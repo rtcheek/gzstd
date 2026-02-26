@@ -1,4 +1,6 @@
-// gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share), v0.9.21
+// gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share), v0.9.31
+// Piping support: stdin/stdout binary mode, SIGPIPE handling, auto-detect pipes
+//
 // Pretty, uniform verbose output (-vv / -vvv) for hybrid mode (CPU + GPU)
 //  - Consistent tagging:
 //      * GPU:   [GPU{dev}/S{stream}] ...
@@ -32,9 +34,15 @@
 #include <type_traits>
 #include <stdexcept>
 #include <memory>
+#include <cerrno>
+#include <csignal>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+ #include <io.h>
+ #include <fcntl.h>
+#endif
 #ifdef HAVE_NVCOMP
  #include <cuda_runtime.h>
  #include <nvcomp/zstd.h>
@@ -43,8 +51,79 @@
 namespace fs = std::filesystem;
 
 /*======================================================================
+ Platform: binary mode for stdin/stdout, SIGPIPE handling
+======================================================================*/
+static void set_binary_mode(FILE * f)
+{
+#ifdef _WIN32
+  _setmode(_fileno(f), _O_BINARY);
+#else
+  (void)f; // POSIX doesn't distinguish text/binary
+#endif
+}
+
+/*======================================================================
+ Temp file cleanup  remove partial output on error / signal
+======================================================================*/
+// Global path to the in-progress temp file. Empty when no temp file is active.
+// Accessed from signal handlers, so we use a simple C string + atomic guard.
+static char g_tmp_path[4096] = {};
+static volatile sig_atomic_t g_tmp_active = 0;
+
+static void cleanup_tmp_file()
+{
+  if (g_tmp_active && g_tmp_path[0] != '\0') {
+    std::remove(g_tmp_path);   // best-effort; ignore errors
+    g_tmp_active = 0;
+    g_tmp_path[0] = '\0';
+  }
+}
+
+static void register_tmp_file(const std::string & path)
+{
+  if (path.size() < sizeof(g_tmp_path)) {
+    std::strncpy(g_tmp_path, path.c_str(), sizeof(g_tmp_path) - 1);
+    g_tmp_path[sizeof(g_tmp_path) - 1] = '\0';
+    g_tmp_active = 1;
+  }
+}
+
+static void clear_tmp_file()
+{
+  g_tmp_active = 0;
+  g_tmp_path[0] = '\0';
+}
+
+// Signal handler for SIGINT / SIGTERM: clean up temp file, then re-raise
+// to get the correct exit status (128 + signum) for the parent process.
+static void signal_cleanup_handler(int signum)
+{
+  cleanup_tmp_file();
+  // Restore default handler and re-raise so the shell sees the signal exit
+  std::signal(signum, SIG_DFL);
+  std::raise(signum);
+}
+
+static void setup_signal_handlers()
+{
+#ifndef _WIN32
+  // Ignore SIGPIPE so writing to a closed pipe returns an error
+  // instead of killing the process  (critical for: gzstd | head)
+  std::signal(SIGPIPE, SIG_IGN);
+#endif
+  // Clean up temp files on interrupt / termination
+  std::signal(SIGINT, signal_cleanup_handler);
+  std::signal(SIGTERM, signal_cleanup_handler);
+
+  // atexit covers die() and any other non-signal abnormal exit
+  std::atexit(cleanup_tmp_file);
+}
+
+/*======================================================================
  Constants
 ======================================================================*/
+static constexpr const char * GZSTD_VERSION = "0.9.31";
+
 static const size_t ONE_MIB = size_t(1024) * size_t(1024);
 static const size_t DEFAULT_CHUNK_MIB = 32;
 #ifdef HAVE_NVCOMP
@@ -71,11 +150,20 @@ struct Options {
   bool level_user_set = false;
   bool fast_flag = false;
   bool best_flag = false;
- bool ultra = false;
-  bool keep = false;
+  bool ultra = false;
+  bool keep = true;
+  bool remove_input = false; // --rm: delete input after success
   bool force = false;
   bool to_stdout = false;
-  int verbosity = 0;
+  // Unified verbosity level:
+  //   V_SILENT(0)  = -qq: suppress everything including errors
+  //   V_ERROR(1)   = -q:  errors only
+  //   V_DEFAULT(2) = normal: progress bar, completion summary
+  //   V_VERBOSE(3) = -v:  informational messages
+  //   V_DEBUG(4)   = -vv: per-worker/batch detail
+  //   V_TRACE(5)   = -vvv: per-chunk debug trace
+  int verbosity = 2;         // V_DEFAULT
+  bool force_progress = false; // --progress: show progress even when stderr is not a TTY
   bool cpu_only = false;
   bool gpu_only = false;
   bool hybrid = false;
@@ -83,7 +171,6 @@ struct Options {
   double cpu_share = -1;     // <0 adaptive (hybrid)
   size_t chunk_mib = DEFAULT_CHUNK_MIB;
   bool chunk_user_set = false;
-  bool no_progress = false;
   size_t cpu_backlog = 0;    // queue depth before CPU pops (hybrid)
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
@@ -96,30 +183,64 @@ struct Options {
   std::string output;
 };
 
-static void log(int v, const Options & opt, const std::string & msg)
-{ if (opt.verbosity >= v) std::cerr << msg << "\n"; }
-static void die(const std::string & msg)
-{ std::cerr << "gzstd: " << msg << "\n"; std::exit(1); }
+/*======================================================================
+ Verbosity levels & exit codes
+======================================================================*/
+static constexpr int V_SILENT  = 0;  // -qq: suppress everything including errors
+static constexpr int V_ERROR   = 1;  // -q:  errors only
+static constexpr int V_DEFAULT = 2;  // normal: progress bar, completion summary
+static constexpr int V_VERBOSE = 3;  // -v:  informational messages
+static constexpr int V_DEBUG   = 4;  // -vv: per-worker/batch detail
+static constexpr int V_TRACE   = 5;  // -vvv: per-chunk debug trace
+
+static constexpr int EXIT_OK       = 0;  // success
+static constexpr int EXIT_ERROR    = 1;  // runtime / I/O / compression error
+static constexpr int EXIT_USAGE    = 2;  // bad command-line usage
+
+// Global verbosity for die() which doesn't take Options
+static int g_verbosity = V_DEFAULT;
+
+// Emit a message to stderr if the current verbosity is >= min_level
+static void vlog(int min_level, const Options & opt, const std::string & msg)
+{ if (opt.verbosity >= min_level) std::cerr << msg << "\n"; }
+
+static void die(const std::string & msg, int code = EXIT_ERROR)
+{ if (g_verbosity >= V_ERROR) std::cerr << "gzstd: " << msg << "\n"; std::exit(code); }
+static void die_usage(const std::string & msg)
+{ die(msg, EXIT_USAGE); }
 
 static void print_help()
 {
   std::cout <<
+"gzstd " << GZSTD_VERSION << " - Hybrid CPU+GPU Zstd compression\n"
+"\n"
 "Usage: gzstd [options] [file]\n"
+"\n"
+"If no file is given (or file is '-'), reads from stdin.\n"
+"When reading from stdin, output goes to stdout (implies -c).\n"
+"Compatible with pipes:  tar cf - dir | gzstd > archive.tar.zst\n"
+"                        gzstd -d < archive.tar.zst | tar xf -\n"
+"\n"
 "Options:\n"
 " -d Decompress\n"
 " -t Test compressed file (verify integrity)\n"
-" -k Keep input file (do not delete)\n"
+" -k Keep input file after operation (default)\n"
+" --rm Remove input file after successful operation\n"
 " -f Force overwrite of output file\n"
 " -c Write to stdout\n"
+" -o, --output FILE  Explicit output path\n"
 " -1 .. -19 Compression level (CPU zstd; default: 3)\n"
 " -20 .. -22 Stronger levels (require --ultra; use more memory)\n"
 " --fast Alias for a fast CPU level (maps to -1)\n"
 " --ultra Enable ultra levels (-20..-22); higher memory usage\n"
 " --best Alias for a strong CPU level (maps to -19)\n"
 " -v / -vv / -vvv Verbose / more verbose / debug-trace\n"
+" -q, --quiet Errors only (suppress progress and info)\n"
+" -qq, --silent Suppress ALL output including errors\n"
+" --progress Force progress meter (even in pipes)\n"
+" --no-progress Suppress progress meter\n"
 " --chunk-size N Host I/O chunk size in MiB (default: auto; was 32)\n"
 " --stats-json <f> Write run statistics (JSON)\n"
-" --no-progress Suppress TTY progress meter entirely\n"
 " --cpu-only Force CPU path (multithreaded)\n"
 " --hybrid Enable hybrid CPU+GPU scheduling (shared queue)\n"
 " -T, --threads N  CPU worker threads (0=auto). Forms -T N or -T# are accepted [CPU-only/hybrid]\n"
@@ -136,15 +257,22 @@ static void print_help()
 #endif
   std::cout <<
 " -h, --help Show this help\n"
-" -V, --version Version info\n";
+" -V, --version Version info\n"
+"\n"
+"Exit codes:\n"
+"  0  Success\n"
+"  1  Runtime error (I/O, compression, GPU failure)\n"
+"  2  Bad command-line usage\n"
+"\n"
+"Progress is shown when stderr is a TTY. Use --progress to force it in pipes.\n";
 }
 
 static void print_version()
 {
 #ifdef HAVE_NVCOMP
-  std::cout << "gzstd 0.9.21 (CPU + nvCOMP) MT-CPU + Hybrid scheduling\n";
+  std::cout << "gzstd " << GZSTD_VERSION << " (CPU + nvCOMP) MT-CPU + Hybrid scheduling\n";
 #else
-  std::cout << "gzstd 0.9.21 (CPU-only) MT compression\n";
+  std::cout << "gzstd " << GZSTD_VERSION << " (CPU-only) MT compression\n";
 #endif
 }
 
@@ -209,8 +337,16 @@ static void progress_emit_line(double pct, const char * in_s, const char * out_s
 
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
 {
-  if (opt.no_progress) return;
-  if (!is_stderr_tty() || opt.verbosity > 0) return;
+  // Progress requires V_DEFAULT(2) or higher.
+  // At V_DEFAULT, suppress if stderr is not a TTY OR if stdin is a pipe
+  // (reading from a pipe = no known total size, progress is noise).
+  // --progress (force_progress) overrides both checks.
+  // At V_VERBOSE+, the user explicitly asked for output, so always show.
+  if (opt.verbosity < V_DEFAULT) return;
+  if (opt.verbosity == V_DEFAULT && !opt.force_progress) {
+    if (!is_stderr_tty()) return;
+    if (opt.input == "-" && !isatty(fileno(stdin))) return;
+  }
   using namespace std::chrono; using namespace std::chrono_literals;
   size_t last_len = 0;
   while (!done_flag->load()) {
@@ -247,9 +383,17 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
  I/O helpers
 ======================================================================*/
 static FILE * open_input(const std::string & path)
-{ if (path == "-") return stdin; FILE * f = std::fopen(path.c_str(), "rb"); if (!f) die("cannot open input: " + path); return f; }
+{
+  if (path == "-") {
+    set_binary_mode(stdin);
+    return stdin;
+  }
+  FILE * f = std::fopen(path.c_str(), "rb");
+  if (!f) die("cannot open input: " + path);
+  return f;
+}
 static FILE * open_output_atomic(const std::string & out, std::string & tmp_path)
-{ tmp_path = out + ".gzstd.tmp"; FILE * f = std::fopen(tmp_path.c_str(), "wb"); if (!f) die("cannot open temp output: " + tmp_path); return f; }
+{ tmp_path = out + ".gzstd.tmp"; register_tmp_file(tmp_path); FILE * f = std::fopen(tmp_path.c_str(), "wb"); if (!f) die("cannot open temp output: " + tmp_path); return f; }
 static void fsync_file(FILE * f)
 {
 #if defined(_POSIX_VERSION)
@@ -260,6 +404,26 @@ static void fsync_file(FILE * f)
 }
 static bool is_regular_file_stream(FILE * f)
 { if (!f) return false; int fd = fileno(f); struct stat st; if (fstat(fd, &st) != 0) return false; return S_ISREG(st.st_mode); }
+
+// Robust fwrite that handles EINTR and short writes (pipes, signals)
+static size_t robust_fwrite(const void * ptr, size_t size, FILE * f)
+{
+  const char * p = static_cast<const char *>(ptr);
+  size_t remaining = size;
+  while (remaining > 0) {
+    size_t w = std::fwrite(p, 1, remaining, f);
+    if (w > 0) {
+      p += w;
+      remaining -= w;
+    } else {
+      // Check for EINTR (interrupted by signal); retry
+      if (errno == EINTR) continue;
+      // Real error (EPIPE, disk full, etc.)
+      return size - remaining;
+    }
+  }
+  return size;
+}
 
 /*======================================================================
  Auto chunk selection
@@ -332,7 +496,11 @@ static void writer_thread(FILE * out, ResultStore & results, const Options & opt
     if (results.producer_done && results.workers_done && results.next_to_write >= results.total_tasks) break;
     auto it = results.data.find(results.next_to_write); if (it == results.data.end()) continue;
     const std::vector<char> & buf = it->second;
-    lk.unlock(); size_t w = std::fwrite(buf.data(), 1, buf.size(), out); if (w != buf.size()) die("short write to output"); if (m) m->wrote_bytes.fetch_add(w); lk.lock(); results.data.erase(it); ++results.next_to_write;
+    lk.unlock();
+    size_t w = robust_fwrite(buf.data(), buf.size(), out);
+    if (w != buf.size()) die("short write to output (broken pipe?)");
+    if (m) m->wrote_bytes.fetch_add(w);
+    lk.lock(); results.data.erase(it); ++results.next_to_write;
   }
 }
 
@@ -351,7 +519,7 @@ static inline void compress_one_cpu_frame(const void * src, size_t src_size, int
 static void decompress_stream(FILE * in, FILE * out, const Options & opt, Meter * m = nullptr)
 {
   size_t chosen_mib = opt.chunk_mib;
-  if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); log(1,opt, std::string("auto-chunk (decompress): ") + std::to_string(chosen_mib) + " MiB"); }
+  if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (decompress): ") + std::to_string(chosen_mib) + " MiB"); }
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
   std::vector<char> inbuf(chunk_bytes);
   std::vector<char> outbuf(chunk_bytes);
@@ -369,8 +537,8 @@ static void decompress_stream(FILE * in, FILE * out, const Options & opt, Meter 
     if (ZSTD_isError(ret)) die(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
     if (zout.pos > 0) {
       if (opt.mode != Mode::TEST) {
-        size_t w = std::fwrite(outbuf.data(), 1, zout.pos, out);
-        if (w != zout.pos) die("short write to output");
+        size_t w = robust_fwrite(outbuf.data(), zout.pos, out);
+        if (w != zout.pos) die("short write to output (broken pipe?)");
       }
       if (m) m->wrote_bytes.fetch_add(zout.pos);
       zout.pos = 0;
@@ -403,10 +571,10 @@ public:
     const double tgt = share_.load(std::memory_order_relaxed) / 1000.0;
     return used < (tgt + 0.02);
   }
-  void mark_cpu_take(uint64_t n){ window_cpu_taken_.fetch_add(n, std::memory_order_relaxed);} 
-  void mark_gpu_take(uint64_t n){ window_gpu_taken_.fetch_add(n, std::memory_order_relaxed);} 
-  void add_cpu_bytes(uint64_t b){ cpu_bytes_.fetch_add(b, std::memory_order_relaxed);} 
-  void add_gpu_bytes(uint64_t b){ gpu_bytes_.fetch_add(b, std::memory_order_relaxed);} 
+  void mark_cpu_take(uint64_t n){ window_cpu_taken_.fetch_add(n, std::memory_order_relaxed);}
+  void mark_gpu_take(uint64_t n){ window_gpu_taken_.fetch_add(n, std::memory_order_relaxed);}
+  void add_cpu_bytes(uint64_t b){ cpu_bytes_.fetch_add(b, std::memory_order_relaxed);}
+  void add_gpu_bytes(uint64_t b){ gpu_bytes_.fetch_add(b, std::memory_order_relaxed);}
   void tick() {
     if (!adaptive_) { return; }
     const auto now = std::chrono::steady_clock::now();
@@ -425,7 +593,7 @@ public:
     set_target_share(ema);
     window_cpu_taken_.store(0, std::memory_order_relaxed);
     window_gpu_taken_.store(0, std::memory_order_relaxed);
-    if (opt_.verbosity >= 2) {
+    if (opt_.verbosity >= V_DEBUG) {
       std::ostringstream os; os << std::fixed << std::setprecision(3)
         << "hybrid: tick cpu_rate=" << (cpu_rate/1e9) << " GiB/s"
         << " gpu_rate=" << (gpu_rate/1e9) << " GiB/s"
@@ -435,7 +603,7 @@ public:
   }
   double target_share() const { return share_.load() / 1000.0; }
 private:
-  void set_target_share(double s){ if (s<0.0) s=0.0; if (s>1.0) s=1.0; share_.store(uint32_t(std::lround(s*1000.0)), std::memory_order_relaxed);} 
+  void set_target_share(double s){ if (s<0.0) s=0.0; if (s>1.0) s=1.0; share_.store(uint32_t(std::lround(s*1000.0)), std::memory_order_relaxed);}
   const Options & opt_;
   std::atomic<uint32_t> share_{250}; // permille
   std::atomic<uint64_t> window_cpu_taken_{0}, window_gpu_taken_{0};
@@ -465,7 +633,7 @@ static void cpu_worker(
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
-  if (opt->verbosity >= 1) { std::ostringstream os; os << "[CPU/T" << worker_id << "] online"; log(1, *opt, os.str()); }
+  if (opt->verbosity >= V_VERBOSE) { std::ostringstream os; os << "[CPU/T" << worker_id << "] online"; vlog(V_VERBOSE, *opt, os.str()); }
 
   while (true) {
 #ifdef HAVE_NVCOMP
@@ -497,7 +665,7 @@ static void cpu_worker(
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
     const size_t csz = out_frame.size();
 
-    if (opt->verbosity >= 3) {
+    if (opt->verbosity >= V_TRACE) {
       char in_s[32], out_s[32];
       human_bytes(double(t.data.size()), in_s, sizeof(in_s));
       human_bytes(double(csz), out_s, sizeof(out_s));
@@ -507,7 +675,7 @@ static void cpu_worker(
          << " in=" << in_s << " out=" << out_s
          << " ms=" << std::fixed << std::setprecision(2) << ms
          << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
-      log(3, *opt, os.str());
+      vlog(V_TRACE, *opt, os.str());
     }
 
     if (m) m->tasks_done.fetch_add(1);
@@ -525,7 +693,7 @@ static void cpu_worker(
     }
   }
 
-  if (opt->verbosity >= 2) {
+  if (opt->verbosity >= V_DEBUG) {
     CpuThreadStats st; { std::lock_guard<std::mutex> lk(cpuagg->m); if ((size_t)worker_id < cpuagg->per_thread.size()) st = cpuagg->per_thread[(size_t)worker_id]; }
     const double thr_gib = (st.comp_ms > 0.0) ? (double)st.in_bytes / (st.comp_ms/1000.0) / 1e9 : 0.0;
     std::ostringstream os;
@@ -533,7 +701,7 @@ static void cpu_worker(
        << " in=" << st.in_bytes << "B out=" << st.out_bytes << "B"
        << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
        << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
-    log(2, *opt, os.str());
+    vlog(V_DEBUG, *opt, os.str());
   }
 }
 
@@ -545,7 +713,7 @@ static void cpu_worker_rescue(
   Meter * /*m*/,
   CpuAgg * cpuagg)
 {
-  if (opt->verbosity >= 1) { std::ostringstream os; os << "[RESCUE/T" << worker_id << "] online"; log(1, *opt, os.str()); }
+  if (opt->verbosity >= V_VERBOSE) { std::ostringstream os; os << "[RESCUE/T" << worker_id << "] online"; vlog(V_VERBOSE, *opt, os.str()); }
   while (true) {
     Task t; if (!rq->pop_one(t)) break;
     const auto t0 = std::chrono::steady_clock::now();
@@ -553,8 +721,8 @@ static void cpu_worker_rescue(
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
     const size_t csz = out_frame.size();
-    if (opt->verbosity >= 3) {
-      char in_s[32], out_s[32]; human_bytes(double(t.data.size()), in_s, sizeof(in_s)); human_bytes(double(csz), out_s, sizeof(out_s)); double thr_gib=(ms>0.0)?(double)t.data.size()/(ms/1000.0)/1e9:0.0; std::ostringstream os; os<<"[RESCUE/T"<<worker_id<<"] seq="<<t.seq<<" in="<<in_s<<" out="<<out_s<<" ms="<<std::fixed<<std::setprecision(2)<<ms<<" thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; log(3, *opt, os.str()); }
+    if (opt->verbosity >= V_TRACE) {
+      char in_s[32], out_s[32]; human_bytes(double(t.data.size()), in_s, sizeof(in_s)); human_bytes(double(csz), out_s, sizeof(out_s)); double thr_gib=(ms>0.0)?(double)t.data.size()/(ms/1000.0)/1e9:0.0; std::ostringstream os; os<<"[RESCUE/T"<<worker_id<<"] seq="<<t.seq<<" in="<<in_s<<" out="<<out_s<<" ms="<<std::fixed<<std::setprecision(2)<<ms<<" thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_TRACE, *opt, os.str()); }
     { std::lock_guard<std::mutex> lk(results->m); results->data.emplace(t.seq, std::move(out_frame)); }
     results->cv.notify_one();
     { std::lock_guard<std::mutex> lk(cpuagg->m); if (cpuagg->per_thread.size() <= (size_t)worker_id) cpuagg->per_thread.resize((size_t)worker_id + 1); auto & st = cpuagg->per_thread[(size_t)worker_id]; st.tasks += 1; st.in_bytes += t.data.size(); st.out_bytes += csz; st.comp_ms += ms; }
@@ -567,8 +735,12 @@ static void cpu_worker_rescue(
 static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   size_t chosen_mib = opt.chunk_mib;
-  if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); log(1,opt, std::string("auto-chunk (CPU): ") + std::to_string(chosen_mib) + " MiB"); }
+  if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (CPU): ") + std::to_string(chosen_mib) + " MiB"); }
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
+
+  uint64_t total_in = 0; if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)) total_in = (uint64_t)fs::file_size(opt.input);
+  std::atomic<bool> progress_done{false}; std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
+
   std::vector< char > inbuf(chunk_bytes);
   std::vector< char > outbuf(ZSTD_compressBound(chunk_bytes));
   while (true) {
@@ -577,10 +749,12 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
     if (m) m->read_bytes.fetch_add(n);
     size_t csz = ZSTD_compress(outbuf.data(), outbuf.size(), inbuf.data(), n, opt.level);
     if (ZSTD_isError(csz)) die(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
-    size_t w = std::fwrite(outbuf.data(), 1, csz, out);
-    if (w != csz) die("short write to output");
+    size_t w = robust_fwrite(outbuf.data(), csz, out);
+    if (w != csz) die("short write to output (broken pipe?)");
     if (m) m->wrote_bytes.fetch_add(w);
   }
+
+  progress_done = true; progress_thr.join();
 }
 
 static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
@@ -589,14 +763,14 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Option A: if single-threaded, use simple streaming helper
   if (threads == 1) {
-    if (opt.verbosity >= 1)
-      log(1, opt, "CPU MT requested with 1 thread; using single-thread streaming path");
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "CPU MT requested with 1 thread; using single-thread streaming path");
     compress_cpu_stream(in, out, opt, m);
     return;
   }
 
   CpuAgg cpuagg{}; cpuagg.threads = threads; cpuagg.per_thread.resize((size_t)threads);
-  size_t chosen_mib = opt.chunk_mib; if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); log(1,opt, std::string("auto-chunk (CPU-MT): ") + std::to_string(chosen_mib) + " MiB"); }
+  size_t chosen_mib = opt.chunk_mib; if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (CPU-MT): ") + std::to_string(chosen_mib) + " MiB"); }
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   uint64_t total_in = 0; if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)) total_in = (uint64_t)fs::file_size(opt.input);
@@ -782,7 +956,7 @@ static void gpu_worker(
         C.per_stream_batch = std::max<size_t>(1, C.per_stream_batch/2);
       }
       C.stats.dev_index = size_t(device_id); C.stats.stream_index = s;
-      if (opt.verbosity >= 1) { std::ostringstream os; os << "[GPU"<<device_id<<"/S"<<s<<"] subchunk="<<(gpu_chunk/ONE_MIB)<<"MiB batch="<<C.per_stream_batch; log(1,opt, os.str()); }
+      if (opt.verbosity >= V_VERBOSE) { std::ostringstream os; os << "[GPU"<<device_id<<"/S"<<s<<"] subchunk="<<(gpu_chunk/ONE_MIB)<<"MiB batch="<<C.per_stream_batch; vlog(V_VERBOSE,opt, os.str()); }
     }
 
     bool producer_done_seen=false;
@@ -797,7 +971,7 @@ static void gpu_worker(
         size_t free_b=0,total_b=0;
         if (cudaMemGetInfo(&free_b,&total_b)==cudaSuccess && free_b>0) {
           size_t target = std::min<size_t>(std::min<size_t>(C.per_stream_batch*2, per_stream_cap), HARD_BATCH_CAP);
-          if (try_grow_stream(C, target, comp_opts, opt)) { if (opt.verbosity>=2) { std::ostringstream os; os<<"[GPU"<<device_id<<"] stream grew to batch="<<C.per_stream_batch; log(2,opt, os.str()); } }
+          if (try_grow_stream(C, target, comp_opts, opt)) { if (opt.verbosity>=V_DEBUG) { std::ostringstream os; os<<"[GPU"<<device_id<<"] stream grew to batch="<<C.per_stream_batch; vlog(V_DEBUG,opt, os.str()); } }
         }
         C.last_adjust = now;
       }
@@ -813,8 +987,8 @@ static void gpu_worker(
         C.filled = C.batch.size();
 
         // -vv: print take line
-        if (opt.verbosity >= 2) {
-          size_t seq_lo = C.batch.front().seq, seq_hi = C.batch.back().seq; uint64_t tin=0; for (size_t i=0;i<C.filled;++i) tin += C.batch[i].data.size(); char tin_s[32]; human_bytes(double(tin), tin_s, sizeof(tin_s)); std::ostringstream os; os << "[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] take N="<<C.filled<<" seq=["<<seq_lo<<".."<<seq_hi<<"] in="<<tin_s; log(2,opt, os.str()); }
+        if (opt.verbosity >= V_DEBUG) {
+          size_t seq_lo = C.batch.front().seq, seq_hi = C.batch.back().seq; uint64_t tin=0; for (size_t i=0;i<C.filled;++i) tin += C.batch[i].data.size(); char tin_s[32]; human_bytes(double(tin), tin_s, sizeof(tin_s)); std::ostringstream os; os << "[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] take N="<<C.filled<<" seq=["<<seq_lo<<".."<<seq_hi<<"] in="<<tin_s; vlog(V_DEBUG,opt, os.str()); }
 
         cudaEventRecord(C.ev_h2d_begin, C.stream);
         for (size_t i=0;i<C.filled;++i) {
@@ -867,8 +1041,8 @@ static void gpu_worker(
           { C.stats.h2d_ms += h2d_ms; C.stats.comp_ms += comp_ms; C.stats.d2h_ms += d2h_ms; C.stats.total_ms += tot_ms; C.stats.in_bytes += in_sum; C.stats.out_bytes += out_sum; C.stats.batches += 1; C.stats.chunks += C.filled; }
 
           // -vv: done line
-          if (opt.verbosity >= 2) {
-            char in_s[32], out_s[32]; human_bytes(double(in_sum), in_s, sizeof(in_s)); human_bytes(double(out_sum), out_s, sizeof(out_s)); double thr_gib = (tot_ms>0.0)? double(in_sum)/(tot_ms/1000.0)/1e9 : 0.0; std::ostringstream os; os<<"[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] done N="<<C.filled<<" in="<<in_s<<" out="<<out_s<<" h2d="<<std::fixed<<std::setprecision(2)<<h2d_ms<<"ms comp="<<comp_ms<<"ms d2h="<<d2h_ms<<"ms tot="<<tot_ms<<"ms thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; log(2,opt, os.str()); }
+          if (opt.verbosity >= V_DEBUG) {
+            char in_s[32], out_s[32]; human_bytes(double(in_sum), in_s, sizeof(in_s)); human_bytes(double(out_sum), out_s, sizeof(out_s)); double thr_gib = (tot_ms>0.0)? double(in_sum)/(tot_ms/1000.0)/1e9 : 0.0; std::ostringstream os; os<<"[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] done N="<<C.filled<<" in="<<in_s<<" out="<<out_s<<" h2d="<<std::fixed<<std::setprecision(2)<<h2d_ms<<"ms comp="<<comp_ms<<"ms d2h="<<d2h_ms<<"ms tot="<<tot_ms<<"ms thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_DEBUG,opt, os.str()); }
 
           C.busy=false; C.filled=0; C.batch.clear();
         } else if (q != cudaErrorNotReady) { checkCuda(q, "cudaStreamQuery"); }
@@ -900,7 +1074,7 @@ static void gpu_worker(
           if (sched) sched->add_gpu_bytes(in_sum);
           #endif
           { C.stats.h2d_ms += h2d_ms; C.stats.comp_ms += comp_ms; C.stats.d2h_ms += d2h_ms; C.stats.total_ms += tot_ms; C.stats.in_bytes += in_sum; C.stats.out_bytes += out_sum; C.stats.batches += 1; C.stats.chunks += C.filled; }
-          if (opt.verbosity >= 2) { char in_s[32], out_s[32]; human_bytes(double(in_sum), in_s, sizeof(in_s)); human_bytes(double(out_sum), out_s, sizeof(out_s)); double thr_gib = (tot_ms>0.0)? double(in_sum)/(tot_ms/1000.0)/1e9 : 0.0; std::ostringstream os; os<<"[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] done N="<<C.filled<<" in="<<in_s<<" out="<<out_s<<" h2d="<<std::fixed<<std::setprecision(2)<<h2d_ms<<"ms comp="<<comp_ms<<"ms d2h="<<d2h_ms<<"ms tot="<<tot_ms<<"ms thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; log(2,opt, os.str()); }
+          if (opt.verbosity >= V_DEBUG) { char in_s[32], out_s[32]; human_bytes(double(in_sum), in_s, sizeof(in_s)); human_bytes(double(out_sum), out_s, sizeof(out_s)); double thr_gib = (tot_ms>0.0)? double(in_sum)/(tot_ms/1000.0)/1e9 : 0.0; std::ostringstream os; os<<"[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] done N="<<C.filled<<" in="<<in_s<<" out="<<out_s<<" h2d="<<std::fixed<<std::setprecision(2)<<h2d_ms<<"ms comp="<<comp_ms<<"ms d2h="<<d2h_ms<<"ms tot="<<tot_ms<<"ms thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_DEBUG,opt, os.str()); }
           C.busy=false; C.filled=0; C.batch.clear(); blocked=true; break;
         }
         if (!blocked) { std::this_thread::yield(); }
@@ -908,7 +1082,7 @@ static void gpu_worker(
     }
 
     if (json_sink) { std::lock_guard<std::mutex> lk(json_sink->m); auto & vec = json_sink->per_dev[size_t(device_id)]; for (size_t s=0;s<ctxs.size();++s) vec.push_back(ctxs[s].stats); }
-    if (opt.verbosity >= 2) {
+    if (opt.verbosity >= V_DEBUG) {
       for (auto & C : ctxs) {
         double thr_gib = (C.stats.total_ms>0.0)? double(C.stats.in_bytes)/(C.stats.total_ms/1000.0)/1e9 : 0.0;
         std::ostringstream os;
@@ -917,7 +1091,7 @@ static void gpu_worker(
            << " in="<<C.stats.in_bytes<<"B out="<<C.stats.out_bytes<<"B"
            << " time="<<std::fixed<<std::setprecision(2)<<C.stats.total_ms<<"ms"
            << " thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s";
-        log(2, opt, os.str());
+        vlog(V_DEBUG, opt, os.str());
       }
     }
 
@@ -941,10 +1115,10 @@ static void gpu_worker(
 
 static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
-  int device_count=0; if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) { if (opt.gpu_only) die("GPU requested (--gpu-only) but no CUDA devices available"); log(1,opt, "nvCOMP: no GPUs found; falling back to MT CPU"); compress_cpu_mt(in, out, opt, m); return; }
-  if (opt.verbosity >= 1 && (opt.level_user_set || opt.fast_flag || opt.best_flag)) log(1,opt, "note: GPU backend ignores CPU level flags; CPU frames in hybrid still honor level");
+  int device_count=0; if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) { if (opt.gpu_only) die("GPU requested (--gpu-only) but no CUDA devices available"); vlog(V_VERBOSE,opt, "nvCOMP: no GPUs found; falling back to MT CPU"); compress_cpu_mt(in, out, opt, m); return; }
+  if (opt.verbosity >= V_VERBOSE && (opt.level_user_set || opt.fast_flag || opt.best_flag)) vlog(V_VERBOSE,opt, "note: GPU backend ignores CPU level flags; CPU frames in hybrid still honor level");
 
-  size_t chosen_mib = opt.chunk_mib; if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_gpu(in, opt, device_count); std::ostringstream os; os<<"auto-chunk (GPU,"<<device_count<<" devices): "<<chosen_mib<<" MiB"; log(1,opt, os.str()); }
+  size_t chosen_mib = opt.chunk_mib; if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_gpu(in, opt, device_count); std::ostringstream os; os<<"auto-chunk (GPU,"<<device_count<<" devices): "<<chosen_mib<<" MiB"; vlog(V_VERBOSE,opt, os.str()); }
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   TaskQueue queue; RescueQueue rescue; ResultStore results; std::atomic<size_t> seq_counter{0};
@@ -956,7 +1130,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m);
 
   std::unique_ptr<HybridSched> sched_ptr; HybridSched * sched=nullptr; std::atomic<bool> tick_done{false}; std::thread tick_thr;
-  if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) { sched_ptr = std::make_unique<HybridSched>(opt.cpu_share, /*cpu_threads*/0, device_count, opt); sched=sched_ptr.get(); tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched); if (opt.verbosity>=1) { std::ostringstream os; os<<std::fixed<<std::setprecision(1)<<"Using hybrid mode: CPU share "<<((opt.cpu_share>=0.0)?(opt.cpu_share*100.0):(sched->target_share()*100.0))<<((opt.cpu_share>=0.0)?"% (fixed)":"% (adaptive)"); log(1,opt, os.str()); } }
+  if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) { sched_ptr = std::make_unique<HybridSched>(opt.cpu_share, /*cpu_threads*/0, device_count, opt); sched=sched_ptr.get(); tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched); if (opt.verbosity>=V_VERBOSE) { std::ostringstream os; os<<std::fixed<<std::setprecision(1)<<"Using hybrid mode: CPU share "<<((opt.cpu_share>=0.0)?(opt.cpu_share*100.0):(sched->target_share()*100.0))<<((opt.cpu_share>=0.0)?"% (fixed)":"% (adaptive)"); vlog(V_VERBOSE,opt, os.str()); } }
 
   // Rescue pool
   std::vector<std::thread> rescue_pool; { unsigned ths = std::max(1u, std::thread::hardware_concurrency()/2); rescue_pool.reserve(ths); for (unsigned i=0;i<ths;++i) rescue_pool.emplace_back(cpu_worker_rescue, (int)i, &rescue, &results, &opt, m, &cpuagg); }
@@ -968,13 +1142,13 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Warm GPUs before starting CPU pool
   std::vector<std::thread> cpu_pool; int cpu_threads=0;
   if (sched) {
-    if (opt.verbosity>=1) log(1,opt, "hybrid: warming GPUs for up to 500ms before starting CPU threads");
+    if (opt.verbosity>=V_VERBOSE) vlog(V_VERBOSE,opt, "hybrid: warming GPUs for up to 500ms before starting CPU threads");
     auto t0w = std::chrono::steady_clock::now();
     while (!gpu_started.load(std::memory_order_acquire)) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); if (std::chrono::steady_clock::now() - t0w > std::chrono::milliseconds(500)) break; }
     cpu_threads = opt.cpu_threads; if (cpu_threads<=0) { unsigned hw=std::max(1u,std::thread::hardware_concurrency()); unsigned def=std::max(1u,hw/3); if (def>32u) def=32u; cpu_threads = def; }
-    if (!gpu_started.load(std::memory_order_acquire)) { if (opt.verbosity>=1) log(1,opt, "hybrid: GPUs not active after warm-up; limiting CPU threads to 8"); if (cpu_threads>8) cpu_threads=8; }
+    if (!gpu_started.load(std::memory_order_acquire)) { if (opt.verbosity>=V_VERBOSE) vlog(V_VERBOSE,opt, "hybrid: GPUs not active after warm-up; limiting CPU threads to 8"); if (cpu_threads>8) cpu_threads=8; }
     cpuagg.threads = cpu_threads; cpuagg.per_thread.resize((size_t)cpu_threads);
-    if (opt.verbosity>=1) { std::ostringstream os; os<<"hybrid: starting CPU pool: "<<cpu_threads<<" threads"; log(1,opt, os.str()); }
+    if (opt.verbosity>=V_VERBOSE) { std::ostringstream os; os<<"hybrid: starting CPU pool: "<<cpu_threads<<" threads"; vlog(V_VERBOSE,opt, os.str()); }
     for (int i=0;i<cpu_threads;++i) cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &cpuagg);
   }
 
@@ -1013,7 +1187,7 @@ static void write_stats_json_cpu_only(const std::string & path, const Options & 
   std::ofstream js(path, std::ios::out | std::ios::binary | std::ios::trunc);
   if (!js) { return; }
   uint64_t in_bytes=meter.read_bytes.load(), out_bytes=meter.wrote_bytes.load();
-  js << "{\n  \"version\": \"0.9.21\",\n  \"mode\": \"" << (opt.mode==Mode::COMPRESS?"compress":opt.mode==Mode::DECOMPRESS?"decompress":"test") << "\",\n  \"elapsed_sec\": " << std::fixed << std::setprecision(6) << elapsed_sec << ",\n  \"input_bytes\": " << in_bytes << ",\n  \"output_bytes\": " << out_bytes << ",\n  \"cpu\": { \"threads\": " << cpuagg.threads << " }\n}\n";
+  js << "{\n  \"version\": \"" << GZSTD_VERSION << "\",\n  \"mode\": \"" << (opt.mode==Mode::COMPRESS?"compress":opt.mode==Mode::DECOMPRESS?"decompress":"test") << "\",\n  \"elapsed_sec\": " << std::fixed << std::setprecision(6) << elapsed_sec << ",\n  \"input_bytes\": " << in_bytes << ",\n  \"output_bytes\": " << out_bytes << ",\n  \"cpu\": { \"threads\": " << cpuagg.threads << " }\n}\n";
 }
 
 /*======================================================================
@@ -1022,26 +1196,54 @@ static void write_stats_json_cpu_only(const std::string & path, const Options & 
 static Options parse_args(int argc, char ** argv);
 int main(int argc, char ** argv)
 {
+  setup_signal_handlers();
+
   Options opt = parse_args(argc, argv);
   FILE * in = open_input(opt.input);
   bool to_stdout = (opt.to_stdout || (!opt.output.empty() && opt.output == "stdout"));
-  std::string tmp; FILE * out = nullptr;
-  if (to_stdout) out = stdout; else { if (fs::exists(opt.output)) { if (!opt.force) die("output exists (use -f to overwrite): "+opt.output); std::error_code ec; fs::remove(opt.output, ec); } out = open_output_atomic(opt.output, tmp); }
-  Meter meter; log(1, opt, "gzstd starting...");
- if (opt.verbosity >= 2 && opt.mode == Mode::COMPRESS) {
-  std::ostringstream os;
-#ifdef HAVE_NVCOMP
-  os << "compression level (CPU path): " << opt.level
-     << (opt.ultra && opt.level >= 20 ? " (ultra)" : "");
-  if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) {
-    os << "  [note: GPU backend ignores level; CPU frames use this level]";
+
+  // When writing to stdout, force keep (can't delete stdin) and set binary mode
+  if (to_stdout) {
+    opt.keep = true;
+    set_binary_mode(stdout);
   }
+
+  std::string tmp;         // non-empty only when using atomic temp file (-f overwrite)
+  bool use_atomic = false; // true when writing to .tmp then renaming
+  FILE * out = nullptr;
+  if (to_stdout) {
+    out = stdout;
+  } else {
+    bool exists = fs::exists(opt.output);
+    if (exists && !opt.force) {
+      die("output exists (use -f to overwrite): " + opt.output);
+    }
+    if (exists && opt.force) {
+      // Atomic overwrite: write to .tmp, rename on success
+      out = open_output_atomic(opt.output, tmp);
+      use_atomic = true;
+    } else {
+      // Direct write: write to final name, delete on failure
+      out = std::fopen(opt.output.c_str(), "wb");
+      if (!out) die("cannot open output: " + opt.output);
+      register_tmp_file(opt.output); // arm cleanup to delete on failure
+    }
+  }
+  Meter meter; vlog(V_VERBOSE, opt, "gzstd starting...");
+  if (opt.verbosity >= V_DEBUG && opt.mode == Mode::COMPRESS) {
+    std::ostringstream os;
+#ifdef HAVE_NVCOMP
+    os << "compression level (CPU path): " << opt.level
+       << (opt.ultra && opt.level >= 20 ? " (ultra)" : "");
+    if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) {
+      os << "  [note: GPU backend ignores level; CPU frames use this level]";
+    }
 #else
-  os << "compression level: " << opt.level
-     << (opt.ultra && opt.level >= 20 ? " (ultra)" : "");
+    os << "compression level: " << opt.level
+       << (opt.ultra && opt.level >= 20 ? " (ultra)" : "");
 #endif
-  log(2, opt, os.str());
- }
+    vlog(V_DEBUG, opt, os.str());
+  }
 
   std::atomic<bool> prog_done{false}; std::thread prog_thr; uint64_t total_in_for_progress=0;
   if (opt.mode == Mode::TEST || opt.mode == Mode::DECOMPRESS) { if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)) total_in_for_progress = (uint64_t)fs::file_size(opt.input); prog_thr = std::thread(progress_loop, std::cref(opt), &meter, total_in_for_progress, &prog_done); }
@@ -1056,8 +1258,8 @@ int main(int argc, char ** argv)
       compress_nvcomp(in, out, opt, &meter);
     }
 #else
-    if (opt.gpu_only) die("This binary was built without nvCOMP; --gpu-only cannot be satisfied");
-    if (opt.hybrid) log(1,opt, "Hybrid requested but not available in CPU-only build; using MT CPU.");
+    if (opt.gpu_only) die_usage("This binary was built without nvCOMP; --gpu-only cannot be satisfied");
+    if (opt.hybrid) vlog(V_VERBOSE,opt, "Hybrid requested but not available in CPU-only build; using MT CPU.");
     compress_cpu_mt(in, out, opt, &meter);
     if (!opt.stats_json.empty()) { CpuAgg agg{}; agg.threads = (opt.cpu_threads>0?opt.cpu_threads: std::max(1,int(std::thread::hardware_concurrency())-1)); double elapsed = std::chrono::duration_cast< std::chrono::duration<double> >(std::chrono::steady_clock::now()-t0).count(); write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, agg); }
 #endif
@@ -1066,54 +1268,97 @@ int main(int argc, char ** argv)
     if (!opt.stats_json.empty()) { double elapsed = std::chrono::duration_cast< std::chrono::duration<double> >(std::chrono::steady_clock::now()-t0).count(); CpuAgg dummy{}; dummy.threads=1; write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, dummy); }
   }
 
-  if (opt.mode == Mode::TEST) { prog_done = true; if (prog_thr.joinable()) prog_thr.join(); uint64_t comp_size = 0; if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)) comp_size = (uint64_t)fs::file_size(opt.input); else comp_size = meter.read_bytes.load(); uint64_t decomp_size = meter.wrote_bytes.load(); double pct = (decomp_size > 0) ? (double)comp_size / (double)decomp_size * 100.0 : 0.0; std::string base_name; if (opt.input == "-") base_name = "(stdin)"; else if (opt.input.size()>4 && opt.input.substr(opt.input.size()-4) == ".zst") base_name = opt.input.substr(0, opt.input.size()-4); else base_name = opt.input; std::cout << base_name << "  : " << "compressed size:" << comp_size << " bytes, " << "uncompressed size:" << decomp_size << " bytes, " << "ratio: " << std::fixed << std::setprecision(1) << pct << "%\n"; std::fclose(in); return 0; }
+  if (opt.mode == Mode::TEST) { prog_done = true; if (prog_thr.joinable()) prog_thr.join(); uint64_t comp_size = 0; if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)) comp_size = (uint64_t)fs::file_size(opt.input); else comp_size = meter.read_bytes.load(); uint64_t decomp_size = meter.wrote_bytes.load(); double pct = (decomp_size > 0) ? (double)comp_size / (double)decomp_size * 100.0 : 0.0; if (opt.verbosity >= V_DEFAULT) { std::string base_name; if (opt.input == "-") base_name = "(stdin)"; else if (opt.input.size()>4 && opt.input.substr(opt.input.size()-4) == ".zst") base_name = opt.input.substr(0, opt.input.size()-4); else base_name = opt.input; std::cout << base_name << "  : " << "compressed size:" << comp_size << " bytes, " << "uncompressed size:" << decomp_size << " bytes, " << "ratio: " << std::fixed << std::setprecision(1) << pct << "%\n"; } std::fclose(in); return EXIT_OK; }
   if (opt.mode == Mode::DECOMPRESS) { prog_done = true; if (prog_thr.joinable()) prog_thr.join(); }
 
   if (!to_stdout) {
-    fsync_file(out); std::fclose(out); std::fclose(in); std::error_code ec_rename; fs::rename(tmp, opt.output, ec_rename);
-    if (ec_rename) { std::ifstream src(tmp, std::ios::binary); std::ofstream dst(opt.output, std::ios::binary | std::ios::trunc); if (!src || !dst) die("failed to finalize output file"); dst << src.rdbuf(); src.close(); dst.close(); fs::remove(tmp); }
+    fsync_file(out); std::fclose(out); std::fclose(in);
+    if (use_atomic) {
+      // Atomic overwrite: rename .tmp to final output
+      std::error_code ec_rename; fs::rename(tmp, opt.output, ec_rename);
+      if (ec_rename) {
+        std::ifstream src(tmp, std::ios::binary);
+        std::ofstream dst(opt.output, std::ios::binary | std::ios::trunc);
+        if (!src || !dst) die("failed to finalize output file");
+        dst << src.rdbuf(); src.close(); dst.close(); fs::remove(tmp);
+      }
+    }
+    // Success: disarm cleanup (temp or direct output file is now final)
+    clear_tmp_file();
     if (!opt.keep && opt.input != "-") { std::error_code ec_rm; fs::remove(opt.input, ec_rm); }
-  } else { std::fclose(in); }
+  } else {
+    // Flush stdout to ensure all data reaches the downstream pipe
+    std::fflush(stdout);
+    std::fclose(in);
+  }
 
-  log(1, opt, "done.");
-  return 0;
+  vlog(V_VERBOSE, opt, "done.");
+  return EXIT_OK;
 }
 
-/* parse_args at end (unchanged) */
+/* parse_args at end */
 static Options parse_args(int argc, char ** argv)
 {
   Options opt;
+
+  // Detect invocation name: if basename starts with "un" (e.g. ungzstd),
+  // default to decompress mode (like gzip/gunzip, zstd/unzstd)
+  if (argc > 0 && argv[0]) {
+    std::string prog = argv[0];
+    // Extract basename (strip directory path)
+    auto slash = prog.find_last_of("/\\");
+    std::string base = (slash != std::string::npos) ? prog.substr(slash + 1) : prog;
+    if (base.size() >= 2 && base[0] == 'u' && base[1] == 'n') {
+      opt.mode = Mode::DECOMPRESS;
+    }
+  }
+
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "-h" || a == "--help") { print_help(); std::exit(0); }
-    else if (a == "-V" || a == "--version") { print_version(); std::exit(0); }
+    if (a == "-h" || a == "--help") { print_help(); std::exit(EXIT_OK); }
+    else if (a == "-V" || a == "--version") { print_version(); std::exit(EXIT_OK); }
     else if (a == "-d") opt.mode = Mode::DECOMPRESS;
     else if (a == "-t") opt.mode = Mode::TEST;
     else if (a == "-k") opt.keep = true;
+    else if (a == "--rm") { opt.remove_input = true; opt.keep = false; }
     else if (a == "-f") opt.force = true;
     else if (a == "-c") opt.to_stdout = true;
-    else if (a == "-v") opt.verbosity = 1;
-    else if (a == "-vv") opt.verbosity = 2;
-    else if (a == "-vvv") opt.verbosity = 3;
+    else if (a == "-v") opt.verbosity = V_VERBOSE;
+    else if (a == "-vv") opt.verbosity = V_DEBUG;
+    else if (a == "-vvv") opt.verbosity = V_TRACE;
+    else if (a == "-q" || a == "--quiet") opt.verbosity = V_ERROR;
+    else if (a == "-qq" || a == "--silent") opt.verbosity = V_SILENT;
+    else if (a == "--progress") { opt.force_progress = true; if (opt.verbosity < V_DEFAULT) opt.verbosity = V_DEFAULT; }
+    else if (a == "--no-progress") { opt.force_progress = false; if (opt.verbosity == V_DEFAULT) opt.verbosity = V_ERROR; }
     else if (a.size() >= 2 && a[0] == '-') {
-  bool all_digits = true;
-  for (size_t k = 1; k < a.size(); ++k) { if (a[k] < '0' || a[k] > '9') { all_digits = false; break; } }
-  if (all_digits) {
-    int lvl = std::stoi(a.substr(1));
-    if (lvl < 1) die("invalid compression level (must be 1..22)");
-    if (lvl >= 20 && lvl <= 22 && !opt.ultra) { die("levels 20..22 require --ultra (zstd-compatible behavior)"); }
-    if (lvl > 22) die("invalid compression level (max 22)");
-    opt.level = lvl; opt.level_user_set = true; continue;
-  }
- }
+      bool all_digits = true;
+      for (size_t k = 1; k < a.size(); ++k) { if (a[k] < '0' || a[k] > '9') { all_digits = false; break; } }
+      if (all_digits) {
+        int lvl = std::stoi(a.substr(1));
+        if (lvl < 1) die_usage("invalid compression level (must be 1..22)");
+        if (lvl >= 20 && lvl <= 22 && !opt.ultra) { die_usage("levels 20..22 require --ultra (zstd-compatible behavior)"); }
+        if (lvl > 22) die_usage("invalid compression level (max 22)");
+        opt.level = lvl; opt.level_user_set = true; continue;
+      }
+    }
     else if (a == "--fast") { opt.fast_flag = true; opt.level = 1; opt.level_user_set = true; }
     else if (a == "--best") { opt.best_flag = true; opt.level = 19; opt.level_user_set = true; }
- else if (a == "--ultra") { opt.ultra = true; }
-    else if (a == "--no-progress") { opt.no_progress = true; }
+    else if (a == "--ultra") { opt.ultra = true; }
     else if (a == "--cpu-only") opt.cpu_only = true;
     else if (a == "--hybrid") opt.hybrid = true;
- else if (a.rfind("-T", 0) == 0 && a.size() > 2) { int th = std::stoi(a.substr(2)); opt.cpu_threads = th; }
-    else if (a == "-T" || a == "--threads") { int th = 0; if (a == "-T" && i + 1 < argc) th = std::stoi(argv[++i]); else if (!parse_int_arg("threads", i, argc, argv, th)) die("missing value for --threads"); opt.cpu_threads = th; }
+    else if (a.rfind("-T", 0) == 0 && a.size() > 2) { int th = std::stoi(a.substr(2)); opt.cpu_threads = th; }
+    else if (a == "-T" || a == "--threads") { int th = 0; if (a == "-T" && i + 1 < argc) th = std::stoi(argv[++i]); else if (!parse_int_arg("threads", i, argc, argv, th)) die_usage("missing value for --threads"); opt.cpu_threads = th; }
+    else if (a == "-o" || a == "--output") {
+      if (i + 1 >= argc) die_usage("missing value for " + a);
+      opt.output = argv[++i];
+      // -o implies not-stdout unless the path is literally "stdout" or "-"
+      if (opt.output == "-") { opt.to_stdout = true; opt.output = "stdout"; }
+    }
+    else if (a.rfind("--output=", 0) == 0) {
+      opt.output = a.substr(9);
+      if (opt.output.empty()) die_usage("missing value for --output");
+      if (opt.output == "-") { opt.to_stdout = true; opt.output = "stdout"; }
+    }
     else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) {}
     else if (parse_str_arg("stats-json", i, argc, argv, opt.stats_json)) {}
     else if (parse_num_arg("chunk-size", i, argc, argv, opt.chunk_mib, &opt.chunk_user_set)) {}
@@ -1132,7 +1377,7 @@ static Options parse_args(int argc, char ** argv)
         if (v == "auto") opt.pin_mode = PinMode::AUTO;
         else if (v == "on") opt.pin_mode = PinMode::ON;
         else if (v == "off") opt.pin_mode = PinMode::OFF;
-        else die("invalid value for --pinned (expected auto|on|off)");
+        else die_usage("invalid value for --pinned (expected auto|on|off)");
       }
     }
 #else
@@ -1140,9 +1385,17 @@ static Options parse_args(int argc, char ** argv)
       // Ignored on CPU-only builds
     }
 #endif
-    else { if (opt.input.empty()) opt.input = a; else die("multiple input files not supported yet"); }
+    else { if (opt.input.empty()) opt.input = a; else die_usage("multiple input files not supported yet"); }
   }
   if (opt.input.empty()) opt.input = "-";
+
+  // When reading from stdin, default to stdout output (pipe-friendly, like gzip/zstd)
+  if (opt.input == "-" && opt.output.empty()) opt.to_stdout = true;
+
+  // When writing to stdout (-c), always keep the input file (can't delete stdin,
+  // and deleting a named file when output goes to stdout matches gzip behavior)
+  if (opt.to_stdout) opt.keep = true;
+
 #ifdef HAVE_NVCOMP
   if (opt.gpu_batch_cap == 0) opt.gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   if (opt.gpu_streams == 0) opt.gpu_streams = DEFAULT_GPU_STREAMS;
@@ -1152,15 +1405,27 @@ static Options parse_args(int argc, char ** argv)
 #endif
   if (opt.chunk_mib == 0) opt.chunk_mib = DEFAULT_CHUNK_MIB;
   if (opt.mode == Mode::TEST) { opt.to_stdout = true; opt.output = "stdout"; }
-  else if (!opt.to_stdout) {
+  else if (opt.to_stdout && opt.output.empty()) {
+    opt.output = "stdout";
+  }
+  else if (!opt.to_stdout && opt.output.empty()) {
     if (opt.mode == Mode::COMPRESS) opt.output = (opt.input == "-") ? "stdout" : (opt.input + ".zst");
     else {
       if (opt.input.size() > 4 && opt.input.substr(opt.input.size() - 4) == ".zst") opt.output = opt.input.substr(0, opt.input.size() - 4);
       else opt.output = opt.input + ".out";
     }
   }
-  if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die("--gpu-only cannot be combined with --cpu-only or --hybrid");
-  if (opt.cpu_only && opt.hybrid) die("--cpu-only cannot be combined with --hybrid");
+  if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die_usage("--gpu-only cannot be combined with --cpu-only or --hybrid");
+  if (opt.cpu_only && opt.hybrid) die_usage("--cpu-only cannot be combined with --hybrid");
+
+  // Auto-lower verbosity when used as a pipe (both stdin and stdout are non-TTY)
+  // but only if the user hasn't explicitly set verbosity via flags.
+  // V_DEFAULT stays V_DEFAULT (keeps progress on a TTY stderr), but if stderr
+  // is also not a TTY we let progress_loop decide (it checks is_stderr_tty).
+  // We do NOT auto-quiet here; the progress_loop already handles the TTY check.
+
+  // Sync global verbosity for die() (which has no access to Options)
+  g_verbosity = opt.verbosity;
+
   return opt;
 }
-
