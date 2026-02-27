@@ -1,4 +1,4 @@
-// gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share), v0.9.31
+// gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share), v0.9.42
 // Piping support: stdin/stdout binary mode, SIGPIPE handling, auto-detect pipes
 //
 // Pretty, uniform verbose output (-vv / -vvv) for hybrid mode (CPU + GPU)
@@ -122,7 +122,7 @@ static void setup_signal_handlers()
 /*======================================================================
  Constants
 ======================================================================*/
-static constexpr const char * GZSTD_VERSION = "0.9.31";
+static constexpr const char * GZSTD_VERSION = "0.9.42";
 
 static const size_t ONE_MIB = size_t(1024) * size_t(1024);
 static const size_t DEFAULT_CHUNK_MIB = 32;
@@ -200,9 +200,10 @@ static constexpr int EXIT_USAGE    = 2;  // bad command-line usage
 // Global verbosity for die() which doesn't take Options
 static int g_verbosity = V_DEFAULT;
 
-// Emit a message to stderr if the current verbosity is >= min_level
+// Emit a message to stderr if the current verbosity is >= min_level.
+// Caller must include \n or \r in msg as appropriate.
 static void vlog(int min_level, const Options & opt, const std::string & msg)
-{ if (opt.verbosity >= min_level) std::cerr << msg << "\n"; }
+{ if (opt.verbosity >= min_level) std::cerr << msg; }
 
 static void die(const std::string & msg, int code = EXIT_ERROR)
 { if (g_verbosity >= V_ERROR) std::cerr << "gzstd: " << msg << "\n"; std::exit(code); }
@@ -241,8 +242,8 @@ static void print_help()
 " --no-progress Suppress progress meter\n"
 " --chunk-size N Host I/O chunk size in MiB (default: auto; was 32)\n"
 " --stats-json <f> Write run statistics (JSON)\n"
-" --cpu-only Force CPU path (multithreaded)\n"
-" --hybrid Enable hybrid CPU+GPU scheduling (shared queue)\n"
+" --cpu-only Force CPU-only path (multithreaded, no GPU)\n"
+" --hybrid Enable hybrid CPU+GPU scheduling (default with GPU)\n"
 " -T, --threads N  CPU worker threads (0=auto). Forms -T N or -T# are accepted [CPU-only/hybrid]\n"
 " --cpu-share X Fixed CPU share [0..1], disables adaptation (hybrid)\n"
 " --cpu-backlog N Min queue depth before CPU pops (hybrid; 0=off)\n";
@@ -251,7 +252,7 @@ static void print_help()
 " --gpu-batch N Max GPU subchunks per device (default: 16)\n"
 " --gpu-mem-frac X Fraction of free VRAM per device (0.1..0.95, def: 0.60)\n"
 " --gpu-streams N CUDA streams per device (default: 3)\n"
-" --gpu-only Error out if GPU path becomes unavailable\n"
+" --gpu-only GPU only, no CPU workers (error if GPU unavailable)\n"
 " --pinned {auto|on|off} Control pinned host buffers (default: auto)\n"
 " --no-pinned Alias for --pinned=off\n";
 #endif
@@ -337,12 +338,11 @@ static void progress_emit_line(double pct, const char * in_s, const char * out_s
 
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
 {
-  // Progress requires V_DEFAULT(2) or higher.
-  // At V_DEFAULT, suppress if stderr is not a TTY OR if stdin is a pipe
-  // (reading from a pipe = no known total size, progress is noise).
-  // --progress (force_progress) overrides both checks.
-  // At V_VERBOSE+, the user explicitly asked for output, so always show.
-  if (opt.verbosity < V_DEFAULT) return;
+  // Progress bar at V_DEFAULT and V_VERBOSE only.
+  // At V_DEBUG+, per-thread summaries provide progress; the bar would collide.
+  // At V_DEFAULT, suppress if stderr is not a TTY OR if stdin is a pipe.
+  // --progress (force_progress) overrides TTY/pipe checks but not V_DEBUG+.
+  if (opt.verbosity < V_DEFAULT || opt.verbosity >= V_DEBUG) return;
   if (opt.verbosity == V_DEFAULT && !opt.force_progress) {
     if (!is_stderr_tty()) return;
     if (opt.input == "-" && !isatty(fileno(stdin))) return;
@@ -363,7 +363,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
     progress_emit_line(pct, in_s, out_s, rate_s, last_len);
   }
-  // Final sample
+  // Final sample (no newline  the completion summary will overwrite this line)
   uint64_t in  = m->read_bytes.load();
   uint64_t out = m->wrote_bytes.load();
   auto dt      = std::chrono::steady_clock::now() - m->t0;
@@ -376,7 +376,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
   size_t last_len2 = 0;
   progress_emit_line(pct, in_s, out_s, rate_s, last_len2);
-  std::fprintf(stderr, "\n");
+  // No \n here  the completion summary overwrites this line with \r
 }
 
 /*======================================================================
@@ -507,11 +507,22 @@ static void writer_thread(FILE * out, ResultStore & results, const Options & opt
 /*======================================================================
  CPU compression helpers / workers
 ======================================================================*/
+// Thread-local CCtx avoids repeated allocation for per-chunk compression
+static thread_local ZSTD_CCtx * tl_cctx = nullptr;
+
 static inline void compress_one_cpu_frame(const void * src, size_t src_size, int level, std::vector< char > & out)
 {
+  if (!tl_cctx) {
+    tl_cctx = ZSTD_createCCtx();
+    if (!tl_cctx) die("failed to create ZSTD_CCtx");
+  }
+  // Set compression level explicitly on every call (level may differ per invocation)
+  size_t st = ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_compressionLevel, level);
+  if (ZSTD_isError(st)) die(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
+
   size_t bound = ZSTD_compressBound(src_size);
   out.resize(bound);
-  size_t csz = ZSTD_compress(out.data(), out.size(), src, src_size, level);
+  size_t csz = ZSTD_compress2(tl_cctx, out.data(), out.size(), src, src_size);
   if (ZSTD_isError(csz)) die(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
   out.resize(csz);
 }
@@ -519,7 +530,7 @@ static inline void compress_one_cpu_frame(const void * src, size_t src_size, int
 static void decompress_stream(FILE * in, FILE * out, const Options & opt, Meter * m = nullptr)
 {
   size_t chosen_mib = opt.chunk_mib;
-  if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (decompress): ") + std::to_string(chosen_mib) + " MiB"); }
+  if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (decompress): ") + std::to_string(chosen_mib) + " MiB\n"); }
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
   std::vector<char> inbuf(chunk_bytes);
   std::vector<char> outbuf(chunk_bytes);
@@ -564,7 +575,8 @@ public:
   }
   bool should_cpu_take() const {
     const uint64_t gpu = window_gpu_taken_.load(std::memory_order_relaxed);
-    if (gpu == 0) { return false; }
+    // If GPUs haven't processed anything yet (still initializing), let CPUs work freely
+    if (gpu == 0) { return true; }
     const uint64_t cpu = window_cpu_taken_.load(std::memory_order_relaxed);
     const uint64_t total = cpu + gpu + 1;
     const double used = double(cpu) / double(total);
@@ -633,7 +645,7 @@ static void cpu_worker(
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
-  if (opt->verbosity >= V_VERBOSE) { std::ostringstream os; os << "[CPU/T" << worker_id << "] online"; vlog(V_VERBOSE, *opt, os.str()); }
+  if (opt->verbosity >= V_TRACE) { std::ostringstream os; os << "[CPU/T" << worker_id << "] online"; vlog(V_TRACE, *opt, os.str() + "\n"); }
 
   while (true) {
 #ifdef HAVE_NVCOMP
@@ -665,7 +677,7 @@ static void cpu_worker(
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
     const size_t csz = out_frame.size();
 
-    if (opt->verbosity >= V_TRACE) {
+    if (opt->verbosity >= V_DEBUG) {
       char in_s[32], out_s[32];
       human_bytes(double(t.data.size()), in_s, sizeof(in_s));
       human_bytes(double(csz), out_s, sizeof(out_s));
@@ -675,7 +687,7 @@ static void cpu_worker(
          << " in=" << in_s << " out=" << out_s
          << " ms=" << std::fixed << std::setprecision(2) << ms
          << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
-      vlog(V_TRACE, *opt, os.str());
+      vlog(V_DEBUG, *opt, os.str() + "\n");
     }
 
     if (m) m->tasks_done.fetch_add(1);
@@ -695,13 +707,18 @@ static void cpu_worker(
 
   if (opt->verbosity >= V_DEBUG) {
     CpuThreadStats st; { std::lock_guard<std::mutex> lk(cpuagg->m); if ((size_t)worker_id < cpuagg->per_thread.size()) st = cpuagg->per_thread[(size_t)worker_id]; }
-    const double thr_gib = (st.comp_ms > 0.0) ? (double)st.in_bytes / (st.comp_ms/1000.0) / 1e9 : 0.0;
-    std::ostringstream os;
-    os << "[CPU/T" << worker_id << "] total tasks=" << st.tasks
-       << " in=" << st.in_bytes << "B out=" << st.out_bytes << "B"
-       << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
-       << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
-    vlog(V_DEBUG, *opt, os.str());
+    if (st.tasks == 0) {
+      // Idle threads only shown at V_TRACE to avoid flooding
+      if (opt->verbosity >= V_TRACE) { std::ostringstream os; os << "[CPU/T" << worker_id << "] idle (0 tasks)"; vlog(V_TRACE, *opt, os.str() + "\n"); }
+    } else {
+      const double thr_gib = (st.comp_ms > 0.0) ? (double)st.in_bytes / (st.comp_ms/1000.0) / 1e9 : 0.0;
+      std::ostringstream os;
+      os << "[CPU/T" << worker_id << "] total tasks=" << st.tasks
+         << " in=" << st.in_bytes << "B out=" << st.out_bytes << "B"
+         << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
+         << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
+      vlog(V_DEBUG, *opt, os.str() + "\n");
+    }
   }
 }
 
@@ -713,16 +730,16 @@ static void cpu_worker_rescue(
   Meter * /*m*/,
   CpuAgg * cpuagg)
 {
-  if (opt->verbosity >= V_VERBOSE) { std::ostringstream os; os << "[RESCUE/T" << worker_id << "] online"; vlog(V_VERBOSE, *opt, os.str()); }
+  if (opt->verbosity >= V_TRACE) { std::ostringstream os; os << "[RESCUE/T" << worker_id << "] online"; vlog(V_TRACE, *opt, os.str() + "\n"); }
   while (true) {
     Task t; if (!rq->pop_one(t)) break;
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> out_frame; compress_one_cpu_frame(t.data.data(), t.data.size(), /*level*/3, out_frame);
+    std::vector<char> out_frame; compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, out_frame);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
     const size_t csz = out_frame.size();
     if (opt->verbosity >= V_TRACE) {
-      char in_s[32], out_s[32]; human_bytes(double(t.data.size()), in_s, sizeof(in_s)); human_bytes(double(csz), out_s, sizeof(out_s)); double thr_gib=(ms>0.0)?(double)t.data.size()/(ms/1000.0)/1e9:0.0; std::ostringstream os; os<<"[RESCUE/T"<<worker_id<<"] seq="<<t.seq<<" in="<<in_s<<" out="<<out_s<<" ms="<<std::fixed<<std::setprecision(2)<<ms<<" thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_TRACE, *opt, os.str()); }
+      char in_s[32], out_s[32]; human_bytes(double(t.data.size()), in_s, sizeof(in_s)); human_bytes(double(csz), out_s, sizeof(out_s)); double thr_gib=(ms>0.0)?(double)t.data.size()/(ms/1000.0)/1e9:0.0; std::ostringstream os; os<<"[RESCUE/T"<<worker_id<<"] seq="<<t.seq<<" in="<<in_s<<" out="<<out_s<<" ms="<<std::fixed<<std::setprecision(2)<<ms<<" thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_TRACE, *opt, os.str() + "\n"); }
     { std::lock_guard<std::mutex> lk(results->m); results->data.emplace(t.seq, std::move(out_frame)); }
     results->cv.notify_one();
     { std::lock_guard<std::mutex> lk(cpuagg->m); if (cpuagg->per_thread.size() <= (size_t)worker_id) cpuagg->per_thread.resize((size_t)worker_id + 1); auto & st = cpuagg->per_thread[(size_t)worker_id]; st.tasks += 1; st.in_bytes += t.data.size(); st.out_bytes += csz; st.comp_ms += ms; }
@@ -735,11 +752,16 @@ static void cpu_worker_rescue(
 static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   size_t chosen_mib = opt.chunk_mib;
-  if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (CPU): ") + std::to_string(chosen_mib) + " MiB"); }
+  if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (CPU): ") + std::to_string(chosen_mib) + " MiB\n"); }
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   uint64_t total_in = 0; if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)) total_in = (uint64_t)fs::file_size(opt.input);
   std::atomic<bool> progress_done{false}; std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
+
+  ZSTD_CCtx * cctx = ZSTD_createCCtx();
+  if (!cctx) die("failed to create ZSTD_CCtx");
+  size_t st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
+  if (ZSTD_isError(st)) die(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
 
   std::vector< char > inbuf(chunk_bytes);
   std::vector< char > outbuf(ZSTD_compressBound(chunk_bytes));
@@ -747,13 +769,14 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
     size_t n = std::fread(inbuf.data(), 1, chunk_bytes, in);
     if (n == 0) break;
     if (m) m->read_bytes.fetch_add(n);
-    size_t csz = ZSTD_compress(outbuf.data(), outbuf.size(), inbuf.data(), n, opt.level);
+    size_t csz = ZSTD_compress2(cctx, outbuf.data(), outbuf.size(), inbuf.data(), n);
     if (ZSTD_isError(csz)) die(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
     size_t w = robust_fwrite(outbuf.data(), csz, out);
     if (w != csz) die("short write to output (broken pipe?)");
     if (m) m->wrote_bytes.fetch_add(w);
   }
 
+  ZSTD_freeCCtx(cctx);
   progress_done = true; progress_thr.join();
 }
 
@@ -764,13 +787,13 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // Option A: if single-threaded, use simple streaming helper
   if (threads == 1) {
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "CPU MT requested with 1 thread; using single-thread streaming path");
+      vlog(V_VERBOSE, opt, "CPU MT requested with 1 thread; using single-thread streaming path\n");
     compress_cpu_stream(in, out, opt, m);
     return;
   }
 
   CpuAgg cpuagg{}; cpuagg.threads = threads; cpuagg.per_thread.resize((size_t)threads);
-  size_t chosen_mib = opt.chunk_mib; if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (CPU-MT): ") + std::to_string(chosen_mib) + " MiB"); }
+  size_t chosen_mib = opt.chunk_mib; if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_cpu(in, opt); vlog(V_VERBOSE,opt, std::string("auto-chunk (CPU-MT): ") + std::to_string(chosen_mib) + " MiB\n"); }
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   uint64_t total_in = 0; if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)) total_in = (uint64_t)fs::file_size(opt.input);
@@ -785,6 +808,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     nullptr,
 #endif
     &cpuagg);
+  if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
 
   std::vector<char> host_in(host_chunk); std::atomic<size_t> seq{0};
   while (true) {
@@ -956,7 +980,7 @@ static void gpu_worker(
         C.per_stream_batch = std::max<size_t>(1, C.per_stream_batch/2);
       }
       C.stats.dev_index = size_t(device_id); C.stats.stream_index = s;
-      if (opt.verbosity >= V_VERBOSE) { std::ostringstream os; os << "[GPU"<<device_id<<"/S"<<s<<"] subchunk="<<(gpu_chunk/ONE_MIB)<<"MiB batch="<<C.per_stream_batch; vlog(V_VERBOSE,opt, os.str()); }
+      if (opt.verbosity >= V_DEBUG) { std::ostringstream os; os << "[GPU"<<device_id<<"/S"<<s<<"] subchunk="<<(gpu_chunk/ONE_MIB)<<"MiB batch="<<C.per_stream_batch; vlog(V_DEBUG,opt, os.str() + "\n"); }
     }
 
     bool producer_done_seen=false;
@@ -971,7 +995,7 @@ static void gpu_worker(
         size_t free_b=0,total_b=0;
         if (cudaMemGetInfo(&free_b,&total_b)==cudaSuccess && free_b>0) {
           size_t target = std::min<size_t>(std::min<size_t>(C.per_stream_batch*2, per_stream_cap), HARD_BATCH_CAP);
-          if (try_grow_stream(C, target, comp_opts, opt)) { if (opt.verbosity>=V_DEBUG) { std::ostringstream os; os<<"[GPU"<<device_id<<"] stream grew to batch="<<C.per_stream_batch; vlog(V_DEBUG,opt, os.str()); } }
+          if (try_grow_stream(C, target, comp_opts, opt)) { if (opt.verbosity>=V_DEBUG) { std::ostringstream os; os<<"[GPU"<<device_id<<"] stream grew to batch="<<C.per_stream_batch; vlog(V_DEBUG,opt, os.str() + "\n"); } }
         }
         C.last_adjust = now;
       }
@@ -988,7 +1012,7 @@ static void gpu_worker(
 
         // -vv: print take line
         if (opt.verbosity >= V_DEBUG) {
-          size_t seq_lo = C.batch.front().seq, seq_hi = C.batch.back().seq; uint64_t tin=0; for (size_t i=0;i<C.filled;++i) tin += C.batch[i].data.size(); char tin_s[32]; human_bytes(double(tin), tin_s, sizeof(tin_s)); std::ostringstream os; os << "[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] take N="<<C.filled<<" seq=["<<seq_lo<<".."<<seq_hi<<"] in="<<tin_s; vlog(V_DEBUG,opt, os.str()); }
+          size_t seq_lo = C.batch.front().seq, seq_hi = C.batch.back().seq; uint64_t tin=0; for (size_t i=0;i<C.filled;++i) tin += C.batch[i].data.size(); char tin_s[32]; human_bytes(double(tin), tin_s, sizeof(tin_s)); std::ostringstream os; os << "[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] take N="<<C.filled<<" seq=["<<seq_lo<<".."<<seq_hi<<"] in="<<tin_s; vlog(V_DEBUG,opt, os.str() + "\n"); }
 
         cudaEventRecord(C.ev_h2d_begin, C.stream);
         for (size_t i=0;i<C.filled;++i) {
@@ -1042,7 +1066,7 @@ static void gpu_worker(
 
           // -vv: done line
           if (opt.verbosity >= V_DEBUG) {
-            char in_s[32], out_s[32]; human_bytes(double(in_sum), in_s, sizeof(in_s)); human_bytes(double(out_sum), out_s, sizeof(out_s)); double thr_gib = (tot_ms>0.0)? double(in_sum)/(tot_ms/1000.0)/1e9 : 0.0; std::ostringstream os; os<<"[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] done N="<<C.filled<<" in="<<in_s<<" out="<<out_s<<" h2d="<<std::fixed<<std::setprecision(2)<<h2d_ms<<"ms comp="<<comp_ms<<"ms d2h="<<d2h_ms<<"ms tot="<<tot_ms<<"ms thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_DEBUG,opt, os.str()); }
+            char in_s[32], out_s[32]; human_bytes(double(in_sum), in_s, sizeof(in_s)); human_bytes(double(out_sum), out_s, sizeof(out_s)); double thr_gib = (tot_ms>0.0)? double(in_sum)/(tot_ms/1000.0)/1e9 : 0.0; std::ostringstream os; os<<"[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] done N="<<C.filled<<" in="<<in_s<<" out="<<out_s<<" h2d="<<std::fixed<<std::setprecision(2)<<h2d_ms<<"ms comp="<<comp_ms<<"ms d2h="<<d2h_ms<<"ms tot="<<tot_ms<<"ms thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_DEBUG,opt, os.str() + "\n"); }
 
           C.busy=false; C.filled=0; C.batch.clear();
         } else if (q != cudaErrorNotReady) { checkCuda(q, "cudaStreamQuery"); }
@@ -1074,7 +1098,7 @@ static void gpu_worker(
           if (sched) sched->add_gpu_bytes(in_sum);
           #endif
           { C.stats.h2d_ms += h2d_ms; C.stats.comp_ms += comp_ms; C.stats.d2h_ms += d2h_ms; C.stats.total_ms += tot_ms; C.stats.in_bytes += in_sum; C.stats.out_bytes += out_sum; C.stats.batches += 1; C.stats.chunks += C.filled; }
-          if (opt.verbosity >= V_DEBUG) { char in_s[32], out_s[32]; human_bytes(double(in_sum), in_s, sizeof(in_s)); human_bytes(double(out_sum), out_s, sizeof(out_s)); double thr_gib = (tot_ms>0.0)? double(in_sum)/(tot_ms/1000.0)/1e9 : 0.0; std::ostringstream os; os<<"[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] done N="<<C.filled<<" in="<<in_s<<" out="<<out_s<<" h2d="<<std::fixed<<std::setprecision(2)<<h2d_ms<<"ms comp="<<comp_ms<<"ms d2h="<<d2h_ms<<"ms tot="<<tot_ms<<"ms thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_DEBUG,opt, os.str()); }
+          if (opt.verbosity >= V_DEBUG) { char in_s[32], out_s[32]; human_bytes(double(in_sum), in_s, sizeof(in_s)); human_bytes(double(out_sum), out_s, sizeof(out_s)); double thr_gib = (tot_ms>0.0)? double(in_sum)/(tot_ms/1000.0)/1e9 : 0.0; std::ostringstream os; os<<"[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] done N="<<C.filled<<" in="<<in_s<<" out="<<out_s<<" h2d="<<std::fixed<<std::setprecision(2)<<h2d_ms<<"ms comp="<<comp_ms<<"ms d2h="<<d2h_ms<<"ms tot="<<tot_ms<<"ms thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s"; vlog(V_DEBUG,opt, os.str() + "\n"); }
           C.busy=false; C.filled=0; C.batch.clear(); blocked=true; break;
         }
         if (!blocked) { std::this_thread::yield(); }
@@ -1091,7 +1115,7 @@ static void gpu_worker(
            << " in="<<C.stats.in_bytes<<"B out="<<C.stats.out_bytes<<"B"
            << " time="<<std::fixed<<std::setprecision(2)<<C.stats.total_ms<<"ms"
            << " thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s";
-        vlog(V_DEBUG, opt, os.str());
+        vlog(V_DEBUG, opt, os.str() + "\n");
       }
     }
 
@@ -1115,10 +1139,10 @@ static void gpu_worker(
 
 static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
-  int device_count=0; if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) { if (opt.gpu_only) die("GPU requested (--gpu-only) but no CUDA devices available"); vlog(V_VERBOSE,opt, "nvCOMP: no GPUs found; falling back to MT CPU"); compress_cpu_mt(in, out, opt, m); return; }
-  if (opt.verbosity >= V_VERBOSE && (opt.level_user_set || opt.fast_flag || opt.best_flag)) vlog(V_VERBOSE,opt, "note: GPU backend ignores CPU level flags; CPU frames in hybrid still honor level");
+  int device_count=0; if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) { if (opt.gpu_only) die("GPU requested (--gpu-only) but no CUDA devices available"); vlog(V_VERBOSE, opt, "nvCOMP: no GPUs found; falling back to MT CPU\n"); compress_cpu_mt(in, out, opt, m); return; }
+  if (opt.verbosity >= V_VERBOSE && (opt.level_user_set || opt.fast_flag || opt.best_flag)) vlog(V_VERBOSE, opt, "note: GPU uses fixed compression; CPU frames honor level " + std::to_string(opt.level) + "\n");
 
-  size_t chosen_mib = opt.chunk_mib; if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_gpu(in, opt, device_count); std::ostringstream os; os<<"auto-chunk (GPU,"<<device_count<<" devices): "<<chosen_mib<<" MiB"; vlog(V_VERBOSE,opt, os.str()); }
+  size_t chosen_mib = opt.chunk_mib; if (!opt.chunk_user_set) { chosen_mib = auto_chunk_mib_gpu(in, opt, device_count); std::ostringstream os; os<<"auto-chunk (GPU,"<<device_count<<" devices): "<<chosen_mib<<" MiB"; vlog(V_VERBOSE,opt, os.str() + "\n"); }
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   TaskQueue queue; RescueQueue rescue; ResultStore results; std::atomic<size_t> seq_counter{0};
@@ -1130,27 +1154,27 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m);
 
   std::unique_ptr<HybridSched> sched_ptr; HybridSched * sched=nullptr; std::atomic<bool> tick_done{false}; std::thread tick_thr;
-  if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) { sched_ptr = std::make_unique<HybridSched>(opt.cpu_share, /*cpu_threads*/0, device_count, opt); sched=sched_ptr.get(); tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched); if (opt.verbosity>=V_VERBOSE) { std::ostringstream os; os<<std::fixed<<std::setprecision(1)<<"Using hybrid mode: CPU share "<<((opt.cpu_share>=0.0)?(opt.cpu_share*100.0):(sched->target_share()*100.0))<<((opt.cpu_share>=0.0)?"% (fixed)":"% (adaptive)"); vlog(V_VERBOSE,opt, os.str()); } }
+  if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) { sched_ptr = std::make_unique<HybridSched>(opt.cpu_share, /*cpu_threads*/0, device_count, opt); sched=sched_ptr.get(); tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched); if (opt.verbosity>=V_VERBOSE) { std::ostringstream os; os<<std::fixed<<std::setprecision(1)<<"Using hybrid mode: CPU share "<<((opt.cpu_share>=0.0)?(opt.cpu_share*100.0):(sched->target_share()*100.0))<<((opt.cpu_share>=0.0)?"% (fixed)":"% (adaptive)"); vlog(V_VERBOSE,opt, os.str() + "\n"); } }
 
   // Rescue pool
   std::vector<std::thread> rescue_pool; { unsigned ths = std::max(1u, std::thread::hardware_concurrency()/2); rescue_pool.reserve(ths); for (unsigned i=0;i<ths;++i) rescue_pool.emplace_back(cpu_worker_rescue, (int)i, &rescue, &results, &opt, m, &cpuagg); }
+  if (opt.verbosity >= V_VERBOSE) { std::ostringstream os; os << "[RESCUE] " << std::max(1u, std::thread::hardware_concurrency()/2) << " rescue threads online"; vlog(V_VERBOSE, opt, os.str() + "\n"); }
 
-  // GPU workers
-  std::vector<std::thread> workers; workers.reserve(device_count); Options opt_for_workers = opt; opt_for_workers.chunk_mib = chosen_mib; std::vector<std::string> fatal_msgs(device_count);
-  for (int dev=0; dev<device_count; ++dev) workers.emplace_back(gpu_worker, dev, opt_for_workers, &queue, &rescue, &results, &per_dev[size_t(dev)], &json_sink, m, sched, &any_gpu_failed, &abort_on_failure, &fatal_msgs[size_t(dev)], &gpu_started);
-
-  // Warm GPUs before starting CPU pool
+  // In hybrid mode, start CPU pool BEFORE GPU workers so CPUs can compress
+  // early chunks while GPUs are still initializing (CUDA context, memory alloc).
+  // Once GPUs come online, the adaptive scheduler shifts work to them.
   std::vector<std::thread> cpu_pool; int cpu_threads=0;
   if (sched) {
-    if (opt.verbosity>=V_VERBOSE) vlog(V_VERBOSE,opt, "hybrid: warming GPUs for up to 500ms before starting CPU threads");
-    auto t0w = std::chrono::steady_clock::now();
-    while (!gpu_started.load(std::memory_order_acquire)) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); if (std::chrono::steady_clock::now() - t0w > std::chrono::milliseconds(500)) break; }
     cpu_threads = opt.cpu_threads; if (cpu_threads<=0) { unsigned hw=std::max(1u,std::thread::hardware_concurrency()); unsigned def=std::max(1u,hw/3); if (def>32u) def=32u; cpu_threads = def; }
-    if (!gpu_started.load(std::memory_order_acquire)) { if (opt.verbosity>=V_VERBOSE) vlog(V_VERBOSE,opt, "hybrid: GPUs not active after warm-up; limiting CPU threads to 8"); if (cpu_threads>8) cpu_threads=8; }
     cpuagg.threads = cpu_threads; cpuagg.per_thread.resize((size_t)cpu_threads);
-    if (opt.verbosity>=V_VERBOSE) { std::ostringstream os; os<<"hybrid: starting CPU pool: "<<cpu_threads<<" threads"; vlog(V_VERBOSE,opt, os.str()); }
+    if (opt.verbosity>=V_VERBOSE) { std::ostringstream os; os<<"hybrid: starting CPU pool: "<<cpu_threads<<" threads (GPUs initializing in background)"; vlog(V_VERBOSE,opt, os.str() + "\n"); }
     for (int i=0;i<cpu_threads;++i) cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &cpuagg);
   }
+
+  // GPU workers (init CUDA context, allocate memory, etc.  CPUs are already working)
+  std::vector<std::thread> workers; workers.reserve(device_count); Options opt_for_workers = opt; opt_for_workers.chunk_mib = chosen_mib; std::vector<std::string> fatal_msgs(device_count);
+  for (int dev=0; dev<device_count; ++dev) workers.emplace_back(gpu_worker, dev, opt_for_workers, &queue, &rescue, &results, &per_dev[size_t(dev)], &json_sink, m, sched, &any_gpu_failed, &abort_on_failure, &fatal_msgs[size_t(dev)], &gpu_started);
+  if (opt.verbosity >= V_VERBOSE) { std::ostringstream os; os << "[GPU] " << device_count << " device worker" << (device_count>1?"s":"") << " online"; vlog(V_VERBOSE, opt, os.str() + "\n"); }
 
   // Producer: read host chunks, split into <= gpu_chunk subchunks
   std::vector<char> host_in(host_chunk);
@@ -1229,20 +1253,25 @@ int main(int argc, char ** argv)
       register_tmp_file(opt.output); // arm cleanup to delete on failure
     }
   }
-  Meter meter; vlog(V_VERBOSE, opt, "gzstd starting...");
+  Meter meter; vlog(V_VERBOSE, opt, "gzstd starting...\n");
   if (opt.verbosity >= V_DEBUG && opt.mode == Mode::COMPRESS) {
     std::ostringstream os;
 #ifdef HAVE_NVCOMP
-    os << "compression level (CPU path): " << opt.level
-       << (opt.ultra && opt.level >= 20 ? " (ultra)" : "");
-    if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) {
-      os << "  [note: GPU backend ignores level; CPU frames use this level]";
+    if (opt.cpu_only) {
+      os << "compression level: " << opt.level
+         << (opt.ultra && opt.level >= 20 ? " (ultra)" : "");
+    } else if (opt.gpu_only) {
+      os << "compression: GPU (nvCOMP, fixed level)";
+    } else {
+      os << "compression level: " << opt.level
+         << (opt.ultra && opt.level >= 20 ? " (ultra)" : "")
+         << " (CPU frames); GPU uses fixed nvCOMP level";
     }
 #else
     os << "compression level: " << opt.level
        << (opt.ultra && opt.level >= 20 ? " (ultra)" : "");
 #endif
-    vlog(V_DEBUG, opt, os.str());
+    vlog(V_DEBUG, opt, os.str() + "\n");
   }
 
   std::atomic<bool> prog_done{false}; std::thread prog_thr; uint64_t total_in_for_progress=0;
@@ -1259,7 +1288,7 @@ int main(int argc, char ** argv)
     }
 #else
     if (opt.gpu_only) die_usage("This binary was built without nvCOMP; --gpu-only cannot be satisfied");
-    if (opt.hybrid) vlog(V_VERBOSE,opt, "Hybrid requested but not available in CPU-only build; using MT CPU.");
+    if (opt.hybrid) vlog(V_VERBOSE, opt, "Hybrid requested but not available in CPU-only build; using MT CPU.\n");
     compress_cpu_mt(in, out, opt, &meter);
     if (!opt.stats_json.empty()) { CpuAgg agg{}; agg.threads = (opt.cpu_threads>0?opt.cpu_threads: std::max(1,int(std::thread::hardware_concurrency())-1)); double elapsed = std::chrono::duration_cast< std::chrono::duration<double> >(std::chrono::steady_clock::now()-t0).count(); write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, agg); }
 #endif
@@ -1292,7 +1321,35 @@ int main(int argc, char ** argv)
     std::fclose(in);
   }
 
-  vlog(V_VERBOSE, opt, "done.");
+  // Print zstd-style completion summary with rate:
+  //   input_file : ratio% (input_size => output_size, output_file) @ rate/s
+  // The \r overwrites the progress bar; trailing spaces clear any leftover chars.
+  if (opt.verbosity >= V_DEFAULT && opt.mode == Mode::COMPRESS) {
+    uint64_t in_bytes  = meter.read_bytes.load();
+    uint64_t out_bytes = meter.wrote_bytes.load();
+    double ratio_pct = (in_bytes > 0) ? (double)out_bytes / (double)in_bytes * 100.0 : 0.0;
+    auto dt = std::chrono::steady_clock::now() - meter.t0;
+    double secs = std::chrono::duration_cast<std::chrono::duration<double>>(dt).count();
+    double rate = secs > 0 ? double(in_bytes) / secs : 0.0;
+    char in_s[64], out_s[64], rate_s[64];
+    human_bytes(double(in_bytes), in_s, sizeof(in_s));
+    human_bytes(double(out_bytes), out_s, sizeof(out_s));
+    human_bytes(rate, rate_s, sizeof(rate_s));
+    std::string in_name  = (opt.input == "-") ? "(stdin)" : opt.input;
+    std::string out_name = to_stdout ? "(stdout)" : opt.output;
+    char summary[512];
+    int slen = std::snprintf(summary, sizeof(summary),
+      "%s : %5.2f%% (%s => %s, %s) @ %s/s",
+      in_name.c_str(), ratio_pct, in_s, out_s, out_name.c_str(), rate_s);
+    if (slen < 0) slen = 0;
+    // Pad with spaces to overwrite any leftover progress bar characters
+    int pad = 120 - slen;
+    if (pad < 0) pad = 0;
+    std::fprintf(stderr, "\r%s%*s\n", summary, pad, "");
+    std::fflush(stderr);
+  }
+
+  vlog(V_VERBOSE, opt, "done.\n");
   return EXIT_OK;
 }
 
@@ -1330,7 +1387,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "-qq" || a == "--silent") opt.verbosity = V_SILENT;
     else if (a == "--progress") { opt.force_progress = true; if (opt.verbosity < V_DEFAULT) opt.verbosity = V_DEFAULT; }
     else if (a == "--no-progress") { opt.force_progress = false; if (opt.verbosity == V_DEFAULT) opt.verbosity = V_ERROR; }
-    else if (a.size() >= 2 && a[0] == '-') {
+    else if (a.size() >= 2 && a[0] == '-' && a[1] != '-') {
       bool all_digits = true;
       for (size_t k = 1; k < a.size(); ++k) { if (a[k] < '0' || a[k] > '9') { all_digits = false; break; } }
       if (all_digits) {
@@ -1417,6 +1474,15 @@ static Options parse_args(int argc, char ** argv)
   }
   if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die_usage("--gpu-only cannot be combined with --cpu-only or --hybrid");
   if (opt.cpu_only && opt.hybrid) die_usage("--cpu-only cannot be combined with --hybrid");
+
+#ifdef HAVE_NVCOMP
+  // Default to hybrid mode when nvCOMP is available, unless the user
+  // explicitly chose --gpu-only or --cpu-only.  This ensures CPU compression
+  // levels (-1..-19) always have an effect and CPUs can work during GPU init.
+  if (!opt.cpu_only && !opt.gpu_only && !opt.hybrid) {
+    opt.hybrid = true;
+  }
+#endif
 
   // Auto-lower verbosity when used as a pipe (both stdin and stdout are non-TTY)
   // but only if the user hasn't explicitly set verbosity via flags.
