@@ -115,6 +115,28 @@ if(USE_NVCOMP)
 endif()
 
 # =====================================================
+#          NVML (GPU utilization monitoring)
+# =====================================================
+set(HAVE_NVML FALSE)
+if(HAVE_NVCOMP AND CUDAToolkit_FOUND)
+  find_library(NVML_LIBRARY
+    NAMES nvidia-ml
+    HINTS ${CUDAToolkit_LIBRARY_DIR}
+          "/usr/lib/x86_64-linux-gnu"
+          "/usr/lib64"
+          "/usr/local/cuda/lib64/stubs"
+          "/usr/lib/x86_64-linux-gnu/nvidia/current"
+    PATH_SUFFIXES stubs)
+
+  if(NVML_LIBRARY)
+    set(HAVE_NVML TRUE)
+    message(STATUS "NVML found: ${NVML_LIBRARY}")
+  else()
+    message(STATUS "NVML (nvidia-ml) not found; GPU selection will use free-VRAM fallback")
+  endif()
+endif()
+
+# =====================================================
 #                     Target
 # =====================================================
 add_executable(gzstd gzstd.cpp)
@@ -125,6 +147,9 @@ if(HAVE_NVCOMP)
   target_compile_definitions(gzstd PRIVATE HAVE_NVCOMP)
   target_include_directories(gzstd PRIVATE ${NVCOMP_INCLUDE_DIR})
 endif()
+if(HAVE_NVML)
+  target_compile_definitions(gzstd PRIVATE HAVE_NVML)
+endif()
 
 # Linkage
 if(HAVE_NVCOMP)
@@ -133,6 +158,9 @@ if(HAVE_NVCOMP)
     Threads::Threads
     CUDA::cudart
     ${NVCOMP_LIBRARY})
+  if(HAVE_NVML)
+    target_link_libraries(gzstd PRIVATE ${NVML_LIBRARY})
+  endif()
 else()
   target_link_libraries(gzstd PRIVATE
     ZSTD::ZSTD
@@ -173,10 +201,14 @@ if(HAVE_NVCOMP)
   message(STATUS " GPU backend     : ENABLED (CUDA ${CUDAToolkit_VERSION})")
   message(STATUS " nvCOMP include  : ${NVCOMP_INCLUDE_DIR}")
   message(STATUS " nvCOMP library  : ${NVCOMP_LIBRARY}")
+  if(HAVE_NVML)
+    message(STATUS " NVML            : ${NVML_LIBRARY}")
+  else()
+    message(STATUS " NVML            : not found (free-VRAM fallback)")
+  endif()
 else()
   message(STATUS " GPU backend     : DISABLED")
 endif()
 message(STATUS " Zstd            : target ZSTD::ZSTD")
 message(STATUS " C++ Standard    : ${CMAKE_CXX_STANDARD}")
 message(STATUS "================================\n")
-

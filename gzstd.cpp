@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.9.62";
+static constexpr const char * GZSTD_VERSION = "0.9.83";
 //
 // Architecture overview:
 //
@@ -73,6 +73,9 @@ static constexpr const char * GZSTD_VERSION = "0.9.62";
 #ifdef HAVE_NVCOMP
  #include <cuda_runtime.h>
  #include <nvcomp/zstd.h>
+ #ifdef HAVE_NVML
+ #include <nvml.h>
+ #endif
 #endif
 
 namespace fs = std::filesystem;
@@ -154,12 +157,13 @@ static const size_t DEFAULT_CHUNK_MIB = 32;
 #ifdef HAVE_NVCOMP
 static const size_t GPU_SUBCHUNK_MAX = size_t(16) * ONE_MIB; // max GPU subchunk
 static const size_t DEFAULT_GPU_BATCH_CAP = 8;    // per device  smaller batches launch sooner
+static const size_t DEFAULT_GPU_DECOMP_BATCH_CAP = 256; // decompress benefits from large batches (less per-launch overhead)
 static const double DEFAULT_GPU_MEM_FRACTION = 0.60; // fraction of free VRAM to use
 static const size_t DEFAULT_GPU_STREAMS = 1;       // single stream avoids context-switch overhead
 static const size_t AUTO_HOST_CHUNK_MIN_MIB = 32;
 static const size_t AUTO_HOST_CHUNK_MAX_MIB = 512;
 static const double GROW_CHECK_SEC = 1.0;
-static const size_t HARD_BATCH_CAP = 256;         // per stream safety cap
+static const size_t HARD_BATCH_CAP = 1024;        // per stream safety cap
 #endif
 
 /*======================================================================
@@ -192,19 +196,22 @@ struct Options {
   bool cpu_only = false;
   bool gpu_only = false;
   bool hybrid = false;
-  int cpu_threads = 0;       // 0=auto
+  int cpu_threads = 0;       // 0=auto (capped at 96), -1=all threads (-T0)
   double cpu_share = -1;     // <0 adaptive (hybrid)
   size_t chunk_mib = DEFAULT_CHUNK_MIB;
   bool chunk_user_set = false;
   size_t cpu_backlog = 0;    // queue depth before CPU pops (hybrid)
+  size_t cpu_batch = 1;      // frames per CPU worker pop (default 1, higher reduces queue contention)
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
+  bool gpu_batch_user_set = false;
   double gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   size_t gpu_streams = DEFAULT_GPU_STREAMS;
   int gpu_devices = 0;            // 0=auto (all for compress, 1 for decompress)
   PinMode pin_mode = PinMode::AUTO;
 #endif
   std::string stats_json;
+  int sparse_mode = -1;           // -1=auto (file:on, stdout:off), 0=off, 1=on
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -262,6 +269,8 @@ static void print_help()
 " -k Keep input file after operation (default)\n"
 " --rm Remove input file after successful operation\n"
 " -f Force overwrite of output file\n"
+" --[no-]sparse Enable/disable sparse file support (skip zero blocks)\n"
+"               Default: enabled for file output, disabled for stdout\n"
 " -c Write to stdout\n"
 " -o, --output FILE  Explicit output path\n"
 " -1 .. -19 Compression level (CPU zstd; default: 3)\n"
@@ -278,7 +287,8 @@ static void print_help()
 " --stats-json <f> Write run statistics (JSON)\n"
 " --cpu-only Force CPU-only path (multithreaded, no GPU)\n"
 " --hybrid Enable hybrid CPU+GPU scheduling (default with GPU)\n"
-" -T, --threads N  CPU worker threads (0=auto). Forms -T N or -T# are accepted [CPU-only/hybrid]\n"
+" -T, --threads N  CPU worker threads (0=all cores, auto=96 max). -T N or -T# [CPU-only/hybrid]\n"
+" --cpu-batch N    Frames per CPU worker pop (default: 1, higher reduces queue contention)\n"
 " --cpu-share X Fixed CPU share [0..1], disables adaptation (hybrid)\n"
 " --cpu-backlog N Min queue depth before CPU pops (hybrid; 0=off)\n";
 #ifdef HAVE_NVCOMP
@@ -555,15 +565,272 @@ static size_t robust_fwrite(const void * ptr, size_t size, FILE * f)
 }
 
 /*======================================================================
+ O_DIRECT writer  bypasses page cache for faster sequential writes
+ -----------------------------------------------------------------------
+ O_DIRECT requires aligned buffers and aligned write sizes.  We accumulate
+ data in an aligned buffer and flush in aligned chunks.  The final partial
+ block is handled by dropping O_DIRECT for the last write (via fallback
+ to pwrite without the flag) or by ftruncate after aligned overwrite.
+
+ Used only for regular file output.  Pipes, stdout, and device files
+ fall back to standard fwrite via robust_fwrite.
+======================================================================*/
+#ifndef _WIN32
+class DirectWriter {
+public:
+  static constexpr size_t ALIGN = 4096;          // filesystem block alignment
+  static constexpr size_t FLUSH_SIZE = 4 * 1024 * 1024;  // flush every 4 MiB
+
+  DirectWriter() = default;
+  ~DirectWriter() { close(); }
+
+  // Open file with O_DIRECT.  Returns false if O_DIRECT not supported
+  // (caller should fall back to FILE*).
+  bool open(const std::string & path) {
+    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0666);
+    if (fd_ < 0) return false;
+    // Allocate aligned buffer
+    if (posix_memalign(&buf_, ALIGN, BUF_CAP) != 0) {
+      ::close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    buf_used_ = 0;
+    total_written_ = 0;
+    return true;
+  }
+
+  // Write data  accumulates in aligned buffer, flushes in aligned chunks
+  bool write(const void * data, size_t len) {
+    if (fd_ < 0) return false;
+    const char * src = static_cast<const char *>(data);
+    while (len > 0) {
+      size_t space = BUF_CAP - buf_used_;
+      size_t copy = std::min(len, space);
+      std::memcpy(static_cast<char*>(buf_) + buf_used_, src, copy);
+      buf_used_ += copy;
+      src += copy;
+      len -= copy;
+      if (buf_used_ >= FLUSH_SIZE) {
+        if (!flush_aligned()) return false;
+      }
+    }
+    return true;
+  }
+
+  // Finalize  flush remaining data (may need non-aligned final write)
+  bool finalize() {
+    if (fd_ < 0) return false;
+    if (buf_used_ == 0) return true;
+
+    size_t aligned = (buf_used_ / ALIGN) * ALIGN;
+    size_t tail = buf_used_ - aligned;
+
+    // Write aligned portion with O_DIRECT
+    if (aligned > 0) {
+      if (!write_all(buf_, aligned)) return false;
+      total_written_ += aligned;
+    }
+
+    // Write remaining tail without O_DIRECT
+    if (tail > 0) {
+      // Remove O_DIRECT flag for the final unaligned write
+      int flags = fcntl(fd_, F_GETFL);
+      if (flags >= 0) fcntl(fd_, F_SETFL, flags & ~O_DIRECT);
+      const char * tail_ptr = static_cast<char*>(buf_) + aligned;
+      if (!write_all(tail_ptr, tail)) return false;
+      total_written_ += tail;
+    }
+
+    buf_used_ = 0;
+    return true;
+  }
+
+  void close() {
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+    if (buf_) {
+      free(buf_);
+      buf_ = nullptr;
+    }
+  }
+
+  size_t total_bytes() const { return total_written_ + buf_used_; }
+  int fd() const { return fd_; }
+
+  // Seek forward by 'offset' bytes  for sparse file support.
+  // Flushes the internal buffer first to keep fd position and buffer in sync,
+  // then seeks the fd forward.  After this call, the next write() will
+  // resume at the new position.
+  bool seek_forward(size_t offset) {
+    if (fd_ < 0) return false;
+    // Flush any buffered data first
+    if (buf_used_ > 0) {
+      if (!flush_aligned()) return false;
+      // flush_aligned may leave a small unaligned tail in the buffer.
+      // For sparse seek we need the buffer fully empty so the fd position
+      // is authoritative.  Write any remaining tail without O_DIRECT.
+      if (buf_used_ > 0) {
+        int flags = fcntl(fd_, F_GETFL);
+        if (flags >= 0) fcntl(fd_, F_SETFL, flags & ~O_DIRECT);
+        if (!write_all(buf_, buf_used_)) return false;
+        if (flags >= 0) fcntl(fd_, F_SETFL, flags);  // restore O_DIRECT
+        total_written_ += buf_used_;
+        buf_used_ = 0;
+      }
+    }
+    // Now seek the fd forward
+    if (lseek(fd_, (off_t)offset, SEEK_CUR) < 0) return false;
+    total_written_ += offset;
+    return true;
+  }
+
+  // Direct pwrite  bypasses internal buffer.  For O_DIRECT, data and offset
+  // must be ALIGN-aligned, and len should be a multiple of ALIGN (except for
+  // the final write where we temporarily drop O_DIRECT).
+  // If source data is not aligned, copies through the internal aligned buffer.
+  bool direct_pwrite(const void * data, size_t len, off_t offset) {
+    if (fd_ < 0) return false;
+
+    // Check if source is aligned
+    bool src_aligned = ((uintptr_t)data % ALIGN == 0);
+    bool off_aligned = ((size_t)offset % ALIGN == 0);
+
+    if (src_aligned && off_aligned) {
+      // Fast path: source and offset are aligned
+      return direct_pwrite_raw(data, len, offset);
+    }
+
+    // Slow path: copy through aligned buffer
+    // Temporarily drop O_DIRECT and use regular pwrite
+    int flags = fcntl(fd_, F_GETFL);
+    if (flags >= 0) fcntl(fd_, F_SETFL, flags & ~O_DIRECT);
+    bool ok = pwrite_all(static_cast<const char*>(data), len, offset);
+    if (flags >= 0) fcntl(fd_, F_SETFL, flags);
+    return ok;
+  }
+
+private:
+  bool direct_pwrite_raw(const void * data, size_t len, off_t offset) {
+    const char * p = static_cast<const char *>(data);
+
+    // Aligned portion
+    size_t aligned = (len / ALIGN) * ALIGN;
+    if (aligned > 0) {
+      if (!pwrite_all(p, aligned, offset)) return false;
+      p += aligned;
+      offset += (off_t)aligned;
+      len -= aligned;
+    }
+
+    // Unaligned tail: temporarily drop O_DIRECT
+    if (len > 0) {
+      int flags = fcntl(fd_, F_GETFL);
+      if (flags >= 0) fcntl(fd_, F_SETFL, flags & ~O_DIRECT);
+      bool ok = pwrite_all(p, len, offset);
+      if (flags >= 0) fcntl(fd_, F_SETFL, flags);  // restore O_DIRECT
+      if (!ok) return false;
+    }
+    return true;
+  }
+
+private:
+  static constexpr size_t BUF_CAP = 16 * 1024 * 1024;  // 16 MiB aligned buffer
+
+  bool flush_aligned() {
+    // Flush as much as possible in aligned chunks
+    size_t aligned = (buf_used_ / ALIGN) * ALIGN;
+    if (aligned == 0) return true;
+    if (!write_all(buf_, aligned)) return false;
+    total_written_ += aligned;
+    // Move leftover tail to front
+    size_t tail = buf_used_ - aligned;
+    if (tail > 0)
+      std::memmove(buf_, static_cast<char*>(buf_) + aligned, tail);
+    buf_used_ = tail;
+    return true;
+  }
+
+  bool write_all(const void * data, size_t len) {
+    const char * p = static_cast<const char *>(data);
+    while (len > 0) {
+      ssize_t w = ::write(fd_, p, len);
+      if (w > 0) {
+        p += w;
+        len -= (size_t)w;
+      } else if (w < 0) {
+        if (errno == EINTR) continue;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool pwrite_all(const void * data, size_t len, off_t offset) {
+    const char * p = static_cast<const char *>(data);
+    while (len > 0) {
+      ssize_t w = ::pwrite(fd_, p, len, offset);
+      if (w > 0) {
+        p += w;
+        len -= (size_t)w;
+        offset += w;
+      } else if (w < 0) {
+        if (errno == EINTR) continue;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  int fd_ = -1;
+  void * buf_ = nullptr;
+  size_t buf_used_ = 0;
+  size_t total_written_ = 0;
+};
+#endif // _WIN32
+
+/*======================================================================
  Auto chunk selection
 ======================================================================*/
 // Choose a default chunk size for CPU compression.
 // Regular files get larger chunks (fewer tasks, less overhead);
 // pipes/streams use smaller chunks for lower latency.
+// Resolve CPU thread count from Options.
+//   -1 = all hardware threads (-T0 flag, like zstd)
+//    0 = auto (capped at 96 for efficiency  diminishing returns beyond that)
+//   >0 = user-specified exact count
+static int resolve_cpu_threads(int opt_threads)
+{
+  unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+  if (opt_threads == -1)
+    return (int)hw;                         // -T0: use every thread
+  if (opt_threads > 0)
+    return opt_threads;                     // explicit -T N
+  // Auto: use hw-1 (leave one for I/O), capped at 96
+  int def = (hw > 1) ? (int)(hw - 1) : 1;
+  return std::min(def, 96);
+}
+
 static size_t auto_chunk_mib_cpu(FILE * in, const Options & opt)
 {
   (void)opt;
-  return is_regular_file_stream(in) ? size_t(64) : size_t(32);
+  if (!is_regular_file_stream(in))
+    return 32;  // pipes: smaller chunks for lower latency
+
+  // Scale chunk size with file size for better CPU efficiency.
+  // Larger chunks = fewer tasks = less scheduling overhead.
+  // But not too large or single-thread latency suffers.
+  uint64_t fsize = 0;
+  struct stat st;
+  if (fstat(fileno(in), &st) == 0 && S_ISREG(st.st_mode))
+    fsize = (uint64_t)st.st_size;
+
+  if (fsize > 100ULL * 1024 * 1024 * 1024)  return 128;  // > 100 GiB
+  if (fsize > 10ULL * 1024 * 1024 * 1024)   return 96;   // > 10 GiB
+  if (fsize > 1ULL * 1024 * 1024 * 1024)    return 64;   // > 1 GiB
+  return 32;                                               // <= 1 GiB
 }
 #ifdef HAVE_NVCOMP
 #if __cplusplus >= 201703L
@@ -733,6 +1000,12 @@ struct PerfCounters {
 // All instrumentation checks `if (g_perf)` before recording.
 static PerfCounters * g_perf = nullptr;
 
+// Global DirectWriter pointer  set when O_DIRECT output is active.
+// Writer thread checks this to decide between DirectWriter and fwrite.
+#ifndef _WIN32
+static DirectWriter * g_direct_writer = nullptr;
+#endif
+
 class TaskQueue {
 public:
   void push(Task && t)
@@ -745,10 +1018,33 @@ public:
 
   // Pop up to max_n tasks at once (used by GPU workers to fill a batch).
   // Returns false when the queue is drained (empty + done).
-  bool pop_batch(size_t max_n, std::vector<Task> & out)
+  // Pop up to max_n tasks at once (used by GPU workers to fill a batch).
+  // If min_n > 0, waits until at least min_n tasks are queued (or producer done).
+  bool pop_batch(size_t max_n, std::vector<Task> & out, size_t min_n = 0)
   {
     std::unique_lock<std::mutex> lk(m_);
-    while (q_.empty() && !done_) cv_.wait(lk);
+    // Wait for at least min_n items (or done signal)
+    while ((q_.size() < min_n && !done_) || (q_.empty() && !done_))
+      cv_.wait(lk);
+    if (q_.empty() && done_) return false;
+
+    const size_t take = std::min(max_n, q_.size());
+    out.reserve(out.size() + take);
+    for (size_t i = 0; i < take; ++i) {
+      out.push_back(std::move(q_.front()));
+      q_.pop_front();
+    }
+    return true;
+  }
+
+  // Greedy pop: wait until the queue has max_n items OR producer is done,
+  // then take everything available up to max_n.  This maximizes batch size
+  // for GPU kernels where per-launch overhead is expensive.
+  bool pop_batch_greedy(size_t max_n, std::vector<Task> & out)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    while (q_.size() < max_n && !done_)
+      cv_.wait(lk);
     if (q_.empty() && done_) return false;
 
     const size_t take = std::min(max_n, q_.size());
@@ -865,20 +1161,203 @@ struct ResultStore {
 // Writer thread: waits for compressed frames to appear in sequence order,
 // then writes them to the output file.  This keeps the output deterministic
 // (frames in the same order as the input) regardless of which worker finishes first.
+/*======================================================================
+ Async write pool  double-buffered I/O to overlap compute with disk writes
+ -----------------------------------------------------------------------
+ The writer thread collects ready frames, then hands them to the write
+ pool instead of writing synchronously.  The pool uses a background
+ thread to flush data to disk while the writer thread goes back to
+ collecting the next batch.  This mirrors zstd's AIO_WritePool design.
+
+ Two slots alternate: while slot A is being written to disk by the
+ background thread, slot B is being filled by the writer thread.
+======================================================================*/
+class AsyncWritePool {
+public:
+  explicit AsyncWritePool(FILE * out_file, DirectWriter * dw, bool sparse = true)
+    : out_(out_file), dw_(dw), sparse_(sparse), done_(false)
+  {
+    worker_ = std::thread(&AsyncWritePool::worker_fn, this);
+  }
+
+  ~AsyncWritePool() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      done_ = true;
+    }
+    cv_producer_.notify_one();
+    if (worker_.joinable()) worker_.join();
+  }
+
+  // Submit a batch of data to be written asynchronously.
+  // Takes ownership of the data via move.  Blocks if the previous
+  // write hasn't finished yet (backpressure).
+  void submit(std::vector<std::vector<char>> && buffers) {
+    std::unique_lock<std::mutex> lk(m_);
+    // Wait for previous write to finish (backpressure)
+    cv_consumer_.wait(lk, [this]{ return pending_.empty() || done_; });
+    if (done_) return;
+    pending_ = std::move(buffers);
+    lk.unlock();
+    cv_producer_.notify_one();
+  }
+
+  // Wait for all queued writes to complete.
+  void flush() {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_consumer_.wait(lk, [this]{ return pending_.empty(); });
+  }
+
+  bool had_error() const { return error_; }
+
+private:
+  // Check if a region is all zeros (for sparse file support).
+  // Uses size_t-wide comparisons for speed.
+  static bool is_all_zero(const char * p, size_t len) {
+    // Check in size_t chunks for speed
+    const size_t * wp = reinterpret_cast<const size_t *>(p);
+    size_t words = len / sizeof(size_t);
+    for (size_t i = 0; i < words; ++i)
+      if (wp[i] != 0) return false;
+    // Check remaining bytes
+    for (size_t i = words * sizeof(size_t); i < len; ++i)
+      if (p[i] != 0) return false;
+    return true;
+  }
+
+  // Write a buffer with sparse file optimization.
+  // Scans for zero-filled blocks and seeks past them instead of writing.
+  // The OS creates a sparse file  zero regions don't consume disk space
+  // and aren't physically written, which can dramatically speed up output
+  // for data with large zero runs (e.g., disk images, memory dumps).
+  bool write_sparse(const char * data, size_t len, bool is_last_buffer = false) {
+    static constexpr size_t SPARSE_BLOCK = 4096;  // check in page-sized blocks
+
+    size_t pos = 0;
+    while (pos < len) {
+      size_t remain = len - pos;
+      size_t block = std::min(remain, SPARSE_BLOCK);
+
+      // Never sparse-skip the final block of the last buffer in a batch 
+      // the file must end with a physical write or it will be truncated.
+      bool at_end = is_last_buffer && (pos + block >= len);
+
+      if (sparse_ && !at_end && block == SPARSE_BLOCK && is_all_zero(data + pos, block)) {
+        // Skip this zero block via seek
+        if (dw_) {
+          if (!dw_->seek_forward(block)) return false;
+        } else if (out_) {
+          if (std::fseek(out_, (long)block, SEEK_CUR) != 0)
+            return false;
+        }
+        pos += block;
+        sparse_saved_ += block;
+      } else {
+        // Find how many consecutive non-zero (or partial) blocks to write at once
+        size_t write_end = pos + block;
+        while (write_end < len) {
+          size_t next_remain = len - write_end;
+          size_t next_block = std::min(next_remain, SPARSE_BLOCK);
+          if (next_block == SPARSE_BLOCK && is_all_zero(data + write_end, next_block))
+            break;  // next block is zero  stop here, let the seek handle it
+          write_end += next_block;
+        }
+
+        size_t to_write = write_end - pos;
+        if (dw_) {
+          if (!dw_->write(data + pos, to_write)) return false;
+        } else if (out_) {
+          size_t w = robust_fwrite(data + pos, to_write, out_);
+          if (w != to_write) return false;
+        }
+        pos = write_end;
+      }
+    }
+    return true;
+  }
+
+  void worker_fn() {
+    while (true) {
+      std::vector<std::vector<char>> work;
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_producer_.wait(lk, [this]{ return !pending_.empty() || done_; });
+        if (done_ && pending_.empty()) return;
+        work = std::move(pending_);
+      }
+      cv_consumer_.notify_one();  // signal that pending_ is now empty
+
+      // Write all buffers (last buffer's final block always written to ensure file length)
+      for (size_t bi = 0; bi < work.size(); ++bi) {
+        auto & buf = work[bi];
+        uint64_t w_t0 = g_perf ? now_ns() : 0;
+        bool is_last = (bi == work.size() - 1);
+        if (!write_sparse(buf.data(), buf.size(), is_last)) {
+          error_ = true;
+          return;
+        }
+        if (g_perf) {
+          g_perf->write_ns.fetch_add(now_ns() - w_t0);
+          g_perf->write_bytes_total.fetch_add(buf.size());
+        }
+      }
+    }
+  }
+
+  FILE * out_;
+  DirectWriter * dw_;
+  bool sparse_;
+  std::mutex m_;
+  std::condition_variable cv_producer_;
+  std::condition_variable cv_consumer_;
+  std::vector<std::vector<char>> pending_;
+  std::thread worker_;
+  bool done_;
+  bool error_ = false;
+  uint64_t sparse_saved_ = 0;  // bytes skipped via sparse seek
+};
+
 static void writer_thread(FILE * out, ResultStore & results,
                           const Options & opt, Meter * m)
 {
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   const bool skip_write = (opt.mode == Mode::TEST);
+
+  // Create async write pool for double-buffered I/O
+  AsyncWritePool * aio = nullptr;
+  std::unique_ptr<AsyncWritePool> aio_ptr;
+  if (!skip_write) {
+    // Sparse file support: skip zero-filled 4K blocks via seek.
+    // --sparse forces on, --no-sparse forces off, default auto (file:on, stdout:off).
+    bool enable_sparse;
+    if (opt.sparse_mode == 1) {
+      enable_sparse = true;  // --sparse: force on
+    } else if (opt.sparse_mode == 0) {
+      enable_sparse = false; // --no-sparse: force off
+    } else {
+      // Auto: enable for seekable file output (not pipes/stdout)
+      enable_sparse = (g_direct_writer != nullptr)   // O_DIRECT file
+                   || (out && out != stdout);          // regular file via fwrite
+    }
+#ifndef _WIN32
+    aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse);
+#else
+    aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse);
+#endif
+    aio = aio_ptr.get();
+  }
+
   std::unique_lock<std::mutex> lk(results.m);
 
   while (true) {
-    // Wait until the next sequential frame is available, or all work is done
     bool all_done = results.producer_done
                  && results.workers_done
                  && results.next_to_write >= results.total_tasks;
+
     uint64_t wait_t0 = g_perf ? now_ns() : 0;
     bool waited = false;
+
+    // Wait for the next sequential frame
     while (results.data.count(results.next_to_write) == 0 && !all_done) {
       waited = true;
       results.cv.wait(lk);
@@ -886,6 +1365,7 @@ static void writer_thread(FILE * out, ResultStore & results,
               && results.workers_done
               && results.next_to_write >= results.total_tasks;
     }
+
     if (g_perf && waited) {
       g_perf->writer_wait_ns.fetch_add(now_ns() - wait_t0);
       g_perf->writer_wait_count.fetch_add(1);
@@ -893,27 +1373,45 @@ static void writer_thread(FILE * out, ResultStore & results,
     }
     if (all_done) break;
 
-    auto it = results.data.find(results.next_to_write);
-    if (it == results.data.end()) continue;  // spurious wakeup
+    // Batch drain: collect ALL consecutive ready frames
+    std::vector<std::vector<char>> batch;
+    size_t batch_bytes = 0;
+    while (true) {
+      auto it = results.data.find(results.next_to_write);
+      if (it == results.data.end()) break;
+      batch_bytes += it->second.size();
+      batch.push_back(std::move(it->second));
+      results.data.erase(it);
+      ++results.next_to_write;
+    }
 
-    const std::vector<char> & buf = it->second;
+    if (batch.empty()) continue;
     lk.unlock();
 
-    // Write frame to output (skipped in test mode  integrity already verified)
-    if (!skip_write) {
-      uint64_t w_t0 = g_perf ? now_ns() : 0;
-      size_t w = robust_fwrite(buf.data(), buf.size(), out);
-      if (w != buf.size()) die("short write to output (broken pipe?)");
-      if (g_perf) {
-        g_perf->write_ns.fetch_add(now_ns() - w_t0);
-        g_perf->write_bytes_total.fetch_add(buf.size());
+    // Submit to async write pool (non-blocking unless previous write still in flight)
+    if (aio) {
+      if (opt.verbosity >= V_DEBUG) {
+        char bs[32];
+        human_bytes(double(batch_bytes), bs, sizeof(bs));
+        vlog(V_DEBUG, opt, std::string("[WRITER] submitting ") + std::to_string(batch.size())
+             + " frames (" + bs + ")\n");
       }
+      aio->submit(std::move(batch));
+      if (aio->had_error()) die("async write failed (disk full?)");
     }
-    if (m) m->wrote_bytes.fetch_add(buf.size());
+    if (m) m->wrote_bytes.fetch_add(batch_bytes);
 
     lk.lock();
-    results.data.erase(it);
-    ++results.next_to_write;
+  }
+
+  // Flush remaining async writes
+  if (aio) {
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "writer: flushing remaining output to disk...\n");
+    aio->flush();
+    if (aio->had_error()) die("async write failed (disk full?)");
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "writer: flush complete\n");
   }
 }
 
@@ -960,8 +1458,16 @@ static void decompress_from_buffer(const std::vector<char> & input,
       die(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
     if (zout.pos > 0) {
       if (opt.mode != Mode::TEST) {
-        size_t w = robust_fwrite(outbuf.data(), zout.pos, out);
-        if (w != zout.pos) die("short write to output (broken pipe?)");
+#ifndef _WIN32
+        if (g_direct_writer) {
+          if (!g_direct_writer->write(outbuf.data(), zout.pos))
+            die("direct write failed (disk full?)");
+        } else
+#endif
+        {
+          size_t w = robust_fwrite(outbuf.data(), zout.pos, out);
+          if (w != zout.pos) die("short write to output (broken pipe?)");
+        }
       }
       if (m) m->wrote_bytes.fetch_add(zout.pos);
       zout.pos = 0;
@@ -997,97 +1503,101 @@ struct CpuAgg {
 ======================================================================*/
 class HybridSched {
 public:
-  HybridSched(double override_share, int /*cpu_threads*/, int /*gpu_devices*/,
+  HybridSched(double override_share, int /*cpu_threads*/, int gpu_devices,
               const Options & opt)
-    : opt_(opt)
+    : opt_(opt), gpu_device_count_(gpu_devices)
   {
     if (override_share >= 0.0) {
-      set_target_share(override_share);
-      adaptive_ = false;
-    } else {
-      // Start at 50%: neutral balance while we measure actual throughput.
-      // With faster ticks (300ms) and aggressive early convergence (alpha=0.5),
-      // the scheduler reaches the optimal share within ~1 second.
-      set_target_share(0.50);
-      adaptive_ = true;
+      fixed_mode_ = true;
+      fixed_cpu_share_ = override_share;
     }
-    window_cpu_taken_.store(0);
-    window_gpu_taken_.store(0);
-    cpu_bytes_.store(0);
-    gpu_bytes_.store(0);
-    last_tick_ = std::chrono::steady_clock::now();
-  }
-  // Decide whether a CPU worker should take the next chunk.
-  // Returns true if CPU's share of work so far is below the target share.
-  // If GPU hasn't processed anything yet (still initializing), always allow CPU.
-  bool should_cpu_take() const {
-    const uint64_t gpu = window_gpu_taken_.load(std::memory_order_relaxed);
-    if (gpu == 0) { return true; }  // GPUs still booting  let CPUs work freely
-    const uint64_t cpu = window_cpu_taken_.load(std::memory_order_relaxed);
-    const uint64_t total = cpu + gpu + 1;
-    const double used = double(cpu) / double(total);
-    const double tgt = share_.load(std::memory_order_relaxed) / 1000.0;
-    return used < (tgt + 0.02);  // 2% hysteresis to avoid thrashing
   }
 
-  // Counters: called by workers after taking/completing work
-  void mark_cpu_take(uint64_t n) { window_cpu_taken_.fetch_add(n, std::memory_order_relaxed); }
-  void mark_gpu_take(uint64_t n) { window_gpu_taken_.fetch_add(n, std::memory_order_relaxed); }
+  // CPU checks this before taking from the queue.
+  // If any GPU stream is waiting for data, CPU yields.
+  bool should_cpu_take(size_t /*queue_depth*/ = 0) const {
+    if (fixed_mode_) {
+      const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
+      const uint64_t gpu = gpu_taken_.load(std::memory_order_relaxed);
+      const uint64_t total = cpu + gpu + 1;
+      return (double(cpu) / double(total)) < (fixed_cpu_share_ + 0.02);
+    }
+
+    // Before any GPU is ready: CPU runs wild
+    if (!gpu_ready_.load(std::memory_order_acquire))
+      return true;
+
+    // If a GPU stream is waiting for data: CPU yields
+    if (gpus_waiting_.load(std::memory_order_acquire) > 0)
+      return false;
+
+    // No GPU is waiting  CPU can take
+    return true;
+  }
+
+  // GPU stream calls this when it's ready and waiting for data
+  void gpu_wants_data() { gpus_waiting_.fetch_add(1, std::memory_order_release); }
+
+  // GPU stream calls this after it has taken a batch from the queue
+  void gpu_got_data()   { gpus_waiting_.fetch_sub(1, std::memory_order_release); }
+
+  // Called by GPU workers once CUDA context is initialized
+  void set_gpu_ready() {
+    gpu_ready_.store(true, std::memory_order_release);
+    if (opt_.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt_, "GPU ready  semaphore scheduling active\n");
+  }
+
+  void mark_cpu_take(uint64_t n) { cpu_taken_.fetch_add(n, std::memory_order_relaxed); }
+  void mark_gpu_take(uint64_t n) { gpu_taken_.fetch_add(n, std::memory_order_relaxed); }
   void add_cpu_bytes(uint64_t b) { cpu_bytes_.fetch_add(b, std::memory_order_relaxed); }
   void add_gpu_bytes(uint64_t b) { gpu_bytes_.fetch_add(b, std::memory_order_relaxed); }
 
-  // Called periodically by the tick thread.  Measures CPU vs GPU throughput
-  // over the last window and adjusts the target CPU share.  Uses a faster
-  // convergence rate in the first few ticks to adapt quickly during GPU
-  // warm-up, then settles into a steadier EMA for stable operation.
+  // Tick runs for monitoring/logging
   void tick() {
-    if (!adaptive_) { return; }
+    if (fixed_mode_) return;
     const auto now = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_tick_).count();
-    if (secs < 0.3) { return; }  // tick every ~300ms for faster adaptation
+    if (secs < 0.5) return;
     last_tick_ = now;
+
     const uint64_t cpu_b = cpu_bytes_.exchange(0, std::memory_order_relaxed);
     const uint64_t gpu_b = gpu_bytes_.exchange(0, std::memory_order_relaxed);
     const double cpu_rate = cpu_b / std::max(1e-6, secs);
     const double gpu_rate = gpu_b / std::max(1e-6, secs);
-    double tgt = (cpu_rate + gpu_rate > 0.0) ? (cpu_rate / (cpu_rate + gpu_rate)) : 0.50;
-    // Clamp: always leave room for both CPU and GPU to contribute
-    if (tgt < 0.05) { tgt = 0.05; }
-    if (tgt > 0.95) { tgt = 0.95; }
-    const double cur = share_.load(std::memory_order_relaxed) / 1000.0;
-    // Fast convergence early (tick_count_ < 5), then slower steady-state EMA
-    ++tick_count_;
-    const double alpha = (tick_count_ <= 5) ? 0.5 : 0.3;
-    const double ema = (1.0 - alpha) * cur + alpha * tgt;
-    set_target_share(ema);
-    window_cpu_taken_.store(0, std::memory_order_relaxed);
-    window_gpu_taken_.store(0, std::memory_order_relaxed);
+
     if (opt_.verbosity >= V_DEBUG) {
-      std::ostringstream os; os << std::fixed << std::setprecision(3)
-        << "hybrid: tick cpu_rate=" << (cpu_rate/1e9) << " GiB/s"
-        << " gpu_rate=" << (gpu_rate/1e9) << " GiB/s"
-        << " target_cpu_share=" << (share_.load()/10.0) << "%";
+      std::ostringstream os;
+      os << std::fixed << std::setprecision(3)
+         << "hybrid: tick cpu_rate=" << (cpu_rate/1e9) << " GiB/s"
+         << " gpu_rate=" << (gpu_rate/1e9) << " GiB/s"
+         << " gpus_waiting=" << gpus_waiting_.load()
+         << " cpu_taken=" << cpu_taken_.load()
+         << " gpu_taken=" << gpu_taken_.load();
       std::cerr << os.str() << "\n";
     }
-  }
-  double target_share() const { return share_.load() / 1000.0; }
-private:
-  void set_target_share(double s)
-  {
-    if (s < 0.0) s = 0.0;
-    if (s > 1.0) s = 1.0;
-    share_.store(uint32_t(std::lround(s * 1000.0)), std::memory_order_relaxed);
+
+    cpu_taken_.store(0, std::memory_order_relaxed);
+    gpu_taken_.store(0, std::memory_order_relaxed);
   }
 
+  double target_share() const { return 0.5; }
+  bool is_gpu_ready() const { return gpu_ready_.load(std::memory_order_acquire); }
+
+private:
   const Options & opt_;
-  std::atomic<uint32_t> share_{500};              // target CPU share in permille (500 = 50%)
-  std::atomic<uint64_t> window_cpu_taken_{0};     // chunks taken by CPU in current window
-  std::atomic<uint64_t> window_gpu_taken_{0};     // chunks taken by GPU in current window
-  std::atomic<uint64_t> cpu_bytes_{0};            // bytes processed by CPU since last tick
-  std::atomic<uint64_t> gpu_bytes_{0};            // bytes processed by GPU since last tick
-  std::chrono::steady_clock::time_point last_tick_;
-  bool adaptive_ = true;                          // false when user specified fixed --cpu-share
-  uint32_t tick_count_ = 0;                       // number of ticks so far (for convergence rate)
+  int gpu_device_count_ = 0;
+  bool fixed_mode_ = false;
+  double fixed_cpu_share_ = -1.0;
+
+  std::atomic<bool> gpu_ready_{false};
+  std::atomic<int> gpus_waiting_{0};
+
+  std::atomic<uint64_t> cpu_taken_{0};
+  std::atomic<uint64_t> gpu_taken_{0};
+  std::atomic<uint64_t> cpu_bytes_{0};
+  std::atomic<uint64_t> gpu_bytes_{0};
+  std::chrono::steady_clock::time_point last_tick_ = std::chrono::steady_clock::now();
 };
 
 // Background thread that periodically calls sched->tick() to update the
@@ -1320,33 +1830,49 @@ static void cpu_decomp_worker(
 
   while (true) {
 #ifdef HAVE_NVCOMP
-    // In hybrid mode, respect the adaptive CPU/GPU share
+    // In hybrid mode: CPU runs wild before GPU ready, then yields to GPU
+    // unless queue is overflowing or CPU measured faster
     if (sched) {
-      if (!sched->should_cpu_take()) {
+      if (!sched->should_cpu_take(tq->size())) {
         if (tq->drained()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
     }
 #endif
-    Task t;
-    if (!tq->pop_one(t)) break;
-#ifdef HAVE_NVCOMP
-    if (sched) sched->mark_cpu_take(1);
-#endif
 
+    // Grab one or more frames depending on cpu_batch setting
+    std::vector<Task> tasks;
+    if (opt->cpu_batch > 1) {
+      if (!tq->pop_batch(opt->cpu_batch, tasks, opt->cpu_batch)) break;
+      if (tasks.empty()) {
+        if (tq->drained()) break;
+        continue;
+      }
+#ifdef HAVE_NVCOMP
+      if (sched) sched->mark_cpu_take(tasks.size());
+#endif
+    } else {
+      Task t;
+      if (!tq->pop_one(t)) break;
+#ifdef HAVE_NVCOMP
+      if (sched) sched->mark_cpu_take(1);
+#endif
+      tasks.push_back(std::move(t));
+    }
+
+    // Process all frames in this batch
+    for (auto & t : tasks) {
     const auto t0_w = std::chrono::steady_clock::now();
 
-    // Decompress this frame using the reusable thread-local context
     std::vector<char> out_buf(t.decomp_size);
-    const size_t comp_size = t.data.size();  // capture before freeing
+    const size_t comp_size = t.data.size();
     size_t actual = ZSTD_decompressDCtx(tl_dctx, out_buf.data(), out_buf.size(),
                                         t.data.data(), t.data.size());
     if (ZSTD_isError(actual))
       die(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
     out_buf.resize(actual);
 
-    // Free compressed data immediately  no longer needed, reduces memory pressure
     { std::vector<char>().swap(t.data); }
 
     const auto t1_w = std::chrono::steady_clock::now();
@@ -1374,8 +1900,6 @@ static void cpu_decomp_worker(
 
     if (m) m->read_bytes.fetch_add(comp_size);
 
-    // Deliver decompressed frame to the result store
-    // (wrote_bytes is tracked by the writer thread)
     {
       std::lock_guard<std::mutex> lk(results->m);
       results->data.emplace(t.seq, std::move(out_buf));
@@ -1395,6 +1919,7 @@ static void cpu_decomp_worker(
       st.out_bytes += actual;
       st.comp_ms  += ms;
     }
+    } // end for (auto & t : tasks)
   }
 }
 
@@ -1538,7 +2063,7 @@ static size_t stream_frames_to_queue(
 
       buf_off += frame_comp;
 
-      if (opt.verbosity >= V_TRACE) {
+      if (opt.verbosity >= V_TRACE && ((seq - 1) % 1000 == 0 || frame_comp > 100 * ONE_MIB)) {
         char cs[32], ds[32];
         human_bytes(double(frame_comp), cs, sizeof(cs));
         human_bytes(double(frame_decomp), ds, sizeof(ds));
@@ -1574,12 +2099,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) g_perf = &perf_local;
 
-  // Auto-detect thread count
-  int threads = opt.cpu_threads;
-  if (threads <= 0) {
-    unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    threads = (hw > 1) ? int(hw - 1) : 1;
-  }
+  int threads = resolve_cpu_threads(opt.cpu_threads);
 
   CpuAgg cpuagg{};
   cpuagg.threads = threads;
@@ -1702,14 +2222,38 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   std::vector< char > inbuf(chunk_bytes);
   std::vector< char > outbuf(ZSTD_compressBound(chunk_bytes));
   while (true) {
+    uint64_t rd_t0 = g_perf ? now_ns() : 0;
     size_t n = std::fread(inbuf.data(), 1, chunk_bytes, in);
+    if (g_perf && n > 0) {
+      g_perf->read_ns.fetch_add(now_ns() - rd_t0);
+      g_perf->read_bytes_total.fetch_add(n);
+    }
     if (n == 0) break;
     if (m) m->read_bytes.fetch_add(n);
+    uint64_t comp_t0 = g_perf ? now_ns() : 0;
     size_t csz = ZSTD_compress2(cctx, outbuf.data(), outbuf.size(), inbuf.data(), n);
     if (ZSTD_isError(csz)) die(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
-    size_t w = robust_fwrite(outbuf.data(), csz, out);
-    if (w != csz) die("short write to output (broken pipe?)");
-    if (m) m->wrote_bytes.fetch_add(w);
+    if (g_perf) {
+      g_perf->cpu_compute_ns.fetch_add(now_ns() - comp_t0);
+      g_perf->cpu_compute_count.fetch_add(1);
+      g_perf->cpu_compute_bytes.fetch_add(n);
+    }
+    uint64_t w_t0 = g_perf ? now_ns() : 0;
+#ifndef _WIN32
+    if (g_direct_writer) {
+      if (!g_direct_writer->write(outbuf.data(), csz))
+        die("direct write failed (disk full?)");
+    } else
+#endif
+    {
+      size_t w = robust_fwrite(outbuf.data(), csz, out);
+      if (w != csz) die("short write to output (broken pipe?)");
+    }
+    if (g_perf) {
+      g_perf->write_ns.fetch_add(now_ns() - w_t0);
+      g_perf->write_bytes_total.fetch_add(csz);
+    }
+    if (m) m->wrote_bytes.fetch_add(csz);
   }
 
   ZSTD_freeCCtx(cctx);
@@ -1722,18 +2266,17 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) g_perf = &perf_local;
 
-  // Auto-detect thread count: use (N-1) hardware threads, leaving one for I/O
-  int threads = opt.cpu_threads;
-  if (threads <= 0) {
-    unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    threads = (hw > 1) ? int(hw - 1) : 1;
-  }
+  int threads = resolve_cpu_threads(opt.cpu_threads);
 
   // Option A: if single-threaded, use simple streaming helper
   if (threads == 1) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "CPU MT requested with 1 thread; using single-thread streaming path\n");
     compress_cpu_stream(in, out, opt, m);
+    if (g_perf) {
+      g_perf->print_summary("CPU-ONLY COMPRESS (single-thread)");
+      g_perf = nullptr;
+    }
     return;
   }
 
@@ -2064,6 +2607,7 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
 
 static void gpu_worker(
   int device_id,
+  int slot_index,   // positional index into per_dev/json_sink arrays
   Options opt,
   TaskQueue * queue,
   RescueQueue * rescue,
@@ -2416,7 +2960,7 @@ static void gpu_worker(
     // Export per-stream stats for JSON output
     if (json_sink) {
       std::lock_guard<std::mutex> lk(json_sink->m);
-      auto & vec = json_sink->per_dev[size_t(device_id)];
+      auto & vec = json_sink->per_dev[size_t(slot_index)];
       for (size_t s = 0; s < ctxs.size(); ++s)
         vec.push_back(ctxs[s].stats);
     }
@@ -2469,6 +3013,224 @@ static void gpu_worker(
   }
 }
 
+// Select the best N GPUs by combining compute utilization and free VRAM.
+// Lower utilization is better; ties broken by more free memory.
+//
+// When NVML is available and we want fewer GPUs than total, we first
+// rank all devices via NVML (no CUDA contexts needed), then only call
+// cudaSetDevice on the winners.  This avoids creating throwaway CUDA
+// contexts on devices we won't use (~200ms each).
+static std::vector<int> select_best_gpus(int total_devices, int want,
+                                          const Options & opt)
+{
+  struct DevInfo {
+    int id;               // CUDA device index
+    size_t free_bytes;
+    unsigned gpu_util;    // 0-100%, lower is better
+    bool has_util;
+  };
+
+  want = std::min(want, total_devices);
+
+#ifdef HAVE_NVML
+  // Fast path: use NVML to rank without touching CUDA, then only probe winners
+  if (want < total_devices) {
+    bool nvml_ok = (nvmlInit_v2() == NVML_SUCCESS);
+    if (nvml_ok) {
+      // Build CUDA device index -> NVML info mapping.  cudaGetDeviceProperties
+      // is lightweight  reads cached driver data, no context creation.
+      struct NvmlInfo {
+        int cuda_id;
+        unsigned gpu_util;      // raw utilization 0-100
+        unsigned score;         // effective score (util + NUMA penalty)
+        size_t free_bytes;
+        int numa_node;          // derived from CPU affinity, -1 if unknown
+        bool has_data;
+      };
+      std::vector<NvmlInfo> infos(total_devices);
+
+      for (int d = 0; d < total_devices; ++d) {
+        infos[d] = {d, 100, 100, 0, -1, false};  // default: assume busy
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+          char pci_bus_id[32];
+          snprintf(pci_bus_id, sizeof(pci_bus_id), "%08x:%02x:%02x.0",
+                   prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+          nvmlDevice_t nvml_dev;
+          if (nvmlDeviceGetHandleByPciBusId_v2(pci_bus_id, &nvml_dev) == NVML_SUCCESS) {
+            nvmlUtilization_t util;
+            if (nvmlDeviceGetUtilizationRates(nvml_dev, &util) == NVML_SUCCESS)
+              infos[d].gpu_util = util.gpu;
+            nvmlMemory_t mem;
+            if (nvmlDeviceGetMemoryInfo(nvml_dev, &mem) == NVML_SUCCESS)
+              infos[d].free_bytes = mem.free;
+            // Get NUMA node via CPU affinity  first set bit determines node
+            unsigned long cpuSet = 0;
+            if (nvmlDeviceGetCpuAffinity(nvml_dev, 1, &cpuSet) == NVML_SUCCESS && cpuSet != 0) {
+              // Find first set bit to determine which CPU group
+              int first_cpu = __builtin_ctzl(cpuSet);
+              // Simple heuristic: CPUs 0-63 = NUMA 0, 64-127 = NUMA 1, etc.
+              // Works for 2-socket systems; for more sockets use first_cpu / (total_cpus / num_nodes)
+              infos[d].numa_node = first_cpu / 64;
+            }
+            infos[d].has_data = true;
+          }
+        }
+        infos[d].score = infos[d].gpu_util;
+      }
+      nvmlShutdown();
+
+      // NUMA penalty: if any GPU on a NUMA node is busy (util > 10%),
+      // add a penalty to all GPUs on that node to prefer the quieter node.
+      // This avoids PCIe root complex contention from co-located busy GPUs.
+      {
+        // Find max utilization per NUMA node
+        std::unordered_map<int, unsigned> numa_max_util;
+        for (auto & info : infos) {
+          if (info.numa_node >= 0 && info.has_data) {
+            auto it = numa_max_util.find(info.numa_node);
+            if (it == numa_max_util.end() || info.gpu_util > it->second)
+              numa_max_util[info.numa_node] = info.gpu_util;
+          }
+        }
+        // Apply penalty: half the max util on that node, capped so we don't
+        // exceed 100. This makes a 0% GPU on a node with a 30% neighbor
+        // score as 15%, losing to a 0% GPU on a fully idle node.
+        for (auto & info : infos) {
+          if (info.numa_node >= 0) {
+            auto it = numa_max_util.find(info.numa_node);
+            if (it != numa_max_util.end()) {
+              unsigned neighbor_busy = it->second;
+              // Don't penalize the busy GPU itself more (it already has high util)
+              if (info.gpu_util < neighbor_busy) {
+                unsigned penalty = neighbor_busy / 2;
+                info.score = std::min(100u, info.gpu_util + penalty);
+              }
+            }
+          }
+        }
+      }
+
+      // Sort by effective score ascending, then free VRAM descending
+      std::sort(infos.begin(), infos.end(),
+                [](const NvmlInfo & a, const NvmlInfo & b) {
+                  if (a.score != b.score) return a.score < b.score;
+                  return a.free_bytes > b.free_bytes;
+                });
+
+      std::vector<int> result;
+      for (int i = 0; i < want; ++i)
+        result.push_back(infos[i].cuda_id);
+
+      if (opt.verbosity >= V_VERBOSE && total_devices > 1) {
+        std::ostringstream os;
+        os << "GPU selection: using device";
+        if (want > 1) os << "s";
+        for (int i = 0; i < want; ++i) {
+          os << (i ? "," : " ") << infos[i].cuda_id;
+          os << " (" << infos[i].gpu_util << "% util";
+          if (infos[i].score != infos[i].gpu_util)
+            os << ", score=" << infos[i].score << " (NUMA penalty)";
+          os << ", N" << infos[i].numa_node;
+          os << ", " << (infos[i].free_bytes / (1024*1024)) << " MiB free)";
+        }
+        if (want < (int)infos.size()) {
+          os << "  skipped:";
+          for (int i = want; i < (int)infos.size(); ++i)
+            os << " " << infos[i].cuda_id << "("
+               << infos[i].gpu_util << "%"
+               << (infos[i].score != infos[i].gpu_util
+                   ? ",s=" + std::to_string(infos[i].score) : "")
+               << ",N" << infos[i].numa_node
+               << "," << (infos[i].free_bytes / (1024*1024)) << "MiB)";
+        }
+        vlog(V_VERBOSE, opt, os.str() + "\n");
+      }
+      return result;
+    }
+  }
+#endif
+
+  // Fallback / all-devices path: use CUDA + optional NVML
+  std::vector<DevInfo> devs;
+  devs.reserve(total_devices);
+
+#ifdef HAVE_NVML
+  bool nvml_ok = (nvmlInit_v2() == NVML_SUCCESS);
+#else
+  bool nvml_ok = false;
+#endif
+
+  for (int d = 0; d < total_devices; ++d) {
+    DevInfo info{d, 0, 0, false};
+    if (cudaSetDevice(d) == cudaSuccess) {
+      size_t free_b = 0, total_b = 0;
+      if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+        info.free_bytes = free_b;
+
+#ifdef HAVE_NVML
+      if (nvml_ok) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+          char pci_bus_id[32];
+          snprintf(pci_bus_id, sizeof(pci_bus_id), "%08x:%02x:%02x.0",
+                   prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+          nvmlDevice_t nvml_dev;
+          if (nvmlDeviceGetHandleByPciBusId_v2(pci_bus_id, &nvml_dev) == NVML_SUCCESS) {
+            nvmlUtilization_t util;
+            if (nvmlDeviceGetUtilizationRates(nvml_dev, &util) == NVML_SUCCESS) {
+              info.gpu_util = util.gpu;
+              info.has_util = true;
+            }
+          }
+        }
+      }
+#endif
+    }
+    devs.push_back(info);
+  }
+
+#ifdef HAVE_NVML
+  if (nvml_ok) nvmlShutdown();
+#endif
+
+  std::sort(devs.begin(), devs.end(),
+            [](const DevInfo & a, const DevInfo & b) {
+              if (a.has_util && b.has_util && a.gpu_util != b.gpu_util)
+                return a.gpu_util < b.gpu_util;
+              return a.free_bytes > b.free_bytes;
+            });
+
+  int n = std::min(want, (int)devs.size());
+  std::vector<int> result;
+  result.reserve(n);
+  for (int i = 0; i < n; ++i)
+    result.push_back(devs[i].id);
+
+  if (opt.verbosity >= V_VERBOSE && total_devices > 1) {
+    std::ostringstream os;
+    os << "GPU selection: using device";
+    if (n > 1) os << "s";
+    for (int i = 0; i < n; ++i) {
+      os << (i ? "," : " ") << devs[i].id;
+      os << " (";
+      if (devs[i].has_util) os << devs[i].gpu_util << "% util, ";
+      os << (devs[i].free_bytes / (1024*1024)) << " MiB free)";
+    }
+    if (n < (int)devs.size()) {
+      os << "  skipped:";
+      for (int i = n; i < (int)devs.size(); ++i) {
+        os << " " << devs[i].id << "(";
+        if (devs[i].has_util) os << devs[i].gpu_util << "%,";
+        os << (devs[i].free_bytes / (1024*1024)) << "MiB)";
+      }
+    }
+    vlog(V_VERBOSE, opt, os.str() + "\n");
+  }
+
+  return result;
+}
+
 static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // ---- Performance instrumentation (active at -vvv) ----
@@ -2486,6 +3248,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   }
 
   // Apply --gpu-devices limit (0 = all for compress)
+  const int total_hw_devices = device_count;
   if (opt.gpu_devices > 0 && opt.gpu_devices < device_count) {
     vlog(V_VERBOSE, opt, "limiting to " + std::to_string(opt.gpu_devices)
          + " of " + std::to_string(device_count) + " GPU devices\n");
@@ -2516,8 +3279,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<bool>   abort_on_failure{ opt.gpu_only };
   std::atomic<bool>   gpu_started{false};
 
-  std::vector<DevStats> per_dev(device_count);
-  StatsSink json_sink(device_count);
+  // Select GPUs before allocating per-device arrays
+  auto gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
+  const int gpu_count_early = (int)gpu_ids.size();
+
+  std::vector<DevStats> per_dev(gpu_count_early);
+  StatsSink json_sink(gpu_count_early);
   CpuAgg cpuagg{};
   cpuagg.threads = 0;
 
@@ -2579,17 +3346,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::vector<std::thread> cpu_pool;
   int cpu_threads = 0;
   if (sched) {
-    cpu_threads = opt.cpu_threads;
-    if (cpu_threads <= 0) {
-      // Use half the hardware threads for CPU workers in hybrid mode.
-      // This leaves headroom for: the reader thread, writer thread,
-      // GPU worker threads, progress/tick threads, and OS scheduling.
-      // The adaptive scheduler adjusts the *share* of work, not the
-      // thread count  too many threads starve the I/O pipeline.
-      unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-      unsigned def = std::max(4u, hw / 2);
-      cpu_threads = (int)def;
-    }
+    cpu_threads = resolve_cpu_threads(opt.cpu_threads);
     cpuagg.threads = cpu_threads;
     cpuagg.per_thread.resize((size_t)cpu_threads);
 
@@ -2604,23 +3361,24 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   }
 
   // ---- GPU workers (init CUDA context, allocate memory  CPUs already working) ----
+  const int gpu_count = gpu_count_early;
   std::vector<std::thread> workers;
-  workers.reserve(device_count);
+  workers.reserve(gpu_count);
   Options opt_for_workers = opt;
   opt_for_workers.chunk_mib = chosen_mib;
-  std::vector<std::string> fatal_msgs(device_count);
+  std::vector<std::string> fatal_msgs(gpu_count);
 
-  for (int dev = 0; dev < device_count; ++dev) {
-    workers.emplace_back(gpu_worker, dev, opt_for_workers,
+  for (int i = 0; i < gpu_count; ++i) {
+    workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
                          &queue, &rescue, &results,
-                         &per_dev[size_t(dev)], &json_sink, m, sched,
+                         &per_dev[size_t(i)], &json_sink, m, sched,
                          &any_gpu_failed, &abort_on_failure,
-                         &fatal_msgs[size_t(dev)], &gpu_started);
+                         &fatal_msgs[size_t(i)], &gpu_started);
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
-    os << "[GPU] " << device_count << " device worker"
-       << (device_count > 1 ? "s" : "") << " online";
+    os << "[GPU] " << gpu_count << " device worker"
+       << (gpu_count > 1 ? "s" : "") << " online";
     vlog(V_VERBOSE, opt, os.str() + "\n");
   }
 
@@ -2735,9 +3493,11 @@ static void gpu_decomp_worker(
     checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
 
     const size_t stream_count = std::max<size_t>(1, opt.gpu_streams);
-    const size_t per_stream_cap = std::max<size_t>(1,
-        std::min<size_t>((opt.gpu_batch_cap + stream_count - 1) / stream_count,
-                         HARD_BATCH_CAP));
+    // For decompress, gpu_batch_cap is PER STREAM (not divided across streams).
+    // Kernel launch overhead dominates, so each stream needs large batches.
+    // Compress divides across streams for VRAM management, but decompress
+    // frames are small (compressed) so VRAM isn't the bottleneck.
+    const size_t per_stream_cap = std::min(opt.gpu_batch_cap, HARD_BATCH_CAP);
 
     // We need to allocate per-stream buffers.  Unlike compression, we need
     // to handle variable decompressed sizes.  We pre-allocate based on the
@@ -2869,6 +3629,9 @@ static void gpu_decomp_worker(
 
     bool producer_done_seen = false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
+    // Signal scheduler that this GPU is ready for work
+    if (sched) sched->set_gpu_ready();
+
     while (true) {
       bool submitted_any = false;
 
@@ -2877,7 +3640,10 @@ static void gpu_decomp_worker(
         if (C.busy) continue;
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
-        if (!queue->pop_batch(per_stream_cap, C.batch)) {
+        // Signal scheduler: this GPU stream wants data (blocks CPU workers)
+        if (sched) sched->gpu_wants_data();
+        if (!queue->pop_batch_greedy(per_stream_cap, C.batch)) {
+          if (sched) sched->gpu_got_data();
           if (g_perf) {
             g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
             g_perf->queue_wait_count.fetch_add(1);
@@ -2885,6 +3651,8 @@ static void gpu_decomp_worker(
           producer_done_seen = true;
           continue;
         }
+        // Signal scheduler: this GPU stream got its data (unblocks CPU workers)
+        if (sched) sched->gpu_got_data();
         if (g_perf && C.batch.empty()) {
           g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
           g_perf->queue_wait_count.fetch_add(1);
@@ -3145,6 +3913,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   if (opt.verbosity >= V_TRACE) g_perf = &perf_local;
 
   // ---- Detect GPU devices ----
+  // Note: must use cudaGetDeviceCount (not NVML) because NVML sees all
+  // physical devices regardless of CUDA_VISIBLE_DEVICES masking.
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
     if (opt.gpu_only)
@@ -3157,9 +3927,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // Default (0) = 1 GPU for decompress: D2H transfer of the full
   // uncompressed data saturates PCIe; multiple GPUs share bandwidth
   // and are slower than a single GPU with full link speed.
+  const int total_hw_devices = device_count;
   if (device_count > 0) {
     int target = opt.gpu_devices;
-    if (target == 0) target = 1;  // auto default for decompress
+    if (target == 0) target = std::min(2, device_count);  // auto: 2 GPUs balances kernel parallelism vs PCIe contention
     if (target < device_count) {
       vlog(V_VERBOSE, opt, "decompress: using " + std::to_string(target)
            + " of " + std::to_string(device_count) + " GPU devices"
@@ -3196,12 +3967,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::vector<std::thread> cpu_pool;
   int cpu_threads = 0;
   if (sched || (device_count <= 0)) {
-    cpu_threads = opt.cpu_threads;
-    if (cpu_threads <= 0) {
-      unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-      unsigned def = std::max(4u, hw / 2);
-      cpu_threads = (int)def;
-    }
+    cpu_threads = resolve_cpu_threads(opt.cpu_threads);
     cpuagg.threads = cpu_threads;
     cpuagg.per_thread.resize((size_t)cpu_threads);
 
@@ -3216,19 +3982,22 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   // ---- GPU decompression workers ----
+  std::vector<int> gpu_ids;
   std::vector<std::thread> gpu_workers;
   std::vector<std::string> fatal_msgs;
   if (device_count > 0) {
-    fatal_msgs.resize(device_count);
-    for (int dev = 0; dev < device_count; ++dev) {
-      gpu_workers.emplace_back(gpu_decomp_worker, dev, opt,
+    gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
+    const int gpu_count = (int)gpu_ids.size();
+    fatal_msgs.resize(gpu_count);
+    for (int i = 0; i < gpu_count; ++i) {
+      gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], opt,
                                &queue, &rescue, &results, m, sched,
                                &any_gpu_failed, &abort_on_failure,
-                               &fatal_msgs[size_t(dev)]);
+                               &fatal_msgs[size_t(i)]);
     }
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
-      os << "[GPU-D] " << device_count << " device(s) online";
+      os << "[GPU-D] " << (int)gpu_ids.size() << " device(s) online";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
   }
@@ -3390,9 +4159,16 @@ int main(int argc, char ** argv)
       die("output exists (use -f to overwrite): " + opt.output);
     }
     if (exists && opt.force) {
-      // Atomic overwrite: write to .tmp, rename on success
-      out = open_output_atomic(opt.output, tmp);
-      use_atomic = true;
+      // Atomic overwrite: write to .tmp, rename on success.
+      // Skip for device/special files (e.g., /dev/null)  can't create .tmp there.
+      bool is_regular = fs::is_regular_file(opt.output);
+      if (is_regular) {
+        out = open_output_atomic(opt.output, tmp);
+        use_atomic = true;
+      } else {
+        out = std::fopen(opt.output.c_str(), "wb");
+        if (!out) die("cannot open output: " + opt.output);
+      }
     } else {
       // Direct write: write to final name, delete on failure
       out = std::fopen(opt.output.c_str(), "wb");
@@ -3400,6 +4176,37 @@ int main(int argc, char ** argv)
       register_tmp_file(opt.output); // arm cleanup to delete on failure
     }
   }
+
+  // Try O_DIRECT for regular file output (bypasses page cache for ~2-3x write speed).
+  // Falls back gracefully: pipes, stdout, device files, and filesystems without
+  // O_DIRECT support all use standard fwrite.
+#ifndef _WIN32
+  std::unique_ptr<DirectWriter> direct_writer;
+  if (!to_stdout && out != stdout) {
+    // Check if output is a regular file (not /dev/null, pipe, etc.)
+    std::string write_path = use_atomic ? tmp : opt.output;
+    struct stat st;
+    bool is_regular = (stat(write_path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
+    if (is_regular) {
+      auto dw = std::make_unique<DirectWriter>();
+      if (dw->open(write_path)) {
+        // Close the FILE*  DirectWriter owns the fd now
+        if (out) { std::fclose(out); out = nullptr; }
+        direct_writer = std::move(dw);
+        vlog(V_VERBOSE, opt, "using O_DIRECT for output (bypass page cache)\n");
+      }
+      // If O_DIRECT open fails (filesystem doesn't support it), keep using FILE*
+    }
+  }
+  DirectWriter * dw_ptr = direct_writer.get();
+#else
+  DirectWriter * dw_ptr = nullptr;
+#endif
+
+#ifndef _WIN32
+  g_direct_writer = dw_ptr;
+#endif
+
   Meter meter; vlog(V_VERBOSE, opt, "gzstd starting...\n");
   if (opt.verbosity >= V_DEBUG && opt.mode == Mode::COMPRESS) {
     std::ostringstream os;
@@ -3465,6 +4272,29 @@ int main(int argc, char ** argv)
 #endif
   } else {
     // Decompression / test mode
+
+    // Validate that input is actually a Zstd file by checking the magic number.
+    // Zstd frames start with 0xFD2FB528.  Skippable frames start with 0x184D2A5?.
+    // Catch this early to give a clear error instead of hanging or cryptic failures.
+    if (opt.input != "-") {
+      unsigned char magic[4] = {0};
+      size_t nr = std::fread(magic, 1, 4, in);
+      if (nr == 4) {
+        uint32_t m32 = 0;
+        std::memcpy(&m32, magic, 4);
+        bool is_zstd = (m32 == 0xFD2FB528u);
+        bool is_skip = ((m32 & 0xFFFFFFF0u) == 0x184D2A50u);
+        if (!is_zstd && !is_skip) {
+          die("not a Zstd file (bad magic: 0x"
+              + ([&]{ char h[16]; snprintf(h, sizeof(h), "%08X", m32); return std::string(h); })()
+              + "): " + opt.input
+              + "\n  hint: did you mean to compress? use: gzstd " + opt.input);
+        }
+      }
+      // Rewind so the actual decompressor sees the full stream
+      std::rewind(in);
+    }
+
 #ifdef HAVE_NVCOMP
     if (opt.cpu_only) {
       decompress_cpu_mt(in, out, opt, &meter);
@@ -3555,8 +4385,19 @@ int main(int argc, char ** argv)
       std::fprintf(stderr, "\r%s\033[K", flush_line);
       std::fflush(stderr);
     }
-    fsync_file(out);
-    std::fclose(out);
+    // Finalize DirectWriter (flush remaining data, handle unaligned tail)
+#ifndef _WIN32
+    if (g_direct_writer) {
+      if (!g_direct_writer->finalize())
+        die("failed to finalize O_DIRECT output");
+      g_direct_writer = nullptr;
+      direct_writer.reset();  // closes the fd
+    }
+#endif
+    if (out) {
+      fsync_file(out);
+      std::fclose(out);
+    }
     std::fclose(in);
     if (use_atomic) {
       // Atomic overwrite: rename .tmp to final output
@@ -3671,6 +4512,8 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "-k") opt.keep = true;
     else if (a == "--rm") { opt.remove_input = true; opt.keep = false; }
     else if (a == "-f") opt.force = true;
+    else if (a == "--sparse") opt.sparse_mode = 1;
+    else if (a == "--no-sparse") opt.sparse_mode = 0;
     else if (a == "-c") opt.to_stdout = true;
     else if (a == "-v") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
@@ -3701,14 +4544,21 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--ultra") { opt.ultra = true; }
     else if (a == "--cpu-only") opt.cpu_only = true;
     else if (a == "--hybrid") opt.hybrid = true;
-    else if (a.rfind("-T", 0) == 0 && a.size() > 2) { int th = std::stoi(a.substr(2)); opt.cpu_threads = th; }
+    else if (a.rfind("-T", 0) == 0 && a.size() > 2) {
+      std::string val = a.substr(2);
+      if (!val.empty() && val[0] == '=') val = val.substr(1);
+      if (val.empty()) die_usage("missing value for -T");
+      int th = std::stoi(val);
+      // -T0 means "use all available threads" (like zstd)
+      opt.cpu_threads = (th == 0) ? -1 : th;
+    }
     else if (a == "-T" || a == "--threads") {
       int th = 0;
       if (a == "-T" && i + 1 < argc)
         th = std::stoi(argv[++i]);
       else if (!parse_int_arg("threads", i, argc, argv, th))
         die_usage("missing value for --threads");
-      opt.cpu_threads = th;
+      opt.cpu_threads = (th == 0) ? -1 : th;
     }
     else if (a == "-o" || a == "--output") {
       if (i + 1 >= argc) die_usage("missing value for " + a);
@@ -3725,9 +4575,10 @@ static Options parse_args(int argc, char ** argv)
     else if (parse_str_arg("stats-json", i, argc, argv, opt.stats_json)) {}
     else if (parse_num_arg("chunk-size", i, argc, argv, opt.chunk_mib, &opt.chunk_user_set)) {}
     else if (parse_num_arg("cpu-backlog", i, argc, argv, opt.cpu_backlog, nullptr)) {}
+    else if (parse_num_arg("cpu-batch", i, argc, argv, opt.cpu_batch, nullptr)) {}
 #ifdef HAVE_NVCOMP
     else if (a == "--gpu-only") opt.gpu_only = true;
-    else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) {}
+    else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) { opt.gpu_batch_user_set = true; }
     else if (parse_double_arg("gpu-mem-frac", i, argc, argv, opt.gpu_mem_fraction)) {}
     else if (parse_num_arg("gpu-streams", i, argc, argv, opt.gpu_streams)) {}
     else if (parse_int_arg("gpu-devices", i, argc, argv, opt.gpu_devices)) {}
@@ -3768,6 +4619,27 @@ static Options parse_args(int argc, char ** argv)
 
 #ifdef HAVE_NVCOMP
   if (opt.gpu_batch_cap == 0) opt.gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
+  // Decompress benefits massively from large batches  nvCOMP kernel launch
+  // Decompress kernel has significant per-launch overhead (Huffman table setup,
+  // Decompress kernel has significant per-launch overhead (Huffman table setup,
+  // scratch allocation).  But very large batches delay the writer since it
+  // can't start until the batch finishes.  Auto-tune for ~4 batches total
+  // to balance kernel efficiency with GPU-writer overlap.
+  if (!opt.gpu_batch_user_set && (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST)) {
+    uint64_t input_size = 0;
+    if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
+      input_size = (uint64_t)fs::file_size(opt.input);
+    if (input_size > 0) {
+      size_t chunk = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+      size_t est_frames = std::max<size_t>(1, (size_t)(input_size / chunk) + 1);
+      size_t target_batches = 4;
+      size_t auto_batch = std::max<size_t>(16, est_frames / target_batches);
+      auto_batch = std::min(auto_batch, (size_t)512);  // auto caps at 512; user --gpu-batch can go to 1024
+      opt.gpu_batch_cap = auto_batch;
+    } else {
+      opt.gpu_batch_cap = 64;  // default for pipes/unknown size
+    }
+  }
   if (opt.gpu_streams == 0) opt.gpu_streams = DEFAULT_GPU_STREAMS;
   if (!(opt.gpu_mem_fraction > 0.0 && opt.gpu_mem_fraction < 1.0)) opt.gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   if (opt.gpu_mem_fraction < 0.10) opt.gpu_mem_fraction = 0.10;

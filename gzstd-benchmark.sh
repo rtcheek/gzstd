@@ -143,9 +143,9 @@ fi
 # Sweep GPU batch sizes
 if $SWEEP_BATCHES && $HAS_GPU && ! $CPU_ONLY; then
   if $QUICK; then
-    BATCH_SIZES="8 32 128"
+    BATCH_SIZES="8 64 256"
   else
-    BATCH_SIZES="4 8 16 32 64 128"
+    BATCH_SIZES="4 8 16 32 64 128 256 512 1024"
   fi
   for b in $BATCH_SIZES; do
     if ! $HYBRID_ONLY; then
