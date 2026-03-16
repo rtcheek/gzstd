@@ -9,7 +9,7 @@
 #   output_dir  Directory for test files (default: ./gzstd-testdata)
 #   size_mib    Approximate size of each file in MiB (default: 512)
 #======================================================================
-set -euo pipefail
+#set -euo pipefail
 
 OUTDIR="${1:-./gzstd-testdata}"
 SIZE_MIB="${2:-512}"

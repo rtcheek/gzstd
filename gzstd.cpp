@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.9.83";
+static constexpr const char * GZSTD_VERSION = "0.10.6";
 //
 // Architecture overview:
 //
@@ -157,12 +157,12 @@ static const size_t DEFAULT_CHUNK_MIB = 32;
 #ifdef HAVE_NVCOMP
 static const size_t GPU_SUBCHUNK_MAX = size_t(16) * ONE_MIB; // max GPU subchunk
 static const size_t DEFAULT_GPU_BATCH_CAP = 8;    // per device  smaller batches launch sooner
-static const size_t DEFAULT_GPU_DECOMP_BATCH_CAP = 256; // decompress benefits from large batches (less per-launch overhead)
+static const size_t DEFAULT_GPU_DECOMP_BATCH_CAP = 16;  // sweet spot: amortizes kernel launch without starving writer
 static const double DEFAULT_GPU_MEM_FRACTION = 0.60; // fraction of free VRAM to use
 static const size_t DEFAULT_GPU_STREAMS = 1;       // single stream avoids context-switch overhead
 static const size_t AUTO_HOST_CHUNK_MIN_MIB = 32;
 static const size_t AUTO_HOST_CHUNK_MAX_MIB = 512;
-static const double GROW_CHECK_SEC = 1.0;
+static const double GROW_CHECK_SEC = 0.3;  // auto-tune check interval (seconds)
 static const size_t HARD_BATCH_CAP = 1024;        // per stream safety cap
 #endif
 
@@ -201,7 +201,7 @@ struct Options {
   size_t chunk_mib = DEFAULT_CHUNK_MIB;
   bool chunk_user_set = false;
   size_t cpu_backlog = 0;    // queue depth before CPU pops (hybrid)
-  size_t cpu_batch = 1;      // frames per CPU worker pop (default 1, higher reduces queue contention)
+  size_t cpu_queue_min = 0;   // min queue depth before CPU workers activate (0=no threshold)
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   bool gpu_batch_user_set = false;
@@ -223,6 +223,7 @@ struct Options {
 static constexpr int V_SILENT  = 0;  // -qq: suppress everything including errors
 static constexpr int V_ERROR   = 1;  // -q:  errors only
 static constexpr int V_DEFAULT = 2;  // normal: progress bar, completion summary
+static constexpr int V_NORMAL  = 0;  // always shown (no -v needed)
 static constexpr int V_VERBOSE = 3;  // -v:  informational messages
 static constexpr int V_DEBUG   = 4;  // -vv: per-worker/batch detail
 static constexpr int V_TRACE   = 5;  // -vvv: per-chunk debug trace
@@ -288,7 +289,7 @@ static void print_help()
 " --cpu-only Force CPU-only path (multithreaded, no GPU)\n"
 " --hybrid Enable hybrid CPU+GPU scheduling (default with GPU)\n"
 " -T, --threads N  CPU worker threads (0=all cores, auto=96 max). -T N or -T# [CPU-only/hybrid]\n"
-" --cpu-batch N    Frames per CPU worker pop (default: 1, higher reduces queue contention)\n"
+" --cpu-batch N    Min queue depth before CPUs activate (0=immediate, keeps queue stocked for GPUs)\n"
 " --cpu-share X Fixed CPU share [0..1], disables adaptation (hybrid)\n"
 " --cpu-backlog N Min queue depth before CPU pops (hybrid; 0=off)\n";
 #ifdef HAVE_NVCOMP
@@ -867,6 +868,16 @@ static inline uint64_t now_ns() {
  -----------------------------------------------------------------------
  Thread-safe accumulation of wall-clock time spent in each pipeline phase.
  All times in nanoseconds (converted to seconds for display).
+
+ USAGE: A stack-local PerfCounters is created in each top-level function
+ (compress_cpu_mt, compress_nvcomp, decompress_cpu_mt, decompress_nvcomp)
+ and g_perf is pointed to it.  Worker threads check `if (g_perf)` before
+ recording.  After all workers join, print_summary() displays the results.
+
+ IMPORTANT: GPU workers may have MULTIPLE completion paths (async poll
+ and synchronous drain).  ALL paths must record to g_perf.  If counters
+ show zero despite GPU tasks completing, check that every completion
+ path includes g_perf recording  this has been a source of bugs.
 ======================================================================*/
 struct PerfCounters {
   // CUDA init (tracks the maximum across all GPU workers  this is the
@@ -944,25 +955,25 @@ struct PerfCounters {
             ns_to_s(read_ns), bytes_to_gib(read_bytes_total),
             rate_gibs(read_bytes_total, read_ns));
 
-    if (h2d_count > 0) {
+    if (h2d_count > 0 || sched_gpu_tasks > 0) {
       fprintf(stderr, "  H2D transfers:    %8.3f s  (%6.2f GiB, %5.2f GiB/s) [%llu] \n",
               ns_to_s(h2d_ns), bytes_to_gib(h2d_bytes),
               rate_gibs(h2d_bytes, h2d_ns),
               (unsigned long long)h2d_count.load());
     }
-    if (kernel_count > 0) {
+    if (kernel_count > 0 || sched_gpu_tasks > 0) {
       fprintf(stderr, "  GPU kernel:       %8.3f s  (%llu batches, %5.1f ms/batch)   \n",
               ns_to_s(kernel_ns),
               (unsigned long long)kernel_count.load(),
               (kernel_count > 0) ? ns_to_ms(kernel_ns) / kernel_count : 0.0);
     }
-    if (d2h_count > 0) {
+    if (d2h_count > 0 || sched_gpu_tasks > 0) {
       fprintf(stderr, "  D2H transfers:    %8.3f s  (%6.2f GiB, %5.2f GiB/s) [%llu] \n",
               ns_to_s(d2h_ns), bytes_to_gib(d2h_bytes),
               rate_gibs(d2h_bytes, d2h_ns),
               (unsigned long long)d2h_count.load());
     }
-    if (gpu_batch_count > 0) {
+    if (gpu_batch_count > 0 || sched_gpu_tasks > 0) {
       fprintf(stderr, "  GPU batch total:  %8.3f s  (%llu batches, %5.1f ms/batch)   \n",
               ns_to_s(gpu_batch_ns),
               (unsigned long long)gpu_batch_count.load(),
@@ -998,6 +1009,10 @@ struct PerfCounters {
 
 // Global perf counters  only non-null when -vvv is active.
 // All instrumentation checks `if (g_perf)` before recording.
+// Set once in the top-level compress/decompress function BEFORE worker
+// threads launch, and cleared AFTER all workers join.  Workers read this
+// pointer from any thread  it's set-once-read-many so no synchronization
+// needed beyond the thread-launch happens-before relationship.
 static PerfCounters * g_perf = nullptr;
 
 // Global DirectWriter pointer  set when O_DIRECT output is active.
@@ -1066,6 +1081,59 @@ public:
     t = std::move(q_.front());
     q_.pop_front();
     return true;
+  }
+
+  // Non-blocking batch pop: takes up to max_n frames if available.
+  // Returns number of frames taken (0 if queue was empty).
+  // Never blocks  used by CPU workers in hybrid mode to avoid
+  // competing with GPU workers for queue CV wakeups.
+  size_t try_pop_batch(size_t max_n, std::vector<Task> & out)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    if (q_.empty()) return 0;
+    const size_t take = std::min(max_n, q_.size());
+    out.reserve(out.size() + take);
+    for (size_t i = 0; i < take; ++i) {
+      out.push_back(std::move(q_.front()));
+      q_.pop_front();
+    }
+    return take;
+  }
+
+  // Non-blocking batch pop with minimum threshold.
+  // Returns 0 (takes nothing) if queue has fewer than min_n items AND
+  // producer is still running.  Once producer is done, takes whatever
+  // remains (even if < min_n) so no frames are stranded.
+  // This implements "--cpu-batch=N" semantics: don't give CPU any work
+  // unless N frames are available, except at end-of-file.
+  size_t try_pop_batch_min(size_t max_n, size_t min_n, std::vector<Task> & out)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    if (q_.empty()) return 0;
+    // If below threshold and producer still running, don't take anything
+    if (q_.size() < min_n && !done_) return 0;
+    // Take up to max_n
+    const size_t take = std::min(max_n, q_.size());
+    out.reserve(out.size() + take);
+    for (size_t i = 0; i < take; ++i) {
+      out.push_back(std::move(q_.front()));
+      q_.pop_front();
+    }
+    return take;
+  }
+
+  // Peek at the compression ratio of the front task without popping.
+  // Returns the ratio (compressed/decompressed) or -1.0 if queue is empty.
+  // Used by CPU decompress workers to detect trivially-compressed frames
+  // (ratio < 2%) that are faster to decompress on CPU than GPU because
+  // CPU avoids the PCIe D2H transfer overhead for near-zero output.
+  double peek_front_ratio()
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    if (q_.empty()) return -1.0;
+    const Task & front = q_.front();
+    if (front.decomp_size == 0) return -1.0;
+    return double(front.data.size()) / double(front.decomp_size);
   }
 
   // Signal that no more tasks will be pushed (producer is finished).
@@ -1499,7 +1567,27 @@ struct CpuAgg {
 
 #ifdef HAVE_NVCOMP
 /*======================================================================
- Hybrid scheduler  single definition placed before workers
+ Hybrid scheduler  GPU-priority semaphore model
+ -----------------------------------------------------------------------
+ Coordinates CPU and GPU workers sharing a single task queue.
+
+ DESIGN: GPUs get priority via a "gpus_waiting" semaphore:
+   - GPU stream calls gpu_wants_data() before popping → increments counter
+   - GPU stream calls gpu_got_data() after popping → decrements counter
+   - CPU workers check should_cpu_take():
+       * Before GPU ready: CPU runs wild (100%)
+       * gpus_waiting > 0: CPU yields (GPU needs data)
+       * gpus_waiting == 0: CPU takes (all GPUs busy processing)
+
+ This ensures GPUs are always fed first.  CPUs handle overflow when all
+ GPU streams are busy processing their batches.
+
+ The tick thread runs for monitoring/logging but does NOT control
+ scheduling  the semaphore handles that in real-time.
+
+ QUEUE INTERACTION: GPU workers use blocking pop_batch_greedy (waits for
+ full batch).  CPU workers use non-blocking try_pop_batch to avoid
+ competing with GPU for the queue's condition variable wakeups.
 ======================================================================*/
 class HybridSched {
 public:
@@ -1654,11 +1742,41 @@ static void cpu_worker(
       }
     }
 
+    // --cpu-batch=N sets a minimum queue depth before CPU workers activate.
+    // This keeps the queue stocked for GPUs.  Each CPU thread still takes
+    // one frame at a time (no batching benefit on CPU unlike GPU).
+    // At end-of-file, CPUs take whatever remains even if < threshold.
     Task t;
-    if (!tq->pop_one(t)) break;
 #ifdef HAVE_NVCOMP
-    if (sched) sched->mark_cpu_take(1);
+    if (sched) {
+      // Hybrid: non-blocking check of queue depth threshold
+      if (opt->cpu_queue_min > 0 && tq->size() < opt->cpu_queue_min && !tq->drained()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      std::vector<Task> tmp;
+      size_t got = tq->try_pop_batch(1, tmp);
+      if (got == 0) {
+        if (tq->drained()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      t = std::move(tmp[0]);
+      sched->mark_cpu_take(1);
+    } else
 #endif
+    {
+      // Non-hybrid (--cpu-only): blocking wait for threshold then take 1
+      if (opt->cpu_queue_min > 0) {
+        // Wait until queue has min frames or producer done
+        while (tq->size() < opt->cpu_queue_min && !tq->drained())
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (tq->drained() && tq->size() == 0) break;
+      }
+      if (!tq->pop_one(t)) break;
+    }
+
+    {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
     compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, out_frame);
@@ -1708,6 +1826,7 @@ static void cpu_worker(
       cpuagg->out_bytes += csz;
       cpuagg->comp_ms  += ms;
     }
+    } // end single-frame processing block
   }
 
   if (opt->verbosity >= V_DEBUG) {
@@ -1830,39 +1949,66 @@ static void cpu_decomp_worker(
 
   while (true) {
 #ifdef HAVE_NVCOMP
-    // In hybrid mode: CPU runs wild before GPU ready, then yields to GPU
-    // unless queue is overflowing or CPU measured faster
+    // In hybrid mode: GPU gets priority via semaphore.
+    // The pop section below handles the --cpu-batch threshold and
+    // trivially-compressed frame bypass (< 2% ratio).
     if (sched) {
       if (!sched->should_cpu_take(tq->size())) {
+        // GPU wants data  but still allow trivially compressed frames
+        // and queue overflow (handled in pop section below)
+        double ratio = tq->peek_front_ratio();
+        bool trivial = (ratio >= 0.0 && ratio < 0.02);
+        if (!trivial) {
+          if (tq->drained()) break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
+        // Trivial frame: fall through to pop
+      }
+    }
+#endif
+
+    // Grab frames respecting --cpu-batch threshold.
+    // --cpu-batch=N sets minimum queue depth before CPU workers activate.
+    // Exception: trivially-compressed frames (ratio < 2%) taken immediately.
+    // Each CPU thread takes one frame (no batching benefit on CPU).
+    Task t;
+#ifdef HAVE_NVCOMP
+    if (sched) {
+      double ratio = tq->peek_front_ratio();
+      bool trivial = (ratio >= 0.0 && ratio < 0.02);
+
+      if (!trivial && opt->cpu_queue_min > 0
+          && tq->size() < opt->cpu_queue_min && !tq->drained()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      std::vector<Task> tmp;
+      size_t got = tq->try_pop_batch(1, tmp);
+      if (got == 0) {
         if (tq->drained()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
-    }
-#endif
-
-    // Grab one or more frames depending on cpu_batch setting
-    std::vector<Task> tasks;
-    if (opt->cpu_batch > 1) {
-      if (!tq->pop_batch(opt->cpu_batch, tasks, opt->cpu_batch)) break;
-      if (tasks.empty()) {
-        if (tq->drained()) break;
-        continue;
+      t = std::move(tmp[0]);
+      sched->mark_cpu_take(1);
+      if (trivial && opt->verbosity >= V_DEBUG) {
+        std::ostringstream os;
+        os << "[CPU-D/T" << worker_id << "] trivial frame (ratio="
+           << std::fixed << std::setprecision(3) << (ratio * 100.0) << "%)";
+        vlog(V_DEBUG, *opt, os.str() + "\n");
       }
-#ifdef HAVE_NVCOMP
-      if (sched) sched->mark_cpu_take(tasks.size());
+    } else
 #endif
-    } else {
-      Task t;
+    {
+      if (opt->cpu_queue_min > 0) {
+        while (tq->size() < opt->cpu_queue_min && !tq->drained())
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (tq->drained() && tq->size() == 0) break;
+      }
       if (!tq->pop_one(t)) break;
-#ifdef HAVE_NVCOMP
-      if (sched) sched->mark_cpu_take(1);
-#endif
-      tasks.push_back(std::move(t));
     }
-
-    // Process all frames in this batch
-    for (auto & t : tasks) {
+    {
     const auto t0_w = std::chrono::steady_clock::now();
 
     std::vector<char> out_buf(t.decomp_size);
@@ -1919,7 +2065,7 @@ static void cpu_decomp_worker(
       st.out_bytes += actual;
       st.comp_ms  += ms;
     }
-    } // end for (auto & t : tasks)
+    } // end single-frame processing block
   }
 }
 
@@ -2459,6 +2605,30 @@ struct StreamCtx {
   size_t      filled = 0;             // subchunks in current batch
   StreamStats stats{};
   std::chrono::steady_clock::time_point last_adjust{ std::chrono::steady_clock::now() };
+
+  // Throughput-aware auto-tuning: continuously searches for the optimal
+  // batch size using a hill-climbing/binary-search approach.
+  //
+  // States:
+  //   EXPLORE: Try a new batch size, measure throughput
+  //   SETTLE:  Found a good size, use it.  Periodically probe to detect
+  //            changes in data characteristics (e.g., mixed tar archives).
+  //
+  // The tuner tracks throughput (GiB/s) at each tested batch size and
+  // binary-searches between known-good and known-bad sizes.
+  enum class TuneState { EXPLORE, SETTLE };
+  TuneState   tune_state = TuneState::EXPLORE;
+  size_t      tune_lo = 0;             // lower bound of search range
+  size_t      tune_hi = 0;             // upper bound (set to per_stream_cap)
+  size_t      tune_best_batch = 0;     // best batch size found so far
+  double      tune_best_thr = 0.0;     // throughput at best batch size
+  size_t      tune_prev_batch = 0;     // batch size we're measuring now
+  double      tune_prev_thr = 0.0;     // throughput at previous batch size
+  uint32_t    tune_batches_at_size = 0; // how many batches processed at current size
+  uint32_t    tune_settle_count = 0;   // ticks spent in SETTLE state
+  static constexpr uint32_t TUNE_MIN_BATCHES = 2;   // min ticks before judging throughput
+  static constexpr uint32_t TUNE_PROBE_INTERVAL = 15; // ticks in SETTLE before probing
+  bool        tune_tried_down = false;  // have we tried halving yet?
 };
 
 static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size_t gpu_chunk, size_t max_out_chunk, nvcompBatchedZstdCompressOpts_t comp_opts, const Options & opt)
@@ -2466,6 +2636,35 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   C.per_stream_batch = per_stream_batch;
   C.gpu_chunk = gpu_chunk;
   C.max_out_chunk = max_out_chunk;
+
+  // Pre-check: estimate total VRAM needed and compare to free memory.
+  // cudaMalloc can hang on some drivers if the request exceeds VRAM,
+  // so we fail fast here instead of letting the driver block.
+  {
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+
+    // Get actual temp workspace size from nvCOMP (can be very large for big batches)
+    size_t temp_est = 0;
+    try {
+      temp_est = get_nvcomp_temp_size(per_stream_batch, gpu_chunk, comp_opts, C.stream);
+    } catch (...) {
+      return false;  // nvCOMP can't even compute temp size for this config
+    }
+
+    size_t est_needed = per_stream_batch * gpu_chunk        // input
+                      + per_stream_batch * max_out_chunk    // output
+                      + temp_est                            // nvCOMP temp workspace
+                      + per_stream_batch * (sizeof(void*)*2 + sizeof(size_t)*2 + sizeof(nvcompStatus_t));
+    if (opt.verbosity >= V_DEBUG) {
+      fprintf(stderr, "[VRAM check] batch=%zu gpu_chunk=%zu max_out=%zu temp=%zu MiB est=%zu MiB free=%zu MiB\n",
+              per_stream_batch, gpu_chunk/ONE_MIB, max_out_chunk/ONE_MIB,
+              temp_est/ONE_MIB, est_needed/ONE_MIB, free_b/ONE_MIB);
+    }
+    if (est_needed > free_b * 0.90) {
+      return false;
+    }
+  }
 
   // Get temporary workspace size required by nvCOMP
   size_t temp_bytes = get_nvcomp_temp_size(per_stream_batch, gpu_chunk, comp_opts, C.stream);
@@ -2542,54 +2741,35 @@ static void free_stream_buffers_only(StreamCtx & C)
   if (C.ev_h2d_end) { cudaEventDestroy(C.ev_h2d_end); }
   if (C.ev_comp_end) { cudaEventDestroy(C.ev_comp_end); }
   if (C.ev_d2h_end) { cudaEventDestroy(C.ev_d2h_end); }
+  // Preserve auto-tune state across buffer reallocation.
+  // C = StreamCtx{} would wipe tune_prev_batch, tune_best_thr, etc.
+  auto save_state = C.tune_state;
+  auto save_lo = C.tune_lo;
+  auto save_hi = C.tune_hi;
+  auto save_best_batch = C.tune_best_batch;
+  auto save_best_thr = C.tune_best_thr;
+  auto save_prev_batch = C.tune_prev_batch;
+  auto save_prev_thr = C.tune_prev_thr;
+  auto save_batches = C.tune_batches_at_size;
+  auto save_settle = C.tune_settle_count;
+  auto save_tried_down = C.tune_tried_down;
+  auto save_adjust = C.last_adjust;
+  auto save_stats = C.stats;
   C = StreamCtx{};
+  C.tune_state = save_state;
+  C.tune_lo = save_lo;
+  C.tune_hi = save_hi;
+  C.tune_best_batch = save_best_batch;
+  C.tune_best_thr = save_best_thr;
+  C.tune_prev_batch = save_prev_batch;
+  C.tune_prev_thr = save_prev_thr;
+  C.tune_batches_at_size = save_batches;
+  C.tune_settle_count = save_settle;
+  C.tune_tried_down = save_tried_down;
+  C.last_adjust = save_adjust;
+  C.stats = save_stats;
 }
 
-static bool try_grow_stream(StreamCtx & C, size_t desired_batch, nvcompBatchedZstdCompressOpts_t comp_opts, const Options & opt)
-{
-  if (desired_batch <= C.per_stream_batch) return false;
-  StreamCtx tmp; tmp.stream = C.stream;
-  try {
-    if (!allocate_stream_buffers(tmp, desired_batch, C.gpu_chunk,
-                                 C.max_out_chunk, comp_opts, opt))
-      return false;
-  } catch (...) {
-    return false;
-  }
-
-  // Swap all buffers from the new (larger) allocation into the live context,
-  // then free the old (smaller) allocation.
-  std::swap(C.d_in_base,       tmp.d_in_base);
-  std::swap(C.d_out_base,      tmp.d_out_base);
-  std::swap(C.d_temp,          tmp.d_temp);
-  std::swap(C.d_in_ptrs,       tmp.d_in_ptrs);
-  std::swap(C.d_out_ptrs,      tmp.d_out_ptrs);
-  std::swap(C.d_in_sizes,      tmp.d_in_sizes);
-  std::swap(C.d_comp_sizes,    tmp.d_comp_sizes);
-  std::swap(C.d_stats,         tmp.d_stats);
-  std::swap(C.h2d_pinned_base, tmp.h2d_pinned_base);
-  std::swap(C.d2h_pinned_base, tmp.d2h_pinned_base);
-  std::swap(C.h_in_sizes,      tmp.h_in_sizes);
-  std::swap(C.h_comp_sizes,    tmp.h_comp_sizes);
-  std::swap(C.h_stats,         tmp.h_stats);
-  std::swap(C.batch,           tmp.batch);
-  std::swap(C.per_stream_batch, tmp.per_stream_batch);
-  std::swap(C.gpu_chunk,       tmp.gpu_chunk);
-  std::swap(C.max_out_chunk,   tmp.max_out_chunk);
-  std::swap(C.temp_bytes_used, tmp.temp_bytes_used);
-  std::swap(C.ev_h2d_begin,    tmp.ev_h2d_begin);
-  std::swap(C.ev_h2d_end,      tmp.ev_h2d_end);
-  std::swap(C.ev_comp_end,     tmp.ev_comp_end);
-  std::swap(C.ev_d2h_end,      tmp.ev_d2h_end);
-
-  C.stats.pinned_h2d    = (C.h2d_pinned_base != nullptr);
-  C.stats.pinned_d2h    = false;
-  C.stats.batch_capacity = C.per_stream_batch;
-
-  tmp.stream = nullptr;
-  free_stream_buffers_only(tmp);
-  return true;
-}
 
 // CUDA / nvCOMP error checkers  throw on failure so gpu_worker's catch block
 // can route in-flight chunks to the rescue queue.
@@ -2605,6 +2785,33 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
     throw std::runtime_error(std::string(msg) + " (nvCOMP status " + std::to_string(int(st)) + ")");
 }
 
+/*----------------------------------------------------------------------
+  GPU COMPRESS WORKER
+  -----------------------------------------------------------------------
+  One thread per GPU device.  Each thread owns one or more CUDA streams
+  (StreamCtx).  The main loop has three phases:
+
+  1. SUBMIT: Pop a batch from the task queue, upload to GPU (H2D),
+     launch nvCOMP compress kernel, and record CUDA events for timing.
+
+  2. POLL COMPLETIONS (async path): Non-blocking cudaStreamQuery checks
+     if a stream has finished.  On success, reads back compressed sizes
+     and data (D2H), records perf counters, and delivers results.
+
+  3. SYNC DRAIN (synchronous path): When no new batch was submitted
+     (!submitted_any)  e.g., queue is empty  we synchronously wait
+     on busy streams via cudaStreamSynchronize instead of polling.
+     This avoids spin-waiting when there's no new work to overlap with.
+
+  IMPORTANT: Both completion paths (async poll and sync drain) MUST
+  record to g_perf counters and per-device/per-stream stats.  If you
+  add perf recording to one path, add it to the other too.  The sync
+  drain path handles the majority of completions when batch sizes are
+  small (N=1) because the GPU finishes before the next batch arrives.
+
+  On failure: the catch block rescues in-flight chunks to the CPU
+  rescue queue (hybrid mode) or dies (--gpu-only mode).
+----------------------------------------------------------------------*/
 static void gpu_worker(
   int device_id,
   int slot_index,   // positional index into per_dev/json_sink arrays
@@ -2639,26 +2846,59 @@ static void gpu_worker(
     for (size_t s=0; s<stream_count; ++s) {
       StreamCtx & C = ctxs[s];
       checkCuda(cudaStreamCreate(&C.stream), "cudaStreamCreate");
-      // Calculate how many subchunks this stream can hold based on free VRAM
+      // Calculate how many subchunks this stream can hold based on free VRAM.
+      // nvCOMP temp workspace can be very large (e.g., 5 GiB for batch=200),
+      // so we use binary search to find the largest batch that fits in VRAM.
       size_t free_b = 0, total_b = 0;
       if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b == 0) {
-        C.per_stream_batch = std::max<size_t>(1, per_stream_cap);
+        C.per_stream_batch = 1;
       } else {
-        const size_t budget   = static_cast<size_t>(free_b * per_stream_frac);
-        const size_t per_in   = gpu_chunk;
-        const size_t per_out  = max_out_chunk;
-        const size_t per_meta = sizeof(void*) * 2 + sizeof(size_t) * 2 + sizeof(nvcompStatus_t);
-
-        size_t bsz = budget / std::max<size_t>(1, per_in + per_out + per_meta);
-        if (bsz == 0) bsz = 1;
-        bsz = std::min(bsz, per_stream_cap);
-        bsz = std::min(bsz, HARD_BATCH_CAP);
-        if (bsz == 0) bsz = 1;
-        C.per_stream_batch = bsz;
+        // Binary search for largest batch that fits
+        size_t lo = 1, hi = std::min(per_stream_cap, HARD_BATCH_CAP);
+        size_t best = 1;
+        while (lo <= hi) {
+          size_t mid = lo + (hi - lo) / 2;
+          // Estimate total VRAM for this batch size
+          size_t temp_est = 0;
+          try { temp_est = get_nvcomp_temp_size(mid, gpu_chunk, comp_opts, C.stream); }
+          catch (...) { hi = mid - 1; continue; }
+          size_t est = mid * (gpu_chunk + max_out_chunk)
+                     + temp_est
+                     + mid * (sizeof(void*)*2 + sizeof(size_t)*2 + sizeof(nvcompStatus_t));
+          if (est <= static_cast<size_t>(free_b * per_stream_frac)) {
+            best = mid;
+            lo = mid + 1;
+          } else {
+            hi = mid - 1;
+          }
+        }
+        C.per_stream_batch = best;
+        if (best < per_stream_cap) {
+          // Always report when user explicitly set batch size; otherwise only at -v
+          int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
+          if (opt.verbosity >= min_verb) {
+            std::ostringstream os;
+            os << "[GPU" << device_id << "/S" << s
+               << "] VRAM-fit: batch=" << best << " (requested " << per_stream_cap
+               << ", free=" << (free_b / ONE_MIB) << " MiB)";
+            vlog(min_verb, opt, os.str() + "\n");
+          }
+        }
       }
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
+        // Free any partial allocations from the failed attempt
+        free_stream_buffers_only(C);
         if (C.per_stream_batch==1) throw std::runtime_error("insufficient GPU memory for per-stream batch=1");
         C.per_stream_batch = std::max<size_t>(1, C.per_stream_batch/2);
+        {
+          int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
+          if (opt.verbosity >= min_verb) {
+            std::ostringstream os;
+            os << "[GPU" << device_id << "/S" << s
+               << "] VRAM insufficient, reducing batch to " << C.per_stream_batch;
+            vlog(min_verb, opt, os.str() + "\n");
+          }
+        }
       }
       C.stats.dev_index = size_t(device_id);
       C.stats.stream_index = s;
@@ -2673,28 +2913,202 @@ static void gpu_worker(
 
     bool producer_done_seen=false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
+    if (sched) sched->set_gpu_ready();
     while (true) {
       bool submitted_any=false;
-      // Adjust/grow if room
+      // ---- Continuous batch-size auto-tuner ----
+      // Binary-search / hill-climb to find optimal batch size during the run.
+      // Measures throughput at each size, narrows the search range, then
+      // periodically probes to detect changes in data characteristics.
+      // DISABLED when user explicitly sets --gpu-batch (respect their choice,
+      // only falling back on VRAM OOM).
+      if (!opt.gpu_batch_user_set)
       for (auto & C: ctxs) {
         if (C.busy) { continue; }
         auto now = std::chrono::steady_clock::now();
         double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - C.last_adjust).count();
         if (secs < GROW_CHECK_SEC) { continue; }
-        size_t free_b=0,total_b=0;
-        if (cudaMemGetInfo(&free_b,&total_b)==cudaSuccess && free_b>0) {
-          size_t target = std::min<size_t>(
-              std::min<size_t>(C.per_stream_batch * 2, per_stream_cap), HARD_BATCH_CAP);
-          if (try_grow_stream(C, target, comp_opts, opt)) {
-            if (opt.verbosity >= V_DEBUG) {
+        C.last_adjust = now;
+
+        // Initialize tuner bounds on first pass
+        if (C.tune_hi == 0) {
+          C.tune_lo = 1;
+          // Upper bound is VRAM-limited, not default-limited.
+          // The binary search at startup already found the max VRAM-fit batch.
+          // Use that as ceiling, or HARD_BATCH_CAP if no VRAM limit was hit.
+          C.tune_hi = std::min(C.per_stream_batch * 16, HARD_BATCH_CAP);
+          // Also query VRAM to set a reasonable ceiling
+          size_t free_b = 0, total_b = 0;
+          if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > 0) {
+            size_t per_chunk = gpu_chunk + max_out_chunk;
+            size_t vram_max = (per_chunk > 0) ? (free_b / 2) / per_chunk : C.tune_hi;
+            C.tune_hi = std::min(C.tune_hi, std::max<size_t>(C.per_stream_batch, vram_max));
+          }
+          C.tune_best_batch = C.per_stream_batch;
+          continue;
+        }
+
+        // Measure current throughput
+        double cur_thr = 0.0;
+        if (C.stats.batches > 0 && C.stats.total_ms > 0.0)
+          cur_thr = double(C.stats.in_bytes) / (C.stats.total_ms / 1000.0) / 1e9;
+        C.tune_batches_at_size += (C.stats.batches > 0) ? 1 : 0;
+
+        // Need enough batches at current size before judging
+        if (C.tune_batches_at_size < C.TUNE_MIN_BATCHES) continue;
+
+        if (C.tune_state == StreamCtx::TuneState::EXPLORE) {
+          // Record throughput at current batch size
+          if (cur_thr > C.tune_best_thr) {
+            C.tune_best_thr = cur_thr;
+            C.tune_best_batch = C.per_stream_batch;
+          }
+
+          // First measurement: record baseline, then try doubling
+          if (C.tune_prev_batch == 0) {
+            C.tune_prev_thr = cur_thr;
+            C.tune_prev_batch = C.per_stream_batch;
+            // First try halving to check if smaller is better
+            if (!C.tune_tried_down && C.per_stream_batch > 1) {
+              C.tune_tried_down = true;
+              size_t half = std::max<size_t>(1, C.per_stream_batch / 2);
+              free_stream_buffers_only(C);
+              if (allocate_stream_buffers(C, half, gpu_chunk, max_out_chunk, comp_opts, opt)) {
+                C.tune_batches_at_size = 0;
+                if (opt.verbosity >= V_VERBOSE) {
+                  std::ostringstream os;
+                  os << "[GPU" << device_id << "] auto-tune: batch "
+                     << C.tune_prev_batch << " -> " << C.per_stream_batch
+                     << " (try smaller, baseline=" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
+                  vlog(V_VERBOSE, opt, os.str() + "\n");
+                }
+              } else {
+                // Can't go smaller, try doubling instead
+                free_stream_buffers_only(C);
+                allocate_stream_buffers(C, C.tune_prev_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
+              }
+              continue;
+            }
+            // Now try doubling
+            size_t next = std::min(C.per_stream_batch * 2, C.tune_hi);
+            if (next > C.per_stream_batch) {
+              free_stream_buffers_only(C);
+              if (allocate_stream_buffers(C, next, gpu_chunk, max_out_chunk, comp_opts, opt)) {
+                C.tune_batches_at_size = 0;
+                if (opt.verbosity >= V_VERBOSE) {
+                  std::ostringstream os;
+                  os << "[GPU" << device_id << "] auto-tune: batch "
+                     << C.tune_prev_batch << " -> " << C.per_stream_batch
+                     << " (baseline thr=" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
+                  vlog(V_VERBOSE, opt, os.str() + "\n");
+                }
+              } else {
+                free_stream_buffers_only(C);
+                allocate_stream_buffers(C, C.tune_best_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
+                C.tune_state = StreamCtx::TuneState::SETTLE;
+                C.tune_settle_count = 0;
+              }
+            } else {
+              C.tune_state = StreamCtx::TuneState::SETTLE;
+              C.tune_settle_count = 0;
+            }
+            continue;
+          }
+
+          // Decide next size  continue in whichever direction was improving
+          size_t next = 0;
+          bool was_halving = (C.per_stream_batch < C.tune_prev_batch);
+          if (cur_thr >= C.tune_prev_thr * 0.98) {
+            // Current is as good or better  continue same direction
+            if (was_halving && C.per_stream_batch > 1) {
+              next = std::max<size_t>(1, C.per_stream_batch / 2);
+            } else if (!was_halving && C.per_stream_batch < C.tune_hi) {
+              next = std::min(C.per_stream_batch * 2, C.tune_hi);
+            } else {
+              // Hit a boundary  settle at best
+              C.tune_state = StreamCtx::TuneState::SETTLE;
+              C.tune_settle_count = 0;
+              if (C.per_stream_batch != C.tune_best_batch)
+                next = C.tune_best_batch;
+            }
+          } else {
+            // Current is worse  settle at best immediately
+            C.tune_state = StreamCtx::TuneState::SETTLE;
+            C.tune_settle_count = 0;
+            next = C.tune_best_batch;
+            if (opt.verbosity >= V_VERBOSE) {
               std::ostringstream os;
-              os << "[GPU" << device_id
-                 << "] stream grew to batch=" << C.per_stream_batch;
-              vlog(V_DEBUG, opt, os.str() + "\n");
+              os << "[GPU" << device_id << "] auto-tune: settled at batch="
+                 << C.tune_best_batch << " (" << std::fixed << std::setprecision(2)
+                 << C.tune_best_thr << " GiB/s)";
+              vlog(V_VERBOSE, opt, os.str() + "\n");
+            }
+          }
+
+          C.tune_prev_thr = cur_thr;
+          C.tune_prev_batch = C.per_stream_batch;
+
+          // Apply new batch size if changed
+          if (next > 0 && next != C.per_stream_batch) {
+            free_stream_buffers_only(C);
+            if (allocate_stream_buffers(C, next, gpu_chunk, max_out_chunk, comp_opts, opt)) {
+              C.tune_batches_at_size = 0;
+              if (opt.verbosity >= V_VERBOSE) {
+                std::ostringstream os;
+                os << "[GPU" << device_id << "] auto-tune: batch "
+                   << C.tune_prev_batch << " -> " << C.per_stream_batch
+                   << " (thr=" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s"
+                   << " best=" << C.tune_best_batch << "@" << C.tune_best_thr << ")";
+                vlog(V_VERBOSE, opt, os.str() + "\n");
+              }
+            } else {
+              // Can't allocate this size  shrink ceiling
+              free_stream_buffers_only(C);
+              C.tune_hi = next - 1;
+              allocate_stream_buffers(C, C.tune_best_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
+              C.tune_state = StreamCtx::TuneState::SETTLE;
+              C.tune_settle_count = 0;
+            }
+          } else if (C.tune_state == StreamCtx::TuneState::SETTLE
+                     && C.per_stream_batch != C.tune_best_batch) {
+            // Revert to best for settle
+            free_stream_buffers_only(C);
+            allocate_stream_buffers(C, C.tune_best_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
+            C.tune_batches_at_size = 0;
+          }
+
+        } else {
+          // SETTLE state  use best batch size, periodically probe
+          ++C.tune_settle_count;
+          if (C.tune_settle_count >= C.TUNE_PROBE_INTERVAL) {
+            // Probe: try doubling to see if data changed and larger batches help now
+            size_t probe = std::min(C.per_stream_batch * 2, std::min(per_stream_cap, HARD_BATCH_CAP));
+            if (probe > C.per_stream_batch) {
+              C.tune_state = StreamCtx::TuneState::EXPLORE;
+              C.tune_lo = C.tune_best_batch / 2;
+              C.tune_hi = std::min(probe, std::min(per_stream_cap, HARD_BATCH_CAP));
+              C.tune_prev_thr = cur_thr;
+              C.tune_prev_batch = C.per_stream_batch;
+              free_stream_buffers_only(C);
+              if (allocate_stream_buffers(C, probe, gpu_chunk, max_out_chunk, comp_opts, opt)) {
+                C.tune_batches_at_size = 0;
+                if (opt.verbosity >= V_VERBOSE) {
+                  std::ostringstream os;
+                  os << "[GPU" << device_id << "] auto-tune: probe " << probe
+                     << " (was " << C.tune_prev_batch << ")";
+                  vlog(V_VERBOSE, opt, os.str() + "\n");
+                }
+              } else {
+                free_stream_buffers_only(C);
+                allocate_stream_buffers(C, C.tune_best_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
+                C.tune_state = StreamCtx::TuneState::SETTLE;
+                C.tune_settle_count = 0;
+              }
+            } else {
+              C.tune_settle_count = 0;  // at cap, reset probe timer
             }
           }
         }
-        C.last_adjust = now;
       }
 
       // Submit batches
@@ -2702,10 +3116,17 @@ static void gpu_worker(
         if (C.busy) { continue; }
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
-        if (!queue->pop_batch(C.per_stream_batch, C.batch)) {
+        // Signal scheduler: GPU stream wants data (blocks CPU workers)
+        if (sched) sched->gpu_wants_data();
+        // Greedy pop: wait for a full batch (per_stream_batch) or producer done.
+        // This maximizes GPU kernel efficiency by processing many chunks per launch.
+        if (!queue->pop_batch_greedy(C.per_stream_batch, C.batch)) {
+          if (sched) sched->gpu_got_data();
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           producer_done_seen = true; continue;
         }
+        // Signal scheduler: GPU got its data (unblocks CPU workers)
+        if (sched) sched->gpu_got_data();
         if (C.batch.empty()) {
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           continue;
@@ -2773,7 +3194,11 @@ static void gpu_worker(
         C.busy = true; submitted_any = true;
       }
 
-      // Poll completions
+      // ---- COMPLETION PATH 1: Async polling ----
+      // Non-blocking check if GPU stream has finished.  This path runs when
+      // we just submitted a new batch (submitted_any=true) and are checking
+      // if previous batches completed while we were submitting.
+      // NOTE: Must record to g_perf here  see also sync drain path below.
       for (auto & C : ctxs) {
         if (!C.busy) { continue; }
         cudaError_t q = cudaStreamQuery(C.stream);
@@ -2875,6 +3300,13 @@ static void gpu_worker(
         }
         if (all_idle) break;
       }
+      // ---- COMPLETION PATH 2: Synchronous drain ----
+      // When no new batch was submitted (queue empty or producer done),
+      // block on busy streams instead of spin-polling.  This is the
+      // primary completion path when batch sizes are small (N=1) or the
+      // queue drains faster than GPU processes.
+      // NOTE: Must record to g_perf here  see also async poll path above.
+      //       If you add perf instrumentation to one path, ADD IT TO BOTH.
       if (!submitted_any) {
         bool blocked=false;
         for (auto & C: ctxs) {
@@ -2888,6 +3320,12 @@ static void gpu_worker(
           cudaEventElapsedTime(&comp_ms, C.ev_h2d_end,   C.ev_comp_end);
           cudaEventElapsedTime(&d2h_ms,  C.ev_comp_end,  C.ev_d2h_end);
           cudaEventElapsedTime(&tot_ms,  C.ev_h2d_begin, C.ev_d2h_end);
+          if (g_perf) {
+            g_perf->h2d_ns.fetch_add(uint64_t(h2d_ms * 1e6));
+            g_perf->h2d_count.fetch_add(1);
+            g_perf->kernel_ns.fetch_add(uint64_t(comp_ms * 1e6));
+            g_perf->kernel_count.fetch_add(1);
+          }
           {
             std::lock_guard<std::mutex> lk(devstats->m);
             devstats->h2d_ms  += h2d_ms;
@@ -2903,6 +3341,7 @@ static void gpu_worker(
           }
           {
             // D2H exact copies and release to writer (synchronous path)
+            uint64_t d2h_t0 = g_perf ? now_ns() : 0;
             for (size_t i = 0; i < C.filled; ++i) {
               const size_t csz = C.h_comp_sizes[i];
               std::vector<char> h_out(csz);
@@ -2914,10 +3353,20 @@ static void gpu_worker(
               }
               results->cv.notify_one();
             }
+            if (g_perf) {
+              g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
+            }
           }
           #ifdef HAVE_NVCOMP
           if (sched) sched->add_gpu_bytes(in_sum);
           #endif
+          if (g_perf) {
+            g_perf->d2h_bytes.fetch_add(out_sum);
+            g_perf->d2h_count.fetch_add(1);
+            g_perf->h2d_bytes.fetch_add(in_sum);
+            g_perf->gpu_batch_ns.fetch_add(uint64_t(tot_ms * 1e6));
+            g_perf->gpu_batch_count.fetch_add(1);
+          }
           // Accumulate per-stream stats (synchronous path)
           C.stats.h2d_ms   += h2d_ms;
           C.stats.comp_ms  += comp_ms;
@@ -3422,20 +3871,28 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // ---- Teardown: join all threads in correct order ----
   for (auto & th : workers) th.join();
 
-  // Check for GPU failures (fatal in --gpu-only mode)
-  if (abort_on_failure.load() && any_gpu_failed.load()) {
-    progress_done = true;
-    progress_thr.join();
-    {
-      std::lock_guard<std::mutex> lk(results.m);
-      results.workers_done = true;
-      results.cv.notify_all();
+  // Check for GPU failures
+  if (any_gpu_failed.load()) {
+    if (abort_on_failure.load()) {
+      // Fatal in --gpu-only mode
+      progress_done = true;
+      progress_thr.join();
+      {
+        std::lock_guard<std::mutex> lk(results.m);
+        results.workers_done = true;
+        results.cv.notify_all();
+      }
+      writer_thr.join();
+      std::string msg = "GPU path failed (--gpu-only).";
+      for (const auto & s : fatal_msgs)
+        if (!s.empty()) { msg += " "; msg += s; }
+      die(msg);
+    } else {
+      // Hybrid mode: warn but continue with CPU rescue
+      for (const auto & s : fatal_msgs)
+        if (!s.empty())
+          vlog(V_VERBOSE, opt, "WARNING: " + s + " (rescued to CPU)\n");
     }
-    writer_thr.join();
-    std::string msg = "GPU path failed (--gpu-only).";
-    for (const auto & s : fatal_msgs)
-      if (!s.empty()) { msg += " "; msg += s; }
-    die(msg);
   }
 
   // Drain rescue queue and join CPU pool
@@ -3497,7 +3954,7 @@ static void gpu_decomp_worker(
     // Kernel launch overhead dominates, so each stream needs large batches.
     // Compress divides across streams for VRAM management, but decompress
     // frames are small (compressed) so VRAM isn't the bottleneck.
-    const size_t per_stream_cap = std::min(opt.gpu_batch_cap, HARD_BATCH_CAP);
+    size_t per_stream_cap = std::min(opt.gpu_batch_cap, HARD_BATCH_CAP);
 
     // We need to allocate per-stream buffers.  Unlike compression, we need
     // to handle variable decompressed sizes.  We pre-allocate based on the
@@ -3514,6 +3971,23 @@ static void gpu_decomp_worker(
       bool busy = false;
       size_t filled = 0;
       size_t stream_index = 0;
+
+      // Auto-tune tracking
+      std::chrono::steady_clock::time_point last_adjust{ std::chrono::steady_clock::now() };
+      uint64_t tune_in_bytes = 0;      // bytes processed since last tune check
+      double   tune_elapsed_ms = 0.0;  // ms elapsed since last tune check
+      enum class TuneState { EXPLORE, SETTLE };
+      TuneState tune_state = TuneState::EXPLORE;
+      size_t    tune_lo = 0, tune_hi = 0;
+      size_t    tune_best_batch = 0;
+      double    tune_best_thr = 0.0;
+      size_t    tune_prev_batch = 0;
+      double    tune_prev_thr = 0.0;
+      uint32_t  tune_batches_at_size = 0;
+      uint32_t  tune_settle_count = 0;
+      // Constants for tuner (not static  local classes can't have static members)
+      uint32_t TUNE_MIN_BATCHES = 2;
+      uint32_t TUNE_PROBE_INTERVAL = 15;
 
       // Pre-allocated device buffers (reused across batches)
       size_t alloc_batch = 0;     // how many slots are allocated
@@ -3611,10 +4085,34 @@ static void gpu_decomp_worker(
       // We'll resize later if a batch has larger frames.
       size_t init_comp = host_chunk_bytes;  // compressed <= original chunk
       size_t init_decomp = host_chunk_bytes;
-      // Estimate temp size  we'll get the real size on first batch and grow if needed
+      // Pre-allocate device buffers.  If batch size is too large for VRAM,
+      // halve it until it fits.  This handles --gpu-batch=256 on GPUs with
+      // limited VRAM (e.g., 10 GiB consumer GPUs vs 80+ GiB datacenter GPUs).
       {
-        size_t est_temp = per_stream_cap * 1024;  // small initial estimate
-        C.ensure_buffers(per_stream_cap, init_comp, init_decomp, est_temp);
+        size_t est_temp = per_stream_cap * 1024;
+        size_t try_batch = per_stream_cap;
+        while (!C.ensure_buffers(try_batch, init_comp, init_decomp, est_temp)) {
+          if (try_batch <= 1) {
+            throw std::runtime_error(
+                std::string("[GPU-D") + std::to_string(device_id)
+                + "] insufficient VRAM for even batch=1 ("
+                + std::to_string(init_comp / ONE_MIB) + " MiB comp + "
+                + std::to_string(init_decomp / ONE_MIB) + " MiB decomp per frame)");
+          }
+          try_batch = std::max<size_t>(1, try_batch / 2);
+          {
+            int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
+            if (opt.verbosity >= min_verb) {
+              std::ostringstream os;
+              os << "[GPU-D" << device_id << "/S" << s
+                 << "] VRAM insufficient, reducing batch to " << try_batch;
+              vlog(min_verb, opt, os.str() + "\n");
+            }
+          }
+        }
+        // Update per_stream_cap to the actual allocated size
+        // (used by pop_batch_greedy to limit how many frames we grab)
+        per_stream_cap = try_batch;
       }
 
       if (opt.verbosity >= V_DEBUG) {
@@ -3634,6 +4132,101 @@ static void gpu_decomp_worker(
 
     while (true) {
       bool submitted_any = false;
+
+      // ---- Continuous batch-size auto-tuner (decompress) ----
+      // Same binary-search / hill-climb as compress.  Adjusts per_stream_cap
+      // based on measured throughput.  ensure_buffers handles VRAM allocation.
+      // DISABLED when user explicitly sets --gpu-batch.
+      if (!opt.gpu_batch_user_set)
+      for (auto & C : ctxs) {
+        if (C.busy) continue;
+        auto now = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - C.last_adjust).count();
+        if (secs < 0.3) continue;
+        C.last_adjust = now;
+
+        if (C.tune_hi == 0) {
+          C.tune_lo = 1;
+          C.tune_hi = std::min((size_t)HARD_BATCH_CAP, (size_t)512);
+          C.tune_best_batch = per_stream_cap;
+          continue;
+        }
+
+        double cur_thr = 0.0;
+        if (C.tune_in_bytes > 0 && secs > 0.0)
+          cur_thr = double(C.tune_in_bytes) / secs / 1e9;
+        C.tune_in_bytes = 0;  // reset for next measurement window
+        C.tune_batches_at_size++;
+
+        if (C.tune_batches_at_size < C.TUNE_MIN_BATCHES) continue;
+
+        if (C.tune_state == DecompStreamCtx::TuneState::EXPLORE) {
+          if (cur_thr > C.tune_best_thr) {
+            C.tune_best_thr = cur_thr;
+            C.tune_best_batch = per_stream_cap;
+          }
+
+          size_t next = 0;
+          if (C.tune_prev_batch == 0) {
+            next = std::min(per_stream_cap * 2, C.tune_hi);
+          } else if (cur_thr >= C.tune_prev_thr * 0.98) {
+            C.tune_lo = per_stream_cap;
+            if (per_stream_cap >= C.tune_hi) {
+              C.tune_state = DecompStreamCtx::TuneState::SETTLE;
+              C.tune_settle_count = 0;
+              next = C.tune_best_batch;
+            } else {
+              next = per_stream_cap + (C.tune_hi - per_stream_cap + 1) / 2;
+            }
+          } else {
+            C.tune_hi = per_stream_cap;
+            if (C.tune_hi <= C.tune_lo + 1) {
+              C.tune_state = DecompStreamCtx::TuneState::SETTLE;
+              C.tune_settle_count = 0;
+              next = C.tune_best_batch;
+            } else {
+              next = C.tune_lo + (C.tune_hi - C.tune_lo) / 2;
+            }
+          }
+
+          C.tune_prev_thr = cur_thr;
+          C.tune_prev_batch = per_stream_cap;
+
+          if (next > 0 && next != per_stream_cap) {
+            if (opt.verbosity >= V_VERBOSE) {
+              std::ostringstream os;
+              os << "[GPU-D" << device_id << "] auto-tune: batch "
+                 << per_stream_cap << " -> " << next
+                 << " (thr=" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s"
+                 << " best=" << C.tune_best_batch << "@" << C.tune_best_thr << ")";
+              vlog(V_VERBOSE, opt, os.str() + "\n");
+            }
+            per_stream_cap = next;
+            C.tune_batches_at_size = 0;
+          }
+        } else {
+          ++C.tune_settle_count;
+          if (C.tune_settle_count >= C.TUNE_PROBE_INTERVAL) {
+            size_t probe = std::min(per_stream_cap * 2, (size_t)512);
+            if (probe > per_stream_cap) {
+              C.tune_state = DecompStreamCtx::TuneState::EXPLORE;
+              C.tune_lo = C.tune_best_batch / 2;
+              C.tune_hi = probe;
+              C.tune_prev_thr = cur_thr;
+              C.tune_prev_batch = per_stream_cap;
+              per_stream_cap = probe;
+              C.tune_batches_at_size = 0;
+              if (opt.verbosity >= V_VERBOSE) {
+                std::ostringstream os;
+                os << "[GPU-D" << device_id << "] auto-tune: probe " << probe;
+                vlog(V_VERBOSE, opt, os.str() + "\n");
+              }
+            } else {
+              C.tune_settle_count = 0;
+            }
+          }
+        }
+      }
 
       // Submit batches
       for (auto & C : ctxs) {
@@ -3838,6 +4431,8 @@ static void gpu_decomp_worker(
           for (size_t i = 0; i < C.filled; ++i)
             in_sum += C.batch[i].data.size();
           if (m) m->read_bytes.fetch_add(in_sum);
+          // Accumulate for auto-tuner throughput measurement
+          C.tune_in_bytes += in_sum;
         }
 
         if (sched) sched->add_gpu_bytes(out_sum);
@@ -4575,7 +5170,7 @@ static Options parse_args(int argc, char ** argv)
     else if (parse_str_arg("stats-json", i, argc, argv, opt.stats_json)) {}
     else if (parse_num_arg("chunk-size", i, argc, argv, opt.chunk_mib, &opt.chunk_user_set)) {}
     else if (parse_num_arg("cpu-backlog", i, argc, argv, opt.cpu_backlog, nullptr)) {}
-    else if (parse_num_arg("cpu-batch", i, argc, argv, opt.cpu_batch, nullptr)) {}
+    else if (parse_num_arg("cpu-batch", i, argc, argv, opt.cpu_queue_min, nullptr)) {}
 #ifdef HAVE_NVCOMP
     else if (a == "--gpu-only") opt.gpu_only = true;
     else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) { opt.gpu_batch_user_set = true; }
@@ -4620,8 +5215,7 @@ static Options parse_args(int argc, char ** argv)
 #ifdef HAVE_NVCOMP
   if (opt.gpu_batch_cap == 0) opt.gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   // Decompress benefits massively from large batches  nvCOMP kernel launch
-  // Decompress kernel has significant per-launch overhead (Huffman table setup,
-  // Decompress kernel has significant per-launch overhead (Huffman table setup,
+  // has significant per-launch overhead (Huffman table setup,
   // scratch allocation).  But very large batches delay the writer since it
   // can't start until the batch finishes.  Auto-tune for ~4 batches total
   // to balance kernel efficiency with GPU-writer overlap.
