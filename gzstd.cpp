@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.10.6";
+static constexpr const char * GZSTD_VERSION = "0.10.34";
 //
 // Architecture overview:
 //
@@ -61,6 +61,7 @@ static constexpr const char * GZSTD_VERSION = "0.10.6";
 #include <memory>
 #include <cerrno>
 #include <csignal>
+#include <liburing.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #ifndef _WIN32
@@ -212,6 +213,7 @@ struct Options {
 #endif
   std::string stats_json;
   int sparse_mode = -1;           // -1=auto (file:on, stdout:off), 0=off, 1=on
+  bool sync_output = false;       // --sync-output: fsync before closing output file
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -272,6 +274,7 @@ static void print_help()
 " -f Force overwrite of output file\n"
 " --[no-]sparse Enable/disable sparse file support (skip zero blocks)\n"
 "               Default: enabled for file output, disabled for stdout\n"
+" --sync-output Fsync output file before exit (default: off; OS flushes in background)\n"
 " -c Write to stdout\n"
 " -o, --output FILE  Explicit output path\n"
 " -1 .. -19 Compression level (CPU zstd; default: 3)\n"
@@ -486,7 +489,15 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     human_bytes(double(out), out_s, sizeof(out_s));
     human_bytes(in_rate,     rate_s, sizeof(rate_s));
     double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
-    progress_emit_line(pct, in_s, out_s, rate_s);
+    // When all input is read, show output write rate instead of input read rate
+    if (total_in > 0 && in >= total_in && out > 0) {
+      double out_rate = secs > 0 ? double(out) / secs : 0.0;
+      char wr_s[64];
+      human_bytes(out_rate, wr_s, sizeof(wr_s));
+      progress_emit_line(pct, in_s, out_s, wr_s);
+    } else {
+      progress_emit_line(pct, in_s, out_s, rate_s);
+    }
   }
   // Final sample (no newline  the completion summary will overwrite this line)
   uint64_t in  = m->read_bytes.load();
@@ -1385,6 +1396,9 @@ private:
   uint64_t sparse_saved_ = 0;  // bytes skipped via sparse seek
 };
 
+// ======================================================================
+// io_uring-based async writer: submits multiple O_DIRECT writes per syscall.
+
 static void writer_thread(FILE * out, ResultStore & results,
                           const Options & opt, Meter * m)
 {
@@ -1409,10 +1423,11 @@ static void writer_thread(FILE * out, ResultStore & results,
     }
 #ifndef _WIN32
     aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse);
+    aio = aio_ptr.get();
 #else
     aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse);
-#endif
     aio = aio_ptr.get();
+#endif
   }
 
   std::unique_lock<std::mutex> lk(results.m);
@@ -1456,14 +1471,14 @@ static void writer_thread(FILE * out, ResultStore & results,
     if (batch.empty()) continue;
     lk.unlock();
 
-    // Submit to async write pool (non-blocking unless previous write still in flight)
+    // Submit to writer backend
+    if (opt.verbosity >= V_DEBUG) {
+      char bs[32];
+      human_bytes(double(batch_bytes), bs, sizeof(bs));
+      vlog(V_DEBUG, opt, std::string("[WRITER] submitting ") + std::to_string(batch.size())
+           + " frames (" + bs + ")\n");
+    }
     if (aio) {
-      if (opt.verbosity >= V_DEBUG) {
-        char bs[32];
-        human_bytes(double(batch_bytes), bs, sizeof(bs));
-        vlog(V_DEBUG, opt, std::string("[WRITER] submitting ") + std::to_string(batch.size())
-             + " frames (" + bs + ")\n");
-      }
       aio->submit(std::move(batch));
       if (aio->had_error()) die("async write failed (disk full?)");
     }
@@ -1472,14 +1487,12 @@ static void writer_thread(FILE * out, ResultStore & results,
     lk.lock();
   }
 
-  // Flush remaining async writes
+  // Flush remaining writes
   if (aio) {
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "writer: flushing remaining output to disk...\n");
+      vlog(V_VERBOSE, opt, "writer: draining write queue...\n");
     aio->flush();
     if (aio->had_error()) die("async write failed (disk full?)");
-    if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "writer: flush complete\n");
   }
 }
 
@@ -2524,6 +2537,40 @@ struct DevStats {
   uint64_t batches   = 0;
 };
 
+// Shared auto-tune state across all GPU workers.
+// One worker acts as the "tuner" (first to complete a measurement window).
+// All workers read shared_batch_size for their pop_batch_greedy calls.
+// This prevents fast-settling GPUs from starving slow-settling ones.
+struct SharedTuneState {
+  std::atomic<size_t> batch_size{8};     // current batch size (all GPUs use this)
+  std::atomic<bool>   locked{false};     // true when user specified --gpu-batch
+  std::mutex          tune_mtx;          // protects tune logic (only one tuner at a time)
+
+  // Tune algorithm state (protected by tune_mtx)
+  enum class Phase { BASELINE, HALVE, DOUBLE, REFINE, SETTLED };
+  Phase    phase = Phase::BASELINE;
+  size_t   best_batch = 0;
+  double   best_thr = 0.0;
+  size_t   prev_batch = 0;
+  double   prev_thr = 0.0;
+  size_t   refine_lo = 0, refine_hi = 0;
+  uint32_t refine_iters = 0;            // count refine steps to prevent oscillation
+  uint32_t probe_count = 0;             // total probes (for alternating up/down)
+  static constexpr uint32_t MAX_REFINE_ITERS = 6;  // settle after this many
+  std::atomic<size_t> vram_ceiling{1024};          // max batch that fits in VRAM (set at init)
+  uint32_t settle_ticks = 0;
+  std::chrono::steady_clock::time_point last_tune = std::chrono::steady_clock::now();
+
+  // Throughput accumulator (all GPUs add to this)
+  std::atomic<uint64_t> window_bytes{0};
+  std::atomic<uint64_t> window_ns{0};
+  std::atomic<uint32_t> window_batches{0};
+
+  static constexpr uint32_t MIN_BATCHES = 4;     // min batches across all GPUs before tuning
+  static constexpr uint32_t PROBE_INTERVAL = 8;   // ticks in SETTLED before re-probing
+  static constexpr double   TUNE_SEC = 0.3;       // min seconds between tune decisions
+};
+
 // Per-stream stats for JSON export.
 struct StreamStats {
   size_t   dev_index      = 0;
@@ -2616,7 +2663,7 @@ struct StreamCtx {
   //
   // The tuner tracks throughput (GiB/s) at each tested batch size and
   // binary-searches between known-good and known-bad sizes.
-  enum class TuneState { EXPLORE, SETTLE };
+  enum class TuneState { EXPLORE, REFINE, SETTLE };
   TuneState   tune_state = TuneState::EXPLORE;
   size_t      tune_lo = 0;             // lower bound of search range
   size_t      tune_hi = 0;             // upper bound (set to per_stream_cap)
@@ -2629,6 +2676,9 @@ struct StreamCtx {
   static constexpr uint32_t TUNE_MIN_BATCHES = 2;   // min ticks before judging throughput
   static constexpr uint32_t TUNE_PROBE_INTERVAL = 15; // ticks in SETTLE before probing
   bool        tune_tried_down = false;  // have we tried halving yet?
+  bool        tune_tried_up = false;    // have we tried doubling yet?
+  size_t      refine_lo = 0;            // lower bound for refinement binary search
+  size_t      refine_hi = 0;            // upper bound for refinement binary search
 };
 
 static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size_t gpu_chunk, size_t max_out_chunk, nvcompBatchedZstdCompressOpts_t comp_opts, const Options & opt)
@@ -2753,6 +2803,9 @@ static void free_stream_buffers_only(StreamCtx & C)
   auto save_batches = C.tune_batches_at_size;
   auto save_settle = C.tune_settle_count;
   auto save_tried_down = C.tune_tried_down;
+  auto save_tried_up = C.tune_tried_up;
+  auto save_refine_lo = C.refine_lo;
+  auto save_refine_hi = C.refine_hi;
   auto save_adjust = C.last_adjust;
   auto save_stats = C.stats;
   C = StreamCtx{};
@@ -2766,6 +2819,9 @@ static void free_stream_buffers_only(StreamCtx & C)
   C.tune_batches_at_size = save_batches;
   C.tune_settle_count = save_settle;
   C.tune_tried_down = save_tried_down;
+  C.tune_tried_up = save_tried_up;
+  C.refine_lo = save_refine_lo;
+  C.refine_hi = save_refine_hi;
   C.last_adjust = save_adjust;
   C.stats = save_stats;
 }
@@ -2826,7 +2882,8 @@ static void gpu_worker(
   std::atomic<bool> * any_gpu_failed,
   std::atomic<bool> * abort_on_failure,
   std::string * fatal_msg,
-  std::atomic<bool> * gpu_started_flag)
+  std::atomic<bool> * gpu_started_flag,
+  SharedTuneState * shared_tune)
 {
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   try {
@@ -2885,6 +2942,24 @@ static void gpu_worker(
           }
         }
       }
+      // Update shared tuner's VRAM ceiling (use minimum across all GPUs).
+      // Use the binary search's maximum viable batch, not the chosen starting size.
+      if (shared_tune) {
+        // The binary search found 'best' as the largest that fits.
+        // Use that as the ceiling (not C.per_stream_batch which is the default start).
+        size_t vram_max = C.per_stream_batch;  // fallback
+        // Re-query VRAM to estimate actual ceiling
+        size_t free_b2 = 0, total_b2 = 0;
+        if (cudaMemGetInfo(&free_b2, &total_b2) == cudaSuccess && free_b2 > 0) {
+          // Estimate: each batch slot needs gpu_chunk + max_out_chunk + temp/batch
+          size_t per_slot = gpu_chunk + max_out_chunk;
+          if (per_slot > 0)
+            vram_max = std::max(vram_max, static_cast<size_t>(free_b2 * 0.8) / per_slot);
+        }
+        size_t old_ceil = shared_tune->vram_ceiling.load();
+        while (vram_max < old_ceil &&
+               !shared_tune->vram_ceiling.compare_exchange_weak(old_ceil, vram_max));
+      }
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
         // Free any partial allocations from the failed attempt
         free_stream_buffers_only(C);
@@ -2916,196 +2991,163 @@ static void gpu_worker(
     if (sched) sched->set_gpu_ready();
     while (true) {
       bool submitted_any=false;
-      // ---- Continuous batch-size auto-tuner ----
-      // Binary-search / hill-climb to find optimal batch size during the run.
-      // Measures throughput at each size, narrows the search range, then
-      // periodically probes to detect changes in data characteristics.
-      // DISABLED when user explicitly sets --gpu-batch (respect their choice,
-      // only falling back on VRAM OOM).
-      if (!opt.gpu_batch_user_set)
-      for (auto & C: ctxs) {
-        if (C.busy) { continue; }
+      // ---- Shared auto-tuner ----
+      // All GPUs report throughput to SharedTuneState. Whichever worker
+      // grabs the mutex first runs the tune logic for everyone.
+      if (shared_tune && !shared_tune->locked.load()) {
         auto now = std::chrono::steady_clock::now();
-        double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - C.last_adjust).count();
-        if (secs < GROW_CHECK_SEC) { continue; }
-        C.last_adjust = now;
+        // Try to run tune logic (non-blocking mutex try_lock)
+        if (shared_tune->window_batches.load(std::memory_order_relaxed) >= SharedTuneState::MIN_BATCHES) {
+          std::unique_lock<std::mutex> lk(shared_tune->tune_mtx, std::try_to_lock);
+          if (lk.owns_lock()) {
+            double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
+                now - shared_tune->last_tune).count();
+            if (secs >= SharedTuneState::TUNE_SEC) {
+              shared_tune->last_tune = now;
+              uint64_t bytes = shared_tune->window_bytes.exchange(0);
+              uint64_t ns = shared_tune->window_ns.exchange(0);
+              shared_tune->window_batches.store(0);
+              double cur_thr = (ns > 0) ? double(bytes) / (double(ns)/1e9) / 1e9 : 0.0;
+              size_t cur_batch = shared_tune->batch_size.load();
 
-        // Initialize tuner bounds on first pass
-        if (C.tune_hi == 0) {
-          C.tune_lo = 1;
-          // Upper bound is VRAM-limited, not default-limited.
-          // The binary search at startup already found the max VRAM-fit batch.
-          // Use that as ceiling, or HARD_BATCH_CAP if no VRAM limit was hit.
-          C.tune_hi = std::min(C.per_stream_batch * 16, HARD_BATCH_CAP);
-          // Also query VRAM to set a reasonable ceiling
-          size_t free_b = 0, total_b = 0;
-          if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > 0) {
-            size_t per_chunk = gpu_chunk + max_out_chunk;
-            size_t vram_max = (per_chunk > 0) ? (free_b / 2) / per_chunk : C.tune_hi;
-            C.tune_hi = std::min(C.tune_hi, std::max<size_t>(C.per_stream_batch, vram_max));
-          }
-          C.tune_best_batch = C.per_stream_batch;
-          continue;
-        }
-
-        // Measure current throughput
-        double cur_thr = 0.0;
-        if (C.stats.batches > 0 && C.stats.total_ms > 0.0)
-          cur_thr = double(C.stats.in_bytes) / (C.stats.total_ms / 1000.0) / 1e9;
-        C.tune_batches_at_size += (C.stats.batches > 0) ? 1 : 0;
-
-        // Need enough batches at current size before judging
-        if (C.tune_batches_at_size < C.TUNE_MIN_BATCHES) continue;
-
-        if (C.tune_state == StreamCtx::TuneState::EXPLORE) {
-          // Record throughput at current batch size
-          if (cur_thr > C.tune_best_thr) {
-            C.tune_best_thr = cur_thr;
-            C.tune_best_batch = C.per_stream_batch;
-          }
-
-          // First measurement: record baseline, then try doubling
-          if (C.tune_prev_batch == 0) {
-            C.tune_prev_thr = cur_thr;
-            C.tune_prev_batch = C.per_stream_batch;
-            // First try halving to check if smaller is better
-            if (!C.tune_tried_down && C.per_stream_batch > 1) {
-              C.tune_tried_down = true;
-              size_t half = std::max<size_t>(1, C.per_stream_batch / 2);
-              free_stream_buffers_only(C);
-              if (allocate_stream_buffers(C, half, gpu_chunk, max_out_chunk, comp_opts, opt)) {
-                C.tune_batches_at_size = 0;
-                if (opt.verbosity >= V_VERBOSE) {
-                  std::ostringstream os;
-                  os << "[GPU" << device_id << "] auto-tune: batch "
-                     << C.tune_prev_batch << " -> " << C.per_stream_batch
-                     << " (try smaller, baseline=" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
-                  vlog(V_VERBOSE, opt, os.str() + "\n");
+              auto & S = *shared_tune;
+              if (S.phase == SharedTuneState::Phase::BASELINE) {
+                S.best_batch = cur_batch;
+                S.best_thr = cur_thr;
+                S.prev_batch = cur_batch;
+                S.prev_thr = cur_thr;
+                // Try halving first
+                size_t half = std::max<size_t>(1, cur_batch / 2);
+                if (half < cur_batch) {
+                  S.batch_size.store(half);
+                  S.phase = SharedTuneState::Phase::HALVE;
+                  if (opt.verbosity >= V_VERBOSE) {
+                    std::ostringstream os;
+                    os << "[auto-tune] baseline=" << cur_batch << " (" << std::fixed
+                       << std::setprecision(2) << cur_thr << " GiB/s) -> try " << half;
+                    vlog(V_VERBOSE, opt, os.str() + "\n");
+                  }
+                } else {
+                  S.batch_size.store(std::min(cur_batch * 2, S.vram_ceiling.load()));
+                  S.phase = SharedTuneState::Phase::DOUBLE;
+                }
+              } else if (S.phase == SharedTuneState::Phase::HALVE) {
+                if (cur_thr > S.best_thr) { S.best_thr = cur_thr; S.best_batch = cur_batch; }
+                if (cur_thr >= S.prev_thr * 0.98) {
+                  // Halving helped  continue halving
+                  S.prev_thr = cur_thr; S.prev_batch = cur_batch;
+                  size_t half = std::max<size_t>(1, cur_batch / 2);
+                  if (half < cur_batch) { S.batch_size.store(half); }
+                  else { S.batch_size.store(S.best_batch); S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0; }
+                } else {
+                  // Halving worse  revert to best, try doubling
+                  S.prev_thr = S.best_thr; S.prev_batch = S.best_batch;
+                  S.batch_size.store(S.best_batch);
+                  S.phase = SharedTuneState::Phase::DOUBLE;
+                  if (opt.verbosity >= V_VERBOSE) {
+                    std::ostringstream os;
+                    os << "[auto-tune] halving worse, will try doubling (best=" << S.best_batch << ")";
+                    vlog(V_VERBOSE, opt, os.str() + "\n");
+                  }
+                }
+              } else if (S.phase == SharedTuneState::Phase::DOUBLE) {
+                // We're at best_batch measuring baseline before doubling, OR measuring after doubling
+                if (cur_batch == S.best_batch) {
+                  // At best  now try doubling
+                  S.prev_thr = cur_thr; S.prev_batch = cur_batch;
+                  size_t dbl = std::min(cur_batch * 2, S.vram_ceiling.load());
+                  if (dbl > cur_batch) { S.batch_size.store(dbl); }
+                  else { S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0; }
+                } else {
+                  if (cur_thr > S.best_thr) { S.best_thr = cur_thr; S.best_batch = cur_batch; }
+                  if (cur_thr >= S.prev_thr * 0.98) {
+                    // Doubling helped  continue
+                    S.prev_thr = cur_thr; S.prev_batch = cur_batch;
+                    size_t dbl = std::min(cur_batch * 2, S.vram_ceiling.load());
+                    if (dbl > cur_batch) { S.batch_size.store(dbl); }
+                    else { S.batch_size.store(S.best_batch); S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0; }
+                  } else {
+                    // Doubling worse  refine between best and current
+                    if (std::abs((long)cur_batch - (long)S.best_batch) > 2) {
+                      S.refine_lo = std::min(S.best_batch, cur_batch);
+                      S.refine_hi = std::max(S.best_batch, cur_batch);
+                      size_t mid = S.refine_lo + (S.refine_hi - S.refine_lo) / 2;
+                      S.batch_size.store(mid);
+                      S.phase = SharedTuneState::Phase::REFINE; S.refine_iters = 0;
+                      if (opt.verbosity >= V_VERBOSE) {
+                        std::ostringstream os;
+                        os << "[auto-tune] refining [" << S.refine_lo << ".." << S.refine_hi
+                           << "] trying " << mid;
+                        vlog(V_VERBOSE, opt, os.str() + "\n");
+                      }
+                    } else {
+                      S.batch_size.store(S.best_batch);
+                      S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
+                      if (opt.verbosity >= V_VERBOSE) {
+                        std::ostringstream os;
+                        os << "[auto-tune] settled at batch=" << S.best_batch
+                           << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
+                        vlog(V_VERBOSE, opt, os.str() + "\n");
+                      }
+                    }
+                  }
+                }
+              } else if (S.phase == SharedTuneState::Phase::REFINE) {
+                ++S.refine_iters;
+                if (cur_thr > S.best_thr) { S.best_thr = cur_thr; S.best_batch = cur_batch; }
+                if (cur_batch < S.best_batch) S.refine_lo = cur_batch;
+                else if (cur_batch > S.best_batch) S.refine_hi = cur_batch;
+                if (S.refine_hi - S.refine_lo <= 2 || S.refine_iters >= SharedTuneState::MAX_REFINE_ITERS) {
+                  S.batch_size.store(S.best_batch);
+                  S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
+                  if (opt.verbosity >= V_VERBOSE) {
+                    std::ostringstream os;
+                    os << "[auto-tune] refined, settled at batch=" << S.best_batch
+                       << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
+                    vlog(V_VERBOSE, opt, os.str() + "\n");
+                  }
+                } else {
+                  size_t mid = S.refine_lo + (S.refine_hi - S.refine_lo) / 2;
+                  if (mid == cur_batch) mid++;
+                  S.batch_size.store(mid);
                 }
               } else {
-                // Can't go smaller, try doubling instead
-                free_stream_buffers_only(C);
-                allocate_stream_buffers(C, C.tune_prev_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
-              }
-              continue;
-            }
-            // Now try doubling
-            size_t next = std::min(C.per_stream_batch * 2, C.tune_hi);
-            if (next > C.per_stream_batch) {
-              free_stream_buffers_only(C);
-              if (allocate_stream_buffers(C, next, gpu_chunk, max_out_chunk, comp_opts, opt)) {
-                C.tune_batches_at_size = 0;
-                if (opt.verbosity >= V_VERBOSE) {
-                  std::ostringstream os;
-                  os << "[GPU" << device_id << "] auto-tune: batch "
-                     << C.tune_prev_batch << " -> " << C.per_stream_batch
-                     << " (baseline thr=" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
-                  vlog(V_VERBOSE, opt, os.str() + "\n");
+                // SETTLED  continuous probing
+                // Alternate between trying larger (+50%) and smaller (-25%)
+                // to track changing data characteristics and find better batch sizes.
+                ++S.settle_ticks;
+                if (S.settle_ticks >= SharedTuneState::PROBE_INTERVAL) {
+                  S.settle_ticks = 0;
+                  // Update best throughput at current size
+                  if (cur_thr > S.best_thr) { S.best_thr = cur_thr; S.best_batch = cur_batch; }
+                  // Alternate: even ticks probe up, odd ticks probe down
+                  ++S.probe_count;
+                  bool probe_up = (S.probe_count % 2 == 0);
+                  size_t probe;
+                  if (probe_up) {
+                    probe = std::min(S.best_batch + S.best_batch / 4, S.vram_ceiling.load());
+                    if (probe <= S.best_batch) probe = S.best_batch + 1;
+                  } else {
+                    probe = std::max<size_t>(1, S.best_batch - S.best_batch / 4);
+                    if (probe >= S.best_batch) probe = std::max<size_t>(1, S.best_batch - 1);
+                  }
+                  if (probe != S.best_batch && probe <= S.vram_ceiling.load()) {
+                    S.prev_thr = cur_thr; S.prev_batch = S.best_batch;
+                    S.batch_size.store(probe);
+                    if (probe > S.best_batch) {
+                      S.phase = SharedTuneState::Phase::DOUBLE;
+                    } else {
+                      S.phase = SharedTuneState::Phase::HALVE;
+                    }
+                    if (opt.verbosity >= V_VERBOSE) {
+                      std::ostringstream os;
+                      os << "[auto-tune] probe: " << S.best_batch << " -> " << probe
+                         << " (" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
+                      vlog(V_VERBOSE, opt, os.str() + "\n");
+                    }
+                  }
                 }
-              } else {
-                free_stream_buffers_only(C);
-                allocate_stream_buffers(C, C.tune_best_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
-                C.tune_state = StreamCtx::TuneState::SETTLE;
-                C.tune_settle_count = 0;
               }
-            } else {
-              C.tune_state = StreamCtx::TuneState::SETTLE;
-              C.tune_settle_count = 0;
-            }
-            continue;
-          }
-
-          // Decide next size  continue in whichever direction was improving
-          size_t next = 0;
-          bool was_halving = (C.per_stream_batch < C.tune_prev_batch);
-          if (cur_thr >= C.tune_prev_thr * 0.98) {
-            // Current is as good or better  continue same direction
-            if (was_halving && C.per_stream_batch > 1) {
-              next = std::max<size_t>(1, C.per_stream_batch / 2);
-            } else if (!was_halving && C.per_stream_batch < C.tune_hi) {
-              next = std::min(C.per_stream_batch * 2, C.tune_hi);
-            } else {
-              // Hit a boundary  settle at best
-              C.tune_state = StreamCtx::TuneState::SETTLE;
-              C.tune_settle_count = 0;
-              if (C.per_stream_batch != C.tune_best_batch)
-                next = C.tune_best_batch;
-            }
-          } else {
-            // Current is worse  settle at best immediately
-            C.tune_state = StreamCtx::TuneState::SETTLE;
-            C.tune_settle_count = 0;
-            next = C.tune_best_batch;
-            if (opt.verbosity >= V_VERBOSE) {
-              std::ostringstream os;
-              os << "[GPU" << device_id << "] auto-tune: settled at batch="
-                 << C.tune_best_batch << " (" << std::fixed << std::setprecision(2)
-                 << C.tune_best_thr << " GiB/s)";
-              vlog(V_VERBOSE, opt, os.str() + "\n");
-            }
-          }
-
-          C.tune_prev_thr = cur_thr;
-          C.tune_prev_batch = C.per_stream_batch;
-
-          // Apply new batch size if changed
-          if (next > 0 && next != C.per_stream_batch) {
-            free_stream_buffers_only(C);
-            if (allocate_stream_buffers(C, next, gpu_chunk, max_out_chunk, comp_opts, opt)) {
-              C.tune_batches_at_size = 0;
-              if (opt.verbosity >= V_VERBOSE) {
-                std::ostringstream os;
-                os << "[GPU" << device_id << "] auto-tune: batch "
-                   << C.tune_prev_batch << " -> " << C.per_stream_batch
-                   << " (thr=" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s"
-                   << " best=" << C.tune_best_batch << "@" << C.tune_best_thr << ")";
-                vlog(V_VERBOSE, opt, os.str() + "\n");
-              }
-            } else {
-              // Can't allocate this size  shrink ceiling
-              free_stream_buffers_only(C);
-              C.tune_hi = next - 1;
-              allocate_stream_buffers(C, C.tune_best_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
-              C.tune_state = StreamCtx::TuneState::SETTLE;
-              C.tune_settle_count = 0;
-            }
-          } else if (C.tune_state == StreamCtx::TuneState::SETTLE
-                     && C.per_stream_batch != C.tune_best_batch) {
-            // Revert to best for settle
-            free_stream_buffers_only(C);
-            allocate_stream_buffers(C, C.tune_best_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
-            C.tune_batches_at_size = 0;
-          }
-
-        } else {
-          // SETTLE state  use best batch size, periodically probe
-          ++C.tune_settle_count;
-          if (C.tune_settle_count >= C.TUNE_PROBE_INTERVAL) {
-            // Probe: try doubling to see if data changed and larger batches help now
-            size_t probe = std::min(C.per_stream_batch * 2, std::min(per_stream_cap, HARD_BATCH_CAP));
-            if (probe > C.per_stream_batch) {
-              C.tune_state = StreamCtx::TuneState::EXPLORE;
-              C.tune_lo = C.tune_best_batch / 2;
-              C.tune_hi = std::min(probe, std::min(per_stream_cap, HARD_BATCH_CAP));
-              C.tune_prev_thr = cur_thr;
-              C.tune_prev_batch = C.per_stream_batch;
-              free_stream_buffers_only(C);
-              if (allocate_stream_buffers(C, probe, gpu_chunk, max_out_chunk, comp_opts, opt)) {
-                C.tune_batches_at_size = 0;
-                if (opt.verbosity >= V_VERBOSE) {
-                  std::ostringstream os;
-                  os << "[GPU" << device_id << "] auto-tune: probe " << probe
-                     << " (was " << C.tune_prev_batch << ")";
-                  vlog(V_VERBOSE, opt, os.str() + "\n");
-                }
-              } else {
-                free_stream_buffers_only(C);
-                allocate_stream_buffers(C, C.tune_best_batch, gpu_chunk, max_out_chunk, comp_opts, opt);
-                C.tune_state = StreamCtx::TuneState::SETTLE;
-                C.tune_settle_count = 0;
-              }
-            } else {
-              C.tune_settle_count = 0;  // at cap, reset probe timer
             }
           }
         }
@@ -3120,7 +3162,12 @@ static void gpu_worker(
         if (sched) sched->gpu_wants_data();
         // Greedy pop: wait for a full batch (per_stream_batch) or producer done.
         // This maximizes GPU kernel efficiency by processing many chunks per launch.
-        if (!queue->pop_batch_greedy(C.per_stream_batch, C.batch)) {
+        // Use shared batch size from auto-tuner (or per-stream if locked)
+        size_t pop_n = (shared_tune && !shared_tune->locked.load())
+                     ? shared_tune->batch_size.load(std::memory_order_relaxed)
+                     : C.per_stream_batch;
+        pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
+        if (!queue->pop_batch_greedy(pop_n, C.batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           producer_done_seen = true; continue;
@@ -3267,6 +3314,13 @@ static void gpu_worker(
           C.stats.batches  += 1;
           C.stats.chunks   += C.filled;
 
+          // Report to shared auto-tuner (both completion paths)
+          if (shared_tune && !shared_tune->locked.load()) {
+            shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
+            shared_tune->window_ns.fetch_add(uint64_t(tot_ms * 1e6), std::memory_order_relaxed);
+            shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
+          }
+
           // -vv: batch completion line
           if (opt.verbosity >= V_DEBUG) {
             char in_s[32], out_s[32];
@@ -3376,6 +3430,13 @@ static void gpu_worker(
           C.stats.out_bytes += out_sum;
           C.stats.batches  += 1;
           C.stats.chunks   += C.filled;
+
+          // Report to shared auto-tuner (sync path)
+          if (shared_tune && !shared_tune->locked.load()) {
+            shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
+            shared_tune->window_ns.fetch_add(uint64_t(tot_ms * 1e6), std::memory_order_relaxed);
+            shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
+          }
 
           if (opt.verbosity >= V_DEBUG) {
             char in_s[32], out_s[32];
@@ -3817,12 +3878,19 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   opt_for_workers.chunk_mib = chosen_mib;
   std::vector<std::string> fatal_msgs(gpu_count);
 
+  // Shared auto-tune state: all GPUs coordinate batch size through this
+  SharedTuneState shared_tune;
+  shared_tune.batch_size.store(opt.gpu_batch_cap);
+  shared_tune.locked.store(opt.gpu_batch_user_set);
+  // VRAM ceiling will be refined by the first worker's binary search
+
   for (int i = 0; i < gpu_count; ++i) {
     workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
                          &queue, &rescue, &results,
                          &per_dev[size_t(i)], &json_sink, m, sched,
                          &any_gpu_failed, &abort_on_failure,
-                         &fatal_msgs[size_t(i)], &gpu_started);
+                         &fatal_msgs[size_t(i)], &gpu_started,
+                         &shared_tune);
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
@@ -3942,7 +4010,8 @@ static void gpu_decomp_worker(
   HybridSched * sched,
   std::atomic<bool> * any_gpu_failed,
   std::atomic<bool> * abort_on_failure,
-  std::string * fatal_msg)
+  std::string * fatal_msg,
+  SharedTuneState * shared_tune)
 {
   (void)m;
   try {
@@ -3976,7 +4045,7 @@ static void gpu_decomp_worker(
       std::chrono::steady_clock::time_point last_adjust{ std::chrono::steady_clock::now() };
       uint64_t tune_in_bytes = 0;      // bytes processed since last tune check
       double   tune_elapsed_ms = 0.0;  // ms elapsed since last tune check
-      enum class TuneState { EXPLORE, SETTLE };
+      enum class TuneState { EXPLORE, REFINE, SETTLE };
       TuneState tune_state = TuneState::EXPLORE;
       size_t    tune_lo = 0, tune_hi = 0;
       size_t    tune_best_batch = 0;
@@ -4133,96 +4202,139 @@ static void gpu_decomp_worker(
     while (true) {
       bool submitted_any = false;
 
-      // ---- Continuous batch-size auto-tuner (decompress) ----
-      // Same binary-search / hill-climb as compress.  Adjusts per_stream_cap
-      // based on measured throughput.  ensure_buffers handles VRAM allocation.
-      // DISABLED when user explicitly sets --gpu-batch.
-      if (!opt.gpu_batch_user_set)
-      for (auto & C : ctxs) {
-        if (C.busy) continue;
+      // ---- Shared auto-tuner (decompress) ----
+      // All GPUs report throughput to SharedTuneState. Same logic as compress.
+      // Whichever worker grabs the mutex first runs the tune decision.
+      if (shared_tune && !shared_tune->locked.load()) {
         auto now = std::chrono::steady_clock::now();
-        double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - C.last_adjust).count();
-        if (secs < 0.3) continue;
-        C.last_adjust = now;
+        if (shared_tune->window_batches.load(std::memory_order_relaxed) >= SharedTuneState::MIN_BATCHES) {
+          std::unique_lock<std::mutex> lk(shared_tune->tune_mtx, std::try_to_lock);
+          if (lk.owns_lock()) {
+            double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
+                now - shared_tune->last_tune).count();
+            if (secs >= SharedTuneState::TUNE_SEC) {
+              shared_tune->last_tune = now;
+              uint64_t bytes = shared_tune->window_bytes.exchange(0);
+              uint64_t ns = shared_tune->window_ns.exchange(0);
+              shared_tune->window_batches.store(0);
+              double cur_thr = (ns > 0) ? double(bytes) / (double(ns)/1e9) / 1e9 : 0.0;
+              size_t cur_batch = shared_tune->batch_size.load();
 
-        if (C.tune_hi == 0) {
-          C.tune_lo = 1;
-          C.tune_hi = std::min((size_t)HARD_BATCH_CAP, (size_t)512);
-          C.tune_best_batch = per_stream_cap;
-          continue;
-        }
-
-        double cur_thr = 0.0;
-        if (C.tune_in_bytes > 0 && secs > 0.0)
-          cur_thr = double(C.tune_in_bytes) / secs / 1e9;
-        C.tune_in_bytes = 0;  // reset for next measurement window
-        C.tune_batches_at_size++;
-
-        if (C.tune_batches_at_size < C.TUNE_MIN_BATCHES) continue;
-
-        if (C.tune_state == DecompStreamCtx::TuneState::EXPLORE) {
-          if (cur_thr > C.tune_best_thr) {
-            C.tune_best_thr = cur_thr;
-            C.tune_best_batch = per_stream_cap;
-          }
-
-          size_t next = 0;
-          if (C.tune_prev_batch == 0) {
-            next = std::min(per_stream_cap * 2, C.tune_hi);
-          } else if (cur_thr >= C.tune_prev_thr * 0.98) {
-            C.tune_lo = per_stream_cap;
-            if (per_stream_cap >= C.tune_hi) {
-              C.tune_state = DecompStreamCtx::TuneState::SETTLE;
-              C.tune_settle_count = 0;
-              next = C.tune_best_batch;
-            } else {
-              next = per_stream_cap + (C.tune_hi - per_stream_cap + 1) / 2;
-            }
-          } else {
-            C.tune_hi = per_stream_cap;
-            if (C.tune_hi <= C.tune_lo + 1) {
-              C.tune_state = DecompStreamCtx::TuneState::SETTLE;
-              C.tune_settle_count = 0;
-              next = C.tune_best_batch;
-            } else {
-              next = C.tune_lo + (C.tune_hi - C.tune_lo) / 2;
-            }
-          }
-
-          C.tune_prev_thr = cur_thr;
-          C.tune_prev_batch = per_stream_cap;
-
-          if (next > 0 && next != per_stream_cap) {
-            if (opt.verbosity >= V_VERBOSE) {
-              std::ostringstream os;
-              os << "[GPU-D" << device_id << "] auto-tune: batch "
-                 << per_stream_cap << " -> " << next
-                 << " (thr=" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s"
-                 << " best=" << C.tune_best_batch << "@" << C.tune_best_thr << ")";
-              vlog(V_VERBOSE, opt, os.str() + "\n");
-            }
-            per_stream_cap = next;
-            C.tune_batches_at_size = 0;
-          }
-        } else {
-          ++C.tune_settle_count;
-          if (C.tune_settle_count >= C.TUNE_PROBE_INTERVAL) {
-            size_t probe = std::min(per_stream_cap * 2, (size_t)512);
-            if (probe > per_stream_cap) {
-              C.tune_state = DecompStreamCtx::TuneState::EXPLORE;
-              C.tune_lo = C.tune_best_batch / 2;
-              C.tune_hi = probe;
-              C.tune_prev_thr = cur_thr;
-              C.tune_prev_batch = per_stream_cap;
-              per_stream_cap = probe;
-              C.tune_batches_at_size = 0;
-              if (opt.verbosity >= V_VERBOSE) {
-                std::ostringstream os;
-                os << "[GPU-D" << device_id << "] auto-tune: probe " << probe;
-                vlog(V_VERBOSE, opt, os.str() + "\n");
+              auto & S = *shared_tune;
+              if (S.phase == SharedTuneState::Phase::BASELINE) {
+                S.best_batch = cur_batch; S.best_thr = cur_thr;
+                S.prev_batch = cur_batch; S.prev_thr = cur_thr;
+                size_t half = std::max<size_t>(1, cur_batch / 2);
+                if (half < cur_batch) {
+                  S.batch_size.store(half);
+                  S.phase = SharedTuneState::Phase::HALVE;
+                  if (opt.verbosity >= V_VERBOSE) {
+                    std::ostringstream os;
+                    os << "[auto-tune-D] baseline=" << cur_batch << " ("
+                       << std::fixed << std::setprecision(2) << cur_thr << " GiB/s) -> try " << half;
+                    vlog(V_VERBOSE, opt, os.str() + "\n");
+                  }
+                } else {
+                  S.batch_size.store(std::min(cur_batch * 2, S.vram_ceiling.load()));
+                  S.phase = SharedTuneState::Phase::DOUBLE;
+                }
+              } else if (S.phase == SharedTuneState::Phase::HALVE) {
+                if (cur_thr > S.best_thr) { S.best_thr = cur_thr; S.best_batch = cur_batch; }
+                if (cur_thr >= S.prev_thr * 0.98) {
+                  S.prev_thr = cur_thr; S.prev_batch = cur_batch;
+                  size_t half = std::max<size_t>(1, cur_batch / 2);
+                  if (half < cur_batch) { S.batch_size.store(half); }
+                  else { S.batch_size.store(S.best_batch); S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0; }
+                } else {
+                  S.prev_thr = S.best_thr; S.prev_batch = S.best_batch;
+                  S.batch_size.store(S.best_batch);
+                  S.phase = SharedTuneState::Phase::DOUBLE;
+                  if (opt.verbosity >= V_VERBOSE) {
+                    std::ostringstream os;
+                    os << "[auto-tune-D] halving worse, will try doubling (best=" << S.best_batch << ")";
+                    vlog(V_VERBOSE, opt, os.str() + "\n");
+                  }
+                }
+              } else if (S.phase == SharedTuneState::Phase::DOUBLE) {
+                if (cur_batch == S.best_batch) {
+                  S.prev_thr = cur_thr; S.prev_batch = cur_batch;
+                  size_t dbl = std::min(cur_batch * 2, S.vram_ceiling.load());
+                  if (dbl > cur_batch) { S.batch_size.store(dbl); }
+                  else { S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0; }
+                } else {
+                  if (cur_thr > S.best_thr) { S.best_thr = cur_thr; S.best_batch = cur_batch; }
+                  if (cur_thr >= S.prev_thr * 0.98) {
+                    S.prev_thr = cur_thr; S.prev_batch = cur_batch;
+                    size_t dbl = std::min(cur_batch * 2, S.vram_ceiling.load());
+                    if (dbl > cur_batch) { S.batch_size.store(dbl); }
+                    else { S.batch_size.store(S.best_batch); S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0; }
+                  } else {
+                    if (std::abs((long)cur_batch - (long)S.best_batch) > 2) {
+                      S.refine_lo = std::min(S.best_batch, cur_batch);
+                      S.refine_hi = std::max(S.best_batch, cur_batch);
+                      S.batch_size.store(S.refine_lo + (S.refine_hi - S.refine_lo) / 2);
+                      S.phase = SharedTuneState::Phase::REFINE; S.refine_iters = 0;
+                    } else {
+                      S.batch_size.store(S.best_batch);
+                      S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
+                    }
+                    if (opt.verbosity >= V_VERBOSE) {
+                      std::ostringstream os;
+                      os << "[auto-tune-D] settled at batch=" << S.best_batch
+                         << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
+                      vlog(V_VERBOSE, opt, os.str() + "\n");
+                    }
+                  }
+                }
+              } else if (S.phase == SharedTuneState::Phase::REFINE) {
+                ++S.refine_iters;
+                if (cur_thr > S.best_thr) { S.best_thr = cur_thr; S.best_batch = cur_batch; }
+                if (cur_batch < S.best_batch) S.refine_lo = cur_batch;
+                else if (cur_batch > S.best_batch) S.refine_hi = cur_batch;
+                if (S.refine_hi - S.refine_lo <= 2 || S.refine_iters >= SharedTuneState::MAX_REFINE_ITERS) {
+                  S.batch_size.store(S.best_batch);
+                  S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
+                  if (opt.verbosity >= V_VERBOSE) {
+                    std::ostringstream os;
+                    os << "[auto-tune-D] refined, settled at batch=" << S.best_batch;
+                    vlog(V_VERBOSE, opt, os.str() + "\n");
+                  }
+                } else {
+                  size_t mid = S.refine_lo + (S.refine_hi - S.refine_lo) / 2;
+                  if (mid == cur_batch) mid++;
+                  S.batch_size.store(mid);
+                }
+              } else {
+                ++S.settle_ticks;
+                if (S.settle_ticks >= SharedTuneState::PROBE_INTERVAL) {
+                  S.settle_ticks = 0;
+                  if (cur_thr > S.best_thr) { S.best_thr = cur_thr; S.best_batch = cur_batch; }
+                  ++S.probe_count;
+                  bool probe_up = (S.probe_count % 2 == 0);
+                  size_t probe;
+                  if (probe_up) {
+                    probe = std::min(S.best_batch + S.best_batch / 4, S.vram_ceiling.load());
+                    if (probe <= S.best_batch) probe = S.best_batch + 1;
+                  } else {
+                    probe = std::max<size_t>(1, S.best_batch - S.best_batch / 4);
+                    if (probe >= S.best_batch) probe = std::max<size_t>(1, S.best_batch - 1);
+                  }
+                  if (probe != S.best_batch && probe <= S.vram_ceiling.load()) {
+                    S.prev_thr = cur_thr; S.prev_batch = S.best_batch;
+                    S.batch_size.store(probe);
+                    if (probe > S.best_batch)
+                      S.phase = SharedTuneState::Phase::DOUBLE;
+                    else
+                      S.phase = SharedTuneState::Phase::HALVE;
+                    if (opt.verbosity >= V_VERBOSE) {
+                      std::ostringstream os;
+                      os << "[auto-tune-D] probe: " << S.best_batch << " -> " << probe
+                         << " (" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
+                      vlog(V_VERBOSE, opt, os.str() + "\n");
+                    }
+                  }
+                }
               }
-            } else {
-              C.tune_settle_count = 0;
             }
           }
         }
@@ -4235,7 +4347,11 @@ static void gpu_decomp_worker(
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
         // Signal scheduler: this GPU stream wants data (blocks CPU workers)
         if (sched) sched->gpu_wants_data();
-        if (!queue->pop_batch_greedy(per_stream_cap, C.batch)) {
+        // Use shared batch size from auto-tuner (all GPUs coordinate)
+        size_t pop_n = (shared_tune && !shared_tune->locked.load())
+                     ? std::min(shared_tune->batch_size.load(std::memory_order_relaxed), per_stream_cap)
+                     : per_stream_cap;
+        if (!queue->pop_batch_greedy(pop_n, C.batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) {
             g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
@@ -4256,7 +4372,7 @@ static void gpu_decomp_worker(
         }
         if (sched) sched->mark_gpu_take(C.batch.size());
         C.filled = C.batch.size();
-        uint64_t batch_t0 = g_perf ? now_ns() : 0;
+        uint64_t batch_t0 = now_ns();  // always record for auto-tuner (not just -vvv)
 
         // Determine max sizes for this batch
         size_t max_comp = 0, max_decomp = 0;
@@ -4431,8 +4547,12 @@ static void gpu_decomp_worker(
           for (size_t i = 0; i < C.filled; ++i)
             in_sum += C.batch[i].data.size();
           if (m) m->read_bytes.fetch_add(in_sum);
-          // Accumulate for auto-tuner throughput measurement
-          C.tune_in_bytes += in_sum;
+          // Report to shared auto-tuner
+          if (shared_tune && !shared_tune->locked.load()) {
+            shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
+            shared_tune->window_ns.fetch_add(now_ns() - batch_t0, std::memory_order_relaxed);
+            shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
+          }
         }
 
         if (sched) sched->add_gpu_bytes(out_sum);
@@ -4580,6 +4700,12 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::vector<int> gpu_ids;
   std::vector<std::thread> gpu_workers;
   std::vector<std::string> fatal_msgs;
+
+  // Shared auto-tune state for decompress GPUs
+  SharedTuneState shared_tune_decomp;
+  shared_tune_decomp.batch_size.store(opt.gpu_batch_cap);
+  shared_tune_decomp.locked.store(opt.gpu_batch_user_set);
+
   if (device_count > 0) {
     gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
     const int gpu_count = (int)gpu_ids.size();
@@ -4588,7 +4714,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], opt,
                                &queue, &rescue, &results, m, sched,
                                &any_gpu_failed, &abort_on_failure,
-                               &fatal_msgs[size_t(i)]);
+                               &fatal_msgs[size_t(i)],
+                               &shared_tune_decomp);
     }
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -4653,8 +4780,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   rescue.set_done();
-  if (!cpu_pool.empty())
+  if (!cpu_pool.empty()) {
+    auto t_cpu = std::chrono::steady_clock::now();
     for (auto & th : cpu_pool) th.join();
+    if (opt.verbosity >= V_VERBOSE) {
+      double ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
+          std::chrono::steady_clock::now() - t_cpu).count();
+      if (ms > 500)
+        vlog(V_VERBOSE, opt, "CPU pool join: " + std::to_string(int(ms)) + " ms\n");
+    }
+  }
 
   {
     std::lock_guard<std::mutex> lk(results.m);
@@ -4667,7 +4802,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     if (tick_thr.joinable()) tick_thr.join();
   }
 
-  writer_thr.join();
+  {
+    auto t_wr = std::chrono::steady_clock::now();
+    writer_thr.join();
+    if (opt.verbosity >= V_VERBOSE) {
+      double ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
+          std::chrono::steady_clock::now() - t_wr).count();
+      if (ms > 500)
+        vlog(V_VERBOSE, opt, "writer join: " + std::to_string(int(ms)) + " ms\n");
+    }
+  }
 
   if (g_perf) {
     g_perf->print_summary(opt.hybrid ? "HYBRID DECOMPRESS" :
@@ -4783,14 +4927,14 @@ int main(int argc, char ** argv)
     struct stat st;
     bool is_regular = (stat(write_path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
     if (is_regular) {
-      auto dw = std::make_unique<DirectWriter>();
-      if (dw->open(write_path)) {
-        // Close the FILE*  DirectWriter owns the fd now
-        if (out) { std::fclose(out); out = nullptr; }
-        direct_writer = std::move(dw);
-        vlog(V_VERBOSE, opt, "using O_DIRECT for output (bypass page cache)\n");
+      {
+        auto dw = std::make_unique<DirectWriter>();
+        if (dw->open(write_path)) {
+          if (out) { std::fclose(out); out = nullptr; }
+          direct_writer = std::move(dw);
+          vlog(V_VERBOSE, opt, "using O_DIRECT for output (bypass page cache)\n");
+        }
       }
-      // If O_DIRECT open fails (filesystem doesn't support it), keep using FILE*
     }
   }
   DirectWriter * dw_ptr = direct_writer.get();
@@ -4959,8 +5103,10 @@ int main(int argc, char ** argv)
   if (opt.mode == Mode::DECOMPRESS) {
     prog_done = true;
     if (prog_thr.joinable()) prog_thr.join();
-    // Summary is printed after fsync below so throughput includes flush time
+    // Summary is printed after finalize below
   }
+
+  double finalize_ms = 0, sync_ms = 0;
 
   if (!to_stdout) {
     // Flush buffered writes to disk.  For large decompressed files this
@@ -4975,26 +5121,32 @@ int main(int argc, char ** argv)
       std::string in_name = (opt.input == "-") ? "(stdin)" : opt.input;
       char flush_line[512];
       std::snprintf(flush_line, sizeof(flush_line),
-        "%s : %s => %s, flushing to disk...",
+        "%s : %s => %s, writing...",
         in_name.c_str(), in_s, out_s);
       std::fprintf(stderr, "\r%s\033[K", flush_line);
       std::fflush(stderr);
     }
-    // Finalize DirectWriter (flush remaining data, handle unaligned tail)
+    // Finalize writer (write unaligned tail, close fd)
 #ifndef _WIN32
     if (g_direct_writer) {
+      auto t_fin = std::chrono::steady_clock::now();
       if (!g_direct_writer->finalize())
         die("failed to finalize O_DIRECT output");
       g_direct_writer = nullptr;
-      direct_writer.reset();  // closes the fd
+      direct_writer.reset();
+      finalize_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
+          std::chrono::steady_clock::now() - t_fin).count();
     }
 #endif
     if (out) {
-      fsync_file(out);
+      if (opt.sync_output) {
+        fsync_file(out);
+      }
       std::fclose(out);
     }
     std::fclose(in);
     if (use_atomic) {
+      auto t_rename = std::chrono::steady_clock::now();
       // Atomic overwrite: rename .tmp to final output
       std::error_code ec_rename; fs::rename(tmp, opt.output, ec_rename);
       if (ec_rename) {
@@ -5003,6 +5155,10 @@ int main(int argc, char ** argv)
         if (!src || !dst) die("failed to finalize output file");
         dst << src.rdbuf(); src.close(); dst.close(); fs::remove(tmp);
       }
+      double rename_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
+          std::chrono::steady_clock::now() - t_rename).count();
+      if (opt.verbosity >= V_VERBOSE && rename_ms > 100)
+        vlog(V_VERBOSE, opt, "atomic rename: " + std::to_string(int(rename_ms)) + " ms\n");
     }
     // Success: disarm cleanup (temp or direct output file is now final)
     clear_tmp_file();
@@ -5040,7 +5196,7 @@ int main(int argc, char ** argv)
     std::fflush(stderr);
   }
 
-  // Decompression summary (printed after fsync so throughput includes flush time)
+  // Decompression summary
   if (opt.verbosity >= V_DEFAULT && opt.mode == Mode::DECOMPRESS) {
     uint64_t in_bytes  = meter.read_bytes.load();
     uint64_t out_bytes = meter.wrote_bytes.load();
@@ -5059,6 +5215,14 @@ int main(int argc, char ** argv)
       in_name.c_str(), in_s, out_s, out_name.c_str(), rate_s);
     std::fprintf(stderr, "\r%s\033[K\n", summary);
     std::fflush(stderr);
+  }
+
+  // Print finalize/fsync timing (deferred until after summary line)
+  if (opt.verbosity >= V_VERBOSE) {
+    if (finalize_ms > 100)
+      vlog(V_VERBOSE, opt, "DirectWriter finalize: " + std::to_string(int(finalize_ms)) + " ms\n");
+    if (sync_ms > 100)
+      vlog(V_VERBOSE, opt, "fsync: " + std::to_string(int(sync_ms)) + " ms\n");
   }
 
   vlog(V_VERBOSE, opt, "done.\n");
@@ -5109,6 +5273,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "-f") opt.force = true;
     else if (a == "--sparse") opt.sparse_mode = 1;
     else if (a == "--no-sparse") opt.sparse_mode = 0;
+    else if (a == "--sync-output") opt.sync_output = true;
     else if (a == "-c") opt.to_stdout = true;
     else if (a == "-v") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
@@ -5219,19 +5384,20 @@ static Options parse_args(int argc, char ** argv)
   // scratch allocation).  But very large batches delay the writer since it
   // can't start until the batch finishes.  Auto-tune for ~4 batches total
   // to balance kernel efficiency with GPU-writer overlap.
+  // Decompress batch: start based on file size, auto-tuner refines from there.
+  // Small files: start low (16) so the tuner converges quickly.
+  // Large files (>75 GiB): start high (256)  benchmarks show H100s perform
+  // well at large batch sizes, and starting low wastes minutes exploring upward.
   if (!opt.gpu_batch_user_set && (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST)) {
     uint64_t input_size = 0;
     if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
       input_size = (uint64_t)fs::file_size(opt.input);
-    if (input_size > 0) {
-      size_t chunk = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
-      size_t est_frames = std::max<size_t>(1, (size_t)(input_size / chunk) + 1);
-      size_t target_batches = 4;
-      size_t auto_batch = std::max<size_t>(16, est_frames / target_batches);
-      auto_batch = std::min(auto_batch, (size_t)512);  // auto caps at 512; user --gpu-batch can go to 1024
-      opt.gpu_batch_cap = auto_batch;
+    if (input_size > 75ULL * 1024 * 1024 * 1024) {
+      opt.gpu_batch_cap = 256;
+    } else if (input_size > 10ULL * 1024 * 1024 * 1024) {
+      opt.gpu_batch_cap = 64;
     } else {
-      opt.gpu_batch_cap = 64;  // default for pipes/unknown size
+      opt.gpu_batch_cap = DEFAULT_GPU_DECOMP_BATCH_CAP;  // 16
     }
   }
   if (opt.gpu_streams == 0) opt.gpu_streams = DEFAULT_GPU_STREAMS;
