@@ -1,0 +1,228 @@
+# gzstd v1.0 Roadmap & Battle Plan
+
+**Current version:** v0.10.34
+**Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
+
+---
+
+## Phase 1: Scheduling Overhaul
+
+### 1.1 Remove 2-GPU Decompress Cap
+**Priority: High | Complexity: Low**
+
+Currently decompress defaults to 2 GPUs based on early PCIe bandwidth assumptions. Instead, use all available GPUs but scale batch sizes by measured utilization (see 1.2).
+
+- Remove hardcoded `device_count = std::min(device_count, 2)` for decompress
+- Let `select_best_gpus()` return all viable GPUs
+- The utilization-scaled dispatch (1.2) handles GPUs that are partially busy
+
+### 1.2 Utilization-Scaled GPU Batch Sizing
+**Priority: High | Complexity: Medium**
+
+Query NVML utilization at dispatch time. Scale batch size inversely with load:
+
+```
+effective_batch = base_batch * (1.0 - gpu_utilization)
+```
+
+- GPU at 0% → full batch (e.g., 256 frames)
+- GPU at 50% → half batch (128 frames)
+- GPU at 90%+ → skip entirely (don't waste PCIe bandwidth)
+
+This serves two purposes: (a) GPUs under student load contribute proportionally instead of blocking, and (b) scaled batches finish at roughly the same time → results arrive in order → writer doesn't stall.
+
+NVML query cost: ~1ms per call, amortized over batch processing time (100ms+). Negligible.
+
+### 1.3 Rate-Matched Dispatch (CPU/GPU Throughput Calibration)
+**Priority: High | Complexity: Medium**
+
+Measure CPU and GPU throughput during calibration phase (first 2-3 seconds), then partition frames so both finish at the same time.
+
+**Calibration:**
+```
+T_gpu = bytes_processed / wall_time  (per device, from auto-tuner data)
+T_cpu = bytes_processed / wall_time  (per thread, new measurement)
+T_cpu_total = T_cpu * num_cpu_threads
+```
+
+**Dispatch each round:**
+```
+gpu_batch_time = gpu_batch_size * avg_frame_size / T_gpu
+cpu_frames = floor(gpu_batch_time * T_cpu_total / avg_frame_size)
+```
+
+CPU gets exactly enough frames to finish when the GPU batch returns. Results arrive interleaved but roughly in order.
+
+Update calibration with sliding window (EMA) to track changing data characteristics.
+
+### 1.4 Sequential Frame Assignment
+**Priority: Medium | Complexity: Low**
+
+Instead of round-robin frame dispatch, assign contiguous ranges:
+- GPU 0: frames 0-255
+- GPU 1: frames 256-511
+- CPU pool: frames 512-537
+
+The writer can drain entire runs without waiting for out-of-order frames. This directly reduces the result queue memory footprint and writer stall time.
+
+### 1.5 I/O Thread Pinning
+**Priority: Medium | Complexity: Low**
+
+Pin reader and writer threads to dedicated cores (e.g., cores 0-1 on the local NUMA node). Exclude these cores from the CPU worker pool.
+
+For `-T0` (all threads): use `hardware_concurrency() - 2` workers. Exception: systems with ≤4 cores use `hardware_concurrency() - 1` (reader/writer share a core).
+
+This prevents worker threads from preempting I/O threads, which was the root cause of the v0.9.52 regression (256 threads starved the I/O pipeline).
+
+---
+
+## Phase 2: Persistent Auto-Tuning (`~/.gzstd/`)
+
+### 2.1 Per-Machine Performance Profile
+**Priority: Medium | Complexity: Medium**
+
+Create `~/.gzstd/` directory on first run. Store tuning data:
+
+```
+~/.gzstd/
+  profile.json          # machine fingerprint + tuning results
+  tuning_history.csv    # raw measurements for analysis
+```
+
+**Machine fingerprint:**
+- CPU: model, core count, cache sizes, NUMA topology
+- GPU: model(s), VRAM, PCIe gen/width, driver version
+- Storage: detected NVMe model, measured sequential write speed
+- Kernel: version, io_uring support (tested, not assumed)
+
+**Stored tuning data:**
+- Optimal compress batch size per GPU model
+- Optimal decompress batch size per GPU model
+- CPU throughput per core (GiB/s for compress and decompress)
+- GPU throughput per device (GiB/s for compress and decompress)
+- NVMe write throughput (GiB/s, for writer thread sizing)
+- CPU/GPU ratio for rate-matched dispatch
+
+### 2.2 Calibration Run
+**Priority: Medium | Complexity: Medium**
+
+`gzstd --calibrate` runs a quick benchmark suite (30-60 seconds):
+1. Small compress/decompress on CPU (measures per-core throughput)
+2. Small compress/decompress on each GPU (measures per-device throughput)
+3. Sequential write benchmark (measures NVMe speed)
+4. Stores results in `~/.gzstd/profile.json`
+
+Subsequent runs read the profile and start with known-optimal settings. The runtime auto-tuner still runs but converges instantly since it starts at the right point.
+
+### 2.3 Automatic Profile Updates
+**Priority: Low | Complexity: Low**
+
+After each run, if the auto-tuner found a different optimal than the profile predicted, update the profile. This handles hardware changes (new GPU, driver update, different NVMe) without requiring explicit recalibration.
+
+---
+
+## Phase 3: Piped I/O Optimization
+
+### 3.1 Pipe-Aware Scheduling
+**Priority: Medium | Complexity: Medium**
+
+Piped input (`stdin`) has unique constraints:
+- Can't seek → no parallel readers
+- Can't know file size → no file-size-based defaults
+- May be slow (network pipe, other process) → reader becomes bottleneck
+
+Optimizations for piped input:
+- Start with conservative batch sizes (8-16), let auto-tuner grow
+- Monitor reader throughput; if reader < GPU throughput, reduce GPU batch size to avoid starving the pipeline
+- CPU workers can start immediately (no GPU warm-up delay matters since reader is slow)
+
+Piped output (`stdout`) has different constraints:
+- Can't use O_DIRECT → buffered writes only
+- Can't seek → no sparse file optimization
+- May have backpressure (downstream pipe consumer is slow)
+
+Optimizations for piped output:
+- Monitor write throughput; if writer < decompression rate, apply backpressure to workers (slow down production to match consumption)
+- Skip sparse detection (can't seek)
+
+### 3.2 Streaming Mode for Unknown-Size Input
+**Priority: Low | Complexity: Low**
+
+When input size is unknown (pipe), the frame count is unknown. The auto-tuner must be more conservative:
+- Don't set tune_hi too high (we might run out of frames before exploring)
+- Shorter probe interval (adapt faster)
+- Skip the "file size > 75 GiB" logic (we don't know)
+
+---
+
+## Phase 4: Parallel I/O (Research)
+
+### 4.1 Multi-Reader for NVMe
+**Priority: Low | Complexity: High | Status: Research needed**
+
+**The idea:** Open the input file N times, each reader seeks to offset `i * filesize / N`, reads its chunk in parallel. NVMe drives have deep internal queues and can serve multiple read streams simultaneously.
+
+**Why it might work:**
+- NVMe SSDs have 64-128 internal command queues
+- A single `read()` thread can only keep 1 queue busy (queue depth 1)
+- Multiple threads doing `pread()` at different offsets can saturate the device
+- Measured NVMe sequential read: ~3-5 GiB/s single-thread, ~6-7 GiB/s theoretical max
+
+**Why it might NOT work:**
+- Linux readahead is already very good for sequential access
+- Multiple readers cause random-ish access patterns from the NVMe's perspective (seeking between N positions)
+- Page cache thrashing with N large read streams
+- For compression: frames must still be processed in order (reader produces frames sequentially for the compressor)
+- For decompression: the zstd frame boundaries must be found before parallel reading is possible (frames are variable-length in the compressed file)
+
+**Decompression-specific challenge:** The compressed file has variable-length frames. You can't just split at byte offsets  you need to find frame headers. A pre-scan of the frame index (skippable frames or magic number search) could identify split points, but adds latency.
+
+**Verdict:** Likely small gain for compression (reader is rarely the bottleneck  3+ GiB/s single-thread is usually enough). For decompression, the complexity of frame boundary detection likely outweighs the benefit. Worth benchmarking with a simple 2-reader prototype before committing.
+
+### 4.2 Multi-Writer with pwrite()
+**Priority: Low | Complexity: Medium | Status: Tested, negative for buffered I/O**
+
+**Already tested in v0.10.29:** 4 pwrite threads through page cache was 2.5× slower due to page cache thrashing (38 minutes sys time vs 12 minutes with O_DIRECT).
+
+**Untested variant:** Multiple pwrite threads with O_DIRECT. Each thread opens its own fd with O_DIRECT, writes to non-overlapping aligned regions. This avoids page cache entirely. Requires knowing output frame sizes in advance (possible for decompression, not for compression).
+
+**Risk:** O_DIRECT pwrite per-frame was catastrophic in v0.9.72 (27k individual pwrite calls). But with larger writes (batch of frames concatenated into one pwrite per thread), the overhead might be acceptable.
+
+**Verdict:** Low priority. The NVMe write ceiling (~2-3 GiB/s) is the physical limit. Multiple O_DIRECT writers might get 10-20% more by keeping the NVMe queue deeper, but the complexity is high.
+
+---
+
+## Future Ideas (v2.0+)
+
+### Speculative CPU/GPU Racing
+Submit the same frame to both CPU and GPU. Take whichever finishes first, discard the other. Skip GPU D2H transfer when CPU wins.
+
+**Pros:** Optimal for mixed-compressibility data. Minimal cost on 256-core machines (2 speculative CPU threads = <1% overhead).
+
+**Cons:** Fights the auto-tuner (GPU sees stolen frames as lower throughput). Memory pressure (frame exists twice). GPU slot wasted even when CPU wins (H2D already happened). Significant architectural complexity.
+
+**Verdict:** Rate-matched dispatch (Phase 1.3) gets 90% of the benefit with 10% of the complexity. Revisit if benchmarks show specific data patterns where prediction fails.
+
+### Compression-Aware Frame Routing
+Sample first few KB of each frame for entropy estimation. Route high-entropy (incompressible) frames to CPU (avoid PCIe overhead). Route low-entropy (highly compressible) frames to GPU (kernel is fast, D2H is small).
+
+**Status:** Partially implemented  trivial frame detection (ratio < 2%) routes to CPU for decompress. Could extend with entropy sampling for compress.
+
+### Network-Distributed Decompression
+For truly massive files (TB+), distribute frames across multiple machines. Each machine decompresses its assigned frames and writes to a shared filesystem or sends results back. gzstd could act as coordinator.
+
+**Verdict:** Out of scope for v1.0. Would require significant architectural changes (network protocol, fault tolerance, frame assignment).
+
+---
+
+## Version History Summary
+
+| Version Range | Key Changes |
+|--------------|-------------|
+| v0.9.50-v0.9.59 | Initial GPU support, scheduler tuning, failed pinned memory & mmap & CUDA warm-up |
+| v0.9.60-v0.9.73 | Performance instrumentation, GPU selection, O_DIRECT writer, async write pool, sparse files |
+| v0.9.74-v0.9.99 | Semaphore scheduler, VRAM-aware batching, trivial frame detection, per-GPU auto-tuner |
+| v0.10.0-v0.10.8 | Binary-search auto-tuner, shared tuning across GPUs, REFINE phase |
+| v0.10.9-v0.10.21 | Shared auto-tuner wired for compress+decompress, continuous probing, writer drain diagnostics |
+| v0.10.22-v0.10.29 | io_uring (failed), pwrite pool (failed), reverted to O_DIRECT |
+| v0.10.30-v0.10.34 | Removed fsync, --sync-output flag, file-size-based decompress batch start |
