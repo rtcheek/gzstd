@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.10.34";
+static constexpr const char * GZSTD_VERSION = "0.11.19";
 //
 // Architecture overview:
 //
@@ -453,6 +453,31 @@ static void try_boost_io_priority(bool has_cpu_pool)
   if (nice(-5) == -1) { /* best-effort; ignore */ }
 #endif
 }
+
+// Pin the calling thread to a specific CPU core.  Best-effort; silently
+// ignores failures.  Used to keep reader/writer on dedicated cores so
+// they aren't preempted by the CPU worker pool.
+__attribute__((unused))
+static void pin_thread_to_core(int core)
+{
+#ifdef __linux__
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(core, &cpuset);
+  pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+#else
+  (void)core;
+#endif
+}
+
+// Returns the set of cores reserved for I/O threads (reader + writer).
+// Workers should avoid these cores.  Returns {0, 1} on most systems.
+static std::vector<int> get_io_cores()
+{
+  unsigned hw = std::thread::hardware_concurrency();
+  if (hw <= 4) return {0};  // tiny system: share one core
+  return {0, 1};            // dedicate two cores to I/O
+}
 static void progress_emit_line(double pct, const char * in_s, const char * out_s, const char * rate_s)
 {
   char line[256];
@@ -816,12 +841,15 @@ private:
 static int resolve_cpu_threads(int opt_threads)
 {
   unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-  if (opt_threads == -1)
-    return (int)hw;                         // -T0: use every thread
+  int io_reserved = (int)get_io_cores().size();  // cores pinned to reader/writer
+  if (opt_threads == -1) {
+    // -T0: use every thread except I/O-pinned cores
+    return std::max(1, (int)hw - io_reserved);
+  }
   if (opt_threads > 0)
     return opt_threads;                     // explicit -T N
-  // Auto: use hw-1 (leave one for I/O), capped at 96
-  int def = (hw > 1) ? (int)(hw - 1) : 1;
+  // Auto: use hw minus I/O cores, capped at 96
+  int def = std::max(1, (int)hw - io_reserved);
   return std::min(def, 96);
 }
 
@@ -999,9 +1027,8 @@ struct PerfCounters {
     fprintf(stderr, "                                                              \n");
     fprintf(stderr, "  Queue wait:       %8.3f s  (%llu waits)                    \n",
             ns_to_s(queue_wait_ns), (unsigned long long)queue_wait_count.load());
-    fprintf(stderr, "  Writer wait:      %8.3f s  (%llu waits, %llu out-of-order)  \n",
-            ns_to_s(writer_wait_ns), (unsigned long long)writer_wait_count.load(),
-            (unsigned long long)out_of_order_waits.load());
+    fprintf(stderr, "  Writer wait:      %8.3f s  (%llu waits)                    \n",
+            ns_to_s(writer_wait_ns), (unsigned long long)writer_wait_count.load());
     fprintf(stderr, "  Writer I/O:       %8.3f s  (%6.2f GiB, %5.2f GiB/s)      \n",
             ns_to_s(write_ns), bytes_to_gib(write_bytes_total),
             rate_gibs(write_bytes_total, write_ns));
@@ -1177,6 +1204,51 @@ private:
   std::atomic<size_t>     total_tasks_{0};
 };
 
+// Sequential frame dispatcher: assigns contiguous frame ranges to GPU workers
+// in round-robin order, so results arrive at the writer in long sequential runs.
+// GPU 0 gets batch 0, GPU 1 gets batch 1, ..., then GPU 0 gets batch N, etc.
+// This minimizes out-of-order delivery to the writer thread.
+//
+// Usage: each GPU worker calls pop_my_batch(my_slot) which blocks until
+// it's that slot's turn, then pops a contiguous batch from the queue.
+class SequentialDispatcher {
+public:
+  explicit SequentialDispatcher(int num_slots)
+    : num_slots_(num_slots), next_slot_(0) {}
+
+  // Block until it's this slot's turn, then pop a batch from the queue.
+  // Returns false when queue is drained.
+  bool pop_my_batch(int slot, size_t batch_size, TaskQueue & queue,
+                    std::vector<Task> & out)
+  {
+    // Wait for our turn
+    std::unique_lock<std::mutex> lk(mtx_);
+    cv_.wait(lk, [&]{ return slot == next_slot_ || queue.drained(); });
+    if (queue.drained() && queue.size() == 0) return false;
+    lk.unlock();
+
+    // Pop from queue (we have the turn  other GPUs are waiting)
+    bool ok = queue.pop_batch_greedy(batch_size, out);
+
+    // Advance to next slot
+    {
+      std::lock_guard<std::mutex> lk2(mtx_);
+      next_slot_ = (next_slot_ + 1) % num_slots_;
+    }
+    cv_.notify_all();
+    return ok;
+  }
+
+  // Wake all waiters (called when queue is drained)
+  void notify_done() { cv_.notify_all(); }
+
+private:
+  int num_slots_;
+  int next_slot_;
+  std::mutex mtx_;
+  std::condition_variable cv_;
+};
+
 // Queue for "rescue" tasks: chunks that a failed GPU worker couldn't compress
 // get re-routed here for CPU fallback compression.
 class RescueQueue {
@@ -1235,6 +1307,49 @@ struct ResultStore {
   size_t                                         total_tasks   = 0;
   bool                                           producer_done = false;
   bool                                           workers_done  = false;
+
+  // --- Per-producer result slots (reduces mutex contention) ---
+  // Each GPU worker and CPU worker group gets its own slot.
+  // Producers push to their slot's local queue (own mutex, no contention).
+  // Writer drains all slots into the shared map periodically.
+  struct Slot {
+    std::mutex slot_m;
+    std::vector<std::pair<size_t, std::vector<char>>> pending;  // (seq, data)
+  };
+  std::vector<std::unique_ptr<Slot>> slots;
+
+  // Create N slots (call before launching workers)
+  void init_slots(int n) {
+    slots.resize(n);
+    for (int i = 0; i < n; ++i)
+      slots[i] = std::make_unique<Slot>();
+  }
+
+  // Producer: push a result to a specific slot (low contention  one producer per slot)
+  void push_to_slot(int slot_id, size_t seq, std::vector<char> && frame) {
+    if (slot_id >= 0 && slot_id < (int)slots.size()) {
+      std::lock_guard<std::mutex> lk(slots[slot_id]->slot_m);
+      slots[slot_id]->pending.emplace_back(seq, std::move(frame));
+      // GPU path: no per-frame notify. Batch-completion notify handles it.
+    } else {
+      // CPU fallback: push to shared map and notify (CPU frames are infrequent)
+      std::lock_guard<std::mutex> lk(m);
+      data.emplace(seq, std::move(frame));
+      cv.notify_one();
+    }
+  }
+
+  // Writer: drain all slots into the shared map.
+  // CALLER MUST HOLD results.m (the shared lock).
+  void drain_slots_locked() {
+    for (auto & s : slots) {
+      std::lock_guard<std::mutex> lk(s->slot_m);
+      if (s->pending.empty()) continue;
+      for (auto & p : s->pending)
+        data.emplace(p.first, std::move(p.second));
+      s->pending.clear();
+    }
+  }
 };
 
 // Writer thread: waits for compressed frames to appear in sequence order,
@@ -1403,6 +1518,7 @@ static void writer_thread(FILE * out, ResultStore & results,
                           const Options & opt, Meter * m)
 {
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
+  // pin_thread_to_core(1);              // disabled: hurts on loaded machines
   const bool skip_write = (opt.mode == Mode::TEST);
 
   // Create async write pool for double-buffered I/O
@@ -1440,10 +1556,16 @@ static void writer_thread(FILE * out, ResultStore & results,
     uint64_t wait_t0 = g_perf ? now_ns() : 0;
     bool waited = false;
 
-    // Wait for the next sequential frame
+    // Wait for the next sequential frame.
+    // On each wakeup, drain per-GPU slots into the shared map, then check
+    // if the next sequential frame is available.  Producers call notify_all
+    // on every frame delivery, so the writer wakes promptly.
     while (results.data.count(results.next_to_write) == 0 && !all_done) {
+      results.drain_slots_locked();
+      if (results.data.count(results.next_to_write) != 0) break;
       waited = true;
       results.cv.wait(lk);
+      results.drain_slots_locked();
       all_done = results.producer_done
               && results.workers_done
               && results.next_to_write >= results.total_tasks;
@@ -1716,6 +1838,95 @@ static void tick_loop_fn(std::atomic<bool> & done, HybridSched * sched)
 /*======================================================================
  CPU workers (normal + rescue)
 ======================================================================*/
+struct RateMatchState {
+  // GPU throughput (bytes/sec, smoothed)
+  std::atomic<double> gpu_thr{0.0};     // GiB/s across all GPUs combined
+  std::atomic<double> cpu_thr{0.0};     // GiB/s across all CPU threads combined
+
+  // Accumulators for windowed measurement
+  std::atomic<uint64_t> gpu_window_bytes{0};
+  std::atomic<uint64_t> gpu_window_ns{0};
+  std::atomic<uint64_t> cpu_window_bytes{0};
+  std::atomic<uint64_t> cpu_window_ns{0};
+  std::chrono::steady_clock::time_point last_update = std::chrono::steady_clock::now();
+  std::mutex update_mtx;
+
+  // CPU frame allowance: how many frames CPUs should take per cycle
+  // Updated each time throughput is measured
+  std::atomic<int> cpu_frame_allowance{4};  // start conservative
+  std::atomic<int> cpu_frames_taken{0};     // frames taken in current cycle
+
+  void report_gpu(uint64_t bytes, uint64_t ns) {
+    gpu_window_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    gpu_window_ns.fetch_add(ns, std::memory_order_relaxed);
+  }
+
+  void report_cpu(uint64_t bytes, uint64_t ns) {
+    cpu_window_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    cpu_window_ns.fetch_add(ns, std::memory_order_relaxed);
+  }
+
+  // Called periodically (e.g., every 0.5s) to update throughput estimates
+  // and recalculate CPU frame allowance.
+  void update(size_t gpu_batch_size, size_t avg_frame_bytes) {
+    std::unique_lock<std::mutex> lk(update_mtx, std::try_to_lock);
+    if (!lk.owns_lock()) return;
+
+    auto now = std::chrono::steady_clock::now();
+    double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
+        now - last_update).count();
+    if (secs < 0.3) return;
+    last_update = now;
+
+    uint64_t gb = gpu_window_bytes.exchange(0);
+    uint64_t gn = gpu_window_ns.exchange(0);
+    uint64_t cb = cpu_window_bytes.exchange(0);
+    uint64_t cn = cpu_window_ns.exchange(0);
+
+    // Smoothed throughput (EMA alpha=0.3)
+    if (gn > 0) {
+      double g = double(gb) / (double(gn) / 1e9) / 1e9;  // GiB/s
+      double old = gpu_thr.load(std::memory_order_relaxed);
+      gpu_thr.store(old * 0.7 + g * 0.3, std::memory_order_relaxed);
+    }
+    if (cn > 0) {
+      double c = double(cb) / (double(cn) / 1e9) / 1e9;  // GiB/s
+      double old = cpu_thr.load(std::memory_order_relaxed);
+      cpu_thr.store(old * 0.7 + c * 0.3, std::memory_order_relaxed);
+    }
+
+    // Calculate CPU frame allowance: how many frames should CPUs process
+    // while GPUs process one batch, so both finish at the same time
+    double g_thr = gpu_thr.load(std::memory_order_relaxed);
+    double c_thr = cpu_thr.load(std::memory_order_relaxed);
+    if (g_thr > 0 && c_thr > 0 && avg_frame_bytes > 0) {
+      // GPU batch time = batch_size * frame_size / gpu_throughput
+      double gpu_batch_sec = double(gpu_batch_size * avg_frame_bytes) / (g_thr * 1e9);
+      // CPU frames in that time = gpu_batch_time * cpu_throughput / frame_size
+      int allowance = (int)(gpu_batch_sec * c_thr * 1e9 / double(avg_frame_bytes));
+      allowance = std::max(1, std::min(allowance, 1000));  // sanity bounds
+      cpu_frame_allowance.store(allowance, std::memory_order_relaxed);
+    }
+    cpu_frames_taken.store(0, std::memory_order_relaxed);
+  }
+
+  // CPU workers call this: should I take a frame right now?
+  bool cpu_may_take() {
+    int taken = cpu_frames_taken.load(std::memory_order_relaxed);
+    int allowed = cpu_frame_allowance.load(std::memory_order_relaxed);
+    if (taken < allowed) {
+      cpu_frames_taken.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    return false;
+  }
+
+  // Reset cycle counter (called when GPU batch completes)
+  void reset_cycle() {
+    cpu_frames_taken.store(0, std::memory_order_relaxed);
+  }
+};
+
 static void cpu_worker(
   int worker_id,
   TaskQueue * tq,
@@ -1724,18 +1935,13 @@ static void cpu_worker(
   Meter * m,
 #ifdef HAVE_NVCOMP
   void * sched_ptr,
+  RateMatchState * rate_match,
 #endif
   CpuAgg * cpuagg)
 {
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
-  if (opt->verbosity >= V_TRACE) {
-    std::ostringstream os;
-    os << "[CPU/T" << worker_id << "] online";
-    vlog(V_TRACE, *opt, os.str() + "\n");
-  }
-
   while (true) {
 #ifdef HAVE_NVCOMP
     if (sched) {
@@ -1744,6 +1950,9 @@ static void cpu_worker(
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
+      // Rate-match: only take if CPUs haven't exceeded their allowance
+      // rate_match CPU throttle disabled for debugging
+      // if (rate_match && !rate_match->cpu_may_take()) { ... }
     }
 #endif
     if (opt->cpu_backlog > 0) {
@@ -1802,6 +2011,11 @@ static void cpu_worker(
       g_perf->cpu_compute_bytes.fetch_add(t.data.size());
       g_perf->sched_cpu_tasks.fetch_add(1);
     }
+#ifdef HAVE_NVCOMP
+    if (rate_match) {
+      rate_match->report_cpu(t.data.size(), uint64_t(ms * 1e6));
+    }
+#endif
 
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32], out_s[32];
@@ -1817,11 +2031,7 @@ static void cpu_worker(
     }
 
     if (m) m->tasks_done.fetch_add(1);
-    {
-      std::lock_guard<std::mutex> lk(results->m);
-      results->data.emplace(t.seq, std::move(out_frame));
-    }
-    results->cv.notify_one();
+    results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(t.data.size());
 #endif
@@ -1876,11 +2086,6 @@ static void cpu_worker_rescue(
   Meter * /*m*/,
   CpuAgg * cpuagg)
 {
-  if (opt->verbosity >= V_TRACE) {
-    std::ostringstream os;
-    os << "[RESCUE/T" << worker_id << "] online";
-    vlog(V_TRACE, *opt, os.str() + "\n");
-  }
   while (true) {
     Task t;
     if (!rq->pop_one(t)) break;
@@ -1905,12 +2110,8 @@ static void cpu_worker_rescue(
       vlog(V_TRACE, *opt, os.str() + "\n");
     }
 
-    // Deliver compressed frame to the result store
-    {
-      std::lock_guard<std::mutex> lk(results->m);
-      results->data.emplace(t.seq, std::move(out_frame));
-    }
-    results->cv.notify_one();
+    // Deliver decompressed frame to the result store
+    results->push_to_slot(-1, t.seq, std::move(out_frame));
 
     // Update per-thread stats
     {
@@ -1942,6 +2143,7 @@ static void cpu_decomp_worker(
   Meter * m,
 #ifdef HAVE_NVCOMP
   void * sched_ptr,
+  RateMatchState * rate_match,
 #endif
   CpuAgg * cpuagg)
 {
@@ -1954,12 +2156,6 @@ static void cpu_decomp_worker(
     if (!tl_dctx) die("failed to create ZSTD_DCtx");
   }
 
-  if (opt->verbosity >= V_TRACE) {
-    std::ostringstream os;
-    os << "[CPU-D/T" << worker_id << "] online";
-    vlog(V_TRACE, *opt, os.str() + "\n");
-  }
-
   while (true) {
 #ifdef HAVE_NVCOMP
     // In hybrid mode: GPU gets priority via semaphore.
@@ -1968,7 +2164,6 @@ static void cpu_decomp_worker(
     if (sched) {
       if (!sched->should_cpu_take(tq->size())) {
         // GPU wants data  but still allow trivially compressed frames
-        // and queue overflow (handled in pop section below)
         double ratio = tq->peek_front_ratio();
         bool trivial = (ratio >= 0.0 && ratio < 0.02);
         if (!trivial) {
@@ -1978,6 +2173,9 @@ static void cpu_decomp_worker(
         }
         // Trivial frame: fall through to pop
       }
+      // Rate-match: only take if CPUs haven't exceeded their allowance for this cycle
+      // rate_match CPU throttle disabled for debugging
+      // if (rate_match && !rate_match->cpu_may_take()) { ... }
     }
 #endif
 
@@ -2043,6 +2241,11 @@ static void cpu_decomp_worker(
       g_perf->cpu_compute_bytes.fetch_add(actual);
       g_perf->sched_cpu_tasks.fetch_add(1);
     }
+#ifdef HAVE_NVCOMP
+    if (rate_match) {
+      rate_match->report_cpu(actual, uint64_t(ms * 1e6));
+    }
+#endif
 
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32], out_s[32];
@@ -2059,11 +2262,7 @@ static void cpu_decomp_worker(
 
     if (m) m->read_bytes.fetch_add(comp_size);
 
-    {
-      std::lock_guard<std::mutex> lk(results->m);
-      results->data.emplace(t.seq, std::move(out_buf));
-    }
-    results->cv.notify_one();
+    results->push_to_slot(-1, t.seq, std::move(out_buf));
 
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(comp_size);
@@ -2277,7 +2476,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   for (int i = 0; i < threads; ++i) {
     pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt_copy, m,
 #ifdef HAVE_NVCOMP
-                      nullptr,
+                      nullptr, nullptr,
 #endif
                       &cpuagg);
   }
@@ -2468,7 +2667,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   Options opt_copy = opt;
   for (int i = 0; i < threads; ++i) pool.emplace_back(cpu_worker, i, &queue, &results, &opt_copy, m,
 #ifdef HAVE_NVCOMP
-    nullptr,
+    nullptr, nullptr,
 #endif
     &cpuagg);
   if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
@@ -2570,6 +2769,16 @@ struct SharedTuneState {
   static constexpr uint32_t PROBE_INTERVAL = 8;   // ticks in SETTLED before re-probing
   static constexpr double   TUNE_SEC = 0.3;       // min seconds between tune decisions
 };
+
+// Rate-matched dispatch: tracks CPU and GPU throughput to partition work
+// so both finish at roughly the same time.  This minimizes out-of-order
+// delivery to the writer.
+//
+// Usage:
+//   - GPU workers call report_gpu() after each batch completion
+//   - CPU workers call report_cpu() after each frame completion
+//   - CPU workers call should_cpu_take() to check if they should grab work
+//   - The dispatcher calculates how many CPU frames to allow per GPU batch cycle
 
 // Per-stream stats for JSON export.
 struct StreamStats {
@@ -2883,7 +3092,8 @@ static void gpu_worker(
   std::atomic<bool> * abort_on_failure,
   std::string * fatal_msg,
   std::atomic<bool> * gpu_started_flag,
-  SharedTuneState * shared_tune)
+  SharedTuneState * shared_tune,
+  RateMatchState * rate_match)
 {
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   try {
@@ -2989,6 +3199,7 @@ static void gpu_worker(
     bool producer_done_seen=false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
     if (sched) sched->set_gpu_ready();
+    double util_scale = 1.0;  // utilization scaling for batch size
     while (true) {
       bool submitted_any=false;
       // ---- Shared auto-tuner ----
@@ -3167,6 +3378,8 @@ static void gpu_worker(
                      ? shared_tune->batch_size.load(std::memory_order_relaxed)
                      : C.per_stream_batch;
         pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
+        // Apply utilization scaling (updated after each batch completion)
+        pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
         if (!queue->pop_batch_greedy(pop_n, C.batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
@@ -3287,11 +3500,7 @@ static void gpu_worker(
             checkCuda(cudaMemcpy(h_out.data(), d_src, csz,
                                  cudaMemcpyDeviceToHost),
                       "cudaMemcpy(D2H exact)");
-            {
-              std::lock_guard<std::mutex> lk(results->m);
-              results->data.emplace(C.batch[i].seq, std::move(h_out));
-            }
-            results->cv.notify_one();
+            results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
           }
           if (g_perf) {
             g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
@@ -3320,6 +3529,13 @@ static void gpu_worker(
             shared_tune->window_ns.fetch_add(uint64_t(tot_ms * 1e6), std::memory_order_relaxed);
             shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
           }
+          if (rate_match) {
+            rate_match->report_gpu(in_sum, uint64_t(tot_ms * 1e6));
+            rate_match->reset_cycle();
+            size_t avg_frame = (C.filled > 0) ? in_sum / C.filled : 16 * 1024 * 1024;
+            size_t batch_sz = shared_tune ? shared_tune->batch_size.load() : C.filled;
+            rate_match->update(batch_sz, avg_frame);
+          }
 
           // -vv: batch completion line
           if (opt.verbosity >= V_DEBUG) {
@@ -3343,6 +3559,17 @@ static void gpu_worker(
           C.busy = false;
           C.filled = 0;
           C.batch.clear();
+          results->cv.notify_one();  // wake writer for batch
+#ifdef HAVE_NVML
+          {
+            nvmlDevice_t dev;
+            nvmlUtilization_t util;
+            if (nvmlDeviceGetHandleByIndex(device_id, &dev) == NVML_SUCCESS &&
+                nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
+              util_scale = std::max(0.05, (100.0 - util.gpu) / 100.0);
+            }
+          }
+#endif
         } else if (q != cudaErrorNotReady) { checkCuda(q, "cudaStreamQuery"); }
       }
 
@@ -3401,11 +3628,7 @@ static void gpu_worker(
               std::vector<char> h_out(csz);
               const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
               checkCuda(cudaMemcpy(h_out.data(), d_src, csz, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H exact sync)");
-              {
-                std::lock_guard<std::mutex> lk(results->m);
-                results->data.emplace(C.batch[i].seq, std::move(h_out));
-              }
-              results->cv.notify_one();
+              results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
             }
             if (g_perf) {
               g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
@@ -3437,6 +3660,13 @@ static void gpu_worker(
             shared_tune->window_ns.fetch_add(uint64_t(tot_ms * 1e6), std::memory_order_relaxed);
             shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
           }
+          if (rate_match) {
+            rate_match->report_gpu(in_sum, uint64_t(tot_ms * 1e6));
+            rate_match->reset_cycle();
+            size_t avg_frame = (C.filled > 0) ? in_sum / C.filled : 16 * 1024 * 1024;
+            size_t batch_sz = shared_tune ? shared_tune->batch_size.load() : C.filled;
+            rate_match->update(batch_sz, avg_frame);
+          }
 
           if (opt.verbosity >= V_DEBUG) {
             char in_s[32], out_s[32];
@@ -3459,6 +3689,17 @@ static void gpu_worker(
           C.busy = false;
           C.filled = 0;
           C.batch.clear();
+          results->cv.notify_one();  // wake writer for batch
+#ifdef HAVE_NVML
+          {
+            nvmlDevice_t dev;
+            nvmlUtilization_t util;
+            if (nvmlDeviceGetHandleByIndex(device_id, &dev) == NVML_SUCCESS &&
+                nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
+              util_scale = std::max(0.05, (100.0 - util.gpu) / 100.0);
+            }
+          }
+#endif
           blocked = true;
           break;
         }
@@ -3634,25 +3875,11 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
 
       if (opt.verbosity >= V_VERBOSE && total_devices > 1) {
         std::ostringstream os;
-        os << "GPU selection: using device";
-        if (want > 1) os << "s";
+        os << "GPUs: " << want << " device" << (want > 1 ? "s" : "") << " active";
         for (int i = 0; i < want; ++i) {
-          os << (i ? "," : " ") << infos[i].cuda_id;
-          os << " (" << infos[i].gpu_util << "% util";
-          if (infos[i].score != infos[i].gpu_util)
-            os << ", score=" << infos[i].score << " (NUMA penalty)";
-          os << ", N" << infos[i].numa_node;
-          os << ", " << (infos[i].free_bytes / (1024*1024)) << " MiB free)";
-        }
-        if (want < (int)infos.size()) {
-          os << "  skipped:";
-          for (int i = want; i < (int)infos.size(); ++i)
-            os << " " << infos[i].cuda_id << "("
-               << infos[i].gpu_util << "%"
-               << (infos[i].score != infos[i].gpu_util
-                   ? ",s=" + std::to_string(infos[i].score) : "")
-               << ",N" << infos[i].numa_node
-               << "," << (infos[i].free_bytes / (1024*1024)) << "MiB)";
+          os << (i ? ", " : ": ") << "GPU" << infos[i].cuda_id;
+          os << " " << infos[i].gpu_util << "%";
+          os << " (" << (infos[i].free_bytes / (1024*1024)) << " MiB)";
         }
         vlog(V_VERBOSE, opt, os.str() + "\n");
       }
@@ -3719,21 +3946,11 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
 
   if (opt.verbosity >= V_VERBOSE && total_devices > 1) {
     std::ostringstream os;
-    os << "GPU selection: using device";
-    if (n > 1) os << "s";
+    os << "GPUs: " << n << " device" << (n > 1 ? "s" : "") << " active";
     for (int i = 0; i < n; ++i) {
-      os << (i ? "," : " ") << devs[i].id;
-      os << " (";
-      if (devs[i].has_util) os << devs[i].gpu_util << "% util, ";
-      os << (devs[i].free_bytes / (1024*1024)) << " MiB free)";
-    }
-    if (n < (int)devs.size()) {
-      os << "  skipped:";
-      for (int i = n; i < (int)devs.size(); ++i) {
-        os << " " << devs[i].id << "(";
-        if (devs[i].has_util) os << devs[i].gpu_util << "%,";
-        os << (devs[i].free_bytes / (1024*1024)) << "MiB)";
-      }
+      os << (i ? ", " : ": ") << "GPU" << devs[i].id;
+      if (devs[i].has_util) os << " " << devs[i].gpu_util << "%";
+      os << " (" << (devs[i].free_bytes / (1024*1024)) << " MiB)";
     }
     vlog(V_VERBOSE, opt, os.str() + "\n");
   }
@@ -3855,6 +4072,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // still doing CUDA context init and memory allocation.
   std::vector<std::thread> cpu_pool;
   int cpu_threads = 0;
+  RateMatchState rate_match_compress;
   if (sched) {
     cpu_threads = resolve_cpu_threads(opt.cpu_threads);
     cpuagg.threads = cpu_threads;
@@ -3867,11 +4085,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
     for (int i = 0; i < cpu_threads; ++i)
-      cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &cpuagg);
+      cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &rate_match_compress, &cpuagg);
   }
 
   // ---- GPU workers (init CUDA context, allocate memory  CPUs already working) ----
   const int gpu_count = gpu_count_early;
+  results.init_slots(gpu_count);  // per-GPU result slots (reduces lock contention)
   std::vector<std::thread> workers;
   workers.reserve(gpu_count);
   Options opt_for_workers = opt;
@@ -3890,7 +4109,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                          &per_dev[size_t(i)], &json_sink, m, sched,
                          &any_gpu_failed, &abort_on_failure,
                          &fatal_msgs[size_t(i)], &gpu_started,
-                         &shared_tune);
+                         &shared_tune, &rate_match_compress);
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
@@ -3901,6 +4120,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // ---- Producer: read input, split into GPU-sized subchunks, enqueue ----
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
+  // pin_thread_to_core(0);              // disabled: hurts on loaded machines
   std::vector<char> host_in(host_chunk);
   while (true) {
     uint64_t rd_t0 = g_perf ? now_ns() : 0;
@@ -4002,6 +4222,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 // but using the decompress API.
 static void gpu_decomp_worker(
   int device_id,
+  int slot_index,
   Options opt,
   TaskQueue * queue,
   RescueQueue * rescue,
@@ -4011,7 +4232,8 @@ static void gpu_decomp_worker(
   std::atomic<bool> * any_gpu_failed,
   std::atomic<bool> * abort_on_failure,
   std::string * fatal_msg,
-  SharedTuneState * shared_tune)
+  SharedTuneState * shared_tune,
+  RateMatchState * rate_match)
 {
   (void)m;
   try {
@@ -4199,6 +4421,12 @@ static void gpu_decomp_worker(
     // Signal scheduler that this GPU is ready for work
     if (sched) sched->set_gpu_ready();
 
+    // Utilization scaling factor: 1.0 = idle, 0.1 = 90% busy.
+    // Updated after each batch completion via NVML query.
+    // Applied to batch size at next pop to match busy GPUs' completion time
+    // with idle GPUs' completion time.
+    double util_scale = 1.0;
+
     while (true) {
       bool submitted_any = false;
 
@@ -4347,10 +4575,14 @@ static void gpu_decomp_worker(
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
         // Signal scheduler: this GPU stream wants data (blocks CPU workers)
         if (sched) sched->gpu_wants_data();
-        // Use shared batch size from auto-tuner (all GPUs coordinate)
+        // Use shared batch size from auto-tuner, scaled by GPU utilization.
+        // A GPU at 50% utilization gets half the batch → finishes at roughly
+        // the same time as idle GPUs → results arrive in order for the writer.
         size_t pop_n = (shared_tune && !shared_tune->locked.load())
                      ? std::min(shared_tune->batch_size.load(std::memory_order_relaxed), per_stream_cap)
                      : per_stream_cap;
+        // Apply utilization scaling (updated after each batch completion)
+        pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
         if (!queue->pop_batch_greedy(pop_n, C.batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) {
@@ -4399,7 +4631,11 @@ static void gpu_decomp_worker(
           throw std::runtime_error("GPU decomp: failed to allocate device buffers");
         }
 
-        // Upload compressed data H2D (async)
+        // Upload compressed data H2D (async into CUDA stream).
+        // Per-frame cudaMemcpyAsync is efficient because CUDA batches them
+        // internally in the stream  no host-side blocking between transfers.
+        // A single large memcpy would require packing a contiguous host buffer
+        // first, which is slower than letting CUDA handle the scatter.
         uint64_t h2d_t0 = g_perf ? now_ns() : 0;
         uint64_t h2d_bytes_batch = 0;
         cudaEventRecord(C.ev_begin, C.stream);
@@ -4509,6 +4745,11 @@ static void gpu_decomp_worker(
         cudaEventElapsedTime(&batch_ms, C.ev_begin, C.ev_end);
         uint64_t out_sum = 0;
 
+        // Download decompressed frames one at a time and deliver to writer
+        // immediately.  Per-frame D2H has slightly more DMA overhead than a
+        // single batch transfer, but it keeps the writer busy in parallel 
+        // the writer can write frame 0 to disk while frame 1 is transferring.
+        // A single batch D2H would stall the writer for the entire transfer.
         for (size_t i = 0; i < C.filled; ++i) {
           if (C.h_statuses[i] != nvcompSuccess)
             throw std::runtime_error("nvCOMP decompress per-chunk status != success");
@@ -4517,20 +4758,14 @@ static void gpu_decomp_worker(
           out_sum += actual;
           d2h_bytes_batch += actual;
 
-          // Download decompressed data
           std::vector<char> h_out(actual);
           const void * d_src = static_cast<char*>(C.d_decomp_buf) + i * C.alloc_decomp;
           checkCuda(cudaMemcpy(h_out.data(), d_src, actual,
                                cudaMemcpyDeviceToHost), "D2H decomp data");
 
-          // Deliver to result store (wrote_bytes tracked by writer thread)
           uint64_t rl_t0 = g_perf ? now_ns() : 0;
-          {
-            std::lock_guard<std::mutex> lk(results->m);
-            results->data.emplace(C.batch[i].seq, std::move(h_out));
-          }
+          results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
           if (g_perf) g_perf->result_lock_ns.fetch_add(now_ns() - rl_t0);
-          results->cv.notify_one();
         }
 
         if (g_perf) {
@@ -4552,6 +4787,14 @@ static void gpu_decomp_worker(
             shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
             shared_tune->window_ns.fetch_add(now_ns() - batch_t0, std::memory_order_relaxed);
             shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
+          }
+          // Report to rate-matcher and reset CPU cycle
+          if (rate_match) {
+            rate_match->report_gpu(out_sum, now_ns() - batch_t0);
+            rate_match->reset_cycle();
+            size_t avg_frame = (C.filled > 0) ? out_sum / C.filled : 16 * 1024 * 1024;
+            size_t batch_sz = shared_tune ? shared_tune->batch_size.load() : C.filled;
+            rate_match->update(batch_sz, avg_frame);
           }
         }
 
@@ -4576,6 +4819,21 @@ static void gpu_decomp_worker(
         C.filled = 0;
         C.batch.clear();
         submitted_any = true;
+
+        // Notify writer that a full batch of frames is now available
+        results->cv.notify_one();
+
+        // Update utilization scale for next batch
+#ifdef HAVE_NVML
+        {
+          nvmlDevice_t dev;
+          nvmlUtilization_t util;
+          if (nvmlDeviceGetHandleByIndex(device_id, &dev) == NVML_SUCCESS &&
+              nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
+            util_scale = std::max(0.05, (100.0 - util.gpu) / 100.0);
+          }
+        }
+#endif
       }
 
       // Check termination
@@ -4640,16 +4898,18 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 
   // Apply --gpu-devices limit.
   // Default (0) = 1 GPU for decompress: D2H transfer of the full
-  // uncompressed data saturates PCIe; multiple GPUs share bandwidth
-  // and are slower than a single GPU with full link speed.
+  // Use all available GPUs for decompression. Utilization-scaled batch sizing
+  // (via NVML queries in select_best_gpus) handles partially-loaded GPUs.
+  // Previously capped at 2 GPUs due to PCIe contention concerns, but the
+  // auto-tuner and utilization scaling handle this better dynamically.
   const int total_hw_devices = device_count;
   if (device_count > 0) {
     int target = opt.gpu_devices;
-    if (target == 0) target = std::min(2, device_count);  // auto: 2 GPUs balances kernel parallelism vs PCIe contention
+    if (target == 0) target = device_count;  // auto: use all GPUs
     if (target < device_count) {
       vlog(V_VERBOSE, opt, "decompress: using " + std::to_string(target)
            + " of " + std::to_string(device_count) + " GPU devices"
-           + (opt.gpu_devices == 0 ? " (auto  PCIe bandwidth optimal)\n" : "\n"));
+           + (opt.gpu_devices == 0 ? " (auto)\n" : "\n"));
       device_count = target;
     }
   }
@@ -4660,6 +4920,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   ResultStore results;
   std::atomic<bool> any_gpu_failed{false};
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
+  RateMatchState rate_match;
 
   // ---- Writer thread (outputs decompressed data in order) ----
   std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m);
@@ -4693,7 +4954,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     }
     for (int i = 0; i < cpu_threads; ++i)
       cpu_pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
-                            (void*)sched, &cpuagg);
+                            (void*)sched, &rate_match, &cpuagg);
   }
 
   // ---- GPU decompression workers ----
@@ -4706,16 +4967,19 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   shared_tune_decomp.batch_size.store(opt.gpu_batch_cap);
   shared_tune_decomp.locked.store(opt.gpu_batch_user_set);
 
+
   if (device_count > 0) {
     gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
     const int gpu_count = (int)gpu_ids.size();
     fatal_msgs.resize(gpu_count);
+    results.init_slots(gpu_count);  // per-GPU result slots (reduces lock contention)
+
     for (int i = 0; i < gpu_count; ++i) {
-      gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], opt,
+      gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], i, opt,
                                &queue, &rescue, &results, m, sched,
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
-                               &shared_tune_decomp);
+                               &shared_tune_decomp, &rate_match);
     }
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -4726,6 +4990,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 
   // ---- Stream frames from input into the queue ----
   // Workers start decompressing as soon as the first frame is pushed.
+  // Pin reader to core 0 so it isn't preempted by the worker pool.
+  // pin_thread_to_core(0);              // disabled: hurts on loaded machines
   bool fallback = false;
   std::vector<char> raw_data;
   size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data);
@@ -4946,7 +5212,7 @@ int main(int argc, char ** argv)
   g_direct_writer = dw_ptr;
 #endif
 
-  Meter meter; vlog(V_VERBOSE, opt, "gzstd starting...\n");
+  Meter meter;
   if (opt.verbosity >= V_DEBUG && opt.mode == Mode::COMPRESS) {
     std::ostringstream os;
 #ifdef HAVE_NVCOMP
@@ -5225,7 +5491,6 @@ int main(int argc, char ** argv)
       vlog(V_VERBOSE, opt, "fsync: " + std::to_string(int(sync_ms)) + " ms\n");
   }
 
-  vlog(V_VERBOSE, opt, "done.\n");
 
   } // end for (file_idx)
 

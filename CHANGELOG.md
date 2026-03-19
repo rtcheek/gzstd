@@ -283,3 +283,71 @@ Auto-tuner still refines from the starting point. On 217 GiB file, converges to 
 9. **Don't fsync unless asked.** zstd doesn't fsync, cp doesn't fsync. O_DIRECT data is already on disk. Removing fsync saves seconds and matches user expectations. Provide `--sync-output` for paranoid users.
 
 10. **The disk is the ceiling.** At 8.13 GiB/s compute vs 1.5-2.0 GiB/s NVMe write, the decompression pipeline is 4-5× faster than storage. No software optimization can fix this. Faster NVMe (Gen5, RAID) is the only path forward.
+
+---
+
+### Batched H2D Transfer (v0.11.6-0.11.8)  NEGATIVE (reverted)
+Packed all compressed frames into contiguous host buffer, one cudaMemcpyAsync.
+- **Why it failed:** `alloc_comp` per frame is max size (16 MiB) but actual compressed data is smaller. Packing copies 4 GiB of mostly padding. Per-frame async only copies actual bytes. CUDA driver already coalesces async transfers internally.
+- H2D went from ~2 GiB/s to 0.22 GiB/s.
+
+### Batched D2H Transfer (v0.11.6)  NEGATIVE (reverted)
+Single cudaMemcpy for entire decompressed batch, deliver all frames at once.
+- **Why it failed:** Blocked writer thread for entire 4 GiB transfer. Writer could no longer pipeline disk writes with GPU D2H. Per-frame D2H feeds writer continuously.
+- D2H: 0.14 GiB/s. Result lock contention: 451 seconds (8 GPUs fighting one mutex).
+
+### Thread Pinning (v0.11.5)  NEGATIVE (disabled)
+Pinned reader to core 0, writer to core 1.
+- **Why it failed on Knuth:** Students had ALL cores at 97-99%. Pinning forced I/O threads onto busy cores instead of letting the OS scheduler find idle moments on any core.
+- **When it would help:** Dedicated machine with no competing workloads.
+
+### GPU Utilization Backoff (v0.11.3)  REPLACED by proportional scaling
+Paused GPU workers when utilization >50%, resumed at ≤30%.
+- **Why it was wrong:** Blocking wastes a GPU that could still contribute at reduced capacity.
+- **Replaced by:** `util_scale` factor (v0.11.4)  GPU at 50% gets half the batch size, still contributes.
+
+### Proportional GPU Utilization Scaling (v0.11.4)  POSITIVE
+`util_scale = max(0.05, (100 - gpu_util%) / 100)` applied to batch size.
+- Updated via NVML after each batch completion.
+- GPU at 0% → full batch, 50% → half, 90% → 10%.
+- No wasted GPU cycles, no blocking.
+
+### Sequential Frame Dispatcher (v0.11.1)  NEGATIVE (reverted)
+Round-robin ticket system forcing GPUs to pop in order.
+- **Why it failed:** Serialized the pop operation  GPU 1 couldn't pop until GPU 0 finished popping. With `pop_batch_greedy` blocking for enough frames, 7 GPUs sat idle while 1 waited.
+
+## Key Lessons Learned (Updated)
+
+11. **Don't batch what CUDA already batches.** `cudaMemcpyAsync` in a stream is already coalesced by the driver. Manual packing adds host-side memcpy overhead and padding waste.
+
+12. **Writer parallelism > transfer efficiency.** Per-frame D2H is "inefficient" per-transfer but keeps the writer pipeline full. Batched D2H is "efficient" but starves the writer. Pipeline throughput wins.
+
+13. **Thread pinning hurts on shared machines.** The OS scheduler is better at finding idle moments across all cores than a fixed pin on a busy core.
+
+14. **Proportional > binary.** Don't block a resource (GPU, core)  scale its allocation proportionally. A 50%-loaded GPU with half the batch is better than an idle GPU.
+
+---
+
+### Per-GPU Result Slots (v0.11.11)  POSITIVE (major)
+Each GPU pushes decompressed frames to its own slot (own mutex). Writer drains all slots periodically. Eliminates cross-GPU mutex contention.
+- **Result lock: 451s → 0.06s** (7,500× improvement)
+- Why: 8 GPUs doing per-frame lock/unlock on one shared mutex = massive contention. Per-GPU slots = zero contention (one producer per slot).
+
+### Batch-Completion Writer Notification (v0.11.14-15)  POSITIVE
+Only notify writer after full D2H batch completes (not per-frame). CPU fallback path still notifies per-frame (low volume).
+- **Writer wakeups: 23,185 → 254** (91× reduction)
+- Each wakeup now drains 200+ frames instead of checking and sleeping.
+
+### Pinned D2H Buffer (v0.11.17)  NEGATIVE (reverted, 3rd attempt)
+Pinned host buffer per stream for D2H, then memcpy to frame vector.
+- 9% slower than pageable. Two copies (DMA→pinned→vector) worse than CUDA's internal staging (DMA→internal_pinned→vector, optimized by driver).
+- **Three failed pinned attempts documented.** CUDA's pageable transfer is highly optimized internally. Don't try to outsmart it unless you can eliminate ALL copies.
+
+### Rate-Match CPU Throttle (v0.11.0, disabled v0.11.9)  MIXED
+`cpu_may_take()` throttled CPU workers to match GPU batch timing.
+- Correctly reduced CPU usage on loaded machines (user time dropped from 8m to 2m)
+- Disabled for debugging; needs re-evaluation on quiet machine.
+
+### Thread Pinning (v0.11.5, disabled v0.11.9)  NEGATIVE on shared machines
+Reader pinned to core 0, writer to core 1. Hurts when cores are loaded by other users.
+- Would help on a dedicated machine. Keep disabled by default, consider `--pin-io` flag.
