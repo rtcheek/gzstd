@@ -4,14 +4,17 @@
 
 ```bash
 # 1. Generate test data (512 MiB per file, ~2.5 GiB total)
-./gzstd-gendata.sh ./testdata 512
+./gzstd-gendata.sh ./gzstd-testdata 512
 
 # 2. Run quick benchmark (reduced sweep, 1 iteration)
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata --quick --sweep-all
+./gzstd-benchmark.sh --quick --sweep-all
 
 # 3. Run full benchmark (3 iterations per config)
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata --sweep-all
+./gzstd-benchmark.sh --sweep-all
 ```
+
+The benchmark script automatically finds `gzstd` in `./gzstd` or `./build/gzstd`.
+Test data defaults to `./gzstd-testdata`. Override with `--gzstd PATH` or `--data-dir DIR` if needed.
 
 ## Test Data
 
@@ -39,27 +42,40 @@
 
 ```bash
 # Find optimal GPU batch size for your hardware
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata --sweep-batches
+./gzstd-benchmark.sh --sweep-batches
 
 # Find optimal GPU stream count
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata --sweep-streams
+./gzstd-benchmark.sh --sweep-streams
 
 # Test combined batch × stream configurations
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata --sweep-batches --sweep-streams
+./gzstd-benchmark.sh --sweep-batches --sweep-streams
 
 # CPU thread scaling only
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata --sweep-threads --cpu-only
+./gzstd-benchmark.sh --sweep-threads --cpu-only
 
 # Compression only (skip decompress, faster)
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata --sweep-all --no-decompress
+./gzstd-benchmark.sh --sweep-all --no-decompress
 
 # Single file only
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata --sweep-all --files "medium_compress.bin"
+./gzstd-benchmark.sh --sweep-all --files "medium_compress.bin"
 
 # Larger test data for more stable measurements
-./gzstd-gendata.sh ./testdata-2g 2048
-./gzstd-benchmark.sh --gzstd ./build/gzstd --data-dir ./testdata-2g --sweep-all --iterations 5
+./gzstd-gendata.sh ./gzstd-testdata-2g 2048
+./gzstd-benchmark.sh --data-dir ./gzstd-testdata-2g --sweep-all --iterations 5
+
+# Use a specific gzstd binary (e.g., comparing two versions)
+./gzstd-benchmark.sh --gzstd ./build-old/gzstd --output old-results.json
+./gzstd-benchmark.sh --gzstd ./build/gzstd --output new-results.json
 ```
+
+## Binary Auto-Discovery
+
+The script searches for the gzstd binary in this order:
+
+1. `$GZSTD` environment variable (if set)
+2. `./gzstd` (current directory)
+3. `./build/gzstd` (CMake build directory)
+4. `--gzstd PATH` (explicit override)
 
 ## Output
 
@@ -81,10 +97,13 @@ Best decompression throughput:
   medium_compress.bin  -> gpu-default               2.341 GiB/s
 ```
 
+During each gzstd run, the script displays live progress from gzstd's progress meter.
+
 ## Tips
 
 - **Larger files** give more stable measurements (less noise from startup overhead)
 - **More iterations** (5+) give more reliable medians
 - **Drop caches**  the script attempts this automatically (needs root)
 - **Warm GPU**  first run may be slower due to GPU initialization; the median handles this
+- **Shared machines**  benchmark numbers can vary 10-15% depending on other users' load; run back-to-back comparisons for reliable deltas
 - The script verifies decompression correctness via `diff` on the last iteration

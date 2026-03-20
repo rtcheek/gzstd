@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.19";
+static constexpr const char * GZSTD_VERSION = "0.11.22";
 //
 // Architecture overview:
 //
@@ -59,9 +59,9 @@ static constexpr const char * GZSTD_VERSION = "0.11.19";
 #include <type_traits>
 #include <stdexcept>
 #include <memory>
+#include <functional>
 #include <cerrno>
 #include <csignal>
-#include <liburing.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #ifndef _WIN32
@@ -1066,7 +1066,8 @@ public:
     std::unique_lock<std::mutex> lk(m_);
     q_.push_back(std::move(t));
     ++total_tasks_;
-    cv_.notify_one();
+    cv_.notify_all();      // wake all GPU workers waiting in pop_batch_greedy
+    cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
   }
 
   // Pop up to max_n tasks at once (used by GPU workers to fill a batch).
@@ -1180,6 +1181,7 @@ public:
     std::unique_lock<std::mutex> lk(m_);
     done_ = true;
     cv_.notify_all();
+    cpu_cv_.notify_all();
   }
 
   size_t total_tasks() const { return total_tasks_; }
@@ -1196,9 +1198,78 @@ public:
     return q_.size();
   }
 
+  // Wake all CPU workers blocking in wait_for_cpu().
+  // Called externally when scheduling conditions change (e.g., GPU releases
+  // the semaphore via gpu_got_data, or the queue is drained).
+  void notify_cpu_waiters()
+  {
+    cpu_cv_.notify_all();
+  }
+
+  // State snapshot passed to CPU worker predicates.  Lets the predicate
+  // inspect queue state without calling back into TaskQueue (which would
+  // deadlock since we already hold m_).
+  struct QueueState {
+    size_t depth;         // number of tasks in queue
+    bool   done;          // producer has called set_done()
+    double front_ratio;   // compressed/decompressed ratio of front task (-1.0 if empty or unknown)
+  };
+
+  // Blocking wait for CPU workers in hybrid mode.
+  // Replaces poll+sleep(1ms) loops with a proper CV wait that wakes
+  // instantly when: (a) a new task is pushed, (b) producer is done,
+  // or (c) notify_cpu_waiters() is called (GPU released semaphore).
+  //
+  // The predicate receives a QueueState snapshot (computed under the lock)
+  // and returns true when the CPU worker should attempt to pop.
+  // Returns false when queue is drained (caller should exit).
+  // Returns true when the predicate is satisfied (caller should try to pop).
+  bool wait_for_cpu(std::function<bool(const QueueState &)> may_proceed)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    while (true) {
+      if (q_.empty() && done_) return false;  // drained
+      if (!q_.empty()) {
+        QueueState qs { q_.size(), done_, front_ratio_locked() };
+        if (may_proceed(qs)) return true;
+      }
+      cpu_cv_.wait(lk);
+    }
+  }
+
+  // Pop one task for a CPU worker, but only if may_proceed() is true.
+  // Combines the wait and pop into a single lock acquisition to avoid
+  // a race between checking the predicate and another thread popping
+  // the same task.  Returns false when drained (caller should exit).
+  bool pop_one_cpu(Task & t, std::function<bool(const QueueState &)> may_proceed)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    while (true) {
+      if (q_.empty() && done_) return false;
+      if (!q_.empty()) {
+        QueueState qs { q_.size(), done_, front_ratio_locked() };
+        if (may_proceed(qs)) {
+          t = std::move(q_.front());
+          q_.pop_front();
+          return true;
+        }
+      }
+      cpu_cv_.wait(lk);
+    }
+  }
+
 private:
+  // Peek at front task's compression ratio.  CALLER MUST HOLD m_.
+  double front_ratio_locked() const {
+    if (q_.empty()) return -1.0;
+    const Task & front = q_.front();
+    if (front.decomp_size == 0) return -1.0;
+    return double(front.data.size()) / double(front.decomp_size);
+  }
+
   std::mutex              m_;
   std::condition_variable cv_;
+  std::condition_variable cpu_cv_;   // dedicated CV for CPU workers (avoids spurious wakes from GPU pops)
   std::deque<Task>        q_;
   bool                    done_ = false;
   std::atomic<size_t>     total_tasks_{0};
@@ -1511,9 +1582,6 @@ private:
   uint64_t sparse_saved_ = 0;  // bytes skipped via sparse seek
 };
 
-// ======================================================================
-// io_uring-based async writer: submits multiple O_DIRECT writes per syscall.
-
 static void writer_thread(FILE * out, ResultStore & results,
                           const Options & opt, Meter * m)
 {
@@ -1736,6 +1804,10 @@ public:
     }
   }
 
+  // Set the task queue pointer so gpu_got_data() can wake CPU workers.
+  // Must be called before GPU workers start.
+  void set_queue(TaskQueue * tq) { queue_ = tq; }
+
   // CPU checks this before taking from the queue.
   // If any GPU stream is waiting for data, CPU yields.
   bool should_cpu_take(size_t /*queue_depth*/ = 0) const {
@@ -1761,12 +1833,18 @@ public:
   // GPU stream calls this when it's ready and waiting for data
   void gpu_wants_data() { gpus_waiting_.fetch_add(1, std::memory_order_release); }
 
-  // GPU stream calls this after it has taken a batch from the queue
-  void gpu_got_data()   { gpus_waiting_.fetch_sub(1, std::memory_order_release); }
+  // GPU stream calls this after it has taken a batch from the queue.
+  // Decrements the semaphore and wakes CPU workers so they can
+  // immediately check should_cpu_take() instead of sleeping.
+  void gpu_got_data() {
+    gpus_waiting_.fetch_sub(1, std::memory_order_release);
+    if (queue_) queue_->notify_cpu_waiters();
+  }
 
   // Called by GPU workers once CUDA context is initialized
   void set_gpu_ready() {
     gpu_ready_.store(true, std::memory_order_release);
+    if (queue_) queue_->notify_cpu_waiters();  // wake CPUs to re-evaluate
     if (opt_.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt_, "GPU ready  semaphore scheduling active\n");
   }
@@ -1812,6 +1890,7 @@ private:
   int gpu_device_count_ = 0;
   bool fixed_mode_ = false;
   double fixed_cpu_share_ = -1.0;
+  TaskQueue * queue_ = nullptr;  // for waking CPU workers from gpu_got_data()
 
   std::atomic<bool> gpu_ready_{false};
   std::atomic<int> gpus_waiting_{0};
@@ -1943,59 +2022,48 @@ static void cpu_worker(
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
   while (true) {
-#ifdef HAVE_NVCOMP
-    if (sched) {
-      if (!sched->should_cpu_take()) {
-        if (tq->drained()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
-      // Rate-match: only take if CPUs haven't exceeded their allowance
-      // rate_match CPU throttle disabled for debugging
-      // if (rate_match && !rate_match->cpu_may_take()) { ... }
-    }
-#endif
-    if (opt->cpu_backlog > 0) {
-      size_t qsz = tq->size();
-      if (qsz < opt->cpu_backlog) {
-        if (tq->drained()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
-    }
-
-    // --cpu-batch=N sets a minimum queue depth before CPU workers activate.
-    // This keeps the queue stocked for GPUs.  Each CPU thread still takes
-    // one frame at a time (no batching benefit on CPU unlike GPU).
-    // At end-of-file, CPUs take whatever remains even if < threshold.
     Task t;
 #ifdef HAVE_NVCOMP
     if (sched) {
-      // Hybrid: non-blocking check of queue depth threshold
-      if (opt->cpu_queue_min > 0 && tq->size() < opt->cpu_queue_min && !tq->drained()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
-      std::vector<Task> tmp;
-      size_t got = tq->try_pop_batch(1, tmp);
-      if (got == 0) {
-        if (tq->drained()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
-      t = std::move(tmp[0]);
+      // Hybrid mode: block on queue CV until scheduler allows CPU to take
+      // and queue depth meets threshold.  Wakes instantly when:
+      //   - producer pushes a task (push -> cpu_cv_.notify)
+      //   - GPU releases semaphore (gpu_got_data -> notify_cpu_waiters)
+      //   - producer is done (set_done -> cpu_cv_.notify_all)
+      auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
+        if (!sched->should_cpu_take()) return false;
+        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
+            && !qs.done) return false;
+        return true;
+      };
+      if (!tq->pop_one_cpu(t, may_take)) break;
       sched->mark_cpu_take(1);
     } else
 #endif
     {
-      // Non-hybrid (--cpu-only): blocking wait for threshold then take 1
+      // Non-hybrid (--cpu-only): block on queue CV with threshold predicate
       if (opt->cpu_queue_min > 0) {
-        // Wait until queue has min frames or producer done
-        while (tq->size() < opt->cpu_queue_min && !tq->drained())
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        auto threshold_met = [&](const TaskQueue::QueueState & qs) -> bool {
+          return qs.depth >= opt->cpu_queue_min || qs.done;
+        };
+        if (!tq->wait_for_cpu(threshold_met)) break;
         if (tq->drained() && tq->size() == 0) break;
       }
       if (!tq->pop_one(t)) break;
+    }
+
+    // cpu_backlog check: if the queue is below the backlog threshold,
+    // re-enqueue and wait.  This is a secondary throttle separate from
+    // cpu_queue_min (which gates the initial pop).
+    // Note: cpu_backlog is rarely used; cpu_queue_min is the primary mechanism.
+    if (opt->cpu_backlog > 0 && tq->size() < opt->cpu_backlog && !tq->drained()) {
+      // Put it back and wait for more frames
+      tq->push(std::move(t));
+      auto backlog_met = [&](const TaskQueue::QueueState & qs) -> bool {
+        return qs.depth >= opt->cpu_backlog || qs.done;
+      };
+      if (!tq->wait_for_cpu(backlog_met)) break;
+      continue;  // re-enter the loop to pop properly
     }
 
     {
@@ -2005,23 +2073,25 @@ static void cpu_worker(
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
     const size_t csz = out_frame.size();
+    const size_t in_size = t.data.size();  // save before releasing
+    { std::vector<char>().swap(t.data); }  // release input immediately
     if (g_perf) {
       g_perf->cpu_compute_ns.fetch_add(uint64_t(ms * 1e6));
       g_perf->cpu_compute_count.fetch_add(1);
-      g_perf->cpu_compute_bytes.fetch_add(t.data.size());
+      g_perf->cpu_compute_bytes.fetch_add(in_size);
       g_perf->sched_cpu_tasks.fetch_add(1);
     }
 #ifdef HAVE_NVCOMP
     if (rate_match) {
-      rate_match->report_cpu(t.data.size(), uint64_t(ms * 1e6));
+      rate_match->report_cpu(in_size, uint64_t(ms * 1e6));
     }
 #endif
 
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32], out_s[32];
-      human_bytes(double(t.data.size()), in_s, sizeof(in_s));
+      human_bytes(double(in_size), in_s, sizeof(in_s));
       human_bytes(double(csz), out_s, sizeof(out_s));
-      const double thr_gib = (ms > 0.0) ? (double)t.data.size() / (ms/1000.0) / 1e9 : 0.0;
+      const double thr_gib = (ms > 0.0) ? (double)in_size / (ms/1000.0) / 1e9 : 0.0;
       std::ostringstream os;
       os << "[CPU/T" << worker_id << "] seq=" << t.seq
          << " in=" << in_s << " out=" << out_s
@@ -2033,7 +2103,7 @@ static void cpu_worker(
     if (m) m->tasks_done.fetch_add(1);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
-    if (sched) sched->add_cpu_bytes(t.data.size());
+    if (sched) sched->add_cpu_bytes(in_size);
 #endif
     {
       std::lock_guard<std::mutex> lk(cpuagg->m);
@@ -2041,11 +2111,11 @@ static void cpu_worker(
         cpuagg->per_thread.resize((size_t)worker_id + 1);
       auto & st = cpuagg->per_thread[(size_t)worker_id];
       st.tasks    += 1;
-      st.in_bytes += t.data.size();
+      st.in_bytes += in_size;
       st.out_bytes += csz;
       st.comp_ms  += ms;
       cpuagg->tasks    += 1;
-      cpuagg->in_bytes += t.data.size();
+      cpuagg->in_bytes += in_size;
       cpuagg->out_bytes += csz;
       cpuagg->comp_ms  += ms;
     }
@@ -2157,53 +2227,29 @@ static void cpu_decomp_worker(
   }
 
   while (true) {
-#ifdef HAVE_NVCOMP
-    // In hybrid mode: GPU gets priority via semaphore.
-    // The pop section below handles the --cpu-batch threshold and
-    // trivially-compressed frame bypass (< 2% ratio).
-    if (sched) {
-      if (!sched->should_cpu_take(tq->size())) {
-        // GPU wants data  but still allow trivially compressed frames
-        double ratio = tq->peek_front_ratio();
-        bool trivial = (ratio >= 0.0 && ratio < 0.02);
-        if (!trivial) {
-          if (tq->drained()) break;
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-          continue;
-        }
-        // Trivial frame: fall through to pop
-      }
-      // Rate-match: only take if CPUs haven't exceeded their allowance for this cycle
-      // rate_match CPU throttle disabled for debugging
-      // if (rate_match && !rate_match->cpu_may_take()) { ... }
-    }
-#endif
-
-    // Grab frames respecting --cpu-batch threshold.
-    // --cpu-batch=N sets minimum queue depth before CPU workers activate.
-    // Exception: trivially-compressed frames (ratio < 2%) taken immediately.
-    // Each CPU thread takes one frame (no batching benefit on CPU).
     Task t;
 #ifdef HAVE_NVCOMP
     if (sched) {
-      double ratio = tq->peek_front_ratio();
-      bool trivial = (ratio >= 0.0 && ratio < 0.02);
-
-      if (!trivial && opt->cpu_queue_min > 0
-          && tq->size() < opt->cpu_queue_min && !tq->drained()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
-      std::vector<Task> tmp;
-      size_t got = tq->try_pop_batch(1, tmp);
-      if (got == 0) {
-        if (tq->drained()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
-      t = std::move(tmp[0]);
+      // Hybrid decompress: block on queue CV until scheduler allows CPU to take
+      // OR a trivially-compressed frame (ratio < 2%) is at the front of the queue.
+      // Trivial frames are faster on CPU (no PCIe D2H overhead), so we bypass
+      // the GPU-priority semaphore for them.
+      bool got_trivial = false;
+      auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
+        // Always allow trivially-compressed frames regardless of scheduler
+        if (qs.front_ratio >= 0.0 && qs.front_ratio < 0.02) { got_trivial = true; return true; }
+        got_trivial = false;
+        // Normal scheduling: respect GPU priority and queue depth threshold
+        if (!sched->should_cpu_take()) return false;
+        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
+            && !qs.done) return false;
+        return true;
+      };
+      if (!tq->pop_one_cpu(t, may_take)) break;
       sched->mark_cpu_take(1);
-      if (trivial && opt->verbosity >= V_DEBUG) {
+      if (got_trivial && opt->verbosity >= V_DEBUG) {
+        double ratio = (t.decomp_size > 0)
+                       ? double(t.data.size()) / double(t.decomp_size) : 0.0;
         std::ostringstream os;
         os << "[CPU-D/T" << worker_id << "] trivial frame (ratio="
            << std::fixed << std::setprecision(3) << (ratio * 100.0) << "%)";
@@ -2212,9 +2258,12 @@ static void cpu_decomp_worker(
     } else
 #endif
     {
+      // Non-hybrid (--cpu-only): block on queue CV with threshold predicate
       if (opt->cpu_queue_min > 0) {
-        while (tq->size() < opt->cpu_queue_min && !tq->drained())
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        auto threshold_met = [&](const TaskQueue::QueueState & qs) -> bool {
+          return qs.depth >= opt->cpu_queue_min || qs.done;
+        };
+        if (!tq->wait_for_cpu(threshold_met)) break;
         if (tq->drained() && tq->size() == 0) break;
       }
       if (!tq->pop_one(t)) break;
@@ -3437,6 +3486,16 @@ static void gpu_worker(
         checkCuda(cudaMemcpyAsync(C.d_in_sizes, C.h_in_sizes.data(), sizeof(size_t)*C.filled, cudaMemcpyHostToDevice, C.stream), "cudaMemcpyAsync(d_in_sizes)");
         cudaEventRecord(C.ev_h2d_end, C.stream);
 
+        // Release host-side input data  it's on the GPU now.
+        // cudaMemcpyAsync with pageable memory is host-synchronous, so
+        // the data is fully copied before the function returns.
+        // In hybrid mode, keep data alive for potential rescue on GPU failure.
+        // In gpu-only mode, no rescue  safe to release immediately.
+        if (!rescue) {
+          for (size_t i = 0; i < C.filled; ++i)
+            { std::vector<char>().swap(C.batch[i].data); }
+        }
+
         checkNvcomp(nvcompBatchedZstdCompressAsync(
           (const void * const *)C.d_in_ptrs,
           (const size_t *)C.d_in_sizes,
@@ -4035,6 +4094,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     sched_ptr = std::make_unique<HybridSched>(
         opt.cpu_share, /*cpu_threads*/0, device_count, opt);
     sched = sched_ptr.get();
+    sched->set_queue(&queue);
     tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
 
     if (opt.verbosity >= V_VERBOSE) {
@@ -4709,6 +4769,17 @@ static void gpu_decomp_worker(
 
         // Launch batched decompression
         uint64_t kern_t0 = g_perf ? now_ns() : 0;
+
+        // Release host-side compressed data  it's on the GPU now.
+        // Save per-frame metadata needed by completion paths.
+        std::vector<size_t> batch_comp_sizes(C.filled);
+        std::vector<size_t> batch_seqs(C.filled);
+        for (size_t i = 0; i < C.filled; ++i) {
+          batch_comp_sizes[i] = C.batch[i].data.size();
+          batch_seqs[i] = C.batch[i].seq;
+          { std::vector<char>().swap(C.batch[i].data); }
+        }
+
         checkNvcomp(nvcompBatchedZstdDecompressAsync(
             (const void * const *)C.d_comp_ptrs,
             C.d_comp_sizes,
@@ -4764,7 +4835,7 @@ static void gpu_decomp_worker(
                                cudaMemcpyDeviceToHost), "D2H decomp data");
 
           uint64_t rl_t0 = g_perf ? now_ns() : 0;
-          results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
+          results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
           if (g_perf) g_perf->result_lock_ns.fetch_add(now_ns() - rl_t0);
         }
 
@@ -4780,7 +4851,7 @@ static void gpu_decomp_worker(
         {
           uint64_t in_sum = 0;
           for (size_t i = 0; i < C.filled; ++i)
-            in_sum += C.batch[i].data.size();
+            in_sum += batch_comp_sizes[i];
           if (m) m->read_bytes.fetch_add(in_sum);
           // Report to shared auto-tuner
           if (shared_tune && !shared_tune->locked.load()) {
@@ -4935,6 +5006,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     sched_ptr = std::make_unique<HybridSched>(
         opt.cpu_share, 0, device_count, opt);
     sched = sched_ptr.get();
+    sched->set_queue(&queue);
     tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
   }
 

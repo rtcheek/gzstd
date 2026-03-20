@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.10.34
+**Current version:** v0.11.22
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -8,78 +8,73 @@
 ## Phase 1: Scheduling Overhaul
 
 ### 1.1 Remove 2-GPU Decompress Cap
-**Priority: High | Complexity: Low**
+**Priority: High | Complexity: Low | Status: DONE (v0.11.x)**
 
-Currently decompress defaults to 2 GPUs based on early PCIe bandwidth assumptions. Instead, use all available GPUs but scale batch sizes by measured utilization (see 1.2).
+Previously decompress defaulted to 2 GPUs based on early PCIe bandwidth assumptions. Now uses all available GPUs with utilization-scaled batch sizing (1.2).
 
-- Remove hardcoded `device_count = std::min(device_count, 2)` for decompress
-- Let `select_best_gpus()` return all viable GPUs
-- The utilization-scaled dispatch (1.2) handles GPUs that are partially busy
+- Removed hardcoded `device_count = std::min(device_count, 2)` for decompress
+- `select_best_gpus()` returns all viable GPUs
+- Utilization-scaled dispatch handles GPUs that are partially busy
 
 ### 1.2 Utilization-Scaled GPU Batch Sizing
-**Priority: High | Complexity: Medium**
+**Priority: High | Complexity: Medium | Status: DONE (v0.11.4)**
 
-Query NVML utilization at dispatch time. Scale batch size inversely with load:
+NVML utilization queried at batch completion. Batch size scaled inversely with load:
 
 ```
-effective_batch = base_batch * (1.0 - gpu_utilization)
+util_scale = max(0.05, (100 - gpu_util%) / 100)
+effective_batch = base_batch * util_scale
 ```
 
-- GPU at 0% → full batch (e.g., 256 frames)
-- GPU at 50% → half batch (128 frames)
-- GPU at 90%+ → skip entirely (don't waste PCIe bandwidth)
-
-This serves two purposes: (a) GPUs under student load contribute proportionally instead of blocking, and (b) scaled batches finish at roughly the same time → results arrive in order → writer doesn't stall.
-
-NVML query cost: ~1ms per call, amortized over batch processing time (100ms+). Negligible.
+- GPU at 0% → full batch, 50% → half, 90% → 10%
+- Updated via NVML after each batch completion
+- No wasted GPU cycles, no blocking
 
 ### 1.3 Rate-Matched Dispatch (CPU/GPU Throughput Calibration)
-**Priority: High | Complexity: Medium**
+**Priority: Medium | Complexity: Medium | Status: PARTIALLY DONE**
 
-Measure CPU and GPU throughput during calibration phase (first 2-3 seconds), then partition frames so both finish at the same time.
+RateMatchState struct exists with EMA-smoothed throughput tracking and CPU frame allowance calculation. CPU throttle (`cpu_may_take()`) is implemented but **disabled for debugging** since v0.11.9.
 
-**Calibration:**
-```
-T_gpu = bytes_processed / wall_time  (per device, from auto-tuner data)
-T_cpu = bytes_processed / wall_time  (per thread, new measurement)
-T_cpu_total = T_cpu * num_cpu_threads
-```
-
-**Dispatch each round:**
-```
-gpu_batch_time = gpu_batch_size * avg_frame_size / T_gpu
-cpu_frames = floor(gpu_batch_time * T_cpu_total / avg_frame_size)
-```
-
-CPU gets exactly enough frames to finish when the GPU batch returns. Results arrive interleaved but roughly in order.
-
-Update calibration with sliding window (EMA) to track changing data characteristics.
+Needs re-evaluation on a quiet dedicated machine. The throughput measurement was unreliable on shared machines (Lovelace) where background load skews the calibration.
 
 ### 1.4 Sequential Frame Assignment
-**Priority: Medium | Complexity: Low**
+**Priority: Medium | Complexity: Low | Status: TRIED, REVERTED (v0.11.1)**
 
-Instead of round-robin frame dispatch, assign contiguous ranges:
-- GPU 0: frames 0-255
-- GPU 1: frames 256-511
-- CPU pool: frames 512-537
+Round-robin ticket system forcing GPUs to pop in order. Serialized the pop operation  GPU 1 couldn't pop until GPU 0 finished popping. With `pop_batch_greedy` blocking for enough frames, 7 GPUs sat idle while 1 waited.
 
-The writer can drain entire runs without waiting for out-of-order frames. This directly reduces the result queue memory footprint and writer stall time.
+**Verdict:** The per-GPU result slots (v0.11.11) solved the writer ordering problem without serializing the pop. This item is cancelled.
 
 ### 1.5 I/O Thread Pinning
-**Priority: Medium | Complexity: Low**
+**Priority: Low | Complexity: Low | Status: TRIED, DISABLED (v0.11.5)**
 
-Pin reader and writer threads to dedicated cores (e.g., cores 0-1 on the local NUMA node). Exclude these cores from the CPU worker pool.
+Pinned reader to core 0, writer to core 1. Hurts on shared machines where all cores are loaded by other users  the OS scheduler is better at finding idle moments across all cores than a fixed pin on a busy core.
 
-For `-T0` (all threads): use `hardware_concurrency() - 2` workers. Exception: systems with ≤4 cores use `hardware_concurrency() - 1` (reader/writer share a core).
+**Verdict:** Keep disabled by default. Consider adding `--pin-io` flag for users on dedicated machines. Low priority.
 
-This prevents worker threads from preempting I/O threads, which was the root cause of the v0.9.52 regression (256 threads starved the I/O pipeline).
+### 1.6 CV-Based CPU Worker Scheduling
+**Priority: High | Complexity: Medium | Status: DONE (v0.11.21)**
+
+Replaced 9 × `sleep_for(1ms)` poll loops with condition variable waits. CPU workers block on a dedicated `cpu_cv_` and wake in microseconds when conditions change (new task pushed, GPU releases semaphore, producer done).
+
+- Eliminates wasted CPU cycles from poll loops
+- Critical for long-running jobs (TB+ files) where sleep overhead compounds
+- No measurable throughput change on 8 GiB files; wins on large workloads
+
+### 1.7 Early Memory Release
+**Priority: Medium | Complexity: Low | Status: DONE (v0.11.22)**
+
+Release input data buffers immediately after consumption (compression, H2D upload) instead of holding until end of processing cycle.
+
+- +7% on mixed.bin (high frame churn data)
+- Reduces peak memory footprint for large files
+- GPU compress: guarded by `!rescue` to preserve rescue path in hybrid mode
 
 ---
 
 ## Phase 2: Persistent Auto-Tuning (`~/.gzstd/`)
 
 ### 2.1 Per-Machine Performance Profile
-**Priority: Medium | Complexity: Medium**
+**Priority: Medium | Complexity: Medium | Status: NOT STARTED**
 
 Create `~/.gzstd/` directory on first run. Store tuning data:
 
@@ -103,8 +98,10 @@ Create `~/.gzstd/` directory on first run. Store tuning data:
 - NVMe write throughput (GiB/s, for writer thread sizing)
 - CPU/GPU ratio for rate-matched dispatch
 
+**Why it matters:** On 8 GiB files where total runtime is 3-6 seconds, the auto-tuner spends 2-3 seconds rediscovering optimal batch sizes every run. On Lovelace where the answer is always "batch=8 for compress," this is pure waste. A cached profile would eliminate the exploration phase.
+
 ### 2.2 Calibration Run
-**Priority: Medium | Complexity: Medium**
+**Priority: Medium | Complexity: Medium | Status: NOT STARTED**
 
 `gzstd --calibrate` runs a quick benchmark suite (30-60 seconds):
 1. Small compress/decompress on CPU (measures per-core throughput)
@@ -115,7 +112,7 @@ Create `~/.gzstd/` directory on first run. Store tuning data:
 Subsequent runs read the profile and start with known-optimal settings. The runtime auto-tuner still runs but converges instantly since it starts at the right point.
 
 ### 2.3 Automatic Profile Updates
-**Priority: Low | Complexity: Low**
+**Priority: Low | Complexity: Low | Status: NOT STARTED**
 
 After each run, if the auto-tuner found a different optimal than the profile predicted, update the profile. This handles hardware changes (new GPU, driver update, different NVMe) without requiring explicit recalibration.
 
@@ -124,7 +121,7 @@ After each run, if the auto-tuner found a different optimal than the profile pre
 ## Phase 3: Piped I/O Optimization
 
 ### 3.1 Pipe-Aware Scheduling
-**Priority: Medium | Complexity: Medium**
+**Priority: Medium | Complexity: Medium | Status: NOT STARTED**
 
 Piped input (`stdin`) has unique constraints:
 - Can't seek → no parallel readers
@@ -146,7 +143,7 @@ Optimizations for piped output:
 - Skip sparse detection (can't seek)
 
 ### 3.2 Streaming Mode for Unknown-Size Input
-**Priority: Low | Complexity: Low**
+**Priority: Low | Complexity: Low | Status: NOT STARTED**
 
 When input size is unknown (pipe), the frame count is unknown. The auto-tuner must be more conservative:
 - Don't set tune_hi too high (we might run out of frames before exploring)
@@ -180,7 +177,7 @@ When input size is unknown (pipe), the frame count is unknown. The auto-tuner mu
 **Verdict:** Likely small gain for compression (reader is rarely the bottleneck  3+ GiB/s single-thread is usually enough). For decompression, the complexity of frame boundary detection likely outweighs the benefit. Worth benchmarking with a simple 2-reader prototype before committing.
 
 ### 4.2 Multi-Writer with pwrite()
-**Priority: Low | Complexity: Medium | Status: Tested, negative for buffered I/O**
+**Priority: Low | Complexity: Medium | Status: Tested, NEGATIVE for buffered I/O**
 
 **Already tested in v0.10.29:** 4 pwrite threads through page cache was 2.5× slower due to page cache thrashing (38 minutes sys time vs 12 minutes with O_DIRECT).
 
@@ -189,6 +186,37 @@ When input size is unknown (pipe), the frame count is unknown. The auto-tuner mu
 **Risk:** O_DIRECT pwrite per-frame was catastrophic in v0.9.72 (27k individual pwrite calls). But with larger writes (batch of frames concatenated into one pwrite per thread), the overhead might be acceptable.
 
 **Verdict:** Low priority. The NVMe write ceiling (~2-3 GiB/s) is the physical limit. Multiple O_DIRECT writers might get 10-20% more by keeping the NVMe queue deeper, but the complexity is high.
+
+---
+
+## Phase 5: Smart Defaults & Asymmetric Mode
+
+### 5.1 Asymmetric Mode (GPU Compress + CPU Decompress)
+**Priority: HIGH | Complexity: Low | Status: NOT STARTED**
+
+Benchmark data from Lovelace (v0.11.20) conclusively shows:
+- **Compress:** GPU/Hybrid wins on 4/5 data types (up to 2.14 GiB/s vs 1.50 CPU)
+- **Decompress:** CPU wins on ALL 5 data types (up to 4.88 GiB/s vs 3.50 hybrid)
+
+On consumer GPUs with PCIe Gen3, the D2H transfer cost makes GPU decompression slower than CPU for every data type tested. The optimal strategy is:
+- **Compress:** Use hybrid (GPU + CPU)
+- **Decompress:** Use CPU-only
+
+Implementation: detect PCIe generation at startup via NVML or sysfs. If Gen3, default decompress to `--cpu-only`. If Gen4+, default to hybrid. User can override with `--gpu-only` or `--hybrid`.
+
+This is the single highest-impact change for Lovelace-class hardware. Estimated improvement: decompress throughput would jump from 1.3-3.5 GiB/s (hybrid) to 1.4-4.9 GiB/s (CPU)  up to 40% faster on trivial data.
+
+### 5.2 PCIe Generation Detection
+**Priority: High | Complexity: Low | Status: NOT STARTED**
+
+Query PCIe link speed to auto-select decompress strategy:
+- NVML: `nvmlDeviceGetCurrPcieLinkGeneration()`
+- Fallback: parse `/sys/bus/pci/devices/*/current_link_speed`
+
+Map to decompress default:
+- Gen3 (8 GT/s): CPU-only decompress
+- Gen4 (16 GT/s): Hybrid decompress
+- Gen5 (32 GT/s): Hybrid decompress (GPU likely wins)
 
 ---
 
@@ -226,3 +254,8 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 | v0.10.9-v0.10.21 | Shared auto-tuner wired for compress+decompress, continuous probing, writer drain diagnostics |
 | v0.10.22-v0.10.29 | io_uring (failed), pwrite pool (failed), reverted to O_DIRECT |
 | v0.10.30-v0.10.34 | Removed fsync, --sync-output flag, file-size-based decompress batch start |
+| v0.11.0-v0.11.19 | Per-GPU result slots, batch-completion notifications, proportional GPU scaling, rate-match (disabled) |
+| v0.11.20 | Removed dead liburing references (cleanup) |
+| v0.11.21 | CV-based CPU worker scheduling (replaced 9 sleep loops with condition variable waits) |
+| v0.11.22 | Early memory release (+7% on mixed data), rescue-safe GPU buffer management |
+

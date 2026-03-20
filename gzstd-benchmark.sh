@@ -36,7 +36,16 @@ set -euo pipefail
 #----------------------------------------------------------------------
 # Defaults
 #----------------------------------------------------------------------
-GZSTD="${GZSTD:-./gzstd}"
+# Auto-discover gzstd binary: GZSTD env var > ./gzstd > ./build/gzstd
+if [[ -n "${GZSTD:-}" ]]; then
+  :  # user set GZSTD env var, use it
+elif [[ -x "./gzstd" ]]; then
+  GZSTD="./gzstd"
+elif [[ -x "./build/gzstd" ]]; then
+  GZSTD="./build/gzstd"
+else
+  GZSTD="./gzstd"  # fall through to validation error below
+fi
 DATA_DIR="./gzstd-testdata"
 OUTPUT="benchmark-results.json"
 ITERATIONS=3
@@ -83,8 +92,8 @@ done
 # Validation
 #----------------------------------------------------------------------
 if [[ ! -x "$GZSTD" ]]; then
-  echo "ERROR: gzstd binary not found at '$GZSTD'"
-  echo "       Use --gzstd PATH or build first."
+  echo "ERROR: gzstd binary not found (tried ./gzstd and ./build/gzstd)"
+  echo "       Use --gzstd PATH, set GZSTD env var, or build first."
   exit 1
 fi
 
@@ -262,8 +271,28 @@ run_timed() {
   fi
 
   start=$(date +%s.%N)
-  # Run the command; suppress stderr (progress/summary) but log to file for debugging
-  "$@" 2>"$TMPDIR/last_stderr.log" || rc=$?
+  # Run the command in background; stderr goes to log file for progress scraping.
+  # --progress forces the progress meter even though stderr is not a TTY.
+  "$@" --progress 2>"$TMPDIR/last_stderr.log" &
+  local pid=$!
+
+  # Poll the stderr log for gzstd's progress percentage while the process runs.
+  # gzstd writes lines like: [45.2%] in:3.14 GiB out:1.23 GiB in_rate:1.50 GiB/s
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 0.3
+    if [[ -s "$TMPDIR/last_stderr.log" ]]; then
+      local gzstd_pct
+      gzstd_pct=$(tail -c 256 "$TMPDIR/last_stderr.log" 2>/dev/null \
+                  | grep -oP '\[\K[0-9]+\.[0-9]+(?=%)' 2>/dev/null \
+                  | tail -1)
+      if [[ -n "$gzstd_pct" ]]; then
+        printf "\r${CLEAR_LINE}    ${DIM}gzstd: %s%%${RESET}" "$gzstd_pct" >&2
+      fi
+    fi
+  done
+  wait "$pid" 2>/dev/null || rc=$?
+  printf "\r${CLEAR_LINE}" >&2
+
   end=$(date +%s.%N)
 
   # If command failed, show the full command and stderr for debugging
@@ -458,7 +487,7 @@ for config_str in "${CONFIGS[@]}"; do
     for ((i=1; i<=ITERATIONS; i++)); do
       rm -f "$comp_out"
       # shellcheck disable=SC2086
-      elapsed=$(run_timed "$GZSTD" $comp_flags -q -f --output="$comp_out" "$test_file")
+      elapsed=$(run_timed "$GZSTD" $comp_flags -f --output="$comp_out" "$test_file")
       times_c+=("$elapsed")
     done
 
@@ -498,7 +527,7 @@ for config_str in "${CONFIGS[@]}"; do
           local_flags="$decomp_flags -d"
         fi
         # shellcheck disable=SC2086
-        elapsed=$(run_timed "$GZSTD" $local_flags -q -f --output="$decomp_out" "$comp_out")
+        elapsed=$(run_timed "$GZSTD" $local_flags -f --output="$decomp_out" "$comp_out")
         times_d+=("$elapsed")
       done
 
