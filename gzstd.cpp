@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.22";
+static constexpr const char * GZSTD_VERSION = "0.11.24";
 //
 // Architecture overview:
 //
@@ -237,12 +237,25 @@ static constexpr int EXIT_USAGE    = 2;  // bad command-line usage
 // Global verbosity for die() which doesn't take Options
 static int g_verbosity = V_DEFAULT;
 
+// Global flag: true when the progress bar is actively drawing on stderr.
+// vlog() checks this to clear the progress line before printing so verbose
+// messages don't overlap the progress bar.  Set by progress_loop, cleared
+// when progress_loop exits.
+static std::atomic<bool> g_progress_active{false};
+
 // Emit a message to stderr if the current verbosity is >= min_level.
 // Caller must include \n or \r in msg as appropriate.
+// If the progress bar is active, clears the progress line first so
+// the message prints cleanly on its own line, then the next progress
+// tick redraws the bar.
 static void vlog(int min_level, const Options & opt, const std::string & msg)
 {
-  if (opt.verbosity >= min_level)
+  if (opt.verbosity >= min_level) {
+    if (g_progress_active.load(std::memory_order_relaxed)) {
+      std::fprintf(stderr, "\r\033[K");  // clear progress line
+    }
     std::cerr << msg;
+  }
 }
 
 static void die(const std::string & msg, int code = EXIT_ERROR)
@@ -426,6 +439,7 @@ struct Meter {
   std::atomic< uint64_t > read_bytes { 0 };
   std::atomic< uint64_t > wrote_bytes{ 0 };
   std::atomic< uint64_t > tasks_done { 0 };
+  std::atomic< uint64_t > total_out  { 0 };  // expected total output bytes (set when known)
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
@@ -501,11 +515,13 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     if (!is_stderr_tty()) return;
     if (opt.input == "-" && !isatty(fileno(stdin))) return;
   }
+  g_progress_active.store(true, std::memory_order_relaxed);
   using namespace std::chrono; using namespace std::chrono_literals;
   while (!done_flag->load()) {
     std::this_thread::sleep_for(200ms);
     uint64_t in  = m->read_bytes.load();
     uint64_t out = m->wrote_bytes.load();
+    uint64_t t_out = m->total_out.load();
     auto dt      = steady_clock::now() - m->t0;
     double secs  = duration_cast< duration<double> >(dt).count();
     double in_rate = secs>0 ? double(in)/secs : 0.0;
@@ -514,12 +530,24 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     human_bytes(double(out), out_s, sizeof(out_s));
     human_bytes(in_rate,     rate_s, sizeof(rate_s));
     double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
-    // When all input is read, show output write rate instead of input read rate
+    // When all input is read, switch to showing write drain progress
     if (total_in > 0 && in >= total_in && out > 0) {
       double out_rate = secs > 0 ? double(out) / secs : 0.0;
       char wr_s[64];
       human_bytes(out_rate, wr_s, sizeof(wr_s));
-      progress_emit_line(pct, in_s, out_s, wr_s);
+      // Show write drain percentage if we know the expected output size
+      if (t_out > 0) {
+        double write_pct = std::min(100.0, 100.0 * double(out) / double(t_out));
+        char line[256];
+        std::snprintf(line, sizeof(line),
+            "[%.1f%%] writing: %s / ", write_pct, out_s);
+        char tot_s[64];
+        human_bytes(double(t_out), tot_s, sizeof(tot_s));
+        std::fprintf(stderr, "\r%s%s @ %s/s\033[K", line, tot_s, wr_s);
+        std::fflush(stderr);
+      } else {
+        progress_emit_line(pct, in_s, out_s, wr_s);
+      }
     } else {
       progress_emit_line(pct, in_s, out_s, rate_s);
     }
@@ -537,6 +565,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
   progress_emit_line(pct, in_s, out_s, rate_s);
   // No \n here  the completion summary overwrites this line with \r
+  g_progress_active.store(false, std::memory_order_relaxed);
 }
 
 /*======================================================================
@@ -1426,6 +1455,92 @@ struct ResultStore {
 // Writer thread: waits for compressed frames to appear in sequence order,
 // then writes them to the output file.  This keeps the output deterministic
 // (frames in the same order as the input) regardless of which worker finishes first.
+
+/*======================================================================
+ Writer backpressure  prevents CPU workers from flooding the writer
+ -----------------------------------------------------------------------
+ Tracks the gap between bytes produced (decompressed) and bytes physically
+ written to disk.  CPU workers block on a CV when the gap exceeds a
+ high-water mark, and wake instantly when it drops below a low-water mark.
+
+ GPU workers are NEVER throttled  their batches are already in-flight
+ on the GPU and can't be stopped mid-kernel.  Only CPU workers check
+ backpressure before popping a new task.
+
+ The AIO worker calls mark_written() after each physical write, which
+ wakes blocked CPU workers if the backlog has dropped enough.
+
+ High/low water marks use a hysteresis band to prevent oscillation:
+   - CPU blocks when backlog > high_water (e.g., 4 GiB)
+   - CPU wakes when backlog < low_water (e.g., 2 GiB)
+ This keeps 2-4 GiB of decompressed data buffered  enough to keep the
+ writer continuously fed without exhausting RAM on huge files.
+======================================================================*/
+class WriterBackpressure {
+public:
+  // Default: 4 GiB high / 2 GiB low.  Tuned for NVMe at ~2 GiB/s:
+  // 2 GiB low-water = ~1 second of writer runway before starvation.
+  explicit WriterBackpressure(uint64_t high = 4ULL * 1024 * 1024 * 1024,
+                              uint64_t low  = 2ULL * 1024 * 1024 * 1024)
+    : high_water_(high), low_water_(low) {}
+
+  // Called by workers after producing a decompressed frame.
+  // Lightweight atomic add  no lock, no CV interaction.
+  void mark_produced(uint64_t bytes) {
+    produced_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+
+  // Called by AIO worker after physically writing data to disk.
+  // If backlog drops below low-water, wakes all blocked CPU workers.
+  void mark_written(uint64_t bytes) {
+    written_.fetch_add(bytes, std::memory_order_release);
+    uint64_t backlog = produced_.load(std::memory_order_relaxed)
+                     - written_.load(std::memory_order_acquire);
+    if (backlog <= low_water_) {
+      std::lock_guard<std::mutex> lk(m_);
+      cv_.notify_all();
+    }
+  }
+
+  // Called by CPU workers before popping a new task.
+  // Blocks if backlog exceeds high-water mark.  Returns immediately
+  // if backlog is acceptable or if done flag is set.
+  void wait_if_backlogged() {
+    uint64_t backlog = produced_.load(std::memory_order_relaxed)
+                     - written_.load(std::memory_order_acquire);
+    if (backlog <= high_water_) return;  // fast path: no contention
+
+    // Slow path: block until writer catches up
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [this] {
+      uint64_t bl = produced_.load(std::memory_order_relaxed)
+                  - written_.load(std::memory_order_acquire);
+      return bl <= low_water_ || done_.load(std::memory_order_relaxed);
+    });
+  }
+
+  // Signal that all work is complete  wake any blocked workers so they can exit.
+  void set_done() {
+    done_.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(m_);
+    cv_.notify_all();
+  }
+
+  uint64_t backlog() const {
+    return produced_.load(std::memory_order_relaxed)
+         - written_.load(std::memory_order_acquire);
+  }
+
+private:
+  std::atomic<uint64_t> produced_{0};
+  std::atomic<uint64_t> written_{0};
+  uint64_t high_water_;
+  uint64_t low_water_;
+  std::atomic<bool> done_{false};
+  std::mutex m_;
+  std::condition_variable cv_;
+};
+
 /*======================================================================
  Async write pool  double-buffered I/O to overlap compute with disk writes
  -----------------------------------------------------------------------
@@ -1439,8 +1554,9 @@ struct ResultStore {
 ======================================================================*/
 class AsyncWritePool {
 public:
-  explicit AsyncWritePool(FILE * out_file, DirectWriter * dw, bool sparse = true)
-    : out_(out_file), dw_(dw), sparse_(sparse), done_(false)
+  explicit AsyncWritePool(FILE * out_file, DirectWriter * dw, bool sparse = true,
+                          Meter * meter = nullptr, WriterBackpressure * bp = nullptr)
+    : out_(out_file), dw_(dw), sparse_(sparse), done_(false), meter_(meter), bp_(bp)
   {
     worker_ = std::thread(&AsyncWritePool::worker_fn, this);
   }
@@ -1565,6 +1681,11 @@ private:
           g_perf->write_ns.fetch_add(now_ns() - w_t0);
           g_perf->write_bytes_total.fetch_add(buf.size());
         }
+        // Update wrote_bytes after physical write (not after submit)
+        // so the progress bar reflects actual disk I/O completion.
+        if (meter_) meter_->wrote_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
+        // Notify backpressure: writer made progress, CPU workers may unblock.
+        if (bp_) bp_->mark_written(buf.size());
       }
     }
   }
@@ -1580,10 +1701,13 @@ private:
   bool done_;
   bool error_ = false;
   uint64_t sparse_saved_ = 0;  // bytes skipped via sparse seek
+  Meter * meter_ = nullptr;     // for tracking physically-written bytes
+  WriterBackpressure * bp_ = nullptr;  // for throttling CPU workers
 };
 
 static void writer_thread(FILE * out, ResultStore & results,
-                          const Options & opt, Meter * m)
+                          const Options & opt, Meter * m,
+                          WriterBackpressure * bp)
 {
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   // pin_thread_to_core(1);              // disabled: hurts on loaded machines
@@ -1606,10 +1730,10 @@ static void writer_thread(FILE * out, ResultStore & results,
                    || (out && out != stdout);          // regular file via fwrite
     }
 #ifndef _WIN32
-    aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse);
+    aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse, m, bp);
     aio = aio_ptr.get();
 #else
-    aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse);
+    aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse, m, bp);
     aio = aio_ptr.get();
 #endif
   }
@@ -1661,6 +1785,14 @@ static void writer_thread(FILE * out, ResultStore & results,
     if (batch.empty()) continue;
     lk.unlock();
 
+    // Update total expected output for write drain progress.
+    // For decompress: total_out is pre-set by stream_frames_to_queue (known from frame headers).
+    // For compress: total_out starts at 0; accumulate here as compressed frames are collected
+    //   since final compressed sizes aren't known upfront.
+    if (m && opt.mode == Mode::COMPRESS) {
+      m->total_out.fetch_add(batch_bytes, std::memory_order_relaxed);
+    }
+
     // Submit to writer backend
     if (opt.verbosity >= V_DEBUG) {
       char bs[32];
@@ -1672,7 +1804,8 @@ static void writer_thread(FILE * out, ResultStore & results,
       aio->submit(std::move(batch));
       if (aio->had_error()) die("async write failed (disk full?)");
     }
-    if (m) m->wrote_bytes.fetch_add(batch_bytes);
+    // wrote_bytes is now updated by the AIO worker after physical write completes,
+    // not here on submit.  This ensures the progress bar reflects actual disk I/O.
 
     lk.lock();
   }
@@ -1842,11 +1975,15 @@ public:
   }
 
   // Called by GPU workers once CUDA context is initialized
-  void set_gpu_ready() {
+  void set_gpu_ready(int device_id = -1) {
     gpu_ready_.store(true, std::memory_order_release);
     if (queue_) queue_->notify_cpu_waiters();  // wake CPUs to re-evaluate
-    if (opt_.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt_, "GPU ready  semaphore scheduling active\n");
+    if (opt_.verbosity >= V_VERBOSE) {
+      if (device_id >= 0)
+        vlog(V_VERBOSE, opt_, "GPU " + std::to_string(device_id) + " ready  semaphore scheduling active\n");
+      else
+        vlog(V_VERBOSE, opt_, "GPU ready  semaphore scheduling active\n");
+    }
   }
 
   void mark_cpu_take(uint64_t n) { cpu_taken_.fetch_add(n, std::memory_order_relaxed); }
@@ -2215,7 +2352,8 @@ static void cpu_decomp_worker(
   void * sched_ptr,
   RateMatchState * rate_match,
 #endif
-  CpuAgg * cpuagg)
+  CpuAgg * cpuagg,
+  WriterBackpressure * bp)
 {
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
@@ -2227,6 +2365,13 @@ static void cpu_decomp_worker(
   }
 
   while (true) {
+    // Writer backpressure: block if the writer is overwhelmed.
+    // This prevents CPU workers from producing decompressed data faster
+    // than the NVMe can write, which would exhaust RAM and cause massive
+    // kernel writeback pressure (the sys time problem).
+    // GPUs are never throttled  their batches are already in-flight.
+    if (bp) bp->wait_if_backlogged();
+
     Task t;
 #ifdef HAVE_NVCOMP
     if (sched) {
@@ -2312,6 +2457,7 @@ static void cpu_decomp_worker(
     if (m) m->read_bytes.fetch_add(comp_size);
 
     results->push_to_slot(-1, t.seq, std::move(out_buf));
+    if (bp) bp->mark_produced(actual);  // track backpressure for writer throttling
 
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(comp_size);
@@ -2349,7 +2495,7 @@ static void cpu_decomp_worker(
 static size_t stream_frames_to_queue(
     FILE * in,
     TaskQueue & queue,
-    Meter * /*m*/,
+    Meter * m,
     const Options & opt,
     bool * fallback,
     std::vector<char> * raw_data)
@@ -2467,6 +2613,7 @@ static size_t stream_frames_to_queue(
       t.data.assign(ptr, ptr + frame_comp);
       t.decomp_size = (size_t)frame_decomp;
       queue.push(std::move(t));
+      if (m) m->total_out.fetch_add((uint64_t)frame_decomp, std::memory_order_relaxed);
 
       buf_off += frame_comp;
 
@@ -2514,9 +2661,10 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 
   TaskQueue queue;
   ResultStore results;
+  WriterBackpressure backpressure;
 
   // Start writer thread (outputs decompressed frames in original order)
-  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m);
+  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &backpressure);
 
   // Start worker threads (they block on the queue until frames arrive)
   std::vector<std::thread> pool;
@@ -2527,7 +2675,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 #ifdef HAVE_NVCOMP
                       nullptr, nullptr,
 #endif
-                      &cpuagg);
+                      &cpuagg, &backpressure);
   }
   if (opt.verbosity >= V_VERBOSE)
     std::cerr << "[CPU-D] " << threads << " decompression threads online\n";
@@ -2548,6 +2696,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
       results.workers_done = true;
     }
     results.cv.notify_all();
+    backpressure.set_done();
     for (auto & th : pool) th.join();
     wthr.join();
 
@@ -2567,6 +2716,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
       results.workers_done = true;
     }
     results.cv.notify_all();
+    backpressure.set_done();
     for (auto & th : pool) th.join();
     wthr.join();
     return;
@@ -2585,6 +2735,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   results.cv.notify_all();
 
   // Wait for workers, then writer
+  backpressure.set_done();  // wake any CPU workers blocked on backpressure
   for (auto & th : pool) th.join();
   {
     std::lock_guard<std::mutex> lk(results.m);
@@ -2710,7 +2861,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
   ResultStore results;
-  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m);
+  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, nullptr);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
   Options opt_copy = opt;
@@ -3247,7 +3398,7 @@ static void gpu_worker(
 
     bool producer_done_seen=false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
-    if (sched) sched->set_gpu_ready();
+    if (sched) sched->set_gpu_ready(device_id);
     double util_scale = 1.0;  // utilization scaling for batch size
     while (true) {
       bool submitted_any=false;
@@ -4082,7 +4233,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
-  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m);
+  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, nullptr);
 
   // ---- Hybrid scheduler (adaptive CPU/GPU work-sharing) ----
   std::unique_ptr<HybridSched> sched_ptr;
@@ -4293,7 +4444,8 @@ static void gpu_decomp_worker(
   std::atomic<bool> * abort_on_failure,
   std::string * fatal_msg,
   SharedTuneState * shared_tune,
-  RateMatchState * rate_match)
+  RateMatchState * rate_match,
+  WriterBackpressure * bp)
 {
   (void)m;
   try {
@@ -4479,7 +4631,7 @@ static void gpu_decomp_worker(
     bool producer_done_seen = false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
     // Signal scheduler that this GPU is ready for work
-    if (sched) sched->set_gpu_ready();
+    if (sched) sched->set_gpu_ready(device_id);
 
     // Utilization scaling factor: 1.0 = idle, 0.1 = 90% busy.
     // Updated after each batch completion via NVML query.
@@ -4838,6 +4990,10 @@ static void gpu_decomp_worker(
           results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
           if (g_perf) g_perf->result_lock_ns.fetch_add(now_ns() - rl_t0);
         }
+        // Track GPU output for writer backpressure accounting.
+        // GPUs are never throttled (batches are in-flight), but their output
+        // counts toward the backlog so CPU workers throttle correctly.
+        if (bp) bp->mark_produced(out_sum);
 
         if (g_perf) {
           g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
@@ -4993,8 +5149,15 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
   RateMatchState rate_match;
 
+  // Writer backpressure: prevents CPU workers from producing decompressed data
+  // faster than the NVMe can write.  Without this, 96 CPU threads + 8 GPUs
+  // all flooding the writer causes 19 minutes of sys time (kernel writeback).
+  // GPUs call mark_produced() but are never throttled (batches in-flight).
+  // CPU workers call wait_if_backlogged() before popping a new task.
+  WriterBackpressure backpressure;
+
   // ---- Writer thread (outputs decompressed data in order) ----
-  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m);
+  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, &backpressure);
 
   // ---- Hybrid scheduler ----
   std::unique_ptr<HybridSched> sched_ptr;
@@ -5026,7 +5189,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     }
     for (int i = 0; i < cpu_threads; ++i)
       cpu_pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
-                            (void*)sched, &rate_match, &cpuagg);
+                            (void*)sched, &rate_match, &cpuagg, &backpressure);
   }
 
   // ---- GPU decompression workers ----
@@ -5051,7 +5214,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
                                &queue, &rescue, &results, m, sched,
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
-                               &shared_tune_decomp, &rate_match);
+                               &shared_tune_decomp, &rate_match,
+                               &backpressure);
     }
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -5078,6 +5242,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       results.workers_done = true;
     }
     results.cv.notify_all();
+    backpressure.set_done();
     for (auto & th : gpu_workers) th.join();
     for (auto & th : cpu_pool) th.join();
     if (sched) { tick_done = true; if (tick_thr.joinable()) tick_thr.join(); }
@@ -5118,6 +5283,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   rescue.set_done();
+  backpressure.set_done();  // wake any CPU workers blocked on backpressure
   if (!cpu_pool.empty()) {
     auto t_cpu = std::chrono::steady_clock::now();
     for (auto & th : cpu_pool) th.join();
@@ -5439,31 +5605,13 @@ int main(int argc, char ** argv)
     continue;  // next file
   }
   if (opt.mode == Mode::DECOMPRESS) {
-    prog_done = true;
-    if (prog_thr.joinable()) prog_thr.join();
-    // Summary is printed after finalize below
+    // Don't stop progress thread yet -- it shows write drain progress.
+    // It will be stopped after finalize below.
   }
 
   double finalize_ms = 0, sync_ms = 0;
 
   if (!to_stdout) {
-    // Flush buffered writes to disk.  For large decompressed files this
-    // can take several seconds as the kernel writes out dirty pages.
-    // Show a summary-style status line so the user knows what's happening.
-    if (opt.verbosity >= V_DEFAULT && opt.mode == Mode::DECOMPRESS) {
-      uint64_t in_bytes  = meter.read_bytes.load();
-      uint64_t out_bytes = meter.wrote_bytes.load();
-      char in_s[64], out_s[64];
-      human_bytes(double(in_bytes), in_s, sizeof(in_s));
-      human_bytes(double(out_bytes), out_s, sizeof(out_s));
-      std::string in_name = (opt.input == "-") ? "(stdin)" : opt.input;
-      char flush_line[512];
-      std::snprintf(flush_line, sizeof(flush_line),
-        "%s : %s => %s, writing...",
-        in_name.c_str(), in_s, out_s);
-      std::fprintf(stderr, "\r%s\033[K", flush_line);
-      std::fflush(stderr);
-    }
     // Finalize writer (write unaligned tail, close fd)
 #ifndef _WIN32
     if (g_direct_writer) {
@@ -5508,6 +5656,12 @@ int main(int argc, char ** argv)
     // Flush stdout to ensure all data reaches the downstream pipe
     std::fflush(stdout);
     std::fclose(in);
+  }
+
+  // Stop decompress progress thread now that write drain is complete
+  if (opt.mode == Mode::DECOMPRESS) {
+    prog_done = true;
+    if (prog_thr.joinable()) prog_thr.join();
   }
 
   // Print zstd-style completion summary with rate:

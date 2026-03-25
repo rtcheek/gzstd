@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.11.22
+**Current version:** v0.11.24
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -258,4 +258,5 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 | v0.11.20 | Removed dead liburing references (cleanup) |
 | v0.11.21 | CV-based CPU worker scheduling (replaced 9 sleep loops with condition variable waits) |
 | v0.11.22 | Early memory release (+7% on mixed data), rescue-safe GPU buffer management |
-
+| v0.11.23 | Write drain progress bar, verbose output cleanup, wrote_bytes tracks physical I/O |
+| v0.11.24 | Writer backpressure (+56% hybrid decompress on 432 GiB file, sys time -66%) |
