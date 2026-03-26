@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.24";
+static constexpr const char * GZSTD_VERSION = "0.11.26";
 //
 // Architecture overview:
 //
@@ -231,8 +231,11 @@ static constexpr int V_DEBUG   = 4;  // -vv: per-worker/batch detail
 static constexpr int V_TRACE   = 5;  // -vvv: per-chunk debug trace
 
 static constexpr int EXIT_OK       = 0;  // success
-static constexpr int EXIT_ERROR    = 1;  // runtime / I/O / compression error
+static constexpr int EXIT_ERROR    = 1;  // general runtime error (catch-all)
 static constexpr int EXIT_USAGE    = 2;  // bad command-line usage
+static constexpr int EXIT_IO       = 3;  // I/O error (disk full, read failure, permissions)
+static constexpr int EXIT_DATA     = 4;  // data/compression error (corrupt input, integrity failure)
+static constexpr int EXIT_GPU_FAIL = 5;  // all GPUs failed (VRAM exhaustion, driver error)
 
 // Global verbosity for die() which doesn't take Options
 static int g_verbosity = V_DEFAULT;
@@ -266,6 +269,10 @@ static void die(const std::string & msg, int code = EXIT_ERROR)
 }
 static void die_usage(const std::string & msg)
 { die(msg, EXIT_USAGE); }
+static void die_io(const std::string & msg)
+{ die(msg, EXIT_IO); }
+static void die_data(const std::string & msg)
+{ die(msg, EXIT_DATA); }
 
 static void print_help()
 {
@@ -324,8 +331,11 @@ static void print_help()
 "\n"
 "Exit codes:\n"
 "  0  Success\n"
-"  1  Runtime error (I/O, compression, GPU failure)\n"
+"  1  Runtime error (out of memory, internal failure)\n"
 "  2  Bad command-line usage\n"
+"  3  I/O error (disk full, read failure, permissions)\n"
+"  4  Data error (corrupt input, integrity check failure)\n"
+"  5  All GPUs failed (VRAM exhaustion, driver error)\n"
 "\n"
 "Progress is shown when stderr is a TTY. Use --progress to force it in pipes.\n";
 }
@@ -350,14 +360,14 @@ static bool parse_num_arg(const std::string & name, int & i, int argc,
   // Form: --name=VALUE
   if (a.rfind(pref + "=", 0) == 0) {
     std::string v = a.substr(pref.size() + 1);
-    if (v.empty()) die("missing value for " + pref);
+    if (v.empty()) die_usage("missing value for " + pref);
     out = std::stoull(v);
     if (was_set) *was_set = true;
     return true;
   }
   // Form: --name VALUE (next argv element)
   else if (a == pref) {
-    if (i + 1 >= argc) die("missing value for " + pref);
+    if (i + 1 >= argc) die_usage("missing value for " + pref);
     out = std::stoull(argv[++i]);
     if (was_set) *was_set = true;
     return true;
@@ -374,12 +384,12 @@ static bool parse_int_arg(const std::string & name, int & i, int argc,
 
   if (a.rfind(pref + "=", 0) == 0) {
     std::string v = a.substr(pref.size() + 1);
-    if (v.empty()) die("missing value for " + pref);
+    if (v.empty()) die_usage("missing value for " + pref);
     out = std::stoi(v);
     return true;
   }
   else if (a == pref) {
-    if (i + 1 >= argc) die("missing value for " + pref);
+    if (i + 1 >= argc) die_usage("missing value for " + pref);
     out = std::stoi(argv[++i]);
     return true;
   }
@@ -395,12 +405,12 @@ static bool parse_str_arg(const std::string & name, int & i, int argc,
 
   if (a.rfind(pref + "=", 0) == 0) {
     std::string v = a.substr(pref.size() + 1);
-    if (v.empty()) die("missing value for " + pref);
+    if (v.empty()) die_usage("missing value for " + pref);
     out = v;
     return true;
   }
   else if (a == pref) {
-    if (i + 1 >= argc) die("missing value for " + pref);
+    if (i + 1 >= argc) die_usage("missing value for " + pref);
     out = argv[++i];
     return true;
   }
@@ -419,12 +429,12 @@ static bool parse_double_arg(const std::string & name, int & i, int argc,
 
   if (a.rfind(pref + "=", 0) == 0) {
     std::string v = a.substr(pref.size() + 1);
-    if (v.empty()) die("missing value for " + pref);
+    if (v.empty()) die_usage("missing value for " + pref);
     out = std::stod(v);
     return true;
   }
   else if (a == pref) {
-    if (i + 1 >= argc) die("missing value for " + pref);
+    if (i + 1 >= argc) die_usage("missing value for " + pref);
     out = std::stod(argv[++i]);
     return true;
   }
@@ -517,6 +527,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   }
   g_progress_active.store(true, std::memory_order_relaxed);
   using namespace std::chrono; using namespace std::chrono_literals;
+  const bool is_test = (opt.mode == Mode::TEST);
   while (!done_flag->load()) {
     std::this_thread::sleep_for(200ms);
     uint64_t in  = m->read_bytes.load();
@@ -530,8 +541,22 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     human_bytes(double(out), out_s, sizeof(out_s));
     human_bytes(in_rate,     rate_s, sizeof(rate_s));
     double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
-    // When all input is read, switch to showing write drain progress
-    if (total_in > 0 && in >= total_in && out > 0) {
+
+    if (is_test) {
+      // Test mode: show verified bytes and decompression throughput.
+      // out = decompressed bytes verified (no disk I/O).
+      double out_rate = secs > 0 ? double(out) / secs : 0.0;
+      char vr_s[64];
+      human_bytes(out_rate, vr_s, sizeof(vr_s));
+      char line[256];
+      if (pct >= 0.0)
+        std::snprintf(line, sizeof(line), "[%.1f%%] in:%s verified:%s @ %s/s ", pct, in_s, out_s, vr_s);
+      else
+        std::snprintf(line, sizeof(line), " in:%s verified:%s @ %s/s ", in_s, out_s, vr_s);
+      std::fprintf(stderr, "\r%s\033[K", line);
+      std::fflush(stderr);
+    } else if (total_in > 0 && in >= total_in && out > 0) {
+      // All input consumed: switch to showing write drain progress
       double out_rate = secs > 0 ? double(out) / secs : 0.0;
       char wr_s[64];
       human_bytes(out_rate, wr_s, sizeof(wr_s));
@@ -578,7 +603,7 @@ static FILE * open_input(const std::string & path)
     return stdin;
   }
   FILE * f = std::fopen(path.c_str(), "rb");
-  if (!f) die("cannot open input: " + path);
+  if (!f) die_io("cannot open input: " + path);
   return f;
 }
 // Open a temporary file for atomic write: write to .tmp, then rename on success.
@@ -587,7 +612,7 @@ static FILE * open_output_atomic(const std::string & out, std::string & tmp_path
   tmp_path = out + ".gzstd.tmp";
   register_tmp_file(tmp_path);
   FILE * f = std::fopen(tmp_path.c_str(), "wb");
-  if (!f) die("cannot open temp output: " + tmp_path);
+  if (!f) die_io("cannot open temp output: " + tmp_path);
   return f;
 }
 // Flush file data to disk (POSIX only).
@@ -1097,6 +1122,19 @@ public:
     ++total_tasks_;
     cv_.notify_all();      // wake all GPU workers waiting in pop_batch_greedy
     cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
+  }
+
+  // Re-enqueue tasks that were popped but never processed (e.g., GPU VRAM failure).
+  // Does NOT increment total_tasks_ since these were already counted on first push.
+  void re_enqueue(std::vector<Task> & batch)
+  {
+    if (batch.empty()) return;
+    std::unique_lock<std::mutex> lk(m_);
+    for (auto & t : batch)
+      q_.push_back(std::move(t));
+    batch.clear();
+    cv_.notify_all();
+    cpu_cv_.notify_one();
   }
 
   // Pop up to max_n tasks at once (used by GPU workers to fill a batch).
@@ -1802,10 +1840,14 @@ static void writer_thread(FILE * out, ResultStore & results,
     }
     if (aio) {
       aio->submit(std::move(batch));
-      if (aio->had_error()) die("async write failed (disk full?)");
+      if (aio->had_error()) die_io("async write failed (disk full?)");
+    } else {
+      // Test mode (no AIO): update wrote_bytes directly so the progress bar
+      // shows decompressed bytes verified, not stuck at 0.
+      if (m) m->wrote_bytes.fetch_add(batch_bytes, std::memory_order_relaxed);
     }
-    // wrote_bytes is now updated by the AIO worker after physical write completes,
-    // not here on submit.  This ensures the progress bar reflects actual disk I/O.
+    // In normal mode, wrote_bytes is updated by the AIO worker after physical
+    // write completes.  This ensures the progress bar reflects actual disk I/O.
 
     lk.lock();
   }
@@ -1815,7 +1857,7 @@ static void writer_thread(FILE * out, ResultStore & results,
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "writer: draining write queue...\n");
     aio->flush();
-    if (aio->had_error()) die("async write failed (disk full?)");
+    if (aio->had_error()) die_io("async write failed (disk full?)");
   }
 }
 
@@ -1833,12 +1875,12 @@ static inline void compress_one_cpu_frame(const void * src, size_t src_size, int
   }
   // Set compression level explicitly on every call (level may differ per invocation)
   size_t st = ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_compressionLevel, level);
-  if (ZSTD_isError(st)) die(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
+  if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
 
   size_t bound = ZSTD_compressBound(src_size);
   out.resize(bound);
   size_t csz = ZSTD_compress2(tl_cctx, out.data(), out.size(), src, src_size);
-  if (ZSTD_isError(csz)) die(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
+  if (ZSTD_isError(csz)) die_data(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
   out.resize(csz);
 }
 
@@ -1856,21 +1898,22 @@ static void decompress_from_buffer(const std::vector<char> & input,
   ZSTD_outBuffer zout { outbuf.data(), outbuf.size(), 0 };
   if (m) m->read_bytes.fetch_add(input.size());
 
+  size_t ret = 0;
   while (zin.pos < zin.size) {
-    size_t ret = ZSTD_decompressStream(dctx, &zout, &zin);
+    ret = ZSTD_decompressStream(dctx, &zout, &zin);
     if (ZSTD_isError(ret))
-      die(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
+      die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
     if (zout.pos > 0) {
       if (opt.mode != Mode::TEST) {
 #ifndef _WIN32
         if (g_direct_writer) {
           if (!g_direct_writer->write(outbuf.data(), zout.pos))
-            die("direct write failed (disk full?)");
+            die_io("direct write failed (disk full?)");
         } else
 #endif
         {
           size_t w = robust_fwrite(outbuf.data(), zout.pos, out);
-          if (w != zout.pos) die("short write to output (broken pipe?)");
+          if (w != zout.pos) die_io("short write to output (broken pipe?)");
         }
       }
       if (m) m->wrote_bytes.fetch_add(zout.pos);
@@ -1880,6 +1923,10 @@ static void decompress_from_buffer(const std::vector<char> & input,
       // Frame boundary in multi-frame stream; continue
     }
   }
+
+  // ret > 0 means ZSTD expected more input  the stream was truncated mid-frame.
+  if (ret > 0)
+    die_data("truncated zstd stream (expected more data)");
 
   ZSTD_freeDCtx(dctx);
 }
@@ -2421,7 +2468,7 @@ static void cpu_decomp_worker(
     size_t actual = ZSTD_decompressDCtx(tl_dctx, out_buf.data(), out_buf.size(),
                                         t.data.data(), t.data.size());
     if (ZSTD_isError(actual))
-      die(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
+      die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
     out_buf.resize(actual);
 
     { std::vector<char>().swap(t.data); }
@@ -2577,7 +2624,21 @@ static size_t stream_frames_to_queue(
           }
           return 0;
         }
-        // Parsed some frames OK; trailing bytes cannot form a valid frame
+        // Parsed some frames OK; trailing bytes cannot form a valid frame.
+        // A few trailing null bytes could be padding; anything substantial
+        // indicates truncation or corruption.
+        if (remaining > 8) {
+          // Significant trailing data that isn't a valid frame = truncated
+          *fallback = false;  // not a format problem, it's a data problem
+          // Return frames parsed so far  the caller should still detect
+          // the issue because the decompressed output will be incomplete.
+          vlog(V_NORMAL, opt,
+               "error: " + std::to_string(remaining)
+               + " trailing bytes after frame " + std::to_string(seq)
+               + " (truncated or corrupt input)\n");
+          die_data("truncated zstd stream: " + std::to_string(remaining)
+                   + " trailing bytes after " + std::to_string(seq) + " frames");
+        }
         vlog(V_VERBOSE, opt,
              "warning: " + std::to_string(remaining)
              + " trailing bytes after frame " + std::to_string(seq)
@@ -2662,9 +2723,12 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   TaskQueue queue;
   ResultStore results;
   WriterBackpressure backpressure;
+  // Disable backpressure in test mode: no disk I/O, so mark_written() is never
+  // called and CPU workers would block at the high-water mark forever.
+  WriterBackpressure * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &backpressure;
 
   // Start writer thread (outputs decompressed frames in original order)
-  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &backpressure);
+  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
 
   // Start worker threads (they block on the queue until frames arrive)
   std::vector<std::thread> pool;
@@ -2675,7 +2739,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 #ifdef HAVE_NVCOMP
                       nullptr, nullptr,
 #endif
-                      &cpuagg, &backpressure);
+                      &cpuagg, bp_ptr);
   }
   if (opt.verbosity >= V_VERBOSE)
     std::cerr << "[CPU-D] " << threads << " decompression threads online\n";
@@ -2775,7 +2839,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   ZSTD_CCtx * cctx = ZSTD_createCCtx();
   if (!cctx) die("failed to create ZSTD_CCtx");
   size_t st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
-  if (ZSTD_isError(st)) die(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
+  if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
 
   std::vector< char > inbuf(chunk_bytes);
   std::vector< char > outbuf(ZSTD_compressBound(chunk_bytes));
@@ -2790,7 +2854,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
     if (m) m->read_bytes.fetch_add(n);
     uint64_t comp_t0 = g_perf ? now_ns() : 0;
     size_t csz = ZSTD_compress2(cctx, outbuf.data(), outbuf.size(), inbuf.data(), n);
-    if (ZSTD_isError(csz)) die(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
+    if (ZSTD_isError(csz)) die_data(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
     if (g_perf) {
       g_perf->cpu_compute_ns.fetch_add(now_ns() - comp_t0);
       g_perf->cpu_compute_count.fetch_add(1);
@@ -2800,12 +2864,12 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
 #ifndef _WIN32
     if (g_direct_writer) {
       if (!g_direct_writer->write(outbuf.data(), csz))
-        die("direct write failed (disk full?)");
+        die_io("direct write failed (disk full?)");
     } else
 #endif
     {
       size_t w = robust_fwrite(outbuf.data(), csz, out);
-      if (w != csz) die("short write to output (broken pipe?)");
+      if (w != csz) die_io("short write to output (broken pipe?)");
     }
     if (g_perf) {
       g_perf->write_ns.fetch_add(now_ns() - w_t0);
@@ -3296,6 +3360,8 @@ static void gpu_worker(
   RateMatchState * rate_match)
 {
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
+  void * vram_reserve = nullptr;
+  size_t vram_reserve_bytes = 0;
   try {
     uint64_t init_t0 = g_perf ? now_ns() : 0;
     checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
@@ -3373,7 +3439,22 @@ static void gpu_worker(
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
         // Free any partial allocations from the failed attempt
         free_stream_buffers_only(C);
-        if (C.per_stream_batch==1) throw std::runtime_error("insufficient GPU memory for per-stream batch=1");
+        if (C.per_stream_batch==1) {
+          // Can't fit even batch=1  skip this GPU entirely.
+          // Other GPUs (or CPU in hybrid) will handle the work.
+          std::string skip_msg = "[GPU" + std::to_string(device_id)
+              + "] insufficient VRAM for even batch=1  skipping device";
+          vlog(V_ERROR, opt, skip_msg + "\n");
+          *any_gpu_failed = true;
+          *fatal_msg = skip_msg;
+          // Clean up streams we already created
+          for (size_t cs = 0; cs <= s; ++cs) {
+            if (ctxs[cs].stream) { cudaStreamDestroy(ctxs[cs].stream); ctxs[cs].stream = nullptr; }
+          }
+          // Wake writer in case it's waiting
+          { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+          return;
+        }
         C.per_stream_batch = std::max<size_t>(1, C.per_stream_batch/2);
         {
           int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
@@ -3398,6 +3479,25 @@ static void gpu_worker(
 
     bool producer_done_seen=false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
+
+    // VRAM reserve: hold enough memory to process half the batch size.
+    // If another user grabs VRAM mid-run and a cudaMalloc fails, we free
+    // the reserve and retry before giving up on this GPU.
+    {
+      size_t half_batch = std::max<size_t>(1, ctxs[0].per_stream_batch / 2);
+      size_t per_frame = gpu_chunk + max_out_chunk + 4096;
+      vram_reserve_bytes = half_batch * per_frame;
+      if (cudaMalloc(&vram_reserve, vram_reserve_bytes) != cudaSuccess) {
+        vram_reserve = nullptr;
+        vram_reserve_bytes = 0;
+        vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
+             + "] could not allocate VRAM reserve (non-fatal)\n");
+      } else if (opt.verbosity >= V_DEBUG) {
+        vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id)
+             + "] VRAM reserve: " + std::to_string(vram_reserve_bytes / ONE_MIB) + " MiB\n");
+      }
+    }
+
     if (sched) sched->set_gpu_ready(device_id);
     double util_scale = 1.0;  // utilization scaling for batch size
     while (true) {
@@ -3939,6 +4039,7 @@ static void gpu_worker(
     }
 
     // Free all GPU resources for this device
+    if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
       free_stream_buffers_only(C);
       if (C.stream) cudaStreamDestroy(C.stream);
@@ -3951,17 +4052,22 @@ static void gpu_worker(
     *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
 
     try {
-      if (rescue) {
-        if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
-          for (auto & C : *sp) {
-            // Re-enqueue in-flight chunks to the rescue (CPU) queue
-            if (C.busy && !C.batch.empty()) {
+      if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
+      if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
+        for (auto & C : *sp) {
+          if (C.busy && !C.batch.empty()) {
+            if (rescue) {
+              // Hybrid mode: push to CPU rescue queue
               for (size_t i = 0; i < C.filled; ++i)
                 rescue->push(Task{ C.batch[i].seq, C.batch[i].data });
+              C.batch.clear();
+            } else {
+              // GPU-only mode: push back to main queue for other GPUs
+              queue->re_enqueue(C.batch);
             }
-            free_stream_buffers_only(C);
-            if (C.stream) cudaStreamDestroy(C.stream);
           }
+          free_stream_buffers_only(C);
+          if (C.stream) cudaStreamDestroy(C.stream);
         }
       }
     } catch (...) {}
@@ -4178,7 +4284,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
     if (opt.gpu_only)
-      die("GPU requested (--gpu-only) but no CUDA devices available");
+      die_usage("GPU requested (--gpu-only) but no CUDA devices available");
     vlog(V_VERBOSE, opt, "nvCOMP: no GPUs found; falling back to MT CPU\n");
     compress_cpu_mt(in, out, opt, m);
     return;
@@ -4372,8 +4478,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Check for GPU failures
   if (any_gpu_failed.load()) {
-    if (abort_on_failure.load()) {
-      // Fatal in --gpu-only mode
+    // Count how many GPUs actually failed
+    int failed_count = 0;
+    for (const auto & s : fatal_msgs)
+      if (!s.empty()) ++failed_count;
+    int total_gpus = (int)fatal_msgs.size();
+
+    if (abort_on_failure.load() && failed_count >= total_gpus) {
+      // ALL GPUs failed in --gpu-only mode  fatal
       progress_done = true;
       progress_thr.join();
       {
@@ -4382,15 +4494,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         results.cv.notify_all();
       }
       writer_thr.join();
-      std::string msg = "GPU path failed (--gpu-only).";
+      std::string msg = "all GPUs failed (--gpu-only).";
       for (const auto & s : fatal_msgs)
         if (!s.empty()) { msg += " "; msg += s; }
-      die(msg);
+      die(msg, EXIT_GPU_FAIL);
     } else {
-      // Hybrid mode: warn but continue with CPU rescue
+      // Some GPUs failed but others are working (or hybrid mode)
       for (const auto & s : fatal_msgs)
         if (!s.empty())
-          vlog(V_VERBOSE, opt, "WARNING: " + s + " (rescued to CPU)\n");
+          vlog(V_NORMAL, opt, "WARNING: " + s
+               + (abort_on_failure.load() ? " (other GPUs continuing)\n" : " (rescued to CPU)\n"));
     }
   }
 
@@ -4448,11 +4561,123 @@ static void gpu_decomp_worker(
   WriterBackpressure * bp)
 {
   (void)m;
+  const size_t stream_count = std::max<size_t>(1, (size_t)opt.gpu_streams);
+
+  // Per-stream state for decompression (declared before try so catch can rescue)
+  struct DecompStreamCtx {
+    cudaStream_t stream{};
+    cudaEvent_t ev_begin{}, ev_end{};
+    std::vector<Task> batch;
+    bool busy = false;
+    size_t filled = 0;
+    size_t stream_index = 0;
+
+    // Auto-tune tracking
+    std::chrono::steady_clock::time_point last_adjust{ std::chrono::steady_clock::now() };
+    uint64_t tune_in_bytes = 0;      // bytes processed since last tune check
+    double   tune_elapsed_ms = 0.0;  // ms elapsed since last tune check
+    enum class TuneState { EXPLORE, REFINE, SETTLE };
+    TuneState tune_state = TuneState::EXPLORE;
+    size_t    tune_lo = 0, tune_hi = 0;
+    size_t    tune_best_batch = 0;
+    double    tune_best_thr = 0.0;
+    size_t    tune_prev_batch = 0;
+    double    tune_prev_thr = 0.0;
+    uint32_t  tune_batches_at_size = 0;
+    uint32_t  tune_settle_count = 0;
+    // Constants for tuner (not static  local classes can't have static members)
+    uint32_t TUNE_MIN_BATCHES = 2;
+    uint32_t TUNE_PROBE_INTERVAL = 15;
+
+    // Pre-allocated device buffers (reused across batches)
+    size_t alloc_batch = 0;     // how many slots are allocated
+    size_t alloc_comp = 0;      // bytes per compressed slot
+    size_t alloc_decomp = 0;    // bytes per decompressed slot
+    void * d_comp_buf = nullptr;
+    void * d_decomp_buf = nullptr;
+    void * d_temp = nullptr;
+    size_t temp_bytes = 0;
+    void ** d_comp_ptrs = nullptr;
+    void ** d_decomp_ptrs = nullptr;
+    size_t * d_comp_sizes = nullptr;
+    size_t * d_decomp_sizes = nullptr;
+    size_t * d_actual_sizes = nullptr;
+    nvcompStatus_t * d_statuses = nullptr;
+
+    // Host-side arrays
+    std::vector<void*> h_comp_ptrs, h_decomp_ptrs;
+    std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual;
+    std::vector<nvcompStatus_t> h_statuses;
+
+    void free_device() {
+      if (d_comp_buf)    { cudaFree(d_comp_buf);    d_comp_buf = nullptr; }
+      if (d_decomp_buf)  { cudaFree(d_decomp_buf);  d_decomp_buf = nullptr; }
+      if (d_temp)        { cudaFree(d_temp);         d_temp = nullptr; }
+      if (d_comp_ptrs)   { cudaFree(d_comp_ptrs);   d_comp_ptrs = nullptr; }
+      if (d_decomp_ptrs) { cudaFree(d_decomp_ptrs); d_decomp_ptrs = nullptr; }
+      if (d_comp_sizes)  { cudaFree(d_comp_sizes);   d_comp_sizes = nullptr; }
+      if (d_decomp_sizes){ cudaFree(d_decomp_sizes); d_decomp_sizes = nullptr; }
+      if (d_actual_sizes){ cudaFree(d_actual_sizes); d_actual_sizes = nullptr; }
+      if (d_statuses)    { cudaFree(d_statuses);     d_statuses = nullptr; }
+      alloc_batch = 0; alloc_comp = 0; alloc_decomp = 0; temp_bytes = 0;
+    }
+
+    // Ensure buffers are large enough for the given batch parameters.
+    // Returns false on allocation failure.
+    bool ensure_buffers(size_t batch_n, size_t max_comp, size_t max_decomp,
+                        size_t needed_temp) {
+      if (batch_n <= alloc_batch && max_comp <= alloc_comp
+          && max_decomp <= alloc_decomp && needed_temp <= temp_bytes)
+        return true;  // already big enough
+
+      // Need to reallocate
+      free_device();
+      alloc_batch  = batch_n;
+      alloc_comp   = max_comp;
+      alloc_decomp = max_decomp;
+
+      if (cudaMalloc(&d_comp_buf,     batch_n * max_comp)    != cudaSuccess) return false;
+      if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) return false;
+      if (cudaMalloc(&d_comp_ptrs,    batch_n * sizeof(void*))   != cudaSuccess) return false;
+      if (cudaMalloc(&d_decomp_ptrs,  batch_n * sizeof(void*))   != cudaSuccess) return false;
+      if (cudaMalloc(&d_comp_sizes,   batch_n * sizeof(size_t))  != cudaSuccess) return false;
+      if (cudaMalloc(&d_decomp_sizes, batch_n * sizeof(size_t))  != cudaSuccess) return false;
+      if (cudaMalloc(&d_actual_sizes, batch_n * sizeof(size_t))  != cudaSuccess) return false;
+      if (cudaMalloc(&d_statuses,     batch_n * sizeof(nvcompStatus_t)) != cudaSuccess) return false;
+      if (needed_temp > 0) {
+        if (cudaMalloc(&d_temp, needed_temp) != cudaSuccess) return false;
+        temp_bytes = needed_temp;
+      }
+
+      // Set up pointer arrays (offsets are fixed for a given max_comp/max_decomp)
+      h_comp_ptrs.resize(batch_n);
+      h_decomp_ptrs.resize(batch_n);
+      for (size_t i = 0; i < batch_n; ++i) {
+        h_comp_ptrs[i]   = static_cast<char*>(d_comp_buf)   + i * max_comp;
+        h_decomp_ptrs[i] = static_cast<char*>(d_decomp_buf) + i * max_decomp;
+      }
+      checkCuda(cudaMemcpy(d_comp_ptrs, h_comp_ptrs.data(),
+                           batch_n * sizeof(void*), cudaMemcpyHostToDevice),
+                "H2D decomp ptrs");
+      checkCuda(cudaMemcpy(d_decomp_ptrs, h_decomp_ptrs.data(),
+                           batch_n * sizeof(void*), cudaMemcpyHostToDevice),
+                "H2D decomp ptrs");
+
+      h_comp_sizes.resize(batch_n);
+      h_decomp_sizes.resize(batch_n);
+      h_actual.resize(batch_n);
+      h_statuses.resize(batch_n);
+      return true;
+    }
+  };
+
+  std::vector<DecompStreamCtx> ctxs;  // declared here so catch block can rescue frames
+  void * vram_reserve = nullptr;
+  size_t vram_reserve_bytes = 0;
   try {
     uint64_t init_t0 = g_perf ? now_ns() : 0;
     checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
 
-    const size_t stream_count = std::max<size_t>(1, opt.gpu_streams);
     // For decompress, gpu_batch_cap is PER STREAM (not divided across streams).
     // Kernel launch overhead dominates, so each stream needs large batches.
     // Compress divides across streams for VRAM management, but decompress
@@ -4466,115 +4691,7 @@ static void gpu_decomp_worker(
 
     const size_t host_chunk_bytes = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
 
-    // Per-stream state for decompression
-    struct DecompStreamCtx {
-      cudaStream_t stream{};
-      cudaEvent_t ev_begin{}, ev_end{};
-      std::vector<Task> batch;
-      bool busy = false;
-      size_t filled = 0;
-      size_t stream_index = 0;
-
-      // Auto-tune tracking
-      std::chrono::steady_clock::time_point last_adjust{ std::chrono::steady_clock::now() };
-      uint64_t tune_in_bytes = 0;      // bytes processed since last tune check
-      double   tune_elapsed_ms = 0.0;  // ms elapsed since last tune check
-      enum class TuneState { EXPLORE, REFINE, SETTLE };
-      TuneState tune_state = TuneState::EXPLORE;
-      size_t    tune_lo = 0, tune_hi = 0;
-      size_t    tune_best_batch = 0;
-      double    tune_best_thr = 0.0;
-      size_t    tune_prev_batch = 0;
-      double    tune_prev_thr = 0.0;
-      uint32_t  tune_batches_at_size = 0;
-      uint32_t  tune_settle_count = 0;
-      // Constants for tuner (not static  local classes can't have static members)
-      uint32_t TUNE_MIN_BATCHES = 2;
-      uint32_t TUNE_PROBE_INTERVAL = 15;
-
-      // Pre-allocated device buffers (reused across batches)
-      size_t alloc_batch = 0;     // how many slots are allocated
-      size_t alloc_comp = 0;      // bytes per compressed slot
-      size_t alloc_decomp = 0;    // bytes per decompressed slot
-      void * d_comp_buf = nullptr;
-      void * d_decomp_buf = nullptr;
-      void * d_temp = nullptr;
-      size_t temp_bytes = 0;
-      void ** d_comp_ptrs = nullptr;
-      void ** d_decomp_ptrs = nullptr;
-      size_t * d_comp_sizes = nullptr;
-      size_t * d_decomp_sizes = nullptr;
-      size_t * d_actual_sizes = nullptr;
-      nvcompStatus_t * d_statuses = nullptr;
-
-      // Host-side arrays
-      std::vector<void*> h_comp_ptrs, h_decomp_ptrs;
-      std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual;
-      std::vector<nvcompStatus_t> h_statuses;
-
-      void free_device() {
-        if (d_comp_buf)    { cudaFree(d_comp_buf);    d_comp_buf = nullptr; }
-        if (d_decomp_buf)  { cudaFree(d_decomp_buf);  d_decomp_buf = nullptr; }
-        if (d_temp)        { cudaFree(d_temp);         d_temp = nullptr; }
-        if (d_comp_ptrs)   { cudaFree(d_comp_ptrs);   d_comp_ptrs = nullptr; }
-        if (d_decomp_ptrs) { cudaFree(d_decomp_ptrs); d_decomp_ptrs = nullptr; }
-        if (d_comp_sizes)  { cudaFree(d_comp_sizes);   d_comp_sizes = nullptr; }
-        if (d_decomp_sizes){ cudaFree(d_decomp_sizes); d_decomp_sizes = nullptr; }
-        if (d_actual_sizes){ cudaFree(d_actual_sizes); d_actual_sizes = nullptr; }
-        if (d_statuses)    { cudaFree(d_statuses);     d_statuses = nullptr; }
-        alloc_batch = 0; alloc_comp = 0; alloc_decomp = 0; temp_bytes = 0;
-      }
-
-      // Ensure buffers are large enough for the given batch parameters.
-      // Returns false on allocation failure.
-      bool ensure_buffers(size_t batch_n, size_t max_comp, size_t max_decomp,
-                          size_t needed_temp) {
-        if (batch_n <= alloc_batch && max_comp <= alloc_comp
-            && max_decomp <= alloc_decomp && needed_temp <= temp_bytes)
-          return true;  // already big enough
-
-        // Need to reallocate
-        free_device();
-        alloc_batch  = batch_n;
-        alloc_comp   = max_comp;
-        alloc_decomp = max_decomp;
-
-        if (cudaMalloc(&d_comp_buf,     batch_n * max_comp)    != cudaSuccess) return false;
-        if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) return false;
-        if (cudaMalloc(&d_comp_ptrs,    batch_n * sizeof(void*))   != cudaSuccess) return false;
-        if (cudaMalloc(&d_decomp_ptrs,  batch_n * sizeof(void*))   != cudaSuccess) return false;
-        if (cudaMalloc(&d_comp_sizes,   batch_n * sizeof(size_t))  != cudaSuccess) return false;
-        if (cudaMalloc(&d_decomp_sizes, batch_n * sizeof(size_t))  != cudaSuccess) return false;
-        if (cudaMalloc(&d_actual_sizes, batch_n * sizeof(size_t))  != cudaSuccess) return false;
-        if (cudaMalloc(&d_statuses,     batch_n * sizeof(nvcompStatus_t)) != cudaSuccess) return false;
-        if (needed_temp > 0) {
-          if (cudaMalloc(&d_temp, needed_temp) != cudaSuccess) return false;
-          temp_bytes = needed_temp;
-        }
-
-        // Set up pointer arrays (offsets are fixed for a given max_comp/max_decomp)
-        h_comp_ptrs.resize(batch_n);
-        h_decomp_ptrs.resize(batch_n);
-        for (size_t i = 0; i < batch_n; ++i) {
-          h_comp_ptrs[i]   = static_cast<char*>(d_comp_buf)   + i * max_comp;
-          h_decomp_ptrs[i] = static_cast<char*>(d_decomp_buf) + i * max_decomp;
-        }
-        checkCuda(cudaMemcpy(d_comp_ptrs, h_comp_ptrs.data(),
-                             batch_n * sizeof(void*), cudaMemcpyHostToDevice),
-                  "H2D decomp ptrs");
-        checkCuda(cudaMemcpy(d_decomp_ptrs, h_decomp_ptrs.data(),
-                             batch_n * sizeof(void*), cudaMemcpyHostToDevice),
-                  "H2D decomp ptrs");
-
-        h_comp_sizes.resize(batch_n);
-        h_decomp_sizes.resize(batch_n);
-        h_actual.resize(batch_n);
-        h_statuses.resize(batch_n);
-        return true;
-      }
-    };
-
-    std::vector<DecompStreamCtx> ctxs(stream_count);
+    ctxs.resize(stream_count);
     for (size_t s = 0; s < stream_count; ++s) {
       auto & C = ctxs[s];
       checkCuda(cudaStreamCreate(&C.stream), "cudaStreamCreate");
@@ -4596,11 +4713,24 @@ static void gpu_decomp_worker(
         size_t try_batch = per_stream_cap;
         while (!C.ensure_buffers(try_batch, init_comp, init_decomp, est_temp)) {
           if (try_batch <= 1) {
-            throw std::runtime_error(
-                std::string("[GPU-D") + std::to_string(device_id)
+            // Can't fit even batch=1  skip this GPU entirely.
+            // Other GPUs (or CPU in hybrid) will handle the work.
+            std::string skip_msg = "[GPU-D" + std::to_string(device_id)
                 + "] insufficient VRAM for even batch=1 ("
                 + std::to_string(init_comp / ONE_MIB) + " MiB comp + "
-                + std::to_string(init_decomp / ONE_MIB) + " MiB decomp per frame)");
+                + std::to_string(init_decomp / ONE_MIB) + " MiB decomp per frame)  skipping device";
+            vlog(V_ERROR, opt, skip_msg + "\n");
+            *any_gpu_failed = true;
+            *fatal_msg = skip_msg;
+            // Clean up streams/events we already created
+            for (size_t cs = 0; cs <= s; ++cs) {
+              if (ctxs[cs].ev_begin) { cudaEventDestroy(ctxs[cs].ev_begin); ctxs[cs].ev_begin = nullptr; }
+              if (ctxs[cs].ev_end)   { cudaEventDestroy(ctxs[cs].ev_end);   ctxs[cs].ev_end = nullptr; }
+              if (ctxs[cs].stream)   { cudaStreamDestroy(ctxs[cs].stream);   ctxs[cs].stream = nullptr; }
+            }
+            // Wake writer in case it's waiting
+            { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+            return;
           }
           try_batch = std::max<size_t>(1, try_batch / 2);
           {
@@ -4630,6 +4760,27 @@ static void gpu_decomp_worker(
 
     bool producer_done_seen = false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
+
+    // VRAM reserve: hold enough memory to process half the batch size.
+    // If another user grabs VRAM mid-run and a cudaMalloc fails (e.g., temp
+    // buffer growth), we free the reserve and retry.  This avoids a hard
+    // failure when VRAM pressure spikes during a long job.
+    {
+      // Reserve = half-batch worth of (comp + decomp + overhead) per stream
+      size_t half_batch = std::max<size_t>(1, per_stream_cap / 2);
+      size_t per_frame = host_chunk_bytes * 2 + 4096;  // comp + decomp + metadata
+      vram_reserve_bytes = half_batch * per_frame;
+      if (cudaMalloc(&vram_reserve, vram_reserve_bytes) != cudaSuccess) {
+        vram_reserve = nullptr;
+        vram_reserve_bytes = 0;
+        vlog(V_VERBOSE, opt, "[GPU-D" + std::to_string(device_id)
+             + "] could not allocate VRAM reserve (non-fatal)\n");
+      } else if (opt.verbosity >= V_DEBUG) {
+        vlog(V_DEBUG, opt, "[GPU-D" + std::to_string(device_id)
+             + "] VRAM reserve: " + std::to_string(vram_reserve_bytes / ONE_MIB) + " MiB\n");
+      }
+    }
+
     // Signal scheduler that this GPU is ready for work
     if (sched) sched->set_gpu_ready(device_id);
 
@@ -4900,8 +5051,21 @@ static void gpu_decomp_worker(
 
         // Re-ensure buffers if temp grew
         if (needed_temp > C.temp_bytes) {
-          if (!C.ensure_buffers(C.filled, max_comp, max_decomp, needed_temp))
-            throw std::runtime_error("GPU decomp: failed to grow temp buffer");
+          if (!C.ensure_buffers(C.filled, max_comp, max_decomp, needed_temp)) {
+            // Allocation failed  free VRAM reserve and retry
+            if (vram_reserve) {
+              vlog(V_VERBOSE, opt, "[GPU-D" + std::to_string(device_id)
+                   + "] freeing VRAM reserve (" + std::to_string(vram_reserve_bytes / ONE_MIB)
+                   + " MiB) to grow temp buffer\n");
+              cudaFree(vram_reserve);
+              vram_reserve = nullptr;
+              vram_reserve_bytes = 0;
+              if (!C.ensure_buffers(C.filled, max_comp, max_decomp, needed_temp))
+                throw std::runtime_error("GPU decomp: failed to grow temp buffer (even after freeing reserve)");
+            } else {
+              throw std::runtime_error("GPU decomp: failed to grow temp buffer");
+            }
+          }
           // Re-upload pointer/size arrays since ensure_buffers may have reallocated
           for (size_t i = 0; i < C.filled; ++i) {
             void * d_dst = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
@@ -5074,6 +5238,7 @@ static void gpu_decomp_worker(
     }
 
     // Cleanup
+    if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
       C.free_device();
       if (C.ev_begin) cudaEventDestroy(C.ev_begin);
@@ -5085,10 +5250,18 @@ static void gpu_decomp_worker(
     *any_gpu_failed = true;
     *fatal_msg = std::string("[GPU-D") + std::to_string(device_id) + "] " + e.what();
 
-    // Rescue in-flight chunks back to CPU
+    // Rescue in-flight chunks back to queue so other GPUs can pick them up.
+    // The batch was popped from the queue but never decompressed.
     try {
-      if (rescue) {
-        // No in-flight since we synchronize per-batch, but rescue unprocessed
+      if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
+      for (auto & C : ctxs) {
+        if (!C.batch.empty()) {
+          queue->re_enqueue(C.batch);
+        }
+        C.free_device();
+        if (C.ev_begin) { cudaEventDestroy(C.ev_begin); C.ev_begin = nullptr; }
+        if (C.ev_end)   { cudaEventDestroy(C.ev_end);   C.ev_end = nullptr; }
+        if (C.stream)   { cudaStreamDestroy(C.stream);   C.stream = nullptr; }
       }
     } catch (...) {}
 
@@ -5118,7 +5291,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
     if (opt.gpu_only)
-      die("GPU requested (--gpu-only) but no CUDA devices available");
+      die_usage("GPU requested (--gpu-only) but no CUDA devices available");
     vlog(V_VERBOSE, opt, "nvCOMP: no GPUs found; falling back to MT CPU decompress\n");
     // Fall through with device_count=0; CPU pool will handle everything
   }
@@ -5154,10 +5327,13 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // all flooding the writer causes 19 minutes of sys time (kernel writeback).
   // GPUs call mark_produced() but are never throttled (batches in-flight).
   // CPU workers call wait_if_backlogged() before popping a new task.
+  // Disabled in test mode: no disk I/O means mark_written() is never called,
+  // so workers would block at the high-water mark forever.
   WriterBackpressure backpressure;
+  WriterBackpressure * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &backpressure;
 
   // ---- Writer thread (outputs decompressed data in order) ----
-  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, &backpressure);
+  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
 
   // ---- Hybrid scheduler ----
   std::unique_ptr<HybridSched> sched_ptr;
@@ -5189,7 +5365,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     }
     for (int i = 0; i < cpu_threads; ++i)
       cpu_pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
-                            (void*)sched, &rate_match, &cpuagg, &backpressure);
+                            (void*)sched, &rate_match, &cpuagg, bp_ptr);
   }
 
   // ---- GPU decompression workers ----
@@ -5215,7 +5391,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
                                &shared_tune_decomp, &rate_match,
-                               &backpressure);
+                               bp_ptr);
     }
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -5270,16 +5446,30 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   for (auto & th : gpu_workers) th.join();
 
   if (abort_on_failure.load() && any_gpu_failed.load()) {
-    {
-      std::lock_guard<std::mutex> lk(results.m);
-      results.workers_done = true;
-      results.cv.notify_all();
-    }
-    writer_thr.join();
-    std::string msg = "GPU decompress failed (--gpu-only).";
+    // Count how many GPUs actually failed
+    int failed_count = 0;
     for (const auto & s : fatal_msgs)
-      if (!s.empty()) { msg += " "; msg += s; }
-    die(msg);
+      if (!s.empty()) ++failed_count;
+    int total_gpus = (int)fatal_msgs.size();
+
+    if (failed_count >= total_gpus) {
+      // ALL GPUs failed  fatal in --gpu-only mode
+      {
+        std::lock_guard<std::mutex> lk(results.m);
+        results.workers_done = true;
+        results.cv.notify_all();
+      }
+      writer_thr.join();
+      std::string msg = "all GPUs failed (--gpu-only).";
+      for (const auto & s : fatal_msgs)
+        if (!s.empty()) { msg += " "; msg += s; }
+      die(msg, EXIT_GPU_FAIL);
+    } else {
+      // Some GPUs failed but others are still working
+      for (const auto & s : fatal_msgs)
+        if (!s.empty())
+          vlog(V_NORMAL, opt, "WARNING: " + s + " (other GPUs continuing)\n");
+    }
   }
 
   rescue.set_done();
@@ -5399,7 +5589,7 @@ int main(int argc, char ** argv)
   } else {
     bool exists = fs::exists(opt.output);
     if (exists && !opt.force) {
-      die("output exists (use -f to overwrite): " + opt.output);
+      die_io("output exists (use -f to overwrite): " + opt.output);
     }
     if (exists && opt.force) {
       // Atomic overwrite: write to .tmp, rename on success.
@@ -5410,12 +5600,12 @@ int main(int argc, char ** argv)
         use_atomic = true;
       } else {
         out = std::fopen(opt.output.c_str(), "wb");
-        if (!out) die("cannot open output: " + opt.output);
+        if (!out) die_io("cannot open output: " + opt.output);
       }
     } else {
       // Direct write: write to final name, delete on failure
       out = std::fopen(opt.output.c_str(), "wb");
-      if (!out) die("cannot open output: " + opt.output);
+      if (!out) die_io("cannot open output: " + opt.output);
       register_tmp_file(opt.output); // arm cleanup to delete on failure
     }
   }
@@ -5528,7 +5718,7 @@ int main(int argc, char ** argv)
         bool is_zstd = (m32 == 0xFD2FB528u);
         bool is_skip = ((m32 & 0xFFFFFFF0u) == 0x184D2A50u);
         if (!is_zstd && !is_skip) {
-          die("not a Zstd file (bad magic: 0x"
+          die_data("not a Zstd file (bad magic: 0x"
               + ([&]{ char h[16]; snprintf(h, sizeof(h), "%08X", m32); return std::string(h); })()
               + "): " + opt.input
               + "\n  hint: did you mean to compress? use: gzstd " + opt.input);
@@ -5617,7 +5807,7 @@ int main(int argc, char ** argv)
     if (g_direct_writer) {
       auto t_fin = std::chrono::steady_clock::now();
       if (!g_direct_writer->finalize())
-        die("failed to finalize O_DIRECT output");
+        die_io("failed to finalize O_DIRECT output");
       g_direct_writer = nullptr;
       direct_writer.reset();
       finalize_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
@@ -5638,7 +5828,7 @@ int main(int argc, char ** argv)
       if (ec_rename) {
         std::ifstream src(tmp, std::ios::binary);
         std::ofstream dst(opt.output, std::ios::binary | std::ios::trunc);
-        if (!src || !dst) die("failed to finalize output file");
+        if (!src || !dst) die_io("failed to finalize output file");
         dst << src.rdbuf(); src.close(); dst.close(); fs::remove(tmp);
       }
       double rename_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
@@ -5785,7 +5975,6 @@ static Options parse_args(int argc, char ** argv)
       if (all_digits) {
         int lvl = std::stoi(a.substr(1));
         if (lvl < 1) die_usage("invalid compression level (must be 1..22)");
-        if (lvl >= 20 && lvl <= 22 && !opt.ultra) { die_usage("levels 20..22 require --ultra (zstd-compatible behavior)"); }
         if (lvl > 22) die_usage("invalid compression level (max 22)");
         opt.level = lvl; opt.level_user_set = true; continue;
       }
@@ -5803,12 +5992,17 @@ static Options parse_args(int argc, char ** argv)
       // -T0 means "use all available threads" (like zstd)
       opt.cpu_threads = (th == 0) ? -1 : th;
     }
-    else if (a == "-T" || a == "--threads") {
+    else if (a == "-T" || a == "--threads" || a.rfind("--threads=", 0) == 0) {
       int th = 0;
-      if (a == "-T" && i + 1 < argc)
+      if (a.rfind("--threads=", 0) == 0) {
+        th = std::stoi(a.substr(10));
+      } else if (a == "-T" && i + 1 < argc) {
         th = std::stoi(argv[++i]);
-      else if (!parse_int_arg("threads", i, argc, argv, th))
-        die_usage("missing value for --threads");
+      } else if (a == "--threads" && i + 1 < argc) {
+        th = std::stoi(argv[++i]);
+      } else {
+        die_usage("missing value for " + a);
+      }
       opt.cpu_threads = (th == 0) ? -1 : th;
     }
     else if (a == "-o" || a == "--output") {
@@ -5850,6 +6044,14 @@ static Options parse_args(int argc, char ** argv)
       // Ignored on CPU-only builds
     }
 #endif
+    else if (a == "--") {
+      // End of options  everything after this is a filename
+      for (++i; i < argc; ++i)
+        opt.inputs.push_back(argv[i]);
+    }
+    else if (a.size() > 1 && a[0] == '-' && a != "-") {
+      die_usage("unknown option: " + a);
+    }
     else { opt.inputs.push_back(a); }
   }
   if (opt.inputs.empty()) opt.inputs.push_back("-");
@@ -5908,6 +6110,7 @@ static Options parse_args(int argc, char ** argv)
   // Multi-file with no -o: output is derived per-file in main loop
   if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die_usage("--gpu-only cannot be combined with --cpu-only or --hybrid");
   if (opt.cpu_only && opt.hybrid) die_usage("--cpu-only cannot be combined with --hybrid");
+  if (opt.level >= 20 && opt.level <= 22 && !opt.ultra) die_usage("levels 20..22 require --ultra (zstd-compatible behavior)");
 
 #ifdef HAVE_NVCOMP
   // Default to hybrid mode when nvCOMP is available, unless the user
