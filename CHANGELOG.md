@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.11.24  
+**Covers:** v0.9.50 → v0.11.30  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -459,9 +459,66 @@ Prevents CPU decompression workers from producing data faster than the NVMe can 
 
 Hybrid went from worst of all three modes (6m07s) to best of all three (3m56s), beating both CPU-only (4m42s, 1.53 GiB/s) and GPU-only tuned (4m13s, 1.72 GiB/s). The sys time drop from 19m to 6m confirms the root cause: 96 CPU threads were flooding the kernel with write syscalls. Backpressure keeps CPU workers productive during GPU batch gaps while preventing writer saturation.
 
+### Test Mode & Progress Fixes (v0.11.25)  BUGFIX
+- **`wrote_bytes` double-counting:** Worker-side updates removed; writer thread is now the sole source of truth for output bytes.
+- **Test mode backpressure stall:** Backpressure pointer set to `nullptr` in test mode (`-t`) since there's no AIO, so `mark_written()` is never called. Without this, CPU workers would block forever waiting for writes that never happen.
+- **Progress bar in test mode:** Shows `verified:` label instead of `out:`.
+
+### Graceful GPU VRAM Handling (v0.11.26)  POSITIVE (robustness)
+GPU workers now survive VRAM exhaustion instead of crashing the process. Critical for shared GPU environments where other users consume VRAM mid-run.
+- **Graceful skip:** GPU workers return early when batch=1 allocation fails. `TaskQueue::re_enqueue()` returns in-flight frames to the queue (without incrementing `total_tasks_`) so other GPUs or CPU workers process them.
+- **VRAM reserve:** Each GPU holds a half-batch-sized reserve. On allocation failure, the reserve is freed for retry before giving up.
+- **VRAM retry limit:** 10 attempts max in both compress and decompress allocation loops, preventing infinite retry when VRAM fluctuates near the threshold.
+- **Reader no longer aborts early:** Removed `abort_on_failure && any_gpu_failed` check from compress reader loop. A single GPU VRAM failure no longer truncates the output  surviving GPUs handle the work.
+- **Post-join GPU failure:** Only calls `die()` if ALL GPUs failed (count-based), not on any single failure.
+
+### Structured Exit Codes & Argument Hardening (v0.11.26)  IMPROVEMENT
+- **Exit codes:** 0=OK, 1=runtime, 2=usage, 3=I/O, 4=data, 5=GPU_FAIL. All `die()` calls categorized via `die_io()`, `die_data()`, `die_usage()`. Help text documents exit codes.
+- **Unknown option rejection:** Flags starting with `-` that aren't recognized exit with code 2 (EXIT_USAGE) instead of being treated as filenames.
+- **`--` end-of-options:** Everything after `--` is treated as a filename, matching POSIX convention.
+- **`--threads=N` form:** Now recognized alongside `-T N`, `-T2`, `--threads N`.
+- **Argument order independence:** `-22 --ultra` works (deferred ultra check to post-parse validation).
+- **Truncated stream detection:** Decompress checks `ret > 0` after loop and dies on >8 trailing bytes at EOF.
+- **`.zst` double-compression warning:** Warns when compressing a file that already has `.zst` extension.
+
+### Writer Deadlock Detection & Cleanup Safety (v0.11.27)  IMPROVEMENT
+- **Writer deadlock detection:** 5-second timed wait when `workers_done` is set. If the next expected frame never arrives, calls `die()` with diagnostic instead of hanging forever or silently producing truncated output.
+- **`die()` reports cleanup:** Shows `gzstd: removing incomplete output: path` on fatal error.
+- **Atomic temp file cleanup:** When using `-f` to overwrite, the `.tmp` file is registered for cleanup on failure/signal. Original file is preserved untouched.
+- **Consistent log format:** `[GPU-D...]` → `[GPU...]` everywhere. `[GPU2] ready, semaphore scheduling active` format.
+
+### Compress Backpressure (v0.11.29)  POSITIVE (major)
+Same backpressure mechanism from decompress (v0.11.24) now applied to all compress paths. Prevents CPU workers from producing compressed data faster than the NVMe can write.
+- **`compress_cpu_mt`:** `WriterBackpressure` created and passed to writer + all CPU workers.
+- **`compress_nvcomp`:** Backpressure passed to writer, GPU workers, CPU hybrid workers, and rescue workers.
+- **CPU workers** call `wait_if_backlogged()` before popping, `mark_produced(csz)` after delivering compressed frame.
+- **GPU workers** call `mark_produced(out_sum)` on both async and sync D2H paths. Never throttled.
+- **`--cpu-batch` in `--cpu-only` mode:** Now ignored with a note, since the stop-and-go pattern caused massive sys overhead (10m26s sys on 432 GiB file).
+
+### Default Chunk Size = 16 MiB (v0.11.30)  POSITIVE
+All paths (CPU-only, hybrid, GPU-only) now default to 16 MiB chunk size. Removed auto-chunk scaling that previously used 32512 MiB based on file size and device count.
+- **Why 16 MiB wins:** More tasks for better load balancing (27,685 vs 3,461 tasks for 432 GiB), lower per-thread memory (3 GiB vs 24 GiB for 96 threads), and matches `GPU_SUBCHUNK_MAX` so no splitting is needed in hybrid mode.
+- **Removed:** `auto_chunk_mib_cpu`, `auto_chunk_mib_gpu`, `is_regular_file_stream`, `AUTO_HOST_CHUNK_*` constants.
+- **`--chunk-size=N`** still available for manual override.
+
+### RAM Budget Check (v0.11.29)  IMPROVEMENT
+Pre-flight check reads `/proc/meminfo` `MemAvailable` and estimates memory needed for N threads × chunk_mib. If estimated usage exceeds 75% of available RAM, auto-reduces chunk size (halving until it fits) with a warning instead of OOMing.
+
+### Progress Bar Improvements (v0.11.30)  IMPROVEMENT
+- **Dual rate display:** Progress bar now shows both `in:` and `out:` rates: `[45.2%] in:195.6 GiB out:97.3 GiB | in:1.84 GiB/s out:918 MiB/s`
+- **Write drain states:** Three states  AIO writing (capped 99.9%), flushing to disk (elapsed timer), finalizing message.
+- **Finalize message:** Shows `[done] finalizing 217.3 GiB ...` for large files during file close/rename.
+
+### Comprehensive Test Suite (v0.11.26v0.11.30)  NEW
+`gzstd-test.sh`: ~170+ tests across 35 sections with live progress bar, per-test timing, CTRL-C handling, and auto GPU detection. Key coverage: round-trip, compression levels with ratios, integrity, pipes, tar, file management, threading forms, chunk sizes, verbosity validation, stats JSON, exit codes, zstd interop, VRAM pressure, wildcards, `--` end-of-options, output redirection, space-separated options, GPU options, error handling, cross-level decompress, argument order, completion summary format.
+
 ## Key Lessons Learned (Updated)
 
-15. **Writer saturation is the hidden hybrid killer.** When CPU + GPU both produce decompressed data at full speed, the writer can't keep up and the kernel spends more time on writeback (19 min sys) than actual work. Backpressure with hysteresis (block at 4 GiB, wake at 2 GiB) keeps the pipeline full without flooding it. The 2 GiB low-water gives the writer ~1 second of runway at NVMe speed  enough to never starve.
+16. **Compress backpressure matters just as much as decompress.** The same writer saturation problem (v0.11.24, 19m sys → 6m) exists on the compress side. 32 CPU threads with `--cpu-batch=128` produced 10m26s sys time  a stop-and-go stampede on the queue CV. Backpressure + removing `--cpu-batch` in CPU-only mode eliminated it.
+
+17. **Smaller chunks beat larger chunks for CPU compress.** 16 MiB chunks outperformed 128 MiB across all file sizes. More tasks = better load balancing across 96 threads. The scheduling overhead of 27k tasks is negligible compared to the starvation caused by only 3,400 large tasks.
+
+18. **GPU VRAM is a shared resource  design for it.** On a multi-user machine (Knuth, 8× H100), any GPU can lose VRAM at any moment. Infinite retry loops, early reader aborts on single GPU failure, and missing frame deadlocks all surfaced under real student workloads. The fix: retry limits, graceful skip with re-enqueue, deadlock detection with hard error, and never abort the reader on partial failure.
 
 ---
 

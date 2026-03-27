@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.26";
+static constexpr const char * GZSTD_VERSION = "0.11.30";
 //
 // Architecture overview:
 //
@@ -154,15 +154,13 @@ static void setup_signal_handlers()
  Constants
 ======================================================================*/
 static const size_t ONE_MIB = size_t(1024) * size_t(1024);
-static const size_t DEFAULT_CHUNK_MIB = 32;
+static const size_t DEFAULT_CHUNK_MIB = 16;
 #ifdef HAVE_NVCOMP
 static const size_t GPU_SUBCHUNK_MAX = size_t(16) * ONE_MIB; // max GPU subchunk
 static const size_t DEFAULT_GPU_BATCH_CAP = 8;    // per device  smaller batches launch sooner
 static const size_t DEFAULT_GPU_DECOMP_BATCH_CAP = 16;  // sweet spot: amortizes kernel launch without starving writer
 static const double DEFAULT_GPU_MEM_FRACTION = 0.60; // fraction of free VRAM to use
 static const size_t DEFAULT_GPU_STREAMS = 1;       // single stream avoids context-switch overhead
-static const size_t AUTO_HOST_CHUNK_MIN_MIB = 32;
-static const size_t AUTO_HOST_CHUNK_MAX_MIB = 512;
 static const double GROW_CHECK_SEC = 0.3;  // auto-tune check interval (seconds)
 static const size_t HARD_BATCH_CAP = 1024;        // per stream safety cap
 #endif
@@ -263,8 +261,11 @@ static void vlog(int min_level, const Options & opt, const std::string & msg)
 
 static void die(const std::string & msg, int code = EXIT_ERROR)
 {
-  if (g_verbosity >= V_ERROR)
-    std::cerr << "gzstd: " << msg << "\n";
+  if (g_verbosity >= V_ERROR) {
+    std::cerr << "gzstd: ERROR: " << msg << "\n";
+    if (g_tmp_active && g_tmp_path[0] != '\0')
+      std::cerr << "gzstd: removing incomplete output: " << g_tmp_path << "\n";
+  }
   std::exit(code);
 }
 static void die_usage(const std::string & msg)
@@ -307,14 +308,15 @@ static void print_help()
 " -qq, --silent Suppress ALL output including errors\n"
 " --progress Force progress meter (even in pipes)\n"
 " --no-progress Suppress progress meter\n"
-" --chunk-size N Host I/O chunk size in MiB (default: auto; was 32)\n"
+" --chunk-size N Host I/O chunk size in MiB (default: 16)\n"
 " --stats-json <f> Write run statistics (JSON)\n"
 " --cpu-only Force CPU-only path (multithreaded, no GPU)\n"
 " --hybrid Enable hybrid CPU+GPU scheduling (default with GPU)\n"
 " -T, --threads N  CPU worker threads (0=all cores, auto=96 max). -T N or -T# [CPU-only/hybrid]\n"
-" --cpu-batch N    Min queue depth before CPUs activate (0=immediate, keeps queue stocked for GPUs)\n"
+" --cpu-batch N    Queue depth before CPUs start popping (hybrid only; keeps frames\n"
+"                  stocked for GPU batch fills). Ignored in --cpu-only. Default: 0\n"
 " --cpu-share X Fixed CPU share [0..1], disables adaptation (hybrid)\n"
-" --cpu-backlog N Min queue depth before CPU pops (hybrid; 0=off)\n";
+" --cpu-backlog N Secondary queue threshold for CPU workers (hybrid; 0=off)\n";
 #ifdef HAVE_NVCOMP
   std::cout <<
 " --gpu-batch N Max GPU subchunks per device (default: 16)\n"
@@ -502,12 +504,13 @@ static std::vector<int> get_io_cores()
   if (hw <= 4) return {0};  // tiny system: share one core
   return {0, 1};            // dedicate two cores to I/O
 }
-static void progress_emit_line(double pct, const char * in_s, const char * out_s, const char * rate_s)
+static void progress_emit_line(double pct, const char * in_s, const char * out_s,
+                               const char * in_rate_s, const char * out_rate_s)
 {
   char line[256];
   int n = 0;
-  if (pct >= 0.0) { n = std::snprintf(line, sizeof(line), "[%.1f%%] in:%s out:%s in_rate:%s/s ", pct, in_s, out_s, rate_s); }
-  else { n = std::snprintf(line, sizeof(line), " in:%s out:%s in_rate:%s/s ", in_s, out_s, rate_s); }
+  if (pct >= 0.0) { n = std::snprintf(line, sizeof(line), "[%.1f%%] in:%s out:%s | in:%s/s out:%s/s ", pct, in_s, out_s, in_rate_s, out_rate_s); }
+  else { n = std::snprintf(line, sizeof(line), " in:%s out:%s | in:%s/s out:%s/s ", in_s, out_s, in_rate_s, out_rate_s); }
   if (n < 0) { n = 0; }
   size_t len = (size_t)std::min(n, (int)sizeof(line) - 1);
   std::fprintf(stderr, "\r%.*s\033[K", (int)len, line);
@@ -536,33 +539,32 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     auto dt      = steady_clock::now() - m->t0;
     double secs  = duration_cast< duration<double> >(dt).count();
     double in_rate = secs>0 ? double(in)/secs : 0.0;
-    char in_s[64], out_s[64], rate_s[64];
+    double out_rate = secs>0 ? double(out)/secs : 0.0;
+    char in_s[64], out_s[64], rate_s[64], out_rate_s[64];
     human_bytes(double(in),  in_s,  sizeof(in_s));
     human_bytes(double(out), out_s, sizeof(out_s));
     human_bytes(in_rate,     rate_s, sizeof(rate_s));
+    human_bytes(out_rate,    out_rate_s, sizeof(out_rate_s));
     double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
 
     if (is_test) {
       // Test mode: show verified bytes and decompression throughput.
       // out = decompressed bytes verified (no disk I/O).
-      double out_rate = secs > 0 ? double(out) / secs : 0.0;
-      char vr_s[64];
-      human_bytes(out_rate, vr_s, sizeof(vr_s));
       char line[256];
       if (pct >= 0.0)
-        std::snprintf(line, sizeof(line), "[%.1f%%] in:%s verified:%s @ %s/s ", pct, in_s, out_s, vr_s);
+        std::snprintf(line, sizeof(line), "[%.1f%%] in:%s verified:%s @ %s/s ", pct, in_s, out_s, out_rate_s);
       else
-        std::snprintf(line, sizeof(line), " in:%s verified:%s @ %s/s ", in_s, out_s, vr_s);
+        std::snprintf(line, sizeof(line), " in:%s verified:%s @ %s/s ", in_s, out_s, out_rate_s);
       std::fprintf(stderr, "\r%s\033[K", line);
       std::fflush(stderr);
     } else if (total_in > 0 && in >= total_in && out > 0) {
       // All input consumed: switch to showing write drain progress
-      double out_rate = secs > 0 ? double(out) / secs : 0.0;
       char wr_s[64];
       human_bytes(out_rate, wr_s, sizeof(wr_s));
       // Show write drain percentage if we know the expected output size
-      if (t_out > 0) {
-        double write_pct = std::min(100.0, 100.0 * double(out) / double(t_out));
+      if (t_out > 0 && out < t_out) {
+        // AIO still writing  show progress
+        double write_pct = std::min(99.9, 100.0 * double(out) / double(t_out));
         char line[256];
         std::snprintf(line, sizeof(line),
             "[%.1f%%] writing: %s / ", write_pct, out_s);
@@ -570,11 +572,17 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
         human_bytes(double(t_out), tot_s, sizeof(tot_s));
         std::fprintf(stderr, "\r%s%s @ %s/s\033[K", line, tot_s, wr_s);
         std::fflush(stderr);
+      } else if (t_out > 0) {
+        // AIO finished but file not yet closed/fsynced  show flushing
+        char tot_s[64];
+        human_bytes(double(t_out), tot_s, sizeof(tot_s));
+        std::fprintf(stderr, "\r[done] flushing %s to disk... (%.0fs)\033[K", tot_s, secs);
+        std::fflush(stderr);
       } else {
-        progress_emit_line(pct, in_s, out_s, wr_s);
+        progress_emit_line(pct, in_s, out_s, rate_s, out_rate_s);
       }
     } else {
-      progress_emit_line(pct, in_s, out_s, rate_s);
+      progress_emit_line(pct, in_s, out_s, rate_s, out_rate_s);
     }
   }
   // Final sample (no newline  the completion summary will overwrite this line)
@@ -583,12 +591,14 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   auto dt      = std::chrono::steady_clock::now() - m->t0;
   double secs  = std::chrono::duration_cast< std::chrono::duration<double> >(dt).count();
   double in_rate = secs>0 ? double(in)/secs : 0.0;
-  char in_s[64], out_s[64], rate_s[64];
+  double out_rate = secs>0 ? double(out)/secs : 0.0;
+  char in_s[64], out_s[64], rate_s[64], out_rate_s[64];
   human_bytes(double(in),  in_s,  sizeof(in_s));
   human_bytes(double(out), out_s, sizeof(out_s));
   human_bytes(in_rate,     rate_s, sizeof(rate_s));
+  human_bytes(out_rate,    out_rate_s, sizeof(out_rate_s));
   double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
-  progress_emit_line(pct, in_s, out_s, rate_s);
+  progress_emit_line(pct, in_s, out_s, rate_s, out_rate_s);
   // No \n here  the completion summary overwrites this line with \r
   g_progress_active.store(false, std::memory_order_relaxed);
 }
@@ -624,15 +634,6 @@ static void fsync_file(FILE * f)
 #else
   (void)f;
 #endif
-}
-// Check whether a FILE* refers to a regular file (not a pipe/socket/etc.)
-static bool is_regular_file_stream(FILE * f)
-{
-  if (!f) return false;
-  int fd = fileno(f);
-  struct stat st;
-  if (fstat(fd, &st) != 0) return false;
-  return S_ISREG(st.st_mode);
 }
 
 // Robust fwrite that handles EINTR and short writes (pipes, signals)
@@ -907,38 +908,71 @@ static int resolve_cpu_threads(int opt_threads)
   return std::min(def, 96);
 }
 
-static size_t auto_chunk_mib_cpu(FILE * in, const Options & opt)
+// Query available host RAM (returns 0 if unknown)
+static uint64_t get_available_ram_bytes()
 {
-  (void)opt;
-  if (!is_regular_file_stream(in))
-    return 32;  // pipes: smaller chunks for lower latency
-
-  // Scale chunk size with file size for better CPU efficiency.
-  // Larger chunks = fewer tasks = less scheduling overhead.
-  // But not too large or single-thread latency suffers.
-  uint64_t fsize = 0;
-  struct stat st;
-  if (fstat(fileno(in), &st) == 0 && S_ISREG(st.st_mode))
-    fsize = (uint64_t)st.st_size;
-
-  if (fsize > 100ULL * 1024 * 1024 * 1024)  return 128;  // > 100 GiB
-  if (fsize > 10ULL * 1024 * 1024 * 1024)   return 96;   // > 10 GiB
-  if (fsize > 1ULL * 1024 * 1024 * 1024)    return 64;   // > 1 GiB
-  return 32;                                               // <= 1 GiB
-}
-#ifdef HAVE_NVCOMP
-#if __cplusplus >= 201703L
-[[maybe_unused]]
+#ifdef __linux__
+  FILE * f = std::fopen("/proc/meminfo", "r");
+  if (!f) return 0;
+  char line[256];
+  uint64_t avail_kb = 0;
+  while (std::fgets(line, sizeof(line), f)) {
+    if (std::sscanf(line, "MemAvailable: %lu kB", &avail_kb) == 1) break;
+  }
+  std::fclose(f);
+  return avail_kb * 1024ULL;
+#else
+  return 0;  // unknown on non-Linux
 #endif
-static size_t auto_chunk_mib_gpu(FILE * in, const Options & opt, int device_count)
+}
+
+// Pre-flight RAM check: estimate memory needed for N threads × chunk_mib.
+// Each thread needs: input buffer (chunk) + output buffer (ZSTD_compressBound(chunk))
+// plus queue overhead, result store, etc.
+// If estimated usage exceeds 75% of available RAM, auto-reduce chunk_mib.
+// Returns the (possibly reduced) chunk_mib.
+static size_t check_ram_budget(int threads, size_t chunk_mib, const Options & opt)
 {
-  (void)in;
-  size_t base = 16;
-  size_t target = std::max<size_t>(1, (size_t)device_count) * std::max<size_t>(1, opt.gpu_batch_cap) * base;
-  size_t chosen = std::max<size_t>(AUTO_HOST_CHUNK_MIN_MIB, std::min<size_t>(target, AUTO_HOST_CHUNK_MAX_MIB));
-  return chosen;
+  uint64_t avail = get_available_ram_bytes();
+  if (avail == 0) return chunk_mib;  // can't determine  skip check
+
+  size_t original_mib = chunk_mib;
+
+  // Target: stay under 75% of available RAM
+  uint64_t budget = avail * 75 / 100;
+
+  while (chunk_mib >= 1) {
+    size_t chunk_bytes = chunk_mib * ONE_MIB;
+    // Per thread: input buf + output buf (compressBound ≈ chunk + chunk/256 + 64)
+    size_t per_thread = chunk_bytes + chunk_bytes + (chunk_bytes >> 8) + 4096;
+    // Queue + result store can hold up to threads × 2 frames in flight
+    size_t overhead = (size_t)threads * 2 * chunk_bytes;
+    uint64_t est_total = (uint64_t)threads * per_thread + overhead;
+
+    if (est_total <= budget) {
+      if (chunk_mib < original_mib && opt.verbosity >= V_ERROR) {
+        char est_s[64], avail_s[64];
+        human_bytes(double(est_total), est_s, sizeof(est_s));
+        human_bytes(double(avail), avail_s, sizeof(avail_s));
+        std::cerr << "gzstd: note: reduced --chunk-size from " << original_mib
+                  << " to " << chunk_mib << " MiB to fit in RAM ("
+                  << est_s << " est, " << avail_s << " available)\n";
+      }
+      return chunk_mib;
+    }
+    // Halve and retry
+    chunk_mib = chunk_mib / 2;
+  }
+
+  // Even 1 MiB doesn't fit  warn but proceed (let the OS handle it)
+  if (opt.verbosity >= V_ERROR) {
+    char avail_s[64];
+    human_bytes(double(avail), avail_s, sizeof(avail_s));
+    std::cerr << "gzstd: warning: very low RAM (" << avail_s
+              << ")  compression may be slow or fail\n";
+  }
+  return 1;
 }
-#endif
 
 /*======================================================================
  Queues and writer
@@ -1794,7 +1828,28 @@ static void writer_thread(FILE * out, ResultStore & results,
       results.drain_slots_locked();
       if (results.data.count(results.next_to_write) != 0) break;
       waited = true;
-      results.cv.wait(lk);
+      // Use timed wait to detect potential deadlocks: if all workers are done
+      // but the next expected frame never arrives, something is wrong.
+      if (results.workers_done) {
+        results.cv.wait_for(lk, std::chrono::seconds(5));
+        results.drain_slots_locked();
+        all_done = results.producer_done
+                && results.workers_done
+                && results.next_to_write >= results.total_tasks;
+        if (!all_done && results.data.count(results.next_to_write) == 0) {
+          // Workers are all done but we're still missing frames  this is a bug.
+          // Log diagnostics and abort to avoid producing corrupt output.
+          std::ostringstream os;
+          os << "internal error: writer stuck  workers_done but frame "
+             << results.next_to_write << " of " << results.total_tasks
+             << " missing (have " << results.data.size() << " buffered)";
+          // Unlock before die() to avoid deadlock in cleanup
+          lk.unlock();
+          die(os.str());
+        }
+      } else {
+        results.cv.wait(lk);
+      }
       results.drain_slots_locked();
       all_done = results.producer_done
               && results.workers_done
@@ -2027,9 +2082,9 @@ public:
     if (queue_) queue_->notify_cpu_waiters();  // wake CPUs to re-evaluate
     if (opt_.verbosity >= V_VERBOSE) {
       if (device_id >= 0)
-        vlog(V_VERBOSE, opt_, "GPU " + std::to_string(device_id) + " ready  semaphore scheduling active\n");
+        vlog(V_VERBOSE, opt_, "[GPU" + std::to_string(device_id) + "] ready, semaphore scheduling active\n");
       else
-        vlog(V_VERBOSE, opt_, "GPU ready  semaphore scheduling active\n");
+        vlog(V_VERBOSE, opt_, "[GPU] ready, semaphore scheduling active\n");
     }
   }
 
@@ -2200,12 +2255,16 @@ static void cpu_worker(
   void * sched_ptr,
   RateMatchState * rate_match,
 #endif
-  CpuAgg * cpuagg)
+  CpuAgg * cpuagg,
+  WriterBackpressure * bp)
 {
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
   while (true) {
+    // Backpressure: block if writer can't keep up (prevents RAM exhaustion)
+    if (bp) bp->wait_if_backlogged();
+
     Task t;
 #ifdef HAVE_NVCOMP
     if (sched) {
@@ -2286,6 +2345,7 @@ static void cpu_worker(
 
     if (m) m->tasks_done.fetch_add(1);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
+    if (bp) bp->mark_produced(csz);  // track output for writer backpressure
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(in_size);
 #endif
@@ -2338,9 +2398,11 @@ static void cpu_worker_rescue(
   ResultStore * results,
   const Options * opt,
   Meter * /*m*/,
-  CpuAgg * cpuagg)
+  CpuAgg * cpuagg,
+  WriterBackpressure * bp)
 {
   while (true) {
+    if (bp) bp->wait_if_backlogged();
     Task t;
     if (!rq->pop_one(t)) break;
     const auto t0 = std::chrono::steady_clock::now();
@@ -2364,8 +2426,9 @@ static void cpu_worker_rescue(
       vlog(V_TRACE, *opt, os.str() + "\n");
     }
 
-    // Deliver decompressed frame to the result store
+    // Deliver compressed frame to the result store
     results->push_to_slot(-1, t.seq, std::move(out_frame));
+    if (bp) bp->mark_produced(csz);
 
     // Update per-thread stats
     {
@@ -2819,13 +2882,8 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 ======================================================================*/
 static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
-  // Choose chunk size
-  size_t chosen_mib = opt.chunk_mib;
-  if (!opt.chunk_user_set) {
-    chosen_mib = auto_chunk_mib_cpu(in, opt);
-    vlog(V_VERBOSE, opt,
-         std::string("auto-chunk (CPU): ") + std::to_string(chosen_mib) + " MiB\n");
-  }
+  // Chunk size: 16 MiB default, or user-specified via --chunk-size
+  size_t chosen_mib = opt.chunk_user_set ? opt.chunk_mib : 16;
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   // Get total input size for progress percentage
@@ -2907,12 +2965,10 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   cpuagg.per_thread.resize((size_t)threads);
 
   // Determine chunk size (auto or user-specified)
-  size_t chosen_mib = opt.chunk_mib;
-  if (!opt.chunk_user_set) {
-    chosen_mib = auto_chunk_mib_cpu(in, opt);
-    vlog(V_VERBOSE, opt,
-         std::string("auto-chunk (CPU-MT): ") + std::to_string(chosen_mib) + " MiB\n");
-  }
+  // Chunk size: 16 MiB default, or user-specified via --chunk-size
+  size_t chosen_mib = opt.chunk_user_set ? opt.chunk_mib : 16;
+  // Pre-flight: check we won't OOM  may reduce chunk size
+  chosen_mib = check_ram_budget(threads, chosen_mib, opt);
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   // Get total input size for progress percentage (unknown for pipes)
@@ -2925,7 +2981,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
   ResultStore results;
-  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, nullptr);
+  WriterBackpressure backpressure;
+  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &backpressure);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
   Options opt_copy = opt;
@@ -2933,7 +2990,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 #ifdef HAVE_NVCOMP
     nullptr, nullptr,
 #endif
-    &cpuagg);
+    &cpuagg, &backpressure);
   if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
 
   // Producer loop: read input in chunks and enqueue for compression
@@ -2966,6 +3023,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   results.cv.notify_all();
 
   // Wait for all workers to finish, then signal the writer
+  backpressure.set_done();  // wake any backlogged workers so they can exit
   for (auto & th : pool) th.join();
   {
     std::lock_guard<std::mutex> lk(results.m);
@@ -3357,7 +3415,8 @@ static void gpu_worker(
   std::string * fatal_msg,
   std::atomic<bool> * gpu_started_flag,
   SharedTuneState * shared_tune,
-  RateMatchState * rate_match)
+  RateMatchState * rate_match,
+  WriterBackpressure * bp)
 {
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   void * vram_reserve = nullptr;
@@ -3436,14 +3495,16 @@ static void gpu_worker(
         while (vram_max < old_ceil &&
                !shared_tune->vram_ceiling.compare_exchange_weak(old_ceil, vram_max));
       }
+      int vram_retries = 0;
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
         // Free any partial allocations from the failed attempt
         free_stream_buffers_only(C);
-        if (C.per_stream_batch==1) {
-          // Can't fit even batch=1  skip this GPU entirely.
+        if (C.per_stream_batch <= 1 || ++vram_retries > 10) {
+          // Can't fit even batch=1 or too many retries  skip this GPU entirely.
           // Other GPUs (or CPU in hybrid) will handle the work.
           std::string skip_msg = "[GPU" + std::to_string(device_id)
-              + "] insufficient VRAM for even batch=1  skipping device";
+              + "] insufficient VRAM for even batch=1  skipping device"
+              + (vram_retries > 10 ? " (retry limit)" : "");
           vlog(V_ERROR, opt, skip_msg + "\n");
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
@@ -3812,6 +3873,8 @@ static void gpu_worker(
                       "cudaMemcpy(D2H exact)");
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
           }
+          // Track GPU compressed output for writer backpressure
+          if (bp) bp->mark_produced(out_sum);
           if (g_perf) {
             g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
             g_perf->d2h_bytes.fetch_add(out_sum);
@@ -3944,6 +4007,8 @@ static void gpu_worker(
               g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
             }
           }
+          // Track GPU compressed output for writer backpressure (sync path)
+          if (bp) bp->mark_produced(out_sum);
           #ifdef HAVE_NVCOMP
           if (sched) sched->add_gpu_bytes(in_sum);
           #endif
@@ -4304,13 +4369,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
          + std::to_string(opt.level) + "\n");
 
   // ---- Determine chunk size ----
-  size_t chosen_mib = opt.chunk_mib;
-  if (!opt.chunk_user_set) {
-    chosen_mib = auto_chunk_mib_gpu(in, opt, device_count);
-    std::ostringstream os;
-    os << "auto-chunk (GPU," << device_count << " devices): " << chosen_mib << " MiB";
-    vlog(V_VERBOSE, opt, os.str() + "\n");
-  }
+  // 16 MiB default: matches GPU_SUBCHUNK_MAX, no splitting needed.
+  size_t chosen_mib = opt.chunk_user_set ? opt.chunk_mib : 16;
+  // Pre-flight: check we won't OOM (CPU rescue threads also need buffers)
+  int cpu_threads_est = opt.cpu_only ? 0 : resolve_cpu_threads(opt.cpu_threads);
+  chosen_mib = check_ram_budget(std::max(1, cpu_threads_est), chosen_mib, opt);
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   // ---- Shared state for all workers ----
@@ -4336,10 +4399,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
     total_in = (uint64_t)fs::file_size(opt.input);
 
+  // Writer backpressure: prevents workers from producing compressed data
+  // faster than the NVMe can write.  Same mechanism as decompress backpressure.
+  WriterBackpressure backpressure;
+
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
-  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, nullptr);
+  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, &backpressure);
 
   // ---- Hybrid scheduler (adaptive CPU/GPU work-sharing) ----
   std::unique_ptr<HybridSched> sched_ptr;
@@ -4372,7 +4439,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     unsigned ths = std::max(1u, std::thread::hardware_concurrency() / 2);
     rescue_pool.reserve(ths);
     for (unsigned i = 0; i < ths; ++i)
-      rescue_pool.emplace_back(cpu_worker_rescue, (int)i, &rescue, &results, &opt, m, &cpuagg);
+      rescue_pool.emplace_back(cpu_worker_rescue, (int)i, &rescue, &results, &opt, m, &cpuagg, &backpressure);
 
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -4402,7 +4469,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
     for (int i = 0; i < cpu_threads; ++i)
-      cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &rate_match_compress, &cpuagg);
+      cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &rate_match_compress, &cpuagg, &backpressure);
   }
 
   // ---- GPU workers (init CUDA context, allocate memory  CPUs already working) ----
@@ -4426,7 +4493,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                          &per_dev[size_t(i)], &json_sink, m, sched,
                          &any_gpu_failed, &abort_on_failure,
                          &fatal_msgs[size_t(i)], &gpu_started,
-                         &shared_tune, &rate_match_compress);
+                         &shared_tune, &rate_match_compress,
+                         &backpressure);
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
@@ -4461,7 +4529,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       off += sub_n;
     }
 
-    if (abort_on_failure.load() && any_gpu_failed.load()) break;
+    // Note: we do NOT abort the read loop on single GPU failures.
+    // Surviving GPUs continue processing.  The post-join check handles
+    // the "all GPUs failed" case after workers are joined.
   }
 
   // Signal workers that all input has been read
@@ -4474,6 +4544,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   results.cv.notify_all();
 
   // ---- Teardown: join all threads in correct order ----
+  backpressure.set_done();  // wake any backlogged workers so they can exit
   for (auto & th : workers) th.join();
 
   // Check for GPU failures
@@ -4486,6 +4557,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
     if (abort_on_failure.load() && failed_count >= total_gpus) {
       // ALL GPUs failed in --gpu-only mode  fatal
+      backpressure.set_done();  // unblock any waiting workers
       progress_done = true;
       progress_thr.join();
       {
@@ -4711,11 +4783,12 @@ static void gpu_decomp_worker(
       {
         size_t est_temp = per_stream_cap * 1024;
         size_t try_batch = per_stream_cap;
+        int vram_retries = 0;
         while (!C.ensure_buffers(try_batch, init_comp, init_decomp, est_temp)) {
-          if (try_batch <= 1) {
+          if (try_batch <= 1 || ++vram_retries > 10) {
             // Can't fit even batch=1  skip this GPU entirely.
             // Other GPUs (or CPU in hybrid) will handle the work.
-            std::string skip_msg = "[GPU-D" + std::to_string(device_id)
+            std::string skip_msg = "[GPU" + std::to_string(device_id)
                 + "] insufficient VRAM for even batch=1 ("
                 + std::to_string(init_comp / ONE_MIB) + " MiB comp + "
                 + std::to_string(init_decomp / ONE_MIB) + " MiB decomp per frame)  skipping device";
@@ -4737,7 +4810,7 @@ static void gpu_decomp_worker(
             int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
             if (opt.verbosity >= min_verb) {
               std::ostringstream os;
-              os << "[GPU-D" << device_id << "/S" << s
+              os << "[GPU" << device_id << "/S" << s
                  << "] VRAM insufficient, reducing batch to " << try_batch;
               vlog(min_verb, opt, os.str() + "\n");
             }
@@ -4750,7 +4823,7 @@ static void gpu_decomp_worker(
 
       if (opt.verbosity >= V_DEBUG) {
         std::ostringstream os;
-        os << "[GPU-D" << device_id << "/S" << s
+        os << "[GPU" << device_id << "/S" << s
            << "] pre-alloc batch=" << per_stream_cap
            << " comp=" << (init_comp / ONE_MIB) << "MiB"
            << " decomp=" << (init_decomp / ONE_MIB) << "MiB";
@@ -4773,10 +4846,10 @@ static void gpu_decomp_worker(
       if (cudaMalloc(&vram_reserve, vram_reserve_bytes) != cudaSuccess) {
         vram_reserve = nullptr;
         vram_reserve_bytes = 0;
-        vlog(V_VERBOSE, opt, "[GPU-D" + std::to_string(device_id)
+        vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
              + "] could not allocate VRAM reserve (non-fatal)\n");
       } else if (opt.verbosity >= V_DEBUG) {
-        vlog(V_DEBUG, opt, "[GPU-D" + std::to_string(device_id)
+        vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id)
              + "] VRAM reserve: " + std::to_string(vram_reserve_bytes / ONE_MIB) + " MiB\n");
       }
     }
@@ -4982,7 +5055,7 @@ static void gpu_decomp_worker(
           for (size_t i = 0; i < C.filled; ++i) tin += C.batch[i].data.size();
           human_bytes(double(tin), in_s, sizeof(in_s));
           std::ostringstream os;
-          os << "[GPU-D" << device_id << "/S" << C.stream_index
+          os << "[GPU" << device_id << "/S" << C.stream_index
              << "] take N=" << C.filled << " in=" << in_s;
           vlog(V_DEBUG, opt, os.str() + "\n");
         }
@@ -5054,7 +5127,7 @@ static void gpu_decomp_worker(
           if (!C.ensure_buffers(C.filled, max_comp, max_decomp, needed_temp)) {
             // Allocation failed  free VRAM reserve and retry
             if (vram_reserve) {
-              vlog(V_VERBOSE, opt, "[GPU-D" + std::to_string(device_id)
+              vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
                    + "] freeing VRAM reserve (" + std::to_string(vram_reserve_bytes / ONE_MIB)
                    + " MiB) to grow temp buffer\n");
               cudaFree(vram_reserve);
@@ -5197,7 +5270,7 @@ static void gpu_decomp_worker(
           double thr_gib = (batch_ms > 0.0)
                            ? double(out_sum) / (batch_ms / 1000.0) / 1e9 : 0.0;
           std::ostringstream os;
-          os << "[GPU-D" << device_id << "/S" << C.stream_index
+          os << "[GPU" << device_id << "/S" << C.stream_index
              << "] done N=" << C.filled
              << " out=" << out_s
              << " ms=" << std::fixed << std::setprecision(2) << batch_ms
@@ -5248,7 +5321,7 @@ static void gpu_decomp_worker(
   }
   catch (const std::exception & e) {
     *any_gpu_failed = true;
-    *fatal_msg = std::string("[GPU-D") + std::to_string(device_id) + "] " + e.what();
+    *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
 
     // Rescue in-flight chunks back to queue so other GPUs can pick them up.
     // The batch was popped from the queue but never decompressed.
@@ -5395,7 +5468,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     }
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
-      os << "[GPU-D] " << (int)gpu_ids.size() << " device(s) online";
+      os << "[GPU] " << (int)gpu_ids.size() << " device(s) online";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
   }
@@ -5598,6 +5671,7 @@ int main(int argc, char ** argv)
       if (is_regular) {
         out = open_output_atomic(opt.output, tmp);
         use_atomic = true;
+        register_tmp_file(tmp);  // clean up .tmp on failure (original preserved)
       } else {
         out = std::fopen(opt.output.c_str(), "wb");
         if (!out) die_io("cannot open output: " + opt.output);
@@ -5674,6 +5748,15 @@ int main(int argc, char ** argv)
 
   const auto t0 = std::chrono::steady_clock::now();
   if (opt.mode == Mode::COMPRESS) {
+    // Warn if input looks like it's already zstd-compressed
+    if (opt.input.size() > 4
+        && opt.input.substr(opt.input.size() - 4) == ".zst"
+        && opt.verbosity >= V_ERROR) {
+      std::cerr << "gzstd: warning: " << opt.input
+                << " already has .zst extension  compressing anyway\n"
+                << "  hint: did you mean to decompress? use: gzstd -d "
+                << opt.input << "\n";
+    }
 #ifdef HAVE_NVCOMP
     if (opt.cpu_only) {
       compress_cpu_mt(in, out, opt, &meter);
@@ -5802,6 +5885,16 @@ int main(int argc, char ** argv)
   double finalize_ms = 0, sync_ms = 0;
 
   if (!to_stdout) {
+    // Show finalizing message for large files (progress bar is already stopped)
+    if (opt.mode == Mode::COMPRESS && opt.verbosity >= V_DEFAULT) {
+      uint64_t out_bytes = meter.wrote_bytes.load();
+      if (out_bytes > 100 * ONE_MIB) {
+        char sz[64];
+        human_bytes(double(out_bytes), sz, sizeof(sz));
+        std::fprintf(stderr, "\r[done] finalizing %s ...\033[K", sz);
+        std::fflush(stderr);
+      }
+    }
     // Finalize writer (write unaligned tail, close fd)
 #ifndef _WIN32
     if (g_direct_writer) {
@@ -6099,6 +6192,11 @@ static Options parse_args(int argc, char ** argv)
   if (opt.gpu_mem_fraction > 0.95) opt.gpu_mem_fraction = 0.95;
 #endif
   if (opt.chunk_mib == 0) opt.chunk_mib = DEFAULT_CHUNK_MIB;
+  if (opt.chunk_user_set && opt.chunk_mib > 1024) {
+    if (opt.verbosity >= V_ERROR)
+      std::cerr << "gzstd: warning: --chunk-size=" << opt.chunk_mib
+                << " is very large (max recommended: 1024 MiB)\n";
+  }
   if (opt.mode == Mode::TEST) { opt.to_stdout = true; opt.output = "stdout"; }
   else if (opt.to_stdout && opt.output.empty()) {
     opt.output = "stdout";
@@ -6111,6 +6209,15 @@ static Options parse_args(int argc, char ** argv)
   if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die_usage("--gpu-only cannot be combined with --cpu-only or --hybrid");
   if (opt.cpu_only && opt.hybrid) die_usage("--cpu-only cannot be combined with --hybrid");
   if (opt.level >= 20 && opt.level <= 22 && !opt.ultra) die_usage("levels 20..22 require --ultra (zstd-compatible behavior)");
+
+  // --cpu-batch is a hybrid-only tuning knob.  In --cpu-only mode it causes
+  // a stop-and-go pattern (all threads idle until queue depth >= N, then stampede)
+  // that wastes CPU time and hammers the kernel with CV contention.
+  if (opt.cpu_only && opt.cpu_queue_min > 0) {
+    if (opt.verbosity >= V_ERROR)
+      std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode (hybrid-only option)\n";
+    opt.cpu_queue_min = 0;
+  }
 
 #ifdef HAVE_NVCOMP
   // Default to hybrid mode when nvCOMP is available, unless the user

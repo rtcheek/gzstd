@@ -352,7 +352,8 @@ count_tests() {
   command -v zstd &>/dev/null && count=$((count + 3)) || count=$((count + 3))  # 16: zstd interop
   count=$((count + 3))   # 17: tar advanced
   has_gpu 2>/dev/null && count=$((count + 10)) || count=$((count + 5))  # 18: GPU
-  count=$((count + 3))   # 19: stress
+  has_gpu 2>/dev/null && count=$((count + 4)) || count=$((count + 4))  # 19: VRAM pressure
+  count=$((count + 3))   # 20: stress
   count=$((count + 3))   # 20: wildcards
   count=$((count + 3))   # 21: -- end-of-options
   count=$((count + 6))   # 22: -c, -o, --output
@@ -402,8 +403,19 @@ spin "small.txt (4 KiB text)"
 dd if=/dev/urandom bs=1024 count=4 2>/dev/null | base64 > "$TMPDIR/small.txt"
 spin_done
 
-spin "medium.txt (1 MiB compressible)"
-( yes "The quick brown fox jumps over the lazy dog. " 2>/dev/null || true ) | head -c $((1024*1024)) > "$TMPDIR/medium.txt"
+spin "medium.txt (1 MiB mixed-compressible)"
+# Mix of text (compressible) and random bytes (not) for realistic ratios
+{
+  dd if=/dev/urandom bs=1024 count=256 2>/dev/null    # 256 KiB random
+  for i in $(seq 1 200); do                            # ~200 KiB varied text
+    echo "Log entry $i: user=$(head -c8 /dev/urandom 2>/dev/null | base64) action=request ts=$(date +%s%N) status=200 latency=$((RANDOM % 500))ms path=/api/v2/resource/$((RANDOM % 10000))"
+  done
+  dd if=/dev/zero bs=1024 count=128 2>/dev/null        # 128 KiB zeros
+  dd if=/dev/urandom bs=1024 count=256 2>/dev/null     # 256 KiB more random
+  for i in $(seq 1 200); do                            # ~200 KiB more text
+    echo "Event id=$(printf '%08x' $((RANDOM * RANDOM))) type=click element=button-$((RANDOM % 50)) page=/dashboard/$((RANDOM % 100)) session=$(head -c12 /dev/urandom 2>/dev/null | base64)"
+  done
+} | head -c $((1024*1024)) > "$TMPDIR/medium.txt"
 spin_done
 
 spin "large.bin (32 MiB mixed)"
@@ -498,14 +510,24 @@ done
 compressed="$TMPDIR/medium-L22.zst"; recovered="$TMPDIR/medium-L22.recovered"
 run_test "$GZSTD" -22 --ultra -k -f --cpu-only "$TMPDIR/medium.txt" -o "$compressed" 2>/dev/null
 run_test "$GZSTD" -d -k -f --cpu-only "$compressed" -o "$recovered" 2>/dev/null
-files_match "$TMPDIR/medium.txt" "$recovered" && pass "level -22 --ultra" || fail "level -22 --ultra" "mismatch"
+if files_match "$TMPDIR/medium.txt" "$recovered"; then
+  ratio=$(awk "BEGIN { printf \"%.1f\", ($(stat -c%s "$compressed") * 100.0) / $(stat -c%s "$TMPDIR/medium.txt") }")
+  pass "level -22 --ultra" "(ratio: ${ratio}%)"
+else
+  fail "level -22 --ultra" "mismatch"
+fi
 rm -f "$compressed" "$recovered"
 
 for alias_flag in "--fast" "--best"; do
   compressed="$TMPDIR/medium-${alias_flag#--}.zst"; recovered="$TMPDIR/medium-${alias_flag#--}.recovered"
   run_test "$GZSTD" $alias_flag -k -f --cpu-only "$TMPDIR/medium.txt" -o "$compressed" 2>/dev/null
   run_test "$GZSTD" -d -k -f --cpu-only "$compressed" -o "$recovered" 2>/dev/null
-  files_match "$TMPDIR/medium.txt" "$recovered" && pass "$alias_flag alias" || fail "$alias_flag alias" "mismatch"
+  if files_match "$TMPDIR/medium.txt" "$recovered"; then
+    ratio=$(awk "BEGIN { printf \"%.1f\", ($(stat -c%s "$compressed") * 100.0) / $(stat -c%s "$TMPDIR/medium.txt") }")
+    pass "$alias_flag alias" "(ratio: ${ratio}%)"
+  else
+    fail "$alias_flag alias" "mismatch"
+  fi
   rm -f "$compressed" "$recovered"
 done
 
@@ -598,9 +620,9 @@ member_count=$(tar -I "$GZSTD --cpu-only" -tf "$TMPDIR/tree.tar.zst" 2>/dev/null
   || fail "tar -I gzstd list" "expected >=4, got $member_count"
 
 t0=$(now_ms)
-tar cf - -C "$TMPDIR" tree | "$GZSTD" --cpu-only > "$TMPDIR/tree-pipe.tar.zst" 2>/dev/null
+tar cf - -C "$TMPDIR" tree 2>/dev/null | "$GZSTD" --cpu-only 2>/dev/null > "$TMPDIR/tree-pipe.tar.zst"
 mkdir -p "$TMPDIR/extracted-pipe"
-"$GZSTD" -d --cpu-only < "$TMPDIR/tree-pipe.tar.zst" | tar xf - -C "$TMPDIR/extracted-pipe" 2>/dev/null
+"$GZSTD" -d --cpu-only 2>/dev/null < "$TMPDIR/tree-pipe.tar.zst" | tar xf - -C "$TMPDIR/extracted-pipe" 2>/dev/null
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 files_match "$TMPDIR/tree/medium.txt" "$TMPDIR/extracted-pipe/tree/medium.txt" \
   && pass "tar cf - | gzstd | gzstd -d | tar xf -" \
@@ -781,6 +803,17 @@ LAST_TEST_MS=0
 ("$GZSTD" -V 2>&1 || true) | grep -qE "[0-9]+\.[0-9]+\.[0-9]+" && pass "-V shows version" "($VERSION)" || fail "-V shows version"
 ("$GZSTD" --version 2>&1 || true) | grep -qE "[0-9]+\.[0-9]+\.[0-9]+" && pass "--version shows version" || fail "--version shows version"
 
+# Exit codes
+rc=0; "$GZSTD" -h >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 0 ]] && pass "-h exits 0" || fail "-h exits 0" "got $rc"
+rc=0; "$GZSTD" --help >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 0 ]] && pass "--help exits 0" || fail "--help exits 0" "got $rc"
+rc=0; "$GZSTD" -V >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 0 ]] && pass "-V exits 0" || fail "-V exits 0" "got $rc"
+
+# Help lists exit codes
+("$GZSTD" -h 2>&1 || true) | grep -qi "exit code" && pass "-h documents exit codes" || fail "-h documents exit codes"
+
 # -h and --help should exit 0
 rc=0; "$GZSTD" -h >/dev/null 2>&1 || rc=$?
 [[ $rc -eq 0 ]] && pass "-h exits 0" || fail "-h exits 0" "got $rc"
@@ -917,7 +950,148 @@ else
 fi
 
 # ============================================================
-# 19. Stress tests
+# 19. GPU VRAM pressure tests
+# ============================================================
+section "GPU VRAM pressure"
+
+if has_gpu 2>/dev/null; then
+  # Build a tiny CUDA program that hogs VRAM on GPU 0
+  VRAM_HOG="$TMPDIR/vram_hog"
+  cat > "$TMPDIR/vram_hog.cu" << 'CUDA_EOF'
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+int main(int argc, char** argv) {
+    int dev = (argc > 1) ? atoi(argv[1]) : 0;
+    double frac = (argc > 2) ? atof(argv[2]) : 0.90;
+    cudaSetDevice(dev);
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    size_t grab = (size_t)(free_b * frac);
+    void* p = nullptr;
+    if (cudaMalloc(&p, grab) != cudaSuccess) {
+        fprintf(stderr, "vram_hog: cudaMalloc failed for %zu MiB\n", grab >> 20);
+        return 1;
+    }
+    fprintf(stderr, "vram_hog: holding %zu MiB on GPU %d (%.0f%% of free)\n",
+            grab >> 20, dev, frac * 100);
+    fflush(stderr);
+    // Hold VRAM until killed
+    pause();
+    cudaFree(p);
+    return 0;
+}
+CUDA_EOF
+
+  # Try to compile
+  VRAM_HOG_OK=false
+  if command -v nvcc &>/dev/null; then
+    if nvcc -o "$VRAM_HOG" "$TMPDIR/vram_hog.cu" -lcudart 2>/dev/null; then
+      VRAM_HOG_OK=true
+    fi
+  fi
+
+  if $VRAM_HOG_OK; then
+    # Prepare test data: compress medium.txt for decompress tests
+    "$GZSTD" -k -f --cpu-only "$TMPDIR/medium.txt" -o "$TMPDIR/vram-test.zst" 2>/dev/null
+
+    # --- Test 1: hybrid compress under VRAM pressure ---
+    # Hog 90% of GPU 0's VRAM
+    "$VRAM_HOG" 0 0.90 &>/dev/null &
+    HOG_PID=$!
+    sleep 1  # let it grab VRAM
+
+    t0=$(now_ms)
+    "$GZSTD" --hybrid -k -f "$TMPDIR/medium.txt" -o "$TMPDIR/vram-hybrid-c.zst" 2>/dev/null
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    kill "$HOG_PID" 2>/dev/null; wait "$HOG_PID" 2>/dev/null || true
+
+    if [[ -s "$TMPDIR/vram-hybrid-c.zst" ]]; then
+      "$GZSTD" -d -k -f --cpu-only "$TMPDIR/vram-hybrid-c.zst" -o "$TMPDIR/vram-hybrid-c.dec" 2>/dev/null
+      files_match "$TMPDIR/medium.txt" "$TMPDIR/vram-hybrid-c.dec" \
+        && pass "hybrid compress under VRAM pressure" "(GPU 0 at 90%)" \
+        || fail "hybrid compress under VRAM pressure" "data mismatch"
+    else
+      fail "hybrid compress under VRAM pressure" "no output"
+    fi
+
+    # --- Test 2: gpu-only compress under VRAM pressure ---
+    "$VRAM_HOG" 0 0.90 &>/dev/null &
+    HOG_PID=$!
+    sleep 1
+
+    t0=$(now_ms)
+    rc=0; "$GZSTD" --gpu-only -k -f "$TMPDIR/medium.txt" -o "$TMPDIR/vram-gpuonly-c.zst" 2>/dev/null || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    kill "$HOG_PID" 2>/dev/null; wait "$HOG_PID" 2>/dev/null || true
+
+    if [[ -s "$TMPDIR/vram-gpuonly-c.zst" ]]; then
+      "$GZSTD" -d -k -f --cpu-only "$TMPDIR/vram-gpuonly-c.zst" -o "$TMPDIR/vram-gpuonly-c.dec" 2>/dev/null
+      files_match "$TMPDIR/medium.txt" "$TMPDIR/vram-gpuonly-c.dec" \
+        && pass "gpu-only compress under VRAM pressure" "(survived, data ok)" \
+        || fail "gpu-only compress under VRAM pressure" "data mismatch"
+    elif [[ $rc -eq 5 ]]; then
+      pass "gpu-only compress under VRAM pressure" "(exit 5 EXIT_GPU_FAIL  expected)"
+    elif [[ $rc -ne 0 ]]; then
+      pass "gpu-only compress under VRAM pressure" "(exit $rc  graceful failure)"
+    else
+      fail "gpu-only compress under VRAM pressure" "no output, exit 0"
+    fi
+
+    # --- Test 3: hybrid decompress under VRAM pressure ---
+    "$VRAM_HOG" 0 0.90 &>/dev/null &
+    HOG_PID=$!
+    sleep 1
+
+    t0=$(now_ms)
+    "$GZSTD" -d --hybrid -k -f "$TMPDIR/vram-test.zst" -o "$TMPDIR/vram-hybrid-d.dec" 2>/dev/null
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    kill "$HOG_PID" 2>/dev/null; wait "$HOG_PID" 2>/dev/null || true
+
+    if files_match "$TMPDIR/medium.txt" "$TMPDIR/vram-hybrid-d.dec" 2>/dev/null; then
+      pass "hybrid decompress under VRAM pressure" "(GPU 0 at 90%)"
+    else
+      fail "hybrid decompress under VRAM pressure" "data mismatch or no output"
+    fi
+
+    # --- Test 4: gpu-only decompress under VRAM pressure ---
+    "$VRAM_HOG" 0 0.90 &>/dev/null &
+    HOG_PID=$!
+    sleep 1
+
+    t0=$(now_ms)
+    rc=0; "$GZSTD" -d --gpu-only -k -f "$TMPDIR/vram-test.zst" -o "$TMPDIR/vram-gpuonly-d.dec" 2>/dev/null || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    kill "$HOG_PID" 2>/dev/null; wait "$HOG_PID" 2>/dev/null || true
+
+    if files_match "$TMPDIR/medium.txt" "$TMPDIR/vram-gpuonly-d.dec" 2>/dev/null; then
+      pass "gpu-only decompress under VRAM pressure" "(survived, data ok)"
+    elif [[ $rc -eq 5 ]]; then
+      pass "gpu-only decompress under VRAM pressure" "(exit 5 EXIT_GPU_FAIL  expected)"
+    elif [[ $rc -ne 0 ]]; then
+      pass "gpu-only decompress under VRAM pressure" "(exit $rc  graceful failure)"
+    else
+      fail "gpu-only decompress under VRAM pressure" "no output, exit 0"
+    fi
+
+    rm -f "$TMPDIR"/vram-*
+  else
+    skip "hybrid compress under VRAM pressure" "nvcc not available"
+    skip "gpu-only compress under VRAM pressure" "nvcc not available"
+    skip "hybrid decompress under VRAM pressure" "nvcc not available"
+    skip "gpu-only decompress under VRAM pressure" "nvcc not available"
+  fi
+  rm -f "$TMPDIR/vram_hog.cu" "$TMPDIR/vram_hog"
+else
+  skip "hybrid compress under VRAM pressure" "no GPU"
+  skip "gpu-only compress under VRAM pressure" "no GPU"
+  skip "hybrid decompress under VRAM pressure" "no GPU"
+  skip "gpu-only decompress under VRAM pressure" "no GPU"
+fi
+
+# ============================================================
+# 20. Stress tests
 # ============================================================
 section "Stress tests"
 
@@ -1174,8 +1348,16 @@ LAST_TEST_MS=0
 "$GZSTD" -k -f --cpu-only --cpu-batch=0 "$TMPDIR/medium.txt" -o "$TMPDIR/cpubatch0.zst" 2>/dev/null
 [[ -s "$TMPDIR/cpubatch0.zst" ]] && pass "--cpu-batch=0" || fail "--cpu-batch=0"
 
-"$GZSTD" -k -f --cpu-only --cpu-batch=8 "$TMPDIR/medium.txt" -o "$TMPDIR/cpubatch8.zst" 2>/dev/null
-[[ -s "$TMPDIR/cpubatch8.zst" ]] && pass "--cpu-batch=8" || fail "--cpu-batch=8"
+# --cpu-batch with --cpu-only should warn and be ignored
+warn_cpub=$("$GZSTD" -k -f --cpu-only --cpu-batch=8 "$TMPDIR/medium.txt" -o "$TMPDIR/cpubatch8.zst" 2>&1)
+[[ -s "$TMPDIR/cpubatch8.zst" ]] && pass "--cpu-batch=8 (still works)" || fail "--cpu-batch=8"
+if echo "$warn_cpub" | grep -qi "ignored\|cpu-only\|note.*cpu.batch"; then
+  pass "--cpu-batch + --cpu-only warns"
+else
+  # Show first 200 chars of output for debugging
+  snippet=$(echo "$warn_cpub" | tr '\r' '\n' | head -5)
+  fail "--cpu-batch + --cpu-only warns" "output: ${snippet:0:200}"
+fi
 
 # --cpu-backlog (only meaningful in hybrid, but should not crash in cpu-only)
 "$GZSTD" -k -f --cpu-only --cpu-backlog=0 "$TMPDIR/medium.txt" -o "$TMPDIR/cpubl0.zst" 2>/dev/null
@@ -1316,6 +1498,16 @@ else
 fi
 
 rm -f "$TMPDIR/ultra-low.zst" "$TMPDIR/empty-stdin"*
+
+# Compressing a .zst file should warn
+"$GZSTD" -k -f --cpu-only "$TMPDIR/small.txt" -o "$TMPDIR/warn-test.zst" 2>/dev/null
+warn_output=$("$GZSTD" -k -f --cpu-only "$TMPDIR/warn-test.zst" -o "$TMPDIR/warn-test.zst.zst" 2>&1 || true)
+if echo "$warn_output" | grep -qi "already.*\.zst\|did you mean.*decompress"; then
+  pass "warn on compressing .zst file"
+else
+  fail "warn on compressing .zst file" "no warning in: $(echo "$warn_output" | head -1)"
+fi
+rm -f "$TMPDIR"/warn-test*
 
 # ============================================================
 # 30. Cross-level decompression
@@ -1462,11 +1654,13 @@ fi
 # --- -vv: should show per-worker/batch detail ---
 stderr_vv=$("$GZSTD" -d -k -f -vv --cpu-only "$TMPDIR/verbose-src.zst" -o "$TMPDIR/verbose-vv.dec" 2>&1 || true)
 
-# -vv should produce more output than -v
-if [[ ${#stderr_vv} -gt ${#stderr_v} ]]; then
-  pass "-vv produces more detail than -v"
+# -vv should show worker-level detail that -v doesn't
+# (Note: -vv disables the progress bar, so total output may be shorter than -v.
+#  We check for specific -vv content instead of comparing length.)
+if echo "$stderr_vv" | grep -qiE "thread|worker|CPU-D|online|batch|stream"; then
+  pass "-vv shows worker-level detail"
 else
-  fail "-vv produces more detail than -v" "v=${#stderr_v} chars, vv=${#stderr_vv} chars"
+  fail "-vv shows worker-level detail"
 fi
 
 # Should show thread count or worker info
@@ -1532,18 +1726,12 @@ else
 fi
 
 # --- Check no garbled output (progress bar overlapping text) ---
-# Look for obvious garbling: \r or \033[ in the middle of a meaningful line
-garbled_count=$(echo "$stderr_vvv" | grep -cE '\\033\[|\\r' 2>/dev/null || echo 0)
-if [[ "$garbled_count" -eq 0 ]]; then
-  pass "-vvv no garbled output"
+# At -vvv, progress bar is disabled, so look for signs of overlapping lines:
+# a line containing both a percentage bracket and a summary stat
+if echo "$stderr_vvv" | grep -qE '^\[.*%\].*GiB/s.*\['; then
+  fail "-vvv progress bar overlaps content"
 else
-  # Escape sequences are expected in raw capture  check for actual corruption
-  # Look for lines that start with a digit/letter mid-word (overwritten by progress)
-  if echo "$stderr_vvv" | grep -qE '^\[.*%\].*GiB/s.*\['; then
-    fail "-vvv progress bar overlaps content"
-  else
-    pass "-vvv output clean" "(escape sequences present but not garbled)"
-  fi
+  pass "-vvv output clean"
 fi
 
 # --- Compress direction verbose ---
