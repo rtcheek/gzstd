@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.11.30  
+**Covers:** v0.9.50 → v0.11.31  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -512,11 +512,36 @@ Pre-flight check reads `/proc/meminfo` `MemAvailable` and estimates memory neede
 ### Comprehensive Test Suite (v0.11.26v0.11.30)  NEW
 `gzstd-test.sh`: ~170+ tests across 35 sections with live progress bar, per-test timing, CTRL-C handling, and auto GPU detection. Key coverage: round-trip, compression levels with ratios, integrity, pipes, tar, file management, threading forms, chunk sizes, verbosity validation, stats JSON, exit codes, zstd interop, VRAM pressure, wildcards, `--` end-of-options, output redirection, space-separated options, GPU options, error handling, cross-level decompress, argument order, completion summary format.
 
+### Stdout O_DIRECT Detection (v0.11.31)  POSITIVE (major)
+When stdout is redirected to a regular file (`gzstd -d < file.zst > output.tar`), gzstd now detects this via `fstat(fileno(stdout))` + `/proc/self/fd/N` and reopens with O_DIRECT, bypassing the page cache.
+- **Safety checks:** Skips O_APPEND (undefined with O_DIRECT), `/dev/*`, deleted files, non-regular files. Falls back silently to buffered fwrite on any failure.
+- **Result:** `tar | gzstd > file.zst` gets full NVMe speed without the user needing to know about `-o`.
+
+**Knuth (432 GiB decompress via stdin redirect):**
+
+| Method | Wall | sys | GiB/s |
+|--------|------|-----|-------|
+| gzstd stdout → page cache | 8m59s | 27m27s | 0.83 |
+| zstd stdout → page cache | 10m46s | 11m01s | 0.67 |
+| **gzstd stdout → O_DIRECT** | **3m33s** | **19m53s** | **2.05** |
+
+### GPU Backpressure on Pop (v0.11.31)  BUGFIX (major)
+GPUs now call `wait_if_backlogged()` before `pop_batch_greedy` in both compress and decompress workers. Previously GPUs were exempt from backpressure ("never throttled"), but 8 H100s decompressing at full speed overwhelmed the NVMe writer  decompression finished with only 28% of data written to disk.
+- GPU workers block before grabbing new work, not mid-kernel
+- One batch per GPU remains in-flight beyond the high-water mark at most
+- Writer drain after decompress: was 72% remaining, now <1 second
+
+### Test Mode Defaults to 2 GPU Streams (v0.11.31)  POSITIVE
+`-t` verify mode now defaults to `--gpu-streams=2` instead of 1. No write bottleneck in verify mode, so stream overlap helps.
+- **Knuth (432 GiB verify):** 1 stream: 4.09 GiB/s (1m47s) → 2 streams: 6.39 GiB/s (1m09s)  **56% faster**
+- Compress/decompress stays at 1 stream (NVMe is the bottleneck, larger batches win)
+- Fixed help text: was incorrectly showing default as 3
+
 ## Key Lessons Learned (Updated)
 
-16. **Compress backpressure matters just as much as decompress.** The same writer saturation problem (v0.11.24, 19m sys → 6m) exists on the compress side. 32 CPU threads with `--cpu-batch=128` produced 10m26s sys time  a stop-and-go stampede on the queue CV. Backpressure + removing `--cpu-batch` in CPU-only mode eliminated it.
+19. **Stdout O_DIRECT is a free 2.5× win.** Users don't think about O_DIRECT  they just write `> file`. Detecting stdout-to-file and auto-enabling O_DIRECT gives them NVMe speed without any knowledge of I/O internals. The page cache adds 17 GiB of dirty pages and halves throughput on 432 GiB files.
 
-17. **Smaller chunks beat larger chunks for CPU compress.** 16 MiB chunks outperformed 128 MiB across all file sizes. More tasks = better load balancing across 96 threads. The scheduling overhead of 27k tasks is negligible compared to the starvation caused by only 3,400 large tasks.
+20. **GPUs need backpressure too.** The original design exempted GPUs ("batches in-flight, can't throttle"). But on H100 × 8, GPU decompression throughput vastly exceeds NVMe write speed. The result: 300+ GiB buffered in RAM, massive kernel writeback, and a frozen "28% writing" progress bar after decompression finished. Throttling GPUs before their next `pop_batch_greedy`  not mid-kernel  keeps the pipeline balanced with <1s drain.
 
 18. **GPU VRAM is a shared resource  design for it.** On a multi-user machine (Knuth, 8× H100), any GPU can lose VRAM at any moment. Infinite retry loops, early reader aborts on single GPU failure, and missing frame deadlocks all surfaced under real student workloads. The fix: retry limits, graceful skip with re-enqueue, deadlock detection with hard error, and never abort the reader on partial failure.
 

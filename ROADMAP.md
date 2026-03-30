@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.11.30
+**Current version:** v0.11.31
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -70,12 +70,13 @@ Release input data buffers immediately after consumption (compression, H2D uploa
 - GPU compress: guarded by `!rescue` to preserve rescue path in hybrid mode
 
 ### 1.8 Writer Backpressure (Compress + Decompress)
-**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.24 decompress, v0.11.29 compress)**
+**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.24 decompress, v0.11.29 compress, v0.11.31 GPU throttle)**
 
-Prevents workers from producing data faster than the NVMe can write. Hysteresis: 4 GiB high-water / 2 GiB low-water. CPU workers block, GPUs never throttled.
+Prevents workers from producing data faster than the NVMe can write. Hysteresis: 4 GiB high-water / 2 GiB low-water. All workers (CPU and GPU) throttled before popping next task.
 
 - Decompress (v0.11.24): sys time 19m → 6m, throughput +56% on 432 GiB hybrid
 - Compress (v0.11.29): wired for `compress_cpu_mt`, `compress_nvcomp`, and rescue workers
+- GPU throttle (v0.11.31): GPUs now wait before `pop_batch_greedy`  fixed 28% write drain issue where 8 H100s overwhelmed the NVMe
 - `--cpu-batch` now ignored in `--cpu-only` mode (caused 10m26s sys time stop-and-go)
 
 ### 1.9 Graceful GPU VRAM Handling
@@ -154,13 +155,14 @@ Optimizations for piped input:
 - CPU workers can start immediately (no GPU warm-up delay matters since reader is slow)
 
 Piped output (`stdout`) has different constraints:
-- Can't use O_DIRECT → buffered writes only
-- Can't seek → no sparse file optimization
+- ~~Can't use O_DIRECT → buffered writes only~~ **SOLVED (v0.11.31):** stdout redirected to a regular file now auto-detected and reopened with O_DIRECT
+- Can't seek → no sparse file optimization (only when stdout is a true pipe)
 - May have backpressure (downstream pipe consumer is slow)
 
 Optimizations for piped output:
-- Writer backpressure already implemented (v0.11.24/v0.11.29)  works for pipe output via fwrite path
-- Skip sparse detection (can't seek)
+- **Stdout O_DIRECT (v0.11.31):** Detects `stdout > file` via `fstat` + `/proc/self/fd/N`, reopens with O_DIRECT. Falls back silently on O_APPEND, unsupported fs, /dev/*, etc. Result: `tar | gzstd > file.zst` gets full NVMe speed (2.05 GiB/s vs 0.83 GiB/s page cache  **2.5× faster**)
+- Writer backpressure already implemented (v0.11.24/v0.11.29/v0.11.31)  works for both O_DIRECT and fwrite paths
+- Skip sparse detection (can't seek on true pipes)
 
 ### 3.2 Streaming Mode for Unknown-Size Input
 **Priority: Low | Complexity: Low | Status: NOT STARTED**
@@ -323,3 +325,4 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 | v0.11.27 | Writer deadlock detection (5s timeout → hard error), `die()` cleanup reporting, atomic temp cleanup |
 | v0.11.28-29 | Compress backpressure (all paths), RAM budget check, `--cpu-batch` ignored in `--cpu-only`, VRAM retry limit |
 | v0.11.30 | Default chunk 16 MiB everywhere, dual-rate progress bar, removed auto-chunk scaling, comprehensive test suite |
+| v0.11.31 | Stdout O_DIRECT detection (3× faster piped decompress), GPU backpressure on pop, -t defaults to 2 streams |
