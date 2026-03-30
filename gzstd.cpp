@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.30";
+static constexpr const char * GZSTD_VERSION = "0.11.31";
 //
 // Architecture overview:
 //
@@ -205,7 +205,7 @@ struct Options {
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   bool gpu_batch_user_set = false;
   double gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
-  size_t gpu_streams = DEFAULT_GPU_STREAMS;
+  size_t gpu_streams = 0;            // 0=auto (1 for compress, 2 for test/verify)
   int gpu_devices = 0;            // 0=auto (all for compress, 1 for decompress)
   PinMode pin_mode = PinMode::AUTO;
 #endif
@@ -321,7 +321,7 @@ static void print_help()
   std::cout <<
 " --gpu-batch N Max GPU subchunks per device (default: 16)\n"
 " --gpu-mem-frac X Fraction of free VRAM per device (0.1..0.95, def: 0.60)\n"
-" --gpu-streams N CUDA streams per device (default: 3)\n"
+" --gpu-streams N CUDA streams per device (default: 1; 2 for -t verify)\n"
 " --gpu-devices N Number of GPUs to use (0=auto: all for compress, 1 for decompress)\n"
 " --gpu-only GPU only, no CPU workers (error if GPU unavailable)\n"
 " --pinned {auto|on|off} Control pinned host buffers (default: auto)\n"
@@ -3741,6 +3741,8 @@ static void gpu_worker(
         pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+        // Backpressure: wait if writer is overwhelmed before grabbing more work
+        if (bp) bp->wait_if_backlogged();
         if (!queue->pop_batch_greedy(pop_n, C.batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
@@ -5019,6 +5021,10 @@ static void gpu_decomp_worker(
                      : per_stream_cap;
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+        // Backpressure: wait if writer is overwhelmed before grabbing more work.
+        // This prevents GPUs from flooding the result store with decompressed
+        // data faster than the NVMe can write.
+        if (bp) bp->wait_if_backlogged();
         if (!queue->pop_batch_greedy(pop_n, C.batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) {
@@ -5690,20 +5696,52 @@ int main(int argc, char ** argv)
 #ifndef _WIN32
   std::unique_ptr<DirectWriter> direct_writer;
   if (!to_stdout && out != stdout) {
-    // Check if output is a regular file (not /dev/null, pipe, etc.)
+    // Explicit output file: use O_DIRECT if it's a regular file
     std::string write_path = use_atomic ? tmp : opt.output;
     struct stat st;
     bool is_regular = (stat(write_path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
     if (is_regular) {
-      {
-        auto dw = std::make_unique<DirectWriter>();
-        if (dw->open(write_path)) {
-          if (out) { std::fclose(out); out = nullptr; }
-          direct_writer = std::move(dw);
-          vlog(V_VERBOSE, opt, "using O_DIRECT for output (bypass page cache)\n");
-        }
+      auto dw = std::make_unique<DirectWriter>();
+      if (dw->open(write_path)) {
+        if (out) { std::fclose(out); out = nullptr; }
+        direct_writer = std::move(dw);
+        vlog(V_VERBOSE, opt, "using O_DIRECT for output (bypass page cache)\n");
       }
     }
+  } else if (to_stdout && out == stdout) {
+    // stdout path: check if stdout is redirected to a regular file.
+    // If so, reopen with O_DIRECT for ~2× write speed.
+    // Fall back silently on any issue (append mode, unsupported fs, etc.)
+    do {
+      int fd = fileno(stdout);
+      if (fd < 0) break;
+      struct stat st;
+      if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) break;
+      // Skip if O_APPEND is set (O_DIRECT + O_APPEND is undefined on Linux)
+      int flags = fcntl(fd, F_GETFL);
+      if (flags < 0 || (flags & O_APPEND)) break;
+      // Get the file path from /proc/self/fd/N
+      char link_path[64];
+      char real_path[4096];
+      std::snprintf(link_path, sizeof(link_path), "/proc/self/fd/%d", fd);
+      ssize_t len = readlink(link_path, real_path, sizeof(real_path) - 1);
+      if (len <= 0) break;
+      real_path[len] = '\0';
+      // Sanity: skip /dev/null, /dev/*, deleted files
+      if (std::strncmp(real_path, "/dev/", 5) == 0) break;
+      if (std::strstr(real_path, "(deleted)")) break;
+      // Try opening with O_DIRECT
+      auto dw = std::make_unique<DirectWriter>();
+      if (dw->open(std::string(real_path))) {
+        // Success: close stdout's FILE*, the DirectWriter owns the fd now
+        std::fflush(stdout);
+        // Don't fclose(stdout)  it's special. Just stop using it.
+        out = nullptr;
+        direct_writer = std::move(dw);
+        vlog(V_VERBOSE, opt, "stdout is a regular file  using O_DIRECT (bypass page cache)\n");
+      }
+      // If open failed, fall through to normal fwrite via stdout
+    } while (false);
   }
   DirectWriter * dw_ptr = direct_writer.get();
 #else
@@ -5884,8 +5922,10 @@ int main(int argc, char ** argv)
 
   double finalize_ms = 0, sync_ms = 0;
 
-  if (!to_stdout) {
-    // Show finalizing message for large files (progress bar is already stopped)
+  // If DirectWriter is active (either explicit file or stdout-to-file O_DIRECT),
+  // finalize it first regardless of to_stdout flag.
+#ifndef _WIN32
+  if (g_direct_writer) {
     if (opt.mode == Mode::COMPRESS && opt.verbosity >= V_DEFAULT) {
       uint64_t out_bytes = meter.wrote_bytes.load();
       if (out_bytes > 100 * ONE_MIB) {
@@ -5895,18 +5935,17 @@ int main(int argc, char ** argv)
         std::fflush(stderr);
       }
     }
-    // Finalize writer (write unaligned tail, close fd)
-#ifndef _WIN32
-    if (g_direct_writer) {
-      auto t_fin = std::chrono::steady_clock::now();
-      if (!g_direct_writer->finalize())
-        die_io("failed to finalize O_DIRECT output");
-      g_direct_writer = nullptr;
-      direct_writer.reset();
-      finalize_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
-          std::chrono::steady_clock::now() - t_fin).count();
-    }
+    auto t_fin = std::chrono::steady_clock::now();
+    if (!g_direct_writer->finalize())
+      die_io("failed to finalize O_DIRECT output");
+    g_direct_writer = nullptr;
+    direct_writer.reset();
+    finalize_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
+        std::chrono::steady_clock::now() - t_fin).count();
+  }
 #endif
+
+  if (!to_stdout) {
     if (out) {
       if (opt.sync_output) {
         fsync_file(out);
@@ -6186,7 +6225,11 @@ static Options parse_args(int argc, char ** argv)
       opt.gpu_batch_cap = DEFAULT_GPU_DECOMP_BATCH_CAP;  // 16
     }
   }
-  if (opt.gpu_streams == 0) opt.gpu_streams = DEFAULT_GPU_STREAMS;
+  if (opt.gpu_streams == 0) {
+    // Auto: 2 streams for verify (-t) where no write bottleneck exists,
+    // 1 stream for compress/decompress (larger batches win over overlap)
+    opt.gpu_streams = (opt.mode == Mode::TEST) ? 2 : DEFAULT_GPU_STREAMS;
+  }
   if (!(opt.gpu_mem_fraction > 0.0 && opt.gpu_mem_fraction < 1.0)) opt.gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   if (opt.gpu_mem_fraction < 0.10) opt.gpu_mem_fraction = 0.10;
   if (opt.gpu_mem_fraction > 0.95) opt.gpu_mem_fraction = 0.95;

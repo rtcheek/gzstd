@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.11.24
+**Current version:** v0.11.30
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -68,6 +68,26 @@ Release input data buffers immediately after consumption (compression, H2D uploa
 - +7% on mixed.bin (high frame churn data)
 - Reduces peak memory footprint for large files
 - GPU compress: guarded by `!rescue` to preserve rescue path in hybrid mode
+
+### 1.8 Writer Backpressure (Compress + Decompress)
+**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.24 decompress, v0.11.29 compress)**
+
+Prevents workers from producing data faster than the NVMe can write. Hysteresis: 4 GiB high-water / 2 GiB low-water. CPU workers block, GPUs never throttled.
+
+- Decompress (v0.11.24): sys time 19m → 6m, throughput +56% on 432 GiB hybrid
+- Compress (v0.11.29): wired for `compress_cpu_mt`, `compress_nvcomp`, and rescue workers
+- `--cpu-batch` now ignored in `--cpu-only` mode (caused 10m26s sys time stop-and-go)
+
+### 1.9 Graceful GPU VRAM Handling
+**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.26v0.11.29)**
+
+Survive VRAM exhaustion on shared GPU machines without hanging or producing truncated output.
+
+- Retry limit (10 attempts) prevents infinite allocation loop
+- Graceful GPU skip with frame re-enqueue to other GPUs/CPU
+- Reader never aborts on single GPU failure
+- Writer deadlock detection (5s timeout → hard error + cleanup)
+- `die()` reports cleanup of incomplete output files
 
 ---
 
@@ -139,7 +159,7 @@ Piped output (`stdout`) has different constraints:
 - May have backpressure (downstream pipe consumer is slow)
 
 Optimizations for piped output:
-- Monitor write throughput; if writer < decompression rate, apply backpressure to workers (slow down production to match consumption)
+- Writer backpressure already implemented (v0.11.24/v0.11.29)  works for pipe output via fwrite path
 - Skip sparse detection (can't seek)
 
 ### 3.2 Streaming Mode for Unknown-Size Input
@@ -220,6 +240,44 @@ Map to decompress default:
 
 ---
 
+## Phase 6: Testing & Hardening (v0.11.26v0.11.30, ongoing)
+
+### 6.1 Comprehensive Test Suite
+**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.26v0.11.30)**
+
+`gzstd-test.sh`: ~170+ tests, live progress bar, per-test timing, auto GPU detection. Covers all CLI options, error handling, edge cases, VRAM pressure, and data integrity.
+
+### 6.2 Structured Exit Codes
+**Priority: Medium | Complexity: Low | Status: DONE (v0.11.26)**
+
+0=OK, 1=runtime, 2=usage, 3=I/O, 4=data, 5=GPU_FAIL. Enables scripting and CI integration.
+
+### 6.3 RAM Budget Check
+**Priority: Medium | Complexity: Low | Status: DONE (v0.11.29)**
+
+Auto-reduces chunk size to fit 75% of available RAM. Prevents OOM on memory-constrained machines.
+
+### 6.4 Argument Hardening
+**Priority: Medium | Complexity: Low | Status: DONE (v0.11.26v0.11.30)**
+
+Unknown flags rejected, `--` end-of-options, `--threads=N` form, argument order independence, `.zst` double-compression warning, `--cpu-batch` ignored in `--cpu-only`.
+
+---
+
+## Remaining Work for v1.0
+
+| Item | Phase | Priority | Status |
+|------|-------|----------|--------|
+| Asymmetric mode (PCIe Gen3 detection) | 5.1, 5.2 | HIGH | Not started |
+| Persistent auto-tuning (`~/.gzstd/`) | 2.12.3 | Medium | Not started |
+| Rate-matched dispatch (re-enable) | 1.3 | Medium | Disabled, needs eval |
+| Pipe-aware scheduling | 3.1 | Medium | Not started |
+| Streaming mode for unknown-size input | 3.2 | Low | Not started |
+| Multi-reader NVMe | 4.1 | Low | Research |
+| Multi-writer O_DIRECT pwrite | 4.2 | Low | Tested negative for buffered |
+
+---
+
 ## Future Ideas (v2.0+)
 
 ### Speculative CPU/GPU Racing
@@ -260,3 +318,8 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 | v0.11.22 | Early memory release (+7% on mixed data), rescue-safe GPU buffer management |
 | v0.11.23 | Write drain progress bar, verbose output cleanup, wrote_bytes tracks physical I/O |
 | v0.11.24 | Writer backpressure (+56% hybrid decompress on 432 GiB file, sys time -66%) |
+| v0.11.25 | Test mode fixes (wrote_bytes double-counting, backpressure stall, progress label) |
+| v0.11.26 | Graceful GPU VRAM skip, structured exit codes, argument hardening, `--threads=N`, `--` support |
+| v0.11.27 | Writer deadlock detection (5s timeout → hard error), `die()` cleanup reporting, atomic temp cleanup |
+| v0.11.28-29 | Compress backpressure (all paths), RAM budget check, `--cpu-batch` ignored in `--cpu-only`, VRAM retry limit |
+| v0.11.30 | Default chunk 16 MiB everywhere, dual-rate progress bar, removed auto-chunk scaling, comprehensive test suite |
