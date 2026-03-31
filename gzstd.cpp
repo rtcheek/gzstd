@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.31";
+static constexpr const char * GZSTD_VERSION = "0.11.32";
 //
 // Architecture overview:
 //
