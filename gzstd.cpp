@@ -2076,9 +2076,15 @@ public:
   }
 
   // GPU workers call this to publish their current batch size so the
-  // scheduler can calculate accurate reservations.
+  // scheduler can calculate accurate reservations.  Uses max to handle
+  // the auto-tuner changing batch sizes mid-run — the reservation must
+  // cover the largest batch any stream might request.
   void set_gpu_batch_size(size_t bs) {
-    gpu_batch_size_.store(bs, std::memory_order_relaxed);
+    size_t cur = gpu_batch_size_.load(std::memory_order_relaxed);
+    while (bs > cur) {
+      if (gpu_batch_size_.compare_exchange_weak(cur, bs, std::memory_order_relaxed))
+        break;
+    }
   }
 
   // GPU stream calls this when it's ready and waiting for data
@@ -2119,6 +2125,11 @@ public:
 
     const uint64_t cpu_b = cpu_bytes_.exchange(0, std::memory_order_relaxed);
     const uint64_t gpu_b = gpu_bytes_.exchange(0, std::memory_order_relaxed);
+
+    // Reset gpu_batch_size_ to 1 so it re-learns the current max from
+    // GPU workers this tick cycle.  This lets the reservation shrink when
+    // the auto-tuner settles on a smaller batch.
+    gpu_batch_size_.store(1, std::memory_order_relaxed);
     const double cpu_rate = cpu_b / std::max(1e-6, secs);
     const double gpu_rate = gpu_b / std::max(1e-6, secs);
 
