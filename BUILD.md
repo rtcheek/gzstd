@@ -11,15 +11,15 @@
 - nvCOMP: `conda install -c conda-forge nvcomp`
 - NVIDIA driver with NVML
 
-## Quick Start
+## Quick Start (from scratch)
 
 ```bash
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+git clone https://github.com/rtcheek/gzstd.git
+cd gzstd
+cmake -B build
+cmake --build build -j$(nproc)
+./build/gzstd --version
 ```
-
-The binary is at `./build/gzstd`.
 
 ## Build Options
 
