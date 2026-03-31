@@ -142,6 +142,14 @@ if(USE_NVCOMP)
     if(NVCOMP_INCLUDE_DIR AND NVCOMP_LIBRARY)
       set(HAVE_NVCOMP TRUE)
       message(STATUS "nvCOMP found: ${NVCOMP_LIBRARY}")
+      # Warn when BUILD_STATIC requested but only shared nvCOMP was found
+      if(BUILD_STATIC AND NVCOMP_LIBRARY MATCHES "\\.(so|dylib)")
+        set(NVCOMP_IS_SHARED TRUE)
+        message(WARNING
+          "BUILD_STATIC is ON but only shared nvCOMP was found (${NVCOMP_LIBRARY}). "
+          "The binary will still depend on libnvcomp.so at runtime. "
+          "Run 'make install' or 'cmake --install' to bundle the .so next to the binary.")
+      endif()
     else()
       message(STATUS "nvCOMP not found; building CPU-only (set NVCOMP_ROOT or CONDA_PREFIX if available)")
     endif()
@@ -301,8 +309,51 @@ message(STATUS " Zstd            : target ZSTD::ZSTD")
 message(STATUS " C++ Standard    : ${CMAKE_CXX_STANDARD}")
 if(BUILD_STATIC)
   message(STATUS " Linking         : static (portable binary)")
-  message(STATUS " Runtime deps    : glibc, NVIDIA driver (libnvidia-ml.so)")
+  if(NVCOMP_IS_SHARED)
+    message(STATUS " Runtime deps    : glibc, NVIDIA driver, libnvcomp.so")
+  else()
+    message(STATUS " Runtime deps    : glibc, NVIDIA driver (libnvidia-ml.so)")
+  endif()
 else()
   message(STATUS " Linking         : shared (default)")
 endif()
+if(BUILD_STATIC AND NVCOMP_IS_SHARED)
+  message(STATUS " NOTE: nvCOMP is shared; use 'make install' to bundle .so with binary")
+endif()
 message(STATUS "================================\n")
+
+# =====================================================
+#                    Install
+# Installs the gzstd binary and bundles any shared libs
+# that couldn't be linked statically (nvCOMP, NVML).
+# Usage: cmake --install build --prefix ./dist
+# =====================================================
+install(TARGETS gzstd RUNTIME DESTINATION bin)
+
+# Bundle shared libraries that the binary needs at runtime
+if(HAVE_NVCOMP AND BUILD_STATIC AND NVCOMP_IS_SHARED)
+  # Resolve symlinks to find the real .so file, then install
+  # both the real file and the soname symlink
+  get_filename_component(_NVCOMP_REAL "${NVCOMP_LIBRARY}" REALPATH)
+  get_filename_component(_NVCOMP_DIR  "${NVCOMP_LIBRARY}" DIRECTORY)
+  get_filename_component(_NVCOMP_NAME "${NVCOMP_LIBRARY}" NAME)
+  install(FILES "${_NVCOMP_REAL}" DESTINATION bin)
+  # Create the soname symlink (e.g., libnvcomp.so.5 -> libnvcomp.so.5.0.1)
+  get_filename_component(_NVCOMP_REAL_NAME "${_NVCOMP_REAL}" NAME)
+  if(NOT _NVCOMP_NAME STREQUAL _NVCOMP_REAL_NAME)
+    install(CODE "
+      execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink
+        \"${_NVCOMP_REAL_NAME}\"
+        \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/bin/${_NVCOMP_NAME}\")
+      message(STATUS \"Symlink: ${_NVCOMP_NAME} -> ${_NVCOMP_REAL_NAME}\")
+    ")
+  endif()
+  # Also grab the unversioned .so symlink if it exists
+  if(EXISTS "${_NVCOMP_DIR}/libnvcomp.so" AND NOT _NVCOMP_NAME STREQUAL "libnvcomp.so")
+    install(CODE "
+      execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink
+        \"${_NVCOMP_REAL_NAME}\"
+        \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/bin/libnvcomp.so\")
+    ")
+  endif()
+endif()
