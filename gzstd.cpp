@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.31";
+static constexpr const char * GZSTD_VERSION = "0.11.33";
 //
 // Architecture overview:
 //
@@ -2033,7 +2033,8 @@ class HybridSched {
 public:
   HybridSched(double override_share, int /*cpu_threads*/, int gpu_devices,
               const Options & opt)
-    : opt_(opt), gpu_device_count_(gpu_devices)
+    : opt_(opt), gpu_device_count_(gpu_devices),
+      total_gpu_streams_(gpu_devices * std::max<int>(1, opt.gpu_streams))
   {
     if (override_share >= 0.0) {
       fixed_mode_ = true;
@@ -2047,7 +2048,8 @@ public:
 
   // CPU checks this before taking from the queue.
   // Depth-aware: CPUs can take surplus frames even while GPUs are waiting,
-  // as long as enough frames remain to fill the waiting GPU batches.
+  // as long as enough frames remain to fill ALL GPU streams (not just the
+  // currently waiting ones — busy streams will come back for data soon).
   bool should_cpu_take(size_t queue_depth = 0) const {
     if (fixed_mode_) {
       const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
@@ -2060,16 +2062,16 @@ public:
     if (!gpu_ready_.load(std::memory_order_acquire))
       return true;
 
-    const int waiting = gpus_waiting_.load(std::memory_order_acquire);
-
     // No GPU is waiting → CPU can take
-    if (waiting <= 0)
+    if (gpus_waiting_.load(std::memory_order_acquire) <= 0)
       return true;
 
-    // GPUs are waiting — check if queue has surplus beyond what they need.
-    // Reserve gpu_batch_size_ frames per waiting stream so pop_batch_greedy
-    // can fill them without stalling.
-    const size_t reserved = size_t(waiting) * gpu_batch_size_.load(std::memory_order_relaxed);
+    // GPUs are waiting — check if queue has surplus beyond what ALL streams
+    // need.  We reserve for total_gpu_streams_ (not just gpus_waiting_)
+    // because busy streams will finish and come back for more data shortly.
+    // Only allowing CPUs to skim genuine surplus prevents queue starvation
+    // that causes pop_batch_greedy to block waiting for frames.
+    const size_t reserved = size_t(total_gpu_streams_) * gpu_batch_size_.load(std::memory_order_relaxed);
     return queue_depth > reserved;
   }
 
@@ -2127,6 +2129,7 @@ public:
          << " gpu_rate=" << (gpu_rate/1e9) << " GiB/s"
          << " gpus_waiting=" << gpus_waiting_.load()
          << " gpu_batch=" << gpu_batch_size_.load()
+         << " reserved=" << (total_gpu_streams_ * gpu_batch_size_.load())
          << " cpu_taken=" << cpu_taken_.load()
          << " gpu_taken=" << gpu_taken_.load();
       std::cerr << os.str() << "\n";
@@ -2142,6 +2145,7 @@ public:
 private:
   const Options & opt_;
   int gpu_device_count_ = 0;
+  int total_gpu_streams_ = 0;   // devices × streams_per_device
   bool fixed_mode_ = false;
   double fixed_cpu_share_ = -1.0;
   TaskQueue * queue_ = nullptr;  // for waking CPU workers from gpu_got_data()
