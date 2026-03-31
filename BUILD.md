@@ -1,308 +1,116 @@
-# CMakeLists.txt  gzstd (hybrid CPU+GPU Zstd) with robust Zstd fallback & RPATH hardening
+# Building gzstd
 
-cmake_minimum_required(VERSION 3.18)
-project(gzstd LANGUAGES CXX)
+## Prerequisites
 
-# ---------------- Options ----------------
-option(USE_NVCOMP "Enable nvCOMP (CUDA) GPU backend if found" ON)
-option(BUILD_STATIC "Link libraries statically for portable binaries" OFF)
+- C++17 compiler (GCC 7+ or Clang 5+)
+- CMake 3.18+
+- Zstd (headers + library): `conda install zstd` or `apt install libzstd-dev`
 
-# ---------------- Language / warnings ----------------
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+**For GPU support (optional):**
+- CUDA Toolkit 11+
+- nvCOMP: `conda install -c conda-forge nvcomp`
+- NVIDIA driver with NVML
 
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
-endif()
+## Quick Start
 
-if(MSVC)
-  add_compile_options(/W3)
-else()
-  add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations)
-endif()
+```bash
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+```
 
-# Threads (for std::thread and -pthread on Unix)
-find_package(Threads REQUIRED)
+The binary is at `./build/gzstd`.
 
-# =====================================================
-#                      Zstd
-# Try, in order:
-#   1) CMake's FindZSTD (target ZSTD::ZSTD)
-#   2) pkg-config 'zstd'
-#   3) Manual fallback that looks in common prefixes (e.g., $CONDA_PREFIX)
-#      and allows -DZSTD_INCLUDE_DIR / -DZSTD_LIBRARY overrides.
-#
-# When BUILD_STATIC is ON, prefer libzstd.a over libzstd.so.
-# =====================================================
+## Build Options
 
-# Helper: preferred library name list based on BUILD_STATIC
-if(BUILD_STATIC)
-  set(_ZSTD_LIB_NAMES zstd_static zstd)      # prefer static archive
-  set(_ZSTD_LIB_SUFFIXES lib lib64)
-else()
-  set(_ZSTD_LIB_NAMES zstd)
-  set(_ZSTD_LIB_SUFFIXES lib lib64)
-endif()
+| Option | Default | Description |
+|--------|---------|-------------|
+| `USE_NVCOMP` | ON | Enable GPU backend (auto-disables if CUDA/nvCOMP not found) |
+| `BUILD_STATIC` | OFF | Link statically for portable binaries |
 
-# 1) Built-in finder (provides target ZSTD::ZSTD)
-find_package(ZSTD QUIET)
+### Shared Build (default)
 
-# 2) pkg-config fallback (synthesizes target when found)
-if(NOT ZSTD_FOUND)
-  find_package(PkgConfig QUIET)
-  if(PKG_CONFIG_FOUND)
-    pkg_check_modules(ZSTD_PKG zstd IMPORTED_TARGET)
-    if(ZSTD_PKG_FOUND)
-      add_library(ZSTD::ZSTD INTERFACE IMPORTED)
-      target_include_directories(ZSTD::ZSTD INTERFACE ${ZSTD_PKG_INCLUDE_DIRS})
-      if(BUILD_STATIC)
-        target_link_libraries(ZSTD::ZSTD INTERFACE ${ZSTD_PKG_STATIC_LIBRARIES})
-      else()
-        target_link_libraries(ZSTD::ZSTD INTERFACE ${ZSTD_PKG_LINK_LIBRARIES})
-      endif()
-      message(STATUS "Zstd found via pkg-config: ${ZSTD_PKG_LINK_LIBRARIES}")
-    endif()
-  endif()
-endif()
+```bash
+cmake -B build
+cmake --build build -j$(nproc)
+```
 
-# 3) Manual fallback (works even without zstd.pc)
-# Hints: user-supplied variables, then environment prefixes.
-if(NOT TARGET ZSTD::ZSTD)
-  # Allow explicit overrides:
-  #   -DZSTD_INCLUDE_DIR=/path/include  -DZSTD_LIBRARY=/path/lib/libzstd.so
-  if(NOT ZSTD_INCLUDE_DIR)
-    find_path(ZSTD_INCLUDE_DIR zstd.h
-              HINTS ${ZSTD_ROOT} ${ZSTD_PREFIX}
-                    ENV CONDA_PREFIX ENV ZSTD_ROOT ENV ZSTD_PREFIX
-              PATH_SUFFIXES include)
-  endif()
+Requires all shared libraries (zstd, nvcomp, cudart) to be on `LD_LIBRARY_PATH` or in the RPATH at runtime. The RPATH is automatically configured for `$ORIGIN`, conda prefixes, and common system paths.
 
-  if(NOT ZSTD_LIBRARY)
-    find_library(ZSTD_LIBRARY NAMES ${_ZSTD_LIB_NAMES}
-                 HINTS ${ZSTD_ROOT} ${ZSTD_PREFIX}
-                       ENV CONDA_PREFIX ENV ZSTD_ROOT ENV ZSTD_PREFIX
-                 PATH_SUFFIXES ${_ZSTD_LIB_SUFFIXES})
-  endif()
+### Static Build (portable)
 
-  if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
-    add_library(ZSTD::ZSTD INTERFACE IMPORTED)
-    target_include_directories(ZSTD::ZSTD INTERFACE ${ZSTD_INCLUDE_DIR})
-    target_link_libraries(ZSTD::ZSTD INTERFACE ${ZSTD_LIBRARY})
-    message(STATUS "Zstd found (manual): ${ZSTD_LIBRARY}")
-  endif()
-endif()
+```bash
+cmake -B build -DBUILD_STATIC=ON
+cmake --build build -j$(nproc)
+```
 
-# Hard fail if we still don't have Zstd
-if(NOT TARGET ZSTD::ZSTD)
-  message(FATAL_ERROR
-    "Zstd not found. Install headers+libs (e.g., conda-forge:zstd or libzstd-dev) "
-    "or pass -DZSTD_INCLUDE_DIR & -DZSTD_LIBRARY.")
-endif()
+Links zstd, libstdc++, libgcc, and CUDA runtime statically. The resulting binary only needs glibc and the NVIDIA driver at runtime.
 
-# =====================================================
-#                nvCOMP + CUDA (optional)
-# When BUILD_STATIC is ON, prefer static nvCOMP and
-# static CUDA runtime (cudart_static).
-# =====================================================
-set(HAVE_NVCOMP FALSE)
-if(USE_NVCOMP)
-  # CUDA runtime
-  find_package(CUDAToolkit QUIET)
-  if(CUDAToolkit_FOUND)
-    # Hints: NVCOMP_ROOT or CONDA_PREFIX
-    find_path(NVCOMP_INCLUDE_DIR
-      NAMES nvcomp/zstd.h
-      HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
-      PATH_SUFFIXES include)
+**Note:** nvCOMP does not ship a static library in the conda-forge package. CMake will warn if it falls back to the shared `libnvcomp.so`. In this case the binary still depends on `libnvcomp.so.5` at runtime.
 
-    if(BUILD_STATIC)
-      # Try static nvCOMP first, fall back to shared
-      find_library(NVCOMP_LIBRARY
-        NAMES nvcomp_static nvcomp
-        HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
-        PATH_SUFFIXES lib lib64)
+### Installing (bundling shared libs)
 
-      # nvCOMP static may depend on additional CUDA libraries
-      find_library(NVCOMP_BITCOMP_LIBRARY
-        NAMES nvcomp_bitcomp_static nvcomp_bitcomp
-        HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
-        PATH_SUFFIXES lib lib64)
-      find_library(NVCOMP_GDEFLATE_LIBRARY
-        NAMES nvcomp_gdeflate_static nvcomp_gdeflate
-        HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
-        PATH_SUFFIXES lib lib64)
-    else()
-      find_library(NVCOMP_LIBRARY
-        NAMES nvcomp
-        HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
-        PATH_SUFFIXES lib lib64)
-    endif()
+When `BUILD_STATIC` is ON and nvCOMP is shared, use the install target to bundle `libnvcomp.so` alongside the binary:
 
-    if(NVCOMP_INCLUDE_DIR AND NVCOMP_LIBRARY)
-      set(HAVE_NVCOMP TRUE)
-      message(STATUS "nvCOMP found: ${NVCOMP_LIBRARY}")
-    else()
-      message(STATUS "nvCOMP not found; building CPU-only (set NVCOMP_ROOT or CONDA_PREFIX if available)")
-    endif()
-  else()
-    message(STATUS "CUDAToolkit not found; building CPU-only")
-  endif()
-endif()
+```bash
+cmake --install build --prefix ./dist
+```
 
-# =====================================================
-#          NVML (GPU utilization monitoring)
-# When BUILD_STATIC is ON, use the NVML stubs library
-# (links at build time, resolves against driver at runtime).
-# NVML cannot be fully statically linked  it's part of
-# the NVIDIA driver.  The stubs library is always used.
-# =====================================================
-set(HAVE_NVML FALSE)
-if(HAVE_NVCOMP AND CUDAToolkit_FOUND)
-  find_library(NVML_LIBRARY
-    NAMES nvidia-ml
-    HINTS ${CUDAToolkit_LIBRARY_DIR}
-          "/usr/lib/x86_64-linux-gnu"
-          "/usr/lib64"
-          "/usr/local/cuda/lib64/stubs"
-          "/usr/lib/x86_64-linux-gnu/nvidia/current"
-    PATH_SUFFIXES stubs)
+This produces:
 
-  if(NVML_LIBRARY)
-    set(HAVE_NVML TRUE)
-    message(STATUS "NVML found: ${NVML_LIBRARY}")
-  else()
-    message(STATUS "NVML (nvidia-ml) not found; GPU selection will use free-VRAM fallback")
-  endif()
-endif()
+```
+dist/
+  bin/
+    gzstd              # the binary
+    libnvcomp.so.5     # symlink -> libnvcomp.so.5.x.x
+    libnvcomp.so.5.x.x # real shared library
+```
 
-# =====================================================
-#                     Target
-# =====================================================
-add_executable(gzstd gzstd.cpp)
-target_compile_features(gzstd PRIVATE cxx_std_17)
+Copy the entire `dist/bin/` directory to the target machine. The `$ORIGIN` RPATH ensures the binary finds `libnvcomp.so.5` next to itself.
 
-# Include/defines
-if(HAVE_NVCOMP)
-  target_compile_definitions(gzstd PRIVATE HAVE_NVCOMP)
-  target_include_directories(gzstd PRIVATE ${NVCOMP_INCLUDE_DIR})
-endif()
-if(HAVE_NVML)
-  target_compile_definitions(gzstd PRIVATE HAVE_NVML)
-endif()
+### CPU-Only Build
 
-# =====================================================
-#                     Linkage
-# =====================================================
-if(HAVE_NVCOMP)
-  # CUDA runtime: static when BUILD_STATIC, shared otherwise
-  if(BUILD_STATIC)
-    set(_CUDA_RT CUDA::cudart_static)
-  else()
-    set(_CUDA_RT CUDA::cudart)
-  endif()
+```bash
+cmake -B build -DUSE_NVCOMP=OFF
+cmake --build build -j$(nproc)
+```
 
-  # Core link libraries
-  target_link_libraries(gzstd PRIVATE
-    ZSTD::ZSTD
-    Threads::Threads
-    ${_CUDA_RT}
-    ${NVCOMP_LIBRARY})
+No CUDA or GPU dependencies required.
 
-  # nvCOMP static may need additional component libraries
-  if(BUILD_STATIC)
-    if(NVCOMP_BITCOMP_LIBRARY)
-      target_link_libraries(gzstd PRIVATE ${NVCOMP_BITCOMP_LIBRARY})
-    endif()
-    if(NVCOMP_GDEFLATE_LIBRARY)
-      target_link_libraries(gzstd PRIVATE ${NVCOMP_GDEFLATE_LIBRARY})
-    endif()
-    # Static CUDA runtime needs dl and rt on Linux
-    if(UNIX)
-      target_link_libraries(gzstd PRIVATE dl rt)
-    endif()
-  endif()
+## Conda Environment Example
 
-  if(HAVE_NVML)
-    target_link_libraries(gzstd PRIVATE ${NVML_LIBRARY})
-  endif()
-else()
-  target_link_libraries(gzstd PRIVATE
-    ZSTD::ZSTD
-    Threads::Threads)
-endif()
+```bash
+conda create -n gzstd -c conda-forge zstd nvcomp cudatoolkit
+conda activate gzstd
+cmake -B build
+cmake --build build -j$(nproc)
+```
 
-# Static linking: prefer static libstdc++ and libgcc for maximum portability.
-# The resulting binary only needs glibc (2.17+) and the NVIDIA driver at runtime.
-if(BUILD_STATIC AND NOT MSVC)
-  target_link_options(gzstd PRIVATE
-    -static-libgcc
-    -static-libstdc++)
-endif()
+## Deploying to Another Machine
 
-# =====================================================
-#                     RPATH
-# Make ./build/gzstd run cleanly with Conda/system libs.
-# When BUILD_STATIC is ON, RPATH is less important since
-# most dependencies are linked statically.  We still set
-# it for NVML (always shared  part of the driver).
-# =====================================================
-if(UNIX AND NOT APPLE)
-  # Base RPATH entries near the binary
-  set(_RPATH_BASE "$ORIGIN;$ORIGIN/..;$ORIGIN/../lib;$ORIGIN/../lib64;$ORIGIN/lib")
+**Option 1: Install target (recommended)**
+```bash
+cmake --install build --prefix ./dist
+scp -r dist/bin/ user@target:~/gzstd/
+```
 
-  # Conda awareness (optional)
-  if(DEFINED ENV{CONDA_PREFIX})
-    list(APPEND _RPATH_BASE "$ENV{CONDA_PREFIX}/lib" "$ENV{CONDA_PREFIX}/lib64")
-  endif()
+**Option 2: Manual copy**
+```bash
+scp build/gzstd user@target:~/gzstd/
+scp $CONDA_PREFIX/lib/libnvcomp.so.5 user@target:~/gzstd/
+```
 
-  set_target_properties(gzstd PROPERTIES
-    BUILD_RPATH "${_RPATH_BASE}"
-    INSTALL_RPATH "${_RPATH_BASE}")
-endif()
+Both options work because the binary's RPATH includes `$ORIGIN`.
 
-# macOS: use @loader_path to keep the binary relocatable
-if(APPLE)
-  set_target_properties(gzstd PROPERTIES
-    BUILD_RPATH "@loader_path"
-    INSTALL_RPATH "@loader_path")
-endif()
+## Verifying the Build
 
-# =====================================================
-#                    Summary
-# =====================================================
-message(STATUS "\n==== gzstd configure summary ====")
-message(STATUS " CMAKE_BUILD_TYPE : ${CMAKE_BUILD_TYPE}")
-message(STATUS " BUILD_STATIC     : ${BUILD_STATIC}")
-if(HAVE_NVCOMP)
-  message(STATUS " GPU backend     : ENABLED (CUDA ${CUDAToolkit_VERSION})")
-  message(STATUS " nvCOMP include  : ${NVCOMP_INCLUDE_DIR}")
-  message(STATUS " nvCOMP library  : ${NVCOMP_LIBRARY}")
-  if(BUILD_STATIC)
-    message(STATUS " CUDA runtime    : static (cudart_static)")
-    if(NVCOMP_BITCOMP_LIBRARY)
-      message(STATUS " nvCOMP bitcomp  : ${NVCOMP_BITCOMP_LIBRARY}")
-    endif()
-    if(NVCOMP_GDEFLATE_LIBRARY)
-      message(STATUS " nvCOMP gdeflate  : ${NVCOMP_GDEFLATE_LIBRARY}")
-    endif()
-  else()
-    message(STATUS " CUDA runtime    : shared (cudart)")
-  endif()
-  if(HAVE_NVML)
-    message(STATUS " NVML            : ${NVML_LIBRARY} (always shared  driver component)")
-  else()
-    message(STATUS " NVML            : not found (free-VRAM fallback)")
-  endif()
-else()
-  message(STATUS " GPU backend     : DISABLED")
-endif()
-message(STATUS " Zstd            : target ZSTD::ZSTD")
-message(STATUS " C++ Standard    : ${CMAKE_CXX_STANDARD}")
-if(BUILD_STATIC)
-  message(STATUS " Linking         : static (portable binary)")
-  message(STATUS " Runtime deps    : glibc, NVIDIA driver (libnvidia-ml.so)")
-else()
-  message(STATUS " Linking         : shared (default)")
-endif()
-message(STATUS "================================\n")
+```bash
+# Check version and GPU support
+./build/gzstd --version
+
+# Run the test suite
+./gzstd-test.sh
+
+# Run benchmarks
+./gzstd-benchmark.sh
+```
