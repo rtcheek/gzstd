@@ -105,27 +105,87 @@ fi
 
 # Detect hardware
 NCPU=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-HAS_GPU=false
+HAS_GPU_BUILD=false
 if "$GZSTD" --version 2>&1 | grep -q "nvCOMP"; then
-  HAS_GPU=true
+  HAS_GPU_BUILD=true
 fi
 
-if $GPU_ONLY && ! $HAS_GPU; then
+if $GPU_ONLY && ! $HAS_GPU_BUILD; then
   echo "ERROR: --gpu-only requested but gzstd was built without nvCOMP"
   exit 1
 fi
 
-echo "============================================================"
-echo " gzstd benchmark suite"
-echo "============================================================"
-echo " Binary     : $GZSTD"
-echo " Version    : $($GZSTD --version 2>&1 | head -1)"
-echo " Data dir   : $DATA_DIR"
-echo " Iterations : $ITERATIONS"
-echo " CPUs       : $NCPU"
-echo " GPU        : $HAS_GPU"
-echo " Output     : $OUTPUT"
-echo "============================================================"
+GPU_SUMMARY="none detected"
+GPU_DRIVER=""
+GPU_DETAILS=()
+if command -v nvidia-smi >/dev/null 2>&1; then
+  mapfile -t GPU_DETAILS < <(nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || true)
+  if [[ ${#GPU_DETAILS[@]} -gt 0 ]]; then
+    GPU_SUMMARY="${#GPU_DETAILS[@]} detected"
+    GPU_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+  fi
+elif command -v lspci >/dev/null 2>&1; then
+  mapfile -t GPU_DETAILS < <(lspci | grep -Ei 'vga|3d|display' | grep -Ei 'nvidia|amd|intel' || true)
+  if [[ ${#GPU_DETAILS[@]} -gt 0 ]]; then
+    GPU_SUMMARY="${#GPU_DETAILS[@]} detected"
+  fi
+fi
+
+#----------------------------------------------------------------------
+# ANSI / display helpers
+#----------------------------------------------------------------------
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+CYAN=$'\033[36m'
+WHITE=$'\033[37m'
+ORANGE=$'\033[38;5;208m'
+RESET=$'\033[0m'
+CLEAR_LINE=$'\033[2K'
+COLS=$(tput cols 2>/dev/null || echo 80)
+STATUS_LINE=""
+CURRENT_GZSTD_PCT=""
+
+repeat_char() {
+  local char="$1" width="$2"
+  printf '%*s' "$width" '' | tr ' ' "$char"
+}
+
+print_separator() {
+  echo "${DIM}$(repeat_char '-' "$COLS")${RESET}"
+}
+
+render_status_line() {
+  local suffix=""
+  if [[ -n "${CURRENT_GZSTD_PCT:-}" ]]; then
+    suffix="  ${DIM}|${RESET} ${ORANGE}gzstd: ${CURRENT_GZSTD_PCT}%${RESET}"
+  fi
+  printf "\r${CLEAR_LINE}%s%s" "$STATUS_LINE" "$suffix" >&2
+}
+
+clear_status_line() {
+  printf "\r${CLEAR_LINE}" >&2
+}
+
+print_separator
+echo "${BOLD}${WHITE} gzstd benchmark suite v0.11.31${RESET}"
+print_separator
+echo " ${WHITE}Binary${RESET}     : ${YELLOW}$GZSTD${RESET}"
+echo " ${WHITE}Version${RESET}    : ${CYAN}$($GZSTD --version 2>&1 | head -1)${RESET}"
+echo " ${WHITE}Data dir${RESET}   : ${YELLOW}$DATA_DIR${RESET}"
+echo " ${WHITE}Iterations${RESET} : ${GREEN}$ITERATIONS${RESET}"
+echo " ${WHITE}CPUs${RESET}       : ${GREEN}$NCPU${RESET}"
+echo " ${WHITE}GPU build${RESET}  : ${ORANGE}$HAS_GPU_BUILD${RESET}"
+echo " ${WHITE}GPUs${RESET}       : ${YELLOW}$GPU_SUMMARY${RESET}"
+if [[ -n "$GPU_DRIVER" ]]; then
+  echo " ${WHITE}Driver${RESET}     : ${CYAN}$GPU_DRIVER${RESET}"
+fi
+for gpu in "${GPU_DETAILS[@]}"; do
+  echo " ${WHITE}GPU detail${RESET} : ${YELLOW}$gpu${RESET}"
+done
+echo " ${WHITE}Output${RESET}     : ${YELLOW}$OUTPUT${RESET}"
+print_separator
 echo ""
 
 #----------------------------------------------------------------------
@@ -137,10 +197,10 @@ CONFIGS=()
 
 # Baseline: defaults
 if ! $GPU_ONLY && ! $HYBRID_ONLY; then
-  CONFIGS+=("cpu-default|--cpu-only|--cpu-only")
+  CONFIGS+=("cpu-only|--cpu-only|--cpu-only")
 fi
 
-if $HAS_GPU && ! $CPU_ONLY; then
+if $HAS_GPU_BUILD && ! $CPU_ONLY; then
   if ! $HYBRID_ONLY; then
     CONFIGS+=("gpu-only|--gpu-only|--gpu-only")
   fi
@@ -150,7 +210,7 @@ if $HAS_GPU && ! $CPU_ONLY; then
 fi
 
 # Sweep GPU batch sizes
-if $SWEEP_BATCHES && $HAS_GPU && ! $CPU_ONLY; then
+if $SWEEP_BATCHES && $HAS_GPU_BUILD && ! $CPU_ONLY; then
   if $QUICK; then
     BATCH_SIZES="8 64 256"
   else
@@ -167,7 +227,7 @@ if $SWEEP_BATCHES && $HAS_GPU && ! $CPU_ONLY; then
 fi
 
 # Sweep GPU stream counts
-if $SWEEP_STREAMS && $HAS_GPU && ! $CPU_ONLY; then
+if $SWEEP_STREAMS && $HAS_GPU_BUILD && ! $CPU_ONLY; then
   if $QUICK; then
     STREAM_COUNTS="1 3 6"
   else
@@ -216,7 +276,7 @@ if $SWEEP_LEVELS && ! $GPU_ONLY && ! $HYBRID_ONLY; then
 fi
 
 # Combined GPU sweeps: batch x streams (if both enabled)
-if $SWEEP_BATCHES && $SWEEP_STREAMS && $HAS_GPU && ! $CPU_ONLY && ! $QUICK; then
+if $SWEEP_BATCHES && $SWEEP_STREAMS && $HAS_GPU_BUILD && ! $CPU_ONLY && ! $QUICK; then
   for b in 16 32 64; do
     for s in 2 4 6; do
       if ! $HYBRID_ONLY; then
@@ -234,7 +294,7 @@ if [[ ${#CONFIGS[@]} -eq 0 ]]; then
   exit 1
 fi
 
-echo "Configurations to test: ${#CONFIGS[@]}"
+echo "${BOLD}${WHITE}Configurations to test:${RESET} ${CYAN}${#CONFIGS[@]}${RESET}"
 echo ""
 
 #----------------------------------------------------------------------
@@ -253,9 +313,9 @@ if [[ ${#TEST_FILES[@]} -eq 0 ]]; then
   exit 1
 fi
 
-echo "Test files:"
+echo "${BOLD}${WHITE}Test files:${RESET}"
 for f in "${TEST_FILES[@]}"; do
-  echo "  $(basename "$f")  $(numfmt --to=iec-i --suffix=B $(stat -c%s "$f"))"
+  echo "  ${YELLOW}$(basename "$f")${RESET}  ${GREEN}$(numfmt --to=iec-i --suffix=B $(stat -c%s "$f"))${RESET}"
 done
 echo ""
 
@@ -264,20 +324,15 @@ echo ""
 #----------------------------------------------------------------------
 run_timed() {
   local start end elapsed rc
-  # Sync and drop caches if possible (Linux)
   sync 2>/dev/null || true
   if [[ -w /proc/sys/vm/drop_caches ]]; then
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
   fi
 
   start=$(date +%s.%N)
-  # Run the command in background; stderr goes to log file for progress scraping.
-  # --progress forces the progress meter even though stderr is not a TTY.
   "$@" --progress 2>"$TMPDIR/last_stderr.log" &
   local pid=$!
 
-  # Poll the stderr log for gzstd's progress percentage while the process runs.
-  # gzstd writes lines like: [45.2%] in:3.14 GiB out:1.23 GiB in_rate:1.50 GiB/s
   while kill -0 "$pid" 2>/dev/null; do
     sleep 0.3
     if [[ -s "$TMPDIR/last_stderr.log" ]]; then
@@ -286,16 +341,17 @@ run_timed() {
                   | grep -oP '\[\K[0-9]+\.[0-9]+(?=%)' 2>/dev/null \
                   | tail -1)
       if [[ -n "$gzstd_pct" ]]; then
-        printf "\r${CLEAR_LINE}    ${DIM}gzstd: %s%%${RESET}" "$gzstd_pct" >&2
+        CURRENT_GZSTD_PCT="$gzstd_pct"
+        render_status_line
       fi
     fi
   done
   wait "$pid" 2>/dev/null || rc=$?
-  printf "\r${CLEAR_LINE}" >&2
+  CURRENT_GZSTD_PCT=""
+  render_status_line
 
   end=$(date +%s.%N)
 
-  # If command failed, show the full command and stderr for debugging
   if [[ ${rc:-0} -ne 0 ]]; then
     echo "" >&2
     echo "  [DEBUG] FAILED (rc=$rc): $*" >&2
@@ -304,7 +360,6 @@ run_timed() {
     fi
   fi
 
-  # Float subtraction  try python3, then bc, then awk
   elapsed=$(python3 -c "print(f'{$end - $start:.4f}')" 2>/dev/null) \
     || elapsed=$(echo "$end - $start" | bc -l 2>/dev/null) \
     || elapsed=$(awk "BEGIN{printf \"%.4f\", $end - $start}" 2>/dev/null) \
@@ -354,18 +409,6 @@ total_tests=$(( total_configs * total_files * decomp_mult ))
 test_num=0
 BENCH_START=$(date +%s.%N)
 
-#----------------------------------------------------------------------
-# ANSI helpers
-#----------------------------------------------------------------------
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-CYAN=$'\033[36m'
-WHITE=$'\033[37m'
-RESET=$'\033[0m'
-CLEAR_LINE=$'\033[2K'
-COLS=$(tput cols 2>/dev/null || echo 80)
 
 draw_bar() {
   # draw_bar <fraction> <width> [<fill_char>] [<empty_char>]
@@ -393,7 +436,6 @@ format_eta() {
 
 print_status() {
   local num="$1" total="$2" label="$3" file="$4" mode="$5"
-  local last_time="${6:-}" last_thr="${7:-}"
 
   local pct=0
   if (( total > 0 )); then
@@ -401,7 +443,6 @@ print_status() {
   fi
   local frac=$(python3 -c "print(f'{$num/$total:.4f}')" 2>/dev/null || echo "0")
 
-  # Calculate ETA
   local now elapsed eta_s eta_str
   now=$(date +%s.%N)
   elapsed=$(python3 -c "print(f'{$now - $BENCH_START:.1f}')" 2>/dev/null || echo "0")
@@ -416,60 +457,48 @@ else: print(0)
   fi
   eta_str=$(format_eta "$eta_s")
 
-  # Overall progress bar
-  local bar_width=30
-  local bar=$(draw_bar "$frac" "$bar_width")
-
-  # Build the display
-  printf "\r${CLEAR_LINE}"
-  printf "${BOLD}${CYAN}[%d/%d]${RESET} " "$num" "$total"
-  printf "${GREEN}%s${RESET} " "$bar"
-  printf "${BOLD}%s%%${RESET} " "$pct"
-
-  # Current test info
-  printf "${DIM}│${RESET} "
-  printf "${YELLOW}%-14s${RESET} " "$label"
-  printf "%-18s " "$file"
+  local line=""
+  printf -v line "%s%s[%d/%d]%s %s%s%%%s "     "$BOLD" "$CYAN" "$num" "$total" "$RESET"     "$BOLD" "$pct" "$RESET"
+  line+="${DIM}|${RESET} "
+  printf -v line "%s%s%-14s%s %-18s "     "$line" "$YELLOW" "$label" "$RESET" "$file"
   if [[ "$mode" == "compress" ]]; then
-    printf "${CYAN}⟫ compress${RESET}"
+    line+="${CYAN}>> compress${RESET}"
   else
-    printf "${GREEN}⟪ decompress${RESET}"
+    line+="${GREEN}<< decompress${RESET}"
   fi
+  line+="  ${DIM}ETA ${eta_str}${RESET}"
 
-  # Last result
-  if [[ -n "$last_time" ]]; then
-    printf "  ${DIM}│${RESET} ${WHITE}${last_time}s${RESET} ${DIM}(${last_thr} GiB/s)${RESET}"
-  fi
-
-  # ETA
-  printf "  ${DIM}ETA %s${RESET}" "$eta_str"
+  STATUS_LINE="$line"
+  CURRENT_GZSTD_PCT=""
+  render_status_line
 }
 
 # Print a completed result line (scrolls up)
 print_result() {
   local label="$1" file="$2" mode="$3" time="$4" thr="$5" ratio="$6"
   local icon
+
+  clear_status_line
+
   if [[ "$mode" == "compress" ]]; then
-    icon="${CYAN}⟫${RESET}"
+    icon="${CYAN}>>${RESET}"
   else
-    icon="${GREEN}⟪${RESET}"
+    icon="${GREEN}<<${RESET}"
   fi
 
-  printf "\r${CLEAR_LINE}"
-  printf "  ${DIM}✓${RESET} %-16s %-20s %s %-10s " "$label" "$file" "$icon" "$mode"
+  printf "${CLEAR_LINE}"
+  printf "  ${BOLD}${GREEN}✓${RESET} %-16s %-20s %s %-10s " "$label" "$file" "$icon" "$mode"
   printf "${BOLD}%8ss${RESET}  %s GiB/s" "$time" "$thr"
   if [[ "$mode" == "compress" && -n "$ratio" && "$ratio" != "?" ]]; then
-    printf "  ${DIM}(%s%%)${RESET}" "$ratio"
+    printf "  ${ORANGE}(%s%%)${RESET}" "$ratio"
   fi
   echo ""
 }
 
+
 echo ""
 echo "${BOLD}Starting benchmark: ${total_tests} tests across ${total_configs} configs × ${total_files} files${RESET}"
-echo "${DIM}$(printf '─%.0s' $(seq 1 $COLS))${RESET}"
-
-last_time=""
-last_thr=""
+print_separator
 
 for config_str in "${CONFIGS[@]}"; do
   IFS='|' read -r label comp_flags decomp_flags <<< "$config_str"
@@ -481,7 +510,7 @@ for config_str in "${CONFIGS[@]}"; do
 
     #--- Compression benchmark ---
     test_num=$((test_num + 1))
-    print_status "$test_num" "$total_tests" "$label" "$file_base" "compress" "$last_time" "$last_thr"
+    print_status "$test_num" "$total_tests" "$label" "$file_base" "compress"
 
     times_c=()
     for ((i=1; i<=ITERATIONS; i++)); do
@@ -506,8 +535,6 @@ for config_str in "${CONFIGS[@]}"; do
     thr_c=$(throughput_gibs "$file_bytes" "$median_c")
     ratio=$(python3 -c "print(f'{$comp_bytes * 100 / $file_bytes:.1f}')" 2>/dev/null || echo "?")
 
-    last_time="$median_c"
-    last_thr="$thr_c"
 
     echo -e "${label}\t${file_base}\tcompress\t${file_bytes}\t${comp_bytes}\t${median_c}\t${thr_c}\t${ratio}" >> "$RESULTS_FILE"
     print_result "$label" "$file_base" "compress" "$median_c" "$thr_c" "$ratio"
@@ -515,7 +542,7 @@ for config_str in "${CONFIGS[@]}"; do
     #--- Decompression benchmark ---
     if $DO_DECOMPRESS; then
       test_num=$((test_num + 1))
-      print_status "$test_num" "$total_tests" "$label" "$file_base" "decompress" "$last_time" "$last_thr"
+      print_status "$test_num" "$total_tests" "$label" "$file_base" "decompress"
 
       decomp_out="$TMPDIR/decompressed.bin"
       times_d=()
@@ -534,8 +561,6 @@ for config_str in "${CONFIGS[@]}"; do
       median_d=$(median "${times_d[@]}")
       thr_d=$(throughput_gibs "$file_bytes" "$median_d")
 
-      last_time="$median_d"
-      last_thr="$thr_d"
 
       echo -e "${label}\t${file_base}\tdecompress\t${file_bytes}\t${comp_bytes}\t${median_d}\t${thr_d}\t${ratio}" >> "$RESULTS_FILE"
       print_result "$label" "$file_base" "decompress" "$median_d" "$thr_d" "$ratio"
@@ -562,43 +587,46 @@ total_elapsed=$(python3 -c "
 import time; print(f'{time.time() - $BENCH_START:.1f}')
 " 2>/dev/null || echo "?")
 printf "\r${CLEAR_LINE}"
-echo "${DIM}$(printf '─%.0s' $(seq 1 $COLS))${RESET}"
+print_separator
 echo "${BOLD}${GREEN}✓ Benchmark complete${RESET}  ${total_tests} tests in ${total_elapsed}s"
 echo ""
 
 #----------------------------------------------------------------------
 # Print results table
 #----------------------------------------------------------------------
-echo "${BOLD}============================================================${RESET}"
-echo "${BOLD} BENCHMARK RESULTS${RESET}"
-echo "${BOLD}============================================================${RESET}"
-echo ""
+print_separator
+echo "${BOLD}${WHITE} BENCHMARK RESULTS${RESET}"
 
-# Compression results
-echo "${BOLD}${CYAN}── COMPRESSION ──${RESET}"
-printf "${DIM}%-22s %-20s %10s %10s %8s %8s${RESET}\n" \
+cfg_rule=$(repeat_char '-' 22)
+file_rule=$(repeat_char '-' 20)
+size_rule=$(repeat_char '-' 10)
+time_rule=$(repeat_char '-' 10)
+thr_rule=$(repeat_char '-' 8)
+ratio_rule=$(repeat_char '-' 8)
+
+echo ""
+echo "${BOLD}${CYAN} COMPRESSION${RESET}"
+printf "${DIM}${WHITE}%-22s %-20s %10s %10s %8s %8s${RESET}\n" \
        "Config" "File" "Size" "Time(s)" "GiB/s" "Ratio%"
 printf "${DIM}%-22s %-20s %10s %10s %8s %8s${RESET}\n" \
-       "──────" "────" "────" "───────" "─────" "──────"
-grep "compress[^_]" "$RESULTS_FILE" | tail -n +1 | while IFS=$'\t' read -r cfg file mode fbytes cbytes secs thr ratio; do
-  [[ "$mode" == "compress" ]] || continue
+       "$cfg_rule" "$file_rule" "$size_rule" "$time_rule" "$thr_rule" "$ratio_rule"
+awk -F '\t' 'NR > 1 && $3 == "compress" { print }' "$RESULTS_FILE" | while IFS=$'\t' read -r cfg file mode fbytes cbytes secs thr ratio; do
   fsize_h=$(numfmt --to=iec-i --suffix=B "$fbytes" 2>/dev/null || echo "${fbytes}B")
-  printf "%-22s %-20s %10s %8.4f %8.3f %7s%%\n" \
+  printf "${YELLOW}%-22s${RESET} ${WHITE}%-20s${RESET} ${DIM}%10s${RESET} ${CYAN}%10.4f${RESET} ${GREEN}%8.3f${RESET} ${ORANGE}%7s%%${RESET}\n" \
          "$cfg" "$file" "$fsize_h" "$secs" "$thr" "$ratio"
 done
 
 echo ""
 
-# Decompression results
 if $DO_DECOMPRESS; then
-  echo "${BOLD}${GREEN}── DECOMPRESSION ──${RESET}"
-  printf "${DIM}%-22s %-20s %10s %10s %8s${RESET}\n" \
+  echo "${BOLD}${GREEN} DECOMPRESSION${RESET}"
+  printf "${DIM}${WHITE}%-22s %-20s %10s %10s %8s${RESET}\n" \
          "Config" "File" "Size" "Time(s)" "GiB/s"
-  printf "%-22s %-20s %10s %10s %8s\n" \
-         "------" "----" "----" "-------" "-----"
-  grep "decompress" "$RESULTS_FILE" | while IFS=$'\t' read -r cfg file mode fbytes cbytes secs thr ratio; do
+  printf "${DIM}%-22s %-20s %10s %10s %8s${RESET}\n" \
+         "$cfg_rule" "$file_rule" "$size_rule" "$time_rule" "$thr_rule"
+  awk -F '\t' 'NR > 1 && $3 == "decompress" { print }' "$RESULTS_FILE" | while IFS=$'\t' read -r cfg file mode fbytes cbytes secs thr ratio; do
     fsize_h=$(numfmt --to=iec-i --suffix=B "$fbytes" 2>/dev/null || echo "${fbytes}B")
-    printf "%-22s %-20s %10s %8.4f %8.3f\n" \
+    printf "${YELLOW}%-22s${RESET} ${WHITE}%-20s${RESET} ${DIM}%10s${RESET} ${CYAN}%10.4f${RESET} ${GREEN}%8.3f${RESET}\n" \
            "$cfg" "$file" "$fsize_h" "$secs" "$thr"
   done
   echo ""
@@ -607,11 +635,11 @@ fi
 #----------------------------------------------------------------------
 # Find optimal configurations
 #----------------------------------------------------------------------
-echo "${BOLD}${YELLOW}── OPTIMAL CONFIGURATIONS ──${RESET}"
+print_separator
+echo "${BOLD}${YELLOW} OPTIMAL CONFIGURATIONS${RESET}"
 echo ""
 
-# Best compression throughput per file
-echo "Best compression throughput:"
+echo "${BOLD}${CYAN}Best compression throughput:${RESET}"
 for test_file in "${TEST_FILES[@]}"; do
   file_base=$(basename "$test_file")
   best=$(grep "compress[^_]" "$RESULTS_FILE" | grep "$file_base" | grep "compress" |
@@ -619,14 +647,13 @@ for test_file in "${TEST_FILES[@]}"; do
   if [[ -n "$best" ]]; then
     cfg=$(echo "$best" | cut -f1)
     thr=$(echo "$best" | cut -f7)
-    printf "  %-20s -> %-22s  %.3f GiB/s\n" "$file_base" "$cfg" "$thr"
+    printf "  ${WHITE}%-20s${RESET} ${DIM}->${RESET} ${YELLOW}%-22s${RESET} ${GREEN}%.3f GiB/s${RESET}\n" "$file_base" "$cfg" "$thr"
   fi
 done
 
 echo ""
-
 if $DO_DECOMPRESS; then
-  echo "Best decompression throughput:"
+  echo "${BOLD}${GREEN}Best decompression throughput:${RESET}"
   for test_file in "${TEST_FILES[@]}"; do
     file_base=$(basename "$test_file")
     best=$(grep "decompress" "$RESULTS_FILE" | grep "$file_base" |
@@ -634,14 +661,13 @@ if $DO_DECOMPRESS; then
     if [[ -n "$best" ]]; then
       cfg=$(echo "$best" | cut -f1)
       thr=$(echo "$best" | cut -f7)
-      printf "  %-20s -> %-22s  %.3f GiB/s\n" "$file_base" "$cfg" "$thr"
+      printf "  ${WHITE}%-20s${RESET} ${DIM}->${RESET} ${YELLOW}%-22s${RESET} ${GREEN}%.3f GiB/s${RESET}\n" "$file_base" "$cfg" "$thr"
     fi
   done
   echo ""
 fi
 
-# Best compression ratio per file
-echo "Best compression ratio:"
+echo "${BOLD}${ORANGE}Best compression ratio:${RESET}"
 for test_file in "${TEST_FILES[@]}"; do
   file_base=$(basename "$test_file")
   best=$(grep "compress[^_]" "$RESULTS_FILE" | grep "$file_base" | grep "compress" |
@@ -649,18 +675,17 @@ for test_file in "${TEST_FILES[@]}"; do
   if [[ -n "$best" ]]; then
     cfg=$(echo "$best" | cut -f1)
     ratio=$(echo "$best" | cut -f8)
-    printf "  %-20s -> %-22s  %s%%\n" "$file_base" "$cfg" "$ratio"
+    printf "  ${WHITE}%-20s${RESET} ${DIM}->${RESET} ${YELLOW}%-22s${RESET} ${ORANGE}%s%%${RESET}\n" "$file_base" "$cfg" "$ratio"
   fi
 done
 
 echo ""
-
 #----------------------------------------------------------------------
 # Write JSON output
 #----------------------------------------------------------------------
 echo "Writing JSON results to $OUTPUT..."
 GZSTD_VER=$("$GZSTD" --version 2>&1 | head -1)
-if $HAS_GPU; then GPU_JSON="True"; else GPU_JSON="False"; fi
+if $HAS_GPU_BUILD; then GPU_JSON="True"; else GPU_JSON="False"; fi
 python3 -c "
 import json, sys
 
@@ -698,6 +723,6 @@ print(f'  {len(results)} results written.')
 " 2>&1 || echo "  (JSON output failed)"
 
 echo ""
-echo "============================================================"
-echo " Benchmark complete!"
-echo "============================================================"
+print_separator
+echo "${BOLD}${WHITE} Benchmark complete!${RESET}"
+print_separator

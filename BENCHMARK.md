@@ -1,109 +1,256 @@
 # gzstd Benchmark Suite
 
+## Overview
+
+`gzstd-benchmark.sh` is an automated benchmark harness for `gzstd`. It can benchmark CPU-only, GPU-only, and hybrid modes, sweep multiple tuning parameters, measure both compression and decompression throughput, verify decompression correctness, print a live progress view, and emit machine-readable JSON results.
+
+The script auto-discovers `gzstd` in this order:
+
+1. `$GZSTD` environment variable
+2. `./gzstd`
+3. `./build/gzstd`
+
+Test data defaults to `./gzstd-testdata`.
+
 ## Quick Start
 
 ```bash
 # 1. Generate test data (512 MiB per file, ~2.5 GiB total)
 ./gzstd-gendata.sh ./gzstd-testdata 512
 
-# 2. Run quick benchmark (reduced sweep, 1 iteration)
+# 2. Run a quick sweep (reduced matrix, 1 iteration)
 ./gzstd-benchmark.sh --quick --sweep-all
 
-# 3. Run full benchmark (3 iterations per config)
+# 3. Run a full sweep (default: 3 iterations per config)
 ./gzstd-benchmark.sh --sweep-all
 ```
 
-The benchmark script automatically finds `gzstd` in `./gzstd` or `./build/gzstd`.
-Test data defaults to `./gzstd-testdata`. Override with `--gzstd PATH` or `--data-dir DIR` if needed.
+## What the Script Benchmarks
+
+The harness can test:
+
+- CPU-only mode
+- GPU-only mode
+- Hybrid CPU+GPU mode
+- GPU batch sizes
+- GPU stream counts
+- CPU thread counts
+- CPU compression levels
+- Optional decompression performance
 
 ## Test Data
 
-`gzstd-gendata.sh` creates 5 files with different compressibility:
+`gzstd-gendata.sh` creates five files with different compressibility profiles:
 
 | File | Description | Typical Ratio |
-|------|-------------|---------------|
+|---|---|---:|
 | `high_compress.bin` | Repeated log lines | ~0.1% |
 | `medium_compress.bin` | English-like text | ~30-40% |
 | `low_compress.bin` | Structured random | ~85-95% |
 | `mixed.bin` | Alternating text/binary | ~50-60% |
 | `zeros.bin` | All zeros | ~0.01% |
 
-## Benchmark Sweeps
+## Actual Sweep Values Used by `gzstd-benchmark.sh`
 
-| Flag | What it tests | Default values |
-|------|--------------|----------------|
-| `--sweep-batches` | GPU batch sizes | 4, 8, 16, 32, 64, 128 |
-| `--sweep-streams` | GPU streams per device | 1, 2, 3, 4, 6, 8 |
-| `--sweep-threads` | CPU thread counts | 1, 2, 4, 8, 16, N-1 |
-| `--sweep-levels` | Compression levels | 1, 3, 6, 9, 12, 15, 19 |
-| `--sweep-all` | All of the above |  |
+### Batch sizes
 
-## Targeted Testing
+- Quick mode: `8, 64, 256`
+- Full mode: `4, 8, 16, 32, 64, 128, 256, 512, 1024`
+
+### Stream counts
+
+- Quick mode: `1, 3, 6`
+- Full mode: `1, 2, 3, 4, 6, 8`
+
+### Thread counts
+
+- Quick mode: `1, N/2, N-1` (clamped to valid values)
+- Full mode: `1, 2, 4, 8, 16, N-1` (where applicable)
+
+Thread sweeps now add both:
+
+- CPU-only thread-count variants such as `cpu-T8`
+- Hybrid baseline thread-count variants such as `hyb-T8`
+
+### Compression levels
+
+- Quick mode: `1, 6, 19`
+- Full mode: `1, 3, 6, 9, 12, 15, 19`
+
+Compression level sweeps remain CPU-only.
+
+### Combined GPU sweeps
+
+When both `--sweep-batches` and `--sweep-streams` are enabled in full mode, the script also tests these combined GPU tuning points:
+
+- batches: `16, 32, 64`
+- streams: `2, 4, 6`
+
+for both GPU-only (`gpu-b32s4`) and hybrid (`hyb-b32s4`) labels when those modes are enabled.
+
+## Usage
 
 ```bash
-# Find optimal GPU batch size for your hardware
+./gzstd-benchmark.sh [options]
+```
+
+### Options
+
+```text
+--gzstd PATH          Path to gzstd binary (default: auto-discover)
+--data-dir DIR        Directory with test files (default: ./gzstd-testdata)
+--output FILE         JSON output file (default: benchmark-results.json)
+--iterations N        Runs per config, reports median (default: 3)
+--files PATTERN       Only test files matching glob (default: *)
+--quick               Reduced sweep and 1 iteration
+--gpu-only            Only test GPU-only configs
+--cpu-only            Only test CPU-only configs
+--hybrid-only         Only test hybrid configs
+--sweep-batches       Sweep GPU batch sizes
+--sweep-streams       Sweep GPU stream counts
+--sweep-threads       Sweep CPU thread counts for CPU-only and hybrid baseline configs
+--sweep-levels        Sweep CPU compression levels
+--sweep-all           Enable all sweeps
+--no-decompress       Skip decompression benchmarks
+--help, -h            Show this help
+```
+
+## Common Benchmark Workflows
+
+### Find the best GPU batch size
+
+```bash
 ./gzstd-benchmark.sh --sweep-batches
+```
 
-# Find optimal GPU stream count
+### Find the best GPU stream count
+
+```bash
 ./gzstd-benchmark.sh --sweep-streams
+```
 
-# Test combined batch × stream configurations
+### Explore combined batch x stream configurations
+
+```bash
 ./gzstd-benchmark.sh --sweep-batches --sweep-streams
+```
 
-# CPU thread scaling only
-./gzstd-benchmark.sh --sweep-threads --cpu-only
+### CPU thread scaling only
 
-# Compression only (skip decompress, faster)
+```bash
+./gzstd-benchmark.sh --cpu-only --sweep-threads
+```
+
+### Hybrid thread scaling only
+
+```bash
+./gzstd-benchmark.sh --hybrid-only --sweep-threads
+```
+
+### CPU compression-level sweep
+
+```bash
+./gzstd-benchmark.sh --cpu-only --sweep-levels
+```
+
+### Compression only (skip decompression)
+
+```bash
 ./gzstd-benchmark.sh --sweep-all --no-decompress
+```
 
-# Single file only
+### Single file only
+
+```bash
 ./gzstd-benchmark.sh --sweep-all --files "medium_compress.bin"
+```
 
-# Larger test data for more stable measurements
+### Larger data set for more stable measurements
+
+```bash
 ./gzstd-gendata.sh ./gzstd-testdata-2g 2048
 ./gzstd-benchmark.sh --data-dir ./gzstd-testdata-2g --sweep-all --iterations 5
+```
 
-# Use a specific gzstd binary (e.g., comparing two versions)
+### Compare two `gzstd` builds
+
+```bash
 ./gzstd-benchmark.sh --gzstd ./build-old/gzstd --output old-results.json
 ./gzstd-benchmark.sh --gzstd ./build/gzstd --output new-results.json
 ```
 
-## Binary Auto-Discovery
-
-The script searches for the gzstd binary in this order:
-
-1. `$GZSTD` environment variable (if set)
-2. `./gzstd` (current directory)
-3. `./build/gzstd` (CMake build directory)
-4. `--gzstd PATH` (explicit override)
-
 ## Output
 
-Results are printed as a table and saved to `benchmark-results.json`:
+The script prints:
 
-```
---- COMPRESSION ---
-Config                 File                       Size    Time(s)   GiB/s  Ratio%
-------                 ----                       ----    -------   -----  ------
-cpu-default            medium_compress.bin       512MiB      1.234   0.406   34.2%
-gpu-default            medium_compress.bin       512MiB      0.567   0.884   34.2%
-gpu-batch32            medium_compress.bin       512MiB      0.498   1.006   34.2%
+- a startup summary,
+- the discovered test files,
+- a live progress line with ETA,
+- one completed-result line per test,
+- a compression summary table,
+- an optional decompression summary table,
+- best-throughput and best-ratio summaries,
+- and JSON output written to the file named by `--output`.
+
+### Example result shape
+
+```text
+-- COMPRESSION --
+Config                 File                       Size    Time(s)    GiB/s   Ratio%
+------                 ----                       ----    -------    -----   ------
+cpu-default            medium_compress.bin      512MiB     1.2340    0.406    34.2%
+gpu-only               medium_compress.bin      512MiB     0.5670    0.884    34.2%
+gpu-batch32            medium_compress.bin      512MiB     0.4980    1.006    34.2%
 ...
-
---- OPTIMAL CONFIGURATIONS ---
-Best compression throughput:
-  medium_compress.bin  -> gpu-batch32               1.006 GiB/s
-Best decompression throughput:
-  medium_compress.bin  -> gpu-default               2.341 GiB/s
 ```
 
-During each gzstd run, the script displays live progress from gzstd's progress meter.
+### JSON structure
 
-## Tips
+The JSON payload contains:
 
-- **Larger files** give more stable measurements (less noise from startup overhead)
-- **More iterations** (5+) give more reliable medians
-- **Drop caches**  the script attempts this automatically (needs root)
-- **Warm GPU**  first run may be slower due to GPU initialization; the median handles this
-- **Shared machines**  benchmark numbers can vary 10-15% depending on other users' load; run back-to-back comparisons for reliable deltas
-- The script verifies decompression correctness via `diff` on the last iteration
+- `gzstd_version`
+- `system.cpus`
+- `system.has_gpu`
+- `iterations`
+- `options.*`
+- `results[]`
+
+Each result row includes:
+
+- `config`
+- `file`
+- `mode`
+- `file_bytes`
+- `comp_bytes`
+- `median_secs`
+- `throughput_gibs`
+- `ratio_pct`
+
+## Notes and Benchmarking Tips
+
+- Larger files produce more stable results because startup overhead matters less.
+- More iterations (for example `5`) usually give more reliable medians.
+- The script attempts to drop Linux page cache when permitted, but it continues if that is unavailable.
+- The first GPU run can be slower due to device/runtime initialization.
+- On shared systems, back-to-back A/B comparisons are usually more meaningful than absolute numbers.
+- Decompression correctness is verified with `diff` on the final iteration for each config/file pair.
+
+## Revision Notes for This Benchmark Script
+
+This section replaces a standalone benchmark-script changelog for this update.
+
+### What changed in this revision
+
+- Synchronized the documented sweep values with the actual script behavior.
+- Clarified that compression-level sweeps are CPU-only.
+- Expanded `--sweep-threads` so it can benchmark hybrid baseline thread counts in addition to CPU-only thread counts.
+- Replaced the old `--help` extraction approach with an explicit help block so usage text stays accurate.
+- Made GPU capability detection more tolerant of version-banner wording by checking for `nvCOMP`, `CUDA`, or `GPU` tokens.
+- Reworked progress parsing so it does not depend on `grep -P`.
+- Improved median calculation so even-sized sample sets are averaged correctly.
+- Added more explicit validation for incompatible mode flags and invalid iteration counts.
+- Expanded JSON metadata to record the selected sweep options.
+
+### Why these changes were made
+
+The previous benchmark script and benchmark documentation had drifted apart in a few places, especially around batch-size and compression-level sweep values. The earlier script also limited thread sweeps to CPU-only mode, which made it harder to compare hybrid thread-scaling behavior. This revision aligns the user-facing documentation with the implementation and broadens the benchmark matrix in a controlled way.
