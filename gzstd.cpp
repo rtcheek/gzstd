@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.35";
+static constexpr const char * GZSTD_VERSION = "0.11.36";
 //
 // Architecture overview:
 //
@@ -1192,13 +1192,21 @@ public:
     return true;
   }
 
-  // Greedy pop: wait until the queue has max_n items OR producer is done,
-  // then take everything available up to max_n.  This maximizes batch size
-  // for GPU kernels where per-launch overhead is expensive.
-  bool pop_batch_greedy(size_t max_n, std::vector<Task> & out)
+  // Greedy pop: wait until the queue has at least min_n items (default: max_n)
+  // OR producer is done, then take everything available up to max_n.
+  //
+  // When min_n == max_n (default): maximizes batch size for GPU kernels where
+  // per-launch overhead is expensive.  Used for compress.
+  //
+  // When min_n < max_n: starts processing sooner with partial batches.  Used
+  // for decompress where 8 GPUs blocking for full batches serializes the
+  // pipeline — each GPU drains the queue and others wait for the reader to
+  // refill.  With min_n=1, GPUs grab whatever is available immediately.
+  bool pop_batch_greedy(size_t max_n, std::vector<Task> & out, size_t min_n = 0)
   {
+    if (min_n == 0) min_n = max_n;  // default: wait for full batch
     std::unique_lock<std::mutex> lk(m_);
-    while (q_.size() < max_n && !done_)
+    while (q_.size() < min_n && !done_)
       cv_.wait(lk);
     if (q_.empty() && done_) return false;
 
@@ -2009,18 +2017,16 @@ struct CpuAgg {
  -----------------------------------------------------------------------
  Coordinates CPU and GPU workers sharing a single task queue.
 
- DESIGN: GPUs get priority via a depth-aware reservation model:
+ DESIGN: GPUs get priority via a "gpus_waiting" semaphore:
    - GPU stream calls gpu_wants_data() before popping → increments counter
    - GPU stream calls gpu_got_data() after popping → decrements counter
-   - GPU workers publish their batch size via set_gpu_batch_size()
-   - CPU workers check should_cpu_take(queue_depth):
+   - CPU workers check should_cpu_take():
        * Before GPU ready: CPU runs wild (100%)
-       * gpus_waiting > 0 AND queue too shallow: CPU yields (GPU needs data)
-       * gpus_waiting > 0 BUT queue has surplus: CPU takes from overflow
+       * gpus_waiting > 0: CPU yields (GPU needs data)
        * gpus_waiting == 0: CPU takes (all GPUs busy processing)
 
- This ensures GPUs are always fed first while CPUs productively handle
- surplus frames instead of idling whenever a GPU signals intent to pop.
+ This ensures GPUs are always fed first.  CPUs handle overflow when all
+ GPU streams are busy processing their batches.
 
  The tick thread runs for monitoring/logging but does NOT control
  scheduling  the semaphore handles that in real-time.
@@ -2033,8 +2039,7 @@ class HybridSched {
 public:
   HybridSched(double override_share, int /*cpu_threads*/, int gpu_devices,
               const Options & opt)
-    : opt_(opt), gpu_device_count_(gpu_devices),
-      total_gpu_streams_(gpu_devices * std::max<int>(1, opt.gpu_streams))
+    : opt_(opt), gpu_device_count_(gpu_devices)
   {
     if (override_share >= 0.0) {
       fixed_mode_ = true;
@@ -2047,15 +2052,8 @@ public:
   void set_queue(TaskQueue * tq) { queue_ = tq; }
 
   // CPU checks this before taking from the queue.
-  //
-  // COMPRESS: Depth-aware reservation.  CPUs only take surplus frames beyond
-  //   what all GPU streams need (total_streams * batch_size).  GPUs are the
-  //   primary workers for compress; CPUs handle overflow only.
-  //
-  // DECOMPRESS: Simple semaphore.  CPUs take whenever no GPU is actively
-  //   waiting.  On most hardware CPUs are faster at decompress (no PCIe D2H
-  //   overhead), so we want them contributing as much as possible.
-  bool should_cpu_take(size_t queue_depth = 0) const {
+  // If any GPU stream is waiting for data, CPU yields.
+  bool should_cpu_take() const {
     if (fixed_mode_) {
       const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
       const uint64_t gpu = gpu_taken_.load(std::memory_order_relaxed);
@@ -2067,25 +2065,12 @@ public:
     if (!gpu_ready_.load(std::memory_order_acquire))
       return true;
 
-    // No GPU is waiting → CPU can take
-    if (gpus_waiting_.load(std::memory_order_acquire) <= 0)
-      return true;
-
-    // Decompress: simple yield — CPUs only blocked while GPUs are actively
-    // waiting for data.  No depth reservation (CPUs are fast at decompress).
-    if (opt_.mode == Mode::DECOMPRESS)
+    // If a GPU stream is waiting for data: CPU yields
+    if (gpus_waiting_.load(std::memory_order_acquire) > 0)
       return false;
 
-    // Compress: depth-aware reservation — CPUs take surplus beyond what all
-    // GPU streams need.  Prevents CPUs from starving pop_batch_greedy.
-    const size_t reserved = size_t(total_gpu_streams_) * gpu_batch_size_.load(std::memory_order_relaxed);
-    return queue_depth > reserved;
-  }
-
-  // GPU workers call this to publish their current batch size so the
-  // scheduler can calculate accurate reservations.
-  void set_gpu_batch_size(size_t bs) {
-    gpu_batch_size_.store(bs, std::memory_order_relaxed);
+    // No GPU is waiting — CPU can take
+    return true;
   }
 
   // GPU stream calls this when it's ready and waiting for data
@@ -2135,8 +2120,6 @@ public:
          << "hybrid: tick cpu_rate=" << (cpu_rate/1e9) << " GiB/s"
          << " gpu_rate=" << (gpu_rate/1e9) << " GiB/s"
          << " gpus_waiting=" << gpus_waiting_.load()
-         << " gpu_batch=" << gpu_batch_size_.load()
-         << " reserved=" << (total_gpu_streams_ * gpu_batch_size_.load())
          << " cpu_taken=" << cpu_taken_.load()
          << " gpu_taken=" << gpu_taken_.load();
       std::cerr << os.str() << "\n";
@@ -2152,14 +2135,12 @@ public:
 private:
   const Options & opt_;
   int gpu_device_count_ = 0;
-  int total_gpu_streams_ = 0;   // devices × streams_per_device
   bool fixed_mode_ = false;
   double fixed_cpu_share_ = -1.0;
   TaskQueue * queue_ = nullptr;  // for waking CPU workers from gpu_got_data()
 
   std::atomic<bool> gpu_ready_{false};
   std::atomic<int> gpus_waiting_{0};
-  std::atomic<size_t> gpu_batch_size_{8};  // current GPU batch size (updated by GPU workers)
 
   std::atomic<uint64_t> cpu_taken_{0};
   std::atomic<uint64_t> gpu_taken_{0};
@@ -2301,7 +2282,7 @@ static void cpu_worker(
       //   - GPU releases semaphore (gpu_got_data -> notify_cpu_waiters)
       //   - producer is done (set_done -> cpu_cv_.notify_all)
       auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
-        if (!sched->should_cpu_take(qs.depth)) return false;
+        if (!sched->should_cpu_take()) return false;
         if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
             && !qs.done) return false;
         return true;
@@ -2522,7 +2503,7 @@ static void cpu_decomp_worker(
         if (qs.front_ratio >= 0.0 && qs.front_ratio < 0.02) { got_trivial = true; return true; }
         got_trivial = false;
         // Normal scheduling: respect GPU priority and queue depth threshold
-        if (!sched->should_cpu_take(qs.depth)) return false;
+        if (!sched->should_cpu_take()) return false;
         if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
             && !qs.done) return false;
         return true;
@@ -3757,6 +3738,8 @@ static void gpu_worker(
         if (C.busy) { continue; }
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
+        // Signal scheduler: GPU stream wants data (blocks CPU workers)
+        if (sched) sched->gpu_wants_data();
         // Greedy pop: wait for a full batch (per_stream_batch) or producer done.
         // This maximizes GPU kernel efficiency by processing many chunks per launch.
         // Use shared batch size from auto-tuner (or per-stream if locked)
@@ -3766,10 +3749,6 @@ static void gpu_worker(
         pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
-        // Publish batch size so scheduler can reserve the right amount for GPUs
-        if (sched) sched->set_gpu_batch_size(pop_n);
-        // Signal scheduler: GPU stream wants data (CPUs yield unless queue has surplus)
-        if (sched) sched->gpu_wants_data();
         // Backpressure: wait if writer is overwhelmed before grabbing more work
         if (bp) bp->wait_if_backlogged();
         if (!queue->pop_batch_greedy(pop_n, C.batch)) {
@@ -5040,6 +5019,8 @@ static void gpu_decomp_worker(
         if (C.busy) continue;
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
+        // Signal scheduler: this GPU stream wants data (blocks CPU workers)
+        if (sched) sched->gpu_wants_data();
         // Use shared batch size from auto-tuner, scaled by GPU utilization.
         // A GPU at 50% utilization gets half the batch → finishes at roughly
         // the same time as idle GPUs → results arrive in order for the writer.
@@ -5048,15 +5029,11 @@ static void gpu_decomp_worker(
                      : per_stream_cap;
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
-        // Publish batch size so scheduler can reserve the right amount for GPUs
-        if (sched) sched->set_gpu_batch_size(pop_n);
-        // Signal scheduler: this GPU stream wants data (CPUs yield unless queue has surplus)
-        if (sched) sched->gpu_wants_data();
         // Backpressure: wait if writer is overwhelmed before grabbing more work.
         // This prevents GPUs from flooding the result store with decompressed
         // data faster than the NVMe can write.
         if (bp) bp->wait_if_backlogged();
-        if (!queue->pop_batch_greedy(pop_n, C.batch)) {
+        if (!queue->pop_batch_greedy(pop_n, C.batch, /*min_n=*/1)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) {
             g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
