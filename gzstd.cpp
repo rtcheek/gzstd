@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.34";
+static constexpr const char * GZSTD_VERSION = "0.11.35";
 //
 // Architecture overview:
 //
@@ -2047,9 +2047,14 @@ public:
   void set_queue(TaskQueue * tq) { queue_ = tq; }
 
   // CPU checks this before taking from the queue.
-  // Depth-aware: CPUs can take surplus frames even while GPUs are waiting,
-  // as long as enough frames remain to fill ALL GPU streams (not just the
-  // currently waiting ones — busy streams will come back for data soon).
+  //
+  // COMPRESS: Depth-aware reservation.  CPUs only take surplus frames beyond
+  //   what all GPU streams need (total_streams * batch_size).  GPUs are the
+  //   primary workers for compress; CPUs handle overflow only.
+  //
+  // DECOMPRESS: Simple semaphore.  CPUs take whenever no GPU is actively
+  //   waiting.  On most hardware CPUs are faster at decompress (no PCIe D2H
+  //   overhead), so we want them contributing as much as possible.
   bool should_cpu_take(size_t queue_depth = 0) const {
     if (fixed_mode_) {
       const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
@@ -2066,11 +2071,13 @@ public:
     if (gpus_waiting_.load(std::memory_order_acquire) <= 0)
       return true;
 
-    // GPUs are waiting — check if queue has surplus beyond what ALL streams
-    // need.  We reserve for total_gpu_streams_ (not just gpus_waiting_)
-    // because busy streams will finish and come back for more data shortly.
-    // Only allowing CPUs to skim genuine surplus prevents queue starvation
-    // that causes pop_batch_greedy to block waiting for frames.
+    // Decompress: simple yield — CPUs only blocked while GPUs are actively
+    // waiting for data.  No depth reservation (CPUs are fast at decompress).
+    if (opt_.mode == Mode::DECOMPRESS)
+      return false;
+
+    // Compress: depth-aware reservation — CPUs take surplus beyond what all
+    // GPU streams need.  Prevents CPUs from starving pop_batch_greedy.
     const size_t reserved = size_t(total_gpu_streams_) * gpu_batch_size_.load(std::memory_order_relaxed);
     return queue_depth > reserved;
   }
