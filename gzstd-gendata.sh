@@ -5,139 +5,370 @@
 # Creates several files with different compressibility characteristics
 # to test gzstd performance across varied workloads.
 #
-# Usage: ./gzstd-gendata.sh [output_dir] [size_mib]
-#   output_dir  Directory for test files (default: ./gzstd-testdata)
+# Usage: ./gzstd-gendata.sh [size_mib] [output_dir]
 #   size_mib    Approximate size of each file in MiB (default: 512)
+#   output_dir  Directory for test files (default: ./gzstd-testdata)
+#
+# Requirements: bash, python3, dd, numfmt, stat
 #======================================================================
+VERSION="0.11.37"
 #set -euo pipefail
 
-OUTDIR="${1:-./gzstd-testdata}"
-SIZE_MIB="${2:-512}"
+SIZE_MIB="${1:-512}"
+OUTDIR="${2:-./gzstd-testdata}"
 SIZE_BYTES=$(( SIZE_MIB * 1024 * 1024 ))
 
+# Number of parallel jobs — capped at 5 (one per file)
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+JOBS=$(( NPROC > 5 ? 5 : NPROC ))
+
+# Temp dir for progress sidecar files (one per generator)
+PROGDIR=$(mktemp -d /tmp/gzstd_prog.XXXXXX)
+trap 'rm -rf "$PROGDIR"' EXIT
+
 mkdir -p "$OUTDIR"
-echo "=== gzstd test data generator ==="
-echo "Output dir : $OUTDIR"
-echo "File size  : ${SIZE_MIB} MiB each"
+
+#----------------------------------------------------------------------
+# ANSI helpers
+#----------------------------------------------------------------------
+ESC=$'\033'
+RESET="${ESC}[0m"
+BOLD="${ESC}[1m"
+DIM="${ESC}[2m"
+
+# Foreground colors
+RED="${ESC}[31m"
+GREEN="${ESC}[32m"
+YELLOW="${ESC}[33m"
+CYAN="${ESC}[36m"
+WHITE="${ESC}[37m"
+BRIGHT_WHITE="${ESC}[97m"
+
+# Cursor movement
+cursor_up()    { printf "${ESC}[%dA" "$1"; }   # move up N lines
+cursor_col0()  { printf "${ESC}[0G";           }   # move to column 0
+erase_line()   { printf "${ESC}[2K";           }   # erase current line
+hide_cursor()  { printf "${ESC}[?25l";         }
+show_cursor()  { printf "${ESC}[?25h";         }
+
+# Restore cursor on Ctrl-C
+trap 'show_cursor; echo ""; exit 130' INT TERM
+
+#----------------------------------------------------------------------
+# Header banner
+#----------------------------------------------------------------------
+echo ""
+printf "${BOLD}${BRIGHT_WHITE}=== gzstd test data generator v${VERSION} ===${RESET}\n"
+printf "${DIM}Output dir : ${RESET}${CYAN}%s${RESET}\n"  "$OUTDIR"
+printf "${DIM}File size  : ${RESET}${CYAN}%s MiB each${RESET}\n" "$SIZE_MIB"
+printf "${DIM}Parallel   : ${RESET}${CYAN}%s jobs${RESET}\n" "$JOBS"
+
+if python3 -c "import numpy" 2>/dev/null; then
+  NUMPY_VER=$(python3 -c "import numpy; print(numpy.__version__)")
+  printf "${DIM}NumPy      : ${RESET}${GREEN}available (v%s) — fast path active${RESET}\n" "$NUMPY_VER"
+else
+  printf "${DIM}NumPy      : ${RESET}${YELLOW}not found — using array.array fallback${RESET}\n"
+  printf "${DIM}             ${RESET}${DIM}(pip install numpy for ~5x boost on medium_compress)${RESET}\n"
+fi
 echo ""
 
 #----------------------------------------------------------------------
-# 1. Highly compressible: repeated log line (~0.01% ratio)
+# Python generator template.
+# Each generator writes its bytes_written count to a sidecar file
+# ($PROGDIR/<slug>) after every chunk so the progress loop can read it.
+# The sidecar contains a single ASCII integer with a newline.
 #----------------------------------------------------------------------
-echo "[1/5] Generating highly compressible data (repeated pattern)..."
-LINE='2025-03-01T12:34:56.789Z INFO  [worker-42] Processing request id=abc123 method=GET path=/api/v2/users status=200 duration=12ms'
-yes "$LINE" | dd of="$OUTDIR/high_compress.bin" bs=1M count="$SIZE_MIB" iflag=fullblock status=none 2>/dev/null
-truncate -s "$SIZE_BYTES" "$OUTDIR/high_compress.bin"
-echo "  -> $(numfmt --to=iec-i --suffix=B $(stat -c%s "$OUTDIR/high_compress.bin"))"
+
+gen_high_compress() {
+  local path="$1" size="$2" prog="$3"
+  python3 -c "
+import os
+path  = '$path'
+size  = $size
+prog  = '$prog'
+chunk = 64 << 20
+line  = b'2025-03-01T12:34:56.789Z INFO  [worker-42] Processing request id=abc123 method=GET path=/api/v2/users status=200 duration=12ms\n'
+buf   = (line * ((chunk // len(line)) + 1))[:chunk]
+written = 0
+with open(path, 'wb') as f:
+    while written < size:
+        n = min(chunk, size - written)
+        f.write(buf[:n])
+        written += n
+        open(prog,'w').write(str(written))
+"
+}
+
+gen_medium_compress() {
+  local path="$1" size="$2" prog="$3"
+  python3 -c "
+import os, array
+path  = '$path'
+size  = $size
+prog  = '$prog'
+chunk = 64 << 20
+words = (b'The server response data cache memory buffer thread process kernel '
+         b'system network packet stream compress decompress algorithm benchmark '
+         b'request error timeout configuration handler middleware serialize '
+         b'deserialize allocate deallocate initialize terminate dispatch validate '
+         b'authenticate authorize encrypt decrypt encode decode transform aggregate '
+         b'distribute replicate synchronize coordinate optimize parallelize schedule '
+         b'monitor analyze profile evaluate calibrate normalize standardize implement '
+         b'integrate deploy maintain support update upgrade migrate refactor document annotate. ')
+cbuf = (words * ((chunk // len(words)) + 1))[:chunk]
+written = 0
+toggle  = 0
+with open(path, 'wb') as f:
+    while written < size:
+        n = min(chunk, size - written)
+        if toggle % 3 != 0:
+            # 2/3 compressible word sequences
+            f.write(cbuf[:n])
+        else:
+            # 1/3 random printable ASCII (0x20-0x7e):
+            # Use NumPy if available (SIMD vectorised, ~100x vs generator),
+            # otherwise fall back to array module (~20x vs generator).
+            raw = os.urandom(n)
+            try:
+                import numpy as np
+                arr = np.frombuffer(raw, dtype=np.uint8)
+                f.write((0x20 + (arr % 95)).tobytes())
+            except ImportError:
+                a = array.array('B', raw)
+                for i in range(len(a)): a[i] = 0x20 + (a[i] % 95)
+                f.write(a)
+        written += n
+        toggle  += 1
+        open(prog,'w').write(str(written))
+"
+}
+
+gen_low_compress() {
+  local path="$1" size="$2" prog="$3"
+  python3 -c "
+import os
+path  = '$path'
+size  = $size
+prog  = '$prog'
+chunk = 64 << 20
+pattern = os.urandom(4096)
+pbuf    = (pattern * ((chunk // len(pattern)) + 1))[:chunk]
+written = 0
+toggle  = 0
+with open(path, 'wb') as f:
+    while written < size:
+        n = min(chunk, size - written)
+        if toggle % 10 != 0:
+            f.write(os.urandom(n))
+        else:
+            f.write(pbuf[:n])
+        written += n
+        toggle  += 1
+        open(prog,'w').write(str(written))
+"
+}
+
+gen_mixed() {
+  local path="$1" size="$2" prog="$3"
+  python3 -c "
+import os
+path   = '$path'
+size   = $size
+prog   = '$prog'
+chunk  = 64 << 20
+record = b'{\"id\":12345,\"name\":\"user_42\",\"score\":87.50,\"active\":true,\"tags\":[\"alpha\",\"beta\",\"gamma\"]}\n'
+cbuf   = (record * ((chunk // len(record)) + 1))[:chunk]
+written = 0
+toggle  = 0
+with open(path, 'wb') as f:
+    while written < size:
+        n = min(chunk, size - written)
+        if toggle % 2 == 0:
+            f.write(cbuf[:n])
+        else:
+            f.write(os.urandom(n))
+        written += n
+        toggle  += 1
+        open(prog,'w').write(str(written))
+"
+}
+
+gen_zeros() {
+  local path="$1" size="$2" prog="$3"
+  # dd doesn't support sidecar progress, so we wrap it in Python too
+  python3 -c "
+import os
+path  = '$path'
+size  = $size
+prog  = '$prog'
+chunk = 64 << 20
+buf   = b'\x00' * chunk
+written = 0
+with open(path, 'wb') as f:
+    while written < size:
+        n = min(chunk, size - written)
+        f.write(buf[:n])
+        written += n
+        open(prog,'w').write(str(written))
+"
+}
 
 #----------------------------------------------------------------------
-# 2. Medium compressibility: printable ASCII with structure (~30-40%)
-#    Base is /dev/urandom filtered to printable chars, then every other
-#    64K block is replaced with repeated English-like word sequences.
+# File registry — ordered list for display
+# Each entry: "slug|label|path|progfile"
 #----------------------------------------------------------------------
-echo "[2/5] Generating medium compressibility data (pseudo-text)..."
-{
-  # Pre-build a 64K compressible word block
-  WORDS="The server response data cache memory buffer thread process kernel system network packet stream compress decompress algorithm benchmark request error timeout configuration handler middleware serialize deserialize allocate deallocate initialize terminate dispatch validate authenticate authorize encrypt decrypt encode decode transform aggregate distribute replicate synchronize coordinate optimize parallelize schedule monitor analyze profile evaluate calibrate normalize standardize implement integrate deploy maintain support update upgrade migrate refactor document annotate"
-  WBLOCK=""
-  while [ ${#WBLOCK} -lt 65536 ]; do
-    WBLOCK="${WBLOCK}${WORDS}. "
-  done
-  WBLOCK="${WBLOCK:0:65536}"
+FILES=(
+  "high_compress|high_compress.bin |(highly compressible)  |$OUTDIR/high_compress.bin|$PROGDIR/high_compress"
+  "medium_compress|medium_compress.bin|(medium compressible)  |$OUTDIR/medium_compress.bin|$PROGDIR/medium_compress"
+  "low_compress|low_compress.bin  |(low compressible)     |$OUTDIR/low_compress.bin|$PROGDIR/low_compress"
+  "mixed|mixed.bin         |(mixed workload)       |$OUTDIR/mixed.bin|$PROGDIR/mixed"
+  "zeros|zeros.bin         |(zero-filled)          |$OUTDIR/zeros.bin|$PROGDIR/zeros"
+)
+NUM_FILES=${#FILES[@]}
 
-  WRITTEN=0
-  TOGGLE=0
-  while [ "$WRITTEN" -lt "$SIZE_BYTES" ]; do
-    REMAINING=$(( SIZE_BYTES - WRITTEN ))
-    CHUNK=65536
-    if [ "$CHUNK" -gt "$REMAINING" ]; then CHUNK="$REMAINING"; fi
-    if [ $(( TOGGLE % 3 )) -ne 0 ]; then
-      # 2/3 of blocks: compressible word sequences
-      printf '%.s' "$WBLOCK" | dd bs="$CHUNK" count=1 status=none 2>/dev/null
-    else
-      # 1/3 of blocks: random printable ASCII
-      dd if=/dev/urandom bs="$CHUNK" count=1 status=none 2>/dev/null | tr '\0-\37\177-\377' 'A-Za-z0-9 ,.'
+declare -A PIDS      # slug -> pid
+declare -A DONE      # slug -> 0/1
+declare -A EXIT_RC   # slug -> exit code
+
+#----------------------------------------------------------------------
+# Launch all generators
+#----------------------------------------------------------------------
+for entry in "${FILES[@]}"; do
+  IFS='|' read -r slug fname annotation fpath prog <<< "$entry"
+  echo 0 > "$prog"
+  fn="gen_${slug}"
+  "$fn" "$fpath" "$SIZE_BYTES" "$prog" &
+  PIDS[$slug]=$!
+  DONE[$slug]=0
+done
+
+#----------------------------------------------------------------------
+# Progress rendering helpers
+#----------------------------------------------------------------------
+
+# Read bytes written from sidecar; return 0 if missing/unreadable
+read_prog() {
+  local prog="$1"
+  local val
+  val=$(cat "$prog" 2>/dev/null)
+  echo "${val:-0}"
+}
+
+# Color a percentage value: red < 33%, yellow < 66%, green >= 66%, bright green = done
+pct_color() {
+  local pct="$1" done="$2"
+  if   [ "$done" -eq 1 ];   then printf "${GREEN}"
+  elif [ "$pct" -ge 66 ];   then printf "${YELLOW}"
+  elif [ "$pct" -ge 33 ];   then printf "${CYAN}"
+  else                           printf "${WHITE}"
+  fi
+}
+
+# Human-readable GiB with one decimal
+to_gib() {
+  python3 -c "print(f'{$1/1073741824:.1f}')"
+}
+
+# Draw all 5 progress rows. Called repeatedly; uses cursor_up to redraw in place.
+# First call: just print. Subsequent calls: move cursor up NUM_FILES lines first.
+FIRST_DRAW=1
+
+draw_progress() {
+  local all_bytes_total=$(( NUM_FILES * SIZE_BYTES ))
+  local all_bytes_done=0
+
+  [ "$FIRST_DRAW" -eq 0 ] && cursor_up "$NUM_FILES"
+  FIRST_DRAW=0
+
+  for entry in "${FILES[@]}"; do
+    IFS='|' read -r slug fname annotation fpath prog <<< "$entry"
+
+    local written pct is_done pid rc
+    written=$(read_prog "$prog")
+    is_done=${DONE[$slug]}
+    pid=${PIDS[$slug]}
+
+    # Check if process finished (non-blocking)
+    if [ "$is_done" -eq 0 ]; then
+      if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid"
+        rc=$?
+        EXIT_RC[$slug]=$rc
+        DONE[$slug]=1
+        is_done=1
+        written=$SIZE_BYTES
+      fi
     fi
-    WRITTEN=$(( WRITTEN + CHUNK ))
-    TOGGLE=$(( TOGGLE + 1 ))
-  done
-} > "$OUTDIR/medium_compress.bin"
-truncate -s "$SIZE_BYTES" "$OUTDIR/medium_compress.bin"
-echo "  -> $(numfmt --to=iec-i --suffix=B $(stat -c%s "$OUTDIR/medium_compress.bin"))"
 
-#----------------------------------------------------------------------
-# 3. Low compressibility: mostly random, occasional repeated blocks
-#    (~85-95% ratio)
-#----------------------------------------------------------------------
-echo "[3/5] Generating low compressibility data (structured random)..."
-{
-  # Pre-generate a 4K repeatable pattern
-  PATTERN=$(dd if=/dev/urandom bs=4096 count=1 status=none 2>/dev/null | base64 | head -c 4096)
+    pct=$(( written * 100 / SIZE_BYTES ))
+    [ "$pct" -gt 100 ] && pct=100
+    all_bytes_done=$(( all_bytes_done + written ))
 
-  WRITTEN=0
-  TOGGLE=0
-  while [ "$WRITTEN" -lt "$SIZE_BYTES" ]; do
-    REMAINING=$(( SIZE_BYTES - WRITTEN ))
-    CHUNK=65536
-    if [ "$CHUNK" -gt "$REMAINING" ]; then CHUNK="$REMAINING"; fi
-    if [ $(( TOGGLE % 10 )) -ne 0 ]; then
-      # 90%: pure random
-      dd if=/dev/urandom bs="$CHUNK" count=1 status=none 2>/dev/null
+    cursor_col0; erase_line
+    local col
+    col=$(pct_color "$pct" "$is_done")
+
+    if [ "$is_done" -eq 1 ]; then
+      local rc_val=${EXIT_RC[$slug]:-0}
+      if [ "$rc_val" -eq 0 ]; then
+        printf "  ${GREEN}✔${RESET}  %-20s ${DIM}%-23s${RESET}  ${GREEN}${BOLD}%3d%%${RESET}  ${DIM}%s GiB${RESET}\n" \
+          "$fname" "$annotation" 100 "$(to_gib "$SIZE_BYTES")"
+      else
+        printf "  ${RED}✘${RESET}  %-20s ${DIM}%-23s${RESET}  ${RED}${BOLD}FAILED (exit %d)${RESET}\n" \
+          "$fname" "$annotation" "$rc_val"
+      fi
     else
-      # 10%: repeated pattern block (gives zstd something to match)
-      REPS=$(( CHUNK / 4096 + 1 ))
-      for ((r=0; r<REPS; r++)); do printf '%s' "$PATTERN"; done | dd bs="$CHUNK" count=1 status=none 2>/dev/null
+      printf "  ${DIM}…${RESET}  %-20s ${DIM}%-23s${RESET}  ${col}${BOLD}%3d%%${RESET}  ${DIM}%s / %s GiB${RESET}\n" \
+        "$fname" "$annotation" "$pct" "$(to_gib "$written")" "$(to_gib "$SIZE_BYTES")"
     fi
-    WRITTEN=$(( WRITTEN + CHUNK ))
-    TOGGLE=$(( TOGGLE + 1 ))
   done
-} > "$OUTDIR/low_compress.bin"
-truncate -s "$SIZE_BYTES" "$OUTDIR/low_compress.bin"
-echo "  -> $(numfmt --to=iec-i --suffix=B $(stat -c%s "$OUTDIR/low_compress.bin"))"
+}
 
 #----------------------------------------------------------------------
-# 4. Mixed workload: alternating compressible and random 64K sections
-#    (~50-60% ratio)
+# Live progress loop
 #----------------------------------------------------------------------
-echo "[4/5] Generating mixed workload data..."
-{
-  # Pre-build a 64K JSON-like compressible block
-  RECORD='{"id":12345,"name":"user_42","score":87.50,"active":true,"tags":["alpha","beta","gamma"]}'
-  JBLOCK=""
-  while [ ${#JBLOCK} -lt 65536 ]; do
-    JBLOCK="${JBLOCK}${RECORD}"$'\n'
-  done
-  JBLOCK="${JBLOCK:0:65536}"
-
-  WRITTEN=0
-  TOGGLE=0
-  while [ "$WRITTEN" -lt "$SIZE_BYTES" ]; do
-    REMAINING=$(( SIZE_BYTES - WRITTEN ))
-    CHUNK=65536
-    if [ "$CHUNK" -gt "$REMAINING" ]; then CHUNK="$REMAINING"; fi
-    if [ $(( TOGGLE % 2 )) -eq 0 ]; then
-      # Compressible block
-      printf '%s' "$JBLOCK" | dd bs="$CHUNK" count=1 status=none 2>/dev/null
-    else
-      # Random block
-      dd if=/dev/urandom bs="$CHUNK" count=1 status=none 2>/dev/null
-    fi
-    WRITTEN=$(( WRITTEN + CHUNK ))
-    TOGGLE=$(( TOGGLE + 1 ))
-  done
-} > "$OUTDIR/mixed.bin"
-truncate -s "$SIZE_BYTES" "$OUTDIR/mixed.bin"
-echo "  -> $(numfmt --to=iec-i --suffix=B $(stat -c%s "$OUTDIR/mixed.bin"))"
-
-#----------------------------------------------------------------------
-# 5. Zero-filled (extreme compression, tests overhead)
-#----------------------------------------------------------------------
-echo "[5/5] Generating zero-filled data (extreme compression)..."
-dd if=/dev/zero of="$OUTDIR/zeros.bin" bs=1M count="$SIZE_MIB" status=none 2>/dev/null
-echo "  -> $(numfmt --to=iec-i --suffix=B $(stat -c%s "$OUTDIR/zeros.bin"))"
-
+hide_cursor
+printf "${BOLD}${WHITE}Progress:${RESET}\n"
 echo ""
-echo "=== Test data ready in $OUTDIR ==="
+
+# Print initial rows (all 0%)
+draw_progress
+
+# Poll until all done
+while true; do
+  sleep 0.25
+
+  # Count how many are still running
+  running=0
+  for entry in "${FILES[@]}"; do
+    IFS='|' read -r slug _ _ _ <<< "$entry"
+    [ "${DONE[$slug]}" -eq 0 ] && running=$(( running + 1 ))
+  done
+
+  draw_progress
+
+  [ "$running" -eq 0 ] && break
+done
+
+show_cursor
+
+#----------------------------------------------------------------------
+# Final summary
+#----------------------------------------------------------------------
+echo ""
+FAILED=0
+for entry in "${FILES[@]}"; do
+  IFS='|' read -r slug _ _ _ <<< "$entry"
+  rc=${EXIT_RC[$slug]:-0}
+  [ "$rc" -ne 0 ] && FAILED=$(( FAILED + 1 ))
+done
+
+[ "$FAILED" -gt 0 ] && printf "${RED}WARNING: %d generator(s) failed.${RESET}\n\n" "$FAILED" >&2
+
+printf "${BOLD}${GREEN}=== Test data ready in %s ===${RESET}\n" "$OUTDIR"
 ls -lhS "$OUTDIR/"
 echo ""
-echo "Total: $(numfmt --to=iec-i --suffix=B $(du -sb "$OUTDIR" | cut -f1))"
+
+# Portable du (Linux vs macOS)
+TOTAL=$(du -sb "$OUTDIR" 2>/dev/null | cut -f1 || du -sk "$OUTDIR" | awk '{print $1*1024}')
+printf "Total: ${CYAN}%s${RESET}\n" "$(numfmt --to=iec-i --suffix=B "$TOTAL")"
