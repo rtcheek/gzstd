@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.36";
+static constexpr const char * GZSTD_VERSION = "0.11.37";
 //
 // Architecture overview:
 //
@@ -2813,7 +2813,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
                       &cpuagg, bp_ptr);
   }
   if (opt.verbosity >= V_VERBOSE)
-    std::cerr << "[CPU-D] " << threads << " decompression threads online\n";
+    std::cerr << "[CPU] " << threads << " decompression threads online\n";
 
   // Stream frames from input directly into the queue.
   // Workers start decompressing as soon as the first frame is pushed.
@@ -4904,7 +4904,7 @@ static void gpu_decomp_worker(
                   S.phase = SharedTuneState::Phase::HALVE;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune-D] baseline=" << cur_batch << " ("
+                    os << "[auto-tune] baseline=" << cur_batch << " ("
                        << std::fixed << std::setprecision(2) << cur_thr << " GiB/s) -> try " << half;
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
@@ -4925,7 +4925,7 @@ static void gpu_decomp_worker(
                   S.phase = SharedTuneState::Phase::DOUBLE;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune-D] halving worse, will try doubling (best=" << S.best_batch << ")";
+                    os << "[auto-tune] halving worse, will try doubling (best=" << S.best_batch << ")";
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
                 }
@@ -4954,7 +4954,7 @@ static void gpu_decomp_worker(
                     }
                     if (opt.verbosity >= V_VERBOSE) {
                       std::ostringstream os;
-                      os << "[auto-tune-D] settled at batch=" << S.best_batch
+                      os << "[auto-tune] settled at batch=" << S.best_batch
                          << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
                       vlog(V_VERBOSE, opt, os.str() + "\n");
                     }
@@ -4970,7 +4970,7 @@ static void gpu_decomp_worker(
                   S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune-D] refined, settled at batch=" << S.best_batch;
+                    os << "[auto-tune] refined, settled at batch=" << S.best_batch;
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
                 } else {
@@ -5002,7 +5002,7 @@ static void gpu_decomp_worker(
                       S.phase = SharedTuneState::Phase::HALVE;
                     if (opt.verbosity >= V_VERBOSE) {
                       std::ostringstream os;
-                      os << "[auto-tune-D] probe: " << S.best_batch << " -> " << probe
+                      os << "[auto-tune] probe: " << S.best_batch << " -> " << probe
                          << " (" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
                       vlog(V_VERBOSE, opt, os.str() + "\n");
                     }
@@ -5029,11 +5029,17 @@ static void gpu_decomp_worker(
                      : per_stream_cap;
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+        // Soft minimum: don't block for the full batch (serializes 8 GPUs
+        // behind the reader), but don't go as low as 1 either (tiny batches
+        // waste H2D/D2H overhead and poison the auto-tuner's throughput
+        // measurement).  4 frames (64 MiB) is enough to amortize kernel
+        // launch overhead while keeping GPUs responsive.
+        const size_t decomp_min_batch = std::min<size_t>(pop_n, 4);
         // Backpressure: wait if writer is overwhelmed before grabbing more work.
         // This prevents GPUs from flooding the result store with decompressed
         // data faster than the NVMe can write.
         if (bp) bp->wait_if_backlogged();
-        if (!queue->pop_batch_greedy(pop_n, C.batch, /*min_n=*/1)) {
+        if (!queue->pop_batch_greedy(pop_n, C.batch, decomp_min_batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) {
             g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
