@@ -15,8 +15,11 @@ Test data defaults to `./gzstd-testdata`.
 ## Quick Start
 
 ```bash
-# 1. Generate test data (512 MiB per file, ~2.5 GiB total)
-./gzstd-gendata.sh ./gzstd-testdata 512
+# 1. Generate test data (512 MiB per file, ~2.5 GiB total — output dir defaults to ./gzstd-testdata)
+./gzstd-gendata.sh 512
+
+# 1a. Or specify a custom output directory as the second argument
+./gzstd-gendata.sh 512 ./gzstd-testdata
 
 # 2. Run a quick sweep (reduced matrix, 1 iteration)
 ./gzstd-benchmark.sh --quick --sweep-all
@@ -40,15 +43,34 @@ The harness can test:
 
 ## Test Data
 
-`gzstd-gendata.sh` creates five files with different compressibility profiles:
+`gzstd-gendata.sh` creates five files with different compressibility profiles. All five are
+generated in parallel (one per CPU core, up to 5), with a live per-file progress display
+showing percentage complete and GiB written.
 
 | File | Description | Typical Ratio |
 |---|---|---:|
 | `high_compress.bin` | Repeated log lines | ~0.1% |
-| `medium_compress.bin` | English-like text | ~30-40% |
-| `low_compress.bin` | Structured random | ~85-95% |
-| `mixed.bin` | Alternating text/binary | ~50-60% |
+| `medium_compress.bin` | Pseudo-text + random printable ASCII | ~30-40% |
+| `low_compress.bin` | 90% random, 10% repeated pattern | ~85-95% |
+| `mixed.bin` | Alternating JSON records + random | ~50-60% |
 | `zeros.bin` | All zeros | ~0.01% |
+
+### Requirements
+
+| Dependency | Required | Notes |
+|---|---|---|
+| `bash` | Yes | |
+| `python3` | Yes | All file generation runs in Python for speed |
+| `dd` | Yes | Used for zero-fill fallback |
+| `numfmt` / `stat` | Yes | Part of GNU coreutils |
+| `numpy` | No | Install for ~5x speed boost on `medium_compress.bin` — the script detects and uses it automatically if present |
+
+### Performance notes
+
+- All five files are written simultaneously in parallel background processes.
+- Each generator uses 64 MiB write chunks, reducing I/O syscall count ~1000x versus the previous 64 KiB chunks.
+- `medium_compress.bin` uses NumPy (if available) for SIMD-vectorised random-printable-ASCII generation, falling back to `array.array` otherwise.
+- On a fast NVMe with NumPy installed, a 20 GiB run completes in roughly 2–5 minutes.
 
 ## Actual Sweep Values Used by `gzstd-benchmark.sh`
 
@@ -168,7 +190,7 @@ for both GPU-only (`gpu-b32s4`) and hybrid (`hyb-b32s4`) labels when those modes
 ### Larger data set for more stable measurements
 
 ```bash
-./gzstd-gendata.sh ./gzstd-testdata-2g 2048
+./gzstd-gendata.sh 2048 ./gzstd-testdata-2g
 ./gzstd-benchmark.sh --data-dir ./gzstd-testdata-2g --sweep-all --iterations 5
 ```
 
@@ -238,6 +260,26 @@ Each result row includes:
 ## Revision Notes for This Benchmark Script
 
 This section replaces a standalone benchmark-script changelog for this update.
+
+### What changed in gzstd-gendata.sh (v0.11.37)
+
+- **Argument order changed**: `size_mib` is now the first argument, `output_dir` is now the
+  second. Passing only one argument sets the file size; the output directory defaults to
+  `./gzstd-testdata`.
+- **Parallel generation**: all five files are now generated simultaneously in background
+  processes (up to 5 parallel jobs, auto-detected via `nproc`/`sysctl`).
+- **Python3 generators**: all file generation moved from bash loops to inline `python3 -c`
+  scripts, eliminating per-chunk fork overhead and dramatically reducing wall time.
+- **64 MiB write chunks**: up from 64 KiB, reducing loop iterations ~1000x for large files.
+- **NumPy fast path**: `medium_compress.bin` now uses NumPy's SIMD-vectorised array operations
+  for the random-printable-ASCII pass when NumPy is available, falling back to `array.array`
+  from the stdlib otherwise. The startup banner reports which path is active and the detected
+  NumPy version.
+- **Live progress display**: a multi-line ANSI progress view redraws in-place at 250 ms
+  intervals, showing per-file percentage, GiB written, and a ✔/✘ completion marker. The
+  terminal cursor is hidden during the run and restored on exit or Ctrl-C.
+- **Version variable**: version `0.11.37` is declared as `VERSION` at the top of the script
+  and displayed in the startup banner.
 
 ### What changed in this revision
 
