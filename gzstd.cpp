@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.37";
+static constexpr const char * GZSTD_VERSION = "0.11.38";
 //
 // Architecture overview:
 //
@@ -2869,9 +2869,12 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   }
   results.cv.notify_all();
 
-  // Wait for workers, then writer
-  backpressure.set_done();  // wake any CPU workers blocked on backpressure
+  // Wait for workers, then writer.
+  // Do NOT call backpressure.set_done() before join: workers must respect
+  // backpressure while draining the queue, otherwise they buffer the entire
+  // output in RAM (the done_ flag makes wait_if_backlogged() a no-op).
   for (auto & th : pool) th.join();
+  backpressure.set_done();  // safe now: all workers exited
   {
     std::lock_guard<std::mutex> lk(results.m);
     results.workers_done = true;
@@ -3030,9 +3033,11 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   }
   results.cv.notify_all();
 
-  // Wait for all workers to finish, then signal the writer
-  backpressure.set_done();  // wake any backlogged workers so they can exit
+  // Wait for all workers to finish, then signal the writer.
+  // Do NOT call backpressure.set_done() before join: workers must respect
+  // backpressure while draining the queue to avoid buffering entire output in RAM.
   for (auto & th : pool) th.join();
+  backpressure.set_done();  // safe now: all workers exited
   {
     std::lock_guard<std::mutex> lk(results.m);
     results.workers_done = true;
@@ -4554,8 +4559,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   results.cv.notify_all();
 
   // ---- Teardown: join all threads in correct order ----
-  backpressure.set_done();  // wake any backlogged workers so they can exit
+  // Do NOT call backpressure.set_done() before join: workers must respect
+  // backpressure while draining the queue to avoid buffering entire output in RAM.
   for (auto & th : workers) th.join();
+  backpressure.set_done();  // safe now: all workers exited
 
   // Check for GPU failures
   if (any_gpu_failed.load()) {
@@ -5566,7 +5573,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   rescue.set_done();
-  backpressure.set_done();  // wake any CPU workers blocked on backpressure
+  // Do NOT call backpressure.set_done() before join: workers must respect
+  // backpressure while draining the queue to avoid buffering entire output in RAM.
   if (!cpu_pool.empty()) {
     auto t_cpu = std::chrono::steady_clock::now();
     for (auto & th : cpu_pool) th.join();
@@ -5577,6 +5585,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         vlog(V_VERBOSE, opt, "CPU pool join: " + std::to_string(int(ms)) + " ms\n");
     }
   }
+  backpressure.set_done();  // safe now: all workers exited
 
   {
     std::lock_guard<std::mutex> lk(results.m);
