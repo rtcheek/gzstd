@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.38";
+static constexpr const char * GZSTD_VERSION = "0.11.39";
 //
 // Architecture overview:
 //
@@ -735,6 +735,12 @@ public:
     }
 
     buf_used_ = 0;
+
+    // If we preallocated, truncate to actual written size to avoid trailing
+    // garbage if the preallocated size was slightly larger than actual output.
+    if (preallocated_ > 0 && total_written_ < preallocated_) {
+      ::ftruncate(fd_, (off_t)total_written_);
+    }
     return true;
   }
 
@@ -749,8 +755,23 @@ public:
     }
   }
 
+  // Pre-allocate disk space to avoid per-write extent allocation overhead.
+  // On NVMe, this can improve sequential write throughput by 2-4x because the
+  // filesystem doesn't need to allocate new extents + journal on every write().
+  // Falls back gracefully on filesystems that don't support fallocate.
+  bool preallocate(uint64_t size) {
+    if (fd_ < 0 || size == 0) return false;
+#ifdef __linux__
+    int ret = ::fallocate(fd_, 0, 0, (off_t)size);
+    if (ret == 0) { preallocated_ = size; return true; }
+    // EOPNOTSUPP / ENOSYS: filesystem doesn't support fallocate — not fatal
+#endif
+    return false;
+  }
+
   size_t total_bytes() const { return total_written_ + buf_used_; }
   int fd() const { return fd_; }
+  uint64_t preallocated() const { return preallocated_; }
 
   // Seek forward by 'offset' bytes  for sparse file support.
   // Flushes the internal buffer first to keep fd position and buffer in sync,
@@ -880,6 +901,7 @@ private:
   void * buf_ = nullptr;
   size_t buf_used_ = 0;
   size_t total_written_ = 0;
+  uint64_t preallocated_ = 0;
 };
 #endif // _WIN32
 
@@ -2820,6 +2842,18 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   bool fallback = false;
   std::vector<char> raw_data;
   size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data);
+
+  // Preallocate output file to avoid per-write extent allocation overhead.
+  // total_out is known from zstd frame headers parsed by stream_frames_to_queue.
+#ifndef _WIN32
+  if (g_direct_writer && m && n_frames > 0) {
+    uint64_t total = m->total_out.load(std::memory_order_relaxed);
+    if (total > 0 && g_direct_writer->preallocate(total)) {
+      char sz[32]; human_bytes(double(total), sz, sizeof(sz));
+      vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+    }
+  }
+#endif
 
   if (fallback && n_frames == 0) {
     // Could not parse any frames  shut down workers, fall back to streaming
@@ -5507,6 +5541,17 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   bool fallback = false;
   std::vector<char> raw_data;
   size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data);
+
+  // Preallocate output file to avoid per-write extent allocation overhead.
+#ifndef _WIN32
+  if (g_direct_writer && m && n_frames > 0) {
+    uint64_t total = m->total_out.load(std::memory_order_relaxed);
+    if (total > 0 && g_direct_writer->preallocate(total)) {
+      char sz[32]; human_bytes(double(total), sz, sizeof(sz));
+      vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+    }
+  }
+#endif
 
   if (fallback && n_frames == 0) {
     // Could not parse any frames  shut down workers, fall back to streaming
