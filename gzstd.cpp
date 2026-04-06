@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.39";
+static constexpr const char * GZSTD_VERSION = "0.11.40";
 //
 // Architecture overview:
 //
@@ -3793,8 +3793,6 @@ static void gpu_worker(
         if (C.busy) { continue; }
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
-        // Signal scheduler: GPU stream wants data (blocks CPU workers)
-        if (sched) sched->gpu_wants_data();
         // Greedy pop: wait for a full batch (per_stream_batch) or producer done.
         // This maximizes GPU kernel efficiency by processing many chunks per launch.
         // Use shared batch size from auto-tuner (or per-stream if locked)
@@ -3804,8 +3802,11 @@ static void gpu_worker(
         pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
-        // Backpressure: wait if writer is overwhelmed before grabbing more work
+        // Backpressure BEFORE gpu_wants_data: if we signal "GPU wants data" first,
+        // CPUs yield to us, but we then stall on backpressure — nobody pops, deadlock.
         if (bp) bp->wait_if_backlogged();
+        // Signal scheduler: GPU stream wants data (blocks CPU workers)
+        if (sched) sched->gpu_wants_data();
         if (!queue->pop_batch_greedy(pop_n, C.batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
@@ -5084,8 +5085,6 @@ static void gpu_decomp_worker(
         if (C.busy) continue;
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
-        // Signal scheduler: this GPU stream wants data (blocks CPU workers)
-        if (sched) sched->gpu_wants_data();
         // Use shared batch size from auto-tuner, scaled by GPU utilization.
         // A GPU at 50% utilization gets half the batch → finishes at roughly
         // the same time as idle GPUs → results arrive in order for the writer.
@@ -5103,7 +5102,12 @@ static void gpu_decomp_worker(
         // Backpressure: wait if writer is overwhelmed before grabbing more work.
         // This prevents GPUs from flooding the result store with decompressed
         // data faster than the NVMe can write.
+        // IMPORTANT: must come BEFORE gpu_wants_data() — otherwise the GPU
+        // signals "I want data" (blocking CPUs) but then stalls on backpressure,
+        // creating a deadlock where nobody pops from the queue.
         if (bp) bp->wait_if_backlogged();
+        // Signal scheduler: this GPU stream wants data (blocks CPU workers)
+        if (sched) sched->gpu_wants_data();
         if (!queue->pop_batch_greedy(pop_n, C.batch, decomp_min_batch)) {
           if (sched) sched->gpu_got_data();
           if (g_perf) {
