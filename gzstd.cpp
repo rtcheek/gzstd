@@ -739,7 +739,7 @@ public:
     // If we preallocated, truncate to actual written size to avoid trailing
     // garbage if the preallocated size was slightly larger than actual output.
     if (preallocated_ > 0 && total_written_ < preallocated_) {
-      (void)::ftruncate(fd_, (off_t)total_written_);
+      if (::ftruncate(fd_, (off_t)total_written_) != 0) { /* best-effort */ }
     }
     return true;
   }
