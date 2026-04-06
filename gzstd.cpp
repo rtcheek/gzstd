@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.41";
+static constexpr const char * GZSTD_VERSION = "0.11.42";
 //
 // Architecture overview:
 //
@@ -1332,13 +1332,16 @@ public:
   // Wake all CPU workers blocking in wait_for_cpu().
   // Called externally when scheduling conditions change (e.g., GPU releases
   // the semaphore via gpu_got_data, or the queue is drained).
-  // Wake one CPU worker to re-evaluate its scheduler predicate.
-  // Uses notify_one (not notify_all) to avoid thundering herd: each CPU
-  // pops one frame then loops back, so waking all N threads just causes
-  // N-1 to contend on m_, check the predicate, and go back to sleep.
+  // Wake CPU workers to re-evaluate their scheduler predicate.
+  // The main performance win is in gpu_got_data() which only calls this
+  // when gpus_waiting_ drops to 0 — reducing broadcast frequency from
+  // "every GPU batch" to "once per GPU cycle."  notify_all is needed
+  // (not notify_one) because after the queue is done, ALL sleeping CPUs
+  // must wake to see empty+done and exit; notify_one would leave the
+  // rest stuck forever.
   void notify_cpu_waiters()
   {
-    cpu_cv_.notify_one();
+    cpu_cv_.notify_all();
   }
 
   // State snapshot passed to CPU worker predicates.  Lets the predicate
@@ -2542,7 +2545,7 @@ static void cpu_decomp_worker(
         double ratio = (t.decomp_size > 0)
                        ? double(t.data.size()) / double(t.decomp_size) : 0.0;
         std::ostringstream os;
-        os << "[CPU-D/T" << worker_id << "] trivial frame (ratio="
+        os << "[CPU/T" << worker_id << "] trivial frame (ratio="
            << std::fixed << std::setprecision(3) << (ratio * 100.0) << "%)";
         vlog(V_DEBUG, *opt, os.str() + "\n");
       }
@@ -2593,7 +2596,7 @@ static void cpu_decomp_worker(
       human_bytes(double(actual), out_s, sizeof(out_s));
       double thr_gib = (ms > 0.0) ? double(actual) / (ms / 1000.0) / 1e9 : 0.0;
       std::ostringstream os;
-      os << "[CPU-D/T" << worker_id << "] seq=" << t.seq
+      os << "[CPU/T" << worker_id << "] seq=" << t.seq
          << " in=" << in_s << " out=" << out_s
          << " ms=" << std::fixed << std::setprecision(2) << ms
          << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
