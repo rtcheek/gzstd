@@ -2936,6 +2936,14 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
     total_in = (uint64_t)fs::file_size(opt.input);
 
+  // Preallocate output file: input size is a safe upper bound for compressed output.
+#ifndef _WIN32
+  if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
+    char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
+    vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+  }
+#endif
+
   std::atomic<bool> progress_done{false};
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
 
@@ -3020,6 +3028,14 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   uint64_t total_in = 0;
   if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
     total_in = (uint64_t)fs::file_size(opt.input);
+
+  // Preallocate output file: input size is a safe upper bound for compressed output.
+#ifndef _WIN32
+  if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
+    char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
+    vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+  }
+#endif
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
@@ -4447,6 +4463,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   uint64_t total_in = 0;
   if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
     total_in = (uint64_t)fs::file_size(opt.input);
+
+  // Preallocate output file: input size is a safe upper bound for compressed output.
+#ifndef _WIN32
+  if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
+    char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
+    vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+  }
+#endif
 
   // Writer backpressure: prevents workers from producing compressed data
   // faster than the NVMe can write.  Same mechanism as decompress backpressure.
