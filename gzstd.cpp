@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.40";
+static constexpr const char * GZSTD_VERSION = "0.11.41";
 //
 // Architecture overview:
 //
@@ -1332,9 +1332,13 @@ public:
   // Wake all CPU workers blocking in wait_for_cpu().
   // Called externally when scheduling conditions change (e.g., GPU releases
   // the semaphore via gpu_got_data, or the queue is drained).
+  // Wake one CPU worker to re-evaluate its scheduler predicate.
+  // Uses notify_one (not notify_all) to avoid thundering herd: each CPU
+  // pops one frame then loops back, so waking all N threads just causes
+  // N-1 to contend on m_, check the predicate, and go back to sleep.
   void notify_cpu_waiters()
   {
-    cpu_cv_.notify_all();
+    cpu_cv_.notify_one();
   }
 
   // State snapshot passed to CPU worker predicates.  Lets the predicate
@@ -2099,11 +2103,13 @@ public:
   void gpu_wants_data() { gpus_waiting_.fetch_add(1, std::memory_order_release); }
 
   // GPU stream calls this after it has taken a batch from the queue.
-  // Decrements the semaphore and wakes CPU workers so they can
-  // immediately check should_cpu_take() instead of sleeping.
+  // Decrements the semaphore.  Only wakes CPU workers when the last
+  // waiting GPU gets data (gpus_waiting_ drops to 0) — before that,
+  // should_cpu_take() returns false anyway, so waking CPUs is wasted
+  // work that creates thundering-herd lock contention on TaskQueue::m_.
   void gpu_got_data() {
-    gpus_waiting_.fetch_sub(1, std::memory_order_release);
-    if (queue_) queue_->notify_cpu_waiters();
+    int prev = gpus_waiting_.fetch_sub(1, std::memory_order_release);
+    if (prev == 1 && queue_) queue_->notify_cpu_waiters();
   }
 
   // Called by GPU workers once CUDA context is initialized
