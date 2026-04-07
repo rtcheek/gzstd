@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.42";
+static constexpr const char * GZSTD_VERSION = "0.11.43";
 //
 // Architecture overview:
 //
@@ -1611,17 +1611,24 @@ public:
     }
   }
 
-  // Called by CPU workers before popping a new task.
+  // Called by workers before popping a new task.
   // Blocks if backlog exceeds high-water mark.  Returns immediately
   // if backlog is acceptable or if done flag is set.
+  //
+  // Uses a timed wait (100ms) to prevent a deadlock that occurs when:
+  //   - The writer needs frame N (sequential ordering) but it's still in the queue
+  //   - Frames N+1..M are in ResultStore (produced, inflating the backlog)
+  //   - ALL workers are blocked here because backlog > high_water
+  //   - Nobody pops frame N → writer can't progress → mark_written never called
+  // The timeout lets one worker unblock, pop frame N, and unblock everyone.
   void wait_if_backlogged() {
     uint64_t backlog = produced_.load(std::memory_order_relaxed)
                      - written_.load(std::memory_order_acquire);
     if (backlog <= high_water_) return;  // fast path: no contention
 
-    // Slow path: block until writer catches up
+    // Slow path: block until writer catches up (or timeout to prevent deadlock)
     std::unique_lock<std::mutex> lk(m_);
-    cv_.wait(lk, [this] {
+    cv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
       uint64_t bl = produced_.load(std::memory_order_relaxed)
                   - written_.load(std::memory_order_acquire);
       return bl <= low_water_ || done_.load(std::memory_order_relaxed);
