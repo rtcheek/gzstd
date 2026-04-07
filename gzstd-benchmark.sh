@@ -169,7 +169,7 @@ clear_status_line() {
 }
 
 print_separator
-echo "${BOLD}${WHITE} gzstd benchmark suite v0.11.31${RESET}"
+echo "${BOLD}${WHITE} gzstd benchmark suite v0.11.40${RESET}"
 print_separator
 echo " ${WHITE}Binary${RESET}     : ${YELLOW}$GZSTD${RESET}"
 echo " ${WHITE}Version${RESET}    : ${CYAN}$($GZSTD --version 2>&1 | head -1)${RESET}"
@@ -462,9 +462,9 @@ else: print(0)
   line+="${DIM}|${RESET} "
   printf -v line "%s%s%-14s%s %-18s "     "$line" "$YELLOW" "$label" "$RESET" "$file"
   if [[ "$mode" == "compress" ]]; then
-    line+="${CYAN}>> compress${RESET}"
+    line+="${CYAN}» compress${RESET}"
   else
-    line+="${GREEN}<< decompress${RESET}"
+    line+="${GREEN}« decompress${RESET}"
   fi
   line+="  ${DIM}ETA ${eta_str}${RESET}"
 
@@ -481,12 +481,12 @@ print_result() {
   clear_status_line
 
   if [[ "$mode" == "compress" ]]; then
-    icon="${CYAN}>>${RESET}"
+    icon="${CYAN}»${RESET}"
   else
-    icon="${GREEN}<<${RESET}"
+    icon="${GREEN}«${RESET}"
   fi
 
-  printf "${CLEAR_LINE}"
+  printf "${CLEAR_LINE}"
   printf "  ${BOLD}${GREEN}✓${RESET} %-16s %-20s %s %-10s " "$label" "$file" "$icon" "$mode"
   printf "${BOLD}%8ss${RESET}  %s GiB/s" "$time" "$thr"
   if [[ "$mode" == "compress" && -n "$ratio" && "$ratio" != "?" ]]; then
