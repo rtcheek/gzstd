@@ -1628,7 +1628,7 @@ public:
 
     // Slow path: block until writer catches up
     std::unique_lock<std::mutex> lk(m_);
-    cv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
+    cv_.wait(lk, [this] {
       uint64_t bl = produced_.load(std::memory_order_relaxed)
                   - written_.load(std::memory_order_acquire);
       return bl <= low_water_
