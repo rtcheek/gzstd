@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.43";
+static constexpr const char * GZSTD_VERSION = "0.11.44";
 //
 // Architecture overview:
 //
@@ -1612,27 +1612,41 @@ public:
   }
 
   // Called by workers before popping a new task.
-  // Blocks if backlog exceeds high-water mark.  Returns immediately
-  // if backlog is acceptable or if done flag is set.
-  //
-  // Uses a timed wait (100ms) to prevent a deadlock that occurs when:
-  //   - The writer needs frame N (sequential ordering) but it's still in the queue
-  //   - Frames N+1..M are in ResultStore (produced, inflating the backlog)
-  //   - ALL workers are blocked here because backlog > high_water
-  //   - Nobody pops frame N → writer can't progress → mark_written never called
-  // The timeout lets one worker unblock, pop frame N, and unblock everyone.
+  // Blocks if backlog exceeds high-water mark.  Returns immediately if:
+  //   - backlog is acceptable (fast path)
+  //   - done flag is set (shutdown)
+  //   - writer is stalled waiting for a sequential frame still in the queue
+  //     (workers must stay active to pop and produce that frame)
   void wait_if_backlogged() {
     uint64_t backlog = produced_.load(std::memory_order_relaxed)
                      - written_.load(std::memory_order_acquire);
     if (backlog <= high_water_) return;  // fast path: no contention
 
-    // Slow path: block until writer catches up (or timeout to prevent deadlock)
+    // If writer is stalled on a missing frame, don't block — the writer
+    // needs us to pop and produce that frame to make progress.
+    if (writer_stalled_.load(std::memory_order_acquire)) return;
+
+    // Slow path: block until writer catches up
     std::unique_lock<std::mutex> lk(m_);
-    cv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
+    cv_.wait(lk, [this] {
       uint64_t bl = produced_.load(std::memory_order_relaxed)
                   - written_.load(std::memory_order_acquire);
-      return bl <= low_water_ || done_.load(std::memory_order_relaxed);
+      return bl <= low_water_
+          || done_.load(std::memory_order_relaxed)
+          || writer_stalled_.load(std::memory_order_acquire);
     });
+  }
+
+  // Called by the writer thread when it's waiting for a sequential frame
+  // that hasn't been produced yet.  Wakes all blocked workers so they can
+  // pop and produce the missing frame — prevents deadlock where out-of-order
+  // frames in ResultStore inflate the backlog while the writer can't drain them.
+  void set_writer_stalled(bool stalled) {
+    writer_stalled_.store(stalled, std::memory_order_release);
+    if (stalled) {
+      std::lock_guard<std::mutex> lk(m_);
+      cv_.notify_all();
+    }
   }
 
   // Signal that all work is complete  wake any blocked workers so they can exit.
@@ -1653,6 +1667,7 @@ private:
   uint64_t high_water_;
   uint64_t low_water_;
   std::atomic<bool> done_{false};
+  std::atomic<bool> writer_stalled_{false};
   std::mutex m_;
   std::condition_variable cv_;
 };
@@ -1868,6 +1883,12 @@ static void writer_thread(FILE * out, ResultStore & results,
     // On each wakeup, drain per-GPU slots into the shared map, then check
     // if the next sequential frame is available.  Producers call notify_all
     // on every frame delivery, so the writer wakes promptly.
+    //
+    // Signal backpressure that we're stalled so blocked workers unblock
+    // and can pop/produce the missing frame.  Clear the flag as soon as
+    // we find the frame (or detect all_done).
+    if (results.data.count(results.next_to_write) == 0 && !all_done && bp)
+      bp->set_writer_stalled(true);
     while (results.data.count(results.next_to_write) == 0 && !all_done) {
       results.drain_slots_locked();
       if (results.data.count(results.next_to_write) != 0) break;
@@ -1899,6 +1920,9 @@ static void writer_thread(FILE * out, ResultStore & results,
               && results.workers_done
               && results.next_to_write >= results.total_tasks;
     }
+
+    // Clear stalled flag — we either found the frame or detected all_done.
+    if (bp) bp->set_writer_stalled(false);
 
     if (g_perf && waited) {
       g_perf->writer_wait_ns.fetch_add(now_ns() - wait_t0);
