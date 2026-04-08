@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.11.31
+**Current version:** v0.12.0
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -69,10 +69,13 @@ Release input data buffers immediately after consumption (compression, H2D uploa
 - Reduces peak memory footprint for large files
 - GPU compress: guarded by `!rescue` to preserve rescue path in hybrid mode
 
-### 1.8 Writer Backpressure (Compress + Decompress)
-**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.24 decompress, v0.11.29 compress, v0.11.31 GPU throttle)**
+### 1.8 Writer Backpressure → FrameThrottle (Compress + Decompress)
+**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.24→v0.12.0)**
 
-Prevents workers from producing data faster than the NVMe can write. Hysteresis: 4 GiB high-water / 2 GiB low-water. All workers (CPU and GPU) throttled before popping next task.
+Prevents workers from producing data faster than the NVMe can write. Evolved through three designs:
+
+1. **v0.11.24–v0.11.42:** `WriterBackpressure` with byte-based hysteresis (4 GiB high / 2 GiB low water marks). Required `writer_stalled_` escape hatch to avoid deadlock from out-of-order frames inflating the backlog.
+2. **v0.12.0:** `FrameThrottle` counting semaphore (512 max in-flight frames). Workers acquire permits before popping; writer releases permits after writing. Deadlock-free by construction (FIFO queue guarantees the writer's next frame is always in-flight). Removed ~60 lines of complexity.
 
 - Decompress (v0.11.24): sys time 19m → 6m, throughput +56% on 432 GiB hybrid
 - Compress (v0.11.29): wired for `compress_cpu_mt`, `compress_nvcomp`, and rescue workers
@@ -326,3 +329,5 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 | v0.11.28-29 | Compress backpressure (all paths), RAM budget check, `--cpu-batch` ignored in `--cpu-only`, VRAM retry limit |
 | v0.11.30 | Default chunk 16 MiB everywhere, dual-rate progress bar, removed auto-chunk scaling, comprehensive test suite |
 | v0.11.31 | Stdout O_DIRECT detection (3× faster piped decompress), GPU backpressure on pop, -t defaults to 2 streams |
+| v0.11.38–v0.11.44 | backpressure set_done ordering, fallocate preallocation, hybrid deadlock fixes, thundering herd fix, writer_stalled_ signal |
+| v0.12.0 | FrameThrottle: counting semaphore replaces byte-based backpressure (-57 lines, deadlock-free by construction) |
