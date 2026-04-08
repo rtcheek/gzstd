@@ -2542,7 +2542,7 @@ static void cpu_decomp_worker(
       got_task = tq->pop_one(t);
     }
     if (!got_task) { if (bp) bp->release(1); break; }
-    }
+// Removed this extra brace here --rtcheek:    }
     {
     const auto t0_w = std::chrono::steady_clock::now();
 

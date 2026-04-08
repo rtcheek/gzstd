@@ -169,7 +169,7 @@ clear_status_line() {
 }
 
 print_separator
-echo "${BOLD}${WHITE} gzstd benchmark suite v0.11.40${RESET}"
+echo "${BOLD}${WHITE} gzstd benchmark suite v0.11.41${RESET}"
 print_separator
 echo " ${WHITE}Binary${RESET}     : ${YELLOW}$GZSTD${RESET}"
 echo " ${WHITE}Version${RESET}    : ${CYAN}$($GZSTD --version 2>&1 | head -1)${RESET}"
@@ -466,7 +466,7 @@ else: print(0)
   else
     line+="${GREEN}« decompress${RESET}"
   fi
-  line+="  ${DIM}ETA ${eta_str}${RESET}"
+  line+=" ${DIM}ETA ${eta_str}${RESET}"
 
   STATUS_LINE="$line"
   CURRENT_GZSTD_PCT=""
@@ -642,7 +642,7 @@ echo ""
 echo "${BOLD}${CYAN}Best compression throughput:${RESET}"
 for test_file in "${TEST_FILES[@]}"; do
   file_base=$(basename "$test_file")
-  best=$(grep "compress[^_]" "$RESULTS_FILE" | grep "$file_base" | grep "compress" |
+  best=$(awk -F'\t' -v f="$file_base" 'NR>1 && $3=="compress" && $2==f' "$RESULTS_FILE" |
          sort -t$'\t' -k7 -rg | head -1)
   if [[ -n "$best" ]]; then
     cfg=$(echo "$best" | cut -f1)
@@ -656,7 +656,7 @@ if $DO_DECOMPRESS; then
   echo "${BOLD}${GREEN}Best decompression throughput:${RESET}"
   for test_file in "${TEST_FILES[@]}"; do
     file_base=$(basename "$test_file")
-    best=$(grep "decompress" "$RESULTS_FILE" | grep "$file_base" |
+    best=$(awk -F'\t' -v f="$file_base" 'NR>1 && $3=="decompress" && $2==f' "$RESULTS_FILE" |
            sort -t$'\t' -k7 -rg | head -1)
     if [[ -n "$best" ]]; then
       cfg=$(echo "$best" | cut -f1)
@@ -670,7 +670,7 @@ fi
 echo "${BOLD}${ORANGE}Best compression ratio:${RESET}"
 for test_file in "${TEST_FILES[@]}"; do
   file_base=$(basename "$test_file")
-  best=$(grep "compress[^_]" "$RESULTS_FILE" | grep "$file_base" | grep "compress" |
+  best=$(awk -F'\t' -v f="$file_base" 'NR>1 && $3=="compress" && $2==f' "$RESULTS_FILE" |
          sort -t$'\t' -k8 -g | head -1)
   if [[ -n "$best" ]]; then
     cfg=$(echo "$best" | cut -f1)
