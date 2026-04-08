@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.11.44";
+static constexpr const char * GZSTD_VERSION = "0.12.0";
 //
 // Architecture overview:
 //
@@ -1566,108 +1566,66 @@ struct ResultStore {
 // (frames in the same order as the input) regardless of which worker finishes first.
 
 /*======================================================================
- Writer backpressure  prevents CPU workers from flooding the writer
+ Frame Throttle (counting semaphore)
  -----------------------------------------------------------------------
- Tracks the gap between bytes produced (decompressed) and bytes physically
- written to disk.  CPU workers block on a CV when the gap exceeds a
- high-water mark, and wake instantly when it drops below a low-water mark.
+ Bounds the number of frames in flight between "popped from queue" and
+ "written to disk."  Workers acquire permits before popping; the writer
+ releases permits after each frame is physically written.
 
- GPU workers are NEVER throttled  their batches are already in-flight
- on the GPU and can't be stopped mid-kernel.  Only CPU workers check
- backpressure before popping a new task.
+ This is deadlock-free by construction: the task queue is FIFO, so the
+ frame the writer needs next is always among the oldest in-flight frames.
+ It was popped first and will finish processing -- the writer never waits
+ for a frame that hasn't been popped yet while all permits are consumed.
 
- The AIO worker calls mark_written() after each physical write, which
- wakes blocked CPU workers if the backlog has dropped enough.
-
- High/low water marks use a hysteresis band to prevent oscillation:
-   - CPU blocks when backlog > high_water (e.g., 4 GiB)
-   - CPU wakes when backlog < low_water (e.g., 2 GiB)
- This keeps 2-4 GiB of decompressed data buffered  enough to keep the
- writer continuously fed without exhausting RAM on huge files.
+ No byte-level tracking, no hysteresis, no writer-stalled flag.
 ======================================================================*/
-class WriterBackpressure {
+class FrameThrottle {
 public:
-  // Default: 4 GiB high / 2 GiB low.  Tuned for NVMe at ~2 GiB/s:
-  // 2 GiB low-water = ~1 second of writer runway before starvation.
-  explicit WriterBackpressure(uint64_t high = 4ULL * 1024 * 1024 * 1024,
-                              uint64_t low  = 2ULL * 1024 * 1024 * 1024)
-    : high_water_(high), low_water_(low) {}
+  explicit FrameThrottle(int max_in_flight = 512)
+    : permits_(max_in_flight), max_(max_in_flight) {}
 
-  // Called by workers after producing a decompressed frame.
-  // Lightweight atomic add  no lock, no CV interaction.
-  void mark_produced(uint64_t bytes) {
-    produced_.fetch_add(bytes, std::memory_order_relaxed);
-  }
-
-  // Called by AIO worker after physically writing data to disk.
-  // If backlog drops below low-water, wakes all blocked CPU workers.
-  void mark_written(uint64_t bytes) {
-    written_.fetch_add(bytes, std::memory_order_release);
-    uint64_t backlog = produced_.load(std::memory_order_relaxed)
-                     - written_.load(std::memory_order_acquire);
-    if (backlog <= low_water_) {
-      std::lock_guard<std::mutex> lk(m_);
-      cv_.notify_all();
-    }
-  }
-
-  // Called by workers before popping a new task.
-  // Blocks if backlog exceeds high-water mark.  Returns immediately if:
-  //   - backlog is acceptable (fast path)
-  //   - done flag is set (shutdown)
-  //   - writer is stalled waiting for a sequential frame still in the queue
-  //     (workers must stay active to pop and produce that frame)
-  void wait_if_backlogged() {
-    uint64_t backlog = produced_.load(std::memory_order_relaxed)
-                     - written_.load(std::memory_order_acquire);
-    if (backlog <= high_water_) return;  // fast path: no contention
-
-    // If writer is stalled on a missing frame, don't block — the writer
-    // needs us to pop and produce that frame to make progress.
-    if (writer_stalled_.load(std::memory_order_acquire)) return;
-
-    // Slow path: block until writer catches up
+  // Acquire n permits.  Blocks until enough are available (or done).
+  // Greedy: takes whatever is available immediately, waits for the rest.
+  void acquire(int n = 1) {
+    if (n <= 0) return;
     std::unique_lock<std::mutex> lk(m_);
-    cv_.wait(lk, [this] {
-      uint64_t bl = produced_.load(std::memory_order_relaxed)
-                  - written_.load(std::memory_order_acquire);
-      return bl <= low_water_
-          || done_.load(std::memory_order_relaxed)
-          || writer_stalled_.load(std::memory_order_acquire);
-    });
-  }
-
-  // Called by the writer thread when it's waiting for a sequential frame
-  // that hasn't been produced yet.  Wakes all blocked workers so they can
-  // pop and produce the missing frame — prevents deadlock where out-of-order
-  // frames in ResultStore inflate the backlog while the writer can't drain them.
-  void set_writer_stalled(bool stalled) {
-    writer_stalled_.store(stalled, std::memory_order_release);
-    if (stalled) {
-      std::lock_guard<std::mutex> lk(m_);
-      cv_.notify_all();
+    while (n > 0 && !done_) {
+      cv_.wait(lk, [&] { return permits_ > 0 || done_; });
+      if (done_) return;
+      int take = std::min(n, permits_);
+      permits_ -= take;
+      n -= take;
     }
   }
 
-  // Signal that all work is complete  wake any blocked workers so they can exit.
-  void set_done() {
-    done_.store(true, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lk(m_);
+  // Release n permits (called by writer after writing frames to disk).
+  void release(int n = 1) {
+    if (n <= 0) return;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      permits_ += n;
+    }
     cv_.notify_all();
   }
 
-  uint64_t backlog() const {
-    return produced_.load(std::memory_order_relaxed)
-         - written_.load(std::memory_order_acquire);
+  // Signal shutdown -- wake all blocked workers so they can exit.
+  void set_done() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      done_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  int in_flight() const {
+    // Not locked -- advisory only (for stats/debug).
+    return max_ - permits_;
   }
 
 private:
-  std::atomic<uint64_t> produced_{0};
-  std::atomic<uint64_t> written_{0};
-  uint64_t high_water_;
-  uint64_t low_water_;
-  std::atomic<bool> done_{false};
-  std::atomic<bool> writer_stalled_{false};
+  int permits_;
+  int max_;
+  bool done_ = false;
   std::mutex m_;
   std::condition_variable cv_;
 };
@@ -1686,7 +1644,7 @@ private:
 class AsyncWritePool {
 public:
   explicit AsyncWritePool(FILE * out_file, DirectWriter * dw, bool sparse = true,
-                          Meter * meter = nullptr, WriterBackpressure * bp = nullptr)
+                          Meter * meter = nullptr, FrameThrottle * bp = nullptr)
     : out_(out_file), dw_(dw), sparse_(sparse), done_(false), meter_(meter), bp_(bp)
   {
     worker_ = std::thread(&AsyncWritePool::worker_fn, this);
@@ -1815,8 +1773,8 @@ private:
         // Update wrote_bytes after physical write (not after submit)
         // so the progress bar reflects actual disk I/O completion.
         if (meter_) meter_->wrote_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
-        // Notify backpressure: writer made progress, CPU workers may unblock.
-        if (bp_) bp_->mark_written(buf.size());
+        // Release one frame permit: writer made progress, blocked workers may unblock.
+        if (bp_) bp_->release(1);
       }
     }
   }
@@ -1833,12 +1791,12 @@ private:
   bool error_ = false;
   uint64_t sparse_saved_ = 0;  // bytes skipped via sparse seek
   Meter * meter_ = nullptr;     // for tracking physically-written bytes
-  WriterBackpressure * bp_ = nullptr;  // for throttling CPU workers
+  FrameThrottle * bp_ = nullptr;  // frame throttle (releases permits after writes)
 };
 
 static void writer_thread(FILE * out, ResultStore & results,
                           const Options & opt, Meter * m,
-                          WriterBackpressure * bp)
+                          FrameThrottle * bp)
 {
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   // pin_thread_to_core(1);              // disabled: hurts on loaded machines
@@ -1883,12 +1841,6 @@ static void writer_thread(FILE * out, ResultStore & results,
     // On each wakeup, drain per-GPU slots into the shared map, then check
     // if the next sequential frame is available.  Producers call notify_all
     // on every frame delivery, so the writer wakes promptly.
-    //
-    // Signal backpressure that we're stalled so blocked workers unblock
-    // and can pop/produce the missing frame.  Clear the flag as soon as
-    // we find the frame (or detect all_done).
-    if (results.data.count(results.next_to_write) == 0 && !all_done && bp)
-      bp->set_writer_stalled(true);
     while (results.data.count(results.next_to_write) == 0 && !all_done) {
       results.drain_slots_locked();
       if (results.data.count(results.next_to_write) != 0) break;
@@ -1920,9 +1872,6 @@ static void writer_thread(FILE * out, ResultStore & results,
               && results.workers_done
               && results.next_to_write >= results.total_tasks;
     }
-
-    // Clear stalled flag — we either found the frame or detected all_done.
-    if (bp) bp->set_writer_stalled(false);
 
     if (g_perf && waited) {
       g_perf->writer_wait_ns.fetch_add(now_ns() - wait_t0);
@@ -2326,16 +2275,17 @@ static void cpu_worker(
   RateMatchState * rate_match,
 #endif
   CpuAgg * cpuagg,
-  WriterBackpressure * bp)
+  FrameThrottle * bp)
 {
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
   while (true) {
-    // Backpressure: block if writer can't keep up (prevents RAM exhaustion)
-    if (bp) bp->wait_if_backlogged();
+    // Frame throttle: block if too many frames in flight (prevents RAM exhaustion)
+    if (bp) bp->acquire(1);
 
     Task t;
+    bool got_task = false;
 #ifdef HAVE_NVCOMP
     if (sched) {
       // Hybrid mode: block on queue CV until scheduler allows CPU to take
@@ -2349,8 +2299,8 @@ static void cpu_worker(
             && !qs.done) return false;
         return true;
       };
-      if (!tq->pop_one_cpu(t, may_take)) break;
-      sched->mark_cpu_take(1);
+      got_task = tq->pop_one_cpu(t, may_take);
+      if (got_task) sched->mark_cpu_take(1);
     } else
 #endif
     {
@@ -2359,11 +2309,12 @@ static void cpu_worker(
         auto threshold_met = [&](const TaskQueue::QueueState & qs) -> bool {
           return qs.depth >= opt->cpu_queue_min || qs.done;
         };
-        if (!tq->wait_for_cpu(threshold_met)) break;
-        if (tq->drained() && tq->size() == 0) break;
+        if (!tq->wait_for_cpu(threshold_met)) { if (bp) bp->release(1); break; }
+        if (tq->drained() && tq->size() == 0) { if (bp) bp->release(1); break; }
       }
-      if (!tq->pop_one(t)) break;
+      got_task = tq->pop_one(t);
     }
+    if (!got_task) { if (bp) bp->release(1); break; }
 
     // cpu_backlog check: if the queue is below the backlog threshold,
     // re-enqueue and wait.  This is a secondary throttle separate from
@@ -2415,7 +2366,6 @@ static void cpu_worker(
 
     if (m) m->tasks_done.fetch_add(1);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
-    if (bp) bp->mark_produced(csz);  // track output for writer backpressure
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(in_size);
 #endif
@@ -2469,12 +2419,12 @@ static void cpu_worker_rescue(
   const Options * opt,
   Meter * /*m*/,
   CpuAgg * cpuagg,
-  WriterBackpressure * bp)
+  FrameThrottle * bp)
 {
   while (true) {
-    if (bp) bp->wait_if_backlogged();
+    if (bp) bp->acquire(1);
     Task t;
-    if (!rq->pop_one(t)) break;
+    if (!rq->pop_one(t)) { if (bp) bp->release(1); break; }
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
     compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, out_frame);
@@ -2498,7 +2448,6 @@ static void cpu_worker_rescue(
 
     // Deliver compressed frame to the result store
     results->push_to_slot(-1, t.seq, std::move(out_frame));
-    if (bp) bp->mark_produced(csz);
 
     // Update per-thread stats
     {
@@ -2533,7 +2482,7 @@ static void cpu_decomp_worker(
   RateMatchState * rate_match,
 #endif
   CpuAgg * cpuagg,
-  WriterBackpressure * bp)
+  FrameThrottle * bp)
 {
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
@@ -2545,14 +2494,11 @@ static void cpu_decomp_worker(
   }
 
   while (true) {
-    // Writer backpressure: block if the writer is overwhelmed.
-    // This prevents CPU workers from producing decompressed data faster
-    // than the NVMe can write, which would exhaust RAM and cause massive
-    // kernel writeback pressure (the sys time problem).
-    // GPUs are never throttled  their batches are already in-flight.
-    if (bp) bp->wait_if_backlogged();
+    // Frame throttle: block if too many frames in flight (prevents RAM exhaustion)
+    if (bp) bp->acquire(1);
 
     Task t;
+    bool got_task = false;
 #ifdef HAVE_NVCOMP
     if (sched) {
       // Hybrid decompress: block on queue CV until scheduler allows CPU to take
@@ -2570,15 +2516,17 @@ static void cpu_decomp_worker(
             && !qs.done) return false;
         return true;
       };
-      if (!tq->pop_one_cpu(t, may_take)) break;
-      sched->mark_cpu_take(1);
-      if (got_trivial && opt->verbosity >= V_DEBUG) {
-        double ratio = (t.decomp_size > 0)
-                       ? double(t.data.size()) / double(t.decomp_size) : 0.0;
-        std::ostringstream os;
-        os << "[CPU/T" << worker_id << "] trivial frame (ratio="
-           << std::fixed << std::setprecision(3) << (ratio * 100.0) << "%)";
-        vlog(V_DEBUG, *opt, os.str() + "\n");
+      got_task = tq->pop_one_cpu(t, may_take);
+      if (got_task) {
+        sched->mark_cpu_take(1);
+        if (got_trivial && opt->verbosity >= V_DEBUG) {
+          double ratio = (t.decomp_size > 0)
+                         ? double(t.data.size()) / double(t.decomp_size) : 0.0;
+          std::ostringstream os;
+          os << "[CPU/T" << worker_id << "] trivial frame (ratio="
+             << std::fixed << std::setprecision(3) << (ratio * 100.0) << "%)";
+          vlog(V_DEBUG, *opt, os.str() + "\n");
+        }
       }
     } else
 #endif
@@ -2588,10 +2536,12 @@ static void cpu_decomp_worker(
         auto threshold_met = [&](const TaskQueue::QueueState & qs) -> bool {
           return qs.depth >= opt->cpu_queue_min || qs.done;
         };
-        if (!tq->wait_for_cpu(threshold_met)) break;
-        if (tq->drained() && tq->size() == 0) break;
+        if (!tq->wait_for_cpu(threshold_met)) { if (bp) bp->release(1); break; }
+        if (tq->drained() && tq->size() == 0) { if (bp) bp->release(1); break; }
       }
-      if (!tq->pop_one(t)) break;
+      got_task = tq->pop_one(t);
+    }
+    if (!got_task) { if (bp) bp->release(1); break; }
     }
     {
     const auto t0_w = std::chrono::steady_clock::now();
@@ -2637,7 +2587,6 @@ static void cpu_decomp_worker(
     if (m) m->read_bytes.fetch_add(comp_size);
 
     results->push_to_slot(-1, t.seq, std::move(out_buf));
-    if (bp) bp->mark_produced(actual);  // track backpressure for writer throttling
 
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(comp_size);
@@ -2855,10 +2804,9 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 
   TaskQueue queue;
   ResultStore results;
-  WriterBackpressure backpressure;
-  // Disable backpressure in test mode: no disk I/O, so mark_written() is never
-  // called and CPU workers would block at the high-water mark forever.
-  WriterBackpressure * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &backpressure;
+  FrameThrottle throttle;
+  // Disable throttle in test mode: no disk I/O means permits are never released.
+  FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // Start writer thread (outputs decompressed frames in original order)
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
@@ -2905,7 +2853,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
       results.workers_done = true;
     }
     results.cv.notify_all();
-    backpressure.set_done();
+    throttle.set_done();
     for (auto & th : pool) th.join();
     wthr.join();
 
@@ -2925,7 +2873,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
       results.workers_done = true;
     }
     results.cv.notify_all();
-    backpressure.set_done();
+    throttle.set_done();
     for (auto & th : pool) th.join();
     wthr.join();
     return;
@@ -2944,11 +2892,11 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   results.cv.notify_all();
 
   // Wait for workers, then writer.
-  // Do NOT call backpressure.set_done() before join: workers must respect
-  // backpressure while draining the queue, otherwise they buffer the entire
-  // output in RAM (the done_ flag makes wait_if_backlogged() a no-op).
+  // Do NOT call throttle.set_done() before join: workers must respect
+  // throttle while draining the queue, otherwise they buffer the entire
+  // output in RAM (the done_ flag bypasses acquire()).
   for (auto & th : pool) th.join();
-  backpressure.set_done();  // safe now: all workers exited
+  throttle.set_done();  // safe now: all workers exited
   {
     std::lock_guard<std::mutex> lk(results.m);
     results.workers_done = true;
@@ -3082,8 +3030,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
   ResultStore results;
-  WriterBackpressure backpressure;
-  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &backpressure);
+  FrameThrottle throttle;
+  std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
   Options opt_copy = opt;
@@ -3091,7 +3039,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 #ifdef HAVE_NVCOMP
     nullptr, nullptr,
 #endif
-    &cpuagg, &backpressure);
+    &cpuagg, &throttle);
   if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
 
   // Producer loop: read input in chunks and enqueue for compression
@@ -3124,10 +3072,10 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   results.cv.notify_all();
 
   // Wait for all workers to finish, then signal the writer.
-  // Do NOT call backpressure.set_done() before join: workers must respect
-  // backpressure while draining the queue to avoid buffering entire output in RAM.
+  // Do NOT call throttle.set_done() before join: workers must respect
+  // throttle while draining the queue to avoid buffering entire output in RAM.
   for (auto & th : pool) th.join();
-  backpressure.set_done();  // safe now: all workers exited
+  throttle.set_done();  // safe now: all workers exited
   {
     std::lock_guard<std::mutex> lk(results.m);
     results.workers_done = true;
@@ -3519,7 +3467,7 @@ static void gpu_worker(
   std::atomic<bool> * gpu_started_flag,
   SharedTuneState * shared_tune,
   RateMatchState * rate_match,
-  WriterBackpressure * bp)
+  FrameThrottle * bp)
 {
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   void * vram_reserve = nullptr;
@@ -3842,22 +3790,28 @@ static void gpu_worker(
         pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
-        // Backpressure BEFORE gpu_wants_data: if we signal "GPU wants data" first,
-        // CPUs yield to us, but we then stall on backpressure — nobody pops, deadlock.
-        if (bp) bp->wait_if_backlogged();
+        // Acquire frame permits BEFORE gpu_wants_data to avoid deadlock:
+        // if we signal "GPU wants data" first, CPUs yield, but we then
+        // block on throttle — nobody pops.
+        if (bp) bp->acquire((int)pop_n);
         // Signal scheduler: GPU stream wants data (blocks CPU workers)
         if (sched) sched->gpu_wants_data();
         if (!queue->pop_batch_greedy(pop_n, C.batch)) {
           if (sched) sched->gpu_got_data();
+          if (bp) bp->release((int)pop_n);  // release unused permits
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           producer_done_seen = true; continue;
         }
         // Signal scheduler: GPU got its data (unblocks CPU workers)
         if (sched) sched->gpu_got_data();
         if (C.batch.empty()) {
+          if (bp) bp->release((int)pop_n);  // release unused permits
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           continue;
         }
+        // Release excess permits if we got fewer frames than requested
+        if (bp && (int)C.batch.size() < (int)pop_n)
+          bp->release((int)pop_n - (int)C.batch.size());
         if (gpu_started_flag) { gpu_started_flag->store(true, std::memory_order_release); }
         if (sched) { sched->mark_gpu_take(C.batch.size()); }
         if (g_perf) g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
@@ -3979,8 +3933,6 @@ static void gpu_worker(
                       "cudaMemcpy(D2H exact)");
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
           }
-          // Track GPU compressed output for writer backpressure
-          if (bp) bp->mark_produced(out_sum);
           if (g_perf) {
             g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
             g_perf->d2h_bytes.fetch_add(out_sum);
@@ -4113,8 +4065,6 @@ static void gpu_worker(
               g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
             }
           }
-          // Track GPU compressed output for writer backpressure (sync path)
-          if (bp) bp->mark_produced(out_sum);
           #ifdef HAVE_NVCOMP
           if (sched) sched->add_gpu_bytes(in_sum);
           #endif
@@ -4513,14 +4463,13 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   }
 #endif
 
-  // Writer backpressure: prevents workers from producing compressed data
-  // faster than the NVMe can write.  Same mechanism as decompress backpressure.
-  WriterBackpressure backpressure;
+  // Frame throttle: bounds in-flight frames to prevent RAM exhaustion.
+  FrameThrottle throttle;
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
-  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, &backpressure);
+  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   // ---- Hybrid scheduler (adaptive CPU/GPU work-sharing) ----
   std::unique_ptr<HybridSched> sched_ptr;
@@ -4553,7 +4502,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     unsigned ths = std::max(1u, std::thread::hardware_concurrency() / 2);
     rescue_pool.reserve(ths);
     for (unsigned i = 0; i < ths; ++i)
-      rescue_pool.emplace_back(cpu_worker_rescue, (int)i, &rescue, &results, &opt, m, &cpuagg, &backpressure);
+      rescue_pool.emplace_back(cpu_worker_rescue, (int)i, &rescue, &results, &opt, m, &cpuagg, &throttle);
 
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -4583,7 +4532,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
     for (int i = 0; i < cpu_threads; ++i)
-      cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &rate_match_compress, &cpuagg, &backpressure);
+      cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &rate_match_compress, &cpuagg, &throttle);
   }
 
   // ---- GPU workers (init CUDA context, allocate memory  CPUs already working) ----
@@ -4608,7 +4557,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                          &any_gpu_failed, &abort_on_failure,
                          &fatal_msgs[size_t(i)], &gpu_started,
                          &shared_tune, &rate_match_compress,
-                         &backpressure);
+                         &throttle);
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
@@ -4658,10 +4607,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   results.cv.notify_all();
 
   // ---- Teardown: join all threads in correct order ----
-  // Do NOT call backpressure.set_done() before join: workers must respect
-  // backpressure while draining the queue to avoid buffering entire output in RAM.
+  // Do NOT call throttle.set_done() before join: workers must respect
+  // throttle while draining the queue to avoid buffering entire output in RAM.
   for (auto & th : workers) th.join();
-  backpressure.set_done();  // safe now: all workers exited
+  throttle.set_done();  // safe now: all workers exited
 
   // Check for GPU failures
   if (any_gpu_failed.load()) {
@@ -4673,7 +4622,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
     if (abort_on_failure.load() && failed_count >= total_gpus) {
       // ALL GPUs failed in --gpu-only mode  fatal
-      backpressure.set_done();  // unblock any waiting workers
+      throttle.set_done();  // unblock any waiting workers
       progress_done = true;
       progress_thr.join();
       {
@@ -4746,7 +4695,7 @@ static void gpu_decomp_worker(
   std::string * fatal_msg,
   SharedTuneState * shared_tune,
   RateMatchState * rate_match,
-  WriterBackpressure * bp)
+  FrameThrottle * bp)
 {
   (void)m;
   const size_t stream_count = std::max<size_t>(1, (size_t)opt.gpu_streams);
@@ -5139,17 +5088,13 @@ static void gpu_decomp_worker(
         // measurement).  4 frames (64 MiB) is enough to amortize kernel
         // launch overhead while keeping GPUs responsive.
         const size_t decomp_min_batch = std::min<size_t>(pop_n, 4);
-        // Backpressure: wait if writer is overwhelmed before grabbing more work.
-        // This prevents GPUs from flooding the result store with decompressed
-        // data faster than the NVMe can write.
-        // IMPORTANT: must come BEFORE gpu_wants_data() — otherwise the GPU
-        // signals "I want data" (blocking CPUs) but then stalls on backpressure,
-        // creating a deadlock where nobody pops from the queue.
-        if (bp) bp->wait_if_backlogged();
+        // Acquire frame permits BEFORE gpu_wants_data to avoid deadlock.
+        if (bp) bp->acquire((int)pop_n);
         // Signal scheduler: this GPU stream wants data (blocks CPU workers)
         if (sched) sched->gpu_wants_data();
         if (!queue->pop_batch_greedy(pop_n, C.batch, decomp_min_batch)) {
           if (sched) sched->gpu_got_data();
+          if (bp) bp->release((int)pop_n);  // release unused permits
           if (g_perf) {
             g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
             g_perf->queue_wait_count.fetch_add(1);
@@ -5159,10 +5104,16 @@ static void gpu_decomp_worker(
         }
         // Signal scheduler: this GPU stream got its data (unblocks CPU workers)
         if (sched) sched->gpu_got_data();
-        if (g_perf && C.batch.empty()) {
-          g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
-          g_perf->queue_wait_count.fetch_add(1);
+        if (C.batch.empty()) {
+          if (bp) bp->release((int)pop_n);  // release unused permits
+          if (g_perf) {
+            g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
+            g_perf->queue_wait_count.fetch_add(1);
+          }
         }
+        // Release excess permits if we got fewer frames than requested
+        if (bp && !C.batch.empty() && (int)C.batch.size() < (int)pop_n)
+          bp->release((int)pop_n - (int)C.batch.size());
         if (C.batch.empty()) continue;
         if (g_perf) {
           g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
@@ -5356,11 +5307,6 @@ static void gpu_decomp_worker(
           results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
           if (g_perf) g_perf->result_lock_ns.fetch_add(now_ns() - rl_t0);
         }
-        // Track GPU output for writer backpressure accounting.
-        // GPUs are never throttled (batches are in-flight), but their output
-        // counts toward the backlog so CPU workers throttle correctly.
-        if (bp) bp->mark_produced(out_sum);
-
         if (g_perf) {
           g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
           g_perf->d2h_bytes.fetch_add(d2h_bytes_batch);
@@ -5524,15 +5470,12 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
   RateMatchState rate_match;
 
-  // Writer backpressure: prevents CPU workers from producing decompressed data
-  // faster than the NVMe can write.  Without this, 96 CPU threads + 8 GPUs
-  // all flooding the writer causes 19 minutes of sys time (kernel writeback).
-  // GPUs call mark_produced() but are never throttled (batches in-flight).
-  // CPU workers call wait_if_backlogged() before popping a new task.
-  // Disabled in test mode: no disk I/O means mark_written() is never called,
-  // so workers would block at the high-water mark forever.
-  WriterBackpressure backpressure;
-  WriterBackpressure * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &backpressure;
+  // Frame throttle: bounds in-flight frames (popped but not yet written) to
+  // prevent RAM exhaustion.  Workers acquire permits before popping; the
+  // writer releases permits after each frame is physically written to disk.
+  // Disabled in test mode: no disk I/O means permits are never released.
+  FrameThrottle throttle;
+  FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // ---- Writer thread (outputs decompressed data in order) ----
   std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
@@ -5631,7 +5574,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       results.workers_done = true;
     }
     results.cv.notify_all();
-    backpressure.set_done();
+    throttle.set_done();
     for (auto & th : gpu_workers) th.join();
     for (auto & th : cpu_pool) th.join();
     if (sched) { tick_done = true; if (tick_thr.joinable()) tick_thr.join(); }
@@ -5686,8 +5629,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   rescue.set_done();
-  // Do NOT call backpressure.set_done() before join: workers must respect
-  // backpressure while draining the queue to avoid buffering entire output in RAM.
+  // Do NOT call throttle.set_done() before join: workers must respect
+  // throttle while draining the queue to avoid buffering entire output in RAM.
   if (!cpu_pool.empty()) {
     auto t_cpu = std::chrono::steady_clock::now();
     for (auto & th : cpu_pool) th.join();
@@ -5698,7 +5641,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         vlog(V_VERBOSE, opt, "CPU pool join: " + std::to_string(int(ms)) + " ms\n");
     }
   }
-  backpressure.set_done();  // safe now: all workers exited
+  throttle.set_done();  // safe now: all workers exited
 
   {
     std::lock_guard<std::mutex> lk(results.m);
