@@ -2497,7 +2497,7 @@ static void cpu_decomp_worker(
     // Frame throttle: block if too many frames in flight (prevents RAM exhaustion)
     if (bp) bp->acquire(1);
 
-    Task t;
+    Task t{};
     bool got_task = false;
 #ifdef HAVE_NVCOMP
     if (sched) {
@@ -2542,8 +2542,7 @@ static void cpu_decomp_worker(
       got_task = tq->pop_one(t);
     }
     if (!got_task) { if (bp) bp->release(1); break; }
-// Removed this extra brace here --rtcheek:    }
-    {
+
     const auto t0_w = std::chrono::steady_clock::now();
 
     std::vector<char> out_buf(t.decomp_size);
@@ -2601,7 +2600,6 @@ static void cpu_decomp_worker(
       st.out_bytes += actual;
       st.comp_ms  += ms;
     }
-    } // end single-frame processing block
   }
 }
 
