@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.0";
+static constexpr const char * GZSTD_VERSION = "0.12.1";
 //
 // Architecture overview:
 //
@@ -301,7 +301,8 @@ static void print_help()
 " -1 .. -19 Compression level (CPU zstd; default: 3)\n"
 " -20 .. -22 Stronger levels (require --ultra; use more memory)\n"
 " --fast Alias for a fast CPU level (maps to -1)\n"
-" --ultra Enable ultra levels (-20..-22); higher memory usage\n"
+" --ultra Enable ultra levels (-20..-22); sets large window (32-128 MiB)\n"
+"               which requires significantly more memory per thread\n"
 " --best Alias for a strong CPU level (maps to -19)\n"
 " -v / -vv / -vvv Verbose / more verbose / debug-trace\n"
 " -q, --quiet Errors only (suppress progress and info)\n"
@@ -948,6 +949,60 @@ static uint64_t get_available_ram_bytes()
 #endif
 }
 
+/*======================================================================
+ Ultra compression: window log helper
+ -----------------------------------------------------------------------
+ Zstd ultra levels (20-22) require explicitly setting ZSTD_c_windowLog
+ to a value larger than the library default.  Without this, the library
+ silently clamps the window to ~8 MiB, negating the purpose of ultra.
+
+ Window sizes:
+   level 20: windowLog 25 = 32 MiB
+   level 21: windowLog 26 = 64 MiB
+   level 22: windowLog 27 = 128 MiB
+
+ The chunk size should be >= window size for ultra to be effective,
+ since zstd can't use a window larger than the input chunk.
+======================================================================*/
+
+// Returns the required windowLog for the given compression level.
+// Returns 0 if no special window is needed (level < 20 or !ultra).
+static int ultra_window_log(int level, bool ultra)
+{
+  if (!ultra || level < 20) return 0;
+  // level 20 -> 25, level 21 -> 26, level 22 -> 27
+  return level + 5;
+}
+
+// Returns the minimum chunk size (in MiB) needed for ultra levels.
+// The chunk must be >= window size for the compressor to use the full window.
+// Returns 0 if no minimum is needed.
+static size_t ultra_min_chunk_mib(int level, bool ultra)
+{
+  int wlog = ultra_window_log(level, ultra);
+  if (wlog == 0) return 0;
+  // windowLog N means window = 2^N bytes; convert to MiB
+  return size_t(1) << (wlog - 20);  // 25->32, 26->64, 27->128
+}
+
+// Apply ultra window log to a CCtx.  Call after setting compression level.
+// Returns the windowLog that was set, or 0 if none.
+static int apply_ultra_cctx(ZSTD_CCtx * cctx, int level, bool ultra)
+{
+  int wlog = ultra_window_log(level, ultra);
+  if (wlog > 0) {
+    size_t st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, wlog);
+    if (ZSTD_isError(st)) {
+      // Non-fatal: log warning but continue with default window
+      std::cerr << "gzstd: warning: ZSTD_c_windowLog(" << wlog
+                << ") failed: " << ZSTD_getErrorName(st)
+                << "  falling back to default window\n";
+      return 0;
+    }
+  }
+  return wlog;
+}
+
 // Pre-flight RAM check: estimate memory needed for N threads × chunk_mib.
 // Each thread needs: input buffer (chunk) + output buffer (ZSTD_compressBound(chunk))
 // plus queue overhead, result store, etc.
@@ -966,7 +1021,18 @@ static size_t check_ram_budget(int threads, size_t chunk_mib, const Options & op
   while (chunk_mib >= 1) {
     size_t chunk_bytes = chunk_mib * ONE_MIB;
     // Per thread: input buf + output buf (compressBound ≈ chunk + chunk/256 + 64)
-    size_t per_thread = chunk_bytes + chunk_bytes + (chunk_bytes >> 8) + 4096;
+    // Ultra levels (20-22) require much larger CCtx internal state because
+    // the window size grows to 32-128 MiB.  Each CCtx allocates roughly
+    // 8 × windowSize for the hash tables + chain tables.
+    size_t cctx_overhead = 0;
+    {
+      int wlog = ultra_window_log(opt.level, opt.ultra);
+      if (wlog > 0) {
+        size_t window_bytes = size_t(1) << wlog;
+        cctx_overhead = window_bytes * 8;  // hash + chain tables
+      }
+    }
+    size_t per_thread = chunk_bytes + chunk_bytes + (chunk_bytes >> 8) + 4096 + cctx_overhead;
     // Queue + result store can hold up to threads × 2 frames in flight
     size_t overhead = (size_t)threads * 2 * chunk_bytes;
     uint64_t est_total = (uint64_t)threads * per_thread + overhead;
@@ -1939,7 +2005,7 @@ static void writer_thread(FILE * out, ResultStore & results,
 // Thread-local CCtx avoids repeated allocation for per-chunk compression
 static thread_local ZSTD_CCtx * tl_cctx = nullptr;
 
-static inline void compress_one_cpu_frame(const void * src, size_t src_size, int level, std::vector< char > & out)
+static inline void compress_one_cpu_frame(const void * src, size_t src_size, int level, bool ultra, std::vector< char > & out)
 {
   if (!tl_cctx) {
     tl_cctx = ZSTD_createCCtx();
@@ -1948,6 +2014,10 @@ static inline void compress_one_cpu_frame(const void * src, size_t src_size, int
   // Set compression level explicitly on every call (level may differ per invocation)
   size_t st = ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_compressionLevel, level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
+
+  // Ultra levels (20-22) need an explicit windowLog for the large window to take effect.
+  // Without this, zstd silently clamps to its default window (~8 MiB), defeating ultra.
+  apply_ultra_cctx(tl_cctx, level, ultra);
 
   size_t bound = ZSTD_compressBound(src_size);
   out.resize(bound);
@@ -2333,7 +2403,7 @@ static void cpu_worker(
     {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
-    compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, out_frame);
+    compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, opt->ultra, out_frame);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
     const size_t csz = out_frame.size();
@@ -2427,7 +2497,7 @@ static void cpu_worker_rescue(
     if (!rq->pop_one(t)) { if (bp) bp->release(1); break; }
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
-    compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, out_frame);
+    compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, opt->ultra, out_frame);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast<
         std::chrono::duration<double, std::milli>>(t1 - t0).count();
@@ -2915,6 +2985,25 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
 {
   // Chunk size: 16 MiB default, or user-specified via --chunk-size
   size_t chosen_mib = opt.chunk_user_set ? opt.chunk_mib : 16;
+
+  // Ultra levels need chunk >= window size to be effective.
+  // Auto-increase if the user didn't explicitly set --chunk-size.
+  {
+    size_t ultra_min = ultra_min_chunk_mib(opt.level, opt.ultra);
+    if (ultra_min > 0 && chosen_mib < ultra_min) {
+      if (!opt.chunk_user_set) {
+        vlog(V_VERBOSE, opt, "ultra: auto-increasing chunk size from "
+             + std::to_string(chosen_mib) + " to " + std::to_string(ultra_min)
+             + " MiB (must be >= window size)\n");
+        chosen_mib = ultra_min;
+      } else {
+        vlog(V_ERROR, opt, "warning: --chunk-size=" + std::to_string(chosen_mib)
+             + " MiB is smaller than the ultra window ("
+             + std::to_string(ultra_min) + " MiB). Compression ratio will suffer.\n");
+      }
+    }
+  }
+
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   // Get total input size for progress percentage
@@ -2937,6 +3026,14 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   if (!cctx) die("failed to create ZSTD_CCtx");
   size_t st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
+
+  // Ultra levels need explicit windowLog for large windows to take effect
+  {
+    int wlog = apply_ultra_cctx(cctx, opt.level, opt.ultra);
+    if (wlog > 0)
+      vlog(V_VERBOSE, opt, "ultra: windowLog=" + std::to_string(wlog)
+           + " (" + std::to_string(size_t(1) << (wlog - 20)) + " MiB window)\n");
+  }
 
   std::vector< char > inbuf(chunk_bytes);
   std::vector< char > outbuf(ZSTD_compressBound(chunk_bytes));
@@ -3006,9 +3103,37 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // Determine chunk size (auto or user-specified)
   // Chunk size: 16 MiB default, or user-specified via --chunk-size
   size_t chosen_mib = opt.chunk_user_set ? opt.chunk_mib : 16;
+
+  // Ultra levels need chunk >= window size to be effective.
+  {
+    size_t ultra_min = ultra_min_chunk_mib(opt.level, opt.ultra);
+    if (ultra_min > 0 && chosen_mib < ultra_min) {
+      if (!opt.chunk_user_set) {
+        vlog(V_VERBOSE, opt, "ultra: auto-increasing chunk size from "
+             + std::to_string(chosen_mib) + " to " + std::to_string(ultra_min)
+             + " MiB (must be >= window size)\n");
+        chosen_mib = ultra_min;
+      } else {
+        vlog(V_ERROR, opt, "warning: --chunk-size=" + std::to_string(chosen_mib)
+             + " MiB is smaller than the ultra window ("
+             + std::to_string(ultra_min) + " MiB). Compression ratio will suffer.\n");
+      }
+    }
+  }
+
   // Pre-flight: check we won't OOM  may reduce chunk size
   chosen_mib = check_ram_budget(threads, chosen_mib, opt);
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
+
+  // Warn if RAM budget forced chunk below ultra minimum
+  {
+    size_t ultra_min = ultra_min_chunk_mib(opt.level, opt.ultra);
+    if (ultra_min > 0 && chosen_mib < ultra_min) {
+      vlog(V_ERROR, opt, "warning: RAM budget reduced chunk to "
+           + std::to_string(chosen_mib) + " MiB, below ultra window ("
+           + std::to_string(ultra_min) + " MiB). Consider reducing -T or adding RAM.\n");
+    }
+  }
 
   // Get total input size for progress percentage (unknown for pipes)
   uint64_t total_in = 0;
@@ -4425,6 +4550,25 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // ---- Determine chunk size ----
   // 16 MiB default: matches GPU_SUBCHUNK_MAX, no splitting needed.
   size_t chosen_mib = opt.chunk_user_set ? opt.chunk_mib : 16;
+
+  // Ultra levels need chunk >= window size for CPU workers in hybrid mode.
+  // GPU workers use nvCOMP (fixed level), but CPU rescue/hybrid workers use zstd.
+  {
+    size_t ultra_min = ultra_min_chunk_mib(opt.level, opt.ultra);
+    if (ultra_min > 0 && chosen_mib < ultra_min && !opt.gpu_only) {
+      if (!opt.chunk_user_set) {
+        vlog(V_VERBOSE, opt, "ultra: auto-increasing chunk size from "
+             + std::to_string(chosen_mib) + " to " + std::to_string(ultra_min)
+             + " MiB (must be >= window size for CPU workers)\n");
+        chosen_mib = ultra_min;
+      } else {
+        vlog(V_ERROR, opt, "warning: --chunk-size=" + std::to_string(chosen_mib)
+             + " MiB is smaller than the ultra window ("
+             + std::to_string(ultra_min) + " MiB). CPU compression ratio will suffer.\n");
+      }
+    }
+  }
+
   // Pre-flight: check we won't OOM (CPU rescue threads also need buffers)
   int cpu_threads_est = opt.cpu_only ? 0 : resolve_cpu_threads(opt.cpu_threads);
   chosen_mib = check_ram_budget(std::max(1, cpu_threads_est), chosen_mib, opt);
