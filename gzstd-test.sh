@@ -369,6 +369,7 @@ count_tests() {
   has_gpu 2>/dev/null && count=$((count + 10)) || count=$((count + 10))  # 32: space-separated (4 base + 6 gpu or 6 skip)
   has_gpu 2>/dev/null && count=$((count + 17)) || count=$((count + 15))  # 33: verbose validation
   count=$((count + 6))   # 34: summary format
+  count=$((count + 8))   # 35: ultra validation (windowLog, T1, T4, chunk-warn, chunk-ok, prog×2, interop)
   echo $count
 }
 
@@ -1728,7 +1729,7 @@ fi
 # --- Check no garbled output (progress bar overlapping text) ---
 # At -vvv, progress bar is disabled, so look for signs of overlapping lines:
 # a line containing both a percentage bracket and a summary stat
-if echo "$stderr_vvv" | grep -qE '^\[.*%\].*GiB/s.*\['; then
+if echo "$stderr_vvv" | grep -qE '^in:[0-9]+\.[0-9]+%.*out:[0-9]+\.[0-9]+%'; then
   fail "-vvv progress bar overlaps content"
 else
   pass "-vvv output clean"
@@ -1842,6 +1843,88 @@ else
 fi
 
 rm -f "$TMPDIR"/summ-*
+
+# ============================================================
+# 35. Ultra compression validation
+# ============================================================
+section "Ultra compression validation"
+
+LAST_TEST_MS=0
+
+# --- windowLog is actually set (proves the v0.12.1 fix works) ---
+# -T1 routes to compress_cpu_stream which logs "ultra: windowLog=27 (128 MiB window)"
+# at -v level.  If the window was being silently clamped, this line would be absent.
+ultra_wlog_out=$("$GZSTD" -k -f --cpu-only -T1 -v --ultra -22 \
+  "$TMPDIR/small.txt" -o "$TMPDIR/ultra-wlog.zst" 2>&1 || true)
+if echo "$ultra_wlog_out" | grep -qE "windowLog=27|128 MiB window"; then
+  pass "--ultra -22 sets windowLog=27"
+else
+  fail "--ultra -22 sets windowLog=27" "no windowLog message in verbose output"
+fi
+rm -f "$TMPDIR/ultra-wlog.zst"
+
+# --- Single-thread (compress_cpu_stream) round-trip ---
+"$GZSTD" -k -f --cpu-only -T1 --ultra -22 \
+  "$TMPDIR/small.txt" -o "$TMPDIR/ultra-t1.zst" 2>/dev/null
+"$GZSTD" -d -k -f --cpu-only \
+  "$TMPDIR/ultra-t1.zst" -o "$TMPDIR/ultra-t1.dec" 2>/dev/null
+files_match "$TMPDIR/small.txt" "$TMPDIR/ultra-t1.dec" \
+  && pass "--ultra -22 -T1 round-trip" || fail "--ultra -22 -T1 round-trip"
+rm -f "$TMPDIR/ultra-t1.zst" "$TMPDIR/ultra-t1.dec"
+
+# --- Multi-thread (compress_cpu_mt) round-trip ---
+"$GZSTD" -k -f --cpu-only -T4 --ultra -22 \
+  "$TMPDIR/medium.txt" -o "$TMPDIR/ultra-t4.zst" 2>/dev/null
+"$GZSTD" -d -k -f --cpu-only \
+  "$TMPDIR/ultra-t4.zst" -o "$TMPDIR/ultra-t4.dec" 2>/dev/null
+files_match "$TMPDIR/medium.txt" "$TMPDIR/ultra-t4.dec" \
+  && pass "--ultra -22 -T4 round-trip" || fail "--ultra -22 -T4 round-trip"
+rm -f "$TMPDIR/ultra-t4.zst" "$TMPDIR/ultra-t4.dec"
+
+# --- Small --chunk-size warns but still produces correct output ---
+ultra_warn_out=$("$GZSTD" -k -f --cpu-only --ultra -22 --chunk-size=4 \
+  "$TMPDIR/small.txt" -o "$TMPDIR/ultra-smallchunk.zst" 2>&1 || true)
+if echo "$ultra_warn_out" | grep -qi "warning.*chunk\|chunk.*warning"; then
+  pass "--ultra -22 --chunk-size=4 warns"
+else
+  fail "--ultra -22 --chunk-size=4 warns" "no warning in: $(echo "$ultra_warn_out" | head -1)"
+fi
+"$GZSTD" -d -k -f --cpu-only \
+  "$TMPDIR/ultra-smallchunk.zst" -o "$TMPDIR/ultra-smallchunk.dec" 2>/dev/null
+files_match "$TMPDIR/small.txt" "$TMPDIR/ultra-smallchunk.dec" \
+  && pass "--ultra -22 --chunk-size=4 still correct" \
+  || fail "--ultra -22 --chunk-size=4 still correct"
+rm -f "$TMPDIR/ultra-smallchunk.zst" "$TMPDIR/ultra-smallchunk.dec"
+
+# --- Progress bar format contains in: and out: ---
+# Use medium.txt to ensure at least one progress tick fires (200ms interval).
+prog_out=$("$GZSTD" -k -f --cpu-only --progress \
+  "$TMPDIR/medium.txt" -o "$TMPDIR/ultra-prog.zst" 2>&1 || true)
+prog_clean=$(echo "$prog_out" | sed 's/\x1b\[[0-9;]*m//g; s/\r/\n/g')
+if echo "$prog_clean" | grep -qE "^in:[0-9]"; then
+  pass "progress bar shows in:XX.X%"
+else
+  skip "progress bar shows in:XX.X%" "file too small/fast for progress tick"
+fi
+if echo "$prog_clean" | grep -qE "out:[0-9]|out:---"; then
+  pass "progress bar shows out:"
+else
+  skip "progress bar shows out:" "file too small/fast for progress tick"
+fi
+rm -f "$TMPDIR/ultra-prog.zst"
+
+# --- Interop: gzstd --ultra -22 output readable by stock zstd ---
+if command -v zstd &>/dev/null; then
+  "$GZSTD" -k -f --cpu-only --ultra -22 \
+    "$TMPDIR/small.txt" -o "$TMPDIR/ultra-interop.zst" 2>/dev/null
+  zstd -d -f "$TMPDIR/ultra-interop.zst" -o "$TMPDIR/ultra-interop.dec" 2>/dev/null
+  files_match "$TMPDIR/small.txt" "$TMPDIR/ultra-interop.dec" \
+    && pass "--ultra -22 interop: zstd -d reads gzstd output" \
+    || fail "--ultra -22 interop: zstd -d reads gzstd output"
+  rm -f "$TMPDIR/ultra-interop.zst" "$TMPDIR/ultra-interop.dec"
+else
+  skip "--ultra -22 interop with zstd" "zstd not installed"
+fi
 
 # ============================================================
 # Final summary

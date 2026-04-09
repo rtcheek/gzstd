@@ -1,9 +1,61 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.1  
+**Covers:** v0.9.50 → v0.12.5  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.5 — Progress bar UI polish + decompression % fix
+
+- **Only `XX.X%` values are bold/bright**; labels, sizes, and rates use dim cyan/green
+- **Dark grey `|` separator** (`\033[90m`) between in and out sections
+- **Completion summary colorized**: `OK` bold green, input size cyan, output size/rate green, ratio bold
+- **Decompression `out%` fix**: was stuck while size display changed because frame-completion counter (`tasks_done/total_frames`) updated before AIO finished writing. Now uses `wrote_bytes/total_out` (byte-level, matches the size display) throughout decompression
+- **Compression early `out%` fix**: spurious 99.9% at startup caused by `wrote_bytes/total_out` where `total_out` was only a partial running sum. Now shows `---` until frame tracking (`total_frames`) is established
+- **Benchmark script**: falls back to `in:XX.X%` when `out%` is not yet available; status suffix shortened (`gzstd ` dropped, `ETA ` → `~`) to stay under 80 columns
+
+---
+
+## v0.12.4 — Colorized progress bar
+
+Progress bar now uses ANSI colors for readability (already required ANSI for cursor control):
+
+- **`in:` label** — cyan; **`in%` value** — bold bright cyan
+- **`out:` label** — green; **`out%` value** — bold bright green (bold yellow when unknown)
+- **rates and separator** — dim
+
+Test mode (`--test`) colorizes `in%` and `verified:` bytes consistently.
+
+---
+
+## v0.12.3 — Dual-percentage progress bar (in% and out% shown independently)
+
+The v0.12.2 frame-based progress caused a visible jump: read-based % reached 100% quickly, then switched to frame-based % near 0% and climbed again. Confusing.
+
+**Fix:** Show two independent percentages side by side — no single number ever jumps backwards.
+
+```
+in:34.2% 2.10 GiB  out:12.7% 780 MiB | in:1.20 GiB/s out:450 MiB/s
+```
+
+- **in%** — `read_bytes / total_input`: how much input has been consumed; climbs fast on fast NVMe
+- **out%** — `tasks_done / total_frames` while compressing/decompressing, then switches to `wrote_bytes / total_out` during the AIO flush phase; reflects actual CPU/GPU work
+- Shows `---` when a metric is unknown (pipe input, single-thread stream path)
+- Test mode updated to match new format
+
+---
+
+## v0.12.2 — Progress bar tracks frame completion instead of reader
+
+Previously the progress percentage was based on `read_bytes / total_input_size`. The reader finishes quickly (it's just I/O), so at ultra compression levels with large chunks the bar jumps to 100% while workers are still compressing — useless as a progress indicator.
+
+**Fix:** Added `total_frames` to `Meter` (set by the producer after enqueuing all work) and moved `tasks_done` tracking to `writer_thread` (incremented per frame batch handed off for writing). Progress is now `tasks_done / total_frames`, which reflects actual compression work.
+
+- Falls back to read-based % before `total_frames` is known (single-thread stream path, or brief start-of-run window)
+- Write drain phase (all frames done, AIO still flushing): shows `[X.X%] writing: A / B @ C/s`
+- Also fixed: removed premature `[done]` flash from inside the progress loop (race where `wrote_bytes` transiently caught up to the incrementally-accumulated `total_out`)
 
 ---
 

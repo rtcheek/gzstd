@@ -24,7 +24,8 @@
 #   --sweep-streams     Sweep GPU stream counts (1,2,3,4,6,8)
 #   --sweep-threads     Sweep CPU thread counts (1,2,4,8,16,N-1)
 #   --sweep-levels      Sweep compression levels (1,3,6,9,15,19)
-#   --sweep-all         Enable all sweeps
+#   --sweep-ultra       Sweep ultra compression levels (20,21,22 with --ultra)
+#   --sweep-all         Enable all sweeps (including --sweep-ultra)
 #   --no-decompress     Skip decompression benchmarks
 #   --help              Show this help
 #
@@ -58,6 +59,7 @@ SWEEP_BATCHES=false
 SWEEP_STREAMS=false
 SWEEP_THREADS=false
 SWEEP_LEVELS=false
+SWEEP_ULTRA=false
 DO_DECOMPRESS=true
 
 #----------------------------------------------------------------------
@@ -78,8 +80,9 @@ while [[ $# -gt 0 ]]; do
     --sweep-streams) SWEEP_STREAMS=true; shift ;;
     --sweep-threads) SWEEP_THREADS=true; shift ;;
     --sweep-levels)  SWEEP_LEVELS=true; shift ;;
+    --sweep-ultra)   SWEEP_ULTRA=true; shift ;;
     --sweep-all)   SWEEP_BATCHES=true; SWEEP_STREAMS=true
-                   SWEEP_THREADS=true; SWEEP_LEVELS=true; shift ;;
+                   SWEEP_THREADS=true; SWEEP_LEVELS=true; SWEEP_ULTRA=true; shift ;;
     --no-decompress) DO_DECOMPRESS=false; shift ;;
     --help|-h)
       head -35 "$0" | tail -30
@@ -146,6 +149,7 @@ CLEAR_LINE=$'\033[2K'
 COLS=$(tput cols 2>/dev/null || echo 80)
 STATUS_LINE=""
 CURRENT_GZSTD_PCT=""
+CURRENT_GZSTD_LABEL=""
 
 repeat_char() {
   local char="$1" width="$2"
@@ -159,7 +163,7 @@ print_separator() {
 render_status_line() {
   local suffix=""
   if [[ -n "${CURRENT_GZSTD_PCT:-}" ]]; then
-    suffix="  ${DIM}|${RESET} ${ORANGE}gzstd: ${CURRENT_GZSTD_PCT}%${RESET}"
+    suffix="  ${DIM}|${RESET} ${ORANGE}${CURRENT_GZSTD_LABEL}:${CURRENT_GZSTD_PCT}%${RESET}"
   fi
   printf "\r${CLEAR_LINE}%s%s" "$STATUS_LINE" "$suffix" >&2
 }
@@ -169,7 +173,7 @@ clear_status_line() {
 }
 
 print_separator
-echo "${BOLD}${WHITE} gzstd benchmark suite v0.11.41${RESET}"
+echo "${BOLD}${WHITE} gzstd benchmark suite v0.12.4${RESET}"
 print_separator
 echo " ${WHITE}Binary${RESET}     : ${YELLOW}$GZSTD${RESET}"
 echo " ${WHITE}Version${RESET}    : ${CYAN}$($GZSTD --version 2>&1 | head -1)${RESET}"
@@ -275,6 +279,20 @@ if $SWEEP_LEVELS && ! $GPU_ONLY && ! $HYBRID_ONLY; then
   done
 fi
 
+# Sweep ultra compression levels (20-22).
+# gzstd auto-adjusts chunk size and guards against OOM via check_ram_budget,
+# so these are safe to run but expect significantly longer wall-clock times.
+if $SWEEP_ULTRA && ! $GPU_ONLY && ! $HYBRID_ONLY; then
+  if $QUICK; then
+    ULTRA_LEVELS="22"
+  else
+    ULTRA_LEVELS="20 21 22"
+  fi
+  for l in $ULTRA_LEVELS; do
+    CONFIGS+=("cpu-ultra${l}|--cpu-only --ultra -$l|--cpu-only")
+  done
+fi
+
 # Combined GPU sweeps: batch x streams (if both enabled)
 if $SWEEP_BATCHES && $SWEEP_STREAMS && $HAS_GPU_BUILD && ! $CPU_ONLY && ! $QUICK; then
   for b in 16 32 64; do
@@ -336,18 +354,28 @@ run_timed() {
   while kill -0 "$pid" 2>/dev/null; do
     sleep 0.3
     if [[ -s "$TMPDIR/last_stderr.log" ]]; then
-      local gzstd_pct
-      gzstd_pct=$(tail -c 256 "$TMPDIR/last_stderr.log" 2>/dev/null \
-                  | grep -oP '\[\K[0-9]+\.[0-9]+(?=%)' 2>/dev/null \
-                  | tail -1)
+      local gzstd_pct gzstd_label stripped
+      # Strip ANSI escapes once, reuse for both patterns.
+      stripped=$(tail -c 256 "$TMPDIR/last_stderr.log" 2>/dev/null \
+                 | sed 's/\x1b\[[0-9;]*m//g')
+      # Prefer out: percentage; fall back to in: when out: is not yet available.
+      gzstd_pct=$(echo "$stripped" | grep -oP '(?<=out:)[0-9]+\.[0-9]+(?=%)' 2>/dev/null | tail -1)
+      if [[ -n "$gzstd_pct" ]]; then
+        gzstd_label="out"
+      else
+        gzstd_pct=$(echo "$stripped" | grep -oP '(?<=in:)[0-9]+\.[0-9]+(?=%)' 2>/dev/null | tail -1)
+        gzstd_label="in"
+      fi
       if [[ -n "$gzstd_pct" ]]; then
         CURRENT_GZSTD_PCT="$gzstd_pct"
+        CURRENT_GZSTD_LABEL="$gzstd_label"
         render_status_line
       fi
     fi
   done
   wait "$pid" 2>/dev/null || rc=$?
   CURRENT_GZSTD_PCT=""
+  CURRENT_GZSTD_LABEL=""
   render_status_line
 
   end=$(date +%s.%N)
@@ -466,10 +494,11 @@ else: print(0)
   else
     line+="${GREEN}« decompress${RESET}"
   fi
-  line+=" ${DIM}ETA ${eta_str}${RESET}"
+  line+=" ${DIM}~${eta_str}${RESET}"
 
   STATUS_LINE="$line"
   CURRENT_GZSTD_PCT=""
+  CURRENT_GZSTD_LABEL=""
   render_status_line
 }
 

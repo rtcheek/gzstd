@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.1";
+static constexpr const char * GZSTD_VERSION = "0.12.5";
 //
 // Architecture overview:
 //
@@ -449,10 +449,11 @@ static bool parse_double_arg(const std::string & name, int & i, int argc,
  Progress & metrics
 ======================================================================*/
 struct Meter {
-  std::atomic< uint64_t > read_bytes { 0 };
-  std::atomic< uint64_t > wrote_bytes{ 0 };
-  std::atomic< uint64_t > tasks_done { 0 };
-  std::atomic< uint64_t > total_out  { 0 };  // expected total output bytes (set when known)
+  std::atomic< uint64_t > read_bytes   { 0 };
+  std::atomic< uint64_t > wrote_bytes  { 0 };
+  std::atomic< uint64_t > tasks_done   { 0 };  // frames handed to writer (written in-order)
+  std::atomic< uint64_t > total_frames { 0 };  // total frames to process (set by producer)
+  std::atomic< uint64_t > total_out    { 0 };  // expected total output bytes (set when known)
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
@@ -505,18 +506,59 @@ static std::vector<int> get_io_cores()
   if (hw <= 4) return {0};  // tiny system: share one core
   return {0, 1};            // dedicate two cores to I/O
 }
-static void progress_emit_line(double pct, const char * in_s, const char * out_s,
+// ANSI color/style codes used by the progress bar.
+// All "in" metrics are cyan; all "out" metrics are green.
+#define PR_RESET    "\033[0m"
+#define PR_DIM      "\033[2m"
+#define PR_CYAN     "\033[36m"       // cyan          — in label, size, rate
+#define PR_CYAN_B   "\033[1;96m"     // bold bright cyan  — in pct
+#define PR_GREEN    "\033[32m"       // green         — out label, size, rate
+#define PR_GREEN_B  "\033[1;92m"     // bold bright green — out pct
+#define PR_YELLOW_B "\033[1;93m"     // bold bright yellow — out pct when unknown
+
+// Emit one progress line.  in_pct and out_pct are 0-100; pass -1 when unknown.
+// Format: "in:<pct> <size> <rate>/s  out:<pct> <size> <rate>/s"
+// All "in" tokens are cyan; all "out" tokens are green.
+static void progress_emit_line(double in_pct, double out_pct,
+                               const char * in_s, const char * out_s,
                                const char * in_rate_s, const char * out_rate_s)
 {
-  char line[256];
-  int n = 0;
-  if (pct >= 0.0) { n = std::snprintf(line, sizeof(line), "[%.1f%%] in:%s out:%s | in:%s/s out:%s/s ", pct, in_s, out_s, in_rate_s, out_rate_s); }
-  else { n = std::snprintf(line, sizeof(line), " in:%s out:%s | in:%s/s out:%s/s ", in_s, out_s, in_rate_s, out_rate_s); }
-  if (n < 0) { n = 0; }
-  size_t len = (size_t)std::min(n, (int)sizeof(line) - 1);
-  std::fprintf(stderr, "\r%.*s\033[K", (int)len, line);
+  char in_pct_s[12], out_pct_s[12];
+  const char * out_pct_color;
+  if (in_pct  >= 0.0) std::snprintf(in_pct_s,  sizeof(in_pct_s),  "%.1f%%", in_pct);
+  else                 std::snprintf(in_pct_s,  sizeof(in_pct_s),  "---");
+  if (out_pct >= 0.0) {
+    std::snprintf(out_pct_s, sizeof(out_pct_s), "%.1f%%", out_pct);
+    out_pct_color = PR_GREEN_B;
+  } else {
+    std::snprintf(out_pct_s, sizeof(out_pct_s), "---");
+    out_pct_color = PR_YELLOW_B;
+  }
+
+  // Buffer is larger than plain text to accommodate ANSI escape sequences.
+  // Only the ##.#% values are bright/bold; labels, sizes, and rates use dim cyan/green.
+  char line[512];
+  int n = std::snprintf(line, sizeof(line),
+      PR_CYAN "in:" PR_CYAN_B "%s" PR_RESET   // in label dim cyan + pct bold bright cyan
+      PR_CYAN " %s %s/s"                      // in size + rate dim cyan
+      "\033[90m | \033[0m"                     // dark grey separator
+      PR_GREEN "out:" "%s" "%s" PR_RESET       // out label dim green + pct (bold green or yellow)
+      PR_GREEN " %s %s/s" PR_RESET " ",        // out size + rate dim green
+      in_pct_s, in_s, in_rate_s,
+      out_pct_color, out_pct_s, out_s, out_rate_s);
+  if (n < 0) n = 0;
+  // \r overwrites the line; \033[K clears to end; PR_RESET before \033[K
+  // prevents the erase from inheriting a background color.
+  std::fprintf(stderr, "\r%.*s\033[K", std::min(n, (int)sizeof(line) - 1), line);
   std::fflush(stderr);
 }
+#undef PR_RESET
+#undef PR_DIM
+#undef PR_CYAN
+#undef PR_CYAN_B
+#undef PR_GREEN
+#undef PR_GREEN_B
+#undef PR_YELLOW_B
 
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
 {
@@ -534,72 +576,91 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   const bool is_test = (opt.mode == Mode::TEST);
   while (!done_flag->load()) {
     std::this_thread::sleep_for(200ms);
-    uint64_t in  = m->read_bytes.load();
-    uint64_t out = m->wrote_bytes.load();
-    uint64_t t_out = m->total_out.load();
+    uint64_t in       = m->read_bytes.load();
+    uint64_t out      = m->wrote_bytes.load();
+    uint64_t t_out    = m->total_out.load();
+    uint64_t t_done   = m->tasks_done.load();
+    uint64_t t_frames = m->total_frames.load();
     auto dt      = steady_clock::now() - m->t0;
     double secs  = duration_cast< duration<double> >(dt).count();
-    double in_rate = secs>0 ? double(in)/secs : 0.0;
-    double out_rate = secs>0 ? double(out)/secs : 0.0;
+    double in_rate  = secs > 0 ? double(in)  / secs : 0.0;
+    double out_rate = secs > 0 ? double(out) / secs : 0.0;
     char in_s[64], out_s[64], rate_s[64], out_rate_s[64];
     human_bytes(double(in),  in_s,  sizeof(in_s));
     human_bytes(double(out), out_s, sizeof(out_s));
-    human_bytes(in_rate,     rate_s, sizeof(rate_s));
-    human_bytes(out_rate,    out_rate_s, sizeof(out_rate_s));
-    double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
+    human_bytes(in_rate,  rate_s,     sizeof(rate_s));
+    human_bytes(out_rate, out_rate_s, sizeof(out_rate_s));
+
+    // in_pct: how much input has been read (always known for regular files).
+    double in_pct = (total_in > 0) ? std::min(100.0, 100.0 * double(in) / double(total_in)) : -1.0;
+
+    // out_pct: tracks actual work completion.
+    //   Decompression: total_out is always known from frame headers, so use
+    //     wrote_bytes/total_out for smooth byte-level tracking from start to finish.
+    //   Compression Phase 1 — frames still being compressed:
+    //     use tasks_done/total_frames (frame completion; total_out is only a partial sum).
+    //   Compression Phase 2 — all frames done, AIO still draining:
+    //     switch to wrote_bytes/total_out (now total_out is complete).
+    //   Unknown (single-thread stream path, pipe input): show ---.
+    double out_pct;
+    if (opt.mode == Mode::DECOMPRESS && t_out > 0) {
+      // Byte-level: matches the out:<size> display, smooth and always accurate.
+      out_pct = std::min(99.9, 100.0 * double(out) / double(t_out));
+    } else if (t_frames > 0 && t_done < t_frames) {
+      out_pct = std::min(99.9, 100.0 * double(t_done) / double(t_frames));
+    } else if (t_frames > 0 && t_out > 0) {
+      out_pct = std::min(99.9, 100.0 * double(out) / double(t_out));
+    } else {
+      out_pct = -1.0;
+    }
 
     if (is_test) {
       // Test mode: show verified bytes and decompression throughput.
-      // out = decompressed bytes verified (no disk I/O).
-      char line[256];
-      if (pct >= 0.0)
-        std::snprintf(line, sizeof(line), "[%.1f%%] in:%s verified:%s @ %s/s ", pct, in_s, out_s, out_rate_s);
+      char line[512];
+      if (in_pct >= 0.0)
+        std::snprintf(line, sizeof(line),
+            "\033[36min:\033[1;96m%.1f%%\033[0m %s  "
+            "\033[32mverified:\033[1;92m%s\033[0m  "
+            "\033[2m@ %s/s\033[0m ",
+            in_pct, in_s, out_s, out_rate_s);
       else
-        std::snprintf(line, sizeof(line), " in:%s verified:%s @ %s/s ", in_s, out_s, out_rate_s);
+        std::snprintf(line, sizeof(line),
+            "\033[36min:\033[0m%s  "
+            "\033[32mverified:\033[1;92m%s\033[0m  "
+            "\033[2m@ %s/s\033[0m ",
+            in_s, out_s, out_rate_s);
       std::fprintf(stderr, "\r%s\033[K", line);
       std::fflush(stderr);
-    } else if (total_in > 0 && in >= total_in && out > 0) {
-      // All input consumed: switch to showing write drain progress
-      char wr_s[64];
-      human_bytes(out_rate, wr_s, sizeof(wr_s));
-      // Show write drain percentage if we know the expected output size
-      if (t_out > 0 && out < t_out) {
-        // AIO still writing  show progress
-        double write_pct = std::min(99.9, 100.0 * double(out) / double(t_out));
-        char line[256];
-        std::snprintf(line, sizeof(line),
-            "[%.1f%%] writing: %s / ", write_pct, out_s);
-        char tot_s[64];
-        human_bytes(double(t_out), tot_s, sizeof(tot_s));
-        std::fprintf(stderr, "\r%s%s @ %s/s\033[K", line, tot_s, wr_s);
-        std::fflush(stderr);
-      } else if (t_out > 0) {
-        // AIO finished but file not yet closed/fsynced  show flushing
-        char tot_s[64];
-        human_bytes(double(t_out), tot_s, sizeof(tot_s));
-        std::fprintf(stderr, "\r[done] flushing %s to disk... (%.0fs)\033[K", tot_s, secs);
-        std::fflush(stderr);
-      } else {
-        progress_emit_line(pct, in_s, out_s, rate_s, out_rate_s);
-      }
     } else {
-      progress_emit_line(pct, in_s, out_s, rate_s, out_rate_s);
+      progress_emit_line(in_pct, out_pct, in_s, out_s, rate_s, out_rate_s);
     }
   }
   // Final sample (no newline  the completion summary will overwrite this line)
-  uint64_t in  = m->read_bytes.load();
-  uint64_t out = m->wrote_bytes.load();
+  uint64_t in       = m->read_bytes.load();
+  uint64_t out      = m->wrote_bytes.load();
+  uint64_t t_out    = m->total_out.load();
+  uint64_t t_done   = m->tasks_done.load();
+  uint64_t t_frames = m->total_frames.load();
   auto dt      = std::chrono::steady_clock::now() - m->t0;
   double secs  = std::chrono::duration_cast< std::chrono::duration<double> >(dt).count();
-  double in_rate = secs>0 ? double(in)/secs : 0.0;
-  double out_rate = secs>0 ? double(out)/secs : 0.0;
+  double in_rate  = secs > 0 ? double(in)  / secs : 0.0;
+  double out_rate = secs > 0 ? double(out) / secs : 0.0;
   char in_s[64], out_s[64], rate_s[64], out_rate_s[64];
   human_bytes(double(in),  in_s,  sizeof(in_s));
   human_bytes(double(out), out_s, sizeof(out_s));
-  human_bytes(in_rate,     rate_s, sizeof(rate_s));
-  human_bytes(out_rate,    out_rate_s, sizeof(out_rate_s));
-  double pct = (total_in > 0) ? (100.0 * double(in) / double(total_in)) : -1.0;
-  progress_emit_line(pct, in_s, out_s, rate_s, out_rate_s);
+  human_bytes(in_rate,  rate_s,     sizeof(rate_s));
+  human_bytes(out_rate, out_rate_s, sizeof(out_rate_s));
+  double in_pct  = (total_in  > 0) ? std::min(100.0, 100.0 * double(in)  / double(total_in))  : -1.0;
+  double out_pct;
+  if (opt.mode == Mode::DECOMPRESS && t_out > 0)
+    out_pct = std::min(100.0, 100.0 * double(out) / double(t_out));
+  else if (t_frames > 0)
+    out_pct = std::min(100.0, 100.0 * double(t_done) / double(t_frames));
+  else if (t_out > 0)
+    out_pct = std::min(100.0, 100.0 * double(out)    / double(t_out));
+  else
+    out_pct = -1.0;
+  progress_emit_line(in_pct, out_pct, in_s, out_s, rate_s, out_rate_s);
   // No \n here  the completion summary overwrites this line with \r
   g_progress_active.store(false, std::memory_order_relaxed);
 }
@@ -1959,6 +2020,9 @@ static void writer_thread(FILE * out, ResultStore & results,
     }
 
     if (batch.empty()) continue;
+
+    // Count frames handed to writer for progress tracking.
+    if (m) m->tasks_done.fetch_add(batch.size(), std::memory_order_relaxed);
     lk.unlock();
 
     // Update total expected output for write drain progress.
@@ -2434,7 +2498,6 @@ static void cpu_worker(
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
 
-    if (m) m->tasks_done.fetch_add(1);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(in_size);
@@ -2956,6 +3019,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;
     results.total_tasks = queue.total_tasks();
+    if (m) m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
   }
   results.cv.notify_all();
 
@@ -3191,6 +3255,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;
     results.total_tasks = queue.total_tasks();
+    if (m) m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
   }
   results.cv.notify_all();
 
@@ -4745,6 +4810,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;
     results.total_tasks = queue.total_tasks();
+    if (m) m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
   }
   results.cv.notify_all();
 
@@ -5737,6 +5803,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;
     results.total_tasks = queue.total_tasks();
+    if (m) m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
   }
   results.cv.notify_all();
 
@@ -6127,7 +6194,7 @@ int main(int argc, char ** argv)
 
       char summary[512];
       std::snprintf(summary, sizeof(summary),
-        "%s : OK (%s => %s, ratio: %.1f%%) @ %s/s",
+        "%s : \033[1;92mOK\033[0m (\033[36m%s\033[0m => \033[32m%s\033[0m, ratio: \033[1m%.1f%%\033[0m) @ \033[32m%s/s\033[0m",
         base_name.c_str(), comp_s, decomp_s, pct, rate_s);
       std::fprintf(stderr, "\r%s\033[K\n", summary);
       std::fflush(stderr);
@@ -6225,7 +6292,7 @@ int main(int argc, char ** argv)
     std::string out_name = to_stdout ? "(stdout)" : opt.output;
     char summary[512];
     std::snprintf(summary, sizeof(summary),
-      "%s : %5.2f%% (%s => %s, %s) @ %s/s",
+      "%s : \033[1m%5.2f%%\033[0m (\033[36m%s\033[0m => \033[32m%s\033[0m, %s) @ \033[32m%s/s\033[0m",
       in_name.c_str(), ratio_pct, in_s, out_s, out_name.c_str(), rate_s);
     std::fprintf(stderr, "\r%s\033[K\n", summary);
     std::fflush(stderr);
@@ -6246,7 +6313,7 @@ int main(int argc, char ** argv)
     std::string out_name = to_stdout ? "(stdout)" : opt.output;
     char summary[512];
     std::snprintf(summary, sizeof(summary),
-      "%s : %s => %s, %s @ %s/s",
+      "%s : \033[36m%s\033[0m => \033[32m%s\033[0m, %s @ \033[32m%s/s\033[0m",
       in_name.c_str(), in_s, out_s, out_name.c_str(), rate_s);
     std::fprintf(stderr, "\r%s\033[K\n", summary);
     std::fflush(stderr);
