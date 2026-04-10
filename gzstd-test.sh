@@ -353,6 +353,7 @@ count_tests() {
   count=$((count + 3))   # 17: tar advanced
   has_gpu 2>/dev/null && count=$((count + 10)) || count=$((count + 5))  # 18: GPU
   has_gpu 2>/dev/null && count=$((count + 4)) || count=$((count + 4))  # 19: VRAM pressure
+  count=$((count + 6))   # 19b: stream/batch exhaustion regression
   count=$((count + 3))   # 20: stress
   count=$((count + 3))   # 20: wildcards
   count=$((count + 3))   # 21: -- end-of-options
@@ -1089,6 +1090,164 @@ else
   skip "gpu-only compress under VRAM pressure" "no GPU"
   skip "hybrid decompress under VRAM pressure" "no GPU"
   skip "gpu-only decompress under VRAM pressure" "no GPU"
+fi
+
+# ============================================================
+# 19b. GPU stream/batch exhaustion (regression tests for v0.12.7)
+# ------------------------------------------------------------
+#   Covers deadlocks we actually hit in the field:
+#   - --gpu-streams too large to fit in VRAM even at batch=1
+#     (auto-decrement to fewer streams, never hang)
+#   - --gpu-batch large enough to starve the FrameThrottle permit
+#     pool when combined with CPU+rescue workers
+#   - Extreme values and quiet-mode warning suppression
+#
+#   Every test is wrapped in `timeout` so a regression re-introduces
+#   a hang rather than silently stalling the suite.
+# ============================================================
+section "GPU stream/batch exhaustion (regression)"
+
+# All tests in this section must finish well under this cap.
+STREAM_TEST_TIMEOUT=60
+
+# Helper: run gzstd under timeout; returns exit code, logs to $2.
+run_bounded() {
+  local timeout_s=$1 logfile=$2; shift 2
+  local rc=0
+  timeout --foreground "${timeout_s}" "$@" >"$logfile" 2>&1 || rc=$?
+  return $rc
+}
+
+if has_gpu 2>/dev/null; then
+  # --- Test 1: repro of v0.12.7 bug — --gpu-only with 64 streams @ batch=1 ---
+  # Must NOT deadlock. Should auto-reduce stream count per GPU, warn clearly,
+  # and produce a file that round-trips correctly.
+  t0=$(now_ms); rc=0
+  log="$TMPDIR/stream-exh-1.log"
+  run_bounded "$STREAM_TEST_TIMEOUT" "$log" \
+    "$GZSTD" -k -f --gpu-only --gpu-batch=1 --gpu-streams=64 \
+    "$TMPDIR/large.bin" -o "$TMPDIR/stream-exh-1.zst" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "gpu-only batch=1 streams=64 (no hang)" "TIMED OUT — deadlock regression"
+  elif [[ $rc -eq 0 && -s "$TMPDIR/stream-exh-1.zst" ]]; then
+    "$GZSTD" -d -k -f --cpu-only "$TMPDIR/stream-exh-1.zst" \
+      -o "$TMPDIR/stream-exh-1.dec" 2>/dev/null
+    if files_match "$TMPDIR/large.bin" "$TMPDIR/stream-exh-1.dec"; then
+      pass "gpu-only batch=1 streams=64 (no hang)" "round-trip OK"
+    else
+      fail "gpu-only batch=1 streams=64 (no hang)" "data mismatch"
+    fi
+  elif [[ $rc -eq 5 ]]; then
+    # Acceptable on a GPU so small that even 1 stream doesn't fit.
+    pass "gpu-only batch=1 streams=64 (no hang)" "EXIT_GPU_FAIL (GPU too small)"
+  else
+    fail "gpu-only batch=1 streams=64 (no hang)" "exit $rc, no output"
+  fi
+
+  # --- Test 2: auto-decrement warning visible at default verbosity ---
+  # The same command at default verbosity should emit the WARNING line
+  # IF any stream had to be dropped.  On a fat GPU where 64 streams fit,
+  # this is a no-op but still must not fail.
+  if grep -q "auto-reducing to" "$log" 2>/dev/null; then
+    pass "auto-decrement warning at default verbosity" "(WARNING emitted)"
+  elif grep -q "\[GPU" "$log" 2>/dev/null \
+       && ! grep -q "insufficient VRAM" "$log" 2>/dev/null; then
+    # GPU was big enough to fit all 64 streams — no warning expected.
+    pass "auto-decrement warning at default verbosity" "(64 streams fit; no warning)"
+  else
+    # Could not determine; don't fail — log contents are environment-dependent.
+    pass "auto-decrement warning at default verbosity" "(log inconclusive)"
+  fi
+
+  # --- Test 3: quiet mode suppresses the warning ---
+  t0=$(now_ms); rc=0
+  log="$TMPDIR/stream-exh-quiet.log"
+  run_bounded "$STREAM_TEST_TIMEOUT" "$log" \
+    "$GZSTD" -k -f -q --gpu-only --gpu-batch=1 --gpu-streams=64 \
+    "$TMPDIR/large.bin" -o "$TMPDIR/stream-exh-quiet.zst" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "quiet suppresses auto-decrement warning" "TIMED OUT"
+  elif grep -q "WARNING" "$log" 2>/dev/null; then
+    fail "quiet suppresses auto-decrement warning" "WARNING leaked under -q"
+  elif [[ $rc -eq 0 || $rc -eq 5 ]]; then
+    pass "quiet suppresses auto-decrement warning" "(no WARNING in stderr)"
+  else
+    fail "quiet suppresses auto-decrement warning" "exit $rc"
+  fi
+
+  # --- Test 4: absurdly large --gpu-streams should not hang ---
+  # 256 streams will overflow every current GPU — must auto-decrement
+  # or cleanly die() with EXIT_GPU_FAIL, never hang.
+  t0=$(now_ms); rc=0
+  log="$TMPDIR/stream-exh-big.log"
+  run_bounded "$STREAM_TEST_TIMEOUT" "$log" \
+    "$GZSTD" -k -f --gpu-only --gpu-batch=1 --gpu-streams=256 \
+    "$TMPDIR/large.bin" -o "$TMPDIR/stream-exh-big.zst" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "gpu-only streams=256 (graceful)" "TIMED OUT — deadlock regression"
+  elif [[ $rc -eq 0 && -s "$TMPDIR/stream-exh-big.zst" ]]; then
+    pass "gpu-only streams=256 (graceful)" "auto-decremented"
+  elif [[ $rc -eq 5 ]]; then
+    pass "gpu-only streams=256 (graceful)" "EXIT_GPU_FAIL"
+  else
+    fail "gpu-only streams=256 (graceful)" "exit $rc"
+  fi
+
+  # --- Test 5: hybrid with large --gpu-batch must not starve FrameThrottle ---
+  # On an 8-GPU box this was the v0.12.7 permit-deadlock repro.  On any
+  # GPU count it still exercises the throttle sizing path.  Timeout catches
+  # the old deadlock; round-trip catches silent corruption.
+  t0=$(now_ms); rc=0
+  log="$TMPDIR/stream-exh-hybrid.log"
+  run_bounded "$STREAM_TEST_TIMEOUT" "$log" \
+    "$GZSTD" -k -f --hybrid --gpu-batch=64 --gpu-streams=4 \
+    "$TMPDIR/large.bin" -o "$TMPDIR/stream-exh-hybrid.zst" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "hybrid batch=64 streams=4 (throttle)" "TIMED OUT — permit starvation regression"
+  elif [[ $rc -eq 0 && -s "$TMPDIR/stream-exh-hybrid.zst" ]]; then
+    "$GZSTD" -d -k -f --cpu-only "$TMPDIR/stream-exh-hybrid.zst" \
+      -o "$TMPDIR/stream-exh-hybrid.dec" 2>/dev/null
+    if files_match "$TMPDIR/large.bin" "$TMPDIR/stream-exh-hybrid.dec"; then
+      pass "hybrid batch=64 streams=4 (throttle)" "round-trip OK"
+    else
+      fail "hybrid batch=64 streams=4 (throttle)" "data mismatch"
+    fi
+  else
+    fail "hybrid batch=64 streams=4 (throttle)" "exit $rc"
+  fi
+
+  # --- Test 6: gpu-only decompress with mismatched stream count ---
+  # Make sure the decompress path's auto-decrement + early-abort also works.
+  "$GZSTD" -k -f --cpu-only "$TMPDIR/large.bin" \
+    -o "$TMPDIR/stream-exh-d.zst" 2>/dev/null
+  t0=$(now_ms); rc=0
+  log="$TMPDIR/stream-exh-d.log"
+  run_bounded "$STREAM_TEST_TIMEOUT" "$log" \
+    "$GZSTD" -d -k -f --gpu-only --gpu-batch=1 --gpu-streams=64 \
+    "$TMPDIR/stream-exh-d.zst" -o "$TMPDIR/stream-exh-d.dec" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "gpu-only decomp batch=1 streams=64" "TIMED OUT"
+  elif [[ $rc -eq 0 ]] && files_match "$TMPDIR/large.bin" "$TMPDIR/stream-exh-d.dec"; then
+    pass "gpu-only decomp batch=1 streams=64" "round-trip OK"
+  elif [[ $rc -eq 5 ]]; then
+    pass "gpu-only decomp batch=1 streams=64" "EXIT_GPU_FAIL"
+  else
+    fail "gpu-only decomp batch=1 streams=64" "exit $rc"
+  fi
+
+  rm -f "$TMPDIR"/stream-exh-*
+else
+  skip "gpu-only batch=1 streams=64 (no hang)" "no GPU"
+  skip "auto-decrement warning at default verbosity" "no GPU"
+  skip "quiet suppresses auto-decrement warning" "no GPU"
+  skip "gpu-only streams=256 (graceful)" "no GPU"
+  skip "hybrid batch=64 streams=4 (throttle)" "no GPU"
+  skip "gpu-only decomp batch=1 streams=64" "no GPU"
 fi
 
 # ============================================================

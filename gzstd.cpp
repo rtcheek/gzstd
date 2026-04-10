@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.6";
+static constexpr const char * GZSTD_VERSION = "0.12.7";
 //
 // Architecture overview:
 //
@@ -2683,9 +2683,6 @@ static void cpu_worker(
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
   while (true) {
-    // Frame throttle: block if too many frames in flight (prevents RAM exhaustion)
-    if (bp) bp->acquire(1);
-
     Task t;
     bool got_task = false;
 #ifdef HAVE_NVCOMP
@@ -2711,12 +2708,12 @@ static void cpu_worker(
         auto threshold_met = [&](const TaskQueue::QueueState & qs) -> bool {
           return qs.depth >= opt->cpu_queue_min || qs.done;
         };
-        if (!tq->wait_for_cpu(threshold_met)) { if (bp) bp->release(1); break; }
-        if (tq->drained() && tq->size() == 0) { if (bp) bp->release(1); break; }
+        if (!tq->wait_for_cpu(threshold_met)) break;
+        if (tq->drained() && tq->size() == 0) break;
       }
       got_task = tq->pop_one(t);
     }
-    if (!got_task) { if (bp) bp->release(1); break; }
+    if (!got_task) break;
 
     // cpu_backlog check: if the queue is below the backlog threshold,
     // re-enqueue and wait.  This is a secondary throttle separate from
@@ -2731,6 +2728,13 @@ static void cpu_worker(
       if (!tq->wait_for_cpu(backlog_met)) break;
       continue;  // re-enter the loop to pop properly
     }
+
+    // Frame throttle: reserve a permit for this in-flight task.
+    // Acquired AFTER pop (not before) so idle workers don't hoard permits
+    // while the queue is empty — that caused deadlocks on multi-GPU setups
+    // where rescue+CPU pool permits exceeded the throttle ceiling.
+    // The writer releases this permit after the output is physically written.
+    if (bp) bp->acquire(1);
 
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32];
@@ -2834,9 +2838,11 @@ static void cpu_worker_rescue(
   FrameThrottle * bp)
 {
   while (true) {
-    if (bp) bp->acquire(1);
     Task t;
-    if (!rq->pop_one(t)) { if (bp) bp->release(1); break; }
+    if (!rq->pop_one(t)) break;
+    // Acquire permit AFTER pop so idle rescue threads don't hoard permits
+    // while waiting on an empty rescue queue (only filled on GPU failures).
+    if (bp) bp->acquire(1);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
     compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, opt->ultra, out_frame);
@@ -2906,9 +2912,6 @@ static void cpu_decomp_worker(
   }
 
   while (true) {
-    // Frame throttle: block if too many frames in flight (prevents RAM exhaustion)
-    if (bp) bp->acquire(1);
-
     Task t{};
     bool got_task = false;
 #ifdef HAVE_NVCOMP
@@ -2948,12 +2951,17 @@ static void cpu_decomp_worker(
         auto threshold_met = [&](const TaskQueue::QueueState & qs) -> bool {
           return qs.depth >= opt->cpu_queue_min || qs.done;
         };
-        if (!tq->wait_for_cpu(threshold_met)) { if (bp) bp->release(1); break; }
-        if (tq->drained() && tq->size() == 0) { if (bp) bp->release(1); break; }
+        if (!tq->wait_for_cpu(threshold_met)) break;
+        if (tq->drained() && tq->size() == 0) break;
       }
       got_task = tq->pop_one(t);
     }
-    if (!got_task) { if (bp) bp->release(1); break; }
+    if (!got_task) break;
+
+    // Frame throttle: reserve a permit for this in-flight task.
+    // Acquired AFTER pop (not before) so idle workers don't hoard permits.
+    // Writer releases the permit after physical write.
+    if (bp) bp->acquire(1);
 
     const auto t0_w = std::chrono::steady_clock::now();
 
@@ -3934,7 +3942,8 @@ static void gpu_worker(
   std::atomic<bool> * gpu_started_flag,
   SharedTuneState * shared_tune,
   RateMatchState * rate_match,
-  FrameThrottle * bp)
+  FrameThrottle * bp,
+  std::atomic<int> * gpu_init_failures)
 {
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   void * vram_reserve = nullptr;
@@ -4014,25 +4023,18 @@ static void gpu_worker(
                !shared_tune->vram_ceiling.compare_exchange_weak(old_ceil, vram_max));
       }
       int vram_retries = 0;
+      bool stream_init_failed = false;
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
         // Free any partial allocations from the failed attempt
         free_stream_buffers_only(C);
         if (C.per_stream_batch <= 1 || ++vram_retries > 10) {
-          // Can't fit even batch=1 or too many retries  skip this GPU entirely.
-          // Other GPUs (or CPU in hybrid) will handle the work.
-          std::string skip_msg = "[GPU" + std::to_string(device_id)
-              + "] insufficient VRAM for even batch=1  skipping device"
-              + (vram_retries > 10 ? " (retry limit)" : "");
-          vlog(V_ERROR, opt, skip_msg + "\n");
-          *any_gpu_failed = true;
-          *fatal_msg = skip_msg;
-          // Clean up streams we already created
-          for (size_t cs = 0; cs <= s; ++cs) {
-            if (ctxs[cs].stream) { cudaStreamDestroy(ctxs[cs].stream); ctxs[cs].stream = nullptr; }
-          }
-          // Wake writer in case it's waiting
-          { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
-          return;
+          // Can't fit even batch=1 on this stream.  If we already initialized
+          // one or more streams, stop adding more and run with what we have
+          // (auto-decrement of --gpu-streams when VRAM is tight).  Only if
+          // no streams succeeded do we skip the GPU entirely.
+          stream_init_failed = true;
+          if (C.stream) { cudaStreamDestroy(C.stream); C.stream = nullptr; }
+          break;
         }
         C.per_stream_batch = std::max<size_t>(1, C.per_stream_batch/2);
         {
@@ -4044,6 +4046,29 @@ static void gpu_worker(
             vlog(min_verb, opt, os.str() + "\n");
           }
         }
+      }
+      if (stream_init_failed) {
+        // Auto-decrement stream count: keep streams [0..s) and stop here.
+        if (s == 0) {
+          // Couldn't fit even one stream — skip this GPU entirely.
+          std::string skip_msg = "[GPU" + std::to_string(device_id)
+              + "] insufficient VRAM for even 1 stream at batch=1  skipping device";
+          vlog(V_ERROR, opt, skip_msg + "\n");
+          *any_gpu_failed = true;
+          *fatal_msg = skip_msg;
+          if (gpu_init_failures) gpu_init_failures->fetch_add(1, std::memory_order_release);
+          // Wake writer in case it's waiting
+          { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+          return;
+        }
+        // At least one stream is usable — shrink ctxs and continue.
+        vlog(V_DEFAULT, opt,
+             "WARNING: [GPU" + std::to_string(device_id)
+             + "] VRAM insufficient for " + std::to_string(stream_count)
+             + " streams at batch=1; auto-reducing to " + std::to_string(s)
+             + " stream" + (s == 1 ? "" : "s") + "\n");
+        ctxs.resize(s);
+        break;  // exit the stream-init loop
       }
       C.stats.dev_index = size_t(device_id);
       C.stats.stream_index = s;
@@ -4950,7 +4975,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #endif
 
   // Frame throttle: bounds in-flight frames to prevent RAM exhaustion.
-  FrameThrottle throttle;
+  // Sized for peak concurrent demand × 2 safety factor:
+  //   CPU pool (cpu_threads, hybrid only) + GPU (gpu_batch_cap × gpu_count)
+  //   + rescue pool headroom (hw_concurrency/2).
+  // The 2× factor covers the pipeline lag between "worker pushes result"
+  // and "writer releases the permit".  Floor of 512 for single-GPU runs.
+  const int throttle_peak =
+      (opt.hybrid ? resolve_cpu_threads(opt.cpu_threads) : 0)
+      + (int)(opt.gpu_batch_cap * (size_t)gpu_count_early)
+      + (int)std::max(1u, std::thread::hardware_concurrency() / 2);
+  FrameThrottle throttle(std::max(512, 2 * throttle_peak));
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
@@ -5036,6 +5070,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   shared_tune.locked.store(opt.gpu_batch_user_set);
   // VRAM ceiling will be refined by the first worker's binary search
 
+  // Counts GPUs that gave up during init (e.g. VRAM too small for even 1
+  // stream at batch=1).  Used by the producer loop to abort early if all
+  // GPUs fail in --gpu-only mode, instead of reading the whole file into
+  // a queue that nobody will ever consume.
+  std::atomic<int> gpu_init_failures{0};
+
   for (int i = 0; i < gpu_count; ++i) {
     workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
                          &queue, &rescue, &results,
@@ -5043,7 +5083,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                          &any_gpu_failed, &abort_on_failure,
                          &fatal_msgs[size_t(i)], &gpu_started,
                          &shared_tune, &rate_match_compress,
-                         &throttle);
+                         &throttle, &gpu_init_failures);
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
@@ -5057,6 +5097,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // pin_thread_to_core(0);              // disabled: hurts on loaded machines
   std::vector<char> host_in(host_chunk);
   while (true) {
+    // Early abort: in --gpu-only mode, if every GPU failed to initialize
+    // (insufficient VRAM), there's no consumer for any further tasks.
+    // Stop reading rather than buffering the whole file into the queue.
+    if (abort_on_failure.load(std::memory_order_acquire)
+        && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count) {
+      break;
+    }
+
     uint64_t rd_t0 = g_perf ? now_ns() : 0;
     size_t n_host = std::fread(host_in.data(), 1, host_chunk, in);
     if (g_perf && n_host > 0) {
@@ -5182,7 +5230,8 @@ static void gpu_decomp_worker(
   std::string * fatal_msg,
   SharedTuneState * shared_tune,
   RateMatchState * rate_match,
-  FrameThrottle * bp)
+  FrameThrottle * bp,
+  std::atomic<int> * gpu_init_failures)
 {
   (void)m;
   const size_t stream_count = std::max<size_t>(1, (size_t)opt.gpu_streams);
@@ -5332,30 +5381,21 @@ static void gpu_decomp_worker(
       // Pre-allocate device buffers.  If batch size is too large for VRAM,
       // halve it until it fits.  This handles --gpu-batch=256 on GPUs with
       // limited VRAM (e.g., 10 GiB consumer GPUs vs 80+ GiB datacenter GPUs).
+      bool stream_init_failed = false;
       {
         size_t est_temp = per_stream_cap * 1024;
         size_t try_batch = per_stream_cap;
         int vram_retries = 0;
         while (!C.ensure_buffers(try_batch, init_comp, init_decomp, est_temp)) {
           if (try_batch <= 1 || ++vram_retries > 10) {
-            // Can't fit even batch=1  skip this GPU entirely.
-            // Other GPUs (or CPU in hybrid) will handle the work.
-            std::string skip_msg = "[GPU" + std::to_string(device_id)
-                + "] insufficient VRAM for even batch=1 ("
-                + std::to_string(init_comp / ONE_MIB) + " MiB comp + "
-                + std::to_string(init_decomp / ONE_MIB) + " MiB decomp per frame)  skipping device";
-            vlog(V_ERROR, opt, skip_msg + "\n");
-            *any_gpu_failed = true;
-            *fatal_msg = skip_msg;
-            // Clean up streams/events we already created
-            for (size_t cs = 0; cs <= s; ++cs) {
-              if (ctxs[cs].ev_begin) { cudaEventDestroy(ctxs[cs].ev_begin); ctxs[cs].ev_begin = nullptr; }
-              if (ctxs[cs].ev_end)   { cudaEventDestroy(ctxs[cs].ev_end);   ctxs[cs].ev_end = nullptr; }
-              if (ctxs[cs].stream)   { cudaStreamDestroy(ctxs[cs].stream);   ctxs[cs].stream = nullptr; }
-            }
-            // Wake writer in case it's waiting
-            { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
-            return;
+            // Can't fit even batch=1 on this stream.  If we already have
+            // working streams, stop adding more and run with what we have
+            // (auto-decrement of --gpu-streams when VRAM is tight).
+            stream_init_failed = true;
+            if (C.ev_begin) { cudaEventDestroy(C.ev_begin); C.ev_begin = nullptr; }
+            if (C.ev_end)   { cudaEventDestroy(C.ev_end);   C.ev_end = nullptr; }
+            if (C.stream)   { cudaStreamDestroy(C.stream);  C.stream = nullptr; }
+            break;
           }
           try_batch = std::max<size_t>(1, try_batch / 2);
           {
@@ -5368,9 +5408,33 @@ static void gpu_decomp_worker(
             }
           }
         }
-        // Update per_stream_cap to the actual allocated size
-        // (used by pop_batch_greedy to limit how many frames we grab)
-        per_stream_cap = try_batch;
+        if (!stream_init_failed) {
+          // Update per_stream_cap to the actual allocated size
+          // (used by pop_batch_greedy to limit how many frames we grab)
+          per_stream_cap = try_batch;
+        }
+      }
+      if (stream_init_failed) {
+        if (s == 0) {
+          // Couldn't fit even one stream — skip this GPU entirely.
+          std::string skip_msg = "[GPU" + std::to_string(device_id)
+              + "] insufficient VRAM for even 1 stream at batch=1 ("
+              + std::to_string(init_comp / ONE_MIB) + " MiB comp + "
+              + std::to_string(init_decomp / ONE_MIB) + " MiB decomp per frame)  skipping device";
+          vlog(V_ERROR, opt, skip_msg + "\n");
+          *any_gpu_failed = true;
+          *fatal_msg = skip_msg;
+          if (gpu_init_failures) gpu_init_failures->fetch_add(1, std::memory_order_release);
+          { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+          return;
+        }
+        vlog(V_DEFAULT, opt,
+             "WARNING: [GPU" + std::to_string(device_id)
+             + "] VRAM insufficient for " + std::to_string(stream_count)
+             + " streams at batch=1; auto-reducing to " + std::to_string(s)
+             + " stream" + (s == 1 ? "" : "s") + "\n");
+        ctxs.resize(s);
+        break;  // exit stream-init loop
       }
 
       if (opt.verbosity >= V_DEBUG) {
@@ -5975,10 +6039,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   RateMatchState rate_match;
 
   // Frame throttle: bounds in-flight frames (popped but not yet written) to
-  // prevent RAM exhaustion.  Workers acquire permits before popping; the
-  // writer releases permits after each frame is physically written to disk.
+  // prevent RAM exhaustion.  Workers reserve a permit after popping a task;
+  // the writer releases permits after each frame is physically written.
   // Disabled in test mode: no disk I/O means permits are never released.
-  FrameThrottle throttle;
+  // Sized for peak concurrent demand × 2: CPU pool (if hybrid) + GPU
+  // (gpu_batch_cap × device_count) + rescue pool headroom.  Floor 512.
+  const int throttle_peak_dec =
+      ((!opt.gpu_only) ? resolve_cpu_threads(opt.cpu_threads) : 0)
+      + (int)(opt.gpu_batch_cap * (size_t)std::max(1, device_count))
+      + (int)std::max(1u, std::thread::hardware_concurrency() / 2);
+  FrameThrottle throttle(std::max(512, 2 * throttle_peak_dec));
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // ---- Writer thread (outputs decompressed data in order) ----
@@ -6027,6 +6097,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   shared_tune_decomp.batch_size.store(opt.gpu_batch_cap);
   shared_tune_decomp.locked.store(opt.gpu_batch_user_set);
 
+  // Counts GPUs that gave up during init (VRAM too small for even 1 stream).
+  // Used by the frame streamer below to abort early if all GPUs fail in
+  // --gpu-only mode instead of buffering the entire file.
+  std::atomic<int> gpu_init_failures{0};
 
   if (device_count > 0) {
     gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
@@ -6040,7 +6114,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
                                &shared_tune_decomp, &rate_match,
-                               bp_ptr);
+                               bp_ptr, &gpu_init_failures);
     }
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
