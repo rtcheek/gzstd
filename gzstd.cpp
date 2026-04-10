@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.5";
+static constexpr const char * GZSTD_VERSION = "0.12.6";
 //
 // Architecture overview:
 //
@@ -238,6 +238,10 @@ static constexpr int EXIT_GPU_FAIL = 5;  // all GPUs failed (VRAM exhaustion, dr
 // Global verbosity for die() which doesn't take Options
 static int g_verbosity = V_DEFAULT;
 
+// True when stderr is a TTY and ANSI color codes should be emitted.
+// Set once after parse_args(); never changes afterwards.
+static bool g_color_stderr = false;
+
 // Global flag: true when the progress bar is actively drawing on stderr.
 // vlog() checks this to clear the progress line before printing so verbose
 // messages don't overlap the progress bar.  Set by progress_loop, cleared
@@ -249,14 +253,234 @@ static std::atomic<bool> g_progress_active{false};
 // If the progress bar is active, clears the progress line first so
 // the message prints cleanly on its own line, then the next progress
 // tick redraws the bar.
+// When stderr is a TTY, applies level-based ANSI color:
+//   V_VERBOSE — default terminal color (most important, reads like plain text)
+//   V_DEBUG   — dim (detail, visually recedes)
+//   V_TRACE   — dark grey (fine-grained noise, lowest visual weight)
+// Any leading [TAG] token is bolded as a visual anchor regardless of level.
+// Numeric tokens (integers and decimals) are colorized from a cycling palette
+// so they pop out from surrounding text.
+// No codes are emitted when stderr is not a TTY (safe to redirect to logs).
+
+// Determine the field color for the number at [num_start, num_end) in `s`.
+// Looks back for a "keyword=" (or "keyword=[") pattern and forward for
+// " keyword" suffixes (e.g. "159 batches").  Returns nullptr to fall through
+// to the cycling palette.
+//
+// Field → color mapping:
+//   in=       bright cyan    (input sizes)
+//   out=      green          (output sizes)
+//   seq=      bright blue    (sequence numbers, both in seq=[N..N])
+//   batch=, tasks=, frames=, chunks=, waits=, count=
+//             bright green   (counts)
+//   N batches/frames/chunks/waits/tasks
+//             bright green   (same counts, space-delimited)
+//   h2d=, d2h=  gray        (timing labels, not meaningful data values)
+static const char * vlog_field_color(const std::string & s,
+                                     size_t num_start, size_t num_end)
+{
+  // --- look-back: find keyword= (or keyword=[) before this number ---
+  size_t k = num_start;
+  // Handle second number in seq=[N..N]: preceded by ".."
+  if (k >= 2 && s[k-1] == '.' && s[k-2] == '.') {
+    // skip back over first number and '[' to reach '='
+    k -= 2;
+    while (k > 0 && std::isdigit((unsigned char)s[k-1])) k--;
+    if (k > 0 && s[k-1] == '[') k--;
+  }
+  // Skip optional '[' (seq=[N)
+  if (k > 0 && s[k-1] == '[') k--;
+  // Expect '='
+  if (k > 0 && s[k-1] == '=') {
+    k--;  // skip '='
+    size_t kend = k;
+    while (k > 0 && (std::isalnum((unsigned char)s[k-1]) || s[k-1] == '_')) k--;
+    std::string kw = s.substr(k, kend - k);
+
+    if (kw == "in")                              return "\033[1;96m";  // bright cyan
+    if (kw == "out")                             return "\033[32m";    // green
+    if (kw == "seq")                             return "\033[1;94m";  // bright blue
+    if (kw == "h2d" || kw == "d2h")             return "";            // no color — plain text
+    if (kw == "batch"  || kw == "tasks"  ||
+        kw == "frames" || kw == "chunks" ||
+        kw == "waits"  || kw == "count"  ||
+        kw == "batches")                         return "\033[1;92m";  // bright green
+  }
+
+  // --- look-ahead: "N keyword" suffix (e.g. "159 batches,") ---
+  if (num_end < s.size() && s[num_end] == ' ') {
+    static const struct { const char * kw; } post[] = {
+      {" batches"}, {" frames"}, {" chunks"}, {" waits"}, {" tasks"}, {" batch"},
+    };
+    for (auto & p : post) {
+      size_t kl = std::strlen(p.kw);
+      if (num_end + kl <= s.size() && s.compare(num_end, kl, p.kw) == 0)
+        return "\033[1;92m";  // bright green
+    }
+  }
+
+  return nullptr;  // use cycling palette
+}
+
+// Skip over an ANSI escape sequence starting at s[i] (must be '\033').
+// Returns the index of the first character after the sequence.
+static size_t vlog_skip_ansi(const std::string & s, size_t i)
+{
+  // Sequences we emit: \033[ <params> m
+  if (i + 1 < s.size() && s[i + 1] == '[') {
+    i += 2;
+    while (i < s.size() && s[i] != 'm') ++i;
+    if (i < s.size()) ++i;  // skip 'm'
+  }
+  return i;
+}
+
+// Colorize a [TAG] token:
+//   '[' '/' ']'  — bold bright white
+//   letters/text — word_color (bright yellow for GPU, bright magenta for CPU)
+//   numbers      — cycling palette
+// Pre-existing ANSI codes in `tag` are passed through unchanged.
+static std::string vlog_colorize_tag(const std::string & tag, const char * word_color)
+{
+  static const char * palette[] = {
+    "\033[34m", "\033[36m", "\033[32m", "\033[33m", "\033[35m",
+  };
+  static constexpr size_t N = sizeof(palette) / sizeof(palette[0]);
+  const char * PUNCT = "\033[1;97m";  // bold bright white
+
+  std::string out;
+  size_t i = 0, ci = 0;
+  out += word_color;
+  while (i < tag.size()) {
+    if (tag[i] == '\033') {                    // pass through existing ANSI codes
+      size_t j = vlog_skip_ansi(tag, i);
+      out.append(tag, i, j - i);
+      i = j;
+    } else if (tag[i] == '[' || tag[i] == ']' || tag[i] == '/') {
+      out += PUNCT;
+      out += tag[i++];
+      out += "\033[0m";
+      out += word_color;
+    } else if (std::isdigit((unsigned char)tag[i])
+               || (tag[i] == '.' && i + 1 < tag.size()
+                   && std::isdigit((unsigned char)tag[i + 1]))) {
+      size_t start = i;
+      while (i < tag.size() && (std::isdigit((unsigned char)tag[i]) || tag[i] == '.'))
+        ++i;
+      out += palette[ci++ % N];
+      out.append(tag, start, i - start);
+      out += "\033[0m";
+      out += word_color;
+    } else {
+      out += tag[i++];
+    }
+  }
+  return out;
+}
+
+// Walk `s` and colorize numeric tokens using keyword context:
+//   in=N      bright cyan    out=N     green
+//   seq=[N..N] bright blue   h2d=/d2h= gray
+//   batch=/tasks=/frames=/etc. bright green
+//   N batches/frames/chunks/waits  bright green
+//   everything else  cycling palette (blue→cyan→green→yellow→purple)
+// Pre-existing ANSI codes are passed through unchanged.
+static std::string vlog_colorize_numbers(const std::string & s, const char * restore)
+{
+  static const char * palette[] = {
+    "\033[34m", "\033[36m", "\033[32m", "\033[33m", "\033[35m",
+  };
+  static constexpr size_t N = sizeof(palette) / sizeof(palette[0]);
+
+  std::string out;
+  out.reserve(s.size() * 2);
+  size_t i = 0, ci = 0;
+  while (i < s.size()) {
+    if (s[i] == '\033') {
+      size_t j = vlog_skip_ansi(s, i);
+      out.append(s, i, j - i);
+      i = j;
+      continue;
+    }
+    // Only start a number token if not preceded by an alphanumeric — this prevents
+    // digits embedded in identifiers like h2d, d2h, GPU0 from being colorized.
+    bool num_start = (i == 0 || !std::isalnum((unsigned char)s[i - 1]))
+                  && (std::isdigit((unsigned char)s[i])
+                      || (s[i] == '.' && i + 1 < s.size()
+                          && std::isdigit((unsigned char)s[i + 1])));
+    if (num_start) {
+      size_t start = i;
+      while (i < s.size() && (std::isdigit((unsigned char)s[i]) || s[i] == '.'))
+        ++i;
+      const char * fc = vlog_field_color(s, start, i);
+      if (fc && fc[0] == '\0') {
+        // Explicitly no color (e.g. h2d=/d2h=) — emit plain, no ANSI.
+        out.append(s, start, i - start);
+      } else {
+        const char * col = fc ? fc : palette[ci++ % N];
+        out += col;
+        out.append(s, start, i - start);
+        out += "\033[0m";
+        out += restore;
+      }
+    } else {
+      out += s[i++];
+    }
+  }
+  return out;
+}
+
 static void vlog(int min_level, const Options & opt, const std::string & msg)
 {
-  if (opt.verbosity >= min_level) {
-    if (g_progress_active.load(std::memory_order_relaxed)) {
-      std::fprintf(stderr, "\r\033[K");  // clear progress line
-    }
+  if (opt.verbosity < min_level) return;
+  if (g_progress_active.load(std::memory_order_relaxed))
+    std::fprintf(stderr, "\r\033[K");  // clear progress line
+
+  if (!g_color_stderr) {
     std::cerr << msg;
+    return;
   }
+
+  // All levels use default terminal color — numbers are colorized individually.
+  const char * lvl_color = "";
+
+  // Split off a leading [TAG] token to bold it as a visual scan anchor.
+  std::string tag_part, body_part;
+  if (!msg.empty() && msg[0] == '[') {
+    auto close = msg.find(']');
+    if (close != std::string::npos && close + 1 < msg.size()) {
+      tag_part  = msg.substr(0, close + 1);
+      body_part = msg.substr(close + 1);
+    }
+  }
+  if (tag_part.empty()) body_part = msg;
+
+  // Pick tag color based on prefix: GPU → bold bright yellow, CPU → bold bright magenta.
+  const char * tag_color = "\033[1m";       // default: bold white
+  if (tag_part.size() > 4) {               // at least "[GPU" or "[CPU"
+    if (tag_part.compare(1, 3, "GPU") == 0) tag_color = "\033[1;93m";  // bold bright yellow
+    else if (tag_part.compare(1, 3, "CPU") == 0) tag_color = "\033[1;95m";  // bold bright magenta
+  }
+
+  // Colorize tag: punctuation white, letters in tag_color, numbers in palette.
+  std::string tag_col  = tag_part.empty() ? "" : vlog_colorize_tag(tag_part, tag_color);
+  std::string body_col = vlog_colorize_numbers(body_part, lvl_color);
+
+  // Assemble: tag | reset | body (numbers already colored).
+  std::string out;
+  out += lvl_color;
+  if (!tag_col.empty()) {
+    out += tag_col;
+    out += "\033[0m";
+    out += lvl_color;
+  }
+  out += body_col;
+
+  // Strip trailing newline so reset lands before it (avoids stray color on blank lines).
+  bool has_nl = !out.empty() && out.back() == '\n';
+  if (has_nl) out.pop_back();
+  std::cerr << out << "\033[0m";
+  if (has_nl) std::cerr << '\n';
 }
 
 static void die(const std::string & msg, int code = EXIT_ERROR)
@@ -1217,68 +1441,106 @@ struct PerfCounters {
       return (ns > 0) ? double(bytes) / (1024.0*1024*1024) / (double(ns)/1e9) : 0;
     };
 
-    fprintf(stderr, "\n\n");
-    fprintf(stderr, "  PERFORMANCE BREAKDOWN: %-36s \n", label);
+    // Color tokens — empty strings when stderr is not a TTY.
+    const char * RST = g_color_stderr ? "\033[0m"    : "";
+    const char * HDR = g_color_stderr ? "\033[1;97m" : "";  // bold bright white  — header
+    const char * LBL = g_color_stderr ? "\033[1;33m" : "";  // bold yellow        — row labels
+    const char * TIM = g_color_stderr ? "\033[1;96m" : "";  // bold bright cyan   — seconds
+    const char * SIZ = g_color_stderr ? "\033[1;94m" : "";  // bold bright blue   — GiB
+    const char * THR = g_color_stderr ? "\033[1;92m" : "";  // bold bright green  — GiB/s
+    const char * CNT = g_color_stderr ? "\033[95m"   : "";  // bright magenta     — counts
+    const char * DIM = g_color_stderr ? "\033[2m"    : "";  // dim                — separators
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  %sPERFORMANCE BREAKDOWN:%s %s%s%s\n",
+            HDR, RST, LBL, label, RST);
     fprintf(stderr, "\n");
 
     if (cuda_init_count > 0)
-      fprintf(stderr, "  CUDA init:        %8.3f s  (%d devices, %.3f s each avg)    \n",
-              ns_to_s(cuda_init_max_ns), cuda_init_count.load(),
-              ns_to_s(cuda_init_sum_ns) / cuda_init_count);
+      fprintf(stderr, "  %sCUDA init:%s        %s%8.3f s%s  "
+                      "(%s%d%s devices, %s%.3f s%s each avg)\n",
+              LBL, RST,
+              TIM, ns_to_s(cuda_init_max_ns), RST,
+              CNT, cuda_init_count.load(), RST,
+              TIM, ns_to_s(cuda_init_sum_ns) / cuda_init_count, RST);
 
-    fprintf(stderr, "                                                              \n");
-    fprintf(stderr, "  Reader:           %8.3f s  (%6.2f GiB, %5.2f GiB/s)      \n",
-            ns_to_s(read_ns), bytes_to_gib(read_bytes_total),
-            rate_gibs(read_bytes_total, read_ns));
+    fprintf(stderr, "  %s──────────────────────────────────────────────────────%s\n", DIM, RST);
+    fprintf(stderr, "  %sReader:%s           %s%8.3f s%s  "
+                    "(%s%6.2f GiB%s, %s%5.2f GiB/s%s)\n",
+            LBL, RST,
+            TIM, ns_to_s(read_ns), RST,
+            SIZ, bytes_to_gib(read_bytes_total), RST,
+            THR, rate_gibs(read_bytes_total, read_ns), RST);
 
-    if (h2d_count > 0 || sched_gpu_tasks > 0) {
-      fprintf(stderr, "  H2D transfers:    %8.3f s  (%6.2f GiB, %5.2f GiB/s) [%llu] \n",
-              ns_to_s(h2d_ns), bytes_to_gib(h2d_bytes),
-              rate_gibs(h2d_bytes, h2d_ns),
-              (unsigned long long)h2d_count.load());
-    }
-    if (kernel_count > 0 || sched_gpu_tasks > 0) {
-      fprintf(stderr, "  GPU kernel:       %8.3f s  (%llu batches, %5.1f ms/batch)   \n",
-              ns_to_s(kernel_ns),
-              (unsigned long long)kernel_count.load(),
-              (kernel_count > 0) ? ns_to_ms(kernel_ns) / kernel_count : 0.0);
-    }
-    if (d2h_count > 0 || sched_gpu_tasks > 0) {
-      fprintf(stderr, "  D2H transfers:    %8.3f s  (%6.2f GiB, %5.2f GiB/s) [%llu] \n",
-              ns_to_s(d2h_ns), bytes_to_gib(d2h_bytes),
-              rate_gibs(d2h_bytes, d2h_ns),
-              (unsigned long long)d2h_count.load());
-    }
-    if (gpu_batch_count > 0 || sched_gpu_tasks > 0) {
-      fprintf(stderr, "  GPU batch total:  %8.3f s  (%llu batches, %5.1f ms/batch)   \n",
-              ns_to_s(gpu_batch_ns),
-              (unsigned long long)gpu_batch_count.load(),
-              (gpu_batch_count > 0) ? ns_to_ms(gpu_batch_ns) / gpu_batch_count : 0.0);
-    }
-    if (cpu_compute_count > 0) {
-      fprintf(stderr, "  CPU compute:      %8.3f s  (%6.2f GiB, %llu chunks)       \n",
-              ns_to_s(cpu_compute_ns), bytes_to_gib(cpu_compute_bytes),
-              (unsigned long long)cpu_compute_count.load());
-    }
+    if (h2d_count > 0 || sched_gpu_tasks > 0)
+      fprintf(stderr, "  %sH2D transfers:%s    %s%8.3f s%s  "
+                      "(%s%6.2f GiB%s, %s%5.2f GiB/s%s) [%s%llu%s]\n",
+              LBL, RST,
+              TIM, ns_to_s(h2d_ns), RST,
+              SIZ, bytes_to_gib(h2d_bytes), RST,
+              THR, rate_gibs(h2d_bytes, h2d_ns), RST,
+              CNT, (unsigned long long)h2d_count.load(), RST);
 
-    fprintf(stderr, "                                                              \n");
-    fprintf(stderr, "  Queue wait:       %8.3f s  (%llu waits)                    \n",
-            ns_to_s(queue_wait_ns), (unsigned long long)queue_wait_count.load());
-    fprintf(stderr, "  Writer wait:      %8.3f s  (%llu waits)                    \n",
-            ns_to_s(writer_wait_ns), (unsigned long long)writer_wait_count.load());
-    fprintf(stderr, "  Writer I/O:       %8.3f s  (%6.2f GiB, %5.2f GiB/s)      \n",
-            ns_to_s(write_ns), bytes_to_gib(write_bytes_total),
-            rate_gibs(write_bytes_total, write_ns));
+    if (kernel_count > 0 || sched_gpu_tasks > 0)
+      fprintf(stderr, "  %sGPU kernel:%s       %s%8.3f s%s  "
+                      "(%s%llu%s batches, %s%5.1f ms%s/batch)\n",
+              LBL, RST,
+              TIM, ns_to_s(kernel_ns), RST,
+              CNT, (unsigned long long)kernel_count.load(), RST,
+              TIM, (kernel_count > 0) ? ns_to_ms(kernel_ns) / kernel_count : 0.0, RST);
+
+    if (d2h_count > 0 || sched_gpu_tasks > 0)
+      fprintf(stderr, "  %sD2H transfers:%s    %s%8.3f s%s  "
+                      "(%s%6.2f GiB%s, %s%5.2f GiB/s%s) [%s%llu%s]\n",
+              LBL, RST,
+              TIM, ns_to_s(d2h_ns), RST,
+              SIZ, bytes_to_gib(d2h_bytes), RST,
+              THR, rate_gibs(d2h_bytes, d2h_ns), RST,
+              CNT, (unsigned long long)d2h_count.load(), RST);
+
+    if (gpu_batch_count > 0 || sched_gpu_tasks > 0)
+      fprintf(stderr, "  %sGPU batch total:%s  %s%8.3f s%s  "
+                      "(%s%llu%s batches, %s%5.1f ms%s/batch)\n",
+              LBL, RST,
+              TIM, ns_to_s(gpu_batch_ns), RST,
+              CNT, (unsigned long long)gpu_batch_count.load(), RST,
+              TIM, (gpu_batch_count > 0) ? ns_to_ms(gpu_batch_ns) / gpu_batch_count : 0.0, RST);
+
+    if (cpu_compute_count > 0)
+      fprintf(stderr, "  %sCPU compute:%s      %s%8.3f s%s  "
+                      "(%s%6.2f GiB%s, %s%llu%s chunks)\n",
+              LBL, RST,
+              TIM, ns_to_s(cpu_compute_ns), RST,
+              SIZ, bytes_to_gib(cpu_compute_bytes), RST,
+              CNT, (unsigned long long)cpu_compute_count.load(), RST);
+
+    fprintf(stderr, "  %s──────────────────────────────────────────────────────%s\n", DIM, RST);
+    fprintf(stderr, "  %sQueue wait:%s       %s%8.3f s%s  (%s%llu%s waits)\n",
+            LBL, RST,
+            TIM, ns_to_s(queue_wait_ns), RST,
+            CNT, (unsigned long long)queue_wait_count.load(), RST);
+    fprintf(stderr, "  %sWriter wait:%s      %s%8.3f s%s  (%s%llu%s waits)\n",
+            LBL, RST,
+            TIM, ns_to_s(writer_wait_ns), RST,
+            CNT, (unsigned long long)writer_wait_count.load(), RST);
+    fprintf(stderr, "  %sWriter I/O:%s       %s%8.3f s%s  "
+                    "(%s%6.2f GiB%s, %s%5.2f GiB/s%s)\n",
+            LBL, RST,
+            TIM, ns_to_s(write_ns), RST,
+            SIZ, bytes_to_gib(write_bytes_total), RST,
+            THR, rate_gibs(write_bytes_total, write_ns), RST);
     if (result_lock_ns > 0)
-      fprintf(stderr, "  Result lock:      %8.3f s                                \n",
-              ns_to_s(result_lock_ns));
+      fprintf(stderr, "  %sResult lock:%s      %s%8.3f s%s\n",
+              LBL, RST,
+              TIM, ns_to_s(result_lock_ns), RST);
 
-    fprintf(stderr, "                                                              \n");
-    fprintf(stderr, "  Scheduler:  CPU %llu tasks, GPU %llu tasks                    \n",
-            (unsigned long long)sched_cpu_tasks.load(),
-            (unsigned long long)sched_gpu_tasks.load());
+    fprintf(stderr, "  %s──────────────────────────────────────────────────────%s\n", DIM, RST);
+    fprintf(stderr, "  %sScheduler:%s  CPU %s%llu%s tasks, GPU %s%llu%s tasks\n",
+            LBL, RST,
+            CNT, (unsigned long long)sched_cpu_tasks.load(), RST,
+            CNT, (unsigned long long)sched_gpu_tasks.load(), RST);
 
-    fprintf(stderr, "\n\n");
+    fprintf(stderr, "\n");
   }
 };
 
@@ -2174,9 +2436,11 @@ struct CpuAgg {
  The tick thread runs for monitoring/logging but does NOT control
  scheduling  the semaphore handles that in real-time.
 
- QUEUE INTERACTION: GPU workers use blocking pop_batch_greedy (waits for
- full batch).  CPU workers use non-blocking try_pop_batch to avoid
- competing with GPU for the queue's condition variable wakeups.
+ QUEUE INTERACTION: GPU workers use pop_batch_greedy(min_n=1) so multiple
+ GPUs can interleave — each grabs whatever is available up to max_n without
+ waiting for a full batch (waiting for full batches serialises GPUs).
+ CPU workers use non-blocking try_pop_batch to avoid competing with GPU
+ for the queue's condition variable wakeups.
 ======================================================================*/
 class HybridSched {
 public:
@@ -2260,14 +2524,18 @@ public:
     const double gpu_rate = gpu_b / std::max(1e-6, secs);
 
     if (opt_.verbosity >= V_DEBUG) {
+      const char * YEL = g_color_stderr ? "\033[1;93m" : "";  // bright yellow — GPU
+      const char * MAG = g_color_stderr ? "\033[1;95m" : "";  // bright magenta — CPU
+      const char * RST = g_color_stderr ? "\033[0m"    : "";
       std::ostringstream os;
       os << std::fixed << std::setprecision(3)
-         << "hybrid: tick cpu_rate=" << (cpu_rate/1e9) << " GiB/s"
-         << " gpu_rate=" << (gpu_rate/1e9) << " GiB/s"
-         << " gpus_waiting=" << gpus_waiting_.load()
-         << " cpu_taken=" << cpu_taken_.load()
-         << " gpu_taken=" << gpu_taken_.load();
-      std::cerr << os.str() << "\n";
+         << "hybrid: tick "
+         << MAG << "cpu_rate=" << (cpu_rate/1e9) << RST << " GiB/s"
+         << "  " << YEL << "gpu_rate=" << (gpu_rate/1e9) << RST << " GiB/s"
+         << "  " << YEL << "gpus_waiting=" << gpus_waiting_.load() << RST
+         << "  " << MAG << "cpu_taken=" << cpu_taken_.load() << RST
+         << "  " << YEL << "gpu_taken=" << gpu_taken_.load() << RST;
+      vlog(V_DEBUG, opt_, os.str() + "\n");
     }
 
     cpu_taken_.store(0, std::memory_order_relaxed);
@@ -2464,6 +2732,14 @@ static void cpu_worker(
       continue;  // re-enter the loop to pop properly
     }
 
+    if (opt->verbosity >= V_DEBUG) {
+      char in_s[32];
+      human_bytes(double(t.data.size()), in_s, sizeof(in_s));
+      std::ostringstream os;
+      os << "[CPU/T" << worker_id << "] take seq=" << t.seq << " in=" << in_s;
+      vlog(V_DEBUG, *opt, os.str() + "\n");
+    }
+
     {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
@@ -2535,9 +2811,12 @@ static void cpu_worker(
       }
     } else {
       const double thr_gib = (st.comp_ms > 0.0) ? (double)st.in_bytes / (st.comp_ms/1000.0) / 1e9 : 0.0;
+      char in_s[32], out_s[32];
+      human_bytes(double(st.in_bytes),  in_s,  sizeof(in_s));
+      human_bytes(double(st.out_bytes), out_s, sizeof(out_s));
       std::ostringstream os;
       os << "[CPU/T" << worker_id << "] total tasks=" << st.tasks
-         << " in=" << st.in_bytes << "B out=" << st.out_bytes << "B"
+         << " in=" << in_s << " out=" << out_s
          << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
          << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
       vlog(V_DEBUG, *opt, os.str() + "\n");
@@ -3984,7 +4263,7 @@ static void gpu_worker(
         if (bp) bp->acquire((int)pop_n);
         // Signal scheduler: GPU stream wants data (blocks CPU workers)
         if (sched) sched->gpu_wants_data();
-        if (!queue->pop_batch_greedy(pop_n, C.batch)) {
+        if (!queue->pop_batch_greedy(pop_n, C.batch, 1)) {
           if (sched) sched->gpu_got_data();
           if (bp) bp->release((int)pop_n);  // release unused permits
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
@@ -4016,7 +4295,7 @@ static void gpu_worker(
           human_bytes(double(tin), tin_s, sizeof(tin_s));
           std::ostringstream os;
           os << "[GPU" << device_id << "/S" << C.stats.stream_index
-             << "] take N=" << C.filled
+             << "] take batch=" << C.filled
              << " seq=[" << seq_lo << ".." << seq_hi << "]"
              << " in=" << tin_s;
           vlog(V_DEBUG, opt, os.str() + "\n");
@@ -4165,7 +4444,7 @@ static void gpu_worker(
                              ? double(in_sum) / (tot_ms / 1000.0) / 1e9 : 0.0;
             std::ostringstream os;
             os << "[GPU" << device_id << "/S" << C.stats.stream_index
-               << "] done N=" << C.filled
+               << "] done batch=" << C.filled
                << " in=" << in_s << " out=" << out_s
                << " h2d=" << std::fixed << std::setprecision(2) << h2d_ms
                << "ms comp=" << comp_ms
@@ -4295,7 +4574,7 @@ static void gpu_worker(
                              ? double(in_sum) / (tot_ms / 1000.0) / 1e9 : 0.0;
             std::ostringstream os;
             os << "[GPU" << device_id << "/S" << C.stats.stream_index
-               << "] done N=" << C.filled
+               << "] done batch=" << C.filled
                << " in=" << in_s << " out=" << out_s
                << " h2d=" << std::fixed << std::setprecision(2) << h2d_ms
                << "ms comp=" << comp_ms
@@ -5342,9 +5621,13 @@ static void gpu_decomp_worker(
           uint64_t tin = 0;
           for (size_t i = 0; i < C.filled; ++i) tin += C.batch[i].data.size();
           human_bytes(double(tin), in_s, sizeof(in_s));
+          size_t seq_lo = C.batch.front().seq;
+          size_t seq_hi = C.batch.back().seq;
           std::ostringstream os;
           os << "[GPU" << device_id << "/S" << C.stream_index
-             << "] take N=" << C.filled << " in=" << in_s;
+             << "] take batch=" << C.filled
+             << " seq=[" << seq_lo << ".." << seq_hi << "]"
+             << " in=" << in_s;
           vlog(V_DEBUG, opt, os.str() + "\n");
         }
 
@@ -5360,7 +5643,7 @@ static void gpu_decomp_worker(
         // internally in the stream  no host-side blocking between transfers.
         // A single large memcpy would require packing a contiguous host buffer
         // first, which is slower than letting CUDA handle the scatter.
-        uint64_t h2d_t0 = g_perf ? now_ns() : 0;
+        uint64_t h2d_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
         uint64_t h2d_bytes_batch = 0;
         cudaEventRecord(C.ev_begin, C.stream);
         for (size_t i = 0; i < C.filled; ++i) {
@@ -5391,8 +5674,10 @@ static void gpu_decomp_worker(
         nvcompBatchedZstdDecompressOpts_t decomp_opts{};
         size_t needed_temp = 0;
         checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(pre-temp)");
+        uint64_t h2d_elapsed_ns = (h2d_t0 > 0) ? now_ns() - h2d_t0 : 0;
+        double h2d_ms_v = double(h2d_elapsed_ns) / 1e6;
         if (g_perf) {
-          g_perf->h2d_ns.fetch_add(now_ns() - h2d_t0);
+          g_perf->h2d_ns.fetch_add(h2d_elapsed_ns);
           g_perf->h2d_bytes.fetch_add(h2d_bytes_batch);
           g_perf->h2d_count.fetch_add(1);
         }
@@ -5445,7 +5730,7 @@ static void gpu_decomp_worker(
         }
 
         // Launch batched decompression
-        uint64_t kern_t0 = g_perf ? now_ns() : 0;
+        uint64_t kern_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
 
         // Release host-side compressed data  it's on the GPU now.
         // Save per-frame metadata needed by completion paths.
@@ -5474,13 +5759,15 @@ static void gpu_decomp_worker(
 
         // Synchronize and read back results
         checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(decomp)");
+        uint64_t kern_elapsed_ns = (kern_t0 > 0) ? now_ns() - kern_t0 : 0;
+        double comp_ms_v = double(kern_elapsed_ns) / 1e6;
         if (g_perf) {
-          g_perf->kernel_ns.fetch_add(now_ns() - kern_t0);
+          g_perf->kernel_ns.fetch_add(kern_elapsed_ns);
           g_perf->kernel_count.fetch_add(1);
         }
 
         // Read back statuses and actual sizes in bulk
-        uint64_t d2h_t0 = g_perf ? now_ns() : 0;
+        uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
         uint64_t d2h_bytes_batch = 0;
         checkCuda(cudaMemcpy(C.h_statuses.data(), C.d_statuses,
                              C.filled * sizeof(nvcompStatus_t),
@@ -5515,8 +5802,10 @@ static void gpu_decomp_worker(
           results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
           if (g_perf) g_perf->result_lock_ns.fetch_add(now_ns() - rl_t0);
         }
+        uint64_t d2h_elapsed_ns = (d2h_t0 > 0) ? now_ns() - d2h_t0 : 0;
+        double d2h_ms_v = double(d2h_elapsed_ns) / 1e6;
         if (g_perf) {
-          g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
+          g_perf->d2h_ns.fetch_add(d2h_elapsed_ns);
           g_perf->d2h_bytes.fetch_add(d2h_bytes_batch);
           g_perf->d2h_count.fetch_add(1);
           g_perf->gpu_batch_ns.fetch_add(now_ns() - batch_t0);
@@ -5548,16 +5837,23 @@ static void gpu_decomp_worker(
         if (sched) sched->add_gpu_bytes(out_sum);
 
         if (opt.verbosity >= V_DEBUG) {
-          char out_s[32];
+          uint64_t in_sum_v = 0;
+          for (size_t i = 0; i < C.filled; ++i) in_sum_v += batch_comp_sizes[i];
+          char in_s[32], out_s[32];
+          human_bytes(double(in_sum_v), in_s, sizeof(in_s));
           human_bytes(double(out_sum), out_s, sizeof(out_s));
-          double thr_gib = (batch_ms > 0.0)
-                           ? double(out_sum) / (batch_ms / 1000.0) / 1e9 : 0.0;
+          double tot_ms_v = double(now_ns() - batch_t0) / 1e6;
+          double thr_gib = (tot_ms_v > 0.0)
+                           ? double(out_sum) / (tot_ms_v / 1000.0) / 1e9 : 0.0;
           std::ostringstream os;
           os << "[GPU" << device_id << "/S" << C.stream_index
-             << "] done N=" << C.filled
-             << " out=" << out_s
-             << " ms=" << std::fixed << std::setprecision(2) << batch_ms
-             << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
+             << "] done batch=" << C.filled
+             << " in=" << in_s << " out=" << out_s
+             << " h2d=" << std::fixed << std::setprecision(2) << h2d_ms_v
+             << "ms comp=" << comp_ms_v
+             << "ms d2h=" << d2h_ms_v
+             << "ms tot=" << tot_ms_v
+             << "ms thr=" << thr_gib << " GiB/s";
           vlog(V_DEBUG, opt, os.str() + "\n");
         }
 
@@ -6567,6 +6863,9 @@ static Options parse_args(int argc, char ** argv)
 
   // Sync global verbosity for die() (which has no access to Options)
   g_verbosity = opt.verbosity;
+
+  // Cache TTY check once; used by vlog() to gate ANSI color on verbose output.
+  g_color_stderr = is_stderr_tty();
 
   return opt;
 }
