@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.7";
+static constexpr const char * GZSTD_VERSION = "0.12.8";
 //
 // Architecture overview:
 //
@@ -1234,6 +1234,26 @@ static uint64_t get_available_ram_bytes()
 #endif
 }
 
+// Compute a memory-based throttle budget: how many frames can be buffered
+// in ResultStore without exceeding ~50% of available RAM.  Returns at
+// least 1024 to ensure enough pipeline depth on any hardware.
+static int compute_throttle_budget(size_t frame_bytes, const Options & opt)
+{
+  size_t avail = get_available_ram_bytes();
+  if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;  // assume 8 GiB if unknown
+  frame_bytes = std::max<size_t>(frame_bytes, 1);
+  size_t budget = avail / (2 * frame_bytes);
+  int frames = (int)std::min<size_t>(budget, (size_t)INT_MAX);
+  frames = std::max(frames, 1024);
+  if (opt.verbosity >= V_DEBUG) {
+    char ram_s[32]; human_bytes(double(avail), ram_s, sizeof(ram_s));
+    std::ostringstream os;
+    os << "throttle: " << frames << " frame budget (" << ram_s << " avail RAM)";
+    vlog(V_DEBUG, opt, os.str() + "\n");
+  }
+  return frames;
+}
+
 /*======================================================================
  Ultra compression: window log helper
  -----------------------------------------------------------------------
@@ -1642,6 +1662,26 @@ public:
     return true;
   }
 
+  // Block until the queue has at least one task or is done.
+  // Returns false when drained (caller should exit).
+  bool wait_for_work()
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    while (q_.empty() && !done_) cv_.wait(lk);
+    return !(q_.empty() && done_);
+  }
+
+  // Non-blocking pop: returns 1 if got a task, 0 if empty, -1 if drained.
+  int try_pop_one(Task & t)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    if (q_.empty() && done_) return -1;
+    if (q_.empty()) return 0;
+    t = std::move(q_.front());
+    q_.pop_front();
+    return 1;
+  }
+
   // Non-blocking batch pop: takes up to max_n frames if available.
   // Returns number of frames taken (0 if queue was empty).
   // Never blocks  used by CPU workers in hybrid mode to avoid
@@ -1718,19 +1758,21 @@ public:
     return q_.size();
   }
 
-  // Wake all CPU workers blocking in wait_for_cpu().
-  // Called externally when scheduling conditions change (e.g., GPU releases
-  // the semaphore via gpu_got_data, or the queue is drained).
-  // Wake CPU workers to re-evaluate their scheduler predicate.
-  // The main performance win is in gpu_got_data() which only calls this
-  // when gpus_waiting_ drops to 0 — reducing broadcast frequency from
-  // "every GPU batch" to "once per GPU cycle."  notify_all is needed
-  // (not notify_one) because after the queue is done, ALL sleeping CPUs
-  // must wake to see empty+done and exit; notify_one would leave the
-  // rest stuck forever.
+  // Wake ALL CPU workers blocking in wait_for_cpu().
+  // Used for rare lifecycle events (set_done, set_gpu_ready, GPU worker exit)
+  // where all CPUs must re-evaluate their state.
   void notify_cpu_waiters()
   {
     cpu_cv_.notify_all();
+  }
+
+  // Wake ONE CPU worker.  Used by the high-frequency gpu_got_data() path
+  // to avoid thundering herd: each CPU pops one frame then loops back,
+  // so waking all N threads just causes N-1 to contend on m_, check the
+  // predicate, and go back to sleep.
+  void notify_cpu_one()
+  {
+    cpu_cv_.notify_one();
   }
 
   // State snapshot passed to CPU worker predicates.  Lets the predicate
@@ -1783,6 +1825,26 @@ public:
       }
       cpu_cv_.wait(lk);
     }
+  }
+
+  // Non-blocking CPU pop: try to pop one task if the predicate allows.
+  // Returns:  1 = got a task,  0 = predicate not met or queue empty (retry later),
+  //          -1 = drained (caller should exit).
+  // Used by the acquire-before-pop pattern where the worker must not block
+  // while holding a FrameThrottle permit.
+  int try_pop_one_cpu(Task & t, std::function<bool(const QueueState &)> may_proceed)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    if (q_.empty() && done_) return -1;
+    if (!q_.empty()) {
+      QueueState qs { q_.size(), done_, front_ratio_locked() };
+      if (may_proceed(qs)) {
+        t = std::move(q_.front());
+        q_.pop_front();
+        return 1;
+      }
+    }
+    return 0;
   }
 
 private:
@@ -1867,6 +1929,26 @@ public:
     t = std::move(q_.front());
     q_.pop_front();
     return true;
+  }
+
+  // Block until the queue has at least one task or is done.
+  // Returns false when drained (caller should exit).
+  bool wait_for_work()
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    while (q_.empty() && !done_) cv_.wait(lk);
+    return !(q_.empty() && done_);
+  }
+
+  // Non-blocking pop: returns 1 if got a task, 0 if empty, -1 if drained.
+  int try_pop_one(Task & t)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    if (q_.empty() && done_) return -1;
+    if (q_.empty()) return 0;
+    t = std::move(q_.front());
+    q_.pop_front();
+    return 1;
   }
 
   bool drained()
@@ -2490,7 +2572,13 @@ public:
   // work that creates thundering-herd lock contention on TaskQueue::m_.
   void gpu_got_data() {
     int prev = gpus_waiting_.fetch_sub(1, std::memory_order_release);
-    if (prev == 1 && queue_) queue_->notify_cpu_waiters();
+    // Only wake when the last waiting GPU gets data (semaphore hits 0).
+    // Before that, should_cpu_take() returns false anyway.
+    // Use notify_one — each CPU pops one task then loops back; waking
+    // all 96 CPUs just causes 95 to contend on TaskQueue::m_ and sleep.
+    // Safety: GPU workers call notify_cpu_waiters() (all) on exit, so
+    // stragglers always get woken for the drain path.
+    if (prev == 1 && queue_) queue_->notify_cpu_one();
   }
 
   // Called by GPU workers once CUDA context is initialized
@@ -2687,23 +2775,42 @@ static void cpu_worker(
     bool got_task = false;
 #ifdef HAVE_NVCOMP
     if (sched) {
-      // Hybrid mode: block on queue CV until scheduler allows CPU to take
-      // and queue depth meets threshold.  Wakes instantly when:
-      //   - producer pushes a task (push -> cpu_cv_.notify)
-      //   - GPU releases semaphore (gpu_got_data -> notify_cpu_waiters)
-      //   - producer is done (set_done -> cpu_cv_.notify_all)
+      // Hybrid mode: acquire-before-pop with release-before-sleep.
+      //
+      // Why this ordering matters:
+      //   acquire-AFTER-pop deadlocks when a worker pops the frame the writer
+      //   needs but can't get a permit (permits exhausted by ResultStore).
+      //   acquire-BEFORE-pop with blocking wait hoards permits while sleeping.
+      //
+      // Solution: wait (no permit) → acquire → try_pop (non-blocking).
+      // If try_pop fails (another worker grabbed it or predicate changed),
+      // release the permit and retry.  Workers only hold permits while
+      // actively processing — never while sleeping on the CV.
       auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
         if (!sched->should_cpu_take()) return false;
         if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
             && !qs.done) return false;
         return true;
       };
-      got_task = tq->pop_one_cpu(t, may_take);
+      bool drained = false;
+      while (true) {
+        // Step 1: wait for predicate (no permit held → no hoarding)
+        if (!tq->wait_for_cpu(may_take)) { drained = true; break; }
+        // Step 2: acquire permit (may block, but no task held → writer can progress)
+        if (bp) bp->acquire(1);
+        // Step 3: non-blocking pop (state may have changed since wait)
+        int rc = tq->try_pop_one_cpu(t, may_take);
+        if (rc == 1) { got_task = true; break; }   // success: have task + permit
+        if (bp) bp->release(1);                     // release unused permit
+        if (rc == -1) { drained = true; break; }    // queue drained
+        // rc == 0: predicate changed between wait and try — retry
+      }
+      if (drained) break;
       if (got_task) sched->mark_cpu_take(1);
     } else
 #endif
     {
-      // Non-hybrid (--cpu-only): block on queue CV with threshold predicate
+      // Non-hybrid: same wait-acquire-try pattern to prevent permit hoarding.
       if (opt->cpu_queue_min > 0) {
         auto threshold_met = [&](const TaskQueue::QueueState & qs) -> bool {
           return qs.depth >= opt->cpu_queue_min || qs.done;
@@ -2711,7 +2818,16 @@ static void cpu_worker(
         if (!tq->wait_for_cpu(threshold_met)) break;
         if (tq->drained() && tq->size() == 0) break;
       }
-      got_task = tq->pop_one(t);
+      bool drained = false;
+      while (true) {
+        if (!tq->wait_for_work()) { drained = true; break; }
+        if (bp) bp->acquire(1);
+        int rc = tq->try_pop_one(t);
+        if (rc == 1) { got_task = true; break; }
+        if (bp) bp->release(1);
+        if (rc == -1) { drained = true; break; }
+      }
+      if (drained) break;
     }
     if (!got_task) break;
 
@@ -2720,8 +2836,9 @@ static void cpu_worker(
     // cpu_queue_min (which gates the initial pop).
     // Note: cpu_backlog is rarely used; cpu_queue_min is the primary mechanism.
     if (opt->cpu_backlog > 0 && tq->size() < opt->cpu_backlog && !tq->drained()) {
-      // Put it back and wait for more frames
+      // Put it back and release the permit — we're not processing this task
       tq->push(std::move(t));
+      if (bp) bp->release(1);
       auto backlog_met = [&](const TaskQueue::QueueState & qs) -> bool {
         return qs.depth >= opt->cpu_backlog || qs.done;
       };
@@ -2729,12 +2846,8 @@ static void cpu_worker(
       continue;  // re-enter the loop to pop properly
     }
 
-    // Frame throttle: reserve a permit for this in-flight task.
-    // Acquired AFTER pop (not before) so idle workers don't hoard permits
-    // while the queue is empty — that caused deadlocks on multi-GPU setups
-    // where rescue+CPU pool permits exceeded the throttle ceiling.
+    // Permit already acquired above (before pop).
     // The writer releases this permit after the output is physically written.
-    if (bp) bp->acquire(1);
 
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32];
@@ -2838,11 +2951,23 @@ static void cpu_worker_rescue(
   FrameThrottle * bp)
 {
   while (true) {
+    // Same wait-acquire-try pattern as cpu_worker: never hold a permit
+    // while sleeping on the rescue CV, never hold a task without a permit.
     Task t;
-    if (!rq->pop_one(t)) break;
-    // Acquire permit AFTER pop so idle rescue threads don't hoard permits
-    // while waiting on an empty rescue queue (only filled on GPU failures).
-    if (bp) bp->acquire(1);
+    bool got_task = false;
+    {
+      bool drained = false;
+      while (true) {
+        if (!rq->wait_for_work()) { drained = true; break; }
+        if (bp) bp->acquire(1);
+        int rc = rq->try_pop_one(t);
+        if (rc == 1) { got_task = true; break; }
+        if (bp) bp->release(1);
+        if (rc == -1) { drained = true; break; }
+      }
+      if (drained) break;
+    }
+    if (!got_task) break;
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
     compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, opt->ultra, out_frame);
@@ -2916,10 +3041,8 @@ static void cpu_decomp_worker(
     bool got_task = false;
 #ifdef HAVE_NVCOMP
     if (sched) {
-      // Hybrid decompress: block on queue CV until scheduler allows CPU to take
-      // OR a trivially-compressed frame (ratio < 2%) is at the front of the queue.
-      // Trivial frames are faster on CPU (no PCIe D2H overhead), so we bypass
-      // the GPU-priority semaphore for them.
+      // Hybrid decompress: acquire-before-pop with release-before-sleep.
+      // Same pattern as cpu_worker — see comments there.
       bool got_trivial = false;
       auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
         // Always allow trivially-compressed frames regardless of scheduler
@@ -2931,7 +3054,16 @@ static void cpu_decomp_worker(
             && !qs.done) return false;
         return true;
       };
-      got_task = tq->pop_one_cpu(t, may_take);
+      bool drained = false;
+      while (true) {
+        if (!tq->wait_for_cpu(may_take)) { drained = true; break; }
+        if (bp) bp->acquire(1);
+        int rc = tq->try_pop_one_cpu(t, may_take);
+        if (rc == 1) { got_task = true; break; }
+        if (bp) bp->release(1);
+        if (rc == -1) { drained = true; break; }
+      }
+      if (drained) break;
       if (got_task) {
         sched->mark_cpu_take(1);
         if (got_trivial && opt->verbosity >= V_DEBUG) {
@@ -2946,7 +3078,7 @@ static void cpu_decomp_worker(
     } else
 #endif
     {
-      // Non-hybrid (--cpu-only): block on queue CV with threshold predicate
+      // Non-hybrid: same wait-acquire-try pattern.
       if (opt->cpu_queue_min > 0) {
         auto threshold_met = [&](const TaskQueue::QueueState & qs) -> bool {
           return qs.depth >= opt->cpu_queue_min || qs.done;
@@ -2954,14 +3086,20 @@ static void cpu_decomp_worker(
         if (!tq->wait_for_cpu(threshold_met)) break;
         if (tq->drained() && tq->size() == 0) break;
       }
-      got_task = tq->pop_one(t);
+      bool drained = false;
+      while (true) {
+        if (!tq->wait_for_work()) { drained = true; break; }
+        if (bp) bp->acquire(1);
+        int rc = tq->try_pop_one(t);
+        if (rc == 1) { got_task = true; break; }
+        if (bp) bp->release(1);
+        if (rc == -1) { drained = true; break; }
+      }
+      if (drained) break;
     }
     if (!got_task) break;
 
-    // Frame throttle: reserve a permit for this in-flight task.
-    // Acquired AFTER pop (not before) so idle workers don't hoard permits.
-    // Writer releases the permit after physical write.
-    if (bp) bp->acquire(1);
+    // Permit already acquired above (before pop).
 
     const auto t0_w = std::chrono::steady_clock::now();
 
@@ -3222,7 +3360,8 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 
   TaskQueue queue;
   ResultStore results;
-  FrameThrottle throttle;
+  FrameThrottle throttle(compute_throttle_budget(
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt));
   // Disable throttle in test mode: no disk I/O means permits are never released.
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
@@ -3504,7 +3643,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
   ResultStore results;
-  FrameThrottle throttle;
+  FrameThrottle throttle(compute_throttle_budget(
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt));
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
@@ -4057,8 +4197,9 @@ static void gpu_worker(
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
           if (gpu_init_failures) gpu_init_failures->fetch_add(1, std::memory_order_release);
-          // Wake writer in case it's waiting
+          // Wake writer and CPU workers in case they're waiting
           { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+          queue->notify_cpu_waiters();
           return;
         }
         // At least one stream is usable — shrink ctxs and continue.
@@ -4658,6 +4799,11 @@ static void gpu_worker(
       if (C.stream) cudaStreamDestroy(C.stream);
       C.stream = nullptr;
     }
+
+    // Wake all CPU workers: with notify_one in gpu_got_data(), CPUs that
+    // were sleeping when this GPU exited might never get another wakeup.
+    // This ensures all stragglers see the drain condition and exit.
+    queue->notify_cpu_waiters();
   }
   catch (const std::exception & e) {
     // GPU failure: record error, rescue any in-flight chunks to CPU fallback
@@ -4690,6 +4836,8 @@ static void gpu_worker(
       std::lock_guard<std::mutex> lk(results->m);
       results->cv.notify_all();
     }
+    // Wake all CPU workers for drain
+    queue->notify_cpu_waiters();
   }
 }
 
@@ -4975,16 +5123,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #endif
 
   // Frame throttle: bounds in-flight frames to prevent RAM exhaustion.
-  // Sized for peak concurrent demand × 2 safety factor:
-  //   CPU pool (cpu_threads, hybrid only) + GPU (gpu_batch_cap × gpu_count)
-  //   + rescue pool headroom (hw_concurrency/2).
-  // The 2× factor covers the pipeline lag between "worker pushes result"
-  // and "writer releases the permit".  Floor of 512 for single-GPU runs.
-  const int throttle_peak =
-      (opt.hybrid ? resolve_cpu_threads(opt.cpu_threads) : 0)
-      + (int)(opt.gpu_batch_cap * (size_t)gpu_count_early)
-      + (int)std::max(1u, std::thread::hardware_concurrency() / 2);
-  FrameThrottle throttle(std::max(512, 2 * throttle_peak));
+  // Sized from available system memory — each buffered frame costs up to
+  // chunk_size bytes, so budget = (available_ram / 2) / chunk_size.
+  // This scales naturally from embedded systems to thousand-GPU clusters.
+  FrameThrottle throttle(compute_throttle_budget(
+      std::max<size_t>(1, chosen_mib) * ONE_MIB, opt));
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
@@ -5426,6 +5569,7 @@ static void gpu_decomp_worker(
           *fatal_msg = skip_msg;
           if (gpu_init_failures) gpu_init_failures->fetch_add(1, std::memory_order_release);
           { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+          queue->notify_cpu_waiters();
           return;
         }
         vlog(V_DEFAULT, opt,
@@ -5961,6 +6105,9 @@ static void gpu_decomp_worker(
       if (C.ev_end)   cudaEventDestroy(C.ev_end);
       if (C.stream)   cudaStreamDestroy(C.stream);
     }
+
+    // Wake all CPU workers (see gpu_worker for rationale)
+    queue->notify_cpu_waiters();
   }
   catch (const std::exception & e) {
     *any_gpu_failed = true;
@@ -5985,6 +6132,7 @@ static void gpu_decomp_worker(
       std::lock_guard<std::mutex> lk(results->m);
       results->cv.notify_all();
     }
+    queue->notify_cpu_waiters();
   }
 }
 
@@ -6038,17 +6186,9 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
   RateMatchState rate_match;
 
-  // Frame throttle: bounds in-flight frames (popped but not yet written) to
-  // prevent RAM exhaustion.  Workers reserve a permit after popping a task;
-  // the writer releases permits after each frame is physically written.
-  // Disabled in test mode: no disk I/O means permits are never released.
-  // Sized for peak concurrent demand × 2: CPU pool (if hybrid) + GPU
-  // (gpu_batch_cap × device_count) + rescue pool headroom.  Floor 512.
-  const int throttle_peak_dec =
-      ((!opt.gpu_only) ? resolve_cpu_threads(opt.cpu_threads) : 0)
-      + (int)(opt.gpu_batch_cap * (size_t)std::max(1, device_count))
-      + (int)std::max(1u, std::thread::hardware_concurrency() / 2);
-  FrameThrottle throttle(std::max(512, 2 * throttle_peak_dec));
+  // Frame throttle: sized from available RAM (see compress_nvcomp).
+  FrameThrottle throttle(compute_throttle_budget(
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt));
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // ---- Writer thread (outputs decompressed data in order) ----
