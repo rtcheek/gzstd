@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.9";
+static constexpr const char * GZSTD_VERSION = "0.12.10";
 //
 // Architecture overview:
 //
@@ -679,7 +679,6 @@ struct Meter {
   std::atomic< uint64_t > total_frames { 0 };  // total frames to process (set by producer)
   std::atomic< uint64_t > total_out    { 0 };  // expected total output bytes (set when known)
   std::atomic< bool >     total_out_final { false }; // true once reader is done and total_out won't grow
-  std::atomic< uint64_t > tasks_queued { 0 };  // frames pushed to queue so far (inc. during read)
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
@@ -807,7 +806,6 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     uint64_t t_out    = m->total_out.load();
     uint64_t t_done   = m->tasks_done.load();
     uint64_t t_frames = m->total_frames.load();
-    uint64_t t_queued = m->tasks_queued.load();
     auto dt      = steady_clock::now() - m->t0;
     double secs  = duration_cast< duration<double> >(dt).count();
     double in_rate  = secs > 0 ? double(in)  / secs : 0.0;
@@ -821,32 +819,33 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     // in_pct: how much input has been read (always known for regular files).
     double in_pct = (total_in > 0) ? std::min(100.0, 100.0 * double(in) / double(total_in)) : -1.0;
 
-    // out_pct: tracks actual work completion.
-    //   Decompression: total_out is accumulated as the reader parses frame
-    //     headers, so it grows during the read phase.  Using wrote_bytes/total_out
-    //     before the reader finishes gives an inflated percentage (denominator
-    //     too small) that then drops as more frames are parsed.  Only use
-    //     byte-level tracking once total_out is finalized; before that, fall
-    //     through to frame-level or show ---.
-    //   Compression Phase 1 — frames still being compressed:
-    //     use tasks_done/total_frames (frame completion; total_out is only a partial sum).
-    //   Compression Phase 2 — all frames done, AIO still draining:
-    //     switch to wrote_bytes/total_out (now total_out is complete).
-    //   Unknown (single-thread stream path, pipe input): show ---.
+    // out_pct: tracks output completion.
+    //   Reader done (total_out_final): exact wrote_bytes / total_out.
+    //   Reader still running: total_out is partial (growing denominator would
+    //     make the percentage jump high then drop).  Estimate the final total
+    //     output from the current ratio: estimated = total_in × (total_out / read_bytes).
+    //     This converges as more of the file is read and only increases
+    //     monotonically in practice (uniform compressibility).
+    //   Compression after reader, frames still in flight: tasks_done / total_frames.
+    //   Unknown (pipe input, no data yet): show ---.
     bool out_final = m->total_out_final.load(std::memory_order_acquire);
     double out_pct;
-    if (opt.mode == Mode::DECOMPRESS && t_out > 0 && out_final) {
-      // Reader done: total_out is stable, use byte-level for smooth tracking.
+    if (out_final && t_out > 0) {
+      // Decompress, reader done: total_out is stable — smooth byte-level.
       out_pct = std::min(99.9, 100.0 * double(out) / double(t_out));
-    } else if (opt.mode == Mode::DECOMPRESS && t_queued > 0 && !out_final) {
-      // Reader still parsing: total_out is growing, so byte-level would show
-      // inflated % that drops as the denominator grows.  Use frame-level
-      // (tasks_done / tasks_queued) which only increases monotonically.
-      out_pct = std::min(99.9, 100.0 * double(t_done) / double(t_queued));
     } else if (t_frames > 0 && t_done < t_frames) {
+      // Reader done (total_frames set), frames still in flight — frame-level.
       out_pct = std::min(99.9, 100.0 * double(t_done) / double(t_frames));
     } else if (t_frames > 0 && t_out > 0) {
+      // All frames done, AIO still draining — byte-level.
       out_pct = std::min(99.9, 100.0 * double(out) / double(t_out));
+    } else if (total_in > 0 && in > 0 && t_out > 0) {
+      // Reader still running (t_frames not set yet): estimate total output
+      // from current input/output ratio.  Converges as more data is read;
+      // slightly conservative for compression (in-flight frames deflate the
+      // ratio) which is better than an inflated percentage.
+      double estimated_total = double(total_in) * (double(t_out) / double(in));
+      out_pct = std::min(99.9, 100.0 * double(out) / std::max(1.0, estimated_total));
     } else {
       out_pct = -1.0;
     }
@@ -3368,10 +3367,7 @@ static size_t stream_frames_to_queue(
       t.data.assign(ptr, ptr + frame_comp);
       t.decomp_size = (size_t)frame_decomp;
       queue.push(std::move(t));
-      if (m) {
-        m->total_out.fetch_add((uint64_t)frame_decomp, std::memory_order_relaxed);
-        m->tasks_queued.fetch_add(1, std::memory_order_relaxed);
-      }
+      if (m) m->total_out.fetch_add((uint64_t)frame_decomp, std::memory_order_relaxed);
 
       buf_off += frame_comp;
 
