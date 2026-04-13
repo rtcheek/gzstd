@@ -1,9 +1,23 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.8  
+**Covers:** v0.9.50 → v0.12.9  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.9 — GPU queue depth reservation + decompression progress fix
+
+**Bug:** On Knuth, hybrid mode was ~10% slower than `--gpu-only`. Scheduler stats showed CPUs took 18,344 tasks vs GPUs 9,341 — despite CPUs being ~6× slower per task (0.21 vs 1.19 GiB/s). The `should_cpu_take()` gate only blocked CPUs when `gpus_waiting > 0`, but GPUs cycle through wants→got in microseconds. During the much longer GPU processing phase (milliseconds), `gpus_waiting == 0` and all 96 CPUs flooded the queue, leaving it empty when GPUs came back for their next batch.
+
+**Fix:** `HybridSched` now tracks total active GPU streams (`register_gpu_stream()`) and current batch size (`set_gpu_batch_size()`). A dynamic queue floor = `active_streams × batch_size` reserves enough tasks for every GPU stream to fill one full batch. The `may_take` lambda in both compress and decompress CPU workers checks `qs.depth <= floor` and yields if so. The floor updates automatically as the auto-tuner adjusts batch size. When the queue is draining (`qs.done`), the floor is bypassed so CPUs can process remaining tasks. The floor is logged in `-vvv` tick output for diagnosis.
+
+### 2. Decompression progress percentage starts high then drops
+
+**Bug:** On large files, the `out:` progress percentage during decompression started at ~60% and decreased before climbing back up. The decompression progress used `wrote_bytes / total_out`, but `total_out` is accumulated incrementally as the reader parses frame headers. Early in the read phase, `total_out` is small (only a few frames parsed), so `wrote_bytes / total_out` is artificially high. As the reader parses more frames, `total_out` grows faster than `wrote_bytes`, causing the percentage to drop.
+
+**Fix:** Added `total_out_final` flag to `Meter`, set when the reader finishes parsing all frames. The byte-level `wrote_bytes / total_out` path is only used once `total_out` is finalized. During the read phase, progress uses frame-level `tasks_done / tasks_queued` (new `tasks_queued` counter incremented per frame pushed), which increases monotonically. Once the reader finishes, it switches to smooth byte-level tracking for the remainder.
 
 ---
 

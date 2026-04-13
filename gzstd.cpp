@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.8";
+static constexpr const char * GZSTD_VERSION = "0.12.9";
 //
 // Architecture overview:
 //
@@ -678,6 +678,8 @@ struct Meter {
   std::atomic< uint64_t > tasks_done   { 0 };  // frames handed to writer (written in-order)
   std::atomic< uint64_t > total_frames { 0 };  // total frames to process (set by producer)
   std::atomic< uint64_t > total_out    { 0 };  // expected total output bytes (set when known)
+  std::atomic< bool >     total_out_final { false }; // true once reader is done and total_out won't grow
+  std::atomic< uint64_t > tasks_queued { 0 };  // frames pushed to queue so far (inc. during read)
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
@@ -805,6 +807,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     uint64_t t_out    = m->total_out.load();
     uint64_t t_done   = m->tasks_done.load();
     uint64_t t_frames = m->total_frames.load();
+    uint64_t t_queued = m->tasks_queued.load();
     auto dt      = steady_clock::now() - m->t0;
     double secs  = duration_cast< duration<double> >(dt).count();
     double in_rate  = secs > 0 ? double(in)  / secs : 0.0;
@@ -819,17 +822,27 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     double in_pct = (total_in > 0) ? std::min(100.0, 100.0 * double(in) / double(total_in)) : -1.0;
 
     // out_pct: tracks actual work completion.
-    //   Decompression: total_out is always known from frame headers, so use
-    //     wrote_bytes/total_out for smooth byte-level tracking from start to finish.
+    //   Decompression: total_out is accumulated as the reader parses frame
+    //     headers, so it grows during the read phase.  Using wrote_bytes/total_out
+    //     before the reader finishes gives an inflated percentage (denominator
+    //     too small) that then drops as more frames are parsed.  Only use
+    //     byte-level tracking once total_out is finalized; before that, fall
+    //     through to frame-level or show ---.
     //   Compression Phase 1 — frames still being compressed:
     //     use tasks_done/total_frames (frame completion; total_out is only a partial sum).
     //   Compression Phase 2 — all frames done, AIO still draining:
     //     switch to wrote_bytes/total_out (now total_out is complete).
     //   Unknown (single-thread stream path, pipe input): show ---.
+    bool out_final = m->total_out_final.load(std::memory_order_acquire);
     double out_pct;
-    if (opt.mode == Mode::DECOMPRESS && t_out > 0) {
-      // Byte-level: matches the out:<size> display, smooth and always accurate.
+    if (opt.mode == Mode::DECOMPRESS && t_out > 0 && out_final) {
+      // Reader done: total_out is stable, use byte-level for smooth tracking.
       out_pct = std::min(99.9, 100.0 * double(out) / double(t_out));
+    } else if (opt.mode == Mode::DECOMPRESS && t_queued > 0 && !out_final) {
+      // Reader still parsing: total_out is growing, so byte-level would show
+      // inflated % that drops as the denominator grows.  Use frame-level
+      // (tasks_done / tasks_queued) which only increases monotonically.
+      out_pct = std::min(99.9, 100.0 * double(t_done) / double(t_queued));
     } else if (t_frames > 0 && t_done < t_frames) {
       out_pct = std::min(99.9, 100.0 * double(t_done) / double(t_frames));
     } else if (t_frames > 0 && t_out > 0) {
@@ -876,6 +889,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   human_bytes(out_rate, out_rate_s, sizeof(out_rate_s));
   double in_pct  = (total_in  > 0) ? std::min(100.0, 100.0 * double(in)  / double(total_in))  : -1.0;
   double out_pct;
+  // Final line: reader is always done here, so total_out is stable
   if (opt.mode == Mode::DECOMPRESS && t_out > 0)
     out_pct = std::min(100.0, 100.0 * double(out) / double(t_out));
   else if (t_frames > 0)
@@ -2558,8 +2572,30 @@ public:
     if (gpus_waiting_.load(std::memory_order_acquire) > 0)
       return false;
 
-    // No GPU is waiting — CPU can take
+    // No GPU is waiting right now — but check queue depth reservation.
+    // GPUs cycle through wants→got in microseconds; during the much longer
+    // processing phase (milliseconds) gpus_waiting==0 and all CPUs flood
+    // the queue.  The queue floor reserves enough tasks for the next GPU
+    // batch cycle so GPUs never find the queue empty.
     return true;
+  }
+
+  // Minimum queue depth below which CPUs should not take work.
+  // Reserves enough tasks for all GPU streams to fill their next batch.
+  size_t cpu_queue_floor() const {
+    return gpu_queue_floor_.load(std::memory_order_relaxed);
+  }
+
+  // GPU workers call this once per stream after init
+  void register_gpu_stream() {
+    int n = active_gpu_streams_.fetch_add(1, std::memory_order_relaxed) + 1;
+    update_queue_floor(n, gpu_batch_size_.load(std::memory_order_relaxed));
+  }
+
+  // GPU workers call this when the shared batch size changes
+  void set_gpu_batch_size(size_t bs) {
+    gpu_batch_size_.store(bs, std::memory_order_relaxed);
+    update_queue_floor(active_gpu_streams_.load(std::memory_order_relaxed), bs);
   }
 
   // GPU stream calls this when it's ready and waiting for data
@@ -2622,7 +2658,8 @@ public:
          << "  " << YEL << "gpu_rate=" << (gpu_rate/1e9) << RST << " GiB/s"
          << "  " << YEL << "gpus_waiting=" << gpus_waiting_.load() << RST
          << "  " << MAG << "cpu_taken=" << cpu_taken_.load() << RST
-         << "  " << YEL << "gpu_taken=" << gpu_taken_.load() << RST;
+         << "  " << YEL << "gpu_taken=" << gpu_taken_.load() << RST
+         << "  queue_floor=" << gpu_queue_floor_.load();
       vlog(V_DEBUG, opt_, os.str() + "\n");
     }
 
@@ -2642,6 +2679,18 @@ private:
 
   std::atomic<bool> gpu_ready_{false};
   std::atomic<int> gpus_waiting_{0};
+
+  // Queue-depth reservation: CPUs yield when depth <= floor.
+  // floor = active_gpu_streams * gpu_batch_size — enough for every
+  // GPU stream to fill one full batch without waiting.
+  std::atomic<int> active_gpu_streams_{0};
+  std::atomic<size_t> gpu_batch_size_{8};   // initial, updated by auto-tuner
+  std::atomic<size_t> gpu_queue_floor_{0};  // computed from streams * batch
+
+  void update_queue_floor(int streams, size_t batch) {
+    gpu_queue_floor_.store(size_t(std::max(0, streams)) * batch,
+                           std::memory_order_relaxed);
+  }
 
   std::atomic<uint64_t> cpu_taken_{0};
   std::atomic<uint64_t> gpu_taken_{0};
@@ -2788,6 +2837,11 @@ static void cpu_worker(
       // actively processing — never while sleeping on the CV.
       auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
         if (!sched->should_cpu_take()) return false;
+        // Reserve enough tasks for GPUs to fill their next batch cycle.
+        // Without this, 96 CPUs drain the queue during GPU processing,
+        // and GPUs find it empty when they come back for more.
+        size_t floor = sched->cpu_queue_floor();
+        if (floor > 0 && qs.depth <= floor && !qs.done) return false;
         if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
             && !qs.done) return false;
         return true;
@@ -3050,6 +3104,8 @@ static void cpu_decomp_worker(
         got_trivial = false;
         // Normal scheduling: respect GPU priority and queue depth threshold
         if (!sched->should_cpu_take()) return false;
+        size_t floor = sched->cpu_queue_floor();
+        if (floor > 0 && qs.depth <= floor && !qs.done) return false;
         if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
             && !qs.done) return false;
         return true;
@@ -3312,7 +3368,10 @@ static size_t stream_frames_to_queue(
       t.data.assign(ptr, ptr + frame_comp);
       t.decomp_size = (size_t)frame_decomp;
       queue.push(std::move(t));
-      if (m) m->total_out.fetch_add((uint64_t)frame_decomp, std::memory_order_relaxed);
+      if (m) {
+        m->total_out.fetch_add((uint64_t)frame_decomp, std::memory_order_relaxed);
+        m->tasks_queued.fetch_add(1, std::memory_order_relaxed);
+      }
 
       buf_off += frame_comp;
 
@@ -3445,7 +3504,10 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;
     results.total_tasks = queue.total_tasks();
-    if (m) m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
+    if (m) {
+      m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
+      m->total_out_final.store(true, std::memory_order_release);
+    }
   }
   results.cv.notify_all();
 
@@ -3682,7 +3744,10 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;
     results.total_tasks = queue.total_tasks();
-    if (m) m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
+    if (m) {
+      m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
+      m->total_out_final.store(true, std::memory_order_release);
+    }
   }
   results.cv.notify_all();
 
@@ -4243,7 +4308,13 @@ static void gpu_worker(
       }
     }
 
-    if (sched) sched->set_gpu_ready(device_id);
+    if (sched) {
+      sched->set_gpu_ready(device_id);
+      // Register each successfully-initialized stream so the scheduler
+      // reserves enough queue depth for GPU batch demand.
+      for (size_t s = 0; s < ctxs.size(); ++s)
+        sched->register_gpu_stream();
+    }
     double util_scale = 1.0;  // utilization scaling for batch size
     while (true) {
       bool submitted_any=false;
@@ -4421,6 +4492,8 @@ static void gpu_worker(
                      ? shared_tune->batch_size.load(std::memory_order_relaxed)
                      : C.per_stream_batch;
         pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
+        // Keep scheduler's queue floor in sync with current batch size
+        if (sched) sched->set_gpu_batch_size(pop_n);
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
         // Acquire frame permits BEFORE gpu_wants_data to avoid deadlock:
@@ -5615,7 +5688,11 @@ static void gpu_decomp_worker(
     }
 
     // Signal scheduler that this GPU is ready for work
-    if (sched) sched->set_gpu_ready(device_id);
+    if (sched) {
+      sched->set_gpu_ready(device_id);
+      for (size_t s = 0; s < ctxs.size(); ++s)
+        sched->register_gpu_stream();
+    }
 
     // Utilization scaling factor: 1.0 = idle, 0.1 = 90% busy.
     // Updated after each batch completion via NVML query.
@@ -5775,6 +5852,8 @@ static void gpu_decomp_worker(
         size_t pop_n = (shared_tune && !shared_tune->locked.load())
                      ? std::min(shared_tune->batch_size.load(std::memory_order_relaxed), per_stream_cap)
                      : per_stream_cap;
+        // Keep scheduler's queue floor in sync with current batch size
+        if (sched) sched->set_gpu_batch_size(pop_n);
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
         // Soft minimum: don't block for the full batch (serializes 8 GPUs
@@ -6313,7 +6392,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;
     results.total_tasks = queue.total_tasks();
-    if (m) m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
+    if (m) {
+      m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
+      m->total_out_final.store(true, std::memory_order_release);
+    }
   }
   results.cv.notify_all();
 
