@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.10";
+static constexpr const char * GZSTD_VERSION = "0.12.11";
 //
 // Architecture overview:
 //
@@ -679,6 +679,7 @@ struct Meter {
   std::atomic< uint64_t > total_frames { 0 };  // total frames to process (set by producer)
   std::atomic< uint64_t > total_out    { 0 };  // expected total output bytes (set when known)
   std::atomic< bool >     total_out_final { false }; // true once reader is done and total_out won't grow
+  mutable std::atomic< uint64_t > read_elapsed_ms { 0 }; // elapsed ms when read completed (frozen rate)
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
@@ -808,7 +809,20 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     uint64_t t_frames = m->total_frames.load();
     auto dt      = steady_clock::now() - m->t0;
     double secs  = duration_cast< duration<double> >(dt).count();
-    double in_rate  = secs > 0 ? double(in)  / secs : 0.0;
+    // Freeze input rate once reading is complete: dividing fixed read_bytes
+    // by ever-growing elapsed time makes the rate decay after the reader stops.
+    // Snapshot the elapsed time when we first see in >= total_in, then reuse it.
+    double in_secs = secs;
+    if (total_in > 0 && in >= total_in) {
+      uint64_t frozen_ms = m->read_elapsed_ms.load(std::memory_order_relaxed);
+      if (frozen_ms == 0) {
+        uint64_t ms = (uint64_t)(secs * 1000.0);
+        m->read_elapsed_ms.store(ms > 0 ? ms : 1, std::memory_order_relaxed);
+        frozen_ms = ms > 0 ? ms : 1;
+      }
+      in_secs = double(frozen_ms) / 1000.0;
+    }
+    double in_rate  = in_secs > 0 ? double(in)  / in_secs : 0.0;
     double out_rate = secs > 0 ? double(out) / secs : 0.0;
     char in_s[64], out_s[64], rate_s[64], out_rate_s[64];
     human_bytes(double(in),  in_s,  sizeof(in_s));
@@ -879,7 +893,12 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   uint64_t t_frames = m->total_frames.load();
   auto dt      = std::chrono::steady_clock::now() - m->t0;
   double secs  = std::chrono::duration_cast< std::chrono::duration<double> >(dt).count();
-  double in_rate  = secs > 0 ? double(in)  / secs : 0.0;
+  double in_secs = secs;
+  {
+    uint64_t frozen_ms = m->read_elapsed_ms.load(std::memory_order_relaxed);
+    if (frozen_ms > 0) in_secs = double(frozen_ms) / 1000.0;
+  }
+  double in_rate  = in_secs > 0 ? double(in)  / in_secs : 0.0;
   double out_rate = secs > 0 ? double(out) / secs : 0.0;
   char in_s[64], out_s[64], rate_s[64], out_rate_s[64];
   human_bytes(double(in),  in_s,  sizeof(in_s));
