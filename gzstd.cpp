@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.11";
+static constexpr const char * GZSTD_VERSION = "0.12.14";
 //
 // Architecture overview:
 //
@@ -201,6 +201,15 @@ struct Options {
   bool chunk_user_set = false;
   size_t cpu_backlog = 0;    // queue depth before CPU pops (hybrid)
   size_t cpu_queue_min = 0;   // min queue depth before CPU workers activate (0=no threshold)
+
+  // Hybrid queue-floor controls (v0.12.12+)
+  //   AUTO    : EMA throughput ratio scales the floor (decomp → ~0, comp → full)
+  //   NOMINAL : v0.12.9 behaviour, floor = active_gpu_streams * gpu_batch_size
+  //   OFF     : no floor, CPUs compete freely (relies on gpus_waiting semaphore)
+  enum class HybridFloorMode { AUTO, NOMINAL, OFF };
+  HybridFloorMode hybrid_floor_mode = HybridFloorMode::AUTO;
+  // Manual override in [0.0, 1.0].  <0 means "unset; use mode above".
+  double hybrid_floor_factor = -1.0;
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   bool gpu_batch_user_set = false;
@@ -541,7 +550,13 @@ static void print_help()
 " --cpu-batch N    Queue depth before CPUs start popping (hybrid only; keeps frames\n"
 "                  stocked for GPU batch fills). Ignored in --cpu-only. Default: 0\n"
 " --cpu-share X Fixed CPU share [0..1], disables adaptation (hybrid)\n"
-" --cpu-backlog N Secondary queue threshold for CPU workers (hybrid; 0=off)\n";
+" --cpu-backlog N Secondary queue threshold for CPU workers (hybrid; 0=off)\n"
+" --hybrid-floor=M GPU queue-depth reservation mode (hybrid): auto|nominal|off\n"
+"                  auto (default): EMA-scaled — shrinks when CPU≈GPU (decomp),\n"
+"                    grows when GPU≫CPU (comp).\n"
+"                  nominal: v0.12.9 behaviour, streams * gpu_batch_size.\n"
+"                  off: no reservation — CPUs compete freely.\n"
+" --hybrid-floor-factor X Override floor scale in [0..1]; disables auto.\n";
 #ifdef HAVE_NVCOMP
   std::cout <<
 " --gpu-batch N Max GPU subchunks per device (default: 16)\n"
@@ -1266,21 +1281,60 @@ static uint64_t get_available_ram_bytes()
 #endif
 }
 
-// Compute a memory-based throttle budget: how many frames can be buffered
-// in ResultStore without exceeding ~50% of available RAM.  Returns at
-// least 1024 to ensure enough pipeline depth on any hardware.
-static int compute_throttle_budget(size_t frame_bytes, const Options & opt)
+// Compute a throttle budget: how many frames can be buffered in ResultStore
+// before producers must block waiting for the writer.
+//
+// v0.12.14: budget scales with the pipeline's actual producer parallelism
+// (CPU threads + GPU streams * batch cap) times a slack factor, then clamped
+// by available RAM.  This replaces the v0.12.13 hard 8 GiB byte ceiling,
+// which was an arbitrary magic number tuned for our test systems.  The new
+// formula scales naturally:
+//
+//   laptop  (8 CPU, no GPU)                ~32 frames   (floor; ~512 MiB)
+//   workstn (24 CPU, 2*2*16 GPU pipeline)  ~352 frames  (~5.5 GiB)
+//   server  (256 CPU, 8*4*64 GPU pipeline) ~9216 frames (~144 GiB)
+//
+// Rationale: every active producer needs a few frames ahead to stay busy
+// across writer jitter, but there is no benefit to queuing hundreds of
+// frames per producer — that just shifts work into RAM with no throughput
+// gain.  SLACK_FACTOR=4 gives each producer ~4 frames of headroom, which
+// matches typical pipeline-depth tuning in other staged designs.  The RAM
+// cap (half of available) remains as a safety net.
+//
+// Floor is 32 frames so tiny-parallelism or very-large chunk_mib configs
+// don't stall.  Fast-I/O systems are NOT slowed by the cap: the writer
+// releases permits as fast as workers acquire, so nobody blocks.  Only
+// slow-I/O systems see backpressure, which is exactly the desired
+// behavior (keeps in-flight RAM bounded and producers in lockstep with
+// disk).
+static constexpr int THROTTLE_SLACK_FACTOR = 4;
+static constexpr int THROTTLE_MIN_FRAMES = 32;
+
+static int compute_throttle_budget(size_t frame_bytes,
+                                   int pipeline_parallelism,
+                                   const Options & opt)
 {
   size_t avail = get_available_ram_bytes();
   if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;  // assume 8 GiB if unknown
   frame_bytes = std::max<size_t>(frame_bytes, 1);
-  size_t budget = avail / (2 * frame_bytes);
-  int frames = (int)std::min<size_t>(budget, (size_t)INT_MAX);
-  frames = std::max(frames, 1024);
+  pipeline_parallelism = std::max(pipeline_parallelism, 1);
+
+  int pipeline_frames = pipeline_parallelism * THROTTLE_SLACK_FACTOR;
+  size_t ram_cap_frames = (avail / 2) / frame_bytes;
+  int ram_frames = (int)std::min<size_t>(ram_cap_frames, (size_t)INT_MAX);
+
+  int frames = std::min(pipeline_frames, ram_frames);
+  frames = std::max(frames, THROTTLE_MIN_FRAMES);
+
   if (opt.verbosity >= V_DEBUG) {
     char ram_s[32]; human_bytes(double(avail), ram_s, sizeof(ram_s));
+    char bud_s[32]; human_bytes(double(size_t(frames) * frame_bytes),
+                                 bud_s, sizeof(bud_s));
     std::ostringstream os;
-    os << "throttle: " << frames << " frame budget (" << ram_s << " avail RAM)";
+    os << "throttle: " << frames << " frame budget ("
+       << bud_s << " in-flight max, parallelism=" << pipeline_parallelism
+       << ", pipeline=" << pipeline_frames << ", ram_cap=" << ram_frames
+       << ", " << ram_s << " avail RAM)";
     vlog(V_DEBUG, opt, os.str() + "\n");
   }
   return frames;
@@ -2558,9 +2612,10 @@ struct CpuAgg {
 ======================================================================*/
 class HybridSched {
 public:
-  HybridSched(double override_share, int /*cpu_threads*/, int gpu_devices,
+  HybridSched(double override_share, int cpu_threads, int gpu_devices,
               const Options & opt)
-    : opt_(opt), gpu_device_count_(gpu_devices)
+    : opt_(opt), gpu_device_count_(gpu_devices),
+      cpu_thread_count_(std::max(1, cpu_threads))
   {
     if (override_share >= 0.0) {
       fixed_mode_ = true;
@@ -2665,6 +2720,24 @@ public:
     const double cpu_rate = cpu_b / std::max(1e-6, secs);
     const double gpu_rate = gpu_b / std::max(1e-6, secs);
 
+    // Feed EMAs (alpha = 0.3) for AUTO-mode floor scaling.  Only count
+    // samples that carried real work; idle ticks shouldn't collapse the EMA.
+    if (cpu_b > 0) {
+      double prev = cpu_rate_ema_.load(std::memory_order_relaxed);
+      double sample = cpu_rate / 1e9;  // GiB/s
+      double next = (prev == 0.0) ? sample : prev * 0.7 + sample * 0.3;
+      cpu_rate_ema_.store(next, std::memory_order_relaxed);
+      cpu_samples_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (gpu_b > 0) {
+      double prev = gpu_rate_ema_.load(std::memory_order_relaxed);
+      double sample = gpu_rate / 1e9;  // GiB/s
+      double next = (prev == 0.0) ? sample : prev * 0.7 + sample * 0.3;
+      gpu_rate_ema_.store(next, std::memory_order_relaxed);
+      gpu_samples_.fetch_add(1, std::memory_order_relaxed);
+    }
+    refresh_queue_floor_();
+
     if (opt_.verbosity >= V_DEBUG) {
       const char * YEL = g_color_stderr ? "\033[1;93m" : "";  // bright yellow — GPU
       const char * MAG = g_color_stderr ? "\033[1;95m" : "";  // bright magenta — CPU
@@ -2677,7 +2750,8 @@ public:
          << "  " << YEL << "gpus_waiting=" << gpus_waiting_.load() << RST
          << "  " << MAG << "cpu_taken=" << cpu_taken_.load() << RST
          << "  " << YEL << "gpu_taken=" << gpu_taken_.load() << RST
-         << "  queue_floor=" << gpu_queue_floor_.load();
+         << "  queue_floor=" << gpu_queue_floor_.load()
+         << "  floor_factor=" << resolve_factor_();
       vlog(V_DEBUG, opt_, os.str() + "\n");
     }
 
@@ -2691,6 +2765,7 @@ public:
 private:
   const Options & opt_;
   int gpu_device_count_ = 0;
+  int cpu_thread_count_ = 1;
   bool fixed_mode_ = false;
   double fixed_cpu_share_ = -1.0;
   TaskQueue * queue_ = nullptr;  // for waking CPU workers from gpu_got_data()
@@ -2699,15 +2774,63 @@ private:
   std::atomic<int> gpus_waiting_{0};
 
   // Queue-depth reservation: CPUs yield when depth <= floor.
-  // floor = active_gpu_streams * gpu_batch_size — enough for every
-  // GPU stream to fill one full batch without waiting.
+  // Nominal floor = active_gpu_streams * gpu_batch_size.
+  // In AUTO mode, scaled by GPU/CPU throughput ratio (see compute_factor_).
   std::atomic<int> active_gpu_streams_{0};
   std::atomic<size_t> gpu_batch_size_{8};   // initial, updated by auto-tuner
-  std::atomic<size_t> gpu_queue_floor_{0};  // computed from streams * batch
+  std::atomic<size_t> gpu_queue_floor_{0};  // computed floor in effect
+
+  // EMA throughput samples for AUTO mode (v0.12.12+).
+  // Stored as bit-casted doubles so other paths can read lock-free.
+  std::atomic<double> cpu_rate_ema_{0.0};  // GiB/s across all CPU threads
+  std::atomic<double> gpu_rate_ema_{0.0};  // GiB/s across all GPU streams
+  std::atomic<int>    cpu_samples_{0};     // warm-up counter
+  std::atomic<int>    gpu_samples_{0};     // warm-up counter
+
+  // Compute the floor scale factor for AUTO mode.  During warm-up (<2
+  // samples either side) returns 1.0 (nominal), preserving v0.12.9.
+  // Once converged, scales by GPU advantage per stream vs CPU per thread.
+  //   factor = clamp((gpu_per - cpu_per) / gpu_per, 0, 1)
+  // GPU ≫ CPU (compress): factor → 1 (full nominal reservation).
+  // GPU ≈ CPU (decomp):   factor → 0 (CPUs compete freely).
+  double compute_auto_factor_() const {
+    int cs = cpu_samples_.load(std::memory_order_relaxed);
+    int gs = gpu_samples_.load(std::memory_order_relaxed);
+    if (cs < 2 || gs < 2) return 1.0;  // warm-up: nominal behaviour
+    double c_total = cpu_rate_ema_.load(std::memory_order_relaxed);
+    double g_total = gpu_rate_ema_.load(std::memory_order_relaxed);
+    int streams = std::max(1, active_gpu_streams_.load(std::memory_order_relaxed));
+    double gpu_per = g_total / double(streams);
+    double cpu_per = c_total / double(std::max(1, cpu_thread_count_));
+    if (gpu_per <= 0.0) return 1.0;
+    double adv = (gpu_per - cpu_per) / gpu_per;
+    if (adv < 0.0) adv = 0.0;
+    if (adv > 1.0) adv = 1.0;
+    return adv;
+  }
+
+  // Resolve the active floor factor from Options + runtime EMA state.
+  double resolve_factor_() const {
+    if (opt_.hybrid_floor_factor >= 0.0) return opt_.hybrid_floor_factor;
+    switch (opt_.hybrid_floor_mode) {
+      case Options::HybridFloorMode::OFF:     return 0.0;
+      case Options::HybridFloorMode::NOMINAL: return 1.0;
+      case Options::HybridFloorMode::AUTO:
+      default:                                return compute_auto_factor_();
+    }
+  }
 
   void update_queue_floor(int streams, size_t batch) {
-    gpu_queue_floor_.store(size_t(std::max(0, streams)) * batch,
-                           std::memory_order_relaxed);
+    size_t nominal = size_t(std::max(0, streams)) * batch;
+    double factor = resolve_factor_();
+    size_t floor = (size_t)(double(nominal) * factor + 0.5);
+    gpu_queue_floor_.store(floor, std::memory_order_relaxed);
+  }
+
+  // Called from tick() so EMA changes immediately take effect.
+  void refresh_queue_floor_() {
+    update_queue_floor(active_gpu_streams_.load(std::memory_order_relaxed),
+                       gpu_batch_size_.load(std::memory_order_relaxed));
   }
 
   std::atomic<uint64_t> cpu_taken_{0};
@@ -3435,7 +3558,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   TaskQueue queue;
   ResultStore results;
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt));
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, opt));
   // Disable throttle in test mode: no disk I/O means permits are never released.
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
@@ -3721,7 +3844,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   TaskQueue queue;
   ResultStore results;
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt));
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, opt));
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
@@ -5211,11 +5334,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #endif
 
   // Frame throttle: bounds in-flight frames to prevent RAM exhaustion.
-  // Sized from available system memory — each buffered frame costs up to
-  // chunk_size bytes, so budget = (available_ram / 2) / chunk_size.
-  // This scales naturally from embedded systems to thousand-GPU clusters.
+  // Budget scales with pipeline parallelism (CPU threads + GPU streams *
+  // batch cap), capped by half of available RAM.  See
+  // compute_throttle_budget header comment for rationale.
+  const int comp_parallelism = cpu_threads_est
+      + gpu_count_early * (int)std::max<size_t>(1, opt.gpu_streams)
+                        * (int)std::max<size_t>(1, opt.gpu_batch_cap);
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, chosen_mib) * ONE_MIB, opt));
+      std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism, opt));
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
@@ -5230,7 +5356,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) {
     sched_ptr = std::make_unique<HybridSched>(
-        opt.cpu_share, /*cpu_threads*/0, device_count, opt);
+        opt.cpu_share, resolve_cpu_threads(opt.cpu_threads),
+        device_count, opt);
     sched = sched_ptr.get();
     sched->set_queue(&queue);
     tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
@@ -6280,9 +6407,13 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
   RateMatchState rate_match;
 
-  // Frame throttle: sized from available RAM (see compress_nvcomp).
+  // Frame throttle: scales with pipeline parallelism (see compress_nvcomp).
+  const int decomp_cpu_threads_est = opt.gpu_only ? 0 : resolve_cpu_threads(opt.cpu_threads);
+  const int decomp_parallelism = decomp_cpu_threads_est
+      + device_count * (int)std::max<size_t>(1, opt.gpu_streams)
+                     * (int)std::max<size_t>(1, opt.gpu_batch_cap);
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt));
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism, opt));
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // ---- Writer thread (outputs decompressed data in order) ----
@@ -6296,7 +6427,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 
   if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) {
     sched_ptr = std::make_unique<HybridSched>(
-        opt.cpu_share, 0, device_count, opt);
+        opt.cpu_share, resolve_cpu_threads(opt.cpu_threads),
+        device_count, opt);
     sched = sched_ptr.get();
     sched->set_queue(&queue);
     tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
@@ -7048,6 +7180,19 @@ static Options parse_args(int argc, char ** argv)
     else if (parse_num_arg("chunk-size", i, argc, argv, opt.chunk_mib, &opt.chunk_user_set)) {}
     else if (parse_num_arg("cpu-backlog", i, argc, argv, opt.cpu_backlog, nullptr)) {}
     else if (parse_num_arg("cpu-batch", i, argc, argv, opt.cpu_queue_min, nullptr)) {}
+    else if (a.rfind("--hybrid-floor=", 0) == 0) {
+      std::string v = a.substr(15);
+      std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+      if (v == "auto")         opt.hybrid_floor_mode = Options::HybridFloorMode::AUTO;
+      else if (v == "nominal") opt.hybrid_floor_mode = Options::HybridFloorMode::NOMINAL;
+      else if (v == "off")     opt.hybrid_floor_mode = Options::HybridFloorMode::OFF;
+      else die_usage("invalid value for --hybrid-floor (expected auto|nominal|off)");
+    }
+    else if (parse_double_arg("hybrid-floor-factor", i, argc, argv,
+                              opt.hybrid_floor_factor)) {
+      if (opt.hybrid_floor_factor < 0.0 || opt.hybrid_floor_factor > 1.0)
+        die_usage("--hybrid-floor-factor must be in [0.0, 1.0]");
+    }
 #ifdef HAVE_NVCOMP
     else if (a == "--gpu-only") opt.gpu_only = true;
     else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) { opt.gpu_batch_user_set = true; }

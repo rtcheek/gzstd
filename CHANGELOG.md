@@ -1,9 +1,84 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.11  
+**Covers:** v0.9.50 → v0.12.14  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
-- **Lovelace:** 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+- **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.14 — Pipeline-depth throttle budget (principled scaling)
+
+**Motivation:** v0.12.13 fixed the lost-backpressure bug by capping the throttle budget at a hard 8 GiB. That number worked on the two test systems but was arbitrary: too restrictive for a 256-core / 8×H100 server (Knuth) whose pipeline can legitimately hold hundreds of GiB in flight, too generous for a 16 GiB VM where 8 GiB is half of physical RAM. The budget needs to track the machine, not a magic constant.
+
+**Fix:** Replace the fixed byte cap with a formula rooted in observable hardware parallelism:
+
+```cpp
+pipeline_frames = (cpu_threads + gpu_count * streams * batch_cap) * SLACK_FACTOR
+ram_cap_frames  = (avail_ram / 2) / frame_bytes
+frames = max(min(pipeline_frames, ram_cap_frames), 32)
+```
+
+`SLACK_FACTOR = 4` gives each active producer ~4 frames of headroom — enough to ride out writer jitter, not so much that we queue hundreds of frames per producer with no throughput payoff. The RAM cap stays as a safety net; the 32-frame floor guards against pathological low-parallelism or huge-chunk configs.
+
+Expected budgets:
+
+| System                         | Parallelism             | Frames   | In-flight |
+|--------------------------------|-------------------------|----------|-----------|
+| Laptop (8 CPU, no GPU)         | 8                       | 32 (floor) | 512 MiB  |
+| 16 GiB VM (4 CPU, no GPU)      | 4                       | 32 (floor) | 512 MiB  |
+| Lovelace (24 CPU, 2×1×16 GPU)  | 24 + 32 = 56            | 224      | ~3.5 GiB  |
+| Knuth (256 CPU, 8×2×64 GPU)    | 256 + 1024 = 1280       | 5120     | ~80 GiB   |
+
+On Lovelace this is ~2× tighter than the old 8 GiB cap but well above the ~320 MiB the writer actually drains before the next producer wakeup, so no throughput regression is expected. On Knuth it unlocks the pipeline the hardware can actually sustain.
+
+The `-vvv` throttle debug line now shows all inputs: `parallelism=`, `pipeline=` (pre-clamp), `ram_cap=`, plus the chosen frame count and in-flight byte equivalent.
+
+---
+
+## v0.12.13 — Throttle budget byte cap (restore writer backpressure)
+
+**Bug:** On Lovelace (256 GiB RAM) decompression appeared to lose all writer backpressure. Reader, GPUs, and CPUs finished in seconds; the writer then ground through a massive in-RAM backlog at ~88 MiB/s with no throttling of producers. The throttle budget formula `avail_ram / (2 × frame_bytes)` gave ~7,800 frames on a 246 GiB-available box — 123 GiB of permitted in-flight data. Files under that size (mixed.bin.zst at ~20 GiB decompressed = 1,220 frames) fit entirely within the budget, so workers never blocked, decompressed everything immediately, and the writer drained alone.
+
+**Fix:** Cap the budget at an absolute byte ceiling in addition to the RAM-relative calculation:
+
+```cpp
+budget_bytes = min(avail_ram / 2, THROTTLE_MAX_BYTES);   // 8 GiB cap
+frames = budget_bytes / frame_bytes;
+frames = max(frames, 32);                                // min pipeline depth
+```
+
+On Lovelace: budget = 512 frames (8 GiB in-flight) instead of ~7,800. Workers fill the pipeline, then block on `acquire(1)` — writer releases permits as frames are written, producers resume. Lockstep backpressure restored.
+
+Fast-I/O systems are unaffected: when the writer can release permits faster than workers acquire them, nobody blocks. Only slow-I/O systems (relative to producer throughput) feel the cap — which is exactly where it's needed.
+
+Prior floor of 1024 was also wrong on low-RAM systems (forced a minimum 16 GiB in-flight on 24 GiB boxes, would have caused swap once the reader's buffer was resident). Floor is now 32 frames.
+
+**Debug log change:** `-vvv` throttle message now reports both the frame count and the byte in-flight max, and the available-RAM figure:
+```
+throttle: 512 frame budget (8.00 GiB in-flight max, 246.03 GiB avail RAM)
+```
+
+---
+
+## v0.12.12 — EMA-scaled hybrid queue floor + tuning knobs
+
+**Bug:** The fixed queue floor introduced in v0.12.9 — `active_gpu_streams × gpu_batch_size` — assumed GPU was strictly faster than CPU per frame. For compression that holds (GPU batches pay off), but for decompression nvCOMP throughput ≈ CPU zstd throughput, so reserving frames for the GPU just idles CPUs. Lovelace benchmarks (v0.12.11) showed hybrid decompression 2–8% slower than the best pure path on every file, and 18% slower than either pure config on `zeros.bin` (3.675 vs 4.482 GiB/s).
+
+**Fix:** `HybridSched` now scales the nominal floor by observed GPU advantage. Each tick (every ≥0.5s) feeds per-side EMA throughput (`cpu_rate_ema_`, `gpu_rate_ema_`, α=0.3) from the already-tracked `cpu_bytes_` / `gpu_bytes_` counters. The floor factor is `clamp((gpu_per_stream − cpu_per_thread) / gpu_per_stream, 0, 1)`:
+- Compression: GPU ≫ CPU → factor ≈ 1.0 (nominal reservation, preserves v0.12.9 gains).
+- Decompression: GPU ≈ CPU → factor → 0 (CPUs compete freely).
+
+During warm-up (<2 EMA samples on either side), factor defaults to 1.0, matching v0.12.9. Convergence is typical after ~2s (≈6 ticks at α=0.3). The constructor now consumes the `cpu_threads` argument it previously ignored.
+
+**New CLI flags** (gated; defaults preserve v0.12.12 AUTO behaviour):
+- `--hybrid-floor=auto|nominal|off`
+  - `auto` (default): EMA-scaled as above.
+  - `nominal`: v0.12.9 behaviour (`streams × batch`).
+  - `off`: no reservation — CPUs compete freely, relying on the `gpus_waiting_` semaphore for GPU priority.
+- `--hybrid-floor-factor=X` — manual override in `[0.0, 1.0]`; bypasses mode selection.
+
+`-vvv` tick output adds `floor_factor=` alongside `queue_floor=` for diagnosis.
 
 ---
 
