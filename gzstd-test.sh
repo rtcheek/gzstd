@@ -371,6 +371,7 @@ count_tests() {
   has_gpu 2>/dev/null && count=$((count + 17)) || count=$((count + 15))  # 33: verbose validation
   count=$((count + 6))   # 34: summary format
   count=$((count + 8))   # 35: ultra validation (windowLog, T1, T4, chunk-warn, chunk-ok, prog×2, interop)
+  count=$((count + 9))   # 36: throttle tunables (+1 GPU deadlock regression)
   echo $count
 }
 
@@ -2083,6 +2084,116 @@ if command -v zstd &>/dev/null; then
   rm -f "$TMPDIR/ultra-interop.zst" "$TMPDIR/ultra-interop.dec"
 else
   skip "--ultra -22 interop with zstd" "zstd not installed"
+fi
+
+# ============================================================
+# 36. Throttle budget tunables
+# ============================================================
+section "Throttle budget tunables"
+
+# Round-trip at the most restrictive throttle: a single in-flight frame.
+# Exercises the min-pipeline path and guards against deadlock at tiny budgets.
+"$GZSTD" -k -f --cpu-only --throttle-frames=1 \
+  "$TMPDIR/large.bin" -o "$TMPDIR/thr1.zst" 2>/dev/null
+"$GZSTD" -d -k -f --cpu-only --throttle-frames=1 \
+  "$TMPDIR/thr1.zst" -o "$TMPDIR/thr1.dec" 2>/dev/null
+files_match "$TMPDIR/large.bin" "$TMPDIR/thr1.dec" \
+  && pass "--throttle-frames=1 round-trip (deadlock guard)" \
+  || fail "--throttle-frames=1 round-trip"
+rm -f "$TMPDIR/thr1.zst" "$TMPDIR/thr1.dec"
+
+# At the default floor (32 frames) the producer pipeline fills quickly; this
+# just verifies no weird interaction with the min-frames clamp.
+"$GZSTD" -k -f --cpu-only --throttle-frames=32 \
+  "$TMPDIR/large.bin" -o "$TMPDIR/thr32.zst" 2>/dev/null
+"$GZSTD" -d -k -f --cpu-only --throttle-frames=32 \
+  "$TMPDIR/thr32.zst" -o "$TMPDIR/thr32.dec" 2>/dev/null
+files_match "$TMPDIR/large.bin" "$TMPDIR/thr32.dec" \
+  && pass "--throttle-frames=32 round-trip (floor)" \
+  || fail "--throttle-frames=32 round-trip"
+rm -f "$TMPDIR/thr32.zst" "$TMPDIR/thr32.dec"
+
+# Large slack multiplier — exercises the other extreme (pipeline-dominated).
+"$GZSTD" -k -f --cpu-only --throttle-factor=16 \
+  "$TMPDIR/large.bin" -o "$TMPDIR/thrf16.zst" 2>/dev/null
+"$GZSTD" -d -k -f --cpu-only --throttle-factor=16 \
+  "$TMPDIR/thrf16.zst" -o "$TMPDIR/thrf16.dec" 2>/dev/null
+files_match "$TMPDIR/large.bin" "$TMPDIR/thrf16.dec" \
+  && pass "--throttle-factor=16 round-trip" \
+  || fail "--throttle-factor=16 round-trip"
+rm -f "$TMPDIR/thrf16.zst" "$TMPDIR/thrf16.dec"
+
+# Minimum slack multiplier (1x parallelism). Must not deadlock.
+"$GZSTD" -k -f --cpu-only --throttle-factor=1 \
+  "$TMPDIR/large.bin" -o "$TMPDIR/thrf1.zst" 2>/dev/null
+"$GZSTD" -d -k -f --cpu-only --throttle-factor=1 \
+  "$TMPDIR/thrf1.zst" -o "$TMPDIR/thrf1.dec" 2>/dev/null
+files_match "$TMPDIR/large.bin" "$TMPDIR/thrf1.dec" \
+  && pass "--throttle-factor=1 round-trip" \
+  || fail "--throttle-factor=1 round-trip"
+rm -f "$TMPDIR/thrf1.zst" "$TMPDIR/thrf1.dec"
+
+# -v emits the one-line throttle summary at startup. Check that both
+# compression and decompression paths surface it.
+v_out=$("$GZSTD" -v -k -f --cpu-only \
+  "$TMPDIR/large.bin" -o "$TMPDIR/thr-v.zst" 2>&1)
+if grep -qE "throttle: [0-9]+ frames .* source=" <<< "$v_out"; then
+  pass "-v logs throttle startup line"
+else
+  fail "-v throttle startup line" "not found"
+fi
+rm -f "$TMPDIR/thr-v.zst"
+
+# -vv emits end-of-run throttle stats (saturation + block counters).
+vv_out=$("$GZSTD" -vv -k -f --cpu-only \
+  "$TMPDIR/large.bin" -o "$TMPDIR/thr-vv.zst" 2>&1)
+if grep -qE "throttle stats \[compress-cpu\]: peak=" <<< "$vv_out"; then
+  pass "-vv logs throttle end-of-run stats"
+else
+  fail "-vv throttle end-of-run stats" "not found"
+fi
+rm -f "$TMPDIR/thr-vv.zst"
+
+# Invalid --throttle-frames=0 must be rejected with usage exit (2).
+"$GZSTD" -k -f --cpu-only --throttle-frames=0 \
+  "$TMPDIR/small.txt" -o "$TMPDIR/thr-bad.zst" 2>/dev/null
+rc=$?
+if [[ $rc -eq 2 ]]; then
+  pass "--throttle-frames=0 rejected (exit 2)"
+else
+  fail "--throttle-frames=0 rejection" "exit $rc"
+fi
+rm -f "$TMPDIR/thr-bad.zst"
+
+# Invalid --throttle-factor=0 must be rejected.
+"$GZSTD" -k -f --cpu-only --throttle-factor=0 \
+  "$TMPDIR/small.txt" -o "$TMPDIR/thr-bad2.zst" 2>/dev/null
+rc=$?
+if [[ $rc -eq 2 ]]; then
+  pass "--throttle-factor=0 rejected (exit 2)"
+else
+  fail "--throttle-factor=0 rejection" "exit $rc"
+fi
+rm -f "$TMPDIR/thr-bad2.zst"
+
+# Hybrid/GPU regression: --throttle-frames=1 without --cpu-only used to
+# deadlock because GPU workers greedy-acquire a full batch of permits.
+# The compute_throttle_budget guardrail must clamp to the GPU batch floor
+# and the run must complete (with a warning) in bounded time.
+if has_gpu 2>/dev/null; then
+  timeout 30 "$GZSTD" -k -f --hybrid --throttle-frames=1 \
+    "$TMPDIR/large.bin" -o "$TMPDIR/thr-hyb.zst" 2>"$TMPDIR/thr-hyb.err"
+  rc=$?
+  if [[ $rc -eq 0 ]] \
+     && grep -q "GPU batch floor" "$TMPDIR/thr-hyb.err" \
+     && [[ -s "$TMPDIR/thr-hyb.zst" ]]; then
+    pass "--throttle-frames=1 --hybrid: warns & clamps (no deadlock)"
+  else
+    fail "--throttle-frames=1 --hybrid deadlock guard" "exit $rc"
+  fi
+  rm -f "$TMPDIR/thr-hyb.zst" "$TMPDIR/thr-hyb.err"
+else
+  skip "--throttle-frames=1 --hybrid deadlock guard" "no GPU"
 fi
 
 # ============================================================

@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.14";
+static constexpr const char * GZSTD_VERSION = "0.12.21";
 //
 // Architecture overview:
 //
@@ -68,6 +68,7 @@ static constexpr const char * GZSTD_VERSION = "0.12.14";
 #endif
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #ifdef _WIN32
  #include <io.h>
 #endif
@@ -210,6 +211,12 @@ struct Options {
   HybridFloorMode hybrid_floor_mode = HybridFloorMode::AUTO;
   // Manual override in [0.0, 1.0].  <0 means "unset; use mode above".
   double hybrid_floor_factor = -1.0;
+
+  // Throttle tuning (v0.12.14+).
+  //   throttle_factor : slack multiplier (default THROTTLE_SLACK_FACTOR when 0)
+  //   throttle_frames : explicit frame override; bypasses the formula entirely
+  int throttle_factor = 0;
+  int throttle_frames = 0;
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   bool gpu_batch_user_set = false;
@@ -221,6 +228,7 @@ struct Options {
   std::string stats_json;
   int sparse_mode = -1;           // -1=auto (file:on, stdout:off), 0=off, 1=on
   bool sync_output = false;       // --sync-output: fsync before closing output file
+  bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -529,6 +537,8 @@ static void print_help()
 " --[no-]sparse Enable/disable sparse file support (skip zero blocks)\n"
 "               Default: enabled for file output, disabled for stdout\n"
 " --sync-output Fsync output file before exit (default: off; OS flushes in background)\n"
+" --direct       Use O_DIRECT for output (bypass page cache; may increase variance)\n"
+" --no-direct    Use buffered I/O for output (default; consistent throughput)\n"
 " -c Write to stdout\n"
 " -o, --output FILE  Explicit output path\n"
 " -1 .. -19 Compression level (CPU zstd; default: 3)\n"
@@ -556,7 +566,10 @@ static void print_help()
 "                    grows when GPU≫CPU (comp).\n"
 "                  nominal: v0.12.9 behaviour, streams * gpu_batch_size.\n"
 "                  off: no reservation — CPUs compete freely.\n"
-" --hybrid-floor-factor X Override floor scale in [0..1]; disables auto.\n";
+" --hybrid-floor-factor X Override floor scale in [0..1]; disables auto.\n"
+" --throttle-factor N Slack multiplier for in-flight frame budget (default: 4)\n"
+"                  budget = parallelism * factor, capped by RAM/2, floor=32.\n"
+" --throttle-frames N Explicit in-flight frame cap (bypasses the formula)\n";
 #ifdef HAVE_NVCOMP
   std::cout <<
 " --gpu-batch N Max GPU subchunks per device (default: 16)\n"
@@ -1000,6 +1013,52 @@ static size_t robust_fwrite(const void * ptr, size_t size, FILE * f)
  Used only for regular file output.  Pipes, stdout, and device files
  fall back to standard fwrite via robust_fwrite.
 ======================================================================*/
+
+/*======================================================================
+ MmapRegion — RAII read-only memory-mapped file
+ -----------------------------------------------------------------------
+ Maps a regular file into the address space for zero-copy producer reads.
+ Workers access the mapped pages directly via Task::view_ptr, avoiding
+ the fread + memcpy overhead that serialises the single-threaded producer.
+ MADV_SEQUENTIAL tells the kernel to read ahead aggressively.
+======================================================================*/
+#ifndef _WIN32
+class MmapRegion {
+public:
+  MmapRegion() = default;
+  ~MmapRegion() { reset(); }
+  MmapRegion(const MmapRegion &) = delete;
+  MmapRegion & operator=(const MmapRegion &) = delete;
+
+  bool open(const char * path) {
+    reset();
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    if (::fstat(fd, &st) != 0 || st.st_size == 0) { ::close(fd); return false; }
+    size_ = (size_t)st.st_size;
+    ptr_ = (const char *)::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (ptr_ == MAP_FAILED) { ptr_ = nullptr; size_ = 0; return false; }
+    ::madvise((void *)ptr_, size_, MADV_SEQUENTIAL);
+    return true;
+  }
+
+  void reset() {
+    if (ptr_) { ::munmap((void *)ptr_, size_); ptr_ = nullptr; size_ = 0; }
+  }
+
+  const char * data() const { return ptr_; }
+  size_t       size() const { return size_; }
+  explicit operator bool() const { return ptr_ != nullptr; }
+
+private:
+  const char * ptr_ = nullptr;
+  size_t       size_ = 0;
+};
+
+#endif // !_WIN32
+
 #ifndef _WIN32
 class DirectWriter {
 public:
@@ -1312,33 +1371,80 @@ static constexpr int THROTTLE_MIN_FRAMES = 32;
 
 static int compute_throttle_budget(size_t frame_bytes,
                                    int pipeline_parallelism,
+                                   int gpu_batch_floor,
                                    const Options & opt)
 {
   size_t avail = get_available_ram_bytes();
   if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;  // assume 8 GiB if unknown
   frame_bytes = std::max<size_t>(frame_bytes, 1);
   pipeline_parallelism = std::max(pipeline_parallelism, 1);
+  gpu_batch_floor = std::max(gpu_batch_floor, 0);
 
-  int pipeline_frames = pipeline_parallelism * THROTTLE_SLACK_FACTOR;
+  int slack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
+  int pipeline_frames = pipeline_parallelism * slack;
   size_t ram_cap_frames = (avail / 2) / frame_bytes;
   int ram_frames = (int)std::min<size_t>(ram_cap_frames, (size_t)INT_MAX);
 
-  int frames = std::min(pipeline_frames, ram_frames);
-  frames = std::max(frames, THROTTLE_MIN_FRAMES);
+  int frames;
+  const char * source;
+  if (opt.throttle_frames > 0) {
+    frames = opt.throttle_frames;
+    source = "user";
+    // Guardrail: GPU workers greedy-acquire up to gpu_batch_cap permits per
+    // stream.  If the budget is smaller than the sum of concurrent batches
+    // that can be in flight, the first stream takes all permits, blocks
+    // waiting for more, and the writer can't release any (nothing was
+    // produced yet) — classic deadlock.  Clamp up to the safe floor.
+    if (gpu_batch_floor > 0 && frames < gpu_batch_floor) {
+      if (opt.verbosity >= V_ERROR) {
+        std::ostringstream os;
+        os << "warning: --throttle-frames=" << opt.throttle_frames
+           << " is below the GPU batch floor (" << gpu_batch_floor
+           << " = devices*streams*gpu_batch_cap); clamping to " << gpu_batch_floor
+           << " to avoid deadlock.\n";
+        vlog(V_ERROR, opt, os.str());
+      }
+      frames = gpu_batch_floor;
+      source = "user+gpu-floor";
+    }
+  } else {
+    frames = std::min(pipeline_frames, ram_frames);
+    frames = std::max(frames, THROTTLE_MIN_FRAMES);
+    if (gpu_batch_floor > 0 && frames < gpu_batch_floor) {
+      // Defensive: the default formula should always clear this, but guard
+      // against unusual configurations (tiny parallelism + huge batch_cap).
+      frames = gpu_batch_floor;
+    }
+    source = (frames == THROTTLE_MIN_FRAMES && pipeline_frames < THROTTLE_MIN_FRAMES)
+           ? "floor"
+           : (pipeline_frames <= ram_frames ? "pipeline" : "ram");
+  }
 
-  if (opt.verbosity >= V_DEBUG) {
-    char ram_s[32]; human_bytes(double(avail), ram_s, sizeof(ram_s));
+  // One-line summary at -v (informational).
+  if (opt.verbosity >= V_VERBOSE) {
     char bud_s[32]; human_bytes(double(size_t(frames) * frame_bytes),
                                  bud_s, sizeof(bud_s));
     std::ostringstream os;
-    os << "throttle: " << frames << " frame budget ("
-       << bud_s << " in-flight max, parallelism=" << pipeline_parallelism
-       << ", pipeline=" << pipeline_frames << ", ram_cap=" << ram_frames
-       << ", " << ram_s << " avail RAM)";
+    os << "throttle: " << frames << " frames (" << bud_s
+       << " in-flight max, source=" << source
+       << ", parallelism=" << pipeline_parallelism
+       << ", slack=" << slack << ")";
+    vlog(V_VERBOSE, opt, os.str() + "\n");
+  }
+  // Detailed breakdown at -vv (debug).
+  if (opt.verbosity >= V_DEBUG) {
+    char ram_s[32]; human_bytes(double(avail), ram_s, sizeof(ram_s));
+    std::ostringstream os;
+    os << "throttle detail: pipeline_cap=" << pipeline_frames
+       << ", ram_cap=" << ram_frames
+       << ", floor=" << THROTTLE_MIN_FRAMES
+       << ", avail_ram=" << ram_s;
     vlog(V_DEBUG, opt, os.str() + "\n");
   }
   return frames;
 }
+
+// log_throttle_stats is defined below, after FrameThrottle.
 
 /*======================================================================
  Ultra compression: window log helper
@@ -1458,7 +1564,23 @@ static size_t check_ram_budget(int threads, size_t chunk_mib, const Options & op
 ======================================================================*/
 // A chunk of work: compressed or uncompressed data with a sequence number.
 // For decompression, decomp_size holds the expected decompressed size (from frame header).
-struct Task { size_t seq; std::vector<char> data; size_t decomp_size = 0; };
+// For mmap-backed compression, view_ptr/view_len point into the mapped region
+// (zero-copy); data is empty.  Consumers use ptr()/len() uniformly.
+struct Task {
+  size_t seq = 0;
+  std::vector<char> data;
+  size_t decomp_size = 0;
+  const char * view_ptr = nullptr;
+  size_t       view_len = 0;
+
+
+  const char * ptr() const { return view_ptr ? view_ptr : data.data(); }
+  size_t       len() const { return view_ptr ? view_len : data.size(); }
+  void release_input() {
+    if (view_ptr) { view_ptr = nullptr; view_len = 0; }
+    else          { std::vector<char>().swap(data); }
+  }
+};
 
 // Thread-safe work queue for distributing chunks to compressor threads.
 // Producer pushes chunks; workers pop one-at-a-time (CPU) or in batches (GPU).
@@ -1675,14 +1797,22 @@ public:
     cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
   }
 
-  // Re-enqueue tasks that were popped but never processed (e.g., GPU VRAM failure).
-  // Does NOT increment total_tasks_ since these were already counted on first push.
+  // Re-enqueue tasks that were popped but never processed (e.g., GPU trivial-skip,
+  // VRAM failure).  Pushes to the FRONT of the deque in original sequence order.
+  //
+  // Why front, not back: the FrameThrottle is deadlock-free only when the FIFO
+  // invariant holds — "the frame the writer needs next is always among the oldest
+  // in-flight frames."  push_back breaks this: the writer needs frame 0, but it's
+  // behind 1200+ higher-sequence frames.  Workers process those higher frames,
+  // consuming all permits, and frame 0 can never be popped — classic circular wait.
+  // push_front restores the invariant: re-enqueued frames (lowest seq) are popped
+  // and processed first, so the writer can make progress and release permits.
   void re_enqueue(std::vector<Task> & batch)
   {
     if (batch.empty()) return;
     std::unique_lock<std::mutex> lk(m_);
-    for (auto & t : batch)
-      q_.push_back(std::move(t));
+    for (auto it = batch.rbegin(); it != batch.rend(); ++it)
+      q_.push_front(std::move(*it));
     batch.clear();
     cv_.notify_all();
     cpu_cv_.notify_one();
@@ -1740,7 +1870,7 @@ public:
   bool pop_one(Task & t)
   {
     std::unique_lock<std::mutex> lk(m_);
-    while (q_.empty() && !done_) cv_.wait(lk);
+    while (q_.empty() && !done_) cpu_cv_.wait(lk);
     if (q_.empty() && done_) return false;
 
     t = std::move(q_.front());
@@ -1750,10 +1880,21 @@ public:
 
   // Block until the queue has at least one task or is done.
   // Returns false when drained (caller should exit).
+  //
+  // Waits on cpu_cv_ (CPU channel) rather than cv_ (GPU batch channel) so
+  // that push()'s targeted cpu_cv_.notify_one() wakes exactly one sleeping
+  // CPU worker per frame.  Previously waited on cv_, which push notifies
+  // via notify_all for GPU batch waiters — so every CPU worker in the pool
+  // woke on every push, 21 of 22 then found the queue drained by the
+  // winner and went back to sleep.  At ~8000 frames × 22 waiters that's
+  // ~176k spurious wakeups per run; eliminating them collapses
+  // worker-to-worker contention on m_ and removes the bulk of the CPU-side
+  // variance at high thread counts.  set_done() notifies both CVs so
+  // shutdown still wakes everyone.
   bool wait_for_work()
   {
     std::unique_lock<std::mutex> lk(m_);
-    while (q_.empty() && !done_) cv_.wait(lk);
+    while (q_.empty() && !done_) cpu_cv_.wait(lk);
     return !(q_.empty() && done_);
   }
 
@@ -1818,7 +1959,7 @@ public:
     if (q_.empty()) return -1.0;
     const Task & front = q_.front();
     if (front.decomp_size == 0) return -1.0;
-    return double(front.data.size()) / double(front.decomp_size);
+    return double(front.len()) / double(front.decomp_size);
   }
 
   // Signal that no more tasks will be pushed (producer is finished).
@@ -1939,7 +2080,7 @@ private:
     if (q_.empty()) return -1.0;
     const Task & front = q_.front();
     if (front.decomp_size == 0) return -1.0;
-    return double(front.data.size()) / double(front.decomp_size);
+    return double(front.len()) / double(front.decomp_size);
   }
 
   std::mutex              m_;
@@ -2098,7 +2239,16 @@ struct ResultStore {
       slots[slot_id]->pending.emplace_back(seq, std::move(frame));
       // GPU path: no per-frame notify. Batch-completion notify handles it.
     } else {
-      // CPU fallback: push to shared map and notify (CPU frames are infrequent)
+      // CPU path: shared map, always notify.  A "targeted notify only when
+      // seq == next_to_write" optimization was tried in v0.12.16 and removed
+      // in v0.12.17 — it was not safe in hybrid mode: if a GPU batch is
+      // in flight (no per-frame notify) and a CPU worker pushes an
+      // out-of-order frame, the writer is left sleeping with data in the
+      // shared map that it cannot see until the next GPU batch completes.
+      // In pathological sequences (many CPU out-of-order pushes between
+      // GPU batch boundaries) the writer stalls.  Per-CPU-push notify_one
+      // is cheap enough — the writer is a single waiter, not a herd — so
+      // correctness wins over the micro-optimization.
       std::lock_guard<std::mutex> lk(m);
       data.emplace(seq, std::move(frame));
       cv.notify_one();
@@ -2146,23 +2296,51 @@ public:
   void acquire(int n = 1) {
     if (n <= 0) return;
     std::unique_lock<std::mutex> lk(m_);
+    bool waited = false;
+    std::chrono::steady_clock::time_point t0;
     while (n > 0 && !done_) {
-      cv_.wait(lk, [&] { return permits_ > 0 || done_; });
-      if (done_) return;
+      if (permits_ <= 0 && !done_) {
+        if (!waited) {
+          waited = true;
+          t0 = std::chrono::steady_clock::now();
+        }
+        cv_.wait(lk, [&] { return permits_ > 0 || done_; });
+      }
+      if (done_) break;
       int take = std::min(n, permits_);
       permits_ -= take;
       n -= take;
     }
+    // Track peak observed in-flight (advisory; under the lock so consistent).
+    int observed = max_ - permits_;
+    int prev = peak_in_flight_.load(std::memory_order_relaxed);
+    while (observed > prev &&
+           !peak_in_flight_.compare_exchange_weak(prev, observed,
+                                                  std::memory_order_relaxed)) {}
+    if (waited) {
+      auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+      block_count_.fetch_add(1, std::memory_order_relaxed);
+      block_nanos_.fetch_add((uint64_t)ns, std::memory_order_relaxed);
+    }
   }
 
   // Release n permits (called by writer after writing frames to disk).
+  //
+  // Wake exactly n waiters, not all: with 22+ workers saturated against the
+  // throttle, notify_all on every single-frame release caused a thundering
+  // herd (each aio write fan-out-wakes every worker, they contend on m_,
+  // one wins, 21 go back to sleep).  At 1280 frames × 22 waiters that's
+  // ~28k wasteful context switches and serializes workers on throttle.m_.
+  // notify_one per permit released matches the actual capacity change and
+  // keeps the pipeline unblocked without the convoy.
   void release(int n = 1) {
     if (n <= 0) return;
     {
       std::lock_guard<std::mutex> lk(m_);
       permits_ += n;
     }
-    cv_.notify_all();
+    for (int i = 0; i < n; ++i) cv_.notify_one();
   }
 
   // Signal shutdown -- wake all blocked workers so they can exit.
@@ -2179,13 +2357,51 @@ public:
     return max_ - permits_;
   }
 
+  int max_permits() const { return max_; }
+
+  struct Stats {
+    int max;
+    int peak_in_flight;
+    uint64_t block_count;
+    uint64_t block_nanos;
+  };
+  Stats stats() const {
+    return Stats{
+      max_,
+      peak_in_flight_.load(std::memory_order_relaxed),
+      block_count_.load(std::memory_order_relaxed),
+      block_nanos_.load(std::memory_order_relaxed),
+    };
+  }
+
 private:
   int permits_;
   int max_;
   bool done_ = false;
   std::mutex m_;
   std::condition_variable cv_;
+  std::atomic<int>      peak_in_flight_{0};
+  std::atomic<uint64_t> block_count_{0};
+  std::atomic<uint64_t> block_nanos_{0};
 };
+
+// End-of-run throttle stats; one line at V_DEBUG.  Shows how often producers
+// actually waited (saturation indicator) and peak in-flight frames vs budget.
+static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
+                               const char * phase)
+{
+  if (opt.verbosity < V_DEBUG) return;
+  auto s = t.stats();
+  double saturation = s.max > 0 ? 100.0 * double(s.peak_in_flight) / double(s.max) : 0.0;
+  double ms = double(s.block_nanos) / 1e6;
+  std::ostringstream os;
+  os << "throttle stats [" << phase << "]: "
+     << "peak=" << s.peak_in_flight << "/" << s.max
+     << " (" << std::fixed << std::setprecision(1) << saturation << "%), "
+     << "block_count=" << s.block_count
+     << ", block_time=" << std::fixed << std::setprecision(2) << ms << "ms";
+  vlog(V_DEBUG, opt, os.str() + "\n");
+}
 
 /*======================================================================
  Async write pool  double-buffered I/O to overlap compute with disk writes
@@ -2665,6 +2881,17 @@ public:
     update_queue_floor(n, gpu_batch_size_.load(std::memory_order_relaxed));
   }
 
+  // GPU workers call this when a stream is shutting down (trivial-skip exit,
+  // normal completion, or failure).  Decrements active_gpu_streams_ and
+  // recalculates the queue floor so CPU workers aren't blocked by a floor
+  // that reserves frames for GPUs that no longer exist.
+  void unregister_gpu_stream() {
+    int n = active_gpu_streams_.fetch_sub(1, std::memory_order_relaxed) - 1;
+    if (n < 0) n = 0;
+    update_queue_floor(n, gpu_batch_size_.load(std::memory_order_relaxed));
+    if (queue_) queue_->notify_cpu_waiters();
+  }
+
   // GPU workers call this when the shared batch size changes
   void set_gpu_batch_size(size_t bs) {
     gpu_batch_size_.store(bs, std::memory_order_relaxed);
@@ -2977,14 +3204,15 @@ static void cpu_worker(
       // release the permit and retry.  Workers only hold permits while
       // actively processing — never while sleeping on the CV.
       auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
+        // Once producer is done, CPU must drain regardless of GPU state
+        if (qs.done) return true;
         if (!sched->should_cpu_take()) return false;
         // Reserve enough tasks for GPUs to fill their next batch cycle.
         // Without this, 96 CPUs drain the queue during GPU processing,
         // and GPUs find it empty when they come back for more.
         size_t floor = sched->cpu_queue_floor();
-        if (floor > 0 && qs.depth <= floor && !qs.done) return false;
-        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
-            && !qs.done) return false;
+        if (floor > 0 && qs.depth <= floor) return false;
+        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min) return false;
         return true;
       };
       bool drained = false;
@@ -3046,7 +3274,7 @@ static void cpu_worker(
 
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32];
-      human_bytes(double(t.data.size()), in_s, sizeof(in_s));
+      human_bytes(double(t.len()), in_s, sizeof(in_s));
       std::ostringstream os;
       os << "[CPU/T" << worker_id << "] take seq=" << t.seq << " in=" << in_s;
       vlog(V_DEBUG, *opt, os.str() + "\n");
@@ -3055,12 +3283,12 @@ static void cpu_worker(
     {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
-    compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, opt->ultra, out_frame);
+    compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, out_frame);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
     const size_t csz = out_frame.size();
-    const size_t in_size = t.data.size();  // save before releasing
-    { std::vector<char>().swap(t.data); }  // release input immediately
+    const size_t in_size = t.len();
+    t.release_input();
     if (g_perf) {
       g_perf->cpu_compute_ns.fetch_add(uint64_t(ms * 1e6));
       g_perf->cpu_compute_count.fetch_add(1);
@@ -3165,7 +3393,7 @@ static void cpu_worker_rescue(
     if (!got_task) break;
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
-    compress_one_cpu_frame(t.data.data(), t.data.size(), opt->level, opt->ultra, out_frame);
+    compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, out_frame);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast<
         std::chrono::duration<double, std::milli>>(t1 - t0).count();
@@ -3173,9 +3401,9 @@ static void cpu_worker_rescue(
 
     if (opt->verbosity >= V_TRACE) {
       char in_s[32], out_s[32];
-      human_bytes(double(t.data.size()), in_s, sizeof(in_s));
+      human_bytes(double(t.len()), in_s, sizeof(in_s));
       human_bytes(double(csz), out_s, sizeof(out_s));
-      double thr_gib = (ms > 0.0) ? (double)t.data.size() / (ms / 1000.0) / 1e9 : 0.0;
+      double thr_gib = (ms > 0.0) ? (double)t.len() / (ms / 1000.0) / 1e9 : 0.0;
       std::ostringstream os;
       os << "[RESCUE/T" << worker_id << "] seq=" << t.seq
          << " in=" << in_s << " out=" << out_s
@@ -3194,7 +3422,7 @@ static void cpu_worker_rescue(
         cpuagg->per_thread.resize((size_t)worker_id + 1);
       auto & st = cpuagg->per_thread[(size_t)worker_id];
       st.tasks    += 1;
-      st.in_bytes += t.data.size();
+      st.in_bytes += t.len();
       st.out_bytes += csz;
       st.comp_ms  += ms;
     }
@@ -3243,12 +3471,14 @@ static void cpu_decomp_worker(
         // Always allow trivially-compressed frames regardless of scheduler
         if (qs.front_ratio >= 0.0 && qs.front_ratio < 0.02) { got_trivial = true; return true; }
         got_trivial = false;
+        // Once producer is done, CPU must drain regardless of GPU state —
+        // GPU may be stuck in bp->acquire, a CUDA op, or already exited.
+        if (qs.done) return true;
         // Normal scheduling: respect GPU priority and queue depth threshold
         if (!sched->should_cpu_take()) return false;
         size_t floor = sched->cpu_queue_floor();
-        if (floor > 0 && qs.depth <= floor && !qs.done) return false;
-        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
-            && !qs.done) return false;
+        if (floor > 0 && qs.depth <= floor) return false;
+        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min) return false;
         return true;
       };
       bool drained = false;
@@ -3265,7 +3495,7 @@ static void cpu_decomp_worker(
         sched->mark_cpu_take(1);
         if (got_trivial && opt->verbosity >= V_DEBUG) {
           double ratio = (t.decomp_size > 0)
-                         ? double(t.data.size()) / double(t.decomp_size) : 0.0;
+                         ? double(t.len()) / double(t.decomp_size) : 0.0;
           std::ostringstream os;
           os << "[CPU/T" << worker_id << "] trivial frame (ratio="
              << std::fixed << std::setprecision(3) << (ratio * 100.0) << "%)";
@@ -3299,16 +3529,19 @@ static void cpu_decomp_worker(
     // Permit already acquired above (before pop).
 
     const auto t0_w = std::chrono::steady_clock::now();
+    const size_t comp_size = t.len();
+    size_t actual;
 
-    std::vector<char> out_buf(t.decomp_size);
-    const size_t comp_size = t.data.size();
-    size_t actual = ZSTD_decompressDCtx(tl_dctx, out_buf.data(), out_buf.size(),
-                                        t.data.data(), t.data.size());
-    if (ZSTD_isError(actual))
-      die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
-    out_buf.resize(actual);
-
-    { std::vector<char>().swap(t.data); }
+    {
+      std::vector<char> out_buf(t.decomp_size);
+      actual = ZSTD_decompressDCtx(tl_dctx, out_buf.data(), out_buf.size(),
+                                   t.ptr(), t.len());
+      if (ZSTD_isError(actual))
+        die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
+      out_buf.resize(actual);
+      t.release_input();
+      results->push_to_slot(-1, t.seq, std::move(out_buf));
+    }
 
     const auto t1_w = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast<
@@ -3340,7 +3573,7 @@ static void cpu_decomp_worker(
 
     if (m) m->read_bytes.fetch_add(comp_size);
 
-    results->push_to_slot(-1, t.seq, std::move(out_buf));
+    if (m) m->tasks_done.fetch_add(1);
 
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(comp_size);
@@ -3551,6 +3784,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 
   int threads = resolve_cpu_threads(opt.cpu_threads);
 
+
   CpuAgg cpuagg{};
   cpuagg.threads = threads;
   cpuagg.per_thread.resize((size_t)threads);
@@ -3558,7 +3792,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   TaskQueue queue;
   ResultStore results;
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, opt));
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, 0, opt));
   // Disable throttle in test mode: no disk I/O means permits are never released.
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
@@ -3661,6 +3895,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   }
   results.cv.notify_all();
   wthr.join();
+  log_throttle_stats(throttle, opt, "decompress-cpu");
 
   if (g_perf) {
     g_perf->print_summary("CPU-ONLY DECOMPRESS");
@@ -3844,7 +4079,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   TaskQueue queue;
   ResultStore results;
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, opt));
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, 0, opt));
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
@@ -3856,24 +4091,50 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     &cpuagg, &throttle);
   if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
 
-  // Producer loop: read input in chunks and enqueue for compression
-  try_boost_io_priority(true);  // CPU-only: always has worker pool
-  std::vector<char> host_in(host_chunk);
+  // Producer loop: read input in chunks and enqueue for compression.
+  // For regular files, mmap the input for zero-copy: workers read directly
+  // from the mapped pages, eliminating the fread + memcpy bottleneck that
+  // serialises the single-threaded producer.  Pipes/stdin fall back to fread.
+  try_boost_io_priority(true);
   std::atomic<size_t> seq{0};
-  while (true) {
-    uint64_t rd_t0 = g_perf ? now_ns() : 0;
-    size_t n = std::fread(host_in.data(), 1, host_chunk, in);
-    if (g_perf && n > 0) {
-      g_perf->read_ns.fetch_add(now_ns() - rd_t0);
-      g_perf->read_bytes_total.fetch_add(n);
+#ifndef _WIN32
+  MmapRegion mmap_region;
+  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)
+      && mmap_region.open(opt.input.c_str())) {
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "using mmap zero-copy reader\n");
+    const char * base = mmap_region.data();
+    const size_t file_size = mmap_region.size();
+    size_t off = 0;
+    while (off < file_size) {
+      size_t n = std::min(host_chunk, file_size - off);
+      if (m) m->read_bytes.fetch_add(n);
+      Task t;
+      t.seq = seq.fetch_add(1, std::memory_order_relaxed);
+      t.view_ptr = base + off;
+      t.view_len = n;
+      queue.push(std::move(t));
+      off += n;
     }
-    if (n == 0) break;
-    if (m) m->read_bytes.fetch_add(n);
+  } else
+#endif
+  {
+    std::vector<char> host_in(host_chunk);
+    while (true) {
+      uint64_t rd_t0 = g_perf ? now_ns() : 0;
+      size_t n = std::fread(host_in.data(), 1, host_chunk, in);
+      if (g_perf && n > 0) {
+        g_perf->read_ns.fetch_add(now_ns() - rd_t0);
+        g_perf->read_bytes_total.fetch_add(n);
+      }
+      if (n == 0) break;
+      if (m) m->read_bytes.fetch_add(n);
 
-    Task t;
-    t.seq = seq.fetch_add(1, std::memory_order_relaxed);
-    t.data.assign(host_in.data(), host_in.data() + n);
-    queue.push(std::move(t));
+      Task t;
+      t.seq = seq.fetch_add(1, std::memory_order_relaxed);
+      t.data.assign(host_in.data(), host_in.data() + n);
+      queue.push(std::move(t));
+    }
   }
 
   // Signal workers that no more input is coming
@@ -3904,6 +4165,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   wthr.join();
   progress_done = true;
   progress_thr.join();
+  log_throttle_stats(throttle, opt, "compress-cpu");
 
   if (g_perf) {
     g_perf->print_summary("CPU-ONLY COMPRESS");
@@ -4667,7 +4929,7 @@ static void gpu_worker(
           size_t seq_hi = C.batch.back().seq;
           uint64_t tin = 0;
           for (size_t i = 0; i < C.filled; ++i)
-            tin += C.batch[i].data.size();
+            tin += C.batch[i].len();
           char tin_s[32];
           human_bytes(double(tin), tin_s, sizeof(tin_s));
           std::ostringstream os;
@@ -4685,19 +4947,17 @@ static void gpu_worker(
           void * d_dst = static_cast<char*>(C.d_in_base) + i * C.gpu_chunk;
 
           if (C.h2d_pinned_base) {
-            // Copy to pinned staging buffer, then async H2D (faster for large transfers)
             void * h_src = static_cast<char*>(C.h2d_pinned_base) + i * C.gpu_chunk;
-            std::memcpy(h_src, t.data.data(), t.data.size());
-            checkCuda(cudaMemcpyAsync(d_dst, h_src, t.data.size(),
+            std::memcpy(h_src, t.ptr(), t.len());
+            checkCuda(cudaMemcpyAsync(d_dst, h_src, t.len(),
                                       cudaMemcpyHostToDevice, C.stream),
                       "cudaMemcpyAsync(H2D pinned)");
           } else {
-            // Direct pageable H2D (simpler but slower)
-            checkCuda(cudaMemcpyAsync(d_dst, t.data.data(), t.data.size(),
+            checkCuda(cudaMemcpyAsync(d_dst, t.ptr(), t.len(),
                                       cudaMemcpyHostToDevice, C.stream),
                       "cudaMemcpyAsync(H2D)");
           }
-          C.h_in_sizes[i] = t.data.size();
+          C.h_in_sizes[i] = t.len();
         }
         checkCuda(cudaMemcpyAsync(C.d_in_sizes, C.h_in_sizes.data(), sizeof(size_t)*C.filled, cudaMemcpyHostToDevice, C.stream), "cudaMemcpyAsync(d_in_sizes)");
         cudaEventRecord(C.ev_h2d_end, C.stream);
@@ -4709,7 +4969,7 @@ static void gpu_worker(
         // In gpu-only mode, no rescue  safe to release immediately.
         if (!rescue) {
           for (size_t i = 0; i < C.filled; ++i)
-            { std::vector<char>().swap(C.batch[i].data); }
+            C.batch[i].release_input();
         }
 
         checkNvcomp(nvcompBatchedZstdCompressAsync(
@@ -5011,6 +5271,12 @@ static void gpu_worker(
       C.stream = nullptr;
     }
 
+    // Deregister streams so queue floor drops and CPU workers aren't blocked
+    if (sched) {
+      for (size_t s = 0; s < ctxs.size(); ++s)
+        sched->unregister_gpu_stream();
+    }
+
     // Wake all CPU workers: with notify_one in gpu_got_data(), CPUs that
     // were sleeping when this GPU exited might never get another wakeup.
     // This ensures all stragglers see the drain condition and exit.
@@ -5041,6 +5307,12 @@ static void gpu_worker(
         }
       }
     } catch (...) {}
+
+    // Deregister streams so queue floor drops and CPU workers aren't blocked
+    if (sched && ctxs_ptr) {
+      for (size_t s = 0; s < ctxs_ptr->size(); ++s)
+        sched->unregister_gpu_stream();
+    }
 
     // Wake writer in case it's waiting on results
     {
@@ -5337,11 +5609,13 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Budget scales with pipeline parallelism (CPU threads + GPU streams *
   // batch cap), capped by half of available RAM.  See
   // compute_throttle_budget header comment for rationale.
-  const int comp_parallelism = cpu_threads_est
-      + gpu_count_early * (int)std::max<size_t>(1, opt.gpu_streams)
-                        * (int)std::max<size_t>(1, opt.gpu_batch_cap);
+  const int comp_gpu_batch_floor = gpu_count_early
+      * (int)std::max<size_t>(1, opt.gpu_streams)
+      * (int)std::max<size_t>(1, opt.gpu_batch_cap);
+  const int comp_parallelism = cpu_threads_est + comp_gpu_batch_floor;
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism, opt));
+      std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism,
+      comp_gpu_batch_floor, opt));
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
@@ -5451,42 +5725,61 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   }
 
   // ---- Producer: read input, split into GPU-sized subchunks, enqueue ----
-  try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
-  // pin_thread_to_core(0);              // disabled: hurts on loaded machines
-  std::vector<char> host_in(host_chunk);
-  while (true) {
-    // Early abort: in --gpu-only mode, if every GPU failed to initialize
-    // (insufficient VRAM), there's no consumer for any further tasks.
-    // Stop reading rather than buffering the whole file into the queue.
-    if (abort_on_failure.load(std::memory_order_acquire)
-        && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count) {
-      break;
-    }
-
-    uint64_t rd_t0 = g_perf ? now_ns() : 0;
-    size_t n_host = std::fread(host_in.data(), 1, host_chunk, in);
-    if (g_perf && n_host > 0) {
-      g_perf->read_ns.fetch_add(now_ns() - rd_t0);
-      g_perf->read_bytes_total.fetch_add(n_host);
-    }
-    if (n_host == 0) break;
-    if (m) m->read_bytes.fetch_add(n_host);
-
-    // Split each host chunk into subchunks that fit in GPU memory
-    const size_t gpu_chunk = std::min(host_chunk, GPU_SUBCHUNK_MAX);
+  try_boost_io_priority(!opt.gpu_only);
+  const size_t gpu_chunk = std::min(host_chunk, GPU_SUBCHUNK_MAX);
+#ifndef _WIN32
+  MmapRegion mmap_region;
+  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)
+      && mmap_region.open(opt.input.c_str())) {
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "using mmap zero-copy reader\n");
+    const char * base = mmap_region.data();
+    const size_t file_size = mmap_region.size();
     size_t off = 0;
-    while (off < n_host) {
-      size_t sub_n = std::min(gpu_chunk, n_host - off);
-      Task t;
-      t.seq = seq_counter.fetch_add(1, std::memory_order_relaxed);
-      t.data.assign(host_in.data() + off, host_in.data() + off + sub_n);
-      queue.push(std::move(t));
-      off += sub_n;
+    while (off < file_size) {
+      if (abort_on_failure.load(std::memory_order_acquire)
+          && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
+        break;
+      size_t n_host = std::min(host_chunk, file_size - off);
+      if (m) m->read_bytes.fetch_add(n_host);
+      size_t sub_off = 0;
+      while (sub_off < n_host) {
+        size_t sub_n = std::min(gpu_chunk, n_host - sub_off);
+        Task t;
+        t.seq = seq_counter.fetch_add(1, std::memory_order_relaxed);
+        t.view_ptr = base + off + sub_off;
+        t.view_len = sub_n;
+        queue.push(std::move(t));
+        sub_off += sub_n;
+      }
+      off += n_host;
     }
-
-    // Note: we do NOT abort the read loop on single GPU failures.
-    // Surviving GPUs continue processing.  The post-join check handles
-    // the "all GPUs failed" case after workers are joined.
+  } else
+#endif
+  {
+    std::vector<char> host_in(host_chunk);
+    while (true) {
+      if (abort_on_failure.load(std::memory_order_acquire)
+          && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
+        break;
+      uint64_t rd_t0 = g_perf ? now_ns() : 0;
+      size_t n_host = std::fread(host_in.data(), 1, host_chunk, in);
+      if (g_perf && n_host > 0) {
+        g_perf->read_ns.fetch_add(now_ns() - rd_t0);
+        g_perf->read_bytes_total.fetch_add(n_host);
+      }
+      if (n_host == 0) break;
+      if (m) m->read_bytes.fetch_add(n_host);
+      size_t off = 0;
+      while (off < n_host) {
+        size_t sub_n = std::min(gpu_chunk, n_host - off);
+        Task t;
+        t.seq = seq_counter.fetch_add(1, std::memory_order_relaxed);
+        t.data.assign(host_in.data() + off, host_in.data() + off + sub_n);
+        queue.push(std::move(t));
+        off += sub_n;
+      }
+    }
   }
 
   // Signal workers that all input has been read
@@ -5539,6 +5832,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Drain rescue queue and join CPU pool
   rescue.set_done();
+  queue.notify_cpu_waiters();
   for (auto & th : rescue_pool) th.join();
   if (!cpu_pool.empty())
     for (auto & th : cpu_pool) th.join();
@@ -5560,6 +5854,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   writer_thr.join();
   progress_done = true;
   progress_thr.join();
+  log_throttle_stats(throttle, opt,
+                     opt.hybrid ? "compress-hybrid" :
+                     opt.gpu_only ? "compress-gpu" : "compress-nvcomp");
 
   if (g_perf) {
     g_perf->print_summary(opt.hybrid ? "HYBRID COMPRESS" :
@@ -5842,6 +6139,13 @@ static void gpu_decomp_worker(
     // with idle GPUs' completion time.
     double util_scale = 1.0;
 
+    // Consecutive trivial-batch skips across all streams.  If we see too many
+    // in a row without doing real GPU work, the remaining workload is
+    // CPU-preferred (all trivially-compressed frames) and this GPU should
+    // exit so CPU can drain the queue without GPU interference.
+    int trivial_skip_streak = 0;
+    const int trivial_skip_exit_threshold = (int)ctxs.size() * 4;
+
     while (true) {
       bool submitted_any = false;
 
@@ -6031,6 +6335,35 @@ static void gpu_decomp_worker(
         if (bp && !C.batch.empty() && (int)C.batch.size() < (int)pop_n)
           bp->release((int)pop_n - (int)C.batch.size());
         if (C.batch.empty()) continue;
+
+        // In hybrid mode, skip batches where every frame is trivially
+        // compressed (ratio < 2%).  CPU decompresses these faster than GPU
+        // because it avoids PCIe D2H overhead.  More importantly, GPU
+        // batches of trivial frames cause head-of-line blocking: the GPU
+        // holds early-sequence frames for ~200ms while CPU fills all
+        // throttle permits waiting for the writer, freezing the pipeline.
+        if (sched) {
+          bool all_trivial = true;
+          for (const auto & t : C.batch) {
+            double ratio = (t.decomp_size > 0)
+                ? double(t.len()) / double(t.decomp_size) : 1.0;
+            if (ratio >= 0.02) { all_trivial = false; break; }
+          }
+          if (all_trivial) {
+            if (opt.verbosity >= V_DEBUG)
+              vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id)
+                   + "/S" + std::to_string(C.stream_index)
+                   + "] skipping trivial batch (" + std::to_string(C.batch.size())
+                   + " frames, ratio<2%) -> re-enqueue for CPU\n");
+            int held = (int)C.batch.size();
+            queue->re_enqueue(C.batch);
+            if (bp) bp->release(held);
+            ++trivial_skip_streak;
+            continue;
+          }
+          trivial_skip_streak = 0;  // reset on any non-trivial batch
+        }
+
         if (g_perf) {
           g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
         }
@@ -6041,14 +6374,14 @@ static void gpu_decomp_worker(
         // Determine max sizes for this batch
         size_t max_comp = 0, max_decomp = 0;
         for (size_t i = 0; i < C.filled; ++i) {
-          max_comp   = std::max(max_comp,   C.batch[i].data.size());
+          max_comp   = std::max(max_comp,   C.batch[i].len());
           max_decomp = std::max(max_decomp, C.batch[i].decomp_size);
         }
 
         if (opt.verbosity >= V_DEBUG) {
           char in_s[32];
           uint64_t tin = 0;
-          for (size_t i = 0; i < C.filled; ++i) tin += C.batch[i].data.size();
+          for (size_t i = 0; i < C.filled; ++i) tin += C.batch[i].len();
           human_bytes(double(tin), in_s, sizeof(in_s));
           size_t seq_lo = C.batch.front().seq;
           size_t seq_hi = C.batch.back().seq;
@@ -6077,12 +6410,12 @@ static void gpu_decomp_worker(
         cudaEventRecord(C.ev_begin, C.stream);
         for (size_t i = 0; i < C.filled; ++i) {
           void * d_dst = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
-          checkCuda(cudaMemcpyAsync(d_dst, C.batch[i].data.data(),
-                                    C.batch[i].data.size(),
+          checkCuda(cudaMemcpyAsync(d_dst, C.batch[i].ptr(),
+                                    C.batch[i].len(),
                                     cudaMemcpyHostToDevice, C.stream),
                     "cudaMemcpyAsync(H2D decomp)");
-          h2d_bytes_batch += C.batch[i].data.size();
-          C.h_comp_sizes[i]   = C.batch[i].data.size();
+          h2d_bytes_batch += C.batch[i].len();
+          C.h_comp_sizes[i]   = C.batch[i].len();
           C.h_decomp_sizes[i] = C.batch[i].decomp_size;
         }
 
@@ -6144,8 +6477,8 @@ static void gpu_decomp_worker(
           // Re-upload pointer/size arrays since ensure_buffers may have reallocated
           for (size_t i = 0; i < C.filled; ++i) {
             void * d_dst = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
-            checkCuda(cudaMemcpyAsync(d_dst, C.batch[i].data.data(),
-                                      C.batch[i].data.size(),
+            checkCuda(cudaMemcpyAsync(d_dst, C.batch[i].ptr(),
+                                      C.batch[i].len(),
                                       cudaMemcpyHostToDevice, C.stream),
                       "cudaMemcpyAsync(H2D decomp re-upload)");
           }
@@ -6166,9 +6499,9 @@ static void gpu_decomp_worker(
         std::vector<size_t> batch_comp_sizes(C.filled);
         std::vector<size_t> batch_seqs(C.filled);
         for (size_t i = 0; i < C.filled; ++i) {
-          batch_comp_sizes[i] = C.batch[i].data.size();
+          batch_comp_sizes[i] = C.batch[i].len();
           batch_seqs[i] = C.batch[i].seq;
-          { std::vector<char>().swap(C.batch[i].data); }
+          C.batch[i].release_input();
         }
 
         checkNvcomp(nvcompBatchedZstdDecompressAsync(
@@ -6308,6 +6641,17 @@ static void gpu_decomp_worker(
 #endif
       }
 
+      // Exit if remaining workload is all trivially-compressed frames.
+      // GPU is a net negative on that data (PCIe D2H overhead dominates,
+      // and HOL-blocks the writer by holding early-sequence frames).
+      // Let CPU workers drain the queue alone.
+      if (trivial_skip_streak >= trivial_skip_exit_threshold) {
+        if (opt.verbosity >= V_VERBOSE)
+          vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
+               + "] all remaining work is trivially compressed; exiting to let CPU drain\n");
+        break;
+      }
+
       // Check termination
       if (producer_done_seen) {
         bool all_idle = true;
@@ -6325,6 +6669,12 @@ static void gpu_decomp_worker(
       if (C.ev_begin) cudaEventDestroy(C.ev_begin);
       if (C.ev_end)   cudaEventDestroy(C.ev_end);
       if (C.stream)   cudaStreamDestroy(C.stream);
+    }
+
+    // Deregister streams so queue floor drops and CPU workers aren't blocked
+    if (sched) {
+      for (size_t s = 0; s < ctxs.size(); ++s)
+        sched->unregister_gpu_stream();
     }
 
     // Wake all CPU workers (see gpu_worker for rationale)
@@ -6348,6 +6698,12 @@ static void gpu_decomp_worker(
         if (C.stream)   { cudaStreamDestroy(C.stream);   C.stream = nullptr; }
       }
     } catch (...) {}
+
+    // Deregister streams so queue floor drops and CPU workers aren't blocked
+    if (sched) {
+      for (size_t s = 0; s < ctxs.size(); ++s)
+        sched->unregister_gpu_stream();
+    }
 
     {
       std::lock_guard<std::mutex> lk(results->m);
@@ -6409,11 +6765,13 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 
   // Frame throttle: scales with pipeline parallelism (see compress_nvcomp).
   const int decomp_cpu_threads_est = opt.gpu_only ? 0 : resolve_cpu_threads(opt.cpu_threads);
-  const int decomp_parallelism = decomp_cpu_threads_est
-      + device_count * (int)std::max<size_t>(1, opt.gpu_streams)
-                     * (int)std::max<size_t>(1, opt.gpu_batch_cap);
+  const int decomp_gpu_batch_floor = device_count
+      * (int)std::max<size_t>(1, opt.gpu_streams)
+      * (int)std::max<size_t>(1, opt.gpu_batch_cap);
+  const int decomp_parallelism = decomp_cpu_threads_est + decomp_gpu_batch_floor;
   FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism, opt));
+      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism,
+      decomp_gpu_batch_floor, opt));
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // ---- Writer thread (outputs decompressed data in order) ----
@@ -6577,6 +6935,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   rescue.set_done();
+  // After all GPUs have exited, ensure CPU workers are unblocked.
+  // GPU unregister_gpu_stream already drops the floor and notifies, but
+  // re-notify here as a safety net in case any CPU worker missed it.
+  queue.notify_cpu_waiters();
+
   // Do NOT call throttle.set_done() before join: workers must respect
   // throttle while draining the queue to avoid buffering entire output in RAM.
   if (!cpu_pool.empty()) {
@@ -6612,6 +6975,9 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         vlog(V_VERBOSE, opt, "writer join: " + std::to_string(int(ms)) + " ms\n");
     }
   }
+  log_throttle_stats(throttle, opt,
+                     opt.hybrid ? "decompress-hybrid" :
+                     opt.gpu_only ? "decompress-gpu" : "decompress-nvcomp");
 
   if (g_perf) {
     g_perf->print_summary(opt.hybrid ? "HYBRID DECOMPRESS" :
@@ -6698,32 +7064,31 @@ int main(int argc, char ** argv)
       die_io("output exists (use -f to overwrite): " + opt.output);
     }
     if (exists && opt.force) {
-      // Atomic overwrite: write to .tmp, rename on success.
-      // Skip for device/special files (e.g., /dev/null)  can't create .tmp there.
       bool is_regular = fs::is_regular_file(opt.output);
       if (is_regular) {
         out = open_output_atomic(opt.output, tmp);
         use_atomic = true;
-        register_tmp_file(tmp);  // clean up .tmp on failure (original preserved)
+        register_tmp_file(tmp);
       } else {
         out = std::fopen(opt.output.c_str(), "wb");
         if (!out) die_io("cannot open output: " + opt.output);
       }
     } else {
-      // Direct write: write to final name, delete on failure
       out = std::fopen(opt.output.c_str(), "wb");
       if (!out) die_io("cannot open output: " + opt.output);
-      register_tmp_file(opt.output); // arm cleanup to delete on failure
+      register_tmp_file(opt.output);
     }
   }
 
-  // Try O_DIRECT for regular file output (bypasses page cache for ~2-3x write speed).
-  // Falls back gracefully: pipes, stdout, device files, and filesystems without
-  // O_DIRECT support all use standard fwrite.
+  // O_DIRECT output: only when explicitly requested via --direct.
+  // Default is buffered I/O (fwrite) which uses the OS page cache for
+  // consistent throughput — O_DIRECT bypasses the cache and exposes the
+  // application to NVMe GC stalls, journal commits, and writeback
+  // contention from prior runs, causing 2-5× wall-time variance on
+  // sequential large-file workloads.
 #ifndef _WIN32
   std::unique_ptr<DirectWriter> direct_writer;
-  if (!to_stdout && out != stdout) {
-    // Explicit output file: use O_DIRECT if it's a regular file
+  if (opt.direct_io && !to_stdout && out != stdout) {
     std::string write_path = use_atomic ? tmp : opt.output;
     struct stat st;
     bool is_regular = (stat(write_path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
@@ -6732,40 +7097,31 @@ int main(int argc, char ** argv)
       if (dw->open(write_path)) {
         if (out) { std::fclose(out); out = nullptr; }
         direct_writer = std::move(dw);
-        vlog(V_VERBOSE, opt, "using O_DIRECT for output (bypass page cache)\n");
+        vlog(V_VERBOSE, opt, "using O_DIRECT for output (--direct)\n");
       }
     }
-  } else if (to_stdout && out == stdout) {
-    // stdout path: check if stdout is redirected to a regular file.
-    // If so, reopen with O_DIRECT for ~2× write speed.
-    // Fall back silently on any issue (append mode, unsupported fs, etc.)
+  } else if (opt.direct_io && to_stdout && out == stdout) {
     do {
       int fd = fileno(stdout);
       if (fd < 0) break;
       struct stat st;
       if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) break;
-      // Skip if O_APPEND is set (O_DIRECT + O_APPEND is undefined on Linux)
       int flags = fcntl(fd, F_GETFL);
       if (flags < 0 || (flags & O_APPEND)) break;
-      // Get the file path from /proc/self/fd/N
       char link_path[64];
       char real_path[4096];
       std::snprintf(link_path, sizeof(link_path), "/proc/self/fd/%d", fd);
       ssize_t len = readlink(link_path, real_path, sizeof(real_path) - 1);
       if (len <= 0) break;
       real_path[len] = '\0';
-      // Sanity: skip /dev/null, /dev/*, deleted files
       if (std::strncmp(real_path, "/dev/", 5) == 0) break;
       if (std::strstr(real_path, "(deleted)")) break;
-      // Try opening with O_DIRECT
       auto dw = std::make_unique<DirectWriter>();
       if (dw->open(std::string(real_path))) {
-        // Success: close stdout's FILE*, the DirectWriter owns the fd now
         std::fflush(stdout);
-        // Don't fclose(stdout)  it's special. Just stop using it.
         out = nullptr;
         direct_writer = std::move(dw);
-        vlog(V_VERBOSE, opt, "stdout is a regular file  using O_DIRECT (bypass page cache)\n");
+        vlog(V_VERBOSE, opt, "stdout redirect  using O_DIRECT (--direct)\n");
       }
       // If open failed, fall through to normal fwrite via stdout
     } while (false);
@@ -7114,6 +7470,8 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--sparse") opt.sparse_mode = 1;
     else if (a == "--no-sparse") opt.sparse_mode = 0;
     else if (a == "--sync-output") opt.sync_output = true;
+    else if (a == "--direct") opt.direct_io = true;
+    else if (a == "--no-direct") opt.direct_io = false;
     else if (a == "-c") opt.to_stdout = true;
     else if (a == "-v") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
@@ -7192,6 +7550,14 @@ static Options parse_args(int argc, char ** argv)
                               opt.hybrid_floor_factor)) {
       if (opt.hybrid_floor_factor < 0.0 || opt.hybrid_floor_factor > 1.0)
         die_usage("--hybrid-floor-factor must be in [0.0, 1.0]");
+    }
+    else if (parse_int_arg("throttle-factor", i, argc, argv, opt.throttle_factor)) {
+      if (opt.throttle_factor < 1)
+        die_usage("--throttle-factor must be >= 1");
+    }
+    else if (parse_int_arg("throttle-frames", i, argc, argv, opt.throttle_frames)) {
+      if (opt.throttle_frames < 1)
+        die_usage("--throttle-frames must be >= 1");
     }
 #ifdef HAVE_NVCOMP
     else if (a == "--gpu-only") opt.gpu_only = true;
