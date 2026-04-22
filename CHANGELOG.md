@@ -1,9 +1,64 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.21  
+**Covers:** v0.9.50 → v0.12.24  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.24 — Streaming decompression for oversized frames
+
+**Symptom.** Decompressing single-frame .zst files (e.g., from `zstd -T0` or `gzstd --sliding-window`) showed the `out:` progress bar stuck at 0% for the entire decompression, then jumping to 99.9% at the end. Memory usage spiked to the full decompressed size (e.g., 125 GiB) because the worker allocated one giant buffer for the entire frame.
+
+**Root cause.** `cpu_decomp_worker` called `ZSTD_decompressDCtx` with a single output buffer sized to the full decompressed frame. Nothing was written to disk until the entire frame was decompressed, so the writer (and its progress tracking) had no work to do until the very end.
+
+**Fix.** For frames larger than 64 MiB (`STREAM_THRESHOLD`), the worker now uses `ZSTD_decompressStream` with 16 MiB output chunks. Each chunk is pushed to `ResultStore` with its own sequence number, and `total_tasks` is adjusted upward to account for the sub-chunks. This lets the writer start writing (and updating `out:` progress) as soon as the first 16 MiB is decompressed, rather than waiting for the entire frame.
+
+**Key details:**
+- `n_chunks_est = ceil(decomp_size / 16 MiB)` — pre-calculated from the frame header
+- `total_tasks` adjusted atomically before streaming begins; corrected after if actual chunk count differs
+- Only triggers for frames > 64 MiB; normal multi-frame files (16 MiB frames) take the existing fast path
+- FrameThrottle naturally releases permits per sub-chunk, providing backpressure
+- Memory usage drops from full-frame to ~16 MiB working set per worker
+
+---
+
+## v0.12.23 — Progressive writeback fix + --sliding-window compression
+
+**Symptom (decompression overwrite stall).** Decompressing low_compress.bin.zst (19.53 GiB output) with `-f` (overwrite) showed a 46-second stall after all decompression work completed, reported as "atomic rename: 46155 ms" in verbose output.
+
+**Root cause.** Buffered `fwrite` of 19.53 GiB accumulated dirty pages in the page cache faster than the kernel's background writeback could drain them. When `rename()` was called on the `.gzstd.tmp` file, ext4's `data=ordered` journaling required flushing ALL dirty pages to disk before committing the metadata transaction — a synchronous 46s wait. Compression didn't suffer because: (1) it's CPU-intensive, giving writeback time to drain; (2) compressed output is smaller.
+
+**Fix.** Added `sync_file_range(fd, offset, len, SYNC_FILE_RANGE_WRITE)` in `AsyncWritePool::worker_fn` after each batch of writes. This non-blocking call tells the kernel to start writing dirty pages to disk immediately rather than letting them accumulate. By the time `rename()` executes, most pages are already on disk.
+
+**Result on Lovelace** (low_compress.bin.zst → existing file with `-f`):
+- Atomic rename: 46,155 ms → ~700 ms (**66× faster**)
+- No regression to compression or fresh-file decompression paths
+
+---
+
+## v0.12.22 — `--sliding-window` single-frame compression mode
+
+**Motivation.** For highly repetitive data (e.g., random word lists repeated across 125 GiB), gzstd's multi-frame architecture (8000 independent 16 MiB frames) achieved 0.29% ratio while `zstd -T0` achieved 0.01% (31× better). The difference: zstd produces a single frame with a 2 MiB sliding window that maintains context across the entire file, while gzstd's frames each start with a cold window.
+
+**Feature.** New `--sliding-window` flag delegates compression to zstd's built-in multi-threaded mode (`ZSTD_c_nbWorkers`), producing a single standard zstd frame. Trade-offs:
+- Ratio matches `zstd -T0` exactly (shared sliding window context)
+- Output is a standard .zst file — `zstd -d` can decompress it
+- Decompression is single-threaded (one frame = one unit of work for any decompressor)
+- Implies `--cpu-only` (GPU/nvCOMP has no sliding window API)
+
+**Validation:**
+- `--sliding-window --gpu-only` and `--sliding-window --hybrid` rejected with clear error
+- `--sliding-window -d` rejected (compression-only)
+- `--sliding-window` without `--cpu-only` auto-enables it with a warning
+- Round-trip verified; `zstd --list` confirms single frame; `zstd -d` interop confirmed
+
+**GPU fallback for oversized frames.** When decompressing a single-frame file (from `zstd -T0` or `--sliding-window`), the frame's decompressed size can be hundreds of GiB — far exceeding nvCOMP's 16 MiB per-slot VRAM allocation. gzstd now detects oversized frames during the pre-scan and automatically falls back to CPU-only decompression with a clear warning. `--gpu-only` is gracefully overridden rather than crashing.
+
+**Progress bar fix (mmap compression).** The mmap zero-copy reader enqueued all tasks instantly (pointer arithmetic, no I/O), causing the `in:` progress to jump to 100% immediately. Fixed by deferring `read_bytes` updates to when workers actually pick up each task, so the progress bar reflects real processing throughput.
+
+**Test coverage.** Full `./gzstd-test.sh` suite passes (200/200).
 
 ---
 

@@ -2196,6 +2196,81 @@ else
   skip "--throttle-frames=1 --hybrid deadlock guard" "no GPU"
 fi
 
+section "Sliding-window compression"
+
+# Basic round-trip: compress with --sliding-window, decompress normally
+"$GZSTD" -k -f --sliding-window \
+  "$TMPDIR/large.bin" -o "$TMPDIR/sw.zst" 2>/dev/null
+"$GZSTD" -d -k -f \
+  "$TMPDIR/sw.zst" -o "$TMPDIR/sw.dec" 2>/dev/null
+files_match "$TMPDIR/large.bin" "$TMPDIR/sw.dec" \
+  && pass "--sliding-window round-trip" \
+  || fail "--sliding-window round-trip"
+rm -f "$TMPDIR/sw.zst" "$TMPDIR/sw.dec"
+
+# Produces a single frame (verified via frame count in output)
+"$GZSTD" -k -f --sliding-window \
+  "$TMPDIR/large.bin" -o "$TMPDIR/sw-frames.zst" 2>/dev/null
+frame_count=$(zstd --list "$TMPDIR/sw-frames.zst" 2>/dev/null | awk '/Frames/{getline; print $1}')
+if [[ "$frame_count" == "1" ]]; then
+  pass "--sliding-window produces single frame"
+else
+  fail "--sliding-window single frame" "got $frame_count frames"
+fi
+rm -f "$TMPDIR/sw-frames.zst"
+
+# zstd can decompress our --sliding-window output
+"$GZSTD" -k -f --sliding-window \
+  "$TMPDIR/large.bin" -o "$TMPDIR/sw-interop.zst" 2>/dev/null
+zstd -d -f "$TMPDIR/sw-interop.zst" -o "$TMPDIR/sw-interop.dec" 2>/dev/null
+files_match "$TMPDIR/large.bin" "$TMPDIR/sw-interop.dec" \
+  && pass "--sliding-window interop: zstd -d reads output" \
+  || fail "--sliding-window zstd interop"
+rm -f "$TMPDIR/sw-interop.zst" "$TMPDIR/sw-interop.dec"
+
+# --sliding-window implies --cpu-only (no error without explicit --cpu-only)
+out=$("$GZSTD" -k -f --sliding-window \
+  "$TMPDIR/large.bin" -o "$TMPDIR/sw-impl.zst" 2>&1)
+rc=$?
+if [[ $rc -eq 0 ]] && grep -q "implies --cpu-only" <<< "$out"; then
+  pass "--sliding-window implies --cpu-only (warning)"
+else
+  fail "--sliding-window implies --cpu-only" "exit $rc"
+fi
+rm -f "$TMPDIR/sw-impl.zst"
+
+# --sliding-window with --gpu-only must be rejected (exit 2)
+"$GZSTD" -k -f --sliding-window --gpu-only \
+  "$TMPDIR/large.bin" -o "$TMPDIR/sw-bad.zst" 2>/dev/null
+rc=$?
+if [[ $rc -eq 2 ]]; then
+  pass "--sliding-window --gpu-only rejected (exit 2)"
+else
+  fail "--sliding-window --gpu-only rejection" "exit $rc"
+fi
+rm -f "$TMPDIR/sw-bad.zst"
+
+# --sliding-window with -d must be rejected (exit 2)
+"$GZSTD" -k -f --sliding-window -d \
+  "$TMPDIR/large.bin" 2>/dev/null
+rc=$?
+if [[ $rc -eq 2 ]]; then
+  pass "--sliding-window -d rejected (exit 2)"
+else
+  fail "--sliding-window -d rejection" "exit $rc"
+fi
+
+# --sliding-window with explicit --cpu-only (no warning)
+out=$("$GZSTD" -k -f --sliding-window --cpu-only \
+  "$TMPDIR/large.bin" -o "$TMPDIR/sw-cpu.zst" 2>&1)
+rc=$?
+if [[ $rc -eq 0 ]] && ! grep -q "implies --cpu-only" <<< "$out"; then
+  pass "--sliding-window --cpu-only (no warning)"
+else
+  fail "--sliding-window --cpu-only" "exit $rc or unexpected warning"
+fi
+rm -f "$TMPDIR/sw-cpu.zst"
+
 # ============================================================
 # Final summary
 # ============================================================

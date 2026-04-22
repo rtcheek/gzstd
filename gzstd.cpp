@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.21";
+static constexpr const char * GZSTD_VERSION = "0.12.24";
 //
 // Architecture overview:
 //
@@ -227,6 +227,7 @@ struct Options {
 #endif
   std::string stats_json;
   int sparse_mode = -1;           // -1=auto (file:on, stdout:off), 0=off, 1=on
+  bool sliding_window = false;    // --sliding-window: single-frame compression (cpu-only)
   bool sync_output = false;       // --sync-output: fsync before closing output file
   bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
   std::string input;              // current file being processed
@@ -555,6 +556,8 @@ static void print_help()
 " --chunk-size N Host I/O chunk size in MiB (default: 16)\n"
 " --stats-json <f> Write run statistics (JSON)\n"
 " --cpu-only Force CPU-only path (multithreaded, no GPU)\n"
+" --sliding-window Single-frame compression for max ratio on repetitive data\n"
+"                  (uses zstd built-in MT; implies --cpu-only; decompression is single-threaded)\n"
 " --hybrid Enable hybrid CPU+GPU scheduling (default with GPU)\n"
 " -T, --threads N  CPU worker threads (0=all cores, auto=96 max). -T N or -T# [CPU-only/hybrid]\n"
 " --cpu-batch N    Queue depth before CPUs start popping (hybrid only; keeps frames\n"
@@ -969,6 +972,7 @@ static FILE * open_output_atomic(const std::string & out, std::string & tmp_path
   register_tmp_file(tmp_path);
   FILE * f = std::fopen(tmp_path.c_str(), "wb");
   if (!f) die_io("cannot open temp output: " + tmp_path);
+  std::setvbuf(f, nullptr, _IOFBF, 1 * 1024 * 1024);
   return f;
 }
 // Flush file data to disk (POSIX only).
@@ -2417,8 +2421,10 @@ static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
 class AsyncWritePool {
 public:
   explicit AsyncWritePool(FILE * out_file, DirectWriter * dw, bool sparse = true,
-                          Meter * meter = nullptr, FrameThrottle * bp = nullptr)
-    : out_(out_file), dw_(dw), sparse_(sparse), done_(false), meter_(meter), bp_(bp)
+                          Meter * meter = nullptr, FrameThrottle * bp = nullptr,
+                          bool progressive_sync = false)
+    : out_(out_file), dw_(dw), sparse_(sparse), done_(false),
+      progressive_sync_(progressive_sync), meter_(meter), bp_(bp)
   {
     worker_ = std::thread(&AsyncWritePool::worker_fn, this);
   }
@@ -2475,13 +2481,15 @@ private:
   // for data with large zero runs (e.g., disk images, memory dumps).
   bool write_sparse(const char * data, size_t len, bool is_last_buffer = false) {
     static constexpr size_t SPARSE_BLOCK = 4096;  // check in page-sized blocks
+    static constexpr size_t PROGRESS_INTERVAL = 16 * 1024 * 1024;  // 16 MiB
 
     size_t pos = 0;
+    size_t bytes_since_progress = 0;
     while (pos < len) {
       size_t remain = len - pos;
       size_t block = std::min(remain, SPARSE_BLOCK);
 
-      // Never sparse-skip the final block of the last buffer in a batch 
+      // Never sparse-skip the final block of the last buffer in a batch
       // the file must end with a physical write or it will be truncated.
       bool at_end = is_last_buffer && (pos + block >= len);
 
@@ -2493,6 +2501,7 @@ private:
           if (std::fseek(out_, (long)block, SEEK_CUR) != 0)
             return false;
         }
+        bytes_since_progress += block;
         pos += block;
         sparse_saved_ += block;
       } else {
@@ -2513,9 +2522,18 @@ private:
           size_t w = robust_fwrite(data + pos, to_write, out_);
           if (w != to_write) return false;
         }
+        bytes_since_progress += to_write;
         pos = write_end;
       }
+
+      if (meter_ && bytes_since_progress >= PROGRESS_INTERVAL) {
+        meter_->wrote_bytes.fetch_add(bytes_since_progress, std::memory_order_relaxed);
+        bytes_since_progress = 0;
+      }
     }
+    // Flush remaining progress
+    if (meter_ && bytes_since_progress > 0)
+      meter_->wrote_bytes.fetch_add(bytes_since_progress, std::memory_order_relaxed);
     return true;
   }
 
@@ -2543,12 +2561,28 @@ private:
           g_perf->write_ns.fetch_add(now_ns() - w_t0);
           g_perf->write_bytes_total.fetch_add(buf.size());
         }
-        // Update wrote_bytes after physical write (not after submit)
-        // so the progress bar reflects actual disk I/O completion.
-        if (meter_) meter_->wrote_bytes.fetch_add(buf.size(), std::memory_order_relaxed);
+        // wrote_bytes is now updated incrementally within write_sparse()
         // Release one frame permit: writer made progress, blocked workers may unblock.
         if (bp_) bp_->release(1);
       }
+
+#ifdef __linux__
+      // Progressive writeback: kick dirty pages to disk asynchronously after
+      // each batch so they don't pile up and cause a stall on rename()/close().
+      // Only for decompression — compression output is smaller and the CPU work
+      // gives the kernel time to flush naturally.  Forcing writeback during
+      // compression creates I/O contention with subsequent fwrite() calls,
+      // triggering balance_dirty_pages throttling.
+      if (progressive_sync_ && !dw_ && out_) {
+        int fd = fileno(out_);
+        off_t cur = ftello(out_);
+        if (cur > sync_offset_) {
+          ::sync_file_range(fd, sync_offset_, cur - sync_offset_,
+                            SYNC_FILE_RANGE_WRITE);
+          sync_offset_ = cur;
+        }
+      }
+#endif
     }
   }
 
@@ -2562,7 +2596,9 @@ private:
   std::thread worker_;
   bool done_;
   bool error_ = false;
+  bool progressive_sync_ = false;
   uint64_t sparse_saved_ = 0;  // bytes skipped via sparse seek
+  off_t sync_offset_ = 0;       // progressive writeback high-water mark
   Meter * meter_ = nullptr;     // for tracking physically-written bytes
   FrameThrottle * bp_ = nullptr;  // frame throttle (releases permits after writes)
 };
@@ -2591,11 +2627,12 @@ static void writer_thread(FILE * out, ResultStore & results,
       enable_sparse = (g_direct_writer != nullptr)   // O_DIRECT file
                    || (out && out != stdout);          // regular file via fwrite
     }
+    bool psync = (opt.mode == Mode::DECOMPRESS);
 #ifndef _WIN32
-    aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse, m, bp);
+    aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse, m, bp, psync);
     aio = aio_ptr.get();
 #else
-    aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse, m, bp);
+    aio_ptr = std::make_unique<AsyncWritePool>(out, nullptr, enable_sparse, m, bp, psync);
     aio = aio_ptr.get();
 #endif
   }
@@ -3272,6 +3309,8 @@ static void cpu_worker(
     // Permit already acquired above (before pop).
     // The writer releases this permit after the output is physically written.
 
+    if (m && t.view_ptr) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
+
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32];
       human_bytes(double(t.len()), in_s, sizeof(in_s));
@@ -3369,7 +3408,7 @@ static void cpu_worker_rescue(
   RescueQueue * rq,
   ResultStore * results,
   const Options * opt,
-  Meter * /*m*/,
+  Meter * m,
   CpuAgg * cpuagg,
   FrameThrottle * bp)
 {
@@ -3391,6 +3430,7 @@ static void cpu_worker_rescue(
       if (drained) break;
     }
     if (!got_task) break;
+    if (m && t.view_ptr) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<char> out_frame;
     compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, out_frame);
@@ -3532,7 +3572,53 @@ static void cpu_decomp_worker(
     const size_t comp_size = t.len();
     size_t actual;
 
-    {
+    // For oversized frames (e.g., single-frame files from zstd -T0), use
+    // streaming decompression with chunked output so the writer can make
+    // progress and the progress bar updates incrementally.
+    static constexpr size_t STREAM_THRESHOLD = 64 * ONE_MIB;
+    if (t.decomp_size > STREAM_THRESHOLD) {
+      static constexpr size_t CHUNK = 16 * ONE_MIB;
+      size_t n_chunks_est = (t.decomp_size + CHUNK - 1) / CHUNK;
+      if (n_chunks_est < 1) n_chunks_est = 1;
+      {
+        std::lock_guard<std::mutex> lk(results->m);
+        results->total_tasks += (n_chunks_est - 1);
+      }
+      results->cv.notify_all();
+
+      ZSTD_inBuffer zin { t.ptr(), t.len(), 0 };
+      actual = 0;
+      size_t chunk_seq = t.seq;
+      size_t prev_zin_pos = 0;
+      for (;;) {
+        std::vector<char> chunk(CHUNK);
+        ZSTD_outBuffer zout { chunk.data(), chunk.size(), 0 };
+        size_t zin_before = zin.pos;
+        size_t ret = ZSTD_decompressStream(tl_dctx, &zout, &zin);
+        if (ZSTD_isError(ret))
+          die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
+        actual += zout.pos;
+        if (m && zin.pos > prev_zin_pos) {
+          m->read_bytes.fetch_add(zin.pos - prev_zin_pos, std::memory_order_relaxed);
+          prev_zin_pos = zin.pos;
+        }
+        if (zout.pos > 0) {
+          chunk.resize(zout.pos);
+          results->push_to_slot(-1, chunk_seq, std::move(chunk));
+          ++chunk_seq;
+        }
+        if (ret == 0) break;
+        if (zin.pos == zin_before && zout.pos == 0)
+          die_data("ZSTD decompressStream stalled: no progress");
+      }
+      size_t actual_chunks = chunk_seq - t.seq;
+      if (actual_chunks != n_chunks_est) {
+        std::lock_guard<std::mutex> lk(results->m);
+        results->total_tasks += (actual_chunks - n_chunks_est);
+        results->cv.notify_all();
+      }
+      t.release_input();
+    } else {
       std::vector<char> out_buf(t.decomp_size);
       actual = ZSTD_decompressDCtx(tl_dctx, out_buf.data(), out_buf.size(),
                                    t.ptr(), t.len());
@@ -3540,6 +3626,7 @@ static void cpu_decomp_worker(
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
       out_buf.resize(actual);
       t.release_input();
+      if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
       results->push_to_slot(-1, t.seq, std::move(out_buf));
     }
 
@@ -3570,8 +3657,6 @@ static void cpu_decomp_worker(
          << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
-
-    if (m) m->read_bytes.fetch_add(comp_size);
 
     if (m) m->tasks_done.fetch_add(1);
 
@@ -3613,8 +3698,10 @@ static size_t stream_frames_to_queue(
     Meter * m,
     const Options & opt,
     bool * fallback,
-    std::vector<char> * raw_data)
+    std::vector<char> * raw_data,
+    size_t * max_frame_decomp_out = nullptr)
 {
+  size_t max_frame_decomp = 0;
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   *fallback = false;
 
@@ -3741,6 +3828,7 @@ static size_t stream_frames_to_queue(
       t.seq = seq++;
       t.data.assign(ptr, ptr + frame_comp);
       t.decomp_size = (size_t)frame_decomp;
+      if ((size_t)frame_decomp > max_frame_decomp) max_frame_decomp = (size_t)frame_decomp;
       queue.push(std::move(t));
       if (m) m->total_out.fetch_add((uint64_t)frame_decomp, std::memory_order_relaxed);
 
@@ -3766,6 +3854,7 @@ static size_t stream_frames_to_queue(
          + " trailing bytes after last Zstd frame (ignored)\n");
   }
 
+  if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
   return seq;
 }
 
@@ -4001,6 +4090,83 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   progress_done = true; progress_thr.join();
 }
 
+// Single-frame compression using zstd's built-in MT with sliding window.
+// Produces one frame (like `zstd -T0`) for maximum ratio on repetitive data.
+// Decompression will be single-threaded (one frame = one unit of work).
+static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
+{
+  unsigned n_threads = (unsigned)std::thread::hardware_concurrency();
+  if (opt.cpu_threads > 0) n_threads = (unsigned)opt.cpu_threads;
+  else if (opt.cpu_threads == -1) n_threads = (unsigned)std::thread::hardware_concurrency();
+  if (n_threads < 1) n_threads = 1;
+
+  vlog(V_VERBOSE, opt, "sliding-window: single-frame compression with "
+       + std::to_string(n_threads) + " zstd worker threads\n");
+
+  uint64_t total_in = 0;
+  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
+    total_in = (uint64_t)fs::file_size(opt.input);
+
+  std::atomic<bool> progress_done{false};
+  std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
+
+  ZSTD_CCtx * cctx = ZSTD_createCCtx();
+  if (!cctx) die("failed to create ZSTD_CCtx");
+
+  size_t st;
+  st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
+  if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level): ") + ZSTD_getErrorName(st));
+  st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, (int)n_threads);
+  if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(nbWorkers): ") + ZSTD_getErrorName(st));
+  if (total_in > 0) {
+    st = ZSTD_CCtx_setPledgedSrcSize(cctx, total_in);
+    if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setPledgedSrcSize: ") + ZSTD_getErrorName(st));
+  }
+
+  apply_ultra_cctx(cctx, opt.level, opt.ultra);
+
+  const size_t READ_CHUNK = 4 * ONE_MIB;
+  const size_t OUT_BUF = ZSTD_CStreamOutSize();
+  std::vector<char> inbuf(READ_CHUNK);
+  std::vector<char> outbuf(OUT_BUF);
+
+  bool finished = false;
+  while (!finished) {
+    size_t n = std::fread(inbuf.data(), 1, READ_CHUNK, in);
+    if (m && n > 0) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
+    bool last_chunk = (n < READ_CHUNK);
+
+    ZSTD_inBuffer input = { inbuf.data(), n, 0 };
+    ZSTD_EndDirective directive = last_chunk ? ZSTD_e_end : ZSTD_e_continue;
+
+    do {
+      ZSTD_outBuffer output = { outbuf.data(), outbuf.size(), 0 };
+      size_t remaining = ZSTD_compressStream2(cctx, &output, &input, directive);
+      if (ZSTD_isError(remaining))
+        die_data(std::string("ZSTD_compressStream2: ") + ZSTD_getErrorName(remaining));
+
+      if (output.pos > 0) {
+#ifndef _WIN32
+        if (g_direct_writer) {
+          if (!g_direct_writer->write((const char *)output.dst, output.pos))
+            die_io("direct write failed (disk full?)");
+        } else
+#endif
+        {
+          size_t w = robust_fwrite((const char *)output.dst, output.pos, out);
+          if (w != output.pos) die_io("short write to output (broken pipe?)");
+        }
+        if (m) m->wrote_bytes.fetch_add(output.pos, std::memory_order_relaxed);
+      }
+
+      if (last_chunk && remaining == 0) finished = true;
+    } while (input.pos < input.size || (last_chunk && !finished));
+  }
+
+  ZSTD_freeCCtx(cctx);
+  progress_done = true; progress_thr.join();
+}
+
 static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // ---- Performance instrumentation (active at -vvv) ----
@@ -4108,7 +4274,6 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     size_t off = 0;
     while (off < file_size) {
       size_t n = std::min(host_chunk, file_size - off);
-      if (m) m->read_bytes.fetch_add(n);
       Task t;
       t.seq = seq.fetch_add(1, std::memory_order_relaxed);
       t.view_ptr = base + off;
@@ -4922,6 +5087,12 @@ static void gpu_worker(
         if (sched) { sched->mark_gpu_take(C.batch.size()); }
         if (g_perf) g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
         C.filled = C.batch.size();
+
+        if (m) {
+          for (size_t i = 0; i < C.filled; ++i)
+            if (C.batch[i].view_ptr)
+              m->read_bytes.fetch_add(C.batch[i].len(), std::memory_order_relaxed);
+        }
 
         // -vv: print take line
         if (opt.verbosity >= V_DEBUG) {
@@ -5741,7 +5912,6 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
         break;
       size_t n_host = std::min(host_chunk, file_size - off);
-      if (m) m->read_bytes.fetch_add(n_host);
       size_t sub_off = 0;
       while (sub_off < n_host) {
         size_t sub_n = std::min(gpu_chunk, n_host - sub_off);
@@ -6579,7 +6749,7 @@ static void gpu_decomp_worker(
           uint64_t in_sum = 0;
           for (size_t i = 0; i < C.filled; ++i)
             in_sum += batch_comp_sizes[i];
-          if (m) m->read_bytes.fetch_add(in_sum);
+          if (m) m->read_bytes.fetch_add(in_sum, std::memory_order_relaxed);
           // Report to shared auto-tuner
           if (shared_tune && !shared_tune->locked.load()) {
             shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
@@ -6763,8 +6933,32 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
   RateMatchState rate_match;
 
+  // ---- Pre-scan: stream frames into queue before starting workers ----
+  // This lets us detect oversized frames (sliding-window / zstd -T0 single-frame
+  // files) and skip GPU workers entirely, avoiding VRAM allocation failures.
+  bool fallback = false;
+  std::vector<char> raw_data;
+  size_t max_frame_decomp = 0;
+  size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data,
+                                           &max_frame_decomp);
+
+  // Detect oversized frames that GPUs cannot handle.
+  // nvCOMP decompresses into fixed 16 MiB slots — frames larger than that
+  // would require enormous VRAM allocations and will fail.
+  if (max_frame_decomp > GPU_SUBCHUNK_MAX && device_count > 0) {
+    char sz[32]; human_bytes(double(max_frame_decomp), sz, sizeof(sz));
+    vlog(V_NORMAL, opt,
+         std::string("warning: input contains frames up to ") + sz
+         + " decompressed (GPU max: 16 MiB).\n"
+         "  This file was likely compressed with --sliding-window or zstd -T0.\n"
+         "  Falling back to CPU-only decompression.\n");
+    if (opt.gpu_only)
+      vlog(V_NORMAL, opt, "  (--gpu-only ignored for this file)\n");
+    device_count = 0;
+  }
+
   // Frame throttle: scales with pipeline parallelism (see compress_nvcomp).
-  const int decomp_cpu_threads_est = opt.gpu_only ? 0 : resolve_cpu_threads(opt.cpu_threads);
+  const int decomp_cpu_threads_est = (device_count > 0 && opt.gpu_only) ? 0 : resolve_cpu_threads(opt.cpu_threads);
   const int decomp_gpu_batch_floor = device_count
       * (int)std::max<size_t>(1, opt.gpu_streams)
       * (int)std::max<size_t>(1, opt.gpu_batch_cap);
@@ -6783,7 +6977,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<bool> tick_done{false};
   std::thread tick_thr;
 
-  if (!opt.cpu_only && !opt.gpu_only && opt.hybrid) {
+  if (!opt.cpu_only && !opt.gpu_only && opt.hybrid && device_count > 0) {
     sched_ptr = std::make_unique<HybridSched>(
         opt.cpu_share, resolve_cpu_threads(opt.cpu_threads),
         device_count, opt);
@@ -6792,7 +6986,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
   }
 
-  // ---- CPU decompression pool (early start) ----
+  // ---- CPU decompression pool ----
   CpuAgg cpuagg{};
   std::vector<std::thread> cpu_pool;
   int cpu_threads = 0;
@@ -6846,14 +7040,6 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
   }
-
-  // ---- Stream frames from input into the queue ----
-  // Workers start decompressing as soon as the first frame is pushed.
-  // Pin reader to core 0 so it isn't preempted by the worker pool.
-  // pin_thread_to_core(0);              // disabled: hurts on loaded machines
-  bool fallback = false;
-  std::vector<char> raw_data;
-  size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data);
 
   // Preallocate output file to avoid per-write extent allocation overhead.
 #ifndef _WIN32
@@ -7072,10 +7258,12 @@ int main(int argc, char ** argv)
       } else {
         out = std::fopen(opt.output.c_str(), "wb");
         if (!out) die_io("cannot open output: " + opt.output);
+        std::setvbuf(out, nullptr, _IOFBF, 1 * 1024 * 1024);
       }
     } else {
       out = std::fopen(opt.output.c_str(), "wb");
       if (!out) die_io("cannot open output: " + opt.output);
+      std::setvbuf(out, nullptr, _IOFBF, 1 * 1024 * 1024);
       register_tmp_file(opt.output);
     }
   }
@@ -7180,7 +7368,10 @@ int main(int argc, char ** argv)
     }
 #ifdef HAVE_NVCOMP
     if (opt.cpu_only) {
-      compress_cpu_mt(in, out, opt, &meter);
+      if (opt.sliding_window)
+        compress_cpu_sliding_window(in, out, opt, &meter);
+      else
+        compress_cpu_mt(in, out, opt, &meter);
       if (!opt.stats_json.empty()) {
         CpuAgg agg{};
         agg.threads = (opt.cpu_threads > 0)
@@ -7196,7 +7387,10 @@ int main(int argc, char ** argv)
 #else
     if (opt.gpu_only) die_usage("This binary was built without nvCOMP; --gpu-only cannot be satisfied");
     if (opt.hybrid) vlog(V_VERBOSE, opt, "Hybrid requested but not available in CPU-only build; using MT CPU.\n");
-    compress_cpu_mt(in, out, opt, &meter);
+    if (opt.sliding_window)
+      compress_cpu_sliding_window(in, out, opt, &meter);
+    else
+      compress_cpu_mt(in, out, opt, &meter);
     if (!opt.stats_json.empty()) {
       CpuAgg agg{};
       agg.threads = (opt.cpu_threads > 0)
@@ -7500,6 +7694,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--best") { opt.best_flag = true; opt.level = 19; opt.level_user_set = true; }
     else if (a == "--ultra") { opt.ultra = true; }
     else if (a == "--cpu-only") opt.cpu_only = true;
+    else if (a == "--sliding-window") opt.sliding_window = true;
     else if (a == "--hybrid") opt.hybrid = true;
     else if (a.rfind("-T", 0) == 0 && a.size() > 2) {
       std::string val = a.substr(2);
@@ -7607,6 +7802,19 @@ static Options parse_args(int argc, char ** argv)
   // When writing to stdout (-c), always keep the input file (can't delete stdin,
   // and deleting a named file when output goes to stdout matches gzip behavior)
   if (opt.to_stdout) opt.keep = true;
+
+  if (opt.sliding_window) {
+    if (opt.mode != Mode::COMPRESS)
+      die_usage("--sliding-window only applies to compression");
+    if (opt.gpu_only)
+      die_usage("--sliding-window is incompatible with --gpu-only (GPU cannot use sliding window context)");
+    if (opt.hybrid)
+      die_usage("--sliding-window is incompatible with --hybrid (GPU cannot use sliding window context)");
+    if (!opt.cpu_only) {
+      vlog(V_NORMAL, opt, "warning: --sliding-window implies --cpu-only (GPU cannot use sliding window context)\n");
+      opt.cpu_only = true;
+    }
+  }
 
 #ifdef HAVE_NVCOMP
   if (opt.gpu_batch_cap == 0) opt.gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;

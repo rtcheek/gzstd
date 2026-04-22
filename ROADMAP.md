@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.12.14
+**Current version:** v0.12.24
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -273,6 +273,7 @@ Unknown flags rejected, `--` end-of-options, `--threads=N` form, argument order 
 
 | Item | Phase | Priority | Status |
 |------|-------|----------|--------|
+| Streaming decompression output | — | HIGH | DONE (v0.12.24) |
 | Asymmetric mode (PCIe Gen3 detection) | 5.1, 5.2 | HIGH | Not started |
 | Persistent auto-tuning (`~/.gzstd/`) | 2.12.3 | Medium | Not started |
 | Rate-matched dispatch (re-enable) | 1.3 | Medium | Disabled, needs eval |
@@ -280,6 +281,17 @@ Unknown flags rejected, `--` end-of-options, `--threads=N` form, argument order 
 | Streaming mode for unknown-size input | 3.2 | Low | Not started |
 | Multi-reader NVMe | 4.1 | Low | Research |
 | Multi-writer O_DIRECT pwrite | 4.2 | Low | Tested negative for buffered |
+
+### Streaming Decompression Output
+**Priority: HIGH | Complexity: Medium | Status: DONE (v0.12.24)**
+
+gzstd decompresses frame-at-a-time: each worker allocates a full-frame output buffer, decompresses into it, then hands it to the writer. For oversized single-frame files (from `zstd -T0` or `--sliding-window`), this meant allocating the entire decompressed size (e.g., 125 GiB) as one buffer — no progress, no backpressure, massive memory spike.
+
+**Fix (v0.12.24):** For frames > 64 MiB, `cpu_decomp_worker` uses `ZSTD_decompressStream` with 16 MiB output chunks. Each chunk gets its own ResultStore sequence number (`total_tasks` adjusted upward). The writer starts writing as soon as the first chunk arrives, so progress bar tracks smoothly and memory stays at ~16 MiB working set.
+
+Normal multi-frame files (16 MiB frames from gzstd's default path) are unaffected — they use the existing `ZSTD_decompressDCtx` fast path.
+
+**Note:** The broader proposal of streaming ALL frames (including normal 16 MiB ones) through a small ring buffer remains a potential future optimization for overwrite workloads, but the acute problem (single-frame files) is solved.
 
 ---
 
@@ -331,3 +343,5 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 | v0.11.31 | Stdout O_DIRECT detection (3× faster piped decompress), GPU backpressure on pop, -t defaults to 2 streams |
 | v0.11.38–v0.11.44 | backpressure set_done ordering, fallocate preallocation, hybrid deadlock fixes, thundering herd fix, writer_stalled_ signal |
 | v0.12.0 | FrameThrottle: counting semaphore replaces byte-based backpressure (-57 lines, deadlock-free by construction) |
+| v0.12.14–20 | Pipeline-depth throttle budget, throttle diagnostics/tunables, thundering herd fix, default buffered I/O, hybrid deadlock fixes, re_enqueue FIFO fix |
+| v0.12.21 | mmap zero-copy compression input (3.1s vs 9.9s), benchmark accuracy fix, failed mmap output experiment documented |
