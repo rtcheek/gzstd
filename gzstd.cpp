@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.24";
+static constexpr const char * GZSTD_VERSION = "0.12.30";
 //
 // Architecture overview:
 //
@@ -183,6 +183,7 @@ struct Options {
   bool keep = true;
   bool remove_input = false; // --rm: delete input after success
   bool force = false;
+  bool unsafe_overwrite = false; // --overwrite: truncate target in place (no atomic tmp+rename)
   bool to_stdout = false;
   // Unified verbosity level:
   //   V_SILENT(0)  = -qq: suppress everything including errors
@@ -217,6 +218,11 @@ struct Options {
   //   throttle_frames : explicit frame override; bypasses the formula entirely
   int throttle_factor = 0;
   int throttle_frames = 0;
+  // Memory usage limit in MiB (zstd-compat `-M#` / `--memlimit` / `--memory`).
+  // Decompress: passed to ZSTD_d_windowLogMax — frames requiring a larger
+  // window are rejected.  Compress: caps the in-flight RAM budget in
+  // compute_throttle_budget.  0 = unlimited (zstd's default).
+  size_t mem_limit_mib = 0;
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   bool gpu_batch_user_set = false;
@@ -517,77 +523,299 @@ static void die_io(const std::string & msg)
 static void die_data(const std::string & msg)
 { die(msg, EXIT_DATA); }
 
+// Short help — shown by -h and -?.  Groups flags by purpose with one-line
+// descriptions.  Point users at --help for details and examples.
 static void print_help()
 {
   std::cout <<
-"gzstd " << GZSTD_VERSION << " - Hybrid CPU+GPU Zstd compression\n"
+"gzstd " << GZSTD_VERSION << " — hybrid CPU+GPU Zstd compression\n"
 "\n"
 "Usage: gzstd [options] [file ...]\n"
 "\n"
-"If no file is given (or file is '-'), reads from stdin.\n"
-"When reading from stdin, output goes to stdout (implies -c).\n"
-"Compatible with pipes:  tar cf - dir | gzstd > archive.tar.zst\n"
-"                        gzstd -d < archive.tar.zst | tar xf -\n"
+"Operation:\n"
+"  -d                  decompress\n"
+"  -t                  test (verify integrity, no output)\n"
+"  -k                  keep input after success (default)\n"
+"  --rm                remove input after success\n"
 "\n"
-"Options:\n"
-" -d Decompress\n"
-" -t Test compressed file (verify integrity)\n"
-" -k Keep input file after operation (default)\n"
-" --rm Remove input file after successful operation\n"
-" -f Force overwrite of output file\n"
-" --[no-]sparse Enable/disable sparse file support (skip zero blocks)\n"
-"               Default: enabled for file output, disabled for stdout\n"
-" --sync-output Fsync output file before exit (default: off; OS flushes in background)\n"
-" --direct       Use O_DIRECT for output (bypass page cache; may increase variance)\n"
-" --no-direct    Use buffered I/O for output (default; consistent throughput)\n"
-" -c Write to stdout\n"
-" -o, --output FILE  Explicit output path\n"
-" -1 .. -19 Compression level (CPU zstd; default: 3)\n"
-" -20 .. -22 Stronger levels (require --ultra; use more memory)\n"
-" --fast Alias for a fast CPU level (maps to -1)\n"
-" --ultra Enable ultra levels (-20..-22); sets large window (32-128 MiB)\n"
-"               which requires significantly more memory per thread\n"
-" --best Alias for a strong CPU level (maps to -19)\n"
-" -v / -vv / -vvv Verbose / more verbose / debug-trace\n"
-" -q, --quiet Errors only (suppress progress and info)\n"
-" -qq, --silent Suppress ALL output including errors\n"
-" --progress Force progress meter (even in pipes)\n"
-" --no-progress Suppress progress meter\n"
-" --chunk-size N Host I/O chunk size in MiB (default: 16)\n"
-" --stats-json <f> Write run statistics (JSON)\n"
-" --cpu-only Force CPU-only path (multithreaded, no GPU)\n"
-" --sliding-window Single-frame compression for max ratio on repetitive data\n"
-"                  (uses zstd built-in MT; implies --cpu-only; decompression is single-threaded)\n"
-" --hybrid Enable hybrid CPU+GPU scheduling (default with GPU)\n"
-" -T, --threads N  CPU worker threads (0=all cores, auto=96 max). -T N or -T# [CPU-only/hybrid]\n"
-" --cpu-batch N    Queue depth before CPUs start popping (hybrid only; keeps frames\n"
-"                  stocked for GPU batch fills). Ignored in --cpu-only. Default: 0\n"
-" --cpu-share X Fixed CPU share [0..1], disables adaptation (hybrid)\n"
-" --cpu-backlog N Secondary queue threshold for CPU workers (hybrid; 0=off)\n"
-" --hybrid-floor=M GPU queue-depth reservation mode (hybrid): auto|nominal|off\n"
-"                  auto (default): EMA-scaled — shrinks when CPU≈GPU (decomp),\n"
-"                    grows when GPU≫CPU (comp).\n"
-"                  nominal: v0.12.9 behaviour, streams * gpu_batch_size.\n"
-"                  off: no reservation — CPUs compete freely.\n"
-" --hybrid-floor-factor X Override floor scale in [0..1]; disables auto.\n"
-" --throttle-factor N Slack multiplier for in-flight frame budget (default: 4)\n"
-"                  budget = parallelism * factor, capped by RAM/2, floor=32.\n"
-" --throttle-frames N Explicit in-flight frame cap (bypasses the formula)\n";
+"Output:\n"
+"  -c                  write to stdout\n"
+"  -o, --output FILE   explicit output path\n"
+"  -f                  overwrite existing file (atomic: .tmp + rename)\n"
+"  --overwrite         overwrite in place (faster on ext4; non-atomic)\n"
+"\n"
+"Compression level:\n"
+"  -1 .. -19           zstd level (default: 3)\n"
+"  -20 .. -22          ultra levels (require --ultra)\n"
+"  --fast / --best     aliases for -1 / -19\n"
+"  --ultra             enable ultra levels (large window, more memory)\n"
+"\n"
+"Backend:\n"
+"  --cpu-only          CPU multithreaded, no GPU\n"
+"  --gpu-only          GPU only, no CPU workers\n"
+"  --hybrid            CPU + GPU (default when a GPU is present)\n"
+"  --sliding-window    single-frame max-ratio mode (implies --cpu-only)\n"
+"\n"
+"Tuning:\n"
+"  -T, --threads N     CPU worker threads (0 = all cores)\n"
+"  --chunk-size N      host I/O chunk size in MiB (default: 16)\n";
 #ifdef HAVE_NVCOMP
   std::cout <<
-" --gpu-batch N Max GPU subchunks per device (default: 16)\n"
-" --gpu-mem-frac X Fraction of free VRAM per device (0.1..0.95, def: 0.60)\n"
-" --gpu-streams N CUDA streams per device (default: 1; 2 for -t verify)\n"
-" --gpu-devices N Number of GPUs to use (0=auto: all for compress, 1 for decompress)\n"
-" --gpu-only GPU only, no CPU workers (error if GPU unavailable)\n"
-" --pinned {auto|on|off} Control pinned host buffers (default: auto)\n"
-" --no-pinned Alias for --pinned=off\n";
+"  --gpu-batch N       GPU subchunks per CUDA stream (default: 16)\n"
+"  --gpu-streams N     CUDA streams per device (default: 1)\n"
+"  --gpu-devices N     number of GPUs (0 = auto)\n"
+"  --gpu-mem-frac X    fraction of free VRAM per device (default: 0.60)\n";
 #endif
   std::cout <<
-" -h, --help Show this help\n"
-" -V, --version Version info\n"
 "\n"
-"Exit codes:\n"
+"I/O:\n"
+"  --[no-]sparse       sparse file writes (default: on for files)\n"
+"  --direct            O_DIRECT output (bypass page cache)\n"
+"  --sync-output       fsync output before exit\n"
+#ifdef HAVE_NVCOMP
+"  --pinned MODE       pinned host buffers: auto|on|off (default: auto)\n"
+#endif
+"\n"
+"Logging:\n"
+"  -v / -vv / -vvv     verbose / debug / trace\n"
+"  -q / -qq            errors only / silent\n"
+"  --progress          force progress meter in pipes\n"
+"  --stats-json FILE   write run stats to FILE\n"
+"\n"
+"Misc:\n"
+"  -h, -?              this short help\n"
+"  --help              full help with details and examples\n"
+"  -V, --version       version info\n"
+"\n"
+"Reads stdin when no file is given; stdin implies -c (stdout).\n"
+"See `gzstd --help` for hybrid-scheduler and throttle flags.\n";
+}
+
+// Long help — shown by --help.  Detailed descriptions, flag interactions,
+// tuning notes, and runnable examples.
+static void print_help_long()
+{
+  std::cout <<
+"gzstd " << GZSTD_VERSION << " — hybrid CPU+GPU Zstd compression\n"
+"\n"
+"Usage: gzstd [options] [file ...]\n"
+"\n"
+"gzstd is a drop-in-compatible replacement for the zstd CLI that can run\n"
+"compression and decompression simultaneously across CPU cores and one or\n"
+"more CUDA-capable GPUs.  It produces standard .zst files that can be read\n"
+"by any zstd implementation.\n"
+"\n"
+"With no file arguments (or file `-`), gzstd reads from stdin and writes\n"
+"to stdout.  Pipes are fully supported:\n"
+"    tar cf - dir  | gzstd > archive.tar.zst\n"
+"    gzstd -d < archive.tar.zst | tar xf -\n"
+"\n"
+"============================================================\n"
+" OPERATION\n"
+"============================================================\n"
+"  -d\n"
+"     Decompress.  Input must be a valid zstd stream.\n"
+"\n"
+"  -t\n"
+"     Test mode: decompress and verify integrity but write nothing.\n"
+"     Exit code 0 on success, 4 on data error.  Defaults to 2 CUDA\n"
+"     streams per device (vs. 1 for normal decompress) because there\n"
+"     is no downstream writer to bottleneck on.\n"
+"\n"
+"  -k\n"
+"     Keep input after success (this is the default).\n"
+"\n"
+"  --rm\n"
+"     Remove input after a successful operation.  Implies -k=off.\n"
+"\n"
+"============================================================\n"
+" OUTPUT\n"
+"============================================================\n"
+"  -c\n"
+"     Write to stdout.  Implied when reading from stdin.\n"
+"\n"
+"  -o, --output FILE\n"
+"     Explicit output path.  Overrides the default (input + .zst on\n"
+"     compress, input with .zst stripped on decompress).\n"
+"\n"
+"  -f\n"
+"     Force overwrite.  Writes to `<output>.gzstd.tmp` then renames\n"
+"     atomically over the target.  On ext4 with large outputs the\n"
+"     rename can stall while the journal flushes dirty pages; use\n"
+"     --overwrite if that cost is unacceptable.\n"
+"\n"
+"  --overwrite\n"
+"     Force overwrite in place (truncate target, no tmp + rename).\n"
+"     Faster than -f on ext4 with large outputs, but NOT atomic: if\n"
+"     gzstd is killed mid-run the target is left corrupt/partial.\n"
+"     Implies -f.\n"
+"\n"
+"  --[no-]sparse\n"
+"     Enable/disable sparse writes (skip zero blocks).  Default: on\n"
+"     for regular files, off for stdout.\n"
+"\n"
+"  --sync-output\n"
+"     fsync the output file before exit.  Default: off.  Without\n"
+"     this the OS flushes in the background; the data is durable on\n"
+"     a clean shutdown but not guaranteed across power loss.\n"
+"\n"
+"  --direct / --no-direct\n"
+"     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
+"     buffered.  O_DIRECT exposes the app to NVMe GC stalls and\n"
+"     journal commits and typically increases wall-time variance.\n"
+"\n"
+"============================================================\n"
+" COMPRESSION LEVEL\n"
+"============================================================\n"
+"  -1 .. -19\n"
+"     Standard zstd compression level.  Higher = better ratio,\n"
+"     slower.  Default: 3.\n"
+"\n"
+"  -20 .. -22\n"
+"     Ultra-high-ratio levels.  Require --ultra (guards against\n"
+"     accidental 32-128 MiB window allocations per thread).\n"
+"\n"
+"  --fast\n"
+"     Alias for -1.\n"
+"\n"
+"  --best\n"
+"     Alias for -19.\n"
+"\n"
+"  --ultra\n"
+"     Enable ultra levels.  Sets a large window (32-128 MiB depending\n"
+"     on level) which can blow RAM budgets with many threads.\n"
+"\n"
+"============================================================\n"
+" BACKEND SELECTION\n"
+"============================================================\n"
+"gzstd picks a backend automatically based on available hardware:\n"
+"  * no GPU:   --cpu-only\n"
+"  * GPU present:  --hybrid (CPU + GPU)\n"
+"Override explicitly with one of these:\n"
+"\n"
+"  --cpu-only\n"
+"     Force CPU-only.  Useful for baseline measurements or when the\n"
+"     GPU is busy with other work.\n"
+"\n"
+"  --gpu-only\n"
+"     Force GPU-only.  Fails if no GPU is available or all GPUs fail\n"
+"     to initialize.\n"
+"\n"
+"  --hybrid\n"
+"     Enable CPU + GPU scheduling (default when a GPU is present).\n"
+"     CPU workers pop single frames; GPU workers pop greedy batches.\n"
+"     An EMA-based scheduler tracks observed throughput and adapts\n"
+"     the CPU/GPU split over time.\n"
+"\n"
+"  --sliding-window\n"
+"     Compress the whole file as a single frame with zstd's built-in\n"
+"     multi-threaded mode (`ZSTD_c_nbWorkers`).  Maximum ratio on\n"
+"     repetitive data (matches `zstd -T0` exactly) because the\n"
+"     sliding window carries context across the full file.\n"
+"     Implies --cpu-only.  Decompression is single-threaded because\n"
+"     one frame = one unit of work for any decompressor.\n"
+"\n"
+"============================================================\n"
+" CPU TUNING\n"
+"============================================================\n"
+"  -T, --threads N\n"
+"     CPU worker threads.  0 = all cores (auto-capped at 96).\n"
+"\n"
+"  --chunk-size N\n"
+"     Host I/O chunk size in MiB (default: 16).  Each independent\n"
+"     frame covers this many bytes of input.  Larger chunks = fewer\n"
+"     frames, less bookkeeping, but less parallelism and coarser\n"
+"     progress granularity.\n"
+"\n"
+"  --cpu-batch N  [hybrid only]\n"
+"     Queue depth before CPU workers start popping.  Keeps frames\n"
+"     stocked for GPU batch fills on fast-decompress workloads.\n"
+"     Default: 0 (CPUs pop immediately).\n"
+"\n"
+"  --cpu-share X  [hybrid only]\n"
+"     Fixed CPU share in [0..1].  Disables the EMA adaptation.\n"
+"\n"
+"  --cpu-backlog N  [hybrid only]\n"
+"     Secondary queue threshold for CPU workers.  0 = off.\n"
+"\n"
+#ifdef HAVE_NVCOMP
+"============================================================\n"
+" GPU TUNING\n"
+"============================================================\n"
+"  --gpu-batch N\n"
+"     Max GPU subchunks per CUDA stream (default: 16).  Each stream\n"
+"     targets batches of up to N subchunks; the per-stream binary\n"
+"     search may clamp lower if VRAM is tight (reported at -v as\n"
+"     `VRAM-fit: batch=X (requested N, ...)`).\n"
+"\n"
+"  --gpu-streams N\n"
+"     CUDA streams per device (default: 1; 2 for -t verify).\n"
+"     More streams = more kernel overlap at the cost of linearly\n"
+"     more VRAM.\n"
+"\n"
+"  --gpu-devices N\n"
+"     Number of GPUs to use.  0 = auto (all GPUs for compress,\n"
+"     1 for decompress).\n"
+"\n"
+"  --gpu-mem-frac X\n"
+"     Fraction of free VRAM per device to allocate (0.1..0.95,\n"
+"     default: 0.60).  Split evenly across --gpu-streams.\n"
+"\n"
+"  --gpu-only\n"
+"     GPU only, no CPU workers (error if no GPU available).\n"
+"\n"
+"  --pinned {auto|on|off}\n"
+"     Control pinned host buffers for H2D/D2H transfers.\n"
+"     --no-pinned is an alias for --pinned=off.\n"
+"\n"
+#endif
+"============================================================\n"
+" HYBRID SCHEDULER\n"
+"============================================================\n"
+"  --hybrid-floor=MODE\n"
+"     GPU queue-depth reservation mode:\n"
+"       auto (default): EMA-scaled — shrinks when CPU ≈ GPU\n"
+"                       (typical for decompress), grows when GPU ≫ CPU\n"
+"                       (typical for compress).\n"
+"       nominal:        streams * gpu_batch_size (v0.12.9 behaviour).\n"
+"       off:            no reservation; CPUs compete freely.\n"
+"\n"
+"  --hybrid-floor-factor X\n"
+"     Override the auto scale with a fixed [0..1] multiplier.\n"
+"\n"
+"  --throttle-factor N\n"
+"     Slack multiplier for the in-flight frame budget.  Default: 4.\n"
+"     Budget = parallelism * factor, capped at RAM/2, floor 32.\n"
+"\n"
+"  --throttle-frames N\n"
+"     Explicit in-flight frame cap (bypasses the formula).\n"
+"\n"
+"  -M N, --memlimit=N, --memory=N\n"
+"     Memory usage limit in MiB (zstd-compatible).  On decompression,\n"
+"     frames requiring a window larger than N MiB are rejected (via\n"
+"     ZSTD_d_windowLogMax).  On compression, caps the in-flight\n"
+"     frame-throttle budget at roughly N MiB total — useful on shared\n"
+"     machines where the default `min(pipeline, RAM/2)` is too generous.\n"
+"\n"
+"============================================================\n"
+" LOGGING\n"
+"============================================================\n"
+"  -v         Informational messages (mmap choice, preallocation,\n"
+"             thread count, etc.).\n"
+"  -vv        Per-worker / per-batch detail.\n"
+"  -vvv       Trace: per-chunk detail plus a PERFORMANCE BREAKDOWN\n"
+"             on completion showing Reader / H2D / Kernel / D2H /\n"
+"             CPU / Writer time and throughput.\n"
+"  -q, --quiet       Errors only (suppresses progress bar and info).\n"
+"  -qq, --silent     Suppress everything, including errors.\n"
+"  --progress        Force the progress meter (e.g. when stderr is a\n"
+"                    pipe and the TTY detection would suppress it).\n"
+"  --no-progress     Suppress the progress meter.\n"
+"  --stats-json FILE Write a machine-readable run summary to FILE.\n"
+"\n"
+"============================================================\n"
+" EXIT CODES\n"
+"============================================================\n"
 "  0  Success\n"
 "  1  Runtime error (out of memory, internal failure)\n"
 "  2  Bad command-line usage\n"
@@ -595,7 +823,40 @@ static void print_help()
 "  4  Data error (corrupt input, integrity check failure)\n"
 "  5  All GPUs failed (VRAM exhaustion, driver error)\n"
 "\n"
-"Progress is shown when stderr is a TTY. Use --progress to force it in pipes.\n";
+"============================================================\n"
+" EXAMPLES\n"
+"============================================================\n"
+"  # Compress with defaults (auto-selects hybrid when a GPU is present)\n"
+"  gzstd big.tar\n"
+"\n"
+"  # Decompress, overwriting any existing output\n"
+"  gzstd -d -f big.tar.zst\n"
+"\n"
+"  # Overwrite in place (faster on ext4; non-atomic)\n"
+"  gzstd -d --overwrite big.tar.zst\n"
+"\n"
+"  # Pipe compression with explicit level 9\n"
+"  tar cf - ./src | gzstd -9 > src.tar.zst\n"
+"\n"
+"  # CPU-only baseline at level 3 using all cores\n"
+"  gzstd --cpu-only -T 0 big.tar\n"
+"\n"
+"  # GPU-only with 4 streams per device, 512-subchunk batches (per stream)\n"
+"  gzstd --gpu-only --gpu-streams 4 --gpu-batch 512 big.tar\n"
+"\n"
+"  # Maximum ratio on repetitive data (single-frame, zstd-compatible)\n"
+"  gzstd --sliding-window -19 repetitive.log\n"
+"\n"
+"  # Integrity check (no output), with trace-level perf breakdown\n"
+"  gzstd -t -vvv big.tar.zst\n"
+"\n"
+"  # Stream through a pipe with forced progress on stderr\n"
+"  gzstd --progress -d archive.tar.zst | tar xf -\n"
+"\n"
+"  # Write run statistics as JSON for later analysis\n"
+"  gzstd --stats-json run.json big.tar\n"
+"\n"
+"For a condensed option list, run `gzstd -h`.\n";
 }
 
 static void print_version()
@@ -697,6 +958,36 @@ static bool parse_double_arg(const std::string & name, int & i, int argc,
     return true;
   }
 
+  return false;
+}
+
+// zstd-compat: emit a single-line warning that a zstd option is accepted but
+// ignored.  Prints to stderr at V_ERROR so -q silences it but default runs see
+// it.  Used by the compat layer in parse_args for flags gzstd accepts for
+// drop-in purposes but does not implement.
+static int g_verbosity_for_compat = 2; // set at arg-parse start; used here
+static void warn_ignored_zstd_opt(const std::string & opt_name,
+                                   const std::string & reason = "")
+{
+  if (g_verbosity_for_compat < 2) return; // -q and -qq suppress
+  std::string msg = "warning: " + opt_name
+                  + " accepted for zstd compatibility but ignored";
+  if (!reason.empty()) msg += " (" + reason + ")";
+  std::fprintf(stderr, "gzstd: %s\n", msg.c_str());
+}
+// Eat a VALUE that follows a zstd long option, whether as `--opt VALUE`
+// (separate argv) or `--opt=VALUE` (joined).  Returns true if the option name
+// matched.  The value itself is discarded — this is for zstd flags we warn on.
+static bool eat_zstd_value_opt(const std::string & name, int & i, int argc,
+                                char ** argv)
+{
+  const std::string pref = "--" + name;
+  std::string a = argv[i];
+  if (a == pref) {
+    if (i + 1 < argc) ++i; // consume value
+    return true;
+  }
+  if (a.rfind(pref + "=", 0) == 0) return true;
   return false;
 }
 
@@ -1387,6 +1678,15 @@ static int compute_throttle_budget(size_t frame_bytes,
   int slack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
   int pipeline_frames = pipeline_parallelism * slack;
   size_t ram_cap_frames = (avail / 2) / frame_bytes;
+  // zstd-compat: --memlimit / --memory / -M# tightens the RAM cap on the
+  // compress side to `mem_limit_mib` MiB total in-flight (matches the
+  // spirit of zstd's memory cap flag, which is decompress-only in stock
+  // zstd but extends naturally to compress for gzstd).
+  if (opt.mem_limit_mib > 0) {
+    size_t mem_cap_bytes = size_t(opt.mem_limit_mib) * ONE_MIB;
+    size_t mem_cap_frames = std::max<size_t>(1, mem_cap_bytes / frame_bytes);
+    if (mem_cap_frames < ram_cap_frames) ram_cap_frames = mem_cap_frames;
+  }
   int ram_frames = (int)std::min<size_t>(ram_cap_frames, (size_t)INT_MAX);
 
   int frames;
@@ -1404,7 +1704,7 @@ static int compute_throttle_budget(size_t frame_bytes,
         std::ostringstream os;
         os << "warning: --throttle-frames=" << opt.throttle_frames
            << " is below the GPU batch floor (" << gpu_batch_floor
-           << " = devices*streams*gpu_batch_cap); clamping to " << gpu_batch_floor
+           << " = devices*streams*per_stream_batch); clamping to " << gpu_batch_floor
            << " to avoid deadlock.\n";
         vlog(V_ERROR, opt, os.str());
       }
@@ -2773,6 +3073,27 @@ static inline void compress_one_cpu_frame(const void * src, size_t src_size, int
   out.resize(csz);
 }
 
+// Apply --memlimit to a decompression context via ZSTD_d_windowLogMax.
+// zstd's decompressor refuses to allocate window buffers larger than 2^wlog,
+// so a user who passes `-M 50` gets streams with >64 MiB windows rejected
+// (we use floor(log2(bytes)) — errs on the strict side of the user's cap).
+// No-op when mem_limit_mib == 0 (zstd's default is windowLogMax=27).
+static void apply_mem_limit_to_dctx(ZSTD_DCtx * dctx, const Options & opt)
+{
+  if (!dctx || opt.mem_limit_mib == 0) return;
+  uint64_t bytes = uint64_t(opt.mem_limit_mib) * ONE_MIB;
+  // floor(log2(bytes)) — clamped to zstd's accepted range [10, 31].
+  int wlog = 0;
+  for (uint64_t b = bytes; b >>= 1; ) ++wlog;
+  if (wlog < 10) wlog = 10;   // zstd minimum
+  if (wlog > 31) wlog = 31;   // zstd maximum (2 GiB window)
+  size_t st = ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, wlog);
+  if (ZSTD_isError(st) && opt.verbosity >= V_ERROR) {
+    std::fprintf(stderr, "gzstd: warning: could not apply --memlimit (%s)\n",
+                 ZSTD_getErrorName(st));
+  }
+}
+
 // Streaming decompress from an in-memory buffer (used when stream_frames_to_queue
 // already consumed stdin but couldn't parse frame boundaries).
 static void decompress_from_buffer(const std::vector<char> & input,
@@ -2782,6 +3103,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
   std::vector<char> outbuf(chunk_bytes);
   ZSTD_DCtx * dctx = ZSTD_createDCtx();
   if (!dctx) die("failed to create ZSTD_DCtx");
+  apply_mem_limit_to_dctx(dctx, opt);
 
   ZSTD_inBuffer zin { input.data(), input.size(), 0 };
   ZSTD_outBuffer zout { outbuf.data(), outbuf.size(), 0 };
@@ -3497,6 +3819,7 @@ static void cpu_decomp_worker(
   if (!tl_dctx) {
     tl_dctx = ZSTD_createDCtx();
     if (!tl_dctx) die("failed to create ZSTD_DCtx");
+    apply_mem_limit_to_dctx(tl_dctx, *opt);
   }
 
   while (true) {
@@ -4272,6 +4595,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
     size_t off = 0;
+    uint64_t mmap_rd_t0 = g_perf ? now_ns() : 0;
     while (off < file_size) {
       size_t n = std::min(host_chunk, file_size - off);
       Task t;
@@ -4280,6 +4604,10 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       t.view_len = n;
       queue.push(std::move(t));
       off += n;
+    }
+    if (g_perf) {
+      g_perf->read_ns.fetch_add(now_ns() - mmap_rd_t0);
+      g_perf->read_bytes_total.fetch_add(file_size);
     }
   } else
 #endif
@@ -4726,8 +5054,10 @@ static void gpu_worker(
     nvcompBatchedZstdCompressOpts_t comp_opts = nvcompBatchedZstdCompressDefaultOpts; size_t max_out_chunk=0;
     checkNvcomp(nvcompBatchedZstdCompressGetMaxOutputChunkSize(gpu_chunk, comp_opts, &max_out_chunk), "nvcompBatchedZstdCompressGetMaxOutputChunkSize");
     const size_t stream_count = std::max<size_t>(1, opt.gpu_streams);
-    size_t per_stream_cap = std::max<size_t>(1, (opt.gpu_batch_cap + stream_count - 1) / stream_count);
-    per_stream_cap = std::min(per_stream_cap, HARD_BATCH_CAP);
+    // --gpu-batch is per-stream (same semantics as decompress).  Each stream
+    // targets up to gpu_batch_cap subchunks; VRAM safety comes from splitting
+    // the memory budget across streams and clamping via binary search below.
+    size_t per_stream_cap = std::max<size_t>(1, std::min(opt.gpu_batch_cap, HARD_BATCH_CAP));
     double per_stream_frac = std::max(0.05, std::min(0.95, opt.gpu_mem_fraction / double(stream_count)));
 
     ctxs_ptr = std::make_shared<std::vector<StreamCtx>>(stream_count);
@@ -5156,7 +5486,6 @@ static void gpu_worker(
           C.d_stats,
           C.stream), "nvcompBatchedZstdCompressAsync");
         cudaEventRecord(C.ev_comp_end, C.stream);
-        cudaEventRecord(C.ev_d2h_end, C.stream);
         C.busy = true; submitted_any = true;
       }
 
@@ -5173,27 +5502,15 @@ static void gpu_worker(
           checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses)");
           checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes)");
           // Measure per-phase timing from CUDA events
-          float h2d_ms = 0, comp_ms = 0, d2h_ms = 0, tot_ms = 0;
+          float h2d_ms = 0, comp_ms = 0;
           cudaEventElapsedTime(&h2d_ms,  C.ev_h2d_begin, C.ev_h2d_end);
           cudaEventElapsedTime(&comp_ms, C.ev_h2d_end,   C.ev_comp_end);
-          cudaEventElapsedTime(&d2h_ms,  C.ev_comp_end,  C.ev_d2h_end);
-          cudaEventElapsedTime(&tot_ms,  C.ev_h2d_begin, C.ev_d2h_end);
 
           if (g_perf) {
             g_perf->h2d_ns.fetch_add(uint64_t(h2d_ms * 1e6));
             g_perf->h2d_count.fetch_add(1);
             g_perf->kernel_ns.fetch_add(uint64_t(comp_ms * 1e6));
             g_perf->kernel_count.fetch_add(1);
-          }
-
-          // Accumulate into per-device stats
-          {
-            std::lock_guard<std::mutex> lk(devstats->m);
-            devstats->h2d_ms  += h2d_ms;
-            devstats->comp_ms += comp_ms;
-            devstats->d2h_ms  += d2h_ms;
-            devstats->total_ms += tot_ms;
-            devstats->batches += 1;
           }
 
           uint64_t in_sum = 0, out_sum = 0;
@@ -5208,13 +5525,24 @@ static void gpu_worker(
                       "cudaMemcpy(D2H exact)");
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
           }
+          double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
+          double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
           if (g_perf) {
-            g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
+            g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
             g_perf->d2h_bytes.fetch_add(out_sum);
             g_perf->d2h_count.fetch_add(1);
             g_perf->h2d_bytes.fetch_add(in_sum);
             g_perf->gpu_batch_ns.fetch_add(uint64_t(tot_ms * 1e6));
             g_perf->gpu_batch_count.fetch_add(1);
+          }
+          // Accumulate into per-device stats
+          {
+            std::lock_guard<std::mutex> lk(devstats->m);
+            devstats->h2d_ms  += h2d_ms;
+            devstats->comp_ms += comp_ms;
+            devstats->d2h_ms  += d2h_ms;
+            devstats->total_ms += tot_ms;
+            devstats->batches += 1;
           }
           #ifdef HAVE_NVCOMP
           if (sched) sched->add_gpu_bytes(in_sum);
@@ -5302,17 +5630,33 @@ static void gpu_worker(
           checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses sync)");
           checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes sync)");
           // Measure per-phase timing (synchronous path)
-          float h2d_ms = 0, comp_ms = 0, d2h_ms = 0, tot_ms = 0;
+          float h2d_ms = 0, comp_ms = 0;
           cudaEventElapsedTime(&h2d_ms,  C.ev_h2d_begin, C.ev_h2d_end);
           cudaEventElapsedTime(&comp_ms, C.ev_h2d_end,   C.ev_comp_end);
-          cudaEventElapsedTime(&d2h_ms,  C.ev_comp_end,  C.ev_d2h_end);
-          cudaEventElapsedTime(&tot_ms,  C.ev_h2d_begin, C.ev_d2h_end);
           if (g_perf) {
             g_perf->h2d_ns.fetch_add(uint64_t(h2d_ms * 1e6));
             g_perf->h2d_count.fetch_add(1);
             g_perf->kernel_ns.fetch_add(uint64_t(comp_ms * 1e6));
             g_perf->kernel_count.fetch_add(1);
           }
+          uint64_t in_sum = 0, out_sum = 0;
+          for (size_t i = 0; i < C.filled; ++i) {
+            in_sum  += C.h_in_sizes[i];
+            out_sum += C.h_comp_sizes[i];
+          }
+          uint64_t d2h_t0 = now_ns();
+          for (size_t i = 0; i < C.filled; ++i) {
+            const size_t csz = C.h_comp_sizes[i];
+            std::vector<char> h_out(csz);
+            const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
+            checkCuda(cudaMemcpy(h_out.data(), d_src, csz, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H exact sync)");
+            results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
+          }
+          double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
+          if (g_perf) {
+            g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
+          }
+          double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
           {
             std::lock_guard<std::mutex> lk(devstats->m);
             devstats->h2d_ms  += h2d_ms;
@@ -5320,25 +5664,6 @@ static void gpu_worker(
             devstats->d2h_ms  += d2h_ms;
             devstats->total_ms += tot_ms;
             devstats->batches += 1;
-          }
-          uint64_t in_sum = 0, out_sum = 0;
-          for (size_t i = 0; i < C.filled; ++i) {
-            in_sum  += C.h_in_sizes[i];
-            out_sum += C.h_comp_sizes[i];
-          }
-          {
-            // D2H exact copies and release to writer (synchronous path)
-            uint64_t d2h_t0 = g_perf ? now_ns() : 0;
-            for (size_t i = 0; i < C.filled; ++i) {
-              const size_t csz = C.h_comp_sizes[i];
-              std::vector<char> h_out(csz);
-              const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
-              checkCuda(cudaMemcpy(h_out.data(), d_src, csz, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H exact sync)");
-              results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
-            }
-            if (g_perf) {
-              g_perf->d2h_ns.fetch_add(now_ns() - d2h_t0);
-            }
           }
           #ifdef HAVE_NVCOMP
           if (sched) sched->add_gpu_bytes(in_sum);
@@ -5907,6 +6232,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
     size_t off = 0;
+    uint64_t mmap_rd_t0 = g_perf ? now_ns() : 0;
     while (off < file_size) {
       if (abort_on_failure.load(std::memory_order_acquire)
           && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
@@ -5923,6 +6249,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         sub_off += sub_n;
       }
       off += n_host;
+    }
+    if (g_perf) {
+      g_perf->read_ns.fetch_add(now_ns() - mmap_rd_t0);
+      g_perf->read_bytes_total.fetch_add(off);
     }
   } else
 #endif
@@ -7251,14 +7581,18 @@ int main(int argc, char ** argv)
     }
     if (exists && opt.force) {
       bool is_regular = fs::is_regular_file(opt.output);
-      if (is_regular) {
+      if (is_regular && !opt.unsafe_overwrite) {
         out = open_output_atomic(opt.output, tmp);
         use_atomic = true;
         register_tmp_file(tmp);
       } else {
+        // --overwrite: truncate target in place.  On ext4 with journaling,
+        // this avoids the rename step that would otherwise force a synchronous
+        // flush of all dirty pages at commit time.
         out = std::fopen(opt.output.c_str(), "wb");
         if (!out) die_io("cannot open output: " + opt.output);
         std::setvbuf(out, nullptr, _IOFBF, 1 * 1024 * 1024);
+        if (is_regular) register_tmp_file(opt.output);
       }
     } else {
       out = std::fopen(opt.output.c_str(), "wb");
@@ -7640,6 +7974,16 @@ static Options parse_args(int argc, char ** argv)
 {
   Options opt;
 
+  // Pre-scan for verbosity flags so zstd-compat warnings emitted during the
+  // main parse below can be suppressed by `-q` / `-qq` regardless of the
+  // order flags appear on the command line.
+  g_verbosity_for_compat = 2; // V_DEFAULT
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "-q" || a == "--quiet") g_verbosity_for_compat = 1;
+    else if (a == "-qq" || a == "--silent") g_verbosity_for_compat = 0;
+  }
+
   // Detect invocation name: if basename starts with "un" (e.g. ungzstd),
   // default to decompress mode (like gzip/gunzip, zstd/unzstd)
   if (argc > 0 && argv[0]) {
@@ -7654,20 +7998,23 @@ static Options parse_args(int argc, char ** argv)
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "-h" || a == "--help") { print_help(); std::exit(EXIT_OK); }
+    if (a == "-h" || a == "-?") { print_help(); std::exit(EXIT_OK); }
+    else if (a == "--help" || a == "-H") { print_help_long(); std::exit(EXIT_OK); }
     else if (a == "-V" || a == "--version") { print_version(); std::exit(EXIT_OK); }
-    else if (a == "-d") opt.mode = Mode::DECOMPRESS;
-    else if (a == "-t") opt.mode = Mode::TEST;
-    else if (a == "-k") opt.keep = true;
+    else if (a == "-d" || a == "--decompress" || a == "--uncompress")
+      opt.mode = Mode::DECOMPRESS;
+    else if (a == "-t" || a == "--test") opt.mode = Mode::TEST;
+    else if (a == "-k" || a == "--keep") opt.keep = true;
     else if (a == "--rm") { opt.remove_input = true; opt.keep = false; }
-    else if (a == "-f") opt.force = true;
+    else if (a == "-f" || a == "--force") opt.force = true;
+    else if (a == "--overwrite") { opt.force = true; opt.unsafe_overwrite = true; }
     else if (a == "--sparse") opt.sparse_mode = 1;
     else if (a == "--no-sparse") opt.sparse_mode = 0;
     else if (a == "--sync-output") opt.sync_output = true;
     else if (a == "--direct") opt.direct_io = true;
     else if (a == "--no-direct") opt.direct_io = false;
-    else if (a == "-c") opt.to_stdout = true;
-    else if (a == "-v") opt.verbosity = V_VERBOSE;
+    else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
+    else if (a == "-v" || a == "--verbose") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
     else if (a == "-vvv") opt.verbosity = V_TRACE;
     else if (a == "-q" || a == "--quiet") opt.verbosity = V_ERROR;
@@ -7691,6 +8038,15 @@ static Options parse_args(int argc, char ** argv)
       }
     }
     else if (a == "--fast") { opt.fast_flag = true; opt.level = 1; opt.level_user_set = true; }
+    else if (a.rfind("--fast=", 0) == 0) {
+      // zstd-compat: --fast=# uses negative-ish fast levels.  Our backend
+      // accepts 1..22, so clamp "--fast=N" to level 1 (fastest) and warn if N>1.
+      std::string v = a.substr(7);
+      int n = v.empty() ? 1 : std::stoi(v);
+      if (n < 1) n = 1;
+      if (n > 1) warn_ignored_zstd_opt("--fast=" + v, "gzstd minimum level is 1");
+      opt.fast_flag = true; opt.level = 1; opt.level_user_set = true;
+    }
     else if (a == "--best") { opt.best_flag = true; opt.level = 19; opt.level_user_set = true; }
     else if (a == "--ultra") { opt.ultra = true; }
     else if (a == "--cpu-only") opt.cpu_only = true;
@@ -7781,6 +8137,126 @@ static Options parse_args(int argc, char ** argv)
       // End of options  everything after this is a filename
       for (++i; i < argc; ++i)
         opt.inputs.push_back(argv[i]);
+    }
+    // === zstd-compat layer: accept flags we don't implement so gzstd can
+    // serve as a drop-in replacement.  Real aliases are handled above; below
+    // is silent or warning acceptance for the rest.  Keep in sync with zstd
+    // --help. ===
+    //
+    // Silent no-ops: zstd defaults we already match, so the flag is a no-op.
+    else if (a == "--asyncio" || a == "--no-asyncio") {}
+    else if (a == "--check" || a == "--no-check") {}
+    else if (a == "--format=zstd") {}
+    else if (a == "--no-dictID") {}
+    else if (a == "--compress-literals" || a == "--no-compress-literals") {}
+    else if (a == "--row-match-finder" || a == "--no-row-match-finder") {}
+    else if (a == "--mmap-dict" || a == "--no-mmap-dict") {}
+    else if (a.rfind("--stream-size=", 0) == 0) {}
+    else if (a.rfind("--size-hint=", 0) == 0) {}
+    else if (a.rfind("--target-compressed-block-size=", 0) == 0) {}
+    else if (a.rfind("--auto-threads=", 0) == 0) {}
+    // Real mapping: --single-thread ≈ -T 1
+    else if (a == "--single-thread") { opt.cpu_threads = 1; }
+    // Warn no-ops: zstd features gzstd does not implement.
+    else if (a == "--adapt" || a.rfind("--adapt=", 0) == 0) {
+      warn_ignored_zstd_opt("--adapt", "gzstd does not adapt level during compression");
+    }
+    else if (a == "--long" || a.rfind("--long=", 0) == 0) {
+      warn_ignored_zstd_opt(a, "use --ultra for large window levels");
+    }
+    else if (a.rfind("--patch-from=", 0) == 0) {
+      warn_ignored_zstd_opt("--patch-from", "dictionary/diff not supported");
+    }
+    else if (a == "--patch-from") {
+      warn_ignored_zstd_opt("--patch-from", "dictionary/diff not supported");
+      if (i + 1 < argc) ++i;
+    }
+    else if (a == "--rsyncable") {
+      warn_ignored_zstd_opt("--rsyncable");
+    }
+    else if (a == "--exclude-compressed") {
+      warn_ignored_zstd_opt("--exclude-compressed");
+    }
+    else if (a == "--format=gzip" || a == "--format=xz"
+          || a == "--format=lzma" || a == "--format=lz4") {
+      warn_ignored_zstd_opt(a, "gzstd emits only zstd format");
+    }
+    else if (a == "--pass-through" || a == "--no-pass-through") {
+      warn_ignored_zstd_opt(a);
+    }
+    else if (a == "-r" || a == "--recursive") {
+      warn_ignored_zstd_opt("-r/--recursive", "recurse into directories yourself");
+    }
+    else if (a == "-l" || a == "--list") {
+      warn_ignored_zstd_opt("-l/--list", "use `zstd --list` for .zst header info");
+    }
+    else if (eat_zstd_value_opt("filelist", i, argc, argv)) {
+      warn_ignored_zstd_opt("--filelist");
+    }
+    else if (eat_zstd_value_opt("output-dir-flat", i, argc, argv)
+          || eat_zstd_value_opt("output-dir-mirror", i, argc, argv)) {
+      warn_ignored_zstd_opt(a, "output dir flags not supported");
+    }
+    else if (eat_zstd_value_opt("trace", i, argc, argv)) {
+      warn_ignored_zstd_opt("--trace");
+    }
+    // Dictionary flags (all warn-no-op)
+    else if (a == "-D" || a == "--dict" || a == "--dictionary") {
+      warn_ignored_zstd_opt(a, "dictionary compression not supported");
+      if (i + 1 < argc) ++i;
+    }
+    else if (a.rfind("--dict=", 0) == 0 || a.rfind("--dictionary=", 0) == 0) {
+      warn_ignored_zstd_opt(a, "dictionary compression not supported");
+    }
+    // Training mode (warn; zstd exits early with these — gzstd will proceed
+    // as normal compression, producing no dictionary)
+    else if (a == "--train" || a.rfind("--train-", 0) == 0
+          || a.rfind("--maxdict", 0) == 0 || a.rfind("--dictID", 0) == 0) {
+      warn_ignored_zstd_opt(a, "dictionary training not supported");
+    }
+    // Memory limit (zstd-compat `-M#` / `-M N` / `--memlimit[=N]` /
+    // `--memory[=N]`, value in MiB).  Applied to decompress via
+    // ZSTD_d_windowLogMax and to compress as a throttle-budget cap.
+    else if (a.size() > 2 && a[0] == '-' && a[1] == 'M'
+          && (a[2] >= '0' && a[2] <= '9')) {
+      opt.mem_limit_mib = (size_t)std::stoull(a.substr(2));
+    }
+    else if (a == "-M") {
+      if (i + 1 >= argc) die_usage("missing value for -M");
+      opt.mem_limit_mib = (size_t)std::stoull(argv[++i]);
+    }
+    else if (a.rfind("--memlimit=", 0) == 0) {
+      opt.mem_limit_mib = (size_t)std::stoull(a.substr(11));
+    }
+    else if (a == "--memlimit") {
+      if (i + 1 >= argc) die_usage("missing value for --memlimit");
+      opt.mem_limit_mib = (size_t)std::stoull(argv[++i]);
+    }
+    else if (a.rfind("--memory=", 0) == 0) {
+      opt.mem_limit_mib = (size_t)std::stoull(a.substr(9));
+    }
+    else if (a == "--memory") {
+      if (i + 1 >= argc) die_usage("missing value for --memory");
+      opt.mem_limit_mib = (size_t)std::stoull(argv[++i]);
+    }
+    // Job size: `-B#` in compression (bytes).  gzstd uses --chunk-size in MiB
+    // with different semantics (one frame per chunk).  Warn.
+    else if (a.size() > 2 && a[0] == '-' && a[1] == 'B'
+          && (a[2] >= '0' && a[2] <= '9')) {
+      warn_ignored_zstd_opt(a, "use --chunk-size N (MiB) for frame size");
+    }
+    else if (a == "-B") {
+      warn_ignored_zstd_opt("-B", "use --chunk-size N (MiB)");
+      if (i + 1 < argc) ++i;
+    }
+    // Benchmark mode (zstd's -b/-e/-i/-S and --priority=rt).  gzstd has its
+    // own benchmark harness (gzstd-benchmark.sh); warn and no-op.
+    else if ((a.size() > 2 && (a[0] == '-')
+           && (a[1] == 'b' || a[1] == 'e' || a[1] == 'i')
+           && (a[2] >= '0' && a[2] <= '9'))
+          || a == "-S"
+          || a.rfind("--priority=", 0) == 0) {
+      warn_ignored_zstd_opt(a, "benchmark mode not implemented; see gzstd-benchmark.sh");
     }
     else if (a.size() > 1 && a[0] == '-' && a != "-") {
       die_usage("unknown option: " + a);

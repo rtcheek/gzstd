@@ -814,18 +814,19 @@ rc=0; "$GZSTD" --help >/dev/null 2>&1 || rc=$?
 rc=0; "$GZSTD" -V >/dev/null 2>&1 || rc=$?
 [[ $rc -eq 0 ]] && pass "-V exits 0" || fail "-V exits 0" "got $rc"
 
-# Help lists exit codes
-("$GZSTD" -h 2>&1 || true) | grep -qi "exit code" && pass "-h documents exit codes" || fail "-h documents exit codes"
+# --help (long form) documents exit codes
+("$GZSTD" --help 2>&1 || true) | grep -qi "exit code" && pass "--help documents exit codes" || fail "--help documents exit codes"
 
-# -h and --help should exit 0
-rc=0; "$GZSTD" -h >/dev/null 2>&1 || rc=$?
-[[ $rc -eq 0 ]] && pass "-h exits 0" || fail "-h exits 0" "got $rc"
+# -? is an alias for -h
+("$GZSTD" "-?" 2>&1 || true) | grep -qi "usage\|options\|compress" && pass "-? shows help" || fail "-? shows help"
+rc=0; "$GZSTD" "-?" >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 0 ]] && pass "-? exits 0" || fail "-? exits 0" "got $rc"
+
+# --help includes at least one example
+("$GZSTD" --help 2>&1 || true) | grep -qi "example" && pass "--help includes examples" || fail "--help includes examples"
 
 rc=0; "$GZSTD" -V >/dev/null 2>&1 || rc=$?
 [[ $rc -eq 0 ]] && pass "-V exits 0" || fail "-V exits 0" "got $rc"
-
-# Help should list exit codes
-("$GZSTD" -h 2>&1 || true) | grep -qi "exit code" && pass "-h documents exit codes" || fail "-h documents exit codes"
 
 # ============================================================
 # 16. Zstd interop
@@ -2270,6 +2271,112 @@ else
   fail "--sliding-window --cpu-only" "exit $rc or unexpected warning"
 fi
 rm -f "$TMPDIR/sw-cpu.zst"
+
+# ============================================================
+section "zstd-compat flag layer"
+
+# Long-form aliases for short flags gzstd already supports
+dd if=/dev/urandom bs=1M count=1 2>/dev/null > "$TMPDIR/zc.bin"
+
+("$GZSTD" --keep "$TMPDIR/zc.bin" 2>/dev/null && test -f "$TMPDIR/zc.bin.zst") \
+  && pass "--keep (alias for -k)" || fail "--keep (alias for -k)"
+rm -f "$TMPDIR/zc.bin.zst"
+("$GZSTD" --force "$TMPDIR/zc.bin" 2>/dev/null && test -f "$TMPDIR/zc.bin.zst") \
+  && pass "--force (alias for -f)" || fail "--force (alias for -f)"
+("$GZSTD" --decompress "$TMPDIR/zc.bin.zst" -o "$TMPDIR/zc.out" 2>/dev/null \
+  && cmp -s "$TMPDIR/zc.bin" "$TMPDIR/zc.out") \
+  && pass "--decompress (alias for -d)" || fail "--decompress (alias for -d)"
+rm -f "$TMPDIR/zc.out"
+("$GZSTD" --test "$TMPDIR/zc.bin.zst" >/dev/null 2>&1) \
+  && pass "--test (alias for -t)" || fail "--test (alias for -t)"
+("$GZSTD" --verbose -f "$TMPDIR/zc.bin" 2>&1 | grep -qi "thread\|worker\|mmap\|preallocated") \
+  && pass "--verbose (alias for -v)" || fail "--verbose (alias for -v)"
+("$GZSTD" --stdout "$TMPDIR/zc.bin" 2>/dev/null | "$GZSTD" -d | cmp -s - "$TMPDIR/zc.bin") \
+  && pass "--stdout (alias for -c)" || fail "--stdout (alias for -c)"
+
+# -H is the long help (zstd convention)
+("$GZSTD" -H 2>&1 | grep -qi "examples") \
+  && pass "-H shows full help" || fail "-H shows full help"
+
+# --single-thread maps to -T 1
+("$GZSTD" --single-thread --cpu-only -f "$TMPDIR/zc.bin" 2>&1 | tail -1 | grep -q "100.00%") \
+  && pass "--single-thread compresses" || fail "--single-thread compresses"
+
+# Silent no-ops (should not print any warning or error)
+for opt in --check --no-check --asyncio --no-asyncio --format=zstd \
+           --no-dictID --compress-literals --no-compress-literals \
+           --row-match-finder --no-row-match-finder \
+           --auto-threads=physical --stream-size=1024 --size-hint=1024 \
+           --target-compressed-block-size=131072; do
+  out=$("$GZSTD" "$opt" -f "$TMPDIR/zc.bin" 2>&1)
+  if ! echo "$out" | grep -qi warning; then
+    pass "silent no-op: $opt"
+  else
+    fail "silent no-op: $opt" "unexpected warning"
+  fi
+done
+
+# Warn no-ops (each should emit one compat warning)
+for opt in --adapt --long=27 --rsyncable --exclude-compressed \
+           --format=gzip --pass-through; do
+  out=$("$GZSTD" "$opt" -f "$TMPDIR/zc.bin" 2>&1)
+  if echo "$out" | grep -qi "accepted for zstd compatibility but ignored"; then
+    pass "warn no-op: $opt"
+  else
+    fail "warn no-op: $opt" "missing compat warning"
+  fi
+done
+
+# Value-eating warn no-ops
+out=$("$GZSTD" --trace foo.log -f "$TMPDIR/zc.bin" 2>&1)
+echo "$out" | grep -qi -- "trace.*compatibility" && pass "--trace eats value" || fail "--trace eats value"
+out=$("$GZSTD" -D /nonexistent -f "$TMPDIR/zc.bin" 2>&1)
+echo "$out" | grep -qi "D.*dictionary" && pass "-D eats value" || fail "-D eats value"
+# -M / --memlimit / --memory are real flags (implemented v0.12.30)
+("$GZSTD" -M256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "-M# accepted (real)" || fail "-M# accepted"
+("$GZSTD" -M 256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "-M N accepted (real)" || fail "-M N accepted"
+("$GZSTD" --memlimit=256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "--memlimit=N accepted" || fail "--memlimit=N accepted"
+("$GZSTD" --memlimit 256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "--memlimit N accepted" || fail "--memlimit N accepted"
+("$GZSTD" --memory=256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "--memory=N accepted" || fail "--memory=N accepted"
+
+# -M tightens the throttle budget at -vv (source should show `source=ram`)
+out=$("$GZSTD" --cpu-only -vv -M 32 -f "$TMPDIR/zc.bin" 2>&1)
+echo "$out" | grep -q "throttle:.*source=ram" && pass "-M tightens throttle (source=ram)" \
+  || fail "-M tightens throttle" "expected source=ram in throttle line"
+
+# -M on decompress rejects frames requiring a larger window.
+# Use zstd --long=27 to force a 128 MiB window frame.
+if command -v zstd >/dev/null 2>&1; then
+  # Need input large AND incompressible so zstd doesn't clamp the effective
+  # window for repetitive data.  128 MiB random + --long=27 forces a 128 MiB
+  # window in the frame header.
+  dd if=/dev/urandom bs=1M count=128 2>/dev/null > "$TMPDIR/mem-big.bin"
+  zstd -q -19 --long=27 -f "$TMPDIR/mem-big.bin" -o "$TMPDIR/mem-big.zst" 2>/dev/null
+  if [ -f "$TMPDIR/mem-big.zst" ]; then
+    rc=0
+    "$GZSTD" --cpu-only -d -M 1 -f "$TMPDIR/mem-big.zst" -o "$TMPDIR/mem-big.out" >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 4 ]] && pass "-M rejects oversize-window stream (exit 4)" \
+                   || fail "-M rejects oversize-window stream" "got exit $rc (expected 4)"
+    # Loose limit should succeed
+    "$GZSTD" --cpu-only -d -M 256 -f "$TMPDIR/mem-big.zst" -o "$TMPDIR/mem-big.out" >/dev/null 2>&1 \
+      && cmp -s "$TMPDIR/mem-big.bin" "$TMPDIR/mem-big.out" \
+      && pass "-M with loose limit still decompresses" \
+      || fail "-M with loose limit still decompresses"
+    rm -f "$TMPDIR/mem-big.bin" "$TMPDIR/mem-big.zst" "$TMPDIR/mem-big.out"
+  fi
+fi
+out=$("$GZSTD" -B128K -f "$TMPDIR/zc.bin" 2>&1)
+echo "$out" | grep -qi "chunk-size" && pass "-B# warns" || fail "-B# warns"
+
+# -q suppresses compat warnings
+out=$("$GZSTD" -q --adapt -f "$TMPDIR/zc.bin" 2>&1)
+if ! echo "$out" | grep -qi warning; then
+  pass "-q suppresses compat warnings"
+else
+  fail "-q suppresses compat warnings" "got: $out"
+fi
+
+rm -f "$TMPDIR/zc.bin" "$TMPDIR/zc.bin.zst" "$TMPDIR/zc.out"
 
 # ============================================================
 # Final summary

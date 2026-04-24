@@ -1,9 +1,154 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.24  
+**Covers:** v0.9.50 → v0.12.30  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.30 — `-M` / `--memlimit` / `--memory` now real flags
+
+Promoted from v0.12.29's warn-no-op set to actual implementations.
+
+**Accepted forms:** `-M N`, `-M N` (joined or separated), `--memlimit N`,
+`--memlimit=N`, `--memory N`, `--memory=N` — value is in MiB to match zstd.
+
+**Decompression.** The value is pushed to every `ZSTD_DCtx` via
+`ZSTD_d_windowLogMax` with `wlog = floor(log2(N * 1 MiB))`, clamped to the
+`[10, 31]` range zstd accepts.  Streams whose frames require a larger window
+are rejected with zstd's `Frame requires too much memory for decoding`
+error (exit 4 = data error) rather than being allowed to allocate unbounded
+memory.  This matches zstd's own semantics for `-M`.
+
+**Compression.** zstd itself ignores `-M` for compress; gzstd uses the
+value to tighten the in-flight frame-throttle budget in
+`compute_throttle_budget`.  Without `-M`, the RAM cap is
+`min(pipeline_parallelism * slack, RAM/2 / frame_bytes)`.  With `-M N`
+the cap is lowered to `max(1, N * 1 MiB / frame_bytes)` if that's
+smaller, and the throttle source in `-vv` output shows `source=ram`
+whenever the user's limit is the binding constraint.
+
+**Not applied to nvCOMP decompression.**  The GPU path allocates its
+VRAM buffers through nvCOMP, which has its own memory accounting via
+`--gpu-mem-frac` — the host-side `-M` cap doesn't directly apply there.
+Frames that fall back to CPU rescue respect the limit through the
+worker thread's `tl_dctx`.
+
+---
+
+## v0.12.29 — zstd-compat flag layer
+
+gzstd now accepts the full zstd CLI flag set so it can truly serve as a
+drop-in replacement.  Flags fall into four buckets:
+
+**Real aliases** (map to existing gzstd semantics):
+`--decompress`, `--uncompress`, `--force`, `--keep`, `--test`, `--verbose`,
+`--stdout`, `--to-stdout`, `-H` (long help), `--single-thread` (≡ `-T 1`),
+`--fast=#`.
+
+**Silent no-ops** (zstd defaults that gzstd already matches — accepted without
+comment): `--asyncio`, `--no-asyncio`, `--check`, `--no-check`,
+`--format=zstd`, `--no-dictID`, `--compress-literals`,
+`--no-compress-literals`, `--row-match-finder`, `--no-row-match-finder`,
+`--mmap-dict`, `--no-mmap-dict`, `--stream-size=…`, `--size-hint=…`,
+`--target-compressed-block-size=…`, `--auto-threads=…`.
+
+**Warn no-ops** (zstd features gzstd does not implement — accepted with a
+`gzstd: warning: <flag> accepted for zstd compatibility but ignored` line):
+`--adapt`, `--long[=#]`, `--patch-from[=REF]`, `--rsyncable`,
+`--exclude-compressed`, `--format=gzip|xz|lzma|lz4`, `--pass-through`,
+`--no-pass-through`, `-r`/`--recursive`, `-l`/`--list`, `--filelist`,
+`--output-dir-flat`, `--output-dir-mirror`, `--trace`, `-D`/`--dict`/
+`--dictionary`, `--train`/`--train-*`, `--maxdict`, `--dictID=#`, `-B#`,
+zstd benchmark flags (`-b#`/`-e#`/`-i#`/`-S`/`--priority=rt`).
+
+(`-M#` / `--memlimit` / `--memory` started here as warn-no-ops and were
+promoted to real flags in v0.12.30 — see that entry.)
+
+The warn stream respects verbosity: `-q` / `-qq` / `--quiet` / `--silent`
+suppress the compat warnings.  A pre-scan of `argv` sets the suppression
+threshold so the quieting flag can appear in any position.
+
+---
+
+## v0.12.28 — Help split: concise `-h` / `-?`, detailed `--help` with examples
+
+`-h` and the new `-?` alias print a short, grouped option list (Operation /
+Output / Compression / Backend / Tuning / I/O / Logging / Misc) intended to
+fit on a single terminal screen.  `--help` now prints a long reference with
+per-flag descriptions, flag interactions, exit codes, and a block of runnable
+examples covering the common workflows (compress, decompress with
+`--overwrite`, piped tar, CPU-only baseline, GPU-only tuning,
+`--sliding-window`, integrity check, forced progress, stats JSON).
+
+---
+
+## v0.12.27 — `--gpu-batch` is now per-stream on compress (BEHAVIOR CHANGE)
+
+**Symptom.** `--gpu-only --gpu-batch=512 --gpu-streams=4` on the compression path was allocating only **128** subchunks per stream, not 512. The user expected "each stream gets batches of 512."
+
+**Cause.** The compression producer-side batch cap was computed as `ceil(gpu_batch_cap / stream_count)` — treating `--gpu-batch` as a *per-device* total and dividing across streams. The decompression path treated the same flag as *per-stream* (see comment at `decompress_nvcomp`: "kernel launch overhead dominates, so each stream needs large batches"). The help text ("Max GPU subchunks per device") agreed with compress, disagreed with decompress.
+
+**Fix.** Compress now uses `--gpu-batch` as a per-stream cap, matching decompress. With `--gpu-batch=512 --gpu-streams=4`, each of the 4 streams now aims for 512 subchunks. VRAM safety is preserved: `gpu_mem_fraction` is still divided across streams, and the per-stream binary search clamps down when the requested batch doesn't fit.
+
+**Compatibility.** Runs that relied on the old semantics (compress dividing the flag) will see more subchunks in flight and higher VRAM usage. If VRAM is tight the binary search will report "VRAM-fit: batch=N (requested M)" at `-v`. To restore the previous effective per-stream batch, divide the old value by `--gpu-streams` (e.g., old `--gpu-batch=512 --gpu-streams=4` → new `--gpu-batch=128 --gpu-streams=4`).
+
+**Help text updated:** `Max GPU subchunks per CUDA stream (default: 16)`.
+
+---
+
+## v0.12.26 — `--overwrite` (non-atomic) + perf-breakdown reader stats fix
+
+### 1. New `--overwrite` flag
+
+**Symptom (Lovelace).** Running `gzstd -d -f big.zst` against a pre-existing output file stalled for tens of seconds at the final rename, while deleting the target first and letting gzstd create a fresh file was fast. v0.12.23 already reduced this stall with `sync_file_range`, but on ext4 with large outputs a substantial rename cost remained.
+
+**Cause.** `-f` always used the `.gzstd.tmp` + `rename()` atomic-overwrite dance, which on ext4 `data=ordered` ties rename commit to flushing dirty pages. For workloads where atomicity isn't worth that cost, users want to opt out.
+
+**Fix.** New `--overwrite` flag (implies `-f`) bypasses the atomic dance: gzstd calls `fopen(target, "wb")` directly, truncating the target in place. No tmp file, no rename. Trade-off: if gzstd is interrupted, the target is partial/corrupt.
+
+- Default `-f` behaviour (atomic) is unchanged.
+- Regular-file check still applies (FIFOs, devices, stdout are unaffected).
+- The target is still registered with the cleanup handler so `Ctrl-C` removes the half-written file.
+
+### 2. Reader stats showing all zeros under `-vvv`
+
+**Symptom.** The `PERFORMANCE BREAKDOWN` table printed `Reader: 0.000 s (0.00 GiB, 0.00 GiB/s)` for any run that used the default mmap zero-copy reader.
+
+**Cause.** `compress_cpu_mt` and `compress_nvcomp` had two producer paths: a `fread` path (which recorded `read_ns` / `read_bytes_total`) and an `mmap` path (which didn't). For regular files on Linux, gzstd always takes the mmap path, so `PerfCounters` never saw any bytes.
+
+**Fix.** Both mmap producer loops now record `read_bytes_total` (= mapped file size) and `read_ns` (time spent enqueuing view tasks). The timing is small — pointer arithmetic, not I/O — but the bytes column now reflects reality.
+
+---
+
+## v0.12.25 — Compression I/O fixes + GPU D2H timing correction
+
+**Three independent fixes surfaced while investigating why gzstd was 6.5× slower than `zstd -T0` on barely-compressible data and inconsistent across runs.**
+
+### 1. Output `setvbuf` — multi-MiB buffer instead of glibc default
+
+**Symptom.** Compression of large barely-compressible data was dominated by `write()` syscall overhead. A 14.4 MiB `fwrite` was being split into 1800–3600 individual `write()` syscalls by the glibc default ~4–8 KiB FILE buffer.
+
+**Fix.** Set a 1 MiB `_IOFBF` buffer on every output `FILE *` opened by gzstd (both `open_output_atomic` and the two `fopen` call sites in `main`). This collapses the syscall count by ~128–256×.
+
+**Long-standing issue.** This has been present for the entire history of the tool — not a v0.12.x regression. Affected both compression and decompression output paths.
+
+### 2. `sync_file_range` gated behind `progressive_sync_` flag
+
+**Symptom.** v0.12.23 added unconditional `sync_file_range(..., SYNC_FILE_RANGE_WRITE)` in `AsyncWritePool::worker_fn` to fix a 46s `rename()` stall on decompression. This caused a measurable regression on compression: the non-blocking writeback hint created I/O contention with subsequent `fwrite` calls, triggering `balance_dirty_pages` throttling inside the writer thread.
+
+**Root cause.** Compression produces much smaller output than decompression (e.g., 19 GiB in → 2 MiB out for trivially-compressible data), so the writeback hint buys nothing but steals bandwidth from the next `fwrite`.
+
+**Fix.** `AsyncWritePool` now takes a `progressive_sync` bool (default `false`). Only enabled for decompression, where the ordered-journal rename stall is the real concern.
+
+### 3. GPU D2H timing always reporting `0.00 ms` at `-vvv`
+
+**Symptom.** `--gpu-only` compression with `-vvv` consistently reported `d2h=0.00ms` per batch, even though real D2H copies were happening.
+
+**Root cause.** `cudaEventRecord(C.ev_comp_end)` and `cudaEventRecord(C.ev_d2h_end)` were recorded back-to-back in the CUDA stream with no D2H operation between them. The actual D2H copies are synchronous host-side `cudaMemcpy` per chunk, which happen *after* stream completion — the CUDA events couldn't see them.
+
+**Fix.** Replaced CUDA event timing with wall-clock `now_ns()` timing bracketed around the host-side D2H memcpy loop in both the async poll path and the sync drain path. Total time is now correctly computed as `h2d_ms + comp_ms + d2h_ms`. The `ev_d2h_end` event is still created/destroyed for ABI simplicity but is unused.
 
 ---
 
