@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.30";
+static constexpr const char * GZSTD_VERSION = "0.12.34";
 //
 // Architecture overview:
 //
@@ -160,6 +160,11 @@ static const size_t DEFAULT_CHUNK_MIB = 16;
 static const size_t GPU_SUBCHUNK_MAX = size_t(16) * ONE_MIB; // max GPU subchunk
 static const size_t DEFAULT_GPU_BATCH_CAP = 8;    // per device  smaller batches launch sooner
 static const size_t DEFAULT_GPU_DECOMP_BATCH_CAP = 16;  // sweet spot: amortizes kernel launch without starving writer
+// Upper bound on the per-stream buffer when --gpu-batch is NOT user-pinned and
+// the shared auto-tuner is active.  Sized to give the tuner real room to grow
+// from DEFAULT_GPU_BATCH_CAP without allocating multi-GiB VRAM blocks per
+// stream up front.  HARD_BATCH_CAP is the hard ceiling above this.
+static const size_t AUTO_TUNE_BATCH_CEILING = 256;
 static const double DEFAULT_GPU_MEM_FRACTION = 0.60; // fraction of free VRAM to use
 static const size_t DEFAULT_GPU_STREAMS = 1;       // single stream avoids context-switch overhead
 static const double GROW_CHECK_SEC = 0.3;  // auto-tune check interval (seconds)
@@ -4638,7 +4643,13 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     results.total_tasks = queue.total_tasks();
     if (m) {
       m->total_frames.store(results.total_tasks, std::memory_order_relaxed);
-      m->total_out_final.store(true, std::memory_order_release);
+      // NOTE: do NOT set total_out_final here.  Unlike decompress (where
+      // total_out is summed from frame-header decomp_size during pre-scan),
+      // compress's total_out is a running accumulator — it grows as workers
+      // finish more frames.  Setting total_out_final = true at producer-done
+      // makes the progress code use `wrote_bytes / total_out_so_far` (the
+      // writer's catch-up percentage), which jumps to ~90% almost immediately.
+      // The GPU compress path correctly leaves this unset; match that here.
     }
   }
   results.cv.notify_all();
@@ -5057,7 +5068,17 @@ static void gpu_worker(
     // --gpu-batch is per-stream (same semantics as decompress).  Each stream
     // targets up to gpu_batch_cap subchunks; VRAM safety comes from splitting
     // the memory budget across streams and clamping via binary search below.
-    size_t per_stream_cap = std::max<size_t>(1, std::min(opt.gpu_batch_cap, HARD_BATCH_CAP));
+    //
+    // When the user does NOT pin --gpu-batch (gpu_batch_user_set==false), the
+    // shared auto-tuner is active and tries to grow the batch.  We must
+    // allocate enough buffer headroom for that growth — otherwise the pop
+    // (clamped to per_stream_batch) caps the tuner at the initial value and
+    // dynamic scaling is silently dead (was a long-standing bug; see
+    // CHANGELOG v0.12.32).  Use HARD_BATCH_CAP as the binary-search ceiling
+    // and let the VRAM check below pick the actual fit.
+    size_t per_stream_cap = opt.gpu_batch_user_set
+        ? std::max<size_t>(1, std::min(opt.gpu_batch_cap, HARD_BATCH_CAP))
+        : AUTO_TUNE_BATCH_CEILING;
     double per_stream_frac = std::max(0.05, std::min(0.95, opt.gpu_mem_fraction / double(stream_count)));
 
     ctxs_ptr = std::make_shared<std::vector<StreamCtx>>(stream_count);
@@ -6105,9 +6126,21 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Budget scales with pipeline parallelism (CPU threads + GPU streams *
   // batch cap), capped by half of available RAM.  See
   // compute_throttle_budget header comment for rationale.
+  //
+  // Use the EFFECTIVE max batch the GPU side might pop, not just
+  // opt.gpu_batch_cap.  When --gpu-batch is not user-pinned, the v0.12.32
+  // auto-tuner can grow per-stream batches up to AUTO_TUNE_BATCH_CEILING
+  // (256).  Sizing the throttle around opt.gpu_batch_cap (default 8) starves
+  // the GPU side: every GPU pop acquires `pop_n` permits, and with 96 CPUs
+  // each holding 1 permit, the budget runs out and GPUs block waiting for
+  // CPU writers to drain.  Use the larger of the two so the budget actually
+  // covers all the GPU permit demand.
+  const size_t per_stream_budget = opt.gpu_batch_user_set
+      ? std::max<size_t>(1, opt.gpu_batch_cap)
+      : std::max<size_t>(opt.gpu_batch_cap, AUTO_TUNE_BATCH_CEILING);
   const int comp_gpu_batch_floor = gpu_count_early
       * (int)std::max<size_t>(1, opt.gpu_streams)
-      * (int)std::max<size_t>(1, opt.gpu_batch_cap);
+      * (int)per_stream_budget;
   const int comp_parallelism = cpu_threads_est + comp_gpu_batch_floor;
   FrameThrottle throttle(compute_throttle_budget(
       std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism,
@@ -6510,7 +6543,17 @@ static void gpu_decomp_worker(
     // Kernel launch overhead dominates, so each stream needs large batches.
     // Compress divides across streams for VRAM management, but decompress
     // frames are small (compressed) so VRAM isn't the bottleneck.
-    size_t per_stream_cap = std::min(opt.gpu_batch_cap, HARD_BATCH_CAP);
+    //
+    // When --gpu-batch is NOT user-pinned, give the shared auto-tuner real
+    // room to grow by sizing buffers up to max(opt.gpu_batch_cap,
+    // AUTO_TUNE_BATCH_CEILING).  Decompress already auto-bumps gpu_batch_cap
+    // to 256 for files >75 GiB (parse_args), so this only changes behaviour
+    // for smaller files where the tuner was previously capped at 16/64.
+    // The VRAM-fit halve loop below shrinks this if the GPU can't hold it.
+    // Same fix as compress in v0.12.32 — see CHANGELOG.
+    size_t per_stream_cap = opt.gpu_batch_user_set
+        ? std::min(opt.gpu_batch_cap, HARD_BATCH_CAP)
+        : std::max(opt.gpu_batch_cap, AUTO_TUNE_BATCH_CEILING);
 
     // We need to allocate per-stream buffers.  Unlike compression, we need
     // to handle variable decompressed sizes.  We pre-allocate based on the
@@ -7288,10 +7331,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   // Frame throttle: scales with pipeline parallelism (see compress_nvcomp).
+  // Same auto-tune-aware sizing as compress: when --gpu-batch is not pinned,
+  // budget for the auto-tuner's potential growth so GPU pops don't starve
+  // on permits when CPUs hold them in hybrid mode.
   const int decomp_cpu_threads_est = (device_count > 0 && opt.gpu_only) ? 0 : resolve_cpu_threads(opt.cpu_threads);
+  const size_t decomp_per_stream_budget = opt.gpu_batch_user_set
+      ? std::max<size_t>(1, opt.gpu_batch_cap)
+      : std::max<size_t>(opt.gpu_batch_cap, AUTO_TUNE_BATCH_CEILING);
   const int decomp_gpu_batch_floor = device_count
       * (int)std::max<size_t>(1, opt.gpu_streams)
-      * (int)std::max<size_t>(1, opt.gpu_batch_cap);
+      * (int)decomp_per_stream_budget;
   const int decomp_parallelism = decomp_cpu_threads_est + decomp_gpu_batch_floor;
   FrameThrottle throttle(compute_throttle_budget(
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism,

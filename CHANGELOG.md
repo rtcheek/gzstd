@@ -1,9 +1,153 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.30  
+**Covers:** v0.9.50 → v0.12.34  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.34 — Test-count display in `gzstd-test.sh`
+
+The runner's progress bar showed `N of 192` while the actual run
+ended at 241 tests, finishing past 100% completion.  The `count_tests`
+function had a hand-maintained per-section breakdown that drifted as
+new sections were added.
+
+Replaced with a single `EXPECTED_TESTS=241` constant at the top of the
+file — bump it when you add/remove tests.  Two safety nets prevent
+display breakage if the constant is forgotten:
+
+- `progress_bar` clamps `pct` to 100 and auto-expands `TOTAL_TESTS` if
+  the running count exceeds the planned count, so the bar never shows
+  more than 100%.
+- A drift-check line at the end of the run prints
+  `note: EXPECTED_TESTS=N at top of script but M ran — please update.`
+  whenever the actual ran count diverges from the constant.
+
+Simpler than chasing a perfect static count or maintaining a cache file.
+
+---
+
+## v0.12.33 — Throttle starvation in hybrid mode (GPUs blocked on permits)
+
+**Symptom (Knuth, hybrid compress).** Per-batch GPU subchunk count grew
+fine after v0.12.32, but `nvtop` showed the H100s mostly idle.  CPUs
+were doing the bulk of the work while GPUs sat blocked.  `-vvv` reported
+`gpus_waiting=0`, which is technically correct (the wants/got window is
+microseconds long) but obscured the real cause.
+
+**Cause.** The frame-throttle budget in both `compress_nvcomp` and
+`decompress_nvcomp` was sized off `opt.gpu_batch_cap` (default 8):
+
+```cpp
+const int comp_gpu_batch_floor = gpu_count * gpu_streams * opt.gpu_batch_cap;
+const int comp_parallelism     = cpu_threads + comp_gpu_batch_floor;
+FrameThrottle throttle(compute_throttle_budget(..., comp_parallelism, ...));
+```
+
+After v0.12.32 the auto-tuner can grow per-stream batches up to
+`AUTO_TUNE_BATCH_CEILING` (256), but the throttle was sized for 8.  On
+Knuth (8 GPUs × 1 stream + 96 CPU workers), every CPU that had popped a
+frame was holding one permit (held until the writer drains it), so when
+a GPU stream tried to `bp->acquire(pop_n)` for, say, 64 permits, it
+blocked waiting for CPUs to drain.  Effectively the GPU pipeline was
+serialised through CPU writeout speed.
+
+**Fix.** Both `compress_nvcomp` (line 6125) and `decompress_nvcomp`
+(line 7333) now compute the throttle floor using the *effective* per-
+stream max:
+
+```cpp
+per_stream_budget = opt.gpu_batch_user_set
+    ? opt.gpu_batch_cap
+    : std::max(opt.gpu_batch_cap, AUTO_TUNE_BATCH_CEILING);
+gpu_batch_floor   = gpu_count * gpu_streams * per_stream_budget;
+```
+
+When `--gpu-batch=N` is set, the budget honours that value exactly (no
+auto-grow either, so no headroom needed).  Otherwise it provisions
+enough permits for the auto-tuner's full growth path.
+
+**Knuth example.** Before: floor = 8×1×8 = 64; throttle ≈ 640 frames
+total → 8 streams × 64 = 512 GPU permits + 96 CPUs ≈ over budget.
+After: floor = 8×1×256 = 2048; throttle ≈ 8192 frames (RAM-capped) →
+2048 GPU + 96 CPU = 2144, well under budget.
+
+---
+
+## v0.12.32 — Fix GPU batch frozen by allocation (auto-tuner had no headroom)
+
+**Symptom (Knuth, `--gpu-only` compress).** The per-batch GPU subchunk
+count was stuck at 8 across the entire run regardless of throughput.  The
+shared auto-tuner appeared to do nothing.  Hybrid compression had the same
+problem (same code path).  Decompression was partially affected for files
+under ~10 GiB.
+
+**Cause.** Two interacting pieces, present in both compress and decompress:
+1. The GPU init path allocates per-stream buffers based on
+   `per_stream_cap = std::min(opt.gpu_batch_cap, HARD_BATCH_CAP)` — for
+   compress that defaults to `min(8, 1024) = 8`; for decompress on small
+   files it's `min(16, 1024) = 16`.  A VRAM-fit search lowers this further
+   if needed but never raises it.
+2. The pop site clamps the per-batch size: `pop_n = std::min(pop_n,
+   C.per_stream_batch)`.  So even when `SharedTuneState::batch_size` grew
+   to 16, 32, etc., the actual pop was still 8 (compress) or 16
+   (small-file decompress) because the buffers were only big enough for
+   that many subchunks.
+
+The auto-tuner's growth path was therefore silently dead on those paths.
+Long-standing: the clamp was introduced in v0.10.34 alongside
+`SharedTuneState`.
+
+**Fix.** Both `compress_nvcomp` and `decompress_nvcomp` now size per-stream
+buffers up to `AUTO_TUNE_BATCH_CEILING` (256) when `--gpu-batch` is not
+user-pinned, giving the shared tuner real room to grow.  The VRAM-fit
+halve loop still shrinks this if the GPU can't hold it.
+
+**Compress.**  Pure win — buffer was previously capped at 8.
+
+**Decompress.**  Already-large files (>75 GiB → cap=256, >10 GiB →
+cap=64) are unchanged because `max(cap, 256) == cap` (or close to it).
+Small files (<10 GiB) now allocate up to 256 per stream instead of 16.
+
+**VRAM impact.**  Each subchunk needs `gpu_chunk + max_out_chunk +
+temp/N` in device memory.  With 16 MiB chunks that's ~33 MiB per slot
+plus nvCOMP scratch.  256 slots per stream is ~8.5 GiB plus scratch —
+fits comfortably in H100 VRAM under the default `--gpu-mem-frac=0.60`.
+On smaller GPUs the binary-search VRAM-fit loop already halves the
+allocation when needed.
+
+**User override.** Pass `--gpu-batch=N` to pin a specific size and skip
+auto-tuning; that path is unchanged on both compress and decompress.
+
+---
+
+## v0.12.31 — Fix `out:%` jumping to ~90% immediately on `--cpu-only` compress
+
+**Symptom (Knuth, 432 GiB tar via `--overwrite --cpu-only --direct`):**
+```
+in:12.8% 55.34 GiB 4.56 GiB/s | out:91.5% 14.95 GiB 1.23 GiB/s
+```
+The `out:%` jumped to ~90% almost immediately and stayed there for the
+duration of the run, while `in:%` ticked up normally.
+
+**Cause.** `compress_cpu_mt` set `meter.total_out_final = true` inside the
+producer-done block.  That flag was designed for decompression — where
+`total_out` is summed from `frame_header.decomp_size` during the pre-scan
+and IS a known final total.  For compress, `total_out` is a *running
+accumulator* incremented by the writer-collector at line 3016 as compressed
+batches arrive.  Setting `total_out_final = true` makes the progress code
+take the "decompress, reader done" branch
+(`wrote_bytes / total_out_so_far`), which is just the writer's catch-up
+ratio — typically 80–95%.
+
+The GPU compress path (`compress_nvcomp`) correctly leaves
+`total_out_final` unset.  Now `compress_cpu_mt` matches that.
+
+**Result.** With the flag unset, the percentage logic falls through to the
+frame-level branch (`tasks_done / total_frames`), giving a percentage that
+tracks `in:%` instead of jumping to 90% right away.
 
 ---
 

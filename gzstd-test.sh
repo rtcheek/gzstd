@@ -115,15 +115,25 @@ progress_bar() {
   local current=$1 total=$2
   [[ $total -eq 0 ]] && return
 
+  # If our count estimate was too low (cache was stale or first run),
+  # expand the displayed total so we never show > 100%.  The next run
+  # will pick up the corrected count from the cache.
+  if [[ $current -gt $total ]]; then
+    total=$current
+    TOTAL_TESTS=$current
+  fi
+
   local pct=$(( current * 100 / total ))
+  [[ $pct -gt 100 ]] && pct=100
   local filled=$(( current * BAR_WIDTH / total ))
+  [[ $filled -gt $BAR_WIDTH ]] && filled=$BAR_WIDTH
   local empty=$(( BAR_WIDTH - filled ))
   local elapsed_ms=$(( $(now_ms) - START_MS ))
   local elapsed_s=$(( elapsed_ms / 1000 ))
 
   # ETA calculation
   local eta_str=""
-  if [[ $current -gt 3 && $elapsed_ms -gt 0 ]]; then
+  if [[ $current -gt 3 && $elapsed_ms -gt 0 && $current -lt $total ]]; then
     local remaining=$(( total - current ))
     local ms_per_test=$(( elapsed_ms / current ))
     local eta_ms=$(( remaining * ms_per_test ))
@@ -330,50 +340,13 @@ human_size() {
 }
 
 # ============================================================
-# Count total tests (for progress bar)
+# Total tests in the suite — bump this when adding/removing tests.
+# Verify with the final run summary; the progress bar will also
+# auto-expand if you forget (so the display never shows > 100%),
+# but you should keep this in sync to get an accurate ETA.
 # ============================================================
-count_tests() {
-  local count=0
-  count=$((count + 4))   # 1: basic round-trip
-  count=$((count + 2))   # 2: edge cases
-  count=$((count + 7))   # 3: levels
-  count=$((count + 2))   # 4: integrity
-  count=$((count + 3))   # 5: pipes
-  count=$((count + 4))   # 6: tar
-  count=$((count + 4))   # 7: file mgmt
-  count=$((count + 2))   # 8: multi-file
-  count=$((count + 2))   # 9: sparse
-  count=$((count + 3))   # 10: threading
-  count=$((count + 3))   # 11: chunk sizes
-  count=$((count + 3))   # 12: verbosity
-  count=$((count + 1))   # 13: stats json
-  count=$((count + 5))   # 14: exit codes
-  count=$((count + 7))   # 15: help+version (expanded)
-  command -v zstd &>/dev/null && count=$((count + 3)) || count=$((count + 3))  # 16: zstd interop
-  count=$((count + 3))   # 17: tar advanced
-  has_gpu 2>/dev/null && count=$((count + 10)) || count=$((count + 5))  # 18: GPU
-  has_gpu 2>/dev/null && count=$((count + 4)) || count=$((count + 4))  # 19: VRAM pressure
-  count=$((count + 6))   # 19b: stream/batch exhaustion regression
-  count=$((count + 3))   # 20: stress
-  count=$((count + 3))   # 20: wildcards
-  count=$((count + 3))   # 21: -- end-of-options
-  count=$((count + 6))   # 22: -c, -o, --output
-  count=$((count + 7))   # 23: pipes with options
-  count=$((count + 8))   # 24: thread forms (expanded with -T=0, -T=4)
-  count=$((count + 4))   # 25: CPU scheduling
-  count=$((count + 1))   # 26: sync output
-  count=$((count + 4))   # 27: pinned memory
-  has_gpu 2>/dev/null && count=$((count + 9)) || count=$((count + 4))  # 28: GPU options
-  count=$((count + 8))   # 29: error handling
-  count=$((count + 2))   # 30: cross-level
-  count=$((count + 6))   # 31: arg order
-  has_gpu 2>/dev/null && count=$((count + 10)) || count=$((count + 10))  # 32: space-separated (4 base + 6 gpu or 6 skip)
-  has_gpu 2>/dev/null && count=$((count + 17)) || count=$((count + 15))  # 33: verbose validation
-  count=$((count + 6))   # 34: summary format
-  count=$((count + 8))   # 35: ultra validation (windowLog, T1, T4, chunk-warn, chunk-ok, prog×2, interop)
-  count=$((count + 9))   # 36: throttle tunables (+1 GPU deadlock regression)
-  echo $count
-}
+EXPECTED_TESTS=241
+count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
 # Banner & system info
@@ -2383,4 +2356,13 @@ rm -f "$TMPDIR/zc.bin" "$TMPDIR/zc.bin.zst" "$TMPDIR/zc.out"
 # ============================================================
 clear_progress
 print_summary
+
+# Drift check: if the actual ran count differs from EXPECTED_TESTS,
+# nudge the maintainer to bump the constant.
+TOTAL_RAN=$(( PASS + FAIL ))
+if [[ $TOTAL_RAN -ne $EXPECTED_TESTS ]]; then
+  printf "\n  ${C_DIM}note: EXPECTED_TESTS=%d at top of script but %d ran — please update.${C_RESET}\n" \
+    "$EXPECTED_TESTS" "$TOTAL_RAN"
+fi
+
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
