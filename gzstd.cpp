@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.34";
+static constexpr const char * GZSTD_VERSION = "0.12.36";
 //
 // Architecture overview:
 //
@@ -5611,6 +5611,20 @@ static void gpu_worker(
             vlog(V_DEBUG, opt, os.str() + "\n");
           }
 
+          // Per-chunk trace at -vvv (compress async-poll path).
+          if (opt.verbosity >= V_TRACE) {
+            for (size_t i = 0; i < C.filled; ++i) {
+              char cs[32], ds[32];
+              human_bytes(double(C.batch[i].len()), ds, sizeof(ds));
+              human_bytes(double(C.h_comp_sizes[i]), cs, sizeof(cs));
+              std::ostringstream os;
+              os << "[GPU" << device_id << "/S" << C.stats.stream_index
+                 << "] chunk seq=" << C.batch[i].seq
+                 << " in=" << ds << " out=" << cs;
+              vlog(V_TRACE, opt, os.str() + "\n");
+            }
+          }
+
           C.busy = false;
           C.filled = 0;
           C.batch.clear();
@@ -5736,6 +5750,20 @@ static void gpu_worker(
                << "ms tot=" << tot_ms
                << "ms thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
             vlog(V_DEBUG, opt, os.str() + "\n");
+          }
+
+          // Per-chunk trace at -vvv (compress sync-drain path).
+          if (opt.verbosity >= V_TRACE) {
+            for (size_t i = 0; i < C.filled; ++i) {
+              char cs[32], ds[32];
+              human_bytes(double(C.batch[i].len()), ds, sizeof(ds));
+              human_bytes(double(C.h_comp_sizes[i]), cs, sizeof(cs));
+              std::ostringstream os;
+              os << "[GPU" << device_id << "/S" << C.stats.stream_index
+                 << "] chunk seq=" << C.batch[i].seq
+                 << " in=" << ds << " out=" << cs;
+              vlog(V_TRACE, opt, os.str() + "\n");
+            }
           }
 
           C.busy = false;
@@ -7162,6 +7190,23 @@ static void gpu_decomp_worker(
           vlog(V_DEBUG, opt, os.str() + "\n");
         }
 
+        // Per-chunk trace at -vvv.  v0.12.32 grew batches up to 256, so
+        // the per-batch `[GPU/S] done batch=N` lines fire ~30x less often
+        // than before.  Emit a per-chunk line at V_TRACE so the volume of
+        // -vvv output actually matches the "trace" name.
+        if (opt.verbosity >= V_TRACE) {
+          for (size_t i = 0; i < C.filled; ++i) {
+            char cs[32], ds[32];
+            human_bytes(double(batch_comp_sizes[i]), cs, sizeof(cs));
+            human_bytes(double(C.batch[i].decomp_size), ds, sizeof(ds));
+            std::ostringstream os;
+            os << "[GPU" << device_id << "/S" << C.stream_index
+               << "] chunk seq=" << C.batch[i].seq
+               << " comp=" << cs << " decomp=" << ds;
+            vlog(V_TRACE, opt, os.str() + "\n");
+          }
+        }
+
         // Buffers are reused  no per-batch free needed
         C.busy = false;
         C.filled = 0;
@@ -7306,14 +7351,42 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
   RateMatchState rate_match;
 
+  // Early init banner for -v/-vv/-vvv users.  The actual GPU/CPU worker
+  // spawn happens after the pre-scan (so oversize detection can route the
+  // workload), but users running large files were stuck staring at
+  // [SPLIT] frame N lines for many seconds with no other output before
+  // workers came online.  Print what we know up front: device count,
+  // mode, parse-phase notice.
+  if (opt.verbosity >= V_VERBOSE) {
+    std::ostringstream os;
+    os << "[INIT] decompress: " << device_count << " GPU(s) detected, mode=";
+    if (opt.gpu_only)      os << "gpu-only";
+    else if (opt.cpu_only) os << "cpu-only";
+    else if (opt.hybrid)   os << "hybrid";
+    else                   os << "auto";
+    vlog(V_VERBOSE, opt, os.str() + "\n");
+    vlog(V_VERBOSE, opt,
+         "[INIT] pre-scanning input frames (workers spawn after pre-scan)\n");
+  }
+
   // ---- Pre-scan: stream frames into queue before starting workers ----
   // This lets us detect oversized frames (sliding-window / zstd -T0 single-frame
   // files) and skip GPU workers entirely, avoiding VRAM allocation failures.
   bool fallback = false;
   std::vector<char> raw_data;
   size_t max_frame_decomp = 0;
+  uint64_t prescan_t0 = now_ns();
   size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data,
                                            &max_frame_decomp);
+  if (opt.verbosity >= V_VERBOSE) {
+    double prescan_s = double(now_ns() - prescan_t0) / 1e9;
+    char ms_s[32]; human_bytes(double(max_frame_decomp), ms_s, sizeof(ms_s));
+    std::ostringstream os;
+    os << "[INIT] pre-scan complete: " << n_frames
+       << " frames, max_decomp=" << ms_s
+       << " (" << std::fixed << std::setprecision(2) << prescan_s << "s)";
+    vlog(V_VERBOSE, opt, os.str() + "\n");
+  }
 
   // Detect oversized frames that GPUs cannot handle.
   // nvCOMP decompresses into fixed 16 MiB slots — frames larger than that

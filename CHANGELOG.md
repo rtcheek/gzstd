@@ -1,9 +1,63 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.34  
+**Covers:** v0.9.50 → v0.12.36  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.36 — Visible init output during decompress pre-scan
+
+**Symptom (Knuth, large `-d` runs).** With a 432 GiB `.zst` file the user
+saw a long stretch of nothing but `[SPLIT] frame N` lines and asked
+"where's the init output?".  No `[GPU]` device-online lines, no
+`[GPU/S] pre-alloc batch=`, no throttle line — until the parse phase
+finished tens of seconds later.
+
+**Cause.** `decompress_nvcomp` does a full pre-scan of the input
+(`stream_frames_to_queue`) *before* spawning GPU workers.  The pre-scan
+is needed to detect oversized frames (sliding-window / `zstd -T0`) and
+fall back to CPU before allocating GPU buffers it can't fill.  But on
+large inputs the pre-scan is the bulk of wall time, and during it only
+the producer's `[SPLIT]` lines emit — the user-visible init lines
+(throttle config, `[GPU] N device(s) online`, `[GPU#/S#] pre-alloc`,
+etc.) all queue up behind the pre-scan.
+
+**Fix.** Added three `[INIT]` log lines that fire BEFORE the pre-scan:
+- `[INIT] decompress: N GPU(s) detected, mode=gpu-only|cpu-only|hybrid|auto`
+- `[INIT] pre-scanning input frames (workers spawn after pre-scan)`
+- (after pre-scan) `[INIT] pre-scan complete: N frames, max_decomp=X (Ts)`
+
+Visible at `-v`/`-vv`/`-vvv`.  This doesn't change the architectural
+ordering — workers still spawn after pre-scan — but the user now sees
+that gzstd is alive and what phase it's in.  A future change can move
+parsing into a thread that runs concurrently with worker spawn.
+
+---
+
+## v0.12.35 — Per-chunk `-vvv` output for GPU compress/decompress
+
+**Symptom (Knuth, `--gpu-only -d -vvv`).** The trace output looked
+sparse — mostly just the producer's `[SPLIT] frame N` lines every 1000
+frames, with little visible GPU activity.
+
+**Cause.** Side effect of v0.12.32: per-stream batches are now allowed
+to grow up to 256 chunks (vs the previous 8-cap).  The existing
+`[GPU#/S#] take batch=` and `[GPU#/S#] done batch=` lines fire once per
+batch — at V_DEBUG (`-vv`).  After v0.12.32 a 16k-frame run produces
+~63 batches instead of ~2000, so those lines show up ~30× less often.
+At `-vvv` the user expects flood-of-detail, not "less than `-vv` used
+to give."
+
+**Fix.** Added per-chunk emission at V_TRACE (`-vvv`) in three places:
+- GPU compress async-poll completion path
+- GPU compress sync-drain completion path
+- GPU decompress completion path
+
+Each chunk in a completed batch now prints
+`[GPU#/S#] chunk seq=N in=X out=Y` at -vvv.  V_DEBUG output is
+unchanged.
 
 ---
 
