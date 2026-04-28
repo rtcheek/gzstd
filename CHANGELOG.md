@@ -1,9 +1,40 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.40  
+**Covers:** v0.9.50 → v0.12.41  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.41 — `--overwrite`: unlink-then-create instead of truncate-on-fopen
+
+**Symptom (Knuth, 432 GiB output).**
+```
+time ./build/gzstd -d --cpu-only -T18 --direct --overwrite -v ...
+using O_DIRECT for output (--direct)
+```
+The `using O_DIRECT` line appeared 10–30 seconds after the command was
+launched.  No output at all during that window.
+
+**Cause.**  `--overwrite` opened the existing target with `fopen(path,
+"wb")`, which truncates the file in place.  On ext4, `truncate(0)` on
+a 432 GiB file has to free every extent the inode references — that's
+O(file_size), and ext4's journal makes the freeing synchronous before
+`fopen` returns.  All subsequent setup (the `using O_DIRECT` log,
+throttle config, worker spawn) sat behind that truncate.
+
+**Fix.**  `--overwrite` now `unlink()`s the existing target first, then
+`fopen("wb")` creates a fresh empty inode in O(1).  The original
+inode is unreferenced immediately; ext4 frees its extents in the
+background.  No user-visible blocking.
+
+Verified locally on a 4 GiB stand-in: time-to-first-output went from
+visible delay to ~0.2 s end-to-end including round-trip.
+
+`--sync-output` semantics are unchanged.  `-f` (atomic, with rename)
+already wrote to a fresh `.gzstd.tmp` file and didn't have this
+problem.
 
 ---
 

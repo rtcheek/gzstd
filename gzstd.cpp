@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.40";
+static constexpr const char * GZSTD_VERSION = "0.12.41";
 //
 // Architecture overview:
 //
@@ -7790,9 +7790,18 @@ int main(int argc, char ** argv)
         use_atomic = true;
         register_tmp_file(tmp);
       } else {
-        // --overwrite: truncate target in place.  On ext4 with journaling,
-        // this avoids the rename step that would otherwise force a synchronous
-        // flush of all dirty pages at commit time.
+        // --overwrite: replace target in place.  On ext4 fopen("wb") has to
+        // truncate the existing file, which means freeing every extent the
+        // inode references — O(file_size) for huge files (10-30+s on 400+ GiB
+        // outputs).  Unlink first instead: the inode is unreferenced
+        // immediately and the extents free in the background.  fopen then
+        // creates a fresh empty file in O(1).
+        if (is_regular) {
+          std::error_code ec_unlink;
+          fs::remove(opt.output, ec_unlink);
+          // If unlink failed (permissions, race), fall through to fopen "wb"
+          // which will return its own error.
+        }
         out = std::fopen(opt.output.c_str(), "wb");
         if (!out) die_io("cannot open output: " + opt.output);
         std::setvbuf(out, nullptr, _IOFBF, 1 * 1024 * 1024);
