@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.36";
+static constexpr const char * GZSTD_VERSION = "0.12.40";
 //
 // Architecture overview:
 //
@@ -2932,7 +2932,14 @@ static void writer_thread(FILE * out, ResultStore & results,
       enable_sparse = (g_direct_writer != nullptr)   // O_DIRECT file
                    || (out && out != stdout);          // regular file via fwrite
     }
-    bool psync = (opt.mode == Mode::DECOMPRESS);
+    // Progressive writeback (sync_file_range) is enabled for decompression to
+    // avoid the multi-second rename stall on ext4 data=ordered when the
+    // tmp file's dirty pages must flush at commit time.  Skip it for
+    // --overwrite (no tmp+rename) — the user explicitly opted out of
+    // atomicity for speed, and the writeback hint just steals bandwidth
+    // from fwrite.  Also skip for stdout (no rename).
+    bool psync = (opt.mode == Mode::DECOMPRESS) && !opt.unsafe_overwrite
+                 && (out != stdout);
 #ifndef _WIN32
     aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse, m, bp, psync);
     aio = aio_ptr.get();
@@ -3896,6 +3903,17 @@ static void cpu_decomp_worker(
 
     // Permit already acquired above (before pop).
 
+    // Per-task take line (mirrors cpu_worker for compress).  Fires at -vv.
+    if (opt->verbosity >= V_DEBUG) {
+      char in_s[32], ds_s[32];
+      human_bytes(double(t.len()), in_s, sizeof(in_s));
+      human_bytes(double(t.decomp_size), ds_s, sizeof(ds_s));
+      std::ostringstream os;
+      os << "[CPU/T" << worker_id << "] take seq=" << t.seq
+         << " comp=" << in_s << " decomp=" << ds_s;
+      vlog(V_DEBUG, *opt, os.str() + "\n");
+    }
+
     const auto t0_w = std::chrono::steady_clock::now();
     const size_t comp_size = t.len();
     size_t actual;
@@ -4000,6 +4018,36 @@ static void cpu_decomp_worker(
       st.in_bytes += comp_size;
       st.out_bytes += actual;
       st.comp_ms  += ms;
+    }
+  }
+
+  // Per-thread total summary (mirrors cpu_worker for compress).
+  // -vv: workers that did real work; -vvv: also report idle workers.
+  if (opt->verbosity >= V_DEBUG) {
+    CpuThreadStats st;
+    {
+      std::lock_guard<std::mutex> lk(cpuagg->m);
+      if ((size_t)worker_id < cpuagg->per_thread.size())
+        st = cpuagg->per_thread[(size_t)worker_id];
+    }
+    if (st.tasks == 0) {
+      if (opt->verbosity >= V_TRACE) {
+        std::ostringstream os;
+        os << "[CPU/T" << worker_id << "] idle (0 tasks)";
+        vlog(V_TRACE, *opt, os.str() + "\n");
+      }
+    } else {
+      double thr_gib = (st.comp_ms > 0.0)
+                       ? double(st.out_bytes) / (st.comp_ms / 1000.0) / 1e9 : 0.0;
+      char in_s[32], out_s[32];
+      human_bytes(double(st.in_bytes),  in_s,  sizeof(in_s));
+      human_bytes(double(st.out_bytes), out_s, sizeof(out_s));
+      std::ostringstream os;
+      os << "[CPU/T" << worker_id << "] total tasks=" << st.tasks
+         << " comp=" << in_s << " decomp=" << out_s
+         << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
+         << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
+      vlog(V_DEBUG, *opt, os.str() + "\n");
     }
   }
 }
@@ -5418,7 +5466,14 @@ static void gpu_worker(
         if (bp) bp->acquire((int)pop_n);
         // Signal scheduler: GPU stream wants data (blocks CPU workers)
         if (sched) sched->gpu_wants_data();
-        if (!queue->pop_batch_greedy(pop_n, C.batch, 1)) {
+        // Pop-batch minimum: when the user pinned --gpu-batch (locked), wait
+        // for the full batch — they asked for it.  When auto-tuning, take
+        // whatever the queue can give (min_n=1) so multiple GPUs don't
+        // serialize behind a single producer.  pop_batch_greedy still returns
+        // early at end-of-queue regardless (no deadlock).
+        const bool locked_batch = shared_tune && shared_tune->locked.load();
+        const size_t comp_min_batch = locked_batch ? pop_n : 1;
+        if (!queue->pop_batch_greedy(pop_n, C.batch, comp_min_batch)) {
           if (sched) sched->gpu_got_data();
           if (bp) bp->release((int)pop_n);  // release unused permits
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
@@ -6873,12 +6928,22 @@ static void gpu_decomp_worker(
         if (sched) sched->set_gpu_batch_size(pop_n);
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
-        // Soft minimum: don't block for the full batch (serializes 8 GPUs
-        // behind the reader), but don't go as low as 1 either (tiny batches
-        // waste H2D/D2H overhead and poison the auto-tuner's throughput
-        // measurement).  4 frames (64 MiB) is enough to amortize kernel
-        // launch overhead while keeping GPUs responsive.
-        const size_t decomp_min_batch = std::min<size_t>(pop_n, 4);
+        // Pop-batch minimum:
+        //   - When the user pinned --gpu-batch (shared_tune->locked), honour
+        //     it: wait for the full batch.  The pop still returns early at
+        //     end-of-queue (pop_batch_greedy detects `done_` and takes
+        //     whatever remains), so there's no deadlock — but during steady
+        //     state, the GPU sees the batch size it asked for instead of
+        //     getting tiny batches that defeat the user's intent.
+        //   - When auto-tuning (unlocked), use a soft minimum of 4 frames.
+        //     Don't block for the full batch (serializes multiple GPUs
+        //     behind the reader); don't go as low as 1 either (tiny
+        //     batches waste H2D/D2H overhead and poison the auto-tuner's
+        //     throughput measurement).
+        const bool locked_batch = shared_tune && shared_tune->locked.load();
+        const size_t decomp_min_batch = locked_batch
+            ? pop_n
+            : std::min<size_t>(pop_n, 4);
         // Acquire frame permits BEFORE gpu_wants_data to avoid deadlock.
         if (bp) bp->acquire((int)pop_n);
         // Signal scheduler: this GPU stream wants data (blocks CPU workers)
@@ -7301,6 +7366,30 @@ static void gpu_decomp_worker(
   }
 }
 
+// Peek at the first frame's decompressed size without consuming input.
+// Used by decompress_nvcomp to detect single-frame "oversize" files
+// (zstd -T0, --sliding-window) BEFORE spawning workers — so the GPU
+// path can be skipped without blocking on a full pre-scan.
+//
+// Returns the decomp size in bytes, or -1 if it can't be determined
+// (stdin, seek failure, unknown content size, etc.).  Restores the
+// input file position on every path so the subsequent producer can
+// re-read from the start.
+static int64_t peek_first_frame_decomp_size(FILE * in)
+{
+  if (!in) return -1;
+  long pos = std::ftell(in);
+  if (pos < 0) return -1;  // not seekable (pipe / stdin)
+  unsigned char buf[64];
+  size_t n = std::fread(buf, 1, sizeof(buf), in);
+  if (std::fseek(in, pos, SEEK_SET) != 0) return -1;
+  if (n < 4) return -1;
+  unsigned long long size = ZSTD_getFrameContentSize(buf, n);
+  if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR)
+    return -1;
+  return (int64_t)size;
+}
+
 /*======================================================================
  GPU/Hybrid decompression entry point
  -----------------------------------------------------------------------
@@ -7351,56 +7440,39 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
   RateMatchState rate_match;
 
-  // Early init banner for -v/-vv/-vvv users.  The actual GPU/CPU worker
-  // spawn happens after the pre-scan (so oversize detection can route the
-  // workload), but users running large files were stuck staring at
-  // [SPLIT] frame N lines for many seconds with no other output before
-  // workers came online.  Print what we know up front: device count,
-  // mode, parse-phase notice.
-  if (opt.verbosity >= V_VERBOSE) {
-    std::ostringstream os;
-    os << "[INIT] decompress: " << device_count << " GPU(s) detected, mode=";
-    if (opt.gpu_only)      os << "gpu-only";
-    else if (opt.cpu_only) os << "cpu-only";
-    else if (opt.hybrid)   os << "hybrid";
-    else                   os << "auto";
-    vlog(V_VERBOSE, opt, os.str() + "\n");
-    vlog(V_VERBOSE, opt,
-         "[INIT] pre-scanning input frames (workers spawn after pre-scan)\n");
-  }
-
-  // ---- Pre-scan: stream frames into queue before starting workers ----
-  // This lets us detect oversized frames (sliding-window / zstd -T0 single-frame
-  // files) and skip GPU workers entirely, avoiding VRAM allocation failures.
+  // ---- Oversize first-frame peek (replaces the v0.12.22-v0.12.36 full
+  // pre-scan that ran BEFORE worker spawn).  The pre-scan blocked worker
+  // init for tens of seconds on large inputs, so users at -v/-vv/-vvv
+  // saw nothing but [SPLIT] frame N lines until parsing finished.  We
+  // restore the v0.12.21 "spawn workers first, parse concurrently"
+  // architecture by checking only the first frame's decompressed size
+  // up front — sufficient to detect zstd -T0 / --sliding-window
+  // single-frame files (where frame 0 IS the whole file) without
+  // touching the rest of the input.
   bool fallback = false;
-  std::vector<char> raw_data;
-  size_t max_frame_decomp = 0;
-  uint64_t prescan_t0 = now_ns();
-  size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data,
-                                           &max_frame_decomp);
-  if (opt.verbosity >= V_VERBOSE) {
-    double prescan_s = double(now_ns() - prescan_t0) / 1e9;
-    char ms_s[32]; human_bytes(double(max_frame_decomp), ms_s, sizeof(ms_s));
-    std::ostringstream os;
-    os << "[INIT] pre-scan complete: " << n_frames
-       << " frames, max_decomp=" << ms_s
-       << " (" << std::fixed << std::setprecision(2) << prescan_s << "s)";
-    vlog(V_VERBOSE, opt, os.str() + "\n");
-  }
-
-  // Detect oversized frames that GPUs cannot handle.
-  // nvCOMP decompresses into fixed 16 MiB slots — frames larger than that
-  // would require enormous VRAM allocations and will fail.
-  if (max_frame_decomp > GPU_SUBCHUNK_MAX && device_count > 0) {
-    char sz[32]; human_bytes(double(max_frame_decomp), sz, sizeof(sz));
+  std::vector<char> raw_data;  // populated by stream_frames_to_queue if it falls back
+  int64_t first_frame_decomp = peek_first_frame_decomp_size(in);
+  if (first_frame_decomp > (int64_t)GPU_SUBCHUNK_MAX && device_count > 0) {
+    char sz[32]; human_bytes(double(first_frame_decomp), sz, sizeof(sz));
     vlog(V_NORMAL, opt,
-         std::string("warning: input contains frames up to ") + sz
-         + " decompressed (GPU max: 16 MiB).\n"
+         std::string("warning: first frame decompresses to ") + sz
+         + " (GPU max: 16 MiB).\n"
          "  This file was likely compressed with --sliding-window or zstd -T0.\n"
          "  Falling back to CPU-only decompression.\n");
     if (opt.gpu_only)
       vlog(V_NORMAL, opt, "  (--gpu-only ignored for this file)\n");
     device_count = 0;
+  }
+
+  // Early init banner for -v/-vv/-vvv users.
+  if (opt.verbosity >= V_VERBOSE) {
+    std::ostringstream os;
+    os << "[INIT] decompress: " << device_count << " GPU(s) active, mode=";
+    if (opt.gpu_only)      os << "gpu-only";
+    else if (opt.cpu_only) os << "cpu-only";
+    else if (opt.hybrid)   os << "hybrid";
+    else                   os << "auto";
+    vlog(V_VERBOSE, opt, os.str() + "\n");
   }
 
   // Frame throttle: scales with pipeline parallelism (see compress_nvcomp).
@@ -7492,6 +7564,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
   }
+
+  // ---- Producer: stream frames into the queue while workers consume ----
+  // v0.12.21 architecture: workers are already spawned and waiting on the
+  // empty queue; they start decompressing as soon as the first frame is
+  // pushed.  This removes the long "init lines invisible until pre-scan
+  // finishes" delay that v0.12.22-v0.12.36 introduced.  Oversize detection
+  // is handled up front by peek_first_frame_decomp_size.
+  size_t max_frame_decomp = 0;
+  size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback,
+                                           &raw_data, &max_frame_decomp);
 
   // Preallocate output file to avoid per-write extent allocation overhead.
 #ifndef _WIN32

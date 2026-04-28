@@ -1,9 +1,156 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.36  
+**Covers:** v0.9.50 → v0.12.40  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.40 — Parameter-honor verification tests + `--overwrite` no progressive sync
+
+### Tests
+
+The existing test suite did round-trip checks for `--gpu-batch=N` etc.
+("compress with the flag, decompress with the flag, output matches"),
+but never verified the flag was actually applied at runtime.  The
+v0.12.39 `--gpu-batch` regression slipped through because the tests
+couldn't see that batches were popped at size 4 instead of N.
+
+New `Parameter honor verification` section (+20 tests, 261 total) parses
+verbose output to check runtime behaviour matches CLI input:
+
+- **`--gpu-batch=N` honored at -vv**: parses every `[GPU/S] take batch=N`
+  line, asserts all non-final batches equal N exactly.
+- **`--gpu-streams=N` honored**: counts unique `[GPU#/S0..N-1]` indices
+  in `pre-alloc` lines.
+- **`--chunk-size=N` produces `ceil(file_size / N MiB)` frames**: counts
+  `[CPU/T#] take seq=` lines emitted at -vv.
+- **`-T N` spawns N workers**: greps for the worker-online line at -v
+  (or single-thread streaming path for `-T 1`).
+- **Verbosity escalates correctly**: `-v` has no `[CPU/T#] take seq=`
+  (V_DEBUG content); `-vv` does, but no `[SPLIT]` (V_TRACE content);
+  `-vvv` includes `[SPLIT]`.  Unique-line count strictly increases with
+  verbosity level.
+- **`-M N` round-trip**: re-verifies the v0.12.30 fix end-to-end.
+- **`--throttle-frames=N` visible at -v**: greps for `source=user` or
+  the explicit count.
+- **`--no-sparse` vs default sparse**: compares `stat -c '%b'` block
+  count on an all-zeros decompressed file.
+- **`--ultra` is required for level 20+** and `--ultra -20` produces
+  valid output.
+
+### `--overwrite` skip progressive writeback
+
+In v0.12.25 we enabled `sync_file_range(SYNC_FILE_RANGE_WRITE)` for all
+decompress runs to fix the multi-second rename stall on ext4
+`data=ordered`.  But `--overwrite` skips the tmp+rename dance entirely —
+the rename stall doesn't apply, and the writeback hint just steals
+bandwidth from `fwrite`.  Now disabled when `unsafe_overwrite` is set.
+
+`--sync-output` is still opt-in (default off): the only thing that
+forces an explicit `fsync()` on the output is `--sync-output`.  Plain
+`fclose()` flushes user buffers to the kernel; the OS handles writeback
+on its own schedule.
+
+---
+
+## v0.12.39 — Honour `--gpu-batch=N` exactly (full batches, not soft-min)
+
+**Symptom (Lovelace).**  `gzstd -d --gpu-only --gpu-batch=64 -vv` showed
+`pre-alloc batch=64` (buffers correct) but actual pops were small:
+```
+[GPU0/S0] take batch=4 seq=[0..3] in=22.05 KiB
+[GPU0/S0] take batch=8 seq=[8..15] in=128.00 MiB
+[GPU1/S0] take batch=7 seq=[16..22] in=112.00 MiB
+```
+
+**Cause.**  Both `compress_nvcomp` and `decompress_nvcomp` pop with a
+hardcoded soft minimum:
+- decompress: `pop_batch_greedy(pop_n, ..., min_n=min(pop_n, 4))`
+- compress:   `pop_batch_greedy(pop_n, ..., min_n=1)`
+
+So when the queue had only 4 frames available, the GPU returned with 4
+even though the user pinned `--gpu-batch=64`.  The soft minimum is
+sensible during auto-tuning (multi-GPU shouldn't serialize behind a
+single producer) but contradicts the user's explicit pin.
+
+**Fix.**  When `shared_tune->locked` is set (user pinned
+`--gpu-batch`), `min_n = pop_n` — wait for the full batch.  When
+unlocked (auto-tuner active), the previous soft minimums apply.
+`pop_batch_greedy` still returns early at end-of-queue regardless, so
+no deadlock — but during steady-state operation the GPU now sees the
+batch size the user asked for.
+
+Applied to both compress (gzstd.cpp:5462) and decompress
+(gzstd.cpp:6927).
+
+---
+
+## v0.12.38 — Restore concurrent worker spawn / parser (v0.12.21 architecture)
+
+**Regression introduced in v0.12.22.**  When `--sliding-window` shipped
+in v0.12.22, `decompress_nvcomp` was restructured to call
+`stream_frames_to_queue` BEFORE spawning workers — so the producer's
+`max_frame_decomp` could be checked against `GPU_SUBCHUNK_MAX` to
+short-circuit GPU init for oversized single-frame files.
+
+**Side effect.**  On large inputs the parse phase blocks for tens of
+seconds.  All worker init (`throttle: …`, `[GPU] N device(s) online`,
+`[GPU#/S#] pre-alloc batch=`, `hybrid decompress: N CPU threads`,
+`hybrid: tick …`) was silent during that window — users saw nothing
+but the producer's `[SPLIT] frame N` lines until parsing finished.
+
+v0.12.21 had it the right way around: workers spawn first, parser runs
+afterwards while workers are already consuming.  Init lines appeared
+immediately at -v/-vv/-vvv.
+
+**Fix.** Restored the v0.12.21 ordering in `decompress_nvcomp`:
+1. Detect GPU device count (existing).
+2. **NEW:** `peek_first_frame_decomp_size(in)` — read just the frame
+   header bytes, get frame 0's decomp size, then `fseek` back to 0.
+   If size > 16 MiB (single-frame oversize), set `device_count=0` and
+   fall back to CPU.  Cheap because it touches only ~64 bytes.
+3. Set up throttle, writer thread, hybrid scheduler.
+4. Spawn CPU pool and GPU workers (init lines fire here).
+5. Run `stream_frames_to_queue` (workers consume concurrently as the
+   parser pushes).
+
+The peek-only check covers the typical "oversize" case (zstd -T0 /
+--sliding-window single-frame files where frame 0 IS the whole file).
+For pathological multi-frame files where only a non-first frame is
+oversize, the GPU runtime fallback path handles it as before.
+
+User-visible result: at `-vvv` the throttle config, GPU device list,
+`[GPU] N device(s) online`, and per-stream `[GPU#/S#] pre-alloc`
+output all appear immediately when the command is run, instead of
+after a 30-second delay on a 432 GiB input.
+
+---
+
+## v0.12.37 — CPU decompress worker verbose output parity with compress
+
+**Symptom.** Compression's `cpu_worker` emits per-task and per-thread
+verbose output:
+- `[CPU/T#] take seq=N in=X` before each frame (`-vv`)
+- `[CPU/T#] seq=N in=X out=Y ms=… thr=…` after each frame (`-vv`)
+- `[CPU/T#] total tasks=… in=… out=… time=…ms thr=…` per-thread summary (`-vv`)
+- `[CPU/T#] idle (0 tasks)` for unused workers (`-vvv`)
+
+Decompression's `cpu_decomp_worker` only emitted the post-frame
+`seq=…` line.  No "take" line, no per-thread summary, no idle reporting
+— so `--cpu-only -d -vv` and `--hybrid -d -vv` looked drastically more
+sparse than the equivalent compress runs.
+
+**Fix.** Added the missing logs to `cpu_decomp_worker` so output now
+matches the compress pattern:
+- Per-task `[CPU/T#] take seq=N comp=X decomp=Y` before processing (V_DEBUG)
+- Per-thread `[CPU/T#] total tasks=… comp=… decomp=… time=…ms thr=…`
+  summary at exit (V_DEBUG)
+- `[CPU/T#] idle (0 tasks)` for unused workers (V_TRACE)
+
+Trace-mode users now see the same level of detail on the decompress
+side that they've always had on compress.
 
 ---
 

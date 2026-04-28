@@ -345,7 +345,7 @@ human_size() {
 # auto-expand if you forget (so the display never shows > 100%),
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
-EXPECTED_TESTS=241
+EXPECTED_TESTS=261
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2350,6 +2350,214 @@ else
 fi
 
 rm -f "$TMPDIR/zc.bin" "$TMPDIR/zc.bin.zst" "$TMPDIR/zc.out"
+
+# ============================================================
+section "Parameter honor verification"
+# ----------------------------------------------------------------
+# Round-trip tests confirm flags don't BREAK things, but they don't
+# confirm flags are actually APPLIED at runtime.  These tests parse
+# verbose output to verify the runtime behaviour matches the user's
+# CLI input.  Added after a regression where --gpu-batch=N was
+# accepted but the GPU popped batches of 4-8 anyway (v0.12.39 fix).
+# ============================================================
+
+# Compressible-but-non-trivial input — needs enough frames to exercise
+# multi-batch behaviour but not so much that tests are slow.
+PHV="$TMPDIR/phv.bin"
+PHV_ZST="$TMPDIR/phv.bin.zst"
+PHV_OUT="$TMPDIR/phv.out"
+dd if=/dev/urandom bs=1M count=64 2>/dev/null > "$PHV"
+"$GZSTD" -k -f --cpu-only --chunk-size=4 "$PHV" -o "$PHV_ZST" 2>/dev/null
+
+# --- --gpu-batch=N actually produces batches of N at -vv ---
+if has_gpu 2>/dev/null; then
+  for batch in 4 8 16; do
+    out=$("$GZSTD" -d --gpu-only --gpu-batch=$batch --overwrite -vv \
+      "$PHV_ZST" -o "$PHV_OUT" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+    # First "take batch=N" line during steady state — should equal $batch
+    # (or be the final partial batch at end-of-queue).  Check ALL take lines:
+    # all but possibly the last must be exactly $batch.
+    actual_batches=$(echo "$out" | grep -oE "take batch=[0-9]+" | grep -oE "[0-9]+")
+    if [[ -z "$actual_batches" ]]; then
+      fail "--gpu-batch=$batch honored at -vv" "no 'take batch=' lines in output"
+    else
+      # All-but-last should equal $batch
+      n=$(echo "$actual_batches" | wc -l)
+      if [[ $n -le 1 ]]; then
+        # Only one batch (small file) — the single batch must be ≤ $batch
+        last=$(echo "$actual_batches" | head -1)
+        if [[ $last -le $batch ]]; then
+          pass "--gpu-batch=$batch honored at -vv" "(single batch=$last)"
+        else
+          fail "--gpu-batch=$batch honored" "single batch=$last > $batch"
+        fi
+      else
+        # Multiple batches — non-final should all be exactly $batch
+        non_final=$(echo "$actual_batches" | head -n -1 | sort -u)
+        if [[ "$non_final" == "$batch" ]]; then
+          pass "--gpu-batch=$batch honored at -vv" "(N=$n batches, all=$batch except possibly last)"
+        else
+          fail "--gpu-batch=$batch honored at -vv" "expected all=$batch, got: $non_final"
+        fi
+      fi
+    fi
+  done
+
+  # --- --gpu-streams=N spawns N CUDA streams per device ---
+  for streams in 1 2; do
+    out=$("$GZSTD" -d --gpu-only --gpu-batch=4 --gpu-streams=$streams --overwrite -vv \
+      "$PHV_ZST" -o "$PHV_OUT" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+    # Expect [GPU0/S0] up to [GPU0/S(streams-1)] in pre-alloc lines.
+    max_s=$(echo "$out" | grep -oE "\[GPU[0-9]+/S[0-9]+\] pre-alloc" \
+            | grep -oE "S[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1)
+    if [[ -z "$max_s" ]]; then
+      fail "--gpu-streams=$streams honored" "no pre-alloc lines"
+    elif [[ $max_s -eq $((streams - 1)) ]]; then
+      pass "--gpu-streams=$streams honored" "(streams 0..$max_s allocated)"
+    else
+      fail "--gpu-streams=$streams honored" "max stream index=$max_s, expected $((streams - 1))"
+    fi
+  done
+else
+  skip "--gpu-batch=N honored at -vv" "no GPU"
+  skip "--gpu-streams=N honored" "no GPU"
+fi
+
+# --- --chunk-size=N produces ceil(file_size / N MiB) frames on compress ---
+for chunk in 2 8; do
+  src_mib=64
+  expected_frames=$((src_mib / chunk))
+  cz="$TMPDIR/cz-${chunk}.zst"
+  out=$("$GZSTD" -k -f --cpu-only --chunk-size=$chunk -vv "$PHV" -o "$cz" 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g')
+  actual_frames=$(echo "$out" | grep -cE "\[CPU/T[0-9]+\] take seq=")
+  if [[ "$actual_frames" == "$expected_frames" ]]; then
+    pass "--chunk-size=$chunk produces $expected_frames frames"
+  else
+    fail "--chunk-size=$chunk frames" "expected $expected_frames take lines, got $actual_frames"
+  fi
+  rm -f "$cz"
+done
+
+# --- -T N spawns N CPU compression workers ---
+for threads in 1 2 4; do
+  out=$("$GZSTD" -k -f --cpu-only -T $threads -v "$PHV" -o "$TMPDIR/threadt.zst" 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g')
+  # Look for "[CPU] N worker threads online" or single-thread streaming notice
+  if [[ $threads -eq 1 ]]; then
+    if echo "$out" | grep -qE "single-thread"; then
+      pass "-T 1 uses single-thread streaming path"
+    else
+      fail "-T 1 uses single-thread path" "no single-thread notice"
+    fi
+  else
+    if echo "$out" | grep -qE "\[CPU\][[:space:]]+$threads[[:space:]]+worker"; then
+      pass "-T $threads spawns $threads workers"
+    else
+      fail "-T $threads spawns $threads workers" "no '[CPU] $threads worker' line"
+    fi
+  fi
+done
+rm -f "$TMPDIR/threadt.zst"
+
+# --- Verbosity-level outputs ---
+# -v: completion summary, info-level lines.  Must NOT contain V_DEBUG-only output.
+out_v=$("$GZSTD" -d --cpu-only --overwrite -v "$PHV_ZST" -o "$PHV_OUT" 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g')
+out_vv=$("$GZSTD" -d --cpu-only --overwrite -vv "$PHV_ZST" -o "$PHV_OUT" 2>&1 \
+         | sed 's/\x1b\[[0-9;]*m//g')
+out_vvv=$("$GZSTD" -d --cpu-only --overwrite -vvv "$PHV_ZST" -o "$PHV_OUT" 2>&1 \
+          | sed 's/\x1b\[[0-9;]*m//g')
+
+# -v should NOT have per-task "[CPU/T#] take seq=" (V_DEBUG content)
+if echo "$out_v" | grep -qE "\[CPU/T[0-9]+\] take seq="; then
+  fail "-v omits V_DEBUG content" "found [CPU/T#] take seq= line at -v"
+else
+  pass "-v omits V_DEBUG content"
+fi
+# -vv SHOULD have per-task "take seq=" lines
+if echo "$out_vv" | grep -qE "\[CPU/T[0-9]+\] take seq="; then
+  pass "-vv shows per-task take lines"
+else
+  fail "-vv shows per-task take lines" "no take seq= line at -vv"
+fi
+# -vv should NOT have V_TRACE-only "[SPLIT] frame" lines
+if echo "$out_vv" | grep -qE "\[SPLIT\] frame"; then
+  fail "-vv omits V_TRACE content" "found [SPLIT] line at -vv"
+else
+  pass "-vv omits V_TRACE content"
+fi
+# -vvv SHOULD have [SPLIT] frame lines
+if echo "$out_vvv" | grep -qE "\[SPLIT\] frame"; then
+  pass "-vvv shows V_TRACE [SPLIT] lines"
+else
+  fail "-vvv shows V_TRACE [SPLIT] lines" "no [SPLIT] line at -vvv"
+fi
+
+# Verbosity escalates: -vvv has more unique lines than -vv has more than -v
+n_v=$(echo "$out_v"   | sort -u | wc -l)
+n_vv=$(echo "$out_vv"  | sort -u | wc -l)
+n_vvv=$(echo "$out_vvv" | sort -u | wc -l)
+if [[ $n_vvv -gt $n_vv && $n_vv -gt $n_v ]]; then
+  pass "verbosity escalates (-v=$n_v < -vv=$n_vv < -vvv=$n_vvv unique lines)"
+else
+  fail "verbosity escalates" "-v=$n_v -vv=$n_vv -vvv=$n_vvv"
+fi
+
+# --- --memlimit applied (re-verifies the v0.12.30 fix) ---
+# Already tested in the zstd-compat section, but assert it appears in -v output too.
+out=$("$GZSTD" -d --cpu-only --overwrite -M 1024 -v "$PHV_ZST" -o "$PHV_OUT" 2>&1 \
+      | sed 's/\x1b\[[0-9;]*m//g')
+# -M 1024 with default 16 MiB chunks → ram cap kicks in at 1024/16=64 frames.
+# Just sanity that decompress completes successfully.
+if cmp -s "$PHV" "$PHV_OUT"; then
+  pass "-M 1024 round-trip"
+else
+  fail "-M 1024 round-trip" "output mismatch"
+fi
+
+# --- --throttle-frames=N visible at -v ---
+out=$("$GZSTD" -k -f --cpu-only --throttle-frames=64 -v "$PHV" -o "$TMPDIR/thr.zst" 2>&1 \
+      | sed 's/\x1b\[[0-9;]*m//g')
+if echo "$out" | grep -qE "throttle:.* 64 frames|source=user"; then
+  pass "--throttle-frames=64 visible at -v"
+else
+  fail "--throttle-frames=64 visible" "no source=user or 64 frames"
+fi
+rm -f "$TMPDIR/thr.zst"
+
+# --- --no-sparse vs default sparse on file with zeros ---
+dd if=/dev/zero bs=1M count=4 2>/dev/null > "$TMPDIR/sparse.bin"
+"$GZSTD" -k -f --cpu-only "$TMPDIR/sparse.bin" -o "$TMPDIR/sparse.zst" 2>/dev/null
+"$GZSTD" -d -f --cpu-only "$TMPDIR/sparse.zst" -o "$TMPDIR/sparse-default.bin" 2>/dev/null
+"$GZSTD" -d -f --cpu-only --no-sparse "$TMPDIR/sparse.zst" -o "$TMPDIR/sparse-no.bin" 2>/dev/null
+default_blocks=$(stat -c '%b' "$TMPDIR/sparse-default.bin" 2>/dev/null || echo 0)
+nosparse_blocks=$(stat -c '%b' "$TMPDIR/sparse-no.bin" 2>/dev/null || echo 0)
+# Sparse should use fewer blocks than non-sparse for an all-zeros file.
+if [[ $default_blocks -lt $nosparse_blocks ]]; then
+  pass "--[no-]sparse changes block usage" "(sparse=$default_blocks < dense=$nosparse_blocks)"
+else
+  fail "--[no-]sparse changes block usage" "sparse=$default_blocks dense=$nosparse_blocks"
+fi
+rm -f "$TMPDIR/sparse.bin" "$TMPDIR/sparse.zst" "$TMPDIR/sparse-default.bin" "$TMPDIR/sparse-no.bin"
+
+# --- --ultra is required for level 20+ ---
+out=$("$GZSTD" -k -f --cpu-only -20 "$PHV" -o "$TMPDIR/ultra.zst" 2>&1)
+if echo "$out" | grep -qiE "ultra"; then
+  pass "level -20 without --ultra rejects/warns"
+else
+  fail "level -20 without --ultra" "no ultra warning"
+fi
+# With --ultra, level 20 should compress fine.
+out=$("$GZSTD" -k -f --cpu-only --ultra -20 "$PHV" -o "$TMPDIR/ultra.zst" 2>&1)
+if [[ -s "$TMPDIR/ultra.zst" ]]; then
+  pass "--ultra -20 produces output"
+else
+  fail "--ultra -20 produces output" "no output"
+fi
+rm -f "$TMPDIR/ultra.zst"
+
+rm -f "$PHV" "$PHV_ZST" "$PHV_OUT"
 
 # ============================================================
 # Final summary
