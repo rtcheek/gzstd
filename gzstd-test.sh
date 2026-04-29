@@ -345,7 +345,7 @@ human_size() {
 # auto-expand if you forget (so the display never shows > 100%),
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
-EXPECTED_TESTS=261
+EXPECTED_TESTS=263
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2111,7 +2111,7 @@ rm -f "$TMPDIR/thrf1.zst" "$TMPDIR/thrf1.dec"
 # compression and decompression paths surface it.
 v_out=$("$GZSTD" -v -k -f --cpu-only \
   "$TMPDIR/large.bin" -o "$TMPDIR/thr-v.zst" 2>&1)
-if grep -qE "throttle: [0-9]+ frames .* source=" <<< "$v_out"; then
+if grep -qE "\[THROTTLE\] [0-9]+ frames .* source=" <<< "$v_out"; then
   pass "-v logs throttle startup line"
 else
   fail "-v throttle startup line" "not found"
@@ -2121,23 +2121,41 @@ rm -f "$TMPDIR/thr-v.zst"
 # -vv emits end-of-run throttle stats (saturation + block counters).
 vv_out=$("$GZSTD" -vv -k -f --cpu-only \
   "$TMPDIR/large.bin" -o "$TMPDIR/thr-vv.zst" 2>&1)
-if grep -qE "throttle stats \[compress-cpu\]: peak=" <<< "$vv_out"; then
+if grep -qE '\[THROTTLE\] stats \[compress-cpu\]: peak=' <<< "$vv_out"; then
   pass "-vv logs throttle end-of-run stats"
 else
   fail "-vv throttle end-of-run stats" "not found"
 fi
 rm -f "$TMPDIR/thr-vv.zst"
 
-# Invalid --throttle-frames=0 must be rejected with usage exit (2).
-"$GZSTD" -k -f --cpu-only --throttle-frames=0 \
+# --throttle-frames=0 disables the throttle (v0.12.48+).  Must succeed AND
+# the verbose output must show DISABLED.
+"$GZSTD" -k -f --cpu-only --throttle-frames=0 -v \
+  "$TMPDIR/small.txt" -o "$TMPDIR/thr-disabled.zst" 2>"$TMPDIR/thr-disabled.log"
+rc=$?
+if [[ $rc -eq 0 ]] && grep -q "\[THROTTLE\] DISABLED" "$TMPDIR/thr-disabled.log"; then
+  pass "--throttle-frames=0 disables throttle"
+else
+  fail "--throttle-frames=0 disables throttle" "exit $rc, log: $(cat "$TMPDIR/thr-disabled.log" 2>/dev/null | head -3)"
+fi
+# --no-throttle is an alias for --throttle-frames=0
+"$GZSTD" -k -f --cpu-only --no-throttle -v --overwrite \
+  "$TMPDIR/small.txt" -o "$TMPDIR/thr-disabled.zst" 2>"$TMPDIR/thr-disabled.log"
+if grep -q "\[THROTTLE\] DISABLED" "$TMPDIR/thr-disabled.log"; then
+  pass "--no-throttle alias works"
+else
+  fail "--no-throttle alias" "no DISABLED line"
+fi
+# --throttle-frames=-2 must still be rejected.
+"$GZSTD" -k -f --cpu-only --throttle-frames=-2 \
   "$TMPDIR/small.txt" -o "$TMPDIR/thr-bad.zst" 2>/dev/null
 rc=$?
 if [[ $rc -eq 2 ]]; then
-  pass "--throttle-frames=0 rejected (exit 2)"
+  pass "--throttle-frames=-2 rejected (exit 2)"
 else
-  fail "--throttle-frames=0 rejection" "exit $rc"
+  fail "--throttle-frames=-2 rejection" "exit $rc"
 fi
-rm -f "$TMPDIR/thr-bad.zst"
+rm -f "$TMPDIR/thr-disabled.zst" "$TMPDIR/thr-disabled.log" "$TMPDIR/thr-bad.zst"
 
 # Invalid --throttle-factor=0 must be rejected.
 "$GZSTD" -k -f --cpu-only --throttle-factor=0 \
@@ -2314,7 +2332,7 @@ echo "$out" | grep -qi "D.*dictionary" && pass "-D eats value" || fail "-D eats 
 
 # -M tightens the throttle budget at -vv (source should show `source=ram`)
 out=$("$GZSTD" --cpu-only -vv -M 32 -f "$TMPDIR/zc.bin" 2>&1)
-echo "$out" | grep -q "throttle:.*source=ram" && pass "-M tightens throttle (source=ram)" \
+echo "$out" | grep -q "\[THROTTLE\].*source=ram" && pass "-M tightens throttle (source=ram)" \
   || fail "-M tightens throttle" "expected source=ram in throttle line"
 
 # -M on decompress rejects frames requiring a larger window.
@@ -2519,7 +2537,7 @@ fi
 # --- --throttle-frames=N visible at -v ---
 out=$("$GZSTD" -k -f --cpu-only --throttle-frames=64 -v "$PHV" -o "$TMPDIR/thr.zst" 2>&1 \
       | sed 's/\x1b\[[0-9;]*m//g')
-if echo "$out" | grep -qE "throttle:.* 64 frames|source=user"; then
+if echo "$out" | grep -qE "\[THROTTLE\].* 64 frames|source=user"; then
   pass "--throttle-frames=64 visible at -v"
 else
   fail "--throttle-frames=64 visible" "no source=user or 64 frames"

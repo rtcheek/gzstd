@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.46";
+static constexpr const char * GZSTD_VERSION = "0.12.49";
 //
 // Architecture overview:
 //
@@ -220,9 +220,11 @@ struct Options {
 
   // Throttle tuning (v0.12.14+).
   //   throttle_factor : slack multiplier (default THROTTLE_SLACK_FACTOR when 0)
-  //   throttle_frames : explicit frame override; bypasses the formula entirely
+  //   throttle_frames : explicit frame cap.  -1 = auto (use formula);
+  //                     0 = disabled (no throttle, no permit accounting);
+  //                     >0 = explicit cap.  v0.12.48+.
   int throttle_factor = 0;
-  int throttle_frames = 0;
+  int throttle_frames = -1;
   // Memory usage limit in MiB (zstd-compat `-M#` / `--memlimit` / `--memory`).
   // Decompress: passed to ZSTD_d_windowLogMax — frames requiring a larger
   // window are rejected.  Compress: caps the in-flight RAM budget in
@@ -566,7 +568,10 @@ static void print_help()
 "\n"
 "Tuning:\n"
 "  -T, --threads N     CPU worker threads (0 = all cores)\n"
-"  --chunk-size N      host I/O chunk size in MiB (default: 16)\n";
+"  --chunk-size N      host I/O chunk size in MiB (default: 16)\n"
+"  --throttle-factor N slack multiplier for in-flight cap (default: 4)\n"
+"  --throttle-frames N explicit cap (-1=auto, 0=disabled)\n"
+"  --no-throttle       alias for --throttle-frames=0 (benchmarking)\n";
 #ifdef HAVE_NVCOMP
   std::cout <<
 "  --gpu-batch N       GPU subchunks per CUDA stream (default: 16)\n"
@@ -598,7 +603,7 @@ static void print_help()
 "  -V, --version       version info\n"
 "\n"
 "Reads stdin when no file is given; stdin implies -c (stdout).\n"
-"See `gzstd --help` for hybrid-scheduler and throttle flags.\n";
+"See `gzstd --help` for hybrid-scheduler details and full flag docs.\n";
 }
 
 // Long help — shown by --help.  Detailed descriptions, flag interactions,
@@ -766,11 +771,16 @@ static void print_help_long()
 "     `source=pipeline` at -v and suspect the writer is bursty.\n"
 "     No effect with -T 1 or --sliding-window (no parallelism to bound).\n"
 "\n"
-"  --throttle-frames N    [all modes]\n"
-"     Explicit in-flight frame cap (bypasses the parallelism * factor\n"
-"     formula).  Use only if you're memory-constrained or chasing a\n"
-"     deadlock; otherwise let the formula run.  Visible at -v as\n"
-"     `source=user` in the throttle line.\n"
+"  --throttle-frames N / --no-throttle    [all modes]\n"
+"     Explicit in-flight frame cap.  Sentinel values:\n"
+"       N >= 1  : explicit cap (bypasses formula).  -v shows source=user.\n"
+"       N == 0  : DISABLE the throttle entirely — no permits, no lock,\n"
+"                 no accounting.  Use for benchmarking the no-throttle\n"
+"                 baseline.  At -v: `[THROTTLE] DISABLED`.\n"
+"                 --no-throttle is an alias for --throttle-frames=0.\n"
+"       N == -1 : auto (default; use the parallelism * factor formula).\n"
+"     With huge inputs you can OOM if every worker queues frames\n"
+"     unbounded — the throttle exists for a reason.  Default is auto.\n"
 "\n"
 #ifdef HAVE_NVCOMP
 "============================================================\n"
@@ -813,7 +823,7 @@ static void print_help_long()
 "       auto:  ration to <=50%% of available RAM, summed across all GPU\n"
 "              workers.  Streams that fit get pinned; streams that\n"
 "              don't fall back to pageable.  Visible at -v as\n"
-"              `[pinned] H2D+D2H <size> reserved (shared per slot)`.\n"
+"              `[PINNED] H2D+D2H <size> reserved (shared per slot)`.\n"
 "       on:    pin every stream regardless of system RAM.  May fail\n"
 "              with cudaHostAlloc errors on memory-pressured boxes.\n"
 "\n"
@@ -1799,6 +1809,15 @@ static int compute_throttle_budget(size_t frame_bytes,
 
   int frames;
   const char * source;
+  if (opt.throttle_frames == 0) {
+    // Explicit disable.  FrameThrottle ctor treats max<=0 as disabled
+    // (acquire/release become no-ops, no lock taken).  This is for
+    // benchmarking the no-throttle baseline.
+    if (opt.verbosity >= V_VERBOSE) {
+      vlog(V_VERBOSE, opt, "[THROTTLE] DISABLED (--throttle-frames=0)\n");
+    }
+    return 0;  // FrameThrottle(0) = disabled
+  }
   if (opt.throttle_frames > 0) {
     frames = opt.throttle_frames;
     source = "user";
@@ -1837,7 +1856,7 @@ static int compute_throttle_budget(size_t frame_bytes,
     char bud_s[32]; human_bytes(double(size_t(frames) * frame_bytes),
                                  bud_s, sizeof(bud_s));
     std::ostringstream os;
-    os << "throttle: " << frames << " frames (" << bud_s
+    os << "[THROTTLE] " << frames << " frames (" << bud_s
        << " in-flight max, source=" << source
        << ", parallelism=" << pipeline_parallelism
        << ", slack=" << slack << ")";
@@ -1847,7 +1866,7 @@ static int compute_throttle_budget(size_t frame_bytes,
   if (opt.verbosity >= V_DEBUG) {
     char ram_s[32]; human_bytes(double(avail), ram_s, sizeof(ram_s));
     std::ostringstream os;
-    os << "throttle detail: pipeline_cap=" << pipeline_frames
+    os << "[THROTTLE] detail: pipeline_cap=" << pipeline_frames
        << ", ram_cap=" << ram_frames
        << ", floor=" << THROTTLE_MIN_FRAMES
        << ", avail_ram=" << ram_s;
@@ -2701,12 +2720,16 @@ struct ResultStore {
 class FrameThrottle {
 public:
   explicit FrameThrottle(int max_in_flight = 512)
-    : permits_(max_in_flight), max_(max_in_flight) {}
+    : permits_(max_in_flight), max_(max_in_flight),
+      disabled_(max_in_flight <= 0) {}
+
+  bool disabled() const { return disabled_; }
 
   // Acquire n permits.  Blocks until enough are available (or done).
   // Greedy: takes whatever is available immediately, waits for the rest.
+  // No-op when disabled (--throttle-frames=0): no lock, no accounting.
   void acquire(int n = 1) {
-    if (n <= 0) return;
+    if (n <= 0 || disabled_) return;
     std::unique_lock<std::mutex> lk(m_);
     bool waited = false;
     std::chrono::steady_clock::time_point t0;
@@ -2747,7 +2770,7 @@ public:
   // notify_one per permit released matches the actual capacity change and
   // keeps the pipeline unblocked without the convoy.
   void release(int n = 1) {
-    if (n <= 0) return;
+    if (n <= 0 || disabled_) return;
     {
       std::lock_guard<std::mutex> lk(m_);
       permits_ += n;
@@ -2756,7 +2779,9 @@ public:
   }
 
   // Signal shutdown -- wake all blocked workers so they can exit.
+  // No-op when disabled (no waiters to wake).
   void set_done() {
+    if (disabled_) return;
     {
       std::lock_guard<std::mutex> lk(m_);
       done_ = true;
@@ -2789,6 +2814,7 @@ public:
 private:
   int permits_;
   int max_;
+  bool disabled_;        // true when constructed with max_in_flight <= 0
   bool done_ = false;
   std::mutex m_;
   std::condition_variable cv_;
@@ -2803,11 +2829,16 @@ static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
                                const char * phase)
 {
   if (opt.verbosity < V_DEBUG) return;
+  if (t.disabled()) {
+    vlog(V_DEBUG, opt, std::string("[THROTTLE] stats [") + phase
+         + "]: DISABLED (--throttle-frames=0)\n");
+    return;
+  }
   auto s = t.stats();
   double saturation = s.max > 0 ? 100.0 * double(s.peak_in_flight) / double(s.max) : 0.0;
   double ms = double(s.block_nanos) / 1e6;
   std::ostringstream os;
-  os << "throttle stats [" << phase << "]: "
+  os << "[THROTTLE] stats [" << phase << "]: "
      << "peak=" << s.peak_in_flight << "/" << s.max
      << " (" << std::fixed << std::setprecision(1) << saturation << "%), "
      << "block_count=" << s.block_count
@@ -3155,7 +3186,7 @@ static void writer_thread(FILE * out, ResultStore & results,
   // Flush remaining writes
   if (aio) {
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "writer: draining write queue...\n");
+      vlog(V_VERBOSE, opt, "[WRITER] draining write queue...\n");
     aio->flush();
     if (aio->had_error()) die_io("async write failed (disk full?)");
   }
@@ -3445,7 +3476,7 @@ public:
       const char * RST = g_color_stderr ? "\033[0m"    : "";
       std::ostringstream os;
       os << std::fixed << std::setprecision(3)
-         << "hybrid: tick "
+         << "[HYBRID] tick "
          << MAG << "cpu_rate=" << (cpu_rate/1e9) << RST << " GiB/s"
          << "  " << YEL << "gpu_rate=" << (gpu_rate/1e9) << RST << " GiB/s"
          << "  " << YEL << "gpus_waiting=" << gpus_waiting_.load() << RST
@@ -4394,7 +4425,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
     uint64_t total = m->total_out.load(std::memory_order_relaxed);
     if (total > 0 && g_direct_writer->preallocate(total)) {
       char sz[32]; human_bytes(double(total), sz, sizeof(sz));
-      vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+      vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
     }
   }
 #endif
@@ -4436,7 +4467,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   vlog(V_VERBOSE, opt,
-       "streamed " + std::to_string(n_frames) + " frames for MT CPU decompress\n");
+       "[READER] streamed " + std::to_string(n_frames) + " frames for MT CPU decompress\n");
 
   // Signal that all frames have been enqueued
   queue.set_done();
@@ -4485,7 +4516,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
     size_t ultra_min = ultra_min_chunk_mib(opt.level, opt.ultra);
     if (ultra_min > 0 && chosen_mib < ultra_min) {
       if (!opt.chunk_user_set) {
-        vlog(V_VERBOSE, opt, "ultra: auto-increasing chunk size from "
+        vlog(V_VERBOSE, opt, "[ULTRA] auto-increasing chunk size from "
              + std::to_string(chosen_mib) + " to " + std::to_string(ultra_min)
              + " MiB (must be >= window size)\n");
         chosen_mib = ultra_min;
@@ -4508,7 +4539,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
 #ifndef _WIN32
   if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
     char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
-    vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+    vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
   }
 #endif
 
@@ -4524,7 +4555,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   {
     int wlog = apply_ultra_cctx(cctx, opt.level, opt.ultra);
     if (wlog > 0)
-      vlog(V_VERBOSE, opt, "ultra: windowLog=" + std::to_string(wlog)
+      vlog(V_VERBOSE, opt, "[ULTRA] windowLog=" + std::to_string(wlog)
            + " (" + std::to_string(size_t(1) << (wlog - 20)) + " MiB window)\n");
   }
 
@@ -4579,7 +4610,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   else if (opt.cpu_threads == -1) n_threads = (unsigned)std::thread::hardware_concurrency();
   if (n_threads < 1) n_threads = 1;
 
-  vlog(V_VERBOSE, opt, "sliding-window: single-frame compression with "
+  vlog(V_VERBOSE, opt, "[SLIDING-WINDOW] single-frame compression with "
        + std::to_string(n_threads) + " zstd worker threads\n");
 
   uint64_t total_in = 0;
@@ -4657,7 +4688,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // Option A: if single-threaded, use simple streaming helper
   if (threads == 1) {
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "CPU MT requested with 1 thread; using single-thread streaming path\n");
+      vlog(V_VERBOSE, opt, "[CPU] single-thread streaming path (-T 1)\n");
     compress_cpu_stream(in, out, opt, m);
     if (g_perf) {
       g_perf->print_summary("CPU-ONLY COMPRESS (single-thread)");
@@ -4679,7 +4710,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     size_t ultra_min = ultra_min_chunk_mib(opt.level, opt.ultra);
     if (ultra_min > 0 && chosen_mib < ultra_min) {
       if (!opt.chunk_user_set) {
-        vlog(V_VERBOSE, opt, "ultra: auto-increasing chunk size from "
+        vlog(V_VERBOSE, opt, "[ULTRA] auto-increasing chunk size from "
              + std::to_string(chosen_mib) + " to " + std::to_string(ultra_min)
              + " MiB (must be >= window size)\n");
         chosen_mib = ultra_min;
@@ -4714,7 +4745,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 #ifndef _WIN32
   if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
     char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
-    vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+    vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
   }
 #endif
 
@@ -4748,7 +4779,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       && fs::is_regular_file(opt.input)
       && mmap_region.open(opt.input.c_str())) {
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "using mmap zero-copy reader\n");
+      vlog(V_VERBOSE, opt, "[MMAP] using zero-copy reader\n");
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
     size_t off = 0;
@@ -5075,14 +5106,14 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
       release_pinned(pin_h2d_bytes, opt);
       if (opt.verbosity >= V_VERBOSE) {
         char sz[32]; human_bytes(double(pin_h2d_bytes), sz, sizeof(sz));
-        vlog(V_VERBOSE, opt, std::string("[pinned] H2D/D2H alloc failed (")
+        vlog(V_VERBOSE, opt, std::string("[PINNED] H2D/D2H alloc failed (")
              + sz + "); using pageable for this stream\n");
       }
     } else {
       C.h2d_pinned_bytes = pin_h2d_bytes;
       if (opt.verbosity >= V_VERBOSE) {
         char sz[32]; human_bytes(double(pin_h2d_bytes), sz, sizeof(sz));
-        vlog(V_VERBOSE, opt, std::string("[pinned] H2D+D2H ") + sz
+        vlog(V_VERBOSE, opt, std::string("[PINNED] H2D+D2H ") + sz
              + " reserved (shared per slot)\n");
       }
     }
@@ -5094,7 +5125,7 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
       uint64_t reserved = g_pinned_bytes_reserved.load();
       human_bytes(double(budget > reserved ? budget - reserved : 0),
                   rem, sizeof(rem));
-      vlog(V_VERBOSE, opt, std::string("[pinned] H2D ") + sz
+      vlog(V_VERBOSE, opt, std::string("[PINNED] H2D ") + sz
            + " skipped (auto budget exhausted, " + rem
            + " left); using pageable\n");
     }
@@ -5470,7 +5501,7 @@ static void gpu_worker(
                   S.phase = SharedTuneState::Phase::HALVE;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune] baseline=" << cur_batch << " (" << std::fixed
+                    os << "[AUTO-TUNE] baseline=" << cur_batch << " (" << std::fixed
                        << std::setprecision(2) << cur_thr << " GiB/s) -> try " << half;
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
@@ -5493,7 +5524,7 @@ static void gpu_worker(
                   S.phase = SharedTuneState::Phase::DOUBLE;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune] halving worse, will try doubling (best=" << S.best_batch << ")";
+                    os << "[AUTO-TUNE] halving worse, will try doubling (best=" << S.best_batch << ")";
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
                 }
@@ -5523,7 +5554,7 @@ static void gpu_worker(
                       S.phase = SharedTuneState::Phase::REFINE; S.refine_iters = 0;
                       if (opt.verbosity >= V_VERBOSE) {
                         std::ostringstream os;
-                        os << "[auto-tune] refining [" << S.refine_lo << ".." << S.refine_hi
+                        os << "[AUTO-TUNE] refining [" << S.refine_lo << ".." << S.refine_hi
                            << "] trying " << mid;
                         vlog(V_VERBOSE, opt, os.str() + "\n");
                       }
@@ -5532,7 +5563,7 @@ static void gpu_worker(
                       S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
                       if (opt.verbosity >= V_VERBOSE) {
                         std::ostringstream os;
-                        os << "[auto-tune] settled at batch=" << S.best_batch
+                        os << "[AUTO-TUNE] settled at batch=" << S.best_batch
                            << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
                         vlog(V_VERBOSE, opt, os.str() + "\n");
                       }
@@ -5549,7 +5580,7 @@ static void gpu_worker(
                   S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune] refined, settled at batch=" << S.best_batch
+                    os << "[AUTO-TUNE] refined, settled at batch=" << S.best_batch
                        << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
@@ -5588,7 +5619,7 @@ static void gpu_worker(
                     }
                     if (opt.verbosity >= V_VERBOSE) {
                       std::ostringstream os;
-                      os << "[auto-tune] probe: " << S.best_batch << " -> " << probe
+                      os << "[AUTO-TUNE] probe: " << S.best_batch << " -> " << probe
                          << " (" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
                       vlog(V_VERBOSE, opt, os.str() + "\n");
                     }
@@ -6212,7 +6243,7 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
 
       if (opt.verbosity >= V_VERBOSE && total_devices > 1) {
         std::ostringstream os;
-        os << "GPUs: " << want << " device" << (want > 1 ? "s" : "") << " active";
+        os << "[GPU] " << want << " device" << (want > 1 ? "s" : "") << " active";
         for (int i = 0; i < want; ++i) {
           os << (i ? ", " : ": ") << "GPU" << infos[i].cuda_id;
           os << " " << infos[i].gpu_util << "%";
@@ -6283,7 +6314,7 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
 
   if (opt.verbosity >= V_VERBOSE && total_devices > 1) {
     std::ostringstream os;
-    os << "GPUs: " << n << " device" << (n > 1 ? "s" : "") << " active";
+    os << "[GPU] " << n << " device" << (n > 1 ? "s" : "") << " active";
     for (int i = 0; i < n; ++i) {
       os << (i ? ", " : ": ") << "GPU" << devs[i].id;
       if (devs[i].has_util) os << " " << devs[i].gpu_util << "%";
@@ -6306,7 +6337,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
     if (opt.gpu_only)
       die_usage("GPU requested (--gpu-only) but no CUDA devices available");
-    vlog(V_VERBOSE, opt, "nvCOMP: no GPUs found; falling back to MT CPU\n");
+    vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU\n");
     compress_cpu_mt(in, out, opt, m);
     return;
   }
@@ -6314,7 +6345,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Apply --gpu-devices limit (0 = all for compress)
   const int total_hw_devices = device_count;
   if (opt.gpu_devices > 0 && opt.gpu_devices < device_count) {
-    vlog(V_VERBOSE, opt, "limiting to " + std::to_string(opt.gpu_devices)
+    vlog(V_VERBOSE, opt, "[GPU] limiting to " + std::to_string(opt.gpu_devices)
          + " of " + std::to_string(device_count) + " GPU devices\n");
     device_count = opt.gpu_devices;
   }
@@ -6334,7 +6365,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     size_t ultra_min = ultra_min_chunk_mib(opt.level, opt.ultra);
     if (ultra_min > 0 && chosen_mib < ultra_min && !opt.gpu_only) {
       if (!opt.chunk_user_set) {
-        vlog(V_VERBOSE, opt, "ultra: auto-increasing chunk size from "
+        vlog(V_VERBOSE, opt, "[ULTRA] auto-increasing chunk size from "
              + std::to_string(chosen_mib) + " to " + std::to_string(ultra_min)
              + " MiB (must be >= window size for CPU workers)\n");
         chosen_mib = ultra_min;
@@ -6378,7 +6409,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #ifndef _WIN32
   if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
     char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
-    vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+    vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
   }
 #endif
 
@@ -6425,15 +6456,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     sched->set_queue(&queue);
     tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
 
-    if (opt.verbosity >= V_VERBOSE) {
+    // Early banner in main() already printed mode + CPU share at -v.
+    // Keep a -vv confirmation that the scheduler actually started.
+    if (opt.verbosity >= V_DEBUG) {
       double share_pct = (opt.cpu_share >= 0.0)
                          ? (opt.cpu_share * 100.0)
                          : (sched->target_share() * 100.0);
       const char * mode_str = (opt.cpu_share >= 0.0) ? "% (fixed)" : "% (adaptive)";
       std::ostringstream os;
       os << std::fixed << std::setprecision(1)
-         << "Using hybrid mode: CPU share " << share_pct << mode_str;
-      vlog(V_VERBOSE, opt, os.str() + "\n");
+         << "hybrid scheduler online: CPU share " << share_pct << mode_str;
+      vlog(V_DEBUG, opt, os.str() + "\n");
     }
   }
 
@@ -6468,7 +6501,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
-      os << "hybrid: starting CPU pool: " << cpu_threads
+      os << "[HYBRID] starting CPU pool: " << cpu_threads
          << " threads (GPUs initializing in background)";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
@@ -6522,7 +6555,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       && fs::is_regular_file(opt.input)
       && mmap_region.open(opt.input.c_str())) {
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "using mmap zero-copy reader\n");
+      vlog(V_VERBOSE, opt, "[MMAP] using zero-copy reader\n");
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
     size_t off = 0;
@@ -6999,7 +7032,7 @@ static void gpu_decomp_worker(
                   S.phase = SharedTuneState::Phase::HALVE;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune] baseline=" << cur_batch << " ("
+                    os << "[AUTO-TUNE] baseline=" << cur_batch << " ("
                        << std::fixed << std::setprecision(2) << cur_thr << " GiB/s) -> try " << half;
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
@@ -7020,7 +7053,7 @@ static void gpu_decomp_worker(
                   S.phase = SharedTuneState::Phase::DOUBLE;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune] halving worse, will try doubling (best=" << S.best_batch << ")";
+                    os << "[AUTO-TUNE] halving worse, will try doubling (best=" << S.best_batch << ")";
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
                 }
@@ -7049,7 +7082,7 @@ static void gpu_decomp_worker(
                     }
                     if (opt.verbosity >= V_VERBOSE) {
                       std::ostringstream os;
-                      os << "[auto-tune] settled at batch=" << S.best_batch
+                      os << "[AUTO-TUNE] settled at batch=" << S.best_batch
                          << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
                       vlog(V_VERBOSE, opt, os.str() + "\n");
                     }
@@ -7065,7 +7098,7 @@ static void gpu_decomp_worker(
                   S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
                   if (opt.verbosity >= V_VERBOSE) {
                     std::ostringstream os;
-                    os << "[auto-tune] refined, settled at batch=" << S.best_batch;
+                    os << "[AUTO-TUNE] refined, settled at batch=" << S.best_batch;
                     vlog(V_VERBOSE, opt, os.str() + "\n");
                   }
                 } else {
@@ -7097,7 +7130,7 @@ static void gpu_decomp_worker(
                       S.phase = SharedTuneState::Phase::HALVE;
                     if (opt.verbosity >= V_VERBOSE) {
                       std::ostringstream os;
-                      os << "[auto-tune] probe: " << S.best_batch << " -> " << probe
+                      os << "[AUTO-TUNE] probe: " << S.best_batch << " -> " << probe
                          << " (" << std::fixed << std::setprecision(2) << cur_thr << " GiB/s)";
                       vlog(V_VERBOSE, opt, os.str() + "\n");
                     }
@@ -7255,7 +7288,7 @@ static void gpu_decomp_worker(
                 C.h_decomp_pinned_bytes = want;
                 if (opt.verbosity >= V_VERBOSE) {
                   char sz[32]; human_bytes(double(want), sz, sizeof(sz));
-                  vlog(V_VERBOSE, opt, std::string("[pinned] D2H ") + sz
+                  vlog(V_VERBOSE, opt, std::string("[PINNED] D2H ") + sz
                        + " reserved (decompress)\n");
                 }
               }
@@ -7651,7 +7684,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
     if (opt.gpu_only)
       die_usage("GPU requested (--gpu-only) but no CUDA devices available");
-    vlog(V_VERBOSE, opt, "nvCOMP: no GPUs found; falling back to MT CPU decompress\n");
+    vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU decompress\n");
     // Fall through with device_count=0; CPU pool will handle everything
   }
 
@@ -7666,7 +7699,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     int target = opt.gpu_devices;
     if (target == 0) target = device_count;  // auto: use all GPUs
     if (target < device_count) {
-      vlog(V_VERBOSE, opt, "decompress: using " + std::to_string(target)
+      vlog(V_VERBOSE, opt, "[GPU] using " + std::to_string(target)
            + " of " + std::to_string(device_count) + " GPU devices"
            + (opt.gpu_devices == 0 ? " (auto)\n" : "\n"));
       device_count = target;
@@ -7762,7 +7795,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
-      os << "hybrid decompress: " << cpu_threads << " CPU threads";
+      os << "[HYBRID] decompress: " << cpu_threads << " CPU threads";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
     for (int i = 0; i < cpu_threads; ++i)
@@ -7822,7 +7855,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     uint64_t total = m->total_out.load(std::memory_order_relaxed);
     if (total > 0 && g_direct_writer->preallocate(total)) {
       char sz[32]; human_bytes(double(total), sz, sizeof(sz));
-      vlog(V_VERBOSE, opt, std::string("preallocated ") + sz + " output (fallocate)\n");
+      vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
     }
   }
 #endif
@@ -7850,7 +7883,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 
   vlog(V_VERBOSE, opt,
-       "streamed " + std::to_string(n_frames) + " frames for GPU/hybrid decompress\n");
+       "[READER] streamed " + std::to_string(n_frames) + " frames for GPU/hybrid decompress\n");
 
   // ---- Signal that all frames have been enqueued ----
   queue.set_done();
@@ -7910,7 +7943,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       double ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
           std::chrono::steady_clock::now() - t_cpu).count();
       if (ms > 500)
-        vlog(V_VERBOSE, opt, "CPU pool join: " + std::to_string(int(ms)) + " ms\n");
+        vlog(V_VERBOSE, opt, "[CPU] pool join took " + std::to_string(int(ms)) + " ms\n");
     }
   }
   throttle.set_done();  // safe now: all workers exited
@@ -7933,7 +7966,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       double ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
           std::chrono::steady_clock::now() - t_wr).count();
       if (ms > 500)
-        vlog(V_VERBOSE, opt, "writer join: " + std::to_string(int(ms)) + " ms\n");
+        vlog(V_VERBOSE, opt, "[WRITER] join took " + std::to_string(int(ms)) + " ms\n");
     }
   }
   log_throttle_stats(throttle, opt,
@@ -7993,6 +8026,38 @@ int main(int argc, char ** argv)
   setup_signal_handlers();
 
   Options opt = parse_args(argc, argv);
+
+  // Early startup banner at -v+.  Printed BEFORE any heavy init (CUDA
+  // device probe, file open, output preallocate) so users get immediate
+  // feedback that gzstd is alive — important on loaded servers where
+  // CUDA init can stall for several seconds.
+  // Verbose output convention: every line uses [TAG] prefix with an
+  // UPPERCASE tag, single space, sentence-case body.  See gzstd.cpp
+  // verbose-output style.
+  if (opt.verbosity >= V_VERBOSE) {
+    std::ostringstream os;
+    os << "[STARTUP] gzstd " << GZSTD_VERSION << " ";
+    switch (opt.mode) {
+      case Mode::COMPRESS:   os << "COMPRESS"; break;
+      case Mode::DECOMPRESS: os << "DECOMPRESS"; break;
+      case Mode::TEST:       os << "TEST"; break;
+    }
+    if (opt.cpu_only)        os << " (cpu-only)";
+    else if (opt.gpu_only)   os << " (gpu-only)";
+    else if (opt.hybrid) {
+      os << " (hybrid";
+      if (opt.cpu_share >= 0.0) {
+        os << ", CPU share " << std::fixed << std::setprecision(1)
+           << (opt.cpu_share * 100.0) << "% fixed";
+      } else {
+        os << ", CPU share adaptive";
+      }
+      os << ")";
+    }
+    else                     os << " (auto-select backend)";
+    std::fprintf(stderr, "%s\n", os.str().c_str());
+    std::fflush(stderr);  // unbuffer so it hits the terminal immediately
+  }
 
   int exit_code = EXIT_OK;
 
@@ -8073,7 +8138,7 @@ int main(int argc, char ** argv)
       if (dw->open(write_path)) {
         if (out) { std::fclose(out); out = nullptr; }
         direct_writer = std::move(dw);
-        vlog(V_VERBOSE, opt, "using O_DIRECT for output (--direct)\n");
+        vlog(V_VERBOSE, opt, "[O_DIRECT] using O_DIRECT for output (--direct)\n");
       }
     }
   } else if (opt.direct_io && to_stdout && out == stdout) {
@@ -8097,7 +8162,7 @@ int main(int argc, char ** argv)
         std::fflush(stdout);
         out = nullptr;
         direct_writer = std::move(dw);
-        vlog(V_VERBOSE, opt, "stdout redirect  using O_DIRECT (--direct)\n");
+        vlog(V_VERBOSE, opt, "[O_DIRECT] stdout redirect using O_DIRECT (--direct)\n");
       }
       // If open failed, fall through to normal fwrite via stdout
     } while (false);
@@ -8174,7 +8239,7 @@ int main(int argc, char ** argv)
     }
 #else
     if (opt.gpu_only) die_usage("This binary was built without nvCOMP; --gpu-only cannot be satisfied");
-    if (opt.hybrid) vlog(V_VERBOSE, opt, "Hybrid requested but not available in CPU-only build; using MT CPU.\n");
+    if (opt.hybrid) vlog(V_VERBOSE, opt, "[HYBRID] not available in CPU-only build; using MT CPU\n");
     if (opt.sliding_window)
       compress_cpu_sliding_window(in, out, opt, &meter);
     else
@@ -8331,7 +8396,7 @@ int main(int argc, char ** argv)
       double rename_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
           std::chrono::steady_clock::now() - t_rename).count();
       if (opt.verbosity >= V_VERBOSE && rename_ms > 100)
-        vlog(V_VERBOSE, opt, "atomic rename: " + std::to_string(int(rename_ms)) + " ms\n");
+        vlog(V_VERBOSE, opt, "[RENAME] atomic rename took " + std::to_string(int(rename_ms)) + " ms\n");
     }
     // Success: disarm cleanup (temp or direct output file is now final)
     clear_tmp_file();
@@ -8399,9 +8464,9 @@ int main(int argc, char ** argv)
   // Print finalize/fsync timing (deferred until after summary line)
   if (opt.verbosity >= V_VERBOSE) {
     if (finalize_ms > 100)
-      vlog(V_VERBOSE, opt, "DirectWriter finalize: " + std::to_string(int(finalize_ms)) + " ms\n");
+      vlog(V_VERBOSE, opt, "[O_DIRECT] finalize took " + std::to_string(int(finalize_ms)) + " ms\n");
     if (sync_ms > 100)
-      vlog(V_VERBOSE, opt, "fsync: " + std::to_string(int(sync_ms)) + " ms\n");
+      vlog(V_VERBOSE, opt, "[FSYNC] took " + std::to_string(int(sync_ms)) + " ms\n");
   }
 
 
@@ -8563,9 +8628,12 @@ static Options parse_args(int argc, char ** argv)
         die_usage("--throttle-factor must be >= 1");
     }
     else if (parse_int_arg("throttle-frames", i, argc, argv, opt.throttle_frames)) {
-      if (opt.throttle_frames < 1)
-        die_usage("--throttle-frames must be >= 1");
+      // 0 = disabled (no throttle); -1 = auto (use formula); >0 = explicit cap.
+      // Reject -2 and lower.
+      if (opt.throttle_frames < -1)
+        die_usage("--throttle-frames must be 0 (disabled), -1 (auto), or >= 1");
     }
+    else if (a == "--no-throttle") opt.throttle_frames = 0;  // alias for --throttle-frames=0
 #ifdef HAVE_NVCOMP
     else if (a == "--gpu-only") opt.gpu_only = true;
     else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) { opt.gpu_batch_user_set = true; }

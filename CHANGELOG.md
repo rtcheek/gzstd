@@ -1,9 +1,128 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.46  
+**Covers:** v0.9.50 → v0.12.49  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.49 — `[STARTUP]` banner + uniform `[TAG]` verbose-output style
+
+Two related changes addressing the "no visual feedback for several
+seconds after pressing enter" complaint on loaded servers:
+
+**1. `[STARTUP]` banner before any heavy init.**  At -v+, the very
+first line printed is `[STARTUP] gzstd vX.Y.Z MODE (backend)`.
+Printed in main() right after `parse_args` returns, BEFORE `cudaGet
+DeviceCount`, file open, output preallocate, or any other potentially
+slow step.  Output is `fflush`'d immediately to bypass stderr line
+buffering.  Examples:
+
+```
+[STARTUP] gzstd 0.12.49 COMPRESS (cpu-only)
+[STARTUP] gzstd 0.12.49 COMPRESS (hybrid, CPU share adaptive)
+[STARTUP] gzstd 0.12.49 DECOMPRESS (gpu-only)
+[STARTUP] gzstd 0.12.49 TEST (auto-select backend)
+```
+
+**2. Uniform `[TAG]` style across all verbose output.**  The codebase
+had drifted to a mix of `lowercase: prefix:`, `[lowercase]`, and
+`[UPPERCASE]` formats.  Standardised every -v / -vv / -vvv message to
+`[UPPERCASE_TAG] sentence-case body` with a single space between tag
+and body.  Tags now used:
+
+- `[STARTUP]`, `[INIT]`
+- `[CPU]`, `[CPU/T#]`
+- `[GPU]`, `[GPU#]`, `[GPU#/S#]`
+- `[HYBRID]`, `[RESCUE]`, `[WRITER]`, `[READER]`, `[SPLIT]`
+- `[THROTTLE]`, `[PINNED]`, `[AUTO-TUNE]`
+- `[MMAP]`, `[O_DIRECT]`, `[FALLOCATE]`, `[FSYNC]`, `[RENAME]`
+- `[ULTRA]`, `[SLIDING-WINDOW]`
+
+Lines previously emitted as `throttle: ...`, `hybrid: ...`,
+`writer: ...`, `using mmap...`, `using O_DIRECT...`, `preallocated
+...`, `streamed N frames`, `[pinned] ...`, `[auto-tune] ...`,
+`atomic rename: ...`, `fsync: ...`, `GPUs: ...` etc. are now all
+prefixed with the appropriate uppercase tag.
+
+The duplicate "Using hybrid mode: CPU share X%" line that used to
+fire late inside `compress_nvcomp` is replaced by the early
+`[STARTUP]` banner; a `[HYBRID]` confirmation line at -vv announces
+when the scheduler actually starts.
+
+Test grep patterns updated for the new format (5 tests).
+
+---
+
+## v0.12.48 — `--throttle-frames=0` / `--no-throttle` to fully disable throttling
+
+For benchmarking the no-throttle baseline.  `FrameThrottle` now
+recognizes a non-positive `max_in_flight` as "disabled":
+`acquire`/`release`/`set_done` become no-op early returns (no lock
+taken, no permit accounting, no peak/block stats).
+
+`--throttle-frames` parsing extended:
+- `N >= 1`  : explicit cap (existing behaviour, `source=user`).
+- `N == 0`  : DISABLE throttle entirely.  -v shows `throttle: DISABLED`.
+- `N == -1` : auto / formula (NEW DEFAULT — was 0 before; semantic
+              shift on the sentinel only, default behaviour unchanged
+              for users who never passed the flag).
+- `N <= -2` : rejected with exit 2 (usage error).
+
+`--no-throttle` is a convenience alias for `--throttle-frames=0`.
+
+Both `compress_*` and `decompress_*` paths construct `FrameThrottle(0)`
+when disabled; the existing acquire/release calls scattered through
+the workers and the writer just no-op.  No control-flow changes
+required outside the throttle class.
+
+`log_throttle_stats` skips the stats line on disabled throttles and
+just prints `DISABLED` instead.
+
+**Quick A/B on Lovelace** (24-core, 2 GiB mixed input):
+
+| mode | throttle=auto | throttle=0 |
+|---|---|---|
+| compress | ~0.53 s | ~0.55 s |
+| decompress | ~0.62 s | ~0.68 s |
+
+Throttle off is *slightly slower* on this workload — without backpressure
+the result store can grow large enough that L3 / RAM cache effects
+hurt.  As suspected, the throttle is a guardrail not an optimization,
+but you can now measure that directly.
+
+Tests: 263/263 (+2 new — disabled-mode verification, `--no-throttle`
+alias verification, replaced the old "must reject 0" rejection test).
+
+---
+
+## v0.12.47 — `--sweep-matrix` benchmark option for backend × mmap × pinned
+
+Adds a small structured sweep that produces 10 configs (cpu-only × 2
+mmap states + hybrid × 4 + gpu-only × 4, with pinned skipped on cpu-only
+since it's a GPU-side knob).  Captures the same "which tricks actually
+help on this system" analysis we did manually in v0.12.45/46 but as a
+re-runnable harness, so the result interpretation can be reproduced on
+any new machine without hand-rolling shell loops.
+
+Smoke-tested against the 20 GiB `medium_compress.bin` profile:
+
+| config | GiB/s |
+|---|---|
+| mtx-cpu-mmap | **7.05** (best) |
+| mtx-hyb-mmap-pin0 | 5.23 |
+| mtx-hyb-mmap-pin1 | 4.47 |
+| mtx-cpu-nommap | 2.42 |
+| mtx-gpu-mmap-pin0 | 2.33 |
+| mtx-gpu-nommap-pin1 | 2.33 |
+| ... | |
+
+Confirms the v0.12.45/46 conclusions at 20 GiB scale on Lovelace
+(2× 2080 Ti): CPU-only crushes, mmap wins, pinned hurts.
+
+`--sweep-all` now also enables `--sweep-matrix`.  Add `--sweep-matrix`
+on its own for a focused 10-config run.
 
 ---
 
