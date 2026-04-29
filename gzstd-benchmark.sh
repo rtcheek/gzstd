@@ -27,6 +27,9 @@
 #   --sweep-levels    Sweep comp levels (1,3,6,9,15,19)
 #   --sweep-ultra     Sweep ultra comp levels (20,21,22 --ultra)
 #   --sweep-throttle  Sweep --throttle-factor over {1,2,4,8,16}
+#   --sweep-matrix    Sweep backend × mmap × pinned (10 configs).
+#                     Useful for verifying which "speed tricks" win
+#                     on the current hardware.  See v0.12.46 CHANGELOG.
 #   --sweep-all       Enable all sweeps (including --sweep-ultra)
 #   --no-decompress   Skip decomp benchmarks
 #   --help            Show this help
@@ -63,6 +66,7 @@ SWEEP_THREADS=false
 SWEEP_LEVELS=false
 SWEEP_ULTRA=false
 SWEEP_THROTTLE=false
+SWEEP_MATRIX=false
 DO_DECOMPRESS=true
 
 #---------------------------------------------------------------------
@@ -85,10 +89,12 @@ while [[ $# -gt 0 ]]; do
     --sweep-levels)  SWEEP_LEVELS=true; shift ;;
     --sweep-ultra)   SWEEP_ULTRA=true; shift ;;
     --sweep-throttle) SWEEP_THROTTLE=true; shift ;;
+    --sweep-matrix)  SWEEP_MATRIX=true; shift ;;
     --sweep-all)
       SWEEP_BATCHES=true; SWEEP_STREAMS=true
       SWEEP_THREADS=true; SWEEP_LEVELS=true
-      SWEEP_ULTRA=true; SWEEP_THROTTLE=true; shift ;;
+      SWEEP_ULTRA=true; SWEEP_THROTTLE=true
+      SWEEP_MATRIX=true; shift ;;
     --no-decompress) DO_DECOMPRESS=false; shift ;;
     --help|-h)
       head -37 "$0" | tail -32
@@ -353,6 +359,41 @@ if $SWEEP_BATCHES && $SWEEP_STREAMS \
       fi
     done
   done
+fi
+
+# Sweep backend × mmap × pinned matrix.
+#
+# Verifies which "speed tricks" actually help on the current hardware.
+# CPU-only paths skip the pinned axis (it's a GPU-side knob).  The matrix
+# is intentionally small (10 configs) so it can run alongside other
+# sweeps without exploding total runtime.  See v0.12.46 CHANGELOG for
+# the result interpretation.
+if $SWEEP_MATRIX; then
+  # cpu-only × mmap (pinned doesn't apply)
+  if ! $GPU_ONLY && ! $HYBRID_ONLY; then
+    CONFIGS+=(
+      "mtx-cpu-mmap|--cpu-only|--cpu-only"
+      "mtx-cpu-nommap|--cpu-only --no-mmap|--cpu-only --no-mmap"
+    )
+  fi
+  # hybrid × mmap × pinned
+  if $HAS_GPU_BUILD && ! $CPU_ONLY && ! $GPU_ONLY; then
+    CONFIGS+=(
+      "mtx-hyb-mmap-pin0|--hybrid --pinned=off|--hybrid --pinned=off"
+      "mtx-hyb-mmap-pin1|--hybrid --pinned=on|--hybrid --pinned=on"
+      "mtx-hyb-nommap-pin0|--hybrid --pinned=off --no-mmap|--hybrid --pinned=off --no-mmap"
+      "mtx-hyb-nommap-pin1|--hybrid --pinned=on --no-mmap|--hybrid --pinned=on --no-mmap"
+    )
+  fi
+  # gpu-only × mmap × pinned
+  if $HAS_GPU_BUILD && ! $CPU_ONLY && ! $HYBRID_ONLY; then
+    CONFIGS+=(
+      "mtx-gpu-mmap-pin0|--gpu-only --pinned=off|--gpu-only --pinned=off"
+      "mtx-gpu-mmap-pin1|--gpu-only --pinned=on|--gpu-only --pinned=on"
+      "mtx-gpu-nommap-pin0|--gpu-only --pinned=off --no-mmap|--gpu-only --pinned=off --no-mmap"
+      "mtx-gpu-nommap-pin1|--gpu-only --pinned=on --no-mmap|--gpu-only --pinned=on --no-mmap"
+    )
+  fi
 fi
 
 if [[ ${#CONFIGS[@]} -eq 0 ]]; then

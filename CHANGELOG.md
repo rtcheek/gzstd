@@ -1,9 +1,170 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.41  
+**Covers:** v0.9.50 → v0.12.46  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.46 — `--mmap=on/off` toggle (default: on)
+
+The mmap zero-copy reader has been the default for regular-file inputs
+since early in the project but had no escape hatch — useful for
+benchmarking against a stack of "tricks that don't help on this
+system" (O_DIRECT, pinned RAM, atomic rename).  This pulls mmap up to
+the same level: on by default, but `--no-mmap` lets you A/B against
+fread to verify it's actually winning on your hardware.
+
+**Local validation** (Lovelace, 4 GiB mixed input, page cache warm):
+| mode | mmap (default) | --no-mmap |
+|---|---|---|
+| `--cpu-only -T18` compress | ~1.4 s | ~2.2 s (~50% slower) |
+| `--gpu-only` compress | ~3.9 s | ~3.9 s (wash) |
+
+mmap wins clearly on CPU-only paths because workers read directly from
+the page cache — no producer-side fread + memcpy through a userspace
+buffer to serialise the input read.  GPU paths are a wash: the input
+gets H2D-copied either way, and the page cache makes pageable cudaMemcpy
+near-DMA-speed regardless of source.
+
+`--mmap=on` / `--mmap=off` / `--no-mmap` accepted.  Pipes and stdin
+always fall back to fread (mmap requires a regular file).
+
+---
+
+## v0.12.45 — `--pinned` default flipped to `off` (pinned was measured slower)
+
+The plumbed-in pinned-host-memory infrastructure (v0.12.43, v0.12.44)
+turned out to be slower than pageable on every workload tested.
+On Lovelace (2× 2080 Ti), 4 GiB mixed-compressibility input:
+
+| mode       | --pinned=off | --pinned=on    |
+|------------|--------------|----------------|
+| compress   | ~3.6 s       | ~4.2 s (-15%)  |
+| decompress | ~1.9 s       | ~4.4 s (-2.4×) |
+
+Decompression was particularly bad — pinned cudaMemcpy + extra copy
+into the result vector was 2-3× slower than direct device→pageable.
+
+Likely causes:
+- Input pages are usually already in the OS page cache (mmap'd file
+  on a fast NVMe), so cudaMemcpy from pageable is near-DMA-speed
+  anyway — the locked-page DMA path doesn't win.
+- Locking pages out of the page cache hurts other parts of the
+  pipeline (reader fread-ahead, writer fwrite cache).
+- The mandatory pinned -> pageable memcpy for the result vector adds
+  pure overhead with no offsetting gain.
+
+**Fix.** `Options::pin_mode` default changed from `AUTO` to `OFF`.
+The infrastructure is plumbed and exposed; users can opt in with
+`--pinned=on` or `--pinned=auto` if their hardware/workload differs.
+Help text updated to explain the trade-off.
+
+Existing pinned tests (which verify flag acceptance) still pass.
+`-v` no longer prints `[pinned]` lines unless explicitly enabled.
+
+---
+
+## v0.12.44 — Compress reuses one pinned buffer for both H2D and D2H
+
+v0.12.43 only pinned H2D for compress (output went direct device →
+pageable vector).  But the H2D pinned slot is unused after the upload
+finishes — the GPU has the data on-device, the host slot sits idle for
+the rest of the batch.  v0.12.44 reuses that same slot for the D2H
+output readback:
+
+1. H2D phase: input chunk is memcpy'd into `pinned[i]`, then
+   `cudaMemcpyAsync` host → device.
+2. Compute phase: GPU has the data; pinned slot is idle.
+3. D2H phase: compressed output `cudaMemcpy`'d device → `pinned[i]`,
+   then `memcpy` from pinned slot into the output `std::vector<char>`.
+
+Each slot is sized to `max(gpu_chunk, max_out_chunk)` (≈ 16 MiB +
+~3 KiB) so either direction's data fits.  Per-stream batches are
+already serialised (`C.busy` gates re-pop until D2H + result delivery
+complete), so there's no buffer-conflict race.
+
+**Net effect:** compress now gets pinned D2H **for free** — same RAM
+allocation as before, just slightly larger slot stride.  Pinned
+cudaMemcpy uses a faster DMA path than pageable, so D2H finishes
+sooner and the tot_ms / GPU-throughput numbers at -vv reflect that.
+
+The `[pinned]` log line at -v changed:
+```
+[pinned] H2D 1.62 GiB reserved              # before v0.12.44
+[pinned] H2D+D2H 1.63 GiB reserved (shared per slot)  # v0.12.44+
+```
+
+Decompress is unchanged (separate H2D-pageable / D2H-pinned scheme
+from v0.12.43).  Adding pinned H2D there would mean an extra
+mmap → pinned memcpy, which usually doesn't pay off because the
+input pages are already cached.
+
+---
+
+## v0.12.43 — `--pinned auto` rations to ≤50% RAM + adds D2H pinning on decompress
+
+### `--pinned auto` is now actually a heuristic
+
+Before: `auto` and `on` were treated identically — both unconditionally
+called `cudaHostAlloc`.  Misleading naming.
+
+Now: `auto` rations pinned host memory to ≤50% of available system RAM,
+summed across ALL gpu-worker threads (compress H2D + decompress D2H).
+Streams that fit get pinned.  Streams that don't ("unlucky" ones) fall
+back to pageable memory silently.  Same fallback if `cudaHostAlloc`
+fails for any reason.
+
+`--pinned on` keeps the prior behaviour (unconditional reserve, ignores
+the budget).  `--pinned off` (and `--no-pinned`) skip pinning entirely.
+
+Implementation: a global `g_pinned_bytes_reserved` atomic + `try_reserve_pinned` /
+`release_pinned` helpers.  AUTO uses CAS to reserve from the global
+budget; ON / OFF short-circuit.  The `[pinned]` log line at -v shows
+each reservation and any skipped streams with the reason.
+
+### Pinned D2H buffer added to decompress
+
+Before: `DecompStreamCtx` had no pinned host memory at all — every D2H
+copied straight from device to a freshly-allocated `std::vector<char>`
+in pageable memory.
+
+Now: each decompress stream allocates a pinned host staging buffer of
+`alloc_batch * alloc_decomp` bytes (typically a few GiB per stream).
+The D2H loop copies device → pinned slot, then `memcpy` from pinned
+slot into the output `std::vector`.  Pinned cudaMemcpy uses a faster
+DMA path; the pinned-to-pageable memcpy is a plain `memcpy` (which the
+kernel optimises well).
+
+Allocation honours the same `--pinned auto` budget; on `--pinned off`
+the decompress path falls back to the previous direct-to-pageable
+behaviour.  The pinned buffer is reused across batches and grown only
+when `alloc_batch` or `alloc_decomp` increase, so per-batch overhead
+is zero.
+
+(Compress D2H still uses direct exact-size copies — output sizes are
+variable, so a fixed-size pinned slot would either waste 2× memory or
+need a per-chunk pinned allocator.  Could be added later if measured
+to matter.)
+
+---
+
+## v0.12.42 — `--help`: throttle flags moved to CPU/GPU TUNING (apply to all modes)
+
+`--throttle-factor` and `--throttle-frames` were listed only under
+HYBRID SCHEDULER, which made them look hybrid-only.  They actually
+affect every multi-threaded path (CPU-only compress with `-T ≥ 2`,
+CPU-only decompress, GPU-only, hybrid).
+
+Moved the canonical description into CPU TUNING with `[all modes]`
+markers and concrete tuning guidance ("bump to 8 or 16 if you see
+`source=pipeline` and the writer is bursty").  Added a cross-reference
+in GPU TUNING with a GPU-specific note about permit starvation when
+N_GPUs * streams * batch exceeds the default budget.  Removed the
+duplicate entries from HYBRID SCHEDULER.
+
+No behaviour change — purely documentation.
 
 ---
 

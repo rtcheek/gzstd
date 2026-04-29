@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.41";
+static constexpr const char * GZSTD_VERSION = "0.12.46";
 //
 // Architecture overview:
 //
@@ -234,13 +234,16 @@ struct Options {
   double gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   size_t gpu_streams = 0;            // 0=auto (1 for compress, 2 for test/verify)
   int gpu_devices = 0;            // 0=auto (all for compress, 1 for decompress)
-  PinMode pin_mode = PinMode::AUTO;
+  PinMode pin_mode = PinMode::OFF;  // empirical: pinned cudaMemcpy is slower
+                                    // on our typical workloads (see CHANGELOG
+                                    // v0.12.45).  Opt-in with --pinned=on.
 #endif
   std::string stats_json;
   int sparse_mode = -1;           // -1=auto (file:on, stdout:off), 0=off, 1=on
   bool sliding_window = false;    // --sliding-window: single-frame compression (cpu-only)
   bool sync_output = false;       // --sync-output: fsync before closing output file
   bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
+  bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -575,10 +578,12 @@ static void print_help()
 "\n"
 "I/O:\n"
 "  --[no-]sparse       sparse file writes (default: on for files)\n"
+"  --[no-]mmap         zero-copy mmap reader for regular-file inputs\n"
+"                      (default: on; --no-mmap forces fread)\n"
 "  --direct            O_DIRECT output (bypass page cache)\n"
 "  --sync-output       fsync output before exit\n"
 #ifdef HAVE_NVCOMP
-"  --pinned MODE       pinned host buffers: auto|on|off (default: auto)\n"
+"  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
 "\n"
 "Logging:\n"
@@ -669,6 +674,15 @@ static void print_help_long()
 "     buffered.  O_DIRECT exposes the app to NVMe GC stalls and\n"
 "     journal commits and typically increases wall-time variance.\n"
 "\n"
+"  --mmap / --no-mmap    (default: on)\n"
+"     Use a zero-copy memory-mapped reader for regular-file inputs.\n"
+"     mmap lets workers read directly from the kernel's page cache —\n"
+"     no fread + memcpy through a userspace buffer, no producer\n"
+"     thread serialising the input read.  Pipes and stdin always\n"
+"     fall back to fread regardless of this flag.  --no-mmap forces\n"
+"     fread for benchmarking — use it to verify mmap is actually\n"
+"     buying you something on your hardware.\n"
+"\n"
 "============================================================\n"
 " COMPRESSION LEVEL\n"
 "============================================================\n"
@@ -743,6 +757,21 @@ static void print_help_long()
 "  --cpu-backlog N  [hybrid only]\n"
 "     Secondary queue threshold for CPU workers.  0 = off.\n"
 "\n"
+"  --throttle-factor N    [all modes]\n"
+"     Slack multiplier for the in-flight frame budget.  Default: 4.\n"
+"     Budget = parallelism * factor, capped at RAM/2, floor 32.\n"
+"     Affects performance: too low and workers stall waiting for the\n"
+"     writer to release permits during NVMe stalls (GC, journal commit);\n"
+"     too high wastes RAM with no upside.  Bump to 8 or 16 if you see\n"
+"     `source=pipeline` at -v and suspect the writer is bursty.\n"
+"     No effect with -T 1 or --sliding-window (no parallelism to bound).\n"
+"\n"
+"  --throttle-frames N    [all modes]\n"
+"     Explicit in-flight frame cap (bypasses the parallelism * factor\n"
+"     formula).  Use only if you're memory-constrained or chasing a\n"
+"     deadlock; otherwise let the formula run.  Visible at -v as\n"
+"     `source=user` in the throttle line.\n"
+"\n"
 #ifdef HAVE_NVCOMP
 "============================================================\n"
 " GPU TUNING\n"
@@ -769,9 +798,33 @@ static void print_help_long()
 "  --gpu-only\n"
 "     GPU only, no CPU workers (error if no GPU available).\n"
 "\n"
-"  --pinned {auto|on|off}\n"
-"     Control pinned host buffers for H2D/D2H transfers.\n"
-"     --no-pinned is an alias for --pinned=off.\n"
+"  --pinned {auto|on|off}    (default: off)\n"
+"     Control pinned (page-locked) host buffers for H2D / D2H transfers.\n"
+"     Pinned cudaMemcpy uses a different DMA path than pageable; on our\n"
+"     typical workloads it has measured SLOWER than pageable (compress\n"
+"     ~15%% slower, decompress ~2.4x slower) — the cost of locking pages\n"
+"     and the extra mmap-or-vector copy outweighs any DMA savings when\n"
+"     the input is already in the page cache.  Off is the default for\n"
+"     that reason.  The infrastructure is plumbed and exposed in case\n"
+"     this differs on your hardware/workload.\n"
+"       off (default): no pinned buffers; data goes pageable -> device\n"
+"              and device -> std::vector directly.  --no-pinned is an\n"
+"              alias for this.\n"
+"       auto:  ration to <=50%% of available RAM, summed across all GPU\n"
+"              workers.  Streams that fit get pinned; streams that\n"
+"              don't fall back to pageable.  Visible at -v as\n"
+"              `[pinned] H2D+D2H <size> reserved (shared per slot)`.\n"
+"       on:    pin every stream regardless of system RAM.  May fail\n"
+"              with cudaHostAlloc errors on memory-pressured boxes.\n"
+"\n"
+"  --throttle-factor N / --throttle-frames N    [all modes]\n"
+"     Bound the in-flight frame budget shared by GPU + CPU workers and\n"
+"     the writer.  Particularly relevant on GPU paths with multiple\n"
+"     streams: with N GPUs * S streams * batch=B, peak permit demand\n"
+"     can exceed the default budget and stall GPUs behind the writer.\n"
+"     Bump --throttle-factor to 8 or 16, or set --throttle-frames\n"
+"     directly, if -vv shows GPUs blocked on permit acquire.  See\n"
+"     CPU TUNING above for full description.\n"
 "\n"
 #endif
 "============================================================\n"
@@ -787,13 +840,6 @@ static void print_help_long()
 "\n"
 "  --hybrid-floor-factor X\n"
 "     Override the auto scale with a fixed [0..1] multiplier.\n"
-"\n"
-"  --throttle-factor N\n"
-"     Slack multiplier for the in-flight frame budget.  Default: 4.\n"
-"     Budget = parallelism * factor, capped at RAM/2, floor 32.\n"
-"\n"
-"  --throttle-frames N\n"
-"     Explicit in-flight frame cap (bypasses the formula).\n"
 "\n"
 "  -M N, --memlimit=N, --memory=N\n"
 "     Memory usage limit in MiB (zstd-compatible).  On decompression,\n"
@@ -1638,6 +1684,63 @@ static uint64_t get_available_ram_bytes()
 #else
   return 0;  // unknown on non-Linux
 #endif
+}
+
+/*======================================================================
+ Pinned host-memory budget (--pinned auto)
+ -----------------------------------------------------------------------
+ Pinned (page-locked) memory speeds up cudaMemcpyAsync but is a global
+ system resource: locked pages can't be swapped, and over-pinning starves
+ other workloads (and on memory-pressured boxes, the kernel may refuse
+ the allocation outright).
+
+ AUTO mode rations pinning to <=50% of available system RAM, summed
+ across ALL gpu workers (compress H2D + decompress D2H).  Streams that
+ fit in the remaining budget get pinned; streams that don't (the
+ unlucky ones) fall back to pageable memory.  Same applies if
+ cudaHostAlloc fails for any reason — the worker silently uses
+ pageable for that stream.
+
+ PinMode::ON skips the budget check (user said "yes, pin everything").
+ PinMode::OFF skips the entire path (no allocation attempt).
+======================================================================*/
+static std::atomic<uint64_t> g_pinned_bytes_reserved{0};
+static std::atomic<uint64_t> g_pinned_bytes_budget{0};
+static std::once_flag g_pinned_budget_init;
+
+static void init_pinned_budget()
+{
+  uint64_t avail = get_available_ram_bytes();
+  if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;  // assume 8 GiB if unknown
+  g_pinned_bytes_budget.store(avail / 2, std::memory_order_relaxed);
+}
+
+// Try to reserve `want_bytes` from the global pinned-memory budget.
+// Returns true if reserved (caller must release on failure or shutdown).
+// Honors --pinned mode: ON always reserves, OFF always refuses, AUTO checks
+// the budget atomically.
+static bool try_reserve_pinned(uint64_t want_bytes, const Options & opt)
+{
+  if (opt.pin_mode == PinMode::OFF) return false;
+  if (opt.pin_mode == PinMode::ON)  return true;  // user override
+  std::call_once(g_pinned_budget_init, init_pinned_budget);
+  uint64_t budget = g_pinned_bytes_budget.load(std::memory_order_relaxed);
+  uint64_t cur = g_pinned_bytes_reserved.load(std::memory_order_acquire);
+  while (true) {
+    if (cur + want_bytes > budget) return false;
+    if (g_pinned_bytes_reserved.compare_exchange_weak(
+          cur, cur + want_bytes,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+      return true;
+    }
+    // cur was updated by the CAS, retry
+  }
+}
+
+static void release_pinned(uint64_t bytes, const Options & opt)
+{
+  if (opt.pin_mode != PinMode::AUTO) return;  // ON/OFF didn't reserve
+  g_pinned_bytes_reserved.fetch_sub(bytes, std::memory_order_release);
 }
 
 // Compute a throttle budget: how many frames can be buffered in ResultStore
@@ -4641,7 +4744,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<size_t> seq{0};
 #ifndef _WIN32
   MmapRegion mmap_region;
-  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)
+  if (opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
+      && fs::is_regular_file(opt.input)
       && mmap_region.open(opt.input.c_str())) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "using mmap zero-copy reader\n");
@@ -4844,9 +4948,16 @@ struct StreamCtx {
   nvcompStatus_t* d_stats      = nullptr;
   size_t          temp_bytes_used = 0;
 
-  // Pinned host memory for faster H2D transfers (optional)
+  // Pinned host memory for H2D + D2H transfers (optional).
+  // ONE buffer per stream is sized to max(gpu_chunk, max_out_chunk) per
+  // slot and used for both directions (input upload, then output readback).
+  // h_io_slot_bytes is the per-slot stride so the D2H code can address slots.
+  // Bytes tracked separately so we can release back to the global budget.
   void * h2d_pinned_base = nullptr;
+  size_t h2d_pinned_bytes = 0;
+  size_t h_io_slot_bytes = 0;  // per-slot stride within h2d_pinned_base
   void * d2h_pinned_base = nullptr;
+  size_t d2h_pinned_bytes = 0;
 
   // Host-side vectors (mirroring device arrays for readback)
   std::vector<size_t>         h_in_sizes;
@@ -4945,14 +5056,50 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   if (cudaMalloc(&C.d_in_sizes,   sizeof(size_t)         * C.per_stream_batch) != cudaSuccess) return false;
   if (cudaMalloc(&C.d_comp_sizes, sizeof(size_t)         * C.per_stream_batch) != cudaSuccess) return false;
   if (cudaMalloc(&C.d_stats,      sizeof(nvcompStatus_t) * C.per_stream_batch) != cudaSuccess) return false;
-  // Optionally allocate pinned (page-locked) host memory for faster H2D transfers
-  bool want_pin = (opt.pin_mode != PinMode::OFF);
-  if (want_pin) {
-    if (cudaHostAlloc(&C.h2d_pinned_base, C.per_stream_batch * gpu_chunk,
-                      cudaHostAllocDefault) != cudaSuccess)
-      C.h2d_pinned_base = nullptr;  // fall back to pageable memory
-    C.d2h_pinned_base = nullptr;    // D2H uses exact-size copies
+  // Optionally allocate pinned (page-locked) host memory for faster H2D
+  // and D2H transfers.  ONE buffer per stream serves both directions:
+  // the slot holds input pre-upload, then the same slot holds compressed
+  // output post-D2H.  Sized to max(gpu_chunk, max_out_chunk) per slot so
+  // either direction fits.  Safe because batches are serialised within a
+  // stream (C.busy gates re-pop until D2H + result delivery complete).
+  // AUTO mode rations to <=50% of system RAM via the global budget;
+  // ON forces; OFF skips.  Streams that don't fit the budget (or fail
+  // cudaHostAlloc) silently fall back to pageable memory.
+  const size_t pin_slot_bytes = std::max(gpu_chunk, max_out_chunk);
+  const size_t pin_h2d_bytes = C.per_stream_batch * pin_slot_bytes;
+  C.h_io_slot_bytes = pin_slot_bytes;
+  if (try_reserve_pinned(pin_h2d_bytes, opt)) {
+    if (cudaHostAlloc(&C.h2d_pinned_base, pin_h2d_bytes,
+                      cudaHostAllocDefault) != cudaSuccess) {
+      C.h2d_pinned_base = nullptr;
+      release_pinned(pin_h2d_bytes, opt);
+      if (opt.verbosity >= V_VERBOSE) {
+        char sz[32]; human_bytes(double(pin_h2d_bytes), sz, sizeof(sz));
+        vlog(V_VERBOSE, opt, std::string("[pinned] H2D/D2H alloc failed (")
+             + sz + "); using pageable for this stream\n");
+      }
+    } else {
+      C.h2d_pinned_bytes = pin_h2d_bytes;
+      if (opt.verbosity >= V_VERBOSE) {
+        char sz[32]; human_bytes(double(pin_h2d_bytes), sz, sizeof(sz));
+        vlog(V_VERBOSE, opt, std::string("[pinned] H2D+D2H ") + sz
+             + " reserved (shared per slot)\n");
+      }
+    }
+  } else if (opt.pin_mode == PinMode::AUTO) {
+    if (opt.verbosity >= V_VERBOSE) {
+      char sz[32]; human_bytes(double(pin_h2d_bytes), sz, sizeof(sz));
+      char rem[32];
+      uint64_t budget = g_pinned_bytes_budget.load();
+      uint64_t reserved = g_pinned_bytes_reserved.load();
+      human_bytes(double(budget > reserved ? budget - reserved : 0),
+                  rem, sizeof(rem));
+      vlog(V_VERBOSE, opt, std::string("[pinned] H2D ") + sz
+           + " skipped (auto budget exhausted, " + rem
+           + " left); using pageable\n");
+    }
   }
+  C.d2h_pinned_base = nullptr;  // compress D2H uses exact-size copies (variable output)
 
   // Build pointer arrays: each slot points to its region of the large buffer
   std::vector<void*> h_in_ptrs(C.per_stream_batch);
@@ -4984,12 +5131,13 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   cudaEventCreateWithFlags(&C.ev_d2h_end,   cudaEventDefault);
 
   C.stats.pinned_h2d = (C.h2d_pinned_base != nullptr);
-  C.stats.pinned_d2h = false;
+  // The same buffer is reused for D2H (compress output readback).
+  C.stats.pinned_d2h = (C.h2d_pinned_base != nullptr);
   C.stats.batch_capacity = per_stream_batch;
   return true;
 }
 
-static void free_stream_buffers_only(StreamCtx & C)
+static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
 {
   if (C.d_in_base) { cudaFree(C.d_in_base); }
   if (C.d_out_base) { cudaFree(C.d_out_base); }
@@ -4999,8 +5147,16 @@ static void free_stream_buffers_only(StreamCtx & C)
   if (C.d_in_sizes) { cudaFree(C.d_in_sizes); }
   if (C.d_comp_sizes) { cudaFree(C.d_comp_sizes); }
   if (C.d_stats) { cudaFree(C.d_stats); }
-  if (C.h2d_pinned_base) { cudaFreeHost(C.h2d_pinned_base); }
-  if (C.d2h_pinned_base) { cudaFreeHost(C.d2h_pinned_base); }
+  if (C.h2d_pinned_base) {
+    cudaFreeHost(C.h2d_pinned_base);
+    release_pinned(C.h2d_pinned_bytes, opt);
+    C.h2d_pinned_bytes = 0;
+  }
+  if (C.d2h_pinned_base) {
+    cudaFreeHost(C.d2h_pinned_base);
+    release_pinned(C.d2h_pinned_bytes, opt);
+    C.d2h_pinned_bytes = 0;
+  }
   if (C.ev_h2d_begin) { cudaEventDestroy(C.ev_h2d_begin); }
   if (C.ev_h2d_end) { cudaEventDestroy(C.ev_h2d_end); }
   if (C.ev_comp_end) { cudaEventDestroy(C.ev_comp_end); }
@@ -5195,7 +5351,7 @@ static void gpu_worker(
       bool stream_init_failed = false;
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
         // Free any partial allocations from the failed attempt
-        free_stream_buffers_only(C);
+        free_stream_buffers_only(C, opt);
         if (C.per_stream_batch <= 1 || ++vram_retries > 10) {
           // Can't fit even batch=1 on this stream.  If we already initialized
           // one or more streams, stop adding more and run with what we have
@@ -5524,7 +5680,7 @@ static void gpu_worker(
           void * d_dst = static_cast<char*>(C.d_in_base) + i * C.gpu_chunk;
 
           if (C.h2d_pinned_base) {
-            void * h_src = static_cast<char*>(C.h2d_pinned_base) + i * C.gpu_chunk;
+            void * h_src = static_cast<char*>(C.h2d_pinned_base) + i * C.h_io_slot_bytes;
             std::memcpy(h_src, t.ptr(), t.len());
             checkCuda(cudaMemcpyAsync(d_dst, h_src, t.len(),
                                       cudaMemcpyHostToDevice, C.stream),
@@ -5596,9 +5752,20 @@ static void gpu_worker(
             std::vector<char> h_out(csz);
             const void * d_src = static_cast<char*>(C.d_out_base)
                                  + i * C.max_out_chunk;
-            checkCuda(cudaMemcpy(h_out.data(), d_src, csz,
-                                 cudaMemcpyDeviceToHost),
-                      "cudaMemcpy(D2H exact)");
+            if (C.h2d_pinned_base) {
+              // Reuse the H2D pinned slot for D2H — input was already
+              // consumed by the GPU, slot is free until next batch's pop.
+              void * pin_slot = static_cast<char*>(C.h2d_pinned_base)
+                                + i * C.h_io_slot_bytes;
+              checkCuda(cudaMemcpy(pin_slot, d_src, csz,
+                                   cudaMemcpyDeviceToHost),
+                        "cudaMemcpy(D2H pinned shared slot)");
+              std::memcpy(h_out.data(), pin_slot, csz);
+            } else {
+              checkCuda(cudaMemcpy(h_out.data(), d_src, csz,
+                                   cudaMemcpyDeviceToHost),
+                        "cudaMemcpy(D2H exact)");
+            }
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
           }
           double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
@@ -5739,7 +5906,17 @@ static void gpu_worker(
             const size_t csz = C.h_comp_sizes[i];
             std::vector<char> h_out(csz);
             const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
-            checkCuda(cudaMemcpy(h_out.data(), d_src, csz, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H exact sync)");
+            if (C.h2d_pinned_base) {
+              // Reuse the H2D pinned slot for D2H (sync drain path).
+              void * pin_slot = static_cast<char*>(C.h2d_pinned_base)
+                                + i * C.h_io_slot_bytes;
+              checkCuda(cudaMemcpy(pin_slot, d_src, csz, cudaMemcpyDeviceToHost),
+                        "cudaMemcpy(D2H pinned shared slot sync)");
+              std::memcpy(h_out.data(), pin_slot, csz);
+            } else {
+              checkCuda(cudaMemcpy(h_out.data(), d_src, csz, cudaMemcpyDeviceToHost),
+                        "cudaMemcpy(D2H exact sync)");
+            }
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
           }
           double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
@@ -5866,7 +6043,7 @@ static void gpu_worker(
     // Free all GPU resources for this device
     if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
-      free_stream_buffers_only(C);
+      free_stream_buffers_only(C, opt);
       if (C.stream) cudaStreamDestroy(C.stream);
       C.stream = nullptr;
     }
@@ -5902,7 +6079,7 @@ static void gpu_worker(
               queue->re_enqueue(C.batch);
             }
           }
-          free_stream_buffers_only(C);
+          free_stream_buffers_only(C, opt);
           if (C.stream) cudaStreamDestroy(C.stream);
         }
       }
@@ -6341,7 +6518,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   const size_t gpu_chunk = std::min(host_chunk, GPU_SUBCHUNK_MAX);
 #ifndef _WIN32
   MmapRegion mmap_region;
-  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input)
+  if (opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
+      && fs::is_regular_file(opt.input)
       && mmap_region.open(opt.input.c_str())) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "using mmap zero-copy reader\n");
@@ -6553,6 +6731,12 @@ static void gpu_decomp_worker(
     std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual;
     std::vector<nvcompStatus_t> h_statuses;
 
+    // Pinned host buffer for D2H decompressed output (faster cudaMemcpy
+    // than to pageable memory).  Sized batch_n * max_decomp; reused across
+    // batches.  Allocated through the global pinned-RAM budget (--pinned).
+    void * h_decomp_pinned = nullptr;
+    size_t h_decomp_pinned_bytes = 0;
+
     void free_device() {
       if (d_comp_buf)    { cudaFree(d_comp_buf);    d_comp_buf = nullptr; }
       if (d_decomp_buf)  { cudaFree(d_decomp_buf);  d_decomp_buf = nullptr; }
@@ -6564,6 +6748,18 @@ static void gpu_decomp_worker(
       if (d_actual_sizes){ cudaFree(d_actual_sizes); d_actual_sizes = nullptr; }
       if (d_statuses)    { cudaFree(d_statuses);     d_statuses = nullptr; }
       alloc_batch = 0; alloc_comp = 0; alloc_decomp = 0; temp_bytes = 0;
+    }
+    // Free pinned host buffer.  Caller must release the budget separately
+    // (we don't have access to Options here).  Returns the byte count freed.
+    size_t free_host_pinned() {
+      size_t freed = 0;
+      if (h_decomp_pinned) {
+        cudaFreeHost(h_decomp_pinned);
+        h_decomp_pinned = nullptr;
+        freed = h_decomp_pinned_bytes;
+        h_decomp_pinned_bytes = 0;
+      }
+      return freed;
     }
 
     // Ensure buffers are large enough for the given batch parameters.
@@ -7036,6 +7232,37 @@ static void gpu_decomp_worker(
           throw std::runtime_error("GPU decomp: failed to allocate device buffers");
         }
 
+        // (Re-)allocate pinned host D2H staging buffer if the per-batch
+        // decompressed footprint grew.  Pinned -> pageable memcpy is faster
+        // than direct device -> pageable for the decompressed results, and
+        // future async-D2H overlap optimizations can build on this.
+        // Honors the global --pinned budget; falls back to no pinned buffer.
+        {
+          size_t want = C.alloc_batch * C.alloc_decomp;
+          if (want > 0 && want != C.h_decomp_pinned_bytes) {
+            if (C.h_decomp_pinned) {
+              cudaFreeHost(C.h_decomp_pinned);
+              release_pinned(C.h_decomp_pinned_bytes, opt);
+              C.h_decomp_pinned = nullptr;
+              C.h_decomp_pinned_bytes = 0;
+            }
+            if (try_reserve_pinned(want, opt)) {
+              if (cudaHostAlloc(&C.h_decomp_pinned, want, cudaHostAllocDefault)
+                  != cudaSuccess) {
+                C.h_decomp_pinned = nullptr;
+                release_pinned(want, opt);
+              } else {
+                C.h_decomp_pinned_bytes = want;
+                if (opt.verbosity >= V_VERBOSE) {
+                  char sz[32]; human_bytes(double(want), sz, sizeof(sz));
+                  vlog(V_VERBOSE, opt, std::string("[pinned] D2H ") + sz
+                       + " reserved (decompress)\n");
+                }
+              }
+            }
+          }
+        }
+
         // Upload compressed data H2D (async into CUDA stream).
         // Per-frame cudaMemcpyAsync is efficient because CUDA batches them
         // internally in the stream  no host-side blocking between transfers.
@@ -7193,8 +7420,18 @@ static void gpu_decomp_worker(
 
           std::vector<char> h_out(actual);
           const void * d_src = static_cast<char*>(C.d_decomp_buf) + i * C.alloc_decomp;
-          checkCuda(cudaMemcpy(h_out.data(), d_src, actual,
-                               cudaMemcpyDeviceToHost), "D2H decomp data");
+          if (C.h_decomp_pinned) {
+            // Device -> pinned host slot, then memcpy pinned -> output vector.
+            // Pinned cudaMemcpy uses a faster DMA path than pageable.
+            void * pin_slot = static_cast<char*>(C.h_decomp_pinned)
+                              + i * C.alloc_decomp;
+            checkCuda(cudaMemcpy(pin_slot, d_src, actual,
+                                 cudaMemcpyDeviceToHost), "D2H decomp pinned");
+            std::memcpy(h_out.data(), pin_slot, actual);
+          } else {
+            checkCuda(cudaMemcpy(h_out.data(), d_src, actual,
+                                 cudaMemcpyDeviceToHost), "D2H decomp data");
+          }
 
           uint64_t rl_t0 = g_perf ? now_ns() : 0;
           results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
@@ -7319,6 +7556,8 @@ static void gpu_decomp_worker(
     if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
       C.free_device();
+      size_t freed = C.free_host_pinned();
+      if (freed) release_pinned(freed, opt);
       if (C.ev_begin) cudaEventDestroy(C.ev_begin);
       if (C.ev_end)   cudaEventDestroy(C.ev_end);
       if (C.stream)   cudaStreamDestroy(C.stream);
@@ -7346,6 +7585,8 @@ static void gpu_decomp_worker(
           queue->re_enqueue(C.batch);
         }
         C.free_device();
+        size_t freed = C.free_host_pinned();
+        if (freed) release_pinned(freed, opt);
         if (C.ev_begin) { cudaEventDestroy(C.ev_begin); C.ev_begin = nullptr; }
         if (C.ev_end)   { cudaEventDestroy(C.ev_end);   C.ev_end = nullptr; }
         if (C.stream)   { cudaStreamDestroy(C.stream);   C.stream = nullptr; }
@@ -8226,6 +8467,8 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--sync-output") opt.sync_output = true;
     else if (a == "--direct") opt.direct_io = true;
     else if (a == "--no-direct") opt.direct_io = false;
+    else if (a == "--mmap" || a == "--mmap=on")  opt.use_mmap = true;
+    else if (a == "--no-mmap" || a == "--mmap=off") opt.use_mmap = false;
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
     else if (a == "-v" || a == "--verbose") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
