@@ -1,9 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.49  
+**Covers:** v0.9.50 → v0.12.50  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.50 — `--preallocate` / `--no-preallocate` toggle for fallocate
+
+Adds the same on/off control over the `fallocate` upfront-preallocate
+that `--mmap`, `--pinned`, and `--direct` already have.  Default stays
+ON (matches the prior unconditional behaviour); `--no-preallocate`
+skips fallocate so users can A/B test whether it actually helps on
+their filesystem.
+
+Touches all four call sites where `g_direct_writer->preallocate(...)`
+fires today (compress/decompress, CPU-only and nvCOMP paths).
+Preallocation only runs when:
+- `--direct` (O_DIRECT) is in effect (fallocate is on `DirectWriter`)
+- The expected size is known (input file size for compress, sum of
+  frame_decomp sizes for decompress)
+- `--preallocate` is on (new — was previously unconditional)
+
+`--no-preallocate` is documented as useful on filesystems that
+handle inline extent allocation efficiently (XFS, ZFS), or for
+benchmarking the allocation cost.
+
+Tests: 263/263.
 
 ---
 

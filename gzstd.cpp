@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.49";
+static constexpr const char * GZSTD_VERSION = "0.12.50";
 //
 // Architecture overview:
 //
@@ -246,6 +246,7 @@ struct Options {
   bool sync_output = false;       // --sync-output: fsync before closing output file
   bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
+  bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -585,6 +586,8 @@ static void print_help()
 "  --[no-]sparse       sparse file writes (default: on for files)\n"
 "  --[no-]mmap         zero-copy mmap reader for regular-file inputs\n"
 "                      (default: on; --no-mmap forces fread)\n"
+"  --[no-]preallocate  fallocate output to expected size up front\n"
+"                      (default: on; --no-preallocate skips fallocate)\n"
 "  --direct            O_DIRECT output (bypass page cache)\n"
 "  --sync-output       fsync output before exit\n"
 #ifdef HAVE_NVCOMP
@@ -687,6 +690,17 @@ static void print_help_long()
 "     fall back to fread regardless of this flag.  --no-mmap forces\n"
 "     fread for benchmarking — use it to verify mmap is actually\n"
 "     buying you something on your hardware.\n"
+"\n"
+"  --preallocate / --no-preallocate    (default: on)\n"
+"     Preallocate the output file with `fallocate` to its expected\n"
+"     final size before writes begin.  Avoids per-write extent\n"
+"     allocation stalls (each fwrite that crosses an unallocated\n"
+"     extent triggers a journal commit on ext4).  Only used when\n"
+"     the expected size is known: O_DIRECT compress/decompress\n"
+"     paths where input file size or sum of frame_decomp sizes\n"
+"     gives an upper bound.  --no-preallocate skips it for\n"
+"     benchmarking, or for filesystems that handle extent\n"
+"     allocation efficiently inline (XFS, ZFS).\n"
 "\n"
 "============================================================\n"
 " COMPRESSION LEVEL\n"
@@ -4421,7 +4435,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   // Preallocate output file to avoid per-write extent allocation overhead.
   // total_out is known from zstd frame headers parsed by stream_frames_to_queue.
 #ifndef _WIN32
-  if (g_direct_writer && m && n_frames > 0) {
+  if (g_direct_writer && m && n_frames > 0 && opt.preallocate_output) {
     uint64_t total = m->total_out.load(std::memory_order_relaxed);
     if (total > 0 && g_direct_writer->preallocate(total)) {
       char sz[32]; human_bytes(double(total), sz, sizeof(sz));
@@ -4537,7 +4551,8 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
 
   // Preallocate output file: input size is a safe upper bound for compressed output.
 #ifndef _WIN32
-  if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
+  if (g_direct_writer && total_in > 0 && opt.preallocate_output
+      && g_direct_writer->preallocate(total_in)) {
     char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
   }
@@ -4743,7 +4758,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Preallocate output file: input size is a safe upper bound for compressed output.
 #ifndef _WIN32
-  if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
+  if (g_direct_writer && total_in > 0 && opt.preallocate_output
+      && g_direct_writer->preallocate(total_in)) {
     char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
   }
@@ -6407,7 +6423,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Preallocate output file: input size is a safe upper bound for compressed output.
 #ifndef _WIN32
-  if (g_direct_writer && total_in > 0 && g_direct_writer->preallocate(total_in)) {
+  if (g_direct_writer && total_in > 0 && opt.preallocate_output
+      && g_direct_writer->preallocate(total_in)) {
     char sz[32]; human_bytes(double(total_in), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
   }
@@ -7851,7 +7868,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 
   // Preallocate output file to avoid per-write extent allocation overhead.
 #ifndef _WIN32
-  if (g_direct_writer && m && n_frames > 0) {
+  if (g_direct_writer && m && n_frames > 0 && opt.preallocate_output) {
     uint64_t total = m->total_out.load(std::memory_order_relaxed);
     if (total > 0 && g_direct_writer->preallocate(total)) {
       char sz[32]; human_bytes(double(total), sz, sizeof(sz));
@@ -8534,6 +8551,8 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--no-direct") opt.direct_io = false;
     else if (a == "--mmap" || a == "--mmap=on")  opt.use_mmap = true;
     else if (a == "--no-mmap" || a == "--mmap=off") opt.use_mmap = false;
+    else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
+    else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
     else if (a == "-v" || a == "--verbose") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
