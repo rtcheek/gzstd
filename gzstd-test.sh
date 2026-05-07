@@ -345,7 +345,7 @@ human_size() {
 # auto-expand if you forget (so the display never shows > 100%),
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
-EXPECTED_TESTS=263
+EXPECTED_TESTS=270
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1504,6 +1504,90 @@ files_match "$TMPDIR/medium.txt" "$TMPDIR/cpubatch0.dec" \
   && pass "--cpu-batch=0 data correct" || fail "--cpu-batch=0 data" "mismatch"
 
 rm -f "$TMPDIR"/cpubatch* "$TMPDIR"/cpubl*
+
+# ============================================================
+# 25b. --cpu-share fixed CPU/GPU split (hybrid only)
+# ============================================================
+section "--cpu-share scheduling (hybrid)"
+
+if has_gpu 2>/dev/null; then
+  # Build a multi-chunk file large enough that GPU initialization
+  # finishes before the reader does — otherwise CPU drains everything
+  # while GPU is still booting and the share is unobservable.
+  # 512 MiB at --chunk-size 4 = 128 frames.
+  share_src="$TMPDIR/share-src.bin"
+  dd if=/dev/urandom bs=1M count=256 2>/dev/null  > "$share_src"
+  dd if=/dev/zero    bs=1M count=256 2>/dev/null >> "$share_src"
+
+  # Round-trip correctness across the share range.
+  for share in 0.0 0.25 0.5 0.75 1.0; do
+    compressed="$TMPDIR/share-${share}.zst"
+    recovered="$TMPDIR/share-${share}.dec"
+    run_test "$GZSTD" --hybrid --cpu-share $share --chunk-size 4 \
+      -k -f "$share_src" -o "$compressed" 2>/dev/null
+    if [[ ! -s "$compressed" ]]; then
+      fail "--cpu-share=$share round-trip" "empty compress output"
+      continue
+    fi
+    run_test "$GZSTD" -d --hybrid --cpu-share $share \
+      -k -f "$compressed" -o "$recovered" 2>/dev/null
+    files_match "$share_src" "$recovered" \
+      && pass "--cpu-share=$share round-trip" \
+      || fail "--cpu-share=$share round-trip" "data mismatch"
+    rm -f "$compressed" "$recovered"
+  done
+
+  # The -v banner reports the requested percentage.
+  banner_out=$("$GZSTD" --hybrid --cpu-share 0.42 --chunk-size 4 -v \
+    -k -f "$share_src" -o "$TMPDIR/share-banner.zst" 2>&1)
+  if echo "$banner_out" | grep -q "CPU share 42.0%"; then
+    pass "--cpu-share banner shows percentage"
+  else
+    fail "--cpu-share banner shows percentage" "(no '42.0%' in -v output)"
+  fi
+  rm -f "$TMPDIR/share-banner.zst"
+
+  # Behavioural check: at -vv, count CPU vs GPU frames at the extremes
+  # and verify the split actually responds to --cpu-share.  This is the
+  # regression guard for the v0.12.51 fix where every share landed at
+  # ~85% CPU regardless of what the user asked for.
+  measure_share() {
+    local share=$1 out cpu_n gpu_n
+    out=$("$GZSTD" --hybrid --cpu-share $share --chunk-size 4 -vv \
+      -k -f "$share_src" -o "$TMPDIR/share-meas.zst" 2>&1)
+    cpu_n=$(echo "$out" | grep -oE "CPU/T[0-9]+\] total tasks=[0-9]+" \
+            | grep -oE "[0-9]+$" | awk '{s+=$1}END{print s+0}')
+    gpu_n=$(echo "$out" | grep -oE "GPU[0-9]+/S[0-9]+\] total batches=[0-9]+ chunks=[0-9]+" \
+            | grep -oE "chunks=[0-9]+" | grep -oE "[0-9]+" | awk '{s+=$1}END{print s+0}')
+    rm -f "$TMPDIR/share-meas.zst"
+    echo "$cpu_n $gpu_n"
+  }
+
+  read low_cpu low_gpu  < <(measure_share 0.0)
+  read high_cpu high_gpu < <(measure_share 1.0)
+
+  if (( low_cpu + low_gpu > 0 )) && (( high_cpu + high_gpu > 0 )); then
+    if (( low_gpu > low_cpu )) && (( high_cpu > high_gpu )); then
+      pass "--cpu-share split responds to value" \
+           "(0.0: ${low_cpu}c/${low_gpu}g; 1.0: ${high_cpu}c/${high_gpu}g)"
+    else
+      fail "--cpu-share split responds to value" \
+           "(0.0: ${low_cpu}c/${low_gpu}g; 1.0: ${high_cpu}c/${high_gpu}g)"
+    fi
+  else
+    skip "--cpu-share split responds to value" "no -vv counters captured"
+  fi
+
+  rm -f "$share_src"
+else
+  skip "--cpu-share=0.0 round-trip"          "no GPU"
+  skip "--cpu-share=0.25 round-trip"         "no GPU"
+  skip "--cpu-share=0.5 round-trip"          "no GPU"
+  skip "--cpu-share=0.75 round-trip"         "no GPU"
+  skip "--cpu-share=1.0 round-trip"          "no GPU"
+  skip "--cpu-share banner shows percentage" "no GPU"
+  skip "--cpu-share split responds to value" "no GPU"
+fi
 
 # ============================================================
 # 26. Sync output

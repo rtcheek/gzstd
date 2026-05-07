@@ -1,9 +1,46 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.50  
+**Covers:** v0.9.50 → v0.12.51  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.12.51 — `--cpu-share` actually enforces the requested split
+
+`--cpu-share X` was effectively a no-op: every value from 0.0 to 1.0
+landed at ~85% CPU work on Lovelace, because the `may_take` predicate
+short-circuited on `qs.done` (`if (qs.done) return true;`) — so the
+moment the reader called `set_done()`, CPUs drained everything
+regardless of the user-set share.  The GPU side never consulted the
+share at all, so even after fixing the drain bypass, high shares
+(0.9, 1.0) capped at ~86% CPU because GPU kept stealing work.
+
+Three coordinated fixes in `HybridSched` and the worker loops:
+- The `qs.done` bypass now only triggers in fixed-share mode if every
+  GPU stream has unregistered (real GPU exit, not just stuck in CUDA).
+  Otherwise the share is honored through drain.
+- New `should_gpu_take()` is the symmetric counterpart of
+  `should_cpu_take()`: in fixed-share mode GPU yields when the
+  cumulative CPU ratio is below `target − 0.02`, same hysteresis band
+  the CPU side uses, so the ratio oscillates around the target instead
+  of one side starving.  Adaptive mode is unchanged (always returns
+  true; the EMA path drives sharing through `gpus_waiting_` and the
+  queue floor).
+- GPU workers propagate `producer_done_seen` when the share-yield path
+  observes `queue->drained()`, otherwise a perpetually-yielding GPU
+  would never exit its loop and the run would hang at high shares.
+
+Measured on Lovelace, 19.5 GiB medium-compressibility input, 22 CPU
+threads + 2× RTX 2080 Ti.  Before: 0.0 → 0.82, 0.5 → 0.86, 0.9 → 0.84
+(all within noise of each other).  After: 0.0 → 0.02, 0.1 → 0.12,
+0.25 → 0.27, 0.5 → 0.51, 0.75 → 0.76, 0.9 → 0.87, 1.0 → 0.98.  The
+slight undershoot at 0.9/1.0 is end-of-run drainage where GPU sweeps
+the tail after CPU threads exit.
+
+Adaptive mode (no `--cpu-share`) is untouched and still hits 5.6 GiB/s
+compress on the same input.
 
 ---
 

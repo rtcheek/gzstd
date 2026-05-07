@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.50";
+static constexpr const char * GZSTD_VERSION = "0.12.51";
 //
 // Architecture overview:
 //
@@ -3388,6 +3388,21 @@ public:
     return true;
   }
 
+  // GPU checks this before popping a batch.  In fixed-share mode, GPU
+  // yields when CPU is below its target share — symmetric counterpart
+  // to should_cpu_take().  In adaptive mode, GPU always takes (the EMA
+  // path drives sharing through gpus_waiting_ / queue floor instead).
+  bool should_gpu_take() const {
+    if (!fixed_mode_) return true;
+    const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
+    const uint64_t gpu = gpu_taken_.load(std::memory_order_relaxed);
+    const uint64_t total = cpu + gpu + 1;
+    // GPU takes when CPU has met (or exceeded) its share.  Same hysteresis
+    // band as should_cpu_take so the ratio oscillates around the target
+    // instead of one side starving when both check at the same moment.
+    return (double(cpu) / double(total)) >= (fixed_cpu_share_ - 0.02);
+  }
+
   // Minimum queue depth below which CPUs should not take work.
   // Reserves enough tasks for all GPU streams to fill their next batch.
   size_t cpu_queue_floor() const {
@@ -3507,6 +3522,10 @@ public:
 
   double target_share() const { return 0.5; }
   bool is_gpu_ready() const { return gpu_ready_.load(std::memory_order_acquire); }
+  bool is_fixed_mode() const { return fixed_mode_; }
+  bool any_gpu_active() const {
+    return active_gpu_streams_.load(std::memory_order_relaxed) > 0;
+  }
 
 private:
   const Options & opt_;
@@ -3723,9 +3742,18 @@ static void cpu_worker(
       // release the permit and retry.  Workers only hold permits while
       // actively processing — never while sleeping on the CV.
       auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
-        // Once producer is done, CPU must drain regardless of GPU state
-        if (qs.done) return true;
+        // Once producer is done, CPU must drain regardless of GPU state.
+        // Exception: in fixed-share mode, the user explicitly requested a
+        // CPU/GPU split — keep honoring it during drain so long as any GPU
+        // stream is still alive to pick up the rest.  If all GPU streams
+        // have unregistered (failure or normal exit), CPU drains.
+        if (qs.done) {
+          if (!sched->is_fixed_mode() || !sched->any_gpu_active()) return true;
+        }
         if (!sched->should_cpu_take()) return false;
+        // After producer is done, share is the only constraint — skip
+        // floor/queue_min reservations meant to keep GPU batches full.
+        if (qs.done) return true;
         // Reserve enough tasks for GPUs to fill their next batch cycle.
         // Without this, 96 CPUs drain the queue during GPU processing,
         // and GPUs find it empty when they come back for more.
@@ -3996,9 +4024,16 @@ static void cpu_decomp_worker(
         got_trivial = false;
         // Once producer is done, CPU must drain regardless of GPU state —
         // GPU may be stuck in bp->acquire, a CUDA op, or already exited.
-        if (qs.done) return true;
+        // Exception: in fixed-share mode, the user explicitly requested a
+        // CPU/GPU split — keep honoring it during drain so long as any GPU
+        // stream is still alive to pick up the rest.
+        if (qs.done) {
+          if (!sched->is_fixed_mode() || !sched->any_gpu_active()) return true;
+        }
         // Normal scheduling: respect GPU priority and queue depth threshold
         if (!sched->should_cpu_take()) return false;
+        // After producer is done, share is the only constraint.
+        if (qs.done) return true;
         size_t floor = sched->cpu_queue_floor();
         if (floor > 0 && qs.depth <= floor) return false;
         if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min) return false;
@@ -5650,6 +5685,14 @@ static void gpu_worker(
       // Submit batches
       for (auto & C : ctxs) {
         if (C.busy) { continue; }
+        // Fixed-share mode: GPU yields when CPU is below its target share.
+        // Skip this stream's pop attempt; the outer worker loop will retry.
+        // If the queue is already drained, propagate that so the worker can
+        // exit instead of spinning forever on the share check.
+        if (sched && !sched->should_gpu_take()) {
+          if (queue->drained()) producer_done_seen = true;
+          continue;
+        }
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
         // Greedy pop: wait for a full batch (per_stream_batch) or producer done.
@@ -7162,6 +7205,13 @@ static void gpu_decomp_worker(
       // Submit batches
       for (auto & C : ctxs) {
         if (C.busy) continue;
+        // Fixed-share mode: GPU yields when CPU is below its target share.
+        // If the queue is already drained, propagate that so the worker can
+        // exit instead of spinning forever on the share check.
+        if (sched && !sched->should_gpu_take()) {
+          if (queue->drained()) producer_done_seen = true;
+          continue;
+        }
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
         // Use shared batch size from auto-tuner, scaled by GPU utilization.
@@ -8065,7 +8115,7 @@ int main(int argc, char ** argv)
       os << " (hybrid";
       if (opt.cpu_share >= 0.0) {
         os << ", CPU share " << std::fixed << std::setprecision(1)
-           << (opt.cpu_share * 100.0) << "% fixed";
+           << (opt.cpu_share * 100.0) << "%";
       } else {
         os << ", CPU share adaptive";
       }
