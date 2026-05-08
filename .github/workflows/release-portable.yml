@@ -40,7 +40,21 @@ jobs:
 
       - name: Smoke test (CPU path only — no GPU on hosted runners)
         run: |
+          # The binary has libnvidia-ml.so.1 as a hard dynamic dependency
+          # (statically-linking NVML isn't possible — it's part of the
+          # NVIDIA driver, not redistributable as a static archive).
+          # Real targets get it from the installed driver; GitHub-hosted
+          # runners don't have a driver, so we extract the no-op stub
+          # that ships with the CUDA toolkit just for the smoke test.
+          # The stub satisfies the loader; CPU-only paths never call NVML.
+          mkdir -p stubs
+          docker run --rm -v "$(pwd)/stubs":/out \
+            nvidia/cuda:12.6.0-devel-ubuntu20.04 \
+            cp /usr/local/cuda/lib64/stubs/libnvidia-ml.so /out/libnvidia-ml.so.1
+
+          export LD_LIBRARY_PATH="$(pwd)/stubs"
           ./build-portable/gzstd --version
+
           # CPU round-trip — exercises the dispatch and proves the binary
           # actually loads on a fresh Ubuntu 22.04 host (different glibc
           # than the build container's 20.04).
@@ -48,7 +62,7 @@ jobs:
           ./build-portable/gzstd --cpu-only -k -f test.txt
           ./build-portable/gzstd --cpu-only -d -k -f test.txt.zst -o test.recovered
           diff test.txt test.recovered
-          rm -f test.txt test.txt.zst test.recovered
+          rm -rf test.txt test.txt.zst test.recovered stubs
 
       - name: Determine version + tag
         id: meta

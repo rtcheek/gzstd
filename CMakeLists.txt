@@ -79,10 +79,21 @@ if(NOT TARGET ZSTD::ZSTD)
   endif()
 
   if(NOT ZSTD_LIBRARY)
+    # When BUILD_STATIC is ON, force find_library to prefer .a over .so so
+    # we pick up libzstd.a (which Ubuntu's libzstd-dev does ship) instead of
+    # libzstd.so.  Without this, .so wins and the binary ends up dynamically
+    # linked to libzstd.
+    if(BUILD_STATIC)
+      set(_zstd_orig_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+      set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    endif()
     find_library(ZSTD_LIBRARY NAMES ${_ZSTD_LIB_NAMES}
                  HINTS ${ZSTD_ROOT} ${ZSTD_PREFIX}
                        ENV CONDA_PREFIX ENV ZSTD_ROOT ENV ZSTD_PREFIX
                  PATH_SUFFIXES ${_ZSTD_LIB_SUFFIXES})
+    if(BUILD_STATIC)
+      set(CMAKE_FIND_LIBRARY_SUFFIXES "${_zstd_orig_suffixes}")
+    endif()
   endif()
 
   if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
