@@ -345,7 +345,7 @@ human_size() {
 # auto-expand if you forget (so the display never shows > 100%),
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
-EXPECTED_TESTS=279
+EXPECTED_TESTS=280
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2445,6 +2445,22 @@ else
   fail "--sliding-window single frame" "got $frame_count frames"
 fi
 rm -f "$TMPDIR/sw-frames.zst"
+
+# v0.13.1 regression: multi-frame files with per-frame decomp_size > 64 MiB
+# (the streaming threshold) used to corrupt output because streaming chunks
+# reused seq numbers that collided with adjacent frames' seqs.  Trigger the
+# condition by forcing chunk-size > 64 MiB on a >2-chunk input.  Bug surfaced
+# under --ultra -22 on knuth (auto-bumped chunks to 128 MiB).
+osmf="$TMPDIR/oversized-multi.bin"
+osmz="$TMPDIR/oversized-multi.zst"
+osmd="$TMPDIR/oversized-multi.dec"
+dd if=/dev/urandom of="$osmf" bs=1M count=200 status=none
+"$GZSTD" --cpu-only --chunk-size 100 -k -f "$osmf" -o "$osmz" 2>/dev/null
+"$GZSTD" --cpu-only -d -k -f "$osmz" -o "$osmd" 2>/dev/null
+files_match "$osmf" "$osmd" \
+  && pass "multi-frame oversized round-trip (decomp_size > 64 MiB per frame)" \
+  || fail "multi-frame oversized round-trip" "streaming-path seq collision"
+rm -f "$osmf" "$osmz" "$osmd"
 
 # zstd can decompress our --sliding-window output
 "$GZSTD" -k -f --sliding-window \

@@ -1,9 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.0  
+**Covers:** v0.9.50 → v0.13.1  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.1 — Multi-frame oversized decompress no longer corrupts output
+
+The CPU streaming-decompress path added in v0.12.24 (for frames whose
+decompressed size exceeds 64 MiB) was only safe for **single-frame**
+inputs.  When fed multi-frame inputs with per-frame decomp_size > 64 MiB,
+streaming chunks reused sequence numbers that collided with adjacent
+frames' natural seqs in the ResultStore — chunks overwrote each other
+and the writer either produced truncated output or got stuck waiting
+for a frame that had been clobbered.
+
+Surfaced on knuth during a benchmark sweep at `--ultra -22`: ultra
+auto-bumps chunk size to 128 MiB (the windowLog 27 minimum), and the
+RAM budget on knuth's 256 GiB allowed the full 128 MiB to survive,
+so every frame qualified for the streaming path.  Two failure modes
+observed:
+- `cpu-ultra22 / mixed.bin` decompress: produced 2.7 GiB of output for a
+  19.5 GiB input (clean exit, truncated data).
+- `cpu-ultra22 / zeros.bin` decompress: writer-deadlock detector fired
+  with `frame 163 of 577 missing (have 161 buffered)`.
+
+Fix: in `cpu_decomp_worker`, before entering the streaming branch, wait
+for the reader to set `producer_done` and only stream when
+`results.total_tasks == 1`.  Multi-frame oversized inputs fall through
+to the normal `ZSTD_decompressDCtx` path with a per-frame `decomp_size`
+allocation — uses more peak RAM but is correct and parallelizable.
+The original v0.12.24 motivation (single-frame `zstd -T0` /
+`--sliding-window` outputs) is preserved.
+
+Regression test added in `gzstd-test.sh` (`--chunk-size 100` on a
+200 MiB input forces 2 frames of 100 MiB each, which trips the bug
+without needing the multi-minute `--ultra -22` workload).
 
 ---
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.0";
+static constexpr const char * GZSTD_VERSION = "0.13.1";
 //
 // Architecture overview:
 //
@@ -4129,8 +4129,21 @@ static void cpu_decomp_worker(
     // For oversized frames (e.g., single-frame files from zstd -T0), use
     // streaming decompression with chunked output so the writer can make
     // progress and the progress bar updates incrementally.
+    //
+    // SAFETY: streaming reuses seq numbers (chunk_seq starts at t.seq and
+    // ascends), which collides with adjacent frames' natural seqs in
+    // multi-frame files (e.g., --ultra -22 produces 128 MiB frames, all
+    // would stream and clobber each other).  Only safe when there is
+    // exactly one frame total — wait for the reader to finish so we know
+    // the true count before deciding.  v0.13.1 fix.
     static constexpr size_t STREAM_THRESHOLD = 64 * ONE_MIB;
+    bool use_streaming = false;
     if (t.decomp_size > STREAM_THRESHOLD) {
+      std::unique_lock<std::mutex> lk(results->m);
+      results->cv.wait(lk, [&]{ return results->producer_done; });
+      use_streaming = (results->total_tasks == 1);
+    }
+    if (use_streaming) {
       static constexpr size_t CHUNK = 16 * ONE_MIB;
       size_t n_chunks_est = (t.decomp_size + CHUNK - 1) / CHUNK;
       if (n_chunks_est < 1) n_chunks_est = 1;
