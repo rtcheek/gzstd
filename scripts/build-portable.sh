@@ -119,8 +119,16 @@ docker run --rm \
     ln -snf /usr/share/zoneinfo/Etc/UTC /etc/localtime
     echo Etc/UTC > /etc/timezone
     apt-get update -qq
+    # NB: not installing cmake from apt — Ubuntu 20.04 ships 3.16, our
+    # CMakeLists.txt requires 3.18+.  We download an official Kitware
+    # binary instead.
     apt-get install -y -qq --no-install-recommends \
-      cmake build-essential libzstd-dev pkg-config xz-utils ca-certificates
+      build-essential libzstd-dev pkg-config xz-utils ca-certificates curl
+    CMAKE_VER=3.30.5
+    curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz" \
+      | tar -xz -C /opt
+    export PATH="/opt/cmake-${CMAKE_VER}-linux-x86_64/bin:$PATH"
+    cmake --version
     cmake -B "$BUILD_DIR" \
       -DBUILD_STATIC=ON \
       -DNVCOMP_ROOT=/nvcomp \
