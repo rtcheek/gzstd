@@ -1,9 +1,61 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.12.51  
+**Covers:** v0.9.50 → v0.13.0  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.0 — Asymmetric mode: smart, hardware-aware backend defaults
+
+GPU compress wins consistently across hardware tiers, but on PCIe Gen3
+(consumer cards: RTX 20-series, 30-series, etc.) the D2H transfer cost
+makes hybrid *decompress* slower than CPU MT for every data type
+measured on Lovelace (2× RTX 2080 Ti):
+
+| Data type | CPU-only | Hybrid | Asymmetric default wins by |
+|-----------|----------|--------|----------------------------|
+| zeros     | 4.88     | 3.50   | +39%                       |
+| trivial   | 4.65     | 3.42   | +36%                       |
+| medium    | 2.80     | 2.45   | +14%                       |
+| mixed     | 1.40     | 1.31   | +7%                        |
+| random    | 1.40     | 1.32   | +6%                        |
+
+(GiB/s decompress on Lovelace; raw v0.11.20 benchmark numbers.)
+
+gzstd now picks the backend based on hardware *and* operation:
+- **Compress (any GPU):** hybrid — GPU compress consistently wins.
+- **Decompress / test, PCIe Gen<4:** cpu-only — D2H eats GPU benefit.
+- **Decompress / test, PCIe Gen4+:** hybrid — D2H is cheap (Knuth's H100s).
+- **Detection unavailable / no GPU:** hybrid (degrades gracefully).
+
+PCIe gen detection uses `nvmlDeviceGetMaxPcieLinkGeneration()` (the
+hardware ceiling, not `Curr` — idle GPUs drop their link to Gen1 for
+power management and would otherwise mislead the heuristic).  Fallback
+parses `/sys/bus/pci/devices/*/max_link_speed` when NVML isn't built in.
+
+Visible at `-v` as `[ASYMMETRIC] PCIe Gen3 detected; defaulting
+decompress to --cpu-only`.  Override with `--hybrid` or `--gpu-only`
+when you specifically want to measure or use GPU decompress.
+
+Implementation: `Options::backend_user_set` tracks whether the user
+explicitly chose a backend (parsing `--cpu-only`/`--gpu-only`/`--hybrid`
+or being implied by `--sliding-window`); the new `apply_backend_defaults()`
+runs after `parse_args` and only fills in defaults when no explicit
+choice was made.
+
+**Tuning-flag promotion.** Asymmetric mode would silently route around
+GPU-tuning flags on Gen3 — `gzstd -d --gpu-batch=64 file.zst` would auto-
+flip to cpu-only and the user's tuning hint would do nothing.
+`Options::gpu_hybrid_tuning_seen` now tracks any flag that only makes
+sense in hybrid/GPU mode (`--gpu-batch`, `--gpu-streams`, `--gpu-devices`,
+`--gpu-mem-frac`, `--pinned`/`--no-pinned`, `--cpu-share`, `--cpu-batch`,
+`--cpu-backlog`, `--hybrid-floor`, `--hybrid-floor-factor`).
+`apply_backend_defaults` promotes these to an implicit `--hybrid` when
+no explicit backend flag was given — same precedent as `--sliding-window`
+implying `--cpu-only`.  Explicit `--cpu-only` always wins over the
+promotion (unchanged precedence).
 
 ---
 

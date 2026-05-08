@@ -236,6 +236,15 @@ if $HAS_GPU_BUILD && ! $CPU_ONLY; then
   fi
 fi
 
+# Asymmetric default (v0.13.0+): no backend flags.  Compress always picks
+# hybrid; decompress picks cpu-only on PCIe Gen<4 or hybrid on Gen4+.
+# Numbers will match one of the explicit configs above by hardware gen,
+# but this row tells users what gzstd does out-of-the-box without any
+# flag intervention.
+if $HAS_GPU_BUILD && ! $CPU_ONLY && ! $GPU_ONLY && ! $HYBRID_ONLY; then
+  CONFIGS+=("asymmetric|||")
+fi
+
 # Sweep GPU batch sizes
 if $SWEEP_BATCHES && $HAS_GPU_BUILD && ! $CPU_ONLY; then
   if $QUICK; then

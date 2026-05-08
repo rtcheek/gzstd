@@ -1,5 +1,5 @@
 // gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
-static constexpr const char * GZSTD_VERSION = "0.12.51";
+static constexpr const char * GZSTD_VERSION = "0.13.0";
 //
 // Architecture overview:
 //
@@ -202,6 +202,17 @@ struct Options {
   bool cpu_only = false;
   bool gpu_only = false;
   bool hybrid = false;
+  // True if the user explicitly passed --cpu-only, --gpu-only, or --hybrid.
+  // When false, apply_backend_defaults() picks based on mode + PCIe gen
+  // (asymmetric mode: hybrid for compress; PCIe Gen3 → cpu-only for decompress).
+  bool backend_user_set = false;
+  // True if the user passed any flag that only makes sense in hybrid/GPU mode
+  // (--gpu-batch, --gpu-streams, --gpu-devices, --gpu-mem-frac, --pinned/-no-pinned,
+  // --cpu-share, --cpu-batch, --cpu-backlog, --hybrid-floor, --hybrid-floor-factor).
+  // apply_backend_defaults() promotes this to an implicit --hybrid when no
+  // explicit backend flag was given, so asymmetric mode doesn't silently
+  // route around the user's tuning intent.
+  bool gpu_hybrid_tuning_seen = false;
   int cpu_threads = 0;       // 0=auto (capped at 96), -1=all threads (-T0)
   double cpu_share = -1;     // <0 adaptive (hybrid)
   size_t chunk_mib = DEFAULT_CHUNK_MIB;
@@ -561,10 +572,10 @@ static void print_help()
 "  --fast / --best     aliases for -1 / -19\n"
 "  --ultra             enable ultra levels (large window, more memory)\n"
 "\n"
-"Backend:\n"
+"Backend (auto: hybrid for compress; cpu-only for Gen3 decompress):\n"
 "  --cpu-only          CPU multithreaded, no GPU\n"
 "  --gpu-only          GPU only, no CPU workers\n"
-"  --hybrid            CPU + GPU (default when a GPU is present)\n"
+"  --hybrid            CPU + GPU\n"
 "  --sliding-window    single-frame max-ratio mode (implies --cpu-only)\n"
 "\n"
 "Tuning:\n"
@@ -726,10 +737,18 @@ static void print_help_long()
 "============================================================\n"
 " BACKEND SELECTION\n"
 "============================================================\n"
-"gzstd picks a backend automatically based on available hardware:\n"
-"  * no GPU:   --cpu-only\n"
-"  * GPU present:  --hybrid (CPU + GPU)\n"
-"Override explicitly with one of these:\n"
+"gzstd picks a backend automatically based on hardware and operation:\n"
+"  * no GPU:                         --cpu-only\n"
+"  * compress, GPU present:          --hybrid (CPU + GPU)\n"
+"  * decompress, PCIe Gen<4 GPU:     --cpu-only  (asymmetric mode)\n"
+"  * decompress, PCIe Gen4+ GPU:     --hybrid\n"
+"\n"
+"Asymmetric mode (v0.13.0+): on PCIe Gen3 hardware the D2H transfer\n"
+"cost makes hybrid decompress slower than CPU MT for every measured\n"
+"data type.  Default decompress goes to CPU-only on Gen<4 to win that\n"
+"benchmark; compress still uses hybrid because GPU compress wins\n"
+"across all PCIe generations tested.  Override explicitly with one\n"
+"of these:\n"
 "\n"
 "  --cpu-only\n"
 "     Force CPU-only.  Useful for baseline measurements or when the\n"
@@ -8087,12 +8106,18 @@ static void write_stats_json_cpu_only(const std::string & path, const Options & 
    4. Join progress thread, print summary, clean up
 ======================================================================*/
 static Options parse_args(int argc, char ** argv);
+static void apply_backend_defaults(Options & opt);
 static std::string derive_output(const std::string & input, Mode mode);
 int main(int argc, char ** argv)
 {
   setup_signal_handlers();
 
   Options opt = parse_args(argc, argv);
+
+  // Asymmetric-mode default: PCIe Gen3 → cpu-only decompress; otherwise
+  // hybrid for compress and Gen4+ decompress.  No-op if user passed an
+  // explicit --cpu-only / --gpu-only / --hybrid.
+  apply_backend_defaults(opt);
 
   // Early startup banner at -v+.  Printed BEFORE any heavy init (CUDA
   // device probe, file open, output preallocate) so users get immediate
@@ -8555,6 +8580,147 @@ static std::string derive_output(const std::string & input, Mode mode)
   return input + ".out";
 }
 
+/*======================================================================
+ PCIe link generation detection (asymmetric mode v0.13.0+)
+
+ GPU compress consistently wins on the hardware tier we target, but
+ PCIe Gen3 D2H transfer cost makes hybrid *decompress* slower than CPU
+ MT for every data type measured on Lovelace (2× RTX 2080 Ti, Gen3).
+ Default decompress to --cpu-only on Gen3 hardware to avoid that
+ pitfall; on Gen4+ machines (e.g. Knuth's H100s) hybrid still wins.
+
+ Returns the minimum link generation across visible GPUs:
+   1, 2, 3 → slow PCIe (D2H dominates decompress)
+   4+      → fast PCIe (D2H cheap; hybrid wins)
+   0       → undetectable (NVML/sysfs unavailable, no NVIDIA GPUs)
+
+ NVML is the primary path; /sys/bus/pci/devices walk is the fallback
+ when the binary was built without NVML.
+======================================================================*/
+static int detect_min_pcie_gen()
+{
+  int min_gen = -1;
+#ifdef HAVE_NVML
+  if (nvmlInit_v2() == NVML_SUCCESS) {
+    unsigned dev_count = 0;
+    if (nvmlDeviceGetCount_v2(&dev_count) == NVML_SUCCESS) {
+      for (unsigned i = 0; i < dev_count; ++i) {
+        nvmlDevice_t dev;
+        if (nvmlDeviceGetHandleByIndex_v2(i, &dev) != NVML_SUCCESS) continue;
+        // Use Max not Curr: idle GPUs drop their link to Gen1 for power
+        // management, so Curr would lie about a Gen3 GPU at rest.  Max
+        // reports the negotiated hardware ceiling (factoring in slot too:
+        // a Gen3 card in a Gen2 slot reports Max=Gen2, which is correct).
+        unsigned int gen = 0;
+        if (nvmlDeviceGetMaxPcieLinkGeneration(dev, &gen) == NVML_SUCCESS) {
+          int g = (int)gen;
+          if (min_gen < 0 || g < min_gen) min_gen = g;
+        }
+      }
+    }
+    nvmlShutdown();
+  }
+#endif
+  if (min_gen > 0) return min_gen;
+
+  // sysfs fallback: walk /sys/bus/pci/devices, find NVIDIA (0x10de),
+  // parse max_link_speed (not current_link_speed — idle GPUs drop their
+  // link to Gen1 for power management).
+  //   "2.5 GT/s"  → Gen1
+  //   "5.0 GT/s"  → Gen2
+  //   "8.0 GT/s"  → Gen3
+  //   "16.0 GT/s" → Gen4
+  //   "32.0 GT/s" → Gen5
+  std::error_code ec;
+  fs::path bus("/sys/bus/pci/devices");
+  if (!fs::exists(bus, ec)) return 0;
+  for (const auto & entry : fs::directory_iterator(bus, ec)) {
+    if (ec) break;
+    std::ifstream vf(entry.path() / "vendor");
+    std::string vstr;
+    if (!vf || !std::getline(vf, vstr)) continue;
+    while (!vstr.empty() && std::isspace((unsigned char)vstr.back())) vstr.pop_back();
+    if (vstr != "0x10de") continue;
+    std::ifstream sf(entry.path() / "max_link_speed");
+    std::string sstr;
+    if (!sf || !std::getline(sf, sstr)) continue;
+    int gen = 0;
+    if      (sstr.find("2.5 GT/s")  != std::string::npos) gen = 1;
+    else if (sstr.find("5.0 GT/s")  != std::string::npos) gen = 2;
+    else if (sstr.find("8.0 GT/s")  != std::string::npos) gen = 3;
+    else if (sstr.find("16.0 GT/s") != std::string::npos) gen = 4;
+    else if (sstr.find("32.0 GT/s") != std::string::npos) gen = 5;
+    else if (sstr.find("64.0 GT/s") != std::string::npos) gen = 6;
+    if (gen > 0 && (min_gen < 0 || gen < min_gen)) min_gen = gen;
+  }
+  return (min_gen > 0) ? min_gen : 0;
+}
+
+/*======================================================================
+ Apply asymmetric-mode default backend selection.  Called after
+ parse_args.  No-op if the user explicitly chose a backend.
+
+   COMPRESS                : hybrid (GPU compress wins on all tiers)
+   DECOMPRESS / TEST       : depends on PCIe link gen
+     Gen<4                 : cpu-only (D2H cost > GPU benefit)
+     Gen4+ or undetectable : hybrid
+======================================================================*/
+static void apply_backend_defaults(Options & opt)
+{
+#ifdef HAVE_NVCOMP
+  // Promote tuning flags to implicit --hybrid: if the user passed any
+  // GPU- or hybrid-only knob (--gpu-batch, --cpu-share, --hybrid-floor, etc.)
+  // but no explicit backend flag, treat it as if they had asked for --hybrid.
+  // Otherwise asymmetric mode would silently flip them to cpu-only on Gen3
+  // and their tuning hint would do nothing.  Same precedent as
+  // --sliding-window implying --cpu-only.
+  if (!opt.backend_user_set && opt.gpu_hybrid_tuning_seen) {
+    opt.hybrid = true;
+    opt.backend_user_set = true;
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt,
+           "[ASYMMETRIC] GPU/hybrid tuning flag passed; implying --hybrid "
+           "(override with --cpu-only)\n");
+  }
+
+  if (opt.backend_user_set) return;
+
+  if (opt.mode == Mode::COMPRESS) { opt.hybrid = true; return; }
+
+  // DECOMPRESS or TEST
+  int gen = detect_min_pcie_gen();
+  if (gen > 0 && gen < 4) {
+    opt.cpu_only = true;
+    // Mirror the parse_args silencing: --cpu-batch in cpu-only mode causes
+    // stop-and-go.  parse_args's own check ran before we flipped cpu_only,
+    // so it missed this auto-flip path; redo it here.
+    if (opt.cpu_queue_min > 0) {
+      if (opt.verbosity >= V_ERROR)
+        std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
+                     "(asymmetric default; override with --hybrid)\n";
+      opt.cpu_queue_min = 0;
+    }
+    if (opt.verbosity >= V_VERBOSE) {
+      std::ostringstream os;
+      os << "[ASYMMETRIC] PCIe Gen" << gen
+         << " detected; defaulting decompress to --cpu-only "
+            "(override with --hybrid or --gpu-only)";
+      vlog(V_VERBOSE, opt, os.str() + "\n");
+    }
+  } else {
+    opt.hybrid = true;
+    if (gen >= 4 && opt.verbosity >= V_VERBOSE) {
+      std::ostringstream os;
+      os << "[ASYMMETRIC] PCIe Gen" << gen
+         << " detected; defaulting decompress to --hybrid";
+      vlog(V_VERBOSE, opt, os.str() + "\n");
+    }
+  }
+#else
+  (void)opt;
+#endif
+}
+
 /* parse_args at end */
 static Options parse_args(int argc, char ** argv)
 {
@@ -8639,9 +8805,9 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (a == "--best") { opt.best_flag = true; opt.level = 19; opt.level_user_set = true; }
     else if (a == "--ultra") { opt.ultra = true; }
-    else if (a == "--cpu-only") opt.cpu_only = true;
+    else if (a == "--cpu-only") { opt.cpu_only = true; opt.backend_user_set = true; }
     else if (a == "--sliding-window") opt.sliding_window = true;
-    else if (a == "--hybrid") opt.hybrid = true;
+    else if (a == "--hybrid") { opt.hybrid = true; opt.backend_user_set = true; }
     else if (a.rfind("-T", 0) == 0 && a.size() > 2) {
       std::string val = a.substr(2);
       if (!val.empty() && val[0] == '=') val = val.substr(1);
@@ -8674,11 +8840,11 @@ static Options parse_args(int argc, char ** argv)
       if (opt.output.empty()) die_usage("missing value for --output");
       if (opt.output == "-") { opt.to_stdout = true; opt.output = "stdout"; }
     }
-    else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) {}
+    else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) { opt.gpu_hybrid_tuning_seen = true; }
     else if (parse_str_arg("stats-json", i, argc, argv, opt.stats_json)) {}
     else if (parse_num_arg("chunk-size", i, argc, argv, opt.chunk_mib, &opt.chunk_user_set)) {}
-    else if (parse_num_arg("cpu-backlog", i, argc, argv, opt.cpu_backlog, nullptr)) {}
-    else if (parse_num_arg("cpu-batch", i, argc, argv, opt.cpu_queue_min, nullptr)) {}
+    else if (parse_num_arg("cpu-backlog", i, argc, argv, opt.cpu_backlog, nullptr)) { opt.gpu_hybrid_tuning_seen = true; }
+    else if (parse_num_arg("cpu-batch", i, argc, argv, opt.cpu_queue_min, nullptr)) { opt.gpu_hybrid_tuning_seen = true; }
     else if (a.rfind("--hybrid-floor=", 0) == 0) {
       std::string v = a.substr(15);
       std::transform(v.begin(), v.end(), v.begin(), ::tolower);
@@ -8686,11 +8852,13 @@ static Options parse_args(int argc, char ** argv)
       else if (v == "nominal") opt.hybrid_floor_mode = Options::HybridFloorMode::NOMINAL;
       else if (v == "off")     opt.hybrid_floor_mode = Options::HybridFloorMode::OFF;
       else die_usage("invalid value for --hybrid-floor (expected auto|nominal|off)");
+      opt.gpu_hybrid_tuning_seen = true;
     }
     else if (parse_double_arg("hybrid-floor-factor", i, argc, argv,
                               opt.hybrid_floor_factor)) {
       if (opt.hybrid_floor_factor < 0.0 || opt.hybrid_floor_factor > 1.0)
         die_usage("--hybrid-floor-factor must be in [0.0, 1.0]");
+      opt.gpu_hybrid_tuning_seen = true;
     }
     else if (parse_int_arg("throttle-factor", i, argc, argv, opt.throttle_factor)) {
       if (opt.throttle_factor < 1)
@@ -8704,12 +8872,12 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (a == "--no-throttle") opt.throttle_frames = 0;  // alias for --throttle-frames=0
 #ifdef HAVE_NVCOMP
-    else if (a == "--gpu-only") opt.gpu_only = true;
-    else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) { opt.gpu_batch_user_set = true; }
-    else if (parse_double_arg("gpu-mem-frac", i, argc, argv, opt.gpu_mem_fraction)) {}
-    else if (parse_num_arg("gpu-streams", i, argc, argv, opt.gpu_streams)) {}
-    else if (parse_int_arg("gpu-devices", i, argc, argv, opt.gpu_devices)) {}
-    else if (a == "--no-pinned") { opt.pin_mode = PinMode::OFF; }
+    else if (a == "--gpu-only") { opt.gpu_only = true; opt.backend_user_set = true; }
+    else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) { opt.gpu_batch_user_set = true; opt.gpu_hybrid_tuning_seen = true; }
+    else if (parse_double_arg("gpu-mem-frac", i, argc, argv, opt.gpu_mem_fraction)) { opt.gpu_hybrid_tuning_seen = true; }
+    else if (parse_num_arg("gpu-streams", i, argc, argv, opt.gpu_streams)) { opt.gpu_hybrid_tuning_seen = true; }
+    else if (parse_int_arg("gpu-devices", i, argc, argv, opt.gpu_devices)) { opt.gpu_hybrid_tuning_seen = true; }
+    else if (a == "--no-pinned") { opt.pin_mode = PinMode::OFF; opt.gpu_hybrid_tuning_seen = true; }
     else if (a.rfind("--pinned", 0) == 0) {
       std::string v;
       if (parse_str_arg("pinned", i, argc, argv, v) || a.find('=') != std::string::npos) {
@@ -8719,6 +8887,7 @@ static Options parse_args(int argc, char ** argv)
         else if (v == "on") opt.pin_mode = PinMode::ON;
         else if (v == "off") opt.pin_mode = PinMode::OFF;
         else die_usage("invalid value for --pinned (expected auto|on|off)");
+        opt.gpu_hybrid_tuning_seen = true;
       }
     }
 #else
@@ -8882,6 +9051,7 @@ static Options parse_args(int argc, char ** argv)
     if (!opt.cpu_only) {
       vlog(V_NORMAL, opt, "warning: --sliding-window implies --cpu-only (GPU cannot use sliding window context)\n");
       opt.cpu_only = true;
+      opt.backend_user_set = true;
     }
   }
 
@@ -8945,14 +9115,9 @@ static Options parse_args(int argc, char ** argv)
     opt.cpu_queue_min = 0;
   }
 
-#ifdef HAVE_NVCOMP
-  // Default to hybrid mode when nvCOMP is available, unless the user
-  // explicitly chose --gpu-only or --cpu-only.  This ensures CPU compression
-  // levels (-1..-19) always have an effect and CPUs can work during GPU init.
-  if (!opt.cpu_only && !opt.gpu_only && !opt.hybrid) {
-    opt.hybrid = true;
-  }
-#endif
+  // Backend default selection moved to apply_backend_defaults() so we can
+  // run PCIe-generation detection (asymmetric mode: hybrid for compress,
+  // CPU-only for Gen3 decompress where D2H cost dwarfs GPU benefit).
 
   // Auto-lower verbosity when used as a pipe (both stdin and stdout are non-TTY)
   // but only if the user hasn't explicitly set verbosity via flags.

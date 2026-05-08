@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.12.50
+**Current version:** v0.13.0
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -217,7 +217,7 @@ When input size is unknown (pipe), the frame count is unknown. The auto-tuner mu
 ## Phase 5: Smart Defaults & Asymmetric Mode
 
 ### 5.1 Asymmetric Mode (GPU Compress + CPU Decompress)
-**Priority: HIGH | Complexity: Low | Status: NOT STARTED**
+**Priority: HIGH | Complexity: Low | Status: DONE (v0.13.0)**
 
 Benchmark data from Lovelace (v0.11.20) conclusively shows:
 - **Compress:** GPU/Hybrid wins on 4/5 data types (up to 2.14 GiB/s vs 1.50 CPU)
@@ -227,21 +227,19 @@ On consumer GPUs with PCIe Gen3, the D2H transfer cost makes GPU decompression s
 - **Compress:** Use hybrid (GPU + CPU)
 - **Decompress:** Use CPU-only
 
-Implementation: detect PCIe generation at startup via NVML or sysfs. If Gen3, default decompress to `--cpu-only`. If Gen4+, default to hybrid. User can override with `--gpu-only` or `--hybrid`.
+Implemented in v0.13.0: PCIe generation queried via NVML (with sysfs fallback). On Gen<4, decompress and `-t` default to `--cpu-only`. On Gen4+, default to `--hybrid`. User can override with `--gpu-only` or `--hybrid`.
 
-This is the single highest-impact change for Lovelace-class hardware. Estimated improvement: decompress throughput would jump from 1.3-3.5 GiB/s (hybrid) to 1.4-4.9 GiB/s (CPU)  up to 40% faster on trivial data.
+Visible at `-v` as `[ASYMMETRIC] PCIe Gen3 detected; defaulting decompress to --cpu-only`.
 
 ### 5.2 PCIe Generation Detection
-**Priority: High | Complexity: Low | Status: NOT STARTED**
+**Priority: High | Complexity: Low | Status: DONE (v0.13.0)**
 
-Query PCIe link speed to auto-select decompress strategy:
-- NVML: `nvmlDeviceGetCurrPcieLinkGeneration()`
-- Fallback: parse `/sys/bus/pci/devices/*/current_link_speed`
+Implemented as part of 5.1. Uses `nvmlDeviceGetMaxPcieLinkGeneration()` (Max, not Curr — idle GPUs drop their link to Gen1 for power management, which would mislead the heuristic). Fallback parses `/sys/bus/pci/devices/*/max_link_speed` when NVML isn't built in.
 
 Map to decompress default:
-- Gen3 (8 GT/s): CPU-only decompress
-- Gen4 (16 GT/s): Hybrid decompress
-- Gen5 (32 GT/s): Hybrid decompress (GPU likely wins)
+- Gen<4: CPU-only decompress
+- Gen4+: Hybrid decompress
+- Detection unavailable: Hybrid (degrades gracefully)
 
 ---
 
@@ -274,7 +272,7 @@ Unknown flags rejected, `--` end-of-options, `--threads=N` form, argument order 
 | Item | Phase | Priority | Status |
 |------|-------|----------|--------|
 | Streaming decompression output | — | HIGH | DONE (v0.12.24) |
-| Asymmetric mode (PCIe Gen3 detection) | 5.1, 5.2 | HIGH | Not started |
+| Asymmetric mode (PCIe Gen3 detection) | 5.1, 5.2 | HIGH | DONE (v0.13.0) |
 | Persistent auto-tuning (`~/.gzstd/`) | 2.12.3 | Medium | Not started |
 | Rate-matched dispatch (re-enable) | 1.3 | Medium | Disabled, needs eval |
 | Pipe-aware scheduling | 3.1 | Medium | Not started |

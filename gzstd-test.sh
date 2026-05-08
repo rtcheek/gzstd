@@ -345,7 +345,7 @@ human_size() {
 # auto-expand if you forget (so the display never shows > 100%),
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
-EXPECTED_TESTS=270
+EXPECTED_TESTS=279
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1587,6 +1587,157 @@ else
   skip "--cpu-share=1.0 round-trip"          "no GPU"
   skip "--cpu-share banner shows percentage" "no GPU"
   skip "--cpu-share split responds to value" "no GPU"
+fi
+
+# ============================================================
+# 25c. Asymmetric mode (PCIe gen → backend auto-selection)
+# ============================================================
+section "Asymmetric mode (PCIe gen detection)"
+
+if has_gpu 2>/dev/null; then
+  asym_src="$TMPDIR/asym-src.bin"
+  asym_zst="$TMPDIR/asym.zst"
+  asym_out="$TMPDIR/asym.out"
+  dd if=/dev/urandom bs=1M count=64 2>/dev/null > "$asym_src"
+  "$GZSTD" --hybrid -k -f "$asym_src" -o "$asym_zst" 2>/dev/null
+
+  # Trigger detection on a decompress run; the [ASYMMETRIC] line carries
+  # the detected gen, and the [STARTUP] line carries the chosen backend.
+  asym_log=$("$GZSTD" -d -v -k -f "$asym_zst" -o "$asym_out" 2>&1)
+  rm -f "$asym_out"
+  asym_gen=$(echo "$asym_log" | grep -oE "PCIe Gen[0-9]+" | head -1 | grep -oE "[0-9]+")
+
+  if [[ -z "$asym_gen" ]]; then
+    # No [ASYMMETRIC] line at all — detection unavailable (NVML missing,
+    # no NVIDIA card visible).  Verify the fallback path: hybrid default.
+    if echo "$asym_log" | grep -q "DECOMPRESS (hybrid"; then
+      pass "asymmetric mode: detection unavailable → hybrid fallback"
+    else
+      fail "asymmetric mode: detection unavailable → hybrid fallback" \
+           "(no [ASYMMETRIC] log AND not hybrid)"
+    fi
+    skip "asymmetric mode: gen-appropriate decompress default" "gen undetected"
+    skip "asymmetric mode: compress always defaults to hybrid"  "gen undetected"
+    skip "asymmetric mode: --hybrid override bypasses asymmetric" "gen undetected"
+    skip "asymmetric mode: --cpu-only override bypasses asymmetric" "gen undetected"
+  else
+    pass "asymmetric mode: PCIe gen detected" "(Gen$asym_gen)"
+
+    # Decompress backend default depends on gen.
+    if (( asym_gen < 4 )); then
+      if echo "$asym_log" | grep -q "DECOMPRESS (cpu-only)"; then
+        pass "asymmetric mode: Gen$asym_gen decompress defaults to cpu-only"
+      else
+        fail "asymmetric mode: Gen$asym_gen decompress defaults to cpu-only" \
+             "(banner: $(echo "$asym_log" | grep STARTUP || echo none))"
+      fi
+    else
+      if echo "$asym_log" | grep -q "DECOMPRESS (hybrid"; then
+        pass "asymmetric mode: Gen$asym_gen decompress defaults to hybrid"
+      else
+        fail "asymmetric mode: Gen$asym_gen decompress defaults to hybrid" \
+             "(banner: $(echo "$asym_log" | grep STARTUP || echo none))"
+      fi
+    fi
+
+    # Compress always defaults to hybrid regardless of gen.
+    comp_log=$("$GZSTD" -v -k -f "$asym_src" -o "$asym_zst" 2>&1)
+    if echo "$comp_log" | grep -q "COMPRESS (hybrid"; then
+      pass "asymmetric mode: compress always defaults to hybrid"
+    else
+      fail "asymmetric mode: compress always defaults to hybrid" \
+           "(banner: $(echo "$comp_log" | grep STARTUP || echo none))"
+    fi
+
+    # --hybrid override: explicit user choice silences [ASYMMETRIC].
+    over_log=$("$GZSTD" -d --hybrid -v -k -f "$asym_zst" -o "$asym_out" 2>&1)
+    rm -f "$asym_out"
+    if echo "$over_log" | grep -q "ASYMMETRIC"; then
+      fail "asymmetric mode: --hybrid override bypasses asymmetric" \
+           "([ASYMMETRIC] log appeared despite explicit --hybrid)"
+    elif echo "$over_log" | grep -q "DECOMPRESS (hybrid"; then
+      pass "asymmetric mode: --hybrid override bypasses asymmetric"
+    else
+      fail "asymmetric mode: --hybrid override bypasses asymmetric" \
+           "(banner: $(echo "$over_log" | grep STARTUP || echo none))"
+    fi
+
+    # --cpu-only override: also silences [ASYMMETRIC] (no auto-pick happens).
+    cpu_log=$("$GZSTD" -d --cpu-only -v -k -f "$asym_zst" -o "$asym_out" 2>&1)
+    rm -f "$asym_out"
+    if echo "$cpu_log" | grep -q "ASYMMETRIC"; then
+      fail "asymmetric mode: --cpu-only override bypasses asymmetric" \
+           "([ASYMMETRIC] log appeared despite explicit --cpu-only)"
+    elif echo "$cpu_log" | grep -q "DECOMPRESS (cpu-only)"; then
+      pass "asymmetric mode: --cpu-only override bypasses asymmetric"
+    else
+      fail "asymmetric mode: --cpu-only override bypasses asymmetric" \
+           "(banner: $(echo "$cpu_log" | grep STARTUP || echo none))"
+    fi
+  fi
+
+  # Implicit-hybrid promotion: GPU-tuning flags (--gpu-batch, etc.) and
+  # hybrid-only flags (--cpu-share, etc.) without an explicit --cpu-only/
+  # --gpu-only/--hybrid should imply --hybrid, otherwise asymmetric mode
+  # would silently flip to cpu-only on Gen3 and drop the user's tuning.
+  imp_log=$("$GZSTD" -d --gpu-batch=64 -v -k -f "$asym_zst" -o "$asym_out" 2>&1)
+  rm -f "$asym_out"
+  if echo "$imp_log" | grep -q "implying --hybrid" \
+     && echo "$imp_log" | grep -q "DECOMPRESS (hybrid"; then
+    pass "asymmetric mode: --gpu-batch implies --hybrid"
+  else
+    fail "asymmetric mode: --gpu-batch implies --hybrid" \
+         "(banner: $(echo "$imp_log" | grep STARTUP || echo none))"
+  fi
+
+  # Same for --cpu-share (hybrid-only knob)
+  imp2_log=$("$GZSTD" -d --cpu-share=0.5 -v -k -f "$asym_zst" -o "$asym_out" 2>&1)
+  rm -f "$asym_out"
+  if echo "$imp2_log" | grep -q "implying --hybrid" \
+     && echo "$imp2_log" | grep -q "DECOMPRESS (hybrid"; then
+    pass "asymmetric mode: --cpu-share implies --hybrid"
+  else
+    fail "asymmetric mode: --cpu-share implies --hybrid" \
+         "(banner: $(echo "$imp2_log" | grep STARTUP || echo none))"
+  fi
+
+  # Explicit --cpu-only must beat tuning-flag promotion (cpu-only wins,
+  # no [ASYMMETRIC] log because backend_user_set is already true).
+  ovr_log=$("$GZSTD" -d --cpu-only --gpu-batch=64 -v -k -f "$asym_zst" -o "$asym_out" 2>&1)
+  rm -f "$asym_out"
+  if echo "$ovr_log" | grep -q "ASYMMETRIC"; then
+    fail "asymmetric mode: explicit --cpu-only beats tuning-flag promotion" \
+         "([ASYMMETRIC] log appeared despite explicit --cpu-only)"
+  elif echo "$ovr_log" | grep -q "DECOMPRESS (cpu-only)"; then
+    pass "asymmetric mode: explicit --cpu-only beats tuning-flag promotion"
+  else
+    fail "asymmetric mode: explicit --cpu-only beats tuning-flag promotion" \
+         "(banner: $(echo "$ovr_log" | grep STARTUP || echo none))"
+  fi
+
+  # Bug A regression: --cpu-batch with NO explicit backend should now
+  # imply --hybrid (so the silencing path doesn't trigger at all).  But
+  # --cpu-batch combined with explicit --cpu-only must still silence.
+  cb_log=$("$GZSTD" -d --cpu-only --cpu-batch=8 -v -k -f "$asym_zst" -o "$asym_out" 2>&1)
+  rm -f "$asym_out"
+  if echo "$cb_log" | grep -q -- "--cpu-batch is ignored in --cpu-only mode"; then
+    pass "asymmetric mode: --cpu-batch + explicit --cpu-only triggers silencing"
+  else
+    fail "asymmetric mode: --cpu-batch + explicit --cpu-only triggers silencing" \
+         "(expected silencing note, got: $(echo "$cb_log" | grep -i cpu-batch || echo none))"
+  fi
+
+  rm -f "$asym_src" "$asym_zst"
+else
+  skip "asymmetric mode: PCIe gen detected"                          "no GPU"
+  skip "asymmetric mode: gen-appropriate decompress default"         "no GPU"
+  skip "asymmetric mode: compress always defaults to hybrid"         "no GPU"
+  skip "asymmetric mode: --hybrid override bypasses asymmetric"      "no GPU"
+  skip "asymmetric mode: --cpu-only override bypasses asymmetric"    "no GPU"
+  skip "asymmetric mode: --gpu-batch implies --hybrid"               "no GPU"
+  skip "asymmetric mode: --cpu-share implies --hybrid"               "no GPU"
+  skip "asymmetric mode: explicit --cpu-only beats tuning-flag promotion" "no GPU"
+  skip "asymmetric mode: --cpu-batch + explicit --cpu-only triggers silencing" "no GPU"
 fi
 
 # ============================================================
