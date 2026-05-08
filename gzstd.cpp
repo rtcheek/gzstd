@@ -1,4 +1,10 @@
-// gzstd.cpp  Hybrid CPU+GPU Zstd (adaptive share)
+// gzstd.cpp — Hybrid CPU+GPU Zstd (adaptive share)
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2024-2026 rtcheek
+//
+// Licensed under the Apache License, Version 2.0 (the "License").
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
 static constexpr const char * GZSTD_VERSION = "0.13.0";
 //
 // Architecture overview:

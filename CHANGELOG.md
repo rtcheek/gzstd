@@ -7,7 +7,18 @@
 
 ---
 
-## v0.13.0 — Asymmetric mode: smart, hardware-aware backend defaults
+## v0.13.0 — Asymmetric mode + Apache 2.0 relicense
+
+**License: GPL v3 → Apache 2.0.**  Required for distributable binaries
+that link nvCOMP: NVIDIA's nvCOMP license (§2.6) prohibits using the
+SDK in a way that would subject it to a copyleft open-source license.
+Apache 2.0 keeps gzstd's source permanently free and public, preserves
+copyright, and adds an explicit patent grant + retaliation clause that
+GPL doesn't have.  See LICENSE (root) and the SPDX header in gzstd.cpp.
+Same license used by TensorFlow, PyTorch, RAPIDS, and every other
+CUDA-using project that ships binaries.
+
+### Asymmetric mode: smart, hardware-aware backend defaults
 
 GPU compress wins consistently across hardware tiers, but on PCIe Gen3
 (consumer cards: RTX 20-series, 30-series, etc.) the D2H transfer cost
