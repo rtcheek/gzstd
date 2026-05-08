@@ -109,9 +109,15 @@ docker run --rm \
   -v "$NVCOMP_DIR":/nvcomp:ro \
   -w /src \
   -e BUILD_DIR="$BUILD_DIR" \
+  -e DEBIAN_FRONTEND=noninteractive \
+  -e TZ=Etc/UTC \
   "$BASE_IMAGE" \
   bash -c '
     set -e
+    # tzdata pulls in a timezone prompt under interactive frontends; pin it
+    # before apt-get install so the package installs unattended.
+    ln -snf /usr/share/zoneinfo/Etc/UTC /etc/localtime
+    echo Etc/UTC > /etc/timezone
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends \
       cmake build-essential libzstd-dev pkg-config xz-utils ca-certificates
