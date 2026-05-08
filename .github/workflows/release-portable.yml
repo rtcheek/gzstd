@@ -1,0 +1,105 @@
+name: Build portable release binary
+
+# Triggers:
+#   - Tag push matching v*: builds and attaches the binary to that release.
+#   - Manual run from the Actions tab: builds and uploads as a workflow
+#     artifact (handy for testing without cutting a real release).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required for softprops/action-gh-release
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Cache the nvCOMP tarball (~45 MB) across runs so we don't re-download
+      # from NVIDIA's CDN every time.  Key includes the version so a bump
+      # invalidates the cache automatically.
+      - name: Cache nvCOMP tarball
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gzstd-build
+          key: nvcomp-5.2.0.10-cuda12-${{ runner.os }}
+
+      - name: Build portable binary
+        run: |
+          scripts/build-portable.sh
+          # Files inside the bind-mounted build dir end up root-owned because
+          # the docker container runs as root.  Reset ownership so subsequent
+          # steps can read/move them.
+          sudo chown -R "$(id -u):$(id -g)" build-portable/
+
+      - name: Smoke test (CPU path only — no GPU on hosted runners)
+        run: |
+          ./build-portable/gzstd --version
+          # CPU round-trip — exercises the dispatch and proves the binary
+          # actually loads on a fresh Ubuntu 22.04 host (different glibc
+          # than the build container's 20.04).
+          echo "gzstd portable smoke test $(date)" > test.txt
+          ./build-portable/gzstd --cpu-only -k -f test.txt
+          ./build-portable/gzstd --cpu-only -d -k -f test.txt.zst -o test.recovered
+          diff test.txt test.recovered
+          rm -f test.txt test.txt.zst test.recovered
+
+      - name: Determine version + tag
+        id: meta
+        run: |
+          # gzstd.cpp is the source of truth for the version string.
+          version=$(grep -oP 'GZSTD_VERSION = "\K[0-9.]+' gzstd.cpp)
+          # Use the pushed tag when triggered by tag, else synthesize from version.
+          tag="${GITHUB_REF_NAME:-v$version}"
+          if [[ "$tag" != "v$version" ]]; then
+            echo "::warning::tag $tag does not match source version $version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Built version: $version (tag: $tag)"
+
+      - name: Package
+        id: package
+        run: |
+          name="gzstd-${{ steps.meta.outputs.version }}-linux-x86_64"
+          mkdir -p "release/$name"
+          cp build-portable/gzstd "release/$name/"
+          cp LICENSE CHANGELOG.md "release/$name/"
+          [ -f README.md ] && cp README.md "release/$name/" || true
+          cd release
+          tar -czf "${name}.tar.gz" "$name"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          # Echo paths relative to repo root for downstream steps.
+          echo "tarball=release/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=release/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Show release artifacts
+        run: |
+          ls -lh release/
+          echo "---"
+          cat release/*.sha256
+
+      - name: Upload as workflow artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: release/
+
+      - name: Attach to GitHub release (tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          files: |
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.checksum }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

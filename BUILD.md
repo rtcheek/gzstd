@@ -46,7 +46,74 @@ cmake --build build -j$(nproc)
 
 Links zstd, libstdc++, libgcc, and CUDA runtime statically. The resulting binary only needs glibc and the NVIDIA driver at runtime.
 
-**Note:** nvCOMP does not ship a static library in the conda-forge package. CMake will warn if it falls back to the shared `libnvcomp.so`. In this case the binary still depends on `libnvcomp.so.5` at runtime.
+**Note:** the conda-forge `libnvcomp` package ships shared libraries only — no `libnvcomp_static.a`. With BUILD_STATIC=ON against a conda env, CMake will fall back to `libnvcomp.so.5` and the binary will still depend on it at runtime. To get a fully self-contained binary, fetch NVIDIA's official tarball (next section) which includes `libnvcomp_static.a`.
+
+### Maximally Portable Build (single self-contained binary)
+
+For distribution, you want one binary that runs on essentially any Linux x86_64 machine from 2020+ with an NVIDIA driver — no nvCOMP install, no CUDA toolkit, no libstdc++ ABI mismatch. The wrapper script `scripts/build-portable.sh` does this in one command:
+
+```bash
+scripts/build-portable.sh
+```
+
+What it does:
+1. Downloads NVIDIA's official `nvcomp-linux-x86_64-5.2.0.10_cuda12-archive.tar.xz` from `developer.download.nvidia.com` (cached at `~/.cache/gzstd-build/nvcomp/` for re-runs).
+2. Spins up a Docker container running `nvidia/cuda:12.6.0-devel-ubuntu20.04` (glibc 2.31 floor — covers Ubuntu 20.04+, Debian 11+, RHEL 8+).
+3. Builds with `BUILD_STATIC=ON`, pointing CMake at the official tarball's `lib/libnvcomp_static.a`.
+4. Statically links nvCOMP, the CUDA runtime, libstdc++, libgcc, and libzstd into a single executable.
+
+Output: `build-portable/gzstd`, ~60–80 MB.
+
+**Runtime requirements on target:**
+- glibc ≥ 2.31 (Ubuntu 20.04 / Debian 11 / RHEL 8 / Fedora 33+)
+- NVIDIA driver providing `libnvidia-ml.so.1` (NVML cannot be statically linked — it's part of the driver)
+- That's it. No CUDA, no nvCOMP, no Python, no nothing.
+
+**Customizing:**
+
+```bash
+# pin a specific nvCOMP version
+scripts/build-portable.sh --nvcomp-version 5.1.0.6
+
+# target CUDA 13 instead of 12
+scripts/build-portable.sh --cuda-major 13
+
+# use a different base image (e.g., target older glibc)
+scripts/build-portable.sh --base-image nvidia/cuda:12.6.0-devel-ubuntu18.04
+
+# rebuild from scratch
+scripts/build-portable.sh --clean
+
+# re-download nvCOMP (don't use cache)
+scripts/build-portable.sh --no-cache
+
+scripts/build-portable.sh --help
+```
+
+**Why nvCOMP from NVIDIA's CDN, not conda-forge:**
+conda-forge's `libnvcomp` package omits the static archive. NVIDIA's official redistributable tarball at https://developer.download.nvidia.com/compute/nvcomp/redist/ includes both the `.so` and `libnvcomp_static.a` (~57 MB containing CUDA kernel code).
+
+### Automated release builds (GitHub Actions)
+
+`.github/workflows/release-portable.yml` runs the same recipe in CI on every tag push:
+
+```bash
+# Tag a release; the workflow builds and attaches the binary automatically.
+git tag v0.13.2
+git push origin v0.13.2
+```
+
+The workflow:
+1. Checks out the repo on `ubuntu-22.04`
+2. Restores the cached nvCOMP tarball (key includes the version, so a bump invalidates automatically)
+3. Runs `scripts/build-portable.sh`
+4. Smoke-tests the binary (CPU round-trip — GitHub-hosted runners don't have GPUs)
+5. Packages `gzstd-<version>-linux-x86_64.tar.gz` with the binary + LICENSE + CHANGELOG.md
+6. Generates a SHA-256 checksum file
+7. On tag push: attaches both files to the GitHub release (creates the release if needed, with auto-generated release notes)
+8. On manual run (Actions tab → Run workflow): uploads as a workflow artifact instead, so you can test the build without cutting a real release
+
+Required repo settings: under Settings → Actions → General → Workflow permissions, "Read and write permissions" must be enabled (so the workflow can publish releases).
 
 ### Installing (bundling shared libs)
 

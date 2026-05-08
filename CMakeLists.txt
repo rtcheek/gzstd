@@ -117,19 +117,12 @@ if(USE_NVCOMP)
       PATH_SUFFIXES include)
 
     if(BUILD_STATIC)
-      # Try static nvCOMP first, fall back to shared
+      # Prefer libnvcomp_static.a; fall back to shared if user only has
+      # conda-forge's package (which is shared-only).  NVIDIA's official
+      # tarball at https://developer.download.nvidia.com/compute/nvcomp/redist/
+      # ships libnvcomp_static.a.  See BUILD.md for the recipe.
       find_library(NVCOMP_LIBRARY
         NAMES nvcomp_static nvcomp
-        HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
-        PATH_SUFFIXES lib lib64)
-
-      # nvCOMP static may depend on additional CUDA libraries
-      find_library(NVCOMP_BITCOMP_LIBRARY
-        NAMES nvcomp_bitcomp_static nvcomp_bitcomp
-        HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
-        PATH_SUFFIXES lib lib64)
-      find_library(NVCOMP_GDEFLATE_LIBRARY
-        NAMES nvcomp_gdeflate_static nvcomp_gdeflate
         HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
         PATH_SUFFIXES lib lib64)
     else()
@@ -217,18 +210,9 @@ if(HAVE_NVCOMP)
     ${_CUDA_RT}
     ${NVCOMP_LIBRARY})
 
-  # nvCOMP static may need additional component libraries
-  if(BUILD_STATIC)
-    if(NVCOMP_BITCOMP_LIBRARY)
-      target_link_libraries(gzstd PRIVATE ${NVCOMP_BITCOMP_LIBRARY})
-    endif()
-    if(NVCOMP_GDEFLATE_LIBRARY)
-      target_link_libraries(gzstd PRIVATE ${NVCOMP_GDEFLATE_LIBRARY})
-    endif()
-    # Static CUDA runtime needs dl and rt on Linux
-    if(UNIX)
-      target_link_libraries(gzstd PRIVATE dl rt)
-    endif()
+  # Static CUDA runtime needs dl and rt on Linux
+  if(BUILD_STATIC AND UNIX)
+    target_link_libraries(gzstd PRIVATE dl rt)
   endif()
 
   if(HAVE_NVML)
@@ -288,12 +272,6 @@ if(HAVE_NVCOMP)
   message(STATUS " nvCOMP library  : ${NVCOMP_LIBRARY}")
   if(BUILD_STATIC)
     message(STATUS " CUDA runtime    : static (cudart_static)")
-    if(NVCOMP_BITCOMP_LIBRARY)
-      message(STATUS " nvCOMP bitcomp  : ${NVCOMP_BITCOMP_LIBRARY}")
-    endif()
-    if(NVCOMP_GDEFLATE_LIBRARY)
-      message(STATUS " nvCOMP gdeflate  : ${NVCOMP_GDEFLATE_LIBRARY}")
-    endif()
   else()
     message(STATUS " CUDA runtime    : shared (cudart)")
   endif()
