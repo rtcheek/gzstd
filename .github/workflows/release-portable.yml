@@ -81,18 +81,25 @@ jobs:
       - name: Package
         id: package
         run: |
-          name="gzstd-${{ steps.meta.outputs.version }}-linux-x86_64"
-          mkdir -p "release/$name"
-          cp build-portable/gzstd "release/$name/"
-          cp LICENSE CHANGELOG.md "release/$name/"
-          [ -f README.md ] && cp README.md "release/$name/" || true
+          # Outer filename is version-less so .../releases/latest/download/
+          # gzstd-linux-x86_64.tar.gz stays stable across releases.  The
+          # version is preserved inside (directory name + binary --version
+          # output + LICENSE/CHANGELOG copies), so users can still audit
+          # what they downloaded.
+          inner="gzstd-${{ steps.meta.outputs.version }}-linux-x86_64"
+          outer="gzstd-linux-x86_64.tar.gz"
+          mkdir -p "release/$inner"
+          cp build-portable/gzstd "release/$inner/"
+          cp LICENSE CHANGELOG.md "release/$inner/"
+          [ -f README.md ] && cp README.md "release/$inner/" || true
           cd release
-          tar -czf "${name}.tar.gz" "$name"
-          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
-          # Echo paths relative to repo root for downstream steps.
-          echo "tarball=release/${name}.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=release/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
+          tar -czf "$outer" "$inner"
+          sha256sum "$outer" > "${outer}.sha256"
+          echo "tarball=release/${outer}" >> "$GITHUB_OUTPUT"
+          echo "checksum=release/${outer}.sha256" >> "$GITHUB_OUTPUT"
+          # The artifact name (workflow_dispatch path) keeps the version
+          # so multiple manual runs don't collide.
+          echo "artifact_name=$inner" >> "$GITHUB_OUTPUT"
 
       - name: Show release artifacts
         run: |
@@ -104,7 +111,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.name }}
+          name: ${{ steps.package.outputs.artifact_name }}
           path: release/
 
       - name: Attach to GitHub release (tag push)
