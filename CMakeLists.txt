@@ -111,9 +111,12 @@ if(USE_NVCOMP)
   find_package(CUDAToolkit QUIET)
   if(CUDAToolkit_FOUND)
     # Hints: NVCOMP_ROOT or CONDA_PREFIX
+    # NVCOMP_ROOT can be passed as either a CMake cache variable
+    # (-DNVCOMP_ROOT=/path) or an environment variable.  CONDA_PREFIX is
+    # checked from the environment as a fallback for conda-installed nvCOMP.
     find_path(NVCOMP_INCLUDE_DIR
       NAMES nvcomp/zstd.h
-      HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
+      HINTS ${NVCOMP_ROOT} $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
       PATH_SUFFIXES include)
 
     if(BUILD_STATIC)
@@ -123,12 +126,12 @@ if(USE_NVCOMP)
       # ships libnvcomp_static.a.  See BUILD.md for the recipe.
       find_library(NVCOMP_LIBRARY
         NAMES nvcomp_static nvcomp
-        HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
+        HINTS ${NVCOMP_ROOT} $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
         PATH_SUFFIXES lib lib64)
     else()
       find_library(NVCOMP_LIBRARY
         NAMES nvcomp
-        HINTS $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
+        HINTS ${NVCOMP_ROOT} $ENV{NVCOMP_ROOT} $ENV{CONDA_PREFIX}
         PATH_SUFFIXES lib lib64)
     endif()
 

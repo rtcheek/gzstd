@@ -1,9 +1,31 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.1  
+**Covers:** v0.9.50 → v0.13.2  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.2 — Build-system fixes for portable-build workflow
+
+Two issues surfaced when first running scripts/build-portable.sh under
+the new GitHub Actions release workflow:
+
+- **NVCOMP_ROOT cache variable was ignored.**  CMakeLists.txt's
+  find_path and find_library calls only checked `$ENV{NVCOMP_ROOT}`,
+  so passing `-DNVCOMP_ROOT=/nvcomp` at the cmake command line had no
+  effect — the build silently fell back to CPU-only.  Now the HINTS
+  list includes both forms (`${NVCOMP_ROOT} $ENV{NVCOMP_ROOT}`).
+
+- **CPU-only build broken.**  When HAVE_NVCOMP is undefined,
+  try_reserve_pinned and release_pinned referenced PinMode and
+  opt.pin_mode, which both live inside #ifdef HAVE_NVCOMP in the
+  Options struct.  The whole pinned-budget infrastructure is now
+  wrapped in #ifdef HAVE_NVCOMP since it's only ever called from GPU
+  paths anyway.  CPU-only builds compile cleanly again.
+
+No runtime behavior change for users on the GPU path.
 
 ---
 

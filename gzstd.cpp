@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.1";
+static constexpr const char * GZSTD_VERSION = "0.13.2";
 //
 // Architecture overview:
 //
@@ -1735,6 +1735,7 @@ static uint64_t get_available_ram_bytes()
 #endif
 }
 
+#ifdef HAVE_NVCOMP
 /*======================================================================
  Pinned host-memory budget (--pinned auto)
  -----------------------------------------------------------------------
@@ -1752,6 +1753,10 @@ static uint64_t get_available_ram_bytes()
 
  PinMode::ON skips the budget check (user said "yes, pin everything").
  PinMode::OFF skips the entire path (no allocation attempt).
+
+ The whole block is GPU-only: PinMode lives inside HAVE_NVCOMP in the
+ Options struct, and these helpers are only ever called from compress/
+ decompress nvcomp paths.
 ======================================================================*/
 static std::atomic<uint64_t> g_pinned_bytes_reserved{0};
 static std::atomic<uint64_t> g_pinned_bytes_budget{0};
@@ -1791,6 +1796,7 @@ static void release_pinned(uint64_t bytes, const Options & opt)
   if (opt.pin_mode != PinMode::AUTO) return;  // ON/OFF didn't reserve
   g_pinned_bytes_reserved.fetch_sub(bytes, std::memory_order_release);
 }
+#endif // HAVE_NVCOMP
 
 // Compute a throttle budget: how many frames can be buffered in ResultStore
 // before producers must block waiting for the writer.
