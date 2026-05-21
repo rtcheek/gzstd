@@ -1,9 +1,53 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.2  
+**Covers:** v0.9.50 → v0.13.4  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.4 — CLI arg-parser hardening + auto-tune log fix
+
+Polish pass on the CLI surface plus one cosmetic bug in the GPU
+decompress auto-tuner.  No behavior change on valid inputs; bad inputs
+that previously crashed or silently truncated now produce a usage hint.
+
+- **Argument-parser error handling.**  parse_num_arg / parse_int_arg /
+  parse_double_arg called std::stoull / std::stoi / std::stod directly,
+  with two failure modes:
+    - `--gpu-streams=12abc` silently parsed as 12 — stoull stops at the
+      first non-digit and never tells the caller.
+    - `--gpu-streams=foo` let std::invalid_argument escape to main,
+      printing a terminate-style backtrace instead of a usage hint.
+
+  Added parse_u64_value / parse_int_value / parse_double_value helpers
+  that catch invalid_argument and out_of_range, verify the full string
+  was consumed, and call die_usage on failure.  All three parsing
+  wrappers route through them.
+
+- **--gpu-mem-frac validation.**  Hard-rejects values outside (0.0, 1.0)
+  and warn-clamps anything outside [0.10, 0.95] so existing scripts that
+  pass slightly aggressive values still run but the user learns why
+  they did not get what they asked for.
+
+- **--pinned auto|on|off.**  The old code combined parse_str_arg with an
+  rfind prefix check and a manual `=` split; the space-separated form
+  bypassed validation.  Replaced with a single parse_str_arg call into
+  a scratch buffer.
+
+- **Asymmetric default visibility.**  Promoted the PCIe Gen3 →
+  --cpu-only notice from V_VERBOSE to V_DEFAULT.  Users on
+  lovelace-class hardware otherwise saw zero GPU activity during
+  decompress and had no signal the runtime had switched backends on
+  them.  Prefix changed from [ASYMMETRIC] to gzstd: to match the other
+  default-verbosity notices.
+
+- **GPU decomp auto-tune log fired twice per settle.**
+  gpu_decomp_worker printed `[AUTO-TUNE] settled at batch=N` on every
+  tune-step completion regardless of whether the next phase was REFINE
+  or SETTLED, because the verbose-log sat outside the if/else.  Split
+  into `refining [lo..hi] trying mid` vs `settled at N`.
 
 ---
 

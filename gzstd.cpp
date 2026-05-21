@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.2";
+static constexpr const char * GZSTD_VERSION = "0.13.4";
 //
 // Architecture overview:
 //
@@ -968,6 +968,55 @@ static void print_version()
 #endif
 }
 
+// Convert a value string to integer/double with friendly errors.  std::sto*
+// throw std::invalid_argument on garbage and std::out_of_range on overflow;
+// letting those propagate to main() prints the raw what() and dumps core-like
+// output instead of a usage hint.  Each helper validates the full string is
+// consumed so "--gpu-streams=12abc" is rejected rather than silently truncated.
+static uint64_t parse_u64_value(const std::string & pref, const std::string & v)
+{
+  try {
+    size_t pos = 0;
+    unsigned long long n = std::stoull(v, &pos);
+    if (pos != v.size()) die_usage("invalid value for " + pref + ": " + v);
+    return (uint64_t)n;
+  } catch (const std::invalid_argument &) {
+    die_usage("invalid value for " + pref + ": " + v);
+  } catch (const std::out_of_range &) {
+    die_usage("value out of range for " + pref + ": " + v);
+  }
+  return 0; // unreachable; die_usage exits
+}
+static int parse_int_value(const std::string & pref, const std::string & v)
+{
+  try {
+    size_t pos = 0;
+    int n = std::stoi(v, &pos);
+    if (pos != v.size()) die_usage("invalid value for " + pref + ": " + v);
+    return n;
+  } catch (const std::invalid_argument &) {
+    die_usage("invalid value for " + pref + ": " + v);
+  } catch (const std::out_of_range &) {
+    die_usage("value out of range for " + pref + ": " + v);
+  }
+  return 0;
+}
+static double parse_double_value(const std::string & pref, const std::string & v)
+{
+  try {
+    size_t pos = 0;
+    double d = std::stod(v, &pos);
+    if (pos != v.size()) die_usage("invalid value for " + pref + ": " + v);
+    if (!std::isfinite(d)) die_usage("value not finite for " + pref + ": " + v);
+    return d;
+  } catch (const std::invalid_argument &) {
+    die_usage("invalid value for " + pref + ": " + v);
+  } catch (const std::out_of_range &) {
+    die_usage("value out of range for " + pref + ": " + v);
+  }
+  return 0.0;
+}
+
 // Parse a --name=VALUE or --name VALUE argument as size_t.
 // Returns true if this argument matched, advancing 'i' if needed.
 static bool parse_num_arg(const std::string & name, int & i, int argc,
@@ -980,14 +1029,14 @@ static bool parse_num_arg(const std::string & name, int & i, int argc,
   if (a.rfind(pref + "=", 0) == 0) {
     std::string v = a.substr(pref.size() + 1);
     if (v.empty()) die_usage("missing value for " + pref);
-    out = std::stoull(v);
+    out = (size_t)parse_u64_value(pref, v);
     if (was_set) *was_set = true;
     return true;
   }
   // Form: --name VALUE (next argv element)
   else if (a == pref) {
     if (i + 1 >= argc) die_usage("missing value for " + pref);
-    out = std::stoull(argv[++i]);
+    out = (size_t)parse_u64_value(pref, argv[++i]);
     if (was_set) *was_set = true;
     return true;
   }
@@ -1004,12 +1053,12 @@ static bool parse_int_arg(const std::string & name, int & i, int argc,
   if (a.rfind(pref + "=", 0) == 0) {
     std::string v = a.substr(pref.size() + 1);
     if (v.empty()) die_usage("missing value for " + pref);
-    out = std::stoi(v);
+    out = parse_int_value(pref, v);
     return true;
   }
   else if (a == pref) {
     if (i + 1 >= argc) die_usage("missing value for " + pref);
-    out = std::stoi(argv[++i]);
+    out = parse_int_value(pref, argv[++i]);
     return true;
   }
 
@@ -1049,12 +1098,12 @@ static bool parse_double_arg(const std::string & name, int & i, int argc,
   if (a.rfind(pref + "=", 0) == 0) {
     std::string v = a.substr(pref.size() + 1);
     if (v.empty()) die_usage("missing value for " + pref);
-    out = std::stod(v);
+    out = parse_double_value(pref, v);
     return true;
   }
   else if (a == pref) {
     if (i + 1 >= argc) die_usage("missing value for " + pref);
-    out = std::stod(argv[++i]);
+    out = parse_double_value(pref, argv[++i]);
     return true;
   }
 
@@ -7178,17 +7227,24 @@ static void gpu_decomp_worker(
                     if (std::abs((long)cur_batch - (long)S.best_batch) > 2) {
                       S.refine_lo = std::min(S.best_batch, cur_batch);
                       S.refine_hi = std::max(S.best_batch, cur_batch);
-                      S.batch_size.store(S.refine_lo + (S.refine_hi - S.refine_lo) / 2);
+                      size_t mid = S.refine_lo + (S.refine_hi - S.refine_lo) / 2;
+                      S.batch_size.store(mid);
                       S.phase = SharedTuneState::Phase::REFINE; S.refine_iters = 0;
+                      if (opt.verbosity >= V_VERBOSE) {
+                        std::ostringstream os;
+                        os << "[AUTO-TUNE] refining [" << S.refine_lo << ".." << S.refine_hi
+                           << "] trying " << mid;
+                        vlog(V_VERBOSE, opt, os.str() + "\n");
+                      }
                     } else {
                       S.batch_size.store(S.best_batch);
                       S.phase = SharedTuneState::Phase::SETTLED; S.settle_ticks = 0;
-                    }
-                    if (opt.verbosity >= V_VERBOSE) {
-                      std::ostringstream os;
-                      os << "[AUTO-TUNE] settled at batch=" << S.best_batch
-                         << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
-                      vlog(V_VERBOSE, opt, os.str() + "\n");
+                      if (opt.verbosity >= V_VERBOSE) {
+                        std::ostringstream os;
+                        os << "[AUTO-TUNE] settled at batch=" << S.best_batch
+                           << " (" << std::fixed << std::setprecision(2) << S.best_thr << " GiB/s)";
+                        vlog(V_VERBOSE, opt, os.str() + "\n");
+                      }
                     }
                   }
                 }
@@ -8725,12 +8781,14 @@ static void apply_backend_defaults(Options & opt)
                      "(asymmetric default; override with --hybrid)\n";
       opt.cpu_queue_min = 0;
     }
-    if (opt.verbosity >= V_VERBOSE) {
+    // Show this at default verbosity: users on Gen3 hardware otherwise see
+    // no GPU activity and have no way to know the runtime made that choice.
+    if (opt.verbosity >= V_DEFAULT) {
       std::ostringstream os;
-      os << "[ASYMMETRIC] PCIe Gen" << gen
+      os << "gzstd: PCIe Gen" << gen
          << " detected; defaulting decompress to --cpu-only "
-            "(override with --hybrid or --gpu-only)";
-      vlog(V_VERBOSE, opt, os.str() + "\n");
+            "(override with --hybrid or --gpu-only)\n";
+      std::fprintf(stderr, "%s", os.str().c_str());
     }
   } else {
     opt.hybrid = true;
@@ -8773,6 +8831,8 @@ static Options parse_args(int argc, char ** argv)
     }
   }
 
+  std::string pinned_value_tmp; // scratch buffer for --pinned VALUE parsing
+  (void)pinned_value_tmp; // referenced only under HAVE_NVCOMP
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "-h" || a == "-?") { print_help(); std::exit(EXIT_OK); }
@@ -8899,21 +8959,36 @@ static Options parse_args(int argc, char ** argv)
 #ifdef HAVE_NVCOMP
     else if (a == "--gpu-only") { opt.gpu_only = true; opt.backend_user_set = true; }
     else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) { opt.gpu_batch_user_set = true; opt.gpu_hybrid_tuning_seen = true; }
-    else if (parse_double_arg("gpu-mem-frac", i, argc, argv, opt.gpu_mem_fraction)) { opt.gpu_hybrid_tuning_seen = true; }
+    else if (parse_double_arg("gpu-mem-frac", i, argc, argv, opt.gpu_mem_fraction)) {
+      // Reject obvious nonsense; warn-and-clamp the soft bounds so existing
+      // scripts that pass slightly aggressive values still work but the user
+      // learns why they didn't get what they asked for.
+      if (opt.gpu_mem_fraction <= 0.0 || opt.gpu_mem_fraction >= 1.0)
+        die_usage("--gpu-mem-frac must be in (0.0, 1.0)");
+      if (opt.gpu_mem_fraction < 0.10 || opt.gpu_mem_fraction > 0.95) {
+        double requested = opt.gpu_mem_fraction;
+        opt.gpu_mem_fraction = (requested < 0.10) ? 0.10 : 0.95;
+        if (opt.verbosity >= V_ERROR) {
+          std::ostringstream os;
+          os << "gzstd: warning: --gpu-mem-frac=" << requested
+             << " outside safe range [0.10, 0.95]; clamping to "
+             << opt.gpu_mem_fraction << "\n";
+          std::fprintf(stderr, "%s", os.str().c_str());
+        }
+      }
+      opt.gpu_hybrid_tuning_seen = true;
+    }
     else if (parse_num_arg("gpu-streams", i, argc, argv, opt.gpu_streams)) { opt.gpu_hybrid_tuning_seen = true; }
     else if (parse_int_arg("gpu-devices", i, argc, argv, opt.gpu_devices)) { opt.gpu_hybrid_tuning_seen = true; }
     else if (a == "--no-pinned") { opt.pin_mode = PinMode::OFF; opt.gpu_hybrid_tuning_seen = true; }
-    else if (a.rfind("--pinned", 0) == 0) {
-      std::string v;
-      if (parse_str_arg("pinned", i, argc, argv, v) || a.find('=') != std::string::npos) {
-        if (a.find('=') != std::string::npos) v = a.substr(a.find('=') + 1);
-        std::transform(v.begin(), v.end(), v.begin(), ::tolower);
-        if (v == "auto") opt.pin_mode = PinMode::AUTO;
-        else if (v == "on") opt.pin_mode = PinMode::ON;
-        else if (v == "off") opt.pin_mode = PinMode::OFF;
-        else die_usage("invalid value for --pinned (expected auto|on|off)");
-        opt.gpu_hybrid_tuning_seen = true;
-      }
+    else if (parse_str_arg("pinned", i, argc, argv, pinned_value_tmp)) {
+      std::transform(pinned_value_tmp.begin(), pinned_value_tmp.end(),
+                     pinned_value_tmp.begin(), ::tolower);
+      if (pinned_value_tmp == "auto") opt.pin_mode = PinMode::AUTO;
+      else if (pinned_value_tmp == "on") opt.pin_mode = PinMode::ON;
+      else if (pinned_value_tmp == "off") opt.pin_mode = PinMode::OFF;
+      else die_usage("invalid value for --pinned (expected auto|on|off)");
+      opt.gpu_hybrid_tuning_seen = true;
     }
 #else
     else if (a.rfind("--gpu-", 0) == 0 || a == "--gpu-only") {
