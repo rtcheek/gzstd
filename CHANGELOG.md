@@ -1,9 +1,59 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.4  
+**Covers:** v0.9.50 → v0.13.5  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.5 — Hybrid mode: proactive batch reservation
+
+Fix hybrid mode regressing below `--gpu-only` on high-core-count
+multi-GPU systems.
+
+A 930-measurement sweep at iterations=3 on a 256-core / 8-GPU server
+showed hybrid compress at 2.45 GiB/s on zeros.bin vs gpu-only at 3.05
+GiB/s — a 20% regression below the GPU-alone baseline.  Decompress was 25-60% slower on every file.
+Hybrid mode is supposed to add CPU contribution on top of GPU; on this
+hardware class it was instead displacing GPU work.
+
+**Root cause: AUTO floor factor too small.**  `compute_auto_factor_()`
+in HybridSched (added v0.12.12) computed the queue floor as
+`(gpu_per_worker - cpu_per_worker) / gpu_per_worker`, clamped to [0, 1].
+On systems where the per-worker GPU and CPU rates are similar (~0.13
+GiB/s each), this produced factor ~0.15.  The effective floor was
+`0.15 * streams * batch` — too shallow to actually reserve a GPU round.
+96 CPU workers drained the queue during the millisecond-long GPU
+processing window, so when a stream returned for its next batch via
+`pop_batch_greedy(min_n=1)`, it got a tiny batch.  Small nvCOMP batches
+don't amortize per-call kernel-launch overhead, and the throughput loss
+from shrunken GPU batches exceeded CPU's contribution.
+
+**Fix: "GPU first, CPU as surplus" policy.**  New AUTO formula keys off
+CPU's measured share of aggregate throughput, not per-worker rates:
+
+  cpu_share < 5%   : factor = 4.0  (CPU not contributing → heavy lockout,
+                                     hybrid converges to gpu-only)
+  cpu_share > 20%  : factor = 1.5  (CPU helping → reserve 1.5 batches,
+                                     but let CPU work the surplus)
+  in between       : linear interpolation
+  warm-up          : factor = 2.0  (proactive default)
+
+Floor is now always >= 1 full GPU round; a CPU pop can never leave the
+next GPU batch short.  Cap on `--hybrid-floor-factor` raised from 1.0
+to 4.0 so users can lock CPUs out further if needed.
+
+The diagnosis path was: gpu-only's per-config sweep showed a flat 3.05
+GiB/s ceiling across all batch×stream combinations (the signature of a
+downstream bottleneck — writer/NVMe/ResultStore).  On mixed.bin where
+nothing was saturated, gpu-only showed a clean "bigger batch wins"
+gradient (0.85 → 0.93 GiB/s); hybrid's gradient was flat at ~0.88,
+evidence that CPU was destroying the GPU's batch-size tuning by
+draining the queue.
+
+No behavior change for explicit `--cpu-only`, `--gpu-only`, or users
+who set `--hybrid-floor=nominal` or `--hybrid-floor-factor=X` manually.
 
 ---
 

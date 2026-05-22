@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.4";
+static constexpr const char * GZSTD_VERSION = "0.13.5";
 //
 // Architecture overview:
 //
@@ -226,13 +226,14 @@ struct Options {
   size_t cpu_backlog = 0;    // queue depth before CPU pops (hybrid)
   size_t cpu_queue_min = 0;   // min queue depth before CPU workers activate (0=no threshold)
 
-  // Hybrid queue-floor controls (v0.12.12+)
-  //   AUTO    : EMA throughput ratio scales the floor (decomp → ~0, comp → full)
-  //   NOMINAL : v0.12.9 behaviour, floor = active_gpu_streams * gpu_batch_size
-  //   OFF     : no floor, CPUs compete freely (relies on gpus_waiting semaphore)
+  // Hybrid queue-floor controls (v0.12.12+, policy rewritten v0.13.5)
+  //   AUTO    : "GPU first, CPU as surplus" — factor in [1.5, 4.0] based
+  //             on CPU's measured share of aggregate throughput
+  //   NOMINAL : factor = 1.0, floor = active_gpu_streams * gpu_batch_size
+  //   OFF     : factor = 0.0, CPUs compete freely (pre-v0.12.12 behaviour)
   enum class HybridFloorMode { AUTO, NOMINAL, OFF };
   HybridFloorMode hybrid_floor_mode = HybridFloorMode::AUTO;
-  // Manual override in [0.0, 1.0].  <0 means "unset; use mode above".
+  // Manual override in [0.0, 4.0].  <0 means "unset; use mode above".
   double hybrid_floor_factor = -1.0;
 
   // Throttle tuning (v0.12.14+).
@@ -881,14 +882,18 @@ static void print_help_long()
 "============================================================\n"
 "  --hybrid-floor=MODE\n"
 "     GPU queue-depth reservation mode:\n"
-"       auto (default): EMA-scaled — shrinks when CPU ≈ GPU\n"
-"                       (typical for decompress), grows when GPU ≫ CPU\n"
-"                       (typical for compress).\n"
+"       auto (default): factor in [1.5, 4.0] based on CPU's share of\n"
+"                       aggregate throughput.  CPU contributing < 5%\n"
+"                       of bytes → factor=4 (heavy lockout, hybrid ≈\n"
+"                       gpu-only).  CPU contributing > 20% → factor=1.5\n"
+"                       (CPU helps, GPU still reserved).\n"
 "       nominal:        streams * gpu_batch_size (v0.12.9 behaviour).\n"
 "       off:            no reservation; CPUs compete freely.\n"
 "\n"
 "  --hybrid-floor-factor X\n"
-"     Override the auto scale with a fixed [0..1] multiplier.\n"
+"     Override the auto scale with a fixed [0..4] multiplier.  Floor =\n"
+"     X * active_gpu_streams * gpu_batch_size.  X=2.0 reserves two full\n"
+"     GPU rounds ahead of CPU; X=0 lets CPU compete freely.\n"
 "\n"
 "  -M N, --memlimit=N, --memory=N\n"
 "     Memory usage limit in MiB (zstd-compatible).  On decompression,\n"
@@ -3632,26 +3637,41 @@ private:
   std::atomic<int>    cpu_samples_{0};     // warm-up counter
   std::atomic<int>    gpu_samples_{0};     // warm-up counter
 
-  // Compute the floor scale factor for AUTO mode.  During warm-up (<2
-  // samples either side) returns 1.0 (nominal), preserving v0.12.9.
-  // Once converged, scales by GPU advantage per stream vs CPU per thread.
-  //   factor = clamp((gpu_per - cpu_per) / gpu_per, 0, 1)
-  // GPU ≫ CPU (compress): factor → 1 (full nominal reservation).
-  // GPU ≈ CPU (decomp):   factor → 0 (CPUs compete freely).
+  // Compute the floor scale factor for AUTO mode.
+  //
+  // Policy: "GPU first, CPU as surplus."  CPU can only take a frame when
+  // the queue has at least factor * streams * batch frames buffered ahead
+  // of it, guaranteeing GPU never finds the queue shallow when it asks
+  // for its next batch.  The old per-worker-rate formula (v0.12.12) was
+  // too small on high-core-count multi-GPU systems where the per-worker
+  // GPU and CPU rates are similar — it produced factor ~0.15 and CPU
+  // drained the queue, shrinking GPU batches and dragging hybrid below
+  // --gpu-only.
+  //
+  // New formula keys off CPU's *share of aggregate throughput*:
+  //   share < 5%  : CPU not contributing meaningfully → factor = 4.0
+  //                 (heavy lockout; hybrid converges to gpu-only)
+  //   share > 20% : CPU genuinely helping            → factor = 1.5
+  //                 (still reserve one full batch + half, but let CPU work)
+  //   in between  : linear interpolation
+  //
+  // Range [1.5, 4.0] guarantees the floor is always at least one full
+  // GPU round, so a CPU pop can never leave the next GPU batch short.
+  // Warm-up returns 2.0 — proactive reserve before any measurement.
   double compute_auto_factor_() const {
     int cs = cpu_samples_.load(std::memory_order_relaxed);
     int gs = gpu_samples_.load(std::memory_order_relaxed);
-    if (cs < 2 || gs < 2) return 1.0;  // warm-up: nominal behaviour
-    double c_total = cpu_rate_ema_.load(std::memory_order_relaxed);
-    double g_total = gpu_rate_ema_.load(std::memory_order_relaxed);
-    int streams = std::max(1, active_gpu_streams_.load(std::memory_order_relaxed));
-    double gpu_per = g_total / double(streams);
-    double cpu_per = c_total / double(std::max(1, cpu_thread_count_));
-    if (gpu_per <= 0.0) return 1.0;
-    double adv = (gpu_per - cpu_per) / gpu_per;
-    if (adv < 0.0) adv = 0.0;
-    if (adv > 1.0) adv = 1.0;
-    return adv;
+    if (cs < 2 || gs < 2) return 2.0;  // warm-up: proactive reserve
+    double c_rate = cpu_rate_ema_.load(std::memory_order_relaxed);
+    double g_rate = gpu_rate_ema_.load(std::memory_order_relaxed);
+    double total = c_rate + g_rate;
+    if (total <= 0.0) return 2.0;
+    double cpu_share = c_rate / total;
+    if (cpu_share >= 0.20) return 1.5;
+    if (cpu_share <= 0.05) return 4.0;
+    // Linear interp between (share=0.05, factor=4.0) and (share=0.20, factor=1.5)
+    double t = (cpu_share - 0.05) / (0.20 - 0.05);
+    return 4.0 - t * (4.0 - 1.5);
   }
 
   // Resolve the active floor factor from Options + runtime EMA state.
@@ -8666,9 +8686,9 @@ static std::string derive_output(const std::string & input, Mode mode)
 
  GPU compress consistently wins on the hardware tier we target, but
  PCIe Gen3 D2H transfer cost makes hybrid *decompress* slower than CPU
- MT for every data type measured on Lovelace (2× RTX 2080 Ti, Gen3).
- Default decompress to --cpu-only on Gen3 hardware to avoid that
- pitfall; on Gen4+ machines (e.g. Knuth's H100s) hybrid still wins.
+ MT for every data type measured on consumer Gen3 GPUs (RTX 20-series
+ and similar).  Default decompress to --cpu-only on Gen3 hardware to
+ avoid that pitfall; on Gen4+ datacenter GPUs hybrid still wins.
 
  Returns the minimum link generation across visible GPUs:
    1, 2, 3 → slow PCIe (D2H dominates decompress)
@@ -8941,8 +8961,10 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (parse_double_arg("hybrid-floor-factor", i, argc, argv,
                               opt.hybrid_floor_factor)) {
-      if (opt.hybrid_floor_factor < 0.0 || opt.hybrid_floor_factor > 1.0)
-        die_usage("--hybrid-floor-factor must be in [0.0, 1.0]");
+      // v0.13.5+: cap raised from 1.0 to 4.0 to permit proactive batch
+      // reservation (factor=N means N full GPU rounds queued ahead of CPU).
+      if (opt.hybrid_floor_factor < 0.0 || opt.hybrid_floor_factor > 4.0)
+        die_usage("--hybrid-floor-factor must be in [0.0, 4.0]");
       opt.gpu_hybrid_tuning_seen = true;
     }
     else if (parse_int_arg("throttle-factor", i, argc, argv, opt.throttle_factor)) {
