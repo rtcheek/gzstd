@@ -1,13 +1,13 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.5  
+**Covers:** v0.9.50 → v0.13.6  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
-## v0.13.5 — Hybrid mode: proactive batch reservation
+## v0.13.6 — Hybrid mode: proactive batch reservation
 
 Fix hybrid mode regressing below `--gpu-only` on high-core-count
 multi-GPU systems.
@@ -44,13 +44,41 @@ Floor is now always >= 1 full GPU round; a CPU pop can never leave the
 next GPU batch short.  Cap on `--hybrid-floor-factor` raised from 1.0
 to 4.0 so users can lock CPUs out further if needed.
 
-The diagnosis path was: gpu-only's per-config sweep showed a flat 3.05
+**Second bug: drain-phase short-circuit ignored the floor.**  The
+may_take predicate in cpu_worker and cpu_decomp_worker had an early
+return when `qs.done && !is_fixed_mode()` — for AUTO mode, once the
+producer finished, CPU took regardless of floor.  On a 20 GiB file with
+mmap and warm page cache, the reader finishes in ~1s but the GPU drain
+takes 10+s, during which CPU floods the queue and shrinks GPU batches.
+Symptom: hybrid still ~10% slower than gpu-only after the AUTO formula
+fix, on the same hardware class where the formula fix should have
+sufficed.  Fix: drain-phase short-circuit only fires when no GPU is
+active.  While any GPU stream is registered (working through its share
+or about to), the floor applies in both fill and drain phases.
+
+**Third bug: fixed-share mode deadlocked under the new floor.**  The
+old code bypassed the floor entirely in fixed-share mode via the
+drain-phase short-circuit; with that short-circuit removed,
+`--cpu-share 0.5` could deadlock: `should_cpu_take` returns true when
+CPU's share is below target, `should_gpu_take` returns true when CPU's
+share is at-or-above target minus 2%.  If the floor blocks CPU, CPU's
+share stays at 0, GPU's predicate also fails, both sides wait forever.
+Fix: skip the floor check entirely in fixed-share mode — the user's
+explicit share is the constraint, not GPU batch preservation.  Floor
+only applies in adaptive AUTO/NOMINAL mode.
+
+The diagnosis path: gpu-only's per-config sweep showed a flat 3.05
 GiB/s ceiling across all batch×stream combinations (the signature of a
 downstream bottleneck — writer/NVMe/ResultStore).  On mixed.bin where
 nothing was saturated, gpu-only showed a clean "bigger batch wins"
 gradient (0.85 → 0.93 GiB/s); hybrid's gradient was flat at ~0.88,
 evidence that CPU was destroying the GPU's batch-size tuning by
 draining the queue.
+
+Consumer Gen3 hardware (24-core, 2× RTX 2080 Ti) validates the fix
+preserves hybrid winning on its target tier: medium_compress.bin
+compress shows hybrid 3.30-3.71 GiB/s vs gpu-only 1.87-2.12 GiB/s
+(~70% faster).
 
 No behavior change for explicit `--cpu-only`, `--gpu-only`, or users
 who set `--hybrid-floor=nominal` or `--hybrid-floor-factor=X` manually.

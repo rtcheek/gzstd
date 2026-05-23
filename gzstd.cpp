@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.5";
+static constexpr const char * GZSTD_VERSION = "0.13.6";
 //
 // Architecture overview:
 //
@@ -3842,23 +3842,25 @@ static void cpu_worker(
       // release the permit and retry.  Workers only hold permits while
       // actively processing — never while sleeping on the CV.
       auto may_take = [&](const TaskQueue::QueueState & qs) -> bool {
-        // Once producer is done, CPU must drain regardless of GPU state.
-        // Exception: in fixed-share mode, the user explicitly requested a
-        // CPU/GPU split — keep honoring it during drain so long as any GPU
-        // stream is still alive to pick up the rest.  If all GPU streams
-        // have unregistered (failure or normal exit), CPU drains.
-        if (qs.done) {
-          if (!sched->is_fixed_mode() || !sched->any_gpu_active()) return true;
-        }
+        // Drain-phase fast path: only when no GPU is left to do the work.
+        // While any GPU stream is still active, honor the floor regardless
+        // of phase — small files where mmap+page-cache finish the producer
+        // in ~1s otherwise let CPU flood the post-done queue, shrinking
+        // GPU batches and dragging hybrid below gpu-only.  When all GPU
+        // streams have unregistered (failure or normal exit), CPU drains.
+        if (qs.done && !sched->any_gpu_active()) return true;
         if (!sched->should_cpu_take()) return false;
-        // After producer is done, share is the only constraint — skip
-        // floor/queue_min reservations meant to keep GPU batches full.
-        if (qs.done) return true;
-        // Reserve enough tasks for GPUs to fill their next batch cycle.
-        // Without this, 96 CPUs drain the queue during GPU processing,
-        // and GPUs find it empty when they come back for more.
-        size_t floor = sched->cpu_queue_floor();
-        if (floor > 0 && qs.depth <= floor) return false;
+        // Floor applies only in adaptive (non-fixed) mode.  Fixed-share
+        // mode is the user's explicit intent and would deadlock here:
+        // should_gpu_take requires cpu_share >= target - 2%, so locking
+        // CPU out via the floor stops GPU too (both predicates fail).
+        if (!sched->is_fixed_mode()) {
+          // Reserve enough tasks for GPUs to fill their next batch cycle.
+          // Without this, CPUs drain the queue during GPU processing and
+          // GPUs find it empty when they come back for more.
+          size_t floor = sched->cpu_queue_floor();
+          if (floor > 0 && qs.depth <= floor) return false;
+        }
         if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min) return false;
         return true;
       };
@@ -4122,20 +4124,18 @@ static void cpu_decomp_worker(
         // Always allow trivially-compressed frames regardless of scheduler
         if (qs.front_ratio >= 0.0 && qs.front_ratio < 0.02) { got_trivial = true; return true; }
         got_trivial = false;
-        // Once producer is done, CPU must drain regardless of GPU state —
-        // GPU may be stuck in bp->acquire, a CUDA op, or already exited.
-        // Exception: in fixed-share mode, the user explicitly requested a
-        // CPU/GPU split — keep honoring it during drain so long as any GPU
-        // stream is still alive to pick up the rest.
-        if (qs.done) {
-          if (!sched->is_fixed_mode() || !sched->any_gpu_active()) return true;
-        }
+        // Drain-phase fast path: only when no GPU is left to do the work.
+        // While any GPU stream is active, honor the floor regardless of phase
+        // so small-file runs (producer finishes in <1s) don't let CPU flood
+        // the post-done queue and shrink GPU batches.
+        if (qs.done && !sched->any_gpu_active()) return true;
         // Normal scheduling: respect GPU priority and queue depth threshold
         if (!sched->should_cpu_take()) return false;
-        // After producer is done, share is the only constraint.
-        if (qs.done) return true;
-        size_t floor = sched->cpu_queue_floor();
-        if (floor > 0 && qs.depth <= floor) return false;
+        // Floor only in adaptive mode — fixed-share would deadlock here.
+        if (!sched->is_fixed_mode()) {
+          size_t floor = sched->cpu_queue_floor();
+          if (floor > 0 && qs.depth <= floor) return false;
+        }
         if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min) return false;
         return true;
       };
