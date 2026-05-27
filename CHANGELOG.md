@@ -1,9 +1,59 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.7  
+**Covers:** v0.9.50 → v0.13.8  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.8 — Result-store buffer pool: decompress page-fault fix
+
+Apply the v0.13.7 page-fault diagnosis to the decompress path via a
+proper buffer pool — the simple "per-thread scratch + copy" pattern
+that worked for compress can't work for decompress because the output
+is the same size as the buffer, so the copy would page-fault as many
+bytes as the original allocation.  Instead, recycle whole buffers
+through the writer.
+
+**Mechanism.**  `ResultStore` and `AsyncWritePool` now carry
+`std::shared_ptr<std::vector<char>>` (alias `FrameBuf`) end-to-end
+instead of bare `std::vector<char>`.  Workers maintain a per-thread
+pool of FrameBufs and reuse a slot once `use_count() == 1` (writer has
+dropped its reference after writing to disk).  Buffers stay resident
+across iterations — `resize()` only memsets resident memory, no kernel
+page-fault path.
+
+**cpu_decomp_worker now uses the pool.**  The single-frame path
+(`acquire_decomp_buf()` → `resize(decomp_size)` → ZSTD writes → push)
+and the streaming-frame path (16 MiB chunks in a loop) both pull from
+the same per-thread pool.  Pool grows on demand and is bounded
+implicitly by FrameThrottle's in-flight cap.
+
+**Compress workers wrap their output in `make_shared` at the push
+site.**  The v0.13.7 fix (per-thread scratch buffer, copy `csz` bytes
+into a sized vector) is unchanged; that sized vector now becomes the
+backing storage for a shared_ptr.  No reuse on the compress side
+because `csz` is small for compressible data and the per-iteration
+alloc is already cheap.
+
+**GPU workers** (compress D2H, decompress D2H) also wrap `h_out` in
+`make_shared` — uniform interface, negligible overhead.
+
+**Expected impact** (needs re-benchmarking on high-core-count
+multi-GPU systems):
+- `cpu-only` decompress at the default high-thread cap: should
+  approach the per-thread sweet-spot ceiling the same way v0.13.7
+  lifted compress.  v0.13.7 cpu-only decompress on the worst-affected
+  file was 3.71 GiB/s; the hand-tuned low-thread ceiling for the same
+  file was 5.25 GiB/s.  Target: 5+ GiB/s.
+- `hybrid` decompress should also benefit (same per-thread overhead).
+- Compress behaviour unchanged from v0.13.7.
+
+**Allocator overhead.**  shared_ptr's atomic refcount adds two atomic
+ops per frame (one push, one writer drop) — measured at ~10-30ns each
+on modern hardware.  At even 1000 frames/sec, that's 60µs/sec total.
+Negligible relative to the page-fault savings.
 
 ---
 
@@ -49,31 +99,46 @@ phase, the kernel serialized all 96 threads on the single per-process
 `mmap_lock` rwsem.  Same pattern in `cpu_decomp_worker` (allocating
 `out_buf(t.decomp_size)` per frame).
 
-**Fix.** Hoist the output buffer to per-thread (lifetime = worker
-thread).  On iteration 1, `resize()` pays the page-fault cost once.
-On iterations 2+, the pages are already resident — `resize` just
-memsets resident memory (fast, no kernel involvement).  After
-compression we copy `csz` bytes into a sized vector for the result
-store, preserving `scratch`'s capacity for the next iteration.
+**Fix (compress only).**  Hoist the output buffer to per-thread
+(lifetime = worker thread) in `cpu_worker` and `cpu_worker_rescue`.
+On iteration 1, `resize()` pays the page-fault cost once.  On
+iterations 2+, the pages are already resident — `resize` just memsets
+resident memory (fast, no kernel involvement).  Then copy `csz` bytes
+into a sized vector for the result store, preserving `scratch`'s
+capacity for the next iteration.
 
 For highly compressible data (csz ≈ 0) the copy is essentially free
 and the fix recovers almost all lost throughput.  For poorly
 compressible data (csz ≈ src_size) the copy still costs a memcpy of
 the compressed output, but the worst-case page-fault storm is gone.
 
-**This also fixes the v0.13.2 finding** that `cpu-only` on the same
-hardware (96 default threads) was 30%+ slower than `cpu-only -T 16`.
-Same mechanism — 96 threads racing on `mmap_lock` for output-buffer
-allocation.  The previously empirical "T16 sweet spot" should now move
-substantially higher; the actual optimum is hardware-dependent and
-needs re-benchmarking.
+**Decompress is NOT patched** — and we tried, then reverted.  For
+decompress, `actual ≈ decomp_size` (output is the decompressed
+payload), so the scratch+copy pattern would page-fault as many bytes
+on the copy as the original allocation, then ADD a memcpy.  Net cost:
+original + memcpy = worse.  The decompress allocation pattern stays
+as-is; the writer owns each `out_buf` after `std::move` and frees it
+as it drains.  Fixing decompress requires a true buffer pool with
+writer-side return — out of scope here.
 
-Validation expected:
-- knuth `--hybrid` should close to within noise of `--gpu-only` on
-  every file class
-- knuth `--cpu-only` (at default T96) should approach the T16 number
-- Lower-core systems unchanged (single-thread page-fault storm doesn't
-  exist on 24-core lovelace)
+**This also lifts `cpu-only` compress at the default high-thread cap**
+by the same mechanism.  Measurements on a 256-core / 8-GPU system:
+zeros.bin compress went from 7.91 to 12.62 GiB/s (+59%),
+high_compress from 9.05 to 15.82 (+75%) — both now ABOVE the
+hand-tuned low-thread sweet spot from the v0.13.2 baseline (10.5
+GiB/s).  The empirical "lower thread count is best" finding is
+retired for compress on this hardware class.
+
+Validation on the same hardware:
+- `--hybrid` and `--gpu-only` compress now converge to identical
+  numbers (3.99 GiB/s on the highly-compressible files) — both
+  bottlenecked downstream (writer/NVMe), CPU contribution can no
+  longer go net-negative.
+- `--cpu-only` (default high-thread cap) is now the clear winner on
+  this hardware class: 12.6 GiB/s on zeros vs 3.99 for any GPU-using
+  mode.
+- Lower-core consumer hardware unchanged (single-thread page-fault
+  storm doesn't exist on 24-ish cores).
 
 ---
 

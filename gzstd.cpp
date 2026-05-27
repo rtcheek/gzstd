@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.7";
+static constexpr const char * GZSTD_VERSION = "0.13.8";
 //
 // Architecture overview:
 //
@@ -2736,10 +2736,19 @@ private:
 
 // Holds compressed output frames indexed by sequence number, allowing the
 // writer thread to emit them in order even though workers finish out-of-order.
+// Output-frame buffer.  shared_ptr so that workers can hold a reference
+// in a per-thread pool while another reference flows through the
+// ResultStore → writer → AsyncWritePool pipeline.  When the writer drops
+// its reference (after writing to disk), use_count returns to 1 (worker
+// only) and the worker can reuse the buffer — eliminating the per-
+// iteration allocation that caused the page-fault storm fixed in
+// v0.13.7 for compress and v0.13.8 for decompress.
+using FrameBuf = std::shared_ptr<std::vector<char>>;
+
 struct ResultStore {
   std::mutex                                     m;
   std::condition_variable                        cv;
-  std::unordered_map<size_t, std::vector<char>>  data;           // seq -> compressed frame
+  std::unordered_map<size_t, FrameBuf>           data;           // seq -> compressed frame
   size_t                                         next_to_write = 0;
   size_t                                         total_tasks   = 0;
   bool                                           producer_done = false;
@@ -2751,7 +2760,7 @@ struct ResultStore {
   // Writer drains all slots into the shared map periodically.
   struct Slot {
     std::mutex slot_m;
-    std::vector<std::pair<size_t, std::vector<char>>> pending;  // (seq, data)
+    std::vector<std::pair<size_t, FrameBuf>> pending;  // (seq, data)
   };
   std::vector<std::unique_ptr<Slot>> slots;
 
@@ -2763,7 +2772,7 @@ struct ResultStore {
   }
 
   // Producer: push a result to a specific slot (low contention  one producer per slot)
-  void push_to_slot(int slot_id, size_t seq, std::vector<char> && frame) {
+  void push_to_slot(int slot_id, size_t seq, FrameBuf frame) {
     if (slot_id >= 0 && slot_id < (int)slots.size()) {
       std::lock_guard<std::mutex> lk(slots[slot_id]->slot_m);
       slots[slot_id]->pending.emplace_back(seq, std::move(frame));
@@ -2979,7 +2988,7 @@ public:
   // Submit a batch of data to be written asynchronously.
   // Takes ownership of the data via move.  Blocks if the previous
   // write hasn't finished yet (backpressure).
-  void submit(std::vector<std::vector<char>> && buffers) {
+  void submit(std::vector<FrameBuf> && buffers) {
     std::unique_lock<std::mutex> lk(m_);
     // Wait for previous write to finish (backpressure)
     cv_consumer_.wait(lk, [this]{ return pending_.empty() || done_; });
@@ -3077,7 +3086,7 @@ private:
 
   void worker_fn() {
     while (true) {
-      std::vector<std::vector<char>> work;
+      std::vector<FrameBuf> work;
       {
         std::unique_lock<std::mutex> lk(m_);
         cv_producer_.wait(lk, [this]{ return !pending_.empty() || done_; });
@@ -3088,20 +3097,23 @@ private:
 
       // Write all buffers (last buffer's final block always written to ensure file length)
       for (size_t bi = 0; bi < work.size(); ++bi) {
-        auto & buf = work[bi];
+        auto & buf = work[bi];   // FrameBuf (shared_ptr<vector<char>>)
         uint64_t w_t0 = g_perf ? now_ns() : 0;
         bool is_last = (bi == work.size() - 1);
-        if (!write_sparse(buf.data(), buf.size(), is_last)) {
+        if (!write_sparse(buf->data(), buf->size(), is_last)) {
           error_ = true;
           return;
         }
         if (g_perf) {
           g_perf->write_ns.fetch_add(now_ns() - w_t0);
-          g_perf->write_bytes_total.fetch_add(buf.size());
+          g_perf->write_bytes_total.fetch_add(buf->size());
         }
         // wrote_bytes is now updated incrementally within write_sparse()
         // Release one frame permit: writer made progress, blocked workers may unblock.
         if (bp_) bp_->release(1);
+        // Drop our shared_ptr ref now (not at end of loop) so the worker pool
+        // can recycle the buffer for its next frame as soon as we're done.
+        buf.reset();
       }
 
 #ifdef __linux__
@@ -3130,7 +3142,7 @@ private:
   std::mutex m_;
   std::condition_variable cv_producer_;
   std::condition_variable cv_consumer_;
-  std::vector<std::vector<char>> pending_;
+  std::vector<FrameBuf> pending_;
   std::thread worker_;
   bool done_;
   bool error_ = false;
@@ -3236,12 +3248,12 @@ static void writer_thread(FILE * out, ResultStore & results,
     if (all_done) break;
 
     // Batch drain: collect ALL consecutive ready frames
-    std::vector<std::vector<char>> batch;
+    std::vector<FrameBuf> batch;
     size_t batch_bytes = 0;
     while (true) {
       auto it = results.data.find(results.next_to_write);
       if (it == results.data.end()) break;
-      batch_bytes += it->second.size();
+      batch_bytes += it->second->size();
       batch.push_back(std::move(it->second));
       results.data.erase(it);
       ++results.next_to_write;
@@ -3978,7 +3990,8 @@ static void cpu_worker(
     // for highly compressible data this is nearly free; for low-ratio data
     // it's still a memcpy of compressed-size bytes (the actual output we
     // would have written anyway).  scratch keeps its capacity for reuse.
-    std::vector<char> out_frame(scratch.data(), scratch.data() + csz);
+    auto out_frame = std::make_shared<std::vector<char>>(
+        scratch.data(), scratch.data() + csz);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(in_size);
@@ -4081,7 +4094,8 @@ static void cpu_worker_rescue(
 
     // Deliver compressed frame to the result store (copy of csz bytes;
     // scratch keeps capacity for the next iteration).
-    std::vector<char> out_frame(scratch.data(), scratch.data() + csz);
+    auto out_frame = std::make_shared<std::vector<char>>(
+        scratch.data(), scratch.data() + csz);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 
     // Update per-thread stats
@@ -4128,10 +4142,20 @@ static void cpu_decomp_worker(
     if (!tl_dctx) die("failed to create ZSTD_DCtx");
     apply_mem_limit_to_dctx(tl_dctx, *opt);
   }
-  // Per-thread reusable scratch — see cpu_worker comment for the rationale.
-  // ZSTD writes the decompressed output here; we copy `actual` bytes into
-  // the result-store vector each iteration so the scratch keeps capacity.
-  std::vector<char> scratch;
+
+  // Per-thread decompress-buffer pool.  Eliminates the per-iteration alloc
+  // + memset that triggers mmap_lock contention at high thread counts.
+  // Each slot is a shared_ptr; we reuse a slot when use_count() == 1
+  // (writer has dropped its ref).  Pool grows on demand; in steady state
+  // it stabilises at ~max-in-flight-per-worker (bounded by FrameThrottle).
+  std::vector<FrameBuf> decomp_pool;
+  auto acquire_decomp_buf = [&]() -> FrameBuf {
+    for (auto & b : decomp_pool) {
+      if (b.use_count() == 1) return b;  // only ref is ours; safe to reuse
+    }
+    decomp_pool.push_back(std::make_shared<std::vector<char>>());
+    return decomp_pool.back();
+  };
 
   while (true) {
     Task t{};
@@ -4254,8 +4278,12 @@ static void cpu_decomp_worker(
       size_t chunk_seq = t.seq;
       size_t prev_zin_pos = 0;
       for (;;) {
-        std::vector<char> chunk(CHUNK);
-        ZSTD_outBuffer zout { chunk.data(), chunk.size(), 0 };
+        // Reuse the same pool — streaming chunks are bounded by CHUNK,
+        // which fits comfortably within the per-frame max we'd otherwise
+        // see.  Buffers are recycled through the writer the same way.
+        auto chunk = acquire_decomp_buf();
+        chunk->resize(CHUNK);
+        ZSTD_outBuffer zout { chunk->data(), chunk->size(), 0 };
         size_t zin_before = zin.pos;
         size_t ret = ZSTD_decompressStream(tl_dctx, &zout, &zin);
         if (ZSTD_isError(ret))
@@ -4266,7 +4294,7 @@ static void cpu_decomp_worker(
           prev_zin_pos = zin.pos;
         }
         if (zout.pos > 0) {
-          chunk.resize(zout.pos);
+          chunk->resize(zout.pos);
           results->push_to_slot(-1, chunk_seq, std::move(chunk));
           ++chunk_seq;
         }
@@ -4282,18 +4310,19 @@ static void cpu_decomp_worker(
       }
       t.release_input();
     } else {
-      // resize() into per-thread scratch — first iteration grows it (page
-      // faults), subsequent iterations reuse the resident pages and just
-      // memset the prefix.  Then copy `actual` bytes into a sized vector
-      // for the result store.
-      scratch.resize(t.decomp_size);
-      actual = ZSTD_decompressDCtx(tl_dctx, scratch.data(), scratch.size(),
+      // Acquire a buffer from the per-thread pool.  First use grows it
+      // (page faults); subsequent uses reuse resident pages and just
+      // memset the prefix during resize.  The pool gives the buffer back
+      // to us once the writer drops its shared_ptr ref.
+      auto out_buf = acquire_decomp_buf();
+      out_buf->resize(t.decomp_size);
+      actual = ZSTD_decompressDCtx(tl_dctx, out_buf->data(), out_buf->size(),
                                    t.ptr(), t.len());
       if (ZSTD_isError(actual))
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
+      out_buf->resize(actual);
       t.release_input();
       if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
-      std::vector<char> out_buf(scratch.data(), scratch.data() + actual);
       results->push_to_slot(-1, t.seq, std::move(out_buf));
     }
 
@@ -5977,7 +6006,7 @@ static void gpu_worker(
           for (size_t i=0;i<C.filled;++i) {
             if (C.h_stats[i] != nvcompSuccess) throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
             const size_t csz = C.h_comp_sizes[i]; out_sum += csz; in_sum += C.h_in_sizes[i];
-            std::vector<char> h_out(csz);
+            auto h_out = std::make_shared<std::vector<char>>(csz);
             const void * d_src = static_cast<char*>(C.d_out_base)
                                  + i * C.max_out_chunk;
             if (C.h2d_pinned_base) {
@@ -5988,9 +6017,9 @@ static void gpu_worker(
               checkCuda(cudaMemcpy(pin_slot, d_src, csz,
                                    cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H pinned shared slot)");
-              std::memcpy(h_out.data(), pin_slot, csz);
+              std::memcpy(h_out->data(), pin_slot, csz);
             } else {
-              checkCuda(cudaMemcpy(h_out.data(), d_src, csz,
+              checkCuda(cudaMemcpy(h_out->data(), d_src, csz,
                                    cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H exact)");
             }
@@ -6132,7 +6161,7 @@ static void gpu_worker(
           uint64_t d2h_t0 = now_ns();
           for (size_t i = 0; i < C.filled; ++i) {
             const size_t csz = C.h_comp_sizes[i];
-            std::vector<char> h_out(csz);
+            auto h_out = std::make_shared<std::vector<char>>(csz);
             const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
             if (C.h2d_pinned_base) {
               // Reuse the H2D pinned slot for D2H (sync drain path).
@@ -6140,9 +6169,9 @@ static void gpu_worker(
                                 + i * C.h_io_slot_bytes;
               checkCuda(cudaMemcpy(pin_slot, d_src, csz, cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H pinned shared slot sync)");
-              std::memcpy(h_out.data(), pin_slot, csz);
+              std::memcpy(h_out->data(), pin_slot, csz);
             } else {
-              checkCuda(cudaMemcpy(h_out.data(), d_src, csz, cudaMemcpyDeviceToHost),
+              checkCuda(cudaMemcpy(h_out->data(), d_src, csz, cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H exact sync)");
             }
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
@@ -7663,7 +7692,7 @@ static void gpu_decomp_worker(
           out_sum += actual;
           d2h_bytes_batch += actual;
 
-          std::vector<char> h_out(actual);
+          auto h_out = std::make_shared<std::vector<char>>(actual);
           const void * d_src = static_cast<char*>(C.d_decomp_buf) + i * C.alloc_decomp;
           if (C.h_decomp_pinned) {
             // Device -> pinned host slot, then memcpy pinned -> output vector.
@@ -7672,9 +7701,9 @@ static void gpu_decomp_worker(
                               + i * C.alloc_decomp;
             checkCuda(cudaMemcpy(pin_slot, d_src, actual,
                                  cudaMemcpyDeviceToHost), "D2H decomp pinned");
-            std::memcpy(h_out.data(), pin_slot, actual);
+            std::memcpy(h_out->data(), pin_slot, actual);
           } else {
-            checkCuda(cudaMemcpy(h_out.data(), d_src, actual,
+            checkCuda(cudaMemcpy(h_out->data(), d_src, actual,
                                  cudaMemcpyDeviceToHost), "D2H decomp data");
           }
 
