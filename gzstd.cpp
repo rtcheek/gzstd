@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.6";
+static constexpr const char * GZSTD_VERSION = "0.13.7";
 //
 // Architecture overview:
 //
@@ -3825,6 +3825,15 @@ static void cpu_worker(
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
+  // Per-thread reusable scratch buffer.  compress_one_cpu_frame's resize()
+  // grows this once on the first iteration (paying ~bound bytes of page
+  // faults) and reuses the same resident pages on every subsequent call.
+  // Without this, each iteration allocates a fresh 16+ MiB vector, faults
+  // every page, then frees it — and with 96 worker threads all doing this
+  // in lockstep during GPU init, they serialize on mmap_lock and burn ~64%
+  // of CPU cycles inside the kernel's page-fault handler.  See v0.13.7
+  // CHANGELOG for the perf-record evidence.
+  std::vector<char> scratch;
   while (true) {
     Task t;
     bool got_task = false;
@@ -3933,11 +3942,10 @@ static void cpu_worker(
 
     {
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> out_frame;
-    compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, out_frame);
+    compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
-    const size_t csz = out_frame.size();
+    const size_t csz = scratch.size();
     const size_t in_size = t.len();
     t.release_input();
     if (g_perf) {
@@ -3965,6 +3973,12 @@ static void cpu_worker(
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
 
+    // Copy compressed bytes into a sized vector for the result store.
+    // The copy allocates only csz bytes (not the upper compressBound), so
+    // for highly compressible data this is nearly free; for low-ratio data
+    // it's still a memcpy of compressed-size bytes (the actual output we
+    // would have written anyway).  scratch keeps its capacity for reuse.
+    std::vector<char> out_frame(scratch.data(), scratch.data() + csz);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(in_size);
@@ -4024,6 +4038,8 @@ static void cpu_worker_rescue(
   CpuAgg * cpuagg,
   FrameThrottle * bp)
 {
+  // Per-thread reusable scratch — see cpu_worker comment for the rationale.
+  std::vector<char> scratch;
   while (true) {
     // Same wait-acquire-try pattern as cpu_worker: never hold a permit
     // while sleeping on the rescue CV, never hold a task without a permit.
@@ -4044,12 +4060,11 @@ static void cpu_worker_rescue(
     if (!got_task) break;
     if (m && t.view_ptr) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<char> out_frame;
-    compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, out_frame);
+    compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast<
         std::chrono::duration<double, std::milli>>(t1 - t0).count();
-    const size_t csz = out_frame.size();
+    const size_t csz = scratch.size();
 
     if (opt->verbosity >= V_TRACE) {
       char in_s[32], out_s[32];
@@ -4064,7 +4079,9 @@ static void cpu_worker_rescue(
       vlog(V_TRACE, *opt, os.str() + "\n");
     }
 
-    // Deliver compressed frame to the result store
+    // Deliver compressed frame to the result store (copy of csz bytes;
+    // scratch keeps capacity for the next iteration).
+    std::vector<char> out_frame(scratch.data(), scratch.data() + csz);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 
     // Update per-thread stats
@@ -4111,6 +4128,10 @@ static void cpu_decomp_worker(
     if (!tl_dctx) die("failed to create ZSTD_DCtx");
     apply_mem_limit_to_dctx(tl_dctx, *opt);
   }
+  // Per-thread reusable scratch — see cpu_worker comment for the rationale.
+  // ZSTD writes the decompressed output here; we copy `actual` bytes into
+  // the result-store vector each iteration so the scratch keeps capacity.
+  std::vector<char> scratch;
 
   while (true) {
     Task t{};
@@ -4261,14 +4282,18 @@ static void cpu_decomp_worker(
       }
       t.release_input();
     } else {
-      std::vector<char> out_buf(t.decomp_size);
-      actual = ZSTD_decompressDCtx(tl_dctx, out_buf.data(), out_buf.size(),
+      // resize() into per-thread scratch — first iteration grows it (page
+      // faults), subsequent iterations reuse the resident pages and just
+      // memset the prefix.  Then copy `actual` bytes into a sized vector
+      // for the result store.
+      scratch.resize(t.decomp_size);
+      actual = ZSTD_decompressDCtx(tl_dctx, scratch.data(), scratch.size(),
                                    t.ptr(), t.len());
       if (ZSTD_isError(actual))
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
-      out_buf.resize(actual);
       t.release_input();
       if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
+      std::vector<char> out_buf(scratch.data(), scratch.data() + actual);
       results->push_to_slot(-1, t.seq, std::move(out_buf));
     }
 

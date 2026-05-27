@@ -1,9 +1,79 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.6  
+**Covers:** v0.9.50 → v0.13.7  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.7 — Hoist per-iteration output buffer in CPU workers
+
+Fix the actual root cause of the hybrid-vs-gpu-only compress gap that
+v0.13.6 only partially closed.  The 14-17% slowdown on high-core-count
+multi-GPU systems wasn't scheduler overhead from idle threads — it was
+**page-fault contention on the per-process mmap_lock from 96 worker
+threads simultaneously allocating fresh 16+ MiB output buffers in their
+hot loops**.
+
+Discovered via `perf record` on a 256-core / 8-GPU server (zeros.bin
+compress, 4-second run).  Counters told the story:
+
+|                    | hybrid (T96) | gpu-only | ratio |
+|--------------------|---|---|---|
+| sys time           | 45.86s | 4.90s  | **9.35×** |
+| context switches   | 107,784 | 1,728 | 62× |
+| page faults        | 2.34M | 348k | 6.7× |
+| IPC                | 0.43 | 1.55 | 0.28× |
+
+The flame graph for hybrid showed **64% of all cycles in
+`asm_exc_page_fault`**, with the call path:
+
+```
+compress_one_cpu_frame
+  std::vector<char>::resize
+    memset_avx512_unaligned_erms
+      asm_exc_page_fault
+        do_user_addr_fault
+          down_read_trylock   ← 28% of fault time on mmap_lock
+```
+
+**Root cause.** Both `cpu_worker` and `cpu_worker_rescue` allocated a
+fresh `std::vector<char> out_frame` inside the per-iteration block,
+which `compress_one_cpu_frame` then grew to `ZSTD_compressBound(src)`
+(~16 MiB for the default GPU subchunk size).  Vector growth value-
+initializes new elements — for `char`, that's `memset(0)` across every
+page, triggering one minor page fault per 4 KiB.  At 96 workers all
+hitting this path during the "CPU runs wild while GPU initializes"
+phase, the kernel serialized all 96 threads on the single per-process
+`mmap_lock` rwsem.  Same pattern in `cpu_decomp_worker` (allocating
+`out_buf(t.decomp_size)` per frame).
+
+**Fix.** Hoist the output buffer to per-thread (lifetime = worker
+thread).  On iteration 1, `resize()` pays the page-fault cost once.
+On iterations 2+, the pages are already resident — `resize` just
+memsets resident memory (fast, no kernel involvement).  After
+compression we copy `csz` bytes into a sized vector for the result
+store, preserving `scratch`'s capacity for the next iteration.
+
+For highly compressible data (csz ≈ 0) the copy is essentially free
+and the fix recovers almost all lost throughput.  For poorly
+compressible data (csz ≈ src_size) the copy still costs a memcpy of
+the compressed output, but the worst-case page-fault storm is gone.
+
+**This also fixes the v0.13.2 finding** that `cpu-only` on the same
+hardware (96 default threads) was 30%+ slower than `cpu-only -T 16`.
+Same mechanism — 96 threads racing on `mmap_lock` for output-buffer
+allocation.  The previously empirical "T16 sweet spot" should now move
+substantially higher; the actual optimum is hardware-dependent and
+needs re-benchmarking.
+
+Validation expected:
+- knuth `--hybrid` should close to within noise of `--gpu-only` on
+  every file class
+- knuth `--cpu-only` (at default T96) should approach the T16 number
+- Lower-core systems unchanged (single-thread page-fault storm doesn't
+  exist on 24-core lovelace)
 
 ---
 
