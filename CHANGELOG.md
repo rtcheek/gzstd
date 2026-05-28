@@ -1,9 +1,60 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.10  
+**Covers:** v0.9.50 → v0.13.11  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.11 — Skip serial GPU probe when using all devices
+
+Fix a ~5s startup stall before the progress meter moves in `--gpu-only`
+and `--hybrid` modes (absent in `--cpu-only`).
+
+**Cause.**  `select_best_gpus()` ranks GPUs by free VRAM / utilization
+so it can pick the best N when the user wants a subset.  The subset
+path uses NVML (no CUDA context creation — fast).  But when using ALL
+devices (the default), the NVML guard `if (want < total_devices)` is
+false and the function fell through to an all-devices loop that calls
+`cudaSetDevice(d)` + `cudaMemGetInfo()` on every device.  Those force
+serial CUDA context creation on the main thread — ~0.6-1s per
+datacenter GPU, ~5s for 8 — and this runs before the reader, progress
+thread, and worker pool start.  The pipeline waits the whole time.
+
+The probe was pointless in this case: when N == all devices there's
+nothing to rank.  We paid 5s gathering ranking data we then ignored.
+
+**Fix.**  Short-circuit when `want >= total_devices`: return the
+trivial `[0..N)` device list without probing.  The GPU worker threads
+create their CUDA contexts in parallel at startup (one per device on
+its own thread) instead of serially on the main thread.  In hybrid
+mode the reader and CPU pool also start immediately and overlap with
+GPU context warm-up.  Expected: ~5s → ~1s (one parallel context init)
+in gpu-only, near-zero perceived delay in hybrid.
+
+**Fixed-share exception.**  Deferring context creation to the worker
+threads broke `--cpu-share`: on a small input the CPU pool drains every
+frame (via the `qs.done && !any_gpu_active()` path) before the GPU
+finishes booting and registers, so the explicit split was silently
+ignored — `--cpu-share 0.0` gave 100% CPU.  Fix: when `--cpu-share` is
+set, `warm_gpu_contexts()` creates the primary contexts in parallel
+(one thread per device, ~1s for 8 vs ~5s serial) before the pipeline
+starts, so the GPU is ready to take its share.  Adaptive mode (the
+default) still defers for fastest startup — there the GPU naturally
+catches up on any non-trivial input, and a small input being
+CPU-drained is the correct fast path.
+
+**Telemetry.**  `[GPU] device selection: N ms` logged at `-v`, so this
+startup cost is visible going forward.
+
+**On the subset case** (`--gpu-devices N` with N < total): already
+fast — it uses NVML to read utilization and free memory without
+creating CUDA contexts (`cudaGetDeviceProperties` reads cached device
+attributes, no context).  The only remaining slow path is NVML being
+unavailable AND selecting a subset, where free-memory ranking requires
+`cudaMemGetInfo` (hence a context).  That's unavoidable without NVML
+and rare on NVIDIA systems.
 
 ---
 

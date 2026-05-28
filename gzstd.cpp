@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.10";
+static constexpr const char * GZSTD_VERSION = "0.13.11";
 //
 // Architecture overview:
 //
@@ -6464,6 +6464,31 @@ static void gpu_worker(
   }
 }
 
+// Warm up CUDA primary contexts for the given devices IN PARALLEL.
+// Each context init is ~0.6-1s on a datacenter GPU; doing them on one
+// thread each overlaps the cost (~1s total for 8 vs ~5s serial).  The
+// per-device primary context created here is reused by the GPU worker
+// threads when they cudaSetDevice() later, so they start instantly.
+//
+// Only called for fixed-share mode (--cpu-share): there the user has
+// asked for a precise CPU/GPU split, and a small input must not be
+// drained entirely to CPU before the GPU finishes booting.  Adaptive
+// mode skips this — deferring context creation to the worker threads
+// gives the fastest possible startup (no progress-meter stall), and
+// the GPU naturally catches up on any non-trivial input.
+static void warm_gpu_contexts(const std::vector<int> & ids)
+{
+  std::vector<std::thread> warm;
+  warm.reserve(ids.size());
+  for (int id : ids) {
+    warm.emplace_back([id]{
+      if (cudaSetDevice(id) == cudaSuccess)
+        cudaFree(nullptr);  // forces primary-context creation
+    });
+  }
+  for (auto & t : warm) t.join();
+}
+
 // Select the best N GPUs by combining compute utilization and free VRAM.
 // Lower utilization is better; ties broken by more free memory.
 //
@@ -6482,6 +6507,21 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
   };
 
   want = std::min(want, total_devices);
+
+  // Using every device — there is nothing to rank, so skip the probe.
+  // The all-devices CUDA fallback below calls cudaSetDevice + cudaMemGetInfo
+  // per device, which forces serial CUDA context creation on the main
+  // thread (~0.6-1s per datacenter GPU → ~5s for 8 of them) BEFORE the
+  // reader, progress meter, and worker pool start.  Returning the trivial
+  // [0..N) list lets the GPU worker threads create their contexts in
+  // parallel at startup instead, overlapping with the reader and (in
+  // hybrid) the CPU pool.  v0.13.11.
+  if (want >= total_devices) {
+    std::vector<int> result;
+    result.reserve(total_devices);
+    for (int d = 0; d < total_devices; ++d) result.push_back(d);
+    return result;
+  }
 
 #ifdef HAVE_NVML
   // Fast path: use NVML to rank without touching CUDA, then only probe winners
@@ -6724,7 +6764,18 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<bool>   gpu_started{false};
 
   // Select GPUs before allocating per-device arrays
+  const uint64_t gpu_sel_t0 = now_ns();
   auto gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
+  // Fixed-share mode: warm GPU contexts before the pipeline so a small
+  // input isn't drained to CPU before the GPU registers (see
+  // warm_gpu_contexts).  Adaptive mode defers for fastest startup.
+  if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
+  if (opt.verbosity >= V_VERBOSE) {
+    std::ostringstream os;
+    os << "[GPU] device selection: " << std::fixed << std::setprecision(1)
+       << double(now_ns() - gpu_sel_t0) / 1e6 << " ms";
+    vlog(V_VERBOSE, opt, os.str() + "\n");
+  }
   const int gpu_count_early = (int)gpu_ids.size();
 
   std::vector<DevStats> per_dev(gpu_count_early);
@@ -8166,7 +8217,15 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   std::atomic<int> gpu_init_failures{0};
 
   if (device_count > 0) {
+    const uint64_t gpu_sel_t0 = now_ns();
     gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
+    if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
+    if (opt.verbosity >= V_VERBOSE) {
+      std::ostringstream os;
+      os << "[GPU] device selection: " << std::fixed << std::setprecision(1)
+         << double(now_ns() - gpu_sel_t0) / 1e6 << " ms";
+      vlog(V_VERBOSE, opt, os.str() + "\n");
+    }
     const int gpu_count = (int)gpu_ids.size();
     fatal_msgs.resize(gpu_count);
     results.init_slots(gpu_count);  // per-GPU result slots (reduces lock contention)
