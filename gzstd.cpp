@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.11";
+static constexpr const char * GZSTD_VERSION = "0.13.13";
 //
 // Architecture overview:
 //
@@ -5618,11 +5618,16 @@ static void gpu_worker(
   size_t vram_reserve_bytes = 0;
   try {
     uint64_t init_t0 = g_perf ? now_ns() : 0;
+    // -vv init-phase breakdown: distinguish context creation (driver-bound,
+    // hard to reduce) from VRAM probing + cudaMalloc (potentially tunable).
+    const uint64_t phase_t0 = now_ns();
+    uint64_t probe_ns = 0, malloc_ns = 0;  // accumulated across streams
     checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
     const size_t host_chunk_bytes = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
     const size_t gpu_chunk = std::min(host_chunk_bytes, GPU_SUBCHUNK_MAX);
     nvcompBatchedZstdCompressOpts_t comp_opts = nvcompBatchedZstdCompressDefaultOpts; size_t max_out_chunk=0;
     checkNvcomp(nvcompBatchedZstdCompressGetMaxOutputChunkSize(gpu_chunk, comp_opts, &max_out_chunk), "nvcompBatchedZstdCompressGetMaxOutputChunkSize");
+    const uint64_t ctx_done_ns = now_ns();  // cudaSetDevice forced context creation
     const size_t stream_count = std::max<size_t>(1, opt.gpu_streams);
     // --gpu-batch is per-stream (same semantics as decompress).  Each stream
     // targets up to gpu_batch_cap subchunks; VRAM safety comes from splitting
@@ -5648,6 +5653,7 @@ static void gpu_worker(
       // Calculate how many subchunks this stream can hold based on free VRAM.
       // nvCOMP temp workspace can be very large (e.g., 5 GiB for batch=200),
       // so we use binary search to find the largest batch that fits in VRAM.
+      const uint64_t probe_t0 = now_ns();
       size_t free_b = 0, total_b = 0;
       if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b == 0) {
         C.per_stream_batch = 1;
@@ -5702,6 +5708,8 @@ static void gpu_worker(
         while (vram_max < old_ceil &&
                !shared_tune->vram_ceiling.compare_exchange_weak(old_ceil, vram_max));
       }
+      probe_ns += now_ns() - probe_t0;
+      const uint64_t malloc_t0 = now_ns();
       int vram_retries = 0;
       bool stream_init_failed = false;
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
@@ -5727,6 +5735,7 @@ static void gpu_worker(
           }
         }
       }
+      malloc_ns += now_ns() - malloc_t0;
       if (stream_init_failed) {
         // Auto-decrement stream count: keep streams [0..s) and stop here.
         if (s == 0) {
@@ -5764,6 +5773,15 @@ static void gpu_worker(
 
     bool producer_done_seen=false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
+    if (opt.verbosity >= V_DEBUG) {
+      std::ostringstream os;
+      os << "[GPU" << device_id << "] init phases: ctx="
+         << std::fixed << std::setprecision(0) << double(ctx_done_ns - phase_t0) / 1e6
+         << "ms probe=" << double(probe_ns) / 1e6
+         << "ms malloc=" << double(malloc_ns) / 1e6
+         << "ms total=" << double(now_ns() - phase_t0) / 1e6 << "ms";
+      vlog(V_DEBUG, opt, os.str() + "\n");
+    }
 
     // VRAM reserve: hold enough memory to process half the batch size.
     // If another user grabs VRAM mid-run and a cudaMalloc fails, we free
@@ -8078,30 +8096,41 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // ---- Detect GPU devices ----
   // Note: must use cudaGetDeviceCount (not NVML) because NVML sees all
   // physical devices regardless of CUDA_VISIBLE_DEVICES masking.
+  //
+  // cudaGetDeviceCount triggers the one-time CUDA driver init (cuInit):
+  // ~2s on an 8-GPU box.  In HYBRID mode we defer it to a background
+  // "GPU bringup" thread (see below) so the CPU pool can decompress
+  // during that init instead of the main thread blocking here.  The
+  // throttle is sized from a provisional device count (it's RAM-capped,
+  // so over-estimating is harmless); the real count is detected in the
+  // bringup thread before any GPU work.  v0.13.13.
+  const bool hybrid_overlap = opt.hybrid && !opt.cpu_only && !opt.gpu_only;
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-    if (opt.gpu_only)
-      die_usage("GPU requested (--gpu-only) but no CUDA devices available");
-    vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU decompress\n");
-    // Fall through with device_count=0; CPU pool will handle everything
-  }
-
-  // Apply --gpu-devices limit.
-  // Default (0) = 1 GPU for decompress: D2H transfer of the full
-  // Use all available GPUs for decompression. Utilization-scaled batch sizing
-  // (via NVML queries in select_best_gpus) handles partially-loaded GPUs.
-  // Previously capped at 2 GPUs due to PCIe contention concerns, but the
-  // auto-tuner and utilization scaling handle this better dynamically.
-  const int total_hw_devices = device_count;
-  if (device_count > 0) {
-    int target = opt.gpu_devices;
-    if (target == 0) target = device_count;  // auto: use all GPUs
-    if (target < device_count) {
-      vlog(V_VERBOSE, opt, "[GPU] using " + std::to_string(target)
-           + " of " + std::to_string(device_count) + " GPU devices"
-           + (opt.gpu_devices == 0 ? " (auto)\n" : "\n"));
-      device_count = target;
+  int total_hw_devices = 0;
+  if (!hybrid_overlap) {
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+      if (opt.gpu_only)
+        die_usage("GPU requested (--gpu-only) but no CUDA devices available");
+      vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU decompress\n");
+      // Fall through with device_count=0; CPU pool will handle everything
     }
+    // Apply --gpu-devices limit.  Default (0) = use all available GPUs.
+    total_hw_devices = device_count;
+    if (device_count > 0) {
+      int target = opt.gpu_devices;
+      if (target == 0) target = device_count;  // auto: use all GPUs
+      if (target < device_count) {
+        vlog(V_VERBOSE, opt, "[GPU] using " + std::to_string(target)
+             + " of " + std::to_string(device_count) + " GPU devices"
+             + (opt.gpu_devices == 0 ? " (auto)\n" : "\n"));
+        device_count = target;
+      }
+    }
+  } else {
+    // Provisional count for throttle sizing; real detection happens in
+    // the background bringup thread.  Generous (RAM-capped downstream).
+    device_count = std::max(opt.gpu_devices, 8);
+    total_hw_devices = device_count;
   }
 
   // ---- Shared state ----
@@ -8122,6 +8151,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // single-frame files (where frame 0 IS the whole file) without
   // touching the rest of the input.
   bool fallback = false;
+  bool gpu_disabled_by_peek = false;  // oversize first frame → no GPU for this file
   std::vector<char> raw_data;  // populated by stream_frames_to_queue if it falls back
   int64_t first_frame_decomp = peek_first_frame_decomp_size(in);
   if (first_frame_decomp > (int64_t)GPU_SUBCHUNK_MAX && device_count > 0) {
@@ -8133,13 +8163,22 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
          "  Falling back to CPU-only decompression.\n");
     if (opt.gpu_only)
       vlog(V_NORMAL, opt, "  (--gpu-only ignored for this file)\n");
-    device_count = 0;
+    // For hybrid the real device_count isn't known yet (deferred to the
+    // bringup thread); record the decision as a flag the bringup thread
+    // honors.  For non-hybrid, disable GPU directly.
+    if (hybrid_overlap) gpu_disabled_by_peek = true;
+    else                device_count = 0;
   }
 
-  // Early init banner for -v/-vv/-vvv users.
+  // Early init banner for -v/-vv/-vvv users.  In hybrid the real GPU
+  // count isn't known yet (detection is deferred to the bringup thread),
+  // so report "detecting" rather than the provisional placeholder.
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
-    os << "[INIT] decompress: " << device_count << " GPU(s) active, mode=";
+    os << "[INIT] decompress: ";
+    if (hybrid_overlap) os << "GPUs detecting in background";
+    else                os << device_count << " GPU(s) active";
+    os << ", mode=";
     if (opt.gpu_only)      os << "gpu-only";
     else if (opt.cpu_only) os << "cpu-only";
     else if (opt.hybrid)   os << "hybrid";
@@ -8216,7 +8255,37 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // --gpu-only mode instead of buffering the entire file.
   std::atomic<int> gpu_init_failures{0};
 
-  if (device_count > 0) {
+  // GPU bringup: detect (hybrid only — triggers the deferred cuInit),
+  // select devices, init result slots, and spawn GPU workers.  Runs on a
+  // background thread for hybrid (so the CPU pool already spawned above
+  // decompresses during cuInit) and inline for gpu-only.
+  auto gpu_bringup = [&]() {
+    if (hybrid_overlap) {
+      // Deferred device detection (the ~2s cuInit, off the critical path).
+      int dc = 0;
+      if (cudaGetDeviceCount(&dc) != cudaSuccess || dc <= 0) {
+        // No GPU after all — the CPU pool (already running) does everything.
+        vlog(V_VERBOSE, opt, "[GPU] no devices found; hybrid running CPU-only\n");
+        return;
+      }
+      total_hw_devices = dc;
+      int target = opt.gpu_devices;
+      if (target == 0) target = dc;
+      device_count = std::min(target, dc);
+      if (gpu_disabled_by_peek) {
+        vlog(V_VERBOSE, opt, "[GPU] disabled for this file (oversize frame); CPU-only\n");
+        return;
+      }
+      // If the CPU pool already drained the whole file during cuInit, skip
+      // GPU spawn entirely — no work left, and pointless context creation
+      // would just delay process exit on small inputs.
+      if (queue.drained() && queue.size() == 0) {
+        vlog(V_VERBOSE, opt, "[GPU] file already decompressed by CPU during init; skipping GPU\n");
+        return;
+      }
+    }
+    if (device_count <= 0) return;
+
     const uint64_t gpu_sel_t0 = now_ns();
     gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
     if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
@@ -8228,7 +8297,13 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     }
     const int gpu_count = (int)gpu_ids.size();
     fatal_msgs.resize(gpu_count);
-    results.init_slots(gpu_count);  // per-GPU result slots (reduces lock contention)
+    // init_slots resizes ResultStore::slots, which the writer iterates in
+    // drain_slots_locked under results.m — take that lock so the resize
+    // can't race a concurrent drain (the writer is already running).
+    {
+      std::lock_guard<std::mutex> lk(results.m);
+      results.init_slots(gpu_count);
+    }
 
     for (int i = 0; i < gpu_count; ++i) {
       gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], i, opt,
@@ -8243,6 +8318,16 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       os << "[GPU] " << (int)gpu_ids.size() << " device(s) online";
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
+  };
+
+  std::thread gpu_bringup_thr;
+  if (hybrid_overlap) {
+    // Background bringup: main thread proceeds to the reader so CPU
+    // workers decompress while cuInit + context creation happen here.
+    gpu_bringup_thr = std::thread(gpu_bringup);
+  } else if (device_count > 0) {
+    // gpu-only / non-hybrid: bring up inline (no CPU pool to overlap with).
+    gpu_bringup();
   }
 
   // ---- Producer: stream frames into the queue while workers consume ----
@@ -8305,6 +8390,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   results.cv.notify_all();
 
   // ---- Teardown ----
+  // Join the background bringup thread FIRST: it populates gpu_workers, so
+  // we must wait for it before iterating that vector.  (If CPU drained the
+  // file during cuInit, the bringup thread may have spawned no GPU workers
+  // or spawned ones that immediately hit the done+empty queue and exit.)
+  if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   for (auto & th : gpu_workers) th.join();
 
   if (abort_on_failure.load() && any_gpu_failed.load()) {

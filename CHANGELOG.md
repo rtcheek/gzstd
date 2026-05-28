@@ -1,9 +1,84 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.11  
+**Covers:** v0.9.50 → v0.13.13  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.13 — Overlap CUDA init with CPU decompression (hybrid)
+
+Eliminate the startup stall before the progress meter moves in hybrid
+decompress.  v0.13.12's timing showed the residual delay was almost
+entirely `cudaSetDevice` context creation; this release also addresses
+the *other* half — `cuInit`.
+
+**Cause.**  `cudaGetDeviceCount` (decompress_nvcomp, the first CUDA call
+in the process) triggers the one-time CUDA driver init `cuInit` —
+~2s on an 8-GPU box.  It ran on the main thread *before* the CPU
+decompression pool was spawned, so in hybrid mode the CPUs couldn't
+start decompressing until cuInit finished.  The user's exact
+observation: "the CPUs should be decompressing while the GPU detection
+is going on" — and they were blocked from doing so.
+
+**Fix.**  In hybrid mode, GPU detection + selection + worker spawn now
+run on a background "bringup" thread:
+
+- Main thread spawns the CPU pool and starts the frame reader
+  immediately, using a *provisional* device count for throttle sizing
+  (RAM-capped, so over-estimating is safe).
+- CPU workers decompress from t≈0 — the scheduler already runs CPUs
+  "wild" while `gpu_ready_` is false (no new scheduling logic needed).
+- The bringup thread does `cudaGetDeviceCount` (the deferred cuInit),
+  `select_best_gpus`, `init_slots`, and spawns GPU workers.  They
+  register with the scheduler when ready and it rebalances.
+
+**Concurrency safeguards:**
+- `init_slots` (resizes `ResultStore::slots`) is called under
+  `results.m`, which the writer's `drain_slots_locked` also holds — no
+  resize/iterate race.
+- Teardown joins the bringup thread before iterating `gpu_workers`
+  (the bringup thread populates that vector).
+- If the CPU pool drains the whole file during cuInit, the bringup
+  thread skips GPU spawn entirely (no wasted context creation; process
+  exits as soon as CPU+writer finish).  Late-spawned GPU workers that
+  hit a done+empty queue exit cleanly via the existing
+  `producer_done_seen` path.
+
+gpu-only and cpu-only paths are unchanged (gpu-only has no CPU pool to
+overlap with; detection stays inline).
+
+**Result** (consumer Gen3, hybrid decompress): TTFB dropped from
+0.256s (v0.13.12) to 0.035s.  The CPU pool starts before cuInit
+instead of after it.  On high-GPU-count systems where cuInit is ~2s,
+the win is correspondingly larger.  Tiny-file edge cases (CPU finishes
+before GPU init) verified for correct output and clean teardown.
+280/280 tests pass.
+
+---
+
+## v0.13.12 — Per-phase GPU init timing at -vv
+
+Diagnostic only, no behavior change.  v0.13.11 removed the 5s serial
+device-selection probe; a residual GPU-init delay remained (~4s on an
+8-GPU box, ~2.5s hybrid).  To locate it, the GPU compress worker now
+logs an init-phase breakdown at -vv:
+
+  [GPU<d>] init phases: ctx=Nms probe=Nms malloc=Nms total=Nms
+
+- **ctx**: `cudaSetDevice` forcing CUDA primary-context creation.
+- **probe**: per-stream VRAM binary search (nvCOMP temp-size queries).
+- **malloc**: `allocate_stream_buffers` (`cudaMalloc` of device buffers).
+
+Measured on consumer Gen3 (2× 2080 Ti): ctx≈230ms, probe 1-11ms,
+malloc≈1ms — context creation is ~99% of init.  The VRAM probe and
+device allocation are negligible, so they're not worth optimizing.
+The remaining startup cost is CUDA context creation, which on
+multi-GPU systems appears to serialize on the driver's init lock
+(8 × ~500ms ≈ the observed 4s).  This release just makes that
+visible; reducing it (parallel context creation, or overlapping it
+behind useful work) is follow-up.
 
 ---
 
