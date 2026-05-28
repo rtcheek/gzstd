@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.15";
+static constexpr const char * GZSTD_VERSION = "0.13.16";
 //
 // Architecture overview:
 //
@@ -162,6 +162,12 @@ static void setup_signal_handlers()
 ======================================================================*/
 static const size_t ONE_MIB = size_t(1024) * size_t(1024);
 static const size_t DEFAULT_CHUNK_MIB = 16;
+// A first frame larger than this is treated as a single-frame file (zstd -T0 /
+// --sliding-window) and streamed directly from the file rather than buffered
+// through the queue.  Sits well above gzstd's largest practical chunk
+// (--ultra auto-bumps to 128 MiB) so genuinely multi-frame chunked inputs keep
+// the parallel queue path (and the v0.13.1 multi-frame-oversize guard).
+static const size_t SINGLE_FRAME_STREAM_MIN = size_t(256) * ONE_MIB;
 #ifdef HAVE_NVCOMP
 static const size_t GPU_SUBCHUNK_MAX = size_t(16) * ONE_MIB; // max GPU subchunk
 static const size_t DEFAULT_GPU_BATCH_CAP = 8;    // per device  smaller batches launch sooner
@@ -3431,6 +3437,64 @@ static void decompress_from_buffer(const std::vector<char> & input,
   if (ret > 0)
     die_data("truncated zstd stream (expected more data)");
 
+  ZSTD_freeDCtx(dctx);
+}
+
+// Streaming decompress of a large single-frame input (zstd -T0 /
+// --sliding-window) read directly from the FILE.  A single zstd frame can't be
+// split across threads (nor GPU subchunks), so the old fallback buffered the
+// whole compressed frame into one Task and decompressed it single-threaded
+// only after the reader finished — serialising read and decompress, spiking
+// memory to input+frame+output, and freezing the progress bar.  Streaming here
+// overlaps read + decompress + write, keeps peak memory to a couple of I/O
+// buffers, and lets the meter move.  Output uses the same DirectWriter / fwrite
+// path as decompress_from_buffer.  ZSTD_decompressStream also decodes the rare
+// trailing-frames-after-a-large-first-frame case correctly.  Used only for
+// seekable inputs whose first frame exceeds SINGLE_FRAME_STREAM_MIN.
+static void decompress_stream_from_file(FILE * in, FILE * out,
+                                        const Options & opt, Meter * m)
+{
+  const size_t IO_CHUNK = 4 * ONE_MIB;
+  std::vector<char> inbuf(IO_CHUNK);
+  std::vector<char> outbuf(IO_CHUNK);
+  ZSTD_DCtx * dctx = ZSTD_createDCtx();
+  if (!dctx) die("failed to create ZSTD_DCtx");
+  apply_mem_limit_to_dctx(dctx, opt);
+
+  size_t ret = 0;  // last decompressStream hint; >0 at EOF means truncated
+  for (;;) {
+    size_t n = std::fread(inbuf.data(), 1, IO_CHUNK, in);
+    if (n == 0) break;  // EOF
+    if (m) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
+    ZSTD_inBuffer zin { inbuf.data(), n, 0 };
+    while (zin.pos < zin.size) {
+      ZSTD_outBuffer zout { outbuf.data(), outbuf.size(), 0 };
+      ret = ZSTD_decompressStream(dctx, &zout, &zin);
+      if (ZSTD_isError(ret)) {
+        ZSTD_freeDCtx(dctx);
+        die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
+      }
+      if (zout.pos > 0) {
+        if (opt.mode != Mode::TEST) {
+#ifndef _WIN32
+          if (g_direct_writer) {
+            if (!g_direct_writer->write(outbuf.data(), zout.pos))
+              die_io("direct write failed (disk full?)");
+          } else
+#endif
+          {
+            size_t w = robust_fwrite(outbuf.data(), zout.pos, out);
+            if (w != zout.pos) die_io("short write to output (broken pipe?)");
+          }
+        }
+        if (m) m->wrote_bytes.fetch_add(zout.pos, std::memory_order_relaxed);
+      }
+    }
+  }
+  if (ret > 0) {
+    ZSTD_freeDCtx(dctx);
+    die_data("truncated zstd stream (expected more data)");
+  }
   ZSTD_freeDCtx(dctx);
 }
 struct CpuThreadStats {
@@ -8856,6 +8920,38 @@ int main(int argc, char ** argv)
       std::rewind(in);
     }
 
+    // A large single frame (zstd -T0 / --sliding-window) can't be split across
+    // CPU threads or GPU subchunks.  Above SINGLE_FRAME_STREAM_MIN it's
+    // effectively a single-frame file, so stream it straight from the FILE —
+    // overlapping read/decompress/write with bounded memory — for every mode,
+    // instead of buffering the whole frame through the queue.  Genuinely
+    // multi-frame chunked inputs (frame0 below the threshold) keep their
+    // parallel path.  Seekable input only (peek returns -1 on stdin).
+    int64_t first_frame_decomp =
+        (opt.input != "-") ? peek_first_frame_decomp_size(in) : -1;
+    if (first_frame_decomp > (int64_t)SINGLE_FRAME_STREAM_MIN) {
+      char sz[32]; human_bytes(double(first_frame_decomp), sz, sizeof(sz));
+#ifdef HAVE_NVCOMP
+      if (!opt.cpu_only)
+        vlog(V_NORMAL, opt,
+             std::string("warning: first frame decompresses to ") + sz
+             + " (GPU max: 16 MiB).\n"
+             "  This file was likely compressed with --sliding-window or zstd -T0.\n"
+             "  Decompressing on CPU (a single frame can't use the GPU).\n");
+#endif
+      vlog(V_VERBOSE, opt,
+           std::string("[INIT] decompress: streaming single ") + sz + " frame on CPU\n");
+      // total_out/total_out_final drive the progress bar's byte-level out%.
+      meter.total_out.store((uint64_t)first_frame_decomp, std::memory_order_relaxed);
+      meter.total_out_final.store(true, std::memory_order_release);
+#ifndef _WIN32
+      if (g_direct_writer && opt.preallocate_output
+          && g_direct_writer->preallocate((uint64_t)first_frame_decomp)) {
+        vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
+      }
+#endif
+      decompress_stream_from_file(in, out, opt, &meter);
+    } else
 #ifdef HAVE_NVCOMP
     if (opt.cpu_only) {
       decompress_cpu_mt(in, out, opt, &meter);

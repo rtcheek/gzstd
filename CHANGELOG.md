@@ -1,9 +1,62 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.15  
+**Covers:** v0.9.50 → v0.13.16  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.16 — Stream large single-frame files directly from the file
+
+Fix a long-standing slow path: decompressing a single-frame `.zst`
+(stock `zstd -T0`, `--sliding-window`) was far slower than `zstd -d`,
+spiked memory, and showed a frozen progress bar — in every mode,
+including `--cpu-only`.
+
+**Cause.**  A single zstd frame can't be split across CPU threads (nor
+GPU subchunks).  The fallback routed the lone frame through the normal
+queue: `stream_frames_to_queue` had to read and buffer the *entire*
+compressed frame (growing its read buffer with realloc churn), `memcpy`
+it into one Task, and only then could a CPU worker decompress it — and
+even then the worker's streaming branch waits on the `producer_done`
+gate (a v0.13.1 seq-collision guard) which can't fire until the reader
+has consumed the whole file.  Net: read and decompress ran *serially*,
+peak memory was input + frame-copy + output (~30 GiB on a 20 GiB file),
+and neither meter moved until decompression started.
+
+**Fix.**  In `main`'s decompress dispatch, peek the first frame; if it
+decompresses to more than `SINGLE_FRAME_STREAM_MIN` (256 MiB) the input
+is effectively a single-frame file, so hand it to a new
+`decompress_stream_from_file` regardless of mode: a plain
+`ZSTD_decompressStream` loop reading 4 MiB at a time straight from the
+`FILE*`, writing each output chunk through the existing DirectWriter /
+fwrite path.  Read, decompress, and write now overlap; peak RSS drops to
+a couple of I/O buffers; the progress bar moves (we set `total_out` /
+`total_out_final` from the peeked size up front); and for GPU modes no
+CUDA is touched (no bringup thread, no cuInit).  Single-threaded by
+nature — one zstd frame can't be split — which is inherent, not a
+regression.
+
+**Why a 256 MiB threshold, not 16 MiB.**  The threshold sits well above
+gzstd's largest practical chunk (`--ultra` auto-bumps to 128 MiB) and the
+v0.13.1 regression test's 100 MiB chunks, so genuinely *multi-frame*
+inputs — even with large per-frame sizes — keep the parallel queue path.
+`decompress_nvcomp` therefore retains its `gpu_disabled_by_peek` CPU
+fallback for the 16–256 MiB multi-frame-oversize case (GPU can't subchunk
+those frames, but the CPU pool still decompresses them in parallel).
+Streaming a multi-frame file would needlessly serialise it.
+
+Applies to all modes and both build configs (`decompress_stream_from_file`
+is not GPU-gated).  Seekable input only — stdin (peek returns -1) keeps
+the old path.  `ZSTD_decompressStream` also decodes the rare
+trailing-frames-after-a-large-first-frame case correctly.
+
+**Verified (Lovelace):** 2 GiB single-frame `--sliding-window` round-trip
+byte-identical via both `--cpu-only` and `--gpu-only` (peak RSS 24 MB, was
+~2-3 GiB; no GPU bringup logged); a 4×100 MiB multi-frame file correctly
+stays on the parallel queue path; full suite passes including the
+`--sliding-window` round-trip and the v0.13.1 multi-frame-oversized guard.
 
 ---
 
