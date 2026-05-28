@@ -1,9 +1,54 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.14  
+**Covers:** v0.9.50 → v0.13.15  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.15 — Overlap CUDA init with the reader (gpu-only decompress)
+
+Extend the v0.13.13 bringup overlap to `--gpu-only` decompress, killing the
+3-4s startup stall (the gap between `[O_DIRECT]` and `[INIT]` at `-v`) on
+high-GPU-count boxes.
+
+**Cause.**  v0.13.13 deferred the `cudaGetDeviceCount` cuInit (~2-3s on an
+8-GPU box) to a background bringup thread, but *only* for adaptive hybrid —
+the rationale was "no CPU pool to overlap with" in gpu-only.  That overlooked
+the **reader**: `stream_frames_to_queue` reads and frame-parses the entire
+compressed input, which on a multi-GiB file takes about as long as cuInit and
+has to happen regardless.  In gpu-only the reader ran *after* the synchronous
+cuInit + inline bringup, so the GPU sat idle through init and the reader sat
+idle through nothing useful — pure serial cost.
+
+**Fix.**  Generalize the deferral predicate from `hybrid_overlap` to
+`defer_detect = hybrid_overlap || opt.gpu_only`.  In gpu-only the bringup
+thread now does the deferred `cudaGetDeviceCount` + `select_best_gpus` +
+worker spawn while the main thread goes straight to the reader, filling the
+`TaskQueue`.  GPU workers consume a warm queue the instant their contexts are
+ready instead of starting cold.  The `[INIT]` banner reports "GPUs detecting
+in background" for gpu-only too.
+
+**gpu-only edge cases** (handled synchronously before, now need explicit care
+because detection is deferred):
+
+- *No CUDA device.*  The synchronous path errored instantly at
+  `cudaGetDeviceCount`.  Deferred, the bringup thread sets a
+  `gpu_only_no_device` atomic; `stream_frames_to_queue` takes a new optional
+  `abort` pointer and returns early when it's set, so main errors with the
+  same `EXIT_USAGE` message instead of buffering a consumer-less queue to EOF.
+- *Oversize first frame* (`--sliding-window` / `zstd -T0` single frame).  The
+  peek sets `gpu_disabled_by_peek`; the CPU-pool spawn condition now also
+  fires on that flag (gpu-only has no `sched`-driven pool), so the file
+  decompresses on CPU.  The deferred bringup still pays a (hidden, discarded)
+  cuInit on the background thread for this case — acceptable for a rare path.
+
+**Verified (Lovelace, 2× 2080 Ti):** 253/253 suite; gpu-only round-trip
+byte-identical; masked-GPU run errors cleanly with exit 2 and removes the
+partial output; sliding-window file falls back to CPU and round-trips.  The
+win scales with GPU count, so the knuth (8× H100) gap should drop from ~3-4s
+to ~0 — re-measure the `[O_DIRECT]`→`[INIT]` interval there.
 
 ---
 

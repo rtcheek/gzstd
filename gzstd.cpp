@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.14";
+static constexpr const char * GZSTD_VERSION = "0.13.15";
 //
 // Architecture overview:
 //
@@ -4531,7 +4531,8 @@ static size_t stream_frames_to_queue(
     const Options & opt,
     bool * fallback,
     std::vector<char> * raw_data,
-    size_t * max_frame_decomp_out = nullptr)
+    size_t * max_frame_decomp_out = nullptr,
+    const std::atomic<bool> * abort = nullptr)
 {
   size_t max_frame_decomp = 0;
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
@@ -4549,6 +4550,13 @@ static size_t stream_frames_to_queue(
   bool eof = false;
 
   while (!eof) {
+    // Caller asked us to stop early (e.g. --gpu-only but the deferred bringup
+    // thread found no CUDA device).  Return what we have; the caller errors.
+    if (abort && abort->load(std::memory_order_acquire)) {
+      if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
+      return seq;
+    }
+
     // Compact: move unconsumed tail to front if needed to make room for reading
     if (buf_off > 0) {
       size_t tail = buf_len - buf_off;
@@ -8129,9 +8137,17 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // warm_gpu_contexts complete first, so the split is honored.
   const bool hybrid_overlap = opt.hybrid && !opt.cpu_only && !opt.gpu_only
                               && opt.cpu_share < 0.0;
+  // gpu-only has no CPU pool to overlap cuInit with, but the *reader* is
+  // useful cover work that the v0.13.13 restructure overlooked.  Defer the
+  // cudaGetDeviceCount cuInit (~2-3s on an 8-GPU box) to the background
+  // bringup thread and let the main thread stream frames into the queue
+  // meanwhile, so GPU workers consume a warm queue the instant they come
+  // online instead of starting cold after a synchronous stall.  v0.13.15.
+  const bool gpu_only_overlap = opt.gpu_only;
+  const bool defer_detect = hybrid_overlap || gpu_only_overlap;
   int device_count = 0;
   int total_hw_devices = 0;
-  if (!hybrid_overlap) {
+  if (!defer_detect) {
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
       if (opt.gpu_only)
         die_usage("GPU requested (--gpu-only) but no CUDA devices available");
@@ -8163,6 +8179,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   ResultStore results;
   std::atomic<bool> any_gpu_failed{false};
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
+  // Set by the deferred bringup thread when --gpu-only is requested but no
+  // CUDA device is found.  The reader checks it and stops streaming so main
+  // can error out cleanly instead of buffering the whole file with no
+  // consumer (the synchronous path errored instantly at detection time).
+  std::atomic<bool> gpu_only_no_device{false};
   RateMatchState rate_match;
 
   // ---- Oversize first-frame peek (replaces the v0.12.22-v0.12.36 full
@@ -8190,8 +8211,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     // For hybrid the real device_count isn't known yet (deferred to the
     // bringup thread); record the decision as a flag the bringup thread
     // honors.  For non-hybrid, disable GPU directly.
-    if (hybrid_overlap) gpu_disabled_by_peek = true;
-    else                device_count = 0;
+    if (defer_detect) gpu_disabled_by_peek = true;
+    else              device_count = 0;
   }
 
   // Early init banner for -v/-vv/-vvv users.  In hybrid the real GPU
@@ -8200,8 +8221,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
     os << "[INIT] decompress: ";
-    if (hybrid_overlap) os << "GPUs detecting in background";
-    else                os << device_count << " GPU(s) active";
+    if (defer_detect) os << "GPUs detecting in background";
+    else              os << device_count << " GPU(s) active";
     os << ", mode=";
     if (opt.gpu_only)      os << "gpu-only";
     else if (opt.cpu_only) os << "cpu-only";
@@ -8214,7 +8235,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // Same auto-tune-aware sizing as compress: when --gpu-batch is not pinned,
   // budget for the auto-tuner's potential growth so GPU pops don't starve
   // on permits when CPUs hold them in hybrid mode.
-  const int decomp_cpu_threads_est = (device_count > 0 && opt.gpu_only) ? 0 : resolve_cpu_threads(opt.cpu_threads);
+  const int decomp_cpu_threads_est = (device_count > 0 && opt.gpu_only && !gpu_disabled_by_peek) ? 0 : resolve_cpu_threads(opt.cpu_threads);
   const size_t decomp_per_stream_budget = opt.gpu_batch_user_set
       ? std::max<size_t>(1, opt.gpu_batch_cap)
       : std::max<size_t>(opt.gpu_batch_cap, AUTO_TUNE_BATCH_CEILING);
@@ -8249,7 +8270,9 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   CpuAgg cpuagg{};
   std::vector<std::thread> cpu_pool;
   int cpu_threads = 0;
-  if (sched || (device_count <= 0)) {
+  // gpu_disabled_by_peek: gpu-only file with an oversize first frame falls
+  // back to CPU; without sched (gpu-only has none) we must still spawn a pool.
+  if (sched || (device_count <= 0) || gpu_disabled_by_peek) {
     cpu_threads = resolve_cpu_threads(opt.cpu_threads);
     cpuagg.threads = cpu_threads;
     cpuagg.per_thread.resize((size_t)cpu_threads);
@@ -8279,15 +8302,21 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // --gpu-only mode instead of buffering the entire file.
   std::atomic<int> gpu_init_failures{0};
 
-  // GPU bringup: detect (hybrid only — triggers the deferred cuInit),
-  // select devices, init result slots, and spawn GPU workers.  Runs on a
-  // background thread for hybrid (so the CPU pool already spawned above
-  // decompresses during cuInit) and inline for gpu-only.
+  // GPU bringup: detect (when deferred — triggers the cuInit), select
+  // devices, init result slots, and spawn GPU workers.  Runs on a background
+  // thread when defer_detect (hybrid adaptive or gpu-only) so the CPU pool
+  // (hybrid) or the reader (gpu-only) overlaps cuInit; inline otherwise.
   auto gpu_bringup = [&]() {
-    if (hybrid_overlap) {
+    if (defer_detect) {
       // Deferred device detection (the ~2s cuInit, off the critical path).
       int dc = 0;
       if (cudaGetDeviceCount(&dc) != cudaSuccess || dc <= 0) {
+        if (opt.gpu_only) {
+          // gpu-only with no GPU: tell the reader to stop so main can error
+          // cleanly (the synchronous path used to die_usage here).
+          gpu_only_no_device.store(true, std::memory_order_release);
+          return;
+        }
         // No GPU after all — the CPU pool (already running) does everything.
         vlog(V_VERBOSE, opt, "[GPU] no devices found; hybrid running CPU-only\n");
         return;
@@ -8345,12 +8374,13 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   };
 
   std::thread gpu_bringup_thr;
-  if (hybrid_overlap) {
-    // Background bringup: main thread proceeds to the reader so CPU
-    // workers decompress while cuInit + context creation happen here.
+  if (defer_detect) {
+    // Background bringup: main thread proceeds to the reader so cuInit +
+    // context creation overlap with the CPU pool (hybrid) or the reader
+    // filling the queue (gpu-only).
     gpu_bringup_thr = std::thread(gpu_bringup);
   } else if (device_count > 0) {
-    // gpu-only / non-hybrid: bring up inline (no CPU pool to overlap with).
+    // auto / fixed-share hybrid: bring up inline.
     gpu_bringup();
   }
 
@@ -8375,7 +8405,15 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // is handled up front by peek_first_frame_decomp_size.
   size_t max_frame_decomp = 0;
   size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback,
-                                           &raw_data, &max_frame_decomp);
+                                           &raw_data, &max_frame_decomp,
+                                           &gpu_only_no_device);
+
+  // Deferred bringup found no GPU for a --gpu-only request: error out as the
+  // old synchronous path did, now that the reader has stopped streaming.
+  if (gpu_only_no_device.load(std::memory_order_acquire)) {
+    if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
+    die_usage("GPU requested (--gpu-only) but no CUDA devices available");
+  }
 
   // Preallocate output file to avoid per-write extent allocation overhead.
 #ifndef _WIN32
