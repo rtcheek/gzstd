@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.13";
+static constexpr const char * GZSTD_VERSION = "0.13.14";
 //
 // Architecture overview:
 //
@@ -6948,6 +6948,22 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     vlog(V_VERBOSE, opt, os.str() + "\n");
   }
 
+  // Fixed-share: wait for at least one GPU stream to register (or for all
+  // GPUs to fail init) before streaming frames.  warm_gpu_contexts only
+  // creates the CUDA contexts; the GPU worker still does VRAM probe +
+  // cudaMalloc + register_gpu_stream afterward.  On fast multi-CPU /
+  // many-GPU machines the reader + CPU pool can otherwise drain a small
+  // input via the drain-phase fast path (qs.done && !any_gpu_active)
+  // before any GPU registers, silently collapsing the requested CPU/GPU
+  // split to all-CPU.  Adaptive mode skips this — it promises no exact
+  // split and wants the fastest possible start.  v0.13.14.
+  if (sched && opt.cpu_share >= 0.0 && gpu_count > 0) {
+    while (!sched->any_gpu_active()
+           && gpu_init_failures.load(std::memory_order_acquire) < gpu_count) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
   // ---- Producer: read input, split into GPU-sized subchunks, enqueue ----
   try_boost_io_priority(!opt.gpu_only);
   const size_t gpu_chunk = std::min(host_chunk, GPU_SUBCHUNK_MAX);
@@ -8104,7 +8120,15 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // throttle is sized from a provisional device count (it's RAM-capped,
   // so over-estimating is harmless); the real count is detected in the
   // bringup thread before any GPU work.  v0.13.13.
-  const bool hybrid_overlap = opt.hybrid && !opt.cpu_only && !opt.gpu_only;
+  // Background GPU bringup applies only to ADAPTIVE hybrid (cpu_share < 0).
+  // Fixed-share (--cpu-share) must keep the synchronous/inline bringup: the
+  // GPU has to be warm before the reader starts, or a small input drains
+  // entirely to CPU before the GPU registers and the explicit split is
+  // silently ignored (the v0.13.11 regression).  In the inline path the CPU
+  // pool is spawned but idle until the reader runs, and GPU bringup +
+  // warm_gpu_contexts complete first, so the split is honored.
+  const bool hybrid_overlap = opt.hybrid && !opt.cpu_only && !opt.gpu_only
+                              && opt.cpu_share < 0.0;
   int device_count = 0;
   int total_hw_devices = 0;
   if (!hybrid_overlap) {
@@ -8328,6 +8352,19 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   } else if (device_count > 0) {
     // gpu-only / non-hybrid: bring up inline (no CPU pool to overlap with).
     gpu_bringup();
+  }
+
+  // Fixed-share decompress: same barrier as compress (see compress_nvcomp).
+  // The inline bringup above spawned GPU workers but didn't wait for them
+  // to register; without this, a small input drains to CPU before any GPU
+  // registers and the explicit split is ignored.  Only applies to the
+  // inline (fixed-share) path — adaptive runs hybrid_overlap with gpu
+  // workers spawned on the background thread and promises no exact split.
+  if (sched && opt.cpu_share >= 0.0 && !gpu_workers.empty()) {
+    while (!sched->any_gpu_active()
+           && gpu_init_failures.load(std::memory_order_acquire) < (int)gpu_workers.size()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
 
   // ---- Producer: stream frames into the queue while workers consume ----

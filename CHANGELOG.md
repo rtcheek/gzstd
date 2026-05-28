@@ -1,9 +1,49 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.13  
+**Covers:** v0.9.50 → v0.13.14  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.14 — Fixed-share: wait for GPU registration before streaming
+
+Fix a `--cpu-share` regression (introduced by the v0.13.11 device-probe
+short-circuit) where the requested CPU/GPU split collapsed to all-CPU
+on high-GPU-count machines.
+
+**Cause.**  Before v0.13.11, `select_best_gpus` did a serial CUDA probe
+that pre-created GPU contexts, so GPU workers registered almost
+instantly.  v0.13.11 removed that probe; `warm_gpu_contexts` was meant
+to compensate but only creates the CUDA *contexts* — the GPU worker
+still does VRAM probe + cudaMalloc + `register_gpu_stream` afterward.
+On an 8-GPU box with many fast CPU workers, the reader + CPU pool drain
+a small input via the drain-phase fast path (`qs.done &&
+!any_gpu_active()`) before any GPU registers, so `--cpu-share 0.0`
+(all-GPU) produced 128c/0g — every frame went to CPU.  Surfaced by the
+suite's `--cpu-share split responds to value` test on the 8-GPU
+system; the 512 MiB test input gave enough lead time on 2-GPU hardware
+but not on 8.
+
+**Fix.**  In fixed-share mode only, wait for at least one GPU stream to
+register (`any_gpu_active()`) — or for all GPUs to fail init
+(`gpu_init_failures >= gpu_count`) — before starting the reader.  This
+guarantees the drain-phase fast path can't fire before the GPU is in
+the rotation, so the split is honored.  Applied to both compress and
+decompress.  Adaptive mode (the default) skips the barrier: it promises
+no exact split and wants the fastest possible start.
+
+**Test suite changes:**
+- New section "Hybrid GPU-bringup overlap (decompress)" guarding the
+  v0.13.13 restructure: adaptive round-trip, fixed-share round-trip,
+  stdout output, and a repeated-run teardown-stability check.
+- Added a `--extensive` flag.  Lower-value / cosmetic sections are now
+  gated behind it so the default run is leaner (253 tests vs 284 with
+  `--extensive`): Stress tests, Help/version, Space-separated option
+  values, and Completion summary format.  GPU correctness and
+  regression-guard sections stay in the default run.  Gate further
+  groups with `if $EXTENSIVE; then ... fi`.
 
 ---
 

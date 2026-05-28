@@ -53,7 +53,18 @@ fi
 # ============================================================
 # Configuration
 # ============================================================
-GZSTD="${1:-}"
+# Args: first non-flag is the gzstd binary path; --extensive enables the
+# heavier / lower-value test groups that are skipped by default to keep the
+# common run fast.  Gate extra tests with `if $EXTENSIVE; then ... fi`.
+EXTENSIVE=false
+GZSTD=""
+for arg in "$@"; do
+  case "$arg" in
+    --extensive|-e) EXTENSIVE=true ;;
+    --help|-h) echo "Usage: $0 [path/to/gzstd] [--extensive]"; exit 0 ;;
+    *) [[ -z "$GZSTD" ]] && GZSTD="$arg" ;;
+  esac
+done
 if [[ -z "$GZSTD" ]]; then
   if [[ -x ./gzstd ]]; then GZSTD=./gzstd
   elif [[ -x ./build/gzstd ]]; then GZSTD=./build/gzstd
@@ -345,7 +356,10 @@ human_size() {
 # auto-expand if you forget (so the display never shows > 100%),
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
-EXPECTED_TESTS=280
+# Default run: 253.  --extensive adds back the gated sections (Stress,
+# Help/version, Space-separated values, Completion summary format) for 284.
+EXPECTED_TESTS=253
+$EXTENSIVE && EXPECTED_TESTS=284
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -771,7 +785,8 @@ rc=0; "$GZSTD" -d -f --cpu-only "$TMPDIR/medium.txt" -o /dev/null 2>/dev/null ||
 # ============================================================
 # 15. Help & version
 # ============================================================
-section "Help and version"
+if $EXTENSIVE; then
+section "Help and version (extensive)"
 
 LAST_TEST_MS=0
 ("$GZSTD" -h 2>&1 || true) | grep -qi "usage\|options\|compress" && pass "-h shows help" || fail "-h shows help"
@@ -800,6 +815,7 @@ rc=0; "$GZSTD" "-?" >/dev/null 2>&1 || rc=$?
 
 rc=0; "$GZSTD" -V >/dev/null 2>&1 || rc=$?
 [[ $rc -eq 0 ]] && pass "-V exits 0" || fail "-V exits 0" "got $rc"
+fi  # $EXTENSIVE (Help and version)
 
 # ============================================================
 # 16. Zstd interop
@@ -1228,7 +1244,8 @@ fi
 # ============================================================
 # 20. Stress tests
 # ============================================================
-section "Stress tests"
+if $EXTENSIVE; then
+section "Stress tests (extensive)"
 
 t0=$(now_ms)
 "$GZSTD" -k -f --cpu-only "$TMPDIR/large.bin" -o "$TMPDIR/stress1.zst" 2>/dev/null
@@ -1265,6 +1282,7 @@ done
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 $all_ok && pass "10 rapid sequential ops" || fail "10 rapid sequential ops"
 rm -f "$TMPDIR"/rapid_*
+fi  # $EXTENSIVE
 
 # ============================================================
 # 20. Wildcard / glob file handling
@@ -1587,6 +1605,60 @@ else
   skip "--cpu-share=1.0 round-trip"          "no GPU"
   skip "--cpu-share banner shows percentage" "no GPU"
   skip "--cpu-share split responds to value" "no GPU"
+fi
+
+# ============================================================
+# 25b2. Hybrid GPU-bringup overlap (v0.13.13 decompress restructure)
+# In adaptive hybrid, GPU detection/cuInit runs on a background thread
+# while the CPU pool decompresses.  These guard the concurrency paths:
+# the CPU-finishes-before-GPU-init window, the fixed-share inline
+# bringup, stdout output, and teardown stability under repetition.
+# ============================================================
+section "Hybrid GPU-bringup overlap (decompress)"
+
+if has_gpu 2>/dev/null; then
+  hov_src="$TMPDIR/hov-src.bin"
+  # Small enough that the CPU pool can plausibly drain it during cuInit
+  # (exercises the bringup-thread skip-GPU-spawn path on fast machines).
+  dd if=/dev/urandom bs=1M count=4 2>/dev/null > "$hov_src"
+  hov_zst="$TMPDIR/hov.zst"
+  "$GZSTD" -k -f --cpu-only "$hov_src" -o "$hov_zst" 2>/dev/null
+
+  # 1. Adaptive hybrid decompress (background bringup) round-trip.
+  run_test "$GZSTD" -d -f --hybrid "$hov_zst" -o "$TMPDIR/hov-adapt.dec" 2>/dev/null
+  files_match "$hov_src" "$TMPDIR/hov-adapt.dec" \
+    && pass "adaptive hybrid decompress round-trip" \
+    || fail "adaptive hybrid decompress round-trip" "mismatch"
+
+  # 2. Fixed-share hybrid decompress (inline bringup, GPU warmed first).
+  run_test "$GZSTD" -d -f --hybrid --cpu-share 0.5 "$hov_zst" -o "$TMPDIR/hov-fixed.dec" 2>/dev/null
+  files_match "$hov_src" "$TMPDIR/hov-fixed.dec" \
+    && pass "fixed-share hybrid decompress round-trip" \
+    || fail "fixed-share hybrid decompress round-trip" "mismatch"
+
+  # 3. Adaptive hybrid decompress to stdout (-c output path).
+  "$GZSTD" -d -f --hybrid -c "$hov_zst" 2>/dev/null > "$TMPDIR/hov-stdout.dec"
+  files_match "$hov_src" "$TMPDIR/hov-stdout.dec" \
+    && pass "hybrid decompress to stdout" \
+    || fail "hybrid decompress to stdout" "mismatch"
+
+  # 4. Teardown stability: repeated adaptive hybrid decompress must all
+  #    match and exit cleanly (shakes out bringup/teardown races).
+  hov_rep_ok=true
+  for i in 1 2 3 4 5; do
+    "$GZSTD" -d -f --hybrid "$hov_zst" -o "$TMPDIR/hov-rep.dec" 2>/dev/null \
+      || { hov_rep_ok=false; break; }
+    files_match "$hov_src" "$TMPDIR/hov-rep.dec" || { hov_rep_ok=false; break; }
+  done
+  $hov_rep_ok && pass "hybrid decompress x5 stable" \
+              || fail "hybrid decompress x5 stable" "mismatch or nonzero exit"
+
+  rm -f "$hov_src" "$hov_zst" "$TMPDIR"/hov-*.dec
+else
+  skip "adaptive hybrid decompress round-trip"  "no GPU"
+  skip "fixed-share hybrid decompress round-trip" "no GPU"
+  skip "hybrid decompress to stdout"            "no GPU"
+  skip "hybrid decompress x5 stable"            "no GPU"
 fi
 
 # ============================================================
@@ -1943,7 +2015,8 @@ rm -f "$TMPDIR"/order*
 # ============================================================
 # 32. Space-separated option values (--opt VAL vs --opt=VAL)
 # ============================================================
-section "Space-separated option values"
+if $EXTENSIVE; then
+section "Space-separated option values (extensive)"
 
 LAST_TEST_MS=0
 # --chunk-size N (space)
@@ -1995,6 +2068,7 @@ else
   skip "--pinned (space)" "no GPU"
 fi
 rm -f "$TMPDIR"/sp-*
+fi  # $EXTENSIVE (Space-separated option values)
 
 # ============================================================
 # 33. Verbose output validation (-v, -vv, -vvv)
@@ -2157,7 +2231,8 @@ fi
 # ============================================================
 # 34. Completion summary format validation
 # ============================================================
-section "Completion summary format"
+if $EXTENSIVE; then
+section "Completion summary format (extensive)"
 
 LAST_TEST_MS=0
 
@@ -2212,6 +2287,7 @@ else
 fi
 
 rm -f "$TMPDIR"/summ-*
+fi  # $EXTENSIVE (Completion summary format)
 
 # ============================================================
 # 35. Ultra compression validation
