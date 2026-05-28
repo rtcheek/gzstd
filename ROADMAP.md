@@ -35,7 +35,7 @@ effective_batch = base_batch * util_scale
 
 RateMatchState struct exists with EMA-smoothed throughput tracking and CPU frame allowance calculation. CPU throttle (`cpu_may_take()`) is implemented but **disabled for debugging** since v0.11.9.
 
-Needs re-evaluation on a quiet dedicated machine. The throughput measurement was unreliable on shared machines (Lovelace) where background load skews the calibration.
+Needs re-evaluation on a quiet dedicated machine. The throughput measurement was unreliable on shared machines (the workstation) where background load skews the calibration.
 
 ### 1.4 Sequential Frame Assignment
 **Priority: Medium | Complexity: Low | Status: TRIED, REVERTED (v0.11.1)**
@@ -122,7 +122,7 @@ Create `~/.gzstd/` directory on first run. Store tuning data:
 - NVMe write throughput (GiB/s, for writer thread sizing)
 - CPU/GPU ratio for rate-matched dispatch
 
-**Why it matters:** On 8 GiB files where total runtime is 3-6 seconds, the auto-tuner spends 2-3 seconds rediscovering optimal batch sizes every run. On Lovelace where the answer is always "batch=8 for compress," this is pure waste. A cached profile would eliminate the exploration phase.
+**Why it matters:** On 8 GiB files where total runtime is 3-6 seconds, the auto-tuner spends 2-3 seconds rediscovering optimal batch sizes every run. On the workstation where the answer is always "batch=8 for compress," this is pure waste. A cached profile would eliminate the exploration phase.
 
 ### 2.2 Calibration Run
 **Priority: Medium | Complexity: Medium | Status: NOT STARTED**
@@ -219,7 +219,7 @@ When input size is unknown (pipe), the frame count is unknown. The auto-tuner mu
 ### 5.1 Asymmetric Mode (GPU Compress + CPU Decompress)
 **Priority: HIGH | Complexity: Low | Status: DONE (v0.13.0)**
 
-Benchmark data from Lovelace (v0.11.20) conclusively shows:
+Benchmark data from the workstation (v0.11.20) conclusively shows:
 - **Compress:** GPU/Hybrid wins on 4/5 data types (up to 2.14 GiB/s vs 1.50 CPU)
 - **Decompress:** CPU wins on ALL 5 data types (up to 4.88 GiB/s vs 3.50 hybrid)
 

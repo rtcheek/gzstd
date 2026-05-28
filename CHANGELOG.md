@@ -1,9 +1,48 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.16  
+**Covers:** v0.9.50 → v0.13.17  
 **Test machines:**
-- **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
-- **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+- **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
+- **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.17 — Pre-fault mmap input on the producer (kill the fault storm)
+
+Fix mmap compression being *slower* than `--no-mmap` on high-core machines,
+despite being the "zero-copy" default.
+
+**Cause.**  The compress producer hands workers `Task`s whose `view_ptr`
+points into the mmap'd input; each worker faults its own pages in on first
+touch.  With hundreds of workers hammering one mapping, concurrent faulting
+storms the kernel's `mmap_lock` and per-page fault path.  On a 256-core
+machine this showed as ~4× system time (~66s vs ~16s) and ~15% slower wall
+than `--no-mmap` — the same `mmap_lock` storm already designed out of the
+*decompress* path (which reads via `fread`).  Compress still defaulted to
+mmap, so it ate the penalty.
+
+**Fix.**  The producer now bulk-pre-faults each chunk with
+`MADV_POPULATE_READ` *before* pushing its task (`mmap_prefault`, new helper
+next to `MmapRegion`).  The faulting happens once, in bulk, on the single
+producer thread — no concurrent storm — and because population precedes the
+push, a worker can never touch an unpopulated page (no startup race, no need
+for a separate prefetch thread).  Zero-copy reads and read/compress overlap
+are preserved.  The producer paces itself to stay ≤ ~1 GiB ahead of
+consumption (`m->read_bytes`, which workers bump per chunk), so the whole
+file is never read up front.  Applied to both `compress_cpu_mt` and
+`compress_nvcomp`.
+
+**Portability.**  `MADV_POPULATE_READ` (Linux 5.14+) is `#define`d to its
+stable UAPI value (22) when missing from build headers (the ubuntu-20.04
+portable-build container, glibc 2.31), so the shipped binary still uses it on
+a 5.14+ runtime kernel; on older kernels `madvise` returns `EINVAL` and we
+fall back to lazy per-access faulting.
+
+**Verified (24-core workstation):** 4 GiB compress round-trip byte-identical;
+mmap+prefault now ~1.7s vs `--no-mmap` ~2.3s with low sys time (no storm);
+full suite passes.  The decisive win is expected on a 256-core machine where
+the storm was severe — re-measure `--direct` vs `--direct --no-mmap` there:
+the goal is mmap matching or beating `--no-mmap` with the ~4× sys gap gone.
 
 ---
 
@@ -52,7 +91,7 @@ is not GPU-gated).  Seekable input only — stdin (peek returns -1) keeps
 the old path.  `ZSTD_decompressStream` also decodes the rare
 trailing-frames-after-a-large-first-frame case correctly.
 
-**Verified (Lovelace):** 2 GiB single-frame `--sliding-window` round-trip
+**Verified (24-core workstation):** 2 GiB single-frame `--sliding-window` round-trip
 byte-identical via both `--cpu-only` and `--gpu-only` (peak RSS 24 MB, was
 ~2-3 GiB; no GPU bringup logged); a 4×100 MiB multi-frame file correctly
 stays on the parallel queue path; full suite passes including the
@@ -97,10 +136,10 @@ because detection is deferred):
   decompresses on CPU.  The deferred bringup still pays a (hidden, discarded)
   cuInit on the background thread for this case — acceptable for a rare path.
 
-**Verified (Lovelace, 2× 2080 Ti):** 253/253 suite; gpu-only round-trip
+**Verified (2-GPU workstation):** 253/253 suite; gpu-only round-trip
 byte-identical; masked-GPU run errors cleanly with exit 2 and removes the
 partial output; sliding-window file falls back to CPU and round-trips.  The
-win scales with GPU count, so the knuth (8× H100) gap should drop from ~3-4s
+win scales with GPU count, so the 8-GPU machine's gap should drop from ~3-4s
 to ~0 — re-measure the `[O_DIRECT]`→`[INIT]` interval there.
 
 ---
@@ -635,7 +674,7 @@ that previously crashed or silently truncated now produce a usage hint.
 
 - **Asymmetric default visibility.**  Promoted the PCIe Gen3 →
   --cpu-only notice from V_VERBOSE to V_DEFAULT.  Users on
-  lovelace-class hardware otherwise saw zero GPU activity during
+  workstation-class hardware otherwise saw zero GPU activity during
   decompress and had no signal the runtime had switched backends on
   them.  Prefix changed from [ASYMMETRIC] to gzstd: to match the other
   default-verbosity notices.
@@ -680,9 +719,9 @@ frames' natural seqs in the ResultStore — chunks overwrote each other
 and the writer either produced truncated output or got stuck waiting
 for a frame that had been clobbered.
 
-Surfaced on knuth during a benchmark sweep at `--ultra -22`: ultra
+Surfaced on server during a benchmark sweep at `--ultra -22`: ultra
 auto-bumps chunk size to 128 MiB (the windowLog 27 minimum), and the
-RAM budget on knuth's 256 GiB allowed the full 128 MiB to survive,
+RAM budget on server's 256 GiB allowed the full 128 MiB to survive,
 so every frame qualified for the streaming path.  Two failure modes
 observed:
 - `cpu-ultra22 / mixed.bin` decompress: produced 2.7 GiB of output for a
@@ -720,7 +759,7 @@ CUDA-using project that ships binaries.
 GPU compress wins consistently across hardware tiers, but on PCIe Gen3
 (consumer cards: RTX 20-series, 30-series, etc.) the D2H transfer cost
 makes hybrid *decompress* slower than CPU MT for every data type
-measured on Lovelace (2× RTX 2080 Ti):
+measured on Workstation (2× RTX 2080 Ti):
 
 | Data type | CPU-only | Hybrid | Asymmetric default wins by |
 |-----------|----------|--------|----------------------------|
@@ -730,12 +769,12 @@ measured on Lovelace (2× RTX 2080 Ti):
 | mixed     | 1.40     | 1.31   | +7%                        |
 | random    | 1.40     | 1.32   | +6%                        |
 
-(GiB/s decompress on Lovelace; raw v0.11.20 benchmark numbers.)
+(GiB/s decompress on Workstation; raw v0.11.20 benchmark numbers.)
 
 gzstd now picks the backend based on hardware *and* operation:
 - **Compress (any GPU):** hybrid — GPU compress consistently wins.
 - **Decompress / test, PCIe Gen<4:** cpu-only — D2H eats GPU benefit.
-- **Decompress / test, PCIe Gen4+:** hybrid — D2H is cheap (Knuth's H100s).
+- **Decompress / test, PCIe Gen4+:** hybrid — D2H is cheap (Server's H100s).
 - **Detection unavailable / no GPU:** hybrid (degrades gracefully).
 
 PCIe gen detection uses `nvmlDeviceGetMaxPcieLinkGeneration()` (the
@@ -770,7 +809,7 @@ promotion (unchanged precedence).
 ## v0.12.51 — `--cpu-share` actually enforces the requested split
 
 `--cpu-share X` was effectively a no-op: every value from 0.0 to 1.0
-landed at ~85% CPU work on Lovelace, because the `may_take` predicate
+landed at ~85% CPU work on Workstation, because the `may_take` predicate
 short-circuited on `qs.done` (`if (qs.done) return true;`) — so the
 moment the reader called `set_done()`, CPUs drained everything
 regardless of the user-set share.  The GPU side never consulted the
@@ -792,7 +831,7 @@ Three coordinated fixes in `HybridSched` and the worker loops:
   observes `queue->drained()`, otherwise a perpetually-yielding GPU
   would never exit its loop and the run would hang at high shares.
 
-Measured on Lovelace, 19.5 GiB medium-compressibility input, 22 CPU
+Measured on Workstation, 19.5 GiB medium-compressibility input, 22 CPU
 threads + 2× RTX 2080 Ti.  Before: 0.0 → 0.82, 0.5 → 0.86, 0.9 → 0.84
 (all within noise of each other).  After: 0.0 → 0.02, 0.1 → 0.12,
 0.25 → 0.27, 0.5 → 0.51, 0.75 → 0.76, 0.9 → 0.87, 1.0 → 0.98.  The
@@ -901,7 +940,7 @@ required outside the throttle class.
 `log_throttle_stats` skips the stats line on disabled throttles and
 just prints `DISABLED` instead.
 
-**Quick A/B on Lovelace** (24-core, 2 GiB mixed input):
+**Quick A/B on Workstation** (24-core, 2 GiB mixed input):
 
 | mode | throttle=auto | throttle=0 |
 |---|---|---|
@@ -939,7 +978,7 @@ Smoke-tested against the 20 GiB `medium_compress.bin` profile:
 | mtx-gpu-nommap-pin1 | 2.33 |
 | ... | |
 
-Confirms the v0.12.45/46 conclusions at 20 GiB scale on Lovelace
+Confirms the v0.12.45/46 conclusions at 20 GiB scale on Workstation
 (2× 2080 Ti): CPU-only crushes, mmap wins, pinned hurts.
 
 `--sweep-all` now also enables `--sweep-matrix`.  Add `--sweep-matrix`
@@ -956,7 +995,7 @@ system" (O_DIRECT, pinned RAM, atomic rename).  This pulls mmap up to
 the same level: on by default, but `--no-mmap` lets you A/B against
 fread to verify it's actually winning on your hardware.
 
-**Local validation** (Lovelace, 4 GiB mixed input, page cache warm):
+**Local validation** (Workstation, 4 GiB mixed input, page cache warm):
 | mode | mmap (default) | --no-mmap |
 |---|---|---|
 | `--cpu-only -T18` compress | ~1.4 s | ~2.2 s (~50% slower) |
@@ -977,7 +1016,7 @@ always fall back to fread (mmap requires a regular file).
 
 The plumbed-in pinned-host-memory infrastructure (v0.12.43, v0.12.44)
 turned out to be slower than pageable on every workload tested.
-On Lovelace (2× 2080 Ti), 4 GiB mixed-compressibility input:
+On Workstation (2× 2080 Ti), 4 GiB mixed-compressibility input:
 
 | mode       | --pinned=off | --pinned=on    |
 |------------|--------------|----------------|
@@ -1110,7 +1149,7 @@ No behaviour change — purely documentation.
 
 ## v0.12.41 — `--overwrite`: unlink-then-create instead of truncate-on-fopen
 
-**Symptom (Knuth, 432 GiB output).**
+**Symptom (Server, 432 GiB output).**
 ```
 time ./build/gzstd -d --cpu-only -T18 --direct --overwrite -v ...
 using O_DIRECT for output (--direct)
@@ -1189,7 +1228,7 @@ on its own schedule.
 
 ## v0.12.39 — Honour `--gpu-batch=N` exactly (full batches, not soft-min)
 
-**Symptom (Lovelace).**  `gzstd -d --gpu-only --gpu-batch=64 -vv` showed
+**Symptom (Workstation).**  `gzstd -d --gpu-only --gpu-batch=64 -vv` showed
 `pre-alloc batch=64` (buffers correct) but actual pops were small:
 ```
 [GPU0/S0] take batch=4 seq=[0..3] in=22.05 KiB
@@ -1288,7 +1327,7 @@ side that they've always had on compress.
 
 ## v0.12.36 — Visible init output during decompress pre-scan
 
-**Symptom (Knuth, large `-d` runs).** With a 432 GiB `.zst` file the user
+**Symptom (Server, large `-d` runs).** With a 432 GiB `.zst` file the user
 saw a long stretch of nothing but `[SPLIT] frame N` lines and asked
 "where's the init output?".  No `[GPU]` device-online lines, no
 `[GPU/S] pre-alloc batch=`, no throttle line — until the parse phase
@@ -1317,7 +1356,7 @@ parsing into a thread that runs concurrently with worker spawn.
 
 ## v0.12.35 — Per-chunk `-vvv` output for GPU compress/decompress
 
-**Symptom (Knuth, `--gpu-only -d -vvv`).** The trace output looked
+**Symptom (Server, `--gpu-only -d -vvv`).** The trace output looked
 sparse — mostly just the producer's `[SPLIT] frame N` lines every 1000
 frames, with little visible GPU activity.
 
@@ -1364,7 +1403,7 @@ Simpler than chasing a perfect static count or maintaining a cache file.
 
 ## v0.12.33 — Throttle starvation in hybrid mode (GPUs blocked on permits)
 
-**Symptom (Knuth, hybrid compress).** Per-batch GPU subchunk count grew
+**Symptom (Server, hybrid compress).** Per-batch GPU subchunk count grew
 fine after v0.12.32, but `nvtop` showed the H100s mostly idle.  CPUs
 were doing the bulk of the work while GPUs sat blocked.  `-vvv` reported
 `gpus_waiting=0`, which is technically correct (the wants/got window is
@@ -1381,7 +1420,7 @@ FrameThrottle throttle(compute_throttle_budget(..., comp_parallelism, ...));
 
 After v0.12.32 the auto-tuner can grow per-stream batches up to
 `AUTO_TUNE_BATCH_CEILING` (256), but the throttle was sized for 8.  On
-Knuth (8 GPUs × 1 stream + 96 CPU workers), every CPU that had popped a
+Server (8 GPUs × 1 stream + 96 CPU workers), every CPU that had popped a
 frame was holding one permit (held until the writer drains it), so when
 a GPU stream tried to `bp->acquire(pop_n)` for, say, 64 permits, it
 blocked waiting for CPUs to drain.  Effectively the GPU pipeline was
@@ -1402,7 +1441,7 @@ When `--gpu-batch=N` is set, the budget honours that value exactly (no
 auto-grow either, so no headroom needed).  Otherwise it provisions
 enough permits for the auto-tuner's full growth path.
 
-**Knuth example.** Before: floor = 8×1×8 = 64; throttle ≈ 640 frames
+**Server example.** Before: floor = 8×1×8 = 64; throttle ≈ 640 frames
 total → 8 streams × 64 = 512 GPU permits + 96 CPUs ≈ over budget.
 After: floor = 8×1×256 = 2048; throttle ≈ 8192 frames (RAM-capped) →
 2048 GPU + 96 CPU = 2144, well under budget.
@@ -1411,7 +1450,7 @@ After: floor = 8×1×256 = 2048; throttle ≈ 8192 frames (RAM-capped) →
 
 ## v0.12.32 — Fix GPU batch frozen by allocation (auto-tuner had no headroom)
 
-**Symptom (Knuth, `--gpu-only` compress).** The per-batch GPU subchunk
+**Symptom (Server, `--gpu-only` compress).** The per-batch GPU subchunk
 count was stuck at 8 across the entire run regardless of throughput.  The
 shared auto-tuner appeared to do nothing.  Hybrid compression had the same
 problem (same code path).  Decompression was partially affected for files
@@ -1458,7 +1497,7 @@ auto-tuning; that path is unchanged on both compress and decompress.
 
 ## v0.12.31 — Fix `out:%` jumping to ~90% immediately on `--cpu-only` compress
 
-**Symptom (Knuth, 432 GiB tar via `--overwrite --cpu-only --direct`):**
+**Symptom (Server, 432 GiB tar via `--overwrite --cpu-only --direct`):**
 ```
 in:12.8% 55.34 GiB 4.56 GiB/s | out:91.5% 14.95 GiB 1.23 GiB/s
 ```
@@ -1579,7 +1618,7 @@ examples covering the common workflows (compress, decompress with
 
 ### 1. New `--overwrite` flag
 
-**Symptom (Lovelace).** Running `gzstd -d -f big.zst` against a pre-existing output file stalled for tens of seconds at the final rename, while deleting the target first and letting gzstd create a fresh file was fast. v0.12.23 already reduced this stall with `sync_file_range`, but on ext4 with large outputs a substantial rename cost remained.
+**Symptom (Workstation).** Running `gzstd -d -f big.zst` against a pre-existing output file stalled for tens of seconds at the final rename, while deleting the target first and letting gzstd create a fresh file was fast. v0.12.23 already reduced this stall with `sync_file_range`, but on ext4 with large outputs a substantial rename cost remained.
 
 **Cause.** `-f` always used the `.gzstd.tmp` + `rename()` atomic-overwrite dance, which on ext4 `data=ordered` ties rename commit to flushing dirty pages. For workloads where atomicity isn't worth that cost, users want to opt out.
 
@@ -1654,7 +1693,7 @@ examples covering the common workflows (compress, decompress with
 
 **Fix.** Added `sync_file_range(fd, offset, len, SYNC_FILE_RANGE_WRITE)` in `AsyncWritePool::worker_fn` after each batch of writes. This non-blocking call tells the kernel to start writing dirty pages to disk immediately rather than letting them accumulate. By the time `rename()` executes, most pages are already on disk.
 
-**Result on Lovelace** (low_compress.bin.zst → existing file with `-f`):
+**Result on Workstation** (low_compress.bin.zst → existing file with `-f`):
 - Atomic rename: 46,155 ms → ~700 ms (**66× faster**)
 - No regression to compression or fresh-file decompression paths
 
@@ -1694,7 +1733,7 @@ examples covering the common workflows (compress, decompress with
 - Extended `Task` struct with `view_ptr`/`view_len` for borrowed (mmap) data vs owned `std::vector<char> data`, plus `ptr()`, `len()`, `release_input()` helpers
 - Updated all consumer touch points: `t.data.data()` → `t.ptr()`, `t.data.size()` → `t.len()`, `std::vector<char>().swap(t.data)` → `t.release_input()`
 
-**Result on Lovelace** (24-core, mixed.bin CPU-only compress):
+**Result on Workstation** (24-core, mixed.bin CPU-only compress):
 - Before: 9.9s (1.97 GiB/s)
 - After: 3.1s (6.3 GiB/s) — **3.2× faster**, now 1.9× faster than zstd
 
@@ -1731,7 +1770,7 @@ for (auto it = batch.rbegin(); it != batch.rend(); ++it)
 ```
 Reverse iteration preserves original sequence order at the front of the queue. This restores the FIFO invariant that `FrameThrottle` depends on for deadlock freedom: "the frame the writer needs next is always among the oldest in-flight frames."
 
-**Result on Lovelace** (24-core, 2× RTX 2080 Ti, medium_compress.bin.zst → real file):
+**Result on Workstation** (24-core, 2× RTX 2080 Ti, medium_compress.bin.zst → real file):
 - Before: stalled at ~39.7% (4/5 runs to disk, 0/5 to `/dev/null` after v0.12.19)
 - After: 5/5 real-file completions at 2.96–3.15 GiB/s, 15/15 `/dev/null` at 6.68–7.54 GiB/s
 
@@ -1762,7 +1801,7 @@ Reverse iteration preserves original sequence order at the front of the queue. T
 
 **Fix.** O_DIRECT is now off by default. `--direct` opts in; `--no-direct` is accepted for explicitness (already the default). Both the explicit-output-file path and the stdout-redirect-to-file path are gated on `opt.direct_io`.
 
-**Result on Lovelace** (24-core, ext4/NVMe, `mixed.bin` 19.5 GiB, 5-run median):
+**Result on Workstation** (24-core, ext4/NVMe, `mixed.bin` 19.5 GiB, 5-run median):
 
 | Mode | Before (O_DIRECT) | After (buffered) |
 |------|-------------------|-------------------|
@@ -1781,7 +1820,7 @@ The "stalled" hybrid decompress was caused by O_DIRECT writes contending with NV
 
 ## v0.12.17 — Kill the CPU-side thundering herd (wait_for_work / notify fixes)
 
-**Motivation.** v0.12.10–0.12.15 fixed several pipeline-depth and throttle issues but left a ~1.7× run-to-run variance on CPU-only decompress at high thread counts (22 workers on Lovelace): fast runs ~4.0 s to `/dev/null`, slow runs ~7.0 s on the same cached input. Reducing `-T` from 22 to 4 collapsed both the variance and the absolute time (3.1–3.6 s). Variance scaled with worker count — a contention signature, not a hardware one.
+**Motivation.** v0.12.10–0.12.15 fixed several pipeline-depth and throttle issues but left a ~1.7× run-to-run variance on CPU-only decompress at high thread counts (22 workers on Workstation): fast runs ~4.0 s to `/dev/null`, slow runs ~7.0 s on the same cached input. Reducing `-T` from 22 to 4 collapsed both the variance and the absolute time (3.1–3.6 s). Variance scaled with worker count — a contention signature, not a hardware one.
 
 **Root cause 1 — `TaskQueue::wait_for_work()` was waiting on the wrong CV.** `TaskQueue` exposes two condition variables by design: `cv_` for GPU batch waiters (woken by `notify_all` because batch predicates need every waiter to re-check) and `cpu_cv_` for CPU workers (woken by `notify_one` in the push path). Non-hybrid CPU workers called `wait_for_work()`, which — incorrectly — waited on `cv_`. So `push()`'s targeted `cpu_cv_.notify_one()` hit nothing, and the `cv_.notify_all()` it fires for GPU waiters woke **every** CPU worker in the pool on every frame push. 22 threads × ~8000 frames = ~176k spurious wakeups per run, all contending on the same queue mutex as they raced to pop, 21 of them losing each race and going back to sleep.
 
@@ -1837,7 +1876,7 @@ Saturation (`peak/max`) plus `block_count` tells you at a glance whether the thr
 
 ## v0.12.14 — Pipeline-depth throttle budget (principled scaling)
 
-**Motivation:** v0.12.13 fixed the lost-backpressure bug by capping the throttle budget at a hard 8 GiB. That number worked on the two test systems but was arbitrary: too restrictive for a 256-core / 8×H100 server (Knuth) whose pipeline can legitimately hold hundreds of GiB in flight, too generous for a 16 GiB VM where 8 GiB is half of physical RAM. The budget needs to track the machine, not a magic constant.
+**Motivation:** v0.12.13 fixed the lost-backpressure bug by capping the throttle budget at a hard 8 GiB. That number worked on the two test systems but was arbitrary: too restrictive for a 256-core / 8×H100 server whose pipeline can legitimately hold hundreds of GiB in flight, too generous for a 16 GiB VM where 8 GiB is half of physical RAM. The budget needs to track the machine, not a magic constant.
 
 **Fix:** Replace the fixed byte cap with a formula rooted in observable hardware parallelism:
 
@@ -1855,10 +1894,10 @@ Expected budgets:
 |--------------------------------|-------------------------|----------|-----------|
 | Laptop (8 CPU, no GPU)         | 8                       | 32 (floor) | 512 MiB  |
 | 16 GiB VM (4 CPU, no GPU)      | 4                       | 32 (floor) | 512 MiB  |
-| Lovelace (24 CPU, 2×1×16 GPU)  | 24 + 32 = 56            | 224      | ~3.5 GiB  |
-| Knuth (256 CPU, 8×2×64 GPU)    | 256 + 1024 = 1280       | 5120     | ~80 GiB   |
+| Workstation (24 CPU, 2×1×16 GPU)  | 24 + 32 = 56            | 224      | ~3.5 GiB  |
+| Server (256 CPU, 8×2×64 GPU)    | 256 + 1024 = 1280       | 5120     | ~80 GiB   |
 
-On Lovelace this is ~2× tighter than the old 8 GiB cap but well above the ~320 MiB the writer actually drains before the next producer wakeup, so no throughput regression is expected. On Knuth it unlocks the pipeline the hardware can actually sustain.
+On Workstation this is ~2× tighter than the old 8 GiB cap but well above the ~320 MiB the writer actually drains before the next producer wakeup, so no throughput regression is expected. On Server it unlocks the pipeline the hardware can actually sustain.
 
 The `-vvv` throttle debug line now shows all inputs: `parallelism=`, `pipeline=` (pre-clamp), `ram_cap=`, plus the chosen frame count and in-flight byte equivalent.
 
@@ -1866,7 +1905,7 @@ The `-vvv` throttle debug line now shows all inputs: `parallelism=`, `pipeline=`
 
 ## v0.12.13 — Throttle budget byte cap (restore writer backpressure)
 
-**Bug:** On Lovelace (256 GiB RAM) decompression appeared to lose all writer backpressure. Reader, GPUs, and CPUs finished in seconds; the writer then ground through a massive in-RAM backlog at ~88 MiB/s with no throttling of producers. The throttle budget formula `avail_ram / (2 × frame_bytes)` gave ~7,800 frames on a 246 GiB-available box — 123 GiB of permitted in-flight data. Files under that size (mixed.bin.zst at ~20 GiB decompressed = 1,220 frames) fit entirely within the budget, so workers never blocked, decompressed everything immediately, and the writer drained alone.
+**Bug:** On Workstation (256 GiB RAM) decompression appeared to lose all writer backpressure. Reader, GPUs, and CPUs finished in seconds; the writer then ground through a massive in-RAM backlog at ~88 MiB/s with no throttling of producers. The throttle budget formula `avail_ram / (2 × frame_bytes)` gave ~7,800 frames on a 246 GiB-available box — 123 GiB of permitted in-flight data. Files under that size (mixed.bin.zst at ~20 GiB decompressed = 1,220 frames) fit entirely within the budget, so workers never blocked, decompressed everything immediately, and the writer drained alone.
 
 **Fix:** Cap the budget at an absolute byte ceiling in addition to the RAM-relative calculation:
 
@@ -1876,7 +1915,7 @@ frames = budget_bytes / frame_bytes;
 frames = max(frames, 32);                                // min pipeline depth
 ```
 
-On Lovelace: budget = 512 frames (8 GiB in-flight) instead of ~7,800. Workers fill the pipeline, then block on `acquire(1)` — writer releases permits as frames are written, producers resume. Lockstep backpressure restored.
+On Workstation: budget = 512 frames (8 GiB in-flight) instead of ~7,800. Workers fill the pipeline, then block on `acquire(1)` — writer releases permits as frames are written, producers resume. Lockstep backpressure restored.
 
 Fast-I/O systems are unaffected: when the writer can release permits faster than workers acquire them, nobody blocks. Only slow-I/O systems (relative to producer throughput) feel the cap — which is exactly where it's needed.
 
@@ -1891,7 +1930,7 @@ throttle: 512 frame budget (8.00 GiB in-flight max, 246.03 GiB avail RAM)
 
 ## v0.12.12 — EMA-scaled hybrid queue floor + tuning knobs
 
-**Bug:** The fixed queue floor introduced in v0.12.9 — `active_gpu_streams × gpu_batch_size` — assumed GPU was strictly faster than CPU per frame. For compression that holds (GPU batches pay off), but for decompression nvCOMP throughput ≈ CPU zstd throughput, so reserving frames for the GPU just idles CPUs. Lovelace benchmarks (v0.12.11) showed hybrid decompression 2–8% slower than the best pure path on every file, and 18% slower than either pure config on `zeros.bin` (3.675 vs 4.482 GiB/s).
+**Bug:** The fixed queue floor introduced in v0.12.9 — `active_gpu_streams × gpu_batch_size` — assumed GPU was strictly faster than CPU per frame. For compression that holds (GPU batches pay off), but for decompression nvCOMP throughput ≈ CPU zstd throughput, so reserving frames for the GPU just idles CPUs. Workstation benchmarks (v0.12.11) showed hybrid decompression 2–8% slower than the best pure path on every file, and 18% slower than either pure config on `zeros.bin` (3.675 vs 4.482 GiB/s).
 
 **Fix:** `HybridSched` now scales the nominal floor by observed GPU advantage. Each tick (every ≥0.5s) feeds per-side EMA throughput (`cpu_rate_ema_`, `gpu_rate_ema_`, α=0.3) from the already-tracked `cpu_bytes_` / `gpu_bytes_` counters. The floor factor is `clamp((gpu_per_stream − cpu_per_thread) / gpu_per_stream, 0, 1)`:
 - Compression: GPU ≫ CPU → factor ≈ 1.0 (nominal reservation, preserves v0.12.9 gains).
@@ -1928,7 +1967,7 @@ During warm-up (<2 EMA samples on either side), factor defaults to 1.0, matching
 
 ## v0.12.9 — GPU queue depth reservation (hybrid scheduler)
 
-**Bug:** On Knuth, hybrid mode was ~10% slower than `--gpu-only`. Scheduler stats showed CPUs took 18,344 tasks vs GPUs 9,341 — despite CPUs being ~6× slower per task (0.21 vs 1.19 GiB/s). The `should_cpu_take()` gate only blocked CPUs when `gpus_waiting > 0`, but GPUs cycle through wants→got in microseconds. During the much longer GPU processing phase (milliseconds), `gpus_waiting == 0` and all 96 CPUs flooded the queue, leaving it empty when GPUs came back for their next batch.
+**Bug:** On Server, hybrid mode was ~10% slower than `--gpu-only`. Scheduler stats showed CPUs took 18,344 tasks vs GPUs 9,341 — despite CPUs being ~6× slower per task (0.21 vs 1.19 GiB/s). The `should_cpu_take()` gate only blocked CPUs when `gpus_waiting > 0`, but GPUs cycle through wants→got in microseconds. During the much longer GPU processing phase (milliseconds), `gpus_waiting == 0` and all 96 CPUs flooded the queue, leaving it empty when GPUs came back for their next batch.
 
 **Fix:** `HybridSched` now tracks total active GPU streams (`register_gpu_stream()`) and current batch size (`set_gpu_batch_size()`). A dynamic queue floor = `active_streams × batch_size` reserves enough tasks for every GPU stream to fill one full batch. The `may_take` lambda in both compress and decompress CPU workers checks `qs.depth <= floor` and yields if so. The floor updates automatically as the auto-tuner adjusts batch size. When the queue is draining (`qs.done`), the floor is bypassed so CPUs can process remaining tasks. The floor is logged in `-vvv` tick output for diagnosis.
 
@@ -2115,24 +2154,24 @@ Replaced `WriterBackpressure` (byte-based high/low water marks + `writer_stalled
 
 ### O_DIRECT Writer (v0.9.71)  POSITIVE
 Bypasses page cache for sequential writes. Uses 16 MiB aligned buffer, flushes in aligned chunks.
-- **Knuth:** Writer I/O improved 1.1 → 2.72 GiB/s on 432 GiB file
+- **Server:** Writer I/O improved 1.1 → 2.72 GiB/s on 432 GiB file
 - **Why it works:** Avoids double-buffering through page cache for large sequential writes
 - **Caveat:** Unaligned tail requires dropping O_DIRECT via fcntl for final write
 
 ### pwrite for Out-of-Order Decompress (v0.9.72)  NEGATIVE (reverted)
 Tried using pwrite() to write decompressed frames directly to their final offset without waiting for in-order delivery.
-- **Knuth:** 0.93 GiB/s (worse than sequential 2.72 GiB/s)
+- **Server:** 0.93 GiB/s (worse than sequential 2.72 GiB/s)
 - **Why it failed:** 27k individual O_DIRECT pwrite calls = massive kernel DMA setup overhead. sys time: 12m45s.
 - **Lesson:** O_DIRECT pwrite per-frame is catastrophically expensive. Sequential batch drain is better.
 
 ### Async Double-Buffered Write Pool (v0.9.73)  POSITIVE
 Background write thread with one pending slot. Writer collects batch → submits to pool (non-blocking) → collects next batch while pool writes previous.
-- **Knuth:** Improved overlap between GPU D2H and disk writes
+- **Server:** Improved overlap between GPU D2H and disk writes
 - **Why it works:** Writer thread doesn't block on disk I/O; can collect next batch while previous is being written
 
 ### Sparse File Support (v0.9.73)  POSITIVE (for zero-heavy data)
 Scans 4K blocks for zeros, lseek past them instead of writing. Integrated with both O_DIRECT (DirectWriter::seek_forward) and fwrite paths.
-- **Knuth:** zeros.bin decompress: sparse=5.2s vs no-sparse=6.9s (~25% faster)
+- **Server:** zeros.bin decompress: sparse=5.2s vs no-sparse=6.9s (~25% faster)
 - **Why it works:** Avoids physical writes for zero-filled regions
 - **Caveat:** O_DIRECT seek_forward must flush internal buffer before seeking. Added --[no-]sparse flag matching zstd syntax.
 
@@ -2175,7 +2214,7 @@ Replaced buf.erase(0,N) O(n) memmove with offset cursor.
 
 ### Pinned (Page-Locked) Memory for GPU Decompress (v0.9.53)  NEGATIVE (catastrophic, reverted)
 cudaHostAlloc for H2D/D2H staging buffers to enable true async DMA.
-- **Knuth:** GPU decompress nearly doubled: 13.4s → 25.6s
+- **Server:** GPU decompress nearly doubled: 13.4s → 25.6s
 - **Why it failed:** Massive pinned allocations (512 MiB per stream) starved system memory, caused page faults in other threads, and the copy-to-pinned + DMA was slower than direct pageable transfer for our access pattern.
 - **Lesson:** Pinned memory requires small rotating pools, not batch-sized allocations. The extra memcpy to/from pinned staging negated any DMA benefit.
 
@@ -2189,7 +2228,7 @@ ensure_buffers() allocates once, reuses across batches. Saves ~150-300ms of cuda
 
 ### VRAM-Aware Batch Sizing (v0.9.96-98)  POSITIVE
 Binary search for largest compress batch that fits in VRAM. Includes nvCOMP temp workspace in estimate.
-- **Lovelace (10 GiB VRAM):** Finds batch=104 instead of hanging on batch=256
+- **Workstation (10 GiB VRAM):** Finds batch=104 instead of hanging on batch=256
 - **Why it matters:** cudaMalloc can hang on some drivers if request exceeds VRAM. Pre-check avoids this.
 - Fixed partial allocation leak on retry (free_stream_buffers_only before halving).
 
@@ -2229,7 +2268,7 @@ Various attempts at throughput-based adaptive scheduling.
 ### Trivially-Compressed Frame Detection (v0.9.93)  POSITIVE
 Decompress: peek at front frame's ratio. If < 2%, CPU takes it regardless of GPU priority.
 - **Why it works:** Frames decompressing to mostly zeros are faster on CPU (no PCIe D2H overhead). CPU + sparse writes = near-instant.
-- **Knuth:** zeros.bin: CPU path 1.4s vs GPU path 4.4s
+- **Server:** zeros.bin: CPU path 1.4s vs GPU path 4.4s
 
 ### Auto CPU Thread Cap at 96 (v0.9.80)  POSITIVE
 Default auto: min(hw-1, 96). -T0 = all threads (matches zstd).
@@ -2245,7 +2284,7 @@ Minimum queue depth before CPU workers activate. Each CPU takes 1 frame (no CPU 
 
 ### Decompress Greedy Batch Pop (v0.9.69)  POSITIVE (massive)
 pop_batch_greedy waits for full batch before GPU processes. DEFAULT_GPU_DECOMP_BATCH_CAP = 256.
-- **Knuth:** medium_compress kernel dropped 24.7s → 1.27s (55× speedup!)
+- **Server:** medium_compress kernel dropped 24.7s → 1.27s (55× speedup!)
 - **Why:** Default batch=8 caused 64 kernel launches × 385ms each. Batch=256 = 3 launches × 424ms.
 
 ### Continuous Binary-Search Auto-Tuner (v0.10.0-0.10.6)  POSITIVE
@@ -2255,7 +2294,7 @@ Runtime throughput-aware batch sizing for compress. Explores both directions fro
 3. Try doubling  if better, continue doubling
 4. Settle at best when throughput drops
 5. Periodically probe to detect data character changes
-- **Lovelace:** Correctly finds batch=8 optimal for compress, settles in 2 steps
+- **Workstation:** Correctly finds batch=8 optimal for compress, settles in 2 steps
 - **Fixed bugs:** free_stream_buffers_only wiped tune state (v0.10.4), tune ceiling was default not VRAM limit (v0.10.2), baseline never recorded (v0.10.3)
 
 ---
@@ -2299,7 +2338,7 @@ PerfCounters struct with atomic accumulators for every pipeline phase.
 
 ## Benchmark Snapshots
 
-### Knuth (H100 × 8)  v0.9.74 vs zstd -T0, 8 GiB files, decompress
+### Server (H100 × 8)  v0.9.74 vs zstd -T0, 8 GiB files, decompress
 | File | zstd -T0 | gzstd | Speedup |
 |------|----------|-------|---------|
 | zeros | 4.85s | 4.40s | 1.10× |
@@ -2309,7 +2348,7 @@ PerfCounters struct with atomic accumulators for every pipeline phase.
 | low_compress | 9.25s | 7.14s | **1.30×** |
 | **Total** | **48.13s** | **34.85s** | **1.38×** |
 
-### Lovelace (RTX 2080 Ti × 2)  v0.10.6 vs zstd -T0, 8 GiB files
+### Workstation (RTX 2080 Ti × 2)  v0.10.6 vs zstd -T0, 8 GiB files
 **Decompress:** gzstd wins 2/5 (medium_compress 1.22×, low_compress 1.06×). Loses on trivial data where zstd's page-cache sparse dominates.
 **Compress:** gzstd wins 4/5 (high 1.83×, low 1.54×, medium 1.11×, mixed 1.26×). Only loses zeros.
 
@@ -2317,7 +2356,7 @@ PerfCounters struct with atomic accumulators for every pipeline phase.
 
 ### io_uring Writer (v0.10.22-0.10.28)  NEGATIVE (reverted)
 Replaced DirectWriter + AsyncWritePool with Linux io_uring for async writes.
-- **v0.10.22-26:** O_DIRECT + io_uring. Writes submitted but never completed  `io_uring_wait_cqe` hung forever. Likely kernel/NVMe driver incompatibility with O_DIRECT + io_uring on Knuth.
+- **v0.10.22-26:** O_DIRECT + io_uring. Writes submitted but never completed  `io_uring_wait_cqe` hung forever. Likely kernel/NVMe driver incompatibility with O_DIRECT + io_uring on Server.
 - **v0.10.27:** Tried `io_uring_submit_and_wait()`  still hung.
 - **v0.10.28:** Dropped O_DIRECT, tried buffered io_uring  still hung.
 - **Root cause:** Unknown kernel-level issue. io_uring write completions never arrived despite successful submission. Possibly a kernel config, seccomp policy, or filesystem limitation.
@@ -2325,9 +2364,9 @@ Replaced DirectWriter + AsyncWritePool with Linux io_uring for async writes.
 
 ### Multi-threaded pwrite Pool (v0.10.29)  NEGATIVE (reverted)
 4 threads doing pwrite() at known offsets through the page cache.
-- **Knuth:** 10m30s (vs 4m with DirectWriter). `sys: 38m40s` (vs 12m).
+- **Server:** 10m30s (vs 4m with DirectWriter). `sys: 38m40s` (vs 12m).
 - **Why it failed:** Without O_DIRECT, 432 GiB went through the page cache. The pwrite() calls returned fast (page cache absorb), but kernel writeback stalled massively. The page cache backlog created 9.5 minutes of post-completion flush.
-- **Key lesson:** You cannot beat the NVMe's physical write speed (~2-3 GiB/s on Knuth). O_DIRECT + single-threaded sequential write is already optimal for this workload. The 220s writer drain IS the hardware limit  not a software bottleneck.
+- **Key lesson:** You cannot beat the NVMe's physical write speed (~2-3 GiB/s on Server). O_DIRECT + single-threaded sequential write is already optimal for this workload. The 220s writer drain IS the hardware limit  not a software bottleneck.
 - **Decision:** Reverted to DirectWriter + AsyncWritePool (v0.10.30).
 
 ---
@@ -2349,7 +2388,7 @@ Auto-tuner still refines from the starting point. On 217 GiB file, converges to 
 
 ## Benchmark Snapshots (Updated)
 
-### Knuth (H100 × 2 GPUs)  v0.10.34, 432 GiB file (rpfrancis.tar)
+### Server (H100 × 2 GPUs)  v0.10.34, 432 GiB file (rpfrancis.tar)
 
 **Decompress test mode (-t, no disk I/O):**
 - 432.58 GiB decompressed in **53.5 seconds** = **8.13 GiB/s**
@@ -2365,7 +2404,7 @@ Auto-tuner still refines from the starting point. On 217 GiB file, converges to 
 - 432.58 GiB → 217 GiB in **3m21s** = **2.16 GiB/s**
 - Auto-tuned to batch=48→816 over the run
 
-### Lovelace (RTX 2080 Ti × 2)  v0.10.6, 8 GiB files
+### Workstation (RTX 2080 Ti × 2)  v0.10.6, 8 GiB files
 
 **Compress: gzstd wins 4/5 vs zstd -T0**
 | File | zstd -T0 | gzstd | Speedup |
@@ -2378,7 +2417,7 @@ Auto-tuner still refines from the starting point. On 217 GiB file, converges to 
 
 **Decompress: gzstd wins 2/5 (storage-limited on consumer NVMe)**
 
-### Lovelace (RTX 2080 Ti × 2)  v0.11.20, 8 GiB files, 3 iterations
+### Workstation (RTX 2080 Ti × 2)  v0.11.20, 8 GiB files, 3 iterations
 
 **Compress (GiB/s):**
 | File | CPU | GPU-only | Hybrid | Best config |
@@ -2402,13 +2441,13 @@ correctly splits work between CPU and GPU based on observed throughput.
 | high_compress | **1.52** | 1.44 | 1.40 | CPU |
 | low_compress | 1.44 | 1.45 | 1.43 | ~Tied |
 
-CPU wins decompress across the board on Lovelace. PCIe Gen3 bandwidth makes D2H
+CPU wins decompress across the board on Workstation. PCIe Gen3 bandwidth makes D2H
 the bottleneck  the GPU can't transfer decompressed data back fast enough to
 justify the round-trip. Trivial frame detection helps (zeros at 4.88 GiB/s).
 Confirms that asymmetric mode (GPU compress + CPU decompress) would be the
 ideal default for consumer GPUs with PCIe Gen3.
 
-### Lovelace (RTX 2080 Ti × 2)  v0.11.22, 8 GiB files, 3 iterations
+### Workstation (RTX 2080 Ti × 2)  v0.11.22, 8 GiB files, 3 iterations
 
 Machine was under student load (~12% lower baseline than v0.11.20 run).
 Back-to-back v0.11.21 → v0.11.22 comparison is valid (same load).
@@ -2438,7 +2477,7 @@ types are flat  bottlenecked by PCIe or NVMe, not memory lifecycle.
 
 ## Key Lessons Learned (Updated)
 
-7. **io_uring may not work on all kernels.** Knuth's kernel accepted io_uring submissions but never completed writes. Possibly a seccomp policy, kernel config, or NVMe driver limitation. Always have a fallback.
+7. **io_uring may not work on all kernels.** Server's kernel accepted io_uring submissions but never completed writes. Possibly a seccomp policy, kernel config, or NVMe driver limitation. Always have a fallback.
 
 8. **Page cache is not free.** Multi-threaded pwrite through page cache caused 38 minutes of sys time (vs 12 min with O_DIRECT). The page cache absorbed writes instantly but kernel writeback created a massive backlog. O_DIRECT + sequential single-thread is optimal for large sequential output.
 
@@ -2460,7 +2499,7 @@ Single cudaMemcpy for entire decompressed batch, deliver all frames at once.
 
 ### Thread Pinning (v0.11.5)  NEGATIVE (disabled)
 Pinned reader to core 0, writer to core 1.
-- **Why it failed on Knuth:** Students had ALL cores at 97-99%. Pinning forced I/O threads onto busy cores instead of letting the OS scheduler find idle moments on any core.
+- **Why it failed on Server:** Students had ALL cores at 97-99%. Pinning forced I/O threads onto busy cores instead of letting the OS scheduler find idle moments on any core.
 - **When it would help:** Dedicated machine with no competing workloads.
 
 ### GPU Utilization Backoff (v0.11.3)  REPLACED by proportional scaling
@@ -2523,7 +2562,7 @@ Removed `#include <liburing.h>` and stale io_uring comment left over from the re
 Replaced 9 × `sleep_for(1ms)` poll loops in CPU compress and decompress workers with proper condition variable waits. CPU workers now block on a dedicated `cpu_cv_` and wake in microseconds when conditions change.
 - **TaskQueue:** Added `cpu_cv_` (dedicated CV for CPU workers), `wait_for_cpu(predicate)`, and `pop_one_cpu(task, predicate)`. Predicates receive a `QueueState` snapshot to avoid recursive lock deadlocks. `push()` uses `cv_.notify_all()` to ensure all waiting GPUs see new frames.
 - **HybridSched:** `gpu_got_data()` and `set_gpu_ready()` now call `notify_cpu_waiters()` so CPU threads wake instantly when scheduling state changes instead of sleeping up to 1ms.
-- **Lovelace (8 GiB files):** No measurable throughput change on small workloads (127 frames  sleep overhead was ~2% of runtime). The win is on large files with thousands of frames where 22 threads × 1ms × thousands of iterations compounds to minutes of waste.
+- **Workstation (8 GiB files):** No measurable throughput change on small workloads (127 frames  sleep overhead was ~2% of runtime). The win is on large files with thousands of frames where 22 threads × 1ms × thousands of iterations compounds to minutes of waste.
 - **Bug fixed during development:** Initial implementation deadlocked because predicate lambdas called `tq->peek_front_ratio()` / `tq->size()` / `tq->drained()` while `pop_one_cpu` held `m_` (non-recursive mutex). Fixed by passing a `QueueState` snapshot to predicates instead.
 - **Bug fixed during development:** `push()` with `cv_.notify_one()` could deliver notifications to a GPU that was busy processing (not waiting), starving the other GPU. Changed to `cv_.notify_all()`.
 
@@ -2533,7 +2572,7 @@ Release input data buffers immediately after they're consumed instead of holding
 - **GPU compress worker:** Batch input data (up to 16 × 16 MiB = 256 MiB) released after H2D upload. Guarded by `!rescue`  in hybrid mode data stays alive for potential CPU rescue on GPU failure; in gpu-only mode released immediately.
 - **GPU decompress worker:** Batch compressed data released before kernel launch (after re-upload path). Saved `batch_seqs[]` and `batch_comp_sizes[]` for completion paths.
 - **CPU decompress worker:** Already had early release (swap at line 2280)  no change needed.
-- **Lovelace (8 GiB files):** +7.1% decompress and +7.5% compress on mixed.bin. Other data types flat (bottlenecked elsewhere). Mixed data benefits most because alternating compressible/random blocks cause high frame churn  freeing memory sooner reduces page allocation contention.
+- **Workstation (8 GiB files):** +7.1% decompress and +7.5% compress on mixed.bin. Other data types flat (bottlenecked elsewhere). Mixed data benefits most because alternating compressible/random blocks cause high frame churn  freeing memory sooner reduces page allocation contention.
 
 ### Write Drain Progress Bar (v0.11.23)  IMPROVEMENT
 Progress bar now shows write drain percentage when the compute pipeline finishes but disk I/O is still in progress. Previously showed a static "writing..." message or sat at 100% while the NVMe caught up.
@@ -2552,7 +2591,7 @@ Prevents CPU decompression workers from producing data faster than the NVMe can 
 - **GPU decomp workers** call `mark_produced()` for accurate backlog accounting but are never blocked.
 - No artificial sleeps  all coordination via condition variables with instant wakeup.
 
-**Knuth (H100 × 8, 432 GiB file) hybrid decompress:**
+**Server (H100 × 8, 432 GiB file) hybrid decompress:**
 
 | Metric | v0.11.22 (before) | v0.11.24 (after) | Change |
 |--------|-------------------|------------------|--------|
@@ -2621,7 +2660,7 @@ When stdout is redirected to a regular file (`gzstd -d < file.zst > output.tar`)
 - **Safety checks:** Skips O_APPEND (undefined with O_DIRECT), `/dev/*`, deleted files, non-regular files. Falls back silently to buffered fwrite on any failure.
 - **Result:** `tar | gzstd > file.zst` gets full NVMe speed without the user needing to know about `-o`.
 
-**Knuth (432 GiB decompress via stdin redirect):**
+**Server (432 GiB decompress via stdin redirect):**
 
 | Method | Wall | sys | GiB/s |
 |--------|------|-----|-------|
@@ -2637,7 +2676,7 @@ GPUs now call `wait_if_backlogged()` before `pop_batch_greedy` in both compress 
 
 ### Test Mode Defaults to 2 GPU Streams (v0.11.31)  POSITIVE
 `-t` verify mode now defaults to `--gpu-streams=2` instead of 1. No write bottleneck in verify mode, so stream overlap helps.
-- **Knuth (432 GiB verify):** 1 stream: 4.09 GiB/s (1m47s) → 2 streams: 6.39 GiB/s (1m09s)  **56% faster**
+- **Server (432 GiB verify):** 1 stream: 4.09 GiB/s (1m47s) → 2 streams: 6.39 GiB/s (1m09s)  **56% faster**
 - Compress/decompress stays at 1 stream (NVMe is the bottleneck, larger batches win)
 - Fixed help text: was incorrectly showing default as 3
 
@@ -2649,11 +2688,11 @@ GPUs now call `wait_if_backlogged()` before `pop_batch_greedy` in both compress 
 
 21. **Bound frames, not bytes.** Byte-based backpressure conflated two concerns: memory pressure (bytes in RAM) and frame ordering (which frames the writer can drain). Out-of-order frames in ResultStore inflated the byte count, triggering false backpressure. A counting semaphore on frames separates these concerns: frame ordering lives in ResultStore, flow control lives in the semaphore. The FIFO queue guarantees the writer's next-needed frame is always in-flight, making the design deadlock-free without escape hatches.
 
-18. **GPU VRAM is a shared resource  design for it.** On a multi-user machine (Knuth, 8× H100), any GPU can lose VRAM at any moment. Infinite retry loops, early reader aborts on single GPU failure, and missing frame deadlocks all surfaced under real student workloads. The fix: retry limits, graceful skip with re-enqueue, deadlock detection with hard error, and never abort the reader on partial failure.
+18. **GPU VRAM is a shared resource  design for it.** On a multi-user machine (Server, 8× H100), any GPU can lose VRAM at any moment. Infinite retry loops, early reader aborts on single GPU failure, and missing frame deadlocks all surfaced under real student workloads. The fix: retry limits, graceful skip with re-enqueue, deadlock detection with hard error, and never abort the reader on partial failure.
 
 ---
 
-## Early Benchmark History (Knuth, v0.9.50v0.9.59)
+## Early Benchmark History (Server, v0.9.50v0.9.59)
 
 Baseline: v0.9.51 CPU-default avg compress 7.7s (1.06 GiB/s), decompress 11.2s (0.72 GiB/s).
 All times are averages across 5 data types (8 GiB each).

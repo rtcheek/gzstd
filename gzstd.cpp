@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.16";
+static constexpr const char * GZSTD_VERSION = "0.13.17";
 //
 // Architecture overview:
 //
@@ -1511,6 +1511,44 @@ private:
   const char * ptr_ = nullptr;
   size_t       size_ = 0;
 };
+
+// MADV_POPULATE_READ (Linux 5.14+) may be missing from older build headers
+// (e.g. the ubuntu-20.04 portable-build container, glibc 2.31).  Define the
+// stable UAPI value so the binary can still use it at runtime on a 5.14+
+// kernel; on older kernels madvise() returns EINVAL and we silently fall back
+// to lazy per-access faulting.
+#if defined(__linux__) && !defined(MADV_POPULATE_READ)
+#define MADV_POPULATE_READ 22
+#endif
+
+// Pre-fault [off, off+n) of an mmap'd input on the single producer thread,
+// in bulk, BEFORE its task is handed to the workers.  Otherwise every worker
+// faults its own pages on first touch; with hundreds of workers hammering one
+// mapping that storms the kernel's mmap_lock + per-page fault path and burns
+// enormous system time (observed ~4x sys and ~15% slower wall on a 256-core
+// box vs. --no-mmap).  Doing the faulting once, in bulk, on the producer keeps
+// zero-copy reads and read/compress overlap while eliminating the storm:
+// because population happens before the push, a worker can never touch an
+// unpopulated page.  `consumed` (m->read_bytes, bumped by workers per chunk)
+// paces the producer to stay at most ~1 GiB ahead, so the whole file is never
+// read up front.  No-op on builds/kernels without MADV_POPULATE_READ.
+static inline void mmap_prefault(const char * base, size_t off, size_t n,
+                                 const std::atomic<uint64_t> * consumed,
+                                 const std::atomic<bool> * abort = nullptr)
+{
+#ifdef MADV_POPULATE_READ
+  if (consumed) {
+    constexpr uint64_t AHEAD = uint64_t(1024) * ONE_MIB;  // stay <= ~1 GiB ahead
+    while ((uint64_t)off > consumed->load(std::memory_order_relaxed) + AHEAD) {
+      if (abort && abort->load(std::memory_order_acquire)) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  ::madvise((void *)(base + off), n, MADV_POPULATE_READ);  // EINVAL on <5.14 → ignored
+#else
+  (void)base; (void)off; (void)n; (void)consumed; (void)abort;
+#endif
+}
 
 #endif // !_WIN32
 
@@ -4313,7 +4351,7 @@ static void cpu_decomp_worker(
       // All slots in flight — writer hasn't drained any yet.  Wait on
       // the writer's drain signal (see FrameThrottle::wait_for_drain),
       // not sched_yield — yielding 96 workers in lockstep burned ~50s
-      // of sys time on the v0.13.9 knuth decompress runs.
+      // of sys time on the v0.13.9 256-core decompress runs.
       ++pool_wait_count;
       if (bp) {
         bp->wait_for_drain([&]{
@@ -5182,6 +5220,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     uint64_t mmap_rd_t0 = g_perf ? now_ns() : 0;
     while (off < file_size) {
       size_t n = std::min(host_chunk, file_size - off);
+      // Bulk pre-fault on the producer so workers read resident pages instead
+      // of storming the fault path (see mmap_prefault).
+      mmap_prefault(base, off, n, m ? &m->read_bytes : nullptr);
       Task t;
       t.seq = seq.fetch_add(1, std::memory_order_relaxed);
       t.view_ptr = base + off;
@@ -7055,6 +7096,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
         break;
       size_t n_host = std::min(host_chunk, file_size - off);
+      // Bulk pre-fault the whole host chunk on the producer before handing its
+      // sub-chunks to CPU/GPU workers, so they read resident pages instead of
+      // storming the fault path (see mmap_prefault).
+      mmap_prefault(base, off, n_host, m ? &m->read_bytes : nullptr, &abort_on_failure);
       size_t sub_off = 0;
       while (sub_off < n_host) {
         size_t sub_n = std::min(gpu_chunk, n_host - sub_off);
