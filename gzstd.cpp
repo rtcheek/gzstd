@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.9";
+static constexpr const char * GZSTD_VERSION = "0.13.10";
 //
 // Architecture overview:
 //
@@ -2919,7 +2919,38 @@ public:
     };
   }
 
+  // -- Pool-drain notification (v0.13.10+) --
+  // The writer calls notify_drain() after each buf.reset() (i.e. after
+  // dropping a per-frame shared_ptr ref).  Per-worker bounded buffer
+  // pools (cpu_worker, cpu_decomp_worker) wait on this CV when their
+  // pool is full instead of yield-spinning, eliminating the sched_yield
+  // syscall storm seen in v0.13.9 at high thread counts.
+  //
+  // Why a separate CV from permit-acquire (cv_):
+  //   - permit-acquire is contended on m_; sharing the CV would force
+  //     pool-waiters and permit-waiters to serialize on the same mutex.
+  //   - notify_all on every shared_ptr drop on m_ would block release()
+  //     for the duration of broadcasting.
+  // drain_cv_ + drain_m_ are dedicated, so permit-acquire is unaffected.
+  void notify_drain() {
+    // notify_all because the writer doesn't know which worker's pool
+    // slot just freed.  Wakes more than necessary but workers re-check
+    // predicate via atomic shared_ptr use_count() — cheap.
+    drain_cv_.notify_all();
+  }
+
+  template<class Predicate>
+  void wait_for_drain(Predicate pred) {
+    std::unique_lock<std::mutex> lk(drain_m_);
+    // 10ms timeout is a safety net for any missed notify; in normal
+    // operation the writer notifies on every frame drop so workers
+    // wake promptly.
+    drain_cv_.wait_for(lk, std::chrono::milliseconds(10), pred);
+  }
+
 private:
+  std::mutex              drain_m_;
+  std::condition_variable drain_cv_;
   int permits_;
   int max_;
   bool disabled_;        // true when constructed with max_in_flight <= 0
@@ -3113,7 +3144,11 @@ private:
         if (bp_) bp_->release(1);
         // Drop our shared_ptr ref now (not at end of loop) so the worker pool
         // can recycle the buffer for its next frame as soon as we're done.
+        // After the drop, notify pool-waiters: this is the moment use_count
+        // transitions from 2 to 1 (worker becomes the sole owner), so the
+        // worker's pool acquire predicate will now succeed.
         buf.reset();
+        if (bp_) bp_->notify_drain();
       }
 
 #ifdef __linux__
@@ -3867,7 +3902,19 @@ static void cpu_worker(
         if (b.use_count() == 1) return b;
       }
       ++pool_wait_count;
-      std::this_thread::yield();
+      // Wait on the writer's drain signal instead of sched_yield.
+      // Predicate checks for a free slot — wait_for() re-checks after
+      // wake, so a single notify_all is sufficient even if 96 workers
+      // race for ~5 slots.  The 10ms timeout in wait_for_drain is a
+      // safety net for any missed notify.
+      if (bp) {
+        bp->wait_for_drain([&]{
+          for (auto & b : out_pool) if (b.use_count() == 1) return true;
+          return false;
+        });
+      } else {
+        std::this_thread::yield();  // no throttle → fall back to yield
+      }
     }
   };
   while (true) {
@@ -4199,10 +4246,19 @@ static void cpu_decomp_worker(
       for (auto & b : decomp_pool) {
         if (b.use_count() == 1) return b;  // only ref is ours; safe to reuse
       }
-      // All slots in flight — writer hasn't drained any yet.  Yield
-      // briefly rather than allocate a fresh buffer (page-fault storm).
+      // All slots in flight — writer hasn't drained any yet.  Wait on
+      // the writer's drain signal (see FrameThrottle::wait_for_drain),
+      // not sched_yield — yielding 96 workers in lockstep burned ~50s
+      // of sys time on the v0.13.9 knuth decompress runs.
       ++pool_wait_count;
-      std::this_thread::yield();
+      if (bp) {
+        bp->wait_for_drain([&]{
+          for (auto & b : decomp_pool) if (b.use_count() == 1) return true;
+          return false;
+        });
+      } else {
+        std::this_thread::yield();  // no throttle → fall back to yield
+      }
     }
   };
 

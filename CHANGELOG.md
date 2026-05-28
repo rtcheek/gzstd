@@ -1,9 +1,46 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.9  
+**Covers:** v0.9.50 → v0.13.10  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.10 — Condition-variable wait for the bounded pool
+
+v0.13.9's bounded pool architecture is correct, but its acquire-when-
+full path used `std::this_thread::yield()` to wait — which is a
+`sched_yield` syscall on Linux.  With 96 workers each yielding hundreds
+of thousands of times per run, sys time on cpu-only decompress mixed
+jumped from 11.87s (v0.13.8) to 51.41s (v0.13.9): same throughput, 4×
+more kernel cycles burned in `sched_yield`.
+
+**Fix.**  Wait on a condition variable instead.  Added `drain_cv_` +
+`drain_m_` to `FrameThrottle` with two methods:
+
+- `notify_drain()` — called by `AsyncWritePool::worker_fn` after each
+  `buf.reset()` (the moment a frame's `shared_ptr` ref drops from 2 to
+  1, freeing a worker pool slot).  `notify_all()` because the writer
+  doesn't know which worker owns the freed slot.
+- `wait_for_drain(predicate)` — workers call this when their pool is
+  full.  Standard CV `wait_for` with predicate, 10ms timeout as a
+  safety net for any missed notify.
+
+Both `cpu_worker` and `cpu_decomp_worker` now use `wait_for_drain`
+instead of `yield`.  Predicate scans the per-worker pool for a slot
+with `use_count() == 1`.
+
+**Why a separate CV from the existing permit-acquire CV (`cv_`):**
+sharing would force pool-waiters and permit-waiters onto the same
+mutex, blocking `release()` while broadcasting.  `drain_m_` is
+dedicated and never held by `release()`, so permit-acquire stays fast.
+
+**Notify granularity.**  Per-frame `notify_all`, not per-batch.
+Trades more wakeups for lower latency: workers wake immediately when
+their slot frees rather than waiting for the writer's whole batch.
+Wake cost is bounded — only workers currently in `wait_for_drain` are
+woken, and the predicate check is a few atomic loads.
 
 ---
 
