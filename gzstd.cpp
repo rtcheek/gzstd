@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.8";
+static constexpr const char * GZSTD_VERSION = "0.13.9";
 //
 // Architecture overview:
 //
@@ -3846,6 +3846,30 @@ static void cpu_worker(
   // of CPU cycles inside the kernel's page-fault handler.  See v0.13.7
   // CHANGELOG for the perf-record evidence.
   std::vector<char> scratch;
+
+  // Per-thread bounded output-frame pool.  Same backpressure design as
+  // cpu_decomp_worker (see comment there) — pool size derived from the
+  // throttle so it auto-adapts; never grows; worker yields when full.
+  // The compress path's per-push allocation is csz bytes (compressed
+  // output size).  For compressible data csz is tiny and this fix is
+  // ~free; for poorly compressible data csz ≈ src_size and the pool
+  // prevents the same mmap_lock storm we fixed for decompress.
+  const int n_workers = std::max(1, cpuagg ? cpuagg->threads : 1);
+  const int throttle_budget = bp ? bp->max_permits() : 512;
+  const int pool_size = std::max(2, throttle_budget / n_workers);
+  std::vector<FrameBuf> out_pool(pool_size);
+  for (auto & b : out_pool) b = std::make_shared<std::vector<char>>();
+  uint64_t pool_wait_count = 0;
+
+  auto acquire_out_buf = [&]() -> FrameBuf {
+    while (true) {
+      for (auto & b : out_pool) {
+        if (b.use_count() == 1) return b;
+      }
+      ++pool_wait_count;
+      std::this_thread::yield();
+    }
+  };
   while (true) {
     Task t;
     bool got_task = false;
@@ -3985,13 +4009,12 @@ static void cpu_worker(
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
 
-    // Copy compressed bytes into a sized vector for the result store.
-    // The copy allocates only csz bytes (not the upper compressBound), so
-    // for highly compressible data this is nearly free; for low-ratio data
-    // it's still a memcpy of compressed-size bytes (the actual output we
-    // would have written anyway).  scratch keeps its capacity for reuse.
-    auto out_frame = std::make_shared<std::vector<char>>(
-        scratch.data(), scratch.data() + csz);
+    // Copy compressed bytes into a pooled buffer for the result store.
+    // The pool entry's resize() reuses resident pages from previous
+    // iterations — only first use of each slot page-faults.
+    auto out_frame = acquire_out_buf();
+    out_frame->resize(csz);
+    std::memcpy(out_frame->data(), scratch.data(), csz);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(in_size);
@@ -4036,7 +4059,8 @@ static void cpu_worker(
       os << "[CPU/T" << worker_id << "] total tasks=" << st.tasks
          << " in=" << in_s << " out=" << out_s
          << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
-         << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
+         << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s"
+         << " pool=" << pool_size << " waits=" << pool_wait_count;
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
   }
@@ -4143,18 +4167,43 @@ static void cpu_decomp_worker(
     apply_mem_limit_to_dctx(tl_dctx, *opt);
   }
 
-  // Per-thread decompress-buffer pool.  Eliminates the per-iteration alloc
-  // + memset that triggers mmap_lock contention at high thread counts.
-  // Each slot is a shared_ptr; we reuse a slot when use_count() == 1
-  // (writer has dropped its ref).  Pool grows on demand; in steady state
-  // it stabilises at ~max-in-flight-per-worker (bounded by FrameThrottle).
-  std::vector<FrameBuf> decomp_pool;
+  // Per-thread decompress-buffer pool.  BOUNDED size; never grows past
+  // pool_size.  When all slots are in flight (use_count > 1 — writer
+  // still holds a ref), the worker yields until a slot becomes free.
+  //
+  // Pool size derived from the throttle budget so it auto-adapts to
+  // --throttle-frames: pool_size = max(2, throttle_budget / N_workers).
+  // The min of 2 guarantees pipelining (one frame in flight + one being
+  // worked on); above that, the throttle's global cap is divided across
+  // workers.  When writer is fast (frames drain quickly) the worker
+  // never blocks; when writer is slow, the worker waits at acquire()
+  // instead of allocating a fresh 16-64 MiB buffer.  This routes the
+  // existing backpressure (FrameThrottle → writer-bound) into per-worker
+  // backpressure without growing memory or storming mmap_lock.
+  //
+  // Discovered in v0.13.9 via perf record on cpu-only decompress:
+  // unbounded pool grew to ~5 slots per worker on 96-worker decompress
+  // because the writer (single-threaded, ~5 GiB/s on sparse zeros) could
+  // never drain fast enough.  Each new slot was a fresh 64 MiB alloc;
+  // 96 workers × ~5 fresh allocs × 4 KiB pages = ~2.3M page faults,
+  // serialized on the per-process mmap_lock.
+  const int n_workers = std::max(1, cpuagg ? cpuagg->threads : 1);
+  const int throttle_budget = bp ? bp->max_permits() : 512;
+  const int pool_size = std::max(2, throttle_budget / n_workers);
+  std::vector<FrameBuf> decomp_pool(pool_size);
+  for (auto & b : decomp_pool) b = std::make_shared<std::vector<char>>();
+  uint64_t pool_wait_count = 0;  // telemetry — # of yields at -vv
+
   auto acquire_decomp_buf = [&]() -> FrameBuf {
-    for (auto & b : decomp_pool) {
-      if (b.use_count() == 1) return b;  // only ref is ours; safe to reuse
+    while (true) {
+      for (auto & b : decomp_pool) {
+        if (b.use_count() == 1) return b;  // only ref is ours; safe to reuse
+      }
+      // All slots in flight — writer hasn't drained any yet.  Yield
+      // briefly rather than allocate a fresh buffer (page-fault storm).
+      ++pool_wait_count;
+      std::this_thread::yield();
     }
-    decomp_pool.push_back(std::make_shared<std::vector<char>>());
-    return decomp_pool.back();
   };
 
   while (true) {
@@ -4396,7 +4445,8 @@ static void cpu_decomp_worker(
       os << "[CPU/T" << worker_id << "] total tasks=" << st.tasks
          << " comp=" << in_s << " decomp=" << out_s
          << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
-         << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
+         << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s"
+         << " pool=" << pool_size << " waits=" << pool_wait_count;
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
   }

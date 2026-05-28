@@ -1,9 +1,92 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.8  
+**Covers:** v0.9.50 → v0.13.9  
 **Test machines:**
 - **Knuth:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Lovelace:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.9 — Bounded per-worker buffer pool: route page-faults through backpressure
+
+v0.13.8 introduced a per-worker output-buffer pool to eliminate the
+per-iteration allocation storm.  Profiling on a 256-core / 8-GPU
+system showed it didn't actually fix decompress at high thread counts
+— the pool was UNBOUNDED and grew faster than the writer could drain.
+This release makes the pool bounded so it participates in the existing
+backpressure chain instead of bypassing it.
+
+**The diagnosis (perf record, cpu-only decompress, zeros.bin):**
+
+| Metric (T96 vs T16) | T96 | T16 |
+|---|---|---|
+| Wall time | 4.14s | 3.27s |
+| Sys time | 29.2s | 3.11s |
+| Sys/real ratio | **9.4×** | 1.0× |
+| Page faults | 2.35M | 510k |
+| IPC | 0.29 | 1.00 |
+
+Hot path at T96: 82% of cycles in `std::vector::resize` → memset →
+`asm_exc_page_fault` → `down_read_trylock` (the per-process mmap_lock
+rwsem).  Same shape as the v0.13.7 compress diagnosis.
+
+Hot path at T16: 68% in `AsyncWritePool::write_sparse` → `fseek` →
+`lseek` syscall.  Writer was the bottleneck; 16 workers were enough.
+
+**Root cause: the v0.13.8 pool bypassed the throttle's backpressure.**
+The FrameThrottle bounds total in-flight frames (default 512).  With
+96 workers, that's ~5 frames/worker on average.  But v0.13.8's
+`acquire_decomp_buf()` grew the pool whenever `use_count() > 1` on all
+existing slots — and since the writer was the bottleneck (~5 GiB/s
+ceiling on sparse zeros), slots stayed in flight long enough that
+workers grew their pools to 5+ entries.  Each new entry was a fresh
+~64 MiB allocation → page-fault storm.
+
+**Fix: pool is now bounded at startup and yields on full.**
+
+```cpp
+const int pool_size = std::max(2, throttle_budget / N_workers);
+std::vector<FrameBuf> pool(pool_size);
+for (auto & b : pool) b = std::make_shared<std::vector<char>>();
+
+auto acquire = [&]() -> FrameBuf {
+  while (true) {
+    for (auto & b : pool) if (b.use_count() == 1) return b;
+    std::this_thread::yield();  // backpressure: wait for writer
+  }
+};
+```
+
+The min-of-2 guarantees pipelining (one frame in flight + one being
+worked on).  Above that, the throttle's global cap is divided across
+workers.  This makes the chain work end-to-end:
+
+```
+writer slow → result store fills → pool slots stay in-flight
+            → pool acquire yields → worker waits → no new alloc
+            → frame production rate = writer drain rate
+
+writer fast → result store drains → slots free fast
+            → acquire returns immediately → worker proceeds full speed
+            → throttle is the only cap (intended design)
+```
+
+**No thread-count cap.**  An arbitrary "decompress shouldn't exceed N
+workers" rule was considered and rejected — it sidesteps the
+architectural issue without fixing it, and gets the wrong answer on
+hardware we haven't measured.  The bounded pool + existing throttle
+lets workers scale to actual hardware while routing back-pressure
+correctly.
+
+**Applied to both `cpu_worker` (compress) and `cpu_decomp_worker`.**
+GPU `h_out` allocations not changed — no evidence they're hitting the
+same issue at current concurrency, but the pattern would transfer if
+needed.
+
+**Telemetry at -vv.**  Per-worker summary now includes `pool=N waits=K`
+showing pool size and yield count.  Non-zero waits indicate the worker
+was blocked waiting for the writer — useful for confirming the
+backpressure is actually engaging.
 
 ---
 
