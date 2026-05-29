@@ -452,10 +452,13 @@ append_result() {
 #---------------------------------------------------------------------
 run_timed() {
   local start end elapsed rc
+  # NOTE: we deliberately do NOT write to /proc/sys/vm/drop_caches here.
+  # That's a system-wide cache + dentry + inode eviction; under sudo it
+  # would clobber whatever else is running on the host just to set up our
+  # benchmark.  Cold-cache reads are handled per-invocation by gzstd's
+  # --cold flag (posix_fadvise(POSIX_FADV_DONTNEED) on the input fd),
+  # which is unprivileged and scoped to the file we're about to read.
   sync 2>/dev/null || true
-  if [[ -w /proc/sys/vm/drop_caches ]]; then
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-  fi
 
   start=$(date +%s.%N)
   "$@" --progress 2>"$TMPDIR/last_stderr.log" &
@@ -687,9 +690,14 @@ for config_str in "${CONFIGS[@]}"; do
       # real-world usage.  Removing it forces the "new file" fast path,
       # underreporting wall time by ~2× due to skipped writeback
       # contention.  The sync in run_timed flushes prior dirty pages.
+      # --cold drops the input from the page cache via posix_fadvise so
+      # iterations 2-3 don't measure memory-to-memory throughput (the
+      # drop_caches in run_timed is best-effort and root-only; --cold is
+      # universal).  Without it the benchmark medians reflect cached reads,
+      # not the cold-disk performance a typical user sees.
       # shellcheck disable=SC2086
       elapsed=$(run_timed \
-        "$GZSTD" $comp_flags -f --output="$comp_out" "$test_file")
+        "$GZSTD" --cold $comp_flags -f --output="$comp_out" "$test_file")
       times_c+=("$elapsed")
     done
 
@@ -734,9 +742,10 @@ for config_str in "${CONFIGS[@]}"; do
         if [[ -n "$decomp_flags" ]]; then
           local_flags="$decomp_flags -d"
         fi
+        # --cold: see compress block above for rationale.
         # shellcheck disable=SC2086
         elapsed=$(run_timed \
-          "$GZSTD" $local_flags -f \
+          "$GZSTD" --cold $local_flags -f \
           --output="$decomp_out" "$comp_out")
         times_d+=("$elapsed")
       done

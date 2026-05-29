@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.20";
+static constexpr const char * GZSTD_VERSION = "0.13.21";
 //
 // Architecture overview:
 //
@@ -272,6 +272,7 @@ struct Options {
   bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
   bool mmap_user_set = false;     // true if --mmap/--no-mmap was given (suppresses kernel-based auto-fallback)
+  bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
@@ -616,6 +617,8 @@ static void print_help()
 "                      (default: on; --no-preallocate skips fallocate)\n"
 "  --direct            O_DIRECT output (bypass page cache)\n"
 "  --sync-output       fsync output before exit\n"
+"  --cold              drop input from page cache before reading\n"
+"                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
@@ -8745,6 +8748,17 @@ int main(int argc, char ** argv)
   }
 
   FILE * in = open_input(opt.input);
+#ifndef _WIN32
+  // --cold (benchmarking only): drop the input file from the kernel's page
+  // cache before reading so repeated benchmark iterations don't measure
+  // memory-to-memory throughput.  POSIX_FADV_DONTNEED on a clean read-only
+  // file evicts its pages from the page cache immediately; the next read
+  // therefore goes to disk.
+  if (opt.cold_read && opt.input != "-" && in != stdin) {
+    int fd = fileno(in);
+    if (fd >= 0) (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+  }
+#endif
   bool to_stdout = (opt.to_stdout || (!opt.output.empty() && opt.output == "stdout"));
 
   // When writing to stdout, force keep (can't delete stdin) and set binary mode
@@ -9405,6 +9419,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--no-direct") opt.direct_io = false;
     else if (a == "--mmap" || a == "--mmap=on")  { opt.use_mmap = true;  opt.mmap_user_set = true; }
     else if (a == "--no-mmap" || a == "--mmap=off") { opt.use_mmap = false; opt.mmap_user_set = true; }
+    else if (a == "--cold") opt.cold_read = true;
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
