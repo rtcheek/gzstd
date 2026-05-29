@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.17";
+static constexpr const char * GZSTD_VERSION = "0.13.18";
 //
 // Architecture overview:
 //
@@ -1478,6 +1478,25 @@ static size_t robust_fwrite(const void * ptr, size_t size, FILE * f)
  MADV_SEQUENTIAL tells the kernel to read ahead aggressively.
 ======================================================================*/
 #ifndef _WIN32
+// DIAGNOSTIC (v0.13.17 investigation): which madvise hint to apply to the
+// input mapping.  GZSTD_MMAP_ADVISE = sequential (default) | normal | willneed
+// | none.  Hypothesis under test: MADV_SEQUENTIAL ("pages may be freed soon
+// after they are accessed") reclaims pages the prefault just populated, so
+// workers re-fault them — defeating MADV_POPULATE_READ.  Read once.
+static int mmap_advise_mode()
+{
+  static int mode = []{
+    const char * e = std::getenv("GZSTD_MMAP_ADVISE");
+    if (!e || !*e) return MADV_SEQUENTIAL;     // default = current behavior
+    std::string s(e);
+    if (s == "normal")   return MADV_NORMAL;
+    if (s == "willneed") return MADV_WILLNEED;
+    if (s == "none")     return -1;            // skip madvise entirely
+    return MADV_SEQUENTIAL;
+  }();
+  return mode;
+}
+
 class MmapRegion {
 public:
   MmapRegion() = default;
@@ -1495,7 +1514,8 @@ public:
     ptr_ = (const char *)::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
     ::close(fd);
     if (ptr_ == MAP_FAILED) { ptr_ = nullptr; size_ = 0; return false; }
-    ::madvise((void *)ptr_, size_, MADV_SEQUENTIAL);
+    int adv = mmap_advise_mode();
+    if (adv >= 0) ::madvise((void *)ptr_, size_, adv);
     return true;
   }
 
@@ -1532,11 +1552,23 @@ private:
 // unpopulated page.  `consumed` (m->read_bytes, bumped by workers per chunk)
 // paces the producer to stay at most ~1 GiB ahead, so the whole file is never
 // read up front.  No-op on builds/kernels without MADV_POPULATE_READ.
+// DIAGNOSTIC (v0.13.17 investigation): GZSTD_MMAP_PREFAULT=0 disables the
+// producer-side MADV_POPULATE_READ so we can A/B it against advise modes.
+static inline bool mmap_prefault_enabled()
+{
+  static bool on = []{
+    const char * e = std::getenv("GZSTD_MMAP_PREFAULT");
+    return !(e && e[0] == '0');   // default on; "0" disables
+  }();
+  return on;
+}
+
 static inline void mmap_prefault(const char * base, size_t off, size_t n,
                                  const std::atomic<uint64_t> * consumed,
                                  const std::atomic<bool> * abort = nullptr)
 {
 #ifdef MADV_POPULATE_READ
+  if (!mmap_prefault_enabled()) return;
   if (consumed) {
     constexpr uint64_t AHEAD = uint64_t(1024) * ONE_MIB;  // stay <= ~1 GiB ahead
     while ((uint64_t)off > consumed->load(std::memory_order_relaxed) + AHEAD) {
@@ -1544,7 +1576,13 @@ static inline void mmap_prefault(const char * base, size_t off, size_t n,
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
-  ::madvise((void *)(base + off), n, MADV_POPULATE_READ);  // EINVAL on <5.14 → ignored
+  if (::madvise((void *)(base + off), n, MADV_POPULATE_READ) != 0) {
+    // One-time diagnostic: confirms whether POPULATE_READ is even accepted by
+    // the running kernel (EINVAL on <5.14 → silently fell back before).
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+      std::fprintf(stderr, "[MMAP] MADV_POPULATE_READ failed: %s\n", std::strerror(errno));
+  }
 #else
   (void)base; (void)off; (void)n; (void)consumed; (void)abort;
 #endif
