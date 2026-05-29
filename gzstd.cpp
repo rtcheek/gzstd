@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.18";
+static constexpr const char * GZSTD_VERSION = "0.13.20";
 //
 // Architecture overview:
 //
@@ -75,6 +75,7 @@ static constexpr const char * GZSTD_VERSION = "0.13.18";
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/utsname.h>   // uname() for kernel per-VMA-lock detection
 #ifdef _WIN32
  #include <io.h>
 #endif
@@ -270,6 +271,7 @@ struct Options {
   bool sync_output = false;       // --sync-output: fsync before closing output file
   bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
+  bool mmap_user_set = false;     // true if --mmap/--no-mmap was given (suppresses kernel-based auto-fallback)
   bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
@@ -1478,25 +1480,6 @@ static size_t robust_fwrite(const void * ptr, size_t size, FILE * f)
  MADV_SEQUENTIAL tells the kernel to read ahead aggressively.
 ======================================================================*/
 #ifndef _WIN32
-// DIAGNOSTIC (v0.13.17 investigation): which madvise hint to apply to the
-// input mapping.  GZSTD_MMAP_ADVISE = sequential (default) | normal | willneed
-// | none.  Hypothesis under test: MADV_SEQUENTIAL ("pages may be freed soon
-// after they are accessed") reclaims pages the prefault just populated, so
-// workers re-fault them — defeating MADV_POPULATE_READ.  Read once.
-static int mmap_advise_mode()
-{
-  static int mode = []{
-    const char * e = std::getenv("GZSTD_MMAP_ADVISE");
-    if (!e || !*e) return MADV_SEQUENTIAL;     // default = current behavior
-    std::string s(e);
-    if (s == "normal")   return MADV_NORMAL;
-    if (s == "willneed") return MADV_WILLNEED;
-    if (s == "none")     return -1;            // skip madvise entirely
-    return MADV_SEQUENTIAL;
-  }();
-  return mode;
-}
-
 class MmapRegion {
 public:
   MmapRegion() = default;
@@ -1514,8 +1497,7 @@ public:
     ptr_ = (const char *)::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
     ::close(fd);
     if (ptr_ == MAP_FAILED) { ptr_ = nullptr; size_ = 0; return false; }
-    int adv = mmap_advise_mode();
-    if (adv >= 0) ::madvise((void *)ptr_, size_, adv);
+    ::madvise((void *)ptr_, size_, MADV_SEQUENTIAL);
     return true;
   }
 
@@ -1532,60 +1514,35 @@ private:
   size_t       size_ = 0;
 };
 
-// MADV_POPULATE_READ (Linux 5.14+) may be missing from older build headers
-// (e.g. the ubuntu-20.04 portable-build container, glibc 2.31).  Define the
-// stable UAPI value so the binary can still use it at runtime on a 5.14+
-// kernel; on older kernels madvise() returns EINVAL and we silently fall back
-// to lazy per-access faulting.
-#if defined(__linux__) && !defined(MADV_POPULATE_READ)
-#define MADV_POPULATE_READ 22
-#endif
-
-// Pre-fault [off, off+n) of an mmap'd input on the single producer thread,
-// in bulk, BEFORE its task is handed to the workers.  Otherwise every worker
-// faults its own pages on first touch; with hundreds of workers hammering one
-// mapping that storms the kernel's mmap_lock + per-page fault path and burns
-// enormous system time (observed ~4x sys and ~15% slower wall on a 256-core
-// box vs. --no-mmap).  Doing the faulting once, in bulk, on the producer keeps
-// zero-copy reads and read/compress overlap while eliminating the storm:
-// because population happens before the push, a worker can never touch an
-// unpopulated page.  `consumed` (m->read_bytes, bumped by workers per chunk)
-// paces the producer to stay at most ~1 GiB ahead, so the whole file is never
-// read up front.  No-op on builds/kernels without MADV_POPULATE_READ.
-// DIAGNOSTIC (v0.13.17 investigation): GZSTD_MMAP_PREFAULT=0 disables the
-// producer-side MADV_POPULATE_READ so we can A/B it against advise modes.
-static inline bool mmap_prefault_enabled()
+// Linux 6.4 added per-VMA locks: page faults take a fine-grained per-VMA lock
+// via RCU instead of the global mm->mmap_lock.  Without them, every page fault
+// contends on the one mm->mmap_lock rwsem counter, and many cores hammering
+// that cacheline dominates system time — so for mmap'd compress input, fread
+// beats mmap at *every* thread count on a pre-6.4 kernel (a binary sweep on
+// 5.15 found fread faster from T=2 up to 256: 7.4 vs 7.8s at T=2, 7.8 vs 11s
+// at 256). On 6.4+ mmap wins. So this is a clean per-kernel switch, not a
+// thread-count threshold.
+// Returns true when the running kernel has per-VMA locks (>= 6.4).  Rule of
+// thumb only: a distro may backport them onto a <6.4 version string (e.g. RHEL
+// on 5.14.x-*.el9) — such a box gets a false negative and uses fread (harmless;
+// roughly ties) unless the user forces --mmap.  Non-Linux: assume no
+// global-lock storm and keep mmap.  Parsed from uname once and cached.
+static bool kernel_has_per_vma_locks()
 {
-  static bool on = []{
-    const char * e = std::getenv("GZSTD_MMAP_PREFAULT");
-    return !(e && e[0] == '0');   // default on; "0" disables
-  }();
-  return on;
-}
-
-static inline void mmap_prefault(const char * base, size_t off, size_t n,
-                                 const std::atomic<uint64_t> * consumed,
-                                 const std::atomic<bool> * abort = nullptr)
-{
-#ifdef MADV_POPULATE_READ
-  if (!mmap_prefault_enabled()) return;
-  if (consumed) {
-    constexpr uint64_t AHEAD = uint64_t(1024) * ONE_MIB;  // stay <= ~1 GiB ahead
-    while ((uint64_t)off > consumed->load(std::memory_order_relaxed) + AHEAD) {
-      if (abort && abort->load(std::memory_order_acquire)) return;
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-  if (::madvise((void *)(base + off), n, MADV_POPULATE_READ) != 0) {
-    // One-time diagnostic: confirms whether POPULATE_READ is even accepted by
-    // the running kernel (EINVAL on <5.14 → silently fell back before).
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true))
-      std::fprintf(stderr, "[MMAP] MADV_POPULATE_READ failed: %s\n", std::strerror(errno));
+  static int cached = -1;
+  if (cached >= 0) return cached != 0;
+#if defined(__linux__)
+  cached = 0;
+  struct utsname u;
+  if (::uname(&u) == 0) {
+    int major = 0, minor = 0;
+    if (std::sscanf(u.release, "%d.%d", &major, &minor) == 2)
+      cached = (major > 6 || (major == 6 && minor >= 4)) ? 1 : 0;
   }
 #else
-  (void)base; (void)off; (void)n; (void)consumed; (void)abort;
+  cached = 1;
 #endif
+  return cached != 0;
 }
 
 #endif // !_WIN32
@@ -5258,9 +5215,6 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     uint64_t mmap_rd_t0 = g_perf ? now_ns() : 0;
     while (off < file_size) {
       size_t n = std::min(host_chunk, file_size - off);
-      // Bulk pre-fault on the producer so workers read resident pages instead
-      // of storming the fault path (see mmap_prefault).
-      mmap_prefault(base, off, n, m ? &m->read_bytes : nullptr);
       Task t;
       t.seq = seq.fetch_add(1, std::memory_order_relaxed);
       t.view_ptr = base + off;
@@ -7134,10 +7088,6 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
         break;
       size_t n_host = std::min(host_chunk, file_size - off);
-      // Bulk pre-fault the whole host chunk on the producer before handing its
-      // sub-chunks to CPU/GPU workers, so they read resident pages instead of
-      // storming the fault path (see mmap_prefault).
-      mmap_prefault(base, off, n_host, m ? &m->read_bytes : nullptr, &abort_on_failure);
       size_t sub_off = 0;
       while (sub_off < n_host) {
         size_t sub_n = std::min(gpu_chunk, n_host - sub_off);
@@ -9331,6 +9281,26 @@ static int detect_min_pcie_gen()
 ======================================================================*/
 static void apply_backend_defaults(Options & opt)
 {
+#ifndef _WIN32
+  // Input reader: mmap vs fread.  On kernels WITHOUT per-VMA locks (<6.4), the
+  // compression workers' page faults contend on the global mm->mmap_lock and
+  // fread is faster at every thread count (measured — see
+  // kernel_has_per_vma_locks).  So fall back to fread on pre-6.4 kernels and
+  // keep mmap (the faster path) on 6.4+.  Skipped if the user pinned
+  // --mmap/--no-mmap, for gpu-only (only a handful of H2D faulters, not the
+  // worker storm), and for decompress (which never uses the mmap reader).
+  if (opt.mode == Mode::COMPRESS && opt.use_mmap && !opt.mmap_user_set
+      && !opt.gpu_only && !kernel_has_per_vma_locks()) {
+    opt.use_mmap = false;
+    if (opt.verbosity >= V_VERBOSE) {
+      struct utsname u;
+      std::string rel = (::uname(&u) == 0) ? u.release : "?";
+      vlog(V_VERBOSE, opt,
+           "[MMAP] kernel " + rel + " lacks per-VMA locks (<6.4); using fread to "
+           "avoid mmap_lock fault contention (force with --mmap)\n");
+    }
+  }
+#endif
 #ifdef HAVE_NVCOMP
   // Promote tuning flags to implicit --hybrid: if the user passed any
   // GPU- or hybrid-only knob (--gpu-batch, --cpu-share, --hybrid-floor, etc.)
@@ -9433,8 +9403,8 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--sync-output") opt.sync_output = true;
     else if (a == "--direct") opt.direct_io = true;
     else if (a == "--no-direct") opt.direct_io = false;
-    else if (a == "--mmap" || a == "--mmap=on")  opt.use_mmap = true;
-    else if (a == "--no-mmap" || a == "--mmap=off") opt.use_mmap = false;
+    else if (a == "--mmap" || a == "--mmap=on")  { opt.use_mmap = true;  opt.mmap_user_set = true; }
+    else if (a == "--no-mmap" || a == "--mmap=off") { opt.use_mmap = false; opt.mmap_user_set = true; }
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;

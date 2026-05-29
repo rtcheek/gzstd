@@ -1,13 +1,55 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.17  
+**Covers:** v0.9.50 → v0.13.20  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+## v0.13.20 — Kernel-gated mmap/fread for compress (fixes the high-core mmap storm)
+
+Resolve the high-core mmap compress slowdown for real, and **revert the failed
+v0.13.17 prefault** (which made it worse). The root cause turned out to be the
+kernel, not gzstd.
+
+**Investigation.** On a 256-core box, mmap compress burned ~94s system time
+(28% of perf samples in `down_read_trylock`) vs ~16s for `--no-mmap`. A toggle
+matrix (v0.13.18, `GZSTD_MMAP_ADVISE` × `GZSTD_MMAP_PREFAULT`) showed the
+v0.13.17 producer-side `MADV_POPULATE_READ` prefault made it *worse* in every
+advise mode (~88-90s sys regardless), because the populated pages were reclaimed
+before the workers reached them (minflt barely changed) — pure added faulting
+work, not a fix. A binary-search sweep then showed `fread` beats mmap at *every*
+thread count on that box (7.4 vs 7.8s at T=2, up to 7.8 vs 11s at T=256) — so
+there's no thread-count crossover at all.
+
+**Root cause.** Pre-6.4 kernels have no per-VMA locks, so every page fault takes
+the single global `mm->mmap_lock` rwsem; many cores doing atomic ops on that one
+counter cacheline dominates system time. Linux **6.4** (per-VMA locks, faults via
+RCU + a fine-grained per-VMA lock) removes it. The slow box was on 5.15; the
+workstation is already on a 6.x kernel, which is why mmap was always fine there.
+
+**Fix.** `apply_backend_defaults` now checks the kernel (`uname`, parsed once):
+on **< 6.4**, compress falls back to `fread`; on **6.4+**, it keeps mmap (the
+faster path). Skipped for `--mmap`/`--no-mmap` (explicit override via a new
+`mmap_user_set` flag), for `--gpu-only` (only a few H2D faulters, not the worker
+storm), and for decompress (never used the mmap reader). It's a clean per-kernel
+switch — no thread-count threshold, since fread wins at all thread counts on
+pre-6.4. Distro backports (e.g. RHEL per-VMA locks on a `5.14.x-*.el9` string)
+get a harmless false negative (fread ≈ mmap there); `--mmap` overrides.
+
+Removed: the v0.13.17 `mmap_prefault` and the v0.13.18 `GZSTD_MMAP_*` diagnostic
+toggles. `MmapRegion` is back to plain `MADV_SEQUENTIAL`. The slow box upgrades
+to a 6.x kernel later this year, after which mmap will be the default there too.
+
+---
+
 ## v0.13.17 — Pre-fault mmap input on the producer (kill the fault storm)
+
+> **Reverted in v0.13.20 — this did NOT work.** The producer-side
+> `MADV_POPULATE_READ` populated pages that were reclaimed before the workers
+> used them, so it *added* system time instead of removing the storm. The real
+> cause was a pre-6.4-kernel `mmap_lock` limitation; see v0.13.20.
 
 Fix mmap compression being *slower* than `--no-mmap` on high-core machines,
 despite being the "zero-copy" default.
