@@ -68,6 +68,7 @@ SWEEP_ULTRA=false
 SWEEP_THROTTLE=false
 SWEEP_MATRIX=false
 DO_DECOMPRESS=true
+DIRECT=false   # --direct: pass --direct (O_DIRECT output) to every gzstd run
 
 #---------------------------------------------------------------------
 # Parse arguments
@@ -80,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --iterations)  ITERATIONS="$2"; shift 2 ;;
     --files)       FILE_PATTERN="$2"; shift 2 ;;
     --quick)       QUICK=true; ITERATIONS=1; shift ;;
+    --direct)      DIRECT=true; shift ;;
     --gpu-only)    GPU_ONLY=true; shift ;;
     --cpu-only)    CPU_ONLY=true; shift ;;
     --hybrid-only) HYBRID_ONLY=true; shift ;;
@@ -691,13 +693,14 @@ for config_str in "${CONFIGS[@]}"; do
       # underreporting wall time by ~2× due to skipped writeback
       # contention.  The sync in run_timed flushes prior dirty pages.
       # --cold drops the input from the page cache via posix_fadvise so
-      # iterations 2-3 don't measure memory-to-memory throughput (the
-      # drop_caches in run_timed is best-effort and root-only; --cold is
-      # universal).  Without it the benchmark medians reflect cached reads,
-      # not the cold-disk performance a typical user sees.
+      # iterations 2-3 don't measure memory-to-memory throughput.  Without
+      # it the benchmark medians reflect cached reads, not the cold-disk
+      # performance a typical user sees.  $direct_flag adds --direct
+      # (O_DIRECT output) when the script is invoked with --direct.
+      direct_flag=""; $DIRECT && direct_flag="--direct"
       # shellcheck disable=SC2086
       elapsed=$(run_timed \
-        "$GZSTD" --cold $comp_flags -f --output="$comp_out" "$test_file")
+        "$GZSTD" --cold $direct_flag $comp_flags -f --output="$comp_out" "$test_file")
       times_c+=("$elapsed")
     done
 
@@ -742,10 +745,11 @@ for config_str in "${CONFIGS[@]}"; do
         if [[ -n "$decomp_flags" ]]; then
           local_flags="$decomp_flags -d"
         fi
-        # --cold: see compress block above for rationale.
+        # --cold and $direct_flag: see compress block above for rationale.
+        direct_flag=""; $DIRECT && direct_flag="--direct"
         # shellcheck disable=SC2086
         elapsed=$(run_timed \
-          "$GZSTD" --cold $local_flags -f \
+          "$GZSTD" --cold $direct_flag $local_flags -f \
           --output="$decomp_out" "$comp_out")
         times_d+=("$elapsed")
       done
