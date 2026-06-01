@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.21";
+static constexpr const char * GZSTD_VERSION = "0.13.22";
 //
 // Architecture overview:
 //
@@ -75,7 +75,6 @@ static constexpr const char * GZSTD_VERSION = "0.13.21";
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/utsname.h>   // uname() for kernel per-VMA-lock detection
 #ifdef _WIN32
  #include <io.h>
 #endif
@@ -271,7 +270,6 @@ struct Options {
   bool sync_output = false;       // --sync-output: fsync before closing output file
   bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
-  bool mmap_user_set = false;     // true if --mmap/--no-mmap was given (suppresses kernel-based auto-fallback)
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
   std::string input;              // current file being processed
@@ -1516,37 +1514,6 @@ private:
   const char * ptr_ = nullptr;
   size_t       size_ = 0;
 };
-
-// Linux 6.4 added per-VMA locks: page faults take a fine-grained per-VMA lock
-// via RCU instead of the global mm->mmap_lock.  Without them, every page fault
-// contends on the one mm->mmap_lock rwsem counter, and many cores hammering
-// that cacheline dominates system time — so for mmap'd compress input, fread
-// beats mmap at *every* thread count on a pre-6.4 kernel (a binary sweep on
-// 5.15 found fread faster from T=2 up to 256: 7.4 vs 7.8s at T=2, 7.8 vs 11s
-// at 256). On 6.4+ mmap wins. So this is a clean per-kernel switch, not a
-// thread-count threshold.
-// Returns true when the running kernel has per-VMA locks (>= 6.4).  Rule of
-// thumb only: a distro may backport them onto a <6.4 version string (e.g. RHEL
-// on 5.14.x-*.el9) — such a box gets a false negative and uses fread (harmless;
-// roughly ties) unless the user forces --mmap.  Non-Linux: assume no
-// global-lock storm and keep mmap.  Parsed from uname once and cached.
-static bool kernel_has_per_vma_locks()
-{
-  static int cached = -1;
-  if (cached >= 0) return cached != 0;
-#if defined(__linux__)
-  cached = 0;
-  struct utsname u;
-  if (::uname(&u) == 0) {
-    int major = 0, minor = 0;
-    if (std::sscanf(u.release, "%d.%d", &major, &minor) == 2)
-      cached = (major > 6 || (major == 6 && minor >= 4)) ? 1 : 0;
-  }
-#else
-  cached = 1;
-#endif
-  return cached != 0;
-}
 
 #endif // !_WIN32
 
@@ -9295,26 +9262,6 @@ static int detect_min_pcie_gen()
 ======================================================================*/
 static void apply_backend_defaults(Options & opt)
 {
-#ifndef _WIN32
-  // Input reader: mmap vs fread.  On kernels WITHOUT per-VMA locks (<6.4), the
-  // compression workers' page faults contend on the global mm->mmap_lock and
-  // fread is faster at every thread count (measured — see
-  // kernel_has_per_vma_locks).  So fall back to fread on pre-6.4 kernels and
-  // keep mmap (the faster path) on 6.4+.  Skipped if the user pinned
-  // --mmap/--no-mmap, for gpu-only (only a handful of H2D faulters, not the
-  // worker storm), and for decompress (which never uses the mmap reader).
-  if (opt.mode == Mode::COMPRESS && opt.use_mmap && !opt.mmap_user_set
-      && !opt.gpu_only && !kernel_has_per_vma_locks()) {
-    opt.use_mmap = false;
-    if (opt.verbosity >= V_VERBOSE) {
-      struct utsname u;
-      std::string rel = (::uname(&u) == 0) ? u.release : "?";
-      vlog(V_VERBOSE, opt,
-           "[MMAP] kernel " + rel + " lacks per-VMA locks (<6.4); using fread to "
-           "avoid mmap_lock fault contention (force with --mmap)\n");
-    }
-  }
-#endif
 #ifdef HAVE_NVCOMP
   // Promote tuning flags to implicit --hybrid: if the user passed any
   // GPU- or hybrid-only knob (--gpu-batch, --cpu-share, --hybrid-floor, etc.)
@@ -9417,8 +9364,8 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--sync-output") opt.sync_output = true;
     else if (a == "--direct") opt.direct_io = true;
     else if (a == "--no-direct") opt.direct_io = false;
-    else if (a == "--mmap" || a == "--mmap=on")  { opt.use_mmap = true;  opt.mmap_user_set = true; }
-    else if (a == "--no-mmap" || a == "--mmap=off") { opt.use_mmap = false; opt.mmap_user_set = true; }
+    else if (a == "--mmap" || a == "--mmap=on")  opt.use_mmap = true;
+    else if (a == "--no-mmap" || a == "--mmap=off") opt.use_mmap = false;
     else if (a == "--cold") opt.cold_read = true;
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;

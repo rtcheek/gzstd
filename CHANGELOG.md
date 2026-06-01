@@ -1,13 +1,58 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.20  
+**Covers:** v0.9.50 → v0.13.22  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+## v0.13.22 — Revert v0.13.20's kernel gate; add `--cold` for honest benchmarking
+
+Plain mmap is restored as the default for compress on every kernel.  v0.13.20
+auto-switched to fread on pre-6.4 kernels (no per-VMA locks), but a follow-up
+benchmark exposed the gate as a net regression: cpu-only `zeros` and
+`high_compress` were **2.6-3× slower** than the prior mmap path, and other
+configs were no better than the noise floor (hybrid `mixed` "won" by ~1%, well
+inside benchmark jitter).
+
+**Mechanism (why mmap beats fread even on a pre-6.4 high-core box).**  For
+I/O-bound workloads the compressor finishes a chunk in microseconds and asks
+for the next.  mmap lets all 256 worker threads fault their own pages directly
+into their address space and read from the page cache *in parallel* — zero
+copy, aggregate bandwidth scales with cores.  fread instead does a *single
+producer thread* `fread` + `memcpy` into a `Task.data` buffer; that one thread
+caps the whole pipeline at single-thread memcpy bandwidth (~4-5 GiB/s),
+regardless of how many workers are downstream.  The `mmap_lock` cacheline
+storm is real (28% `down_read_trylock` in the v0.13.20 profile) but doesn't
+move wall time outside the run-to-run noise the kernel-gate ostensibly fixed.
+
+**Removed:** `kernel_has_per_vma_locks()`, the gate in `apply_backend_defaults`,
+the `mmap_user_set` flag, and `#include <sys/utsname.h>`.  `--mmap`/`--no-mmap`
+still work as explicit overrides; default is mmap everywhere.
+
+**Kept (added in v0.13.21, folded into this entry):** a `--cold` flag that
+calls `posix_fadvise(POSIX_FADV_DONTNEED)` on the input fd right after open.
+Without it, `gzstd-benchmark.sh`'s median-of-3 against a 20 GiB file on a
+600+ GiB-RAM box was measuring memory-to-memory throughput — iteration 1
+warmed the cache and iterations 2-3 served from RAM.  `--cold` makes every
+iteration a real cold-disk read as an ordinary user (no root, no
+`drop_caches`).  Documented in `--help` as benchmarking-only.
+`gzstd-benchmark.sh` now passes `--cold` for both compress and decompress
+invocations and no longer writes to `/proc/sys/vm/drop_caches` (system-wide
+cache wipe under sudo, bad citizen on a shared host).
+
+---
+
 ## v0.13.20 — Kernel-gated mmap/fread for compress (fixes the high-core mmap storm)
+
+> **Reverted in v0.13.22 — net regression.**  Cold-cache benchmarks on the
+> 256-core box (5.15 kernel) showed cpu-only `zeros`/`high_compress` 2.6-3×
+> slower than plain mmap; the "fix" only helped warm-cache `mixed` by ~1%,
+> within noise.  fread serializes the read on a single producer thread, which
+> caps aggregate throughput at one core's memcpy bandwidth — a worse problem
+> than the `mmap_lock` cacheline contention the gate was trying to avoid.
+> See v0.13.22.
 
 Resolve the high-core mmap compress slowdown for real, and **revert the failed
 v0.13.17 prefault** (which made it worse). The root cause turned out to be the
