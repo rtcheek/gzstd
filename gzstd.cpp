@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.26";
+static constexpr const char * GZSTD_VERSION = "0.13.27";
 //
 // Architecture overview:
 //
@@ -9409,10 +9409,53 @@ static void apply_backend_defaults(Options & opt)
 #endif
 }
 
+// zstd/gzip compat: is `a` a bundled group of no-arg short flags like "-dcf"?
+// True only when every char after a single leading '-' is one of the no-arg
+// operation flags {d,t,k,f,c}.  Anything containing a value-taking flag
+// (-o/-T/-M/-B/-D), a digit (numeric levels, -M#, -b#), a long option ("--…"),
+// or the repeat flags (-vv/-vvv/-qq — v/q aren't in the set) returns false and
+// is left for the exact-match loop to handle unchanged.  v/q are intentionally
+// excluded so their repeat semantics survive; bundle verbosity flags separately.
+static bool is_bundleable_short_group(const std::string & a)
+{
+  if (a.size() < 3 || a[0] != '-' || a[1] == '-') return false;
+  for (size_t i = 1; i < a.size(); ++i) {
+    char c = a[i];
+    if (c != 'd' && c != 't' && c != 'k' && c != 'f' && c != 'c') return false;
+  }
+  return true;
+}
+
 /* parse_args at end */
 static Options parse_args(int argc, char ** argv)
 {
   Options opt;
+
+  // zstd/gzip compat: expand bundled short-flag groups (-dc, -dkf, …) into
+  // individual flags up front, so the match loop and all its value-flag
+  // (argv[++i]) handling work unchanged.  Only all-no-arg-operation-flag groups
+  // expand; value flags, digits, and -vv/-qq pass through untouched (see
+  // is_bundleable_short_group).  xargs/xv own the rewritten argv for the rest
+  // of this function; everything below operates on the expanded argc/argv.
+  std::vector<std::string> xargs;
+  xargs.reserve((size_t)std::max(argc, 1));
+  if (argc > 0) xargs.push_back(argv[0] ? argv[0] : "gzstd");
+  {
+    bool end_of_opts = false;
+    for (int i = 1; i < argc; ++i) {
+      std::string a = argv[i] ? argv[i] : "";
+      if (!end_of_opts && a == "--") { end_of_opts = true; xargs.push_back(a); continue; }
+      if (!end_of_opts && is_bundleable_short_group(a))
+        for (size_t k = 1; k < a.size(); ++k) xargs.push_back(std::string("-") + a[k]);
+      else
+        xargs.push_back(std::move(a));
+    }
+  }
+  std::vector<char *> xv;
+  xv.reserve(xargs.size() + 1);
+  for (auto & s : xargs) xv.push_back(const_cast<char *>(s.c_str()));
+  argc = (int)xv.size();
+  argv = xv.data();
 
   // Pre-scan for verbosity flags so zstd-compat warnings emitted during the
   // main parse below can be suppressed by `-q` / `-qq` regardless of the

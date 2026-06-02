@@ -1,9 +1,34 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.26  
+**Covers:** v0.9.50 → v0.13.27  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.27 — Accept bundled short flags (`-dc`, `-dkf`, …) for zstd/gzip compat
+
+`parse_args` exact-matched each argv token, so a bundled short-flag group like
+`-dc` was rejected with `unknown option: -dc` — even though `zstd -dc` and
+`gzip -dc` both accept it, and gzstd bills itself as a drop-in zstd replacement.
+This bit common idioms carried over from zstd/gzip (`gzstd -dc archive | tar -xf -`,
+`-dk`, `-df`, `-dcf`).
+
+Fix: a pre-pass at the top of `parse_args` expands a bundled group into
+individual flags *before* the match loop, so the loop and all its value-flag
+(`argv[++i]`) handling are untouched.  A group is expanded only when every
+character after a single leading `-` is a no-arg operation flag — `{d,t,k,f,c}`.
+Anything else passes through unchanged: value flags (`-o`/`-T`/`-M`/`-B`/`-D`),
+numeric levels (`-19`), attached-value short flags (`-T4`, `-M512`, `-b3`), the
+repeat flags (`-vv`/`-vvv`/`-qq`), long options, and `--`/`-`.  `v`/`q` are
+deliberately excluded so their repeat semantics survive — bundle verbosity flags
+separately (`-d -vv`, not `-dvv`).  Unknown bundles (e.g. `-dz`) still error as
+before.
+
+Verified: `-dc`/`-dcf` decompress to stdout and round-trip; `-vv` still maps to
+debug, `-19`/`-T4`/`-M512` parse, `-dz` rejected; 253/253 tests pass.  ROADMAP
+Phase 7.9.
 
 ---
 

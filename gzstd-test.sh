@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=253
-$EXTENSIVE && EXPECTED_TESTS=284
+EXPECTED_TESTS=259
+$EXTENSIVE && EXPECTED_TESTS=290
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2526,7 +2526,7 @@ rm -f "$TMPDIR/sw-frames.zst"
 # (the streaming threshold) used to corrupt output because streaming chunks
 # reused seq numbers that collided with adjacent frames' seqs.  Trigger the
 # condition by forcing chunk-size > 64 MiB on a >2-chunk input.  Bug surfaced
-# under --ultra -22 on knuth (auto-bumped chunks to 128 MiB).
+# under --ultra -22 on a 256-core machine (auto-bumped chunks to 128 MiB).
 osmf="$TMPDIR/oversized-multi.bin"
 osmz="$TMPDIR/oversized-multi.zst"
 osmd="$TMPDIR/oversized-multi.dec"
@@ -2609,7 +2609,7 @@ rm -f "$TMPDIR/zc.out"
   && pass "--test (alias for -t)" || fail "--test (alias for -t)"
 ("$GZSTD" --verbose -f "$TMPDIR/zc.bin" 2>&1 | grep -qi "thread\|worker\|mmap\|preallocated") \
   && pass "--verbose (alias for -v)" || fail "--verbose (alias for -v)"
-("$GZSTD" --stdout "$TMPDIR/zc.bin" 2>/dev/null | "$GZSTD" -d | cmp -s - "$TMPDIR/zc.bin") \
+("$GZSTD" --stdout "$TMPDIR/zc.bin" 2>/dev/null | "$GZSTD" -d 2>/dev/null | cmp -s - "$TMPDIR/zc.bin") \
   && pass "--stdout (alias for -c)" || fail "--stdout (alias for -c)"
 
 # -H is the long help (zstd convention)
@@ -2695,6 +2695,47 @@ else
 fi
 
 rm -f "$TMPDIR/zc.bin" "$TMPDIR/zc.bin.zst" "$TMPDIR/zc.out"
+
+# ============================================================
+section "Bundled short flags (zstd/gzip compat)"
+# ----------------------------------------------------------------
+# gzstd should accept bundled no-arg short flags (-dc, -dkf, …) like
+# zstd/gzip.  Only operation-flag groups {d,t,k,f,c} expand; value flags,
+# numeric levels, and the repeat flags (-vv/-qq) must be unaffected.
+
+dd if=/dev/urandom bs=1M count=1 2>/dev/null > "$TMPDIR/bf.bin"
+"$GZSTD" -k -f --cpu-only "$TMPDIR/bf.bin" -o "$TMPDIR/bf.zst" 2>/dev/null
+
+# -dc : decompress to stdout (the canonical `gzstd -dc | tar -xf -` idiom)
+("$GZSTD" -dc "$TMPDIR/bf.zst" 2>/dev/null | cmp -s - "$TMPDIR/bf.bin") \
+  && pass "-dc decompresses to stdout" || fail "-dc decompresses to stdout"
+
+# -cd : same flags reordered (bundling is order-independent)
+("$GZSTD" -cd "$TMPDIR/bf.zst" 2>/dev/null | cmp -s - "$TMPDIR/bf.bin") \
+  && pass "-cd (reordered) decompresses to stdout" || fail "-cd (reordered) decompresses to stdout"
+
+# -dcf : decompress + stdout + force, round-trips
+("$GZSTD" -dcf "$TMPDIR/bf.zst" 2>/dev/null | cmp -s - "$TMPDIR/bf.bin") \
+  && pass "-dcf round-trips" || fail "-dcf round-trips"
+
+# -dk : bundle decompresses to the derived path and leaves the .zst in place
+rm -f "$TMPDIR/bf"
+("$GZSTD" -dk --cpu-only "$TMPDIR/bf.zst" 2>/dev/null \
+   && test -f "$TMPDIR/bf.zst" && cmp -s "$TMPDIR/bf" "$TMPDIR/bf.bin") \
+  && pass "-dk decompresses and keeps input" || fail "-dk decompresses and keeps input"
+rm -f "$TMPDIR/bf"
+
+# Regression: a bundle with a non-operation char must NOT be silently accepted
+expect_exit 2 "$GZSTD" -dz "$TMPDIR/bf.zst" \
+  && pass "-dz (unknown bundle) rejected (exit 2)" || fail "-dz (unknown bundle) rejected"
+
+# Regression: -vv keeps its repeat semantics (debug), not split into -v -v.
+# At V_DEBUG the decomp worker prints per-task "take seq=" lines; -v (V_VERBOSE)
+# does not — so this distinguishes "still debug" from "accidentally bundled".
+("$GZSTD" -d -vv --cpu-only "$TMPDIR/bf.zst" -o "$TMPDIR/bf.out" 2>&1 \
+   | grep -q "take seq=") \
+  && pass "-vv still maps to debug (repeat flag not bundled)" || fail "-vv still maps to debug"
+rm -f "$TMPDIR/bf.bin" "$TMPDIR/bf.zst" "$TMPDIR/bf" "$TMPDIR/bf.out"
 
 # ============================================================
 section "Parameter honor verification"

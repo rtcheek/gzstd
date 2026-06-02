@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.26
+**Current version:** v0.13.27
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -484,7 +484,16 @@ opt-in and not the Gen4 default (asymmetric routes Gen4 decompress to hybrid,
 which is unaffected) — but worth it before any TB-scale gpu-only decompress.
 
 ### 7.9 Support bundled short flags (`-dc`, `-dk`, …) for zstd/gzip compat
-**Priority: Medium | Complexity: Medium | Status: NOT STARTED**
+**Priority: Medium | Complexity: Medium | Status: DONE (v0.13.27)**
+
+Implemented via a pre-pass in `parse_args` that expands a bundled group into
+individual flags before the match loop. Conservative scope: a group expands only
+when every char after a single leading `-` is a no-arg operation flag
+`{d,t,k,f,c}`; everything else (value flags `-o`/`-T`/`-M`/`-B`/`-D`, numeric
+levels, attached-value `-T4`/`-M512`/`-b3`, repeat flags `-vv`/`-vvv`/`-qq`, long
+options, `--`/`-`) passes through unchanged. `v`/`q` excluded so repeat semantics
+survive — bundle verbosity separately (`-d -vv`). The original analysis below
+documents the edge cases this handles.
 
 `parse_args` exact-matches each argv token (`a == "-d"`, `a == "-c"`, …), so a
 bundled short-flag group like `-dc` is rejected with `unknown option: -dc`
@@ -530,7 +539,7 @@ high compat value.
 | is_all_zero unaligned load | 7.6 | Low | Not started |
 | Remove dead SequentialDispatcher | 7.7 | Low | Needs verify |
 | Decompress reader queue-depth cap (gpu-only RSS blowup) | 7.8 | Medium | Not started (hybrid-fault hypothesis disproven) |
-| Bundled short flags (-dc, -dk) for zstd/gzip compat | 7.9 | Medium | Not started |
+| Bundled short flags (-dc, -dk) for zstd/gzip compat | 7.9 | Medium | DONE (v0.13.27) |
 
 ### Streaming Decompression Output
 **Priority: HIGH | Complexity: Medium | Status: DONE (v0.12.24)**
