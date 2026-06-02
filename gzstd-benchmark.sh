@@ -32,6 +32,10 @@
 #                     on the current hardware.  See v0.12.46 CHANGELOG.
 #   --sweep-all       Enable all sweeps (including --sweep-ultra)
 #   --no-decompress   Skip decomp benchmarks
+#   --direct          Force --direct (O_DIRECT output) on every run
+#   --no-direct       Force --no-direct (buffered) on every run; default is
+#                       neither (let gzstd auto-decide — Gen4+ auto-enables
+#                       O_DIRECT, so use --no-direct for the buffered baseline)
 #   --help            Show this help
 #
 # Generates a temporary compressed file for each config, measures
@@ -68,7 +72,13 @@ SWEEP_ULTRA=false
 SWEEP_THROTTLE=false
 SWEEP_MATRIX=false
 DO_DECOMPRESS=true
-DIRECT=false   # --direct: pass --direct (O_DIRECT output) to every gzstd run
+# Tri-state O_DIRECT control for every gzstd run:
+#   ""            (default) pass nothing — let gzstd auto-decide.  NOTE: on
+#                 PCIe Gen4+, gzstd auto-enables O_DIRECT, so the default sweep
+#                 measures the O_DIRECT path there, not buffered.
+#   "--direct"    force O_DIRECT output
+#   "--no-direct" force buffered output (the buffered baseline on Gen4)
+DIRECT_FLAG=""
 
 #---------------------------------------------------------------------
 # Parse arguments
@@ -81,7 +91,8 @@ while [[ $# -gt 0 ]]; do
     --iterations)  ITERATIONS="$2"; shift 2 ;;
     --files)       FILE_PATTERN="$2"; shift 2 ;;
     --quick)       QUICK=true; ITERATIONS=1; shift ;;
-    --direct)      DIRECT=true; shift ;;
+    --direct)      DIRECT_FLAG="--direct"; shift ;;
+    --no-direct)   DIRECT_FLAG="--no-direct"; shift ;;
     --gpu-only)    GPU_ONLY=true; shift ;;
     --cpu-only)    CPU_ONLY=true; shift ;;
     --hybrid-only) HYBRID_ONLY=true; shift ;;
@@ -99,7 +110,7 @@ while [[ $# -gt 0 ]]; do
       SWEEP_MATRIX=true; shift ;;
     --no-decompress) DO_DECOMPRESS=false; shift ;;
     --help|-h)
-      head -37 "$0" | tail -32
+      head -42 "$0" | tail -37
       exit 0 ;;
     *) echo "Unknown option: $1"; exit 2 ;;
   esac
@@ -695,12 +706,11 @@ for config_str in "${CONFIGS[@]}"; do
       # --cold drops the input from the page cache via posix_fadvise so
       # iterations 2-3 don't measure memory-to-memory throughput.  Without
       # it the benchmark medians reflect cached reads, not the cold-disk
-      # performance a typical user sees.  $direct_flag adds --direct
-      # (O_DIRECT output) when the script is invoked with --direct.
-      direct_flag=""; $DIRECT && direct_flag="--direct"
+      # performance a typical user sees.  $DIRECT_FLAG forces --direct or
+      # --no-direct per the script flag (empty = let gzstd auto-decide).
       # shellcheck disable=SC2086
       elapsed=$(run_timed \
-        "$GZSTD" --cold $direct_flag $comp_flags -f --output="$comp_out" "$test_file")
+        "$GZSTD" --cold $DIRECT_FLAG $comp_flags -f --output="$comp_out" "$test_file")
       times_c+=("$elapsed")
     done
 
@@ -745,11 +755,10 @@ for config_str in "${CONFIGS[@]}"; do
         if [[ -n "$decomp_flags" ]]; then
           local_flags="$decomp_flags -d"
         fi
-        # --cold and $direct_flag: see compress block above for rationale.
-        direct_flag=""; $DIRECT && direct_flag="--direct"
+        # --cold and $DIRECT_FLAG: see compress block above for rationale.
         # shellcheck disable=SC2086
         elapsed=$(run_timed \
-          "$GZSTD" --cold $direct_flag $local_flags -f \
+          "$GZSTD" --cold $DIRECT_FLAG $local_flags -f \
           --output="$decomp_out" "$comp_out")
         times_d+=("$elapsed")
       done
