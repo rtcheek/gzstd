@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.24";
+static constexpr const char * GZSTD_VERSION = "0.13.26";
 //
 // Architecture overview:
 //
@@ -269,6 +269,7 @@ struct Options {
   bool sliding_window = false;    // --sliding-window: single-frame compression (cpu-only)
   bool sync_output = false;       // --sync-output: fsync before closing output file
   bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
+  bool direct_io_user_set = false; // true if user passed --direct/--no-direct (suppresses the Gen4 decompress auto-default)
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
@@ -613,7 +614,8 @@ static void print_help()
 "                      (default: on; --no-mmap forces fread)\n"
 "  --[no-]preallocate  fallocate output to expected size up front\n"
 "                      (default: on; --no-preallocate skips fallocate)\n"
-"  --direct            O_DIRECT output (bypass page cache)\n"
+"  --direct            O_DIRECT output (bypass page cache; auto-on for\n"
+"                      Gen4+ compress & decompress, --no-direct to force buffered)\n"
 "  --sync-output       fsync output before exit\n"
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
@@ -706,8 +708,15 @@ static void print_help_long()
 "\n"
 "  --direct / --no-direct\n"
 "     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
-"     buffered.  O_DIRECT exposes the app to NVMe GC stalls and\n"
-"     journal commits and typically increases wall-time variance.\n"
+"     buffered, EXCEPT on PCIe Gen4+ hardware, where O_DIRECT is\n"
+"     auto-enabled for BOTH compress and decompress: on fast-fabric\n"
+"     boxes frame production outruns buffered writeback, so bypassing\n"
+"     the page cache is a large win that scales with output volume\n"
+"     (it regresses on smaller Gen<4 boxes, which stay buffered).\n"
+"     Test mode writes nothing, so it is unaffected.  --no-direct\n"
+"     forces buffered I/O (e.g. to benchmark the buffered baseline on\n"
+"     Gen4).  O_DIRECT can expose the app to NVMe GC stalls and\n"
+"     journal commits.\n"
 "\n"
 "  --mmap / --no-mmap    (default: on)\n"
 "     Use a zero-copy memory-mapped reader for regular-file inputs.\n"
@@ -9343,12 +9352,29 @@ static void apply_backend_defaults(Options & opt)
            "(override with --cpu-only)\n");
   }
 
+  // PCIe-gen probe — drives the --direct default (compress + decompress) and
+  // the decompress backend default further down.
+  int gen = detect_min_pcie_gen();
+
+  // --direct default: O_DIRECT output is a large win on fast-fabric (PCIe Gen4+)
+  // boxes for BOTH compress and decompress — frame production outruns buffered
+  // writeback, scaling with output volume (win on large output, neutral on
+  // tiny) — and a regression on Gen<4, which stay buffered.  Enable on Gen4+
+  // unless the user passed --direct/--no-direct.  Skip test mode (writes
+  // nothing).  Backend-independent (the win is the output write path), so it
+  // runs before the backend_user_set return and covers cpu-only/hybrid/gpu-only
+  // alike.  Harmless for pipe/stdout output: DirectWriter only activates for
+  // regular-file targets.  See CHANGELOG / the --direct asymmetry finding.
+  if (opt.mode != Mode::TEST && !opt.direct_io_user_set && gen >= 4) {
+    opt.direct_io = true;
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "[ASYMMETRIC] PCIe Gen" + std::to_string(gen)
+           + " detected; defaulting output to --direct (override with --no-direct)\n");
+  }
+
   if (opt.backend_user_set) return;
 
   if (opt.mode == Mode::COMPRESS) { opt.hybrid = true; return; }
-
-  // DECOMPRESS or TEST
-  int gen = detect_min_pcie_gen();
   if (gen > 0 && gen < 4) {
     opt.cpu_only = true;
     // Mirror the parse_args silencing: --cpu-batch in cpu-only mode causes
@@ -9427,8 +9453,8 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--sparse") opt.sparse_mode = 1;
     else if (a == "--no-sparse") opt.sparse_mode = 0;
     else if (a == "--sync-output") opt.sync_output = true;
-    else if (a == "--direct") opt.direct_io = true;
-    else if (a == "--no-direct") opt.direct_io = false;
+    else if (a == "--direct") { opt.direct_io = true; opt.direct_io_user_set = true; }
+    else if (a == "--no-direct") { opt.direct_io = false; opt.direct_io_user_set = true; }
     else if (a == "--mmap" || a == "--mmap=on")  opt.use_mmap = true;
     else if (a == "--no-mmap" || a == "--mmap=off") opt.use_mmap = false;
     else if (a == "--cold") opt.cold_read = true;

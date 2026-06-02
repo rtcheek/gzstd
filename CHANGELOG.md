@@ -1,9 +1,72 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.24  
+**Covers:** v0.9.50 → v0.13.26  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.26 — Extend the Gen4+ `--direct` default to compress (was decompress-only)
+
+v0.13.25 auto-enabled `--direct` for decompress on Gen4+; this extends the same
+gate to **compress**.  The knuth (Gen4) `--direct` data shows compress benefits
+the same way decompress does — the win scales with output volume and is
+backend-independent: cpu-only low_compress +103% / mixed +50% / medium +15%,
+gpu-only +71% / +29% / +12%, hybrid +70% / +24% / +21%; tiny-output profiles
+(high, zeros) are neutral.  No measured regression on Gen4 for any backend.
+
+The decompress-only scoping in v0.13.25 existed solely to avoid the Gen<4
+compress regression (a low-core box never saturates buffered writeback, so
+O_DIRECT just adds alignment overhead) — but the `gen >= 4` gate already excludes
+that case, so the extra `mode == DECOMPRESS` guard was redundant.
+
+`apply_backend_defaults()` now enables `--direct` on Gen4+ for both compress and
+decompress (test mode skipped — it writes nothing), unless the user passed
+`--direct`/`--no-direct`.  The PCIe-gen probe moved above the compress branch so
+it runs for all modes.  Verbose line generalized to
+`[ASYMMETRIC] PCIe Gen4 detected; defaulting output to --direct`.
+
+Caveats unchanged from v0.13.25: compress output size is unknown, so the O_DIRECT
+path preallocates `input_size` as an upper bound and `ftruncate`s down at
+finalize (already handled; `--no-preallocate` opts out).  O_DIRECT can raise
+tail-latency variance (NVMe GC / journal commits); medians favor it on Gen4.
+`--no-direct` forces the buffered baseline.
+
+Verified: Gen3 compress stays buffered (no auto-enable), explicit
+`--direct`/`--no-direct` honored, round-trip clean, 253/253 tests pass.  ROADMAP
+Phase 5.3.
+
+---
+
+## v0.13.25 — Default `--direct` (O_DIRECT output) for decompress on PCIe Gen4+
+
+Decompress on the Gen4 reference box is ~95% write-bound: with the write path
+removed (`-c >/dev/null`) cpu-only decompress hits ~14 GiB/s, but buffered output
+to disk runs at ~0.68 GiB/s — page-cache population + writeback throttling is the
+whole cost.  O_DIRECT output bypasses that, and on fast-fabric / high-core boxes
+where frame production outruns buffered writeback it is a large decompress win
+(up to +130–230% on the Gen4 reference; mixed `-d` ~0.68 → ~2.0 GiB/s).  On
+smaller Gen<4 boxes O_DIRECT regresses — the producer never saturates buffered
+writeback, so it only adds alignment overhead — so they stay buffered.
+
+`apply_backend_defaults()` now auto-enables `--direct` for **decompress** on PCIe
+Gen4+ (reusing the `detect_min_pcie_gen()` probe that already drives the
+cpu-only/hybrid decompress default), unless the user passed `--direct` or
+`--no-direct`.  It is backend-independent — the win is in the output write path —
+so it applies to cpu-only, hybrid, and gpu-only decompress alike.  Compress never
+auto-enables it (O_DIRECT regresses compress on smaller boxes; strictly opt-in).
+Test mode writes nothing, so it is skipped.  Visible at `-v` as
+`[ASYMMETRIC] PCIe Gen4 detected; defaulting decompress output to --direct`.
+
+Behavior notes:
+- Override with `--no-direct` (e.g. to benchmark the buffered baseline on Gen4).
+- The standard benchmark's plain decompress runs on a Gen4 box now use O_DIRECT
+  by default; pass `--no-direct` for the buffered comparison.
+- Gen<4 and detection-unavailable paths are unchanged (buffered).
+
+Verified: Gen3 stays buffered (no auto-enable), explicit `--direct`/`--no-direct`
+honored, round-trip clean, 253/253 tests pass.  ROADMAP Phase 5.3.
 
 ---
 
