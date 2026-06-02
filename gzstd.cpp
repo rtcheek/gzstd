@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.23";
+static constexpr const char * GZSTD_VERSION = "0.13.24";
 //
 // Architecture overview:
 //
@@ -7288,6 +7288,40 @@ static void gpu_decomp_worker(
     void * h_decomp_pinned = nullptr;
     size_t h_decomp_pinned_bytes = 0;
 
+    // Recycled host output buffers for D2H readback.  Avoids a fresh
+    // make_shared (+ a full-frame minor-fault storm) per frame on every batch
+    // — the GPU analogue of the cpu_decomp_worker pool (ROADMAP 7.2).  A slot
+    // with use_count()==1 has been drained by the writer and is free to reuse;
+    // recycled slots keep their resident pages, so the steady state stops
+    // faulting.  Grows lazily up to a cap; never preallocated.
+    std::vector<FrameBuf> out_pool;
+    uint64_t out_pool_waits = 0;
+
+    // Acquire a recycled output buffer.  Grows the pool up to `cap` slots, then
+    // waits on the writer's drain signal until a slot frees (so it never
+    // allocates beyond cap).  Deadlock-free: a stream pushes its frames in
+    // ascending seq order, so the writer always has the oldest in-flight frame
+    // to write, drops its ref after writing, and frees a slot.
+    FrameBuf acquire_out_buf(size_t cap, FrameThrottle * bp) {
+      for (;;) {
+        for (auto & b : out_pool)
+          if (b.use_count() == 1) return b;
+        if (out_pool.size() < cap) {
+          out_pool.push_back(std::make_shared<std::vector<char>>());
+          return out_pool.back();
+        }
+        ++out_pool_waits;
+        if (bp) {
+          bp->wait_for_drain([&]{
+            for (auto & b : out_pool) if (b.use_count() == 1) return true;
+            return false;
+          });
+        } else {
+          std::this_thread::yield();
+        }
+      }
+    }
+
     void free_device() {
       if (d_comp_buf)    { cudaFree(d_comp_buf);    d_comp_buf = nullptr; }
       if (d_decomp_buf)  { cudaFree(d_decomp_buf);  d_decomp_buf = nullptr; }
@@ -7983,7 +8017,13 @@ static void gpu_decomp_worker(
           out_sum += actual;
           d2h_bytes_batch += actual;
 
-          auto h_out = std::make_shared<std::vector<char>>(actual);
+          // Recycle a host buffer from this stream's pool rather than a fresh
+          // per-frame allocation (ROADMAP 7.2).  Cap at two batches' worth so
+          // the batch now completing and the previous one still draining at the
+          // writer both fit without stalling.
+          size_t out_pool_cap = std::max<size_t>(2, C.alloc_batch) * 2;
+          auto h_out = C.acquire_out_buf(out_pool_cap, bp);
+          h_out->resize(actual);
           const void * d_src = static_cast<char*>(C.d_decomp_buf) + i * C.alloc_decomp;
           if (C.h_decomp_pinned) {
             // Device -> pinned host slot, then memcpy pinned -> output vector.

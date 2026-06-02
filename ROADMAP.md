@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.23
+**Current version:** v0.13.24
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -303,7 +303,7 @@ must be unchanged; compress/decompress throughput should be unaffected (no
 hot-path change).
 
 ### 7.2 GPU result buffers allocate fresh per frame (no recycled pool)
-**Priority: HIGH | Complexity: Medium | Status: NOT STARTED**
+**Priority: HIGH | Complexity: Medium | Status: DONE for decompress (v0.13.24); compress deferred**
 
 The CPU workers recycle a bounded `FrameBuf` pool (the v0.13.7/v0.13.8 fix for
 the per-iteration alloc + page-fault storm). The GPU completion paths do not —
@@ -315,14 +315,23 @@ the CPU pools were built to eliminate, never ported to the GPU side. This is the
 highest-value perf lead and it sits on the fast-fabric path that actually runs
 hybrid decompress.
 
-**Plan:** give each `StreamCtx` a small recycled `FrameBuf` pool with the same
-`use_count()==1` reclaim trick as `cpu_decomp_worker`. Confirm with `perf record`
-(page-fault + `mmap_lock` contention) on a Gen4 hybrid `-d` run before/after.
+**Done (v0.13.24, decompress):** `DecompStreamCtx` now owns a recycled `out_pool`
+(`acquire_out_buf()`, `use_count()==1` reclaim, lazy growth to two batches, waits
+on the writer's drain signal past the cap). Deadlock-free by the same FIFO
+argument as the throttle. Gen3 proxy (`--gpu-only -d`, 2 GiB mixed): minor-faults
+636k→538k (−15%), peak RSS 2.57→2.26 GiB (−12%); 253/253 tests pass; round-trip
+verified on `--gpu-only`/`--hybrid`.
 
-**Test:** Gen4 hybrid decompress on `mixed`/`low` (large output); compare
-throughput and `perf stat` faults vs v0.13.23. Gen3 path is `--cpu-only` by
-default so it won't exercise this — force `--hybrid -d` there for a sanity
-round-trip only.
+**Still to test (Gen4):** this is the hybrid-decompress *default* on Gen4+, where
+batches are larger and frames cycle faster, so the win should be larger than the
+Gen3 proxy. Benchmark `--hybrid -d` on `mixed`/`low` vs v0.13.23 (throughput +
+`/usr/bin/time -v` faults/RSS). `perf stat` needs `perf_event_paranoid` lowered;
+`/usr/bin/time -v` works unprivileged and is what the Gen3 numbers above used.
+
+**Deferred (compress):** `compress_nvcomp` completion paths also allocate per
+frame, but hold only the *compressed* output (small), so fault pressure is far
+lower. Same pool pattern applies; do it only if a Gen4 compress profile shows it
+matters.
 
 ### 7.3 Throttle budget computed from the unresolved chunk size (compress)
 **Priority: Medium | Complexity: Low | Status: NOT STARTED**
@@ -399,7 +408,7 @@ delete it (~40 lines of concurrency surface removed). Verify before removing.
 | Multi-reader NVMe | 4.1 | Low | Research |
 | Multi-writer O_DIRECT pwrite | 4.2 | Low | Tested negative for buffered |
 | AsyncWritePool flush() final-batch error | 7.1 | HIGH | DONE (v0.13.23) |
-| GPU result buffer pool (Gen4 hybrid decompress) | 7.2 | HIGH | Not started |
+| GPU result buffer pool (Gen4 hybrid decompress) | 7.2 | HIGH | Decompress DONE (v0.13.24); compress deferred |
 | Throttle budget uses resolved chunk size | 7.3 | Medium | Not started |
 | CPU-compress redundant memcpy | 7.4 | Medium | Needs benchmark |
 | --sync-output under --direct | 7.5 | Low | Not started |
@@ -472,3 +481,4 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 | v0.13.0–v0.13.16 | Asymmetric mode + PCIe-gen detection, streaming single-frame decompress, bounded per-worker buffer pools (page-fault storm fix), CV-wait pool drain, skip-serial-GPU-probe, CUDA-init/reader overlap |
 | v0.13.17–v0.13.22 | mmap fault-storm investigation: producer prefault and kernel-gated mmap/fread both tried and reverted (pre-6.4-kernel mmap_lock artifact); `--cold` flag for honest cold-cache benchmarking; mmap restored as default everywhere |
 | v0.13.23 | AsyncWritePool flush() waits for physical write completion (final-batch I/O errors no longer slip past had_error()) |
+| v0.13.24 | Recycled GPU decompress output-buffer pool (DecompStreamCtx::out_pool) — kills per-frame D2H alloc churn; Gen3 proxy −15% faults / −12% RSS on gpu-only -d |

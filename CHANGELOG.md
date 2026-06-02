@@ -1,9 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.23  
+**Covers:** v0.9.50 → v0.13.24  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.24 — Recycle GPU decompress output buffers (kill the per-frame D2H alloc churn)
+
+The CPU workers recycle a bounded `FrameBuf` pool (the v0.13.7/v0.13.8 page-fault
+storm fix), but the GPU decompress completion path never got the same treatment:
+every readback frame did a fresh `make_shared<vector<char>>(actual)` — a full
+decompressed-frame (~16 MiB) allocation that faults every page, on every frame
+of every batch.  On the Gen4+ hybrid-decompress default this is the hot path and
+the allocation cycles fast.
+
+`DecompStreamCtx` now owns a recycled `out_pool`: `acquire_out_buf()` reuses a
+slot whose `use_count()==1` (writer has drained it), grows the pool lazily up to
+two batches' worth, and past that waits on the writer's drain signal rather than
+allocating.  Recycled slots keep their resident pages, so after warm-up the path
+stops faulting.  Deadlock-free by the same FIFO argument as the throttle: a
+stream pushes frames in ascending seq, so the writer always has the oldest
+in-flight frame to write and frees a slot when it drops the ref.
+
+Measured on a consumer Gen3 box (2 GiB→2 GiB mixed, `--gpu-only -d`, isolating
+the path): minor page-faults 636k → 538k (−15%), peak RSS 2.57 → 2.26 GiB
+(−12%).  The Gen3 default is `--cpu-only` decompress so this only shows under a
+forced GPU/hybrid run; the real target is the Gen4+ hybrid-decompress default,
+where batches are larger and frames cycle faster — validate there.  Round-trip
+verified on `--gpu-only` and `--hybrid`; 253/253 tests pass.
+
+Compress-side GPU output buffers (`compress_nvcomp`) still allocate per frame but
+hold only the *compressed* output (small), so the fault pressure is far lower;
+left as a follow-up.  ROADMAP Phase 7.2.
 
 ---
 
