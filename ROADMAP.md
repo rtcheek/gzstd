@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.27
+**Current version:** v0.13.28
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -364,7 +364,13 @@ lower. Same pool pattern applies; do it only if a Gen4 compress profile shows it
 matters.
 
 ### 7.3 Throttle budget computed from the unresolved chunk size (compress)
-**Priority: Medium | Complexity: Low | Status: NOT STARTED**
+**Priority: Medium | Complexity: Low | Status: DONE (v0.13.28)**
+
+`compress_cpu_mt` now sizes the `FrameThrottle` from the resolved `host_chunk`
+(= `chosen_mib`) instead of `opt.chunk_mib`. Verified at `-v`: `--ultra -22 -T4`
+reports a 4.00 GiB in-flight cap (32 × 128 MiB) vs the old 512 MiB. GPU compress
+already used `chosen_mib`; decompress paths stay heuristic (frame size unknown
+until the stream is parsed). 259/259 tests pass.
 
 `compress_cpu_mt` builds the `FrameThrottle` from `opt.chunk_mib * ONE_MIB`, but
 the frame size actually used is `host_chunk` (= `chosen_mib`), which can be
@@ -533,7 +539,7 @@ high compat value.
 | Multi-writer O_DIRECT pwrite | 4.2 | Low | Tested negative for buffered |
 | AsyncWritePool flush() final-batch error | 7.1 | HIGH | DONE (v0.13.23) |
 | GPU result buffer pool (Gen4 hybrid decompress) | 7.2 | HIGH | Decompress DONE (v0.13.24); compress deferred |
-| Throttle budget uses resolved chunk size | 7.3 | Medium | Not started |
+| Throttle budget uses resolved chunk size | 7.3 | Medium | DONE (v0.13.28) |
 | CPU-compress redundant memcpy | 7.4 | Medium | Needs benchmark |
 | --sync-output under --direct | 7.5 | Low | Not started |
 | is_all_zero unaligned load | 7.6 | Low | Not started |

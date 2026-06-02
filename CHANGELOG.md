@@ -1,9 +1,30 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.27  
+**Covers:** v0.9.50 → v0.13.28  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.28 — Size the compress throttle from the resolved chunk, not opt.chunk_mib
+
+`compress_cpu_mt` built its `FrameThrottle` from `opt.chunk_mib`, but the frame
+size actually used is `host_chunk` (= the resolved `chosen_mib`), which can be
+auto-bumped for `--ultra` (e.g. level 22 forces a 128 MiB chunk) or shrunk by
+`check_ram_budget`.  `compute_throttle_budget` divides `avail/2` by the frame
+size for its RAM-cap term, so a stale 16 MiB there mis-sizes the in-flight cap:
+on `--ultra` it under-counts in-flight RAM (thinks frames are 16 MiB when they're
+128 MiB — 8× under), which on a RAM-constrained box could admit more frames than
+memory holds.  Pass the resolved `host_chunk` instead.
+
+Default (non-ultra) runs are unchanged — `opt.chunk_mib == chosen_mib == 16`
+there.  Demonstrated at `-v`: a `--ultra -22 -T4` run now reports
+`[THROTTLE] … 4.00 GiB in-flight max` (32 × 128 MiB) instead of the old
+512 MiB (32 × 16 MiB).  The GPU compress path already used `chosen_mib`; the two
+decompress paths keep `opt.chunk_mib` as a heuristic (the true decompressed frame
+size isn't known until the stream is parsed, after the throttle is built).
+259/259 tests pass.  ROADMAP Phase 7.3.
 
 ---
 

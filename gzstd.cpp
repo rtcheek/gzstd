@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.27";
+static constexpr const char * GZSTD_VERSION = "0.13.28";
 //
 // Architecture overview:
 //
@@ -5187,8 +5187,12 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
   ResultStore results;
-  FrameThrottle throttle(compute_throttle_budget(
-      std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, 0, opt));
+  // Size the throttle from the *resolved* chunk (host_chunk = chosen_mib),
+  // not opt.chunk_mib: chosen_mib may have been auto-bumped for --ultra or
+  // shrunk by check_ram_budget, and the RAM-cap term divides avail/2 by the
+  // frame size — a stale 16 MiB there over- or under-shoots the in-flight cap
+  // on ultra / low-RAM runs.  (ROADMAP 7.3.)
+  FrameThrottle throttle(compute_throttle_budget(host_chunk, threads, 0, opt));
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
