@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.28";
+static constexpr const char * GZSTD_VERSION = "0.13.29";
 //
 // Architecture overview:
 //
@@ -2339,10 +2339,24 @@ public:
   void push(Task && t)
   {
     std::unique_lock<std::mutex> lk(m_);
+    // Bounded-queue backpressure (ROADMAP 7.8): block the producer once the
+    // queue is full, so a consumer slower than the reader can't buffer the
+    // entire input in RAM.  Unbounded by default (max_depth_ == 0).  Internal
+    // re_enqueue (push_front) bypasses this so it never blocks.
+    while (max_depth_ > 0 && q_.size() >= max_depth_ && !done_)
+      space_cv_.wait(lk);
     q_.push_back(std::move(t));
     ++total_tasks_;
     cv_.notify_all();      // wake all GPU workers waiting in pop_batch_greedy
     cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
+  }
+
+  // Cap the number of queued (read-but-not-popped) frames for producer
+  // backpressure.  0 = unbounded (default).  Set before the producer starts.
+  void set_max_depth(size_t n)
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    max_depth_ = n;
   }
 
   // Re-enqueue tasks that were popped but never processed (e.g., GPU trivial-skip,
@@ -2411,6 +2425,7 @@ public:
       out.push_back(std::move(q_.front()));
       q_.pop_front();
     }
+    pop_signal_locked();
     return true;
   }
 
@@ -2454,6 +2469,7 @@ public:
     if (q_.empty()) return 0;
     t = std::move(q_.front());
     q_.pop_front();
+    pop_signal_locked();
     return 1;
   }
 
@@ -2517,6 +2533,7 @@ public:
     done_ = true;
     cv_.notify_all();
     cpu_cv_.notify_all();
+    space_cv_.notify_all();  // wake a producer blocked on a full bounded queue
   }
 
   size_t total_tasks() const { return total_tasks_; }
@@ -2616,6 +2633,7 @@ public:
       if (may_proceed(qs)) {
         t = std::move(q_.front());
         q_.pop_front();
+        pop_signal_locked();
         return 1;
       }
     }
@@ -2631,11 +2649,21 @@ private:
     return double(front.len()) / double(front.decomp_size);
   }
 
+  // Wake a producer blocked in push() on a full bounded queue.  No-op when
+  // unbounded (max_depth_ == 0).  CALLER MUST HOLD m_.  Called by the pop paths
+  // a bounded (decompress) queue actually uses — try_pop_one, pop_batch_greedy,
+  // try_pop_one_cpu — plus set_done().  Other pop methods only run on compress
+  // queues, which are never bounded; if one is ever used with a bounded queue,
+  // add a pop_signal_locked() call there too.
+  void pop_signal_locked() { if (max_depth_ > 0) space_cv_.notify_all(); }
+
   std::mutex              m_;
   std::condition_variable cv_;
   std::condition_variable cpu_cv_;   // dedicated CV for CPU workers (avoids spurious wakes from GPU pops)
+  std::condition_variable space_cv_; // producer waits here when a bounded queue is full
   std::deque<Task>        q_;
   bool                    done_ = false;
+  size_t                  max_depth_ = 0;  // 0 = unbounded (default); >0 caps queued frames (ROADMAP 7.8)
   std::atomic<size_t>     total_tasks_{0};
 };
 
@@ -4825,6 +4853,14 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, 0, opt));
   // Disable throttle in test mode: no disk I/O means permits are never released.
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
+
+  // Bound queued (read-but-not-popped) frames to pipeline depth so a consumer
+  // slower than the reader can't buffer the whole compressed input in RAM
+  // (ROADMAP 7.8).  Skip when throttling is explicitly disabled.
+  if (opt.throttle_frames != 0) {
+    int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
+    queue.set_max_depth((size_t)std::max(THROTTLE_MIN_FRAMES, threads * qslack));
+  }
 
   // Start writer thread (outputs decompressed frames in original order)
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
@@ -8392,6 +8428,15 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism,
       decomp_gpu_batch_floor, opt));
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
+
+  // Bound queued (read-but-not-popped) frames to pipeline depth so a slow GPU
+  // consumer (D2H-bound) can't let the reader buffer the entire compressed
+  // input in RAM — the gpu-only RSS blowup in ROADMAP 7.8.  Skip when
+  // throttling is explicitly disabled.
+  if (opt.throttle_frames != 0) {
+    int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
+    queue.set_max_depth((size_t)std::max(THROTTLE_MIN_FRAMES, decomp_parallelism * qslack));
+  }
 
   // ---- Writer thread (outputs decompressed data in order) ----
   std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);

@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.28
+**Current version:** v0.13.29
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -430,7 +430,17 @@ Defined but no caller was found in the reviewed paths (GPU workers use
 delete it (~40 lines of concurrency surface removed). Verify before removing.
 
 ### 7.8 Decompress reader has no queue-depth backpressure (slow-consumer RSS blowup)
-**Priority: Medium | Complexity: Medium | Status: NOT STARTED — reframed; the original hybrid-fault hypothesis was disproven (see Update below)**
+**Priority: Medium | Complexity: Medium | Status: DONE (v0.13.29); the original hybrid-fault hypothesis was disproven (see Update below)**
+
+Fixed in v0.13.29: `TaskQueue` gained an optional `max_depth_` (0 = unbounded);
+`push()` blocks on `space_cv_` when full, woken by the pop paths a bounded queue
+uses + `set_done()` (`re_enqueue`/push_front bypasses it). Both decompress paths
+cap the queue at `max(THROTTLE_MIN_FRAMES, parallelism * slack)`, so queued RAM is
+O(pipeline) not O(input) — skipped under `--no-throttle`. Cap is ≥ the auto-tuner's
+batch needs (no throughput risk). Verified: no deadlock across cpu/gpu/hybrid
+round-trips; slow-consumer gpu-only `-d` of a 3 GB / ~2861-frame input held
+1.79 GiB RSS (capped, not whole-input). Compress queues stay unbounded (mmap input
+is zero-copy). 259/259 tests pass.
 
 Surfaced by the v0.13.24 Gen4 validation. On a 256-core Gen4 box decompressing a
 9.75 GiB → 19.53 GiB mixed file (buffered output, no `--direct`), the three
@@ -544,7 +554,7 @@ high compat value.
 | --sync-output under --direct | 7.5 | Low | Not started |
 | is_all_zero unaligned load | 7.6 | Low | Not started |
 | Remove dead SequentialDispatcher | 7.7 | Low | Needs verify |
-| Decompress reader queue-depth cap (gpu-only RSS blowup) | 7.8 | Medium | Not started (hybrid-fault hypothesis disproven) |
+| Decompress reader queue-depth cap (gpu-only RSS blowup) | 7.8 | Medium | DONE (v0.13.29) |
 | Bundled short flags (-dc, -dk) for zstd/gzip compat | 7.9 | Medium | DONE (v0.13.27) |
 
 ### Streaming Decompression Output

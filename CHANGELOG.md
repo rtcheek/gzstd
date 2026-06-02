@@ -1,9 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.28  
+**Covers:** v0.9.50 → v0.13.29  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.29 — Bound the decompress reader: queue-depth backpressure (slow-consumer RSS)
+
+The FrameThrottle bounds *popped-but-unwritten* frames, but nothing bounded the
+TaskQueue *ahead* of the workers.  On decompress, `stream_frames_to_queue` reads
+each compressed frame into a fresh `Task.data` vector and pushes it; when the
+consumer is slower than the reader — classically `--gpu-only` decompress, which
+is D2H-bound — the reader races ahead and buffers the *entire* compressed input
+in RAM.  The v0.13.24 Gen4 isolation caught this: gpu-only `-d` of a 9.75 GiB
+input held 11.3 GiB RSS (vs ~1.9 GiB for cpu-only/hybrid), and it's a latent OOM
+on inputs larger than RAM.  (ROADMAP 7.8; the original "hybrid excess faults"
+hypothesis there was disproven — that was the buffered-write storm.)
+
+`TaskQueue` gains an optional `max_depth_` (0 = unbounded, the default): `push()`
+blocks on a new `space_cv_` once the queue is full, and the pop paths a bounded
+queue uses (`try_pop_one`, `pop_batch_greedy`, `try_pop_one_cpu`) plus `set_done()`
+wake it.  `re_enqueue` (push_front) bypasses the cap so it never blocks.  Both
+decompress paths set the cap to a pipeline-depth multiple
+(`max(THROTTLE_MIN_FRAMES, parallelism * slack)`), so queued RAM is O(pipeline),
+not O(input) — skipped under `--no-throttle`.  The cap is deliberately ≥ the
+auto-tuner's batch needs, so it bounds RAM without constraining GPU batch growth
+(no throughput risk).  Compress queues are never bounded; with mmap input they're
+zero-copy views anyway.
+
+Verified: cpu-only/gpu-only/hybrid decompress round-trip with no deadlock (the
+producer blocks and resumes correctly); a slow-consumer gpu-only `-d` of a 3 GB /
+~2861-frame incompressible input holds 1.79 GiB RSS (queue capped, not the whole
+input buffered); 259/259 tests pass.
 
 ---
 
