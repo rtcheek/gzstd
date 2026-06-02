@@ -1,9 +1,34 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.22  
+**Covers:** v0.9.50 → v0.13.23  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.23 — Fix: AsyncWritePool flush() waits for the physical write, not just the dequeue
+
+Correctness fix found in a full-pipeline review.  `AsyncWritePool::flush()` waited
+only on `pending_.empty()`, but the background write thread empties `pending_` by
+*moving* the batch out before it writes it to disk.  So `flush()` could return
+while the last batch was still in flight.  A write error on that final batch
+(disk full, EIO, broken O_DIRECT tail) sets `error_` only *after* the single
+`had_error()` check in `writer_thread`, so the run reported success (exit 0) and
+the atomic `rename` proceeded over truncated/corrupt output.  Mid-stream errors
+were already caught one batch late by the `had_error()` check inside `submit()`;
+only the final batch escaped — i.e. precisely the disk-full-at-the-end case.
+
+Fix: a `writing_` flag (guarded by the pool mutex) is set true when the worker
+dequeues a batch and cleared once the batch is physically written — including on
+the error-return path, which now also notifies so a blocked `flush()` wakes.
+`flush()` now waits on `pending_.empty() && !writing_`, making the post-`flush()`
+`had_error()` check reliable.  No hot-path change: the flag is touched twice per
+batch under a mutex that was already taken on those transitions.
+
+Roadmap Phase 7.1.  The remaining review items (GPU result-buffer pooling on the
+Gen4 hybrid-decompress path, throttle-budget chunk size, CPU-compress memcpy,
+and minor nits) are tracked in ROADMAP.md Phase 7.
 
 ---
 

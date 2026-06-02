@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.22";
+static constexpr const char * GZSTD_VERSION = "0.13.23";
 //
 // Architecture overview:
 //
@@ -3041,7 +3041,12 @@ public:
   // Wait for all queued writes to complete.
   void flush() {
     std::unique_lock<std::mutex> lk(m_);
-    cv_consumer_.wait(lk, [this]{ return pending_.empty(); });
+    // Wait until the queued batch is both dequeued AND physically written.
+    // Waiting only on pending_.empty() returned while the worker was still
+    // writing the final batch (pending_ is emptied by the move, before the
+    // write), so a write error on that last batch escaped the had_error()
+    // check in writer_thread and the run reported success over corrupt output.
+    cv_consumer_.wait(lk, [this]{ return pending_.empty() && !writing_; });
   }
 
   bool had_error() const { return error_; }
@@ -3132,8 +3137,9 @@ private:
         cv_producer_.wait(lk, [this]{ return !pending_.empty() || done_; });
         if (done_ && pending_.empty()) return;
         work = std::move(pending_);
+        writing_ = true;  // mark busy: flush() must wait until this batch is written, not just moved
       }
-      cv_consumer_.notify_one();  // signal that pending_ is now empty
+      cv_consumer_.notify_one();  // pending_ now empty: unblock submit() backpressure
 
       // Write all buffers (last buffer's final block always written to ensure file length)
       for (size_t bi = 0; bi < work.size(); ++bi) {
@@ -3141,7 +3147,15 @@ private:
         uint64_t w_t0 = g_perf ? now_ns() : 0;
         bool is_last = (bi == work.size() - 1);
         if (!write_sparse(buf->data(), buf->size(), is_last)) {
-          error_ = true;
+          // Clear writing_ and surface the error before returning, so a
+          // flush() blocked on !writing_ wakes and the post-flush had_error()
+          // check sees the failure (final-batch errors used to be lost here).
+          {
+            std::lock_guard<std::mutex> lk(m_);
+            writing_ = false;
+            error_ = true;
+          }
+          cv_consumer_.notify_one();
           return;
         }
         if (g_perf) {
@@ -3159,6 +3173,16 @@ private:
         buf.reset();
         if (bp_) bp_->notify_drain();
       }
+
+      // Batch fully written (handed to the OS): clear writing_ and wake any
+      // flush() waiter.  flush() blocks on (pending_.empty() && !writing_) so
+      // it can no longer return mid-write — which is what let final-batch I/O
+      // errors slip past the had_error() check in writer_thread.
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        writing_ = false;
+      }
+      cv_consumer_.notify_one();
 
 #ifdef __linux__
       // Progressive writeback: kick dirty pages to disk asynchronously after
@@ -3189,6 +3213,7 @@ private:
   std::vector<FrameBuf> pending_;
   std::thread worker_;
   bool done_;
+  bool writing_ = false;  // true while the worker is physically writing a batch (guarded by m_)
   bool error_ = false;
   bool progressive_sync_ = false;
   uint64_t sparse_saved_ = 0;  // bytes skipped via sparse seek

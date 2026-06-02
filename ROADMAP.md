@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.0
+**Current version:** v0.13.23
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -267,6 +267,125 @@ Unknown flags rejected, `--` end-of-options, `--threads=N` form, argument order 
 
 ---
 
+## Phase 7: Code Review Findings (v0.13.23+)
+
+Deep-read review of the full CPU/shared pipeline (TaskQueue, FrameThrottle,
+writer thread + AsyncWritePool, HybridSched, both CPU workers, the frame
+splitter, `main`, arg parsing, backend defaults, DirectWriter) plus a sampling
+pass over the nvCOMP compress/decompress bodies. Each item below is
+independently testable. **Validate every item on both a low-core PCIe Gen3 box
+and a high-core PCIe Gen4 box** — the read/writeback balance differs enough
+between them that a win on one can be a wash or regression on the other (same
+asymmetry that governs `--mmap`/`--direct` defaults).
+
+### 7.1 `AsyncWritePool::flush()` returned before the final write completed
+**Priority: HIGH | Complexity: Low | Status: DONE (v0.13.23)**
+
+`flush()` waited only on `pending_.empty()`, but the worker empties `pending_`
+by *moving* the batch out before it writes it. So `flush()` could return while
+the last batch was still being written; a write failure there (disk full, EIO,
+broken O_DIRECT tail) set `error_` only after the single `had_error()` check in
+`writer_thread`, so the run reported success (exit 0) and the atomic `rename`
+proceeded over truncated/corrupt output. Mid-stream errors were caught one batch
+late by the `had_error()` check inside `submit()`; only the *final* batch was
+exposed — i.e. exactly the disk-full-at-the-end case.
+
+**Fix:** added a `writing_` flag (guarded by the pool mutex) set true when the
+worker dequeues a batch and cleared after the batch is physically written (and
+on the error-return path, with a notify). `flush()` now blocks on
+`pending_.empty() && !writing_`, making the post-`flush()` `had_error()` check
+reliable.
+
+**Test:** point output at a tiny tmpfs / quota'd directory sized so the *last*
+batch write is the one that fails; confirm a non-zero `EXIT_IO` (3) and that no
+successful `rename` occurs. Round-trip integrity across all five data profiles
+must be unchanged; compress/decompress throughput should be unaffected (no
+hot-path change).
+
+### 7.2 GPU result buffers allocate fresh per frame (no recycled pool)
+**Priority: HIGH | Complexity: Medium | Status: NOT STARTED**
+
+The CPU workers recycle a bounded `FrameBuf` pool (the v0.13.7/v0.13.8 fix for
+the per-iteration alloc + page-fault storm). The GPU completion paths do not —
+each finished frame does a fresh `make_shared<std::vector<char>>(size)`
+(`compress_nvcomp` async-poll + sync-drain paths; `decompress_nvcomp` D2H push).
+On the **Gen4 hybrid-decompress path** `size` is the full decompressed frame
+(~16 MiB), so every frame is a fresh ~16 MiB allocation + fault — the same storm
+the CPU pools were built to eliminate, never ported to the GPU side. This is the
+highest-value perf lead and it sits on the fast-fabric path that actually runs
+hybrid decompress.
+
+**Plan:** give each `StreamCtx` a small recycled `FrameBuf` pool with the same
+`use_count()==1` reclaim trick as `cpu_decomp_worker`. Confirm with `perf record`
+(page-fault + `mmap_lock` contention) on a Gen4 hybrid `-d` run before/after.
+
+**Test:** Gen4 hybrid decompress on `mixed`/`low` (large output); compare
+throughput and `perf stat` faults vs v0.13.23. Gen3 path is `--cpu-only` by
+default so it won't exercise this — force `--hybrid -d` there for a sanity
+round-trip only.
+
+### 7.3 Throttle budget computed from the unresolved chunk size (compress)
+**Priority: Medium | Complexity: Low | Status: NOT STARTED**
+
+`compress_cpu_mt` builds the `FrameThrottle` from `opt.chunk_mib * ONE_MIB`, but
+the frame size actually used is `host_chunk` (= `chosen_mib`), which can be
+auto-bumped for `--ultra` or shrunk by `check_ram_budget`. For the default path
+they're equal; on ultra / low-RAM runs the in-flight RAM cap is computed against
+a stale 16 MiB and can over- or under-shoot. Pass the resolved `chosen_mib`.
+(`decompress_cpu_mt` has the same stale-`opt.chunk_mib` argument, but there the
+true frame size isn't known until after streaming, so it stays a heuristic.)
+
+**Test:** `--ultra -22 --chunk-size`-unset compress; verify peak RSS stays within
+the intended in-flight cap (watch `[THROTTLE]` at `-v`/`-vv`) and that throughput
+is unchanged at default settings.
+
+### 7.4 Redundant memcpy of every compressed frame (CPU compress)
+**Priority: Medium | Complexity: Medium | Status: NEEDS BENCHMARK**
+
+`cpu_worker` compresses into a per-thread `scratch`, then copies `csz` bytes into
+a pooled `FrameBuf`. For low-compressibility data (`mixed`/`low`) `csz ≈ chunk`,
+so it's a full-frame memcpy per frame on exactly the profiles where compress is
+slowest. Compressing straight into the pooled buffer eliminates the copy **but**
+inflates every pool slot to `compressBound` capacity, which on a high-core box
+with a deep throttle is a large RAM regression for *compressible* data — so the
+current scratch+copy is a deliberate trade. A targeted version (e.g. `swap`
+scratch into the slot only when `csz` exceeds a fraction of the chunk) could
+capture the incompressible-data win without the memory hit.
+
+**Test:** prototype the conditional swap; benchmark compress on all five profiles
+on both box classes, watching both throughput *and* peak RSS. Only land if
+`mixed`/`low` improve with no RSS regression on `high`/`zeros`. Do not change
+blindly.
+
+### 7.5 `--sync-output` is a no-op under `--direct`
+**Priority: Low | Complexity: Low | Status: NOT STARTED**
+
+When the O_DIRECT writer owns output, the `FILE* out` was closed and nulled, so
+the `if (out) fsync(out)` branch in `main` is skipped. O_DIRECT data is durable
+but the `ftruncate`-set size metadata isn't fsync'd. If a user pairs
+`--direct --sync-output` expecting durability they don't get the fsync. Add an
+`fdatasync(dw->fd())` in `DirectWriter::finalize()` (or before close) when
+`sync_output` is set.
+
+**Test:** `--direct --sync-output`, then inspect with `strace`/`fsync` that the
+sync actually fires; functional round-trip unchanged.
+
+### 7.6 `is_all_zero` does an unaligned `size_t` load
+**Priority: Low | Complexity: Low | Status: NOT STARTED**
+
+`reinterpret_cast<const size_t*>(p)` where `p` is `vector<char>::data()` — fine
+on x86, UB on strict-alignment targets. Cosmetic for current hardware; use
+`memcpy` into a `size_t` (compiles to the same load on x86) to keep it portable.
+
+### 7.7 `SequentialDispatcher` appears unused
+**Priority: Low | Complexity: Low | Status: NEEDS VERIFY**
+
+Defined but no caller was found in the reviewed paths (GPU workers use
+`pop_batch_greedy(min_n=1)` directly). If a full-file grep confirms it's dead,
+delete it (~40 lines of concurrency surface removed). Verify before removing.
+
+---
+
 ## Remaining Work for v1.0
 
 | Item | Phase | Priority | Status |
@@ -279,6 +398,13 @@ Unknown flags rejected, `--` end-of-options, `--threads=N` form, argument order 
 | Streaming mode for unknown-size input | 3.2 | Low | Not started |
 | Multi-reader NVMe | 4.1 | Low | Research |
 | Multi-writer O_DIRECT pwrite | 4.2 | Low | Tested negative for buffered |
+| AsyncWritePool flush() final-batch error | 7.1 | HIGH | DONE (v0.13.23) |
+| GPU result buffer pool (Gen4 hybrid decompress) | 7.2 | HIGH | Not started |
+| Throttle budget uses resolved chunk size | 7.3 | Medium | Not started |
+| CPU-compress redundant memcpy | 7.4 | Medium | Needs benchmark |
+| --sync-output under --direct | 7.5 | Low | Not started |
+| is_all_zero unaligned load | 7.6 | Low | Not started |
+| Remove dead SequentialDispatcher | 7.7 | Low | Needs verify |
 
 ### Streaming Decompression Output
 **Priority: HIGH | Complexity: Medium | Status: DONE (v0.12.24)**
@@ -343,3 +469,6 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 | v0.12.0 | FrameThrottle: counting semaphore replaces byte-based backpressure (-57 lines, deadlock-free by construction) |
 | v0.12.14–20 | Pipeline-depth throttle budget, throttle diagnostics/tunables, thundering herd fix, default buffered I/O, hybrid deadlock fixes, re_enqueue FIFO fix |
 | v0.12.21 | mmap zero-copy compression input (3.1s vs 9.9s), benchmark accuracy fix, failed mmap output experiment documented |
+| v0.13.0–v0.13.16 | Asymmetric mode + PCIe-gen detection, streaming single-frame decompress, bounded per-worker buffer pools (page-fault storm fix), CV-wait pool drain, skip-serial-GPU-probe, CUDA-init/reader overlap |
+| v0.13.17–v0.13.22 | mmap fault-storm investigation: producer prefault and kernel-gated mmap/fread both tried and reverted (pre-6.4-kernel mmap_lock artifact); `--cold` flag for honest cold-cache benchmarking; mmap restored as default everywhere |
+| v0.13.23 | AsyncWritePool flush() waits for physical write completion (final-batch I/O errors no longer slip past had_error()) |
