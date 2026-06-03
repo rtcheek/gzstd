@@ -358,7 +358,7 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=259
+EXPECTED_TESTS=213
 $EXTENSIVE && EXPECTED_TESTS=290
 count_tests() { echo "$EXPECTED_TESTS"; }
 
@@ -2590,6 +2590,12 @@ else
 fi
 rm -f "$TMPDIR/sw-cpu.zst"
 
+# The two zstd-compat command-line sections below are gated to --extensive:
+# they verify drop-in zstd/gzip flag compatibility (aliases, no-op acceptance,
+# bundled short flags), which rarely changes.  Run the extensive suite (-e)
+# after touching arg parsing or the compat layer.
+if $EXTENSIVE; then
+
 # ============================================================
 section "zstd-compat flag layer"
 
@@ -2736,6 +2742,8 @@ expect_exit 2 "$GZSTD" -dz "$TMPDIR/bf.zst" \
    | grep -q "take seq=") \
   && pass "-vv still maps to debug (repeat flag not bundled)" || fail "-vv still maps to debug"
 rm -f "$TMPDIR/bf.bin" "$TMPDIR/bf.zst" "$TMPDIR/bf" "$TMPDIR/bf.out"
+
+fi  # $EXTENSIVE (zstd-compat flag layer + bundled short flags)
 
 # ============================================================
 section "Parameter honor verification"
