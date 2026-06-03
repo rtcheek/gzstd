@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.29
+**Current version:** v0.13.30
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -403,7 +403,12 @@ on both box classes, watching both throughput *and* peak RSS. Only land if
 blindly.
 
 ### 7.5 `--sync-output` is a no-op under `--direct`
-**Priority: Low | Complexity: Low | Status: NOT STARTED**
+**Priority: Low | Complexity: Low | Status: DONE (v0.13.30)**
+
+`main` now fsyncs the DirectWriter's own fd when `sync_output` is set (the
+`FILE* out` is closed/nulled under `--direct`, so the buffered fsync path never
+ran). Confirmed via strace: `--direct --sync-output` issues one fsync, `--direct`
+alone issues none.
 
 When the O_DIRECT writer owns output, the `FILE* out` was closed and nulled, so
 the `if (out) fsync(out)` branch in `main` is skipped. O_DIRECT data is durable
@@ -416,14 +421,21 @@ but the `ftruncate`-set size metadata isn't fsync'd. If a user pairs
 sync actually fires; functional round-trip unchanged.
 
 ### 7.6 `is_all_zero` does an unaligned `size_t` load
-**Priority: Low | Complexity: Low | Status: NOT STARTED**
+**Priority: Low | Complexity: Low | Status: DONE (v0.13.30)**
+
+Replaced the unaligned `reinterpret_cast<const size_t*>` with a constant-size
+`memcpy` into a `size_t` (same wide load on x86, portable on strict-alignment
+targets).
 
 `reinterpret_cast<const size_t*>(p)` where `p` is `vector<char>::data()` — fine
 on x86, UB on strict-alignment targets. Cosmetic for current hardware; use
 `memcpy` into a `size_t` (compiles to the same load on x86) to keep it portable.
 
 ### 7.7 `SequentialDispatcher` appears unused
-**Priority: Low | Complexity: Low | Status: NEEDS VERIFY**
+**Priority: Low | Complexity: Low | Status: DONE (v0.13.30)**
+
+Verified dead (type + methods appeared only in its own definition; superseded by
+the per-GPU result slots in v0.11.11) and removed — ~46 lines.
 
 Defined but no caller was found in the reviewed paths (GPU workers use
 `pop_batch_greedy(min_n=1)` directly). If a full-file grep confirms it's dead,
@@ -551,9 +563,9 @@ high compat value.
 | GPU result buffer pool (Gen4 hybrid decompress) | 7.2 | HIGH | Decompress DONE (v0.13.24); compress deferred |
 | Throttle budget uses resolved chunk size | 7.3 | Medium | DONE (v0.13.28) |
 | CPU-compress redundant memcpy | 7.4 | Medium | Needs benchmark |
-| --sync-output under --direct | 7.5 | Low | Not started |
-| is_all_zero unaligned load | 7.6 | Low | Not started |
-| Remove dead SequentialDispatcher | 7.7 | Low | Needs verify |
+| --sync-output under --direct | 7.5 | Low | DONE (v0.13.30) |
+| is_all_zero unaligned load | 7.6 | Low | DONE (v0.13.30) |
+| Remove dead SequentialDispatcher | 7.7 | Low | DONE (v0.13.30) |
 | Decompress reader queue-depth cap (gpu-only RSS blowup) | 7.8 | Medium | DONE (v0.13.29) |
 | Bundled short flags (-dc, -dk) for zstd/gzip compat | 7.9 | Medium | DONE (v0.13.27) |
 

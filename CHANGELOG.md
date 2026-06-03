@@ -1,9 +1,35 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.29  
+**Covers:** v0.9.50 → v0.13.30  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.30 — Review cleanups: --sync-output under --direct, unaligned load, dead code
+
+Three small fixes from the Phase 7 review (ROADMAP 7.5–7.7):
+
+- **7.5 — `--sync-output` was a no-op under `--direct`.** When the O_DIRECT writer
+  owns the output, the `FILE* out` is closed and nulled, so the `fsync_file(out)`
+  path in `main` never ran — `--direct --sync-output` returned without ever
+  flushing.  Now `main` fsyncs the DirectWriter's own fd (device write cache +
+  the size metadata from finalize's ftruncate) when `sync_output` is set.
+  Confirmed via strace: `--direct --sync-output` issues one fsync, `--direct`
+  alone issues none.
+
+- **7.6 — `is_all_zero` did an unaligned `size_t` load.**
+  `reinterpret_cast<const size_t*>(p)` on a `vector<char>::data()` pointer is UB
+  on strict-alignment targets.  Replaced with a constant-size `memcpy` into a
+  `size_t` (same wide load on x86, portable elsewhere).
+
+- **7.7 — removed the dead `SequentialDispatcher` class.**  Superseded by the
+  per-GPU result slots (v0.11.11); no callers remained (verified — the type and
+  its methods appeared only in its own definition).  ~46 lines of concurrency
+  surface gone.
+
+259/259 tests pass; sparse and `--direct --sync-output` round-trips verified.
 
 ---
 

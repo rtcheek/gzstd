@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.29";
+static constexpr const char * GZSTD_VERSION = "0.13.30";
 //
 // Architecture overview:
 //
@@ -2667,51 +2667,6 @@ private:
   std::atomic<size_t>     total_tasks_{0};
 };
 
-// Sequential frame dispatcher: assigns contiguous frame ranges to GPU workers
-// in round-robin order, so results arrive at the writer in long sequential runs.
-// GPU 0 gets batch 0, GPU 1 gets batch 1, ..., then GPU 0 gets batch N, etc.
-// This minimizes out-of-order delivery to the writer thread.
-//
-// Usage: each GPU worker calls pop_my_batch(my_slot) which blocks until
-// it's that slot's turn, then pops a contiguous batch from the queue.
-class SequentialDispatcher {
-public:
-  explicit SequentialDispatcher(int num_slots)
-    : num_slots_(num_slots), next_slot_(0) {}
-
-  // Block until it's this slot's turn, then pop a batch from the queue.
-  // Returns false when queue is drained.
-  bool pop_my_batch(int slot, size_t batch_size, TaskQueue & queue,
-                    std::vector<Task> & out)
-  {
-    // Wait for our turn
-    std::unique_lock<std::mutex> lk(mtx_);
-    cv_.wait(lk, [&]{ return slot == next_slot_ || queue.drained(); });
-    if (queue.drained() && queue.size() == 0) return false;
-    lk.unlock();
-
-    // Pop from queue (we have the turn  other GPUs are waiting)
-    bool ok = queue.pop_batch_greedy(batch_size, out);
-
-    // Advance to next slot
-    {
-      std::lock_guard<std::mutex> lk2(mtx_);
-      next_slot_ = (next_slot_ + 1) % num_slots_;
-    }
-    cv_.notify_all();
-    return ok;
-  }
-
-  // Wake all waiters (called when queue is drained)
-  void notify_done() { cv_.notify_all(); }
-
-private:
-  int num_slots_;
-  int next_slot_;
-  std::mutex mtx_;
-  std::condition_variable cv_;
-};
-
 // Queue for "rescue" tasks: chunks that a failed GPU worker couldn't compress
 // get re-routed here for CPU fallback compression.
 class RescueQueue {
@@ -3092,11 +3047,16 @@ private:
   // Check if a region is all zeros (for sparse file support).
   // Uses size_t-wide comparisons for speed.
   static bool is_all_zero(const char * p, size_t len) {
-    // Check in size_t chunks for speed
-    const size_t * wp = reinterpret_cast<const size_t *>(p);
+    // Check in size_t chunks for speed.  memcpy into a size_t rather than an
+    // unaligned reinterpret_cast: p is vector<char>::data() (not size_t-
+    // aligned), so the cast is UB on strict-alignment targets.  With a constant
+    // size this compiles to the same wide load on x86 (ROADMAP 7.6).
     size_t words = len / sizeof(size_t);
-    for (size_t i = 0; i < words; ++i)
-      if (wp[i] != 0) return false;
+    for (size_t i = 0; i < words; ++i) {
+      size_t w;
+      std::memcpy(&w, p + i * sizeof(size_t), sizeof(w));
+      if (w != 0) return false;
+    }
     // Check remaining bytes
     for (size_t i = words * sizeof(size_t); i < len; ++i)
       if (p[i] != 0) return false;
@@ -9178,6 +9138,14 @@ int main(int argc, char ** argv)
     auto t_fin = std::chrono::steady_clock::now();
     if (!g_direct_writer->finalize())
       die_io("failed to finalize O_DIRECT output");
+    if (opt.sync_output) {
+      // --direct closed the FILE* and writes via DirectWriter's own fd, so the
+      // fsync_file(out) path below never runs.  Flush the O_DIRECT fd here
+      // (device write cache + the size metadata set by finalize's ftruncate) so
+      // --direct --sync-output is actually durable (ROADMAP 7.5).
+      int dfd = g_direct_writer->fd();
+      if (dfd >= 0) ::fsync(dfd);
+    }
     g_direct_writer = nullptr;
     direct_writer.reset();
     finalize_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
