@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.32
+**Current version:** v0.13.33
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -342,7 +342,7 @@ must be unchanged; compress/decompress throughput should be unaffected (no
 hot-path change).
 
 ### 7.2 GPU result buffers allocate fresh per frame (no recycled pool)
-**Priority: HIGH | Complexity: Medium | Status: DONE for decompress (v0.13.24); compress deferred**
+**Priority: HIGH | Complexity: Medium | Status: DONE (decompress v0.13.24, compress v0.13.33)**
 
 The CPU workers recycle a bounded `FrameBuf` pool (the v0.13.7/v0.13.8 fix for
 the per-iteration alloc + page-fault storm). The GPU completion paths do not —
@@ -367,10 +367,9 @@ Gen3 proxy. Benchmark `--hybrid -d` on `mixed`/`low` vs v0.13.23 (throughput +
 `/usr/bin/time -v` faults/RSS). `perf stat` needs `perf_event_paranoid` lowered;
 `/usr/bin/time -v` works unprivileged and is what the Gen3 numbers above used.
 
-**Deferred (compress):** `compress_nvcomp` completion paths also allocate per
-frame, but hold only the *compressed* output (small), so fault pressure is far
-lower. Same pool pattern applies; do it only if a Gen4 compress profile shows it
-matters.
+**Done (compress, v0.13.33):** `StreamCtx` got the same recycled `out_pool`; both
+`gpu_worker` completion paths use it. Lower-value (compressed output is small) but
+removes the per-frame alloc churn; round-trips verified, 213/213. 7.2 fully closed.
 
 ### 7.3 Throttle budget computed from the unresolved chunk size (compress)
 **Priority: Medium | Complexity: Low | Status: DONE (v0.13.28)**
@@ -581,7 +580,7 @@ high compat value.
 | Multi-reader NVMe | 4.1 | Low | Research |
 | Multi-writer O_DIRECT pwrite | 4.2 | Low | Tested negative for buffered |
 | AsyncWritePool flush() final-batch error | 7.1 | HIGH | DONE (v0.13.23) |
-| GPU result buffer pool (Gen4 hybrid decompress) | 7.2 | HIGH | Decompress DONE (v0.13.24); compress deferred |
+| GPU result buffer pool (compress + decompress) | 7.2 | HIGH | DONE (decompress v0.13.24, compress v0.13.33) |
 | Throttle budget uses resolved chunk size | 7.3 | Medium | DONE (v0.13.28) |
 | CPU-compress redundant memcpy | 7.4 | Medium | DONE (v0.13.32) — kept; throughput within noise |
 | --sync-output under --direct | 7.5 | Low | DONE (v0.13.30) |

@@ -41,7 +41,7 @@ Results written to `benchmark-results.json`.
 
 ## Architecture
 
-**Single-file monolith**: All ~6,400 lines live in `gzstd.cpp`. Read the architecture comment at the top (lines 1–36) first.
+**Single-file monolith**: All ~9,900 lines live in `gzstd.cpp`. Read the architecture comment at the top (lines 1–41) first.
 
 ### Data flow
 

@@ -1,9 +1,29 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.32  
+**Covers:** v0.9.50 → v0.13.33  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.33 — Recycle GPU compress output buffers; CLAUDE.md line count
+
+Finishes the compress side of ROADMAP 7.2 (the decompress side landed in
+v0.13.24).  Both GPU-compress completion paths (`gpu_worker` async-poll and sync
+drain) did a fresh `make_shared<std::vector<char>>(csz)` per frame for the D2H
+readback buffer; `StreamCtx` now owns the same recycled `out_pool` as the
+decompress path (`acquire_out_buf`, `use_count()==1` reclaim, lazy growth to two
+batches, drain-wait past the cap).  Lower-value than the decompress pool —
+compress output is the *compressed* bytes (small for compressible data) — but it
+removes the per-frame allocation churn on the GPU/hybrid compress paths, most
+relevant for incompressible input where csz approaches the chunk size.
+
+Round-trips verified on gpu-only and hybrid compress (incompressible + mixed);
+213/213 tests pass.  This closes 7.2 — GPU result buffers are now pooled on both
+compress and decompress.
+
+Also: corrected the stale `~6,400 lines` figure in CLAUDE.md (the file is ~9,900).
 
 ---
 

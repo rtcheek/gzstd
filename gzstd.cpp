@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.32";
+static constexpr const char * GZSTD_VERSION = "0.13.33";
 //
 // Architecture overview:
 //
@@ -5487,6 +5487,35 @@ struct StreamCtx {
   StreamStats stats{};
   std::chrono::steady_clock::time_point last_adjust{ std::chrono::steady_clock::now() };
 
+  // Recycled host output buffers for D2H readback — same pool as the decompress
+  // path (ROADMAP 7.2): reuse a slot whose use_count()==1 (writer has drained
+  // it) instead of a fresh make_shared per frame.  Compress output is the
+  // *compressed* bytes (smaller than decomp), so fault pressure is lower, but
+  // the pool still removes the per-frame allocation churn.  Grows lazily to a
+  // cap; deadlock-free by the throttle FIFO argument (frames pushed in seq
+  // order, writer drains the oldest and frees a slot).
+  std::vector<FrameBuf> out_pool;
+  uint64_t out_pool_waits = 0;
+  FrameBuf acquire_out_buf(size_t cap, FrameThrottle * bp) {
+    for (;;) {
+      for (auto & b : out_pool)
+        if (b.use_count() == 1) return b;
+      if (out_pool.size() < cap) {
+        out_pool.push_back(std::make_shared<std::vector<char>>());
+        return out_pool.back();
+      }
+      ++out_pool_waits;
+      if (bp) {
+        bp->wait_for_drain([&]{
+          for (auto & b : out_pool) if (b.use_count() == 1) return true;
+          return false;
+        });
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  }
+
   // Throughput-aware auto-tuning: continuously searches for the optimal
   // batch size using a hill-climbing/binary-search approach.
   //
@@ -6284,7 +6313,8 @@ static void gpu_worker(
           for (size_t i=0;i<C.filled;++i) {
             if (C.h_stats[i] != nvcompSuccess) throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
             const size_t csz = C.h_comp_sizes[i]; out_sum += csz; in_sum += C.h_in_sizes[i];
-            auto h_out = std::make_shared<std::vector<char>>(csz);
+            auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
+            h_out->resize(csz);
             const void * d_src = static_cast<char*>(C.d_out_base)
                                  + i * C.max_out_chunk;
             if (C.h2d_pinned_base) {
@@ -6439,7 +6469,8 @@ static void gpu_worker(
           uint64_t d2h_t0 = now_ns();
           for (size_t i = 0; i < C.filled; ++i) {
             const size_t csz = C.h_comp_sizes[i];
-            auto h_out = std::make_shared<std::vector<char>>(csz);
+            auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
+            h_out->resize(csz);
             const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
             if (C.h2d_pinned_base) {
               // Reuse the H2D pinned slot for D2H (sync drain path).
