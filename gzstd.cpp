@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.31";
+static constexpr const char * GZSTD_VERSION = "0.13.32";
 //
 // Architecture overview:
 //
@@ -4181,12 +4181,21 @@ static void cpu_worker(
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
 
-    // Copy compressed bytes into a pooled buffer for the result store.
-    // The pool entry's resize() reuses resident pages from previous
-    // iterations — only first use of each slot page-faults.
+    // Deliver compressed bytes via a pooled buffer.  For poorly-compressible
+    // output (csz a large fraction of the input) the memcpy below would copy a
+    // near-full chunk per frame, so instead swap the scratch buffer straight
+    // into the pooled FrameBuf (zero-copy) and take the pool slot's old buffer
+    // as the next scratch.  For well-compressible output csz is small: the copy
+    // is cheap and we keep pooled buffers right-sized (swapping there would
+    // leave every slot carrying scratch's full compressBound capacity).
+    // Threshold: output >= half the input.  (ROADMAP 7.4.)
     auto out_frame = acquire_out_buf();
-    out_frame->resize(csz);
-    std::memcpy(out_frame->data(), scratch.data(), csz);
+    if (csz * 2 >= in_size) {
+      std::swap(*out_frame, scratch);   // out_frame now owns the compressed data (size == csz)
+    } else {
+      out_frame->resize(csz);
+      std::memcpy(out_frame->data(), scratch.data(), csz);
+    }
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(in_size);

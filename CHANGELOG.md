@@ -1,9 +1,34 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.31  
+**Covers:** v0.9.50 → v0.13.32  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.32 — CPU compress: zero-copy swap for poorly-compressible frames (ROADMAP 7.4)
+
+`cpu_worker` compressed into a per-thread `scratch` buffer, then `memcpy`'d the
+result into a pooled `FrameBuf` for the writer.  For poorly-compressible data
+(`mixed` ~50%, `low` ~90%) `csz` is a large fraction of the chunk, so that was a
+near-full-chunk memcpy per frame on exactly the profiles where compress is
+slowest.
+
+Now, when `csz >= in_size / 2`, the worker `std::swap`s the scratch buffer
+straight into the pooled `FrameBuf` (zero-copy) and takes the pool slot's old
+buffer as the next scratch.  Well-compressible output (`csz` small) keeps the
+memcpy path — the copy is cheap there, and swapping would leave every pool slot
+carrying scratch's full `compressBound` capacity (a memory regression for tiny
+output).  The threshold confines the capacity overhang to slots that already
+hold large frames.
+
+Correctness verified (round-trips on incompressible/swap path, zeros/memcpy path,
+and mixed/both, multi-threaded); 213/213 tests pass.  This is the one Phase 7
+item that was deferred pending a benchmark — **validate compress throughput and
+peak RSS on `mixed`/`low` vs `high`/`zeros` on knuth (Gen5) and a low-core box.**
+Expected: faster `mixed`/`low` compress, no RSS regression on `high`/`zeros`; if
+RSS regresses or throughput doesn't move, revert (it's a contained change).
 
 ---
 

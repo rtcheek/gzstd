@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.31
+**Current version:** v0.13.32
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -394,7 +394,14 @@ the intended in-flight cap (watch `[THROTTLE]` at `-v`/`-vv`) and that throughpu
 is unchanged at default settings.
 
 ### 7.4 Redundant memcpy of every compressed frame (CPU compress)
-**Priority: Medium | Complexity: Medium | Status: NEEDS BENCHMARK**
+**Priority: Medium | Complexity: Medium | Status: IMPLEMENTED (v0.13.32); needs knuth benchmark**
+
+Implemented the conditional swap: when `csz >= in_size/2`, `cpu_worker` swaps the
+scratch buffer into the pooled FrameBuf (zero-copy) instead of memcpy; small
+output keeps the memcpy (avoids inflating pool slots to compressBound). Correctness
+verified (swap/memcpy/mixed round-trips, 213/213). Still needs a knuth benchmark of
+compress throughput + peak RSS on mixed/low vs high/zeros before declaring DONE;
+revert if no throughput win or an RSS regression on compressible profiles.
 
 `cpu_worker` compresses into a per-thread `scratch`, then copies `csz` bytes into
 a pooled `FrameBuf`. For low-compressibility data (`mixed`/`low`) `csz ≈ chunk`,
@@ -571,7 +578,7 @@ high compat value.
 | AsyncWritePool flush() final-batch error | 7.1 | HIGH | DONE (v0.13.23) |
 | GPU result buffer pool (Gen4 hybrid decompress) | 7.2 | HIGH | Decompress DONE (v0.13.24); compress deferred |
 | Throttle budget uses resolved chunk size | 7.3 | Medium | DONE (v0.13.28) |
-| CPU-compress redundant memcpy | 7.4 | Medium | Needs benchmark |
+| CPU-compress redundant memcpy | 7.4 | Medium | Implemented (v0.13.32); needs knuth benchmark |
 | --sync-output under --direct | 7.5 | Low | DONE (v0.13.30) |
 | is_all_zero unaligned load | 7.6 | Low | DONE (v0.13.30) |
 | Remove dead SequentialDispatcher | 7.7 | Low | DONE (v0.13.30) |
