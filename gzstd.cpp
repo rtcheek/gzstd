@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.30";
+static constexpr const char * GZSTD_VERSION = "0.13.31";
 //
 // Architecture overview:
 //
@@ -1527,6 +1527,18 @@ private:
 #endif // !_WIN32
 
 #ifndef _WIN32
+// FALLOC_FL_* may not be exposed by <fcntl.h> on all libc versions; the values
+// are stable kernel ABI.  Used by DirectWriter::seek_forward to punch holes so
+// sparse output and preallocation coexist (preallocate gives dense writes their
+// extent-stall-free path; punch-hole restores sparseness over skipped zeros).
+#ifdef __linux__
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE 0x01
+#endif
+#ifndef FALLOC_FL_PUNCH_HOLE
+#define FALLOC_FL_PUNCH_HOLE 0x02
+#endif
+#endif
 class DirectWriter {
 public:
   static constexpr size_t ALIGN = 4096;          // filesystem block alignment
@@ -1653,6 +1665,19 @@ public:
         buf_used_ = 0;
       }
     }
+    // If the file was preallocated, fallocate already allocated the blocks
+    // we're about to skip, so a bare lseek would NOT leave a hole — defeating
+    // sparse output.  Punch the skipped region back to a hole so sparse and
+    // preallocate coexist.  Best-effort: filesystems without punch support just
+    // keep the blocks allocated (degrades to non-sparse, never incorrect).
+    // write_sparse coalesces consecutive zero blocks, so this is one punch per
+    // zero run, not one per 4 KiB.
+#ifdef __linux__
+    if (preallocated_ > 0 && offset > 0) {
+      (void)::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                        (off_t)total_written_, (off_t)offset);
+    }
+#endif
     // Now seek the fd forward
     if (lseek(fd_, (off_t)offset, SEEK_CUR) < 0) return false;
     total_written_ += offset;
@@ -3083,16 +3108,27 @@ private:
       bool at_end = is_last_buffer && (pos + block >= len);
 
       if (sparse_ && !at_end && block == SPARSE_BLOCK && is_all_zero(data + pos, block)) {
-        // Skip this zero block via seek
+        // Coalesce consecutive zero blocks into a single skip, so the seek
+        // (and, on a preallocated O_DIRECT file, the hole-punch inside
+        // seek_forward) happens once per zero run instead of once per 4 KiB.
+        size_t zero_end = pos + block;
+        while (zero_end < len) {
+          size_t nb = std::min(len - zero_end, SPARSE_BLOCK);
+          bool nb_at_end = is_last_buffer && (zero_end + nb >= len);
+          if (nb != SPARSE_BLOCK || nb_at_end || !is_all_zero(data + zero_end, nb))
+            break;
+          zero_end += nb;
+        }
+        size_t zero_len = zero_end - pos;
         if (dw_) {
-          if (!dw_->seek_forward(block)) return false;
+          if (!dw_->seek_forward(zero_len)) return false;
         } else if (out_) {
-          if (std::fseek(out_, (long)block, SEEK_CUR) != 0)
+          if (std::fseek(out_, (long)zero_len, SEEK_CUR) != 0)
             return false;
         }
-        bytes_since_progress += block;
-        pos += block;
-        sparse_saved_ += block;
+        bytes_since_progress += zero_len;
+        pos = zero_end;
+        sparse_saved_ += zero_len;
       } else {
         // Find how many consecutive non-zero (or partial) blocks to write at once
         size_t write_end = pos + block;
@@ -9385,7 +9421,7 @@ static void apply_backend_defaults(Options & opt)
   if (opt.mode != Mode::TEST && !opt.direct_io_user_set && gen >= 4) {
     opt.direct_io = true;
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "[ASYMMETRIC] PCIe Gen" + std::to_string(gen)
+      vlog(V_VERBOSE, opt, "[O_DIRECT] PCIe Gen" + std::to_string(gen)
            + " detected; defaulting output to --direct (override with --no-direct)\n");
   }
 

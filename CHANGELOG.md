@@ -1,9 +1,42 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.30  
+**Covers:** v0.9.50 → v0.13.31  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.31 — Fix two Gen4+ regressions from the --direct default (sparse + log tag)
+
+Two test failures surfaced on a Gen5 box, both fallout from making `--direct` the
+default on Gen4+ (v0.13.25/26) — they only manifest where `--direct` auto-engages,
+so Gen<4 never saw them.
+
+- **Sparse output defeated by preallocate.**  Default `--direct` decompress uses
+  the DirectWriter, which preallocates the output (`fallocate`); the sparse path
+  then `lseek`s over zero regions whose blocks are *already allocated*, so the
+  file came out fully allocated instead of sparse (a real disk-bloat regression
+  for zero-heavy data, not just a test artifact).  Fix — **punch-hole hybrid**:
+  `seek_forward` now `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`s the
+  skipped region when the file was preallocated, deallocating those blocks back
+  to a hole.  Keeps preallocate's extent-stall-free dense writes AND restores
+  sparseness.  `write_sparse` now coalesces consecutive zero blocks into one
+  skip, so it's one punch per zero run, not one per 4 KiB.  Best-effort:
+  filesystems without punch support degrade to non-sparse (never incorrect).
+  Verified (forced `--direct` on a Gen3 box): 64 MiB zeros decompress → 16 blocks
+  sparse vs 131080 dense, both byte-correct; random-data `--direct` round-trip
+  unaffected.
+
+- **`[ASYMMETRIC]` log tag collision.**  The v0.13.25 `--direct` auto-default
+  reused the `[ASYMMETRIC]` tag and (correctly) runs before the
+  `backend_user_set` return, so on Gen4+ it logged `[ASYMMETRIC] … --direct` even
+  with an explicit `--cpu-only`/`--hybrid` — tripping the asymmetric tests that
+  assert explicit backends silence `[ASYMMETRIC]`.  Retagged that line
+  `[O_DIRECT]` (it's an I/O decision, not backend selection).  No behavior change.
+
+259/259 tests pass.  Validate the punch-hole + `[O_DIRECT]` retag on the Gen4+
+box where the failures originally appeared.
 
 ---
 

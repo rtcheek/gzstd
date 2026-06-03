@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.30
+**Current version:** v0.13.31
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -270,6 +270,15 @@ journal commits); medians favor it on Gen4.
 compress and decompress by default — pass `--no-direct` for the buffered
 comparison. Tracks the read/writeback asymmetry recorded in the CHANGELOG and
 memory.
+
+**Gen4+ regressions fixed (v0.13.31):** the default `--direct` exposed two issues
+that only manifest where it auto-engages. (1) DirectWriter preallocate
+(`fallocate`) defeated sparse output — fixed with a **punch-hole hybrid**
+(`seek_forward` punches skipped zero runs back to holes; `write_sparse` coalesces
+runs so it's one punch per run). Keeps preallocate's dense-write perf AND
+sparseness. (2) The `--direct` auto-default log reused the `[ASYMMETRIC]` tag and
+ran before the backend-user-set return, tripping the asymmetric tests under
+explicit backends — retagged `[O_DIRECT]`.
 
 ---
 
