@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.37";
+static constexpr const char * GZSTD_VERSION = "0.13.39";
 //
 // Architecture overview:
 //
@@ -2769,7 +2769,31 @@ private:
 // only) and the worker can reuse the buffer — eliminating the per-
 // iteration allocation that caused the page-fault storm fixed in
 // v0.13.7 for compress and v0.13.8 for decompress.
-using FrameBuf = std::shared_ptr<std::vector<char>>;
+// Allocator that DEFAULT-initializes (not value-initializes) elements grown by
+// resize()/the size-ctor.  For trivial T like char the grown region is left
+// UNINITIALIZED instead of zeroed, eliminating the resize() memset that
+// profiling pinned at ~16% on CPU decompress (every pooled buffer's first grow
+// to the full decompressed frame size) and the smaller residual on the GPU
+// direct-D2H readback paths.  Safe because every producer fully fills [0,size())
+// before the buffer is read (ZSTD / cudaMemcpy / assign / memcpy) and no writer
+// reads past size() — DirectWriter copies exactly size() bytes into its own
+// aligned buffer, so a buffer's [size(),capacity()) tail never reaches disk.
+template <typename T>
+struct default_init_allocator : std::allocator<T> {
+  using base = std::allocator<T>;
+  using base::base;
+  template <typename U> struct rebind { using other = default_init_allocator<U>; };
+  template <typename U>
+  void construct(U * p) noexcept(std::is_nothrow_default_constructible<U>::value) {
+    ::new (static_cast<void *>(p)) U;   // default-init: no zero-fill for trivial U
+  }
+  template <typename U, typename... Args>
+  void construct(U * p, Args &&... args) {
+    std::allocator_traits<base>::construct(static_cast<base &>(*this), p, std::forward<Args>(args)...);
+  }
+};
+using FrameVec = std::vector<char, default_init_allocator<char>>;
+using FrameBuf = std::shared_ptr<FrameVec>;
 
 struct ResultStore {
   std::mutex                                     m;
@@ -3414,7 +3438,7 @@ static thread_local ZSTD_CCtx * tl_cctx = nullptr;
 // Compresses one frame into `out` (a reusable per-thread buffer) and returns the
 // compressed size.  `out` is left sized to >= compressBound, NOT shrunk to csz —
 // the caller uses the returned size, and [csz, out.size()) is undefined padding.
-static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, int level, bool ultra, std::vector< char > & out)
+static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, int level, bool ultra, FrameVec & out)
 {
   if (!tl_cctx) {
     tl_cctx = ZSTD_createCCtx();
@@ -4025,7 +4049,7 @@ static void cpu_worker(
   // in lockstep during GPU init, they serialize on mmap_lock and burn ~64%
   // of CPU cycles inside the kernel's page-fault handler.  See v0.13.7
   // CHANGELOG for the perf-record evidence.
-  std::vector<char> scratch;
+  FrameVec scratch;
 
   // Per-thread bounded output-frame pool.  Same backpressure design as
   // cpu_decomp_worker (see comment there) — pool size derived from the
@@ -4038,7 +4062,7 @@ static void cpu_worker(
   const int throttle_budget = bp ? bp->max_permits() : 512;
   const int pool_size = std::max(2, throttle_budget / n_workers);
   std::vector<FrameBuf> out_pool(pool_size);
-  for (auto & b : out_pool) b = std::make_shared<std::vector<char>>();
+  for (auto & b : out_pool) b = std::make_shared<FrameVec>();
   uint64_t pool_wait_count = 0;
 
   auto acquire_out_buf = [&]() -> FrameBuf {
@@ -4279,7 +4303,7 @@ static void cpu_worker_rescue(
   FrameThrottle * bp)
 {
   // Per-thread reusable scratch — see cpu_worker comment for the rationale.
-  std::vector<char> scratch;
+  FrameVec scratch;
   while (true) {
     // Same wait-acquire-try pattern as cpu_worker: never hold a permit
     // while sleeping on the rescue CV, never hold a task without a permit.
@@ -4320,7 +4344,7 @@ static void cpu_worker_rescue(
 
     // Deliver compressed frame to the result store (copy of csz bytes;
     // scratch keeps capacity for the next iteration).
-    auto out_frame = std::make_shared<std::vector<char>>(
+    auto out_frame = std::make_shared<FrameVec>(
         scratch.data(), scratch.data() + csz);
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 
@@ -4393,7 +4417,7 @@ static void cpu_decomp_worker(
   const int throttle_budget = bp ? bp->max_permits() : 512;
   const int pool_size = std::max(2, throttle_budget / n_workers);
   std::vector<FrameBuf> decomp_pool(pool_size);
-  for (auto & b : decomp_pool) b = std::make_shared<std::vector<char>>();
+  for (auto & b : decomp_pool) b = std::make_shared<FrameVec>();
   uint64_t pool_wait_count = 0;  // telemetry — # of yields at -vv
 
   auto acquire_decomp_buf = [&]() -> FrameBuf {
@@ -5522,7 +5546,7 @@ struct StreamCtx {
       for (auto & b : out_pool)
         if (b.use_count() == 1) return b;
       if (out_pool.size() < cap) {
-        out_pool.push_back(std::make_shared<std::vector<char>>());
+        out_pool.push_back(std::make_shared<FrameVec>());
         return out_pool.back();
       }
       ++out_pool_waits;
@@ -7367,7 +7391,7 @@ static void gpu_decomp_worker(
         for (auto & b : out_pool)
           if (b.use_count() == 1) return b;
         if (out_pool.size() < cap) {
-          out_pool.push_back(std::make_shared<std::vector<char>>());
+          out_pool.push_back(std::make_shared<FrameVec>());
           return out_pool.back();
         }
         ++out_pool_waits;
@@ -8083,17 +8107,22 @@ static void gpu_decomp_worker(
           // writer both fit without stalling.
           size_t out_pool_cap = std::max<size_t>(2, C.alloc_batch) * 2;
           auto h_out = C.acquire_out_buf(out_pool_cap, bp);
-          h_out->resize(actual);
           const void * d_src = static_cast<char*>(C.d_decomp_buf) + i * C.alloc_decomp;
           if (C.h_decomp_pinned) {
-            // Device -> pinned host slot, then memcpy pinned -> output vector.
+            // Device -> pinned host slot, then copy pinned -> output vector.
             // Pinned cudaMemcpy uses a faster DMA path than pageable.
             void * pin_slot = static_cast<char*>(C.h_decomp_pinned)
                               + i * C.alloc_decomp;
             checkCuda(cudaMemcpy(pin_slot, d_src, actual,
                                  cudaMemcpyDeviceToHost), "D2H decomp pinned");
-            std::memcpy(h_out->data(), pin_slot, actual);
+            // assign() copies from the pinned slot without the resize() zero-fill
+            // the copy would immediately overwrite — and here `actual` is a FULL
+            // decompressed frame (~16 MiB), so the saved memset is far from tiny
+            // when the pool buffer has to grow (variable-frame-size input).
+            h_out->assign(static_cast<char*>(pin_slot),
+                          static_cast<char*>(pin_slot) + actual);
           } else {
+            h_out->resize(actual);  // direct D2H needs the dst pre-sized
             checkCuda(cudaMemcpy(h_out->data(), d_src, actual,
                                  cudaMemcpyDeviceToHost), "D2H decomp data");
           }

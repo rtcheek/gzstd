@@ -634,9 +634,17 @@ copy, but `assign` copy-constructs from the source instead of value-initializing
 then overwriting, so the zero-fill is gone.  Applied to the CPU memcpy branch and
 both GPU pinned completion paths (async-poll + sync-drain).  The GPU **non-pinned**
 direct-D2H fallback keeps `resize()` (dst must be pre-sized before `cudaMemcpy`;
-`assign` can't source from device memory) — slow fallback, left as-is.  Net: the
-provably-wasted zeroing is removed at zero cost/risk; the default-init allocator
-remains unnecessary.
+`assign` can't source from device memory) — slow fallback.
+
+**Update (v0.13.39): the default-init allocator was adopted after all** — not for
+this 0.59% GPU residual, but because the same audit found the **CPU decompress**
+resize-zero (`ZSTD_decompressDCtx` writes direct, so `assign` can't help) at **~16%
+of instructions** (large buffer pool → most frames grow a fresh full-frame buffer).
+`FrameBuf` now uses `default_init_allocator<char>`, which also mops up the remaining
+direct-write resize-zeros (CPU decompress, both non-pinned D2H paths).  Note: it's
+**throughput-neutral** (the memset was parallel/overlapped, not the wall-clock
+bottleneck) — kept as resource-waste elimination (fewer cycles + less memory-write
+traffic), not a speedup.  See CHANGELOG v0.13.39.
 
 <details><summary>Reproduction runbook (perf on knuth)</summary>
 

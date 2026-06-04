@@ -1,9 +1,50 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.37  
+**Covers:** v0.9.50 → v0.13.39  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.39 — Default-init allocator on `FrameBuf`: eliminate the resize() zero-fill on direct-write paths
+
+The `assign()` fixes (v0.13.37/38) only cover handoffs where bytes pass through
+host memory first.  The **direct-write** paths — CPU decompress (`ZSTD_decompressDCtx`
+writes straight into the buffer), GPU non-pinned D2H — still did
+`out_buf->resize(decomp_size)` before the write, value-initializing (zeroing) the
+grown region that the decompressor then fully overwrites.  Profiling CPU decompress
+(callgrind) pinned this at **`_M_default_append`→memset = ~16% of instructions**:
+the decomp buffer *pool* is large (`throttle_budget/n_workers`), so for any file up
+to ~pool-size frames almost every frame grows a never-yet-used buffer and pays the
+full ~16 MiB zero (it amortizes only on very large files).
+
+Fix: `FrameBuf` now uses a `default_init_allocator<char>` (a `std::allocator`
+subclass whose no-arg `construct()` default-initializes instead of value-initializes),
+so `resize()`-grow leaves the new region uninitialized rather than zeroed.  Safe:
+every producer fully fills `[0,size())` before the buffer is read (ZSTD / cudaMemcpy /
+assign / memcpy), and no writer reads past `size()` — `DirectWriter` copies exactly
+`size()` bytes into its own aligned buffer, so a buffer's `[size(),capacity())` tail
+never reaches disk.  Ripple was contained: the typedef, 5 `make_shared` sites, and
+the per-thread compress `scratch` (now `FrameVec` so it still `swap`s with the pooled
+output).
+
+Confirmed: `__memset` 16.2% → 1.9%, `_M_default_append` zeroing gone.  **Throughput-
+neutral** in wall-clock, though — those cycles were parallel across workers and
+overlapped with the memory-bandwidth/writer bottleneck, so this removes provably-
+wasted CPU cycles + ~0.9× output-size of memory-write traffic per decompress rather
+than adding speed.  Kept deliberately as resource-waste elimination.  All 30
+compress×decompress combinations (5 profiles × cpu/gpu/hybrid × cpu/gpu decompress)
+bit-identical incl. the sparse `zeros` path; 213/213 tests pass.
+
+## v0.13.38 — `assign()` for the GPU decompress pinned readback
+
+Extends v0.13.37's `assign()` change to the GPU decompress D2H readback pinned path
+(`gpu_decomp_worker`, both completion paths): `h_out->resize(actual)+memcpy(pin_slot)`
+→ `h_out->assign(pin_slot, pin_slot+actual)`.  Here `actual` is a full decompressed
+frame (~16 MiB), so the avoided zero-fill is far from tiny when the pooled buffer
+grows.  Non-pinned direct-D2H keeps `resize()` (dst must be pre-sized; superseded by
+the v0.13.39 allocator anyway).  Round-trips verified; 213/213 tests pass.
 
 ---
 
