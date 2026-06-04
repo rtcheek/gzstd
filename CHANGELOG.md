@@ -1,9 +1,52 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.33  
+**Covers:** v0.9.50 → v0.13.34  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.34 — GPU-failure rescue: fix permit leak + stranded-batch hang (ROADMAP 7.10)
+
+Deep-dive audit of the VRAM-exhaustion / GPU-failure rescue path (one of the
+7.10 targets) found two correctness bugs in the worker catch blocks, both of
+which only fire when a device fails mid-run — exactly when graceful rescue
+matters most.
+
+1. **FrameThrottle permit leak (compress + decompress).**  The throttle invariant
+   is "the popper acquires one permit per frame; the writer releases it after the
+   frame is written."  The success paths honour this (the GPU bulk-acquires
+   `pop_n` permits and the writer releases them one-by-one).  But both catch
+   blocks handed in-flight frames to the rescue queue / re-enqueued them
+   **without releasing the GPU's permits** — and the receiver (rescue worker, or
+   the next popper after re_enqueue) re-acquires a fresh permit per frame.  That
+   leaked one permit per rescued frame, up to `streams × per_stream_batch` per
+   device failure.  Since the auto budget floor is `devices × streams ×
+   per_stream_batch`, losing a device's permits could starve the surviving
+   rescue/CPU workers into deadlock.  Both catches now release the held permits
+   on hand-off (matching the in-loop decompress re_enqueue, which already did).
+
+2. **Stranded batch on submit-time failure (compress only).**  The compress
+   catch guarded rescue on `C.busy && !C.batch.empty()`, but `C.busy` isn't set
+   until *after* the H2D copies and the `nvcompBatchedZstdCompressAsync` launch —
+   any of which can throw.  A launch failure therefore left the just-popped batch
+   un-rescued: those frames never reached the sequence-ordered `ResultStore`, so
+   in hybrid mode (no abort) the writer blocked forever on the missing seq.  The
+   guard is now `!C.batch.empty()` (matching the decompress side); both success
+   paths clear `C.batch`, so a non-empty batch is always popped-but-undelivered
+   and safe to rescue without duplicate-output risk.
+
+Also removed dead code surfaced by the same audit: the per-stream
+EXPLORE/REFINE/SETTLE batch-size tuner (the `TuneState` enum + `tune_*` /
+`refine_*` fields in the compress `StreamCtx`, its ~26-line save/restore across
+buffer reallocation, and the identical unreferenced block in the decompress
+worker's per-stream struct).  It was fully superseded by the cross-GPU
+`SharedTuneState` hill-climb that all streams/devices share — same class as the
+7.7 `SequentialDispatcher` removal.  No behavioural change; batch size already
+came solely from `shared_tune`.
+
+213/213 tests pass.
 
 ---
 

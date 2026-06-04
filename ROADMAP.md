@@ -565,7 +565,26 @@ silently failed in a test pipeline). Low risk once the value-flag rule is fixed,
 high compat value.
 
 ### 7.10 Not-yet-audited areas — next deep-dive targets
-**Priority: Medium | Complexity: High | Status: OPEN (for a future session)**
+**Priority: Medium | Complexity: High | Status: PARTIAL — auto-tuner + failure rescue audited (v0.13.34); HybridSched still open**
+
+**v0.13.34 audit progress (2 of 3 targets done):**
+- **GPU auto-tuner — audited + dead code removed.** The live tuner is the
+  cross-GPU `SharedTuneState` (BASELINE→HALVE/DOUBLE→REFINE→SETTLED); no races or
+  convergence bugs found in it on this pass.  The per-stream
+  EXPLORE/REFINE/SETTLE hill-climb (`TuneState` + `tune_*`/`refine_*` fields in
+  both the compress `StreamCtx` and the decompress per-stream struct, plus the
+  save/restore across buffer reallocation) was **dead code** — superseded by
+  `SharedTuneState`, never read by any decision path — and is now removed (~56
+  lines), same class as the 7.7 `SequentialDispatcher` removal.
+- **VRAM-exhaustion + GPU-failure rescue — audited, two bugs fixed.**  (1) Both
+  catch blocks leaked one FrameThrottle permit per rescued/re-enqueued frame
+  (handed frames off without releasing; the receiver re-acquires) — up to
+  `streams × per_stream_batch` per device failure, enough to deadlock the
+  survivors.  (2) The compress catch guarded on `C.busy`, which isn't set until
+  after the throwing H2D/compress-launch calls, so a launch failure stranded the
+  just-popped batch and hung the writer.  Both fixed; see CHANGELOG v0.13.34.
+
+**Still open — `HybridSched` corner cases** (the third target below).
 
 The Phase 7 review (v0.13.23–v0.13.33) read the shared/CPU machinery line-by-line
 — `TaskQueue`, `FrameThrottle`, `AsyncWritePool`/`writer_thread`, `ResultStore`,

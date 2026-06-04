@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.33";
+static constexpr const char * GZSTD_VERSION = "0.13.34";
 //
 // Architecture overview:
 //
@@ -5516,32 +5516,9 @@ struct StreamCtx {
     }
   }
 
-  // Throughput-aware auto-tuning: continuously searches for the optimal
-  // batch size using a hill-climbing/binary-search approach.
-  //
-  // States:
-  //   EXPLORE: Try a new batch size, measure throughput
-  //   SETTLE:  Found a good size, use it.  Periodically probe to detect
-  //            changes in data characteristics (e.g., mixed tar archives).
-  //
-  // The tuner tracks throughput (GiB/s) at each tested batch size and
-  // binary-searches between known-good and known-bad sizes.
-  enum class TuneState { EXPLORE, REFINE, SETTLE };
-  TuneState   tune_state = TuneState::EXPLORE;
-  size_t      tune_lo = 0;             // lower bound of search range
-  size_t      tune_hi = 0;             // upper bound (set to per_stream_cap)
-  size_t      tune_best_batch = 0;     // best batch size found so far
-  double      tune_best_thr = 0.0;     // throughput at best batch size
-  size_t      tune_prev_batch = 0;     // batch size we're measuring now
-  double      tune_prev_thr = 0.0;     // throughput at previous batch size
-  uint32_t    tune_batches_at_size = 0; // how many batches processed at current size
-  uint32_t    tune_settle_count = 0;   // ticks spent in SETTLE state
-  static constexpr uint32_t TUNE_MIN_BATCHES = 2;   // min ticks before judging throughput
-  static constexpr uint32_t TUNE_PROBE_INTERVAL = 15; // ticks in SETTLE before probing
-  bool        tune_tried_down = false;  // have we tried halving yet?
-  bool        tune_tried_up = false;    // have we tried doubling yet?
-  size_t      refine_lo = 0;            // lower bound for refinement binary search
-  size_t      refine_hi = 0;            // upper bound for refinement binary search
+  // (Per-stream EXPLORE/REFINE/SETTLE batch-size tuner removed v0.13.34: it was
+  // dead code, superseded by the cross-GPU SharedTuneState hill-climb that all
+  // streams/devices share.  Batch size now comes solely from shared_tune.)
 };
 
 static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size_t gpu_chunk, size_t max_out_chunk, nvcompBatchedZstdCompressOpts_t comp_opts, const Options & opt)
@@ -5699,37 +5676,11 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   if (C.ev_h2d_end) { cudaEventDestroy(C.ev_h2d_end); }
   if (C.ev_comp_end) { cudaEventDestroy(C.ev_comp_end); }
   if (C.ev_d2h_end) { cudaEventDestroy(C.ev_d2h_end); }
-  // Preserve auto-tune state across buffer reallocation.
-  // C = StreamCtx{} would wipe tune_prev_batch, tune_best_thr, etc.
-  auto save_state = C.tune_state;
-  auto save_lo = C.tune_lo;
-  auto save_hi = C.tune_hi;
-  auto save_best_batch = C.tune_best_batch;
-  auto save_best_thr = C.tune_best_thr;
-  auto save_prev_batch = C.tune_prev_batch;
-  auto save_prev_thr = C.tune_prev_thr;
-  auto save_batches = C.tune_batches_at_size;
-  auto save_settle = C.tune_settle_count;
-  auto save_tried_down = C.tune_tried_down;
-  auto save_tried_up = C.tune_tried_up;
-  auto save_refine_lo = C.refine_lo;
-  auto save_refine_hi = C.refine_hi;
+  // Preserve accumulated per-stream stats (+ last_adjust) across the buffer
+  // reallocation: C = StreamCtx{} would otherwise wipe the JSON stats.
   auto save_adjust = C.last_adjust;
   auto save_stats = C.stats;
   C = StreamCtx{};
-  C.tune_state = save_state;
-  C.tune_lo = save_lo;
-  C.tune_hi = save_hi;
-  C.tune_best_batch = save_best_batch;
-  C.tune_best_thr = save_best_thr;
-  C.tune_prev_batch = save_prev_batch;
-  C.tune_prev_thr = save_prev_thr;
-  C.tune_batches_at_size = save_batches;
-  C.tune_settle_count = save_settle;
-  C.tune_tried_down = save_tried_down;
-  C.tune_tried_up = save_tried_up;
-  C.refine_lo = save_refine_lo;
-  C.refine_hi = save_refine_hi;
   C.last_adjust = save_adjust;
   C.stats = save_stats;
 }
@@ -6634,7 +6585,14 @@ static void gpu_worker(
       if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
       if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
         for (auto & C : *sp) {
-          if (C.busy && !C.batch.empty()) {
+          // Guard on the batch, NOT C.busy: a launch failure can throw after
+          // the pop (C.filled set) but before C.busy=true (during the H2D
+          // copies or the compress submit).  Those frames still hold permits
+          // and a ResultStore seq slot, so they must be rescued or they strand
+          // the sequence-ordered writer forever.  Both success paths clear
+          // C.batch, so a non-empty batch here is always popped-but-undelivered.
+          if (!C.batch.empty()) {
+            const int held = (int)C.filled;
             if (rescue) {
               // Hybrid mode: push to CPU rescue queue
               for (size_t i = 0; i < C.filled; ++i)
@@ -6644,6 +6602,11 @@ static void gpu_worker(
               // GPU-only mode: push back to main queue for other GPUs
               queue->re_enqueue(C.batch);
             }
+            // Release the permits this batch held: the rescue worker (and the
+            // next popper, after re_enqueue) re-acquires one permit per frame,
+            // so the GPU's originals must be handed back or they leak and
+            // eventually starve the surviving rescue/CPU workers into deadlock.
+            if (bp) bp->release(held);
           }
           free_stream_buffers_only(C, opt);
           if (C.stream) cudaStreamDestroy(C.stream);
@@ -7330,22 +7293,8 @@ static void gpu_decomp_worker(
     size_t filled = 0;
     size_t stream_index = 0;
 
-    // Auto-tune tracking
-    std::chrono::steady_clock::time_point last_adjust{ std::chrono::steady_clock::now() };
-    uint64_t tune_in_bytes = 0;      // bytes processed since last tune check
-    double   tune_elapsed_ms = 0.0;  // ms elapsed since last tune check
-    enum class TuneState { EXPLORE, REFINE, SETTLE };
-    TuneState tune_state = TuneState::EXPLORE;
-    size_t    tune_lo = 0, tune_hi = 0;
-    size_t    tune_best_batch = 0;
-    double    tune_best_thr = 0.0;
-    size_t    tune_prev_batch = 0;
-    double    tune_prev_thr = 0.0;
-    uint32_t  tune_batches_at_size = 0;
-    uint32_t  tune_settle_count = 0;
-    // Constants for tuner (not static  local classes can't have static members)
-    uint32_t TUNE_MIN_BATCHES = 2;
-    uint32_t TUNE_PROBE_INTERVAL = 15;
+    // (Per-stream auto-tune tracking removed v0.13.34: dead code, superseded by
+    // the shared SharedTuneState hill-climb — same as the compress StreamCtx.)
 
     // Pre-allocated device buffers (reused across batches)
     size_t alloc_batch = 0;     // how many slots are allocated
@@ -8272,7 +8221,13 @@ static void gpu_decomp_worker(
       if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
       for (auto & C : ctxs) {
         if (!C.batch.empty()) {
+          // Capture the permit count before re_enqueue clears the batch.  The
+          // next popper re-acquires one permit per frame, so release the GPU's
+          // originals here or they leak (mirrors the in-loop re_enqueue at the
+          // VRAM-retry path, which already releases).
+          const int held = (int)C.batch.size();
           queue->re_enqueue(C.batch);
+          if (bp) bp->release(held);
         }
         C.free_device();
         size_t freed = C.free_host_pinned();
