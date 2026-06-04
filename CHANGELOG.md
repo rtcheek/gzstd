@@ -1,9 +1,34 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.34  
+**Covers:** v0.9.50 → v0.13.35  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.35 — HybridSched: don't cap CPU when no GPU is active (ROADMAP 7.10)
+
+Completes the 7.10 deep-dive by auditing the third target, `HybridSched`.  No
+deadlock, missed-wakeup, or `gpus_waiting_` accounting bugs found: in fixed-share
+mode `should_cpu_take`/`should_gpu_take` can never both be false (so one engine
+always takes), the queue floor is enforced atomically in `may_take` and correctly
+skipped in fixed mode, `push()` wakes one CPU per task while the exit paths
+`notify_all`, and `gpu_got_data()` always fires before any throwing CUDA op.
+
+One robustness gap fixed: in fixed `--cpu-share` mode, if the GPU(s) never
+register (still initializing) or all fail/exit mid-run, nothing advances
+`gpu_taken_`, so the share cap (`cpu/total < share+0.02`) stalls the main CPU
+workers until the producer finishes — wasting the whole production phase before
+the drain fast-path recovers.  `should_cpu_take` now short-circuits to `true`
+when `active_gpu_streams_ == 0`, letting CPU run unrestricted whenever no GPU is
+present to consume its share.  Adaptive mode already handled this via the
+`gpus_waiting_`/floor path; healthy fixed-share runs keep `active_gpu_streams_ >
+0` throughout, so this is a no-op for them (verified: `--cpu-share 0.5` hybrid
+round-trip unchanged, GPU active throughout).
+
+213/213 tests pass.  This closes the 7.10 audit — all three targets (auto-tuner,
+failure rescue, HybridSched) are now done.
 
 ---
 

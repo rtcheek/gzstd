@@ -565,9 +565,9 @@ silently failed in a test pipeline). Low risk once the value-flag rule is fixed,
 high compat value.
 
 ### 7.10 Not-yet-audited areas — next deep-dive targets
-**Priority: Medium | Complexity: High | Status: PARTIAL — auto-tuner + failure rescue audited (v0.13.34); HybridSched still open**
+**Priority: Medium | Complexity: High | Status: DONE — all three targets audited (auto-tuner + failure rescue v0.13.34, HybridSched v0.13.35)**
 
-**v0.13.34 audit progress (2 of 3 targets done):**
+**Audit results (3 of 3 targets done):**
 - **GPU auto-tuner — audited + dead code removed.** The live tuner is the
   cross-GPU `SharedTuneState` (BASELINE→HALVE/DOUBLE→REFINE→SETTLED); no races or
   convergence bugs found in it on this pass.  The per-stream
@@ -584,34 +584,25 @@ high compat value.
   after the throwing H2D/compress-launch calls, so a launch failure stranded the
   just-popped batch and hung the writer.  Both fixed; see CHANGELOG v0.13.34.
 
-**Still open — `HybridSched` corner cases** (the third target below).
+- **`HybridSched` corner cases — audited (v0.13.35), clean + one robustness fix.**
+  No deadlock (fixed-mode `should_cpu_take`/`should_gpu_take` can't both be
+  false), no missed-wakeup (`push` wakes one CPU/task, exit paths `notify_all`),
+  floor enforced atomically in `may_take` and correctly skipped in fixed mode,
+  `gpus_waiting_` balanced.  Fixed: in fixed `--cpu-share` mode with no active GPU
+  (still initializing, or all failed), the share cap stalled the main CPU workers
+  for the whole production phase; `should_cpu_take` now short-circuits to `true`
+  when `active_gpu_streams_ == 0`.  Remaining cosmetic note: the ±0.02 hysteresis
+  leaks ~2% to the opposite engine at `--cpu-share` 0.0/1.0 (not worth fixing).
 
-The Phase 7 review (v0.13.23–v0.13.33) read the shared/CPU machinery line-by-line
-— `TaskQueue`, `FrameThrottle`, `AsyncWritePool`/`writer_thread`, `ResultStore`,
-the CPU compress/decompress workers, `stream_frames_to_queue`, `DirectWriter`,
-`main`, `parse_args`, `apply_backend_defaults` — and **sampled** the ~3,200-line
-nvCOMP bodies (completion paths, permit accounting, buffer pooling). The
-following were **not** audited line-by-line; a future session should dig here
-looking for both correctness bugs and perf wins:
+Background: the Phase 7 review (v0.13.23–v0.13.33) had read the shared/CPU
+machinery line-by-line — `TaskQueue`, `FrameThrottle`, `AsyncWritePool`/
+`writer_thread`, `ResultStore`, the CPU compress/decompress workers,
+`stream_frames_to_queue`, `DirectWriter`, `main`, `parse_args`,
+`apply_backend_defaults` — and only **sampled** the ~3,200-line nvCOMP bodies.
+The three areas left un-audited then (GPU auto-tuner, VRAM/GPU-failure rescue,
+`HybridSched`) are the ones resolved in the audit-results block above.
 
-- **GPU auto-tuner** (`SharedTuneState`, `StreamStats`, the `StreamCtx`
-  EXPLORE/REFINE/SETTLE hill-climb in `gpu_worker` / `gpu_decomp_worker`).
-  Questions: does it converge stably, re-probe correctly on mixed/heterogeneous
-  data (tar archives), and not thrash? Are the probe interval / batch bounds
-  optimal, or leaving throughput on the table? Any races on the shared tune
-  state across streams/devices?
-- **VRAM-exhaustion + GPU-failure rescue** (`RescueQueue`, `cpu_worker_rescue`,
-  the retry-limit + frame re-enqueue path, `any_gpu_failed` / `abort_on_failure`).
-  Questions: is FrameThrottle permit accounting exactly balanced when a batch
-  fails partway or a device drops mid-run? Any path that strands frames or
-  double-releases permits? Correctness when *some* (not all) GPUs fail.
-- **`HybridSched` corner cases** (`should_cpu_take` / `should_gpu_take`,
-  `gpus_waiting_`, the queue-floor + AUTO factor EMA). Questions: edge configs
-  (1 GPU + many CPUs, all-trivial-batch streaks, fixed-share `--cpu-share`
-  deadlock guards), and whether the floor/factor heuristics are near-optimal vs
-  just safe.
-
-Thinner ice worth a second look: punch-hole + O_DIRECT was only validated on the
+Thinner ice still worth a second look: punch-hole + O_DIRECT was only validated on the
 test boxes' filesystems (ext4-class) — confirm on others before assuming; and
 the 7.8 reader queue-cap is deliberately conservative (`parallelism * slack`), so
 it prevents OOM but won't shrink RSS on inputs that already fit — a measured,

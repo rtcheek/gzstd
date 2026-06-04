@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.34";
+static constexpr const char * GZSTD_VERSION = "0.13.35";
 //
 // Architecture overview:
 //
@@ -3623,6 +3623,15 @@ public:
   // If any GPU stream is waiting for data, CPU yields.
   bool should_cpu_take() const {
     if (fixed_mode_) {
+      // If no GPU stream is currently active — GPUs haven't registered yet, or
+      // they all failed/exited mid-run — the fixed share is moot: nothing
+      // advances gpu_taken_, so the share cap would stall the main CPU workers
+      // until the producer finishes (the drain fast-path then recovers, but the
+      // whole production phase is wasted).  Let CPU run unrestricted instead.
+      // Adaptive mode already handles this via the gpus_waiting_/floor path.
+      // During a healthy run active_gpu_streams_ > 0, so this is a no-op there.
+      if (active_gpu_streams_.load(std::memory_order_relaxed) == 0)
+        return true;
       const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
       const uint64_t gpu = gpu_taken_.load(std::memory_order_relaxed);
       const uint64_t total = cpu + gpu + 1;
