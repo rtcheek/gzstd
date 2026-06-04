@@ -608,6 +608,46 @@ the 7.8 reader queue-cap is deliberately conservative (`parallelism * slack`), s
 it prevents OOM but won't shrink RSS on inputs that already fit — a measured,
 tighter cap could reclaim memory on big-RAM boxes without starving consumers.
 
+### Open perf check: GPU compress D2H readback `resize()` zeroing (low priority)
+
+v0.13.36 removed the per-frame output-buffer zero-fill on the **CPU** compress
+path (`compress_one_cpu_frame`'s `resize(bound)`→`resize(csz)` shrink-regrow
+cycle).  The **GPU** compress D2H readback (`gpu_worker`, both the async-poll and
+sync-drain completion paths) does the analogous `h_out->resize(csz)` before the
+`cudaMemcpy` D2H.  Reasoned to be negligible — unlike the CPU path it has no
+forced shrink-regrow cycle, so the pooled `out_pool` buffers self-stabilize at
+the steady compressed size and `resize(csz)` becomes a no-op after warm-up
+(zeroing only the upward `csz` *variation*, worst on mixed/heterogeneous data) —
+and it's host-side, overlapped with GPU compute + PCIe D2H.  **Not measured**
+(callgrind can't profile CUDA).  Confirm on knuth with `perf` before deciding
+whether the (invasive) default-init-allocator-on-`FrameBuf` fix is worth it.
+
+Runbook (knuth, 8×H100):
+```bash
+# 1. perf needs paranoid <= 2 for unprivileged sampling; check then (if needed) lower:
+cat /proc/sys/kernel/perf_event_paranoid           # if > 2:
+sudo sysctl kernel.perf_event_paranoid=1           # (run via `! sudo …` in-session)
+
+# 2. mixed data MAXIMIZES csz frame-to-frame variation = worst case for the resize-grow.
+#    Output to /dev/null so disk I/O doesn't dominate the profile.
+dd if=gzstd-testdata/mixed.bin of=/tmp/gpin bs=1M count=8192 status=none
+
+# 3. record with DWARF call graphs (needed: hot frames are in libc/libzstd;
+#    --call-graph dwarf uses .eh_frame CFI, works on the -O3 release build).
+perf record -g --call-graph dwarf -o /tmp/gpu.perf \
+    ./build/gzstd --gpu-only -c -f /tmp/gpin > /dev/null
+
+# 4. find __memset_avx2 and WHO calls it:
+perf report --stdio -g -i /tmp/gpu.perf | grep -B2 -A25 memset_avx2 | head -60
+```
+Decision rule: if `__memset` is < ~1% **or** its callers are all nvcomp/cuda/
+libzstd (not `std::vector::_M_default_append` / `acquire_out_buf` / `gpu_worker`),
+the readback zeroing is confirmed negligible — close this and do nothing.  If
+`_M_default_append` under the GPU readback shows meaningful self-time, justify the
+`FrameBuf` default-init allocator change (it would also make the CPU path's
+one-time first-frame zeroing free).  Optional confirmation: A/B `gpu-only`
+throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
+
 ---
 
 ## Remaining Work for v1.0

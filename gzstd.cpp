@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.35";
+static constexpr const char * GZSTD_VERSION = "0.13.36";
 //
 // Architecture overview:
 //
@@ -3411,7 +3411,10 @@ static void writer_thread(FILE * out, ResultStore & results,
 // Thread-local CCtx avoids repeated allocation for per-chunk compression
 static thread_local ZSTD_CCtx * tl_cctx = nullptr;
 
-static inline void compress_one_cpu_frame(const void * src, size_t src_size, int level, bool ultra, std::vector< char > & out)
+// Compresses one frame into `out` (a reusable per-thread buffer) and returns the
+// compressed size.  `out` is left sized to >= compressBound, NOT shrunk to csz —
+// the caller uses the returned size, and [csz, out.size()) is undefined padding.
+static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, int level, bool ultra, std::vector< char > & out)
 {
   if (!tl_cctx) {
     tl_cctx = ZSTD_createCCtx();
@@ -3426,10 +3429,18 @@ static inline void compress_one_cpu_frame(const void * src, size_t src_size, int
   apply_ultra_cctx(tl_cctx, level, ultra);
 
   size_t bound = ZSTD_compressBound(src_size);
-  out.resize(bound);
+  // Grow-only: ZSTD writes [0,csz) and never reads the dst buffer, so the tail
+  // [csz,bound) needs no initialization.  resize() value-initializes (zeroes)
+  // the grown region — up to ~16 MiB per frame, which the profile pins as the
+  // single largest gzstd-attributable CPU-compress cost (callgrind:
+  // _M_default_append -> memset, ~7% of total, worst on compressible data).
+  // Keeping the buffer at bound across frames makes resize() zero once on the
+  // first frame, then no-op.  We return csz instead of shrinking `out` so the
+  // buffer never re-grows (and re-zeroes) on the next call.
+  if (out.size() < bound) out.resize(bound);
   size_t csz = ZSTD_compress2(tl_cctx, out.data(), out.size(), src, src_size);
   if (ZSTD_isError(csz)) die_data(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
-  out.resize(csz);
+  return csz;
 }
 
 // Apply --memlimit to a decompression context via ZSTD_d_windowLogMax.
@@ -4159,10 +4170,9 @@ static void cpu_worker(
 
     {
     const auto t0 = std::chrono::steady_clock::now();
-    compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
+    const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
-    const size_t csz = scratch.size();
     const size_t in_size = t.len();
     t.release_input();
     if (g_perf) {
@@ -4200,7 +4210,8 @@ static void cpu_worker(
     // Threshold: output >= half the input.  (ROADMAP 7.4.)
     auto out_frame = acquire_out_buf();
     if (csz * 2 >= in_size) {
-      std::swap(*out_frame, scratch);   // out_frame now owns the compressed data (size == csz)
+      std::swap(*out_frame, scratch);   // out_frame takes scratch's buffer (sized to bound)
+      out_frame->resize(csz);           // shrink to the actual compressed size (shrink: no zeroing)
     } else {
       out_frame->resize(csz);
       std::memcpy(out_frame->data(), scratch.data(), csz);
@@ -4287,11 +4298,10 @@ static void cpu_worker_rescue(
     if (!got_task) break;
     if (m && t.view_ptr) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
     const auto t0 = std::chrono::steady_clock::now();
-    compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
+    const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast<
         std::chrono::duration<double, std::milli>>(t1 - t0).count();
-    const size_t csz = scratch.size();
 
     if (opt->verbosity >= V_TRACE) {
       char in_s[32], out_s[32];

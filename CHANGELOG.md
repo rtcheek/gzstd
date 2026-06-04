@@ -1,9 +1,48 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.35  
+**Covers:** v0.9.50 → v0.13.36  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.36 — CPU compress: stop zero-filling the output buffer every frame
+
+Profiled the cpu-only compress path (callgrind, no root: `valgrind --tool=callgrind`
+on the real `-T>1` per-frame path — note `-T1` takes the separate
+`compress_cpu_stream` streaming path).  After zstd's own entropy kernels (~67%,
+all BMI2-SIMD and not ours to touch), the single largest *gzstd-attributable*
+cost was `std::vector<char>::_M_default_append → memset`, ~7% of total
+instructions: `compress_one_cpu_frame` did `out.resize(bound)` before every
+`ZSTD_compress2`, value-initializing (zeroing) up to ~16 MiB per frame — pure
+waste, since ZSTD only writes `[0,csz)` and never reads the dst buffer, and the
+`[csz,bound)` tail is undefined padding anyway.  Because the buffer was then
+shrunk to `csz`, the next frame re-grew and re-zeroed `(bound − csz)` bytes —
+worst on compressible data, where `csz` is tiny so nearly the whole buffer was
+re-zeroed each frame.
+
+Fix: `compress_one_cpu_frame` now grows the reusable per-thread buffer to
+`compressBound` **once** (grow-only, never shrunk) and returns `csz` explicitly
+instead of resizing the buffer down.  `resize()` then zeroes once on a thread's
+first frame and no-ops thereafter.  The poorly-compressible "zero-copy swap"
+branch (ROADMAP 7.4) resizes the swapped-in buffer down to `csz` after the swap
+(a shrink — no zeroing).  Output bytes are identical (no ratio change).
+
+Measured on the 24-core workstation, cpu-only `-T8`, 4 GiB inputs, compute-bound
+(output to /dev/null), best of 5:
+
+| profile          | before     | after      | gain  |
+|------------------|------------|------------|-------|
+| high_compress    | 17.1 GiB/s | 19.5 GiB/s | +14%  |
+| medium_compress  |  8.9 GiB/s |  9.8 GiB/s | +9.5% |
+| low_compress     | 11.1 GiB/s | 11.4 GiB/s | +2.8% |
+| mixed            | 12.0 GiB/s | 12.4 GiB/s | +3.0% |
+
+Round-trips verified on all four profiles; 213/213 tests pass.  (The win amortizes
+over frames-per-thread, so it needs frames ≫ threads to show — a 4-frame/4-thread
+microbenchmark gives each thread only its one-time first-frame zeroing and hides
+it.)
 
 ---
 
