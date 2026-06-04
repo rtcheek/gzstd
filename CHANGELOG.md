@@ -1,9 +1,35 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.36  
+**Covers:** v0.9.50 → v0.13.37  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.37 — Use `assign()` for buffer handoffs to drop the residual resize() zero-fill
+
+Follow-up to v0.13.36.  Three handoff sites took a recycled pooled `FrameBuf`,
+`resize(csz)`'d it, then `memcpy`'d `csz` bytes over it — value-initializing
+(zeroing) the grown region only to immediately overwrite it.  Replacing
+`resize(csz)+memcpy` with `vector::assign(src, src+csz)` does the identical copy
+but copy-constructs straight from the source, so it never zeroes — same bytes,
+no wasted memset.  Sites:
+- CPU compress worker, well-compressible (memcpy) branch.
+- GPU compress D2H readback, **pinned** path (async-poll + sync-drain) — the bytes
+  already pass through the pinned host slot, so `assign` from that slot applies.
+
+This is the clean, local alternative to the `FrameBuf` default-init allocator
+considered (and rejected as too invasive) for the GPU readback — no type change,
+no extra copy, strictly less work than what it replaces.  The GPU **non-pinned**
+direct-D2H fallback still needs `resize()` (the dst must be pre-sized before
+`cudaMemcpy` writes into it; `assign` can't source from device memory) — that's
+the slow fallback path, left as-is.
+
+Throughput-neutral by design — the eliminated zeroing was the 0.59%-class
+residual measured on a non-bottleneck host thread (see the closed GPU-readback
+ROADMAP check) — but it stops doing provably useless work.  Round-trips verified
+on cpu-only + gpu-only across all four profiles; 213/213 tests pass.
 
 ---
 

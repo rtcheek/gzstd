@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.36";
+static constexpr const char * GZSTD_VERSION = "0.13.37";
 //
 // Architecture overview:
 //
@@ -4213,8 +4213,10 @@ static void cpu_worker(
       std::swap(*out_frame, scratch);   // out_frame takes scratch's buffer (sized to bound)
       out_frame->resize(csz);           // shrink to the actual compressed size (shrink: no zeroing)
     } else {
-      out_frame->resize(csz);
-      std::memcpy(out_frame->data(), scratch.data(), csz);
+      // assign() copy-constructs csz bytes straight from scratch — unlike
+      // resize(csz)+memcpy it never value-initializes (zeroes) the grown region
+      // only to overwrite it.  Same bytes, no wasted memset.
+      out_frame->assign(scratch.data(), scratch.data() + csz);
     }
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
@@ -6284,7 +6286,6 @@ static void gpu_worker(
             if (C.h_stats[i] != nvcompSuccess) throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
             const size_t csz = C.h_comp_sizes[i]; out_sum += csz; in_sum += C.h_in_sizes[i];
             auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
-            h_out->resize(csz);
             const void * d_src = static_cast<char*>(C.d_out_base)
                                  + i * C.max_out_chunk;
             if (C.h2d_pinned_base) {
@@ -6295,8 +6296,12 @@ static void gpu_worker(
               checkCuda(cudaMemcpy(pin_slot, d_src, csz,
                                    cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H pinned shared slot)");
-              std::memcpy(h_out->data(), pin_slot, csz);
+              // assign() copies straight from the pinned slot — no resize() zero-fill
+              // (the copy would immediately overwrite it anyway).
+              h_out->assign(static_cast<char*>(pin_slot),
+                            static_cast<char*>(pin_slot) + csz);
             } else {
+              h_out->resize(csz);  // direct D2H needs the dst pre-sized
               checkCuda(cudaMemcpy(h_out->data(), d_src, csz,
                                    cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H exact)");
@@ -6440,7 +6445,6 @@ static void gpu_worker(
           for (size_t i = 0; i < C.filled; ++i) {
             const size_t csz = C.h_comp_sizes[i];
             auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
-            h_out->resize(csz);
             const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
             if (C.h2d_pinned_base) {
               // Reuse the H2D pinned slot for D2H (sync drain path).
@@ -6448,8 +6452,11 @@ static void gpu_worker(
                                 + i * C.h_io_slot_bytes;
               checkCuda(cudaMemcpy(pin_slot, d_src, csz, cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H pinned shared slot sync)");
-              std::memcpy(h_out->data(), pin_slot, csz);
+              // assign() copies straight from the pinned slot — no resize() zero-fill.
+              h_out->assign(static_cast<char*>(pin_slot),
+                            static_cast<char*>(pin_slot) + csz);
             } else {
+              h_out->resize(csz);  // direct D2H needs the dst pre-sized
               checkCuda(cudaMemcpy(h_out->data(), d_src, csz, cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H exact sync)");
             }
