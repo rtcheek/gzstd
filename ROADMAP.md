@@ -564,6 +564,40 @@ Discovered while debugging a `gzstd -dc` invocation (2026-06; the bundled form
 silently failed in a test pipeline). Low risk once the value-flag rule is fixed,
 high compat value.
 
+### 7.10 Not-yet-audited areas — next deep-dive targets
+**Priority: Medium | Complexity: High | Status: OPEN (for a future session)**
+
+The Phase 7 review (v0.13.23–v0.13.33) read the shared/CPU machinery line-by-line
+— `TaskQueue`, `FrameThrottle`, `AsyncWritePool`/`writer_thread`, `ResultStore`,
+the CPU compress/decompress workers, `stream_frames_to_queue`, `DirectWriter`,
+`main`, `parse_args`, `apply_backend_defaults` — and **sampled** the ~3,200-line
+nvCOMP bodies (completion paths, permit accounting, buffer pooling). The
+following were **not** audited line-by-line; a future session should dig here
+looking for both correctness bugs and perf wins:
+
+- **GPU auto-tuner** (`SharedTuneState`, `StreamStats`, the `StreamCtx`
+  EXPLORE/REFINE/SETTLE hill-climb in `gpu_worker` / `gpu_decomp_worker`).
+  Questions: does it converge stably, re-probe correctly on mixed/heterogeneous
+  data (tar archives), and not thrash? Are the probe interval / batch bounds
+  optimal, or leaving throughput on the table? Any races on the shared tune
+  state across streams/devices?
+- **VRAM-exhaustion + GPU-failure rescue** (`RescueQueue`, `cpu_worker_rescue`,
+  the retry-limit + frame re-enqueue path, `any_gpu_failed` / `abort_on_failure`).
+  Questions: is FrameThrottle permit accounting exactly balanced when a batch
+  fails partway or a device drops mid-run? Any path that strands frames or
+  double-releases permits? Correctness when *some* (not all) GPUs fail.
+- **`HybridSched` corner cases** (`should_cpu_take` / `should_gpu_take`,
+  `gpus_waiting_`, the queue-floor + AUTO factor EMA). Questions: edge configs
+  (1 GPU + many CPUs, all-trivial-batch streaks, fixed-share `--cpu-share`
+  deadlock guards), and whether the floor/factor heuristics are near-optimal vs
+  just safe.
+
+Thinner ice worth a second look: punch-hole + O_DIRECT was only validated on the
+test boxes' filesystems (ext4-class) — confirm on others before assuming; and
+the 7.8 reader queue-cap is deliberately conservative (`parallelism * slack`), so
+it prevents OOM but won't shrink RSS on inputs that already fit — a measured,
+tighter cap could reclaim memory on big-RAM boxes without starving consumers.
+
 ---
 
 ## Remaining Work for v1.0
