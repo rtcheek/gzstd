@@ -1,9 +1,28 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.41  
+**Covers:** v0.9.50 → v0.13.42  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.42 — Fix `-T` with no numeric value crashing (uncaught `std::stoi`)
+
+`-T`/`--threads` parsed their separate value with a raw `std::stoi(argv[++i])`,
+so a bare `-T` followed by a non-numeric token — `gzstd -T --cpu-only file`, or
+`-T file.zst`, or a trailing `-T` — threw an uncaught `std::invalid_argument`
+and `abort()`ed (core dump).  The attached `-T4` form had the same unguarded
+`stoi` (`-Tx` would crash too).
+
+Fix: the separate form now only consumes the next token as the thread count when
+it actually looks like an integer (new `looks_like_int` helper); otherwise the
+token is left for normal parsing and `-T` falls back to the default (auto) thread
+count — no crash, no error.  Both the attached (`-T4`, `--threads=N`) and
+consumed-value paths now go through `parse_int_value`, which reports a clean
+usage error (exit 2) on a genuinely malformed attached value (`-Tx`) instead of
+aborting.  `-T0` (= all cores), `-T N`, `-T4`, `--threads=N`, `--threads N` all
+unchanged.  Verified across the extensive suite's `-T` cases.
 
 ---
 

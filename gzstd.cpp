@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.41";
+static constexpr const char * GZSTD_VERSION = "0.13.42";
 //
 // Architecture overview:
 //
@@ -1023,6 +1023,17 @@ static int parse_int_value(const std::string & pref, const std::string & v)
     die_usage("value out of range for " + pref + ": " + v);
   }
   return 0;
+}
+// True if the whole string is a (optionally signed) base-10 integer.  Used to
+// decide whether a separate token after a flag like `-T` is its value or the
+// next argument — so `-T --cpu-only` / `-T file.zst` don't crash std::stoi.
+static bool looks_like_int(const char * s)
+{
+  if (!s || !*s) return false;
+  size_t i = (s[0] == '+' || s[0] == '-') ? 1 : 0;
+  if (!s[i]) return false;                 // sign with no digits
+  for (; s[i]; ++i) if (s[i] < '0' || s[i] > '9') return false;
+  return true;
 }
 static double parse_double_value(const std::string & pref, const std::string & v)
 {
@@ -9704,22 +9715,24 @@ static Options parse_args(int argc, char ** argv)
       std::string val = a.substr(2);
       if (!val.empty() && val[0] == '=') val = val.substr(1);
       if (val.empty()) die_usage("missing value for -T");
-      int th = std::stoi(val);
+      int th = parse_int_value("-T", val);  // graceful error on a bad attached value
       // -T0 means "use all available threads" (like zstd)
       opt.cpu_threads = (th == 0) ? -1 : th;
     }
     else if (a == "-T" || a == "--threads" || a.rfind("--threads=", 0) == 0) {
-      int th = 0;
+      // Value forms: `--threads=N` (attached), or `-T N` / `--threads N`
+      // (separate).  Only consume the next token as the count when it actually
+      // looks like an integer — a bare `-T` (e.g. `-T --cpu-only`, `-T file.zst`,
+      // or a trailing `-T`) is tolerated and falls back to the default thread
+      // count rather than crashing std::stoi on a non-numeric token.
       if (a.rfind("--threads=", 0) == 0) {
-        th = std::stoi(a.substr(10));
-      } else if (a == "-T" && i + 1 < argc) {
-        th = std::stoi(argv[++i]);
-      } else if (a == "--threads" && i + 1 < argc) {
-        th = std::stoi(argv[++i]);
-      } else {
-        die_usage("missing value for " + a);
+        int th = parse_int_value("--threads", a.substr(10));
+        opt.cpu_threads = (th == 0) ? -1 : th;
+      } else if (i + 1 < argc && looks_like_int(argv[i + 1])) {
+        int th = parse_int_value(a, argv[++i]);
+        opt.cpu_threads = (th == 0) ? -1 : th;
       }
-      opt.cpu_threads = (th == 0) ? -1 : th;
+      // else: no usable numeric value — leave cpu_threads at its default (auto)
     }
     else if (a == "-o" || a == "--output") {
       if (i + 1 >= argc) die_usage("missing value for " + a);
