@@ -1,9 +1,69 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.39  
+**Covers:** v0.9.50 → v0.13.41  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.41 — Extend the byte cap to the compress producer (pipe/stdin RAM safety)
+
+(Committed together with v0.13.40.)  The 7.8/v0.13.40 queue cap was decompress-only,
+but **compress had the same exposure**: for a regular file the producer mmaps the
+input (zero-copy views, no heap — a 1 TB file streams in bounded RAM regardless of
+size), but for a **pipe/stdin** input it falls back to `fread`, reading frames onto
+the heap, and the compress queue had *no* cap.  A producer that outruns the workers
+(or a writer/disk bottleneck that blocks them on throttle permits, so they stop
+popping) could then buffer the entire input in RAM → OOM.
+
+Fix: call `queue.set_max_bytes(floor * host_chunk/2)` on both compress queues
+(`compress_cpu_mt`, `compress_nvcomp`).  Bytes only, no frame cap — mmap views are
+`data.size()==0` so it's a **no-op for the common regular-file path** and bounds only
+fread.  Reuses the same `TaskQueue` machinery (`max_bytes_`/`queued_bytes_`/
+`take_front_locked`, `!q_.empty()` deadlock guard) added in v0.13.40.
+
+Demonstrated (Gen3, 2 GiB incompressible piped via `cat | gzstd --cpu-only -T2 -19`,
+slow workers so the warm-cache pipe outruns them; max-RSS):
+
+| build                  | maxRSS   | time    |
+|------------------------|----------|---------|
+| before (no compress cap) | 2232 MiB | 193.2 s |
+| after  (byte cap)        |  568 MiB | 191.5 s |
+
+−75% peak RSS, throughput unchanged.  At default level the workers keep up so the
+queue never grows and the cap doesn't engage (both builds ~153 MiB) — it's a safety
+net for the slow-worker / slow-output pathological case, where without it a large
+pipe input OOMs.  Pipe + mmap round-trips verified across cpu/gpu/hybrid; 213/213.
+
+## v0.13.40 — Byte-aware decompress reader queue cap (ROADMAP 7.8 follow-up): bound queue RAM
+
+The 7.8 reader queue cap (`set_max_depth`) bounds the queue by **frame count**
+(`parallelism * slack`), so the RAM it holds scales with compressibility — an
+incompressible file (near-full-size compressed frames) buffers ~4× the RAM a
+compressible one does for the same frame count.  Added a parallel **byte** cap to
+`TaskQueue`: the reader now blocks when `frames >= max_depth_` **OR**
+`queued_bytes_ >= max_bytes_`, whichever binds first.  `queued_bytes_` tracks
+owned heap (`Task::data.size()`) so zero-copy mmap views (size 0) are correctly
+ignored; a `!q_.empty()` guard on the byte cap guarantees progress even when a
+single frame exceeds the whole budget (no deadlock).  Byte accounting is
+centralized in one `take_front_locked()` helper so it can't drift across the pop
+sites.  Budget = `floor * 8 MiB` (~half a standard 16 MiB frame per slot), set at
+both decompress readers; tunable via `--throttle-factor`.
+
+Measured (Gen3 2×2080Ti, `gpu-only` decompress, 4 GiB, max-RSS / best-of-3):
+
+| profile         | RSS before | RSS after  | Δ      | time |
+|-----------------|------------|------------|--------|------|
+| low_compress    | 2127 MiB   | 1902 MiB   | −11%   | flat |
+| medium_compress | 1748 MiB   | 1603 MiB   | −8%    | flat |
+
+Throughput-neutral, RAM down 145–225 MiB — biggest on incompressible input, as
+intended.  The reduced buffering for big frames *could* matter on a much faster
+reader/consumer ratio (knuth, 8×H100) — flagged in-code and tunable; validate
+there.  Round-trips verified cpu/gpu × incompressible + sparse `zeros` (deadlock-
+checked with timeouts); 213/213 tests pass.  CPU decompress RSS is unaffected (its
+RAM is the output-buffer throttle budget, not the input queue).
 
 ---
 

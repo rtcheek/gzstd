@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.39";
+static constexpr const char * GZSTD_VERSION = "0.13.41";
 //
 // Architecture overview:
 //
@@ -2364,12 +2364,20 @@ public:
   void push(Task && t)
   {
     std::unique_lock<std::mutex> lk(m_);
-    // Bounded-queue backpressure (ROADMAP 7.8): block the producer once the
-    // queue is full, so a consumer slower than the reader can't buffer the
-    // entire input in RAM.  Unbounded by default (max_depth_ == 0).  Internal
-    // re_enqueue (push_front) bypasses this so it never blocks.
-    while (max_depth_ > 0 && q_.size() >= max_depth_ && !done_)
+    // Bounded-queue backpressure (ROADMAP 7.8): block the producer so a consumer
+    // slower than the reader can't buffer the entire input in RAM.  Two
+    // independent caps, either may be 0 = off:
+    //   max_depth_ — frame count (enough frames buffered to keep consumers fed)
+    //   max_bytes_ — owned heap bytes (bounds RAM regardless of compressibility;
+    //                a frame-count cap holds ~4× the RAM on incompressible input).
+    // The `!q_.empty()` guard on the byte cap guarantees progress even when a
+    // single frame exceeds the whole budget.  re_enqueue (push_front) bypasses
+    // both, so it never blocks.
+    while (!done_ &&
+           ((max_depth_ > 0 && q_.size() >= max_depth_) ||
+            (max_bytes_ > 0 && !q_.empty() && queued_bytes_ >= max_bytes_)))
       space_cv_.wait(lk);
+    queued_bytes_ += t.data.size();
     q_.push_back(std::move(t));
     ++total_tasks_;
     cv_.notify_all();      // wake all GPU workers waiting in pop_batch_greedy
@@ -2382,6 +2390,15 @@ public:
   {
     std::lock_guard<std::mutex> lk(m_);
     max_depth_ = n;
+  }
+
+  // Cap the total owned (heap) bytes of queued frames for producer backpressure.
+  // Complements set_max_depth: bounds RAM regardless of compressibility (a frame
+  // cap holds far more RAM on incompressible input).  0 = unbounded.
+  void set_max_bytes(size_t n)
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    max_bytes_ = n;
   }
 
   // Re-enqueue tasks that were popped but never processed (e.g., GPU trivial-skip,
@@ -2398,8 +2415,10 @@ public:
   {
     if (batch.empty()) return;
     std::unique_lock<std::mutex> lk(m_);
-    for (auto it = batch.rbegin(); it != batch.rend(); ++it)
+    for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+      queued_bytes_ += it->data.size();
       q_.push_front(std::move(*it));
+    }
     batch.clear();
     cv_.notify_all();
     cpu_cv_.notify_one();
@@ -2420,8 +2439,7 @@ public:
     const size_t take = std::min(max_n, q_.size());
     out.reserve(out.size() + take);
     for (size_t i = 0; i < take; ++i) {
-      out.push_back(std::move(q_.front()));
-      q_.pop_front();
+      out.push_back(take_front_locked());
     }
     return true;
   }
@@ -2447,8 +2465,7 @@ public:
     const size_t take = std::min(max_n, q_.size());
     out.reserve(out.size() + take);
     for (size_t i = 0; i < take; ++i) {
-      out.push_back(std::move(q_.front()));
-      q_.pop_front();
+      out.push_back(take_front_locked());
     }
     pop_signal_locked();
     return true;
@@ -2461,8 +2478,7 @@ public:
     while (q_.empty() && !done_) cpu_cv_.wait(lk);
     if (q_.empty() && done_) return false;
 
-    t = std::move(q_.front());
-    q_.pop_front();
+    t = take_front_locked();
     return true;
   }
 
@@ -2492,8 +2508,7 @@ public:
     std::unique_lock<std::mutex> lk(m_);
     if (q_.empty() && done_) return -1;
     if (q_.empty()) return 0;
-    t = std::move(q_.front());
-    q_.pop_front();
+    t = take_front_locked();
     pop_signal_locked();
     return 1;
   }
@@ -2509,8 +2524,7 @@ public:
     const size_t take = std::min(max_n, q_.size());
     out.reserve(out.size() + take);
     for (size_t i = 0; i < take; ++i) {
-      out.push_back(std::move(q_.front()));
-      q_.pop_front();
+      out.push_back(take_front_locked());
     }
     return take;
   }
@@ -2531,8 +2545,7 @@ public:
     const size_t take = std::min(max_n, q_.size());
     out.reserve(out.size() + take);
     for (size_t i = 0; i < take; ++i) {
-      out.push_back(std::move(q_.front()));
-      q_.pop_front();
+      out.push_back(take_front_locked());
     }
     return take;
   }
@@ -2635,8 +2648,7 @@ public:
       if (!q_.empty()) {
         QueueState qs { q_.size(), done_, front_ratio_locked() };
         if (may_proceed(qs)) {
-          t = std::move(q_.front());
-          q_.pop_front();
+          t = take_front_locked();
           return true;
         }
       }
@@ -2656,8 +2668,7 @@ public:
     if (!q_.empty()) {
       QueueState qs { q_.size(), done_, front_ratio_locked() };
       if (may_proceed(qs)) {
-        t = std::move(q_.front());
-        q_.pop_front();
+        t = take_front_locked();
         pop_signal_locked();
         return 1;
       }
@@ -2680,7 +2691,17 @@ private:
   // try_pop_one_cpu — plus set_done().  Other pop methods only run on compress
   // queues, which are never bounded; if one is ever used with a bounded queue,
   // add a pop_signal_locked() call there too.
-  void pop_signal_locked() { if (max_depth_ > 0) space_cv_.notify_all(); }
+  void pop_signal_locked() { if (max_depth_ > 0 || max_bytes_ > 0) space_cv_.notify_all(); }
+
+  // Dequeue the front task, keeping queued_bytes_ (owned heap held by the queue)
+  // in sync.  CALLER MUST HOLD m_.  Centralizes the byte accounting so it can't
+  // drift across the many pop sites.  Views (mmap; data.size()==0) contribute 0.
+  Task take_front_locked() {
+    queued_bytes_ -= q_.front().data.size();
+    Task t = std::move(q_.front());
+    q_.pop_front();
+    return t;
+  }
 
   std::mutex              m_;
   std::condition_variable cv_;
@@ -2689,6 +2710,8 @@ private:
   std::deque<Task>        q_;
   bool                    done_ = false;
   size_t                  max_depth_ = 0;  // 0 = unbounded (default); >0 caps queued frames (ROADMAP 7.8)
+  size_t                  max_bytes_ = 0;  // 0 = unbounded; >0 caps queued owned bytes / RAM (7.8 follow-up)
+  size_t                  queued_bytes_ = 0; // running sum of q_'s owned data.size() bytes
   std::atomic<size_t>     total_tasks_{0};
 };
 
@@ -4909,7 +4932,14 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   // (ROADMAP 7.8).  Skip when throttling is explicitly disabled.
   if (opt.throttle_frames != 0) {
     int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
-    queue.set_max_depth((size_t)std::max(THROTTLE_MIN_FRAMES, threads * qslack));
+    const size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, threads * qslack);
+    queue.set_max_depth(qfloor);
+    // Byte ceiling alongside the frame floor: bound queued RAM so incompressible
+    // input (near-full-size compressed frames) can't hold ~4× the RAM a
+    // compressible run does.  ~8 MiB/slot = half a standard 16 MiB frame (≈ half
+    // the floor's worst-case bytes; measured throughput-neutral on Gen3 — should
+    // be validated on knuth).  Soft cap — push() still admits a frame when empty.
+    queue.set_max_bytes(qfloor * (8 * ONE_MIB));
   }
 
   // Start writer thread (outputs decompressed frames in original order)
@@ -5272,6 +5302,17 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<bool> progress_done{false};
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
   TaskQueue queue;
+  // Byte-cap the input queue: a pipe/stdin producer that outruns the workers
+  // (fread reads frames into heap) must not buffer the whole input in RAM — the
+  // compress-side analogue of the ROADMAP 7.8 decompress cap.  Bytes only (no
+  // frame cap): mmap frames are zero-copy views (data.size()==0), so this is a
+  // no-op for the common regular-file path and bounds only the fread path.
+  // ~half a frame per slot; tunable via --throttle-factor.
+  if (opt.throttle_frames != 0) {
+    int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
+    size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, threads * qslack);
+    queue.set_max_bytes(qfloor * (host_chunk / 2));
+  }
   ResultStore results;
   // Size the throttle from the *resolved* chunk (host_chunk = chosen_mib),
   // not opt.chunk_mib: chosen_mib may have been auto-bumped for --ultra or
@@ -7033,6 +7074,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       * (int)std::max<size_t>(1, opt.gpu_streams)
       * (int)per_stream_budget;
   const int comp_parallelism = cpu_threads_est + comp_gpu_batch_floor;
+  // Byte-cap the input queue (compress-side ROADMAP 7.8 analogue): a pipe/stdin
+  // producer that outruns the consumers reads frames into heap, so bound the
+  // queued owned bytes.  No-op for the common mmap path (zero-copy views,
+  // data.size()==0); bounds only fread.  Bytes only — no frame cap, so mmap can
+  // run ahead freely.  Tunable via --throttle-factor.
+  if (opt.throttle_frames != 0) {
+    int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
+    size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, comp_parallelism * qslack);
+    queue.set_max_bytes(qfloor * (host_chunk / 2));
+  }
   FrameThrottle throttle(compute_throttle_budget(
       std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism,
       comp_gpu_batch_floor, opt));
@@ -8481,7 +8532,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // throttling is explicitly disabled.
   if (opt.throttle_frames != 0) {
     int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
-    queue.set_max_depth((size_t)std::max(THROTTLE_MIN_FRAMES, decomp_parallelism * qslack));
+    const size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, decomp_parallelism * qslack);
+    queue.set_max_depth(qfloor);
+    // Byte ceiling — see decompress_cpu_mt: bounds queued RAM independent of
+    // compressibility (~8 MiB/slot).  Soft cap; tune via --throttle-factor.
+    queue.set_max_bytes(qfloor * (8 * ONE_MIB));
   }
 
   // ---- Writer thread (outputs decompressed data in order) ----

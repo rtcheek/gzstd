@@ -603,10 +603,27 @@ The three areas left un-audited then (GPU auto-tuner, VRAM/GPU-failure rescue,
 `HybridSched`) are the ones resolved in the audit-results block above.
 
 Thinner ice still worth a second look: punch-hole + O_DIRECT was only validated on the
-test boxes' filesystems (ext4-class) — confirm on others before assuming; and
-the 7.8 reader queue-cap is deliberately conservative (`parallelism * slack`), so
-it prevents OOM but won't shrink RSS on inputs that already fit — a measured,
-tighter cap could reclaim memory on big-RAM boxes without starving consumers.
+test boxes' filesystems (ext4-class) — confirm on others (xfs/btrfs/zfs) before
+assuming.  **(Still open — no xfs/btrfs host available to test; needs a loopback
+image or a CI matrix.)**
+
+~~the 7.8 reader queue-cap is deliberately conservative (`parallelism * slack`)~~
+**DONE (v0.13.40):** the 7.8 frame-count cap held RAM proportional to
+compressibility (incompressible ~4× compressible).  Added a parallel byte cap to
+`TaskQueue` (`max_bytes_`/`queued_bytes_`, centralized in `take_front_locked`):
+reader blocks on `frames>=floor OR bytes>=budget`, budget = `floor*8 MiB`, with a
+`!q_.empty()` deadlock guard and mmap-view-aware accounting (`data.size()`).
+Measured gpu-only decompress RSS −8…−11% (145–225 MiB on 4 GiB), throughput
+flat.  Tunable via `--throttle-factor`; flagged for knuth validation (reduced
+big-frame buffering on a faster reader/consumer ratio).  See CHANGELOG v0.13.40.
+
+**Extended to the compress producer (v0.13.41):** compress had the same exposure
+on **pipe/stdin** input (fread → heap; the compress queue was uncapped — a
+producer outrunning the workers could buffer the whole input → OOM).  Regular
+files were always safe (mmap = zero-copy views, no heap, so a 1 TB file streams in
+bounded RAM).  Same byte cap now set on both compress queues; no-op for mmap.
+Demonstrated −75% peak RSS (2232→568 MiB) on a slow-worker piped incompressible
+run, throughput unchanged.  See CHANGELOG v0.13.41.
 
 ### GPU compress D2H readback `resize()` zeroing — CHECKED negligible, then fixed cleanly (closed)
 
