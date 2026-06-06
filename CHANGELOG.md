@@ -1,9 +1,55 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.42  
+**Covers:** v0.9.50 → v0.13.44  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.44 — `--direct-read`: O_DIRECT input reader (page-cache bypass)
+
+A first-class O_DIRECT input reader for the compress path (`compress_cpu_mt` and
+`compress_nvcomp`).  O_DIRECT transfers straight disk→buffer, **bypassing the page
+cache entirely** — it neither reads from nor populates it.  Two payoffs:
+
+1. **One-pass speedup (real feature):** compressing a backup touches every input
+   byte exactly once and never re-reads it, so the page cache provides zero reuse
+   benefit — it's pure populate + writeback-pressure overhead.  Reading around it
+   skips that.  (Caveat: O_DIRECT loses kernel readahead, so it needs large reads
+   to keep the disk saturated — gzstd's 16 MiB chunks + pipelining cover that.)
+2. **Honest cold benchmarking with zero system impact:** because nothing is cached
+   or evicted, every run reads cold from disk deterministically — no warm-cache
+   skew, and critically **no `kcompactd` storm**.  (The old `--cold` =
+   `fadvise(DONTNEED)` *populates then drops* the cache; dropping a huge file
+   fragments free memory and wakes kernel compaction, stalling the whole box.
+   O_DIRECT sidesteps the drop entirely — see project_mmap_kernel_storm.)
+
+Shared helper `odirect_read_chunks` (4 KiB-aligned `pread` into a `posix_memalign`
+bounce buffer; EOF handled via O_DIRECT's short read; falls back to fread if
+O_DIRECT can't be set up, e.g. tmpfs).  Takes precedence over mmap (mmap *is* the
+page cache, so it can't bypass it).  Output is byte-identical to the normal reader
+on both cpu-only and gpu-only (verified); round-trips incl. unaligned-size files;
+290/290.  `--direct` (O_DIRECT *output*) and `--direct-read` (O_DIRECT *input*)
+are independent — combine for a fully cache-bypassing run.
+
+## v0.13.43 — Auto-fall-back to fread for large inputs on pre-6.4 kernels (mmap_lock storm)
+
+On a 256-core box at kernel **5.15** (pre-6.4, no per-VMA locks), compressing a
+432 GiB file with the default mmap reader cost **13–41%** vs `--no-mmap`: the
+single `mmap_lock` rwsem serialises ~108M page faults across 256 cores (the file
+fits in 1.5 TiB RAM, so it's pure lock contention, not eviction).  The v0.13.22
+"mmap on everywhere" decision was calibrated on 20 GiB test files where the storm
+was a tolerable regression; it scales with fault count = file size, so real
+backup-scale files hit it ~20× harder.
+
+Fix: gate mmap on **kernel version + input size** — on kernels `< 6.4`
+(`kernel_has_per_vma_locks()` via `uname`), fall back to fread for inputs
+`> 4 GiB`.  6.4+ kernels and small files are unchanged (mmap stays on, where its
+zero-copy wins and few faults don't storm), so this is *not* the kernel-only gate
+that regressed cold small files in v0.13.20–22, and *not* a core-count gate.
+`--mmap`/`--no-mmap` hard-override it; the gate auto-retires when the box reaches
+≥6.4.  Verified gate-off on a 6.17 box; 290/290.
 
 ---
 

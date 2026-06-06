@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.42";
+static constexpr const char * GZSTD_VERSION = "0.13.44";
 //
 // Architecture overview:
 //
@@ -75,6 +75,7 @@ static constexpr const char * GZSTD_VERSION = "0.13.42";
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/utsname.h>
 #ifdef _WIN32
  #include <io.h>
 #endif
@@ -271,7 +272,9 @@ struct Options {
   bool direct_io = false;         // --direct: use O_DIRECT (bypasses page cache)
   bool direct_io_user_set = false; // true if user passed --direct/--no-direct (suppresses the Gen4 decompress auto-default)
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
+  bool mmap_user_set = false;     // true if --mmap/--no-mmap given (suppresses the pre-6.4 large-file auto-gate)
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
+  bool direct_read = false;       // --direct-read: O_DIRECT input — bypass the page cache (no populate/evict)
   bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
@@ -619,6 +622,8 @@ static void print_help()
 "  --sync-output       fsync output before exit\n"
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
+"  --direct-read       read input with O_DIRECT, bypassing the page cache\n"
+"                      (one-pass speedup + honest cold reads; implies fread)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
@@ -5236,6 +5241,83 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   progress_done = true; progress_thr.join();
 }
 
+// True if the running kernel has per-VMA locks (Linux >= 6.4).  Before 6.4 a
+// single mmap_lock rwsem serialises every page fault in an address space, so many
+// worker threads faulting a large mmap'd input contend hard — a sys-time storm
+// that scales with file size and core count (see project_mmap_kernel_storm /
+// CHANGELOG).  On 6.4+ faults are lock-free and mmap is a win.
+static bool kernel_has_per_vma_locks()
+{
+#ifdef __linux__
+  struct utsname u;
+  if (uname(&u) != 0) return true;                 // unknown: assume modern, keep mmap
+  int major = 0, minor = 0;
+  if (std::sscanf(u.release, "%d.%d", &major, &minor) != 2) return true;
+  return major > 6 || (major == 6 && minor >= 4);
+#else
+  return true;
+#endif
+}
+
+// Above this input size, on a pre-6.4 kernel, fread beats mmap (the mmap_lock
+// fault-storm dominates); below it mmap's zero-copy wins and the fault volume is
+// small.  Heuristic, pre-6.4 only; --mmap / --no-mmap override the whole gate.
+static const size_t MMAP_PREVMA_MAX_BYTES = size_t(4) * 1024 * ONE_MIB;  // 4 GiB
+
+// Whether to mmap `path`, applying the pre-6.4 large-file auto-gate.  Evaluated
+// before MmapReader::open() so a gated input never gets mapped at all.
+static bool mmap_ok_for_input(const Options & opt, const std::string & path)
+{
+  if (opt.mmap_user_set) return true;              // explicit --mmap/--no-mmap: honour it
+  if (kernel_has_per_vma_locks()) return true;     // >= 6.4: mmap is safe
+  std::error_code ec;
+  uintmax_t fsz = fs::file_size(path, ec);
+  if (ec || fsz <= MMAP_PREVMA_MAX_BYTES) return true;  // small/unknown: mmap fine
+  if (opt.verbosity >= V_VERBOSE)
+    vlog(V_VERBOSE, opt, "[MMAP] pre-6.4 kernel + large input ("
+         + std::to_string(size_t(fsz / ONE_MIB)) + " MiB): using fread to avoid the "
+           "mmap_lock fault-storm (override with --mmap)\n");
+  return false;
+}
+
+#ifndef _WIN32
+// --direct-read: read `path` with O_DIRECT in host_chunk-sized, 4 KiB-aligned
+// chunks, calling emit(buf,n) for each (emit builds Task[s] and enqueues; return
+// false to stop early).  O_DIRECT transfers straight disk→buffer, bypassing the
+// page cache entirely — it neither reads from nor populates it, so it's honest-
+// cold every run with nothing to evict (no kcompactd) and no warm-cache skew, and
+// it skips the populate/writeback overhead the cache adds to a one-pass read.
+// O_DIRECT can't go through mmap (mmap IS the page cache), so this is its own
+// reader.  The final partial chunk uses the short read O_DIRECT returns at EOF
+// (request stays 4 KiB-aligned; return may be shorter).  Returns false if
+// O_DIRECT couldn't be set up — caller falls back to fread.
+static bool odirect_read_chunks(const std::string & path, size_t host_chunk,
+                                Meter * m,
+                                const std::function<bool(const char *, size_t)> & emit)
+{
+  int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+  if (fd < 0) return false;
+  const size_t ALIGN = 4096;
+  const size_t cap = ((host_chunk + ALIGN - 1) / ALIGN) * ALIGN;
+  void * abuf = nullptr;
+  if (posix_memalign(&abuf, ALIGN, cap) != 0) { ::close(fd); return false; }
+  off_t off = 0;
+  for (;;) {
+    uint64_t t0 = g_perf ? now_ns() : 0;
+    ssize_t got = ::pread(fd, abuf, cap, off);   // offset is k*cap (aligned); count is cap (aligned)
+    if (got < 0) { free(abuf); ::close(fd); die_io("O_DIRECT read failed (--direct-read)"); }
+    if (got == 0) break;
+    if (g_perf) { g_perf->read_ns.fetch_add(now_ns() - t0); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
+    if (m) m->read_bytes.fetch_add((uint64_t)got);
+    bool cont = emit(static_cast<const char *>(abuf), (size_t)got);
+    off += got;
+    if (!cont || (size_t)got < cap) break;   // short read ⇒ EOF
+  }
+  free(abuf); ::close(fd);
+  return true;
+}
+#endif
+
 static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // ---- Performance instrumentation (active at -vvv) ----
@@ -5350,8 +5432,24 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<size_t> seq{0};
 #ifndef _WIN32
   MmapRegion mmap_region;
-  if (opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
+  bool reader_done = false;
+  // --direct-read: O_DIRECT input (bypass the page cache).  Takes precedence over
+  // mmap (mmap IS the page cache); falls through to fread if O_DIRECT can't open.
+  if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
+    reader_done = odirect_read_chunks(opt.input, host_chunk, m,
+      [&](const char * buf, size_t n) {
+        Task t;
+        t.seq = seq.fetch_add(1, std::memory_order_relaxed);
+        t.data.assign(buf, buf + n);
+        queue.push(std::move(t));
+        return true;
+      });
+  }
+  if (!reader_done && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
       && fs::is_regular_file(opt.input)
+      && mmap_ok_for_input(opt, opt.input)
       && mmap_region.open(opt.input.c_str())) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[MMAP] using zero-copy reader\n");
@@ -5372,7 +5470,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       g_perf->read_ns.fetch_add(now_ns() - mmap_rd_t0);
       g_perf->read_bytes_total.fetch_add(file_size);
     }
-  } else
+    reader_done = true;
+  }
+  if (!reader_done)
 #endif
   {
     std::vector<char> host_in(host_chunk);
@@ -7229,8 +7329,33 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   const size_t gpu_chunk = std::min(host_chunk, GPU_SUBCHUNK_MAX);
 #ifndef _WIN32
   MmapRegion mmap_region;
-  if (opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
+  bool reader_done = false;
+  // --direct-read: O_DIRECT input (bypass page cache); splits each host chunk into
+  // gpu_chunk subchunks like the other readers.  Precedence over mmap; falls
+  // through to fread if O_DIRECT can't open.
+  if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
+    reader_done = odirect_read_chunks(opt.input, host_chunk, m,
+      [&](const char * buf, size_t n_host) {
+        if (abort_on_failure.load(std::memory_order_acquire)
+            && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
+          return false;
+        size_t sub_off = 0;
+        while (sub_off < n_host) {
+          size_t sub_n = std::min(gpu_chunk, n_host - sub_off);
+          Task t;
+          t.seq = seq_counter.fetch_add(1, std::memory_order_relaxed);
+          t.data.assign(buf + sub_off, buf + sub_off + sub_n);
+          queue.push(std::move(t));
+          sub_off += sub_n;
+        }
+        return true;
+      });
+  }
+  if (!reader_done && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
       && fs::is_regular_file(opt.input)
+      && mmap_ok_for_input(opt, opt.input)
       && mmap_region.open(opt.input.c_str())) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[MMAP] using zero-copy reader\n");
@@ -7259,7 +7384,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       g_perf->read_ns.fetch_add(now_ns() - mmap_rd_t0);
       g_perf->read_bytes_total.fetch_add(off);
     }
-  } else
+    reader_done = true;
+  }
+  if (!reader_done)
 #endif
   {
     std::vector<char> host_in(host_chunk);
@@ -9667,9 +9794,10 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--sync-output") opt.sync_output = true;
     else if (a == "--direct") { opt.direct_io = true; opt.direct_io_user_set = true; }
     else if (a == "--no-direct") { opt.direct_io = false; opt.direct_io_user_set = true; }
-    else if (a == "--mmap" || a == "--mmap=on")  opt.use_mmap = true;
-    else if (a == "--no-mmap" || a == "--mmap=off") opt.use_mmap = false;
+    else if (a == "--mmap" || a == "--mmap=on")  { opt.use_mmap = true;  opt.mmap_user_set = true; }
+    else if (a == "--no-mmap" || a == "--mmap=off") { opt.use_mmap = false; opt.mmap_user_set = true; }
     else if (a == "--cold") opt.cold_read = true;
+    else if (a == "--direct-read") opt.direct_read = true;
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
