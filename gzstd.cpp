@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.44";
+static constexpr const char * GZSTD_VERSION = "0.13.45";
 //
 // Architecture overview:
 //
@@ -614,7 +614,7 @@ static void print_help()
 "I/O:\n"
 "  --[no-]sparse       sparse file writes (default: on for files)\n"
 "  --[no-]mmap         zero-copy mmap reader for regular-file inputs\n"
-"                      (default: on; --no-mmap forces fread)\n"
+"                      (on; auto-fread for inputs >4 GiB on kernel <6.4)\n"
 "  --[no-]preallocate  fallocate output to expected size up front\n"
 "                      (default: on; --no-preallocate skips fallocate)\n"
 "  --direct            O_DIRECT output (bypass page cache; auto-on for\n"
@@ -723,14 +723,30 @@ static void print_help_long()
 "     Gen4).  O_DIRECT can expose the app to NVMe GC stalls and\n"
 "     journal commits.\n"
 "\n"
-"  --mmap / --no-mmap    (default: on)\n"
+"  --mmap / --no-mmap    (default: on, with a kernel auto-gate)\n"
 "     Use a zero-copy memory-mapped reader for regular-file inputs.\n"
 "     mmap lets workers read directly from the kernel's page cache —\n"
-"     no fread + memcpy through a userspace buffer, no producer\n"
-"     thread serialising the input read.  Pipes and stdin always\n"
-"     fall back to fread regardless of this flag.  --no-mmap forces\n"
-"     fread for benchmarking — use it to verify mmap is actually\n"
-"     buying you something on your hardware.\n"
+"     no fread + memcpy through a userspace buffer.  Pipes and stdin\n"
+"     always fall back to fread regardless of this flag.\n"
+"     AUTO-GATE: Linux kernels before 6.4 lack per-VMA locks, so a\n"
+"     large mmap faulted by many worker threads serialises on the one\n"
+"     mmap_lock — a fault-storm that scales with file size and cores.\n"
+"     For inputs over 4 GiB on a <6.4 kernel, gzstd therefore defaults\n"
+"     to fread; on 6.4+ kernels mmap stays on (zero-copy wins there).\n"
+"     --mmap / --no-mmap force the choice and override the auto-gate.\n"
+"\n"
+"  --direct-read    (default: off)\n"
+"     Read the input with O_DIRECT: transfer straight from disk into an\n"
+"     aligned buffer, BYPASSING the page cache entirely (it neither\n"
+"     reads from nor populates it).  Two uses: (1) a one-pass speedup —\n"
+"     compressing a file you never re-read gains nothing from caching\n"
+"     it, so skipping the populate + writeback overhead can be faster;\n"
+"     (2) honest cold benchmarking with zero system impact — every run\n"
+"     reads cold from disk, with no cache to drop, so no kcompactd\n"
+"     compaction stall and no eviction of other users cached data\n"
+"     (unlike --cold, which drops the cache via fadvise).  Implies the\n"
+"     fread path (O_DIRECT cannot go through mmap) and takes precedence\n"
+"     over it.  Independent of --direct, which is O_DIRECT for OUTPUT.\n"
 "\n"
 "  --preallocate / --no-preallocate    (default: on)\n"
 "     Preallocate the output file with `fallocate` to its expected\n"

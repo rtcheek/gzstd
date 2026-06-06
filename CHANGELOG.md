@@ -1,11 +1,19 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.44  
+**Covers:** v0.9.50 → v0.13.45  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.45 — Document the mmap kernel-gate + `--direct-read` in `--help`
+
+Help text only.  The extended (`--help`) and short (`-h`) entries for
+`--mmap`/`--no-mmap` now describe the v0.13.43 auto-gate (kernel <6.4 + input
+>4 GiB → fread; mmap on for 6.4+), and a new extended `--direct-read` entry
+explains the O_DIRECT page-cache bypass, its one-pass-speedup vs honest-cold-
+benchmark uses, that it implies fread and is independent of `--direct` (output).
 
 ## v0.13.44 — `--direct-read`: O_DIRECT input reader (page-cache bypass)
 
