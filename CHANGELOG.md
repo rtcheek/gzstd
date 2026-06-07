@@ -1,11 +1,34 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.46  
+**Covers:** v0.9.50 → v0.13.47  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.47 — Fix the v0.13.46 parallel O_DIRECT reader (strided → work-stealing)
+
+v0.13.46's parallel reader was catastrophically slow in practice — on a 432 GiB
+real-data run it crawled at ~95 MiB/s (vs 1.47 GiB/s for the v0.13.44 single
+thread it replaced, and 3.51 GiB/s for the page-cache path), starving the whole
+pipeline so it looked like the writer had stalled. Two flaws, now fixed:
+
+- **Strided assignment was the killer.** Each thread took `idx += ODIRECT_READERS`
+  (a 64 MiB stride). That is only sequential while the threads stay in lockstep;
+  the first copy/push stall desynchronises them and the in-flight reads scatter up
+  to `N*cap` apart into a random-looking pattern. With O_DIRECT (no kernel
+  readahead) that destroys NVMe locality. Replaced with **work-stealing**: a shared
+  `atomic<size_t> next_idx` hands the next chunk to whichever reader is free, so the
+  N outstanding reads are always on *consecutive* chunks — a contiguous window that
+  slides forward at queue depth N. Near-sequential access, still deep-queued.
+- **Shared fd.** All readers `pread` one fd; each now opens its own O_DIRECT fd to
+  avoid serialising on the shared file struct.
+
+seq is still the chunk index (file position), so output stays ordered and the
+ordered writer keeps RAM bounded regardless of completion order. Output
+byte-identical to the normal reader on cpu-only and gpu-only across multi-chunk +
+unaligned-tail files; round-trip clean; 290/290 extensive.
 
 ## v0.13.46 — Parallel O_DIRECT reader (--direct-read was QD1-bound)
 

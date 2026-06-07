@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.46";
+static constexpr const char * GZSTD_VERSION = "0.13.47";
 //
 // Architecture overview:
 //
@@ -5299,13 +5299,14 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 #ifndef _WIN32
 // Reader threads for --direct-read.  O_DIRECT bypasses kernel readahead, so a
 // single synchronous pread runs the NVMe at queue-depth 1 and badly underutilises
-// it.  Multiple reader threads issuing strided reads keep many requests in flight
-// (deep queue) and saturate the drive.
+// it.  Multiple reader threads work-stealing consecutive chunks keep many requests
+// in flight (deep queue) while staying near-sequential, so the drive saturates.
 static const int ODIRECT_READERS = 4;
 
-// --direct-read: parallel O_DIRECT reader.  ODIRECT_READERS threads each pread
-// strided, 4 KiB-aligned host_chunks (deterministic chunk_idx) into their own
-// aligned buffer and call emit(buf, n, chunk_idx) — which builds Task[s] with a
+// --direct-read: parallel O_DIRECT reader.  ODIRECT_READERS threads work-steal
+// consecutive 4 KiB-aligned host_chunks from a shared counter (deterministic
+// chunk_idx) into their own aligned buffer and call emit(buf, n, chunk_idx) —
+// which builds Task[s] with a
 // seq derived from chunk_idx and enqueues (total/ordering stay correct because
 // completion is tracked by push count, not a shared seq counter).  emit returns
 // false to abort (e.g. GPU failure).  O_DIRECT transfers straight disk→buffer,
@@ -5319,34 +5320,49 @@ template <typename Emit>   // template so the lambda inlines and the optimizer c
 static bool odirect_read_chunks(const std::string & path, size_t host_chunk,
                                 Meter * m, Emit && emit)
 {
-  int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-  if (fd < 0) return false;
+  int probe_fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+  if (probe_fd < 0) return false;          // O_DIRECT unsupported → caller falls back to fread
   struct stat st;
-  if (::fstat(fd, &st) != 0 || st.st_size < 0) { ::close(fd); return false; }
+  if (::fstat(probe_fd, &st) != 0 || st.st_size < 0) { ::close(probe_fd); return false; }
+  ::close(probe_fd);                       // threads open their own fds (no shared file-struct contention)
   const size_t ALIGN = 4096;
   const size_t cap = ((host_chunk + ALIGN - 1) / ALIGN) * ALIGN;
   const size_t file_size = (size_t)st.st_size;
   const size_t n_chunks = file_size == 0 ? 0 : (file_size + cap - 1) / cap;
+  // Work-stealing, NOT strided.  A shared monotonic counter hands the next chunk to
+  // whichever reader is free, so the ODIRECT_READERS in-flight reads are always on
+  // *consecutive* chunk indices — a contiguous window that slides forward at queue
+  // depth N.  That gives the NVMe near-sequential access (the whole point: O_DIRECT
+  // has no kernel readahead) while keeping many requests in flight.  A strided
+  // assignment (idx += N) looks sequential only while the threads stay in lockstep;
+  // the first copy/push stall desynchronises them and the outstanding reads scatter
+  // up to N*cap apart into a random-looking pattern that collapses throughput.  seq
+  // is still the chunk index (file position), so output stays ordered and the
+  // ordered writer keeps RAM bounded regardless of completion order.
   std::atomic<bool> failed{false};
   std::atomic<bool> stop{false};
-  auto reader = [&](int tid) {
+  std::atomic<size_t> next_idx{0};
+  auto reader = [&]() {
+    int tfd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (tfd < 0) { failed.store(true); return; }
     void * abuf = nullptr;
-    if (posix_memalign(&abuf, ALIGN, cap) != 0 || !abuf) { failed.store(true); return; }
-    for (size_t idx = (size_t)tid; idx < n_chunks && !stop.load(std::memory_order_relaxed);
-         idx += (size_t)ODIRECT_READERS) {
+    if (posix_memalign(&abuf, ALIGN, cap) != 0 || !abuf) { ::close(tfd); failed.store(true); return; }
+    while (!stop.load(std::memory_order_relaxed)) {
+      size_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+      if (idx >= n_chunks) break;
       uint64_t t0 = g_perf ? now_ns() : 0;
-      ssize_t got = ::pread(fd, abuf, cap, (off_t)(idx * cap));  // offset & count 4 KiB-aligned
+      ssize_t got = ::pread(tfd, abuf, cap, (off_t)(idx * cap));  // offset & count 4 KiB-aligned
       if (got <= 0) { failed.store(true); break; }               // within bounds, got>0 unless error
       if (g_perf) { g_perf->read_ns.fetch_add(now_ns() - t0); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
       if (m) m->read_bytes.fetch_add((uint64_t)got);
       if (!emit(static_cast<const char *>(abuf), (size_t)got, idx)) { stop.store(true); break; }
     }
     free(abuf);
+    ::close(tfd);
   };
   std::vector<std::thread> readers;
-  for (int t = 0; t < ODIRECT_READERS; ++t) readers.emplace_back(reader, t);
+  for (int t = 0; t < ODIRECT_READERS; ++t) readers.emplace_back(reader);
   for (auto & th : readers) th.join();
-  ::close(fd);
   if (failed.load()) die_io("O_DIRECT read failed (--direct-read)");
   return true;
 }
