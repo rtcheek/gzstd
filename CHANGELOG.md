@@ -1,11 +1,34 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.47  
+**Covers:** v0.9.50 → v0.13.48  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.48 — Recycle frame buffers (pin mmap threshold) — kill the munmap TLB-shootdown storm
+
+After v0.13.47 fixed the reader's access pattern, `--direct-read` still ran at only
+~1.35 GiB/s on the 432 GiB compress while `dd` showed the same NVMe doing **4.5
+GB/s single-stream O_DIRECT** (4.9 at 128 MiB blocks) — so ~70% of the drive was
+left on the table, and the limiter was ours, not the disk. Root cause: our
+per-frame buffers are 16 MiB (32 MiB ultra), above glibc's 32 MiB dynamic
+`mmap` ceiling, so under the 4-producer/N-consumer hand-off the allocator `mmap`s
+each chunk and **`munmap`s it on free**. The munmap — not the page faults — is the
+killer: tearing down a 16 MiB mapping triggers a TLB shootdown (an IPI to every
+other core), whose cost scales with core count, so on the 256-core server it
+dominated (the run's enormous `sys` time).
+
+Fix: at startup, `mallopt(M_MMAP_THRESHOLD, 128 MiB)` + `mallopt(M_TRIM_THRESHOLD,
+256 MiB)` so frame buffers come from the heap and freed chunks are reused from the
+arena bins — no munmap, no shootdown, no re-grow. Local A/B on a 4 GiB direct-read
+(no 256-core shootdown tax to begin with): wall **2.97 s → 1.58 s** (~1.9×, 1.35 →
+2.53 GB/s); minor faults essentially unchanged (255k → 243k), confirming the win is
+the syscall/shootdown churn, not the faults. Expected to help *more* on the
+256-core box where the shootdown cost is highest. Benefits every path that churns
+large per-frame buffers (compress, decompress, GPU host staging), not just
+`--direct-read`. Peak RSS stays bounded by the in-flight cap. 290/290 extensive.
 
 ## v0.13.47 — Fix the v0.13.46 parallel O_DIRECT reader (strided → work-stealing)
 

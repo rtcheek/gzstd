@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.47";
+static constexpr const char * GZSTD_VERSION = "0.13.48";
 //
 // Architecture overview:
 //
@@ -43,6 +43,9 @@ static constexpr const char * GZSTD_VERSION = "0.13.47";
 #include <zstd_errors.h>
 #include <cstdio>
 #include <cstdlib>
+#if defined(__GLIBC__)
+#include <malloc.h>   // mallopt / M_MMAP_THRESHOLD — recycle frame buffers (see main)
+#endif
 #include <cstring>
 #include <cstdint>
 #include <string>
@@ -9086,6 +9089,25 @@ static std::string derive_output(const std::string & input, Mode mode);
 int main(int argc, char ** argv)
 {
   setup_signal_handlers();
+
+  // Recycle frame buffers instead of mmap/munmap-ing them every chunk.
+  // Our per-frame heap buffers are large (16 MiB default, 32 MiB ultra), so glibc
+  // serves each via mmap (its dynamic threshold caps at 32 MiB and the 4-producer/
+  // N-consumer hand-off pattern keeps the adaptation from engaging).  The killer is
+  // not the page faults but the munmap on every free: tearing down a 16 MiB mapping
+  // forces a TLB shootdown — an IPI to every other core — and that cost scales with
+  // core count, so on a 256-core box it dominates (observed as many minutes of sys
+  // time and the --direct-read reader stuck at ~1/3 of the drive's O_DIRECT
+  // bandwidth; locally, 256-core-free, pinning the threshold still ~halved a 4 GiB
+  // direct-read).  Pinning the mmap threshold above our frame size keeps these
+  // buffers on the heap, where freed chunks return to the arena's bins and are
+  // reused with no munmap and no shootdown; a high trim threshold stops glibc
+  // handing the heap back to the OS between bursts only to re-grow it.  Peak RSS is
+  // bounded by the in-flight cap (throttle + queue byte-cap).
+#if defined(__GLIBC__)
+  mallopt(M_MMAP_THRESHOLD, 128 * 1024 * 1024);  // frames (≤32 MiB) come from the heap, not mmap
+  mallopt(M_TRIM_THRESHOLD, 256 * 1024 * 1024);  // keep the recycled heap resident
+#endif
 
   Options opt = parse_args(argc, argv);
 
