@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.45";
+static constexpr const char * GZSTD_VERSION = "0.13.46";
 //
 // Architecture overview:
 //
@@ -5297,40 +5297,72 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 }
 
 #ifndef _WIN32
-// --direct-read: read `path` with O_DIRECT in host_chunk-sized, 4 KiB-aligned
-// chunks, calling emit(buf,n) for each (emit builds Task[s] and enqueues; return
-// false to stop early).  O_DIRECT transfers straight disk→buffer, bypassing the
-// page cache entirely — it neither reads from nor populates it, so it's honest-
-// cold every run with nothing to evict (no kcompactd) and no warm-cache skew, and
-// it skips the populate/writeback overhead the cache adds to a one-pass read.
-// O_DIRECT can't go through mmap (mmap IS the page cache), so this is its own
-// reader.  The final partial chunk uses the short read O_DIRECT returns at EOF
-// (request stays 4 KiB-aligned; return may be shorter).  Returns false if
-// O_DIRECT couldn't be set up — caller falls back to fread.
+// Reader threads for --direct-read.  O_DIRECT bypasses kernel readahead, so a
+// single synchronous pread runs the NVMe at queue-depth 1 and badly underutilises
+// it.  Multiple reader threads issuing strided reads keep many requests in flight
+// (deep queue) and saturate the drive.
+static const int ODIRECT_READERS = 4;
+
+// --direct-read: parallel O_DIRECT reader.  ODIRECT_READERS threads each pread
+// strided, 4 KiB-aligned host_chunks (deterministic chunk_idx) into their own
+// aligned buffer and call emit(buf, n, chunk_idx) — which builds Task[s] with a
+// seq derived from chunk_idx and enqueues (total/ordering stay correct because
+// completion is tracked by push count, not a shared seq counter).  emit returns
+// false to abort (e.g. GPU failure).  O_DIRECT transfers straight disk→buffer,
+// bypassing the page cache (no populate, no eviction) — honest-cold, no kcompactd,
+// no warm-cache skew, and it skips the cache's populate/writeback overhead on a
+// one-pass read.  O_DIRECT can't go through mmap (mmap IS the cache), so this is
+// its own reader.  The final partial chunk uses O_DIRECT's EOF short read.
+// Returns false if O_DIRECT couldn't be set up — caller falls back to fread.
+template <typename Emit>   // template so the lambda inlines and the optimizer can
+                           // see the posix_memalign buffer is non-null (-Wnonnull)
 static bool odirect_read_chunks(const std::string & path, size_t host_chunk,
-                                Meter * m,
-                                const std::function<bool(const char *, size_t)> & emit)
+                                Meter * m, Emit && emit)
 {
   int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
   if (fd < 0) return false;
+  struct stat st;
+  if (::fstat(fd, &st) != 0 || st.st_size < 0) { ::close(fd); return false; }
   const size_t ALIGN = 4096;
   const size_t cap = ((host_chunk + ALIGN - 1) / ALIGN) * ALIGN;
-  void * abuf = nullptr;
-  if (posix_memalign(&abuf, ALIGN, cap) != 0) { ::close(fd); return false; }
-  off_t off = 0;
-  for (;;) {
-    uint64_t t0 = g_perf ? now_ns() : 0;
-    ssize_t got = ::pread(fd, abuf, cap, off);   // offset is k*cap (aligned); count is cap (aligned)
-    if (got < 0) { free(abuf); ::close(fd); die_io("O_DIRECT read failed (--direct-read)"); }
-    if (got == 0) break;
-    if (g_perf) { g_perf->read_ns.fetch_add(now_ns() - t0); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
-    if (m) m->read_bytes.fetch_add((uint64_t)got);
-    bool cont = emit(static_cast<const char *>(abuf), (size_t)got);
-    off += got;
-    if (!cont || (size_t)got < cap) break;   // short read ⇒ EOF
-  }
-  free(abuf); ::close(fd);
+  const size_t file_size = (size_t)st.st_size;
+  const size_t n_chunks = file_size == 0 ? 0 : (file_size + cap - 1) / cap;
+  std::atomic<bool> failed{false};
+  std::atomic<bool> stop{false};
+  auto reader = [&](int tid) {
+    void * abuf = nullptr;
+    if (posix_memalign(&abuf, ALIGN, cap) != 0 || !abuf) { failed.store(true); return; }
+    for (size_t idx = (size_t)tid; idx < n_chunks && !stop.load(std::memory_order_relaxed);
+         idx += (size_t)ODIRECT_READERS) {
+      uint64_t t0 = g_perf ? now_ns() : 0;
+      ssize_t got = ::pread(fd, abuf, cap, (off_t)(idx * cap));  // offset & count 4 KiB-aligned
+      if (got <= 0) { failed.store(true); break; }               // within bounds, got>0 unless error
+      if (g_perf) { g_perf->read_ns.fetch_add(now_ns() - t0); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
+      if (m) m->read_bytes.fetch_add((uint64_t)got);
+      if (!emit(static_cast<const char *>(abuf), (size_t)got, idx)) { stop.store(true); break; }
+    }
+    free(abuf);
+  };
+  std::vector<std::thread> readers;
+  for (int t = 0; t < ODIRECT_READERS; ++t) readers.emplace_back(reader, t);
+  for (auto & th : readers) th.join();
+  ::close(fd);
+  if (failed.load()) die_io("O_DIRECT read failed (--direct-read)");
   return true;
+}
+
+// Copy a raw byte range into a Task and enqueue it.  Its own (non-inlined)
+// function so vector::assign is analysed with a provably non-null source — inlined
+// into the threaded O_DIRECT reader, GCC can't prove the alloc/source non-null and
+// trips a -Wnonnull false positive on assign's memmove.
+__attribute__((noinline))
+static void enqueue_direct_chunk(TaskQueue & q, size_t seq, const char * buf, size_t n)
+{
+  if (!buf || n == 0) return;
+  Task t;
+  t.seq = seq;
+  t.data.assign(buf, buf + n);
+  q.push(std::move(t));
 }
 #endif
 
@@ -5455,11 +5487,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
     reader_done = odirect_read_chunks(opt.input, host_chunk, m,
-      [&](const char * buf, size_t n) {
-        Task t;
-        t.seq = seq.fetch_add(1, std::memory_order_relaxed);
-        t.data.assign(buf, buf + n);
-        queue.push(std::move(t));
+      [&](const char * buf, size_t n, size_t idx) {
+        enqueue_direct_chunk(queue, idx, buf, n);   // seq deterministic by file position
         return true;
       });
   }
@@ -7352,19 +7381,19 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
+    const size_t subs_per_host = (host_chunk + gpu_chunk - 1) / gpu_chunk;
     reader_done = odirect_read_chunks(opt.input, host_chunk, m,
-      [&](const char * buf, size_t n_host) {
+      [&](const char * buf, size_t n_host, size_t idx) {
         if (abort_on_failure.load(std::memory_order_acquire)
             && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
           return false;
-        size_t sub_off = 0;
+        // Deterministic, contiguous seq by file position: only the last (highest-
+        // idx) chunk is partial, so chunk idx owns [idx*subs_per_host, +n_subs).
+        size_t sub_off = 0, sub_i = 0;
         while (sub_off < n_host) {
           size_t sub_n = std::min(gpu_chunk, n_host - sub_off);
-          Task t;
-          t.seq = seq_counter.fetch_add(1, std::memory_order_relaxed);
-          t.data.assign(buf + sub_off, buf + sub_off + sub_n);
-          queue.push(std::move(t));
-          sub_off += sub_n;
+          enqueue_direct_chunk(queue, idx * subs_per_host + sub_i, buf + sub_off, sub_n);
+          sub_off += sub_n; ++sub_i;
         }
         return true;
       });

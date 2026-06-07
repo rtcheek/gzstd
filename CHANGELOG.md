@@ -1,11 +1,27 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.45  
+**Covers:** v0.9.50 → v0.13.46  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.46 — Parallel O_DIRECT reader (--direct-read was QD1-bound)
+
+The v0.13.44 --direct-read used a single synchronous pread loop, which runs the
+NVMe at queue-depth 1: O_DIRECT has no kernel readahead, so the drive sits idle
+between reads and the reader starves the workers (measured ~1.47 GiB/s on a 432
+GiB cold read vs ~4.5 the drive can do). Now ODIRECT_READERS=4 reader threads
+each pread strided, 4 KiB-aligned host chunks, keeping multiple requests in
+flight (deep queue) to saturate the NVMe. seq is assigned deterministically from
+the chunk index (file position), not a shared counter, so frames stay correctly
+ordered/contiguous despite out-of-order completion across threads (completion is
+tracked by push count). The per-chunk copy lives in a noinline enqueue helper so
+vector::assign is analysed in a clean context (avoids a -Wnonnull false positive
+on the alloc when inlined into the threaded reader). Output byte-identical to the
+normal reader on cpu-only and gpu-only across multi-chunk + unaligned-size files;
+290/290.
 
 ## v0.13.45 — Document the mmap kernel-gate + `--direct-read` in `--help`
 
