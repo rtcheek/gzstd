@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.49";
+static constexpr const char * GZSTD_VERSION = "0.13.50";
 //
 // Architecture overview:
 //
@@ -2413,14 +2413,29 @@ class DirectReadPool {
 public:
   bool init(size_t buf_size, size_t n_bufs) {
     buf_size_ = buf_size;
+    // One big 2 MiB-aligned region + MADV_HUGEPAGE, sliced into buffers on a
+    // 2 MiB-aligned stride.  Huge-page backing makes each 16 MiB buffer physically
+    // (near-)contiguous, so an O_DIRECT pread issues a few large DMA segments instead
+    // of being shattered by the driver's max_segments limit into ~48 tiny ~340 KiB
+    // requests — which on knuth capped the device at 1.8 GB/s vs dd's 4.5.  No memset:
+    // the first pread faults each buffer, and workers read only view_len (== got).
+    const size_t HP = 2 * 1024 * 1024;
+    stride_ = ((buf_size + HP - 1) / HP) * HP;   // 2 MiB-aligned stride ⇒ every slice is 2 MiB-aligned
+    const size_t total = stride_ * n_bufs;
+    if (posix_memalign(&base_, HP, total) != 0 || !base_) { base_ = nullptr; return false; }
+#ifdef MADV_HUGEPAGE
+    (void)madvise(base_, total, MADV_HUGEPAGE);  // best-effort; no-op if THP is disabled
+#endif
+    // Pre-fault one byte per 2 MiB page via the normal write-fault path, which DOES
+    // back a 2 MiB-aligned MADV_HUGEPAGE region with a huge page.  Necessary because
+    // O_DIRECT's get_user_pages would otherwise fault the buffer in as 4 KiB pages
+    // (THP never engages) and we'd keep the fragmented ~340 KiB-request behaviour.
+    volatile char * vp = static_cast<volatile char *>(base_);
+    for (size_t o = 0; o < total; o += HP) vp[o] = 0;
     bufs_.reserve(n_bufs);
     free_.reserve(n_bufs);
     for (size_t i = 0; i < n_bufs; ++i) {
-      void * p = nullptr;
-      if (posix_memalign(&p, 4096, buf_size) != 0 || !p) return false;
-      // No memset: the first pread fills the buffer (faulting its pages once), and
-      // the worker only ever reads view_len (== got) bytes, so the tail is never seen.
-      bufs_.push_back(static_cast<char *>(p));
+      bufs_.push_back(static_cast<char *>(base_) + i * stride_);
       free_.push_back((int)i);
     }
     return true;
@@ -2438,8 +2453,10 @@ public:
     cv_.notify_one();
   }
   char * buf(int slot) { return bufs_[(size_t)slot]; }
-  ~DirectReadPool() { for (char * p : bufs_) free(p); }
+  ~DirectReadPool() { if (base_) free(base_); }
 private:
+  void *              base_ = nullptr;   // single backing region (2 MiB-aligned, THP-advised)
+  size_t              stride_ = 0;       // per-buffer stride (2 MiB-aligned)
   std::vector<char *> bufs_;
   std::vector<int>    free_;
   std::mutex          m_;

@@ -1,11 +1,42 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.49  
+**Covers:** v0.9.50 → v0.13.50  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.50 — `--direct-read`: huge-page pool buffers (fix the ~340 KiB request split)
+
+After v0.13.49, `--direct-read` was still only 1.6 GiB/s vs the page-cache path's
+4.46. `-vvv` showed the reader spends 99% of wall *inside* `pread` (279 s of a 283 s
+run) yet moves only 1.55 GiB/s — so it's not starvation (cores were 97% idle waiting
+on it), the `pread`s themselves are slow. `iostat` found why and `dd` confirmed it:
+
+| | rareq-sz | aqu-sz | throughput |
+|---|---|---|---|
+| dd (16 MiB O_DIRECT) | **638 KiB** | 8.5 | 3.8 GB/s |
+| our reader | **340 KiB** | 15 | 1.8 GB/s |
+
+Same requests/sec; dd's DMA requests are 2× larger, which is the whole 2× gap. Our
+pool buffers (`posix_memalign`) are virtually contiguous but **physically scattered
+4 KiB pages**, so O_DIRECT's scatter-gather list hits the driver's limits
+(`max_segments=127`) and each 16 MiB read shatters into ~340 KiB pieces. dd's buffer
+has enough physical contiguity to reach 638 KiB.
+
+Fix: back the `DirectReadPool` with **transparent huge pages**. One 2 MiB-aligned
+region, `MADV_HUGEPAGE`, sliced on a 2 MiB stride, then **pre-faulted one byte per
+2 MiB** via the normal write-fault path — necessary because O_DIRECT's
+`get_user_pages` would otherwise fault the buffer in as 4 KiB pages and THP would
+never engage. Each 16 MiB buffer is then 8 contiguous 2 MiB pages = 8 DMA segments,
+so a `pread` can reach the device's full `max_sectors_kb` (1280 KiB on the server) —
+2× dd's request size, with headroom toward the ~4.5 GB/s the drive showed
+single-stream. Falls back to plain pages where THP is unavailable (no regression;
+the pre-fault is one touch per 2 MiB). Effect is hardware-specific (needs healthy
+THP + a driver that merges segments) so it shows on the server, not the low-core
+workstation whose THP is effectively disabled. Byte-identical cpu+gpu, round-trip
+clean, 290/290 extensive.
 
 ## v0.13.49 — `--direct-read`: single-stream + zero-copy reader
 
