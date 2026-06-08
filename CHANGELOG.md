@@ -1,11 +1,30 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.50  
+**Covers:** v0.9.50 → v0.13.51  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.51 — `--direct-read` for decompress (was compress-only)
+
+`--direct-read` only honored the compress reader; decompress silently fell back to
+buffered `fread`, so a benchmark or cold run would read the compressed input warm.
+Wired O_DIRECT into `stream_frames_to_queue` (the shared reader behind both
+`decompress_cpu_mt` and `decompress_nvcomp`): when `--direct-read` is set on a
+regular-file input it opens its own O_DIRECT fd on `opt.input` and reads 4 KiB-aligned
+`READ_CHUNK` (4 MiB) blocks into an aligned bounce buffer, copying into the existing
+frame-parse buffer (frame boundaries don't align to reads, so a bounce copy is
+required — but it's the same copy `fread` did internally). The FILE* `in` is at offset
+0 here (`peek_first_frame_decomp_size` rewinds) and is simply unused for reading while
+O_DIRECT is active; the streaming-fallback path (unknown content size) reads through
+the same helper. Falls back to `fread` if O_DIRECT can't be set up. Byte-identical
+decompressed output vs the buffered reader on cpu-only and gpu-only across multi-frame
++ unaligned inputs; round-trip clean; 290/290 extensive. (Known minor gap: the
+single-giant-frame streaming path, `decompress_stream_from_file` for inputs above
+`SINGLE_FRAME_STREAM_MIN` — i.e. `--sliding-window` / `zstd` outputs — still reads
+buffered; gzstd's own chunked output is multi-frame and uses the wired path.)
 
 ## v0.13.50 — `--direct-read`: one contiguous pool region (fix the ~340 KiB request split)
 
@@ -882,7 +901,7 @@ the goal is mmap matching or beating `--no-mmap` with the ~4× sys gap gone.
 ## v0.13.16 — Stream large single-frame files directly from the file
 
 Fix a long-standing slow path: decompressing a single-frame `.zst`
-(stock `zstd -T0`, `--sliding-window`) was far slower than `zstd -d`,
+(stock `zstd`, `--sliding-window`) was far slower than `zstd -d`,
 spiked memory, and showed a frozen progress bar — in every mode,
 including `--cpu-only`.
 
@@ -963,7 +982,7 @@ because detection is deferred):
   `gpu_only_no_device` atomic; `stream_frames_to_queue` takes a new optional
   `abort` pointer and returns early when it's set, so main errors with the
   same `EXIT_USAGE` message instead of buffering a consumer-less queue to EOF.
-- *Oversize first frame* (`--sliding-window` / `zstd -T0` single frame).  The
+- *Oversize first frame* (`--sliding-window` / `zstd` single frame).  The
   peek sets `gpu_disabled_by_peek`; the CPU-pool spawn condition now also
   fires on that flag (gpu-only has no `sched`-driven pool), so the file
   decompresses on CPU.  The deferred bringup still pays a (hidden, discarded)
@@ -1567,7 +1586,7 @@ for the reader to set `producer_done` and only stream when
 `results.total_tasks == 1`.  Multi-frame oversized inputs fall through
 to the normal `ZSTD_decompressDCtx` path with a per-frame `decomp_size`
 allocation — uses more peak RAM but is correct and parallelizable.
-The original v0.12.24 motivation (single-frame `zstd -T0` /
+The original v0.12.24 motivation (single-frame `zstd` /
 `--sliding-window` outputs) is preserved.
 
 Regression test added in `gzstd-test.sh` (`--chunk-size 100` on a
@@ -2120,7 +2139,7 @@ immediately at -v/-vv/-vvv.
 5. Run `stream_frames_to_queue` (workers consume concurrently as the
    parser pushes).
 
-The peek-only check covers the typical "oversize" case (zstd -T0 /
+The peek-only check covers the typical "oversize" case (zstd /
 --sliding-window single-frame files where frame 0 IS the whole file).
 For pathological multi-frame files where only a non-first frame is
 oversize, the GPU runtime fallback path handles it as before.
@@ -2168,7 +2187,7 @@ finished tens of seconds later.
 
 **Cause.** `decompress_nvcomp` does a full pre-scan of the input
 (`stream_frames_to_queue`) *before* spawning GPU workers.  The pre-scan
-is needed to detect oversized frames (sliding-window / `zstd -T0`) and
+is needed to detect oversized frames (sliding-window / `zstd`) and
 fall back to CPU before allocating GPU buffers it can't fill.  But on
 large inputs the pre-scan is the bulk of wall time, and during it only
 the producer's `[SPLIT]` lines emit — the user-visible init lines
@@ -2503,7 +2522,7 @@ examples covering the common workflows (compress, decompress with
 
 ## v0.12.24 — Streaming decompression for oversized frames
 
-**Symptom.** Decompressing single-frame .zst files (e.g., from `zstd -T0` or `gzstd --sliding-window`) showed the `out:` progress bar stuck at 0% for the entire decompression, then jumping to 99.9% at the end. Memory usage spiked to the full decompressed size (e.g., 125 GiB) because the worker allocated one giant buffer for the entire frame.
+**Symptom.** Decompressing single-frame .zst files (e.g., from `zstd` or `gzstd --sliding-window`) showed the `out:` progress bar stuck at 0% for the entire decompression, then jumping to 99.9% at the end. Memory usage spiked to the full decompressed size (e.g., 125 GiB) because the worker allocated one giant buffer for the entire frame.
 
 **Root cause.** `cpu_decomp_worker` called `ZSTD_decompressDCtx` with a single output buffer sized to the full decompressed frame. Nothing was written to disk until the entire frame was decompressed, so the writer (and its progress tracking) had no work to do until the very end.
 
@@ -2534,10 +2553,10 @@ examples covering the common workflows (compress, decompress with
 
 ## v0.12.22 — `--sliding-window` single-frame compression mode
 
-**Motivation.** For highly repetitive data (e.g., random word lists repeated across 125 GiB), gzstd's multi-frame architecture (8000 independent 16 MiB frames) achieved 0.29% ratio while `zstd -T0` achieved 0.01% (31× better). The difference: zstd produces a single frame with a 2 MiB sliding window that maintains context across the entire file, while gzstd's frames each start with a cold window.
+**Motivation.** For highly repetitive data (e.g., random word lists repeated across 125 GiB), gzstd's multi-frame architecture (8000 independent 16 MiB frames) achieved 0.29% ratio while `zstd` achieved 0.01% (31× better). The difference: zstd produces a single frame with a 2 MiB sliding window that maintains context across the entire file, while gzstd's frames each start with a cold window.
 
 **Feature.** New `--sliding-window` flag delegates compression to zstd's built-in multi-threaded mode (`ZSTD_c_nbWorkers`), producing a single standard zstd frame. Trade-offs:
-- Ratio matches `zstd -T0` exactly (shared sliding window context)
+- Ratio matches `zstd` exactly (shared sliding window context)
 - Output is a standard .zst file — `zstd -d` can decompress it
 - Decompression is single-threaded (one frame = one unit of work for any decompressor)
 - Implies `--cpu-only` (GPU/nvCOMP has no sliding window API)
@@ -2548,7 +2567,7 @@ examples covering the common workflows (compress, decompress with
 - `--sliding-window` without `--cpu-only` auto-enables it with a warning
 - Round-trip verified; `zstd --list` confirms single frame; `zstd -d` interop confirmed
 
-**GPU fallback for oversized frames.** When decompressing a single-frame file (from `zstd -T0` or `--sliding-window`), the frame's decompressed size can be hundreds of GiB — far exceeding nvCOMP's 16 MiB per-slot VRAM allocation. gzstd now detects oversized frames during the pre-scan and automatically falls back to CPU-only decompression with a clear warning. `--gpu-only` is gracefully overridden rather than crashing.
+**GPU fallback for oversized frames.** When decompressing a single-frame file (from `zstd` or `--sliding-window`), the frame's decompressed size can be hundreds of GiB — far exceeding nvCOMP's 16 MiB per-slot VRAM allocation. gzstd now detects oversized frames during the pre-scan and automatically falls back to CPU-only decompression with a clear warning. `--gpu-only` is gracefully overridden rather than crashing.
 
 **Progress bar fix (mmap compression).** The mmap zero-copy reader enqueued all tasks instantly (pointer arithmetic, no I/O), causing the `in:` progress to jump to 100% immediately. Fixed by deferring `read_bytes` updates to when workers actually pick up each task, so the progress bar reflects real processing throughput.
 

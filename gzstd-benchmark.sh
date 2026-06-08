@@ -32,14 +32,14 @@
 #                     on the current hardware.  See v0.12.46 CHANGELOG.
 #   --sweep-all       Enable all sweeps (including --sweep-ultra)
 #   --no-decompress   Skip decomp benchmarks
-#   --direct          Force --direct (O_DIRECT output) on every run
-#   --no-direct       Force --no-direct (buffered) on every run; default is
-#                       neither (let gzstd auto-decide — Gen4+ auto-enables
-#                       O_DIRECT, so use --no-direct for the buffered baseline)
 #   --help            Show this help
 #
-# Generates a temporary compressed file for each config, measures
-# wall-clock time, and computes throughput in GiB/s.
+# Every run reads cold via --direct-read (O_DIRECT bypasses the page cache, so
+# repeated iterations don't measure RAM) and writes to /dev/null (no NVMe wear,
+# no read/write device contention — all paths share the same writer, so the read
+# + compute path is what's compared).  Decompress reads the .bin.zst that
+# gzstd-gendata.sh builds next to each .bin — run gzstd-gendata.sh first.
+# Reports wall-clock time and throughput in GiB/s.
 #=====================================================================
 set -euo pipefail
 
@@ -72,13 +72,6 @@ SWEEP_ULTRA=false
 SWEEP_THROTTLE=false
 SWEEP_MATRIX=false
 DO_DECOMPRESS=true
-# Tri-state O_DIRECT control for every gzstd run:
-#   ""            (default) pass nothing — let gzstd auto-decide.  NOTE: on
-#                 PCIe Gen4+, gzstd auto-enables O_DIRECT, so the default sweep
-#                 measures the O_DIRECT path there, not buffered.
-#   "--direct"    force O_DIRECT output
-#   "--no-direct" force buffered output (the buffered baseline on Gen4)
-DIRECT_FLAG=""
 
 #---------------------------------------------------------------------
 # Parse arguments
@@ -91,8 +84,6 @@ while [[ $# -gt 0 ]]; do
     --iterations)  ITERATIONS="$2"; shift 2 ;;
     --files)       FILE_PATTERN="$2"; shift 2 ;;
     --quick)       QUICK=true; ITERATIONS=1; shift ;;
-    --direct)      DIRECT_FLAG="--direct"; shift ;;
-    --no-direct)   DIRECT_FLAG="--no-direct"; shift ;;
     --gpu-only)    GPU_ONLY=true; shift ;;
     --cpu-only)    CPU_ONLY=true; shift ;;
     --hybrid-only) HYBRID_ONLY=true; shift ;;
@@ -429,8 +420,10 @@ echo ""
 TEST_FILES=()
 for f in "$DATA_DIR"/$FILE_PATTERN; do
   [[ -f "$f" ]] || continue
-  # Skip .zst files (compressed outputs from previous runs)
-  [[ "$f" == *.zst ]] && continue
+  # The corpus is .bin (compress input) + matching .bin.zst (decompress input).
+  # Only collect .bin; ignore the .zst siblings and any other stray files so the
+  # decompress step always has a ${file}.zst to read.
+  [[ "$f" == *.bin ]] || continue
   TEST_FILES+=("$f")
 done
 
@@ -447,6 +440,22 @@ for f in "${TEST_FILES[@]}"; do
 done
 echo ""
 
+# Decompress benchmarks read the .bin.zst that gzstd-gendata.sh builds next to each
+# .bin (the benchmark never compresses to disk).  Verify they exist up front so we
+# fail fast with a clear message instead of mid-sweep.
+if $DO_DECOMPRESS; then
+  missing=()
+  for f in "${TEST_FILES[@]}"; do
+    [[ -f "${f}.zst" ]] || missing+=("$(basename "${f}.zst")")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "ERROR: missing decompress inputs: ${missing[*]}" >&2
+    echo "       Run ./gzstd-gendata.sh to (re)build the .bin.zst alongside each .bin," >&2
+    echo "       or pass --no-decompress to benchmark compression only." >&2
+    exit 1
+  fi
+fi
+
 #---------------------------------------------------------------------
 # Helper: append one row to the results TSV
 #---------------------------------------------------------------------
@@ -461,12 +470,11 @@ append_result() {
 #---------------------------------------------------------------------
 run_timed() {
   local start end elapsed rc
-  # NOTE: we deliberately do NOT write to /proc/sys/vm/drop_caches here.
-  # That's a system-wide cache + dentry + inode eviction; under sudo it
-  # would clobber whatever else is running on the host just to set up our
-  # benchmark.  Cold-cache reads are handled per-invocation by gzstd's
-  # --cold flag (posix_fadvise(POSIX_FADV_DONTNEED) on the input fd),
-  # which is unprivileged and scoped to the file we're about to read.
+  # Cold reads are handled per-invocation by gzstd's --direct-read (O_DIRECT
+  # bypasses the page cache entirely — honest-cold every run, no system-wide
+  # drop_caches, no eviction of other users' data).  The sync just flushes any
+  # stray dirty pages so they can't write back mid-measurement; output is
+  # /dev/null so the run itself produces none.
   sync 2>/dev/null || true
 
   start=$(date +%s.%N)
@@ -685,7 +693,7 @@ for config_str in "${CONFIGS[@]}"; do
     file_base=$(basename "$test_file")
     file_bytes=$(stat -c%s "$test_file" 2>/dev/null \
                  || stat -f%z "$test_file" 2>/dev/null)
-    comp_out="$TMPDIR/compressed.zst"
+    zst_in="${test_file}.zst"   # decompress input, built by gzstd-gendata.sh
 
     #--- Comp benchmark ---
     test_num=$((test_num + 1))
@@ -694,39 +702,29 @@ for config_str in "${CONFIGS[@]}"; do
 
     times_c=()
     for ((i=1; i<=ITERATIONS; i++)); do
-      # Don't rm the output between iterations: gzstd -f uses atomic
-      # overwrite (.tmp + rename) when the file exists, which matches
-      # real-world usage.  Removing it forces the "new file" fast path,
-      # underreporting wall time by ~2× due to skipped writeback
-      # contention.  The sync in run_timed flushes prior dirty pages.
-      # --cold drops the input from the page cache via posix_fadvise so
-      # iterations 2-3 don't measure memory-to-memory throughput.  Without
-      # it the benchmark medians reflect cached reads, not the cold-disk
-      # performance a typical user sees.  $DIRECT_FLAG forces --direct or
-      # --no-direct per the script flag (empty = let gzstd auto-decide).
+      # Every run reads the input cold via --direct-read (O_DIRECT bypasses the
+      # page cache, so iterations 2..N don't measure memory-to-memory) and writes
+      # to /dev/null (no NVMe wear, no read/write device contention — every config
+      # uses the same writer, so the read + compute path is what we compare).
       # shellcheck disable=SC2086
       elapsed=$(run_timed \
-        "$GZSTD" --cold $DIRECT_FLAG $comp_flags -f --output="$comp_out" "$test_file")
+        "$GZSTD" --direct-read $comp_flags -f --output=/dev/null "$test_file")
       times_c+=("$elapsed")
     done
 
     median_c=$(median "${times_c[@]}")
 
-    # Verify compressed output exists (debug first file)
-    if [[ ! -f "$comp_out" ]]; then
-      echo "" >&2
-      echo "  [DEBUG] compressed output not found: $comp_out" >&2
-      echo "  [DEBUG] TMPDIR: $(ls -la "$TMPDIR"/ 2>&1 | head -5)" >&2
-      echo "  [DEBUG] Last command stderr:" >&2
-      cat "$TMPDIR/last_stderr.log" >&2 2>/dev/null
+    # No output file (we wrote /dev/null) — take the compression ratio from gzstd's
+    # own completion line: "<file> : NN.NN% (a => b, /dev/null) @ rate".
+    ratio=$(sed 's/\x1b\[[0-9;]*m//g' "$TMPDIR/last_stderr.log" 2>/dev/null \
+            | grep -aoP '[0-9]+\.[0-9]+(?=% \()' | tail -1 || true)
+    [[ -z "$ratio" ]] && ratio="?"
+    if [[ "$ratio" != "?" ]]; then
+      comp_bytes=$(python3 -c "print(int($file_bytes * $ratio / 100))" 2>/dev/null || echo 0)
+    else
+      comp_bytes=0
     fi
-
-    comp_bytes=$(stat -c%s "$comp_out" 2>/dev/null \
-                 || stat -f%z "$comp_out" 2>/dev/null || echo "0")
     thr_c=$(throughput_gibs "$file_bytes" "$median_c")
-    ratio=$(python3 -c \
-      "print(f'{$comp_bytes * 100 / $file_bytes:.1f}')" \
-      2>/dev/null || echo "?")
 
     append_result \
       "$label" "$file_base" "compress" \
@@ -741,21 +739,22 @@ for config_str in "${CONFIGS[@]}"; do
         "$test_num" "$total_tests" \
         "$label" "$file_base" "decompress"
 
-      decomp_out="$TMPDIR/decompressed.bin"
+      # Decompress the gendata-built .bin.zst, cold via --direct-read, to /dev/null.
+      # Its actual on-disk size is the honest "compressed input" for this row.
+      zst_bytes=$(stat -c%s "$zst_in" 2>/dev/null \
+                  || stat -f%z "$zst_in" 2>/dev/null || echo "0")
+      dratio=$(python3 -c \
+        "print(f'{$zst_bytes * 100 / $file_bytes:.1f}')" 2>/dev/null || echo "?")
       times_d=()
       for ((i=1; i<=ITERATIONS; i++)); do
-        # Same rationale as compress: keep output between iterations
-        # so overwrite path is exercised after the first run.
         # Use decomp_flags if set, otherwise just -d
         local_flags="-d"
         if [[ -n "$decomp_flags" ]]; then
           local_flags="$decomp_flags -d"
         fi
-        # --cold and $DIRECT_FLAG: see compress block above for rationale.
         # shellcheck disable=SC2086
         elapsed=$(run_timed \
-          "$GZSTD" --cold $DIRECT_FLAG $local_flags -f \
-          --output="$decomp_out" "$comp_out")
+          "$GZSTD" --direct-read $local_flags -f --output=/dev/null "$zst_in")
         times_d+=("$elapsed")
       done
 
@@ -764,31 +763,13 @@ for config_str in "${CONFIGS[@]}"; do
 
       append_result \
         "$label" "$file_base" "decompress" \
-        "$file_bytes" "$comp_bytes" "$median_d" "$thr_d" "$ratio"
+        "$file_bytes" "$zst_bytes" "$median_d" "$thr_d" "$dratio"
       print_result \
         "$label" "$file_base" "decompress" \
-        "$median_d" "$thr_d" "$ratio"
-
-      # Verify correctness on last iteration
-      if [[ ! -f "$decomp_out" ]]; then
-        echo ""
-        echo "  WARNING: decomp output missing" \
-             "for $label / $file_base!"
-      elif ! diff -q "$test_file" "$decomp_out" > /dev/null 2>&1
-      then
-        orig_sz=$(stat -c%s "$test_file" 2>/dev/null \
-                  || stat -f%z "$test_file" 2>/dev/null || echo "?")
-        dec_sz=$(stat -c%s "$decomp_out" 2>/dev/null \
-                 || stat -f%z "$decomp_out" 2>/dev/null || echo "?")
-        echo ""
-        echo "  WARNING: decomp mismatch" \
-             "for $label / $file_base" \
-             "(orig=$orig_sz dec=$dec_sz)"
-      fi
-      rm -f "$decomp_out"
+        "$median_d" "$thr_d" "$dratio"
+      # Correctness is verified when gzstd-gendata.sh builds the corpus and by the
+      # test suite; with /dev/null output there's nothing to diff here.
     fi
-
-    rm -f "$comp_out"
   done
 done
 

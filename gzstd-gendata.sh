@@ -2,21 +2,39 @@
 #======================================================================
 # gzstd-gendata.sh  Generate test data for gzstd benchmarking
 #
-# Creates several files with different compressibility characteristics
-# to test gzstd performance across varied workloads.
+# Creates several .bin files with different compressibility characteristics,
+# then compresses each to a matching .bin.zst with gzstd (multi-frame defaults).
+# The .bin.zst are the decompress-benchmark inputs: gzstd-benchmark.sh reads them
+# (and the .bin) and writes only /dev/null, so the corpus is built once here and
+# the benchmark never writes to the test disk.  The .bin/.bin.zst pair is always
+# (re)created together so they match.
 #
 # Usage: ./gzstd-gendata.sh [size_mib] [output_dir]
 #   size_mib    Approximate size of each file in MiB (default: 512)
 #   output_dir  Directory for test files (default: ./gzstd-testdata)
+#   GZSTD_BIN   env: path to the gzstd binary (default: ./build/gzstd, then PATH)
 #
-# Requirements: bash, python3, dd, numfmt, stat
+# Requirements: bash, python3, dd, numfmt, stat, gzstd
 #======================================================================
-VERSION="0.11.37"
+VERSION="0.13.51"
 #set -euo pipefail
 
 SIZE_MIB="${1:-512}"
 OUTDIR="${2:-./gzstd-testdata}"
 SIZE_BYTES=$(( SIZE_MIB * 1024 * 1024 ))
+
+# gzstd binary used to build the matching .bin.zst decompress inputs.
+GZSTD_BIN="${GZSTD_BIN:-./build/gzstd}"
+if [ ! -x "$GZSTD_BIN" ]; then
+  if command -v gzstd >/dev/null 2>&1; then
+    GZSTD_BIN="$(command -v gzstd)"
+  else
+    echo "ERROR: gzstd binary not found (looked at ./build/gzstd and PATH)." >&2
+    echo "       Set GZSTD_BIN=/path/to/gzstd — it builds the .bin.zst decompress" >&2
+    echo "       inputs that gzstd-benchmark.sh needs." >&2
+    exit 1
+  fi
+fi
 
 # Number of parallel jobs — capped at 5 (one per file)
 NPROC=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
@@ -62,6 +80,7 @@ printf "${BOLD}${BRIGHT_WHITE}=== gzstd test data generator v${VERSION} ===${RES
 printf "${DIM}Output dir : ${RESET}${CYAN}%s${RESET}\n"  "$OUTDIR"
 printf "${DIM}File size  : ${RESET}${CYAN}%s MiB each${RESET}\n" "$SIZE_MIB"
 printf "${DIM}Parallel   : ${RESET}${CYAN}%s jobs${RESET}\n" "$JOBS"
+printf "${DIM}gzstd bin  : ${RESET}${CYAN}%s${RESET}\n" "$GZSTD_BIN"
 
 if python3 -c "import numpy" 2>/dev/null; then
   NUMPY_VER=$(python3 -c "import numpy; print(numpy.__version__)")
@@ -353,6 +372,37 @@ done
 show_cursor
 
 #----------------------------------------------------------------------
+# Compress each .bin -> .bin.zst with gzstd (multi-frame defaults).
+# These are the decompress-benchmark inputs.  Recreated every run so the
+# .bin and .bin.zst always match.  gzstd keeps the source .bin by default and
+# names the output <file>.bin.zst, so a bare `gzstd --overwrite <file>` is all
+# we need.  Sequential: each gzstd run already uses every core.
+#----------------------------------------------------------------------
+echo ""
+printf "${BOLD}${WHITE}Compressing → .bin.zst:${RESET}\n"
+CFAILED=0
+for entry in "${FILES[@]}"; do
+  IFS='|' read -r slug fname annotation fpath prog <<< "$entry"
+  if [ "${EXIT_RC[$slug]:-0}" -ne 0 ]; then
+    printf "  ${YELLOW}–${RESET}  %-20s ${DIM}skipped (generation failed)${RESET}\n" "$fname"
+    continue
+  fi
+  printf "  ${DIM}…${RESET}  %-20s ${DIM}compressing…${RESET}\r" "$fname"
+  # -k/--keep: gzstd keeps the source by default, but pass it explicitly so we still
+  # retain the .bin if that default ever changes (we need both .bin and .bin.zst).
+  if "$GZSTD_BIN" --overwrite -k "$fpath" >/dev/null 2>&1; then
+    zsz=$(stat -c%s "${fpath}.zst" 2>/dev/null || echo 0)
+    cursor_col0; erase_line
+    printf "  ${GREEN}✔${RESET}  %-20s ${DIM}→ %s.bin.zst  %s${RESET}\n" \
+      "$fname" "$slug" "$(numfmt --to=iec-i --suffix=B "$zsz" 2>/dev/null || echo "${zsz}B")"
+  else
+    cursor_col0; erase_line
+    printf "  ${RED}✘${RESET}  %-20s ${RED}compress failed${RESET}\n" "$fname"
+    CFAILED=$(( CFAILED + 1 ))
+  fi
+done
+
+#----------------------------------------------------------------------
 # Final summary
 #----------------------------------------------------------------------
 echo ""
@@ -364,6 +414,7 @@ for entry in "${FILES[@]}"; do
 done
 
 [ "$FAILED" -gt 0 ] && printf "${RED}WARNING: %d generator(s) failed.${RESET}\n\n" "$FAILED" >&2
+[ "${CFAILED:-0}" -gt 0 ] && printf "${RED}WARNING: %d compression(s) failed.${RESET}\n\n" "$CFAILED" >&2
 
 printf "${BOLD}${GREEN}=== Test data ready in %s ===${RESET}\n" "$OUTDIR"
 ls -lhS "$OUTDIR/"

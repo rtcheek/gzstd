@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.50";
+static constexpr const char * GZSTD_VERSION = "0.13.51";
 //
 // Architecture overview:
 //
@@ -166,7 +166,7 @@ static void setup_signal_handlers()
 ======================================================================*/
 static const size_t ONE_MIB = size_t(1024) * size_t(1024);
 static const size_t DEFAULT_CHUNK_MIB = 16;
-// A first frame larger than this is treated as a single-frame file (zstd -T0 /
+// A first frame larger than this is treated as a single-frame file (zstd /
 // --sliding-window) and streamed directly from the file rather than buffered
 // through the queue.  Sits well above gzstd's largest practical chunk
 // (--ultra auto-bumps to 128 MiB) so genuinely multi-frame chunked inputs keep
@@ -816,7 +816,7 @@ static void print_help_long()
 "  --sliding-window\n"
 "     Compress the whole file as a single frame with zstd's built-in\n"
 "     multi-threaded mode (`ZSTD_c_nbWorkers`).  Maximum ratio on\n"
-"     repetitive data (matches `zstd -T0` exactly) because the\n"
+"     repetitive data (matches `zstd` exactly) because the\n"
 "     sliding window carries context across the full file.\n"
 "     Implies --cpu-only.  Decompression is single-threaded because\n"
 "     one frame = one unit of work for any decompressor.\n"
@@ -3684,7 +3684,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
   ZSTD_freeDCtx(dctx);
 }
 
-// Streaming decompress of a large single-frame input (zstd -T0 /
+// Streaming decompress of a large single-frame input (zstd /
 // --sliding-window) read directly from the FILE.  A single zstd frame can't be
 // split across threads (nor GPU subchunks), so the old fallback buffered the
 // whole compressed frame into one Task and decompressed it single-threaded
@@ -4680,7 +4680,7 @@ static void cpu_decomp_worker(
     const size_t comp_size = t.len();
     size_t actual;
 
-    // For oversized frames (e.g., single-frame files from zstd -T0), use
+    // For oversized frames (e.g., single-frame files from zstd), use
     // streaming decompression with chunked output so the writer can make
     // progress and the progress bar updates incrementally.
     //
@@ -4878,6 +4878,41 @@ static size_t stream_frames_to_queue(
   size_t seq = 0;
   bool eof = false;
 
+  // --direct-read: O_DIRECT input for decompress, mirroring the compress reader.
+  // Read 4 KiB-aligned READ_CHUNK blocks into an aligned bounce buffer and copy into
+  // the parse buffer (frame boundaries don't align to reads, so the bounce is
+  // unavoidable — but it's the same copy fread does internally).  Bypasses the page
+  // cache: honest-cold, no eviction.  Opens its own fd on opt.input — the FILE* `in`
+  // is at offset 0 here (peek_first_frame_decomp_size rewinds) and is simply unused
+  // for reading while O_DIRECT is active.  Falls back to fread if it can't be set up.
+  struct DirectIn { int fd = -1; void * b = nullptr;
+    ~DirectIn() { if (fd >= 0) ::close(fd); if (b) free(b); } } din;
+  off_t din_off = 0;
+  bool use_direct = false;
+#ifndef _WIN32
+  if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
+    din.fd = ::open(opt.input.c_str(), O_RDONLY | O_DIRECT);
+    if (din.fd >= 0 && posix_memalign(&din.b, 4096, READ_CHUNK) == 0 && din.b) {
+      use_direct = true;
+      vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
+    }
+  }
+#endif
+  // Fill dst with up to READ_CHUNK bytes; returns count (0 = EOF).
+  auto read_chunk = [&](char * dst) -> size_t {
+#ifndef _WIN32
+    if (use_direct) {
+      ssize_t got = ::pread(din.fd, din.b, READ_CHUNK, din_off);  // offset & len 4 KiB-aligned
+      if (got < 0) die_io("O_DIRECT read failed (--direct-read, decompress)");
+      if (got == 0) return 0;
+      std::memcpy(dst, din.b, (size_t)got);
+      din_off += got;
+      return (size_t)got;
+    }
+#endif
+    return std::fread(dst, 1, READ_CHUNK, in);
+  };
+
   while (!eof) {
     // Caller asked us to stop early (e.g. --gpu-only but the deferred bringup
     // thread found no CUDA device).  Return what we have; the caller errors.
@@ -4899,9 +4934,9 @@ static size_t stream_frames_to_queue(
     if (buf_len + READ_CHUNK > buf.size())
       buf.resize(buf_len + READ_CHUNK);
 
-    // Read more data from input
+    // Read more data from input (O_DIRECT bounce when --direct-read, else fread)
     uint64_t rd_t0 = g_perf ? now_ns() : 0;
-    size_t n = std::fread(buf.data() + buf_len, 1, READ_CHUNK, in);
+    size_t n = read_chunk(buf.data() + buf_len);
     if (g_perf && n > 0) {
       g_perf->read_ns.fetch_add(now_ns() - rd_t0);
       g_perf->read_bytes_total.fetch_add(n);
@@ -4984,7 +5019,7 @@ static size_t stream_frames_to_queue(
           raw_data->assign(buf.data() + buf_off, buf.data() + buf_len);
           std::vector<char> tail(READ_CHUNK);
           while (true) {
-            size_t r = std::fread(tail.data(), 1, READ_CHUNK, in);
+            size_t r = read_chunk(tail.data());
             if (r == 0) break;
             raw_data->insert(raw_data->end(), tail.data(), tail.data() + r);
           }
@@ -5276,7 +5311,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
 }
 
 // Single-frame compression using zstd's built-in MT with sliding window.
-// Produces one frame (like `zstd -T0`) for maximum ratio on repetitive data.
+// Produces one frame (like `zstd`) for maximum ratio on repetitive data.
 // Decompression will be single-threaded (one frame = one unit of work).
 static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
@@ -8672,7 +8707,7 @@ static void gpu_decomp_worker(
 
 // Peek at the first frame's decompressed size without consuming input.
 // Used by decompress_nvcomp to detect single-frame "oversize" files
-// (zstd -T0, --sliding-window) BEFORE spawning workers — so the GPU
+// (zstd, --sliding-window) BEFORE spawning workers — so the GPU
 // path can be skipped without blocking on a full pre-scan.
 //
 // Returns the decomp size in bytes, or -1 if it can't be determined
@@ -8782,7 +8817,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // saw nothing but [SPLIT] frame N lines until parsing finished.  We
   // restore the v0.12.21 "spawn workers first, parse concurrently"
   // architecture by checking only the first frame's decompressed size
-  // up front — sufficient to detect zstd -T0 / --sliding-window
+  // up front — sufficient to detect zstd / --sliding-window
   // single-frame files (where frame 0 IS the whole file) without
   // touching the rest of the input.
   bool fallback = false;
@@ -8794,7 +8829,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     vlog(V_NORMAL, opt,
          std::string("warning: first frame decompresses to ") + sz
          + " (GPU max: 16 MiB).\n"
-         "  This file was likely compressed with --sliding-window or zstd -T0.\n"
+         "  This file was likely compressed with --sliding-window or zstd.\n"
          "  Falling back to CPU-only decompression.\n");
     if (opt.gpu_only)
       vlog(V_NORMAL, opt, "  (--gpu-only ignored for this file)\n");
@@ -9489,7 +9524,7 @@ int main(int argc, char ** argv)
       std::rewind(in);
     }
 
-    // A large single frame (zstd -T0 / --sliding-window) can't be split across
+    // A large single frame (zstd / --sliding-window) can't be split across
     // CPU threads or GPU subchunks.  Above SINGLE_FRAME_STREAM_MIN it's
     // effectively a single-frame file, so stream it straight from the FILE —
     // overlapping read/decompress/write with bounded memory — for every mode,
@@ -9505,7 +9540,7 @@ int main(int argc, char ** argv)
         vlog(V_NORMAL, opt,
              std::string("warning: first frame decompresses to ") + sz
              + " (GPU max: 16 MiB).\n"
-             "  This file was likely compressed with --sliding-window or zstd -T0.\n"
+             "  This file was likely compressed with --sliding-window or zstd.\n"
              "  Decompressing on CPU (a single frame can't use the GPU).\n");
 #endif
       vlog(V_VERBOSE, opt,
