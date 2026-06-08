@@ -1,11 +1,46 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.48  
+**Covers:** v0.9.50 → v0.13.49  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.49 — `--direct-read`: single-stream + zero-copy reader
+
+Two `dd` facts settled the design. (1) On this NVMe a *single* O_DIRECT stream does
+**4.5 GB/s** (4.9 at 128 MiB), while **4 independent streams collapse to ~3.0 GB/s
+aggregate** (0.77 each) — concurrent O_DIRECT *contends*, it does not scale. So the
+v0.13.46/47 multi-threaded reader was wrong for this hardware. (2) A single `dd`
+stream already saturates the drive, yet our pipeline extracted only ~1.5 GB/s of
+that 4.5 — because every chunk did a 16 MiB `memcpy` from the O_DIRECT buffer into
+the Task, and on the 256-core box that copy competes for memory bandwidth with the
+compressors and stalls the read stream between requests.
+
+Rewritten as **one stream, zero copies**:
+- **Single reader.** Dropped the work-stealing/multi-thread machinery; one
+  uninterrupted O_DIRECT stream is fastest here.
+- **Zero-copy (CPU path).** `pread` lands straight in a pooled 4 KiB-aligned buffer
+  (`DirectReadPool`); the Task aliases it as a `view_ptr` (like the mmap path) and
+  the worker recycles the slot on `release_input()`. No per-chunk copy — the stream
+  reads continuously. `pool->acquire()` blocks when all buffers are in flight, so
+  the pool *is* the producer backpressure (the queue byte-cap is a no-op for
+  zero-byte view tasks). Pool sized to keep every worker fed plus a read-ahead
+  backlog (`threads + 128`, capped by file size and 1024); a buffer is held only
+  from pread until compression finishes (not during write), so peak RSS stays
+  bounded. Read-byte metering moved fully to the reader for these views (workers
+  skip `direct_buf >= 0` tasks) — no double-count.
+- **GPU path unchanged.** It splits each host chunk into gpu subchunks, so one
+  owning buffer per read doesn't map to one Task; it keeps the copy (pool == null,
+  single scratch buffer), where PCIe dominates anyway.
+
+Expected to close most of the 1.5 → ~4.5 GB/s gap on the 256-core box (capped by
+the compressor at ~3.5); the win is memory-bandwidth-bound so it doesn't show on a
+low-core workstation (where the copy was never the bottleneck) — local runs confirm
+byte-identical output (cpu + gpu, multi-chunk + unaligned tail), clean round-trip,
+correct read metering, and bounded RSS. 290/290 extensive. (v0.13.48's mallopt stays
+— it still helps the GPU/fread/decompress and output-buffer paths.)
 
 ## v0.13.48 — Recycle frame buffers (pin mmap threshold) — kill the munmap TLB-shootdown storm
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.48";
+static constexpr const char * GZSTD_VERSION = "0.13.49";
 //
 // Architecture overview:
 //
@@ -2174,19 +2174,24 @@ static size_t check_ram_budget(int threads, size_t chunk_mib, const Options & op
 // For decompression, decomp_size holds the expected decompressed size (from frame header).
 // For mmap-backed compression, view_ptr/view_len point into the mapped region
 // (zero-copy); data is empty.  Consumers use ptr()/len() uniformly.
+// fwd: return a --direct-read zero-copy buffer to its pool (defined with DirectReadPool).
+static void gz_direct_read_release(int slot);
+
 struct Task {
   size_t seq = 0;
   std::vector<char> data;
   size_t decomp_size = 0;
   const char * view_ptr = nullptr;
   size_t       view_len = 0;
+  int          direct_buf = -1;   // >=0: view_ptr aliases DirectReadPool slot; recycle on release
 
 
   const char * ptr() const { return view_ptr ? view_ptr : data.data(); }
   size_t       len() const { return view_ptr ? view_len : data.size(); }
   void release_input() {
-    if (view_ptr) { view_ptr = nullptr; view_len = 0; }
-    else          { std::vector<char>().swap(data); }
+    if (direct_buf >= 0) { gz_direct_read_release(direct_buf); direct_buf = -1; view_ptr = nullptr; view_len = 0; }
+    else if (view_ptr)   { view_ptr = nullptr; view_len = 0; }
+    else                 { std::vector<char>().swap(data); }
   }
 };
 
@@ -2393,6 +2398,68 @@ static PerfCounters * g_perf = nullptr;
 #ifndef _WIN32
 static DirectWriter * g_direct_writer = nullptr;
 #endif
+
+// Fixed pool of page-aligned buffers for the zero-copy --direct-read path.
+// The single O_DIRECT reader preads each chunk straight into a pooled buffer and
+// hands it to a worker as a Task view (no per-chunk 16 MiB copy); the worker
+// recycles it via release_input() -> gz_direct_read_release().  acquire() blocks
+// when every buffer is in flight, so the pool doubles as producer backpressure
+// (replacing the queue byte-cap, which is a no-op for zero-copy view tasks).
+// One reader stream is deliberate: concurrent O_DIRECT reads *contend* on this
+// class of NVMe (measured: 1 stream 4.5 GB/s, 4 streams 3.0 GB/s aggregate), so
+// the win is a single uninterrupted stream that never stalls to memcpy.
+#ifndef _WIN32
+class DirectReadPool {
+public:
+  bool init(size_t buf_size, size_t n_bufs) {
+    buf_size_ = buf_size;
+    bufs_.reserve(n_bufs);
+    free_.reserve(n_bufs);
+    for (size_t i = 0; i < n_bufs; ++i) {
+      void * p = nullptr;
+      if (posix_memalign(&p, 4096, buf_size) != 0 || !p) return false;
+      // No memset: the first pread fills the buffer (faulting its pages once), and
+      // the worker only ever reads view_len (== got) bytes, so the tail is never seen.
+      bufs_.push_back(static_cast<char *>(p));
+      free_.push_back((int)i);
+    }
+    return true;
+  }
+  // Blocks until a buffer is free; returns its slot index.
+  int acquire() {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&]{ return !free_.empty(); });
+    int s = free_.back(); free_.pop_back();
+    return s;
+  }
+  void release(int slot) {
+    if (slot < 0) return;
+    { std::lock_guard<std::mutex> lk(m_); free_.push_back(slot); }
+    cv_.notify_one();
+  }
+  char * buf(int slot) { return bufs_[(size_t)slot]; }
+  ~DirectReadPool() { for (char * p : bufs_) free(p); }
+private:
+  std::vector<char *> bufs_;
+  std::vector<int>    free_;
+  std::mutex          m_;
+  std::condition_variable cv_;
+  size_t              buf_size_ = 0;
+};
+
+// Set while a zero-copy --direct-read run is active (single producer sets it
+// before workers start, clears it after they join); workers only ever call
+// release() through it, which is internally locked.
+static DirectReadPool * g_direct_read_pool = nullptr;
+#endif
+
+static void gz_direct_read_release(int slot) {
+#ifndef _WIN32
+  if (g_direct_read_pool) g_direct_read_pool->release(slot);
+#else
+  (void)slot;
+#endif
+}
 
 class TaskQueue {
 public:
@@ -4240,7 +4307,9 @@ static void cpu_worker(
     // Permit already acquired above (before pop).
     // The writer releases this permit after the output is physically written.
 
-    if (m && t.view_ptr) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
+    // Count mmap views here (their reader doesn't); --direct-read views
+    // (direct_buf>=0) are already counted by the O_DIRECT reader — skip them.
+    if (m && t.view_ptr && t.direct_buf < 0) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
 
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32];
@@ -4380,7 +4449,7 @@ static void cpu_worker_rescue(
       if (drained) break;
     }
     if (!got_task) break;
-    if (m && t.view_ptr) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
+    if (m && t.view_ptr && t.direct_buf < 0) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
     const auto t0 = std::chrono::steady_clock::now();
     const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
     const auto t1 = std::chrono::steady_clock::now();
@@ -5300,73 +5369,69 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 }
 
 #ifndef _WIN32
-// Reader threads for --direct-read.  O_DIRECT bypasses kernel readahead, so a
-// single synchronous pread runs the NVMe at queue-depth 1 and badly underutilises
-// it.  Multiple reader threads work-stealing consecutive chunks keep many requests
-// in flight (deep queue) while staying near-sequential, so the drive saturates.
-static const int ODIRECT_READERS = 4;
-
-// --direct-read: parallel O_DIRECT reader.  ODIRECT_READERS threads work-steal
-// consecutive 4 KiB-aligned host_chunks from a shared counter (deterministic
-// chunk_idx) into their own aligned buffer and call emit(buf, n, chunk_idx) —
-// which builds Task[s] with a
-// seq derived from chunk_idx and enqueues (total/ordering stay correct because
-// completion is tracked by push count, not a shared seq counter).  emit returns
-// false to abort (e.g. GPU failure).  O_DIRECT transfers straight disk→buffer,
-// bypassing the page cache (no populate, no eviction) — honest-cold, no kcompactd,
-// no warm-cache skew, and it skips the cache's populate/writeback overhead on a
-// one-pass read.  O_DIRECT can't go through mmap (mmap IS the cache), so this is
-// its own reader.  The final partial chunk uses O_DIRECT's EOF short read.
-// Returns false if O_DIRECT couldn't be set up — caller falls back to fread.
-template <typename Emit>   // template so the lambda inlines and the optimizer can
-                           // see the posix_memalign buffer is non-null (-Wnonnull)
+// --direct-read: SINGLE-stream O_DIRECT reader.  Concurrent O_DIRECT reads contend
+// hard on this class of NVMe — measured on a 432 GiB file: 1 stream 4.5 GB/s, 4
+// independent streams only ~3.0 GB/s aggregate (0.77 GB/s each).  So the fast path
+// is one uninterrupted stream; the v0.13.46/47 multi-threaded readers were a
+// mistake here.  A single dd stream already saturates the drive (4.5 GB/s), so the
+// only job left is to not stall that stream — hence zero-copy:
+//
+//   • pool != nullptr (CPU path): pread straight into a pooled aligned buffer and
+//     hand it to emit(buf, n, idx, slot); the Task aliases it as a view and the
+//     worker recycles the slot on release_input().  No per-chunk 16 MiB memcpy —
+//     that copy, contending for memory bandwidth with the compressors, was what
+//     held the stream to ~1/3 of the drive (1.5 vs 4.5 GB/s).  pool->acquire()
+//     blocks when all buffers are in flight, so it is also the producer
+//     backpressure (the queue byte-cap is a no-op for zero-byte view tasks).
+//   • pool == nullptr (GPU path): reuse one scratch buffer; emit copies (it splits
+//     the host chunk into gpu subchunks anyway, so a single owning buffer per chunk
+//     doesn't fit — keep the copy there, where PCIe dominates regardless).
+//
+// O_DIRECT transfers straight disk→buffer, bypassing the page cache (no populate,
+// no eviction) — honest-cold, no kcompactd, no warm-cache skew.  It can't go
+// through mmap (mmap IS the cache), so this is its own reader.  emit(buf,n,idx,slot)
+// returns false to abort (GPU failure).  The final partial chunk rides O_DIRECT's
+// EOF short read.  Returns false if O_DIRECT couldn't be set up (caller falls back
+// to fread).  seq is the chunk index (file position): output stays ordered, RAM
+// bounded.
+template <typename Emit>   // template so the lambda inlines (and -Wnonnull sees the
+                           // pooled/aligned buffer as non-null)
 static bool odirect_read_chunks(const std::string & path, size_t host_chunk,
-                                Meter * m, Emit && emit)
+                                Meter * m, DirectReadPool * pool, Emit && emit)
 {
-  int probe_fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-  if (probe_fd < 0) return false;          // O_DIRECT unsupported → caller falls back to fread
-  struct stat st;
-  if (::fstat(probe_fd, &st) != 0 || st.st_size < 0) { ::close(probe_fd); return false; }
-  ::close(probe_fd);                       // threads open their own fds (no shared file-struct contention)
+  int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+  if (fd < 0) return false;                 // O_DIRECT unsupported → caller falls back to fread
   const size_t ALIGN = 4096;
   const size_t cap = ((host_chunk + ALIGN - 1) / ALIGN) * ALIGN;
-  const size_t file_size = (size_t)st.st_size;
-  const size_t n_chunks = file_size == 0 ? 0 : (file_size + cap - 1) / cap;
-  // Work-stealing, NOT strided.  A shared monotonic counter hands the next chunk to
-  // whichever reader is free, so the ODIRECT_READERS in-flight reads are always on
-  // *consecutive* chunk indices — a contiguous window that slides forward at queue
-  // depth N.  That gives the NVMe near-sequential access (the whole point: O_DIRECT
-  // has no kernel readahead) while keeping many requests in flight.  A strided
-  // assignment (idx += N) looks sequential only while the threads stay in lockstep;
-  // the first copy/push stall desynchronises them and the outstanding reads scatter
-  // up to N*cap apart into a random-looking pattern that collapses throughput.  seq
-  // is still the chunk index (file position), so output stays ordered and the
-  // ordered writer keeps RAM bounded regardless of completion order.
-  std::atomic<bool> failed{false};
-  std::atomic<bool> stop{false};
-  std::atomic<size_t> next_idx{0};
-  auto reader = [&]() {
-    int tfd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-    if (tfd < 0) { failed.store(true); return; }
-    void * abuf = nullptr;
-    if (posix_memalign(&abuf, ALIGN, cap) != 0 || !abuf) { ::close(tfd); failed.store(true); return; }
-    while (!stop.load(std::memory_order_relaxed)) {
-      size_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
-      if (idx >= n_chunks) break;
-      uint64_t t0 = g_perf ? now_ns() : 0;
-      ssize_t got = ::pread(tfd, abuf, cap, (off_t)(idx * cap));  // offset & count 4 KiB-aligned
-      if (got <= 0) { failed.store(true); break; }               // within bounds, got>0 unless error
-      if (g_perf) { g_perf->read_ns.fetch_add(now_ns() - t0); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
-      if (m) m->read_bytes.fetch_add((uint64_t)got);
-      if (!emit(static_cast<const char *>(abuf), (size_t)got, idx)) { stop.store(true); break; }
+  void * scratch = nullptr;                 // only used when pool == nullptr (copy path)
+  if (!pool) {
+    if (posix_memalign(&scratch, ALIGN, cap) != 0 || !scratch) { ::close(fd); return false; }
+  }
+  off_t off = 0;
+  size_t idx = 0;
+  for (;;) {
+    int slot = -1;
+    char * buf;
+    if (pool) { slot = pool->acquire(); buf = pool->buf(slot); }  // blocks = backpressure
+    else      { buf = static_cast<char *>(scratch); }
+    uint64_t t0 = g_perf ? now_ns() : 0;
+    ssize_t got = ::pread(fd, buf, cap, off);   // offset & count 4 KiB-aligned
+    if (got < 0) {
+      if (pool) pool->release(slot); else free(scratch);
+      ::close(fd);
+      die_io("O_DIRECT read failed (--direct-read)");
     }
-    free(abuf);
-    ::close(tfd);
-  };
-  std::vector<std::thread> readers;
-  for (int t = 0; t < ODIRECT_READERS; ++t) readers.emplace_back(reader);
-  for (auto & th : readers) th.join();
-  if (failed.load()) die_io("O_DIRECT read failed (--direct-read)");
+    if (got == 0) { if (pool) pool->release(slot); break; }   // EOF on an exact multiple of cap
+    if (g_perf) { g_perf->read_ns.fetch_add(now_ns() - t0); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
+    if (m) m->read_bytes.fetch_add((uint64_t)got);
+    // emit takes ownership of `slot` in the pool path (the Task carries it and the
+    // worker releases it); the reader must not touch the buffer after this.
+    bool cont = emit(static_cast<const char *>(buf), (size_t)got, idx, slot);
+    off += got; ++idx;
+    if (!cont || (size_t)got < cap) break;   // abort, or short read ⇒ EOF
+  }
+  if (!pool) free(scratch);
+  ::close(fd);
   return true;
 }
 
@@ -5499,15 +5564,34 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<size_t> seq{0};
 #ifndef _WIN32
   MmapRegion mmap_region;
+  DirectReadPool dr_pool;   // zero-copy --direct-read buffers; outlives the workers
   bool reader_done = false;
   // --direct-read: O_DIRECT input (bypass the page cache).  Takes precedence over
   // mmap (mmap IS the page cache); falls through to fread if O_DIRECT can't open.
   if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
+    // Size a zero-copy buffer pool: enough to keep every worker fed plus a read-ahead
+    // backlog, but no more than the file needs, capped so RAM stays sane (a buffer is
+    // held only from pread until the worker finishes compressing, not during write).
+    const size_t cap = ((host_chunk + 4095) / 4096) * 4096;
+    std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
+    size_t file_chunks = (!fec && fsz > 0) ? (size_t)((fsz + cap - 1) / cap) : (size_t)threads;
+    size_t pool_n = std::min<size_t>((size_t)threads + 128,
+                                     std::min<size_t>(file_chunks + 1, 1024));
+    if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
+    bool pool_ok = dr_pool.init(cap, pool_n);
+    if (pool_ok) g_direct_read_pool = &dr_pool;
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
-    reader_done = odirect_read_chunks(opt.input, host_chunk, m,
-      [&](const char * buf, size_t n, size_t idx) {
-        enqueue_direct_chunk(queue, idx, buf, n);   // seq deterministic by file position
+      vlog(V_VERBOSE, opt, std::string("[DIRECT-READ] O_DIRECT input (page cache bypassed)")
+           + (pool_ok ? ", zero-copy pool " + std::to_string(pool_n) + " buffers\n"
+                      : " (pool alloc failed; copy path)\n"));
+    reader_done = odirect_read_chunks(opt.input, host_chunk, m, pool_ok ? &dr_pool : nullptr,
+      [&](const char * buf, size_t n, size_t idx, int slot) {
+        if (slot >= 0) {                              // zero-copy: Task aliases the pooled buffer
+          Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
+          queue.push(std::move(t));
+        } else {                                      // copy fallback (pool unavailable)
+          enqueue_direct_chunk(queue, idx, buf, n);   // seq deterministic by file position
+        }
         return true;
       });
   }
@@ -5580,6 +5664,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // Do NOT call throttle.set_done() before join: workers must respect
   // throttle while draining the queue to avoid buffering entire output in RAM.
   for (auto & th : pool) th.join();
+  g_direct_read_pool = nullptr;  // workers done: no more release() calls; safe to drop the pool
   throttle.set_done();  // safe now: all workers exited
   {
     std::lock_guard<std::mutex> lk(results.m);
@@ -7401,8 +7486,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
     const size_t subs_per_host = (host_chunk + gpu_chunk - 1) / gpu_chunk;
-    reader_done = odirect_read_chunks(opt.input, host_chunk, m,
-      [&](const char * buf, size_t n_host, size_t idx) {
+    // GPU path keeps the copy: each host chunk is split into gpu_chunk subchunks, so
+    // one owning buffer per host read doesn't map to one Task (pool == nullptr).
+    reader_done = odirect_read_chunks(opt.input, host_chunk, m, nullptr,
+      [&](const char * buf, size_t n_host, size_t idx, int /*slot*/) {
         if (abort_on_failure.load(std::memory_order_acquire)
             && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
           return false;
