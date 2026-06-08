@@ -7,36 +7,41 @@
 
 ---
 
-## v0.13.50 — `--direct-read`: huge-page pool buffers (fix the ~340 KiB request split)
+## v0.13.50 — `--direct-read`: one contiguous pool region (fix the ~340 KiB request split)
 
-After v0.13.49, `--direct-read` was still only 1.6 GiB/s vs the page-cache path's
+After v0.13.49, `--direct-read` was still only 1.55 GiB/s vs the page-cache path's
 4.46. `-vvv` showed the reader spends 99% of wall *inside* `pread` (279 s of a 283 s
-run) yet moves only 1.55 GiB/s — so it's not starvation (cores were 97% idle waiting
-on it), the `pread`s themselves are slow. `iostat` found why and `dd` confirmed it:
+run) yet moves only 1.55 GiB/s — not starvation (cores were 97% idle waiting on it),
+the `pread`s themselves are slow. `iostat` found why and `dd` confirmed it:
 
 | | rareq-sz | aqu-sz | throughput |
 |---|---|---|---|
 | dd (16 MiB O_DIRECT) | **638 KiB** | 8.5 | 3.8 GB/s |
 | our reader | **340 KiB** | 15 | 1.8 GB/s |
 
-Same requests/sec; dd's DMA requests are 2× larger, which is the whole 2× gap. Our
-pool buffers (`posix_memalign`) are virtually contiguous but **physically scattered
-4 KiB pages**, so O_DIRECT's scatter-gather list hits the driver's limits
-(`max_segments=127`) and each 16 MiB read shatters into ~340 KiB pieces. dd's buffer
-has enough physical contiguity to reach 638 KiB.
+Same requests/sec; dd's DMA requests are ~2× larger — the whole gap. Our 150 pool
+buffers were separate `posix_memalign(16 MiB)` calls, and because 16 MiB is below
+v0.13.48's `M_MMAP_THRESHOLD` they came from the **fragmented heap**: physically
+scattered 4 KiB pages, so O_DIRECT's scatter-gather list hits the driver's
+`max_segments=127` and each 16 MiB read shatters into ~340 KiB requests.
 
-Fix: back the `DirectReadPool` with **transparent huge pages**. One 2 MiB-aligned
-region, `MADV_HUGEPAGE`, sliced on a 2 MiB stride, then **pre-faulted one byte per
-2 MiB** via the normal write-fault path — necessary because O_DIRECT's
-`get_user_pages` would otherwise fault the buffer in as 4 KiB pages and THP would
-never engage. Each 16 MiB buffer is then 8 contiguous 2 MiB pages = 8 DMA segments,
-so a `pread` can reach the device's full `max_sectors_kb` (1280 KiB on the server) —
-2× dd's request size, with headroom toward the ~4.5 GB/s the drive showed
-single-stream. Falls back to plain pages where THP is unavailable (no regression;
-the pre-fault is one touch per 2 MiB). Effect is hardware-specific (needs healthy
-THP + a driver that merges segments) so it shows on the server, not the low-core
-workstation whose THP is effectively disabled. Byte-identical cpu+gpu, round-trip
-clean, 290/290 extensive.
+Fix: allocate the **whole pool as one large region** (> the mmap threshold ⇒ a fresh
+dedicated `mmap`) and slice it. On an unfragmented box its pages fault in as long
+physically-contiguous runs that merge into a few big DMA segments, so a `pread`
+reaches the device's `max_sectors_kb`. Measured on the server: **rareq-sz 340 →
+~1230 KiB** (≈ the 1280 KiB max), throughput **1.55 → 1.96 GiB/s**, run 4m43 → 3m41.
+The region is 2 MiB-aligned + `MADV_HUGEPAGE` + lightly pre-faulted as
+belt-and-suspenders for THP where it's healthy, but **THP did not engage on the 5.15
+server** (`AnonHugePages=0`) — the win is the contiguous allocation, not huge pages.
+Byte-identical cpu+gpu, round-trip clean, 290/290 extensive.
+
+Remaining limiter (not a code issue): with `--direct --direct-read` on one drive,
+O_DIRECT reads (~1.9 GB/s) and the O_DIRECT output writes (~0.8 GB/s) **contend for
+the same device queue** — iostat shows ~2.7 GB/s mixed at 80% util. The page-cache
+path avoids this only because its reads are free (served from RAM), leaving the whole
+drive for writes. Reading and writing on separate drives removes the contention; on a
+single big-RAM box the buffered path remains the throughput king and `--direct-read`'s
+value stays honest-cold benchmarking + not evicting other users' cache.
 
 ## v0.13.49 — `--direct-read`: single-stream + zero-copy reader
 

@@ -2413,12 +2413,18 @@ class DirectReadPool {
 public:
   bool init(size_t buf_size, size_t n_bufs) {
     buf_size_ = buf_size;
-    // One big 2 MiB-aligned region + MADV_HUGEPAGE, sliced into buffers on a
-    // 2 MiB-aligned stride.  Huge-page backing makes each 16 MiB buffer physically
-    // (near-)contiguous, so an O_DIRECT pread issues a few large DMA segments instead
-    // of being shattered by the driver's max_segments limit into ~48 tiny ~340 KiB
-    // requests — which on knuth capped the device at 1.8 GB/s vs dd's 4.5.  No memset:
-    // the first pread faults each buffer, and workers read only view_len (== got).
+    // Allocate the WHOLE pool as one big region (not n_bufs small ones) and slice it.
+    // This is what cuts the O_DIRECT DMA segment count: many small posix_memalign
+    // buffers land on the fragmented heap (16 MiB < our M_MMAP_THRESHOLD), so each
+    // 16 MiB read is shattered by the driver's max_segments limit into ~340 KiB
+    // requests; one large region (> the threshold) is a fresh mmap whose pages fault
+    // in as long physically-contiguous runs on an unfragmented box, merging into a
+    // few big segments so a pread reaches the device's max request size (measured on
+    // the 256-core server: rareq-sz 340 KiB -> ~1230 KiB, ~max_sectors_kb).  The
+    // 2 MiB alignment + MADV_HUGEPAGE additionally request THP backing where it's
+    // healthy (belt-and-suspenders; measured AnonHugePages=0 on the 5.15 box, so the
+    // win there is the contiguous allocation, not THP).  No memset: the first pread
+    // faults each buffer, and workers read only view_len (== got).
     const size_t HP = 2 * 1024 * 1024;
     stride_ = ((buf_size + HP - 1) / HP) * HP;   // 2 MiB-aligned stride ⇒ every slice is 2 MiB-aligned
     const size_t total = stride_ * n_bufs;
