@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.51";
+static constexpr const char * GZSTD_VERSION = "0.13.52";
 //
 // Architecture overview:
 //
@@ -4729,6 +4729,15 @@ static void cpu_decomp_worker(
         }
         if (zout.pos > 0) {
           chunk->resize(zout.pos);
+          // Each streamed chunk becomes an in-flight result frame, and the
+          // writer releases one throttle permit per frame it writes.  We
+          // entered holding exactly one permit (the pre-pop acquire): charge it
+          // to the first chunk, then acquire one more per subsequent chunk so
+          // acquires match the writer's releases.  Without this the writer
+          // over-released by (actual_chunks - 1), drifting permits_ above the
+          // cap.  Deadlock-free: chunks ascend from the lowest seq, so the
+          // writer always drains the oldest first and frees a permit.
+          if (chunk_seq != t.seq && bp) bp->acquire(1);
           results->push_to_slot(-1, chunk_seq, std::move(chunk));
           ++chunk_seq;
         }
@@ -7003,9 +7012,17 @@ static void gpu_worker(
           if (!C.batch.empty()) {
             const int held = (int)C.filled;
             if (rescue) {
-              // Hybrid mode: push to CPU rescue queue
-              for (size_t i = 0; i < C.filled; ++i)
-                rescue->push(Task{ C.batch[i].seq, C.batch[i].data });
+              // Hybrid mode: push to CPU rescue queue.  MOVE the whole Task —
+              // do NOT reconstruct as Task{seq, data}: the default compress
+              // reader is the zero-copy mmap reader, whose tasks carry the data
+              // in view_ptr/view_len with an EMPTY data vector.  Rebuilding from
+              // .data alone dropped the view, so the rescue worker compressed 0
+              // bytes and emitted an empty frame — silent data loss on the exact
+              // GPU-failure path rescue exists to handle.  The mmap region
+              // outlives the rescue join, so the view stays valid; move also
+              // preserves direct_buf ownership and avoids copying owning data.
+              for (auto & t : C.batch)
+                rescue->push(std::move(t));
               C.batch.clear();
             } else {
               // GPU-only mode: push back to main queue for other GPUs

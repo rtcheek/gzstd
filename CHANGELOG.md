@@ -1,11 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.51  
+**Covers:** v0.9.50 → v0.13.52  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.52 — fix GPU-compress hybrid rescue dropping mmap/view tasks (silent data loss)
+
+Two correctness fixes in the failure/edge paths, found by code review.
+
+**1. Hybrid GPU-compress rescue lost zero-copy (mmap) frames.** When a GPU failed
+mid-batch in hybrid mode, the worker's `catch` re-routed the in-flight chunks to the
+CPU rescue queue by reconstructing each task as `Task{ seq, data }`. But the default
+compress reader for a regular file is the zero-copy **mmap** reader, whose tasks carry
+their bytes in `view_ptr`/`view_len` with an **empty `data` vector**. Rebuilding from
+`.data` alone dropped the view, so the rescue worker compressed **0 bytes** and emitted
+an empty zstd frame for that sequence number — the output decompressed cleanly but was
+**silently missing those chunks' bytes**. This corrupted output on the exact path the
+rescue mechanism exists to handle gracefully (VRAM exhaustion / driver error), whenever
+the input used the mmap reader (the default). Fix: `std::move` the whole `Task` into the
+rescue queue instead of reconstructing it — the mmap region outlives the rescue join so
+the view stays valid, and the move also preserves `direct_buf` ownership and avoids
+copying owning data. The sibling paths were already correct (GPU-only failure and the
+decompress failure path both `re_enqueue` the intact tasks); only this hybrid
+`rescue->push` reconstructed the task.
+
+**2. Throttle permit over-release in single-frame streaming decompress.** The CPU
+decompress worker's streaming branch (single giant frame, e.g. `--ultra` / `zstd`
+output) acquired exactly one `FrameThrottle` permit before the pop but pushed N result
+chunks, and the writer releases one permit per frame written — so the writer
+over-released by `(actual_chunks - 1)`, drifting `permits_` above its cap (and making
+`in_flight()` read negative). Harmless in practice (only fires on a single-frame file at
+end of work, and in-flight memory is independently bounded by the per-thread decomp
+pool), but a real acquire/release asymmetry. Fix: acquire one additional permit per
+streamed chunk beyond the first, so acquires match releases. Deadlock-free — chunks
+ascend from the lowest seq, so the writer always drains the oldest first and frees a
+permit.
 
 ## v0.13.51 — `--direct-read` for decompress (was compress-only)
 
