@@ -638,7 +638,7 @@ else: print(0)
     "$BOLD" "$CYAN" "$num" "$total" "$RESET" \
     "$BOLD" "$pct" "$RESET"
   line+="${DIM}|${RESET} "
-  printf -v line "%s%s%-14s%s %-18s " \
+  printf -v line "%s%s%-13s%s %-19s " \
     "$line" "$YELLOW" "$label" "$RESET" "$file"
   if [[ "$mode" == "compress" ]]; then
     line+="${CYAN}» comp${RESET}"
@@ -667,7 +667,7 @@ print_result() {
   fi
 
   printf "${CLEAR_LINE}"
-  printf "  ${BOLD}${GREEN}✓${RESET} %-16s %-18s %s " \
+  printf "  ${BOLD}${GREEN}✓${RESET} %-15s %-19s %s " \
     "$label" "$file" "$mdisp"
   printf "${BOLD}%8ss${RESET}  %s GiB/s" "$time" "$thr"
   if [[ "$mode" == "compress" \
