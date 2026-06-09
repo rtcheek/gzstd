@@ -19,6 +19,31 @@
 VERSION="0.13.51"
 #set -euo pipefail
 
+usage() {
+  cat <<EOF
+gzstd-gendata.sh v${VERSION} — build the gzstd benchmark corpus
+
+Usage: ./gzstd-gendata.sh [size_mib] [output_dir]
+  size_mib    Approximate size of each .bin file in MiB (default: 512)
+  output_dir  Directory for the corpus           (default: ./gzstd-testdata)
+
+Environment:
+  GZSTD_BIN   Path to the gzstd binary used to build the .bin.zst
+              (default: ./build/gzstd, then PATH)
+
+Creates 5 .bin files (high/medium/low compressibility, mixed, zeros), then
+compresses each to a matching .bin.zst with gzstd.  Both are recreated every run
+so the pair always matches.  gzstd-benchmark.sh reads them and writes /dev/null.
+
+Options:
+  -h, --help  Show this help and exit
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
 SIZE_MIB="${1:-512}"
 OUTDIR="${2:-./gzstd-testdata}"
 SIZE_BYTES=$(( SIZE_MIB * 1024 * 1024 ))
@@ -374,33 +399,48 @@ show_cursor
 #----------------------------------------------------------------------
 # Compress each .bin -> .bin.zst with gzstd (multi-frame defaults).
 # These are the decompress-benchmark inputs.  Recreated every run so the
-# .bin and .bin.zst always match.  gzstd keeps the source .bin by default and
-# names the output <file>.bin.zst, so a bare `gzstd --overwrite <file>` is all
-# we need.  Sequential: each gzstd run already uses every core.
+# .bin and .bin.zst always match.  -k keeps the source .bin (the default, but
+# explicit in case it ever changes); gzstd names the output <file>.bin.zst.
+# Sequential: each gzstd run already uses every core.  We parse gzstd's own
+# --progress ("in:NN.N%" = input consumed) for a live per-file percentage.
 #----------------------------------------------------------------------
 echo ""
 printf "${BOLD}${WHITE}Compressing → .bin.zst:${RESET}\n"
+hide_cursor
 CFAILED=0
+cerr="$PROGDIR/compress.err"
 for entry in "${FILES[@]}"; do
   IFS='|' read -r slug fname annotation fpath prog <<< "$entry"
   if [ "${EXIT_RC[$slug]:-0}" -ne 0 ]; then
     printf "  ${YELLOW}–${RESET}  %-20s ${DIM}skipped (generation failed)${RESET}\n" "$fname"
     continue
   fi
-  printf "  ${DIM}…${RESET}  %-20s ${DIM}compressing…${RESET}\r" "$fname"
-  # -k/--keep: gzstd keeps the source by default, but pass it explicitly so we still
-  # retain the .bin if that default ever changes (we need both .bin and .bin.zst).
-  if "$GZSTD_BIN" --overwrite -k "$fpath" >/dev/null 2>&1; then
+  : > "$cerr"
+  "$GZSTD_BIN" --overwrite -k --progress "$fpath" >/dev/null 2>"$cerr" &
+  cpid=$!
+  # Live percentage in bright green (matches the .bin step), from gzstd's progress.
+  while kill -0 "$cpid" 2>/dev/null; do
+    sleep 0.2
+    cpct=$(tail -c 200 "$cerr" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+           | grep -oP '(?<=in:)[0-9]+\.[0-9]+(?=%)' | tail -1)
+    if [ -n "$cpct" ]; then
+      cursor_col0; erase_line
+      printf "  ${DIM}…${RESET}  %-20s ${GREEN}${BOLD}%5s%%${RESET}  ${DIM}compressing…${RESET}" \
+        "$fname" "$cpct"
+    fi
+  done
+  wait "$cpid"; crc=$?
+  cursor_col0; erase_line
+  if [ "$crc" -eq 0 ]; then
     zsz=$(stat -c%s "${fpath}.zst" 2>/dev/null || echo 0)
-    cursor_col0; erase_line
-    printf "  ${GREEN}✔${RESET}  %-20s ${DIM}→ %s.bin.zst  %s${RESET}\n" \
+    printf "  ${GREEN}✔${RESET}  %-20s ${GREEN}${BOLD}100%%${RESET}  ${DIM}→ %s.bin.zst  %s${RESET}\n" \
       "$fname" "$slug" "$(numfmt --to=iec-i --suffix=B "$zsz" 2>/dev/null || echo "${zsz}B")"
   else
-    cursor_col0; erase_line
     printf "  ${RED}✘${RESET}  %-20s ${RED}compress failed${RESET}\n" "$fname"
     CFAILED=$(( CFAILED + 1 ))
   fi
 done
+show_cursor
 
 #----------------------------------------------------------------------
 # Final summary
