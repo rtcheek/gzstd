@@ -1,11 +1,29 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.52  
+**Covers:** v0.9.50 → v0.13.53  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.53 — reconcile --help / -h with actual operation (docs only)
+
+Help text had drifted from the code after a lot of churn. Audited every flag in
+both screens against the parser and the runtime defaults; the flag names all
+matched, but three stated defaults/details were stale. Docs follow code (no
+behaviour change):
+
+- **`--gpu-batch` default.** Both screens said `default: 16`. Actual: 8 for
+  compress (`DEFAULT_GPU_BATCH_CAP`), 16 for decompress auto-scaled up by input
+  size (64 above 10 GiB, 256 above 75 GiB). Updated both screens to state the
+  mode-dependent default.
+- **`--gpu-devices` auto.** Long help and the `Options::gpu_devices` comment said
+  auto = "all GPUs for compress, 1 for decompress". Both decompress paths
+  (synchronous and deferred) actually use all available GPUs, same as compress.
+  Corrected the wording and the struct comment.
+- **`--cold`.** Documented in the short help but only mentioned in passing in the
+  long help; gave it its own entry in the long-help I/O section.
 
 ## v0.13.52 — fix GPU-compress hybrid rescue dropping mmap/view tasks (silent data loss)
 

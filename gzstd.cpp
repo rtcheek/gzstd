@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.52";
+static constexpr const char * GZSTD_VERSION = "0.13.53";
 //
 // Architecture overview:
 //
@@ -263,7 +263,7 @@ struct Options {
   bool gpu_batch_user_set = false;
   double gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   size_t gpu_streams = 0;            // 0=auto (1 for compress, 2 for test/verify)
-  int gpu_devices = 0;            // 0=auto (all for compress, 1 for decompress)
+  int gpu_devices = 0;            // 0=auto (all GPUs, compress and decompress)
   PinMode pin_mode = PinMode::OFF;  // empirical: pinned cudaMemcpy is slower
                                     // on our typical workloads (see CHANGELOG
                                     // v0.12.45).  Opt-in with --pinned=on.
@@ -607,7 +607,8 @@ static void print_help()
 "  --no-throttle       alias for --throttle-frames=0 (benchmarking)\n";
 #ifdef HAVE_NVCOMP
   std::cout <<
-"  --gpu-batch N       GPU subchunks per CUDA stream (default: 16)\n"
+"  --gpu-batch N       GPU subchunks per stream (default: 8 compress,\n"
+"                      16 decompress; decompress auto-scales by size)\n"
 "  --gpu-streams N     CUDA streams per device (default: 1)\n"
 "  --gpu-devices N     number of GPUs (0 = auto)\n"
 "  --gpu-mem-frac X    fraction of free VRAM per device (default: 0.60)\n";
@@ -751,6 +752,12 @@ static void print_help_long()
 "     fread path (O_DIRECT cannot go through mmap) and takes precedence\n"
 "     over it.  Independent of --direct, which is O_DIRECT for OUTPUT.\n"
 "\n"
+"  --cold    (default: off)\n"
+"     Drop the input from the page cache (posix_fadvise DONTNEED) before\n"
+"     reading it, forcing a cold-cache read.  BENCHMARKING ONLY: unlike\n"
+"     --direct-read (which bypasses the cache entirely), --cold evicts\n"
+"     any already-cached pages, so it disturbs other users of that data.\n"
+"\n"
 "  --preallocate / --no-preallocate    (default: on)\n"
 "     Preallocate the output file with `fallocate` to its expected\n"
 "     final size before writes begin.  Avoids per-write extent\n"
@@ -869,10 +876,11 @@ static void print_help_long()
 " GPU TUNING\n"
 "============================================================\n"
 "  --gpu-batch N\n"
-"     Max GPU subchunks per CUDA stream (default: 16).  Each stream\n"
-"     targets batches of up to N subchunks; the per-stream binary\n"
-"     search may clamp lower if VRAM is tight (reported at -v as\n"
-"     `VRAM-fit: batch=X (requested N, ...)`).\n"
+"     Max GPU subchunks per CUDA stream.  Default: 8 for compress; for\n"
+"     decompress 16, auto-scaled up by input size (64 above 10 GiB, 256\n"
+"     above 75 GiB).  Each stream targets batches of up to N subchunks;\n"
+"     the per-stream binary search may clamp lower if VRAM is tight\n"
+"     (reported at -v as `VRAM-fit: batch=X (requested N, ...)`).\n"
 "\n"
 "  --gpu-streams N\n"
 "     CUDA streams per device (default: 1; 2 for -t verify).\n"
@@ -880,8 +888,8 @@ static void print_help_long()
 "     more VRAM.\n"
 "\n"
 "  --gpu-devices N\n"
-"     Number of GPUs to use.  0 = auto (all GPUs for compress,\n"
-"     1 for decompress).\n"
+"     Number of GPUs to use.  0 = auto (all available GPUs, for both\n"
+"     compress and decompress).\n"
 "\n"
 "  --gpu-mem-frac X\n"
 "     Fraction of free VRAM per device to allocate (0.1..0.95,\n"
