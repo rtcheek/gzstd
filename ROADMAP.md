@@ -180,7 +180,7 @@ When input size is unknown (pipe), the frame count is unknown. The auto-tuner mu
 ## Phase 4: Parallel I/O (Research)
 
 ### 4.1 Multi-Reader for NVMe
-**Priority: Low | Complexity: High | Status: Research needed**
+**Priority: Low | Complexity: High | Status: DONE (v0.13.44–v0.13.51) — multi-reader is NEGATIVE on real NVMe; the win is a single O_DIRECT stream + zero-copy, shipped as `--direct-read`. See RESULT below.**
 
 **The idea:** Open the input file N times, each reader seeks to offset `i * filesize / N`, reads its chunk in parallel. NVMe drives have deep internal queues and can serve multiple read streams simultaneously.
 
@@ -199,7 +199,19 @@ When input size is unknown (pipe), the frame count is unknown. The auto-tuner mu
 
 **Decompression-specific challenge:** The compressed file has variable-length frames. You can't just split at byte offsets  you need to find frame headers. A pre-scan of the frame index (skippable frames or magic number search) could identify split points, but adds latency.
 
-**Verdict:** Likely small gain for compression (reader is rarely the bottleneck  3+ GiB/s single-thread is usually enough). For decompression, the complexity of frame boundary detection likely outweighs the benefit. Worth benchmarking with a simple 2-reader prototype before committing.
+**Verdict (pre-research hypothesis):** Likely small gain for compression (reader is rarely the bottleneck  3+ GiB/s single-thread is usually enough). For decompression, the complexity of frame boundary detection likely outweighs the benefit. Worth benchmarking with a simple 2-reader prototype before committing.
+
+**RESULT (v0.13.44–v0.13.51): researched and resolved — multi-reader is the WRONG approach on real NVMe; the win is a *single* O_DIRECT stream that does nothing but read.** Built as the `--direct-read` flag (O_DIRECT input — bypasses the page cache, so it's honest-cold every run with no eviction). Findings on the 256-core Gen4 box against a real 432 GiB file:
+
+- **Concurrent readers CONTEND, they do not scale.** `dd` O_DIRECT: 1 stream = 4.5 GB/s; **4 independent streams = ~3.0 GB/s *aggregate*** (0.77 each) — slower combined than one. The "N parallel preads saturate the deep queue" premise is false here, so the v0.13.46/47 multi-threaded readers were reverted to a single stream (v0.13.49).
+- **A single stream already saturates the drive (4.5 GB/s); the only job is to not stall it.** Levers that mattered, in order:
+  1. **Zero-copy** (v0.13.49) — `pread` straight into a pooled aligned buffer handed to the worker as a `Task` view, eliminating the per-chunk 16 MiB `memcpy` that competed with the compressors for memory bandwidth.
+  2. **mallopt mmap threshold** (v0.13.48) — frame buffers above glibc's 32 MiB ceiling were `munmap`'d per free, firing a TLB-shootdown IPI to every core (dominated sys time on 256 cores).
+  3. **One large contiguous pool region** (v0.13.50) — many small `posix_memalign`s came from the fragmented heap, so O_DIRECT hit `max_segments=127` and shattered each 16 MiB read into ~340 KiB device requests; one big `mmap` faults as contiguous runs → ~1230 KiB requests (the device max). Net: stall → **4.08 GiB/s read-isolated**.
+- **Read/write contention is physical, not a code bug.** Reads + writes on one drive share the NAND/controller (~1.9 R + 0.8 W = 2.7 GB/s mixed); the page cache only hides this for reads (RAM-resident), never for a sustained write. Go fast by reading and writing on **separate drives** (3.8 GiB/s) — confirms Phase 4.2's NVMe-write-ceiling verdict.
+- **The decompression frame-boundary concern above was a non-issue:** O_DIRECT reads aligned blocks into a bounce buffer and the existing frame parser consumes from it unchanged (`stream_frames_to_queue`, v0.13.51) — works for both decompress paths.
+
+**Net:** multi-reader shelved (negative result); the single-stream O_DIRECT zero-copy reader shipped as `--direct-read` for honest-cold benchmarking and one-pass reads that don't pollute the cache. On a big-RAM box the buffered/page-cache path is still the throughput king (reads served from RAM). The benchmark methodology was rebuilt around this: `gzstd-benchmark.sh` now reads cold via `--direct-read` and writes `/dev/null`; `gzstd-gendata.sh` builds a matching `.bin.zst` per profile. See CHANGELOG v0.13.44–v0.13.51.
 
 ### 4.2 Multi-Writer with pwrite()
 **Priority: Low | Complexity: Medium | Status: Tested, NEGATIVE for buffered I/O**
@@ -270,6 +282,13 @@ journal commits); medians favor it on Gen4.
 compress and decompress by default — pass `--no-direct` for the buffered
 comparison. Tracks the read/writeback asymmetry recorded in the CHANGELOG and
 memory.
+
+**Input-side counterpart — `--direct-read` (O_DIRECT *input*, opt-in):** the read
+analog of `--direct`, added v0.13.44–v0.13.51 (see Phase 4.1). Bypasses the page
+cache on input → honest-cold every run + one-pass reads that don't pollute/evict the
+cache. NOT auto-enabled (the buffered/page-cache read path wins on big-RAM boxes
+where the input is resident); it's opt-in for cold benchmarking and the
+`gzstd-benchmark.sh` methodology. Works for compress and decompress.
 
 **Gen4+ regressions fixed (v0.13.31):** the default `--direct` exposed two issues
 that only manifest where it auto-engages. (1) DirectWriter preallocate
