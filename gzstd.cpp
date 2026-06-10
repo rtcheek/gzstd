@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.54";
+static constexpr const char * GZSTD_VERSION = "0.13.55";
 //
 // Architecture overview:
 //
@@ -86,8 +86,104 @@ static constexpr const char * GZSTD_VERSION = "0.13.54";
  #include <cuda_runtime.h>
  #include <nvcomp/zstd.h>
  #ifdef HAVE_NVML
- #include <nvml.h>
- #endif
+ #include <dlfcn.h>
+
+/*======================================================================
+ NVML runtime loader (v0.13.55)
+ -----------------------------------------------------------------------
+ NVML ships with the NVIDIA *driver* — there is no static archive, and
+ linking the CUDA toolkit's stub still writes DT_NEEDED libnvidia-ml.so.1
+ into the binary.  The ELF loader resolves DT_NEEDED at startup, before
+ main(), so the "portable" release binary refused to start on any machine
+ without the driver ("error while loading shared libraries") — exactly
+ the machines a portable build must support.
+
+ Load it with dlopen at first use instead: no link-time dependency at
+ all.  With the driver present, behaviour is identical to linking.
+ Without it, every wrapper returns GZ_NVML_UNAVAILABLE and the callers'
+ existing fallbacks take over (free-VRAM device ranking, /sys PCIe-gen
+ probe, util_scale staying at 1.0).
+
+ The types below mirror nvml.h's stable v1 ABI for exactly the calls
+ this file makes; the wrappers reuse the official function names so call
+ sites compile unchanged.  If you add a new NVML call, extend GzNvmlApi
+ and add a wrapper here.
+======================================================================*/
+typedef int nvmlReturn_t;
+static constexpr nvmlReturn_t NVML_SUCCESS = 0;
+static constexpr nvmlReturn_t GZ_NVML_UNAVAILABLE = 999;  // driver/library absent
+typedef struct nvmlDevice_st * nvmlDevice_t;
+typedef struct { unsigned int gpu; unsigned int memory; } nvmlUtilization_t;
+typedef struct { unsigned long long total, free, used; } nvmlMemory_t;
+
+struct GzNvmlApi {
+  nvmlReturn_t (*Init)(void) = nullptr;
+  nvmlReturn_t (*Shutdown)(void) = nullptr;
+  nvmlReturn_t (*DeviceGetCount)(unsigned int *) = nullptr;
+  nvmlReturn_t (*DeviceGetHandleByIndex)(unsigned int, nvmlDevice_t *) = nullptr;
+  nvmlReturn_t (*DeviceGetHandleByPciBusId)(const char *, nvmlDevice_t *) = nullptr;
+  nvmlReturn_t (*DeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t *) = nullptr;
+  nvmlReturn_t (*DeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t *) = nullptr;
+  nvmlReturn_t (*DeviceGetCpuAffinity)(nvmlDevice_t, unsigned int, unsigned long *) = nullptr;
+  nvmlReturn_t (*DeviceGetMaxPcieLinkGeneration)(nvmlDevice_t, unsigned int *) = nullptr;
+};
+
+// Resolve once, thread-safely (magic static).  RTLD_LOCAL keeps the driver's
+// symbols out of our global namespace.
+static const GzNvmlApi & gz_nvml()
+{
+  static const GzNvmlApi api = []{
+    GzNvmlApi a{};
+    void * h = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!h) h = dlopen("libnvidia-ml.so", RTLD_LAZY | RTLD_LOCAL);
+    if (!h) return a;  // no driver: all pointers stay null
+    auto sym = [&](const char * v2, const char * v1) -> void * {
+      void * p = dlsym(h, v2);
+      return p ? p : (v1 ? dlsym(h, v1) : nullptr);
+    };
+    a.Init        = (nvmlReturn_t(*)(void))sym("nvmlInit_v2", "nvmlInit");
+    a.Shutdown    = (nvmlReturn_t(*)(void))sym("nvmlShutdown", nullptr);
+    a.DeviceGetCount = (nvmlReturn_t(*)(unsigned int *))
+        sym("nvmlDeviceGetCount_v2", "nvmlDeviceGetCount");
+    a.DeviceGetHandleByIndex = (nvmlReturn_t(*)(unsigned int, nvmlDevice_t *))
+        sym("nvmlDeviceGetHandleByIndex_v2", "nvmlDeviceGetHandleByIndex");
+    a.DeviceGetHandleByPciBusId = (nvmlReturn_t(*)(const char *, nvmlDevice_t *))
+        sym("nvmlDeviceGetHandleByPciBusId_v2", "nvmlDeviceGetHandleByPciBusId");
+    a.DeviceGetUtilizationRates = (nvmlReturn_t(*)(nvmlDevice_t, nvmlUtilization_t *))
+        sym("nvmlDeviceGetUtilizationRates", nullptr);
+    a.DeviceGetMemoryInfo = (nvmlReturn_t(*)(nvmlDevice_t, nvmlMemory_t *))
+        sym("nvmlDeviceGetMemoryInfo", nullptr);
+    a.DeviceGetCpuAffinity = (nvmlReturn_t(*)(nvmlDevice_t, unsigned int, unsigned long *))
+        sym("nvmlDeviceGetCpuAffinity", nullptr);
+    a.DeviceGetMaxPcieLinkGeneration = (nvmlReturn_t(*)(nvmlDevice_t, unsigned int *))
+        sym("nvmlDeviceGetMaxPcieLinkGeneration", nullptr);
+    return a;
+  }();
+  return api;
+}
+
+// Same-name wrappers — every call site in this file compiles unchanged.
+static inline nvmlReturn_t nvmlInit_v2(void)
+{ auto & a = gz_nvml(); return a.Init ? a.Init() : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlShutdown(void)
+{ auto & a = gz_nvml(); return a.Shutdown ? a.Shutdown() : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetCount_v2(unsigned int * n)
+{ auto & a = gz_nvml(); return a.DeviceGetCount ? a.DeviceGetCount(n) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetHandleByIndex(unsigned int i, nvmlDevice_t * d)
+{ auto & a = gz_nvml(); return a.DeviceGetHandleByIndex ? a.DeviceGetHandleByIndex(i, d) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int i, nvmlDevice_t * d)
+{ return nvmlDeviceGetHandleByIndex(i, d); }
+static inline nvmlReturn_t nvmlDeviceGetHandleByPciBusId_v2(const char * id, nvmlDevice_t * d)
+{ auto & a = gz_nvml(); return a.DeviceGetHandleByPciBusId ? a.DeviceGetHandleByPciBusId(id, d) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t d, nvmlUtilization_t * u)
+{ auto & a = gz_nvml(); return a.DeviceGetUtilizationRates ? a.DeviceGetUtilizationRates(d, u) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t d, nvmlMemory_t * mem)
+{ auto & a = gz_nvml(); return a.DeviceGetMemoryInfo ? a.DeviceGetMemoryInfo(d, mem) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetCpuAffinity(nvmlDevice_t d, unsigned int sz, unsigned long * set)
+{ auto & a = gz_nvml(); return a.DeviceGetCpuAffinity ? a.DeviceGetCpuAffinity(d, sz, set) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetMaxPcieLinkGeneration(nvmlDevice_t d, unsigned int * gen)
+{ auto & a = gz_nvml(); return a.DeviceGetMaxPcieLinkGeneration ? a.DeviceGetMaxPcieLinkGeneration(d, gen) : GZ_NVML_UNAVAILABLE; }
+ #endif // HAVE_NVML
 #endif
 
 namespace fs = std::filesystem;

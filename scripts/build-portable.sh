@@ -144,11 +144,11 @@ echo
 echo "=== Result ==="
 ls -lh "$BIN"
 echo
-echo "=== Runtime dependencies (should not include libnvcomp/libstdc++/libzstd) ==="
+echo "=== Runtime dependencies (should not include libnvcomp/libstdc++/libzstd/libnvidia-ml) ==="
 ldd "$BIN" || true
 echo
 echo "=== Version ==="
 "$BIN" --version || echo "(could not run binary on this host — try on the target)"
 echo
 echo "Output: $BIN"
-echo "Copy to any Linux x86_64 with glibc >= 2.31 and an NVIDIA driver."
+echo "Copy to any Linux x86_64 with glibc >= 2.31 (NVIDIA driver optional: GPU paths engage when present)."

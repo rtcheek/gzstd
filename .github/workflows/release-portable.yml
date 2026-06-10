@@ -38,21 +38,21 @@ jobs:
           # steps can read/move them.
           sudo chown -R "$(id -u):$(id -g)" build-portable/
 
-      - name: Smoke test (CPU path only — no GPU on hosted runners)
+      - name: Smoke test (CPU path only — no GPU, no driver on hosted runners)
         run: |
-          # The binary has libnvidia-ml.so.1 as a hard dynamic dependency
-          # (statically-linking NVML isn't possible — it's part of the
-          # NVIDIA driver, not redistributable as a static archive).
-          # Real targets get it from the installed driver; GitHub-hosted
-          # runners don't have a driver, so we extract the no-op stub
-          # that ships with the CUDA toolkit just for the smoke test.
-          # The stub satisfies the loader; CPU-only paths never call NVML.
-          mkdir -p stubs
-          docker run --rm -v "$(pwd)/stubs":/out \
-            nvidia/cuda:12.6.0-devel-ubuntu20.04 \
-            cp /usr/local/cuda/lib64/stubs/libnvidia-ml.so /out/libnvidia-ml.so.1
+          # Hosted runners have NO NVIDIA driver — exactly the environment a
+          # portable binary must support.  Since v0.13.55 NVML is dlopen'd at
+          # runtime, so the binary must carry no DT_NEEDED on libnvidia-ml;
+          # assert that here so a stub-linking regression fails the release.
+          if ldd build-portable/gzstd | grep -q "libnvidia-ml"; then
+            echo "ERROR: binary has a hard NVML dependency (DT_NEEDED" \
+                 "libnvidia-ml) — it will not start on driver-less machines"
+            ldd build-portable/gzstd
+            exit 1
+          fi
 
-          export LD_LIBRARY_PATH="$(pwd)/stubs"
+          # Runs directly, no LD_LIBRARY_PATH tricks: this is the real
+          # driver-less user experience.
           ./build-portable/gzstd --version
 
           # CPU round-trip — exercises the dispatch and proves the binary
@@ -62,7 +62,7 @@ jobs:
           ./build-portable/gzstd --cpu-only -k -f test.txt
           ./build-portable/gzstd --cpu-only -d -k -f test.txt.zst -o test.recovered
           diff test.txt test.recovered
-          rm -rf test.txt test.txt.zst test.recovered stubs
+          rm -rf test.txt test.txt.zst test.recovered
 
       - name: Determine version + tag
         id: meta

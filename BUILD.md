@@ -9,7 +9,7 @@
 **For GPU support (optional):**
 - CUDA Toolkit 11+
 - nvCOMP: `conda install -c conda-forge nvcomp`
-- NVIDIA driver with NVML
+- NVIDIA driver (optional at runtime — NVML is dlopen'd; without a driver gzstd runs CPU-only)
 
 ## Quick Start (from scratch)
 
@@ -44,13 +44,13 @@ cmake -B build -DBUILD_STATIC=ON
 cmake --build build -j$(nproc)
 ```
 
-Links zstd, libstdc++, libgcc, and CUDA runtime statically. The resulting binary only needs glibc and the NVIDIA driver at runtime.
+Links zstd, libstdc++, libgcc, and CUDA runtime statically. The resulting binary only needs glibc at runtime; the NVIDIA driver is optional (CUDA and NVML are discovered at runtime, with CPU-only fallback when absent).
 
 **Note:** the conda-forge `libnvcomp` package ships shared libraries only — no `libnvcomp_static.a`. With BUILD_STATIC=ON against a conda env, CMake will fall back to `libnvcomp.so.5` and the binary will still depend on it at runtime. To get a fully self-contained binary, fetch NVIDIA's official tarball (next section) which includes `libnvcomp_static.a`.
 
 ### Maximally Portable Build (single self-contained binary)
 
-For distribution, you want one binary that runs on essentially any Linux x86_64 machine from 2020+ with an NVIDIA driver — no nvCOMP install, no CUDA toolkit, no libstdc++ ABI mismatch. The wrapper script `scripts/build-portable.sh` does this in one command:
+For distribution, you want one binary that runs on essentially any Linux x86_64 machine from 2020+, with or without an NVIDIA driver — no nvCOMP install, no CUDA toolkit, no libstdc++ ABI mismatch. The wrapper script `scripts/build-portable.sh` does this in one command:
 
 ```bash
 scripts/build-portable.sh
@@ -66,7 +66,7 @@ Output: `build-portable/gzstd`, ~60–80 MB.
 
 **Runtime requirements on target:**
 - glibc ≥ 2.31 (Ubuntu 20.04 / Debian 11 / RHEL 8 / Fedora 33+)
-- NVIDIA driver providing `libnvidia-ml.so.1` (NVML cannot be statically linked — it's part of the driver)
+- NVIDIA driver — optional. Since v0.13.55 NVML is loaded via dlopen at runtime, so the binary starts (and runs CPU-only) on machines without any NVIDIA driver. With a driver present, GPU paths work as usual.
 - That's it. No CUDA, no nvCOMP, no Python, no nothing.
 
 **Customizing:**

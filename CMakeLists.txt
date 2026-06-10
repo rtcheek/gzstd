@@ -167,28 +167,19 @@ endif()
 
 # =====================================================
 #          NVML (GPU utilization monitoring)
-# When BUILD_STATIC is ON, use the NVML stubs library
-# (links at build time, resolves against driver at runtime).
-# NVML cannot be fully statically linked  it's part of
-# the NVIDIA driver.  The stubs library is always used.
+# NVML is part of the NVIDIA driver and CANNOT be statically linked.
+# Linking even the toolkit's stub writes DT_NEEDED libnvidia-ml.so.1
+# into the binary, and the ELF loader requires that library AT STARTUP
+# — the portable binary refused to start on driver-less machines.
+# Since v0.13.55 gzstd dlopen()s NVML at runtime (loader shim in
+# gzstd.cpp): no link-time dependency, graceful fallback to free-VRAM
+# ranking / sysfs PCIe probing when the driver is absent.  All it
+# needs at build time is <dlfcn.h>.
 # =====================================================
 set(HAVE_NVML FALSE)
-if(HAVE_NVCOMP AND CUDAToolkit_FOUND)
-  find_library(NVML_LIBRARY
-    NAMES nvidia-ml
-    HINTS ${CUDAToolkit_LIBRARY_DIR}
-          "/usr/lib/x86_64-linux-gnu"
-          "/usr/lib64"
-          "/usr/local/cuda/lib64/stubs"
-          "/usr/lib/x86_64-linux-gnu/nvidia/current"
-    PATH_SUFFIXES stubs)
-
-  if(NVML_LIBRARY)
-    set(HAVE_NVML TRUE)
-    message(STATUS "NVML found: ${NVML_LIBRARY}")
-  else()
-    message(STATUS "NVML (nvidia-ml) not found; GPU selection will use free-VRAM fallback")
-  endif()
+if(HAVE_NVCOMP AND CUDAToolkit_FOUND AND UNIX)
+  set(HAVE_NVML TRUE)
+  message(STATUS "NVML: runtime dlopen loader enabled (no link-time dependency)")
 endif()
 
 # =====================================================
@@ -224,13 +215,13 @@ if(HAVE_NVCOMP)
     ${_CUDA_RT}
     ${NVCOMP_LIBRARY})
 
-  # Static CUDA runtime needs dl and rt on Linux
-  if(BUILD_STATIC AND UNIX)
-    target_link_libraries(gzstd PRIVATE dl rt)
+  # dl: the NVML runtime loader (dlopen) and static cudart both need it
+  if(UNIX)
+    target_link_libraries(gzstd PRIVATE dl)
   endif()
-
-  if(HAVE_NVML)
-    target_link_libraries(gzstd PRIVATE ${NVML_LIBRARY})
+  # Static CUDA runtime additionally needs rt on Linux
+  if(BUILD_STATIC AND UNIX)
+    target_link_libraries(gzstd PRIVATE rt)
   endif()
 else()
   target_link_libraries(gzstd PRIVATE
@@ -239,7 +230,8 @@ else()
 endif()
 
 # Static linking: prefer static libstdc++ and libgcc for maximum portability.
-# The resulting binary only needs glibc (2.17+) and the NVIDIA driver at runtime.
+# The resulting binary only needs glibc (2.17+) at runtime; the NVIDIA driver
+# is optional (CUDA and NVML are discovered at runtime, with CPU fallback).
 if(BUILD_STATIC AND NOT MSVC)
   target_link_options(gzstd PRIVATE
     -static-libgcc
@@ -250,8 +242,8 @@ endif()
 #                     RPATH
 # Make ./build/gzstd run cleanly with Conda/system libs.
 # When BUILD_STATIC is ON, RPATH is less important since
-# most dependencies are linked statically.  We still set
-# it for NVML (always shared  part of the driver).
+# most dependencies are linked statically (NVML is dlopen'd
+# at runtime, so it needs no RPATH at all).
 # =====================================================
 if(UNIX AND NOT APPLE)
   # Base RPATH entries near the binary
@@ -290,9 +282,9 @@ if(HAVE_NVCOMP)
     message(STATUS " CUDA runtime    : shared (cudart)")
   endif()
   if(HAVE_NVML)
-    message(STATUS " NVML            : ${NVML_LIBRARY} (always shared  driver component)")
+    message(STATUS " NVML            : runtime dlopen (driver optional; no DT_NEEDED)")
   else()
-    message(STATUS " NVML            : not found (free-VRAM fallback)")
+    message(STATUS " NVML            : disabled (free-VRAM fallback)")
   endif()
 else()
   message(STATUS " GPU backend     : DISABLED")
@@ -302,9 +294,9 @@ message(STATUS " C++ Standard    : ${CMAKE_CXX_STANDARD}")
 if(BUILD_STATIC)
   message(STATUS " Linking         : static (portable binary)")
   if(NVCOMP_IS_SHARED)
-    message(STATUS " Runtime deps    : glibc, NVIDIA driver, libnvcomp.so")
+    message(STATUS " Runtime deps    : glibc, libnvcomp.so (NVIDIA driver optional)")
   else()
-    message(STATUS " Runtime deps    : glibc, NVIDIA driver (libnvidia-ml.so)")
+    message(STATUS " Runtime deps    : glibc only (NVIDIA driver optional)")
   endif()
 else()
   message(STATUS " Linking         : shared (default)")
@@ -317,7 +309,8 @@ message(STATUS "================================\n")
 # =====================================================
 #                    Install
 # Installs the gzstd binary and bundles any shared libs
-# that couldn't be linked statically (nvCOMP, NVML).
+# that couldn't be linked statically (nvCOMP).  NVML is
+# dlopen'd from the driver at runtime — never bundled.
 # Usage: cmake --install build --prefix ./dist
 # =====================================================
 install(TARGETS gzstd RUNTIME DESTINATION bin)

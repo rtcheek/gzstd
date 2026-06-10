@@ -1,11 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.54  
+**Covers:** v0.9.50 → v0.13.55  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.55 — portable binary failed to start on machines without an NVIDIA driver
+
+The released portable binary aborted at load time on any machine without the
+NVIDIA driver:
+
+    gzstd: error while loading shared libraries: libnvidia-ml.so.1:
+    cannot open shared object file: No such file or directory
+
+Root cause: NVML ships with the *driver* (no static archive exists), and the
+build linked the CUDA toolkit's stub — which still writes a DT_NEEDED entry
+for `libnvidia-ml.so.1` into the binary.  The ELF loader resolves DT_NEEDED at
+startup, before `main()`, so the binary could not start at all on driver-less
+machines — even though the CPU-only paths never call NVML.  The release
+workflow had been masking this in its own smoke test by putting the stub on
+`LD_LIBRARY_PATH`.
+
+Fix: NVML is now loaded at **runtime** via `dlopen` (loader shim at the top of
+gzstd.cpp; same function names, so call sites are unchanged).  No link-time
+dependency remains.  With the driver present, behaviour is identical
+(verified: NVML device ranking and PCIe-gen detection still work).  Without
+it, the wrappers report failure and the existing fallbacks take over —
+free-VRAM device ranking, sysfs PCIe probe — and CUDA detection already
+handled the missing driver gracefully through cudart.  Verified by blocking
+the driver libraries from dlopen: `--version` and full CPU round-trips work.
+
+Build changes: CMake no longer searches for/links `nvidia-ml` (HAVE_NVML is
+on whenever the GPU backend builds on UNIX; `dl` is linked explicitly).  The
+release workflow's smoke test now runs with **no** stub on a driver-less
+runner — the real user environment — and additionally fails the release if
+`ldd` ever shows a hard `libnvidia-ml` dependency again.  BUILD.md updated:
+the NVIDIA driver is now optional at runtime.
 
 ## v0.13.54 — full-file code review: 3 reproduced critical bugs + GPU-failure CPU fallback
 
