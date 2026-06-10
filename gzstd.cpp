@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.53";
+static constexpr const char * GZSTD_VERSION = "0.13.54";
 //
 // Architecture overview:
 //
@@ -201,8 +201,7 @@ struct Options {
   bool fast_flag = false;
   bool best_flag = false;
   bool ultra = false;
-  bool keep = true;
-  bool remove_input = false; // --rm: delete input after success
+  bool keep = true;          // --rm clears this: delete input after success
   bool force = false;
   bool unsafe_overwrite = false; // --overwrite: truncate target in place (no atomic tmp+rename)
   bool to_stdout = false;
@@ -300,7 +299,9 @@ static constexpr int EXIT_ERROR    = 1;  // general runtime error (catch-all)
 static constexpr int EXIT_USAGE    = 2;  // bad command-line usage
 static constexpr int EXIT_IO       = 3;  // I/O error (disk full, read failure, permissions)
 static constexpr int EXIT_DATA     = 4;  // data/compression error (corrupt input, integrity failure)
-static constexpr int EXIT_GPU_FAIL = 5;  // all GPUs failed (VRAM exhaustion, driver error)
+static constexpr int EXIT_GPU_FAIL = 5;  // reserved: all GPUs failed.  Since v0.13.54
+                                         // unused — gpu_only_cpu_fallback finishes the
+                                         // job on CPU (warning + exit 0) instead.
 
 // Global verbosity for die() which doesn't take Options
 static int g_verbosity = V_DEFAULT;
@@ -976,7 +977,8 @@ static void print_help_long()
 "  2  Bad command-line usage\n"
 "  3  I/O error (disk full, read failure, permissions)\n"
 "  4  Data error (corrupt input, integrity check failure)\n"
-"  5  All GPUs failed (VRAM exhaustion, driver error)\n"
+"  5  Reserved: all GPUs failed (since v0.13.54 the run instead falls back\n"
+"     to CPU with a warning and exits 0 — data is never left incomplete)\n"
 "\n"
 "============================================================\n"
 " EXAMPLES\n"
@@ -1498,6 +1500,7 @@ static size_t robust_fwrite(const void * ptr, size_t size, FILE * f)
   const char * p = static_cast<const char *>(ptr);
   size_t remaining = size;
   while (remaining > 0) {
+    errno = 0;  // don't let a stale EINTR from an earlier syscall loop us forever
     size_t w = std::fwrite(p, 1, remaining, f);
     if (w > 0) {
       p += w;
@@ -1803,6 +1806,8 @@ private:
       } else if (w < 0) {
         if (errno == EINTR) continue;
         return false;
+      } else {
+        return false;  // write() == 0 with len > 0: no progress possible
       }
     }
     return true;
@@ -1819,6 +1824,8 @@ private:
       } else if (w < 0) {
         if (errno == EINTR) continue;
         return false;
+      } else {
+        return false;  // pwrite() == 0 with len > 0: no progress possible
       }
     }
     return true;
@@ -3287,7 +3294,21 @@ private:
       // the file must end with a physical write or it will be truncated.
       bool at_end = is_last_buffer && (pos + block >= len);
 
-      if (sparse_ && !at_end && block == SPARSE_BLOCK && is_all_zero(data + pos, block)) {
+      // O_DIRECT writes require ALIGN-aligned file offsets.  A sparse seek is
+      // only safe through the DirectWriter when the current logical position
+      // is aligned (zero runs are ALIGN multiples, so alignment is preserved
+      // across the skip).  Frames are usually 4 KiB multiples so this is
+      // almost always true; odd-size frames just write their zeros instead of
+      // seeking — correct output, merely less sparse.  Without this guard the
+      // post-seek flush issues an O_DIRECT write at an unaligned offset and
+      // fails with EINVAL (surfacing as a bogus "disk full?" error).
+#ifndef _WIN32
+      bool skip_ok = !dw_ || (dw_->total_bytes() % DirectWriter::ALIGN) == 0;
+#else
+      bool skip_ok = true;
+#endif
+
+      if (sparse_ && !at_end && skip_ok && block == SPARSE_BLOCK && is_all_zero(data + pos, block)) {
         // Coalesce consecutive zero blocks into a single skip, so the seek
         // (and, on a preallocated O_DIRECT file, the hole-punch inside
         // seek_forward) happens once per zero run instead of once per 4 KiB.
@@ -4696,14 +4717,23 @@ static void cpu_decomp_worker(
     // ascends), which collides with adjacent frames' natural seqs in
     // multi-frame files (e.g., --ultra -22 produces 128 MiB frames, all
     // would stream and clobber each other).  Only safe when there is
-    // exactly one frame total — wait for the reader to finish so we know
-    // the true count before deciding.  v0.13.1 fix.
+    // exactly one frame total.  v0.13.1 fix.
+    //
+    // Only frame 0 can possibly be "the single frame", and a second pushed
+    // task disproves single-frame instantly — so most oversize frames skip
+    // the wait entirely (faster than the old wait-for-producer-done).  When
+    // we do have to wait, it MUST be a timed wait that re-checks the task
+    // count: the input queue is bounded (v0.13.29), so the producer can be
+    // blocked in push() while every worker sits here — waiting on
+    // producer_done alone deadlocked low-thread-count decompression of
+    // multi-frame files with >64 MiB frames (fixed v0.13.54).
     static constexpr size_t STREAM_THRESHOLD = 64 * ONE_MIB;
     bool use_streaming = false;
-    if (t.decomp_size > STREAM_THRESHOLD) {
+    if (t.decomp_size > STREAM_THRESHOLD && t.seq == 0 && tq->total_tasks() <= 1) {
       std::unique_lock<std::mutex> lk(results->m);
-      results->cv.wait(lk, [&]{ return results->producer_done; });
-      use_streaming = (results->total_tasks == 1);
+      while (!results->producer_done && tq->total_tasks() <= 1)
+        results->cv.wait_for(lk, std::chrono::milliseconds(20));
+      use_streaming = (tq->total_tasks() == 1);
     }
     if (use_streaming) {
       static constexpr size_t CHUNK = 16 * ONE_MIB;
@@ -4766,7 +4796,15 @@ static void cpu_decomp_worker(
       // memset the prefix during resize.  The pool gives the buffer back
       // to us once the writer drops its shared_ptr ref.
       auto out_buf = acquire_decomp_buf();
-      out_buf->resize(t.decomp_size);
+      try {
+        out_buf->resize(t.decomp_size);
+      } catch (const std::bad_alloc &) {
+        // A corrupt/hostile frame header can claim an absurd content size;
+        // fail as a data error instead of an uncaught-exception abort.
+        die_data("frame " + std::to_string(t.seq) + " header claims "
+                 + std::to_string(t.decomp_size)
+                 + " bytes; allocation failed (corrupt input?)");
+      }
       actual = ZSTD_decompressDCtx(tl_dctx, out_buf->data(), out_buf->size(),
                                    t.ptr(), t.len());
       if (ZSTD_isError(actual))
@@ -4805,7 +4843,9 @@ static void cpu_decomp_worker(
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
 
-    if (m) m->tasks_done.fetch_add(1);
+    // (tasks_done is counted by the writer when frames are handed off in
+    // order — counting here too double-counted CPU-decompressed frames and
+    // skewed the progress bar's frame-level percentage.)
 
 #ifdef HAVE_NVCOMP
     if (sched) sched->add_cpu_bytes(comp_size);
@@ -4853,6 +4893,48 @@ static void cpu_decomp_worker(
     }
   }
 }
+
+#ifdef HAVE_NVCOMP
+/*======================================================================
+ GPU-only CPU fallback (v0.13.54)
+ -----------------------------------------------------------------------
+ All GPU workers in a --gpu-only run failed terminally (VRAM exhaustion,
+ driver error — at init or mid-run).  The old behaviour either died with
+ the queue half-processed or, worse, left the reader blocked forever on a
+ bounded queue nobody drains.  Instead, the LAST failing GPU worker calls
+ this to finish the job on a full CPU pool — maximum remaining throughput,
+ and the output is byte-for-byte correct (CPU and GPU emit interchangeable
+ zstd frames).  Blocks until the queue is drained; the caller (a dead GPU
+ worker thread) then exits and the normal teardown proceeds.
+======================================================================*/
+static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
+                                  ResultStore * results, const Options & opt,
+                                  Meter * m, FrameThrottle * bp)
+{
+  int threads = resolve_cpu_threads(opt.cpu_threads);
+  vlog(V_DEFAULT, opt,
+       std::string("WARNING: all GPUs failed; finishing ")
+       + (decompress ? "decompression" : "compression") + " on CPU ("
+       + std::to_string(threads) + " threads).\n"
+       "  Falling back for data safety: the remaining frames are processed "
+       "on the CPU instead,\n  so the output is complete and correct — just "
+       "without GPU acceleration.\n");
+  CpuAgg agg{};
+  agg.threads = threads;
+  agg.per_thread.resize((size_t)threads);
+  std::vector<std::thread> pool;
+  pool.reserve((size_t)threads);
+  for (int i = 0; i < threads; ++i) {
+    if (decompress)
+      pool.emplace_back(cpu_decomp_worker, i, queue, results, &opt, m,
+                        (void *)nullptr, (RateMatchState *)nullptr, &agg, bp);
+    else
+      pool.emplace_back(cpu_worker, i, queue, results, &opt, m,
+                        (void *)nullptr, (RateMatchState *)nullptr, &agg, bp);
+  }
+  for (auto & th : pool) th.join();
+}
+#endif // HAVE_NVCOMP
 
 /*======================================================================
  Streaming Zstd frame producer
@@ -5221,6 +5303,20 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   results.cv.notify_all();
   wthr.join();
   log_throttle_stats(throttle, opt, "decompress-cpu");
+
+  // Mid-file fallback tail: stream_frames_to_queue hit a frame with no
+  // content-size header (e.g. `cat a.zst b.zst` where b came from zstd on a
+  // pipe) and buffered the rest of the input in raw_data.  The parsed frames
+  // are fully written now (writer joined), so append the tail via the CPU
+  // streaming decoder.  Before v0.13.54 this tail was silently dropped —
+  // truncated output with exit 0.
+  if (fallback && !raw_data.empty()) {
+    vlog(V_DEFAULT, opt,
+         "note: frame " + std::to_string(n_frames) + " onward has no "
+         "content-size header (zstd streaming output); decompressing the "
+         "remaining data with the CPU streaming decoder so nothing is lost.\n");
+    decompress_from_buffer(raw_data, out, opt, m);
+  }
 
   if (g_perf) {
     g_perf->print_summary("CPU-ONLY DECOMPRESS");
@@ -5905,6 +6001,8 @@ struct StreamCtx {
   cudaEvent_t ev_d2h_end{};
   bool        busy   = false;         // true while a batch is in-flight
   size_t      filled = 0;             // subchunks in current batch
+  size_t      delivered = 0;          // frames of the current batch already pushed to ResultStore
+                                      // (lets the failure path rescue only the undelivered tail)
   StreamStats stats{};
   std::chrono::steady_clock::time_point last_adjust{ std::chrono::steady_clock::now() };
 
@@ -6166,7 +6264,8 @@ static void gpu_worker(
   SharedTuneState * shared_tune,
   RateMatchState * rate_match,
   FrameThrottle * bp,
-  std::atomic<int> * gpu_init_failures)
+  std::atomic<int> * gpu_failures,   // terminal failures (init or mid-run), all workers
+  int gpu_worker_count)              // total GPU workers spawned (for last-failure detection)
 {
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   void * vram_reserve = nullptr;
@@ -6300,10 +6399,15 @@ static void gpu_worker(
           vlog(V_ERROR, opt, skip_msg + "\n");
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
-          if (gpu_init_failures) gpu_init_failures->fetch_add(1, std::memory_order_release);
+          int fails = gpu_failures
+              ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
           // Wake writer and CPU workers in case they're waiting
           { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
           queue->notify_cpu_waiters();
+          // Last GPU standing just failed in --gpu-only: finish on CPU
+          // instead of stranding the queue (data safety over mode purity).
+          if (opt.gpu_only && fails == gpu_worker_count)
+            gpu_only_cpu_fallback(false, queue, results, opt, m, bp);
           return;
         }
         // At least one stream is usable — shrink ctxs and continue.
@@ -6585,10 +6689,14 @@ static void gpu_worker(
         if (sched) { sched->mark_gpu_take(C.batch.size()); }
         if (g_perf) g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
         C.filled = C.batch.size();
+        C.delivered = 0;
 
         if (m) {
+          // mmap views are counted here (their reader doesn't); --direct-read
+          // views (direct_buf >= 0) were already counted by the O_DIRECT
+          // reader — skip them (mirrors cpu_worker).
           for (size_t i = 0; i < C.filled; ++i)
-            if (C.batch[i].view_ptr)
+            if (C.batch[i].view_ptr && C.batch[i].direct_buf < 0)
               m->read_bytes.fetch_add(C.batch[i].len(), std::memory_order_relaxed);
         }
 
@@ -6707,6 +6815,7 @@ static void gpu_worker(
                         "cudaMemcpy(D2H exact)");
             }
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
+            C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
           }
           double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
           double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
@@ -6843,6 +6952,11 @@ static void gpu_worker(
           }
           uint64_t d2h_t0 = now_ns();
           for (size_t i = 0; i < C.filled; ++i) {
+            // Per-chunk status check — the async-poll path always had this,
+            // the sync drain was missing it: a failed chunk's comp_size is
+            // garbage, so delivering it silently corrupted output (v0.13.54).
+            if (C.h_stats[i] != nvcompSuccess)
+              throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
             const size_t csz = C.h_comp_sizes[i];
             auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
             const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
@@ -6861,6 +6975,7 @@ static void gpu_worker(
                         "cudaMemcpy(D2H exact sync)");
             }
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
+            C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
           }
           double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
           if (g_perf) {
@@ -7017,8 +7132,17 @@ static void gpu_worker(
           // and a ResultStore seq slot, so they must be rescued or they strand
           // the sequence-ordered writer forever.  Both success paths clear
           // C.batch, so a non-empty batch here is always popped-but-undelivered.
+          //
+          // A throw can also land MID-delivery (per-chunk status check, D2H
+          // copy): frames [0, delivered) already reached the ResultStore and
+          // will be written (the writer releases their permits) — rescuing
+          // them again would burn CPU on duplicates and leak their rescue
+          // permits.  Rescue only the undelivered tail.
+          if (C.delivered > 0 && C.delivered <= C.batch.size())
+            C.batch.erase(C.batch.begin(),
+                          C.batch.begin() + (ptrdiff_t)C.delivered);
           if (!C.batch.empty()) {
-            const int held = (int)C.filled;
+            const int held = (int)C.batch.size();
             if (rescue) {
               // Hybrid mode: push to CPU rescue queue.  MOVE the whole Task —
               // do NOT reconstruct as Task{seq, data}: the default compress
@@ -7061,6 +7185,16 @@ static void gpu_worker(
     }
     // Wake all CPU workers for drain
     queue->notify_cpu_waiters();
+
+    // Last GPU just failed in --gpu-only: finish the job on CPU.  The rescue
+    // pool handles the batch pushed above; this drains everything else still
+    // in (or yet to enter) the main queue, which otherwise has no consumer —
+    // the reader would block forever against the bounded queue, or the
+    // writer's watchdog would abort with a misleading internal error.
+    int fails = gpu_failures
+        ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
+    if (opt.gpu_only && fails == gpu_worker_count)
+      gpu_only_cpu_fallback(false, queue, results, opt, m, bp);
   }
 }
 
@@ -7518,11 +7652,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   shared_tune.locked.store(opt.gpu_batch_user_set);
   // VRAM ceiling will be refined by the first worker's binary search
 
-  // Counts GPUs that gave up during init (e.g. VRAM too small for even 1
-  // stream at batch=1).  Used by the producer loop to abort early if all
-  // GPUs fail in --gpu-only mode, instead of reading the whole file into
-  // a queue that nobody will ever consume.
-  std::atomic<int> gpu_init_failures{0};
+  // Counts GPUs that failed terminally (init or mid-run).  When the count
+  // reaches gpu_count in --gpu-only mode, the last failing worker runs
+  // gpu_only_cpu_fallback to finish the job on CPU (v0.13.54) — so the
+  // producer keeps reading and the queue always has a consumer.
+  std::atomic<int> gpu_failures{0};
 
   for (int i = 0; i < gpu_count; ++i) {
     workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
@@ -7531,7 +7665,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                          &any_gpu_failed, &abort_on_failure,
                          &fatal_msgs[size_t(i)], &gpu_started,
                          &shared_tune, &rate_match_compress,
-                         &throttle, &gpu_init_failures);
+                         &throttle, &gpu_failures, gpu_count);
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
@@ -7551,7 +7685,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // split and wants the fastest possible start.  v0.13.14.
   if (sched && opt.cpu_share >= 0.0 && gpu_count > 0) {
     while (!sched->any_gpu_active()
-           && gpu_init_failures.load(std::memory_order_acquire) < gpu_count) {
+           && gpu_failures.load(std::memory_order_acquire) < gpu_count) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
@@ -7571,11 +7705,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     const size_t subs_per_host = (host_chunk + gpu_chunk - 1) / gpu_chunk;
     // GPU path keeps the copy: each host chunk is split into gpu_chunk subchunks, so
     // one owning buffer per host read doesn't map to one Task (pool == nullptr).
+    // No early-abort on GPU failure: even if every GPU dies, the CPU
+    // fallback (gpu_only_cpu_fallback / hybrid CPU pool) consumes the queue,
+    // so the reader always streams the whole input.
     reader_done = odirect_read_chunks(opt.input, host_chunk, m, nullptr,
       [&](const char * buf, size_t n_host, size_t idx, int /*slot*/) {
-        if (abort_on_failure.load(std::memory_order_acquire)
-            && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
-          return false;
         // Deterministic, contiguous seq by file position: only the last (highest-
         // idx) chunk is partial, so chunk idx owns [idx*subs_per_host, +n_subs).
         size_t sub_off = 0, sub_i = 0;
@@ -7598,9 +7732,6 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     size_t off = 0;
     uint64_t mmap_rd_t0 = g_perf ? now_ns() : 0;
     while (off < file_size) {
-      if (abort_on_failure.load(std::memory_order_acquire)
-          && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
-        break;
       size_t n_host = std::min(host_chunk, file_size - off);
       size_t sub_off = 0;
       while (sub_off < n_host) {
@@ -7625,9 +7756,6 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   {
     std::vector<char> host_in(host_chunk);
     while (true) {
-      if (abort_on_failure.load(std::memory_order_acquire)
-          && gpu_init_failures.load(std::memory_order_acquire) >= gpu_count)
-        break;
       uint64_t rd_t0 = g_perf ? now_ns() : 0;
       size_t n_host = std::fread(host_in.data(), 1, host_chunk, in);
       if (g_perf && n_host > 0) {
@@ -7664,36 +7792,24 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   for (auto & th : workers) th.join();
   throttle.set_done();  // safe now: all workers exited
 
-  // Check for GPU failures
+  // Report GPU failures.  Even when ALL GPUs failed in --gpu-only mode the
+  // job is already complete: the last failing worker ran
+  // gpu_only_cpu_fallback (with its own warning), and the rescue pool
+  // recompressed any in-flight batches.  Output integrity is unaffected —
+  // CPU and GPU emit interchangeable zstd frames — so warn and continue
+  // instead of dying with EXIT_GPU_FAIL over data that is safely on disk.
   if (any_gpu_failed.load()) {
-    // Count how many GPUs actually failed
     int failed_count = 0;
     for (const auto & s : fatal_msgs)
       if (!s.empty()) ++failed_count;
     int total_gpus = (int)fatal_msgs.size();
-
-    if (abort_on_failure.load() && failed_count >= total_gpus) {
-      // ALL GPUs failed in --gpu-only mode  fatal
-      throttle.set_done();  // unblock any waiting workers
-      progress_done = true;
-      progress_thr.join();
-      {
-        std::lock_guard<std::mutex> lk(results.m);
-        results.workers_done = true;
-        results.cv.notify_all();
-      }
-      writer_thr.join();
-      std::string msg = "all GPUs failed (--gpu-only).";
-      for (const auto & s : fatal_msgs)
-        if (!s.empty()) { msg += " "; msg += s; }
-      die(msg, EXIT_GPU_FAIL);
-    } else {
-      // Some GPUs failed but others are working (or hybrid mode)
-      for (const auto & s : fatal_msgs)
-        if (!s.empty())
-          vlog(V_NORMAL, opt, "WARNING: " + s
-               + (abort_on_failure.load() ? " (other GPUs continuing)\n" : " (rescued to CPU)\n"));
-    }
+    const char * suffix = (failed_count >= total_gpus)
+        ? " (work completed on CPU)\n"
+        : (abort_on_failure.load() ? " (other GPUs continuing)\n"
+                                   : " (rescued to CPU)\n");
+    for (const auto & s : fatal_msgs)
+      if (!s.empty())
+        vlog(V_DEFAULT, opt, "WARNING: " + s + suffix);
   }
 
   // Drain rescue queue and join CPU pool
@@ -7752,7 +7868,8 @@ static void gpu_decomp_worker(
   SharedTuneState * shared_tune,
   RateMatchState * rate_match,
   FrameThrottle * bp,
-  std::atomic<int> * gpu_init_failures)
+  std::atomic<int> * gpu_failures,   // terminal failures (init or mid-run), all workers
+  int gpu_worker_count)              // total GPU workers spawned (for last-failure detection)
 {
   (void)m;
   const size_t stream_count = std::max<size_t>(1, (size_t)opt.gpu_streams);
@@ -7764,6 +7881,8 @@ static void gpu_decomp_worker(
     std::vector<Task> batch;
     bool busy = false;
     size_t filled = 0;
+    size_t delivered = 0;   // frames of the current batch already pushed to ResultStore
+                            // (lets the failure path re-enqueue only the undelivered tail)
     size_t stream_index = 0;
 
     // (Per-stream auto-tune tracking removed v0.13.34: dead code, superseded by
@@ -7993,9 +8112,14 @@ static void gpu_decomp_worker(
           vlog(V_ERROR, opt, skip_msg + "\n");
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
-          if (gpu_init_failures) gpu_init_failures->fetch_add(1, std::memory_order_release);
+          int fails = gpu_failures
+              ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
           { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
           queue->notify_cpu_waiters();
+          // Last GPU standing just failed in --gpu-only: finish on CPU
+          // instead of stranding the queue (data safety over mode purity).
+          if (opt.gpu_only && fails == gpu_worker_count)
+            gpu_only_cpu_fallback(true, queue, results, opt, m, bp);
           return;
         }
         vlog(V_DEFAULT, opt,
@@ -8463,15 +8587,22 @@ static void gpu_decomp_worker(
         // Launch batched decompression
         uint64_t kern_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
 
-        // Release host-side compressed data  it's on the GPU now.
         // Save per-frame metadata needed by completion paths.
+        //
+        // Do NOT release the host-side compressed inputs here ("it's on the
+        // GPU now"): if the kernel or a per-chunk status fails AFTER the
+        // release, the catch block re-enqueues tasks whose data is gone —
+        // the retry then decompresses 0 bytes and the rescue path is dead on
+        // arrival.  Inputs are released per-frame after successful delivery
+        // below (compressed frames are small, so holding them for the
+        // kernel's duration costs little RAM).  v0.13.54.
         std::vector<size_t> batch_comp_sizes(C.filled);
         std::vector<size_t> batch_seqs(C.filled);
         for (size_t i = 0; i < C.filled; ++i) {
           batch_comp_sizes[i] = C.batch[i].len();
           batch_seqs[i] = C.batch[i].seq;
-          C.batch[i].release_input();
         }
+        C.delivered = 0;
 
         checkNvcomp(nvcompBatchedZstdDecompressAsync(
             (const void * const *)C.d_comp_ptrs,
@@ -8553,6 +8684,11 @@ static void gpu_decomp_worker(
           uint64_t rl_t0 = g_perf ? now_ns() : 0;
           results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
           if (g_perf) g_perf->result_lock_ns.fetch_add(now_ns() - rl_t0);
+          // Delivered: safe to free this frame's compressed input now.  A
+          // mid-loop throw (bad status / failed D2H) re-enqueues only the
+          // undelivered tail, whose inputs are still intact.
+          C.batch[i].release_input();
+          C.delivered = i + 1;
         }
         uint64_t d2h_elapsed_ns = (d2h_t0 > 0) ? now_ns() - d2h_t0 : 0;
         double d2h_ms_v = double(d2h_elapsed_ns) / 1e6;
@@ -8694,15 +8830,22 @@ static void gpu_decomp_worker(
     *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
 
     // Rescue in-flight chunks back to queue so other GPUs can pick them up.
-    // The batch was popped from the queue but never decompressed.
+    // The batch was popped from the queue but not (fully) decompressed.
     try {
       if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
       for (auto & C : ctxs) {
+        // Frames [0, delivered) already reached the ResultStore (and had
+        // their inputs released) — re-enqueueing them would push empty,
+        // duplicate-seq tasks.  Re-enqueue only the undelivered tail.
+        if (C.delivered > 0 && C.delivered <= C.batch.size())
+          C.batch.erase(C.batch.begin(),
+                        C.batch.begin() + (ptrdiff_t)C.delivered);
         if (!C.batch.empty()) {
           // Capture the permit count before re_enqueue clears the batch.  The
           // next popper re-acquires one permit per frame, so release the GPU's
           // originals here or they leak (mirrors the in-loop re_enqueue at the
-          // VRAM-retry path, which already releases).
+          // VRAM-retry path, which already releases).  The writer releases the
+          // delivered frames' permits as it writes them.
           const int held = (int)C.batch.size();
           queue->re_enqueue(C.batch);
           if (bp) bp->release(held);
@@ -8727,6 +8870,13 @@ static void gpu_decomp_worker(
       results->cv.notify_all();
     }
     queue->notify_cpu_waiters();
+
+    // Last GPU just failed in --gpu-only: finish decompression on CPU so the
+    // re-enqueued frames (and everything still in the queue) have a consumer.
+    int fails = gpu_failures
+        ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
+    if (opt.gpu_only && fails == gpu_worker_count)
+      gpu_only_cpu_fallback(true, queue, results, opt, m, bp);
   }
 }
 
@@ -8960,10 +9110,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   shared_tune_decomp.batch_size.store(opt.gpu_batch_cap);
   shared_tune_decomp.locked.store(opt.gpu_batch_user_set);
 
-  // Counts GPUs that gave up during init (VRAM too small for even 1 stream).
-  // Used by the frame streamer below to abort early if all GPUs fail in
-  // --gpu-only mode instead of buffering the entire file.
-  std::atomic<int> gpu_init_failures{0};
+  // Counts GPUs that failed terminally (init or mid-run).  When the count
+  // reaches the worker count in --gpu-only mode, the last failing worker
+  // runs gpu_only_cpu_fallback to finish on CPU (v0.13.54).
+  std::atomic<int> gpu_failures{0};
 
   // GPU bringup: detect (when deferred — triggers the cuInit), select
   // devices, init result slots, and spawn GPU workers.  Runs on a background
@@ -9027,7 +9177,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
                                &shared_tune_decomp, &rate_match,
-                               bp_ptr, &gpu_init_failures);
+                               bp_ptr, &gpu_failures, gpu_count);
     }
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -9055,7 +9205,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // workers spawned on the background thread and promises no exact split.
   if (sched && opt.cpu_share >= 0.0 && !gpu_workers.empty()) {
     while (!sched->any_gpu_active()
-           && gpu_init_failures.load(std::memory_order_acquire) < (int)gpu_workers.size()) {
+           && gpu_failures.load(std::memory_order_acquire) < (int)gpu_workers.size()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
@@ -9100,13 +9250,24 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     }
     results.cv.notify_all();
     throttle.set_done();
+    // Join the background bringup thread BEFORE touching gpu_workers: it
+    // populates that vector (data race otherwise), and leaving it joinable
+    // made this std::thread's destructor call std::terminate — an abort on
+    // every hybrid/gpu-only decompress of a streamed-zstd file (v0.13.54).
+    if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
     for (auto & th : gpu_workers) th.join();
     for (auto & th : cpu_pool) th.join();
     if (sched) { tick_done = true; if (tick_thr.joinable()) tick_thr.join(); }
     writer_thr.join();
 
-    vlog(V_VERBOSE, opt,
-         "frame sizes unknown; falling back to CPU streaming decompress\n");
+    vlog(V_DEFAULT, opt,
+         std::string("warning: frame sizes unknown (no content-size headers); "
+         "falling back from ")
+         + (opt.gpu_only ? "--gpu-only" : opt.hybrid ? "--hybrid" : "parallel")
+         + " to CPU streaming decompress.\n"
+         "  A single frame of unknown size cannot be split across workers; "
+         "the CPU decoder\n  guarantees a complete, correct output — this is "
+         "for data safety, just slower.\n");
     decompress_from_buffer(raw_data, out, opt, m);
     return;
   }
@@ -9135,31 +9296,22 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   for (auto & th : gpu_workers) th.join();
 
-  if (abort_on_failure.load() && any_gpu_failed.load()) {
-    // Count how many GPUs actually failed
+  // Report GPU failures.  Even when ALL GPUs failed in --gpu-only mode the
+  // job is already complete: the last failing worker ran
+  // gpu_only_cpu_fallback (with its own warning) and drained the queue on
+  // CPU, so the output is complete and correct.  Warn instead of dying.
+  if (any_gpu_failed.load()) {
     int failed_count = 0;
     for (const auto & s : fatal_msgs)
       if (!s.empty()) ++failed_count;
     int total_gpus = (int)fatal_msgs.size();
-
-    if (failed_count >= total_gpus) {
-      // ALL GPUs failed  fatal in --gpu-only mode
-      {
-        std::lock_guard<std::mutex> lk(results.m);
-        results.workers_done = true;
-        results.cv.notify_all();
-      }
-      writer_thr.join();
-      std::string msg = "all GPUs failed (--gpu-only).";
-      for (const auto & s : fatal_msgs)
-        if (!s.empty()) { msg += " "; msg += s; }
-      die(msg, EXIT_GPU_FAIL);
-    } else {
-      // Some GPUs failed but others are still working
-      for (const auto & s : fatal_msgs)
-        if (!s.empty())
-          vlog(V_NORMAL, opt, "WARNING: " + s + " (other GPUs continuing)\n");
-    }
+    const char * suffix = (failed_count >= total_gpus && abort_on_failure.load())
+        ? " (work completed on CPU)\n"
+        : (abort_on_failure.load() ? " (other GPUs continuing)\n"
+                                   : " (rescued to CPU/other GPUs)\n");
+    for (const auto & s : fatal_msgs)
+      if (!s.empty())
+        vlog(V_DEFAULT, opt, "WARNING: " + s + suffix);
   }
 
   rescue.set_done();
@@ -9203,6 +9355,19 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         vlog(V_VERBOSE, opt, "[WRITER] join took " + std::to_string(int(ms)) + " ms\n");
     }
   }
+
+  // Mid-file fallback tail (see decompress_cpu_mt): a later frame had no
+  // content-size header, so the reader buffered the rest of the input in
+  // raw_data.  All parsed frames are written (writer joined); append the
+  // tail via the CPU streaming decoder.  Previously dropped silently.
+  if (fallback && !raw_data.empty()) {
+    vlog(V_DEFAULT, opt,
+         "note: frame " + std::to_string(n_frames) + " onward has no "
+         "content-size header (zstd streaming output); decompressing the "
+         "remaining data with the CPU streaming decoder so nothing is lost.\n");
+    decompress_from_buffer(raw_data, out, opt, m);
+  }
+
   log_throttle_stats(throttle, opt,
                      opt.hybrid ? "decompress-hybrid" :
                      opt.gpu_only ? "decompress-gpu" : "decompress-nvcomp");
@@ -10039,7 +10204,7 @@ static Options parse_args(int argc, char ** argv)
       opt.mode = Mode::DECOMPRESS;
     else if (a == "-t" || a == "--test") opt.mode = Mode::TEST;
     else if (a == "-k" || a == "--keep") opt.keep = true;
-    else if (a == "--rm") { opt.remove_input = true; opt.keep = false; }
+    else if (a == "--rm") { opt.keep = false; }
     else if (a == "-f" || a == "--force") opt.force = true;
     else if (a == "--overwrite") { opt.force = true; opt.unsafe_overwrite = true; }
     else if (a == "--sparse") opt.sparse_mode = 1;
@@ -10070,19 +10235,21 @@ static Options parse_args(int argc, char ** argv)
     else if (a.size() >= 2 && a[0] == '-' && a[1] >= '0' && a[1] <= '9') {
       bool all_digits = true;
       for (size_t k = 1; k < a.size(); ++k) { if (a[k] < '0' || a[k] > '9') { all_digits = false; break; } }
-      if (all_digits) {
-        int lvl = std::stoi(a.substr(1));
-        if (lvl < 1) die_usage("invalid compression level (must be 1..22)");
-        if (lvl > 22) die_usage("invalid compression level (max 22)");
-        opt.level = lvl; opt.level_user_set = true; continue;
-      }
+      // Reject "-5x" etc. explicitly: this else-if already matched, so falling
+      // through silently swallowed the malformed flag (and compressed at the
+      // default level).  parse_int_value also catches overflow (-9999999...).
+      if (!all_digits) die_usage("unknown option: " + a);
+      int lvl = parse_int_value(a, a.substr(1));
+      if (lvl < 1) die_usage("invalid compression level (must be 1..22)");
+      if (lvl > 22) die_usage("invalid compression level (max 22)");
+      opt.level = lvl; opt.level_user_set = true; continue;
     }
     else if (a == "--fast") { opt.fast_flag = true; opt.level = 1; opt.level_user_set = true; }
     else if (a.rfind("--fast=", 0) == 0) {
       // zstd-compat: --fast=# uses negative-ish fast levels.  Our backend
       // accepts 1..22, so clamp "--fast=N" to level 1 (fastest) and warn if N>1.
       std::string v = a.substr(7);
-      int n = v.empty() ? 1 : std::stoi(v);
+      int n = v.empty() ? 1 : parse_int_value("--fast", v);
       if (n < 1) n = 1;
       if (n > 1) warn_ignored_zstd_opt("--fast=" + v, "gzstd minimum level is 1");
       opt.fast_flag = true; opt.level = 1; opt.level_user_set = true;
@@ -10284,25 +10451,25 @@ static Options parse_args(int argc, char ** argv)
     // ZSTD_d_windowLogMax and to compress as a throttle-budget cap.
     else if (a.size() > 2 && a[0] == '-' && a[1] == 'M'
           && (a[2] >= '0' && a[2] <= '9')) {
-      opt.mem_limit_mib = (size_t)std::stoull(a.substr(2));
+      opt.mem_limit_mib = (size_t)parse_u64_value("-M", a.substr(2));
     }
     else if (a == "-M") {
       if (i + 1 >= argc) die_usage("missing value for -M");
-      opt.mem_limit_mib = (size_t)std::stoull(argv[++i]);
+      opt.mem_limit_mib = (size_t)parse_u64_value("-M", argv[++i]);
     }
     else if (a.rfind("--memlimit=", 0) == 0) {
-      opt.mem_limit_mib = (size_t)std::stoull(a.substr(11));
+      opt.mem_limit_mib = (size_t)parse_u64_value("--memlimit", a.substr(11));
     }
     else if (a == "--memlimit") {
       if (i + 1 >= argc) die_usage("missing value for --memlimit");
-      opt.mem_limit_mib = (size_t)std::stoull(argv[++i]);
+      opt.mem_limit_mib = (size_t)parse_u64_value("--memlimit", argv[++i]);
     }
     else if (a.rfind("--memory=", 0) == 0) {
-      opt.mem_limit_mib = (size_t)std::stoull(a.substr(9));
+      opt.mem_limit_mib = (size_t)parse_u64_value("--memory", a.substr(9));
     }
     else if (a == "--memory") {
       if (i + 1 >= argc) die_usage("missing value for --memory");
-      opt.mem_limit_mib = (size_t)std::stoull(argv[++i]);
+      opt.mem_limit_mib = (size_t)parse_u64_value("--memory", argv[++i]);
     }
     // Job size: `-B#` in compression (bytes).  gzstd uses --chunk-size in MiB
     // with different semantics (one frame per chunk).  Warn.

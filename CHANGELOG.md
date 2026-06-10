@@ -1,11 +1,99 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.53  
+**Covers:** v0.9.50 → v0.13.54  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.54 — full-file code review: 3 reproduced critical bugs + GPU-failure CPU fallback
+
+A line-by-line review of gzstd.cpp found three serious decompress-path bugs
+(all reproduced on the workstation before fixing) plus a batch of smaller
+correctness and robustness issues.  Common thread: error/fallback paths written
+in one era weren't revisited when later features (bounded queues v0.13.29/41,
+async GPU bringup v0.13.13/15) changed the invariants they relied on.
+
+**1. Silent data loss on concatenated zstd streams (reproduced).** When a
+multi-frame input contained a frame with no content-size header *after* at
+least one parseable frame (e.g. `cat a.zst b.zst` where b came from
+`... | zstd` on a pipe — valid zstd), `stream_frames_to_queue` buffered the
+rest of the input in `raw_data` and returned, but both decompress paths only
+consumed `raw_data` when *zero* frames had parsed.  Result: the tail was
+silently dropped — truncated output, exit 0.  Repro: 2 MiB concatenated input
+→ 1 MiB output.  Fix: after the writer drains the parsed frames, append the
+tail via the CPU streaming decoder (`decompress_from_buffer`), with a note.
+
+**2. SIGABRT on hybrid/gpu-only decompress of streamed-zstd files
+(reproduced).** The `fallback && n_frames == 0` early-return in
+`decompress_nvcomp` never joined the deferred GPU-bringup thread: the joinable
+`std::thread`'s destructor called `std::terminate` — an abort (exit 134) on
+*every* hybrid or gpu-only decompress of a file whose first frame lacks a
+content size.  It also iterated `gpu_workers` while the bringup thread could
+still be appending to it (data race).  Fix: join the bringup thread first
+(matches the normal path's ordering comment).  The fallback message is now a
+visible warning explaining that the mode fallback is for data safety.
+
+**3. Deadlock decompressing >64 MiB frames at low thread counts
+(reproduced).** `cpu_decomp_worker`'s single-frame-file detection (v0.13.1)
+blocked on `producer_done` for every frame over 64 MiB.  Once the input queue
+became bounded (v0.13.29), the producer could be blocked in `push()` while
+every worker sat in that wait — circular wait, hard hang.  Repro: 1 GiB of
+`--chunk-size 128` frames, `-d --cpu-only -T 2` → infinite hang (now 1.2 s).
+Fix (also a small speedup): only frame seq 0 can be "the single frame", and a
+second pushed task disproves single-frame instantly — oversize frames in
+multi-frame files now skip the wait entirely; the genuine wait is a timed
+re-checking loop that can't deadlock against a blocked producer.
+
+**4. All-GPU failure in --gpu-only now falls back to CPU instead of dying
+(or hanging).** Previously: all GPUs failing at init aborted the reader and
+died with EXIT_GPU_FAIL — but mid-run failures weren't counted by that check,
+so with pipe input the producer blocked forever on the bounded queue (no
+consumer), and with mmap input the writer's watchdog killed the run with a
+misleading "internal error: writer stuck" (exit 1).  Now the last terminally
+failing GPU worker runs `gpu_only_cpu_fallback`: a full CPU pool drains the
+queue (maximum remaining throughput), a warning explains the fallback is for
+data safety, and the run completes with exit 0.  Exit code 5 is now reserved
+(documented in --help); the reader-side abort checks are gone — the queue
+always has a consumer.
+
+**5. Missing nvCOMP per-chunk status check in the compress sync-drain path
+(silent corruption risk).** The async-poll completion path validated
+`h_stats[i]`; the sync drain did not — a failed chunk's garbage comp_size
+would have been delivered as output.  Both paths now check.
+
+**6. GPU-decompress rescue re-enqueued empty tasks.** Inputs were released
+("it's on the GPU now") *before* the kernel ran, so any failure after that
+point re-enqueued zero-byte tasks — the retry was dead on arrival.  Inputs are
+now released per-frame after successful delivery.
+
+**7. Partial-batch failure accounting (compress + decompress).** A throw
+mid-delivery rescued/re-enqueued the *whole* batch including frames already
+pushed to the ResultStore: duplicate-seq work and permit drift.  Streams now
+track `delivered` and the failure paths handle only the undelivered tail, with
+exact permit release.
+
+**Smaller fixes:**
+- `--fast=abc`, `-M abc`, `--memlimit=`/`--memory` garbage, and overflowing
+  `-NNN…` levels crashed with an uncaught std::stoi/stoull exception; now
+  clean usage errors (exit 2).  Malformed level flags like `-5x` were silently
+  swallowed (and compressed at the default level!); now "unknown option".
+- Corrupt frame headers claiming absurd content sizes aborted via uncaught
+  `std::bad_alloc`; now a clean data error (exit 4).
+- `tasks_done` was double-counted on CPU decompress (writer + worker), skewing
+  the progress bar's frame-level percentage; the writer is the sole counter.
+- O_DIRECT + sparse: a sparse seek from a non-4 KiB-aligned position left the
+  fd offset unaligned, making the next O_DIRECT flush fail with EINVAL
+  (reported as "disk full?").  Sparse skips through the DirectWriter now only
+  happen from aligned positions; unaligned zero runs are written instead
+  (correct, merely less sparse — unreachable with gzstd's own 16 MiB frames).
+- `DirectWriter::write_all`/`pwrite_all` looped forever on `write() == 0`;
+  `robust_fwrite` could loop on a stale `EINTR` in errno.  Both bounded.
+- gpu_worker counted `--direct-read` view bytes into the progress meter that
+  the O_DIRECT reader had already counted (mirrors cpu_worker's guard).
+- Removed the write-only `Options::remove_input` field (`--rm` works via
+  `keep = false`).
 
 ## v0.13.53 — reconcile --help / -h with actual operation (docs only)
 
