@@ -1,11 +1,62 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.55  
+**Covers:** v0.9.50 → v0.13.58  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.58 — hybrid compress: slow GPU no longer sets the makespan (tail-aware intake)
+
+On the workstation (slow-GPU box: GPU pool ~1.1 GiB/s vs CPU pool ~15),
+hybrid compress ran 26–45% behind cpu-only.  Root cause: in adaptive mode the
+GPU popped batches unconditionally, including from the near-empty queue at
+the end of the run — a 1 GiB batch takes the slow GPU pool ~2 s while the
+entire CPU pool sits idle waiting for it.  The damage was almost entirely a
+*tail* effect: mid-run greedy intake is harmless (work conserves, both pools
+stay busy), but whoever holds frames when the queue runs dry decides when the
+run ends.
+
+**Failed approach (v0.13.56, never released):** cap GPU intake at its
+EMA-measured fair share of throughput per ~0.5 s scheduler window, lifting
+the cap when the producer finishes so the tail drains greedily.  Falsified by
+A/B on a 100 GiB page-cached input: identical to v0.13.55 within noise.  Two
+design errors: (1) with mmap input (the default) the reader enqueues view
+tasks for the whole file in milliseconds, so "producer done" fires at t≈0 and
+the cap was disabled for effectively the entire run; (2) lifting the cap for
+the tail re-creates the exact failure being fixed — the tail *is* where
+greedy intake hurts.
+
+**Shipped approach:** `should_gpu_take()` (adaptive, compress only) yields
+only at the tail — the GPU starts a new batch only if the queue holds more
+than ~1.3 GPU-batch-times of CPU work: `(depth − batch)/cpu_ema ≥
+1.3 · batch · streams/gpu_ema` (frames are uniform, so frame counts over EMA
+byte-rates compare directly).  The check arms once the producer is done
+(t≈0 for mmap, so it is live the whole run; a streaming producer keeps the
+queue shallow and would otherwise starve the GPU).  The first yield latches
+`tail_yield_`, which zeroes `cpu_queue_floor()` and wakes sleeping CPU
+workers — otherwise CPUs would refuse the very frames the floor had reserved
+for the GPU that just declined them.  The GPU remains the drain of last
+resort below `--cpu-queue-min` (CPUs refuse those depths; mutual yield would
+hang).  A yielded GPU worker (all streams idle) parks on the queue CV via
+`wait_for_gpu_yield()` — event-driven like the CPU side's `wait_for_cpu`, no
+polling, no fixed sleeps — and wakes exactly when a decision input changes:
+any pop (`take_front_locked` is the centralized dequeue point and notifies
+when a waiter is parked; a free integer check otherwise), the queue
+draining, or a scheduler tick moving the EMAs (the one input with no queue
+event; `notify_gpu_yield_waiters()` covers it).  The wait predicate
+evaluates `should_gpu_take_at(depth)` from the QueueState snapshot — like
+wait_for_cpu's predicate, it must not call back into TaskQueue.
+Fixed-share mode is unchanged (its share check oscillates per-batch by
+design and must keep spinning).
+
+Measured (workstation, 100 GiB medium-compressibility input, page-cached,
+output to /dev/null, median of 3 alternating runs): hybrid 8.57 s →
+**6.31 s** (−26%), variance collapsed (7.8–9.4 s → 6.2–6.3 s); cpu-only
+reference 5.94 s.  Hybrid now lands within ~6% of cpu-only on this box
+(≈ CUDA init cost) instead of 30–45% behind.  A fast GPU is unaffected:
+its fair share is large, so the yield condition only trims the last batch.
 
 ## v0.13.55 — portable binary failed to start on machines without an NVIDIA driver
 

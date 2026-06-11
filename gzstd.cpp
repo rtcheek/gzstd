@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.55";
+static constexpr const char * GZSTD_VERSION = "0.13.58";
 //
 // Architecture overview:
 //
@@ -2872,6 +2872,37 @@ public:
     }
   }
 
+  // Park a tail-yielded GPU worker (should_gpu_take() == false, all its
+  // streams idle) until something that could change the decision happens:
+  // any pop shrinks the queue (take_front_locked notifies when a waiter is
+  // registered), the queue drains, or a scheduler tick moves the EMA rates
+  // (notify_gpu_yield_waiters).  Event-driven counterpart to wait_for_cpu —
+  // no polling, no fixed sleeps.  The predicate receives a QueueState
+  // snapshot under the lock and, like wait_for_cpu's, must not call back
+  // into TaskQueue (deadlock).  Returns false when drained (caller exits),
+  // true when the predicate says the GPU should take again.
+  bool wait_for_gpu_yield(std::function<bool(const QueueState &)> may_take)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    ++gpu_yield_waiters_;
+    while (true) {
+      if (q_.empty() && done_) { --gpu_yield_waiters_; return false; }
+      QueueState qs { q_.size(), done_, front_ratio_locked() };
+      if (may_take(qs)) { --gpu_yield_waiters_; return true; }
+      cv_.wait(lk);
+    }
+  }
+
+  // Wake GPU workers parked in wait_for_gpu_yield().  Called by the
+  // scheduler tick after an EMA update — the only input to the yield
+  // decision that changes without a queue event.  Takes the lock so a
+  // notify can't slip between a waiter's predicate check and its wait.
+  void notify_gpu_yield_waiters()
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    if (gpu_yield_waiters_ > 0) cv_.notify_all();
+  }
+
   // Pop one task for a CPU worker, but only if may_proceed() is true.
   // Combines the wait and pop into a single lock acquisition to avoid
   // a race between checking the predicate and another thread popping
@@ -2936,6 +2967,10 @@ private:
     queued_bytes_ -= q_.front().data.size();
     Task t = std::move(q_.front());
     q_.pop_front();
+    // Every pop path lands here, so this is the one place a depth change
+    // can wake a GPU parked in wait_for_gpu_yield().  Free integer check
+    // when nothing is parked (the common case).
+    if (gpu_yield_waiters_ > 0) cv_.notify_all();
     return t;
   }
 
@@ -2948,6 +2983,7 @@ private:
   size_t                  max_depth_ = 0;  // 0 = unbounded (default); >0 caps queued frames (ROADMAP 7.8)
   size_t                  max_bytes_ = 0;  // 0 = unbounded; >0 caps queued owned bytes / RAM (7.8 follow-up)
   size_t                  queued_bytes_ = 0; // running sum of q_'s owned data.size() bytes
+  int                     gpu_yield_waiters_ = 0; // GPUs parked in wait_for_gpu_yield (guarded by m_)
   std::atomic<size_t>     total_tasks_{0};
 };
 
@@ -3964,22 +4000,90 @@ public:
 
   // GPU checks this before popping a batch.  In fixed-share mode, GPU
   // yields when CPU is below its target share — symmetric counterpart
-  // to should_cpu_take().  In adaptive mode, GPU always takes (the EMA
-  // path drives sharing through gpus_waiting_ / queue floor instead).
-  bool should_gpu_take() const {
-    if (!fixed_mode_) return true;
-    const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
-    const uint64_t gpu = gpu_taken_.load(std::memory_order_relaxed);
-    const uint64_t total = cpu + gpu + 1;
-    // GPU takes when CPU has met (or exceeded) its share.  Same hysteresis
-    // band as should_cpu_take so the ratio oscillates around the target
-    // instead of one side starving when both check at the same moment.
-    return (double(cpu) / double(total)) >= (fixed_cpu_share_ - 0.02);
+  // to should_cpu_take().
+  //
+  // Adaptive mode (compress only, v0.13.57): tail-aware intake.  The old
+  // "GPU always takes" policy let a slow GPU set the run's makespan:
+  // profiled on a Gen3 2-GPU box (GPU pool ~1.1 GiB/s vs CPU pool ~15),
+  // the GPU grabbed batches from the near-empty queue and the whole run
+  // waited ~2s per batch for it while the CPU pool sat idle — hybrid
+  // finished 26% behind cpu-only.  Mid-run, greedy intake is harmless
+  // (work conserves; both pools stay busy), so the GPU yields only at
+  // the tail: when the queue holds less CPU-time of work than ~1.3x the
+  // time this GPU batch would take, starting the batch would outlive
+  // the CPU drain and stretch the makespan.  Frames are uniform
+  // (chunk_mib), so frame counts divided by the EMA byte-rates compare
+  // directly.  The check arms only once the producer is done — before
+  // that, queue depth measures the reader, not remaining work, and a
+  // streaming producer would starve the GPU (with mmap input the
+  // producer finishes near t=0, so in the default path the check is
+  // live for effectively the whole run).  It never engages during EMA
+  // warm-up (both engines need 2 samples) or for decompress (different
+  // economics — not validated there).  The first yield latches
+  // tail_yield_, which zeroes cpu_queue_floor() — otherwise CPUs would
+  // refuse the very frames the GPU just declined (reserved by the
+  // floor) and the tail would strand.
+  bool should_gpu_take() {
+    if (fixed_mode_) {
+      const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
+      const uint64_t gpu = gpu_taken_.load(std::memory_order_relaxed);
+      const uint64_t total = cpu + gpu + 1;
+      // GPU takes when CPU has met (or exceeded) its share.  Same hysteresis
+      // band as should_cpu_take so the ratio oscillates around the target
+      // instead of one side starving when both check at the same moment.
+      return (double(cpu) / double(total)) >= (fixed_cpu_share_ - 0.02);
+    }
+    if (opt_.mode != Mode::COMPRESS) return true;
+    if (!producer_done_.load(std::memory_order_acquire)) return true;
+    if (!queue_) return true;
+    return should_gpu_take_at(queue_->size());
+  }
+
+  // Core of the adaptive tail decision for a known queue depth.  Split out
+  // so the wait_for_gpu_yield predicate can evaluate it under the queue
+  // lock without calling back into TaskQueue (deadlock).  Only reached
+  // after the should_gpu_take() gates (adaptive, compress, producer done),
+  // all of which are monotonic — once a worker parks, they can't unflip.
+  bool should_gpu_take_at(size_t depth_now) {
+    if (cpu_samples_.load(std::memory_order_relaxed) < 2 ||
+        gpu_samples_.load(std::memory_order_relaxed) < 2) return true;
+    const double c = cpu_rate_ema_.load(std::memory_order_relaxed);
+    const double g = gpu_rate_ema_.load(std::memory_order_relaxed);
+    if (c <= 0.0 || g <= 0.0) return true;
+    const double depth = (double)depth_now;
+    // CPUs refuse depths below --cpu-queue-min, so the GPU must stay the
+    // drain of last resort there or the run hangs with both sides yielding.
+    if (opt_.cpu_queue_min > 0 && depth <= (double)opt_.cpu_queue_min)
+      return true;
+    const double batch =
+        (double)std::max<size_t>(1, gpu_batch_size_.load(std::memory_order_relaxed));
+    const double streams =
+        (double)std::max(1, active_gpu_streams_.load(std::memory_order_relaxed));
+    // CPU-seconds of work left after this batch vs GPU-seconds to finish it
+    // (per-stream rate = pool EMA / streams).
+    const bool take = (depth - batch) / c >= 1.3 * batch * streams / g;
+    if (!take && !tail_yield_.exchange(true, std::memory_order_acq_rel)) {
+      // First yield: the floor is now zero — wake CPUs sleeping on it,
+      // since no push will arrive to re-evaluate their predicate.
+      // (Plain CV notify — safe even when called under the queue lock
+      // from the wait_for_gpu_yield predicate.)
+      queue_->notify_cpu_waiters();
+    }
+    return take;
+  }
+
+  // Producer finished: queue depth now equals remaining work, so the
+  // tail-aware GPU intake check in should_gpu_take() can arm.
+  void set_producer_done() {
+    producer_done_.store(true, std::memory_order_release);
   }
 
   // Minimum queue depth below which CPUs should not take work.
   // Reserves enough tasks for all GPU streams to fill their next batch.
+  // Zero once the GPU has tail-yielded: the reservation exists to feed
+  // GPU batches, and the GPU has declared it won't take another.
   size_t cpu_queue_floor() const {
+    if (tail_yield_.load(std::memory_order_relaxed)) return 0;
     return gpu_queue_floor_.load(std::memory_order_relaxed);
   }
 
@@ -4072,6 +4176,9 @@ public:
       gpu_samples_.fetch_add(1, std::memory_order_relaxed);
     }
     refresh_queue_floor_();
+    // EMA movement is the one yield-decision input with no queue event;
+    // wake any GPU parked in wait_for_gpu_yield so it re-evaluates.
+    if (queue_) queue_->notify_gpu_yield_waiters();
 
     if (opt_.verbosity >= V_DEBUG) {
       const char * YEL = g_color_stderr ? "\033[1;93m" : "";  // bright yellow — GPU
@@ -4111,6 +4218,8 @@ private:
 
   std::atomic<bool> gpu_ready_{false};
   std::atomic<int> gpus_waiting_{0};
+  std::atomic<bool> producer_done_{false};  // arms the tail-aware GPU intake check
+  std::atomic<bool> tail_yield_{false};     // GPU declined the tail; floor released
 
   // Queue-depth reservation: CPUs yield when depth <= floor.
   // Nominal floor = active_gpu_streams * gpu_batch_size.
@@ -6736,7 +6845,26 @@ static void gpu_worker(
         // If the queue is already drained, propagate that so the worker can
         // exit instead of spinning forever on the share check.
         if (sched && !sched->should_gpu_take()) {
-          if (queue->drained()) producer_done_seen = true;
+          if (queue->drained()) { producer_done_seen = true; continue; }
+          // Adaptive tail yield (compress): CPUs are draining the rest.
+          // Park on the queue CV until an event that could change the
+          // decision: a pop shrinks the queue, the queue drains, or a
+          // scheduler tick moves the EMAs.  No polling, no fixed sleeps.
+          // Only park when every stream is idle — with a batch in flight
+          // this loop must keep polling cudaStreamQuery, and the
+          // completion paths below already block appropriately.  (Fixed
+          // mode keeps its spin: the share check is designed to
+          // oscillate per-batch.  Adaptive decompress never declines.)
+          if (!sched->is_fixed_mode()) {
+            bool any_busy = false;
+            for (auto & X : ctxs) if (X.busy) { any_busy = true; break; }
+            if (!any_busy &&
+                !queue->wait_for_gpu_yield(
+                    [&](const TaskQueue::QueueState & qs) {
+                      return sched->should_gpu_take_at(qs.depth);
+                    }))
+              producer_done_seen = true;
+          }
           continue;
         }
         C.batch.clear();
@@ -7874,6 +8002,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Signal workers that all input has been read
   queue.set_done();
+  if (sched) sched->set_producer_done();  // arm the tail-aware GPU intake check
   {
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;
@@ -8435,7 +8564,26 @@ static void gpu_decomp_worker(
         // If the queue is already drained, propagate that so the worker can
         // exit instead of spinning forever on the share check.
         if (sched && !sched->should_gpu_take()) {
-          if (queue->drained()) producer_done_seen = true;
+          if (queue->drained()) { producer_done_seen = true; continue; }
+          // Adaptive tail yield (compress): CPUs are draining the rest.
+          // Park on the queue CV until an event that could change the
+          // decision: a pop shrinks the queue, the queue drains, or a
+          // scheduler tick moves the EMAs.  No polling, no fixed sleeps.
+          // Only park when every stream is idle — with a batch in flight
+          // this loop must keep polling cudaStreamQuery, and the
+          // completion paths below already block appropriately.  (Fixed
+          // mode keeps its spin: the share check is designed to
+          // oscillate per-batch.  Adaptive decompress never declines.)
+          if (!sched->is_fixed_mode()) {
+            bool any_busy = false;
+            for (auto & X : ctxs) if (X.busy) { any_busy = true; break; }
+            if (!any_busy &&
+                !queue->wait_for_gpu_yield(
+                    [&](const TaskQueue::QueueState & qs) {
+                      return sched->should_gpu_take_at(qs.depth);
+                    }))
+              producer_done_seen = true;
+          }
           continue;
         }
         C.batch.clear();
