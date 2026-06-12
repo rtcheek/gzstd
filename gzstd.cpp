@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.62";
+static constexpr const char * GZSTD_VERSION = "0.13.63";
 //
 // Architecture overview:
 //
@@ -373,6 +373,7 @@ struct Options {
   bool mmap_user_set = false;     // true if --mmap/--no-mmap given (suppresses the pre-6.4 large-file auto-gate)
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool direct_read = false;       // --direct-read: O_DIRECT input — bypass the page cache (no populate/evict)
+  size_t read_threads = 0;        // --read-threads N: buffered pooled-reader threads (0 = auto: 3)
   bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
@@ -724,6 +725,8 @@ static void print_help()
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
 "  --direct-read       read input with O_DIRECT, bypassing the page cache\n"
+"  --read-threads N    buffered pooled-reader threads (default: auto = 3;\n"
+"                      ignored for O_DIRECT/mmap/stdin)\n"
 "                      (one-pass speedup + honest cold reads; implies fread)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
@@ -837,6 +840,7 @@ static void print_help_long()
 "     --mmap / --no-mmap force the choice and override the auto-gate.\n"
 "\n"
 "  --direct-read    (default: off)\n"
+"  --read-threads   (default: 0 = auto)\n"
 "     Read the input with O_DIRECT: transfer straight from disk into an\n"
 "     aligned buffer, BYPASSING the page cache entirely (it neither\n"
 "     reads from nor populates it).  Two uses: (1) a one-pass speedup —\n"
@@ -1334,6 +1338,7 @@ struct Meter {
   std::atomic< uint64_t > reader_io_ns      { 0 };
   std::atomic< uint64_t > reader_copy_ns    { 0 };
   std::atomic< uint64_t > reader_blocked_ns { 0 };
+  std::atomic< int >      reader_threads    { 1 }; // io/copy/blocked sum across these
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
 
@@ -5874,11 +5879,24 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 // kernel gate, --no-mmap): mmap remains strictly better where it's safe
 // (zero copies vs one), and O_DIRECT remains better only when the device's
 // raw rate beats its buffered rate (not true on the Gen5 box: 4.5 vs 9.6).
+// n_readers > 1 (buffered pool mode only, v0.13.63): N threads pull chunk
+// indices from a shared atomic counter and pread the SAME fd.  This breaks
+// the single-thread cold-destination copy wall (~3.5 GB/s node-local on the
+// dual-socket server) while keeping the device stream effectively
+// sequential — the offsets arrive near-ordered, so one readahead context
+// keeps working and the device never sees the O_DIRECT-style random
+// contention (probe on that box: 2 buffered dd streams = 17.4 GB/s
+// aggregate vs 9.9 single; the O_DIRECT 1-stream rule does NOT carry over
+// to page-cache reads).  Interleaved indices — NOT partitioned file
+// regions — bound the queue's seq skew to ~N: a partitioned design floods
+// the ResultStore with distant-seq frames, exhausts FrameThrottle permits
+// and then the pool, and starves the region the writer needs (the
+// re_enqueue FIFO-invariant deadlock).  O_DIRECT always stays 1 stream.
 template <typename Emit>   // template so the lambda inlines (and -Wnonnull sees the
                            // pooled/aligned buffer as non-null)
 static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
                                Meter * m, DirectReadPool * pool, bool o_direct,
-                               Emit && emit)
+                               int n_readers, Emit && emit)
 {
   int fd = ::open(path.c_str(), O_RDONLY | (o_direct ? O_DIRECT : 0));
   if (fd < 0) return false;                 // O_DIRECT unsupported → caller falls back to fread
@@ -5888,43 +5906,72 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
 #endif
   const size_t ALIGN = 4096;
   const size_t cap = ((host_chunk + ALIGN - 1) / ALIGN) * ALIGN;
+  if (o_direct || !pool) n_readers = 1;     // O_DIRECT contends; scratch path has one buffer
+  if (n_readers < 1) n_readers = 1;
+  if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
+
   void * scratch = nullptr;                 // only used when pool == nullptr (copy path)
   if (!pool) {
     if (posix_memalign(&scratch, ALIGN, cap) != 0 || !scratch) { ::close(fd); return false; }
   }
-  off_t off = 0;
-  size_t idx = 0;
-  for (;;) {
-    int slot = -1;
-    char * buf;
-    if (pool) {                             // blocks when all bufs in flight = backpressure
-      const uint64_t a_t0 = m ? now_ns() : 0;
-      slot = pool->acquire(); buf = pool->buf(slot);
-      if (m) m->reader_blocked_ns.fetch_add(now_ns() - a_t0, std::memory_order_relaxed);
+
+  std::atomic<size_t> next_idx{0};
+  std::atomic<bool>   done{false};
+  std::atomic<bool>   io_error{false};
+  auto read_loop = [&]() {
+    for (;;) {
+      if (done.load(std::memory_order_relaxed)) break;
+      const size_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+      int slot = -1;
+      char * buf;
+      if (pool) {                           // blocks when all bufs in flight = backpressure
+        const uint64_t a_t0 = m ? now_ns() : 0;
+        slot = pool->acquire(); buf = pool->buf(slot);
+        if (m) m->reader_blocked_ns.fetch_add(now_ns() - a_t0, std::memory_order_relaxed);
+      }
+      else      { buf = static_cast<char *>(scratch); }
+      uint64_t t0 = (g_perf || m) ? now_ns() : 0;
+      ssize_t got = ::pread(fd, buf, cap, (off_t)idx * (off_t)cap);
+      if (got < 0) {
+        if (pool) pool->release(slot);
+        io_error.store(true, std::memory_order_relaxed);
+        done.store(true, std::memory_order_relaxed);
+        break;
+      }
+      if (got == 0) {                       // at/past EOF (exact-multiple end, or a
+        if (pool) pool->release(slot);      // racing thread's idx beyond the short read)
+        done.store(true, std::memory_order_relaxed);
+        break;
+      }
+      if (g_perf || m) {
+        const uint64_t r_dt = now_ns() - t0;
+        if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+        if (g_perf) { g_perf->read_ns.fetch_add(r_dt); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
+      }
+      if (m) m->read_bytes.fetch_add((uint64_t)got);
+      // emit takes ownership of `slot` in the pool path (the Task carries it and the
+      // worker releases it); the reader must not touch the buffer after this.
+      bool cont = emit(static_cast<const char *>(buf), (size_t)got, idx, slot);
+      if (!cont || (size_t)got < cap) {     // abort, or short read ⇒ this was the last chunk
+        done.store(true, std::memory_order_relaxed);
+        break;
+      }
     }
-    else      { buf = static_cast<char *>(scratch); }
-    uint64_t t0 = (g_perf || m) ? now_ns() : 0;
-    ssize_t got = ::pread(fd, buf, cap, off);   // offset & count 4 KiB-aligned
-    if (got < 0) {
-      if (pool) pool->release(slot); else free(scratch);
-      ::close(fd);
-      die_io(o_direct ? "O_DIRECT read failed (--direct-read)" : "pread failed (pooled reader)");
-    }
-    if (got == 0) { if (pool) pool->release(slot); break; }   // EOF on an exact multiple of cap
-    if (g_perf || m) {
-      const uint64_t r_dt = now_ns() - t0;
-      if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
-      if (g_perf) { g_perf->read_ns.fetch_add(r_dt); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
-    }
-    if (m) m->read_bytes.fetch_add((uint64_t)got);
-    // emit takes ownership of `slot` in the pool path (the Task carries it and the
-    // worker releases it); the reader must not touch the buffer after this.
-    bool cont = emit(static_cast<const char *>(buf), (size_t)got, idx, slot);
-    off += got; ++idx;
-    if (!cont || (size_t)got < cap) break;   // abort, or short read ⇒ EOF
+  };
+
+  if (n_readers == 1) {
+    read_loop();
+  } else {
+    std::vector<std::thread> rthr;
+    rthr.reserve((size_t)n_readers - 1);
+    for (int i = 1; i < n_readers; ++i) rthr.emplace_back(read_loop);
+    read_loop();
+    for (auto & th : rthr) th.join();
   }
   if (!pool) free(scratch);
   ::close(fd);
+  if (io_error.load(std::memory_order_relaxed))
+    die_io(o_direct ? "O_DIRECT read failed (--direct-read)" : "pread failed (pooled reader)");
   return true;
 }
 
@@ -6084,8 +6131,14 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
              + (dr_pool_ok ? ", zero-copy pool " + std::to_string(pool_n) + " buffers\n"
                            : " (pool alloc failed; copy path)\n"));
     }
+    // Buffered mode fans the kernel copy out over a few threads (the wall is
+    // the per-thread cold-destination copy, not the device — see
+    // pooled_read_chunks).  3 is enough to clear a ~10 GB/s device at the
+    // measured ~3.5 GB/s per-thread copy rate; --read-threads overrides.
+    const int n_readers = o_direct ? 1
+                        : (opt.read_threads > 0 ? (int)opt.read_threads : 3);
     return pooled_read_chunks(opt.input, host_chunk, m, dr_pool_ok ? &dr_pool : nullptr,
-      o_direct,
+      o_direct, n_readers,
       [&](const char * buf, size_t n, size_t idx, int slot) {
         if (slot >= 0) {                              // zero-copy: Task aliases the pooled buffer
           Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
@@ -6125,21 +6178,15 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     }
     reader_done = true;
   }
-  // mmap declined (--no-mmap or open failure) but the input is a regular
-  // file: buffered zero-copy pooled reads instead of the fread+copy
-  // fallback.  Same pool/view machinery as --direct-read, through the page
-  // cache.  MODERN KERNELS ONLY (same >=6.4 proxy as the mmap gate): the
-  // single reader's copy_to_user lands in a cold pool buffer (recycled 200+
-  // reads later, no cache residency, no NT stores in the kernel copier), and
-  // on the dual-socket pre-6.4 server that cold/remote-destination copy ran
-  // at 2.14 GiB/s — SLOWER than fread+assign's 5.7, whose two copies each
-  // sit in a fast regime (hot reused staging buffer at 9.6; glibc NT-store
-  // memcpy at ~14).  Measured v0.13.60/61; single-socket numactl bind
-  // recovered only 3.46.  On the >=6.4 workstation the pooled path wins
-  // +72% (--no-mmap A/B, 5.34 -> 3.10 s).  fread below serves stdin/pipes
-  // and old-kernel large files.
-  if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input)
-      && kernel_has_per_vma_locks())
+  // mmap declined (pre-6.4 kernel gate, --no-mmap, or open failure) but the
+  // input is a regular file: buffered zero-copy pooled reads instead of the
+  // fread+copy fallback.  Same pool/view machinery as --direct-read, through
+  // the page cache, with the kernel copy fanned out over a few reader
+  // threads — a SINGLE pooled reader regressed the dual-socket server to
+  // 2.14 GiB/s (cold-destination copy_to_user wall; see pooled_read_chunks
+  // and CHANGELOG v0.13.60–63) and only multi-reader clears fread+assign's
+  // 5.7 there.  fread below serves stdin/pipes only.
+  if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input))
     reader_done = run_pooled_reader(false);
   if (!reader_done)
 #endif
@@ -8084,6 +8131,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // fallback (gpu_only_cpu_fallback / hybrid CPU pool) consumes the queue,
     // so the reader always streams the whole input.
     reader_done = pooled_read_chunks(opt.input, host_chunk, m, nullptr, /*o_direct=*/true,
+      /*n_readers=*/1,
       [&](const char * buf, size_t n_host, size_t idx, int /*slot*/) {
         // Deterministic, contiguous seq by file position: only the last (highest-
         // idx) chunk is partial, so chunk idx owns [idx*subs_per_host, +n_subs).
@@ -10378,13 +10426,17 @@ int main(int argc, char ** argv)
       const uint64_t r_cp = meter.reader_copy_ns.load();
       const uint64_t r_bk = meter.reader_blocked_ns.load();
       if (r_io + r_cp + r_bk > 0) {
+        // Percentages are per reader thread (counters sum across them).
+        const double r_n = std::max(1, meter.reader_threads.load());
+        const double r_wall = wall_ns * r_n;
         char rline[192];
         std::snprintf(rline, sizeof(rline),
-          "[READER] io %.1f%% | task-copy %.1f%% | blocked-on-pool %.1f%%  (of %.2f s run)\n",
-          double(r_io) / wall_ns * 100.0, double(r_cp) / wall_ns * 100.0,
-          double(r_bk) / wall_ns * 100.0, wall_ns / 1e9);
+          "[READER] io %.1f%% | task-copy %.1f%% | blocked-on-pool %.1f%%  "
+          "(per thread, %d reader%s, %.2f s run)\n",
+          double(r_io) / r_wall * 100.0, double(r_cp) / r_wall * 100.0,
+          double(r_bk) / r_wall * 100.0, (int)r_n, r_n > 1 ? "s" : "", wall_ns / 1e9);
         vlog(V_VERBOSE, opt, rline);
-        const double r_busy = double(r_io + r_cp) / wall_ns;
+        const double r_busy = double(r_io + r_cp) / r_wall;
         if (r_busy >= 0.90)
           vlog(V_VERBOSE, opt, std::string("[READER] verdict: reader thread saturated — ")
                + (r_cp * 2 > r_io
@@ -10675,6 +10727,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--no-mmap" || a == "--mmap=off") { opt.use_mmap = false; opt.mmap_user_set = true; }
     else if (a == "--cold") opt.cold_read = true;
     else if (a == "--direct-read") opt.direct_read = true;
+    else if (parse_num_arg("read-threads", i, argc, argv, opt.read_threads)) { }
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;

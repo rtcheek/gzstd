@@ -1,11 +1,40 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.62  
+**Covers:** v0.9.50 → v0.13.63  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.63 — parallel buffered readers: fan the kernel copy out, keep the device stream sequential
+
+The v0.13.62 analysis left one lever: the buffered pooled reader's wall is
+the per-thread cold-destination copy_to_user (~3.5 GB/s node-local), not
+the device (~10 GB/s buffered).  Probe on the server confirmed page-cache
+reads parallelize where O_DIRECT contends: two simultaneous buffered dd
+streams = 17.4 GB/s aggregate (vs 9.9 single; O_DIRECT measured 1 stream
+4.5 / 4 streams 3.0 — that rule does NOT carry over).
+
+`pooled_read_chunks` now runs N reader threads (default 3, `--read-threads
+N` overrides; O_DIRECT and the scratch path stay at 1) pulling chunk
+indices from a shared atomic counter against ONE fd.  Interleaved indices
+— deliberately NOT partitioned file regions — keep the offset stream
+near-sequential (one readahead context keeps working) and bound the
+queue's seq skew to ~N.  A partitioned design would flood the ResultStore
+with distant-seq frames, exhaust FrameThrottle permits, then the pool, and
+starve the region the writer needs — the re_enqueue FIFO-invariant
+deadlock.  EOF and abort propagate via a shared done flag; each index is
+preaded by exactly one thread, so the emit set is dense and seq-exact.
+
+With the per-thread copy wall broken, the pre-6.4 kernel gate from
+v0.13.62 is removed — old-kernel large files use the multi-reader pooled
+path instead of fread+assign (which remains for stdin/pipes).  Measured
+(workstation, --no-mmap, 20 GiB warm, /dev/null, median of 3): 1 reader
+3.11 s → 3 readers **1.67 s** — within ~15% of the mmap zero-copy path.
+The `[READER]` report now prints per-thread percentages with the thread
+count.  Server expectation: ~8–10 GiB/s vs the 5.7 fread floor (and 2.14
+single-pooled); to be validated on the 432 GiB tar.
 
 ## v0.13.62 — buffered pooled reader gated to ≥6.4 kernels; cold-destination copy was the real culprit
 
