@@ -1,11 +1,37 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.65  
+**Covers:** v0.9.50 → v0.13.66  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.66 — queue floor clamped to the pooled queue's depth ceiling; gpu-only reader count fixed
+
+The first fed-pipeline server runs falsified the "hybrid loses to
+bandwidth" reading and exposed two interacting bugs:
+
+- **Hybrid (11.63 GiB/s vs cpu-only's 18.93) wasn't contention — the CPU
+  pool was locked out.**  Ratio arithmetic (gpu-only 50.23%, cpu-only
+  48.70%, hybrid 50.19%) shows the GPU took ~97% of frames.  The GPU
+  queue floor (streams × batch ≈ 900 frames) predates the pooled reader:
+  with mmap the whole file sat in the queue and the floor was harmless,
+  but the pool bounds depth at ~1500, the GPUs' batch gulps held depth
+  below the floor near-permanently, and `may_take` refused the CPU pool
+  forever.  Side effect: the starved CPU pool never accumulated EMA
+  samples, so the tail-yield never armed.  Fix: the pooled producer
+  declares its depth ceiling (`HybridSched::set_queue_depth_cap`) and
+  `update_queue_floor` clamps the floor to a quarter of it.
+- **gpu-only was reader-capped, not GPU-capped.**  Its 14.17 GiB/s run
+  used 3 readers: the auto count divided `cpu_threads`, which is 0 in
+  gpu-only mode.  Now scales from `resolve_cpu_threads` (machine
+  parallelism) regardless of mode.  The H100 pool's true ceiling is
+  ABOVE 14 GiB/s and still unmeasured — the auto-tune GiB/s figures are
+  per-stream, not pool (a misreading that fed the earlier wrong verdict).
+
+Corrected picture on the server: CPU pool ~19 GiB/s, GPU pool ≥14 — a
+correctly-scheduled hybrid should beat both.  To be measured.
 
 ## v0.13.65 — GPU/hybrid compress gets the multi-reader pooled path (was still on fread+copy)
 

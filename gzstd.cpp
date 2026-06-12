@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.65";
+static constexpr const char * GZSTD_VERSION = "0.13.66";
 //
 // Architecture overview:
 //
@@ -4181,6 +4181,13 @@ public:
     producer_done_.store(true, std::memory_order_release);
   }
 
+  // Producer with a bounded queue depth (pooled reader: pool size) declares
+  // its ceiling so update_queue_floor's clamp can engage.  0 = unbounded.
+  void set_queue_depth_cap(size_t n) {
+    queue_depth_cap_.store(n, std::memory_order_relaxed);
+    refresh_queue_floor_();
+  }
+
   // Minimum queue depth below which CPUs should not take work.
   // Reserves enough tasks for all GPU streams to fill their next batch.
   // Zero once the GPU has tail-yielded: the reservation exists to feed
@@ -4390,6 +4397,17 @@ private:
     size_t nominal = size_t(std::max(0, streams)) * batch;
     double factor = resolve_factor_();
     size_t floor = (size_t)(double(nominal) * factor + 0.5);
+    // Clamp against the producer's queue-depth ceiling (pooled reader: pool
+    // size bounds how deep the queue can ever get).  The floor predates the
+    // pooled reader, when mmap enqueued the whole file and depth was
+    // effectively unbounded — with a bounded producer, 8 devices' nominal
+    // floor (~streams×batch ≈ 900 frames vs a ~1500-buffer pool) held depth
+    // below the floor ~permanently and locked the CPU pool out of hybrid
+    // compress entirely (measured: GPU took 97% of frames, hybrid 11.6 GiB/s
+    // vs 18.9 cpu-only).  A quarter of the ceiling keeps the GPUs' next-pop
+    // reservation meaningful while guaranteeing CPUs see poppable depth.
+    const size_t cap = queue_depth_cap_.load(std::memory_order_relaxed);
+    if (cap > 0) floor = std::min(floor, cap / 4);
     gpu_queue_floor_.store(floor, std::memory_order_relaxed);
   }
 
@@ -4403,6 +4421,7 @@ private:
   std::atomic<uint64_t> gpu_taken_{0};
   std::atomic<uint64_t> cpu_bytes_{0};
   std::atomic<uint64_t> gpu_bytes_{0};
+  std::atomic<size_t>   queue_depth_cap_{0};  // producer's depth ceiling (pooled reader); 0 = unbounded
   std::chrono::steady_clock::time_point last_tick_ = std::chrono::steady_clock::now();
 };
 
@@ -8213,8 +8232,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // reader's — clamped to a quarter of available RAM (the FrameThrottle
   // bounds total in-flight output; this bounds in-flight input).
   if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input)) {
+    // Reader count scales with MACHINE parallelism, not the CPU pool:
+    // cpu_threads is 0 in gpu-only mode, which silently capped gpu-only at
+    // 3 readers (= 14.17 GiB/s measured) while the H100 pool had headroom.
+    const int hw_par = resolve_cpu_threads(opt.cpu_threads);
     const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
-                        : std::max(3, std::min(12, cpu_threads / 8));
+                        : std::max(3, std::min(12, hw_par / 8));
     const size_t cap = ((gpu_chunk + 4095) / 4096) * 4096;
     std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
     const size_t file_chunks = (!fec && fsz > 0) ? (size_t)((fsz + cap - 1) / cap)
@@ -8230,6 +8253,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                                       /*want_thp=*/kernel_has_per_vma_locks());
     if (pool_ok) {
       g_direct_read_pool = &nv_pool;
+      // Declare the depth ceiling: the queue can never hold more than
+      // pool_n frames, so the GPU queue floor must clamp below it or the
+      // CPU pool gets locked out (see update_queue_floor).
+      if (sched) sched->set_queue_depth_cap(pool_n);
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, "[POOLED-READ] buffered input (page cache + readahead), zero-copy pool "
              + std::to_string(pool_n) + " buffers\n");
