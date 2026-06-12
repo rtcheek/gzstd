@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.61";
+static constexpr const char * GZSTD_VERSION = "0.13.62";
 //
 // Architecture overview:
 //
@@ -6125,13 +6125,21 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     }
     reader_done = true;
   }
-  // mmap declined (pre-6.4 kernel gate, --no-mmap, or open failure) but the
-  // input is a regular file: buffered zero-copy pooled reads instead of the
-  // fread+copy fallback.  Same pool/view machinery as --direct-read, through
-  // the page cache — keeps the device's buffered read rate and drops the
-  // hidden per-task 16 MiB assign that halved effective intake (see
-  // pooled_read_chunks).  fread below remains only for stdin/pipes.
-  if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input))
+  // mmap declined (--no-mmap or open failure) but the input is a regular
+  // file: buffered zero-copy pooled reads instead of the fread+copy
+  // fallback.  Same pool/view machinery as --direct-read, through the page
+  // cache.  MODERN KERNELS ONLY (same >=6.4 proxy as the mmap gate): the
+  // single reader's copy_to_user lands in a cold pool buffer (recycled 200+
+  // reads later, no cache residency, no NT stores in the kernel copier), and
+  // on the dual-socket pre-6.4 server that cold/remote-destination copy ran
+  // at 2.14 GiB/s — SLOWER than fread+assign's 5.7, whose two copies each
+  // sit in a fast regime (hot reused staging buffer at 9.6; glibc NT-store
+  // memcpy at ~14).  Measured v0.13.60/61; single-socket numactl bind
+  // recovered only 3.46.  On the >=6.4 workstation the pooled path wins
+  // +72% (--no-mmap A/B, 5.34 -> 3.10 s).  fread below serves stdin/pipes
+  // and old-kernel large files.
+  if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input)
+      && kernel_has_per_vma_locks())
     reader_done = run_pooled_reader(false);
   if (!reader_done)
 #endif

@@ -1,11 +1,40 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.61  
+**Covers:** v0.9.50 → v0.13.62  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.62 — buffered pooled reader gated to ≥6.4 kernels; cold-destination copy was the real culprit
+
+v0.13.61's THP hypothesis was falsified on-box: identical 2.14 GiB/s with
+MADV_NOHUGEPAGE and THP=madvise.  The controlled experiments named the
+true mechanism:
+
+- `dd` (same file, same 16 MiB buffered reads): **9.9 GB/s** — one hot
+  reused buffer; the kernel copy lands in cache-warm lines.
+- gzstd's pool: **2.14** — 224×16 MiB of cycling buffers means every
+  pread's destination is cache-cold and recently touched by a remote
+  worker core; copy_to_user has no NT stores, so cold destinations pay
+  RFO + writeback (~3× the memory traffic).
+- `numactl --cpunodebind=0 --membind=0`: **3.46** — removes the
+  cross-socket hop (node distance 32 vs 10), recovering the NUMA share.
+  `--interleave=all`: no change (spreading coldness isn't warmth).
+- Old fread+assign's 5.7 decomposes cleanly: fread's kernel copy at 9.6
+  (hot staging buffer, the dd pattern) + assign at ~14 (glibc switches to
+  non-temporal stores for L3-sized memcpys).  Two copies, each in a fast
+  regime, beat one copy in the slowest regime.
+
+Resolution: the pooled buffered reader keeps its win where measured
+(+72%, ≥6.4-kernel workstation, --no-mmap) and is gated off on pre-6.4
+kernels (same per-VMA-locks proxy as the mmap gate), restoring
+fread+assign's 5.7 floor on the server.  Open lever for that box:
+parallel buffered readers — the O_DIRECT single-stream rule (1 stream
+4.5, 4 streams 3.0 GB/s) does NOT obviously apply to page-cache reads,
+and N readers would break the single-thread cold-copy wall (~3.5 GB/s
+local) against the device's ~10.  Needs a dual-dd probe before building.
 
 ## v0.13.61 — pooled-reader pool takes plain pages on pre-6.4 kernels (v0.13.60 regressed 2.7× on the server)
 
