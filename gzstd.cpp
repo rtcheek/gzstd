@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.66";
+static constexpr const char * GZSTD_VERSION = "0.13.67";
 //
 // Architecture overview:
 //
@@ -4397,17 +4397,27 @@ private:
     size_t nominal = size_t(std::max(0, streams)) * batch;
     double factor = resolve_factor_();
     size_t floor = (size_t)(double(nominal) * factor + 0.5);
-    // Clamp against the producer's queue-depth ceiling (pooled reader: pool
-    // size bounds how deep the queue can ever get).  The floor predates the
-    // pooled reader, when mmap enqueued the whole file and depth was
-    // effectively unbounded — with a bounded producer, 8 devices' nominal
-    // floor (~streams×batch ≈ 900 frames vs a ~1500-buffer pool) held depth
-    // below the floor ~permanently and locked the CPU pool out of hybrid
-    // compress entirely (measured: GPU took 97% of frames, hybrid 11.6 GiB/s
-    // vs 18.9 cpu-only).  A quarter of the ceiling keeps the GPUs' next-pop
-    // reservation meaningful while guaranteeing CPUs see poppable depth.
+    // The floor predates the pooled reader, when mmap enqueued the whole
+    // file and queue depth was effectively unbounded.  With a bounded
+    // producer (pool size caps depth), GPU appetite (streams × batch) can
+    // exceed the reader's supply rate so depth NEVER builds: any
+    // substantial floor then locks the CPU pool out permanently — and the
+    // AUTO mode latches (starved CPU ⇒ <5% share ⇒ factor=4 ⇒ starved CPU).
+    // Measured on the 8-GPU server (v0.13.66 floor sweep): auto 15.74
+    // GiB/s with GPU taking 92% of frames; even factor=0.5 locked at 90%;
+    // floor OFF rebalanced to 37% GPU and 18.17 GiB/s ≈ cpu-only.  The
+    // reservation has no purpose under continuous refill (GPUs pop with
+    // min_n=1 and the auto-tuner adapts batch size), so a bounded producer
+    // zeroes the AUTO floor; an explicit --hybrid-floor=nominal or
+    // --hybrid-floor-factor is honored but still clamped to a quarter of
+    // the ceiling so it cannot re-create the permanent lockout.
     const size_t cap = queue_depth_cap_.load(std::memory_order_relaxed);
-    if (cap > 0) floor = std::min(floor, cap / 4);
+    if (cap > 0) {
+      const bool user_floor =
+          opt_.hybrid_floor_factor >= 0.0 ||
+          opt_.hybrid_floor_mode != Options::HybridFloorMode::AUTO;
+      floor = user_floor ? std::min(floor, cap / 4) : 0;
+    }
     gpu_queue_floor_.store(floor, std::memory_order_relaxed);
   }
 

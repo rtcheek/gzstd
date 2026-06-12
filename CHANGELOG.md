@@ -1,11 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.66  
+**Covers:** v0.9.50 → v0.13.67  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.67 — bounded producer zeroes the AUTO queue floor; the server's compress verdict is in
+
+The v0.13.66 cap/4 clamp (376 frames) was not enough: the GPUs' combined
+appetite (16 streams × ~200 batch) exceeds the reader's ~1000 frames/s
+supply, so queue depth never builds past ANY substantial floor, and the
+AUTO mode is a latch under starvation (CPU <5% share ⇒ factor=4 ⇒ CPU
+stays at <5%).  Server floor sweep on the 432 GiB tar:
+
+| floor          | GiB/s | GPU share of frames |
+|----------------|-------|---------------------|
+| auto           | 15.74 | ~92%                |
+| factor 0.5     | 15.69 | ~90%                |
+| **off**        | 18.17 | ~37%                |
+| (cpu-only ref) | 18.93 | 0%                  |
+| (gpu-only ref) | 15.59 | 100%                |
+
+Under a continuously-refilling bounded queue the reservation is obsolete
+(GPUs pop min_n=1; the auto-tuner adapts batch size), so a bounded
+producer now zeroes the AUTO floor; explicit --hybrid-floor=nominal /
+--hybrid-floor-factor are honored, clamped to cap/4.
+
+**Compress verdict for the dual-socket 8-GPU server**: CPU pool alone
+18.9 GiB/s, H100 pool alone 15.6, both together 18.2 — the shared memory
+fabric, not either engine, is the ceiling.  GPUs add ~nothing to compress
+on this box (and with the floor fixed, no longer subtract).  The week's
+totals on this workload: 5.73 → ~18–19 GiB/s (75.5 s → ~23 s), all of it
+from the input path; engine mix was never the lever.
 
 ## v0.13.66 — queue floor clamped to the pooled queue's depth ceiling; gpu-only reader count fixed
 
