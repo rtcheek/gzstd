@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.59";
+static constexpr const char * GZSTD_VERSION = "0.13.60";
 //
 // Architecture overview:
 //
@@ -1326,6 +1326,14 @@ struct Meter {
   std::atomic< uint64_t > writer_hol_ns     { 0 }; // head-of-line: waiting while later frames sit buffered
   std::atomic< uint64_t > writer_hol_depth_ns { 0 }; // ∑ wait_ns × frames buffered behind the gap (ns·frames)
   std::atomic< uint64_t > writer_starved_ns { 0 }; // waiting with nothing buffered
+  // Reader-state accounting, mirror of the writer's (compress readers only).
+  // io = inside fread/pread; copy = duplicating bytes into tasks (zero for the
+  // mmap and pooled zero-copy readers — its presence IS the diagnosis); blocked
+  // = waiting for a pool buffer (downstream backpressure).  A reader thread
+  // near 100% of wall time in io+copy is the run's faucet.
+  std::atomic< uint64_t > reader_io_ns      { 0 };
+  std::atomic< uint64_t > reader_copy_ns    { 0 };
+  std::atomic< uint64_t > reader_blocked_ns { 0 };
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
 
@@ -5805,7 +5813,7 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
   if (ec || fsz <= MMAP_PREVMA_MAX_BYTES) return true;  // small/unknown: mmap fine
   if (opt.verbosity >= V_VERBOSE)
     vlog(V_VERBOSE, opt, "[MMAP] pre-6.4 kernel + large input ("
-         + std::to_string(size_t(fsz / ONE_MIB)) + " MiB): using fread to avoid the "
+         + std::to_string(size_t(fsz / ONE_MIB)) + " MiB): skipping mmap to avoid the "
            "mmap_lock fault-storm (override with --mmap)\n");
   return false;
 }
@@ -5836,13 +5844,28 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 // EOF short read.  Returns false if O_DIRECT couldn't be set up (caller falls back
 // to fread).  seq is the chunk index (file position): output stays ordered, RAM
 // bounded.
+//
+// o_direct == false (v0.13.60): same machinery through the PAGE CACHE — pread
+// into a pooled buffer, kernel readahead intact.  Exists because on the
+// large-memory server the fread fallback's hidden second copy (kernel→scratch,
+// then scratch→task 16 MiB assign) halved effective intake (9.6 → ~5.7 GiB/s
+// measured on a 432 GiB input) and starved 96 workers; buffered-pooled reads
+// keep the 9.6 and drop the assign.  Use it when mmap is unavailable (pre-6.4
+// kernel gate, --no-mmap): mmap remains strictly better where it's safe
+// (zero copies vs one), and O_DIRECT remains better only when the device's
+// raw rate beats its buffered rate (not true on the Gen5 box: 4.5 vs 9.6).
 template <typename Emit>   // template so the lambda inlines (and -Wnonnull sees the
                            // pooled/aligned buffer as non-null)
-static bool odirect_read_chunks(const std::string & path, size_t host_chunk,
-                                Meter * m, DirectReadPool * pool, Emit && emit)
+static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
+                               Meter * m, DirectReadPool * pool, bool o_direct,
+                               Emit && emit)
 {
-  int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+  int fd = ::open(path.c_str(), O_RDONLY | (o_direct ? O_DIRECT : 0));
   if (fd < 0) return false;                 // O_DIRECT unsupported → caller falls back to fread
+#ifdef POSIX_FADV_SEQUENTIAL
+  if (!o_direct)
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);  // widen kernel readahead
+#endif
   const size_t ALIGN = 4096;
   const size_t cap = ((host_chunk + ALIGN - 1) / ALIGN) * ALIGN;
   void * scratch = nullptr;                 // only used when pool == nullptr (copy path)
@@ -5854,17 +5877,25 @@ static bool odirect_read_chunks(const std::string & path, size_t host_chunk,
   for (;;) {
     int slot = -1;
     char * buf;
-    if (pool) { slot = pool->acquire(); buf = pool->buf(slot); }  // blocks = backpressure
+    if (pool) {                             // blocks when all bufs in flight = backpressure
+      const uint64_t a_t0 = m ? now_ns() : 0;
+      slot = pool->acquire(); buf = pool->buf(slot);
+      if (m) m->reader_blocked_ns.fetch_add(now_ns() - a_t0, std::memory_order_relaxed);
+    }
     else      { buf = static_cast<char *>(scratch); }
-    uint64_t t0 = g_perf ? now_ns() : 0;
+    uint64_t t0 = (g_perf || m) ? now_ns() : 0;
     ssize_t got = ::pread(fd, buf, cap, off);   // offset & count 4 KiB-aligned
     if (got < 0) {
       if (pool) pool->release(slot); else free(scratch);
       ::close(fd);
-      die_io("O_DIRECT read failed (--direct-read)");
+      die_io(o_direct ? "O_DIRECT read failed (--direct-read)" : "pread failed (pooled reader)");
     }
     if (got == 0) { if (pool) pool->release(slot); break; }   // EOF on an exact multiple of cap
-    if (g_perf) { g_perf->read_ns.fetch_add(now_ns() - t0); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
+    if (g_perf || m) {
+      const uint64_t r_dt = now_ns() - t0;
+      if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+      if (g_perf) { g_perf->read_ns.fetch_add(r_dt); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
+    }
     if (m) m->read_bytes.fetch_add((uint64_t)got);
     // emit takes ownership of `slot` in the pool path (the Task carries it and the
     // worker releases it); the reader must not touch the buffer after this.
@@ -6008,25 +6039,32 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   MmapRegion mmap_region;
   DirectReadPool dr_pool;   // zero-copy --direct-read buffers; outlives the workers
   bool reader_done = false;
-  // --direct-read: O_DIRECT input (bypass the page cache).  Takes precedence over
-  // mmap (mmap IS the page cache); falls through to fread if O_DIRECT can't open.
-  if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
-    // Size a zero-copy buffer pool: enough to keep every worker fed plus a read-ahead
-    // backlog, but no more than the file needs, capped so RAM stays sane (a buffer is
-    // held only from pread until the worker finishes compressing, not during write).
+  // Pooled zero-copy reader, shared by --direct-read (O_DIRECT) and the buffered
+  // fallback below.  Sizes the pool once: enough to keep every worker fed plus a
+  // read-ahead backlog, but no more than the file needs, capped so RAM stays sane
+  // (a buffer is held only from pread until the worker finishes compressing, not
+  // during write).
+  bool dr_pool_ok = false, dr_pool_tried = false;
+  auto run_pooled_reader = [&](bool o_direct) -> bool {
     const size_t cap = ((host_chunk + 4095) / 4096) * 4096;
-    std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
-    size_t file_chunks = (!fec && fsz > 0) ? (size_t)((fsz + cap - 1) / cap) : (size_t)threads;
-    size_t pool_n = std::min<size_t>((size_t)threads + 128,
-                                     std::min<size_t>(file_chunks + 1, 1024));
-    if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
-    bool pool_ok = dr_pool.init(cap, pool_n);
-    if (pool_ok) g_direct_read_pool = &dr_pool;
-    if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, std::string("[DIRECT-READ] O_DIRECT input (page cache bypassed)")
-           + (pool_ok ? ", zero-copy pool " + std::to_string(pool_n) + " buffers\n"
-                      : " (pool alloc failed; copy path)\n"));
-    reader_done = odirect_read_chunks(opt.input, host_chunk, m, pool_ok ? &dr_pool : nullptr,
+    if (!dr_pool_tried) {
+      dr_pool_tried = true;
+      std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
+      size_t file_chunks = (!fec && fsz > 0) ? (size_t)((fsz + cap - 1) / cap) : (size_t)threads;
+      size_t pool_n = std::min<size_t>((size_t)threads + 128,
+                                       std::min<size_t>(file_chunks + 1, 1024));
+      if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
+      dr_pool_ok = dr_pool.init(cap, pool_n);
+      if (dr_pool_ok) g_direct_read_pool = &dr_pool;
+      if (opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt,
+             std::string(o_direct ? "[DIRECT-READ] O_DIRECT input (page cache bypassed)"
+                                  : "[POOLED-READ] buffered input (page cache + readahead)")
+             + (dr_pool_ok ? ", zero-copy pool " + std::to_string(pool_n) + " buffers\n"
+                           : " (pool alloc failed; copy path)\n"));
+    }
+    return pooled_read_chunks(opt.input, host_chunk, m, dr_pool_ok ? &dr_pool : nullptr,
+      o_direct,
       [&](const char * buf, size_t n, size_t idx, int slot) {
         if (slot >= 0) {                              // zero-copy: Task aliases the pooled buffer
           Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
@@ -6036,7 +6074,11 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
         }
         return true;
       });
-  }
+  };
+  // --direct-read: O_DIRECT input (bypass the page cache).  Takes precedence over
+  // mmap (mmap IS the page cache); falls through to fread if O_DIRECT can't open.
+  if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input))
+    reader_done = run_pooled_reader(true);
   if (!reader_done && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
       && fs::is_regular_file(opt.input)
       && mmap_ok_for_input(opt, opt.input)
@@ -6062,23 +6104,37 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     }
     reader_done = true;
   }
+  // mmap declined (pre-6.4 kernel gate, --no-mmap, or open failure) but the
+  // input is a regular file: buffered zero-copy pooled reads instead of the
+  // fread+copy fallback.  Same pool/view machinery as --direct-read, through
+  // the page cache — keeps the device's buffered read rate and drops the
+  // hidden per-task 16 MiB assign that halved effective intake (see
+  // pooled_read_chunks).  fread below remains only for stdin/pipes.
+  if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input))
+    reader_done = run_pooled_reader(false);
   if (!reader_done)
 #endif
   {
     std::vector<char> host_in(host_chunk);
     while (true) {
-      uint64_t rd_t0 = g_perf ? now_ns() : 0;
+      uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
       size_t n = std::fread(host_in.data(), 1, host_chunk, in);
-      if (g_perf && n > 0) {
-        g_perf->read_ns.fetch_add(now_ns() - rd_t0);
-        g_perf->read_bytes_total.fetch_add(n);
+      if ((g_perf || m) && n > 0) {
+        const uint64_t r_dt = now_ns() - rd_t0;
+        if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+        if (g_perf) {
+          g_perf->read_ns.fetch_add(r_dt);
+          g_perf->read_bytes_total.fetch_add(n);
+        }
       }
       if (n == 0) break;
       if (m) m->read_bytes.fetch_add(n);
 
       Task t;
       t.seq = seq.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t c_t0 = m ? now_ns() : 0;
       t.data.assign(host_in.data(), host_in.data() + n);
+      if (m) m->reader_copy_ns.fetch_add(now_ns() - c_t0, std::memory_order_relaxed);
       queue.push(std::move(t));
     }
   }
@@ -7998,7 +8054,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // No early-abort on GPU failure: even if every GPU dies, the CPU
     // fallback (gpu_only_cpu_fallback / hybrid CPU pool) consumes the queue,
     // so the reader always streams the whole input.
-    reader_done = odirect_read_chunks(opt.input, host_chunk, m, nullptr,
+    reader_done = pooled_read_chunks(opt.input, host_chunk, m, nullptr, /*o_direct=*/true,
       [&](const char * buf, size_t n_host, size_t idx, int /*slot*/) {
         // Deterministic, contiguous seq by file position: only the last (highest-
         // idx) chunk is partial, so chunk idx owns [idx*subs_per_host, +n_subs).
@@ -8046,15 +8102,20 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   {
     std::vector<char> host_in(host_chunk);
     while (true) {
-      uint64_t rd_t0 = g_perf ? now_ns() : 0;
+      uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
       size_t n_host = std::fread(host_in.data(), 1, host_chunk, in);
-      if (g_perf && n_host > 0) {
-        g_perf->read_ns.fetch_add(now_ns() - rd_t0);
-        g_perf->read_bytes_total.fetch_add(n_host);
+      if ((g_perf || m) && n_host > 0) {
+        const uint64_t r_dt = now_ns() - rd_t0;
+        if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+        if (g_perf) {
+          g_perf->read_ns.fetch_add(r_dt);
+          g_perf->read_bytes_total.fetch_add(n_host);
+        }
       }
       if (n_host == 0) break;
       if (m) m->read_bytes.fetch_add(n_host);
       size_t off = 0;
+      const uint64_t c_t0 = m ? now_ns() : 0;
       while (off < n_host) {
         size_t sub_n = std::min(gpu_chunk, n_host - off);
         Task t;
@@ -8063,6 +8124,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         queue.push(std::move(t));
         off += sub_n;
       }
+      if (m) m->reader_copy_ns.fetch_add(now_ns() - c_t0, std::memory_order_relaxed);
     }
   }
 
@@ -10281,6 +10343,25 @@ int main(int argc, char ** argv)
 #endif
       const double healthy_window =
           2.0 * resolve_cpu_threads(opt.cpu_threads) + gpu_window;
+      // Reader line first (input before output).  Only when a counting reader
+      // ran — the mmap reader is zero-copy/near-instant and reports nothing.
+      const uint64_t r_io = meter.reader_io_ns.load();
+      const uint64_t r_cp = meter.reader_copy_ns.load();
+      const uint64_t r_bk = meter.reader_blocked_ns.load();
+      if (r_io + r_cp + r_bk > 0) {
+        char rline[192];
+        std::snprintf(rline, sizeof(rline),
+          "[READER] io %.1f%% | task-copy %.1f%% | blocked-on-pool %.1f%%  (of %.2f s run)\n",
+          double(r_io) / wall_ns * 100.0, double(r_cp) / wall_ns * 100.0,
+          double(r_bk) / wall_ns * 100.0, wall_ns / 1e9);
+        vlog(V_VERBOSE, opt, rline);
+        const double r_busy = double(r_io + r_cp) / wall_ns;
+        if (r_busy >= 0.90)
+          vlog(V_VERBOSE, opt, std::string("[READER] verdict: reader thread saturated — ")
+               + (r_cp * 2 > r_io
+                      ? "the per-task copy is a large share; a zero-copy read path would raise the ceiling\n"
+                      : "the device/syscall path is the faucet; a faster source or read path is the only lever\n"));
+      }
       char wline[224];
       std::snprintf(wline, sizeof(wline),
         "[WRITER] write-path busy %.1f%% | head-of-line %.1f%% (avg %.0f frames stuck) | "

@@ -1,11 +1,49 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.59  
+**Covers:** v0.9.50 → v0.13.60  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.60 — buffered zero-copy reader: the fread fallback's hidden copy halved intake
+
+Diagnosed live on the server with the v0.13.59 writer accounting plus the
+-vvv breakdown: compressing a 432 GiB tar, the run reported upstream-bound
+with 96 workers averaging only ~17.5 busy, and the arithmetic exposed the
+reader thread as ~99% saturated — 45 s inside fread (9.6 GiB/s) plus ~30 s
+of UNTIMED `t.data.assign` copying every byte a second time.  Effective
+intake 1/(1/9.6 + 1/~15) ≈ 5.7 GiB/s — exactly the observed throughput.
+The fread fallback is the default on that box because the pre-6.4-kernel
+mmap gate declines large files.  `--direct-read` was not the answer there:
+its O_DIRECT ceiling (~4.1–4.5 GB/s, matching the old dd measurement)
+loses to the page cache's buffered 9.6 GiB/s with readahead.
+
+Fix: `odirect_read_chunks` generalized to `pooled_read_chunks(o_direct)` —
+the same single-stream pooled zero-copy reader, with O_DIRECT now just an
+open flag.  When mmap is declined (kernel gate, --no-mmap, open failure)
+and the input is a regular file, the cpu-only compress reader now preads
+buffered (readahead intact, POSIX_FADV_SEQUENTIAL) straight into pooled
+buffers and emits view tasks: one kernel→buffer copy instead of two, and
+the pool acquire doubles as producer backpressure.  fread+assign remains
+only for stdin/pipes.  Measured (workstation, --no-mmap, 20 GiB warm
+input, /dev/null, median of 3 alternating): 5.34 s → **3.10 s (+72%
+throughput, 3.66 → 6.30 GiB/s)**.  Path ranking per box: mmap (zero
+copies) where the kernel allows; buffered-pooled (one copy) otherwise;
+O_DIRECT only when the device's raw rate beats its buffered rate.
+
+Not yet covered: the GPU/hybrid reader keeps its copy fallback — its
+host-chunk-to-subchunk split means one pooled buffer would back many view
+tasks, and slot recycling is single-owner (`direct_buf`); needs a
+refcounted release before the pool can serve it.  Decompress readers
+untouched (compressed input is 3–30× smaller; far less reader-bound).
+
+Also: reader-state accounting (input mirror of v0.13.59's writer states,
+compress readers only): `[READER] io | task-copy | blocked-on-pool` at -v
+with its own verdict; task-copy > 0 IS the double-copy diagnosis.  The
+nvcomp fread fallback is instrumented too, so hybrid runs on the server
+will now show the copy share directly.
 
 ## v0.13.59 — writer-state accounting: every run reports whether it pegged the writer
 
