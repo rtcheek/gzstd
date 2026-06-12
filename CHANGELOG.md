@@ -1,11 +1,28 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.63  
+**Covers:** v0.9.50 → v0.13.64  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.64 — reader count scales with the worker pool; pool sized for the readers
+
+Server sweep of `--read-threads` on the 432 GiB tar: 3 → 7.46 GiB/s,
+6 → 15.61, 8 → 16.28, 12 → **18.74** (23.1 s; the same file took 75.5 s
+at v0.13.59).  Two saturation signals emerged in the [READER] line: per-
+thread io fell (96.5 → 75.4%) while blocked-on-pool climbed (0 → 15.3%) —
+the readers were starving for pool buffers, not hitting the device.
+Caveat recorded: by the 12-reader run much of the file sat in the 1.5 TB
+page cache, so absolute numbers are cache-flattered; the scaling shape
+and the blocked-on-pool growth are the trustworthy signals.
+
+Auto reader count is now `clamp(threads/8, 3, 12)` — 3 on the 24-thread
+workstation (measured optimal), 12 on the 96-worker server (best
+measured) — and the pool gains 32 buffers per reader (512 MiB each step;
+the threads+128 sizing predates multi-reader).  `--read-threads N` still
+overrides.
 
 ## v0.13.63 — parallel buffered readers: fan the kernel copy out, keep the device stream sequential
 

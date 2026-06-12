@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.63";
+static constexpr const char * GZSTD_VERSION = "0.13.64";
 //
 // Architecture overview:
 //
@@ -725,8 +725,8 @@ static void print_help()
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
 "  --direct-read       read input with O_DIRECT, bypassing the page cache\n"
-"  --read-threads N    buffered pooled-reader threads (default: auto = 3;\n"
-"                      ignored for O_DIRECT/mmap/stdin)\n"
+"  --read-threads N    buffered pooled-reader threads (default: auto, scales\n"
+"                      with -T, 3..12; ignored for O_DIRECT/mmap/stdin)\n"
 "                      (one-pass speedup + honest cold reads; implies fread)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
@@ -6114,11 +6114,23 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   bool dr_pool_ok = false, dr_pool_tried = false;
   auto run_pooled_reader = [&](bool o_direct) -> bool {
     const size_t cap = ((host_chunk + 4095) / 4096) * 4096;
+    // Buffered mode fans the kernel copy out over several threads (the wall
+    // is the per-thread cold-destination copy at ~2.5-3.5 GB/s, not the
+    // device — see pooled_read_chunks).  Auto count scales with the worker
+    // pool: measured optima are 3 on a 24-thread box and 12 on a 96-worker
+    // dual-socket server (7.46 -> 18.74 GiB/s from 3 -> 12 there);
+    // --read-threads overrides.
+    const int n_readers = o_direct ? 1
+                        : (opt.read_threads > 0 ? (int)opt.read_threads
+                                                : std::max(3, std::min(12, threads / 8)));
     if (!dr_pool_tried) {
       dr_pool_tried = true;
       std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
       size_t file_chunks = (!fec && fsz > 0) ? (size_t)((fsz + cap - 1) / cap) : (size_t)threads;
-      size_t pool_n = std::min<size_t>((size_t)threads + 128,
+      // 32 extra buffers per reader: at 12 readers the original
+      // threads+128 sizing showed 15% blocked-on-pool — the readers, not
+      // the device, were starving for buffers.
+      size_t pool_n = std::min<size_t>((size_t)threads + 128 + 32 * (size_t)n_readers,
                                        std::min<size_t>(file_chunks + 1, 1024));
       if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
       dr_pool_ok = dr_pool.init(cap, pool_n,
@@ -6131,12 +6143,6 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
              + (dr_pool_ok ? ", zero-copy pool " + std::to_string(pool_n) + " buffers\n"
                            : " (pool alloc failed; copy path)\n"));
     }
-    // Buffered mode fans the kernel copy out over a few threads (the wall is
-    // the per-thread cold-destination copy, not the device — see
-    // pooled_read_chunks).  3 is enough to clear a ~10 GB/s device at the
-    // measured ~3.5 GB/s per-thread copy rate; --read-threads overrides.
-    const int n_readers = o_direct ? 1
-                        : (opt.read_threads > 0 ? (int)opt.read_threads : 3);
     return pooled_read_chunks(opt.input, host_chunk, m, dr_pool_ok ? &dr_pool : nullptr,
       o_direct, n_readers,
       [&](const char * buf, size_t n, size_t idx, int slot) {
