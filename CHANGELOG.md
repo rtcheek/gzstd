@@ -1,11 +1,42 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.58  
+**Covers:** v0.9.50 → v0.13.59  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.59 — writer-state accounting: every run reports whether it pegged the writer
+
+Motivation: runs that grind below the output device's capability are
+maddening to triage because the candidate causes — sink saturated, frame
+stragglers stalling the in-order writer, or upstream compute/read too slow —
+all look identical from the outside (disk not pegged, machine "busy").
+Observed concretely on the server benchmarks: cpu-only compress pegs the
+~3 GiB/s NVMe at 3.3–3.5 GiB/s while hybrid grinds at ~2.0 with strictly
+more hardware in play.
+
+The output side is now modeled as three mutually exclusive states, measured
+always (two timestamps per wait segment / write call — negligible):
+
+- **write-path busy** — inside physical write/seek calls (AsyncWritePool
+  worker).  ≥85% of wall time means the sink is the bottleneck; mission
+  accomplished, nothing upstream can help.
+- **head-of-line** — writer idle waiting for the next in-sequence frame
+  while LATER frames sit buffered: a straggler (slow GPU batch, unlucky
+  frame) is capping output, the pipeline's fault.
+- **starved** — writer idle with nothing buffered at all: compute/read
+  simply hasn't produced; the engines are the bottleneck.
+
+The buckets accrue on different threads (busy on the AIO worker, the waits
+on the writer thread), so percentages overlap and need not sum to 100; each
+is independently meaningful against run wall time.  At `-v` each run prints
+the three percentages plus a one-line interpreted verdict
+(`writer_verdict()`), e.g. `stragglers — writer idled waiting for the next
+in-order frame while later frames sat buffered`.  These three signals are
+the regime detectors a future --adapt mode would switch on (io-bound /
+pipeline-bound / compute-bound).
 
 ## v0.13.58 — hybrid compress: slow GPU no longer sets the makespan (tail-aware intake)
 

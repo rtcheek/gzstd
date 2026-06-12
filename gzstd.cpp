@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.58";
+static constexpr const char * GZSTD_VERSION = "0.13.59";
 //
 // Architecture overview:
 //
@@ -1315,8 +1315,46 @@ struct Meter {
   std::atomic< uint64_t > total_out    { 0 };  // expected total output bytes (set when known)
   std::atomic< bool >     total_out_final { false }; // true once reader is done and total_out won't grow
   mutable std::atomic< uint64_t > read_elapsed_ms { 0 }; // elapsed ms when read completed (frozen rate)
+  // Writer-state accounting (always on; reported at -v).  Answers "why isn't
+  // the output device pegged?" — at any instant the output side is either
+  // physically writing, idle because the next in-sequence frame is missing
+  // while LATER frames sit buffered (a straggler: the pipeline's fault), or
+  // idle with nothing buffered at all (upstream compute/read can't keep up).
+  // disk_ns accrues on the AsyncWritePool worker; the two wait buckets accrue
+  // on the writer thread, so percentages overlap and don't sum to 100.
+  std::atomic< uint64_t > writer_disk_ns    { 0 }; // inside physical write/seek calls
+  std::atomic< uint64_t > writer_hol_ns     { 0 }; // head-of-line: waiting while later frames sit buffered
+  std::atomic< uint64_t > writer_hol_depth_ns { 0 }; // ∑ wait_ns × frames buffered behind the gap (ns·frames)
+  std::atomic< uint64_t > writer_starved_ns { 0 }; // waiting with nothing buffered
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
+
+// Interpret the Meter's writer-state accounting into a one-line diagnosis.
+// Inputs are fractions of run wall time; they accrue on different threads,
+// so they overlap and need not sum to 1.  Mirrors the manual triage order:
+// a pegged sink is success; otherwise whichever idle state dominates names
+// the culprit.  avg_stuck (mean frames buffered behind the missing one
+// during head-of-line waits) separates a true straggler from healthy
+// out-of-order jitter: N parallel workers buffer up to ~N frames in normal
+// operation, so only depths well beyond the in-flight window indicate a
+// pipeline pathology — small-depth HOL means the missing frame is simply
+// still being computed, i.e. upstream-bound.  (Groundwork for --adapt:
+// these are the regime signals.)
+static const char * writer_verdict(double busy, double hol, double starved,
+                                   double avg_stuck, double healthy_window)
+{
+  if (busy >= 0.80)
+    return "output device saturated — the sink is the bottleneck (optimal for this device)";
+  if (hol >= 0.25 && avg_stuck > healthy_window)
+    return "stragglers — writer idled while far more frames sat buffered than the "
+           "in-flight window; pipeline ordering, not the device, capped output";
+  if (hol + starved >= 0.25)
+    return "upstream-bound — compute/read could not fill the writer; the engines, "
+           "not the device, capped output";
+  if (busy >= 0.50)
+    return "output device mostly busy — near sink-limited";
+  return "no dominant writer-side state — output was capped upstream of the result store";
+}
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
 // Format a byte count as a human-readable string (e.g. "3.14 GiB").
 static void human_bytes(double x, char * buf, size_t n)
@@ -3510,7 +3548,7 @@ private:
       // Write all buffers (last buffer's final block always written to ensure file length)
       for (size_t bi = 0; bi < work.size(); ++bi) {
         auto & buf = work[bi];   // FrameBuf (shared_ptr<vector<char>>)
-        uint64_t w_t0 = g_perf ? now_ns() : 0;
+        uint64_t w_t0 = (g_perf || meter_) ? now_ns() : 0;
         bool is_last = (bi == work.size() - 1);
         if (!write_sparse(buf->data(), buf->size(), is_last)) {
           // Clear writing_ and surface the error before returning, so a
@@ -3524,9 +3562,13 @@ private:
           cv_consumer_.notify_one();
           return;
         }
-        if (g_perf) {
-          g_perf->write_ns.fetch_add(now_ns() - w_t0);
-          g_perf->write_bytes_total.fetch_add(buf->size());
+        if (g_perf || meter_) {
+          const uint64_t w_dt = now_ns() - w_t0;
+          if (meter_) meter_->writer_disk_ns.fetch_add(w_dt, std::memory_order_relaxed);
+          if (g_perf) {
+            g_perf->write_ns.fetch_add(w_dt);
+            g_perf->write_bytes_total.fetch_add(buf->size());
+          }
         }
         // wrote_bytes is now updated incrementally within write_sparse()
         // Release one frame permit: writer made progress, blocked workers may unblock.
@@ -3647,10 +3689,25 @@ static void writer_thread(FILE * out, ResultStore & results,
       results.drain_slots_locked();
       if (results.data.count(results.next_to_write) != 0) break;
       waited = true;
+      // Classify this wait for the Meter's writer-state accounting: if any
+      // LATER frame is already buffered, the writer is head-of-line blocked
+      // on a straggler (pipeline ordering); if nothing is buffered at all,
+      // upstream simply hasn't produced (starved).  Snapshot at sleep time.
+      const bool seg_hol = !results.data.empty();
+      const uint64_t seg_t0 = m ? now_ns() : 0;
       // Use timed wait to detect potential deadlocks: if all workers are done
       // but the next expected frame never arrives, something is wrong.
       if (results.workers_done) {
         results.cv.wait_for(lk, std::chrono::seconds(5));
+        if (m) {
+          const uint64_t seg = now_ns() - seg_t0;
+          (seg_hol ? m->writer_hol_ns : m->writer_starved_ns)
+              .fetch_add(seg, std::memory_order_relaxed);
+          // Depth at wake: frames buffered behind the gap while we waited.
+          if (seg_hol)
+            m->writer_hol_depth_ns.fetch_add(seg * (uint64_t)results.data.size(),
+                                             std::memory_order_relaxed);
+        }
         results.drain_slots_locked();
         all_done = results.producer_done
                 && results.workers_done
@@ -3668,6 +3725,15 @@ static void writer_thread(FILE * out, ResultStore & results,
         }
       } else {
         results.cv.wait(lk);
+        if (m) {
+          const uint64_t seg = now_ns() - seg_t0;
+          (seg_hol ? m->writer_hol_ns : m->writer_starved_ns)
+              .fetch_add(seg, std::memory_order_relaxed);
+          // Depth at wake: frames buffered behind the gap while we waited.
+          if (seg_hol)
+            m->writer_hol_depth_ns.fetch_add(seg * (uint64_t)results.data.size(),
+                                             std::memory_order_relaxed);
+        }
       }
       results.drain_slots_locked();
       all_done = results.producer_done
@@ -10186,6 +10252,45 @@ int main(int argc, char ** argv)
       vlog(V_VERBOSE, opt, "[O_DIRECT] finalize took " + std::to_string(int(finalize_ms)) + " ms\n");
     if (sync_ms > 100)
       vlog(V_VERBOSE, opt, "[FSYNC] took " + std::to_string(int(sync_ms)) + " ms\n");
+  }
+
+  // Writer-state report: did this run peg the writer, and if not, whose
+  // fault was it?  Always measured (the counters are cheap), printed at -v.
+  // See the Meter comments for the three-state model.
+  if (opt.verbosity >= V_VERBOSE && opt.mode != Mode::TEST) {
+    auto wdt = std::chrono::steady_clock::now() - meter.t0;
+    const double wall_ns =
+        (double)std::chrono::duration_cast<std::chrono::nanoseconds>(wdt).count();
+    if (wall_ns > 0) {
+      const double busy    = double(meter.writer_disk_ns.load())    / wall_ns;
+      const double hol     = double(meter.writer_hol_ns.load())     / wall_ns;
+      const double starved = double(meter.writer_starved_ns.load()) / wall_ns;
+      const uint64_t hol_ns = meter.writer_hol_ns.load();
+      const double avg_stuck = hol_ns > 0
+          ? double(meter.writer_hol_depth_ns.load()) / double(hol_ns) : 0.0;
+      // Healthy in-flight window: N workers legitimately buffer up to ~N
+      // out-of-order frames; GPU batches land tens-to-hundreds at once, so
+      // allow ~2 batches when GPUs are in play (the user's pin if given,
+      // else the auto-tuner's typical settle point).  Crude — refine when
+      // --adapt consumes these signals.
+      double gpu_window = 0.0;
+#ifdef HAVE_NVCOMP
+      if (!opt.cpu_only)
+        gpu_window = 2.0 * double(opt.gpu_batch_user_set ? opt.gpu_batch_cap
+                                                         : (size_t)128);
+#endif
+      const double healthy_window =
+          2.0 * resolve_cpu_threads(opt.cpu_threads) + gpu_window;
+      char wline[224];
+      std::snprintf(wline, sizeof(wline),
+        "[WRITER] write-path busy %.1f%% | head-of-line %.1f%% (avg %.0f frames stuck) | "
+        "starved %.1f%%  (of %.2f s run)\n",
+        busy * 100.0, hol * 100.0, avg_stuck, starved * 100.0, wall_ns / 1e9);
+      vlog(V_VERBOSE, opt, wline);
+      vlog(V_VERBOSE, opt,
+           std::string("[WRITER] verdict: ")
+           + writer_verdict(busy, hol, starved, avg_stuck, healthy_window) + "\n");
+    }
   }
 
 
