@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.60";
+static constexpr const char * GZSTD_VERSION = "0.13.61";
 //
 // Architecture overview:
 //
@@ -2568,7 +2568,19 @@ static DirectWriter * g_direct_writer = nullptr;
 #ifndef _WIN32
 class DirectReadPool {
 public:
-  bool init(size_t buf_size, size_t n_bufs) {
+  // want_thp: the MADV_HUGEPAGE + sparse-prefault dance below was built to
+  // merge O_DIRECT DMA segments, and on a modern kernel it also speeds the
+  // buffered pooled reader (huge-page-backed copy_to_user: 3.10 s vs 3.85 s
+  // plain on the Gen3 workstation).  On pre-6.4 kernels it is poison for
+  // buffered mode: THP doesn't engage, the sparse prefault leaves 1 page per
+  // 2 MiB mapped, and every copy faults into a THP-eligible VMA (compaction
+  // attempts on a fragmented box) — measured 2.14 GiB/s vs plain fread's 9.6
+  // on the 256-core server.  Callers pass want_thp = o_direct (DMA always
+  // needs it) || kernel >= 6.4.  The !want_thp path takes MADV_NOHUGEPAGE
+  // explicitly (system THP=always must not re-enable the pathology) and
+  // prefaults everything with a memset — deterministic, zero faults during
+  // reads, no THP anywhere.
+  bool init(size_t buf_size, size_t n_bufs, bool want_thp) {
     buf_size_ = buf_size;
     // Allocate the WHOLE pool as one big region (not n_bufs small ones) and slice it.
     // This is what cuts the O_DIRECT DMA segment count: many small posix_memalign
@@ -2586,15 +2598,23 @@ public:
     stride_ = ((buf_size + HP - 1) / HP) * HP;   // 2 MiB-aligned stride ⇒ every slice is 2 MiB-aligned
     const size_t total = stride_ * n_bufs;
     if (posix_memalign(&base_, HP, total) != 0 || !base_) { base_ = nullptr; return false; }
+    if (want_thp) {
 #ifdef MADV_HUGEPAGE
-    (void)madvise(base_, total, MADV_HUGEPAGE);  // best-effort; no-op if THP is disabled
+      (void)madvise(base_, total, MADV_HUGEPAGE);  // best-effort; no-op if THP is disabled
 #endif
-    // Pre-fault one byte per 2 MiB page via the normal write-fault path, which DOES
-    // back a 2 MiB-aligned MADV_HUGEPAGE region with a huge page.  Necessary because
-    // O_DIRECT's get_user_pages would otherwise fault the buffer in as 4 KiB pages
-    // (THP never engages) and we'd keep the fragmented ~340 KiB-request behaviour.
-    volatile char * vp = static_cast<volatile char *>(base_);
-    for (size_t o = 0; o < total; o += HP) vp[o] = 0;
+      // Pre-fault one byte per 2 MiB page via the normal write-fault path, which DOES
+      // back a 2 MiB-aligned MADV_HUGEPAGE region with a huge page.  Necessary because
+      // O_DIRECT's get_user_pages would otherwise fault the buffer in as 4 KiB pages
+      // (THP never engages) and we'd keep the fragmented ~340 KiB-request behaviour.
+      volatile char * vp = static_cast<volatile char *>(base_);
+      for (size_t o = 0; o < total; o += HP) vp[o] = 0;
+    } else {
+      // Old-kernel buffered mode: plain pages, fully prefaulted (see init comment).
+#ifdef MADV_NOHUGEPAGE
+      (void)madvise(base_, total, MADV_NOHUGEPAGE);
+#endif
+      std::memset(base_, 0, total);
+    }
     bufs_.reserve(n_bufs);
     free_.reserve(n_bufs);
     for (size_t i = 0; i < n_bufs; ++i) {
@@ -6054,7 +6074,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       size_t pool_n = std::min<size_t>((size_t)threads + 128,
                                        std::min<size_t>(file_chunks + 1, 1024));
       if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
-      dr_pool_ok = dr_pool.init(cap, pool_n);
+      dr_pool_ok = dr_pool.init(cap, pool_n,
+                                /*want_thp=*/o_direct || kernel_has_per_vma_locks());
       if (dr_pool_ok) g_direct_read_pool = &dr_pool;
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt,

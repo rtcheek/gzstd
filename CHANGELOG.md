@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.60  
+**Covers:** v0.9.50 → v0.13.61  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.61 — pooled-reader pool takes plain pages on pre-6.4 kernels (v0.13.60 regressed 2.7× on the server)
+
+v0.13.60's buffered pooled reader, +72% on the workstation, measured 2.14
+GiB/s on the server — 2.7× WORSE than the fread path it replaced, with the
+reader 99.7% saturated inside pread.  Working hypothesis (consistent with
+the box's documented pre-6.4 pathologies, pending on-box validation): the
+pool's MADV_HUGEPAGE + sparse one-byte-per-2 MiB prefault was built for
+O_DIRECT DMA-segment merging; under buffered reads the kernel copies into
+the buffer instead, and on that kernel THP never engages — so the sparse
+prefault leaves 1 of 512 pages mapped and every copy page-faults into a
+THP-eligible VMA, with compaction attempts on a fragmented box.
+
+The same machinery is a WIN on modern kernels (huge-page-backed
+copy_to_user: 3.10 s vs 3.85 s plain, workstation --no-mmap A/B), so it is
+gated, not removed: `DirectReadPool::init(want_thp)` keeps the THP
+prefault for O_DIRECT (DMA always needs it) and for buffered mode on
+kernels ≥ 6.4 (per-VMA-locks check as the vintage proxy); older kernels
+get MADV_NOHUGEPAGE explicitly (system THP=always must not re-enable the
+pathology) plus a full memset prefault — deterministic, zero faults during
+reads.  Workstation verified at parity (3.08–3.13 s); server expectation
+is fread-class or better (≥ 5.7, target ~9 GiB/s), to be validated.
 
 ## v0.13.60 — buffered zero-copy reader: the fread fallback's hidden copy halved intake
 
