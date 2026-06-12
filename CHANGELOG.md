@@ -1,11 +1,41 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.64  
+**Covers:** v0.9.50 → v0.13.65  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.65 — GPU/hybrid compress gets the multi-reader pooled path (was still on fread+copy)
+
+The first "fed pipeline" hybrid run on the server exposed the scoping gap:
+the v0.13.63 multi-reader only served cpu-only compress; hybrid still ran
+the single fread+assign reader and capped at 6.11 GiB/s while cpu-only did
+~17 ([READER] said it directly: 1 reader, task-copy 33.8%).
+
+Wiring it needed two things the CPU path didn't:
+
+- **One pool buffer per Task, no refcount.**  The host-chunk→gpu_chunk
+  subchunk split (one read backing many tasks) was an fread-efficiency
+  artifact; the pooled reader simply preads at gpu_chunk granularity, so
+  the existing single-owner slot release (`direct_buf`) works unchanged
+  and seq == chunk idx stays dense.
+- **Slot recycling on every GPU input lifecycle.**  Hybrid keeps batch
+  inputs alive for rescue and previously never released them on success
+  (owned vectors freed via destructor; pool slots would leak → reader
+  starvation → hang).  Releases added at: batch fully delivered (both
+  completion paths), the delivered-prefix of a mid-delivery throw (the
+  rescue handoff erases those frames), and the rescue worker after
+  recompression.  gpu-only keeps its existing release-after-H2D.
+
+Pool sizing for the GPU path: cpu_threads + 32/reader + 1024 (GPU batches
+hold slots from pop to delivery), clamped to file size and a quarter of
+MemAvailable; the plain-pages prefault is capped at 4 GiB (beyond that,
+first-touch faults amortize — MADV_NOHUGEPAGE already prevents the toxic
+THP attempts).  Verified on the 2-GPU workstation: hybrid and gpu-only
+--no-mmap round-trip clean through the pool (1250 frames through a ~1150-
+slot pool — a single leaked slot would hang it).
 
 ## v0.13.64 — reader count scales with the worker pool; pool sized for the readers
 

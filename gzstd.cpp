@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.64";
+static constexpr const char * GZSTD_VERSION = "0.13.65";
 //
 // Architecture overview:
 //
@@ -2614,11 +2614,15 @@ public:
       volatile char * vp = static_cast<volatile char *>(base_);
       for (size_t o = 0; o < total; o += HP) vp[o] = 0;
     } else {
-      // Old-kernel buffered mode: plain pages, fully prefaulted (see init comment).
+      // Old-kernel buffered mode: plain pages, prefaulted (see init comment).
 #ifdef MADV_NOHUGEPAGE
       (void)madvise(base_, total, MADV_NOHUGEPAGE);
 #endif
-      std::memset(base_, 0, total);
+      // Prefault capped at 4 GiB: the GPU-path pool can reach tens of GiB
+      // and a full memset costs seconds of startup.  Beyond the cap, plain
+      // 4 KiB first-touch faults amortize fine — it was the THP allocation
+      // attempts that were toxic, and MADV_NOHUGEPAGE prevents those.
+      std::memset(base_, 0, std::min<size_t>(total, size_t(4) << 30));
     }
     bufs_.reserve(n_bufs);
     free_.reserve(n_bufs);
@@ -4842,6 +4846,9 @@ static void cpu_worker_rescue(
       st.out_bytes += csz;
       st.comp_ms  += ms;
     }
+    // Recycle the input — rescued tasks can carry a pooled-reader slot
+    // (direct_buf); without this the slot leaks and the readers starve.
+    t.release_input();
   }
 }
 
@@ -7245,6 +7252,11 @@ static void gpu_worker(
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
             C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
           }
+          // Hybrid keeps inputs alive for rescue; the whole batch delivered,
+          // so recycle them now (pool slot / view / owned buffer alike).
+          // Without this, pooled-reader slots leak and the readers starve.
+          if (rescue)
+            for (size_t i = 0; i < C.filled; ++i) C.batch[i].release_input();
           double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
           double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
           if (g_perf) {
@@ -7405,6 +7417,10 @@ static void gpu_worker(
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
             C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
           }
+          // Hybrid keeps inputs alive for rescue; batch fully delivered —
+          // recycle now (see the async completion path).
+          if (rescue)
+            for (size_t i = 0; i < C.filled; ++i) C.batch[i].release_input();
           double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
           if (g_perf) {
             g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
@@ -7566,9 +7582,14 @@ static void gpu_worker(
           // will be written (the writer releases their permits) — rescuing
           // them again would burn CPU on duplicates and leak their rescue
           // permits.  Rescue only the undelivered tail.
-          if (C.delivered > 0 && C.delivered <= C.batch.size())
+          if (C.delivered > 0 && C.delivered <= C.batch.size()) {
+            // Delivered frames won't be rescued — recycle their inputs here
+            // (the success-path release never ran for a mid-delivery throw),
+            // or their pooled-reader slots leak.
+            for (size_t i = 0; i < C.delivered; ++i) C.batch[i].release_input();
             C.batch.erase(C.batch.begin(),
                           C.batch.begin() + (ptrdiff_t)C.delivered);
+          }
           if (!C.batch.empty()) {
             const int held = (int)C.batch.size();
             if (rescue) {
@@ -8123,6 +8144,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   const size_t gpu_chunk = std::min(host_chunk, GPU_SUBCHUNK_MAX);
 #ifndef _WIN32
   MmapRegion mmap_region;
+  DirectReadPool nv_pool;   // buffered zero-copy pool; must outlive all workers
   bool reader_done = false;
   // --direct-read: O_DIRECT input (bypass page cache); splits each host chunk into
   // gpu_chunk subchunks like the other readers.  Precedence over mmap; falls
@@ -8179,6 +8201,48 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       g_perf->read_bytes_total.fetch_add(off);
     }
     reader_done = true;
+  }
+  // mmap declined (pre-6.4 gate, --no-mmap, open failure), regular file:
+  // multi-thread buffered pooled reads at GPU-CHUNK granularity — one pool
+  // buffer per Task, so the single-owner slot release works unchanged (the
+  // host-chunk/subchunk split was an fread-efficiency artifact; pooled
+  // preads don't need it, and seq == chunk idx stays dense).  Slots are
+  // recycled on the batch-success, partial-rescue, and rescue-worker paths
+  // (v0.13.65) and by CPU workers as before.  GPU batches hold slots from
+  // pop to delivery, so the pool is sized far larger than the cpu-only
+  // reader's — clamped to a quarter of available RAM (the FrameThrottle
+  // bounds total in-flight output; this bounds in-flight input).
+  if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input)) {
+    const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
+                        : std::max(3, std::min(12, cpu_threads / 8));
+    const size_t cap = ((gpu_chunk + 4095) / 4096) * 4096;
+    std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
+    const size_t file_chunks = (!fec && fsz > 0) ? (size_t)((fsz + cap - 1) / cap)
+                                                 : (size_t)cpu_threads;
+    size_t pool_n = std::min<size_t>(
+        (size_t)cpu_threads + 32 * (size_t)n_readers + 1024,  // CPU pool + reader lead + GPU window
+        file_chunks + 1);
+    const uint64_t ram_avail = get_available_ram_bytes();
+    if (ram_avail > 0)
+      pool_n = std::min<size_t>(pool_n, std::max<size_t>(8, (size_t)(ram_avail / 4 / cap)));
+    if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
+    const bool pool_ok = nv_pool.init(cap, pool_n,
+                                      /*want_thp=*/kernel_has_per_vma_locks());
+    if (pool_ok) {
+      g_direct_read_pool = &nv_pool;
+      if (opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt, "[POOLED-READ] buffered input (page cache + readahead), zero-copy pool "
+             + std::to_string(pool_n) + " buffers\n");
+      reader_done = pooled_read_chunks(opt.input, gpu_chunk, m, &nv_pool,
+        /*o_direct=*/false, n_readers,
+        [&](const char * buf, size_t n, size_t idx, int slot) {
+          Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
+          queue.push(std::move(t));
+          return true;
+        });
+      if (!reader_done) g_direct_read_pool = nullptr;  // open failed; fread takes over
+    }
+    // pool alloc failure: fall through to fread+copy below.
   }
   if (!reader_done)
 #endif
@@ -8254,6 +8318,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   for (auto & th : rescue_pool) th.join();
   if (!cpu_pool.empty())
     for (auto & th : cpu_pool) th.join();
+#ifndef _WIN32
+  g_direct_read_pool = nullptr;  // all release() callers joined; safe to drop the pool
+#endif
 
   // Signal writer that all workers are done
   {
