@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.68";
+static constexpr const char * GZSTD_VERSION = "0.13.69";
 //
 // Architecture overview:
 //
@@ -8954,7 +8954,21 @@ static void gpu_decomp_worker(
         //     batches waste H2D/D2H overhead and poison the auto-tuner's
         //     throughput measurement).
         const bool locked_batch = shared_tune && shared_tune->locked.load();
-        const size_t decomp_min_batch = locked_batch
+        // gpu-only has no CPU relief valve for the in-order writer's
+        // head-of-line frame: hybrid's CPU pool pops one low-seq frame at a
+        // time, but rescue threads only fire on GPU failure.  A locked
+        // full-batch wait in gpu-only lets streams sequester every throttle
+        // permit (the budget is sized FROM device×streams×batch, so GPU
+        // demand can drain the whole pool via the upfront acquire(pop_n)),
+        // and the writer then wedges behind a head-of-line frame no stream
+        // can pop — CONFIRMED on the 8-GPU server: -d --gpu-only
+        // --gpu-batch=64 --gpu-streams=16 hangs at ~74% (hybrid completes).
+        // So in gpu-only, treat --gpu-batch as a CAP, not a hard floor:
+        // reuse the unlocked soft minimum so streams grab whatever is
+        // queued and release the excess permits (handled just below)
+        // instead of blocking on a full batch.  Hybrid keeps the honored
+        // full-batch wait — its CPU pool prevents the wedge.
+        const size_t decomp_min_batch = (locked_batch && !opt.gpu_only)
             ? pop_n
             : std::min<size_t>(pop_n, 4);
         // Acquire frame permits BEFORE gpu_wants_data to avoid deadlock.

@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=217
-$EXTENSIVE && EXPECTED_TESTS=294
+EXPECTED_TESTS=218
+$EXTENSIVE && EXPECTED_TESTS=295
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1339,12 +1339,39 @@ if has_gpu 2>/dev/null; then
   else
     fail "gpu-only pooled slots, frames > pool" "exit $rc / mismatch"
   fi
+
+  # --- DECOMPRESS wedge (v0.13.69): locked high batch × many streams,
+  # gpu-only.  Confirmed hang on an 8-GPU server: 128 streams each acquire
+  # pop_n permits upfront and block on a full locked batch, draining the
+  # throttle (sized FROM device×streams×batch) so the in-order writer wedges
+  # behind a head-of-line frame.  gpu-only has no CPU relief valve (hybrid
+  # does — and does NOT hang).  Fix: gpu-only treats --gpu-batch as a cap,
+  # not a hard floor.  Many-frame archive (chunk-size=1) ensures streams
+  # actually compete.  On a small GPU the wedge may not trigger (VRAM-fit
+  # shrinks demand); the canary still guards the no-hang invariant.
+  "$GZSTD" -k -f --cpu-only --chunk-size=1 \
+    "$TMPDIR/pooltest.bin" -o "$TMPDIR/pool-dwedge.zst" 2>/dev/null
+  t0=$(now_ms); rc=0
+  run_bounded "$POOL_TEST_TIMEOUT" "$TMPDIR/pool-dwedge.log" \
+    "$GZSTD" -d -k -f --gpu-only --gpu-batch=64 --gpu-streams=16 \
+    "$TMPDIR/pool-dwedge.zst" -o "$TMPDIR/pool-dwedge.dec" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "gpu-only decomp locked batch × 16 streams" "TIMED OUT — permit-sequester deadlock"
+  elif [[ $rc -eq 0 ]] && files_match "$TMPDIR/pooltest.bin" "$TMPDIR/pool-dwedge.dec"; then
+    pass "gpu-only decomp locked batch × 16 streams" "round-trip OK"
+  elif [[ $rc -eq 5 ]]; then
+    pass "gpu-only decomp locked batch × 16 streams" "EXIT_GPU_FAIL (GPU too small)"
+  else
+    fail "gpu-only decomp locked batch × 16 streams" "exit $rc / mismatch"
+  fi
 else
   skip "locked batch × 16 streams, bounded queue" "no GPU"
   skip "hybrid pooled slots, frames > pool" "no GPU"
   skip "gpu-only pooled slots, frames > pool" "no GPU"
+  skip "gpu-only decomp locked batch × 16 streams" "no GPU"
 fi
-rm -f "$TMPDIR"/pool-*.zst "$TMPDIR"/pool-*.dec "$TMPDIR"/pool-*.log "$TMPDIR/pooltest.bin"
+rm -f "$TMPDIR"/pool-*.zst "$TMPDIR"/pool-*.dec "$TMPDIR"/pool-*.log "$TMPDIR/pool-dwedge."* "$TMPDIR/pooltest.bin"
 
 # ============================================================
 # 20. Stress tests

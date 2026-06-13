@@ -1,9 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.68  
+**Covers:** v0.9.50 → v0.13.69  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.69 — deadlock: gpu-only DECOMPRESS with locked --gpu-batch × many streams
+
+The v0.13.68 fix covered compress; probing its decompress analog found a
+real but DIFFERENT deadlock.  Confirmed on the server: `-d --gpu-only
+--gpu-batch=64 --gpu-streams=16` on a many-frame archive hangs at ~74%
+(must ^C); the same flags with `--hybrid` complete cleanly.
+
+Mechanism — classic permit / head-of-line, not the v0.13.68
+pool-exhaustion: each of 128 streams (8 dev × 16) does `bp->acquire(pop_n)`
+upfront, then blocks waiting for a FULL locked batch.  The throttle budget
+is sized FROM `device × streams × batch`, so GPU demand can consume the
+entire permit pool; the in-order writer then wedges behind a head-of-line
+frame that no stream can pop.  Hybrid survives because its CPU workers are
+a fine-grained relief valve (they pop one low-seq frame at a time);
+gpu-only has none (rescue threads fire only on GPU failure).
+
+Fix: in gpu-only decompress, a locked `--gpu-batch` becomes a CAP, not a
+hard floor — reuse the unlocked soft minimum (`min(pop_n, 4)`), so streams
+take whatever is queued and release the excess permits (the worker already
+does this) instead of sequestering a full batch.  Hybrid keeps the honored
+full-batch wait.  One-line predicate change (`locked_batch && !opt.gpu_only`).
+
+Could NOT be reproduced on the 2-GPU workstation (VRAM-fit shrinks
+per-stream demand on 10 GiB cards; 2 devices don't open deep enough
+head-of-line gaps), so correctness was verified locally (round-trip + full
+suite) and the deadlock cure is to be confirmed on the server.  Adds a
+gpu-only decompress wedge canary to the bounded-queue test section.
 
 ---
 
