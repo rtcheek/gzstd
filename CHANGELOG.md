@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.67  
+**Covers:** v0.9.50 → v0.13.68  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.68 — deadlock: locked --gpu-batch × many streams wedges under a bounded queue
+
+Reproduced on the server: `--gpu-streams=16 --gpu-batch=64` hung at 45%
+(^C needed).  Mechanism: a user-pinned batch makes streams wait for FULL
+batches in pop_batch_greedy, and each stream acquires its FrameThrottle
+permits BEFORE blocking (that order prevents a different deadlock).  128
+streams × VRAM-fit ~20 frames ≈ 2,560 permits sequestered by sleeping
+streams; the bounded queue (pool 1,504) can rarely present 16–25
+consecutive frames past 96 CPU workers, in-flight output accumulates
+until the 8,576-permit throttle exhausts, CPUs can't pop the frames the
+writer needs, the writer can't release permits — circular wait.  Same
+disease as the v0.13.67 floor lockout: a blocking reservation sized
+against a queue that can no longer back it.
+
+Guard: when aggregate locked demand (active streams × pop_n) exceeds
+half the queue's depth ceiling, full-batch waits relax to min_n=1 with a
+one-time warning — the user's batch remains the pop CAP.  Auto-tuned
+(unlocked) runs already use min_n=1 and were never exposed.  Note: the
+decompress path's bounded queue + locked batches has the same
+theoretical hazard (its bound is TaskQueue max_depth, not the pool);
+not yet plumbed — locked decompress batches there remain unguarded.
 
 ## v0.13.67 — bounded producer zeroes the AUTO queue floor; the server's compress verdict is in
 

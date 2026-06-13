@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.67";
+static constexpr const char * GZSTD_VERSION = "0.13.68";
 //
 // Architecture overview:
 //
@@ -4317,6 +4317,12 @@ public:
   bool any_gpu_active() const {
     return active_gpu_streams_.load(std::memory_order_relaxed) > 0;
   }
+  int active_gpu_streams() const {
+    return active_gpu_streams_.load(std::memory_order_relaxed);
+  }
+  size_t queue_depth_cap() const {
+    return queue_depth_cap_.load(std::memory_order_relaxed);
+  }
 
 private:
   const Options & opt_;
@@ -7132,7 +7138,29 @@ static void gpu_worker(
         // serialize behind a single producer.  pop_batch_greedy still returns
         // early at end-of-queue regardless (no deadlock).
         const bool locked_batch = shared_tune && shared_tune->locked.load();
-        const size_t comp_min_batch = locked_batch ? pop_n : 1;
+        size_t comp_min_batch = locked_batch ? pop_n : 1;
+        // Deadlock guard: a locked full-batch wait blocks while HOLDING this
+        // batch's throttle permits.  Under a bounded queue (pooled reader),
+        // the streams' aggregate locked demand can exceed the depth the
+        // queue can ever present; the sleeping streams then sequester
+        // enough permits to exhaust the throttle, CPUs can't pop the frames
+        // the writer needs, and the run wedges (measured on the 8-GPU
+        // server: --gpu-streams=16 --gpu-batch=64 → 128 streams × VRAM-fit
+        // ~20 ≈ 2560 held permits, hang at 45%).  When aggregate locked
+        // demand exceeds half the queue's depth ceiling, relax to min_n=1 —
+        // the user's batch stays as the pop CAP.
+        if (locked_batch && sched) {
+          const size_t dcap = sched->queue_depth_cap();
+          const size_t streams_n = (size_t)std::max(1, sched->active_gpu_streams());
+          if (dcap > 0 && streams_n * pop_n * 2 > dcap) {
+            comp_min_batch = 1;
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+              vlog(V_DEFAULT, opt,
+                   "[GPU] locked --gpu-batch × streams exceeds queue capacity; "
+                   "relaxing full-batch waits to avoid deadlock (batch stays the cap)\n");
+          }
+        }
         if (!queue->pop_batch_greedy(pop_n, C.batch, comp_min_batch)) {
           if (sched) sched->gpu_got_data();
           if (bp) bp->release((int)pop_n);  // release unused permits

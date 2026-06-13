@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=213
-$EXTENSIVE && EXPECTED_TESTS=290
+EXPECTED_TESTS=217
+$EXTENSIVE && EXPECTED_TESTS=294
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1240,6 +1240,111 @@ else
   skip "hybrid batch=64 streams=4 (throttle)" "no GPU"
   skip "gpu-only decomp batch=1 streams=64" "no GPU"
 fi
+
+# ============================================================
+# Bounded-queue (pooled reader) regressions — v0.13.60–68 class.
+# --no-mmap forces the buffered pooled reader, whose pool BOUNDS queue
+# depth (on pre-6.4 kernels it is the default for large files).  Two
+# failure modes live here, both of which present as a hang:
+#   1. Locked --gpu-batch × many streams: sleeping streams hold throttle
+#      permits while waiting for full batches the bounded queue can never
+#      present (the v0.13.68 wedge: 128 streams ≈ 2,560 sequestered
+#      permits, hang at 45%).
+#   2. Pooled-slot leaks: every GPU input lifecycle (batch success,
+#      partial-rescue, rescue worker, trivial-skip re-enqueue) must
+#      recycle its DirectReadPool slot; one missed release path starves
+#      the readers once frames-in-file > pool slots.
+# pooltest.bin is sized so frame count EXCEEDS the pool on any box
+# (cpu pool ≈ threads+128+96; gpu pool adds +1024): at --chunk-size=1
+# its 1536 frames overflow both even at 256 threads.  Half zeros / half
+# random also routes some frames through the trivial-skip path.
+# ============================================================
+section "Bounded-queue pooled-reader regressions"
+
+POOL_TEST_TIMEOUT=120
+spin "pooltest.bin (1.5 GiB, half zero / half random)"
+dd if=/dev/zero    bs=1M count=768 2>/dev/null  > "$TMPDIR/pooltest.bin"
+dd if=/dev/urandom bs=1M count=768 2>/dev/null >> "$TMPDIR/pooltest.bin"
+spin_done
+
+# --- CPU pooled reader: frames ≫ pool slots (slot recycle canary) ---
+t0=$(now_ms); rc=0
+run_bounded "$POOL_TEST_TIMEOUT" "$TMPDIR/pool-cpu.log" \
+  "$GZSTD" -k -f --cpu-only --no-mmap --chunk-size=1 \
+  "$TMPDIR/pooltest.bin" -o "$TMPDIR/pool-cpu.zst" || rc=$?
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+if [[ $rc -eq 124 ]]; then
+  fail "cpu-only pooled reader, frames > pool" "TIMED OUT — slot leak regression"
+elif [[ $rc -eq 0 ]] \
+     && "$GZSTD" -d -k -f --cpu-only "$TMPDIR/pool-cpu.zst" -o "$TMPDIR/pool-cpu.dec" 2>/dev/null \
+     && files_match "$TMPDIR/pooltest.bin" "$TMPDIR/pool-cpu.dec"; then
+  pass "cpu-only pooled reader, frames > pool" "round-trip OK"
+else
+  fail "cpu-only pooled reader, frames > pool" "exit $rc / mismatch"
+fi
+
+if has_gpu 2>/dev/null; then
+  # --- The v0.13.68 wedge repro: locked batch × many streams, bounded queue ---
+  t0=$(now_ms); rc=0
+  log="$TMPDIR/pool-wedge.log"
+  run_bounded "$POOL_TEST_TIMEOUT" "$log" \
+    "$GZSTD" -k -f --hybrid --no-mmap --chunk-size=1 \
+    --gpu-batch=64 --gpu-streams=16 \
+    "$TMPDIR/pooltest.bin" -o "$TMPDIR/pool-wedge.zst" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "locked batch × 16 streams, bounded queue" "TIMED OUT — permit-sequester deadlock"
+  elif [[ $rc -eq 0 ]] \
+       && "$GZSTD" -d -k -f --cpu-only "$TMPDIR/pool-wedge.zst" -o "$TMPDIR/pool-wedge.dec" 2>/dev/null \
+       && files_match "$TMPDIR/pooltest.bin" "$TMPDIR/pool-wedge.dec"; then
+    pass "locked batch × 16 streams, bounded queue" "round-trip OK"
+  elif [[ $rc -eq 5 ]]; then
+    pass "locked batch × 16 streams, bounded queue" "EXIT_GPU_FAIL (GPU too small)"
+  else
+    fail "locked batch × 16 streams, bounded queue" "exit $rc"
+  fi
+
+  # --- Hybrid slot lifecycle: success + rescue + trivial-skip releases ---
+  t0=$(now_ms); rc=0
+  run_bounded "$POOL_TEST_TIMEOUT" "$TMPDIR/pool-hyb.log" \
+    "$GZSTD" -k -f --hybrid --no-mmap --chunk-size=1 \
+    "$TMPDIR/pooltest.bin" -o "$TMPDIR/pool-hyb.zst" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "hybrid pooled slots, frames > pool" "TIMED OUT — slot leak regression"
+  elif [[ $rc -eq 0 ]] \
+       && "$GZSTD" -d -k -f --cpu-only "$TMPDIR/pool-hyb.zst" -o "$TMPDIR/pool-hyb.dec" 2>/dev/null \
+       && files_match "$TMPDIR/pooltest.bin" "$TMPDIR/pool-hyb.dec"; then
+    pass "hybrid pooled slots, frames > pool" "round-trip OK"
+  elif [[ $rc -eq 5 ]]; then
+    pass "hybrid pooled slots, frames > pool" "EXIT_GPU_FAIL (GPU too small)"
+  else
+    fail "hybrid pooled slots, frames > pool" "exit $rc / mismatch"
+  fi
+
+  # --- gpu-only slot lifecycle: release-after-H2D + re-enqueue releases ---
+  t0=$(now_ms); rc=0
+  run_bounded "$POOL_TEST_TIMEOUT" "$TMPDIR/pool-gpu.log" \
+    "$GZSTD" -k -f --gpu-only --no-mmap --chunk-size=1 \
+    "$TMPDIR/pooltest.bin" -o "$TMPDIR/pool-gpu.zst" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 124 ]]; then
+    fail "gpu-only pooled slots, frames > pool" "TIMED OUT — slot leak regression"
+  elif [[ $rc -eq 0 ]] \
+       && "$GZSTD" -d -k -f --cpu-only "$TMPDIR/pool-gpu.zst" -o "$TMPDIR/pool-gpu.dec" 2>/dev/null \
+       && files_match "$TMPDIR/pooltest.bin" "$TMPDIR/pool-gpu.dec"; then
+    pass "gpu-only pooled slots, frames > pool" "round-trip OK"
+  elif [[ $rc -eq 5 ]]; then
+    pass "gpu-only pooled slots, frames > pool" "EXIT_GPU_FAIL (GPU too small)"
+  else
+    fail "gpu-only pooled slots, frames > pool" "exit $rc / mismatch"
+  fi
+else
+  skip "locked batch × 16 streams, bounded queue" "no GPU"
+  skip "hybrid pooled slots, frames > pool" "no GPU"
+  skip "gpu-only pooled slots, frames > pool" "no GPU"
+fi
+rm -f "$TMPDIR"/pool-*.zst "$TMPDIR"/pool-*.dec "$TMPDIR"/pool-*.log "$TMPDIR/pooltest.bin"
 
 # ============================================================
 # 20. Stress tests
