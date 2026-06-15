@@ -1,9 +1,41 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.69  
+**Covers:** v0.9.50 → v0.13.70  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.70 — decompress reader-state accounting (-v); groundwork for parallelizing the decompress reader
+
+Toward a "multi-reader" decompress path: first, make the decompress reader
+measurable, because its architecture differs fundamentally from compress.
+The compress reader slices the input at fixed byte offsets, so N threads
+grab independent chunk indices trivially.  The decompress reader
+(`stream_frames_to_queue`) must PARSE variable-length frame boundaries
+sequentially — frame N+1's start is unknown until frame N's header is
+walked (`ZSTD_findFrameCompressedSize`) — so N independent parsers aren't
+safe without a frame index (the zstd magic can appear inside payload).
+
+`stream_frames_to_queue` now feeds the same Meter reader-state counters the
+compress path uses, with a new `parse` bucket: `[READER] io | parse |
+task-copy | blocked-downstream` at -v.  io = read syscall; parse =
+frame-boundary walk; task-copy = the per-frame `assign` out of the parse
+buffer; blocked-downstream = `queue.push()` stalling on the bounded queue
+(which means the GPU/CPU consumers, not the reader, are the faucet).  The
+verdict distinguishes a saturated reader (and which sub-component to attack
+— copy → zero-copy frame reader, parse → needs an index, io → faster
+source) from a reader that's merely blocked because the consumers can't
+keep up.  The `[WRITER]` three-state report (v0.13.59) already covered
+decompress — it just hadn't been exercised on a decompress run.
+
+Diagnostic-only (no behavior change).  Early local signal (tiny runs, not
+representative): parse is ~0.1% — the serial spine is NOT the bottleneck,
+so parallelizing it isn't the lever; copy slightly exceeds io.  The actual
+optimization (likely a zero-copy frame reader if knuth shows the reader is
+copy-bound, or pipelined raw-read I/O if io-bound) is to be chosen from a
+real-workload -v run on the server.
 
 ---
 

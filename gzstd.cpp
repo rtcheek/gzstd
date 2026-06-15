@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.69";
+static constexpr const char * GZSTD_VERSION = "0.13.70";
 //
 // Architecture overview:
 //
@@ -1330,15 +1330,19 @@ struct Meter {
   std::atomic< uint64_t > writer_hol_ns     { 0 }; // head-of-line: waiting while later frames sit buffered
   std::atomic< uint64_t > writer_hol_depth_ns { 0 }; // ∑ wait_ns × frames buffered behind the gap (ns·frames)
   std::atomic< uint64_t > writer_starved_ns { 0 }; // waiting with nothing buffered
-  // Reader-state accounting, mirror of the writer's (compress readers only).
-  // io = inside fread/pread; copy = duplicating bytes into tasks (zero for the
-  // mmap and pooled zero-copy readers — its presence IS the diagnosis); blocked
-  // = waiting for a pool buffer (downstream backpressure).  A reader thread
-  // near 100% of wall time in io+copy is the run's faucet.
+  // Reader-state accounting, mirror of the writer's.  io = inside fread/pread;
+  // parse = finding frame boundaries (decompress only — ZSTD_findFrameCompressedSize
+  // / getFrameContentSize; zero for compress, which slices at fixed offsets);
+  // copy = duplicating bytes into tasks (zero for the mmap and pooled zero-copy
+  // readers — its presence IS the diagnosis); blocked = waiting for downstream
+  // capacity (a pool buffer on compress, a bounded-queue push on decompress).
+  // A reader near 100% of wall in io+parse+copy is the run's faucet; near 100%
+  // in blocked means the CONSUMERS are the faucet and the reader is starved out.
   std::atomic< uint64_t > reader_io_ns      { 0 };
+  std::atomic< uint64_t > reader_parse_ns   { 0 };
   std::atomic< uint64_t > reader_copy_ns    { 0 };
   std::atomic< uint64_t > reader_blocked_ns { 0 };
-  std::atomic< int >      reader_threads    { 1 }; // io/copy/blocked sum across these
+  std::atomic< int >      reader_threads    { 1 }; // io/parse/copy/blocked sum across these
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
 };
 
@@ -5311,6 +5315,7 @@ static size_t stream_frames_to_queue(
   size_t max_frame_decomp = 0;
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   *fallback = false;
+  if (m) m->reader_threads.store(1, std::memory_order_relaxed);  // single sequential splitter
 
   // Read buffer with offset-based tracking to avoid per-iteration shifts.
   // We compact (memmove) only when the unconsumed tail is too small to
@@ -5380,11 +5385,15 @@ static size_t stream_frames_to_queue(
       buf.resize(buf_len + READ_CHUNK);
 
     // Read more data from input (O_DIRECT bounce when --direct-read, else fread)
-    uint64_t rd_t0 = g_perf ? now_ns() : 0;
+    uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
     size_t n = read_chunk(buf.data() + buf_len);
-    if (g_perf && n > 0) {
-      g_perf->read_ns.fetch_add(now_ns() - rd_t0);
-      g_perf->read_bytes_total.fetch_add(n);
+    if ((g_perf || m) && n > 0) {
+      const uint64_t r_dt = now_ns() - rd_t0;
+      if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+      if (g_perf) {
+        g_perf->read_ns.fetch_add(r_dt);
+        g_perf->read_bytes_total.fetch_add(n);
+      }
     }
     buf_len += n;
     if (n == 0) eof = true;
@@ -5412,8 +5421,11 @@ static size_t stream_frames_to_queue(
         }
       }
 
-      // Try to find the compressed frame size
+      // Try to find the compressed frame size (the sequential parse spine —
+      // each frame's blocks must be walked to locate the next frame's start).
+      uint64_t ps_t0 = m ? now_ns() : 0;
       size_t frame_comp = ZSTD_findFrameCompressedSize(ptr, remaining);
+      if (m) m->reader_parse_ns.fetch_add(now_ns() - ps_t0, std::memory_order_relaxed);
       if (ZSTD_isError(frame_comp)) {
         if (!eof) {
           // Incomplete frame data -- need to read more.
@@ -5475,10 +5487,17 @@ static size_t stream_frames_to_queue(
       // Complete frame with known sizes -- push to the queue
       Task t;
       t.seq = seq++;
-      t.data.assign(ptr, ptr + frame_comp);
+      uint64_t cp_t0 = m ? now_ns() : 0;
+      t.data.assign(ptr, ptr + frame_comp);   // copy compressed bytes out of the parse buffer
+      if (m) m->reader_copy_ns.fetch_add(now_ns() - cp_t0, std::memory_order_relaxed);
       t.decomp_size = (size_t)frame_decomp;
       if ((size_t)frame_decomp > max_frame_decomp) max_frame_decomp = (size_t)frame_decomp;
+      // push() blocks on the bounded queue when consumers can't keep up — that
+      // wait is "the consumers are the bottleneck, not the reader" (vs io/parse/
+      // copy, which are the reader itself).
+      uint64_t pb_t0 = m ? now_ns() : 0;
       queue.push(std::move(t));
+      if (m) m->reader_blocked_ns.fetch_add(now_ns() - pb_t0, std::memory_order_relaxed);
       if (m) m->total_out.fetch_add((uint64_t)frame_decomp, std::memory_order_relaxed);
 
       buf_off += frame_comp;
@@ -10575,25 +10594,38 @@ int main(int argc, char ** argv)
       // Reader line first (input before output).  Only when a counting reader
       // ran — the mmap reader is zero-copy/near-instant and reports nothing.
       const uint64_t r_io = meter.reader_io_ns.load();
+      const uint64_t r_ps = meter.reader_parse_ns.load();
       const uint64_t r_cp = meter.reader_copy_ns.load();
       const uint64_t r_bk = meter.reader_blocked_ns.load();
-      if (r_io + r_cp + r_bk > 0) {
+      if (r_io + r_ps + r_cp + r_bk > 0) {
         // Percentages are per reader thread (counters sum across them).
         const double r_n = std::max(1, meter.reader_threads.load());
         const double r_wall = wall_ns * r_n;
-        char rline[192];
+        char rline[256];
         std::snprintf(rline, sizeof(rline),
-          "[READER] io %.1f%% | task-copy %.1f%% | blocked-on-pool %.1f%%  "
+          "[READER] io %.1f%% | parse %.1f%% | task-copy %.1f%% | blocked-downstream %.1f%%  "
           "(per thread, %d reader%s, %.2f s run)\n",
-          double(r_io) / r_wall * 100.0, double(r_cp) / r_wall * 100.0,
-          double(r_bk) / r_wall * 100.0, (int)r_n, r_n > 1 ? "s" : "", wall_ns / 1e9);
+          double(r_io) / r_wall * 100.0, double(r_ps) / r_wall * 100.0,
+          double(r_cp) / r_wall * 100.0, double(r_bk) / r_wall * 100.0,
+          (int)r_n, r_n > 1 ? "s" : "", wall_ns / 1e9);
         vlog(V_VERBOSE, opt, rline);
-        const double r_busy = double(r_io + r_cp) / r_wall;
-        if (r_busy >= 0.90)
-          vlog(V_VERBOSE, opt, std::string("[READER] verdict: reader thread saturated — ")
-               + (r_cp * 2 > r_io
-                      ? "the per-task copy is a large share; a zero-copy read path would raise the ceiling\n"
-                      : "the device/syscall path is the faucet; a faster source or read path is the only lever\n"));
+        // Reader-saturated (the reader is the faucet) vs blocked-downstream
+        // (the reader is idle waiting for the GPU/CPU consumers — they are the
+        // faucet, not the reader).  Whichever dominates names the bottleneck.
+        const double r_busy    = double(r_io + r_ps + r_cp) / r_wall;
+        const double r_blocked = double(r_bk) / r_wall;
+        if (r_blocked > r_busy && r_blocked >= 0.30)
+          vlog(V_VERBOSE, opt, "[READER] verdict: reader is NOT the bottleneck — it stalls "
+               "pushing to a full queue; the decompress consumers (GPU/CPU) are the faucet\n");
+        else if (r_busy >= 0.85) {
+          const char * why =
+              (r_cp >= r_io && r_cp >= r_ps)
+                  ? "the per-frame copy dominates; a zero-copy frame reader would raise the ceiling"
+              : (r_ps >= r_io)
+                  ? "frame-boundary parsing dominates; the serial parse is the spine (needs a frame index to split)"
+                  : "the device/syscall path is the faucet; a faster source or read path is the only lever";
+          vlog(V_VERBOSE, opt, std::string("[READER] verdict: reader saturated — ") + why + "\n");
+        }
       }
       char wline[224];
       std::snprintf(wline, sizeof(wline),
