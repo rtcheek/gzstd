@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=218
-$EXTENSIVE && EXPECTED_TESTS=295
+EXPECTED_TESTS=222
+$EXTENSIVE && EXPECTED_TESTS=299
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1372,6 +1372,58 @@ else
   skip "gpu-only decomp locked batch × 16 streams" "no GPU"
 fi
 rm -f "$TMPDIR"/pool-*.zst "$TMPDIR"/pool-*.dec "$TMPDIR"/pool-*.log "$TMPDIR/pool-dwedge."* "$TMPDIR/pooltest.bin"
+
+# ============================================================
+# Parallel-prefetch decompress reader (v0.13.71)
+# The MT reader engages only for seekable regular files > 128 MiB, so the
+# other decompress tests (small files) never exercise it.  These verify
+# byte-identical round-trips for the frame/block-size relationships that
+# stress the carry/spanning logic: chunk=1 (tiny frames, ~64 per 64 MiB
+# block → heavy boundary-spanning) and chunk=128 (frames larger than a
+# block → multi-block carry).  Cross-checked against the single-threaded
+# reader (forced via --direct-read).  CPU-only, runs on all machines.
+# ============================================================
+section "Parallel-prefetch decompress reader"
+
+# Mostly incompressible so the COMPRESSED .zst (what the reader reads) clears
+# the 128 MiB MT gate; a zero run still exercises tiny trailing frames.
+spin "mtreader.bin (176 MiB, compresses > 128 MiB)"
+dd if=/dev/urandom bs=1M count=160 2>/dev/null  > "$TMPDIR/mtreader.bin"
+dd if=/dev/zero    bs=1M count=16  2>/dev/null >> "$TMPDIR/mtreader.bin"
+spin_done
+
+for cs in 1 128; do
+  "$GZSTD" -k -f --cpu-only --chunk-size=$cs "$TMPDIR/mtreader.bin" -o "$TMPDIR/mt-$cs.zst" 2>/dev/null
+  # MT path (default cpu-only decompress on a > 128 MiB regular file)
+  "$GZSTD" -d -k -f --cpu-only "$TMPDIR/mt-$cs.zst" -o "$TMPDIR/mt-$cs.dec" 2>/dev/null
+  # single-reader reference (--direct-read keeps one reader)
+  "$GZSTD" -d -k -f --cpu-only --direct-read "$TMPDIR/mt-$cs.zst" -o "$TMPDIR/sg-$cs.dec" 2>/dev/null
+  if files_match "$TMPDIR/mtreader.bin" "$TMPDIR/mt-$cs.dec" \
+     && files_match "$TMPDIR/mtreader.bin" "$TMPDIR/sg-$cs.dec"; then
+    pass "parallel reader round-trip, chunk=$cs MiB" "MT == single == source"
+  else
+    fail "parallel reader round-trip, chunk=$cs MiB" \
+         "MT match: $(files_match "$TMPDIR/mtreader.bin" "$TMPDIR/mt-$cs.dec" && echo y || echo n), single: $(files_match "$TMPDIR/mtreader.bin" "$TMPDIR/sg-$cs.dec" && echo y || echo n)"
+  fi
+done
+
+# Confirm the parallel path actually engaged (not silently single-threaded).
+if "$GZSTD" -d -k -f -v --cpu-only "$TMPDIR/mt-1.zst" -o /dev/null 2>&1 \
+     | tr '\r' '\n' | grep -q "parallel prefetch"; then
+  pass "parallel reader engaged on > 128 MiB file" "(prefetch threads active)"
+else
+  fail "parallel reader engaged on > 128 MiB file" "MT path did not engage"
+fi
+
+# --read-threads 1 must stay on the single reader.
+if "$GZSTD" -d -k -f -v --cpu-only --read-threads 1 "$TMPDIR/mt-1.zst" -o /dev/null 2>&1 \
+     | tr '\r' '\n' | grep -q "parallel prefetch"; then
+  fail "--read-threads 1 stays single-threaded" "MT engaged unexpectedly"
+else
+  pass "--read-threads 1 stays single-threaded" "(single reader)"
+fi
+
+rm -f "$TMPDIR"/mt-*.zst "$TMPDIR"/mt-*.dec "$TMPDIR"/sg-*.dec "$TMPDIR/mtreader.bin"
 
 # ============================================================
 # 20. Stress tests

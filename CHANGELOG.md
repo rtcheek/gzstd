@@ -1,9 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.70  
+**Covers:** v0.9.50 → v0.13.71  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.13.71 — parallel-prefetch decompress reader (multi-reader)
+
+The v0.13.70 accounting confirmed the decompress reader is the cap on the
+cpu-only path: on the server (432 GiB / 27685 frames) the single reader ran
+**92% saturated** (io 52.5%, parse 2.5%, task-copy 37.0%, blocked 0.3%) and
+the writer was 50% starved waiting for it, holding cpu-only decompress to
+15.1 GiB/s.  (gpu-only is 7.4 — decompress, like compress, is a cpu-only
+regime on that box, so the cpu-only reader is the lever.)
+
+Compression's N-independent-reader trick can't be copied: decompress frame
+boundaries are found by sequential parsing and the zstd magic can appear in
+payload, so there is no safe blind resync without a frame index.  Instead,
+`stream_frames_to_queue_mt`: K prefetch threads `pread` fixed 64 MiB BLOCKs
+of the file (claimed in order via a shared counter) into a bounded ring, and
+one consumer parses frames in-place and pushes them — a carry buffer bridges
+a frame (or skippable frame) that straddles a block boundary.  This
+parallelizes the dominant read I/O; the per-frame copy stays on the consumer
+(a later zero-copy pass can remove it).  Reader count scales with the box
+(`clamp(threads/8, 3, 12)`, `--read-threads N` overrides), matching compress.
+
+Conservatively gated: engaged only for a seekable regular file > 128 MiB,
+not `--direct-read` (O_DIRECT stays single-stream), whose first frame is a
+normal known-size zstd frame.  Every other case (stdin, O_DIRECT,
+unknown-size single-frame, foreign archives) stays on the single-threaded
+`stream_frames_to_queue`, which still owns all the fallback paths;
+mid-stream anomalies are a hard data error (as the single reader treats
+truncation), never a mid-stream handoff.  Validated byte-identical against
+the single reader across chunk sizes 1/4/16/64/128 MiB (frames smaller than,
+equal to, and larger than a block — exercising heavy boundary-spanning and
+the multi-block carry path), all consumers (cpu/gpu/hybrid), `--read-threads`
+1–16, and highly-compressible input.  Server speedup to be measured.
 
 ---
 

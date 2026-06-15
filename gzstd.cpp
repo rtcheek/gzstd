@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.70";
+static constexpr const char * GZSTD_VERSION = "0.13.71";
 //
 // Architecture overview:
 //
@@ -5286,6 +5286,235 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
 }
 #endif // HAVE_NVCOMP
 
+// Defined below (near decompress_nvcomp); used by the parallel reader's gate.
+static int64_t peek_first_frame_decomp_size(FILE * in);
+
+#ifndef _WIN32
+// Sentinel: stream_frames_to_queue_mt bailed before pushing anything; caller
+// must fall back to the single-threaded reader (which re-reads from offset 0).
+static constexpr size_t MT_READER_BAIL = SIZE_MAX;
+
+/*======================================================================
+ Parallel-prefetch Zstd frame producer (decompress)
+ -----------------------------------------------------------------------
+ K prefetch threads pread fixed-size BLOCKs of the file (claimed in order
+ via a shared counter) into a bounded ring; one consumer parses frames
+ in-place and pushes them.  A carry buffer bridges a frame (or skippable
+ frame) that straddles a block boundary.  This parallelizes the read I/O,
+ the dominant decompress-reader cost (v0.13.70 [READER]: io ~52%, copy
+ ~37%, parse ~2.5% on the server); the per-frame copy stays on the
+ consumer (a later zero-copy pass can remove it).
+
+ Engaged only for a seekable regular file whose first frame is a normal
+ known-size zstd frame (caller's peek).  Anything unusual mid-stream
+ (unknown content size, malformed frame) is treated as a hard data error,
+ exactly as the single-threaded reader treats truncation — it never hands
+ off mid-stream.  Returns frames pushed, or MT_READER_BAIL if it could not
+ even open the file (no frames pushed; caller uses the single reader).
+======================================================================*/
+static size_t stream_frames_to_queue_mt(
+    const std::string & path, uint64_t file_size, int n_readers,
+    TaskQueue & queue, Meter * m, const Options & opt,
+    size_t * max_frame_decomp_out, const std::atomic<bool> * abort)
+{
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return MT_READER_BAIL;
+  try_boost_io_priority(!opt.gpu_only);
+  if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
+
+  // BLOCK comfortably larger than a typical frame so most frames sit fully
+  // within one block (a straddling frame costs an extra small copy).  Frames
+  // larger than BLOCK (e.g. huge --chunk-size) just span multiple blocks via
+  // carry — correct, merely with more copying.
+  const size_t BLOCK = (size_t)64 * ONE_MIB;
+  const size_t STEP  = (size_t)4 * ONE_MIB;   // carry-growth increment
+  const size_t n_blocks = (size_t)((file_size + BLOCK - 1) / BLOCK);
+  const int    n_slots  = std::max(n_readers * 2, n_readers + 1);
+
+  struct Slot { std::vector<char> buf; size_t len = 0; size_t idx = SIZE_MAX; bool ready = false; };
+  std::vector<Slot> slots((size_t)n_slots);
+  for (auto & s : slots) s.buf.resize(BLOCK);
+
+  std::mutex mtx;
+  std::condition_variable cv_filled, cv_freed;
+  size_t consumed = 0;                 // blocks < consumed are free for reuse
+  std::atomic<size_t> next_block{0};
+  std::atomic<bool> failed{false};
+  std::string fail_msg;
+  bool stop = false;
+
+  auto prefetch = [&]() {
+    for (;;) {
+      size_t i = next_block.fetch_add(1, std::memory_order_relaxed);
+      if (i >= n_blocks) break;
+      Slot & s = slots[i % (size_t)n_slots];
+      {
+        std::unique_lock<std::mutex> lk(mtx);
+        // slot i%n last held block i-n; free once the consumer passed it
+        cv_freed.wait(lk, [&]{ return stop || consumed + (size_t)n_slots > i; });
+        if (stop) return;
+      }
+      const off_t  off  = (off_t)i * (off_t)BLOCK;
+      const size_t want = std::min(BLOCK, (size_t)(file_size - (uint64_t)off));
+      uint64_t t0 = m ? now_ns() : 0;
+      size_t got = 0;
+      bool io_err = false;
+      while (got < want) {
+        ssize_t r = ::pread(fd, s.buf.data() + got, want - got, off + (off_t)got);
+        if (r < 0)  { io_err = true; break; }
+        if (r == 0) break;            // file shrank under us; len<want flags it
+        got += (size_t)r;
+      }
+      if (m && got) { m->reader_io_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+                      m->read_bytes.fetch_add(got, std::memory_order_relaxed); }
+      {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (io_err) { failed.store(true, std::memory_order_relaxed);
+                      if (fail_msg.empty()) fail_msg = "pread failed (parallel decompress reader)";
+                      stop = true; }
+        else { s.idx = i; s.len = got; s.ready = true; }
+      }
+      cv_filled.notify_all();
+      if (io_err) { cv_freed.notify_all(); return; }
+    }
+  };
+
+  std::vector<std::thread> readers;
+  readers.reserve((size_t)n_readers);
+  for (int k = 0; k < n_readers; ++k) readers.emplace_back(prefetch);
+
+  size_t seq = 0, max_frame_decomp = 0;
+  std::vector<char> carry;            // straddling-frame bytes from prior block(s)
+  bool aborted = false;
+
+  auto fail = [&](const std::string & why) {
+    std::lock_guard<std::mutex> lk(mtx);
+    if (fail_msg.empty()) fail_msg = why;
+    failed.store(true, std::memory_order_relaxed);
+    stop = true;
+  };
+
+  auto emit = [&](const char * p, size_t fc) -> bool {
+    unsigned long long dz = ZSTD_getFrameContentSize(p, fc);
+    if (dz == ZSTD_CONTENTSIZE_UNKNOWN || dz == ZSTD_CONTENTSIZE_ERROR) {
+      fail("frame " + std::to_string(seq) + " has unknown content size (not a gzstd archive?)");
+      return false;
+    }
+    Task t; t.seq = seq++;
+    uint64_t cp = m ? now_ns() : 0;
+    t.data.assign(p, p + fc);
+    if (m) m->reader_copy_ns.fetch_add(now_ns() - cp, std::memory_order_relaxed);
+    t.decomp_size = (size_t)dz;
+    if ((size_t)dz > max_frame_decomp) max_frame_decomp = (size_t)dz;
+    uint64_t pb = m ? now_ns() : 0;
+    queue.push(std::move(t));
+    if (m) { m->reader_blocked_ns.fetch_add(now_ns() - pb, std::memory_order_relaxed);
+             m->total_out.fetch_add((uint64_t)dz, std::memory_order_relaxed); }
+    return true;
+  };
+
+  for (size_t cur = 0; cur < n_blocks && !aborted; ++cur) {
+    if (abort && abort->load(std::memory_order_acquire)) { aborted = true; break; }
+    Slot & s = slots[cur % (size_t)n_slots];
+    {
+      std::unique_lock<std::mutex> lk(mtx);
+      cv_filled.wait(lk, [&]{ return failed.load(std::memory_order_relaxed) || (s.ready && s.idx == cur); });
+      if (failed.load(std::memory_order_relaxed)) { aborted = true; break; }
+    }
+    const char * data = s.buf.data();
+    const size_t len  = s.len;
+    size_t pos = 0;
+
+    // (A) finish a frame/skippable carried from the previous block(s).
+    if (!carry.empty()) {
+      const size_t old = carry.size();
+      // Is the carried frame a skippable frame?
+      uint32_t magic = 0;
+      if (carry.size() >= 4) std::memcpy(&magic, carry.data(), 4);
+      const bool skippable = (carry.size() >= 4) && ((magic & 0xFFFFFFF0u) == 0x184D2A50u);
+      size_t appended = 0, need = 0; bool resolved = false;
+      if (skippable) {
+        // need 8 bytes for the size field, then 8 + skip_size total
+        while (carry.size() < 8 && appended < len) {
+          size_t step = std::min(STEP, len - appended);
+          carry.insert(carry.end(), data + appended, data + appended + step); appended += step;
+        }
+        if (carry.size() >= 8) {
+          uint32_t ss = 0; std::memcpy(&ss, carry.data() + 4, 4);
+          need = 8 + (size_t)ss;
+          while (carry.size() < need && appended < len) {
+            size_t step = std::min(STEP, len - appended);
+            carry.insert(carry.end(), data + appended, data + appended + step); appended += step;
+          }
+          if (carry.size() >= need) { pos = need - old; carry.clear(); resolved = true; }  // skipped
+        }
+      } else {
+        size_t fc = 0;
+        while (appended <= len) {
+          uint64_t ps = m ? now_ns() : 0;
+          fc = ZSTD_findFrameCompressedSize(carry.data(), carry.size());
+          if (m) m->reader_parse_ns.fetch_add(now_ns() - ps, std::memory_order_relaxed);
+          if (!ZSTD_isError(fc) && fc <= carry.size()) {
+            if (!emit(carry.data(), fc)) { aborted = true; }
+            pos = (fc > old) ? (fc - old) : 0; carry.clear(); resolved = true; break;
+          }
+          if (appended >= len) break;       // exhausted this block; frame spans further
+          size_t step = std::min(STEP, len - appended);
+          carry.insert(carry.end(), data + appended, data + appended + step); appended += step;
+        }
+      }
+      if (aborted) break;
+      if (!resolved) { pos = len; }         // whole block absorbed into carry; fetch next block
+    }
+
+    // (B) parse the rest of the block in place.
+    while (!aborted && pos < len) {
+      const char * p = data + pos; const size_t rem = len - pos;
+      if (rem < 4) { carry.assign(p, p + rem); break; }
+      uint32_t magic = 0; std::memcpy(&magic, p, 4);
+      if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {          // skippable frame
+        if (rem < 8) { carry.assign(p, p + rem); break; }
+        uint32_t ss = 0; std::memcpy(&ss, p + 4, 4);
+        size_t tot = 8 + (size_t)ss;
+        if (tot > rem) { carry.assign(p, p + rem); break; }  // straddles
+        pos += tot; continue;
+      }
+      uint64_t ps = m ? now_ns() : 0;
+      size_t fc = ZSTD_findFrameCompressedSize(p, rem);
+      if (m) m->reader_parse_ns.fetch_add(now_ns() - ps, std::memory_order_relaxed);
+      if (ZSTD_isError(fc) || fc > rem) { carry.assign(p, p + rem); break; }  // straddles
+      if (!emit(p, fc)) { aborted = true; break; }
+      pos += fc;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      consumed = cur + 1; s.ready = false;
+    }
+    cv_freed.notify_all();
+  }
+
+  // Tail: a non-empty carry after the last block means trailing bytes that
+  // never formed a complete frame — truncation/corruption (the single reader
+  // dies on the same condition).  A few trailing zero/pad bytes are tolerated.
+  if (!aborted && !failed.load(std::memory_order_relaxed) && carry.size() > 8)
+    fail("truncated zstd stream: " + std::to_string(carry.size())
+         + " trailing bytes after " + std::to_string(seq) + " frames");
+
+  { std::lock_guard<std::mutex> lk(mtx); stop = true; }
+  cv_freed.notify_all(); cv_filled.notify_all();
+  for (auto & th : readers) th.join();
+  ::close(fd);
+
+  if (failed.load(std::memory_order_relaxed)) {
+    std::string why; { std::lock_guard<std::mutex> lk(mtx); why = fail_msg; }
+    die_data(why.empty() ? "parallel decompress reader failed" : why);
+  }
+  if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
+  return seq;
+}
+#endif  // !_WIN32
+
 /*======================================================================
  Streaming Zstd frame producer
  -----------------------------------------------------------------------
@@ -5316,6 +5545,32 @@ static size_t stream_frames_to_queue(
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   *fallback = false;
   if (m) m->reader_threads.store(1, std::memory_order_relaxed);  // single sequential splitter
+
+#ifndef _WIN32
+  // Parallel-prefetch fast path: a seekable regular file, NOT --direct-read
+  // (O_DIRECT stays single-stream), whose first frame is a normal known-size
+  // zstd frame.  The MT reader parallelizes the dominant read I/O; anything
+  // else (stdin, O_DIRECT, unknown-size single-frame, foreign archive) stays
+  // on this single-threaded reader, which also owns every fallback path.
+  if (!opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
+    const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
+                        : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
+    std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
+    // Only worth the threads when there is real work and >1 reader; peek the
+    // first frame — known content size ⇒ a normal (gzstd) frame, MT-safe.
+    if (n_readers > 1 && !fec && fsz > (uintmax_t)(2 * 64 * ONE_MIB)
+        && peek_first_frame_decomp_size(in) >= 0) {
+      if (opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt, "[READER] parallel prefetch: " + std::to_string(n_readers)
+             + " reader threads\n");
+      size_t r = stream_frames_to_queue_mt(opt.input, (uint64_t)fsz, n_readers,
+                                           queue, m, opt, max_frame_decomp_out, abort);
+      if (r != MT_READER_BAIL) return r;
+      // bail (open failed): fall through to the single-threaded reader below
+      if (m) m->reader_threads.store(1, std::memory_order_relaxed);
+    }
+  }
+#endif
 
   // Read buffer with offset-based tracking to avoid per-iteration shifts.
   // We compact (memmove) only when the unconsumed tail is too small to
