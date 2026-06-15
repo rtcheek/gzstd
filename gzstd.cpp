@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.71";
+static constexpr const char * GZSTD_VERSION = "0.13.73";
 //
 // Architecture overview:
 //
@@ -1490,6 +1490,12 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   g_progress_active.store(true, std::memory_order_relaxed);
   using namespace std::chrono; using namespace std::chrono_literals;
   const bool is_test = (opt.mode == Mode::TEST);
+  // out% denominator (total output) isn't known upfront — for decompress it
+  // grows as the reader discovers frames, for compress it's an estimate from
+  // the running ratio — so the raw percentage can dip when the estimate
+  // jumps.  Clamp the displayed value to be monotonically non-decreasing: a
+  // brief forward stall is acceptable, going backwards is not.
+  double out_pct_floor = 0.0;
   while (!done_flag->load()) {
     std::this_thread::sleep_for(200ms);
     uint64_t in       = m->read_bytes.load();
@@ -1552,6 +1558,12 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
       out_pct = std::min(99.9, 100.0 * double(out) / std::max(1.0, estimated_total));
     } else {
       out_pct = -1.0;
+    }
+    // Monotonic clamp (see out_pct_floor declaration): never display a lower
+    // out% than already shown.  Skips the unknown (-1) state.
+    if (out_pct >= 0.0) {
+      if (out_pct < out_pct_floor) out_pct = out_pct_floor;
+      else                         out_pct_floor = out_pct;
     }
 
     if (is_test) {
@@ -5365,8 +5377,13 @@ static size_t stream_frames_to_queue_mt(
         if (r == 0) break;            // file shrank under us; len<want flags it
         got += (size_t)r;
       }
-      if (m && got) { m->reader_io_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
-                      m->read_bytes.fetch_add(got, std::memory_order_relaxed); }
+      // Timing only — NOT m->read_bytes: the decompress workers count input
+      // bytes per frame (cpu_decomp_worker / gpu workers), exactly as for the
+      // single-threaded reader.  Counting here too double-counts the input
+      // (the "423.78 GiB" display / progress-to-100%-at-half bug).
+      if (m && got) m->reader_io_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+      if (g_perf && got) { g_perf->read_ns.fetch_add(now_ns() - t0);
+                           g_perf->read_bytes_total.fetch_add(got); }
       {
         std::lock_guard<std::mutex> lk(mtx);
         if (io_err) { failed.store(true, std::memory_order_relaxed);

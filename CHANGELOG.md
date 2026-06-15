@@ -1,11 +1,46 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.71  
+**Covers:** v0.9.50 → v0.13.73  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.73 — progress bar: clamp out% monotonic (stop it going backwards)
+
+The output percentage could move backwards.  Root cause: there is no
+file-level "total decompressed size" or "frame count" in a zstd stream —
+each FRAME header carries only its own content size, so the total is known
+only after the reader has parsed every frame.  `out% = wrote_bytes /
+total_out` therefore divides by a denominator that GROWS during reading;
+when a burst of highly-compressible frames is discovered, total_out jumps
+and the percentage dips.  (The parallel reader made it more visible by
+discovering frames in fast bursts.)  Counting frames at the writer doesn't
+help — `total_frames` grows during reading too.
+
+Fix: clamp the displayed out% to be monotonically non-decreasing (track a
+floor across progress samples).  Worst case is a brief forward stall if the
+running estimate overshot, never a backward step; with the fast parallel
+reader the estimate phase is short anyway.  Considered but rejected: an
+exact compressed-domain out% (comp-bytes-written / file_size, monotonic by
+construction) — it would essentially duplicate the in% bar and costs
+per-frame memory proportional to frame count.  Cosmetic; affects only the
+live -v/--progress bar, not the final summary.
+
+## v0.13.72 — fix: parallel decompress reader double-counted input bytes
+
+v0.13.71's prefetch threads added each block to `m->read_bytes`, but the
+decompress workers ALSO count input per frame (the single-threaded reader
+relies on them and adds nothing itself).  So `-d` reported 2× the input
+("423.78 GiB =>" for a 211.89 GiB file) and the progress bar hit 100% at
+the halfway point.  (`-t` was unaffected — its summary derives the input
+size differently.)  Fix: the prefetch threads keep only the reader-state
+timing (and the -vvv g_perf totals); the workers remain the sole counter
+of `read_bytes`.  Display-only — decompressed output was always correct.
+
+Server speedup confirmed on the 432 GiB archive: gpu-only decompress
+7.37 → **14.13 GiB/s** (≈2×), cpu-only 15.12 → **18.48** (+22%), -t 18.80.
 
 ## v0.13.71 — parallel-prefetch decompress reader (multi-reader)
 
