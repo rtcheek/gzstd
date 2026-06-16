@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=222
-$EXTENSIVE && EXPECTED_TESTS=299
+EXPECTED_TESTS=224
+$EXTENSIVE && EXPECTED_TESTS=301
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1423,7 +1423,26 @@ else
   pass "--read-threads 1 stays single-threaded" "(single reader)"
 fi
 
-rm -f "$TMPDIR"/mt-*.zst "$TMPDIR"/mt-*.dec "$TMPDIR"/sg-*.dec "$TMPDIR/mtreader.bin"
+# Redirected stdin from a real file (`< file`) must engage the parallel reader
+# (fstat detects the seekable fd) AND round-trip; a pipe must NOT engage it.
+"$GZSTD" -d -k -f -v --cpu-only -c < "$TMPDIR/mt-1.zst" > "$TMPDIR/mt-redir.dec" 2>"$TMPDIR/mt-redir.log"
+if grep -q "parallel prefetch" "$TMPDIR/mt-redir.log" \
+   && files_match "$TMPDIR/mtreader.bin" "$TMPDIR/mt-redir.dec"; then
+  pass "parallel reader on redirected stdin (< file)" "(MT engaged, round-trip OK)"
+else
+  fail "parallel reader on redirected stdin (< file)" \
+       "MT: $(grep -q 'parallel prefetch' "$TMPDIR/mt-redir.log" && echo y || echo n), match: $(files_match "$TMPDIR/mtreader.bin" "$TMPDIR/mt-redir.dec" && echo y || echo n)"
+fi
+cat "$TMPDIR/mt-1.zst" | "$GZSTD" -d -k -f -v --cpu-only -c > "$TMPDIR/mt-pipe.dec" 2>"$TMPDIR/mt-pipe.log"
+if grep -q "parallel prefetch" "$TMPDIR/mt-pipe.log"; then
+  fail "pipe stays single-threaded (no fstat false-positive)" "MT engaged on a pipe"
+elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/mt-pipe.dec"; then
+  pass "pipe stays single-threaded (no fstat false-positive)" "(single reader, round-trip OK)"
+else
+  fail "pipe stays single-threaded (no fstat false-positive)" "round-trip mismatch"
+fi
+
+rm -f "$TMPDIR"/mt-*.zst "$TMPDIR"/mt-*.dec "$TMPDIR"/mt-*.log "$TMPDIR"/sg-*.dec "$TMPDIR/mtreader.bin"
 
 # ============================================================
 # 20. Stress tests

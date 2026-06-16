@@ -1,11 +1,35 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.74  
+**Covers:** v0.9.50 → v0.13.75  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.75 — parallel reads from a redirected stdin and block devices (fstat the fd)
+
+The parallel readers (compress pooled + decompress prefetch) gated on a
+NAMED regular-file argument, so `gzstd -d < big.zst` — stdin redirected
+from a real file — fell to the single-threaded reader even though fd 0 is
+fully seekable.  New `probe_preadable_input()` `fstat`s the fd instead of
+trusting the path: S_ISREG or S_ISBLK + seekable → preadable, whatever the
+fd's origin (named file, `< file` redirect, `< /dev/sdX`).  Pipes/FIFOs/
+sockets/ttys (the `tar -I gzstd` stream, process substitution, a terminal)
+are correctly rejected and stay on the sequential reader.
+
+Both readers now take an optional borrowed fd: for a redirect they pread
+the inherited stdin fd directly (positional, so it coexists with the
+buffered peek and never disturbs the FILE* position) and don't close it.
+Block devices are sized via SEEK_END (st_size is 0 for them).  --direct-read
+is excluded (it owns its single O_DIRECT stream).
+
+So `gzstd -d < big.zst` and `gzstd < big.bin` now get the same multi-reader
+speedup as the named-file form.  What still can't: `tar -I gzstd -cf
+out.tar.zst /dir` — tar generates the stream into a pipe, so the bytes
+never exist as a seekable file; fstat sees the FIFO and we stay sequential
+(correctly).  Validated byte-identical across named / `< redirect` / pipe /
+process-substitution for cpu/gpu/hybrid, both directions.
 
 ## v0.13.74 — help: separate --direct-read and --read-threads (docs only)
 

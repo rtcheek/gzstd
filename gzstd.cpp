@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.74";
+static constexpr const char * GZSTD_VERSION = "0.13.75";
 //
 // Architecture overview:
 //
@@ -5319,6 +5319,42 @@ static int64_t peek_first_frame_decomp_size(FILE * in);
 // must fall back to the single-threaded reader (which re-reads from offset 0).
 static constexpr size_t MT_READER_BAIL = SIZE_MAX;
 
+// Can we pread() the input in parallel?  fstat tells us what the fd really is,
+// regardless of how it arrived: a named regular file / block device, OR a
+// redirected stdin ("gzstd < file", "gzstd -d < file", even "< /dev/sdX") —
+// anything S_ISREG or S_ISBLK and seekable.  Pipes/FIFOs/sockets/ttys — the
+// "tar -I gzstd" stream, process substitution, a terminal — are NOT preadable
+// and return -1, so the caller stays on the sequential stream reader.
+// Returns an fd (caller closes it iff *owns) and sets *size; -1 if unpreadable.
+// --direct-read is excluded (it owns the single O_DIRECT stream itself).
+static int probe_preadable_input(const Options & opt, FILE * in,
+                                 bool * owns, uint64_t * size)
+{
+  *owns = false; *size = 0;
+  if (opt.direct_read) return -1;
+  int fd;
+  if (opt.input == "-") { fd = in ? ::fileno(in) : 0; }          // inherited stdin
+  else { fd = ::open(opt.input.c_str(), O_RDONLY); if (fd < 0) return -1; *owns = true; }
+
+  struct stat st;
+  if (::fstat(fd, &st) != 0) { if (*owns) ::close(fd); return -1; }
+  uint64_t sz = 0; bool ok = false;
+  if (S_ISREG(st.st_mode)) {
+    sz = (uint64_t)st.st_size; ok = (sz > 0);
+  } else if (S_ISBLK(st.st_mode)) {
+    // Block device: size isn't in st_size — query via SEEK_END, then restore
+    // the offset (we may be borrowing the inherited stdin fd).
+    off_t cur = ::lseek(fd, 0, SEEK_CUR);
+    off_t end = ::lseek(fd, 0, SEEK_END);
+    if (cur >= 0 && end > 0) { sz = (uint64_t)end; ok = true; ::lseek(fd, cur, SEEK_SET); }
+  }
+  // Seekability sanity — rejects anything that slipped through (ESPIPE etc.).
+  if (ok && ::lseek(fd, 0, SEEK_CUR) == (off_t)-1) ok = false;
+  if (!ok) { if (*owns) ::close(fd); return -1; }
+  *size = sz;
+  return fd;
+}
+
 /*======================================================================
  Parallel-prefetch Zstd frame producer (decompress)
  -----------------------------------------------------------------------
@@ -5338,11 +5374,10 @@ static constexpr size_t MT_READER_BAIL = SIZE_MAX;
  even open the file (no frames pushed; caller uses the single reader).
 ======================================================================*/
 static size_t stream_frames_to_queue_mt(
-    const std::string & path, uint64_t file_size, int n_readers,
+    int fd, bool owns_fd, uint64_t file_size, int n_readers,
     TaskQueue & queue, Meter * m, const Options & opt,
     size_t * max_frame_decomp_out, const std::atomic<bool> * abort)
 {
-  int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) return MT_READER_BAIL;
   try_boost_io_priority(!opt.gpu_only);
   if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
@@ -5534,7 +5569,7 @@ static size_t stream_frames_to_queue_mt(
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
   cv_freed.notify_all(); cv_filled.notify_all();
   for (auto & th : readers) th.join();
-  ::close(fd);
+  if (owns_fd) ::close(fd);   // borrowed (inherited stdin) fd: leave it open
 
   if (failed.load(std::memory_order_relaxed)) {
     std::string why; { std::lock_guard<std::mutex> lk(mtx); why = fail_msg; }
@@ -5577,27 +5612,33 @@ static size_t stream_frames_to_queue(
   if (m) m->reader_threads.store(1, std::memory_order_relaxed);  // single sequential splitter
 
 #ifndef _WIN32
-  // Parallel-prefetch fast path: a seekable regular file, NOT --direct-read
-  // (O_DIRECT stays single-stream), whose first frame is a normal known-size
-  // zstd frame.  The MT reader parallelizes the dominant read I/O; anything
-  // else (stdin, O_DIRECT, unknown-size single-frame, foreign archive) stays
-  // on this single-threaded reader, which also owns every fallback path.
-  if (!opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
-    const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
-                        : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
-    std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
-    // Only worth the threads when there is real work and >1 reader; peek the
-    // first frame — known content size ⇒ a normal (gzstd) frame, MT-safe.
-    if (n_readers > 1 && !fec && fsz > (uintmax_t)(2 * 64 * ONE_MIB)
-        && peek_first_frame_decomp_size(in) >= 0) {
-      if (opt.verbosity >= V_VERBOSE)
-        vlog(V_VERBOSE, opt, "[READER] parallel prefetch: " + std::to_string(n_readers)
-             + " reader threads\n");
-      size_t r = stream_frames_to_queue_mt(opt.input, (uint64_t)fsz, n_readers,
-                                           queue, m, opt, max_frame_decomp_out, abort);
-      if (r != MT_READER_BAIL) return r;
-      // bail (open failed): fall through to the single-threaded reader below
-      if (m) m->reader_threads.store(1, std::memory_order_relaxed);
+  // Parallel-prefetch fast path: any preadable source — a named regular
+  // file/block device OR a redirected stdin ("gzstd -d < big.zst") — whose
+  // first frame is a normal known-size zstd frame.  fstat (probe_preadable_
+  // input) decides preadability; pipes (tar -I gzstd), O_DIRECT, unknown-size
+  // single-frame, and foreign archives stay on this single-threaded reader,
+  // which also owns every fallback path.  peek runs on the FILE* (seekable
+  // here, since fstat said so); the MT reader preads absolute offsets, so the
+  // peek's position is irrelevant.
+  {
+    bool owns = false; uint64_t fsz = 0;
+    int pfd = probe_preadable_input(opt, in, &owns, &fsz);
+    if (pfd >= 0) {
+      const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
+                          : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
+      if (n_readers > 1 && fsz > (uint64_t)(2 * 64 * ONE_MIB)
+          && peek_first_frame_decomp_size(in) >= 0) {
+        if (opt.verbosity >= V_VERBOSE)
+          vlog(V_VERBOSE, opt, "[READER] parallel prefetch: " + std::to_string(n_readers)
+               + " reader threads"
+               + (opt.input == "-" ? " (stdin is a seekable file)" : "") + "\n");
+        size_t r = stream_frames_to_queue_mt(pfd, owns, fsz, n_readers,
+                                             queue, m, opt, max_frame_decomp_out, abort);
+        if (r != MT_READER_BAIL) return r;
+        if (m) m->reader_threads.store(1, std::memory_order_relaxed);
+      } else if (owns) {
+        ::close(pfd);   // not engaging MT; release the fd we opened to probe
+      }
     }
   }
 #endif
@@ -6242,9 +6283,13 @@ template <typename Emit>   // template so the lambda inlines (and -Wnonnull sees
                            // pooled/aligned buffer as non-null)
 static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
                                Meter * m, DirectReadPool * pool, bool o_direct,
-                               int n_readers, Emit && emit)
+                               int n_readers, int borrowed_fd, Emit && emit)
 {
-  int fd = ::open(path.c_str(), O_RDONLY | (o_direct ? O_DIRECT : 0));
+  // borrowed_fd >= 0: pread an already-open fd (an inherited, seekable stdin)
+  // — don't close it.  Otherwise open the path ourselves (and close at exit).
+  const bool owns_fd = (borrowed_fd < 0);
+  int fd = owns_fd ? ::open(path.c_str(), O_RDONLY | (o_direct ? O_DIRECT : 0))
+                   : borrowed_fd;
   if (fd < 0) return false;                 // O_DIRECT unsupported → caller falls back to fread
 #ifdef POSIX_FADV_SEQUENTIAL
   if (!o_direct)
@@ -6258,7 +6303,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
 
   void * scratch = nullptr;                 // only used when pool == nullptr (copy path)
   if (!pool) {
-    if (posix_memalign(&scratch, ALIGN, cap) != 0 || !scratch) { ::close(fd); return false; }
+    if (posix_memalign(&scratch, ALIGN, cap) != 0 || !scratch) { if (owns_fd) ::close(fd); return false; }
   }
 
   std::atomic<size_t> next_idx{0};
@@ -6315,7 +6360,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
     for (auto & th : rthr) th.join();
   }
   if (!pool) free(scratch);
-  ::close(fd);
+  if (owns_fd) ::close(fd);   // borrowed (inherited stdin) fd: leave it open
   if (io_error.load(std::memory_order_relaxed))
     die_io(o_direct ? "O_DIRECT read failed (--direct-read)" : "pread failed (pooled reader)");
   return true;
@@ -6458,7 +6503,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // (a buffer is held only from pread until the worker finishes compressing, not
   // during write).
   bool dr_pool_ok = false, dr_pool_tried = false;
-  auto run_pooled_reader = [&](bool o_direct) -> bool {
+  // borrowed_fd >= 0: pread that already-open fd (a seekable stdin redirect),
+  // sizing the pool from known_size; else read opt.input by path.
+  auto run_pooled_reader = [&](bool o_direct, int borrowed_fd, uint64_t known_size) -> bool {
     const size_t cap = ((host_chunk + 4095) / 4096) * 4096;
     // Buffered mode fans the kernel copy out over several threads (the wall
     // is the per-thread cold-destination copy at ~2.5-3.5 GB/s, not the
@@ -6471,8 +6518,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
                                                 : std::max(3, std::min(12, threads / 8)));
     if (!dr_pool_tried) {
       dr_pool_tried = true;
-      std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
-      size_t file_chunks = (!fec && fsz > 0) ? (size_t)((fsz + cap - 1) / cap) : (size_t)threads;
+      uint64_t fsz = known_size;
+      if (borrowed_fd < 0) { std::error_code fec; uintmax_t z = fs::file_size(opt.input, fec); fsz = fec ? 0 : (uint64_t)z; }
+      size_t file_chunks = (fsz > 0) ? (size_t)((fsz + cap - 1) / cap) : (size_t)threads;
       // 32 extra buffers per reader: at 12 readers the original
       // threads+128 sizing showed 15% blocked-on-pool — the readers, not
       // the device, were starving for buffers.
@@ -6490,7 +6538,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
                            : " (pool alloc failed; copy path)\n"));
     }
     return pooled_read_chunks(opt.input, host_chunk, m, dr_pool_ok ? &dr_pool : nullptr,
-      o_direct, n_readers,
+      o_direct, n_readers, borrowed_fd,
       [&](const char * buf, size_t n, size_t idx, int slot) {
         if (slot >= 0) {                              // zero-copy: Task aliases the pooled buffer
           Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
@@ -6504,7 +6552,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // --direct-read: O_DIRECT input (bypass the page cache).  Takes precedence over
   // mmap (mmap IS the page cache); falls through to fread if O_DIRECT can't open.
   if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input))
-    reader_done = run_pooled_reader(true);
+    reader_done = run_pooled_reader(true, -1, 0);
   if (!reader_done && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
       && fs::is_regular_file(opt.input)
       && mmap_ok_for_input(opt, opt.input)
@@ -6531,15 +6579,20 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     reader_done = true;
   }
   // mmap declined (pre-6.4 kernel gate, --no-mmap, or open failure) but the
-  // input is a regular file: buffered zero-copy pooled reads instead of the
-  // fread+copy fallback.  Same pool/view machinery as --direct-read, through
-  // the page cache, with the kernel copy fanned out over a few reader
-  // threads — a SINGLE pooled reader regressed the dual-socket server to
-  // 2.14 GiB/s (cold-destination copy_to_user wall; see pooled_read_chunks
-  // and CHANGELOG v0.13.60–63) and only multi-reader clears fread+assign's
-  // 5.7 there.  fread below serves stdin/pipes only.
-  if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input))
-    reader_done = run_pooled_reader(false);
+  // input is preadable — a named regular file/block device OR a seekable
+  // stdin redirect ("gzstd < big.bin"): buffered zero-copy pooled reads
+  // instead of the fread+copy fallback.  Same pool/view machinery as
+  // --direct-read, through the page cache, with the kernel copy fanned out
+  // over a few reader threads.  fstat (probe_preadable_input) decides;
+  // pipes (tar -I gzstd) fall through to fread below.
+  if (!reader_done) {
+    bool owns = false; uint64_t psz = 0;
+    int pfd = probe_preadable_input(opt, in, &owns, &psz);
+    if (pfd >= 0) {
+      reader_done = run_pooled_reader(false, pfd, psz);
+      if (owns) ::close(pfd);   // pooled reader borrows the fd; we opened it
+    }
+  }
   if (!reader_done)
 #endif
   {
@@ -8520,7 +8573,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // fallback (gpu_only_cpu_fallback / hybrid CPU pool) consumes the queue,
     // so the reader always streams the whole input.
     reader_done = pooled_read_chunks(opt.input, host_chunk, m, nullptr, /*o_direct=*/true,
-      /*n_readers=*/1,
+      /*n_readers=*/1, /*borrowed_fd=*/-1,
       [&](const char * buf, size_t n_host, size_t idx, int /*slot*/) {
         // Deterministic, contiguous seq by file position: only the last (highest-
         // idx) chunk is partial, so chunk idx owns [idx*subs_per_host, +n_subs).
@@ -8573,7 +8626,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // pop to delivery, so the pool is sized far larger than the cpu-only
   // reader's — clamped to a quarter of available RAM (the FrameThrottle
   // bounds total in-flight output; this bounds in-flight input).
-  if (!reader_done && opt.input != "-" && fs::is_regular_file(opt.input)) {
+  // Preadable (named regular/block file OR a seekable stdin redirect)?  fstat
+  // decides; pipes (tar -I gzstd) fall through to fread below.
+  bool dr_owns = false; uint64_t dr_sz = 0;
+  int dr_fd = reader_done ? -1 : probe_preadable_input(opt, in, &dr_owns, &dr_sz);
+  if (dr_fd >= 0) {
     // Reader count scales with MACHINE parallelism, not the CPU pool:
     // cpu_threads is 0 in gpu-only mode, which silently capped gpu-only at
     // 3 readers (= 14.17 GiB/s measured) while the H100 pool had headroom.
@@ -8581,9 +8638,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
                         : std::max(3, std::min(12, hw_par / 8));
     const size_t cap = ((gpu_chunk + 4095) / 4096) * 4096;
-    std::error_code fec; uintmax_t fsz = fs::file_size(opt.input, fec);
-    const size_t file_chunks = (!fec && fsz > 0) ? (size_t)((fsz + cap - 1) / cap)
-                                                 : (size_t)cpu_threads;
+    const size_t file_chunks = (dr_sz > 0) ? (size_t)((dr_sz + cap - 1) / cap)
+                                           : (size_t)cpu_threads;
     size_t pool_n = std::min<size_t>(
         (size_t)cpu_threads + 32 * (size_t)n_readers + 1024,  // CPU pool + reader lead + GPU window
         file_chunks + 1);
@@ -8603,7 +8659,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         vlog(V_VERBOSE, opt, "[POOLED-READ] buffered input (page cache + readahead), zero-copy pool "
              + std::to_string(pool_n) + " buffers\n");
       reader_done = pooled_read_chunks(opt.input, gpu_chunk, m, &nv_pool,
-        /*o_direct=*/false, n_readers,
+        /*o_direct=*/false, n_readers, dr_fd,
         [&](const char * buf, size_t n, size_t idx, int slot) {
           Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
           queue.push(std::move(t));
@@ -8612,6 +8668,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       if (!reader_done) g_direct_read_pool = nullptr;  // open failed; fread takes over
     }
     // pool alloc failure: fall through to fread+copy below.
+    if (dr_owns) ::close(dr_fd);   // pooled reader borrows the fd; we opened it
   }
   if (!reader_done)
 #endif
