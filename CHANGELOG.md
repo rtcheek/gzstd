@@ -1,11 +1,25 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.73  
+**Covers:** v0.9.50 → v0.13.74  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.74 — help: separate --direct-read and --read-threads (docs only)
+
+The two flags were crammed together as if related.  In the short help a
+`--direct-read` note ("one-pass speedup…") was stranded under
+`--read-threads`; in the long help they shared one header and the
+paragraph described only `--direct-read`, leaving `--read-threads`
+undocumented.  They are unrelated beyond being mutually exclusive
+(`--direct-read` is always a single O_DIRECT stream; `--read-threads` is
+parallelism for the buffered path).  Now each has its own entry:
+`--direct-read` keeps its standalone write-up (and notes it's single-stream
+/ benchmarking-oriented), and `--read-threads` gets a real description
+(parallel readers for the buffered input path, compress pooled reader +
+decompress prefetch reader, auto `clamp(threads/8,3,12)`, 1 = single).
 
 ## v0.13.73 — progress bar: clamp out% monotonic (stop it going backwards)
 

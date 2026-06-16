@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.73";
+static constexpr const char * GZSTD_VERSION = "0.13.74";
 //
 // Architecture overview:
 //
@@ -724,10 +724,10 @@ static void print_help()
 "  --sync-output       fsync output before exit\n"
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
-"  --direct-read       read input with O_DIRECT, bypassing the page cache\n"
-"  --read-threads N    buffered pooled-reader threads (default: auto, scales\n"
-"                      with -T, 3..12; ignored for O_DIRECT/mmap/stdin)\n"
-"                      (one-pass speedup + honest cold reads; implies fread)\n"
+"  --direct-read       O_DIRECT input, single stream: bypass the page cache\n"
+"                      for one-pass speedups and honest cold benchmarks\n"
+"  --read-threads N    parallel readers for the BUFFERED input path (default:\n"
+"                      auto 3..12 by -T; 1 = single; n/a with --direct-read/stdin)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
@@ -840,7 +840,6 @@ static void print_help_long()
 "     --mmap / --no-mmap force the choice and override the auto-gate.\n"
 "\n"
 "  --direct-read    (default: off)\n"
-"  --read-threads   (default: 0 = auto)\n"
 "     Read the input with O_DIRECT: transfer straight from disk into an\n"
 "     aligned buffer, BYPASSING the page cache entirely (it neither\n"
 "     reads from nor populates it).  Two uses: (1) a one-pass speedup —\n"
@@ -848,10 +847,24 @@ static void print_help_long()
 "     it, so skipping the populate + writeback overhead can be faster;\n"
 "     (2) honest cold benchmarking with zero system impact — every run\n"
 "     reads cold from disk, with no cache to drop, so no kcompactd\n"
-"     compaction stall and no eviction of other users cached data\n"
-"     (unlike --cold, which drops the cache via fadvise).  Implies the\n"
-"     fread path (O_DIRECT cannot go through mmap) and takes precedence\n"
-"     over it.  Independent of --direct, which is O_DIRECT for OUTPUT.\n"
+"     compaction stall and no eviction of other users' cached data\n"
+"     (unlike --cold, which drops the cache via fadvise).  Always a\n"
+"     SINGLE stream: concurrent O_DIRECT reads contend on NVMe, so it\n"
+"     cannot use --read-threads and cannot go through mmap.  On a\n"
+"     big-RAM box the buffered path is usually faster (reads served from\n"
+"     cache), so this is mainly a benchmarking / one-pass tool.\n"
+"     Independent of --direct, which is O_DIRECT for OUTPUT.\n"
+"\n"
+"  --read-threads N    (default: 0 = auto)\n"
+"     Number of parallel reader threads for the BUFFERED input path.  A\n"
+"     single reader's per-frame copy and read syscalls can cap throughput\n"
+"     on a fast box; spreading them over N threads lifts that ceiling.\n"
+"     Applies to compress (the pooled reader — used when mmap is declined,\n"
+"     e.g. a >4 GiB input on a <6.4 kernel, or --no-mmap) and to\n"
+"     decompress (the parallel-prefetch frame reader), for seekable\n"
+"     regular-file inputs.  0 = auto: clamp(threads/8, 3, 12).  1 = force\n"
+"     a single reader.  Ignored for stdin/pipes and under --direct-read.\n"
+"     Unrelated to --direct-read beyond being mutually exclusive with it.\n"
 "\n"
 "  --cold    (default: off)\n"
 "     Drop the input from the page cache (posix_fadvise DONTNEED) before\n"
