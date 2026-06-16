@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=224
-$EXTENSIVE && EXPECTED_TESTS=301
+EXPECTED_TESTS=227
+$EXTENSIVE && EXPECTED_TESTS=304
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1443,6 +1443,61 @@ else
 fi
 
 rm -f "$TMPDIR"/mt-*.zst "$TMPDIR"/mt-*.dec "$TMPDIR"/mt-*.log "$TMPDIR"/sg-*.dec "$TMPDIR/mtreader.bin"
+
+# ============================================================
+# 19e. MT reader streaming-fallback (concatenated unknown-size tail)
+# ============================================================
+# A gzstd archive (known frame sizes) concatenated with a zstd-streamed
+# segment (no content-size header), sized past the 128 MiB MT gate.  The
+# parallel reader parses the known frames, hits the unknown-size frame, and
+# must NOT die: it warns and hands the remainder to the CPU streaming decoder,
+# exactly like the single-threaded reader.  Regression for v0.13.77.  Needs
+# stock zstd to produce the unknown-size frame (piped input => no content size).
+section "MT reader streaming-fallback (unknown-size tail)"
+
+if command -v zstd &>/dev/null; then
+  spin "fallback fixture (gzstd archive + zstd-streamed tail, > 128 MiB)"
+  dd if=/dev/urandom bs=1M count=110 2>/dev/null > "$TMPDIR/fb-A.bin"
+  dd if=/dev/urandom bs=1M count=40  2>/dev/null > "$TMPDIR/fb-B.bin"
+  cat "$TMPDIR/fb-A.bin" "$TMPDIR/fb-B.bin" > "$TMPDIR/fb-orig.bin"
+  "$GZSTD" -q -k -f --cpu-only "$TMPDIR/fb-A.bin" -o "$TMPDIR/fb-A.zst" 2>/dev/null
+  cat "$TMPDIR/fb-B.bin" | zstd -q -3 > "$TMPDIR/fb-B.zst" 2>/dev/null  # piped => unknown content size
+  cat "$TMPDIR/fb-A.zst" "$TMPDIR/fb-B.zst" > "$TMPDIR/fb-combined.zst"
+  spin_done
+
+  # MT path (default cpu-only decompress on a > 128 MiB regular file), verbose
+  # so we can confirm the parallel reader engaged AND took the fallback.
+  "$GZSTD" -d -k -f -v --cpu-only "$TMPDIR/fb-combined.zst" -o "$TMPDIR/fb-mt.dec" 2>"$TMPDIR/fb.log"
+  fb_rc=$?
+
+  if [[ $fb_rc -eq 0 ]] && files_match "$TMPDIR/fb-orig.bin" "$TMPDIR/fb-mt.dec"; then
+    pass "fallback round-trip" "(exit 0, output matches source)"
+  else
+    fail "fallback round-trip" "rc=$fb_rc, match=$(files_match "$TMPDIR/fb-orig.bin" "$TMPDIR/fb-mt.dec" && echo y || echo n)"
+  fi
+
+  if tr '\r' '\n' < "$TMPDIR/fb.log" | grep -q "parallel prefetch" \
+     && tr '\r' '\n' < "$TMPDIR/fb.log" | grep -qi "no content-size header"; then
+    pass "MT reader engaged, warned, fell back (no die)" "(parallel + warning)"
+  else
+    fail "MT reader engaged, warned, fell back (no die)" \
+         "engaged=$(tr '\r' '\n' < "$TMPDIR/fb.log" | grep -q 'parallel prefetch' && echo y || echo n), warned=$(tr '\r' '\n' < "$TMPDIR/fb.log" | grep -qi 'no content-size header' && echo y || echo n)"
+  fi
+
+  # Single-reader reference (--read-threads 1 stays single) must match the MT output.
+  "$GZSTD" -d -k -f --cpu-only --read-threads 1 "$TMPDIR/fb-combined.zst" -o "$TMPDIR/fb-sg.dec" 2>/dev/null
+  if files_match "$TMPDIR/fb-mt.dec" "$TMPDIR/fb-sg.dec"; then
+    pass "fallback parity: MT == single reader"
+  else
+    fail "fallback parity: MT == single reader" "outputs differ"
+  fi
+
+  rm -f "$TMPDIR"/fb-*.bin "$TMPDIR"/fb-*.zst "$TMPDIR"/fb-*.dec "$TMPDIR/fb-orig.bin" "$TMPDIR/fb.log"
+else
+  skip "fallback round-trip" "zstd not installed"
+  skip "MT reader engaged, warned, fell back (no die)" "zstd not installed"
+  skip "fallback parity: MT == single reader" "zstd not installed"
+fi
 
 # ============================================================
 # 20. Stress tests

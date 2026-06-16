@@ -1,11 +1,55 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.76  
+**Covers:** v0.9.50 → v0.13.77  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.77 — decompress integrity guard + graceful parallel-reader fallback
+
+Three decompress-path fixes from a correctness review.
+
+1. **GPU decompress now verifies the produced size against the frame header.**
+   `gpu_decomp_worker` checked nvCOMP's per-chunk status but then trusted the
+   reported output size (`h_actual[i]`) verbatim.  The CPU path gets this check
+   for free — `ZSTD_decompressDCtx` rejects a frame whose output differs from
+   its declared content size — so the GPU path could silently write a short or
+   wrong-length frame and exit 0 on corrupt/malformed input where the CPU path
+   and stock `zstd -d` both error.  It now compares `actual` to the header's
+   `decomp_size` and throws on mismatch; the existing catch re-enqueues the
+   undelivered tail to the main queue, where a CPU worker re-decodes it and
+   either succeeds (a transient device glitch — the run completes correctly) or
+   dies cleanly with a zstd data error.  No effect on valid archives, where the
+   two sizes always agree; verified the guard does not false-positive on a real
+   GPU round-trip.
+
+2. **The parallel-prefetch decompress reader falls back instead of dying.**
+   A mid-stream frame with no content-size header (e.g. a gzstd archive
+   concatenated with a zstd-streamed segment) made the MT reader `die_data`,
+   while the single-threaded reader handled the same input by streaming the
+   remainder.  The MT reader now records the offending frame's file offset,
+   reads `[offset, EOF)` into the caller's buffer, and signals the same
+   fallback the single reader uses — the parsed frames are written, then the
+   tail goes through the CPU streaming decoder.  Both readers now emit one
+   shared `warning:` line (previously the only message here was a `note:`).
+   Confirmed byte-identical output on cpu-only, `--hybrid`, and `--gpu-only`.
+
+3. **Bounded the MT reader's frame-spanning re-parse cost.**
+   Completing a frame that straddles a 64 MiB block re-runs
+   `ZSTD_findFrameCompressedSize()` on the growing carry (zstd has no resumable
+   size parser), and growing the carry by a fixed 4 MiB step made that
+   re-walk quadratic for frames larger than a block (`--ultra` / huge
+   `--chunk-size`: ~16 re-parses per block, each rescanning the whole carry).
+   The step now grows geometrically (capped at one block), so a
+   straddle-by-a-little still resolves on the first small step while a
+   multi-block frame needs only ~log2(block/step) parses per block.  Overshoot
+   is bounded at 2× and re-parsed in place, so output is unchanged.
+
+Adds a regression test (`MT reader streaming-fallback`) covering the §2 path:
+a > 128 MiB gzstd-archive + piped-zstd tail must round-trip, warn, and match
+the single reader.
 
 ## v0.13.76 — progress bar for a redirected stdin: auto-show + real percentages
 

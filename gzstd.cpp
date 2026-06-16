@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.76";
+static constexpr const char * GZSTD_VERSION = "0.13.77";
 //
 // Architecture overview:
 //
@@ -5407,7 +5407,8 @@ static int probe_preadable_input(const Options & opt, FILE * in,
 static size_t stream_frames_to_queue_mt(
     int fd, bool owns_fd, uint64_t file_size, int n_readers,
     TaskQueue & queue, Meter * m, const Options & opt,
-    size_t * max_frame_decomp_out, const std::atomic<bool> * abort)
+    size_t * max_frame_decomp_out, const std::atomic<bool> * abort,
+    bool * fallback_out, std::vector<char> * raw_data_out)
 {
   if (fd < 0) return MT_READER_BAIL;
   try_boost_io_priority(!opt.gpu_only);
@@ -5481,7 +5482,14 @@ static size_t stream_frames_to_queue_mt(
 
   size_t seq = 0, max_frame_decomp = 0;
   std::vector<char> carry;            // straddling-frame bytes from prior block(s)
+  uint64_t carry_origin = 0;          // absolute file offset of carry[0] (for the fallback offset)
   bool aborted = false;
+  // Set when a mid-stream frame has no content-size header: parallel decode
+  // needs known frame sizes, so we hand the rest of the file (from fallback_off)
+  // to the caller's CPU streaming decoder instead of dying.  Matches the
+  // single-threaded reader's mid-file fallback (which sets the same out-params).
+  bool need_fallback = false;
+  uint64_t fallback_off = 0;
 
   auto fail = [&](const std::string & why) {
     std::lock_guard<std::mutex> lk(mtx);
@@ -5493,7 +5501,9 @@ static size_t stream_frames_to_queue_mt(
   auto emit = [&](const char * p, size_t fc) -> bool {
     unsigned long long dz = ZSTD_getFrameContentSize(p, fc);
     if (dz == ZSTD_CONTENTSIZE_UNKNOWN || dz == ZSTD_CONTENTSIZE_ERROR) {
-      fail("frame " + std::to_string(seq) + " has unknown content size (not a gzstd archive?)");
+      // Complete frame but no content-size header (e.g. a zstd-streamed segment
+      // concatenated after a gzstd archive).  Don't die: the caller computes the
+      // file offset and falls back to the CPU streaming decoder for the tail.
       return false;
     }
     Task t; t.seq = seq++;
@@ -5545,18 +5555,30 @@ static size_t stream_frames_to_queue_mt(
           if (carry.size() >= need) { pos = need - old; carry.clear(); resolved = true; }  // skipped
         }
       } else {
+        // Complete a normal frame that straddled into this block.  zstd has no
+        // resumable frame-size parser, so each ZSTD_findFrameCompressedSize()
+        // re-walks the whole carry from the start.  Growing the carry by a
+        // FIXED STEP made that re-walk quadratic for frames much larger than a
+        // BLOCK (--ultra / huge --chunk-size: a 128 MiB frame did ~16 re-parses
+        // per 64 MiB block, each rescanning the full accumulated carry).  Grow
+        // the step geometrically instead: a straddle-by-a-little still resolves
+        // on the first small step, while a multi-block frame needs only
+        // ~log2(BLOCK/STEP) parses per block.  Overshoot is bounded at 2x and
+        // re-parsed in place by (B), so correctness is unchanged.
         size_t fc = 0;
+        size_t step = STEP;
         while (appended <= len) {
           uint64_t ps = m ? now_ns() : 0;
           fc = ZSTD_findFrameCompressedSize(carry.data(), carry.size());
           if (m) m->reader_parse_ns.fetch_add(now_ns() - ps, std::memory_order_relaxed);
           if (!ZSTD_isError(fc) && fc <= carry.size()) {
-            if (!emit(carry.data(), fc)) { aborted = true; }
+            if (!emit(carry.data(), fc)) { need_fallback = true; fallback_off = carry_origin; aborted = true; }
             pos = (fc > old) ? (fc - old) : 0; carry.clear(); resolved = true; break;
           }
           if (appended >= len) break;       // exhausted this block; frame spans further
-          size_t step = std::min(STEP, len - appended);
-          carry.insert(carry.end(), data + appended, data + appended + step); appended += step;
+          size_t take = std::min(step, len - appended);
+          carry.insert(carry.end(), data + appended, data + appended + take); appended += take;
+          step = std::min(step * 2, BLOCK); // geometric growth, capped at one block
         }
       }
       if (aborted) break;
@@ -5566,6 +5588,10 @@ static size_t stream_frames_to_queue_mt(
     // (B) parse the rest of the block in place.
     while (!aborted && pos < len) {
       const char * p = data + pos; const size_t rem = len - pos;
+      // A frame starting here begins at this absolute file offset.  Recorded so
+      // a carry assigned below carries its origin (for section A's fallback),
+      // and reused directly if this frame has no content-size header.
+      carry_origin = (uint64_t)cur * BLOCK + pos;
       if (rem < 4) { carry.assign(p, p + rem); break; }
       uint32_t magic = 0; std::memcpy(&magic, p, 4);
       if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {          // skippable frame
@@ -5579,7 +5605,7 @@ static size_t stream_frames_to_queue_mt(
       size_t fc = ZSTD_findFrameCompressedSize(p, rem);
       if (m) m->reader_parse_ns.fetch_add(now_ns() - ps, std::memory_order_relaxed);
       if (ZSTD_isError(fc) || fc > rem) { carry.assign(p, p + rem); break; }  // straddles
-      if (!emit(p, fc)) { aborted = true; break; }
+      if (!emit(p, fc)) { need_fallback = true; fallback_off = carry_origin; aborted = true; break; }
       pos += fc;
     }
 
@@ -5600,6 +5626,33 @@ static size_t stream_frames_to_queue_mt(
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
   cv_freed.notify_all(); cv_filled.notify_all();
   for (auto & th : readers) th.join();
+
+  // Mid-stream unknown-size frame: hand the rest of the file to the caller's
+  // CPU streaming decoder rather than dying.  Read [fallback_off, file_size)
+  // from the (still-open) fd into raw_data; the frames already queued are
+  // written first, then the caller appends this tail via decompress_from_buffer.
+  // A genuine I/O error (failed) takes the die path below instead.
+  if (need_fallback && !failed.load(std::memory_order_relaxed)) {
+    if (raw_data_out && fallback_off < file_size) {
+      raw_data_out->resize((size_t)(file_size - fallback_off));
+      size_t got = 0;
+      while (got < raw_data_out->size()) {
+        ssize_t r = ::pread(fd, raw_data_out->data() + got,
+                            raw_data_out->size() - got,
+                            (off_t)(fallback_off + (uint64_t)got));
+        if (r <= 0) break;     // short/erroring read: caller streams what we got
+        got += (size_t)r;
+      }
+      raw_data_out->resize(got);
+    }
+    if (fallback_out) *fallback_out = true;
+    if (owns_fd) ::close(fd);
+    // The caller emits the single user-facing warning (shared with the
+    // single-threaded reader's fallback) once the parsed frames are written.
+    if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
+    return seq;
+  }
+
   if (owns_fd) ::close(fd);   // borrowed (inherited stdin) fd: leave it open
 
   if (failed.load(std::memory_order_relaxed)) {
@@ -5664,7 +5717,8 @@ static size_t stream_frames_to_queue(
                + " reader threads"
                + (opt.input == "-" ? " (stdin is a seekable file)" : "") + "\n");
         size_t r = stream_frames_to_queue_mt(pfd, owns, fsz, n_readers,
-                                             queue, m, opt, max_frame_decomp_out, abort);
+                                             queue, m, opt, max_frame_decomp_out, abort,
+                                             fallback, raw_data);
         if (r != MT_READER_BAIL) return r;
         if (m) m->reader_threads.store(1, std::memory_order_relaxed);
       } else if (owns) {
@@ -6034,9 +6088,10 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   // truncated output with exit 0.
   if (fallback && !raw_data.empty()) {
     vlog(V_DEFAULT, opt,
-         "note: frame " + std::to_string(n_frames) + " onward has no "
-         "content-size header (zstd streaming output); decompressing the "
-         "remaining data with the CPU streaming decoder so nothing is lost.\n");
+         "warning: frame " + std::to_string(n_frames) + " onward has no "
+         "content-size header (zstd streaming output); the parallel reader "
+         "can't split it, so the remaining data is decompressed with the CPU "
+         "streaming decoder (slower, but nothing is lost).\n");
     decompress_from_buffer(raw_data, out, opt, m);
   }
 
@@ -9637,6 +9692,22 @@ static void gpu_decomp_worker(
             throw std::runtime_error("nvCOMP decompress per-chunk status != success");
 
           size_t actual = C.h_actual[i];
+          // Integrity check: nvCOMP can report success yet produce a size that
+          // disagrees with the frame header's declared content size (corrupt
+          // input, or a transient device fault).  The CPU path gets this for
+          // free — ZSTD_decompressDCtx rejects a frame whose output != declared
+          // size — so without this guard the GPU path silently writes a short
+          // /wrong frame and exits 0.  Throwing re-enqueues the undelivered tail
+          // to the main queue (catch block); a CPU worker then re-decodes it and
+          // either succeeds (transient glitch — run completes correctly) or dies
+          // cleanly with a zstd data error, matching CPU-only and stock zstd.
+          if (actual != C.batch[i].decomp_size)
+            throw std::runtime_error(
+                "GPU decompress size mismatch at frame "
+                + std::to_string(batch_seqs[i]) + ": header declared "
+                + std::to_string(C.batch[i].decomp_size)
+                + " bytes, nvCOMP produced " + std::to_string(actual)
+                + " (corrupt input?)");
           out_sum += actual;
           d2h_bytes_batch += actual;
 
@@ -10347,9 +10418,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // tail via the CPU streaming decoder.  Previously dropped silently.
   if (fallback && !raw_data.empty()) {
     vlog(V_DEFAULT, opt,
-         "note: frame " + std::to_string(n_frames) + " onward has no "
-         "content-size header (zstd streaming output); decompressing the "
-         "remaining data with the CPU streaming decoder so nothing is lost.\n");
+         "warning: frame " + std::to_string(n_frames) + " onward has no "
+         "content-size header (zstd streaming output); the parallel reader "
+         "can't split it, so the remaining data is decompressed with the CPU "
+         "streaming decoder (slower, but nothing is lost).\n");
     decompress_from_buffer(raw_data, out, opt, m);
   }
 
