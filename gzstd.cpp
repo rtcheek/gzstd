@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.75";
+static constexpr const char * GZSTD_VERSION = "0.13.76";
 //
 // Architecture overview:
 //
@@ -1489,16 +1489,47 @@ static void progress_emit_line(double in_pct, double out_pct,
 #undef PR_GREEN_B
 #undef PR_YELLOW_B
 
+// Input size if knowable up front: a named regular file, OR a seekable stdin
+// redirect ("gzstd < file", "gzstd -d < file.zst", "< /dev/sdX").  0 for a
+// true pipe (tar -I gzstd, "cat | gzstd") or unknown.  Drives the progress
+// denominator (real % instead of "---") and auto-progress (a known size ⇒
+// NOT a true pipe, so the bar is worth showing).
+static uint64_t known_input_size(const Options & opt, FILE * in)
+{
+  if (opt.input != "-") {
+    std::error_code ec; uintmax_t z = fs::file_size(opt.input, ec);
+    return ec ? 0 : (uint64_t)z;            // named regular file
+  }
+#ifndef _WIN32
+  if (in) {                                 // stdin: is it a "< file" redirect?
+    const int fd = ::fileno(in);
+    struct stat st;
+    if (::fstat(fd, &st) == 0) {
+      if (S_ISREG(st.st_mode)) return (uint64_t)st.st_size;
+      if (S_ISBLK(st.st_mode)) {            // block device: size via SEEK_END
+        off_t cur = ::lseek(fd, 0, SEEK_CUR), end = ::lseek(fd, 0, SEEK_END);
+        if (cur >= 0 && end > 0) { ::lseek(fd, cur, SEEK_SET); return (uint64_t)end; }
+      }
+    }
+  }
+#endif
+  return 0;                                 // true pipe / unknown
+}
+
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
 {
   // Progress bar at V_DEFAULT and V_VERBOSE only.
   // At V_DEBUG+, per-thread summaries provide progress; the bar would collide.
-  // At V_DEFAULT, suppress if stderr is not a TTY OR if stdin is a pipe.
-  // --progress (force_progress) overrides TTY/pipe checks but not V_DEBUG+.
+  // At V_DEFAULT, suppress if stderr is not a TTY OR if stdin is a TRUE pipe.
+  // A redirected stdin from a real file ("gzstd -d < big.zst") has a known
+  // size (total_in > 0), so it is NOT a true pipe — show the bar with real
+  // percentages.  Only a genuine pipe (total_in == 0: tar -I gzstd, cat |
+  // gzstd, terminal) is suppressed.  --progress overrides everything but the
+  // V_DEBUG cap.
   if (opt.verbosity < V_DEFAULT || opt.verbosity >= V_DEBUG) return;
   if (opt.verbosity == V_DEFAULT && !opt.force_progress) {
     if (!is_stderr_tty()) return;
-    if (opt.input == "-" && !isatty(fileno(stdin))) return;
+    if (opt.input == "-" && total_in == 0) return;
   }
   g_progress_active.store(true, std::memory_order_relaxed);
   using namespace std::chrono; using namespace std::chrono_literals;
@@ -6044,9 +6075,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   // Get total input size for progress percentage
-  uint64_t total_in = 0;
-  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
-    total_in = (uint64_t)fs::file_size(opt.input);
+  uint64_t total_in = known_input_size(opt, in);
 
   // Preallocate output file: input size is a safe upper bound for compressed output.
 #ifndef _WIN32
@@ -6127,9 +6156,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   vlog(V_VERBOSE, opt, "[SLIDING-WINDOW] single-frame compression with "
        + std::to_string(n_threads) + " zstd worker threads\n");
 
-  uint64_t total_in = 0;
-  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
-    total_in = (uint64_t)fs::file_size(opt.input);
+  uint64_t total_in = known_input_size(opt, in);
 
   std::atomic<bool> progress_done{false};
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
@@ -6441,9 +6468,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   }
 
   // Get total input size for progress percentage (unknown for pipes)
-  uint64_t total_in = 0;
-  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
-    total_in = (uint64_t)fs::file_size(opt.input);
+  uint64_t total_in = known_input_size(opt, in);
 
   // Preallocate output file: input size is a safe upper bound for compressed output.
 #ifndef _WIN32
@@ -8381,9 +8406,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   cpuagg.threads = 0;
 
   // Get total input size for progress percentage (unknown for pipes)
-  uint64_t total_in = 0;
-  if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
-    total_in = (uint64_t)fs::file_size(opt.input);
+  uint64_t total_in = known_input_size(opt, in);
 
   // Preallocate output file: input size is a safe upper bound for compressed output.
 #ifndef _WIN32
@@ -10599,8 +10622,7 @@ int main(int argc, char ** argv)
   std::thread prog_thr;
   uint64_t total_in_for_progress = 0;
   if (opt.mode == Mode::TEST || opt.mode == Mode::DECOMPRESS) {
-    if (opt.input != "-" && fs::exists(opt.input) && fs::is_regular_file(opt.input))
-      total_in_for_progress = (uint64_t)fs::file_size(opt.input);
+    total_in_for_progress = known_input_size(opt, in);
     prog_thr = std::thread(progress_loop, std::cref(opt), &meter,
                            total_in_for_progress, &prog_done);
   }

@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.75  
+**Covers:** v0.9.50 → v0.13.76  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.76 — progress bar for a redirected stdin: auto-show + real percentages
+
+Two fixes for `gzstd -dc < big.zst`, both flowing from "we now know the
+input size via fstat":
+
+1. **Auto-show the bar.** The default-verbosity suppression treated any
+   non-TTY stdin as a pipe and hid the bar, so a `< file` redirect needed
+   `--progress`.  It now suppresses only a TRUE pipe — keyed on whether the
+   input size is known (`total_in == 0`).  A redirect from a real file /
+   block device has a known size, so the bar shows automatically; genuine
+   pipes (`tar -I gzstd`, `cat | gzstd`, a terminal) stay quiet.
+2. **Real percentages instead of `---`.**  The progress denominator came
+   from `fs::file_size` of a named path, so stdin showed `in:--- out:---`.
+   New `known_input_size()` returns the size for a named regular file OR a
+   seekable stdin redirect (`fstat` S_ISREG/S_ISBLK), so `< file` now shows
+   `in:NN% out:NN%`.  All five total_in sites (4 compress + decompress/test)
+   route through it; named-file and true-pipe behavior is unchanged.
+
+A side benefit: the single-threaded streaming compress paths now learn the
+pledged source size on a `gzstd < big.bin` redirect too (ZSTD_CCtx_set
+PledgedSrcSize), so the frame header carries the content size.
 
 ## v0.13.75 — parallel reads from a redirected stdin and block devices (fstat the fd)
 
