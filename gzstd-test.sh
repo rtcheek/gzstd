@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=227
-$EXTENSIVE && EXPECTED_TESTS=304
+EXPECTED_TESTS=226
+$EXTENSIVE && EXPECTED_TESTS=302
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1770,10 +1770,6 @@ else
   fail "--cpu-batch + --cpu-only warns" "output: ${snippet:0:200}"
 fi
 
-# --cpu-backlog (only meaningful in hybrid, but should not crash in cpu-only)
-"$GZSTD" -k -f --cpu-only --cpu-backlog=0 "$TMPDIR/medium.txt" -o "$TMPDIR/cpubl0.zst" 2>/dev/null
-[[ -s "$TMPDIR/cpubl0.zst" ]] && pass "--cpu-backlog=0 (cpu-only)" || fail "--cpu-backlog=0"
-
 # Verify data is correct
 "$GZSTD" -d -k -f --cpu-only "$TMPDIR/cpubatch0.zst" -o "$TMPDIR/cpubatch0.dec" 2>/dev/null
 files_match "$TMPDIR/medium.txt" "$TMPDIR/cpubatch0.dec" \
@@ -2284,10 +2280,6 @@ LAST_TEST_MS=0
 # --cpu-batch N (space)
 "$GZSTD" -k -f --cpu-only --cpu-batch 4 "$TMPDIR/medium.txt" -o "$TMPDIR/sp-cpub.zst" 2>/dev/null
 [[ -s "$TMPDIR/sp-cpub.zst" ]] && pass "--cpu-batch 4 (space)" || fail "--cpu-batch 4 (space)"
-
-# --cpu-backlog N (space)
-"$GZSTD" -k -f --cpu-only --cpu-backlog 0 "$TMPDIR/medium.txt" -o "$TMPDIR/sp-cpubl.zst" 2>/dev/null
-[[ -s "$TMPDIR/sp-cpubl.zst" ]] && pass "--cpu-backlog 0 (space)" || fail "--cpu-backlog 0 (space)"
 
 # --stats-json FILE (space  already tested with space, verify)
 "$GZSTD" -k -f --cpu-only --stats-json "$TMPDIR/sp-stats.json" "$TMPDIR/small.txt" 2>/dev/null

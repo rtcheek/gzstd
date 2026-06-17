@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.78  
+**Covers:** v0.9.50 → v0.13.79  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.79 — remove --cpu-backlog (redundant with --cpu-batch)
+
+Removed the `--cpu-backlog N` flag entirely.  It was a secondary, post-pop CPU
+throttle that duplicated `--cpu-batch` (`cpu_queue_min`): where `--cpu-batch`
+declines to pop until the queue holds ≥ N frames (checked atomically inside the
+locked pop, before a permit is acquired), `--cpu-backlog` popped first and then
+un-popped — pushing the frame back, releasing the permit, and waiting — making
+it effectively `--cpu-batch (N+1)` with extra permit/queue churn.  The
+"reserve queue depth for the GPU" job it aimed at is already handled
+automatically by the adaptive scheduler's `cpu_queue_floor` (scales with
+streams × batch × measured throughput, self-disables at the tail) and manually
+by `--cpu-batch`.  Nothing depended on it (the only references were two
+arg-parse smoke tests that passed `0` = off), and it carried a footgun — unlike
+`--cpu-batch`, it was never disabled in `--cpu-only` mode despite its
+`[hybrid only]` help.
+
+Dropped: the `Options::cpu_backlog` field, its arg-parse case, the help entry,
+and the per-task branch in `cpu_worker` — which removes one lock-taking
+`tq->size()` check from the CPU-compress hot path.  `--cpu-backlog` now reports
+`unknown option` (exit 2).  The two smoke tests were removed (default expected
+test count 227 → 226; one was extensive-only, so extensive 304 → 302).
 
 ## v0.13.78 — audit cleanup: --sync-output durability, signal-safe cleanup, RAM-bound single-thread chunk
 

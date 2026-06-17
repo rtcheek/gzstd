@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.78";
+static constexpr const char * GZSTD_VERSION = "0.13.79";
 //
 // Architecture overview:
 //
@@ -326,7 +326,7 @@ struct Options {
   bool backend_user_set = false;
   // True if the user passed any flag that only makes sense in hybrid/GPU mode
   // (--gpu-batch, --gpu-streams, --gpu-devices, --gpu-mem-frac, --pinned/-no-pinned,
-  // --cpu-share, --cpu-batch, --cpu-backlog, --hybrid-floor, --hybrid-floor-factor).
+  // --cpu-share, --cpu-batch, --hybrid-floor, --hybrid-floor-factor).
   // apply_backend_defaults() promotes this to an implicit --hybrid when no
   // explicit backend flag was given, so asymmetric mode doesn't silently
   // route around the user's tuning intent.
@@ -335,7 +335,6 @@ struct Options {
   double cpu_share = -1;     // <0 adaptive (hybrid)
   size_t chunk_mib = DEFAULT_CHUNK_MIB;
   bool chunk_user_set = false;
-  size_t cpu_backlog = 0;    // queue depth before CPU pops (hybrid)
   size_t cpu_queue_min = 0;   // min queue depth before CPU workers activate (0=no threshold)
 
   // Hybrid queue-floor controls (v0.12.12+, policy rewritten v0.13.5)
@@ -968,9 +967,6 @@ static void print_help_long()
 "\n"
 "  --cpu-share X  [hybrid only]\n"
 "     Fixed CPU share in [0..1].  Disables the EMA adaptation.\n"
-"\n"
-"  --cpu-backlog N  [hybrid only]\n"
-"     Secondary queue threshold for CPU workers.  0 = off.\n"
 "\n"
 "  --throttle-factor N    [all modes]\n"
 "     Slack multiplier for the in-flight frame budget.  Default: 4.\n"
@@ -4745,21 +4741,6 @@ static void cpu_worker(
       if (drained) break;
     }
     if (!got_task) break;
-
-    // cpu_backlog check: if the queue is below the backlog threshold,
-    // re-enqueue and wait.  This is a secondary throttle separate from
-    // cpu_queue_min (which gates the initial pop).
-    // Note: cpu_backlog is rarely used; cpu_queue_min is the primary mechanism.
-    if (opt->cpu_backlog > 0 && tq->size() < opt->cpu_backlog && !tq->drained()) {
-      // Put it back and release the permit — we're not processing this task
-      tq->push(std::move(t));
-      if (bp) bp->release(1);
-      auto backlog_met = [&](const TaskQueue::QueueState & qs) -> bool {
-        return qs.depth >= opt->cpu_backlog || qs.done;
-      };
-      if (!tq->wait_for_cpu(backlog_met)) break;
-      continue;  // re-enter the loop to pop properly
-    }
 
     // Permit already acquired above (before pop).
     // The writer releases this permit after the output is physically written.
@@ -11436,7 +11417,6 @@ static Options parse_args(int argc, char ** argv)
     else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) { opt.gpu_hybrid_tuning_seen = true; }
     else if (parse_str_arg("stats-json", i, argc, argv, opt.stats_json)) {}
     else if (parse_num_arg("chunk-size", i, argc, argv, opt.chunk_mib, &opt.chunk_user_set)) {}
-    else if (parse_num_arg("cpu-backlog", i, argc, argv, opt.cpu_backlog, nullptr)) { opt.gpu_hybrid_tuning_seen = true; }
     else if (parse_num_arg("cpu-batch", i, argc, argv, opt.cpu_queue_min, nullptr)) { opt.gpu_hybrid_tuning_seen = true; }
     else if (a.rfind("--hybrid-floor=", 0) == 0) {
       std::string v = a.substr(15);
