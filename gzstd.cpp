@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.77";
+static constexpr const char * GZSTD_VERSION = "0.13.78";
 //
 // Architecture overview:
 //
@@ -211,7 +211,14 @@ static volatile sig_atomic_t g_tmp_active = 0;
 static void cleanup_tmp_file()
 {
   if (g_tmp_active && g_tmp_path[0] != '\0') {
-    std::remove(g_tmp_path);   // best-effort; ignore errors
+    // Runs from the SIGINT/SIGTERM handler: use unlink() (async-signal-safe)
+    // rather than std::remove(), whose libc wrapper isn't guaranteed safe to
+    // call from a signal handler.  best-effort; ignore errors.
+#ifndef _WIN32
+    ::unlink(g_tmp_path);
+#else
+    std::remove(g_tmp_path);
+#endif
     g_tmp_active = 0;
     g_tmp_path[0] = '\0';
   }
@@ -1694,6 +1701,12 @@ static FILE * open_output_atomic(const std::string & out, std::string & tmp_path
 static void fsync_file(FILE * f)
 {
 #if defined(_POSIX_VERSION)
+  // Flush the stdio buffer to the fd FIRST: the output FILE* has a 1 MiB
+  // full-buffer (setvbuf), so without this fsync() would sync only what has
+  // already reached the fd and miss up to ~1 MiB of trailing output still in
+  // the userspace buffer — defeating --sync-output's durability guarantee for
+  // the tail (fclose flushes it afterward, but nothing fsyncs it then).
+  std::fflush(f);
   int fd = fileno(f);
   fsync(fd);
 #else
@@ -4588,17 +4601,6 @@ struct RateMatchState {
     cpu_frames_taken.store(0, std::memory_order_relaxed);
   }
 
-  // CPU workers call this: should I take a frame right now?
-  bool cpu_may_take() {
-    int taken = cpu_frames_taken.load(std::memory_order_relaxed);
-    int allowed = cpu_frame_allowance.load(std::memory_order_relaxed);
-    if (taken < allowed) {
-      cpu_frames_taken.fetch_add(1, std::memory_order_relaxed);
-      return true;
-    }
-    return false;
-  }
-
   // Reset cycle counter (called when GPU batch completes)
   void reset_cycle() {
     cpu_frames_taken.store(0, std::memory_order_relaxed);
@@ -6127,6 +6129,12 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
     }
   }
 
+  // Bound the chunk by available RAM, exactly as the MT path does (the -T1
+  // early-return in compress_cpu_mt skips its own check_ram_budget call).  A
+  // no-op for normal chunk sizes; for an absurd --chunk-size it reduces the
+  // chunk to fit instead of throwing an uncaught bad_alloc on the inbuf/outbuf
+  // allocation below.
+  chosen_mib = check_ram_budget(1, chosen_mib, opt);
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
   // Get total input size for progress percentage

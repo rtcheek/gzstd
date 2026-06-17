@@ -1,11 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.77  
+**Covers:** v0.9.50 → v0.13.78  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.78 — audit cleanup: --sync-output durability, signal-safe cleanup, RAM-bound single-thread chunk
+
+Four fixes from a full read-through of the previously un-audited code
+(orchestration, output path, arg parsing, budget/sizing).  None affects a
+normal round-trip; they close durability, signal-safety, and misuse-robustness
+gaps.
+
+1. **`--sync-output` now flushes the stdio buffer before fsync.**  The buffered
+   (non-O_DIRECT) writer's output `FILE*` has a 1 MiB full-buffer, but
+   `fsync_file()` ran `fsync(fd)` before `fclose()` flushed that buffer to the
+   fd — so up to ~1 MiB of trailing output was synced only by the later
+   `fclose` (which doesn't fsync) and wasn't durable across a crash, defeating
+   the flag's purpose for the tail (worst on the atomic path, where the rename
+   then publishes a not-yet-durable file).  `fsync_file()` now `fflush()`es
+   first.  The O_DIRECT path was already correct (`finalize()` flushes before
+   its own fsync).
+
+2. **Temp-file cleanup uses `unlink()` instead of `std::remove()` in the signal
+   handler.**  `cleanup_tmp_file()` runs from the SIGINT/SIGTERM handler, where
+   the libc `std::remove` wrapper isn't guaranteed async-signal-safe; `unlink()`
+   is.  POSIX only; Windows keeps `std::remove`.
+
+3. **Single-threaded compress now RAM-bounds its chunk.**  `compress_cpu_mt`'s
+   `-T1` early-return into `compress_cpu_stream` skipped the `check_ram_budget`
+   call the multi-thread path runs, so an absurd `--chunk-size` with `-T1` threw
+   an uncaught `std::bad_alloc` (→ `std::terminate`) on the input/output buffer
+   allocation instead of reducing gracefully.  `compress_cpu_stream` now applies
+   the same RAM cap (no-op for normal sizes; matches MT behavior).
+
+4. **Removed dead code:** `RateMatchState::cpu_may_take()` was defined but never
+   called (the live CPU gate is `should_cpu_take` + the queue floor).
 
 ## v0.13.77 — decompress integrity guard + graceful parallel-reader fallback
 
