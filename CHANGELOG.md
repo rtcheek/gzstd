@@ -1,11 +1,34 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.79  
+**Covers:** v0.9.50 → v0.13.80  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.13.80 — spell out acronyms on first use in --help
+
+Expanded the technical acronyms in the long `--help` on their first
+occurrence so the help is self-documenting (prompted by a user not
+recognizing EMA in the `--cpu-share` description):
+
+  EMA  → exponential moving average     D2H  → device-to-host
+  H2D  → host-to-device                 VRAM → GPU memory
+  DMA  → direct memory access           VMA  → virtual memory area
+  PCIe → PCI Express                    NVMe → NVM Express
+  GC   → garbage collection             MT   → multithreaded
+  OOM  → out of memory                  TTY  → terminal
+
+Each is expanded only at its first instance per the established convention;
+later uses stay bare — except EMA, which is also expanded in the
+`--cpu-share` description (a reader landing there directly shouldn't have to
+scroll up to `--hybrid` to learn what it means).  Universal terms
+(CPU, GPU, RAM, I/O, OS, JSON, CUDA),
+size units (GiB/MiB), and filesystem names (ext4, XFS, ZFS) are left as-is,
+as is the deliberately terse short `-h` (its only jargon term, VRAM, kept
+bare to preserve the aligned column layout).  Help text only — no behavior
+change.
 
 ## v0.13.79 — remove --cpu-backlog (redundant with --cpu-batch)
 
