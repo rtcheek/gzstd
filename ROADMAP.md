@@ -772,6 +772,31 @@ For truly massive files (TB+), distribute frames across multiple machines. Each 
 
 ---
 
+## Native tar archiving (`--tar`, v0.14.0+)
+
+`--tar` builds a GNU-format `.tar.zst` directly, reading members in parallel and
+feeding the existing CPU/GPU pipeline (replaces the single-threaded `tar -cf - |
+gzstd` bottleneck). Creation **and** extraction (`-d --tar [-C DIR]`) shipped in
+v0.14.0 — extraction overlaps parallel decompression with a file-writer pool and
+is secured with `openat`/`O_NOFOLLOW` against path-traversal and symlink-escape.
+Open follow-ups:
+
+- **GNU sparse files** — *Priority: Medium | Complexity: Medium.* Members are
+  currently archived at full logical size (correct, just larger for holey files).
+  Add GNU sparse encoding (`'S'` / pax `GNU.sparse.*`) and detect holes via
+  `SEEK_HOLE`/`SEEK_DATA` during the walk.
+- **More tar input ergonomics** — *Priority: Low | Complexity: Low.*
+  `--exclude-from=FILE`, `-T/--files-from=FILE`, `--absolute-names`/`-P`,
+  `--exclude-vcs`. Each is a small parse + walk tweak.
+- **xattrs / ACLs / SELinux** — *Priority: Low | Complexity: Medium.* Opt-in
+  `--xattrs`/`--acls`/`--selinux` stored as `SCHILY.*` pax extended records, to
+  match `tar --xattrs` for full-fidelity backups (needs `llistxattr`/`lgetxattr`).
+- **Parallelize the walk** — *Priority: Low | Complexity: Medium.* On a cold tree
+  with millions of files, the single-threaded layout walk (`lstat` sweep) can be
+  a secondary bottleneck; a parallel `stat` sweep would shorten it. Measure first.
+
+---
+
 ## Version History Summary
 
 | Version Range | Key Changes |

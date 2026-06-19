@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=226
-$EXTENSIVE && EXPECTED_TESTS=302
+EXPECTED_TESTS=250
+$EXTENSIVE && EXPECTED_TESTS=326
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3202,6 +3202,297 @@ fi
 rm -f "$TMPDIR/ultra.zst"
 
 rm -f "$PHV" "$PHV_ZST" "$PHV_OUT"
+
+# ============================================================
+# Native tar archiving (--tar)
+# ============================================================
+section "Native tar archiving (--tar)"
+
+if ! command -v tar >/dev/null 2>&1; then
+  skip "tar not available" "cannot verify .tar.zst round-trip"
+else
+  TARSRC="$TMPDIR/tarsrc"
+  rm -rf "$TARSRC"
+  mkdir -p "$TARSRC/a" "$TARSRC/b" "$TARSRC/emptydir"
+  # A path long enough (>100 bytes total) to force a GNU 'L' long-name entry.
+  LONGDIR="$TARSRC/a_very_long_directory_name_designed_to_exceed_the_one_hundred_byte_ustar_name_limit_forcing_gnu_longname"
+  mkdir -p "$LONGDIR"
+  echo "hello tar" > "$TARSRC/a/f1.txt"
+  head -c 3000000 /dev/urandom > "$TARSRC/b/rand.bin"   # ~3 MB → multiple 1-MiB chunks
+  echo "deep" > "$LONGDIR/deep.txt"
+  ln -s ../a/f1.txt "$TARSRC/b/sym"                      # symlink
+  ln "$TARSRC/a/f1.txt" "$TARSRC/a/hard"                 # hardlink
+  chmod 750 "$TARSRC/a"
+  # Members are stored relative (leading '/' stripped), so extracting ARC under
+  # EXT recreates the tree at "$EXT$TARSRC".
+  ARC="$TMPDIR/arc.tar.zst"
+  EXT="$TMPDIR/tarext"
+
+  # 1. Round-trip: gzstd creates, GNU tar extracts, trees match.
+  run_test "$GZSTD" --cpu-only -q -f -o "$ARC" --tar "$TARSRC" 2>/dev/null
+  rm -rf "$EXT"; mkdir -p "$EXT"
+  if tar --zstd -xf "$ARC" -C "$EXT" 2>/dev/null \
+     && diff -r --no-dereference "$TARSRC" "$EXT$TARSRC" >/dev/null 2>&1; then
+    pass "round-trip (gzstd create → tar extract)" "($(human_size "$(stat -c%s "$ARC")"))"
+  else
+    fail "round-trip (gzstd create → tar extract)" "tree mismatch"
+  fi
+
+  # 2. Listing parity with GNU tar --sort=name.
+  "$GZSTD" -d -q -c "$ARC" 2>/dev/null | tar -tf - 2>/dev/null | sort > "$TMPDIR/gz.lst"
+  tar --sort=name -cf - "$TARSRC" 2>/dev/null | tar -tf - 2>/dev/null | sort > "$TMPDIR/ref.lst"
+  if diff -q "$TMPDIR/gz.lst" "$TMPDIR/ref.lst" >/dev/null 2>&1; then
+    pass "member listing matches GNU tar"
+  else
+    fail "member listing matches GNU tar" "listing differs"
+  fi
+
+  # 3. --exclude drops matching members.  (List to a file first: `grep -q` on a
+  # pipe closes it early, and the suite's `pipefail` would then flag tar's
+  # SIGPIPE as a pipeline failure.)
+  "$GZSTD" --cpu-only -q -f -o "$ARC" --exclude '*.bin' --tar "$TARSRC" 2>/dev/null
+  tar --zstd -tf "$ARC" 2>/dev/null > "$TMPDIR/tar.lst" || true
+  if grep -q 'rand\.bin' "$TMPDIR/tar.lst"; then
+    fail "--exclude '*.bin'" "excluded file still present"
+  else
+    pass "--exclude '*.bin'"
+  fi
+
+  # 3b. Bare-name --exclude is non-anchored (GNU default): drops a nested
+  # directory component anywhere in the path, not just a leading one.
+  "$GZSTD" --cpu-only -q -f -o "$ARC" --tar --exclude b "$TARSRC" 2>/dev/null
+  tar --zstd -tf "$ARC" 2>/dev/null > "$TMPDIR/tar.lst" || true
+  if grep -q '/b/' "$TMPDIR/tar.lst"; then
+    fail "--exclude bare name (non-anchored)" "nested dir not excluded"
+  else
+    pass "--exclude bare name (non-anchored)"
+  fi
+
+  # Recreate the full archive for the remaining metadata checks.
+  "$GZSTD" --cpu-only -q -f -o "$ARC" --tar "$TARSRC" 2>/dev/null
+
+  # 4. Long path (>100 bytes) stored via GNU long-name entry.
+  tar --zstd -tf "$ARC" 2>/dev/null > "$TMPDIR/tar.lst" || true
+  if grep -q 'forcing_gnu_longname/deep.txt' "$TMPDIR/tar.lst"; then
+    pass "long path (>100B) preserved"
+  else
+    fail "long path (>100B) preserved" "long-name entry missing"
+  fi
+
+  # 5/6/7. Symlink, hardlink identity, and permissions after extraction.
+  rm -rf "$EXT"; mkdir -p "$EXT"; tar --zstd -xpf "$ARC" -C "$EXT" 2>/dev/null
+  [[ -L "$EXT$TARSRC/b/sym" ]] && pass "symlink preserved" || fail "symlink preserved" "not a symlink"
+  if [[ "$(stat -c %i "$EXT$TARSRC/a/f1.txt" 2>/dev/null)" \
+        == "$(stat -c %i "$EXT$TARSRC/a/hard" 2>/dev/null)" ]]; then
+    pass "hardlink shares inode"
+  else
+    fail "hardlink shares inode" "distinct inodes"
+  fi
+  [[ "$(stat -c '%a' "$EXT$TARSRC/a" 2>/dev/null)" == "750" ]] \
+    && pass "permissions preserved (750)" || fail "permissions preserved (750)" "mode mismatch"
+
+  # 8. Tiny chunks: headers/data straddle frame boundaries.
+  run_test "$GZSTD" --cpu-only -q -f --chunk-size 1 -o "$ARC" --tar "$TARSRC" 2>/dev/null
+  rm -rf "$EXT"; mkdir -p "$EXT"
+  if tar --zstd -xf "$ARC" -C "$EXT" 2>/dev/null \
+     && diff -r --no-dereference "$TARSRC" "$EXT$TARSRC" >/dev/null 2>&1; then
+    pass "tiny-chunk (1 MiB) round-trip"
+  else
+    fail "tiny-chunk (1 MiB) round-trip" "tree mismatch"
+  fi
+
+  # 9. Multiple parallel readers.
+  run_test "$GZSTD" --cpu-only -q -f --read-threads 4 -o "$ARC" --tar "$TARSRC" 2>/dev/null
+  rm -rf "$EXT"; mkdir -p "$EXT"
+  if tar --zstd -xf "$ARC" -C "$EXT" 2>/dev/null \
+     && diff -r --no-dereference "$TARSRC" "$EXT$TARSRC" >/dev/null 2>&1; then
+    pass "parallel readers (--read-threads 4) round-trip"
+  else
+    fail "parallel readers (--read-threads 4) round-trip" "tree mismatch"
+  fi
+
+  # 10. Empty source list is a usage error.
+  rc=0; "$GZSTD" -q -f -o "$ARC" --tar 2>/dev/null || rc=$?
+  [[ $rc -eq 2 ]] && pass "empty --tar source list rejected" "(EXIT_USAGE)" \
+                  || fail "empty --tar source list rejected" "got exit $rc"
+
+  # 11. A missing source warns + exits non-zero, but the archive stays valid.
+  rc=0; "$GZSTD" --cpu-only -q -f -o "$ARC" --tar "$TARSRC" "$TMPDIR/does_not_exist_xyz" 2>/dev/null || rc=$?
+  if [[ $rc -ne 0 ]] && tar --zstd -tf "$ARC" >/dev/null 2>&1; then
+    pass "missing source: non-zero exit, valid archive" "(exit $rc)"
+  else
+    fail "missing source: non-zero exit, valid archive" "exit $rc"
+  fi
+
+  # Absolute --exclude path is anchored to the source root (matches GNU tar):
+  # an absolute pattern drops that exact subtree.
+  "$GZSTD" --cpu-only -q -f -o "$ARC" --tar --exclude="$TARSRC/a" "$TARSRC" 2>/dev/null
+  tar --zstd -tf "$ARC" 2>/dev/null > "$TMPDIR/tar.lst" || true
+  if grep -q '/a/' "$TMPDIR/tar.lst"; then
+    fail "absolute-path --exclude" "absolute path not excluded"
+  else
+    pass "absolute-path --exclude"
+  fi
+
+  # Sockets/unknown types are ignored (GNU "file ignored" class): quiet by
+  # default, no effect on exit code; archive stays valid.
+  SOCKDIR="$TMPDIR/socktest"; rm -rf "$SOCKDIR"; mkdir -p "$SOCKDIR"
+  echo data > "$SOCKDIR/regular.txt"
+  if python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' \
+       "$SOCKDIR/live.sock" 2>/dev/null; then
+    rc=0; out=$("$GZSTD" --cpu-only -f -o "$ARC" --tar "$SOCKDIR" 2>&1) || rc=$?
+    tar --zstd -tf "$ARC" 2>/dev/null > "$TMPDIR/tar.lst" || true
+    if [[ $rc -eq 0 ]] && ! echo "$out" | grep -qi 'ignoring' \
+       && grep -q 'regular.txt' "$TMPDIR/tar.lst" \
+       && ! grep -q 'live.sock' "$TMPDIR/tar.lst"; then
+      pass "socket ignored quietly (exit 0)"
+    else
+      fail "socket ignored quietly" "rc=$rc"
+    fi
+  else
+    skip "socket ignored quietly" "cannot create unix socket"
+  fi
+  rm -rf "$SOCKDIR"
+
+  # --one-file-system records a crossed mount point as an empty stub but prunes
+  # its contents.  /dev (devtmpfs) reliably has nested mounts (/dev/pts, /dev/shm)
+  # and contains only device nodes, so it is safe + fast to archive here.
+  if grep -qE ' /dev/(pts|shm) ' /proc/mounts 2>/dev/null; then
+    "$GZSTD" --cpu-only -q -f -o "$ARC" --tar --one-file-system /dev 2>/dev/null
+    "$GZSTD" -d -q -c "$ARC" 2>/dev/null | tar -tf - 2>/dev/null > "$TMPDIR/ofs.lst" || true
+    ofs_stub=$(grep -cE '^dev/(pts|shm)/$' "$TMPDIR/ofs.lst" || true)
+    ofs_inside=$(grep -cE '^dev/(pts|shm)/.' "$TMPDIR/ofs.lst" || true)
+    if [[ "$ofs_stub" -ge 1 && "$ofs_inside" -eq 0 ]]; then
+      pass "--one-file-system: mount stubs kept, contents pruned"
+    else
+      fail "--one-file-system mount stubs" "stubs=$ofs_stub contents=$ofs_inside"
+    fi
+  else
+    skip "--one-file-system mount stubs" "no nested /dev mount"
+  fi
+
+  # GPU/hybrid path (only when a GPU is present).
+  if has_gpu 2>/dev/null; then
+    run_test "$GZSTD" --gpu-only -q -f -o "$ARC" --tar "$TARSRC" 2>/dev/null
+    rm -rf "$EXT"; mkdir -p "$EXT"
+    if tar --zstd -xf "$ARC" -C "$EXT" 2>/dev/null \
+       && diff -r --no-dereference "$TARSRC" "$EXT$TARSRC" >/dev/null 2>&1; then
+      pass "GPU path round-trip"
+    else
+      fail "GPU path round-trip" "tree mismatch"
+    fi
+  else
+    skip "GPU path round-trip" "no GPU"
+  fi
+
+  rm -rf "$TARSRC" "$EXT" "$ARC" "$TMPDIR/gz.lst" "$TMPDIR/ref.lst" "$TMPDIR/tar.lst" "$TMPDIR/ofs.lst"
+fi
+
+# ============================================================
+# Native tar extraction (-d --tar)
+# ============================================================
+section "Native tar extraction (-d --tar)"
+
+if ! command -v tar >/dev/null 2>&1; then
+  skip "tar not available" "cannot verify extraction"
+else
+  XS="$TMPDIR/xsrc"; rm -rf "$XS"; mkdir -p "$XS/a" "$XS/b" "$XS/emptydir"
+  XLONG="$XS/a_long_directory_name_that_exceeds_the_one_hundred_byte_ustar_limit_to_force_a_gnu_longname_entry_xyz"
+  mkdir -p "$XLONG"
+  echo "hello extract" > "$XS/a/f1.txt"
+  head -c 5000000 /dev/urandom > "$XS/b/big.bin"        # >4 MiB → streamed-extract path
+  echo deep > "$XLONG/deep.txt"
+  ln -s ../a/f1.txt "$XS/b/sym"
+  ln "$XS/a/f1.txt" "$XS/a/hard"
+  chmod 750 "$XS/a"
+  XARC="$TMPDIR/x.tar.zst"; XOUT="$TMPDIR/xout"
+
+  # 1. gzstd create → gzstd extract → identical tree (incl. long name, big file).
+  "$GZSTD" --cpu-only -q -f -o "$XARC" --tar "$XS" 2>/dev/null
+  rm -rf "$XOUT"; mkdir -p "$XOUT"
+  run_test "$GZSTD" -d --cpu-only -q --tar -C "$XOUT" "$XARC" 2>/dev/null
+  if [[ $LAST_RC -eq 0 ]] && diff -r --no-dereference "$XS" "$XOUT$XS" >/dev/null 2>&1; then
+    pass "create → extract round-trip"
+  else
+    fail "create → extract round-trip" "rc=$LAST_RC or tree mismatch"
+  fi
+
+  # 2/3/4. Metadata: permissions, hardlink identity, symlink.
+  [[ "$(stat -c '%a' "$XOUT$XS/a" 2>/dev/null)" == "750" ]] \
+    && pass "extract preserves permissions (750)" || fail "extract permissions" "mode mismatch"
+  if [[ "$(stat -c %i "$XOUT$XS/a/f1.txt" 2>/dev/null)" \
+        == "$(stat -c %i "$XOUT$XS/a/hard" 2>/dev/null)" ]]; then
+    pass "extract restores hardlink (shared inode)"
+  else
+    fail "extract hardlink" "distinct inodes"
+  fi
+  [[ -L "$XOUT$XS/b/sym" ]] && pass "extract restores symlink" || fail "extract symlink" "not a symlink"
+
+  # 5. Cross-tool: GNU tar creates, gzstd extracts.
+  tar -cf - -C "$(dirname "$XS")" "$(basename "$XS")" 2>/dev/null | "$GZSTD" -q -f -o "$XARC" - 2>/dev/null
+  rm -rf "$XOUT"; mkdir -p "$XOUT"
+  "$GZSTD" -d --cpu-only -q --tar -C "$XOUT" "$XARC" 2>/dev/null
+  if diff -r --no-dereference "$XS" "$XOUT/$(basename "$XS")" >/dev/null 2>&1; then
+    pass "extract GNU-tar-created archive"
+  else
+    fail "extract GNU-tar-created archive" "tree mismatch"
+  fi
+
+  # 6/7. Security: hostile archives must not write outside -C DIR.
+  if command -v python3 >/dev/null 2>&1; then
+    SECD="$TMPDIR/secX"; rm -rf "$SECD"; mkdir -p "$SECD/dest" "$SECD/OUTSIDE"
+    echo PRISTINE > "$SECD/OUTSIDE/sentinel.txt"
+    python3 - "$SECD" <<'PYEOF'
+import tarfile, io, sys, os
+base=sys.argv[1]
+def reg(t,name,data=b"PWNED\n"):
+    ti=tarfile.TarInfo(name); ti.size=len(data); ti.mode=0o644; t.addfile(ti, io.BytesIO(data))
+with tarfile.open(base+"/trav.tar","w") as t:
+    reg(t,"../OUTSIDE/sentinel.txt"); reg(t,"ok.txt",b"ok\n")
+with tarfile.open(base+"/symesc.tar","w") as t:
+    li=tarfile.TarInfo("evil"); li.type=tarfile.SYMTYPE; li.linkname=base+"/OUTSIDE"; li.mode=0o777
+    t.addfile(li); reg(t,"evil/escaped.txt")
+PYEOF
+    "$GZSTD" -q -f -o "$SECD/trav.tar.zst" "$SECD/trav.tar" 2>/dev/null
+    "$GZSTD" -q -f -o "$SECD/symesc.tar.zst" "$SECD/symesc.tar" 2>/dev/null
+    rc=0; "$GZSTD" -d --cpu-only -q --tar -C "$SECD/dest" "$SECD/trav.tar.zst" 2>/dev/null || rc=$?
+    if [[ $rc -ne 0 ]] && [[ "$(cat "$SECD/OUTSIDE/sentinel.txt")" == "PRISTINE" ]] \
+       && [[ ! -e "$SECD/dest/../OUTSIDE/pwn" ]]; then
+      pass "refuses path traversal (../), sentinel intact"
+    else
+      fail "path traversal refusal" "rc=$rc sentinel=$(cat "$SECD/OUTSIDE/sentinel.txt")"
+    fi
+    rc=0; "$GZSTD" -d --cpu-only -q --tar -C "$SECD/dest" "$SECD/symesc.tar.zst" 2>/dev/null || rc=$?
+    # symlink-escape: 'evil' symlink may be created in dest, but nothing may be
+    # written THROUGH it into OUTSIDE.
+    if [[ $rc -ne 0 ]] && [[ ! -e "$SECD/OUTSIDE/escaped.txt" ]] \
+       && [[ "$(cat "$SECD/OUTSIDE/sentinel.txt")" == "PRISTINE" ]]; then
+      pass "refuses symlink-escape, nothing written outside dest"
+    else
+      fail "symlink-escape refusal" "rc=$rc; OUTSIDE leaked"
+    fi
+    rm -rf "$SECD"
+  else
+    skip "security (path traversal)" "python3 unavailable"
+    skip "security (symlink escape)" "python3 unavailable"
+  fi
+
+  # 8. GPU extraction path (only when a GPU is present).
+  if has_gpu 2>/dev/null; then
+    "$GZSTD" --cpu-only -q -f -o "$XARC" --tar "$XS" 2>/dev/null
+    rm -rf "$XOUT"; mkdir -p "$XOUT"
+    "$GZSTD" -d --gpu-only -q --tar -C "$XOUT" "$XARC" 2>/dev/null
+    if diff -r --no-dereference "$XS" "$XOUT$XS" >/dev/null 2>&1; then
+      pass "GPU extraction round-trip"
+    else
+      fail "GPU extraction round-trip" "tree mismatch"
+    fi
+  else
+    skip "GPU extraction round-trip" "no GPU"
+  fi
+
+  rm -rf "$XS" "$XOUT" "$XARC"
+fi
 
 # ============================================================
 # Final summary

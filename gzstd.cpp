@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.13.80";
+static constexpr const char * GZSTD_VERSION = "0.14.0";
 //
 // Architecture overview:
 //
@@ -51,6 +51,7 @@ static constexpr const char * GZSTD_VERSION = "0.13.80";
 #include <string>
 #include <vector>
 #include <deque>
+#include <map>
 #include <unordered_map>
 #include <iostream>
 #include <fstream>
@@ -74,6 +75,11 @@ static constexpr const char * GZSTD_VERSION = "0.13.80";
 #include <sys/types.h>
 #include <sys/stat.h>
 #ifndef _WIN32
+#include <dirent.h>        // opendir/readdir — tar-mode directory walk
+#include <fnmatch.h>       // --exclude glob matching (GNU tar semantics)
+#include <grp.h>           // getgrgid_r — gname for tar headers
+#include <pwd.h>           // getpwuid_r — uname for tar headers
+#include <sys/sysmacros.h> // major()/minor() — device-node tar headers
 #endif
 #include <unistd.h>
 #include <fcntl.h>
@@ -380,10 +386,22 @@ struct Options {
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool direct_read = false;       // --direct-read: O_DIRECT input — bypass the page cache (no populate/evict)
   size_t read_threads = 0;        // --read-threads N: buffered pooled-reader threads (0 = auto: 3)
+  size_t write_threads = 0;       // --write-threads N: -d --tar extractor writer pool (0 = auto: min(threads,16))
   bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
+
+  // --tar: synthesize a GNU-format tar stream from tar_sources and feed it to
+  // the compressor, reading member files in parallel (replaces `tar -cf - … |
+  // gzstd`).  --tar ends option parsing: every token after it is an archive
+  // member path.  Compression only; output is a standard .tar.zst.
+  bool tar_mode = false;
+  std::vector<std::string> tar_sources;  // compress: files/dirs to archive; decompress: input archives (post-`--tar`)
+  std::vector<std::string> tar_excludes; // --exclude PATTERN (fnmatch, repeatable)
+  bool tar_numeric_owner = false;        // --numeric-owner: omit uname/gname lookup
+  bool tar_one_file_system = false;      // --one-file-system: don't cross mount points
+  std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
 };
 
 /*======================================================================
@@ -691,6 +709,17 @@ static void print_help()
 "  -f                  overwrite existing file (atomic: .tmp + rename)\n"
 "  --overwrite         overwrite in place (faster on ext4; non-atomic)\n"
 "\n"
+"Archive (tar):\n"
+"  --tar SRC...        build one .tar.zst from the files/dirs listed after\n"
+"                      --tar, reading members in parallel.  The tar options\n"
+"                      below may also follow --tar.  Compression only.\n"
+"  -d --tar ARC...     extract .tar.zst archive(s) (decompress + untar)\n"
+"  -C, --directory DIR extraction root for -d --tar (default: current dir)\n"
+"  --write-threads N   parallel file writers for -d --tar (default: min(-T,16))\n"
+"  --exclude PATTERN   skip members matching PATTERN (glob; repeatable)\n"
+"  --numeric-owner     store uid/gid only (no user/group name lookup)\n"
+"  --one-file-system   do not descend into other mounted filesystems\n"
+"\n"
 "Compression level:\n"
 "  -1 .. -19           zstd level (default: 3)\n"
 "  -20 .. -22          ultra levels (require --ultra)\n"
@@ -889,6 +918,88 @@ static void print_help_long()
 "     gives an upper bound.  --no-preallocate skips it for\n"
 "     benchmarking, or for filesystems that handle extent\n"
 "     allocation efficiently inline (XFS, ZFS).\n"
+"\n"
+"============================================================\n"
+" ARCHIVE (tar)\n"
+"============================================================\n"
+"  --tar SRC...\n"
+"     Build a single .tar.zst archive from the listed files and\n"
+"     directories, instead of piping `tar` into gzstd.  gzstd walks\n"
+"     the tree itself and reads member files IN PARALLEL, feeding\n"
+"     the same multithreaded CPU/GPU pipeline — so the archiving is\n"
+"     no longer bottlenecked on tar's single-threaded reader.\n"
+"     Compression only; the result is a standard GNU-format tar\n"
+"     stream (`tar --format=gnu`, the default on Ubuntu/Debian)\n"
+"     wrapped in zstd, extractable with any tar+zstd:\n"
+"         tar --zstd -xf out.tar.zst        # or:\n"
+"         gzstd -d out.tar.zst | tar -xf -\n"
+"     List the files and directories to archive AFTER --tar.  The\n"
+"     tar-specific options (--exclude, --numeric-owner,\n"
+"     --one-file-system) may appear after --tar too, mixed with the\n"
+"     sources, e.g.:\n"
+"         gzstd -o backup.tar.zst --tar --exclude '*/.cache/*' ~/docs\n"
+"     A source whose name begins with '-' must be written ./-name (or\n"
+"     placed after a literal `--`).  Output goes to -o FILE, or to\n"
+"     stdout when piped.\n"
+"     Stores regular files, directories, symlinks, hardlinks, FIFOs\n"
+"     (named pipes), and device nodes, with permissions, owner, and\n"
+"     modification time.  Long paths (>100 bytes) and large files\n"
+"     (>8 GiB) use the standard GNU long-name and base-256 fields.\n"
+"     Sockets and unknown file types are ignored (shown only at -v, like\n"
+"     tar's --warning=no-file-ignored), and do not affect the exit code.\n"
+"     A member that genuinely cannot be read (permissions, or it changes\n"
+"     mid-read) is reported and the run exits non-zero, but the archive\n"
+"     stays valid.\n"
+"     Reads are spread over --read-threads workers (see CPU TUNING).\n"
+"     Note: extraction is not yet built in; use tar to extract.\n"
+"\n"
+"  --exclude PATTERN\n"
+"     Skip paths matching the shell-glob PATTERN (repeatable).  Matched\n"
+"     against the filesystem path being walked, like GNU tar: a leading\n"
+"     '/' anchors to the source root (--exclude=/proc drops only the\n"
+"     top-level /proc, not var/proc), while a bare name is unanchored and\n"
+"     matches that component anywhere (--exclude .cache drops every\n"
+"     .cache).  '*' spans '/', and a directory match drops its whole\n"
+"     subtree.  Examples: --exclude=/proc --exclude='/home/*/.cache'.\n"
+"\n"
+"  --numeric-owner\n"
+"     Record numeric uid/gid only; skip user/group name resolution.\n"
+"\n"
+"  --one-file-system\n"
+"     Stay on each source's filesystem: a directory on a different mount\n"
+"     is recorded as an empty stub (so the mount point exists on restore)\n"
+"     but its contents are not archived.  This is the safe way to back up\n"
+"     `/` — it skips /proc, /sys, /dev, /run automatically.  List real\n"
+"     partitions as separate sources to include them:\n"
+"         sudo gzstd -o root.tar.zst --tar --one-file-system / /home /boot\n"
+"\n"
+"  -d --tar ARCHIVE...\n"
+"     Extract one or more .tar.zst archives (decompress AND untar in one\n"
+"     pass).  Decompression runs on the full parallel CPU/GPU pipeline and\n"
+"     overlaps with file writes (small files written by a worker pool), so\n"
+"     it is faster than `gzstd -d | tar -x` on many-small-file archives.\n"
+"     Restores regular files, directories, symlinks, hardlinks, FIFOs and\n"
+"     device nodes with permissions and modification time; owners are\n"
+"     restored only when running as root.  Reads any standard tar inside\n"
+"     zstd (GNU, ustar, or pax), not just gzstd's own.\n"
+"     Extraction is SECURE BY CONSTRUCTION: members are written through the\n"
+"     destination directory with O_NOFOLLOW on every path component, so a\n"
+"     member symlink cannot be traversed to escape the destination, and\n"
+"     `..` components are refused — the classic tar path-traversal and\n"
+"     symlink-escape attacks are blocked.  A leading '/' is stripped\n"
+"     (members extract relative to -C DIR).  Existing files are overwritten.\n"
+"\n"
+"  -C, --directory DIR\n"
+"     Extraction root for -d --tar (default: current directory).  Must\n"
+"     already exist.  Example:\n"
+"         gzstd -d --tar -C /restore backup.tar.zst\n"
+"\n"
+"  --write-threads N\n"
+"     Number of parallel file-writer threads for -d --tar extraction\n"
+"     (default: min(worker threads, 16)).  Small files are written by this\n"
+"     pool while decompression runs; raising it past ~16 usually plateaus\n"
+"     on filesystem metadata/journal contention, but the optimum is\n"
+"     hardware-dependent — tune it on the target box.\n"
 "\n"
 "============================================================\n"
 " COMPRESSION LEVEL\n"
@@ -1116,6 +1227,9 @@ static void print_help_long()
 "\n"
 "  # Pipe compression with explicit level 9\n"
 "  tar cf - ./src | gzstd -9 > src.tar.zst\n"
+"\n"
+"  # Build a .tar.zst directly, reading members in parallel (no `tar`)\n"
+"  gzstd -o backup.tar.zst --tar --exclude '*/.cache/*' ~/docs ~/proj\n"
 "\n"
 "  # CPU-only baseline at level 3 using all cores\n"
 "  gzstd --cpu-only -T 0 big.tar\n"
@@ -6458,6 +6572,937 @@ static void enqueue_direct_chunk(TaskQueue & q, size_t seq, const char * buf, si
 }
 #endif
 
+#ifndef _WIN32
+// Set when --tar skips a member (permissions, vanished, socket) or a file
+// changed during read.  main() promotes it to a non-zero exit (GNU tar parity).
+static std::atomic<bool> g_tar_had_errors{false};
+
+/*======================================================================
+ --tar: native parallel GNU-format tar archive creation
+ ----------------------------------------------------------------------
+ `tar -cf - … | gzstd` is bottlenecked by tar: it walks the tree and reads
+ every member on a single thread before gzstd ever sees a byte.  Instead we
+ synthesize the tar byte stream ourselves and read member files in parallel,
+ feeding the existing TaskQueue → workers → writer pipeline (CPU and GPU).
+
+ Two phases:
+   1. build_layout() — single-threaded walk: lstat every member, apply
+      --exclude, detect hardlinks, and compute each member's byte offset in
+      the virtual tar stream (header length + data + 512-byte padding are all
+      known from metadata alone).  Result: an ordered entry table and the
+      total stream length.
+   2. assemble() — parallel: split the virtual stream into chunk_size chunks,
+      read the file ranges each chunk overlaps with concurrent preads, and
+      push chunks to the queue.  Pushes are emitted in strict sequence order
+      (a tiny reorder buffer) so the FrameThrottle's FIFO invariant holds
+      (see TaskQueue::re_enqueue) — only the reads run out of order.
+
+ Output is a standard GNU-format .tar.zst, extractable by `tar --zstd -xf`
+ or `gzstd -d | tar -x`.  Format details mirror `tar --format=gnu` (Ubuntu's
+ default): ustar base block + OLDGNU magic, 'L'/'K' long-name/long-link
+ entries for paths > 100 bytes, and base-256 numeric fields for files > 8 GiB
+ or uid/gid > 2^21.
+======================================================================*/
+namespace tarx {
+
+static constexpr size_t TAR_BLK    = 512;
+static constexpr size_t TAR_RECORD = 10240;  // GNU default blocking factor (20 blocks)
+
+static inline uint64_t tar_round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+
+// One archive member.  Offsets are into the virtual (uncompressed) tar stream.
+struct TarEntry {
+  std::string path;       // member name (dirs carry a trailing '/')
+  std::string link;       // symlink target or hardlink referent ("" otherwise)
+  std::string src;        // filesystem path to pread (regular files only)
+  uint64_t    size      = 0;   // data bytes (0 for dir/symlink/hardlink/special)
+  uint64_t    hdr_off   = 0;   // offset of the (first) header block
+  uint64_t    data_off  = 0;   // offset of file data = hdr_off + hdr_len
+  uint64_t    entry_end = 0;   // data_off + round_up(size, 512)
+  uint32_t    hdr_len   = (uint32_t)TAR_BLK;  // 512 + optional L/K blocks
+  uint32_t    mode      = 0;
+  uint64_t    uid = 0, gid = 0;
+  int64_t     mtime     = 0;
+  uint64_t    rdev      = 0;   // char/block device nodes
+  char        typeflag  = '0';
+};
+
+struct TarLayout {
+  std::vector<TarEntry> entries;
+  std::unordered_map<uint64_t, std::string> unames, gnames;  // uid/gid → name (walk-populated)
+  uint64_t total_size = 0;     // full padded virtual tar stream length
+  bool     had_errors = false; // a member was skipped (permissions, vanished, socket)
+};
+
+// total header bytes for a member with the given name/link lengths.
+static uint32_t header_len(size_t name_len, size_t link_len) {
+  uint32_t n = (uint32_t)TAR_BLK;
+  if (name_len > 100) n += (uint32_t)(TAR_BLK + tar_round_up(name_len + 1, TAR_BLK));
+  if (link_len > 100) n += (uint32_t)(TAR_BLK + tar_round_up(link_len + 1, TAR_BLK));
+  return n;
+}
+
+// Write `val` into an n-byte tar numeric field: octal ASCII (n-1 digits + NUL)
+// when it fits, else GNU base-256 (0x80 marker + big-endian binary).
+static void put_num(char * f, size_t n, uint64_t val) {
+  bool fits = (3 * (n - 1) >= 64) || (val < (uint64_t(1) << (3 * (n - 1))));
+  if (fits) {
+    for (size_t i = n - 1; i-- > 0; ) { f[i] = char('0' + (val & 7)); val >>= 3; }
+    f[n - 1] = '\0';
+  } else {
+    for (size_t i = n; i-- > 1; ) { f[i] = char(val & 0xff); val >>= 8; }
+    f[0] = char(0x80);
+  }
+}
+
+// Emit one 512-byte ustar/OLDGNU header block.
+static void emit_block(char * h, const std::string & name, uint32_t mode,
+                       uint64_t uid, uint64_t gid, uint64_t size, uint64_t mtime,
+                       char typeflag, const std::string & link,
+                       const std::string & uname, const std::string & gname,
+                       uint64_t devmajor, uint64_t devminor) {
+  std::memset(h, 0, TAR_BLK);
+  std::memcpy(h, name.data(), std::min<size_t>(name.size(), 100));
+  put_num(h + 100, 8,  mode & 07777);
+  put_num(h + 108, 8,  uid);
+  put_num(h + 116, 8,  gid);
+  put_num(h + 124, 12, size);
+  put_num(h + 136, 12, mtime);
+  h[156] = typeflag;
+  if (!link.empty()) std::memcpy(h + 157, link.data(), std::min<size_t>(link.size(), 100));
+  std::memcpy(h + 257, "ustar  ", 8);   // OLDGNU magic+version: "ustar  \0"
+  if (!uname.empty()) std::memcpy(h + 265, uname.data(), std::min<size_t>(uname.size(), 31));
+  if (!gname.empty()) std::memcpy(h + 297, gname.data(), std::min<size_t>(gname.size(), 31));
+  if (typeflag == '3' || typeflag == '4') {
+    put_num(h + 329, 8, devmajor);
+    put_num(h + 337, 8, devminor);
+  }
+  // Checksum: sum of all 512 bytes with the chksum field counted as spaces.
+  std::memset(h + 148, ' ', 8);
+  uint64_t sum = 0;
+  for (size_t i = 0; i < TAR_BLK; ++i) sum += (unsigned char)h[i];
+  char cs[8];
+  std::snprintf(cs, sizeof(cs), "%06o", (unsigned)(sum & 0777777));
+  std::memcpy(h + 148, cs, 6);
+  h[154] = '\0';
+  h[155] = ' ';
+}
+
+// Emit a GNU long-name ('L') or long-link ('K') pseudo-entry: a header naming
+// "././@LongLink" whose data is the full string (NUL-terminated, padded).
+static size_t emit_longlink(char * out, const std::string & s, char type) {
+  emit_block(out, "././@LongLink", 0, 0, 0, s.size() + 1, 0, type, "", "", "", 0, 0);
+  size_t datalen = s.size() + 1;
+  std::memcpy(out + TAR_BLK, s.data(), s.size());
+  size_t padded = tar_round_up(datalen, TAR_BLK);
+  std::memset(out + TAR_BLK + s.size(), 0, padded - s.size());  // NUL + pad
+  return TAR_BLK + padded;
+}
+
+// Synthesize a member's full header (long-name/link blocks + base block) into
+// `out` (caller sizes it ≥ e.hdr_len).  Returns bytes written (== e.hdr_len).
+static size_t emit_header(const TarEntry & e, const TarLayout & lay, char * out) {
+  static const std::string empty;
+  size_t off = 0;
+  if (e.path.size() > 100) off += emit_longlink(out + off, e.path, 'L');
+  if (e.link.size() > 100) off += emit_longlink(out + off, e.link, 'K');
+  auto uit = lay.unames.find(e.uid);
+  auto git = lay.gnames.find(e.gid);
+  emit_block(out + off, e.path, e.mode, e.uid, e.gid, e.size, (uint64_t)e.mtime,
+             e.typeflag, e.link,
+             uit != lay.unames.end() ? uit->second : empty,
+             git != lay.gnames.end() ? git->second : empty,
+             (uint64_t)major((dev_t)e.rdev), (uint64_t)minor((dev_t)e.rdev));
+  return off + TAR_BLK;
+}
+
+// ---- Phase 1: walk the source tree and lay out the virtual tar stream. ----
+struct LayoutBuilder {
+  const Options & opt;
+  Meter * m;
+  TarLayout lay;
+  uint64_t off = 0;
+  std::map<std::pair<uint64_t, uint64_t>, std::string> hardlinks;  // (dev,ino) → first member
+  bool warned_leading_slash = false;
+
+  LayoutBuilder(const Options & o, Meter * mm) : opt(o), m(mm) {}
+
+  void resolve_owner(uint64_t uid, uint64_t gid) {
+    if (opt.tar_numeric_owner) return;
+    if (lay.unames.find(uid) == lay.unames.end()) {
+      std::string nm; char buf[1024]; struct passwd pw, *res = nullptr;
+      if (getpwuid_r((uid_t)uid, &pw, buf, sizeof buf, &res) == 0 && res) nm = pw.pw_name;
+      lay.unames.emplace(uid, std::move(nm));
+    }
+    if (lay.gnames.find(gid) == lay.gnames.end()) {
+      std::string nm; char buf[1024]; struct group gr, *res = nullptr;
+      if (getgrgid_r((gid_t)gid, &gr, buf, sizeof buf, &res) == 0 && res) nm = gr.gr_name;
+      lay.gnames.emplace(gid, std::move(nm));
+    }
+  }
+
+  void add(TarEntry e) {
+    e.hdr_off   = off;
+    e.hdr_len   = header_len(e.path.size(), e.link.size());
+    e.data_off  = off + e.hdr_len;
+    e.entry_end = e.data_off + tar_round_up(e.size, TAR_BLK);
+    off = e.entry_end;
+    lay.entries.push_back(std::move(e));
+  }
+
+  // True if the path being walked is excluded.  Matches against the *filesystem
+  // path* (absolute when the source is absolute), exactly like GNU tar — so
+  // `--exclude=/proc` works when archiving `/`.  GNU --exclude defaults: '*'
+  // spans '/' (no FNM_PATHNAME); FNM_LEADING_DIR so a directory pattern drops
+  // its whole subtree; non-anchored — the pattern may match the full path OR any
+  // component-suffix after a '/' (so bare `.cache` drops `a/.cache`).  A pattern
+  // with a leading '/' can only match at the full path (its slash can't match a
+  // mid-path suffix start), so `/tmp` is effectively anchored to the source root
+  // and does NOT drop `var/tmp` — matching GNU tar.  Trailing '/' is ignored.
+  bool excluded(const std::string & path) const {
+    if (opt.tar_excludes.empty()) return false;
+    std::string name = path;
+    if (name.size() > 1 && name.back() == '/') name.pop_back();
+    for (const std::string & pat : opt.tar_excludes) {
+      std::string p = pat;
+      if (p.size() > 1 && p.back() == '/') p.pop_back();
+      for (size_t pos = 0; ; ) {
+        if (fnmatch(p.c_str(), name.c_str() + pos, FNM_LEADING_DIR) == 0) return true;
+        size_t slash = name.find('/', pos);
+        if (slash == std::string::npos) break;
+        pos = slash + 1;
+      }
+    }
+    return false;
+  }
+
+  // A genuine failure (cannot stat/open/readlink, file changed mid-read): shown
+  // by default and promoted to a non-zero exit, like GNU tar's errors.
+  void warn_skip(const std::string & path, const std::string & why) {
+    lay.had_errors = true;
+    g_tar_had_errors.store(true, std::memory_order_relaxed);
+    vlog(V_ERROR, opt, "gzstd: tar: skipping " + path + ": " + why + "\n");
+  }
+
+  // A benign skip (socket, unknown file type) — GNU tar's "file ignored"
+  // warning class.  Expected on a full-system backup (sockets in /run, /tmp),
+  // so it is informational only: shown at -v, never an error or exit change.
+  // This makes the default behaviour equivalent to GNU tar's
+  // --warning=no-file-ignored without needing a flag.
+  void note_skip(const std::string & path, const std::string & why) {
+    vlog(V_VERBOSE, opt, "gzstd: tar: ignoring " + path + ": " + why + "\n");
+  }
+
+  // fspath: filesystem path to stat/read.  member: name to store in the archive.
+  // boundary_dev: (dev_t)-1 until --one-file-system fixes it to a source's root.
+  void walk(const std::string & fspath, const std::string & member, dev_t boundary_dev) {
+    if (excluded(fspath)) return;
+    struct stat st;
+    if (::lstat(fspath.c_str(), &st) != 0) { warn_skip(fspath, std::strerror(errno)); return; }
+
+    // --one-file-system: this entry sits on a different filesystem than the
+    // source root it was reached from.  A crossed mount point (always a dir) is
+    // still recorded as an empty stub below — so the mount point exists on
+    // restore — but we do not descend into it.
+    const bool cross = opt.tar_one_file_system && boundary_dev != (dev_t)-1
+                       && st.st_dev != boundary_dev;
+
+    if (S_ISDIR(st.st_mode)) {
+      // Record the directory itself.  Skip the root placeholder (empty member):
+      // an absolute source's members are stored leading-'/'-stripped with no
+      // root entry, matching GNU tar (`/` → `proc/`, `home/...`, not `./proc`).
+      if (!member.empty()) {
+        TarEntry e;
+        e.path = member;
+        if (e.path.back() != '/') e.path += '/';
+        e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid; e.mtime = st.st_mtime;
+        e.typeflag = '5';
+        resolve_owner(e.uid, e.gid); add(std::move(e));
+      }
+      if (cross) return;  // mount-point stub recorded; do not descend
+
+      dev_t child_boundary = boundary_dev;
+      if (opt.tar_one_file_system && boundary_dev == (dev_t)-1) child_boundary = st.st_dev;
+
+      DIR * d = ::opendir(fspath.c_str());
+      if (!d) { warn_skip(fspath, std::strerror(errno)); return; }
+      std::vector<std::string> names;
+      for (struct dirent * de; (de = ::readdir(d)); ) {
+        if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
+        names.emplace_back(de->d_name);
+      }
+      ::closedir(d);
+      std::sort(names.begin(), names.end());  // deterministic ordering across runs
+      std::string base = member;
+      if (!base.empty() && base.back() == '/') base.pop_back();
+      const std::string sep = (!fspath.empty() && fspath.back() == '/') ? "" : "/";
+      for (const std::string & nm : names)
+        walk(fspath + sep + nm, base.empty() ? nm : base + "/" + nm, child_boundary);
+      return;
+    }
+
+    if (cross) return;  // non-directory on a crossed filesystem: skip
+
+    TarEntry e;
+    e.path = member; e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid;
+    e.mtime = st.st_mtime;
+
+    if (S_ISREG(st.st_mode)) {
+      if (st.st_nlink > 1) {
+        auto key = std::make_pair((uint64_t)st.st_dev, (uint64_t)st.st_ino);
+        auto it = hardlinks.find(key);
+        if (it != hardlinks.end()) {
+          e.typeflag = '1'; e.link = it->second; e.size = 0;  // hardlink, no data
+          resolve_owner(e.uid, e.gid); add(std::move(e)); return;
+        }
+        hardlinks.emplace(key, member);  // first occurrence → store as a regular file
+      }
+      e.typeflag = '0'; e.size = (uint64_t)st.st_size; e.src = fspath;
+    } else if (S_ISLNK(st.st_mode)) {
+      std::vector<char> tgt((size_t)st.st_size + 1);
+      ssize_t n = ::readlink(fspath.c_str(), tgt.data(), tgt.size());
+      if (n < 0) { warn_skip(fspath, std::strerror(errno)); return; }
+      e.typeflag = '2'; e.link.assign(tgt.data(), (size_t)n); e.size = 0;
+    } else if (S_ISCHR(st.st_mode)) {
+      e.typeflag = '3'; e.rdev = st.st_rdev;
+    } else if (S_ISBLK(st.st_mode)) {
+      e.typeflag = '4'; e.rdev = st.st_rdev;
+    } else if (S_ISFIFO(st.st_mode)) {
+      e.typeflag = '6';
+    } else {
+      note_skip(fspath, S_ISSOCK(st.st_mode) ? "socket" : "unknown file type");
+      return;
+    }
+    resolve_owner(e.uid, e.gid); add(std::move(e));
+  }
+
+  void finalize() {
+    // Two zero blocks (end-of-archive marker) then pad to a full record.
+    lay.total_size = tar_round_up(off + 2 * TAR_BLK, TAR_RECORD);
+  }
+};
+
+// Strip leading slashes from a command-line source so members are stored
+// relative (GNU tar default).  Warns once.
+static std::string strip_leading_slash(std::string s, const Options & opt, bool & warned) {
+  size_t i = 0;
+  while (i < s.size() && s[i] == '/') ++i;
+  if (i > 0) {
+    if (!warned) {
+      vlog(V_ERROR, opt, "gzstd: tar: removing leading '/' from member names\n");
+      warned = true;
+    }
+    s = s.substr(i);
+  }
+  return s;
+}
+
+static TarLayout build_layout(const Options & opt, Meter * m) {
+  LayoutBuilder b(opt, m);
+  if (opt.verbosity >= V_VERBOSE)
+    vlog(V_VERBOSE, opt, "[TAR] scanning " + std::to_string(opt.tar_sources.size())
+         + " source path(s)\n");
+  for (std::string src : opt.tar_sources) {
+    // Normalize: drop trailing slashes (keep a lone "/"), strip leading slash.
+    // An empty member (source was "/") means no root entry — children are stored
+    // directly as "proc/", "home/...", matching GNU tar archiving "/".
+    while (src.size() > 1 && src.back() == '/') src.pop_back();
+    std::string member = strip_leading_slash(src, opt, b.warned_leading_slash);
+    b.walk(src, member, (dev_t)-1);
+  }
+  b.finalize();
+  if (opt.verbosity >= V_VERBOSE) {
+    char sz[64]; human_bytes(double(b.lay.total_size), sz, sizeof(sz));
+    vlog(V_VERBOSE, opt, "[TAR] " + std::to_string(b.lay.entries.size())
+         + " entries, " + sz + " uncompressed tar stream\n");
+  }
+  return std::move(b.lay);
+}
+
+// ---- Phase 2: assemble the tar stream into seq-ordered chunks, in parallel. ----
+// Reads run concurrently; a reorder buffer + single pusher emit chunks to the
+// queue in strict sequence order so the FrameThrottle FIFO invariant holds.
+static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size,
+                     const Options & opt, Meter * m) {
+  const uint64_t total = lay.total_size;
+  const size_t nchunks = chunk_size ? (size_t)((total + chunk_size - 1) / chunk_size) : 0;
+  if (nchunks == 0) return;
+
+  int hw = resolve_cpu_threads(opt.cpu_threads);
+  int nreaders = opt.read_threads > 0 ? (int)opt.read_threads
+                                      : std::max(3, std::min(12, hw / 8));
+  nreaders = std::max(1, std::min<int>(nreaders, (int)nchunks));
+  if (opt.verbosity >= V_VERBOSE)
+    vlog(V_VERBOSE, opt, "[TAR] " + std::to_string(nreaders) + " parallel reader(s), "
+         + std::to_string(nchunks) + " chunks\n");
+
+  std::atomic<size_t> next_chunk{0};
+
+  // Reorder buffer: readers deposit completed chunks here; a pusher drains them
+  // to the queue in strict order.  Readers may only CLAIM a chunk once it is
+  // within `window` of the push frontier (push_next) — this keeps the head
+  // chunk always depositable (a deposit never blocks), so the head reader can't
+  // be wedged behind later chunks.  window ≥ nreaders keeps every reader busy.
+  const size_t window = std::max<size_t>(8, (size_t)nreaders * 2);
+  std::mutex rb_mx;
+  std::condition_variable rb_cv;        // signals: chunk arrived / frontier advanced
+  std::map<size_t, Task> ready;
+  size_t push_next = 0;
+
+  // Assemble one chunk [a,b) into a zero-filled owning buffer.
+  auto assemble_chunk = [&](size_t ci, std::string & cur_path, int & cur_fd, int & cur_errno) -> Task {
+    uint64_t a = (uint64_t)ci * chunk_size;
+    uint64_t b = std::min(total, a + chunk_size);
+    size_t clen = (size_t)(b - a);
+    Task t; t.seq = ci; t.data.assign(clen, 0);
+    char * outp = t.data.data();
+    // First entry whose data/padding could reach into this chunk (entry_end > a).
+    auto it = std::upper_bound(lay.entries.begin(), lay.entries.end(), a,
+                [](uint64_t v, const TarEntry & e) { return v < e.entry_end; });
+    std::vector<char> hdrbuf;
+    for (; it != lay.entries.end() && it->hdr_off < b; ++it) {
+      const TarEntry & e = *it;
+      // Header region.
+      uint64_t he = e.hdr_off + e.hdr_len;
+      if (e.hdr_off < b && he > a) {
+        if (hdrbuf.size() < e.hdr_len) hdrbuf.resize(e.hdr_len);
+        emit_header(e, lay, hdrbuf.data());
+        uint64_t s = std::max<uint64_t>(e.hdr_off, a), en = std::min<uint64_t>(he, b);
+        std::memcpy(outp + (s - a), hdrbuf.data() + (s - e.hdr_off), (size_t)(en - s));
+      }
+      // Data region (file bytes); padding stays zero.
+      if (e.size > 0) {
+        uint64_t de = e.data_off + e.size;
+        if (e.data_off < b && de > a) {
+          uint64_t s = std::max<uint64_t>(e.data_off, a), en = std::min<uint64_t>(de, b);
+          off_t fileoff = (off_t)(s - e.data_off);
+          size_t len = (size_t)(en - s);
+          if (cur_path != e.src) {
+            if (cur_fd >= 0) ::close(cur_fd);
+            cur_fd = ::open(e.src.c_str(), O_RDONLY);
+            cur_errno = (cur_fd < 0) ? errno : 0;
+            cur_path = e.src;
+          }
+          size_t done = 0;
+          if (cur_fd >= 0) {
+            while (done < len) {
+              ssize_t r = ::pread(cur_fd, outp + (s - a) + done, len - done, fileoff + (off_t)done);
+              if (r <= 0) break;
+              done += (size_t)r;
+            }
+          }
+          if (done < len) {  // unreadable/vanished/shrank: remainder stays zero (GNU tar parity)
+            g_tar_had_errors.store(true, std::memory_order_relaxed);
+            if (cur_fd < 0)
+              vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": cannot read ("
+                   + std::strerror(cur_errno) + ")\n");
+            else
+              vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": file changed as we read it\n");
+          }
+        }
+      }
+    }
+    if (m) m->read_bytes.fetch_add(clen);  // tar-stream bytes produced (progress %)
+    return t;
+  };
+
+  auto reader = [&]() {
+    std::string cur_path; int cur_fd = -1, cur_errno = 0;
+    for (;;) {
+      size_t ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
+      if (ci >= nchunks) break;
+      {  // throttle read-ahead to `window` chunks past the push frontier
+        std::unique_lock<std::mutex> lk(rb_mx);
+        rb_cv.wait(lk, [&] { return ci < push_next + window; });
+      }
+      Task t = assemble_chunk(ci, cur_path, cur_fd, cur_errno);  // concurrent preads (unlocked)
+      {
+        std::unique_lock<std::mutex> lk(rb_mx);
+        ready.emplace(ci, std::move(t));
+      }
+      rb_cv.notify_all();
+    }
+    if (cur_fd >= 0) ::close(cur_fd);
+  };
+
+  // Pusher: drain `ready` to the queue in strict sequence order.
+  auto pusher = [&]() {
+    for (;;) {
+      Task t;
+      {
+        std::unique_lock<std::mutex> lk(rb_mx);
+        rb_cv.wait(lk, [&] { return !ready.empty() && ready.begin()->first == push_next; });
+        t = std::move(ready.begin()->second);
+        ready.erase(ready.begin());
+        ++push_next;
+      }
+      rb_cv.notify_all();        // advance the frontier: unblock readers waiting to claim
+      queue.push(std::move(t));  // may block on the queue's byte cap (backpressure)
+      if (push_next >= nchunks) break;
+    }
+  };
+
+  std::vector<std::thread> pool;
+  pool.reserve((size_t)nreaders);
+  for (int i = 0; i < nreaders; ++i) pool.emplace_back(reader);
+  std::thread push_thr(pusher);
+  for (auto & th : pool) th.join();
+  push_thr.join();
+}
+
+/*======================================================================
+ Extraction: parse the decompressed tar stream and write files securely.
+ ----------------------------------------------------------------------
+ The archive's zstd stream is decompressed by the existing parallel pipeline
+ (writing the tar byte stream to a pipe); this consumer reads that pipe.  A
+ single parser thread walks the serial tar stream (tar is inherently serial),
+ handles directories/symlinks/specials inline, and dispatches regular-file
+ writes to a worker pool — so file I/O runs in parallel with decompression.
+
+ Security: every filesystem op goes through the destination dir fd using
+ openat/mkdirat/symlinkat with O_NOFOLLOW on EVERY path component, so a member
+ symlink can never be traversed to escape the destination (the classic
+ symlink-escape CVE).  `..` components are rejected outright (path traversal).
+======================================================================*/
+
+// Read an octal or GNU base-256 tar numeric field.
+static uint64_t get_num(const char * f, size_t n) {
+  if ((unsigned char)f[0] & 0x80) {                  // GNU base-256, big-endian
+    uint64_t v = (uint64_t)((unsigned char)f[0] & 0x7f);
+    for (size_t i = 1; i < n; ++i) v = (v << 8) | (unsigned char)f[i];
+    return v;
+  }
+  uint64_t v = 0; size_t i = 0;
+  while (i < n && (f[i] == ' ' || f[i] == '\0')) ++i;
+  for (; i < n && f[i] >= '0' && f[i] <= '7'; ++i) v = (v << 3) | (uint64_t)(f[i] - '0');
+  return v;
+}
+
+// Read a NUL-terminated (or full-width) string field.
+static std::string get_str(const char * f, size_t n) {
+  size_t len = 0; while (len < n && f[len] != '\0') ++len;
+  return std::string(f, len);
+}
+
+// A parsed tar entry (metadata only).
+struct InEntry {
+  std::string name, linkname;
+  uint64_t size = 0, uid = 0, gid = 0;
+  uint32_t mode = 0, devmajor = 0, devminor = 0;
+  int64_t  mtime = 0;
+  char     typeflag = '0';
+};
+
+// Buffered reader over a fd (the decompression pipe).
+struct StreamReader {
+  int fd; std::vector<char> buf; size_t pos = 0, fill = 0; bool eof = false;
+  explicit StreamReader(int f) : fd(f), buf(1 << 20) {}
+  void refill() {
+    pos = 0; fill = 0;
+    ssize_t r; do { r = ::read(fd, buf.data(), buf.size()); } while (r < 0 && errno == EINTR);
+    if (r <= 0) { eof = true; return; }
+    fill = (size_t)r;
+  }
+  size_t read_some(char * dst, size_t n) {
+    if (pos == fill) { refill(); if (pos == fill) return 0; }
+    size_t k = std::min(fill - pos, n);
+    std::memcpy(dst, buf.data() + pos, k); pos += k; return k;
+  }
+  bool read_exact(char * dst, size_t n) {
+    size_t got = 0; while (got < n) { size_t k = read_some(dst + got, n - got); if (!k) return false; got += k; }
+    return true;
+  }
+  bool skip(uint64_t n) {
+    char tmp[8192];
+    while (n) { size_t k = read_some(tmp, (size_t)std::min<uint64_t>(n, sizeof tmp)); if (!k) return false; n -= k; }
+    return true;
+  }
+  void drain() { char tmp[8192]; while (read_some(tmp, sizeof tmp)) {} }  // consume to EOF (unblocks producer)
+};
+
+class Extractor {
+public:
+  Extractor(int dest_fd, const Options & opt, Meter * m)
+    : dest_fd_(dest_fd), opt_(opt), m_(m), as_root_(::geteuid() == 0) {}
+
+  bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
+
+  void run(int read_fd) {
+    start_pool();
+    StreamReader r(read_fd);
+    parse(r);
+    r.drain();              // consume trailing padding so the decompressor can finish
+    stop_pool();
+    finish_deferred();
+  }
+
+private:
+  static constexpr uint64_t SMALL_FILE_MAX = 4 * 1024 * 1024;  // buffer+dispatch below this; stream above
+  int dest_fd_; const Options & opt_; Meter * m_; bool as_root_;
+  std::atomic<bool> had_error_{false};
+
+  // Deferred work applied after all data is written.
+  struct Hard { std::string name, target; };
+  struct DirMeta { std::string path; uint32_t mode; int64_t mtime; uint64_t uid, gid; };
+  std::vector<Hard> hardlinks_;
+  std::vector<DirMeta> dirmeta_;
+
+  void fail(const std::string & path, const std::string & why) {
+    had_error_.store(true, std::memory_order_relaxed);
+    vlog(V_ERROR, opt_, "gzstd: untar: " + path + ": " + why + "\n");
+  }
+
+  // ---- secure path resolution (O_NOFOLLOW on every component) ----
+  // Returns the fd of rel's parent directory (caller closes) and sets `leaf`.
+  // Refuses any '..' component; refuses to traverse a symlink.  create: mkdir
+  // missing intermediates.
+  int open_parent(const std::string & rel, std::string & leaf, bool create) {
+    std::vector<std::string> comps;
+    size_t i = 0;
+    while (i < rel.size()) {
+      size_t j = rel.find('/', i);
+      std::string c = rel.substr(i, j == std::string::npos ? std::string::npos : j - i);
+      if (!c.empty() && c != ".") {
+        if (c == "..") return -1;                 // path traversal: refuse
+        comps.push_back(std::move(c));
+      }
+      if (j == std::string::npos) break; else i = j + 1;
+    }
+    if (comps.empty()) return -1;
+    leaf = comps.back();
+    int cur = ::dup(dest_fd_);
+    if (cur < 0) return -1;
+    for (size_t k = 0; k + 1 < comps.size(); ++k) {
+      int nx = ::openat(cur, comps[k].c_str(), O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC);
+      if (nx < 0 && create && errno == ENOENT) {
+        if (::mkdirat(cur, comps[k].c_str(), 0755) != 0 && errno != EEXIST) { ::close(cur); return -1; }
+        nx = ::openat(cur, comps[k].c_str(), O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC);
+      }
+      ::close(cur);
+      if (nx < 0) return -1;                       // ELOOP (symlink), ENOTDIR, … → refuse
+      cur = nx;
+    }
+    return cur;
+  }
+
+  void set_meta_fd(int fd, uint32_t mode, int64_t mtime, uint64_t uid, uint64_t gid) {
+    (void)::fchmod(fd, mode & 07777);
+    struct timespec ts[2]; ts[0].tv_sec = (time_t)mtime; ts[0].tv_nsec = 0; ts[1] = ts[0];
+    (void)::futimens(fd, ts);
+    if (as_root_ && ::fchown(fd, (uid_t)uid, (gid_t)gid) != 0) { /* best-effort */ }
+  }
+
+  // Securely create/replace a regular file; returns an open write fd or -1.
+  int create_file(const std::string & rel, uint32_t mode) {
+    std::string leaf; int pfd = open_parent(rel, leaf, true);
+    if (pfd < 0) return -1;
+    ::unlinkat(pfd, leaf.c_str(), 0);              // remove any existing file/symlink first
+    int fd = ::openat(pfd, leaf.c_str(),
+                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode & 07777);
+    ::close(pfd);
+    return fd;
+  }
+
+  bool make_dir(const std::string & rel, uint32_t mode) {
+    std::string leaf; int pfd = open_parent(rel, leaf, true);
+    if (pfd < 0) return false;
+    bool ok = true;
+    if (::mkdirat(pfd, leaf.c_str(), mode & 07777) != 0) {
+      if (errno == EEXIST) {
+        struct stat st;
+        if (::fstatat(pfd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(st.st_mode)) {
+          ::unlinkat(pfd, leaf.c_str(), 0);        // a planted symlink/file where a dir belongs
+          ok = (::mkdirat(pfd, leaf.c_str(), mode & 07777) == 0);
+        }
+      } else ok = false;
+    }
+    ::close(pfd);
+    return ok;
+  }
+
+  bool make_symlink(const std::string & rel, const std::string & target,
+                    uint64_t uid, uint64_t gid) {
+    std::string leaf; int pfd = open_parent(rel, leaf, true);
+    if (pfd < 0) return false;
+    ::unlinkat(pfd, leaf.c_str(), 0);
+    bool ok = (::symlinkat(target.c_str(), pfd, leaf.c_str()) == 0);
+    if (ok && as_root_ && ::fchownat(pfd, leaf.c_str(), (uid_t)uid, (gid_t)gid, AT_SYMLINK_NOFOLLOW) != 0) { /* best-effort */ }
+    ::close(pfd);
+    return ok;
+  }
+
+  bool make_special(const std::string & rel, uint32_t mode, char type,
+                    uint32_t major_, uint32_t minor_) {
+    std::string leaf; int pfd = open_parent(rel, leaf, true);
+    if (pfd < 0) return false;
+    ::unlinkat(pfd, leaf.c_str(), 0);
+    mode_t mt = (mode & 07777) | (type == '6' ? S_IFIFO : type == '3' ? S_IFCHR : S_IFBLK);
+    dev_t dev = (type == '6') ? 0 : makedev(major_, minor_);
+    bool ok = (::mknodat(pfd, leaf.c_str(), mt, dev) == 0);
+    ::close(pfd);
+    return ok;
+  }
+
+  // ---- writer pool (regular-file data writes, in parallel with decompression) ----
+  struct Job { std::string rel; uint32_t mode; int64_t mtime; uint64_t uid, gid; std::vector<char> data; };
+  std::mutex q_m_; std::condition_variable q_cv_prod_, q_cv_cons_;
+  std::deque<Job> q_; size_t q_bytes_ = 0; bool q_done_ = false;
+  static constexpr size_t Q_MAX_BYTES = 256 * 1024 * 1024;
+  std::vector<std::thread> writers_;
+
+  void start_pool() {
+    // --write-threads overrides; auto = min(worker threads, 16) — beyond ~16 the
+    // gain plateaus on filesystem metadata/journal contention (tune per box).
+    int n = opt_.write_threads > 0 ? (int)opt_.write_threads
+                                   : std::min(resolve_cpu_threads(opt_.cpu_threads), 16);
+    n = std::max(1, n);
+    if (opt_.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt_, "[UNTAR] " + std::to_string(n) + " writer thread(s)\n");
+    for (int i = 0; i < n; ++i) writers_.emplace_back([this] { writer_loop(); });
+  }
+  void stop_pool() {
+    { std::lock_guard<std::mutex> lk(q_m_); q_done_ = true; } q_cv_cons_.notify_all();
+    for (auto & t : writers_) t.join();
+    writers_.clear();
+  }
+  void enqueue(Job && j) {
+    std::unique_lock<std::mutex> lk(q_m_);
+    q_cv_prod_.wait(lk, [&] { return q_bytes_ < Q_MAX_BYTES || q_.empty(); });
+    q_bytes_ += j.data.size();
+    q_.push_back(std::move(j));
+    lk.unlock(); q_cv_cons_.notify_one();
+  }
+  void writer_loop() {
+    for (;;) {
+      Job j;
+      {
+        std::unique_lock<std::mutex> lk(q_m_);
+        q_cv_cons_.wait(lk, [&] { return !q_.empty() || q_done_; });
+        if (q_.empty()) return;
+        j = std::move(q_.front()); q_.pop_front();
+        q_bytes_ -= j.data.size();
+        lk.unlock(); q_cv_prod_.notify_all();
+      }
+      write_small(j);
+    }
+  }
+  void write_small(const Job & j) {
+    int fd = create_file(j.rel, j.mode);
+    if (fd < 0) { fail(j.rel, std::strerror(errno)); return; }
+    size_t off = 0; bool ok = true;
+    while (off < j.data.size()) {
+      ssize_t w = ::write(fd, j.data.data() + off, j.data.size() - off);
+      if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
+      off += (size_t)w;
+    }
+    if (!ok) fail(j.rel, std::strerror(errno));
+    set_meta_fd(fd, j.mode, j.mtime, j.uid, j.gid);
+    ::close(fd);
+    if (m_) m_->wrote_bytes.fetch_add(j.data.size(), std::memory_order_relaxed);
+  }
+
+  // ---- parsing ----
+  // Normalize a member name to a safe relative path (strip leading '/' and './';
+  // empty result means "skip").  '..' is rejected later in open_parent().
+  static std::string norm(const std::string & raw) {
+    std::string s = raw;
+    size_t i = 0; while (i < s.size() && s[i] == '/') ++i; s = s.substr(i);
+    while (s.rfind("./", 0) == 0) s = s.substr(2);
+    return s;
+  }
+
+  void parse(StreamReader & r) {
+    char blk[TAR_BLK];
+    std::string pend_name, pend_link;     // GNU 'L'/'K' overrides for the next header
+    std::string pax_path, pax_link; uint64_t pax_size = 0; int64_t pax_mtime = 0;
+    bool pax_has_size = false, pax_has_mtime = false;
+    int zero_run = 0;
+    while (true) {
+      if (!r.read_exact(blk, TAR_BLK)) {
+        if (zero_run == 0) fail("(archive)", "truncated tar stream");
+        return;
+      }
+      bool all_zero = true;
+      for (size_t k = 0; k < TAR_BLK; ++k) if (blk[k]) { all_zero = false; break; }
+      if (all_zero) { if (++zero_run >= 2) return; else continue; }
+      zero_run = 0;
+
+      // Verify the header checksum (also guards against reading garbage).
+      uint64_t stored = get_num(blk + 148, 8);
+      uint64_t sum = 0; for (size_t k = 0; k < TAR_BLK; ++k)
+        sum += (k >= 148 && k < 156) ? (unsigned char)' ' : (unsigned char)blk[k];
+      if (sum != stored) { fail("(archive)", "bad tar header checksum"); return; }
+
+      char type = blk[156];
+      uint64_t size = get_num(blk + 124, 12);
+
+      // GNU long name / long link: data is the string for the NEXT header.
+      if (type == 'L' || type == 'K') {
+        std::vector<char> nm(size + 1, 0);
+        if (!r.read_exact(nm.data(), size)) { fail("(archive)", "truncated long name"); return; }
+        r.skip((TAR_BLK - (size % TAR_BLK)) % TAR_BLK);
+        std::string s(nm.data(), size ? size - (nm[size - 1] == 0 ? 1 : 0) : 0);
+        if (type == 'L') pend_name = s; else pend_link = s;
+        continue;
+      }
+      // pax extended headers: "len key=value\n" records.
+      if (type == 'x' || type == 'g') {
+        std::vector<char> pd(size);
+        if (!r.read_exact(pd.data(), size)) { fail("(archive)", "truncated pax header"); return; }
+        r.skip((TAR_BLK - (size % TAR_BLK)) % TAR_BLK);
+        size_t p = 0; std::string rec(pd.data(), pd.size());
+        while (p < rec.size()) {
+          size_t sp = rec.find(' ', p); if (sp == std::string::npos) break;
+          int rlen = atoi(rec.substr(p, sp - p).c_str()); if (rlen <= 0) break;
+          std::string kv = rec.substr(sp + 1, (size_t)rlen - (sp - p) - 2);  // drop trailing '\n'
+          size_t eq = kv.find('=');
+          if (eq != std::string::npos) {
+            std::string key = kv.substr(0, eq), val = kv.substr(eq + 1);
+            if (key == "path") pax_path = val;
+            else if (key == "linkpath") pax_link = val;
+            else if (key == "size") { pax_size = strtoull(val.c_str(), nullptr, 10); pax_has_size = true; }
+            else if (key == "mtime") { pax_mtime = (int64_t)strtoll(val.c_str(), nullptr, 10); pax_has_mtime = true; }
+          }
+          p += (size_t)rlen;
+        }
+        continue;
+      }
+
+      InEntry e;
+      std::string name = get_str(blk, 100);
+      std::string prefix = get_str(blk + 345, 155);
+      if (!prefix.empty()) name = prefix + "/" + name;
+      if (!pend_name.empty()) { name = pend_name; pend_name.clear(); }
+      if (!pax_path.empty())  { name = pax_path;  pax_path.clear(); }
+      e.name = name;
+      e.linkname = get_str(blk + 157, 100);
+      if (!pend_link.empty()) { e.linkname = pend_link; pend_link.clear(); }
+      if (!pax_link.empty())  { e.linkname = pax_link;  pax_link.clear(); }
+      e.mode = (uint32_t)get_num(blk + 100, 8);
+      e.uid = get_num(blk + 108, 8);
+      e.gid = get_num(blk + 116, 8);
+      e.size = pax_has_size ? pax_size : size;
+      e.mtime = pax_has_mtime ? pax_mtime : (int64_t)get_num(blk + 136, 12);
+      e.typeflag = type;
+      e.devmajor = (uint32_t)get_num(blk + 329, 8);
+      e.devminor = (uint32_t)get_num(blk + 337, 8);
+      pax_has_size = pax_has_mtime = false;
+
+      handle_entry(r, e);
+    }
+  }
+
+  // True if any path component is "..", i.e. a parent-traversal escape attempt.
+  static bool has_dotdot(const std::string & rel) {
+    size_t i = 0;
+    while (i < rel.size()) {
+      size_t j = rel.find('/', i);
+      std::string c = rel.substr(i, j == std::string::npos ? std::string::npos : j - i);
+      if (c == "..") return true;
+      if (j == std::string::npos) break; else i = j + 1;
+    }
+    return false;
+  }
+
+  void handle_entry(StreamReader & r, const InEntry & e) {
+    std::string rel = norm(e.name);
+    // data byte count present in the stream (for regular files); always skip it
+    // after handling so the parser stays aligned even when we reject the member.
+    uint64_t pad = (TAR_BLK - (e.size % TAR_BLK)) % TAR_BLK;
+
+    if (rel.empty()) { if (e.size) { r.skip(e.size); r.skip(pad); } return; }
+    // Path-traversal guard (the openat O_NOFOLLOW walk is the backstop; this gives
+    // a clear message and refuses before touching the filesystem).
+    if (has_dotdot(rel)) {
+      fail(rel, "unsafe path (parent-directory traversal) — skipped");
+      if (e.size) { r.skip(e.size); r.skip(pad); }
+      return;
+    }
+
+    switch (e.typeflag) {
+      case '0': case '\0': case '7': {            // regular file
+        if (e.size <= SMALL_FILE_MAX) {
+          Job j; j.rel = rel; j.mode = e.mode; j.mtime = e.mtime; j.uid = e.uid; j.gid = e.gid;
+          j.data.resize(e.size);
+          if (e.size && !r.read_exact(j.data.data(), e.size)) { fail(rel, "truncated file data"); return; }
+          r.skip(pad);
+          enqueue(std::move(j));
+        } else {
+          stream_large(r, rel, e);
+          r.skip(pad);
+        }
+        break;
+      }
+      case '5':                                    // directory
+        if (!make_dir(rel, e.mode)) fail(rel, "cannot create directory");
+        else dirmeta_.push_back({rel, e.mode, e.mtime, e.uid, e.gid});
+        break;
+      case '2':                                    // symlink
+        if (!make_symlink(rel, e.linkname, e.uid, e.gid)) fail(rel, "cannot create symlink");
+        break;
+      case '1':                                    // hardlink (deferred: target must exist)
+        hardlinks_.push_back({rel, norm(e.linkname)});
+        break;
+      case '3': case '4': case '6':                // char/block device, fifo
+        if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor)) {
+          if (errno == EPERM) vlog(V_VERBOSE, opt_, "gzstd: untar: " + rel + ": need privilege for device/special; skipped\n");
+          else fail(rel, "cannot create special file");
+        }
+        if (e.size) { r.skip(e.size); r.skip(pad); }
+        break;
+      default:                                      // unknown type: skip its data
+        if (e.size) { r.skip(e.size); r.skip(pad); }
+        break;
+    }
+  }
+
+  void stream_large(StreamReader & r, const std::string & rel, const InEntry & e) {
+    int fd = create_file(rel, e.mode);
+    if (fd < 0) { fail(rel, std::strerror(errno)); r.skip(e.size); return; }
+    uint64_t left = e.size; char tmp[1 << 20]; bool ok = true;
+    while (left) {
+      size_t want = (size_t)std::min<uint64_t>(left, sizeof tmp);
+      size_t got = r.read_some(tmp, want);
+      if (!got) { ok = false; break; }
+      size_t off = 0;
+      while (off < got) { ssize_t w = ::write(fd, tmp + off, got - off); if (w < 0) { if (errno == EINTR) continue; ok = false; break; } off += (size_t)w; }
+      if (!ok) break;
+      left -= got;
+      if (m_) m_->wrote_bytes.fetch_add(got, std::memory_order_relaxed);
+    }
+    if (!ok) fail(rel, "write failed");
+    set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
+    ::close(fd);
+  }
+
+  void finish_deferred() {
+    // Hardlinks: target file is now written.  Resolve both paths securely.
+    for (const auto & h : hardlinks_) {
+      std::string nleaf, tleaf;
+      int npfd = open_parent(h.name, nleaf, true);
+      int tpfd = (h.target.empty() ? -1 : open_parent(h.target, tleaf, false));
+      if (npfd < 0 || tpfd < 0) { if (npfd >= 0) ::close(npfd); if (tpfd >= 0) ::close(tpfd); fail(h.name, "cannot create hardlink"); continue; }
+      ::unlinkat(npfd, nleaf.c_str(), 0);
+      if (::linkat(tpfd, tleaf.c_str(), npfd, nleaf.c_str(), 0) != 0) fail(h.name, std::string("hardlink: ") + std::strerror(errno));
+      ::close(npfd); ::close(tpfd);
+    }
+    // Directory metadata in reverse order, so a parent's mtime isn't bumped by
+    // writing its children after it.
+    for (auto it = dirmeta_.rbegin(); it != dirmeta_.rend(); ++it) {
+      std::string leaf; int pfd = open_parent(it->path, leaf, false);
+      if (pfd < 0) continue;
+      int dfd = ::openat(pfd, leaf.c_str(), O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC);
+      ::close(pfd);
+      if (dfd < 0) continue;
+      set_meta_fd(dfd, it->mode, it->mtime, it->uid, it->gid);
+      ::close(dfd);
+    }
+  }
+};
+
+}  // namespace tarx
+#endif  // !_WIN32
+
 static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // ---- Performance instrumentation (active at -vvv) ----
@@ -6466,8 +7511,10 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 
   int threads = resolve_cpu_threads(opt.cpu_threads);
 
-  // Option A: if single-threaded, use simple streaming helper
-  if (threads == 1) {
+  // Option A: if single-threaded, use simple streaming helper.  --tar has no
+  // single FILE* to stream; it always uses the chunked queue path below (a
+  // 1-worker pool still works), so the tar producer can feed it.
+  if (threads == 1 && !opt.tar_mode) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[CPU] single-thread streaming path (-T 1)\n");
     compress_cpu_stream(in, out, opt, m);
@@ -6517,8 +7564,17 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     }
   }
 
-  // Get total input size for progress percentage (unknown for pipes)
+  // Get total input size for progress percentage (unknown for pipes).
+  // --tar: build the archive layout up front (single-threaded walk) so the
+  // progress bar has a real denominator and the parallel assembler can run.
+#ifndef _WIN32
+  tarx::TarLayout tar_layout;
+  bool tar_built = false;
+  if (opt.tar_mode) { tar_layout = tarx::build_layout(opt, m); tar_built = true; }
+  uint64_t total_in = tar_built ? tar_layout.total_size : known_input_size(opt, in);
+#else
   uint64_t total_in = known_input_size(opt, in);
+#endif
 
   // Preallocate output file: input size is a safe upper bound for compressed output.
 #ifndef _WIN32
@@ -6572,6 +7628,12 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   MmapRegion mmap_region;
   DirectReadPool dr_pool;   // zero-copy --direct-read buffers; outlives the workers
   bool reader_done = false;
+  // --tar: the parallel archive assembler IS the producer (synthesizes the tar
+  // stream + reads member files concurrently, pushing chunks in sequence order).
+  if (opt.tar_mode) {
+    tarx::assemble(queue, tar_layout, host_chunk, opt, m);
+    reader_done = true;
+  }
   // Pooled zero-copy reader, shared by --direct-read (O_DIRECT) and the buffered
   // fallback below.  Sizes the pool once: enough to keep every worker fed plus a
   // read-ahead backlog, but no more than the file needs, capped so RAM stays sane
@@ -8455,8 +9517,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   CpuAgg cpuagg{};
   cpuagg.threads = 0;
 
-  // Get total input size for progress percentage (unknown for pipes)
+  // Get total input size for progress percentage (unknown for pipes).
+  // --tar: build the archive layout up front (see compress_cpu_mt).
+#ifndef _WIN32
+  tarx::TarLayout tar_layout;
+  bool tar_built = false;
+  if (opt.tar_mode) { tar_layout = tarx::build_layout(opt, m); tar_built = true; }
+  uint64_t total_in = tar_built ? tar_layout.total_size : known_input_size(opt, in);
+#else
   uint64_t total_in = known_input_size(opt, in);
+#endif
 
   // Preallocate output file: input size is a safe upper bound for compressed output.
 #ifndef _WIN32
@@ -8633,6 +9703,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   MmapRegion mmap_region;
   DirectReadPool nv_pool;   // buffered zero-copy pool; must outlive all workers
   bool reader_done = false;
+  // --tar: parallel assembler at GPU-chunk granularity (≤16 MiB frames feed the
+  // nvCOMP batched path unchanged).  Pushes in sequence order.
+  if (opt.tar_mode) {
+    tarx::assemble(queue, tar_layout, gpu_chunk, opt, m);
+    reader_done = true;
+  }
   // --direct-read: O_DIRECT input (bypass page cache); splits each host chunk into
   // gpu_chunk subchunks like the other readers.  Precedence over mmap; falls
   // through to fread if O_DIRECT can't open.
@@ -10473,6 +11549,69 @@ static void write_stats_json_cpu_only(const std::string & path, const Options & 
 static Options parse_args(int argc, char ** argv);
 static void apply_backend_defaults(Options & opt);
 static std::string derive_output(const std::string & input, Mode mode);
+
+#ifndef _WIN32
+// -d --tar: decompress each archive into a pipe and extract it via
+// tarx::Extractor.  Reuses the full parallel decompressor (CPU/GPU) unchanged —
+// the pipe is just a FILE* sink like stdout.  Returns an exit code.
+static int extract_tar(const Options & opt, Meter * m)
+{
+  int dest_fd = ::open(opt.tar_dest.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+  if (dest_fd < 0)
+    die_io("cannot open extraction directory '" + opt.tar_dest + "': " + std::strerror(errno));
+
+  int rc = EXIT_OK;
+  for (const std::string & arc : opt.tar_sources) {
+    FILE * in = open_input(arc);   // dies on failure
+    if (arc != "-") {              // validate zstd magic (skip for unseekable stdin)
+      unsigned char magic[4] = {0};
+      size_t nr = std::fread(magic, 1, 4, in);
+      uint32_t mg = 0; if (nr == 4) std::memcpy(&mg, magic, 4);
+      bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
+      if (!ok_magic) {
+        vlog(V_ERROR, opt, "gzstd: untar: not a zstd archive: " + arc + "\n");
+        if (in && in != stdin) std::fclose(in);
+        rc = EXIT_DATA; continue;
+      }
+      std::rewind(in);
+    }
+
+    int fds[2];
+    if (::pipe(fds) != 0) die_io("pipe() failed");
+    FILE * pout = ::fdopen(fds[1], "wb");
+    if (!pout) die_io("fdopen(pipe) failed");
+
+    tarx::Extractor ex(dest_fd, opt, m);
+    std::thread exth([&] { ex.run(fds[0]); });
+
+    // Pipe-friendly writer settings: no sparse seeks, no progressive fsync.
+    Options dopt = opt;
+    dopt.sparse_mode = 0;
+    dopt.unsafe_overwrite = true;
+
+    int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
+    if (ff > (int64_t)SINGLE_FRAME_STREAM_MIN) {
+      decompress_stream_from_file(in, pout, dopt, m);
+    } else {
+#ifdef HAVE_NVCOMP
+      if (dopt.cpu_only) decompress_cpu_mt(in, pout, dopt, m);
+      else               decompress_nvcomp(in, pout, dopt, m);
+#else
+      decompress_cpu_mt(in, pout, dopt, m);
+#endif
+    }
+    std::fflush(pout);
+    std::fclose(pout);     // close write end → EOF to the extractor
+    exth.join();
+    ::close(fds[0]);
+    if (in && in != stdin) std::fclose(in);
+    if (ex.had_error() && rc == EXIT_OK) rc = EXIT_ERROR;
+  }
+  ::close(dest_fd);
+  return rc;
+}
+#endif  // !_WIN32
+
 int main(int argc, char ** argv)
 {
   setup_signal_handlers();
@@ -10535,6 +11674,15 @@ int main(int argc, char ** argv)
     std::fflush(stderr);  // unbuffer so it hits the terminal immediately
   }
 
+#ifndef _WIN32
+  // -d --tar: extract the archive(s) into -C DIR via the native parallel
+  // extractor; bypasses the single-output per-file loop below.
+  if (opt.tar_mode && opt.mode == Mode::DECOMPRESS) {
+    Meter meter;
+    return extract_tar(opt, &meter);
+  }
+#endif
+
   int exit_code = EXIT_OK;
 
   for (size_t file_idx = 0; file_idx < opt.inputs.size(); ++file_idx) {
@@ -10546,7 +11694,8 @@ int main(int argc, char ** argv)
     opt.output = derive_output(opt.input, opt.mode);
   }
 
-  FILE * in = open_input(opt.input);
+  // --tar synthesizes its input from tar_sources; there is no input FILE*.
+  FILE * in = opt.tar_mode ? nullptr : open_input(opt.input);
 #ifndef _WIN32
   // --cold (benchmarking only): drop the input file from the kernel's page
   // cache before reading so repeated benchmark iterations don't measure
@@ -10908,7 +12057,7 @@ int main(int argc, char ** argv)
       }
       std::fclose(out);
     }
-    std::fclose(in);
+    if (in) std::fclose(in);  // null in --tar mode (no input FILE*)
     if (use_atomic) {
       auto t_rename = std::chrono::steady_clock::now();
       // Atomic overwrite: rename .tmp to final output
@@ -10933,7 +12082,7 @@ int main(int argc, char ** argv)
   } else {
     // Flush stdout to ensure all data reaches the downstream pipe
     std::fflush(stdout);
-    std::fclose(in);
+    if (in) std::fclose(in);  // null in --tar mode (no input FILE*)
   }
 
   // Stop decompress progress thread now that write drain is complete
@@ -11072,6 +12221,14 @@ int main(int argc, char ** argv)
 
 
   } // end for (file_idx)
+
+#ifndef _WIN32
+  // --tar: some members were skipped or changed mid-read (warnings already
+  // printed) — report a non-zero exit like GNU tar, but the archive is valid.
+  if (opt.tar_mode && g_tar_had_errors.load(std::memory_order_relaxed)
+      && exit_code == EXIT_OK)
+    exit_code = EXIT_ERROR;
+#endif
 
   return exit_code;
 }
@@ -11343,6 +12500,32 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--cold") opt.cold_read = true;
     else if (a == "--direct-read") opt.direct_read = true;
     else if (parse_num_arg("read-threads", i, argc, argv, opt.read_threads)) { }
+    else if (parse_num_arg("write-threads", i, argc, argv, opt.write_threads)) { }
+    // --tar introduces the archive sub-invocation: positionals that follow it
+    // become archive members, and the tar-specific options (--exclude,
+    // --numeric-owner, --one-file-system) may sit after --tar alongside them.
+    // Flags still parse normally, so a source whose name begins with '-' must
+    // be written ./-name (or placed after a literal `--`), as with real tar.
+    else if (a == "--tar") opt.tar_mode = true;
+    else if (a == "--exclude") {
+      if (i + 1 >= argc) die_usage("missing value for --exclude");
+      opt.tar_excludes.push_back(argv[++i]);
+    }
+    else if (a.rfind("--exclude=", 0) == 0) {
+      std::string v = a.substr(10);
+      if (v.empty()) die_usage("missing value for --exclude");
+      opt.tar_excludes.push_back(v);
+    }
+    else if (a == "--numeric-owner") opt.tar_numeric_owner = true;
+    else if (a == "--one-file-system") opt.tar_one_file_system = true;
+    else if (a == "-C" || a == "--directory") {
+      if (i + 1 >= argc) die_usage("missing value for " + a);
+      opt.tar_dest = argv[++i];
+    }
+    else if (a.rfind("--directory=", 0) == 0) {
+      opt.tar_dest = a.substr(12);
+      if (opt.tar_dest.empty()) die_usage("missing value for --directory");
+    }
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
@@ -11492,9 +12675,10 @@ static Options parse_args(int argc, char ** argv)
     }
 #endif
     else if (a == "--") {
-      // End of options  everything after this is a filename
+      // End of options — everything after this is a literal path (archive
+      // sources in --tar mode, input files otherwise).
       for (++i; i < argc; ++i)
-        opt.inputs.push_back(argv[i]);
+        (opt.tar_mode ? opt.tar_sources : opt.inputs).push_back(argv[i]);
     }
     // === zstd-compat layer: accept flags we don't implement so gzstd can
     // serve as a drop-in replacement.  Real aliases are handled above; below
@@ -11619,7 +12803,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a.size() > 1 && a[0] == '-' && a != "-") {
       die_usage("unknown option: " + a);
     }
-    else { opt.inputs.push_back(a); }
+    else { (opt.tar_mode ? opt.tar_sources : opt.inputs).push_back(a); }
   }
   if (opt.inputs.empty()) opt.inputs.push_back("-");
 
@@ -11636,6 +12820,35 @@ static Options parse_args(int argc, char ** argv)
   // When writing to stdout (-c), always keep the input file (can't delete stdin,
   // and deleting a named file when output goes to stdout matches gzip behavior)
   if (opt.to_stdout) opt.keep = true;
+
+  if (opt.tar_mode) {
+#ifdef _WIN32
+    die_usage("--tar is not supported on this platform");
+#endif
+    if (opt.mode == Mode::TEST)
+      die_usage("--tar cannot be combined with -t (test); use -d --tar to extract");
+    if (opt.sliding_window)
+      die_usage("--tar is incompatible with --sliding-window");
+    // Sources/archives follow --tar; anything in inputs leaked in before it
+    // (opt.inputs is otherwise just the "-" placeholder added below).
+    for (const std::string & s : opt.inputs)
+      if (s != "-")
+        die_usage(std::string("--tar paths must come after --tar (found '") + s + "' before it)");
+    if (opt.tar_sources.empty())
+      die_usage(opt.mode == Mode::COMPRESS
+                ? "--tar requires at least one file or directory to archive"
+                : "-d --tar requires at least one archive to extract");
+    if (opt.mode == Mode::DECOMPRESS) {
+      // Extraction: the post-`--tar` positionals are the input archive(s); the
+      // first becomes opt.input so the existing single-input plumbing works.
+      if (!opt.tar_excludes.empty())
+        die_usage("--exclude applies to creation (--tar), not extraction (-d --tar)");
+      opt.input = opt.tar_sources[0];
+    }
+    opt.keep = true;  // never delete archive sources / input archives
+  }
+  else if (!opt.tar_excludes.empty() || opt.tar_numeric_owner || opt.tar_one_file_system)
+    die_usage("--exclude/--numeric-owner/--one-file-system require --tar");
 
   if (opt.sliding_window) {
     if (opt.mode != Mode::COMPRESS)

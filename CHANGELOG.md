@@ -1,11 +1,106 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.13.80  
+**Covers:** v0.9.50 → v0.14.0  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.0 — native parallel .tar.zst creation (--tar)
+
+`tar -cf - dir | gzstd` is limited by tar: it walks the tree and reads every
+member on a single thread, so gzstd's parallel readers and CPU/GPU workers
+sit starved behind one pipe — worst on directories full of small files,
+where the cost is per-file open/stat/read syscall latency.
+
+`--tar` moves the archiving into gzstd.  A single-threaded walk lstat's every
+member, applies `--exclude`, detects hardlinks, and computes each member's
+byte offset in the virtual tar stream (header length + data + 512-byte
+padding are all known from metadata).  The stream is then split into the
+usual frame-sized chunks and assembled by a pool of reader threads that pread
+the member-file ranges each chunk overlaps **concurrently** — the parallel
+read is the whole point.  Chunks are emitted to the existing TaskQueue in
+strict sequence order via a small reorder buffer, so the FrameThrottle's FIFO
+invariant (see TaskQueue::re_enqueue) is preserved and the CPU, GPU, and
+hybrid pipelines are reused unchanged.  Read-ahead is gated to a window past
+the push frontier, which keeps every reader busy without ever wedging the
+head chunk behind later ones.
+
+Output is a standard GNU-format tar stream (`tar --format=gnu`, the Ubuntu
+default) wrapped in zstd: ustar + OLDGNU magic, `L`/`K` long-name/long-link
+entries for paths over 100 bytes, and base-256 numeric fields for files over
+8 GiB or high uid/gid.  Stores regular files, directories, symlinks,
+hardlinks, FIFOs, and device nodes with mode/owner/mtime; sockets are skipped
+with a warning, as tar does.  A member that vanishes or changes mid-read is
+zero-filled for the missing bytes and reported (exit non-zero, archive still
+valid) — the same outcome as GNU tar's "file changed as we read it".
+Extraction is unchanged territory: any `tar --zstd -xf` or `gzstd -d | tar
+-x` reads the result; listings match `tar --sort=name -cf` byte-for-byte.
+
+List the archive sources after `--tar`; the tar-specific options
+(`--exclude`, `--numeric-owner`, `--one-file-system`) may follow `--tar` too,
+mixed with the sources, while `-o` and the global flags can sit anywhere.  A
+source whose name begins with `-` must be written `./-name` (or placed after
+a literal `--`), as with real tar.  New flags: `--exclude PATTERN`
+(repeatable glob), `--numeric-owner`, `--one-file-system`.
+
+**Extraction** (`gzstd -d --tar [-C DIR] archive.tar.zst …`) completes the
+round trip.  The archive's zstd stream is decompressed on the full parallel
+CPU/GPU pipeline and piped into an in-process tar extractor, so decompression
+overlaps with file writes — small files are written by a worker pool, large
+files stream — beating `gzstd -d | tar -x` on many-small-file archives.  It
+reads any standard tar inside zstd (GNU `L`/`K` long names, base-256, ustar
+`prefix`, and pax extended headers), not just gzstd's own.  Restores regular
+files, directories, symlinks, hardlinks, FIFOs and device nodes with mode and
+mtime (owners only as root; directory mtimes applied last so children don't
+bump them).  `-C DIR` sets the extraction root (default cwd).
+
+The extractor's file-writer pool size is `--write-threads N` (default
+`min(worker threads, 16)`); past ~16 the gain plateaus on filesystem
+metadata/journal contention, but the optimum is hardware-dependent — tune it
+on the target box.
+
+Extraction is **secure by construction**: every member is created through the
+destination dir fd with `O_NOFOLLOW` on every path component (libarchive-style
+`openat`/`mkdirat`/`symlinkat`), so a member symlink can never be traversed to
+write outside the destination (symlink-escape), and any `..` component is
+refused (path traversal).  A leading `/` is stripped.  Both classic tar
+extraction CVEs are blocked — verified with hostile archives that leave a
+sentinel outside the destination untouched.
+
+Whole-filesystem / OS backups (`gzstd --tar --one-file-system /`) work the
+same as GNU tar, and the matching was made GNU-faithful so existing exclude
+lists drop in unchanged:
+
+  - `--exclude` is matched against the filesystem path being walked (absolute
+    when the source is absolute), so `--exclude=/proc`, `--exclude=/tmp`,
+    `--exclude='/home/*/.cache'` all work archiving `/`.  A leading `/` is
+    anchored to the source root (drops only top-level `/tmp`, not `var/tmp`);
+    a bare name is unanchored (`--exclude .cache` drops every `.cache`); `*`
+    spans `/`.  Output is byte-for-byte identical to GNU `tar --exclude`.
+  - `--one-file-system` records a crossed mount point as an empty directory
+    stub (so it exists on restore) but does not descend into it — pruning
+    `/proc`, `/sys`, `/dev`, `/run` automatically.  List real partitions as
+    extra sources (`--tar --one-file-system / /home /boot`) to include them.
+  - An absolute source's members are stored leading-`/`-stripped with no
+    `./` prefix and no synthetic root entry (`/` → `proc/`, `home/...`),
+    matching GNU tar.
+
+  - Sockets and unknown file types are *ignored* (GNU tar's "file ignored"
+    class): shown only at `-v` and never an error, so the sockets scattered
+    through `/run`, `/tmp`, etc. don't spam the log or force a non-zero exit.
+    The default is therefore equivalent to GNU tar's
+    `--warning=no-file-ignored`.  Genuine read failures (permissions, a file
+    that changes mid-read) are still reported and still set a non-zero exit,
+    with an accurate message (`cannot read (Permission denied)` vs `file
+    changed as we read it`).
+
+  Caveat (same as tar): run as root to read every file, write the archive
+  outside the tree being walked, and snapshot (LVM/btrfs) for a consistent
+  image of a live system.
+
+POSIX only (Linux/macOS); `--tar` is rejected on Windows builds.
 
 ## v0.13.80 — spell out acronyms on first use in --help
 
