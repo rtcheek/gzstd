@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.0";
+static constexpr const char * GZSTD_VERSION = "0.14.1";
 //
 // Architecture overview:
 //
@@ -1509,6 +1509,7 @@ static const char * writer_verdict(double busy, double hol, double starved,
   return "no dominant writer-side state — output was capped upstream of the result store";
 }
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
+static bool is_stdout_tty() { return isatty(fileno(stdout)) != 0; }
 // Format a byte count as a human-readable string (e.g. "3.14 GiB").
 static void human_bytes(double x, char * buf, size_t n)
 {
@@ -12911,6 +12912,15 @@ static Options parse_args(int argc, char ** argv)
     opt.output = derive_output(opt.input, opt.mode);
   }
   // Multi-file with no -o: output is derived per-file in main loop
+
+  // Refuse to write compressed (binary) data to an interactive terminal, like
+  // zstd/gzip.  Catches the common slip of forgetting -o (e.g. `gzstd --tar
+  // ~/backup` with no -o would otherwise spray a .tar.zst at the screen).
+  // Compression only — decompressed output to a terminal is fine.  -f overrides.
+  if (opt.mode == Mode::COMPRESS && opt.to_stdout && !opt.force && is_stdout_tty())
+    die_usage("refusing to write compressed data to the terminal "
+              "(use -o FILE, redirect stdout, or -f to force)");
+
   if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die_usage("--gpu-only cannot be combined with --cpu-only or --hybrid");
   if (opt.cpu_only && opt.hybrid) die_usage("--cpu-only cannot be combined with --hybrid");
   if (opt.level >= 20 && opt.level <= 22 && !opt.ultra) die_usage("levels 20..22 require --ultra (zstd-compatible behavior)");

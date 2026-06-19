@@ -358,8 +358,8 @@ human_size() {
 # ============================================================
 # Default run: 253.  --extensive adds back the gated sections (Stress,
 # Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=250
-$EXTENSIVE && EXPECTED_TESTS=326
+EXPECTED_TESTS=252
+$EXTENSIVE && EXPECTED_TESTS=328
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3492,6 +3492,53 @@ PYEOF
   fi
 
   rm -rf "$XS" "$XOUT" "$XARC"
+fi
+
+# ============================================================
+# Terminal-output guard (refuse compressed data to a TTY)
+# ============================================================
+section "Terminal-output guard"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  skip "refuses compress to a TTY" "python3 unavailable (need a pty)"
+  skip "-f forces compress to a TTY" "python3 unavailable (need a pty)"
+else
+  # Run gzstd compressing to stdout with stdout attached to a real pty; echo
+  # "<exit_code> <1 if zstd-magic was written else 0>".
+  tty_compress() {  # $1 = plain|force
+    python3 - "$GZSTD" "$TMPDIR/medium.txt" "$1" <<'PY'
+import sys, os, pty, select, subprocess
+gz, src, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+args = [gz, "-c", src] + (["-f"] if mode == "force" else [])
+mp, sp = pty.openpty()
+p = subprocess.Popen(args, stdout=sp, stderr=subprocess.DEVNULL)
+os.close(sp)
+out = b""
+while True:
+    r, _, _ = select.select([mp], [], [], 5)
+    if not r:
+        if p.poll() is not None: break
+        continue
+    try: chunk = os.read(mp, 65536)
+    except OSError: break
+    if not chunk: break
+    out += chunk
+p.wait(); os.close(mp)
+print(p.returncode, 1 if out[:4] == b"\x28\xb5\x2f\xfd" else 0)
+PY
+  }
+  read rc magic < <(tty_compress plain)
+  if [[ "$rc" -ne 0 && "$magic" -eq 0 ]]; then
+    pass "refuses compress to a TTY (no -f)" "(exit $rc, no output)"
+  else
+    fail "refuses compress to a TTY" "rc=$rc magic=$magic"
+  fi
+  read rc magic < <(tty_compress force)
+  if [[ "$rc" -eq 0 && "$magic" -eq 1 ]]; then
+    pass "-f forces compress to a TTY"
+  else
+    fail "-f forces compress to a TTY" "rc=$rc magic=$magic"
+  fi
 fi
 
 # ============================================================

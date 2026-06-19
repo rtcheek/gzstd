@@ -794,6 +794,22 @@ Open follow-ups:
 - **Parallelize the walk** — *Priority: Low | Complexity: Medium.* On a cold tree
   with millions of files, the single-threaded layout walk (`lstat` sweep) can be
   a secondary bottleneck; a parallel `stat` sweep would shorten it. Measure first.
+- **O_DIRECT extraction writes for large files (Gen4+)** — *Priority: Low |
+  Complexity: Medium | Status: investigate, measure first.* Extraction currently
+  writes every member buffered (page cache) — the 4 MiB `SMALL_FILE_MAX` cut only
+  splits "buffer whole file → writer pool" from "stream inline", both buffered;
+  there is no O_DIRECT on the extract side. On fast NVMe (PCIe Gen4/Gen5) and
+  memory-bandwidth-bound boxes, writing *large* members (new, higher threshold —
+  ~≥32–64 MiB, NOT the 4 MiB cut) via O_DIRECT could sustain device bandwidth and
+  avoid evicting the whole page cache during a big restore. Caveats that make it
+  measure-first, not obvious: buffered `write()` is already async (writeback
+  overlaps decompression) while O_DIRECT is synchronous, so big-file writes must
+  move off the parser thread with double-buffered aligned chunks or they stall the
+  pipe; alignment + unaligned-tail handling needed (reuse `DirectWriter`);
+  concurrent O_DIRECT streams contend (keep to one writer); only helps
+  large-file-heavy archives, never the many-small-files case. Gate behind
+  `--direct` (+ Gen4 auto, mirroring compress). Prototype + cold-cache benchmark
+  on the Gen4+ box before shipping.
 
 ---
 

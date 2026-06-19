@@ -1,11 +1,23 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.0  
+**Covers:** v0.9.50 → v0.14.1  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.1 — refuse to write compressed data to a terminal
+
+gzstd never had the guard zstd/gzip/bzip2 have against writing compressed
+output to an interactive terminal.  Compressing to stdout when stdout is a TTY
+(and `-f` was not given) now errors instead of spraying a binary stream at the
+screen — most importantly catching `gzstd --tar ~/backup` with a forgotten
+`-o`, which would otherwise dump the whole `.tar.zst` to the terminal.
+
+Compression only (`is_stdout_tty()` check); decompressed output to a terminal
+is still allowed, redirects and pipes are unaffected, and `-f`/`--force`
+overrides as in zstd.
 
 ## v0.14.0 — native parallel .tar.zst creation (--tar)
 
