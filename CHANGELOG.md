@@ -1,11 +1,72 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.1  
+**Covers:** v0.9.50 → v0.14.4  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.4 — fix the CPU-only / portable (`USE_NVCOMP=OFF`) build
+
+Two latent bugs broke any build without nvCOMP (the portable static target and
+`-DUSE_NVCOMP=OFF`); they had been masked because the CUDA headers transitively
+supplied what was missing:
+
+- `INT_MAX` (RAM-frame caps) was used without `#include <climits>` — only
+  resolved via a CUDA header. Added the include.
+- `peek_first_frame_decomp_size()` was *declared* at file scope but *defined*
+  inside the big `#ifdef HAVE_NVCOMP` block, while being called from CPU-only
+  paths (the parallel reader's gate, the decompress dispatch, `extract_tar`).
+  With nvCOMP off the definition vanished → link error. Moved it to file scope.
+
+Also: `BUILD_STATIC` needs `libzstd.a`, which conda-forge's `zstd` package omits;
+`BUILD.md` now documents `conda install -c conda-forge zstd-static`. The static
+CPU-only binary builds and round-trips ACLs/xattrs, depending only on glibc.
+
+## v0.14.3 — `--acls` and `--xattrs` for `--tar` (GNU-tar compatible)
+
+`--tar` now stores POSIX ACLs and extended attributes, and `-d --tar` restores
+them — both off by default and gated exactly like GNU tar: the flags must be
+given on BOTH create and extract or the metadata is ignored, so the default
+path pays nothing (no extra syscalls in the layout walk).
+
+Storage matches GNU tar so archives interoperate in both directions: ACLs go in
+PAX `SCHILY.acl.access`/`SCHILY.acl.default` text records, xattrs in
+`SCHILY.xattr.*`.  Only non-trivial ACLs are stored (a trivial ACL just mirrors
+the mode bits); when both flags are set, the `system.posix_acl_*` xattrs are
+omitted to avoid duplicating the ACL records.  Verified round-trip three ways:
+gzstd→gzstd, gzstd→GNU tar, and GNU tar→gzstd, including directory default ACLs
+and the streamed large-file path.
+
+Gathering is parallelized: the single-threaded layout walk stays cheap (just
+the `lstat` it already did), and the expensive `acl_get_file`/`llistxattr`
+calls run as a parallel pass over the entry list afterward, with a cheap serial
+offset-recompute once each member's PAX block size is known.  On restore, ACLs/
+xattrs are applied through the secure-by-fd write path (after permissions, so an
+access ACL wins; default ACLs via `/proc/self/fd` to keep the O_NOFOLLOW
+guarantee) and parallelize through the existing extractor writer pool.
+
+Build: adds an optional libacl dependency (xattr syscalls are in glibc; only
+ACLs need the library).  `BUILD_STATIC` links `libacl.a`/`libattr.a`.  Without
+libacl, gzstd still builds and `--acls`/`--xattrs` are simply unavailable.
+
+## v0.14.2 — progress bar + summary for `-d --tar` extraction
+
+`-d --tar` showed no progress bar and no completion summary — not even with
+`--progress`.  The decompress progress machinery lives in `main()`, wrapped
+around the normal single-output decompress path, but `-d --tar` returns early
+through a separate dispatch (`extract_tar`) that spawns the decompress workers
+itself and never set up the progress thread or printed the summary.  So the
+output side of `--tar` was silent while the create side (`compress_cpu_mt`
+self-spawns its own progress) was not.
+
+`extract_tar` now spawns the same `progress_loop` (input %% driven by the sum
+of the compressed archive sizes) and prints a zstd-style decompress summary on
+completion (`archive.tar.zst : <compressed> => <extracted>, <dir> @ <rate>`).
+Single-site fix: the worker functions are unchanged, and `extract_tar` was the
+only `main()` dispatch that bypassed the progress setup (compress `--tar` and
+every per-file decompress already had it).
 
 ## v0.14.1 — refuse to write compressed data to a terminal
 

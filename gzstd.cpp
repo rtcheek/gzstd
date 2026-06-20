@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.1";
+static constexpr const char * GZSTD_VERSION = "0.14.4";
 //
 // Architecture overview:
 //
@@ -48,6 +48,7 @@ static constexpr const char * GZSTD_VERSION = "0.14.1";
 #endif
 #include <cstring>
 #include <cstdint>
+#include <climits>    // INT_MAX — used in RAM-frame caps; pulled in transitively only with nvCOMP
 #include <string>
 #include <vector>
 #include <deque>
@@ -80,6 +81,11 @@ static constexpr const char * GZSTD_VERSION = "0.14.1";
 #include <grp.h>           // getgrgid_r — gname for tar headers
 #include <pwd.h>           // getpwuid_r — uname for tar headers
 #include <sys/sysmacros.h> // major()/minor() — device-node tar headers
+#include <sys/xattr.h>     // --xattrs: l/f getxattr/setxattr/listxattr (glibc)
+#ifdef GZSTD_HAVE_ACL
+#include <sys/acl.h>       // --acls: POSIX.1e ACLs (libacl)
+#include <acl/libacl.h>    // acl_extended_file_nofollow, acl_equiv_mode, acl_to_any_text
+#endif
 #endif
 #include <unistd.h>
 #include <fcntl.h>
@@ -401,6 +407,8 @@ struct Options {
   std::vector<std::string> tar_excludes; // --exclude PATTERN (fnmatch, repeatable)
   bool tar_numeric_owner = false;        // --numeric-owner: omit uname/gname lookup
   bool tar_one_file_system = false;      // --one-file-system: don't cross mount points
+  bool tar_xattrs = false;               // --xattrs: store/restore extended attributes (SCHILY.xattr.*)
+  bool tar_acls = false;                 // --acls: store/restore POSIX ACLs (SCHILY.acl.*); needs both on create AND extract
   std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
 };
 
@@ -719,6 +727,8 @@ static void print_help()
 "  --exclude PATTERN   skip members matching PATTERN (glob; repeatable)\n"
 "  --numeric-owner     store uid/gid only (no user/group name lookup)\n"
 "  --one-file-system   do not descend into other mounted filesystems\n"
+"  --xattrs            store/restore extended attributes (give on both create and extract)\n"
+"  --acls              store/restore POSIX ACLs (give on both create and extract)\n"
 "\n"
 "Compression level:\n"
 "  -1 .. -19           zstd level (default: 3)\n"
@@ -972,6 +982,20 @@ static void print_help_long()
 "     `/` — it skips /proc, /sys, /dev, /run automatically.  List real\n"
 "     partitions as separate sources to include them:\n"
 "         sudo gzstd -o root.tar.zst --tar --one-file-system / /home /boot\n"
+"\n"
+"  --xattrs\n"
+"     Store extended attributes (xattrs) — the user.*, security.*, etc.\n"
+"     key/value pairs a file carries — as PAX (Portable Archive eXchange)\n"
+"     extended-header `SCHILY.xattr.*` records, compatible with GNU tar.\n"
+"     Off by default (gathering xattrs costs an extra syscall per member);\n"
+"     must be given on BOTH create and extract, or it is ignored — exactly\n"
+"     as GNU tar behaves.  Gathering runs in parallel across the worker pool.\n"
+"\n"
+"  --acls\n"
+"     Store POSIX access control lists (ACLs) as PAX `SCHILY.acl.access`\n"
+"     and `SCHILY.acl.default` text records, compatible with GNU tar.  Off\n"
+"     by default; must be given on BOTH create and extract or it is ignored.\n"
+"     Restoring an ACL is applied after permissions, so the ACL wins.\n"
 "\n"
 "  -d --tar ARCHIVE...\n"
 "     Extract one or more .tar.zst archives (decompress AND untar in one\n"
@@ -5446,8 +5470,25 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
 }
 #endif // HAVE_NVCOMP
 
-// Defined below (near decompress_nvcomp); used by the parallel reader's gate.
-static int64_t peek_first_frame_decomp_size(FILE * in);
+// Peek at the first frame's decompressed size without consuming input.  Used by
+// the parallel reader's gate AND the decompress dispatch (CPU and GPU) and
+// extract_tar, so it must live outside the HAVE_NVCOMP block.  Returns the
+// decomp size in bytes, or -1 if it can't be determined (stdin, seek failure,
+// unknown content size).  Restores the input file position on every path.
+static int64_t peek_first_frame_decomp_size(FILE * in)
+{
+  if (!in) return -1;
+  long pos = std::ftell(in);
+  if (pos < 0) return -1;  // not seekable (pipe / stdin)
+  unsigned char buf[64];
+  size_t n = std::fread(buf, 1, sizeof(buf), in);
+  if (std::fseek(in, pos, SEEK_SET) != 0) return -1;
+  if (n < 4) return -1;
+  unsigned long long size = ZSTD_getFrameContentSize(buf, n);
+  if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR)
+    return -1;
+  return (int64_t)size;
+}
 
 #ifndef _WIN32
 // Sentinel: stream_frames_to_queue_mt bailed before pushing anything; caller
@@ -6615,12 +6656,14 @@ static inline uint64_t tar_round_up(uint64_t v, uint64_t a) { return (v + a - 1)
 struct TarEntry {
   std::string path;       // member name (dirs carry a trailing '/')
   std::string link;       // symlink target or hardlink referent ("" otherwise)
-  std::string src;        // filesystem path to pread (regular files only)
+  std::string src;        // filesystem path to pread (regular files); also set for
+                          // every member when --acls/--xattrs is on (gather source)
+  std::string pax;        // serialized PAX SCHILY.* records ("" = no extended header)
   uint64_t    size      = 0;   // data bytes (0 for dir/symlink/hardlink/special)
   uint64_t    hdr_off   = 0;   // offset of the (first) header block
   uint64_t    data_off  = 0;   // offset of file data = hdr_off + hdr_len
   uint64_t    entry_end = 0;   // data_off + round_up(size, 512)
-  uint32_t    hdr_len   = (uint32_t)TAR_BLK;  // 512 + optional L/K blocks
+  uint32_t    hdr_len   = (uint32_t)TAR_BLK;  // pax 'x' block + 512 + optional L/K
   uint32_t    mode      = 0;
   uint64_t    uid = 0, gid = 0;
   int64_t     mtime     = 0;
@@ -6700,11 +6743,93 @@ static size_t emit_longlink(char * out, const std::string & s, char type) {
   return TAR_BLK + padded;
 }
 
-// Synthesize a member's full header (long-name/link blocks + base block) into
-// `out` (caller sizes it ≥ e.hdr_len).  Returns bytes written (== e.hdr_len).
+// ---- PAX extended headers: xattrs (--xattrs) and POSIX ACLs (--acls) ----
+// Stored as SCHILY.* records inside an 'x'-typeflag pseudo-entry preceding the
+// member, matching GNU tar so archives interoperate.  Everything here is gated
+// by the flags (build_layout only gathers when --acls/--xattrs is given), so the
+// default path pays nothing.
+
+// One PAX record: "<len> <key>=<value>\n", where <len> counts its own digits.
+static std::string pax_record(const std::string & key, const std::string & val) {
+  size_t fixed = key.size() + val.size() + 3;   // ' ', '=', '\n'
+  size_t len = fixed + 1;                        // + at least one length digit
+  for (;;) {
+    size_t d = std::to_string(len).size();
+    if (fixed + d == len) break;
+    len = fixed + d;
+  }
+  return std::to_string(len) + " " + key + "=" + val + "\n";
+}
+
+// Append SCHILY.xattr.* records for `path` to `recs` (nofollow — the member's
+// own xattrs, not a symlink target's).  When ACLs are stored separately, the
+// system.posix_acl_* attributes are skipped here (they ride in the ACL records
+// instead) to avoid duplication, exactly as GNU tar does.
+static void gather_xattrs(const std::string & path, bool acls_separate, std::string & recs) {
+  ssize_t ln = ::llistxattr(path.c_str(), nullptr, 0);
+  if (ln <= 0) return;
+  std::vector<char> names((size_t)ln);
+  ln = ::llistxattr(path.c_str(), names.data(), names.size());
+  if (ln <= 0) return;
+  for (size_t p = 0; p < (size_t)ln; ) {
+    std::string name(&names[p]);
+    p += name.size() + 1;
+    if (name.empty()) continue;
+    if (acls_separate && (name == "system.posix_acl_access" ||
+                          name == "system.posix_acl_default")) continue;
+    ssize_t vl = ::lgetxattr(path.c_str(), name.c_str(), nullptr, 0);
+    if (vl < 0) continue;
+    std::string val((size_t)vl, '\0');
+    vl = ::lgetxattr(path.c_str(), name.c_str(), val.data(), val.size());
+    if (vl < 0) continue;
+    val.resize((size_t)vl);
+    recs += pax_record("SCHILY.xattr." + name, val);
+  }
+}
+
+#ifdef GZSTD_HAVE_ACL
+// Append SCHILY.acl.access / SCHILY.acl.default records.  Only non-trivial ACLs
+// are stored (a trivial ACL just mirrors the mode bits — storing it would bloat
+// every file), matching GNU tar.  Default ACLs apply to directories only.  Text
+// is the comma-separated long form, which GNU tar's acl_from_text() reads.
+static void gather_acls(const std::string & path, bool is_dir, std::string & recs) {
+  if (::acl_extended_file_nofollow(path.c_str()) > 0) {
+    acl_t acc = ::acl_get_file(path.c_str(), ACL_TYPE_ACCESS);
+    if (acc) {
+      char * txt = ::acl_to_any_text(acc, nullptr, ',', 0);
+      if (txt) { recs += pax_record("SCHILY.acl.access", txt); ::acl_free(txt); }
+      ::acl_free(acc);
+    }
+  }
+  if (is_dir) {
+    acl_t def = ::acl_get_file(path.c_str(), ACL_TYPE_DEFAULT);
+    if (def) {
+      if (::acl_entries(def) > 0) {
+        char * txt = ::acl_to_any_text(def, nullptr, ',', 0);
+        if (txt) { recs += pax_record("SCHILY.acl.default", txt); ::acl_free(txt); }
+      }
+      ::acl_free(def);
+    }
+  }
+}
+#endif
+
+// Emit a PAX 'x' extended-header pseudo-entry whose data is `recs`.
+static size_t emit_pax_block(char * out, const std::string & recs, const std::string & path) {
+  std::string nm = "PaxHeaders/" + path;        // cosmetic; applies to the next header
+  emit_block(out, nm, 0644, 0, 0, recs.size(), 0, 'x', "", "", "", 0, 0);
+  std::memcpy(out + TAR_BLK, recs.data(), recs.size());
+  size_t padded = tar_round_up(recs.size(), TAR_BLK);
+  std::memset(out + TAR_BLK + recs.size(), 0, padded - recs.size());
+  return TAR_BLK + padded;
+}
+
+// Synthesize a member's full header (PAX 'x' block + long-name/link blocks + base
+// block) into `out` (caller sizes it ≥ e.hdr_len).  Returns bytes written.
 static size_t emit_header(const TarEntry & e, const TarLayout & lay, char * out) {
   static const std::string empty;
   size_t off = 0;
+  if (!e.pax.empty()) off += emit_pax_block(out + off, e.pax, e.path);
   if (e.path.size() > 100) off += emit_longlink(out + off, e.path, 'L');
   if (e.link.size() > 100) off += emit_longlink(out + off, e.link, 'K');
   auto uit = lay.unames.find(e.uid);
@@ -6818,6 +6943,7 @@ struct LayoutBuilder {
         if (e.path.back() != '/') e.path += '/';
         e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid; e.mtime = st.st_mtime;
         e.typeflag = '5';
+        if (opt.tar_xattrs || opt.tar_acls) e.src = fspath;  // gather source (dir)
         resolve_owner(e.uid, e.gid); add(std::move(e));
       }
       if (cross) return;  // mount-point stub recorded; do not descend
@@ -6847,6 +6973,7 @@ struct LayoutBuilder {
     TarEntry e;
     e.path = member; e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid;
     e.mtime = st.st_mtime;
+    if (opt.tar_xattrs || opt.tar_acls) e.src = fspath;  // gather source (symlink/special/regular)
 
     if (S_ISREG(st.st_mode)) {
       if (st.st_nlink > 1) {
@@ -6875,6 +7002,51 @@ struct LayoutBuilder {
       return;
     }
     resolve_owner(e.uid, e.gid); add(std::move(e));
+  }
+
+  // --acls/--xattrs: gather extended metadata for every member, then fold each
+  // member's PAX 'x' block into the offset layout.  The gather (one acl_get_file
+  // + llistxattr/lgetxattr per member) is the expensive part, so it runs in
+  // parallel across the entry list — entries are independent.  The offset
+  // recompute is a cheap serial pass afterward (pax block sizes are now known).
+  // Only called when a flag is set, so the default path never touches this.
+  void apply_extended_metadata() {
+    const size_t n = lay.entries.size();
+    if (n == 0) return;
+    int nthreads = std::max(1, resolve_cpu_threads(opt.cpu_threads));
+    nthreads = std::min<int>(nthreads, (int)n);
+    std::atomic<size_t> idx{0};
+    auto worker = [&] {
+      for (size_t i = idx.fetch_add(1); i < n; i = idx.fetch_add(1)) {
+        TarEntry & e = lay.entries[i];
+        if (e.src.empty() || e.typeflag == '1') continue;  // hardlink ref shares the
+                                                           // first occurrence's metadata
+        std::string recs;
+        if (opt.tar_xattrs) gather_xattrs(e.src, opt.tar_acls, recs);
+#ifdef GZSTD_HAVE_ACL
+        if (opt.tar_acls)   gather_acls(e.src, e.typeflag == '5', recs);
+#endif
+        e.pax = std::move(recs);
+      }
+    };
+    if (nthreads <= 1) worker();
+    else {
+      std::vector<std::thread> ths;
+      for (int t = 0; t < nthreads; ++t) ths.emplace_back(worker);
+      for (auto & t : ths) t.join();
+    }
+    // Serial recompute: insert each entry's PAX block ahead of its header.
+    uint64_t o = 0;
+    for (TarEntry & e : lay.entries) {
+      uint32_t pax_blk = e.pax.empty()
+          ? 0u : (uint32_t)(TAR_BLK + tar_round_up(e.pax.size(), TAR_BLK));
+      e.hdr_off   = o;
+      e.hdr_len   = pax_blk + header_len(e.path.size(), e.link.size());
+      e.data_off  = o + e.hdr_len;
+      e.entry_end = e.data_off + tar_round_up(e.size, TAR_BLK);
+      o = e.entry_end;
+    }
+    off = o;
   }
 
   void finalize() {
@@ -6910,6 +7082,13 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
     while (src.size() > 1 && src.back() == '/') src.pop_back();
     std::string member = strip_leading_slash(src, opt, b.warned_leading_slash);
     b.walk(src, member, (dev_t)-1);
+  }
+  if (opt.tar_xattrs || opt.tar_acls) {
+    b.apply_extended_metadata();
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, std::string("[TAR] gathered ")
+           + (opt.tar_acls ? "ACLs " : "") + (opt.tar_xattrs ? "xattrs " : "")
+           + "(parallel)\n");
   }
   b.finalize();
   if (opt.verbosity >= V_VERBOSE) {
@@ -7085,6 +7264,13 @@ static std::string get_str(const char * f, size_t n) {
   return std::string(f, len);
 }
 
+// Extended metadata restored under --xattrs/--acls (from PAX SCHILY.* records).
+struct ExtMeta {
+  std::vector<std::pair<std::string, std::string>> xattrs;  // (name, value)
+  std::string acl_access, acl_default;                      // POSIX ACL text
+  bool empty() const { return xattrs.empty() && acl_access.empty() && acl_default.empty(); }
+};
+
 // A parsed tar entry (metadata only).
 struct InEntry {
   std::string name, linkname;
@@ -7092,6 +7278,7 @@ struct InEntry {
   uint32_t mode = 0, devmajor = 0, devminor = 0;
   int64_t  mtime = 0;
   char     typeflag = '0';
+  ExtMeta  ext;
 };
 
 // Buffered reader over a fd (the decompression pipe).
@@ -7144,7 +7331,7 @@ private:
 
   // Deferred work applied after all data is written.
   struct Hard { std::string name, target; };
-  struct DirMeta { std::string path; uint32_t mode; int64_t mtime; uint64_t uid, gid; };
+  struct DirMeta { std::string path; uint32_t mode; int64_t mtime; uint64_t uid, gid; ExtMeta ext; };
   std::vector<Hard> hardlinks_;
   std::vector<DirMeta> dirmeta_;
 
@@ -7191,6 +7378,39 @@ private:
     struct timespec ts[2]; ts[0].tv_sec = (time_t)mtime; ts[0].tv_nsec = 0; ts[1] = ts[0];
     (void)::futimens(fd, ts);
     if (as_root_ && ::fchown(fd, (uid_t)uid, (gid_t)gid) != 0) { /* best-effort */ }
+  }
+
+  // Apply --xattrs/--acls metadata via a securely-opened fd (regular file or
+  // directory).  Must run AFTER set_meta_fd: the access ACL overrides the mode's
+  // group bits, so the ACL has to win.  Default ACLs (directories only) need a
+  // path, so we go through /proc/self/fd to keep the secure-by-fd guarantee.
+  // Failures (EPERM on system.*/security.*, filesystem without ACL support) are
+  // best-effort and reported only at -v, like the device-node path.
+  void apply_ext(int fd, bool is_dir, const ExtMeta & ext) {
+    if (ext.empty()) return;
+    for (const auto & kv : ext.xattrs) {
+      if (::fsetxattr(fd, kv.first.c_str(), kv.second.data(), kv.second.size(), 0) != 0)
+        vlog(V_VERBOSE, opt_, "gzstd: untar: xattr " + kv.first + ": " + std::strerror(errno) + "\n");
+    }
+#ifdef GZSTD_HAVE_ACL
+    if (!ext.acl_access.empty()) {
+      acl_t a = ::acl_from_text(ext.acl_access.c_str());
+      if (a) {
+        if (::acl_set_fd(fd, a) != 0)
+          vlog(V_VERBOSE, opt_, std::string("gzstd: untar: acl(access): ") + std::strerror(errno) + "\n");
+        ::acl_free(a);
+      }
+    }
+    if (is_dir && !ext.acl_default.empty()) {
+      acl_t a = ::acl_from_text(ext.acl_default.c_str());
+      if (a) {
+        std::string pp = "/proc/self/fd/" + std::to_string(fd);  // fd opened O_NOFOLLOW per component
+        if (::acl_set_file(pp.c_str(), ACL_TYPE_DEFAULT, a) != 0)
+          vlog(V_VERBOSE, opt_, std::string("gzstd: untar: acl(default): ") + std::strerror(errno) + "\n");
+        ::acl_free(a);
+      }
+    }
+#endif
   }
 
   // Securely create/replace a regular file; returns an open write fd or -1.
@@ -7245,7 +7465,7 @@ private:
   }
 
   // ---- writer pool (regular-file data writes, in parallel with decompression) ----
-  struct Job { std::string rel; uint32_t mode; int64_t mtime; uint64_t uid, gid; std::vector<char> data; };
+  struct Job { std::string rel; uint32_t mode; int64_t mtime; uint64_t uid, gid; std::vector<char> data; ExtMeta ext; };
   std::mutex q_m_; std::condition_variable q_cv_prod_, q_cv_cons_;
   std::deque<Job> q_; size_t q_bytes_ = 0; bool q_done_ = false;
   static constexpr size_t Q_MAX_BYTES = 256 * 1024 * 1024;
@@ -7298,6 +7518,7 @@ private:
     }
     if (!ok) fail(j.rel, std::strerror(errno));
     set_meta_fd(fd, j.mode, j.mtime, j.uid, j.gid);
+    apply_ext(fd, /*is_dir=*/false, j.ext);
     ::close(fd);
     if (m_) m_->wrote_bytes.fetch_add(j.data.size(), std::memory_order_relaxed);
   }
@@ -7317,6 +7538,7 @@ private:
     std::string pend_name, pend_link;     // GNU 'L'/'K' overrides for the next header
     std::string pax_path, pax_link; uint64_t pax_size = 0; int64_t pax_mtime = 0;
     bool pax_has_size = false, pax_has_mtime = false;
+    ExtMeta pax_ext;                      // SCHILY.xattr.* / SCHILY.acl.* for next header
     int zero_run = 0;
     while (true) {
       if (!r.read_exact(blk, TAR_BLK)) {
@@ -7363,6 +7585,12 @@ private:
             else if (key == "linkpath") pax_link = val;
             else if (key == "size") { pax_size = strtoull(val.c_str(), nullptr, 10); pax_has_size = true; }
             else if (key == "mtime") { pax_mtime = (int64_t)strtoll(val.c_str(), nullptr, 10); pax_has_mtime = true; }
+            // --xattrs/--acls: collect SCHILY.* records only when the matching flag
+            // is set, so without the flag they are parsed-and-ignored (GNU tar's behavior).
+            else if (opt_.tar_xattrs && key.rfind("SCHILY.xattr.", 0) == 0)
+              pax_ext.xattrs.emplace_back(key.substr(13), val);
+            else if (opt_.tar_acls && key == "SCHILY.acl.access")  pax_ext.acl_access  = val;
+            else if (opt_.tar_acls && key == "SCHILY.acl.default") pax_ext.acl_default = val;
           }
           p += (size_t)rlen;
         }
@@ -7387,6 +7615,7 @@ private:
       e.typeflag = type;
       e.devmajor = (uint32_t)get_num(blk + 329, 8);
       e.devminor = (uint32_t)get_num(blk + 337, 8);
+      e.ext = std::move(pax_ext); pax_ext = ExtMeta{};
       pax_has_size = pax_has_mtime = false;
 
       handle_entry(r, e);
@@ -7424,6 +7653,7 @@ private:
       case '0': case '\0': case '7': {            // regular file
         if (e.size <= SMALL_FILE_MAX) {
           Job j; j.rel = rel; j.mode = e.mode; j.mtime = e.mtime; j.uid = e.uid; j.gid = e.gid;
+          j.ext = e.ext;
           j.data.resize(e.size);
           if (e.size && !r.read_exact(j.data.data(), e.size)) { fail(rel, "truncated file data"); return; }
           r.skip(pad);
@@ -7436,7 +7666,7 @@ private:
       }
       case '5':                                    // directory
         if (!make_dir(rel, e.mode)) fail(rel, "cannot create directory");
-        else dirmeta_.push_back({rel, e.mode, e.mtime, e.uid, e.gid});
+        else dirmeta_.push_back({rel, e.mode, e.mtime, e.uid, e.gid, e.ext});
         break;
       case '2':                                    // symlink
         if (!make_symlink(rel, e.linkname, e.uid, e.gid)) fail(rel, "cannot create symlink");
@@ -7473,6 +7703,7 @@ private:
     }
     if (!ok) fail(rel, "write failed");
     set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
+    apply_ext(fd, /*is_dir=*/false, e.ext);
     ::close(fd);
   }
 
@@ -7496,6 +7727,7 @@ private:
       ::close(pfd);
       if (dfd < 0) continue;
       set_meta_fd(dfd, it->mode, it->mtime, it->uid, it->gid);
+      apply_ext(dfd, /*is_dir=*/true, it->ext);
       ::close(dfd);
     }
   }
@@ -11008,30 +11240,6 @@ static void gpu_decomp_worker(
   }
 }
 
-// Peek at the first frame's decompressed size without consuming input.
-// Used by decompress_nvcomp to detect single-frame "oversize" files
-// (zstd, --sliding-window) BEFORE spawning workers — so the GPU
-// path can be skipped without blocking on a full pre-scan.
-//
-// Returns the decomp size in bytes, or -1 if it can't be determined
-// (stdin, seek failure, unknown content size, etc.).  Restores the
-// input file position on every path so the subsequent producer can
-// re-read from the start.
-static int64_t peek_first_frame_decomp_size(FILE * in)
-{
-  if (!in) return -1;
-  long pos = std::ftell(in);
-  if (pos < 0) return -1;  // not seekable (pipe / stdin)
-  unsigned char buf[64];
-  size_t n = std::fread(buf, 1, sizeof(buf), in);
-  if (std::fseek(in, pos, SEEK_SET) != 0) return -1;
-  if (n < 4) return -1;
-  unsigned long long size = ZSTD_getFrameContentSize(buf, n);
-  if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR)
-    return -1;
-  return (int64_t)size;
-}
-
 /*======================================================================
  GPU/Hybrid decompression entry point
  -----------------------------------------------------------------------
@@ -11561,6 +11769,20 @@ static int extract_tar(const Options & opt, Meter * m)
   if (dest_fd < 0)
     die_io("cannot open extraction directory '" + opt.tar_dest + "': " + std::strerror(errno));
 
+  // Progress bar + completion summary.  This path bypasses main()'s
+  // decompress progress setup (it returns early via extract_tar), so spawn the
+  // same machinery here.  total_in = sum of compressed archive sizes drives the
+  // input %; the decompress workers update the shared meter.  Unseekable/stdin
+  // archives contribute 0 (unknown size), matching single-file stdin behavior.
+  uint64_t total_in = 0;
+  for (const std::string & arc : opt.tar_sources) {
+    if (arc == "-") continue;
+    std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
+    if (!ec) total_in += (uint64_t)z;
+  }
+  std::atomic<bool> prog_done{false};
+  std::thread prog_thr(progress_loop, std::cref(opt), m, total_in, &prog_done);
+
   int rc = EXIT_OK;
   for (const std::string & arc : opt.tar_sources) {
     FILE * in = open_input(arc);   // dies on failure
@@ -11609,6 +11831,32 @@ static int extract_tar(const Options & opt, Meter * m)
     if (ex.had_error() && rc == EXIT_OK) rc = EXIT_ERROR;
   }
   ::close(dest_fd);
+
+  // Stop the progress bar and print a zstd-style decompress summary (mirrors
+  // main()'s DECOMPRESS summary).  in = total compressed read, out = total
+  // extracted; the "output" label is the extraction directory.
+  prog_done = true;
+  if (prog_thr.joinable()) prog_thr.join();
+  if (opt.verbosity >= V_DEFAULT) {
+    uint64_t in_bytes  = m->read_bytes.load();
+    uint64_t out_bytes = m->wrote_bytes.load();
+    auto dt = std::chrono::steady_clock::now() - m->t0;
+    double secs = std::chrono::duration_cast<std::chrono::duration<double>>(dt).count();
+    double rate = secs > 0 ? double(out_bytes) / secs : 0.0;
+    char in_s[64], out_s[64], rate_s[64];
+    human_bytes(double(in_bytes),  in_s,  sizeof(in_s));
+    human_bytes(double(out_bytes), out_s, sizeof(out_s));
+    human_bytes(rate, rate_s, sizeof(rate_s));
+    std::string in_name = (opt.tar_sources.size() == 1)
+        ? opt.tar_sources[0]
+        : (std::to_string(opt.tar_sources.size()) + " archives");
+    char summary[512];
+    std::snprintf(summary, sizeof(summary),
+      "%s : \033[36m%s\033[0m => \033[32m%s\033[0m, %s @ \033[32m%s/s\033[0m",
+      in_name.c_str(), in_s, out_s, opt.tar_dest.c_str(), rate_s);
+    std::fprintf(stderr, "\r%s\033[K\n", summary);
+    std::fflush(stderr);
+  }
   return rc;
 }
 #endif  // !_WIN32
@@ -12519,6 +12767,8 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (a == "--numeric-owner") opt.tar_numeric_owner = true;
     else if (a == "--one-file-system") opt.tar_one_file_system = true;
+    else if (a == "--xattrs") opt.tar_xattrs = true;
+    else if (a == "--acls") opt.tar_acls = true;
     else if (a == "-C" || a == "--directory") {
       if (i + 1 >= argc) die_usage("missing value for " + a);
       opt.tar_dest = argv[++i];

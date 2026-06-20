@@ -197,6 +197,34 @@ if(HAVE_NVML)
   target_compile_definitions(gzstd PRIVATE HAVE_NVML)
 endif()
 
+# POSIX ACL support for --acls (libacl).  The --xattrs syscalls live in glibc
+# and need no library; only ACLs require libacl.  Optional: without it, gzstd
+# builds fine and --acls/--xattrs error at runtime.  When BUILD_STATIC, prefer
+# the .a archives and also link libattr (libacl's dependency).
+if(UNIX AND NOT APPLE)
+  if(BUILD_STATIC)
+    set(_SAVED_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+  endif()
+  find_path(ACL_INCLUDE_DIR sys/acl.h)
+  find_library(ACL_LIBRARY NAMES acl)
+  find_library(ATTR_LIBRARY NAMES attr)
+  if(BUILD_STATIC)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_SAVED_SUFFIXES})
+  endif()
+  if(ACL_INCLUDE_DIR AND ACL_LIBRARY)
+    target_compile_definitions(gzstd PRIVATE GZSTD_HAVE_ACL=1)
+    target_include_directories(gzstd PRIVATE ${ACL_INCLUDE_DIR})
+    target_link_libraries(gzstd PRIVATE ${ACL_LIBRARY})
+    if(BUILD_STATIC AND ATTR_LIBRARY)
+      target_link_libraries(gzstd PRIVATE ${ATTR_LIBRARY})
+    endif()
+    message(STATUS "ACL/xattr support: enabled (${ACL_LIBRARY})")
+  else()
+    message(STATUS "ACL/xattr support: disabled (libacl not found; --acls/--xattrs unavailable)")
+  endif()
+endif()
+
 # =====================================================
 #                     Linkage
 # =====================================================

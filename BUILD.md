@@ -44,7 +44,17 @@ cmake -B build -DBUILD_STATIC=ON
 cmake --build build -j$(nproc)
 ```
 
-Links zstd, libstdc++, libgcc, and CUDA runtime statically. The resulting binary only needs glibc at runtime; the NVIDIA driver is optional (CUDA and NVML are discovered at runtime, with CPU-only fallback when absent).
+Links zstd, libstdc++, libgcc, libacl, and CUDA runtime statically. The resulting binary only needs glibc at runtime; the NVIDIA driver is optional (CUDA and NVML are discovered at runtime, with CPU-only fallback when absent).
+
+**Static zstd archive required.** `BUILD_STATIC=ON` links `libzstd.a`, which the
+conda-forge `zstd` package does **not** ship — install it explicitly:
+```bash
+conda install -c conda-forge zstd-static   # provides $CONDA_PREFIX/lib/libzstd.a
+```
+(or `apt install libzstd-dev` for the system archive, though that may be a
+different zstd version than the one used at compile time). Likewise `--acls`
+needs `libacl.a`/`libattr.a` (`apt install libacl1-dev libattr1-dev`); without
+them the binary builds but `--acls`/`--xattrs` are unavailable.
 
 **Note:** the conda-forge `libnvcomp` package ships shared libraries only — no `libnvcomp_static.a`. With BUILD_STATIC=ON against a conda env, CMake will fall back to `libnvcomp.so.5` and the binary will still depend on it at runtime. To get a fully self-contained binary, fetch NVIDIA's official tarball (next section) which includes `libnvcomp_static.a`.
 

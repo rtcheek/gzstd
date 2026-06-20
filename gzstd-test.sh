@@ -356,10 +356,11 @@ human_size() {
 # auto-expand if you forget (so the display never shows > 100%),
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
-# Default run: 253.  --extensive adds back the gated sections (Stress,
-# Help/version, Space-separated values, Completion summary format) for 284.
-EXPECTED_TESTS=252
-$EXTENSIVE && EXPECTED_TESTS=328
+# Counts assume a GPU is present.  --extensive adds back the gated sections
+# (Stress, Help/version, Space-separated values, Thread option forms, Verbose
+# output validation, Completion summary format).
+EXPECTED_TESTS=235
+$EXTENSIVE && EXPECTED_TESTS=333
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1711,6 +1712,7 @@ rm -f "$TMPDIR"/pipe-*
 # ============================================================
 # 24. Thread option forms
 # ============================================================
+if $EXTENSIVE; then
 section "Thread option forms (-T)"
 
 LAST_TEST_MS=0
@@ -1748,6 +1750,7 @@ files_match "$TMPDIR/small.txt" "$TMPDIR/tform1.recovered" \
   && pass "-T 2 round-trip correct" || fail "-T 2 round-trip" "mismatch"
 
 rm -f "$TMPDIR"/tform*
+fi  # $EXTENSIVE (Thread option forms)
 
 # ============================================================
 # 25. CPU scheduling options
@@ -2323,6 +2326,7 @@ fi  # $EXTENSIVE (Space-separated option values)
 # ============================================================
 # 33. Verbose output validation (-v, -vv, -vvv)
 # ============================================================
+if $EXTENSIVE; then
 section "Verbose output validation"
 
 # Compress a file we'll use for all verbose tests
@@ -2477,6 +2481,7 @@ else
   skip "-vvv GPU stats" "no GPU"
   skip "-vvv H2D stats" "no GPU"
 fi
+fi  # $EXTENSIVE (Verbose output validation)
 
 # ============================================================
 # 34. Completion summary format validation
@@ -3489,6 +3494,62 @@ PYEOF
     fi
   else
     skip "GPU extraction round-trip" "no GPU"
+  fi
+
+  # 9. Progress + summary on extraction.  Regression: extract_tar returns early
+  #    from main() and used to bypass the progress machinery, so -d --tar was
+  #    silent even with --progress (v0.14.2 fix).  --progress forces the meter
+  #    on captured (non-TTY) stderr; the summary prints the "<in> => <out>" line.
+  "$GZSTD" --cpu-only -q -f -o "$XARC" --tar "$XS" 2>/dev/null
+  rm -rf "$XOUT"; mkdir -p "$XOUT"
+  PERR="$TMPDIR/xprog.err"
+  "$GZSTD" -d --cpu-only --progress --tar -C "$XOUT" "$XARC" 2>"$PERR" >/dev/null
+  if grep -q '=>' "$PERR" && grep -qE '/s' "$PERR"; then
+    pass "extraction prints progress summary (--progress)"
+  else
+    fail "extraction progress summary" "no summary line on stderr"
+  fi
+  rm -f "$PERR"
+
+  # 10-13. Extended metadata: POSIX ACLs (--acls) and xattrs (--xattrs), gated
+  #    like GNU tar (must be given on both create and extract).  Needs setfacl/
+  #    setfattr and a filesystem that supports them, else the group is skipped.
+  XMETA_OK=0
+  if command -v setfacl >/dev/null 2>&1 && command -v setfattr >/dev/null 2>&1; then
+    XPROBE="$TMPDIR/xmeta_probe"; : > "$XPROBE"
+    if setfacl -m "u:$(id -u):rwx" "$XPROBE" 2>/dev/null \
+       && setfattr -n user.gztest -v v "$XPROBE" 2>/dev/null; then XMETA_OK=1; fi
+    rm -f "$XPROBE"
+  fi
+  if [[ $XMETA_OK -eq 1 ]]; then
+    XM="$TMPDIR/xmsrc"; rm -rf "$XM"; mkdir -p "$XM/d"
+    echo content > "$XM/file"
+    setfacl -m "u:$(id -u):rwx" "$XM/file"
+    setfattr -n user.note -v hello "$XM/file"
+    setfacl -d -m "u:$(id -u):rwx" "$XM/d"          # default ACL on a directory
+    XMA="$TMPDIR/xm.tar.zst"; XMO="$TMPDIR/xmout"
+    "$GZSTD" -q -f -o "$XMA" --tar --acls --xattrs "$XM" 2>/dev/null
+    rm -rf "$XMO"; mkdir -p "$XMO"
+    "$GZSTD" -d -q --tar --acls --xattrs -C "$XMO" "$XMA" 2>/dev/null
+    getfacl -cpn "$XMO$XM/file" 2>/dev/null | grep -q "user:$(id -u):rwx" \
+      && pass "extract restores POSIX ACL (--acls)" || fail "extract ACL" "user entry missing"
+    [[ "$(getfattr -n user.note --only-values "$XMO$XM/file" 2>/dev/null)" == hello ]] \
+      && pass "extract restores xattr (--xattrs)" || fail "extract xattr" "user.note missing"
+    getfacl -cpn "$XMO$XM/d" 2>/dev/null | grep -q "default:user:$(id -u):rwx" \
+      && pass "extract restores default ACL on directory" || fail "extract default ACL" "default entry missing"
+    # zero-overhead: WITHOUT the flags, no SCHILY records appear in the archive.
+    "$GZSTD" -q -f -o "$XMA" --tar "$XM" 2>/dev/null
+    if "$GZSTD" -dc "$XMA" 2>/dev/null | grep -qa SCHILY; then
+      fail "no extended metadata without flags" "SCHILY present"
+    else
+      pass "no extended metadata without flags"
+    fi
+    rm -rf "$XM" "$XMO" "$XMA"
+  else
+    skip "extract restores POSIX ACL (--acls)" "no setfacl / xattr fs support"
+    skip "extract restores xattr (--xattrs)" "no setfacl / xattr fs support"
+    skip "extract restores default ACL on directory" "no setfacl / xattr fs support"
+    skip "no extended metadata without flags" "no setfacl / xattr fs support"
   fi
 
   rm -rf "$XS" "$XOUT" "$XARC"

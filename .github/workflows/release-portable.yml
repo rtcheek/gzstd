@@ -64,6 +64,25 @@ jobs:
           diff test.txt test.recovered
           rm -rf test.txt test.txt.zst test.recovered
 
+          # --tar --acls --xattrs round-trip: proves the shipped binary actually
+          # restores POSIX ACLs and xattrs (not just that the flags parse).  The
+          # runner's ext4 workspace supports both; acl/attr CLIs may not be
+          # preinstalled.
+          sudo apt-get update -qq && sudo apt-get install -y -qq acl attr
+          mkdir -p acltest/src acltest/out
+          echo data > acltest/src/f
+          setfacl -m "u:$(id -u):rwx" acltest/src/f
+          setfattr -n user.gz -v v acltest/src/f
+          ./build-portable/gzstd -q -f -o acltest/a.tar.zst --tar --acls --xattrs acltest/src
+          ./build-portable/gzstd -d -q --tar --acls --xattrs -C acltest/out acltest/a.tar.zst
+          F=$(find acltest/out -type f -name f | head -1)
+          getfacl -cpn "$F" 2>/dev/null | grep -q "user:$(id -u):rwx" \
+            || { echo "ERROR: ACL not restored — shipped binary lacks working --acls"; exit 1; }
+          [ "$(getfattr -n user.gz --only-values "$F" 2>/dev/null)" = v ] \
+            || { echo "ERROR: xattr not restored — shipped binary lacks working --xattrs"; exit 1; }
+          echo "ACL/xattr round-trip OK"
+          rm -rf acltest
+
       - name: Determine version + tag
         id: meta
         run: |
