@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.4";
+static constexpr const char * GZSTD_VERSION = "0.14.5";
 //
 // Architecture overview:
 //
@@ -401,7 +401,7 @@ struct Options {
   // --tar: synthesize a GNU-format tar stream from tar_sources and feed it to
   // the compressor, reading member files in parallel (replaces `tar -cf - … |
   // gzstd`).  --tar ends option parsing: every token after it is an archive
-  // member path.  Compression only; output is a standard .tar.zst.
+  // member path (files to archive on create; archives to extract on -d --tar).
   bool tar_mode = false;
   std::vector<std::string> tar_sources;  // compress: files/dirs to archive; decompress: input archives (post-`--tar`)
   std::vector<std::string> tar_excludes; // --exclude PATTERN (fnmatch, repeatable)
@@ -720,7 +720,7 @@ static void print_help()
 "Archive (tar):\n"
 "  --tar SRC...        build one .tar.zst from the files/dirs listed after\n"
 "                      --tar, reading members in parallel.  The tar options\n"
-"                      below may also follow --tar.  Compression only.\n"
+"                      below may also follow --tar.\n"
 "  -d --tar ARC...     extract .tar.zst archive(s) (decompress + untar)\n"
 "  -C, --directory DIR extraction root for -d --tar (default: current dir)\n"
 "  --write-threads N   parallel file writers for -d --tar (default: min(-T,16))\n"
@@ -938,7 +938,7 @@ static void print_help_long()
 "     the tree itself and reads member files IN PARALLEL, feeding\n"
 "     the same multithreaded CPU/GPU pipeline — so the archiving is\n"
 "     no longer bottlenecked on tar's single-threaded reader.\n"
-"     Compression only; the result is a standard GNU-format tar\n"
+"     The result is a standard GNU-format tar\n"
 "     stream (`tar --format=gnu`, the default on Ubuntu/Debian)\n"
 "     wrapped in zstd, extractable with any tar+zstd:\n"
 "         tar --zstd -xf out.tar.zst        # or:\n"
@@ -1254,6 +1254,19 @@ static void print_help_long()
 "\n"
 "  # Build a .tar.zst directly, reading members in parallel (no `tar`)\n"
 "  gzstd -o backup.tar.zst --tar --exclude '*/.cache/*' ~/docs ~/proj\n"
+"\n"
+"  # Extract a .tar.zst archive (decompress + untar in one parallel pass)\n"
+"  gzstd -d --tar backup.tar.zst              # into the current directory\n"
+"  gzstd -d --tar -C /restore backup.tar.zst  # into /restore (must exist)\n"
+"\n"
+"  # Preserve POSIX ACLs and extended attributes (give the flags on BOTH\n"
+"  # create and extract, as GNU tar requires)\n"
+"  gzstd -o home.tar.zst --tar --acls --xattrs ~user\n"
+"  gzstd -d --tar --acls --xattrs -C /restore home.tar.zst\n"
+"\n"
+"  # Full-system backup: one archive, stay on each filesystem (skips /proc,\n"
+"  # /sys, /dev; list real partitions as separate sources to include them)\n"
+"  sudo gzstd -o root.tar.zst --tar --one-file-system / /home /boot\n"
 "\n"
 "  # CPU-only baseline at level 3 using all cores\n"
 "  gzstd --cpu-only -T 0 big.tar\n"
@@ -11922,6 +11935,22 @@ int main(int argc, char ** argv)
     std::fprintf(stderr, "%s\n", os.str().c_str());
     std::fflush(stderr);  // unbuffer so it hits the terminal immediately
   }
+
+  // --direct-read is a no-op when CREATING a --tar archive: members are read
+  // through the parallel tar reader (buffered preads, gzstd.cpp:assemble), not
+  // the single-file O_DIRECT input path (which also requires a regular-file
+  // input, whereas --tar's input is a directory).  Warn instead of silently
+  // ignoring it.
+  if (opt.direct_read && opt.tar_mode && opt.mode == Mode::COMPRESS)
+    vlog(V_DEFAULT, opt, "gzstd: warning: --direct-read has no effect with --tar "
+                         "(archive members are read buffered); ignoring it\n");
+
+  // --write-threads sizes the -d --tar extractor's parallel file-writer pool and
+  // is consumed nowhere else (gzstd.cpp:Extractor::start_pool), so it is a no-op
+  // for plain compress/decompress and for --tar create.  Warn rather than ignore.
+  if (opt.write_threads > 0 && !(opt.tar_mode && opt.mode == Mode::DECOMPRESS))
+    vlog(V_DEFAULT, opt, "gzstd: warning: --write-threads only applies to -d --tar "
+                         "extraction (parallel file-writer pool); ignoring it\n");
 
 #ifndef _WIN32
   // -d --tar: extract the archive(s) into -C DIR via the native parallel

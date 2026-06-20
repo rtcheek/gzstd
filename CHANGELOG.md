@@ -1,11 +1,25 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.4  
+**Covers:** v0.9.50 → v0.14.5  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.5 — help text tweaks for --tar
+
+- Dropped the stale "Compression only" notes from `-h`/`--help` (and the
+  matching `Options` comment): `--tar` archives are no longer compress-only —
+  `-d --tar` extracts, and `--acls`/`--xattrs` apply on both create and extract.
+- Added `--help` EXAMPLES for `--tar`: extraction (`-d --tar`, with `-C`),
+  ACL/xattr-preserving backup + restore, and a full-system `--one-file-system`
+  backup.
+- Warn (instead of silently ignoring) when a flag has no effect in the given
+  mode: `--direct-read` with `--tar` on create (members are read through the
+  buffered parallel tar reader, so O_DIRECT input never engages), and
+  `--write-threads` anywhere but `-d --tar` (it only sizes the extractor's
+  file-writer pool). Both warnings are suppressed by `-q`.
 
 ## v0.14.4 — fix the CPU-only / portable (`USE_NVCOMP=OFF`) build
 
