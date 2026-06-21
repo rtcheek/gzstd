@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.7";
+static constexpr const char * GZSTD_VERSION = "0.14.8";
 //
 // Architecture overview:
 //
@@ -12020,7 +12020,12 @@ int main(int argc, char ** argv)
   if (to_stdout) {
     out = stdout;
   } else {
-    bool exists = fs::exists(opt.output);
+    // Only a pre-existing REGULAR file is a clobber risk.  A special output
+    // target (/dev/null, a device node, a fifo) is a deliberate sink, not
+    // something we overwrite — never block on it and never register it for
+    // cleanup-unlink (we must not delete /dev/null on failure).
+    bool existed_before = fs::exists(opt.output);
+    bool exists = existed_before && fs::is_regular_file(opt.output);
     if (exists && !opt.force) {
       die_io("output exists (use -f to overwrite): " + opt.output);
     }
@@ -12052,7 +12057,9 @@ int main(int argc, char ** argv)
       out = std::fopen(opt.output.c_str(), "wb");
       if (!out) die_io("cannot open output: " + opt.output);
       std::setvbuf(out, nullptr, _IOFBF, 1 * 1024 * 1024);
-      register_tmp_file(opt.output);
+      // Register for cleanup-on-failure only if we are CREATING a new file;
+      // never register a pre-existing special target like /dev/null.
+      if (!existed_before) register_tmp_file(opt.output);
     }
   }
 
