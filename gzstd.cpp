@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.6";
+static constexpr const char * GZSTD_VERSION = "0.14.7";
 //
 // Architecture overview:
 //
@@ -11832,7 +11832,13 @@ static int extract_tar(const Options & opt, Meter * m)
     FILE * pout = ::fdopen(fds[1], "wb");
     if (!pout) die_io("fdopen(pipe) failed");
 
-    tarx::Extractor ex(dest_fd, opt, m);
+    // Pass no meter to the Extractor: the decompressor (below) already counts
+    // the tar stream it writes into the pipe as wrote_bytes, and the Extractor
+    // writes that same stream's file data to disk — counting both on the shared
+    // meter double-counts the output (summary/progress showed ~2x).  The
+    // decompressor's count (the decompressed tar-stream size) is the meaningful
+    // "out" for the summary and matches the compress side's reported size.
+    tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
     std::thread exth([&] { ex.run(fds[0]); });
 
     // Pipe-friendly writer settings: no sparse seeks, no progressive fsync.
