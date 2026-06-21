@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.5";
+static constexpr const char * GZSTD_VERSION = "0.14.6";
 //
 // Architecture overview:
 //
@@ -7084,10 +7084,15 @@ static std::string strip_leading_slash(std::string s, const Options & opt, bool 
 }
 
 static TarLayout build_layout(const Options & opt, Meter * m) {
+  using _clk = std::chrono::steady_clock;
+  auto _secs = [](_clk::time_point a, _clk::time_point b) {
+    return std::chrono::duration_cast<std::chrono::duration<double>>(b - a).count();
+  };
   LayoutBuilder b(opt, m);
   if (opt.verbosity >= V_VERBOSE)
     vlog(V_VERBOSE, opt, "[TAR] scanning " + std::to_string(opt.tar_sources.size())
          + " source path(s)\n");
+  auto t_walk0 = _clk::now();
   for (std::string src : opt.tar_sources) {
     // Normalize: drop trailing slashes (keep a lone "/"), strip leading slash.
     // An empty member (source was "/") means no root entry — children are stored
@@ -7096,8 +7101,12 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
     std::string member = strip_leading_slash(src, opt, b.warned_leading_slash);
     b.walk(src, member, (dev_t)-1);
   }
+  double walk_s = _secs(t_walk0, _clk::now());
+  double gather_s = 0.0;
   if (opt.tar_xattrs || opt.tar_acls) {
+    auto t_g0 = _clk::now();
     b.apply_extended_metadata();
+    gather_s = _secs(t_g0, _clk::now());
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, std::string("[TAR] gathered ")
            + (opt.tar_acls ? "ACLs " : "") + (opt.tar_xattrs ? "xattrs " : "")
@@ -7108,6 +7117,12 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
     char sz[64]; human_bytes(double(b.lay.total_size), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, "[TAR] " + std::to_string(b.lay.entries.size())
          + " entries, " + sz + " uncompressed tar stream\n");
+    // TEMP (Step 0): phase split for the parallel-walk decision.  walk = serial
+    // readdir+lstat tree scan; gather = parallel ACL/xattr pass (0 if neither flag).
+    char tbuf[128];
+    std::snprintf(tbuf, sizeof(tbuf), "[TIMING] layout walk=%.2fs gather=%.2fs\n",
+                  walk_s, gather_s);
+    vlog(V_VERBOSE, opt, tbuf);
   }
   return std::move(b.lay);
 }
