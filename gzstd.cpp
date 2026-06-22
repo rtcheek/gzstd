@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.11";
+static constexpr const char * GZSTD_VERSION = "0.14.13";
 //
 // Architecture overview:
 //
@@ -6695,6 +6695,12 @@ struct TarEntry {
   int64_t     mtime     = 0;
   uint64_t    rdev      = 0;   // char/block device nodes
   char        typeflag  = '0';
+  // --sparse create (OLDGNU 'S'): sparse_map = (logical offset, length) per data
+  // segment; real_size = logical file size.  size becomes the STORED data length
+  // (Σ segment lengths); hdr_len includes the sparse extension blocks.  Empty map
+  // = not sparse.  data region holds the concatenated segments only.
+  uint64_t    real_size = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> sparse_map;
 };
 
 struct TarLayout {
@@ -6852,6 +6858,38 @@ static size_t emit_pax_block(char * out, const std::string & recs, const std::st
 
 // Synthesize a member's full header (PAX 'x' block + long-name/link blocks + base
 // block) into `out` (caller sizes it ≥ e.hdr_len).  Returns bytes written.
+// Fill the OLDGNU sparse map into a base header already written by emit_block
+// ('S' typeflag, size = stored): 4 segments at offset 386, isextended at 482,
+// realsize at 483; recompute the checksum; then emit 512-byte extension blocks
+// (21 segments each) for any remaining segments.  Returns base + extension bytes.
+static size_t emit_oldgnu_sparse(char * h, const TarEntry & e) {
+  const auto & m = e.sparse_map;
+  size_t n = m.size(), in_base = std::min<size_t>(4, n);
+  for (size_t i = 0; i < in_base; ++i) {
+    put_num(h + 386 + i * 24,      12, m[i].first);
+    put_num(h + 386 + i * 24 + 12, 12, m[i].second);
+  }
+  h[482] = (n > 4) ? 1 : 0;                 // isextended
+  put_num(h + 483, 12, e.real_size);
+  std::memset(h + 148, ' ', 8);             // recompute checksum
+  uint64_t sum = 0; for (size_t i = 0; i < TAR_BLK; ++i) sum += (unsigned char)h[i];
+  char cs[8]; std::snprintf(cs, sizeof(cs), "%06o", (unsigned)(sum & 0777777));
+  std::memcpy(h + 148, cs, 6); h[154] = '\0'; h[155] = ' ';
+  size_t off = TAR_BLK, idx = in_base;
+  while (idx < n) {
+    char * xb = h + off; std::memset(xb, 0, TAR_BLK);
+    size_t cnt = std::min<size_t>(21, n - idx);
+    for (size_t i = 0; i < cnt; ++i) {
+      put_num(xb + i * 24,      12, m[idx + i].first);
+      put_num(xb + i * 24 + 12, 12, m[idx + i].second);
+    }
+    idx += cnt;
+    xb[504] = (idx < n) ? 1 : 0;            // isextended
+    off += TAR_BLK;
+  }
+  return off;
+}
+
 static size_t emit_header(const TarEntry & e, const TarLayout & lay, char * out) {
   static const std::string empty;
   size_t off = 0;
@@ -6865,6 +6903,8 @@ static size_t emit_header(const TarEntry & e, const TarLayout & lay, char * out)
              uit != lay.unames.end() ? uit->second : empty,
              git != lay.gnames.end() ? git->second : empty,
              (uint64_t)major((dev_t)e.rdev), (uint64_t)minor((dev_t)e.rdev));
+  if (e.typeflag == 'S' && !e.sparse_map.empty())
+    return off + emit_oldgnu_sparse(out + off, e);
   return off + TAR_BLK;
 }
 
@@ -6892,6 +6932,7 @@ struct LayoutBuilder {
     std::string link;            // readlink target (symlinks)
     int         stat_err = 0;    // 0 ok, else errno from lstat
     int         link_err = 0;    // 0 ok, else errno from readlink
+    std::vector<std::pair<uint64_t, uint64_t>> sparse_map;  // --sparse: data segments
   };
   std::vector<Pending> pending_;
 
@@ -6914,6 +6955,10 @@ struct LayoutBuilder {
   void add(TarEntry e) {
     e.hdr_off   = off;
     e.hdr_len   = header_len(e.path.size(), e.link.size());
+    // OLDGNU sparse: 4 segments fit in the base header; the rest spill into
+    // 512-byte extension blocks (21 segments each) appended after it.
+    if (!e.sparse_map.empty() && e.sparse_map.size() > 4)
+      e.hdr_len += (uint32_t)(((e.sparse_map.size() - 4 + 20) / 21) * TAR_BLK);
     e.data_off  = off + e.hdr_len;
     e.entry_end = e.data_off + tar_round_up(e.size, TAR_BLK);
     off = e.entry_end;
@@ -7035,6 +7080,39 @@ struct LayoutBuilder {
                 child_boundary, k.second);
   }
 
+  // --sparse: build a regular file's data-segment map from filesystem hole
+  // metadata via SEEK_DATA/SEEK_HOLE (no data is read).  Leaves p.sparse_map
+  // empty (→ stored normally) if the file has no holes, or if the fs/seek
+  // doesn't support hole queries (graceful fallback to full storage).
+  void probe_sparse(Pending & p) {
+    int fd = ::open(p.fspath.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    const off_t size = p.st.st_size;
+    std::vector<std::pair<uint64_t, uint64_t>> segs;
+    off_t pos = 0; bool has_hole = false, ok = true;
+    while (pos < size) {
+      off_t data = ::lseek(fd, pos, SEEK_DATA);
+      if (data < 0) {
+        if (errno == ENXIO) has_hole = true;  // pos..EOF is a trailing hole
+        else ok = false;                       // SEEK_DATA unsupported → fall back
+        break;
+      }
+      if (data > pos) has_hole = true;          // hole before this data run
+      off_t hole = ::lseek(fd, data, SEEK_HOLE);
+      if (hole < 0) hole = size;
+      if (hole > data) segs.emplace_back((uint64_t)data, (uint64_t)(hole - data));
+      if (hole < size) has_hole = true;         // hole after this data run
+      pos = hole;
+    }
+    ::close(fd);
+    if (ok && has_hole) {
+      // GNU tar terminates the segment map with a zero-length entry at the real
+      // size; emit it too so GNU tar parses our archive correctly.
+      segs.emplace_back((uint64_t)size, 0);
+      p.sparse_map = std::move(segs);
+    }
+  }
+
   // ---- Pass B: lstat (+ readlink) every pending entry IN PARALLEL. ----
   // Disjoint slots, no shared state, so no locking — the cold-inode storm runs
   // concurrently.  errno is captured per-slot for Pass C's ordered warnings.
@@ -7054,6 +7132,13 @@ struct LayoutBuilder {
           if (r < 0) p.link_err = errno;
           else       p.link.assign(tgt.data(), (size_t)r);
         }
+        // --sparse: probe a regular file's hole structure via SEEK_DATA/SEEK_HOLE
+        // (filesystem extent metadata — reads no data).  A file with real holes
+        // gets >1 segment or a trailing hole; a fully-allocated file yields one
+        // segment spanning [0,size) and is treated as non-sparse (single segment).
+        if (opt.sparse_mode == 1 && S_ISREG(p.st.st_mode) && p.st.st_nlink <= 1
+            && p.st.st_size > 0)
+          probe_sparse(p);
       }
     };
     if (nthreads <= 1) worker();
@@ -7105,6 +7190,15 @@ struct LayoutBuilder {
           hardlinks.emplace(key, p.member);  // first occurrence stores the data
         }
         e.typeflag = '0'; e.size = (uint64_t)st.st_size; e.src = p.fspath;
+        // --sparse: this file has holes (Pass B built the segment map).  Store
+        // as OLDGNU 'S': size = Σ segment lengths (data only); real_size = logical.
+        if (!p.sparse_map.empty()) {
+          e.typeflag = 'S';
+          e.real_size = (uint64_t)st.st_size;
+          e.sparse_map = std::move(p.sparse_map);
+          uint64_t stored = 0; for (auto & s : e.sparse_map) stored += s.second;
+          e.size = stored;
+        }
       } else if (S_ISLNK(st.st_mode)) {
         if (p.link_err != 0) { warn_skip(p.fspath, std::strerror(p.link_err)); continue; }
         e.typeflag = '2'; e.link = p.link; e.size = 0;
@@ -7293,34 +7387,50 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         uint64_t s = std::max<uint64_t>(e.hdr_off, a), en = std::min<uint64_t>(he, b);
         std::memcpy(outp + (s - a), hdrbuf.data() + (s - e.hdr_off), (size_t)(en - s));
       }
-      // Data region (file bytes); padding stays zero.
+      // Data region (file bytes); padding stays zero.  For a sparse entry the
+      // data region holds the concatenated data segments, so a virtual (stored)
+      // offset maps to a file offset via the segment map; non-sparse is linear.
       if (e.size > 0) {
         uint64_t de = e.data_off + e.size;
         if (e.data_off < b && de > a) {
-          uint64_t s = std::max<uint64_t>(e.data_off, a), en = std::min<uint64_t>(de, b);
-          off_t fileoff = (off_t)(s - e.data_off);
-          size_t len = (size_t)(en - s);
           if (cur_path != e.src) {
             if (cur_fd >= 0) ::close(cur_fd);
             cur_fd = ::open(e.src.c_str(), O_RDONLY);
             cur_errno = (cur_fd < 0) ? errno : 0;
             cur_path = e.src;
           }
-          size_t done = 0;
-          if (cur_fd >= 0) {
-            while (done < len) {
-              ssize_t r = ::pread(cur_fd, outp + (s - a) + done, len - done, fileoff + (off_t)done);
-              if (r <= 0) break;
-              done += (size_t)r;
+          // Read `len` bytes from file offset `foff` into the chunk at virtual
+          // offset `voff`.  On short read the remainder stays zero (GNU parity).
+          auto read_seg = [&](off_t foff, uint64_t voff, size_t len) {
+            size_t done = 0;
+            if (cur_fd >= 0) {
+              while (done < len) {
+                ssize_t r = ::pread(cur_fd, outp + (voff - a) + done, len - done, foff + (off_t)done);
+                if (r <= 0) break;
+                done += (size_t)r;
+              }
             }
-          }
-          if (done < len) {  // unreadable/vanished/shrank: remainder stays zero (GNU tar parity)
-            g_tar_had_errors.store(true, std::memory_order_relaxed);
-            if (cur_fd < 0)
-              vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": cannot read ("
-                   + std::strerror(cur_errno) + ")\n");
-            else
-              vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": file changed as we read it\n");
+            if (done < len) {
+              g_tar_had_errors.store(true, std::memory_order_relaxed);
+              if (cur_fd < 0)
+                vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": cannot read ("
+                     + std::strerror(cur_errno) + ")\n");
+              else
+                vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": file changed as we read it\n");
+            }
+          };
+          uint64_t s = std::max<uint64_t>(e.data_off, a), en = std::min<uint64_t>(de, b);
+          if (e.sparse_map.empty()) {
+            read_seg((off_t)(s - e.data_off), s, (size_t)(en - s));
+          } else {
+            uint64_t ss = s - e.data_off, se = en - e.data_off, cum = 0;
+            for (const auto & seg : e.sparse_map) {
+              uint64_t seg_end = cum + seg.second;
+              uint64_t lo = std::max(cum, ss), hi = std::min(seg_end, se);
+              if (lo < hi) read_seg((off_t)(seg.first + (lo - cum)), e.data_off + lo, (size_t)(hi - lo));
+              cum = seg_end;
+              if (cum >= se) break;
+            }
           }
         }
       }
@@ -7428,6 +7538,8 @@ struct InEntry {
   bool      is_sparse = false;
   uint64_t  real_size = 0;
   std::vector<std::pair<uint64_t, uint64_t>> sparse_map;
+  bool      sparse_map_in_data = false;  // PAX GNU.sparse.1.0: map is a text block
+                                         // prefixed to the file data, not in sparse_map
 };
 
 // Buffered reader over a fd (the decompression pipe).
@@ -7723,6 +7835,11 @@ private:
     std::string pax_path, pax_link; uint64_t pax_size = 0; int64_t pax_mtime = 0;
     bool pax_has_size = false, pax_has_mtime = false;
     bool pax_gnu_sparse = false;          // GNU.sparse.* records seen (PAX sparse format)
+    int  pax_sp_major = 0, pax_sp_minor = 0;
+    std::string pax_sp_name;
+    uint64_t pax_sp_realsize = 0; bool pax_has_sp_realsize = false;
+    std::vector<std::pair<uint64_t, uint64_t>> pax_sp_map;  // 0.0/0.1 segment map
+    uint64_t pax_sp_pending_off = 0; bool pax_sp_have_off = false;  // 0.0 pairing
     ExtMeta pax_ext;                      // SCHILY.xattr.* / SCHILY.acl.* for next header
     int zero_run = 0;
     while (true) {
@@ -7776,7 +7893,32 @@ private:
               pax_ext.xattrs.emplace_back(key.substr(13), val);
             else if (opt_.tar_acls && key == "SCHILY.acl.access")  pax_ext.acl_access  = val;
             else if (opt_.tar_acls && key == "SCHILY.acl.default") pax_ext.acl_default = val;
-            else if (key.rfind("GNU.sparse.", 0) == 0) pax_gnu_sparse = true;
+            // PAX GNU sparse (0.0/0.1/1.0).  Capture the version, real size, real
+            // name, and the segment map (however this version encodes it).
+            else if (key.rfind("GNU.sparse.", 0) == 0) {
+              pax_gnu_sparse = true;
+              if      (key == "GNU.sparse.major") pax_sp_major = atoi(val.c_str());
+              else if (key == "GNU.sparse.minor") pax_sp_minor = atoi(val.c_str());
+              else if (key == "GNU.sparse.name")  pax_sp_name = val;
+              else if (key == "GNU.sparse.realsize" || key == "GNU.sparse.size") {
+                pax_sp_realsize = strtoull(val.c_str(), nullptr, 10); pax_has_sp_realsize = true;
+              }
+              else if (key == "GNU.sparse.map") {           // 0.1: "off,len,off,len,..."
+                pax_sp_map.clear(); const char * s = val.c_str(); char * end = nullptr;
+                while (*s) {
+                  uint64_t o = strtoull(s, &end, 10); if (end == s || *end != ',') break; s = end + 1;
+                  uint64_t l = strtoull(s, &end, 10); pax_sp_map.emplace_back(o, l);
+                  if (*end == ',') s = end + 1; else s = end;
+                }
+              }
+              else if (key == "GNU.sparse.offset") {        // 0.0: paired with numbytes
+                pax_sp_pending_off = strtoull(val.c_str(), nullptr, 10); pax_sp_have_off = true;
+              }
+              else if (key == "GNU.sparse.numbytes" && pax_sp_have_off) {
+                pax_sp_map.emplace_back(pax_sp_pending_off, strtoull(val.c_str(), nullptr, 10));
+                pax_sp_have_off = false;
+              }
+            }
           }
           p += (size_t)rlen;
         }
@@ -7824,17 +7966,28 @@ private:
         if (!ok_ext) return;
         e.is_sparse = true;
       } else if (pax_gnu_sparse) {
-        // PAX GNU.sparse.* (0.x/1.0) stores the map in the data area; not
-        // reconstructed here.  Fail loudly + skip rather than silently writing
-        // the map-and-data blob as if it were the file (which plain regular
-        // handling would do).  Use GNU tar to extract these.
-        fail(e.name, "PAX GNU sparse format not supported — skipped (extract with GNU tar)");
-        uint64_t pad = (TAR_BLK - (e.size % TAR_BLK)) % TAR_BLK;
-        if (e.size) { r.skip(e.size); r.skip(pad); }
-        pax_gnu_sparse = false;
-        continue;
+        // PAX GNU sparse.  The real name lives in GNU.sparse.name (the header
+        // name is a placeholder); real size in GNU.sparse.realsize/size.  e.size
+        // (the pax 'size' record) is the stored byte count to consume.
+        if (!pax_sp_name.empty()) e.name = pax_sp_name;
+        if (pax_has_sp_realsize)  e.real_size = pax_sp_realsize;
+        if (pax_sp_major >= 1) {
+          // 1.0: the segment map is a text block at the start of the file data.
+          e.is_sparse = true; e.sparse_map_in_data = true;
+        } else if (!pax_sp_map.empty()) {
+          // 0.0 / 0.1: the map is fully described by the PAX records.
+          e.is_sparse = true; e.sparse_map = pax_sp_map;
+        } else {
+          fail(e.name, "unrecognized PAX GNU sparse variant — skipped");
+          uint64_t pad = (TAR_BLK - (e.size % TAR_BLK)) % TAR_BLK;
+          if (e.size) { r.skip(e.size); r.skip(pad); }
+          pax_gnu_sparse = false;
+          continue;
+        }
       }
-      pax_gnu_sparse = false;
+      pax_gnu_sparse = false; pax_sp_major = pax_sp_minor = 0; pax_sp_name.clear();
+      pax_sp_realsize = 0; pax_has_sp_realsize = false; pax_sp_map.clear();
+      pax_sp_have_off = false;
 
       handle_entry(r, e);
     }
@@ -7925,14 +8078,51 @@ private:
     }
   }
 
+  // PAX GNU.sparse.1.0: the segment map is a text block ("numblocks\noff\nlen\n…")
+  // at the start of the file data, NUL-padded to a 512 multiple.  Read whole
+  // 512-blocks (so map bytes consumed is always 512-aligned), parsing decimals.
+  bool read_pax_sparse_map(StreamReader & r, std::vector<std::pair<uint64_t,uint64_t>> & map,
+                           uint64_t & consumed) {
+    map.clear(); consumed = 0;
+    char blk[TAR_BLK]; std::string num;
+    long long numblocks = -1; size_t need = 0, got = 0;
+    uint64_t pend = 0; bool have = false, done = false;
+    while (!done) {
+      if (!r.read_exact(blk, TAR_BLK)) return false;
+      consumed += TAR_BLK;
+      for (size_t i = 0; i < TAR_BLK && !done; ++i) {
+        char c = blk[i];
+        if (c >= '0' && c <= '9') { num.push_back(c); continue; }
+        if (c != '\n' || num.empty()) continue;
+        uint64_t v = strtoull(num.c_str(), nullptr, 10); num.clear();
+        if (numblocks < 0) { numblocks = (long long)v; need = 1 + 2 * (size_t)numblocks; got = 1;
+                             if (numblocks == 0) done = true; }
+        else { ++got;
+               if (!have) { pend = v; have = true; }
+               else { map.emplace_back(pend, v); have = false; }
+               if (got >= need) done = true; }
+      }
+    }
+    return numblocks >= 0;
+  }
+
   // Restore a GNU sparse file: write each stored segment at its logical offset
   // (leaving holes between them), then ftruncate to the real size.  Consumes
-  // exactly e.size bytes of segment data + padding from the stream.
+  // exactly e.size bytes of stored data + padding from the stream.
   void extract_sparse(StreamReader & r, const std::string & rel, const InEntry & e, uint64_t pad) {
     int fd = create_file(rel, e.mode);
     if (fd < 0) { fail(rel, std::strerror(errno)); if (e.size) { r.skip(e.size); r.skip(pad); } return; }
     char buf[1 << 20]; bool ok = true; uint64_t consumed = 0;
-    for (const auto & seg : e.sparse_map) {
+    std::vector<std::pair<uint64_t,uint64_t>> data_map;
+    const std::vector<std::pair<uint64_t,uint64_t>> * mapp = &e.sparse_map;
+    if (e.sparse_map_in_data) {  // PAX 1.0: map prefixes the data
+      uint64_t mc = 0;
+      if (!read_pax_sparse_map(r, data_map, mc)) {
+        fail(rel, "bad PAX sparse map"); ::close(fd); return;
+      }
+      consumed = mc; mapp = &data_map;
+    }
+    for (const auto & seg : *mapp) {
       uint64_t base = seg.first, len = seg.second, w = 0;
       while (w < len && ok) {
         size_t want = (size_t)std::min<uint64_t>(len - w, sizeof buf);

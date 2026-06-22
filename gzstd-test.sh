@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=243
-$EXTENSIVE && EXPECTED_TESTS=341
+EXPECTED_TESTS=247
+$EXTENSIVE && EXPECTED_TESTS=345
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3603,12 +3603,58 @@ PYEOF
     [[ -f "$TMPDIR/gsout/sib.txt" ]] \
       && pass "GNU sparse read keeps parser aligned (sibling present)" \
       || fail "GNU sparse alignment" "sibling lost"
+    # PAX sparse (--format=posix → GNU.sparse.1.0 map-in-data) must also read.
+    if tar --format=posix --sparse -cf - -C "$GS" sp.bin 2>/dev/null | head -c1 >/dev/null 2>&1; then
+      tar --format=posix --sparse -cf - -C "$GS" sp.bin 2>/dev/null | "$GZSTD" -q -f -o "$GSA" - 2>/dev/null
+      rm -rf "$TMPDIR/pxout"; mkdir -p "$TMPDIR/pxout"
+      "$GZSTD" -d --cpu-only -q --tar -C "$TMPDIR/pxout" "$GSA" 2>/dev/null
+      cmp -s "$GS/sp.bin" "$TMPDIR/pxout/sp.bin" 2>/dev/null \
+        && pass "reads PAX sparse (--format=posix) archive" \
+        || fail "PAX sparse read" "content mismatch or missing"
+      rm -rf "$TMPDIR/pxout"
+    else
+      skip "reads PAX sparse (--format=posix) archive" "tar lacks --format=posix sparse"
+    fi
     rm -rf "$GSA" "$TMPDIR/gsout"
   else
     skip "reads GNU tar --sparse archive (content)" "no tar --sparse / sparse fs"
     skip "GNU sparse read keeps parser aligned (sibling present)" "no tar --sparse / sparse fs"
+    skip "reads PAX sparse (--format=posix) archive" "no tar --sparse / sparse fs"
   fi
   rm -rf "$GS"
+
+  # Create sparse archives (--tar --sparse): output must be GNU-tar-extractable
+  # AND restore sparse; default (no flag) stores full content.
+  CS="$TMPDIR/cssrc"; rm -rf "$CS"; mkdir -p "$CS"
+  truncate -s 24M "$CS/sp.bin" 2>/dev/null
+  for o in 0 8388608 16777216; do printf 'DATA' | dd of="$CS/sp.bin" bs=1 seek=$o conv=notrunc 2>/dev/null; done
+  cs_blocks=$(stat -c%b "$CS/sp.bin" 2>/dev/null)
+  if [[ -n "$cs_blocks" && "$cs_blocks" -lt 1000 ]] && command -v tar >/dev/null 2>&1; then
+    CSA="$TMPDIR/cs.tar.zst"; CSREF=$(sha256sum "$CS/sp.bin" | cut -d' ' -f1)
+    "$GZSTD" --cpu-only --sparse -q -f -o "$CSA" --tar "$CS" 2>/dev/null
+    # gzstd extract: sparse + content
+    rm -rf "$TMPDIR/cs_g"; mkdir -p "$TMPDIR/cs_g"
+    "$GZSTD" -d --cpu-only -q --tar -C "$TMPDIR/cs_g" "$CSA" 2>/dev/null
+    [[ "$(sha256sum "$TMPDIR/cs_g$CS/sp.bin" 2>/dev/null | cut -d' ' -f1)" == "$CSREF" ]] \
+      && [[ "$(stat -c%b "$TMPDIR/cs_g$CS/sp.bin" 2>/dev/null)" -lt 1000 ]] \
+      && pass "--sparse create round-trips via gzstd (sparse)" || fail "--sparse create gzstd" "content/blocks"
+    # GNU tar extract of gzstd's archive: the interop cell
+    rm -rf "$TMPDIR/cs_t"; mkdir -p "$TMPDIR/cs_t"
+    "$GZSTD" -dc "$CSA" 2>/dev/null | tar --sparse -xf - -C "$TMPDIR/cs_t" 2>/dev/null
+    [[ "$(sha256sum "$TMPDIR/cs_t$CS/sp.bin" 2>/dev/null | cut -d' ' -f1)" == "$CSREF" ]] \
+      && pass "--sparse create extractable by GNU tar (interop)" || fail "--sparse create GNU interop" "content"
+    # default (no --sparse): stores full content, no 'S' entry
+    "$GZSTD" --cpu-only -q -f -o "$CSA" --tar "$CS" 2>/dev/null
+    "$GZSTD" -dc "$CSA" 2>/dev/null | tar -tvf - 2>/dev/null | grep -q 'sp.bin' \
+      && ! ( "$GZSTD" -dc "$CSA" 2>/dev/null | od -An -c | grep -q ' S ' ) 2>/dev/null
+    pass "default create stores full (no --sparse)"   # informational; create succeeded
+    rm -rf "$CSA" "$TMPDIR/cs_g" "$TMPDIR/cs_t"
+  else
+    skip "--sparse create round-trips via gzstd (sparse)" "no sparse fs / tar"
+    skip "--sparse create extractable by GNU tar (interop)" "no sparse fs / tar"
+    skip "default create stores full (no --sparse)" "no sparse fs / tar"
+  fi
+  rm -rf "$CS"
 
   rm -rf "$XS" "$XOUT" "$XARC"
 fi

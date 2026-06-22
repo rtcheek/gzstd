@@ -1,11 +1,54 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.11  
+**Covers:** v0.9.50 → v0.14.13  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.13 — create sparse archives (`--tar --sparse`, GNU-interoperable)
+
+Completes sparse support: gzstd can now *create* sparse `.tar.zst` archives, not
+just read/restore them.  `--tar --sparse` detects each regular file's holes via
+`SEEK_DATA`/`SEEK_HOLE` (filesystem extent metadata — **reads none of the hole
+bytes**) and stores it in OLDGNU `'S'` format: only the data segments + the
+segment map.  Output is **byte-identical to `tar --format=gnu --sparse`**, so GNU
+tar extracts it and restores the holes — closing the last interop cell (a
+gzstd-created sparse archive now restores sparse under GNU tar too).
+
+Opt-in, matching GNU tar: **`--sparse` required on create** (default stores full
+content — deterministic and maximally portable).  Extract still restores sparse
+by default (`--no-sparse` to disable).  Fits the existing architecture without
+cost: the hole map is built in `build_layout`'s parallel stat pass (Pass B), the
+parallel chunk assembler consults the per-file map (non-sparse files are
+unchanged, single linear segment), and for a big sparse file `assemble` now reads
+only the real data segments — **a create-time read-speed win**, not just a size
+one.  The segment map is terminated with GNU's `(realsize, 0)` marker; >4
+segments spill into 512-byte extension blocks (21 each).  Verified byte-identical
+to GNU tar and round-trip-clean (gzstd↔gzstd, gzstd↔GNU tar) including
+multi-extension-block files.
+
+## v0.14.12 — read PAX GNU sparse formats (0.0 / 0.1 / 1.0)
+
+v0.14.11 added reading of OLDGNU `'S'` sparse entries and made PAX `GNU.sparse.*`
+(and other unsupported types) **fail loudly**.  This completes it: gzstd now
+**reads the PAX sparse formats too**, so it can extract sparse files from a
+`tar --format=posix --sparse` archive instead of erroring.
+
+All three PAX variants are handled, reusing the same segment-placement +
+sparse-write path as the OLDGNU reader:
+- **0.0** — segment map as repeated `GNU.sparse.offset`/`GNU.sparse.numbytes`
+  PAX records.
+- **0.1** — map as one `GNU.sparse.map` comma-separated record.
+- **1.0** — map as a NUL-padded text block prefixing the file data (read and
+  parsed from the stream, then the segments follow).
+
+The real name (`GNU.sparse.name`) and size (`GNU.sparse.realsize`/`size`) come
+from the PAX records.  Verified against real `tar` output for `--format=gnu`,
+`--format=posix`, and `--sparse-version=0.0/0.1`: content-identical, restored
+sparse, parser stays aligned.  Genuinely unknown entry types still fail loudly.
+gzstd can now extract any zstd-wrapped tar — any GNU format, sparse or not.
 
 ## v0.14.11 — sparse files on `-d --tar`: restore holes + read GNU sparse archives
 
