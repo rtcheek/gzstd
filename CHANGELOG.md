@@ -1,11 +1,52 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.5  
+**Covers:** v0.9.50 → v0.14.9  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.9 — parallelize the --tar layout walk (two-pass)
+
+`build_layout`'s tree walk was single-threaded — it did one `lstat` per member
+serially before any compression could start.  On a cold first-time backup of a
+many-small-file tree this is pure dead time (the compress threads sit idle until
+the layout exists): measured ~10.7s on a 1M-file / 179 GiB tree, ≈20% of cold
+wall time.  (A `--read-threads` sweep first ruled out the read path — cold
+small-file reads are device-bound at ~3.3 GiB/s and don't scale with more
+readers; the serial walk was the real reclaimable lever.)
+
+The walk is now three passes inside `LayoutBuilder`:
+- **Pass A (enumerate, serial):** readdir-driven DFS in canonical order, using
+  the dirent `d_type` so leaves need no `lstat` here; an `lstat` happens only for
+  `DT_UNKNOWN` or `--one-file-system` directories (st_dev drives descent).
+- **Pass B (stat, parallel):** every entry's `lstat` (+ symlink `readlink`) runs
+  across N workers on disjoint slots — the cold-inode storm, concurrently.
+- **Pass C (finalize, serial):** hardlink first-occurrence, owner-name
+  resolution, and the offset prefix-sum, in canonical order.
+
+Order-sensitive logic stays serial, so **archives are byte-for-byte identical**
+to the old walk — verified by `cmp` against the prior binary across plain,
+`--exclude`, `--numeric-owner`, `--one-file-system`, and `--acls --xattrs`, plus
+the full test suite.  `-v` `[TIMING]` now reports the `enum`/`stat` split.
+
+## v0.14.8 — don't treat special-file outputs (`/dev/null`) as clobber targets
+
+Only regular files are a clobber risk now; `-o /dev/null` (and device nodes /
+fifos) write through without `-f`, and special targets are never registered for
+cleanup-unlink.
+
+## v0.14.7 — fix -d --tar summary double-counting output size
+
+The extract summary shared one Meter between the decompressor (tar stream →
+pipe) and the Extractor (files → disk), so the reported size/rate came out ~2×.
+Display only; on-disk extraction was always correct.
+
+## v0.14.6 — add [TIMING] layout phase split to --tar
+
+`-v` instrumentation measuring the layout walk vs the parallel ACL/xattr gather,
+to drive the parallel-`build_layout` decision.
 
 ## v0.14.5 — help text tweaks for --tar
 

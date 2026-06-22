@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.8";
+static constexpr const char * GZSTD_VERSION = "0.14.9";
 //
 // Architecture overview:
 //
@@ -6864,6 +6864,24 @@ struct LayoutBuilder {
   std::map<std::pair<uint64_t, uint64_t>, std::string> hardlinks;  // (dev,ino) → first member
   bool warned_leading_slash = false;
 
+  // Two-pass walk: Pass A (enumerate) fills `pending_` in canonical order using
+  // readdir's d_type (no lstat on leaves); Pass B (stat_pending) lstats every
+  // entry IN PARALLEL — the cold-inode storm, ~20% of cold --tar wall time; see
+  // project-tar-read-path; Pass C (finalize_entries) does the order-sensitive
+  // bookkeeping (hardlinks, owners, offsets) serially on the stat'd results, so
+  // the archive stays byte-for-byte identical to the old serial walk.
+  struct Pending {
+    std::string fspath, member;
+    dev_t       boundary_dev;
+    bool        is_dir;
+    // filled by Pass B:
+    struct stat st {};
+    std::string link;            // readlink target (symlinks)
+    int         stat_err = 0;    // 0 ok, else errno from lstat
+    int         link_err = 0;    // 0 ok, else errno from readlink
+  };
+  std::vector<Pending> pending_;
+
   LayoutBuilder(const Options & o, Meter * mm) : opt(o), m(mm) {}
 
   void resolve_owner(uint64_t uid, uint64_t gid) {
@@ -6934,87 +6952,162 @@ struct LayoutBuilder {
 
   // fspath: filesystem path to stat/read.  member: name to store in the archive.
   // boundary_dev: (dev_t)-1 until --one-file-system fixes it to a source's root.
-  void walk(const std::string & fspath, const std::string & member, dev_t boundary_dev) {
+  // ---- Pass A: enumerate the tree into pending_ in canonical order. ----
+  // dtype is the parent readdir's d_type for this entry (DT_UNKNOWN for the
+  // top-level sources or filesystems that don't report it).  We avoid lstat
+  // here: d_type tells us whether to recurse, and leaf metadata is deferred to
+  // Pass B.  An lstat happens in Pass A only when unavoidable: DT_UNKNOWN (to
+  // learn dir-ness) or --one-file-system on a directory (st_dev drives the
+  // mount-crossing / descent decision, which must be known before recursing).
+  void enumerate(const std::string & fspath, const std::string & member,
+                 dev_t boundary_dev, int dtype) {
     if (excluded(fspath)) return;
-    struct stat st;
-    if (::lstat(fspath.c_str(), &st) != 0) { warn_skip(fspath, std::strerror(errno)); return; }
 
-    // --one-file-system: this entry sits on a different filesystem than the
-    // source root it was reached from.  A crossed mount point (always a dir) is
-    // still recorded as an empty stub below — so the mount point exists on
-    // restore — but we do not descend into it.
-    const bool cross = opt.tar_one_file_system && boundary_dev != (dev_t)-1
-                       && st.st_dev != boundary_dev;
+    bool is_dir;
+    struct stat ast {}; bool have_ast = false;
+    if (dtype == DT_DIR) {
+      is_dir = true;
+    } else if (dtype == DT_UNKNOWN) {
+      if (::lstat(fspath.c_str(), &ast) != 0) { warn_skip(fspath, std::strerror(errno)); return; }
+      have_ast = true; is_dir = S_ISDIR(ast.st_mode);
+    } else {
+      is_dir = false;  // DT_REG/DT_LNK/DT_CHR/DT_BLK/DT_FIFO/DT_SOCK
+    }
 
-    if (S_ISDIR(st.st_mode)) {
-      // Record the directory itself.  Skip the root placeholder (empty member):
-      // an absolute source's members are stored leading-'/'-stripped with no
-      // root entry, matching GNU tar (`/` → `proc/`, `home/...`, not `./proc`).
-      if (!member.empty()) {
+    if (!is_dir) {
+      // Leaf.  The --one-file-system cross-check is deferred to Pass C (a leaf
+      // is on its parent's filesystem unless it is itself a bind-mount, the rare
+      // case Pass C still catches via the parallel-lstat st_dev).  No lstat here.
+      pending_.push_back({fspath, member, boundary_dev, false, {}, {}, 0, 0});
+      return;
+    }
+
+    // Directory.  Under --one-file-system we need st_dev now to decide crossing
+    // (before descending) and to seed a source root's boundary.
+    bool cross = false;
+    dev_t child_boundary = boundary_dev;
+    if (opt.tar_one_file_system) {
+      if (!have_ast) {
+        if (::lstat(fspath.c_str(), &ast) != 0) { warn_skip(fspath, std::strerror(errno)); return; }
+        have_ast = true;
+      }
+      if (boundary_dev != (dev_t)-1) cross = (ast.st_dev != boundary_dev);
+      else                          child_boundary = ast.st_dev;  // source root sets the boundary
+    }
+
+    // Record the directory itself.  Skip the root placeholder (empty member):
+    // an absolute source's members are stored leading-'/'-stripped with no root
+    // entry, matching GNU tar (`/` → `proc/`, `home/...`, not `./proc`).
+    if (!member.empty())
+      pending_.push_back({fspath, member, boundary_dev, true, {}, {}, 0, 0});
+
+    if (cross) return;  // mount-point stub recorded; do not descend
+
+    DIR * d = ::opendir(fspath.c_str());
+    if (!d) { warn_skip(fspath, std::strerror(errno)); return; }
+    std::vector<std::pair<std::string, int>> kids;  // (name, d_type)
+    for (struct dirent * de; (de = ::readdir(d)); ) {
+      if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
+      kids.emplace_back(de->d_name, (int)de->d_type);
+    }
+    ::closedir(d);
+    std::sort(kids.begin(), kids.end(),
+              [](const auto & a, const auto & b) { return a.first < b.first; });  // canonical order
+    std::string base = member;
+    if (!base.empty() && base.back() == '/') base.pop_back();
+    const std::string sep = (!fspath.empty() && fspath.back() == '/') ? "" : "/";
+    for (const auto & k : kids)
+      enumerate(fspath + sep + k.first,
+                base.empty() ? k.first : base + "/" + k.first,
+                child_boundary, k.second);
+  }
+
+  // ---- Pass B: lstat (+ readlink) every pending entry IN PARALLEL. ----
+  // Disjoint slots, no shared state, so no locking — the cold-inode storm runs
+  // concurrently.  errno is captured per-slot for Pass C's ordered warnings.
+  void stat_pending() {
+    const size_t n = pending_.size();
+    if (n == 0) return;
+    int nthreads = std::max(1, resolve_cpu_threads(opt.cpu_threads));
+    nthreads = std::min<int>(nthreads, (int)n);
+    std::atomic<size_t> idx{0};
+    auto worker = [&] {
+      for (size_t i = idx.fetch_add(1); i < n; i = idx.fetch_add(1)) {
+        Pending & p = pending_[i];
+        if (::lstat(p.fspath.c_str(), &p.st) != 0) { p.stat_err = errno; continue; }
+        if (S_ISLNK(p.st.st_mode)) {
+          std::vector<char> tgt((size_t)p.st.st_size + 1);
+          ssize_t r = ::readlink(p.fspath.c_str(), tgt.data(), tgt.size());
+          if (r < 0) p.link_err = errno;
+          else       p.link.assign(tgt.data(), (size_t)r);
+        }
+      }
+    };
+    if (nthreads <= 1) worker();
+    else {
+      std::vector<std::thread> ths;
+      for (int t = 0; t < nthreads; ++t) ths.emplace_back(worker);
+      for (auto & t : ths) t.join();
+    }
+  }
+
+  // ---- Pass C: order-sensitive bookkeeping on the stat'd results. ----
+  // Iterates pending_ in canonical order, so hardlink first-occurrence, owner
+  // resolution, and the offset prefix-sum are byte-for-byte identical to the old
+  // serial walk — only the lstat I/O moved to the parallel Pass B.
+  void finalize_entries() {
+    for (Pending & p : pending_) {
+      if (p.stat_err != 0) { warn_skip(p.fspath, std::strerror(p.stat_err)); continue; }
+      const struct stat & st = p.st;
+
+      if (p.is_dir) {
         TarEntry e;
-        e.path = member;
-        if (e.path.back() != '/') e.path += '/';
+        e.path = p.member;
+        if (e.path.empty() || e.path.back() != '/') e.path += '/';
         e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid; e.mtime = st.st_mtime;
         e.typeflag = '5';
-        if (opt.tar_xattrs || opt.tar_acls) e.src = fspath;  // gather source (dir)
+        if (opt.tar_xattrs || opt.tar_acls) e.src = p.fspath;
         resolve_owner(e.uid, e.gid); add(std::move(e));
+        continue;
       }
-      if (cross) return;  // mount-point stub recorded; do not descend
 
-      dev_t child_boundary = boundary_dev;
-      if (opt.tar_one_file_system && boundary_dev == (dev_t)-1) child_boundary = st.st_dev;
+      // Leaf --one-file-system cross-check (deferred from Pass A): skip a leaf on
+      // a different filesystem than its boundary (a file bind-mount).
+      if (opt.tar_one_file_system && p.boundary_dev != (dev_t)-1
+          && st.st_dev != p.boundary_dev) continue;
 
-      DIR * d = ::opendir(fspath.c_str());
-      if (!d) { warn_skip(fspath, std::strerror(errno)); return; }
-      std::vector<std::string> names;
-      for (struct dirent * de; (de = ::readdir(d)); ) {
-        if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
-        names.emplace_back(de->d_name);
-      }
-      ::closedir(d);
-      std::sort(names.begin(), names.end());  // deterministic ordering across runs
-      std::string base = member;
-      if (!base.empty() && base.back() == '/') base.pop_back();
-      const std::string sep = (!fspath.empty() && fspath.back() == '/') ? "" : "/";
-      for (const std::string & nm : names)
-        walk(fspath + sep + nm, base.empty() ? nm : base + "/" + nm, child_boundary);
-      return;
-    }
+      TarEntry e;
+      e.path = p.member; e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid;
+      e.mtime = st.st_mtime;
+      if (opt.tar_xattrs || opt.tar_acls) e.src = p.fspath;
 
-    if (cross) return;  // non-directory on a crossed filesystem: skip
-
-    TarEntry e;
-    e.path = member; e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid;
-    e.mtime = st.st_mtime;
-    if (opt.tar_xattrs || opt.tar_acls) e.src = fspath;  // gather source (symlink/special/regular)
-
-    if (S_ISREG(st.st_mode)) {
-      if (st.st_nlink > 1) {
-        auto key = std::make_pair((uint64_t)st.st_dev, (uint64_t)st.st_ino);
-        auto it = hardlinks.find(key);
-        if (it != hardlinks.end()) {
-          e.typeflag = '1'; e.link = it->second; e.size = 0;  // hardlink, no data
-          resolve_owner(e.uid, e.gid); add(std::move(e)); return;
+      if (S_ISREG(st.st_mode)) {
+        if (st.st_nlink > 1) {
+          auto key = std::make_pair((uint64_t)st.st_dev, (uint64_t)st.st_ino);
+          auto it = hardlinks.find(key);
+          if (it != hardlinks.end()) {
+            e.typeflag = '1'; e.link = it->second; e.size = 0;
+            resolve_owner(e.uid, e.gid); add(std::move(e)); continue;
+          }
+          hardlinks.emplace(key, p.member);  // first occurrence stores the data
         }
-        hardlinks.emplace(key, member);  // first occurrence → store as a regular file
+        e.typeflag = '0'; e.size = (uint64_t)st.st_size; e.src = p.fspath;
+      } else if (S_ISLNK(st.st_mode)) {
+        if (p.link_err != 0) { warn_skip(p.fspath, std::strerror(p.link_err)); continue; }
+        e.typeflag = '2'; e.link = p.link; e.size = 0;
+      } else if (S_ISCHR(st.st_mode)) {
+        e.typeflag = '3'; e.rdev = st.st_rdev;
+      } else if (S_ISBLK(st.st_mode)) {
+        e.typeflag = '4'; e.rdev = st.st_rdev;
+      } else if (S_ISFIFO(st.st_mode)) {
+        e.typeflag = '6';
+      } else {
+        note_skip(p.fspath, S_ISSOCK(st.st_mode) ? "socket" : "unknown file type");
+        continue;
       }
-      e.typeflag = '0'; e.size = (uint64_t)st.st_size; e.src = fspath;
-    } else if (S_ISLNK(st.st_mode)) {
-      std::vector<char> tgt((size_t)st.st_size + 1);
-      ssize_t n = ::readlink(fspath.c_str(), tgt.data(), tgt.size());
-      if (n < 0) { warn_skip(fspath, std::strerror(errno)); return; }
-      e.typeflag = '2'; e.link.assign(tgt.data(), (size_t)n); e.size = 0;
-    } else if (S_ISCHR(st.st_mode)) {
-      e.typeflag = '3'; e.rdev = st.st_rdev;
-    } else if (S_ISBLK(st.st_mode)) {
-      e.typeflag = '4'; e.rdev = st.st_rdev;
-    } else if (S_ISFIFO(st.st_mode)) {
-      e.typeflag = '6';
-    } else {
-      note_skip(fspath, S_ISSOCK(st.st_mode) ? "socket" : "unknown file type");
-      return;
+      resolve_owner(e.uid, e.gid); add(std::move(e));
     }
-    resolve_owner(e.uid, e.gid); add(std::move(e));
+    std::vector<Pending>().swap(pending_);  // release the transient enumeration buffer
   }
 
   // --acls/--xattrs: gather extended metadata for every member, then fold each
@@ -7092,16 +7185,24 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
   if (opt.verbosity >= V_VERBOSE)
     vlog(V_VERBOSE, opt, "[TAR] scanning " + std::to_string(opt.tar_sources.size())
          + " source path(s)\n");
-  auto t_walk0 = _clk::now();
+  // Pass A: serial enumeration (canonical order, no leaf lstat).
+  auto t_enum0 = _clk::now();
   for (std::string src : opt.tar_sources) {
     // Normalize: drop trailing slashes (keep a lone "/"), strip leading slash.
     // An empty member (source was "/") means no root entry — children are stored
     // directly as "proc/", "home/...", matching GNU tar archiving "/".
     while (src.size() > 1 && src.back() == '/') src.pop_back();
     std::string member = strip_leading_slash(src, opt, b.warned_leading_slash);
-    b.walk(src, member, (dev_t)-1);
+    b.enumerate(src, member, (dev_t)-1, DT_UNKNOWN);
   }
-  double walk_s = _secs(t_walk0, _clk::now());
+  double enum_s = _secs(t_enum0, _clk::now());
+  // Pass B: parallel lstat (the cold-inode storm).
+  auto t_stat0 = _clk::now();
+  b.stat_pending();
+  double stat_s = _secs(t_stat0, _clk::now());
+  // Pass C: serial finalize (hardlinks, owners, offsets — byte-stable order).
+  b.finalize_entries();
+  double walk_s = _secs(t_enum0, _clk::now());
   double gather_s = 0.0;
   if (opt.tar_xattrs || opt.tar_acls) {
     auto t_g0 = _clk::now();
@@ -7117,11 +7218,12 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
     char sz[64]; human_bytes(double(b.lay.total_size), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, "[TAR] " + std::to_string(b.lay.entries.size())
          + " entries, " + sz + " uncompressed tar stream\n");
-    // TEMP (Step 0): phase split for the parallel-walk decision.  walk = serial
-    // readdir+lstat tree scan; gather = parallel ACL/xattr pass (0 if neither flag).
-    char tbuf[128];
-    std::snprintf(tbuf, sizeof(tbuf), "[TIMING] layout walk=%.2fs gather=%.2fs\n",
-                  walk_s, gather_s);
+    // Phase split: enum = serial readdir tree scan; stat = parallel lstat pass
+    // (Pass B); walk = enum+stat+finalize; gather = parallel ACL/xattr pass.
+    char tbuf[160];
+    std::snprintf(tbuf, sizeof(tbuf),
+                  "[TIMING] layout walk=%.2fs (enum=%.2fs stat=%.2fs) gather=%.2fs\n",
+                  walk_s, enum_s, stat_s, gather_s);
     vlog(V_VERBOSE, opt, tbuf);
   }
   return std::move(b.lay);
