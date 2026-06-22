@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=238
-$EXTENSIVE && EXPECTED_TESTS=336
+EXPECTED_TESTS=243
+$EXTENSIVE && EXPECTED_TESTS=341
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3551,6 +3551,64 @@ PYEOF
     skip "extract restores default ACL on directory" "no setfacl / xattr fs support"
     skip "no extended metadata without flags" "no setfacl / xattr fs support"
   fi
+
+  # Sparse-file restoration: a sparse source restores with holes by default
+  # (fewer disk blocks than apparent size) and content intact; --no-sparse
+  # forces full allocation.  Needs a filesystem that supports holes.
+  SPF="$TMPDIR/spsrc"; rm -rf "$SPF"; mkdir -p "$SPF"
+  truncate -s 8M "$SPF/sparse.bin" 2>/dev/null
+  printf 'data' | dd of="$SPF/sparse.bin" bs=1 seek=0 conv=notrunc 2>/dev/null
+  src_blocks=$(stat -c%b "$SPF/sparse.bin" 2>/dev/null)
+  if [[ -n "$src_blocks" && "$src_blocks" -lt 1000 ]]; then   # source really is sparse
+    SPA="$TMPDIR/sp.tar.zst"
+    "$GZSTD" --cpu-only -q -f -o "$SPA" --tar "$SPF" 2>/dev/null
+    rm -rf "$TMPDIR/sp_def" "$TMPDIR/sp_no"; mkdir -p "$TMPDIR/sp_def" "$TMPDIR/sp_no"
+    "$GZSTD" -d --cpu-only -q             --tar -C "$TMPDIR/sp_def" "$SPA" 2>/dev/null
+    "$GZSTD" -d --cpu-only -q --no-sparse --tar -C "$TMPDIR/sp_no"  "$SPA" 2>/dev/null
+    def_b=$(stat -c%b "$TMPDIR/sp_def$SPF/sparse.bin" 2>/dev/null)
+    no_b=$(stat -c%b "$TMPDIR/sp_no$SPF/sparse.bin" 2>/dev/null)
+    [[ -n "$def_b" && "$def_b" -lt 1000 ]] \
+      && pass "extract restores sparse holes by default" || fail "sparse restore" "blocks=$def_b (not sparse)"
+    [[ -n "$no_b" && "$no_b" -gt 1000 ]] \
+      && pass "--no-sparse forces full allocation" || fail "--no-sparse" "blocks=$no_b (still sparse?)"
+    cmp -s "$SPF/sparse.bin" "$TMPDIR/sp_def$SPF/sparse.bin" \
+      && pass "sparse restore content identical" || fail "sparse content" "differs"
+    rm -rf "$SPA" "$TMPDIR/sp_def" "$TMPDIR/sp_no"
+  else
+    skip "extract restores sparse holes by default" "fs does not support sparse files"
+    skip "--no-sparse forces full allocation" "fs does not support sparse files"
+    skip "sparse restore content identical" "fs does not support sparse files"
+  fi
+  rm -rf "$SPF"
+
+  # GNU `tar --sparse` interop: gzstd must correctly read OLDGNU 'S' sparse
+  # entries (previously silently dropped).  Needs tar --sparse support + holes.
+  GS="$TMPDIR/gssrc"; rm -rf "$GS"; mkdir -p "$GS"
+  truncate -s 16M "$GS/sp.bin" 2>/dev/null
+  printf 'HEAD' | dd of="$GS/sp.bin" bs=1 seek=0 conv=notrunc 2>/dev/null
+  printf 'TAIL' | dd of="$GS/sp.bin" bs=1 seek=$((16*1024*1024-4)) conv=notrunc 2>/dev/null
+  echo sibling > "$GS/sib.txt"
+  gs_blocks=$(stat -c%b "$GS/sp.bin" 2>/dev/null)
+  if [[ -n "$gs_blocks" && "$gs_blocks" -lt 1000 ]] \
+     && tar --sparse -cf - -C "$GS" sp.bin 2>/dev/null | head -c1 >/dev/null 2>&1; then
+    GSA="$TMPDIR/gs.tar.zst"
+    tar --sparse -cf - -C "$GS" sp.bin sib.txt 2>/dev/null | "$GZSTD" -q -f -o "$GSA" - 2>/dev/null
+    rm -rf "$TMPDIR/gsout"; mkdir -p "$TMPDIR/gsout"
+    "$GZSTD" -d --cpu-only -q --tar -C "$TMPDIR/gsout" "$GSA" 2>/dev/null
+    if cmp -s "$GS/sp.bin" "$TMPDIR/gsout/sp.bin" 2>/dev/null; then
+      pass "reads GNU tar --sparse archive (content)"
+    else
+      fail "GNU sparse read" "content mismatch or file missing"
+    fi
+    [[ -f "$TMPDIR/gsout/sib.txt" ]] \
+      && pass "GNU sparse read keeps parser aligned (sibling present)" \
+      || fail "GNU sparse alignment" "sibling lost"
+    rm -rf "$GSA" "$TMPDIR/gsout"
+  else
+    skip "reads GNU tar --sparse archive (content)" "no tar --sparse / sparse fs"
+    skip "GNU sparse read keeps parser aligned (sibling present)" "no tar --sparse / sparse fs"
+  fi
+  rm -rf "$GS"
 
   rm -rf "$XS" "$XOUT" "$XARC"
 fi

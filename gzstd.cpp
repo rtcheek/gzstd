@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.10";
+static constexpr const char * GZSTD_VERSION = "0.14.11";
 //
 // Architecture overview:
 //
@@ -857,7 +857,10 @@ static void print_help_long()
 "\n"
 "  --[no-]sparse\n"
 "     Enable/disable sparse writes (skip zero blocks).  Default: on\n"
-"     for regular files, off for stdout.\n"
+"     for regular files, off for stdout.  Also applies to `-d --tar`\n"
+"     extraction: zero-filled regions are restored as filesystem holes\n"
+"     (a 100 GiB-sparse/1 GiB-real file restores to ~1 GiB on disk, not\n"
+"     100 GiB).  --no-sparse forces full allocation.\n"
 "\n"
 "  --sync-output\n"
 "     fsync the output file before exit.  Default: off.  Without\n"
@@ -7414,11 +7417,17 @@ struct ExtMeta {
 // A parsed tar entry (metadata only).
 struct InEntry {
   std::string name, linkname;
-  uint64_t size = 0, uid = 0, gid = 0;
+  uint64_t size = 0, uid = 0, gid = 0;   // size = bytes stored in the stream
   uint32_t mode = 0, devmajor = 0, devminor = 0;
   int64_t  mtime = 0;
   char     typeflag = '0';
   ExtMeta  ext;
+  // GNU sparse ('S' / GNU.sparse.*): the file's data is stored as segments, not
+  // a linear copy.  sparse_map = (logical offset, length) per stored segment;
+  // real_size = the file's logical size (ftruncate target).
+  bool      is_sparse = false;
+  uint64_t  real_size = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> sparse_map;
 };
 
 // Buffered reader over a fd (the decompression pipe).
@@ -7653,14 +7662,43 @@ private:
       write_small(j);
     }
   }
+  // --sparse extract: write [data,data+n) at file offset `at`, leaving holes for
+  // all-zero SPARSE_BLK runs (skip the pwrite).  The caller ftruncate()s to the
+  // final size afterward so trailing holes and the exact length are preserved.
+  static constexpr size_t SPARSE_BLK = 4096;
+  static bool pwrite_sparse(int fd, off_t at, const char * data, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+      size_t chunk = std::min(SPARSE_BLK, n - off);
+      bool zero = true;
+      for (size_t k = 0; k < chunk; ++k) if (data[off + k]) { zero = false; break; }
+      if (!zero) {
+        size_t w = 0;
+        while (w < chunk) {
+          ssize_t r = ::pwrite(fd, data + off + w, chunk - w, at + (off_t)(off + w));
+          if (r < 0) { if (errno == EINTR) continue; return false; }
+          w += (size_t)r;
+        }
+      }
+      off += chunk;
+    }
+    return true;
+  }
+
   void write_small(const Job & j) {
     int fd = create_file(j.rel, j.mode);
     if (fd < 0) { fail(j.rel, std::strerror(errno)); return; }
-    size_t off = 0; bool ok = true;
-    while (off < j.data.size()) {
-      ssize_t w = ::write(fd, j.data.data() + off, j.data.size() - off);
-      if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
-      off += (size_t)w;
+    bool ok = true;
+    if (opt_.sparse_mode != 0) {  // --sparse / auto (default on for file output); --no-sparse disables
+      ok = pwrite_sparse(fd, 0, j.data.data(), j.data.size());
+      if (ok && ::ftruncate(fd, (off_t)j.data.size()) != 0) ok = false;
+    } else {
+      size_t off = 0;
+      while (off < j.data.size()) {
+        ssize_t w = ::write(fd, j.data.data() + off, j.data.size() - off);
+        if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
+        off += (size_t)w;
+      }
     }
     if (!ok) fail(j.rel, std::strerror(errno));
     set_meta_fd(fd, j.mode, j.mtime, j.uid, j.gid);
@@ -7684,6 +7722,7 @@ private:
     std::string pend_name, pend_link;     // GNU 'L'/'K' overrides for the next header
     std::string pax_path, pax_link; uint64_t pax_size = 0; int64_t pax_mtime = 0;
     bool pax_has_size = false, pax_has_mtime = false;
+    bool pax_gnu_sparse = false;          // GNU.sparse.* records seen (PAX sparse format)
     ExtMeta pax_ext;                      // SCHILY.xattr.* / SCHILY.acl.* for next header
     int zero_run = 0;
     while (true) {
@@ -7737,6 +7776,7 @@ private:
               pax_ext.xattrs.emplace_back(key.substr(13), val);
             else if (opt_.tar_acls && key == "SCHILY.acl.access")  pax_ext.acl_access  = val;
             else if (opt_.tar_acls && key == "SCHILY.acl.default") pax_ext.acl_default = val;
+            else if (key.rfind("GNU.sparse.", 0) == 0) pax_gnu_sparse = true;
           }
           p += (size_t)rlen;
         }
@@ -7764,6 +7804,38 @@ private:
       e.ext = std::move(pax_ext); pax_ext = ExtMeta{};
       pax_has_size = pax_has_mtime = false;
 
+      // GNU OLDGNU sparse ('S'): the sparse map is in the header (4 entries at
+      // offset 386) + optional extension blocks; realsize at 483.  e.size is the
+      // stored (compacted) data length; e.real_size is the logical size.
+      if (type == 'S') {
+        auto add_seg = [&](const char * p) {
+          uint64_t off = get_num(p, 12), len = get_num(p + 12, 12);
+          if (!(off == 0 && len == 0)) e.sparse_map.emplace_back(off, len);
+        };
+        for (int i = 0; i < 4; ++i) add_seg(blk + 386 + i * 24);
+        e.real_size = get_num(blk + 483, 12);
+        bool ext = (unsigned char)blk[482] != 0;
+        char xb[TAR_BLK]; bool ok_ext = true;
+        while (ext) {
+          if (!r.read_exact(xb, TAR_BLK)) { fail(e.name, "truncated sparse extension"); ok_ext = false; break; }
+          for (int i = 0; i < 21; ++i) add_seg(xb + i * 24);
+          ext = (unsigned char)xb[504] != 0;
+        }
+        if (!ok_ext) return;
+        e.is_sparse = true;
+      } else if (pax_gnu_sparse) {
+        // PAX GNU.sparse.* (0.x/1.0) stores the map in the data area; not
+        // reconstructed here.  Fail loudly + skip rather than silently writing
+        // the map-and-data blob as if it were the file (which plain regular
+        // handling would do).  Use GNU tar to extract these.
+        fail(e.name, "PAX GNU sparse format not supported — skipped (extract with GNU tar)");
+        uint64_t pad = (TAR_BLK - (e.size % TAR_BLK)) % TAR_BLK;
+        if (e.size) { r.skip(e.size); r.skip(pad); }
+        pax_gnu_sparse = false;
+        continue;
+      }
+      pax_gnu_sparse = false;
+
       handle_entry(r, e);
     }
   }
@@ -7790,10 +7862,13 @@ private:
     // parse(); just count the member and consume its data so the parser stays
     // aligned.  A short read here (truncated archive) is caught by parse().
     if (validate_only_) {
-      ++vfiles_; vbytes_ += e.size;
+      ++vfiles_; vbytes_ += e.is_sparse ? e.real_size : e.size;
       if (e.size) { r.skip(e.size); r.skip(pad); }
       return;
     }
+
+    // GNU sparse: place each stored segment at its logical offset, leaving holes.
+    if (e.is_sparse) { extract_sparse(r, rel, e, pad); return; }
 
     if (rel.empty()) { if (e.size) { r.skip(e.size); r.skip(pad); } return; }
     // Path-traversal guard (the openat O_NOFOLLOW walk is the backstop; this gives
@@ -7836,27 +7911,77 @@ private:
         }
         if (e.size) { r.skip(e.size); r.skip(pad); }
         break;
-      default:                                      // unknown type: skip its data
+      case 'V':                                     // volume label/header: no file data
+        if (e.size) { r.skip(e.size); r.skip(pad); }
+        break;
+      default:
+        // Unknown/unsupported entry type (e.g. 'D' GNU incremental dumpdir,
+        // 'M' multi-volume continuation).  Fail LOUDLY — do not silently drop
+        // data; the user needs to know this archive isn't fully extracted.
+        fail(rel, std::string("unsupported tar entry type '") + e.typeflag
+                  + "' — skipped (data NOT extracted; use GNU tar)");
         if (e.size) { r.skip(e.size); r.skip(pad); }
         break;
     }
+  }
+
+  // Restore a GNU sparse file: write each stored segment at its logical offset
+  // (leaving holes between them), then ftruncate to the real size.  Consumes
+  // exactly e.size bytes of segment data + padding from the stream.
+  void extract_sparse(StreamReader & r, const std::string & rel, const InEntry & e, uint64_t pad) {
+    int fd = create_file(rel, e.mode);
+    if (fd < 0) { fail(rel, std::strerror(errno)); if (e.size) { r.skip(e.size); r.skip(pad); } return; }
+    char buf[1 << 20]; bool ok = true; uint64_t consumed = 0;
+    for (const auto & seg : e.sparse_map) {
+      uint64_t base = seg.first, len = seg.second, w = 0;
+      while (w < len && ok) {
+        size_t want = (size_t)std::min<uint64_t>(len - w, sizeof buf);
+        size_t got = r.read_some(buf, want);
+        if (!got) { ok = false; break; }
+        size_t p = 0;
+        while (p < got) {
+          ssize_t n = ::pwrite(fd, buf + p, got - p, (off_t)(base + w + p));
+          if (n < 0) { if (errno == EINTR) continue; ok = false; break; }
+          p += (size_t)n;
+        }
+        w += got; consumed += got;
+      }
+      if (!ok) break;
+    }
+    if (consumed < e.size) r.skip(e.size - consumed);  // any trailing stored bytes
+    r.skip(pad);
+    if (ok && ::ftruncate(fd, (off_t)e.real_size) != 0) ok = false;
+    if (!ok) fail(rel, "sparse write failed");
+    set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
+    apply_ext(fd, /*is_dir=*/false, e.ext);
+    ::close(fd);
+    if (m_) m_->wrote_bytes.fetch_add(e.real_size, std::memory_order_relaxed);
   }
 
   void stream_large(StreamReader & r, const std::string & rel, const InEntry & e) {
     int fd = create_file(rel, e.mode);
     if (fd < 0) { fail(rel, std::strerror(errno)); r.skip(e.size); return; }
     uint64_t left = e.size; char tmp[1 << 20]; bool ok = true;
+    uint64_t fpos = 0;  // running file offset (for --sparse pwrite)
     while (left) {
       size_t want = (size_t)std::min<uint64_t>(left, sizeof tmp);
       size_t got = r.read_some(tmp, want);
       if (!got) { ok = false; break; }
-      size_t off = 0;
-      while (off < got) { ssize_t w = ::write(fd, tmp + off, got - off); if (w < 0) { if (errno == EINTR) continue; ok = false; break; } off += (size_t)w; }
+      if (opt_.sparse_mode != 0) {
+        if (!pwrite_sparse(fd, (off_t)fpos, tmp, got)) { ok = false; break; }
+      } else {
+        size_t off = 0;
+        while (off < got) { ssize_t w = ::write(fd, tmp + off, got - off); if (w < 0) { if (errno == EINTR) continue; ok = false; break; } off += (size_t)w; }
+      }
       if (!ok) break;
+      fpos += got;
       left -= got;
       if (m_) m_->wrote_bytes.fetch_add(got, std::memory_order_relaxed);
     }
     if (!ok) fail(rel, "write failed");
+    // --sparse skips trailing/interior zero blocks, so set the exact final size
+    // (materializes trailing holes and the correct length).
+    else if (opt_.sparse_mode != 0 && ::ftruncate(fd, (off_t)e.size) != 0) fail(rel, "ftruncate failed");
     set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
     apply_ext(fd, /*is_dir=*/false, e.ext);
     ::close(fd);

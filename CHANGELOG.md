@@ -1,11 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.10  
+**Covers:** v0.9.50 → v0.14.11  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.11 — sparse files on `-d --tar`: restore holes + read GNU sparse archives
+
+Two sparse-related fixes on extract, one of which was silent data loss:
+
+**Restore as sparse.** `-d --tar` extracted sparse files fully-allocated — a
+100 GiB-sparse / 1 GiB-real file (VM image, big DB) restored to 100 GiB on disk
+(content correct, holes became real zeros).  The Extractor now writes files
+sparse, leaving filesystem holes where 4 KiB blocks are all-zero (`pwrite` skips
+them; `ftruncate` sets the final size).  Reuses the existing
+`--sparse`/`--no-sparse` flag, so `-d --tar` matches single-file decompress:
+**sparse by default for file output**, `--no-sparse` forces full allocation.
+
+**Read GNU sparse archives (was SILENT DATA LOSS).** A `.tar.zst` created by
+`tar --sparse` stores sparse files in GNU's OLDGNU `'S'` format; gzstd didn't
+recognize `'S'`, hit the `default` case, and **silently dropped the file** (and
+could mis-align the parser for following members).  gzstd now parses the OLDGNU
+sparse header (+ extension blocks), reconstructs the file from its segment map,
+and restores it sparse — content-identical, parser stays aligned.  PAX-format
+GNU sparse (`GNU.sparse.*`) and any other unsupported entry type (e.g. `'D'`
+incremental dumpdir, `'M'` multi-volume) now **fail loudly** (exit 4) instead of
+silently skipping, so no archive is ever partially extracted without notice.
+(base-256 large-number fields were already handled on read.)
+
+The GNU `--sparse` *create* format (gzstd emitting sparse, so GNU tar also
+restores holes) is intentionally not implemented: gzstd's parallel chunked
+assemble makes it costly, and it's moot here — gzstd restores sparse itself,
+zstd keeps the archive small, and plain entries are maximally portable.
 
 ## v0.14.10 — `-t --tar` structural verify + per-frame content checksums
 
