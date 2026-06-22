@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.9";
+static constexpr const char * GZSTD_VERSION = "0.14.10";
 //
 // Architecture overview:
 //
@@ -822,6 +822,10 @@ static void print_help_long()
 "     Exit code 0 on success, 4 on data error.  Defaults to 2 CUDA\n"
 "     streams per device (vs. 1 for normal decompress) because there\n"
 "     is no downstream writer to bottleneck on.\n"
+"     With --tar (`-t --tar ARCHIVE`), ALSO validates the tar structure\n"
+"     inside the zstd stream — every header checksum and member size, and\n"
+"     that the archive is complete — catching a truncated or corrupt tar\n"
+"     that plain -t (which only checks the zstd stream) would pass.\n"
 "\n"
 "  -k\n"
 "     Keep input after success (this is the default).\n"
@@ -4086,6 +4090,10 @@ static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, i
   // Set compression level explicitly on every call (level may differ per invocation)
   size_t st = ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_compressionLevel, level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
+  // Per-frame content checksum (XXH64 in the frame footer): makes every frame
+  // self-verifying so decompress/-t catches silent corruption / bit-rot.  ~4
+  // bytes/frame; standard zstd, verified by any decoder.
+  ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_checksumFlag, 1);
 
   // Ultra levels (20-22) need an explicit windowLog for the large window to take effect.
   // Without this, zstd silently clamps to its default window (~8 MiB), defeating ultra.
@@ -6312,6 +6320,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   if (!cctx) die("failed to create ZSTD_CCtx");
   size_t st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
+  ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);  // self-verifying frames (see compress worker)
 
   // Ultra levels need explicit windowLog for large windows to take effect
   {
@@ -6386,6 +6395,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   size_t st;
   st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level): ") + ZSTD_getErrorName(st));
+  ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);  // self-verifying frames (see compress worker)
   st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, (int)n_threads);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(nbWorkers): ") + ZSTD_getErrorName(st));
   if (total_in > 0) {
@@ -7440,23 +7450,29 @@ struct StreamReader {
 
 class Extractor {
 public:
-  Extractor(int dest_fd, const Options & opt, Meter * m)
-    : dest_fd_(dest_fd), opt_(opt), m_(m), as_root_(::geteuid() == 0) {}
+  // validate_only: parse and structurally verify the tar (header checksums,
+  // sizes, completeness) WITHOUT writing any files — for `gzstd -t --tar`.
+  Extractor(int dest_fd, const Options & opt, Meter * m, bool validate_only = false)
+    : dest_fd_(dest_fd), opt_(opt), m_(m), as_root_(::geteuid() == 0),
+      validate_only_(validate_only) {}
 
   bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
+  uint64_t validated_files() const { return vfiles_; }
+  uint64_t validated_bytes() const { return vbytes_; }
 
   void run(int read_fd) {
-    start_pool();
+    if (!validate_only_) start_pool();
     StreamReader r(read_fd);
-    parse(r);
+    parse(r);               // validates every header checksum; flags truncation
     r.drain();              // consume trailing padding so the decompressor can finish
-    stop_pool();
-    finish_deferred();
+    if (!validate_only_) { stop_pool(); finish_deferred(); }
   }
 
 private:
   static constexpr uint64_t SMALL_FILE_MAX = 4 * 1024 * 1024;  // buffer+dispatch below this; stream above
   int dest_fd_; const Options & opt_; Meter * m_; bool as_root_;
+  bool validate_only_ = false;
+  uint64_t vfiles_ = 0, vbytes_ = 0;  // validate_only counters
   std::atomic<bool> had_error_{false};
 
   // Deferred work applied after all data is written.
@@ -7769,6 +7785,15 @@ private:
     // data byte count present in the stream (for regular files); always skip it
     // after handling so the parser stays aligned even when we reject the member.
     uint64_t pad = (TAR_BLK - (e.size % TAR_BLK)) % TAR_BLK;
+
+    // Validate-only (`-t --tar`): the header checksum was already verified in
+    // parse(); just count the member and consume its data so the parser stays
+    // aligned.  A short read here (truncated archive) is caught by parse().
+    if (validate_only_) {
+      ++vfiles_; vbytes_ += e.size;
+      if (e.size) { r.skip(e.size); r.skip(pad); }
+      return;
+    }
 
     if (rel.empty()) { if (e.size) { r.skip(e.size); r.skip(pad); } return; }
     // Path-traversal guard (the openat O_NOFOLLOW walk is the backstop; this gives
@@ -11995,6 +12020,81 @@ static int extract_tar(const Options & opt, Meter * m)
   }
   return rc;
 }
+
+// -t --tar: decompress each archive and STRUCTURALLY validate the tar inside it
+// (every header checksum, member sizes, completeness) without writing any files.
+// Plain `-t` only proves the zstd stream decompresses; this also catches a
+// truncated or corrupt tar wrapped in an intact zstd stream.  zstd already
+// guarantees byte integrity end-to-end, and tar has no per-file data checksums,
+// so this verifies "structurally valid, complete, would extract cleanly."
+static int verify_tar(const Options & opt, Meter * m)
+{
+  int rc = EXIT_OK;
+  for (const std::string & arc : opt.tar_sources) {
+    FILE * in = open_input(arc);   // dies on failure
+    if (arc != "-") {
+      unsigned char magic[4] = {0};
+      size_t nr = std::fread(magic, 1, 4, in);
+      uint32_t mg = 0; if (nr == 4) std::memcpy(&mg, magic, 4);
+      bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
+      if (!ok_magic) {
+        vlog(V_ERROR, opt, "gzstd: test: not a zstd archive: " + arc + "\n");
+        if (in && in != stdin) std::fclose(in);
+        rc = EXIT_DATA; continue;
+      }
+      std::rewind(in);
+    }
+
+    int fds[2];
+    if (::pipe(fds) != 0) die_io("pipe() failed");
+    FILE * pout = ::fdopen(fds[1], "wb");
+    if (!pout) die_io("fdopen(pipe) failed");
+
+    tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/true);
+    std::thread exth([&] { ex.run(fds[0]); });
+
+    Options dopt = opt;
+    dopt.sparse_mode = 0;
+    dopt.unsafe_overwrite = true;
+    dopt.mode = Mode::DECOMPRESS;  // produce the tar stream into the pipe; the
+                                   // validate-only Extractor provides the test
+                                   // semantics (no writes).  In TEST mode the
+                                   // decompressor discards output and the pipe
+                                   // would stay empty.
+
+    // A corrupt zstd stream makes the decompressor die_data(); that is itself a
+    // test failure, surfaced as exit 4 — the desired behavior for `-t`.
+    int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
+    if (ff > (int64_t)SINGLE_FRAME_STREAM_MIN) {
+      decompress_stream_from_file(in, pout, dopt, m);
+    } else {
+#ifdef HAVE_NVCOMP
+      if (dopt.cpu_only) decompress_cpu_mt(in, pout, dopt, m);
+      else               decompress_nvcomp(in, pout, dopt, m);
+#else
+      decompress_cpu_mt(in, pout, dopt, m);
+#endif
+    }
+    std::fflush(pout);
+    std::fclose(pout);
+    exth.join();
+    ::close(fds[0]);
+    if (in && in != stdin) std::fclose(in);
+
+    bool bad = ex.had_error();
+    if (bad && rc == EXIT_OK) rc = EXIT_DATA;
+    if (opt.verbosity >= V_DEFAULT) {
+      char sz[64]; human_bytes(double(ex.validated_bytes()), sz, sizeof(sz));
+      std::fprintf(stderr, "%s : %s, %llu entries, %s — %s\n",
+                   (arc == "-") ? "(stdin)" : arc.c_str(),
+                   bad ? "\033[31mCORRUPT\033[0m" : "\033[32mOK\033[0m",
+                   (unsigned long long)ex.validated_files(), sz,
+                   bad ? "tar structure invalid" : "tar structure valid");
+      std::fflush(stderr);
+    }
+  }
+  return rc;
+}
 #endif  // !_WIN32
 
 int main(int argc, char ** argv)
@@ -12081,6 +12181,13 @@ int main(int argc, char ** argv)
   if (opt.tar_mode && opt.mode == Mode::DECOMPRESS) {
     Meter meter;
     return extract_tar(opt, &meter);
+  }
+  // -t --tar: decompress AND structurally validate the inner tar (header
+  // checksums, completeness) without writing files — catches a corrupt/truncated
+  // tar inside an otherwise-intact zstd stream, which plain -t misses.
+  if (opt.tar_mode && opt.mode == Mode::TEST) {
+    Meter meter;
+    return verify_tar(opt, &meter);
   }
 #endif
 
@@ -13235,8 +13342,6 @@ static Options parse_args(int argc, char ** argv)
 #ifdef _WIN32
     die_usage("--tar is not supported on this platform");
 #endif
-    if (opt.mode == Mode::TEST)
-      die_usage("--tar cannot be combined with -t (test); use -d --tar to extract");
     if (opt.sliding_window)
       die_usage("--tar is incompatible with --sliding-window");
     // Sources/archives follow --tar; anything in inputs leaked in before it
@@ -13247,12 +13352,14 @@ static Options parse_args(int argc, char ** argv)
     if (opt.tar_sources.empty())
       die_usage(opt.mode == Mode::COMPRESS
                 ? "--tar requires at least one file or directory to archive"
+                : opt.mode == Mode::TEST
+                ? "-t --tar requires at least one archive to test"
                 : "-d --tar requires at least one archive to extract");
-    if (opt.mode == Mode::DECOMPRESS) {
-      // Extraction: the post-`--tar` positionals are the input archive(s); the
-      // first becomes opt.input so the existing single-input plumbing works.
+    if (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST) {
+      // Extraction/test: the post-`--tar` positionals are the input archive(s);
+      // the first becomes opt.input so the existing single-input plumbing works.
       if (!opt.tar_excludes.empty())
-        die_usage("--exclude applies to creation (--tar), not extraction (-d --tar)");
+        die_usage("--exclude applies to creation (--tar), not extraction/test");
       opt.input = opt.tar_sources[0];
     }
     opt.keep = true;  // never delete archive sources / input archives

@@ -1,11 +1,32 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.9  
+**Covers:** v0.9.50 → v0.14.10  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.10 — `-t --tar` structural verify + per-frame content checksums
+
+Two integrity improvements, especially for backups:
+
+- **`gzstd -t --tar ARCHIVE`** now decompresses *and* structurally validates the
+  tar inside the zstd stream — every header checksum, member sizes, and that the
+  archive is complete (not truncated) — writing nothing.  Plain `-t` only proves
+  the zstd stream decompresses; a truncated or corrupt tar inside an intact zstd
+  wrapper passed `-t` before and would only surface on a failed restore.
+  Implemented as a validate-only pass through the existing `Extractor` (no file
+  writes); reports `archive : OK/CORRUPT, N entries, M bytes`.  (`--tar` is no
+  longer rejected with `-t`.)
+
+- **Content checksums enabled** (`ZSTD_c_checksumFlag`) on all CPU compress
+  paths.  Each frame now carries an XXH64 footer, so a bit-flip / bit-rot in the
+  compressed data is **caught on decompress** — `-d`, `-t`, and `-t --tar` all
+  fail with exit 4 instead of silently restoring corrupted bytes.  Previously no
+  checksum was set, so silent content corruption went undetected.  Cost is ~4
+  bytes/frame; output is standard zstd (any decoder verifies it).  Archives
+  created from this version forward are self-verifying.
 
 ## v0.14.9 — parallelize the --tar layout walk (two-pass)
 

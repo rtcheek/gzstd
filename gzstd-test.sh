@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=235
-$EXTENSIVE && EXPECTED_TESTS=333
+EXPECTED_TESTS=238
+$EXTENSIVE && EXPECTED_TESTS=336
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3553,6 +3553,43 @@ PYEOF
   fi
 
   rm -rf "$XS" "$XOUT" "$XARC"
+fi
+
+# ============================================================
+# Tar-aware integrity verification (-t --tar) + content checksums
+# ============================================================
+section "Tar verify and checksums (-t --tar)"
+
+if ! command -v tar >/dev/null 2>&1; then
+  skip "tar verify" "tar not available"
+else
+  VS="$TMPDIR/vsrc"; rm -rf "$VS"; mkdir -p "$VS/d"
+  for i in 1 2 3 4 5; do echo "verify-$i" > "$VS/d/f$i"; done
+  head -c 2000000 /dev/urandom > "$VS/big.bin"
+  VA="$TMPDIR/v.tar.zst"
+  "$GZSTD" --cpu-only -q -f -o "$VA" --tar "$VS" 2>/dev/null
+
+  # 1. valid archive: -t --tar succeeds and validates the tar structure.
+  "$GZSTD" -t --cpu-only --tar "$VA" >/dev/null 2>&1 \
+    && pass "-t --tar accepts a valid archive" || fail "-t --tar valid" "rc=$?"
+
+  # 2. truncated archive: -t --tar must reject it (exit 4).
+  vsz=$(stat -c%s "$VA"); head -c $((vsz*60/100)) "$VA" > "$TMPDIR/v.trunc.zst"
+  "$GZSTD" -t --cpu-only --tar "$TMPDIR/v.trunc.zst" >/dev/null 2>&1
+  [[ $? -eq 4 ]] && pass "-t --tar rejects a truncated archive" || fail "-t --tar truncated" "expected exit 4"
+
+  # 3. content checksum: a bit-flip in the compressed stream is caught (exit 4)
+  #    on plain -t — proves ZSTD_c_checksumFlag is active.
+  if command -v python3 >/dev/null 2>&1; then
+    cp "$VA" "$TMPDIR/v.flip.zst"
+    python3 -c "d=bytearray(open('$TMPDIR/v.flip.zst','rb').read()); d[int(len(d)*0.5)]^=0xFF; open('$TMPDIR/v.flip.zst','wb').write(d)"
+    "$GZSTD" -t --cpu-only "$TMPDIR/v.flip.zst" >/dev/null 2>&1
+    [[ $? -eq 4 ]] && pass "content checksum catches a bit-flip" || fail "checksum bit-flip" "expected exit 4"
+  else
+    skip "content checksum catches a bit-flip" "python3 unavailable"
+  fi
+
+  rm -rf "$VS" "$VA" "$TMPDIR"/v.*.zst
 fi
 
 # ============================================================
