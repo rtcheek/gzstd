@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.13";
+static constexpr const char * GZSTD_VERSION = "0.14.14";
 //
 // Architecture overview:
 //
@@ -6927,12 +6927,12 @@ struct LayoutBuilder {
     std::string fspath, member;
     dev_t       boundary_dev;
     bool        is_dir;
-    // filled by Pass B:
+    // filled by Pass B (all default-initialized so partial aggregate-init is clean):
     struct stat st {};
-    std::string link;            // readlink target (symlinks)
+    std::string link {};         // readlink target (symlinks)
     int         stat_err = 0;    // 0 ok, else errno from lstat
     int         link_err = 0;    // 0 ok, else errno from readlink
-    std::vector<std::pair<uint64_t, uint64_t>> sparse_map;  // --sparse: data segments
+    std::vector<std::pair<uint64_t, uint64_t>> sparse_map {};  // --sparse: data segments
   };
   std::vector<Pending> pending_;
 
@@ -7036,7 +7036,7 @@ struct LayoutBuilder {
       // Leaf.  The --one-file-system cross-check is deferred to Pass C (a leaf
       // is on its parent's filesystem unless it is itself a bind-mount, the rare
       // case Pass C still catches via the parallel-lstat st_dev).  No lstat here.
-      pending_.push_back({fspath, member, boundary_dev, false, {}, {}, 0, 0});
+      pending_.push_back({fspath, member, boundary_dev, false});  // rest default-init
       return;
     }
 
@@ -7057,7 +7057,7 @@ struct LayoutBuilder {
     // an absolute source's members are stored leading-'/'-stripped with no root
     // entry, matching GNU tar (`/` → `proc/`, `home/...`, not `./proc`).
     if (!member.empty())
-      pending_.push_back({fspath, member, boundary_dev, true, {}, {}, 0, 0});
+      pending_.push_back({fspath, member, boundary_dev, true});   // rest default-init
 
     if (cross) return;  // mount-point stub recorded; do not descend
 

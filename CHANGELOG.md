@@ -1,11 +1,20 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.13  
+**Covers:** v0.9.50 → v0.14.14  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.14 — silence -Wmissing-field-initializers in the tar layout walk
+
+v0.14.13 added a `sparse_map` field to `LayoutBuilder::Pending` but left the two
+`pending_.push_back({...})` aggregate-initializers partial, so `-Wmissing-field-
+initializers` fired (harmless — the field default-constructs empty).  Gave the
+Pass-B `Pending` members explicit `{}` default initializers and trimmed the
+push_backs to the fields actually set, so partial aggregate-init is clean.  No
+behavior change; warning-free build.
 
 ## v0.14.13 — create sparse archives (`--tar --sparse`, GNU-interoperable)
 
