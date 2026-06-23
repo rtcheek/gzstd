@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=247
-$EXTENSIVE && EXPECTED_TESTS=345
+EXPECTED_TESTS=249
+$EXTENSIVE && EXPECTED_TESTS=347
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3580,6 +3580,31 @@ PYEOF
     skip "sparse restore content identical" "fs does not support sparse files"
   fi
   rm -rf "$SPF"
+
+  # O_DIRECT large-file extract (--direct): big files (>4 MiB) go through the
+  # O_DIRECT stream path; it must be content-correct and sparse-aware.  Not the
+  # default on this box (Gen3), so forced with --direct; falls back if the fs
+  # rejects O_DIRECT.
+  DD="$TMPDIR/ddsrc"; rm -rf "$DD"; mkdir -p "$DD"
+  head -c 5000000 /dev/urandom > "$DD/dense.bin"          # >4 MiB dense → O_DIRECT path
+  head -c 5000000 /dev/urandom >  "$DD/holey.bin"
+  printf '\0%.0s' $(seq 1 4194304) >> "$DD/holey.bin" 2>/dev/null  # + a 4 MiB zero run
+  DDA="$TMPDIR/dd.tar.zst"
+  "$GZSTD" --cpu-only -q -f -o "$DDA" --tar "$DD" 2>/dev/null
+  rm -rf "$TMPDIR/dd_o"; mkdir -p "$TMPDIR/dd_o"
+  "$GZSTD" -d --cpu-only --direct -q --tar -C "$TMPDIR/dd_o" "$DDA" 2>/dev/null
+  if [[ -f "$TMPDIR/dd_o$DD/dense.bin" ]]; then
+    cmp -s "$DD/dense.bin" "$TMPDIR/dd_o$DD/dense.bin" \
+      && pass "O_DIRECT large-file extract (--direct) content correct" \
+      || fail "O_DIRECT extract content" "dense.bin differs"
+    cmp -s "$DD/holey.bin" "$TMPDIR/dd_o$DD/holey.bin" \
+      && pass "O_DIRECT extract content correct (holey)" \
+      || fail "O_DIRECT holey content" "differs"
+  else
+    skip "O_DIRECT large-file extract (--direct) content correct" "O_DIRECT unsupported on fs"
+    skip "O_DIRECT extract content correct (holey)" "O_DIRECT unsupported on fs"
+  fi
+  rm -rf "$DD" "$DDA" "$TMPDIR/dd_o"
 
   # GNU `tar --sparse` interop: gzstd must correctly read OLDGNU 'S' sparse
   # entries (previously silently dropped).  Needs tar --sparse support + holes.

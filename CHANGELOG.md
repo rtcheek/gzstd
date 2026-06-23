@@ -1,11 +1,41 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.14  
+**Covers:** v0.9.50 → v0.14.15  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.15 — O_DIRECT large-file extract; `-t --tar` progress bar; help fixes
+
+**O_DIRECT on `-d --tar` large-file extract.** `-d --tar` ignored `--direct`
+entirely: the Extractor's per-file writes were always buffered, even on Gen4+
+where `--direct` is auto-on (the `[O_DIRECT] defaulting to --direct` banner was
+misleading there).  Buffered writeback throttling capped big-file extract — the
+parallel decompressor outran the disk through the page cache.  Files >4 MiB
+(`stream_large`) now write with O_DIRECT when `--direct` is active, so the
+producer streams straight to disk.  It's **sparse-aware**: all-zero 4 KiB blocks
+are skipped as holes (when sparse is on), runs of non-zero blocks are coalesced
+into one aligned O_DIRECT write, and the final sub-block tail is written with
+O_DIRECT cleared.  Small files (≤4 MiB) stay buffered on purpose — O_DIRECT
+backfires on many tiny, mostly-unaligned, metadata-bound writes.  Falls back to
+buffered if the filesystem rejects O_DIRECT (e.g. tmpfs).  Content-verified
+across `--direct` / `--no-direct` / `--direct --no-sparse`; reuses a single
+reused 4 KiB-aligned bounce buffer (the parse thread writes large files serially).
+
+**`-t --tar` progress bar.** `gzstd -t --tar` (verify) showed no progress bar —
+`verify_tar` never spawned `progress_loop` (same gap as the v0.14.2 extract fix).
+It now shows the bar (labeled `verified:` via the existing TEST-mode variant), and
+the per-archive OK/CORRUPT result lines print after the bar stops so they don't
+collide.
+
+**Help text.** `--[no-]sparse` now documents its extract behavior precisely:
+`--no-sparse` only disables the scan-for-zeros (makes *normal* entries fully
+allocated) and does NOT affect entries the archive declared sparse (those always
+restore their recorded holes, like GNU tar) — "don't go looking for holes," not
+"materialize holes the archive declared."  Added the create-side `--sparse` entry
+under `--tar` (it was undocumented).
 
 ## v0.14.14 — silence -Wmissing-field-initializers in the tar layout walk
 

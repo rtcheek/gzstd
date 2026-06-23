@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.14";
+static constexpr const char * GZSTD_VERSION = "0.14.15";
 //
 // Architecture overview:
 //
@@ -729,6 +729,7 @@ static void print_help()
 "  --one-file-system   do not descend into other mounted filesystems\n"
 "  --xattrs            store/restore extended attributes (give on both create and extract)\n"
 "  --acls              store/restore POSIX ACLs (give on both create and extract)\n"
+"  --sparse            store sparse files compactly on create (GNU format; opt-in)\n"
 "\n"
 "Compression level:\n"
 "  -1 .. -19           zstd level (default: 3)\n"
@@ -856,11 +857,19 @@ static void print_help_long()
 "     Implies -f.\n"
 "\n"
 "  --[no-]sparse\n"
-"     Enable/disable sparse writes (skip zero blocks).  Default: on\n"
-"     for regular files, off for stdout.  Also applies to `-d --tar`\n"
-"     extraction: zero-filled regions are restored as filesystem holes\n"
-"     (a 100 GiB-sparse/1 GiB-real file restores to ~1 GiB on disk, not\n"
-"     100 GiB).  --no-sparse forces full allocation.\n"
+"     Sparse output: skip writing all-zero blocks, leaving filesystem\n"
+"     holes.  Default: on for regular-file output, off for stdout.\n"
+"     On `-d --tar` extraction, on by default: a zero-filled region is\n"
+"     restored as a hole (a 100 GiB-sparse/1 GiB-real file restores to\n"
+"     ~1 GiB on disk, not 100 GiB).\n"
+"     --no-sparse only disables this scan-for-zeros: it makes normal\n"
+"     file entries fully allocated.  It does NOT affect entries the\n"
+"     archive explicitly stored as sparse (created with `--tar --sparse`\n"
+"     or GNU `tar --sparse`) — those are always restored with their\n"
+"     recorded holes, like GNU tar.  --no-sparse means \"don't go looking\n"
+"     for holes,\" not \"materialize holes the archive declared.\"\n"
+"     On `--tar --sparse` (create), a sparse source file is stored\n"
+"     compactly in GNU sparse format (opt-in; see --sparse under --tar).\n"
 "\n"
 "  --sync-output\n"
 "     fsync the output file before exit.  Default: off.  Without\n"
@@ -1003,6 +1012,16 @@ static void print_help_long()
 "     and `SCHILY.acl.default` text records, compatible with GNU tar.  Off\n"
 "     by default; must be given on BOTH create and extract or it is ignored.\n"
 "     Restoring an ACL is applied after permissions, so the ACL wins.\n"
+"\n"
+"  --sparse (on create)\n"
+"     Detect each file's holes via SEEK_DATA/SEEK_HOLE (filesystem metadata,\n"
+"     reads no hole bytes) and store it compactly in GNU OLDGNU sparse\n"
+"     format — only the data segments plus a hole map.  Output is\n"
+"     byte-identical to `tar --format=gnu --sparse`, so GNU tar extracts it\n"
+"     and restores the holes too.  Opt-in, matching GNU tar: without\n"
+"     --sparse a sparse file is stored with full content (Zstd still\n"
+"     compresses the zeros, but the archive is not marked sparse).\n"
+"     Extraction restores holes by default regardless; see --[no-]sparse.\n"
 "\n"
 "  -d --tar ARCHIVE...\n"
 "     Extract one or more .tar.zst archives (decompress AND untar in one\n"
@@ -7576,6 +7595,7 @@ public:
   Extractor(int dest_fd, const Options & opt, Meter * m, bool validate_only = false)
     : dest_fd_(dest_fd), opt_(opt), m_(m), as_root_(::geteuid() == 0),
       validate_only_(validate_only) {}
+  ~Extractor() { if (dbuf_) ::free(dbuf_); }
 
   bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
   uint64_t validated_files() const { return vfiles_; }
@@ -7595,6 +7615,10 @@ private:
   bool validate_only_ = false;
   uint64_t vfiles_ = 0, vbytes_ = 0;  // validate_only counters
   std::atomic<bool> had_error_{false};
+  // O_DIRECT large-file writer: one reused 4 KiB-aligned bounce buffer (the
+  // parse thread writes large files sequentially, so a single buffer is safe).
+  static constexpr size_t DBUF_CAP = 8 * 1024 * 1024;
+  void * dbuf_ = nullptr;
 
   // Deferred work applied after all data is written.
   struct Hard { std::string name, target; };
@@ -7681,12 +7705,17 @@ private:
   }
 
   // Securely create/replace a regular file; returns an open write fd or -1.
-  int create_file(const std::string & rel, uint32_t mode) {
+  // o_direct: add O_DIRECT to the leaf open (large-file extract fast path).  The
+  // secure O_NOFOLLOW-per-component walk is unchanged; only the final flag differs.
+  int create_file(const std::string & rel, uint32_t mode, bool o_direct = false) {
     std::string leaf; int pfd = open_parent(rel, leaf, true);
     if (pfd < 0) return -1;
     ::unlinkat(pfd, leaf.c_str(), 0);              // remove any existing file/symlink first
-    int fd = ::openat(pfd, leaf.c_str(),
-                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode & 07777);
+    int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC;
+#ifdef O_DIRECT
+    if (o_direct) flags |= O_DIRECT;
+#endif
+    int fd = ::openat(pfd, leaf.c_str(), flags, mode & 07777);
     ::close(pfd);
     return fd;
   }
@@ -8042,7 +8071,8 @@ private:
           r.skip(pad);
           enqueue(std::move(j));
         } else {
-          stream_large(r, rel, e);
+          if (opt_.direct_io) stream_large_direct(r, rel, e);  // O_DIRECT (Gen4+ default)
+          else                stream_large(r, rel, e);
           r.skip(pad);
         }
         break;
@@ -8172,6 +8202,67 @@ private:
     // --sparse skips trailing/interior zero blocks, so set the exact final size
     // (materializes trailing holes and the correct length).
     else if (opt_.sparse_mode != 0 && ::ftruncate(fd, (off_t)e.size) != 0) fail(rel, "ftruncate failed");
+    set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
+    apply_ext(fd, /*is_dir=*/false, e.ext);
+    ::close(fd);
+  }
+
+  // O_DIRECT large-file extract (Gen4+ --direct): bypass the page cache so the
+  // decompressor isn't throttled by buffered writeback.  Sparse-aware: all-zero
+  // 4 KiB blocks are skipped as holes when sparse is on; runs of non-zero blocks
+  // are coalesced into one aligned O_DIRECT write.  The final sub-block tail is
+  // written with O_DIRECT cleared (it can't do unaligned), then ftruncate sets
+  // the exact size.  Falls back to the buffered stream_large if O_DIRECT is
+  // rejected (open failure, or a filesystem like tmpfs that lacks it).
+  void stream_large_direct(StreamReader & r, const std::string & rel, const InEntry & e) {
+    int fd = create_file(rel, e.mode, /*o_direct=*/true);
+    if (fd < 0) { stream_large(r, rel, e); return; }
+    static constexpr size_t AL = 4096;
+    if (!dbuf_ && posix_memalign(&dbuf_, AL, DBUF_CAP) != 0) dbuf_ = nullptr;
+    if (!dbuf_) { ::close(fd); stream_large(r, rel, e); return; }  // create_file unlinks+recreates
+
+    char * buf = static_cast<char *>(dbuf_);
+    const bool sp = (opt_.sparse_mode != 0);
+    auto blk_zero = [](const char * p) {
+      for (size_t k = 0; k < AL; ++k) if (p[k]) return false;
+      return true;
+    };
+    auto pwrite_run = [&](const char * p, size_t len, uint64_t at) {
+      size_t done = 0;
+      while (done < len) {
+        ssize_t w = ::pwrite(fd, p + done, len - done, (off_t)(at + done));
+        if (w < 0) { if (errno == EINTR) continue; return false; }
+        done += (size_t)w;
+      }
+      return true;
+    };
+    uint64_t left = e.size, fpos = 0; size_t pending = 0; bool ok = true;
+    while (left && ok) {
+      size_t want = (size_t)std::min<uint64_t>(left, DBUF_CAP - pending);
+      size_t got = r.read_some(buf + pending, want);
+      if (!got) { ok = false; break; }
+      left -= got; pending += got;
+      if (m_) m_->wrote_bytes.fetch_add(got, std::memory_order_relaxed);
+      size_t flushable = (pending / AL) * AL, off = 0;  // whole aligned blocks
+      while (off < flushable) {
+        if (sp && blk_zero(buf + off)) { fpos += AL; off += AL; continue; }  // hole
+        size_t run = off;
+        while (off < flushable && !(sp && blk_zero(buf + off))) off += AL;
+        if (!pwrite_run(buf + run, off - run, fpos)) { ok = false; break; }
+        fpos += (off - run);
+      }
+      size_t rem = pending - flushable;
+      if (rem) std::memmove(buf, buf + flushable, rem);
+      pending = rem;
+    }
+    if (ok && pending) {  // final sub-block tail: O_DIRECT can't do unaligned
+#ifdef O_DIRECT
+      int fl = ::fcntl(fd, F_GETFL); if (fl >= 0) ::fcntl(fd, F_SETFL, fl & ~O_DIRECT);
+#endif
+      if (!pwrite_run(buf, pending, fpos)) ok = false; else fpos += pending;
+    }
+    if (!ok) fail(rel, "write failed");
+    else if (::ftruncate(fd, (off_t)e.size) != 0) fail(rel, "ftruncate failed");
     set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
     apply_ext(fd, /*is_dir=*/false, e.ext);
     ::close(fd);
@@ -12344,6 +12435,22 @@ static int extract_tar(const Options & opt, Meter * m)
 // so this verifies "structurally valid, complete, would extract cleanly."
 static int verify_tar(const Options & opt, Meter * m)
 {
+  // Progress bar (same machinery as extract_tar): total_in = sum of compressed
+  // archive sizes drives the input %, fed by the decompressor's meter updates.
+  uint64_t total_in = 0;
+  for (const std::string & arc : opt.tar_sources) {
+    if (arc == "-") continue;
+    std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
+    if (!ec) total_in += (uint64_t)z;
+  }
+  std::atomic<bool> prog_done{false};
+  std::thread prog_thr(progress_loop, std::cref(opt), m, total_in, &prog_done);
+
+  // Result lines are collected and printed AFTER the progress thread stops, so
+  // they don't collide with the bar.
+  struct VRes { std::string name; bool bad; uint64_t files, bytes; };
+  std::vector<VRes> vres;
+
   int rc = EXIT_OK;
   for (const std::string & arc : opt.tar_sources) {
     FILE * in = open_input(arc);   // dies on failure
@@ -12398,15 +12505,24 @@ static int verify_tar(const Options & opt, Meter * m)
 
     bool bad = ex.had_error();
     if (bad && rc == EXIT_OK) rc = EXIT_DATA;
-    if (opt.verbosity >= V_DEFAULT) {
-      char sz[64]; human_bytes(double(ex.validated_bytes()), sz, sizeof(sz));
+    vres.push_back({arc == "-" ? "(stdin)" : arc, bad,
+                    ex.validated_files(), ex.validated_bytes()});
+  }
+
+  // Stop the progress bar, then print the per-archive results on clean lines.
+  prog_done = true;
+  if (prog_thr.joinable()) prog_thr.join();
+  if (opt.verbosity >= V_DEFAULT) {
+    std::fprintf(stderr, "\r\033[K");  // clear any leftover progress line
+    for (const VRes & v : vres) {
+      char sz[64]; human_bytes(double(v.bytes), sz, sizeof(sz));
       std::fprintf(stderr, "%s : %s, %llu entries, %s — %s\n",
-                   (arc == "-") ? "(stdin)" : arc.c_str(),
-                   bad ? "\033[31mCORRUPT\033[0m" : "\033[32mOK\033[0m",
-                   (unsigned long long)ex.validated_files(), sz,
-                   bad ? "tar structure invalid" : "tar structure valid");
-      std::fflush(stderr);
+                   v.name.c_str(),
+                   v.bad ? "\033[31mCORRUPT\033[0m" : "\033[32mOK\033[0m",
+                   (unsigned long long)v.files, sz,
+                   v.bad ? "tar structure invalid" : "tar structure valid");
     }
+    std::fflush(stderr);
   }
   return rc;
 }
