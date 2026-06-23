@@ -1,11 +1,23 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.16  
+**Covers:** v0.9.50 → v0.14.17  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.17 — 1 MiB pipe for the -d --tar / -t --tar stream
+
+The decompressor feeds the tar Extractor through a pipe with a single reader (the
+parse thread is inherently serial — tar headers must be read in order).  At the
+default 64 KiB pipe size, a 130 GiB stream is ~2M full/empty cycles and syscalls
+on that one bottleneck thread.  `extract_tar` and `verify_tar` now request a
+**1 MiB pipe** (`F_SETPIPE_SZ`, best-effort) — ~16× fewer cycles on the reader.
+Capped at 1 MiB (the default unprivileged `pipe-max-size`) and best-effort, so it
+either helps or silently no-ops; never fails the run.  No effect on small
+archives (a bigger pipe is just unused capacity, ~1 MiB kernel buffer per
+archive); large streams get the syscall reduction.
 
 ## v0.14.16 — pipeline the O_DIRECT large-file extract writer
 

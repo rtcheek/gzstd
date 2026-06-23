@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.16";
+static constexpr const char * GZSTD_VERSION = "0.14.17";
 //
 // Architecture overview:
 //
@@ -12409,6 +12409,10 @@ static int extract_tar(const Options & opt, Meter * m)
 
     int fds[2];
     if (::pipe(fds) != 0) die_io("pipe() failed");
+#ifdef F_SETPIPE_SZ
+    ::fcntl(fds[1], F_SETPIPE_SZ, 1 << 20);  // best-effort 1 MiB pipe: fewer full/empty
+                                             // cycles on the single tar-stream reader
+#endif
     FILE * pout = ::fdopen(fds[1], "wb");
     if (!pout) die_io("fdopen(pipe) failed");
 
@@ -12516,6 +12520,10 @@ static int verify_tar(const Options & opt, Meter * m)
 
     int fds[2];
     if (::pipe(fds) != 0) die_io("pipe() failed");
+#ifdef F_SETPIPE_SZ
+    ::fcntl(fds[1], F_SETPIPE_SZ, 1 << 20);  // best-effort 1 MiB pipe: fewer full/empty
+                                             // cycles on the single tar-stream reader
+#endif
     FILE * pout = ::fdopen(fds[1], "wb");
     if (!pout) die_io("fdopen(pipe) failed");
 
