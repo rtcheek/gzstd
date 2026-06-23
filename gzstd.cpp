@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.17";
+static constexpr const char * GZSTD_VERSION = "0.14.18";
 //
 // Architecture overview:
 //
@@ -12499,7 +12499,7 @@ static int verify_tar(const Options & opt, Meter * m)
 
   // Result lines are collected and printed AFTER the progress thread stops, so
   // they don't collide with the bar.
-  struct VRes { std::string name; bool bad; uint64_t files, bytes; };
+  struct VRes { std::string name; bool bad; uint64_t files, bytes, comp; double secs; };
   std::vector<VRes> vres;
 
   int rc = EXIT_OK;
@@ -12541,6 +12541,7 @@ static int verify_tar(const Options & opt, Meter * m)
 
     // A corrupt zstd stream makes the decompressor die_data(); that is itself a
     // test failure, surfaced as exit 4 — the desired behavior for `-t`.
+    auto t_arc0 = std::chrono::steady_clock::now();
     int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
     if (ff > (int64_t)SINGLE_FRAME_STREAM_MIN) {
       decompress_stream_from_file(in, pout, dopt, m);
@@ -12558,10 +12559,17 @@ static int verify_tar(const Options & opt, Meter * m)
     ::close(fds[0]);
     if (in && in != stdin) std::fclose(in);
 
+    double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
+        std::chrono::steady_clock::now() - t_arc0).count();
     bool bad = ex.had_error();
     if (bad && rc == EXIT_OK) rc = EXIT_DATA;
+    uint64_t comp = 0;
+    if (arc != "-") {
+      std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
+      if (!ec) comp = (uint64_t)z;
+    }
     vres.push_back({arc == "-" ? "(stdin)" : arc, bad,
-                    ex.validated_files(), ex.validated_bytes()});
+                    ex.validated_files(), ex.validated_bytes(), comp, secs});
   }
 
   // Stop the progress bar, then print the per-archive results on clean lines.
@@ -12571,11 +12579,21 @@ static int verify_tar(const Options & opt, Meter * m)
     std::fprintf(stderr, "\r\033[K");  // clear any leftover progress line
     for (const VRes & v : vres) {
       char sz[64]; human_bytes(double(v.bytes), sz, sizeof(sz));
-      std::fprintf(stderr, "%s : %s, %llu entries, %s — %s\n",
-                   v.name.c_str(),
-                   v.bad ? "\033[31mCORRUPT\033[0m" : "\033[32mOK\033[0m",
-                   (unsigned long long)v.files, sz,
-                   v.bad ? "tar structure invalid" : "tar structure valid");
+      char rate[64];
+      human_bytes(v.secs > 0 ? double(v.bytes) / v.secs : 0.0, rate, sizeof(rate));
+      const char * verdict = v.bad ? "tar structure invalid" : "tar structure valid";
+      const char * status  = v.bad ? "\033[31mCORRUPT\033[0m" : "\033[32mOK\033[0m";
+      if (v.comp > 0 && v.bytes > 0) {
+        char comp[64]; human_bytes(double(v.comp), comp, sizeof(comp));
+        double pct = double(v.comp) / double(v.bytes) * 100.0;
+        std::fprintf(stderr, "%s : %s, %llu entries, %s => %s (ratio: %.1f%%) @ %s/s — %s\n",
+                     v.name.c_str(), status, (unsigned long long)v.files,
+                     comp, sz, pct, rate, verdict);
+      } else {
+        std::fprintf(stderr, "%s : %s, %llu entries, %s @ %s/s — %s\n",
+                     v.name.c_str(), status, (unsigned long long)v.files,
+                     sz, rate, verdict);
+      }
     }
     std::fflush(stderr);
   }

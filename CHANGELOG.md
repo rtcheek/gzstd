@@ -1,11 +1,30 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.17  
+**Covers:** v0.9.50 → v0.14.18  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.18 — decompression rate + compression ratio in the -t --tar result line
+
+The live progress bar during `-t --tar` reports the verify rate, but it gets
+overwritten by the final per-archive result line, which only showed entry count
+and total size — no speed and no ratio (unlike plain `-t`).  Each archive's
+decompress+validate span is now timed (`steady_clock` around the decompress
+dispatch through `Extractor::run` join), and the result line gains both a
+`@ <rate>/s` field and a `<comp> => <decomp> (ratio: X%)` field, matching the
+plain-`-t` summary:
+
+```
+archive.tar.zst : OK, 534532 entries, 51.8 GiB => 103.6 GiB (ratio: 50.0%) @ 2.21 GiB/s — tar structure valid
+```
+
+Rate is decompressed bytes over wall time; ratio is compressed file size over
+decompressed bytes (same convention as plain `-t`).  Ratio is omitted for stdin
+input (compressed size unknown).  Cosmetic only — no change to verify semantics
+or exit codes.
 
 ## v0.14.17 — 1 MiB pipe for the -d --tar / -t --tar stream
 
