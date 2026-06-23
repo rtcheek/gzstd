@@ -1,11 +1,45 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.20  
+**Covers:** v0.9.50 → v0.14.21  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.21 — -t --tar line colors, smoother extract progress, extract bottleneck counters
+
+Three small changes, the last two prompted by `-d --tar` extract behavior on a
+high-core Gen5 server (96 threads, 8 GPUs):
+
+- **Colorized the `-t --tar` result line** to match the plain `-t` summary: input
+  size cyan, output size green, ratio bold, rate green, `OK` bold-bright-green,
+  entry count bold.  Cosmetic; same fields, same numbers.
+
+- **Smoothed the extract/verify progress bar.**  The decompress writer accounted
+  `wrote_bytes` once per *batch* after pushing the whole batch into the in-memory
+  `FrameSink`.  When the (write-bound) Extractor drains slowly the sink fills and
+  the push blocks for seconds, so a multi-GiB batch made the `out:` counter sit,
+  then jump.  It now counts each frame as it is accepted into the sink (and
+  releases the throttle permit per frame, so workers refill as the batch drains),
+  matching how the old aio path updated every 16 MiB.  NOTE: for extract the bar
+  still tracks bytes *handed to* the Extractor (sink intake), which leads the
+  actual file writes by the sink + Extractor buffers — accurate "bytes written"
+  accounting is folded into the parallel-dispatch work (see ROADMAP).
+
+- **Added `-v` extract bottleneck counters.**  Large-file extract (`>4 MiB`,
+  `stream_large_direct`) runs on the single tar-parse thread feeding one O_DIRECT
+  writer, while the 16-thread writer pool only handles small files — so a
+  large-file-heavy archive is single-parse-thread bound.  Two new verbose lines
+  pinpoint where the time goes before we try to open it up:
+  - `[UNTAR-LARGE] … parse: fill=…/scan=…/bufwait=… | writer: write=…/jobwait=…`
+    — splits the parse thread's sink-read+memcpy (`fill`), zero-detect (`scan`),
+    and wait-for-a-free-buffer (`bufwait`, = write-bound) from the writer's
+    `pwrite` time and its wait-for-data (`jobwait`, = parse-bound).
+  - `[SINK] producer waited … | consumer waited …` — whether decompress (producer)
+    or extraction (consumer) is the bottleneck across the `FrameSink` hand-off.
+  Measurement only; no behavior change.  Parallel-dispatch extraction (the actual
+  fix) remains the ROADMAP item.
 
 ## v0.14.20 — -d --tar extract uses the same in-memory frame hand-off
 

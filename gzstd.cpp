@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.20";
+static constexpr const char * GZSTD_VERSION = "0.14.21";
 //
 // Architecture overview:
 //
@@ -3652,7 +3652,13 @@ public:
     if (!f || f->empty()) return;                 // nothing to verify; drop
     const size_t sz = f->size();
     std::unique_lock<std::mutex> lk(m_);
-    cv_prod_.wait(lk, [&] { return bytes_ + sz <= max_bytes_ || q_.empty(); });
+    // Producer blocked here == the consumer (tar parser) is the bottleneck:
+    // decompress is ready but the sink is full because extraction is behind.
+    if (!(bytes_ + sz <= max_bytes_ || q_.empty())) {
+      uint64_t t0 = now_ns();
+      cv_prod_.wait(lk, [&] { return bytes_ + sz <= max_bytes_ || q_.empty(); });
+      prod_wait_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+    }
     bytes_ += sz;
     q_.push_back(std::move(f));
     cv_cons_.notify_one();
@@ -3664,10 +3670,16 @@ public:
     cv_cons_.notify_all();
   }
 
-  // Consumer (validator): next frame in order, or null FrameBuf at EOF.
+  // Consumer (validator/extractor): next frame in order, or null at EOF.
   FrameBuf pop() {
     std::unique_lock<std::mutex> lk(m_);
-    cv_cons_.wait(lk, [&] { return !q_.empty() || closed_; });
+    // Consumer blocked here == the producer (decompress) is the bottleneck:
+    // the tar parser is ready but no decompressed frame is available yet.
+    if (q_.empty() && !closed_) {
+      uint64_t t0 = now_ns();
+      cv_cons_.wait(lk, [&] { return !q_.empty() || closed_; });
+      cons_wait_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+    }
     if (q_.empty()) return nullptr;               // closed and drained
     FrameBuf f = std::move(q_.front());
     q_.pop_front();
@@ -3676,6 +3688,12 @@ public:
     return f;
   }
 
+  // Diagnostics (-v): time the producer spent blocked on a full sink (consumer/
+  // extraction is the bottleneck) vs the consumer spent blocked on an empty sink
+  // (producer/decompress is the bottleneck).
+  uint64_t producer_wait_ns() const { return prod_wait_ns_.load(std::memory_order_relaxed); }
+  uint64_t consumer_wait_ns() const { return cons_wait_ns_.load(std::memory_order_relaxed); }
+
 private:
   std::mutex m_;
   std::condition_variable cv_prod_, cv_cons_;
@@ -3683,6 +3701,7 @@ private:
   size_t bytes_ = 0;
   size_t max_bytes_;
   bool closed_ = false;
+  std::atomic<uint64_t> prod_wait_ns_{0}, cons_wait_ns_{0};
 };
 
 // Set by verify_tar() / extract_tar() for the duration of one archive's
@@ -4133,11 +4152,19 @@ static void writer_thread(FILE * out, ResultStore & results,
     }
     if (sink) {
       // -t/-d --tar: hand frames to the in-process tar parser (no kernel pipe).
-      // The throttle permit each frame holds is released here, in place of the
-      // aio write that would otherwise release it (see AsyncWritePool::worker_fn).
-      for (auto & fb : batch) sink->push(std::move(fb));
-      if (m) m->wrote_bytes.fetch_add(batch_bytes, std::memory_order_relaxed);
-      if (bp) bp->release((int)batch.size());
+      // Account per frame, NOT once per batch: when the (write-bound) Extractor
+      // drains slowly, push() blocks and a big batch can take seconds to hand
+      // off — a per-batch fetch_add then makes the progress bar sit, then jump
+      // by the whole batch.  Counting each frame as it is accepted advances the
+      // bar smoothly at the drain rate (the old aio path likewise updated every
+      // 16 MiB inside the write).  Release the throttle permit per frame too, so
+      // workers refill as the batch drains instead of all at once at the end.
+      for (auto & fb : batch) {
+        const size_t fsz = fb->size();
+        sink->push(std::move(fb));
+        if (m) m->wrote_bytes.fetch_add(fsz, std::memory_order_relaxed);
+        if (bp) bp->release(1);
+      }
     } else if (aio) {
       aio->submit(std::move(batch));
       if (aio->had_error()) die_io("async write failed (disk full?)");
@@ -7703,7 +7730,7 @@ public:
     StreamReader r(read_fd);
     parse(r);               // validates every header checksum; flags truncation
     r.drain();              // consume trailing padding so the decompressor can finish
-    if (!validate_only_) { stop_pool(); finish_deferred(); }
+    if (!validate_only_) { stop_pool(); finish_deferred(); log_large_file_stats(); }
   }
 
   // Same as run() but reads decompressed frames straight from an in-memory
@@ -7714,15 +7741,45 @@ public:
     StreamReader r(src);
     parse(r);
     r.drain();              // pop any trailing frames so the producer can finish
-    if (!validate_only_) { stop_pool(); finish_deferred(); }
+    if (!validate_only_) { stop_pool(); finish_deferred(); log_large_file_stats(); }
   }
 
 private:
+  // -v breakdown of the single-parse-thread large-file write path.  bufwait
+  // dominant → WRITE-bound (writer can't keep up); fill dominant → the parse
+  // thread's sink read + memcpy is the spine; scan dominant → zero-detect; the
+  // writer's jobwait dominant → the parse thread can't feed it fast enough.
+  void log_large_file_stats() {
+    if (opt_.verbosity < V_VERBOSE) return;
+    uint64_t files = ld_files_.load(), bytes = ld_bytes_.load();
+    if (files == 0) return;   // no large files in this archive
+    auto ms = [](uint64_t ns) { return ns / 1000000.0; };
+    char sz[48]; human_bytes(double(bytes), sz, sizeof(sz));
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+      "[UNTAR-LARGE] %llu file(s), %s via O_DIRECT | parse: fill=%.0fms scan=%.0fms "
+      "bufwait=%.0fms (write-bound) | writer: write=%.0fms jobwait=%.0fms (parse-bound)\n",
+      (unsigned long long)files, sz,
+      ms(ld_fill_ns_.load()), ms(ld_scan_ns_.load()), ms(ld_bufwait_ns_.load()),
+      ms(ld_write_ns_.load()), ms(ld_jobwait_ns_.load()));
+    vlog(V_VERBOSE, opt_, buf);
+  }
+
   static constexpr uint64_t SMALL_FILE_MAX = 4 * 1024 * 1024;  // buffer+dispatch below this; stream above
   int dest_fd_; const Options & opt_; Meter * m_; bool as_root_;
   bool validate_only_ = false;
   uint64_t vfiles_ = 0, vbytes_ = 0;  // validate_only counters
   std::atomic<bool> had_error_{false};
+  // Large-file (stream_large_direct) breakdown, -v only.  All on the single
+  // parse thread except ld_write_ns_ / ld_jobwait_ns_ (the per-file writer):
+  //   fill   = read member data from the sink into the aligned buffer (memcpy)
+  //   scan   = zero-detect + build the O_DIRECT write plan
+  //   bufwait= parse thread blocked waiting for the writer to free a buffer  → WRITE-bound
+  //   write  = writer thread in pwrite
+  //   jobwait= writer thread blocked waiting for a filled buffer            → PARSE-bound
+  std::atomic<uint64_t> ld_fill_ns_{0}, ld_scan_ns_{0}, ld_bufwait_ns_{0};
+  std::atomic<uint64_t> ld_write_ns_{0}, ld_jobwait_ns_{0};
+  std::atomic<uint64_t> ld_bytes_{0}, ld_files_{0};
   // O_DIRECT large-file writer: a small pool of reused 4 KiB-aligned buffers.
   // The parse thread fills one (pipe read + zero-detect) while a dedicated writer
   // thread O_DIRECTs another — pipelining the read and the write on a single
@@ -8366,13 +8423,19 @@ private:
       for (;;) {
         DJob j;
         { std::unique_lock<std::mutex> lk(mx);
-          job_cv.wait(lk, [&] { return !jobs.empty() || done; });
+          if (jobs.empty() && !done) {
+            uint64_t t0 = now_ns();
+            job_cv.wait(lk, [&] { return !jobs.empty() || done; });
+            ld_jobwait_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+          }
           if (jobs.empty()) return;
           j = std::move(jobs.front()); jobs.pop_front(); }
         const char * buf = static_cast<const char *>(dbufs_[j.bi]);
         bool ok = true;
+        uint64_t wt0 = now_ns();
         for (auto & run : j.runs)
           if (!pwrite_at(buf + std::get<0>(run), std::get<2>(run), std::get<1>(run))) { ok = false; break; }
+        ld_write_ns_.fetch_add(now_ns() - wt0, std::memory_order_relaxed);
         if (ok && j.tail_len) {  // final sub-block tail: O_DIRECT can't do unaligned
 #ifdef O_DIRECT
           int fl = ::fcntl(fd, F_GETFL); if (fl >= 0) ::fcntl(fd, F_SETFL, fl & ~O_DIRECT);
@@ -8386,20 +8449,29 @@ private:
     });
     // ---- parse thread: fill a buffer, build its write plan, hand it off ----
     uint64_t left = e.size, fpos = 0; bool ok = true;
+    ld_files_.fetch_add(1, std::memory_order_relaxed);
+    ld_bytes_.fetch_add(e.size, std::memory_order_relaxed);
     while (left && ok && !werr.load()) {
       int bi;
       { std::unique_lock<std::mutex> lk(mx);
-        free_cv.wait(lk, [&] { return !freeq.empty() || werr.load(); });
+        if (freeq.empty() && !werr.load()) {
+          uint64_t t0 = now_ns();
+          free_cv.wait(lk, [&] { return !freeq.empty() || werr.load(); });
+          ld_bufwait_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);  // WRITE-bound
+        }
         if (werr.load()) { ok = false; break; }
         bi = freeq.front(); freeq.pop_front(); }
       char * buf = static_cast<char *>(dbufs_[bi]);
       size_t fill = 0;
+      uint64_t ft0 = now_ns();
       while (fill < DBUF_CAP && left) {
         size_t got = r.read_some(buf + fill, (size_t)std::min<uint64_t>(DBUF_CAP - fill, left));
         if (!got) { ok = false; break; }
         fill += got; left -= got;
         if (m_) m_->wrote_bytes.fetch_add(got, std::memory_order_relaxed);
       }
+      ld_fill_ns_.fetch_add(now_ns() - ft0, std::memory_order_relaxed);  // sink read + memcpy
+      uint64_t st0 = now_ns();
       size_t aligned = (fill / AL) * AL, off = 0;
       DJob j; j.bi = bi;
       while (off < aligned) {
@@ -8410,6 +8482,7 @@ private:
       }
       j.tail_off = aligned; j.tail_len = fill - aligned; j.tail_fpos = fpos;
       fpos += j.tail_len;
+      ld_scan_ns_.fetch_add(now_ns() - st0, std::memory_order_relaxed);  // zero-scan + plan
       { std::lock_guard<std::mutex> lk(mx); jobs.push_back(std::move(j)); }
       job_cv.notify_one();
     }
@@ -12552,6 +12625,13 @@ static int extract_tar(const Options & opt, Meter * m)
     sink.close();          // signal EOF to the Extractor after all frames pushed
     exth.join();
     g_tar_decomp_sink = nullptr;
+    if (opt.verbosity >= V_VERBOSE) {
+      char b[200];
+      std::snprintf(b, sizeof(b),
+        "[SINK] producer waited %.0fms (extract-bound) | consumer waited %.0fms (decompress-bound)\n",
+        sink.producer_wait_ns() / 1e6, sink.consumer_wait_ns() / 1e6);
+      vlog(V_VERBOSE, opt, b);
+    }
     if (in && in != stdin) std::fclose(in);
     if (ex.had_error() && rc == EXIT_OK) rc = EXIT_ERROR;
   }
@@ -12664,6 +12744,13 @@ static int verify_tar(const Options & opt, Meter * m)
     sink.close();          // idempotent: writer_thread also closes on normal exit
     exth.join();
     g_tar_decomp_sink = nullptr;
+    if (opt.verbosity >= V_VERBOSE) {
+      char b[200];
+      std::snprintf(b, sizeof(b),
+        "[SINK] producer waited %.0fms (verify-bound) | consumer waited %.0fms (decompress-bound)\n",
+        sink.producer_wait_ns() / 1e6, sink.consumer_wait_ns() / 1e6);
+      vlog(V_VERBOSE, opt, b);
+    }
     if (in && in != stdin) std::fclose(in);
 
     double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -12689,15 +12776,20 @@ static int verify_tar(const Options & opt, Meter * m)
       char rate[64];
       human_bytes(v.secs > 0 ? double(v.bytes) / v.secs : 0.0, rate, sizeof(rate));
       const char * verdict = v.bad ? "tar structure invalid" : "tar structure valid";
-      const char * status  = v.bad ? "\033[31mCORRUPT\033[0m" : "\033[32mOK\033[0m";
+      // Numbers colored to match the plain -t summary line: in=cyan, out=green,
+      // ratio=bold, rate=green; entry count bold; OK bold-bright-green.
+      const char * status  = v.bad ? "\033[31mCORRUPT\033[0m" : "\033[1;92mOK\033[0m";
       if (v.comp > 0 && v.bytes > 0) {
         char comp[64]; human_bytes(double(v.comp), comp, sizeof(comp));
         double pct = double(v.comp) / double(v.bytes) * 100.0;
-        std::fprintf(stderr, "%s : %s, %llu entries, %s => %s (ratio: %.1f%%) @ %s/s — %s\n",
+        std::fprintf(stderr,
+                     "%s : %s, \033[1m%llu\033[0m entries, \033[36m%s\033[0m => \033[32m%s\033[0m"
+                     " (ratio: \033[1m%.1f%%\033[0m) @ \033[32m%s/s\033[0m — %s\n",
                      v.name.c_str(), status, (unsigned long long)v.files,
                      comp, sz, pct, rate, verdict);
       } else {
-        std::fprintf(stderr, "%s : %s, %llu entries, %s @ %s/s — %s\n",
+        std::fprintf(stderr,
+                     "%s : %s, \033[1m%llu\033[0m entries, \033[32m%s\033[0m @ \033[32m%s/s\033[0m — %s\n",
                      v.name.c_str(), status, (unsigned long long)v.files,
                      sz, rate, verdict);
       }
