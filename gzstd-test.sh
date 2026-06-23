@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=249
-$EXTENSIVE && EXPECTED_TESTS=347
+EXPECTED_TESTS=251
+$EXTENSIVE && EXPECTED_TESTS=349
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3718,7 +3718,36 @@ else
     skip "content checksum catches a bit-flip" "python3 unavailable"
   fi
 
-  rm -rf "$VS" "$VA" "$TMPDIR"/v.*.zst
+  # 4. multi-frame archive: with a tiny chunk size the tar stream spans many
+  #    zstd frames, so member headers and large-file data straddle frame
+  #    boundaries.  Exercises the in-memory verify path's cross-frame skip()/
+  #    read_exact (v0.14.19) — the small single-frame archive above does not.
+  MS="$TMPDIR/vmsrc"; rm -rf "$MS"; mkdir -p "$MS/d"
+  for i in $(seq 1 40); do echo "member-$i content line" > "$MS/d/m$i"; done
+  head -c 5000000 /dev/urandom > "$MS/d/big1.bin"   # spans several 1 MiB frames
+  head -c 3000000 /dev/urandom > "$MS/d/big2.bin"
+  MA="$TMPDIR/vm.tar.zst"
+  "$GZSTD" --cpu-only -q -f --chunk-size 1 -o "$MA" --tar "$MS" 2>/dev/null
+  "$GZSTD" -t --cpu-only --tar "$MA" >/dev/null 2>&1 \
+    && pass "-t --tar accepts a multi-frame archive (cross-frame skip)" \
+    || fail "-t --tar multi-frame" "rc=$?"
+
+  # 5. foreign archive: `tar -cf - | zstd` produces a single streaming frame with
+  #    no content-size header, so verify takes the fallback decompress path
+  #    (decompress_from_buffer) which routes to the in-memory validator too.
+  #    Confirms -t --tar still works on archives gzstd did not author.
+  if command -v zstd >/dev/null 2>&1; then
+    FA="$TMPDIR/vforeign.tar.zst"
+    ( cd "$(dirname "$VS")" && tar -cf - "$(basename "$VS")" | zstd -q -o "$FA" ) 2>/dev/null
+    "$GZSTD" -t --cpu-only --tar "$FA" >/dev/null 2>&1 \
+      && pass "-t --tar accepts a foreign tar|zstd archive (fallback path)" \
+      || fail "-t --tar foreign archive" "rc=$?"
+    rm -f "$FA"
+  else
+    skip "-t --tar accepts a foreign tar|zstd archive (fallback path)" "zstd CLI unavailable"
+  fi
+
+  rm -rf "$VS" "$MS" "$VA" "$MA" "$TMPDIR"/v.*.zst
 fi
 
 # ============================================================

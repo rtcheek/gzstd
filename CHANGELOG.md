@@ -1,11 +1,55 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.18  
+**Covers:** v0.9.50 → v0.14.19  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.19 — parallel -t --tar verify via in-memory random access
+
+`-t --tar` barely beat `tar --zstd -t` while every other tar path is fast.  The
+cause was structural, not algorithmic: `verify_tar` ran the full parallel
+decompressor but then funneled the *entire* decompressed tar stream through a
+single 1 MiB kernel pipe into one `Extractor` thread.  Tar headers are cheap to
+check (one 512-byte checksum per file), but to reach the next header the
+validator calls `r.skip(e.size)` on a pipe-backed `StreamReader` — and a pipe
+can't seek, so `skip` *drained every data byte* through the kernel.  Verify was
+therefore single-pipe-drain bound, doing O(bytes) serial work on top of the
+parallel decompress.
+
+That treated the decompressed stream like a forward-only tape.  But it is already
+in RAM and in original order (`ResultStore` → `writer_thread`).  Verify now hands
+those in-order frames to the **same** reused `Extractor::parse` *in memory*, so
+`skip(data_size)` becomes pointer arithmetic — advance a cursor, drop the
+already-checksum-validated frame — touching only the ~512-byte headers (O(files))
+and never copying file data a second time.
+
+Mechanism:
+
+- **`FrameSink`** — a byte-bounded, in-order `FrameBuf` hand-off queue, replacing
+  the kernel pipe.
+- **`StreamReader`** gains a sink source alongside the fd source; in sink mode the
+  read cursor points straight into the current frame (no copy) and `skip()`
+  advances past whole frames without touching their bytes.  `Extractor::parse` /
+  `handle_entry` / the `validate_only` path are reused verbatim.
+- **`writer_thread`** routes finished frames to the sink on the common parallel
+  path (zero-copy), releasing the throttle permit per frame in place of the aio
+  write that would otherwise release it.  The streaming/single-frame helpers
+  (`decompress_from_buffer`, `decompress_stream_from_file`) push a copy to the
+  sink so foreign single-frame `.tar.zst` (e.g. `tar -I zstd`) still verify
+  correctly.
+
+No archive format change — this works on every existing gzstd archive and on
+foreign `.tar.zst`.  Verify is now decompress-bound rather than pipe-bound: on the
+Gen3 workstation `-t --tar` runs at 4.05 GiB/s vs plain `-t` at 4.32 GiB/s (was
+~pipe-bound); the gap should widen on a high-core box where the old serial-drain
+ceiling sat further below the parallel decompress rate.  `-d --tar` extract is
+unchanged (still pipe + writing `Extractor`).  Integrity unchanged: a corrupt
+zstd frame still fails the per-frame checksum (exit 4), a truncated tar is still
+caught by the parser's zero-block/short-read checks.  Full suite 249/249,
+extensive/compat 347/347.
 
 ## v0.14.18 — decompression rate + compression ratio in the -t --tar result line
 

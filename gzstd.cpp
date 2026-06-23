@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.18";
+static constexpr const char * GZSTD_VERSION = "0.14.19";
 //
 // Architecture overview:
 //
@@ -3635,6 +3635,61 @@ private:
   std::atomic<uint64_t> block_nanos_{0};
 };
 
+// In-order, byte-bounded hand-off of decompressed frames from the decompress
+// writer thread to an in-process consumer — the `-t --tar` validator.  It
+// replaces the kernel pipe the verifier used to drain: the validator parses tar
+// headers by random access (skip() = pointer arithmetic over already-decompressed
+// frames) instead of having every data byte copied through a pipe.  Bounded by a
+// byte budget so a huge archive can't balloon RAM; push() blocks the producer
+// when over budget (but always admits at least one frame to avoid a stall on a
+// single oversized frame).
+class FrameSink {
+public:
+  explicit FrameSink(size_t max_bytes) : max_bytes_(max_bytes) {}
+
+  // Producer (writer_thread): enqueue one decompressed frame, in order.
+  void push(FrameBuf f) {
+    if (!f || f->empty()) return;                 // nothing to verify; drop
+    const size_t sz = f->size();
+    std::unique_lock<std::mutex> lk(m_);
+    cv_prod_.wait(lk, [&] { return bytes_ + sz <= max_bytes_ || q_.empty(); });
+    bytes_ += sz;
+    q_.push_back(std::move(f));
+    cv_cons_.notify_one();
+  }
+
+  // Producer done: no more frames will arrive.
+  void close() {
+    { std::lock_guard<std::mutex> lk(m_); closed_ = true; }
+    cv_cons_.notify_all();
+  }
+
+  // Consumer (validator): next frame in order, or null FrameBuf at EOF.
+  FrameBuf pop() {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_cons_.wait(lk, [&] { return !q_.empty() || closed_; });
+    if (q_.empty()) return nullptr;               // closed and drained
+    FrameBuf f = std::move(q_.front());
+    q_.pop_front();
+    bytes_ -= f->size();
+    cv_prod_.notify_one();
+    return f;
+  }
+
+private:
+  std::mutex m_;
+  std::condition_variable cv_prod_, cv_cons_;
+  std::deque<FrameBuf> q_;
+  size_t bytes_ = 0;
+  size_t max_bytes_;
+  bool closed_ = false;
+};
+
+// Set by verify_tar() for the duration of one archive's decompress: when non-null
+// the decompress writer_thread routes finished frames here instead of to disk/aio
+// (mirrors the g_direct_writer global-sink pattern).
+static FrameSink * g_tar_verify_sink = nullptr;
+
 // End-of-run throttle stats; one line at V_DEBUG.  Shows how often producers
 // actually waited (saturation indicator) and peak in-flight frames vs budget.
 static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
@@ -3927,11 +3982,14 @@ static void writer_thread(FILE * out, ResultStore & results,
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   // pin_thread_to_core(1);              // disabled: hurts on loaded machines
   const bool skip_write = (opt.mode == Mode::TEST);
+  // -t --tar: hand decompressed frames to the in-process tar validator instead
+  // of writing them.  Set by verify_tar() for the archive being decompressed.
+  FrameSink * const sink = g_tar_verify_sink;
 
   // Create async write pool for double-buffered I/O
   AsyncWritePool * aio = nullptr;
   std::unique_ptr<AsyncWritePool> aio_ptr;
-  if (!skip_write) {
+  if (!skip_write && !sink) {
     // Sparse file support: skip zero-filled 4K blocks via seek.
     // --sparse forces on, --no-sparse forces off, default auto (file:on, stdout:off).
     bool enable_sparse;
@@ -4071,7 +4129,14 @@ static void writer_thread(FILE * out, ResultStore & results,
       vlog(V_DEBUG, opt, std::string("[WRITER] submitting ") + std::to_string(batch.size())
            + " frames (" + bs + ")\n");
     }
-    if (aio) {
+    if (sink) {
+      // -t --tar: hand frames to the in-process tar validator (no disk, no pipe).
+      // The throttle permit each frame holds is released here, in place of the
+      // aio write that would otherwise release it (see AsyncWritePool::worker_fn).
+      for (auto & fb : batch) sink->push(std::move(fb));
+      if (m) m->wrote_bytes.fetch_add(batch_bytes, std::memory_order_relaxed);
+      if (bp) bp->release((int)batch.size());
+    } else if (aio) {
       aio->submit(std::move(batch));
       if (aio->had_error()) die_io("async write failed (disk full?)");
     } else {
@@ -4092,6 +4157,10 @@ static void writer_thread(FILE * out, ResultStore & results,
     aio->flush();
     if (aio->had_error()) die_io("async write failed (disk full?)");
   }
+  // NB: the sink is NOT closed here.  writer_thread is not always the last
+  // producer — the fallback/streaming decompress tail runs after wthr.join()
+  // (see decompress_cpu_mt) and pushes more frames.  verify_tar closes the sink
+  // once, after the whole decompress call returns.
 }
 
 /*======================================================================
@@ -4178,7 +4247,10 @@ static void decompress_from_buffer(const std::vector<char> & input,
     if (ZSTD_isError(ret))
       die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
     if (zout.pos > 0) {
-      if (opt.mode != Mode::TEST) {
+      if (g_tar_verify_sink) {
+        // -t --tar streaming/fallback path: hand the chunk to the validator.
+        g_tar_verify_sink->push(std::make_shared<FrameVec>(outbuf.data(), outbuf.data() + zout.pos));
+      } else if (opt.mode != Mode::TEST) {
 #ifndef _WIN32
         if (g_direct_writer) {
           if (!g_direct_writer->write(outbuf.data(), zout.pos))
@@ -4240,7 +4312,10 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
       }
       if (zout.pos > 0) {
-        if (opt.mode != Mode::TEST) {
+        if (g_tar_verify_sink) {
+          // -t --tar single-frame path: hand the chunk to the validator.
+          g_tar_verify_sink->push(std::make_shared<FrameVec>(outbuf.data(), outbuf.data() + zout.pos));
+        } else if (opt.mode != Mode::TEST) {
 #ifndef _WIN32
           if (g_direct_writer) {
             if (!g_direct_writer->write(outbuf.data(), zout.pos))
@@ -7563,29 +7638,49 @@ struct InEntry {
 
 // Buffered reader over a fd (the decompression pipe).
 struct StreamReader {
+  // Two interchangeable sources behind one interface: an fd (the extract pipe)
+  // or an in-memory FrameSink (the `-t --tar` validator — see FrameSink).  In
+  // sink mode `base` points straight into the current frame buffer (no copy)
+  // and skip() advances past whole frames without touching their bytes; that is
+  // the random-access win over the old "drain the pipe" path.
   int fd; std::vector<char> buf; size_t pos = 0, fill = 0; bool eof = false;
-  explicit StreamReader(int f) : fd(f), buf(1 << 20) {}
+  FrameSink * src = nullptr;     // in-memory frame source (null = fd mode)
+  FrameBuf cur;                  // current frame (sink mode); keeps `base` alive
+  const char * base = nullptr;   // read cursor base: into buf (fd) or cur (sink)
+  explicit StreamReader(int f) : fd(f), buf(1 << 20) { base = buf.data(); }
+  explicit StreamReader(FrameSink * s) : fd(-1), src(s) {}
   void refill() {
     pos = 0; fill = 0;
+    if (src) {
+      cur = src->pop();
+      if (!cur) { eof = true; return; }
+      base = cur->data(); fill = cur->size();
+      return;
+    }
     ssize_t r; do { r = ::read(fd, buf.data(), buf.size()); } while (r < 0 && errno == EINTR);
     if (r <= 0) { eof = true; return; }
-    fill = (size_t)r;
+    base = buf.data(); fill = (size_t)r;
   }
   size_t read_some(char * dst, size_t n) {
     if (pos == fill) { refill(); if (pos == fill) return 0; }
     size_t k = std::min(fill - pos, n);
-    std::memcpy(dst, buf.data() + pos, k); pos += k; return k;
+    std::memcpy(dst, base + pos, k); pos += k; return k;
   }
   bool read_exact(char * dst, size_t n) {
     size_t got = 0; while (got < n) { size_t k = read_some(dst + got, n - got); if (!k) return false; got += k; }
     return true;
   }
+  // Advance n bytes without copying: just move the cursor, refilling (which in
+  // sink mode drops the spent frame and pulls the next) as buffers run out.
   bool skip(uint64_t n) {
-    char tmp[8192];
-    while (n) { size_t k = read_some(tmp, (size_t)std::min<uint64_t>(n, sizeof tmp)); if (!k) return false; n -= k; }
+    while (n) {
+      if (pos == fill) { refill(); if (pos == fill) return false; }
+      size_t k = (size_t)std::min<uint64_t>(n, fill - pos);
+      pos += k; n -= k;
+    }
     return true;
   }
-  void drain() { char tmp[8192]; while (read_some(tmp, sizeof tmp)) {} }  // consume to EOF (unblocks producer)
+  void drain() { while (true) { if (pos == fill) { refill(); if (pos == fill) return; } pos = fill; } }  // consume to EOF (unblocks producer)
 };
 
 class Extractor {
@@ -7606,6 +7701,17 @@ public:
     StreamReader r(read_fd);
     parse(r);               // validates every header checksum; flags truncation
     r.drain();              // consume trailing padding so the decompressor can finish
+    if (!validate_only_) { stop_pool(); finish_deferred(); }
+  }
+
+  // Same as run() but reads decompressed frames straight from an in-memory
+  // FrameSink (the `-t --tar` fast path) instead of a pipe fd — skip() over
+  // file data becomes pointer arithmetic, so the validator does O(files) work.
+  void run_sink(FrameSink * src) {
+    if (!validate_only_) start_pool();
+    StreamReader r(src);
+    parse(r);
+    r.drain();              // pop any trailing frames so the producer can finish
     if (!validate_only_) { stop_pool(); finish_deferred(); }
   }
 
@@ -12518,45 +12624,45 @@ static int verify_tar(const Options & opt, Meter * m)
       std::rewind(in);
     }
 
-    int fds[2];
-    if (::pipe(fds) != 0) die_io("pipe() failed");
-#ifdef F_SETPIPE_SZ
-    ::fcntl(fds[1], F_SETPIPE_SZ, 1 << 20);  // best-effort 1 MiB pipe: fewer full/empty
-                                             // cycles on the single tar-stream reader
-#endif
-    FILE * pout = ::fdopen(fds[1], "wb");
-    if (!pout) die_io("fdopen(pipe) failed");
+    // Hand the decompressed tar stream to the validator in memory instead of
+    // through a kernel pipe: the validator skips over each member's data by
+    // pointer arithmetic (FrameSink + StreamReader's sink mode) rather than
+    // having every byte copied through a pipe and re-scanned.  This makes verify
+    // decompress-bound (like plain -t) instead of single-pipe-drain bound.  The
+    // budget bounds RAM if the validator ever falls behind the decompressors.
+    FrameSink sink(256 * ONE_MIB);
+    g_tar_verify_sink = &sink;
 
     tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/true);
-    std::thread exth([&] { ex.run(fds[0]); });
+    std::thread exth([&] { ex.run_sink(&sink); });
 
     Options dopt = opt;
     dopt.sparse_mode = 0;
     dopt.unsafe_overwrite = true;
-    dopt.mode = Mode::DECOMPRESS;  // produce the tar stream into the pipe; the
-                                   // validate-only Extractor provides the test
-                                   // semantics (no writes).  In TEST mode the
-                                   // decompressor discards output and the pipe
-                                   // would stay empty.
+    dopt.mode = Mode::DECOMPRESS;  // produce the tar stream (routed to the sink by
+                                   // writer_thread / the streaming helpers); the
+                                   // validate-only Extractor gives the test
+                                   // semantics.  TEST mode would discard output.
 
     // A corrupt zstd stream makes the decompressor die_data(); that is itself a
-    // test failure, surfaced as exit 4 — the desired behavior for `-t`.
+    // test failure, surfaced as exit 4 — the desired behavior for `-t`.  out is
+    // null: every output route is redirected to the sink while g_tar_verify_sink
+    // is set, so the FILE* is never touched.
     auto t_arc0 = std::chrono::steady_clock::now();
     int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
     if (ff > (int64_t)SINGLE_FRAME_STREAM_MIN) {
-      decompress_stream_from_file(in, pout, dopt, m);
+      decompress_stream_from_file(in, nullptr, dopt, m);
     } else {
 #ifdef HAVE_NVCOMP
-      if (dopt.cpu_only) decompress_cpu_mt(in, pout, dopt, m);
-      else               decompress_nvcomp(in, pout, dopt, m);
+      if (dopt.cpu_only) decompress_cpu_mt(in, nullptr, dopt, m);
+      else               decompress_nvcomp(in, nullptr, dopt, m);
 #else
-      decompress_cpu_mt(in, pout, dopt, m);
+      decompress_cpu_mt(in, nullptr, dopt, m);
 #endif
     }
-    std::fflush(pout);
-    std::fclose(pout);
+    sink.close();          // idempotent: writer_thread also closes on normal exit
     exth.join();
-    ::close(fds[0]);
+    g_tar_verify_sink = nullptr;
     if (in && in != stdin) std::fclose(in);
 
     double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
