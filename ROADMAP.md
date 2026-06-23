@@ -779,7 +779,39 @@ feeding the existing CPU/GPU pipeline (replaces the single-threaded `tar -cf - |
 gzstd` bottleneck). Creation **and** extraction (`-d --tar [-C DIR]`) shipped in
 v0.14.0 — extraction overlaps parallel decompression with a file-writer pool and
 is secured with `openat`/`O_NOFOLLOW` against path-traversal and symlink-escape.
-Open follow-ups:
+Since v0.14.19/20 both `-t --tar` (verify) and `-d --tar` (extract) feed the
+in-order decompressed frames to the tar parser **in memory** (`FrameSink`), not
+through a kernel pipe — verify's `skip()` over file data became pointer
+arithmetic (decompress-bound now, ~5× on a high-core box), and extract dropped
+the per-byte pipe copy + syscalls. The tar **parse itself is still serial** on
+both paths. Open follow-ups:
+
+- **Parallel-dispatch `-d --tar` extraction** — *Priority: Medium | Complexity:
+  High | Status: design.* The single biggest remaining extract lever. Today one
+  thread walks the decompressed tar stream in order (header → size → next header)
+  and dispatches files to a writer pool; the walk is serial because tar has no
+  index and each header's position depends on the previous member's size. To
+  parallelize the *parse + dispatch*, give workers independent entry-range
+  start points. Two routes:
+  1. **In-memory entry table (no format change):** a first pass walks headers to
+     build an offset→entry map, then N workers each extract a disjoint entry
+     range from the already-in-RAM (or re-decompressed) frames. Costs a parse
+     pass; only the dispatch parallelizes.
+  2. **Skippable-frame parse index (our archives only):** plant a header-boundary
+     index in a zstd skippable frame at create time (file stays a standard
+     `.tar.zst` — see the parse-index design note); readers seek straight to
+     entry boundaries, no pre-walk. Foreign archives fall back to route 1 or the
+     serial walk.
+  Hard parts independent of which route: **directory-creation ordering** (a
+  worker extracting `a/b/f` must not race the creation of `a/`, `a/b/` — needs an
+  upfront dir-tree pass or per-prefix coordination), **single-O_DIRECT-stream
+  contention** (concurrent O_DIRECT writers contend on NVMe — 1 stream 4.5 GB/s,
+  4 streams ~3.0 aggregate — so large-file writes likely stay one pipelined
+  stream while small-file writes fan out), **metadata/hardlink/`finish_deferred`
+  ordering**, and **security invariant preservation** (`openat`/`O_NOFOLLOW` per
+  worker). Extract is write-bound, so the realistic upside is bounded by the disk
+  and by how much the serial parse currently costs above the device rate —
+  prototype + measure on the Gen4+/high-core box before committing.
 
 - **GNU sparse files** — *Priority: Medium | Complexity: Medium.* Members are
   currently archived at full logical size (correct, just larger for holey files).

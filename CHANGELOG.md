@@ -1,11 +1,34 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.19  
+**Covers:** v0.9.50 → v0.14.20  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.20 — -d --tar extract uses the same in-memory frame hand-off
+
+Applies the v0.14.19 `FrameSink` change to `-d --tar` extraction: `extract_tar`
+no longer creates a kernel pipe + an `Extractor` thread draining it.  The
+decompressors push finished frames straight to the in-process `Extractor` (now
+via `run_sink`), which reads each member's data out of the in-RAM frames and
+writes it.  Same parser, same security and tar-format handling — only the byte
+source changed (pipe → in-memory `FrameSink`), so there are no new
+compatibility concerns.  The `g_tar_verify_sink` global is renamed
+`g_tar_decomp_sink` since it now serves both `-t` and `-d`.
+
+Unlike verify (which became decompress-bound), extract still copies and writes
+every byte to disk and its tar parse is still serial, so this is a tidy
+efficiency win — it removes the pipe's per-byte kernel copy, syscalls, and a
+context-switch hop, lowering system time and memory-bandwidth contention — not a
+parallelization.  The big extract lever (parallel parse + dispatch across entry
+ranges, with directory-ordering and single-O_DIRECT-stream contention to solve)
+is documented in ROADMAP as future work.  Peak RSS is unchanged (the hand-off
+queue is byte-bounded; when the write-bound Extractor lags, the bound throttles
+the decompressors).  Round-trip content verified byte-identical for gzstd,
+multi-frame (`--chunk-size 1`), and foreign `tar|zstd` archives; full suite
+251/251, extensive/compat 349/349.
 
 ## v0.14.19 — parallel -t --tar verify via in-memory random access
 
@@ -42,14 +65,17 @@ Mechanism:
   correctly.
 
 No archive format change — this works on every existing gzstd archive and on
-foreign `.tar.zst`.  Verify is now decompress-bound rather than pipe-bound: on the
-Gen3 workstation `-t --tar` runs at 4.05 GiB/s vs plain `-t` at 4.32 GiB/s (was
-~pipe-bound); the gap should widen on a high-core box where the old serial-drain
-ceiling sat further below the parallel decompress rate.  `-d --tar` extract is
-unchanged (still pipe + writing `Extractor`).  Integrity unchanged: a corrupt
-zstd frame still fails the per-frame checksum (exit 4), a truncated tar is still
-caught by the parser's zero-block/short-read checks.  Full suite 249/249,
-extensive/compat 347/347.
+foreign `.tar.zst`.  Verify is now decompress-bound rather than pipe-bound: on a
+96-thread dual-socket server a 65 GiB / 130 GiB archive verifies at 14.1 GiB/s,
+matching plain `-t` (13.6 GiB/s) — roughly 5× the old pipe-bound verify, with
+lower system time (no kernel pipe).  On a 24-core Gen3 workstation `-t --tar`
+runs at 4.05 GiB/s vs plain `-t` 4.32 GiB/s.  Peak RSS is unchanged (the in-memory
+hand-off queue is byte-bounded and the validator drains it as fast as the
+decompressors fill it, so it stays near-empty).  `-d --tar` extract is unchanged
+(still pipe + writing `Extractor`).  Integrity unchanged: a corrupt zstd frame
+still fails the per-frame checksum (exit 4), a truncated tar is still caught by
+the parser's zero-block/short-read checks.  Full suite 251/251, extensive/compat
+349/349.
 
 ## v0.14.18 — decompression rate + compression ratio in the -t --tar result line
 
