@@ -1,11 +1,32 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.15  
+**Covers:** v0.9.50 → v0.14.16  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.16 — pipeline the O_DIRECT large-file extract writer
+
+v0.14.15 wrote large files with O_DIRECT on a single thread that read a chunk
+from the decompressor pipe, then wrote it, then read the next — serial, so the
+pwrite and the pipe-read never overlapped.  That capped big-file extract well
+below the device's single-stream O_DIRECT ceiling (~1.1 vs ~4.5 GiB/s observed).
+
+`stream_large_direct` is now a producer/consumer: the parse thread fills one of
+a small pool of 4 KiB-aligned buffers (pipe read + zero-detect, building the
+write plan) while a single dedicated writer thread O_DIRECTs another.  Read and
+write now overlap.  It deliberately keeps exactly **one** O_DIRECT writer —
+concurrent O_DIRECT streams contend on NVMe (prior finding: 1 stream 4.5 GB/s, 4
+streams ~3.0 aggregate), so the win is pipelining the single stream, not
+parallelizing it.  Sparse-awareness is preserved (zero blocks skipped as holes,
+non-zero runs coalesced), the unaligned final tail is handled (O_DIRECT cleared),
+and buffers are reused across files.  `blk_zero` is now word-wise (uint64_t).
+
+Content-verified across multi-buffer (>24 MiB) files, unaligned tails, interior
+holes, and multiple large files in one archive; full suite 249/249.  (Throughput
+gain to be confirmed on an idle box; correctness is independent of that.)
 
 ## v0.14.15 — O_DIRECT large-file extract; `-t --tar` progress bar; help fixes
 

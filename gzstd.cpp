@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.15";
+static constexpr const char * GZSTD_VERSION = "0.14.16";
 //
 // Architecture overview:
 //
@@ -7595,7 +7595,7 @@ public:
   Extractor(int dest_fd, const Options & opt, Meter * m, bool validate_only = false)
     : dest_fd_(dest_fd), opt_(opt), m_(m), as_root_(::geteuid() == 0),
       validate_only_(validate_only) {}
-  ~Extractor() { if (dbuf_) ::free(dbuf_); }
+  ~Extractor() { for (void * b : dbufs_) ::free(b); }
 
   bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
   uint64_t validated_files() const { return vfiles_; }
@@ -7615,10 +7615,13 @@ private:
   bool validate_only_ = false;
   uint64_t vfiles_ = 0, vbytes_ = 0;  // validate_only counters
   std::atomic<bool> had_error_{false};
-  // O_DIRECT large-file writer: one reused 4 KiB-aligned bounce buffer (the
-  // parse thread writes large files sequentially, so a single buffer is safe).
+  // O_DIRECT large-file writer: a small pool of reused 4 KiB-aligned buffers.
+  // The parse thread fills one (pipe read + zero-detect) while a dedicated writer
+  // thread O_DIRECTs another — pipelining the read and the write on a single
+  // stream (concurrent O_DIRECT streams contend, so we keep exactly one writer).
   static constexpr size_t DBUF_CAP = 8 * 1024 * 1024;
-  void * dbuf_ = nullptr;
+  static constexpr int    NDBUF    = 3;
+  void * dbufs_[NDBUF] = {};
 
   // Deferred work applied after all data is written.
   struct Hard { std::string name, target; };
@@ -8214,54 +8217,98 @@ private:
   // written with O_DIRECT cleared (it can't do unaligned), then ftruncate sets
   // the exact size.  Falls back to the buffered stream_large if O_DIRECT is
   // rejected (open failure, or a filesystem like tmpfs that lacks it).
+  // One O_DIRECT write job: which aligned runs of buffer `bi` to write where, plus
+  // the file's final sub-block tail (last job only).
+  struct DJob {
+    int bi;
+    std::vector<std::tuple<size_t, uint64_t, size_t>> runs;  // (buf_off, file_off, len)
+    size_t tail_off = 0, tail_len = 0; uint64_t tail_fpos = 0;
+  };
+
   void stream_large_direct(StreamReader & r, const std::string & rel, const InEntry & e) {
     int fd = create_file(rel, e.mode, /*o_direct=*/true);
     if (fd < 0) { stream_large(r, rel, e); return; }
     static constexpr size_t AL = 4096;
-    if (!dbuf_ && posix_memalign(&dbuf_, AL, DBUF_CAP) != 0) dbuf_ = nullptr;
-    if (!dbuf_) { ::close(fd); stream_large(r, rel, e); return; }  // create_file unlinks+recreates
+    for (int i = 0; i < NDBUF; ++i)
+      if (!dbufs_[i] && posix_memalign(&dbufs_[i], AL, DBUF_CAP) != 0) dbufs_[i] = nullptr;
+    if (!dbufs_[0]) { ::close(fd); stream_large(r, rel, e); return; }  // create_file unlinks+recreates
+    int nbuf = 0; while (nbuf < NDBUF && dbufs_[nbuf]) ++nbuf;  // however many we got
 
-    char * buf = static_cast<char *>(dbuf_);
     const bool sp = (opt_.sparse_mode != 0);
     auto blk_zero = [](const char * p) {
-      for (size_t k = 0; k < AL; ++k) if (p[k]) return false;
+      const uint64_t * w = reinterpret_cast<const uint64_t *>(p);  // word-wise scan
+      for (size_t i = 0; i < AL / sizeof(uint64_t); ++i) if (w[i]) return false;
       return true;
     };
-    auto pwrite_run = [&](const char * p, size_t len, uint64_t at) {
-      size_t done = 0;
-      while (done < len) {
-        ssize_t w = ::pwrite(fd, p + done, len - done, (off_t)(at + done));
-        if (w < 0) { if (errno == EINTR) continue; return false; }
-        done += (size_t)w;
+    // ---- writer thread: drains DJobs, O_DIRECTs the runs, returns buffers ----
+    std::mutex mx; std::condition_variable job_cv, free_cv;
+    std::deque<DJob> jobs; std::deque<int> freeq;
+    for (int i = 0; i < nbuf; ++i) freeq.push_back(i);
+    bool done = false; std::atomic<bool> werr{false};
+    std::thread wr([&] {
+      auto pwrite_at = [&](const char * p, size_t len, uint64_t at) {
+        size_t d = 0;
+        while (d < len) {
+          ssize_t w = ::pwrite(fd, p + d, len - d, (off_t)(at + d));
+          if (w < 0) { if (errno == EINTR) continue; return false; }
+          d += (size_t)w;
+        }
+        return true;
+      };
+      for (;;) {
+        DJob j;
+        { std::unique_lock<std::mutex> lk(mx);
+          job_cv.wait(lk, [&] { return !jobs.empty() || done; });
+          if (jobs.empty()) return;
+          j = std::move(jobs.front()); jobs.pop_front(); }
+        const char * buf = static_cast<const char *>(dbufs_[j.bi]);
+        bool ok = true;
+        for (auto & run : j.runs)
+          if (!pwrite_at(buf + std::get<0>(run), std::get<2>(run), std::get<1>(run))) { ok = false; break; }
+        if (ok && j.tail_len) {  // final sub-block tail: O_DIRECT can't do unaligned
+#ifdef O_DIRECT
+          int fl = ::fcntl(fd, F_GETFL); if (fl >= 0) ::fcntl(fd, F_SETFL, fl & ~O_DIRECT);
+#endif
+          if (!pwrite_at(buf + j.tail_off, j.tail_len, j.tail_fpos)) ok = false;
+        }
+        { std::lock_guard<std::mutex> lk(mx); freeq.push_back(j.bi); }
+        free_cv.notify_one();
+        if (!ok) { werr.store(true); return; }
       }
-      return true;
-    };
-    uint64_t left = e.size, fpos = 0; size_t pending = 0; bool ok = true;
-    while (left && ok) {
-      size_t want = (size_t)std::min<uint64_t>(left, DBUF_CAP - pending);
-      size_t got = r.read_some(buf + pending, want);
-      if (!got) { ok = false; break; }
-      left -= got; pending += got;
-      if (m_) m_->wrote_bytes.fetch_add(got, std::memory_order_relaxed);
-      size_t flushable = (pending / AL) * AL, off = 0;  // whole aligned blocks
-      while (off < flushable) {
+    });
+    // ---- parse thread: fill a buffer, build its write plan, hand it off ----
+    uint64_t left = e.size, fpos = 0; bool ok = true;
+    while (left && ok && !werr.load()) {
+      int bi;
+      { std::unique_lock<std::mutex> lk(mx);
+        free_cv.wait(lk, [&] { return !freeq.empty() || werr.load(); });
+        if (werr.load()) { ok = false; break; }
+        bi = freeq.front(); freeq.pop_front(); }
+      char * buf = static_cast<char *>(dbufs_[bi]);
+      size_t fill = 0;
+      while (fill < DBUF_CAP && left) {
+        size_t got = r.read_some(buf + fill, (size_t)std::min<uint64_t>(DBUF_CAP - fill, left));
+        if (!got) { ok = false; break; }
+        fill += got; left -= got;
+        if (m_) m_->wrote_bytes.fetch_add(got, std::memory_order_relaxed);
+      }
+      size_t aligned = (fill / AL) * AL, off = 0;
+      DJob j; j.bi = bi;
+      while (off < aligned) {
         if (sp && blk_zero(buf + off)) { fpos += AL; off += AL; continue; }  // hole
         size_t run = off;
-        while (off < flushable && !(sp && blk_zero(buf + off))) off += AL;
-        if (!pwrite_run(buf + run, off - run, fpos)) { ok = false; break; }
-        fpos += (off - run);
+        while (off < aligned && !(sp && blk_zero(buf + off))) off += AL;
+        j.runs.emplace_back(run, fpos, off - run); fpos += (off - run);
       }
-      size_t rem = pending - flushable;
-      if (rem) std::memmove(buf, buf + flushable, rem);
-      pending = rem;
+      j.tail_off = aligned; j.tail_len = fill - aligned; j.tail_fpos = fpos;
+      fpos += j.tail_len;
+      { std::lock_guard<std::mutex> lk(mx); jobs.push_back(std::move(j)); }
+      job_cv.notify_one();
     }
-    if (ok && pending) {  // final sub-block tail: O_DIRECT can't do unaligned
-#ifdef O_DIRECT
-      int fl = ::fcntl(fd, F_GETFL); if (fl >= 0) ::fcntl(fd, F_SETFL, fl & ~O_DIRECT);
-#endif
-      if (!pwrite_run(buf, pending, fpos)) ok = false; else fpos += pending;
-    }
-    if (!ok) fail(rel, "write failed");
+    { std::lock_guard<std::mutex> lk(mx); done = true; }
+    job_cv.notify_one();
+    wr.join();
+    if (!ok || werr.load()) fail(rel, "write failed");
     else if (::ftruncate(fd, (off_t)e.size) != 0) fail(rel, "ftruncate failed");
     set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
     apply_ext(fd, /*is_dir=*/false, e.ext);
