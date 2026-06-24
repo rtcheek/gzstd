@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.25";
+static constexpr const char * GZSTD_VERSION = "0.14.27";
 //
 // Architecture overview:
 //
@@ -9068,6 +9068,7 @@ struct StreamCtx {
   // Host-side vectors (mirroring device arrays for readback)
   std::vector<size_t>         h_in_sizes;
   std::vector<size_t>         h_comp_sizes;
+  std::vector<uint32_t>       h_checksums;   // XXH64-low32 of each chunk's uncompressed data
   std::vector<nvcompStatus_t> h_stats;
   std::vector<Task>           batch;
 
@@ -9235,6 +9236,7 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   // Allocate host-side vectors for sizes and statuses
   C.h_in_sizes.resize(C.per_stream_batch);
   C.h_comp_sizes.resize(C.per_stream_batch);
+  C.h_checksums.resize(C.per_stream_batch);
   C.h_stats.resize(C.per_stream_batch);
   C.batch.reserve(C.per_stream_batch);
 
@@ -9326,6 +9328,32 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
   On failure: the catch block rescues in-flight chunks to the CPU
   rescue queue (hybrid mode) or dies (--gpu-only mode).
 ----------------------------------------------------------------------*/
+
+// nvCOMP's batched zstd compressor does NOT add the per-frame content checksum
+// that the CPU path emits (ZSTD_c_checksumFlag), so GPU/hybrid archives were not
+// self-verifying.  We add it ourselves: zstd's content checksum is the low 32
+// bits of XXH64(uncompressed_frame, 0).  ZSTD_XXH64 is exported by libzstd (it
+// builds xxHash under the ZSTD_ namespace for its own checksums), so no extra
+// dependency.  The checksum is computed at H2D staging (uncompressed data still
+// on the host) and stitched onto the frame after D2H.
+extern "C" unsigned long long ZSTD_XXH64(const void * input, size_t length,
+                                         unsigned long long seed);
+
+// Turn an nvCOMP-produced frame into a self-verifying one: set the
+// Frame_Header_Descriptor's content-checksum flag (bit 2 of the byte after the
+// 4-byte magic) and append the 4-byte XXH64-low32, little-endian — exactly what
+// a zstd decoder (and `zstd -l`, and gzstd -t) expects.  The FrameBuf is a heap
+// vector, so the append is free of the fixed-buffer overflow the GPU output
+// slots would have.
+static inline void gpu_frame_add_checksum(FrameVec & f, uint32_t ck) {
+  if (f.size() < 5) return;                 // not a well-formed zstd frame; leave as-is
+  f[4] |= 0x04;                             // Content_Checksum_flag
+  f.push_back((char)(ck & 0xff));
+  f.push_back((char)((ck >> 8) & 0xff));
+  f.push_back((char)((ck >> 16) & 0xff));
+  f.push_back((char)((ck >> 24) & 0xff));
+}
+
 static void gpu_worker(
   int device_id,
   int slot_index,   // positional index into per_dev/json_sink arrays
@@ -9856,6 +9884,9 @@ static void gpu_worker(
                       "cudaMemcpyAsync(H2D)");
           }
           C.h_in_sizes[i] = t.len();
+          // Compute the zstd content checksum now, while the uncompressed chunk
+          // is still on the host (it may be released right after H2D below).
+          C.h_checksums[i] = (uint32_t)ZSTD_XXH64(t.ptr(), t.len(), 0);
         }
         checkCuda(cudaMemcpyAsync(C.d_in_sizes, C.h_in_sizes.data(), sizeof(size_t)*C.filled, cudaMemcpyHostToDevice, C.stream), "cudaMemcpyAsync(d_in_sizes)");
         cudaEventRecord(C.ev_h2d_end, C.stream);
@@ -9935,6 +9966,7 @@ static void gpu_worker(
                                    cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H exact)");
             }
+            gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
             C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
           }
@@ -10100,6 +10132,7 @@ static void gpu_worker(
               checkCuda(cudaMemcpy(h_out->data(), d_src, csz, cudaMemcpyDeviceToHost),
                         "cudaMemcpy(D2H exact sync)");
             }
+            gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
             C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
           }
@@ -12936,7 +12969,14 @@ static int list_zst(const Options & opt)
       if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
         mp_len = (size_t)st.st_size;
         mp = ::mmap(nullptr, mp_len, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mp != MAP_FAILED) { base = (const unsigned char *)mp; fsize = mp_len; }
+        if (mp != MAP_FAILED) {
+          base = (const unsigned char *)mp; fsize = mp_len;
+          // The frame walk touches only block-header bytes (~one per 128 KiB),
+          // which on a cold file is ~1M serial random page faults.  Hint a
+          // forward sequential scan so the kernel prefetches in big reads
+          // instead — turns random fault-per-header I/O into streaming reads.
+          ::madvise(mp, mp_len, MADV_SEQUENTIAL);
+        }
       }
       ::close(fd);
     }

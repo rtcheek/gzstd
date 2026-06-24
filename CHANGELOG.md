@@ -1,11 +1,52 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.25  
+**Covers:** v0.9.50 → v0.14.27  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.27 — MADV_SEQUENTIAL on the -l frame walk (cold-file speed)
+
+Plain -l mmaps the file and walks frame + block headers with
+ZSTD_findFrameCompressedSize, which skips block content by pointer math — so it
+touches only the block-header bytes, roughly one per 128 KiB.  On a cold file
+that is ~1M scattered, serial, synchronous page faults (a 65 GiB / 8343-frame
+archive took ~42s: ~19s iowait on random reads + ~23s fault handling).  zstd -l
+instead streams the file sequentially, so it's readahead-bound.
+
+Added madvise(MADV_SEQUENTIAL) on the mapping.  The walk's accesses are
+forward-only, so the kernel now prefetches in large sequential reads instead of
+faulting one header page at a time — turning the cold path from random-IO-bound
+into sequential-read-bound, matching zstd's profile.  Warm (page-cache-resident)
+runs were already fast; this fixes the cold case.  Note the cold floor is still
+the time to stream the file once (both tools read it); a header-only variant
+would need parallel/async scatter reads and is left for later.
+
+## v0.14.26 — GPU and hybrid compress now write XXH64 content checksums
+
+The CPU compressor sets ZSTD_c_checksumFlag, so CPU-compressed frames carry a
+per-frame XXH64 content checksum (self-verifying; -t and any zstd decoder catch
+silent bit-rot).  nvCOMP's batched zstd compressor does NOT add it, so GPU- and
+hybrid-compressed archives shipped without that integrity check — gzstd -l (and
+zstd -l) showed Check: None.  An oversight: GPU/hybrid output was less protected
+than CPU output.
+
+Fixed by stitching the checksum onto each GPU-produced frame.  zstd's content
+checksum is the low 32 bits of XXH64(uncompressed_frame, 0); we compute it at H2D
+staging (while the uncompressed chunk is still on the host) using ZSTD_XXH64
+(exported by libzstd, which builds xxHash under the ZSTD_ namespace — no new
+dependency), then after D2H set the frame header descriptor's content-checksum
+bit and append the 4 bytes (little-endian).  Done at both gpu_worker delivery
+sites (async + sync drain); rescued chunks already get the checksum from the CPU
+recompress path, so every frame ends up self-verifying with no duplication.  The
+append lands in the heap FrameBuf, avoiding the fixed GPU output slot's overflow.
+
+Verified: GPU- and hybrid-compressed archives now show Check: XXH64, a stock
+zstd -t validates the checksum, round-trips are byte-identical, and a flipped
+byte is caught as a checksum mismatch by both zstd and gzstd.  Small per-frame
+host-side XXH64 cost on the GPU path, accepted for the integrity guarantee.
 
 ## v0.14.25 — silence a -Wnonnull false positive in the sink-mode decompress helpers
 
