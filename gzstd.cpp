@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.29";
+static constexpr const char * GZSTD_VERSION = "0.14.30";
 //
 // Architecture overview:
 //
@@ -1990,6 +1990,11 @@ private:
 #endif
 #endif
 static inline uint64_t now_ns();   // defined below; used by DirectWriter write timing
+// -v writer breakdown: time inside the O_DIRECT ::write syscall, kept at file
+// scope so the [WRITER] summary can read it after the DirectWriter is destroyed
+// (g_direct_writer is null by summary time).  Reset per output in open().
+static std::atomic<uint64_t> g_odirect_write_ns{0};
+static std::atomic<bool>     g_odirect_used{false};
 class DirectWriter {
 public:
   static constexpr size_t ALIGN = 4096;          // filesystem block alignment
@@ -2011,6 +2016,8 @@ public:
     }
     buf_used_ = 0;
     total_written_ = 0;
+    g_odirect_write_ns.store(0, std::memory_order_relaxed);  // -v: per-output write-time
+    g_odirect_used.store(true, std::memory_order_relaxed);
     return true;
   }
 
@@ -2216,7 +2223,7 @@ private:
         return false;  // write() == 0 with len > 0: no progress possible
       }
     }
-    write_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+    g_odirect_write_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     return true;
   }
 
@@ -2243,9 +2250,6 @@ private:
   size_t buf_used_ = 0;
   size_t total_written_ = 0;
   uint64_t preallocated_ = 0;
-  std::atomic<uint64_t> write_ns_{0};  // -v: time inside the ::write syscall (vs bounce-copy)
-public:
-  uint64_t write_ns() const { return write_ns_.load(std::memory_order_relaxed); }
 };
 #endif // _WIN32
 
@@ -13772,14 +13776,11 @@ int main(int argc, char ** argv)
         char sline[300];
         bool odirect = false;
 #ifndef _WIN32
-        odirect = (g_direct_writer != nullptr);
+        odirect = g_odirect_used.load(std::memory_order_relaxed);
 #endif
         const double scan_pct = double(disk_ns - io_ns) / double(disk_ns) * 100.0;
         if (odirect) {
-          uint64_t wr_ns = 0;
-#ifndef _WIN32
-          wr_ns = g_direct_writer->write_ns();
-#endif
+          uint64_t wr_ns = g_odirect_write_ns.load(std::memory_order_relaxed);
           if (wr_ns > io_ns) wr_ns = io_ns;   // clamp (different clocks/overlap)
           std::snprintf(sline, sizeof(sline),
             "[WRITER]   of busy: O_DIRECT ::write %.1f%% | bounce-copy→aligned %.1f%% | zero-scan %.1f%%"

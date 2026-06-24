@@ -1,11 +1,25 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.29  
+**Covers:** v0.9.50 → v0.14.30  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.30 — fix the writer breakdown so the O_DIRECT ::write split actually reports
+
+v0.14.29's split read the ::write time from g_direct_writer at summary time, but
+that pointer is already torn down by then, so an O_DIRECT run mislabeled itself
+"buffered write" and lumped bounce-copy + write together.  Moved the ::write
+timing to a file-scope counter (g_odirect_write_ns) that survives the
+DirectWriter's destruction, with a g_odirect_used flag set in open(), so the
+O_DIRECT ::write / bounce-copy / zero-scan split prints correctly.  First good
+server reading: on a 130 GiB cpu-only -d, zero-scan is ~12.7% of the write
+thread's busy time (not the ~1.5% the buffered local box showed — the fast
+O_DIRECT write makes the serial CPU scan a much larger slice), confirming the
+single-threaded scan + bounce-copy on the write thread is the gap vs extract
+(which pipelines them).  Still measurement only.
 
 ## v0.14.29 — writer-busy breakdown (-v): split the write thread's time three ways
 
