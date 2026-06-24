@@ -1,11 +1,37 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.23  
+**Covers:** v0.9.50 → v0.14.24  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.24 — `-l` / `--list`: zstd-style frame info, and `-l --tar` archive contents
+
+`-l` was a no-op stub that pointed users at `zstd --list`.  It now lists for real,
+in two modes:
+
+- **`-l file.zst`** — a `zstd -l`-style summary: `Frames  Skips  Compressed
+  Uncompressed  Ratio  Check  Filename`.  It mmaps the file and walks the frame +
+  block headers WITHOUT decompressing — `ZSTD_findFrameCompressedSize` skips block
+  content, so over the mapping only header pages fault in; uncompressed is summed
+  from each frame's content-size header and `Check` is read from the frame
+  descriptor's checksum bit (`XXH64`/`None`).  Fast even on a huge multi-frame
+  file.  Works on any zstd file (ours or foreign); frame count matches `zstd -l`.
+
+- **`-l --tar archive.tar.zst`** — lists the archive's contents in `tar -tvf`
+  style (perms, owner/group, size, mtime, name; `-> target` for symlinks), then a
+  `N files, <size>` footer.  It reuses the verify fast path — decompress through
+  the in-memory `FrameSink` and the `Extractor` in a new **list mode** that prints
+  each entry and skips the data — so it's decompress-bound, not pipe-bound, and
+  works on foreign `.tar.zst` too.  The tar header parser now also reads the
+  ustar `uname`/`gname` fields so owner/group show as names when present.
+
+Entries print to stdout; the footer and any notices go to stderr, so the listing
+pipes cleanly.  The Gen3 "defaulting decompress to --cpu-only" notice is
+suppressed under `-l` (a listing shouldn't announce a backend; plain `-l` doesn't
+even decompress).
 
 ## v0.14.23 — persistent cross-file O_DIRECT writer for -d --tar extract
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.23";
+static constexpr const char * GZSTD_VERSION = "0.14.24";
 //
 // Architecture overview:
 //
@@ -311,6 +311,7 @@ enum class PinMode { AUTO, ON, OFF };
 #endif
 struct Options {
   Mode mode = Mode::COMPRESS;
+  bool list_mode = false;    // -l/--list: list .zst frame info, or `-l --tar` archive contents
   int level = 3;             // CPU Zstd level
   bool level_user_set = false;
   bool fast_flag = false;
@@ -708,6 +709,8 @@ static void print_help()
 "Operation:\n"
 "  -d                  decompress\n"
 "  -t                  test (verify integrity, no output)\n"
+"  -l                  list .zst frame info (Frames/Sizes/Ratio/Check); with\n"
+"                      --tar, list the archive contents (tar -tvf style)\n"
 "  -k                  keep input after success (default)\n"
 "  --rm                remove input after success\n"
 "\n"
@@ -7649,7 +7652,7 @@ struct ExtMeta {
 
 // A parsed tar entry (metadata only).
 struct InEntry {
-  std::string name, linkname;
+  std::string name, linkname, uname, gname;   // uname/gname: owner/group names (-l --tar)
   uint64_t size = 0, uid = 0, gid = 0;   // size = bytes stored in the stream
   uint32_t mode = 0, devmajor = 0, devminor = 0;
   int64_t  mtime = 0;
@@ -7716,9 +7719,12 @@ class Extractor {
 public:
   // validate_only: parse and structurally verify the tar (header checksums,
   // sizes, completeness) WITHOUT writing any files — for `gzstd -t --tar`.
-  Extractor(int dest_fd, const Options & opt, Meter * m, bool validate_only = false)
+  // list_only: parse and print each entry (tar -tvf style) to stdout, write
+  // nothing — for `gzstd -l --tar`.  Both are read-only walks (no writer pool).
+  Extractor(int dest_fd, const Options & opt, Meter * m, bool validate_only = false,
+            bool list_only = false)
     : dest_fd_(dest_fd), opt_(opt), m_(m), as_root_(::geteuid() == 0),
-      validate_only_(validate_only) {}
+      validate_only_(validate_only), list_only_(list_only) {}
   ~Extractor() {
     // Defensive: stop_pool() normally joins the writer; ensure it's down before
     // freeing the buffers it writes from (e.g. an early-return/exception path).
@@ -7734,22 +7740,22 @@ public:
   uint64_t validated_bytes() const { return vbytes_; }
 
   void run(int read_fd) {
-    if (!validate_only_) start_pool();
+    if (!read_only()) start_pool();
     StreamReader r(read_fd);
     parse(r);               // validates every header checksum; flags truncation
     r.drain();              // consume trailing padding so the decompressor can finish
-    if (!validate_only_) { stop_pool(); finish_deferred(); log_large_file_stats(); }
+    if (!read_only()) { stop_pool(); finish_deferred(); log_large_file_stats(); }
   }
 
   // Same as run() but reads decompressed frames straight from an in-memory
-  // FrameSink (the `-t --tar` fast path) instead of a pipe fd — skip() over
-  // file data becomes pointer arithmetic, so the validator does O(files) work.
+  // FrameSink (the `-t`/`-l --tar` fast path) instead of a pipe fd — skip() over
+  // file data becomes pointer arithmetic, so the walk does O(files) work.
   void run_sink(FrameSink * src) {
-    if (!validate_only_) start_pool();
+    if (!read_only()) start_pool();
     StreamReader r(src);
     parse(r);
     r.drain();              // pop any trailing frames so the producer can finish
-    if (!validate_only_) { stop_pool(); finish_deferred(); log_large_file_stats(); }
+    if (!read_only()) { stop_pool(); finish_deferred(); log_large_file_stats(); }
   }
 
 private:
@@ -7777,8 +7783,46 @@ private:
   static constexpr uint64_t SMALL_FILE_MAX = 4 * 1024 * 1024;  // buffer+dispatch below this; stream above
   int dest_fd_; const Options & opt_; Meter * m_; bool as_root_;
   bool validate_only_ = false;
-  uint64_t vfiles_ = 0, vbytes_ = 0;  // validate_only counters
+  bool list_only_ = false;
+  bool read_only() const { return validate_only_ || list_only_; }  // no writer pool
+  uint64_t vfiles_ = 0, vbytes_ = 0;  // validate/list counters (entries, logical bytes)
   std::atomic<bool> had_error_{false};
+
+  // Format one entry as a `tar -tvf` line on stdout (for -l --tar).  perms,
+  // owner/group (names if present in the header, else numeric), logical size,
+  // mtime (local), name (+ link target).  Fixed fields ~fit 80 cols; the name
+  // runs after, like every tar tool.
+  void print_list_entry(const InEntry & e) {
+    char perms[11];
+    char t = '-';
+    switch (e.typeflag) {
+      case '5': t = 'd'; break; case '2': t = 'l'; break; case '1': t = 'h'; break;
+      case '3': t = 'c'; break; case '4': t = 'b'; break; case '6': t = 'p'; break;
+    }
+    perms[0] = t;
+    static const char rwx[9] = {'r','w','x','r','w','x','r','w','x'};
+    for (int i = 0; i < 9; ++i) perms[1 + i] = (e.mode & (1u << (8 - i))) ? rwx[i] : '-';
+    if (e.mode & 04000) perms[3] = (perms[3] == 'x') ? 's' : 'S';
+    if (e.mode & 02000) perms[6] = (perms[6] == 'x') ? 's' : 'S';
+    if (e.mode & 01000) perms[9] = (perms[9] == 'x') ? 't' : 'T';
+    perms[10] = '\0';
+
+    std::string owner = e.uname.empty() ? std::to_string(e.uid) : e.uname;
+    std::string group = e.gname.empty() ? std::to_string(e.gid) : e.gname;
+    std::string owngrp = owner + "/" + group;
+
+    char date[24] = "";
+    time_t tt = (time_t)e.mtime; struct tm tmv;
+    if (localtime_r(&tt, &tmv)) std::strftime(date, sizeof date, "%Y-%m-%d %H:%M", &tmv);
+
+    uint64_t sz = e.is_sparse ? e.real_size : e.size;
+    std::string nm = e.name;
+    if (e.typeflag == '2' && !e.linkname.empty()) nm += " -> " + e.linkname;       // symlink
+    else if (e.typeflag == '1' && !e.linkname.empty()) nm += " link to " + e.linkname;  // hardlink
+
+    std::fprintf(stdout, "%s %-17s %12llu %s %s\n",
+                 perms, owngrp.c_str(), (unsigned long long)sz, date, nm.c_str());
+  }
   // Large-file (stream_large_direct) breakdown, -v only.  All on the single
   // parse thread except ld_write_ns_ / ld_jobwait_ns_ (the per-file writer):
   //   fill   = read member data from the sink into the aligned buffer (memcpy)
@@ -8168,6 +8212,8 @@ private:
       e.mode = (uint32_t)get_num(blk + 100, 8);
       e.uid = get_num(blk + 108, 8);
       e.gid = get_num(blk + 116, 8);
+      e.uname = get_str(blk + 265, 32);   // ustar owner/group names (for -l --tar)
+      e.gname = get_str(blk + 297, 32);
       e.size = pax_has_size ? pax_size : size;
       e.mtime = pax_has_mtime ? pax_mtime : (int64_t)get_num(blk + 136, 12);
       e.typeflag = type;
@@ -8241,10 +8287,12 @@ private:
     // after handling so the parser stays aligned even when we reject the member.
     uint64_t pad = (TAR_BLK - (e.size % TAR_BLK)) % TAR_BLK;
 
-    // Validate-only (`-t --tar`): the header checksum was already verified in
-    // parse(); just count the member and consume its data so the parser stays
-    // aligned.  A short read here (truncated archive) is caught by parse().
-    if (validate_only_) {
+    // Read-only walks (`-t --tar` validate, `-l --tar` list): the header
+    // checksum was already verified in parse(); count the member, list it if
+    // requested, and consume its data so the parser stays aligned.  A short read
+    // here (truncated archive) is caught by parse().
+    if (read_only()) {
+      if (list_only_) print_list_entry(e);
       ++vfiles_; vbytes_ += e.is_sparse ? e.real_size : e.size;
       if (e.size) { r.skip(e.size); r.skip(pad); }
       return;
@@ -12863,6 +12911,143 @@ static int verify_tar(const Options & opt, Meter * m)
   }
   return rc;
 }
+#endif  // !_WIN32  (extract_tar + verify_tar)
+
+// -l (plain): zstd-style frame summary for each .zst file — Frames / Skips /
+// Compressed / Uncompressed / Ratio / Check / Filename.  Walks frame + block
+// headers WITHOUT decompressing (ZSTD_findFrameCompressedSize skips block
+// content); over an mmap only the header pages fault in, so it's fast even on a
+// huge multi-frame file.  Uncompressed is summed from frame-header content sizes.
+static int list_zst(const Options & opt)
+{
+  std::printf("%7s %6s %12s %14s %7s %6s  %s\n",
+              "Frames", "Skips", "Compressed", "Uncompressed", "Ratio", "Check", "Filename");
+  int rc = EXIT_OK;
+  for (const std::string & fn : opt.inputs) {
+    // Get a contiguous read-only view: mmap a regular file (lazy, zero-copy),
+    // else read it all (stdin / mmap failure).
+    const unsigned char * base = nullptr; size_t fsize = 0;
+    void * mp = MAP_FAILED; size_t mp_len = 0; std::vector<char> buf;
+#ifndef _WIN32
+    if (fn != "-") {
+      int fd = ::open(fn.c_str(), O_RDONLY);
+      if (fd < 0) { vlog(V_ERROR, opt, "gzstd: list: " + fn + ": " + std::strerror(errno) + "\n"); rc = EXIT_DATA; continue; }
+      struct stat st;
+      if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        mp_len = (size_t)st.st_size;
+        mp = ::mmap(nullptr, mp_len, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mp != MAP_FAILED) { base = (const unsigned char *)mp; fsize = mp_len; }
+      }
+      ::close(fd);
+    }
+#endif
+    if (!base) {  // stdin or non-mmappable: read it all
+      FILE * f = open_input(fn);
+      char tmp[1 << 20]; size_t n;
+      while ((n = std::fread(tmp, 1, sizeof tmp, f)) > 0) buf.insert(buf.end(), tmp, tmp + n);
+      if (f && f != stdin) std::fclose(f);
+      base = (const unsigned char *)buf.data(); fsize = buf.size();
+    }
+
+    uint64_t nframes = 0, nskips = 0, uncomp = 0;
+    bool uncomp_known = true, has_check = false, ok = true;
+    size_t pos = 0;
+    while (pos + 4 <= fsize) {
+      uint32_t magic; std::memcpy(&magic, base + pos, 4);
+      if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {           // skippable frame
+        if (pos + 8 > fsize) { ok = false; break; }
+        uint32_t ssz; std::memcpy(&ssz, base + pos + 4, 4);
+        pos += 8 + (size_t)ssz; ++nskips; continue;
+      }
+      size_t csz = ZSTD_findFrameCompressedSize(base + pos, fsize - pos);
+      if (ZSTD_isError(csz) || csz == 0) { ok = false; break; }
+      unsigned long long ucs = ZSTD_getFrameContentSize(base + pos, fsize - pos);
+      if (ucs == ZSTD_CONTENTSIZE_UNKNOWN || ucs == ZSTD_CONTENTSIZE_ERROR) uncomp_known = false;
+      else uncomp += ucs;
+      // Frame_Header_Descriptor (byte after the 4-byte magic): bit 2 = content checksum.
+      if (pos + 4 < fsize && (base[pos + 4] & 0x04)) has_check = true;
+      pos += csz; ++nframes;
+    }
+#ifndef _WIN32
+    if (mp != MAP_FAILED) ::munmap(mp, mp_len);
+#endif
+
+    char comp_h[32], unc_h[32];
+    human_bytes(double(fsize), comp_h, sizeof comp_h);
+    if (uncomp_known) human_bytes(double(uncomp), unc_h, sizeof unc_h);
+    else std::snprintf(unc_h, sizeof unc_h, "?");
+    double ratio = (uncomp_known && fsize > 0) ? double(uncomp) / double(fsize) : 0.0;
+    char ratio_s[16];
+    if (uncomp_known) std::snprintf(ratio_s, sizeof ratio_s, "%.3f", ratio);
+    else std::snprintf(ratio_s, sizeof ratio_s, "-");
+    std::printf("%7llu %6llu %12s %14s %7s %6s  %s\n",
+                (unsigned long long)nframes, (unsigned long long)nskips,
+                comp_h, unc_h, ratio_s, has_check ? "XXH64" : "None",
+                fn == "-" ? "(stdin)" : fn.c_str());
+    if (!ok) {
+      vlog(V_ERROR, opt, "gzstd: list: " + fn + ": not a valid zstd stream (truncated or corrupt)\n");
+      rc = EXIT_DATA;
+    }
+  }
+  std::fflush(stdout);
+  return rc;
+}
+
+#ifndef _WIN32
+// -l --tar: list each archive's contents (tar -tvf style) without writing.
+// Decompresses through the in-memory FrameSink (same fast path as verify); the
+// Extractor in list mode prints each entry to stdout and skips the data.
+static int list_tar(const Options & opt, Meter * m)
+{
+  int rc = EXIT_OK;
+  for (const std::string & arc : opt.tar_sources) {
+    FILE * in = open_input(arc);   // dies on failure
+    if (arc != "-") {
+      unsigned char magic[4] = {0};
+      size_t nr = std::fread(magic, 1, 4, in);
+      uint32_t mg = 0; if (nr == 4) std::memcpy(&mg, magic, 4);
+      bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
+      if (!ok_magic) {
+        vlog(V_ERROR, opt, "gzstd: list: not a zstd archive: " + arc + "\n");
+        if (in && in != stdin) std::fclose(in);
+        rc = EXIT_DATA; continue;
+      }
+      std::rewind(in);
+    }
+    FrameSink sink(256 * ONE_MIB);
+    g_tar_decomp_sink = &sink;
+    tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/false, /*list_only=*/true);
+    std::thread exth([&] { ex.run_sink(&sink); });
+
+    Options dopt = opt;
+    dopt.sparse_mode = 0; dopt.unsafe_overwrite = true; dopt.mode = Mode::DECOMPRESS;
+    int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
+    if (ff > (int64_t)SINGLE_FRAME_STREAM_MIN) {
+      decompress_stream_from_file(in, nullptr, dopt, m);
+    } else {
+#ifdef HAVE_NVCOMP
+      if (dopt.cpu_only) decompress_cpu_mt(in, nullptr, dopt, m);
+      else               decompress_nvcomp(in, nullptr, dopt, m);
+#else
+      decompress_cpu_mt(in, nullptr, dopt, m);
+#endif
+    }
+    sink.close();
+    exth.join();
+    g_tar_decomp_sink = nullptr;
+    if (in && in != stdin) std::fclose(in);
+    std::fflush(stdout);
+
+    if (opt.verbosity >= V_DEFAULT) {  // footer summary (stderr, so stdout stays a clean listing)
+      char sz[64]; human_bytes(double(ex.validated_bytes()), sz, sizeof sz);
+      std::string pfx = opt.tar_sources.size() > 1 ? arc + ": " : "";
+      std::fprintf(stderr, "%s%llu files, %s\n", pfx.c_str(),
+                   (unsigned long long)ex.validated_files(), sz);
+    }
+    if (ex.had_error() && rc == EXIT_OK) rc = EXIT_DATA;
+  }
+  return rc;
+}
 #endif  // !_WIN32
 
 int main(int argc, char ** argv)
@@ -12944,6 +13129,12 @@ int main(int argc, char ** argv)
                          "extraction (parallel file-writer pool); ignoring it\n");
 
 #ifndef _WIN32
+  // -l: list .zst frame info (plain) or archive contents (`-l --tar`).  Checked
+  // before the extract/verify dispatch so it doesn't fall through to either.
+  if (opt.list_mode) {
+    if (opt.tar_mode) { Meter meter; return list_tar(opt, &meter); }
+    return list_zst(opt);
+  }
   // -d --tar: extract the archive(s) into -C DIR via the native parallel
   // extractor; bypasses the single-output per-file loop below.
   if (opt.tar_mode && opt.mode == Mode::DECOMPRESS) {
@@ -13668,7 +13859,9 @@ static void apply_backend_defaults(Options & opt)
     }
     // Show this at default verbosity: users on Gen3 hardware otherwise see
     // no GPU activity and have no way to know the runtime made that choice.
-    if (opt.verbosity >= V_DEFAULT) {
+    // Suppress for -l: a listing shouldn't announce a decompress backend (plain
+    // -l doesn't even decompress).
+    if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
       std::ostringstream os;
       os << "gzstd: PCIe Gen" << gen
          << " detected; defaulting decompress to --cpu-only "
@@ -14015,7 +14208,8 @@ static Options parse_args(int argc, char ** argv)
       warn_ignored_zstd_opt("-r/--recursive", "recurse into directories yourself");
     }
     else if (a == "-l" || a == "--list") {
-      warn_ignored_zstd_opt("-l/--list", "use `zstd --list` for .zst header info");
+      opt.list_mode = true;
+      opt.mode = Mode::DECOMPRESS;   // a read-only op; main dispatches list before any decompress
     }
     else if (eat_zstd_value_opt("filelist", i, argc, argv)) {
       warn_ignored_zstd_opt("--filelist");

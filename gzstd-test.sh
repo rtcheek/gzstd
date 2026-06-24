@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=251
-$EXTENSIVE && EXPECTED_TESTS=349
+EXPECTED_TESTS=254
+$EXTENSIVE && EXPECTED_TESTS=352
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3748,6 +3748,52 @@ else
   fi
 
   rm -rf "$VS" "$MS" "$VA" "$MA" "$TMPDIR"/v.*.zst
+fi
+
+# ============================================================
+# List (-l, and -l --tar)
+# ============================================================
+section "List contents (-l)"
+
+if ! command -v tar >/dev/null 2>&1; then
+  skip "list" "tar not available"
+else
+  LS="$TMPDIR/lsrc"; rm -rf "$LS"; mkdir -p "$LS/d"
+  for i in 1 2 3 4 5 6; do echo "list-entry-$i" > "$LS/d/f$i"; done
+  head -c 3000000 /dev/urandom > "$LS/big.bin"   # forces several 1 MiB frames below
+  ln -sf big.bin "$LS/lnk"
+  LA="$TMPDIR/l.tar.zst"
+  "$GZSTD" --cpu-only -q -f --chunk-size 1 -o "$LA" --tar "$LS" 2>/dev/null
+
+  # 1. plain -l: a header + a single data row, exit 0, names the file.
+  out=$("$GZSTD" -l "$LA" 2>/dev/null); rc=$?
+  if [[ $rc -eq 0 ]] && grep -q "Frames" <<<"$out" && grep -q "l.tar.zst" <<<"$out"; then
+    pass "-l prints a frame summary"
+  else fail "-l frame summary" "rc=$rc out=[$out]"; fi
+
+  # 2. plain -l frame count matches zstd -l (both walk the same frames).
+  if command -v zstd >/dev/null 2>&1; then
+    gz_frames=$("$GZSTD" -l "$LA" 2>/dev/null | awk 'NR==2{print $1}')
+    zs_frames=$(zstd -l "$LA" 2>/dev/null | awk 'NR==2{print $1}')
+    if [[ -n "$gz_frames" && "$gz_frames" == "$zs_frames" ]]; then
+      pass "-l frame count matches zstd -l" "($gz_frames)"
+    else fail "-l frame count vs zstd" "gzstd=$gz_frames zstd=$zs_frames"; fi
+  else
+    skip "-l frame count matches zstd -l" "zstd CLI unavailable"
+  fi
+
+  # 3. -l --tar lists every entry (count matches what's in the tree) and shows
+  #    the tar -tvf fields (perms column + a known member + the symlink target).
+  list=$("$GZSTD" -l --tar --cpu-only "$LA" 2>/dev/null); rc=$?
+  n_list=$(grep -c . <<<"$list")
+  n_tree=$(find "$LS" | wc -l)   # dirs + files + symlink (matches tar entry count)
+  if [[ $rc -eq 0 ]] && [[ "$n_list" -eq "$n_tree" ]] \
+     && grep -q "/d/f1" <<<"$list" && grep -q -- "lnk -> big.bin" <<<"$list" \
+     && grep -qE '^[-dl]' <<<"$list"; then
+    pass "-l --tar lists all entries (tar -tvf style)" "($n_list)"
+  else fail "-l --tar listing" "rc=$rc listed=$n_list tree=$n_tree"; fi
+
+  rm -rf "$LS" "$LA"
 fi
 
 # ============================================================
