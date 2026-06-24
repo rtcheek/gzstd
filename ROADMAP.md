@@ -782,9 +782,12 @@ is secured with `openat`/`O_NOFOLLOW` against path-traversal and symlink-escape.
 Since v0.14.19/20 both `-t --tar` (verify) and `-d --tar` (extract) feed the
 in-order decompressed frames to the tar parser **in memory** (`FrameSink`), not
 through a kernel pipe — verify's `skip()` over file data became pointer
-arithmetic (decompress-bound now, ~5× on a high-core box), and extract dropped
-the per-byte pipe copy + syscalls. The tar **parse itself is still serial** on
-both paths. Open follow-ups:
+arithmetic (decompress-bound now), and extract dropped the per-byte pipe copy +
+syscalls. v0.14.23 made the O_DIRECT large-file writer **persistent across files**
+(was spawned/joined per file), so a file's tail writes overlap the next file's
+parse/read instead of stalling the parse thread on a per-file join — a structural
+win that grows with file count. The tar **parse itself is still serial** on both
+paths (one thread walks the stream in order). Open follow-ups:
 
 - **Parallel-dispatch `-d --tar` extraction** — *Priority: Medium | Complexity:
   High | Status: design.* The single biggest remaining extract lever. Today one
@@ -804,14 +807,24 @@ both paths. Open follow-ups:
      serial walk.
   Hard parts independent of which route: **directory-creation ordering** (a
   worker extracting `a/b/f` must not race the creation of `a/`, `a/b/` — needs an
-  upfront dir-tree pass or per-prefix coordination), **single-O_DIRECT-stream
-  contention** (concurrent O_DIRECT writers contend on NVMe — 1 stream 4.5 GB/s,
-  4 streams ~3.0 aggregate — so large-file writes likely stay one pipelined
-  stream while small-file writes fan out), **metadata/hardlink/`finish_deferred`
-  ordering**, and **security invariant preservation** (`openat`/`O_NOFOLLOW` per
-  worker). Extract is write-bound, so the realistic upside is bounded by the disk
-  and by how much the serial parse currently costs above the device rate —
-  prototype + measure on the Gen4+/high-core box before committing.
+  upfront dir-tree pass or per-prefix coordination), **write-stream contention**
+  (see below), **metadata/hardlink/`finish_deferred` ordering**, and **security
+  invariant preservation** (`openat`/`O_NOFOLLOW` per worker).
+
+  **Current-hardware caveat (measured, NOT a reason to drop this):** on a Gen5
+  NVMe server the array is the wall, not the software — a *single* O_DIRECT write
+  stream already reaches the device ceiling (`dd` probe: 1 stream 3.0 GiB/s, 4
+  concurrent streams 3.6 GiB/s aggregate ≈ no scaling), and `-d --tar` extract of
+  a 130 GiB / large-file archive already runs at ~3.0 GiB/s wall vs a ~3.5 GiB/s
+  single-stream write rate. So on *today's* drives the parallel-dispatch win is
+  bounded to the ~15% the serial parse/pipeline loses below the device rate — most
+  of which the cheap single-writer pipelining cleanup (persistent writer + deeper
+  buffer queue, v0.14.22/23) already reclaims, no parallel dispatch needed.
+  **The design stays on the roadmap deliberately**: it is correct and future-
+  proofs gzstd for arrays whose write fabric *does* scale with concurrent streams
+  (multi-controller / CXL / next-gen NVMe), where parallel writers become the
+  dominant lever. Re-probe concurrent-O_DIRECT scaling on new hardware; build when
+  a target array shows >1.5× aggregate from N streams.
 
 - **GNU sparse files** — *Priority: Medium | Complexity: Medium.* Members are
   currently archived at full logical size (correct, just larger for holey files).

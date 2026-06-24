@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.21";
+static constexpr const char * GZSTD_VERSION = "0.14.23";
 //
 // Architecture overview:
 //
@@ -7719,7 +7719,15 @@ public:
   Extractor(int dest_fd, const Options & opt, Meter * m, bool validate_only = false)
     : dest_fd_(dest_fd), opt_(opt), m_(m), as_root_(::geteuid() == 0),
       validate_only_(validate_only) {}
-  ~Extractor() { for (void * b : dbufs_) ::free(b); }
+  ~Extractor() {
+    // Defensive: stop_pool() normally joins the writer; ensure it's down before
+    // freeing the buffers it writes from (e.g. an early-return/exception path).
+    if (ld_writer_.joinable()) {
+      { std::lock_guard<std::mutex> lk(ld_mx_); ld_done_ = true; } ld_jobcv_.notify_one();
+      ld_writer_.join();
+    }
+    for (void * b : dbufs_) ::free(b);
+  }
 
   bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
   uint64_t validated_files() const { return vfiles_; }
@@ -7757,7 +7765,8 @@ private:
     char sz[48]; human_bytes(double(bytes), sz, sizeof(sz));
     char buf[320];
     std::snprintf(buf, sizeof(buf),
-      "[UNTAR-LARGE] %llu file(s), %s via O_DIRECT | parse: fill=%.0fms scan=%.0fms "
+      "[UNTAR-LARGE] %llu large file(s) >4 MiB, %s via O_DIRECT (small files + dirs go to "
+      "the writer pool, not counted here) | parse: fill=%.0fms scan=%.0fms "
       "bufwait=%.0fms (write-bound) | writer: write=%.0fms jobwait=%.0fms (parse-bound)\n",
       (unsigned long long)files, sz,
       ms(ld_fill_ns_.load()), ms(ld_scan_ns_.load()), ms(ld_bufwait_ns_.load()),
@@ -7780,13 +7789,36 @@ private:
   std::atomic<uint64_t> ld_fill_ns_{0}, ld_scan_ns_{0}, ld_bufwait_ns_{0};
   std::atomic<uint64_t> ld_write_ns_{0}, ld_jobwait_ns_{0};
   std::atomic<uint64_t> ld_bytes_{0}, ld_files_{0};
-  // O_DIRECT large-file writer: a small pool of reused 4 KiB-aligned buffers.
-  // The parse thread fills one (pipe read + zero-detect) while a dedicated writer
-  // thread O_DIRECTs another — pipelining the read and the write on a single
-  // stream (concurrent O_DIRECT streams contend, so we keep exactly one writer).
-  static constexpr size_t DBUF_CAP = 8 * 1024 * 1024;
-  static constexpr int    NDBUF    = 3;
+  // O_DIRECT large-file writer: a pool of reused 4 KiB-aligned buffers.  The
+  // parse thread fills one (sink read + zero-detect) while a dedicated writer
+  // thread O_DIRECTs another — pipelining read and write on a single stream
+  // (concurrent O_DIRECT streams contend, so we keep exactly one writer).
+  // Buffers: 16 MiB transfers (larger O_DIRECT writes sit closer to the device's
+  // single-stream ceiling than 8 MiB) and a deeper queue (6, was 3) so the
+  // writer doesn't starve when the parse thread briefly stalls.  96 MiB peak.
+  static constexpr size_t DBUF_CAP = 16 * 1024 * 1024;
+  static constexpr int    NDBUF    = 6;
   void * dbufs_[NDBUF] = {};
+
+  // The writer is PERSISTENT across all large files (not spawned/joined per
+  // file): at a file boundary the parse thread enqueues a FINALIZE job and moves
+  // straight to the next entry, so the prior file's tail writes overlap the next
+  // file's parse/read instead of stalling the parse thread on a per-file join.
+  // The parse thread is the sole sink reader; the writer only touches dbufs_/fds.
+  struct DJob {
+    enum Kind { WRITE, FINALIZE } kind = WRITE;
+    int fd = -1, bi = -1;
+    std::vector<std::tuple<size_t, uint64_t, size_t>> runs;  // (buf_off, file_off, len)
+    size_t tail_off = 0, tail_len = 0; uint64_t tail_fpos = 0;
+    uint64_t final_size = 0;                                  // FINALIZE: ftruncate target
+    uint32_t mode = 0; int64_t mtime = 0; uint64_t uid = 0, gid = 0; ExtMeta ext;
+    std::string rel;
+  };
+  std::mutex ld_mx_; std::condition_variable ld_jobcv_, ld_freecv_;
+  std::deque<DJob> ld_jobs_; std::deque<int> ld_freeq_;
+  bool ld_done_ = false, ld_started_ = false, ld_nobuf_ = false;
+  std::atomic<bool> ld_werr_{false};
+  std::thread ld_writer_;
 
   // Deferred work applied after all data is written.
   struct Hard { std::string name, target; };
@@ -7949,6 +7981,7 @@ private:
     { std::lock_guard<std::mutex> lk(q_m_); q_done_ = true; } q_cv_cons_.notify_all();
     for (auto & t : writers_) t.join();
     writers_.clear();
+    ld_stop_writer();   // drain + join the persistent large-file writer too
   }
   void enqueue(Job && j) {
     std::unique_lock<std::mutex> lk(q_m_);
@@ -8375,105 +8408,138 @@ private:
     ::close(fd);
   }
 
-  // O_DIRECT large-file extract (Gen4+ --direct): bypass the page cache so the
-  // decompressor isn't throttled by buffered writeback.  Sparse-aware: all-zero
-  // 4 KiB blocks are skipped as holes when sparse is on; runs of non-zero blocks
-  // are coalesced into one aligned O_DIRECT write.  The final sub-block tail is
-  // written with O_DIRECT cleared (it can't do unaligned), then ftruncate sets
-  // the exact size.  Falls back to the buffered stream_large if O_DIRECT is
-  // rejected (open failure, or a filesystem like tmpfs that lacks it).
-  // One O_DIRECT write job: which aligned runs of buffer `bi` to write where, plus
-  // the file's final sub-block tail (last job only).
-  struct DJob {
-    int bi;
-    std::vector<std::tuple<size_t, uint64_t, size_t>> runs;  // (buf_off, file_off, len)
-    size_t tail_off = 0, tail_len = 0; uint64_t tail_fpos = 0;
-  };
-
-  void stream_large_direct(StreamReader & r, const std::string & rel, const InEntry & e) {
-    int fd = create_file(rel, e.mode, /*o_direct=*/true);
-    if (fd < 0) { stream_large(r, rel, e); return; }
+  // Lazily allocate the aligned buffer pool and spawn the persistent writer on
+  // the first large file.  Returns false if no aligned buffer could be had (the
+  // caller then falls back to the buffered stream_large path for that file).
+  bool ld_ensure_writer() {
+    if (ld_started_) return !ld_nobuf_;
+    ld_started_ = true;
     static constexpr size_t AL = 4096;
     for (int i = 0; i < NDBUF; ++i)
       if (!dbufs_[i] && posix_memalign(&dbufs_[i], AL, DBUF_CAP) != 0) dbufs_[i] = nullptr;
-    if (!dbufs_[0]) { ::close(fd); stream_large(r, rel, e); return; }  // create_file unlinks+recreates
-    int nbuf = 0; while (nbuf < NDBUF && dbufs_[nbuf]) ++nbuf;  // however many we got
+    int nbuf = 0; while (nbuf < NDBUF && dbufs_[nbuf]) ++nbuf;  // leading run we got
+    if (nbuf == 0) { ld_nobuf_ = true; return false; }
+    for (int i = 0; i < nbuf; ++i) ld_freeq_.push_back(i);
+    ld_writer_ = std::thread([this] { ld_writer_loop(); });
+    return true;
+  }
 
+  // Persistent writer thread: drains DJobs FIFO.  WRITE → O_DIRECT the aligned
+  // runs of dbufs_[bi] to its fd (+ the unaligned tail with O_DIRECT cleared),
+  // return the buffer.  FINALIZE → ftruncate to the exact size, set metadata,
+  // close the fd.  FIFO ordering guarantees a file's WRITE jobs all complete
+  // before its FINALIZE, and that earlier files finish before later ones.
+  void ld_writer_loop() {
+    auto pwrite_at = [](int fd, const char * p, size_t len, uint64_t at) {
+      size_t d = 0;
+      while (d < len) {
+        ssize_t w = ::pwrite(fd, p + d, len - d, (off_t)(at + d));
+        if (w < 0) { if (errno == EINTR) continue; return false; }
+        d += (size_t)w;
+      }
+      return true;
+    };
+    for (;;) {
+      DJob j;
+      { std::unique_lock<std::mutex> lk(ld_mx_);
+        if (ld_jobs_.empty() && !ld_done_) {
+          uint64_t t0 = now_ns();
+          ld_jobcv_.wait(lk, [&] { return !ld_jobs_.empty() || ld_done_; });
+          ld_jobwait_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);  // PARSE-bound
+        }
+        if (ld_jobs_.empty()) return;          // done and drained
+        j = std::move(ld_jobs_.front()); ld_jobs_.pop_front(); }
+
+      if (j.kind == DJob::FINALIZE) {
+        // ftruncate fixes the exact size (materializes trailing holes / a tail
+        // that a write error left short), then metadata, then close.
+        if (::ftruncate(j.fd, (off_t)j.final_size) != 0 && !ld_werr_.load()) {
+          fail(j.rel, "ftruncate failed"); ld_werr_.store(true);
+        }
+        set_meta_fd(j.fd, j.mode, j.mtime, j.uid, j.gid);
+        apply_ext(j.fd, /*is_dir=*/false, j.ext);
+        ::close(j.fd);
+        continue;
+      }
+
+      const char * buf = static_cast<const char *>(dbufs_[j.bi]);
+      bool ok = true;
+      uint64_t wt0 = now_ns();
+      for (auto & run : j.runs)
+        if (!pwrite_at(j.fd, buf + std::get<0>(run), std::get<2>(run), std::get<1>(run))) { ok = false; break; }
+      ld_write_ns_.fetch_add(now_ns() - wt0, std::memory_order_relaxed);
+      if (ok && j.tail_len) {  // final sub-block tail: O_DIRECT can't do unaligned
+#ifdef O_DIRECT
+        int fl = ::fcntl(j.fd, F_GETFL); if (fl >= 0) ::fcntl(j.fd, F_SETFL, fl & ~O_DIRECT);
+#endif
+        if (!pwrite_at(j.fd, buf + j.tail_off, j.tail_len, j.tail_fpos)) ok = false;
+      }
+      { std::lock_guard<std::mutex> lk(ld_mx_); ld_freeq_.push_back(j.bi); }
+      ld_freecv_.notify_one();
+      // Don't return on error — keep draining so pending FINALIZE jobs still
+      // close their fds (no leak); ftruncate is skipped once werr is set.
+      if (!ok && !ld_werr_.load()) { fail(j.rel, "write failed"); ld_werr_.store(true); }
+    }
+  }
+
+  // Join the persistent writer after the parse thread has enqueued every file's
+  // jobs (called from stop_pool()).  Propagates a write error to had_error_.
+  void ld_stop_writer() {
+    if (!ld_started_ || ld_nobuf_) return;
+    { std::lock_guard<std::mutex> lk(ld_mx_); ld_done_ = true; } ld_jobcv_.notify_one();
+    if (ld_writer_.joinable()) ld_writer_.join();
+    if (ld_werr_.load()) had_error_.store(true, std::memory_order_relaxed);
+  }
+
+  // O_DIRECT large-file extract (Gen4+ --direct): bypass the page cache so the
+  // decompressor isn't throttled by buffered writeback.  Sparse-aware: all-zero
+  // 4 KiB blocks are skipped as holes when sparse is on; runs of non-zero blocks
+  // are coalesced into one aligned O_DIRECT write.  Data is handed to the
+  // PERSISTENT writer (above) so the writes of this file overlap parsing of the
+  // next; the parse thread is the sole sink reader and never blocks on a join.
+  // Falls back to the buffered stream_large if O_DIRECT or the buffer pool is
+  // unavailable (open failure, or a filesystem like tmpfs that lacks O_DIRECT).
+  void stream_large_direct(StreamReader & r, const std::string & rel, const InEntry & e) {
+    if (ld_werr_.load()) { r.skip(e.size); return; }   // a prior write failed: drain, skip
+    int fd = create_file(rel, e.mode, /*o_direct=*/true);
+    if (fd < 0) { stream_large(r, rel, e); return; }
+    if (!ld_ensure_writer()) { ::close(fd); stream_large(r, rel, e); return; }
+    static constexpr size_t AL = 4096;
     const bool sp = (opt_.sparse_mode != 0);
     auto blk_zero = [](const char * p) {
       const uint64_t * w = reinterpret_cast<const uint64_t *>(p);  // word-wise scan
       for (size_t i = 0; i < AL / sizeof(uint64_t); ++i) if (w[i]) return false;
       return true;
     };
-    // ---- writer thread: drains DJobs, O_DIRECTs the runs, returns buffers ----
-    std::mutex mx; std::condition_variable job_cv, free_cv;
-    std::deque<DJob> jobs; std::deque<int> freeq;
-    for (int i = 0; i < nbuf; ++i) freeq.push_back(i);
-    bool done = false; std::atomic<bool> werr{false};
-    std::thread wr([&] {
-      auto pwrite_at = [&](const char * p, size_t len, uint64_t at) {
-        size_t d = 0;
-        while (d < len) {
-          ssize_t w = ::pwrite(fd, p + d, len - d, (off_t)(at + d));
-          if (w < 0) { if (errno == EINTR) continue; return false; }
-          d += (size_t)w;
-        }
-        return true;
-      };
-      for (;;) {
-        DJob j;
-        { std::unique_lock<std::mutex> lk(mx);
-          if (jobs.empty() && !done) {
-            uint64_t t0 = now_ns();
-            job_cv.wait(lk, [&] { return !jobs.empty() || done; });
-            ld_jobwait_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);
-          }
-          if (jobs.empty()) return;
-          j = std::move(jobs.front()); jobs.pop_front(); }
-        const char * buf = static_cast<const char *>(dbufs_[j.bi]);
-        bool ok = true;
-        uint64_t wt0 = now_ns();
-        for (auto & run : j.runs)
-          if (!pwrite_at(buf + std::get<0>(run), std::get<2>(run), std::get<1>(run))) { ok = false; break; }
-        ld_write_ns_.fetch_add(now_ns() - wt0, std::memory_order_relaxed);
-        if (ok && j.tail_len) {  // final sub-block tail: O_DIRECT can't do unaligned
-#ifdef O_DIRECT
-          int fl = ::fcntl(fd, F_GETFL); if (fl >= 0) ::fcntl(fd, F_SETFL, fl & ~O_DIRECT);
-#endif
-          if (!pwrite_at(buf + j.tail_off, j.tail_len, j.tail_fpos)) ok = false;
-        }
-        { std::lock_guard<std::mutex> lk(mx); freeq.push_back(j.bi); }
-        free_cv.notify_one();
-        if (!ok) { werr.store(true); return; }
-      }
-    });
-    // ---- parse thread: fill a buffer, build its write plan, hand it off ----
-    uint64_t left = e.size, fpos = 0; bool ok = true;
     ld_files_.fetch_add(1, std::memory_order_relaxed);
     ld_bytes_.fetch_add(e.size, std::memory_order_relaxed);
-    while (left && ok && !werr.load()) {
+    uint64_t left = e.size, fpos = 0; bool ok = true;
+    while (left && ok) {
+      // A write failed on another file: stop writing, but keep the sink aligned
+      // by consuming this file's remaining bytes, so later entries parse cleanly.
+      if (ld_werr_.load()) { r.skip(left); left = 0; ok = false; break; }
       int bi;
-      { std::unique_lock<std::mutex> lk(mx);
-        if (freeq.empty() && !werr.load()) {
+      { std::unique_lock<std::mutex> lk(ld_mx_);
+        if (ld_freeq_.empty() && !ld_werr_.load()) {
           uint64_t t0 = now_ns();
-          free_cv.wait(lk, [&] { return !freeq.empty() || werr.load(); });
+          ld_freecv_.wait(lk, [&] { return !ld_freeq_.empty() || ld_werr_.load(); });
           ld_bufwait_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);  // WRITE-bound
         }
-        if (werr.load()) { ok = false; break; }
-        bi = freeq.front(); freeq.pop_front(); }
+        if (ld_werr_.load()) continue;         // re-check at loop top (drains via skip)
+        bi = ld_freeq_.front(); ld_freeq_.pop_front(); }
       char * buf = static_cast<char *>(dbufs_[bi]);
       size_t fill = 0;
       uint64_t ft0 = now_ns();
       while (fill < DBUF_CAP && left) {
         size_t got = r.read_some(buf + fill, (size_t)std::min<uint64_t>(DBUF_CAP - fill, left));
-        if (!got) { ok = false; break; }
+        if (!got) { ok = false; break; }       // sink truncated
         fill += got; left -= got;
         if (m_) m_->wrote_bytes.fetch_add(got, std::memory_order_relaxed);
       }
       ld_fill_ns_.fetch_add(now_ns() - ft0, std::memory_order_relaxed);  // sink read + memcpy
       uint64_t st0 = now_ns();
       size_t aligned = (fill / AL) * AL, off = 0;
-      DJob j; j.bi = bi;
+      DJob j; j.kind = DJob::WRITE; j.fd = fd; j.bi = bi; j.rel = rel;
       while (off < aligned) {
         if (sp && blk_zero(buf + off)) { fpos += AL; off += AL; continue; }  // hole
         size_t run = off;
@@ -8483,17 +8549,16 @@ private:
       j.tail_off = aligned; j.tail_len = fill - aligned; j.tail_fpos = fpos;
       fpos += j.tail_len;
       ld_scan_ns_.fetch_add(now_ns() - st0, std::memory_order_relaxed);  // zero-scan + plan
-      { std::lock_guard<std::mutex> lk(mx); jobs.push_back(std::move(j)); }
-      job_cv.notify_one();
+      { std::lock_guard<std::mutex> lk(ld_mx_); ld_jobs_.push_back(std::move(j)); }
+      ld_jobcv_.notify_one();
     }
-    { std::lock_guard<std::mutex> lk(mx); done = true; }
-    job_cv.notify_one();
-    wr.join();
-    if (!ok || werr.load()) fail(rel, "write failed");
-    else if (::ftruncate(fd, (off_t)e.size) != 0) fail(rel, "ftruncate failed");
-    set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
-    apply_ext(fd, /*is_dir=*/false, e.ext);
-    ::close(fd);
+    if (!ok && !ld_werr_.load()) { fail(rel, "write failed"); ld_werr_.store(true); }
+    // FINALIZE (ftruncate to e.size + metadata + close) runs on the writer after
+    // this file's WRITE jobs drain — the parse thread does NOT wait for it.
+    DJob f; f.kind = DJob::FINALIZE; f.fd = fd; f.final_size = e.size;
+    f.mode = e.mode; f.mtime = e.mtime; f.uid = e.uid; f.gid = e.gid; f.ext = e.ext; f.rel = rel;
+    { std::lock_guard<std::mutex> lk(ld_mx_); ld_jobs_.push_back(std::move(f)); }
+    ld_jobcv_.notify_one();
   }
 
   void finish_deferred() {

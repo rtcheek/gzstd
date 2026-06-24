@@ -1,11 +1,52 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.21  
+**Covers:** v0.9.50 → v0.14.23  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.23 — persistent cross-file O_DIRECT writer for -d --tar extract
+
+The large-file extract writer (`stream_large_direct`) was spawned **and joined
+per file**: at every large-file boundary the parse thread blocked until that
+file's tail writes drained before it could even read the next entry's header.
+That per-file join is a structural bubble independent of hardware, and it scales
+badly with file count (an archive of thousands of medium-large members pays it
+thousands of times).
+
+The writer is now **persistent across all large files**.  At a file boundary the
+parse thread enqueues a `FINALIZE` job (ftruncate to the exact size + metadata +
+close, performed on the writer) and moves straight to the next entry, so a file's
+tail writes overlap the next file's parse/read.  The parse thread remains the
+sole sink reader; FIFO job ordering guarantees each file's `WRITE` jobs all
+complete before its `FINALIZE`, and that earlier files finish before later ones.
+The single O_DIRECT write stream is unchanged (concurrent streams contend — see
+ROADMAP); this removes the *pipeline* bubble, not the device ceiling, so the gain
+shows wherever writes aren't the sole wall (slower disks, faster future arrays,
+many-medium-file archives).
+
+Reliability: fd lifecycle is single-owner (parse opens, `FINALIZE` closes — no
+double-close; fallbacks close their own fd); on a write error the writer keeps
+draining so pending `FINALIZE`s still close their fds (no leak), and the parse
+thread drains the current file's remaining stream bytes so later entries stay
+aligned; the writer is joined in `stop_pool` before `finish_deferred`
+(hardlinks/dir metadata), with a defensive join in the destructor.  Verified
+byte-identical across many large files (cross-file pipelining), mixed
+small/dir/symlink/holey content, multi-frame, and foreign `tar|zstd` archives;
+full suite 251/251.
+
+## v0.14.22 — extract writer buffer tuning + accurate large-file counter label
+
+- **Bigger / deeper O_DIRECT write-ahead buffers** for large-file extract:
+  `DBUF_CAP` 8→16 MiB (larger transfers sit closer to the device's single-stream
+  ceiling) and `NDBUF` 3→6 (a deeper queue so the writer doesn't starve when the
+  parse thread briefly stalls — measured `jobwait` was several seconds of the
+  wall under CPU contention).  96 MiB peak, one large file extracts at a time.
+- **`[UNTAR-LARGE]` label fix:** it counts only files that took the large-file
+  path (`>4 MiB`), so it now reads "N large file(s) >4 MiB … (small files + dirs
+  go to the writer pool, not counted here)" instead of looking like a total.
 
 ## v0.14.21 — -t --tar line colors, smoother extract progress, extract bottleneck counters
 
