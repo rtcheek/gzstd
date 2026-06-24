@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.24";
+static constexpr const char * GZSTD_VERSION = "0.14.25";
 //
 // Architecture overview:
 //
@@ -4289,7 +4289,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
             die_io("direct write failed (disk full?)");
         } else
 #endif
-        {
+        if (out) {   // out is null only in sink mode (handled above); guard silences -Wnonnull
           size_t w = robust_fwrite(outbuf.data(), zout.pos, out);
           if (w != zout.pos) die_io("short write to output (broken pipe?)");
         }
@@ -4354,7 +4354,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
               die_io("direct write failed (disk full?)");
           } else
 #endif
-          {
+          if (out) {   // out is null only in sink mode (handled above); guard silences -Wnonnull
             size_t w = robust_fwrite(outbuf.data(), zout.pos, out);
             if (w != zout.pos) die_io("short write to output (broken pipe?)");
           }

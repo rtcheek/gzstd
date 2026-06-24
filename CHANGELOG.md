@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.24  
+**Covers:** v0.9.50 → v0.14.25  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.25 — silence a -Wnonnull false positive in the sink-mode decompress helpers
+
+`decompress_from_buffer` / `decompress_stream_from_file` take `out` and, since
+v0.14.19/20, are also called with `out=nullptr` when routing to the in-memory tar
+sink (verify/extract/list).  GCC inlined the `out=nullptr` constant and flagged
+the `robust_fwrite(..., out)` path as a possible `fwrite(NULL)` — but that path is
+unreachable whenever `out` is null (the `g_tar_decomp_sink` branch handles output
+first).  Guarded the `fwrite` with `if (out)` to make that explicit; behavior is
+unchanged (out is always valid on that path at runtime).  Build is warning-clean.
 
 ## v0.14.24 — `-l` / `--list`: zstd-style frame info, and `-l --tar` archive contents
 
