@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.30";
+static constexpr const char * GZSTD_VERSION = "0.14.31";
 //
 // Architecture overview:
 //
@@ -1998,7 +1998,6 @@ static std::atomic<bool>     g_odirect_used{false};
 class DirectWriter {
 public:
   static constexpr size_t ALIGN = 4096;          // filesystem block alignment
-  static constexpr size_t FLUSH_SIZE = 4 * 1024 * 1024;  // flush every 4 MiB
 
   DirectWriter() = default;
   ~DirectWriter() { close(); }
@@ -2008,80 +2007,78 @@ public:
   bool open(const std::string & path) {
     fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0666);
     if (fd_ < 0) return false;
-    // Allocate aligned buffer
-    if (posix_memalign(&buf_, ALIGN, BUF_CAP) != 0) {
-      ::close(fd_);
-      fd_ = -1;
-      return false;
+    // Allocate the aligned buffer pool.
+    for (int i = 0; i < NBUF; ++i) {
+      if (posix_memalign(&bufs_[i], ALIGN, BUF_CAP) != 0) {
+        for (int j = 0; j < i; ++j) { ::free(bufs_[j]); bufs_[j] = nullptr; }
+        ::close(fd_); fd_ = -1; return false;
+      }
     }
-    buf_used_ = 0;
-    total_written_ = 0;
+    buf_used_ = 0; cur_bi_ = 0;
+    logical_written_ = 0; phys_written_ = 0;
+    werr_.store(false, std::memory_order_relaxed); wt_done_ = false;
+    free_.clear(); for (int i = 1; i < NBUF; ++i) free_.push_back(i);  // 0 is the first fill buffer
+    ops_.clear();
     g_odirect_write_ns.store(0, std::memory_order_relaxed);  // -v: per-output write-time
     g_odirect_used.store(true, std::memory_order_relaxed);
+    wt_ = std::thread(&DirectWriter::writer_loop, this);
     return true;
   }
 
-  // Write data  accumulates in aligned buffer, flushes in aligned chunks
+  // Bounce-copy into the current aligned buffer; when it fills (BUF_CAP, a
+  // multiple of ALIGN), hand it to the write thread and take a free one.  Only
+  // full buffers flush mid-stream, so there is no unaligned tail except at
+  // finalize.  The copy runs here (caller thread); the ::write runs async.
   bool write(const void * data, size_t len) {
-    if (fd_ < 0) return false;
+    if (fd_ < 0 || werr_.load(std::memory_order_relaxed)) return false;
     const char * src = static_cast<const char *>(data);
     while (len > 0) {
       size_t space = BUF_CAP - buf_used_;
       size_t copy = std::min(len, space);
-      std::memcpy(static_cast<char*>(buf_) + buf_used_, src, copy);
-      buf_used_ += copy;
-      src += copy;
-      len -= copy;
-      if (buf_used_ >= FLUSH_SIZE) {
-        if (!flush_aligned()) return false;
+      std::memcpy(static_cast<char*>(bufs_[cur_bi_]) + buf_used_, src, copy);
+      buf_used_ += copy; src += copy; len -= copy;
+      if (buf_used_ == BUF_CAP) {                 // full → hand off
+        enqueue({OP_WRITE, cur_bi_, BUF_CAP, 0});
+        logical_written_ += BUF_CAP;
+        cur_bi_ = acquire_free();
+        if (cur_bi_ < 0) return false;            // write error surfaced
+        buf_used_ = 0;
       }
     }
-    return true;
+    return !werr_.load(std::memory_order_relaxed);
   }
 
-  // Finalize  flush remaining data (may need non-aligned final write)
+  // Finalize: enqueue the last partial buffer (aligned body O_DIRECT + sub-ALIGN
+  // tail without O_DIRECT, handled in writer_loop), drain and join the write
+  // thread, then truncate off any preallocation slack.
   bool finalize() {
     if (fd_ < 0) return false;
-    if (buf_used_ == 0) return true;
-
-    size_t aligned = (buf_used_ / ALIGN) * ALIGN;
-    size_t tail = buf_used_ - aligned;
-
-    // Write aligned portion with O_DIRECT
-    if (aligned > 0) {
-      if (!write_all(buf_, aligned)) return false;
-      total_written_ += aligned;
+    if (!wt_.joinable()) return !werr_.load(std::memory_order_relaxed);  // never opened/already done
+    if (buf_used_ > 0) {
+      size_t tail = buf_used_ - (buf_used_ / ALIGN) * ALIGN;
+      enqueue({OP_WRITE, cur_bi_, buf_used_, tail});
+      logical_written_ += buf_used_;
+      buf_used_ = 0;
     }
-
-    // Write remaining tail without O_DIRECT
-    if (tail > 0) {
-      // Remove O_DIRECT flag for the final unaligned write
-      int flags = fcntl(fd_, F_GETFL);
-      if (flags >= 0) fcntl(fd_, F_SETFL, flags & ~O_DIRECT);
-      const char * tail_ptr = static_cast<char*>(buf_) + aligned;
-      if (!write_all(tail_ptr, tail)) return false;
-      total_written_ += tail;
-    }
-
-    buf_used_ = 0;
-
-    // If we preallocated, truncate to actual written size to avoid trailing
-    // garbage if the preallocated size was slightly larger than actual output.
-    if (preallocated_ > 0 && total_written_ < preallocated_) {
-      if (::ftruncate(fd_, (off_t)total_written_) != 0) { /* best-effort */ }
+    { std::lock_guard<std::mutex> lk(mx_); wt_done_ = true; }
+    cv_op_.notify_one();
+    wt_.join();
+    if (werr_.load(std::memory_order_relaxed)) return false;
+    if (preallocated_ > 0 && logical_written_ < preallocated_) {
+      if (::ftruncate(fd_, (off_t)logical_written_) != 0) { /* best-effort */ }
     }
     return true;
   }
 
   void close() {
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
+    // Join the write thread if finalize() didn't (e.g. an error/abort path).
+    if (wt_.joinable()) {
+      { std::lock_guard<std::mutex> lk(mx_); wt_done_ = true; }
+      cv_op_.notify_one();
+      wt_.join();
     }
-    if (buf_) {
-      free(buf_);
-      buf_ = nullptr;
-    }
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    for (int i = 0; i < NBUF; ++i) if (bufs_[i]) { ::free(bufs_[i]); bufs_[i] = nullptr; }
   }
 
   // Pre-allocate disk space to avoid per-write extent allocation overhead.
@@ -2098,48 +2095,30 @@ public:
     return false;
   }
 
-  size_t total_bytes() const { return total_written_ + buf_used_; }
+  // Logical output position (what's been enqueued + what's buffered).  Used by
+  // write_sparse to keep sparse seeks O_DIRECT-aligned, so it must reflect the
+  // caller's view, not the (lagging) physical write position.
+  size_t total_bytes() const { return (size_t)logical_written_ + buf_used_; }
   int fd() const { return fd_; }
   uint64_t preallocated() const { return preallocated_; }
 
-  // Seek forward by 'offset' bytes  for sparse file support.
-  // Flushes the internal buffer first to keep fd position and buffer in sync,
-  // then seeks the fd forward.  After this call, the next write() will
-  // resume at the new position.
+  // Seek forward by 'offset' bytes (sparse hole).  Flush the current buffer
+  // (ALIGN-aligned here — write_sparse only seeks at aligned positions, see its
+  // skip_ok guard), then enqueue an ordered SEEK so it lands after the buffered
+  // data on the write thread.  The hole-punch + lseek happen there.
   bool seek_forward(size_t offset) {
-    if (fd_ < 0) return false;
-    // Flush any buffered data first
+    if (fd_ < 0 || werr_.load(std::memory_order_relaxed)) return false;
     if (buf_used_ > 0) {
-      if (!flush_aligned()) return false;
-      // flush_aligned may leave a small unaligned tail in the buffer.
-      // For sparse seek we need the buffer fully empty so the fd position
-      // is authoritative.  Write any remaining tail without O_DIRECT.
-      if (buf_used_ > 0) {
-        int flags = fcntl(fd_, F_GETFL);
-        if (flags >= 0) fcntl(fd_, F_SETFL, flags & ~O_DIRECT);
-        if (!write_all(buf_, buf_used_)) return false;
-        if (flags >= 0) fcntl(fd_, F_SETFL, flags);  // restore O_DIRECT
-        total_written_ += buf_used_;
-        buf_used_ = 0;
-      }
+      size_t tail = buf_used_ - (buf_used_ / ALIGN) * ALIGN;  // normally 0 (aligned seek point)
+      enqueue({OP_WRITE, cur_bi_, buf_used_, tail});
+      logical_written_ += buf_used_;
+      cur_bi_ = acquire_free();
+      if (cur_bi_ < 0) return false;
+      buf_used_ = 0;
     }
-    // If the file was preallocated, fallocate already allocated the blocks
-    // we're about to skip, so a bare lseek would NOT leave a hole — defeating
-    // sparse output.  Punch the skipped region back to a hole so sparse and
-    // preallocate coexist.  Best-effort: filesystems without punch support just
-    // keep the blocks allocated (degrades to non-sparse, never incorrect).
-    // write_sparse coalesces consecutive zero blocks, so this is one punch per
-    // zero run, not one per 4 KiB.
-#ifdef __linux__
-    if (preallocated_ > 0 && offset > 0) {
-      (void)::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                        (off_t)total_written_, (off_t)offset);
-    }
-#endif
-    // Now seek the fd forward
-    if (lseek(fd_, (off_t)offset, SEEK_CUR) < 0) return false;
-    total_written_ += offset;
-    return true;
+    enqueue({OP_SEEK, -1, offset, 0});
+    logical_written_ += offset;
+    return !werr_.load(std::memory_order_relaxed);
   }
 
   // Direct pwrite  bypasses internal buffer.  For O_DIRECT, data and offset
@@ -2194,36 +2173,16 @@ private:
 private:
   static constexpr size_t BUF_CAP = 16 * 1024 * 1024;  // 16 MiB aligned buffer
 
-  bool flush_aligned() {
-    // Flush as much as possible in aligned chunks
-    size_t aligned = (buf_used_ / ALIGN) * ALIGN;
-    if (aligned == 0) return true;
-    if (!write_all(buf_, aligned)) return false;
-    total_written_ += aligned;
-    // Move leftover tail to front
-    size_t tail = buf_used_ - aligned;
-    if (tail > 0)
-      std::memmove(buf_, static_cast<char*>(buf_) + aligned, tail);
-    buf_used_ = tail;
-    return true;
-  }
-
-  bool write_all(const void * data, size_t len) {
+  // Bare ::write loop, run on the background write thread (each op is timed in
+  // writer_loop, so no timing here).
+  bool write_raw(const void * data, size_t len) {
     const char * p = static_cast<const char *>(data);
-    uint64_t t0 = now_ns();
     while (len > 0) {
       ssize_t w = ::write(fd_, p, len);
-      if (w > 0) {
-        p += w;
-        len -= (size_t)w;
-      } else if (w < 0) {
-        if (errno == EINTR) continue;
-        return false;
-      } else {
-        return false;  // write() == 0 with len > 0: no progress possible
-      }
+      if (w > 0) { p += w; len -= (size_t)w; }
+      else if (w < 0) { if (errno == EINTR) continue; return false; }
+      else return false;  // write() == 0 with len > 0: no progress possible
     }
-    g_odirect_write_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     return true;
   }
 
@@ -2245,11 +2204,76 @@ private:
     return true;
   }
 
+  // --- async write pipeline ---
+  // The caller thread fills aligned buffers (bounce-copy + sparse zero-scan) and
+  // a dedicated write thread ::writes them, so that CPU work overlaps the
+  // O_DIRECT write instead of serializing on one thread (the win that brought
+  // -d --tar extract to the device ceiling; this brings plain -d there too).
+  static constexpr int NBUF = 4;            // 4 × 16 MiB = 64 MiB in flight
   int fd_ = -1;
-  void * buf_ = nullptr;
-  size_t buf_used_ = 0;
-  size_t total_written_ = 0;
+  void * bufs_[NBUF] = {};
+  int    cur_bi_ = -1;             // buffer the caller is currently filling
+  size_t buf_used_ = 0;            // bytes in the current buffer
+  uint64_t logical_written_ = 0;   // caller-side logical position (enqueued writes + seeks)
+  uint64_t phys_written_ = 0;      // write-thread physical position (hole-punch offset)
   uint64_t preallocated_ = 0;
+  enum OpKind { OP_WRITE, OP_SEEK };
+  struct WOp { OpKind kind; int bi; size_t len; size_t tail; };
+  std::mutex mx_;
+  std::condition_variable cv_op_, cv_free_;
+  std::deque<WOp> ops_;            // ordered fd ops for the write thread
+  std::deque<int> free_;           // free buffer indices
+  bool wt_done_ = false;
+  std::atomic<bool> werr_{false};  // a write/seek failed on the write thread
+  std::thread wt_;
+
+  // Write thread: drains ops in order (writes + sparse seeks), keeping all fd
+  // position changes sequential; returns each written buffer to the free list.
+  void writer_loop() {
+    for (;;) {
+      WOp op;
+      { std::unique_lock<std::mutex> lk(mx_);
+        cv_op_.wait(lk, [&]{ return !ops_.empty() || wt_done_; });
+        if (ops_.empty()) return;            // done and drained
+        op = ops_.front(); ops_.pop_front(); }
+      if (op.kind == OP_SEEK) {
+#ifdef __linux__
+        if (preallocated_ > 0 && op.len > 0)  // punch the skipped region back to a hole
+          (void)::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                            (off_t)phys_written_, (off_t)op.len);
+#endif
+        if (::lseek(fd_, (off_t)op.len, SEEK_CUR) < 0) werr_.store(true, std::memory_order_relaxed);
+        phys_written_ += op.len;
+      } else {
+        char * b = static_cast<char*>(bufs_[op.bi]);
+        size_t body = op.len - op.tail;       // aligned body (O_DIRECT) + optional sub-ALIGN tail
+        uint64_t t0 = now_ns();
+        bool ok = (body == 0) || write_raw(b, body);
+        if (ok && op.tail > 0) {              // final unaligned tail: O_DIRECT can't do it
+          int fl = ::fcntl(fd_, F_GETFL); if (fl >= 0) ::fcntl(fd_, F_SETFL, fl & ~O_DIRECT);
+          ok = write_raw(b + body, op.tail);
+          if (fl >= 0) ::fcntl(fd_, F_SETFL, fl);
+        }
+        g_odirect_write_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+        phys_written_ += op.len;
+        if (!ok) werr_.store(true, std::memory_order_relaxed);
+        { std::lock_guard<std::mutex> lk(mx_); free_.push_back(op.bi); }
+        cv_free_.notify_one();
+      }
+    }
+  }
+  // Caller: take a free buffer to fill, blocking until the write thread frees
+  // one (backpressure).  Returns -1 on write error.
+  int acquire_free() {
+    std::unique_lock<std::mutex> lk(mx_);
+    cv_free_.wait(lk, [&]{ return !free_.empty() || werr_.load(std::memory_order_relaxed); });
+    if (werr_.load(std::memory_order_relaxed)) return -1;
+    int bi = free_.front(); free_.pop_front(); return bi;
+  }
+  void enqueue(WOp op) {
+    { std::lock_guard<std::mutex> lk(mx_); ops_.push_back(op); }
+    cv_op_.notify_one();
+  }
 };
 #endif // _WIN32
 

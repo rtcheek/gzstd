@@ -1,11 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.30  
+**Covers:** v0.9.50 → v0.14.31  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.31 — asynchronous DirectWriter: pipeline the O_DIRECT write off the copy/scan
+
+The v0.14.29/30 breakdown nailed it: on a cpu-only 130 GiB -d, the single
+AsyncWritePool thread split ~69.5% O_DIRECT ::write, ~15.1% bounce-copy (the
+memcpy into DirectWriter's aligned buffer), ~15.5% zero-scan — all SERIAL on one
+thread.  -d --tar extract hits the device ceiling because it does the copy+scan
+on its parse thread, overlapped with the pwrite on a separate writer thread.
+Plain -d did all three in series, so it trailed extract (~2.7 vs ~3.7 GiB/s).
+
+DirectWriter is now internally pipelined.  It keeps a small pool of aligned
+buffers (4 × 16 MiB) and a dedicated write thread that drains an ordered op queue
+(writes + sparse seeks), so the caller thread's bounce-copy and zero-scan overlap
+the O_DIRECT ::write instead of serializing.  The public API is unchanged
+(write/seek_forward/finalize/total_bytes), so both compress and decompress get
+it.  Mechanics: only full 16 MiB buffers flush mid-stream (no unaligned tail
+except at finalize); sparse seeks flush the current buffer then enqueue an
+ordered SEEK (hole-punch + lseek run on the write thread, after the buffered
+data); total_bytes() reports the caller's logical position (not the lagging
+physical one) so write_sparse's alignment guard still holds; finalize drains and
+joins the thread before truncating preallocation slack; write errors set a flag
+the caller checks.  Backpressure: the caller blocks for a free buffer when the
+write thread falls behind (bounded at 64 MiB in flight).
+
+Verified byte-identical with O_DIRECT actually engaged (random, holey/sparse with
+holes preserved, --no-sparse, compress, multi-file, tiny/empty); full suite green.
+Expected to bring plain -d to extract's write rate (~4 GiB/s) — server timing to
+confirm.
 
 ## v0.14.30 — fix the writer breakdown so the O_DIRECT ::write split actually reports
 
