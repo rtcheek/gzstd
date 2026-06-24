@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.32";
+static constexpr const char * GZSTD_VERSION = "0.14.33";
 //
 // Architecture overview:
 //
@@ -394,7 +394,10 @@ struct Options {
   bool direct_read = false;       // --direct-read: O_DIRECT input — bypass the page cache (no populate/evict)
   size_t read_threads = 0;        // --read-threads N: buffered pooled-reader threads (0 = auto: 3)
   size_t write_threads = 0;       // --write-threads N: -d --tar extractor writer pool (0 = auto: min(threads,16))
-  bool preallocate_output = true; // --preallocate / --no-preallocate: fallocate output upfront
+  bool preallocate_output = false; // --preallocate / --no-preallocate: fallocate output upfront
+                                   // (default off: fallocate'd unwritten extents make O_DIRECT
+                                   //  writes pay an extent-conversion per write — measured ~4-6%
+                                   //  slower on ext4/NVMe, both compress and decompress)
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -767,7 +770,7 @@ static void print_help()
 "  --[no-]mmap         zero-copy mmap reader for regular-file inputs\n"
 "                      (on; auto-fread for inputs >4 GiB on kernel <6.4)\n"
 "  --[no-]preallocate  fallocate output to expected size up front\n"
-"                      (default: on; --no-preallocate skips fallocate)\n"
+"                      (default: off; slower for O_DIRECT — see --preallocate)\n"
 "  --direct            O_DIRECT output (bypass page cache; auto-on for\n"
 "                      Gen4+ compress & decompress, --no-direct to force buffered)\n"
 "  --sync-output       fsync output before exit\n"
@@ -937,16 +940,16 @@ static void print_help_long()
 "     --direct-read (which bypasses the cache entirely), --cold evicts\n"
 "     any already-cached pages, so it disturbs other users of that data.\n"
 "\n"
-"  --preallocate / --no-preallocate    (default: on)\n"
+"  --preallocate / --no-preallocate    (default: off)\n"
 "     Preallocate the output file with `fallocate` to its expected\n"
-"     final size before writes begin.  Avoids per-write extent\n"
-"     allocation stalls (each fwrite that crosses an unallocated\n"
-"     extent triggers a journal commit on ext4).  Only used when\n"
-"     the expected size is known: O_DIRECT compress/decompress\n"
-"     paths where input file size or sum of frame_decomp sizes\n"
-"     gives an upper bound.  --no-preallocate skips it for\n"
-"     benchmarking, or for filesystems that handle extent\n"
-"     allocation efficiently inline (XFS, ZFS).\n"
+"     final size before writes begin.  Off by default: with O_DIRECT\n"
+"     output (the Gen4+ default), fallocate creates unwritten extents\n"
+"     and each O_DIRECT write then pays an unwritten-to-written extent\n"
+"     conversion — measured ~4-6%% slower on ext4/NVMe for both compress\n"
+"     and decompress.  --preallocate forces it on for filesystems or\n"
+"     workloads where reserving space up front helps (and for early\n"
+"     out-of-space detection).  Only ever applies to the O_DIRECT paths\n"
+"     where the expected size is known (input size / sum of frame sizes).\n"
 "\n"
 "============================================================\n"
 " ARCHIVE (tar)\n"
@@ -7868,12 +7871,12 @@ public:
   }
 
 private:
-  // -v breakdown of the single-parse-thread large-file write path.  bufwait
+  // -vv breakdown of the single-parse-thread large-file write path.  bufwait
   // dominant → WRITE-bound (writer can't keep up); fill dominant → the parse
   // thread's sink read + memcpy is the spine; scan dominant → zero-detect; the
   // writer's jobwait dominant → the parse thread can't feed it fast enough.
   void log_large_file_stats() {
-    if (opt_.verbosity < V_VERBOSE) return;
+    if (opt_.verbosity < V_DEBUG) return;
     uint64_t files = ld_files_.load(), bytes = ld_bytes_.load();
     if (files == 0) return;   // no large files in this archive
     auto ms = [](uint64_t ns) { return ns / 1000000.0; };
@@ -7886,7 +7889,7 @@ private:
       (unsigned long long)files, sz,
       ms(ld_fill_ns_.load()), ms(ld_scan_ns_.load()), ms(ld_bufwait_ns_.load()),
       ms(ld_write_ns_.load()), ms(ld_jobwait_ns_.load()));
-    vlog(V_VERBOSE, opt_, buf);
+    vlog(V_DEBUG, opt_, buf);
   }
 
   static constexpr uint64_t SMALL_FILE_MAX = 4 * 1024 * 1024;  // buffer+dispatch below this; stream above
@@ -12880,12 +12883,12 @@ static int extract_tar(const Options & opt, Meter * m)
     sink.close();          // signal EOF to the Extractor after all frames pushed
     exth.join();
     g_tar_decomp_sink = nullptr;
-    if (opt.verbosity >= V_VERBOSE) {
+    if (opt.verbosity >= V_DEBUG) {
       char b[200];
       std::snprintf(b, sizeof(b),
         "[SINK] producer waited %.0fms (extract-bound) | consumer waited %.0fms (decompress-bound)\n",
         sink.producer_wait_ns() / 1e6, sink.consumer_wait_ns() / 1e6);
-      vlog(V_VERBOSE, opt, b);
+      vlog(V_DEBUG, opt, b);
     }
     if (in && in != stdin) std::fclose(in);
     if (ex.had_error() && rc == EXIT_OK) rc = EXIT_ERROR;
@@ -12999,12 +13002,12 @@ static int verify_tar(const Options & opt, Meter * m)
     sink.close();          // idempotent: writer_thread also closes on normal exit
     exth.join();
     g_tar_decomp_sink = nullptr;
-    if (opt.verbosity >= V_VERBOSE) {
+    if (opt.verbosity >= V_DEBUG) {
       char b[200];
       std::snprintf(b, sizeof(b),
         "[SINK] producer waited %.0fms (verify-bound) | consumer waited %.0fms (decompress-bound)\n",
         sink.producer_wait_ns() / 1e6, sink.consumer_wait_ns() / 1e6);
-      vlog(V_VERBOSE, opt, b);
+      vlog(V_DEBUG, opt, b);
     }
     if (in && in != stdin) std::fclose(in);
 
@@ -13841,7 +13844,7 @@ int main(int argc, char ** argv)
       // saturated" when much of it is CPU scanning on the write thread.
       const uint64_t io_ns   = meter.writer_iowrite_ns.load();
       const uint64_t disk_ns = meter.writer_disk_ns.load();
-      if (disk_ns > 0 && io_ns <= disk_ns) {
+      if (opt.verbosity >= V_DEBUG && disk_ns > 0 && io_ns <= disk_ns) {  // -vv: deep write-time split
         // io_ns = time in dw_->write (bounce-copy into the aligned buffer + the
         // ::write syscall); the DirectWriter reports the ::write time alone, so
         // bounce-copy = io_ns - write_syscall.  Splits the write thread's busy
@@ -13865,7 +13868,7 @@ int main(int argc, char ** argv)
             "[WRITER]   of busy: buffered write %.1f%% | zero-scan %.1f%%\n",
             double(io_ns) / double(disk_ns) * 100.0, scan_pct);
         }
-        vlog(V_VERBOSE, opt, sline);
+        vlog(V_DEBUG, opt, sline);
       }
       vlog(V_VERBOSE, opt,
            std::string("[WRITER] verdict: ")

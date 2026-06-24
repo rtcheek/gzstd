@@ -1,11 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.32  
+**Covers:** v0.9.50 → v0.14.33  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.33 — default to no preallocation (fallocate hurts O_DIRECT)
+
+Output preallocation (`fallocate` to the expected size up front) is now OFF by
+default.  It was added back in v0.11.x for extent-stall-free dense writes and was
+very likely a genuine win then — the write path was synchronous and buffered, so
+reserving the extents avoided a per-`fwrite` allocation stall (journal commit on
+ext4) on every extent boundary.  Two things changed since: O_DIRECT became the
+Gen4+ default, and the write path was restructured into the async, pipelined
+DirectWriter.  In that world `fallocate` backfires — it creates *unwritten*
+extents, and each O_DIRECT write then pays an unwritten→written conversion that
+costs more than the allocation it was meant to avoid.  Measured ~4-6% slower with
+preallocation, on both compress and decompress, reproduced on two different
+machines (Gen5 and Gen3, both ext4/NVMe).  It's also why `-d --tar` extract
+(which never preallocated) was the faster path all along.
+
+`preallocate_output` defaults false; `--preallocate` opts back in (for
+filesystems/workloads where reserving space helps, or for early out-of-space
+detection).  Preallocation only ever applied to the O_DIRECT paths where the
+size is known, so this is purely an O_DIRECT-path change.  Bonus: with no
+preallocated blocks, the sparse path's seeks create holes naturally — the
+preallocate+punch-hole hybrid is no longer exercised by the default.
+
+Also moved the deep write-path diagnostics added while chasing this (the
+`[WRITER] of busy:` ::write/bounce-copy/zero-scan split, `[SINK]` producer/
+consumer waits, `[UNTAR-LARGE]` fill/scan/bufwait/write/jobwait) from `-v` to
+`-vv` — they're per-batch internals.  `-v` keeps the high-level regime lines
+(`[READER]` state, `[WRITER]` busy/verdict).
 
 ## v0.14.32 — offload the sparse zero-scan off the write path
 
