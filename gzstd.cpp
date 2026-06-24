@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.31";
+static constexpr const char * GZSTD_VERSION = "0.14.32";
 //
 // Architecture overview:
 //
@@ -3807,11 +3807,23 @@ public:
   // Takes ownership of the data via move.  Blocks if the previous
   // write hasn't finished yet (backpressure).
   void submit(std::vector<FrameBuf> && buffers) {
+    // Offload the per-frame zero scan to here (the writer thread) — done BEFORE
+    // the backpressure wait, so it overlaps the write worker draining the
+    // previous batch instead of running serially on the write path.  Only when
+    // sparse + O_DIRECT (the case where the worker would otherwise scan).
+    std::vector<char> dense;
+    if (sparse_ && dw_) {
+      dense.resize(buffers.size());
+      for (size_t i = 0; i < buffers.size(); ++i)
+        dense[i] = (buffers[i] && !buffers[i]->empty())
+                       ? (char)frame_dense(buffers[i]->data(), buffers[i]->size()) : (char)1;
+    }
     std::unique_lock<std::mutex> lk(m_);
     // Wait for previous write to finish (backpressure)
     cv_consumer_.wait(lk, [this]{ return pending_.empty() || done_; });
     if (done_) return;
     pending_ = std::move(buffers);
+    pending_dense_ = std::move(dense);
     lk.unlock();
     cv_producer_.notify_one();
   }
@@ -3847,6 +3859,35 @@ private:
     for (size_t i = words * sizeof(size_t); i < len; ++i)
       if (p[i] != 0) return false;
     return true;
+  }
+
+  // "Dense" = the frame has no all-zero 4 KiB block, so write_sparse would find
+  // nothing to skip and just write the whole thing.  Computed on the writer
+  // thread (in submit) so the per-block zero scan overlaps the write instead of
+  // running serially on the write thread.  Early-exits at the first zero block
+  // (so genuinely sparse frames cost little here and fall through to the full
+  // write_sparse).  SPARSE_BLOCK == 4096 (matches write_sparse).
+  static bool frame_dense(const char * p, size_t len) {
+    for (size_t off = 0; off + 4096 <= len; off += 4096)
+      if (is_all_zero(p + off, 4096)) return false;
+    return true;   // remainder (< 4096) is always written, never skipped
+  }
+
+  // Write a whole buffer with no zero-scan (dense frames, and the --no-sparse
+  // fast path share this).  Records the I/O time like write_sparse's writes.
+  bool write_whole(const char * data, size_t len) {
+    uint64_t t0 = now_ns();
+    bool ok = true;
+#ifndef _WIN32
+    if (dw_) ok = dw_->write(data, len);
+    else
+#endif
+    if (out_) ok = (robust_fwrite(data, len, out_) == len);
+    if (meter_) {
+      meter_->writer_iowrite_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+      if (ok) meter_->wrote_bytes.fetch_add(len, std::memory_order_relaxed);
+    }
+    return ok;
   }
 
   // Write a buffer with sparse file optimization.
@@ -3965,11 +4006,13 @@ private:
   void worker_fn() {
     while (true) {
       std::vector<FrameBuf> work;
+      std::vector<char> work_dense;
       {
         std::unique_lock<std::mutex> lk(m_);
         cv_producer_.wait(lk, [this]{ return !pending_.empty() || done_; });
         if (done_ && pending_.empty()) return;
         work = std::move(pending_);
+        work_dense = std::move(pending_dense_);
         writing_ = true;  // mark busy: flush() must wait until this batch is written, not just moved
       }
       cv_consumer_.notify_one();  // pending_ now empty: unblock submit() backpressure
@@ -3979,7 +4022,12 @@ private:
         auto & buf = work[bi];   // FrameBuf (shared_ptr<vector<char>>)
         uint64_t w_t0 = (g_perf || meter_) ? now_ns() : 0;
         bool is_last = (bi == work.size() - 1);
-        if (!write_sparse(buf->data(), buf->size(), is_last)) {
+        // Dense frames (no zero blocks; scanned in submit) write whole with no
+        // scan here; only frames with actual holes run the full write_sparse.
+        bool dense = (bi < work_dense.size()) && work_dense[bi];
+        bool wrote = dense ? write_whole(buf->data(), buf->size())
+                           : write_sparse(buf->data(), buf->size(), is_last);
+        if (!wrote) {
           // Clear writing_ and surface the error before returning, so a
           // flush() blocked on !writing_ wakes and the post-flush had_error()
           // check sees the failure (final-batch errors used to be lost here).
@@ -4048,6 +4096,7 @@ private:
   std::condition_variable cv_producer_;
   std::condition_variable cv_consumer_;
   std::vector<FrameBuf> pending_;
+  std::vector<char>     pending_dense_;  // per-frame: 1 = no zero blocks → write whole, skip the scan
   std::thread worker_;
   bool done_;
   bool writing_ = false;  // true while the worker is physically writing a batch (guarded by m_)

@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.31  
+**Covers:** v0.9.50 → v0.14.32  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.32 — offload the sparse zero-scan off the write path
+
+After v0.14.31 the writer breakdown still showed ~15-19% of the write thread's
+busy time in the per-block zero-scan (is_all_zero), serial ahead of the
+O_DIRECT write — the last gap to extract parity.  Moved that scan upstream into
+AsyncWritePool::submit(), which runs on the writer thread (it has slack — it
+just hands batches to the write worker), BEFORE the backpressure wait, so it
+overlaps the worker draining the previous batch.
+
+submit() now computes a per-frame "dense" flag (frame_dense: true when the frame
+has no all-zero 4 KiB block).  The write worker writes dense frames whole with no
+scan; only frames that actually contain a hole run the full write_sparse.  This
+is behavior-identical (a dense frame is exactly one write_sparse would emit as a
+single run) — it just relocates the scan off the write-critical-path.  Gated to
+sparse + O_DIRECT; buffered/--no-sparse/compress paths unchanged.  Genuinely
+sparse frames early-exit the dense check cheaply and take the existing path.
+
+Verified byte-identical with O_DIRECT engaged: dense/incompressible (zero-scan
+now 0% on the write worker, confirmed via -v), holey/sparse (holes preserved),
+--no-sparse, compress.  Full suite green.  Closes the remaining gap so plain -d
+matches -d --tar extract's write rate.
 
 ## v0.14.31 — asynchronous DirectWriter: pipeline the O_DIRECT write off the copy/scan
 
