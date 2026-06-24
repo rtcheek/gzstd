@@ -1,11 +1,24 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.27  
+**Covers:** v0.9.50 → v0.14.28  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.28 — no-scan fast path when sparse output is disabled
+
+write_sparse scanned every 4 KiB block (is_all_zero) even with sparse disabled —
+the run-coalescing loop calls is_all_zero regardless of the sparse_ flag, so
+--no-sparse still paid a full single-threaded zero-scan on the write thread's
+critical path.  Added a sparse_-off fast path that writes the whole buffer in one
+call with no scanning.  Speeds up --no-sparse decompression, and isolates the
+scan cost while we investigate why plain -d (single-file decompress) trails
+-d --tar extract: extract pipelines the zero-scan (parse thread) against the
+O_DIRECT write (writer thread), whereas AsyncWritePool's single write thread does
+scan + write serially.  Behavior unchanged for the default (sparse auto-on);
+round-trips verified byte-identical (random + holey) with --no-sparse.
 
 ## v0.14.27 — MADV_SEQUENTIAL on the -l frame walk (cold-file speed)
 

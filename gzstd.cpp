@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.27";
+static constexpr const char * GZSTD_VERSION = "0.14.28";
 //
 // Architecture overview:
 //
@@ -3822,6 +3822,21 @@ private:
   bool write_sparse(const char * data, size_t len, bool is_last_buffer = false) {
     static constexpr size_t SPARSE_BLOCK = 4096;  // check in page-sized blocks
     static constexpr size_t PROGRESS_INTERVAL = 16 * 1024 * 1024;  // 16 MiB
+
+    // Sparse disabled: write the whole buffer in one shot, no per-block zero
+    // scan.  The scanning loop below calls is_all_zero on every block even when
+    // sparse is off (to coalesce write runs), so skipping it here avoids a full
+    // single-threaded pass over the data on the write thread's critical path.
+    if (!sparse_) {
+      (void)is_last_buffer;
+#ifndef _WIN32
+      if (dw_) { if (!dw_->write(data, len)) return false; }
+      else
+#endif
+      if (out_) { if (robust_fwrite(data, len, out_) != len) return false; }
+      if (meter_) meter_->wrote_bytes.fetch_add(len, std::memory_order_relaxed);
+      return true;
+    }
 
     size_t pos = 0;
     size_t bytes_since_progress = 0;
