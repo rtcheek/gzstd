@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.28";
+static constexpr const char * GZSTD_VERSION = "0.14.29";
 //
 // Architecture overview:
 //
@@ -1528,7 +1528,8 @@ struct Meter {
   // idle with nothing buffered at all (upstream compute/read can't keep up).
   // disk_ns accrues on the AsyncWritePool worker; the two wait buckets accrue
   // on the writer thread, so percentages overlap and don't sum to 100.
-  std::atomic< uint64_t > writer_disk_ns    { 0 }; // inside physical write/seek calls
+  std::atomic< uint64_t > writer_disk_ns    { 0 }; // inside write_sparse (scan + write/seek)
+  std::atomic< uint64_t > writer_iowrite_ns { 0 }; // subset: inside the write/seek syscalls only (rest = zero-scan)
   std::atomic< uint64_t > writer_hol_ns     { 0 }; // head-of-line: waiting while later frames sit buffered
   std::atomic< uint64_t > writer_hol_depth_ns { 0 }; // ∑ wait_ns × frames buffered behind the gap (ns·frames)
   std::atomic< uint64_t > writer_starved_ns { 0 }; // waiting with nothing buffered
@@ -1988,6 +1989,7 @@ private:
 #define FALLOC_FL_PUNCH_HOLE 0x02
 #endif
 #endif
+static inline uint64_t now_ns();   // defined below; used by DirectWriter write timing
 class DirectWriter {
 public:
   static constexpr size_t ALIGN = 4096;          // filesystem block alignment
@@ -2201,6 +2203,7 @@ private:
 
   bool write_all(const void * data, size_t len) {
     const char * p = static_cast<const char *>(data);
+    uint64_t t0 = now_ns();
     while (len > 0) {
       ssize_t w = ::write(fd_, p, len);
       if (w > 0) {
@@ -2213,6 +2216,7 @@ private:
         return false;  // write() == 0 with len > 0: no progress possible
       }
     }
+    write_ns_.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     return true;
   }
 
@@ -2239,6 +2243,9 @@ private:
   size_t buf_used_ = 0;
   size_t total_written_ = 0;
   uint64_t preallocated_ = 0;
+  std::atomic<uint64_t> write_ns_{0};  // -v: time inside the ::write syscall (vs bounce-copy)
+public:
+  uint64_t write_ns() const { return write_ns_.load(std::memory_order_relaxed); }
 };
 #endif // _WIN32
 
@@ -3823,6 +3830,17 @@ private:
     static constexpr size_t SPARSE_BLOCK = 4096;  // check in page-sized blocks
     static constexpr size_t PROGRESS_INTERVAL = 16 * 1024 * 1024;  // 16 MiB
 
+    // Time only the actual write/seek syscalls into writer_iowrite_ns; the rest
+    // of write_sparse's time (tracked as writer_disk_ns by the caller) is the
+    // single-threaded zero-scan.  The split shows whether the write thread is
+    // device-I/O-bound or scan-bound (-v).
+    auto timed_io = [&](auto && fn) -> bool {
+      uint64_t t0 = now_ns();
+      bool ok = fn();
+      if (meter_) meter_->writer_iowrite_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+      return ok;
+    };
+
     // Sparse disabled: write the whole buffer in one shot, no per-block zero
     // scan.  The scanning loop below calls is_all_zero on every block even when
     // sparse is off (to coalesce write runs), so skipping it here avoids a full
@@ -3830,10 +3848,10 @@ private:
     if (!sparse_) {
       (void)is_last_buffer;
 #ifndef _WIN32
-      if (dw_) { if (!dw_->write(data, len)) return false; }
+      if (dw_) { if (!timed_io([&]{ return dw_->write(data, len); })) return false; }
       else
 #endif
-      if (out_) { if (robust_fwrite(data, len, out_) != len) return false; }
+      if (out_) { if (!timed_io([&]{ return robust_fwrite(data, len, out_) == len; })) return false; }
       if (meter_) meter_->wrote_bytes.fetch_add(len, std::memory_order_relaxed);
       return true;
     }
@@ -3876,9 +3894,9 @@ private:
         }
         size_t zero_len = zero_end - pos;
         if (dw_) {
-          if (!dw_->seek_forward(zero_len)) return false;
+          if (!timed_io([&]{ return dw_->seek_forward(zero_len); })) return false;
         } else if (out_) {
-          if (std::fseek(out_, (long)zero_len, SEEK_CUR) != 0)
+          if (!timed_io([&]{ return std::fseek(out_, (long)zero_len, SEEK_CUR) == 0; }))
             return false;
         }
         bytes_since_progress += zero_len;
@@ -3897,10 +3915,9 @@ private:
 
         size_t to_write = write_end - pos;
         if (dw_) {
-          if (!dw_->write(data + pos, to_write)) return false;
+          if (!timed_io([&]{ return dw_->write(data + pos, to_write); })) return false;
         } else if (out_) {
-          size_t w = robust_fwrite(data + pos, to_write, out_);
-          if (w != to_write) return false;
+          if (!timed_io([&]{ return robust_fwrite(data + pos, to_write, out_) == to_write; })) return false;
         }
         bytes_since_progress += to_write;
         pos = write_end;
@@ -13742,6 +13759,40 @@ int main(int argc, char ** argv)
         "starved %.1f%%  (of %.2f s run)\n",
         busy * 100.0, hol * 100.0, avg_stuck, starved * 100.0, wall_ns / 1e9);
       vlog(V_VERBOSE, opt, wline);
+      // Split the "busy" time into actual device I/O vs the single-threaded
+      // zero-scan (sparse detection), so "busy 97%" isn't mistaken for "device
+      // saturated" when much of it is CPU scanning on the write thread.
+      const uint64_t io_ns   = meter.writer_iowrite_ns.load();
+      const uint64_t disk_ns = meter.writer_disk_ns.load();
+      if (disk_ns > 0 && io_ns <= disk_ns) {
+        // io_ns = time in dw_->write (bounce-copy into the aligned buffer + the
+        // ::write syscall); the DirectWriter reports the ::write time alone, so
+        // bounce-copy = io_ns - write_syscall.  Splits the write thread's busy
+        // time three ways: actual device write / aligned bounce-copy / zero-scan.
+        char sline[300];
+        bool odirect = false;
+#ifndef _WIN32
+        odirect = (g_direct_writer != nullptr);
+#endif
+        const double scan_pct = double(disk_ns - io_ns) / double(disk_ns) * 100.0;
+        if (odirect) {
+          uint64_t wr_ns = 0;
+#ifndef _WIN32
+          wr_ns = g_direct_writer->write_ns();
+#endif
+          if (wr_ns > io_ns) wr_ns = io_ns;   // clamp (different clocks/overlap)
+          std::snprintf(sline, sizeof(sline),
+            "[WRITER]   of busy: O_DIRECT ::write %.1f%% | bounce-copy→aligned %.1f%% | zero-scan %.1f%%"
+            "  (copy+write are serial on ONE thread; extract pipelines them)\n",
+            double(wr_ns) / double(disk_ns) * 100.0,
+            double(io_ns - wr_ns) / double(disk_ns) * 100.0, scan_pct);
+        } else {
+          std::snprintf(sline, sizeof(sline),
+            "[WRITER]   of busy: buffered write %.1f%% | zero-scan %.1f%%\n",
+            double(io_ns) / double(disk_ns) * 100.0, scan_pct);
+        }
+        vlog(V_VERBOSE, opt, sline);
+      }
       vlog(V_VERBOSE, opt,
            std::string("[WRITER] verdict: ")
            + writer_verdict(busy, hol, starved, avg_stuck, healthy_window) + "\n");

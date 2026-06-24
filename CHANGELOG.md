@@ -1,11 +1,30 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.28  
+**Covers:** v0.9.50 → v0.14.29  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.29 — writer-busy breakdown (-v): split the write thread's time three ways
+
+Investigating why single-file -d trails -d --tar extract on the same data (plain
+~2.6-2.9 vs extract ~3.7 GiB/s, both write 130 GiB O_DIRECT).  The existing
+[WRITER] line said "write-path busy 97%" and concluded "device saturated", but
+that busy time lumps together the CPU zero-scan, the bounce-copy into the aligned
+O_DIRECT buffer, and the actual write syscall — all serial on the single
+AsyncWritePool thread.  Added a breakdown line at -v:
+
+  [WRITER]   of busy: O_DIRECT ::write X% | bounce-copy→aligned Y% | zero-scan Z%
+
+writer_iowrite_ns times the write/seek calls inside write_sparse (vs the scan),
+and DirectWriter now reports the time inside the ::write syscall alone, so the
+bounce-copy (DirectWriter::write memcpy's every byte into its aligned buffer
+before flushing) is isolated as iowrite − write.  This makes visible that plain
+-d serializes copy + write on one thread where extract pipelines the copy (parse
+thread) against the pwrite (writer thread).  Measurement only — no behavior
+change (counters are -v-gated; ruled out the zero-scan, ~1.5%, as the cause).
 
 ## v0.14.28 — no-scan fast path when sparse output is disabled
 
