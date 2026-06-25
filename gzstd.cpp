@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.38";
+static constexpr const char * GZSTD_VERSION = "0.14.43";
 //
 // Architecture overview:
 //
@@ -398,6 +398,16 @@ struct Options {
                                    // (default off: fallocate'd unwritten extents make O_DIRECT
                                    //  writes pay an extent-conversion per write — measured ~4-6%
                                    //  slower on ext4/NVMe, both compress and decompress)
+  bool verify = false;            // --verify: background CPU decompress-verify of every compressed
+                                  //  frame (independent zstd -t round-trip) while compressing.  On
+                                  //  any XXH64 mismatch, discard the output and rebuild CPU-only,
+                                  //  retrying until it verifies clean.  Compress-only.
+  int  verify_retries = 0;        // --verify-retries=N: max rebuild attempts on verify mismatch
+                                  //  (0 = unlimited — keep trying until clean or interrupted)
+  bool keep_going = false;        // --keep-going: on decompress, don't abort on a frame integrity
+                                  //  error — write what decoded, record the damage, continue, then
+                                  //  report which file(s)/byte ranges are affected.  Implies
+                                  //  --cpu-only (the authoritative checksum validator).
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -435,6 +445,12 @@ static constexpr int EXIT_DATA     = 4;  // data/compression error (corrupt inpu
 static constexpr int EXIT_GPU_FAIL = 5;  // reserved: all GPUs failed.  Since v0.13.54
                                          // unused — gpu_only_cpu_fallback finishes the
                                          // job on CPU (warning + exit 0) instead.
+// --keep-going (decompress) completion codes.  A recovery run that produced
+// output still exits non-zero so a script never mistakes it for a clean restore.
+static constexpr int EXIT_DECOMP_UNVERIFIED = 6;  // finished; >=1 frame had a checksum mismatch
+                                                  // (content present but UNVERIFIED), no data lost
+static constexpr int EXIT_DECOMP_INCOMPLETE = 7;  // finished; >=1 frame could not fully decode
+                                                  // (data missing/partial — outranks UNVERIFIED)
 
 // Global verbosity for die() which doesn't take Options
 static int g_verbosity = V_DEFAULT;
@@ -784,6 +800,13 @@ static void print_help()
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
 "\n"
+"Integrity:\n"
+"  --verify            decompress-verify every frame while compressing; on any\n"
+"                      mismatch, rebuild CPU-only and retry until it verifies\n"
+"  --verify-retries N  cap verify rebuild attempts (0 = unlimited; default)\n"
+"  --keep-going        on -d, don't stop at a corrupt frame: recover what's\n"
+"                      readable, then report which file(s) are damaged\n"
+"\n"
 "Logging:\n"
 "  -v / -vv / -vvv     verbose / debug / trace\n"
 "  -q / -qq            errors only / silent\n"
@@ -892,6 +915,47 @@ static void print_help_long()
 "     fsync the output file before exit.  Default: off.  Without\n"
 "     this the OS flushes in the background; the data is durable on\n"
 "     a clean shutdown but not guaranteed across power loss.\n"
+"\n"
+"  --verify\n"
+"     While compressing, independently decompress-verify every frame on\n"
+"     the CPU (the same round-trip as `gzstd -t`) using the XXH64\n"
+"     (64-bit xxHash) content checksum each frame already carries.  zstd\n"
+"     — and gzstd by default — only WRITE that checksum; it is checked at\n"
+"     read time, never at creation.  That is fine for a CPU compressor\n"
+"     (deterministic), but the GPU is an untrusted producer: a fault can\n"
+"     emit wrong compressed bytes that surface only at restore, possibly\n"
+"     after the source is gone.  --verify closes that gap.  It runs in a\n"
+"     background thread pool that grows on demand and competes with the\n"
+"     compress threads for CPU, so it costs throughput only when it has\n"
+"     to; on a GPU run the otherwise-idle CPU absorbs it nearly free.\n"
+"     On ANY mismatch the whole output is discarded and rebuilt CPU-only\n"
+"     from the original input, retrying until it verifies clean.  Needs\n"
+"     regular files for input and output (a pipe cannot be rewound to\n"
+"     rebuild); over a pipe a mismatch is a fatal data error instead.\n"
+"     Off by default.  Compress-only (decompression already validates).\n"
+"\n"
+"  --verify-retries N\n"
+"     Cap the number of CPU-only rebuild attempts --verify makes on a\n"
+"     persistent mismatch.  Default 0 = unlimited (keep trying until the\n"
+"     archive verifies clean or you interrupt it) — the right default for\n"
+"     an unattended backup.  Set a bound (e.g. for a cron job) so a truly\n"
+"     faulty machine eventually gives up with a non-zero exit instead of\n"
+"     looping forever.  Implies --verify.\n"
+"\n"
+"  --keep-going\n"
+"     Recovery mode for DECOMPRESSING a damaged archive.  Normally a frame\n"
+"     whose XXH64 (64-bit xxHash) content checksum does not match aborts\n"
+"     the whole operation.  With --keep-going, gzstd instead writes what it\n"
+"     could decode, records the damage, and continues — then reports which\n"
+"     file(s) (with --tar) or output byte range(s) are affected.  It does\n"
+"     NOT repair data: a checksum-mismatch frame is written in full but is\n"
+"     UNVERIFIED (one or more bytes somewhere in it may be wrong); a frame\n"
+"     that cannot be decoded at all yields only what decoded before the\n"
+"     error.  Implies --cpu-only.  Existing files are overwritten as usual;\n"
+"     to recover alongside the originals, extract into a fresh directory\n"
+"     with -C DIR.  Exit codes: 6 = finished but some file(s) are\n"
+"     unverified; 7 = finished but some data could not be decoded\n"
+"     (incomplete).  Off by default.\n"
 "\n"
 "  --direct / --no-direct\n"
 "     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
@@ -2662,6 +2726,8 @@ struct Task {
   size_t seq = 0;
   std::vector<char> data;
   size_t decomp_size = 0;
+  uint64_t out_off = 0;           // --keep-going: this frame's start offset in the decompressed
+                                  //  output (prefix sum of decomp_size; set by the single reader)
   const char * view_ptr = nullptr;
   size_t       view_len = 0;
   int          direct_buf = -1;   // >=0: view_ptr aliases DirectReadPool slot; recycle on release
@@ -2887,11 +2953,190 @@ static DirectWriter * g_direct_writer = nullptr;
 // restart path in the driver.
 static std::atomic<bool> g_gpu_failed_restart{false};
 
+// Set the instant a GPU faults mid-compress (distinct from g_gpu_failed_restart,
+// which --verify also sets AFTER a pass to request a rebuild).  This one ABORTS
+// the in-flight compress pass: the producer stops reading, CPU/GPU workers exit
+// without compressing more, and the writer bails its in-order wait WITHOUT the
+// "writer stuck" watchdog firing.  The whole (doomed) output is discarded and the
+// driver rebuilds CPU-only — so there is no point finishing it, which is why the
+// old rescue/fallback machinery (which re-compressed the tail only to throw it
+// away) was deleted.  GPU-fault only: never set on decompress (a faulted GPU
+// there is finished on CPU and the output is KEPT) nor by --verify.
+static std::atomic<bool> g_gpu_aborted{false};
+
+// --verify: a background decompress-verify worker found a frame whose compressed
+// bytes do NOT round-trip (XXH64 mismatch / decode error).  Set alongside
+// g_gpu_failed_restart so the driver's existing discard-and-rebuild path fires;
+// this flag tells it the trigger was a verify failure (not a GPU fault) so it
+// uses the data-error exit code and message on the unrecoverable (pipe) path.
+// g_verify_failed_seq records the first failing frame's sequence number for the
+// per-attempt log (a seq that repeats across rebuilds = a deterministic fault).
+static std::atomic<bool>    g_verify_failed{false};
+static std::atomic<int64_t> g_verify_failed_seq{-1};
+
 // Test-only fault injection (read once from $GZSTD_DEBUG_FAIL_GPU_AFTER): make a
 // GPU compress worker throw a simulated fault after it has delivered this many
 // frames, to exercise the CPU-only restart path deterministically (real GPU
 // faults are intermittent).  -1 (default, env unset) = disabled.
 static int64_t g_debug_fail_gpu_after = -1;
+
+// Test-only corruption injection (read once from $GZSTD_DEBUG_CORRUPT_FRAME):
+// flip a byte in the compressed payload of the frame with this sequence number
+// just before it reaches the writer, so --verify must catch it.  Exercises the
+// verify→rebuild path deterministically.  -1 (default, env unset) = disabled.
+// By default it fires ONCE (so the CPU rebuild then verifies clean); set
+// $GZSTD_DEBUG_CORRUPT_PERSIST=1 to corrupt on EVERY pass (to exercise the
+// --verify-retries give-up path).
+static int64_t g_debug_corrupt_frame   = -1;
+static bool    g_debug_corrupt_persist = false;
+
+// --keep-going: collects every frame that failed to fully verify/decode during a
+// recovery decompress, so the driver can report which output ranges (and, with
+// --tar, which files) are damaged and pick the right exit code.  Only touched
+// when opt.keep_going (which also forces the single-threaded, cpu-only path).
+struct DamageReport {
+  struct Range {
+    uint64_t off;        // start offset in the decompressed output
+    uint64_t produced;   // bytes actually recovered for this frame
+    uint64_t declared;   // bytes the frame header said it should hold
+  };
+  std::mutex            m;
+  std::vector<Range>    ranges;                  // one per damaged frame
+  std::atomic<bool>     any{false};              // >=1 frame damaged
+  std::atomic<bool>     incomplete{false};       // >=1 frame produced < declared (data lost)
+
+  // Framing break: the reader lost frame sync (a corrupt frame header / declared
+  // size overrun / truncation), so recovery stopped after the last good frame.
+  // Everything past break_off is unrecoverable without a magic-scan resync, which
+  // we deliberately don't do — so the recovery is INCOMPLETE (exit 7).
+  std::atomic<bool>     framing_break{false};
+  uint64_t              break_after_frames = 0;  // frames recovered before the break
+  uint64_t              break_off = 0;           // bytes recovered before the break
+  std::string           break_reason;
+
+  void record(uint64_t off, uint64_t produced, uint64_t declared) {
+    { std::lock_guard<std::mutex> lk(m); ranges.push_back({off, produced, declared}); }
+    any.store(true, std::memory_order_relaxed);
+    if (produced < declared) incomplete.store(true, std::memory_order_relaxed);
+  }
+  void set_framing_break(uint64_t after_frames, uint64_t off, const std::string & reason) {
+    { std::lock_guard<std::mutex> lk(m); break_after_frames = after_frames; break_off = off; break_reason = reason; }
+    framing_break.store(true, std::memory_order_relaxed);
+    incomplete.store(true, std::memory_order_relaxed);   // data past the break is lost
+  }
+  bool damaged() const {   // anything to report?
+    return any.load(std::memory_order_relaxed) || framing_break.load(std::memory_order_relaxed);
+  }
+  void reset() {
+    std::lock_guard<std::mutex> lk(m);
+    ranges.clear();
+    any.store(false, std::memory_order_relaxed);
+    incomplete.store(false, std::memory_order_relaxed);
+    framing_break.store(false, std::memory_order_relaxed);
+    break_after_frames = 0; break_off = 0; break_reason.clear();
+  }
+};
+static DamageReport g_damage;
+
+// --keep-going: print the post-run damage summary and pick the verdict wording.
+// Plain output → byte ranges; --tar member mapping is added in report's caller
+// chain (the extractor records member ranges).  Workers already printed a
+// per-frame WARNING; this is the rollup.
+static void report_keep_going_damage(const Options & opt) {
+  std::lock_guard<std::mutex> lk(g_damage.m);
+  const size_t n = g_damage.ranges.size();
+  std::ostringstream os;
+  if (n > 0)
+    os << "WARNING: --keep-going recovered past " << n
+       << " damaged frame(s); the output is NOT verified.\n";
+  else
+    os << "WARNING: --keep-going recovered the readable portion; the output is incomplete.\n";
+  const size_t SHOW = 20;   // cap detail so heavily-rotted input doesn't flood
+  for (size_t i = 0; i < n && i < SHOW; ++i) {
+    const auto & r = g_damage.ranges[i];
+    os << "  output bytes " << r.off << ".." << (r.off + r.declared);
+    if (r.produced >= r.declared)
+      os << ": checksum mismatch (content present, UNVERIFIED)\n";
+    else
+      os << ": could not decode — " << r.produced << " of " << r.declared
+         << " bytes recovered\n";
+  }
+  if (n > SHOW) os << "  ... and " << (n - SHOW) << " more\n";
+  if (g_damage.framing_break.load(std::memory_order_relaxed))
+    os << "  RECOVERY STOPPED after " << g_damage.break_after_frames << " frame(s), "
+       << g_damage.break_off << " bytes: " << g_damage.break_reason << "\n";
+  if (g_damage.incomplete.load(std::memory_order_relaxed))
+    os << "  result: INCOMPLETE — some data could not be decoded (exit "
+       << EXIT_DECOMP_INCOMPLETE << ").\n";
+  else
+    os << "  result: complete but UNVERIFIED — one or more bytes may be wrong (exit "
+       << EXIT_DECOMP_UNVERIFIED << ").\n";
+  vlog(V_ERROR, opt, os.str());
+}
+
+// --keep-going + --tar: each extracted regular file's data range in the tar byte
+// stream, recorded by the Extractor so the post-extraction report can name the
+// file(s) overlapping a damaged frame.  Because the recovery decode emits every
+// frame at its full declared length, the stream never desyncs, so these offsets
+// line up exactly with the damage offsets regardless of error type.
+struct MemberRanges {
+  struct M { std::string path; uint64_t start; uint64_t size; };
+  std::mutex          m;
+  std::vector<M>      v;
+  void add(const std::string & p, uint64_t start, uint64_t size) {
+    std::lock_guard<std::mutex> lk(m); v.push_back({p, start, size});
+  }
+  void reset() { std::lock_guard<std::mutex> lk(m); v.clear(); }
+};
+static MemberRanges g_member_ranges;
+
+// --keep-going + --tar: name the file(s) whose data overlaps a damaged frame and
+// pick the verdict.  Returns the recovery exit code (EXIT_DECOMP_*), or EXIT_OK
+// if nothing was damaged.
+static int report_keep_going_damage_tar(const Options & opt) {
+  if (!g_damage.damaged()) return EXIT_OK;
+  std::vector<DamageReport::Range> dmg;
+  { std::lock_guard<std::mutex> lk(g_damage.m); dmg = g_damage.ranges; }
+  std::vector<MemberRanges::M> mem;
+  { std::lock_guard<std::mutex> lk(g_member_ranges.m); mem = g_member_ranges.v; }
+
+  // Worst overlapping severity per file (2 = data lost, 1 = unverified).
+  std::vector<std::pair<std::string,int>> hits;
+  for (const auto & f : mem) {
+    int sev = 0;
+    for (const auto & d : dmg) {
+      const uint64_t a0 = f.start, a1 = f.start + f.size;       // member data range
+      const uint64_t b0 = d.off,   b1 = d.off + d.declared;     // damaged frame range
+      if (a0 < b1 && b0 < a1)                                   // ranges overlap
+        sev = std::max(sev, (d.produced < d.declared) ? 2 : 1);
+    }
+    if (sev) hits.push_back({f.path, sev});
+  }
+
+  std::ostringstream os;
+  os << "WARNING: --keep-going: ";
+  if (!dmg.empty()) os << dmg.size() << " damaged frame(s); ";
+  os << "the extracted files are NOT verified.\n";
+  if (!dmg.empty() && hits.empty()) {
+    os << "  (damage fell in tar metadata/padding, not within any file's data)\n";
+  } else if (!hits.empty()) {
+    os << "  damaged file(s):\n";
+    const size_t SHOW = 50;
+    for (size_t i = 0; i < hits.size() && i < SHOW; ++i)
+      os << "    " << hits[i].first
+         << (hits[i].second == 2 ? "  (INCOMPLETE — some data could not be decoded)"
+                                 : "  (UNVERIFIED — one or more bytes may be wrong)") << "\n";
+    if (hits.size() > SHOW) os << "    ... and " << (hits.size() - SHOW) << " more\n";
+  }
+  if (g_damage.framing_break.load(std::memory_order_relaxed))
+    os << "  RECOVERY STOPPED after " << g_damage.break_after_frames << " frame(s), "
+       << g_damage.break_off << " bytes: " << g_damage.break_reason << "\n"
+       << "  files at/after that point were not extracted or are truncated.\n";
+  os << "  tip: extract into a fresh directory with -C DIR to keep the originals.\n";
+  vlog(V_ERROR, opt, os.str());
+  return g_damage.incomplete.load(std::memory_order_relaxed)
+       ? EXIT_DECOMP_INCOMPLETE : EXIT_DECOMP_UNVERIFIED;
+}
 
 // Fixed pool of page-aligned buffers for the zero-copy --direct-read path.
 // The single O_DIRECT reader preads each chunk straight into a pooled buffer and
@@ -3020,6 +3265,12 @@ public:
            ((max_depth_ > 0 && q_.size() >= max_depth_) ||
             (max_bytes_ > 0 && !q_.empty() && queued_bytes_ >= max_bytes_)))
       space_cv_.wait(lk);
+    // done_ set mid-stream means a shutdown is in progress (GPU-fault abort): drop
+    // the task instead of buffering it — the consumers have exited and the whole
+    // output is being discarded, so buffering the rest of the input would only
+    // grow memory unbounded.  Normal end-of-input calls set_done() AFTER the last
+    // push, so this never drops a wanted frame.
+    if (done_) return;
     queued_bytes_ += t.data.size();
     q_.push_back(std::move(t));
     ++total_tasks_;
@@ -3496,6 +3747,172 @@ struct default_init_allocator : std::allocator<T> {
 };
 using FrameVec = std::vector<char, default_init_allocator<char>>;
 using FrameBuf = std::shared_ptr<FrameVec>;
+
+/*======================================================================
+ VerifyPool — background decompress-verify for --verify (compress only)
+ ----------------------------------------------------------------------
+ Every compressed frame is a complete, self-delimiting zstd frame carrying
+ an XXH64 content checksum (CPU path via ZSTD_c_checksumFlag, GPU path via
+ gpu_frame_add_checksum), so a streaming decompress validates it exactly
+ like `gzstd -t` — no separate hashing needed.  The writer taps each
+ finished frame into this pool (a shared_ptr copy, so the frame outlives
+ the write until verified) and keeps going; verification runs off the
+ critical path.
+
+ Thread policy: start with ONE worker and add more only when the backlog
+ persists, capped at hardware concurrency.  The workers are plain CPU
+ decompressors that contend with the compress workers for cores, so on a
+ CPU-bound run verification naturally steals time from compression — the
+ backpressure lands exactly where it should — while on a GPU run the
+ otherwise-idle CPU absorbs it nearly free.  A bounded queue blocks the
+ writer (and thus the producers) if verification can't keep up.
+
+ On ANY frame that fails to round-trip, it sets g_verify_failed (+ the
+ first failing seq) and g_gpu_failed_restart, so the driver's existing
+ discard-and-rebuild path fires.  See the compress driver's retry loop.
+======================================================================*/
+class VerifyPool {
+public:
+  VerifyPool(int max_threads, size_t max_queue)
+    : max_threads_(std::max(1, max_threads)),
+      max_queue_(std::max<size_t>(4, max_queue)),
+      high_water_(std::max<size_t>(2, max_queue_ / 2)) {
+    spawn_one();   // start very low — a single verify thread
+  }
+  ~VerifyPool() { finish(); }
+
+  VerifyPool(const VerifyPool &) = delete;
+  VerifyPool & operator=(const VerifyPool &) = delete;
+
+  // Writer thread hands off a finished frame.  Blocks while the queue is full
+  // (bounded) — that block propagates back as compress backpressure.  Cheap
+  // no-op once a failure is known: no point verifying more, we're rebuilding.
+  void submit(size_t seq, const FrameBuf & frame) {
+    if (g_verify_failed.load(std::memory_order_relaxed)) return;
+    bool grow = false;
+    {
+      std::unique_lock<std::mutex> lk(m_);
+      not_full_.wait(lk, [&]{
+        return q_.size() < max_queue_ || g_verify_failed.load(std::memory_order_relaxed);
+      });
+      if (g_verify_failed.load(std::memory_order_relaxed)) return;
+      q_.push_back({seq, frame});
+      grow = q_.size() > high_water_;
+    }
+    not_empty_.notify_one();
+    if (grow) maybe_grow();
+  }
+
+  // No more frames will arrive.  Drains the queue, joins all workers, and
+  // returns true iff every frame verified clean.
+  bool finish() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (done_) return !g_verify_failed.load(std::memory_order_relaxed);
+      done_ = true;
+    }
+    not_empty_.notify_all();
+    not_full_.notify_all();
+    {
+      std::lock_guard<std::mutex> tlk(threads_m_);
+      for (auto & t : threads_) if (t.joinable()) t.join();
+      threads_.clear();
+    }
+    return !g_verify_failed.load(std::memory_order_relaxed);
+  }
+
+private:
+  struct Item { size_t seq; FrameBuf frame; };
+
+  void spawn_one() {
+    std::lock_guard<std::mutex> tlk(threads_m_);
+    if ((int)threads_.size() >= max_threads_) return;
+    threads_.emplace_back([this]{ worker(); });
+  }
+
+  // Add a worker if the backlog warrants it and we're below the cap.  Called
+  // off-lock from submit(); guarded by threads_m_ so growth is race-free.
+  void maybe_grow() {
+    {
+      std::lock_guard<std::mutex> tlk(threads_m_);
+      if ((int)threads_.size() >= max_threads_) return;
+    }
+    // Re-check backlog under the queue lock so we don't over-spawn on a blip.
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (q_.size() <= high_water_ || done_) return;
+    }
+    spawn_one();
+  }
+
+  void worker() {
+    ZSTD_DStream * zds = ZSTD_createDStream();
+    std::vector<char> scratch(ZSTD_DStreamOutSize());   // reused output sink (discarded)
+    if (!zds) {   // allocation failure — treat as a verify failure, fail safe
+      mark_failed((size_t)-1);
+      return;
+    }
+    for (;;) {
+      Item it;
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        not_empty_.wait(lk, [&]{
+          return !q_.empty() || done_ || g_verify_failed.load(std::memory_order_relaxed);
+        });
+        if (g_verify_failed.load(std::memory_order_relaxed)) break;
+        if (q_.empty()) { if (done_) break; else continue; }
+        it = std::move(q_.front());
+        q_.pop_front();
+      }
+      not_full_.notify_one();
+      if (it.frame && !verify_one(zds, scratch, *it.frame)) {
+        mark_failed(it.seq);
+        break;
+      }
+    }
+    ZSTD_freeDStream(zds);
+  }
+
+  // Streaming-decompress the whole frame, discarding output.  Returns false on
+  // any decode error OR XXH64 checksum mismatch (zstd reports both as errors),
+  // or on a truncated frame (last call still expecting input).
+  static bool verify_one(ZSTD_DStream * zds, std::vector<char> & scratch, const FrameVec & f) {
+    ZSTD_initDStream(zds);
+    ZSTD_inBuffer in{ f.data(), f.size(), 0 };
+    size_t last = 0;
+    while (in.pos < in.size) {
+      ZSTD_outBuffer out{ scratch.data(), scratch.size(), 0 };
+      last = ZSTD_decompressStream(zds, &out, &in);
+      if (ZSTD_isError(last)) return false;
+    }
+    return last == 0;   // 0 = frame(s) ended cleanly; >0 = truncated
+  }
+
+  void mark_failed(size_t seq) {
+    int64_t expected = -1;
+    g_verify_failed_seq.compare_exchange_strong(expected, (int64_t)seq);  // record first
+    g_verify_failed.store(true, std::memory_order_relaxed);
+    g_gpu_failed_restart.store(true);   // reuse the driver's discard-and-rebuild path
+    not_empty_.notify_all();
+    not_full_.notify_all();
+  }
+
+  const int    max_threads_;
+  const size_t max_queue_;
+  const size_t high_water_;
+
+  std::mutex                 m_;
+  std::condition_variable    not_empty_, not_full_;
+  std::deque<Item>           q_;
+  bool                       done_ = false;
+
+  std::mutex                 threads_m_;
+  std::vector<std::thread>   threads_;
+};
+
+// Set by the compress driver while a --verify run is in flight; the writer's
+// in-order drain taps each finished frame into it.  null = verification off.
+static VerifyPool * g_verify_pool = nullptr;
 
 struct ResultStore {
   std::mutex                                     m;
@@ -4207,7 +4624,8 @@ static void writer_thread(FILE * out, ResultStore & results,
     // On each wakeup, drain per-GPU slots into the shared map, then check
     // if the next sequential frame is available.  Producers call notify_all
     // on every frame delivery, so the writer wakes promptly.
-    while (results.data.count(results.next_to_write) == 0 && !all_done) {
+    while (results.data.count(results.next_to_write) == 0 && !all_done
+           && !g_gpu_aborted.load(std::memory_order_relaxed)) {
       results.drain_slots_locked();
       if (results.data.count(results.next_to_write) != 0) break;
       waited = true;
@@ -4234,9 +4652,13 @@ static void writer_thread(FILE * out, ResultStore & results,
         all_done = results.producer_done
                 && results.workers_done
                 && results.next_to_write >= results.total_tasks;
-        if (!all_done && results.data.count(results.next_to_write) == 0) {
+        if (!all_done && !g_gpu_aborted.load(std::memory_order_relaxed)
+            && results.data.count(results.next_to_write) == 0) {
           // Workers are all done but we're still missing frames  this is a bug.
           // Log diagnostics and abort to avoid producing corrupt output.
+          // (A GPU fault sets g_gpu_aborted, in which case missing frames are
+          // EXPECTED — the doomed output is discarded and rebuilt — so we exit
+          // cleanly below instead of treating it as an internal error.)
           std::ostringstream os;
           os << "internal error: writer stuck  workers_done but frame "
              << results.next_to_write << " of " << results.total_tasks
@@ -4268,11 +4690,12 @@ static void writer_thread(FILE * out, ResultStore & results,
       g_perf->writer_wait_count.fetch_add(1);
       g_perf->out_of_order_waits.fetch_add(1);
     }
-    if (all_done) break;
+    if (all_done || g_gpu_aborted.load(std::memory_order_relaxed)) break;  // GPU-fault abort: stop, output is discarded
 
     // Batch drain: collect ALL consecutive ready frames
     std::vector<FrameBuf> batch;
     size_t batch_bytes = 0;
+    const size_t batch_start_seq = results.next_to_write;   // seq of batch[0]
     while (true) {
       auto it = results.data.find(results.next_to_write);
       if (it == results.data.end()) break;
@@ -4287,6 +4710,30 @@ static void writer_thread(FILE * out, ResultStore & results,
     // Count frames handed to writer for progress tracking.
     if (m) m->tasks_done.fetch_add(batch.size(), std::memory_order_relaxed);
     lk.unlock();
+
+    // --verify tap: hand each finished frame to the background decompress-verify
+    // pool BEFORE it is written (the pool holds a shared_ptr copy, so the frame
+    // outlives the write until verified).  Done off the ResultStore lock so a
+    // full verify queue applies backpressure to the writer, never stalls
+    // producers behind the results mutex.  Frames are still standard zstd frames
+    // on disk; this only reads them back in RAM.
+    if (g_verify_pool) {
+      for (size_t k = 0; k < batch.size(); ++k) {
+        const size_t seq = batch_start_seq + k;
+        // Test-only: flip a byte in this frame's compressed payload exactly once,
+        // so --verify must catch it and trigger a rebuild (which, the hook having
+        // fired, then verifies clean).  Corrupts the SAME buffer the writer emits,
+        // so the on-disk frame is genuinely bad until rebuilt.
+        if (g_debug_corrupt_frame >= 0 && seq == (size_t)g_debug_corrupt_frame
+            && batch[k] && batch[k]->size() > 8) {
+          static std::atomic<bool> corrupted_once{false};
+          bool expect = false;
+          if (g_debug_corrupt_persist || corrupted_once.compare_exchange_strong(expect, true))
+            (*batch[k])[batch[k]->size() / 2] ^= 0xFF;
+        }
+        g_verify_pool->submit(seq, batch[k]);
+      }
+    }
 
     // Update total expected output for write drain progress.
     // For decompress: total_out is pre-set by stream_frames_to_queue (known from frame headers).
@@ -4427,7 +4874,8 @@ static void decompress_from_buffer(const std::vector<char> & input,
   while (zin.pos < zin.size) {
     ret = ZSTD_decompressStream(dctx, &zout, &zin);
     if (ZSTD_isError(ret))
-      die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
+      die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
+               + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
     if (zout.pos > 0) {
       if (g_tar_decomp_sink) {
         // -t/-d --tar streaming/fallback path: hand the chunk to the tar parser.
@@ -4491,7 +4939,8 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
       ret = ZSTD_decompressStream(dctx, &zout, &zin);
       if (ZSTD_isError(ret)) {
         ZSTD_freeDCtx(dctx);
-        die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
+        die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
+               + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
       }
       if (zout.pos > 0) {
         if (g_tar_decomp_sink) {
@@ -5090,6 +5539,9 @@ static void cpu_worker(
 
   auto acquire_out_buf = [&]() -> FrameBuf {
     while (true) {
+      // GPU-fault abort: the writer has stopped draining, so no slot will ever
+      // free — return any buffer; the caller exits at the next loop top.
+      if (g_gpu_aborted.load(std::memory_order_relaxed)) return out_pool[0];
       for (auto & b : out_pool) {
         if (b.use_count() == 1) return b;
       }
@@ -5101,6 +5553,7 @@ static void cpu_worker(
       // safety net for any missed notify.
       if (bp) {
         bp->wait_for_drain([&]{
+          if (g_gpu_aborted.load(std::memory_order_relaxed)) return true;
           for (auto & b : out_pool) if (b.use_count() == 1) return true;
           return false;
         });
@@ -5110,6 +5563,7 @@ static void cpu_worker(
     }
   };
   while (true) {
+    if (g_gpu_aborted.load(std::memory_order_relaxed)) break;  // GPU fault: abort without draining the queue
     Task t;
     bool got_task = false;
 #ifdef HAVE_NVCOMP
@@ -5300,78 +5754,6 @@ static void cpu_worker(
          << " pool=" << pool_size << " waits=" << pool_wait_count;
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
-  }
-}
-
-static void cpu_worker_rescue(
-  int worker_id,
-  RescueQueue * rq,
-  ResultStore * results,
-  const Options * opt,
-  Meter * m,
-  CpuAgg * cpuagg,
-  FrameThrottle * bp)
-{
-  // Per-thread reusable scratch — see cpu_worker comment for the rationale.
-  FrameVec scratch;
-  while (true) {
-    // Same wait-acquire-try pattern as cpu_worker: never hold a permit
-    // while sleeping on the rescue CV, never hold a task without a permit.
-    Task t;
-    bool got_task = false;
-    {
-      bool drained = false;
-      while (true) {
-        if (!rq->wait_for_work()) { drained = true; break; }
-        if (bp) bp->acquire(1);
-        int rc = rq->try_pop_one(t);
-        if (rc == 1) { got_task = true; break; }
-        if (bp) bp->release(1);
-        if (rc == -1) { drained = true; break; }
-      }
-      if (drained) break;
-    }
-    if (!got_task) break;
-    if (m && t.view_ptr && t.direct_buf < 0) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
-    const auto t0 = std::chrono::steady_clock::now();
-    const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
-    const auto t1 = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration_cast<
-        std::chrono::duration<double, std::milli>>(t1 - t0).count();
-
-    if (opt->verbosity >= V_TRACE) {
-      char in_s[32], out_s[32];
-      human_bytes(double(t.len()), in_s, sizeof(in_s));
-      human_bytes(double(csz), out_s, sizeof(out_s));
-      double thr_gib = (ms > 0.0) ? (double)t.len() / (ms / 1000.0) / 1e9 : 0.0;
-      std::ostringstream os;
-      os << "[RESCUE/T" << worker_id << "] seq=" << t.seq
-         << " in=" << in_s << " out=" << out_s
-         << " ms=" << std::fixed << std::setprecision(2) << ms
-         << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
-      vlog(V_TRACE, *opt, os.str() + "\n");
-    }
-
-    // Deliver compressed frame to the result store (copy of csz bytes;
-    // scratch keeps capacity for the next iteration).
-    auto out_frame = std::make_shared<FrameVec>(
-        scratch.data(), scratch.data() + csz);
-    results->push_to_slot(-1, t.seq, std::move(out_frame));
-
-    // Update per-thread stats
-    {
-      std::lock_guard<std::mutex> lk(cpuagg->m);
-      if (cpuagg->per_thread.size() <= (size_t)worker_id)
-        cpuagg->per_thread.resize((size_t)worker_id + 1);
-      auto & st = cpuagg->per_thread[(size_t)worker_id];
-      st.tasks    += 1;
-      st.in_bytes += t.len();
-      st.out_bytes += csz;
-      st.comp_ms  += ms;
-    }
-    // Recycle the input — rescued tasks can carry a pooled-reader slot
-    // (direct_buf); without this the slot leaks and the readers starve.
-    t.release_input();
   }
 }
 
@@ -5569,7 +5951,44 @@ static void cpu_decomp_worker(
         results->cv.wait_for(lk, std::chrono::milliseconds(20));
       use_streaming = (tq->total_tasks() == 1);
     }
-    if (use_streaming) {
+    if (opt->keep_going) {
+      // --keep-going recovery decode (one-shot).  The one-shot decoder writes the
+      // WHOLE frame before validating the trailing checksum, so a checksum-mismatch
+      // frame is recovered in full (unverified) and — crucially — keeps its exact
+      // length, so nothing downstream (especially --tar member boundaries) desyncs.
+      // We zero the buffer first so any tail a hard-corruption decode never reached
+      // holds zeros, not stale pool data, and still emit the full declared length
+      // to preserve alignment.  The DCtx is reused across frames, so reset it.
+      ZSTD_DCtx_reset(tl_dctx, ZSTD_reset_session_only);
+      auto out_buf = acquire_decomp_buf();
+      try {
+        out_buf->resize(t.decomp_size);
+      } catch (const std::bad_alloc &) {
+        die_data("frame " + std::to_string(t.seq) + " header claims "
+                 + std::to_string(t.decomp_size) + " bytes; allocation failed — the frame header "
+                 "is corrupt and --keep-going cannot recover past an un-allocatable frame");
+      }
+      std::memset(out_buf->data(), 0, out_buf->size());
+      size_t rc = ZSTD_decompressDCtx(tl_dctx, out_buf->data(), out_buf->size(),
+                                      t.ptr(), t.len());
+      actual = t.decomp_size;            // always emit the full declared length (alignment)
+      t.release_input();
+      if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
+      if (ZSTD_isError(rc)) {
+        const bool checksum = (ZSTD_getErrorCode(rc) == ZSTD_error_checksum_wrong);
+        // checksum mismatch → full content present but UNVERIFIED.  Any other
+        // error → the frame can't be trusted; keep the full-length buffer (valid
+        // prefix + zeros) for alignment but report it as unrecovered.
+        g_damage.record(t.out_off, checksum ? (uint64_t)t.decomp_size : 0, t.decomp_size);
+        std::ostringstream os;
+        os << "WARNING: --keep-going: frame " << t.seq << " (output bytes "
+           << t.out_off << ".." << (t.out_off + t.decomp_size) << "): ";
+        if (checksum) os << "checksum mismatch — content recovered but UNVERIFIED";
+        else          os << "could not decode (" << ZSTD_getErrorName(rc) << ") — data unreliable";
+        vlog(V_ERROR, *opt, os.str() + "\n");
+      }
+      results->push_to_slot(-1, t.seq, std::move(out_buf));
+    } else if (use_streaming) {
       static constexpr size_t CHUNK = 16 * ONE_MIB;
       size_t n_chunks_est = (t.decomp_size + CHUNK - 1) / CHUNK;
       if (n_chunks_est < 1) n_chunks_est = 1;
@@ -5593,7 +6012,8 @@ static void cpu_decomp_worker(
         size_t zin_before = zin.pos;
         size_t ret = ZSTD_decompressStream(tl_dctx, &zout, &zin);
         if (ZSTD_isError(ret))
-          die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret));
+          die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
+               + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
         actual += zout.pos;
         if (m && zin.pos > prev_zin_pos) {
           m->read_bytes.fetch_add(zin.pos - prev_zin_pos, std::memory_order_relaxed);
@@ -5642,7 +6062,8 @@ static void cpu_decomp_worker(
       actual = ZSTD_decompressDCtx(tl_dctx, out_buf->data(), out_buf->size(),
                                    t.ptr(), t.len());
       if (ZSTD_isError(actual))
-        die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual));
+        die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual)
+                 + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
       out_buf->resize(actual);
       t.release_input();
       if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
@@ -6194,6 +6615,7 @@ static size_t stream_frames_to_queue(
   size_t buf_off = 0;    // parse cursor within buf
 
   size_t seq = 0;
+  uint64_t out_off_acc = 0;   // --keep-going: running decompressed-output offset
   bool eof = false;
 
   // --direct-read: O_DIRECT input for decompress, mirroring the compress reader.
@@ -6314,6 +6736,19 @@ static size_t stream_frames_to_queue(
         if (remaining > 8) {
           // Significant trailing data that isn't a valid frame = truncated
           *fallback = false;  // not a format problem, it's a data problem
+          if (opt.keep_going) {
+            // Recovery: the reader can no longer find frame boundaries, so it
+            // can't skip ahead.  Keep the frames already parsed (the pipeline
+            // writes them), flag the framing break, and stop reading cleanly —
+            // the driver prints the rollup and exits EXIT_DECOMP_INCOMPLETE.
+            g_damage.set_framing_break((uint64_t)seq, out_off_acc,
+                "frame structure corrupt after frame " + std::to_string(seq)
+                + " — " + std::to_string(remaining)
+                + " trailing bytes cannot form a valid frame, and gzstd does not "
+                "scan to resync; everything past here is unrecoverable");
+            if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
+            return seq;
+          }
           // Return frames parsed so far  the caller should still detect
           // the issue because the decompressed output will be incomplete.
           vlog(V_NORMAL, opt,
@@ -6359,6 +6794,8 @@ static size_t stream_frames_to_queue(
       t.data.assign(ptr, ptr + frame_comp);   // copy compressed bytes out of the parse buffer
       if (m) m->reader_copy_ns.fetch_add(now_ns() - cp_t0, std::memory_order_relaxed);
       t.decomp_size = (size_t)frame_decomp;
+      t.out_off = out_off_acc;                 // --keep-going: offset of this frame in the output
+      out_off_acc += (uint64_t)frame_decomp;
       if ((size_t)frame_decomp > max_frame_decomp) max_frame_decomp = (size_t)frame_decomp;
       // push() blocks on the bounded queue when consumers can't keep up — that
       // wait is "the consumers are the bottleneck, not the reader" (vs io/parse/
@@ -7841,6 +8278,7 @@ struct StreamReader {
   FrameSink * src = nullptr;     // in-memory frame source (null = fd mode)
   FrameBuf cur;                  // current frame (sink mode); keeps `base` alive
   const char * base = nullptr;   // read cursor base: into buf (fd) or cur (sink)
+  uint64_t consumed_total = 0;   // --keep-going: running offset in the tar byte stream
   explicit StreamReader(int f) : fd(f), buf(1 << 20) { base = buf.data(); }
   explicit StreamReader(FrameSink * s) : fd(-1), src(s) {}
   void refill() {
@@ -7858,7 +8296,7 @@ struct StreamReader {
   size_t read_some(char * dst, size_t n) {
     if (pos == fill) { refill(); if (pos == fill) return 0; }
     size_t k = std::min(fill - pos, n);
-    std::memcpy(dst, base + pos, k); pos += k; return k;
+    std::memcpy(dst, base + pos, k); pos += k; consumed_total += k; return k;
   }
   bool read_exact(char * dst, size_t n) {
     size_t got = 0; while (got < n) { size_t k = read_some(dst + got, n - got); if (!k) return false; got += k; }
@@ -7870,11 +8308,11 @@ struct StreamReader {
     while (n) {
       if (pos == fill) { refill(); if (pos == fill) return false; }
       size_t k = (size_t)std::min<uint64_t>(n, fill - pos);
-      pos += k; n -= k;
+      pos += k; n -= k; consumed_total += k;
     }
     return true;
   }
-  void drain() { while (true) { if (pos == fill) { refill(); if (pos == fill) return; } pos = fill; } }  // consume to EOF (unblocks producer)
+  void drain() { while (true) { if (pos == fill) { refill(); if (pos == fill) return; } consumed_total += (fill - pos); pos = fill; } }  // consume to EOF (unblocks producer)
 };
 
 class Extractor {
@@ -8474,6 +8912,11 @@ private:
 
     switch (e.typeflag) {
       case '0': case '\0': case '7': {            // regular file
+        // --keep-going: record this file's data range in the tar stream (the
+        // header is fully consumed, so consumed_total is the data start) so the
+        // post-extraction report can name files that overlap a damaged frame.
+        if (opt_.keep_going && e.size)
+          g_member_ranges.add(rel, r.consumed_total, e.size);
         if (e.size <= SMALL_FILE_MAX) {
           Job j; j.rel = rel; j.mode = e.mode; j.mtime = e.mtime; j.uid = e.uid; j.gid = e.gid;
           j.ext = e.ext;
@@ -9521,7 +9964,6 @@ static void gpu_worker(
   int slot_index,   // positional index into per_dev/json_sink arrays
   Options opt,
   TaskQueue * queue,
-  RescueQueue * rescue,
   ResultStore * results,
   DevStats * devstats,
   StatsSink * json_sink,
@@ -10060,15 +10502,14 @@ static void gpu_worker(
         checkCuda(cudaMemcpyAsync(C.d_in_sizes, C.h_in_sizes.data(), sizeof(size_t)*C.filled, cudaMemcpyHostToDevice, C.stream), "cudaMemcpyAsync(d_in_sizes)");
         cudaEventRecord(C.ev_h2d_end, C.stream);
 
-        // Release host-side input data  it's on the GPU now.
-        // cudaMemcpyAsync with pageable memory is host-synchronous, so
-        // the data is fully copied before the function returns.
-        // In hybrid mode, keep data alive for potential rescue on GPU failure.
-        // In gpu-only mode, no rescue  safe to release immediately.
-        if (!rescue) {
-          for (size_t i = 0; i < C.filled; ++i)
-            C.batch[i].release_input();
-        }
+        // Release host-side input data  it's on the GPU now (and the per-frame
+        // checksum was already computed above).  cudaMemcpyAsync with pageable
+        // memory is host-synchronous, so the data is fully copied before the
+        // function returns.  We no longer keep it alive for rescue (a GPU fault
+        // now aborts and rebuilds from the original input), so release always —
+        // freeing pooled-reader slots / mmap views as early as possible.
+        for (size_t i = 0; i < C.filled; ++i)
+          C.batch[i].release_input();
 
         checkNvcomp(nvcompBatchedZstdCompressAsync(
           (const void * const *)C.d_in_ptrs,
@@ -10147,11 +10588,6 @@ static void gpu_worker(
                 throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
             }
           }
-          // Hybrid keeps inputs alive for rescue; the whole batch delivered,
-          // so recycle them now (pool slot / view / owned buffer alike).
-          // Without this, pooled-reader slots leak and the readers starve.
-          if (rescue)
-            for (size_t i = 0; i < C.filled; ++i) C.batch[i].release_input();
           double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
           double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
           if (g_perf) {
@@ -10321,10 +10757,6 @@ static void gpu_worker(
                 throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
             }
           }
-          // Hybrid keeps inputs alive for rescue; batch fully delivered —
-          // recycle now (see the async completion path).
-          if (rescue)
-            for (size_t i = 0; i < C.filled; ++i) C.batch[i].release_input();
           double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
           if (g_perf) {
             g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
@@ -10466,93 +10898,50 @@ static void gpu_worker(
     queue->notify_cpu_waiters();
   }
   catch (const std::exception & e) {
-    // GPU failure: a faulted GPU is an unreliable narrator — we cannot trust any
-    // frame it reported "done".  Flag the whole compress for a CPU-only rebuild
-    // (the driver discards this output and starts over from the input).  The
-    // in-flight rescue/fallback below still runs so the pipeline tears down
-    // cleanly; its output is thrown away.
+    // GPU fault — a faulted GPU is an unreliable narrator: we cannot trust any
+    // frame it reported "done".  ABORT the whole compress pass and let the driver
+    // rebuild CPU-only from the (still-present) input.  There is no point
+    // finishing the doomed output, so we do NOT recompress the in-flight tail on
+    // the CPU (that work would only be discarded) — the old rescue queue /
+    // re-enqueue / gpu_only_cpu_fallback machinery was deleted.  We just raise
+    // g_gpu_aborted (the producer stops reading, CPU/GPU workers exit, the writer
+    // bails its in-order wait without finalizing), recycle inputs, and free the
+    // GPU.  See g_gpu_aborted.
     *any_gpu_failed = true;
     g_gpu_failed_restart.store(true);
+    g_gpu_aborted.store(true);
     *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
+    (void)gpu_failures; (void)gpu_worker_count;   // no longer needed on the abort path
 
     try {
       if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
       if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
         for (auto & C : *sp) {
-          // Guard on the batch, NOT C.busy: a launch failure can throw after
-          // the pop (C.filled set) but before C.busy=true (during the H2D
-          // copies or the compress submit).  Those frames still hold permits
-          // and a ResultStore seq slot, so they must be rescued or they strand
-          // the sequence-ordered writer forever.  Both success paths clear
-          // C.batch, so a non-empty batch here is always popped-but-undelivered.
-          //
-          // A throw can also land MID-delivery (per-chunk status check, D2H
-          // copy): frames [0, delivered) already reached the ResultStore and
-          // will be written (the writer releases their permits) — rescuing
-          // them again would burn CPU on duplicates and leak their rescue
-          // permits.  Rescue only the undelivered tail.
-          if (C.delivered > 0 && C.delivered <= C.batch.size()) {
-            // Delivered frames won't be rescued — recycle their inputs here
-            // (the success-path release never ran for a mid-delivery throw),
-            // or their pooled-reader slots leak.
-            for (size_t i = 0; i < C.delivered; ++i) C.batch[i].release_input();
-            C.batch.erase(C.batch.begin(),
-                          C.batch.begin() + (ptrdiff_t)C.delivered);
-          }
-          if (!C.batch.empty()) {
-            const int held = (int)C.batch.size();
-            if (rescue) {
-              // Hybrid mode: push to CPU rescue queue.  MOVE the whole Task —
-              // do NOT reconstruct as Task{seq, data}: the default compress
-              // reader is the zero-copy mmap reader, whose tasks carry the data
-              // in view_ptr/view_len with an EMPTY data vector.  Rebuilding from
-              // .data alone dropped the view, so the rescue worker compressed 0
-              // bytes and emitted an empty frame — silent data loss on the exact
-              // GPU-failure path rescue exists to handle.  The mmap region
-              // outlives the rescue join, so the view stays valid; move also
-              // preserves direct_buf ownership and avoids copying owning data.
-              for (auto & t : C.batch)
-                rescue->push(std::move(t));
-              C.batch.clear();
-            } else {
-              // GPU-only mode: push back to main queue for other GPUs
-              queue->re_enqueue(C.batch);
-            }
-            // Release the permits this batch held: the rescue worker (and the
-            // next popper, after re_enqueue) re-acquires one permit per frame,
-            // so the GPU's originals must be handed back or they leak and
-            // eventually starve the surviving rescue/CPU workers into deadlock.
-            if (bp) bp->release(held);
-          }
+          // Recycle any popped-but-undelivered (or mid-delivery) inputs so pooled
+          // reader slots / mmap views don't leak; the output is discarded either
+          // way, so nothing here is recompressed.
+          for (auto & t : C.batch) t.release_input();
+          C.batch.clear();
           free_stream_buffers_only(C, opt);
           if (C.stream) cudaStreamDestroy(C.stream);
         }
       }
     } catch (...) {}
 
-    // Deregister streams so queue floor drops and CPU workers aren't blocked
+    // Deregister streams so the queue floor drops and CPU workers aren't blocked.
     if (sched && ctxs_ptr) {
       for (size_t s = 0; s < ctxs_ptr->size(); ++s)
         sched->unregister_gpu_stream();
     }
 
-    // Wake writer in case it's waiting on results
-    {
-      std::lock_guard<std::mutex> lk(results->m);
-      results->cv.notify_all();
-    }
-    // Wake all CPU workers for drain
-    queue->notify_cpu_waiters();
-
-    // Last GPU just failed in --gpu-only: finish the job on CPU.  The rescue
-    // pool handles the batch pushed above; this drains everything else still
-    // in (or yet to enter) the main queue, which otherwise has no consumer —
-    // the reader would block forever against the bounded queue, or the
-    // writer's watchdog would abort with a misleading internal error.
-    int fails = gpu_failures
-        ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
-    if (opt.gpu_only && fails == gpu_worker_count)
-      gpu_only_cpu_fallback(false, queue, results, opt, m, bp);
+    // Wake everything so it sees the abort and tears down cleanly: the writer's
+    // in-order wait, CPU workers blocked popping the queue, the producer blocked
+    // pushing a full bounded queue, workers blocked on the throttle, and any
+    // rescue waiters (hybrid).  set_done() on the queue wakes both poppers and the
+    // pusher; the workers then see g_gpu_aborted and exit without draining.
+    { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+    queue->set_done();
+    if (bp) bp->set_done();
   }
 }
 
@@ -10865,7 +11254,6 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // ---- Shared state for all workers ----
   TaskQueue   queue;
-  RescueQueue rescue;
   ResultStore results;
   std::atomic<size_t> seq_counter{0};
   std::atomic<bool>   any_gpu_failed{false};
@@ -10979,20 +11367,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     }
   }
 
-  // ---- Rescue pool: CPU fallback threads for GPU failures ----
-  std::vector<std::thread> rescue_pool;
-  {
-    unsigned ths = std::max(1u, std::thread::hardware_concurrency() / 2);
-    rescue_pool.reserve(ths);
-    for (unsigned i = 0; i < ths; ++i)
-      rescue_pool.emplace_back(cpu_worker_rescue, (int)i, &rescue, &results, &opt, m, &cpuagg, &throttle);
-
-    if (opt.verbosity >= V_VERBOSE) {
-      std::ostringstream os;
-      os << "[RESCUE] " << ths << " rescue threads online";
-      vlog(V_VERBOSE, opt, os.str() + "\n");
-    }
-  }
+  // (No CPU "rescue" pool: a GPU fault aborts the whole compress pass and the
+  // driver rebuilds CPU-only from the original input — there is nothing to
+  // rescue mid-run.  See g_gpu_aborted.)
 
   // In hybrid mode, start CPU pool BEFORE GPU workers so CPUs can compress
   // early chunks while GPUs are still initializing (CUDA context, memory alloc).
@@ -11041,7 +11418,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   for (int i = 0; i < gpu_count; ++i) {
     workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
-                         &queue, &rescue, &results,
+                         &queue, &results,
                          &per_dev[size_t(i)], &json_sink, m, sched,
                          &any_gpu_failed, &abort_on_failure,
                          &fatal_msgs[size_t(i)], &gpu_started,
@@ -11264,10 +11641,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         vlog(V_DEFAULT, opt, "WARNING: " + s + suffix);
   }
 
-  // Drain rescue queue and join CPU pool
-  rescue.set_done();
+  // Join the hybrid CPU pool.
   queue.notify_cpu_waiters();
-  for (auto & th : rescue_pool) th.join();
   if (!cpu_pool.empty())
     for (auto & th : cpu_pool) th.join();
 #ifndef _WIN32
@@ -12929,6 +13304,7 @@ static int extract_tar(const Options & opt, Meter * m)
 
   int rc = EXIT_OK;
   for (const std::string & arc : opt.tar_sources) {
+    if (opt.keep_going) { g_damage.reset(); g_member_ranges.reset(); }  // damage reported per archive
     FILE * in = open_input(arc);   // dies on failure
     if (arc != "-") {              // validate zstd magic (skip for unseekable stdin)
       unsigned char magic[4] = {0};
@@ -12989,6 +13365,10 @@ static int extract_tar(const Options & opt, Meter * m)
     }
     if (in && in != stdin) std::fclose(in);
     if (ex.had_error() && rc == EXIT_OK) rc = EXIT_ERROR;
+    if (opt.keep_going) {
+      int sev = report_keep_going_damage_tar(opt);   // names damaged files; 6/7 or OK
+      if (sev > rc) rc = sev;                         // recovery verdict outranks a plain error
+    }
   }
   ::close(dest_fd);
 
@@ -13307,6 +13687,12 @@ int main(int argc, char ** argv)
   if (const char * fa = std::getenv("GZSTD_DEBUG_FAIL_GPU_AFTER"))
     g_debug_fail_gpu_after = std::atoll(fa);
 
+  // Test-only: deterministic frame-corruption injection (see g_debug_corrupt_frame).
+  if (const char * cf = std::getenv("GZSTD_DEBUG_CORRUPT_FRAME"))
+    g_debug_corrupt_frame = std::atoll(cf);
+  if (const char * cp = std::getenv("GZSTD_DEBUG_CORRUPT_PERSIST"))
+    g_debug_corrupt_persist = (std::atoll(cp) != 0);
+
   // Recycle frame buffers instead of mmap/munmap-ing them every chunk.
   // Our per-frame heap buffers are large (16 MiB default, 32 MiB ultra), so glibc
   // serves each via mmap (its dynamic threshold caps at 32 MiB and the 4-producer/
@@ -13408,6 +13794,7 @@ int main(int argc, char ** argv)
   for (size_t file_idx = 0; file_idx < opt.inputs.size(); ++file_idx) {
   // --- Per-file setup ---
   opt.input = opt.inputs[file_idx];
+  if (opt.keep_going) g_damage.reset();   // damage is reported per input file
 
   // For multi-file with no explicit -o, derive output per file
   if (opt.inputs.size() > 1 && !opt.to_stdout) {
@@ -13581,89 +13968,157 @@ int main(int argc, char ** argv)
                 << "  hint: did you mean to decompress? use: gzstd -d "
                 << opt.input << "\n";
     }
-#ifdef HAVE_NVCOMP
-    if (opt.cpu_only) {
-      if (opt.sliding_window)
-        compress_cpu_sliding_window(in, out, opt, &meter);
-      else
-        compress_cpu_mt(in, out, opt, &meter);
-      if (!opt.stats_json.empty()) {
-        CpuAgg agg{};
-        agg.threads = (opt.cpu_threads > 0)
-                      ? opt.cpu_threads
-                      : std::max(1, int(std::thread::hardware_concurrency()) - 1);
-        double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
-            std::chrono::steady_clock::now() - t0).count();
-        write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, agg);
-      }
-    } else {
-      g_gpu_failed_restart.store(false);
-      compress_nvcomp(in, out, opt, &meter);
-      if (g_gpu_failed_restart.load()) {
-        // A GPU faulted mid-run.  A faulted GPU's output cannot be trusted, so
-        // the only safe response is to discard everything and rebuild the whole
-        // archive CPU-only from the original input.  That needs to (a) re-read
-        // the input and (b) discard the partial output — both impossible over a
-        // pipe: stdin is already consumed, and the partial (untrusted) bytes have
-        // already streamed to the downstream reader and cannot be recalled.
-        // --tar re-reads its source paths, so only its OUTPUT can be a blocker.
-        const bool in_rebuildable =
-            opt.tar_mode || (in && in != stdin && std::fseek(in, 0, SEEK_SET) == 0);
-        bool out_rebuildable;
-#ifndef _WIN32
-        if (dw_ptr) out_rebuildable = true;            // O_DIRECT regular file
-        else
-#endif
-          out_rebuildable = (out && std::fseek(out, 0, SEEK_SET) == 0);  // seekable file (incl. redirected stdout)
-
-        if (!in_rebuildable || !out_rebuildable) {
-          // Unrecoverable: die loudly with a non-zero code so a pipeline fails.
-          die(std::string("a GPU faulted during compression and the ")
-              + (!in_rebuildable ? "input" : "output")
-              + " is a pipe/stream — the partial output cannot be discarded and\n"
-              "  rebuilt on the CPU, and a faulted GPU's output is NOT trustworthy.\n"
-              "  Any bytes already sent downstream are INCOMPLETE/CORRUPT; do not use them.\n"
-              "  Re-run with --cpu-only, or compress to/from regular files so a GPU\n"
-              "  fault can be recovered automatically.", EXIT_GPU_FAIL);
-        }
-
-        vlog(V_DEFAULT, opt,
-             "WARNING: a GPU faulted — discarding all output and rebuilding the "
-             "entire archive on the CPU from the original input...\n");
-        // Reset the output to empty (input was already rewound by the check above).
-#ifndef _WIN32
-        if (dw_ptr) {
-          std::string write_path = use_atomic ? tmp : opt.output;
-          direct_writer.reset();                 // dtor joins writer thread, closes fd
-          direct_writer = std::make_unique<DirectWriter>();
-          if (!direct_writer->open(write_path))
-            die_io("failed to reopen O_DIRECT output for CPU rebuild");
-          dw_ptr = direct_writer.get();
-          g_direct_writer = dw_ptr;
-        } else
-#endif
-        if (out) {
-          std::rewind(out);
-          if (ftruncate(fileno(out), 0) != 0) { /* best-effort: rebuild overwrites */ }
-        }
-        meter.reset();
-        Options cpu_opt = opt;
-        cpu_opt.cpu_only = true; cpu_opt.gpu_only = false; cpu_opt.hybrid = false;
-        g_gpu_failed_restart.store(false);
-        if (cpu_opt.sliding_window)
-          compress_cpu_sliding_window(in, out, cpu_opt, &meter);
-        else
-          compress_cpu_mt(in, out, cpu_opt, &meter);
-      }
-    }
-#else
+    // Compress dispatch with --verify + automatic rebuild-on-failure.
+    //
+    // A pass can fail two ways that both demand discarding the output and
+    // rebuilding CPU-only from the original input: a GPU fault mid-run, or (with
+    // --verify) a frame that fails to decompress-verify.  Both set
+    // g_gpu_failed_restart.  We loop: run a pass, drain the verify pool, and if a
+    // restart was flagged, reset the output and retry CPU-only — repeating until
+    // it succeeds or (with --verify-retries) the cap is hit.  Without --verify
+    // and without a GPU fault, the loop runs exactly once.
+#ifndef HAVE_NVCOMP
     if (opt.gpu_only) die_usage("This binary was built without nvCOMP; --gpu-only cannot be satisfied");
     if (opt.hybrid) vlog(V_VERBOSE, opt, "[HYBRID] not available in CPU-only build; using MT CPU\n");
-    if (opt.sliding_window)
-      compress_cpu_sliding_window(in, out, opt, &meter);
-    else
-      compress_cpu_mt(in, out, opt, &meter);
-    if (!opt.stats_json.empty()) {
+#endif
+    auto run_one_pass = [&](const Options & po) {
+#ifdef HAVE_NVCOMP
+      if (po.cpu_only) {
+        if (po.sliding_window) compress_cpu_sliding_window(in, out, po, &meter);
+        else                   compress_cpu_mt(in, out, po, &meter);
+      } else {
+        compress_nvcomp(in, out, po, &meter);
+      }
+#else
+      if (po.sliding_window) compress_cpu_sliding_window(in, out, po, &meter);
+      else                   compress_cpu_mt(in, out, po, &meter);
+#endif
+    };
+
+    Options pass_opt = opt;
+    int rebuild_attempt = 0;
+    for (;;) {
+      g_gpu_failed_restart.store(false);
+      g_gpu_aborted.store(false);   // clear the GPU-fault abort before each pass (incl. the CPU rebuild)
+      g_verify_failed.store(false, std::memory_order_relaxed);
+      g_verify_failed_seq.store(-1, std::memory_order_relaxed);
+
+      // --verify: stand up a background decompress-verify pool for this pass.
+      // It taps frames via g_verify_pool from the writer's in-order drain.
+      std::unique_ptr<VerifyPool> vpool;
+      if (opt.verify) {
+        const int vmax = (opt.cpu_threads > 0)
+            ? opt.cpu_threads
+            : std::max(1, (int)std::thread::hardware_concurrency());
+        vpool = std::make_unique<VerifyPool>(vmax, 256 /* max frames queued */);
+        g_verify_pool = vpool.get();
+      }
+
+      run_one_pass(pass_opt);
+
+      // Drain/join verify BEFORE reading the restart flag, so a mismatch that
+      // surfaces only as the final frames are checked still triggers a rebuild.
+      if (vpool) { vpool->finish(); g_verify_pool = nullptr; vpool.reset(); }
+
+      if (!g_gpu_failed_restart.load()) break;   // clean — verified, or no verify and no fault
+
+      const bool verify_trigger = g_verify_failed.load(std::memory_order_relaxed);
+
+      // Recoverable only if we can re-read the input AND discard the output.
+      // --tar re-reads its source paths; otherwise the fseek both TESTS and (as a
+      // side effect) REWINDS the input for the rebuild.
+      const bool in_rebuildable =
+          opt.tar_mode || (in && in != stdin && std::fseek(in, 0, SEEK_SET) == 0);
+      bool out_rebuildable;
+#ifndef _WIN32
+      if (dw_ptr) out_rebuildable = true;            // O_DIRECT regular file
+      else
+#endif
+        out_rebuildable = (out && std::fseek(out, 0, SEEK_SET) == 0);  // seekable (incl. redirected stdout)
+
+      if (!in_rebuildable || !out_rebuildable) {
+        // Unrecoverable over a pipe: die loudly so a pipeline fails.
+        if (verify_trigger) {
+          die(std::string("--verify: a frame failed to verify and the ")
+              + (!in_rebuildable ? "input" : "output")
+              + " is a pipe/stream, so the output cannot be discarded and rebuilt.\n"
+              "  The compressed bytes are CORRUPT; do not use them.  Re-run with\n"
+              "  regular files for input and output so --verify can recover.", EXIT_DATA);
+        }
+        die(std::string("a GPU faulted during compression and the ")
+            + (!in_rebuildable ? "input" : "output")
+            + " is a pipe/stream — the partial output cannot be discarded and\n"
+            "  rebuilt on the CPU, and a faulted GPU's output is NOT trustworthy.\n"
+            "  Any bytes already sent downstream are INCOMPLETE/CORRUPT; do not use them.\n"
+            "  Re-run with --cpu-only, or compress to/from regular files so a GPU\n"
+            "  fault can be recovered automatically.", EXIT_GPU_FAIL);
+      }
+
+      ++rebuild_attempt;
+
+      // --verify-retries cap (verify-triggered rebuilds only; a GPU fault rebuilds
+      // CPU-only once and the CPU path doesn't re-fault).
+      if (verify_trigger && opt.verify_retries > 0 && rebuild_attempt > opt.verify_retries) {
+        die("--verify: output still failed to verify after "
+            + std::to_string(opt.verify_retries)
+            + " CPU rebuild attempt(s) — this machine looks unreliable and the\n"
+            "  output is NOT trustworthy.  (Raise or clear --verify-retries to keep "
+            "trying.)", EXIT_DATA);
+      }
+
+      // Loud per-attempt log: an unattended user sees progress, and a failing seq
+      // that repeats across attempts marks a deterministic fault, not a transient.
+      {
+        std::ostringstream os;
+        if (verify_trigger) {
+          os << "WARNING: --verify caught a corrupt frame";
+          const int64_t bad = g_verify_failed_seq.load(std::memory_order_relaxed);
+          if (bad >= 0) os << " (sequence " << bad << ")";
+          os << " — discarding output and rebuilding CPU-only";
+        } else {
+          os << "WARNING: a GPU faulted — discarding output and rebuilding CPU-only";
+        }
+        os << " from the original input (attempt " << rebuild_attempt << ")...\n";
+        vlog(V_ERROR, opt, os.str());   // loud: an integrity event survives -q (only -qq silences)
+      }
+
+      // Reset the output to empty for the rebuild (input already rewound above).
+#ifndef _WIN32
+      if (dw_ptr) {
+        std::string write_path = use_atomic ? tmp : opt.output;
+        direct_writer.reset();                 // dtor joins writer thread, closes fd
+        direct_writer = std::make_unique<DirectWriter>();
+        if (!direct_writer->open(write_path))
+          die_io("failed to reopen O_DIRECT output for CPU rebuild");
+        dw_ptr = direct_writer.get();
+        g_direct_writer = dw_ptr;
+      } else
+#endif
+      if (out) {
+        std::rewind(out);
+        if (ftruncate(fileno(out), 0) != 0) { /* best-effort: rebuild overwrites */ }
+      }
+      meter.reset();
+
+      // Anti-spin floor between full-archive rebuilds — NOT a coordination wait:
+      // real rebuilds take real time; this only guards a pathological instant-fail
+      // loop (e.g. a tiny input) from busy-spinning a core.
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+      // Every rebuild is CPU-only — the trustworthy, deterministic path.
+      pass_opt = opt;
+      pass_opt.cpu_only = true; pass_opt.gpu_only = false; pass_opt.hybrid = false;
+    }
+
+    // CPU-only stats: written when the final (successful) pass ran on the CPU —
+    // the original cpu-only path, any rebuild, or a no-NVCOMP build.  The nvCOMP
+    // path writes its own stats internally.
+#ifdef HAVE_NVCOMP
+    const bool final_pass_cpu = pass_opt.cpu_only;
+#else
+    const bool final_pass_cpu = true;
+#endif
+    if (final_pass_cpu && !opt.stats_json.empty()) {
       CpuAgg agg{};
       agg.threads = (opt.cpu_threads > 0)
                     ? opt.cpu_threads
@@ -13672,7 +14127,6 @@ int main(int argc, char ** argv)
           std::chrono::steady_clock::now() - t0).count();
       write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, agg);
     }
-#endif
   } else {
     // Decompression / test mode
 
@@ -13745,6 +14199,16 @@ int main(int argc, char ** argv)
       CpuAgg dummy{};
       dummy.threads = 1;
       write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, dummy);
+    }
+
+    // --keep-going: summarize the damage and choose the recovery exit code.  The
+    // workers already printed a per-frame WARNING for each; here we report the
+    // affected file(s) (for --tar) or byte range(s) (plain .zst) and the verdict.
+    if (opt.keep_going && g_damage.damaged()) {
+      report_keep_going_damage(opt);
+      const int sev = g_damage.incomplete.load(std::memory_order_relaxed)
+          ? EXIT_DECOMP_INCOMPLETE : EXIT_DECOMP_UNVERIFIED;
+      if (sev > exit_code) exit_code = sev;   // worst across multiple input files
     }
   }
 
@@ -14347,6 +14811,17 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
+    else if (a == "--verify") opt.verify = true;
+    else if (a == "--keep-going") opt.keep_going = true;
+    else if (a.rfind("--verify-retries=", 0) == 0) {
+      std::string v = a.substr(17);
+      if (v.empty()) die_usage("missing value for --verify-retries");
+      char * end = nullptr;
+      long n = std::strtol(v.c_str(), &end, 10);
+      if (*end != '\0' || n < 0) die_usage("--verify-retries must be a non-negative integer (0 = unlimited)");
+      opt.verify = true;          // implied: you asked for a retry bound
+      opt.verify_retries = (int)n;
+    }
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
     else if (a == "-v" || a == "--verbose") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
@@ -14681,6 +15156,36 @@ static Options parse_args(int argc, char ** argv)
       vlog(V_NORMAL, opt, "warning: --sliding-window implies --cpu-only (GPU cannot use sliding window context)\n");
       opt.cpu_only = true;
       opt.backend_user_set = true;
+    }
+  }
+
+  if (opt.verify && opt.mode != Mode::COMPRESS) {
+    // Decompression already validates every frame's checksum as it runs, so
+    // --verify is redundant there — accept it quietly so scripts that always
+    // pass --verify still work, but say it's a no-op.
+    vlog(V_VERBOSE, opt, "note: --verify applies to compression; decompression already validates checksums\n");
+    opt.verify = false;
+  }
+
+  if (opt.keep_going) {
+    if (opt.mode != Mode::DECOMPRESS) {
+      // Recovery only makes sense when extracting (-d).  -t in particular would
+      // otherwise record damage but still print "OK"; accept quietly for scripts.
+      vlog(V_VERBOSE, opt, "note: --keep-going applies to decompression (-d); ignored otherwise\n");
+      opt.keep_going = false;
+    } else {
+      if (!opt.cpu_only) {
+        // The CPU decoder is the authoritative checksum validator and the recovery
+        // path lives there; recovery is rare and not perf-critical, so route the
+        // whole run through it rather than also threading it through nvCOMP.
+        vlog(V_VERBOSE, opt, "note: --keep-going implies --cpu-only (the authoritative checksum validator)\n");
+        opt.cpu_only = true;
+        opt.backend_user_set = true;
+      }
+      // Force the single-threaded reader so each frame's output offset is a simple
+      // prefix sum (needed to map damage to byte ranges / tar members); the
+      // parallel readers don't process frames in a single offset-accumulating order.
+      opt.read_threads = 1;
     }
   }
 

@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.13.33
+**Current version:** v0.14.43
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -602,6 +602,10 @@ high compat value.
   survivors.  (2) The compress catch guarded on `C.busy`, which isn't set until
   after the throwing H2D/compress-launch calls, so a launch failure stranded the
   just-popped batch and hung the writer.  Both fixed; see CHANGELOG v0.13.34.
+  **Superseded (v0.14.43):** the COMPRESS rescue was deleted entirely — a faulting
+  GPU's output is untrusted, so the pass now aborts cleanly and the driver rebuilds
+  CPU-only (no mid-run salvage to leak permits from).  The DECOMPRESS rescue stays
+  (a faulted GPU there is finished on CPU and the output is kept and correct).
 
 - **`HybridSched` corner cases — audited (v0.13.35), clean + one robustness fix.**
   No deadlock (fixed-mode `should_cpu_take`/`should_gpu_take` can't both be
@@ -735,6 +739,26 @@ throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
 | Remove dead SequentialDispatcher | 7.7 | Low | DONE (v0.13.30) |
 | Decompress reader queue-depth cap (gpu-only RSS blowup) | 7.8 | Medium | DONE (v0.13.29) |
 | Bundled short flags (-dc, -dk) for zstd/gzip compat | 7.9 | Medium | DONE (v0.13.27) |
+| `--verify` — background decompress-verify on compress (untrusted GPU) | — | Medium | DONE (v0.14.39–40) |
+| `--keep-going` — recover a damaged archive on decompress | — | Medium | DONE (v0.14.41–42) |
+| Delete compress CPU-rescue → clean GPU-fault abort | — | Medium | DONE (v0.14.43) |
+| Checkpoint/resume on fault (resume from last good frame vs. rebuild from zero) | — | Low | Not started |
+
+### Data integrity & recovery (v0.14.39–43)
+**Status: DONE (verify, keep-going, rescue removal); checkpoint/resume NOT started**
+
+A faulting GPU is an untrusted producer (see CHANGELOG v0.14.38).  `--verify`
+(compress) decompress-verifies every frame in the background and rebuilds CPU-only
+on any mismatch; `--keep-going` (decompress) recovers what it can from a damaged
+archive and reports the affected files / byte ranges; and the now-pointless
+compress rescue machinery was deleted in favor of a clean abort-and-rebuild.  See
+CHANGELOG for each.
+
+Remaining: on a fault, gzstd rebuilds the whole archive from frame zero.  A
+checkpoint/resume would decompress-verify the written prefix, find the last good
+frame, and resume CPU-only from there — a large win for a fault near the end of a
+multi-TB archive.  Fixed-size chunking makes the resume offset trivial; `--tar`
+re-walks its layout.  Not started.
 
 ### Streaming Decompression Output
 **Priority: HIGH | Complexity: Medium | Status: DONE (v0.12.24)**

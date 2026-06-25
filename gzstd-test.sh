@@ -984,6 +984,136 @@ else
 fi
 
 # ============================================================
+# 18b. --verify (background decompress-verify on write)
+# ============================================================
+section "--verify (decompress-verify on write)"
+
+# large.bin is 32 MiB = multiple default-size frames, so seq 0 is a real frame.
+vsrc="$TMPDIR/large.bin"
+
+# Clean run: --verify must succeed and round-trip exactly.
+vz="$TMPDIR/verify-clean.zst"; vr="$TMPDIR/verify-clean.rec"
+run_test "$GZSTD" --verify --cpu-only -k -f "$vsrc" -o "$vz" 2>/dev/null
+run_test "$GZSTD" -d -k -f "$vz" -o "$vr" 2>/dev/null
+files_match "$vsrc" "$vr" && pass "--verify clean run round-trips" \
+  || fail "--verify clean run" "mismatch"
+rm -f "$vz" "$vr"
+
+# Injected corruption: --verify must catch the bad frame (logging its sequence),
+# rebuild CPU-only, and produce a valid archive that round-trips exactly.
+vcz="$TMPDIR/verify-corrupt.zst"; vcr="$TMPDIR/verify-corrupt.rec"; verr="$TMPDIR/verify.err"
+GZSTD_DEBUG_CORRUPT_FRAME=0 "$GZSTD" --verify --cpu-only -k -f "$vsrc" -o "$vcz" 2>"$verr"
+"$GZSTD" -d -k -f "$vcz" -o "$vcr" 2>/dev/null
+if files_match "$vsrc" "$vcr" && grep -qiE "verify caught a corrupt frame.*sequence 0" "$verr"; then
+  pass "--verify catches corruption, rebuilds, round-trips"
+else
+  fail "--verify catches corruption" "no rebuild logged or output mismatch"
+fi
+rm -f "$vcz" "$vcr" "$verr"
+
+# Persistent corruption + --verify-retries=2: must give up after 2 rebuild
+# attempts with a non-zero (data) exit rather than loop forever.
+vgz="$TMPDIR/verify-giveup.zst"; gerr="$TMPDIR/verify-giveup.err"
+GZSTD_DEBUG_CORRUPT_FRAME=0 GZSTD_DEBUG_CORRUPT_PERSIST=1 \
+  "$GZSTD" --verify --cpu-only --verify-retries=2 -k -f "$vsrc" -o "$vgz" 2>"$gerr"
+vg_rc=$?
+if [[ $vg_rc -ne 0 ]] && grep -qiE "failed to verify after 2" "$gerr"; then
+  pass "--verify-retries caps rebuilds (exit $vg_rc)"
+else
+  fail "--verify-retries cap" "rc=$vg_rc (expected non-zero + give-up message)"
+fi
+rm -f "$vgz" "$gerr"
+
+# Corruption over a pipe cannot be rebuilt (output already streamed downstream),
+# so --verify must die loudly with a non-zero exit, not emit a corrupt stream.
+perr="$TMPDIR/verify-pipe.err"
+GZSTD_DEBUG_CORRUPT_FRAME=0 "$GZSTD" --verify --cpu-only -c "$vsrc" 2>"$perr" | cat >/dev/null
+vp_rc=${PIPESTATUS[0]}
+if [[ $vp_rc -ne 0 ]] && grep -qiE "pipe|corrupt|regular files" "$perr"; then
+  pass "--verify over a pipe dies loudly (exit $vp_rc)"
+else
+  fail "--verify over a pipe dies loudly" "rc=$vp_rc (expected non-zero + message)"
+fi
+rm -f "$perr"
+
+# ============================================================
+# 18c. --keep-going (decompress recovery + damage report)
+# ============================================================
+section "--keep-going (decompress recovery)"
+
+# Multi-frame plain .zst, one byte flipped inside a middle frame.  A single flip
+# decodes in full but fails the checksum, so the frame is recovered UNVERIFIED and
+# the run exits 6 (not aborting) with the output length preserved.
+kgsrc="$TMPDIR/keepgoing.bin"
+head -c 50331648 /dev/urandom > "$kgsrc"          # 48 MiB -> 3 default frames
+kgz="$TMPDIR/keepgoing.zst"; kgbad="$TMPDIR/keepgoing-bad.zst"; kgout="$TMPDIR/keepgoing.out"
+run_test "$GZSTD" --cpu-only -k -f "$kgsrc" -o "$kgz" 2>/dev/null
+cp "$kgz" "$kgbad"
+kgsz=$(stat -c%s "$kgbad")
+printf '\xFF' | dd of="$kgbad" bs=1 seek=$(( kgsz / 2 )) count=1 conv=notrunc 2>/dev/null
+
+# Without --keep-going: abort with a data error AND suggest --keep-going.
+"$GZSTD" -d -k -f "$kgbad" -o "$kgout" 2>"$TMPDIR/kg1.err"; kg1=$?
+if [[ $kg1 -ne 0 ]] && grep -qiE "keep-going" "$TMPDIR/kg1.err"; then
+  pass "corrupt .zst without --keep-going aborts + suggests --keep-going (exit $kg1)"
+else
+  fail "corrupt .zst aborts + suggests flag" "rc=$kg1"
+fi
+
+# With --keep-going: recover, report, exit 6 or 7, length preserved.
+"$GZSTD" -d --keep-going -k -f "$kgbad" -o "$kgout" 2>"$TMPDIR/kg2.err"; kg2=$?
+kgout_sz=$(stat -c%s "$kgout" 2>/dev/null || echo 0)
+if { [[ $kg2 -eq 6 ]] || [[ $kg2 -eq 7 ]]; } \
+   && grep -qiE "recovered past .* damaged frame" "$TMPDIR/kg2.err" \
+   && [[ "$kgout_sz" == "$(stat -c%s "$kgsrc")" ]]; then
+  pass "--keep-going recovers a corrupt .zst (exit $kg2, length preserved)"
+else
+  fail "--keep-going recovers .zst" "rc=$kg2 outsize=$kgout_sz expected=$(stat -c%s "$kgsrc")"
+fi
+rm -f "$kgz" "$kgbad" "$kgout" "$kgsrc" "$TMPDIR/kg1.err" "$TMPDIR/kg2.err"
+
+# --tar: a flipped byte inside a large member must name THAT file and still
+# recover the undamaged members intact.
+kgtree="$TMPDIR/kgtree"; rm -rf "$kgtree"; mkdir -p "$kgtree"
+echo "intact small file" > "$kgtree/a_small.txt"
+head -c 41943040 /dev/urandom > "$kgtree/big.bin"   # 40 MiB -> spans several frames
+echo "another intact file" > "$kgtree/z_small.txt"
+kgarc="$TMPDIR/kg.tar.zst"; kgbadarc="$TMPDIR/kg-bad.tar.zst"
+run_test "$GZSTD" --cpu-only -f -o "$kgarc" --tar "$kgtree" 2>/dev/null
+cp "$kgarc" "$kgbadarc"
+printf '\xFF' | dd of="$kgbadarc" bs=1 seek=$(( 20 * 1024 * 1024 )) count=1 conv=notrunc 2>/dev/null
+kgxd="$TMPDIR/kg-extract"; rm -rf "$kgxd"; mkdir -p "$kgxd"
+"$GZSTD" -d --tar --keep-going "$kgbadarc" -C "$kgxd" 2>"$TMPDIR/kg3.err"; kg3=$?
+a_ext=$(find "$kgxd" -name a_small.txt -print -quit 2>/dev/null)
+if { [[ $kg3 -eq 6 ]] || [[ $kg3 -eq 7 ]]; } \
+   && grep -qiE "damaged file" "$TMPDIR/kg3.err" \
+   && grep -qE "big\.bin" "$TMPDIR/kg3.err" \
+   && [[ -n "$a_ext" ]] && cmp -s "$kgtree/a_small.txt" "$a_ext"; then
+  pass "--keep-going --tar names the damaged file, recovers the rest (exit $kg3)"
+else
+  fail "--keep-going --tar damage report" "rc=$kg3 (see kg3.err)"
+fi
+rm -rf "$kgtree" "$kgxd"; rm -f "$kgarc" "$kgbadarc" "$TMPDIR/kg3.err"
+
+# Framing break: a truncated archive (frame boundary lost) cannot be resynced.
+# --keep-going must still recover the intact prefix, report RECOVERY STOPPED, and
+# exit 7 (incomplete) rather than aborting abruptly.
+fbsrc="$TMPDIR/framing.bin"
+head -c 50331648 /dev/urandom > "$fbsrc"          # 48 MiB -> 3 frames
+fbz="$TMPDIR/framing.zst"; fbt="$TMPDIR/framing-trunc.zst"; fbo="$TMPDIR/framing.out"
+run_test "$GZSTD" --cpu-only -k -f "$fbsrc" -o "$fbz" 2>/dev/null
+head -c 20971520 "$fbz" > "$fbt"                  # cut mid-frame-1: frame 0 intact, sync lost after
+"$GZSTD" -d --keep-going -k -f "$fbt" -o "$fbo" 2>"$TMPDIR/fb.err"; fb=$?
+fbo_sz=$(stat -c%s "$fbo" 2>/dev/null || echo 0)
+if [[ $fb -eq 7 ]] && grep -qiE "RECOVERY STOPPED" "$TMPDIR/fb.err" \
+   && [[ "$fbo_sz" == "16777216" ]] && cmp -s -n 16777216 "$fbsrc" "$fbo"; then
+  pass "--keep-going recovers the prefix of a truncated stream (exit 7)"
+else
+  fail "--keep-going framing break" "rc=$fb outsize=$fbo_sz"
+fi
+rm -f "$fbsrc" "$fbz" "$fbt" "$fbo" "$TMPDIR/fb.err"
+
+# ============================================================
 # 19. GPU VRAM pressure tests
 # ============================================================
 section "GPU VRAM pressure"

@@ -1,11 +1,81 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.38  
+**Covers:** v0.9.50 → v0.14.43  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.43 — delete the compress CPU-rescue machinery; clean GPU-fault abort
+
+With the v0.14.38 posture (a faulting GPU is abandoned and the archive rebuilt
+CPU-only), the old mid-run rescue had nothing left to do: the rescue queue, the
+`C.delivered`-watermark re-enqueue, and `gpu_only_cpu_fallback`'s "finish the tail
+on CPU" all produced output the rebuild then discarded — a pure ~2× CPU drain on
+the fault path.
+
+Replaced with a true abort.  A compress GPU fault sets `g_gpu_aborted` (kept
+separate from `g_gpu_failed_restart`, which `--verify` also sets after a pass):
+the producer's `TaskQueue::push` drops further frames, the CPU/GPU workers exit
+without draining the queue, and the writer bails its in-order wait without the
+"writer stuck" watchdog firing.  The driver rebuilds CPU-only as before.
+`g_gpu_aborted` is cleared before every pass (the rebuild included) — a missed
+reset made the first rebuild emit empty output, caught in fault-injection testing.
+
+Deleted: `cpu_worker_rescue`, the compress rescue pool and its `RescueQueue`, the
+`gpu_worker` rescue parameter, and the "keep inputs alive for rescue" retention
+(GPU-worker inputs now release at H2D always, freeing pooled-reader slots / mmap
+views sooner in hybrid too).
+
+Kept deliberately, because it is NOT vestigial: the hybrid CPU pool in normal
+operation; the startup VRAM-skip CPU dispatch (nothing written yet); and the whole
+DECOMPRESS rescue path — a faulted GPU on decompress is finished on CPU and the
+output is kept and correct (decompression is deterministic and checksum-verified).
+
+## v0.14.41–0.14.42 — `--keep-going`: recover a damaged archive on decompress
+
+Read-side counterpart to `--verify`.  Normally a frame whose XXH64 checksum fails
+aborts `-d` (exit 4).  With `--keep-going` gzstd recovers what it can and reports
+what is damaged.  Implies `--cpu-only` and the single-threaded reader (so each
+frame's output offset is a simple prefix sum); decompress-only.
+
+Each frame is one-shot-decoded into a full-size buffer: the one-shot decoder
+writes the whole frame before validating the trailing checksum, so a
+checksum-mismatch frame is recovered in full and keeps its exact length — nothing
+downstream (in particular `--tar` member boundaries) desyncs.  A hard decode error
+keeps the valid prefix plus zeros (the buffer is zeroed first so no stale pool data
+leaks).  Classified by `ZSTD_getErrorCode`: checksum mismatch → exit 6
+(unverified); any other error → exit 7 (incomplete).
+
+Reporting: plain `.zst` lists damaged output byte ranges; `--tar` names the
+affected member files (the extractor records each member's data range via
+`StreamReader.consumed_total` and intersects it with the damaged frames).  Without
+the flag the decompress error messages now suggest `--keep-going`.
+
+Framing break (v0.14.42): corruption that destroys frame boundaries (corrupt
+header, declared-size overrun, truncation) cannot be skipped without a magic-scan
+resync, which gzstd does not do.  The reader keeps the frames parsed so far, flags
+the break, and stops cleanly — the driver prints "RECOVERY STOPPED after N
+frame(s)" and exits 7 — instead of an abrupt die.
+
+## v0.14.39–0.14.40 — `--verify`: background decompress-verify while compressing
+
+zstd (and gzstd) only WRITE the per-frame XXH64 checksum; it is validated at read
+time, never at creation.  That is fine for a CPU compressor, but the GPU is an
+untrusted producer — a fault can emit wrong bytes that surface only at restore,
+possibly after the source is gone.  `--verify` closes the gap: a background pool
+independently decompress-verifies every finished frame (the `gzstd -t` round-trip)
+while compressing, and on any mismatch discards the output and rebuilds CPU-only,
+retrying until it verifies clean (`--verify-retries=N` caps it; 0 = unlimited, the
+default for an unattended backup).  Off by default, compress-only.
+
+The pool starts at one thread and grows on backlog, capped at hardware concurrency
+— its threads contend with the compress workers, so verification steals CPU from
+compression (backpressure in the right place), and on a GPU run the otherwise-idle
+CPU absorbs it nearly free.  A mismatch over a pipe (cannot rewind to rebuild) is a
+fatal data error.  The rebuild reuses the GPU-fault discard-and-rebuild path; a
+verify mismatch warning is loud enough to survive `-q`.
 
 ## v0.14.38 — GPU fault → full CPU-only rebuild; GPU subchunk overflow guard
 
