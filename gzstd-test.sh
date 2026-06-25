@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=254
-$EXTENSIVE && EXPECTED_TESTS=352
+EXPECTED_TESTS=257
+$EXTENSIVE && EXPECTED_TESTS=355
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -935,12 +935,52 @@ if has_gpu 2>/dev/null; then
     files_match "$TMPDIR/medium.txt" "$recovered" && pass "--gpu-batch=$batch" || fail "--gpu-batch=$batch" "mismatch"
     rm -f "$compressed" "$recovered"
   done
+
+  # GPU-fault recovery: a mid-run GPU fault (simulated via the debug env hook)
+  # must abandon ALL GPU output and rebuild the whole archive CPU-only from the
+  # original input, producing a valid archive that round-trips exactly.
+  gf_src="$TMPDIR/large.bin"; gf_zst="$TMPDIR/gpufault.zst"; gf_rec="$TMPDIR/gpufault.rec"
+  GZSTD_DEBUG_FAIL_GPU_AFTER=0 "$GZSTD" --gpu-only -k -f "$gf_src" -o "$gf_zst" 2>/dev/null
+  "$GZSTD" -d -k -f "$gf_zst" -o "$gf_rec" 2>/dev/null
+  files_match "$gf_src" "$gf_rec" && pass "GPU fault -> CPU-only rebuild (round-trips)" \
+    || fail "GPU fault -> CPU-only rebuild" "mismatch after rebuild"
+  rm -f "$gf_zst" "$gf_rec"
+
+  # Same recovery in --tar mode: rebuild from the source layout, extract matches.
+  # (gzstd --tar anchors member names on the given source path, which may be
+  # absolute, so locate the file by name rather than a fixed extracted path.)
+  gft_zst="$TMPDIR/gpufault-tar.zst"; gft_out="$TMPDIR/gpufault-extract"
+  mkdir -p "$gft_out"
+  GZSTD_DEBUG_FAIL_GPU_AFTER=0 "$GZSTD" --gpu-only -f -o "$gft_zst" --tar "$TMPDIR/tree" 2>/dev/null
+  "$GZSTD" -d --tar "$gft_zst" -C "$gft_out" 2>/dev/null
+  if [[ -n "$(find "$gft_out" -name small.txt -print -quit 2>/dev/null)" ]]; then
+    pass "GPU fault -> CPU-only rebuild (--tar)"
+  else
+    fail "GPU fault -> CPU-only rebuild (--tar)" "missing extracted file after rebuild"
+  fi
+  rm -rf "$gft_out" "$gft_zst"
+
+  # A GPU fault over a pipe cannot be rebuilt (output already streamed downstream,
+  # input may be consumed), so gzstd must die loudly with a non-zero exit and an
+  # explanatory message rather than emit a silently-corrupt stream.
+  gf_perr="$TMPDIR/gpufault.err"
+  GZSTD_DEBUG_FAIL_GPU_AFTER=0 "$GZSTD" --gpu-only -c "$gf_src" 2>"$gf_perr" | cat >/dev/null
+  gf_rc=${PIPESTATUS[0]}
+  if [[ $gf_rc -ne 0 ]] && grep -qiE "pipe|corrupt|--cpu-only" "$gf_perr"; then
+    pass "GPU fault over a pipe dies loudly (exit $gf_rc)"
+  else
+    fail "GPU fault over a pipe dies loudly" "rc=$gf_rc (expected non-zero + message)"
+  fi
+  rm -f "$gf_perr"
 else
   skip "gpu-only compress/decompress" "no GPU"
   skip "hybrid compress/decompress" "no GPU"
   skip "gpu integrity test" "no GPU"
   skip "gpu tar" "no GPU"
   skip "gpu batch sizes" "no GPU"
+  skip "GPU fault -> CPU-only rebuild (round-trips)" "no GPU"
+  skip "GPU fault -> CPU-only rebuild (--tar)" "no GPU"
+  skip "GPU fault over a pipe dies loudly" "no GPU"
 fi
 
 # ============================================================

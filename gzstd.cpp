@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.33";
+static constexpr const char * GZSTD_VERSION = "0.14.38";
 //
 // Architecture overview:
 //
@@ -834,6 +834,17 @@ static void print_help_long()
 "     that the archive is complete — catching a truncated or corrupt tar\n"
 "     that plain -t (which only checks the zstd stream) would pass.\n"
 "\n"
+"  -l, --list\n"
+"     List mode (no output written).  For a plain .zst file, prints the\n"
+"     per-file frame summary — frame count, skippable frames, compressed\n"
+"     and uncompressed sizes, ratio, and whether a content checksum is\n"
+"     present (Frames/Skips/Compressed/Uncompressed/Ratio/Check), matching\n"
+"     `zstd -l`.  Reads only frame headers, not the payload, so it is fast\n"
+"     even on huge archives.\n"
+"     With --tar (`-l --tar ARCHIVE`), lists the archive contents in\n"
+"     `tar -tvf` style (mode, owner, size, mtime, name) by decompressing\n"
+"     and parsing the tar headers in memory.\n"
+"\n"
 "  -k\n"
 "     Keep input after success (this is the default).\n"
 "\n"
@@ -1100,7 +1111,9 @@ static void print_help_long()
 "\n"
 "  --gpu-only\n"
 "     Force GPU-only.  Fails if no GPU is available or all GPUs fail\n"
-"     to initialize.\n"
+"     to initialize.  If a GPU faults mid-run, its output cannot be\n"
+"     trusted, so the whole archive is discarded and rebuilt CPU-only\n"
+"     from the original input.\n"
 "\n"
 "  --hybrid\n"
 "     Enable CPU + GPU scheduling (default when a GPU is present).\n"
@@ -1550,6 +1563,18 @@ struct Meter {
   std::atomic< uint64_t > reader_blocked_ns { 0 };
   std::atomic< int >      reader_threads    { 1 }; // io/parse/copy/blocked sum across these
   std::chrono::steady_clock::time_point t0 { std::chrono::steady_clock::now() };
+
+  // Zero all counters and restart the clock — used when a GPU fault forces a
+  // full CPU-only rebuild so the rebuild's progress/summary start fresh.
+  void reset() {
+    read_bytes = 0; wrote_bytes = 0; tasks_done = 0; total_frames = 0;
+    total_out = 0; total_out_final = false; read_elapsed_ms = 0;
+    writer_disk_ns = 0; writer_iowrite_ns = 0; writer_hol_ns = 0;
+    writer_hol_depth_ns = 0; writer_starved_ns = 0;
+    reader_io_ns = 0; reader_parse_ns = 0; reader_copy_ns = 0;
+    reader_blocked_ns = 0; reader_threads = 1;
+    t0 = std::chrono::steady_clock::now();
+  }
 };
 
 // Interpret the Meter's writer-state accounting into a one-line diagnosis.
@@ -2854,6 +2879,19 @@ static PerfCounters * g_perf = nullptr;
 #ifndef _WIN32
 static DirectWriter * g_direct_writer = nullptr;
 #endif
+
+// Set when ANY GPU fault is detected during compression.  A faulting GPU is an
+// unreliable narrator — we cannot trust which frames it already "finished" — so
+// the entire GPU/hybrid attempt is abandoned and the compress driver rebuilds
+// the whole output CPU-only from the (still-present) input.  See the compress
+// restart path in the driver.
+static std::atomic<bool> g_gpu_failed_restart{false};
+
+// Test-only fault injection (read once from $GZSTD_DEBUG_FAIL_GPU_AFTER): make a
+// GPU compress worker throw a simulated fault after it has delivered this many
+// frames, to exercise the CPU-only restart path deterministically (real GPU
+// faults are intermittent).  -1 (default, env unset) = disabled.
+static int64_t g_debug_fail_gpu_after = -1;
 
 // Fixed pool of page-aligned buffers for the zero-copy --direct-read path.
 // The single O_DIRECT reader preads each chunk straight into a pooled buffer and
@@ -5708,13 +5746,25 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
                                   Meter * m, FrameThrottle * bp)
 {
   int threads = resolve_cpu_threads(opt.cpu_threads);
-  vlog(V_DEFAULT, opt,
-       std::string("WARNING: all GPUs failed; finishing ")
-       + (decompress ? "decompression" : "compression") + " on CPU ("
-       + std::to_string(threads) + " threads).\n"
-       "  Falling back for data safety: the remaining frames are processed "
-       "on the CPU instead,\n  so the output is complete and correct — just "
-       "without GPU acceleration.\n");
+  // Compress with a pending restart (g_gpu_failed_restart): this drain only
+  // tears the pipeline down cleanly; its output is about to be DISCARDED and
+  // rebuilt from scratch by the driver, so don't claim it's "complete and
+  // correct".  Decompress (and any non-restart drain) keeps the original
+  // finish-on-CPU semantics.
+  if (!decompress && g_gpu_failed_restart.load()) {
+    vlog(V_DEFAULT, opt,
+         std::string("WARNING: GPU fault — draining the pipeline on CPU (")
+         + std::to_string(threads) + " threads); this partial output will be "
+         "discarded and the whole archive rebuilt.\n");
+  } else {
+    vlog(V_DEFAULT, opt,
+         std::string("WARNING: all GPUs failed; finishing ")
+         + (decompress ? "decompression" : "compression") + " on CPU ("
+         + std::to_string(threads) + " threads).\n"
+         "  Falling back for data safety: the remaining frames are processed "
+         "on the CPU instead,\n  so the output is complete and correct — just "
+         "without GPU acceleration.\n");
+  }
   CpuAgg agg{};
   agg.threads = threads;
   agg.per_thread.resize((size_t)threads);
@@ -9982,6 +10032,13 @@ static void gpu_worker(
         // Upload each subchunk to its slot in the device input buffer
         for (size_t i = 0; i < C.filled; ++i) {
           const Task & t = C.batch[i];
+          // Guard the slot bound: a Task larger than gpu_chunk would overflow
+          // its device slot (illegal memory access).  The driver clamps the
+          // host chunk to GPU_SUBCHUNK_MAX so this can't happen — fail loudly
+          // rather than silently corrupt VRAM if that invariant ever breaks.
+          if (t.len() > C.gpu_chunk)
+            die("internal error: input chunk " + std::to_string(t.len())
+                + " exceeds GPU subchunk slot " + std::to_string(C.gpu_chunk));
           void * d_dst = static_cast<char*>(C.d_in_base) + i * C.gpu_chunk;
 
           if (C.h2d_pinned_base) {
@@ -10081,6 +10138,14 @@ static void gpu_worker(
             gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
             C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
+            // Test hook: deterministically simulate a GPU fault after N frames
+            // (real illegal-access faults are intermittent) to exercise the
+            // CPU-only rebuild path.  Disabled unless GZSTD_DEBUG_FAIL_GPU_AFTER set.
+            if (g_debug_fail_gpu_after >= 0) {
+              static std::atomic<int64_t> dbg_delivered{0};
+              if (dbg_delivered.fetch_add(1) + 1 > g_debug_fail_gpu_after)
+                throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
+            }
           }
           // Hybrid keeps inputs alive for rescue; the whole batch delivered,
           // so recycle them now (pool slot / view / owned buffer alike).
@@ -10247,6 +10312,14 @@ static void gpu_worker(
             gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
             results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
             C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
+            // Test hook: deterministically simulate a GPU fault after N frames
+            // (real illegal-access faults are intermittent) to exercise the
+            // CPU-only rebuild path.  Disabled unless GZSTD_DEBUG_FAIL_GPU_AFTER set.
+            if (g_debug_fail_gpu_after >= 0) {
+              static std::atomic<int64_t> dbg_delivered{0};
+              if (dbg_delivered.fetch_add(1) + 1 > g_debug_fail_gpu_after)
+                throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
+            }
           }
           // Hybrid keeps inputs alive for rescue; batch fully delivered —
           // recycle now (see the async completion path).
@@ -10393,8 +10466,13 @@ static void gpu_worker(
     queue->notify_cpu_waiters();
   }
   catch (const std::exception & e) {
-    // GPU failure: record error, rescue any in-flight chunks to CPU fallback
+    // GPU failure: a faulted GPU is an unreliable narrator — we cannot trust any
+    // frame it reported "done".  Flag the whole compress for a CPU-only rebuild
+    // (the driver discards this output and starts over from the input).  The
+    // in-flight rescue/fallback below still runs so the pipeline tears down
+    // cleanly; its output is thrown away.
     *any_gpu_failed = true;
+    g_gpu_failed_restart.store(true);
     *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
 
     try {
@@ -10760,6 +10838,23 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
              + " MiB is smaller than the ultra window ("
              + std::to_string(ultra_min) + " MiB). CPU compression ratio will suffer.\n");
       }
+    }
+  }
+
+  // GPU slots are sized to gpu_chunk = min(host_chunk, GPU_SUBCHUNK_MAX) and the
+  // GPU worker does NOT split a Task into subchunks, so a host chunk larger than
+  // GPU_SUBCHUNK_MAX would overflow the device input slot on the H2D copy — a
+  // device out-of-bounds write, i.e. an illegal memory access that wedges the
+  // GPU.  Any GPU-capable run reaches this function (cpu-only never does), so
+  // clamp here.  This overrides the ultra auto-bump above for hybrid: a >16 MiB
+  // ultra window for the CPU rescue workers is not worth a GPU OOB.
+  {
+    const size_t gpu_cap_mib = GPU_SUBCHUNK_MAX / ONE_MIB;
+    if (chosen_mib > gpu_cap_mib) {
+      vlog(V_DEFAULT, opt, "warning: clamping chunk size "
+           + std::to_string(chosen_mib) + " -> " + std::to_string(gpu_cap_mib)
+           + " MiB (GPU subchunks cap at " + std::to_string(gpu_cap_mib) + " MiB)\n");
+      chosen_mib = gpu_cap_mib;
     }
   }
 
@@ -11150,18 +11245,20 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Report GPU failures.  Even when ALL GPUs failed in --gpu-only mode the
   // job is already complete: the last failing worker ran
   // gpu_only_cpu_fallback (with its own warning), and the rescue pool
-  // recompressed any in-flight batches.  Output integrity is unaffected —
-  // CPU and GPU emit interchangeable zstd frames — so warn and continue
-  // instead of dying with EXIT_GPU_FAIL over data that is safely on disk.
+  // recompressed any in-flight batches.  Output integrity is intact — CPU and
+  // GPU emit interchangeable zstd frames, and verify-on-write recompresses any
+  // silently-corrupt GPU frame on the CPU — so the archive on disk is complete
+  // and correct.  But every GPU faulting is a hardware/driver problem worth
+  // surfacing, so we flag it for an EXIT_GPU_FAIL once the output is finalized.
   if (any_gpu_failed.load()) {
-    int failed_count = 0;
-    for (const auto & s : fatal_msgs)
-      if (!s.empty()) ++failed_count;
-    int total_gpus = (int)fatal_msgs.size();
-    const char * suffix = (failed_count >= total_gpus)
-        ? " (work completed on CPU)\n"
+    // If a GPU faulted mid-run (g_gpu_failed_restart), this output is about to
+    // be discarded and rebuilt CPU-only by the driver — say so plainly.  A
+    // startup VRAM skip with no fault just continues on the remaining workers.
+    const bool rebuilding = g_gpu_failed_restart.load();
+    const char * suffix = rebuilding
+        ? " (output will be discarded; rebuilding CPU-only)\n"
         : (abort_on_failure.load() ? " (other GPUs continuing)\n"
-                                   : " (rescued to CPU)\n");
+                                   : " (handled on CPU)\n");
     for (const auto & s : fatal_msgs)
       if (!s.empty())
         vlog(V_DEFAULT, opt, "WARNING: " + s + suffix);
@@ -13206,6 +13303,10 @@ int main(int argc, char ** argv)
 {
   setup_signal_handlers();
 
+  // Test-only: deterministic GPU fault injection (see g_debug_fail_gpu_after).
+  if (const char * fa = std::getenv("GZSTD_DEBUG_FAIL_GPU_AFTER"))
+    g_debug_fail_gpu_after = std::atoll(fa);
+
   // Recycle frame buffers instead of mmap/munmap-ing them every chunk.
   // Our per-frame heap buffers are large (16 MiB default, 32 MiB ultra), so glibc
   // serves each via mmap (its dynamic threshold caps at 32 MiB and the 4-producer/
@@ -13496,7 +13597,64 @@ int main(int argc, char ** argv)
         write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, agg);
       }
     } else {
+      g_gpu_failed_restart.store(false);
       compress_nvcomp(in, out, opt, &meter);
+      if (g_gpu_failed_restart.load()) {
+        // A GPU faulted mid-run.  A faulted GPU's output cannot be trusted, so
+        // the only safe response is to discard everything and rebuild the whole
+        // archive CPU-only from the original input.  That needs to (a) re-read
+        // the input and (b) discard the partial output — both impossible over a
+        // pipe: stdin is already consumed, and the partial (untrusted) bytes have
+        // already streamed to the downstream reader and cannot be recalled.
+        // --tar re-reads its source paths, so only its OUTPUT can be a blocker.
+        const bool in_rebuildable =
+            opt.tar_mode || (in && in != stdin && std::fseek(in, 0, SEEK_SET) == 0);
+        bool out_rebuildable;
+#ifndef _WIN32
+        if (dw_ptr) out_rebuildable = true;            // O_DIRECT regular file
+        else
+#endif
+          out_rebuildable = (out && std::fseek(out, 0, SEEK_SET) == 0);  // seekable file (incl. redirected stdout)
+
+        if (!in_rebuildable || !out_rebuildable) {
+          // Unrecoverable: die loudly with a non-zero code so a pipeline fails.
+          die(std::string("a GPU faulted during compression and the ")
+              + (!in_rebuildable ? "input" : "output")
+              + " is a pipe/stream — the partial output cannot be discarded and\n"
+              "  rebuilt on the CPU, and a faulted GPU's output is NOT trustworthy.\n"
+              "  Any bytes already sent downstream are INCOMPLETE/CORRUPT; do not use them.\n"
+              "  Re-run with --cpu-only, or compress to/from regular files so a GPU\n"
+              "  fault can be recovered automatically.", EXIT_GPU_FAIL);
+        }
+
+        vlog(V_DEFAULT, opt,
+             "WARNING: a GPU faulted — discarding all output and rebuilding the "
+             "entire archive on the CPU from the original input...\n");
+        // Reset the output to empty (input was already rewound by the check above).
+#ifndef _WIN32
+        if (dw_ptr) {
+          std::string write_path = use_atomic ? tmp : opt.output;
+          direct_writer.reset();                 // dtor joins writer thread, closes fd
+          direct_writer = std::make_unique<DirectWriter>();
+          if (!direct_writer->open(write_path))
+            die_io("failed to reopen O_DIRECT output for CPU rebuild");
+          dw_ptr = direct_writer.get();
+          g_direct_writer = dw_ptr;
+        } else
+#endif
+        if (out) {
+          std::rewind(out);
+          if (ftruncate(fileno(out), 0) != 0) { /* best-effort: rebuild overwrites */ }
+        }
+        meter.reset();
+        Options cpu_opt = opt;
+        cpu_opt.cpu_only = true; cpu_opt.gpu_only = false; cpu_opt.hybrid = false;
+        g_gpu_failed_restart.store(false);
+        if (cpu_opt.sliding_window)
+          compress_cpu_sliding_window(in, out, cpu_opt, &meter);
+        else
+          compress_cpu_mt(in, out, cpu_opt, &meter);
+      }
     }
 #else
     if (opt.gpu_only) die_usage("This binary was built without nvCOMP; --gpu-only cannot be satisfied");

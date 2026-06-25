@@ -1,9 +1,70 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.33  
+**Covers:** v0.9.50 → v0.14.38  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.38 — GPU fault → full CPU-only rebuild; GPU subchunk overflow guard
+
+Background: a `--gpu-only` compress on a faulting GPU produced a corrupt archive.
+A CUDA `illegal memory access` is asynchronous and sticky — the faulting kernel
+corrupts its output while the error only surfaces at a later sync, so the
+completion path saw `cudaStreamQuery == cudaSuccess` and `nvcompSuccess` and
+delivered an already-corrupt frame.  The old rescue trusted any frame past its
+`delivered` watermark, so the corrupt frame stayed in the output and the run
+exited 0.  (An earlier attempt verified every GPU frame by CPU-decompressing it
+before commit; that worked but cost ~30% throughput on every run to defend
+against a rare event, and it treated the symptom, not the cause.)
+
+New approach — a faulting GPU is an unreliable narrator, so don't try to salvage
+its work:
+
+1. Subchunk overflow guard.  GPU input/output slots are sized to
+   `gpu_chunk = min(host_chunk, GPU_SUBCHUNK_MAX=16 MiB)` and the worker does not
+   split a Task into subchunks, so a host chunk larger than 16 MiB (e.g.
+   `--chunk-size 32`, or the hybrid ultra-window auto-bump) overflowed the device
+   slot on the H2D copy — itself an illegal memory access.  The compress driver
+   now clamps the host chunk to GPU_SUBCHUNK_MAX whenever a GPU is in play
+   (warning if it had to), and the H2D loop hard-guards the slot bound.  This
+   removes one concrete way we could provoke the fault ourselves.
+
+2. Fault → discard → CPU rebuild.  On ANY GPU fault during compression, the whole
+   GPU/hybrid attempt is abandoned: nothing the GPU produced is trusted, the
+   partial output is discarded (the O_DIRECT writer is reopened with O_TRUNC, or
+   a buffered output is truncated to 0), and the entire archive is rebuilt
+   CPU-only from the original input — which is always still present (and for
+   `--tar`, the layout is rebuilt from the source paths).  Speed is secondary to
+   a correct archive.  If the input/output is not seekable (stdin/pipe) the
+   rebuild is impossible and we die with a clear message to rerun `--cpu-only`.
+   This replaces the old per-frame verify and the partial CPU "finish the tail"
+   fallback for the fault case.
+
+   The pipe case is unrecoverable by construction: stdin is already consumed and
+   any partial (untrusted) output has already streamed to the downstream reader
+   and cannot be recalled.  So a GPU fault while `--gpu-only`/`--hybrid` reads or
+   writes a pipe dies loudly with EXIT_GPU_FAIL (5) and a message stating the
+   already-emitted bytes are incomplete/corrupt and to rerun `--cpu-only` (or use
+   regular files so a fault can be recovered).  `--tar` re-reads its source paths,
+   so only a piped OUTPUT blocks its rebuild.
+
+Tested deterministically (real GPU faults are intermittent): a debug-only hook,
+$GZSTD_DEBUG_FAIL_GPU_AFTER=N, makes a GPU worker throw a simulated fault after
+N delivered frames (disabled otherwise — a single almost-always-false branch).
+The suite asserts that a fault triggers a CPU-only rebuild whose output is a
+valid archive that round-trips exactly, for both a plain file and `--tar`.
+
+---
+
+## v0.14.34 — document -l/--list in --help
+
+The `-l`/`--list` mode was listed in the short `-h` summary but had no entry in
+the full `--help` OPERATION section.  Added one (after `-t`) describing both
+forms: plain `.zst` frame summary (`zstd -l` style, header-only so it stays fast
+on huge archives) and `-l --tar` archive listing (`tar -tvf` style).  No code
+change.
 
 ---
 
