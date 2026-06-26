@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.46";
+static constexpr const char * GZSTD_VERSION = "0.14.47";
 //
 // Architecture overview:
 //
@@ -2503,6 +2503,30 @@ static void release_pinned(uint64_t bytes, const Options & opt)
 // disk).
 static constexpr int THROTTLE_SLACK_FACTOR = 4;
 static constexpr int THROTTLE_MIN_FRAMES = 32;
+
+// --verify: how many finished frames to buffer ahead of the verify pool.  Each
+// frame is held (a shared_ptr) until verified, so this trades RAM for the ability
+// to absorb the GPU's bursty multi-device delivery without the verify tap
+// back-pressuring the writer.  Scale it with available RAM — a small/limited-RAM
+// system gets a shallow queue (and never OOMs), a big box gets a deep one that
+// smooths bursts — capped so it never dominates RAM, honoring --memlimit.
+// frame_bytes is the worst-case (uncompressed-chunk) frame size, so the byte
+// budget is conservative (real compressed frames are smaller).
+static size_t compute_verify_queue_depth(size_t frame_bytes, const Options & opt)
+{
+  size_t avail = get_available_ram_bytes();
+  if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;   // assume 8 GiB if unknown
+  frame_bytes = std::max<size_t>(frame_bytes, 1);
+  size_t budget = avail / 16;                            // ~6% of available RAM
+  const size_t HARD_CAP = 16ULL * 1024 * 1024 * 1024;    // never hold > 16 GiB of frames
+  if (budget > HARD_CAP) budget = HARD_CAP;
+  if (opt.mem_limit_mib > 0) {                            // give verify a slice of any --memlimit
+    size_t ml = (size_t(opt.mem_limit_mib) * ONE_MIB) / 4;
+    if (ml < budget) budget = ml;
+  }
+  size_t depth = budget / frame_bytes;
+  return std::clamp<size_t>(depth, 32, 8192);            // floor keeps it functional; ceiling sane
+}
 
 static int compute_throttle_budget(size_t frame_bytes,
                                    int pipeline_parallelism,
@@ -14085,18 +14109,25 @@ int main(int argc, char ** argv)
       g_verify_failed_seq.store(-1, std::memory_order_relaxed);
 
       // --verify: stand up a background decompress-verify pool for this pass.
-      // It taps frames via g_verify_pool from the writer's in-order drain.  Cap
-      // the pool well below the core count: decompress-verify only needs to match
-      // the producer (a few threads), and on a fast many-core box letting it grow
-      // to every core starves the compress pipeline of CPU and memory bandwidth.
-      // The pool grows rate-matched from 1 up to this ceiling (see maybe_grow).
+      // It taps frames via g_verify_pool from the writer's in-order drain.  Two
+      // dynamic knobs, both kept well clear of starving the compress pipeline:
+      //   * thread cap — decompress-verify only needs to match the producer (a
+      //     handful of threads even on 8 GPUs); cap at ~cores/16 (≤16) so it can
+      //     never grow into the pipeline's CPU.  The pool ramps rate-matched from
+      //     1 up to this ceiling (see maybe_grow) and usually settles far below.
+      //   * queue depth — sized to available RAM so it can buffer the GPU's bursty
+      //     delivery instead of back-pressuring the writer (see
+      //     compute_verify_queue_depth); shallow on limited-RAM boxes, deep on big.
       std::unique_ptr<VerifyPool> vpool;
       if (opt.verify) {
         const int cores = (opt.cpu_threads > 0)
             ? opt.cpu_threads
             : std::max(1, (int)std::thread::hardware_concurrency());
-        const int vmax = std::max(2, cores / 8);
-        vpool = std::make_unique<VerifyPool>(vmax, 256 /* max frames queued */);
+        const int vmax = std::clamp(cores / 16, 2, 16);
+        size_t frame_est = std::max<size_t>(opt.chunk_mib, 1) * ONE_MIB;  // worst-case frame size
+        if (!opt.cpu_only) frame_est = std::min(frame_est, GPU_SUBCHUNK_MAX);   // GPU frames ≤ 16 MiB
+        const size_t vqueue = compute_verify_queue_depth(frame_est, opt);
+        vpool = std::make_unique<VerifyPool>(vmax, vqueue);
         g_verify_pool = vpool.get();
       }
 

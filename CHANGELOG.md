@@ -1,13 +1,13 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.46  
+**Covers:** v0.9.50 → v0.14.47  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
-## v0.14.44–0.14.46 — `--verify` observability at `-v`, rate-matched verify pool; drop a redundant O_DIRECT line
+## v0.14.44–0.14.47 — `--verify` observability at `-v`, rate-matched + RAM-sized verify pool; drop a redundant O_DIRECT line
 
 `--verify` ran silently — no way to see whether it was keeping up or how much CPU
 it cost, which matters on `--gpu-only` runs where it competes with the otherwise
@@ -50,6 +50,24 @@ rate by >10%.  Once an added thread stops helping (bandwidth/CPU plateau, or it 
 matched the producer) it holds, so the pool settles at the few threads it actually
 uses.  The `-v` line now reports the aggregate **drain** rate (compare to the
 compress out-rate for keep-up) alongside the per-thread rate.
+
+That cut the `--gpu-only` penalty from ~5 s to ~1–2 s, with the pool settling at
+8–9 threads (gpu-only) / 13–15 (hybrid) instead of 256.  The residual was *not* a
+capacity deficit — verify keeps up on average (`drain ≈ out`, ~1 thread's worth) —
+but the 8 GPUs deliver in bursts that briefly overflowed the fixed 256-frame queue,
+and since the verify tap lives in the writer, a full queue stalls the writer for a
+moment (×~5000, ~2.8 s total).
+
+**Dynamic sizing (v0.14.47):** make both knobs scale to the machine instead of
+fixed constants.  The queue depth is now sized from available RAM
+(`compute_verify_queue_depth`: ~6 % of free RAM, capped at 16 GiB and honoring
+`--memlimit`, divided by the worst-case frame size, clamped to 32..8192 frames) —
+so a big box gets a deep queue (~1024 frames) that absorbs the GPU bursts without
+back-pressuring the writer, while a limited-RAM box gets a shallow one and never
+risks OOM (the old fixed 256 frames was up to 4 GiB regardless of RAM).  And the
+thread cap drops to `clamp(cores/16, 2, 16)` — the pool only ever needs a handful,
+and a deeper queue means it grows to even fewer (bursts are buffered, not drained
+by spinning up threads).
 
 ## v0.14.43 — delete the compress CPU-rescue machinery; clean GPU-fault abort
 
