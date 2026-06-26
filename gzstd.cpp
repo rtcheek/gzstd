@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.43";
+static constexpr const char * GZSTD_VERSION = "0.14.45";
 //
 // Architecture overview:
 //
@@ -3777,6 +3777,7 @@ public:
     : max_threads_(std::max(1, max_threads)),
       max_queue_(std::max<size_t>(4, max_queue)),
       high_water_(std::max<size_t>(2, max_queue_ / 2)) {
+    t_start_ = now_ns();
     spawn_one();   // start very low — a single verify thread
   }
   ~VerifyPool() { finish(); }
@@ -3792,11 +3793,22 @@ public:
     bool grow = false;
     {
       std::unique_lock<std::mutex> lk(m_);
+      // Stall accounting: if the queue is full here, verification has fallen
+      // behind compression and this submit (the writer) is about to block —
+      // i.e. verify is back-pressuring the pipeline.  Time it for the -v summary.
+      const bool will_block = (q_.size() >= max_queue_)
+                              && !g_verify_failed.load(std::memory_order_relaxed);
+      const uint64_t wt0 = will_block ? now_ns() : 0;
       not_full_.wait(lk, [&]{
         return q_.size() < max_queue_ || g_verify_failed.load(std::memory_order_relaxed);
       });
+      if (will_block) {
+        stall_ns_.fetch_add(now_ns() - wt0, std::memory_order_relaxed);
+        stall_count_.fetch_add(1, std::memory_order_relaxed);
+      }
       if (g_verify_failed.load(std::memory_order_relaxed)) return;
       q_.push_back({seq, frame});
+      if (q_.size() > peak_q_) peak_q_ = q_.size();   // guarded by m_
       grow = q_.size() > high_water_;
     }
     not_empty_.notify_one();
@@ -3815,10 +3827,38 @@ public:
     not_full_.notify_all();
     {
       std::lock_guard<std::mutex> tlk(threads_m_);
+      final_threads_ = (int)threads_.size();   // peak (the pool only grows)
       for (auto & t : threads_) if (t.joinable()) t.join();
       threads_.clear();
     }
+    t_end_ = now_ns();
     return !g_verify_failed.load(std::memory_order_relaxed);
+  }
+
+  // -v one-line summary of how verification kept up.  Call after finish().
+  void log_summary(const Options & opt) const {
+    if (opt.verbosity < V_VERBOSE) return;
+    const uint64_t fr = frames_.load(std::memory_order_relaxed);
+    const uint64_t by = bytes_.load(std::memory_order_relaxed);
+    const uint64_t st = stall_ns_.load(std::memory_order_relaxed);
+    const uint64_t sc = stall_count_.load(std::memory_order_relaxed);
+    const double vsec = verify_ns_.load(std::memory_order_relaxed) / 1e9;  // active CPU time
+    char bs[32]; human_bytes(double(by), bs, sizeof(bs));
+    // Intrinsic decompress rate (bytes / active verify time) — "how fast it works",
+    // independent of how long it sat idle waiting for frames to arrive.
+    const double gibs = vsec > 0 ? double(by) / vsec / (1024.0*1024.0*1024.0) : 0.0;
+    (void)t_start_; (void)t_end_;
+    std::ostringstream os;
+    os << "[VERIFY] " << final_threads_ << " thread(s) (cap " << max_threads_ << "), "
+       << fr << " frames (" << bs << ") decompress-checked @ "
+       << std::fixed << std::setprecision(2) << gibs << " GiB/s, peak backlog "
+       << peak_q_ << "/" << max_queue_ << " frames; ";
+    if (sc == 0)
+      os << "kept up (compression never waited on verify)";
+    else
+      os << "fell behind: throttled compression " << sc << "x for "
+         << std::fixed << std::setprecision(2) << (st / 1e9) << " s";
+    vlog(V_VERBOSE, opt, os.str() + "\n");
   }
 
 private:
@@ -3865,9 +3905,13 @@ private:
         q_.pop_front();
       }
       not_full_.notify_one();
-      if (it.frame && !verify_one(zds, scratch, *it.frame)) {
-        mark_failed(it.seq);
-        break;
+      if (it.frame) {
+        const uint64_t vt0 = now_ns();
+        const bool ok = verify_one(zds, scratch, *it.frame);
+        verify_ns_.fetch_add(now_ns() - vt0, std::memory_order_relaxed);
+        frames_.fetch_add(1, std::memory_order_relaxed);
+        bytes_.fetch_add(it.frame->size(), std::memory_order_relaxed);
+        if (!ok) { mark_failed(it.seq); break; }
       }
     }
     ZSTD_freeDStream(zds);
@@ -3908,6 +3952,13 @@ private:
 
   std::mutex                 threads_m_;
   std::vector<std::thread>   threads_;
+
+  // -v stats.
+  std::atomic<uint64_t> frames_{0}, bytes_{0}, verify_ns_{0};
+  std::atomic<uint64_t> stall_ns_{0}, stall_count_{0};
+  size_t                peak_q_ = 0;          // guarded by m_
+  int                   final_threads_ = 0;   // captured in finish()
+  uint64_t              t_start_ = 0, t_end_ = 0;
 };
 
 // Set by the compress driver while a --verify run is in flight; the writer's
@@ -13888,7 +13939,6 @@ int main(int argc, char ** argv)
       if (dw->open(write_path)) {
         if (out) { std::fclose(out); out = nullptr; }
         direct_writer = std::move(dw);
-        vlog(V_VERBOSE, opt, "[O_DIRECT] using O_DIRECT for output (--direct)\n");
       }
     }
   } else if (opt.direct_io && to_stdout && out == stdout) {
@@ -14018,7 +14068,7 @@ int main(int argc, char ** argv)
 
       // Drain/join verify BEFORE reading the restart flag, so a mismatch that
       // surfaces only as the final frames are checked still triggers a rebuild.
-      if (vpool) { vpool->finish(); g_verify_pool = nullptr; vpool.reset(); }
+      if (vpool) { vpool->finish(); vpool->log_summary(opt); g_verify_pool = nullptr; vpool.reset(); }
 
       if (!g_gpu_failed_restart.load()) break;   // clean — verified, or no verify and no fault
 
