@@ -1,11 +1,55 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.43  
+**Covers:** v0.9.50 → v0.14.46  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.44–0.14.46 — `--verify` observability at `-v`, rate-matched verify pool; drop a redundant O_DIRECT line
+
+`--verify` ran silently — no way to see whether it was keeping up or how much CPU
+it cost, which matters on `--gpu-only` runs where it competes with the otherwise
+near-idle CPU.  The `VerifyPool` now tracks per-frame counts, active decompress
+time, peak queue backlog, and stall time (how long a full verify queue blocked the
+writer = verification back-pressuring the pipeline).  After the pass, `-v` prints
+one line, e.g.:
+
+```
+[VERIFY] 1 thread(s) (cap 24), 32 frames (512.02 MiB) decompress-checked @ 3.34 GiB/s, peak backlog 13/256 frames; kept up (compression never waited on verify)
+```
+
+Threads (vs. the cap), intrinsic decompress rate (bytes ÷ active verify time, so it
+reflects how fast verification works rather than how long it sat idle), peak
+backlog, and a verdict: "kept up" or "fell behind: throttled compression Nx for Ts".
+On hardware that produces frames faster than one verify thread can check (e.g.
+Gen5 + H100), this shows the pool growing toward the cap and, if it saturates, the
+back-pressure it applies.
+
+Also removed the duplicate `[O_DIRECT] using O_DIRECT for output` line — the Gen4+
+auto-default notice (`PCIe GenN detected; defaulting output to --direct`) already
+says it.
+
+The new `[VERIFY]` line immediately exposed a bug it had been hiding: on an 8×H100
+Gen5 box, `--verify --gpu-only` cost ~5 s, and the line showed why — the pool had
+ballooned to **256 threads (the full core count), peak backlog pegged at 256/256**,
+yet was doing only ~2 threads' worth of work (65 GiB ÷ the reported per-thread rate
+≈ 2 thread-seconds active).  Two causes: (1) the cap was `hardware_concurrency`, and
+(2) growth spawned a thread on *every* `submit()` while backlog was high, so a GPU
+burst rocketed it to the cap and it never shrank.  The extra ~254 threads did not
+verify any faster — this data is ~half incompressible, where "decompress" is
+`memcpy` + XXH64, i.e. **memory-bandwidth-bound** — they just contended with the
+GPU pipeline's host-side staging (8× H2D/D2H, 12 readers, the O_DIRECT writer) for
+CPU and bandwidth, dropping output 4.35 → 3.75 GiB/s.
+
+**Fix (v0.14.46):** cap the verify pool at `max(2, cores/8)` (leave the cores for
+the pipeline) and grow **rate-matched** instead of per-submit — every 50 ms it
+measures the drain rate and adds a thread only while the previous one raised that
+rate by >10%.  Once an added thread stops helping (bandwidth/CPU plateau, or it has
+matched the producer) it holds, so the pool settles at the few threads it actually
+uses.  The `-v` line now reports the aggregate **drain** rate (compare to the
+compress out-rate for keep-up) alongside the per-thread rate.
 
 ## v0.14.43 — delete the compress CPU-rescue machinery; clean GPU-fault abort
 

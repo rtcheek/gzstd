@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.45";
+static constexpr const char * GZSTD_VERSION = "0.14.46";
 //
 // Architecture overview:
 //
@@ -3790,7 +3790,6 @@ public:
   // no-op once a failure is known: no point verifying more, we're rebuilding.
   void submit(size_t seq, const FrameBuf & frame) {
     if (g_verify_failed.load(std::memory_order_relaxed)) return;
-    bool grow = false;
     {
       std::unique_lock<std::mutex> lk(m_);
       // Stall accounting: if the queue is full here, verification has fallen
@@ -3809,10 +3808,9 @@ public:
       if (g_verify_failed.load(std::memory_order_relaxed)) return;
       q_.push_back({seq, frame});
       if (q_.size() > peak_q_) peak_q_ = q_.size();   // guarded by m_
-      grow = q_.size() > high_water_;
     }
     not_empty_.notify_one();
-    if (grow) maybe_grow();
+    maybe_grow();   // rate-limited internally; called serially from the single writer/tap
   }
 
   // No more frames will arrive.  Drains the queue, joins all workers, and
@@ -3842,16 +3840,19 @@ public:
     const uint64_t by = bytes_.load(std::memory_order_relaxed);
     const uint64_t st = stall_ns_.load(std::memory_order_relaxed);
     const uint64_t sc = stall_count_.load(std::memory_order_relaxed);
-    const double vsec = verify_ns_.load(std::memory_order_relaxed) / 1e9;  // active CPU time
+    const double wall = (t_end_ > t_start_) ? (t_end_ - t_start_) / 1e9 : 0.0;
+    const double vsec = verify_ns_.load(std::memory_order_relaxed) / 1e9;  // summed active CPU time
     char bs[32]; human_bytes(double(by), bs, sizeof(bs));
-    // Intrinsic decompress rate (bytes / active verify time) — "how fast it works",
-    // independent of how long it sat idle waiting for frames to arrive.
-    const double gibs = vsec > 0 ? double(by) / vsec / (1024.0*1024.0*1024.0) : 0.0;
-    (void)t_start_; (void)t_end_;
+    // Aggregate drain rate (bytes / wall) — the effective rate verify kept up at;
+    // compare it to the compress out-rate to see whether it matched the producer.
+    // Per-thread is the intrinsic decompress speed (bytes / summed active time).
+    const double drain = wall > 0 ? double(by) / wall / (1024.0*1024.0*1024.0) : 0.0;
+    const double perthr = vsec > 0 ? double(by) / vsec / (1024.0*1024.0*1024.0) : 0.0;
     std::ostringstream os;
     os << "[VERIFY] " << final_threads_ << " thread(s) (cap " << max_threads_ << "), "
-       << fr << " frames (" << bs << ") decompress-checked @ "
-       << std::fixed << std::setprecision(2) << gibs << " GiB/s, peak backlog "
+       << fr << " frames (" << bs << ") checked, drain "
+       << std::fixed << std::setprecision(2) << drain << " GiB/s ("
+       << std::setprecision(2) << perthr << " /thread), peak backlog "
        << peak_q_ << "/" << max_queue_ << " frames; ";
     if (sc == 0)
       os << "kept up (compression never waited on verify)";
@@ -3870,19 +3871,44 @@ private:
     threads_.emplace_back([this]{ worker(); });
   }
 
-  // Add a worker if the backlog warrants it and we're below the cap.  Called
-  // off-lock from submit(); guarded by threads_m_ so growth is race-free.
+  // Rate-matched, rate-limited growth.  Called serially from the single writer
+  // thread's submit(), so the bookkeeping needs no lock.  Add a verify thread
+  // ONLY while doing so actually raises the drain rate — so on data where
+  // decompress is memory-bandwidth-bound (incompressible frames are essentially
+  // memcpy + checksum) the pool settles at the few threads that match the
+  // producer instead of ballooning to every core and starving the compress
+  // pipeline of CPU and memory bandwidth (the bug that made --verify cost ~5 s on
+  // a fast 8-GPU box: it spawned 256 threads to do ~2 threads' worth of work).
   void maybe_grow() {
-    {
-      std::lock_guard<std::mutex> tlk(threads_m_);
-      if ((int)threads_.size() >= max_threads_) return;
+    const uint64_t now = now_ns();
+    if (grow_t_last_ == 0) {            // first call: open the measurement window
+      grow_t_last_ = now;
+      grow_frames_last_ = frames_.load(std::memory_order_relaxed);
+      return;
     }
-    // Re-check backlog under the queue lock so we don't over-spawn on a blip.
-    {
-      std::lock_guard<std::mutex> lk(m_);
-      if (q_.size() <= high_water_ || done_) return;
+    if (now - grow_t_last_ < GROW_INTERVAL_NS) return;   // reassess at most once per interval
+
+    const uint64_t frames_now = frames_.load(std::memory_order_relaxed);
+    const double   dt   = (now - grow_t_last_) / 1e9;
+    const double   rate = dt > 0 ? double(frames_now - grow_frames_last_) / dt : 0.0;  // frames/s drained
+    grow_t_last_ = now;
+    grow_frames_last_ = frames_now;
+
+    size_t backlog;
+    { std::lock_guard<std::mutex> lk(m_); if (done_) return; backlog = q_.size(); }
+    int nthreads;
+    { std::lock_guard<std::mutex> tlk(threads_m_); nthreads = (int)threads_.size(); }
+
+    // Grow only if we're falling behind (queue building past high-water) AND the
+    // last thread we added paid off (drain rate climbed >10%) — or we still have
+    // a single thread.  Once an added thread stops raising the rate we've hit the
+    // bandwidth/CPU plateau (or matched the producer), so we hold.
+    const bool behind = backlog > high_water_;
+    const bool helped = (nthreads <= 1) || (rate > grow_rate_last_ * 1.10);
+    if (behind && helped && nthreads < max_threads_) {
+      spawn_one();
+      grow_rate_last_ = rate;          // baseline the next thread must beat
     }
-    spawn_one();
   }
 
   void worker() {
@@ -3952,6 +3978,11 @@ private:
 
   std::mutex                 threads_m_;
   std::vector<std::thread>   threads_;
+
+  // Rate-matched growth bookkeeping (writer-thread-only; see maybe_grow).
+  static constexpr uint64_t GROW_INTERVAL_NS = 50ull * 1000 * 1000;  // 50 ms between grow decisions
+  uint64_t              grow_t_last_ = 0, grow_frames_last_ = 0;
+  double                grow_rate_last_ = 0.0;
 
   // -v stats.
   std::atomic<uint64_t> frames_{0}, bytes_{0}, verify_ns_{0};
@@ -14054,12 +14085,17 @@ int main(int argc, char ** argv)
       g_verify_failed_seq.store(-1, std::memory_order_relaxed);
 
       // --verify: stand up a background decompress-verify pool for this pass.
-      // It taps frames via g_verify_pool from the writer's in-order drain.
+      // It taps frames via g_verify_pool from the writer's in-order drain.  Cap
+      // the pool well below the core count: decompress-verify only needs to match
+      // the producer (a few threads), and on a fast many-core box letting it grow
+      // to every core starves the compress pipeline of CPU and memory bandwidth.
+      // The pool grows rate-matched from 1 up to this ceiling (see maybe_grow).
       std::unique_ptr<VerifyPool> vpool;
       if (opt.verify) {
-        const int vmax = (opt.cpu_threads > 0)
+        const int cores = (opt.cpu_threads > 0)
             ? opt.cpu_threads
             : std::max(1, (int)std::thread::hardware_concurrency());
+        const int vmax = std::max(2, cores / 8);
         vpool = std::make_unique<VerifyPool>(vmax, 256 /* max frames queued */);
         g_verify_pool = vpool.get();
       }
