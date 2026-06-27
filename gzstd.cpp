@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.48";
+static constexpr const char * GZSTD_VERSION = "0.14.49";
 //
 // Architecture overview:
 //
@@ -2987,6 +2987,14 @@ static std::atomic<bool> g_gpu_failed_restart{false};
 // away) was deleted.  GPU-fault only: never set on decompress (a faulted GPU
 // there is finished on CPU and the output is KEPT) nor by --verify.
 static std::atomic<bool> g_gpu_aborted{false};
+
+// GPU-side --verify (gpu-only) stats, for the -v [GPU-VERIFY] summary.  Summed
+// across all device workers/streams; the time is aggregate GPU time on the
+// verify decompress+compare (overlaps compress across the 8 GPUs, so it's a work
+// total, not a wall figure).  Reset per compress pass.
+static std::atomic<uint64_t> g_gpu_verify_frames{0};
+static std::atomic<uint64_t> g_gpu_verify_bytes{0};   // decompressed (verified) bytes
+static std::atomic<uint64_t> g_gpu_verify_ns{0};
 
 // --verify: a background decompress-verify worker found a frame whose compressed
 // bytes do NOT round-trip (XXH64 mismatch / decode error).  Set alongside
@@ -10144,6 +10152,15 @@ static void gpu_verify_check(StreamCtx & C, const Options & opt)
       throw std::runtime_error("GPU verify: a frame failed to decompress (compressed output is corrupt)");
   if (v_mism)
     throw std::runtime_error("GPU verify: decompressed output != input (the GPU corrupted the data)");
+
+  // Passed — accumulate -v stats.  The verify ran comp_end..d2h_end on the stream.
+  float v_ms = 0.0f;
+  cudaEventElapsedTime(&v_ms, C.ev_comp_end, C.ev_d2h_end);
+  g_gpu_verify_ns.fetch_add((uint64_t)(v_ms * 1e6), std::memory_order_relaxed);
+  g_gpu_verify_frames.fetch_add(C.filled, std::memory_order_relaxed);
+  uint64_t vb = 0;
+  for (size_t i = 0; i < C.filled; ++i) vb += C.h_in_sizes[i];
+  g_gpu_verify_bytes.fetch_add(vb, std::memory_order_relaxed);
 }
 
 static void gpu_worker(
@@ -10739,6 +10756,7 @@ static void gpu_worker(
             C.stream), "nvcompBatchedZstdDecompressAsync(verify)");
           gzv_launch_compare(C.d_verify_base, C.d_in_base, C.d_in_sizes,
                              C.filled, C.gpu_chunk, C.d_verify_mismatch, C.stream);
+          cudaEventRecord(C.ev_d2h_end, C.stream);   // mark end of verify (for -v timing)
         }
         C.busy = true; submitted_any = true;
       }
@@ -14219,6 +14237,7 @@ int main(int argc, char ** argv)
     for (;;) {
       g_gpu_failed_restart.store(false);
       g_gpu_aborted.store(false);   // clear the GPU-fault abort before each pass (incl. the CPU rebuild)
+      g_gpu_verify_frames.store(0); g_gpu_verify_bytes.store(0); g_gpu_verify_ns.store(0);
       g_verify_failed.store(false, std::memory_order_relaxed);
       g_verify_failed_seq.store(-1, std::memory_order_relaxed);
 
@@ -14250,6 +14269,20 @@ int main(int argc, char ** argv)
       // Drain/join verify BEFORE reading the restart flag, so a mismatch that
       // surfaces only as the final frames are checked still triggers a rebuild.
       if (vpool) { vpool->finish(); vpool->log_summary(opt); g_verify_pool = nullptr; vpool.reset(); }
+
+      // GPU-side verify (gpu-only) summary — confirms it ran and at what GPU cost.
+      if (opt.verify && opt.gpu_only && opt.verbosity >= V_VERBOSE
+          && g_gpu_verify_frames.load() > 0) {
+        const uint64_t vf = g_gpu_verify_frames.load();
+        const uint64_t vb = g_gpu_verify_bytes.load();
+        const double   vs = g_gpu_verify_ns.load() / 1e9;   // aggregate GPU time (overlaps compress)
+        char bs[32]; human_bytes(double(vb), bs, sizeof(bs));
+        std::ostringstream os;
+        os << "[GPU-VERIFY] " << vf << " frames (" << bs
+           << ") decompressed + byte-compared on the GPU in VRAM (no CPU/host traffic); "
+           << std::fixed << std::setprecision(2) << vs << " s aggregate GPU verify time";
+        vlog(V_VERBOSE, opt, os.str() + "\n");
+      }
 
       if (!g_gpu_failed_restart.load()) break;   // clean — verified, or no verify and no fault
 
