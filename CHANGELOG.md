@@ -1,13 +1,13 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.50  
+**Covers:** v0.9.50 → v0.14.51  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
-## v0.14.48–0.14.50 — GPU-side `--verify`, and a `--verify-engine` flag that picks by bottleneck
+## v0.14.48–0.14.51 — GPU-side `--verify`, and a `--verify-engine` flag that picks by bottleneck
 
 `--verify` on a `--gpu-only` compress had to decompress-check on the CPU, which on
 a fast many-GPU box competes with the GPU pipeline's host-side staging for CPU and

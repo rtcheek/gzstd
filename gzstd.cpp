@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.50";
+static constexpr const char * GZSTD_VERSION = "0.14.51";
 //
 // Architecture overview:
 //
@@ -14931,6 +14931,13 @@ static void apply_backend_defaults(Options & opt)
                              : "CPU (background decompress-verify pool)")
            + (opt.verify_engine == VERIFY_ENGINE_AUTO
                 ? " [auto: PCIe Gen" + std::to_string(gen) + "]" : " [forced]") + "\n");
+  } else if (opt.verify && opt.verify_engine == VERIFY_ENGINE_GPU
+             && opt.mode == Mode::COMPRESS) {
+    // GPU verify only works in gpu-only mode (every frame goes through the GPU
+    // worker); hybrid has CPU-compressed frames the GPU never sees, and cpu-only
+    // has no GPU at all.  Honor the request as far as we can — fall back to the
+    // CPU VerifyPool (which covers all frames) — but don't do it silently.
+    vlog(V_ERROR, opt, "warning: --verify-engine=gpu requires --gpu-only; using CPU verify\n");
   }
 
   // --direct default: O_DIRECT output is a large win on fast-fabric (PCIe Gen4+)

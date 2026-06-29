@@ -972,8 +972,47 @@ if has_gpu 2>/dev/null; then
     fail "GPU fault over a pipe dies loudly" "rc=$gf_rc (expected non-zero + message)"
   fi
   rm -f "$gf_perr"
+
+  # GPU-side --verify (--verify-engine=gpu): decompress + raw byte-compare each
+  # batch in VRAM on the GPU.  Tiny config (1 GPU/1 stream/batch 1/4 MiB chunks)
+  # so the verify buffers fit a small card.
+  # Incompressible source so each 4 MiB frame's compressed output is large (the
+  # corruption hook flips a byte at offset 64, which must land inside the frame).
+  gvsrc="$TMPDIR/gvrand.bin"; head -c 8388608 /dev/urandom > "$gvsrc"
+  gvz="$TMPDIR/gpuverify.zst"; gvr="$TMPDIR/gpuverify.rec"; gverr="$TMPDIR/gpuverify.err"
+  GVCFG="--verify-engine=gpu --gpu-only --gpu-devices=1 --gpu-streams=1 --gpu-batch=1 --chunk-size=4"
+  # Clean: GPU verify actually runs ([GPU-VERIFY] line) and the archive round-trips.
+  "$GZSTD" $GVCFG -v -k -f "$gvsrc" -o "$gvz" 2>"$gverr"
+  "$GZSTD" -d -k -f "$gvz" -o "$gvr" 2>/dev/null
+  if grep -qi "GPU-VERIFY" "$gverr" && files_match "$gvsrc" "$gvr"; then
+    pass "GPU verify (--verify-engine=gpu) runs + round-trips"
+  else
+    fail "GPU verify clean" "no [GPU-VERIFY] line or round-trip mismatch"
+  fi
+  # Corruption injected into the compressed output in VRAM must be caught by the
+  # GPU compare and rebuilt CPU-only into a correct archive.
+  GZSTD_DEBUG_GPU_CORRUPT=1 "$GZSTD" $GVCFG -k -f "$gvsrc" -o "$gvz" 2>"$gverr"
+  "$GZSTD" -d -k -f "$gvz" -o "$gvr" 2>/dev/null
+  if grep -qiE "GPU verify|rebuilding CPU-only" "$gverr" && files_match "$gvsrc" "$gvr"; then
+    pass "GPU verify catches VRAM corruption, rebuilds clean"
+  else
+    fail "GPU verify corruption catch" "no rebuild or output mismatch"
+  fi
+  # --verify-engine=gpu without --gpu-only can't run GPU verify: warn, fall back
+  # to CPU verify, still produce a correct archive.
+  "$GZSTD" --verify-engine=gpu --cpu-only -k -f "$gvsrc" -o "$gvz" 2>"$gverr"
+  "$GZSTD" -d -k -f "$gvz" -o "$gvr" 2>/dev/null
+  if grep -qi "requires --gpu-only" "$gverr" && files_match "$gvsrc" "$gvr"; then
+    pass "--verify-engine=gpu without --gpu-only warns + falls back to CPU verify"
+  else
+    fail "--verify-engine=gpu fallback warning" "no warning or round-trip mismatch"
+  fi
+  rm -f "$gvz" "$gvr" "$gverr"
 else
   skip "gpu-only compress/decompress" "no GPU"
+  skip "GPU verify (--verify-engine=gpu) runs + round-trips" "no GPU"
+  skip "GPU verify catches VRAM corruption, rebuilds clean" "no GPU"
+  skip "--verify-engine=gpu without --gpu-only warns + falls back to CPU verify" "no GPU"
   skip "hybrid compress/decompress" "no GPU"
   skip "gpu integrity test" "no GPU"
   skip "gpu tar" "no GPU"
