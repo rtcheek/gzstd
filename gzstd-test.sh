@@ -1315,7 +1315,10 @@ STREAM_TEST_TIMEOUT=60
 run_bounded() {
   local timeout_s=$1 logfile=$2; shift 2
   local rc=0
-  timeout --foreground "${timeout_s}" "$@" >"$logfile" 2>&1 || rc=$?
+  # -k 10: if the soft timeout's SIGTERM doesn't bring the process down within
+  # 10s, follow with SIGKILL.  A wedged multi-threaded gzstd can otherwise ignore
+  # SIGTERM and leave `timeout` itself blocked, stalling the whole suite.
+  timeout --foreground -k 10 "${timeout_s}" "$@" >"$logfile" 2>&1 || rc=$?
   return $rc
 }
 
@@ -2948,7 +2951,10 @@ rm -f "$TMPDIR/thr-bad2.zst"
 # The compute_throttle_budget guardrail must clamp to the GPU batch floor
 # and the run must complete (with a warning) in bounded time.
 if has_gpu 2>/dev/null; then
-  timeout 30 "$GZSTD" -k -f --hybrid --throttle-frames=1 \
+  # --foreground -k 10: hard-kill if the soft 30s SIGTERM is ignored, so a wedged
+  # run can't leave a defunct child with `timeout` blocked behind it (which would
+  # stall the whole suite rather than failing this one test).
+  timeout --foreground -k 10 30 "$GZSTD" -k -f --hybrid --throttle-frames=1 \
     "$TMPDIR/large.bin" -o "$TMPDIR/thr-hyb.zst" 2>"$TMPDIR/thr-hyb.err"
   rc=$?
   if [[ $rc -eq 0 ]] \

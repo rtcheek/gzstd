@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.56";
+static constexpr const char * GZSTD_VERSION = "0.14.57";
 //
 // Architecture overview:
 //
@@ -8481,6 +8481,21 @@ public:
   uint64_t validated_files() const { return vfiles_; }
   uint64_t validated_bytes() const { return vbytes_; }
 
+  // Writer-pool timing for the -v [WRITER] diagnosis.  Folds the persistent
+  // large-file O_DIRECT writer (one thread, already always-counted) into the
+  // small-file pool only when large files were actually written, so an archive
+  // with no large files isn't dragged down by an idle extra "thread".
+  bool ld_active() const { return ld_files_.load(std::memory_order_relaxed) > 0; }
+  uint64_t writer_busy_ns() const {
+    return wpool_busy_ns_.load(std::memory_order_relaxed)
+         + (ld_active() ? ld_write_ns_.load(std::memory_order_relaxed) : 0);
+  }
+  uint64_t writer_starved_ns() const {
+    return wpool_starved_ns_.load(std::memory_order_relaxed)
+         + (ld_active() ? ld_jobwait_ns_.load(std::memory_order_relaxed) : 0);
+  }
+  int writer_threads() const { return n_writers_ + (ld_active() ? 1 : 0); }
+
   void run(int read_fd) {
     if (!read_only()) start_pool();
     StreamReader r(read_fd);
@@ -8752,6 +8767,12 @@ private:
   std::deque<Job> q_; size_t q_bytes_ = 0; bool q_done_ = false;
   static constexpr size_t Q_MAX_BYTES = 256 * 1024 * 1024;
   std::vector<std::thread> writers_;
+  // Small-file writer-pool timing for the -v [WRITER] diagnosis (gated to -v):
+  // busy = time in write_small (create+write+meta), starved = time blocked
+  // waiting for a job.  Each thread accumulates locally and flushes ONE atomic
+  // add at exit, so the 16 writers never contend on a shared counter mid-run.
+  int n_writers_ = 0;
+  std::atomic<uint64_t> wpool_busy_ns_{0}, wpool_starved_ns_{0};
 
   void start_pool() {
     // --write-threads overrides; auto = min(worker threads, 16) — beyond ~16 the
@@ -8759,6 +8780,7 @@ private:
     int n = opt_.write_threads > 0 ? (int)opt_.write_threads
                                    : std::min(resolve_cpu_threads(opt_.cpu_threads), 16);
     n = std::max(1, n);
+    n_writers_ = n;
     if (opt_.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt_, "[UNTAR] " + std::to_string(n) + " writer thread(s)\n");
     for (int i = 0; i < n; ++i) writers_.emplace_back([this] { writer_loop(); });
@@ -8777,17 +8799,38 @@ private:
     lk.unlock(); q_cv_cons_.notify_one();
   }
   void writer_loop() {
+    // -v diagnosis: time job-waits (starved) and write_small (busy) into thread-
+    // local counters, flushed once at exit so the pool never contends on a shared
+    // atomic.  measure off (no -v) → the now_ns() calls are skipped entirely.
+    const bool measure = opt_.verbosity >= V_VERBOSE;
+    uint64_t busy_ns = 0, starved_ns = 0;
     for (;;) {
       Job j;
       {
         std::unique_lock<std::mutex> lk(q_m_);
-        q_cv_cons_.wait(lk, [&] { return !q_.empty() || q_done_; });
-        if (q_.empty()) return;
+        if (measure) {
+          uint64_t t0 = now_ns();
+          q_cv_cons_.wait(lk, [&] { return !q_.empty() || q_done_; });
+          starved_ns += now_ns() - t0;
+        } else {
+          q_cv_cons_.wait(lk, [&] { return !q_.empty() || q_done_; });
+        }
+        if (q_.empty()) break;
         j = std::move(q_.front()); q_.pop_front();
         q_bytes_ -= j.data.size();
         lk.unlock(); q_cv_prod_.notify_all();
       }
-      write_small(j);
+      if (measure) {
+        uint64_t t0 = now_ns();
+        write_small(j);
+        busy_ns += now_ns() - t0;
+      } else {
+        write_small(j);
+      }
+    }
+    if (measure) {
+      wpool_busy_ns_.fetch_add(busy_ns, std::memory_order_relaxed);
+      wpool_starved_ns_.fetch_add(starved_ns, std::memory_order_relaxed);
     }
   }
   // --sparse extract: write [data,data+n) at file offset `at`, leaving holes for
@@ -13608,6 +13651,47 @@ static void apply_backend_defaults(Options & opt);
 static std::string derive_output(const std::string & input, Mode mode);
 
 #ifndef _WIN32
+// Reader-state diagnosis (per-thread), shared by the plain decompress loop and
+// the --tar extractor.  Reads the shared meter's reader counters (populated by
+// whichever reader ran) and names the reader's role.  Prints nothing when no
+// counting reader ran (the mmap path is zero-copy and reports nothing).  Gated
+// to -v by the callers.
+static void print_reader_diag(const Options & opt, const Meter & meter, double wall_ns)
+{
+  const uint64_t r_io = meter.reader_io_ns.load();
+  const uint64_t r_ps = meter.reader_parse_ns.load();
+  const uint64_t r_cp = meter.reader_copy_ns.load();
+  const uint64_t r_bk = meter.reader_blocked_ns.load();
+  if (r_io + r_ps + r_cp + r_bk == 0) return;
+  // Percentages are per reader thread (counters sum across them).
+  const double r_n = std::max(1, meter.reader_threads.load());
+  const double r_wall = wall_ns * r_n;
+  char rline[256];
+  std::snprintf(rline, sizeof(rline),
+    "[READER] io %.1f%% | parse %.1f%% | task-copy %.1f%% | blocked-downstream %.1f%%  "
+    "(per thread, %d reader%s, %.2f s run)\n",
+    double(r_io) / r_wall * 100.0, double(r_ps) / r_wall * 100.0,
+    double(r_cp) / r_wall * 100.0, double(r_bk) / r_wall * 100.0,
+    (int)r_n, r_n > 1 ? "s" : "", wall_ns / 1e9);
+  vlog(V_VERBOSE, opt, rline);
+  // Reader-saturated (the reader is the faucet) vs blocked-downstream (the reader
+  // is idle waiting for the GPU/CPU consumers — they are the faucet).
+  const double r_busy    = double(r_io + r_ps + r_cp) / r_wall;
+  const double r_blocked = double(r_bk) / r_wall;
+  if (r_blocked > r_busy && r_blocked >= 0.30)
+    vlog(V_VERBOSE, opt, "[READER] verdict: reader is NOT the bottleneck — it stalls "
+         "pushing to a full queue; the decompress consumers (GPU/CPU) are the faucet\n");
+  else if (r_busy >= 0.85) {
+    const char * why =
+        (r_cp >= r_io && r_cp >= r_ps)
+            ? "the per-frame copy dominates; a zero-copy frame reader would raise the ceiling"
+        : (r_ps >= r_io)
+            ? "frame-boundary parsing dominates; the serial parse is the spine (needs a frame index to split)"
+            : "the device/syscall path is the faucet; a faster source or read path is the only lever";
+    vlog(V_VERBOSE, opt, std::string("[READER] verdict: reader saturated — ") + why + "\n");
+  }
+}
+
 // -d --tar: decompress each archive into a pipe and extract it via
 // tarx::Extractor.  Reuses the full parallel decompressor (CPU/GPU) unchanged —
 // the pipe is just a FILE* sink like stdout.  Returns an exit code.
@@ -13632,6 +13716,12 @@ static int extract_tar(const Options & opt, Meter * m)
   std::thread prog_thr(progress_loop, std::cref(opt), m, total_in, &prog_done);
 
   int rc = EXIT_OK;
+  // -v [WRITER] diagnosis accumulators (across archives; the common case is one).
+  // The Extractor is created per archive, so harvest its writer-pool timing after
+  // each one finishes.  prod/cons sink waits give the decompress-vs-extract seam.
+  uint64_t agg_wbusy_ns = 0, agg_wstarved_ns = 0;
+  uint64_t agg_prod_wait_ns = 0, agg_cons_wait_ns = 0;
+  int wpool_threads = 0;
   for (const std::string & arc : opt.tar_sources) {
     if (opt.keep_going) { g_damage.reset(); g_member_ranges.reset(); }  // damage reported per archive
     FILE * in = open_input(arc);   // dies on failure
@@ -13685,6 +13775,13 @@ static int extract_tar(const Options & opt, Meter * m)
     sink.close();          // signal EOF to the Extractor after all frames pushed
     exth.join();
     g_tar_decomp_sink = nullptr;
+    if (opt.verbosity >= V_VERBOSE) {
+      agg_wbusy_ns      += ex.writer_busy_ns();
+      agg_wstarved_ns   += ex.writer_starved_ns();
+      agg_prod_wait_ns  += (uint64_t)sink.producer_wait_ns();
+      agg_cons_wait_ns  += (uint64_t)sink.consumer_wait_ns();
+      wpool_threads      = std::max(wpool_threads, ex.writer_threads());
+    }
     if (opt.verbosity >= V_DEBUG) {
       char b[200];
       std::snprintf(b, sizeof(b),
@@ -13725,6 +13822,42 @@ static int extract_tar(const Options & opt, Meter * m)
       in_name.c_str(), in_s, out_s, opt.tar_dest.c_str(), rate_s);
     std::fprintf(stderr, "\r%s\033[K\n", summary);
     std::fflush(stderr);
+  }
+
+  // Performance diagnosis (mirrors the plain -d path): what capped throughput?
+  //   [READER] — the shared decompressor's reader counters (input side).
+  //   [WRITER] — the Extractor write pool's per-thread busy/starved (output side).
+  //   [WRITER] verdict — the decompress↔extract seam, read straight off the sink:
+  //     the producer (decompressors) blocking on a full sink = extract/write-bound;
+  //     the consumer (Extractor) blocking on an empty sink = decompress-bound.
+  // All gated to -v; the writer-pool timing was only accumulated under -v too.
+  if (opt.verbosity >= V_VERBOSE) {
+    auto wdt = std::chrono::steady_clock::now() - m->t0;
+    const double wall_ns =
+        (double)std::chrono::duration_cast<std::chrono::nanoseconds>(wdt).count();
+    if (wall_ns > 0) {
+      print_reader_diag(opt, *m, wall_ns);
+      if (wpool_threads > 0 && (agg_wbusy_ns + agg_wstarved_ns) > 0) {
+        // Per-thread average over the writer pool, like the [READER] line.
+        const double w_wall = wall_ns * wpool_threads;
+        char wline[224];
+        std::snprintf(wline, sizeof(wline),
+          "[WRITER] write-path busy %.1f%% | starved %.1f%%  (per thread, %d writer%s, %.2f s run)\n",
+          double(agg_wbusy_ns) / w_wall * 100.0, double(agg_wstarved_ns) / w_wall * 100.0,
+          wpool_threads, wpool_threads > 1 ? "s" : "", wall_ns / 1e9);
+        vlog(V_VERBOSE, opt, wline);
+      }
+      const double pw = double(agg_prod_wait_ns), cw = double(agg_cons_wait_ns);
+      if (pw + cw > 0) {
+        if (pw >= cw)
+          vlog(V_VERBOSE, opt, "[WRITER] verdict: extract-bound — the decompressors stalled "
+               "waiting for the extractor to drain the buffer; the write path (the device) "
+               "capped output\n");
+        else
+          vlog(V_VERBOSE, opt, "[WRITER] verdict: decompress-bound — the extractor stalled "
+               "waiting for frames; the read+decompress engines, not the device, capped output\n");
+      }
+    }
   }
   return rc;
 }
@@ -14776,42 +14909,9 @@ int main(int argc, char ** argv)
 #endif
       const double healthy_window =
           2.0 * resolve_cpu_threads(opt.cpu_threads) + gpu_window;
-      // Reader line first (input before output).  Only when a counting reader
-      // ran — the mmap reader is zero-copy/near-instant and reports nothing.
-      const uint64_t r_io = meter.reader_io_ns.load();
-      const uint64_t r_ps = meter.reader_parse_ns.load();
-      const uint64_t r_cp = meter.reader_copy_ns.load();
-      const uint64_t r_bk = meter.reader_blocked_ns.load();
-      if (r_io + r_ps + r_cp + r_bk > 0) {
-        // Percentages are per reader thread (counters sum across them).
-        const double r_n = std::max(1, meter.reader_threads.load());
-        const double r_wall = wall_ns * r_n;
-        char rline[256];
-        std::snprintf(rline, sizeof(rline),
-          "[READER] io %.1f%% | parse %.1f%% | task-copy %.1f%% | blocked-downstream %.1f%%  "
-          "(per thread, %d reader%s, %.2f s run)\n",
-          double(r_io) / r_wall * 100.0, double(r_ps) / r_wall * 100.0,
-          double(r_cp) / r_wall * 100.0, double(r_bk) / r_wall * 100.0,
-          (int)r_n, r_n > 1 ? "s" : "", wall_ns / 1e9);
-        vlog(V_VERBOSE, opt, rline);
-        // Reader-saturated (the reader is the faucet) vs blocked-downstream
-        // (the reader is idle waiting for the GPU/CPU consumers — they are the
-        // faucet, not the reader).  Whichever dominates names the bottleneck.
-        const double r_busy    = double(r_io + r_ps + r_cp) / r_wall;
-        const double r_blocked = double(r_bk) / r_wall;
-        if (r_blocked > r_busy && r_blocked >= 0.30)
-          vlog(V_VERBOSE, opt, "[READER] verdict: reader is NOT the bottleneck — it stalls "
-               "pushing to a full queue; the decompress consumers (GPU/CPU) are the faucet\n");
-        else if (r_busy >= 0.85) {
-          const char * why =
-              (r_cp >= r_io && r_cp >= r_ps)
-                  ? "the per-frame copy dominates; a zero-copy frame reader would raise the ceiling"
-              : (r_ps >= r_io)
-                  ? "frame-boundary parsing dominates; the serial parse is the spine (needs a frame index to split)"
-                  : "the device/syscall path is the faucet; a faster source or read path is the only lever";
-          vlog(V_VERBOSE, opt, std::string("[READER] verdict: reader saturated — ") + why + "\n");
-        }
-      }
+      // Reader line first (input before output).  Shared with the --tar
+      // extractor; prints nothing when a zero-copy (mmap) reader ran.
+      print_reader_diag(opt, meter, wall_ns);
       char wline[224];
       std::snprintf(wline, sizeof(wline),
         "[WRITER] write-path busy %.1f%% | head-of-line %.1f%% (avg %.0f frames stuck) | "

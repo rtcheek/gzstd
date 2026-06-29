@@ -1,9 +1,44 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.56  
+**Covers:** v0.9.50 → v0.14.57  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.57 — `[READER]`/`[WRITER]` bottleneck diagnosis for `-d --tar` extraction
+
+`-d --tar` extraction returns early via `extract_tar()`, bypassing the per-file loop
+that prints the `-v` `[READER]`/`[WRITER]` bottleneck diagnosis — so unlike plain `-d`,
+a tar extract gave no definitive answer to "what capped throughput?".  Added the same
+class of diagnosis, adapted to the extract pipeline (decompressors → in-memory
+`FrameSink` → parallel `Extractor` write pool):
+
+- **`[READER]`** — factored the plain-`-d` reader breakdown into a shared
+  `print_reader_diag()` and call it from both paths.  The shared decompressor
+  populates the same reader counters, so this is identical: io / parse / task-copy /
+  blocked-downstream, per thread.
+
+- **`[WRITER]` busy/starved** — the tar writer is the `Extractor`'s pool (default 16
+  threads), not the single in-order `DirectWriter`, so its counters aren't in the
+  meter.  Instrumented the pool's `writer_loop` with **per-thread local accumulators**
+  (busy = time in `write_small`; starved = time blocked waiting for a job), flushed
+  with one atomic add at thread exit — no shared-counter contention across the 16
+  writers.  The persistent large-file O_DIRECT writer's existing `write`/`jobwait`
+  timing folds in when large files were written.  Reported as a per-thread average,
+  like `[READER]`.  Gated to `-v`: with no `-v`, the timing `now_ns()` calls are
+  skipped entirely (zero cost).
+
+- **`[WRITER]` verdict** — read straight off the sink seam: the producer
+  (decompressors) blocking on a full sink ⇒ extract/write-bound; the consumer
+  (`Extractor`) blocking on an empty sink ⇒ decompress-bound (the engines, not the
+  device, capped output).  This is the same producer/consumer-wait signal previously
+  shown only at `-vv` in the `[SINK]` line, promoted to a `-v` verdict.
+
+The writer busy% and the sink verdict cross-check each other (idle pool + consumer-
+wait ⇒ decompress-bound; saturated pool + producer-wait ⇒ write-bound), giving a
+definitive read.  Profiling-only; no effect on output or throughput.
 
 ---
 
