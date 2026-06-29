@@ -169,10 +169,23 @@ endif()
 # (gpuverify.cu, the --verify byte compare) is compiled by nvcc.  The CPU-only
 # build stays LANGUAGES CXX (no nvcc required).
 if(HAVE_NVCOMP)
-  enable_language(CUDA)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "75;90")  # Turing (2080 Ti) + Hopper (H100); override with -DCMAKE_CUDA_ARCHITECTURES
+  # Goal: the GPU-verify kernel must run on every GPU nvCOMP itself supports,
+  # not just the boxes we test on.  Embed native SASS (-real) for the cards
+  # people actually run (Turing through Hopper) AND a low virtual-arch PTX
+  # (75-virtual).  PTX is forward-compatible: a compute_75 image JITs onto ANY
+  # device with capability >= 7.5 — the in-between parts we don't list
+  # (Ampere sm_87, …) and every future architecture (Ada-next, Blackwell, …).
+  # So a single virtual entry future-proofs the kernel without re-listing each
+  # new arch; the real cubins are just a JIT-skip optimization for the common
+  # cards.  Override with -DCMAKE_CUDA_ARCHITECTURES to trim build time.
+  #
+  # This MUST be set before enable_language(CUDA): that call seeds a (cached)
+  # compiler default for CMAKE_CUDA_ARCHITECTURES, so a guard placed after it
+  # would always see the variable already defined and never apply our list.
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;75-virtual")
   endif()
+  enable_language(CUDA)
 endif()
 
 # =====================================================

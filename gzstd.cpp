@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.52";
+static constexpr const char * GZSTD_VERSION = "0.14.53";
 //
 // Architecture overview:
 //
@@ -9792,6 +9792,10 @@ static inline size_t get_nvcomp_temp_size(size_t chunks, size_t gpu_chunk, nvcom
 extern "C" void gzv_launch_compare(const void * a, const void * b,
                                    const size_t * sizes, size_t n_chunks,
                                    size_t stride, int * mismatch, cudaStream_t stream);
+// Probe whether the compare kernel has a usable image for the current device
+// (1=yes, 0=no compatible image, -1=probe could not run); lets the verify-engine
+// resolver fall back to CPU verify on an architecture the kernel wasn't built for.
+extern "C" int gzv_kernel_available(void);
 
 struct StreamCtx {
   cudaStream_t stream{};
@@ -14978,6 +14982,19 @@ static void apply_backend_defaults(Options & opt)
     if      (opt.verify_engine == VERIFY_ENGINE_GPU) opt.gpu_verify = true;
     else if (opt.verify_engine == VERIFY_ENGINE_CPU) opt.gpu_verify = false;
     else                                             opt.gpu_verify = (gen >= 4);  // auto
+    // The byte-compare kernel (gpuverify.cu) only carries images for the
+    // architectures this binary was built for, plus a JIT-able PTX fallback.
+    // On a GPU outside that range the launch would fail with no-image-for-device
+    // and abort the whole compress, so probe once and quietly demote to the CPU
+    // VerifyPool (which covers every frame) instead.  The probe runs on the
+    // default device; in the common homogeneous-GPU box that is representative,
+    // and the embedded PTX makes the answer identical across same-or-newer cards.
+    if (opt.gpu_verify && gzv_kernel_available() != 1) {
+      opt.gpu_verify = false;
+      vlog(V_ERROR, opt,
+           "warning: GPU verify kernel has no compatible image for this device; "
+           "falling back to CPU verify\n");
+    }
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, std::string("[VERIFY] engine: ")
            + (opt.gpu_verify ? "GPU (decompress + byte-compare in VRAM)"

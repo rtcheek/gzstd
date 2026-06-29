@@ -1,9 +1,41 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.52  
+**Covers:** v0.9.50 → v0.14.53  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.53 — GPU-verify kernel runs on every supported GPU, with a CPU fallback
+
+The `--verify-engine=gpu` byte-compare kernel (`gpuverify.cu`) was compiled for only
+two architectures — `sm_75;sm_90`, exactly the two test boxes — and with **no PTX**.
+On any other card (Ampere `sm_80/86`, Ada `sm_89`, in-between parts like `sm_87`, or
+any future Blackwell+) the kernel launch would fail with no-image-for-device, so
+`--verify-engine=gpu` aborted the whole compress on hardware it had never been built
+for.  Two fixes make it broadly portable:
+
+- **Broadened the compiled image set** to native SASS for Turing→Hopper
+  (`75/80/86/89/90-real`) plus a low virtual-arch PTX (`75-virtual`).  PTX is
+  forward-compatible: a `compute_75` image JITs onto **any** device with capability
+  ≥ 7.5, so the kernel now runs on every GPU nvCOMP itself supports — including
+  architectures released after this binary — without re-listing each one.  The real
+  cubins are just a JIT-skip optimization for the common cards.  (Also fixed a latent
+  CMake bug: the arch list was `set()` *after* `enable_language(CUDA)`, which seeds a
+  cached `sm_52` default — so the intended defaults had silently never applied.  It is
+  now set before `enable_language`.)
+
+- **Graceful CPU fallback.**  Before committing to GPU verify, a one-shot probe
+  (`gzv_kernel_available`) does a trivial kernel launch on the device; if there is no
+  compatible image it quietly demotes to the CPU `VerifyPool` (which covers every
+  frame) and warns, instead of aborting mid-run.  Defense-in-depth — with the PTX
+  fallback in place this should essentially never fire, but a verify path must fail
+  safe, not hard.
+
+No release-pipeline change: the portable build inherits the new architecture default
+(it passes no `-DCMAKE_CUDA_ARCHITECTURES`), and the CUDA 12.6 build container
+compiles all listed real arches and the `compute_75` PTX.
 
 ---
 

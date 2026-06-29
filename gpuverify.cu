@@ -46,3 +46,40 @@ extern "C" void gzv_launch_compare(const void * a, const void * b,
     gzv_compare_kernel<<<grid, block, 0, stream>>>(
         (const unsigned char *)a, (const unsigned char *)b, sizes, stride, mismatch);
 }
+
+// One-shot capability probe for the current device: can this binary actually
+// launch the compare kernel here?  The kernel only carries device images for the
+// architectures it was compiled for (CMAKE_CUDA_ARCHITECTURES) plus a PTX
+// fallback the driver JITs; on a card outside that range a launch fails with
+// cudaErrorNoKernelImageForDevice.  We do a trivial 1-chunk / 0-byte launch
+// (the len=0 loop never dereferences a/b) and report whether it ran, so the
+// caller can quietly fall back to CPU verify instead of aborting mid-compress.
+//
+//   1  = kernel ran (GPU verify usable)
+//   0  = no compatible image for this device
+//  -1  = probe could not run (no device / allocation failure) — caller should
+//        also fall back to CPU verify
+//
+// Any CUDA error is consumed here so a 0/-1 result doesn't poison later calls.
+extern "C" int gzv_kernel_available(void)
+{
+    int    * d_mismatch = nullptr;
+    size_t * d_sizes    = nullptr;
+    if (cudaMalloc(&d_mismatch, sizeof(int)) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    if (cudaMalloc(&d_sizes, sizeof(size_t)) != cudaSuccess) {
+        cudaGetLastError();
+        cudaFree(d_mismatch);
+        return -1;
+    }
+    cudaMemset(d_sizes, 0, sizeof(size_t));   // sizes[0] = 0 -> kernel does no work
+    gzv_compare_kernel<<<dim3(1, 1, 1), 1>>>(nullptr, nullptr, d_sizes, 0, d_mismatch);
+    cudaError_t launch = cudaGetLastError();
+    cudaError_t sync   = (launch == cudaSuccess) ? cudaDeviceSynchronize() : launch;
+    cudaFree(d_sizes);
+    cudaFree(d_mismatch);
+    cudaGetLastError();                        // swallow any residual error
+    return (launch == cudaSuccess && sync == cudaSuccess) ? 1 : 0;
+}
