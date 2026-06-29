@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.53";
+static constexpr const char * GZSTD_VERSION = "0.14.55";
 //
 // Architecture overview:
 //
@@ -8261,10 +8261,20 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
           auto read_seg = [&](off_t foff, uint64_t voff, size_t len) {
             size_t done = 0;
             if (cur_fd >= 0) {
+              // Attribute member reads to the Reader line (-vvv).  Aggregate
+              // across the parallel assembler threads, like the CPU-compute
+              // counter — so read_ns can exceed wall time and the reported rate
+              // is the per-thread average.  Only real file bytes are counted;
+              // synthesized headers/padding are not disk I/O.
+              uint64_t t0 = g_perf ? now_ns() : 0;
               while (done < len) {
                 ssize_t r = ::pread(cur_fd, outp + (voff - a) + done, len - done, foff + (off_t)done);
                 if (r <= 0) break;
                 done += (size_t)r;
+              }
+              if (g_perf) {
+                g_perf->read_ns.fetch_add(now_ns() - t0);
+                g_perf->read_bytes_total.fetch_add((uint64_t)done);
               }
             }
             if (done < len) {

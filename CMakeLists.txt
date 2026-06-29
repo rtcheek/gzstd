@@ -169,21 +169,17 @@ endif()
 # (gpuverify.cu, the --verify byte compare) is compiled by nvcc.  The CPU-only
 # build stays LANGUAGES CXX (no nvcc required).
 if(HAVE_NVCOMP)
-  # Goal: the GPU-verify kernel must run on every GPU nvCOMP itself supports,
-  # not just the boxes we test on.  Embed native SASS (-real) for the cards
-  # people actually run (Turing through Hopper) AND a low virtual-arch PTX
-  # (75-virtual).  PTX is forward-compatible: a compute_75 image JITs onto ANY
-  # device with capability >= 7.5 — the in-between parts we don't list
-  # (Ampere sm_87, …) and every future architecture (Ada-next, Blackwell, …).
-  # So a single virtual entry future-proofs the kernel without re-listing each
-  # new arch; the real cubins are just a JIT-skip optimization for the common
-  # cards.  Override with -DCMAKE_CUDA_ARCHITECTURES to trim build time.
-  #
-  # This MUST be set before enable_language(CUDA): that call seeds a (cached)
-  # compiler default for CMAKE_CUDA_ARCHITECTURES, so a guard placed after it
-  # would always see the variable already defined and never apply our list.
-  if(NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;75-virtual")
+  # Record whether the user pinned architectures explicitly
+  # (-DCMAKE_CUDA_ARCHITECTURES=...).  This MUST be checked BEFORE
+  # enable_language(CUDA): that call seeds a cached compiler default, after which
+  # the variable always looks "defined" and we could no longer tell a user
+  # override from CMake's fallback.  The architecture list itself is applied to
+  # the gzstd target further down — once enable_language has told us the nvcc
+  # version, which gates the newest -real arches.
+  if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(GZSTD_CUDA_ARCH_USER_SET TRUE)
+  else()
+    set(GZSTD_CUDA_ARCH_USER_SET FALSE)
   endif()
   enable_language(CUDA)
 endif()
@@ -217,6 +213,30 @@ if(HAVE_NVCOMP)
   target_include_directories(gzstd PRIVATE ${NVCOMP_INCLUDE_DIR})
   # The GPU-verify byte-compare kernel (nvcc-compiled).
   target_sources(gzstd PRIVATE gpuverify.cu)
+
+  # Goal: the GPU-verify kernel must run on every GPU nvCOMP itself supports,
+  # not just the boxes we test on.  Embed native SASS (-real) for the cards
+  # people actually run (Turing through Blackwell) AND a low virtual-arch PTX
+  # (75-virtual).  PTX is forward-compatible: a compute_75 image JITs onto ANY
+  # device with capability >= 7.5 — the in-between parts we don't list
+  # (Ampere sm_87, …) and every future architecture beyond Blackwell.  So the
+  # virtual entry future-proofs the kernel without re-listing each new arch; the
+  # real cubins are just a JIT-skip optimization for known cards.  Applied as a
+  # target property (not the CMAKE_ variable) so it overrides the default CMake
+  # seeds at enable_language regardless.  Skipped when the user pinned arches.
+  if(NOT GZSTD_CUDA_ARCH_USER_SET)
+    set(_gz_arches 75-real 80-real 86-real 89-real 90-real)
+    # sm_100 (Blackwell datacenter) and sm_120 (Blackwell consumer) can only be
+    # emitted as native cubins by nvcc >= 12.8.  On older toolkits we skip them
+    # rather than failing the build — the compute_75 PTX below already JITs onto
+    # those parts, so coverage is unchanged, only the one-time launch JIT remains.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+      list(APPEND _gz_arches 100-real 120-real)
+    endif()
+    list(APPEND _gz_arches 75-virtual)
+    set_target_properties(gzstd PROPERTIES CUDA_ARCHITECTURES "${_gz_arches}")
+    message(STATUS "gzstd verify-kernel CUDA architectures: ${_gz_arches}")
+  endif()
 endif()
 if(HAVE_NVML)
   target_compile_definitions(gzstd PRIVATE HAVE_NVML)

@@ -1,9 +1,42 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.53  
+**Covers:** v0.9.50 → v0.14.55  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.55 — native Blackwell cubins for the verify kernel; Reader line counts `--tar` reads
+
+Two follow-ons to v0.14.53.
+
+**Native Blackwell cubins (toolkit-gated).**  Added `sm_100` (Blackwell datacenter)
+and `sm_120` (Blackwell consumer) to the verify kernel's native SASS set, so those
+cards skip the one-time PTX JIT.  These cubins can only be emitted by nvcc ≥ 12.8, so
+they are gated on the detected compiler version — on an older toolkit they are dropped
+and Blackwell still runs via the `compute_75` PTX, so the build never fails and
+coverage is unchanged.  Mechanically, the architecture list moved from a
+`CMAKE_CUDA_ARCHITECTURES` set *before* `enable_language(CUDA)` to a
+`CUDA_ARCHITECTURES` **target property** set after it — the only point where
+`CMAKE_CUDA_COMPILER_VERSION` is known, which the toolkit gate needs.  A user
+`-DCMAKE_CUDA_ARCHITECTURES=…` override is still honored (detected before
+`enable_language`, before CMake seeds its own default).  The portable release build
+(CUDA 12.6 container) gates the Blackwell cubins out but keeps full coverage via PTX
+JIT; bump that container to CUDA ≥ 12.8 to bake them in — a startup-JIT optimization,
+not a coverage change.
+
+**Reader line now counts `--tar` create member reads.**  The `-vvv` PERFORMANCE
+BREAKDOWN reported `Reader: 0.000 s (0.00 GiB)` for a `--tar` create, which looked
+like the reads were free.  They weren't measured: `--tar` create uses the parallel
+assembler (`tarx::assemble`) as its producer and returns before the
+streaming/mmap/pooled reader block that owns the `read_ns` / `read_bytes_total`
+counters — so the member `pread`s in `read_seg` never touched them.  Now the
+member-read loop accumulates into those counters.  The figure is aggregate across the
+assembler's parallel reader threads (so it can exceed wall time and the reported rate
+is the per-thread average) — the same convention as the `CPU compute` line.  Only real
+file bytes are counted; the synthesized tar headers and padding are not disk I/O.
+Profiling-only (`-vvv`); no effect on output or throughput.
 
 ---
 
