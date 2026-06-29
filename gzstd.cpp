@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.49";
+static constexpr const char * GZSTD_VERSION = "0.14.50";
 //
 // Architecture overview:
 //
@@ -404,6 +404,13 @@ struct Options {
                                   //  retrying until it verifies clean.  Compress-only.
   int  verify_retries = 0;        // --verify-retries=N: max rebuild attempts on verify mismatch
                                   //  (0 = unlimited — keep trying until clean or interrupted)
+  // --verify-engine=cpu|gpu|auto: which engine runs the --verify check on a
+  // gpu-only compress.  GPU verify (decompress+byte-compare in VRAM) is a win only
+  // when the GPU is the idle resource (disk/sink-bound pipeline, fast Gen4+ card);
+  // CPU verify uses the otherwise-idle CPU and wins when the GPU is compute-bound.
+  // auto picks by PCIe gen (see apply_backend_defaults).  0=auto,1=cpu,2=gpu.
+  int  verify_engine = 0;         // VERIFY_ENGINE_*; user choice
+  bool gpu_verify = false;        // resolved: run --verify on the GPU (gpu-only only)
   bool keep_going = false;        // --keep-going: on decompress, don't abort on a frame integrity
                                   //  error — write what decoded, record the damage, continue, then
                                   //  report which file(s)/byte ranges are affected.  Implies
@@ -425,6 +432,11 @@ struct Options {
   bool tar_acls = false;                 // --acls: store/restore POSIX ACLs (SCHILY.acl.*); needs both on create AND extract
   std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
 };
+
+// --verify-engine values (see Options::verify_engine).
+static constexpr int VERIFY_ENGINE_AUTO = 0;  // pick by PCIe gen / bottleneck heuristic
+static constexpr int VERIFY_ENGINE_CPU  = 1;  // background CPU VerifyPool
+static constexpr int VERIFY_ENGINE_GPU  = 2;  // GPU decompress + byte-compare in VRAM
 
 /*======================================================================
  Verbosity levels & exit codes
@@ -804,6 +816,7 @@ static void print_help()
 "  --verify            decompress-verify every frame while compressing; on any\n"
 "                      mismatch, rebuild CPU-only and retry until it verifies\n"
 "  --verify-retries N  cap verify rebuild attempts (0 = unlimited; default)\n"
+"  --verify-engine E   verify on cpu|gpu|auto (gpu-only compress; auto=by GPU speed)\n"
 "  --keep-going        on -d, don't stop at a corrupt frame: recover what's\n"
 "                      readable, then report which file(s) are damaged\n"
 "\n"
@@ -9889,7 +9902,7 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
                       + per_stream_batch * max_out_chunk    // output
                       + temp_est                            // nvCOMP temp workspace
                       + per_stream_batch * (sizeof(void*)*2 + sizeof(size_t)*2 + sizeof(nvcompStatus_t));
-    if (opt.verify && opt.gpu_only)                          // GPU verify: + decompressed buffer + decomp temp
+    if (opt.gpu_verify)                                      // GPU verify: + decompressed buffer + decomp temp
       est_needed += per_stream_batch * gpu_chunk + temp_est;
     if (opt.verbosity >= V_DEBUG) {
       fprintf(stderr, "[VRAM check] batch=%zu gpu_chunk=%zu max_out=%zu temp=%zu MiB est=%zu MiB free=%zu MiB\n",
@@ -9983,7 +9996,7 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   // per-chunk status, actual-size array, and a 1-int mismatch flag.  Only in
   // gpu-only mode, where every frame flows through the GPU worker (hybrid/cpu-only
   // keep the CPU VerifyPool, which also covers their CPU-produced frames).
-  if (opt.verify && opt.gpu_only) {
+  if (opt.gpu_verify) {
     nvcompBatchedZstdDecompressOpts_t decomp_opts{};
     size_t vtb = 0;
     if (nvcompBatchedZstdDecompressGetTempSizeAsync(
@@ -14252,7 +14265,7 @@ int main(int argc, char ** argv)
       //     delivery instead of back-pressuring the writer (see
       //     compute_verify_queue_depth); shallow on limited-RAM boxes, deep on big.
       std::unique_ptr<VerifyPool> vpool;
-      if (opt.verify && !opt.gpu_only) {   // gpu-only verifies on the GPU (in the worker), not here
+      if (opt.verify && !opt.gpu_verify) {   // GPU verify (gpu-only) runs in the GPU worker, not here
         const int cores = (opt.cpu_threads > 0)
             ? opt.cpu_threads
             : std::max(1, (int)std::thread::hardware_concurrency());
@@ -14271,7 +14284,7 @@ int main(int argc, char ** argv)
       if (vpool) { vpool->finish(); vpool->log_summary(opt); g_verify_pool = nullptr; vpool.reset(); }
 
       // GPU-side verify (gpu-only) summary — confirms it ran and at what GPU cost.
-      if (opt.verify && opt.gpu_only && opt.verbosity >= V_VERBOSE
+      if (opt.gpu_verify && opt.verbosity >= V_VERBOSE
           && g_gpu_verify_frames.load() > 0) {
         const uint64_t vf = g_gpu_verify_frames.load();
         const uint64_t vb = g_gpu_verify_bytes.load();
@@ -14896,6 +14909,30 @@ static void apply_backend_defaults(Options & opt)
   // the decompress backend default further down.
   int gen = detect_min_pcie_gen();
 
+  // Resolve the --verify engine (compress only).  GPU verify (decompress + raw
+  // byte-compare in VRAM) applies ONLY to gpu-only mode, where every frame flows
+  // through the GPU worker.  It trades the GPU's spare compute for the CPU's, so
+  // it wins only when the GPU is the idle resource: on a disk/sink-bound pipeline
+  // (fast Gen4+ cards waiting on the writer) the GPUs have cycles to hide the
+  // verify-decompress (measured +1.4 s on 8×H100 vs +5.8 s for CPU verify); on a
+  // compute-bound box (slow Gen<4 cards) it lands on the saturated GPU critical
+  // path while the CPU sits idle, so CPU verify is far cheaper (measured +0.07 s
+  // on 2×2080 Ti vs +0.80 s for GPU verify).  Hence auto picks GPU on Gen4+, CPU
+  // otherwise.  (A true runtime bottleneck read — the [WRITER] sink-vs-upstream
+  // verdict — is the lever a future --adapt mode would steer this with.)
+  opt.gpu_verify = false;
+  if (opt.verify && opt.gpu_only && opt.mode == Mode::COMPRESS) {
+    if      (opt.verify_engine == VERIFY_ENGINE_GPU) opt.gpu_verify = true;
+    else if (opt.verify_engine == VERIFY_ENGINE_CPU) opt.gpu_verify = false;
+    else                                             opt.gpu_verify = (gen >= 4);  // auto
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, std::string("[VERIFY] engine: ")
+           + (opt.gpu_verify ? "GPU (decompress + byte-compare in VRAM)"
+                             : "CPU (background decompress-verify pool)")
+           + (opt.verify_engine == VERIFY_ENGINE_AUTO
+                ? " [auto: PCIe Gen" + std::to_string(gen) + "]" : " [forced]") + "\n");
+  }
+
   // --direct default: O_DIRECT output is a large win on fast-fabric (PCIe Gen4+)
   // boxes for BOTH compress and decompress — frame production outruns buffered
   // writeback, scaling with output volume (win on large output, neutral on
@@ -15076,6 +15113,14 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "--verify") opt.verify = true;
+    else if (a.rfind("--verify-engine=", 0) == 0) {
+      std::string v = a.substr(16);
+      if      (v == "auto") opt.verify_engine = VERIFY_ENGINE_AUTO;
+      else if (v == "cpu")  opt.verify_engine = VERIFY_ENGINE_CPU;
+      else if (v == "gpu")  opt.verify_engine = VERIFY_ENGINE_GPU;
+      else die_usage("--verify-engine must be auto, cpu, or gpu");
+      opt.verify = true;   // implied
+    }
     else if (a == "--keep-going") opt.keep_going = true;
     else if (a.rfind("--verify-retries=", 0) == 0) {
       std::string v = a.substr(17);
