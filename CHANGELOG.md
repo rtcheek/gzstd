@@ -1,9 +1,35 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.55  
+**Covers:** v0.9.50 → v0.14.56  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.56 — fix bogus D2H/total times on the `-vv` GPU batch line; `-vvv` per-chunk `in=`; human-readable byte totals
+
+At `-vv` (`V_DEBUG`) the per-batch `[GPU/S] done batch=…` line reported a wild `d2h=`
+(and therefore `tot=`) — e.g. `d2h=736848192.52ms`, which is the machine's whole
+monotonic clock, not a transfer time.  Cause: the async-polling completion path only
+captured the D2H start timestamp when the `-vvv` perf breakdown was active
+(`d2h_t0 = g_perf ? now_ns() : 0`), so at `-vv` it stayed 0 and `now_ns() - d2h_t0`
+returned the full clock.  Batches that happened to finish via the sync-drain path
+(which sets the timestamp unconditionally) looked fine, hence the mix of sane and
+garbage lines.  Now the start is captured whenever either `g_perf` **or** `-vv` is on,
+and the elapsed computation is guarded (`d2h_t0 > 0 ? … : 0`) — mirroring the
+decompress path, which already did this.  The bogus value also fed the per-stream
+`total … time=` accumulator, so that line is corrected too.
+
+Same root shape, separate spot: the `-vvv` per-chunk trace (`[GPU/S] chunk seq=…`)
+printed `in=0.00 B` for every chunk.  It read the input size from `C.batch[i].len()`,
+but by completion the host input buffer has been moved out (only the `seq` metadata
+survives), so the length reads 0.  It now uses the saved `C.h_in_sizes[i]` array — the
+same source the batch `in_sum` already used — so `in=` shows the real chunk size.
+
+Also switched the `[GPU/S] total …` line's `in=`/`out=` from raw byte counts
+(`in=8589934592B`) to human-readable units (`in=8.00 GiB`), matching the per-batch
+line.  Profiling-only (`-vv`/`-vvv`); no effect on output or throughput.
 
 ---
 

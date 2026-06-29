@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.55";
+static constexpr const char * GZSTD_VERSION = "0.14.56";
 //
 // Architecture overview:
 //
@@ -10829,7 +10829,11 @@ static void gpu_worker(
         if (!C.busy) { continue; }
         cudaError_t q = cudaStreamQuery(C.stream);
         if (q == cudaSuccess) {
-          uint64_t d2h_t0 = g_perf ? now_ns() : 0;
+          // Capture the D2H start for both the -vvv perf breakdown (g_perf) AND
+          // the -vv per-batch line below; otherwise d2h_t0 stays 0 and the
+          // `now_ns() - d2h_t0` below reports the whole monotonic clock as the
+          // D2H time.  (The sync-drain path sets it unconditionally; mirror that.)
+          uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
           checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses)");
           checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes)");
           gpu_verify_check(C, opt);
@@ -10882,7 +10886,7 @@ static void gpu_worker(
                 throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
             }
           }
-          double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
+          double d2h_ms = (d2h_t0 > 0) ? double(now_ns() - d2h_t0) / 1e6 : 0.0;
           double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
           if (g_perf) {
             g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
@@ -10951,7 +10955,10 @@ static void gpu_worker(
           if (opt.verbosity >= V_TRACE) {
             for (size_t i = 0; i < C.filled; ++i) {
               char cs[32], ds[32];
-              human_bytes(double(C.batch[i].len()), ds, sizeof(ds));
+              // Input size from the saved per-chunk array, not C.batch[i].len():
+              // the host input buffer was moved out during processing, so its
+              // length now reads 0 (the seq metadata survives).
+              human_bytes(double(C.h_in_sizes[i]), ds, sizeof(ds));
               human_bytes(double(C.h_comp_sizes[i]), cs, sizeof(cs));
               std::ostringstream os;
               os << "[GPU" << device_id << "/S" << C.stats.stream_index
@@ -11121,7 +11128,10 @@ static void gpu_worker(
           if (opt.verbosity >= V_TRACE) {
             for (size_t i = 0; i < C.filled; ++i) {
               char cs[32], ds[32];
-              human_bytes(double(C.batch[i].len()), ds, sizeof(ds));
+              // Input size from the saved per-chunk array, not C.batch[i].len():
+              // the host input buffer was moved out during processing, so its
+              // length now reads 0 (the seq metadata survives).
+              human_bytes(double(C.h_in_sizes[i]), ds, sizeof(ds));
               human_bytes(double(C.h_comp_sizes[i]), cs, sizeof(cs));
               std::ostringstream os;
               os << "[GPU" << device_id << "/S" << C.stats.stream_index
@@ -11163,10 +11173,13 @@ static void gpu_worker(
     if (opt.verbosity >= V_DEBUG) {
       for (auto & C : ctxs) {
         double thr_gib = (C.stats.total_ms>0.0)? double(C.stats.in_bytes)/(C.stats.total_ms/1000.0)/1e9 : 0.0;
+        char tin[32], tout[32];
+        human_bytes(double(C.stats.in_bytes), tin, sizeof(tin));
+        human_bytes(double(C.stats.out_bytes), tout, sizeof(tout));
         std::ostringstream os;
         os << "[GPU"<<device_id<<"/S"<<C.stats.stream_index<<"] total batches="<<C.stats.batches
            << " chunks="<<C.stats.chunks
-           << " in="<<C.stats.in_bytes<<"B out="<<C.stats.out_bytes<<"B"
+           << " in="<<tin<<" out="<<tout
            << " time="<<std::fixed<<std::setprecision(2)<<C.stats.total_ms<<"ms"
            << " thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s";
         vlog(V_DEBUG, opt, os.str() + "\n");
