@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.51";
+static constexpr const char * GZSTD_VERSION = "0.14.52";
 //
 // Architecture overview:
 //
@@ -9720,6 +9720,16 @@ struct SharedTuneState {
   static constexpr uint32_t MIN_BATCHES = 4;     // min batches across all GPUs before tuning
   static constexpr uint32_t PROBE_INTERVAL = 8;   // ticks in SETTLED before re-probing
   static constexpr double   TUNE_SEC = 0.3;       // min seconds between tune decisions
+
+  // Sink-limited freeze.  Once the output writer (not GPU compute) is the run's
+  // bottleneck, batch size no longer moves end-to-end throughput, and growing
+  // it only deepens head-of-line latency at the in-order writer.  Detected from
+  // the Meter's writer-busy fraction; latches sticky for the rest of the run so
+  // the tuner stops churning.  (This is the [WRITER] sink-limited regime; a
+  // future --adapt mode generalizes the gate.)
+  std::atomic<bool> frozen{false};
+  static constexpr double SINK_FREEZE_BUSY = 0.55; // writer-busy frac ⇒ sink-bound
+  static constexpr double FREEZE_MIN_SEC   = 3.0;  // ignore writer ramp-up before this
 };
 
 // Rate-matched dispatch: tracks CPU and GPU throughput to partition work
@@ -10402,7 +10412,7 @@ static void gpu_worker(
       // ---- Shared auto-tuner ----
       // All GPUs report throughput to SharedTuneState. Whichever worker
       // grabs the mutex first runs the tune logic for everyone.
-      if (shared_tune && !shared_tune->locked.load()) {
+      if (shared_tune && !shared_tune->locked.load() && !shared_tune->frozen.load()) {
         auto now = std::chrono::steady_clock::now();
         // Try to run tune logic (non-blocking mutex try_lock)
         if (shared_tune->window_batches.load(std::memory_order_relaxed) >= SharedTuneState::MIN_BATCHES) {
@@ -10419,7 +10429,29 @@ static void gpu_worker(
               size_t cur_batch = shared_tune->batch_size.load();
 
               auto & S = *shared_tune;
-              if (S.phase == SharedTuneState::Phase::BASELINE) {
+              // Sink-limited freeze: if the writer is the run's bottleneck, stop
+              // tuning. GPU batch size can't lift a writer-capped run, and a
+              // bigger batch only worsens head-of-line latency at the in-order
+              // writer. Latch sticky at the best batch found so far.
+              double wall_s = m ? std::chrono::duration_cast<
+                  std::chrono::duration<double>>(now - m->t0).count() : 0.0;
+              double w_busy = (m && wall_s > 0.0)
+                  ? double(m->writer_disk_ns.load()) / (wall_s * 1e9) : 0.0;
+              if (m && wall_s >= SharedTuneState::FREEZE_MIN_SEC
+                    && w_busy >= SharedTuneState::SINK_FREEZE_BUSY) {
+                if (S.best_batch) S.batch_size.store(S.best_batch);
+                else              S.best_batch = cur_batch;
+                S.phase = SharedTuneState::Phase::SETTLED;
+                S.frozen.store(true);
+                if (opt.verbosity >= V_VERBOSE) {
+                  std::ostringstream os;
+                  os << "[AUTO-TUNE] sink-limited (writer busy " << std::fixed
+                     << std::setprecision(0) << w_busy * 100.0
+                     << "%); freezing batch at " << S.batch_size.load()
+                     << " — GPU throughput is no longer the bottleneck";
+                  vlog(V_VERBOSE, opt, os.str() + "\n");
+                }
+              } else if (S.phase == SharedTuneState::Phase::BASELINE) {
                 S.best_batch = cur_batch;
                 S.best_thr = cur_thr;
                 S.prev_batch = cur_batch;
@@ -12269,7 +12301,7 @@ static void gpu_decomp_worker(
       // ---- Shared auto-tuner (decompress) ----
       // All GPUs report throughput to SharedTuneState. Same logic as compress.
       // Whichever worker grabs the mutex first runs the tune decision.
-      if (shared_tune && !shared_tune->locked.load()) {
+      if (shared_tune && !shared_tune->locked.load() && !shared_tune->frozen.load()) {
         auto now = std::chrono::steady_clock::now();
         if (shared_tune->window_batches.load(std::memory_order_relaxed) >= SharedTuneState::MIN_BATCHES) {
           std::unique_lock<std::mutex> lk(shared_tune->tune_mtx, std::try_to_lock);
@@ -12285,7 +12317,28 @@ static void gpu_decomp_worker(
               size_t cur_batch = shared_tune->batch_size.load();
 
               auto & S = *shared_tune;
-              if (S.phase == SharedTuneState::Phase::BASELINE) {
+              // Sink-limited freeze (see compress path): if the writer is the
+              // bottleneck, stop tuning — batch size can't lift a writer-capped
+              // run and a bigger batch only deepens head-of-line latency.
+              double wall_s = m ? std::chrono::duration_cast<
+                  std::chrono::duration<double>>(now - m->t0).count() : 0.0;
+              double w_busy = (m && wall_s > 0.0)
+                  ? double(m->writer_disk_ns.load()) / (wall_s * 1e9) : 0.0;
+              if (m && wall_s >= SharedTuneState::FREEZE_MIN_SEC
+                    && w_busy >= SharedTuneState::SINK_FREEZE_BUSY) {
+                if (S.best_batch) S.batch_size.store(S.best_batch);
+                else              S.best_batch = cur_batch;
+                S.phase = SharedTuneState::Phase::SETTLED;
+                S.frozen.store(true);
+                if (opt.verbosity >= V_VERBOSE) {
+                  std::ostringstream os;
+                  os << "[AUTO-TUNE] sink-limited (writer busy " << std::fixed
+                     << std::setprecision(0) << w_busy * 100.0
+                     << "%); freezing batch at " << S.batch_size.load()
+                     << " — GPU throughput is no longer the bottleneck";
+                  vlog(V_VERBOSE, opt, os.str() + "\n");
+                }
+              } else if (S.phase == SharedTuneState::Phase::BASELINE) {
                 S.best_batch = cur_batch; S.best_thr = cur_thr;
                 S.prev_batch = cur_batch; S.prev_thr = cur_thr;
                 size_t half = std::max<size_t>(1, cur_batch / 2);

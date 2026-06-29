@@ -1,9 +1,35 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.51  
+**Covers:** v0.9.50 → v0.14.52  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.52 — GPU batch auto-tuner freezes once the writer is the bottleneck
+
+At 130 GiB scale on the 8-GPU box, the GPU batch auto-tuner was hunting a moving
+GPU-throughput target (e.g. "settled at batch=64 @ 6.11 GiB/s") while the run only
+delivered ~4.6 GiB/s — because the **output device**, not GPU compute, was the cap
+(`[WRITER]` verdict: near sink-limited, ~66–71% busy across configs).  In that
+regime GPU batch size can't lift end-to-end throughput, and a *larger* batch only
+hurts: it raises latency to the in-order writer, deepening head-of-line blocking
+(a forced `--gpu-batch=256` flipped the pipeline to upstream-bound with ~1800–2190
+frames stuck behind the missing in-sequence frame).
+
+The tuner now reads the same writer-busy fraction the `[WRITER]` line reports.  Once
+the writer is sink-limited (busy ≥ 55%, after a 3 s ramp-up guard so initial
+exploration still runs), it **latches frozen** at the best batch found and stops
+probing — no more churn chasing a number that doesn't move the run, no wandering
+into the head-of-line cliff.  The gate is sticky per run and applies to both the
+compress and decompress GPU tuners.
+
+Deliberately one-directional and regime-gated: on a GPU-**compute**-bound box (slow
+GPU, idle disk — writer busy ~1%, starved ~99%) the freeze never fires and the
+tuner keeps exploring, exactly where batch size still matters.  This is the first
+piece of `[WRITER]`-verdict-driven control wired into a live decision — the
+groundwork a future `--adapt` mode generalizes.
 
 ---
 
