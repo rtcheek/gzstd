@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.57";
+static constexpr const char * GZSTD_VERSION = "0.14.58";
 //
 // Architecture overview:
 //
@@ -3324,7 +3324,7 @@ public:
     queued_bytes_ += t.data.size();
     q_.push_back(std::move(t));
     ++total_tasks_;
-    cv_.notify_all();      // wake all GPU workers waiting in pop_batch_greedy
+    cv_.notify_all();      // wake all GPU workers waiting in wait_for_batch_or_cap
     cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
   }
 
@@ -3491,6 +3491,44 @@ public:
     for (size_t i = 0; i < take; ++i) {
       out.push_back(take_front_locked());
     }
+    return take;
+  }
+
+  // Wait (no pop, no throttle permit) until the queue holds at least `target`
+  // tasks, OR the producer is done, OR the queue has hit its bounded capacity
+  // (so it cannot grow further without a pop).  This lets a GPU worker wait for
+  // a full batch WITHOUT holding throttle permits — it acquires permits only
+  // after this returns, so a waiting stream never hoards permits.  That is the
+  // structural fix for the full-batch-wait deadlock: the producer never touches
+  // the throttle, so a permit-free waiter is always eventually fed, and streams
+  // can no longer sequester the whole budget and wedge the in-order writer.
+  // The capacity escape avoids waiting forever for a batch larger than the
+  // bounded queue can ever hold.  Returns false only when drained (empty+done).
+  bool wait_for_batch_or_cap(size_t target)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&] {
+      return done_
+          || q_.size() >= target
+          || (max_depth_ > 0 && q_.size() >= max_depth_)
+          || (max_bytes_ > 0 && !q_.empty() && queued_bytes_ >= max_bytes_);
+    });
+    return !(q_.empty() && done_);
+  }
+
+  // Non-blocking batch pop that ALSO wakes a producer blocked on a bounded queue
+  // (try_pop_batch deliberately doesn't, as its CPU-hybrid caller relies on the
+  // GPU path's signal).  Used by the acquire-then-pop GPU intake.
+  size_t try_pop_batch_signal(size_t max_n, std::vector<Task> & out)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    if (q_.empty()) return 0;
+    const size_t take = std::min(max_n, q_.size());
+    out.reserve(out.size() + take);
+    for (size_t i = 0; i < take; ++i) {
+      out.push_back(take_front_locked());
+    }
+    pop_signal_locked();
     return take;
   }
 
@@ -10693,57 +10731,34 @@ static void gpu_worker(
         if (sched) sched->set_gpu_batch_size(pop_n);
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
-        // Acquire frame permits BEFORE gpu_wants_data to avoid deadlock:
-        // if we signal "GPU wants data" first, CPUs yield, but we then
-        // block on throttle — nobody pops.
-        if (bp) bp->acquire((int)pop_n);
-        // Signal scheduler: GPU stream wants data (blocks CPU workers)
-        if (sched) sched->gpu_wants_data();
-        // Pop-batch minimum: when the user pinned --gpu-batch (locked), wait
-        // for the full batch — they asked for it.  When auto-tuning, take
-        // whatever the queue can give (min_n=1) so multiple GPUs don't
-        // serialize behind a single producer.  pop_batch_greedy still returns
-        // early at end-of-queue regardless (no deadlock).
-        const bool locked_batch = shared_tune && shared_tune->locked.load();
-        size_t comp_min_batch = locked_batch ? pop_n : 1;
-        // Deadlock guard: a locked full-batch wait blocks while HOLDING this
-        // batch's throttle permits.  Under a bounded queue (pooled reader),
-        // the streams' aggregate locked demand can exceed the depth the
-        // queue can ever present; the sleeping streams then sequester
-        // enough permits to exhaust the throttle, CPUs can't pop the frames
-        // the writer needs, and the run wedges (measured on the 8-GPU
-        // server: --gpu-streams=16 --gpu-batch=64 → 128 streams × VRAM-fit
-        // ~20 ≈ 2560 held permits, hang at 45%).  When aggregate locked
-        // demand exceeds half the queue's depth ceiling, relax to min_n=1 —
-        // the user's batch stays as the pop CAP.
-        if (locked_batch && sched) {
-          const size_t dcap = sched->queue_depth_cap();
-          const size_t streams_n = (size_t)std::max(1, sched->active_gpu_streams());
-          if (dcap > 0 && streams_n * pop_n * 2 > dcap) {
-            comp_min_batch = 1;
-            static std::atomic<bool> warned{false};
-            if (!warned.exchange(true))
-              vlog(V_DEFAULT, opt,
-                   "[GPU] locked --gpu-batch × streams exceeds queue capacity; "
-                   "relaxing full-batch waits to avoid deadlock (batch stays the cap)\n");
-          }
-        }
-        if (!queue->pop_batch_greedy(pop_n, C.batch, comp_min_batch)) {
-          if (sched) sched->gpu_got_data();
-          if (bp) bp->release((int)pop_n);  // release unused permits
+        // Deadlock-free batch intake (v0.14.58): wait for a full batch — or the
+        // queue's bounded capacity / producer-done — WITHOUT holding any throttle
+        // permit, THEN acquire and non-blocking-pop.  A stream therefore never
+        // sleeps while holding permits, so streams cannot sequester the whole
+        // budget and wedge the in-order writer behind a head-of-line frame no one
+        // can pop.  This replaces the old acquire-then-blocking-pop plus its
+        // conditional full-batch-wait guard (which only covered pooled-reader +
+        // hybrid; tar / mmap / gpu-only slipped through and could deadlock).  The
+        // producer never touches the throttle, so a permit-free waiter is always
+        // eventually fed; the user's --gpu-batch is honored as the pop size when
+        // the queue can supply it, and silently capped when it can't.
+        if (!queue->wait_for_batch_or_cap(pop_n)) {   // no permit held while waiting
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           producer_done_seen = true; continue;
         }
-        // Signal scheduler: GPU got its data (unblocks CPU workers)
+        // Permits now (safe to block here: no frames held, so the writer can
+        // always drain and release).  Then signal intent + non-blocking pop.
+        if (bp) bp->acquire((int)pop_n);
+        if (sched) sched->gpu_wants_data();
+        size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
         if (sched) sched->gpu_got_data();
-        if (C.batch.empty()) {
-          if (bp) bp->release((int)pop_n);  // release unused permits
+        if (got == 0) {   // raced: another worker drained the queue — retry
+          if (bp) bp->release((int)pop_n);
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           continue;
         }
         // Release excess permits if we got fewer frames than requested
-        if (bp && (int)C.batch.size() < (int)pop_n)
-          bp->release((int)pop_n - (int)C.batch.size());
+        if (bp && got < pop_n) bp->release((int)(pop_n - got));
         if (gpu_started_flag) { gpu_started_flag->store(true, std::memory_order_release); }
         if (sched) { sched->mark_gpu_take(C.batch.size()); }
         if (g_perf) g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
@@ -12575,63 +12590,30 @@ static void gpu_decomp_worker(
         if (sched) sched->set_gpu_batch_size(pop_n);
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
-        // Pop-batch minimum:
-        //   - When the user pinned --gpu-batch (shared_tune->locked), honour
-        //     it: wait for the full batch.  The pop still returns early at
-        //     end-of-queue (pop_batch_greedy detects `done_` and takes
-        //     whatever remains), so there's no deadlock — but during steady
-        //     state, the GPU sees the batch size it asked for instead of
-        //     getting tiny batches that defeat the user's intent.
-        //   - When auto-tuning (unlocked), use a soft minimum of 4 frames.
-        //     Don't block for the full batch (serializes multiple GPUs
-        //     behind the reader); don't go as low as 1 either (tiny
-        //     batches waste H2D/D2H overhead and poison the auto-tuner's
-        //     throughput measurement).
-        const bool locked_batch = shared_tune && shared_tune->locked.load();
-        // gpu-only has no CPU relief valve for the in-order writer's
-        // head-of-line frame: hybrid's CPU pool pops one low-seq frame at a
-        // time, but rescue threads only fire on GPU failure.  A locked
-        // full-batch wait in gpu-only lets streams sequester every throttle
-        // permit (the budget is sized FROM device×streams×batch, so GPU
-        // demand can drain the whole pool via the upfront acquire(pop_n)),
-        // and the writer then wedges behind a head-of-line frame no stream
-        // can pop — CONFIRMED on the 8-GPU server: -d --gpu-only
-        // --gpu-batch=64 --gpu-streams=16 hangs at ~74% (hybrid completes).
-        // So in gpu-only, treat --gpu-batch as a CAP, not a hard floor:
-        // reuse the unlocked soft minimum so streams grab whatever is
-        // queued and release the excess permits (handled just below)
-        // instead of blocking on a full batch.  Hybrid keeps the honored
-        // full-batch wait — its CPU pool prevents the wedge.
-        const size_t decomp_min_batch = (locked_batch && !opt.gpu_only)
-            ? pop_n
-            : std::min<size_t>(pop_n, 4);
-        // Acquire frame permits BEFORE gpu_wants_data to avoid deadlock.
-        if (bp) bp->acquire((int)pop_n);
-        // Signal scheduler: this GPU stream wants data (blocks CPU workers)
-        if (sched) sched->gpu_wants_data();
-        if (!queue->pop_batch_greedy(pop_n, C.batch, decomp_min_batch)) {
-          if (sched) sched->gpu_got_data();
-          if (bp) bp->release((int)pop_n);  // release unused permits
-          if (g_perf) {
-            g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
-            g_perf->queue_wait_count.fetch_add(1);
-          }
+        // Deadlock-free batch intake (v0.14.58): wait for the batch — or the
+        // queue's bounded capacity / producer-done — WITHOUT holding any throttle
+        // permit, THEN acquire and non-blocking-pop.  A waiting stream never
+        // hoards permits, so it cannot sequester the budget and wedge the writer
+        // behind a head-of-line frame (this replaces the gpu-only hang: -d
+        // --gpu-only --gpu-batch=64 --gpu-streams=16 hung at ~74%).  The producer
+        // never touches the throttle, so a permit-free waiter is always fed; the
+        // user's --gpu-batch is the pop size when the queue can supply it, capped
+        // when it can't — so the old gpu-only soft-min special case is gone.
+        if (!queue->wait_for_batch_or_cap(pop_n)) {
+          if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           producer_done_seen = true;
           continue;
         }
-        // Signal scheduler: this GPU stream got its data (unblocks CPU workers)
+        if (bp) bp->acquire((int)pop_n);          // safe to block: no frames held
+        if (sched) sched->gpu_wants_data();
+        size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
         if (sched) sched->gpu_got_data();
-        if (C.batch.empty()) {
-          if (bp) bp->release((int)pop_n);  // release unused permits
-          if (g_perf) {
-            g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0);
-            g_perf->queue_wait_count.fetch_add(1);
-          }
+        if (got == 0) {   // raced: another stream drained the queue — retry
+          if (bp) bp->release((int)pop_n);
+          if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
+          continue;
         }
-        // Release excess permits if we got fewer frames than requested
-        if (bp && !C.batch.empty() && (int)C.batch.size() < (int)pop_n)
-          bp->release((int)pop_n - (int)C.batch.size());
-        if (C.batch.empty()) continue;
+        if (bp && got < pop_n) bp->release((int)(pop_n - got));
 
         // In hybrid mode, skip batches where every frame is trivially
         // compressed (ratio < 2%).  CPU decompresses these faster than GPU

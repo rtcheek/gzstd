@@ -1,9 +1,54 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.57  
+**Covers:** v0.9.50 → v0.14.58  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.58 — structural fix for the intermittent GPU permit-hoarding deadlock
+
+The long-standing intermittent hang on pinned `--gpu-batch`/`--gpu-streams` runs is
+fixed at the root.
+
+**Mechanism.** A GPU stream acquired its *whole* batch of throttle permits up front
+(`acquire(pop_n)` *before* popping), and `FrameThrottle::acquire` is incremental
+("take what's available, wait for the rest") — so a stream grabs partial permits and
+**blocks holding them**. In "locked" mode (set whenever you pin `--gpu-batch`) the
+stream then **slept in the batch pop waiting for a full batch while still holding
+`pop_n` permits**. The throttle budget is sized to exactly the aggregate GPU demand
+(`devices×streams×batch`) with no headroom, so when every stream hold-and-waited at
+once, all permits were sequestered and the in-order writer wedged behind a head-of-
+line frame no one could pop. It was intermittent because it needs a transient where
+all streams wait at once with the bounded queue below the aggregate threshold — a
+function of producer rate, VRAM-reduced batch sizes, and startup timing, i.e.
+load/contention.
+
+The previous patches were point fixes that each covered one `(mode × reader)` combo
+and left holes — the compress hybrid guard only armed for the pooled reader (its
+`queue_depth_cap` is unset for the **mmap** and **`--tar` assembler** producers, and
+absent in **gpu-only** where there's no scheduler), and the decompress gpu-only
+soft-min was a parallel special case. So pinned-batch `--tar` compress and gpu-only
+compress in particular could still wedge.
+
+**Fix.** Both GPU worker loops (compress and decompress) now **wait for the batch
+without holding any permits, then acquire and non-blocking-pop**: `wait_for_batch_or_cap(pop_n)`
+→ `acquire(pop_n)` → `try_pop_batch_signal(pop_n)` → release excess. A stream never
+sleeps while holding permits, so it can't sequester the budget. This is sound because
+the producer never touches the throttle (it's bounded only by the queue), so a
+permit-free waiter is always eventually fed; the writer drains the frames whose
+holders *do* have permits, releasing them. `wait_for_batch_or_cap` also returns at the
+queue's bounded capacity, so a stream never waits for a batch larger than the queue
+can supply (`--gpu-batch` stays the pop size when the queue can fill it, and is
+silently capped when it can't). This removes the need for the conditional full-batch-
+wait guards and the gpu-only soft-min special case — both deleted; mirrors the CPU
+worker's proven wait→acquire→try-pop→release-on-miss pattern, now batched.
+
+Validated: the exact reproducer configs (`--hybrid`/`--gpu-only` compress and
+decompress, plain and `--tar`, with pinned `--gpu-batch`/`--gpu-streams` and the tight
+`--throttle-frames=1`) all complete with byte-identical round-trips, including a 15×
+repeat of the worst case; full suite green.
 
 ---
 
