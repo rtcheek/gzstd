@@ -1,11 +1,49 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.47  
+**Covers:** v0.9.50 → v0.14.50  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.48–0.14.50 — GPU-side `--verify`, and a `--verify-engine` flag that picks by bottleneck
+
+`--verify` on a `--gpu-only` compress had to decompress-check on the CPU, which on
+a fast many-GPU box competes with the GPU pipeline's host-side staging for CPU and
+memory bandwidth (residual ~+5.8 s on 8×H100 after the v0.14.47 fixes).  But those
+GPUs are **disk/sink-bound** — ~half-idle waiting on the writer.  So verify on the
+GPU instead.
+
+After each batch compresses, the GPU worker decompresses it back in VRAM (nvCOMP,
+same stream) and **raw-byte-compares** it against the still-resident original
+input — no host traffic, no CPU.  A custom compare kernel (`gpuverify.cu`, the only
+kernel gzstd ships; CMake enables the CUDA language only under `HAVE_NVCOMP`) sets a
+device mismatch flag; any decode failure or mismatch throws → the existing
+gpu_worker catch → abort → CPU-only rebuild.  Raw compare, not XXH64: absolute, no
+collision window.  A `[GPU-VERIFY]` line at `-v` reports frames/bytes checked and
+aggregate GPU verify time.
+
+**Measured both ways on both boxes — and the winner flips with the bottleneck:**
+
+| box | bottleneck | idle resource | CPU verify | GPU verify |
+|-----|-----------|---------------|-----------|-----------|
+| 8×H100 (Gen5) | disk (sink) | GPU compute | +5.8 s | **+1.4 s** |
+| 2×2080 Ti (Gen3) | GPU compute | CPU | **+0.07 s** | +0.80 s |
+
+GPU verify wins only when the GPU is the idle resource (disk-bound, fast Gen4+ card
+with VRAM to spare); when the GPU is compute-bound, CPU verify rides the idle CPU
+and is far cheaper.  So `--verify-engine=cpu|gpu|auto` (default **auto**) picks by
+PCIe gen: **GPU on Gen4+, CPU otherwise** — CPU being the safe fallback (no VRAM
+cost, never terrible).  GPU verify only applies to `--gpu-only` (every frame flows
+through the GPU worker); hybrid/cpu-only always use the CPU `VerifyPool`.  VRAM: per
+stream adds a decompressed-output buffer (= input size) + an nvCOMP decompress temp
+(~= the compress temp), so on a small-VRAM card the default config may not fit and
+it falls back as usual.
+
+(The static PCIe-gen heuristic stands in for a true runtime read of the bottleneck
+— the `[WRITER]` sink-vs-upstream verdict — the lever a future `--adapt` mode would
+steer this with.)
 
 ## v0.14.44–0.14.47 — `--verify` observability at `-v`, rate-matched + RAM-sized verify pool; drop a redundant O_DIRECT line
 

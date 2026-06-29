@@ -165,6 +165,16 @@ if(USE_NVCOMP)
   endif()
 endif()
 
+# Enable the CUDA compiler only for the GPU build — the one custom kernel
+# (gpuverify.cu, the --verify byte compare) is compiled by nvcc.  The CPU-only
+# build stays LANGUAGES CXX (no nvcc required).
+if(HAVE_NVCOMP)
+  enable_language(CUDA)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "75;90")  # Turing (2080 Ti) + Hopper (H100); override with -DCMAKE_CUDA_ARCHITECTURES
+  endif()
+endif()
+
 # =====================================================
 #          NVML (GPU utilization monitoring)
 # NVML is part of the NVIDIA driver and CANNOT be statically linked.
@@ -192,6 +202,8 @@ target_compile_features(gzstd PRIVATE cxx_std_17)
 if(HAVE_NVCOMP)
   target_compile_definitions(gzstd PRIVATE HAVE_NVCOMP)
   target_include_directories(gzstd PRIVATE ${NVCOMP_INCLUDE_DIR})
+  # The GPU-verify byte-compare kernel (nvcc-compiled).
+  target_sources(gzstd PRIVATE gpuverify.cu)
 endif()
 if(HAVE_NVML)
   target_compile_definitions(gzstd PRIVATE HAVE_NVML)

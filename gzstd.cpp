@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.47";
+static constexpr const char * GZSTD_VERSION = "0.14.50";
 //
 // Architecture overview:
 //
@@ -404,6 +404,13 @@ struct Options {
                                   //  retrying until it verifies clean.  Compress-only.
   int  verify_retries = 0;        // --verify-retries=N: max rebuild attempts on verify mismatch
                                   //  (0 = unlimited — keep trying until clean or interrupted)
+  // --verify-engine=cpu|gpu|auto: which engine runs the --verify check on a
+  // gpu-only compress.  GPU verify (decompress+byte-compare in VRAM) is a win only
+  // when the GPU is the idle resource (disk/sink-bound pipeline, fast Gen4+ card);
+  // CPU verify uses the otherwise-idle CPU and wins when the GPU is compute-bound.
+  // auto picks by PCIe gen (see apply_backend_defaults).  0=auto,1=cpu,2=gpu.
+  int  verify_engine = 0;         // VERIFY_ENGINE_*; user choice
+  bool gpu_verify = false;        // resolved: run --verify on the GPU (gpu-only only)
   bool keep_going = false;        // --keep-going: on decompress, don't abort on a frame integrity
                                   //  error — write what decoded, record the damage, continue, then
                                   //  report which file(s)/byte ranges are affected.  Implies
@@ -425,6 +432,11 @@ struct Options {
   bool tar_acls = false;                 // --acls: store/restore POSIX ACLs (SCHILY.acl.*); needs both on create AND extract
   std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
 };
+
+// --verify-engine values (see Options::verify_engine).
+static constexpr int VERIFY_ENGINE_AUTO = 0;  // pick by PCIe gen / bottleneck heuristic
+static constexpr int VERIFY_ENGINE_CPU  = 1;  // background CPU VerifyPool
+static constexpr int VERIFY_ENGINE_GPU  = 2;  // GPU decompress + byte-compare in VRAM
 
 /*======================================================================
  Verbosity levels & exit codes
@@ -804,6 +816,7 @@ static void print_help()
 "  --verify            decompress-verify every frame while compressing; on any\n"
 "                      mismatch, rebuild CPU-only and retry until it verifies\n"
 "  --verify-retries N  cap verify rebuild attempts (0 = unlimited; default)\n"
+"  --verify-engine E   verify on cpu|gpu|auto (gpu-only compress; auto=by GPU speed)\n"
 "  --keep-going        on -d, don't stop at a corrupt frame: recover what's\n"
 "                      readable, then report which file(s) are damaged\n"
 "\n"
@@ -2988,6 +3001,14 @@ static std::atomic<bool> g_gpu_failed_restart{false};
 // there is finished on CPU and the output is KEPT) nor by --verify.
 static std::atomic<bool> g_gpu_aborted{false};
 
+// GPU-side --verify (gpu-only) stats, for the -v [GPU-VERIFY] summary.  Summed
+// across all device workers/streams; the time is aggregate GPU time on the
+// verify decompress+compare (overlaps compress across the 8 GPUs, so it's a work
+// total, not a wall figure).  Reset per compress pass.
+static std::atomic<uint64_t> g_gpu_verify_frames{0};
+static std::atomic<uint64_t> g_gpu_verify_bytes{0};   // decompressed (verified) bytes
+static std::atomic<uint64_t> g_gpu_verify_ns{0};
+
 // --verify: a background decompress-verify worker found a frame whose compressed
 // bytes do NOT round-trip (XXH64 mismatch / decode error).  Set alongside
 // g_gpu_failed_restart so the driver's existing discard-and-rebuild path fires;
@@ -3013,6 +3034,11 @@ static int64_t g_debug_fail_gpu_after = -1;
 // --verify-retries give-up path).
 static int64_t g_debug_corrupt_frame   = -1;
 static bool    g_debug_corrupt_persist = false;
+
+// Test-only: flip a byte of the GPU's compressed output in VRAM before the
+// verify-decompress, so the GPU-side verify (gpu-only) must catch it.  Fires once
+// (first batch).  false (env unset) = disabled.  $GZSTD_DEBUG_GPU_CORRUPT=1.
+static std::atomic<bool> g_debug_gpu_corrupt{false};
 
 // --keep-going: collects every frame that failed to fully verify/decode during a
 // recovery decompress, so the driver can report which output ranges (and, with
@@ -9749,6 +9775,14 @@ static inline size_t get_nvcomp_temp_size(size_t chunks, size_t gpu_chunk, nvcom
 
 // Per-stream GPU context: holds device buffers, CUDA events, and batch state
 // for one CUDA stream on one device.
+// GPU-side raw byte compare for --verify (defined in gpuverify.cu, nvcc-compiled).
+// Compares each chunk's `sizes[i]` bytes of `a` vs `b` (stride between chunks),
+// setting *mismatch=1 on any difference.  Launched on `stream` after the
+// verify-decompress.
+extern "C" void gzv_launch_compare(const void * a, const void * b,
+                                   const size_t * sizes, size_t n_chunks,
+                                   size_t stride, int * mismatch, cudaStream_t stream);
+
 struct StreamCtx {
   cudaStream_t stream{};
 
@@ -9764,6 +9798,17 @@ struct StreamCtx {
   size_t *        d_comp_sizes = nullptr;
   nvcompStatus_t* d_stats      = nullptr;
   size_t          temp_bytes_used = 0;
+
+  // --verify (gpu-only): decompress this batch back in VRAM and raw-byte-compare
+  // it against the original input, all on the GPU.  Allocated only when opt.verify.
+  void *          d_verify_base   = nullptr;  // decompressed output (N * gpu_chunk)
+  void **         d_verify_ptrs   = nullptr;
+  size_t *        d_verify_actual = nullptr;  // actual decompressed sizes (output)
+  nvcompStatus_t* d_verify_stats  = nullptr;  // per-chunk decompress status
+  void *          d_verify_temp   = nullptr;
+  size_t          verify_temp_bytes = 0;
+  int *           d_verify_mismatch = nullptr; // device flag: 0 ok, 1 = bytes differ
+  std::vector<nvcompStatus_t> h_verify_stats;  // host readback of decompress status
 
   // Pinned host memory for H2D + D2H transfers (optional).
   // ONE buffer per stream is sized to max(gpu_chunk, max_out_chunk) per
@@ -9857,6 +9902,8 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
                       + per_stream_batch * max_out_chunk    // output
                       + temp_est                            // nvCOMP temp workspace
                       + per_stream_batch * (sizeof(void*)*2 + sizeof(size_t)*2 + sizeof(nvcompStatus_t));
+    if (opt.gpu_verify)                                      // GPU verify: + decompressed buffer + decomp temp
+      est_needed += per_stream_batch * gpu_chunk + temp_est;
     if (opt.verbosity >= V_DEBUG) {
       fprintf(stderr, "[VRAM check] batch=%zu gpu_chunk=%zu max_out=%zu temp=%zu MiB est=%zu MiB free=%zu MiB\n",
               per_stream_batch, gpu_chunk/ONE_MIB, max_out_chunk/ONE_MIB,
@@ -9944,6 +9991,34 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
                       cudaMemcpyHostToDevice, C.stream) != cudaSuccess) return false;
   if (cudaStreamSynchronize(C.stream) != cudaSuccess) return false;
 
+  // --verify (gpu-only): decompressed-output buffer + its pointer array, nvCOMP
+  // decompress temp (sized from the max chunk via the Async API — no stream sync),
+  // per-chunk status, actual-size array, and a 1-int mismatch flag.  Only in
+  // gpu-only mode, where every frame flows through the GPU worker (hybrid/cpu-only
+  // keep the CPU VerifyPool, which also covers their CPU-produced frames).
+  if (opt.gpu_verify) {
+    nvcompBatchedZstdDecompressOpts_t decomp_opts{};
+    size_t vtb = 0;
+    if (nvcompBatchedZstdDecompressGetTempSizeAsync(
+            per_stream_batch, gpu_chunk, decomp_opts, &vtb,
+            per_stream_batch * gpu_chunk) != nvcompSuccess) return false;
+    C.verify_temp_bytes = vtb;
+    if (cudaMalloc(&C.d_verify_base, per_stream_batch * gpu_chunk) != cudaSuccess) return false;
+    if (vtb > 0 && cudaMalloc(&C.d_verify_temp, vtb) != cudaSuccess) return false;
+    if (cudaMalloc(&C.d_verify_ptrs,     sizeof(void*)          * per_stream_batch) != cudaSuccess) return false;
+    if (cudaMalloc(&C.d_verify_actual,   sizeof(size_t)         * per_stream_batch) != cudaSuccess) return false;
+    if (cudaMalloc(&C.d_verify_stats,    sizeof(nvcompStatus_t) * per_stream_batch) != cudaSuccess) return false;
+    if (cudaMalloc(&C.d_verify_mismatch, sizeof(int))                                != cudaSuccess) return false;
+    std::vector<void*> h_verify_ptrs(per_stream_batch);
+    for (size_t i = 0; i < per_stream_batch; ++i)
+      h_verify_ptrs[i] = static_cast<char*>(C.d_verify_base) + i * gpu_chunk;
+    if (cudaMemcpyAsync(C.d_verify_ptrs, h_verify_ptrs.data(),
+                        sizeof(void*) * per_stream_batch,
+                        cudaMemcpyHostToDevice, C.stream) != cudaSuccess) return false;
+    if (cudaStreamSynchronize(C.stream) != cudaSuccess) return false;
+    C.h_verify_stats.resize(per_stream_batch);
+  }
+
   // Allocate host-side vectors for sizes and statuses
   C.h_in_sizes.resize(C.per_stream_batch);
   C.h_comp_sizes.resize(C.per_stream_batch);
@@ -9974,6 +10049,12 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   if (C.d_in_sizes) { cudaFree(C.d_in_sizes); }
   if (C.d_comp_sizes) { cudaFree(C.d_comp_sizes); }
   if (C.d_stats) { cudaFree(C.d_stats); }
+  if (C.d_verify_base)     { cudaFree(C.d_verify_base);     C.d_verify_base = nullptr; }
+  if (C.d_verify_temp)     { cudaFree(C.d_verify_temp);     C.d_verify_temp = nullptr; }
+  if (C.d_verify_ptrs)     { cudaFree(C.d_verify_ptrs);     C.d_verify_ptrs = nullptr; }
+  if (C.d_verify_actual)   { cudaFree(C.d_verify_actual);   C.d_verify_actual = nullptr; }
+  if (C.d_verify_stats)    { cudaFree(C.d_verify_stats);    C.d_verify_stats = nullptr; }
+  if (C.d_verify_mismatch) { cudaFree(C.d_verify_mismatch); C.d_verify_mismatch = nullptr; }
   if (C.h2d_pinned_base) {
     cudaFreeHost(C.h2d_pinned_base);
     release_pinned(C.h2d_pinned_bytes, opt);
@@ -10063,6 +10144,36 @@ static inline void gpu_frame_add_checksum(FrameVec & f, uint32_t ck) {
   f.push_back((char)((ck >> 8) & 0xff));
   f.push_back((char)((ck >> 16) & 0xff));
   f.push_back((char)((ck >> 24) & 0xff));
+}
+
+// --verify (gpu-only): read back the per-chunk decompress status + the GPU
+// byte-compare flag for the just-completed batch, and throw on any decode failure
+// or mismatch.  The gpu_worker catch turns the throw into the standard abort →
+// CPU-only rebuild (a GPU that can't round-trip its own output is exactly the
+// "unreliable narrator" we discard).  No-op unless verify buffers were allocated.
+static void gpu_verify_check(StreamCtx & C, const Options & opt)
+{
+  if (!opt.verify || !C.d_verify_base) return;
+  checkCuda(cudaMemcpy(C.h_verify_stats.data(), C.d_verify_stats,
+                       sizeof(nvcompStatus_t) * C.filled, cudaMemcpyDeviceToHost),
+            "cudaMemcpy(D2H verify statuses)");
+  int v_mism = 0;
+  checkCuda(cudaMemcpy(&v_mism, C.d_verify_mismatch, sizeof(int), cudaMemcpyDeviceToHost),
+            "cudaMemcpy(D2H verify mismatch)");
+  for (size_t i = 0; i < C.filled; ++i)
+    if (C.h_verify_stats[i] != nvcompSuccess)
+      throw std::runtime_error("GPU verify: a frame failed to decompress (compressed output is corrupt)");
+  if (v_mism)
+    throw std::runtime_error("GPU verify: decompressed output != input (the GPU corrupted the data)");
+
+  // Passed — accumulate -v stats.  The verify ran comp_end..d2h_end on the stream.
+  float v_ms = 0.0f;
+  cudaEventElapsedTime(&v_ms, C.ev_comp_end, C.ev_d2h_end);
+  g_gpu_verify_ns.fetch_add((uint64_t)(v_ms * 1e6), std::memory_order_relaxed);
+  g_gpu_verify_frames.fetch_add(C.filled, std::memory_order_relaxed);
+  uint64_t vb = 0;
+  for (size_t i = 0; i < C.filled; ++i) vb += C.h_in_sizes[i];
+  g_gpu_verify_bytes.fetch_add(vb, std::memory_order_relaxed);
 }
 
 static void gpu_worker(
@@ -10630,6 +10741,36 @@ static void gpu_worker(
           C.d_stats,
           C.stream), "nvcompBatchedZstdCompressAsync");
         cudaEventRecord(C.ev_comp_end, C.stream);
+
+        // --verify (gpu-only): decompress the batch we just compressed straight
+        // back in VRAM (same stream, ordered after compress) and raw-byte-compare
+        // it against the still-resident original input.  No host traffic, no CPU.
+        // The GPU is disk-bound here, so this rides its idle compute.  Any decode
+        // failure or byte mismatch throws → the gpu_worker catch aborts and the
+        // driver rebuilds CPU-only (same response as a hard GPU fault).
+        if (opt.verify && C.d_verify_base) {
+          cudaMemsetAsync(C.d_verify_mismatch, 0, sizeof(int), C.stream);
+          // Test-only: corrupt the compressed output in VRAM once, so the verify
+          // below must catch it (flip a byte well past the frame header).
+          if (g_debug_gpu_corrupt.exchange(false))
+            cudaMemsetAsync(static_cast<char*>(C.d_out_base) + 64, 0xFF, 1, C.stream);
+          nvcompBatchedZstdDecompressOpts_t v_opts{};
+          checkNvcomp(nvcompBatchedZstdDecompressAsync(
+            (const void * const *)C.d_out_ptrs,   // compressed = the compress output
+            C.d_comp_sizes,                       // its compressed sizes (device)
+            C.d_in_sizes,                          // expected decompressed sizes = input sizes
+            C.d_verify_actual,
+            C.filled,
+            C.d_verify_temp,
+            C.verify_temp_bytes,
+            (void * const *)C.d_verify_ptrs,       // decompressed output
+            v_opts,
+            C.d_verify_stats,
+            C.stream), "nvcompBatchedZstdDecompressAsync(verify)");
+          gzv_launch_compare(C.d_verify_base, C.d_in_base, C.d_in_sizes,
+                             C.filled, C.gpu_chunk, C.d_verify_mismatch, C.stream);
+          cudaEventRecord(C.ev_d2h_end, C.stream);   // mark end of verify (for -v timing)
+        }
         C.busy = true; submitted_any = true;
       }
 
@@ -10645,6 +10786,7 @@ static void gpu_worker(
           uint64_t d2h_t0 = g_perf ? now_ns() : 0;
           checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses)");
           checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes)");
+          gpu_verify_check(C, opt);
           // Measure per-phase timing from CUDA events
           float h2d_ms = 0, comp_ms = 0;
           cudaEventElapsedTime(&h2d_ms,  C.ev_h2d_begin, C.ev_h2d_end);
@@ -10812,6 +10954,7 @@ static void gpu_worker(
           checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize");
           checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses sync)");
           checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes sync)");
+          gpu_verify_check(C, opt);
           // Measure per-phase timing (synchronous path)
           float h2d_ms = 0, comp_ms = 0;
           cudaEventElapsedTime(&h2d_ms,  C.ev_h2d_begin, C.ev_h2d_end);
@@ -13798,6 +13941,8 @@ int main(int argc, char ** argv)
     g_debug_corrupt_frame = std::atoll(cf);
   if (const char * cp = std::getenv("GZSTD_DEBUG_CORRUPT_PERSIST"))
     g_debug_corrupt_persist = (std::atoll(cp) != 0);
+  if (const char * gc = std::getenv("GZSTD_DEBUG_GPU_CORRUPT"))
+    g_debug_gpu_corrupt.store(std::atoll(gc) != 0);
 
   // Recycle frame buffers instead of mmap/munmap-ing them every chunk.
   // Our per-frame heap buffers are large (16 MiB default, 32 MiB ultra), so glibc
@@ -14105,6 +14250,7 @@ int main(int argc, char ** argv)
     for (;;) {
       g_gpu_failed_restart.store(false);
       g_gpu_aborted.store(false);   // clear the GPU-fault abort before each pass (incl. the CPU rebuild)
+      g_gpu_verify_frames.store(0); g_gpu_verify_bytes.store(0); g_gpu_verify_ns.store(0);
       g_verify_failed.store(false, std::memory_order_relaxed);
       g_verify_failed_seq.store(-1, std::memory_order_relaxed);
 
@@ -14119,7 +14265,7 @@ int main(int argc, char ** argv)
       //     delivery instead of back-pressuring the writer (see
       //     compute_verify_queue_depth); shallow on limited-RAM boxes, deep on big.
       std::unique_ptr<VerifyPool> vpool;
-      if (opt.verify) {
+      if (opt.verify && !opt.gpu_verify) {   // GPU verify (gpu-only) runs in the GPU worker, not here
         const int cores = (opt.cpu_threads > 0)
             ? opt.cpu_threads
             : std::max(1, (int)std::thread::hardware_concurrency());
@@ -14136,6 +14282,20 @@ int main(int argc, char ** argv)
       // Drain/join verify BEFORE reading the restart flag, so a mismatch that
       // surfaces only as the final frames are checked still triggers a rebuild.
       if (vpool) { vpool->finish(); vpool->log_summary(opt); g_verify_pool = nullptr; vpool.reset(); }
+
+      // GPU-side verify (gpu-only) summary — confirms it ran and at what GPU cost.
+      if (opt.gpu_verify && opt.verbosity >= V_VERBOSE
+          && g_gpu_verify_frames.load() > 0) {
+        const uint64_t vf = g_gpu_verify_frames.load();
+        const uint64_t vb = g_gpu_verify_bytes.load();
+        const double   vs = g_gpu_verify_ns.load() / 1e9;   // aggregate GPU time (overlaps compress)
+        char bs[32]; human_bytes(double(vb), bs, sizeof(bs));
+        std::ostringstream os;
+        os << "[GPU-VERIFY] " << vf << " frames (" << bs
+           << ") decompressed + byte-compared on the GPU in VRAM (no CPU/host traffic); "
+           << std::fixed << std::setprecision(2) << vs << " s aggregate GPU verify time";
+        vlog(V_VERBOSE, opt, os.str() + "\n");
+      }
 
       if (!g_gpu_failed_restart.load()) break;   // clean — verified, or no verify and no fault
 
@@ -14749,6 +14909,30 @@ static void apply_backend_defaults(Options & opt)
   // the decompress backend default further down.
   int gen = detect_min_pcie_gen();
 
+  // Resolve the --verify engine (compress only).  GPU verify (decompress + raw
+  // byte-compare in VRAM) applies ONLY to gpu-only mode, where every frame flows
+  // through the GPU worker.  It trades the GPU's spare compute for the CPU's, so
+  // it wins only when the GPU is the idle resource: on a disk/sink-bound pipeline
+  // (fast Gen4+ cards waiting on the writer) the GPUs have cycles to hide the
+  // verify-decompress (measured +1.4 s on 8×H100 vs +5.8 s for CPU verify); on a
+  // compute-bound box (slow Gen<4 cards) it lands on the saturated GPU critical
+  // path while the CPU sits idle, so CPU verify is far cheaper (measured +0.07 s
+  // on 2×2080 Ti vs +0.80 s for GPU verify).  Hence auto picks GPU on Gen4+, CPU
+  // otherwise.  (A true runtime bottleneck read — the [WRITER] sink-vs-upstream
+  // verdict — is the lever a future --adapt mode would steer this with.)
+  opt.gpu_verify = false;
+  if (opt.verify && opt.gpu_only && opt.mode == Mode::COMPRESS) {
+    if      (opt.verify_engine == VERIFY_ENGINE_GPU) opt.gpu_verify = true;
+    else if (opt.verify_engine == VERIFY_ENGINE_CPU) opt.gpu_verify = false;
+    else                                             opt.gpu_verify = (gen >= 4);  // auto
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, std::string("[VERIFY] engine: ")
+           + (opt.gpu_verify ? "GPU (decompress + byte-compare in VRAM)"
+                             : "CPU (background decompress-verify pool)")
+           + (opt.verify_engine == VERIFY_ENGINE_AUTO
+                ? " [auto: PCIe Gen" + std::to_string(gen) + "]" : " [forced]") + "\n");
+  }
+
   // --direct default: O_DIRECT output is a large win on fast-fabric (PCIe Gen4+)
   // boxes for BOTH compress and decompress — frame production outruns buffered
   // writeback, scaling with output volume (win on large output, neutral on
@@ -14929,6 +15113,14 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "--verify") opt.verify = true;
+    else if (a.rfind("--verify-engine=", 0) == 0) {
+      std::string v = a.substr(16);
+      if      (v == "auto") opt.verify_engine = VERIFY_ENGINE_AUTO;
+      else if (v == "cpu")  opt.verify_engine = VERIFY_ENGINE_CPU;
+      else if (v == "gpu")  opt.verify_engine = VERIFY_ENGINE_GPU;
+      else die_usage("--verify-engine must be auto, cpu, or gpu");
+      opt.verify = true;   // implied
+    }
     else if (a == "--keep-going") opt.keep_going = true;
     else if (a.rfind("--verify-retries=", 0) == 0) {
       std::string v = a.substr(17);
