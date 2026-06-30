@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.58";
+static constexpr const char * GZSTD_VERSION = "0.14.59";
 //
 // Architecture overview:
 //
@@ -3024,6 +3024,9 @@ static std::atomic<int64_t> g_verify_failed_seq{-1};
 // frames, to exercise the CPU-only restart path deterministically (real GPU
 // faults are intermittent).  -1 (default, env unset) = disabled.
 static int64_t g_debug_fail_gpu_after = -1;
+// TEMPORARY (v0.14.59 diagnostic): freeze the writer after N frames to exercise
+// the deadlock watchdog without a real hang.  -1 = disabled.
+static std::atomic<int64_t> g_debug_freeze_writer_after{-1};
 
 // Test-only corruption injection (read once from $GZSTD_DEBUG_CORRUPT_FRAME):
 // flip a byte in the compressed payload of the frame with this sequence number
@@ -3368,53 +3371,6 @@ public:
     cpu_cv_.notify_one();
   }
 
-  // Pop up to max_n tasks at once (used by GPU workers to fill a batch).
-  // Returns false when the queue is drained (empty + done).
-  // Pop up to max_n tasks at once (used by GPU workers to fill a batch).
-  // If min_n > 0, waits until at least min_n tasks are queued (or producer done).
-  bool pop_batch(size_t max_n, std::vector<Task> & out, size_t min_n = 0)
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    // Wait for at least min_n items (or done signal)
-    while ((q_.size() < min_n && !done_) || (q_.empty() && !done_))
-      cv_.wait(lk);
-    if (q_.empty() && done_) return false;
-
-    const size_t take = std::min(max_n, q_.size());
-    out.reserve(out.size() + take);
-    for (size_t i = 0; i < take; ++i) {
-      out.push_back(take_front_locked());
-    }
-    return true;
-  }
-
-  // Greedy pop: wait until the queue has at least min_n items (default: max_n)
-  // OR producer is done, then take everything available up to max_n.
-  //
-  // When min_n == max_n (default): maximizes batch size for GPU kernels where
-  // per-launch overhead is expensive.  Used for compress.
-  //
-  // When min_n < max_n: starts processing sooner with partial batches.  Used
-  // for decompress where 8 GPUs blocking for full batches serializes the
-  // pipeline — each GPU drains the queue and others wait for the reader to
-  // refill.  With min_n=1, GPUs grab whatever is available immediately.
-  bool pop_batch_greedy(size_t max_n, std::vector<Task> & out, size_t min_n = 0)
-  {
-    if (min_n == 0) min_n = max_n;  // default: wait for full batch
-    std::unique_lock<std::mutex> lk(m_);
-    while (q_.size() < min_n && !done_)
-      cv_.wait(lk);
-    if (q_.empty() && done_) return false;
-
-    const size_t take = std::min(max_n, q_.size());
-    out.reserve(out.size() + take);
-    for (size_t i = 0; i < take; ++i) {
-      out.push_back(take_front_locked());
-    }
-    pop_signal_locked();
-    return true;
-  }
-
   // Pop a single task (used by CPU workers).
   bool pop_one(Task & t)
   {
@@ -3700,10 +3656,10 @@ private:
 
   // Wake a producer blocked in push() on a full bounded queue.  No-op when
   // unbounded (max_depth_ == 0).  CALLER MUST HOLD m_.  Called by the pop paths
-  // a bounded (decompress) queue actually uses — try_pop_one, pop_batch_greedy,
-  // try_pop_one_cpu — plus set_done().  Other pop methods only run on compress
-  // queues, which are never bounded; if one is ever used with a bounded queue,
-  // add a pop_signal_locked() call there too.
+  // a bounded (decompress) queue actually uses — try_pop_one, try_pop_one_cpu,
+  // try_pop_batch_signal (the GPU intake) — plus set_done().  Other pop methods
+  // only run on compress queues, which are never bounded; if one is ever used
+  // with a bounded queue, add a pop_signal_locked() call there too.
   void pop_signal_locked() { if (max_depth_ > 0 || max_bytes_ > 0) space_cv_.notify_all(); }
 
   // Dequeue the front task, keeping queued_bytes_ (owned heap held by the queue)
@@ -4783,6 +4739,14 @@ static void writer_thread(FILE * out, ResultStore & results,
   std::unique_lock<std::mutex> lk(results.m);
 
   while (true) {
+    // TEST HOOK (temporary, v0.14.59): freeze the writer at a given seq so the
+    // deadlock watchdog can be exercised without a real hang.  Releases the lock
+    // first so workers fill the throttle and block naturally, like a real wedge.
+    if (g_debug_freeze_writer_after.load(std::memory_order_relaxed) >= 0 &&
+        (int64_t)results.next_to_write >= g_debug_freeze_writer_after.load(std::memory_order_relaxed)) {
+      lk.unlock();
+      while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
     bool all_done = results.producer_done
                  && results.workers_done
                  && results.next_to_write >= results.total_tasks;
@@ -5176,9 +5140,10 @@ struct CpuAgg {
  The tick thread runs for monitoring/logging but does NOT control
  scheduling  the semaphore handles that in real-time.
 
- QUEUE INTERACTION: GPU workers use pop_batch_greedy(min_n=1) so multiple
- GPUs can interleave — each grabs whatever is available up to max_n without
- waiting for a full batch (waiting for full batches serialises GPUs).
+ QUEUE INTERACTION: GPU workers wait for a batch WITHOUT holding throttle
+ permits (wait_for_batch_or_cap), then acquire and non-blocking-pop up to the
+ batch cap (try_pop_batch_signal) — so a stream never sleeps holding permits,
+ and multiple GPUs interleave instead of serialising on full-batch waits.
  CPU workers use non-blocking try_pop_batch to avoid competing with GPU
  for the queue's condition variable wakeups.
 ======================================================================*/
@@ -9781,7 +9746,7 @@ struct DevStats {
 
 // Shared auto-tune state across all GPU workers.
 // One worker acts as the "tuner" (first to complete a measurement window).
-// All workers read shared_batch_size for their pop_batch_greedy calls.
+// All workers read shared_batch_size to size their batch pops.
 // This prevents fast-settling GPUs from starving slow-settling ones.
 struct SharedTuneState {
   std::atomic<size_t> batch_size{8};     // current batch size (all GPUs use this)
@@ -10281,6 +10246,212 @@ static void gpu_verify_check(StreamCtx & C, const Options & opt)
   g_gpu_verify_bytes.fetch_add(vb, std::memory_order_relaxed);
 }
 
+// ============================================================================
+// TEMPORARY deadlock diagnostic watchdog (v0.14.59) — REMOVE once the
+// intermittent GPU-pipeline wedge is root-caused.  It does NOT recover: it
+// detects a stalled run (the writer made no progress for N seconds while the
+// run is not done), dumps a JSON snapshot of every worker / stream / queue /
+// throttle / NVML / kernel-Xid signal to the current directory, and hard-exits
+// — turning a frozen process into evidence.  The two key discriminators:
+//   * per-worker HEARTBEAT sampled twice: is the worker SPINNING (a GPU stream
+//     that never completes) or BLOCKED in our own code (a CV/lock)?
+//   * per-stream last cudaStreamQuery result + its AGE: is the kernel genuinely
+//     NotReady (running/hung), or did it finish and we are stuck downstream?
+// Enable timeout via GZSTD_WATCHDOG_SECS (default 30; 0 disables).
+// GZSTD_DEBUG_FREEZE_WRITER_AFTER=N freezes the writer after N frames to
+// exercise the watchdog without a real hang.
+// ============================================================================
+enum class WatchPhase : int {
+  Idle=0, Tuning, IntakeWait, IntakeAcquire, IntakePop, Submit, Poll, Drain, Yield, Exiting
+};
+static const char * watch_phase_name(int p) {
+  switch ((WatchPhase)p) {
+    case WatchPhase::Idle: return "idle";
+    case WatchPhase::Tuning: return "tuning";
+    case WatchPhase::IntakeWait: return "intake_wait_batch";
+    case WatchPhase::IntakeAcquire: return "intake_acquire_permits";
+    case WatchPhase::IntakePop: return "intake_pop";
+    case WatchPhase::Submit: return "submit_h2d_kernel";
+    case WatchPhase::Poll: return "poll_stream_query";
+    case WatchPhase::Drain: return "drain_d2h_push";
+    case WatchPhase::Yield: return "yield";
+    case WatchPhase::Exiting: return "exiting";
+  }
+  return "?";
+}
+struct WdStream {
+  std::atomic<bool>     busy{false};
+  std::atomic<uint64_t> busy_since_ns{0};
+  std::atomic<uint64_t> seq_lo{0}, seq_hi{0}, filled{0};
+  std::atomic<int>      last_query{-1000};      // last cudaStreamQuery() return code
+  std::atomic<uint64_t> last_query_ns{0};
+};
+struct WdWorker {
+  std::atomic<uint64_t> heartbeat{0};           // ++ each worker-loop iteration
+  std::atomic<int>      phase{(int)WatchPhase::Idle};
+  std::atomic<int>      device_id{-1};
+};
+struct GzWatchdog {
+  int n_workers=0, streams_per=0;
+  std::vector<WdWorker> workers;
+  std::vector<WdStream> streams;   // n_workers*streams_per, row-major
+  const Options * opt=nullptr;
+  Meter * meter=nullptr;
+  FrameThrottle * throttle=nullptr;
+  TaskQueue * queue=nullptr;
+  const char * which="compress";
+  WdStream & st(int w,int s){ return streams[(size_t)w*streams_per+s]; }
+  WdWorker & wk(int w){ return workers[(size_t)w]; }
+};
+static std::atomic<GzWatchdog*> g_wd{nullptr};
+
+static inline void wd_beat(int w){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).heartbeat.fetch_add(1,std::memory_order_relaxed); }
+static inline void wd_phase(int w, WatchPhase p){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).phase.store((int)p,std::memory_order_relaxed); }
+static inline void wd_dev(int w,int dev){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).device_id.store(dev,std::memory_order_relaxed); }
+static inline void wd_submit(int w,int s,uint64_t lo,uint64_t hi,uint64_t filled){ if(auto*d=g_wd.load(std::memory_order_relaxed)){auto&x=d->st(w,s); x.seq_lo.store(lo);x.seq_hi.store(hi);x.filled.store(filled);x.busy_since_ns.store(now_ns());x.busy.store(true);} }
+static inline void wd_query(int w,int s,int q){ if(auto*d=g_wd.load(std::memory_order_relaxed)){auto&x=d->st(w,s); x.last_query.store(q);x.last_query_ns.store(now_ns());} }
+static inline void wd_idle(int w,int s){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->st(w,s).busy.store(false); }
+
+static std::string wd_json_escape(const std::string & s) {
+  std::string o; o.reserve(s.size()+16);
+  for (char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default: if ((unsigned char)c < 0x20) { char b[8]; std::snprintf(b,sizeof(b),"\\u%04x",c); o += b; } else o += c;
+    }
+  }
+  return o;
+}
+static std::string wd_run_cmd(const char * cmd) {
+  std::string out; FILE * p = popen(cmd, "r"); if (!p) return out;
+  char buf[4096]; size_t n; while ((n = fread(buf,1,sizeof(buf),p)) > 0) out.append(buf,n);
+  pclose(p); return out;
+}
+
+// Gather state, write ./gzstd-deadlock-<pid>-<unixtime>.json, and hard-exit.
+[[noreturn]] static void wd_dump_and_die(double stall_s) {
+  GzWatchdog * d = g_wd.load(std::memory_order_relaxed);
+  if (!d) std::_Exit(70);
+  // Sample heartbeats twice (500 ms apart) to tell SPINNING from BLOCKED.
+  std::vector<uint64_t> hb0((size_t)d->n_workers), hb1((size_t)d->n_workers);
+  for (int w=0; w<d->n_workers; ++w) hb0[(size_t)w] = d->wk(w).heartbeat.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  for (int w=0; w<d->n_workers; ++w) hb1[(size_t)w] = d->wk(w).heartbeat.load();
+  const uint64_t now = now_ns();
+
+  std::ostringstream js; js << std::fixed << std::setprecision(3);
+  js << "{\n";
+  js << "  \"gzstd_version\": \"" << GZSTD_VERSION << "\",\n";
+  js << "  \"event\": \"deadlock_watchdog\",\n";
+  js << "  \"pipeline\": \"" << d->which << "\",\n";
+  js << "  \"writer_stall_seconds\": " << stall_s << ",\n";
+  if (d->meter) {
+    js << "  \"read_bytes\": "  << d->meter->read_bytes.load()  << ",\n";
+    js << "  \"wrote_bytes\": " << d->meter->wrote_bytes.load() << ",\n";
+  }
+  if (d->throttle) {
+    auto s = d->throttle->stats();
+    js << "  \"throttle\": {\"max\": " << s.max << ", \"in_flight\": " << d->throttle->in_flight()
+       << ", \"peak_in_flight\": " << s.peak_in_flight << ", \"block_count\": " << s.block_count << "},\n";
+  }
+  if (d->queue) {
+    js << "  \"queue\": {\"size\": " << d->queue->size() << ", \"drained\": "
+       << (d->queue->drained() ? "true" : "false") << "},\n";
+  }
+  js << "  \"workers\": [\n";
+  for (int w=0; w<d->n_workers; ++w) {
+    auto & wk = d->wk(w);
+    const bool spinning = hb1[(size_t)w] != hb0[(size_t)w];
+    js << "    {\"worker\": " << w << ", \"device_id\": " << wk.device_id.load()
+       << ", \"phase\": \"" << watch_phase_name(wk.phase.load()) << "\""
+       << ", \"heartbeat\": " << hb1[(size_t)w]
+       << ", \"delta_500ms\": " << (hb1[(size_t)w] - hb0[(size_t)w])
+       << ", \"state\": \"" << (spinning ? "SPINNING" : "BLOCKED") << "\", \"streams\": [";
+    for (int s=0; s<d->streams_per; ++s) {
+      auto & x = d->st(w,s);
+      const double q_age = x.last_query_ns.load() ? double(now - x.last_query_ns.load())/1e9 : -1.0;
+      const double busy_age = (x.busy.load() && x.busy_since_ns.load()) ? double(now - x.busy_since_ns.load())/1e9 : -1.0;
+      js << (s ? ", " : "") << "{\"s\": " << s << ", \"busy\": " << (x.busy.load()?"true":"false")
+         << ", \"busy_seconds\": " << busy_age
+         << ", \"seq_lo\": " << x.seq_lo.load() << ", \"seq_hi\": " << x.seq_hi.load()
+         << ", \"filled\": " << x.filled.load()
+         << ", \"last_cuda_query\": " << x.last_query.load()
+         << ", \"last_query_age_seconds\": " << q_age << "}";
+    }
+    js << "]}" << (w+1<d->n_workers ? "," : "") << "\n";
+  }
+  js << "  ],\n";
+  // NVML per device (util + memory), best-effort via the dlopen shim.
+  js << "  \"nvml\": [";
+#ifdef HAVE_NVML
+  {
+    nvmlInit_v2();   // refcounted; harmless if already initialized, no Shutdown (we _Exit)
+    bool first = true;
+    std::vector<int> seen;
+    for (int w=0; w<d->n_workers; ++w) {
+      int dev = d->wk(w).device_id.load();
+      if (dev < 0 || std::find(seen.begin(),seen.end(),dev)!=seen.end()) continue;
+      seen.push_back(dev);
+      nvmlDevice_t h{}; nvmlUtilization_t u{}; nvmlMemory_t mem{};
+      unsigned util=0; unsigned long long memused=0, memtot=0;
+      if (nvmlDeviceGetHandleByIndex((unsigned)dev,&h)==NVML_SUCCESS) {
+        if (nvmlDeviceGetUtilizationRates(h,&u)==NVML_SUCCESS) util=u.gpu;
+        if (nvmlDeviceGetMemoryInfo(h,&mem)==NVML_SUCCESS) { memused=mem.used; memtot=mem.total; }
+      }
+      js << (first?"":",") << "{\"device\": " << dev << ", \"gpu_util_pct\": " << util
+         << ", \"mem_used\": " << memused << ", \"mem_total\": " << memtot << "}";
+      first = false;
+    }
+  }
+#endif
+  js << "],\n";
+  // Kernel ring buffer: recent NVIDIA Xid / NVRM lines (the definitive HW signal).
+  std::string xid = wd_run_cmd("journalctl -k --no-pager -n 8000 2>/dev/null | grep -iE 'xid|NVRM' | tail -n 60");
+  if (xid.empty()) xid = wd_run_cmd("dmesg 2>/dev/null | grep -iE 'xid|NVRM' | tail -n 60");
+  js << "  \"kernel_xid_nvrm\": \"" << wd_json_escape(xid) << "\"\n";
+  js << "}\n";
+
+  char fname[256];
+  std::snprintf(fname, sizeof(fname), "./gzstd-deadlock-%d-%lld.json",
+                (int)getpid(), (long long)time(nullptr));
+  if (FILE * f = std::fopen(fname, "w")) { std::fputs(js.str().c_str(), f); std::fclose(f); }
+  std::fprintf(stderr,
+    "\n[WATCHDOG] DEADLOCK: writer made no progress for %.1fs (run not done).\n"
+    "[WATCHDOG] State dumped to %s\n"
+    "[WATCHDOG] Hard-exiting — diagnostic build, no recovery.\n",
+    stall_s, fname);
+  std::fflush(stderr);
+  std::_Exit(70);
+}
+
+static void watchdog_loop(std::atomic<bool> * done, int timeout_secs) {
+  GzWatchdog * d = g_wd.load(std::memory_order_relaxed);
+  if (!d || !d->meter || timeout_secs <= 0) return;
+  uint64_t last_wrote = d->meter->wrote_bytes.load();
+  uint64_t last_change = now_ns();
+  while (!done->load(std::memory_order_relaxed)) {
+    for (int k=0; k<10 && !done->load(std::memory_order_relaxed); ++k)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (done->load(std::memory_order_relaxed)) break;
+    uint64_t w = d->meter->wrote_bytes.load();
+    uint64_t now = now_ns();
+    if (w != last_wrote) { last_wrote = w; last_change = now; continue; }
+    // Only a genuine wedge has unfinished work that isn't progressing.  End-of-run
+    // finalization (fsync / O_DIRECT finalize / rename) legitimately holds
+    // wrote_bytes static with NOTHING in flight and the queue drained — never fire
+    // there, or we'd hard-exit a healthy run mid-commit.
+    const bool pending = (d->throttle && d->throttle->in_flight() > 0)
+                      || (d->queue && (d->queue->size() > 0 || !d->queue->drained()));
+    if (!pending) { last_change = now; continue; }   // not wedged — reset the timer
+    if (double(now - last_change)/1e9 >= timeout_secs)
+      wd_dump_and_die(double(now - last_change)/1e9);
+  }
+}
+
 static void gpu_worker(
   int device_id,
   int slot_index,   // positional index into per_dev/json_sink arrays
@@ -10501,8 +10672,10 @@ static void gpu_worker(
       for (size_t s = 0; s < ctxs.size(); ++s)
         sched->register_gpu_stream();
     }
+    wd_dev(slot_index, device_id);   // diagnostic watchdog (temporary)
     double util_scale = 1.0;  // utilization scaling for batch size
     while (true) {
+      wd_beat(slot_index);           // heartbeat: spinning vs blocked
       bool submitted_any=false;
       // ---- Shared auto-tuner ----
       // All GPUs report throughput to SharedTuneState. Whichever worker
@@ -10742,12 +10915,14 @@ static void gpu_worker(
         // producer never touches the throttle, so a permit-free waiter is always
         // eventually fed; the user's --gpu-batch is honored as the pop size when
         // the queue can supply it, and silently capped when it can't.
+        wd_phase(slot_index, WatchPhase::IntakeWait);
         if (!queue->wait_for_batch_or_cap(pop_n)) {   // no permit held while waiting
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           producer_done_seen = true; continue;
         }
         // Permits now (safe to block here: no frames held, so the writer can
         // always drain and release).  Then signal intent + non-blocking pop.
+        wd_phase(slot_index, WatchPhase::IntakeAcquire);
         if (bp) bp->acquire((int)pop_n);
         if (sched) sched->gpu_wants_data();
         size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
@@ -10876,6 +11051,9 @@ static void gpu_worker(
           cudaEventRecord(C.ev_d2h_end, C.stream);   // mark end of verify (for -v timing)
         }
         C.busy = true; submitted_any = true;
+        wd_phase(slot_index, WatchPhase::Submit);
+        wd_submit(slot_index, (int)C.stats.stream_index,
+                  C.batch.front().seq, C.batch.back().seq, C.filled);
       }
 
       // ---- COMPLETION PATH 1: Async polling ----
@@ -10883,9 +11061,11 @@ static void gpu_worker(
       // we just submitted a new batch (submitted_any=true) and are checking
       // if previous batches completed while we were submitting.
       // NOTE: Must record to g_perf here  see also sync drain path below.
+      wd_phase(slot_index, WatchPhase::Poll);
       for (auto & C : ctxs) {
         if (!C.busy) { continue; }
         cudaError_t q = cudaStreamQuery(C.stream);
+        wd_query(slot_index, (int)C.stats.stream_index, (int)q);
         if (q == cudaSuccess) {
           // Capture the D2H start for both the -vvv perf breakdown (g_perf) AND
           // the -vv per-batch line below; otherwise d2h_t0 stays 0 and the
@@ -11026,6 +11206,7 @@ static void gpu_worker(
             }
           }
 
+          wd_idle(slot_index, (int)C.stats.stream_index);
           C.busy = false;
           C.filled = 0;
           C.batch.clear();
@@ -11199,6 +11380,7 @@ static void gpu_worker(
             }
           }
 
+          wd_idle(slot_index, (int)C.stats.stream_index);
           C.busy = false;
           C.filled = 0;
           C.batch.clear();
@@ -11782,6 +11964,26 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // producer keeps reading and the queue always has a consumer.
   std::atomic<int> gpu_failures{0};
 
+  // ---- TEMPORARY deadlock watchdog (v0.14.59) — see GzWatchdog above ----
+  GzWatchdog wd;
+  std::atomic<bool> watchdog_done{false};
+  std::thread watchdog_thr;
+  {
+    const char * ws = std::getenv("GZSTD_WATCHDOG_SECS");
+    int wsecs = ws ? std::atoi(ws) : 30;
+    if (const char * fz = std::getenv("GZSTD_DEBUG_FREEZE_WRITER_AFTER"))
+      g_debug_freeze_writer_after.store(std::atoll(fz));
+    if (wsecs > 0) {
+      wd.n_workers   = gpu_count;
+      wd.streams_per = (int)std::max<size_t>(1, opt.gpu_streams);
+      wd.workers     = std::vector<WdWorker>((size_t)wd.n_workers);
+      wd.streams     = std::vector<WdStream>((size_t)wd.n_workers * (size_t)wd.streams_per);
+      wd.opt = &opt; wd.meter = m; wd.throttle = &throttle; wd.queue = &queue; wd.which = "compress";
+      g_wd.store(&wd, std::memory_order_release);
+      watchdog_thr = std::thread(watchdog_loop, &watchdog_done, wsecs);
+    }
+  }
+
   for (int i = 0; i < gpu_count; ++i) {
     workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
                          &queue, &results,
@@ -12030,6 +12232,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Wait for writer and progress threads
   writer_thr.join();
+  // ---- TEMPORARY deadlock watchdog teardown (v0.14.59) ----
+  if (watchdog_thr.joinable()) {
+    watchdog_done.store(true, std::memory_order_relaxed);
+    watchdog_thr.join();
+  }
+  g_wd.store(nullptr, std::memory_order_release);
   progress_done = true;
   progress_thr.join();
   log_throttle_stats(throttle, opt,
@@ -12294,7 +12502,7 @@ static void gpu_decomp_worker(
         }
         if (!stream_init_failed) {
           // Update per_stream_cap to the actual allocated size
-          // (used by pop_batch_greedy to limit how many frames we grab)
+          // (caps how many frames a batch pop grabs)
           per_stream_cap = try_batch;
         }
       }

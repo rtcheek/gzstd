@@ -1,9 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.58  
+**Covers:** v0.9.50 → v0.14.59  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.59 — TEMPORARY deadlock-diagnostic watchdog (compress GPU path)
+
+A `-vv` trace of a fresh hang on a **quiet** 8×H100 box (gzstd the only GPU user,
+no Xid, GPUs clean afterward) showed the v0.14.58 permit fix did **not** cover this
+failure: it's a different mode.  One GPU stream took a low-seq batch
+(`[GPU1/S0] take batch=32 seq=[6131..6162]`) and **never completed** — the worker
+kept polling `cudaStreamQuery` (NotReady), the in-order writer wedged behind those
+frames, the CPU raced ahead then stopped on the `queue_floor` reservation, and the
+run froze (`[HYBRID] tick … 0/0`).  The throttle was only ~5% used, so it is **not**
+the permit deadlock.  The existing GPU-fault→CPU-rebuild path can't catch it because a
+*hang* never returns a CUDA error.
+
+To stop guessing, this adds a **temporary, diagnostic** watchdog (no recovery — it is
+not a fault/rebuild).  When the writer makes no progress for `GZSTD_WATCHDOG_SECS`
+(default 30; 0 disables) **while work is still pending** (frames in flight or queue
+not drained — so end-of-run fsync/rename never false-fires), it dumps a JSON snapshot
+to `./gzstd-deadlock-<pid>-<time>.json` and hard-exits.  The snapshot is built to
+*definitively* separate a real GPU stall from a software wedge:
+
+- per-worker **heartbeat** sampled 500 ms apart → `SPINNING` (a stream that never
+  completes) vs `BLOCKED` (parked in our own CV/lock), plus the worker's current phase;
+- per-stream `busy` + last `cudaStreamQuery` result **and its age** → kernel genuinely
+  NotReady (running/hung) vs finished-but-stuck-downstream;
+- throttle (in-flight/max), queue (size/drained), NVML per-GPU util+memory, and a scan
+  of the kernel ring buffer for **Xid/NVRM** lines (`journalctl -k`, dmesg fallback).
+
+`GZSTD_DEBUG_FREEZE_WRITER_AFTER=N` freezes the writer after N frames to exercise the
+watchdog without a real hang (validated: fires + dumps; a healthy run does not).  This
+code is explicitly temporary — it exists to capture the real wedge so it can be root-
+caused, after which it (and the planned CUDA host-callback/event redesign that removes
+the completion-poll yield) replace it.  Diagnostic only; no effect on output.
 
 ---
 
@@ -43,7 +77,13 @@ queue's bounded capacity, so a stream never waits for a batch larger than the qu
 can supply (`--gpu-batch` stays the pop size when the queue can fill it, and is
 silently capped when it can't). This removes the need for the conditional full-batch-
 wait guards and the gpu-only soft-min special case — both deleted; mirrors the CPU
-worker's proven wait→acquire→try-pop→release-on-miss pattern, now batched.
+worker's proven wait→acquire→try-pop→release-on-miss pattern, now batched.  The
+now-unused `pop_batch` / `pop_batch_greedy` queue methods are removed (the latter's
+`while (size < min_n) cv_.wait` — wait-for-a-full-batch-while-the-caller-holds-permits
+— was the buggy model this replaces).  All waits remain pure CV/predicate, no polling
+or fixed sleeps; the new path holds permits for a *shorter* window (acquire→pop is
+immediate, no batch-ready wait while holding), which slightly improves throttle
+utilization rather than costing anything.
 
 Validated: the exact reproducer configs (`--hybrid`/`--gpu-only` compress and
 decompress, plain and `--tar`, with pinned `--gpu-batch`/`--gpu-streams` and the tight
