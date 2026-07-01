@@ -1,11 +1,52 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.66  
+**Covers:** v0.9.50 → v0.14.68  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.68 — demote the deadlock watchdog to opt-in `--watchdog` (diagnostic)
+
+The GPU deadlock watchdog (v0.14.59) that captured the v0.14.60 hybrid hang was still
+**armed by default** on every hybrid/GPU compress run.  With the deadlocks fixed
+(v0.14.58/60) it no longer needs to run unconditionally.  It is kept — it is the fastest
+way to turn a future wedge (marginal hardware, a new nvCOMP, an unfamiliar box) into a
+JSON evidence dump — but is now **off unless you pass `--watchdog`**, and mentioned only
+in `--help` alongside `--cold` as a diagnostic.
+
+- New `--watchdog` flag (default off): arms the stall detector for the run.  On no
+  writer progress for the timeout (30 s default, `GZSTD_WATCHDOG_SECS` to tune) while the
+  run is not done, it dumps the per-worker / per-stream / queue / throttle / NVML /
+  kernel-Xid snapshot and hard-exits.  Does not recover — it is evidence capture.
+- The `wd_*` instrumentation stays inline in the GPU workers but is a cheap no-op while
+  `g_wd` is null (the default), so the normal path is unaffected.
+- `GZSTD_DEBUG_FREEZE_WRITER_AFTER` (exercise the watchdog without a real hang) and
+  `GZSTD_DEBUG_SLOW_PRODUCER_US` remain as undocumented test hooks.
+
+## v0.14.67 — honest `[VERIFY]` verdict: stop crying "fell behind" when the sink hid it
+
+v0.14.66 validated on the 8-GPU box: `[WRITER] starved 0.0%`, `write-path busy 83.1%`,
+verdict "output device saturated — optimal", and `4.03 GiB/s` — i.e. **at the no-verify
+disk ceiling**.  Yet the `[VERIFY]` line still said `fell behind: throttled compression
+6635x for 6.81 s`.  Both can't be the headline: if the writer never starved, the sink
+never idled, so those 6.81 s of compress-side back-pressure were fully overlapped by disk
+writes and cost **zero** wall-time.  (The submit-burst and full queue persist because the
+writer pushes to the verify queue at memory-copy speed, always faster than any number of
+decompress threads — so the queue caps during a burst regardless.  Harmless when the
+writer never starves.)
+
+Fix: the verify verdict now consults the writer's starvation fraction (`Meter::
+writer_starved_ns`, the same signal behind the `[WRITER]` line):
+
+- writer never starved (< 2%): `applied back-pressure Nx (T s) but the writer never
+  starved — overlapped disk writes, not the end-to-end limiter`.
+- writer starved ≥ 2%: `fell behind … starving the sink X% — verify capped throughput`
+  (the honest "verify is the real bottleneck" case — a fast-disk / slow-CPU box).
+- no meter / no stalls: unchanged.
+
+No pipeline change; this only corrects the reporting so `[VERIFY]` and `[WRITER]` agree.
 
 ## v0.14.66 — feed --verify AFTER the write, not before (kill the verify burst at its source)
 

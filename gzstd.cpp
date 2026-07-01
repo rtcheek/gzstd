@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.66";
+static constexpr const char * GZSTD_VERSION = "0.14.68";
 //
 // Architecture overview:
 //
@@ -391,6 +391,7 @@ struct Options {
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
   bool mmap_user_set = false;     // true if --mmap/--no-mmap given (suppresses the pre-6.4 large-file auto-gate)
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
+  bool watchdog = false;          // --watchdog: arm the GPU deadlock watchdog (diagnostic; dumps JSON + aborts on a stall)
   bool direct_read = false;       // --direct-read: O_DIRECT input — bypass the page cache (no populate/evict)
   size_t read_threads = 0;        // --read-threads N: buffered pooled-reader threads (0 = auto: 3)
   size_t write_threads = 0;       // --write-threads N: -d --tar extractor writer pool (0 = auto: min(threads,16))
@@ -804,6 +805,8 @@ static void print_help()
 "  --sync-output       fsync output before exit\n"
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
+"  --watchdog          arm the GPU deadlock watchdog (DIAGNOSTIC ONLY: if a\n"
+"                      hybrid/GPU run stalls, dump a JSON snapshot and abort)\n"
 "  --direct-read       O_DIRECT input, single stream: bypass the page cache\n"
 "                      for one-pass speedups and honest cold benchmarks\n"
 "  --read-threads N    parallel readers for the BUFFERED input path (default:\n"
@@ -1027,6 +1030,14 @@ static void print_help_long()
 "     reading it, forcing a cold-cache read.  BENCHMARKING ONLY: unlike\n"
 "     --direct-read (which bypasses the cache entirely), --cold evicts\n"
 "     any already-cached pages, so it disturbs other users of that data.\n"
+"\n"
+"  --watchdog    (default: off)\n"
+"     DIAGNOSTIC ONLY.  Arm a stall detector for hybrid/GPU runs.  If the\n"
+"     writer makes no progress for 30 s (GZSTD_WATCHDOG_SECS to tune) while\n"
+"     the run is not done, dump a JSON snapshot of every GPU worker, stream,\n"
+"     queue, throttle and NVML/kernel-Xid signal to the current directory and\n"
+"     abort.  It does NOT recover — it turns a frozen process into evidence.\n"
+"     Normal runs never need it; use it to capture a suspected GPU wedge.\n"
 "\n"
 "  --preallocate / --no-preallocate    (default: off)\n"
 "     Preallocate the output file with `fallocate` to its expected\n"
@@ -3913,7 +3924,9 @@ public:
   }
 
   // -v one-line summary of how verification kept up.  Call after finish().
-  void log_summary(const Options & opt) const {
+  // `meter` (optional) supplies the writer's starvation fraction — the arbiter
+  // of whether verify's back-pressure actually cost end-to-end throughput.
+  void log_summary(const Options & opt, const Meter * meter = nullptr) const {
     if (opt.verbosity < V_VERBOSE) return;
     const uint64_t fr = frames_.load(std::memory_order_relaxed);
     const uint64_t by = bytes_.load(std::memory_order_relaxed);
@@ -3942,7 +3955,29 @@ public:
        << std::setprecision(2) << perthr << " /thread), peak backlog "
        << peak_q_ << "/" << max_queue_ << " frames, max submit-burst "
        << max_burst_ << " frames; ";
-    if (sc > 0)
+    // Did verify's back-pressure actually cost wall-time?  The writer's own
+    // starvation is the arbiter.  Verify back-pressures by holding each frame's
+    // buffer until checked, which (via the frame throttle) can slow producers and
+    // ultimately starve the writer of ready frames.  So if the writer NEVER
+    // starved, the sink stayed saturated and verify's stalls were fully overlapped
+    // by disk writes — they cost nothing end-to-end, however alarming the raw
+    // stall count looks (v0.14.66 feeds verify after the write, so on a sink-bound
+    // run verify runs concurrently with the disk and the run hits the device
+    // ceiling with verify effectively free).  Only when verify genuinely starves
+    // the writer — a fast-disk / slow-CPU box where verify is the true bottleneck
+    // — does the back-pressure cap throughput; there it SHOULD, and we say so.
+    const double wstarve = (meter && wall > 0)
+        ? double(meter->writer_starved_ns.load(std::memory_order_relaxed)) / 1e9 / wall
+        : -1.0;   // <0 ⇒ no meter, fall back to the raw stall count
+    if (sc > 0 && wstarve >= 0.0 && wstarve < 0.02)
+      os << "applied back-pressure " << sc << "x (" << std::fixed << std::setprecision(2)
+         << (st / 1e9) << " s) but the writer never starved — overlapped disk writes, "
+            "not the end-to-end limiter";
+    else if (sc > 0 && wstarve >= 0.02)
+      os << "fell behind: throttled compression " << sc << "x for "
+         << std::fixed << std::setprecision(2) << (st / 1e9) << " s, starving the sink "
+         << (int)(wstarve * 100.0) << "% — verify capped throughput";
+    else if (sc > 0)
       os << "fell behind: throttled compression " << sc << "x for "
          << std::fixed << std::setprecision(2) << (st / 1e9) << " s";
     else if (util >= 0.85)
@@ -10382,19 +10417,22 @@ static void gpu_verify_check(StreamCtx & C, const Options & opt)
 }
 
 // ============================================================================
-// TEMPORARY deadlock diagnostic watchdog (v0.14.59) — REMOVE once the
-// intermittent GPU-pipeline wedge is root-caused.  It does NOT recover: it
-// detects a stalled run (the writer made no progress for N seconds while the
-// run is not done), dumps a JSON snapshot of every worker / stream / queue /
-// throttle / NVML / kernel-Xid signal to the current directory, and hard-exits
-// — turning a frozen process into evidence.  The two key discriminators:
+// GPU deadlock diagnostic watchdog (v0.14.59) — opt-in via --watchdog.  Off by
+// default; the wd_* hooks in the workers are a cheap no-op while g_wd is null.
+// It does NOT recover: it detects a stalled run (the writer made no progress for
+// N seconds while the run is not done), dumps a JSON snapshot of every worker /
+// stream / queue / throttle / NVML / kernel-Xid signal to the current directory,
+// and hard-exits — turning a frozen process into evidence.  Retained as a
+// diagnostic after the v0.14.58/60 hybrid deadlocks were fixed: it is the fastest
+// way to capture a future wedge (marginal HW, a new nvCOMP, an unfamiliar box).
+// The two key discriminators:
 //   * per-worker HEARTBEAT sampled twice: is the worker SPINNING (a GPU stream
 //     that never completes) or BLOCKED in our own code (a CV/lock)?
 //   * per-stream last cudaStreamQuery result + its AGE: is the kernel genuinely
 //     NotReady (running/hung), or did it finish and we are stuck downstream?
-// Enable timeout via GZSTD_WATCHDOG_SECS (default 30; 0 disables).
-// GZSTD_DEBUG_FREEZE_WRITER_AFTER=N freezes the writer after N frames to
-// exercise the watchdog without a real hang.
+// Stall timeout defaults to 30 s, overridable via GZSTD_WATCHDOG_SECS (0 disables
+// even with --watchdog).  GZSTD_DEBUG_FREEZE_WRITER_AFTER=N freezes the writer
+// after N frames to exercise the watchdog without a real hang.
 // ============================================================================
 enum class WatchPhase : int {
   Idle=0, Tuning, IntakeWait, IntakeAcquire, IntakePop, Submit, Poll, Drain, Yield, Exiting
@@ -10557,7 +10595,7 @@ static std::string wd_run_cmd(const char * cmd) {
   std::fprintf(stderr,
     "\n[WATCHDOG] DEADLOCK: writer made no progress for %.1fs (run not done).\n"
     "[WATCHDOG] State dumped to %s\n"
-    "[WATCHDOG] Hard-exiting — diagnostic build, no recovery.\n",
+    "[WATCHDOG] Hard-exiting — --watchdog is a diagnostic, no recovery.\n",
     stall_s, fname);
   std::fflush(stderr);
   std::_Exit(70);
@@ -12119,11 +12157,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // producer keeps reading and the queue always has a consumer.
   std::atomic<int> gpu_failures{0};
 
-  // ---- TEMPORARY deadlock watchdog (v0.14.59) — see GzWatchdog above ----
+  // ---- GPU deadlock watchdog (v0.14.59) — opt-in via --watchdog (diagnostic) ----
+  // Off by default; the wd_* instrumentation in the workers is a cheap no-op while
+  // g_wd is null.  Interval defaults to 30 s, overridable with GZSTD_WATCHDOG_SECS
+  // for tuning.  See GzWatchdog above.
   GzWatchdog wd;
   std::atomic<bool> watchdog_done{false};
   std::thread watchdog_thr;
-  {
+  if (opt.watchdog) {
     const char * ws = std::getenv("GZSTD_WATCHDOG_SECS");
     int wsecs = ws ? std::atoi(ws) : 30;
     if (const char * fz = std::getenv("GZSTD_DEBUG_FREEZE_WRITER_AFTER"))
@@ -12387,7 +12428,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Wait for writer and progress threads
   writer_thr.join();
-  // ---- TEMPORARY deadlock watchdog teardown (v0.14.59) ----
+  // ---- GPU deadlock watchdog teardown (v0.14.59) ----
   if (watchdog_thr.joinable()) {
     watchdog_done.store(true, std::memory_order_relaxed);
     watchdog_thr.join();
@@ -14863,7 +14904,7 @@ int main(int argc, char ** argv)
 
       // Drain/join verify BEFORE reading the restart flag, so a mismatch that
       // surfaces only as the final frames are checked still triggers a rebuild.
-      if (vpool) { vpool->finish(); vpool->log_summary(opt); g_verify_pool = nullptr; vpool.reset(); }
+      if (vpool) { vpool->finish(); vpool->log_summary(opt, &meter); g_verify_pool = nullptr; vpool.reset(); }
 
       // GPU-side verify (gpu-only) summary — confirms it ran and at what GPU cost.
       if (opt.gpu_verify && opt.verbosity >= V_VERBOSE
@@ -15654,6 +15695,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--mmap" || a == "--mmap=on")  { opt.use_mmap = true;  opt.mmap_user_set = true; }
     else if (a == "--no-mmap" || a == "--mmap=off") { opt.use_mmap = false; opt.mmap_user_set = true; }
     else if (a == "--cold") opt.cold_read = true;
+    else if (a == "--watchdog") opt.watchdog = true;
     else if (a == "--direct-read") opt.direct_read = true;
     else if (parse_num_arg("read-threads", i, argc, argv, opt.read_threads)) { }
     else if (parse_num_arg("write-threads", i, argc, argv, opt.write_threads)) { }
