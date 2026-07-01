@@ -1,9 +1,37 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.63  
+**Covers:** v0.9.50 → v0.14.64  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.64 — correct the verify "memory-bandwidth" misdiagnosis; add a burst probe
+
+Two things.
+
+- **Corrected wording.**  v0.14.60–v0.14.63 described the verify-thread plateau as a
+  "memory-bandwidth plateau."  That was wrong, and the numbers refute it: verify at
+  ~2.7 GiB/s moves ~10 GiB/s of memory traffic, i.e. **~2–3% of a 256-core box's
+  300–600 GB/s** — RAM is nowhere near the wall.  And the `[VERIFY]` line's own figures
+  (`16 thread(s), drain 2.70 / 0.87 per-thread`) show verify did the work of **~3 busy
+  threads** with ~13 idle — 5× spare capacity, so it is not resource-bound at all.
+  `helped` halts thread growth simply because the drain rate already equals production;
+  more threads can't lift a production-limited rate.  Comments and CHANGELOG fixed.
+
+- **Burst probe.**  The real reason hybrid `--verify` back-pressures (and cpu-only does
+  not) appears to be *bursty* delivery: if the 8 GPUs finish batches in lockstep, the
+  in-order writer drains a wave and dumps it on verify at once, briefly overflowing the
+  queue — even though verify has spare capacity to drain it.  The `[VERIFY]` line now
+  reports `max submit-burst N frames` (longest run of submits <100 µs apart).  A large N
+  on the 8-GPU box confirms synchronized GPU delivery (then the lever is staggering the
+  GPU batch completions / varying per-GPU batch size); a small N means the queue fills
+  for another reason.  Measure before building the de-sync.
+
+Practical note: on a disk-bound workload the GPUs buy no throughput, so `--verify
+--cpu-only` is the fast path (smooth delivery, no back-pressure).  Diagnostic + wording
+only; no effect on output.
 
 ---
 
@@ -11,7 +39,9 @@
 
 The v0.14.62 hybrid thread-cap raise confirmed the diagnosis rather than fixing it:
 on the 8-GPU box verify grew from 16 to **17** threads and then `helped` halted it
-(memory-bandwidth plateau — `drain` stayed 2.75 GiB/s), while `peak backlog` stayed
+(a *drain* plateau — `drain` stayed 2.75 GiB/s because verify already matches
+production; more threads can't lift a production-limited rate — **not** memory
+bandwidth: verify uses ~2–3% of the box's RAM bandwidth), while `peak backlog` stayed
 **pinned at 1024/1024**.  So the limiter is the **verify queue depth**, not the thread
 count: the queue held only 16 GiB (1024 frames) while the hybrid throttle allows 134 GiB
 in flight, so the disk's write-bursts filled it and back-pressured the writer
@@ -35,8 +65,10 @@ Follow-ons to v0.14.61, from a 319 GiB real-data run.
   14274x`) because the hybrid producer is much faster than cpu-only.  In hybrid the
   GPUs carry the compression, so the CPU pool has spare cores — raised verify's
   ceiling there to `cores/8` (≤32) vs `cores/16` (≤16) for cpu-only.  The rate-matched
-  `helped` guard in `maybe_grow` still halts growth at the memory-bandwidth plateau,
-  so the higher ceiling only spends threads that actually raise the drain rate.
+  `helped` guard in `maybe_grow` still halts growth once an added thread stops raising
+  the drain rate, so the higher ceiling only spends threads that actually help.
+  (v0.14.63 note: this raise confirmed rather than fixed it — the limiter turned out to
+  be bursty GPU delivery overflowing the verify queue, not thread count.)
 - **`[VERIFY]` on its own line.** It was being appended to the live progress bar's
   last in-place (`\r`) update; now printed on a fresh line.
 - **Correct source name in the summary.** `--tar` synthesizes its input, so the
@@ -67,8 +99,8 @@ back-pressure on compression.
 
 - **Scaling fix:** grow while verify is *saturated* — `backlog > nthreads*4` (reachable
   under back-pressure) instead of `> max_queue/2`.  The existing `helped` guard (a new
-  thread must raise the drain rate >10%) still halts growth at the memory-bandwidth/CPU
-  plateau, so it scales to match the producer and no further.  Removed the now-dead
+  thread must raise the drain rate >10%) still halts growth once an added thread stops
+  raising drain, so it scales to match the producer and no further.  Removed the now-dead
   `high_water_`.
 - **Honest verdict:** the summary now judges by worker saturation (`verify_ns /
   (wall × threads)`), not the writer-stall count — `verify-bound: … N% busy` when verify

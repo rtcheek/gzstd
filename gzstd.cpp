@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.63";
+static constexpr const char * GZSTD_VERSION = "0.14.64";
 //
 // Architecture overview:
 //
@@ -3874,6 +3874,18 @@ public:
       if (g_verify_failed.load(std::memory_order_relaxed)) return;
       q_.push_back({seq, frame});
       if (q_.size() > peak_q_) peak_q_ = q_.size();   // guarded by m_
+      // Burst probe: count runs of submits arriving <100 us apart.  If the 8
+      // GPUs finish batches in lockstep, the in-order writer drains and submits
+      // a wave, so a large max-burst points at synchronized GPU delivery (the
+      // lever to stagger); a small max-burst means the queue fills for another
+      // reason.  Guarded by m_.
+      {
+        uint64_t now = now_ns();
+        if (last_submit_ns_ && now - last_submit_ns_ < 100000) ++cur_burst_;
+        else cur_burst_ = 1;
+        if (cur_burst_ > max_burst_) max_burst_ = cur_burst_;
+        last_submit_ns_ = now;
+      }
     }
     not_empty_.notify_one();
     maybe_grow();   // rate-limited internally; called serially from the single writer/tap
@@ -3927,7 +3939,8 @@ public:
        << fr << " frames (" << bs << ") checked, drain "
        << std::fixed << std::setprecision(2) << drain << " GiB/s ("
        << std::setprecision(2) << perthr << " /thread), peak backlog "
-       << peak_q_ << "/" << max_queue_ << " frames; ";
+       << peak_q_ << "/" << max_queue_ << " frames, max submit-burst "
+       << max_burst_ << " frames; ";
     if (sc > 0)
       os << "fell behind: throttled compression " << sc << "x for "
          << std::fixed << std::setprecision(2) << (st / 1e9) << " s";
@@ -3985,8 +3998,11 @@ private:
     // frame throttle caps in-flight frames BELOW the verify queue's half-full
     // point — the backlog plateaus at ~throttle size and the pool never scaled
     // off its first thread, silently capping a multi-GiB/s pipeline at one
-    // thread's ~0.9 GiB/s.)  `helped` still halts growth at the memory-bandwidth
-    // /CPU plateau (or once verify matches the producer), so we never balloon.
+    // thread's ~0.9 GiB/s.)  `helped` still halts growth once an added thread
+    // stops raising the drain rate — usually because verify has matched the
+    // producer (drain == production, so more threads can't lift a
+    // production-limited rate), occasionally a real CPU/bandwidth ceiling on
+    // near-incompressible frames — so we never balloon.
     const bool behind = backlog > (size_t)std::max(1, nthreads) * 4;
     const bool helped = (nthreads <= 1) || (rate > grow_rate_last_ * 1.10);
     if (behind && helped && nthreads < max_threads_) {
@@ -4071,6 +4087,8 @@ private:
   std::atomic<uint64_t> frames_{0}, bytes_{0}, verify_ns_{0};
   std::atomic<uint64_t> stall_ns_{0}, stall_count_{0};
   size_t                peak_q_ = 0;          // guarded by m_
+  uint64_t              last_submit_ns_ = 0;  // burst probe, guarded by m_
+  size_t                cur_burst_ = 0, max_burst_ = 0;
   int                   final_threads_ = 0;   // captured in finish()
   uint64_t              t_start_ = 0, t_end_ = 0;
 };
@@ -14767,9 +14785,11 @@ int main(int argc, char ** argv)
         // hybrid: the GPUs carry the compression, so the CPU pool has spare
         // cores — raise the ceiling (≤ cores/8) so verify can match the faster
         // hybrid producer instead of back-pressuring it (it hit the old cap of
-        // 16 and still fell behind on an 8-GPU box).  The rate-matched `helped`
-        // guard in maybe_grow still halts growth at the memory-bandwidth plateau,
-        // so a higher ceiling only costs threads when they actually raise drain.
+        // 16 and still fell behind on an 8-GPU box — though that turned out to be
+        // bursty GPU delivery overflowing the verify queue, not a lack of threads;
+        // verify has spare capacity there).  The rate-matched `helped` guard in
+        // maybe_grow halts growth once an added thread stops raising drain, so a
+        // higher ceiling only costs threads when they actually help.
         const int vmax = opt.cpu_only ? std::clamp(cores / 16, 2, 16)
                                       : std::clamp(cores / 8,  4, 32);
         size_t frame_est = std::max<size_t>(opt.chunk_mib, 1) * ONE_MIB;  // worst-case frame size
