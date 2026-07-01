@@ -1,9 +1,51 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.59  
+**Covers:** v0.9.50 → v0.14.60  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.60 — fix the real hybrid deadlock: completion-poll starvation
+
+The v0.14.59 watchdog caught the intermittent hang in the act on the 8-GPU box and
+named the root cause unambiguously.  The dump: **all 8 GPU workers BLOCKED** (heartbeat
+frozen) in `intake_wait_batch`, **several streams busy 7–32 s** holding the writer's
+head-of-line frames, the throttle only **~14% used** (`in_flight 350 / 2432`,
+`block_count 0`), GPUs **idle at 0% util, no Xid**.  So it was never a GPU fault and
+never the permit deadlock — it was our own pipeline.
+
+**Root cause.** One worker thread serves all of a device's streams, looping
+*intake → completion-poll*.  With a slow producer (the trigger was `--tar --xattrs
+--acls` over a huge small-file home dir, which the parallel assembler feeds slowly) and
+a pinned `--gpu-batch`, the queue sits below the batch size, so the worker **blocks in
+`wait_for_batch_or_cap` for an idle stream — and never reaches the completion poll for
+its *other*, busy streams.**  Their kernels finish but are never drained, so the
+in-order writer wedges behind a finished-but-undelivered batch and the run freezes.
+Long-standing: the pre-refactor `pop_batch_greedy` blocked the same way under a pinned
+batch; v0.14.58 fixed the orthogonal permit-hoarding but not this.
+
+**Fix.** A worker must never block in intake while it still has an in-flight stream to
+drain.  Both GPU worker loops now check `self_busy` (any of this device's streams in
+flight); if so they intake **non-blockingly** (`ready_for_batch_or_cap` +
+`try_acquire`) and otherwise fall straight through to the completion poll — they only
+take the blocking `wait_for_batch_or_cap` when nothing of theirs is in flight (so there
+is no poll to starve).  This guarantees in-flight batches are always drained promptly,
+so the writer can't wedge behind one.  New non-blocking primitives: `TaskQueue::
+ready_for_batch_or_cap` and `FrameThrottle::try_acquire`.
+
+**Deterministically A/B-proven.**  A temporary env hook `GZSTD_DEBUG_SLOW_PRODUCER_US`
+(µs/frame throttle in the tar assembler) reproduces the slow-producer starvation on a
+warm-cache box.  With `--gpu-only --chunk-size 1 --gpu-batch=16 --gpu-streams=8` at
+150 ms/frame, the **pre-fix** build wedges on the first run with the exact production
+signature — worker `BLOCKED` in `intake_wait_batch`, streams busy in a staircase
+(s0 13 s … s5 1 s, all unpolled), throttle only 16% used — while the **fixed** build
+completes cleanly (gpu-only and hybrid) under identical conditions.
+
+The v0.14.59 diagnostic watchdog is **retained** for now so the fix can be confirmed on
+the box that actually triggers the hang (if it ever fires again, it dumps a fresh
+snapshot); it will be removed once validated.  No effect on output.
 
 ---
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.59";
+static constexpr const char * GZSTD_VERSION = "0.14.60";
 //
 // Architecture overview:
 //
@@ -3472,6 +3472,21 @@ public:
     return !(q_.empty() && done_);
   }
 
+  // Non-blocking sibling of wait_for_batch_or_cap: true iff a batch is poppable
+  // RIGHT NOW (queue has >= target, or is at capacity / done with frames left).
+  // A GPU worker that still has an in-flight stream to drain must NOT block in
+  // the wait above — it would starve its own completion poll and wedge the
+  // in-order writer behind a finished-but-undrained batch.  It uses this to
+  // intake only when work is immediately available, otherwise it goes to poll.
+  bool ready_for_batch_or_cap(size_t target)
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    if (q_.empty()) return false;            // nothing to pop yet
+    return q_.size() >= target || done_
+        || (max_depth_ > 0 && q_.size() >= max_depth_)
+        || (max_bytes_ > 0 && queued_bytes_ >= max_bytes_);
+  }
+
   // Non-blocking batch pop that ALSO wakes a producer blocked on a bounded queue
   // (try_pop_batch deliberately doesn't, as its CPU-hybrid caller relies on the
   // GPU path's signal).  Used by the acquire-then-pop GPU intake.
@@ -4127,6 +4142,23 @@ public:
       disabled_(max_in_flight <= 0) {}
 
   bool disabled() const { return disabled_; }
+
+  // Non-blocking acquire: take all n permits iff they are ALL available right
+  // now, else take none and return false.  A GPU worker with an in-flight stream
+  // to drain uses this so it never blocks here (which would starve its
+  // completion poll); on failure it goes to poll instead of waiting.
+  bool try_acquire(int n = 1) {
+    if (n <= 0 || disabled_) return true;
+    std::lock_guard<std::mutex> lk(m_);
+    if (permits_ < n) return false;
+    permits_ -= n;
+    int observed = max_ - permits_;
+    int prev = peak_in_flight_.load(std::memory_order_relaxed);
+    while (observed > prev &&
+           !peak_in_flight_.compare_exchange_weak(prev, observed,
+                                                  std::memory_order_relaxed)) {}
+    return true;
+  }
 
   // Acquire n permits.  Blocks until enough are available (or done).
   // Greedy: takes whatever is available immediately, waits for the rest.
@@ -8340,6 +8372,13 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         ++push_next;
       }
       rb_cv.notify_all();        // advance the frontier: unblock readers waiting to claim
+      // TEST HOOK (temporary, v0.14.60): throttle the producer to N µs/frame so a
+      // fast (page-cache-warm) box can reproduce the slow-producer starvation that
+      // wedged GPU workers in intake on the 8-GPU cold-read run.
+      {
+        static const long slow_us = []{ const char* e = std::getenv("GZSTD_DEBUG_SLOW_PRODUCER_US"); return e ? atol(e) : 0L; }();
+        if (slow_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(slow_us));
+      }
       queue.push(std::move(t));  // may block on the queue's byte cap (backpressure)
       if (push_next >= nchunks) break;
     }
@@ -10915,15 +10954,32 @@ static void gpu_worker(
         // producer never touches the throttle, so a permit-free waiter is always
         // eventually fed; the user's --gpu-batch is honored as the pop size when
         // the queue can supply it, and silently capped when it can't.
+        // CRITICAL (v0.14.60): one thread serves all this device's streams, so it
+        // must NOT block in intake while ANOTHER of its streams has an in-flight
+        // batch to drain — a blocking wait here starves the completion poll below
+        // and wedges the in-order writer behind a finished-but-undrained batch
+        // (root cause of the hybrid hang captured by the watchdog: every worker
+        // BLOCKED in intake_wait_batch while busy streams held the head-of-line
+        // frames, throttle only ~14% used).  So: block only when nothing of ours
+        // is in flight; otherwise intake non-blockingly and fall through to poll.
+        bool self_busy = false;
+        for (auto & X : ctxs) if (X.busy) { self_busy = true; break; }
         wd_phase(slot_index, WatchPhase::IntakeWait);
-        if (!queue->wait_for_batch_or_cap(pop_n)) {   // no permit held while waiting
-          if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
-          producer_done_seen = true; continue;
+        if (self_busy) {
+          // Non-blocking: take a batch only if one is ready AND permits are free
+          // right now; otherwise skip to the completion poll for our busy streams.
+          if (!queue->ready_for_batch_or_cap(pop_n)) continue;
+          wd_phase(slot_index, WatchPhase::IntakeAcquire);
+          if (bp && !bp->try_acquire((int)pop_n)) continue;
+        } else {
+          // Nothing of ours in flight → blocking is safe (no poll to starve).
+          if (!queue->wait_for_batch_or_cap(pop_n)) {   // no permit held while waiting
+            if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
+            producer_done_seen = true; continue;
+          }
+          wd_phase(slot_index, WatchPhase::IntakeAcquire);
+          if (bp) bp->acquire((int)pop_n);
         }
-        // Permits now (safe to block here: no frames held, so the writer can
-        // always drain and release).  Then signal intent + non-blocking pop.
-        wd_phase(slot_index, WatchPhase::IntakeAcquire);
-        if (bp) bp->acquire((int)pop_n);
         if (sched) sched->gpu_wants_data();
         size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
         if (sched) sched->gpu_got_data();
@@ -12807,12 +12863,23 @@ static void gpu_decomp_worker(
         // never touches the throttle, so a permit-free waiter is always fed; the
         // user's --gpu-batch is the pop size when the queue can supply it, capped
         // when it can't — so the old gpu-only soft-min special case is gone.
-        if (!queue->wait_for_batch_or_cap(pop_n)) {
-          if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
-          producer_done_seen = true;
-          continue;
+        // See compress: never BLOCK in intake while another of this device's
+        // streams has an in-flight batch to drain (the one thread would starve
+        // its own completion poll and wedge the in-order writer).  Block only
+        // when nothing of ours is in flight; else intake non-blockingly and poll.
+        bool self_busy = false;
+        for (auto & X : ctxs) if (X.busy) { self_busy = true; break; }
+        if (self_busy) {
+          if (!queue->ready_for_batch_or_cap(pop_n)) continue;
+          if (bp && !bp->try_acquire((int)pop_n)) continue;
+        } else {
+          if (!queue->wait_for_batch_or_cap(pop_n)) {
+            if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
+            producer_done_seen = true;
+            continue;
+          }
+          if (bp) bp->acquire((int)pop_n);        // safe to block: nothing to poll
         }
-        if (bp) bp->acquire((int)pop_n);          // safe to block: no frames held
         if (sched) sched->gpu_wants_data();
         size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
         if (sched) sched->gpu_got_data();
