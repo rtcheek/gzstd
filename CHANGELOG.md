@@ -1,11 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.64  
+**Covers:** v0.9.50 → v0.14.65  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.65 — de-sync sink-limited GPU batch completions (kill the verify burst)
+
+The v0.14.64 burst probe confirmed the cause of `--verify` back-pressure in hybrid
+mode: on a multi-GPU box, identical GPUs running the same frozen batch size finish in
+**lockstep**.  The in-order writer stalls on one straggler while a contiguous run of
+frames buffers, then flushes the whole run at once.  With `--verify` that flush is a
+single huge submit burst — measured `max submit-burst 2063 frames` against a 2048-frame
+queue, correlated with `[WRITER] head-of-line 4.2% (avg 1281 frames stuck)`.  The burst
+overflows the verify queue, which back-pressures the writer and stalls the sink.
+
+Fix: `gpu_desync_batch()`.  Once the writer is **sink-limited** (the tuner's `frozen`
+latch), batch size no longer moves throughput, so every batch is jittered to a random
+size in `[batch/2, batch]`.  Randomizing per batch — rather than giving each device a
+fixed offset — matters: fixed distinct periods drift back into a beat pattern and
+re-synchronize, whereas random jitter breaks lockstep permanently.  Completions then
+scatter into a steady stream instead of a wave, so the writer flushes small contiguous
+runs and the verify queue never sees the mega-burst.
+
+- **Head-of-line-safe:** the jitter only ever *shrinks* a batch (upper bound is the
+  frozen size), never grows it, and never exceeds the per-stream buffer.
+- **Output-deterministic:** batch size only controls how many independent frames a launch
+  grabs; frame contents and the archive bytes are identical regardless.
+- **General, not machine-tuned:** gated purely on the sink-limited signal — while the
+  auto-tuner is still probing it measures clean same-size batches, and compute-bound runs
+  (where batch size still governs GPU throughput) keep the uniform throughput-optimal
+  batch.  No box-specific constants; a phase de-correlator that helps any multi-GPU box
+  (or even multi-stream single-GPU) whose writer is the bottleneck.
+- Applies symmetrically to the compress and decompress GPU worker paths.
+
+Verify the effect with `-v --verify`: the `[VERIFY]` line's `max submit-burst` should
+drop well below the queue depth, and `throttled compression … x` should shrink.
 
 ## v0.14.64 — correct the verify "memory-bandwidth" misdiagnosis; add a burst probe
 

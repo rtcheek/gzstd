@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.64";
+static constexpr const char * GZSTD_VERSION = "0.14.65";
 //
 // Architecture overview:
 //
@@ -9869,6 +9869,38 @@ struct SharedTuneState {
   static constexpr double FREEZE_MIN_SEC   = 3.0;  // ignore writer ramp-up before this
 };
 
+// De-synchronize sink-limited GPU batch completions.  When the output writer
+// (not GPU compute) is the run's bottleneck, batch size no longer moves
+// end-to-end throughput — but identical batches across N GPUs (and across the
+// several streams per GPU) make them finish in lockstep.  The in-order writer
+// then stalls on a straggler while a contiguous run of frames piles up, and
+// flushes the whole run at once.  With --verify that flush is a single huge
+// submit burst that overflows the verify queue and momentarily stalls the sink
+// (observed: ~2000-frame bursts against a 2048 queue on an 8-GPU box).
+//
+// Fix: once sink-limited, jitter every batch to a RANDOM size in [pop_n/2,
+// pop_n].  Randomized per batch (not a fixed per-device offset) so batches
+// never re-align into a beat pattern the way fixed periods do — completions
+// scatter into a steady stream instead of a wave.  This NEVER grows a batch
+// (head-of-line-safe, never exceeds the per-stream buffer) and is gated on the
+// frozen (sink-limited) state, so while the auto-tuner is still probing it
+// measures clean same-size batches, and compute-bound runs — where batch size
+// still governs GPU throughput — keep the uniform throughput-optimal batch.
+// Batch size only controls how many independent frames a launch grabs; frame
+// contents (and the archive bytes) are identical regardless, so the jitter is
+// output-deterministic.  Pure phase de-correlator; no machine-specific tuning.
+static inline size_t gpu_desync_batch(size_t pop_n, const SharedTuneState* st) {
+  if (!st || !st->frozen.load(std::memory_order_relaxed)) return pop_n;
+  if (pop_n <= 8) return pop_n;
+  // Cheap per-thread xorshift64 — no shared state, no <random> overhead, seeded
+  // distinctly per worker thread from its own thread-local storage address.
+  static thread_local uint64_t s = 0;
+  if (!s) s = 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)&s;
+  s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+  size_t lo = pop_n / 2;
+  return lo + (size_t)(s % (uint64_t)(pop_n - lo + 1));   // uniform in [pop_n/2, pop_n]
+}
+
 // Rate-matched dispatch: tracks CPU and GPU throughput to partition work
 // so both finish at roughly the same time.  This minimizes out-of-order
 // delivery to the writer.
@@ -10985,6 +11017,9 @@ static void gpu_worker(
         if (sched) sched->set_gpu_batch_size(pop_n);
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+        // De-sync sink-limited completions so the in-order writer never flushes
+        // one lockstep wave (which bursts the verify queue); no-op unless frozen.
+        pop_n = gpu_desync_batch(pop_n, shared_tune);
         // Deadlock-free batch intake (v0.14.58): wait for a full batch — or the
         // queue's bounded capacity / producer-done — WITHOUT holding any throttle
         // permit, THEN acquire and non-blocking-pop.  A stream therefore never
@@ -12896,6 +12931,9 @@ static void gpu_decomp_worker(
         if (sched) sched->set_gpu_batch_size(pop_n);
         // Apply utilization scaling (updated after each batch completion)
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+        // De-sync sink-limited completions so the in-order writer never flushes
+        // one lockstep wave (see gpu_desync_batch); no-op unless frozen.
+        pop_n = gpu_desync_batch(pop_n, shared_tune);
         // Deadlock-free batch intake (v0.14.58): wait for the batch — or the
         // queue's bounded capacity / producer-done — WITHOUT holding any throttle
         // permit, THEN acquire and non-blocking-pop.  A waiting stream never
