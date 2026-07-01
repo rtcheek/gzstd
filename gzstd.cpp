@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.65";
+static constexpr const char * GZSTD_VERSION = "0.14.66";
 //
 // Architecture overview:
 //
@@ -3874,11 +3874,12 @@ public:
       if (g_verify_failed.load(std::memory_order_relaxed)) return;
       q_.push_back({seq, frame});
       if (q_.size() > peak_q_) peak_q_ = q_.size();   // guarded by m_
-      // Burst probe: count runs of submits arriving <100 us apart.  If the 8
-      // GPUs finish batches in lockstep, the in-order writer drains and submits
-      // a wave, so a large max-burst points at synchronized GPU delivery (the
-      // lever to stagger); a small max-burst means the queue fills for another
-      // reason.  Guarded by m_.
+      // Burst probe: count runs of submits arriving <100 us apart.  Originally
+      // added to test a synchronized-GPU-delivery theory; that was falsified
+      // (de-syncing GPU completions left the burst unchanged).  The burst was the
+      // writer front-loading a whole drained run into the queue before writing;
+      // v0.14.66 feeds verify AFTER the write, so a healthy run now shows a small
+      // max-burst.  Kept as a regression sentinel.  Guarded by m_.
       {
         uint64_t now = now_ns();
         if (last_submit_ns_ && now - last_submit_ns_ < 100000) ++cur_burst_;
@@ -4919,19 +4920,30 @@ static void writer_thread(FILE * out, ResultStore & results,
     if (m) m->tasks_done.fetch_add(batch.size(), std::memory_order_relaxed);
     lk.unlock();
 
-    // --verify tap: hand each finished frame to the background decompress-verify
-    // pool BEFORE it is written (the pool holds a shared_ptr copy, so the frame
-    // outlives the write until verified).  Done off the ResultStore lock so a
-    // full verify queue applies backpressure to the writer, never stalls
-    // producers behind the results mutex.  Frames are still standard zstd frames
-    // on disk; this only reads them back in RAM.
+    // --verify (v0.14.66): capture a shared_ptr to each finished frame now, but
+    // submit to the decompress-verify pool AFTER handing the batch to the write
+    // backend below — deliberately NOT before.  The writer used to front-load the
+    // whole drained run into the verify queue in one tight loop; on a disk-bound
+    // run a big contiguous run accumulates while the previous batch is written, so
+    // that dump overflowed the bounded queue and the writer then ping-ponged
+    // against it, idling the sink while verify caught up.  Feeding verify AFTER
+    // the write lets it drain this batch CONCURRENTLY with the batch's disk write
+    // (and verify's real capacity far exceeds any single device's sink rate), so
+    // the queue is empty again before the next batch and the pre-write burst never
+    // forms — the sink stays fed.  Correctness is unchanged: the pool holds a
+    // shared_ptr, so the frame outlives the write regardless of order, and a
+    // verify failure discards and rebuilds the whole output either way.  Frames on
+    // disk are standard zstd frames; this only reads them back in RAM.
+    std::vector<std::pair<size_t, FrameBuf>> verify_items;
     if (g_verify_pool) {
+      verify_items.reserve(batch.size());
       for (size_t k = 0; k < batch.size(); ++k) {
         const size_t seq = batch_start_seq + k;
         // Test-only: flip a byte in this frame's compressed payload exactly once,
         // so --verify must catch it and trigger a rebuild (which, the hook having
-        // fired, then verifies clean).  Corrupts the SAME buffer the writer emits,
-        // so the on-disk frame is genuinely bad until rebuilt.
+        // fired, then verifies clean).  Corrupts the SAME buffer the writer emits
+        // (done here, before the write below), so the on-disk frame is genuinely
+        // bad until rebuilt.
         if (g_debug_corrupt_frame >= 0 && seq == (size_t)g_debug_corrupt_frame
             && batch[k] && batch[k]->size() > 8) {
           static std::atomic<bool> corrupted_once{false};
@@ -4939,7 +4951,7 @@ static void writer_thread(FILE * out, ResultStore & results,
           if (g_debug_corrupt_persist || corrupted_once.compare_exchange_strong(expect, true))
             (*batch[k])[batch[k]->size() / 2] ^= 0xFF;
         }
-        g_verify_pool->submit(seq, batch[k]);
+        verify_items.emplace_back(seq, batch[k]);   // shared_ptr copy; submitted post-write
       }
     }
 
@@ -4983,6 +4995,16 @@ static void writer_thread(FILE * out, ResultStore & results,
     }
     // In normal mode, wrote_bytes is updated by the AIO worker after physical
     // write completes.  This ensures the progress bar reflects actual disk I/O.
+
+    // --verify: the batch is now handed to the write backend, so feed verify.
+    // It drains concurrently with the disk write above (see the capture note), so
+    // the queue never sees the old pre-write submit burst and the sink is never
+    // starved waiting on verify.  If verify is genuinely the slower stage (a
+    // slow-CPU box), submit() still blocks here — correct back-pressure — but the
+    // sink already has this batch to write, so it does not idle meanwhile.
+    if (g_verify_pool)
+      for (auto & vit : verify_items)
+        g_verify_pool->submit(vit.first, vit.second);
 
     lk.lock();
   }

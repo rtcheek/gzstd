@@ -1,21 +1,55 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.65  
+**Covers:** v0.9.50 → v0.14.66  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
-## v0.14.65 — de-sync sink-limited GPU batch completions (kill the verify burst)
+## v0.14.66 — feed --verify AFTER the write, not before (kill the verify burst at its source)
 
-The v0.14.64 burst probe confirmed the cause of `--verify` back-pressure in hybrid
-mode: on a multi-GPU box, identical GPUs running the same frozen batch size finish in
-**lockstep**.  The in-order writer stalls on one straggler while a contiguous run of
-frames buffers, then flushes the whole run at once.  With `--verify` that flush is a
-single huge submit burst — measured `max submit-burst 2063 frames` against a 2048-frame
-queue, correlated with `[WRITER] head-of-line 4.2% (avg 1281 frames stuck)`.  The burst
-overflows the verify queue, which back-pressures the writer and stalls the sink.
+v0.14.65's de-sync **falsified** the theory it was built on: breaking GPU-completion
+lockstep dropped `[WRITER] head-of-line` from 4.2% to 0.1% but left `max submit-burst`
+pinned at ~2062 against the 2048 queue.  So the burst was never synchronized GPU
+delivery.  Tracing it to `writer_thread`: the writer drains **all** consecutive ready
+frames from the ResultStore into one batch, then submitted **every** frame to the verify
+pool in a tight loop *before* writing any of them.  On a disk-bound run a big contiguous
+run accumulates while the previous batch is on the (slow) sink, so that pre-write dump
+overflowed the bounded verify queue and the writer ping-ponged against it (12069 stalls,
+14.4 s) — **idling the sink while verify caught up.**  The measurements also show verify
+was never the bottleneck: `drain 2.76 / 0.85 per-thread` ⇒ only ~3 of 17 threads busy on
+average; its real capacity (~14 GiB/s) dwarfs any single device's sink rate.  A
+delivery-shape defect, not a verify-speed one — and it only appears when the sink is the
+bottleneck, so the fix is general, not box-specific.
+
+Fix (Option A, "pace the feed"): submit each drained batch to verify **after** handing it
+to the write backend.  `AsyncWritePool` is double-buffered — `submit()` blocks until the
+*previous* batch is written — so by the time the writer feeds verify, that stage runs
+**concurrently with the current batch's disk write**.  Verify drains the batch with huge
+margin (14 GiB/s vs a ~3 GiB/s sink) and the queue is empty again before the next batch,
+so the pre-write burst never forms and the sink is never starved.
+
+- **Root fix, zero extra memory:** no deeper queue, no tunable cap, no box-specific
+  constant.  The verify queue depth is unchanged.
+- **Correctness unchanged:** the pool holds a `shared_ptr`, so a frame outlives its write
+  regardless of submit order, and a verify failure discards and rebuilds the whole output
+  either way.  The test-only corruption hook still fires before the write.
+- **Degrades correctly on slow-CPU (verify-bound) boxes:** `submit()` still blocks as
+  real back-pressure, but the sink already holds the batch to write, so it does not idle.
+- Verify with `-v --verify`: `max submit-burst` should now be small and the
+  `throttled compression … x` count should collapse toward zero on a disk-bound run.
+
+## v0.14.65 — de-sync sink-limited GPU batch completions (fixes writer head-of-line)
+
+NOTE: this was aimed at the `--verify` burst and **missed** — v0.14.66 found and fixed the
+real cause.  It stays in because it fixes a *different*, real problem: writer head-of-line
+stalls.  On a multi-GPU box, identical GPUs running the same frozen batch size finish in
+**lockstep**, so the in-order writer stalls on one straggler while a contiguous run of
+frames buffers.  Measured effect: `[WRITER] head-of-line` dropped from 4.2% (avg 1281
+frames stuck) to 0.1% (avg 30).  It did NOT move `max submit-burst` (still ~2062) — which
+is what falsified the "synchronized delivery causes the verify burst" theory and pointed
+v0.14.66 at the writer's pre-write submit loop instead.
 
 Fix: `gpu_desync_batch()`.  Once the writer is **sink-limited** (the tuner's `frozen`
 latch), batch size no longer moves throughput, so every batch is jittered to a random
@@ -23,7 +57,7 @@ size in `[batch/2, batch]`.  Randomizing per batch — rather than giving each d
 fixed offset — matters: fixed distinct periods drift back into a beat pattern and
 re-synchronize, whereas random jitter breaks lockstep permanently.  Completions then
 scatter into a steady stream instead of a wave, so the writer flushes small contiguous
-runs and the verify queue never sees the mega-burst.
+runs (the head-of-line win above).
 
 - **Head-of-line-safe:** the jitter only ever *shrinks* a batch (upper bound is the
   frozen size), never grows it, and never exceeds the per-stream buffer.
@@ -35,9 +69,6 @@ runs and the verify queue never sees the mega-burst.
   batch.  No box-specific constants; a phase de-correlator that helps any multi-GPU box
   (or even multi-stream single-GPU) whose writer is the bottleneck.
 - Applies symmetrically to the compress and decompress GPU worker paths.
-
-Verify the effect with `-v --verify`: the `[VERIFY]` line's `max submit-burst` should
-drop well below the queue depth, and `throttled compression … x` should shrink.
 
 ## v0.14.64 — correct the verify "memory-bandwidth" misdiagnosis; add a burst probe
 
