@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.62";
+static constexpr const char * GZSTD_VERSION = "0.14.63";
 //
 // Architecture overview:
 //
@@ -2530,8 +2530,16 @@ static size_t compute_verify_queue_depth(size_t frame_bytes, const Options & opt
   size_t avail = get_available_ram_bytes();
   if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;   // assume 8 GiB if unknown
   frame_bytes = std::max<size_t>(frame_bytes, 1);
-  size_t budget = avail / 16;                            // ~6% of available RAM
-  const size_t HARD_CAP = 16ULL * 1024 * 1024 * 1024;    // never hold > 16 GiB of frames
+  // ~12% of available RAM.  The verify queue is post-write RAM held separately
+  // from the frame throttle (the write releases the throttle permit; verify holds
+  // a shared_ptr copy until checked), so it stays RAM-proportional.  It was
+  // ~6%/16 GiB, but in HYBRID the throttle allows a far deeper in-flight window
+  // (e.g. 134 GiB / 8576 frames on the 8-GPU box) and the disk writes in bursts,
+  // so a 16 GiB (1024-frame) verify queue filled and back-pressured the writer
+  // even when verify's aggregate rate nearly matched the disk.  A deeper queue
+  // absorbs the bursts; it scales down on small-RAM boxes and honors --memlimit.
+  size_t budget = avail / 8;                             // ~12% of available RAM
+  const size_t HARD_CAP = 32ULL * 1024 * 1024 * 1024;    // never hold > 32 GiB of frames
   if (budget > HARD_CAP) budget = HARD_CAP;
   if (opt.mem_limit_mib > 0) {                            // give verify a slice of any --memlimit
     size_t ml = (size_t(opt.mem_limit_mib) * ONE_MIB) / 4;

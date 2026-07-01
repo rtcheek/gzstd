@@ -1,9 +1,28 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.62  
+**Covers:** v0.9.50 → v0.14.63  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.63 — deeper verify queue to absorb hybrid write-bursts
+
+The v0.14.62 hybrid thread-cap raise confirmed the diagnosis rather than fixing it:
+on the 8-GPU box verify grew from 16 to **17** threads and then `helped` halted it
+(memory-bandwidth plateau — `drain` stayed 2.75 GiB/s), while `peak backlog` stayed
+**pinned at 1024/1024**.  So the limiter is the **verify queue depth**, not the thread
+count: the queue held only 16 GiB (1024 frames) while the hybrid throttle allows 134 GiB
+in flight, so the disk's write-bursts filled it and back-pressured the writer
+(`throttled compression 13020x for 13.18 s`) even though verify's aggregate rate nearly
+matched the disk.
+
+Raised the verify-queue sizing from ~6%/16 GiB to ~12%/32 GiB of available RAM (still
+RAM-proportional, still honoring `--memlimit`), which absorbs the bursts.  This is the
+"queue lever" flagged in v0.14.62.  The verify queue is post-write RAM held separately
+from the throttle, so the sizing stays proportional to keep small-RAM boxes safe.  No
+effect on output or on what gets verified.
 
 ---
 
