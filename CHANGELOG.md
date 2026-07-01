@@ -1,9 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.60  
+**Covers:** v0.9.50 → v0.14.61  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.61 — `--verify` no longer serializes the pipeline to one thread
+
+`--verify` on 300+ GiB of real data ran ~3.5× slower than the same compress without it
+(4m03s vs 1m10s), yet the `[VERIFY]` line claimed `kept up (compression never waited on
+verify)`.  Both the slowdown and the false "kept up" traced to the same wrong reference
+point.
+
+The verify tap holds a `shared_ptr` copy of each finished frame until it is checked, so
+the compressor's output buffer isn't recyclable until then — verify back-pressures
+*compression*.  The `VerifyPool` decides to add a thread only when `backlog >
+max_queue/2` (here 512), but the frame throttle caps in-flight frames at ~384 (peak
+backlog 373) — **below** that mark.  So the grow trigger was **unreachable**, the pool
+sat on its **first thread**, and verify silently capped a 4.6 GiB/s pipeline at one
+thread's ~0.9 GiB/s (243 s ≈ 221 GiB ÷ 0.91).  The `[VERIFY]` verdict compounded it:
+`kept up` was gated on whether the *writer* blocked on a *full verify queue* (it never
+did — the queue is bounded from below by the throttle), which says nothing about the
+back-pressure on compression.
+
+- **Scaling fix:** grow while verify is *saturated* — `backlog > nthreads*4` (reachable
+  under back-pressure) instead of `> max_queue/2`.  The existing `helped` guard (a new
+  thread must raise the drain rate >10%) still halts growth at the memory-bandwidth/CPU
+  plateau, so it scales to match the producer and no further.  Removed the now-dead
+  `high_water_`.
+- **Honest verdict:** the summary now judges by worker saturation (`verify_ns /
+  (wall × threads)`), not the writer-stall count — `verify-bound: … N% busy` when verify
+  capped throughput, `kept up (workers N% busy; not the bottleneck)` otherwise.
+
+Measured (24-core box, cap 2, 1.8 GiB incompressible → RAM): the pool now grows to 2
+threads and `--verify` costs ~5% (0.94 s vs 0.89 s) instead of stalling on one thread;
+verdict reads honestly.  On the 256-core box `vmax=16`, so it will scale to the handful
+of threads that match the disk.  No effect on output or on what gets verified.
 
 ---
 

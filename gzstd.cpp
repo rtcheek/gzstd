@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.60";
+static constexpr const char * GZSTD_VERSION = "0.14.61";
 //
 // Architecture overview:
 //
@@ -3834,8 +3834,7 @@ class VerifyPool {
 public:
   VerifyPool(int max_threads, size_t max_queue)
     : max_threads_(std::max(1, max_threads)),
-      max_queue_(std::max<size_t>(4, max_queue)),
-      high_water_(std::max<size_t>(2, max_queue_ / 2)) {
+      max_queue_(std::max<size_t>(4, max_queue)) {
     t_start_ = now_ns();
     spawn_one();   // start very low — a single verify thread
   }
@@ -3907,17 +3906,28 @@ public:
     // Per-thread is the intrinsic decompress speed (bytes / summed active time).
     const double drain = wall > 0 ? double(by) / wall / (1024.0*1024.0*1024.0) : 0.0;
     const double perthr = vsec > 0 ? double(by) / vsec / (1024.0*1024.0*1024.0) : 0.0;
+    // The "kept up" verdict must reflect the REAL impact, not just whether the
+    // writer blocked on a full verify queue (`sc`): verify back-pressures
+    // COMPRESSION by holding each frame's output buffer until it is checked, so
+    // it can cap end-to-end throughput while its own queue — bounded from below
+    // by the compress throttle — never overflows.  Worker saturation is the
+    // honest signal: near-100% busy means verify was the limiter.
+    const double util = (final_threads_ > 0 && wall > 0)
+        ? vsec / (wall * final_threads_) : 0.0;
     std::ostringstream os;
     os << "[VERIFY] " << final_threads_ << " thread(s) (cap " << max_threads_ << "), "
        << fr << " frames (" << bs << ") checked, drain "
        << std::fixed << std::setprecision(2) << drain << " GiB/s ("
        << std::setprecision(2) << perthr << " /thread), peak backlog "
        << peak_q_ << "/" << max_queue_ << " frames; ";
-    if (sc == 0)
-      os << "kept up (compression never waited on verify)";
-    else
+    if (sc > 0)
       os << "fell behind: throttled compression " << sc << "x for "
          << std::fixed << std::setprecision(2) << (st / 1e9) << " s";
+    else if (util >= 0.85)
+      os << "verify-bound: all " << final_threads_ << " thread(s) " << (int)(util * 100.0)
+         << "% busy — verify likely capped throughput";
+    else
+      os << "kept up (workers " << (int)(util * 100.0) << "% busy; not the bottleneck)";
     vlog(V_VERBOSE, opt, os.str() + "\n");
   }
 
@@ -3958,11 +3968,16 @@ private:
     int nthreads;
     { std::lock_guard<std::mutex> tlk(threads_m_); nthreads = (int)threads_.size(); }
 
-    // Grow only if we're falling behind (queue building past high-water) AND the
-    // last thread we added paid off (drain rate climbed >10%) — or we still have
-    // a single thread.  Once an added thread stops raising the rate we've hit the
-    // bandwidth/CPU plateau (or matched the producer), so we hold.
-    const bool behind = backlog > high_water_;
+    // Grow while verify is SATURATED — a sustained backlog of several frames per
+    // existing thread means the workers are never starved, i.e. verify is the
+    // limiter.  (The old `backlog > max_queue/2` mark was UNREACHABLE: the
+    // compress pipeline holds each frame's buffer until verify checks it, so the
+    // frame throttle caps in-flight frames BELOW the verify queue's half-full
+    // point — the backlog plateaus at ~throttle size and the pool never scaled
+    // off its first thread, silently capping a multi-GiB/s pipeline at one
+    // thread's ~0.9 GiB/s.)  `helped` still halts growth at the memory-bandwidth
+    // /CPU plateau (or once verify matches the producer), so we never balloon.
+    const bool behind = backlog > (size_t)std::max(1, nthreads) * 4;
     const bool helped = (nthreads <= 1) || (rate > grow_rate_last_ * 1.10);
     if (behind && helped && nthreads < max_threads_) {
       spawn_one();
@@ -4028,7 +4043,6 @@ private:
 
   const int    max_threads_;
   const size_t max_queue_;
-  const size_t high_water_;
 
   std::mutex                 m_;
   std::condition_variable    not_empty_, not_full_;
