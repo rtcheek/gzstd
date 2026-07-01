@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.68";
+static constexpr const char * GZSTD_VERSION = "0.14.69";
 //
 // Architecture overview:
 //
@@ -392,6 +392,7 @@ struct Options {
   bool mmap_user_set = false;     // true if --mmap/--no-mmap given (suppresses the pre-6.4 large-file auto-gate)
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool watchdog = false;          // --watchdog: arm the GPU deadlock watchdog (diagnostic; dumps JSON + aborts on a stall)
+  int  watchdog_secs = 30;        // --watchdog=SECS: stall timeout in seconds (default 30)
   bool direct_read = false;       // --direct-read: O_DIRECT input — bypass the page cache (no populate/evict)
   size_t read_threads = 0;        // --read-threads N: buffered pooled-reader threads (0 = auto: 3)
   size_t write_threads = 0;       // --write-threads N: -d --tar extractor writer pool (0 = auto: min(threads,16))
@@ -805,8 +806,8 @@ static void print_help()
 "  --sync-output       fsync output before exit\n"
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
-"  --watchdog          arm the GPU deadlock watchdog (DIAGNOSTIC ONLY: if a\n"
-"                      hybrid/GPU run stalls, dump a JSON snapshot and abort)\n"
+"  --watchdog[=SECS]   arm the GPU deadlock watchdog (DIAGNOSTIC ONLY: if a\n"
+"                      hybrid/GPU run stalls SECS s (default 30), dump JSON + abort)\n"
 "  --direct-read       O_DIRECT input, single stream: bypass the page cache\n"
 "                      for one-pass speedups and honest cold benchmarks\n"
 "  --read-threads N    parallel readers for the BUFFERED input path (default:\n"
@@ -1031,13 +1032,13 @@ static void print_help_long()
 "     --direct-read (which bypasses the cache entirely), --cold evicts\n"
 "     any already-cached pages, so it disturbs other users of that data.\n"
 "\n"
-"  --watchdog    (default: off)\n"
+"  --watchdog[=SECS]    (default: off; SECS default 30)\n"
 "     DIAGNOSTIC ONLY.  Arm a stall detector for hybrid/GPU runs.  If the\n"
-"     writer makes no progress for 30 s (GZSTD_WATCHDOG_SECS to tune) while\n"
-"     the run is not done, dump a JSON snapshot of every GPU worker, stream,\n"
-"     queue, throttle and NVML/kernel-Xid signal to the current directory and\n"
-"     abort.  It does NOT recover — it turns a frozen process into evidence.\n"
-"     Normal runs never need it; use it to capture a suspected GPU wedge.\n"
+"     writer makes no progress for SECS seconds (default 30) while the run is\n"
+"     not done, dump a JSON snapshot of every GPU worker, stream, queue,\n"
+"     throttle and NVML/kernel-Xid signal to the current directory and abort.\n"
+"     It does NOT recover — it turns a frozen process into evidence.  Normal\n"
+"     runs never need it; use it to capture a suspected GPU wedge.\n"
 "\n"
 "  --preallocate / --no-preallocate    (default: off)\n"
 "     Preallocate the output file with `fallocate` to its expected\n"
@@ -3043,9 +3044,6 @@ static std::atomic<int64_t> g_verify_failed_seq{-1};
 // frames, to exercise the CPU-only restart path deterministically (real GPU
 // faults are intermittent).  -1 (default, env unset) = disabled.
 static int64_t g_debug_fail_gpu_after = -1;
-// TEMPORARY (v0.14.59 diagnostic): freeze the writer after N frames to exercise
-// the deadlock watchdog without a real hang.  -1 = disabled.
-static std::atomic<int64_t> g_debug_freeze_writer_after{-1};
 
 // Test-only corruption injection (read once from $GZSTD_DEBUG_CORRUPT_FRAME):
 // flip a byte in the compressed payload of the frame with this sequence number
@@ -4849,14 +4847,6 @@ static void writer_thread(FILE * out, ResultStore & results,
   std::unique_lock<std::mutex> lk(results.m);
 
   while (true) {
-    // TEST HOOK (temporary, v0.14.59): freeze the writer at a given seq so the
-    // deadlock watchdog can be exercised without a real hang.  Releases the lock
-    // first so workers fill the throttle and block naturally, like a real wedge.
-    if (g_debug_freeze_writer_after.load(std::memory_order_relaxed) >= 0 &&
-        (int64_t)results.next_to_write >= g_debug_freeze_writer_after.load(std::memory_order_relaxed)) {
-      lk.unlock();
-      while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
     bool all_done = results.producer_done
                  && results.workers_done
                  && results.next_to_write >= results.total_tasks;
@@ -8471,13 +8461,6 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         ++push_next;
       }
       rb_cv.notify_all();        // advance the frontier: unblock readers waiting to claim
-      // TEST HOOK (temporary, v0.14.60): throttle the producer to N µs/frame so a
-      // fast (page-cache-warm) box can reproduce the slow-producer starvation that
-      // wedged GPU workers in intake on the 8-GPU cold-read run.
-      {
-        static const long slow_us = []{ const char* e = std::getenv("GZSTD_DEBUG_SLOW_PRODUCER_US"); return e ? atol(e) : 0L; }();
-        if (slow_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(slow_us));
-      }
       queue.push(std::move(t));  // may block on the queue's byte cap (backpressure)
       if (push_next >= nchunks) break;
     }
@@ -10430,9 +10413,8 @@ static void gpu_verify_check(StreamCtx & C, const Options & opt)
 //     that never completes) or BLOCKED in our own code (a CV/lock)?
 //   * per-stream last cudaStreamQuery result + its AGE: is the kernel genuinely
 //     NotReady (running/hung), or did it finish and we are stuck downstream?
-// Stall timeout defaults to 30 s, overridable via GZSTD_WATCHDOG_SECS (0 disables
-// even with --watchdog).  GZSTD_DEBUG_FREEZE_WRITER_AFTER=N freezes the writer
-// after N frames to exercise the watchdog without a real hang.
+// Stall timeout is opt.watchdog_secs — 30 s default, `--watchdog=SECS` to tune,
+// 0 disables the check.
 // ============================================================================
 enum class WatchPhase : int {
   Idle=0, Tuning, IntakeWait, IntakeAcquire, IntakePop, Submit, Poll, Drain, Yield, Exiting
@@ -12159,17 +12141,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // ---- GPU deadlock watchdog (v0.14.59) — opt-in via --watchdog (diagnostic) ----
   // Off by default; the wd_* instrumentation in the workers is a cheap no-op while
-  // g_wd is null.  Interval defaults to 30 s, overridable with GZSTD_WATCHDOG_SECS
-  // for tuning.  See GzWatchdog above.
+  // g_wd is null.  Stall timeout is opt.watchdog_secs (30 s default; --watchdog=SECS
+  // to tune; 0 disables the check).  See GzWatchdog above.
   GzWatchdog wd;
   std::atomic<bool> watchdog_done{false};
   std::thread watchdog_thr;
-  if (opt.watchdog) {
-    const char * ws = std::getenv("GZSTD_WATCHDOG_SECS");
-    int wsecs = ws ? std::atoi(ws) : 30;
-    if (const char * fz = std::getenv("GZSTD_DEBUG_FREEZE_WRITER_AFTER"))
-      g_debug_freeze_writer_after.store(std::atoll(fz));
-    if (wsecs > 0) {
+  if (opt.watchdog && opt.watchdog_secs > 0) {
+    {
+      const int wsecs = opt.watchdog_secs;
       wd.n_workers   = gpu_count;
       wd.streams_per = (int)std::max<size_t>(1, opt.gpu_streams);
       wd.workers     = std::vector<WdWorker>((size_t)wd.n_workers);
@@ -15696,6 +15675,11 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--no-mmap" || a == "--mmap=off") { opt.use_mmap = false; opt.mmap_user_set = true; }
     else if (a == "--cold") opt.cold_read = true;
     else if (a == "--watchdog") opt.watchdog = true;
+    else if (a.rfind("--watchdog=", 0) == 0) {
+      opt.watchdog = true;
+      opt.watchdog_secs = parse_int_value("--watchdog", a.substr(11));
+      if (opt.watchdog_secs < 0) die_usage("--watchdog seconds must be >= 0 (0 disables the stall check)");
+    }
     else if (a == "--direct-read") opt.direct_read = true;
     else if (parse_num_arg("read-threads", i, argc, argv, opt.read_threads)) { }
     else if (parse_num_arg("write-threads", i, argc, argv, opt.write_threads)) { }

@@ -1,11 +1,28 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.68  
+**Covers:** v0.9.50 → v0.14.69  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.69 — `--watchdog=SECS`; strip the now-obsolete test hooks
+
+Follow-up cleanup to v0.14.68.
+
+- `--watchdog` now takes an optional timeout: `--watchdog` = 30 s (unchanged),
+  `--watchdog=SECS` sets the stall timeout (0 disables the check).  Only the `=` form
+  takes a value, so it can never swallow a following filename.  This replaces the
+  `GZSTD_WATCHDOG_SECS` env var, which is removed.
+- Removed the two temporary reproduction hooks whose jobs are done: `GZSTD_DEBUG_FREEZE_
+  WRITER_AFTER` (freeze the writer to exercise the watchdog without a real hang) and
+  `GZSTD_DEBUG_SLOW_PRODUCER_US` (throttle the producer to reproduce the v0.14.60
+  completion-poll starvation).  Both deadlocks are fixed; the hooks were only ever manual
+  diagnostics and are trivial to reconstruct if a future wedge needs them.
+- The `g_debug_freeze_writer_after` global and its writer freeze-point are gone.
+- Test hooks that remain are the ones the suite actually uses: `GZSTD_DEBUG_CORRUPT_FRAME`
+  / `_PERSIST` (verify tests) and `GZSTD_DEBUG_FAIL_GPU_AFTER` (GPU-fault rebuild).
 
 ## v0.14.68 — demote the deadlock watchdog to opt-in `--watchdog` (diagnostic)
 

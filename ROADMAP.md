@@ -93,6 +93,31 @@ Survive VRAM exhaustion on shared GPU machines without hanging or producing trun
 - Writer deadlock detection (5s timeout → hard error + cleanup)
 - `die()` reports cleanup of incomplete output files
 
+### 1.10 Event-Driven GPU Completion (replace the completion-poll yield)
+**Priority: Medium | Complexity: High | Status: PLANNED**
+
+Each GPU worker serves all its device's streams from one thread that loops:
+intake → submit → **poll** (`cudaStreamQuery` in a loop) → drain. The poll spins with a
+`yield` when no stream has finished, which is what made the intake/poll interplay
+deadlock-prone (fixed structurally in v0.14.58 permit-hoarding and v0.14.60 completion-poll
+starvation, and made opt-in-observable via `--watchdog`, v0.14.59/68/69). The poll is
+correct now but still a busy-wait, and the ordering that made it fragile is inherent to a
+hand-rolled poll loop.
+
+Redesign: drive completion from the driver instead of polling — `cudaLaunchHostFunc`
+(or a `cudaEvent_t` per batch + a completion thread) enqueues a host callback that fires
+when a stream's batch finishes, pushing the finished batch onto a completion queue the
+worker blocks on with a CV. That removes the spin, decouples intake from completion (no
+single thread can starve its own poll), and makes the pipeline event-driven end to end —
+aligning with `[[feedback_no_fixed_waits]]` (CV, not poll). Deferred until after the
+current deadlock work settled; the structural invariant to preserve is
+`[[project_throttle_hybrid_deadlock]]` ("hold permits only while holding frames").
+Validate any rewrite under `--watchdog` and the full hybrid/gpu-only/tar matrix.
+
+Note: host callbacks must not call CUDA APIs and must not block the driver thread — the
+callback only hands the batch to a queue; all CUDA work stays on the worker/completion
+thread.
+
 ---
 
 ## Phase 2: Persistent Auto-Tuning (`~/.gzstd/`)
