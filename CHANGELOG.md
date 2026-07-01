@@ -1,9 +1,30 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.61  
+**Covers:** v0.9.50 → v0.14.62  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.14.62 — `--verify` polish: hybrid thread cap, output-line fixes
+
+Follow-ons to v0.14.61, from a 319 GiB real-data run.
+
+- **Hybrid verify cap.** On the 8-GPU box, verify still fell behind: it hit the
+  cpu-only ceiling of 16 threads (`peak backlog 1024/1024, throttled compression
+  14274x`) because the hybrid producer is much faster than cpu-only.  In hybrid the
+  GPUs carry the compression, so the CPU pool has spare cores — raised verify's
+  ceiling there to `cores/8` (≤32) vs `cores/16` (≤16) for cpu-only.  The rate-matched
+  `helped` guard in `maybe_grow` still halts growth at the memory-bandwidth plateau,
+  so the higher ceiling only spends threads that actually raise the drain rate.
+- **`[VERIFY]` on its own line.** It was being appended to the live progress bar's
+  last in-place (`\r`) update; now printed on a fresh line.
+- **Correct source name in the summary.** `--tar` synthesizes its input, so the
+  compress summary labelled it `(stdin)` even when reading a directory tree — it now
+  shows the actual source path(s), matching the extract summary.
+
+Cosmetic + tuning only; no effect on output or on what gets verified.
 
 ---
 

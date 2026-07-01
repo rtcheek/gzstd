@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.61";
+static constexpr const char * GZSTD_VERSION = "0.14.62";
 //
 // Architecture overview:
 //
@@ -3928,7 +3928,9 @@ public:
          << "% busy — verify likely capped throughput";
     else
       os << "kept up (workers " << (int)(util * 100.0) << "% busy; not the bottleneck)";
-    vlog(V_VERBOSE, opt, os.str() + "\n");
+    // Leading '\n' so the line starts fresh below the live progress bar instead
+    // of being appended to its last in-place (\r) update.
+    vlog(V_VERBOSE, opt, "\n" + os.str() + "\n");
   }
 
 private:
@@ -14753,7 +14755,15 @@ int main(int argc, char ** argv)
         const int cores = (opt.cpu_threads > 0)
             ? opt.cpu_threads
             : std::max(1, (int)std::thread::hardware_concurrency());
-        const int vmax = std::clamp(cores / 16, 2, 16);
+        // cpu-only: keep verify well clear of the compress pool (≤ cores/16).
+        // hybrid: the GPUs carry the compression, so the CPU pool has spare
+        // cores — raise the ceiling (≤ cores/8) so verify can match the faster
+        // hybrid producer instead of back-pressuring it (it hit the old cap of
+        // 16 and still fell behind on an 8-GPU box).  The rate-matched `helped`
+        // guard in maybe_grow still halts growth at the memory-bandwidth plateau,
+        // so a higher ceiling only costs threads when they actually raise drain.
+        const int vmax = opt.cpu_only ? std::clamp(cores / 16, 2, 16)
+                                      : std::clamp(cores / 8,  4, 32);
         size_t frame_est = std::max<size_t>(opt.chunk_mib, 1) * ONE_MIB;  // worst-case frame size
         if (!opt.cpu_only) frame_est = std::min(frame_est, GPU_SUBCHUNK_MAX);   // GPU frames ≤ 16 MiB
         const size_t vqueue = compute_verify_queue_depth(frame_est, opt);
@@ -15114,7 +15124,12 @@ int main(int argc, char ** argv)
     human_bytes(double(in_bytes), in_s, sizeof(in_s));
     human_bytes(double(out_bytes), out_s, sizeof(out_s));
     human_bytes(rate, rate_s, sizeof(rate_s));
-    std::string in_name  = (opt.input == "-") ? "(stdin)" : opt.input;
+    // --tar synthesizes its input from tar_sources (opt.input is "-"); name the
+    // actual source path(s) rather than the misleading "(stdin)".
+    std::string in_name = opt.tar_mode
+        ? (opt.tar_sources.size() == 1 ? opt.tar_sources[0]
+             : std::to_string(opt.tar_sources.size()) + " source path(s)")
+        : ((opt.input == "-") ? "(stdin)" : opt.input);
     std::string out_name = to_stdout ? "(stdout)" : opt.output;
     char summary[512];
     std::snprintf(summary, sizeof(summary),
