@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.75";
+static constexpr const char * GZSTD_VERSION = "0.14.76";
 //
 // Architecture overview:
 //
@@ -8250,6 +8250,11 @@ struct LayoutBuilder {
           ? 0u : (uint32_t)(TAR_BLK + tar_round_up(e.pax.size(), TAR_BLK));
       e.hdr_off   = o;
       e.hdr_len   = pax_blk + header_len(e.path.size(), e.link.size());
+      // OLDGNU sparse extension blocks (see add() above) — this recompute
+      // must include them too, or a fragmented sparse file's header comes
+      // up short and every offset from here on is wrong.
+      if (!e.sparse_map.empty() && e.sparse_map.size() > 4)
+        e.hdr_len += (uint32_t)(((e.sparse_map.size() - 4 + 20) / 21) * TAR_BLK);
       e.data_off  = o + e.hdr_len;
       e.entry_end = e.data_off + tar_round_up(e.size, TAR_BLK);
       o = e.entry_end;
@@ -8834,13 +8839,20 @@ private:
   bool make_dir(const std::string & rel, uint32_t mode) {
     std::string leaf; int pfd = open_parent(rel, leaf, true);
     if (pfd < 0) return false;
+    // Create with owner rwx forced on regardless of the stored mode: a
+    // restrictive stored mode (e.g. a read-only package-cache dir, common in
+    // real home directories) would otherwise lock out writing children into
+    // it during extraction. finish_deferred() reapplies the TRUE stored mode
+    // (via set_meta_fd) once the whole tree is populated, so this scratch
+    // mode is never visible in the final result.
+    uint32_t scratch_mode = (mode & 07777) | 0700;
     bool ok = true;
-    if (::mkdirat(pfd, leaf.c_str(), mode & 07777) != 0) {
+    if (::mkdirat(pfd, leaf.c_str(), scratch_mode) != 0) {
       if (errno == EEXIST) {
         struct stat st;
         if (::fstatat(pfd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(st.st_mode)) {
           ::unlinkat(pfd, leaf.c_str(), 0);        // a planted symlink/file where a dir belongs
-          ok = (::mkdirat(pfd, leaf.c_str(), mode & 07777) == 0);
+          ok = (::mkdirat(pfd, leaf.c_str(), scratch_mode) == 0);
         }
       } else ok = false;
     }

@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.75  
+**Covers:** v0.9.50 → v0.14.76  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.76 — two extraction/creation correctness fixes found in a pre-release audit
+
+Swept the codebase before tagging a release, focused on `-d --tar` restore fidelity and `--tar` archive-creation correctness. Two confirmed bugs, both found by direct reproduction (not just reading):
+
+**Directories with restrictive owner permissions broke extraction.** `Extractor::make_dir()` created a directory with its final stored mode immediately, so a directory lacking owner write/execute (read-only package caches are the common real-world trigger — e.g. Go's module cache) blocked every child underneath it: the leaf `mkdirat` succeeded, but the following `openat(O_CREAT)` for a file inside it (or `mkdirat` for a subdirectory) failed EACCES. Reported per-file (non-zero exit, named path) rather than silent, but left whole subtrees of a restore missing. Fix: create directories with owner rwx forced on (`mode | 0700`); `finish_deferred()` already reapplies the true stored mode/ACLs once the tree is fully populated, matching GNU tar's own create-permissive-then-fix-later approach.
+
+**`--sparse` combined with `--acls`/`--xattrs` corrupted the archive for fragmented sparse files.** `LayoutBuilder::add()` correctly grows a sparse entry's `hdr_len` for the OLDGNU extension blocks needed once a file's sparse map exceeds 4 segments. But `apply_extended_metadata()` — the second pass that recomputes every entry's header offsets once PAX xattr/ACL records are known — rebuilt `hdr_len` from scratch and dropped that extension-block term, undercounting the header size for any sufficiently fragmented sparse file. The declared header length then disagreed with what `emit_header()` actually wrote, corrupting the stream: `-t --tar` reported CORRUPT / truncated tar stream, and extraction produced truncated output. Reproduced with a 6-segment sparse file plus `--xattrs`; fixed by adding the same extension-block term to the recompute loop. Verified byte-identical (`cmp`) after the fix, holes and xattr intact.
+
+Full suite (268/268) green after each fix.
 
 ## v0.14.75 — cap the --tar decompress throttle (found by v0.14.74's clamp)
 
