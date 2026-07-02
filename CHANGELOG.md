@@ -1,11 +1,48 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.72  
+**Covers:** v0.9.50 → v0.14.73  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.73 — parallel large-file extraction: windowed part jobs on the writer pool
+
+v0.14.72's `[EXTRACT]` line immediately paid off on the server rerun: with the
+small-file copies gone, the serial parse thread was 83–92% in the LARGE-file path —
+byte-wise the archive is dominated by >4 MiB files, and that path was a single
+parse-thread fill/zero-scan feeding a single persistent O_DIRECT writer (~one device
+stream), with the 16-thread writer pool sitting 84% starved beside it.
+
+Large files now go through the SAME writer pool as small ones, as 64 MiB windowed
+zero-copy part jobs:
+
+- The serial thread only creates + pre-truncates the file and hands out `DataSeg`
+  views per window; all byte work (assemble, zero-scan, pwrite) runs on the pool
+  threads for many windows and files CONCURRENTLY — parallel memcpy, parallel scan,
+  and real device queue depth instead of one stream.
+- One shared write fd per file (O_DIRECT under `--direct`); parts `pwrite` their
+  absolute offsets — thread-safe, no per-part opens.  Pre-truncating to the full size
+  makes zero-skips holes and the final length exact with no FINALIZE step; whichever
+  part completes last applies metadata and closes the fd.
+- O_DIRECT parts assemble ≤16 MiB chunks into a lazily-allocated per-writer-thread
+  aligned bounce buffer and write coalesced non-zero 4 KiB runs; the file's sub-4K
+  tail goes through a separate buffered fd (O_DIRECT can't write unaligned lengths).
+  Buffered mode (no `--direct`) writes straight from the frame segments — no copy at
+  all.  O_DIRECT-less filesystems (tmpfs) fall back to buffered parts per file.
+- RAM stays bounded: the job queue budget scales to `writers × 2 windows` (256 MiB
+  floor), so a huge file pins only its in-queue windows' frames, never the whole file.
+- The entire single-lane `ld_*` pipeline (persistent writer thread, DJob queue,
+  6×16 MiB staging pool, `[UNTAR-LARGE]` stats) is deleted; `[WRITER]` busy/starved
+  now covers ALL file bytes, and the `[EXTRACT]` bucket becomes `large-dispatch`
+  (view-building + create/truncate only).
+
+Verified: round-trips byte-identical across buffered / `--direct` / `--no-sparse` /
+GPU-hybrid on a large-file-heavy tree including multi-part files (up to 1 GiB),
+window-edge sizes (64 MiB ± 1, +4096, +1234), interior zero runs, a 512 MiB
+mostly-hole file (extracted with identical block count — holes preserved through the
+O_DIRECT path), and a hardlink to a multi-part file.
 
 ## v0.14.72 — zero-copy tar extractor; extract-aware tuner freeze; honest extract diagnostics
 
