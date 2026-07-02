@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.71";
+static constexpr const char * GZSTD_VERSION = "0.14.72";
 //
 // Architecture overview:
 //
@@ -8506,6 +8506,18 @@ struct InEntry {
                                          // prefixed to the file data, not in sparse_map
 };
 
+// Zero-copy view of file data: a span into a decompressed frame, kept alive by
+// the refcount.  A small file is usually one segment; it spans two (rarely
+// more) when it crosses a frame boundary.  The writer pool writes straight
+// from the frame — the serial parse thread no longer copies file bytes at all
+// (v0.14.72; the per-file memcpy was the extract-path ceiling on small-file
+// archives: one thread copying the entire uncompressed stream).
+struct DataSeg {
+  FrameBuf     keep;   // refcount holder (owns p)
+  const char * p = nullptr;
+  size_t       n = 0;
+};
+
 // Buffered reader over a fd (the decompression pipe).
 struct StreamReader {
   // Two interchangeable sources behind one interface: an fd (the extract pipe)
@@ -8539,6 +8551,26 @@ struct StreamReader {
   }
   bool read_exact(char * dst, size_t n) {
     size_t got = 0; while (got < n) { size_t k = read_some(dst + got, n - got); if (!k) return false; got += k; }
+    return true;
+  }
+  // Zero-copy read: hand out n bytes as views into the current frame(s).
+  // Sink mode appends one DataSeg per frame touched (shared_ptr copy, no byte
+  // copy).  fd mode has no owning frames, so it falls back to one copied,
+  // owned segment — same downstream interface either way.
+  bool read_segs(uint64_t n, std::vector<DataSeg> & out) {
+    if (!src) {                                  // fd mode: copy into an owned buffer
+      if (!n) return true;
+      auto own = std::make_shared<FrameVec>(n);
+      if (!read_exact(own->data(), n)) return false;
+      out.push_back(DataSeg{own, own->data(), (size_t)n});
+      return true;
+    }
+    while (n) {
+      if (pos == fill) { refill(); if (pos == fill) return false; }
+      size_t k = (size_t)std::min<uint64_t>(n, fill - pos);
+      out.push_back(DataSeg{cur, base + pos, k});
+      pos += k; n -= k; consumed_total += k;
+    }
     return true;
   }
   // Advance n bytes without copying: just move the cursor, refilling (which in
@@ -8594,10 +8626,12 @@ public:
   int writer_threads() const { return n_writers_ + (ld_active() ? 1 : 0); }
 
   void run(int read_fd) {
+    uint64_t t0 = now_ns();
     if (!read_only()) start_pool();
     StreamReader r(read_fd);
     parse(r);               // validates every header checksum; flags truncation
     r.drain();              // consume trailing padding so the decompressor can finish
+    ex_wall_ns_ = now_ns() - t0;
     if (!read_only()) { stop_pool(); finish_deferred(); log_large_file_stats(); }
   }
 
@@ -8605,11 +8639,26 @@ public:
   // FrameSink (the `-t`/`-l --tar` fast path) instead of a pipe fd — skip() over
   // file data becomes pointer arithmetic, so the walk does O(files) work.
   void run_sink(FrameSink * src) {
+    uint64_t t0 = now_ns();
     if (!read_only()) start_pool();
     StreamReader r(src);
     parse(r);
     r.drain();              // pop any trailing frames so the producer can finish
+    ex_wall_ns_ = now_ns() - t0;
+    ex_sinkwait_ns_ = src->consumer_wait_ns();
     if (!read_only()) { stop_pool(); finish_deferred(); log_large_file_stats(); }
+  }
+
+  // Serial parse-thread phase timing (see the counter block below) for the -v
+  // [EXTRACT] diagnosis in extract_tar.
+  uint64_t serial_wall_ns()     const { return ex_wall_ns_; }
+  uint64_t serial_sinkwait_ns() const { return ex_sinkwait_ns_; }
+  uint64_t serial_enq_ns()      const { return ex_enq_ns_; }
+  uint64_t serial_inline_ns()   const { return ex_inline_ns_; }
+  uint64_t serial_large_ns()    const {   // parse-thread share of the large-file path
+    return ld_fill_ns_.load(std::memory_order_relaxed)
+         + ld_scan_ns_.load(std::memory_order_relaxed)
+         + ld_bufwait_ns_.load(std::memory_order_relaxed);
   }
 
 private:
@@ -8859,7 +8908,14 @@ private:
   }
 
   // ---- writer pool (regular-file data writes, in parallel with decompression) ----
-  struct Job { std::string rel; uint32_t mode; int64_t mtime; uint64_t uid, gid; std::vector<char> data; ExtMeta ext; };
+  // Job data is zero-copy: segments referencing the decompressed frames (see
+  // DataSeg).  A frame stays alive until the last job referencing it is
+  // written; with the queue bounded at Q_MAX_BYTES of logical data, the pinned
+  // overhang is at most ~one frame per queue-resident job — bounded and small.
+  struct Job {
+    std::string rel; uint32_t mode; int64_t mtime; uint64_t uid, gid;
+    std::vector<DataSeg> segs; uint64_t size = 0; ExtMeta ext;
+  };
   std::mutex q_m_; std::condition_variable q_cv_prod_, q_cv_cons_;
   std::deque<Job> q_; size_t q_bytes_ = 0; bool q_done_ = false;
   static constexpr size_t Q_MAX_BYTES = 256 * 1024 * 1024;
@@ -8870,6 +8926,21 @@ private:
   // add at exit, so the 16 writers never contend on a shared counter mid-run.
   int n_writers_ = 0;
   std::atomic<uint64_t> wpool_busy_ns_{0}, wpool_starved_ns_{0};
+
+  // Serial parse-thread phase timing for the -v [EXTRACT] line (all accumulated
+  // on the one parse thread, so plain counters; harvested after join):
+  //   wall     = run()/run_sink() duration
+  //   sinkwait = blocked popping frames (decompress is behind)
+  //   enq      = blocked pushing jobs (the writer pool / device is behind)
+  //   inline   = filesystem ops done inline (dirs, symlinks, specials, sparse)
+  // Residual (wall − the above − large-file time) = header parse + dispatch,
+  // the serial thread's own irreducible work.
+  uint64_t ex_wall_ns_ = 0, ex_sinkwait_ns_ = 0, ex_enq_ns_ = 0, ex_inline_ns_ = 0;
+  struct NsAdd {   // scoped accumulator, no-op unless -v
+    uint64_t & acc; uint64_t t0; bool on;
+    NsAdd(uint64_t & a, bool en) : acc(a), t0(en ? now_ns() : 0), on(en) {}
+    ~NsAdd() { if (on) acc += now_ns() - t0; }
+  };
 
   void start_pool() {
     // --write-threads overrides; auto = min(worker threads, 16) — beyond ~16 the
@@ -8890,8 +8961,17 @@ private:
   }
   void enqueue(Job && j) {
     std::unique_lock<std::mutex> lk(q_m_);
-    q_cv_prod_.wait(lk, [&] { return q_bytes_ < Q_MAX_BYTES || q_.empty(); });
-    q_bytes_ += j.data.size();
+    // Time blocked on a full job queue (-v): this is the "writer pool can't
+    // keep up" signal for the [EXTRACT] line — distinct from the serial
+    // thread itself being the ceiling.
+    if (opt_.verbosity >= V_VERBOSE && !(q_bytes_ < Q_MAX_BYTES || q_.empty())) {
+      uint64_t t0 = now_ns();
+      q_cv_prod_.wait(lk, [&] { return q_bytes_ < Q_MAX_BYTES || q_.empty(); });
+      ex_enq_ns_ += now_ns() - t0;
+    } else {
+      q_cv_prod_.wait(lk, [&] { return q_bytes_ < Q_MAX_BYTES || q_.empty(); });
+    }
+    q_bytes_ += j.size;
     q_.push_back(std::move(j));
     lk.unlock(); q_cv_cons_.notify_one();
   }
@@ -8914,7 +8994,7 @@ private:
         }
         if (q_.empty()) break;
         j = std::move(q_.front()); q_.pop_front();
-        q_bytes_ -= j.data.size();
+        q_bytes_ -= j.size;
         lk.unlock(); q_cv_prod_.notify_all();
       }
       if (measure) {
@@ -8957,22 +9037,33 @@ private:
     int fd = create_file(j.rel, j.mode);
     if (fd < 0) { fail(j.rel, std::strerror(errno)); return; }
     bool ok = true;
+    // Write straight from the decompressed frame segments (zero-copy).  The
+    // segments are contiguous ranges of the file, so a running offset places
+    // each one; per-segment sparse detection stays correct (the file is fresh,
+    // unwritten regions read as zeros).
     if (opt_.sparse_mode != 0) {  // --sparse / auto (default on for file output); --no-sparse disables
-      ok = pwrite_sparse(fd, 0, j.data.data(), j.data.size());
-      if (ok && ::ftruncate(fd, (off_t)j.data.size()) != 0) ok = false;
+      off_t at = 0;
+      for (const DataSeg & s : j.segs) {
+        if (!pwrite_sparse(fd, at, s.p, s.n)) { ok = false; break; }
+        at += (off_t)s.n;
+      }
+      if (ok && ::ftruncate(fd, (off_t)j.size) != 0) ok = false;
     } else {
-      size_t off = 0;
-      while (off < j.data.size()) {
-        ssize_t w = ::write(fd, j.data.data() + off, j.data.size() - off);
-        if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
-        off += (size_t)w;
+      for (const DataSeg & s : j.segs) {
+        size_t off = 0;
+        while (off < s.n) {
+          ssize_t w = ::write(fd, s.p + off, s.n - off);
+          if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
+          off += (size_t)w;
+        }
+        if (off < s.n) { ok = false; break; }
       }
     }
     if (!ok) fail(j.rel, std::strerror(errno));
     set_meta_fd(fd, j.mode, j.mtime, j.uid, j.gid);
     apply_ext(fd, /*is_dir=*/false, j.ext);
     ::close(fd);
-    if (m_) m_->wrote_bytes.fetch_add(j.data.size(), std::memory_order_relaxed);
+    if (m_) m_->wrote_bytes.fetch_add(j.size, std::memory_order_relaxed);
   }
 
   // ---- parsing ----
@@ -9181,7 +9272,11 @@ private:
     }
 
     // GNU sparse: place each stored segment at its logical offset, leaving holes.
-    if (e.is_sparse) { extract_sparse(r, rel, e, pad); return; }
+    if (e.is_sparse) {
+      NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE);
+      extract_sparse(r, rel, e, pad);
+      return;
+    }
 
     if (rel.empty()) { if (e.size) { r.skip(e.size); r.skip(pad); } return; }
     // Path-traversal guard (the openat O_NOFOLLOW walk is the backstop; this gives
@@ -9202,8 +9297,10 @@ private:
         if (e.size <= SMALL_FILE_MAX) {
           Job j; j.rel = rel; j.mode = e.mode; j.mtime = e.mtime; j.uid = e.uid; j.gid = e.gid;
           j.ext = e.ext;
-          j.data.resize(e.size);
-          if (e.size && !r.read_exact(j.data.data(), e.size)) { fail(rel, "truncated file data"); return; }
+          j.size = e.size;
+          // Zero-copy: views into the decompressed frame(s), no memcpy on this
+          // serial thread (see DataSeg).
+          if (e.size && !r.read_segs(e.size, j.segs)) { fail(rel, "truncated file data"); return; }
           r.skip(pad);
           enqueue(std::move(j));
         } else {
@@ -9213,23 +9310,29 @@ private:
         }
         break;
       }
-      case '5':                                    // directory
+      case '5': {                                  // directory
+        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE);
         if (!make_dir(rel, e.mode)) fail(rel, "cannot create directory");
         else dirmeta_.push_back({rel, e.mode, e.mtime, e.uid, e.gid, e.ext});
         break;
-      case '2':                                    // symlink
+      }
+      case '2': {                                  // symlink
+        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE);
         if (!make_symlink(rel, e.linkname, e.uid, e.gid)) fail(rel, "cannot create symlink");
         break;
+      }
       case '1':                                    // hardlink (deferred: target must exist)
         hardlinks_.push_back({rel, norm(e.linkname)});
         break;
-      case '3': case '4': case '6':                // char/block device, fifo
+      case '3': case '4': case '6': {              // char/block device, fifo
+        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE);
         if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor)) {
           if (errno == EPERM) vlog(V_VERBOSE, opt_, "gzstd: untar: " + rel + ": need privilege for device/special; skipped\n");
           else fail(rel, "cannot create special file");
         }
         if (e.size) { r.skip(e.size); r.skip(pad); }
         break;
+      }
       case 'V':                                     // volume label/header: no file data
         if (e.size) { r.skip(e.size); r.skip(pad); }
         break;
@@ -12740,13 +12843,25 @@ static void gpu_decomp_worker(
               size_t cur_batch = shared_tune->batch_size.load();
 
               auto & S = *shared_tune;
-              // Sink-limited freeze (see compress path): if the writer is the
-              // bottleneck, stop tuning — batch size can't lift a writer-capped
-              // run and a bigger batch only deepens head-of-line latency.
+              // Sink-limited freeze (see compress path): if the sink is the
+              // bottleneck, stop tuning — batch size can't lift a sink-capped
+              // run and a bigger batch only deepens head-of-line latency at
+              // the in-order writer.  TWO sink signals, because --tar extract
+              // never touches writer_disk_ns (its untar pool tracks time
+              // separately, so the disk signal reads ~0 there — that gap let
+              // batches balloon to 512 on extract-bound runs, v0.14.72):
+              //   * plain -d: writer disk-busy fraction (writer_disk_ns)
+              //   * -d --tar: the in-order writer's time blocked pushing into
+              //     the extract FrameSink (producer_wait_ns) — extract behind
               double wall_s = m ? std::chrono::duration_cast<
                   std::chrono::duration<double>>(now - m->t0).count() : 0.0;
               double w_busy = (m && wall_s > 0.0)
                   ? double(m->writer_disk_ns.load()) / (wall_s * 1e9) : 0.0;
+              const char * sink_kind = "writer busy";
+              if (FrameSink * sk = g_tar_decomp_sink; sk && wall_s > 0.0) {
+                double sink_blocked = double(sk->producer_wait_ns()) / (wall_s * 1e9);
+                if (sink_blocked > w_busy) { w_busy = sink_blocked; sink_kind = "extract backlog"; }
+              }
               if (m && wall_s >= SharedTuneState::FREEZE_MIN_SEC
                     && w_busy >= SharedTuneState::SINK_FREEZE_BUSY) {
                 if (S.best_batch) S.batch_size.store(S.best_batch);
@@ -12755,7 +12870,7 @@ static void gpu_decomp_worker(
                 S.frozen.store(true);
                 if (opt.verbosity >= V_VERBOSE) {
                   std::ostringstream os;
-                  os << "[AUTO-TUNE] sink-limited (writer busy " << std::fixed
+                  os << "[AUTO-TUNE] sink-limited (" << sink_kind << " " << std::fixed
                      << std::setprecision(0) << w_busy * 100.0
                      << "%); freezing batch at " << S.batch_size.load()
                      << " — GPU throughput is no longer the bottleneck";
@@ -14037,6 +14152,8 @@ static int extract_tar(const Options & opt, Meter * m)
   // each one finishes.  prod/cons sink waits give the decompress-vs-extract seam.
   uint64_t agg_wbusy_ns = 0, agg_wstarved_ns = 0;
   uint64_t agg_prod_wait_ns = 0, agg_cons_wait_ns = 0;
+  uint64_t agg_ex_wall_ns = 0, agg_ex_sink_ns = 0, agg_ex_enq_ns = 0;
+  uint64_t agg_ex_inline_ns = 0, agg_ex_large_ns = 0;
   int wpool_threads = 0;
   for (const std::string & arc : opt.tar_sources) {
     if (opt.keep_going) { g_damage.reset(); g_member_ranges.reset(); }  // damage reported per archive
@@ -14096,6 +14213,11 @@ static int extract_tar(const Options & opt, Meter * m)
       agg_wstarved_ns   += ex.writer_starved_ns();
       agg_prod_wait_ns  += (uint64_t)sink.producer_wait_ns();
       agg_cons_wait_ns  += (uint64_t)sink.consumer_wait_ns();
+      agg_ex_wall_ns    += ex.serial_wall_ns();
+      agg_ex_sink_ns    += ex.serial_sinkwait_ns();
+      agg_ex_enq_ns     += ex.serial_enq_ns();
+      agg_ex_inline_ns  += ex.serial_inline_ns();
+      agg_ex_large_ns   += ex.serial_large_ns();
       wpool_threads      = std::max(wpool_threads, ex.writer_threads());
     }
     if (opt.verbosity >= V_DEBUG) {
@@ -14163,15 +14285,51 @@ static int extract_tar(const Options & opt, Meter * m)
           wpool_threads, wpool_threads > 1 ? "s" : "", wall_ns / 1e9);
         vlog(V_VERBOSE, opt, wline);
       }
+      // [EXTRACT]: where the ONE serial parse thread's time went.  Residual
+      // (parse+dispatch) is its own irreducible work — if that dominates while
+      // the writer pool starves, the serial thread is the ceiling, not the
+      // device.  sink-wait dominant = decompress behind; dispatch-blocked
+      // dominant = writer pool/device behind.
+      double ex_wall = double(agg_ex_wall_ns);
+      double ex_parse_frac = 0, ex_sink_frac = 0, ex_enq_frac = 0;
+      if (ex_wall > 0) {
+        ex_sink_frac = double(agg_ex_sink_ns) / ex_wall;
+        ex_enq_frac  = double(agg_ex_enq_ns) / ex_wall;
+        double inline_frac = double(agg_ex_inline_ns) / ex_wall;
+        double large_frac  = double(agg_ex_large_ns) / ex_wall;
+        ex_parse_frac = std::max(0.0, 1.0 - ex_sink_frac - ex_enq_frac
+                                          - inline_frac - large_frac);
+        char eline[256];
+        std::snprintf(eline, sizeof(eline),
+          "[EXTRACT] serial parse thread: sink-wait %.1f%% | dispatch-blocked %.1f%% | "
+          "inline-meta %.1f%% | large-file %.1f%% | parse+dispatch %.1f%%  (%.2f s)\n",
+          ex_sink_frac * 100.0, ex_enq_frac * 100.0, inline_frac * 100.0,
+          large_frac * 100.0, ex_parse_frac * 100.0, ex_wall / 1e9);
+        vlog(V_VERBOSE, opt, eline);
+      }
+      // Verdict: pick the stage the evidence actually points at, and say what
+      // the numbers were so a wrong guess is visible.
       const double pw = double(agg_prod_wait_ns), cw = double(agg_cons_wait_ns);
+      const double wbusy_frac = (wpool_threads > 0 && wall_ns > 0)
+          ? double(agg_wbusy_ns) / (wall_ns * wpool_threads) : 0.0;
       if (pw + cw > 0) {
-        if (pw >= cw)
-          vlog(V_VERBOSE, opt, "[WRITER] verdict: extract-bound — the decompressors stalled "
-               "waiting for the extractor to drain the buffer; the write path (the device) "
-               "capped output\n");
-        else
-          vlog(V_VERBOSE, opt, "[WRITER] verdict: decompress-bound — the extractor stalled "
-               "waiting for frames; the read+decompress engines, not the device, capped output\n");
+        char v[320];
+        if (pw < cw) {
+          std::snprintf(v, sizeof(v), "[WRITER] verdict: decompress-bound — the extractor "
+              "stalled waiting for frames (sink-wait %.0f%%); the read+decompress engines, "
+              "not the write path, capped output\n", ex_sink_frac * 100.0);
+        } else if (ex_enq_frac >= 0.40 || wbusy_frac >= 0.55) {
+          std::snprintf(v, sizeof(v), "[WRITER] verdict: extract-bound at the WRITE side — "
+              "the writer pool ran %.0f%% busy and the parse thread was dispatch-blocked "
+              "%.0f%% of the time; the output device capped throughput\n",
+              wbusy_frac * 100.0, ex_enq_frac * 100.0);
+        } else {
+          std::snprintf(v, sizeof(v), "[WRITER] verdict: extract-bound at the SERIAL parse "
+              "thread (parse+dispatch %.0f%% of its time) — the writer pool was only %.0f%% "
+              "busy, so the device had headroom; the single-threaded extractor capped "
+              "throughput\n", ex_parse_frac * 100.0, wbusy_frac * 100.0);
+        }
+        vlog(V_VERBOSE, opt, v);
       }
     }
   }

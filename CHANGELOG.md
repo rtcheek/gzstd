@@ -1,11 +1,44 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.71  
+**Covers:** v0.9.50 → v0.14.72  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.72 — zero-copy tar extractor; extract-aware tuner freeze; honest extract diagnostics
+
+Server profiling of a 319 GiB / 505k-file archive showed every `-d --tar` backend
+converging on ~2–3 GiB/s with the writer pool 84% STARVED — the bottleneck was the one
+serial parse thread memcpy'ing the entire uncompressed stream into writer-pool jobs,
+while the `[WRITER]` verdict wrongly blamed the device.
+
+**Zero-copy extractor.**  `Job::data` (a per-file `std::vector<char>` copy) is replaced
+by `DataSeg` views into the decompressed frames: refcounted spans (`FrameBuf` +
+pointer + length), one per frame touched (a file crossing a frame boundary gets two).
+The serial thread now only parses headers and hands out views; the writer pool writes
+straight from the frames (per-segment `pwrite_sparse` at a running offset — sparse-hole
+detection is offset-based, so per-segment stays correct on freshly created files).
+Frame lifetime: a frame is freed when the last job referencing it is written; with the
+job queue bounded at 256 MiB of logical bytes the pinned overhang is ~one frame per
+queued job.  The fd-mode StreamReader (no frames) falls back to one owned, copied
+segment behind the same interface.
+
+**Extract-aware sink-limited freeze (GPU decompress tuner).**  The freeze keyed solely
+on `writer_disk_ns`, which `--tar` extract never feeds (the untar pool tracks time in
+its own counters) — so on extract-bound runs the tuner saw "writer 0% busy" and grew
+batches to 512 against an in-order sink (deep head-of-line, 22 s end-of-run join).
+The freeze now also fires on the in-order writer's time blocked pushing into the
+extract FrameSink (`producer_wait_ns`), reported as "extract backlog N%".
+
+**Honest diagnostics.**  New `-v` `[EXTRACT]` line breaks down the serial parse
+thread's time: sink-wait (decompress behind) | dispatch-blocked (writer pool/device
+behind) | inline-meta | large-file | parse+dispatch (its own irreducible work).  The
+`[WRITER]` verdict now picks between three evidence-backed attributions instead of
+always blaming the device: decompress-bound / write-side-bound (pool busy or parse
+thread dispatch-blocked) / SERIAL-parse-thread-bound (pool idle, device had headroom)
+— each with the numbers inline.
 
 ## v0.14.71 — remove dead `busy` machinery from the decompress GPU worker; test-count constants
 
