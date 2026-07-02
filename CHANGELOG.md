@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.74  
+**Covers:** v0.9.50 → v0.14.75  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.75 — cap the --tar decompress throttle (found by v0.14.74's clamp)
+
+v0.14.74's batch clamp shrank the CPU queue floor (gpu_batch × streams), which
+had been silently locking the 96 hybrid CPU threads out of the tail of the
+queue — freed, decode finished ~60% through the run and raced the disk by the
+FULL pipeline throttle budget (134 GiB in flight on the 8-GPU box), which the
+writer then visibly drained for 44 s after the last worker exited ("[WRITER]
+join took 44095 ms" on a quiet box).  Wall time was unchanged — the disk is
+the clock either way — but holding 100+ GiB of decompressed frames to feed a
+~3 GiB/s sink is pure RAM waste.
+
+**`--tar` decompress now caps the auto throttle budget at 16 GiB of frames,
+never below the GPU batch-floor deadlock guardrail** (`source=tar-extract` in
+the -v line; the guardrail lands at 2048 frames / 32 GiB on the 8-GPU box, so
+the same run holds ≤32 GiB and the drain tail drops proportionally).  cpu-only
+budgets were already below the cap and are unchanged; user-pinned
+--throttle-frames is untouched.  The cap must NOT go below the guardrail:
+FrameThrottle::acquire is greedy — a stream holds a partial permit set while
+waiting for the rest, and with delivered-but-unwritten frames pinning the
+remainder the head-of-line frame can sit unpopped forever (all-or-nothing
+acquire semantics would be needed to go lower).
 
 ## v0.14.74 — smooth GPU completion bursts at the in-order writer; quieter startup
 

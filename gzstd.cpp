@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.74";
+static constexpr const char * GZSTD_VERSION = "0.14.75";
 //
 // Architecture overview:
 //
@@ -2561,6 +2561,13 @@ static size_t compute_verify_queue_depth(size_t frame_bytes, const Options & opt
   return std::clamp<size_t>(depth, 32, 8192);            // floor keeps it functional; ceiling sane
 }
 
+// Non-null while a --tar decompress routes frames to the in-process tar
+// parser (extract / verify / list).  Declared up here because the throttle
+// sizing below caps the in-flight budget for that pipeline shape; defined
+// alongside FrameSink further down, where the full story lives.
+class FrameSink;
+static FrameSink * g_tar_decomp_sink = nullptr;
+
 static int compute_throttle_budget(size_t frame_bytes,
                                    int pipeline_parallelism,
                                    int gpu_batch_floor,
@@ -2628,6 +2635,22 @@ static int compute_throttle_budget(size_t frame_bytes,
     source = (frames == THROTTLE_MIN_FRAMES && pipeline_frames < THROTTLE_MIN_FRAMES)
            ? "floor"
            : (pipeline_frames <= ram_frames ? "pipeline" : "ram");
+    // --tar decompress: the pipeline ends at the extract sink, whose drain
+    // rate is the target device's — in-flight frames beyond "every decode
+    // lane busy + a few seconds of write buffer" are pure RAM and a long
+    // end-of-run drain (observed on an 8-GPU box: the parallelism formula
+    // allowed 134 GiB in flight; decode raced the disk by the full budget
+    // and the writer drained a 100+ GiB backlog for 44 s after the last
+    // worker exited).  Cap at 16 GiB of frames, never below the GPU batch
+    // floor — the deadlock guardrail above stays authoritative because
+    // greedy permit acquisition can hold a partial batch while delivered-
+    // but-unwritten frames pin the rest.
+    if (g_tar_decomp_sink) {
+      int tar_cap = (int)std::min<size_t>(INT_MAX, std::max<size_t>(
+          (size_t)std::max(gpu_batch_floor, THROTTLE_MIN_FRAMES),
+          (16ULL * 1024 * 1024 * 1024) / frame_bytes));
+      if (frames > tar_cap) { frames = tar_cap; source = "tar-extract"; }
+    }
   }
 
   // One-line summary at -v (informational).
@@ -4407,12 +4430,12 @@ private:
   std::atomic<uint64_t> prod_wait_ns_{0}, cons_wait_ns_{0};
 };
 
-// Set by verify_tar() / extract_tar() for the duration of one archive's
-// decompress: when non-null the decompress writer_thread (and the streaming/
+// g_tar_decomp_sink (defined above compute_throttle_budget, which needs it):
+// set by verify_tar() / extract_tar() for the duration of one archive's
+// decompress; when non-null the decompress writer_thread (and the streaming/
 // fallback helpers) route finished frames here, to the in-process tar parser,
 // instead of through a kernel pipe (mirrors the g_direct_writer global-sink
 // pattern).  Used for both `-t --tar` (validate) and `-d --tar` (extract).
-static FrameSink * g_tar_decomp_sink = nullptr;
 
 // Sink budget for that hand-off.  CPU decompress delivers frames near-
 // continuously, so a small buffer suffices.  GPU/hybrid completion is BATCH-
