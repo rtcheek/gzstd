@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.14.51
+**Current version:** v0.14.71
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -94,29 +94,55 @@ Survive VRAM exhaustion on shared GPU machines without hanging or producing trun
 - `die()` reports cleanup of incomplete output files
 
 ### 1.10 Event-Driven GPU Completion (replace the completion-poll yield)
-**Priority: Medium | Complexity: High | Status: PLANNED**
+**Priority: Medium | Complexity: High | Status: DONE (v0.14.70)**
 
-Each GPU worker serves all its device's streams from one thread that loops:
-intake → submit → **poll** (`cudaStreamQuery` in a loop) → drain. The poll spins with a
-`yield` when no stream has finished, which is what made the intake/poll interplay
-deadlock-prone (fixed structurally in v0.14.58 permit-hoarding and v0.14.60 completion-poll
-starvation, and made opt-in-observable via `--watchdog`, v0.14.59/68/69). The poll is
-correct now but still a busy-wait, and the ordering that made it fragile is inherent to a
-hand-rolled poll loop.
+The compress GPU worker's poll loop (intake → submit → `cudaStreamQuery` spin → sync
+drain) is replaced by a per-device **drain thread**: the worker submits and records a
+per-stream `ev_done` (`cudaEventBlockingSync`), pushes the stream onto a FIFO; the drain
+thread pops the FIFO in submit order, parks in `cudaEventSynchronize` (an OS block, not a
+spin), and does readback + delivery in the single `gpu_drain_batch` path.
 
-Redesign: drive completion from the driver instead of polling — `cudaLaunchHostFunc`
-(or a `cudaEvent_t` per batch + a completion thread) enqueues a host callback that fires
-when a stream's batch finishes, pushing the finished batch onto a completion queue the
-worker blocks on with a CV. That removes the spin, decouples intake from completion (no
-single thread can starve its own poll), and makes the pipeline event-driven end to end —
-aligning with `[[feedback_no_fixed_waits]]` (CV, not poll). Deferred until after the
-current deadlock work settled; the structural invariant to preserve is
-`[[project_throttle_hybrid_deadlock]]` ("hold permits only while holding frames").
-Validate any rewrite under `--watchdog` and the full hybrid/gpu-only/tar matrix.
+Design decisions (see CHANGELOG v0.14.70 for the full rationale):
+- Chose the "`cudaEvent_t` + completion thread" variant over `cudaLaunchHostFunc`: host
+  functions are documented to NOT run when the batch faults, which would turn every GPU
+  fault into a hang; the event-sync thread sees the error and routes it to the abort path.
+- FIFO (submit-order) drain is writer-optimal: submit order = pop order = seq order, so
+  the in-order writer's head-of-line frame is always at the front of some device's FIFO —
+  this strengthens the deadlock-freedom argument rather than weakening it.
+- `[[project_throttle_hybrid_deadlock]]` invariant preserved (wait without permits →
+  acquire → non-blocking pop); the v0.14.60 self-busy special case is structurally
+  obsolete and deleted.  Aligns with `[[feedback_no_fixed_waits]]` — no spin remains.
+- The drain thread runs the abort protocol itself on failure so a blocked worker always
+  wakes; `wait_for_gpu_yield` and `acquire_out_buf` gained `g_gpu_aborted` escapes.
 
-Note: host callbacks must not call CUDA APIs and must not block the driver thread — the
-callback only hands the batch to a queue; all CUDA work stays on the worker/completion
-thread.
+Decompress is out of scope: its GPU worker synchronizes inline per batch (required by
+`GetTempSizeSync`) and has no poll loop.  See 1.11 for what decompress could still gain.
+
+### 1.11 Decompress GPU Pipelining
+**Priority: Low (Gen4+ only) | Complexity: High | Status: EVALUATE — profile on the server first**
+
+The decompress GPU worker is deliberately simple, not optimal: each batch runs
+H2D → `GetTempSizeSync` (forced mid-submission sync) → kernel → sync → per-frame D2H,
+fully inline.  Three known inefficiencies:
+
+1. **No intra-device overlap.**  Multiple `--gpu-streams` only rotate buffers; H2D,
+   kernel, and D2H serialize per device.  A compress-style drain thread (1.10) would
+   pipeline H2D(n+1) ∥ kernel(n) ∥ D2H(n−1).
+2. **Per-batch `GetTempSizeSync` stall**, even when the temp buffer didn't grow.
+   Cheapest first step: query a conservative bound once and re-query only when the
+   batch's max frame shape grows (compress already sizes temp once at init).
+3. **Reader-side copy** on the GPU path (refcounted slot release is a long-open
+   follow-up — see reader-path notes).
+
+Why it has NOT mattered yet: pipelining only helps where GPU decompress wins at all.
+On PCIe Gen3 the D2H of the decompressed output (2–4× the input bytes) is the structural
+ceiling and cpu-only is both the default and the fastest.  `--tar` extract is
+write-bound (~4 GiB/s converged across backends).  So the observable win is confined to
+Gen4+ machines on non-tar decompress — and there the higher-leverage fix is that the
+**default backend choice is wrong on Gen4+** (picks cpu-only where GPU wins; the
+unblocked first slice of `--adapt`).  Fix the default first, then profile: if the GPU
+path becomes the chosen backend and profiling shows kernel/H2D idle during D2H, port the
+1.10 drain-thread design.  Item 2 is safe to do independently any time.
 
 ---
 

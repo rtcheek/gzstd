@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.69";
+static constexpr const char * GZSTD_VERSION = "0.14.71";
 //
 // Architecture overview:
 //
@@ -3489,21 +3489,6 @@ public:
     return !(q_.empty() && done_);
   }
 
-  // Non-blocking sibling of wait_for_batch_or_cap: true iff a batch is poppable
-  // RIGHT NOW (queue has >= target, or is at capacity / done with frames left).
-  // A GPU worker that still has an in-flight stream to drain must NOT block in
-  // the wait above — it would starve its own completion poll and wedge the
-  // in-order writer behind a finished-but-undrained batch.  It uses this to
-  // intake only when work is immediately available, otherwise it goes to poll.
-  bool ready_for_batch_or_cap(size_t target)
-  {
-    std::lock_guard<std::mutex> lk(m_);
-    if (q_.empty()) return false;            // nothing to pop yet
-    return q_.size() >= target || done_
-        || (max_depth_ > 0 && q_.size() >= max_depth_)
-        || (max_bytes_ > 0 && queued_bytes_ >= max_bytes_);
-  }
-
   // Non-blocking batch pop that ALSO wakes a producer blocked on a bounded queue
   // (try_pop_batch deliberately doesn't, as its CPU-hybrid caller relies on the
   // GPU path's signal).  Used by the acquire-then-pop GPU intake.
@@ -3621,6 +3606,11 @@ public:
     ++gpu_yield_waiters_;
     while (true) {
       if (q_.empty() && done_) { --gpu_yield_waiters_; return false; }
+      // GPU-fault abort: CPU workers exit WITHOUT draining, so the queue may
+      // never empty and the yield predicate may never flip — treat as drained
+      // (the caller exits; the output is discarded anyway).  The abort paths
+      // store the flag before set_done(), whose notify_all lands here.
+      if (g_gpu_aborted.load(std::memory_order_relaxed)) { --gpu_yield_waiters_; return false; }
       QueueState qs { q_.size(), done_, front_ratio_locked() };
       if (may_take(qs)) { --gpu_yield_waiters_; return true; }
       cv_.wait(lk);
@@ -4218,23 +4208,6 @@ public:
       disabled_(max_in_flight <= 0) {}
 
   bool disabled() const { return disabled_; }
-
-  // Non-blocking acquire: take all n permits iff they are ALL available right
-  // now, else take none and return false.  A GPU worker with an in-flight stream
-  // to drain uses this so it never blocks here (which would starve its
-  // completion poll); on failure it goes to poll instead of waiting.
-  bool try_acquire(int n = 1) {
-    if (n <= 0 || disabled_) return true;
-    std::lock_guard<std::mutex> lk(m_);
-    if (permits_ < n) return false;
-    permits_ -= n;
-    int observed = max_ - permits_;
-    int prev = peak_in_flight_.load(std::memory_order_relaxed);
-    while (observed > prev &&
-           !peak_in_flight_.compare_exchange_weak(prev, observed,
-                                                  std::memory_order_relaxed)) {}
-    return true;
-  }
 
   // Acquire n permits.  Blocks until enough are available (or done).
   // Greedy: takes whatever is available immediately, waits for the rest.
@@ -10059,7 +10032,13 @@ struct StreamCtx {
   cudaEvent_t ev_h2d_end{};
   cudaEvent_t ev_comp_end{};
   cudaEvent_t ev_d2h_end{};
+  // End-of-batch marker for the drain thread (ROADMAP 1.10): recorded after all
+  // of the batch's stream work, created with cudaEventBlockingSync so
+  // cudaEventSynchronize parks the drain thread on an OS wait instead of
+  // spinning in the driver.
+  cudaEvent_t ev_done{};
   bool        busy   = false;         // true while a batch is in-flight
+                                      // (compress: guarded by the worker's idle_m)
   size_t      filled = 0;             // subchunks in current batch
   size_t      delivered = 0;          // frames of the current batch already pushed to ResultStore
                                       // (lets the failure path rescue only the undelivered tail)
@@ -10077,6 +10056,11 @@ struct StreamCtx {
   uint64_t out_pool_waits = 0;
   FrameBuf acquire_out_buf(size_t cap, FrameThrottle * bp) {
     for (;;) {
+      // GPU-fault abort: the writer stops draining, so pool slots may never
+      // free — hand back any slot (output is discarded) instead of wedging
+      // the drain thread and blocking the worker's teardown join.
+      if (g_gpu_aborted.load(std::memory_order_relaxed))
+        return out_pool.empty() ? std::make_shared<FrameVec>() : out_pool[0];
       for (auto & b : out_pool)
         if (b.use_count() == 1) return b;
       if (out_pool.size() < cap) {
@@ -10254,6 +10238,10 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   cudaEventCreateWithFlags(&C.ev_h2d_end,   cudaEventDefault);
   cudaEventCreateWithFlags(&C.ev_comp_end,  cudaEventDefault);
   cudaEventCreateWithFlags(&C.ev_d2h_end,   cudaEventDefault);
+  // Batch-done marker: BlockingSync so the drain thread's cudaEventSynchronize
+  // sleeps on an OS primitive (no timing needed on this one).
+  cudaEventCreateWithFlags(&C.ev_done,
+                           cudaEventBlockingSync | cudaEventDisableTiming);
 
   C.stats.pinned_h2d = (C.h2d_pinned_base != nullptr);
   // The same buffer is reused for D2H (compress output readback).
@@ -10292,6 +10280,7 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   if (C.ev_h2d_end) { cudaEventDestroy(C.ev_h2d_end); }
   if (C.ev_comp_end) { cudaEventDestroy(C.ev_comp_end); }
   if (C.ev_d2h_end) { cudaEventDestroy(C.ev_d2h_end); }
+  if (C.ev_done) { cudaEventDestroy(C.ev_done); }
   // Preserve accumulated per-stream stats (+ last_adjust) across the buffer
   // reallocation: C = StreamCtx{} would otherwise wipe the JSON stats.
   auto save_adjust = C.last_adjust;
@@ -10317,31 +10306,34 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
 }
 
 /*----------------------------------------------------------------------
-  GPU COMPRESS WORKER
+  GPU COMPRESS WORKER — event-driven completion (ROADMAP 1.10, v0.14.70)
   -----------------------------------------------------------------------
-  One thread per GPU device.  Each thread owns one or more CUDA streams
-  (StreamCtx).  The main loop has three phases:
+  TWO threads per GPU device, sharing one or more CUDA streams (StreamCtx):
 
-  1. SUBMIT: Pop a batch from the task queue, upload to GPU (H2D),
-     launch nvCOMP compress kernel, and record CUDA events for timing.
+  1. WORKER (intake/submit): waits for an idle stream, pops a batch from
+     the task queue (wait WITHOUT permits -> acquire -> non-blocking pop,
+     the v0.14.58 invariant), uploads H2D, launches the nvCOMP kernel
+     (+ the in-VRAM verify chain), records ev_done, and pushes the stream
+     onto a FIFO for the drain thread.  Every wait is a CV or an OS-level
+     block — there is no cudaStreamQuery poll and no yield spin.
 
-  2. POLL COMPLETIONS (async path): Non-blocking cudaStreamQuery checks
-     if a stream has finished.  On success, reads back compressed sizes
-     and data (D2H), records perf counters, and delivers results.
+  2. DRAIN: pops the FIFO in submit order, blocks in
+     cudaEventSynchronize(ev_done) (BlockingSync — an OS wait), then does
+     the readback + delivery in gpu_drain_batch() and marks the stream
+     idle.  Submit order is pop order is seq order, so FIFO drain hands
+     the in-order writer exactly the frames it needs next — this is what
+     makes the pipeline deadlock-free: the writer's head-of-line frame is
+     always at the front of some device's drain FIFO.
 
-  3. SYNC DRAIN (synchronous path): When no new batch was submitted
-     (!submitted_any)  e.g., queue is empty  we synchronously wait
-     on busy streams via cudaStreamSynchronize instead of polling.
-     This avoids spin-waiting when there's no new work to overlap with.
+  Because completion runs on its own thread, blocking in intake can no
+  longer starve the drain (the v0.14.60 starvation class is structurally
+  gone), and a waiting stream still never holds throttle permits
+  (v0.14.58).
 
-  IMPORTANT: Both completion paths (async poll and sync drain) MUST
-  record to g_perf counters and per-device/per-stream stats.  If you
-  add perf recording to one path, add it to the other too.  The sync
-  drain path handles the majority of completions when batch sizes are
-  small (N=1) because the GPU finishes before the next batch arrives.
-
-  On failure: the catch block rescues in-flight chunks to the CPU
-  rescue queue (hybrid mode) or dies (--gpu-only mode).
+  On failure (either thread): raise g_gpu_aborted and run the abort
+  protocol — the whole output is discarded and the driver rebuilds
+  CPU-only from the original input.  The drain thread performs the same
+  protocol itself so a worker blocked in intake is guaranteed to wake.
 ----------------------------------------------------------------------*/
 
 // nvCOMP's batched zstd compressor does NOT add the per-frame content checksum
@@ -10409,25 +10401,29 @@ static void gpu_verify_check(StreamCtx & C, const Options & opt)
 // diagnostic after the v0.14.58/60 hybrid deadlocks were fixed: it is the fastest
 // way to capture a future wedge (marginal HW, a new nvCOMP, an unfamiliar box).
 // The two key discriminators:
-//   * per-worker HEARTBEAT sampled twice: is the worker SPINNING (a GPU stream
-//     that never completes) or BLOCKED in our own code (a CV/lock)?
-//   * per-stream last cudaStreamQuery result + its AGE: is the kernel genuinely
-//     NotReady (running/hung), or did it finish and we are stuck downstream?
+//   * per-worker HEARTBEAT sampled twice (intake and drain threads separately):
+//     is the thread SPINNING (a GPU stream that never completes) or BLOCKED in
+//     our own code (a CV/lock)?
+//   * per-stream last cudaEventSynchronize(ev_done) result + its AGE: did the
+//     batch genuinely never finish (running/hung kernel), or did it complete
+//     and we are stuck downstream?
 // Stall timeout is opt.watchdog_secs — 30 s default, `--watchdog=SECS` to tune,
 // 0 disables the check.
 // ============================================================================
 enum class WatchPhase : int {
-  Idle=0, Tuning, IntakeWait, IntakeAcquire, IntakePop, Submit, Poll, Drain, Yield, Exiting
+  Idle=0, Tuning, StreamWait, IntakeWait, IntakeAcquire, IntakePop, Submit,
+  DrainWait, Drain, Yield, Exiting
 };
 static const char * watch_phase_name(int p) {
   switch ((WatchPhase)p) {
     case WatchPhase::Idle: return "idle";
     case WatchPhase::Tuning: return "tuning";
+    case WatchPhase::StreamWait: return "wait_idle_stream";
     case WatchPhase::IntakeWait: return "intake_wait_batch";
     case WatchPhase::IntakeAcquire: return "intake_acquire_permits";
     case WatchPhase::IntakePop: return "intake_pop";
     case WatchPhase::Submit: return "submit_h2d_kernel";
-    case WatchPhase::Poll: return "poll_stream_query";
+    case WatchPhase::DrainWait: return "drain_wait_completion";
     case WatchPhase::Drain: return "drain_d2h_push";
     case WatchPhase::Yield: return "yield";
     case WatchPhase::Exiting: return "exiting";
@@ -10438,13 +10434,18 @@ struct WdStream {
   std::atomic<bool>     busy{false};
   std::atomic<uint64_t> busy_since_ns{0};
   std::atomic<uint64_t> seq_lo{0}, seq_hi{0}, filled{0};
-  std::atomic<int>      last_query{-1000};      // last cudaStreamQuery() return code
-  std::atomic<uint64_t> last_query_ns{0};
+  std::atomic<int>      last_sync{-1000};       // last cudaEventSynchronize(ev_done) result
+  std::atomic<uint64_t> last_sync_ns{0};
 };
 struct WdWorker {
   std::atomic<uint64_t> heartbeat{0};           // ++ each worker-loop iteration
   std::atomic<int>      phase{(int)WatchPhase::Idle};
   std::atomic<int>      device_id{-1};
+  // Compress runs a second, per-device drain thread (event-driven completion,
+  // ROADMAP 1.10); it heartbeats separately so the dump can tell a stuck
+  // intake from a stuck drain.
+  std::atomic<uint64_t> drain_heartbeat{0};
+  std::atomic<int>      drain_phase{(int)WatchPhase::Idle};
 };
 struct GzWatchdog {
   int n_workers=0, streams_per=0;
@@ -10464,8 +10465,10 @@ static inline void wd_beat(int w){ if(auto*d=g_wd.load(std::memory_order_relaxed
 static inline void wd_phase(int w, WatchPhase p){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).phase.store((int)p,std::memory_order_relaxed); }
 static inline void wd_dev(int w,int dev){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).device_id.store(dev,std::memory_order_relaxed); }
 static inline void wd_submit(int w,int s,uint64_t lo,uint64_t hi,uint64_t filled){ if(auto*d=g_wd.load(std::memory_order_relaxed)){auto&x=d->st(w,s); x.seq_lo.store(lo);x.seq_hi.store(hi);x.filled.store(filled);x.busy_since_ns.store(now_ns());x.busy.store(true);} }
-static inline void wd_query(int w,int s,int q){ if(auto*d=g_wd.load(std::memory_order_relaxed)){auto&x=d->st(w,s); x.last_query.store(q);x.last_query_ns.store(now_ns());} }
+static inline void wd_sync(int w,int s,int q){ if(auto*d=g_wd.load(std::memory_order_relaxed)){auto&x=d->st(w,s); x.last_sync.store(q);x.last_sync_ns.store(now_ns());} }
 static inline void wd_idle(int w,int s){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->st(w,s).busy.store(false); }
+static inline void wd_drain_beat(int w){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).drain_heartbeat.fetch_add(1,std::memory_order_relaxed); }
+static inline void wd_drain_phase(int w, WatchPhase p){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).drain_phase.store((int)p,std::memory_order_relaxed); }
 
 static std::string wd_json_escape(const std::string & s) {
   std::string o; o.reserve(s.size()+16);
@@ -10493,9 +10496,10 @@ static std::string wd_run_cmd(const char * cmd) {
   if (!d) std::_Exit(70);
   // Sample heartbeats twice (500 ms apart) to tell SPINNING from BLOCKED.
   std::vector<uint64_t> hb0((size_t)d->n_workers), hb1((size_t)d->n_workers);
-  for (int w=0; w<d->n_workers; ++w) hb0[(size_t)w] = d->wk(w).heartbeat.load();
+  std::vector<uint64_t> dhb0((size_t)d->n_workers), dhb1((size_t)d->n_workers);
+  for (int w=0; w<d->n_workers; ++w) { hb0[(size_t)w] = d->wk(w).heartbeat.load(); dhb0[(size_t)w] = d->wk(w).drain_heartbeat.load(); }
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  for (int w=0; w<d->n_workers; ++w) hb1[(size_t)w] = d->wk(w).heartbeat.load();
+  for (int w=0; w<d->n_workers; ++w) { hb1[(size_t)w] = d->wk(w).heartbeat.load(); dhb1[(size_t)w] = d->wk(w).drain_heartbeat.load(); }
   const uint64_t now = now_ns();
 
   std::ostringstream js; js << std::fixed << std::setprecision(3);
@@ -10521,21 +10525,26 @@ static std::string wd_run_cmd(const char * cmd) {
   for (int w=0; w<d->n_workers; ++w) {
     auto & wk = d->wk(w);
     const bool spinning = hb1[(size_t)w] != hb0[(size_t)w];
+    const bool drain_spinning = dhb1[(size_t)w] != dhb0[(size_t)w];
     js << "    {\"worker\": " << w << ", \"device_id\": " << wk.device_id.load()
        << ", \"phase\": \"" << watch_phase_name(wk.phase.load()) << "\""
        << ", \"heartbeat\": " << hb1[(size_t)w]
        << ", \"delta_500ms\": " << (hb1[(size_t)w] - hb0[(size_t)w])
-       << ", \"state\": \"" << (spinning ? "SPINNING" : "BLOCKED") << "\", \"streams\": [";
+       << ", \"state\": \"" << (spinning ? "SPINNING" : "BLOCKED") << "\""
+       << ", \"drain_phase\": \"" << watch_phase_name(wk.drain_phase.load()) << "\""
+       << ", \"drain_heartbeat\": " << dhb1[(size_t)w]
+       << ", \"drain_delta_500ms\": " << (dhb1[(size_t)w] - dhb0[(size_t)w])
+       << ", \"drain_state\": \"" << (drain_spinning ? "SPINNING" : "BLOCKED") << "\", \"streams\": [";
     for (int s=0; s<d->streams_per; ++s) {
       auto & x = d->st(w,s);
-      const double q_age = x.last_query_ns.load() ? double(now - x.last_query_ns.load())/1e9 : -1.0;
+      const double q_age = x.last_sync_ns.load() ? double(now - x.last_sync_ns.load())/1e9 : -1.0;
       const double busy_age = (x.busy.load() && x.busy_since_ns.load()) ? double(now - x.busy_since_ns.load())/1e9 : -1.0;
       js << (s ? ", " : "") << "{\"s\": " << s << ", \"busy\": " << (x.busy.load()?"true":"false")
          << ", \"busy_seconds\": " << busy_age
          << ", \"seq_lo\": " << x.seq_lo.load() << ", \"seq_hi\": " << x.seq_hi.load()
          << ", \"filled\": " << x.filled.load()
-         << ", \"last_cuda_query\": " << x.last_query.load()
-         << ", \"last_query_age_seconds\": " << q_age << "}";
+         << ", \"last_event_sync\": " << x.last_sync.load()
+         << ", \"last_sync_age_seconds\": " << q_age << "}";
     }
     js << "]}" << (w+1<d->n_workers ? "," : "") << "\n";
   }
@@ -10607,6 +10616,174 @@ static void watchdog_loop(std::atomic<bool> * done, int timeout_secs) {
   }
 }
 
+// Drain one completed batch (runs on the per-device DRAIN thread): read back
+// statuses and compressed sizes, run the verify check, copy each frame D2H,
+// stitch on the content checksum, deliver to the ResultStore, and record all
+// perf/stats/tuner state.  The caller has already synchronized on ev_done.
+// Throws on any CUDA/nvCOMP/verify failure — the caller routes that into the
+// GPU-abort protocol.  This replaces the async-poll and sync-drain twins of
+// the old poll-loop design (whose perf recording had to be kept in sync by
+// hand); there is exactly one completion path now.
+static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
+                            const Options & opt,
+                            ResultStore * results, DevStats * devstats,
+                            HybridSched * sched, SharedTuneState * shared_tune,
+                            RateMatchState * rate_match, FrameThrottle * bp,
+                            std::atomic<double> * util_scale)
+{
+  uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
+  checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses)");
+  checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes)");
+  gpu_verify_check(C, opt);
+  // Measure per-phase timing from CUDA events
+  float h2d_ms = 0, comp_ms = 0;
+  cudaEventElapsedTime(&h2d_ms,  C.ev_h2d_begin, C.ev_h2d_end);
+  cudaEventElapsedTime(&comp_ms, C.ev_h2d_end,   C.ev_comp_end);
+
+  if (g_perf) {
+    g_perf->h2d_ns.fetch_add(uint64_t(h2d_ms * 1e6));
+    g_perf->h2d_count.fetch_add(1);
+    g_perf->kernel_ns.fetch_add(uint64_t(comp_ms * 1e6));
+    g_perf->kernel_count.fetch_add(1);
+  }
+
+  uint64_t in_sum = 0, out_sum = 0;
+  for (size_t i=0;i<C.filled;++i) {
+    if (C.h_stats[i] != nvcompSuccess) throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
+    const size_t csz = C.h_comp_sizes[i]; out_sum += csz; in_sum += C.h_in_sizes[i];
+    auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
+    const void * d_src = static_cast<char*>(C.d_out_base)
+                         + i * C.max_out_chunk;
+    if (C.h2d_pinned_base) {
+      // Reuse the H2D pinned slot for D2H — input was already
+      // consumed by the GPU, slot is free until next batch's pop.
+      void * pin_slot = static_cast<char*>(C.h2d_pinned_base)
+                        + i * C.h_io_slot_bytes;
+      checkCuda(cudaMemcpy(pin_slot, d_src, csz,
+                           cudaMemcpyDeviceToHost),
+                "cudaMemcpy(D2H pinned shared slot)");
+      // assign() copies straight from the pinned slot — no resize() zero-fill
+      // (the copy would immediately overwrite it anyway).
+      h_out->assign(static_cast<char*>(pin_slot),
+                    static_cast<char*>(pin_slot) + csz);
+    } else {
+      h_out->resize(csz);  // direct D2H needs the dst pre-sized
+      checkCuda(cudaMemcpy(h_out->data(), d_src, csz,
+                           cudaMemcpyDeviceToHost),
+                "cudaMemcpy(D2H exact)");
+    }
+    gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
+    results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
+    C.delivered = i + 1;  // a mid-loop throw discards the run anyway; kept for parity
+    // Test hook: deterministically simulate a GPU fault after N frames
+    // (real illegal-access faults are intermittent) to exercise the
+    // CPU-only rebuild path.  Disabled unless GZSTD_DEBUG_FAIL_GPU_AFTER set.
+    if (g_debug_fail_gpu_after >= 0) {
+      static std::atomic<int64_t> dbg_delivered{0};
+      if (dbg_delivered.fetch_add(1) + 1 > g_debug_fail_gpu_after)
+        throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
+    }
+  }
+  double d2h_ms = (d2h_t0 > 0) ? double(now_ns() - d2h_t0) / 1e6 : 0.0;
+  double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
+  if (g_perf) {
+    g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
+    g_perf->d2h_bytes.fetch_add(out_sum);
+    g_perf->d2h_count.fetch_add(1);
+    g_perf->h2d_bytes.fetch_add(in_sum);
+    g_perf->gpu_batch_ns.fetch_add(uint64_t(tot_ms * 1e6));
+    g_perf->gpu_batch_count.fetch_add(1);
+  }
+  // Accumulate into per-device stats
+  {
+    std::lock_guard<std::mutex> lk(devstats->m);
+    devstats->h2d_ms  += h2d_ms;
+    devstats->comp_ms += comp_ms;
+    devstats->d2h_ms  += d2h_ms;
+    devstats->total_ms += tot_ms;
+    devstats->batches += 1;
+  }
+  #ifdef HAVE_NVCOMP
+  if (sched) sched->add_gpu_bytes(in_sum);
+  #endif
+  // Accumulate into per-stream stats
+  C.stats.h2d_ms   += h2d_ms;
+  C.stats.comp_ms  += comp_ms;
+  C.stats.d2h_ms   += d2h_ms;
+  C.stats.total_ms += tot_ms;
+  C.stats.in_bytes += in_sum;
+  C.stats.out_bytes += out_sum;
+  C.stats.batches  += 1;
+  C.stats.chunks   += C.filled;
+
+  // Report to shared auto-tuner
+  if (shared_tune && !shared_tune->locked.load()) {
+    shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
+    shared_tune->window_ns.fetch_add(uint64_t(tot_ms * 1e6), std::memory_order_relaxed);
+    shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (rate_match) {
+    rate_match->report_gpu(in_sum, uint64_t(tot_ms * 1e6));
+    rate_match->reset_cycle();
+    size_t avg_frame = (C.filled > 0) ? in_sum / C.filled : 16 * 1024 * 1024;
+    size_t batch_sz = shared_tune ? shared_tune->batch_size.load() : C.filled;
+    rate_match->update(batch_sz, avg_frame);
+  }
+
+  // -vv: batch completion line
+  if (opt.verbosity >= V_DEBUG) {
+    char in_s[32], out_s[32];
+    human_bytes(double(in_sum), in_s, sizeof(in_s));
+    human_bytes(double(out_sum), out_s, sizeof(out_s));
+    double thr_gib = (tot_ms > 0.0)
+                     ? double(in_sum) / (tot_ms / 1000.0) / 1e9 : 0.0;
+    std::ostringstream os;
+    os << "[GPU" << device_id << "/S" << C.stats.stream_index
+       << "] done batch=" << C.filled
+       << " in=" << in_s << " out=" << out_s
+       << " h2d=" << std::fixed << std::setprecision(2) << h2d_ms
+       << "ms comp=" << comp_ms
+       << "ms d2h=" << d2h_ms
+       << "ms tot=" << tot_ms
+       << "ms thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
+    vlog(V_DEBUG, opt, os.str() + "\n");
+  }
+
+  // Per-chunk trace at -vvv.
+  if (opt.verbosity >= V_TRACE) {
+    for (size_t i = 0; i < C.filled; ++i) {
+      char cs[32], ds[32];
+      // Input size from the saved per-chunk array, not C.batch[i].len():
+      // the host input buffer was moved out during processing, so its
+      // length now reads 0 (the seq metadata survives).
+      human_bytes(double(C.h_in_sizes[i]), ds, sizeof(ds));
+      human_bytes(double(C.h_comp_sizes[i]), cs, sizeof(cs));
+      std::ostringstream os;
+      os << "[GPU" << device_id << "/S" << C.stats.stream_index
+         << "] chunk seq=" << C.batch[i].seq
+         << " in=" << ds << " out=" << cs;
+      vlog(V_TRACE, opt, os.str() + "\n");
+    }
+  }
+
+  results->cv.notify_one();  // wake writer for batch
+#ifdef HAVE_NVML
+  // Utilization scaling for the worker's next intake (shared machine: a busy
+  // GPU takes a smaller batch).  Queried post-batch, same cadence as before.
+  {
+    nvmlDevice_t dev;
+    nvmlUtilization_t util;
+    if (nvmlDeviceGetHandleByIndex(device_id, &dev) == NVML_SUCCESS &&
+        nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
+      util_scale->store(std::max(0.05, (100.0 - util.gpu) / 100.0),
+                        std::memory_order_relaxed);
+    }
+  }
+#else
+  (void)util_scale;
+#endif
+}
+
 static void gpu_worker(
   int device_id,
   int slot_index,   // positional index into per_dev/json_sink arrays
@@ -10630,6 +10807,26 @@ static void gpu_worker(
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   void * vram_reserve = nullptr;
   size_t vram_reserve_bytes = 0;
+
+  // ---- Event-driven completion state (ROADMAP 1.10) ----
+  // Declared before the try so the catch block can retire the drain thread
+  // before freeing stream buffers.  idle_m guards StreamCtx::busy, the
+  // submitted FIFO, drain_closed and drain_err; idle_cv wakes the worker when
+  // a stream goes idle (or the drain thread errors); submit_cv wakes the drain
+  // thread when a batch is pushed (or the FIFO is closed).
+  std::mutex idle_m;
+  std::condition_variable idle_cv;
+  std::condition_variable submit_cv;
+  std::deque<StreamCtx*> submitted;     // in-flight streams, submit (= seq) order
+  bool drain_closed = false;
+  std::string drain_err;                // non-empty => drain thread aborted
+  std::atomic<double> util_scale{1.0};  // NVML batch scaling, written by drain
+  std::thread drainer;
+  auto close_drain_fifo = [&] {
+    { std::lock_guard<std::mutex> lk(idle_m); drain_closed = true; }
+    submit_cv.notify_all();
+  };
+
   try {
     uint64_t init_t0 = g_perf ? now_ns() : 0;
     // -vv init-phase breakdown: distinguish context creation (driver-bound,
@@ -10790,7 +10987,6 @@ static void gpu_worker(
       }
     }
 
-    bool producer_done_seen=false;
     if (g_perf) { uint64_t dt = now_ns() - init_t0; g_perf->cuda_init_sum_ns.fetch_add(dt); g_perf->cuda_init_count.fetch_add(1); uint64_t cur = g_perf->cuda_init_max_ns.load(); while (dt > cur && !g_perf->cuda_init_max_ns.compare_exchange_weak(cur, dt)); };
     if (opt.verbosity >= V_DEBUG) {
       std::ostringstream os;
@@ -10827,11 +11023,77 @@ static void gpu_worker(
       for (size_t s = 0; s < ctxs.size(); ++s)
         sched->register_gpu_stream();
     }
-    wd_dev(slot_index, device_id);   // diagnostic watchdog (temporary)
-    double util_scale = 1.0;  // utilization scaling for batch size
+    wd_dev(slot_index, device_id);   // diagnostic watchdog
+
+    // ---- DRAIN thread: the single completion path for this device ----
+    // Pops the submitted FIFO in order, parks in cudaEventSynchronize
+    // (BlockingSync = OS wait, no spin), then reads back + delivers via
+    // gpu_drain_batch and returns the stream to the worker's idle set.
+    // On any failure it runs the full abort protocol ITSELF (not just a
+    // flag): the worker may be blocked in queue/throttle waits that only
+    // set_done() can wake, and the producer/writer/CPU workers must see
+    // the abort no matter which thread died.
+    drainer = std::thread([&, device_id, slot_index] {
+      try {
+        checkCuda(cudaSetDevice(device_id), "cudaSetDevice(drain)");
+        for (;;) {
+          StreamCtx * C = nullptr;
+          {
+            std::unique_lock<std::mutex> lk(idle_m);
+            wd_drain_phase(slot_index, WatchPhase::DrainWait);
+            submit_cv.wait(lk, [&]{ return !submitted.empty() || drain_closed; });
+            if (submitted.empty()) break;   // closed and fully drained
+            C = submitted.front();
+            submitted.pop_front();
+          }
+          wd_drain_beat(slot_index);
+          wd_drain_phase(slot_index, WatchPhase::Drain);
+          cudaError_t st = cudaEventSynchronize(C->ev_done);
+          wd_sync(slot_index, (int)C->stats.stream_index, (int)st);
+          checkCuda(st, "cudaEventSynchronize(batch done)");
+          gpu_drain_batch(*C, device_id, slot_index, opt, results, devstats,
+                          sched, shared_tune, rate_match, bp, &util_scale);
+          wd_idle(slot_index, (int)C->stats.stream_index);
+          {
+            std::lock_guard<std::mutex> lk(idle_m);
+            C->busy = false;
+            C->filled = 0;
+            C->batch.clear();
+          }
+          idle_cv.notify_all();
+        }
+      } catch (const std::exception & e) {
+        // Abort protocol (mirrors the worker's catch, idempotent): discard
+        // the run, stop the producer, wake every blocked thread.
+        *any_gpu_failed = true;
+        g_gpu_failed_restart.store(true);
+        g_gpu_aborted.store(true);
+        {
+          std::lock_guard<std::mutex> lk(idle_m);
+          // No device prefix: the worker rethrows this into its catch, which
+          // prepends "[GPU<id>] " when it fills fatal_msg.
+          if (drain_err.empty())
+            drain_err = std::string("drain: ") + e.what();
+          drain_closed = true;
+        }
+        { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+        queue->set_done();
+        if (bp) bp->set_done();
+        idle_cv.notify_all();
+      }
+      wd_drain_phase(slot_index, WatchPhase::Exiting);
+    });
+
+    // Rethrow a drain-thread failure on the worker thread, into the same
+    // catch/abort path a worker-side CUDA error takes.
+    auto check_drain_err = [&] {
+      std::lock_guard<std::mutex> lk(idle_m);
+      if (!drain_err.empty()) throw std::runtime_error(drain_err);
+    };
+
     while (true) {
       wd_beat(slot_index);           // heartbeat: spinning vs blocked
-      bool submitted_any=false;
+      check_drain_err();
       // ---- Shared auto-tuner ----
       // All GPUs report throughput to SharedTuneState. Whichever worker
       // grabs the mutex first runs the tune logic for everyone.
@@ -11016,36 +11278,51 @@ static void gpu_worker(
         }
       }
 
-      // Submit batches
-      for (auto & C : ctxs) {
-        if (C.busy) { continue; }
-        // Fixed-share mode: GPU yields when CPU is below its target share.
-        // Skip this stream's pop attempt; the outer worker loop will retry.
-        // If the queue is already drained, propagate that so the worker can
-        // exit instead of spinning forever on the share check.
-        if (sched && !sched->should_gpu_take()) {
-          if (queue->drained()) { producer_done_seen = true; continue; }
+      // ---- 1) Acquire an idle stream ----
+      // Hold nothing while waiting: the drain thread returns streams here
+      // independently of intake, so this wait is always eventually fed (a
+      // submitted batch either completes or aborts the run).
+      StreamCtx * Cp = nullptr;
+      {
+        std::unique_lock<std::mutex> lk(idle_m);
+        wd_phase(slot_index, WatchPhase::StreamWait);
+        idle_cv.wait(lk, [&] {
+          if (!drain_err.empty()) return true;
+          for (auto & X : ctxs) if (!X.busy) return true;
+          return false;
+        });
+        if (!drain_err.empty()) throw std::runtime_error(drain_err);
+        for (auto & X : ctxs) if (!X.busy) { Cp = &X; break; }
+      }
+      StreamCtx & C = *Cp;
+
+      // ---- 2) Hybrid share check ----
+      // GPU yields while CPU is below its target share.  In-flight batches
+      // keep draining on the drain thread either way, so parking here is
+      // safe even with busy streams (the old single-thread loop could only
+      // park when everything was idle — its poll would have starved).
+      if (sched && !sched->should_gpu_take()) {
+        if (queue->drained()) break;
+        if (!sched->is_fixed_mode()) {
           // Adaptive tail yield (compress): CPUs are draining the rest.
           // Park on the queue CV until an event that could change the
           // decision: a pop shrinks the queue, the queue drains, or a
           // scheduler tick moves the EMAs.  No polling, no fixed sleeps.
-          // Only park when every stream is idle — with a batch in flight
-          // this loop must keep polling cudaStreamQuery, and the
-          // completion paths below already block appropriately.  (Fixed
-          // mode keeps its spin: the share check is designed to
-          // oscillate per-batch.  Adaptive decompress never declines.)
-          if (!sched->is_fixed_mode()) {
-            bool any_busy = false;
-            for (auto & X : ctxs) if (X.busy) { any_busy = true; break; }
-            if (!any_busy &&
-                !queue->wait_for_gpu_yield(
-                    [&](const TaskQueue::QueueState & qs) {
-                      return sched->should_gpu_take_at(qs.depth);
-                    }))
-              producer_done_seen = true;
-          }
-          continue;
+          if (!queue->wait_for_gpu_yield(
+                  [&](const TaskQueue::QueueState & qs) {
+                    return sched->should_gpu_take_at(qs.depth);
+                  }))
+            break;   // drained while parked
+        } else {
+          // Fixed mode keeps its spin: the share check is designed to
+          // oscillate per-batch.  (Adaptive decompress never declines.)
+          std::this_thread::yield();
         }
+        continue;
+      }
+
+      // ---- 3) Intake sizing + 4) pop ----
+      {
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
         // Greedy pop: wait for a full batch (per_stream_batch) or producer done.
@@ -11067,37 +11344,27 @@ static void gpu_worker(
         // permit, THEN acquire and non-blocking-pop.  A stream therefore never
         // sleeps while holding permits, so streams cannot sequester the whole
         // budget and wedge the in-order writer behind a head-of-line frame no one
-        // can pop.  This replaces the old acquire-then-blocking-pop plus its
-        // conditional full-batch-wait guard (which only covered pooled-reader +
-        // hybrid; tar / mmap / gpu-only slipped through and could deadlock).  The
-        // producer never touches the throttle, so a permit-free waiter is always
-        // eventually fed; the user's --gpu-batch is honored as the pop size when
-        // the queue can supply it, and silently capped when it can't.
-        // CRITICAL (v0.14.60): one thread serves all this device's streams, so it
-        // must NOT block in intake while ANOTHER of its streams has an in-flight
-        // batch to drain — a blocking wait here starves the completion poll below
-        // and wedges the in-order writer behind a finished-but-undrained batch
-        // (root cause of the hybrid hang captured by the watchdog: every worker
-        // BLOCKED in intake_wait_batch while busy streams held the head-of-line
-        // frames, throttle only ~14% used).  So: block only when nothing of ours
-        // is in flight; otherwise intake non-blockingly and fall through to poll.
-        bool self_busy = false;
-        for (auto & X : ctxs) if (X.busy) { self_busy = true; break; }
+        // can pop.  The producer never touches the throttle, so a permit-free
+        // waiter is always eventually fed; the user's --gpu-batch is honored as
+        // the pop size when the queue can supply it, and capped when it can't.
+        // Blocking here is ALWAYS safe now: completion runs on the drain thread,
+        // so an intake wait can no longer starve it (the v0.14.60 self-busy
+        // non-blocking special case is structurally obsolete).
         wd_phase(slot_index, WatchPhase::IntakeWait);
-        if (self_busy) {
-          // Non-blocking: take a batch only if one is ready AND permits are free
-          // right now; otherwise skip to the completion poll for our busy streams.
-          if (!queue->ready_for_batch_or_cap(pop_n)) continue;
-          wd_phase(slot_index, WatchPhase::IntakeAcquire);
-          if (bp && !bp->try_acquire((int)pop_n)) continue;
-        } else {
-          // Nothing of ours in flight → blocking is safe (no poll to starve).
-          if (!queue->wait_for_batch_or_cap(pop_n)) {   // no permit held while waiting
-            if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
-            producer_done_seen = true; continue;
+        if (!queue->wait_for_batch_or_cap(pop_n)) {   // no permit held while waiting
+          if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
+          break;   // drained: flush in-flight batches below and exit
+        }
+        wd_phase(slot_index, WatchPhase::IntakeAcquire);
+        if (bp) bp->acquire((int)pop_n);
+        // If the drain thread aborted while we slept, the queue and throttle
+        // were set_done and the waits fell through — don't feed a dead device.
+        {
+          std::lock_guard<std::mutex> lk(idle_m);
+          if (!drain_err.empty()) {
+            if (bp) bp->release((int)pop_n);
+            throw std::runtime_error(drain_err);
           }
-          wd_phase(slot_index, WatchPhase::IntakeAcquire);
-          if (bp) bp->acquire((int)pop_n);
         }
         if (sched) sched->gpu_wants_data();
         size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
@@ -11225,358 +11492,39 @@ static void gpu_worker(
                              C.filled, C.gpu_chunk, C.d_verify_mismatch, C.stream);
           cudaEventRecord(C.ev_d2h_end, C.stream);   // mark end of verify (for -v timing)
         }
-        C.busy = true; submitted_any = true;
+        // ---- 5) Hand the batch to the drain thread ----
+        // ev_done is ordered after everything this batch enqueued (H2D,
+        // kernel, verify chain); the drain thread parks on it and takes
+        // over readback + delivery from here.
+        checkCuda(cudaEventRecord(C.ev_done, C.stream), "cudaEventRecord(done)");
         wd_phase(slot_index, WatchPhase::Submit);
         wd_submit(slot_index, (int)C.stats.stream_index,
                   C.batch.front().seq, C.batch.back().seq, C.filled);
-      }
-
-      // ---- COMPLETION PATH 1: Async polling ----
-      // Non-blocking check if GPU stream has finished.  This path runs when
-      // we just submitted a new batch (submitted_any=true) and are checking
-      // if previous batches completed while we were submitting.
-      // NOTE: Must record to g_perf here  see also sync drain path below.
-      wd_phase(slot_index, WatchPhase::Poll);
-      for (auto & C : ctxs) {
-        if (!C.busy) { continue; }
-        cudaError_t q = cudaStreamQuery(C.stream);
-        wd_query(slot_index, (int)C.stats.stream_index, (int)q);
-        if (q == cudaSuccess) {
-          // Capture the D2H start for both the -vvv perf breakdown (g_perf) AND
-          // the -vv per-batch line below; otherwise d2h_t0 stays 0 and the
-          // `now_ns() - d2h_t0` below reports the whole monotonic clock as the
-          // D2H time.  (The sync-drain path sets it unconditionally; mirror that.)
-          uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
-          checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses)");
-          checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes)");
-          gpu_verify_check(C, opt);
-          // Measure per-phase timing from CUDA events
-          float h2d_ms = 0, comp_ms = 0;
-          cudaEventElapsedTime(&h2d_ms,  C.ev_h2d_begin, C.ev_h2d_end);
-          cudaEventElapsedTime(&comp_ms, C.ev_h2d_end,   C.ev_comp_end);
-
-          if (g_perf) {
-            g_perf->h2d_ns.fetch_add(uint64_t(h2d_ms * 1e6));
-            g_perf->h2d_count.fetch_add(1);
-            g_perf->kernel_ns.fetch_add(uint64_t(comp_ms * 1e6));
-            g_perf->kernel_count.fetch_add(1);
-          }
-
-          uint64_t in_sum = 0, out_sum = 0;
-          for (size_t i=0;i<C.filled;++i) {
-            if (C.h_stats[i] != nvcompSuccess) throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
-            const size_t csz = C.h_comp_sizes[i]; out_sum += csz; in_sum += C.h_in_sizes[i];
-            auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
-            const void * d_src = static_cast<char*>(C.d_out_base)
-                                 + i * C.max_out_chunk;
-            if (C.h2d_pinned_base) {
-              // Reuse the H2D pinned slot for D2H — input was already
-              // consumed by the GPU, slot is free until next batch's pop.
-              void * pin_slot = static_cast<char*>(C.h2d_pinned_base)
-                                + i * C.h_io_slot_bytes;
-              checkCuda(cudaMemcpy(pin_slot, d_src, csz,
-                                   cudaMemcpyDeviceToHost),
-                        "cudaMemcpy(D2H pinned shared slot)");
-              // assign() copies straight from the pinned slot — no resize() zero-fill
-              // (the copy would immediately overwrite it anyway).
-              h_out->assign(static_cast<char*>(pin_slot),
-                            static_cast<char*>(pin_slot) + csz);
-            } else {
-              h_out->resize(csz);  // direct D2H needs the dst pre-sized
-              checkCuda(cudaMemcpy(h_out->data(), d_src, csz,
-                                   cudaMemcpyDeviceToHost),
-                        "cudaMemcpy(D2H exact)");
-            }
-            gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
-            results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
-            C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
-            // Test hook: deterministically simulate a GPU fault after N frames
-            // (real illegal-access faults are intermittent) to exercise the
-            // CPU-only rebuild path.  Disabled unless GZSTD_DEBUG_FAIL_GPU_AFTER set.
-            if (g_debug_fail_gpu_after >= 0) {
-              static std::atomic<int64_t> dbg_delivered{0};
-              if (dbg_delivered.fetch_add(1) + 1 > g_debug_fail_gpu_after)
-                throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
-            }
-          }
-          double d2h_ms = (d2h_t0 > 0) ? double(now_ns() - d2h_t0) / 1e6 : 0.0;
-          double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
-          if (g_perf) {
-            g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
-            g_perf->d2h_bytes.fetch_add(out_sum);
-            g_perf->d2h_count.fetch_add(1);
-            g_perf->h2d_bytes.fetch_add(in_sum);
-            g_perf->gpu_batch_ns.fetch_add(uint64_t(tot_ms * 1e6));
-            g_perf->gpu_batch_count.fetch_add(1);
-          }
-          // Accumulate into per-device stats
-          {
-            std::lock_guard<std::mutex> lk(devstats->m);
-            devstats->h2d_ms  += h2d_ms;
-            devstats->comp_ms += comp_ms;
-            devstats->d2h_ms  += d2h_ms;
-            devstats->total_ms += tot_ms;
-            devstats->batches += 1;
-          }
-          #ifdef HAVE_NVCOMP
-          if (sched) sched->add_gpu_bytes(in_sum);
-          #endif
-          // Accumulate into per-stream stats
-          C.stats.h2d_ms   += h2d_ms;
-          C.stats.comp_ms  += comp_ms;
-          C.stats.d2h_ms   += d2h_ms;
-          C.stats.total_ms += tot_ms;
-          C.stats.in_bytes += in_sum;
-          C.stats.out_bytes += out_sum;
-          C.stats.batches  += 1;
-          C.stats.chunks   += C.filled;
-
-          // Report to shared auto-tuner (both completion paths)
-          if (shared_tune && !shared_tune->locked.load()) {
-            shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
-            shared_tune->window_ns.fetch_add(uint64_t(tot_ms * 1e6), std::memory_order_relaxed);
-            shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
-          }
-          if (rate_match) {
-            rate_match->report_gpu(in_sum, uint64_t(tot_ms * 1e6));
-            rate_match->reset_cycle();
-            size_t avg_frame = (C.filled > 0) ? in_sum / C.filled : 16 * 1024 * 1024;
-            size_t batch_sz = shared_tune ? shared_tune->batch_size.load() : C.filled;
-            rate_match->update(batch_sz, avg_frame);
-          }
-
-          // -vv: batch completion line
-          if (opt.verbosity >= V_DEBUG) {
-            char in_s[32], out_s[32];
-            human_bytes(double(in_sum), in_s, sizeof(in_s));
-            human_bytes(double(out_sum), out_s, sizeof(out_s));
-            double thr_gib = (tot_ms > 0.0)
-                             ? double(in_sum) / (tot_ms / 1000.0) / 1e9 : 0.0;
-            std::ostringstream os;
-            os << "[GPU" << device_id << "/S" << C.stats.stream_index
-               << "] done batch=" << C.filled
-               << " in=" << in_s << " out=" << out_s
-               << " h2d=" << std::fixed << std::setprecision(2) << h2d_ms
-               << "ms comp=" << comp_ms
-               << "ms d2h=" << d2h_ms
-               << "ms tot=" << tot_ms
-               << "ms thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
-            vlog(V_DEBUG, opt, os.str() + "\n");
-          }
-
-          // Per-chunk trace at -vvv (compress async-poll path).
-          if (opt.verbosity >= V_TRACE) {
-            for (size_t i = 0; i < C.filled; ++i) {
-              char cs[32], ds[32];
-              // Input size from the saved per-chunk array, not C.batch[i].len():
-              // the host input buffer was moved out during processing, so its
-              // length now reads 0 (the seq metadata survives).
-              human_bytes(double(C.h_in_sizes[i]), ds, sizeof(ds));
-              human_bytes(double(C.h_comp_sizes[i]), cs, sizeof(cs));
-              std::ostringstream os;
-              os << "[GPU" << device_id << "/S" << C.stats.stream_index
-                 << "] chunk seq=" << C.batch[i].seq
-                 << " in=" << ds << " out=" << cs;
-              vlog(V_TRACE, opt, os.str() + "\n");
-            }
-          }
-
-          wd_idle(slot_index, (int)C.stats.stream_index);
-          C.busy = false;
-          C.filled = 0;
-          C.batch.clear();
-          results->cv.notify_one();  // wake writer for batch
-#ifdef HAVE_NVML
-          {
-            nvmlDevice_t dev;
-            nvmlUtilization_t util;
-            if (nvmlDeviceGetHandleByIndex(device_id, &dev) == NVML_SUCCESS &&
-                nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
-              util_scale = std::max(0.05, (100.0 - util.gpu) / 100.0);
-            }
-          }
-#endif
-        } else if (q != cudaErrorNotReady) { checkCuda(q, "cudaStreamQuery"); }
-      }
-
-      // If producer is done and all streams are idle, this device is finished
-      if (producer_done_seen) {
-        bool all_idle = true;
-        for (auto & C : ctxs) {
-          if (C.busy) { all_idle = false; break; }
+        {
+          std::lock_guard<std::mutex> lk(idle_m);
+          C.busy = true;
+          submitted.push_back(&C);
         }
-        if (all_idle) break;
-      }
-      // ---- COMPLETION PATH 2: Synchronous drain ----
-      // When no new batch was submitted (queue empty or producer done),
-      // block on busy streams instead of spin-polling.  This is the
-      // primary completion path when batch sizes are small (N=1) or the
-      // queue drains faster than GPU processes.
-      // NOTE: Must record to g_perf here  see also async poll path above.
-      //       If you add perf instrumentation to one path, ADD IT TO BOTH.
-      if (!submitted_any) {
-        bool blocked=false;
-        for (auto & C: ctxs) {
-          if (!C.busy) { continue; }
-          checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize");
-          checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses sync)");
-          checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes sync)");
-          gpu_verify_check(C, opt);
-          // Measure per-phase timing (synchronous path)
-          float h2d_ms = 0, comp_ms = 0;
-          cudaEventElapsedTime(&h2d_ms,  C.ev_h2d_begin, C.ev_h2d_end);
-          cudaEventElapsedTime(&comp_ms, C.ev_h2d_end,   C.ev_comp_end);
-          if (g_perf) {
-            g_perf->h2d_ns.fetch_add(uint64_t(h2d_ms * 1e6));
-            g_perf->h2d_count.fetch_add(1);
-            g_perf->kernel_ns.fetch_add(uint64_t(comp_ms * 1e6));
-            g_perf->kernel_count.fetch_add(1);
-          }
-          uint64_t in_sum = 0, out_sum = 0;
-          for (size_t i = 0; i < C.filled; ++i) {
-            in_sum  += C.h_in_sizes[i];
-            out_sum += C.h_comp_sizes[i];
-          }
-          uint64_t d2h_t0 = now_ns();
-          for (size_t i = 0; i < C.filled; ++i) {
-            // Per-chunk status check — the async-poll path always had this,
-            // the sync drain was missing it: a failed chunk's comp_size is
-            // garbage, so delivering it silently corrupted output (v0.13.54).
-            if (C.h_stats[i] != nvcompSuccess)
-              throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
-            const size_t csz = C.h_comp_sizes[i];
-            auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
-            const void * d_src = static_cast<char*>(C.d_out_base) + i * C.max_out_chunk;
-            if (C.h2d_pinned_base) {
-              // Reuse the H2D pinned slot for D2H (sync drain path).
-              void * pin_slot = static_cast<char*>(C.h2d_pinned_base)
-                                + i * C.h_io_slot_bytes;
-              checkCuda(cudaMemcpy(pin_slot, d_src, csz, cudaMemcpyDeviceToHost),
-                        "cudaMemcpy(D2H pinned shared slot sync)");
-              // assign() copies straight from the pinned slot — no resize() zero-fill.
-              h_out->assign(static_cast<char*>(pin_slot),
-                            static_cast<char*>(pin_slot) + csz);
-            } else {
-              h_out->resize(csz);  // direct D2H needs the dst pre-sized
-              checkCuda(cudaMemcpy(h_out->data(), d_src, csz, cudaMemcpyDeviceToHost),
-                        "cudaMemcpy(D2H exact sync)");
-            }
-            gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
-            results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
-            C.delivered = i + 1;  // a mid-loop throw rescues only [delivered..)
-            // Test hook: deterministically simulate a GPU fault after N frames
-            // (real illegal-access faults are intermittent) to exercise the
-            // CPU-only rebuild path.  Disabled unless GZSTD_DEBUG_FAIL_GPU_AFTER set.
-            if (g_debug_fail_gpu_after >= 0) {
-              static std::atomic<int64_t> dbg_delivered{0};
-              if (dbg_delivered.fetch_add(1) + 1 > g_debug_fail_gpu_after)
-                throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
-            }
-          }
-          double d2h_ms = double(now_ns() - d2h_t0) / 1e6;
-          if (g_perf) {
-            g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
-          }
-          double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
-          {
-            std::lock_guard<std::mutex> lk(devstats->m);
-            devstats->h2d_ms  += h2d_ms;
-            devstats->comp_ms += comp_ms;
-            devstats->d2h_ms  += d2h_ms;
-            devstats->total_ms += tot_ms;
-            devstats->batches += 1;
-          }
-          #ifdef HAVE_NVCOMP
-          if (sched) sched->add_gpu_bytes(in_sum);
-          #endif
-          if (g_perf) {
-            g_perf->d2h_bytes.fetch_add(out_sum);
-            g_perf->d2h_count.fetch_add(1);
-            g_perf->h2d_bytes.fetch_add(in_sum);
-            g_perf->gpu_batch_ns.fetch_add(uint64_t(tot_ms * 1e6));
-            g_perf->gpu_batch_count.fetch_add(1);
-          }
-          // Accumulate per-stream stats (synchronous path)
-          C.stats.h2d_ms   += h2d_ms;
-          C.stats.comp_ms  += comp_ms;
-          C.stats.d2h_ms   += d2h_ms;
-          C.stats.total_ms += tot_ms;
-          C.stats.in_bytes += in_sum;
-          C.stats.out_bytes += out_sum;
-          C.stats.batches  += 1;
-          C.stats.chunks   += C.filled;
-
-          // Report to shared auto-tuner (sync path)
-          if (shared_tune && !shared_tune->locked.load()) {
-            shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
-            shared_tune->window_ns.fetch_add(uint64_t(tot_ms * 1e6), std::memory_order_relaxed);
-            shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
-          }
-          if (rate_match) {
-            rate_match->report_gpu(in_sum, uint64_t(tot_ms * 1e6));
-            rate_match->reset_cycle();
-            size_t avg_frame = (C.filled > 0) ? in_sum / C.filled : 16 * 1024 * 1024;
-            size_t batch_sz = shared_tune ? shared_tune->batch_size.load() : C.filled;
-            rate_match->update(batch_sz, avg_frame);
-          }
-
-          if (opt.verbosity >= V_DEBUG) {
-            char in_s[32], out_s[32];
-            human_bytes(double(in_sum), in_s, sizeof(in_s));
-            human_bytes(double(out_sum), out_s, sizeof(out_s));
-            double thr_gib = (tot_ms > 0.0)
-                             ? double(in_sum) / (tot_ms / 1000.0) / 1e9 : 0.0;
-            std::ostringstream os;
-            os << "[GPU" << device_id << "/S" << C.stats.stream_index
-               << "] done batch=" << C.filled
-               << " in=" << in_s << " out=" << out_s
-               << " h2d=" << std::fixed << std::setprecision(2) << h2d_ms
-               << "ms comp=" << comp_ms
-               << "ms d2h=" << d2h_ms
-               << "ms tot=" << tot_ms
-               << "ms thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s";
-            vlog(V_DEBUG, opt, os.str() + "\n");
-          }
-
-          // Per-chunk trace at -vvv (compress sync-drain path).
-          if (opt.verbosity >= V_TRACE) {
-            for (size_t i = 0; i < C.filled; ++i) {
-              char cs[32], ds[32];
-              // Input size from the saved per-chunk array, not C.batch[i].len():
-              // the host input buffer was moved out during processing, so its
-              // length now reads 0 (the seq metadata survives).
-              human_bytes(double(C.h_in_sizes[i]), ds, sizeof(ds));
-              human_bytes(double(C.h_comp_sizes[i]), cs, sizeof(cs));
-              std::ostringstream os;
-              os << "[GPU" << device_id << "/S" << C.stats.stream_index
-                 << "] chunk seq=" << C.batch[i].seq
-                 << " in=" << ds << " out=" << cs;
-              vlog(V_TRACE, opt, os.str() + "\n");
-            }
-          }
-
-          wd_idle(slot_index, (int)C.stats.stream_index);
-          C.busy = false;
-          C.filled = 0;
-          C.batch.clear();
-          results->cv.notify_one();  // wake writer for batch
-#ifdef HAVE_NVML
-          {
-            nvmlDevice_t dev;
-            nvmlUtilization_t util;
-            if (nvmlDeviceGetHandleByIndex(device_id, &dev) == NVML_SUCCESS &&
-                nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
-              util_scale = std::max(0.05, (100.0 - util.gpu) / 100.0);
-            }
-          }
-#endif
-          blocked = true;
-          break;
-        }
-        if (!blocked)
-          std::this_thread::yield();
+        submit_cv.notify_one();
       }
     }
+
+    // Producer drained (or the scheduler retired us): all remaining work is
+    // the drain thread's.  Wait for the in-flight batches to finish, then
+    // close the FIFO and join.
+    {
+      std::unique_lock<std::mutex> lk(idle_m);
+      wd_phase(slot_index, WatchPhase::StreamWait);
+      idle_cv.wait(lk, [&] {
+        if (!drain_err.empty()) return true;
+        for (auto & X : ctxs) if (X.busy) return false;
+        return true;
+      });
+      if (!drain_err.empty()) throw std::runtime_error(drain_err);
+    }
+    close_drain_fifo();
+    drainer.join();
+    wd_phase(slot_index, WatchPhase::Exiting);
 
     // Export per-stream stats for JSON output
     if (json_sink) {
@@ -11635,6 +11583,14 @@ static void gpu_worker(
     g_gpu_aborted.store(true);
     *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
     (void)gpu_failures; (void)gpu_worker_count;   // no longer needed on the abort path
+
+    // Retire the drain thread BEFORE touching the stream contexts below.  With
+    // g_gpu_aborted set, its blocking points all resolve: acquire_out_buf
+    // returns immediately, a wedged cudaEventSynchronize surfaces the device
+    // error, and closing the FIFO wakes its pop wait.  (If the drain thread
+    // is the one that threw, it already ran this protocol and exited.)
+    close_drain_fifo();
+    if (drainer.joinable()) drainer.join();
 
     try {
       if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
@@ -12458,7 +12414,6 @@ static void gpu_decomp_worker(
     cudaStream_t stream{};
     cudaEvent_t ev_begin{}, ev_end{};
     std::vector<Task> batch;
-    bool busy = false;
     size_t filled = 0;
     size_t delivered = 0;   // frames of the current batch already pushed to ResultStore
                             // (lets the failure path re-enqueue only the undelivered tail)
@@ -12932,28 +12887,25 @@ static void gpu_decomp_worker(
         }
       }
 
-      // Submit batches
+      // Submit batches.  Each batch is processed to completion inline (H2D →
+      // kernel → sync → D2H → deliver), so no stream is ever left in flight
+      // between iterations — waits below can always block safely.  (The old
+      // `busy` bookkeeping copied from compress was write-only-false here and
+      // guarded states that cannot occur; removed v0.14.71.)
       for (auto & C : ctxs) {
-        if (C.busy) continue;
         // Fixed-share mode: GPU yields when CPU is below its target share.
         // If the queue is already drained, propagate that so the worker can
         // exit instead of spinning forever on the share check.
         if (sched && !sched->should_gpu_take()) {
           if (queue->drained()) { producer_done_seen = true; continue; }
-          // Adaptive tail yield (compress): CPUs are draining the rest.
+          // Adaptive tail yield (decompress): CPUs are draining the rest.
           // Park on the queue CV until an event that could change the
           // decision: a pop shrinks the queue, the queue drains, or a
           // scheduler tick moves the EMAs.  No polling, no fixed sleeps.
-          // Only park when every stream is idle — with a batch in flight
-          // this loop must keep polling cudaStreamQuery, and the
-          // completion paths below already block appropriately.  (Fixed
-          // mode keeps its spin: the share check is designed to
+          // (Fixed mode keeps its spin: the share check is designed to
           // oscillate per-batch.  Adaptive decompress never declines.)
           if (!sched->is_fixed_mode()) {
-            bool any_busy = false;
-            for (auto & X : ctxs) if (X.busy) { any_busy = true; break; }
-            if (!any_busy &&
-                !queue->wait_for_gpu_yield(
+            if (!queue->wait_for_gpu_yield(
                     [&](const TaskQueue::QueueState & qs) {
                       return sched->should_gpu_take_at(qs.depth);
                     }))
@@ -12985,23 +12937,14 @@ static void gpu_decomp_worker(
         // never touches the throttle, so a permit-free waiter is always fed; the
         // user's --gpu-batch is the pop size when the queue can supply it, capped
         // when it can't — so the old gpu-only soft-min special case is gone.
-        // See compress: never BLOCK in intake while another of this device's
-        // streams has an in-flight batch to drain (the one thread would starve
-        // its own completion poll and wedge the in-order writer).  Block only
-        // when nothing of ours is in flight; else intake non-blockingly and poll.
-        bool self_busy = false;
-        for (auto & X : ctxs) if (X.busy) { self_busy = true; break; }
-        if (self_busy) {
-          if (!queue->ready_for_batch_or_cap(pop_n)) continue;
-          if (bp && !bp->try_acquire((int)pop_n)) continue;
-        } else {
-          if (!queue->wait_for_batch_or_cap(pop_n)) {
-            if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
-            producer_done_seen = true;
-            continue;
-          }
-          if (bp) bp->acquire((int)pop_n);        // safe to block: nothing to poll
+        // Blocking is safe: batches complete inline, so nothing of ours is
+        // ever in flight when we reach intake.
+        if (!queue->wait_for_batch_or_cap(pop_n)) {
+          if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
+          producer_done_seen = true;
+          continue;
         }
+        if (bp) bp->acquire((int)pop_n);
         if (sched) sched->gpu_wants_data();
         size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
         if (sched) sched->gpu_got_data();
@@ -13393,7 +13336,6 @@ static void gpu_decomp_worker(
         }
 
         // Buffers are reused  no per-batch free needed
-        C.busy = false;
         C.filled = 0;
         C.batch.clear();
         submitted_any = true;
@@ -13425,13 +13367,8 @@ static void gpu_decomp_worker(
         break;
       }
 
-      // Check termination
-      if (producer_done_seen) {
-        bool all_idle = true;
-        for (auto & C : ctxs)
-          if (C.busy) { all_idle = false; break; }
-        if (all_idle) break;
-      }
+      // Check termination (no in-flight check needed: batches complete inline)
+      if (producer_done_seen) break;
       if (!submitted_any) std::this_thread::yield();
     }
 

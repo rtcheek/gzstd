@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=257
-$EXTENSIVE && EXPECTED_TESTS=355
+EXPECTED_TESTS=268
+$EXTENSIVE && EXPECTED_TESTS=366
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================

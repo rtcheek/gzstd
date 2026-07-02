@@ -1,11 +1,83 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.69  
+**Covers:** v0.9.50 → v0.14.71  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.71 — remove dead `busy` machinery from the decompress GPU worker; test-count constants
+
+Cleanup fallout from v0.14.70's analysis.  The decompress GPU worker's `busy` flag was
+**write-only false**: every batch completes inline (H2D → kernel → sync → D2H → deliver)
+within one loop iteration, so no stream is ever in flight at intake time.  The flag and
+everything guarding on it were dead code inherited from the compress worker's old poll
+design:
+
+- `DecompStreamCtx::busy`, the `if (C.busy) continue` skip, the `any_busy` tail-yield
+  guard, the `self_busy` non-blocking intake branch, and the `all_idle` termination scan
+  are deleted; decompress intake now always uses the blocking permit-free wait (which is
+  what actually executed all along).
+- `TaskQueue::ready_for_batch_or_cap` and `FrameThrottle::try_acquire` had exactly one
+  caller each — that dead branch — and are deleted with it.  No behavior change; the
+  compiled hot path is identical to what really ran before.
+- `gzstd-test.sh`: EXPECTED_TESTS drift-check constants updated (257 → 268 default,
+  355 → 366 extensive) — the suite had grown 11 tests since the constants were last bumped.
+
+## v0.14.70 — event-driven GPU completion (ROADMAP 1.10): drain thread replaces the poll loop
+
+The compress GPU worker's completion poll (`cudaStreamQuery` + yield, plus the
+synchronous-drain fallback) is gone.  Each device now runs TWO threads:
+
+- **Worker (intake/submit):** waits for an idle stream, pops a batch (wait
+  without permits → acquire → non-blocking pop, unchanged v0.14.58 invariant),
+  submits H2D + kernel (+ in-VRAM verify), records a new per-stream `ev_done`
+  event (`cudaEventBlockingSync`), and pushes the stream onto a FIFO.
+- **Drain:** pops the FIFO in submit order, parks in
+  `cudaEventSynchronize(ev_done)` — an OS-level block, not a spin — then does
+  readback + delivery (`gpu_drain_batch`) and returns the stream to the idle set.
+
+Why this shape:
+
+- **No spin anywhere.**  Every wait is a CV or a blocking-sync CUDA event.  The
+  poll loop and its `yield()` are deleted.
+- **The v0.14.60 starvation class is structurally gone.**  Blocking in intake
+  cannot starve completion because completion runs on its own thread; the
+  self-busy non-blocking intake special case is deleted with it.
+- **FIFO drain is writer-optimal and strengthens the deadlock-freedom
+  argument:** submit order is pop order is seq order, so the in-order writer's
+  head-of-line frame is always at the front of some device's drain FIFO.
+- **One completion path.**  The async-poll and sync-drain twins (whose perf
+  recording had to be kept in sync by hand) collapse into `gpu_drain_batch`.
+- **Events, not host callbacks:** `cudaLaunchHostFunc` is documented to NOT run
+  when the batch faults — every GPU fault would become a hang.  A drain thread
+  synchronizing on the event sees the error and routes it to the abort path.
+- **Intake and D2H readback now overlap** (they serialized on one thread before).
+
+Error handling: the drain thread runs the full abort protocol itself (raise
+`g_gpu_aborted`, `set_done` the queue and throttle, wake the writer) so a worker
+blocked in intake always wakes; the worker rethrows the drain error into its
+existing catch, which joins the drain thread before freeing stream buffers.
+Two hardening fixes that fell out of the analysis: `wait_for_gpu_yield` now
+bails on `g_gpu_aborted` (a parked worker could previously sleep through an
+abort forever since CPU workers exit without draining the queue), and
+`StreamCtx::acquire_out_buf` returns immediately on abort instead of waiting
+for writer drains that will never come.
+
+Watchdog: worker phases gain `wait_idle_stream`; the drain thread heartbeats
+separately (`drain_phase`/`drain_heartbeat`/`drain_state` in the dump), and the
+per-stream `last_cuda_query` field is now `last_event_sync`.
+
+Decompress is untouched: its GPU worker synchronizes inline per batch (required
+by `GetTempSizeSync`) and has no poll loop to replace.
+
+Verified on the workstation: 20 GiB round-trips byte-identical across
+gpu-only/hybrid/cpu-only; pinned `--gpu-batch`/`--gpu-streams` deadlock shapes
+clean under `--watchdog`; simulated GPU fault (`GZSTD_DEBUG_FAIL_GPU_AFTER`,
+which now throws on the drain thread) still aborts + rebuilds CPU-only,
+byte-identical.  (`--verify-engine=gpu` cannot initialize on the 11 GiB
+workstation cards — pre-existing VRAM limit, confirmed identical on v0.14.69.)
 
 ## v0.14.69 — `--watchdog=SECS`; strip the now-obsolete test hooks
 
