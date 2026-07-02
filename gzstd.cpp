@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.73";
+static constexpr const char * GZSTD_VERSION = "0.14.74";
 //
 // Architecture overview:
 //
@@ -4414,6 +4414,22 @@ private:
 // pattern).  Used for both `-t --tar` (validate) and `-d --tar` (extract).
 static FrameSink * g_tar_decomp_sink = nullptr;
 
+// Sink budget for that hand-off.  CPU decompress delivers frames near-
+// continuously, so a small buffer suffices.  GPU/hybrid completion is BATCH-
+// granular: a multi-GiB wave lands at once, then nothing arrives while the
+// next in-order batch finishes — with a 256 MiB sink the consumer drained dry
+// in those gaps and the extract writer pool sat starved (~9% of an extract-
+// bound gpu-only run vs ~1% cpu-only).  Budget roughly one completion wave,
+// clamped to a quarter of available RAM for small boxes.  The deque only
+// holds frames when the consumer lags, so an unused budget costs nothing.
+static size_t tar_sink_budget(const Options & opt) {
+  if (opt.cpu_only) return 256 * ONE_MIB;
+  uint64_t avail = get_available_ram_bytes();
+  uint64_t cap = avail ? avail / 4 : 4096ull * ONE_MIB;
+  return (size_t)std::min<uint64_t>(4096ull * ONE_MIB,
+                                    std::max<uint64_t>(256 * ONE_MIB, cap));
+}
+
 // End-of-run throttle stats; one line at V_DEBUG.  Shows how often producers
 // actually waited (saturation indicator) and peak in-flight frames vs budget.
 static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
@@ -5435,11 +5451,13 @@ public:
   void set_gpu_ready(int device_id = -1) {
     gpu_ready_.store(true, std::memory_order_release);
     if (queue_) queue_->notify_cpu_waiters();  // wake CPUs to re-evaluate
-    if (opt_.verbosity >= V_VERBOSE) {
+    // Per-device line demoted to -vv: "[GPU] N device(s) online" already says
+    // it at -v, and 8 of these drown the interesting startup lines.
+    if (opt_.verbosity >= V_DEBUG) {
       if (device_id >= 0)
-        vlog(V_VERBOSE, opt_, "[GPU" + std::to_string(device_id) + "] ready, semaphore scheduling active\n");
+        vlog(V_DEBUG, opt_, "[GPU" + std::to_string(device_id) + "] ready, semaphore scheduling active\n");
       else
-        vlog(V_VERBOSE, opt_, "[GPU] ready, semaphore scheduling active\n");
+        vlog(V_DEBUG, opt_, "[GPU] ready, semaphore scheduling active\n");
     }
   }
 
@@ -9914,6 +9932,18 @@ struct SharedTuneState {
   std::atomic<bool> frozen{false};
   static constexpr double SINK_FREEZE_BUSY = 0.55; // writer-busy frac ⇒ sink-bound
   static constexpr double FREEZE_MIN_SEC   = 3.0;  // ignore writer ramp-up before this
+  // Freeze clamps the batch DOWN, not just in place: sink-limited means GPU
+  // throughput has headroom, and batch size sets the COMPLETION GRANULARITY —
+  // a 256-frame batch lands 4 GiB of frames at once, and the in-order writer
+  // starves in the head-of-line gap until the straggler batch finishes
+  // (measured: writers 9% starved gpu-only vs 1% cpu-only on an extract-bound
+  // run, entirely from these gaps).  Keep >= 1/4 of the tuned batch so the
+  // GPU stays comfortably ahead of the sink; floor at 16 to keep per-launch
+  // overhead amortized.  gpu_desync_batch() then jitters below the clamp.
+  static constexpr size_t SINK_FREEZE_BATCH_MIN = 16;
+  static size_t sink_freeze_clamp(size_t best) {
+    return std::min(best, std::max<size_t>(SINK_FREEZE_BATCH_MIN, best / 4));
+  }
 };
 
 // De-synchronize sink-limited GPU batch completions.  When the output writer
@@ -11158,8 +11188,11 @@ static void gpu_worker(
                   ? double(m->writer_disk_ns.load()) / (wall_s * 1e9) : 0.0;
               if (m && wall_s >= SharedTuneState::FREEZE_MIN_SEC
                     && w_busy >= SharedTuneState::SINK_FREEZE_BUSY) {
-                if (S.best_batch) S.batch_size.store(S.best_batch);
-                else              S.best_batch = cur_batch;
+                // Latch DOWN-clamped (see sink_freeze_clamp): finer batches
+                // shrink the head-of-line bursts at the in-order writer.
+                S.best_batch = SharedTuneState::sink_freeze_clamp(
+                    S.best_batch ? S.best_batch : cur_batch);
+                S.batch_size.store(S.best_batch);
                 S.phase = SharedTuneState::Phase::SETTLED;
                 S.frozen.store(true);
                 if (opt.verbosity >= V_VERBOSE) {
@@ -12795,8 +12828,11 @@ static void gpu_decomp_worker(
               }
               if (m && wall_s >= SharedTuneState::FREEZE_MIN_SEC
                     && w_busy >= SharedTuneState::SINK_FREEZE_BUSY) {
-                if (S.best_batch) S.batch_size.store(S.best_batch);
-                else              S.best_batch = cur_batch;
+                // Latch DOWN-clamped (see sink_freeze_clamp): finer batches
+                // shrink the head-of-line bursts at the in-order writer.
+                S.best_batch = SharedTuneState::sink_freeze_clamp(
+                    S.best_batch ? S.best_batch : cur_batch);
+                S.batch_size.store(S.best_batch);
                 S.phase = SharedTuneState::Phase::SETTLED;
                 S.frozen.store(true);
                 if (opt.verbosity >= V_VERBOSE) {
@@ -14110,7 +14146,7 @@ static int extract_tar(const Options & opt, Meter * m)
     // ceiling, so this is a tidy efficiency win, not a parallelization (see
     // ROADMAP for parallel-dispatch extract).  The budget bounds RAM when the
     // (write-bound) Extractor falls behind the decompressors.
-    FrameSink sink(256 * ONE_MIB);
+    FrameSink sink(tar_sink_budget(opt));
     g_tar_decomp_sink = &sink;
 
     // Pass no meter to the Extractor: the decompressor already counts the tar
@@ -14313,7 +14349,7 @@ static int verify_tar(const Options & opt, Meter * m)
     // having every byte copied through a pipe and re-scanned.  This makes verify
     // decompress-bound (like plain -t) instead of single-pipe-drain bound.  The
     // budget bounds RAM if the validator ever falls behind the decompressors.
-    FrameSink sink(256 * ONE_MIB);
+    FrameSink sink(tar_sink_budget(opt));
     g_tar_decomp_sink = &sink;
 
     tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/true);
@@ -14510,7 +14546,7 @@ static int list_tar(const Options & opt, Meter * m)
       }
       std::rewind(in);
     }
-    FrameSink sink(256 * ONE_MIB);
+    FrameSink sink(tar_sink_budget(opt));
     g_tar_decomp_sink = &sink;
     tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/false, /*list_only=*/true);
     std::thread exth([&] { ex.run_sink(&sink); });

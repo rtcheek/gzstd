@@ -1,11 +1,41 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.73  
+**Covers:** v0.9.50 → v0.14.74  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.74 — smooth GPU completion bursts at the in-order writer; quieter startup
+
+The v0.14.73 server rerun proved the extract stage now saturates the device
+(writer pool 86–95% busy) but GPU modes still trailed cpu-only ~10%: writers
+starved 9.2% of the gpu-only run vs 1.0% cpu-only.  Cause: GPU completion is
+BATCH-granular — a frozen batch of 64 lands 1 GiB of frames per stream at once,
+then the strictly-ordered writer waits on the next head-of-line batch while the
+sub-second downstream buffering (256 MiB sink + job queue) drains dry.  Two
+mitigations, both compress and decompress:
+
+- **Sink-limited freeze now clamps the batch DOWN, not just in place**:
+  `min(best, max(16, best/4))` — sink-limited means GPU throughput has headroom,
+  and batch size is purely the completion granularity at that point.  64 → 16
+  (256 MiB bursts instead of 1 GiB), 256 → 64.  `gpu_desync_batch` keeps
+  jittering below the clamp.  Applies to both the compress (writer-disk signal)
+  and decompress (writer-disk or extract-backlog signal) tuners.
+- **The `--tar` FrameSink deepens for GPU/hybrid decompress**: 256 MiB → up to
+  4 GiB (clamped to a quarter of available RAM), enough to absorb one
+  completion wave so the extractor keeps feeding the pool through head-of-line
+  gaps.  cpu-only keeps 256 MiB (its arrival is near-continuous); the deque
+  only holds frames when the consumer lags, so unused budget costs nothing.
+
+Ceiling note: these bring GPU modes TOWARD cpu-only on a device-bound extract;
+they cannot pass it (a GPU adds no speed to a disk-bound stage).  cpu-only
+remains the `-d --tar` default.
+
+Also: the per-device "[GPUn] ready, semaphore scheduling active" lines are
+demoted to -vv — `[GPU] N device(s) online` already says it at -v, and eight of
+them drowned the interesting startup output.
 
 ## v0.14.73 — parallel large-file extraction: windowed part jobs on the writer pool
 
