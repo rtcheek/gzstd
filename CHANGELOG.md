@@ -1,11 +1,15 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.78  
+**Covers:** v0.9.50 → v0.14.79  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.79 — stream sizeless single-frame archives (tar --zstd): instant -l, constant memory
+
+**Archives made by `tar --zstd` / `tar -I zstd` / piped `zstd` were pathologically slow to list, extract, or verify — fixed.** Those tools emit ONE zstd frame with NO content-size header (zstd can't know the size when reading a pipe). gzstd's router only sent frames with a *known-large* size to the incremental streaming decoder; a sizeless frame fell through to the parallel batch path, whose reader cannot size its output buffer, bails, and slurps the ENTIRE compressed file into RAM before decoding a byte. User-visible symptoms on a 40+ GiB backup: `-l --tar` printed nothing for many minutes (`tar -tvf` starts instantly) while RSS climbed toward the archive size. Measured on a 1.75 GiB reproduction: first listing line at 6.4 s with 4.3 GB peak RSS before; **0.4 s to first line and 47 MB RSS after** (12 GiB archive: first line still ~0.4 s). Fix: a shared `needs_stream_decode()` gate — seekable inputs whose first frame is huge *or sizeless* now route to `decompress_stream_from_file()` (4 MiB-chunk incremental decode, constant memory) in all four consumers: `-d --tar`, `-l --tar`, `-t --tar`, and plain `-d` (which also stops feeding the bogus −1 size to the progress meter and preallocator on sizeless input). gzstd's own multi-frame archives keep the parallel batch path (66 GiB archive still lists in ~9 s on the server). Verified: single-frame extract tree identical to GNU tar's, plain `-d` output byte-identical to `zstd -d`, structure `-t` valid.
 
 ## v0.14.78 — GNU-parity ownership restore (name-first chown) and byte-identical -l --tar listing
 

@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=283
-$EXTENSIVE && EXPECTED_TESTS=381
+EXPECTED_TESTS=286
+$EXTENSIVE && EXPECTED_TESTS=384
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3997,6 +3997,50 @@ else
   else fail "create relative -C chaining" "member names differ from GNU tar"; fi
 
   rm -rf "$MS" "$MARC" "$CR" "$CARC" "$TMPDIR/m.tar" "$TMPDIR/cr.tar" "$TMPDIR"/mout? "$TMPDIR/crout" "$merr"
+fi
+
+# ============================================================
+# Sizeless single-frame archives (tar --zstd / piped zstd streams)
+# ============================================================
+section "Sizeless single-frame archives (tar --zstd streams)"
+
+if ! command -v tar >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
+  skip "sizeless-frame handling" "tar or zstd not available"
+else
+  # A .tar.zst made by piping tar through zstd is ONE frame with NO
+  # content-size header.  These must route to the incremental streaming
+  # decoder: the batch path cannot size its output and slurps the whole
+  # compressed file into RAM before emitting anything (v0.14.79 fix).
+  SF="$TMPDIR/sfsrc"; rm -rf "$SF"; mkdir -p "$SF/t/sub"
+  head -c 200M /dev/urandom > "$SF/t/big.bin"; echo hi > "$SF/t/sub/s.txt"
+  ln -s big.bin "$SF/t/lnk"
+  tar -cf - -C "$SF" t | zstd -q -3 > "$SF/sf.tar.zst"
+
+  # 1. -l --tar lists it, byte-identical to tar -tvf.
+  if diff <("$GZSTD" -l --cpu-only --tar "$SF/sf.tar.zst" 2>/dev/null) \
+          <(zstd -q -dc "$SF/sf.tar.zst" | tar -tvf -) >/dev/null 2>&1; then
+    pass "sizeless frame: -l --tar matches tar -tvf"
+  else fail "sizeless frame listing" "differs or failed"; fi
+
+  # 2. -d --tar extracts it, identical tree to GNU tar.
+  rm -rf "$SF/xo" "$SF/xg"; mkdir -p "$SF/xo" "$SF/xg"
+  (cd "$SF/xo" && "$GZSTD" -d --cpu-only -q --tar "$SF/sf.tar.zst") 2>/dev/null
+  (cd "$SF/xg" && zstd -q -dc "$SF/sf.tar.zst" | tar -xf -) 2>/dev/null
+  if diff -r --no-dereference "$SF/xo" "$SF/xg" >/dev/null 2>&1; then
+    pass "sizeless frame: -d --tar extracts correctly"
+  else fail "sizeless frame extract" "tree mismatch"; fi
+
+  # 3. Constant memory: peak RSS must stay far below the archive size
+  #    (the old batch fallback slurped the compressed file into RAM).
+  if [[ -x /usr/bin/time ]]; then
+    rss=$(/usr/bin/time -f %M "$GZSTD" -l --cpu-only --tar "$SF/sf.tar.zst" 2>&1 >/dev/null | tail -1)
+    if [[ "$rss" =~ ^[0-9]+$ ]] && (( rss < 150000 )); then
+      pass "sizeless frame: streaming keeps constant memory (${rss}KB)"
+    else fail "sizeless frame memory" "maxRSS ${rss}KB (expected <150MB)"; fi
+  else
+    skip "sizeless frame: constant memory" "/usr/bin/time not available"
+  fi
+  rm -rf "$SF"
 fi
 
 # ============================================================

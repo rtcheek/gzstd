@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.78";
+static constexpr const char * GZSTD_VERSION = "0.14.79";
 //
 // Architecture overview:
 //
@@ -6555,6 +6555,19 @@ static int64_t peek_first_frame_decomp_size(FILE * in)
   if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR)
     return -1;
   return (int64_t)size;
+}
+
+// True when a SEEKABLE input's first frame must go to the sequential
+// streaming decoder (decompress_stream_from_file) instead of the parallel
+// batch path: either it is huge (can't be split across workers anyway), or it
+// carries no content-size header (`ff` < 0) — the signature of `tar --zstd` /
+// piped-zstd streams, whose single sizeless frame makes the batch reader bail
+// and slurp the WHOLE compressed file into RAM before decoding a byte (no
+// output for minutes on a big archive, RSS ≈ the file size).  Streaming
+// decodes it incrementally in constant memory.  Genuinely multi-frame chunked
+// archives (frame 0 small, with a size) keep their parallel path.
+static bool needs_stream_decode(int64_t ff) {
+  return ff < 0 || ff > (int64_t)SINGLE_FRAME_STREAM_MIN;
 }
 
 #ifndef _WIN32
@@ -14451,7 +14464,10 @@ static int extract_tar(const Options & opt, Meter * m)
     // out is null: every output route is redirected to the sink while
     // g_tar_decomp_sink is set, so the FILE* is never touched.
     int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
-    if (ff > (int64_t)SINGLE_FRAME_STREAM_MIN) {
+    // Named input with a huge or sizeless first frame (tar --zstd, zstd
+    // streams, --sliding-window): decode it incrementally — see
+    // needs_stream_decode.  Stdin keeps the sequential batch reader.
+    if (arc != "-" && needs_stream_decode(ff)) {
       decompress_stream_from_file(in, nullptr, dopt, m);
     } else {
 #ifdef HAVE_NVCOMP
@@ -14658,7 +14674,10 @@ static int verify_tar(const Options & opt, Meter * m)
     // is set, so the FILE* is never touched.
     auto t_arc0 = std::chrono::steady_clock::now();
     int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
-    if (ff > (int64_t)SINGLE_FRAME_STREAM_MIN) {
+    // Named input with a huge or sizeless first frame (tar --zstd, zstd
+    // streams, --sliding-window): decode it incrementally — see
+    // needs_stream_decode.  Stdin keeps the sequential batch reader.
+    if (arc != "-" && needs_stream_decode(ff)) {
       decompress_stream_from_file(in, nullptr, dopt, m);
     } else {
 #ifdef HAVE_NVCOMP
@@ -14848,7 +14867,10 @@ static int list_tar(const Options & opt, Meter * m)
     Options dopt = opt;
     dopt.sparse_mode = 0; dopt.unsafe_overwrite = true; dopt.mode = Mode::DECOMPRESS;
     int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
-    if (ff > (int64_t)SINGLE_FRAME_STREAM_MIN) {
+    // Named input with a huge or sizeless first frame (tar --zstd, zstd
+    // streams, --sliding-window): decode it incrementally — see
+    // needs_stream_decode.  Stdin keeps the sequential batch reader.
+    if (arc != "-" && needs_stream_decode(ff)) {
       decompress_stream_from_file(in, nullptr, dopt, m);
     } else {
 #ifdef HAVE_NVCOMP
@@ -15396,27 +15418,36 @@ int main(int argc, char ** argv)
     // parallel path.  Seekable input only (peek returns -1 on stdin).
     int64_t first_frame_decomp =
         (opt.input != "-") ? peek_first_frame_decomp_size(in) : -1;
-    if (first_frame_decomp > (int64_t)SINGLE_FRAME_STREAM_MIN) {
-      char sz[32]; human_bytes(double(first_frame_decomp), sz, sizeof(sz));
+    if (opt.input != "-" && needs_stream_decode(first_frame_decomp)) {
+      // < 0: no content-size header (tar --zstd / piped zstd) — size unknown,
+      // so the byte-level out% and preallocation have nothing to go on.
+      const bool known_size = first_frame_decomp > 0;
+      char sz[32]; human_bytes(double(known_size ? first_frame_decomp : 0), sz, sizeof(sz));
 #ifdef HAVE_NVCOMP
       if (!opt.cpu_only)
-        vlog(V_NORMAL, opt,
-             std::string("warning: first frame decompresses to ") + sz
-             + " (GPU max: 16 MiB).\n"
-             "  This file was likely compressed with --sliding-window or zstd.\n"
-             "  Decompressing on CPU (a single frame can't use the GPU).\n");
+        vlog(V_NORMAL, opt, known_size
+             ? std::string("warning: first frame decompresses to ") + sz
+               + " (GPU max: 16 MiB).\n"
+               "  This file was likely compressed with --sliding-window or zstd.\n"
+               "  Decompressing on CPU (a single frame can't use the GPU).\n"
+             : std::string("warning: first frame has no content-size header "
+               "(a piped zstd / tar --zstd stream).\n"
+               "  Streaming on CPU (a sizeless frame can't be split for the GPU).\n"));
 #endif
-      vlog(V_VERBOSE, opt,
-           std::string("[INIT] decompress: streaming single ") + sz + " frame on CPU\n");
-      // total_out/total_out_final drive the progress bar's byte-level out%.
-      meter.total_out.store((uint64_t)first_frame_decomp, std::memory_order_relaxed);
-      meter.total_out_final.store(true, std::memory_order_release);
+      vlog(V_VERBOSE, opt, known_size
+           ? std::string("[INIT] decompress: streaming single ") + sz + " frame on CPU\n"
+           : std::string("[INIT] decompress: streaming sizeless frame on CPU\n"));
+      if (known_size) {
+        // total_out/total_out_final drive the progress bar's byte-level out%.
+        meter.total_out.store((uint64_t)first_frame_decomp, std::memory_order_relaxed);
+        meter.total_out_final.store(true, std::memory_order_release);
 #ifndef _WIN32
-      if (g_direct_writer && opt.preallocate_output
-          && g_direct_writer->preallocate((uint64_t)first_frame_decomp)) {
-        vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
-      }
+        if (g_direct_writer && opt.preallocate_output
+            && g_direct_writer->preallocate((uint64_t)first_frame_decomp)) {
+          vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
+        }
 #endif
+      }
       decompress_stream_from_file(in, out, opt, &meter);
     } else
 #ifdef HAVE_NVCOMP
