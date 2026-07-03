@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=279
-$EXTENSIVE && EXPECTED_TESTS=377
+EXPECTED_TESTS=283
+$EXTENSIVE && EXPECTED_TESTS=381
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3997,6 +3997,95 @@ else
   else fail "create relative -C chaining" "member names differ from GNU tar"; fi
 
   rm -rf "$MS" "$MARC" "$CR" "$CARC" "$TMPDIR/m.tar" "$TMPDIR/cr.tar" "$TMPDIR"/mout? "$TMPDIR/crout" "$merr"
+fi
+
+# ============================================================
+# GNU tar output/ownership parity (-l --tar == tar -tvf; name-first chown)
+# ============================================================
+section "GNU tar parity (listing bytes, ownership mapping)"
+
+if ! command -v tar >/dev/null 2>&1; then
+  skip "listing parity" "tar not available"
+else
+  # 1. -l --tar is byte-identical to tar -tvf on a rich local tree
+  #    (dirs, setuid, sticky, symlink, hardlink, fifo, growing sizes).
+  LP="$TMPDIR/lpsrc"; rm -rf "$LP"; mkdir -p "$LP/tree/sub"
+  echo hi > "$LP/tree/f.txt"; head -c 123456 /dev/zero > "$LP/tree/sub/big.bin"
+  ln -s ../f.txt "$LP/tree/sub/rel"; ln "$LP/tree/f.txt" "$LP/tree/hardf"
+  mkfifo "$LP/tree/pipe0"; chmod 4755 "$LP/tree/f.txt"; chmod 1777 "$LP/tree/sub"
+  tar -cf "$LP/p.tar" -C "$LP" tree 2>/dev/null
+  "$GZSTD" --cpu-only -q -f -o "$LP/p.tar.zst" "$LP/p.tar" 2>/dev/null
+  if diff <("$GZSTD" -l --cpu-only --tar "$LP/p.tar.zst" 2>/dev/null) \
+          <(tar -tvf "$LP/p.tar") >/dev/null 2>&1; then
+    pass "-l --tar matches tar -tvf byte-for-byte (local tree)"
+  else fail "-l --tar parity (local tree)" "listings differ"; fi
+
+  # 2/3. Crafted hard cases: long owner names (the sticky user/group+size
+  #      column must grow mid-listing exactly like GNU's), device nodes
+  #      (major,minor), control chars in names (escape quoting), and PAX
+  #      owner records (uname > 32 bytes only fits in a pax record).
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$LP" <<'PYEOF'
+import tarfile, io, sys
+base = sys.argv[1]
+def make(fmt, path, longpax):
+    t = tarfile.open(path, "w", format=fmt)
+    def reg(name, uname="u", gname="g", uid=1000, gid=1000):
+        ti = tarfile.TarInfo(name); ti.size = 2; ti.mode = 0o644; ti.mtime = 981173106
+        ti.uname, ti.gname, ti.uid, ti.gid = uname, gname, uid, gid
+        t.addfile(ti, io.BytesIO(b"x\n"))
+    reg("short.txt")
+    reg("owned.txt", uname="averylongusername", gname="anevenlongergroupname")
+    reg("after.txt")
+    reg("numeric.txt", uname="", gname="", uid=54321, gid=987654)
+    reg("weird\tname\nfile")
+    if longpax: reg("paxowned.txt", uname="a_username_much_longer_than_thirtytwo_bytes")
+    dev = tarfile.TarInfo("devnode"); dev.type = tarfile.CHRTYPE
+    dev.devmajor, dev.devminor, dev.mode, dev.mtime = 5, 1, 0o666, 981173106
+    dev.uname = dev.gname = "root"; t.addfile(dev)
+    t.close()
+make(tarfile.GNU_FORMAT, base + "/hg.tar", False)
+make(tarfile.PAX_FORMAT, base + "/hp.tar", True)
+PYEOF
+    for fmt in hg hp; do
+      "$GZSTD" --cpu-only -q -f -o "$LP/$fmt.tar.zst" "$LP/$fmt.tar" 2>/dev/null
+      if diff <("$GZSTD" -l --cpu-only --tar "$LP/$fmt.tar.zst" 2>/dev/null) \
+              <(tar -tvf "$LP/$fmt.tar") >/dev/null 2>&1; then
+        pass "-l --tar matches tar -tvf ($fmt: owners/devices/escapes)"
+      else fail "-l --tar parity ($fmt)" "listings differ"; fi
+    done
+
+    # 4. Name-first ownership mapping (GNU tar's as-root default).  Run under
+    #    GZSTD_DEBUG_FAKE_ROOT with the runner's own user + a supplementary
+    #    group: the archive carries those NAMES with bogus numeric ids, so a
+    #    correct name-first chown lands on the local ids (observable without
+    #    root), while --numeric-owner attempts the bogus ids and no-ops.
+    sgrp=$(id -Gn | tr ' ' '\n' | grep -v "^$(id -gn)$" | head -1)
+    if [[ -n "$sgrp" ]]; then
+      python3 - "$LP" "$(id -un)" "$sgrp" <<'PYEOF'
+import tarfile, io, sys
+base, uname, gname = sys.argv[1:4]
+t = tarfile.open(base + "/own.tar", "w", format=tarfile.GNU_FORMAT)
+ti = tarfile.TarInfo("mapped.txt"); ti.size = 2; ti.mode = 0o644; ti.mtime = 981173106
+ti.uname, ti.gname, ti.uid, ti.gid = uname, gname,4242, 4244
+t.addfile(ti, io.BytesIO(b"x\n")); t.close()
+PYEOF
+      "$GZSTD" --cpu-only -q -f -o "$LP/own.tar.zst" "$LP/own.tar" 2>/dev/null
+      rm -rf "$LP/o1" "$LP/o2"; mkdir -p "$LP/o1" "$LP/o2"
+      GZSTD_DEBUG_FAKE_ROOT=1 "$GZSTD" -d --cpu-only -q --tar -C "$LP/o1" "$LP/own.tar.zst" 2>/dev/null
+      GZSTD_DEBUG_FAKE_ROOT=1 "$GZSTD" -d --cpu-only -q --tar --numeric-owner -C "$LP/o2" "$LP/own.tar.zst" 2>/dev/null
+      if [[ "$(stat -c %G "$LP/o1/mapped.txt" 2>/dev/null)" == "$sgrp" \
+         && "$(stat -c %G "$LP/o2/mapped.txt" 2>/dev/null)" != "$sgrp" ]]; then
+        pass "extract chowns by NAME first; --numeric-owner uses raw ids"
+      else fail "name-first ownership mapping" "group not remapped as expected"; fi
+    else
+      skip "name-first ownership mapping" "no supplementary group"
+    fi
+  else
+    skip "-l --tar parity (crafted archives)" "python3 not available"
+    skip "name-first ownership mapping" "python3 not available"
+  fi
+  rm -rf "$LP"
 fi
 
 # ============================================================

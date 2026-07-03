@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.77";
+static constexpr const char * GZSTD_VERSION = "0.14.78";
 //
 // Architecture overview:
 //
@@ -773,7 +773,8 @@ static void print_help()
 "                      source root on create; binds the names that follow it\n"
 "  --write-threads N   parallel file writers for -d --tar (default: min(-T,16))\n"
 "  --exclude PATTERN   skip members matching PATTERN (glob; repeatable)\n"
-"  --numeric-owner     store uid/gid only (no user/group name lookup)\n"
+"  --numeric-owner     numeric uid/gid only: no name lookup on create, no\n"
+"                      name-first chown on root extract (like GNU tar)\n"
 "  --one-file-system   do not descend into other mounted filesystems\n"
 "  --xattrs            store/restore extended attributes (give on both create and extract)\n"
 "  --acls              store/restore POSIX ACLs (give on both create and extract)\n"
@@ -894,9 +895,13 @@ static void print_help_long()
 "     `zstd -l`.  Reads only frame headers, not the payload, so it is fast\n"
 "     even on huge archives.\n"
 "     With --tar (`-l --tar ARCHIVE [MEMBER...]`), lists the archive\n"
-"     contents in `tar -tvf` style (mode, owner, size, mtime, name) by\n"
-"     decompressing and parsing the tar headers in memory.  MEMBER names\n"
-"     filter the listing like tar's name arguments (see -d --tar).\n"
+"     contents by decompressing and parsing the tar headers in memory.\n"
+"     The output is BYTE-IDENTICAL to `tar -tvf` on the same archive —\n"
+"     same type letters, column alignment (including GNU tar's growing\n"
+"     owner/size column), date format, device major,minor, link\n"
+"     suffixes, and control-character escaping — so scripts that parse\n"
+"     `tar -tvf` output can consume it unchanged.  MEMBER names filter\n"
+"     the listing like tar's name arguments (see -d --tar).\n"
 "\n"
 "  -k\n"
 "     Keep input after success (this is the default).\n"
@@ -1114,7 +1119,16 @@ static void print_help_long()
 "     subtree.  Examples: --exclude=/proc --exclude='/home/*/.cache'.\n"
 "\n"
 "  --numeric-owner\n"
-"     Record numeric uid/gid only; skip user/group name resolution.\n"
+"     Use numeric uid/gid only, in both directions, like GNU tar.  On\n"
+"     create: record the ids without resolving user/group names.  On\n"
+"     extract (as root): chown by the archive's numeric ids as-is.\n"
+"     Without it, extraction as root restores ownership by NAME first,\n"
+"     GNU tar's default: the stored uname/gname is looked up in the\n"
+"     local passwd/group database and wins when the account exists\n"
+"     (so files owned by `postgres` land on the local postgres uid even\n"
+"     if the backup source used a different one); the numeric ids are\n"
+"     the fallback for names with no local account.  Non-root extraction\n"
+"     never chowns, so the flag changes nothing there.\n"
 "\n"
 "  --one-file-system\n"
 "     Stay on each source's filesystem: a directory on a different mount\n"
@@ -1155,8 +1169,9 @@ static void print_help_long()
 "     it is faster than `gzstd -d | tar -x` on many-small-file archives.\n"
 "     Restores regular files, directories, symlinks, hardlinks, FIFOs and\n"
 "     device nodes with permissions and modification time; owners are\n"
-"     restored only when running as root.  Reads any standard tar inside\n"
-"     zstd (GNU, ustar, or pax), not just gzstd's own.\n"
+"     restored only when running as root — by NAME first, like GNU tar\n"
+"     (see --numeric-owner).  Reads any standard tar inside zstd (GNU,\n"
+"     ustar, or pax), not just gzstd's own.\n"
 "     Extraction is SECURE BY CONSTRUCTION: members are written through the\n"
 "     destination directory with O_NOFOLLOW on every path component, so a\n"
 "     member symlink cannot be traversed to escape the destination, and\n"
@@ -8701,9 +8716,14 @@ public:
   // sizes, completeness) WITHOUT writing any files — for `gzstd -t --tar`.
   // list_only: parse and print each entry (tar -tvf style) to stdout, write
   // nothing — for `gzstd -l --tar`.  Both are read-only walks (no writer pool).
+  // Test-only ($GZSTD_DEBUG_FAKE_ROOT): pretend to be root so the ownership
+  // paths (chown attempts, name-first uid/gid mapping) run for the test suite
+  // without privileges; the fchown calls themselves stay best-effort and
+  // simply fail for ids the real user cannot assign.
   Extractor(int dest_fd, const Options & opt, Meter * m, bool validate_only = false,
             bool list_only = false)
-    : dest_fd_(dest_fd), opt_(opt), m_(m), as_root_(::geteuid() == 0),
+    : dest_fd_(dest_fd), opt_(opt), m_(m),
+      as_root_(::geteuid() == 0 || std::getenv("GZSTD_DEBUG_FAKE_ROOT") != nullptr),
       validate_only_(validate_only), list_only_(list_only) { roots_.push_back(dest_fd); }
   ~Extractor() = default;   // writer pool joined by stop_pool()
 
@@ -8808,43 +8828,105 @@ private:
     for (size_t k = 0; k < members_.size(); ++k)
       if (!member_hit_[k]) fail(members_[k].first, "Not found in archive");
   }
+
+  // GNU tar's default ownership restore (as root): the stored uname/gname is
+  // looked up in the LOCAL passwd/group database and wins when it exists;
+  // the archive's numeric id is only the fallback.  --numeric-owner skips
+  // the lookup.  Cached per name — archives repeat a handful of owners, and
+  // getpwnam_r/getgrnam_r may hit NSS/LDAP.  -1 caches "no such local name".
+  std::unordered_map<std::string, int64_t> uid_by_name_, gid_by_name_;
+  uint64_t map_owner(bool is_group, const std::string & nm, uint64_t numeric) {
+    if (nm.empty()) return numeric;
+    auto & cache = is_group ? gid_by_name_ : uid_by_name_;
+    auto it = cache.find(nm);
+    if (it == cache.end()) {
+      int64_t id = -1; char buf[4096];
+      if (is_group) {
+        struct group g, *res = nullptr;
+        if (getgrnam_r(nm.c_str(), &g, buf, sizeof buf, &res) == 0 && res) id = (int64_t)g.gr_gid;
+      } else {
+        struct passwd p, *res = nullptr;
+        if (getpwnam_r(nm.c_str(), &p, buf, sizeof buf, &res) == 0 && res) id = (int64_t)p.pw_uid;
+      }
+      it = cache.emplace(nm, id).first;
+    }
+    return it->second >= 0 ? (uint64_t)it->second : numeric;
+  }
   uint64_t vfiles_ = 0, vbytes_ = 0;  // validate/list counters (entries, logical bytes)
   std::atomic<bool> had_error_{false};
 
-  // Format one entry as a `tar -tvf` line on stdout (for -l --tar).  perms,
-  // owner/group (names if present in the header, else numeric), logical size,
-  // mtime (local), name (+ link target).  Fixed fields ~fit 80 cols; the name
-  // runs after, like every tar tool.
+  // Format one entry as a `tar -tvf` line on stdout (for -l --tar), matching
+  // GNU tar's simple_print_header (list.c) BYTE FOR BYTE: same type letters
+  // (incl. 'h' hardlinks, name-ends-in-/ regulars listed as 'd'), the same
+  // sticky "user group size" column (starts at 19, grows to the widest line
+  // seen and stays there), "major,minor" in the size column for device nodes,
+  // %Y-%m-%d %H:%M local mtime, " -> "/" link to " suffixes, and control
+  // bytes escaped like tar's default escape quoting style.
+  int ugswidth_ = 19;               // GNU tar list.c: static int ugswidth = 19
+  static std::string quote_name(const std::string & s) {
+    std::string q; q.reserve(s.size());
+    for (unsigned char c : s) {
+      switch (c) {
+        case '\\': q += "\\\\"; break;
+        case '\a': q += "\\a";  break; case '\b': q += "\\b"; break;
+        case '\f': q += "\\f";  break; case '\n': q += "\\n"; break;
+        case '\r': q += "\\r";  break; case '\t': q += "\\t"; break;
+        case '\v': q += "\\v";  break;
+        default:
+          if (c < 0x20 || c == 0x7f) {
+            char b[6]; std::snprintf(b, sizeof b, "\\%03o", c); q += b;
+          } else q += (char)c;
+      }
+    }
+    return q;
+  }
   void print_list_entry(const InEntry & e) {
-    char perms[11];
-    char t = '-';
+    char modes[11];
+    char t = '?';
     switch (e.typeflag) {
+      case '0': case '\0': case 'S':
+        t = (!e.name.empty() && e.name.back() == '/') ? 'd' : '-'; break;
       case '5': t = 'd'; break; case '2': t = 'l'; break; case '1': t = 'h'; break;
       case '3': t = 'c'; break; case '4': t = 'b'; break; case '6': t = 'p'; break;
+      case '7': t = 'C'; break; case 'V': t = 'V'; break; case 'M': t = 'M'; break;
+      case 'D': t = 'd'; break;
     }
-    perms[0] = t;
+    modes[0] = t;
     static const char rwx[9] = {'r','w','x','r','w','x','r','w','x'};
-    for (int i = 0; i < 9; ++i) perms[1 + i] = (e.mode & (1u << (8 - i))) ? rwx[i] : '-';
-    if (e.mode & 04000) perms[3] = (perms[3] == 'x') ? 's' : 'S';
-    if (e.mode & 02000) perms[6] = (perms[6] == 'x') ? 's' : 'S';
-    if (e.mode & 01000) perms[9] = (perms[9] == 'x') ? 't' : 'T';
-    perms[10] = '\0';
+    for (int i = 0; i < 9; ++i) modes[1 + i] = (e.mode & (1u << (8 - i))) ? rwx[i] : '-';
+    if (e.mode & 04000) modes[3] = (modes[3] == 'x') ? 's' : 'S';
+    if (e.mode & 02000) modes[6] = (modes[6] == 'x') ? 's' : 'S';
+    if (e.mode & 01000) modes[9] = (modes[9] == 'x') ? 't' : 'T';
+    modes[10] = '\0';
 
-    std::string owner = e.uname.empty() ? std::to_string(e.uid) : e.uname;
+    std::string user  = e.uname.empty() ? std::to_string(e.uid) : e.uname;
     std::string group = e.gname.empty() ? std::to_string(e.gid) : e.gname;
-    std::string owngrp = owner + "/" + group;
 
-    char date[24] = "";
+    char size[64];
+    if (e.typeflag == '3' || e.typeflag == '4')
+      std::snprintf(size, sizeof size, "%llu,%llu",
+                    (unsigned long long)e.devmajor, (unsigned long long)e.devminor);
+    else
+      std::snprintf(size, sizeof size, "%llu",
+                    (unsigned long long)(e.is_sparse ? e.real_size : e.size));
+
+    char tbuf[24];
     time_t tt = (time_t)e.mtime; struct tm tmv;
-    if (localtime_r(&tt, &tmv)) std::strftime(date, sizeof date, "%Y-%m-%d %H:%M", &tmv);
+    if (localtime_r(&tt, &tmv)) std::strftime(tbuf, sizeof tbuf, "%Y-%m-%d %H:%M", &tmv);
+    else std::snprintf(tbuf, sizeof tbuf, "%lld", (long long)e.mtime);
 
-    uint64_t sz = e.is_sparse ? e.real_size : e.size;
-    std::string nm = e.name;
-    if (e.typeflag == '2' && !e.linkname.empty()) nm += " -> " + e.linkname;       // symlink
-    else if (e.typeflag == '1' && !e.linkname.empty()) nm += " link to " + e.linkname;  // hardlink
-
-    std::fprintf(stdout, "%s %-17s %12llu %s %s\n",
-                 perms, owngrp.c_str(), (unsigned long long)sz, date, nm.c_str());
+    // GNU's alignment: "user group size" is padded to ugswidth, which only
+    // ever grows; the pad lands to the LEFT of the size.
+    int sizelen = (int)std::strlen(size);
+    int pad = (int)(user.size() + 1 + group.size() + 1) + sizelen;
+    if (pad > ugswidth_) ugswidth_ = pad;
+    std::fprintf(stdout, "%s %s/%s %*s %s %s",
+                 modes, user.c_str(), group.c_str(),
+                 ugswidth_ - pad + sizelen, size, tbuf, quote_name(e.name).c_str());
+    if      (e.typeflag == '2') std::fprintf(stdout, " -> %s\n", quote_name(e.linkname).c_str());
+    else if (e.typeflag == '1') std::fprintf(stdout, " link to %s\n", quote_name(e.linkname).c_str());
+    else if (e.typeflag == 'V') std::fprintf(stdout, "--Volume Header--\n");
+    else std::fputc('\n', stdout);
   }
 
   // Deferred work applied after all data is written.
@@ -9357,6 +9439,10 @@ private:
     std::string pend_name, pend_link;     // GNU 'L'/'K' overrides for the next header
     std::string pax_path, pax_link; uint64_t pax_size = 0; int64_t pax_mtime = 0;
     bool pax_has_size = false, pax_has_mtime = false;
+    // POSIX owner overrides (pax format stores uid/gid > 2097151 and names
+    // longer than the 32-byte ustar fields as records; GNU tar honors them).
+    uint64_t pax_uid = 0, pax_gid = 0; std::string pax_uname, pax_gname;
+    bool pax_has_uid = false, pax_has_gid = false, pax_has_uname = false, pax_has_gname = false;
     bool pax_gnu_sparse = false;          // GNU.sparse.* records seen (PAX sparse format)
     int  pax_sp_major = 0, pax_sp_minor = 0;
     std::string pax_sp_name;
@@ -9410,6 +9496,10 @@ private:
             else if (key == "linkpath") pax_link = val;
             else if (key == "size") { pax_size = strtoull(val.c_str(), nullptr, 10); pax_has_size = true; }
             else if (key == "mtime") { pax_mtime = (int64_t)strtoll(val.c_str(), nullptr, 10); pax_has_mtime = true; }
+            else if (key == "uid")   { pax_uid = strtoull(val.c_str(), nullptr, 10); pax_has_uid = true; }
+            else if (key == "gid")   { pax_gid = strtoull(val.c_str(), nullptr, 10); pax_has_gid = true; }
+            else if (key == "uname") { pax_uname = val; pax_has_uname = true; }
+            else if (key == "gname") { pax_gname = val; pax_has_gname = true; }
             // --xattrs/--acls: collect SCHILY.* records only when the matching flag
             // is set, so without the flag they are parsed-and-ignored (GNU tar's behavior).
             else if (opt_.tar_xattrs && key.rfind("SCHILY.xattr.", 0) == 0)
@@ -9459,10 +9549,10 @@ private:
       if (!pend_link.empty()) { e.linkname = pend_link; pend_link.clear(); }
       if (!pax_link.empty())  { e.linkname = pax_link;  pax_link.clear(); }
       e.mode = (uint32_t)get_num(blk + 100, 8);
-      e.uid = get_num(blk + 108, 8);
-      e.gid = get_num(blk + 116, 8);
-      e.uname = get_str(blk + 265, 32);   // ustar owner/group names (for -l --tar)
-      e.gname = get_str(blk + 297, 32);
+      e.uid = pax_has_uid ? pax_uid : get_num(blk + 108, 8);
+      e.gid = pax_has_gid ? pax_gid : get_num(blk + 116, 8);
+      e.uname = pax_has_uname ? pax_uname : get_str(blk + 265, 32);  // owner names: -l --tar
+      e.gname = pax_has_gname ? pax_gname : get_str(blk + 297, 32);  // and name-first chown
       e.size = pax_has_size ? pax_size : size;
       e.mtime = pax_has_mtime ? pax_mtime : (int64_t)get_num(blk + 136, 12);
       e.typeflag = type;
@@ -9470,6 +9560,8 @@ private:
       e.devminor = (uint32_t)get_num(blk + 337, 8);
       e.ext = std::move(pax_ext); pax_ext = ExtMeta{};
       pax_has_size = pax_has_mtime = false;
+      pax_has_uid = pax_has_gid = pax_has_uname = pax_has_gname = false;
+      pax_uname.clear(); pax_gname.clear();
 
       // GNU OLDGNU sparse ('S'): the sparse map is in the header (4 entries at
       // offset 386) + optional extension blocks; realsize at 483.  e.size is the
@@ -9513,6 +9605,15 @@ private:
       pax_gnu_sparse = false; pax_sp_major = pax_sp_minor = 0; pax_sp_name.clear();
       pax_sp_realsize = 0; pax_has_sp_realsize = false; pax_sp_map.clear();
       pax_sp_have_off = false;
+
+      // Extract-as-root default (GNU tar parity): restore ownership by NAME
+      // when the stored uname/gname exists locally, numeric ids otherwise;
+      // --numeric-owner forces the numeric ids.  Listing shows the archive's
+      // own owners, so read-only walks skip the remap.
+      if (as_root_ && !read_only() && !opt_.tar_numeric_owner) {
+        e.uid = map_owner(false, e.uname, e.uid);
+        e.gid = map_owner(true,  e.gname, e.gid);
+      }
 
       handle_entry(r, e);
     }

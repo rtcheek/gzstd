@@ -1,11 +1,19 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.77  
+**Covers:** v0.9.50 → v0.14.78  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.78 — GNU-parity ownership restore (name-first chown) and byte-identical -l --tar listing
+
+**Extraction as root now restores ownership by NAME first, GNU tar's default.** Previously the extractor always `fchown`ed the archive's numeric uid/gid — behaving as if `--numeric-owner` were permanently on — which puts files on the wrong accounts when restoring across hosts whose uids differ (the classic `postgres` is 118 here, 999 there). Now the stored uname/gname is looked up in the local passwd/group database (cached per name; archives repeat a handful of owners) and wins when the account exists; the numeric ids remain the fallback, and `--numeric-owner` on extract disables the lookup — exactly GNU tar's contract, now documented under `--numeric-owner` in `--help`. Also parses the POSIX pax `uid`/`gid`/`uname`/`gname` records (pax-format archives store ids > 2097151 and names > 32 bytes there; GNU tar honors them, gzstd previously ignored them). Verified with a `GZSTD_DEBUG_FAKE_ROOT` test hook (same pattern as the GPU fault-injection env): an archive carrying the runner's own user/supplementary-group names with bogus numeric ids lands on the correct local ids name-first, and on the raw ids under `--numeric-owner`.
+
+**`-l --tar` output is now byte-identical to `tar -tvf`.** The old listing used fixed-width columns; GNU tar's `simple_print_header` does not — it keeps a sticky "user/group size" column that starts at 19 and grows to the widest line seen (all later lines shift), prints `major,minor` in the size column for device nodes, uses `h`/`C`/`V` type letters (with regulars whose stored name ends in `/` listed as `d`), appends ` -> `/` link to ` suffixes, and escape-quotes control bytes (`\n`, `\t`, `\303` …). Reimplemented all of it, plus the `%Y-%m-%d %H:%M` local mtime and numeric-owner fallbacks. Byte-diffed against real `tar -tvf` on: a local tree (setuid/sticky/fifo/hard+symlinks), crafted GNU and PAX archives with mid-listing column growth, device nodes, control-char names, >32-byte pax owner names, and a fragmented `--sparse` member (logical size shown, like tar). All identical; `--help` now states the guarantee.
+
+Suite: 283/283 green (4 new parity tests; listing-format tests skip gracefully without python3).
 
 ## v0.14.77 — tar-compatible member selection and positional -C (extract, list, create); review cleanups
 
