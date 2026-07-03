@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.76  
+**Covers:** v0.9.50 → v0.14.77  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.77 — tar-compatible member selection and positional -C (extract, list, create); review cleanups
+
+**`-d --tar ARCHIVE MEMBER...` and `-l --tar ARCHIVE MEMBER...` now select members, with GNU tar's exact semantics.** A member name picks the entry stored under that name; a directory picks its whole recursive subtree; trailing slashes are ignored; a selector that matches nothing is reported (`Not found in archive`) with a non-zero exit while the matching members still extract. `-C` between members is positional like tar's: it redirects the members that FOLLOW it (`gzstd -d --tar b.tar.zst -C /a src/x -C /b src/y`), and a RELATIVE second `-C` chains off the previous one exactly like GNU tar (which physically chdirs at each `-C` — verified side-by-side). Implementation: positionals after the archive on `-d`/`-l` become selectors, each remembering the `-C` in effect at its command-line position; the Extractor filters entries against the selector list (non-matching entries' data is skipped, keeping the parser aligned) and every path-resolving helper takes a root index so deferred work — writer-pool jobs, large-file parts, hardlinks, dirmeta — replays under the right `-C` root. All verified against GNU tar on the same trees: subtree selection, positional and chained `-C`, unmatched-name errors, hardlink-without-target failure, sparse member with holes intact, and `-l` filtering match entry-for-entry. Note the (previously undocumented) ability to pass multiple archives to `-d`/`-l --tar` is gone — the tail positionals are selectors now, as in tar; `-t --tar` keeps its multi-archive meaning.
+
+**`--tar` create takes positional `-C` too, matching `tar -c`.** `gzstd -o my.tar.zst --tar --numeric-owner --acls --xattrs -C /dir1 user-data -C /dir2 sys1 sys2 sys3` reads each RELATIVE source from the `-C` in effect at its position but stores the member under the name as typed (`user-data/`, `sys1/`, … — no path prefixes), so one archive can gather trees from several roots. Absolute sources ignore `-C`, and a relative second `-C` chains off the previous one — both exactly as tar behaves (member listings verified identical to `tar -cf` with the same arguments, xattrs intact through a round-trip). Implementation rides the same parse-time mechanism as extraction's selectors: each post-`--tar` positional remembers the `-C` in effect, and the create driver hands `enumerate()` the `-C`-prefixed filesystem path with the unprefixed member name — the walker always supported split fspath/member naming, so no layout changes. Also added a `--tar` compatibility block to `--help` EXAMPLES (multi-root create, selective extract with positional `-C`, member-filtered listing).
+
+**Review cleanups from the v0.14.76 audit follow-up.** (1) The OLDGNU sparse extension-block size lives in one place now — `entry_header_len()` — called by both `LayoutBuilder::add()` and `apply_extended_metadata()`'s recompute, so the two header-length computations can never drift again (the drift was the root cause of v0.14.76's corruption bug); verified byte-identical archives before/after. (2) `make_dir()` also widens a PRE-EXISTING directory lacking owner rwx (fd-based chmod under the O_NOFOLLOW walk), so re-extracting an archive over a populated destination is now idempotent even for read-only directories — GNU tar fails that re-extract; `finish_deferred()` still restores the exact stored mode. (3) Fixed a stale help note claiming extraction wasn't built in.
+
+Full suite green after each change (268/268 before the features, 279/279 with the new selective-extraction and multi-root-create tests).
 
 ## v0.14.76 — two extraction/creation correctness fixes found in a pre-release audit
 

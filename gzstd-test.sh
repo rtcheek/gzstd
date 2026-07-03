@@ -359,8 +359,8 @@ human_size() {
 # Counts assume a GPU is present.  --extensive adds back the gated sections
 # (Stress, Help/version, Space-separated values, Thread option forms, Verbose
 # output validation, Completion summary format).
-EXPECTED_TESTS=268
-$EXTENSIVE && EXPECTED_TESTS=366
+EXPECTED_TESTS=279
+$EXTENSIVE && EXPECTED_TESTS=377
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3897,6 +3897,106 @@ PYEOF
   rm -rf "$CS"
 
   rm -rf "$XS" "$XOUT" "$XARC"
+fi
+
+# ============================================================
+# Selective extraction (-d --tar ARCHIVE MEMBER..., positional -C)
+# ============================================================
+section "Selective extraction (member args, positional -C)"
+
+if ! command -v tar >/dev/null 2>&1; then
+  skip "selective extraction" "tar not available"
+else
+  MS="$TMPDIR/msrc"; rm -rf "$MS"; mkdir -p "$MS/src/a/deep" "$MS/src/b" "$MS/src/c"
+  echo a1 > "$MS/src/a/f1"; echo a2 > "$MS/src/a/deep/f2"
+  echo b1 > "$MS/src/b/f1"; echo c1 > "$MS/src/c/f1"
+  ln -s f1 "$MS/src/a/sym"; ln "$MS/src/a/f1" "$MS/src/a/hard"
+  MARC="$TMPDIR/m.tar.zst"
+  (cd "$MS" && "$GZSTD" --cpu-only -q -f -o "$MARC" --tar src) 2>/dev/null
+
+  # 1. Directory member: whole subtree, nothing else (tar name-arg semantics).
+  MD="$TMPDIR/mout1"; rm -rf "$MD"; mkdir -p "$MD"
+  (cd "$MD" && "$GZSTD" -d --cpu-only -q --tar "$MARC" src/a) 2>/dev/null
+  if [[ -f "$MD/src/a/deep/f2" && -L "$MD/src/a/sym" && ! -e "$MD/src/b" && ! -e "$MD/src/c" ]]; then
+    pass "directory member extracts its subtree only"
+  else fail "directory member subtree" "wrong tree"; fi
+
+  # 2. Exact file member + trailing-slash directory member.
+  MD="$TMPDIR/mout2"; rm -rf "$MD"; mkdir -p "$MD"
+  (cd "$MD" && "$GZSTD" -d --cpu-only -q --tar "$MARC" src/a/f1 src/b/) 2>/dev/null
+  if [[ -f "$MD/src/a/f1" && -f "$MD/src/b/f1" && ! -e "$MD/src/a/deep" && ! -e "$MD/src/c" ]]; then
+    pass "file member and trailing-slash member"
+  else fail "file/trailing-slash member" "wrong tree"; fi
+
+  # 3. Unmatched member: reported like GNU tar, non-zero exit, others extracted.
+  MD="$TMPDIR/mout3"; rm -rf "$MD"; mkdir -p "$MD"
+  merr="$TMPDIR/m3.err"; rc=0
+  (cd "$MD" && "$GZSTD" -d --cpu-only -q --tar "$MARC" src/c nosuch) 2>"$merr" || rc=$?
+  if [[ $rc -ne 0 ]] && grep -q "nosuch: Not found in archive" "$merr" && [[ -f "$MD/src/c/f1" ]]; then
+    pass "unmatched member: Not found in archive + non-zero exit"
+  else fail "unmatched member" "rc=$rc $(cat "$merr" 2>/dev/null | head -1)"; fi
+
+  # 4. Positional -C: each member lands under the -C that precedes it.
+  MD="$TMPDIR/mout4"; rm -rf "$MD"; mkdir -p "$MD/d1" "$MD/d2"
+  "$GZSTD" -d --cpu-only -q --tar "$MARC" -C "$MD/d1" src/a -C "$MD/d2" src/c 2>/dev/null
+  if [[ -f "$MD/d1/src/a/f1" && -f "$MD/d2/src/c/f1" && ! -e "$MD/d1/src/c" && ! -e "$MD/d2/src/a" ]]; then
+    pass "positional -C binds members that follow it"
+  else fail "positional -C" "wrong destinations"; fi
+
+  # 5. Relative -C chains like GNU tar (which chdirs at each -C): d1 then d2
+  #    lands in d1/d2.  Compare against tar itself.
+  MD="$TMPDIR/mout5"; rm -rf "$MD"; mkdir -p "$MD/g/d1/d2" "$MD/z/d1/d2"
+  tar -cf "$TMPDIR/m.tar" -C "$MS" src 2>/dev/null
+  (cd "$MD/g" && tar -xf "$TMPDIR/m.tar" -C d1 src/b -C d2 src/c) 2>/dev/null
+  (cd "$MD/z" && "$GZSTD" -d --cpu-only -q --tar "$MARC" -C d1 src/b -C d2 src/c) 2>/dev/null
+  if diff -r --no-dereference "$MD/g" "$MD/z" >/dev/null 2>&1; then
+    pass "relative -C chains like GNU tar"
+  else fail "relative -C chaining" "tree differs from GNU tar"; fi
+
+  # 6. -l --tar MEMBER filters the listing; unmatched name errors.
+  nls=$("$GZSTD" -l --cpu-only --tar "$MARC" src/b 2>/dev/null | wc -l)
+  [[ "$nls" == "2" ]] && pass "-l --tar member filters listing (2 entries)" \
+                      || fail "-l --tar member filter" "listed $nls"
+  rc=0; "$GZSTD" -l --cpu-only -q --tar "$MARC" nosuch >/dev/null 2>&1 || rc=$?
+  [[ $rc -ne 0 ]] && pass "-l --tar unmatched member exits non-zero" \
+                  || fail "-l --tar unmatched member" "rc=0"
+
+  # 7. Hardlink member without its target fails per-file, like GNU tar.
+  MD="$TMPDIR/mout7"; rm -rf "$MD"; mkdir -p "$MD"
+  rc=0; (cd "$MD" && "$GZSTD" -d --cpu-only -q --tar "$MARC" src/a/hard) 2>/dev/null || rc=$?
+  [[ $rc -ne 0 && ! -e "$MD/src/a/hard" ]] && pass "hardlink member without target fails (GNU parity)" \
+                                           || fail "hardlink member without target" "rc=$rc"
+
+  # 8. Create-side positional -C: relative sources are read from the -C in
+  #    effect but stored under the name as typed (no path prefix), like tar -c.
+  CR="$TMPDIR/crsrc"; rm -rf "$CR"; mkdir -p "$CR/dir1/user-data" "$CR/dir2/sys1" "$CR/dir2/sys2"
+  echo u > "$CR/dir1/user-data/u.txt"; echo s1 > "$CR/dir2/sys1/s.txt"; echo s2 > "$CR/dir2/sys2/s.txt"
+  CARC="$TMPDIR/cr.tar.zst"
+  "$GZSTD" --cpu-only -q -f -o "$CARC" --tar -C "$CR/dir1" user-data -C "$CR/dir2" sys1 sys2 2>/dev/null
+  tar -cf "$TMPDIR/cr.tar" -C "$CR/dir1" user-data -C "$CR/dir2" sys1 sys2 2>/dev/null
+  if diff <("$GZSTD" -l --cpu-only --tar "$CARC" 2>/dev/null | awk '{print $NF}' | sort) \
+          <(tar -tf "$TMPDIR/cr.tar" | sort) >/dev/null 2>&1; then
+    pass "create: positional -C roots, names match GNU tar"
+  else fail "create positional -C" "member names differ from GNU tar"; fi
+
+  # 9. Create round-trip: content lands under the stored (prefix-free) names.
+  MD="$TMPDIR/crout"; rm -rf "$MD"; mkdir -p "$MD"
+  (cd "$MD" && "$GZSTD" -d --cpu-only -q --tar "$CARC") 2>/dev/null
+  if [[ "$(cat "$MD/user-data/u.txt" 2>/dev/null)" == "u" \
+     && "$(cat "$MD/sys2/s.txt" 2>/dev/null)" == "s2" && ! -e "$MD/dir1" ]]; then
+    pass "create: multi-root archive round-trips"
+  else fail "create multi-root round-trip" "wrong tree"; fi
+
+  # 10. Relative -C chains on create too (tar chdirs at each -C): -C base
+  #     dir1 -C dir2 sys1 reads base/dir1 and base/dir2/sys1.
+  "$GZSTD" --cpu-only -q -f -o "$CARC" --tar -C "$CR" dir1 -C dir2 sys1 2>/dev/null
+  tar -cf "$TMPDIR/cr.tar" -C "$CR" dir1 -C dir2 sys1 2>/dev/null
+  if diff <("$GZSTD" -l --cpu-only --tar "$CARC" 2>/dev/null | awk '{print $NF}' | sort) \
+          <(tar -tf "$TMPDIR/cr.tar" | sort) >/dev/null 2>&1; then
+    pass "create: relative -C chains like GNU tar"
+  else fail "create relative -C chaining" "member names differ from GNU tar"; fi
+
+  rm -rf "$MS" "$MARC" "$CR" "$CARC" "$TMPDIR/m.tar" "$TMPDIR/cr.tar" "$TMPDIR"/mout? "$TMPDIR/crout" "$merr"
 fi
 
 # ============================================================
