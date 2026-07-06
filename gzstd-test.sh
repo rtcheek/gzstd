@@ -357,9 +357,10 @@ human_size() {
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
 # Counts assume a GPU is present.  --extensive adds back the gated sections
-# (Stress, Help/version, Space-separated values, Thread option forms, Verbose
-# output validation, Completion summary format).
-EXPECTED_TESTS=286
+# (File management, Multi-file, Sparse, Threading, Stress, Help/version,
+# Output redirection, Sync output, Space-separated values, Thread option
+# forms, Verbose output validation, Completion summary format).
+EXPECTED_TESTS=268
 $EXTENSIVE && EXPECTED_TESTS=384
 count_tests() { echo "$EXPECTED_TESTS"; }
 
@@ -621,9 +622,10 @@ files_match "$TMPDIR/tree/medium.txt" "$TMPDIR/extracted-pipe/tree/medium.txt" \
 rm -rf "$TMPDIR/tree.tar.zst" "$TMPDIR/tree-pipe.tar.zst" "$TMPDIR/extracted" "$TMPDIR/extracted-pipe"
 
 # ============================================================
-# 7. File management flags
+# 7-10. File management, multi-file, sparse, threading (extensive)
 # ============================================================
-section "File management flags"
+if $EXTENSIVE; then
+section "File management flags (extensive)"
 
 LAST_TEST_MS=0
 cp "$TMPDIR/small.txt" "$TMPDIR/keep-test.txt"
@@ -656,7 +658,7 @@ rm -f "$TMPDIR/force-test.txt" "$TMPDIR/force-test.txt.zst"
 # ============================================================
 # 8. Multi-file
 # ============================================================
-section "Multi-file operation"
+section "Multi-file operation (extensive)"
 
 LAST_TEST_MS=0
 cp "$TMPDIR/small.txt" "$TMPDIR/multi1.txt"; cp "$TMPDIR/medium.txt" "$TMPDIR/multi2.txt"
@@ -672,7 +674,7 @@ rm -f "$TMPDIR/multi1.txt" "$TMPDIR/multi2.txt" "$TMPDIR/multi1.txt.zst" "$TMPDI
 # ============================================================
 # 9. Sparse files
 # ============================================================
-section "Sparse file support"
+section "Sparse file support (extensive)"
 
 compressed="$TMPDIR/zeros.bin.zst"
 run_test "$GZSTD" -k -f --cpu-only "$TMPDIR/zeros.bin" -o "$compressed" 2>/dev/null
@@ -692,7 +694,7 @@ rm -f "$compressed" "$TMPDIR/zeros-sparse.bin" "$TMPDIR/zeros-nosparse.bin"
 # ============================================================
 # 10. Threading
 # ============================================================
-section "Threading options"
+section "Threading options (extensive)"
 
 for threads in 1 2 4; do
   compressed="$TMPDIR/thread-${threads}.zst"; recovered="$TMPDIR/thread-${threads}.recovered"
@@ -701,6 +703,7 @@ for threads in 1 2 4; do
   files_match "$TMPDIR/medium.txt" "$recovered" && pass "-T $threads" || fail "-T $threads" "mismatch"
   rm -f "$compressed" "$recovered"
 done
+fi  # $EXTENSIVE (File management, multi-file, sparse, threading)
 
 # ============================================================
 # 11. Chunk sizes
@@ -1756,7 +1759,7 @@ rm -f "$TMPDIR"/rapid_*
 fi  # $EXTENSIVE
 
 # ============================================================
-# 20. Wildcard / glob file handling
+# 21. Wildcard / glob file handling
 # ============================================================
 section "Wildcard / glob file handling"
 
@@ -1793,7 +1796,7 @@ pass "glob with mixed .txt/.zst doesn't crash" "(exit $rc)"
 rm -f "$TMPDIR"/wild_*
 
 # ============================================================
-# 21. End-of-options (--) handling
+# 22. End-of-options (--) handling
 # ============================================================
 section "End-of-options (--) handling"
 
@@ -1832,9 +1835,10 @@ echo "bbb" > "$TMPDIR/bb.txt"
 rm -f "$TMPDIR/-dashfile"* "$TMPDIR/--doublefile"* "$TMPDIR/aa.txt"* "$TMPDIR/bb.txt"*
 
 # ============================================================
-# 22. -c (stdout) option
+# 23. -c (stdout) option (extensive)
 # ============================================================
-section "Output redirection (-c, -o, --output)"
+if $EXTENSIVE; then
+section "Output redirection (-c, -o, --output) (extensive)"
 
 LAST_TEST_MS=0
 # -c: write compressed to stdout
@@ -1864,9 +1868,10 @@ files_match "$TMPDIR/medium.txt" "$TMPDIR/explicit-dec.txt" \
   && pass "-o with decompress" || fail "-o with decompress" "mismatch"
 
 rm -f "$TMPDIR/stdout-test"* "$TMPDIR/c-keep-test"* "$TMPDIR/explicit-out"* "$TMPDIR/explicit-dec"*
+fi  # $EXTENSIVE (Output redirection)
 
 # ============================================================
-# 23. Pipe with various options
+# 24. Pipe with various options
 # ============================================================
 section "Pipes with options"
 
@@ -1922,7 +1927,7 @@ files_match "$TMPDIR/medium.txt" "$TMPDIR/pipe-prog.recovered" \
 rm -f "$TMPDIR"/pipe-*
 
 # ============================================================
-# 24. Thread option forms
+# 25. Thread option forms
 # ============================================================
 if $EXTENSIVE; then
 section "Thread option forms (-T)"
@@ -1965,7 +1970,7 @@ rm -f "$TMPDIR"/tform*
 fi  # $EXTENSIVE (Thread option forms)
 
 # ============================================================
-# 25. CPU scheduling options
+# 26. CPU scheduling options
 # ============================================================
 section "CPU scheduling options"
 
@@ -2282,9 +2287,10 @@ else
 fi
 
 # ============================================================
-# 26. Sync output
+# 27. Sync output (extensive)
 # ============================================================
-section "Sync output"
+if $EXTENSIVE; then
+section "Sync output (extensive)"
 
 LAST_TEST_MS=0
 t0=$(now_ms)
@@ -2298,9 +2304,10 @@ else
   fail "--sync-output" "no output"
 fi
 rm -f "$TMPDIR"/sync-test*
+fi  # $EXTENSIVE (Sync output)
 
 # ============================================================
-# 27. Pinned memory options (GPU builds only, but shouldn't crash on CPU-only)
+# 28. Pinned memory options (GPU builds only, but shouldn't crash on CPU-only)
 # ============================================================
 section "Pinned memory options"
 
@@ -2317,7 +2324,7 @@ done
 rm -f "$TMPDIR"/pin-*
 
 # ============================================================
-# 28. GPU-specific options (if GPU available)
+# 29. GPU-specific options (if GPU available)
 # ============================================================
 section "GPU-specific options"
 
@@ -2358,7 +2365,7 @@ else
 fi
 
 # ============================================================
-# 29. Error handling robustness
+# 30. Error handling robustness
 # ============================================================
 section "Error handling & edge cases"
 
@@ -2421,7 +2428,7 @@ fi
 rm -f "$TMPDIR"/warn-test*
 
 # ============================================================
-# 30. Cross-level decompression
+# 31. Cross-level decompression
 # ============================================================
 section "Cross-level decompression"
 
@@ -2447,7 +2454,7 @@ run_test "$GZSTD" -t --cpu-only "$TMPDIR/xlvl-t.zst" 2>/dev/null
 rm -f "$TMPDIR"/xlvl-*
 
 # ============================================================
-# 31. Argument order independence
+# 32. Argument order independence
 # ============================================================
 section "Argument order independence"
 
@@ -2482,7 +2489,7 @@ fi
 rm -f "$TMPDIR"/order*
 
 # ============================================================
-# 32. Space-separated option values (--opt VAL vs --opt=VAL)
+# 33. Space-separated option values (--opt VAL vs --opt=VAL)
 # ============================================================
 if $EXTENSIVE; then
 section "Space-separated option values (extensive)"
@@ -2536,7 +2543,7 @@ rm -f "$TMPDIR"/sp-*
 fi  # $EXTENSIVE (Space-separated option values)
 
 # ============================================================
-# 33. Verbose output validation (-v, -vv, -vvv)
+# 34. Verbose output validation (-v, -vv, -vvv)
 # ============================================================
 if $EXTENSIVE; then
 section "Verbose output validation"
@@ -2696,7 +2703,7 @@ fi
 fi  # $EXTENSIVE (Verbose output validation)
 
 # ============================================================
-# 34. Completion summary format validation
+# 35. Completion summary format validation
 # ============================================================
 if $EXTENSIVE; then
 section "Completion summary format (extensive)"
@@ -2757,7 +2764,7 @@ rm -f "$TMPDIR"/summ-*
 fi  # $EXTENSIVE (Completion summary format)
 
 # ============================================================
-# 35. Ultra compression validation
+# 36. Ultra compression validation
 # ============================================================
 section "Ultra compression validation"
 
@@ -2839,7 +2846,7 @@ else
 fi
 
 # ============================================================
-# 36. Throttle budget tunables
+# 37. Throttle budget tunables
 # ============================================================
 section "Throttle budget tunables"
 
