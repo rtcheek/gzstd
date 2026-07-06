@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=268
-$EXTENSIVE && EXPECTED_TESTS=384
+EXPECTED_TESTS=274
+$EXTENSIVE && EXPECTED_TESTS=390
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -4004,6 +4004,71 @@ else
   else fail "create relative -C chaining" "member names differ from GNU tar"; fi
 
   rm -rf "$MS" "$MARC" "$CR" "$CARC" "$TMPDIR/m.tar" "$TMPDIR/cr.tar" "$TMPDIR"/mout? "$TMPDIR/crout" "$merr"
+fi
+
+# ============================================================
+# Member index (--tar create; instant -l via trailing skippable frame)
+# ============================================================
+section "Member index (instant -l --tar)"
+
+if ! command -v tar >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
+  skip "member index" "tar or zstd not available"
+else
+  IX="$TMPDIR/ixsrc"; rm -rf "$IX"; mkdir -p "$IX/t/sub"
+  echo a > "$IX/t/f.txt"; head -c 2M /dev/urandom > "$IX/t/sub/big.bin"
+  ln -s f.txt "$IX/t/lnk"; ln "$IX/t/f.txt" "$IX/t/hard"
+  (cd "$IX" && "$GZSTD" --cpu-only -q -f -o wi.tar.zst --tar t \
+            && "$GZSTD" --cpu-only -q -f -o wo.tar.zst --tar --no-index t) 2>/dev/null
+
+  # 1. Indexed listing is used (verbose says so) and matches the walk and
+  #    tar -tvf byte-for-byte.
+  used=$("$GZSTD" -l -v --cpu-only --tar "$IX/wi.tar.zst" 2>&1 >/dev/null | grep -c "listed from member index")
+  if [[ "$used" == "1" ]] \
+     && diff <("$GZSTD" -l --cpu-only --tar "$IX/wi.tar.zst" 2>/dev/null) \
+             <("$GZSTD" -l --cpu-only --tar "$IX/wo.tar.zst" 2>/dev/null) >/dev/null 2>&1 \
+     && diff <("$GZSTD" -l --cpu-only --tar "$IX/wi.tar.zst" 2>/dev/null) \
+             <(zstd -q -dc "$IX/wi.tar.zst" | tar -tvf -) >/dev/null 2>&1; then
+    pass "index listing used and byte-identical to walk + tar -tvf"
+  else fail "index listing" "not used or differs"; fi
+
+  # 2. The skippable frame is invisible to extraction: gzstd and GNU tar
+  #    both extract the indexed archive to the identical tree.
+  rm -rf "$IX/x1" "$IX/x2"; mkdir -p "$IX/x1" "$IX/x2"
+  (cd "$IX/x1" && "$GZSTD" -d --cpu-only -q --tar "$IX/wi.tar.zst") 2>/dev/null
+  (cd "$IX/x2" && zstd -q -dc "$IX/wi.tar.zst" | tar -xf -) 2>/dev/null
+  if diff -r --no-dereference "$IX/x1" "$IX/x2" >/dev/null 2>&1; then
+    pass "indexed archive extracts identically (gzstd + GNU tar)"
+  else fail "indexed archive extract" "tree mismatch"; fi
+
+  # 3. Member filtering + unmatched-name error work on the index path.
+  rc=0; "$GZSTD" -l --cpu-only -q --tar "$IX/wi.tar.zst" nosuch >/dev/null 2>&1 || rc=$?
+  if diff <("$GZSTD" -l --cpu-only --tar "$IX/wi.tar.zst" t/sub 2>/dev/null) \
+          <("$GZSTD" -l --cpu-only --tar "$IX/wo.tar.zst" t/sub 2>/dev/null) >/dev/null 2>&1 \
+     && [[ $rc -ne 0 ]]; then
+    pass "member filter and Not-found work via index"
+  else fail "index member filter" "differs or rc=$rc"; fi
+
+  # 4. A damaged trailer falls back to the decompress walk silently.
+  cp "$IX/wi.tar.zst" "$IX/tr.tar.zst"; truncate -s -10 "$IX/tr.tar.zst"
+  if diff <("$GZSTD" -l --cpu-only --tar "$IX/tr.tar.zst" 2>/dev/null) \
+          <("$GZSTD" -l --cpu-only --tar "$IX/wo.tar.zst" 2>/dev/null) >/dev/null 2>&1; then
+    pass "damaged trailer falls back to the walk"
+  else fail "index fallback" "listing differs"; fi
+
+  # 5. --no-index really omits it (zstd -l reports no skippable frame).
+  sk=$(zstd -l "$IX/wo.tar.zst" 2>/dev/null | awk 'NR==2{print $2}')
+  [[ "$sk" == "0" ]] && pass "--no-index omits the skippable frame" \
+                     || fail "--no-index" "skips=$sk"
+
+  # 6. --progress: the decompress walk shows a meter on stderr and the
+  #    listing bytes are untouched; the (instant) index path stays silent.
+  "$GZSTD" -l --progress --cpu-only --tar "$IX/wo.tar.zst" >"$IX/pl.txt" 2>"$IX/pm.txt"
+  "$GZSTD" -l --progress --cpu-only --tar "$IX/wi.tar.zst" >/dev/null 2>"$IX/pim.txt"
+  if grep -q "in:" "$IX/pm.txt" && ! grep -q "in:" "$IX/pim.txt" \
+     && diff "$IX/pl.txt" <("$GZSTD" -l --cpu-only --tar "$IX/wo.tar.zst" 2>/dev/null) >/dev/null 2>&1; then
+    pass "-l --progress: meter on the walk, silent on the index path"
+  else fail "-l --progress" "meter missing, on index path, or listing changed"; fi
+  rm -rf "$IX"
 fi
 
 # ============================================================

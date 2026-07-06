@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.14.79
+**Current version:** v0.14.80
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -879,7 +879,9 @@ paths (one thread walks the stream in order). Open follow-ups:
      index in a zstd skippable frame at create time (file stays a standard
      `.tar.zst` — see the parse-index design note); readers seek straight to
      entry boundaries, no pre-walk. Foreign archives fall back to route 1 or the
-     serial walk.
+     serial walk. **Shipped in v0.14.80 for create + `-l` (instant listing;
+     records carry hdr_off/data_off/entry_end per member)** — the extract-side
+     seek/dispatch consumer is the remaining piece.
   Hard parts independent of which route: **directory-creation ordering** (a
   worker extracting `a/b/f` must not race the creation of `a/`, `a/b/` — needs an
   upfront dir-tree pass or per-prefix coordination), **write-stream contention**

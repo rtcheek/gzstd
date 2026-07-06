@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.79";
+static constexpr const char * GZSTD_VERSION = "0.14.80";
 //
 // Architecture overview:
 //
@@ -442,6 +442,7 @@ struct Options {
   bool tar_one_file_system = false;      // --one-file-system: don't cross mount points
   bool tar_xattrs = false;               // --xattrs: store/restore extended attributes (SCHILY.xattr.*)
   bool tar_acls = false;                 // --acls: store/restore POSIX ACLs (SCHILY.acl.*); needs both on create AND extract
+  bool tar_index = true;                 // --[no-]index: append the member-index skippable frame on create
   std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
 };
 
@@ -779,6 +780,8 @@ static void print_help()
 "  --xattrs            store/restore extended attributes (give on both create and extract)\n"
 "  --acls              store/restore POSIX ACLs (give on both create and extract)\n"
 "  --sparse            store sparse files compactly on create (GNU format; opt-in)\n"
+"  --no-index          create: skip the member index (instant -l); the index\n"
+"                      is a standard zstd skippable frame all tools ignore\n"
 "\n"
 "Compression level:\n"
 "  -1 .. -19           zstd level (default: 3)\n"
@@ -895,7 +898,15 @@ static void print_help_long()
 "     `zstd -l`.  Reads only frame headers, not the payload, so it is fast\n"
 "     even on huge archives.\n"
 "     With --tar (`-l --tar ARCHIVE [MEMBER...]`), lists the archive\n"
-"     contents by decompressing and parsing the tar headers in memory.\n"
+"     contents — instantly from the member index when the archive was\n"
+"     created by gzstd (see --[no-]index), otherwise by decompressing\n"
+"     and parsing the tar headers in memory.  Entries print as they\n"
+"     are found.  When the decompress walk produces the listing, the\n"
+"     progress meter shows on stderr — by default ONLY when the\n"
+"     listing is piped or redirected (and stderr is a terminal), so it\n"
+"     never interleaves with a listing on the same screen.  --progress\n"
+"     forces it on regardless; --no-progress (or -q) removes it if it\n"
+"     gets in the way.  The index path is instant and never shows one.\n"
 "     The output is BYTE-IDENTICAL to `tar -tvf` on the same archive —\n"
 "     same type letters, column alignment (including GNU tar's growing\n"
 "     owner/size column), date format, device major,minor, link\n"
@@ -1161,6 +1172,19 @@ static void print_help_long()
 "     --sparse a sparse file is stored with full content (Zstd still\n"
 "     compresses the zeros, but the archive is not marked sparse).\n"
 "     Extraction restores holes by default regardless; see --[no-]sparse.\n"
+"\n"
+"  --[no-]index (on create; default: on)\n"
+"     Append a member index to the archive so `-l --tar` lists it\n"
+"     INSTANTLY (two seeks and a small read) instead of decompressing\n"
+"     the whole archive.  The index lives in a standard zstd SKIPPABLE\n"
+"     frame after the tar data: every zstd decoder ignores it by\n"
+"     specification, so the file remains a plain .tar.zst that GNU\n"
+"     `tar --zstd -x` extracts unchanged, and `gzstd -d` decompresses\n"
+"     to a byte-identical tar stream with or without it.  Costs a few\n"
+"     bytes per member (compressed).  Listing archives with\n"
+"     no index (older gzstd, tar --zstd, --no-index) falls back to the\n"
+"     decompress walk automatically; `-t --tar` always verifies the\n"
+"     real stream and never trusts the index.\n"
 "\n"
 "  -d --tar ARCHIVE [MEMBER...]\n"
 "     Extract a .tar.zst archive (decompress AND untar in one pass).\n"
@@ -7717,6 +7741,12 @@ static void enqueue_direct_chunk(TaskQueue & q, size_t seq, const char * buf, si
 // changed during read.  main() promotes it to a non-zero exit (GNU tar parity).
 static std::atomic<bool> g_tar_had_errors{false};
 
+// --tar create: the member-index skippable frame, built by build_layout() and
+// appended by main() as the archive's final bytes once the writer is done
+// (see tarx::build_tar_index_frame).  Empty = no index (--no-index, or the
+// index would overflow the skippable frame's u32 size field).
+static std::string g_tar_index_frame;
+
 /*======================================================================
  --tar: native parallel GNU-format tar archive creation
  ----------------------------------------------------------------------
@@ -8365,6 +8395,77 @@ static std::string strip_leading_slash(std::string s, const Options & opt, bool 
   return s;
 }
 
+/*---- member-index skippable frame (instant -l, future seek-extract) ----
+ A zstd SKIPPABLE frame (magic 0x184D2A50) appended after the archive's last
+ data frame.  Every zstd decoder ignores skippable frames, so the file stays a
+ standard .tar.zst (GNU `tar --zstd` extracts it unchanged); gzstd -l reads it
+ to list without decompressing anything.  Payload layout:
+
+   [zstd-compressed index][u64 usize][u64 csize][8-byte magic "GZIDX001"]
+
+ The 24-byte trailer sits at EOF so a reader finds the index with two seeks
+ and can verify the skippable-frame header right before the compressed blob.
+ Anything without the trailer (foreign/older archives, data appended after)
+ falls back to the full decompress walk.  Index body, all little-endian:
+ u64 entry count, u64 tar-stream size, then per entry: typeflag u8, flags u8
+ (bit0 = sparse), mode u32, devmajor u32, devminor u32, uid u64, gid u64,
+ mtime i64, size u64, real_size u64, hdr_off u64, data_off u64, entry_end
+ u64, then 4 length-prefixed strings (u32 + bytes): path, link, uname, gname.
+ uname/gname are truncated to 31 bytes exactly like the ustar header fields,
+ so an index listing is byte-identical to the stream walk's.  */
+static const char TAR_INDEX_MAGIC[9] = "GZIDX001";
+
+static void idx_u32(std::string & s, uint32_t v) {
+  for (int i = 0; i < 4; ++i) s.push_back((char)(v >> (8 * i)));
+}
+static void idx_u64(std::string & s, uint64_t v) {
+  for (int i = 0; i < 8; ++i) s.push_back((char)(v >> (8 * i)));
+}
+static void idx_str(std::string & s, const std::string & v, size_t cap = SIZE_MAX) {
+  size_t n = std::min(v.size(), cap);
+  idx_u32(s, (uint32_t)n); s.append(v.data(), n);
+}
+
+static std::string build_tar_index_frame(const TarLayout & lay) {
+  std::string raw;
+  raw.reserve(lay.entries.size() * 96 + 16);
+  idx_u64(raw, (uint64_t)lay.entries.size());
+  idx_u64(raw, lay.total_size);
+  static const std::string empty;
+  for (const TarEntry & e : lay.entries) {
+    auto uit = lay.unames.find(e.uid);
+    auto git = lay.gnames.find(e.gid);
+    raw.push_back(e.typeflag);
+    raw.push_back(e.sparse_map.empty() ? 0 : 1);
+    idx_u32(raw, e.mode);
+    idx_u32(raw, (uint32_t)major((dev_t)e.rdev));
+    idx_u32(raw, (uint32_t)minor((dev_t)e.rdev));
+    idx_u64(raw, e.uid); idx_u64(raw, e.gid);
+    idx_u64(raw, (uint64_t)e.mtime);
+    idx_u64(raw, e.size); idx_u64(raw, e.real_size);
+    idx_u64(raw, e.hdr_off); idx_u64(raw, e.data_off); idx_u64(raw, e.entry_end);
+    idx_str(raw, e.path); idx_str(raw, e.link);
+    idx_str(raw, uit != lay.unames.end() ? uit->second : empty, 31);
+    idx_str(raw, git != lay.gnames.end() ? git->second : empty, 31);
+  }
+  size_t bound = ZSTD_compressBound(raw.size());
+  std::string comp(bound, '\0');
+  size_t cz = ZSTD_compress(&comp[0], bound, raw.data(), raw.size(), 9);
+  if (ZSTD_isError(cz)) return std::string();
+  comp.resize(cz);
+  uint64_t payload = comp.size() + 24;
+  if (payload > 0xFFFFFFFFull) return std::string();  // u32 frame-size field
+  std::string frame;
+  frame.reserve(8 + payload);
+  idx_u32(frame, 0x184D2A50u);            // zstd skippable-frame magic
+  idx_u32(frame, (uint32_t)payload);
+  frame += comp;
+  idx_u64(frame, (uint64_t)raw.size());
+  idx_u64(frame, (uint64_t)comp.size());
+  frame.append(TAR_INDEX_MAGIC, 8);
+  return frame;
+}
+
 static TarLayout build_layout(const Options & opt, Meter * m) {
   using _clk = std::chrono::steady_clock;
   auto _secs = [](_clk::time_point a, _clk::time_point b) {
@@ -8412,6 +8513,15 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
            + "(parallel)\n");
   }
   b.finalize();
+  // Member index (--no-index disables): built here where the final offsets
+  // are known; main() appends it after the last data frame is written.
+  if (opt.tar_index) {
+    g_tar_index_frame = build_tar_index_frame(b.lay);
+    if (opt.verbosity >= V_VERBOSE && !g_tar_index_frame.empty()) {
+      char sz[64]; human_bytes(double(g_tar_index_frame.size()), sz, sizeof(sz));
+      vlog(V_VERBOSE, opt, std::string("[TAR] member index built (") + sz + ")\n");
+    }
+  }
   if (opt.verbosity >= V_VERBOSE) {
     char sz[64]; human_bytes(double(b.lay.total_size), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, "[TAR] " + std::to_string(b.lay.entries.size())
@@ -8760,6 +8870,22 @@ public:
   bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
   uint64_t validated_files() const { return vfiles_; }
   uint64_t validated_bytes() const { return vbytes_; }
+
+  // -l --tar from the member index (see build_tar_index_frame): the same
+  // filter + byte-format path as the stream walk, with no decompression.
+  // Entries arrive in archive order, so the listing bytes match exactly.
+  void list_entries(const std::vector<InEntry> & es) {
+    for (const InEntry & e : es) {
+      if (!members_.empty()) {
+        int mi = match_member(norm(e.name));
+        if (mi < 0) continue;
+        member_hit_[mi] = 1;
+      }
+      print_list_entry(e);
+      ++vfiles_; vbytes_ += e.is_sparse ? e.real_size : e.size;
+    }
+    report_unmatched();
+  }
 
   // Writer-pool timing for the -v [WRITER] diagnosis.  Large-file part writes
   // run on the same pool (v0.14.72), so busy/starved covers ALL file bytes.
@@ -9856,6 +9982,81 @@ private:
     }
   }
 };
+
+// Read back the member index appended by --tar create (see
+// build_tar_index_frame for the layout).  Fills `entries` in archive order
+// and returns true only when every check passes — trailer magic, the
+// skippable-frame header anchoring the blob, decompressed size, and full
+// bounds checking of each record.  Any mismatch (foreign/older archive,
+// truncation, data appended after the index) returns false and the caller
+// does the decompress walk.  The FILE* is rewound to offset 0 either way.
+static bool read_tar_index(FILE * in, std::vector<InEntry> & entries) {
+  auto rd_u32 = [](const unsigned char * p) {
+    uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; };
+  auto rd_u64 = [](const unsigned char * p) {
+    uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; };
+  bool ok = false;
+  std::string comp, raw;
+  do {
+    if (std::fseek(in, 0, SEEK_END) != 0) break;
+    long endl = std::ftell(in);
+    if (endl < 40) break;                        // frame hdr + trailer minimum
+    uint64_t end = (uint64_t)endl;
+    unsigned char tr[24];
+    if (std::fseek(in, -24, SEEK_END) != 0 || std::fread(tr, 1, 24, in) != 24) break;
+    if (std::memcmp(tr + 16, TAR_INDEX_MAGIC, 8) != 0) break;
+    uint64_t usize = rd_u64(tr), csize = rd_u64(tr + 8);
+    if (csize > end - 32 || usize > (uint64_t)16 << 30) break;  // 16 GiB sanity cap
+    // Anchor: the skippable-frame header must sit right before the blob.
+    unsigned char fh[8];
+    if (std::fseek(in, (long)(end - 32 - csize), SEEK_SET) != 0
+        || std::fread(fh, 1, 8, in) != 8) break;
+    if (rd_u32(fh) != 0x184D2A50u || rd_u32(fh + 4) != csize + 24) break;
+    comp.resize((size_t)csize);
+    if (csize && std::fread(&comp[0], 1, (size_t)csize, in) != (size_t)csize) break;
+    raw.resize((size_t)usize);
+    size_t dz = ZSTD_decompress(usize ? &raw[0] : nullptr, (size_t)usize,
+                                comp.data(), comp.size());
+    if (ZSTD_isError(dz) || dz != usize) break;
+
+    size_t p = 0;
+    auto have = [&](size_t n) { return raw.size() - p >= n; };
+    auto ru32 = [&] { uint32_t v = rd_u32((const unsigned char *)raw.data() + p); p += 4; return v; };
+    auto ru64 = [&] { uint64_t v = rd_u64((const unsigned char *)raw.data() + p); p += 8; return v; };
+    if (!have(16)) break;
+    uint64_t count = ru64(); (void)ru64();       // entry count, tar-stream size
+    if (count > raw.size() / 94) break;          // 94 = minimum record size
+    entries.clear(); entries.reserve((size_t)count);
+    bool bad = false;
+    for (uint64_t k = 0; k < count && !bad; ++k) {
+      if (!have(94)) { bad = true; break; }
+      InEntry e;
+      e.typeflag  = raw[p++];
+      e.is_sparse = raw[p++] != 0;
+      e.mode      = ru32();
+      e.devmajor  = ru32();
+      e.devminor  = ru32();
+      e.uid       = ru64();
+      e.gid       = ru64();
+      e.mtime     = (int64_t)ru64();
+      e.size      = ru64();
+      e.real_size = ru64();
+      (void)ru64(); (void)ru64(); (void)ru64();  // hdr_off, data_off, entry_end
+      std::string * fields[4] = {&e.name, &e.linkname, &e.uname, &e.gname};
+      for (auto * f : fields) {
+        if (!have(4)) { bad = true; break; }
+        uint32_t n = ru32();
+        if (!have(n)) { bad = true; break; }
+        f->assign(raw, p, n); p += n;
+      }
+      if (!bad) entries.push_back(std::move(e));
+    }
+    ok = !bad && entries.size() == count;
+  } while (false);
+  std::rewind(in);
+  if (!ok) entries.clear();
+  return ok;
+}
 
 }  // namespace tarx
 #endif  // !_WIN32
@@ -14797,7 +14998,10 @@ static int list_zst(const Options & opt)
       if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {           // skippable frame
         if (pos + 8 > fsize) { ok = false; break; }
         uint32_t ssz; std::memcpy(&ssz, base + pos + 4, 4);
-        pos += 8 + (size_t)ssz; ++nskips; continue;
+        // zstd -l counts skippable frames in BOTH columns (Frames includes
+        // them; Skips breaks them out) — match it, or the counts diverge on
+        // archives carrying the --tar member index.
+        pos += 8 + (size_t)ssz; ++nskips; ++nframes; continue;
       }
       size_t csz = ZSTD_findFrameCompressedSize(base + pos, fsize - pos);
       if (ZSTD_isError(csz) || csz == 0) { ok = false; break; }
@@ -14854,6 +15058,33 @@ static int list_tar(const Options & opt, Meter * m)
       }
       std::rewind(in);
     }
+    // Instant path: a gzstd-created archive carries a member index in a
+    // trailing skippable frame (see tarx::build_tar_index_frame) — list from
+    // it without decompressing anything.  Same Extractor filter/format code,
+    // so the output bytes match the decompress walk (and tar -tvf) exactly.
+    if (arc != "-") {
+      std::vector<tarx::InEntry> ie;
+      if (tarx::read_tar_index(in, ie)) {
+        tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/false, /*list_only=*/true);
+        if (!opt.tar_members.empty()) {
+          std::vector<std::pair<std::string, int>> members;
+          for (const Options::TarMember & mm : opt.tar_members) members.emplace_back(mm.name, 0);
+          ex.set_members(std::move(members), {});
+        }
+        ex.list_entries(ie);
+        std::fflush(stdout);
+        vlog(V_VERBOSE, opt, "[TAR] listed from member index (no decompression)\n");
+        if (opt.verbosity >= V_DEFAULT) {
+          char sz[64]; human_bytes(double(ex.validated_bytes()), sz, sizeof sz);
+          std::string pfx = opt.tar_sources.size() > 1 ? arc + ": " : "";
+          std::fprintf(stderr, "%s%llu files, %s\n", pfx.c_str(),
+                       (unsigned long long)ex.validated_files(), sz);
+        }
+        if (ex.had_error() && rc == EXIT_OK) rc = EXIT_DATA;
+        if (in && in != stdin) std::fclose(in);
+        continue;
+      }
+    }
     FrameSink sink(tar_sink_budget(opt));
     g_tar_decomp_sink = &sink;
     tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/false, /*list_only=*/true);
@@ -14861,6 +15092,21 @@ static int list_tar(const Options & opt, Meter * m)
       std::vector<std::pair<std::string, int>> members;
       for (const Options::TarMember & mm : opt.tar_members) members.emplace_back(mm.name, 0);
       ex.set_members(std::move(members), {});
+    }
+    // Progress for the decompress walk, like -t/-d --tar (the index path
+    // above is instant and needs none).  Skipped when the listing itself is
+    // on the terminal — a \r meter interleaves badly with scrolling stdout —
+    // unless --progress asks for it explicitly.  Entries stream to stdout as
+    // they are parsed; the meter tracks the decompress underneath.
+    std::atomic<bool> prog_done{false};
+    std::thread prog_thr;
+    if (opt.force_progress || !is_stdout_tty()) {
+      uint64_t total_in = 0;
+      if (arc != "-") {
+        std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
+        if (!ec) total_in = (uint64_t)z;
+      }
+      prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done);
     }
     std::thread exth([&] { ex.run_sink(&sink); });
 
@@ -14883,6 +15129,8 @@ static int list_tar(const Options & opt, Meter * m)
     sink.close();
     exth.join();
     g_tar_decomp_sink = nullptr;
+    prog_done = true;
+    if (prog_thr.joinable()) prog_thr.join();   // meter off before the footer
     if (in && in != stdin) std::fclose(in);
     std::fflush(stdout);
 
@@ -14897,6 +15145,24 @@ static int list_tar(const Options & opt, Meter * m)
   return rc;
 }
 #endif  // !_WIN32
+
+#ifndef _WIN32
+// Append raw bytes at EOF through a possibly-O_DIRECT fd: clear O_DIRECT
+// first (the tail is unaligned) and write().  Used for the --tar member
+// index, which must be the archive's final bytes.
+static bool append_plain_fd(int fd, const std::string & b) {
+  int fl = ::fcntl(fd, F_GETFL);
+  if (fl >= 0 && (fl & O_DIRECT)) (void)::fcntl(fd, F_SETFL, fl & ~O_DIRECT);
+  if (::lseek(fd, 0, SEEK_END) < 0) return false;
+  size_t off = 0;
+  while (off < b.size()) {
+    ssize_t w = ::write(fd, b.data() + off, b.size() - off);
+    if (w < 0) { if (errno == EINTR) continue; return false; }
+    off += (size_t)w;
+  }
+  return true;
+}
+#endif
 
 int main(int argc, char ** argv)
 {
@@ -15549,6 +15815,17 @@ int main(int argc, char ** argv)
     auto t_fin = std::chrono::steady_clock::now();
     if (!g_direct_writer->finalize())
       die_io("failed to finalize O_DIRECT output");
+    // --tar create: append the member-index skippable frame as the archive's
+    // final bytes (built by build_layout; see tarx::build_tar_index_frame).
+    // After finalize the file length is exact, so a plain append lands the
+    // trailer at EOF; the fd needs O_DIRECT cleared for the unaligned tail.
+    if (!g_tar_index_frame.empty()) {
+      int dfd = g_direct_writer->fd();
+      if (dfd < 0 || !append_plain_fd(dfd, g_tar_index_frame))
+        die_io("failed to append tar member index");
+      meter.wrote_bytes.fetch_add(g_tar_index_frame.size(), std::memory_order_relaxed);
+      g_tar_index_frame.clear();
+    }
     if (opt.sync_output) {
       // --direct closed the FILE* and writes via DirectWriter's own fd, so the
       // fsync_file(out) path below never runs.  Flush the O_DIRECT fd here
@@ -15561,6 +15838,16 @@ int main(int argc, char ** argv)
     direct_writer.reset();
     finalize_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
         std::chrono::steady_clock::now() - t_fin).count();
+  }
+
+  // --tar create, buffered / stdout output: append the member index here
+  // (the O_DIRECT path appended via the writer's fd above).
+  if (!g_tar_index_frame.empty() && out) {
+    if (std::fwrite(g_tar_index_frame.data(), 1, g_tar_index_frame.size(), out)
+        != g_tar_index_frame.size())
+      die_io("failed to append tar member index");
+    meter.wrote_bytes.fetch_add(g_tar_index_frame.size(), std::memory_order_relaxed);
+    g_tar_index_frame.clear();
   }
 #endif
 
@@ -16099,6 +16386,8 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--one-file-system") opt.tar_one_file_system = true;
     else if (a == "--xattrs") opt.tar_xattrs = true;
     else if (a == "--acls") opt.tar_acls = true;
+    else if (a == "--index") opt.tar_index = true;
+    else if (a == "--no-index") opt.tar_index = false;
     else if (a == "-C" || a == "--directory") {
       if (i + 1 >= argc) die_usage("missing value for " + a);
       opt.tar_dest = tar_chain_dest(opt.tar_dest, argv[++i]);

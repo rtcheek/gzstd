@@ -1,11 +1,17 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.79  
+**Covers:** v0.9.50 → v0.14.80  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.80 — member index in a skippable frame: instant -l --tar (~0.2 s at any archive size)
+
+**`--tar` create now appends a member index; `-l --tar` reads it and lists without decompressing anything.** The index is a zstd SKIPPABLE frame after the tar data — part of the zstd format spec, ignored by every decoder — so the file stays a standard `.tar.zst`: GNU `tar --zstd -x` extracts it unchanged and `gzstd -d` produces a byte-identical tar stream with or without it (both verified). The frame carries one record per member (type, mode, owner ids + names, sizes, mtime, device numbers, and each entry's tar-stream offsets for future seek-based selective extraction) zstd-compressed with a self-locating 24-byte trailer at EOF, so the lister finds it with two seeks. Measured: **9 GiB / 20k-entry archive lists in 0.24 s vs 4.97 s** for the decompress walk — and the indexed time is O(index), not O(archive), so a 40+ GiB backup lists in ~0.2 s where the walk takes minutes on NVMe-limited hardware. Cost: ~6 bytes per member (119 KB for 20k entries) and no measurable create or extract time (alternating create runs land within noise; extraction skips the frame by spec). The index path reuses the walk's exact filter/format code, so listings — including MEMBER selection and `Not found in archive` errors — are byte-identical to the walk and to `tar -tvf`; uname/gname are stored 31-byte-truncated like the ustar fields to keep that guarantee. Robust fallbacks: no trailer (foreign/older archives), damaged/truncated trailer, data appended after the index, or a corrupt blob all fall back silently to the decompress walk (bounds-checked parse, 16 GiB decompressed-size sanity cap, and the skippable-frame header is verified to sit exactly where the trailer claims). `--no-index` opts out on create; `-t --tar` deliberately never trusts the index and always verifies the real stream. Groundwork for ROADMAP's parallel-dispatch extract route 2.
+
+Two smaller `-l` fixes landed with this: plain `-l` now counts skippable frames in the `Frames` column like `zstd -l` does (the two only ever agreed before because gzstd archives had no skippable frames), and `-l --tar`'s decompress walk now shows the standard progress meter on stderr — like `-t`/`-d --tar` always did — when the listing is piped/redirected or `--progress` is given (never on the instant index path, and never interleaved with a listing that shares the terminal). Walk listings have streamed entries incrementally since v0.14.79; the meter now shows the decompress running underneath them.
 
 ## v0.14.79 — stream sizeless single-frame archives (tar --zstd): instant -l, constant memory
 
