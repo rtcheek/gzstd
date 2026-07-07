@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.80";
+static constexpr const char * GZSTD_VERSION = "0.14.81";
 //
 // Architecture overview:
 //
@@ -6571,14 +6571,30 @@ static int64_t peek_first_frame_decomp_size(FILE * in)
   if (!in) return -1;
   long pos = std::ftell(in);
   if (pos < 0) return -1;  // not seekable (pipe / stdin)
-  unsigned char buf[64];
-  size_t n = std::fread(buf, 1, sizeof(buf), in);
+  int64_t ret = -1;
+  long at = pos;
+  // Skip leading SKIPPABLE frames (pzstd prepends one per chunk):
+  // ZSTD_getFrameContentSize reports 0 for them, which would defeat the
+  // sizeless/huge-DATA-frame detection this peek exists for (v0.14.81 fix).
+  // Bounded hops so a pathological chain of skippables can't spin the peek.
+  for (int hop = 0; hop < 16; ++hop) {
+    unsigned char buf[64];
+    if (std::fseek(in, at, SEEK_SET) != 0) break;
+    size_t n = std::fread(buf, 1, sizeof(buf), in);
+    if (n < 8) break;
+    uint32_t magic; std::memcpy(&magic, buf, 4);
+    if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {          // skippable frame
+      uint32_t ssz; std::memcpy(&ssz, buf + 4, 4);
+      at += 8 + (long)ssz;                               // hop to the next frame
+      continue;
+    }
+    unsigned long long size = ZSTD_getFrameContentSize(buf, n);
+    if (size != ZSTD_CONTENTSIZE_UNKNOWN && size != ZSTD_CONTENTSIZE_ERROR)
+      ret = (int64_t)size;
+    break;
+  }
   if (std::fseek(in, pos, SEEK_SET) != 0) return -1;
-  if (n < 4) return -1;
-  unsigned long long size = ZSTD_getFrameContentSize(buf, n);
-  if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR)
-    return -1;
-  return (int64_t)size;
+  return ret;
 }
 
 // True when a SEEKABLE input's first frame must go to the sequential
@@ -8489,7 +8505,8 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
     // (`-C /dir1 user-data` reads /dir1/user-data, stores "user-data").
     // An absolute source ignores -C, exactly like tar.
     std::string fspath = src;
-    const std::string & cdir = opt.tar_source_dest[si];
+    const std::string cdir =
+        si < opt.tar_source_dest.size() ? opt.tar_source_dest[si] : std::string(".");
     if (!src.empty() && src[0] != '/' && cdir != ".")
       fspath = cdir + "/" + src;
     b.enumerate(fspath, member, (dev_t)-1, DT_UNKNOWN);
@@ -8845,7 +8862,7 @@ public:
   // simply fail for ids the real user cannot assign.
   Extractor(int dest_fd, const Options & opt, Meter * m, bool validate_only = false,
             bool list_only = false)
-    : dest_fd_(dest_fd), opt_(opt), m_(m),
+    : opt_(opt), m_(m),
       as_root_(::geteuid() == 0 || std::getenv("GZSTD_DEBUG_FAKE_ROOT") != nullptr),
       validate_only_(validate_only), list_only_(list_only) { roots_.push_back(dest_fd); }
   ~Extractor() = default;   // writer pool joined by stop_pool()
@@ -8868,21 +8885,17 @@ public:
   }
 
   bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
+  bool had_unmatched() const { return unmatched_; }
   uint64_t validated_files() const { return vfiles_; }
   uint64_t validated_bytes() const { return vbytes_; }
 
   // -l --tar from the member index (see build_tar_index_frame): the same
-  // filter + byte-format path as the stream walk, with no decompression.
-  // Entries arrive in archive order, so the listing bytes match exactly.
+  // filter_entry/list_count code the stream walk runs, with no
+  // decompression, so the listing bytes match the walk exactly.
   void list_entries(const std::vector<InEntry> & es) {
     for (const InEntry & e : es) {
-      if (!members_.empty()) {
-        int mi = match_member(norm(e.name));
-        if (mi < 0) continue;
-        member_hit_[mi] = 1;
-      }
-      print_list_entry(e);
-      ++vfiles_; vbytes_ += e.is_sparse ? e.real_size : e.size;
+      if (filter_entry(norm(e.name)) < 0) continue;
+      list_count(e);
     }
     report_unmatched();
   }
@@ -8934,13 +8947,13 @@ public:
 private:
 
   static constexpr uint64_t SMALL_FILE_MAX = 4 * 1024 * 1024;  // one pool job below this; windowed part jobs above
-  int dest_fd_; const Options & opt_; Meter * m_; bool as_root_;
+  const Options & opt_; Meter * m_; bool as_root_;   // extraction root = roots_[0]
   bool validate_only_ = false;
   bool list_only_ = false;
   bool read_only() const { return validate_only_ || list_only_; }  // no writer pool
 
   // Member selection (see set_members).  Every path-resolving helper takes a
-  // root index into roots_ (default 0 = dest_fd_) so a member bound to its own
+  // root index into roots_ (default 0 = the ctor's dest_fd) so a member bound to its own
   // -C extracts under it — including work replayed later on writer-pool
   // threads and in finish_deferred, which is why Job/BigFile/Hard/DirMeta all
   // carry the index rather than an fd of their own.
@@ -8962,10 +8975,36 @@ private:
     return -1;
   }
 
-  // GNU parity: selectors that matched nothing are per-name errors.
+  // GNU parity: selectors that matched nothing are per-name errors — but
+  // USAGE errors (exit 1), not data errors: the archive itself is fine, so
+  // they set unmatched_ rather than had_error_ (v0.14.81; previously -l
+  // mapped them to exit 4 "corrupt input" while -d gave 1).
+  bool unmatched_ = false;
   void report_unmatched() {
     for (size_t k = 0; k < members_.size(); ++k)
-      if (!member_hit_[k]) fail(members_[k].first, "Not found in archive");
+      if (!member_hit_[k]) {
+        unmatched_ = true;
+        vlog(V_ERROR, opt_, "gzstd: untar: " + members_[k].first + ": Not found in archive\n");
+      }
+  }
+
+  // The per-entry member filter shared by the stream walk and the index
+  // path.  Returns the matched member's root index (0 with no selection),
+  // or -1 when selection skips the entry.
+  int filter_entry(const std::string & rel) {
+    if (members_.empty()) return 0;
+    int mi = match_member(rel);
+    if (mi < 0) return -1;
+    member_hit_[mi] = 1;
+    return members_[mi].second;
+  }
+
+  // The per-entry read-only accounting (print + counters) shared by the
+  // stream walk and the index path, so the two listings can never drift —
+  // the duplicated-computation shape behind the v0.14.76 corruption bug.
+  void list_count(const InEntry & e) {
+    if (list_only_) print_list_entry(e);
+    ++vfiles_; vbytes_ += e.is_sparse ? e.real_size : e.size;
   }
 
   // GNU tar's default ownership restore (as root): the stored uname/gname is
@@ -8979,13 +9018,25 @@ private:
     auto & cache = is_group ? gid_by_name_ : uid_by_name_;
     auto it = cache.find(nm);
     if (it == cache.end()) {
-      int64_t id = -1; char buf[4096];
-      if (is_group) {
-        struct group g, *res = nullptr;
-        if (getgrnam_r(nm.c_str(), &g, buf, sizeof buf, &res) == 0 && res) id = (int64_t)g.gr_gid;
-      } else {
-        struct passwd p, *res = nullptr;
-        if (getpwnam_r(nm.c_str(), &p, buf, sizeof buf, &res) == 0 && res) id = (int64_t)p.pw_uid;
+      // ERANGE means the buffer was too small for the record (a group with
+      // many members — routine on LDAP/NSS hosts), NOT "no such name": retry
+      // with a doubled buffer or big groups silently chown numeric (v0.14.81
+      // fix).  Result is cached either way, so the retries are once per name.
+      int64_t id = -1;
+      std::vector<char> buf(4096);
+      for (;;) {
+        int rc;
+        if (is_group) {
+          struct group g, *res = nullptr;
+          rc = getgrnam_r(nm.c_str(), &g, buf.data(), buf.size(), &res);
+          if (rc == 0 && res) id = (int64_t)g.gr_gid;
+        } else {
+          struct passwd p, *res = nullptr;
+          rc = getpwnam_r(nm.c_str(), &p, buf.data(), buf.size(), &res);
+          if (rc == 0 && res) id = (int64_t)p.pw_uid;
+        }
+        if (rc == ERANGE && buf.size() < (size_t)1 << 20) { buf.resize(buf.size() * 2); continue; }
+        break;
       }
       it = cache.emplace(nm, id).first;
     }
@@ -9374,6 +9425,7 @@ private:
     while (d < len) {
       ssize_t w = ::pwrite(fd, p + d, len - d, (off_t)(at + d));
       if (w < 0) { if (errno == EINTR) continue; return false; }
+      if (w == 0) return false;               // no progress possible: don't spin
       d += (size_t)w;
     }
     return true;
@@ -9778,21 +9830,15 @@ private:
 
     // Member selection (-d/-l --tar ARCHIVE MEMBER...): skip entries no
     // selector picks, consuming their data so the parser stays aligned.
-    int root = 0;
-    if (!members_.empty()) {
-      int mi = match_member(rel);
-      if (mi < 0) { if (e.size) { r.skip(e.size); r.skip(pad); } return; }
-      member_hit_[mi] = 1;
-      root = members_[mi].second;
-    }
+    int root = filter_entry(rel);
+    if (root < 0) { if (e.size) { r.skip(e.size); r.skip(pad); } return; }
 
     // Read-only walks (`-t --tar` validate, `-l --tar` list): the header
     // checksum was already verified in parse(); count the member, list it if
     // requested, and consume its data so the parser stays aligned.  A short read
     // here (truncated archive) is caught by parse().
     if (read_only()) {
-      if (list_only_) print_list_entry(e);
-      ++vfiles_; vbytes_ += e.is_sparse ? e.real_size : e.size;
+      list_count(e);
       if (e.size) { r.skip(e.size); r.skip(pad); }
       return;
     }
@@ -10006,7 +10052,9 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries) {
     if (std::fseek(in, -24, SEEK_END) != 0 || std::fread(tr, 1, 24, in) != 24) break;
     if (std::memcmp(tr + 16, TAR_INDEX_MAGIC, 8) != 0) break;
     uint64_t usize = rd_u64(tr), csize = rd_u64(tr + 8);
-    if (csize > end - 32 || usize > (uint64_t)16 << 30) break;  // 16 GiB sanity cap
+    // 1 GiB cap ≈ >10M members at ~100 B/record — generous for any real
+    // index, and it bounds what a forged trailer can make us allocate.
+    if (csize > end - 32 || usize > (uint64_t)1 << 30) break;
     // Anchor: the skippable-frame header must sit right before the blob.
     unsigned char fh[8];
     if (std::fseek(in, (long)(end - 32 - csize), SEEK_SET) != 0
@@ -10014,6 +10062,12 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries) {
     if (rd_u32(fh) != 0x184D2A50u || rd_u32(fh + 4) != csize + 24) break;
     comp.resize((size_t)csize);
     if (csize && std::fread(&comp[0], 1, (size_t)csize, in) != (size_t)csize) break;
+    // The blob was written with ZSTD_compress, which embeds its content size:
+    // it must corroborate the trailer BEFORE we allocate usize bytes, so a
+    // forged trailer can't demand an allocation the frame won't back.
+    unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), comp.size());
+    if (fcs == ZSTD_CONTENTSIZE_UNKNOWN || fcs == ZSTD_CONTENTSIZE_ERROR
+        || fcs != usize) break;
     raw.resize((size_t)usize);
     size_t dz = ZSTD_decompress(usize ? &raw[0] : nullptr, (size_t)usize,
                                 comp.data(), comp.size());
@@ -14701,7 +14755,7 @@ static int extract_tar(const Options & opt, Meter * m)
       vlog(V_DEBUG, opt, b);
     }
     if (in && in != stdin) std::fclose(in);
-    if (ex.had_error() && rc == EXIT_OK) rc = EXIT_ERROR;
+    if ((ex.had_error() || ex.had_unmatched()) && rc == EXIT_OK) rc = EXIT_ERROR;
     if (opt.keep_going) {
       int sev = report_keep_going_damage_tar(opt);   // names damaged files; 6/7 or OK
       if (sev > rc) rc = sev;                         // recovery verdict outranks a plain error
@@ -15058,89 +15112,81 @@ static int list_tar(const Options & opt, Meter * m)
       }
       std::rewind(in);
     }
-    // Instant path: a gzstd-created archive carries a member index in a
-    // trailing skippable frame (see tarx::build_tar_index_frame) — list from
-    // it without decompressing anything.  Same Extractor filter/format code,
-    // so the output bytes match the decompress walk (and tar -tvf) exactly.
-    if (arc != "-") {
-      std::vector<tarx::InEntry> ie;
-      if (tarx::read_tar_index(in, ie)) {
-        tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/false, /*list_only=*/true);
-        if (!opt.tar_members.empty()) {
-          std::vector<std::pair<std::string, int>> members;
-          for (const Options::TarMember & mm : opt.tar_members) members.emplace_back(mm.name, 0);
-          ex.set_members(std::move(members), {});
-        }
-        ex.list_entries(ie);
-        std::fflush(stdout);
-        vlog(V_VERBOSE, opt, "[TAR] listed from member index (no decompression)\n");
-        if (opt.verbosity >= V_DEFAULT) {
-          char sz[64]; human_bytes(double(ex.validated_bytes()), sz, sizeof sz);
-          std::string pfx = opt.tar_sources.size() > 1 ? arc + ": " : "";
-          std::fprintf(stderr, "%s%llu files, %s\n", pfx.c_str(),
-                       (unsigned long long)ex.validated_files(), sz);
-        }
-        if (ex.had_error() && rc == EXIT_OK) rc = EXIT_DATA;
-        if (in && in != stdin) std::fclose(in);
-        continue;
-      }
-    }
-    FrameSink sink(tar_sink_budget(opt));
-    g_tar_decomp_sink = &sink;
+    // ONE Extractor serves both listing routes below, so the filtering,
+    // formatting, footer, and exit-code mapping cannot drift between them.
     tarx::Extractor ex(-1, opt, /*meter=*/nullptr, /*validate_only=*/false, /*list_only=*/true);
     if (!opt.tar_members.empty()) {   // -l --tar ARCHIVE MEMBER...: list only those
       std::vector<std::pair<std::string, int>> members;
       for (const Options::TarMember & mm : opt.tar_members) members.emplace_back(mm.name, 0);
       ex.set_members(std::move(members), {});
     }
-    // Progress for the decompress walk, like -t/-d --tar (the index path
-    // above is instant and needs none).  Skipped when the listing itself is
-    // on the terminal — a \r meter interleaves badly with scrolling stdout —
-    // unless --progress asks for it explicitly.  Entries stream to stdout as
-    // they are parsed; the meter tracks the decompress underneath.
-    std::atomic<bool> prog_done{false};
-    std::thread prog_thr;
-    if (opt.force_progress || !is_stdout_tty()) {
-      uint64_t total_in = 0;
-      if (arc != "-") {
-        std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
-        if (!ec) total_in = (uint64_t)z;
-      }
-      prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done);
-    }
-    std::thread exth([&] { ex.run_sink(&sink); });
 
-    Options dopt = opt;
-    dopt.sparse_mode = 0; dopt.unsafe_overwrite = true; dopt.mode = Mode::DECOMPRESS;
-    int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
-    // Named input with a huge or sizeless first frame (tar --zstd, zstd
-    // streams, --sliding-window): decode it incrementally — see
-    // needs_stream_decode.  Stdin keeps the sequential batch reader.
-    if (arc != "-" && needs_stream_decode(ff)) {
-      decompress_stream_from_file(in, nullptr, dopt, m);
-    } else {
-#ifdef HAVE_NVCOMP
-      if (dopt.cpu_only) decompress_cpu_mt(in, nullptr, dopt, m);
-      else               decompress_nvcomp(in, nullptr, dopt, m);
-#else
-      decompress_cpu_mt(in, nullptr, dopt, m);
-#endif
+    // Instant route: a gzstd-created archive carries a member index in a
+    // trailing skippable frame (see tarx::build_tar_index_frame) — list from
+    // it without decompressing anything.
+    bool from_index = false;
+    if (arc != "-") {
+      std::vector<tarx::InEntry> ie;
+      if (tarx::read_tar_index(in, ie)) {
+        ex.list_entries(ie);
+        vlog(V_VERBOSE, opt, "[TAR] listed from member index (no decompression)\n");
+        from_index = true;
+      }
     }
-    sink.close();
-    exth.join();
-    g_tar_decomp_sink = nullptr;
-    prog_done = true;
-    if (prog_thr.joinable()) prog_thr.join();   // meter off before the footer
+
+    if (!from_index) {  // decompress walk
+      FrameSink sink(tar_sink_budget(opt));
+      g_tar_decomp_sink = &sink;
+      // Progress for the walk, like -t/-d --tar (the index route is instant
+      // and needs none).  Skipped when the listing itself is on the terminal
+      // — a \r meter interleaves badly with scrolling stdout — unless
+      // --progress asks explicitly.  Entries stream to stdout as they are
+      // parsed; the meter tracks the decompress underneath.
+      std::atomic<bool> prog_done{false};
+      std::thread prog_thr;
+      if (opt.force_progress || !is_stdout_tty()) {
+        uint64_t total_in = 0;
+        if (arc != "-") {
+          std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
+          if (!ec) total_in = (uint64_t)z;
+        }
+        prog_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &prog_done);
+      }
+      std::thread exth([&] { ex.run_sink(&sink); });
+
+      Options dopt = opt;
+      dopt.sparse_mode = 0; dopt.unsafe_overwrite = true; dopt.mode = Mode::DECOMPRESS;
+      int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
+      // Named input with a huge or sizeless first frame (tar --zstd, zstd
+      // streams, --sliding-window): decode it incrementally — see
+      // needs_stream_decode.  Stdin keeps the sequential batch reader.
+      if (arc != "-" && needs_stream_decode(ff)) {
+        decompress_stream_from_file(in, nullptr, dopt, m);
+      } else {
+#ifdef HAVE_NVCOMP
+        if (dopt.cpu_only) decompress_cpu_mt(in, nullptr, dopt, m);
+        else               decompress_nvcomp(in, nullptr, dopt, m);
+#else
+        decompress_cpu_mt(in, nullptr, dopt, m);
+#endif
+      }
+      sink.close();
+      exth.join();
+      g_tar_decomp_sink = nullptr;
+      prog_done = true;
+      if (prog_thr.joinable()) prog_thr.join();   // meter off before the footer
+    }
+
     if (in && in != stdin) std::fclose(in);
     std::fflush(stdout);
-
     if (opt.verbosity >= V_DEFAULT) {  // footer summary (stderr, so stdout stays a clean listing)
       char sz[64]; human_bytes(double(ex.validated_bytes()), sz, sizeof sz);
       std::string pfx = opt.tar_sources.size() > 1 ? arc + ": " : "";
       std::fprintf(stderr, "%s%llu files, %s\n", pfx.c_str(),
                    (unsigned long long)ex.validated_files(), sz);
     }
-    if (ex.had_error() && rc == EXIT_OK) rc = EXIT_DATA;
+    if      (ex.had_error()     && rc == EXIT_OK) rc = EXIT_DATA;   // corrupt archive
+    else if (ex.had_unmatched() && rc == EXIT_OK) rc = EXIT_ERROR;  // bad member name
   }
   return rc;
 }
@@ -15158,9 +15204,29 @@ static bool append_plain_fd(int fd, const std::string & b) {
   while (off < b.size()) {
     ssize_t w = ::write(fd, b.data() + off, b.size() - off);
     if (w < 0) { if (errno == EINTR) continue; return false; }
+    if (w == 0) return false;                 // no progress possible: don't spin
     off += (size_t)w;
   }
   return true;
+}
+
+// The ONE place the --tar member index reaches the output (see
+// build_tar_index_frame).  dfd >= 0: the O_DIRECT writer's fd (post-
+// finalize); else `f` (buffered file or stdout).  Dies on failure — a
+// short index would leave a trailer that read_tar_index rejects, but the
+// user asked for an archive with an index and didn't get one.  NOTE: these
+// bytes land AFTER --verify's in-memory frame taps; the loud failure here
+// is the coverage.  Any new output route must call this or the index is
+// silently absent (-l just falls back to the walk — no test fails).
+static void append_tar_index(int dfd, FILE * f, Meter & meter) {
+  if (g_tar_index_frame.empty()) return;
+  bool ok = false;
+  if (dfd >= 0) ok = append_plain_fd(dfd, g_tar_index_frame);
+  else if (f)   ok = robust_fwrite(g_tar_index_frame.data(), g_tar_index_frame.size(), f)
+                     == g_tar_index_frame.size();
+  if (!ok) die_io("failed to append tar member index");
+  meter.wrote_bytes.fetch_add(g_tar_index_frame.size(), std::memory_order_relaxed);
+  g_tar_index_frame.clear();
 }
 #endif
 
@@ -15819,13 +15885,7 @@ int main(int argc, char ** argv)
     // final bytes (built by build_layout; see tarx::build_tar_index_frame).
     // After finalize the file length is exact, so a plain append lands the
     // trailer at EOF; the fd needs O_DIRECT cleared for the unaligned tail.
-    if (!g_tar_index_frame.empty()) {
-      int dfd = g_direct_writer->fd();
-      if (dfd < 0 || !append_plain_fd(dfd, g_tar_index_frame))
-        die_io("failed to append tar member index");
-      meter.wrote_bytes.fetch_add(g_tar_index_frame.size(), std::memory_order_relaxed);
-      g_tar_index_frame.clear();
-    }
+    append_tar_index(g_direct_writer->fd(), nullptr, meter);
     if (opt.sync_output) {
       // --direct closed the FILE* and writes via DirectWriter's own fd, so the
       // fsync_file(out) path below never runs.  Flush the O_DIRECT fd here
@@ -15841,14 +15901,8 @@ int main(int argc, char ** argv)
   }
 
   // --tar create, buffered / stdout output: append the member index here
-  // (the O_DIRECT path appended via the writer's fd above).
-  if (!g_tar_index_frame.empty() && out) {
-    if (std::fwrite(g_tar_index_frame.data(), 1, g_tar_index_frame.size(), out)
-        != g_tar_index_frame.size())
-      die_io("failed to append tar member index");
-    meter.wrote_bytes.fetch_add(g_tar_index_frame.size(), std::memory_order_relaxed);
-    g_tar_index_frame.clear();
-  }
+  // (the O_DIRECT path appended via the writer's fd above and cleared it).
+  append_tar_index(-1, out, meter);
 #endif
 
   if (!to_stdout) {
@@ -16338,6 +16392,16 @@ static Options parse_args(int argc, char ** argv)
 
   std::string pinned_value_tmp; // scratch buffer for --pinned VALUE parsing
   (void)pinned_value_tmp; // referenced only under HAVE_NVCOMP
+  // EVERY positional goes through here: a post---tar positional must carry
+  // the -C in effect at its position (the parallel tar_source_dest vector).
+  // A push site that bypasses this desyncs the vectors and their consumers
+  // index out of bounds — the v0.14.80 `--tar -- SRC` segfault.
+  auto push_positional = [&opt](const std::string & p) {
+    if (opt.tar_mode) {
+      opt.tar_sources.push_back(p);
+      opt.tar_source_dest.push_back(opt.tar_dest);
+    } else opt.inputs.push_back(p);
+  };
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "-h" || a == "-?") { print_help(); std::exit(EXIT_OK); }
@@ -16567,8 +16631,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--") {
       // End of options — everything after this is a literal path (archive
       // sources in --tar mode, input files otherwise).
-      for (++i; i < argc; ++i)
-        (opt.tar_mode ? opt.tar_sources : opt.inputs).push_back(argv[i]);
+      for (++i; i < argc; ++i) push_positional(argv[i]);
     }
     // === zstd-compat layer: accept flags we don't implement so gzstd can
     // serve as a drop-in replacement.  Real aliases are handled above; below
@@ -16694,10 +16757,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a.size() > 1 && a[0] == '-' && a != "-") {
       die_usage("unknown option: " + a);
     }
-    else {
-      if (opt.tar_mode) { opt.tar_sources.push_back(a); opt.tar_source_dest.push_back(opt.tar_dest); }
-      else opt.inputs.push_back(a);
-    }
+    else push_positional(a);
   }
   // -d/-l --tar ARCHIVE MEMBER...: the first positional after --tar is the
   // archive; the rest select members (tar name-arg semantics), each bound to
@@ -16706,9 +16766,10 @@ static Options parse_args(int argc, char ** argv)
   // source its own -C root — see the enumerate loop in synthesize_tar.)
   if (opt.tar_mode && opt.mode == Mode::DECOMPRESS && opt.tar_sources.size() > 1) {
     for (size_t k = 1; k < opt.tar_sources.size(); ++k)
-      opt.tar_members.push_back({opt.tar_sources[k], opt.tar_source_dest[k]});
+      opt.tar_members.push_back({opt.tar_sources[k],
+          k < opt.tar_source_dest.size() ? opt.tar_source_dest[k] : opt.tar_dest});
     opt.tar_sources.resize(1);
-    opt.tar_source_dest.resize(1);
+    opt.tar_source_dest.resize(opt.tar_source_dest.empty() ? 0 : 1);
   }
   if (opt.inputs.empty()) opt.inputs.push_back("-");
 

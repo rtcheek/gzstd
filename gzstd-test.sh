@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=274
-$EXTENSIVE && EXPECTED_TESTS=390
+EXPECTED_TESTS=277
+$EXTENSIVE && EXPECTED_TESTS=393
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -4003,7 +4003,27 @@ else
     pass "create: relative -C chains like GNU tar"
   else fail "create relative -C chaining" "member names differ from GNU tar"; fi
 
-  rm -rf "$MS" "$MARC" "$CR" "$CARC" "$TMPDIR/m.tar" "$TMPDIR/cr.tar" "$TMPDIR"/mout? "$TMPDIR/crout" "$merr"
+  # 11. Regression (v0.14.81): positionals after a literal `--` carry their
+  #     -C binding too — the v0.14.80 single-push desync SEGFAULTED on
+  #     `--tar -- SRC` and `-d --tar ARCHIVE -- MEMBER`.
+  MD="$TMPDIR/mout11"; rm -rf "$MD"; mkdir -p "$MD"
+  rc1=0; "$GZSTD" --cpu-only -q -f -o "$MD/d.tar.zst" --tar -C "$MS" -- src 2>/dev/null || rc1=$?
+  rc2=0; (cd "$MD" && "$GZSTD" -d --cpu-only -q --tar d.tar.zst -- src/a/f1) 2>/dev/null || rc2=$?
+  if [[ $rc1 -eq 0 && $rc2 -eq 0 && -f "$MD/src/a/f1" ]]; then
+    pass "literal -- after --tar (create + member select)"
+  else fail "literal -- after --tar" "create rc=$rc1 extract rc=$rc2"; fi
+
+  # 12. Regression (v0.14.81): an unmatched member name exits 1 (usage/runtime
+  #     error) on BOTH -d and -l — not 4, which the exit-code table reserves
+  #     for corrupt data.
+  rc1=0; "$GZSTD" -l --cpu-only -q --tar "$MARC" nosuch >/dev/null 2>&1 || rc1=$?
+  MD="$TMPDIR/mout12"; rm -rf "$MD"; mkdir -p "$MD"
+  rc2=0; (cd "$MD" && "$GZSTD" -d --cpu-only -q --tar "$MARC" nosuch) >/dev/null 2>&1 || rc2=$?
+  if [[ $rc1 -eq 1 && $rc2 -eq 1 ]]; then
+    pass "unmatched member exits 1 on -l and -d (not EXIT_DATA)"
+  else fail "unmatched member exit codes" "-l rc=$rc1 -d rc=$rc2 (want 1/1)"; fi
+
+  rm -rf "$MS" "$MARC" "$CR" "$CARC" "$TMPDIR/m.tar" "$TMPDIR/cr.tar" "$TMPDIR"/mout* "$TMPDIR/crout" "$merr"
 fi
 
 # ============================================================
@@ -4084,7 +4104,7 @@ else
   # decoder: the batch path cannot size its output and slurps the whole
   # compressed file into RAM before emitting anything (v0.14.79 fix).
   SF="$TMPDIR/sfsrc"; rm -rf "$SF"; mkdir -p "$SF/t/sub"
-  head -c 200M /dev/urandom > "$SF/t/big.bin"; echo hi > "$SF/t/sub/s.txt"
+  head -c 400M /dev/urandom > "$SF/t/big.bin"; echo hi > "$SF/t/sub/s.txt"
   ln -s big.bin "$SF/t/lnk"
   tar -cf - -C "$SF" t | zstd -q -3 > "$SF/sf.tar.zst"
 
@@ -4102,16 +4122,35 @@ else
     pass "sizeless frame: -d --tar extracts correctly"
   else fail "sizeless frame extract" "tree mismatch"; fi
 
-  # 3. Constant memory: peak RSS must stay far below the archive size
-  #    (the old batch fallback slurped the compressed file into RAM).
+  # 3. Bounded memory: peak RSS must stay far below the slurp failure mode
+  #    (the old batch fallback held compressed+decompressed in RAM, ~850MB+
+  #    for this 400MB archive).  The bound is the 256 MiB FrameSink budget
+  #    plus baseline — NOT ~50MB: sink occupancy between the streaming
+  #    producer and the header-skipping consumer is scheduling-dependent, and
+  #    asserting below the budget made this test flake under suite load.
   if [[ -x /usr/bin/time ]]; then
     rss=$(/usr/bin/time -f %M "$GZSTD" -l --cpu-only --tar "$SF/sf.tar.zst" 2>&1 >/dev/null | tail -1)
-    if [[ "$rss" =~ ^[0-9]+$ ]] && (( rss < 150000 )); then
-      pass "sizeless frame: streaming keeps constant memory (${rss}KB)"
-    else fail "sizeless frame memory" "maxRSS ${rss}KB (expected <150MB)"; fi
+    if [[ "$rss" =~ ^[0-9]+$ ]] && (( rss < 500000 )); then
+      pass "sizeless frame: streaming keeps bounded memory (${rss}KB)"
+    else fail "sizeless frame memory" "maxRSS ${rss}KB (expected <500MB)"; fi
   else
-    skip "sizeless frame: constant memory" "/usr/bin/time not available"
+    skip "sizeless frame: bounded memory" "/usr/bin/time not available"
   fi
+
+  # 4. Regression (v0.14.81): a LEADING skippable frame (pzstd-style) must
+  #    not defeat the sizeless-frame detection — the peek now hops over it.
+  printf '\x50\x2a\x4d\x18\x08\x00\x00\x00SKIPPAYL' > "$SF/skip.bin"
+  cat "$SF/skip.bin" "$SF/sf.tar.zst" > "$SF/lead.tar.zst"
+  lrss=0
+  if [[ -x /usr/bin/time ]]; then
+    lrss=$(/usr/bin/time -f %M "$GZSTD" -l --cpu-only --tar "$SF/lead.tar.zst" 2>&1 >"$SF/ll.txt" | tail -1)
+  else
+    "$GZSTD" -l --cpu-only --tar "$SF/lead.tar.zst" 2>/dev/null >"$SF/ll.txt"
+  fi
+  if diff "$SF/ll.txt" <(zstd -q -dc "$SF/lead.tar.zst" | tar -tvf -) >/dev/null 2>&1 \
+     && [[ "$lrss" =~ ^[0-9]+$ ]] && (( lrss < 500000 )); then
+    pass "leading skippable frame: streams, listing correct (${lrss}KB)"
+  else fail "leading skippable frame" "rss=${lrss}KB or listing differs"; fi
   rm -rf "$SF"
 fi
 

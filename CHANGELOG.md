@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.80  
+**Covers:** v0.9.50 → v0.14.81  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.81 — pre-release multi-agent audit of v0.14.77–80: two crashes and eight hardening fixes
+
+An 8-angle agent review of everything since v0.14.76 (member selection, positional -C, ownership mapping, listing parity, sizeless streaming, member index, progress meter), run before tagging the first downloadable build. Ten findings, all fixed:
+
+**Two reproducible crashes.** (1) `gzstd --tar -- SRC` (and `-d/-l --tar ARCHIVE -- MEMBER`) SEGFAULTED: the `--` end-of-options branch still used the pre-v0.14.77 single push, so `tar_sources` and the parallel `tar_source_dest` (-C bindings) desynced and consumers indexed out of bounds. Both push sites now go through one `push_positional` helper, and both consumers bounds-check as belt-and-braces. (2) A LEADING zstd skippable frame — pzstd emits exactly that — defeated the v0.14.79 sizeless-frame detection (`ZSTD_getFrameContentSize` reports 0 for skippables), sending the archive down the batch path that slurps the whole file into RAM: reproduced at 3.0 GB peak RSS for a 600 MB archive. `peek_first_frame_decomp_size` now hops over leading skippable frames (bounded at 16) to read the first DATA frame; same file now lists in 47 MB.
+
+**Correctness/robustness.** Name-first ownership (v0.14.78) silently fell back to numeric ids for any group whose NSS record exceeded 4 KB — `getgrnam_r` ERANGE was indistinguishable from "no such name" and cached; now retried with a doubling buffer (to 1 MiB). `read_tar_index` could be made to allocate 16 GiB by a forged trailer; the compressed blob's embedded content size must now corroborate the trailer BEFORE the allocation, and the sanity cap dropped to 1 GiB (forged-trailer cost measured at 32 MB, clean fallback to the walk). An unmatched member selector now exits 1 on `-l` and `-d` alike (was 4 = "corrupt data" on `-l` — off the documented exit-code table, and inconsistent). The index-append paths got the file's standard write robustness (`robust_fwrite` for EINTR/short writes; `write()==0` no-progress guards in `append_plain_fd` AND the pre-existing gap in `pwrite_all`) and were consolidated into one `append_tar_index` helper so a future output route can't half-forget the index.
+
+**Drift-proofing and the transient test failure.** The index and walk listing routes shared only a promise of byte-identity; now they share the code — `filter_entry`/`list_count` serve both `handle_entry` and `list_entries`, and `list_tar` builds ONE Extractor with one footer/exit-code epilogue for both routes (the same de-duplication lesson as v0.14.76's `entry_header_len`). The one-off extensive-suite flake was root-caused to the RSS test asserting below the 256 MiB FrameSink budget — sink occupancy between the streaming producer and the header-skipping consumer is scheduling-dependent, so one consumer stall crossed the 146 MiB threshold; the test now uses a 400 MB archive with a 500 MB bound (slurp failure mode ≈ 850 MB+, streaming worst case ≈ 320 MB). Dead `Extractor::dest_fd_` removed (roots_[0] is the root). Suite: 277 normal / 393 extensive, all green, including new regressions for both crashes and the exit codes.
 
 ## v0.14.80 — member index in a skippable frame: instant -l --tar (~0.2 s at any archive size)
 
