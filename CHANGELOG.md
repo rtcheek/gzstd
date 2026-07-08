@@ -1,11 +1,32 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.83  
+**Covers:** v0.9.50 → v0.14.84  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.84 — pre-tag audit of the v0.14.82/83 seek code (rounds 1–4)
+
+**Round 4 — resource hygiene and error paths.** The suspected ZSTD_DCtx leak in the foreign scanner turned out not to exist (the early returns are inside the range-reader lambdas; the scan body funnels through the single free), and the rest traced clean: both table parsers rewind on every exit, failed planners are reset by the caller, seek_feed joins its pool on all non-fatal paths, and the Extractor's drain guarantees the feeder can never hang on a dead consumer. Two real gaps, both fixed: the two new decode sites (foreign scanner, seek_feed workers) neither checked `ZSTD_createDCtx()` for NULL (dereferenced under memory pressure → segfault instead of a clean error) nor applied `apply_mem_limit_to_dctx` — meaning a user's `--memlimit` window cap, enforced by every other decode path, was silently bypassed by seek extraction. Scanner OOM now falls back to the walk; a worker OOM dies cleanly; both honor the memory limit.
+
+
+
+**Round 3 — semantic parity between the seek planners and the walk.** Most equivalences hold by construction and were verified as such: selector and entry-name normalization are the same shared functions on both paths, duplicate member names keep tar's last-wins ordering (every match's range is included in archive order and the Extractor replays them), positional -C root binding is literally the same first-matching-selector function, and a scanner misparse is always checksum-caught into the walk — never wrong output. One real divergence found and fixed: the foreign header scanner zeroed the data size for typeflags '1'–'5', but the Extractor's actual alignment rule consumes zero data only for links and directories ('1','2','5') while devices/fifos/labels/unknown types consume `size` bytes. On a foreign tar carrying a nonzero size on a device entry (pathological but legal-ish), the scanner desynced — checksum-caught, so it only cost the seek path, but a selected member after the mismatch could fail where the walk succeeds. The scanner now mirrors the parser's rule exactly, verified with a crafted archive (device entry with bogus size + data blocks, then a selected member: seek path engages and extracts).
+
+**Round 2 — concurrency.** Reviewed the seek_feed worker pool (claim gate, reorder window, condition-variable discipline), its interaction with FrameSink backpressure and worker-side die(), and the writer-thread frame recording across passes. The pool's core is sound — the smallest outstanding claim always passes its gate so the reorder window cannot deadlock, predicates are re-checked under the mutex so wakeups cannot be lost, the slicer never holds the pool mutex while blocked on the sink, and die() from a worker is lock-free. Two real findings, both fixed:
+
+1. **GPU-fault rebuild silently dropped the seek table.** A GPU fault discards the output and reruns the whole compress pass — including assemble() and the writer — but the recorded per-frame sizes were never cleared between passes, so the retry appended to the first pass's entries, the completeness check failed, and finish_tar_index_frame quietly omitted the table (archive valid, seek-extract and outside random access silently gone). Now cleared at each assemble(). Verified with GZSTD_DEBUG_FAIL_GPU_AFTER on --gpu-only: the rebuilt archive seek-extracts.
+2. **seek_feed's reorder window counted frames, not bytes.** Every in-flight frame holds compressed + decompressed buffers, so a huge --chunk-size archive could pin ~3×threads×chunk of RAM where the normal decompress paths are bounded by the 4 GiB FrameThrottle. The window is now sized from a 4 GiB byte budget over the plan's largest frame (and the pool spawns no more workers than the window admits).
+
+**Round 1 — untrusted-input robustness.** Reviewed the new parsers that consume attacker-controllable bytes (`-l`/`-d` run them on any archive): the seekable-footer probes, the GZIDX cross-validation, the foreign header scanner, and `seek_feed`. Three findings, all fixed and regression-tested with real crafted archives (suite test #12):
+
+1. **OOM crash (both footer parsers):** the seek-table allocation was bounded only by the file size, so a forged frame count (e.g. 500M) on a large archive demanded an allocation up to the whole file → `bad_alloc` → terminate, from a plain `-l --tar`. Now capped at 1 GiB (>100M frames — the index blob's cap philosophy); verified prompt failure under a 3 GB address-space limit.
+2. **Infinite loop (foreign header scan):** a forged base-256 size field near 2^64 wrapped `tar_round_up`, letting the entry end land *behind* the cursor while still passing the `<= tar_size` check — the scan walked backward forever. The size is now bounded by the remaining stream before the round-up, and `eend <= cursor` bails to the walk; verified prompt exit on a crafted archive that previously hung.
+3. **Unbounded per-worker allocation (seek_feed, minor):** a forged u32 dsize in the table let each worker allocate up to 4 GiB before decompression corroborated it (content-size-less GPU frames skip the earlier check); now capped at 2 GiB/frame like the foreign scanner.
+
+Suite: 289 normal / 405 extensive.
 
 ## v0.14.83 — indexed archives adopt the standard zstd seekable format (t2sz/ratarmount interop)
 

@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=288
-$EXTENSIVE && EXPECTED_TESTS=404
+EXPECTED_TESTS=289
+$EXTENSIVE && EXPECTED_TESTS=405
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -4239,6 +4239,32 @@ PYEOF
   if [[ "$fline" == "1" ]] && cmp -s "$SX/xf/t/sub/b.txt" "$SX/t/sub/b.txt"; then
     pass "foreign seekable archive: header-hop selective extract"
   else fail "foreign seekable extract" "engaged=$fline or mismatch"; fi
+
+  # 12. Hostile inputs (audit round 1): a forged footer claiming 500M frames
+  #     must not OOM (1 GiB table cap), and a forged base-256 size that
+  #     wraps the entry arithmetic must not hang the header scan.  Prompt,
+  #     bounded, non-zero exits — never a crash or a spin.
+  python3 - "$SX/foreign.tar.zst" "$SX/evil1.tar.zst" "$SX/evil2.tar.zst" <<'PYEOF'
+import struct, subprocess, sys
+d = open(sys.argv[1],'rb').read()
+open(sys.argv[2],'wb').write(d + struct.pack('<IBI', 500_000_000, 0, 0x8F92EAB1))
+blk = bytearray(512); blk[0:8] = b'evil.bin'
+blk[100:108] = b'0000644\x00'; blk[108:116] = b'0000000\x00'; blk[116:124] = b'0000000\x00'
+blk[124] = 0x80; blk[125:136] = b'\xff'*11          # base-256 size ~2^88
+blk[136:148] = b'00000000000\x00'; blk[156] = ord('0'); blk[257:263] = b'ustar\x00'
+blk[148:156] = b' '*8; blk[148:156] = ('%06o\x00 ' % sum(blk)).encode()
+tar = bytes(blk) + b'\x00'*1024
+c = subprocess.run(['zstd','-q','-3','-c'], input=tar, capture_output=True).stdout
+tbl = struct.pack('<II', 0x184D2A5E, 17) + struct.pack('<II', len(c), len(tar)) \
+    + struct.pack('<IBI', 1, 0, 0x8F92EAB1)
+open(sys.argv[3],'wb').write(c + tbl)
+PYEOF
+  r1=0; ( ulimit -v 3000000; timeout 30 "$GZSTD" -l --cpu-only --tar "$SX/evil1.tar.zst" >/dev/null 2>&1 ) || r1=$?
+  rm -rf "$SX/xe"; mkdir -p "$SX/xe"
+  r2=0; timeout 30 "$GZSTD" -d --cpu-only --tar -C "$SX/xe" "$SX/evil2.tar.zst" evil.bin >/dev/null 2>&1 || r2=$?
+  if [[ $r1 -ne 0 && $r1 -lt 124 && $r2 -ne 0 && $r2 -lt 124 ]]; then
+    pass "hostile footer/size fields: bounded, prompt, non-zero exit"
+  else fail "hostile inputs" "forged-footer rc=$r1 wrap-size rc=$r2 (124=hang, 134/139=crash)"; fi
 fi
 
 rm -rf "$SX"

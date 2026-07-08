@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.83";
+static constexpr const char * GZSTD_VERSION = "0.14.84";
 //
 // Architecture overview:
 //
@@ -8672,6 +8672,10 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     g_tar_chunk_size  = (uint64_t)chunk_size;
     g_tar_nframes     = (uint64_t)nchunks;
     g_tar_stream_size = total;
+    // A GPU-fault rebuild runs a whole second pass through assemble() and
+    // the writer; without this clear the retry appends to the first pass's
+    // sizes and the count mismatch silently drops the seek table.
+    g_tar_frame_csizes.clear();
     g_tar_frame_csizes.reserve(nchunks);
   }
   if (nchunks == 0) return;
@@ -10211,7 +10215,9 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
         uint64_t nf = rd_u32(ft);
         const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);  // + per-frame checksum
         uint64_t tpay = nf * esz + 9;
-        if (nf > 0 && nf < ((uint64_t)1 << 32) && tpay + 8 + 40 <= end) {
+        // 1 GiB cap (>100M frames) bounds what a forged frame count can make
+        // us allocate — same philosophy as the index-blob cap below.
+        if (nf > 0 && tpay <= ((uint64_t)1 << 30) && tpay + 8 + 40 <= end) {
           uint64_t tstart = end - 8 - tpay;
           std::vector<unsigned char> tb((size_t)(8 + tpay));
           if (std::fseek(in, (long)tstart, SEEK_SET) == 0
@@ -10430,7 +10436,8 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     uint64_t nf = rd_u32(ft);
     const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);
     uint64_t tpay = nf * esz + 9;
-    if (nf == 0 || tpay + 8 > end) break;
+    // 1 GiB cap: bounds the allocation a forged frame count can demand.
+    if (nf == 0 || tpay > ((uint64_t)1 << 30) || tpay + 8 > end) break;
     uint64_t tstart = end - 8 - tpay;
     std::vector<unsigned char> tb((size_t)(8 + tpay));
     if (std::fseek(in, (long)tstart, SEEK_SET) != 0
@@ -10476,7 +10483,7 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
 // corrupt an extraction.
 static bool build_foreign_seek_plan(FILE * in,
                                     const std::vector<std::pair<std::string, int>> & members,
-                                    SeekPlan & plan, Meter * m) {
+                                    const Options & opt, SeekPlan & plan, Meter * m) {
   TarSeekTable st;
   if (!parse_foreign_seek_table(in, st)) return false;
   const int fd = fileno(in);
@@ -10487,6 +10494,8 @@ static bool build_foreign_seek_plan(FILE * in,
   // table, so each is verified against the frame's own declared content size
   // and the actual decompressed length.
   ZSTD_DCtx * dctx = ZSTD_createDCtx();
+  if (!dctx) return false;                      // OOM: fall back to the walk
+  apply_mem_limit_to_dctx(dctx, opt);           // honor --memlimit like every decode path
   std::vector<char> fbuf, comp;
   size_t fcur = SIZE_MAX;
   auto load_frame = [&](size_t k) -> bool {
@@ -10587,11 +10596,20 @@ static bool build_foreign_seek_plan(FILE * in,
       if (!pax_path.empty())  { name = pax_path;  pax_path.clear(); }
       uint64_t dsize = pax_has_size ? pax_size : size;
       pax_has_size = false;
-      // Link-family entries store no data regardless of the size field.
-      if (type == '1' || type == '2' || type == '3' || type == '4' || type == '5')
+      // Parity with Extractor::handle_entry's alignment rule, NOT the POSIX
+      // convention: links and directories ('1','2','5') consume zero data
+      // even with a nonzero size field, while devices/fifos/labels/unknown
+      // types ('3','4','6','V',...) consume size bytes.  The scanner must
+      // mirror the parser exactly or a selected entry after the mismatch
+      // slices wrong (checksum-caught, but the walk would have succeeded).
+      if (type == '1' || type == '2' || type == '5')
         dsize = 0;
+      // dsize is straight from the (untrusted) header; a forged base-256
+      // value near 2^64 would wrap tar_round_up and send eend BACKWARD,
+      // looping the scan forever.  Bound it by the remaining stream first.
+      if (dsize > st.tar_size - cursor - TAR_BLK) { ok = false; break; }
       uint64_t eend = cursor + TAR_BLK + tar_round_up(dsize, TAR_BLK);
-      if (eend > st.tar_size) { ok = false; break; }
+      if (eend > st.tar_size || eend <= cursor) { ok = false; break; }
       ents.push_back({std::move(name), entry_start, eend});
       cursor = eend;
       in_ext = false;
@@ -10647,9 +10665,22 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
     std::mutex mx; std::condition_variable cv;
     std::map<size_t, FrameBuf> ready;
     size_t push_next = 0;
-    const size_t window = std::max<size_t>(4, (size_t)nthreads * 2);
+    // Reorder window in FRAMES, sized from a byte budget: every claimed frame
+    // can hold compressed + decompressed buffers, so with huge --chunk-size
+    // archives a count-only window would balloon RAM past what the normal
+    // decompress paths' FrameThrottle (4 GiB) would ever allow.
+    uint64_t max_usz = 1;
+    for (size_t f : plan.frames)
+      max_usz = std::max(max_usz, plan.u_off[f + 1] - plan.u_off[f]);
+    const size_t budget_frames =
+        (size_t)std::max<uint64_t>(2, ((uint64_t)4 << 30) / (2 * max_usz));
+    const size_t window =
+        std::min<size_t>(budget_frames, std::max<size_t>(4, (size_t)nthreads * 2));
+    nthreads = std::min(nthreads, (int)window);   // extra workers would just gate-wait
     auto worker = [&] {
       ZSTD_DCtx * dctx = ZSTD_createDCtx();
+      if (!dctx) die("failed to create ZSTD_DCtx");
+      apply_mem_limit_to_dctx(dctx, opt);   // honor --memlimit like every decode path
       std::vector<char> comp;
       size_t i;
       while ((i = next.fetch_add(1)) < nfr) {
@@ -10677,6 +10708,13 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
             || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz))
           die_data("seek-extract: frame " + std::to_string(k)
                    + " does not match the member index (corrupt archive?)");
+        // A frame with no declared content size (GPU-written) is only
+        // corroborated by the decompress below, so bound what a forged
+        // table dsize can make each worker allocate first (matches the
+        // foreign scanner's per-frame cap).
+        if (usz > ((size_t)1 << 31))
+          die_data("seek-extract: frame " + std::to_string(k)
+                   + ": implausible frame size in seek table");
         FrameBuf fb = std::make_shared<FrameVec>(usz);
         size_t dz = ZSTD_decompressDCtx(dctx, fb->data(), usz, comp.data(), csz);
         if (ZSTD_isError(dz) || dz != usz)
@@ -15317,7 +15355,7 @@ static int extract_tar(const Options & opt, Meter * m)
       // No gzstd index — a foreign zstd-seekable archive (t2sz-style) still
       // carries the frame map: header-hop to find the members, then seek.
       plan = tarx::SeekPlan();
-      if (!tarx::build_foreign_seek_plan(in, members, plan, m))
+      if (!tarx::build_foreign_seek_plan(in, members, opt, plan, m))
         plan = tarx::SeekPlan();
     }
     if (plan.active && opt.verbosity >= V_VERBOSE) {
