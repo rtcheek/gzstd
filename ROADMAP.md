@@ -880,8 +880,17 @@ paths (one thread walks the stream in order). Open follow-ups:
      `.tar.zst` — see the parse-index design note); readers seek straight to
      entry boundaries, no pre-walk. Foreign archives fall back to route 1 or the
      serial walk. **Shipped in v0.14.80 for create + `-l` (instant listing;
-     records carry hdr_off/data_off/entry_end per member)** — the extract-side
-     seek/dispatch consumer is the remaining piece.
+     records carry hdr_off/data_off/entry_end per member), and in v0.14.82 for
+     selective extraction:** the index now also carries a frame table (chunk
+     size + per-frame compressed sizes → seek offsets by prefix sum), and
+     `-d --tar ARCHIVE MEMBER...` reads/decompresses only the frames the
+     selection touches (one file out of a 9.76 GiB archive: 0.58 s / 0.1% read
+     vs 6.7 s for the walk). What remains of this item is the NO-selection
+     case: parallel parse+dispatch of a full extraction using the same frame
+     table (workers start at entry boundaries), which is exactly where the
+     hard parts below (dir-creation ordering, write contention, hardlink/
+     deferred ordering) live — the selective path sidesteps them by keeping
+     the single serial Extractor and only shrinking its input.
   Hard parts independent of which route: **directory-creation ordering** (a
   worker extracting `a/b/f` must not race the creation of `a/`, `a/b/` — needs an
   upfront dir-tree pass or per-prefix coordination), **write-stream contention**
@@ -903,6 +912,35 @@ paths (one thread walks the stream in order). Open follow-ups:
   dominant lever. Re-probe concurrent-O_DIRECT scaling on new hardware; build when
   a target array shows >1.5× aggregate from N streams.
 
+- **Zstd-ecosystem seek interop** — *Priority: Medium | Complexity: Medium |
+  Status: (1) and (2) shipped v0.14.83 for seekable-format archives; pzstd
+  inline-tag reading deferred (legacy tool, chunks may lack the content-size
+  header the map needs, no pzstd available to test against — revisit only if
+  real pzstd archives show up).*
+  1. **Emit the standard zstd seekable format** (contrib/seekable_format — what
+     t2sz produces and indexed_zstd/ratarmount-class readers consume): indexed
+     archives end with a spec-conformant seek table (u32 csize/dsize per data
+     frame, footer magic at EOF); the GZIDX member index sits immediately
+     before it and dropped its private GZFT frame table — the standard table
+     now serves outside readers AND our own seek-extract, so foreign tools get
+     random access to gzstd archives for free. Omitted only when a frame
+     exceeds the format's u32 fields (huge --chunk-size); the index then sits
+     at EOF as before and seek-extract falls back to the walk. pzstd's inline
+     tags are NOT emitted — legacy format, benefits only pzstd's own
+     decompressor (zstd -T superseded it).
+  2. **Read foreign seek metadata for selective extraction** (shipped
+     v0.14.83 for seekable-format archives): t2sz/seekable archives map
+     compressed↔uncompressed offsets. With member selection, header-hop
+     (`build_foreign_seek_plan`): walk tar headers decompressing only
+     header-bearing frames, skip file data by arithmetic, feed matched ranges
+     to the existing seek_feed → Extractor pipeline. Big win on large-file
+     archives; degrades toward the full walk when small files put headers in
+     every frame. The scan bails to the walk on GNU sparse, pax globals, bad
+     checksums, or mid-stream skippables; a scan miss can only produce "Not
+     found", never corruption (the Extractor re-parses the sliced stream for
+     real). Their formats carry no entry metadata, so instant -l stays
+     gzstd-only — a header-hop -l (names/sizes cheaply) is a follow-up, as is
+     pzstd inline-tag reading (see status above).
 - **GNU sparse files** — *Priority: Medium | Complexity: Medium.* Members are
   currently archived at full logical size (correct, just larger for holey files).
   Add GNU sparse encoding (`'S'` / pax `GNU.sparse.*`) and detect holes via

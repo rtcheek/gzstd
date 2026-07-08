@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.81";
+static constexpr const char * GZSTD_VERSION = "0.14.83";
 //
 // Architecture overview:
 //
@@ -287,8 +287,11 @@ static const size_t DEFAULT_CHUNK_MIB = 16;
 // (--ultra auto-bumps to 128 MiB) so genuinely multi-frame chunked inputs keep
 // the parallel queue path (and the v0.13.1 multi-frame-oversize guard).
 static const size_t SINGLE_FRAME_STREAM_MIN = size_t(256) * ONE_MIB;
+// Max GPU subchunk.  Outside the HAVE_NVCOMP guard: the --verify pool sizing
+// references it from CPU-visible code (dead branch when cpu_only, but it must
+// compile), and v0.14.81 broke USE_NVCOMP=OFF builds by guarding it.
+static const size_t GPU_SUBCHUNK_MAX = size_t(16) * ONE_MIB;
 #ifdef HAVE_NVCOMP
-static const size_t GPU_SUBCHUNK_MAX = size_t(16) * ONE_MIB; // max GPU subchunk
 static const size_t DEFAULT_GPU_BATCH_CAP = 8;    // per device  smaller batches launch sooner
 static const size_t DEFAULT_GPU_DECOMP_BATCH_CAP = 16;  // sweet spot: amortizes kernel launch without starving writer
 // Upper bound on the per-stream buffer when --gpu-batch is NOT user-pinned and
@@ -780,8 +783,9 @@ static void print_help()
 "  --xattrs            store/restore extended attributes (give on both create and extract)\n"
 "  --acls              store/restore POSIX ACLs (give on both create and extract)\n"
 "  --sparse            store sparse files compactly on create (GNU format; opt-in)\n"
-"  --no-index          create: skip the member index (instant -l); the index\n"
-"                      is a standard zstd skippable frame all tools ignore\n"
+"  --no-index          create: skip the member index (instant -l, seek-based\n"
+"                      MEMBER extraction); it is a standard zstd skippable\n"
+"                      frame all tools ignore\n"
 "\n"
 "Compression level:\n"
 "  -1 .. -19           zstd level (default: 3)\n"
@@ -1176,13 +1180,20 @@ static void print_help_long()
 "  --[no-]index (on create; default: on)\n"
 "     Append a member index to the archive so `-l --tar` lists it\n"
 "     INSTANTLY (two seeks and a small read) instead of decompressing\n"
-"     the whole archive.  The index lives in a standard zstd SKIPPABLE\n"
+"     the whole archive, and `-d --tar ARCHIVE MEMBER...` extracts a\n"
+"     selection by SEEKING straight to its frames (reading only the\n"
+"     bytes the selection touches) instead of decompressing everything.\n"
+"     The index lives in a standard zstd SKIPPABLE\n"
 "     frame after the tar data: every zstd decoder ignores it by\n"
 "     specification, so the file remains a plain .tar.zst that GNU\n"
 "     `tar --zstd -x` extracts unchanged, and `gzstd -d` decompresses\n"
-"     to a byte-identical tar stream with or without it.  Costs a few\n"
-"     bytes per member (compressed).  Listing archives with\n"
-"     no index (older gzstd, tar --zstd, --no-index) falls back to the\n"
+"     to a byte-identical tar stream with or without it.  The archive\n"
+"     additionally ends with a spec-conformant ZSTD SEEKABLE FORMAT seek\n"
+"     table (the format t2sz produces), so any seekable-format reader —\n"
+"     indexed_zstd, ratarmount-class mounting tools, libzstd-seekable —\n"
+"     can random-access gzstd archives with no gzstd knowledge.  Costs a\n"
+"     few bytes per member (compressed).  Archives with no index (older\n"
+"     gzstd, tar --zstd, --no-index) fall back to the\n"
 "     decompress walk automatically; `-t --tar` always verifies the\n"
 "     real stream and never trusts the index.\n"
 "\n"
@@ -1206,6 +1217,12 @@ static void print_help_long()
 "     tar's name arguments: each names an entry as stored (see -l --tar),\n"
 "     a directory selects its whole subtree, and a name that matches\n"
 "     nothing is reported (\"Not found in archive\") with a non-zero exit.\n"
+"     When the archive carries a member index (gzstd-created, see\n"
+"     --[no-]index), a selection extracts by SEEK: gzstd reads and\n"
+"     decompresses only the frames the selected entries touch, so pulling\n"
+"     one file out of a 100 GiB backup takes milliseconds, independent of\n"
+"     the archive size.  Foreign/older/--no-index archives, stdin, and\n"
+"     --keep-going use the full decompress walk instead (same result).\n"
 "     -C between members is positional, like tar: it redirects the members\n"
 "     that FOLLOW it.  Example:\n"
 "         gzstd -d --tar backup.tar.zst etc/nginx -C /srv www/site1\n"
@@ -4900,6 +4917,21 @@ private:
   FrameThrottle * bp_ = nullptr;  // frame throttle (releases permits after writes)
 };
 
+// --tar create: the member-index BODY (uncompressed entry records), built by
+// tarx::build_layout(); tarx::finish_tar_index_frame() appends the frame table
+// and wraps it into the skippable frame appended by main() as the archive's
+// final bytes once the writer is done.  Empty = no index (--no-index).
+static std::string g_tar_index_raw;
+// The frame table feeding the index (seek-based selective extraction): the
+// writer thread records every data frame's compressed size in write order
+// (== seq order); tarx::assemble() pins the chunk size and expected frame
+// count so finish_tar_index_frame() can sanity-check completeness before
+// trusting it.
+static std::vector<uint64_t> g_tar_frame_csizes;
+static uint64_t g_tar_chunk_size = 0;
+static uint64_t g_tar_nframes = 0;
+static uint64_t g_tar_stream_size = 0;   // total uncompressed tar bytes
+
 static void writer_thread(FILE * out, ResultStore & results,
                           const Options & opt, Meter * m,
                           FrameThrottle * bp)
@@ -5040,6 +5072,13 @@ static void writer_thread(FILE * out, ResultStore & results,
     }
 
     if (batch.empty()) continue;
+
+    // --tar create with an index: record each data frame's compressed size in
+    // write order (== seq order) for the index's frame table (seek-based
+    // selective extraction).  Single writer thread — no locking needed.
+    if (opt.mode == Mode::COMPRESS && opt.tar_mode && opt.tar_index)
+      for (const FrameBuf & f : batch)
+        g_tar_frame_csizes.push_back((uint64_t)f->size());
 
     // Count frames handed to writer for progress tracking.
     if (m) m->tasks_done.fetch_add(batch.size(), std::memory_order_relaxed);
@@ -7757,11 +7796,8 @@ static void enqueue_direct_chunk(TaskQueue & q, size_t seq, const char * buf, si
 // changed during read.  main() promotes it to a non-zero exit (GNU tar parity).
 static std::atomic<bool> g_tar_had_errors{false};
 
-// --tar create: the member-index skippable frame, built by build_layout() and
-// appended by main() as the archive's final bytes once the writer is done
-// (see tarx::build_tar_index_frame).  Empty = no index (--no-index, or the
-// index would overflow the skippable frame's u32 size field).
-static std::string g_tar_index_frame;
+// --tar create: the member index's globals (g_tar_index_raw and the frame
+// table) are declared above writer_thread, which records into them.
 
 /*======================================================================
  --tar: native parallel GNU-format tar archive creation
@@ -8411,7 +8447,7 @@ static std::string strip_leading_slash(std::string s, const Options & opt, bool 
   return s;
 }
 
-/*---- member-index skippable frame (instant -l, future seek-extract) ----
+/*---- member-index skippable frame (instant -l, seek-based extraction) ----
  A zstd SKIPPABLE frame (magic 0x184D2A50) appended after the archive's last
  data frame.  Every zstd decoder ignores skippable frames, so the file stays a
  standard .tar.zst (GNU `tar --zstd` extracts it unchanged); gzstd -l reads it
@@ -8428,8 +8464,27 @@ static std::string strip_leading_slash(std::string s, const Options & opt, bool 
  mtime i64, size u64, real_size u64, hdr_off u64, data_off u64, entry_end
  u64, then 4 length-prefixed strings (u32 + bytes): path, link, uname, gname.
  uname/gname are truncated to 31 bytes exactly like the ustar header fields,
- so an index listing is byte-identical to the stream walk's.  */
-static const char TAR_INDEX_MAGIC[9] = "GZIDX001";
+ so an index listing is byte-identical to the stream walk's.
+
+ v0.14.83 (GZIDX002): the frame table lives in a SECOND skippable frame
+ appended AFTER the index — a spec-conformant **zstd seekable format** seek
+ table (contrib/seekable_format; what t2sz writes and indexed_zstd/
+ ratarmount-class readers consume):
+
+   0x184D2A5E | u32 size | per frame { u32 csize, u32 dsize } |
+   u32 frame_count | u8 descriptor(0) | u32 0x8F92EAB1   ← last bytes of file
+
+ so any seekable-format reader can random-access gzstd archives with no
+ knowledge of gzstd, and gzstd's own seek-extract uses the same table (the
+ private "GZFT" section of v0.14.82 is gone).  Readers locate the index by
+ probing the seekable footer at EOF first and expecting the GZIDX trailer
+ immediately before the seek-table frame; with no footer (a frame overflows
+ the u32 fields — huge --chunk-size) the trailer sits at EOF as before and
+ extraction falls back to the walk.  The seek table is validated before use:
+ csize prefix sum must land exactly on the index frame's start and dsize sum
+ on the tar-stream size, so truncated/concatenated/foreign files can never
+ validate.  */
+static const char TAR_INDEX_MAGIC[9] = "GZIDX002";
 
 static void idx_u32(std::string & s, uint32_t v) {
   for (int i = 0; i < 4; ++i) s.push_back((char)(v >> (8 * i)));
@@ -8442,7 +8497,7 @@ static void idx_str(std::string & s, const std::string & v, size_t cap = SIZE_MA
   idx_u32(s, (uint32_t)n); s.append(v.data(), n);
 }
 
-static std::string build_tar_index_frame(const TarLayout & lay) {
+static std::string build_tar_index_body(const TarLayout & lay) {
   std::string raw;
   raw.reserve(lay.entries.size() * 96 + 16);
   idx_u64(raw, (uint64_t)lay.entries.size());
@@ -8464,6 +8519,20 @@ static std::string build_tar_index_frame(const TarLayout & lay) {
     idx_str(raw, uit != lay.unames.end() ? uit->second : empty, 31);
     idx_str(raw, git != lay.gnames.end() ? git->second : empty, 31);
   }
+  return raw;
+}
+
+// Called once by append_tar_index after the writer finished (every data
+// frame is on disk, so the compressed sizes are complete): compresses the
+// body, wraps it into the GZIDX skippable frame, and appends the zstd
+// seekable-format seek table after it.  A recording mismatch (a write path
+// that bypassed it — must not happen) or a frame overflowing the seekable
+// format's u32 fields drops the seek table, never the index: -l stays
+// instant, seek-extraction falls back to the walk.
+static std::string finish_tar_index_frame() {
+  if (g_tar_index_raw.empty()) return std::string();
+  std::string raw = std::move(g_tar_index_raw);
+  g_tar_index_raw.clear();
   size_t bound = ZSTD_compressBound(raw.size());
   std::string comp(bound, '\0');
   size_t cz = ZSTD_compress(&comp[0], bound, raw.data(), raw.size(), 9);
@@ -8479,6 +8548,39 @@ static std::string build_tar_index_frame(const TarLayout & lay) {
   idx_u64(frame, (uint64_t)raw.size());
   idx_u64(frame, (uint64_t)comp.size());
   frame.append(TAR_INDEX_MAGIC, 8);
+  // ---- zstd seekable-format seek table (see the format comment) ----
+  // Appended after the index so its footer is the file's last bytes, where
+  // seekable-format readers look.  Descriptor 0: no per-frame checksums
+  // (zstd frame checksums already cover the data when --check is used).
+  if (g_tar_chunk_size && g_tar_nframes && g_tar_stream_size
+      && g_tar_frame_csizes.size() == g_tar_nframes) {
+    const uint64_t gz_fsz = (uint64_t)frame.size();      // the GZIDX frame itself
+    const uint64_t n_ent  = g_tar_nframes + 1;           // + one dsize=0 entry for it
+    bool fits = g_tar_chunk_size <= 0xFFFFFFFFull
+             && gz_fsz <= 0xFFFFFFFFull
+             && n_ent * 8 + 9 <= 0xFFFFFFFFull;
+    for (uint64_t c : g_tar_frame_csizes)
+      if (c > 0xFFFFFFFFull) { fits = false; break; }
+    if (fits) {
+      frame.reserve(frame.size() + 8 * (size_t)n_ent + 17);
+      idx_u32(frame, 0x184D2A5Eu);                       // seek-table skippable magic
+      idx_u32(frame, (uint32_t)(n_ent * 8 + 9));         // payload size
+      for (uint64_t k = 0; k < g_tar_nframes; ++k) {
+        uint64_t d = (k + 1 < g_tar_nframes)
+                       ? g_tar_chunk_size
+                       : g_tar_stream_size - (g_tar_nframes - 1) * g_tar_chunk_size;
+        idx_u32(frame, (uint32_t)g_tar_frame_csizes[(size_t)k]);
+        idx_u32(frame, (uint32_t)d);
+      }
+      // The GZIDX skippable frame, listed per spec as a decompressed-size-0
+      // entry so the table tiles the whole file for strict readers.
+      idx_u32(frame, (uint32_t)gz_fsz);
+      idx_u32(frame, 0);
+      idx_u32(frame, (uint32_t)n_ent);
+      frame.push_back((char)0);                          // descriptor: no checksums
+      idx_u32(frame, 0x8F92EAB1u);                       // seekable magic, at EOF
+    }
+  }
   return frame;
 }
 
@@ -8530,13 +8632,15 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
            + "(parallel)\n");
   }
   b.finalize();
-  // Member index (--no-index disables): built here where the final offsets
-  // are known; main() appends it after the last data frame is written.
+  // Member index (--no-index disables): the entry records are built here
+  // where the final tar-stream offsets are known; the frame table joins them
+  // in finish_tar_index_frame() once compression fixes the compressed sizes,
+  // and main() appends the finished frame after the last data frame.
   if (opt.tar_index) {
-    g_tar_index_frame = build_tar_index_frame(b.lay);
-    if (opt.verbosity >= V_VERBOSE && !g_tar_index_frame.empty()) {
-      char sz[64]; human_bytes(double(g_tar_index_frame.size()), sz, sizeof(sz));
-      vlog(V_VERBOSE, opt, std::string("[TAR] member index built (") + sz + ")\n");
+    g_tar_index_raw = build_tar_index_body(b.lay);
+    if (opt.verbosity >= V_VERBOSE && !g_tar_index_raw.empty()) {
+      char sz[64]; human_bytes(double(g_tar_index_raw.size()), sz, sizeof(sz));
+      vlog(V_VERBOSE, opt, std::string("[TAR] member index built (") + sz + " body)\n");
     }
   }
   if (opt.verbosity >= V_VERBOSE) {
@@ -8561,6 +8665,15 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
                      const Options & opt, Meter * m) {
   const uint64_t total = lay.total_size;
   const size_t nchunks = chunk_size ? (size_t)((total + chunk_size - 1) / chunk_size) : 0;
+  // Frame-table geometry for the member index: one data frame per chunk, so
+  // frame k holds tar bytes [k*chunk_size, (k+1)*chunk_size).  The writer
+  // thread records each frame's compressed size against this expected count.
+  if (!g_tar_index_raw.empty()) {
+    g_tar_chunk_size  = (uint64_t)chunk_size;
+    g_tar_nframes     = (uint64_t)nchunks;
+    g_tar_stream_size = total;
+    g_tar_frame_csizes.reserve(nchunks);
+  }
   if (nchunks == 0) return;
 
   int hw = resolve_cpu_threads(opt.cpu_threads);
@@ -8768,6 +8881,10 @@ struct InEntry {
   std::vector<std::pair<uint64_t, uint64_t>> sparse_map;
   bool      sparse_map_in_data = false;  // PAX GNU.sparse.1.0: map is a text block
                                          // prefixed to the file data, not in sparse_map
+  // Tar-stream offsets, filled only by read_tar_index (0 on the stream walk):
+  // the entry occupies [hdr_off, entry_end), headers + pax/L/K extensions in
+  // [hdr_off, data_off).  Seek-based selective extraction slices on these.
+  uint64_t  hdr_off = 0, data_off = 0, entry_end = 0;
 };
 
 // Zero-copy view of file data: a span into a decompressed frame, kept alive by
@@ -8850,6 +8967,33 @@ struct StreamReader {
   void drain() { while (true) { if (pos == fill) { refill(); if (pos == fill) return; } consumed_total += (fill - pos); pos = fill; } }  // consume to EOF (unblocks producer)
 };
 
+// Normalize a member name to a safe relative path (strip leading '/' and
+// './'; empty result means "skip").  '..' is rejected later in
+// Extractor::open_parent().  Shared by the stream walk, the index lister,
+// and the seek-extract planner so selection semantics can never drift.
+static std::string norm_member_name(const std::string & raw) {
+  std::string s = raw;
+  size_t i = 0; while (i < s.size() && s[i] == '/') ++i; s = s.substr(i);
+  while (s.rfind("./", 0) == 0) s = s.substr(2);
+  return s;
+}
+
+// GNU tar name matching: a selector picks the entry with exactly that name
+// and, when it is a directory, everything beneath it.  Trailing slashes are
+// ignored on both sides.  `members` hold normalized selector → root index
+// (see Extractor::set_members).  Returns the member index or -1.
+static int match_tar_member(const std::string & rel,
+                            const std::vector<std::pair<std::string, int>> & members) {
+  size_t rn = rel.size(); while (rn && rel[rn - 1] == '/') --rn;
+  for (size_t k = 0; k < members.size(); ++k) {
+    const std::string & mname = members[k].first;
+    if (mname.empty() || rn < mname.size()) continue;
+    if (rel.compare(0, mname.size(), mname) != 0) continue;
+    if (rn == mname.size() || rel[mname.size()] == '/') return (int)k;
+  }
+  return -1;
+}
+
 class Extractor {
 public:
   // validate_only: parse and structurally verify the tar (header checksums,
@@ -8889,7 +9033,7 @@ public:
   uint64_t validated_files() const { return vfiles_; }
   uint64_t validated_bytes() const { return vbytes_; }
 
-  // -l --tar from the member index (see build_tar_index_frame): the same
+  // -l --tar from the member index (see build_tar_index_body): the same
   // filter_entry/list_count code the stream walk runs, with no
   // decompression, so the listing bytes match the walk exactly.
   void list_entries(const std::vector<InEntry> & es) {
@@ -8961,18 +9105,10 @@ private:
   std::vector<char> member_hit_;
   std::vector<int>  roots_;
 
-  // GNU tar name matching: a selector picks the entry with exactly that name
-  // and, when it is a directory, everything beneath it.  Trailing slashes are
-  // ignored on both sides.  Returns the member index or -1.
+  // GNU tar name matching — see match_tar_member (shared with the
+  // seek-extract planner, which must select the same entries).
   int match_member(const std::string & rel) const {
-    size_t rn = rel.size(); while (rn && rel[rn - 1] == '/') --rn;
-    for (size_t k = 0; k < members_.size(); ++k) {
-      const std::string & mname = members_[k].first;
-      if (mname.empty() || rn < mname.size()) continue;
-      if (rel.compare(0, mname.size(), mname) != 0) continue;
-      if (rn == mname.size() || rel[mname.size()] == '/') return (int)k;
-    }
-    return -1;
+    return match_tar_member(rel, members_);
   }
 
   // GNU parity: selectors that matched nothing are per-name errors — but
@@ -9616,14 +9752,9 @@ private:
   }
 
   // ---- parsing ----
-  // Normalize a member name to a safe relative path (strip leading '/' and './';
-  // empty result means "skip").  '..' is rejected later in open_parent().
-  static std::string norm(const std::string & raw) {
-    std::string s = raw;
-    size_t i = 0; while (i < s.size() && s[i] == '/') ++i; s = s.substr(i);
-    while (s.rfind("./", 0) == 0) s = s.substr(2);
-    return s;
-  }
+  // Member-name normalization — see norm_member_name (shared with the
+  // seek-extract planner).
+  static std::string norm(const std::string & raw) { return norm_member_name(raw); }
 
   void parse(StreamReader & r) {
     char blk[TAR_BLK];
@@ -10029,35 +10160,87 @@ private:
   }
 };
 
+// The archive's frame map, parsed from the zstd seekable-format seek table
+// by read_tar_index when the caller asks for it (seek-based selective
+// extraction): data frame k holds tar-stream bytes [u_off[k], u_off[k+1])
+// and occupies archive bytes [c_off[k], c_off[k+1]).  valid() only after
+// every structural check passed — including that the csize prefix sum lands
+// exactly on the index frame's own start and the dsize sum on the tar-stream
+// size, so a table from a truncated/concatenated/foreign file can never
+// validate.
+struct TarSeekTable {
+  uint64_t tar_size = 0;              // total tar-stream size
+  std::vector<uint64_t> c_off;        // nframes+1 prefix sums (archive offsets)
+  std::vector<uint64_t> u_off;        // nframes+1 prefix sums (tar offsets)
+  bool valid() const { return c_off.size() >= 2 && u_off.size() == c_off.size(); }
+};
+
 // Read back the member index appended by --tar create (see
-// build_tar_index_frame for the layout).  Fills `entries` in archive order
+// build_tar_index_body for the layout).  Fills `entries` in archive order
 // and returns true only when every check passes — trailer magic, the
 // skippable-frame header anchoring the blob, decompressed size, and full
 // bounds checking of each record.  Any mismatch (foreign/older archive,
 // truncation, data appended after the index) returns false and the caller
 // does the decompress walk.  The FILE* is rewound to offset 0 either way.
-static bool read_tar_index(FILE * in, std::vector<InEntry> & entries) {
+// `st` non-null: also parse the optional frame table; a missing or invalid
+// table leaves *st !valid() without failing the index as a whole.
+static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
+                           TarSeekTable * st = nullptr) {
   auto rd_u32 = [](const unsigned char * p) {
     uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; };
   auto rd_u64 = [](const unsigned char * p) {
     uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; };
   bool ok = false;
   std::string comp, raw;
+  std::vector<uint64_t> t_csz, t_dsz;   // seekable seek-table entries, if present
   do {
     if (std::fseek(in, 0, SEEK_END) != 0) break;
     long endl = std::ftell(in);
     if (endl < 40) break;                        // frame hdr + trailer minimum
     uint64_t end = (uint64_t)endl;
+    // The zstd seekable-format seek table we append after the index (its
+    // magic is the file's last 4 bytes).  When present and well-formed, the
+    // GZIDX trailer sits immediately before the seek-table frame; without it
+    // (huge frames, older archives) the trailer is at EOF.  A malformed
+    // footer just means "no seek table" — the EOF probe below still runs.
+    uint64_t idx_end = end;
+    {
+      unsigned char ft[9];
+      if (std::fseek(in, -9, SEEK_END) == 0 && std::fread(ft, 1, 9, in) == 9
+          && rd_u32(ft + 5) == 0x8F92EAB1u) {
+        uint64_t nf = rd_u32(ft);
+        const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);  // + per-frame checksum
+        uint64_t tpay = nf * esz + 9;
+        if (nf > 0 && nf < ((uint64_t)1 << 32) && tpay + 8 + 40 <= end) {
+          uint64_t tstart = end - 8 - tpay;
+          std::vector<unsigned char> tb((size_t)(8 + tpay));
+          if (std::fseek(in, (long)tstart, SEEK_SET) == 0
+              && std::fread(tb.data(), 1, tb.size(), in) == tb.size()
+              && rd_u32(tb.data()) == 0x184D2A5Eu
+              && rd_u32(tb.data() + 4) == tpay) {
+            t_csz.reserve((size_t)nf); t_dsz.reserve((size_t)nf);
+            const unsigned char * q = tb.data() + 8;
+            for (uint64_t k = 0; k < nf; ++k, q += esz) {
+              t_csz.push_back(rd_u32(q));
+              t_dsz.push_back(rd_u32(q + 4));
+            }
+            idx_end = tstart;
+          }
+        }
+      }
+    }
+    if (idx_end < 40) break;
     unsigned char tr[24];
-    if (std::fseek(in, -24, SEEK_END) != 0 || std::fread(tr, 1, 24, in) != 24) break;
+    if (std::fseek(in, (long)(idx_end - 24), SEEK_SET) != 0
+        || std::fread(tr, 1, 24, in) != 24) break;
     if (std::memcmp(tr + 16, TAR_INDEX_MAGIC, 8) != 0) break;
     uint64_t usize = rd_u64(tr), csize = rd_u64(tr + 8);
     // 1 GiB cap ≈ >10M members at ~100 B/record — generous for any real
     // index, and it bounds what a forged trailer can make us allocate.
-    if (csize > end - 32 || usize > (uint64_t)1 << 30) break;
+    if (csize > idx_end - 32 || usize > (uint64_t)1 << 30) break;
     // Anchor: the skippable-frame header must sit right before the blob.
     unsigned char fh[8];
-    if (std::fseek(in, (long)(end - 32 - csize), SEEK_SET) != 0
+    if (std::fseek(in, (long)(idx_end - 32 - csize), SEEK_SET) != 0
         || std::fread(fh, 1, 8, in) != 8) break;
     if (rd_u32(fh) != 0x184D2A50u || rd_u32(fh + 4) != csize + 24) break;
     comp.resize((size_t)csize);
@@ -10078,7 +10261,7 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries) {
     auto ru32 = [&] { uint32_t v = rd_u32((const unsigned char *)raw.data() + p); p += 4; return v; };
     auto ru64 = [&] { uint64_t v = rd_u64((const unsigned char *)raw.data() + p); p += 8; return v; };
     if (!have(16)) break;
-    uint64_t count = ru64(); (void)ru64();       // entry count, tar-stream size
+    uint64_t count = ru64(), tar_size = ru64();  // entry count, tar-stream size
     if (count > raw.size() / 94) break;          // 94 = minimum record size
     entries.clear(); entries.reserve((size_t)count);
     bool bad = false;
@@ -10095,7 +10278,9 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries) {
       e.mtime     = (int64_t)ru64();
       e.size      = ru64();
       e.real_size = ru64();
-      (void)ru64(); (void)ru64(); (void)ru64();  // hdr_off, data_off, entry_end
+      e.hdr_off   = ru64();
+      e.data_off  = ru64();
+      e.entry_end = ru64();
       std::string * fields[4] = {&e.name, &e.linkname, &e.uname, &e.gname};
       for (auto * f : fields) {
         if (!have(4)) { bad = true; break; }
@@ -10106,10 +10291,438 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries) {
       if (!bad) entries.push_back(std::move(e));
     }
     ok = !bad && entries.size() == count;
+
+    // Cross-validate the seekable seek table (parsed above) against the
+    // index before trusting it for slicing.  A bad table degrades to "no
+    // table" (extraction falls back to the walk), never to a failed index.
+    if (ok && st && !t_csz.empty()) {
+      // Archive offset where the index's skippable frame begins (its 8-byte
+      // header — anchored above) == where the data frames end: the csize
+      // prefix sum must land exactly here; the dsize sum must be the tar
+      // stream, exactly.
+      const uint64_t data_end = idx_end - 32 - csize;
+      std::vector<uint64_t> co, uo;
+      co.reserve(t_csz.size() + 1); uo.reserve(t_csz.size() + 1);
+      co.push_back(0); uo.push_back(0);
+      uint64_t c = 0, u = 0, c_all = 0;
+      bool tbad = tar_size == 0, skips = false;
+      for (size_t k = 0; k < t_csz.size() && !tbad; ++k) {
+        // Anything that walks past the file is forged/corrupt.
+        if (t_csz[k] < 8 || t_csz[k] > idx_end - c_all) { tbad = true; break; }
+        c_all += t_csz[k];
+        if (t_dsz[k] == 0) { skips = true; continue; }   // skippable frame (our index)
+        // Data frames must precede the skippables, fit the regions, and be
+        // at least a minimal zstd frame (~10 bytes).
+        if (skips || t_csz[k] < 10 || t_dsz[k] > tar_size - u
+            || c + t_csz[k] > data_end) { tbad = true; break; }
+        c += t_csz[k]; co.push_back(c);
+        u += t_dsz[k]; uo.push_back(u);
+      }
+      if (!tbad && c == data_end && u == tar_size) {
+        st->tar_size = tar_size;
+        st->c_off = std::move(co);
+        st->u_off = std::move(uo);
+      }
+    }
   } while (false);
   std::rewind(in);
   if (!ok) entries.clear();
   return ok;
+}
+
+/*---- seek-based selective extraction (-d --tar ARCHIVE MEMBER...) ----
+ With a member selection, a seekable archive, and an index carrying the
+ frame table, extraction reads and decompresses ONLY the data frames the
+ selected entries touch: the planner matches the selectors against the
+ index records (same matcher as the stream walk), coalesces the selected
+ entries' [hdr_off, entry_end) tar ranges, and maps them to frames; the
+ feeder preads + decompresses those frames on a small pool and pushes the
+ sliced tar stream (plus the end-of-archive zero blocks) into the same
+ FrameSink → Extractor pipeline the full walk uses — so matching, security
+ (openat/O_NOFOLLOW), metadata, and "Not found in archive" reporting are
+ the unchanged Extractor code paths.  Anything without a valid table
+ (foreign/older/--no-index archives, stdin) falls back to the full
+ decompress walk; --keep-going also falls back, keeping its damage-recovery
+ semantics.  */
+struct SeekPlan {
+  uint64_t tar_size = 0;
+  std::vector<uint64_t> c_off;                        // frame k: [c_off[k], c_off[k+1])
+  std::vector<uint64_t> u_off;                        // frame k: tar bytes [u_off[k], u_off[k+1])
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;  // merged [a,b) tar ranges, ascending
+  std::vector<size_t> frames;                         // needed frame indices, ascending
+  size_t sel_entries = 0, all_entries = 0;
+  bool active = false;                                // plan trustworthy: seek path engaged
+};
+
+// Build the plan from the index.  False (plan stays !active) on any doubt:
+// no/invalid index or table, or offsets failing the structural checks — the
+// offsets come from the (untrusted) archive, so before they drive slicing
+// they must describe a well-formed contiguous stream.  Rewinds `in` (via
+// read_tar_index) either way.
+static bool build_seek_plan(FILE * in,
+                            const std::vector<std::pair<std::string, int>> & members,
+                            SeekPlan & plan) {
+  std::vector<InEntry> es;
+  TarSeekTable st;
+  if (!read_tar_index(in, es, &st) || !st.valid()) return false;
+  // Normalize the selectors exactly like Extractor::set_members.
+  std::vector<std::pair<std::string, int>> sel = members;
+  for (auto & mp : sel) {
+    mp.first = norm_member_name(mp.first);
+    while (!mp.first.empty() && mp.first.back() == '/') mp.first.pop_back();
+  }
+  uint64_t prev_end = 0;
+  for (const InEntry & e : es) {
+    // Structural sanity: entries contiguous and ascending (gzstd's layout
+    // guarantees this), header at least one block, data inside the stream.
+    if (e.hdr_off != prev_end || e.data_off < e.hdr_off + TAR_BLK
+        || e.entry_end < e.data_off || e.entry_end > st.tar_size)
+      return false;
+    prev_end = e.entry_end;
+    if (match_tar_member(norm_member_name(e.name), sel) < 0) continue;
+    ++plan.sel_entries;
+    if (!plan.ranges.empty() && plan.ranges.back().second == e.hdr_off)
+      plan.ranges.back().second = e.entry_end;        // contiguous with previous
+    else
+      plan.ranges.emplace_back(e.hdr_off, e.entry_end);
+  }
+  plan.all_entries = es.size();
+  const size_t nframes = st.c_off.size() - 1;
+  // Frame containing tar offset v: the last u_off entry <= v.  Frames can be
+  // non-uniform (the map comes from the seekable seek table), so this is a
+  // binary search, not a division.
+  auto frame_of = [&](uint64_t v) {
+    return (size_t)(std::upper_bound(st.u_off.begin(), st.u_off.end(), v)
+                    - st.u_off.begin()) - 1;
+  };
+  for (const auto & r : plan.ranges) {
+    const size_t f0 = frame_of(r.first);
+    const size_t f1 = frame_of(r.second - 1);   // second > first (header ≥ 1 block)
+    if (f1 >= nframes) return false;    // unreachable after the checks above; belt-and-braces
+    for (size_t f = plan.frames.empty() ? f0 : std::max(f0, plan.frames.back() + 1); f <= f1; ++f)
+      plan.frames.push_back(f);
+  }
+  plan.tar_size = st.tar_size;
+  plan.c_off = std::move(st.c_off); plan.u_off = std::move(st.u_off);
+  plan.active = true;
+  return true;
+}
+
+// ---- foreign seekable archives (t2sz / zstd seekable format) ----
+// A .tar.zst not made by gzstd but carrying a seekable-format seek table has
+// the frame map — but no entry index.  parse_foreign_seek_table reads and
+// validates the table alone; the caller then header-hops: walk tar headers
+// decompressing ONLY the frames headers land in, skipping file data by
+// arithmetic.  Big win on large-file archives; on many-small-file archives
+// headers sit in every frame and this degrades toward the full walk.
+static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
+  auto rd_u32 = [](const unsigned char * p) {
+    uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; };
+  bool ok = false;
+  do {
+    if (std::fseek(in, 0, SEEK_END) != 0) break;
+    long endl = std::ftell(in);
+    if (endl < 26) break;                       // hdr + one entry + footer
+    uint64_t end = (uint64_t)endl;
+    unsigned char ft[9];
+    if (std::fseek(in, -9, SEEK_END) != 0 || std::fread(ft, 1, 9, in) != 9
+        || rd_u32(ft + 5) != 0x8F92EAB1u) break;
+    uint64_t nf = rd_u32(ft);
+    const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);
+    uint64_t tpay = nf * esz + 9;
+    if (nf == 0 || tpay + 8 > end) break;
+    uint64_t tstart = end - 8 - tpay;
+    std::vector<unsigned char> tb((size_t)(8 + tpay));
+    if (std::fseek(in, (long)tstart, SEEK_SET) != 0
+        || std::fread(tb.data(), 1, tb.size(), in) != tb.size()
+        || rd_u32(tb.data()) != 0x184D2A5Eu || rd_u32(tb.data() + 4) != tpay) break;
+    std::vector<uint64_t> co{0}, uo{0};
+    uint64_t c = 0, u = 0;
+    bool bad = false, skips = false;
+    const unsigned char * q = tb.data() + 8;
+    for (uint64_t k = 0; k < nf && !bad; ++k, q += esz) {
+      uint64_t cz = rd_u32(q), dz = rd_u32(q + 4);
+      if (cz < 8 || cz > tstart - c) { bad = true; break; }
+      if (dz == 0) { skips = true; c += cz; continue; }  // trailing skippables only
+      // v1 restriction: data frames must be contiguous from offset 0 (true
+      // for t2sz output); mid-stream skippables would break csize slicing.
+      if (skips || cz < 10) { bad = true; break; }
+      c += cz; co.push_back(c);
+      u += dz; uo.push_back(u);
+    }
+    // The data region must start at 0 and every byte before the seek table
+    // must be accounted for; the first bytes must be a zstd data frame.
+    if (bad || uo.size() < 2 || c != tstart) break;
+    unsigned char mg[4];
+    if (std::fseek(in, 0, SEEK_SET) != 0 || std::fread(mg, 1, 4, in) != 4
+        || rd_u32(mg) != 0xFD2FB528u) break;
+    st.tar_size = u;
+    st.c_off = std::move(co);
+    st.u_off = std::move(uo);
+    ok = true;
+  } while (false);
+  std::rewind(in);
+  return ok;
+}
+
+// Header-hop a foreign seekable archive: build (name, hdr_off, entry_end)
+// for every member by decompressing only the frames that hold header (or
+// pax/longname) bytes, then select and map to frames exactly like the
+// indexed path.  Bails to the full walk (returns false) on anything whose
+// stream geometry this mini-parser does not fully model: GNU sparse ('S' /
+// pax GNU.sparse.*), pax globals ('g'), bad checksums, oversized extension
+// records.  A false NEGATIVE here only yields "Not found in archive" — the
+// Extractor re-parses the sliced stream for real, so a scan bug cannot
+// corrupt an extraction.
+static bool build_foreign_seek_plan(FILE * in,
+                                    const std::vector<std::pair<std::string, int>> & members,
+                                    SeekPlan & plan, Meter * m) {
+  TarSeekTable st;
+  if (!parse_foreign_seek_table(in, st)) return false;
+  const int fd = fileno(in);
+  const size_t nframes = st.c_off.size() - 1;
+
+  // Range reader over the virtual tar stream: decompresses (and caches) one
+  // frame at a time.  Frame decompressed sizes come from the (untrusted)
+  // table, so each is verified against the frame's own declared content size
+  // and the actual decompressed length.
+  ZSTD_DCtx * dctx = ZSTD_createDCtx();
+  std::vector<char> fbuf, comp;
+  size_t fcur = SIZE_MAX;
+  auto load_frame = [&](size_t k) -> bool {
+    if (k == fcur) return true;
+    const uint64_t coff = st.c_off[k];
+    const size_t csz = (size_t)(st.c_off[k + 1] - coff);
+    const size_t usz = (size_t)(st.u_off[k + 1] - st.u_off[k]);
+    if (usz > ((size_t)1 << 31)) return false;          // sanity: 2 GiB/frame cap
+    comp.resize(csz);
+    for (size_t got = 0; got < csz;) {
+      ssize_t r = ::pread(fd, comp.data() + got, csz - got, (off_t)(coff + got));
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) return false;
+      got += (size_t)r;
+    }
+    if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+    unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), csz);
+    if (fcs == ZSTD_CONTENTSIZE_ERROR
+        || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz)) return false;
+    fbuf.resize(usz);
+    size_t dz = ZSTD_decompressDCtx(dctx, fbuf.data(), usz, comp.data(), csz);
+    if (ZSTD_isError(dz) || dz != usz) return false;
+    fcur = k;
+    return true;
+  };
+  auto frame_of = [&](uint64_t v) {
+    return (size_t)(std::upper_bound(st.u_off.begin(), st.u_off.end(), v)
+                    - st.u_off.begin()) - 1;
+  };
+  auto get_range = [&](uint64_t off, size_t len, char * dst) -> bool {
+    while (len) {
+      size_t k = frame_of(off);
+      if (k >= nframes || !load_frame(k)) return false;
+      size_t at = (size_t)(off - st.u_off[k]);
+      size_t n = std::min(len, fbuf.size() - at);
+      std::memcpy(dst, fbuf.data() + at, n);
+      dst += n; off += n; len -= n;
+    }
+    return true;
+  };
+
+  // The scan: same header grammar subset as Extractor::parse, offsets only.
+  struct ScanEnt { std::string name; uint64_t hdr_off, entry_end; };
+  std::vector<ScanEnt> ents;
+  bool ok = true;
+  {
+    char blk[TAR_BLK];
+    std::string pend_name, pax_path;
+    uint64_t pax_size = 0; bool pax_has_size = false;
+    uint64_t cursor = 0, entry_start = 0; bool in_ext = false;
+    int zero_run = 0;
+    while (cursor + TAR_BLK <= st.tar_size) {
+      if (!get_range(cursor, TAR_BLK, blk)) { ok = false; break; }
+      bool all_zero = true;
+      for (size_t z = 0; z < TAR_BLK; ++z) if (blk[z]) { all_zero = false; break; }
+      if (all_zero) { if (++zero_run >= 2) break; cursor += TAR_BLK; continue; }
+      zero_run = 0;
+      uint64_t stored = get_num(blk + 148, 8), sum = 0;
+      for (size_t z = 0; z < TAR_BLK; ++z)
+        sum += (z >= 148 && z < 156) ? (unsigned char)' ' : (unsigned char)blk[z];
+      if (sum != stored) { ok = false; break; }
+      char type = blk[156];
+      uint64_t size = get_num(blk + 124, 12);
+      if (!in_ext) { entry_start = cursor; in_ext = true; }
+      uint64_t data_end = cursor + TAR_BLK + tar_round_up(size, TAR_BLK);
+      if (type == 'L' || type == 'K' || type == 'x') {
+        if (size > (1u << 20)) { ok = false; break; }   // implausible ext record
+        std::vector<char> pd((size_t)size);
+        if (size && !get_range(cursor + TAR_BLK, (size_t)size, pd.data())) { ok = false; break; }
+        if (type == 'L') {
+          pend_name.assign(pd.data(), size ? size - (pd[size - 1] == 0 ? 1 : 0) : 0);
+        } else if (type == 'x') {
+          std::string rec(pd.data(), pd.size());
+          size_t p2 = 0;
+          while (p2 < rec.size()) {
+            size_t sp = rec.find(' ', p2); if (sp == std::string::npos) break;
+            int rlen = atoi(rec.substr(p2, sp - p2).c_str()); if (rlen <= 0) break;
+            std::string kv = rec.substr(sp + 1, (size_t)rlen - (sp - p2) - 2);
+            size_t eq = kv.find('=');
+            if (eq != std::string::npos) {
+              std::string key = kv.substr(0, eq);
+              if (key == "path") pax_path = kv.substr(eq + 1);
+              else if (key == "size") { pax_size = strtoull(kv.c_str() + eq + 1, nullptr, 10); pax_has_size = true; }
+              else if (key.rfind("GNU.sparse.", 0) == 0) { ok = false; break; }
+            }
+            p2 += (size_t)rlen;
+          }
+          if (!ok) break;
+        }
+        cursor = data_end;
+        continue;
+      }
+      if (type == 'g' || type == 'S') { ok = false; break; }  // not modeled: fall back
+      std::string name = get_str(blk, 100);
+      std::string prefix = get_str(blk + 345, 155);
+      if (!prefix.empty()) name = prefix + "/" + name;
+      if (!pend_name.empty()) { name = pend_name; pend_name.clear(); }
+      if (!pax_path.empty())  { name = pax_path;  pax_path.clear(); }
+      uint64_t dsize = pax_has_size ? pax_size : size;
+      pax_has_size = false;
+      // Link-family entries store no data regardless of the size field.
+      if (type == '1' || type == '2' || type == '3' || type == '4' || type == '5')
+        dsize = 0;
+      uint64_t eend = cursor + TAR_BLK + tar_round_up(dsize, TAR_BLK);
+      if (eend > st.tar_size) { ok = false; break; }
+      ents.push_back({std::move(name), entry_start, eend});
+      cursor = eend;
+      in_ext = false;
+    }
+  }
+  ZSTD_freeDCtx(dctx);
+  if (!ok) return false;
+
+  // Selection + range/frame mapping, same as the indexed path.
+  std::vector<std::pair<std::string, int>> sel = members;
+  for (auto & mp : sel) {
+    mp.first = norm_member_name(mp.first);
+    while (!mp.first.empty() && mp.first.back() == '/') mp.first.pop_back();
+  }
+  for (const ScanEnt & e : ents) {
+    if (match_tar_member(norm_member_name(e.name), sel) < 0) continue;
+    ++plan.sel_entries;
+    if (!plan.ranges.empty() && plan.ranges.back().second >= e.hdr_off)
+      plan.ranges.back().second = std::max(plan.ranges.back().second, e.entry_end);
+    else
+      plan.ranges.emplace_back(e.hdr_off, e.entry_end);
+  }
+  plan.all_entries = ents.size();
+  for (const auto & r : plan.ranges) {
+    const size_t f0 = frame_of(r.first);
+    const size_t f1 = frame_of(r.second - 1);
+    if (f1 >= nframes) return false;
+    for (size_t f = plan.frames.empty() ? f0 : std::max(f0, plan.frames.back() + 1); f <= f1; ++f)
+      plan.frames.push_back(f);
+  }
+  plan.tar_size = st.tar_size;
+  plan.c_off = std::move(st.c_off); plan.u_off = std::move(st.u_off);
+  plan.active = true;
+  return true;
+}
+
+// Feed the sliced tar stream for `plan` into the sink: a small worker pool
+// preads + decompresses the needed frames (a reorder window keeps RAM
+// bounded; the sink's own budget applies backpressure), while the caller's
+// thread slices them in order.  A frame fully covered by one range is moved
+// into the sink without a copy — the common case: a large member's interior
+// frames.  Ends with the end-of-archive zero blocks the parser expects, so
+// the Extractor sees a complete, well-formed (shorter) tar stream.  Corrupt
+// frames die_data like every !keep_going decompress path.
+static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
+                      const Options & opt, Meter * m) {
+  const int fd = fileno(in);
+  const size_t nfr = plan.frames.size();
+  if (nfr) {
+    int nthreads = resolve_cpu_threads(opt.cpu_threads);
+    nthreads = std::max(1, std::min(std::min(nthreads, (int)nfr), 16));
+    std::atomic<size_t> next{0};
+    std::mutex mx; std::condition_variable cv;
+    std::map<size_t, FrameBuf> ready;
+    size_t push_next = 0;
+    const size_t window = std::max<size_t>(4, (size_t)nthreads * 2);
+    auto worker = [&] {
+      ZSTD_DCtx * dctx = ZSTD_createDCtx();
+      std::vector<char> comp;
+      size_t i;
+      while ((i = next.fetch_add(1)) < nfr) {
+        {  // claim gate: stay within `window` of the slicer so RAM stays bounded
+          std::unique_lock<std::mutex> lk(mx);
+          cv.wait(lk, [&] { return i < push_next + window; });
+        }
+        const size_t k = plan.frames[i];
+        const uint64_t coff = plan.c_off[k];
+        const size_t csz = (size_t)(plan.c_off[k + 1] - coff);
+        const size_t usz = (size_t)(plan.u_off[k + 1] - plan.u_off[k]);
+        comp.resize(csz);
+        for (size_t got = 0; got < csz;) {
+          ssize_t r = ::pread(fd, comp.data() + got, csz - got, (off_t)(coff + got));
+          if (r < 0 && errno == EINTR) continue;
+          if (r <= 0) die_io("seek-extract: pread failed at frame " + std::to_string(k)
+                             + ": " + (r < 0 ? std::strerror(errno) : "unexpected EOF"));
+          got += (size_t)r;
+        }
+        if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+        // GPU-written frames may omit the content size; when present it must
+        // corroborate the index geometry before we allocate.
+        unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), csz);
+        if (fcs == ZSTD_CONTENTSIZE_ERROR
+            || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz))
+          die_data("seek-extract: frame " + std::to_string(k)
+                   + " does not match the member index (corrupt archive?)");
+        FrameBuf fb = std::make_shared<FrameVec>(usz);
+        size_t dz = ZSTD_decompressDCtx(dctx, fb->data(), usz, comp.data(), csz);
+        if (ZSTD_isError(dz) || dz != usz)
+          die_data("seek-extract: frame " + std::to_string(k) + ": "
+                   + (ZSTD_isError(dz) ? ZSTD_getErrorName(dz)
+                                       : "size mismatch vs member index"));
+        {
+          std::lock_guard<std::mutex> lk(mx);
+          ready.emplace(i, std::move(fb));
+        }
+        cv.notify_all();
+      }
+      ZSTD_freeDCtx(dctx);
+    };
+    std::vector<std::thread> pool;
+    pool.reserve((size_t)nthreads);
+    for (int t = 0; t < nthreads; ++t) pool.emplace_back(worker);
+
+    size_t ri = 0;   // two-pointer walk: ranges and frames both ascend
+    for (size_t i = 0; i < nfr; ++i) {
+      FrameBuf fb;
+      {
+        std::unique_lock<std::mutex> lk(mx);
+        cv.wait(lk, [&] { return ready.count(push_next) != 0; });
+        auto it = ready.find(push_next);
+        fb = std::move(it->second);
+        ready.erase(it);
+        ++push_next;
+      }
+      cv.notify_all();
+      const uint64_t u0 = plan.u_off[plan.frames[i]];
+      const uint64_t u1 = u0 + fb->size();
+      while (ri < plan.ranges.size() && plan.ranges[ri].second <= u0) ++ri;
+      for (size_t rj = ri; rj < plan.ranges.size() && plan.ranges[rj].first < u1; ++rj) {
+        const uint64_t a = std::max(plan.ranges[rj].first, u0);
+        const uint64_t b = std::min(plan.ranges[rj].second, u1);
+        if (a >= b) continue;
+        if (m) m->wrote_bytes.fetch_add(b - a, std::memory_order_relaxed);
+        if (a == u0 && b == u1) { sink->push(std::move(fb)); break; }  // whole frame, no copy
+        sink->push(std::make_shared<FrameVec>(fb->data() + (a - u0), fb->data() + (b - u0)));
+      }
+    }
+    for (auto & t : pool) t.join();
+  }
+  // End-of-archive marker: two zero blocks, so parse() ends cleanly.
+  sink->push(std::make_shared<FrameVec>((size_t)(2 * TAR_BLK), (char)0));
 }
 
 }  // namespace tarx
@@ -14694,6 +15307,30 @@ static int extract_tar(const Options & opt, Meter * m)
       std::rewind(in);
     }
 
+    // Seek-based selective extraction: MEMBERs + a seekable archive whose
+    // index carries the frame table → read and decompress only the frames
+    // the selection touches (see tarx::build_seek_plan).  --keep-going falls
+    // back to the walk so damage recovery keeps seeing the whole stream.
+    tarx::SeekPlan plan;
+    if (!members.empty() && arc != "-" && !opt.keep_going
+        && !tarx::build_seek_plan(in, members, plan)) {
+      // No gzstd index — a foreign zstd-seekable archive (t2sz-style) still
+      // carries the frame map: header-hop to find the members, then seek.
+      plan = tarx::SeekPlan();
+      if (!tarx::build_foreign_seek_plan(in, members, plan, m))
+        plan = tarx::SeekPlan();
+    }
+    if (plan.active && opt.verbosity >= V_VERBOSE) {
+      uint64_t need = 0;
+      for (size_t f : plan.frames) need += plan.c_off[f + 1] - plan.c_off[f];
+      char b[192];
+      std::snprintf(b, sizeof b,
+        "[TAR] seek-extract: %zu of %zu entries, %zu of %zu frames (%.1f%% of the archive read)\n",
+        plan.sel_entries, plan.all_entries, plan.frames.size(), plan.c_off.size() - 1,
+        plan.c_off.back() ? 100.0 * (double)need / (double)plan.c_off.back() : 0.0);
+      vlog(V_VERBOSE, opt, b);
+    }
+
     // Feed the decompressed tar stream to the Extractor in memory rather than
     // through a kernel pipe (same FrameSink path as verify, see verify_tar):
     // the decompressors push finished frames straight to the parser, which
@@ -14718,19 +15355,24 @@ static int extract_tar(const Options & opt, Meter * m)
 
     // out is null: every output route is redirected to the sink while
     // g_tar_decomp_sink is set, so the FILE* is never touched.
-    int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
-    // Named input with a huge or sizeless first frame (tar --zstd, zstd
-    // streams, --sliding-window): decode it incrementally — see
-    // needs_stream_decode.  Stdin keeps the sequential batch reader.
-    if (arc != "-" && needs_stream_decode(ff)) {
-      decompress_stream_from_file(in, nullptr, dopt, m);
+    if (plan.active) {
+      // Selective seek path: feed the sliced tar stream straight to the sink.
+      tarx::seek_feed(in, plan, &sink, dopt, m);
     } else {
+      int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
+      // Named input with a huge or sizeless first frame (tar --zstd, zstd
+      // streams, --sliding-window): decode it incrementally — see
+      // needs_stream_decode.  Stdin keeps the sequential batch reader.
+      if (arc != "-" && needs_stream_decode(ff)) {
+        decompress_stream_from_file(in, nullptr, dopt, m);
+      } else {
 #ifdef HAVE_NVCOMP
-      if (dopt.cpu_only) decompress_cpu_mt(in, nullptr, dopt, m);
-      else               decompress_nvcomp(in, nullptr, dopt, m);
+        if (dopt.cpu_only) decompress_cpu_mt(in, nullptr, dopt, m);
+        else               decompress_nvcomp(in, nullptr, dopt, m);
 #else
-      decompress_cpu_mt(in, nullptr, dopt, m);
+        decompress_cpu_mt(in, nullptr, dopt, m);
 #endif
+      }
     }
     sink.close();          // signal EOF to the Extractor after all frames pushed
     exth.join();
@@ -15122,7 +15764,7 @@ static int list_tar(const Options & opt, Meter * m)
     }
 
     // Instant route: a gzstd-created archive carries a member index in a
-    // trailing skippable frame (see tarx::build_tar_index_frame) — list from
+    // trailing skippable frame (see tarx::build_tar_index_body) — list from
     // it without decompressing anything.
     bool from_index = false;
     if (arc != "-") {
@@ -15211,22 +15853,22 @@ static bool append_plain_fd(int fd, const std::string & b) {
 }
 
 // The ONE place the --tar member index reaches the output (see
-// build_tar_index_frame).  dfd >= 0: the O_DIRECT writer's fd (post-
-// finalize); else `f` (buffered file or stdout).  Dies on failure — a
+// build_tar_index_body / finish_tar_index_frame — the finish also folds in
+// the frame table the writer recorded).  dfd >= 0: the O_DIRECT writer's fd
+// (post-finalize); else `f` (buffered file or stdout).  Dies on failure — a
 // short index would leave a trailer that read_tar_index rejects, but the
 // user asked for an archive with an index and didn't get one.  NOTE: these
 // bytes land AFTER --verify's in-memory frame taps; the loud failure here
 // is the coverage.  Any new output route must call this or the index is
 // silently absent (-l just falls back to the walk — no test fails).
 static void append_tar_index(int dfd, FILE * f, Meter & meter) {
-  if (g_tar_index_frame.empty()) return;
+  const std::string frame = tarx::finish_tar_index_frame();
+  if (frame.empty()) return;
   bool ok = false;
-  if (dfd >= 0) ok = append_plain_fd(dfd, g_tar_index_frame);
-  else if (f)   ok = robust_fwrite(g_tar_index_frame.data(), g_tar_index_frame.size(), f)
-                     == g_tar_index_frame.size();
+  if (dfd >= 0) ok = append_plain_fd(dfd, frame);
+  else if (f)   ok = robust_fwrite(frame.data(), frame.size(), f) == frame.size();
   if (!ok) die_io("failed to append tar member index");
-  meter.wrote_bytes.fetch_add(g_tar_index_frame.size(), std::memory_order_relaxed);
-  g_tar_index_frame.clear();
+  meter.wrote_bytes.fetch_add(frame.size(), std::memory_order_relaxed);
 }
 #endif
 
@@ -15882,7 +16524,7 @@ int main(int argc, char ** argv)
     if (!g_direct_writer->finalize())
       die_io("failed to finalize O_DIRECT output");
     // --tar create: append the member-index skippable frame as the archive's
-    // final bytes (built by build_layout; see tarx::build_tar_index_frame).
+    // final bytes (built by build_layout; see tarx::build_tar_index_body).
     // After finalize the file length is exact, so a plain append lands the
     // trailer at EOF; the fd needs O_DIRECT cleared for the unaligned tail.
     append_tar_index(g_direct_writer->fd(), nullptr, meter);

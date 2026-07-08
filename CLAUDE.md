@@ -69,6 +69,7 @@ INPUT → [Reader] → [TaskQueue] → [CPU workers / GPU workers] → [ResultSt
 |------|-------------|---------|
 | CPU-only | `decompress_cpu_mt` | N CPU threads, `ZSTD_decompress` per frame |
 | GPU | `decompress_nvcomp` | batched nvCOMP + CPU rescue for failed frames |
+| Seek-extract | `tarx::build_seek_plan` + `seek_feed` | `-d --tar ARCHIVE MEMBER...` on an indexed archive: preads + decompresses only the frames the selection touches |
 
 Frames with compression ratio < 2% (trivially compressed) are always routed to CPU to avoid PCIe D2H cost.
 

@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=277
-$EXTENSIVE && EXPECTED_TESTS=393
+EXPECTED_TESTS=288
+$EXTENSIVE && EXPECTED_TESTS=404
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -4090,6 +4090,158 @@ else
   else fail "-l --progress" "meter missing, on index path, or listing changed"; fi
   rm -rf "$IX"
 fi
+
+# ============================================================
+# Seek-based selective extraction (-d --tar ARCHIVE MEMBER via the index)
+# ============================================================
+section "Seek-based selective extraction (-d --tar MEMBER)"
+
+SX="$TMPDIR/sxsrc"; rm -rf "$SX"; mkdir -p "$SX/t/sub/deep"
+echo alpha > "$SX/t/a.txt"; echo beta > "$SX/t/sub/b.txt"
+head -c 3M /dev/urandom > "$SX/t/sub/big.bin"       # spans frames at --chunk-size 1
+LNAME=$(printf 'l%.0s' $(seq 120))                  # > 100 chars → GNU 'L' record
+mkdir -p "$SX/t/$LNAME"; echo gamma > "$SX/t/$LNAME/long.txt"
+ln "$SX/t/a.txt" "$SX/t/hard"
+touch -d '2020-05-04 03:02:01' "$SX/t/sub/deep" "$SX/t/sub/b.txt"
+(cd "$SX" && "$GZSTD" --cpu-only -q -f -o s.tar.zst  --tar --chunk-size 1 t \
+          && "$GZSTD" --cpu-only -q -f -o sno.tar.zst --tar --chunk-size 1 --no-index t) 2>/dev/null
+
+# 1. The seek path engages (verbose says so, and only a fraction of the
+#    frames is read) and the extracted member matches the walk's bytes
+#    and metadata.
+rm -rf "$SX/x1" "$SX/x2"; mkdir -p "$SX/x1" "$SX/x2"
+sline=$("$GZSTD" -d --cpu-only -v --tar -C "$SX/x1" "$SX/s.tar.zst" t/sub/b.txt 2>&1 | grep 'seek-extract' || true)
+"$GZSTD" -d --cpu-only -q --tar -C "$SX/x2" "$SX/sno.tar.zst" t/sub/b.txt 2>/dev/null
+if [[ -n "$sline" ]] && ! echo "$sline" | grep -q "of 4 frames.*100" \
+   && cmp -s "$SX/x1/t/sub/b.txt" "$SX/t/sub/b.txt" \
+   && [[ "$(stat -c '%a %Y' "$SX/x1/t/sub/b.txt")" == "$(stat -c '%a %Y' "$SX/x2/t/sub/b.txt")" ]]; then
+  pass "seek path engages; bytes + metadata match the walk"
+else fail "seek single member" "line='$sline' or mismatch"; fi
+
+# 2. A member spanning several frames reassembles bit-exact.
+rm -rf "$SX/x3"; mkdir -p "$SX/x3"
+"$GZSTD" -d --cpu-only -q --tar -C "$SX/x3" "$SX/s.tar.zst" t/sub/big.bin 2>/dev/null
+cmp -s "$SX/x3/t/sub/big.bin" "$SX/t/sub/big.bin" \
+  && pass "multi-frame member reassembles bit-exact" \
+  || fail "multi-frame member" "content mismatch"
+
+# 3. A directory selector extracts the whole subtree, and deferred dir
+#    metadata (mtime) still lands on the seek path.
+rm -rf "$SX/x4"; mkdir -p "$SX/x4"
+"$GZSTD" -d --cpu-only -q --tar -C "$SX/x4" "$SX/s.tar.zst" t/sub 2>/dev/null
+if diff -r "$SX/x4/t/sub" "$SX/t/sub" >/dev/null 2>&1 \
+   && [[ "$(stat -c %Y "$SX/x4/t/sub/deep")" == "$(stat -c %Y "$SX/t/sub/deep")" ]]; then
+  pass "directory selector: subtree + deferred dir mtime"
+else fail "directory selector" "tree or dir mtime mismatch"; fi
+
+# 4. GNU long-name members carry their 'L' record inside the slice.
+rm -rf "$SX/x5"; mkdir -p "$SX/x5"
+"$GZSTD" -d --cpu-only -q --tar -C "$SX/x5" "$SX/s.tar.zst" "t/$LNAME/long.txt" 2>/dev/null
+cmp -s "$SX/x5/t/$LNAME/long.txt" "$SX/t/$LNAME/long.txt" \
+  && pass "long-name member extracts via seek" \
+  || fail "long-name member" "content mismatch"
+
+# 5. No frame table (--no-index) → silent fallback to the walk, same result.
+rm -rf "$SX/x6"; mkdir -p "$SX/x6"
+n=$("$GZSTD" -d --cpu-only -v --tar -C "$SX/x6" "$SX/sno.tar.zst" t/a.txt 2>&1 | grep -c 'seek-extract' || true)
+[[ "$n" == "0" ]] && cmp -s "$SX/x6/t/a.txt" "$SX/t/a.txt" \
+  && pass "--no-index archive falls back silently" \
+  || fail "--no-index fallback" "seek engaged (n=$n) or mismatch"
+
+# 6. stdin and --keep-going also fall back (and stay correct).
+rm -rf "$SX/x7" "$SX/x8"; mkdir -p "$SX/x7" "$SX/x8"
+"$GZSTD" -d --cpu-only -q --tar -C "$SX/x7" - t/a.txt < "$SX/s.tar.zst" 2>/dev/null
+k=$("$GZSTD" -d --cpu-only -v --keep-going --tar -C "$SX/x8" "$SX/s.tar.zst" t/a.txt 2>&1 | grep -c 'seek-extract' || true)
+cmp -s "$SX/x7/t/a.txt" "$SX/t/a.txt" && [[ "$k" == "0" ]] && cmp -s "$SX/x8/t/a.txt" "$SX/t/a.txt" \
+  && pass "stdin + --keep-going fall back to the walk" \
+  || fail "stdin/keep-going fallback" "seek engaged (k=$k) or mismatch"
+
+# 7. Concatenated archives: the frame table's prefix sum no longer anchors →
+#    the plan is rejected, extraction falls back and still succeeds.
+cat "$SX/s.tar.zst" "$SX/s.tar.zst" > "$SX/dbl.tar.zst"
+rm -rf "$SX/x9"; mkdir -p "$SX/x9"
+c=$("$GZSTD" -d --cpu-only -v --tar -C "$SX/x9" "$SX/dbl.tar.zst" t/a.txt 2>&1 | grep -c 'seek-extract' || true)
+[[ "$c" == "0" ]] && cmp -s "$SX/x9/t/a.txt" "$SX/t/a.txt" \
+  && pass "concatenated archive rejects the table, falls back" \
+  || fail "concatenated archive" "seek engaged (c=$c) or mismatch"
+
+# 8. Unmatched member: 'Not found in archive', non-zero exit, empty tree.
+rm -rf "$SX/xa"; mkdir -p "$SX/xa"
+rc=0; msg=$("$GZSTD" -d --cpu-only --tar -C "$SX/xa" "$SX/s.tar.zst" nosuch 2>&1) || rc=$?
+if [[ $rc -ne 0 ]] && echo "$msg" | grep -q "Not found in archive" \
+   && [[ -z "$(ls -A "$SX/xa")" ]]; then
+  pass "unmatched member: Not-found error, nothing written"
+else fail "unmatched member" "rc=$rc msg=$msg"; fi
+
+# 9. A hardlink selected without its target behaves exactly like the walk
+#    (GNU parity: error, link not created) — seek must not change semantics.
+rm -rf "$SX/xb" "$SX/xc"; mkdir -p "$SX/xb" "$SX/xc"
+r1=0; "$GZSTD" -d --cpu-only -q --tar -C "$SX/xb" "$SX/s.tar.zst"   t/hard >/dev/null 2>&1 || r1=$?
+r2=0; "$GZSTD" -d --cpu-only -q --tar -C "$SX/xc" "$SX/sno.tar.zst" t/hard >/dev/null 2>&1 || r2=$?
+if [[ "$r1" == "$r2" ]] && diff -r "$SX/xb" "$SX/xc" >/dev/null 2>&1; then
+  pass "hardlink-without-target parity with the walk (rc=$r1)"
+else fail "hardlink parity" "seek rc=$r1 walk rc=$r2 or tree differs"; fi
+
+# 10. The trailing seek table is spec-conformant zstd seekable format: a
+#     format-blind reader (python struct + plain zstd) can locate and
+#     decompress a single frame by offsets from the table alone, and the
+#     table tiles the whole file (index frame listed as a dsize=0 entry).
+if ! command -v python3 >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
+  skip "seekable-format interop" "python3 or zstd not available"
+else
+  "$GZSTD" -d --cpu-only -q -f -o "$SX/stream.tar" "$SX/s.tar.zst" 2>/dev/null
+  fr=$(python3 - "$SX/s.tar.zst" <<'PYEOF'
+import struct, sys
+d = open(sys.argv[1],'rb').read()
+assert struct.unpack('<I', d[-4:])[0] == 0x8F92EAB1
+nf, desc = struct.unpack('<IB', d[-9:-4]); assert desc == 0
+tpay = nf*8 + 9; ts = len(d) - 8 - tpay
+magic, size = struct.unpack('<II', d[ts:ts+8])
+assert magic == 0x184D2A5E and size == tpay
+co = uo = 0; rows = []
+for k in range(nf):
+    c, u = struct.unpack('<II', d[ts+8+8*k: ts+16+8*k])
+    rows.append((co, c, uo, u)); co += c; uo += u
+assert co == ts and rows[-1][3] == 0      # tiles the file; index = dsize 0
+k = next(i for i, r in enumerate(rows) if r[3] > 0 and i > 0)
+print(*rows[k])
+PYEOF
+) && read -r coff csz uoff usz <<< "$fr" \
+  && dd if="$SX/s.tar.zst" bs=1 skip="$coff" count="$csz" 2>/dev/null | zstd -q -d 2>/dev/null \
+     | cmp -s - <(dd if="$SX/stream.tar" bs=1 skip="$uoff" count="$usz" 2>/dev/null) \
+  && pass "seekable-format seek table: spec parse + zstd random access" \
+  || fail "seekable-format interop" "footer parse or frame decompress mismatch"
+fi
+
+# 11. FOREIGN zstd-seekable archives (t2sz-style: plain tar chunked into
+#     frames + spec seek table, NO gzstd index): selective extraction
+#     header-hops via the table alone.
+if ! command -v python3 >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 \
+   || ! command -v tar >/dev/null 2>&1; then
+  skip "foreign seekable extract" "python3, zstd, or tar not available"
+else
+  tar --format=gnu -C "$SX" -cf "$SX/plain.tar" t
+  python3 - "$SX/plain.tar" "$SX/foreign.tar.zst" <<'PYEOF'
+import struct, subprocess, sys
+d = open(sys.argv[1],'rb').read()
+out, ents = b'', []
+for i in range(0, len(d), 300000):           # deliberately block-unaligned
+    c = subprocess.run(['zstd','-q','-3','-c'], input=d[i:i+300000],
+                       capture_output=True).stdout
+    ents.append((len(c), len(d[i:i+300000]))); out += c
+tbl = struct.pack('<II', 0x184D2A5E, len(ents)*8+9)
+for cz, dz in ents: tbl += struct.pack('<II', cz, dz)
+tbl += struct.pack('<IBI', len(ents), 0, 0x8F92EAB1)
+open(sys.argv[2],'wb').write(out + tbl)
+PYEOF
+  rm -rf "$SX/xf"; mkdir -p "$SX/xf"
+  fline=$("$GZSTD" -d --cpu-only -v --tar -C "$SX/xf" "$SX/foreign.tar.zst" t/sub/b.txt 2>&1 | grep -c 'seek-extract' || true)
+  if [[ "$fline" == "1" ]] && cmp -s "$SX/xf/t/sub/b.txt" "$SX/t/sub/b.txt"; then
+    pass "foreign seekable archive: header-hop selective extract"
+  else fail "foreign seekable extract" "engaged=$fline or mismatch"; fi
+fi
+
+rm -rf "$SX"
 
 # ============================================================
 # Sizeless single-frame archives (tar --zstd / piped zstd streams)
