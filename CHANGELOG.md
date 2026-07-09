@@ -1,11 +1,19 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.86  
+**Covers:** v0.9.50 → v0.14.87  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.87 — parallel-extract audit follow-ups: determinism on malformed archives + honest summary figures
+
+Post-merge multi-angle audit of v0.14.86 found no correctness, race, or security defect on legitimate archives (parallel extraction is byte- and metadata-identical to the serial walk), but surfaced two polish items, both fixed here.
+
+**Leaf/directory path collisions now fall back to the serial walk.** On a *malformed* archive where one path is both a non-directory entry (file/symlink/special) and also used as a directory — e.g. a file `x` plus a file `x/y` — the serial walk resolves the contradiction deterministically by archive order, but two parallel workers could race the shared path with a nondeterministic winner (no security escape: the `openat`/`O_NOFOLLOW` walk still contains it, and `unlinkat` can't replace a directory — only the file-vs-refused outcome differed run-to-run). `build_full_parallel_plan` now rejects any leaf whose path is an explicit directory entry or a parent component of another entry (`tar_leaf_dir_collision`), forcing serial so parallel == serial even on adversarial input. Legitimate archives (a real directory `d` with children `d/a`, `d/e/f`) are unaffected — verified they still engage parallel. The foreign header-hop scan now records each entry's typeflag to feed the same check.
+
+**Extraction summary figures now match the serial walk.** The parallel path's reported output under-counted by the trailing end-of-archive zero blocks, and its reported input double-counted the boundary frame that two adjacent partitions each `pread`. Fixed: the trailing stream bytes are added once after join so output equals the full decompressed stream, and the later partition skips read-accounting for its shared leading frame (`decode_seek_frame(..., count_read=false)`) so input reflects the archive's logical compressed size, not the physical re-read. A parallel and a serial extraction of the same content now print an identical `in => out` and ratio. Extracted data was never affected — these were reporting-only counters.
 
 ## v0.14.86 — parallel-dispatch full `-d --tar` extraction (the last serial extract stage, parallelized)
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.86";
+static constexpr const char * GZSTD_VERSION = "0.14.87";
 //
 // Architecture overview:
 //
@@ -54,6 +54,7 @@ static constexpr const char * GZSTD_VERSION = "0.14.86";
 #include <deque>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -9029,7 +9030,7 @@ static FrameBuf decode_seek_frame(int fd,
                                   const std::vector<uint64_t> & c_off,
                                   const std::vector<uint64_t> & u_off,
                                   size_t k, std::vector<char> & comp,
-                                  ZSTD_DCtx * dctx, Meter * m);
+                                  ZSTD_DCtx * dctx, Meter * m, bool count_read = true);
 
 class Extractor {
 public:
@@ -9192,10 +9193,14 @@ public:
         auto comp = std::make_shared<std::vector<char>>();
         size_t f = f0;
         std::function<FrameBuf()> producer =
-          [fd, &c_off, &u_off, f1, start, end, dctx, comp, f, feed_meter]() mutable -> FrameBuf {
+          [fd, &c_off, &u_off, f0, f1, start, end, dctx, comp, f, feed_meter]() mutable -> FrameBuf {
             if (f > f1) return nullptr;
             size_t k = f++;
-            FrameBuf fb = decode_seek_frame(fd, c_off, u_off, k, *comp, dctx.get(), feed_meter);
+            // A boundary frame shared with the previous partition (this worker's
+            // leading frame when it straddles `start`) was already read+counted
+            // there; skip its read_bytes so the reported input isn't inflated.
+            bool count_read = !(k == f0 && start > u_off[f0]);
+            FrameBuf fb = decode_seek_frame(fd, c_off, u_off, k, *comp, dctx.get(), feed_meter, count_read);
             if (feed_meter) {   // count the tar bytes this worker actually parses
               uint64_t a = std::max(u_off[k], start), b = std::min(u_off[k + 1], end);
               if (b > a) feed_meter->wrote_bytes.fetch_add(b - a, std::memory_order_relaxed);
@@ -9217,6 +9222,11 @@ public:
       for (auto & d : pc.dirmeta)   dirmeta_.push_back(std::move(d));
     }
     stream_bytes_ = u_off.empty() ? 0 : u_off.back();   // full decompressed tar-stream size
+    // The workers counted tar bytes only up to the last entry's end; add the
+    // trailing end-of-archive zero blocks + padding so the reported output
+    // equals the full decompressed stream, matching the serial walk.
+    if (feed_meter && !u_off.empty() && !bounds.empty() && u_off.back() > bounds.back())
+      feed_meter->wrote_bytes.fetch_add(u_off.back() - bounds.back(), std::memory_order_relaxed);
     ex_wall_ns_ = now_ns() - t0;
     stop_pool();
     finish_deferred();
@@ -10631,7 +10641,7 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
 
 // One member's stream geometry, as recovered by the foreign header-hop scan:
 // offsets only (the caller re-parses for real metadata).
-struct ScanEnt { std::string name; uint64_t hdr_off, entry_end; };
+struct ScanEnt { std::string name; uint64_t hdr_off, entry_end; char typeflag; };
 
 // Header-hop a foreign seekable archive: build (name, hdr_off, entry_end) for
 // every member by decompressing ONLY the frames that hold header (or
@@ -10769,7 +10779,7 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
       if (dsize > st.tar_size - cursor - TAR_BLK) { ok = false; break; }
       uint64_t eend = cursor + TAR_BLK + tar_round_up(dsize, TAR_BLK);
       if (eend > st.tar_size || eend <= cursor) { ok = false; break; }
-      ents.push_back({std::move(name), entry_start, eend});
+      ents.push_back({std::move(name), entry_start, eend, type});
       cursor = eend;
       in_ext = false;
     }
@@ -10835,11 +10845,16 @@ static bool build_foreign_seek_plan(FILE * in,
 // Fatal (die_*) on I/O or corruption, like every non-keep_going decompress path.
 // Shared by seek_feed (selective extract) and the parallel full-extract
 // producers.  `comp`/`dctx` are caller-owned scratch reused across frames.
+// count_read=false suppresses the read_bytes accounting for this frame: the
+// parallel full-extract path shares a boundary frame between two partitions
+// (both physically pread it), so the later partition passes false for that one
+// leading frame to keep the reported compressed-input figure at the archive's
+// logical size rather than double-counting the re-read.
 static FrameBuf decode_seek_frame(int fd,
                                   const std::vector<uint64_t> & c_off,
                                   const std::vector<uint64_t> & u_off,
                                   size_t k, std::vector<char> & comp,
-                                  ZSTD_DCtx * dctx, Meter * m) {
+                                  ZSTD_DCtx * dctx, Meter * m, bool count_read) {
   const uint64_t coff = c_off[k];
   const size_t csz = (size_t)(c_off[k + 1] - coff);
   const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
@@ -10851,7 +10866,7 @@ static FrameBuf decode_seek_frame(int fd,
                        + ": " + (r < 0 ? std::strerror(errno) : "unexpected EOF"));
     got += (size_t)r;
   }
-  if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+  if (m && count_read) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
   // GPU-written frames may omit the content size; when present it must
   // corroborate the index geometry before we allocate.
   unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), csz);
@@ -10957,15 +10972,43 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
 // occupying [bounds[i-1], bounds[i]) with entry 0 starting at 0).  Tries our own
 // member index first, then a foreign zstd-seekable header-hop scan.  Returns
 // false (→ the caller uses the serial walk) when there is no valid frame table +
-// entry list, the entries are not contiguous from offset 0, or duplicate
-// normalized names exist — tar's last-writer-wins semantics can't be preserved
-// once such names land in different parallel partitions.  Rewinds `in`.
+// entry list, the entries are not contiguous from offset 0, duplicate normalized
+// names exist (tar's last-writer-wins can't be preserved across partitions), or a
+// leaf/directory path collision exists (see tar_leaf_dir_collision).  Rewinds `in`.
+// True if some non-directory entry's path is also used as a directory — an
+// explicit directory entry OR a parent component of another entry.  Serial
+// extraction resolves such leaf/prefix collisions deterministically by archive
+// order; parallel workers would race the shared path (nondeterministic winner),
+// so the caller falls back to the serial walk to keep parallel == serial.
+// Legitimate archives never contain this (a path can't be both a file and a
+// directory) — only malformed / tar-slip archives.  `ents` are (normalized name
+// with any trailing '/' stripped, typeflag).
+static bool tar_leaf_dir_collision(const std::vector<std::pair<std::string, char>> & ents) {
+  std::unordered_set<std::string> dirs;      // explicit dirs + every ancestor path
+  std::vector<const std::string *> leaves;
+  for (const auto & e : ents) {
+    const std::string & k = e.first;
+    if (k.empty()) continue;
+    if (e.second == '5') dirs.insert(k); else leaves.push_back(&k);
+    for (size_t s = k.find('/'); s != std::string::npos; s = k.find('/', s + 1))
+      dirs.insert(k.substr(0, s));
+  }
+  for (const std::string * lp : leaves) if (dirs.count(*lp)) return true;
+  return false;
+}
+
 static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
                                      TarSeekTable & st, std::vector<uint64_t> & bounds) {
   bounds.clear();
   auto no_dup = [](std::unordered_map<std::string, char> & seen, const std::string & name) {
     std::string nm = norm_member_name(name);
     return nm.empty() || seen.emplace(nm, 1).second;   // empty names never collide
+  };
+  // Normalized name with any trailing slash stripped (for the leaf/dir check).
+  auto key = [](const std::string & name) {
+    std::string nm = norm_member_name(name);
+    while (!nm.empty() && nm.back() == '/') nm.pop_back();
+    return nm;
   };
   bool have = false;
 
@@ -10975,13 +11018,16 @@ static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
     if (read_tar_index(in, es, &s2) && s2.valid() && !es.empty()) {
       uint64_t prev = 0; bool ok = true;
       std::unordered_map<std::string, char> seen;
+      std::vector<std::pair<std::string, char>> nt;
       for (const InEntry & e : es) {
         if (e.hdr_off != prev || e.data_off < e.hdr_off + TAR_BLK
             || e.entry_end < e.data_off || e.entry_end > s2.tar_size
             || !no_dup(seen, e.name)) { ok = false; break; }
         prev = e.entry_end;
         bounds.push_back(e.entry_end);
+        nt.emplace_back(key(e.name), e.typeflag);
       }
+      if (ok && tar_leaf_dir_collision(nt)) ok = false;
       if (ok) { st = std::move(s2); have = true; } else bounds.clear();
     }
   }
@@ -10993,12 +11039,15 @@ static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
         && !fes.empty()) {
       uint64_t prev = 0; bool ok = true;
       std::unordered_map<std::string, char> seen;
+      std::vector<std::pair<std::string, char>> nt;
       for (const ScanEnt & e : fes) {
         if (e.hdr_off != prev || e.entry_end <= e.hdr_off || e.entry_end > s2.tar_size
             || !no_dup(seen, e.name)) { ok = false; break; }
         prev = e.entry_end;
         bounds.push_back(e.entry_end);
+        nt.emplace_back(key(e.name), e.typeflag);
       }
+      if (ok && tar_leaf_dir_collision(nt)) ok = false;
       if (ok) { st = std::move(s2); have = true; } else bounds.clear();
     }
   }

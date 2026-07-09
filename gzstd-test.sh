@@ -4240,6 +4240,53 @@ PYEOF
     pass "foreign seekable archive: header-hop selective extract"
   else fail "foreign seekable extract" "engaged=$fline or mismatch"; fi
 
+  # 11b. Parallel full-extract: a leaf/directory collision (file "x" AND file
+  #      "x/y") must fall back to the serial walk (parallel workers would race
+  #      the shared path), extracting deterministically like the serial order;
+  #      a legit multi-dir archive must still engage the parallel path.
+  chunk_seektable() {  # $1 plain.tar  $2 out.tar.zst — t2sz-style foreign archive
+    python3 - "$1" "$2" <<'PYEOF'
+import struct, subprocess, sys
+d=open(sys.argv[1],'rb').read(); out=b''; ents=[]
+for i in range(0,len(d),300000):
+    c=subprocess.run(['zstd','-q','-3','-c'],input=d[i:i+300000],capture_output=True).stdout
+    ents.append((len(c),len(d[i:i+300000]))); out+=c
+tbl=struct.pack('<II',0x184D2A5E,len(ents)*8+9)
+for cz,dz in ents: tbl+=struct.pack('<II',cz,dz)
+tbl+=struct.pack('<IBI',len(ents),0,0x8F92EAB1)
+open(sys.argv[2],'wb').write(out+tbl)
+PYEOF
+  }
+  python3 - "$SX/coll.tar" "$SX/legit.tar" <<'PYEOF'
+import tarfile, io, os, sys
+def build(path, entries):
+    buf=io.BytesIO(); tf=tarfile.open(fileobj=buf,mode='w',format=tarfile.GNU_FORMAT)
+    for name,kind in entries:
+        ti=tarfile.TarInfo(name)
+        if kind=='d': ti.type=tarfile.DIRTYPE; ti.mode=0o755; tf.addfile(ti)
+        else:
+            data=os.urandom(2_000_000) if kind=='big' else b"content:"+name.encode()+b"\n"
+            ti.size=len(data); ti.mode=0o644; tf.addfile(ti, io.BytesIO(data))
+    tf.close(); open(path,'wb').write(buf.getvalue())
+# collision: file x AND file x/y, with filler to force multiple frames
+build(sys.argv[1], [("f1.bin","big"),("x","f"),("f2.bin","big"),("x/y","f"),("f3.bin","big")])
+# legit: real dir entries with children (must NOT trip the collision guard)
+build(sys.argv[2], [("d","d"),("d/e","d"),("d/a","big"),("d/b","big"),("d/e/f","big")])
+PYEOF
+  chunk_seektable "$SX/coll.tar" "$SX/coll.tar.zst"
+  chunk_seektable "$SX/legit.tar" "$SX/legit.tar.zst"
+  rm -rf "$SX/cout" "$SX/lout" "$SX/lref"; mkdir -p "$SX/cout" "$SX/lout" "$SX/lref"
+  cpar=$("$GZSTD" -d --cpu-only -v --tar "$SX/coll.tar.zst" -C "$SX/cout" 2>&1 | grep -c 'parallel-extract' || true)
+  ctype=$(stat -c %F "$SX/cout/x" 2>/dev/null)
+  if [[ "$cpar" == "0" && "$ctype" == "regular file" && ! -e "$SX/cout/x/y" ]]; then
+    pass "parallel-extract: leaf/dir collision falls back to serial (deterministic)"
+  else fail "parallel-extract collision" "engaged=$cpar x-type=$ctype"; fi
+  lpar=$("$GZSTD" -d --cpu-only -v --tar "$SX/legit.tar.zst" -C "$SX/lout" 2>&1 | grep -c 'parallel-extract' || true)
+  tar -xf "$SX/legit.tar" -C "$SX/lref" 2>/dev/null
+  if [[ "$lpar" == "1" ]] && diff -r "$SX/lout" "$SX/lref" >/dev/null 2>&1; then
+    pass "parallel-extract: legit directory tree still engages + matches tar"
+  else fail "parallel-extract legit" "engaged=$lpar or mismatch vs tar"; fi
+
   # 12. Hostile inputs (audit round 1): a forged footer claiming 500M frames
   #     must not OOM (1 GiB table cap), and a forged base-256 size that
   #     wraps the entry arithmetic must not hang the header scan.  Prompt,
