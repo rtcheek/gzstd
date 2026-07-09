@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.85";
+static constexpr const char * GZSTD_VERSION = "0.14.86";
 //
 // Architecture overview:
 //
@@ -8912,15 +8912,36 @@ struct StreamReader {
   // the random-access win over the old "drain the pipe" path.
   int fd; std::vector<char> buf; size_t pos = 0, fill = 0; bool eof = false;
   FrameSink * src = nullptr;     // in-memory frame source (null = fd mode)
-  FrameBuf cur;                  // current frame (sink mode); keeps `base` alive
+  std::function<FrameBuf()> prod;// on-demand frame producer (parallel-slice mode)
+  FrameBuf cur;                  // current frame (sink/producer); keeps `base` alive
   const char * base = nullptr;   // read cursor base: into buf (fd) or cur (sink)
   uint64_t consumed_total = 0;   // --keep-going: running offset in the tar byte stream
+  // Partial-slice cap (parallel full extract): a worker parses only its
+  // partition's byte range [start, end).  limit_ is the absolute tar offset the
+  // reader stops at (in consumed_total terms), so the parser sees a clean EOF
+  // exactly at its partition's final entry boundary — the tail of the last
+  // frame (which belongs to the next partition) is never delivered.
+  bool has_limit_ = false; uint64_t limit_ = 0;
   explicit StreamReader(int f) : fd(f), buf(1 << 20) { base = buf.data(); }
   explicit StreamReader(FrameSink * s) : fd(-1), src(s) {}
+  // Producer mode: `p` yields decompressed frames in order (null = end of
+  // slice).  `base_off` seeds consumed_total so it reflects the absolute tar
+  // offset of the first delivered frame.  With has_limit_, the reader also
+  // stops delivering at `limit`.
+  StreamReader(std::function<FrameBuf()> p, uint64_t base_off, uint64_t limit)
+    : fd(-1), prod(std::move(p)), consumed_total(base_off),
+      has_limit_(true), limit_(limit) {}
+  bool at_limit() const { return has_limit_ && consumed_total >= limit_; }
+  // Bytes deliverable at the cursor without refilling, respecting the limit.
+  uint64_t cap(uint64_t want) const {
+    uint64_t a = std::min<uint64_t>(want, fill - pos);
+    if (has_limit_ && consumed_total + a > limit_) a = limit_ - consumed_total;
+    return a;
+  }
   void refill() {
     pos = 0; fill = 0;
-    if (src) {
-      cur = src->pop();
+    if (src || prod) {
+      cur = src ? src->pop() : prod();
       if (!cur) { eof = true; return; }
       base = cur->data(); fill = cur->size();
       return;
@@ -8930,8 +8951,9 @@ struct StreamReader {
     base = buf.data(); fill = (size_t)r;
   }
   size_t read_some(char * dst, size_t n) {
+    if (at_limit()) return 0;
     if (pos == fill) { refill(); if (pos == fill) return 0; }
-    size_t k = std::min(fill - pos, n);
+    size_t k = (size_t)cap(n);
     std::memcpy(dst, base + pos, k); pos += k; consumed_total += k; return k;
   }
   bool read_exact(char * dst, size_t n) {
@@ -8951,8 +8973,9 @@ struct StreamReader {
       return true;
     }
     while (n) {
+      if (at_limit()) return false;
       if (pos == fill) { refill(); if (pos == fill) return false; }
-      size_t k = (size_t)std::min<uint64_t>(n, fill - pos);
+      size_t k = (size_t)cap(n);
       out.push_back(DataSeg{cur, base + pos, k});
       pos += k; n -= k; consumed_total += k;
     }
@@ -8962,8 +8985,9 @@ struct StreamReader {
   // sink mode drops the spent frame and pulls the next) as buffers run out.
   bool skip(uint64_t n) {
     while (n) {
+      if (at_limit()) return false;
       if (pos == fill) { refill(); if (pos == fill) return false; }
-      size_t k = (size_t)std::min<uint64_t>(n, fill - pos);
+      size_t k = (size_t)cap(n);
       pos += k; n -= k; consumed_total += k;
     }
     return true;
@@ -8997,6 +9021,15 @@ static int match_tar_member(const std::string & rel,
   }
   return -1;
 }
+
+// Defined below (after the seek machinery); forward-declared so Extractor::
+// run_parallel can decode its partition's frames with the same verified path
+// seek_feed uses.
+static FrameBuf decode_seek_frame(int fd,
+                                  const std::vector<uint64_t> & c_off,
+                                  const std::vector<uint64_t> & u_off,
+                                  size_t k, std::vector<char> & comp,
+                                  ZSTD_DCtx * dctx, Meter * m);
 
 class Extractor {
 public:
@@ -9091,6 +9124,105 @@ public:
     if (!read_only()) { stop_pool(); finish_deferred(); }
   }
 
+  // Parallel full extraction (-d --tar, no selection) for a seekable archive
+  // whose frame table (c_off/u_off) and per-entry boundaries (`bounds`[i] =
+  // entry i's entry_end, ascending, entry 0 starting at offset 0) are known.
+  // Partitions the entries into N contiguous groups balanced by data bytes;
+  // each worker preads + decompresses ONLY its own frames (like seek_feed) and
+  // runs the standard parse/handle_entry over its byte slice, dispatching file
+  // writes to the SHARED writer pool.  Dirs/symlinks/specials/sparse are handled
+  // by the one worker that owns the entry; hardlinks and dir metadata are
+  // collected per worker (ParCtx) and merged in archive order for
+  // finish_deferred.  `feed_meter` counts read/written bytes for the progress
+  // bar (the Extractor's own m_ stays null to avoid double counting).
+  void run_parallel(FILE * in,
+                    const std::vector<uint64_t> & bounds,
+                    const std::vector<uint64_t> & c_off,
+                    const std::vector<uint64_t> & u_off,
+                    const Options & dopt, Meter * feed_meter) {
+    uint64_t t0 = now_ns();
+    par_mode_ = true;
+    start_pool();
+    const int fd = fileno(in);
+    const size_t nent = bounds.size();
+    auto frame_of = [&](uint64_t v) {
+      return (size_t)(std::upper_bound(u_off.begin(), u_off.end(), v) - u_off.begin()) - 1;
+    };
+
+    // Partition entries into N contiguous groups, snapping splits to entry
+    // boundaries and balancing summed data bytes.  Cap N by the frame count too:
+    // adjacent partitions share their boundary frame (decoded by both), so more
+    // partitions than frames would just multiply that redundant decode.
+    const size_t nframes = c_off.size() - 1;
+    int N = std::max(1, std::min(resolve_cpu_threads(dopt.cpu_threads), 16));
+    N = std::min<int>(N, (int)nent);
+    N = std::min<int>(N, (int)nframes);
+    struct Part { size_t a, b; };            // entries [a, b)
+    std::vector<Part> parts;
+    {
+      const uint64_t total = bounds.empty() ? 0 : bounds.back();
+      size_t a = 0;
+      for (int g = 0; g < N && a < nent; ++g) {
+        size_t b;
+        if (g == N - 1) { b = nent; }        // last group takes the rest
+        else {
+          uint64_t target = (uint64_t)((double)total * (double)(g + 1) / (double)N);
+          b = a;
+          while (b < nent && bounds[b] < target) ++b;
+          if (b <= a) b = a + 1;             // guarantee progress
+        }
+        parts.push_back({a, b});
+        a = b;
+      }
+    }
+
+    std::vector<ParCtx> pctx(parts.size());
+    std::vector<std::thread> workers;
+    workers.reserve(parts.size());
+    for (size_t pi = 0; pi < parts.size(); ++pi) {
+      workers.emplace_back([&, pi] {
+        const Part pr = parts[pi];
+        const uint64_t start = pr.a == 0 ? 0 : bounds[pr.a - 1];
+        const uint64_t end   = bounds[pr.b - 1];
+        const size_t f0 = frame_of(start);
+        const size_t f1 = frame_of(end - 1);
+        auto dctx = std::shared_ptr<ZSTD_DCtx>(ZSTD_createDCtx(), ZSTD_freeDCtx);
+        if (!dctx) die("failed to create ZSTD_DCtx");
+        apply_mem_limit_to_dctx(dctx.get(), dopt);
+        auto comp = std::make_shared<std::vector<char>>();
+        size_t f = f0;
+        std::function<FrameBuf()> producer =
+          [fd, &c_off, &u_off, f1, start, end, dctx, comp, f, feed_meter]() mutable -> FrameBuf {
+            if (f > f1) return nullptr;
+            size_t k = f++;
+            FrameBuf fb = decode_seek_frame(fd, c_off, u_off, k, *comp, dctx.get(), feed_meter);
+            if (feed_meter) {   // count the tar bytes this worker actually parses
+              uint64_t a = std::max(u_off[k], start), b = std::min(u_off[k + 1], end);
+              if (b > a) feed_meter->wrote_bytes.fetch_add(b - a, std::memory_order_relaxed);
+            }
+            return fb;
+          };
+        StreamReader r(std::move(producer), u_off[f0], end);
+        if (start > u_off[f0]) r.skip(start - u_off[f0]);   // align to the entry boundary
+        parse(r, &pctx[pi]);
+      });
+    }
+    for (auto & t : workers) t.join();
+
+    // Merge per-worker deferred lists in partition (archive) order, so
+    // finish_deferred still creates hardlinks after their targets exist and
+    // applies dir metadata in reverse archive order.
+    for (auto & pc : pctx) {
+      for (auto & h : pc.hardlinks) hardlinks_.push_back(std::move(h));
+      for (auto & d : pc.dirmeta)   dirmeta_.push_back(std::move(d));
+    }
+    stream_bytes_ = u_off.empty() ? 0 : u_off.back();   // full decompressed tar-stream size
+    ex_wall_ns_ = now_ns() - t0;
+    stop_pool();
+    finish_deferred();
+    par_mode_ = false;
+  }
+
   // Serial parse-thread phase timing (see the counter block below) for the -v
   // [EXTRACT] diagnosis in extract_tar.
   uint64_t serial_wall_ns()     const { return ex_wall_ns_; }
@@ -9162,6 +9294,7 @@ private:
   std::unordered_map<std::string, int64_t> uid_by_name_, gid_by_name_;
   uint64_t map_owner(bool is_group, const std::string & nm, uint64_t numeric) {
     if (nm.empty()) return numeric;
+    std::lock_guard<std::mutex> lk(owner_mx_);   // parallel workers share the caches
     auto & cache = is_group ? gid_by_name_ : uid_by_name_;
     auto it = cache.find(nm);
     if (it == cache.end()) {
@@ -9272,6 +9405,14 @@ private:
   struct DirMeta { std::string path; uint32_t mode; int64_t mtime; uint64_t uid, gid; ExtMeta ext; int root = 0; };
   std::vector<Hard> hardlinks_;
   std::vector<DirMeta> dirmeta_;
+  // Per-worker deferred collections for the parallel full-extract path: each
+  // partition worker parses into a private ParCtx (no shared-vector races);
+  // run_parallel merges them in partition order after join, preserving global
+  // archive order for finish_deferred (hardlinks forward, dir metadata reverse).
+  struct ParCtx { std::vector<Hard> hardlinks; std::vector<DirMeta> dirmeta; };
+  // Guards the map_owner name→id caches, which the parallel workers hit
+  // concurrently (only as root, and only misses touch NSS — contention is nil).
+  std::mutex owner_mx_;
 
   void fail(const std::string & path, const std::string & why) {
     had_error_.store(true, std::memory_order_relaxed);
@@ -9477,6 +9618,11 @@ private:
   // the serial thread's own irreducible work.
   uint64_t ex_wall_ns_ = 0, ex_sinkwait_ns_ = 0, ex_enq_ns_ = 0, ex_inline_ns_ = 0;
   uint64_t ex_large_ns_ = 0;   // large-file dispatch (nested enq/sink waits excluded)
+  // Set for the duration of run_parallel: the fine-grained serial parse-phase
+  // counters above model a SINGLE parse thread, so they are left uncollected in
+  // the parallel path (multiple workers would race the plain counters, and the
+  // breakdown is meaningless there).  The atomic writer-pool counters still work.
+  bool par_mode_ = false;
   struct NsAdd {   // scoped accumulator, no-op unless -v
     uint64_t & acc; uint64_t t0; bool on;
     NsAdd(uint64_t & a, bool en) : acc(a), t0(en ? now_ns() : 0), on(en) {}
@@ -9509,7 +9655,7 @@ private:
     // Time blocked on a full job queue (-v): this is the "writer pool can't
     // keep up" signal for the [EXTRACT] line — distinct from the serial
     // thread itself being the ceiling.
-    if (opt_.verbosity >= V_VERBOSE && !(q_bytes_ < q_max_bytes_ || q_.empty())) {
+    if (opt_.verbosity >= V_VERBOSE && !par_mode_ && !(q_bytes_ < q_max_bytes_ || q_.empty())) {
       uint64_t t0 = now_ns();
       q_cv_prod_.wait(lk, [&] { return q_bytes_ < q_max_bytes_ || q_.empty(); });
       ex_enq_ns_ += now_ns() - t0;
@@ -9768,7 +9914,7 @@ private:
   // seek-extract planner).
   static std::string norm(const std::string & raw) { return norm_member_name(raw); }
 
-  void parse(StreamReader & r) {
+  void parse(StreamReader & r, ParCtx * par = nullptr) {
     char blk[TAR_BLK];
     std::string pend_name, pend_link;     // GNU 'L'/'K' overrides for the next header
     std::string pax_path, pax_link; uint64_t pax_size = 0; int64_t pax_mtime = 0;
@@ -9787,6 +9933,9 @@ private:
     int zero_run = 0;
     while (true) {
       if (!r.read_exact(blk, TAR_BLK)) {
+        // Parallel partition worker: hitting the slice limit at a header
+        // boundary is the clean end of this partition, not a truncation.
+        if (par && r.at_limit()) return;
         if (zero_run == 0) fail("(archive)", "truncated tar stream");
         return;
       }
@@ -9949,7 +10098,7 @@ private:
         e.gid = map_owner(true,  e.gname, e.gid);
       }
 
-      handle_entry(r, e);
+      handle_entry(r, e, par);
     }
   }
 
@@ -9965,7 +10114,7 @@ private:
     return false;
   }
 
-  void handle_entry(StreamReader & r, const InEntry & e) {
+  void handle_entry(StreamReader & r, const InEntry & e, ParCtx * par = nullptr) {
     std::string rel = norm(e.name);
     // data byte count present in the stream (for regular files); always skip it
     // after handling so the parser stays aligned even when we reject the member.
@@ -9988,7 +10137,7 @@ private:
 
     // GNU sparse: place each stored segment at its logical offset, leaving holes.
     if (e.is_sparse) {
-      NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE);
+      NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
       extract_sparse(r, rel, e, pad, root);
       return;
     }
@@ -10022,7 +10171,7 @@ private:
           // Large file: windowed zero-copy part jobs on the writer pool.
           // Timing: subtract the nested enqueue-block and sink-wait deltas so
           // the [EXTRACT] buckets stay disjoint.
-          const bool measure = opt_.verbosity >= V_VERBOSE;
+          const bool measure = opt_.verbosity >= V_VERBOSE && !par_mode_;
           uint64_t t0 = 0, enq0 = 0, sw0 = 0;
           if (measure) {
             t0 = now_ns(); enq0 = ex_enq_ns_;
@@ -10040,21 +10189,21 @@ private:
         break;
       }
       case '5': {                                  // directory
-        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE);
+        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
         if (!make_dir(rel, e.mode, root)) fail(rel, "cannot create directory");
-        else dirmeta_.push_back({rel, e.mode, e.mtime, e.uid, e.gid, e.ext, root});
+        else (par ? par->dirmeta : dirmeta_).push_back({rel, e.mode, e.mtime, e.uid, e.gid, e.ext, root});
         break;
       }
       case '2': {                                  // symlink
-        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE);
+        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
         if (!make_symlink(rel, e.linkname, e.uid, e.gid, root)) fail(rel, "cannot create symlink");
         break;
       }
       case '1':                                    // hardlink (deferred: target must exist)
-        hardlinks_.push_back({rel, norm(e.linkname), root});
+        (par ? par->hardlinks : hardlinks_).push_back({rel, norm(e.linkname), root});
         break;
       case '3': case '4': case '6': {              // char/block device, fifo
-        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE);
+        NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
         if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor, root)) {
           if (errno == EPERM) vlog(V_VERBOSE, opt_, "gzstd: untar: " + rel + ": need privilege for device/special; skipped\n");
           else fail(rel, "cannot create special file");
@@ -10480,20 +10629,23 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
   return ok;
 }
 
-// Header-hop a foreign seekable archive: build (name, hdr_off, entry_end)
-// for every member by decompressing only the frames that hold header (or
-// pax/longname) bytes, then select and map to frames exactly like the
-// indexed path.  Bails to the full walk (returns false) on anything whose
-// stream geometry this mini-parser does not fully model: GNU sparse ('S' /
-// pax GNU.sparse.*), pax globals ('g'), bad checksums, oversized extension
-// records.  A false NEGATIVE here only yields "Not found in archive" — the
-// Extractor re-parses the sliced stream for real, so a scan bug cannot
-// corrupt an extraction.
-static bool build_foreign_seek_plan(FILE * in,
-                                    const std::vector<std::pair<std::string, int>> & members,
-                                    const Options & opt, SeekPlan & plan, Meter * m) {
-  TarSeekTable st;
-  if (!parse_foreign_seek_table(in, st)) return false;
+// One member's stream geometry, as recovered by the foreign header-hop scan:
+// offsets only (the caller re-parses for real metadata).
+struct ScanEnt { std::string name; uint64_t hdr_off, entry_end; };
+
+// Header-hop a foreign seekable archive: build (name, hdr_off, entry_end) for
+// every member by decompressing ONLY the frames that hold header (or
+// pax/longname) bytes, skipping file data by arithmetic.  Shared by the
+// selective planner (build_foreign_seek_plan) and the full-extract partitioner
+// (extract_tar's parallel path).  Bails (returns false → the caller falls back
+// to the serial walk) on anything whose stream geometry this mini-parser does
+// not fully model: GNU sparse ('S' / pax GNU.sparse.*), pax globals ('g'), bad
+// checksums, oversized extension records, or an I/O/decode failure.  A false
+// NEGATIVE only mislabels — the Extractor re-parses the sliced stream for real,
+// so a scan bug can never corrupt an extraction.
+static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
+                                 const Options & opt, Meter * m,
+                                 std::vector<ScanEnt> & ents) {
   const int fd = fileno(in);
   const size_t nframes = st.c_off.size() - 1;
 
@@ -10546,8 +10698,7 @@ static bool build_foreign_seek_plan(FILE * in,
   };
 
   // The scan: same header grammar subset as Extractor::parse, offsets only.
-  struct ScanEnt { std::string name; uint64_t hdr_off, entry_end; };
-  std::vector<ScanEnt> ents;
+  ents.clear();
   bool ok = true;
   {
     char blk[TAR_BLK];
@@ -10624,7 +10775,24 @@ static bool build_foreign_seek_plan(FILE * in,
     }
   }
   ZSTD_freeDCtx(dctx);
-  if (!ok) return false;
+  return ok;
+}
+
+// Build a selective SeekPlan for a foreign (non-gzstd) zstd-seekable archive:
+// read + validate the frame table, header-hop for every member's geometry,
+// then select and map to frames exactly like the indexed build_seek_plan.
+static bool build_foreign_seek_plan(FILE * in,
+                                    const std::vector<std::pair<std::string, int>> & members,
+                                    const Options & opt, SeekPlan & plan, Meter * m) {
+  TarSeekTable st;
+  if (!parse_foreign_seek_table(in, st)) return false;
+  std::vector<ScanEnt> ents;
+  if (!foreign_scan_entries(in, st, opt, m, ents)) return false;
+  const size_t nframes = st.c_off.size() - 1;
+  auto frame_of = [&](uint64_t v) {
+    return (size_t)(std::upper_bound(st.u_off.begin(), st.u_off.end(), v)
+                    - st.u_off.begin()) - 1;
+  };
 
   // Selection + range/frame mapping, same as the indexed path.
   std::vector<std::pair<std::string, int>> sel = members;
@@ -10662,6 +10830,50 @@ static bool build_foreign_seek_plan(FILE * in,
 // frames.  Ends with the end-of-archive zero blocks the parser expects, so
 // the Extractor sees a complete, well-formed (shorter) tar stream.  Corrupt
 // frames die_data like every !keep_going decompress path.
+// Read + decompress data frame `k` of a seekable archive into a fresh FrameBuf,
+// verifying it against the (untrusted) frame table before and after the decode.
+// Fatal (die_*) on I/O or corruption, like every non-keep_going decompress path.
+// Shared by seek_feed (selective extract) and the parallel full-extract
+// producers.  `comp`/`dctx` are caller-owned scratch reused across frames.
+static FrameBuf decode_seek_frame(int fd,
+                                  const std::vector<uint64_t> & c_off,
+                                  const std::vector<uint64_t> & u_off,
+                                  size_t k, std::vector<char> & comp,
+                                  ZSTD_DCtx * dctx, Meter * m) {
+  const uint64_t coff = c_off[k];
+  const size_t csz = (size_t)(c_off[k + 1] - coff);
+  const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
+  comp.resize(csz);
+  for (size_t got = 0; got < csz;) {
+    ssize_t r = ::pread(fd, comp.data() + got, csz - got, (off_t)(coff + got));
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) die_io("seek-extract: pread failed at frame " + std::to_string(k)
+                       + ": " + (r < 0 ? std::strerror(errno) : "unexpected EOF"));
+    got += (size_t)r;
+  }
+  if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+  // GPU-written frames may omit the content size; when present it must
+  // corroborate the index geometry before we allocate.
+  unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), csz);
+  if (fcs == ZSTD_CONTENTSIZE_ERROR
+      || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz))
+    die_data("seek-extract: frame " + std::to_string(k)
+             + " does not match the member index (corrupt archive?)");
+  // A frame with no declared content size (GPU-written) is only corroborated by
+  // the decompress below, so bound what a forged table dsize can make each
+  // worker allocate first (matches the foreign scanner's per-frame cap).
+  if (usz > ((size_t)1 << 31))
+    die_data("seek-extract: frame " + std::to_string(k)
+             + ": implausible frame size in seek table");
+  FrameBuf fb = std::make_shared<FrameVec>(usz);
+  size_t dz = ZSTD_decompressDCtx(dctx, fb->data(), usz, comp.data(), csz);
+  if (ZSTD_isError(dz) || dz != usz)
+    die_data("seek-extract: frame " + std::to_string(k) + ": "
+             + (ZSTD_isError(dz) ? ZSTD_getErrorName(dz)
+                                 : "size mismatch vs member index"));
+  return fb;
+}
+
 static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
                       const Options & opt, Meter * m) {
   const int fd = fileno(in);
@@ -10697,38 +10909,7 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
           cv.wait(lk, [&] { return i < push_next + window; });
         }
         const size_t k = plan.frames[i];
-        const uint64_t coff = plan.c_off[k];
-        const size_t csz = (size_t)(plan.c_off[k + 1] - coff);
-        const size_t usz = (size_t)(plan.u_off[k + 1] - plan.u_off[k]);
-        comp.resize(csz);
-        for (size_t got = 0; got < csz;) {
-          ssize_t r = ::pread(fd, comp.data() + got, csz - got, (off_t)(coff + got));
-          if (r < 0 && errno == EINTR) continue;
-          if (r <= 0) die_io("seek-extract: pread failed at frame " + std::to_string(k)
-                             + ": " + (r < 0 ? std::strerror(errno) : "unexpected EOF"));
-          got += (size_t)r;
-        }
-        if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
-        // GPU-written frames may omit the content size; when present it must
-        // corroborate the index geometry before we allocate.
-        unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), csz);
-        if (fcs == ZSTD_CONTENTSIZE_ERROR
-            || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz))
-          die_data("seek-extract: frame " + std::to_string(k)
-                   + " does not match the member index (corrupt archive?)");
-        // A frame with no declared content size (GPU-written) is only
-        // corroborated by the decompress below, so bound what a forged
-        // table dsize can make each worker allocate first (matches the
-        // foreign scanner's per-frame cap).
-        if (usz > ((size_t)1 << 31))
-          die_data("seek-extract: frame " + std::to_string(k)
-                   + ": implausible frame size in seek table");
-        FrameBuf fb = std::make_shared<FrameVec>(usz);
-        size_t dz = ZSTD_decompressDCtx(dctx, fb->data(), usz, comp.data(), csz);
-        if (ZSTD_isError(dz) || dz != usz)
-          die_data("seek-extract: frame " + std::to_string(k) + ": "
-                   + (ZSTD_isError(dz) ? ZSTD_getErrorName(dz)
-                                       : "size mismatch vs member index"));
+        FrameBuf fb = decode_seek_frame(fd, plan.c_off, plan.u_off, k, comp, dctx, m);
         {
           std::lock_guard<std::mutex> lk(mx);
           ready.emplace(i, std::move(fb));
@@ -10769,6 +10950,61 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
   }
   // End-of-archive marker: two zero blocks, so parse() ends cleanly.
   sink->push(std::make_shared<FrameVec>((size_t)(2 * TAR_BLK), (char)0));
+}
+
+// Assemble the input for Extractor::run_parallel from a seekable archive: the
+// frame table `st` and per-entry end boundaries `bounds` (ascending, entry i
+// occupying [bounds[i-1], bounds[i]) with entry 0 starting at 0).  Tries our own
+// member index first, then a foreign zstd-seekable header-hop scan.  Returns
+// false (→ the caller uses the serial walk) when there is no valid frame table +
+// entry list, the entries are not contiguous from offset 0, or duplicate
+// normalized names exist — tar's last-writer-wins semantics can't be preserved
+// once such names land in different parallel partitions.  Rewinds `in`.
+static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
+                                     TarSeekTable & st, std::vector<uint64_t> & bounds) {
+  bounds.clear();
+  auto no_dup = [](std::unordered_map<std::string, char> & seen, const std::string & name) {
+    std::string nm = norm_member_name(name);
+    return nm.empty() || seen.emplace(nm, 1).second;   // empty names never collide
+  };
+  bool have = false;
+
+  // Our own archives: the member index carries every entry's offsets directly.
+  {
+    std::vector<InEntry> es; TarSeekTable s2;
+    if (read_tar_index(in, es, &s2) && s2.valid() && !es.empty()) {
+      uint64_t prev = 0; bool ok = true;
+      std::unordered_map<std::string, char> seen;
+      for (const InEntry & e : es) {
+        if (e.hdr_off != prev || e.data_off < e.hdr_off + TAR_BLK
+            || e.entry_end < e.data_off || e.entry_end > s2.tar_size
+            || !no_dup(seen, e.name)) { ok = false; break; }
+        prev = e.entry_end;
+        bounds.push_back(e.entry_end);
+      }
+      if (ok) { st = std::move(s2); have = true; } else bounds.clear();
+    }
+  }
+
+  // Foreign zstd-seekable archives (t2sz-style): header-hop for the geometry.
+  if (!have) {
+    TarSeekTable s2; std::vector<ScanEnt> fes;
+    if (parse_foreign_seek_table(in, s2) && foreign_scan_entries(in, s2, opt, m, fes)
+        && !fes.empty()) {
+      uint64_t prev = 0; bool ok = true;
+      std::unordered_map<std::string, char> seen;
+      for (const ScanEnt & e : fes) {
+        if (e.hdr_off != prev || e.entry_end <= e.hdr_off || e.entry_end > s2.tar_size
+            || !no_dup(seen, e.name)) { ok = false; break; }
+        prev = e.entry_end;
+        bounds.push_back(e.entry_end);
+      }
+      if (ok) { st = std::move(s2); have = true; } else bounds.clear();
+    }
+  }
+
+  std::rewind(in);
+  return have;
 }
 
 }  // namespace tarx
@@ -15336,6 +15572,7 @@ static int extract_tar(const Options & opt, Meter * m)
   uint64_t agg_prod_wait_ns = 0, agg_cons_wait_ns = 0;
   uint64_t agg_ex_wall_ns = 0, agg_ex_sink_ns = 0, agg_ex_enq_ns = 0;
   uint64_t agg_ex_inline_ns = 0, agg_ex_large_ns = 0;
+  uint64_t agg_par_wall_ns = 0;   // parallel full-extract wall (distinct from the serial breakdown)
   int wpool_threads = 0;
   for (const std::string & arc : opt.tar_sources) {
     if (opt.keep_going) { g_damage.reset(); g_member_ranges.reset(); }  // damage reported per archive
@@ -15351,6 +15588,43 @@ static int extract_tar(const Options & opt, Meter * m)
         rc = EXIT_DATA; continue;
       }
       std::rewind(in);
+    }
+
+    // Parallel full extraction (no member selection): a seekable archive whose
+    // frame table + per-entry boundaries are recoverable (our index, or a
+    // foreign seekable header-hop) is partitioned across worker threads that
+    // each decompress only their frames and parse+dispatch their slice — the
+    // last serial stage of extract, parallelized.  Falls back to the serial
+    // FrameSink walk below when the plan can't be built (no table, non-
+    // contiguous/duplicate names, foreign sparse/pax) or it isn't worth it.
+    // --keep-going always uses the serial walk so damage recovery sees the
+    // whole stream; stdin isn't seekable.
+    if (members.empty() && arc != "-" && !opt.keep_going) {
+      tarx::TarSeekTable pst; std::vector<uint64_t> pbounds;
+      if (tarx::build_full_parallel_plan(in, opt, m, pst, pbounds)) {
+        int Np = std::min<int>({resolve_cpu_threads(opt.cpu_threads), 16,
+                                (int)pbounds.size(), (int)(pst.c_off.size() - 1)});
+        if (Np >= 2) {
+          if (opt.verbosity >= V_VERBOSE) {
+            char b[160];
+            std::snprintf(b, sizeof b,
+              "[TAR] parallel-extract: %d partitions over %zu entries, %zu frames\n",
+              Np, pbounds.size(), pst.c_off.size() - 1);
+            vlog(V_VERBOSE, opt, b);
+          }
+          tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
+          ex.run_parallel(in, pbounds, pst.c_off, pst.u_off, opt, m);
+          if (opt.verbosity >= V_VERBOSE) {
+            agg_wbusy_ns    += ex.writer_busy_ns();
+            agg_wstarved_ns += ex.writer_starved_ns();
+            agg_par_wall_ns += ex.serial_wall_ns();
+            wpool_threads    = std::max(wpool_threads, ex.writer_threads());
+          }
+          if (in && in != stdin) std::fclose(in);
+          if (ex.had_error() && rc == EXIT_OK) rc = EXIT_ERROR;
+          continue;   // this archive done; skip the serial FrameSink pipeline
+        }
+      }
     }
 
     // Seek-based selective extraction: MEMBERs + a seekable archive whose
@@ -15505,6 +15779,16 @@ static int extract_tar(const Options & opt, Meter * m)
       // the writer pool starves, the serial thread is the ceiling, not the
       // device.  sink-wait dominant = decompress behind; dispatch-blocked
       // dominant = writer pool/device behind.
+      // Parallel full-extract archives: no single serial parse thread, so the
+      // write-side signal (the [WRITER] line above) is the bound — report the
+      // N-way wall and let the writer busy% speak for where the ceiling is.
+      if (agg_par_wall_ns > 0) {
+        char pline[192];
+        std::snprintf(pline, sizeof(pline),
+          "[EXTRACT] parallel parse+dispatch (%d writer%s), %.2f s wall — see [WRITER] for the bound\n",
+          wpool_threads, wpool_threads == 1 ? "" : "s", double(agg_par_wall_ns) / 1e9);
+        vlog(V_VERBOSE, opt, pline);
+      }
       double ex_wall = double(agg_ex_wall_ns);
       double ex_parse_frac = 0, ex_sink_frac = 0, ex_enq_frac = 0;
       if (ex_wall > 0) {

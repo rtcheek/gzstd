@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.14.81
+**Current version:** v0.14.86
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -865,7 +865,33 @@ win that grows with file count. The tar **parse itself is still serial** on both
 paths (one thread walks the stream in order). Open follow-ups:
 
 - **Parallel-dispatch `-d --tar` extraction** — *Priority: Medium | Complexity:
-  High | Status: design.* The single biggest remaining extract lever. Today one
+  High | Status: DONE (v0.14.86) — full no-selection extraction now parses +
+  dispatches in parallel; serial walk kept as the always-correct fallback.* See
+  the resolution note directly below; the design record is retained for context.
+
+  **DONE (v0.14.86):** `Extractor::run_parallel` splits the entries (from our
+  index or a foreign header-hop scan) into N contiguous partitions; each worker
+  `pread`s + decompresses only its frames (shared `decode_seek_frame`) and runs
+  the standard `parse`/`handle_entry` over its slice via a new `StreamReader`
+  producer source with a partial-slice limit (clean EOF at the partition's final
+  entry boundary), dispatching to the one shared writer pool. The hard parts
+  resolved as: **dir-creation ordering** — no upfront pass needed; `mkdirat` is
+  atomic and `open_parent(create)` treats `EEXIST` as success, so concurrent
+  implicit/explicit dir creation is race-free and true dir mode/ext is reapplied
+  once in `finish_deferred`; **hardlink/deferred ordering** — collected into
+  per-worker `ParCtx` lists, merged in partition (archive) order after join, so
+  hardlinks are created after their targets exist and dir metadata is applied in
+  reverse order; **security** — the `openat`/`O_NOFOLLOW` walk is stateless and
+  runs per worker unchanged (`map_owner` cache mutex-guarded). Engaged by default
+  with automatic fallback to the serial walk (no selection · seekable · not
+  `--keep-going` · valid contiguous table · no duplicate names · N≥2 after
+  capping by CPU/16/entries/**frames**). Both our indexed and foreign
+  zstd-seekable archives supported. ThreadSanitizer-clean; byte-identical to the
+  serial walk and to source across mixed trees; corruption → exit 4. The
+  current-hardware caveat below still holds (write-bound; the win is
+  future-proofing), which is why it stayed Medium and the serial path remains.
+
+  *Original design record (for context):* Today one
   thread walks the decompressed tar stream in order (header → size → next header)
   and dispatches files to a writer pool; the walk is serial because tar has no
   index and each header's position depends on the previous member's size. To
