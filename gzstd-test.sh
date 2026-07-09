@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=289
-$EXTENSIVE && EXPECTED_TESTS=405
+EXPECTED_TESTS=290
+$EXTENSIVE && EXPECTED_TESTS=406
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -4438,6 +4438,27 @@ else
   # 1. valid archive: -t --tar succeeds and validates the tar structure.
   "$GZSTD" -t --cpu-only --tar "$VA" >/dev/null 2>&1 \
     && pass "-t --tar accepts a valid archive" || fail "-t --tar valid" "rc=$?"
+
+  # 1b. -t --tar reports the true decompressed tar-stream size (matching the
+  #     create summary and zstd -l), NOT the smaller file-content-only sum.
+  #     Build a many-small-file archive so header/padding overhead is large and
+  #     the two definitions differ sharply, then compare -t's byte count to the
+  #     stream size gzstd -d actually produces.
+  VMS="$TMPDIR/vms"; rm -rf "$VMS"; mkdir -p "$VMS/d"
+  for i in $(seq 1 3000); do echo "small-file-payload" > "$VMS/d/f$i"; done
+  VMA="$TMPDIR/vms.tar.zst"
+  "$GZSTD" --cpu-only -q -f -o "$VMA" --tar "$VMS" 2>/dev/null
+  real_stream=$("$GZSTD" -d --cpu-only -q -c "$VMA" 2>/dev/null | wc -c)
+  # pull the "=> N.NN UNIT" uncompressed figure out of the -t summary and convert
+  t_line=$("$GZSTD" -t --cpu-only --tar "$VMA" 2>&1 | tr '\r' '\n' | sed 's/\x1b\[[0-9;]*m//g' | grep entries | tail -1)
+  t_unc=$(echo "$t_line" | sed -E 's/.*=> ([0-9.]+) ([KMG]?i?B).*/\1 \2/')
+  t_bytes=$(awk -v v="${t_unc% *}" -v u="${t_unc#* }" 'BEGIN{
+    m=(u=="KiB"?1024:u=="MiB"?1048576:u=="GiB"?1073741824:1); printf "%.0f", v*m }')
+  # allow 1% slack for human_bytes rounding; content-only would be ~10x smaller
+  lo=$(( real_stream * 99 / 100 )); hi=$(( real_stream * 101 / 100 ))
+  if [ "$t_bytes" -ge "$lo" ] && [ "$t_bytes" -le "$hi" ]; then
+    pass "-t --tar reports the true stream size (not content-only)"
+  else fail "-t --tar stream size" "t=$t_bytes stream=$real_stream (line: $t_line)"; fi
 
   # 2. truncated archive: -t --tar must reject it (exit 4).
   vsz=$(stat -c%s "$VA"); head -c $((vsz*60/100)) "$VA" > "$TMPDIR/v.trunc.zst"

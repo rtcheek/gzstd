@@ -1,11 +1,15 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.84  
+**Covers:** v0.9.50 → v0.14.85  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.85 — `-t --tar` reports the true stream size (consistent with create and `zstd -l`)
+
+**The `-t --tar` verify summary printed the file-content-only byte total, so its `compressed => uncompressed (ratio)` disagreed with the create summary on the same archive.** The create line reports the full tar-stream size it compressed (file data plus every 512-byte header, per-file padding, and pax ACL/xattr / long-name record); `-t` reported `validated_bytes` — the sum of member content only, which omits all that structure. On a real 171k-entry home backup with `--acls --xattrs` the two differed by ~310 MiB (3%): create said 10.31 GiB, `-t` said 10.00 GiB, and the ratios disagreed (43.7% vs 45.0%) — mildly alarming on a backup-then-delete tool even though no data was lost (the gap is pure tar overhead, and the archive verified structurally valid). `-t --tar` now reports the total decompressed tar-stream size (captured from the parser's `consumed_total`), so its size and ratio match the create summary and `zstd -l`/`gzstd -d | wc -c` exactly. `validated_bytes` (the file-content total) is unchanged and still drives the `-l --tar` listing footer, where "N files, X" legitimately means content bytes. New regression test builds a many-small-file archive (where the two definitions differ ~50x) and asserts the `-t` figure matches `gzstd -d | wc -c` within rounding. Suite: 290 normal / 406 extensive.
 
 ## v0.14.84 — pre-tag audit of the v0.14.82/83 seek code (rounds 1–4)
 

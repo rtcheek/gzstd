@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.84";
+static constexpr const char * GZSTD_VERSION = "0.14.85";
 //
 // Architecture overview:
 //
@@ -9036,6 +9036,11 @@ public:
   bool had_unmatched() const { return unmatched_; }
   uint64_t validated_files() const { return vfiles_; }
   uint64_t validated_bytes() const { return vbytes_; }
+  // Total decompressed tar-stream size (file data + headers + padding + pax
+  // records) = the archive's true uncompressed size, matching the create
+  // summary and `zstd -l`.  validated_bytes() is the smaller file-content-only
+  // sum; the -t summary uses THIS so its ratio is consistent with create.
+  uint64_t stream_bytes() const { return stream_bytes_; }
 
   // -l --tar from the member index (see build_tar_index_body): the same
   // filter_entry/list_count code the stream walk runs, with no
@@ -9064,6 +9069,7 @@ public:
     StreamReader r(read_fd);
     parse(r);               // validates every header checksum; flags truncation
     r.drain();              // consume trailing padding so the decompressor can finish
+    stream_bytes_ = r.consumed_total;   // full decompressed tar-stream size
     ex_wall_ns_ = now_ns() - t0;
     report_unmatched();
     if (!read_only()) { stop_pool(); finish_deferred(); }
@@ -9078,6 +9084,7 @@ public:
     StreamReader r(src);
     parse(r);
     r.drain();              // pop any trailing frames so the producer can finish
+    stream_bytes_ = r.consumed_total;   // full decompressed tar-stream size
     ex_wall_ns_ = now_ns() - t0;
     ex_sinkwait_ns_ = src->consumer_wait_ns();
     report_unmatched();
@@ -9183,6 +9190,7 @@ private:
     return it->second >= 0 ? (uint64_t)it->second : numeric;
   }
   uint64_t vfiles_ = 0, vbytes_ = 0;  // validate/list counters (entries, logical bytes)
+  uint64_t stream_bytes_ = 0;         // total decompressed tar-stream size (see stream_bytes())
   std::atomic<bool> had_error_{false};
 
   // Format one entry as a `tar -tvf` line on stdout (for -l --tar), matching
@@ -15643,8 +15651,11 @@ static int verify_tar(const Options & opt, Meter * m)
       std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
       if (!ec) comp = (uint64_t)z;
     }
+    // bytes = the true decompressed tar-stream size (matches the create summary
+    // and zstd -l), NOT validated_bytes() (file content only), so the reported
+    // "compressed => uncompressed (ratio)" is consistent with create.
     vres.push_back({arc == "-" ? "(stdin)" : arc, bad,
-                    ex.validated_files(), ex.validated_bytes(), comp, secs});
+                    ex.validated_files(), ex.stream_bytes(), comp, secs});
   }
 
   // Stop the progress bar, then print the per-archive results on clean lines.

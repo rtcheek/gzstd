@@ -954,6 +954,31 @@ paths (one thread walks the stream in order). Open follow-ups:
 - **Parallelize the walk** — *Priority: Low | Complexity: Medium.* On a cold tree
   with millions of files, the single-threaded layout walk (`lstat` sweep) can be
   a secondary bottleneck; a parallel `stat` sweep would shorten it. Measure first.
+- **Cache-bypass / O_DIRECT member reads on `--tar` create** — *Priority: Low |
+  Complexity: Medium | Status: investigate + MEASURE, two separate questions.*
+  The `--tar` member reader (`assemble()`) opens every member `O_RDONLY` buffered
+  and `--direct-read` is a no-op there (only wired to the single-file input path,
+  which warns). Motivating use case: a backup-then-delete (deleteuser) reads the
+  whole home once and never reuses it, so populating the page cache is pure
+  waste — doubly so right before the data is deleted.
+  1. **`POSIX_FADV_DONTNEED` after each member read (the likely-right answer).**
+     Keep the buffered parallel reader (and its kernel readahead), but drop each
+     member's pages from cache once read — fast reads AND no cache pollution.
+     Cheapest packaging: make `--direct-read` on `--tar` DO this instead of
+     warning, so the obvious flag just works. Gate it (default off): a normal
+     user may want the cache warm; a backup does not.
+  2. **Actually benchmark a real O_DIRECT multi-reader for `--tar`, cold.** This
+     was NEVER tested for the many-small-file case — the measured O_DIRECT loss
+     (single-file: buffered readahead ~9.6 GiB/s vs O_DIRECT ~4.5 GiB/s, see the
+     `--direct-read` notes) is for ONE large sequential stream, not a parallel
+     small-file walk. The a-priori expectation is that O_DIRECT still loses here
+     (no cross-file readahead, alignment overhead on small files, and the
+     concurrent-O_DIRECT contention already documented), but that's a guess —
+     wire O_DIRECT into `assemble()`'s member opens behind a flag and measure
+     cold (umount/remount or drop_caches) on Gen4/Gen5 vs the buffered reader
+     across a realistic home-dir mix. If it genuinely wins, keep it; if not, (1)
+     delivers the actual goal (cache hygiene) without the throughput hit. Either
+     way, settle it with numbers rather than the current warning.
 - **O_DIRECT extraction writes for large files (Gen4+)** — *Priority: Low |
   Complexity: Medium | Status: investigate, measure first.* Extraction currently
   writes every member buffered (page cache) — the 4 MiB `SMALL_FILE_MAX` cut only
