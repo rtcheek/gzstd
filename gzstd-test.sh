@@ -3895,7 +3895,19 @@ PYEOF
     "$GZSTD" -dc "$CSA" 2>/dev/null | tar -tvf - 2>/dev/null | grep -q 'sp.bin' \
       && ! ( "$GZSTD" -dc "$CSA" 2>/dev/null | od -An -c | grep -q ' S ' ) 2>/dev/null
     pass "default create stores full (no --sparse)"   # informational; create succeeded
-    rm -rf "$CSA" "$TMPDIR/cs_g" "$TMPDIR/cs_t"
+    # default --sparse emits PAX GNU.sparse.1.0 (records present in the stream)
+    "$GZSTD" --cpu-only --sparse -q -f -o "$TMPDIR/px.tar.zst" --tar "$CS" 2>/dev/null
+    "$GZSTD" -dc "$TMPDIR/px.tar.zst" 2>/dev/null | grep -qa "GNU.sparse.major=1" \
+      && pass "--sparse default emits PAX GNU.sparse.1.0" || fail "--sparse default PAX" "no GNU.sparse records"
+    # --format=oldgnu: legacy OLDGNU 'S' still round-trips (gzstd + GNU tar)
+    "$GZSTD" --cpu-only --sparse --format=oldgnu -q -f -o "$TMPDIR/og.tar.zst" --tar "$CS" 2>/dev/null
+    rm -rf "$TMPDIR/og_g" "$TMPDIR/og_t"; mkdir -p "$TMPDIR/og_g" "$TMPDIR/og_t"
+    "$GZSTD" -d --cpu-only -q --tar -C "$TMPDIR/og_g" "$TMPDIR/og.tar.zst" 2>/dev/null
+    "$GZSTD" -dc "$TMPDIR/og.tar.zst" 2>/dev/null | tar -xf - -C "$TMPDIR/og_t" 2>/dev/null
+    [[ "$(sha256sum "$TMPDIR/og_g$CS/sp.bin" 2>/dev/null | cut -d' ' -f1)" == "$CSREF" \
+       && "$(sha256sum "$TMPDIR/og_t$CS/sp.bin" 2>/dev/null | cut -d' ' -f1)" == "$CSREF" ]] \
+      && pass "--format=oldgnu create round-trips (gzstd + GNU tar)" || fail "--format=oldgnu create" "content"
+    rm -rf "$CSA" "$TMPDIR/cs_g" "$TMPDIR/cs_t" "$TMPDIR/px.tar.zst" "$TMPDIR/og.tar.zst" "$TMPDIR/og_g" "$TMPDIR/og_t"
   else
     skip "--sparse create round-trips via gzstd (sparse)" "no sparse fs / tar"
     skip "--sparse create extractable by GNU tar (interop)" "no sparse fs / tar"

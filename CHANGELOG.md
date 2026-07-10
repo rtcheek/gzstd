@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.88  
+**Covers:** v0.9.50 → v0.14.89  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.89 — `--sparse` create now emits PAX GNU.sparse.1.0 (with `--format` to select OLDGNU)
+
+**`--tar --sparse` now stores sparse files as PAX GNU.sparse.1.0 by default instead of OLDGNU `'S'`.** Both formats round-trip through gzstd, GNU tar, bsdtar, and Python, but they degrade very differently for a sparse-*unaware* reader: OLDGNU `'S'` with >4 segments puts extension blocks between the header and data, so such a reader reads them as file content and **loses archive alignment — corrupting every member after the sparse file**; PAX 1.0 keeps the member a plain regular `'0'` file whose data is `[map text block][segments]`, so an unaware reader mangles only that one file and the rest of the archive stays intact (both verified with a naive-POSIX-walk harness: OLDGNU → lost alignment, PAX → clean EOF). PAX 1.0 is also the format modern GNU tar writes for `--sparse --format=posix`.
+
+**`--format=FMT` selects the sparse encoding** (it affects only sparse files — the rest of the archive is always ustar + GNU extensions): `posix`/`pax` → PAX GNU.sparse.1.0 (default, so `--format=posix` is effectively a no-op you can pass for GNU-tar-command parity); `gnu`/`oldgnu` → legacy OLDGNU `'S'` (there is no dedicated GNU tar flag for OLDGNU sparse either — it's `--format=oldgnu`). The zstd/gzip output-format values that share the `--format=` prefix stay accepted for zstd-CLI compatibility (`--format=zstd` silent; `--format=gzip`/`xz`/`lzma`/`lz4` warn-and-ignore, since gzstd only emits zstd) — the new tar-format parsing folds them in rather than rejecting them. Any other value is a clean usage error.
+
+**Implementation.** The map block lives in the member's data region (not the header), so the fragile layout offset-math is untouched: `sparse_map_text()` is the single source of truth for the `"<n>\n<off>\n<len>…"` map (shared by the sizing, the reader's synthesis, and matching what `read_pax_sparse_map` already parses), the member's `size` is `map_padded + Σ segment lengths`, and the `GNU.sparse.major/minor/name/realsize` pax records are injected in `apply_extended_metadata` (which now also runs for PAX sparse without `--xattrs`/`--acls`). The `assemble` reader synthesizes the map bytes for the leading region and reads the segments after it.
+
+**Two GNU-tar-interop subtleties, both diagnosed against GNU tar 1.35's own output and fixed:** (1) a plain `size` pax record short-circuits GNU tar's sparse detection (it then extracts the raw map+data as a regular file), so gzstd carries the stored size **only** in the ustar header, like GNU tar; (2) GNU tar reconstructs the holes only when the member's headers use the **POSIX** ustar magic (`"ustar\0"`+`"00"`), not gzstd's usual OLDGNU magic (`"ustar  "`) — so PAX sparse members (their pax block + ustar header) now emit POSIX magic. With both fixes, GNU tar / bsdtar / Python / gzstd all extract gzstd's PAX sparse archives with holes preserved, no `--sparse` flag needed. Verified across a multi-segment file and a 10 GiB-logical file (data past the 8 GiB base-256 boundary); `--format=oldgnu` still emits `'S'` and round-trips; `-l --tar` reports the logical size; `-t --tar` verifies clean.
 
 ## v0.14.88 — `gzstd -l` is O(1) on any seekable archive + consistent sparse-hole detection on extract
 

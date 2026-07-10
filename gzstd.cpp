@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.88";
+static constexpr const char * GZSTD_VERSION = "0.14.89";
 //
 // Architecture overview:
 //
@@ -447,6 +447,7 @@ struct Options {
   bool tar_xattrs = false;               // --xattrs: store/restore extended attributes (SCHILY.xattr.*)
   bool tar_acls = false;                 // --acls: store/restore POSIX ACLs (SCHILY.acl.*); needs both on create AND extract
   bool tar_index = true;                 // --[no-]index: append the member-index skippable frame on create
+  bool tar_sparse_oldgnu = false;        // --format=gnu/oldgnu: emit OLDGNU 'S' sparse (default: PAX GNU.sparse.1.0)
   std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
 };
 
@@ -783,7 +784,7 @@ static void print_help()
 "  --one-file-system   do not descend into other mounted filesystems\n"
 "  --xattrs            store/restore extended attributes (give on both create and extract)\n"
 "  --acls              store/restore POSIX ACLs (give on both create and extract)\n"
-"  --sparse            store sparse files compactly on create (GNU format; opt-in)\n"
+"  --sparse            store sparse files compactly on create (PAX GNU.sparse.1.0; opt-in)\n"
 "  --no-index          create: skip the member index (instant -l, seek-based\n"
 "                      MEMBER extraction); it is a standard zstd skippable\n"
 "                      frame all tools ignore\n"
@@ -960,7 +961,8 @@ static void print_help_long()
 "     recorded holes, like GNU tar.  --no-sparse means \"don't go looking\n"
 "     for holes,\" not \"materialize holes the archive declared.\"\n"
 "     On `--tar --sparse` (create), a sparse source file is stored\n"
-"     compactly in GNU sparse format (opt-in; see --sparse under --tar).\n"
+"     compactly in PAX GNU.sparse.1.0 format by default (opt-in; use\n"
+"     `--format=gnu` for legacy OLDGNU 'S' — see --format).\n"
 "\n"
 "  --sync-output\n"
 "     fsync the output file before exit.  Default: off.  Without\n"
@@ -1170,13 +1172,23 @@ static void print_help_long()
 "\n"
 "  --sparse (on create)\n"
 "     Detect each file's holes via SEEK_DATA/SEEK_HOLE (filesystem metadata,\n"
-"     reads no hole bytes) and store it compactly in GNU OLDGNU sparse\n"
-"     format — only the data segments plus a hole map.  Output is\n"
-"     byte-identical to `tar --format=gnu --sparse`, so GNU tar extracts it\n"
-"     and restores the holes too.  Opt-in, matching GNU tar: without\n"
-"     --sparse a sparse file is stored with full content (Zstd still\n"
-"     compresses the zeros, but the archive is not marked sparse).\n"
-"     Extraction restores holes by default regardless; see --[no-]sparse.\n"
+"     reads no hole bytes) and store it compactly — only the data segments\n"
+"     plus a hole map.  Default format is PAX GNU.sparse.1.0 (same as\n"
+"     `tar --sparse --format=posix`); use --format=gnu for legacy OLDGNU 'S'\n"
+"     (`tar --sparse`).  Every mainstream reader (GNU tar, bsdtar, star,\n"
+"     Python) extracts either without a flag and restores the holes.  PAX\n"
+"     1.0 is the default because it degrades gracefully for a sparse-unaware\n"
+"     reader (that one file is mangled but the rest of the archive stays\n"
+"     intact), whereas OLDGNU can misalign the archive.  Opt-in, matching\n"
+"     GNU tar: without --sparse a sparse file is stored with full content\n"
+"     (Zstd still compresses the zeros, but the archive is not marked\n"
+"     sparse).  Extraction restores holes by default regardless; see\n"
+"     --[no-]sparse.\n"
+"\n"
+"  --format=FMT (on create)\n"
+"     Selects the SPARSE-file encoding only (the rest of the archive is\n"
+"     always ustar + GNU extensions).  posix, pax = PAX GNU.sparse.1.0\n"
+"     (default); gnu, oldgnu = legacy OLDGNU 'S'.  Inert without --sparse.\n"
 "\n"
 "  --[no-]index (on create; default: on)\n"
 "     Append a member index to the archive so `-l --tar` lists it\n"
@@ -7882,9 +7894,30 @@ static uint32_t header_len(size_t name_len, size_t link_len) {
 // which only the recompute knows.
 static uint32_t entry_header_len(const TarEntry & e) {
   uint32_t n = header_len(e.path.size(), e.link.size());
-  if (e.sparse_map.size() > 4)
+  // OLDGNU 'S' spills segments past the base 4 into 512-byte extension blocks
+  // (21 each).  PAX GNU.sparse.1.0 (typeflag '0') carries its map in the data
+  // region, not the header, so it adds no extension blocks here.
+  if (e.typeflag == 'S' && e.sparse_map.size() > 4)
     n += (uint32_t)(((e.sparse_map.size() - 4 + 20) / 21) * TAR_BLK);
   return n;
+}
+
+// PAX GNU.sparse.1.0 segment map, as the text block that prefixes the member
+// data: "<numsegs>\n<off0>\n<len0>\n<off1>\n<len1>\n…\n" (decimal, newline
+// separated).  read_pax_sparse_map (the extract side) parses exactly this.  The
+// block is NUL-padded to a 512 multiple; sparse_map_padded() gives that length.
+// Single source of truth for the sizing, the pax `size` record, and the reader.
+static std::string sparse_map_text(const std::vector<std::pair<uint64_t, uint64_t>> & map) {
+  std::string s = std::to_string(map.size());
+  s.push_back('\n');
+  for (const auto & seg : map) {
+    s += std::to_string(seg.first);  s.push_back('\n');
+    s += std::to_string(seg.second); s.push_back('\n');
+  }
+  return s;
+}
+static uint64_t sparse_map_padded(const std::vector<std::pair<uint64_t, uint64_t>> & map) {
+  return tar_round_up(sparse_map_text(map).size(), TAR_BLK);
 }
 
 // Write `val` into an n-byte tar numeric field: octal ASCII (n-1 digits + NUL)
@@ -7905,7 +7938,7 @@ static void emit_block(char * h, const std::string & name, uint32_t mode,
                        uint64_t uid, uint64_t gid, uint64_t size, uint64_t mtime,
                        char typeflag, const std::string & link,
                        const std::string & uname, const std::string & gname,
-                       uint64_t devmajor, uint64_t devminor) {
+                       uint64_t devmajor, uint64_t devminor, bool posix_magic = false) {
   std::memset(h, 0, TAR_BLK);
   std::memcpy(h, name.data(), std::min<size_t>(name.size(), 100));
   put_num(h + 100, 8,  mode & 07777);
@@ -7915,7 +7948,11 @@ static void emit_block(char * h, const std::string & name, uint32_t mode,
   put_num(h + 136, 12, mtime);
   h[156] = typeflag;
   if (!link.empty()) std::memcpy(h + 157, link.data(), std::min<size_t>(link.size(), 100));
-  std::memcpy(h + 257, "ustar  ", 8);   // OLDGNU magic+version: "ustar  \0"
+  // Magic+version.  OLDGNU "ustar  \0" by default; POSIX "ustar\0" + "00" for
+  // PAX members (GNU tar gates GNU.sparse.1.0 map reading on the POSIX magic —
+  // with OLDGNU magic it ignores the sparse records and extracts raw map+data).
+  if (posix_magic) { std::memcpy(h + 257, "ustar", 6); std::memcpy(h + 263, "00", 2); }
+  else             std::memcpy(h + 257, "ustar  ", 8);
   if (!uname.empty()) std::memcpy(h + 265, uname.data(), std::min<size_t>(uname.size(), 31));
   if (!gname.empty()) std::memcpy(h + 297, gname.data(), std::min<size_t>(gname.size(), 31));
   if (typeflag == '3' || typeflag == '4') {
@@ -8016,9 +8053,10 @@ static void gather_acls(const std::string & path, bool is_dir, std::string & rec
 #endif
 
 // Emit a PAX 'x' extended-header pseudo-entry whose data is `recs`.
-static size_t emit_pax_block(char * out, const std::string & recs, const std::string & path) {
+static size_t emit_pax_block(char * out, const std::string & recs, const std::string & path,
+                             bool posix_magic = false) {
   std::string nm = "PaxHeaders/" + path;        // cosmetic; applies to the next header
-  emit_block(out, nm, 0644, 0, 0, recs.size(), 0, 'x', "", "", "", 0, 0);
+  emit_block(out, nm, 0644, 0, 0, recs.size(), 0, 'x', "", "", "", 0, 0, posix_magic);
   std::memcpy(out + TAR_BLK, recs.data(), recs.size());
   size_t padded = tar_round_up(recs.size(), TAR_BLK);
   std::memset(out + TAR_BLK + recs.size(), 0, padded - recs.size());
@@ -8062,7 +8100,10 @@ static size_t emit_oldgnu_sparse(char * h, const TarEntry & e) {
 static size_t emit_header(const TarEntry & e, const TarLayout & lay, char * out) {
   static const std::string empty;
   size_t off = 0;
-  if (!e.pax.empty()) off += emit_pax_block(out + off, e.pax, e.path);
+  // PAX GNU.sparse.1.0 members ('0' + a segment map) need the POSIX ustar magic
+  // on their pax block AND ustar header, or GNU tar won't reconstruct the holes.
+  const bool posix_magic = (e.typeflag == '0' && !e.sparse_map.empty());
+  if (!e.pax.empty()) off += emit_pax_block(out + off, e.pax, e.path, posix_magic);
   if (e.path.size() > 100) off += emit_longlink(out + off, e.path, 'L');
   if (e.link.size() > 100) off += emit_longlink(out + off, e.link, 'K');
   auto uit = lay.unames.find(e.uid);
@@ -8071,7 +8112,7 @@ static size_t emit_header(const TarEntry & e, const TarLayout & lay, char * out)
              e.typeflag, e.link,
              uit != lay.unames.end() ? uit->second : empty,
              git != lay.gnames.end() ? git->second : empty,
-             (uint64_t)major((dev_t)e.rdev), (uint64_t)minor((dev_t)e.rdev));
+             (uint64_t)major((dev_t)e.rdev), (uint64_t)minor((dev_t)e.rdev), posix_magic);
   if (e.typeflag == 'S' && !e.sparse_map.empty())
     return off + emit_oldgnu_sparse(out + off, e);
   return off + TAR_BLK;
@@ -8355,14 +8396,22 @@ struct LayoutBuilder {
           hardlinks.emplace(key, p.member);  // first occurrence stores the data
         }
         e.typeflag = '0'; e.size = (uint64_t)st.st_size; e.src = p.fspath;
-        // --sparse: this file has holes (Pass B built the segment map).  Store
-        // as OLDGNU 'S': size = Σ segment lengths (data only); real_size = logical.
+        // --sparse: this file has holes (Pass B built the segment map).
+        // real_size = logical size; only the data segments are stored.
         if (!p.sparse_map.empty()) {
-          e.typeflag = 'S';
           e.real_size = (uint64_t)st.st_size;
           e.sparse_map = std::move(p.sparse_map);
-          uint64_t stored = 0; for (auto & s : e.sparse_map) stored += s.second;
-          e.size = stored;
+          uint64_t datalen = 0; for (auto & s : e.sparse_map) datalen += s.second;
+          if (opt.tar_sparse_oldgnu) {
+            // OLDGNU 'S': map in the header (+ extension blocks); size = data only.
+            e.typeflag = 'S';
+            e.size = datalen;
+          } else {
+            // PAX GNU.sparse.1.0: stays a regular '0' file carrying GNU.sparse.*
+            // pax records (added in apply_extended_metadata); its data region is
+            // [map text block][data segments], so size includes the map block.
+            e.size = sparse_map_padded(e.sparse_map) + datalen;
+          }
         }
       } else if (S_ISLNK(st.st_mode)) {
         if (p.link_err != 0) { warn_skip(p.fspath, std::strerror(p.link_err)); continue; }
@@ -8400,6 +8449,21 @@ struct LayoutBuilder {
         if (e.src.empty() || e.typeflag == '1') continue;  // hardlink ref shares the
                                                            // first occurrence's metadata
         std::string recs;
+        // PAX GNU.sparse.1.0: the sparse geometry travels as pax records (the
+        // member stays a regular '0' file whose data region is prefixed by the
+        // map block).  Emitted for every hole-mapped file, even without
+        // --xattrs/--acls.  realsize = logical size; the STORED size (map block +
+        // data) lives only in the ustar header size field — matching GNU tar
+        // exactly.  A plain `size` pax record is deliberately NOT emitted: it
+        // short-circuits GNU tar's sparse detection (it then extracts the raw
+        // map+data as a regular file), and gzstd's own reader falls back to the
+        // ustar size field, so it is redundant here.
+        if (!e.sparse_map.empty() && e.typeflag == '0') {
+          recs += pax_record("GNU.sparse.major", "1");
+          recs += pax_record("GNU.sparse.minor", "0");
+          recs += pax_record("GNU.sparse.name", e.path);
+          recs += pax_record("GNU.sparse.realsize", std::to_string(e.real_size));
+        }
         if (opt.tar_xattrs) gather_xattrs(e.src, opt.tar_acls, recs);
 #ifdef GZSTD_HAVE_ACL
         if (opt.tar_acls)   gather_acls(e.src, e.typeflag == '5', recs);
@@ -8623,11 +8687,15 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
   b.finalize_entries();
   double walk_s = _secs(t_enum0, _clk::now());
   double gather_s = 0.0;
-  if (opt.tar_xattrs || opt.tar_acls) {
+  // Run the PAX recompute when any member will carry a pax block: --xattrs/--acls,
+  // or PAX sparse (--sparse in the default GNU.sparse.1.0 mode).  OLDGNU sparse
+  // ('S') needs no pax block, so add()'s offsets already suffice for it.
+  const bool pax_sparse = opt.sparse_mode == 1 && !opt.tar_sparse_oldgnu;
+  if (opt.tar_xattrs || opt.tar_acls || pax_sparse) {
     auto t_g0 = _clk::now();
     b.apply_extended_metadata();
     gather_s = _secs(t_g0, _clk::now());
-    if (opt.verbosity >= V_VERBOSE)
+    if (opt.verbosity >= V_VERBOSE && (opt.tar_acls || opt.tar_xattrs))
       vlog(V_VERBOSE, opt, std::string("[TAR] gathered ")
            + (opt.tar_acls ? "ACLs " : "") + (opt.tar_xattrs ? "xattrs " : "")
            + "(parallel)\n");
@@ -8769,7 +8837,21 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
           if (e.sparse_map.empty()) {
             read_seg((off_t)(s - e.data_off), s, (size_t)(en - s));
           } else {
-            uint64_t ss = s - e.data_off, se = en - e.data_off, cum = 0;
+            // Sparse data region.  OLDGNU 'S': just the concatenated segments.
+            // PAX GNU.sparse.1.0 ('0'): the map text block precedes them, so the
+            // segments start at stored offset map_pad; synthesize the map bytes
+            // for the leading region (NUL padding stays zero from the buffer).
+            uint64_t ss = s - e.data_off, se = en - e.data_off, map_pad = 0;
+            if (e.typeflag != 'S') {
+              std::string mt = sparse_map_text(e.sparse_map);
+              map_pad = tar_round_up(mt.size(), TAR_BLK);
+              if (ss < map_pad) {
+                uint64_t hi = std::min({se, map_pad, (uint64_t)mt.size()});
+                if (ss < hi)
+                  std::memcpy(outp + (e.data_off + ss) - a, mt.data() + (size_t)ss, (size_t)(hi - ss));
+              }
+            }
+            uint64_t cum = map_pad;
             for (const auto & seg : e.sparse_map) {
               uint64_t seg_end = cum + seg.second;
               uint64_t lo = std::max(cum, ss), hi = std::min(seg_end, se);
@@ -17542,6 +17624,24 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--acls") opt.tar_acls = true;
     else if (a == "--index") opt.tar_index = true;
     else if (a == "--no-index") opt.tar_index = false;
+    else if (a == "--format" || a.rfind("--format=", 0) == 0) {
+      // Two roles share the --format= prefix.  posix/pax/gnu/oldgnu select
+      // gzstd's SPARSE-file encoding (posix/pax → PAX GNU.sparse.1.0, the
+      // default; gnu/oldgnu → OLDGNU 'S'; inert without --sparse).  The zstd/gzip
+      // OUTPUT-format values are accepted for zstd-CLI compatibility and ignored
+      // (gzstd only ever emits zstd) — this must stay a warn/silent no-op, not an
+      // error, or `gzstd --format=gzip` from a ported command line breaks.
+      std::string v;
+      if (a.rfind("--format=", 0) == 0) v = a.substr(9);
+      else { if (i + 1 >= argc) die_usage("missing value for --format"); v = argv[++i]; }
+      if      (v == "posix" || v == "pax")    opt.tar_sparse_oldgnu = false;
+      else if (v == "gnu"   || v == "oldgnu") opt.tar_sparse_oldgnu = true;
+      else if (v == "zstd") { /* already zstd — silent no-op */ }
+      else if (v == "gzip" || v == "xz" || v == "lzma" || v == "lz4")
+        warn_ignored_zstd_opt("--format=" + v, "gzstd emits only zstd format");
+      else die_usage("unsupported --format '" + v + "' (tar sparse: posix, pax, gnu, "
+                     "oldgnu; zstd/gzip/xz/lzma/lz4 accepted for compatibility)");
+    }
     else if (a == "-C" || a == "--directory") {
       if (i + 1 >= argc) die_usage("missing value for " + a);
       opt.tar_dest = tar_chain_dest(opt.tar_dest, argv[++i]);
@@ -17731,7 +17831,6 @@ static Options parse_args(int argc, char ** argv)
     // Silent no-ops: zstd defaults we already match, so the flag is a no-op.
     else if (a == "--asyncio" || a == "--no-asyncio") {}
     else if (a == "--check" || a == "--no-check") {}
-    else if (a == "--format=zstd") {}
     else if (a == "--no-dictID") {}
     else if (a == "--compress-literals" || a == "--no-compress-literals") {}
     else if (a == "--row-match-finder" || a == "--no-row-match-finder") {}
@@ -17761,10 +17860,6 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (a == "--exclude-compressed") {
       warn_ignored_zstd_opt("--exclude-compressed");
-    }
-    else if (a == "--format=gzip" || a == "--format=xz"
-          || a == "--format=lzma" || a == "--format=lz4") {
-      warn_ignored_zstd_opt(a, "gzstd emits only zstd format");
     }
     else if (a == "--pass-through" || a == "--no-pass-through") {
       warn_ignored_zstd_opt(a);

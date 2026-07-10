@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.14.88
+**Current version:** v0.14.89
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -967,10 +967,19 @@ paths (one thread walks the stream in order). Open follow-ups:
      real). Their formats carry no entry metadata, so instant -l stays
      gzstd-only — a header-hop -l (names/sizes cheaply) is a follow-up, as is
      pzstd inline-tag reading (see status above).
-- **GNU sparse files** — *Priority: Medium | Complexity: Medium.* Members are
-  currently archived at full logical size (correct, just larger for holey files).
-  Add GNU sparse encoding (`'S'` / pax `GNU.sparse.*`) and detect holes via
-  `SEEK_HOLE`/`SEEK_DATA` during the walk.
+- **GNU sparse files** — *Status: DONE (opt-in `--sparse`; PAX GNU.sparse.1.0 default
+  since v0.14.89).* `--sparse` on create detects holes via `SEEK_DATA`/`SEEK_HOLE`
+  during the parallel stat pass (`probe_sparse`, reads no data) and stores holey
+  files compactly as **PAX GNU.sparse.1.0** by default (graceful degradation for
+  sparse-unaware readers), or OLDGNU `'S'` via `--format=gnu`/`oldgnu`. Verified:
+  a 10 GiB-logical file (data past the 8 GiB base-256 boundary) round-trips
+  byte-identical with holes preserved through gzstd, GNU tar, bsdtar, and Python,
+  no `--sparse` flag on extract. Left OPT-IN (matching GNU tar); the compressed-size
+  win is small (zstd already crushes zero runs) — the real benefit is a smaller
+  uncompressed stream and not reading/writing the holes (a large win for VM/DB
+  images). Remaining optional follow-up: auto-enable on create (extra cost: one
+  cheap `SEEK_HOLE` probe per regular file) — declined for now, matching GNU tar's
+  opt-in `--sparse`.
 - **More tar input ergonomics** — *Priority: Low | Complexity: Low.*
   `--exclude-from=FILE`, `-T/--files-from=FILE`, `--absolute-names`/`-P`,
   `--exclude-vcs`. Each is a small parse + walk tweak.
