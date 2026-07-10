@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.87";
+static constexpr const char * GZSTD_VERSION = "0.14.88";
 //
 // Architecture overview:
 //
@@ -9870,13 +9870,25 @@ private:
   static bool pwrite_sparse(int fd, off_t at, const char * data, size_t n) {
     size_t off = 0;
     while (off < n) {
-      size_t chunk = std::min(SPARSE_BLK, n - off);
+      // Align each zero-scan window to the FILE's SPARSE_BLK grid (via `at`),
+      // not the caller's segment start: the first (possibly short) window
+      // reaches the next block boundary, then every window is one full block.
+      // A file's data begins at a 512- but rarely 4 KiB-aligned tar offset, and
+      // it arrives as several frame segments, so scanning at segment offsets
+      // would straddle file blocks and leave a fully-zero block allocated
+      // whenever it shares a window with a neighbour's non-zero bytes.  Scanning
+      // on the file's own blocks detects the hole regardless of segment
+      // boundaries, matching the O_DIRECT writer (blk_zero_4k) and making the
+      // sparse layout identical across write paths and serial vs parallel extract.
+      off_t fpos = at + (off_t)off;
+      size_t align = (size_t)(fpos % (off_t)SPARSE_BLK);
+      size_t chunk = std::min(n - off, SPARSE_BLK - align);
       bool zero = true;
       for (size_t k = 0; k < chunk; ++k) if (data[off + k]) { zero = false; break; }
       if (!zero) {
         size_t w = 0;
         while (w < chunk) {
-          ssize_t r = ::pwrite(fd, data + off + w, chunk - w, at + (off_t)(off + w));
+          ssize_t r = ::pwrite(fd, data + off + w, chunk - w, fpos + (off_t)w);
           if (r < 0) { if (errno == EINTR) continue; return false; }
           w += (size_t)r;
         }
@@ -16025,11 +16037,63 @@ static int verify_tar(const Options & opt, Meter * m)
 }
 #endif  // !_WIN32  (extract_tar + verify_tar)
 
+// O(1) frame summary from a zstd seekable-format seek table at EOF (what gzstd
+// appends by default, and what t2sz / libzstd-seekable produce).  The table
+// records every frame's compressed and uncompressed size, so Frames / Skips /
+// Uncompressed come straight from its ~two tail reads — no frame walk over the
+// whole file.  Fills the counters and returns true only when the table is
+// present AND structurally consistent with the file (its compressed sizes tile
+// the file exactly up to the seek-table frame); on any doubt it returns false
+// and the caller does the full walk.  Operates on the already-mapped
+// [base, base+fsize), touching only the footer, the entry array, and one frame
+// header — so on an mmap it faults a handful of pages, not the archive.
+static bool seek_table_frame_summary(const unsigned char * base, size_t fsize,
+                                     uint64_t & nframes, uint64_t & nskips,
+                                     uint64_t & uncomp, bool & uncomp_known,
+                                     bool & has_check) {
+  auto rd_u32 = [](const unsigned char * p) {   // seekable format is little-endian
+    uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; };
+  if (fsize < 9 + 8) return false;
+  const unsigned char * ft = base + fsize - 9;              // Seek_Table_Footer
+  if (rd_u32(ft + 5) != 0x8F92EAB1u) return false;          // Seekable_Magic_Number
+  uint64_t nf = rd_u32(ft);
+  const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);       // +checksum per entry?
+  uint64_t tpay = nf * esz + 9;
+  // 1 GiB cap (>100M frames) bounds what a forged frame count can make us read.
+  if (nf == 0 || tpay > ((uint64_t)1 << 30) || tpay + 8 > fsize) return false;
+  uint64_t tstart = fsize - 8 - tpay;                       // start of the seek-table frame
+  const unsigned char * tb = base + tstart;
+  if (rd_u32(tb) != 0x184D2A5Eu || rd_u32(tb + 4) != tpay) return false;  // skippable header
+  const unsigned char * q = tb + 8;
+  uint64_t c_all = 0, u = 0, skips = 0, first_data_off = 0; bool found_data = false;
+  for (uint64_t k = 0; k < nf; ++k, q += esz) {
+    uint64_t foff = c_all, cz = rd_u32(q), dz = rd_u32(q + 4);
+    if (cz < 8 || cz > fsize - c_all) return false;         // frame runs past EOF → forged
+    c_all += cz;
+    if (dz == 0) ++skips;                                   // skippable (e.g. our GZIDX index)
+    else { u += dz; if (!found_data) { first_data_off = foff; found_data = true; } }
+  }
+  // Integrity gate: the entries must tile the file exactly up to the seek-table
+  // frame (which never lists itself).  A truncated/concatenated/forged file can't
+  // pass this, so it degrades to the walk rather than printing wrong numbers.
+  if (c_all != tstart) return false;
+  nframes = nf + 1;            // + the seek-table frame itself
+  nskips  = skips + 1;         // which is skippable
+  uncomp  = u; uncomp_known = true;
+  // XXH64 content-checksum flag: read the first data frame's header descriptor
+  // (bit 2).  gzstd writes every frame with the same params, so one is enough.
+  has_check = found_data && first_data_off + 5 <= fsize
+              && rd_u32(base + first_data_off) == 0xFD2FB528u
+              && (base[first_data_off + 4] & 0x04);
+  return true;
+}
+
 // -l (plain): zstd-style frame summary for each .zst file — Frames / Skips /
-// Compressed / Uncompressed / Ratio / Check / Filename.  Walks frame + block
-// headers WITHOUT decompressing (ZSTD_findFrameCompressedSize skips block
-// content); over an mmap only the header pages fault in, so it's fast even on a
-// huge multi-frame file.  Uncompressed is summed from frame-header content sizes.
+// Compressed / Uncompressed / Ratio / Check / Filename.  Prefers the O(1)
+// seek-table fast path (see seek_table_frame_summary); falls back to walking
+// frame + block headers WITHOUT decompressing (ZSTD_findFrameCompressedSize
+// skips block content) when there is no valid table.  Uncompressed is summed
+// from the seek table, or from frame-header content sizes on the walk.
 static int list_zst(const Options & opt)
 {
   std::printf("%7s %6s %12s %14s %7s %6s  %s\n",
@@ -16048,14 +16112,7 @@ static int list_zst(const Options & opt)
       if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
         mp_len = (size_t)st.st_size;
         mp = ::mmap(nullptr, mp_len, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mp != MAP_FAILED) {
-          base = (const unsigned char *)mp; fsize = mp_len;
-          // The frame walk touches only block-header bytes (~one per 128 KiB),
-          // which on a cold file is ~1M serial random page faults.  Hint a
-          // forward sequential scan so the kernel prefetches in big reads
-          // instead — turns random fault-per-header I/O into streaming reads.
-          ::madvise(mp, mp_len, MADV_SEQUENTIAL);
-        }
+        if (mp != MAP_FAILED) { base = (const unsigned char *)mp; fsize = mp_len; }
       }
       ::close(fd);
     }
@@ -16070,25 +16127,34 @@ static int list_zst(const Options & opt)
 
     uint64_t nframes = 0, nskips = 0, uncomp = 0;
     bool uncomp_known = true, has_check = false, ok = true;
-    size_t pos = 0;
-    while (pos + 4 <= fsize) {
-      uint32_t magic; std::memcpy(&magic, base + pos, 4);
-      if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {           // skippable frame
-        if (pos + 8 > fsize) { ok = false; break; }
-        uint32_t ssz; std::memcpy(&ssz, base + pos + 4, 4);
-        // zstd -l counts skippable frames in BOTH columns (Frames includes
-        // them; Skips breaks them out) — match it, or the counts diverge on
-        // archives carrying the --tar member index.
-        pos += 8 + (size_t)ssz; ++nskips; ++nframes; continue;
+    // O(1) fast path: read the summary straight from the seekable seek table.
+    if (!seek_table_frame_summary(base, fsize, nframes, nskips, uncomp, uncomp_known, has_check)) {
+      // No usable table → walk every frame header (see the block below).  Only
+      // now hint sequential access: the walk streams the header bytes forward,
+      // whereas the fast path only touches the tail + one header.
+#ifndef _WIN32
+      if (mp != MAP_FAILED) ::madvise(mp, mp_len, MADV_SEQUENTIAL);
+#endif
+      size_t pos = 0;
+      while (pos + 4 <= fsize) {
+        uint32_t magic; std::memcpy(&magic, base + pos, 4);
+        if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {           // skippable frame
+          if (pos + 8 > fsize) { ok = false; break; }
+          uint32_t ssz; std::memcpy(&ssz, base + pos + 4, 4);
+          // zstd -l counts skippable frames in BOTH columns (Frames includes
+          // them; Skips breaks them out) — match it, or the counts diverge on
+          // archives carrying the --tar member index.
+          pos += 8 + (size_t)ssz; ++nskips; ++nframes; continue;
+        }
+        size_t csz = ZSTD_findFrameCompressedSize(base + pos, fsize - pos);
+        if (ZSTD_isError(csz) || csz == 0) { ok = false; break; }
+        unsigned long long ucs = ZSTD_getFrameContentSize(base + pos, fsize - pos);
+        if (ucs == ZSTD_CONTENTSIZE_UNKNOWN || ucs == ZSTD_CONTENTSIZE_ERROR) uncomp_known = false;
+        else uncomp += ucs;
+        // Frame_Header_Descriptor (byte after the 4-byte magic): bit 2 = content checksum.
+        if (pos + 4 < fsize && (base[pos + 4] & 0x04)) has_check = true;
+        pos += csz; ++nframes;
       }
-      size_t csz = ZSTD_findFrameCompressedSize(base + pos, fsize - pos);
-      if (ZSTD_isError(csz) || csz == 0) { ok = false; break; }
-      unsigned long long ucs = ZSTD_getFrameContentSize(base + pos, fsize - pos);
-      if (ucs == ZSTD_CONTENTSIZE_UNKNOWN || ucs == ZSTD_CONTENTSIZE_ERROR) uncomp_known = false;
-      else uncomp += ucs;
-      // Frame_Header_Descriptor (byte after the 4-byte magic): bit 2 = content checksum.
-      if (pos + 4 < fsize && (base[pos + 4] & 0x04)) has_check = true;
-      pos += csz; ++nframes;
     }
 #ifndef _WIN32
     if (mp != MAP_FAILED) ::munmap(mp, mp_len);
