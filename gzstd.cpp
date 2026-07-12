@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.90";
+static constexpr const char * GZSTD_VERSION = "0.14.91";
 //
 // Architecture overview:
 //
@@ -450,6 +450,7 @@ struct Options {
   bool tar_one_file_system = false;      // --one-file-system: don't cross mount points
   bool tar_xattrs = false;               // --xattrs: store/restore extended attributes (SCHILY.xattr.*)
   bool tar_acls = false;                 // --acls: store/restore POSIX ACLs (SCHILY.acl.*); needs both on create AND extract
+  bool tar_selinux = false;              // --selinux: store/restore SELinux contexts (RHT.security.selinux)
   bool tar_index = true;                 // --[no-]index: append the member-index skippable frame on create
   bool tar_sparse_oldgnu = false;        // --format=gnu/oldgnu: emit OLDGNU 'S' sparse (default: PAX GNU.sparse.1.0)
   std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
@@ -792,6 +793,7 @@ static void print_help()
 "  --one-file-system   do not descend into other mounted filesystems\n"
 "  --xattrs            store/restore extended attributes (give on both create and extract)\n"
 "  --acls              store/restore POSIX ACLs (give on both create and extract)\n"
+"  --selinux           store/restore SELinux contexts (give on both create and extract)\n"
 "  --sparse            store sparse files compactly on create (PAX GNU.sparse.1.0; opt-in)\n"
 "  --no-index          create: skip the member index (instant -l, seek-based\n"
 "                      MEMBER extraction); it is a standard zstd skippable\n"
@@ -913,9 +915,13 @@ static void print_help_long()
 "     even on huge archives.\n"
 "     With --tar (`-l --tar ARCHIVE [MEMBER...]`), lists the archive\n"
 "     contents — instantly from the member index when the archive was\n"
-"     created by gzstd (see --[no-]index), otherwise by decompressing\n"
-"     and parsing the tar headers in memory.  Entries print as they\n"
-"     are found.  When the decompress walk produces the listing, the\n"
+"     created by gzstd (see --[no-]index); a FOREIGN zstd-seekable\n"
+"     archive (t2sz-style: seek table, no gzstd index) is listed nearly\n"
+"     as fast by hopping the tar headers through its seek table,\n"
+"     decompressing only header-bearing frames; anything else falls\n"
+"     back to decompressing and parsing the tar headers in memory.\n"
+"     Entries print as they are found.  When the walk produces the\n"
+"     listing, the\n"
 "     progress meter shows on stderr — by default ONLY when the\n"
 "     listing is piped or redirected (and stderr is a terminal), so it\n"
 "     never interleaves with a listing on the same screen.  --progress\n"
@@ -1202,12 +1208,29 @@ static void print_help_long()
 "     Off by default (gathering xattrs costs an extra syscall per member);\n"
 "     must be given on BOTH create and extract, or it is ignored — exactly\n"
 "     as GNU tar behaves.  Gathering runs in parallel across the worker pool.\n"
+"     Restore currently reapplies xattrs to regular files and directories;\n"
+"     a symlink's or device node's stored xattrs are not reapplied on\n"
+"     extract (GNU tar restores those too).\n"
 "\n"
 "  --acls\n"
 "     Store POSIX access control lists (ACLs) as PAX `SCHILY.acl.access`\n"
 "     and `SCHILY.acl.default` text records, compatible with GNU tar.  Off\n"
 "     by default; must be given on BOTH create and extract or it is ignored.\n"
 "     Restoring an ACL is applied after permissions, so the ACL wins.\n"
+"\n"
+"  --selinux\n"
+"     Store SELinux security contexts (the security.selinux extended\n"
+"     attribute) as PAX `RHT.security.selinux` records, compatible with\n"
+"     GNU tar --selinux.  Off by default; must be given on BOTH create\n"
+"     and extract or it is ignored.  Read/restored directly through the\n"
+"     xattr (no libselinux needed): on a host without SELinux labeling,\n"
+"     create finds no contexts and extract's restore is best-effort\n"
+"     (failures reported at -v, never fatal), like --xattrs.  With both\n"
+"     --selinux and --xattrs, the context rides only in the RHT record —\n"
+"     never duplicated into SCHILY.xattr.*.  Restore currently reapplies\n"
+"     contexts to regular files and directories; a symlink's or device\n"
+"     node's stored context is not reapplied on extract (same limitation\n"
+"     as --xattrs; GNU tar restores those too).\n"
 "\n"
 "  --sparse (on create)\n"
 "     Detect each file's holes via SEEK_DATA/SEEK_HOLE (filesystem metadata,\n"
@@ -8042,7 +8065,8 @@ static std::string pax_record(const std::string & key, const std::string & val) 
 // own xattrs, not a symlink target's).  When ACLs are stored separately, the
 // system.posix_acl_* attributes are skipped here (they ride in the ACL records
 // instead) to avoid duplication, exactly as GNU tar does.
-static void gather_xattrs(const std::string & path, bool acls_separate, std::string & recs) {
+static void gather_xattrs(const std::string & path, bool acls_separate,
+                          bool selinux_separate, std::string & recs) {
   ssize_t ln = ::llistxattr(path.c_str(), nullptr, 0);
   if (ln <= 0) return;
   std::vector<char> names((size_t)ln);
@@ -8054,6 +8078,7 @@ static void gather_xattrs(const std::string & path, bool acls_separate, std::str
     if (name.empty()) continue;
     if (acls_separate && (name == "system.posix_acl_access" ||
                           name == "system.posix_acl_default")) continue;
+    if (selinux_separate && name == "security.selinux") continue;  // rides RHT.security.selinux
     ssize_t vl = ::lgetxattr(path.c_str(), name.c_str(), nullptr, 0);
     if (vl < 0) continue;
     std::string val((size_t)vl, '\0');
@@ -8062,6 +8087,38 @@ static void gather_xattrs(const std::string & path, bool acls_separate, std::str
     val.resize((size_t)vl);
     recs += pax_record("SCHILY.xattr." + name, val);
   }
+}
+
+// --selinux: append an RHT.security.selinux record (GNU tar's pax key) holding
+// the member's SELinux context.  Read straight from the security.selinux xattr
+// (lgetxattr, nofollow) — no libselinux dependency, so this works on any build
+// and simply finds nothing on hosts without SELinux labeling.  The kernel
+// stores the context NUL-terminated; the pax record carries it as text
+// (stripped), exactly like GNU tar's lgetfilecon-based record.
+static void gather_selinux(const std::string & path, std::string & recs) {
+  // One syscall for the ~100% case (real contexts are 30–60 bytes; this runs
+  // per member in the parallel gather pool, so syscall count matters at
+  // scale).  ERANGE falls back to probe-and-fetch, retried a few times so a
+  // context that GROWS between probe and fetch is re-probed, never silently
+  // dropped — with --xattrs --selinux the SCHILY dedupe means a drop here
+  // would lose the context entirely, strictly worse than --xattrs alone.
+  char sbuf[256];
+  std::string ctx;
+  ssize_t vl = ::lgetxattr(path.c_str(), "security.selinux", sbuf, sizeof sbuf);
+  if (vl > 0) ctx.assign(sbuf, (size_t)vl);
+  else if (vl < 0 && errno == ERANGE) {
+    for (int tries = 0; ; ++tries) {
+      ssize_t n = ::lgetxattr(path.c_str(), "security.selinux", nullptr, 0);
+      if (n <= 0) return;
+      ctx.assign((size_t)n, '\0');
+      n = ::lgetxattr(path.c_str(), "security.selinux", ctx.data(), ctx.size());
+      if (n > 0) { ctx.resize((size_t)n); break; }
+      if (n < 0 && errno == ERANGE && tries < 4) continue;  // grew again: re-probe
+      return;
+    }
+  } else return;
+  while (!ctx.empty() && ctx.back() == '\0') ctx.pop_back();
+  if (!ctx.empty()) recs += pax_record("RHT.security.selinux", ctx);
 }
 
 #ifdef GZSTD_HAVE_ACL
@@ -8410,7 +8467,7 @@ struct LayoutBuilder {
         if (e.path.empty() || e.path.back() != '/') e.path += '/';
         e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid; e.mtime = st.st_mtime;
         e.typeflag = '5';
-        if (opt.tar_xattrs || opt.tar_acls) e.src = p.fspath;
+        if (opt.tar_xattrs || opt.tar_acls || opt.tar_selinux) e.src = p.fspath;
         resolve_owner(e.uid, e.gid); add(std::move(e));
         continue;
       }
@@ -8423,7 +8480,7 @@ struct LayoutBuilder {
       TarEntry e;
       e.path = p.member; e.mode = st.st_mode; e.uid = st.st_uid; e.gid = st.st_gid;
       e.mtime = st.st_mtime;
-      if (opt.tar_xattrs || opt.tar_acls) e.src = p.fspath;
+      if (opt.tar_xattrs || opt.tar_acls || opt.tar_selinux) e.src = p.fspath;
 
       if (S_ISREG(st.st_mode)) {
         if (st.st_nlink > 1) {
@@ -8504,9 +8561,10 @@ struct LayoutBuilder {
           recs += pax_record("GNU.sparse.name", e.path);
           recs += pax_record("GNU.sparse.realsize", std::to_string(e.real_size));
         }
-        if (opt.tar_xattrs) gather_xattrs(e.src, opt.tar_acls, recs);
+        if (opt.tar_xattrs)  gather_xattrs(e.src, opt.tar_acls, opt.tar_selinux, recs);
+        if (opt.tar_selinux) gather_selinux(e.src, recs);
 #ifdef GZSTD_HAVE_ACL
-        if (opt.tar_acls)   gather_acls(e.src, e.typeflag == '5', recs);
+        if (opt.tar_acls)    gather_acls(e.src, e.typeflag == '5', recs);
 #endif
         e.pax = std::move(recs);
       }
@@ -8736,13 +8794,14 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
   // or PAX sparse (--sparse in the default GNU.sparse.1.0 mode).  OLDGNU sparse
   // ('S') needs no pax block, so add()'s offsets already suffice for it.
   const bool pax_sparse = opt.sparse_mode == 1 && !opt.tar_sparse_oldgnu;
-  if (opt.tar_xattrs || opt.tar_acls || pax_sparse) {
+  if (opt.tar_xattrs || opt.tar_acls || opt.tar_selinux || pax_sparse) {
     auto t_g0 = _clk::now();
     b.apply_extended_metadata();
     gather_s = _secs(t_g0, _clk::now());
-    if (opt.verbosity >= V_VERBOSE && (opt.tar_acls || opt.tar_xattrs))
+    if (opt.verbosity >= V_VERBOSE && (opt.tar_acls || opt.tar_xattrs || opt.tar_selinux))
       vlog(V_VERBOSE, opt, std::string("[TAR] gathered ")
            + (opt.tar_acls ? "ACLs " : "") + (opt.tar_xattrs ? "xattrs " : "")
+           + (opt.tar_selinux ? "SELinux-contexts " : "")
            + "(parallel)\n");
   }
   b.finalize();
@@ -10138,6 +10197,12 @@ private:
               pax_ext.xattrs.emplace_back(key.substr(13), val);
             else if (opt_.tar_acls && key == "SCHILY.acl.access")  pax_ext.acl_access  = val;
             else if (opt_.tar_acls && key == "SCHILY.acl.default") pax_ext.acl_default = val;
+            // --selinux: the context restores through the security.selinux xattr
+            // (apply_ext's best-effort fsetxattr — EPERM/ENOTSUP reported at -v,
+            // never fatal, matching --xattrs).  Stored as text; the kernel wants
+            // it NUL-terminated, like libselinux's lsetfilecon writes it.
+            else if (opt_.tar_selinux && key == "RHT.security.selinux")
+              pax_ext.xattrs.emplace_back("security.selinux", val + '\0');
             // PAX GNU sparse (0.0/0.1/1.0).  Capture the version, real size, real
             // name, and the segment map (however this version encodes it).
             else if (key.rfind("GNU.sparse.", 0) == 0) {
@@ -10792,9 +10857,15 @@ struct ScanEnt { std::string name; uint64_t hdr_off, entry_end; char typeflag; }
 // checksums, oversized extension records, or an I/O/decode failure.  A false
 // NEGATIVE only mislabels — the Extractor re-parses the sliced stream for real,
 // so a scan bug can never corrupt an extraction.
+// lmeta (optional): also collect full per-entry listing metadata (mode, owner,
+// size, mtime, link target — everything `-l --tar`'s tar-tvf format needs) from
+// the same hopped headers, enabling an instant seek-table listing of FOREIGN
+// archives (no GZIDX member index) that decompresses only header-bearing
+// frames.  Filled only on a true return; the extract-path callers pass null.
 static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
                                  const Options & opt, Meter * m,
-                                 std::vector<ScanEnt> & ents) {
+                                 std::vector<ScanEnt> & ents,
+                                 std::vector<InEntry> * lmeta = nullptr) {
   const int fd = fileno(in);
   const size_t nframes = st.c_off.size() - 1;
 
@@ -10846,15 +10917,21 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
     return true;
   };
 
-  // The scan: same header grammar subset as Extractor::parse, offsets only.
+  // The scan: same header grammar subset as Extractor::parse, offsets only
+  // (plus listing fields when lmeta is set).
   ents.clear();
+  if (lmeta) lmeta->clear();
   bool ok = true;
   {
     char blk[TAR_BLK];
-    std::string pend_name, pax_path;
-    uint64_t pax_size = 0; bool pax_has_size = false;
+    std::string pend_name, pend_link, pax_path, pax_link;
+    std::string pax_uname, pax_gname;
+    uint64_t pax_size = 0, pax_uid = 0, pax_gid = 0; int64_t pax_mtime = 0;
+    bool pax_has_size = false, pax_has_uid = false, pax_has_gid = false,
+         pax_has_mtime = false, pax_has_uname = false, pax_has_gname = false;
     uint64_t cursor = 0, entry_start = 0; bool in_ext = false;
     int zero_run = 0;
+    size_t accum_bytes = 0;   // entry-accumulation cap (see the push site)
     while (cursor + TAR_BLK <= st.tar_size) {
       if (!get_range(cursor, TAR_BLK, blk)) { ok = false; break; }
       bool all_zero = true;
@@ -10875,6 +10952,8 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
         if (size && !get_range(cursor + TAR_BLK, (size_t)size, pd.data())) { ok = false; break; }
         if (type == 'L') {
           pend_name.assign(pd.data(), size ? size - (pd[size - 1] == 0 ? 1 : 0) : 0);
+        } else if (type == 'K') {
+          pend_link.assign(pd.data(), size ? size - (pd[size - 1] == 0 ? 1 : 0) : 0);
         } else if (type == 'x') {
           std::string rec(pd.data(), pd.size());
           size_t p2 = 0;
@@ -10884,9 +10963,15 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
             std::string kv = rec.substr(sp + 1, (size_t)rlen - (sp - p2) - 2);
             size_t eq = kv.find('=');
             if (eq != std::string::npos) {
-              std::string key = kv.substr(0, eq);
-              if (key == "path") pax_path = kv.substr(eq + 1);
-              else if (key == "size") { pax_size = strtoull(kv.c_str() + eq + 1, nullptr, 10); pax_has_size = true; }
+              std::string key = kv.substr(0, eq), val = kv.substr(eq + 1);
+              if (key == "path") pax_path = val;
+              else if (key == "size") { pax_size = strtoull(val.c_str(), nullptr, 10); pax_has_size = true; }
+              else if (key == "linkpath") pax_link = val;
+              else if (key == "mtime") { pax_mtime = (int64_t)strtoll(val.c_str(), nullptr, 10); pax_has_mtime = true; }
+              else if (key == "uid")   { pax_uid = strtoull(val.c_str(), nullptr, 10); pax_has_uid = true; }
+              else if (key == "gid")   { pax_gid = strtoull(val.c_str(), nullptr, 10); pax_has_gid = true; }
+              else if (key == "uname") { pax_uname = val; pax_has_uname = true; }
+              else if (key == "gname") { pax_gname = val; pax_has_gname = true; }
               else if (key.rfind("GNU.sparse.", 0) == 0) { ok = false; break; }
             }
             p2 += (size_t)rlen;
@@ -10902,8 +10987,16 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
       if (!prefix.empty()) name = prefix + "/" + name;
       if (!pend_name.empty()) { name = pend_name; pend_name.clear(); }
       if (!pax_path.empty())  { name = pax_path;  pax_path.clear(); }
+      std::string link = get_str(blk + 157, 100);
+      if (!pend_link.empty()) { link = pend_link; pend_link.clear(); }
+      if (!pax_link.empty())  { link = pax_link;  pax_link.clear(); }
       uint64_t dsize = pax_has_size ? pax_size : size;
       pax_has_size = false;
+      // Listing size = the header/pax size AS STORED, captured before the
+      // link/dir zeroing below (that zeroing is stream GEOMETRY, not display):
+      // the walk and GNU tar -tv print the stored size even for a dir/link
+      // header that carries one, and the hop listing must match them.
+      const uint64_t list_size = dsize;
       // Parity with Extractor::handle_entry's alignment rule, NOT the POSIX
       // convention: links and directories ('1','2','5') consume zero data
       // even with a nonzero size field, while devices/fifos/labels/unknown
@@ -10918,6 +11011,34 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
       if (dsize > st.tar_size - cursor - TAR_BLK) { ok = false; break; }
       uint64_t eend = cursor + TAR_BLK + tar_round_up(dsize, TAR_BLK);
       if (eend > st.tar_size || eend <= cursor) { ok = false; break; }
+      // The scan holds every entry in RAM (the walk streams with bounded
+      // memory), so a crafted archive — tiny compressed frames inflating to
+      // header-filled RLE bombs — could otherwise OOM the scanner.  Cap the
+      // accumulated footprint generously (real archives: a 171k-entry home
+      // backup is ~10 MB of names) and bail to the walk, which handles any
+      // entry count correctly.
+      accum_bytes += name.size() + link.size() + sizeof(ScanEnt)
+                     + (lmeta ? sizeof(InEntry) + name.size()
+                                + pax_uname.size() + pax_gname.size() + 64
+                              : 0);
+      if (accum_bytes > (1u << 30)) { ok = false; break; }
+      if (lmeta) {
+        InEntry ie;
+        ie.name = name; ie.linkname = std::move(link);
+        ie.size = list_size; ie.typeflag = type;
+        ie.mode = (uint32_t)get_num(blk + 100, 8);
+        ie.uid  = pax_has_uid ? pax_uid : get_num(blk + 108, 8);
+        ie.gid  = pax_has_gid ? pax_gid : get_num(blk + 116, 8);
+        ie.mtime = pax_has_mtime ? pax_mtime : (int64_t)get_num(blk + 136, 12);
+        ie.uname = pax_has_uname ? pax_uname : get_str(blk + 265, 32);
+        ie.gname = pax_has_gname ? pax_gname : get_str(blk + 297, 32);
+        ie.devmajor = (uint32_t)get_num(blk + 329, 8);
+        ie.devminor = (uint32_t)get_num(blk + 337, 8);
+        ie.hdr_off = entry_start; ie.data_off = cursor + TAR_BLK; ie.entry_end = eend;
+        lmeta->push_back(std::move(ie));
+      }
+      pax_has_uid = pax_has_gid = pax_has_mtime = false;
+      pax_has_uname = pax_has_gname = false;
       ents.push_back({std::move(name), entry_start, eend, type});
       cursor = eend;
       in_ext = false;
@@ -16351,6 +16472,28 @@ static int list_tar(const Options & opt, Meter * m)
       }
     }
 
+    // Header-hop route: a FOREIGN zstd-seekable archive (t2sz-style — seek
+    // table, no GZIDX member index) is listed by hopping tar headers via the
+    // seek table, decompressing only header-bearing frames and skipping file
+    // data by arithmetic.  Same fields, filter, and footer as the index route
+    // (both feed list_entries), so the two cannot drift.  Any scan bail
+    // (GNU sparse, pax globals, bad checksum, decode error) falls back to the
+    // walk below, which is always correct.
+    if (!from_index && arc != "-") {
+      tarx::TarSeekTable st;
+      if (tarx::parse_foreign_seek_table(in, st)) {
+        std::vector<tarx::ScanEnt> se;
+        std::vector<tarx::InEntry> ie;
+        if (tarx::foreign_scan_entries(in, st, opt, m, se, &ie)) {
+          ex.list_entries(ie);
+          vlog(V_VERBOSE, opt, "[TAR] listed via seek-table header-hop ("
+               + std::to_string(ie.size()) + " entries, data frames skipped)\n");
+          from_index = true;
+        }
+      }
+      std::rewind(in);   // scan/table probe moved the fd; the walk needs offset 0
+    }
+
     if (!from_index) {  // decompress walk
       FrameSink sink(tar_sink_budget(opt));
       g_tar_decomp_sink = &sink;
@@ -17731,6 +17874,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--one-file-system") opt.tar_one_file_system = true;
     else if (a == "--xattrs") opt.tar_xattrs = true;
     else if (a == "--acls") opt.tar_acls = true;
+    else if (a == "--selinux") opt.tar_selinux = true;
     else if (a == "--index") opt.tar_index = true;
     else if (a == "--no-index") opt.tar_index = false;
     else if (a == "--format" || a.rfind("--format=", 0) == 0) {

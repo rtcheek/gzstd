@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=300
-$EXTENSIVE && EXPECTED_TESTS=416
+EXPECTED_TESTS=304
+$EXTENSIVE && EXPECTED_TESTS=420
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3838,6 +3838,46 @@ PYEOF
     skip "no extended metadata without flags" "no setfacl / xattr fs support"
   fi
 
+  # 14. --selinux (v0.14.91): contexts ride PAX RHT.security.selinux records,
+  # GNU tar --selinux compatible.  A non-SELinux host cannot label files, so
+  # create-side record EMISSION is verifiable only on an SELinux host; the
+  # record-handling paths test everywhere: a crafted archive carrying the
+  # record extracts with --selinux (best-effort apply — EPERM tolerated, never
+  # fatal), the record is parsed-and-ignored without the flag, and create with
+  # --selinux on an unlabeled tree emits no records.
+  if command -v python3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
+    SEL="$TMPDIR/selinux"; rm -rf "$SEL"; mkdir -p "$SEL/tree/d" "$SEL/out" "$SEL/out2"
+    echo hi > "$SEL/tree/d/f.txt"
+    python3 - "$SEL/lab.tar" <<'PYEOF'
+import tarfile, io, sys
+buf = io.BytesIO()
+tf = tarfile.open(fileobj=buf, mode='w', format=tarfile.PAX_FORMAT)
+data = b"labeled content\n"
+ti = tarfile.TarInfo('lab/f.txt'); ti.size = len(data); ti.mode = 0o644
+ti.pax_headers = {'RHT.security.selinux': 'system_u:object_r:etc_t:s0'}
+tf.addfile(ti, io.BytesIO(data)); tf.close()
+open(sys.argv[1],'wb').write(buf.getvalue())
+PYEOF
+    zstd -q -f "$SEL/lab.tar" -o "$SEL/lab.tar.zst" 2>/dev/null
+    rc=0; "$GZSTD" -d --cpu-only -q --tar --selinux -C "$SEL/out" "$SEL/lab.tar.zst" 2>/dev/null || rc=$?
+    if [[ $rc -eq 0 ]] && printf 'labeled content\n' | cmp -s - "$SEL/out/lab/f.txt"; then
+      pass "--selinux extract: RHT record applied best-effort (exit 0)"
+    else fail "--selinux extract" "(exit $rc or content mismatch)"; fi
+    rc=0; "$GZSTD" -d --cpu-only -q --tar -C "$SEL/out2" "$SEL/lab.tar.zst" 2>/dev/null || rc=$?
+    [[ $rc -eq 0 ]] && cmp -s "$SEL/out/lab/f.txt" "$SEL/out2/lab/f.txt" \
+      && pass "RHT record parsed-and-ignored without --selinux" \
+      || fail "RHT without flag" "(exit $rc)"
+    "$GZSTD" --cpu-only -q -f -o "$SEL/plain.tar.zst" --tar --selinux "$SEL/tree" 2>/dev/null
+    if "$GZSTD" -dc "$SEL/plain.tar.zst" 2>/dev/null | grep -qa "RHT.security"; then
+      fail "--selinux create on unlabeled tree" "unexpected RHT record"
+    else pass "--selinux create on unlabeled tree stays clean"; fi
+    rm -rf "$SEL"
+  else
+    skip "--selinux extract: RHT record applied best-effort (exit 0)" "python3/zstd unavailable"
+    skip "RHT record parsed-and-ignored without --selinux" "python3/zstd unavailable"
+    skip "--selinux create on unlabeled tree stays clean" "python3/zstd unavailable"
+  fi
+
   # Sparse-file restoration: a sparse source restores with holes by default
   # (fewer disk blocks than apparent size) and content intact; --no-sparse
   # forces full allocation.  Needs a filesystem that supports holes.
@@ -4315,6 +4355,16 @@ PYEOF
   if [[ "$fline" == "1" ]] && cmp -s "$SX/xf/t/sub/b.txt" "$SX/t/sub/b.txt"; then
     pass "foreign seekable archive: header-hop selective extract"
   else fail "foreign seekable extract" "engaged=$fline or mismatch"; fi
+
+  # 11a. Header-hop -l (v0.14.91): the same foreign archive LISTS via its seek
+  # table (decompressing only header-bearing frames), byte-identical to
+  # tar -tvf.  The -v route log confirms the walk was not used.
+  hline=$("$GZSTD" -l --tar --cpu-only -v "$SX/foreign.tar.zst" 2>&1 >/dev/null | grep -c 'header-hop' || true)
+  "$GZSTD" -l --tar --cpu-only -q "$SX/foreign.tar.zst" > "$SX/hh.lst" 2>/dev/null
+  tar -tvf "$SX/plain.tar" > "$SX/ref.lst" 2>/dev/null
+  if [[ "$hline" == "1" ]] && diff -q "$SX/hh.lst" "$SX/ref.lst" >/dev/null 2>&1; then
+    pass "foreign seekable archive: header-hop -l (tar -tvf parity)"
+  else fail "foreign header-hop -l" "engaged=$hline or listing differs"; fi
 
   # 11b. Parallel full-extract: a leaf/directory collision (file "x" AND file
   #      "x/y") must fall back to the serial walk (parallel workers would race

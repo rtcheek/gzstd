@@ -795,7 +795,9 @@ throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
 | Delete compress CPU-rescue → clean GPU-fault abort | — | Medium | DONE (v0.14.43) |
 | Checkpoint/resume on fault (resume from last good frame vs. rebuild from zero) | — | Low | Not started |
 | `--tar` input ergonomics (`--exclude-from`/`-X`, `--files-from`, `-P`, `--exclude-vcs`) | tar | Low | DONE (v0.14.90) |
-| `--selinux` context storage (third leg of xattrs/ACLs) | tar | Low | Not started |
+| `--selinux` context storage (third leg of xattrs/ACLs) | tar | Low | DONE (v0.14.91) — spot-check a labeled-host round-trip if one appears |
+| Restore xattrs/contexts on symlinks & special files (extract side) | tar | Low | Open — stored on create but silently not reapplied (apply_ext is fd-based; needs lsetxattr via the secure parent-fd walk); inherited gap affecting --xattrs AND --selinux, GNU tar restores these; documented in --help since v0.14.91 |
+| Hoist the pax record-grammar walk into a shared for_each_pax_record | — | Low | Open — the length arithmetic is duplicated between Extractor::parse and foreign_scan_entries (v0.14.91 review recommendation, match_tar_member-style one-source hoist); mechanical but rewires working dispatch — do it as its own change with a full suite run, not mid-release |
 | Parallelize the `--tar` layout walk | tar | Medium | DONE (v0.14.9) — the lstat storm (Pass B) runs parallel; serial Pass A enumerate is the residual, unmeasured |
 | Cache-bypass member reads on `--tar` create (FADV_DONTNEED vs O_DIRECT) | tar | Low | Investigate + measure |
 | O_DIRECT extraction writes for large files (Gen4+) | tar | Low | Investigate + measure |
@@ -803,13 +805,14 @@ throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
 
 ### Versioning plan (as of v0.14.89, 2026-07)
 
-- **0.14.x** closes out the `--tar` chapter. The hard core is done (parallel
+- **0.14.x — the `--tar` chapter is CLOSED as of v0.14.91.** Parallel
   create/extract including the parallel-lstat layout walk, member index +
-  instant `-l`, seek-based selective extraction, zstd seekable-format interop,
-  parallel-dispatch full extraction, sparse files, xattrs/ACLs, and the
-  v0.14.90 input-ergonomics flags). What remains before drawing the line: the
-  `--selinux` decision. The two O_DIRECT/cache probes are measure-first and
-  can land whenever the numbers justify them.
+  instant `-l`, seek-based selective extraction, zstd seekable-format interop
+  (including header-hop `-l` for foreign archives), parallel-dispatch full
+  extraction, sparse files, xattrs/ACLs/SELinux, and the v0.14.90
+  input-ergonomics flags. Remaining tar-adjacent work is opportunistic only:
+  the two measure-first O_DIRECT/cache probes, the xfs/btrfs/zfs punch-hole
+  validation, and an SELinux labeled-host round-trip spot-check.
 - **0.15.0** opens the next big change — likely `--adapt` (AI/heuristic runtime
   self-tuning; regime-signal instrumentation already built). The unblocked first
   slice is independent of the full design: **the decompress default backend is
@@ -989,9 +992,12 @@ paths (one thread walks the stream in order). Open follow-ups:
      every frame. The scan bails to the walk on GNU sparse, pax globals, bad
      checksums, or mid-stream skippables; a scan miss can only produce "Not
      found", never corruption (the Extractor re-parses the sliced stream for
-     real). Their formats carry no entry metadata, so instant -l stays
-     gzstd-only — a header-hop -l (names/sizes cheaply) is a follow-up, as is
-     pzstd inline-tag reading (see status above).
+     real). Their formats carry no entry metadata, but a **header-hop -l
+     shipped in v0.14.91**: the same scanner also collects the tar-tvf listing
+     fields from the hopped headers and feeds the index route's `list_entries`,
+     so foreign seekable archives list near-instantly (byte-identical to
+     `tar -tvf`, walk fallback on any scan bail). Only pzstd inline-tag reading
+     remains deferred (see status above).
 - **GNU sparse files** — *Status: DONE (opt-in `--sparse`; PAX GNU.sparse.1.0 default
   since v0.14.89).* `--sparse` on create detects holes via `SEEK_DATA`/`SEEK_HOLE`
   during the parallel stat pass (`probe_sparse`, reads no data) and stores holey
@@ -1002,9 +1008,9 @@ paths (one thread walks the stream in order). Open follow-ups:
   no `--sparse` flag on extract. Left OPT-IN (matching GNU tar); the compressed-size
   win is small (zstd already crushes zero runs) — the real benefit is a smaller
   uncompressed stream and not reading/writing the holes (a large win for VM/DB
-  images). Remaining optional follow-up: auto-enable on create (extra cost: one
-  cheap `SEEK_HOLE` probe per regular file) — declined for now, matching GNU tar's
-  opt-in `--sparse`.
+  images). Auto-enable on create was considered and is CLOSED as won't-do:
+  gzstd matches GNU tar's opt-in `--sparse` (2026-07 decision — not a pending
+  item, do not revisit without a user-visible reason).
 - **More tar input ergonomics** — *Priority: Low | Complexity: Low | Status:
   DONE (v0.14.90).* `--exclude-from FILE`/`-X` (also `-` = stdin),
   `--exclude-vcs` (GNU tar's version-control table, listing-parity verified),
@@ -1013,12 +1019,15 @@ paths (one thread walks the stream in order). Open follow-ups:
   `-P`/`--absolute-names` (create-only; extraction always strips leading `/`
   and stays contained, so `-P` on extract is refused, not ignored).
 - **xattrs / ACLs / SELinux** — *Priority: Low | Complexity: Medium | Status:
-  `--xattrs`/`--acls` DONE (v0.14.3); `--selinux` NOT started.* Opt-in
-  `--xattrs`/`--acls` store/restore PAX `SCHILY.xattr.*` and
-  `SCHILY.acl.access`/`SCHILY.acl.default` records, GNU-tar interoperable in both
-  directions (round-trips verified gzstd↔GNU tar, including directory default
-  ACLs). SELinux contexts (`--selinux`) remain unimplemented — only relevant on
-  SELinux-enforcing hosts; add if a real restore workflow needs it.
+  DONE (`--xattrs`/`--acls` v0.14.3; `--selinux` v0.14.91).* Opt-in flags
+  store/restore PAX `SCHILY.xattr.*`, `SCHILY.acl.access`/`SCHILY.acl.default`,
+  and `RHT.security.selinux` records, GNU-tar interoperable in both directions
+  (xattr/ACL round-trips verified gzstd↔GNU tar including directory default
+  ACLs; SELinux record handling verified against crafted PAX archives).
+  `--selinux` reads/restores through the `security.selinux` xattr directly — no
+  libselinux dependency — and restore is best-effort like `--xattrs`. Caveat:
+  create-side emission with a REAL context is verifiable only on an
+  SELinux-labeled host; spot-check a full round-trip if one becomes available.
 - **Parallelize the walk** — *Status: DONE (v0.14.9) — this item was stale.*
   `build_layout` is a three-pass design: Pass A enumerates serially via readdir
   `d_type` (no leaf lstat), Pass B runs every `lstat`/`readlink` (+ `--sparse`
