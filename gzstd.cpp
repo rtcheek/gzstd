@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.89";
+static constexpr const char * GZSTD_VERSION = "0.14.90";
 //
 // Architecture overview:
 //
@@ -441,7 +441,11 @@ struct Options {
   // semantics — `-C /dir1 user-data` reads /dir1/user-data but stores the
   // member as `user-data`).  Parallel to tar_sources; "." = no -C.
   std::vector<std::string> tar_source_dest;
-  std::vector<std::string> tar_excludes; // --exclude PATTERN (fnmatch, repeatable)
+  std::vector<std::string> tar_excludes; // --exclude PATTERN (fnmatch, repeatable);
+                                         // --exclude-from/-X and --exclude-vcs append here too
+  bool tar_exclude_vcs = false;          // --exclude-vcs: append GNU tar's version-control list
+  bool tar_absolute_names = false;       // -P/--absolute-names: keep leading '/' on stored names (create)
+  bool tar_files_from = false;           // --files-from FILE was given (creation-only validation)
   bool tar_numeric_owner = false;        // --numeric-owner: omit uname/gname lookup
   bool tar_one_file_system = false;      // --one-file-system: don't cross mount points
   bool tar_xattrs = false;               // --xattrs: store/restore extended attributes (SCHILY.xattr.*)
@@ -779,6 +783,10 @@ static void print_help()
 "                      source root on create; binds the names that follow it\n"
 "  --write-threads N   parallel file writers for -d --tar (default: min(-T,16))\n"
 "  --exclude PATTERN   skip members matching PATTERN (glob; repeatable)\n"
+"  -X, --exclude-from FILE  read exclude patterns from FILE (one per line)\n"
+"  --exclude-vcs       skip version-control dirs/files (.git, .svn, .hg, ...)\n"
+"  --files-from FILE   read paths to archive from FILE (one per line)\n"
+"  -P, --absolute-names  keep leading '/' on stored member names (create)\n"
 "  --numeric-owner     numeric uid/gid only: no name lookup on create, no\n"
 "                      name-first chown on root extract (like GNU tar)\n"
 "  --one-file-system   do not descend into other mounted filesystems\n"
@@ -1135,6 +1143,37 @@ static void print_help_long()
 "     matches that component anywhere (--exclude .cache drops every\n"
 "     .cache).  '*' spans '/', and a directory match drops its whole\n"
 "     subtree.  Examples: --exclude=/proc --exclude='/home/*/.cache'.\n"
+"\n"
+"  -X, --exclude-from FILE\n"
+"     Read --exclude patterns from FILE, one per line ('-' reads them\n"
+"     from standard input).  Lines are literal patterns (no comment\n"
+"     syntax); empty lines are skipped.  Matching rules are exactly\n"
+"     --exclude's.\n"
+"\n"
+"  --exclude-vcs\n"
+"     Skip version-control bookkeeping files and directories, using GNU\n"
+"     tar's list: CVS/RCS/SCCS, .svn, .git (with .gitignore,\n"
+"     .gitattributes, .gitmodules), .cvsignore, GNU Arch, Bazaar,\n"
+"     Mercurial (.hg*), and darcs entries.  Each behaves like a\n"
+"     bare-name --exclude: it matches anywhere in the walk and a\n"
+"     directory match drops its whole subtree.\n"
+"\n"
+"  --files-from FILE\n"
+"     Read the files/directories to archive from FILE, one path per\n"
+"     line ('-' reads them from standard input; empty lines skipped).\n"
+"     Every line is a literal path — unlike GNU tar, a line starting\n"
+"     with '-' is never parsed as an option.  Paths honor the -C in\n"
+"     effect at the flag's position, exactly like positional sources.\n"
+"     GNU tar's short form -T is taken by threads (zstd compatibility),\n"
+"     so this option is long-form only.\n"
+"\n"
+"  -P, --absolute-names\n"
+"     On create, store member names exactly as typed, keeping a leading\n"
+"     '/' (by default it is stripped so archives extract relative, with\n"
+"     a one-time warning).  Extraction is unaffected by stored leading\n"
+"     '/' either way — gzstd always contains output inside the -C\n"
+"     directory — so -P applies to creation only and is an error on\n"
+"     -d/-t.\n"
 "\n"
 "  --numeric-owner\n"
 "     Use numeric uid/gid only, in both directions, like GNU tar.  On\n"
@@ -8279,11 +8318,12 @@ struct LayoutBuilder {
               [](const auto & a, const auto & b) { return a.first < b.first; });  // canonical order
     std::string base = member;
     if (!base.empty() && base.back() == '/') base.pop_back();
+    // -P with source "/": member is "/" (base collapses to ""), and children
+    // must keep the leading slash ("/proc", not "proc").
+    const std::string cpre = (member == "/") ? "/" : (base.empty() ? "" : base + "/");
     const std::string sep = (!fspath.empty() && fspath.back() == '/') ? "" : "/";
     for (const auto & k : kids)
-      enumerate(fspath + sep + k.first,
-                base.empty() ? k.first : base + "/" + k.first,
-                child_boundary, k.second);
+      enumerate(fspath + sep + k.first, cpre + k.first, child_boundary, k.second);
   }
 
   // --sparse: build a regular file's data-segment map from filesystem hole
@@ -8666,7 +8706,12 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
     // An empty member (source was "/") means no root entry — children are stored
     // directly as "proc/", "home/...", matching GNU tar archiving "/".
     while (src.size() > 1 && src.back() == '/') src.pop_back();
-    std::string member = strip_leading_slash(src, opt, b.warned_leading_slash);
+    // -P/--absolute-names keeps the name as typed (GNU tar -P); a source of
+    // "/" then yields a "/" member (root entry stored) instead of the
+    // stripped default's no-root-entry layout.
+    std::string member = opt.tar_absolute_names
+        ? src
+        : strip_leading_slash(src, opt, b.warned_leading_slash);
     // Positional -C (GNU tar -c semantics): read a RELATIVE source from the
     // -C directory in effect at its position, but store the name as typed
     // (`-C /dir1 user-data` reads /dir1/user-data, stores "user-data").
@@ -17509,6 +17554,44 @@ static std::string tar_chain_dest(const std::string & prev, const std::string & 
   return prev + "/" + next;
 }
 
+// --exclude-from / --files-from: read one item per line from FILE ("-" =
+// standard input, like GNU tar).  Lines are taken verbatim (no comment or
+// quote processing — unlike GNU tar, a line starting with '-' is a literal
+// path, never an option); empty lines are skipped.  An unreadable FILE is a
+// usage-class error (exit 2), matching GNU tar's fatal exit on a bad -T/-X.
+static std::vector<std::string> read_list_file(const std::string & flag,
+                                               const std::string & path) {
+  std::vector<std::string> lines;
+  std::ifstream file;
+  std::istream * in = &std::cin;
+  if (path != "-") {
+    file.open(path);
+    if (!file) die_usage(flag + ": cannot open '" + path + "': " + std::strerror(errno));
+    in = &file;
+  }
+  std::string line;
+  while (std::getline(*in, line)) {
+    if (!line.empty()) lines.push_back(line);
+  }
+  if (in->bad()) die_usage(flag + ": read error on '" + path + "'");
+  return lines;
+}
+
+// --exclude-vcs: GNU tar's version-control exclusion table (src/tar.c) —
+// matched with the same non-anchored bare-name semantics as --exclude, so a
+// directory entry (.git, .svn, …) drops its whole subtree anywhere in the walk.
+static const char * const VCS_EXCLUDES[] = {
+  "CVS", ".cvsignore",                                     // CVS
+  "RCS",                                                   // RCS
+  "SCCS",                                                  // SCCS
+  ".svn",                                                  // Subversion
+  ".git", ".gitignore", ".gitattributes", ".gitmodules",   // git
+  ".arch-ids", "{arch}", "=RELEASE-ID", "=meta-update", "=update",  // GNU Arch
+  ".bzr", ".bzrignore", ".bzrtags",                        // Bazaar
+  ".hg", ".hgignore", ".hgtags",                           // Mercurial
+  "_darcs",                                                // darcs
+};
+
 /* parse_args at end */
 static Options parse_args(int argc, char ** argv)
 {
@@ -17618,6 +17701,32 @@ static Options parse_args(int argc, char ** argv)
       if (v.empty()) die_usage("missing value for --exclude");
       opt.tar_excludes.push_back(v);
     }
+    // -X is GNU tar's short form.  Patterns are appended to the same list as
+    // --exclude, so semantics (anchoring, subtree drop) are identical.
+    else if (a == "--exclude-from" || a == "-X" || a.rfind("--exclude-from=", 0) == 0) {
+      std::string v;
+      if (a.rfind("--exclude-from=", 0) == 0) v = a.substr(15);
+      else { if (i + 1 >= argc) die_usage("missing value for " + a); v = argv[++i]; }
+      if (v.empty()) die_usage("missing value for --exclude-from");
+      for (std::string & pat : read_list_file("--exclude-from", v))
+        opt.tar_excludes.push_back(std::move(pat));
+    }
+    else if (a == "--exclude-vcs") opt.tar_exclude_vcs = true;
+    // GNU tar's short form is -T, which gzstd already uses for threads (zstd
+    // compatibility) — so this is long-only.  Each line is read relative to
+    // the -C in effect at THIS flag's position, exactly like a positional.
+    else if (a == "--files-from" || a.rfind("--files-from=", 0) == 0) {
+      std::string v;
+      if (a.rfind("--files-from=", 0) == 0) v = a.substr(13);
+      else { if (i + 1 >= argc) die_usage("missing value for --files-from"); v = argv[++i]; }
+      if (v.empty()) die_usage("missing value for --files-from");
+      if (!opt.tar_mode)
+        die_usage("--files-from must come after --tar (its paths are archive sources)");
+      opt.tar_files_from = true;
+      for (const std::string & p : read_list_file("--files-from", v))
+        push_positional(p);
+    }
+    else if (a == "-P" || a == "--absolute-names") opt.tar_absolute_names = true;
     else if (a == "--numeric-owner") opt.tar_numeric_owner = true;
     else if (a == "--one-file-system") opt.tar_one_file_system = true;
     else if (a == "--xattrs") opt.tar_xattrs = true;
@@ -17972,6 +18081,10 @@ static Options parse_args(int argc, char ** argv)
   // and deleting a named file when output goes to stdout matches gzip behavior)
   if (opt.to_stdout) opt.keep = true;
 
+  // --exclude-vcs expands once here (not per-flag) so repeating it is harmless.
+  if (opt.tar_exclude_vcs)
+    for (const char * pat : VCS_EXCLUDES) opt.tar_excludes.push_back(pat);
+
   if (opt.tar_mode) {
 #ifdef _WIN32
     die_usage("--tar is not supported on this platform");
@@ -17993,13 +18106,20 @@ static Options parse_args(int argc, char ** argv)
       // Extraction/test: the post-`--tar` positionals are the input archive(s);
       // the first becomes opt.input so the existing single-input plumbing works.
       if (!opt.tar_excludes.empty())
-        die_usage("--exclude applies to creation (--tar), not extraction/test");
+        die_usage("--exclude/--exclude-from/--exclude-vcs apply to creation (--tar), not extraction/test");
+      if (opt.tar_files_from)
+        die_usage("--files-from applies to creation (--tar), not extraction/test");
+      if (opt.tar_absolute_names)
+        die_usage("-P/--absolute-names applies to creation; extraction always "
+                  "strips leading '/' and contains paths inside -C");
       opt.input = opt.tar_sources[0];
     }
     opt.keep = true;  // never delete archive sources / input archives
   }
-  else if (!opt.tar_excludes.empty() || opt.tar_numeric_owner || opt.tar_one_file_system)
-    die_usage("--exclude/--numeric-owner/--one-file-system require --tar");
+  else if (!opt.tar_excludes.empty() || opt.tar_numeric_owner || opt.tar_one_file_system
+           || opt.tar_absolute_names)
+    die_usage("--exclude/--exclude-from/--exclude-vcs/--numeric-owner/"
+              "--one-file-system/-P require --tar");
 
   if (opt.sliding_window) {
     if (opt.mode != Mode::COMPRESS)

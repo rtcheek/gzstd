@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=290
-$EXTENSIVE && EXPECTED_TESTS=406
+EXPECTED_TESTS=300
+$EXTENSIVE && EXPECTED_TESTS=416
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3494,6 +3494,70 @@ else
   else
     pass "--exclude bare name (non-anchored)"
   fi
+
+  # 3c–3f. Input-ergonomics flags (v0.14.90): --exclude-from/-X, --exclude-vcs,
+  # --files-from, -P/--absolute-names.  Dedicated small tree so version-control
+  # names don't pollute TARSRC for the later metadata checks.
+  ETSRC="$TMPDIR/ergosrc"
+  rm -rf "$ETSRC"
+  mkdir -p "$ETSRC/.git" "$ETSRC/sub/.svn" "$ETSRC/keep"
+  echo g > "$ETSRC/.git/config"; echo s > "$ETSRC/sub/.svn/entries"
+  echo k > "$ETSRC/keep/a.txt"; echo t > "$ETSRC/skip.tmp"; echo l > "$ETSRC/b.log"
+
+  # 3c. --exclude-from FILE applies each line as an --exclude pattern; the
+  # -X short form accepts '-' (patterns on stdin).
+  printf '*.tmp\n' > "$TMPDIR/ex.lst"
+  "$GZSTD" --cpu-only -q -f -o "$ARC" --tar --exclude-from "$TMPDIR/ex.lst" "$ETSRC" 2>/dev/null
+  tar --zstd -tf "$ARC" 2>/dev/null > "$TMPDIR/tar.lst" || true
+  if grep -q 'skip\.tmp' "$TMPDIR/tar.lst"; then
+    fail "--exclude-from FILE" "pattern from file not applied"
+  else
+    pass "--exclude-from FILE"
+  fi
+  printf '*.log\n' | "$GZSTD" --cpu-only -q -f -o "$ARC" --tar -X - "$ETSRC" 2>/dev/null
+  tar --zstd -tf "$ARC" 2>/dev/null > "$TMPDIR/tar.lst" || true
+  if grep -q 'b\.log' "$TMPDIR/tar.lst"; then
+    fail "-X - (patterns from stdin)" "stdin pattern not applied"
+  else
+    pass "-X - (patterns from stdin)"
+  fi
+
+  # 3d. --exclude-vcs drops version-control bookkeeping anywhere in the walk.
+  "$GZSTD" --cpu-only -q -f -o "$ARC" --tar --exclude-vcs "$ETSRC" 2>/dev/null
+  tar --zstd -tf "$ARC" 2>/dev/null > "$TMPDIR/tar.lst" || true
+  if grep -qE '\.git|\.svn' "$TMPDIR/tar.lst"; then
+    fail "--exclude-vcs" ".git/.svn member still present"
+  else
+    pass "--exclude-vcs"
+  fi
+
+  # 3e. --files-from archives exactly the listed paths, honoring the -C in
+  # effect at the flag's position (paths in the list are relative to it).
+  printf 'keep\nb.log\n' > "$TMPDIR/ff.lst"
+  "$GZSTD" --cpu-only -q -f -o "$ARC" --tar -C "$ETSRC" --files-from "$TMPDIR/ff.lst" 2>/dev/null
+  tar --zstd -tf "$ARC" 2>/dev/null | sort > "$TMPDIR/tar.lst" || true
+  if [ "$(paste -sd, - < "$TMPDIR/tar.lst")" = "b.log,keep/,keep/a.txt" ]; then
+    pass "--files-from (with positional -C)"
+  else
+    fail "--files-from (with positional -C)" "member set: $(paste -sd, - < "$TMPDIR/tar.lst")"
+  fi
+
+  # 3f. -P/--absolute-names keeps the leading '/' on create (GNU tar -P
+  # parity) and is refused on extract (containment is unconditional).
+  "$GZSTD" --cpu-only -q -f -o "$ARC" --tar -P "$ETSRC/keep" 2>/dev/null
+  tar --zstd -tf "$ARC" -P 2>/dev/null > "$TMPDIR/tar.lst" || true
+  if grep -Fxq "$ETSRC/keep/" "$TMPDIR/tar.lst"; then
+    pass "-P keeps leading '/' on create"
+  else
+    fail "-P keeps leading '/' on create" "absolute member name missing"
+  fi
+  rc=0; "$GZSTD" -d --tar -P "$ARC" -C "$TMPDIR" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    pass "-P rejected on extract (exit 2)"
+  else
+    fail "-P rejected on extract (exit 2)" "(exit $rc)"
+  fi
+  rm -rf "$ETSRC"
 
   # Recreate the full archive for the remaining metadata checks.
   "$GZSTD" --cpu-only -q -f -o "$ARC" --tar "$TARSRC" 2>/dev/null

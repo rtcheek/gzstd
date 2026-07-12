@@ -794,6 +794,31 @@ throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
 | `--keep-going` — recover a damaged archive on decompress | — | Medium | DONE (v0.14.41–42) |
 | Delete compress CPU-rescue → clean GPU-fault abort | — | Medium | DONE (v0.14.43) |
 | Checkpoint/resume on fault (resume from last good frame vs. rebuild from zero) | — | Low | Not started |
+| `--tar` input ergonomics (`--exclude-from`/`-X`, `--files-from`, `-P`, `--exclude-vcs`) | tar | Low | DONE (v0.14.90) |
+| `--selinux` context storage (third leg of xattrs/ACLs) | tar | Low | Not started |
+| Parallelize the `--tar` layout walk | tar | Medium | DONE (v0.14.9) — the lstat storm (Pass B) runs parallel; serial Pass A enumerate is the residual, unmeasured |
+| Cache-bypass member reads on `--tar` create (FADV_DONTNEED vs O_DIRECT) | tar | Low | Investigate + measure |
+| O_DIRECT extraction writes for large files (Gen4+) | tar | Low | Investigate + measure |
+| Punch-hole + O_DIRECT on xfs/btrfs/zfs (validated ext4-class only) | 7.10 | Low | Open — needs loopback image or CI matrix |
+
+### Versioning plan (as of v0.14.89, 2026-07)
+
+- **0.14.x** closes out the `--tar` chapter. The hard core is done (parallel
+  create/extract including the parallel-lstat layout walk, member index +
+  instant `-l`, seek-based selective extraction, zstd seekable-format interop,
+  parallel-dispatch full extraction, sparse files, xattrs/ACLs, and the
+  v0.14.90 input-ergonomics flags). What remains before drawing the line: the
+  `--selinux` decision. The two O_DIRECT/cache probes are measure-first and
+  can land whenever the numbers justify them.
+- **0.15.0** opens the next big change — likely `--adapt` (AI/heuristic runtime
+  self-tuning; regime-signal instrumentation already built). The unblocked first
+  slice is independent of the full design: **the decompress default backend is
+  wrong on Gen4+** (picks cpu-only where GPU wins — see 1.11). Note Phase 2
+  (persistent auto-tuning), 1.3 (rate-matched dispatch), and 3.1/3.2 (pipe-aware
+  scheduling) are exactly what `--adapt` would subsume — decide there, not
+  piecemeal.
+- **v1.0** when the chosen 0.15 scope is polished and proven. Whether `--adapt`
+  is *in* v1.0 or lands after is deliberately still open.
 
 ### Data integrity & recovery (v0.14.39–43)
 **Status: DONE (verify, keep-going, rescue removal); checkpoint/resume NOT started**
@@ -980,15 +1005,28 @@ paths (one thread walks the stream in order). Open follow-ups:
   images). Remaining optional follow-up: auto-enable on create (extra cost: one
   cheap `SEEK_HOLE` probe per regular file) — declined for now, matching GNU tar's
   opt-in `--sparse`.
-- **More tar input ergonomics** — *Priority: Low | Complexity: Low.*
-  `--exclude-from=FILE`, `-T/--files-from=FILE`, `--absolute-names`/`-P`,
-  `--exclude-vcs`. Each is a small parse + walk tweak.
-- **xattrs / ACLs / SELinux** — *Priority: Low | Complexity: Medium.* Opt-in
-  `--xattrs`/`--acls`/`--selinux` stored as `SCHILY.*` pax extended records, to
-  match `tar --xattrs` for full-fidelity backups (needs `llistxattr`/`lgetxattr`).
-- **Parallelize the walk** — *Priority: Low | Complexity: Medium.* On a cold tree
-  with millions of files, the single-threaded layout walk (`lstat` sweep) can be
-  a secondary bottleneck; a parallel `stat` sweep would shorten it. Measure first.
+- **More tar input ergonomics** — *Priority: Low | Complexity: Low | Status:
+  DONE (v0.14.90).* `--exclude-from FILE`/`-X` (also `-` = stdin),
+  `--exclude-vcs` (GNU tar's version-control table, listing-parity verified),
+  `--files-from FILE` (long-only — GNU tar's `-T` short form is taken by
+  threads for zstd-CLI compat; lines are literal paths, never options), and
+  `-P`/`--absolute-names` (create-only; extraction always strips leading `/`
+  and stays contained, so `-P` on extract is refused, not ignored).
+- **xattrs / ACLs / SELinux** — *Priority: Low | Complexity: Medium | Status:
+  `--xattrs`/`--acls` DONE (v0.14.3); `--selinux` NOT started.* Opt-in
+  `--xattrs`/`--acls` store/restore PAX `SCHILY.xattr.*` and
+  `SCHILY.acl.access`/`SCHILY.acl.default` records, GNU-tar interoperable in both
+  directions (round-trips verified gzstd↔GNU tar, including directory default
+  ACLs). SELinux contexts (`--selinux`) remain unimplemented — only relevant on
+  SELinux-enforcing hosts; add if a real restore workflow needs it.
+- **Parallelize the walk** — *Status: DONE (v0.14.9) — this item was stale.*
+  `build_layout` is a three-pass design: Pass A enumerates serially via readdir
+  `d_type` (no leaf lstat), Pass B runs every `lstat`/`readlink` (+ `--sparse`
+  hole probe) in parallel — the cold-inode storm that measured ~10.7 s / ≈20% of
+  cold wall on a 1M-file tree — and Pass C finalizes serially so archives stay
+  byte-identical to the old walk. `-v [TIMING]` reports the `enum`/`stat` split;
+  if the serial Pass A enumerate ever shows up as the residual bottleneck on a
+  cold many-small-file tree, that is the remaining (unmeasured) lever.
 - **Cache-bypass / O_DIRECT member reads on `--tar` create** — *Priority: Low |
   Complexity: Medium | Status: investigate + MEASURE, two separate questions.*
   The `--tar` member reader (`assemble()`) opens every member `O_RDONLY` buffered

@@ -1,11 +1,22 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.89  
+**Covers:** v0.9.50 → v0.14.90  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.90 — tar input ergonomics: `--exclude-from`/`-X`, `--exclude-vcs`, `--files-from`, `-P`
+
+**Four GNU-tar creation conveniences, closing the ROADMAP's "more tar input ergonomics" item.** All are creation-only (like the existing `--exclude`) and rejected with a clear usage error on `-d`/`-t` or without `--tar`:
+
+- **`--exclude-from FILE` / `-X FILE`** reads exclude patterns from FILE, one per line (`-` = standard input). Patterns land in the same list as `--exclude`, so anchoring and subtree-drop semantics are identical by construction. Lines are literal (no comment syntax); empty lines skipped; an unreadable FILE is a usage error (exit 2), matching GNU tar's fatal exit.
+- **`--exclude-vcs`** appends GNU tar's version-control exclusion table (CVS/RCS/SCCS, .svn, .git + .gitignore/.gitattributes/.gitmodules, .cvsignore, GNU Arch, Bazaar, Mercurial, darcs). Each entry behaves like a bare-name `--exclude` (matches anywhere, directory match drops the subtree). Member listing verified identical to GNU `tar --exclude-vcs` on a tree with .git/.svn dirs. Expanded once after parsing, so repeating the flag doesn't duplicate patterns.
+- **`--files-from FILE`** reads the paths to archive, one per line (`-` = standard input), each honoring the `-C` in effect at the flag's position exactly like a positional source (it feeds the same `push_positional` path, so the `tar_source_dest` pairing can't desync). Deliberate divergence from GNU tar, documented in `--help`: every line is a literal path — a line starting with `-` is never parsed as an option (GNU tar's in-file `-C` handling is a known footgun). Long-form only: GNU tar's `-T` short form is taken by threads (zstd CLI compatibility).
+- **`-P` / `--absolute-names`** keeps the leading `/` on stored member names at creation (verified listing parity with GNU `tar -P`), including the `src == "/"` root case (children stored as `/proc`, not `proc`). Extraction always strips leading slashes and contains output inside `-C` (`norm_member_name` + the `openat`/`O_NOFOLLOW` walk), so `-P` on extract is refused rather than silently ignored — refusing loudly beats implying GNU tar's unconfined absolute-path restore, which gzstd deliberately does not offer.
+
+Suite: 300 normal / 416 extensive, all passing (6 new: exclude-from file + `-X -` stdin, exclude-vcs, files-from with positional `-C`, `-P` create parity, `-P` extract refusal). Extensive (zstd-CLI compat) run since this touches `parse_args`. `EXPECTED_TESTS` also absorbs 4 tests the two prior releases added without bumping it (2 parallel-extract audit tests in v0.14.87, 2 sparse-format tests in v0.14.89) — verified against the git diffs, so the drift note is silenced honestly, not papered over.
 
 ## v0.14.89 — `--sparse` create now emits PAX GNU.sparse.1.0 (with `--format` to select OLDGNU)
 
