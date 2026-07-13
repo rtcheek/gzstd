@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=304
-$EXTENSIVE && EXPECTED_TESTS=420
+EXPECTED_TESTS=307
+$EXTENSIVE && EXPECTED_TESTS=423
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3099,8 +3099,10 @@ rm -f "$TMPDIR/zc.out"
 ("$GZSTD" -H 2>&1 | grep -qi "examples") \
   && pass "-H shows full help" || fail "-H shows full help"
 
-# --single-thread maps to -T 1
-("$GZSTD" --single-thread --cpu-only -f "$TMPDIR/zc.bin" 2>&1 | tail -1 | grep -q "100.00%") \
+# --single-thread maps to -T 1.  Assert the summary line printed (in => out),
+# not an exact ratio: the seek table (v0.14.92) adds ~33 bytes, so a 1 MiB
+# incompressible input legitimately reports 100.01%, not 100.00%.
+("$GZSTD" --single-thread --cpu-only -f "$TMPDIR/zc.bin" 2>&1 | tail -1 | grep -q " => ") \
   && pass "--single-thread compresses" || fail "--single-thread compresses"
 
 # Silent no-ops (should not print any warning or error)
@@ -4712,6 +4714,28 @@ else
   else
     skip "-l frame count matches zstd -l" "zstd CLI unavailable"
   fi
+
+  # 2b. Plain compress appends the zstd seekable seek table (v0.14.92): the
+  # footer magic is the file's last bytes (feeds the O(1) -l fast path and
+  # foreign seekable readers), zstd itself still accepts the trailing
+  # skippable frame, and --no-index opts out.
+  PLZ="$TMPDIR/plainseek.zst"
+  "$GZSTD" --cpu-only -q -f -o "$PLZ" "$TMPDIR/large.bin" 2>/dev/null
+  ftr=$(tail -c 4 "$PLZ" | od -An -tx1 | tr -d ' \n')
+  if [[ "$ftr" == "b1ea928f" ]]; then
+    pass "plain compress appends seekable seek table"
+  else fail "plain seek table" "footer=$ftr"; fi
+  if ! command -v zstd >/dev/null 2>&1; then
+    skip "zstd -t accepts tabled plain output" "zstd CLI unavailable"
+  elif zstd -t -q "$PLZ" 2>/dev/null; then
+    pass "zstd -t accepts tabled plain output"
+  else fail "zstd -t on tabled output" "zstd rejected it"; fi
+  "$GZSTD" --cpu-only --no-index -q -f -o "$PLZ" "$TMPDIR/large.bin" 2>/dev/null
+  ftr=$(tail -c 4 "$PLZ" | od -An -tx1 | tr -d ' \n')
+  if [[ "$ftr" != "b1ea928f" ]]; then
+    pass "--no-index omits the plain seek table"
+  else fail "--no-index plain" "table still present"; fi
+  rm -f "$PLZ"
 
   # 3. -l --tar lists every entry (count matches what's in the tree) and shows
   #    the tar -tvf fields (perms column + a known member + the symlink target).

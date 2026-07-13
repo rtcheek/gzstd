@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.91";
+static constexpr const char * GZSTD_VERSION = "0.14.92";
 //
 // Architecture overview:
 //
@@ -5148,10 +5148,12 @@ static void writer_thread(FILE * out, ResultStore & results,
 
     if (batch.empty()) continue;
 
-    // --tar create with an index: record each data frame's compressed size in
-    // write order (== seq order) for the index's frame table (seek-based
-    // selective extraction).  Single writer thread — no locking needed.
-    if (opt.mode == Mode::COMPRESS && opt.tar_mode && opt.tar_index)
+    // Compress with an index/seek table: record each data frame's compressed
+    // size in write order (== seq order).  --tar feeds the member index's
+    // frame table (seek-based selective extraction); plain compress feeds the
+    // trailing zstd seekable seek table (v0.14.92 — O(1) -l + foreign random
+    // access on plain .zst output too).  Single writer thread — no locking.
+    if (opt.mode == Mode::COMPRESS && opt.tar_index)
       for (const FrameBuf & f : batch)
         g_tar_frame_csizes.push_back((uint64_t)f->size());
 
@@ -7530,6 +7532,16 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   chosen_mib = check_ram_budget(1, chosen_mib, opt);
   const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
 
+  // Plain-compress seek table (v0.14.92): pin the fixed-chunk geometry that
+  // the per-frame csize recording pairs with; append_tar_index derives and
+  // self-validates the frame count and stream size at finalize.  (--tar pins
+  // its own geometry in tarx::assemble(); this path never runs under --tar.)
+  if (opt.tar_index) {
+    g_tar_chunk_size = (uint64_t)chunk_bytes;
+    g_tar_nframes = g_tar_stream_size = 0;
+    g_tar_frame_csizes.clear();
+  }
+
   // Get total input size for progress percentage
   uint64_t total_in = known_input_size(opt, in);
 
@@ -7594,6 +7606,9 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
       g_perf->write_bytes_total.fetch_add(csz);
     }
     if (m) m->wrote_bytes.fetch_add(csz);
+    // Seek-table csize recording: this serial path writes inline (no
+    // writer_thread), so it records here — same order guarantee (one thread).
+    if (opt.tar_index) g_tar_frame_csizes.push_back((uint64_t)csz);
   }
 
   ZSTD_freeCCtx(cctx);
@@ -8693,32 +8708,38 @@ static std::string build_tar_index_body(const TarLayout & lay) {
 // format's u32 fields drops the seek table, never the index: -l stays
 // instant, seek-extraction falls back to the walk.
 static std::string finish_tar_index_frame() {
-  if (g_tar_index_raw.empty()) return std::string();
-  std::string raw = std::move(g_tar_index_raw);
-  g_tar_index_raw.clear();
-  size_t bound = ZSTD_compressBound(raw.size());
-  std::string comp(bound, '\0');
-  size_t cz = ZSTD_compress(&comp[0], bound, raw.data(), raw.size(), 9);
-  if (ZSTD_isError(cz)) return std::string();
-  comp.resize(cz);
-  uint64_t payload = comp.size() + 24;
-  if (payload > 0xFFFFFFFFull) return std::string();  // u32 frame-size field
   std::string frame;
-  frame.reserve(8 + payload);
-  idx_u32(frame, 0x184D2A50u);            // zstd skippable-frame magic
-  idx_u32(frame, (uint32_t)payload);
-  frame += comp;
-  idx_u64(frame, (uint64_t)raw.size());
-  idx_u64(frame, (uint64_t)comp.size());
-  frame.append(TAR_INDEX_MAGIC, 8);
+  // ---- GZIDX member index (--tar create only; empty body = plain compress
+  // or --no-index, which emit no index frame) ----
+  if (!g_tar_index_raw.empty()) {
+    std::string raw = std::move(g_tar_index_raw);
+    g_tar_index_raw.clear();
+    size_t bound = ZSTD_compressBound(raw.size());
+    std::string comp(bound, '\0');
+    size_t cz = ZSTD_compress(&comp[0], bound, raw.data(), raw.size(), 9);
+    if (ZSTD_isError(cz)) return std::string();
+    comp.resize(cz);
+    uint64_t payload = comp.size() + 24;
+    if (payload > 0xFFFFFFFFull) return std::string();  // u32 frame-size field
+    frame.reserve(8 + payload);
+    idx_u32(frame, 0x184D2A50u);            // zstd skippable-frame magic
+    idx_u32(frame, (uint32_t)payload);
+    frame += comp;
+    idx_u64(frame, (uint64_t)raw.size());
+    idx_u64(frame, (uint64_t)comp.size());
+    frame.append(TAR_INDEX_MAGIC, 8);
+  }
   // ---- zstd seekable-format seek table (see the format comment) ----
-  // Appended after the index so its footer is the file's last bytes, where
-  // seekable-format readers look.  Descriptor 0: no per-frame checksums
-  // (zstd frame checksums already cover the data when --check is used).
+  // Appended after the index (when there is one) so its footer is the file's
+  // last bytes, where seekable-format readers look.  Since v0.14.92 PLAIN
+  // compress pins the geometry too, so plain .zst output gets a table-only
+  // trailer: O(1) -l and foreign random access on any gzstd output.
+  // Descriptor 0: no per-frame checksums (zstd frame checksums already cover
+  // the data when --check is used).
   if (g_tar_chunk_size && g_tar_nframes && g_tar_stream_size
       && g_tar_frame_csizes.size() == g_tar_nframes) {
     const uint64_t gz_fsz = (uint64_t)frame.size();      // the GZIDX frame itself
-    const uint64_t n_ent  = g_tar_nframes + 1;           // + one dsize=0 entry for it
+    const uint64_t n_ent  = g_tar_nframes + (gz_fsz ? 1 : 0);  // + dsize=0 entry for it
     bool fits = g_tar_chunk_size <= 0xFFFFFFFFull
              && gz_fsz <= 0xFFFFFFFFull
              && n_ent * 8 + 9 <= 0xFFFFFFFFull;
@@ -8735,15 +8756,23 @@ static std::string finish_tar_index_frame() {
         idx_u32(frame, (uint32_t)g_tar_frame_csizes[(size_t)k]);
         idx_u32(frame, (uint32_t)d);
       }
-      // The GZIDX skippable frame, listed per spec as a decompressed-size-0
-      // entry so the table tiles the whole file for strict readers.
-      idx_u32(frame, (uint32_t)gz_fsz);
-      idx_u32(frame, 0);
+      // The GZIDX skippable frame (when present), listed per spec as a
+      // decompressed-size-0 entry so the table tiles the whole file for
+      // strict readers.
+      if (gz_fsz) {
+        idx_u32(frame, (uint32_t)gz_fsz);
+        idx_u32(frame, 0);
+      }
       idx_u32(frame, (uint32_t)n_ent);
       frame.push_back((char)0);                          // descriptor: no checksums
       idx_u32(frame, 0x8F92EAB1u);                       // seekable magic, at EOF
     }
   }
+  // Consume the geometry: main() calls append_tar_index on BOTH output paths
+  // (O_DIRECT fd, then buffered FILE*), and the second call must be a no-op.
+  // The index body used to be the latch; the table-only trailer needs its own.
+  g_tar_nframes = 0; g_tar_stream_size = 0;
+  g_tar_frame_csizes.clear();
   return frame;
 }
 
@@ -9047,6 +9076,34 @@ static uint64_t get_num(const char * f, size_t n) {
 static std::string get_str(const char * f, size_t n) {
   size_t len = 0; while (len < n && f[len] != '\0') ++len;
   return std::string(f, len);
+}
+
+// Walk a PAX 'x' extended header's records — "<len> <key>=<value>\n", where
+// <len> counts its own digits — calling fn(key, value) for each well-formed
+// record.  fn returning false aborts the walk and this returns false (a
+// caller-specific bail: the seek scanner refuses GNU-sparse archives this
+// way); malformed data (no space, non-positive length, no '=') skips or ends
+// the walk benignly, returning true.  The length arithmetic here — including
+// the "-2" dropping the separator space and trailing newline from the
+// record's self-counted length — is THE drift-prone piece of pax handling:
+// every pax consumer must go through this one helper (the same one-source
+// rule that hoisted match_tar_member in v0.14.82; the extract parser and the
+// seek scanner previously carried verbatim copies).  Values are binary-safe:
+// the length prefix, not any terminator, delimits them.
+template <typename Fn>
+static bool for_each_pax_record(const std::string & rec, Fn && fn) {
+  size_t p = 0;
+  while (p < rec.size()) {
+    size_t sp = rec.find(' ', p); if (sp == std::string::npos) break;
+    int rlen = atoi(rec.substr(p, sp - p).c_str()); if (rlen <= 0) break;
+    std::string kv = rec.substr(sp + 1, (size_t)rlen - (sp - p) - 2);  // drop trailing '\n'
+    size_t eq = kv.find('=');
+    if (eq != std::string::npos) {
+      if (!fn(kv.substr(0, eq), kv.substr(eq + 1))) return false;
+    }
+    p += (size_t)rlen;
+  }
+  return true;
 }
 
 // Extended metadata restored under --xattrs/--acls (from PAX SCHILY.* records).
@@ -10175,63 +10232,56 @@ private:
         std::vector<char> pd(size);
         if (!r.read_exact(pd.data(), size)) { fail("(archive)", "truncated pax header"); return; }
         r.skip((TAR_BLK - (size % TAR_BLK)) % TAR_BLK);
-        size_t p = 0; std::string rec(pd.data(), pd.size());
-        while (p < rec.size()) {
-          size_t sp = rec.find(' ', p); if (sp == std::string::npos) break;
-          int rlen = atoi(rec.substr(p, sp - p).c_str()); if (rlen <= 0) break;
-          std::string kv = rec.substr(sp + 1, (size_t)rlen - (sp - p) - 2);  // drop trailing '\n'
-          size_t eq = kv.find('=');
-          if (eq != std::string::npos) {
-            std::string key = kv.substr(0, eq), val = kv.substr(eq + 1);
-            if (key == "path") pax_path = val;
-            else if (key == "linkpath") pax_link = val;
-            else if (key == "size") { pax_size = strtoull(val.c_str(), nullptr, 10); pax_has_size = true; }
-            else if (key == "mtime") { pax_mtime = (int64_t)strtoll(val.c_str(), nullptr, 10); pax_has_mtime = true; }
-            else if (key == "uid")   { pax_uid = strtoull(val.c_str(), nullptr, 10); pax_has_uid = true; }
-            else if (key == "gid")   { pax_gid = strtoull(val.c_str(), nullptr, 10); pax_has_gid = true; }
-            else if (key == "uname") { pax_uname = val; pax_has_uname = true; }
-            else if (key == "gname") { pax_gname = val; pax_has_gname = true; }
-            // --xattrs/--acls: collect SCHILY.* records only when the matching flag
-            // is set, so without the flag they are parsed-and-ignored (GNU tar's behavior).
-            else if (opt_.tar_xattrs && key.rfind("SCHILY.xattr.", 0) == 0)
-              pax_ext.xattrs.emplace_back(key.substr(13), val);
-            else if (opt_.tar_acls && key == "SCHILY.acl.access")  pax_ext.acl_access  = val;
-            else if (opt_.tar_acls && key == "SCHILY.acl.default") pax_ext.acl_default = val;
-            // --selinux: the context restores through the security.selinux xattr
-            // (apply_ext's best-effort fsetxattr — EPERM/ENOTSUP reported at -v,
-            // never fatal, matching --xattrs).  Stored as text; the kernel wants
-            // it NUL-terminated, like libselinux's lsetfilecon writes it.
-            else if (opt_.tar_selinux && key == "RHT.security.selinux")
-              pax_ext.xattrs.emplace_back("security.selinux", val + '\0');
-            // PAX GNU sparse (0.0/0.1/1.0).  Capture the version, real size, real
-            // name, and the segment map (however this version encodes it).
-            else if (key.rfind("GNU.sparse.", 0) == 0) {
-              pax_gnu_sparse = true;
-              if      (key == "GNU.sparse.major") pax_sp_major = atoi(val.c_str());
-              else if (key == "GNU.sparse.minor") pax_sp_minor = atoi(val.c_str());
-              else if (key == "GNU.sparse.name")  pax_sp_name = val;
-              else if (key == "GNU.sparse.realsize" || key == "GNU.sparse.size") {
-                pax_sp_realsize = strtoull(val.c_str(), nullptr, 10); pax_has_sp_realsize = true;
-              }
-              else if (key == "GNU.sparse.map") {           // 0.1: "off,len,off,len,..."
-                pax_sp_map.clear(); const char * s = val.c_str(); char * end = nullptr;
-                while (*s) {
-                  uint64_t o = strtoull(s, &end, 10); if (end == s || *end != ',') break; s = end + 1;
-                  uint64_t l = strtoull(s, &end, 10); pax_sp_map.emplace_back(o, l);
-                  if (*end == ',') s = end + 1; else s = end;
-                }
-              }
-              else if (key == "GNU.sparse.offset") {        // 0.0: paired with numbytes
-                pax_sp_pending_off = strtoull(val.c_str(), nullptr, 10); pax_sp_have_off = true;
-              }
-              else if (key == "GNU.sparse.numbytes" && pax_sp_have_off) {
-                pax_sp_map.emplace_back(pax_sp_pending_off, strtoull(val.c_str(), nullptr, 10));
-                pax_sp_have_off = false;
+        std::string rec(pd.data(), pd.size());
+        for_each_pax_record(rec, [&](const std::string & key, const std::string & val) {
+          if (key == "path") pax_path = val;
+          else if (key == "linkpath") pax_link = val;
+          else if (key == "size") { pax_size = strtoull(val.c_str(), nullptr, 10); pax_has_size = true; }
+          else if (key == "mtime") { pax_mtime = (int64_t)strtoll(val.c_str(), nullptr, 10); pax_has_mtime = true; }
+          else if (key == "uid")   { pax_uid = strtoull(val.c_str(), nullptr, 10); pax_has_uid = true; }
+          else if (key == "gid")   { pax_gid = strtoull(val.c_str(), nullptr, 10); pax_has_gid = true; }
+          else if (key == "uname") { pax_uname = val; pax_has_uname = true; }
+          else if (key == "gname") { pax_gname = val; pax_has_gname = true; }
+          // --xattrs/--acls: collect SCHILY.* records only when the matching flag
+          // is set, so without the flag they are parsed-and-ignored (GNU tar's behavior).
+          else if (opt_.tar_xattrs && key.rfind("SCHILY.xattr.", 0) == 0)
+            pax_ext.xattrs.emplace_back(key.substr(13), val);
+          else if (opt_.tar_acls && key == "SCHILY.acl.access")  pax_ext.acl_access  = val;
+          else if (opt_.tar_acls && key == "SCHILY.acl.default") pax_ext.acl_default = val;
+          // --selinux: the context restores through the security.selinux xattr
+          // (apply_ext's best-effort fsetxattr — EPERM/ENOTSUP reported at -v,
+          // never fatal, matching --xattrs).  Stored as text; the kernel wants
+          // it NUL-terminated, like libselinux's lsetfilecon writes it.
+          else if (opt_.tar_selinux && key == "RHT.security.selinux")
+            pax_ext.xattrs.emplace_back("security.selinux", val + '\0');
+          // PAX GNU sparse (0.0/0.1/1.0).  Capture the version, real size, real
+          // name, and the segment map (however this version encodes it).
+          else if (key.rfind("GNU.sparse.", 0) == 0) {
+            pax_gnu_sparse = true;
+            if      (key == "GNU.sparse.major") pax_sp_major = atoi(val.c_str());
+            else if (key == "GNU.sparse.minor") pax_sp_minor = atoi(val.c_str());
+            else if (key == "GNU.sparse.name")  pax_sp_name = val;
+            else if (key == "GNU.sparse.realsize" || key == "GNU.sparse.size") {
+              pax_sp_realsize = strtoull(val.c_str(), nullptr, 10); pax_has_sp_realsize = true;
+            }
+            else if (key == "GNU.sparse.map") {           // 0.1: "off,len,off,len,..."
+              pax_sp_map.clear(); const char * s = val.c_str(); char * end = nullptr;
+              while (*s) {
+                uint64_t o = strtoull(s, &end, 10); if (end == s || *end != ',') break; s = end + 1;
+                uint64_t l = strtoull(s, &end, 10); pax_sp_map.emplace_back(o, l);
+                if (*end == ',') s = end + 1; else s = end;
               }
             }
+            else if (key == "GNU.sparse.offset") {        // 0.0: paired with numbytes
+              pax_sp_pending_off = strtoull(val.c_str(), nullptr, 10); pax_sp_have_off = true;
+            }
+            else if (key == "GNU.sparse.numbytes" && pax_sp_have_off) {
+              pax_sp_map.emplace_back(pax_sp_pending_off, strtoull(val.c_str(), nullptr, 10));
+              pax_sp_have_off = false;
+            }
           }
-          p += (size_t)rlen;
-        }
+          return true;   // the extract parser consumes every record; it never bails
+        });
         continue;
       }
 
@@ -10956,27 +11006,18 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
           pend_link.assign(pd.data(), size ? size - (pd[size - 1] == 0 ? 1 : 0) : 0);
         } else if (type == 'x') {
           std::string rec(pd.data(), pd.size());
-          size_t p2 = 0;
-          while (p2 < rec.size()) {
-            size_t sp = rec.find(' ', p2); if (sp == std::string::npos) break;
-            int rlen = atoi(rec.substr(p2, sp - p2).c_str()); if (rlen <= 0) break;
-            std::string kv = rec.substr(sp + 1, (size_t)rlen - (sp - p2) - 2);
-            size_t eq = kv.find('=');
-            if (eq != std::string::npos) {
-              std::string key = kv.substr(0, eq), val = kv.substr(eq + 1);
-              if (key == "path") pax_path = val;
-              else if (key == "size") { pax_size = strtoull(val.c_str(), nullptr, 10); pax_has_size = true; }
-              else if (key == "linkpath") pax_link = val;
-              else if (key == "mtime") { pax_mtime = (int64_t)strtoll(val.c_str(), nullptr, 10); pax_has_mtime = true; }
-              else if (key == "uid")   { pax_uid = strtoull(val.c_str(), nullptr, 10); pax_has_uid = true; }
-              else if (key == "gid")   { pax_gid = strtoull(val.c_str(), nullptr, 10); pax_has_gid = true; }
-              else if (key == "uname") { pax_uname = val; pax_has_uname = true; }
-              else if (key == "gname") { pax_gname = val; pax_has_gname = true; }
-              else if (key.rfind("GNU.sparse.", 0) == 0) { ok = false; break; }
-            }
-            p2 += (size_t)rlen;
-          }
-          if (!ok) break;
+          if (!for_each_pax_record(rec, [&](const std::string & key, const std::string & val) {
+                if (key.rfind("GNU.sparse.", 0) == 0) return false;  // not modeled: bail to the walk
+                if (key == "path") pax_path = val;
+                else if (key == "size") { pax_size = strtoull(val.c_str(), nullptr, 10); pax_has_size = true; }
+                else if (key == "linkpath") pax_link = val;
+                else if (key == "mtime") { pax_mtime = (int64_t)strtoll(val.c_str(), nullptr, 10); pax_has_mtime = true; }
+                else if (key == "uid")   { pax_uid = strtoull(val.c_str(), nullptr, 10); pax_has_uid = true; }
+                else if (key == "gid")   { pax_gid = strtoull(val.c_str(), nullptr, 10); pax_has_gid = true; }
+                else if (key == "uname") { pax_uname = val; pax_has_uname = true; }
+                else if (key == "gname") { pax_gname = val; pax_has_gname = true; }
+                return true;
+              })) { ok = false; break; }
         }
         cursor = data_end;
         continue;
@@ -11369,6 +11410,14 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // Pre-flight: check we won't OOM  may reduce chunk size
   chosen_mib = check_ram_budget(threads, chosen_mib, opt);
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
+
+  // Plain-compress seek table (v0.14.92): pin the chunk geometry for the
+  // writer thread's csize recording; see compress_cpu_stream for the story.
+  if (!opt.tar_mode && opt.tar_index) {
+    g_tar_chunk_size = (uint64_t)host_chunk;
+    g_tar_nframes = g_tar_stream_size = 0;
+    g_tar_frame_csizes.clear();
+  }
 
   // Warn if RAM budget forced chunk below ultra minimum
   {
@@ -13739,6 +13788,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   int cpu_threads_est = opt.cpu_only ? 0 : resolve_cpu_threads(opt.cpu_threads);
   chosen_mib = check_ram_budget(std::max(1, cpu_threads_est), chosen_mib, opt);
   const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
+
+  // Plain-compress seek table (v0.14.92): pin the chunk geometry for the
+  // writer thread's csize recording; see compress_cpu_stream for the story.
+  if (!opt.tar_mode && opt.tar_index) {
+    g_tar_chunk_size = (uint64_t)host_chunk;
+    g_tar_nframes = g_tar_stream_size = 0;
+    g_tar_frame_csizes.clear();
+  }
 
   // ---- Shared state for all workers ----
   TaskQueue   queue;
@@ -16342,6 +16399,44 @@ static bool seek_table_frame_summary(const unsigned char * base, size_t fsize,
 // frame + block headers WITHOUT decompressing (ZSTD_findFrameCompressedSize
 // skips block content) when there is no valid table.  Uncompressed is summed
 // from the seek table, or from frame-header content sizes on the walk.
+// Advisory intra-frame progress for the -l fallback walk: hop the frame's
+// block headers (RFC 8878: a 3-byte little-endian header per block, blocks
+// <= 128 KiB), ticking the meter with the compressed offset as it goes.
+// Purely a meter driver — the authoritative frame size still comes from
+// ZSTD_findFrameCompressedSize immediately after, which re-reads the same
+// header pages (now warm, so the double walk costs ~nothing) and is the only
+// thing the listing's counts depend on.  Any anomaly (reserved block type,
+// size past EOF) just stops the hop.  This is what gives a SINGLE-frame
+// archive (plain `zstd`/-T0 output) a byte counter: its whole walk is
+// otherwise one opaque library call that cannot tick.
+template <typename Tick>
+static void hop_frame_blocks(const unsigned char * base, size_t pos, size_t fsize,
+                             Tick && tick) {
+  size_t p = pos;
+  if (p + 4 > fsize) return;
+  uint32_t magic; std::memcpy(&magic, base + p, 4);
+  if (magic != 0xFD2FB528u) return;                    // not a zstd frame
+  p += 4;
+  if (p >= fsize) return;
+  const unsigned char fhd = base[p++];                 // Frame_Header_Descriptor
+  if (!(fhd & 0x20)) ++p;                              // window descriptor
+  static const size_t did_len[4] = {0, 1, 2, 4};
+  p += did_len[fhd & 3];                               // dictionary ID
+  const unsigned fcs = fhd >> 6;                       // content-size field code
+  p += fcs == 0 ? ((fhd & 0x20) ? 1u : 0u) : ((size_t)1 << fcs);  // 0/1, 2, 4, 8
+  while (p + 3 <= fsize) {
+    const uint32_t bh = (uint32_t)base[p]
+                      | ((uint32_t)base[p + 1] << 8)
+                      | ((uint32_t)base[p + 2] << 16);
+    const unsigned btype = (bh >> 1) & 3;
+    if (btype == 3) return;                            // reserved: stop hopping
+    p += 3 + (btype == 1 ? 1 : (size_t)(bh >> 3));     // RLE block stores one byte
+    if (p > fsize) return;
+    tick(p);
+    if (bh & 1) return;                                // last block
+  }
+}
+
 static int list_zst(const Options & opt)
 {
   std::printf("%7s %6s %12s %14s %7s %6s  %s\n",
@@ -16383,8 +16478,30 @@ static int list_zst(const Options & opt)
 #ifndef _WIN32
       if (mp != MAP_FAILED) ::madvise(mp, mp_len, MADV_SEQUENTIAL);
 #endif
+      // The walk streams the whole archive (disk-bound: ~41 s on a 54 GiB
+      // un-tabled file) with no output until the summary — show a stderr
+      // meter.  Same visibility rules as progress_loop: V_DEFAULT/V_VERBOSE
+      // only, TTY unless --progress forces, silenced by -q.  First update
+      // after 100 ms, so a fast small-file walk never flashes one.
+      const bool prog = opt.verbosity >= V_DEFAULT && opt.verbosity < V_DEBUG
+                        && (opt.force_progress || is_stderr_tty());
+      auto prog_last = std::chrono::steady_clock::now();
+      bool prog_shown = false;
+      auto prog_tick = [&](size_t at) {
+        auto now = std::chrono::steady_clock::now();
+        if (now - prog_last < std::chrono::milliseconds(100)) return;
+        prog_last = now;
+        char a[32], b[32];
+        human_bytes(double(at), a, sizeof a);
+        human_bytes(double(fsize), b, sizeof b);
+        std::fprintf(stderr, "\r[LIST] scanning frames  %3.0f%%  %s / %s ",
+                     fsize ? 100.0 * double(at) / double(fsize) : 0.0, a, b);
+        std::fflush(stderr);
+        prog_shown = true;
+      };
       size_t pos = 0;
       while (pos + 4 <= fsize) {
+        if (prog) prog_tick(pos);
         uint32_t magic; std::memcpy(&magic, base + pos, 4);
         if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {           // skippable frame
           if (pos + 8 > fsize) { ok = false; break; }
@@ -16394,6 +16511,10 @@ static int list_zst(const Options & opt)
           // archives carrying the --tar member index.
           pos += 8 + (size_t)ssz; ++nskips; ++nframes; continue;
         }
+        // Tick through the frame's blocks first (meter only; does the cold
+        // page reads WITH progress), then let ZSTD compute the authoritative
+        // size over the now-warm pages.
+        if (prog) hop_frame_blocks(base, pos, fsize, prog_tick);
         size_t csz = ZSTD_findFrameCompressedSize(base + pos, fsize - pos);
         if (ZSTD_isError(csz) || csz == 0) { ok = false; break; }
         unsigned long long ucs = ZSTD_getFrameContentSize(base + pos, fsize - pos);
@@ -16403,6 +16524,7 @@ static int list_zst(const Options & opt)
         if (pos + 4 < fsize && (base[pos + 4] & 0x04)) has_check = true;
         pos += csz; ++nframes;
       }
+      if (prog_shown) { std::fprintf(stderr, "\r%*s\r", 64, ""); std::fflush(stderr); }
     }
 #ifndef _WIN32
     if (mp != MAP_FAILED) ::munmap(mp, mp_len);
@@ -17228,6 +17350,23 @@ int main(int argc, char ** argv)
   // If DirectWriter is active (either explicit file or stdout-to-file O_DIRECT),
   // finalize it first regardless of to_stdout flag.
 #ifndef _WIN32
+  // Plain (non-tar) compress: derive + self-validate the seek-table geometry
+  // so append_tar_index below emits a table-only trailer (v0.14.92; the GZIDX
+  // body stays empty).  nframes comes from the writer's csize recording and
+  // the stream size from the meter; the total must land inside the last
+  // frame's range for the pinned fixed chunking, or the table is skipped
+  // entirely — an unexpected frame split or byte miscount can only cost the
+  // O(1) fast path, never emit a wrong table (readers ALSO validate tiling).
+  // Sliding-window (one streamed frame, no chunk geometry) never pins.
+  if (opt.mode == Mode::COMPRESS && !opt.tar_mode && opt.tar_index
+      && !opt.sliding_window && g_tar_chunk_size && !g_tar_frame_csizes.empty()) {
+    const uint64_t n = g_tar_frame_csizes.size();
+    const uint64_t total = meter.read_bytes.load();
+    if (total > (n - 1) * g_tar_chunk_size && total <= n * g_tar_chunk_size) {
+      g_tar_nframes = n;
+      g_tar_stream_size = total;
+    }
+  }
   if (g_direct_writer) {
     if (opt.mode == Mode::COMPRESS && opt.verbosity >= V_DEFAULT) {
       uint64_t out_bytes = meter.wrote_bytes.load();

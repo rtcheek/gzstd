@@ -797,7 +797,8 @@ throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
 | `--tar` input ergonomics (`--exclude-from`/`-X`, `--files-from`, `-P`, `--exclude-vcs`) | tar | Low | DONE (v0.14.90) |
 | `--selinux` context storage (third leg of xattrs/ACLs) | tar | Low | DONE (v0.14.91) — spot-check a labeled-host round-trip if one appears |
 | Restore xattrs/contexts on symlinks & special files (extract side) | tar | Low | Open — stored on create but silently not reapplied (apply_ext is fd-based; needs lsetxattr via the secure parent-fd walk); inherited gap affecting --xattrs AND --selinux, GNU tar restores these; documented in --help since v0.14.91 |
-| Hoist the pax record-grammar walk into a shared for_each_pax_record | — | Low | Open — the length arithmetic is duplicated between Extractor::parse and foreign_scan_entries (v0.14.91 review recommendation, match_tar_member-style one-source hoist); mechanical but rewires working dispatch — do it as its own change with a full suite run, not mid-release |
+| Hoist the pax record-grammar walk into a shared for_each_pax_record | — | Low | DONE (v0.14.92) — grammar walk single-sourced; per-caller key dispatch deliberately kept local (premature-abstraction verdict) |
+| Seek table on PLAIN (non-tar) compress output | — | Low | DONE (v0.14.92) — all compress paths emit it (cpu/gpu/hybrid/serial/stdin verified; --sliding-window and --no-index excluded); self-validating geometry so a wrong table can never be emitted |
 | Parallelize the `--tar` layout walk | tar | Medium | DONE (v0.14.9) — the lstat storm (Pass B) runs parallel; serial Pass A enumerate is the residual, unmeasured |
 | Cache-bypass member reads on `--tar` create (FADV_DONTNEED vs O_DIRECT) | tar | Low | Investigate + measure |
 | O_DIRECT extraction writes for large files (Gen4+) | tar | Low | Investigate + measure |
