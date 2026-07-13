@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""drop_cache [-c|--check] FILE [FILE...] — evict or inspect a file's page cache.
+
+Default: evict.  Diagnostic helper for honest cold-cache runs against a
+specific file (e.g. timing `gzstd -l` / `zstd -l` cold) without root and
+without the umount/remount dance — POSIX_FADV_DONTNEED is advisory but
+reliably drops CLEAN pages on Linux.  Each file is fdatasync'd first so
+freshly written pages become clean and can actually be dropped (same
+trick as `dd oflag=nocache`).
+
+-c / --check: report how much of each file is resident in the page cache
+(mincore(2) per-page residency — the same mechanism vmtouch/fincore use;
+querying is non-perturbing, no pages are faulted in).  Useful to confirm
+a benchmark really ran cold, or to see what a run left behind.
+
+Scope: per-file page cache only.  It does NOT touch the inode/dentry
+caches (a stat-heavy cold test still needs umount/remount) and does not
+affect other files.
+"""
+import ctypes
+import os
+import sys
+
+PAGE = os.sysconf("SC_PAGE_SIZE")
+WINDOW = 1 << 30                       # mincore in 1 GiB windows (256 KiB vector each)
+PROT_READ, MAP_SHARED = 1, 1
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_libc.mmap.restype = ctypes.c_void_p
+_libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                       ctypes.c_int, ctypes.c_int, ctypes.c_long]
+_libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+MAP_FAILED = ctypes.c_void_p(-1).value
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.2f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.2f} TiB"
+
+
+def resident_pages(fd: int, size: int) -> int:
+    """Count page-cache-resident pages via mincore, windowed to bound memory."""
+    res = 0
+    off = 0
+    while off < size:
+        length = min(WINDOW, size - off)
+        addr = _libc.mmap(None, length, PROT_READ, MAP_SHARED, fd, off)
+        if addr == MAP_FAILED:
+            raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+        try:
+            npages = (length + PAGE - 1) // PAGE
+            vec = ctypes.create_string_buffer(npages)
+            if _libc.mincore(addr, length, vec) != 0:
+                raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            res += sum(b & 1 for b in vec.raw)
+        finally:
+            _libc.munmap(addr, length)
+        off += length
+    return res
+
+
+def check(path: str) -> bool:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as e:
+        print(f"drop_cache: {path}: {e.strerror}", file=sys.stderr)
+        return False
+    try:
+        size = os.fstat(fd).st_size
+        if size == 0:
+            print(f"drop_cache: {path}: empty file")
+            return True
+        res = resident_pages(fd, size)
+        total = (size + PAGE - 1) // PAGE
+        pct = 100.0 * res / total
+        print(f"drop_cache: {path}: {human(res * PAGE)} of {human(size)} "
+              f"resident ({res}/{total} pages, {pct:.1f}%)")
+        return True
+    except OSError as e:
+        print(f"drop_cache: {path}: {e.strerror}", file=sys.stderr)
+        return False
+    finally:
+        os.close(fd)
+
+
+def drop(path: str) -> bool:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as e:
+        print(f"drop_cache: {path}: {e.strerror}", file=sys.stderr)
+        return False
+    try:
+        size = os.fstat(fd).st_size
+        try:
+            os.fdatasync(fd)          # dirty pages can't be dropped; clean them first
+        except OSError:
+            pass                      # e.g. special files; the fadvise below still tries
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)   # 0 len = whole file
+        print(f"drop_cache: {path}: dropped ({human(size)})")
+        return True
+    except OSError as e:
+        print(f"drop_cache: {path}: {e.strerror}", file=sys.stderr)
+        return False
+    finally:
+        os.close(fd)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    checking = False
+    if args and args[0] in ("-c", "--check"):
+        checking = True
+        args = args[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    ok = True
+    for path in args:
+        ok = (check(path) if checking else drop(path)) and ok
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=307
-$EXTENSIVE && EXPECTED_TESTS=423
+EXPECTED_TESTS=310
+$EXTENSIVE && EXPECTED_TESTS=426
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -762,6 +762,29 @@ LAST_TEST_MS=0
 expect_exit 0 "$GZSTD" -k -f --cpu-only "$TMPDIR/medium.txt" -o "$TMPDIR/exitcode.zst" \
   && pass "exit 0 on success" || fail "exit 0 on success"
 rm -f "$TMPDIR/exitcode.zst"
+
+# ENOSPC-class write failure (v0.14.94): RLIMIT_FSIZE with SIGXFSZ ignored
+# makes writes fail mid-stream exactly like a full disk.  BUFFERED output
+# used to report exit 0 over a truncated archive (glibc fwrite claims a full
+# count after a failed flush; ferror was never checked) and then delete the
+# no-keep input; --direct used to hang forever (the dead write worker
+# stopped releasing FrameThrottle permits).  Both must exit 3, keep the
+# input, and leave no output behind.
+head -c 8000000 /dev/urandom > "$TMPDIR/enospc.bin"
+rc=0; ( trap '' XFSZ; ulimit -f 500
+  timeout 30 "$GZSTD" --cpu-only --no-direct -q -f "$TMPDIR/enospc.bin" \
+    -o "$TMPDIR/enospc.zst" >/dev/null 2>&1 ) || rc=$?
+if [[ $rc -eq 3 && -f "$TMPDIR/enospc.bin" && ! -e "$TMPDIR/enospc.zst" ]]; then
+  pass "exit 3: buffered write failure (disk full)" "(input kept, no output)"
+else fail "buffered disk-full" "(exit $rc; input $([[ -f $TMPDIR/enospc.bin ]] && echo kept || echo LOST))"; fi
+rc=0; ( trap '' XFSZ; ulimit -f 500
+  timeout 30 "$GZSTD" --cpu-only --direct -q -f "$TMPDIR/enospc.bin" \
+    -o "$TMPDIR/enospc.zst" >/dev/null 2>&1 ) || rc=$?
+if [[ $rc -eq 3 ]]; then
+  pass "exit 3: O_DIRECT write failure (no hang)"
+elif [[ $rc -eq 124 ]]; then fail "O_DIRECT disk-full" "HUNG (timeout)"
+else fail "O_DIRECT disk-full" "(exit $rc)"; fi
+rm -f "$TMPDIR/enospc.bin" "$TMPDIR/enospc.zst"
 
 rc=0; "$GZSTD" --nonexistent-flag >/dev/null 2>&1 || rc=$?
 [[ $rc -eq 2 ]] && pass "exit 2 bad usage" "(EXIT_USAGE)" \
@@ -4735,6 +4758,24 @@ else
   if [[ "$ftr" != "b1ea928f" ]]; then
     pass "--no-index omits the plain seek table"
   else fail "--no-index plain" "table still present"; fi
+
+  # 2c. A warm (page-cache-resident) un-tabled file dispatches -l to the
+  # buffered pread walk (v0.14.93; mincore residency sample at -v) and its
+  # counts match zstd -l exactly.  Warm the file EXPLICITLY: on Gen4+ boxes
+  # compress auto-enables --direct, so a fresh write bypasses the page cache
+  # entirely and the file starts cold (the dispatch then correctly picks the
+  # mmap walk — right behavior, wrong fixture for this test).
+  if ! command -v zstd >/dev/null 2>&1; then
+    skip "warm -l buffered-walk parity with zstd -l" "zstd CLI unavailable"
+  else
+    cat "$PLZ" >/dev/null
+    route=$("$GZSTD" -l -v "$PLZ" 2>&1 >/dev/null | grep -c "buffered walk" || true)
+    gzc=$("$GZSTD" -l "$PLZ" 2>/dev/null | awk 'NR==2{print $1","$2}')
+    zsc=$(zstd -l "$PLZ" 2>/dev/null | awk 'NR==2{print $1","$2}')
+    if [[ "$route" == "1" && -n "$gzc" && "$gzc" == "$zsc" ]]; then
+      pass "warm -l buffered-walk parity with zstd -l" "($gzc)"
+    else fail "warm -l buffered walk" "route=$route gz=$gzc zs=$zsc"; fi
+  fi
   rm -f "$PLZ"
 
   # 3. -l --tar lists every entry (count matches what's in the tree) and shows

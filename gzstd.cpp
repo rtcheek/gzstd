@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.92";
+static constexpr const char * GZSTD_VERSION = "0.14.94";
 //
 // Architecture overview:
 //
@@ -735,8 +735,18 @@ static void vlog(int min_level, const Options & opt, const std::string & msg)
   if (has_nl) std::cerr << '\n';
 }
 
+static std::atomic<bool> g_dying{false};
+
 static void die(const std::string & msg, int code = EXIT_ERROR)
 {
+  // First dier wins; any concurrent dier parks.  Two threads calling
+  // std::exit() at once race the runtime's exit handlers — observed as a
+  // deterministic SIGSEGV (and interleaved error lines) when the async write
+  // worker and the writer thread both died on the same disk-full (v0.14.94).
+  // A doomed thread sleeping costs nothing; the process is terminating.
+  // (The no-fixed-waits rule governs scheduling paths, not the death path.)
+  if (g_dying.exchange(true, std::memory_order_acq_rel))
+    for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
   if (g_verbosity >= V_ERROR) {
     std::cerr << "gzstd: ERROR: " << msg << "\n";
     if (g_tmp_active && g_tmp_path[0] != '\0')
@@ -2213,6 +2223,14 @@ static size_t robust_fwrite(const void * ptr, size_t size, FILE * f)
       return size - remaining;
     }
   }
+  // glibc fwrite can report a FULL count while only buffering the bytes after
+  // a failed flush — the failure is sticky in ferror(), not in the return
+  // value.  Without this check, a full disk (ENOSPC/EFBIG) let every "write"
+  // report success while the file stopped growing: 8655 kernel-rejected
+  // writes were observed producing a truncated archive and exit 0 (v0.14.94).
+  // ferror is sticky by design — any earlier write failure on this stream
+  // means the output is already corrupt, so failing fast here is correct.
+  if (std::ferror(f)) return 0;
   return size;
 }
 
@@ -4912,16 +4930,26 @@ private:
         bool wrote = dense ? write_whole(buf->data(), buf->size())
                            : write_sparse(buf->data(), buf->size(), is_last);
         if (!wrote) {
-          // Clear writing_ and surface the error before returning, so a
-          // flush() blocked on !writing_ wakes and the post-flush had_error()
-          // check sees the failure (final-batch errors used to be lost here).
+          // Clear writing_ and surface the error, so a flush() blocked on
+          // !writing_ wakes and the post-flush had_error() check sees the
+          // failure (final-batch errors used to be lost here).
           {
             std::lock_guard<std::mutex> lk(m_);
             writing_ = false;
             error_ = true;
           }
           cv_consumer_.notify_one();
-          return;
+          // Dying HERE (not just flagging and returning) is the deadlock fix
+          // (v0.14.94): this worker holds the only hand that releases
+          // FrameThrottle permits, so a quiet return starved the compress
+          // workers of permits, the writer thread never collected another
+          // batch, submit() was never called again — and the had_error()
+          // checks there were unreachable.  ENOSPC mid-backup hung forever
+          // (observed in the field on 0.14.89).  This worker is the sole
+          // writer of the output stream, so it holds no stdio lock another
+          // thread needs during exit.  The flag + notify above still serve
+          // the flush()/destructor paths.
+          die_io("write failed (disk full?)");
         }
         if (g_perf || meter_) {
           const uint64_t w_dt = now_ns() - w_t0;
@@ -16437,6 +16465,107 @@ static void hop_frame_blocks(const unsigned char * base, size_t pos, size_t fsiz
   }
 }
 
+#ifndef _WIN32
+// Sampled page-cache residency of a mapped region: mincore(2) over up to 64
+// evenly spaced 32-page windows — microseconds even on a 65 GiB map, and
+// non-perturbing (querying never faults pages in).  Drives the fallback
+// walk's warm/cold dispatch below.
+static double residency_fraction(const void * addr, size_t len) {
+  const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  const size_t npages = (len + page - 1) / page;
+  if (!npages) return 1.0;
+  const size_t win = 32;
+  const size_t nwin = std::min<size_t>(64, (npages + win - 1) / win);
+  size_t sampled = 0, res = 0;
+  unsigned char vec[32];
+  for (size_t w = 0; w < nwin; ++w) {
+    size_t first = nwin == 1 ? 0 : (npages - 1) * w / (nwin - 1);  // spread incl. tail
+    if (first + win > npages) first = npages - std::min(npages, win);
+    size_t n = std::min(win, npages - first);
+    if (::mincore((char *)addr + first * page, n * page, vec) != 0) return 0.0;
+    for (size_t i = 0; i < n; ++i) res += (size_t)(vec[i] & 1);
+    sampled += n;
+  }
+  return sampled ? double(res) / double(sampled) : 0.0;
+}
+
+// Buffered (pread) frame walk for a PAGE-CACHE-RESIDENT file: computes the
+// same summary fields as the mmap walk via read() lookups instead of page
+// faults — measured 3× faster warm (zstd -l's approach; 560k mmap faults on
+// a 65 GiB single frame were the entire gap).  Unlike hop_frame_blocks this
+// walk IS authoritative when it returns true, so it validates strictly and
+// returns false on ANYTHING it does not fully model (legacy v0.x frames,
+// reserved block types, any size running past EOF, short reads) — the caller
+// then falls back to the always-correct mmap+library walk with the counters
+// reset.  A wrong summary can never be printed; a bail only costs speed.
+template <typename Tick>
+static bool buffered_frame_walk(int fd, size_t fsize,
+                                uint64_t & nframes, uint64_t & nskips,
+                                uint64_t & uncomp, bool & uncomp_known,
+                                bool & has_check, bool prog, Tick && tick) {
+  auto pr = [&](void * dst, size_t len, size_t off) -> bool {
+    if (len > fsize || off > fsize - len) return false;
+    char * p = (char *)dst;
+    while (len) {
+      ssize_t r = ::pread(fd, p, len, (off_t)off);
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) return false;
+      p += r; off += (size_t)r; len -= (size_t)r;
+    }
+    return true;
+  };
+  size_t pos = 0;
+  unsigned char h[8];
+  while (pos + 4 <= fsize) {
+    if (prog) tick(pos);
+    uint32_t magic;
+    if (!pr(&magic, 4, pos)) return false;
+    if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {          // skippable frame
+      uint32_t ssz;
+      if (!pr(&ssz, 4, pos + 4)) return false;
+      if (8 + (uint64_t)ssz > fsize - pos) return false;
+      pos += 8 + (size_t)ssz; ++nskips; ++nframes; continue;
+    }
+    if (magic != 0xFD2FB528u) return false;              // legacy/garbage: bail
+    // Frame header: magic(4) FHD(1) [window(1)] [dictID 0/1/2/4] [FCS 0/1/2/4/8]
+    if (!pr(h, 1, pos + 4)) return false;
+    const unsigned char fhd = h[0];
+    const bool single_seg = (fhd & 0x20) != 0;
+    static const size_t did_len[4] = {0, 1, 2, 4};
+    const unsigned code = fhd >> 6;
+    const size_t fcs_len = code == 0 ? (single_seg ? 1 : 0) : (size_t)1 << code;
+    const size_t hlen = 4 + 1 + (single_seg ? 0 : 1) + did_len[fhd & 3] + fcs_len;
+    if (fcs_len) {
+      if (!pr(h, fcs_len, pos + hlen - fcs_len)) return false;
+      uint64_t v = 0;
+      for (size_t i = 0; i < fcs_len; ++i) v |= (uint64_t)h[i] << (8 * i);
+      if (fcs_len == 2) v += 256;                        // RFC 8878 2-byte offset
+      uncomp += v;
+    } else uncomp_known = false;
+    if (fhd & 0x04) has_check = true;
+    // Blocks: one 3-byte little-endian header per block (<= 128 KiB apart) —
+    // each pread is a page-cache lookup, never a fault.
+    size_t p2 = pos + hlen;
+    if (p2 > fsize) return false;
+    for (;;) {
+      unsigned char bh[3];
+      if (!pr(bh, 3, p2)) return false;
+      const uint32_t b = (uint32_t)bh[0] | ((uint32_t)bh[1] << 8)
+                       | ((uint32_t)bh[2] << 16);
+      const unsigned btype = (b >> 1) & 3;
+      if (btype == 3) return false;                      // reserved block type
+      p2 += 3 + (btype == 1 ? 1 : (size_t)(b >> 3));     // RLE stores one byte
+      if (p2 > fsize) return false;
+      if (prog) tick(p2);
+      if (b & 1) break;                                  // last block
+    }
+    if (fhd & 0x04) { p2 += 4; if (p2 > fsize) return false; }  // XXH64 tail
+    pos = p2; ++nframes;
+  }
+  return fsize - pos < 4;   // same trailing-slack tolerance as the mmap walk
+}
+#endif  // !_WIN32
+
 static int list_zst(const Options & opt)
 {
   std::printf("%7s %6s %12s %14s %7s %6s  %s\n",
@@ -16447,6 +16576,7 @@ static int list_zst(const Options & opt)
     // else read it all (stdin / mmap failure).
     const unsigned char * base = nullptr; size_t fsize = 0;
     void * mp = MAP_FAILED; size_t mp_len = 0; std::vector<char> buf;
+    int wfd = -1;   // kept open for the buffered (pread) walk dispatch
 #ifndef _WIN32
     if (fn != "-") {
       int fd = ::open(fn.c_str(), O_RDONLY);
@@ -16457,7 +16587,7 @@ static int list_zst(const Options & opt)
         mp = ::mmap(nullptr, mp_len, PROT_READ, MAP_PRIVATE, fd, 0);
         if (mp != MAP_FAILED) { base = (const unsigned char *)mp; fsize = mp_len; }
       }
-      ::close(fd);
+      if (mp != MAP_FAILED) wfd = fd; else ::close(fd);
     }
 #endif
     if (!base) {  // stdin or non-mmappable: read it all
@@ -16472,12 +16602,6 @@ static int list_zst(const Options & opt)
     bool uncomp_known = true, has_check = false, ok = true;
     // O(1) fast path: read the summary straight from the seekable seek table.
     if (!seek_table_frame_summary(base, fsize, nframes, nskips, uncomp, uncomp_known, has_check)) {
-      // No usable table → walk every frame header (see the block below).  Only
-      // now hint sequential access: the walk streams the header bytes forward,
-      // whereas the fast path only touches the tail + one header.
-#ifndef _WIN32
-      if (mp != MAP_FAILED) ::madvise(mp, mp_len, MADV_SEQUENTIAL);
-#endif
       // The walk streams the whole archive (disk-bound: ~41 s on a 54 GiB
       // un-tabled file) with no output until the summary — show a stderr
       // meter.  Same visibility rules as progress_loop: V_DEFAULT/V_VERBOSE
@@ -16499,7 +16623,40 @@ static int list_zst(const Options & opt)
         std::fflush(stderr);
         prog_shown = true;
       };
-      size_t pos = 0;
+      bool walked = false;
+#ifndef _WIN32
+      // Warm/cold walk dispatch (measured on a 65 GiB single frame): warm,
+      // a buffered pread walk beats the mmap walk 3× (1.1 s vs 3.0 s — the
+      // gap is 560k page faults, one per touched header page); cold, the
+      // mmap walk + MADV_SEQUENTIAL wins (38.7 s vs 42.4 s — streaming at
+      // bandwidth beats queue-depth-1 strided reads).  So sample residency
+      // (mincore, non-perturbing) and pick.  The threshold is lenient
+      // because the penalty is asymmetric: a wrong warm guess costs ~10%
+      // cold, a right one wins 3× warm.  Any pread-walk bail resets the
+      // counters and falls through to the mmap walk, which stays the
+      // always-correct authority.
+      if (mp != MAP_FAILED && wfd >= 0) {
+        const double resid = residency_fraction(mp, mp_len);
+        if (resid >= 0.95) {
+          walked = buffered_frame_walk(wfd, fsize, nframes, nskips, uncomp,
+                                       uncomp_known, has_check, prog, prog_tick);
+          if (walked) {
+            vlog(V_VERBOSE, opt, "[LIST] page-cache-resident: buffered walk (no mmap faults)\n");
+          } else {
+            nframes = nskips = uncomp = 0; uncomp_known = true; has_check = false;
+            vlog(V_VERBOSE, opt, "[LIST] buffered walk bailed; using the mmap walk\n");
+          }
+        } else if (opt.verbosity >= V_VERBOSE) {
+          char rb[32]; std::snprintf(rb, sizeof rb, "%.0f%%", resid * 100.0);
+          vlog(V_VERBOSE, opt, std::string("[LIST] residency ~") + rb
+               + ": sequential mmap walk\n");
+        }
+      }
+      // Only the mmap walk wants aggressive readahead — the fast path above
+      // touches just the tail, and the buffered walk reads sparse headers.
+      if (!walked && mp != MAP_FAILED) ::madvise(mp, mp_len, MADV_SEQUENTIAL);
+#endif
+      size_t pos = walked ? fsize : 0;
       while (pos + 4 <= fsize) {
         if (prog) prog_tick(pos);
         uint32_t magic; std::memcpy(&magic, base + pos, 4);
@@ -16528,7 +16685,9 @@ static int list_zst(const Options & opt)
     }
 #ifndef _WIN32
     if (mp != MAP_FAILED) ::munmap(mp, mp_len);
+    if (wfd >= 0) ::close(wfd);
 #endif
+    (void)wfd;
 
     char comp_h[32], unc_h[32];
     human_bytes(double(fsize), comp_h, sizeof comp_h);
@@ -17409,7 +17568,18 @@ int main(int argc, char ** argv)
       if (opt.sync_output) {
         fsync_file(out);
       }
-      std::fclose(out);
+      // fclose flushes the final stdio buffer, and ferror carries any
+      // earlier sticky write failure.  Either failing means the output is
+      // incomplete — die (exit 3) BEFORE the atomic rename installs it and
+      // BEFORE the no-keep unlink deletes the input.  Ignoring this let a
+      // full disk rename a truncated archive over the target and then
+      // delete the source (v0.14.94).
+      const bool werr = std::ferror(out) != 0;
+      if (std::fclose(out) != 0 || werr) {
+        out = nullptr;
+        die_io("output write failed (disk full?)");
+      }
+      out = nullptr;
     }
     if (in) std::fclose(in);  // null in --tar mode (no input FILE*)
     if (use_atomic) {
@@ -17434,8 +17604,12 @@ int main(int argc, char ** argv)
       fs::remove(opt.input, ec_rm);
     }
   } else {
-    // Flush stdout to ensure all data reaches the downstream pipe
-    std::fflush(stdout);
+    // Flush stdout to ensure all data reaches the downstream pipe — and die
+    // if the flush fails or an earlier stdout write failed (same sticky-
+    // ferror story as the file path; a truncated stream on stdout must not
+    // exit 0).
+    if (std::fflush(stdout) != 0 || std::ferror(stdout))
+      die_io("stdout write failed (disk full / closed pipe?)");
     if (in) std::fclose(in);  // null in --tar mode (no input FILE*)
   }
 

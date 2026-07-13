@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.92  
+**Covers:** v0.9.50 → v0.14.94  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.94 — disk-full: fix the O_DIRECT hang AND the buffered silent-success data loss
+
+**Field report (0.14.89, a workstation running backups): gzstd hangs when the output partition fills.** Reproduced unprivileged with `RLIMIT_FSIZE` + `SIGXFSZ` ignored (writes fail mid-stream exactly like ENOSPC) — and the investigation found TWO bugs, the second one worse than the reported hang:
+
+**1. The `--direct` hang (what the field hit — Gen4+ boxes auto-enable `--direct`).** On a write failure, `AsyncWritePool::worker_fn` set `error_` and quietly returned — but that worker holds the only hand that releases `FrameThrottle` permits. The compress workers starved on permits, the writer thread never collected another batch, `submit()` was never called again, and the `had_error()` checks there were unreachable: the process hung forever (same permit-starvation family as the v0.14.58 GPU deadlock). Fix: the worker now dies (`die_io`, exit 3) at the failure point — it is the sole writer of the output stream, so it holds no stdio lock another thread needs during exit; the error flag + notify stay for the `flush()`/destructor paths.
+
+**2. Buffered output reported SUCCESS over a truncated archive — and then deleted the input.** With buffered (non-`--direct`) output, strace showed **8655 kernel-rejected writes and exit 0**: glibc's `fwrite` can report a full count while merely buffering the bytes after a failed flush — the failure is sticky in `ferror()`, which nothing checked; `fclose()`'s return (the final flush) was ignored too. The truncated tmp was then atomically renamed over the target, and — for plain no-`-k` compress — the INPUT was unlinked. A full disk could destroy both the backup target and the source. `--verify` cannot catch it (frames are verified from RAM before the write). Fixes: `robust_fwrite` now fails on sticky `ferror` (any earlier write failure means the stream is already corrupt); main's finalize checks `ferror` + `fclose` and dies (exit 3) BEFORE the rename and BEFORE the no-keep unlink; the stdout path checks its final `fflush`/`ferror` the same way. Verified across buffered/`--direct`/`--verify` tar creates and plain no-keep compress: all exit 3 with a clear error, the truncated tmp is cleaned up, the input survives.
+
+**3. And the fix's own regression, caught by the new suite test at a tighter limit: concurrent `die()` calls segfaulted.** With the failure landing mid-submit, the write worker's new `die_io` raced the writer thread's (now-reachable) `had_error()` `die_io` — two threads in `std::exit()` at once race the runtime's exit handlers (deterministic SIGSEGV, interleaved error lines). `die()` now has a first-dier-wins latch; a concurrent dier parks in a sleep loop (the no-fixed-waits rule governs scheduling paths, not the death path — a doomed thread sleeping costs nothing). 5/5 clean exit-3 runs at the limit that previously segfaulted 3/3.
+
+Suite: 310 normal / 426 extensive (2 new: buffered disk-full → exit 3 + input kept + no output; `--direct` disk-full → exit 3, no hang). If a 0.14.89–0.14.93 process is currently hung on a full partition: it is safe to kill; check for a leftover `*.tmp` output and free space before rerunning.
+
+## v0.14.93 — warm/cold-adaptive `-l` fallback walk (3× faster on cached files, zstd-class)
+
+**The `-l` fallback frame walk now picks its I/O strategy by sampling page-cache residency.** Measured on a 65 GiB single-frame archive (Gen4+ server): warm, zstd's `read()`-based walk beat our mmap walk 3× (1.1 s vs 3.0 s) because every touched header page cost a fault — 560k of them; cold, our `MADV_SEQUENTIAL` stream beat zstd's queue-depth-1 strided reads (38.7 s vs 42.4 s). Neither strategy dominates, so `list_zst` now runs both, choosing per file: `residency_fraction` samples up to 64 spread `mincore(2)` windows over the existing mapping (microseconds, non-perturbing — querying never faults pages in); ≥95% resident routes to a new **buffered pread walk** (`buffered_frame_walk` — page-cache lookups instead of faults), anything colder keeps the mmap+`MADV_SEQUENTIAL` walk, which also stops hinting when the buffered walk runs. The threshold is lenient by design: the penalty is asymmetric (a wrong warm guess costs ~10% cold; a right one wins 3× warm). Result: warm 65 GiB single frame **3.0 s → 1.29 s** (faults 560k → 4.4k), zstd-class; cold unchanged (~40 s, correctly dispatched at ~2% residency); `-v` logs the route either way.
+
+**The buffered walk is authoritative when it succeeds, so it validates strictly and can never print a wrong summary.** It parses RFC 8878 frame headers itself (including the FCS 2-byte +256 offset and the XXH64 tail) and bails — returning the reset counters to the always-correct mmap+library walk — on anything it doesn't fully model: legacy v0.x frames, reserved block types, any size running past EOF, short reads. Verified: counts byte-identical to the mmap walk and `zstd -l` across multi-frame, 3M-tiny-frame (sizeless FCS → `?`), and single-frame fixtures; a truncated file bails to the mmap walk's corrupt verdict (exit 4); the meter ticks through both walks. The remaining cold-side idea (batched `posix_fadvise(WILLNEED)` prefetch to beat the sequential stream too) stays on the ROADMAP.
+
+Also: `scripts/drop_cache [-c] FILE...` — the diagnostic these measurements used: evicts a file's pages via `POSIX_FADV_DONTNEED` (fdatasync first, so fresh writes drop too) or, with `-c`, reports residency via the same `mincore` mechanism. Unprivileged, per-file, no umount dance (inode/dentry-cold tests still need one).
+
+Suite: 308 normal / 424 extensive (1 new: warm un-tabled file routes to the buffered walk and matches `zstd -l` counts).
 
 ## v0.14.92 — one pax record-grammar walk: `for_each_pax_record` (the v0.14.91 review's deferred hoist)
 
