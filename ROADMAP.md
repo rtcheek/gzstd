@@ -313,7 +313,7 @@ and a regression on Gen<4 (which stay buffered). It applies to both modes:
 - **Decompress** is ~95% write-bound on disk — Gen4 compute ceiling ~14 GiB/s
   cpu-only (`-c >/dev/null`) vs ~0.68 GiB/s buffered (see Phase 7). O_DIRECT
   takes mixed `-d` ~0.68 → ~2.0 GiB/s (up to +130–230%).
-- **Compress** benefits the same way (knuth `--direct` data): cpu-only
+- **Compress** benefits the same way (Gen4 server `--direct` data): cpu-only
   low +103% / mixed +50% / medium +15%, gpu-only +71% / +29% / +12%, hybrid
   +70% / +24% / +21%; tiny-output (high, zeros) neutral. No Gen4 regression.
 
@@ -688,7 +688,8 @@ compressibility (incompressible ~4× compressible).  Added a parallel byte cap t
 reader blocks on `frames>=floor OR bytes>=budget`, budget = `floor*8 MiB`, with a
 `!q_.empty()` deadlock guard and mmap-view-aware accounting (`data.size()`).
 Measured gpu-only decompress RSS −8…−11% (145–225 MiB on 4 GiB), throughput
-flat.  Tunable via `--throttle-factor`; flagged for knuth validation (reduced
+flat.  Tunable via `--throttle-factor`; flagged for validation on the Gen4
+8×H100 server (reduced
 big-frame buffering on a faster reader/consumer ratio).  See CHANGELOG v0.13.40.
 
 **Extended to the compress producer (v0.13.41):** compress had the same exposure
@@ -710,7 +711,7 @@ shrink-regrow cycle, so the pooled `out_pool` buffers self-stabilize at the
 steady compressed size and `resize(csz)` becomes a no-op after warm-up (zeroing
 only the upward `csz` *variation*).
 
-**Measured on knuth (8×H100), `gpu-only`, 8 GiB mixed data (worst case for csz
+**Measured on the Gen4 8×H100 server, `gpu-only`, 8 GiB mixed data (worst case for csz
 variation), `perf --call-graph dwarf`:** `__memset` via
 `_M_default_append`←`resize`←`gpu_worker` = **0.59%** of host CPU self-time —
 below the 1% threshold, and on a path whose host CPU isn't the bottleneck anyway
@@ -737,7 +738,7 @@ direct-write resize-zeros (CPU decompress, both non-pinned D2H paths).  Note: it
 bottleneck) — kept as resource-waste elimination (fewer cycles + less memory-write
 traffic), not a speedup.  See CHANGELOG v0.13.39.
 
-<details><summary>Reproduction runbook (perf on knuth)</summary>
+<details><summary>Reproduction runbook (perf on the Gen4 server)</summary>
 
 ```bash
 # 1. perf needs paranoid <= 2 for unprivileged sampling; check then (if needed) lower:

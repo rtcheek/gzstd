@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.94";
+static constexpr const char * GZSTD_VERSION = "0.14.95";
 //
 // Architecture overview:
 //
@@ -19,8 +19,10 @@ static constexpr const char * GZSTD_VERSION = "0.14.94";
 //   A writer thread reassembles compressed frames in original sequence order.
 //
 //   DECOMPRESSION:
-//   Input is read entirely into memory, then split into individual Zstd frames
-//   using ZSTD_findFrameCompressedSize() and ZSTD_getFrameContentSize().
+//   Input is split into individual Zstd frames using
+//   ZSTD_findFrameCompressedSize() and ZSTD_getFrameContentSize() and
+//   streamed through a bounded TaskQueue (mmap, pooled multi-reader pread,
+//   or fread — chosen by input type and kernel; RAM stays bounded).
 //   Multi-frame files are decompressed in parallel (CPU MT or GPU batched).
 //   Single-frame files or files with unknown content sizes fall back to
 //   streaming CPU decompression.
@@ -398,7 +400,8 @@ struct Options {
   bool watchdog = false;          // --watchdog: arm the GPU deadlock watchdog (diagnostic; dumps JSON + aborts on a stall)
   int  watchdog_secs = 30;        // --watchdog=SECS: stall timeout in seconds (default 30)
   bool direct_read = false;       // --direct-read: O_DIRECT input — bypass the page cache (no populate/evict)
-  size_t read_threads = 0;        // --read-threads N: buffered pooled-reader threads (0 = auto: 3)
+  size_t read_threads = 0;        // --read-threads N: buffered pooled-reader threads
+                                  //  (0 = auto: clamp(threads/8, 3, 12))
   size_t write_threads = 0;       // --write-threads N: -d --tar extractor writer pool (0 = auto: min(threads,16))
   bool preallocate_output = false; // --preallocate / --no-preallocate: fallocate output upfront
                                    // (default off: fallocate'd unwritten extents make O_DIRECT
@@ -773,8 +776,8 @@ static void print_help()
 "Operation:\n"
 "  -d                  decompress\n"
 "  -t                  test (verify integrity, no output)\n"
-"  -l                  list .zst frame info (Frames/Sizes/Ratio/Check); with\n"
-"                      --tar, list the archive contents (tar -tvf style)\n"
+"  -l                  list .zst frame info (Frames/Skips/Sizes/Ratio/Check);\n"
+"                      with --tar, list the archive contents (tar -tvf style)\n"
 "  -k                  keep input after success (default)\n"
 "  --rm                remove input after success\n"
 "\n"
@@ -853,7 +856,7 @@ static void print_help()
 "  --direct-read       O_DIRECT input, single stream: bypass the page cache\n"
 "                      for one-pass speedups and honest cold benchmarks\n"
 "  --read-threads N    parallel readers for the BUFFERED input path (default:\n"
-"                      auto 3..12 by -T; 1 = single; n/a with --direct-read/stdin)\n"
+"                      auto 3..12 by -T; 1 = single; n/a for pipes/--direct-read)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
@@ -862,7 +865,8 @@ static void print_help()
 "  --verify            decompress-verify every frame while compressing; on any\n"
 "                      mismatch, rebuild CPU-only and retry until it verifies\n"
 "  --verify-retries N  cap verify rebuild attempts (0 = unlimited; default)\n"
-"  --verify-engine E   verify on cpu|gpu|auto (gpu-only compress; auto=by GPU speed)\n"
+"  --verify-engine E   verify on cpu|gpu|auto (gpu-only compress; auto = by\n"
+"                      PCIe generation)\n"
 "  --keep-going        on -d, don't stop at a corrupt frame: recover what's\n"
 "                      readable, then report which file(s) are damaged\n"
 "\n"
@@ -931,8 +935,7 @@ static void print_help_long()
 "     decompressing only header-bearing frames; anything else falls\n"
 "     back to decompressing and parsing the tar headers in memory.\n"
 "     Entries print as they are found.  When the walk produces the\n"
-"     listing, the\n"
-"     progress meter shows on stderr — by default ONLY when the\n"
+"     listing, the progress meter shows on stderr — by default ONLY when the\n"
 "     listing is piped or redirected (and stderr is a terminal), so it\n"
 "     never interleaves with a listing on the same screen.  --progress\n"
 "     forces it on regardless; --no-progress (or -q) removes it if it\n"
@@ -1019,6 +1022,15 @@ static void print_help_long()
 "     faulty machine eventually gives up with a non-zero exit instead of\n"
 "     looping forever.  Implies --verify.\n"
 "\n"
+"  --verify-engine ENGINE      (auto | cpu | gpu; default: auto)\n"
+"     Which engine runs the --verify round-trip on a --gpu-only compress:\n"
+"     gpu decompresses and byte-compares entirely in VRAM (video RAM),\n"
+"     keeping the check off the CPU; cpu re-decodes on the host.  Which\n"
+"     wins depends on the bottleneck — gpu when the run is disk-bound,\n"
+"     cpu when it is compute-bound; auto picks by PCIe generation.\n"
+"     Ignored (CPU verify, with a warning) unless --gpu-only.  Implies\n"
+"     --verify.\n"
+"\n"
 "  --keep-going\n"
 "     Recovery mode for DECOMPRESSING a damaged archive.  Normally a frame\n"
 "     whose XXH64 (64-bit xxHash) content checksum does not match aborts\n"
@@ -1028,7 +1040,8 @@ static void print_help_long()
 "     NOT repair data: a checksum-mismatch frame is written in full but is\n"
 "     UNVERIFIED (one or more bytes somewhere in it may be wrong); a frame\n"
 "     that cannot be decoded at all yields only what decoded before the\n"
-"     error.  Implies --cpu-only.  Existing files are overwritten as usual;\n"
+"     error.  Implies --cpu-only and a single reader thread (damage must\n"
+"     map to exact output offsets).  Existing files are overwritten as usual;\n"
 "     to recover alongside the originals, extract into a fresh directory\n"
 "     with -C DIR.  Exit codes: 6 = finished but some file(s) are\n"
 "     unverified; 7 = finished but some data could not be decoded\n"
@@ -1053,8 +1066,8 @@ static void print_help_long()
 "     always fall back to fread regardless of this flag.\n"
 "     AUTO-GATE: Linux kernels before 6.4 lack per-VMA (virtual memory\n"
 "     area) locks, so a large mmap faulted by many worker threads\n"
-"     serialises on the one\n"
-"     mmap_lock — a fault-storm that scales with file size and cores.\n"
+"     serialises on the one mmap_lock — a fault-storm that scales with\n"
+"     file size and cores.\n"
 "     For inputs over 4 GiB on a <6.4 kernel, gzstd therefore defaults\n"
 "     to fread; on 6.4+ kernels mmap stays on (zero-copy wins there).\n"
 "     --mmap / --no-mmap force the choice and override the auto-gate.\n"
@@ -1083,7 +1096,8 @@ static void print_help_long()
 "     e.g. a >4 GiB input on a <6.4 kernel, or --no-mmap) and to\n"
 "     decompress (the parallel-prefetch frame reader), for seekable\n"
 "     regular-file inputs.  0 = auto: clamp(threads/8, 3, 12).  1 = force\n"
-"     a single reader.  Ignored for stdin/pipes and under --direct-read.\n"
+"     a single reader.  Ignored for pipes and under --direct-read; a\n"
+"     seekable stdin redirect (gzstd < FILE) does use it.\n"
 "     Unrelated to --direct-read beyond being mutually exclusive with it.\n"
 "\n"
 "  --cold    (default: off)\n"
@@ -1096,7 +1110,8 @@ static void print_help_long()
 "     DIAGNOSTIC ONLY.  Arm a stall detector for hybrid/GPU runs.  If the\n"
 "     writer makes no progress for SECS seconds (default 30) while the run is\n"
 "     not done, dump a JSON snapshot of every GPU worker, stream, queue,\n"
-"     throttle and NVML/kernel-Xid signal to the current directory and abort.\n"
+"     throttle and NVML (NVIDIA Management Library) / kernel Xid (GPU\n"
+"     error report) signal to the current directory and abort.\n"
 "     It does NOT recover — it turns a frozen process into evidence.  Normal\n"
 "     runs never need it; use it to capture a suspected GPU wedge.\n"
 "\n"
@@ -1397,7 +1412,8 @@ static void print_help_long()
 " CPU TUNING\n"
 "============================================================\n"
 "  -T, --threads N\n"
-"     CPU worker threads.  0 = all cores (auto-capped at 96).\n"
+"     CPU worker threads.  0 = all cores, uncapped.  When -T is omitted\n"
+"     entirely, the default is all cores, capped at 96.\n"
 "\n"
 "  --chunk-size N\n"
 "     Host I/O chunk size in MiB (default: 16).  Each independent\n"
@@ -1434,6 +1450,13 @@ static void print_help_long()
 "     With huge inputs you can run out of memory (OOM) if every\n"
 "     worker queues frames unbounded — the throttle exists for a\n"
 "     reason.  Default is auto.\n"
+"\n"
+"  -M N, --memlimit=N, --memory=N    [all modes]\n"
+"     Memory usage limit in MiB (zstd-compatible).  On decompression,\n"
+"     frames requiring a window larger than N MiB are rejected (via\n"
+"     ZSTD_d_windowLogMax).  On compression, caps the in-flight\n"
+"     frame-throttle budget at roughly N MiB total — useful on shared\n"
+"     machines where the default `min(pipeline, RAM/2)` is too generous.\n"
 "\n"
 #ifdef HAVE_NVCOMP
 "============================================================\n"
@@ -1511,13 +1534,6 @@ static void print_help_long()
 "     X * active_gpu_streams * gpu_batch_size.  X=2.0 reserves two full\n"
 "     GPU rounds ahead of CPU; X=0 lets CPU compete freely.\n"
 "\n"
-"  -M N, --memlimit=N, --memory=N\n"
-"     Memory usage limit in MiB (zstd-compatible).  On decompression,\n"
-"     frames requiring a window larger than N MiB are rejected (via\n"
-"     ZSTD_d_windowLogMax).  On compression, caps the in-flight\n"
-"     frame-throttle budget at roughly N MiB total — useful on shared\n"
-"     machines where the default `min(pipeline, RAM/2)` is too generous.\n"
-"\n"
 "============================================================\n"
 " LOGGING\n"
 "============================================================\n"
@@ -1545,6 +1561,10 @@ static void print_help_long()
 "  4  Data error (corrupt input, integrity check failure)\n"
 "  5  Reserved: all GPUs failed (since v0.13.54 the run instead falls back\n"
 "     to CPU with a warning and exits 0 — data is never left incomplete)\n"
+"  6  --keep-going: finished, but one or more frames failed their checksum\n"
+"     (content written in full but UNVERIFIED)\n"
+"  7  --keep-going: finished, but some data could not be decoded at all\n"
+"     (output incomplete; outranks 6)\n"
 "\n"
 "============================================================\n"
 " EXAMPLES\n"
@@ -3500,10 +3520,12 @@ public:
     }
     return true;
   }
-  // Blocks until a buffer is free; returns its slot index.
+  // Blocks until a buffer is free; returns its slot index, or -1 after
+  // set_done() (abort: the reader must stop, no buffer is coming back).
   int acquire() {
     std::unique_lock<std::mutex> lk(m_);
-    cv_.wait(lk, [&]{ return !free_.empty(); });
+    cv_.wait(lk, [&]{ return done_ || !free_.empty(); });
+    if (done_) return -1;
     int s = free_.back(); free_.pop_back();
     return s;
   }
@@ -3511,6 +3533,14 @@ public:
     if (slot < 0) return;
     { std::lock_guard<std::mutex> lk(m_); free_.push_back(slot); }
     cv_.notify_one();
+  }
+  // Abort escape (GPU-fault shutdown): pool-as-backpressure means the reader
+  // is very likely parked in acquire() at fault time — with the workers gone,
+  // no release() would ever wake it and the fault->CPU-rebuild path would
+  // never be reached.  Wake it and make acquire() fail fast from now on.
+  void set_done() {
+    { std::lock_guard<std::mutex> lk(m_); done_ = true; }
+    cv_.notify_all();
   }
   char * buf(int slot) { return bufs_[(size_t)slot]; }
   ~DirectReadPool() { if (base_) free(base_); }
@@ -3522,19 +3552,33 @@ private:
   std::mutex          m_;
   std::condition_variable cv_;
   size_t              buf_size_ = 0;
+  bool                done_ = false;   // abort: acquire() returns -1
 };
 
-// Set while a zero-copy --direct-read run is active (single producer sets it
-// before workers start, clears it after they join); workers only ever call
-// release() through it, which is internally locked.
-static DirectReadPool * g_direct_read_pool = nullptr;
+// Set while a zero-copy --direct-read run is active (the producer sets it just
+// before its read loop, clears it after all release() callers join).  Atomic:
+// GPU workers read it from the abort protocol while the producer thread
+// writes it; the pool object itself outlives every reader (cleared before the
+// joins complete, destroyed after).
+static std::atomic<DirectReadPool *> g_direct_read_pool{nullptr};
 #endif
 
 static void gz_direct_read_release(int slot) {
 #ifndef _WIN32
-  if (g_direct_read_pool) g_direct_read_pool->release(slot);
+  DirectReadPool * p = g_direct_read_pool.load(std::memory_order_acquire);
+  if (p) p->release(slot);
 #else
   (void)slot;
+#endif
+}
+
+// GPU-fault abort protocol hook: wake a reader parked in DirectReadPool::acquire()
+// so the run can tear down and reach the CPU-only rebuild.  No-op when no pooled
+// read is active (mmap/fread paths, Windows).
+static void gz_direct_read_abort() {
+#ifndef _WIN32
+  DirectReadPool * p = g_direct_read_pool.load(std::memory_order_acquire);
+  if (p) p->set_done();
 #endif
 }
 
@@ -3560,8 +3604,10 @@ public:
     // the task instead of buffering it — the consumers have exited and the whole
     // output is being discarded, so buffering the rest of the input would only
     // grow memory unbounded.  Normal end-of-input calls set_done() AFTER the last
-    // push, so this never drops a wanted frame.
-    if (done_) return;
+    // push, so this never drops a wanted frame.  release_input() so a dropped
+    // pooled-view task returns its DirectReadPool slot instead of leaking it
+    // (leaked slots starve the reader's acquire() and wedge the teardown).
+    if (done_) { t.release_input(); return; }
     queued_bytes_ += t.data.size();
     q_.push_back(std::move(t));
     ++total_tasks_;
@@ -7400,7 +7446,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
     // input (near-full-size compressed frames) can't hold ~4× the RAM a
     // compressible run does.  ~8 MiB/slot = half a standard 16 MiB frame (≈ half
     // the floor's worst-case bytes; measured throughput-neutral on Gen3 — should
-    // be validated on knuth).  Soft cap — push() still admits a frame when empty.
+    // be validated on a Gen4+ host).  Soft cap — push() still admits a frame when empty.
     queue.set_max_bytes(qfloor * (8 * ONE_MIB));
   }
 
@@ -7845,8 +7891,13 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
       char * buf;
       if (pool) {                           // blocks when all bufs in flight = backpressure
         const uint64_t a_t0 = m ? now_ns() : 0;
-        slot = pool->acquire(); buf = pool->buf(slot);
+        slot = pool->acquire();
         if (m) m->reader_blocked_ns.fetch_add(now_ns() - a_t0, std::memory_order_relaxed);
+        if (slot < 0) {                     // pool set_done(): GPU-fault abort, stop reading
+          done.store(true, std::memory_order_relaxed);
+          break;
+        }
+        buf = pool->buf(slot);
       }
       else      { buf = static_cast<char *>(scratch); }
       uint64_t t0 = (g_perf || m) ? now_ns() : 0;
@@ -9338,6 +9389,7 @@ public:
   }
 
   bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
+  bool had_data_error() const { return data_error_.load(std::memory_order_relaxed); }
   bool had_unmatched() const { return unmatched_; }
   uint64_t validated_files() const { return vfiles_; }
   uint64_t validated_bytes() const { return vbytes_; }
@@ -9606,6 +9658,7 @@ private:
   uint64_t vfiles_ = 0, vbytes_ = 0;  // validate/list counters (entries, logical bytes)
   uint64_t stream_bytes_ = 0;         // total decompressed tar-stream size (see stream_bytes())
   std::atomic<bool> had_error_{false};
+  std::atomic<bool> data_error_{false};  // structural archive damage (subset of had_error_)
 
   // Format one entry as a `tar -tvf` line on stdout (for -l --tar), matching
   // GNU tar's simple_print_header (list.c) BYTE FOR BYTE: same type letters
@@ -9698,6 +9751,14 @@ private:
   void fail(const std::string & path, const std::string & why) {
     had_error_.store(true, std::memory_order_relaxed);
     vlog(V_ERROR, opt_, "gzstd: untar: " + path + ": " + why + "\n");
+  }
+  // Corrupt-archive variant: structural damage (bad checksum, truncated or
+  // implausible headers/data) additionally sets data_error_ so the extract
+  // exit code honors the documented contract (4 = corrupt input) instead of
+  // the generic 1 used for per-member restore failures (permissions etc.).
+  void fail_data(const std::string & path, const std::string & why) {
+    data_error_.store(true, std::memory_order_relaxed);
+    fail(path, why);
   }
 
   // ---- secure path resolution (O_NOFOLLOW on every component) ----
@@ -10125,7 +10186,7 @@ private:
       enqueue(std::move(j));
     }
     if (!ok) {
-      fail(rel, "truncated file data");
+      fail_data(rel, "truncated file data");
       big->failed.store(true);
       // Un-account the parts that were never enqueued; if every enqueued part
       // already completed, this thread is the last owner and finalizes.
@@ -10229,7 +10290,7 @@ private:
         // Parallel partition worker: hitting the slice limit at a header
         // boundary is the clean end of this partition, not a truncation.
         if (par && r.at_limit()) return;
-        if (zero_run == 0) fail("(archive)", "truncated tar stream");
+        if (zero_run == 0) fail_data("(archive)", "truncated tar stream");
         return;
       }
       bool all_zero = true;
@@ -10241,15 +10302,26 @@ private:
       uint64_t stored = get_num(blk + 148, 8);
       uint64_t sum = 0; for (size_t k = 0; k < TAR_BLK; ++k)
         sum += (k >= 148 && k < 156) ? (unsigned char)' ' : (unsigned char)blk[k];
-      if (sum != stored) { fail("(archive)", "bad tar header checksum"); return; }
+      if (sum != stored) { fail_data("(archive)", "bad tar header checksum"); return; }
 
       char type = blk[156];
       uint64_t size = get_num(blk + 124, 12);
 
+      // Extension-header size cap: the size field is untrusted (base-256
+      // admits up to 2^63) and drives the allocations below — an uncapped
+      // value throws bad_alloc in this thread, which is uncaught and aborts
+      // the process instead of reporting a data error.  Real long-name/pax
+      // data is KB-scale even with heavy xattr sets; 64 MiB is ~3 orders of
+      // magnitude of headroom.  (The foreign-scan walk has its own tighter
+      // cap and bails to this parser; this one is authoritative, so it must
+      // fail cleanly rather than bail.)
+      static constexpr uint64_t EXT_HDR_MAX = 64ull << 20;
+
       // GNU long name / long link: data is the string for the NEXT header.
       if (type == 'L' || type == 'K') {
+        if (size > EXT_HDR_MAX) { fail_data("(archive)", "implausible long-name header size"); return; }
         std::vector<char> nm(size + 1, 0);
-        if (!r.read_exact(nm.data(), size)) { fail("(archive)", "truncated long name"); return; }
+        if (!r.read_exact(nm.data(), size)) { fail_data("(archive)", "truncated long name"); return; }
         r.skip((TAR_BLK - (size % TAR_BLK)) % TAR_BLK);
         std::string s(nm.data(), size ? size - (nm[size - 1] == 0 ? 1 : 0) : 0);
         if (type == 'L') pend_name = s; else pend_link = s;
@@ -10257,8 +10329,9 @@ private:
       }
       // pax extended headers: "len key=value\n" records.
       if (type == 'x' || type == 'g') {
+        if (size > EXT_HDR_MAX) { fail_data("(archive)", "implausible pax header size"); return; }
         std::vector<char> pd(size);
-        if (!r.read_exact(pd.data(), size)) { fail("(archive)", "truncated pax header"); return; }
+        if (!r.read_exact(pd.data(), size)) { fail_data("(archive)", "truncated pax header"); return; }
         r.skip((TAR_BLK - (size % TAR_BLK)) % TAR_BLK);
         std::string rec(pd.data(), pd.size());
         for_each_pax_record(rec, [&](const std::string & key, const std::string & val) {
@@ -10351,7 +10424,7 @@ private:
         bool ext = (unsigned char)blk[482] != 0;
         char xb[TAR_BLK]; bool ok_ext = true;
         while (ext) {
-          if (!r.read_exact(xb, TAR_BLK)) { fail(e.name, "truncated sparse extension"); ok_ext = false; break; }
+          if (!r.read_exact(xb, TAR_BLK)) { fail_data(e.name, "truncated sparse extension"); ok_ext = false; break; }
           for (int i = 0; i < 21; ++i) add_seg(xb + i * 24);
           ext = (unsigned char)xb[504] != 0;
         }
@@ -10456,7 +10529,7 @@ private:
           j.size = e.size; j.root = root;
           // Zero-copy: views into the decompressed frame(s), no memcpy on this
           // serial thread (see DataSeg).
-          if (e.size && !r.read_segs(e.size, j.segs)) { fail(rel, "truncated file data"); return; }
+          if (e.size && !r.read_segs(e.size, j.segs)) { fail_data(rel, "truncated file data"); return; }
           r.skip(pad);
           enqueue(std::move(j));
         } else {
@@ -10557,7 +10630,7 @@ private:
     if (e.sparse_map_in_data) {  // PAX 1.0: map prefixes the data
       uint64_t mc = 0;
       if (!read_pax_sparse_map(r, data_map, mc)) {
-        fail(rel, "bad PAX sparse map"); ::close(fd); return;
+        fail_data(rel, "bad PAX sparse map"); ::close(fd); return;
       }
       consumed = mc; mapp = &data_map;
     }
@@ -12962,6 +13035,7 @@ static void gpu_worker(
         { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
         queue->set_done();
         if (bp) bp->set_done();
+        gz_direct_read_abort();  // wake a reader parked in DirectReadPool::acquire()
         idle_cv.notify_all();
       }
       wd_drain_phase(slot_index, WatchPhase::Exiting);
@@ -13501,12 +13575,14 @@ static void gpu_worker(
 
     // Wake everything so it sees the abort and tears down cleanly: the writer's
     // in-order wait, CPU workers blocked popping the queue, the producer blocked
-    // pushing a full bounded queue, workers blocked on the throttle, and any
-    // rescue waiters (hybrid).  set_done() on the queue wakes both poppers and the
-    // pusher; the workers then see g_gpu_aborted and exit without draining.
+    // pushing a full bounded queue (or parked in DirectReadPool::acquire()),
+    // workers blocked on the throttle, and any rescue waiters (hybrid).
+    // set_done() on the queue wakes both poppers and the pusher; the workers
+    // then see g_gpu_aborted and exit without draining.
     { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
     queue->set_done();
     if (bp) bp->set_done();
+    gz_direct_read_abort();
   }
 }
 
@@ -14149,6 +14225,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // pool_n frames, so the GPU queue floor must clamp below it or the
       // CPU pool gets locked out (see update_queue_floor).
       if (sched) sched->set_queue_depth_cap(pool_n);
+      // Mirror the ceiling on the queue itself so wait_for_batch_or_cap's
+      // capacity escape fires: a stream waiting for a batch larger than
+      // pool_n would otherwise wait forever (the reader is parked in
+      // acquire() at exactly that point — its designed backpressure — and
+      // in gpu-only mode no CPU pop can break the standoff).  push() can
+      // never actually block on this cap: queued view tasks each hold a
+      // pool slot, so acquire() gates the producer strictly earlier.
+      queue.set_max_depth(pool_n);
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, "[POOLED-READ] buffered input (page cache + readahead), zero-copy pool "
              + std::to_string(pool_n) + " buffers\n");
@@ -14157,7 +14241,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         [&](const char * buf, size_t n, size_t idx, int slot) {
           Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
           queue.push(std::move(t));
-          return true;
+          // GPU-fault abort: push() dropped the task (queue is done) — stop
+          // the readers instead of streaming the rest of the file into drops.
+          return !g_gpu_aborted.load(std::memory_order_relaxed);
         });
       if (!reader_done) g_direct_read_pool = nullptr;  // open failed; fread takes over
     }
@@ -16015,7 +16101,8 @@ static int extract_tar(const Options & opt, Meter * m)
             wpool_threads    = std::max(wpool_threads, ex.writer_threads());
           }
           if (in && in != stdin) std::fclose(in);
-          if (ex.had_error() && rc == EXIT_OK) rc = EXIT_ERROR;
+          if (ex.had_error() && rc == EXIT_OK)
+            rc = ex.had_data_error() ? EXIT_DATA : EXIT_ERROR;
           continue;   // this archive done; skip the serial FrameSink pipeline
         }
       }
@@ -16111,7 +16198,8 @@ static int extract_tar(const Options & opt, Meter * m)
       vlog(V_DEBUG, opt, b);
     }
     if (in && in != stdin) std::fclose(in);
-    if ((ex.had_error() || ex.had_unmatched()) && rc == EXIT_OK) rc = EXIT_ERROR;
+    if ((ex.had_error() || ex.had_unmatched()) && rc == EXIT_OK)
+      rc = ex.had_data_error() ? EXIT_DATA : EXIT_ERROR;
     if (opt.keep_going) {
       int sev = report_keep_going_damage_tar(opt);   // names damaged files; 6/7 or OK
       if (sev > rc) rc = sev;                         // recovery verdict outranks a plain error
@@ -17590,7 +17678,19 @@ int main(int argc, char ** argv)
         std::ifstream src(tmp, std::ios::binary);
         std::ofstream dst(opt.output, std::ios::binary | std::ios::trunc);
         if (!src || !dst) die_io("failed to finalize output file");
-        dst << src.rdbuf(); src.close(); dst.close(); fs::remove(tmp);
+        dst << src.rdbuf();
+        dst.flush();
+        // A short copy (ENOSPC/EIO) sets the stream error state silently —
+        // removing the temp and falling through would install a truncated
+        // output, delete the source, and exit 0 (the same silent-loss class
+        // the fclose/ferror gate above closes on the primary path).  Keep
+        // the complete temp file (disarm its atexit unlink) and die (exit 3)
+        // BEFORE the temp removal and the no-keep source unlink.
+        if (!src || !dst) {
+          clear_tmp_file();
+          die_io("failed to finalize output file (copy failed; complete output kept at " + tmp + ")");
+        }
+        src.close(); dst.close(); fs::remove(tmp);
       }
       double rename_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
           std::chrono::steady_clock::now() - t_rename).count();
@@ -18220,8 +18320,11 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--preallocate" || a == "--preallocate=on")  opt.preallocate_output = true;
     else if (a == "--no-preallocate" || a == "--preallocate=off") opt.preallocate_output = false;
     else if (a == "--verify") opt.verify = true;
-    else if (a.rfind("--verify-engine=", 0) == 0) {
-      std::string v = a.substr(16);
+    else if (a == "--verify-engine" || a.rfind("--verify-engine=", 0) == 0) {
+      // Both --verify-engine=E and --verify-engine E, like every other
+      // value-taking flag (parse_num_arg's contract).
+      std::string v = (a.size() > 15) ? a.substr(16)
+                    : (i + 1 < argc ? std::string(argv[++i]) : std::string());
       if      (v == "auto") opt.verify_engine = VERIFY_ENGINE_AUTO;
       else if (v == "cpu")  opt.verify_engine = VERIFY_ENGINE_CPU;
       else if (v == "gpu")  opt.verify_engine = VERIFY_ENGINE_GPU;
@@ -18229,8 +18332,9 @@ static Options parse_args(int argc, char ** argv)
       opt.verify = true;   // implied
     }
     else if (a == "--keep-going") opt.keep_going = true;
-    else if (a.rfind("--verify-retries=", 0) == 0) {
-      std::string v = a.substr(17);
+    else if (a == "--verify-retries" || a.rfind("--verify-retries=", 0) == 0) {
+      std::string v = (a.size() > 16) ? a.substr(17)
+                    : (i + 1 < argc ? std::string(argv[++i]) : std::string());
       if (v.empty()) die_usage("missing value for --verify-retries");
       char * end = nullptr;
       long n = std::strtol(v.c_str(), &end, 10);
@@ -18313,7 +18417,13 @@ static Options parse_args(int argc, char ** argv)
       if (opt.output.empty()) die_usage("missing value for --output");
       if (opt.output == "-") { opt.to_stdout = true; opt.output = "stdout"; }
     }
-    else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) { opt.gpu_hybrid_tuning_seen = true; }
+    else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) {
+      // Validate the documented range (parity with --hybrid-floor-factor;
+      // an out-of-range share silently skewed the fixed-share scheduler).
+      if (opt.cpu_share < 0.0 || opt.cpu_share > 1.0)
+        die_usage("--cpu-share must be in [0.0, 1.0]");
+      opt.gpu_hybrid_tuning_seen = true;
+    }
     else if (parse_str_arg("stats-json", i, argc, argv, opt.stats_json)) {}
     else if (parse_num_arg("chunk-size", i, argc, argv, opt.chunk_mib, &opt.chunk_user_set)) {}
     else if (parse_num_arg("cpu-batch", i, argc, argv, opt.cpu_queue_min, nullptr)) { opt.gpu_hybrid_tuning_seen = true; }

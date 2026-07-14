@@ -24,11 +24,12 @@ See `BUILD.md` for conda setup and static linking details.
 ## Tests
 
 ```bash
-./gzstd-test.sh                # run all tests (~170+)
+./gzstd-test.sh                # run all tests (300+)
 ./gzstd-test.sh ./build/gzstd  # explicit binary path
+./gzstd-test.sh -e             # extensive: adds zstd CLI-compat sections
 ```
 
-GPU tests are automatically skipped if no GPU is detected. Run before every commit.
+GPU tests are automatically skipped if no GPU is detected. Run before every commit; run `-e` after any arg-parsing or zstd-compat change.
 
 ## Benchmarks
 
@@ -41,7 +42,7 @@ Results written to `benchmark-results.json`.
 
 ## Architecture
 
-**Single-file monolith**: All ~9,900 lines live in `gzstd.cpp`. Read the architecture comment at the top (lines 1–41) first.
+**Single-file monolith**: All ~18,800 lines live in `gzstd.cpp`. Read the architecture comment at the top of the file first.
 
 ### Data flow
 
@@ -96,6 +97,8 @@ Frames with compression ratio < 2% (trivially compressed) are always routed to C
 | 3 | I/O error (disk full, permissions) |
 | 4 | Data error (corrupt input, integrity failure) |
 | 5 | All GPUs failed (VRAM exhaustion, driver error) |
+| 6 | `--keep-going`: finished, but some frames failed checksum (unverified) |
+| 7 | `--keep-going`: finished, but some data could not be decoded (incomplete) |
 
 ### Adding a new CLI flag
 

@@ -1,11 +1,31 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.94  
+**Covers:** v0.9.50 → v0.14.95  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.14.95 — v0.14.xx close-out review: two pooled-reader deadlocks, malformed-tar abort, exit-code fidelity, help/doc accuracy
+
+**A three-angle sequential review (concurrency hangs → data correctness → help accuracy) to close out the v0.14.xx line before v0.15.0.** Each angle ran to a verdict and its fixes were banked before the next started. Findings, most severe first:
+
+**1. GPU-fault abort wedged the buffered pooled reader (deadlock in the exact path that exists to save the data).** The abort protocol woke the queue, throttle, results, and idle CVs — but never `DirectReadPool`, whose `acquire()` had no escape predicate. Pool-as-backpressure is the designed steady state, so at fault time the producer is very likely parked in `acquire()`; with the workers gone, no `release()` was ever coming, and `TaskQueue::push`'s drop-on-done path leaked each dropped view task's pool slot on top (dropping a `Task` never ran `release_input()`). The reader thread — which is the driver thread — hung forever and the fault→discard→CPU-only-rebuild path was never reached. Never observed in the field because the GPU boxes that reproduce faults take the mmap reader (kernel ≥ 6.4), which has no pool; the pooled reader engages for redirected-stdin/blockdev input, `--no-mmap`, or pre-6.4 kernels. Fixes: `DirectReadPool::set_done()` (acquire returns −1, reader exits), wired into both abort sites (GPU worker catch and drain-thread catch); `push`'s drop path now releases the task's input; the compress emit callback stops the readers on abort instead of streaming the rest of the file into drops; `g_direct_read_pool` is atomic (worker threads read it during abort while the producer writes it).
+
+**2. gpu-only compress could wedge with NO fault when the per-stream batch exceeds the pool size.** The pooled reader parks in `acquire()` at `pool_n` queued tasks (its designed backpressure); a stream in `wait_for_batch_or_cap(pop_n)` with `pop_n > pool_n` waits for a queue depth that can never exist — compress queues set no depth cap, view tasks count zero bytes against the byte cap, and in gpu-only there is no CPU pop to break the standoff. Reachable today: `--gpu-only --gpu-batch=512 < bigfile` where the RAM clamp yields a smaller pool. Fix: mirror the pool ceiling onto the queue (`set_max_depth(pool_n)`) so the existing capacity escape fires and the v0.14.58 partial-batch pop handles the rest. `push()` can never actually block on this cap — a queued view task holds a pool slot, so `acquire()` gates the producer strictly earlier (the bounded-queue `space_cv_` discipline is untouched).
+
+**3. A malformed tar member header aborted the process instead of reporting a data error.** `parse()` read the `L`/`K` longname and pax `x`/`g` sizes from the untrusted header (base-256 admits ~2^63) and allocated unchecked — `bad_alloc` in the parse thread → `std::terminate` → SIGABRT (exit 134) on all of `-d`/`-t`/`-l --tar`. Crafted-archive-reproduced on all three paths. Fix: 64 MiB extension-header cap (≈3 orders of magnitude above anything a real archiver emits; the foreign-scan walk already had its own tighter cap and bails — this parser is authoritative, so it fails cleanly). All three paths now exit 4.
+
+**4. Extract exit-code fidelity: corrupt archive now exits 4, matching the documented contract and the `-t`/`-l` paths.** The extractor collapsed structural damage and per-member restore failures into one `had_error_` flag, so `-d --tar` on a corrupt archive exited 1. Structural sites (bad checksum, truncated stream/long-name/pax/file-data/sparse-extension, implausible header sizes, bad PAX sparse map) now also set a `data_error_` flag; extraction maps it to exit 4, per-member restore failures stay exit 1.
+
+**5. The rename-fallback finalize could install a truncated output, delete the source, and exit 0.** When the atomic rename fails (near-dead code — the tmp is created adjacent to the target), the `rdbuf()` copy's stream state was never checked: a mid-copy ENOSPC/EIO silently set badbit, the good tmp was removed, and the no-keep unlink deleted the input — the same silent-loss class the v0.14.94 `ferror`/`fclose` gate closed on the primary path. Now: check the copy, keep the complete tmp (cleanup disarmed, path named in the error), die exit 3 before the tmp removal and the source unlink.
+
+**6. Help/parse audit (every flag in both help texts checked against `parse_args` and behavior).** Parse fixes: `--verify-retries` and `--verify-engine` accepted only the `=VAL` form while their help showed the space form — both now take both, like every other value flag; `--cpu-share` documented `[0..1]` but validated nothing (1.7 ran silently, skewing the fixed-share scheduler) — now a usage error, parity with `--hybrid-floor-factor`. Help fixes: `--verify-engine` had NO long-help entry (added, under `--verify`); the EXIT CODES table omitted 6/7 (documented only inside `--keep-going`); `-T 0` conflated "all cores uncapped" with the no-flag default's 96 cap; `--read-threads` claimed "ignored for stdin" but a seekable stdin redirect uses the multi-reader pool (both helps); short `-l` column list missed `Skips`; `--keep-going` entry now states the forced single reader; `--verify-engine E` short-help said "auto=by GPU speed" — it picks by PCIe generation; NVML/Xid expanded at first use per house style; two mid-sentence line breaks mended; `-M` moved from HYBRID SCHEDULER to CPU TUNING (it is an all-modes flag). Deliberately-undocumented zstd-compat flags and aliases were confirmed intentional and left undocumented.
+
+**Also:** stale architecture-comment claim fixed (decompression has streamed through bounded queues since v0.13.x, not "read entirely into memory"); stale `read_threads` field comment (auto is clamp(threads/8, 3, 12), not 3); machine-specific hostnames scrubbed from CHANGELOG/ROADMAP/code comments in favor of spec descriptors; CLAUDE.md refreshed (line count, exit codes 6/7, extensive-suite note).
+
+Suite: 310 normal / 426 extensive, all passing (crafted malformed-header archives verified exit 4 on `-d`/`-t`/`-l`; space-form verify flags and `--cpu-share` bounds verified live).
 
 ## v0.14.94 — disk-full: fix the O_DIRECT hang AND the buffered silent-success data loss
 
@@ -2152,7 +2172,7 @@ decompress — it just hadn't been exercised on a decompress run.
 Diagnostic-only (no behavior change).  Early local signal (tiny runs, not
 representative): parse is ~0.1% — the serial spine is NOT the bottleneck,
 so parallelizing it isn't the lever; copy slightly exceeds io.  The actual
-optimization (likely a zero-copy frame reader if knuth shows the reader is
+optimization (likely a zero-copy frame reader if the high-core Gen4 server shows the reader is
 copy-bound, or pipelined raw-read I/O if io-bound) is to be chosen from a
 real-workload -v run on the server.
 
@@ -2959,7 +2979,7 @@ Measured (Gen3 2×2080Ti, `gpu-only` decompress, 4 GiB, max-RSS / best-of-3):
 
 Throughput-neutral, RAM down 145–225 MiB — biggest on incompressible input, as
 intended.  The reduced buffering for big frames *could* matter on a much faster
-reader/consumer ratio (knuth, 8×H100) — flagged in-code and tunable; validate
+reader/consumer ratio (Gen4, 8×H100) — flagged in-code and tunable; validate
 there.  Round-trips verified cpu/gpu × incompressible + sparse `zeros` (deadlock-
 checked with timeouts); 213/213 tests pass.  CPU decompress RSS is unaffected (its
 RAM is the output-buffer throttle budget, not the input queue).
@@ -3331,7 +3351,7 @@ Phase 7.9.
 ## v0.13.26 — Extend the Gen4+ `--direct` default to compress (was decompress-only)
 
 v0.13.25 auto-enabled `--direct` for decompress on Gen4+; this extends the same
-gate to **compress**.  The knuth (Gen4) `--direct` data shows compress benefits
+gate to **compress**.  The Gen4 server `--direct` data shows compress benefits
 the same way decompress does — the win scales with output volume and is
 backend-independent: cpu-only low_compress +103% / mixed +50% / medium +15%,
 gpu-only +71% / +29% / +12%, hybrid +70% / +24% / +21%; tiny-output profiles
