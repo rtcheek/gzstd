@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.14.89
+**Current version:** v0.14.95
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -807,7 +807,7 @@ throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
 | O_DIRECT extraction writes for large files (Gen4+) | tar | Low | Investigate + measure |
 | Punch-hole + O_DIRECT on xfs/btrfs/zfs (validated ext4-class only) | 7.10 | Low | Open — needs loopback image or CI matrix |
 
-### Versioning plan (as of v0.14.89, 2026-07)
+### Versioning plan (as of v0.14.95, 2026-07)
 
 - **0.14.x — the `--tar` chapter is CLOSED as of v0.14.91.** Parallel
   create/extract including the parallel-lstat layout walk, member index +
@@ -817,6 +817,14 @@ throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
   input-ergonomics flags. Remaining tar-adjacent work is opportunistic only:
   the two measure-first O_DIRECT/cache probes, the xfs/btrfs/zfs punch-hole
   validation, and an SELinux labeled-host round-trip spot-check.
+- **The 0.14.x line itself is closed as of v0.14.95.** v0.14.94 fixed the
+  disk-full field report (the `--direct` permit-starvation hang AND the worse
+  buffered silent-success data loss); v0.14.95 was the deliberate close-out: a
+  three-angle sequential review (concurrency hangs → data correctness →
+  help/parse accuracy) that fixed two pooled-reader deadlocks, the
+  malformed-tar SIGABRT, extract exit-code fidelity (corrupt archive → exit 4),
+  the rename-fallback silent truncation, and a full help/parse audit. See
+  CHANGELOG v0.14.94–95.
 - **0.15.0** opens the next big change — likely `--adapt` (AI/heuristic runtime
   self-tuning; regime-signal instrumentation already built). The unblocked first
   slice is independent of the full design: **the decompress default backend is
