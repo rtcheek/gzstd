@@ -365,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=338
-$EXTENSIVE && EXPECTED_TESTS=455
+EXPECTED_TESTS=343
+$EXTENSIVE && EXPECTED_TESTS=460
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3339,6 +3339,79 @@ else
   skip "latched run output round-trips" "no GPU"
 fi
 rm -f "$TMPDIR/alat.zst" "$TMPDIR/alat.out" "$TMPDIR/alat1.err" "$TMPDIR/alat2.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt ranked-engine overflow dispatch"
+
+# GZSTD_DEBUG_ADAPT_RATES injects per-engine rates into the ranker
+# (unit-level dispatch-math testing without exotic hardware, per plan).
+# An absurdly slow injected GPU ranking must zero GPU intake; the CPU
+# pool always remains eligible, so output is unaffected.
+# Cover the ranker's full 32-slot table so a >16-GPU box can't leave
+# unranked (always-take) devices that would false-fail tests 1/3.
+ARANK_INJ="cpu=50"
+for _d in $(seq 0 31); do ARANK_INJ="$ARANK_INJ,gpu$_d=0.01"; done
+
+if has_gpu 2>/dev/null; then
+  # 1. Injected slow ranking: no GPU stream completes a batch (compress).
+  env GZSTD_DEBUG_ADAPT_RATES="$ARANK_INJ" "$GZSTD" --adapt --no-profile -vv \
+    -k -f "$TMPDIR/large.bin" -o "$TMPDIR/arank.zst" 2>"$TMPDIR/arank1.err"
+  ARANK_BATCHES=$(grep -c 'take batch=' "$TMPDIR/arank1.err")
+  if [[ "$ARANK_BATCHES" == "0" ]]; then
+    pass "injected slow ranking zeroes GPU compress intake"
+  else
+    fail "injected slow ranking zeroes GPU compress intake" "batches=$ARANK_BATCHES"
+  fi
+
+  # 2. The output of a fully-declined run round-trips.
+  "$GZSTD" -d --cpu-only -k -f "$TMPDIR/arank.zst" -o "$TMPDIR/arank.out" 2>/dev/null
+  if files_match "$TMPDIR/large.bin" "$TMPDIR/arank.out"; then
+    pass "declined-GPU run output round-trips"
+  else
+    fail "declined-GPU run output round-trips"
+  fi
+
+  # 3. Decompress declining is NEW behavior and --adapt-only: the same
+  # injection on -d also zeroes GPU intake, and output stays correct.
+  env GZSTD_DEBUG_ADAPT_RATES="$ARANK_INJ" "$GZSTD" --adapt --no-profile -vv \
+    -d -k -f "$TMPDIR/arank.zst" -o "$TMPDIR/arank.out" 2>"$TMPDIR/arank2.err"
+  ARANK_DBATCH=$(grep -c 'take batch=' "$TMPDIR/arank2.err")
+  if [[ "$ARANK_DBATCH" == "0" ]] && files_match "$TMPDIR/large.bin" "$TMPDIR/arank.out"; then
+    pass "injected slow ranking zeroes GPU decompress intake"
+  else
+    fail "injected slow ranking zeroes GPU decompress intake" "batches=$ARANK_DBATCH"
+  fi
+
+  # 4. Without --adapt the hook (and ranked dispatch) is inert: dispatch
+  # must not consult the injected rates.
+  env GZSTD_DEBUG_ADAPT_RATES="$ARANK_INJ" "$GZSTD" -vv \
+    -k -f "$TMPDIR/large.bin" -o "$TMPDIR/arank.zst" 2>"$TMPDIR/arank3.err"
+  if ! grep -q 'ranked slow' "$TMPDIR/arank3.err" \
+     && "$GZSTD" -t --cpu-only "$TMPDIR/arank.zst" 2>/dev/null; then
+    pass "ranked dispatch inert without --adapt"
+  else
+    fail "ranked dispatch inert without --adapt"
+  fi
+
+  # 5. A pinned --cpu-share keeps ranked dispatch inert (fixed mode: the
+  # user chose the split) — and the share machinery still works.
+  env GZSTD_DEBUG_ADAPT_RATES="$ARANK_INJ" "$GZSTD" --adapt --no-profile \
+    --cpu-share 0.5 -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/arank.zst" 2>"$TMPDIR/arank4.err"
+  if ! grep -q 'ranked slow' "$TMPDIR/arank4.err" \
+     && "$GZSTD" -t --cpu-only "$TMPDIR/arank.zst" 2>/dev/null; then
+    pass "fixed --cpu-share keeps ranked dispatch inert"
+  else
+    fail "fixed --cpu-share keeps ranked dispatch inert"
+  fi
+else
+  skip "injected slow ranking zeroes GPU compress intake" "no GPU"
+  skip "declined-GPU run output round-trips" "no GPU"
+  skip "injected slow ranking zeroes GPU decompress intake" "no GPU"
+  skip "ranked dispatch inert without --adapt" "no GPU"
+  skip "fixed --cpu-share keeps ranked dispatch inert" "no GPU"
+fi
+rm -f "$TMPDIR/arank.zst" "$TMPDIR/arank.out" "$TMPDIR/arank1.err" \
+      "$TMPDIR/arank2.err" "$TMPDIR/arank3.err" "$TMPDIR/arank4.err"
 
 section "Sliding-window compression"
 

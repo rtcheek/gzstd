@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.3";
+static constexpr const char * GZSTD_VERSION = "0.15.4";
 //
 // Architecture overview:
 //
@@ -2017,7 +2017,8 @@ static std::atomic<int> g_adapt_regime{0};
 // Actions the governor's regime triggered this operation, as a bitmask —
 // set by the acting sites (GPU workers etc.), consumed by print_summary
 // and reset at governor start.
-static constexpr uint32_t    ADAPT_ACT_SOURCE_LATCH = 1u << 0;
+static constexpr uint32_t    ADAPT_ACT_SOURCE_LATCH   = 1u << 0;
+static constexpr uint32_t    ADAPT_ACT_DEVICE_QUIESCE = 1u << 1;
 static std::atomic<uint32_t> g_adapt_action_flags{0};
 
 class AdaptGovernor {
@@ -2102,8 +2103,9 @@ public:
     }
     os << " | transitions " << transitions_ << " | actions:";
     const uint32_t acts = g_adapt_action_flags.load(std::memory_order_relaxed);
-    if (acts == 0)                       os << " none";
-    if (acts & ADAPT_ACT_SOURCE_LATCH)   os << " source-latch(gpu-batch)";
+    if (acts == 0)                        os << " none";
+    if (acts & ADAPT_ACT_SOURCE_LATCH)    os << " source-latch(gpu-batch)";
+    if (acts & ADAPT_ACT_DEVICE_QUIESCE)  os << " device-quiesce(ranked)";
     os << "\n";
     vlog(V_VERBOSE, opt_, os.str());
   }
@@ -6386,8 +6388,43 @@ public:
     // before any refusal can latch tail_yield_ off a stale prior.
     const double cseed = g_adapt_seed_cpu_gibs.load(std::memory_order_relaxed);
     const double gseed = g_adapt_seed_gpu_gibs.load(std::memory_order_relaxed);
-    if (cseed > 0) { cpu_rate_ema_.store(cseed); cpu_samples_.store(1); }
+    if (cseed > 0) {
+      cpu_rate_ema_.store(cseed);
+      cpu_payload_ema_.store(cseed);   // best available payload prior
+      cpu_samples_.store(1);
+    }
     if (gseed > 0) { gpu_rate_ema_.store(gseed); gpu_samples_.store(1); }
+    // Ranked-engine dispatch (--adapt, M4 action 2): per-device rate table.
+    // Sized once here, before any worker exists; never resized.  Indexed by
+    // RAW CUDA device id (workers report that), which under --gpu-devices
+    // subsetting can exceed the selected count — so the table gets a fixed
+    // cap, not gpu_device_count_.
+    if (gpu_device_count_ > 0)
+      dev_ = std::make_unique<DevStat[]>((size_t)RANKED_MAX);
+    // Test hook: inject engine rates into the ranker (unit-level testing of
+    // the dispatch math without exotic hardware, per the approved plan).
+    // Format: "cpu=10,gpu0=0.5,gpu1=3" (GiB/s).  Samples set to 2 so the
+    // injected rates are immediately rank-eligible.
+    if (const char * e = std::getenv("GZSTD_DEBUG_ADAPT_RATES")) {
+      if (opt_.adapt) {
+        parse_injected_rates_(e);
+        // Publish an initial ranking immediately: a sub-second test run may
+        // never reach the 0.5 s tick gate.  Only the CPU can contribute here
+        // (no GPU stream is registered yet), which is exactly the unit-level
+        // comparison the hook exists for.
+        const double c = cpu_payload_ema_.load(std::memory_order_relaxed);
+        if (dev_ && c > 0 && cpu_samples_.load(std::memory_order_relaxed) >= 2) {
+          for (int i = 0; i < RANKED_MAX; ++i) {
+            DevStat & D = dev_[i];
+            if (D.samples.load(std::memory_order_relaxed) < 2) continue;
+            if (c > D.ema.load(std::memory_order_relaxed)) {
+              D.faster_mask.store(1ull, std::memory_order_relaxed);
+              D.faster_sum.store(c, std::memory_order_relaxed);
+            }
+          }
+        }
+      }
+    }
   }
 
   // Set the task queue pointer so gpu_got_data() can wake CPU workers.
@@ -6454,7 +6491,7 @@ public:
   // tail_yield_, which zeroes cpu_queue_floor() — otherwise CPUs would
   // refuse the very frames the GPU just declined (reserved by the
   // floor) and the tail would strand.
-  bool should_gpu_take() {
+  bool should_gpu_take(int device = -1) {
     if (fixed_mode_) {
       const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
       const uint64_t gpu = gpu_taken_.load(std::memory_order_relaxed);
@@ -6463,6 +6500,16 @@ public:
       // band as should_cpu_take so the ratio oscillates around the target
       // instead of one side starving when both check at the same moment.
       return (double(cpu) / double(total)) >= (fixed_cpu_share_ - 0.02);
+    }
+    // Ranked-engine dispatch (--adapt): per-device overflow decision, all
+    // run long and BOTH directions — decompress declining is new behavior,
+    // gated behind --adapt.  No producer_done gate: a shallow queue under a
+    // streaming producer is exactly when overflow engines should idle (the
+    // fast engine alone drains the trickle); the park below re-evaluates on
+    // every queue event, so a backlog re-admits the device.
+    if (ranked_active_() && dev_valid_(device)) {
+      if (!queue_) return true;
+      return should_gpu_take_at(queue_->size(), device);
     }
     if (opt_.mode != Mode::COMPRESS) return true;
     if (!producer_done_.load(std::memory_order_acquire)) return true;
@@ -6475,7 +6522,72 @@ public:
   // lock without calling back into TaskQueue (deadlock).  Only reached
   // after the should_gpu_take() gates (adaptive, compress, producer done),
   // all of which are monotonic — once a worker parks, they can't unflip.
-  bool should_gpu_take_at(size_t depth_now) {
+  // under_queue_lock: true only when called from a wait_for_cpu/
+  // wait_for_gpu_yield predicate (caller holds TaskQueue::m_).  The
+  // tail_yield_ latch may ONLY fire then: its notify_cpu_waiters must be
+  // ordered against the CPU predicate-check-then-wait sequence, or a CPU
+  // between its check and its wait misses the only notification that will
+  // ever come (review v0.15.4 MAJOR-1).  An unlocked caller that declines
+  // proceeds to park, and the park predicate — under the lock — latches
+  // microseconds later.
+  bool should_gpu_take_at(size_t depth_now, int device = -1,
+                          bool under_queue_lock = false) {
+    // Ranked-engine path (--adapt): the generalized inequality.  Engine E
+    // takes work only when the queue holds more than what all strictly
+    // faster engines will drain within E's own batch window.  The fastest
+    // engine has an empty faster set (faster_sum 0) and always feeds;
+    // engines slower than everyone combined naturally starve.  With one
+    // GPU device and a faster CPU this is exactly the proven tail-yield
+    // inequality below.
+    if (ranked_active_() && dev_valid_(device)) {
+      DevStat & D = dev_[device];
+      if (D.samples.load(std::memory_order_relaxed) < 2) return true;  // measure first
+      const double mine   = D.ema.load(std::memory_order_relaxed);
+      const double faster = D.faster_sum.load(std::memory_order_relaxed);
+      if (mine <= 0.0 || faster <= 0.0) return true;   // fastest, or unranked yet
+      const double depth = (double)depth_now;
+      // CPUs refuse depths below --cpu-queue-min, so GPUs must stay the
+      // drain of last resort there (same invariant as the aggregate path).
+      if (opt_.cpu_queue_min > 0 && depth <= (double)opt_.cpu_queue_min)
+        return true;
+      const double batch =
+          (double)std::max<size_t>(1, gpu_batch_size_.load(std::memory_order_relaxed));
+      const double streams =
+          (double)std::max(1, D.streams.load(std::memory_order_relaxed));
+      const bool take = (depth - batch) / faster >= 1.3 * batch * streams / mine;
+      if (!take && under_queue_lock
+          && producer_done_.load(std::memory_order_acquire)
+          && !tail_yield_.load(std::memory_order_relaxed)) {
+        // If at this depth EVERY live device would decline, the floor
+        // reserves depth for batches that will never form — release it
+        // (same rule, and same one-way latch, as the aggregate tail yield;
+        // CPUs must be woken because no push will re-run their predicate).
+        // Evaluated with the same inequality per device, so this is exact
+        // at this snapshot, not a membership guess.  Gated on
+        // producer_done_ (review v0.15.4 MAJOR-2): pre-done, a shallow
+        // queue measures the reader — latching the floor away then would
+        // permanently strip the reservation from devices still
+        // initializing (a 1-GPU pipe run would latch at its very first
+        // decline).  Per-device parking above needs no such gate.
+        bool all_decline = true;
+        for (int i = 0; i < RANKED_MAX && all_decline; ++i) {
+          if (i == device) continue;
+          const DevStat & O = dev_[i];
+          if (O.streams.load(std::memory_order_relaxed) <= 0
+              || O.quiesced.load(std::memory_order_relaxed)) continue;
+          if (O.samples.load(std::memory_order_relaxed) < 2) { all_decline = false; break; }
+          const double o_ema = O.ema.load(std::memory_order_relaxed);
+          const double o_fs  = O.faster_sum.load(std::memory_order_relaxed);
+          if (o_ema <= 0.0 || o_fs <= 0.0) { all_decline = false; break; }
+          const double o_str = (double)std::max(1, O.streams.load(std::memory_order_relaxed));
+          if ((depth - batch) / o_fs >= 1.3 * batch * o_str / o_ema)
+            all_decline = false;   // that device would still take here
+        }
+        if (all_decline && !tail_yield_.exchange(true, std::memory_order_acq_rel))
+          queue_->notify_cpu_waiters();
+      }
+      return take;
+    }
     if (cpu_samples_.load(std::memory_order_relaxed) < 2 ||
         gpu_samples_.load(std::memory_order_relaxed) < 2) return true;
     const double c = cpu_rate_ema_.load(std::memory_order_relaxed);
@@ -6493,11 +6605,14 @@ public:
     // CPU-seconds of work left after this batch vs GPU-seconds to finish it
     // (per-stream rate = pool EMA / streams).
     const bool take = (depth - batch) / c >= 1.3 * batch * streams / g;
-    if (!take && !tail_yield_.exchange(true, std::memory_order_acq_rel)) {
+    if (!take && under_queue_lock
+        && !tail_yield_.exchange(true, std::memory_order_acq_rel)) {
       // First yield: the floor is now zero — wake CPUs sleeping on it,
-      // since no push will arrive to re-evaluate their predicate.
-      // (Plain CV notify — safe even when called under the queue lock
-      // from the wait_for_gpu_yield predicate.)
+      // since no push will arrive to re-evaluate their predicate.  Only
+      // from a predicate caller (under the queue lock): that orders the
+      // notify against every CPU's check-then-wait, closing the lost-
+      // wakeup window; an unlocked decline latches at the park predicate
+      // that follows.
       queue_->notify_cpu_waiters();
     }
     return take;
@@ -6526,7 +6641,9 @@ public:
   }
 
   // GPU workers call this once per stream after init
-  void register_gpu_stream() {
+  void register_gpu_stream(int device = -1) {
+    if (dev_valid_(device))
+      dev_[device].streams.fetch_add(1, std::memory_order_relaxed);
     int n = active_gpu_streams_.fetch_add(1, std::memory_order_relaxed) + 1;
     update_queue_floor(n, gpu_batch_size_.load(std::memory_order_relaxed));
   }
@@ -6535,11 +6652,25 @@ public:
   // normal completion, or failure).  Decrements active_gpu_streams_ and
   // recalculates the queue floor so CPU workers aren't blocked by a floor
   // that reserves frames for GPUs that no longer exist.
-  void unregister_gpu_stream() {
+  void unregister_gpu_stream(int device = -1) {
+    if (dev_valid_(device))
+      dev_[device].streams.fetch_sub(1, std::memory_order_relaxed);
     int n = active_gpu_streams_.fetch_sub(1, std::memory_order_relaxed) - 1;
     if (n < 0) n = 0;
     update_queue_floor(n, gpu_batch_size_.load(std::memory_order_relaxed));
     if (queue_) queue_->notify_cpu_waiters();
+  }
+
+  // Streams whose floor reservation is live: total minus quiesced devices'.
+  // The counters are all live per-device truth, so a quiesce and a stream
+  // exit can interleave freely without double-releasing anything.
+  int floor_streams_(int total) const {
+    if (!dev_) return total;
+    int n = total;
+    for (int i = 0; i < RANKED_MAX; ++i)
+      if (dev_[i].quiesced.load(std::memory_order_relaxed))
+        n -= dev_[i].streams.load(std::memory_order_relaxed);
+    return n < 0 ? 0 : n;
   }
 
   // GPU workers call this when the shared batch size changes
@@ -6584,7 +6715,22 @@ public:
   void mark_cpu_take(uint64_t n) { cpu_taken_.fetch_add(n, std::memory_order_relaxed); }
   void mark_gpu_take(uint64_t n) { gpu_taken_.fetch_add(n, std::memory_order_relaxed); }
   void add_cpu_bytes(uint64_t b) { cpu_bytes_.fetch_add(b, std::memory_order_relaxed); }
-  void add_gpu_bytes(uint64_t b) { gpu_bytes_.fetch_add(b, std::memory_order_relaxed); }
+  void add_gpu_bytes(uint64_t b, int device = -1) {
+    gpu_bytes_.fetch_add(b, std::memory_order_relaxed);
+    if (dev_valid_(device))
+      dev_[device].bytes.fetch_add(b, std::memory_order_relaxed);
+  }
+  // PAYLOAD-unit CPU bytes, for the ranked dispatcher only.  The aggregate
+  // cpu_bytes_ above reports COMPRESSED bytes on the decompress path while
+  // the GPU side reports decompressed — units that never mattered while
+  // decompress never declined, but the ranked inequality compares engine
+  // rates directly, so it gets its own consistently-payload-unit EMA
+  // (frames are uniform in payload size, chunk_mib, making byte rates a
+  // faithful frames/sec proxy).  On the compress path payload == input ==
+  // what the aggregate already counts.
+  void add_cpu_payload_bytes(uint64_t b) {
+    cpu_payload_bytes_.fetch_add(b, std::memory_order_relaxed);
+  }
 
   // Tick runs for monitoring/logging
   void tick() {
@@ -6620,6 +6766,12 @@ public:
                                std::memory_order_relaxed);
     g_adapt_gpu_ema_gibs.store(gpu_rate_ema_.load(std::memory_order_relaxed),
                                std::memory_order_relaxed);
+    // Ranked-engine dispatch (--adapt): per-device EMAs, faster-set ranking
+    // with membership hysteresis, and the floor quiesce for devices that
+    // have been declining for QUIESCE_STICKY_TICKS.  All single-threaded
+    // here (tick thread owns cand_/decline_ counters); the hot path only
+    // reads the published atomics.
+    if (ranked_active_()) rank_tick_(secs);
     refresh_queue_floor_();
     // EMA movement is the one yield-decision input with no queue event;
     // wake any GPU parked in wait_for_gpu_yield so it re-evaluates.
@@ -6686,6 +6838,174 @@ private:
   std::atomic<int>    cpu_samples_{0};     // warm-up counter
   std::atomic<int>    gpu_samples_{0};     // warm-up counter
 
+  // Ranked-engine dispatch (--adapt, M4 action 2): every engine is ranked
+  // individually — the CPU pool as one engine, each GPU DEVICE as its own
+  // (per-device EMA over the bytes its streams complete).  The tick thread
+  // computes each device's faster_sum = the summed EMAs of every strictly
+  // faster engine; the hot path applies the generalized tail-yield
+  // inequality against it.  Membership of the faster set only swaps after
+  // RANK_STICKY_TICKS agreeing ticks (values refresh every tick) — rank
+  // swaps are damped, rate drift is live.
+  struct DevStat {
+    std::atomic<uint64_t> bytes{0};        // tick-window byte accumulator
+    std::atomic<double>   ema{0.0};        // GiB/s, this device's streams
+    std::atomic<int>      samples{0};      // rank-eligible at >= 2 (F5 rule)
+    std::atomic<int>      streams{0};      // live streams on this device
+    std::atomic<double>   faster_sum{0.0}; // sum of strictly-faster EMAs
+    std::atomic<uint64_t> faster_mask{0};  // membership: bit0=cpu, bit1+i=dev i
+    uint64_t              cand_mask = 0;   // tick-thread only: pending membership
+    int                   cand_ticks = 0;  // tick-thread only: agreement streak
+    int                   decline_ticks = 0; // tick-thread only: quiesce streak
+    std::atomic<bool>     quiesced{false}; // floor reservation released (one-way)
+  };
+  std::unique_ptr<DevStat[]> dev_;         // size RANKED_MAX, ctor-fixed
+  static constexpr int RANKED_MAX           = 32; // table cap (raw CUDA ids)
+  static constexpr int RANK_STICKY_TICKS    = 3;  // 1.5 s at the 0.5 s tick
+  static constexpr int QUIESCE_STICKY_TICKS = 5;  // 2.5 s declining -> floor release
+  std::atomic<uint64_t> cpu_payload_bytes_{0};    // payload-unit window (ranked)
+  std::atomic<double>   cpu_payload_ema_{0.0};    // GiB/s payload, CPU pool
+
+  // Tick-thread half of the ranked dispatcher: per-device EMAs, faster-set
+  // membership with hysteresis (values live, membership damped), and the
+  // one-way floor quiesce.  cand_/decline_ counters are tick-thread-only.
+  void rank_tick_(double secs) {
+    // Per-device EMA update (alpha matches the aggregate EMAs).
+    for (int i = 0; i < RANKED_MAX; ++i) {
+      DevStat & D = dev_[i];
+      const uint64_t b = D.bytes.exchange(0, std::memory_order_relaxed);
+      if (b == 0) continue;
+      const double sample = (double(b) / std::max(1e-6, secs)) / 1e9;
+      const double prev = D.ema.load(std::memory_order_relaxed);
+      D.ema.store(prev == 0.0 ? sample : prev * 0.7 + sample * 0.3,
+                  std::memory_order_relaxed);
+      D.samples.fetch_add(1, std::memory_order_relaxed);
+    }
+    // CPU payload EMA (ranked comparisons only).
+    {
+      const uint64_t b = cpu_payload_bytes_.exchange(0, std::memory_order_relaxed);
+      if (b > 0) {
+        const double sample = (double(b) / std::max(1e-6, secs)) / 1e9;
+        const double prev = cpu_payload_ema_.load(std::memory_order_relaxed);
+        cpu_payload_ema_.store(prev == 0.0 ? sample : prev * 0.7 + sample * 0.3,
+                               std::memory_order_relaxed);
+      }
+    }
+    // Faster set per device.  Contributors: the CPU pool (payload EMA) and
+    // every other live, non-quiesced device with a strictly greater EMA.
+    // Membership swaps only after RANK_STICKY_TICKS agreeing ticks so a
+    // noisy tick can't flip ranks; the SUM refreshes every tick so rate
+    // drift stays live inside a stable ranking.
+    const bool   cpu_ok = cpu_samples_.load(std::memory_order_relaxed) >= 2;
+    const double c      = cpu_ok ? cpu_payload_ema_.load(std::memory_order_relaxed) : 0.0;
+    for (int i = 0; i < RANKED_MAX; ++i) {
+      DevStat & D = dev_[i];
+      if (D.samples.load(std::memory_order_relaxed) < 2) continue;
+      const double mine = D.ema.load(std::memory_order_relaxed);
+      uint64_t mask = 0; double sum = 0.0;
+      if (cpu_ok && c > mine) { mask |= 1ull; sum += c; }
+      for (int j = 0; j < RANKED_MAX; ++j) {
+        if (j == i) continue;
+        const DevStat & O = dev_[j];
+        if (O.samples.load(std::memory_order_relaxed) < 2) continue;
+        if (O.streams.load(std::memory_order_relaxed) <= 0) continue;
+        if (O.quiesced.load(std::memory_order_relaxed)) continue;  // mostly parked
+        const double oe = O.ema.load(std::memory_order_relaxed);
+        if (oe > mine) { mask |= (2ull << j); sum += oe; }
+      }
+      const uint64_t pub = D.faster_mask.load(std::memory_order_relaxed);
+      if (mask == pub) {
+        D.cand_ticks = 0;
+        D.faster_sum.store(sum, std::memory_order_relaxed);
+      } else if (mask == D.cand_mask) {
+        if (++D.cand_ticks >= RANK_STICKY_TICKS) {
+          D.faster_mask.store(mask, std::memory_order_relaxed);
+          D.faster_sum.store(sum, std::memory_order_relaxed);
+          D.cand_ticks = 0;
+        }
+      } else {
+        D.cand_mask = mask;
+        D.cand_ticks = 1;
+      }
+    }
+    // Floor quiesce: a device that has been DECLINING (by the same
+    // inequality the hot path uses) for QUIESCE_STICKY_TICKS releases its
+    // share of the queue-floor reservation — one-way for the run, per the
+    // plan's no-flapping rule.  Intake stays live: a quiesced device that
+    // later passes the inequality still takes (as overflow, unreserved).
+    const size_t depth = queue_ ? queue_->size() : 0;
+    const double batch =
+        (double)std::max<size_t>(1, gpu_batch_size_.load(std::memory_order_relaxed));
+    for (int i = 0; i < RANKED_MAX; ++i) {
+      DevStat & D = dev_[i];
+      if (D.quiesced.load(std::memory_order_relaxed)) continue;
+      if (D.streams.load(std::memory_order_relaxed) <= 0) { D.decline_ticks = 0; continue; }
+      bool declining = false;
+      if (D.samples.load(std::memory_order_relaxed) >= 2
+          // Mirror the hot path's drain-of-last-resort rule: below
+          // --cpu-queue-min the device TAKES, so counting that instant as
+          // declining would quiesce (and mislabel) a device that is in
+          // fact draining every frame.
+          && !(opt_.cpu_queue_min > 0 && depth <= (size_t)opt_.cpu_queue_min)) {
+        const double mine = D.ema.load(std::memory_order_relaxed);
+        const double fs   = D.faster_sum.load(std::memory_order_relaxed);
+        if (mine > 0.0 && fs > 0.0) {
+          const double streams =
+              (double)std::max(1, D.streams.load(std::memory_order_relaxed));
+          declining = ((double)depth - batch) / fs < 1.3 * batch * streams / mine;
+        }
+      }
+      if (!declining) { D.decline_ticks = 0; continue; }
+      if (++D.decline_ticks >= QUIESCE_STICKY_TICKS) {
+        D.quiesced.store(true, std::memory_order_relaxed);
+        g_adapt_action_flags.fetch_or(ADAPT_ACT_DEVICE_QUIESCE,
+                                      std::memory_order_relaxed);
+        if (queue_) queue_->notify_cpu_waiters();
+        if (opt_.verbosity >= V_VERBOSE) {
+          char line[192];
+          std::snprintf(line, sizeof(line),
+            "[ADAPT] gpu%d ranked slow (%.2f vs faster %.2f GiB/s): floor "
+            "reservation released (overflow-only for this run)\n",
+            i, D.ema.load(std::memory_order_relaxed),
+            D.faster_sum.load(std::memory_order_relaxed));
+          vlog(V_VERBOSE, opt_, line);
+        }
+      }
+    }
+  }
+
+  bool ranked_active_() const {
+    return opt_.adapt && !fixed_mode_ && dev_ != nullptr;
+  }
+
+  bool dev_valid_(int device) const {
+    return device >= 0 && device < RANKED_MAX && dev_ != nullptr;
+  }
+
+  // Test hook body: "cpu=10,gpu0=0.5,gpu1=3" (GiB/s), samples forced to 2.
+  void parse_injected_rates_(const char * spec) {
+    std::string s(spec);
+    size_t pos = 0;
+    while (pos < s.size()) {
+      size_t comma = s.find(',', pos);
+      if (comma == std::string::npos) comma = s.size();
+      std::string kv = s.substr(pos, comma - pos);
+      pos = comma + 1;
+      size_t eq = kv.find('=');
+      if (eq == std::string::npos) continue;
+      const std::string key = kv.substr(0, eq);
+      double val = 0.0;
+      try { val = std::stod(kv.substr(eq + 1)); } catch (...) { continue; }
+      if (val <= 0.0) continue;
+      if (key == "cpu") {
+        cpu_rate_ema_.store(val); cpu_payload_ema_.store(val); cpu_samples_.store(2);
+      } else if (key.size() > 3 && key.compare(0, 3, "gpu") == 0) {
+        int d = -1;
+        try { d = std::stoi(key.substr(3)); } catch (...) { continue; }
+        if (dev_valid_(d)) { dev_[d].ema.store(val); dev_[d].samples.store(2); }
+      }
+    }
+  }
+
   // Compute the floor scale factor for AUTO mode.
   //
   // Policy: "GPU first, CPU as surplus."  CPU can only take a frame when
@@ -6735,6 +7055,11 @@ private:
   }
 
   void update_queue_floor(int streams, size_t batch) {
+    // Quiesced devices (--adapt ranked dispatch) reserve nothing: the floor
+    // exists to keep the NEXT batch fillable, and a quiesced device has
+    // declared it won't form one.  Single choke point — every caller passes
+    // the raw aggregate count.
+    streams = floor_streams_(streams);
     size_t nominal = size_t(std::max(0, streams)) * batch;
     double factor = resolve_factor_();
     size_t floor = (size_t)(double(nominal) * factor + 0.5);
@@ -6791,84 +7116,6 @@ static void tick_loop_fn(std::atomic<bool> & done, HybridSched * sched)
 /*======================================================================
  CPU workers (normal + rescue)
 ======================================================================*/
-struct RateMatchState {
-  // GPU throughput (bytes/sec, smoothed)
-  std::atomic<double> gpu_thr{0.0};     // GiB/s across all GPUs combined
-  std::atomic<double> cpu_thr{0.0};     // GiB/s across all CPU threads combined
-
-  // Accumulators for windowed measurement
-  std::atomic<uint64_t> gpu_window_bytes{0};
-  std::atomic<uint64_t> gpu_window_ns{0};
-  std::atomic<uint64_t> cpu_window_bytes{0};
-  std::atomic<uint64_t> cpu_window_ns{0};
-  std::chrono::steady_clock::time_point last_update = std::chrono::steady_clock::now();
-  std::mutex update_mtx;
-
-  // CPU frame allowance: how many frames CPUs should take per cycle
-  // Updated each time throughput is measured
-  std::atomic<int> cpu_frame_allowance{4};  // start conservative
-  std::atomic<int> cpu_frames_taken{0};     // frames taken in current cycle
-
-  void report_gpu(uint64_t bytes, uint64_t ns) {
-    gpu_window_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    gpu_window_ns.fetch_add(ns, std::memory_order_relaxed);
-  }
-
-  void report_cpu(uint64_t bytes, uint64_t ns) {
-    cpu_window_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    cpu_window_ns.fetch_add(ns, std::memory_order_relaxed);
-  }
-
-  // Called periodically (e.g., every 0.5s) to update throughput estimates
-  // and recalculate CPU frame allowance.
-  void update(size_t gpu_batch_size, size_t avg_frame_bytes) {
-    std::unique_lock<std::mutex> lk(update_mtx, std::try_to_lock);
-    if (!lk.owns_lock()) return;
-
-    auto now = std::chrono::steady_clock::now();
-    double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
-        now - last_update).count();
-    if (secs < 0.3) return;
-    last_update = now;
-
-    uint64_t gb = gpu_window_bytes.exchange(0);
-    uint64_t gn = gpu_window_ns.exchange(0);
-    uint64_t cb = cpu_window_bytes.exchange(0);
-    uint64_t cn = cpu_window_ns.exchange(0);
-
-    // Smoothed throughput (EMA alpha=0.3)
-    if (gn > 0) {
-      double g = double(gb) / (double(gn) / 1e9) / 1e9;  // GiB/s
-      double old = gpu_thr.load(std::memory_order_relaxed);
-      gpu_thr.store(old * 0.7 + g * 0.3, std::memory_order_relaxed);
-    }
-    if (cn > 0) {
-      double c = double(cb) / (double(cn) / 1e9) / 1e9;  // GiB/s
-      double old = cpu_thr.load(std::memory_order_relaxed);
-      cpu_thr.store(old * 0.7 + c * 0.3, std::memory_order_relaxed);
-    }
-
-    // Calculate CPU frame allowance: how many frames should CPUs process
-    // while GPUs process one batch, so both finish at the same time
-    double g_thr = gpu_thr.load(std::memory_order_relaxed);
-    double c_thr = cpu_thr.load(std::memory_order_relaxed);
-    if (g_thr > 0 && c_thr > 0 && avg_frame_bytes > 0) {
-      // GPU batch time = batch_size * frame_size / gpu_throughput
-      double gpu_batch_sec = double(gpu_batch_size * avg_frame_bytes) / (g_thr * 1e9);
-      // CPU frames in that time = gpu_batch_time * cpu_throughput / frame_size
-      int allowance = (int)(gpu_batch_sec * c_thr * 1e9 / double(avg_frame_bytes));
-      allowance = std::max(1, std::min(allowance, 1000));  // sanity bounds
-      cpu_frame_allowance.store(allowance, std::memory_order_relaxed);
-    }
-    cpu_frames_taken.store(0, std::memory_order_relaxed);
-  }
-
-  // Reset cycle counter (called when GPU batch completes)
-  void reset_cycle() {
-    cpu_frames_taken.store(0, std::memory_order_relaxed);
-  }
-};
-
 static void cpu_worker(
   int worker_id,
   TaskQueue * tq,
@@ -6877,7 +7124,6 @@ static void cpu_worker(
   Meter * m,
 #ifdef HAVE_NVCOMP
   void * sched_ptr,
-  RateMatchState * rate_match,
 #endif
   CpuAgg * cpuagg,
   FrameThrottle * bp)
@@ -7042,9 +7288,6 @@ static void cpu_worker(
       g_perf->sched_cpu_tasks.fetch_add(1);
     }
 #ifdef HAVE_NVCOMP
-    if (rate_match) {
-      rate_match->report_cpu(in_size, uint64_t(ms * 1e6));
-    }
 #endif
 
     if (opt->verbosity >= V_DEBUG) {
@@ -7080,7 +7323,7 @@ static void cpu_worker(
     }
     results->push_to_slot(-1, t.seq, std::move(out_frame));
 #ifdef HAVE_NVCOMP
-    if (sched) sched->add_cpu_bytes(in_size);
+    if (sched) { sched->add_cpu_bytes(in_size); sched->add_cpu_payload_bytes(in_size); }
 #endif
     {
       std::lock_guard<std::mutex> lk(cpuagg->m);
@@ -7145,7 +7388,6 @@ static void cpu_decomp_worker(
   Meter * m,
 #ifdef HAVE_NVCOMP
   void * sched_ptr,
-  RateMatchState * rate_match,
 #endif
   CpuAgg * cpuagg,
   FrameThrottle * bp)
@@ -7452,9 +7694,6 @@ static void cpu_decomp_worker(
       g_perf->sched_cpu_tasks.fetch_add(1);
     }
 #ifdef HAVE_NVCOMP
-    if (rate_match) {
-      rate_match->report_cpu(actual, uint64_t(ms * 1e6));
-    }
 #endif
 
     if (opt->verbosity >= V_DEBUG) {
@@ -7475,7 +7714,7 @@ static void cpu_decomp_worker(
     // skewed the progress bar's frame-level percentage.)
 
 #ifdef HAVE_NVCOMP
-    if (sched) sched->add_cpu_bytes(comp_size);
+    if (sched) { sched->add_cpu_bytes(comp_size); sched->add_cpu_payload_bytes(actual); }
 #endif
     {
       std::lock_guard<std::mutex> lk(cpuagg->m);
@@ -7566,10 +7805,10 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
   for (int i = 0; i < threads; ++i) {
     if (decompress)
       pool.emplace_back(cpu_decomp_worker, i, queue, results, &opt, m,
-                        (void *)nullptr, (RateMatchState *)nullptr, &agg, bp);
+                        (void *)nullptr, &agg, bp);
     else
       pool.emplace_back(cpu_worker, i, queue, results, &opt, m,
-                        (void *)nullptr, (RateMatchState *)nullptr, &agg, bp);
+                        (void *)nullptr, &agg, bp);
   }
   for (auto & th : pool) th.join();
 }
@@ -8284,7 +8523,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   for (int i = 0; i < threads; ++i) {
     pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt_copy, m,
 #ifdef HAVE_NVCOMP
-                      nullptr, nullptr,
+                      nullptr,
 #endif
                       &cpuagg, bp_ptr);
   }
@@ -12403,7 +12642,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   Options opt_copy = opt;
   for (int i = 0; i < threads; ++i) pool.emplace_back(cpu_worker, i, &queue, &results, &opt_copy, m,
 #ifdef HAVE_NVCOMP
-    nullptr, nullptr,
+    nullptr,
 #endif
     &cpuagg, &throttle);
   if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
@@ -12703,15 +12942,9 @@ static inline size_t gpu_desync_batch(size_t pop_n, const SharedTuneState* st) {
   return lo + (size_t)(s % (uint64_t)(pop_n - lo + 1));   // uniform in [pop_n/2, pop_n]
 }
 
-// Rate-matched dispatch: tracks CPU and GPU throughput to partition work
-// so both finish at roughly the same time.  This minimizes out-of-order
-// delivery to the writer.
-//
-// Usage:
-//   - GPU workers call report_gpu() after each batch completion
-//   - CPU workers call report_cpu() after each frame completion
-//   - CPU workers call should_cpu_take() to check if they should grab work
-//   - The dispatcher calculates how many CPU frames to allow per GPU batch cycle
+// (RateMatchState — the old rate-matched CPU frame allowance — was deleted
+// in v0.15.4: its allowance was computed but read by nothing, and its role
+// is filled by HybridSched's ranked-engine dispatch under --adapt.)
 
 // Per-stream stats for JSON export.
 struct StreamStats {
@@ -13417,7 +13650,7 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
                             const Options & opt,
                             ResultStore * results, DevStats * devstats,
                             HybridSched * sched, SharedTuneState * shared_tune,
-                            RateMatchState * rate_match, FrameThrottle * bp,
+                            FrameThrottle * bp,
                             std::atomic<double> * util_scale)
 {
   uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
@@ -13493,7 +13726,7 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
     devstats->batches += 1;
   }
   #ifdef HAVE_NVCOMP
-  if (sched) sched->add_gpu_bytes(in_sum);
+  if (sched) sched->add_gpu_bytes(in_sum, device_id);
   #endif
   // Accumulate into per-stream stats
   C.stats.h2d_ms   += h2d_ms;
@@ -13515,14 +13748,6 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   if (shared_tune)
     g_adapt_settled_batch.store(shared_tune->batch_size.load(std::memory_order_relaxed),
                                 std::memory_order_relaxed);
-  if (rate_match) {
-    rate_match->report_gpu(in_sum, uint64_t(tot_ms * 1e6));
-    rate_match->reset_cycle();
-    size_t avg_frame = (C.filled > 0) ? in_sum / C.filled : 16 * 1024 * 1024;
-    size_t batch_sz = shared_tune ? shared_tune->batch_size.load() : C.filled;
-    rate_match->update(batch_sz, avg_frame);
-  }
-
   // -vv: batch completion line
   if (opt.verbosity >= V_DEBUG) {
     char in_s[32], out_s[32];
@@ -13592,7 +13817,6 @@ static void gpu_worker(
   std::string * fatal_msg,
   std::atomic<bool> * gpu_started_flag,
   SharedTuneState * shared_tune,
-  RateMatchState * rate_match,
   FrameThrottle * bp,
   std::atomic<int> * gpu_failures,   // terminal failures (init or mid-run), all workers
   int gpu_worker_count)              // total GPU workers spawned (for last-failure detection)
@@ -13814,7 +14038,7 @@ static void gpu_worker(
       // Register each successfully-initialized stream so the scheduler
       // reserves enough queue depth for GPU batch demand.
       for (size_t s = 0; s < ctxs.size(); ++s)
-        sched->register_gpu_stream();
+        sched->register_gpu_stream(device_id);
     }
     wd_dev(slot_index, device_id);   // diagnostic watchdog
 
@@ -13845,7 +14069,7 @@ static void gpu_worker(
           wd_sync(slot_index, (int)C->stats.stream_index, (int)st);
           checkCuda(st, "cudaEventSynchronize(batch done)");
           gpu_drain_batch(*C, device_id, slot_index, opt, results, devstats,
-                          sched, shared_tune, rate_match, bp, &util_scale);
+                          sched, shared_tune, bp, &util_scale);
           wd_idle(slot_index, (int)C->stats.stream_index);
           {
             std::lock_guard<std::mutex> lk(idle_m);
@@ -14122,16 +14346,17 @@ static void gpu_worker(
       // keep draining on the drain thread either way, so parking here is
       // safe even with busy streams (the old single-thread loop could only
       // park when everything was idle — its poll would have starved).
-      if (sched && !sched->should_gpu_take()) {
+      if (sched && !sched->should_gpu_take(device_id)) {
         if (queue->drained()) break;
         if (!sched->is_fixed_mode()) {
-          // Adaptive tail yield (compress): CPUs are draining the rest.
-          // Park on the queue CV until an event that could change the
-          // decision: a pop shrinks the queue, the queue drains, or a
+          // Adaptive tail yield (compress) / ranked overflow (--adapt):
+          // CPUs (or faster engines) are draining the rest.  Park on the
+          // queue CV until an event that could change the decision: a pop
+          // shrinks the queue, a push deepens it, the queue drains, or a
           // scheduler tick moves the EMAs.  No polling, no fixed sleeps.
           if (!queue->wait_for_gpu_yield(
                   [&](const TaskQueue::QueueState & qs) {
-                    return sched->should_gpu_take_at(qs.depth);
+                    return sched->should_gpu_take_at(qs.depth, device_id, true);
                   }))
             break;   // drained while parked
         } else {
@@ -14381,7 +14606,7 @@ static void gpu_worker(
     // Deregister streams so queue floor drops and CPU workers aren't blocked
     if (sched) {
       for (size_t s = 0; s < ctxs.size(); ++s)
-        sched->unregister_gpu_stream();
+        sched->unregister_gpu_stream(device_id);
     }
 
     // Wake all CPU workers: with notify_one in gpu_got_data(), CPUs that
@@ -14431,7 +14656,7 @@ static void gpu_worker(
     // Deregister streams so the queue floor drops and CPU workers aren't blocked.
     if (sched && ctxs_ptr) {
       for (size_t s = 0; s < ctxs_ptr->size(); ++s)
-        sched->unregister_gpu_stream();
+        sched->unregister_gpu_stream(device_id);
     }
 
     // Wake everything so it sees the abort and tears down cleanly: the writer's
@@ -14889,7 +15114,6 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // still doing CUDA context init and memory allocation.
   std::vector<std::thread> cpu_pool;
   int cpu_threads = 0;
-  RateMatchState rate_match_compress;
   if (sched) {
     cpu_threads = resolve_cpu_threads(opt.cpu_threads);
     cpuagg.threads = cpu_threads;
@@ -14902,7 +15126,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
     for (int i = 0; i < cpu_threads; ++i)
-      cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &rate_match_compress, &cpuagg, &throttle);
+      cpu_pool.emplace_back(cpu_worker, i, &queue, &results, &opt, m, (void*)sched, &cpuagg, &throttle);
   }
 
   // ---- GPU workers (init CUDA context, allocate memory  CPUs already working) ----
@@ -14952,7 +15176,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                          &per_dev[size_t(i)], &json_sink, m, sched,
                          &any_gpu_failed, &abort_on_failure,
                          &fatal_msgs[size_t(i)], &gpu_started,
-                         &shared_tune, &rate_match_compress,
+                         &shared_tune,
                          &throttle, &gpu_failures, gpu_count);
   }
   if (opt.verbosity >= V_VERBOSE) {
@@ -15242,7 +15466,6 @@ static void gpu_decomp_worker(
   std::atomic<bool> * abort_on_failure,
   std::string * fatal_msg,
   SharedTuneState * shared_tune,
-  RateMatchState * rate_match,
   FrameThrottle * bp,
   std::atomic<int> * gpu_failures,   // terminal failures (init or mid-run), all workers
   int gpu_worker_count)              // total GPU workers spawned (for last-failure detection)
@@ -15543,7 +15766,7 @@ static void gpu_decomp_worker(
     if (sched) {
       sched->set_gpu_ready(device_id);
       for (size_t s = 0; s < ctxs.size(); ++s)
-        sched->register_gpu_stream();
+        sched->register_gpu_stream(device_id);
     }
 
     // Utilization scaling factor: 1.0 = idle, 0.1 = 90% busy.
@@ -15773,18 +15996,19 @@ static void gpu_decomp_worker(
         // Fixed-share mode: GPU yields when CPU is below its target share.
         // If the queue is already drained, propagate that so the worker can
         // exit instead of spinning forever on the share check.
-        if (sched && !sched->should_gpu_take()) {
+        if (sched && !sched->should_gpu_take(device_id)) {
           if (queue->drained()) { producer_done_seen = true; continue; }
-          // Adaptive tail yield (decompress): CPUs are draining the rest.
-          // Park on the queue CV until an event that could change the
-          // decision: a pop shrinks the queue, the queue drains, or a
-          // scheduler tick moves the EMAs.  No polling, no fixed sleeps.
-          // (Fixed mode keeps its spin: the share check is designed to
-          // oscillate per-batch.  Adaptive decompress never declines.)
+          // Ranked overflow decline (--adapt) — the only way adaptive
+          // decompress reaches here (the aggregate tail check never arms
+          // for decompress).  Park on the queue CV until an event that
+          // could change the decision: a pop shrinks the queue, a push
+          // deepens it, the queue drains, or a scheduler tick moves the
+          // EMAs.  No polling, no fixed sleeps.  (Fixed mode keeps its
+          // spin: the share check is designed to oscillate per-batch.)
           if (!sched->is_fixed_mode()) {
             if (!queue->wait_for_gpu_yield(
                     [&](const TaskQueue::QueueState & qs) {
-                      return sched->should_gpu_take_at(qs.depth);
+                      return sched->should_gpu_take_at(qs.depth, device_id, true);
                     }))
               producer_done_seen = true;
           }
@@ -16166,17 +16390,9 @@ static void gpu_decomp_worker(
           if (shared_tune)
             g_adapt_settled_batch.store(shared_tune->batch_size.load(std::memory_order_relaxed),
                                         std::memory_order_relaxed);
-          // Report to rate-matcher and reset CPU cycle
-          if (rate_match) {
-            rate_match->report_gpu(out_sum, now_ns() - batch_t0);
-            rate_match->reset_cycle();
-            size_t avg_frame = (C.filled > 0) ? out_sum / C.filled : 16 * 1024 * 1024;
-            size_t batch_sz = shared_tune ? shared_tune->batch_size.load() : C.filled;
-            rate_match->update(batch_sz, avg_frame);
-          }
         }
 
-        if (sched) sched->add_gpu_bytes(out_sum);
+        if (sched) sched->add_gpu_bytes(out_sum, device_id);
 
         if (opt.verbosity >= V_DEBUG) {
           uint64_t in_sum_v = 0;
@@ -16267,7 +16483,7 @@ static void gpu_decomp_worker(
     // Deregister streams so queue floor drops and CPU workers aren't blocked
     if (sched) {
       for (size_t s = 0; s < ctxs.size(); ++s)
-        sched->unregister_gpu_stream();
+        sched->unregister_gpu_stream(device_id);
     }
 
     // Wake all CPU workers (see gpu_worker for rationale)
@@ -16310,7 +16526,7 @@ static void gpu_decomp_worker(
     // Deregister streams so queue floor drops and CPU workers aren't blocked
     if (sched) {
       for (size_t s = 0; s < ctxs.size(); ++s)
-        sched->unregister_gpu_stream();
+        sched->unregister_gpu_stream(device_id);
     }
 
     {
@@ -16408,7 +16624,6 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // can error out cleanly instead of buffering the whole file with no
   // consumer (the synchronous path errored instantly at detection time).
   std::atomic<bool> gpu_only_no_device{false};
-  RateMatchState rate_match;
 
   // ---- Oversize first-frame peek (replaces the v0.12.22-v0.12.36 full
   // pre-scan that ran BEFORE worker spawn).  The pre-scan blocked worker
@@ -16521,7 +16736,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     }
     for (int i = 0; i < cpu_threads; ++i)
       cpu_pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
-                            (void*)sched, &rate_match, &cpuagg, bp_ptr);
+                            (void*)sched, &cpuagg, bp_ptr);
   }
 
   // ---- GPU decompression workers ----
@@ -16600,7 +16815,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
                                &queue, &rescue, &results, m, sched,
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
-                               &shared_tune_decomp, &rate_match,
+                               &shared_tune_decomp,
                                bp_ptr, &gpu_failures, gpu_count);
     }
     if (opt.verbosity >= V_VERBOSE) {

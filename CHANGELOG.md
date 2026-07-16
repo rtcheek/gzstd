@@ -1,11 +1,29 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.3  
+**Covers:** v0.9.50 → v0.15.4  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.4 — --adapt M4 action 2: ranked-engine overflow dispatch (the heart of the chapter)
+
+**Every engine is now ranked individually under `--adapt` — the CPU pool as one engine, each GPU device as its own — and dispatch generalizes the proven tail-yield inequality to every engine, all run long:** engine E takes work only when the queue depth exceeds what all strictly-faster engines will drain within E's own batch window (`(depth − batch) / faster_sum ≥ 1.3 · batch · streams_E / rate_E`). The fastest engine has an empty faster-set and always feeds; slower engines are overflow; an engine slower than everyone combined naturally starves to zero intake. With one GPU engine and a faster CPU this is byte-for-byte the v0.13.58 tail inequality — on the measured boxes it degenerates to today's cpu-primary hybrid; on a fast-GPU/weak-CPU box it inverts automatically, same formula, no box assumptions.
+
+Mechanics, all `--adapt`-gated (non-adapt dispatch is byte-for-byte unchanged):
+- **Per-device rate table** in `HybridSched` (fixed 32-slot, indexed by raw CUDA device id so `--gpu-devices` subsetting can't alias), fed by per-device byte windows on the existing tick. **Payload-unit CPU EMA added for the comparisons:** the aggregate CPU counter reports *compressed* bytes on decompress while the GPU side reports decompressed — units that never mattered while decompress never declined, but the ranked inequality compares engines head-to-head, so it gets its own consistently-payload EMA (frames are uniform in payload size, making byte rates a faithful frames/sec proxy).
+- **Ranking on the tick, inequality in the hot path:** the tick computes each device's `faster_sum`; the take-site just applies the inequality. Faster-set *membership* swaps only after 3 agreeing ticks (rank hysteresis); the *sum* refreshes every tick — rate drift stays live inside a stable ranking (observed live: injected 50 GiB/s prior drifting to the real 7.7 while the decline held).
+- **Intake stays a live decision** — declined workers park in the existing `wait_for_gpu_yield` spot (no permits held, no `gpus_waiting_` increment, drain/abort exits intact) and re-evaluate on queue events, so a transient *shallow queue* can't permanently kill a good device (a transient *rate dip* right before parking can, since a parked device's EMA freezes — the between-runs profile promotion is the recovery path for that, by design). **The one-way latch is the floor quiesce:** a device declining for 5 consecutive ticks releases its share of the queue-floor reservation (`[ADAPT] gpuN ranked slow … floor reservation released`), computed by summing streams over non-quiesced devices at the floor's single choke point — no subtraction bookkeeping, so a quiesce and a stream exit can interleave freely. Promotion is between runs via the profile, per the plan's no-flapping rule.
+- **Decompress declining is NEW behavior** (`should_gpu_take` hard-returned true for decompress), reached only under `--adapt`; the trivial-frame CPU routing stays safe because the CPU pool never latches off (its lockout remains the existing floor-factor mechanism). When at the current depth *every* live device would decline (evaluated exactly, per device), the aggregate `tail_yield_` latches and zeroes the floor — same rule as the aggregate tail yield.
+- **`RateMatchState` deleted** (~90 lines + plumbing through 6 signatures): its CPU frame allowance was computed but read by nothing since the semaphore scheduler landed.
+- **Test hook** `GZSTD_DEBUG_ADAPT_RATES=cpu=50,gpu0=0.01,…` injects engine rates into the ranker (unit-level dispatch-math testing without exotic hardware, per plan), publishing an initial ranking at construction so sub-tick runs exercise the decline path.
+
+Verified live on the 8-GPU box: injected slow ranking → GPU batch intake drops from 37 batches (control, throttled CPU) to **0**, output integrity intact, all 8 devices quiesce with the `[ADAPT]` line and the summary reports `device-quiesce(ranked)`; fixed `--cpu-share` and non-adapt runs untouched.
+
+Dedicated adversarial review angle (per plan): 2 majors + 5 minors, majors fixed pre-commit. **MAJOR-1:** the `tail_yield_` latch's CPU wakeup could be lost when the latch fired from the loop-top gate (no queue lock held — a CPU between its floor-predicate check and its CV wait misses the only notification that will ever come; pre-existing in narrower form on the aggregate path, but this change armed the window all run in both directions). Fix: the latch may only fire from a park-predicate caller, which holds `TaskQueue::m_` — an unlocked decline parks and latches at the predicate microseconds later; applied to both the ranked and aggregate latch sites. **MAJOR-2:** the ranked all-decline latch could fire before `producer_done_` (pre-done, a shallow queue measures the reader), permanently stripping the floor from devices still initializing — a 1-GPU pipe run would have latched at its first decline. Fix: the aggregate latch keeps its tail semantics (`producer_done_` gate); per-device parking stays armed all run. Minors fixed: the quiesce evaluation now mirrors the hot path's `--cpu-queue-min` drain-of-last-resort short-circuit (a last-resort-draining device no longer counts as declining), `dev_` null guard on the ctor injection block, test-hook injection extended to the full 32-slot table so >16-GPU boxes can't false-fail. Accepted trades flagged by review: quiesce decides on tick-instant depth snapshots; parked-device EMA freeze (above).
+
+Suite: 343 normal / 460 extensive (5 new: injection zeroes compress intake, declined-run round-trip, injection zeroes decompress intake, inert without --adapt, inert under fixed --cpu-share).
 
 ## v0.15.3 — --adapt M4 opens: the governor acts — source-bound GPU-batch growth latch
 
