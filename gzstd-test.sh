@@ -365,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=333
-$EXTENSIVE && EXPECTED_TESTS=450
+EXPECTED_TESTS=338
+$EXTENSIVE && EXPECTED_TESTS=455
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3286,6 +3286,59 @@ rm -rf "$APRI_XDG" "$TMPDIR/apri.zst" "$TMPDIR/apri.out" "$TMPDIR/apri.err" \
        "$TMPDIR/apri-pipe.err" "$TMPDIR/apri-fp.zst" "$TMPDIR/apri-fp.err" \
        "$TMPDIR/apri-pri.err" "$TMPDIR/apri-ovr.err" "$TMPDIR/apri-drv.err" \
        "$TMPDIR/apri-t.tzst" "$TMPDIR/apri-tar.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt governor actions: source-bound batch latch"
+
+# GZSTD_DEBUG_ADAPT_REGIME forces the classifier's verdict from t=0
+# (skipping ramp + hysteresis) so sub-second suite runs exercise the
+# acting paths deterministically.  --no-profile keeps the persistence
+# layer out of these runs.
+
+# 1. A forced regime publishes and prints the transition line (no GPU needed).
+env GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" --adapt --no-profile -v --cpu-only \
+  -k -f "$TMPDIR/large.bin" -o "$TMPDIR/alat.zst" 2>"$TMPDIR/alat1.err"
+if grep -q '\[ADAPT\] regime: warmup -> sink-bound' "$TMPDIR/alat1.err"; then
+  pass "forced regime prints the transition"
+else
+  fail "forced regime prints the transition"
+fi
+
+# 2. A cpu-only run has no GPU tuner to latch: summary reports actions: none.
+if grep -q 'actions: none' "$TMPDIR/alat1.err"; then
+  pass "cpu-only run reports no governor actions"
+else
+  fail "cpu-only run reports no governor actions"
+fi
+
+if has_gpu 2>/dev/null; then
+  # 3. source-bound + GPU tuner: the growth latch fires, is logged, and
+  # lands in the summary's action list.
+  env GZSTD_DEBUG_ADAPT_REGIME=source-bound "$GZSTD" --adapt --no-profile -v --gpu-only \
+    -k -f "$TMPDIR/large.bin" -o "$TMPDIR/alat.zst" 2>"$TMPDIR/alat2.err"
+  if grep -q 'GPU batch growth latched' "$TMPDIR/alat2.err"; then
+    pass "source-bound latches the GPU batch tuner"
+  else
+    fail "source-bound latches the GPU batch tuner"
+  fi
+  if grep -q 'actions: source-latch(gpu-batch)' "$TMPDIR/alat2.err"; then
+    pass "summary lists the source latch"
+  else
+    fail "summary lists the source latch"
+  fi
+  # 4. The latch touches tuning only: the latched run's output round-trips.
+  "$GZSTD" -d -k -f --cpu-only "$TMPDIR/alat.zst" -o "$TMPDIR/alat.out" 2>/dev/null
+  if files_match "$TMPDIR/large.bin" "$TMPDIR/alat.out"; then
+    pass "latched run output round-trips"
+  else
+    fail "latched run output round-trips"
+  fi
+else
+  skip "source-bound latches the GPU batch tuner" "no GPU"
+  skip "summary lists the source latch" "no GPU"
+  skip "latched run output round-trips" "no GPU"
+fi
+rm -f "$TMPDIR/alat.zst" "$TMPDIR/alat.out" "$TMPDIR/alat1.err" "$TMPDIR/alat2.err"
 
 section "Sliding-window compression"
 

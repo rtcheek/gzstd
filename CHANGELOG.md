@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.2  
+**Covers:** v0.9.50 → v0.15.3  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.3 — --adapt M4 opens: the governor acts — source-bound GPU-batch growth latch
+
+**First acting consumer of the regime classifier (M4 action 1, risk-ascending order): when the governor says SOURCE_BOUND, the GPU batch auto-tuner latches.** The reader is the faucet — a bigger batch can never be filled faster than the source feeds it, so growth is pure pop-latency. The mechanism is deliberately "one more producer for an existing latch": the same `frozen` flag the v0.14.52 sink-freeze uses, now with a `freeze_reason` code (sink | source). Differences from the sink freeze, both principled: **no down-clamp** (there is no writer head-of-line wave to shrink — the latch lands in place at the tuner's current best), and **no desync jitter** (`gpu_desync_batch` is now gated on the *sink* reason specifically: its randomization exists to de-correlate completion waves at the in-order writer, which a starved queue doesn't produce).
+
+Wiring keeps the governor decoupled from worker lifetime: `AdaptGovernor` publishes its regime through a global atomic (`g_adapt_regime`, reset at start, stored on every transition); the two GPU tuner sites (compress + decompress) read it at the top of their existing tune block — **before the `MIN_BATCHES` window gate, because a starved queue may never accumulate a full measurement window** — and latch under the tuner mutex (try-lock, retried next iteration). Actions record themselves in an action-flags bitmask; the end-of-run `[ADAPT]` summary now prints the real action list instead of "(observe-only stage)".
+
+Test hook: `GZSTD_DEBUG_ADAPT_REGIME=source-bound|sink-bound|compute-bound` forces the classifier's verdict from t=0 (skipping ramp + hysteresis), same family as `GZSTD_DEBUG_GPU_CORRUPT` — the plan's sanctioned pattern for making sub-second suite runs exercise governor actions deterministically.
+
+Suite: 338 normal / 455 extensive (5 new: forced regime prints the transition, cpu-only reports actions none, source-bound latches the tuner, summary lists the latch, latched-run output round-trips).
 
 ## v0.15.2 — --adapt priors + the residency-informed decompress default (unconditional)
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.2";
+static constexpr const char * GZSTD_VERSION = "0.15.3";
 //
 // Architecture overview:
 //
@@ -1988,10 +1988,12 @@ static const char * writer_verdict(double busy, double hol, double starved,
  A Meter::reset() mid-run (GPU-fault CPU rebuild) makes deltas go
  negative; the governor re-baselines and skips that window.
 
- This stage is the sensing half: classify + report ([ADAPT] lines at -v).
- The acting half — ranked-engine overflow dispatch, reader/writer pool
- scaling, measured I/O probes, deadline demotion — attaches to these
- regime signals in later 0.15.x stages, per the approved design.
+ The governor publishes its regime through g_adapt_regime; acting sites
+ read it and latch their own mechanisms (first consumer: the GPU batch
+ tuner's source-bound growth latch, v0.15.3).  Remaining acting halves —
+ ranked-engine overflow dispatch, reader/writer pool scaling, measured
+ I/O probes, deadline demotion — attach the same way in later 0.15.x
+ stages, per the approved design.
 ======================================================================*/
 enum class AdaptRegime : int { WARMUP = 0, SOURCE_BOUND, COMPUTE_BOUND, SINK_BOUND };
 
@@ -2006,15 +2008,42 @@ static const char * adapt_regime_name(AdaptRegime r)
   return "?";
 }
 
+// The governor's published regime, readable by any acting site without
+// holding a pointer into the governor (whose lifetime is per-operation):
+// (int)AdaptRegime, stored on every transition, reset at governor start.
+// 0 (WARMUP) doubles as "no governor running" — actions treat it as inert.
+static std::atomic<int> g_adapt_regime{0};
+
+// Actions the governor's regime triggered this operation, as a bitmask —
+// set by the acting sites (GPU workers etc.), consumed by print_summary
+// and reset at governor start.
+static constexpr uint32_t    ADAPT_ACT_SOURCE_LATCH = 1u << 0;
+static std::atomic<uint32_t> g_adapt_action_flags{0};
+
 class AdaptGovernor {
 public:
-  AdaptGovernor(const Options & opt, const Meter * m) : opt_(opt), m_(m) {}
+  AdaptGovernor(const Options & opt, const Meter * m) : opt_(opt), m_(m)
+  {
+    // Test hook: force the classifier's verdict from the first tick (and
+    // skip the ramp), so suite runs of any length exercise the acting
+    // paths deterministically.  Same family as GZSTD_DEBUG_GPU_CORRUPT.
+    if (const char * e = std::getenv("GZSTD_DEBUG_ADAPT_REGIME")) {
+      if      (!std::strcmp(e, "source-bound"))  forced_ = AdaptRegime::SOURCE_BOUND;
+      else if (!std::strcmp(e, "sink-bound"))    forced_ = AdaptRegime::SINK_BOUND;
+      else if (!std::strcmp(e, "compute-bound")) forced_ = AdaptRegime::COMPUTE_BOUND;
+    }
+  }
   ~AdaptGovernor() { stop(); }
 
   void start()
   {
     t_start_ = std::chrono::steady_clock::now();
+    g_adapt_regime.store(0, std::memory_order_relaxed);
+    g_adapt_action_flags.store(0, std::memory_order_relaxed);
     snap_baseline_();
+    // Forced regime (test hook) publishes before any worker runs, so even
+    // sub-tick operations exercise the acting paths.
+    if (forced_ != AdaptRegime::WARMUP) transition_(forced_, now_ns_());
     thr_ = std::thread(&AdaptGovernor::tick_loop_, this);
   }
 
@@ -2071,8 +2100,11 @@ public:
                     adapt_regime_name(r), ns / 1e9, 100.0 * ns / total);
       os << frag;
     }
-    os << " | transitions " << transitions_
-       << " | actions: none (observe-only stage)\n";
+    os << " | transitions " << transitions_ << " | actions:";
+    const uint32_t acts = g_adapt_action_flags.load(std::memory_order_relaxed);
+    if (acts == 0)                       os << " none";
+    if (acts & ADAPT_ACT_SOURCE_LATCH)   os << " source-latch(gpu-batch)";
+    os << "\n";
     vlog(V_VERBOSE, opt_, os.str());
   }
 
@@ -2135,7 +2167,9 @@ private:
     if (dt <= 0) return;
 
     AdaptRegime observed;
-    if (t < int64_t(RAMP_SEC * 1e9)) {
+    if (forced_ != AdaptRegime::WARMUP) {
+      observed = forced_;
+    } else if (t < int64_t(RAMP_SEC * 1e9)) {
       observed = AdaptRegime::WARMUP;
     } else {
       const double sink_busy = double(cur.wdisk - prev_.wdisk) / dt;
@@ -2172,6 +2206,7 @@ private:
     regime_ = to;
     candidate_ = to;
     candidate_ticks_ = 0;
+    g_adapt_regime.store((int)to, std::memory_order_relaxed);
     if (from != AdaptRegime::WARMUP) ++transitions_;
     char line[160];
     std::snprintf(line, sizeof(line), "[ADAPT] regime: %s -> %s (t=%.1f s)\n",
@@ -2196,6 +2231,7 @@ private:
 
   Snap    prev_{};
   int64_t prev_ns_ = 0;
+  AdaptRegime forced_ = AdaptRegime::WARMUP;   // GZSTD_DEBUG_ADAPT_REGIME
   AdaptRegime regime_ = AdaptRegime::WARMUP;
   AdaptRegime candidate_ = AdaptRegime::WARMUP;
   int     candidate_ticks_ = 0;
@@ -12610,6 +12646,11 @@ struct SharedTuneState {
   // the tuner stops churning.  (This is the [WRITER] sink-limited regime; a
   // future --adapt mode generalizes the gate.)
   std::atomic<bool> frozen{false};
+  // Why the latch fired: sink (v0.14.52 writer-busy detection, down-clamped)
+  // or source (--adapt governor says the reader is the faucet, v0.15.3 —
+  // frozen in place, no clamp).  Only the desync jitter distinguishes them.
+  static constexpr int FREEZE_SINK = 1, FREEZE_SOURCE = 2;
+  std::atomic<int> freeze_reason{0};
   static constexpr double SINK_FREEZE_BUSY = 0.55; // writer-busy frac ⇒ sink-bound
   static constexpr double FREEZE_MIN_SEC   = 3.0;  // ignore writer ramp-up before this
   // Freeze clamps the batch DOWN, not just in place: sink-limited means GPU
@@ -12647,7 +12688,11 @@ struct SharedTuneState {
 // contents (and the archive bytes) are identical regardless, so the jitter is
 // output-deterministic.  Pure phase de-correlator; no machine-specific tuning.
 static inline size_t gpu_desync_batch(size_t pop_n, const SharedTuneState* st) {
-  if (!st || !st->frozen.load(std::memory_order_relaxed)) return pop_n;
+  // Sink-freeze only: the jitter exists to de-correlate completion waves at
+  // the in-order writer.  A source-bound freeze (--adapt) has no writer wave
+  // to break — the queue is starved, batches are small and irregular already.
+  if (!st || st->freeze_reason.load(std::memory_order_relaxed)
+                 != SharedTuneState::FREEZE_SINK) return pop_n;
   if (pop_n <= 8) return pop_n;
   // Cheap per-thread xorshift64 — no shared state, no <random> overhead, seeded
   // distinctly per worker thread from its own thread-local storage address.
@@ -13848,8 +13893,31 @@ static void gpu_worker(
       // grabs the mutex first runs the tune logic for everyone.
       if (shared_tune && !shared_tune->locked.load() && !shared_tune->frozen.load()) {
         auto now = std::chrono::steady_clock::now();
+        // --adapt source-bound latch (M4 action 1): the governor says the
+        // reader is the faucet — a bigger batch can never be filled faster
+        // than the source feeds it, so growth is pure latency.  Latch the
+        // tuner in place (no down-clamp: unlike sink-bound there is no
+        // writer head-of-line wave to shrink).  Checked before the window
+        // gate: a starved queue may never accumulate MIN_BATCHES.
+        if (opt.adapt && g_adapt_regime.load(std::memory_order_relaxed)
+              == (int)AdaptRegime::SOURCE_BOUND) {
+          std::unique_lock<std::mutex> lk(shared_tune->tune_mtx, std::try_to_lock);
+          if (lk.owns_lock() && !shared_tune->frozen.load()) {
+            auto & S = *shared_tune;
+            if (!S.best_batch) S.best_batch = S.batch_size.load();
+            S.batch_size.store(S.best_batch);
+            S.phase = SharedTuneState::Phase::SETTLED;
+            S.freeze_reason.store(SharedTuneState::FREEZE_SOURCE);
+            S.frozen.store(true);
+            g_adapt_action_flags.fetch_or(ADAPT_ACT_SOURCE_LATCH,
+                                          std::memory_order_relaxed);
+            if (opt.verbosity >= V_VERBOSE)
+              vlog(V_VERBOSE, opt, "[ADAPT] source-bound: GPU batch growth latched at "
+                   + std::to_string(S.best_batch) + " (source cannot outfeed it)\n");
+          }
+        }
         // Try to run tune logic (non-blocking mutex try_lock)
-        if (shared_tune->window_batches.load(std::memory_order_relaxed) >= SharedTuneState::MIN_BATCHES) {
+        else if (shared_tune->window_batches.load(std::memory_order_relaxed) >= SharedTuneState::MIN_BATCHES) {
           std::unique_lock<std::mutex> lk(shared_tune->tune_mtx, std::try_to_lock);
           if (lk.owns_lock()) {
             double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -13879,6 +13947,7 @@ static void gpu_worker(
                     S.best_batch ? S.best_batch : cur_batch);
                 S.batch_size.store(S.best_batch);
                 S.phase = SharedTuneState::Phase::SETTLED;
+                S.freeze_reason.store(SharedTuneState::FREEZE_SINK);
                 S.frozen.store(true);
                 if (opt.verbosity >= V_VERBOSE) {
                   std::ostringstream os;
@@ -15498,7 +15567,27 @@ static void gpu_decomp_worker(
       // Whichever worker grabs the mutex first runs the tune decision.
       if (shared_tune && !shared_tune->locked.load() && !shared_tune->frozen.load()) {
         auto now = std::chrono::steady_clock::now();
-        if (shared_tune->window_batches.load(std::memory_order_relaxed) >= SharedTuneState::MIN_BATCHES) {
+        // --adapt source-bound latch (M4 action 1) — see the compress-path
+        // twin for rationale.  Checked before the window gate: a starved
+        // queue may never accumulate MIN_BATCHES.
+        if (opt.adapt && g_adapt_regime.load(std::memory_order_relaxed)
+              == (int)AdaptRegime::SOURCE_BOUND) {
+          std::unique_lock<std::mutex> lk(shared_tune->tune_mtx, std::try_to_lock);
+          if (lk.owns_lock() && !shared_tune->frozen.load()) {
+            auto & S = *shared_tune;
+            if (!S.best_batch) S.best_batch = S.batch_size.load();
+            S.batch_size.store(S.best_batch);
+            S.phase = SharedTuneState::Phase::SETTLED;
+            S.freeze_reason.store(SharedTuneState::FREEZE_SOURCE);
+            S.frozen.store(true);
+            g_adapt_action_flags.fetch_or(ADAPT_ACT_SOURCE_LATCH,
+                                          std::memory_order_relaxed);
+            if (opt.verbosity >= V_VERBOSE)
+              vlog(V_VERBOSE, opt, "[ADAPT] source-bound: GPU batch growth latched at "
+                   + std::to_string(S.best_batch) + " (source cannot outfeed it)\n");
+          }
+        }
+        else if (shared_tune->window_batches.load(std::memory_order_relaxed) >= SharedTuneState::MIN_BATCHES) {
           std::unique_lock<std::mutex> lk(shared_tune->tune_mtx, std::try_to_lock);
           if (lk.owns_lock()) {
             double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -15539,6 +15628,7 @@ static void gpu_decomp_worker(
                     S.best_batch ? S.best_batch : cur_batch);
                 S.batch_size.store(S.best_batch);
                 S.phase = SharedTuneState::Phase::SETTLED;
+                S.freeze_reason.store(SharedTuneState::FREEZE_SINK);
                 S.frozen.store(true);
                 if (opt.verbosity >= V_VERBOSE) {
                   std::ostringstream os;
