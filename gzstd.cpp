@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.1";
+static constexpr const char * GZSTD_VERSION = "0.15.2";
 //
 // Architecture overview:
 //
@@ -2214,6 +2214,15 @@ static std::atomic<double>   g_adapt_cpu_ema_gibs{0.0};
 static std::atomic<double>   g_adapt_gpu_ema_gibs{0.0};
 static std::atomic<uint64_t> g_adapt_settled_batch{0};
 
+// --adapt prior SEEDS (the reverse direction: profile -> this run).  Set by
+// apply_backend_defaults from the loaded priors; consumed once by the
+// HybridSched constructor to pre-warm its rate EMAs.  Sample counters seed
+// to 1, NOT the 2 that arms refusals: should_gpu_take_at's first refusal
+// latches tail_yield_ permanently, and a stale profile must never trigger
+// that latch before at least one live measurement per side.
+static std::atomic<double> g_adapt_seed_cpu_gibs{0.0};
+static std::atomic<double> g_adapt_seed_gpu_gibs{0.0};
+
 #ifndef _WIN32
 /*======================================================================
  --adapt persistent per-machine profile (v0.15 M2).
@@ -2566,6 +2575,50 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     dir.put_num("settled_batch", (double)obs.settled_batch);   // discrete: latest wins
   if (obs.regime != "unclassified")
     dir.put_str("regime", obs.regime);
+}
+
+// This machine's priors, read from the profile at startup (v0.15 M3).
+// Consumed by apply_backend_defaults under --adapt: initial backend,
+// GPU batch start point, scheduler EMA seeds, verify-engine choice.
+// A GPU driver version mismatch invalidates ONLY the GPU-derived priors
+// (rates + settled batch); CPU and device rates survive the driver bump.
+struct AdaptPriors {
+  bool loaded = false;      // fingerprint matched an entry
+  bool gpu_valid = false;   // entry's driver == current driver
+  struct Dir {
+    double cpu_gibs = 0, gpu_gibs = 0, source_gibs = 0, sink_gibs = 0;
+    double overall_gibs = 0, settled_batch = 0, runs = 0;
+    std::string regime;
+  } dir[2];                 // [0] = compress, [1] = decompress
+};
+
+static AdaptPriors adapt_load_priors()
+{
+  AdaptPriors P;
+  AdaptJv root;
+  if (!adapt_profile_load(adapt_profile_path(), root)) return P;
+  const AdaptFp fp = adapt_fingerprint();
+  const AdaptJv * entries = root.get("entries");
+  if (!entries || entries->t != AdaptJv::OBJ) return P;
+  const AdaptJv * entry = entries->get(fp.hash);
+  if (!entry || entry->t != AdaptJv::OBJ) return P;
+  P.loaded = true;
+  P.gpu_valid = (entry->gstr("driver", "") == fp.driver);
+  static const char * names[2] = { "compress", "decompress" };
+  for (int d = 0; d < 2; ++d) {
+    const AdaptJv * dj = entry->get(names[d]);
+    if (!dj || dj->t != AdaptJv::OBJ) continue;
+    AdaptPriors::Dir & D = P.dir[d];
+    D.cpu_gibs      = dj->gnum("cpu_gibs", 0);
+    D.gpu_gibs      = P.gpu_valid ? dj->gnum("gpu_gibs", 0) : 0;
+    D.settled_batch = P.gpu_valid ? dj->gnum("settled_batch", 0) : 0;
+    D.source_gibs   = dj->gnum("source_gibs", 0);
+    D.sink_gibs     = dj->gnum("sink_gibs", 0);
+    D.overall_gibs  = dj->gnum("overall_gibs", 0);
+    D.runs          = dj->gnum("runs", 0);
+    D.regime        = dj->gstr("regime", "");
+  }
+  return P;
 }
 
 // Load -> merge -> atomically replace.  Called once per process, only when
@@ -6290,6 +6343,15 @@ public:
       fixed_mode_ = true;
       fixed_cpu_share_ = override_share;
     }
+    // --adapt priors: pre-warm the rate EMAs from the profile so the floor
+    // scaling and tail-yield math start near the measured answer instead of
+    // spending the first ticks converging from zero.  Sample counters seed
+    // to 1 (NOT the refusal-arming 2) — one live tick per side is required
+    // before any refusal can latch tail_yield_ off a stale prior.
+    const double cseed = g_adapt_seed_cpu_gibs.load(std::memory_order_relaxed);
+    const double gseed = g_adapt_seed_gpu_gibs.load(std::memory_order_relaxed);
+    if (cseed > 0) { cpu_rate_ema_.store(cseed); cpu_samples_.store(1); }
+    if (gseed > 0) { gpu_rate_ema_.store(gseed); gpu_samples_.store(1); }
   }
 
   // Set the task queue pointer so gpu_got_data() can wake CPU workers.
@@ -19086,14 +19148,89 @@ static int detect_min_pcie_gen()
 }
 
 
+#ifndef _WIN32
+// Pre-run input page-cache residency (v0.15 M3) — the disk-vs-compute
+// regime signal from the v0.14.93 -l walk, now informing the decompress
+// backend default.  Opens + maps the first input itself (no mapping exists
+// this early), samples mincore — which never faults pages in — and unmaps.
+// NEVER MAP_POPULATE (the mmap fault-storm rule).  Returns <0 for unknown
+// (pipe, unreadable, empty): callers keep today's defaults.
+static double adapt_input_residency(const Options & opt)
+{
+  // --tar decompress/test reads its archive from tar_sources; opt.inputs
+  // holds a synthesized "-" there, which would route the probe to whatever
+  // stdin happens to be (review M3-1: a warm redirected stdin must not
+  // steer the backend for a cold archive).
+  std::string path;
+  if (opt.tar_mode) {
+    if (opt.tar_sources.empty()) return -1.0;
+    path = opt.tar_sources[0];
+  } else if (!opt.inputs.empty() && opt.inputs[0] != "-") {
+    path = opt.inputs[0];
+  }
+  int fd = -1;
+  bool close_fd = false;
+  struct stat st{};
+  if (!path.empty()) {
+    // stat before open: a named FIFO must not get a blocking open + close
+    // (a zero-reader window a fast producer could die in) just to be probed.
+    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return -1.0;
+    fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return -1.0;
+    close_fd = true;
+  } else {
+    fd = 0;   // stdin redirected to a regular file probes fd 0
+  }
+  double resid = -1.0;
+  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+    void * m = ::mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (m != MAP_FAILED) {
+      resid = residency_fraction(m, (size_t)st.st_size);
+      ::munmap(m, (size_t)st.st_size);
+    }
+  }
+  if (close_fd) ::close(fd);
+  return resid;
+}
+
+// True when the run's output lands in a regular file (or nowhere: TEST) —
+// the residency-based default only applies then: a hot small input piped
+// to a slow consumer is sink-bound, not compute-bound, and must keep
+// today's default.
+static bool adapt_output_is_regular(const Options & opt)
+{
+  if (opt.mode == Mode::TEST) return true;         // writes nothing
+  if (!opt.to_stdout) {                            // -o FILE or derived name
+    // An explicit -o naming an EXISTING non-regular sink (FIFO, device) is
+    // exactly the slow-consumer case this guard exists for; a target that
+    // does not exist yet will be created as a regular file.
+    if (!opt.output.empty()) {
+      struct stat st{};
+      if (::stat(opt.output.c_str(), &st) == 0 && !S_ISREG(st.st_mode))
+        return false;
+    }
+    return true;
+  }
+  struct stat st{};
+  return fstat(1, &st) == 0 && S_ISREG(st.st_mode); // stdout > file redirect
+}
+#endif  // !_WIN32
+
 /*======================================================================
  Apply asymmetric-mode default backend selection.  Called after
  parse_args.  No-op if the user explicitly chose a backend.
 
-   COMPRESS                : hybrid (GPU compress wins on all tiers)
-   DECOMPRESS / TEST       : depends on PCIe link gen
+   COMPRESS                : hybrid (GPU compress wins on all tiers),
+                             unless an --adapt profile prior says the CPU
+                             engine dominates this box (then cpu-only)
+   DECOMPRESS / TEST       : profile prior first (--adapt), then PCIe gen:
      Gen<4                 : cpu-only (D2H cost > GPU benefit)
-     Gen4+ or undetectable : hybrid
+     Gen4+ or undetectable : residency-informed — a warm page-cache input
+                             feeds at memory speed (compute-bound regime,
+                             where cpu-only measures fastest on the fabric
+                             boxes), so warm + regular-file output →
+                             cpu-only; cold or unknown → hybrid (today's
+                             default)
 ======================================================================*/
 static void apply_backend_defaults(Options & opt)
 {
@@ -19117,6 +19254,27 @@ static void apply_backend_defaults(Options & opt)
   // the decompress backend default further down.
   int gen = detect_min_pcie_gen();
 
+#ifndef _WIN32
+  // --adapt: load this machine's measured priors once.  They refine the
+  // static rules below (verify engine, GPU batch start, scheduler EMA
+  // seeds, initial backend) — always under the same user-flag guards.
+  AdaptPriors priors;
+  if (opt.adapt && !opt.no_profile) {
+    if (opt.verbosity >= V_DEBUG) {   // -vv: lets users (and the suite) see the profile key
+      const AdaptFp fp = adapt_fingerprint();
+      vlog(V_DEBUG, opt, "[ADAPT] fingerprint " + fp.hash + " driver "
+           + (fp.driver.empty() ? "(none)" : fp.driver) + " (" + fp.human + ")\n");
+    }
+    priors = adapt_load_priors();
+    if (priors.loaded && opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, std::string("[ADAPT] profile priors loaded")
+           + (priors.gpu_valid ? "" : " (driver changed: GPU rates/batch invalidated)")
+           + "\n");
+  }
+  const AdaptPriors::Dir & prior_dir =
+      priors.dir[opt.mode == Mode::COMPRESS ? 0 : 1];
+#endif
+
   // Resolve the --verify engine (compress only).  GPU verify (decompress + raw
   // byte-compare in VRAM) applies ONLY to gpu-only mode, where every frame flows
   // through the GPU worker.  It trades the GPU's spare compute for the CPU's, so
@@ -19129,10 +19287,25 @@ static void apply_backend_defaults(Options & opt)
   // otherwise.  (A true runtime bottleneck read — the [WRITER] sink-vs-upstream
   // verdict — is the lever a future --adapt mode would steer this with.)
   opt.gpu_verify = false;
+  std::string verify_auto_why = " [auto: PCIe Gen" + std::to_string(gen) + "]";
   if (opt.verify && opt.gpu_only && opt.mode == Mode::COMPRESS) {
     if      (opt.verify_engine == VERIFY_ENGINE_GPU) opt.gpu_verify = true;
     else if (opt.verify_engine == VERIFY_ENGINE_CPU) opt.gpu_verify = false;
-    else                                             opt.gpu_verify = (gen >= 4);  // auto
+    else {
+      // auto: PCIe generation is the cold-start guess; an observed regime
+      // from this machine's profile is the real bottleneck read the comment
+      // above always named as the --adapt lever.  GPU verify wins exactly
+      // when the GPU is the idle resource — any observed regime OTHER than
+      // compute-bound (sink- or source-bound pipeline) means it has cycles.
+      opt.gpu_verify = (gen >= 4);
+#ifndef _WIN32
+      if (priors.loaded && !prior_dir.regime.empty()
+          && prior_dir.regime != "calibrate" && prior_dir.regime != "unclassified") {
+        opt.gpu_verify = (prior_dir.regime != "compute-bound");
+        verify_auto_why = " [auto: profile regime " + prior_dir.regime + "]";
+      }
+#endif
+    }
     // The byte-compare kernel (gpuverify.cu) only carries images for the
     // architectures this binary was built for, plus a JIT-able PTX fallback.
     // On a GPU outside that range the launch would fail with no-image-for-device
@@ -19151,7 +19324,7 @@ static void apply_backend_defaults(Options & opt)
            + (opt.gpu_verify ? "GPU (decompress + byte-compare in VRAM)"
                              : "CPU (background decompress-verify pool)")
            + (opt.verify_engine == VERIFY_ENGINE_AUTO
-                ? " [auto: PCIe Gen" + std::to_string(gen) + "]" : " [forced]") + "\n");
+                ? verify_auto_why : " [forced]") + "\n");
   } else if (opt.verify && opt.verify_engine == VERIFY_ENGINE_GPU
              && opt.mode == Mode::COMPRESS) {
     // GPU verify only works in gpu-only mode (every frame goes through the GPU
@@ -19177,7 +19350,66 @@ static void apply_backend_defaults(Options & opt)
            + " detected; defaulting output to --direct (override with --no-direct)\n");
   }
 
+#ifndef _WIN32
+  // --adapt seeds (apply even with an explicit backend — they tune HOW an
+  // engine runs, not WHICH engine runs; each under its own user guard):
+  //   * GPU batch start point: the tuner begins at the cap
+  //     (shared_tune.batch_size = gpu_batch_cap), so seeding the cap with
+  //     the profile's last-used batch replaces the exploration ramp; the
+  //     tuner still probes from there, so a stale value is recoverable.
+  //   * Scheduler EMA seeds: consumed by the HybridSched constructor
+  //     (samples seed to 1 — one live tick before any refusal can latch).
+  if (priors.gpu_valid) {
+    if (!opt.gpu_batch_user_set && prior_dir.settled_batch >= 1) {
+      // Clamp before the cast: a foreign/hand-edited profile can legally
+      // carry any finite double, and double->size_t above the type's range
+      // is UB (same magnitude guard as the profile emitter's integer branch).
+      const size_t settled = (size_t)std::min(prior_dir.settled_batch,
+                                              (double)HARD_BATCH_CAP);
+      opt.gpu_batch_cap = settled;
+      if (opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt, "[ADAPT] GPU batch starts at the profile's settled "
+             + std::to_string(settled) + " (tuner still explores)\n");
+    }
+    if (prior_dir.gpu_gibs > 0)
+      g_adapt_seed_gpu_gibs.store(prior_dir.gpu_gibs, std::memory_order_relaxed);
+  }
+  if (priors.loaded && prior_dir.cpu_gibs > 0)
+    g_adapt_seed_cpu_gibs.store(prior_dir.cpu_gibs, std::memory_order_relaxed);
+#endif
+
   if (opt.backend_user_set) return;
+
+#ifndef _WIN32
+  // --adapt backend prior: measured engine ranking beats every static rule
+  // below.  cpu-only when the CPU engine dominates outright (> 1.5x the GPU
+  // engine — hybrid coordination overhead can't win back a gap that wide,
+  // the measured story of the fast-fabric boxes); anything closer keeps
+  // hybrid, where the scheduler splits by live rates.  Never gpu-ONLY by
+  // default: hybrid contains it, minus the single-engine failure mode.
+  if (priors.loaded && prior_dir.cpu_gibs > 0 && prior_dir.gpu_gibs > 0) {
+    const bool cpu_dominates = prior_dir.cpu_gibs > 1.5 * prior_dir.gpu_gibs;
+    if (cpu_dominates) opt.cpu_only = true;
+    else               opt.hybrid = true;
+    if (cpu_dominates && opt.cpu_queue_min > 0) {   // mirror the Gen<4 silencing
+      if (opt.verbosity >= V_ERROR)
+        std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
+                     "(profile prior; override with --hybrid)\n";
+      opt.cpu_queue_min = 0;
+    }
+    if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
+      char line[256];
+      std::snprintf(line, sizeof(line),
+        "gzstd: profile prior (cpu %.1f vs gpu %.1f GiB/s): defaulting %s to %s "
+        "(override with --hybrid/--cpu-only/--gpu-only)\n",
+        prior_dir.cpu_gibs, prior_dir.gpu_gibs,
+        opt.mode == Mode::COMPRESS ? "compress" : "decompress",
+        cpu_dominates ? "--cpu-only" : "--hybrid");
+      std::fprintf(stderr, "%s", line);
+    }
+    return;
+  }
+#endif
 
   if (opt.mode == Mode::COMPRESS) { opt.hybrid = true; return; }
   if (gen > 0 && gen < 4) {
@@ -19203,12 +19435,52 @@ static void apply_backend_defaults(Options & opt)
       std::fprintf(stderr, "%s", os.str().c_str());
     }
   } else {
-    opt.hybrid = true;
-    if (gen >= 4 && opt.verbosity >= V_VERBOSE) {
-      std::ostringstream os;
-      os << "[ASYMMETRIC] PCIe Gen" << gen
-         << " detected; defaulting decompress to --hybrid";
-      vlog(V_VERBOSE, opt, os.str() + "\n");
+    // Gen4+ (or undetectable): the blanket-hybrid default was measurably
+    // wrong for warm inputs (v0.15.2) — a ~fully-resident input feeds at
+    // memory speed, the run is compute-bound, and cpu-only wins on the
+    // fast-fabric boxes (measured 16-18 vs ~12 GiB/s).  Cold inputs keep
+    // hybrid: the disk is the ceiling and the GPU-favoring default holds.
+    // Unconditional (no --adapt needed) — both branches beat blanket
+    // hybrid; the probe costs microseconds and never faults pages in.
+    // Regular-file output only (a warm input piped to a slow consumer is
+    // sink-bound, not compute-bound); pipes/unknown keep today's default.
+    double resid = -1.0;
+#ifndef _WIN32
+    if (!opt.list_mode && adapt_output_is_regular(opt))
+      resid = adapt_input_residency(opt);
+#endif
+    if (resid >= 0.95) {
+      opt.cpu_only = true;
+      if (opt.cpu_queue_min > 0) {   // mirror the Gen<4 silencing
+        if (opt.verbosity >= V_ERROR)
+          std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
+                       "(warm-input default; override with --hybrid)\n";
+        opt.cpu_queue_min = 0;
+      }
+      // Default verbosity, like the Gen<4 notice: the user sees no GPU
+      // activity and must know the runtime chose that (and how to undo it).
+      if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
+        // gen==0 = PCIe undetectable, possibly no GPU at all — don't
+        // recommend a --gpu-only that would exit 2 there.
+        char line[224];
+        std::snprintf(line, sizeof(line),
+          "gzstd: input is %d%% page-cache resident (compute-bound); defaulting "
+          "decompress to --cpu-only (override with %s)\n",
+          (int)(resid * 100.0),
+          gen > 0 ? "--hybrid or --gpu-only" : "--hybrid");
+        std::fprintf(stderr, "%s", line);
+      }
+    } else {
+      opt.hybrid = true;
+      if (gen >= 4 && opt.verbosity >= V_VERBOSE) {
+        std::ostringstream os;
+        os << "[ASYMMETRIC] PCIe Gen" << gen
+           << " detected; defaulting decompress to --hybrid";
+        if (resid >= 0.0) {
+          os << " (input " << (int)(resid * 100.0) << "% resident: cold/disk-bound)";
+        }
+        vlog(V_VERBOSE, opt, os.str() + "\n");
+      }
     }
   }
 #else

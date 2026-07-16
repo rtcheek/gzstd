@@ -341,6 +341,11 @@ has_gpu() {
   return $?
 }
 
+# Build-time capability, not runtime: a USE_NVCOMP=OFF binary compiles out
+# apply_backend_defaults entirely, so [ADAPT] fingerprint/prior lines never
+# print there even though the profile writer itself works.
+has_nvcomp() { "$GZSTD" -V 2>&1 | grep -qi nvcomp; }
+
 human_size() {
   local bytes=$1
   if   [[ $bytes -ge 1073741824 ]]; then awk "BEGIN{printf \"%.1f GiB\", $bytes/1073741824}"
@@ -360,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=326
-$EXTENSIVE && EXPECTED_TESTS=443
+EXPECTED_TESTS=333
+$EXTENSIVE && EXPECTED_TESTS=450
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3149,6 +3154,138 @@ rm -f "$TMPDIR/aprof-precious.txt"
 
 rm -rf "$APROF_XDG" "$TMPDIR/aprof.zst" "$TMPDIR/aprof-fast.zst" "$TMPDIR/aprof-bad.zst" \
        "$TMPDIR/aprof-cal.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt priors + residency-informed decompress default"
+
+APRI_XDG="$TMPDIR/xdg-priors"
+APRI="$APRI_XDG/gzstd/profile.json"
+
+if has_gpu 2>/dev/null; then
+  # 1. Warm input announces a decompress backend default at default verbosity:
+  # Gen4+ prints the residency notice, Gen<4 the PCIe notice — both mean the
+  # runtime chose cpu-only and said so.
+  "$GZSTD" --cpu-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/apri.zst" 2>/dev/null
+  cat "$TMPDIR/apri.zst" > /dev/null    # warm it (O_DIRECT output leaves it cold)
+  "$GZSTD" -d -k -f "$TMPDIR/apri.zst" -o "$TMPDIR/apri.out" 2>"$TMPDIR/apri.err"
+  if files_match "$TMPDIR/large.bin" "$TMPDIR/apri.out" \
+     && grep -qE "page-cache resident|PCIe Gen" "$TMPDIR/apri.err"; then
+    pass "warm-input decompress announces its backend default"
+  else
+    fail "warm-input decompress announces its backend default"
+  fi
+
+  # 2. Warm input piped to stdout: the residency default must NOT engage
+  # (sink could be the bottleneck) — no resident notice.
+  cat "$TMPDIR/apri.zst" > /dev/null
+  "$GZSTD" -d -c "$TMPDIR/apri.zst" 2>"$TMPDIR/apri-pipe.err" | cat > "$TMPDIR/apri.out"
+  if files_match "$TMPDIR/large.bin" "$TMPDIR/apri.out" \
+     && ! grep -q "page-cache resident" "$TMPDIR/apri-pipe.err"; then
+    pass "piped output skips the residency default"
+  else
+    fail "piped output skips the residency default"
+  fi
+else
+  skip "warm-input decompress announces its backend default" "no GPU"
+  skip "piped output skips the residency default" "no GPU"
+fi
+
+# 3. -vv --adapt prints the fingerprint (hash + driver) — harvest it for the
+# crafted-profile tests below.  The [ADAPT] lines live in
+# apply_backend_defaults, which a non-nvCOMP build compiles out.
+rm -rf "$APRI_XDG"
+FP_HASH=""
+FP_DRV=""
+if has_nvcomp; then
+  env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt -vv --cpu-only -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp.zst" 2>"$TMPDIR/apri-fp.err"
+  FP_LINE=$(grep -o '\[ADAPT\] fingerprint [0-9a-f]* driver [^ ]*' "$TMPDIR/apri-fp.err" | head -1)
+  FP_HASH=$(echo "$FP_LINE" | awk '{print $3}')
+  FP_DRV=$(echo  "$FP_LINE" | awk '{print $5}')
+  if [[ ${#FP_HASH} -eq 16 ]]; then
+    pass "--adapt -vv prints the profile fingerprint"
+  else
+    fail "--adapt -vv prints the profile fingerprint"
+  fi
+else
+  skip "--adapt -vv prints the profile fingerprint" "no nvCOMP build"
+fi
+
+# Craft a cpu-dominant profile for this machine's fingerprint.
+[[ "$FP_DRV" == "(none)" ]] && FP_DRV=""
+mkdir -p "$APRI_XDG/gzstd"
+cat > "$APRI" <<APROF_EOF
+{
+  "gzstd_profile": 1,
+  "entries": {
+    "$FP_HASH": {
+      "fingerprint": "crafted",
+      "driver": "$FP_DRV",
+      "compress": { "runs": 3, "cpu_gibs": 10.0, "gpu_gibs": 2.0, "regime": "compute-bound" }
+    }
+  }
+}
+APROF_EOF
+
+if has_gpu 2>/dev/null; then
+  # 4. The prior flips the compress default to cpu-only, announced.
+  env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp.zst" 2>"$TMPDIR/apri-pri.err"
+  if grep -q "profile prior (cpu 10.0 vs gpu 2.0 GiB/s): defaulting compress to --cpu-only" \
+       "$TMPDIR/apri-pri.err"; then
+    pass "profile prior defaults compress to cpu-only"
+  else
+    fail "profile prior defaults compress to cpu-only"
+  fi
+
+  # 5. An explicit backend flag beats the prior (no defaulting line).
+  env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt --hybrid -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp.zst" 2>"$TMPDIR/apri-ovr.err"
+  if ! grep -q "defaulting compress" "$TMPDIR/apri-ovr.err"; then
+    pass "explicit --hybrid overrides the prior"
+  else
+    fail "explicit --hybrid overrides the prior"
+  fi
+else
+  skip "profile prior defaults compress to cpu-only" "no GPU"
+  skip "explicit --hybrid overrides the prior" "no GPU"
+fi
+
+# 6. A driver mismatch invalidates the GPU priors (and says so at -v).
+if has_nvcomp; then
+  sed -i "s/\"driver\": \"$FP_DRV\"/\"driver\": \"mismatched-0.0\"/" "$APRI"
+  env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt -v --cpu-only -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp.zst" 2>"$TMPDIR/apri-drv.err"
+  if grep -q "driver changed: GPU rates/batch invalidated" "$TMPDIR/apri-drv.err"; then
+    pass "driver mismatch invalidates GPU priors"
+  else
+    fail "driver mismatch invalidates GPU priors"
+  fi
+else
+  skip "driver mismatch invalidates GPU priors" "no nvCOMP build"
+fi
+
+# 7. --tar test/decompress probes the ARCHIVE's residency, not stdin
+# (review M3-1: tar mode keeps its archive in tar_sources and synthesizes
+# opt.inputs = "-", which used to send the probe to fd 0).  Warm archive +
+# stdin pointed elsewhere must still announce the backend default.
+if has_gpu 2>/dev/null; then
+  "$GZSTD" --tar -f -o "$TMPDIR/apri-t.tzst" "$TMPDIR/medium.txt" 2>/dev/null
+  cat "$TMPDIR/apri-t.tzst" > /dev/null
+  if "$GZSTD" -t --tar "$TMPDIR/apri-t.tzst" </dev/null 2>"$TMPDIR/apri-tar.err" \
+     && grep -qE "page-cache resident|PCIe Gen" "$TMPDIR/apri-tar.err"; then
+    pass "-t --tar probes the archive's residency (not stdin)"
+  else
+    fail "-t --tar probes the archive's residency (not stdin)"
+  fi
+else
+  skip "-t --tar probes the archive's residency (not stdin)" "no GPU"
+fi
+
+rm -rf "$APRI_XDG" "$TMPDIR/apri.zst" "$TMPDIR/apri.out" "$TMPDIR/apri.err" \
+       "$TMPDIR/apri-pipe.err" "$TMPDIR/apri-fp.zst" "$TMPDIR/apri-fp.err" \
+       "$TMPDIR/apri-pri.err" "$TMPDIR/apri-ovr.err" "$TMPDIR/apri-drv.err" \
+       "$TMPDIR/apri-t.tzst" "$TMPDIR/apri-tar.err"
 
 section "Sliding-window compression"
 

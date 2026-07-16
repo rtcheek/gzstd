@@ -1,11 +1,26 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.1  
+**Covers:** v0.9.50 → v0.15.2  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.2 — --adapt priors + the residency-informed decompress default (unconditional)
+
+**The Gen4+ decompress default is no longer a blanket hybrid — it reads the input's page-cache residency first (unconditional, no `--adapt` needed).** The blanket choice was measurably wrong for warm inputs: a ~fully-resident input feeds at memory speed, the run is compute-bound, and cpu-only is the fast engine on the fast-fabric boxes. Measured this build (256-core Gen4+ 8-GPU box, warm `-t`, median-of-3): high-compressibility 20 GiB corpus **16.3 vs 4.9 GiB/s** (cpu-only vs hybrid, 3.4×), mixed profile **7.4 vs 4.9** (+50%), and a realistic ~50%-ratio 130 GiB tar archive **4.8 vs 4.7** (parity) — warm cpu-only wins or ties, never loses, and frees the GPUs; cold stays hybrid (measured parity there too: 2.7 both, disk-bound). Now `apply_backend_defaults` probes the first input with its own `stat` + `open` + `mmap(PROT_READ)` + `residency_fraction` + `munmap` (microseconds; `mincore` never faults pages in; **never `MAP_POPULATE`** per the fault-storm rule): ≥ 95% resident → cpu-only with a default-verbosity notice mirroring the Gen<4 one; cold or unknown → hybrid exactly as before, with the residency shown in the `-v` `[ASYMMETRIC]` line. Guards: regular-file output only (a warm input piped to a slow consumer is sink-bound, not compute-bound — piped stdout and `-o` to an existing FIFO/device keep today's default), pipes/unreadable inputs skip the probe (a named FIFO is stat-rejected without ever being opened), `--tar` probes the archive from `tar_sources` (not the synthesized stdin input), `-l` stays silent. One measured subtlety: Gen4+ auto-`--direct` means a *freshly written* archive is NOT warm (O_DIRECT bypasses the cache on the way out) — the warm path engages for genuinely re-read data, which is exactly the case it exists for.
+
+**Under `--adapt`, the profile's measured priors now drive the initial configuration** (each behind its own user-flag guard, logged as `[ADAPT]` lines):
+- **Backend per direction:** with both engine rates on record, cpu-only when the CPU engine dominates outright (> 1.5× the GPU engine — hybrid coordination can't win back a gap that wide; the measured story of the fabric boxes), else hybrid, announced at default verbosity. Never gpu-ONLY by default (hybrid contains it, minus the single-engine failure mode). On this Gen4 8-GPU box the calibrate-seeded prior flips compress to cpu-only — the correct measured answer a blanket "hybrid for compress" has never given it.
+- **GPU batch start point:** the tuner starts at the cap (`shared_tune.batch_size = gpu_batch_cap`), so seeding the cap with the profile's settled batch replaces the exploration ramp while leaving the tuner free to move.
+- **Scheduler EMA seeds:** the `HybridSched` constructor pre-warms `cpu/gpu_rate_ema_` from the profile with sample counters at 1, NOT the refusal-arming 2 — one live tick per side is required before any refusal can latch `tail_yield_` off a stale prior (the design-review F5 rule).
+- **Verify-engine auto:** an observed regime replaces the PCIe-gen guess — GPU verify wins exactly when the GPU is the idle resource, so any recorded regime other than compute-bound picks it (the lever the old comment always said `--adapt` would pull).
+- **Driver-mismatch quarantine:** a changed driver version invalidates only the GPU rates and settled batch; CPU and device-rate priors survive the bump. `-vv` prints the fingerprint hash + driver so users (and the suite) can see the profile key.
+
+Priors review angle: 6 findings, all fixed pre-commit — the big one caught empirically before the agent reported it: **`--tar` decompress/test probed stdin's residency instead of the archive's** (tar mode keeps its archive in `tar_sources` and synthesizes `inputs = "-"`), so the warm-archive case never engaged and a warm redirected stdin could steer a cold extraction to cpu-only. Also: the profile's `settled_batch` double→size_t cast was UB on foreign values (now clamped to `HARD_BATCH_CAP` pre-cast, mirroring the emitter's magnitude guard); fingerprint/driver tests now skip on non-nvCOMP builds; `-o` to an existing non-regular sink defeats the warm default as intended; the notice no longer recommends `--gpu-only` when PCIe gen is undetectable.
+
+Suite: 333 normal / 450 extensive (7 new: warm-input default announced, piped-output skip, fingerprint at -vv, crafted-profile prior flips compress to cpu-only, explicit --hybrid beats the prior, driver-mismatch invalidation, --tar probes the archive not stdin).
 
 ## v0.15.1 — --adapt persistence: per-machine profile, hardware fingerprint, --calibrate
 
