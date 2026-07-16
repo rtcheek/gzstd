@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=316
-$EXTENSIVE && EXPECTED_TESTS=433
+EXPECTED_TESTS=326
+$EXTENSIVE && EXPECTED_TESTS=443
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3040,6 +3040,115 @@ else
 fi
 rm -f "$TMPDIR/adapt.zst" "$TMPDIR/adapt.dec" "$TMPDIR/adapt-plain.zst" \
       "$TMPDIR/adapt-on.zst" "$TMPDIR/adapt-v.err" "$TMPDIR/adapt-q.err" "$TMPDIR/adapt-off.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt persistent profile"
+
+# All profile tests point XDG_CACHE_HOME at a scratch dir — never the
+# user's real cache.  A qualifying write needs a clean >=3 s run: 32 MiB
+# of compressible text at -19 on one thread stays comfortably past that
+# on any machine this suite runs on.
+APROF_XDG="$TMPDIR/xdg-cache"
+APROF="$APROF_XDG/gzstd/profile.json"
+APROF_SRC="$TMPDIR/aprof-src.txt"
+if [[ ! -f "$APROF_SRC" ]]; then
+  for i in $(seq 1 400000); do echo "session=$i commit delta backup index worker $((i*7919))"; done > "$APROF_SRC"
+fi
+rm -rf "$APROF_XDG"
+
+# 1. A qualifying --adapt run creates the profile with this run's direction.
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -19 -T 1 --cpu-only -k -f \
+  "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
+if [[ -f "$APROF" ]] && grep -q '"compress"' "$APROF" && grep -q '"overall_gibs"' "$APROF"; then
+  pass "qualifying --adapt run writes the profile"
+else
+  fail "qualifying --adapt run writes the profile"
+fi
+
+# 2. A second run EMA-merges into the same entry (runs: 2, one fingerprint).
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -19 -T 1 --cpu-only -k -f \
+  "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
+if grep -q '"runs": 2' "$APROF" && [[ $(grep -c '"fingerprint"' "$APROF") -eq 1 ]]; then
+  pass "second run merges (runs: 2, one fingerprint)"
+else
+  fail "second run merges (runs: 2, one fingerprint)"
+fi
+
+# 3. A corrupt profile is benign: run exits 0 and the file is rewritten fresh.
+echo '{"gzstd_profile": 1, "entries": {' > "$APROF"   # truncated JSON
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -19 -T 1 --cpu-only -k -f \
+  "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
+if [[ $? -eq 0 ]] && grep -q '"runs": 1' "$APROF"; then
+  pass "corrupt profile discarded and rewritten (exit 0)"
+else
+  fail "corrupt profile discarded and rewritten"
+fi
+
+# 4. --no-profile writes nothing.
+rm -rf "$APROF_XDG"
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt --no-profile -19 -T 1 --cpu-only -k -f \
+  "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
+[[ ! -e "$APROF" ]] && pass "--no-profile writes nothing" || fail "--no-profile writes nothing"
+
+# 5. A sub-3 s run writes nothing (small file, fast level).
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt --cpu-only -k -f \
+  "$TMPDIR/medium.txt" -o "$TMPDIR/aprof-fast.zst" 2>/dev/null
+[[ ! -e "$APROF" ]] && pass "sub-3s run writes nothing" || fail "sub-3s run writes nothing"
+
+# 6. A failing run writes nothing (corrupt input, nonzero exit).
+head -c 65536 /dev/urandom > "$TMPDIR/aprof-bad.zst"
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt --cpu-only -d -f \
+  "$TMPDIR/aprof-bad.zst" -o /dev/null 2>/dev/null
+rc=$?
+if [[ $rc -ne 0 && ! -e "$APROF" ]]; then
+  pass "failing run writes nothing (exit $rc)"
+else
+  fail "failing run writes nothing" "rc=$rc"
+fi
+
+# 7. An unwritable cache dir is benign (exit 0, no crash).
+mkdir -p "$APROF_XDG/gzstd"
+chmod 555 "$APROF_XDG/gzstd"
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -19 -T 1 --cpu-only -k -f \
+  "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
+rc=$?
+chmod 755 "$APROF_XDG/gzstd"
+[[ $rc -eq 0 ]] && pass "read-only cache dir benign (exit 0)" || fail "read-only cache dir benign" "rc=$rc"
+
+# 8. --calibrate: measures, prints the table, records both directions.
+rm -rf "$APROF_XDG"
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --calibrate 2>"$TMPDIR/aprof-cal.err"
+rc=$?
+if [[ $rc -eq 0 ]] && grep -q "cpu compress" "$TMPDIR/aprof-cal.err" \
+   && grep -q '"compress"' "$APROF" && grep -q '"decompress"' "$APROF"; then
+  pass "--calibrate measures and records both directions"
+else
+  fail "--calibrate measures and records both directions" "rc=$rc"
+fi
+
+# 9. --calibrate --no-profile measures only.
+rm -rf "$APROF_XDG"
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --calibrate --no-profile 2>/dev/null
+rc=$?
+[[ $rc -eq 0 && ! -e "$APROF" ]] && pass "--calibrate --no-profile records nothing" \
+  || fail "--calibrate --no-profile records nothing" "rc=$rc"
+
+# 10. --calibrate -o EXISTING refuses (exit 2) and leaves the file untouched —
+# the sink target is created and REMOVED, so a pre-existing file must never
+# be accepted (a user may read "-o FILE" as "write the report to FILE").
+echo "precious" > "$TMPDIR/aprof-precious.txt"
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --calibrate --no-profile \
+  -o "$TMPDIR/aprof-precious.txt" 2>/dev/null
+rc=$?
+if [[ $rc -eq 2 ]] && [[ "$(cat "$TMPDIR/aprof-precious.txt")" == "precious" ]]; then
+  pass "--calibrate -o existing target refused (exit 2, file intact)"
+else
+  fail "--calibrate -o existing target refused" "rc=$rc"
+fi
+rm -f "$TMPDIR/aprof-precious.txt"
+
+rm -rf "$APROF_XDG" "$TMPDIR/aprof.zst" "$TMPDIR/aprof-fast.zst" "$TMPDIR/aprof-bad.zst" \
+       "$TMPDIR/aprof-cal.err"
 
 section "Sliding-window compression"
 

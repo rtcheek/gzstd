@@ -1,11 +1,23 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.0  
+**Covers:** v0.9.50 → v0.15.1  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.1 — --adapt persistence: per-machine profile, hardware fingerprint, --calibrate
+
+**The measured-calibration cache lands: a clean `--adapt` run of ≥ 3 s records what it learned to `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json`, keyed by a HARDWARE-ONLY fingerprint** (CPU model + logical cores, GPU name list via two new dlopen-shim NVML calls, kernel release — FNV-1a hashed; the raw string stored for debugging). The GPU driver version deliberately lives INSIDE the entry, not the key: a driver bump must not orphan a machine's priors — the prior layer (next stage) invalidates only the GPU rates on mismatch. Per direction the entry carries: overall payload GiB/s, the hybrid scheduler's per-engine EMAs (tapped from `HybridSched::tick`), source/sink device rates (reader-io / writer-disk time, so an mmap run simply leaves source unmeasured), the GPU tuner's last-used batch, the governor's dominant regime, run/fault counts, timestamp. Numeric fields merge as EMA (old·0.5 + new·0.5) so hardware/driver drift converges in a few runs; a GPU-fault → CPU-rebuild run merges NOTHING measured (its clock was rebased mid-run and its GPU numbers are garbage) — it bumps the fault count only, order-verified in review. Writes are per-pid tmp + atomic same-dir rename, happen only on exit 0, and every profile I/O failure is a `-v` note, never fatal.
+
+**The profile is parsed by a deliberately strict JSON subset** (objects/strings/numbers/bools, depth-capped, 1 MiB cap, no arrays — the schema never needs them): anything unmodeled rejects the WHOLE file, which is then discarded and rewritten — for a regenerable cache the failure mode of strictness is a one-run recalibration, never a wrong prior. Discard-and-rewrite is total (a partial parse can never be merged into), and emitted output must survive its own re-parse: keys escape exactly like values (a foreign key with a quote must not poison other machines' entries on the next load) and the integer-emit magnitude guard runs BEFORE the long-long cast (a hand-edited `1e300` is legal input; casting it is UB).
+
+**`--calibrate` measures this machine's engine rates explicitly** and records both directions like qualifying runs: a generated corpus (half text-like, half xorshift-random; 1 GiB, RAM-clamped) rides a **memfd exposed as `/proc/self/fd/N`** — a RAM-backed REGULAR file, so the pipeline's real readers engage; fmemopen looked like a pipe and measured the single-reader stdin path (1.0 vs 2.85 GiB/s, same corpus, same box). Each engine gets an untimed warmup pass (cuInit, contexts, pools, thread spinup outside the clock) that doubles as the compressed-corpus capture, and timed passes run over 4 concatenated corpus copies so per-call setup stays under the noise floor — the first cut's sub-second passes disagreed with themselves by 5×; the final form reproduces this Gen4 8-GPU box's known ground truth (CPU wins BOTH directions) with ≤ 13% run-to-run drift. Optional sink row only with `-o NEWFILE`: buffered write + fsync folded into the measured time (page-cache-only timing overstated the device), the target must NOT pre-exist and is removed — a pre-existing target is a usage error (exit 2), because a user reading "-o FILE" as "write the report here" must never lose that file. A faulting GPU discards its calibrate rows rather than recording garbage.
+
+`--no-profile` suppresses read + write (benchmark honesty; `gzstd-benchmark.sh` should adopt it when --adapt benches land). Persistence review angle ran to a verdict: 7 findings (the `-o` data-loss footgun HIGH; emit-cast UB; unescaped keys; page-cache sink timing; cpu-row-keyed save; relative XDG; a latent null-guard) — all fixed before commit; the clean-list confirmed parser robustness against malformed input, atomicity, fingerprint stability on ARM/no-GPU/no-NVML boxes, and multi-file accounting.
+
+Suite: 326 normal / 443 extensive (10 new: profile write/merge/corrupt-tolerance/no-profile/sub-3s/failing-run/read-only-dir gates, --calibrate records both directions, --calibrate --no-profile records nothing, --calibrate -o existing-target refused with the file intact).
 
 ## v0.15.0 — the --adapt chapter opens: AdaptGovernor skeleton (regime classifier, observe-only)
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.0";
+static constexpr const char * GZSTD_VERSION = "0.15.1";
 //
 // Architecture overview:
 //
@@ -91,6 +91,9 @@ static constexpr const char * GZSTD_VERSION = "0.15.0";
 #endif
 #endif
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/syscall.h>   // SYS_memfd_create (--calibrate's RAM-backed corpus file)
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/utsname.h>
@@ -141,6 +144,8 @@ struct GzNvmlApi {
   nvmlReturn_t (*DeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t *) = nullptr;
   nvmlReturn_t (*DeviceGetCpuAffinity)(nvmlDevice_t, unsigned int, unsigned long *) = nullptr;
   nvmlReturn_t (*DeviceGetMaxPcieLinkGeneration)(nvmlDevice_t, unsigned int *) = nullptr;
+  nvmlReturn_t (*DeviceGetName)(nvmlDevice_t, char *, unsigned int) = nullptr;
+  nvmlReturn_t (*SystemGetDriverVersion)(char *, unsigned int) = nullptr;
 };
 
 // Resolve once, thread-safely (magic static).  RTLD_LOCAL keeps the driver's
@@ -172,6 +177,10 @@ static const GzNvmlApi & gz_nvml()
         sym("nvmlDeviceGetCpuAffinity", nullptr);
     a.DeviceGetMaxPcieLinkGeneration = (nvmlReturn_t(*)(nvmlDevice_t, unsigned int *))
         sym("nvmlDeviceGetMaxPcieLinkGeneration", nullptr);
+    a.DeviceGetName = (nvmlReturn_t(*)(nvmlDevice_t, char *, unsigned int))
+        sym("nvmlDeviceGetName", nullptr);
+    a.SystemGetDriverVersion = (nvmlReturn_t(*)(char *, unsigned int))
+        sym("nvmlSystemGetDriverVersion", nullptr);
     return a;
   }();
   return api;
@@ -198,6 +207,10 @@ static inline nvmlReturn_t nvmlDeviceGetCpuAffinity(nvmlDevice_t d, unsigned int
 { auto & a = gz_nvml(); return a.DeviceGetCpuAffinity ? a.DeviceGetCpuAffinity(d, sz, set) : GZ_NVML_UNAVAILABLE; }
 static inline nvmlReturn_t nvmlDeviceGetMaxPcieLinkGeneration(nvmlDevice_t d, unsigned int * gen)
 { auto & a = gz_nvml(); return a.DeviceGetMaxPcieLinkGeneration ? a.DeviceGetMaxPcieLinkGeneration(d, gen) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetName(nvmlDevice_t d, char * buf, unsigned int len)
+{ auto & a = gz_nvml(); return a.DeviceGetName ? a.DeviceGetName(d, buf, len) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlSystemGetDriverVersion(char * buf, unsigned int len)
+{ auto & a = gz_nvml(); return a.SystemGetDriverVersion ? a.SystemGetDriverVersion(buf, len) : GZ_NVML_UNAVAILABLE; }
  #endif // HAVE_NVML
 #endif
 
@@ -429,6 +442,11 @@ struct Options {
                                   //  and steer tuning toward the measured-fastest configuration.
                                   //  Opt-in through v0.15.x; default decided at v1.0.
   bool adapt_user_set = false;    // --adapt/--no-adapt given (guards the eventual default flip)
+  bool no_profile = false;        // --no-profile: never read or write the persistent
+                                  //  per-machine calibration profile (benchmarking honesty)
+  bool calibrate = false;         // --calibrate: run the explicit calibration pass (measure
+                                  //  per-engine rates over generated in-memory data, print
+                                  //  the table, record the profile) instead of compressing
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -879,6 +897,10 @@ static void print_help()
 "  --adapt             adaptive governor: classify the run's bottleneck regime\n"
 "                      (source/compute/sink), report at -v; observe-only stage\n"
 "  --no-adapt          explicitly off (accepted now; default flip planned v1.0)\n"
+"  --no-profile        don't read or write the per-machine calibration profile\n"
+"  --calibrate         measure this machine's engine rates over generated data\n"
+"                      and record them to the profile; -o NEWFILE also measures\n"
+"                      the write sink (scratch file, created + removed)\n"
 "\n"
 "Logging:\n"
 "  -v / -vv / -vvv     verbose / debug / trace\n"
@@ -1073,6 +1095,16 @@ static void print_help_long()
 "     over: bare --adapt enables the governor; zstd's value form\n"
 "     --adapt=min#,max# also enables it, but the level bounds are\n"
 "     ignored with a warning (gzstd does not vary the level mid-stream).\n"
+"     PROFILE: a clean --adapt run of 3 s or longer records its measured\n"
+"     calibration (per-direction throughput, source/sink device rates,\n"
+"     settled GPU batch, dominant regime) to\n"
+"     ${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json, keyed by a\n"
+"     hardware fingerprint (CPU model + cores, GPU names, kernel).\n"
+"     Values merge as a running average, so drift converges over a few\n"
+"     runs; a GPU-fault run only counts the fault, never its rates.  The\n"
+"     profile is a regenerable cache — corrupt or unreadable files are\n"
+"     ignored and rewritten.  --no-profile disables both reading and\n"
+"     writing (use it for honest benchmarks).\n"
 "\n"
 "  --direct / --no-direct\n"
 "     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
@@ -2003,6 +2035,17 @@ public:
     account_(now_ns_());
   }
 
+  // Post-stop only (main thread after join): the regime that owned the most
+  // classified wall time, or "unclassified" when nothing outlived the ramp.
+  // Consumed by the profile writer as this run's dominant-regime observation.
+  const char * dominant_regime() const
+  {
+    int best = -1; uint64_t best_ns = 0;
+    for (int r = 1; r < 4; ++r)   // skip WARMUP
+      if (acc_[r] > best_ns) { best_ns = acc_[r]; best = r; }
+    return best < 0 ? "unclassified" : adapt_regime_name((AdaptRegime)best);
+  }
+
   // End-of-run [ADAPT] block, printed with the [READER]/[WRITER] diags.
   void print_summary() const
   {
@@ -2160,6 +2203,425 @@ private:
   uint64_t acc_[4] = { 0, 0, 0, 0 };  // ns per AdaptRegime value
   int transitions_ = 0;
 };
+
+// --adapt profile observation taps: written by their owners during the run
+// (HybridSched::tick stores its per-engine EMAs; the GPU workers store the
+// batch size they last actually used), read once at profile-save time.
+// Zero means "that engine never ran this process".  Cheap unconditional
+// relaxed stores — they exist whether or not --adapt is on; only the
+// profile writer consumes them.
+static std::atomic<double>   g_adapt_cpu_ema_gibs{0.0};
+static std::atomic<double>   g_adapt_gpu_ema_gibs{0.0};
+static std::atomic<uint64_t> g_adapt_settled_batch{0};
+
+#ifndef _WIN32
+/*======================================================================
+ --adapt persistent per-machine profile (v0.15 M2).
+
+ ${XDG_CACHE_HOME:-$HOME/.cache}/gzstd/profile.json — measured calibration
+ (per-direction throughput, settled GPU batch, dominant regime) keyed by a
+ HARDWARE-ONLY fingerprint (CPU model + logical cores, GPU name list,
+ kernel release).  The GPU driver version is stored INSIDE each entry, not
+ in the key: a driver bump must not orphan the whole entry — the prior
+ layer (M3) invalidates only the GPU rates on mismatch.
+
+ Read at startup under --adapt only (plain runs stay reproducible); written
+ on exit 0 only, per-pid tmp + atomic same-dir rename (last-writer-wins is
+ fine for a cache; interleaved writes into a shared tmp are not).  Numeric
+ fields merge as EMA (old*0.5 + new*0.5) so hardware/driver drift converges
+ in a few runs.  Runs shorter than 3 s never write (nothing converged); a
+ GPU-fault -> CPU-rebuild run never merges rates (its GPU numbers are
+ garbage and Meter::reset() rebased the clock) — it bumps the fault count.
+ Every profile I/O failure is a -v note, never fatal; a corrupt or
+ oversized file is discarded and rewritten.
+
+ The JSON dialect is a deliberately strict subset (objects, strings,
+ numbers, bools — no arrays; the schema never needs them).  Anything the
+ parser does not fully model rejects the whole file — the profile is a
+ regenerable cache, so the failure mode of strictness is a one-run
+ re-calibration, never a wrong prior.
+======================================================================*/
+struct AdaptJv {
+  enum T { NUL, BOOL, NUM, STR, OBJ } t = NUL;
+  bool b = false;
+  double num = 0;
+  std::string str;
+  std::vector<std::pair<std::string, AdaptJv>> obj;  // insertion-ordered
+
+  const AdaptJv * get(const std::string & k) const
+  {
+    for (const auto & kv : obj) if (kv.first == k) return &kv.second;
+    return nullptr;
+  }
+  AdaptJv & set(const std::string & k)
+  {
+    for (auto & kv : obj) if (kv.first == k) return kv.second;
+    obj.emplace_back(k, AdaptJv{});
+    t = OBJ;
+    return obj.back().second;
+  }
+  double gnum(const std::string & k, double dflt) const
+  { const AdaptJv * v = get(k); return (v && v->t == NUM) ? v->num : dflt; }
+  std::string gstr(const std::string & k, const std::string & dflt) const
+  { const AdaptJv * v = get(k); return (v && v->t == STR) ? v->str : dflt; }
+  void put_num(const std::string & k, double v) { AdaptJv & j = set(k); j.t = NUM; j.num = v; }
+  void put_str(const std::string & k, const std::string & v) { AdaptJv & j = set(k); j.t = STR; j.str = v; }
+};
+
+// Strict recursive-descent parser for the subset above.  Any deviation
+// (arrays, trailing garbage, bad escapes, depth > 8) fails the whole parse.
+class AdaptJsonParser {
+public:
+  AdaptJsonParser(const char * s, size_t n) : p_(s), end_(s + n) {}
+  bool parse(AdaptJv & out)
+  {
+    skip_ws_();
+    if (!value_(out, 0)) return false;
+    skip_ws_();
+    return p_ == end_;
+  }
+private:
+  const char * p_;
+  const char * end_;
+
+  void skip_ws_() { while (p_ < end_ && (*p_==' '||*p_=='\t'||*p_=='\n'||*p_=='\r')) ++p_; }
+  bool lit_(const char * s) { size_t n = std::strlen(s);
+    if (size_t(end_ - p_) < n || std::memcmp(p_, s, n) != 0) return false;
+    p_ += n; return true; }
+
+  bool value_(AdaptJv & v, int depth)
+  {
+    if (depth > 8 || p_ >= end_) return false;
+    if (*p_ == '{') return object_(v, depth);
+    if (*p_ == '"') { v.t = AdaptJv::STR; return string_(v.str); }
+    if (lit_("true"))  { v.t = AdaptJv::BOOL; v.b = true;  return true; }
+    if (lit_("false")) { v.t = AdaptJv::BOOL; v.b = false; return true; }
+    if (lit_("null"))  { v.t = AdaptJv::NUL;  return true; }
+    return number_(v);
+  }
+
+  bool object_(AdaptJv & v, int depth)
+  {
+    v.t = AdaptJv::OBJ;
+    ++p_;  // '{'
+    skip_ws_();
+    if (p_ < end_ && *p_ == '}') { ++p_; return true; }
+    for (;;) {
+      skip_ws_();
+      if (p_ >= end_ || *p_ != '"') return false;
+      std::string key;
+      if (!string_(key)) return false;
+      skip_ws_();
+      if (p_ >= end_ || *p_ != ':') return false;
+      ++p_;
+      skip_ws_();
+      AdaptJv child;
+      if (!value_(child, depth + 1)) return false;
+      v.obj.emplace_back(std::move(key), std::move(child));
+      skip_ws_();
+      if (p_ < end_ && *p_ == ',') { ++p_; continue; }
+      if (p_ < end_ && *p_ == '}') { ++p_; return true; }
+      return false;
+    }
+  }
+
+  bool string_(std::string & out)
+  {
+    ++p_;  // '"'
+    out.clear();
+    while (p_ < end_ && *p_ != '"') {
+      unsigned char c = (unsigned char)*p_;
+      if (c == '\\') {
+        if (p_ + 1 >= end_) return false;
+        ++p_;
+        switch (*p_) {
+          case '"': out += '"'; break; case '\\': out += '\\'; break;
+          case '/': out += '/'; break; case 'n': out += '\n'; break;
+          case 't': out += '\t'; break; case 'r': out += '\r'; break;
+          default: return false;  // \uXXXX etc: not in our dialect
+        }
+      } else if (c < 0x20) {
+        return false;
+      } else {
+        out += (char)c;
+      }
+      ++p_;
+    }
+    if (p_ >= end_) return false;
+    ++p_;  // closing '"'
+    return true;
+  }
+
+  bool number_(AdaptJv & v)
+  {
+    const char * s = p_;
+    if (p_ < end_ && *p_ == '-') ++p_;
+    while (p_ < end_ && (std::isdigit((unsigned char)*p_) || *p_=='.' || *p_=='e'
+                         || *p_=='E' || *p_=='+' || *p_=='-')) ++p_;
+    if (p_ == s) return false;
+    std::string tok(s, p_);
+    char * endp = nullptr;
+    v.num = std::strtod(tok.c_str(), &endp);
+    if (!endp || *endp != '\0' || !std::isfinite(v.num)) return false;
+    v.t = AdaptJv::NUM;
+    return true;
+  }
+};
+
+static void adapt_json_emit_str(const std::string & s, std::string & out)
+{
+  out += '"';
+  for (char c : s) {
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if (c == '\n') out += "\\n";
+    else if (c == '\t') out += "\\t";
+    else if (c == '\r') out += "\\r";
+    else if ((unsigned char)c < 0x20) out += ' ';
+    else out += c;
+  }
+  out += '"';
+}
+
+static void adapt_json_emit(const AdaptJv & v, std::string & out, int indent)
+{
+  switch (v.t) {
+    case AdaptJv::NUL:  out += "null"; return;
+    case AdaptJv::BOOL: out += v.b ? "true" : "false"; return;
+    case AdaptJv::NUM: {
+      char buf[48];
+      // Integers emit clean; measured rates keep 4 significant decimals.
+      // Magnitude guard FIRST: casting |x| >= 2^63 to long long is UB, and
+      // a foreign/hand-edited profile can legally carry any finite double.
+      if (std::fabs(v.num) < 1e15 && v.num == (double)(long long)v.num)
+        std::snprintf(buf, sizeof(buf), "%lld", (long long)v.num);
+      else
+        std::snprintf(buf, sizeof(buf), "%.4f", v.num);
+      out += buf;
+      return;
+    }
+    case AdaptJv::STR:
+      adapt_json_emit_str(v.str, out);
+      return;
+    case AdaptJv::OBJ: {
+      out += "{\n";
+      for (size_t i = 0; i < v.obj.size(); ++i) {
+        out.append((indent + 1) * 2, ' ');
+        // Keys escape exactly like values: the parser UNescapes keys, so a
+        // foreign profile's exotic key must survive the emit round-trip or
+        // the next load rejects the file and drops other machines' entries.
+        adapt_json_emit_str(v.obj[i].first, out);
+        out += ": ";
+        adapt_json_emit(v.obj[i].second, out, indent + 1);
+        if (i + 1 < v.obj.size()) out += ',';
+        out += '\n';
+      }
+      out.append(indent * 2, ' ');
+      out += '}';
+      return;
+    }
+  }
+}
+
+struct AdaptFp {
+  std::string hash;    // fnv1a-64 hex of `human` — the entry key
+  std::string human;   // readable hardware description (stored for debugging)
+  std::string driver;  // GPU driver version ("" without a driver); entry data, NOT key
+};
+
+static AdaptFp adapt_fingerprint()
+{
+  AdaptFp fp;
+  std::string cpu = "unknown-cpu";
+  {
+    std::ifstream ci("/proc/cpuinfo");
+    std::string line;
+    while (ci && std::getline(ci, line)) {
+      if (line.rfind("model name", 0) == 0) {
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+          size_t s = line.find_first_not_of(" \t", colon + 1);
+          if (s != std::string::npos) cpu = line.substr(s);
+        }
+        break;
+      }
+    }
+  }
+  unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+  std::string kernel = "unknown-kernel";
+  {
+    struct utsname u{};
+    if (uname(&u) == 0) kernel = u.release;
+  }
+  std::string gpus;
+#if defined(HAVE_NVCOMP) && defined(HAVE_NVML)
+  if (nvmlInit_v2() == NVML_SUCCESS) {
+    unsigned n = 0;
+    if (nvmlDeviceGetCount_v2(&n) == NVML_SUCCESS) {
+      for (unsigned i = 0; i < n; ++i) {
+        nvmlDevice_t d;
+        char name[96] = {0};
+        if (nvmlDeviceGetHandleByIndex(i, &d) == NVML_SUCCESS
+            && nvmlDeviceGetName(d, name, sizeof(name) - 1) == NVML_SUCCESS) {
+          if (!gpus.empty()) gpus += '+';
+          gpus += name;
+        }
+      }
+    }
+    char drv[96] = {0};
+    if (nvmlSystemGetDriverVersion(drv, sizeof(drv) - 1) == NVML_SUCCESS)
+      fp.driver = drv;
+    nvmlShutdown();
+  }
+#endif
+  if (gpus.empty()) gpus = "no-gpu";
+  fp.human = cpu + " x" + std::to_string(cores) + " | " + gpus + " | " + kernel;
+  uint64_t h = 1469598103934665603ull;                    // FNV-1a 64
+  for (unsigned char c : fp.human) { h ^= c; h *= 1099511628211ull; }
+  char hex[20];
+  std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+  fp.hash = hex;
+  return fp;
+}
+
+static std::string adapt_profile_path()
+{
+  const char * x = std::getenv("XDG_CACHE_HOME");
+  std::string base;
+  if (x && x[0] == '/') base = x;   // XDG spec: ignore non-absolute values
+  else {
+    const char * home = std::getenv("HOME");
+    if (!home || !*home) return "";
+    base = std::string(home) + "/.cache";
+  }
+  return base + "/gzstd/profile.json";
+}
+
+// Read + strictly parse the profile.  false = no usable profile (absent,
+// unreadable, oversized, or malformed — all benign; caller starts fresh).
+static bool adapt_profile_load(const std::string & path, AdaptJv & root)
+{
+  if (path.empty()) return false;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  if (text.empty() || text.size() > 1u << 20) return false;   // >1 MiB: not ours
+  AdaptJsonParser p(text.data(), text.size());
+  if (!p.parse(root) || root.t != AdaptJv::OBJ) return false;
+  if (root.gnum("gzstd_profile", 0) != 1) return false;
+  return true;
+}
+
+// One process's accumulated observation, filled on the main thread as each
+// operation finishes (multi-file runs sum; rates derive from the sums).
+struct AdaptObs {
+  uint64_t payload_bytes = 0;   // uncompressed side (compress: read, decompress: wrote)
+  uint64_t wall_ns = 0;
+  uint64_t reader_bytes = 0, reader_io_ns = 0;   // source device rate while reading
+  uint64_t writer_bytes = 0, writer_disk_ns = 0; // sink device rate while writing
+  double   cpu_ema_gibs = 0, gpu_ema_gibs = 0;   // hybrid scheduler taps (0 = didn't run)
+  uint64_t settled_batch = 0;                    // GPU tuner's last-used batch (0 = no GPU)
+  std::string regime = "unclassified";           // governor's dominant regime, last file
+  bool fault = false;                            // a GPU fault/rebuild happened this process
+
+  void add_meter(const Meter & m, uint64_t wall, bool compress_dir)
+  {
+    payload_bytes += compress_dir ? m.read_bytes.load() : m.wrote_bytes.load();
+    wall_ns += wall;
+    reader_bytes += m.read_bytes.load();
+    reader_io_ns += m.reader_io_ns.load();
+    writer_bytes += m.wrote_bytes.load();
+    writer_disk_ns += m.writer_disk_ns.load();
+  }
+};
+
+// EMA-merge one direction's observation into its profile entry.
+// A fault run merges nothing measured — it only counts itself.
+static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
+{
+  auto ema = [](double oldv, double newv) {
+    if (newv <= 0) return oldv;
+    if (oldv <= 0) return newv;
+    return oldv * 0.5 + newv * 0.5;
+  };
+  dir.put_num("runs",   dir.gnum("runs", 0) + 1);
+  dir.put_num("faults", dir.gnum("faults", 0) + (obs.fault ? 1 : 0));
+  dir.put_num("updated", (double)::time(nullptr));
+  if (obs.fault) return;
+
+  const double wall_s = obs.wall_ns / 1e9;
+  const double GiB = 1024.0 * 1024.0 * 1024.0;
+  if (wall_s > 0 && obs.payload_bytes > 0)
+    dir.put_num("overall_gibs", ema(dir.gnum("overall_gibs", 0), obs.payload_bytes / GiB / wall_s));
+  if (obs.reader_io_ns > 0)
+    dir.put_num("source_gibs", ema(dir.gnum("source_gibs", 0),
+                                   obs.reader_bytes / GiB / (obs.reader_io_ns / 1e9)));
+  if (obs.writer_disk_ns > 0)
+    dir.put_num("sink_gibs", ema(dir.gnum("sink_gibs", 0),
+                                 obs.writer_bytes / GiB / (obs.writer_disk_ns / 1e9)));
+  if (obs.cpu_ema_gibs > 0)
+    dir.put_num("cpu_gibs", ema(dir.gnum("cpu_gibs", 0), obs.cpu_ema_gibs));
+  if (obs.gpu_ema_gibs > 0)
+    dir.put_num("gpu_gibs", ema(dir.gnum("gpu_gibs", 0), obs.gpu_ema_gibs));
+  if (obs.settled_batch > 0)
+    dir.put_num("settled_batch", (double)obs.settled_batch);   // discrete: latest wins
+  if (obs.regime != "unclassified")
+    dir.put_str("regime", obs.regime);
+}
+
+// Load -> merge -> atomically replace.  Called once per process, only when
+// the run qualifies (exit 0, --adapt, not --no-profile, wall >= 3 s or a
+// fault to count).  Never fatal.
+static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
+{
+  const std::string path = adapt_profile_path();
+  if (path.empty()) return;
+
+  AdaptJv root;
+  if (!adapt_profile_load(path, root)) {
+    root = AdaptJv{};
+    root.t = AdaptJv::OBJ;
+    root.put_num("gzstd_profile", 1);
+    if (fs::exists(path))
+      vlog(V_VERBOSE, opt, "[ADAPT] profile unreadable; rewriting: " + path + "\n");
+  }
+
+  const AdaptFp fp = adapt_fingerprint();
+  AdaptJv & entries = root.set("entries");
+  entries.t = AdaptJv::OBJ;
+  AdaptJv & entry = entries.set(fp.hash);
+  entry.t = AdaptJv::OBJ;
+  entry.put_str("fingerprint", fp.human);
+  if (!fp.driver.empty()) entry.put_str("driver", fp.driver);
+  const char * dname = (opt.mode == Mode::COMPRESS) ? "compress" : "decompress";
+  AdaptJv & dir = entry.set(dname);
+  dir.t = AdaptJv::OBJ;
+  adapt_merge_dir(dir, obs);
+
+  std::string text;
+  adapt_json_emit(root, text, 0);
+  text += '\n';
+
+  std::error_code ec;
+  fs::create_directories(fs::path(path).parent_path(), ec);
+  const std::string tmp = path + ".tmp." + std::to_string((long)getpid());
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f || !(f << text) || (f.close(), f.fail())) {
+      vlog(V_VERBOSE, opt, "[ADAPT] profile write failed (ignored): " + tmp + "\n");
+      ::unlink(tmp.c_str());
+      return;
+    }
+  }
+  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    vlog(V_VERBOSE, opt, "[ADAPT] profile rename failed (ignored): " + path + "\n");
+    ::unlink(tmp.c_str());
+    return;
+  }
+  vlog(V_VERBOSE, opt, std::string("[ADAPT] profile updated (") + dname + ", "
+       + (obs.fault ? "fault counted, rates unchanged" : ("regime " + obs.regime))
+       + "): " + path + "\n");
+}
+#endif  // !_WIN32
 
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
 static bool is_stdout_tty() { return isatty(fileno(stdout)) != 0; }
@@ -6055,6 +6517,11 @@ public:
       gpu_rate_ema_.store(next, std::memory_order_relaxed);
       gpu_samples_.fetch_add(1, std::memory_order_relaxed);
     }
+    // --adapt profile taps: mirror the settled EMAs for the profile writer.
+    g_adapt_cpu_ema_gibs.store(cpu_rate_ema_.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+    g_adapt_gpu_ema_gibs.store(gpu_rate_ema_.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
     refresh_queue_floor_();
     // EMA movement is the one yield-decision input with no queue event;
     // wake any GPU parked in wait_for_gpu_yield so it re-evaluates.
@@ -12937,6 +13404,10 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
     shared_tune->window_ns.fetch_add(uint64_t(tot_ms * 1e6), std::memory_order_relaxed);
     shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
   }
+  // --adapt profile tap: the batch size this device last actually ran.
+  if (shared_tune)
+    g_adapt_settled_batch.store(shared_tune->batch_size.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
   if (rate_match) {
     rate_match->report_gpu(in_sum, uint64_t(tot_ms * 1e6));
     rate_match->reset_cycle();
@@ -15539,6 +16010,10 @@ static void gpu_decomp_worker(
             shared_tune->window_ns.fetch_add(now_ns() - batch_t0, std::memory_order_relaxed);
             shared_tune->window_batches.fetch_add(1, std::memory_order_relaxed);
           }
+          // --adapt profile tap: the batch size this device last actually ran.
+          if (shared_tune)
+            g_adapt_settled_batch.store(shared_tune->batch_size.load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
           // Report to rate-matcher and reset CPU cycle
           if (rate_match) {
             rate_match->report_gpu(out_sum, now_ns() - batch_t0);
@@ -17218,6 +17693,309 @@ static void append_tar_index(int dfd, FILE * f, Meter & meter) {
 }
 #endif
 
+#ifndef _WIN32
+/*======================================================================
+ --calibrate (v0.15 M2): the explicit calibration pass.
+
+ Measures each engine's real rate by running the actual pipeline over
+ GENERATED IN-MEMORY data (half text-like compressible, half xorshift
+ random — the two ends of the compressibility spectrum) with the output
+ discarded, so neither disk feeds nor sinks the measurement:
+
+   cpu compress    compress_cpu_mt          fmemopen corpus -> /dev/null
+   gpu compress    compress_nvcomp (gpu)    same corpus     -> memstream
+   cpu decompress  decompress_cpu_mt        compressed corpus -> /dev/null
+   gpu decompress  decompress_nvcomp (gpu)  same             -> /dev/null
+
+ Optional SINK measurement only when -o TARGET is given: one cpu-only
+ compress writes real bytes to TARGET (<= 2 GiB, buffered write + fsync
+ folded into the measured time; TARGET must not pre-exist and is removed
+ afterwards) and the recorded rate is the observed writer rate through
+ to media.  Prints the table; records both
+ directions to the profile exactly like a qualifying --adapt run
+ (--no-profile measures and prints only).  GPU rows are skipped without
+ a usable GPU.  Rates INCLUDE pipeline scheduling but exclude cuInit
+ (the corpus is sized so startup amortizes; treat them as priors, not
+ benchmarks — gzstd-benchmark.sh remains the honest instrument).
+======================================================================*/
+static int run_calibrate(Options opt)
+{
+  const double GiB = 1024.0 * 1024.0 * 1024.0;
+
+  // Corpus: 1 GiB, clamped to an eighth of available RAM — the timed
+  // passes hold up to 4 concatenated copies in a memfd alongside the
+  // corpus, its compressed form, and pipeline scratch.
+  size_t corpus_sz = 1ull << 30;
+  long pages = sysconf(_SC_AVPHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+  if (pages > 0 && psz > 0) {
+    size_t eighth = (size_t)pages * (size_t)psz / 8;
+    if (corpus_sz > eighth) corpus_sz = std::max((size_t)(64ull << 20), eighth);
+  }
+  std::fprintf(stderr, "[CALIBRATE] generating %.1f GiB corpus (half text-like, half random)...\n",
+               corpus_sz / GiB);
+  std::string corpus(corpus_sz, '\0');
+  {
+    // Text-like half: rotating dictionary words + counters (compresses ~3-4x,
+    // like logs).  Random half: xorshift64 (incompressible).
+    static const char * words[] = { "request", "session", "backup", "delta",
+      "index", "commit", "worker", "stream", "frame", "batch " };
+    size_t pos = 0, n = 0;
+    const size_t half = corpus_sz / 2;
+    while (pos + 32 < half) {
+      int len = std::snprintf(&corpus[pos], 32, "%s=%zu ", words[n % 10], n * 7919);
+      pos += (len > 0) ? (size_t)len : 1;
+      ++n;
+    }
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    for (size_t i = half; i + 8 <= corpus_sz; i += 8) {
+      x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+      std::memcpy(&corpus[i], &x, 8);
+    }
+  }
+
+  Options base = opt;
+  base.verbosity = V_ERROR;        // measurements print their own lines
+  base.input = "-";
+  base.to_stdout = true;
+  base.tar_mode = false;
+  base.verify = false;
+  base.keep = true;
+  base.adapt = false;              // no governor inside the measurement passes
+
+  struct Row { const char * name; double gibs = 0; bool ran = false; };
+  Row rows[5] = { {"cpu compress"}, {"gpu compress"}, {"cpu decompress"},
+                  {"gpu decompress"}, {"sink write (-o)"} };
+
+  // One pipeline pass: corpus (or a compressed buffer) in, sink out.
+  // Returns payload GiB/s (uncompressed side per wall second).
+  //
+  // The input rides a memfd exposed as /proc/self/fd/N: a RAM-backed
+  // REGULAR file, so the pipeline's real readers engage (mmap zero-copy /
+  // multi-pread).  fmemopen would look like a pipe and measure the
+  // single-reader stdin path instead — measured 1.0 vs 2.85 GiB/s for the
+  // same corpus on the same box.  If memfd_create is unavailable the
+  // fmemopen fallback still measures; the rate is then the pipe-path rate.
+  auto pass = [&](bool compress_dir, bool gpu, const std::string & in_buf,
+                  FILE * sink, uint64_t & payload_out, int repeat) -> double {
+    Options po = base;
+    FILE * in = nullptr;
+    int mfd = (int)syscall(SYS_memfd_create, "gzstd-calibrate", 0);
+    if (mfd >= 0) {
+      // `repeat` concatenated copies: concatenated zstd streams decode as
+      // multi-frame input, and a longer timed region drowns the per-call
+      // pipeline setup/teardown (sub-second passes measured noise, not
+      // engines — three runs of the first cut disagreed by 5x).
+      bool wok = true;
+      for (int r = 0; r < repeat && wok; ++r) {
+        size_t off = 0;
+        while (off < in_buf.size()) {
+          ssize_t w = ::write(mfd, in_buf.data() + off, in_buf.size() - off);
+          if (w <= 0) { wok = false; break; }
+          off += (size_t)w;
+        }
+      }
+      if (wok && ::lseek(mfd, 0, SEEK_SET) == 0
+          && (in = fdopen(mfd, "rb")) != nullptr) {
+        po.input = "/proc/self/fd/" + std::to_string(mfd);
+      } else {
+        if (!in) ::close(mfd);
+        in = nullptr;
+      }
+    }
+    if (!in) {
+      in = fmemopen((void *)in_buf.data(), in_buf.size(), "rb");
+      po.input = "-";
+    }
+    if (!in) return 0.0;
+    po.cpu_only = !gpu; po.gpu_only = gpu; po.hybrid = false;
+    po.backend_user_set = true;
+    po.mode = compress_dir ? Mode::COMPRESS : Mode::DECOMPRESS;
+    Meter m;
+    const auto t0 = std::chrono::steady_clock::now();
+#ifdef HAVE_NVCOMP
+    if (compress_dir) { if (gpu) compress_nvcomp(in, sink, po, &m); else compress_cpu_mt(in, sink, po, &m); }
+    else              { if (gpu) decompress_nvcomp(in, sink, po, &m); else decompress_cpu_mt(in, sink, po, &m); }
+#else
+    if (gpu) { std::fclose(in); return 0.0; }
+    if (compress_dir) compress_cpu_mt(in, sink, po, &m);
+    else              decompress_cpu_mt(in, sink, po, &m);
+#endif
+    const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::fclose(in);
+    payload_out = compress_dir ? m.read_bytes.load() : m.wrote_bytes.load();
+    return (secs > 0 && payload_out > 0) ? payload_out / GiB / secs : 0.0;
+  };
+
+  uint64_t payload = 0;
+
+  FILE * devnull = std::fopen("/dev/null", "wb");
+  if (!devnull) die_io("--calibrate: cannot open /dev/null");
+
+  // Each engine gets an UNTIMED warmup pass before its timed pass, so
+  // one-time costs (CUDA context creation, allocator pools, thread spinup,
+  // first-touch faults) land outside the measurement.  Without this the
+  // rates are startup artifacts, not engine rates (first cut measured a
+  // 256-core box at 0.78 GiB/s cpu compress — 5x under its warmed rate).
+  //
+  // Timed passes run over TIMED_REPEAT concatenated corpus copies so the
+  // per-call setup cost stays under the noise floor; the untimed warmup
+  // pass doubles as the compressed-corpus capture (a truncated prefix is
+  // NOT a valid warmup input — it cuts mid-frame and reads as corruption).
+  const int TIMED_REPEAT = 4;
+
+  // cpu compress: warmup+capture (untimed, 1 copy), then timed (4 copies).
+  char * comp_buf = nullptr; size_t comp_sz = 0;
+  {
+    FILE * ms = open_memstream(&comp_buf, &comp_sz);
+    if (!ms) die_io("--calibrate: open_memstream failed");
+    pass(true, false, corpus, ms, payload, 1);         // warmup + capture
+    std::fclose(ms);
+  }
+  std::string compressed = comp_buf ? std::string(comp_buf, comp_sz) : std::string();
+  free(comp_buf);
+  if (compressed.empty()) die("--calibrate: cpu compress pass produced no output");
+  rows[0].gibs = pass(true, false, corpus, devnull, payload, TIMED_REPEAT);
+  rows[0].ran = rows[0].gibs > 0;
+  std::fprintf(stderr, "[CALIBRATE] cpu compress    %7.2f GiB/s\n", rows[0].gibs);
+
+  // cpu decompress: warmup (untimed), then timed.
+  pass(false, false, compressed, devnull, payload, 1);
+  rows[2].gibs = pass(false, false, compressed, devnull, payload, TIMED_REPEAT);
+  rows[2].ran = rows[2].gibs > 0;
+  std::fprintf(stderr, "[CALIBRATE] cpu decompress  %7.2f GiB/s\n", rows[2].gibs);
+
+#ifdef HAVE_NVCOMP
+  // gpu rows only when a device is actually usable.
+  {
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0) {
+      // A GPU fault during a measurement pass makes that row garbage (there
+      // is no rebuild driver here) — discard it and say so.
+      g_gpu_failed_restart.store(false);
+      g_gpu_aborted.store(false);
+      // Warmup+capture pays cuInit + per-device context + VRAM pools
+      // outside the clock and yields the GPU-compressed corpus.
+      char * gcomp = nullptr; size_t gsz = 0;
+      FILE * gms = open_memstream(&gcomp, &gsz);
+      if (gms) {
+        pass(true, true, corpus, gms, payload, 1);     // warmup + capture
+        std::fclose(gms);
+      }
+      std::string gcompressed = gcomp ? std::string(gcomp, gsz) : std::string();
+      free(gcomp);
+      if (!g_gpu_failed_restart.load() && !gcompressed.empty()) {
+        rows[1].gibs = pass(true, true, corpus, devnull, payload, TIMED_REPEAT);
+        rows[1].ran = rows[1].gibs > 0;
+      }
+      if (g_gpu_failed_restart.load()) {
+        rows[1] = Row{"gpu compress"};
+        gcompressed.clear();
+        std::fprintf(stderr, "[CALIBRATE] gpu compress    FAULTED — row discarded\n");
+      } else {
+        std::fprintf(stderr, "[CALIBRATE] gpu compress    %7.2f GiB/s\n", rows[1].gibs);
+      }
+      if (!gcompressed.empty()) {
+        g_gpu_failed_restart.store(false);
+        g_gpu_aborted.store(false);
+        pass(false, true, gcompressed, devnull, payload, 1);   // warmup
+        rows[3].gibs = pass(false, true, gcompressed, devnull, payload, TIMED_REPEAT);
+        rows[3].ran = rows[3].gibs > 0;
+        if (g_gpu_failed_restart.load()) {
+          rows[3] = Row{"gpu decompress"};
+          std::fprintf(stderr, "[CALIBRATE] gpu decompress  FAULTED — row discarded\n");
+        } else {
+          std::fprintf(stderr, "[CALIBRATE] gpu decompress  %7.2f GiB/s\n", rows[3].gibs);
+        }
+      }
+    } else {
+      std::fprintf(stderr, "[CALIBRATE] no usable GPU — skipping gpu rows\n");
+    }
+  }
+#endif
+
+  // Optional sink measurement: only with an explicit -o TARGET (post-parse,
+  // no-args stdin mode leaves output == "stdout" with to_stdout set — that
+  // must NOT create a file literally named "stdout" in the working dir).
+  AdaptObs cobs;   // compress-direction observation
+  if (!opt.to_stdout && !opt.output.empty()) {
+    // The sink target is created, written, and REMOVED — it must not
+    // pre-exist (a user reading "-o FILE" as "write the report to FILE"
+    // must never lose that file; -f semantics don't fit a file we delete).
+    if (fs::exists(opt.output))
+      die_usage("--calibrate -o target exists; it would be overwritten and "
+                "removed — give a path to create: " + opt.output);
+    Options po = base;
+    po.cpu_only = true; po.gpu_only = false; po.hybrid = false;
+    po.backend_user_set = true;
+    po.mode = Mode::COMPRESS;
+    po.to_stdout = false;
+    po.output = opt.output;
+    const size_t cap = std::min(corpus.size(), (size_t)(2ull << 30));
+    FILE * in = fmemopen((void *)corpus.data(), cap, "rb");
+    FILE * outf = std::fopen(po.output.c_str(), "wb");
+    if (in && outf) {
+      Meter m;
+      compress_cpu_mt(in, outf, po, &m);
+      // Buffered fwrite alone measures the page cache, not the device —
+      // fold the flush into the measured time so the recorded rate is the
+      // observed writer rate through to media.
+      const auto fs0 = std::chrono::steady_clock::now();
+      ::fflush(outf);
+      ::fsync(fileno(outf));
+      const uint64_t fsync_ns =
+          (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - fs0).count();
+      std::fclose(outf);
+      const uint64_t dns = m.writer_disk_ns.load() + fsync_ns;
+      if (dns > 0) {
+        rows[4].gibs = m.wrote_bytes.load() / GiB / (dns / 1e9);
+        rows[4].ran = true;
+        cobs.writer_bytes = m.wrote_bytes.load();
+        cobs.writer_disk_ns = dns;
+      }
+      std::fprintf(stderr, "[CALIBRATE] sink write      %7.2f GiB/s -> %s (removed)\n",
+                   rows[4].gibs, po.output.c_str());
+    }
+    if (in) std::fclose(in);
+    ::unlink(po.output.c_str());
+  } else {
+    std::fprintf(stderr, "[CALIBRATE] no -o TARGET — sink rate not measured\n");
+  }
+  std::fclose(devnull);
+
+  // Record both directions like qualifying --adapt runs.
+  if (!opt.no_profile) {
+    // Wall synthesis falls back to whichever engine measured, so one dead
+    // engine never discards the other's valid rate.
+    auto synth_wall = [&](const Row & a, const Row & b) -> uint64_t {
+      const double g = a.ran ? a.gibs : (b.ran ? b.gibs : 0.0);
+      return g > 0 ? (uint64_t)(corpus.size() / GiB / g * 1e9) : 0;
+    };
+    cobs.payload_bytes = corpus.size();
+    cobs.wall_ns = synth_wall(rows[0], rows[1]);
+    cobs.cpu_ema_gibs = rows[0].gibs;
+    cobs.gpu_ema_gibs = rows[1].gibs;
+    cobs.regime = "calibrate";
+    Options save_opt = opt; save_opt.mode = Mode::COMPRESS;
+    if (cobs.wall_ns > 0) adapt_profile_save(save_opt, cobs);
+
+    AdaptObs dobs;
+    dobs.payload_bytes = corpus.size();
+    dobs.wall_ns = synth_wall(rows[2], rows[3]);
+    dobs.cpu_ema_gibs = rows[2].gibs;
+    dobs.gpu_ema_gibs = rows[3].gibs;
+    dobs.regime = "calibrate";
+    save_opt.mode = Mode::DECOMPRESS;
+    if (dobs.wall_ns > 0) adapt_profile_save(save_opt, dobs);
+    std::fprintf(stderr, "[CALIBRATE] profile recorded: %s\n", adapt_profile_path().c_str());
+  } else {
+    std::fprintf(stderr, "[CALIBRATE] --no-profile: measured only, nothing recorded\n");
+  }
+  return EXIT_OK;
+}
+#endif  // !_WIN32
+
 int main(int argc, char ** argv)
 {
   setup_signal_handlers();
@@ -17309,6 +18087,9 @@ int main(int argc, char ** argv)
                          "extraction (parallel file-writer pool); ignoring it\n");
 
 #ifndef _WIN32
+  // --calibrate: explicit calibration pass; no input files involved.
+  if (opt.calibrate) return run_calibrate(opt);
+
   // -l: list .zst frame info (plain) or archive contents (`-l --tar`).  Checked
   // before the extract/verify dispatch so it doesn't fall through to either.
   if (opt.list_mode) {
@@ -17326,7 +18107,22 @@ int main(int argc, char ** argv)
     std::unique_ptr<AdaptGovernor> adapt;
     if (opt.adapt) { adapt = std::make_unique<AdaptGovernor>(opt, &meter); adapt->start(); }
     int rc = extract_tar(opt, &meter);
-    if (adapt) { adapt->stop(); adapt->print_summary(); }
+    if (adapt) {
+      adapt->stop();
+      adapt->print_summary();
+      AdaptObs obs;
+      obs.add_meter(meter,
+          (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - meter.t0).count(),
+          /*compress_dir=*/false);
+      obs.regime = adapt->dominant_regime();
+      if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= 3ull * 1000 * 1000 * 1000) {
+        obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
+        obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
+        obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
+        adapt_profile_save(opt, obs);
+      }
+    }
     return rc;
   }
   // -t --tar: decompress AND structurally validate the inner tar (header
@@ -17337,12 +18133,33 @@ int main(int argc, char ** argv)
     std::unique_ptr<AdaptGovernor> adapt;
     if (opt.adapt) { adapt = std::make_unique<AdaptGovernor>(opt, &meter); adapt->start(); }
     int rc = verify_tar(opt, &meter);
-    if (adapt) { adapt->stop(); adapt->print_summary(); }
+    if (adapt) {
+      adapt->stop();
+      adapt->print_summary();
+      AdaptObs obs;
+      obs.add_meter(meter,
+          (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - meter.t0).count(),
+          /*compress_dir=*/false);
+      obs.regime = adapt->dominant_regime();
+      if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= 3ull * 1000 * 1000 * 1000) {
+        obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
+        obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
+        obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
+        adapt_profile_save(opt, obs);
+      }
+    }
     return rc;
   }
 #endif
 
   int exit_code = EXIT_OK;
+
+#ifndef _WIN32
+  // --adapt: this process's accumulated profile observation (multi-file
+  // runs sum; the save at the bottom derives rates from the sums).
+  AdaptObs adapt_obs;
+#endif
 
   for (size_t file_idx = 0; file_idx < opt.inputs.size(); ++file_idx) {
   // --- Per-file setup ---
@@ -17651,6 +18468,12 @@ int main(int argc, char ** argv)
       }
 
       ++rebuild_attempt;
+#ifndef _WIN32
+      // --adapt profile: a fault/verify rebuild poisons this run's measured
+      // rates (Meter::reset() rebases the clock; the GPU numbers are garbage)
+      // — count the fault, merge nothing.
+      adapt_obs.fault = true;
+#endif
 
       // --verify-retries cap (verify-triggered rebuilds only; a GPU fault rebuilds
       // CPU-only once and the CPU path doesn't re-fault).
@@ -17865,6 +18688,11 @@ int main(int argc, char ** argv)
     if (adapt) {
       adapt->stop();
       adapt->print_summary();
+      adapt_obs.add_meter(meter,
+          (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - meter.t0).count(),
+          /*compress_dir=*/false);
+      adapt_obs.regime = adapt->dominant_regime();
     }
     std::fclose(in);
     continue;  // next file
@@ -18135,6 +18963,13 @@ int main(int argc, char ** argv)
   if (adapt) {
     adapt->stop();
     adapt->print_summary();
+#ifndef _WIN32
+    adapt_obs.add_meter(meter,
+        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - meter.t0).count(),
+        opt.mode == Mode::COMPRESS);
+    adapt_obs.regime = adapt->dominant_regime();
+#endif
   }
 
   } // end for (file_idx)
@@ -18145,6 +18980,17 @@ int main(int argc, char ** argv)
   if (opt.tar_mode && g_tar_had_errors.load(std::memory_order_relaxed)
       && exit_code == EXIT_OK)
     exit_code = EXIT_ERROR;
+
+  // --adapt: persist this process's calibration observation.  Only a clean
+  // run qualifies (exit 0); sub-3 s runs measured nothing worth keeping
+  // unless there is a fault to count.
+  if (opt.adapt && !opt.no_profile && exit_code == EXIT_OK
+      && (adapt_obs.wall_ns >= 3ull * 1000 * 1000 * 1000 || adapt_obs.fault)) {
+    adapt_obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
+    adapt_obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
+    adapt_obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
+    adapt_profile_save(opt, adapt_obs);
+  }
 #endif
 
   return exit_code;
@@ -18238,6 +19084,7 @@ static int detect_min_pcie_gen()
   }
   return (min_gen > 0) ? min_gen : 0;
 }
+
 
 /*======================================================================
  Apply asymmetric-mode default backend selection.  Called after
@@ -18618,8 +19465,10 @@ static Options parse_args(int argc, char ** argv)
       opt.verify = true;   // implied
     }
     else if (a == "--keep-going") opt.keep_going = true;
-    else if (a == "--adapt")    { opt.adapt = true;  opt.adapt_user_set = true; }
-    else if (a == "--no-adapt") { opt.adapt = false; opt.adapt_user_set = true; }
+    else if (a == "--adapt")      { opt.adapt = true;  opt.adapt_user_set = true; }
+    else if (a == "--no-adapt")   { opt.adapt = false; opt.adapt_user_set = true; }
+    else if (a == "--no-profile") { opt.no_profile = true; }
+    else if (a == "--calibrate")  { opt.calibrate = true; }
     else if (a == "--verify-retries" || a.rfind("--verify-retries=", 0) == 0) {
       std::string v = (a.size() > 16) ? a.substr(17)
                     : (i + 1 < argc ? std::string(argv[++i]) : std::string());
