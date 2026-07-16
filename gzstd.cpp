@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.14.95";
+static constexpr const char * GZSTD_VERSION = "0.15.0";
 //
 // Architecture overview:
 //
@@ -424,6 +424,11 @@ struct Options {
                                   //  error — write what decoded, record the damage, continue, then
                                   //  report which file(s)/byte ranges are affected.  Implies
                                   //  --cpu-only (the authoritative checksum validator).
+  bool adapt = false;             // --adapt: adaptive governor — classify the run's bottleneck
+                                  //  regime (source/compute/sink) from the Meter's state counters
+                                  //  and steer tuning toward the measured-fastest configuration.
+                                  //  Opt-in through v0.15.x; default decided at v1.0.
+  bool adapt_user_set = false;    // --adapt/--no-adapt given (guards the eventual default flip)
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
   std::string output;             // explicit -o; empty = auto-derive per file
@@ -870,6 +875,11 @@ static void print_help()
 "  --keep-going        on -d, don't stop at a corrupt frame: recover what's\n"
 "                      readable, then report which file(s) are damaged\n"
 "\n"
+"Adaptive:\n"
+"  --adapt             adaptive governor: classify the run's bottleneck regime\n"
+"                      (source/compute/sink), report at -v; observe-only stage\n"
+"  --no-adapt          explicitly off (accepted now; default flip planned v1.0)\n"
+"\n"
 "Logging:\n"
 "  -v / -vv / -vvv     verbose / debug / trace\n"
 "  -q / -qq            errors only / silent\n"
@@ -1046,6 +1056,23 @@ static void print_help_long()
 "     with -C DIR.  Exit codes: 6 = finished but some file(s) are\n"
 "     unverified; 7 = finished but some data could not be decoded\n"
 "     (incomplete).  Off by default.\n"
+"\n"
+"  --adapt / --no-adapt    (default: off through v0.15.x)\n"
+"     Adaptive governor.  A background observer samples the run's reader\n"
+"     and writer state counters every 100 ms and classifies the bottleneck\n"
+"     regime: source-bound (the input path is the faucet), compute-bound\n"
+"     (the CPU/GPU engines are the ceiling), or sink-bound (the output\n"
+"     device is).  Regime transitions and an end-of-run share summary\n"
+"     print at -v as [ADAPT] lines.  This stage is observe-only — it\n"
+"     changes no tuning decision; later 0.15.x stages wire the regimes to\n"
+"     actions (measured engine ranking, reader/writer scaling, cached\n"
+"     per-machine calibration).  --no-adapt is accepted now so scripts\n"
+"     keep working when the default flips (decision planned for v1.0).\n"
+"     COMPATIBILITY: zstd has its own --adapt (it varies the compression\n"
+"     LEVEL with I/O conditions).  gzstd deliberately takes the name\n"
+"     over: bare --adapt enables the governor; zstd's value form\n"
+"     --adapt=min#,max# also enables it, but the level bounds are\n"
+"     ignored with a warning (gzstd does not vary the level mid-stream).\n"
 "\n"
 "  --direct / --no-direct\n"
 "     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
@@ -1902,6 +1929,238 @@ static const char * writer_verdict(double busy, double hol, double starved,
     return "output device mostly busy — near sink-limited";
   return "no dominant writer-side state — output was capped upstream of the result store";
 }
+
+/*======================================================================
+ AdaptGovernor (--adapt) — measured-regime runtime self-tuning (v0.15).
+
+ One instance per operation, alongside its Meter.  A background tick
+ thread (100 ms cadence, condition-variable stoppable — same cadence as
+ the hybrid scheduler's tick loop, and it exists only under --adapt)
+ samples the Meter's reader/writer state counters as WINDOWED deltas and
+ classifies the run's bottleneck regime:
+
+   SOURCE_BOUND  — the reader is the faucet: per-thread io+parse+copy
+                   ≥ 85% of the window and essentially never blocked on
+                   downstream capacity ([READER] verdict thresholds).
+   SINK_BOUND    — the output device is the ceiling: write-path busy
+                   ≥ 55% of the window (the proven v0.14.52 sink-freeze
+                   threshold), checked first — a saturated sink caps the
+                   pipeline regardless of what the reader is doing.
+   COMPUTE_BOUND — neither: the engines are the ceiling.  Note the mmap
+                   zero-copy reader leaves all four reader counters at
+                   zero, so a source-starved mmap-fed run classifies here
+                   until the queue-starvation fallback signal lands (M4).
+
+ Transitions require STICKY_TICKS consecutive windows of the new regime
+ (hysteresis) and only start after a RAMP_SEC warm-up (v0.14.52 guard).
+ A Meter::reset() mid-run (GPU-fault CPU rebuild) makes deltas go
+ negative; the governor re-baselines and skips that window.
+
+ This stage is the sensing half: classify + report ([ADAPT] lines at -v).
+ The acting half — ranked-engine overflow dispatch, reader/writer pool
+ scaling, measured I/O probes, deadline demotion — attaches to these
+ regime signals in later 0.15.x stages, per the approved design.
+======================================================================*/
+enum class AdaptRegime : int { WARMUP = 0, SOURCE_BOUND, COMPUTE_BOUND, SINK_BOUND };
+
+static const char * adapt_regime_name(AdaptRegime r)
+{
+  switch (r) {
+    case AdaptRegime::WARMUP:        return "warmup";
+    case AdaptRegime::SOURCE_BOUND:  return "source-bound";
+    case AdaptRegime::COMPUTE_BOUND: return "compute-bound";
+    case AdaptRegime::SINK_BOUND:    return "sink-bound";
+  }
+  return "?";
+}
+
+class AdaptGovernor {
+public:
+  AdaptGovernor(const Options & opt, const Meter * m) : opt_(opt), m_(m) {}
+  ~AdaptGovernor() { stop(); }
+
+  void start()
+  {
+    t_start_ = std::chrono::steady_clock::now();
+    snap_baseline_();
+    thr_ = std::thread(&AdaptGovernor::tick_loop_, this);
+  }
+
+  // Idempotent; joins the tick thread.  Safe to call from the destructor.
+  // Single-caller-thread only: a second CONCURRENT stop() would early-return
+  // while the first is still joining — every caller today (explicit stop +
+  // destructor) runs on the main thread, keep it that way.
+  void stop()
+  {
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (done_) return;
+      done_ = true;
+    }
+    cv_.notify_all();
+    if (thr_.joinable()) thr_.join();
+    // Close out the timeline so the summary covers the full run.
+    account_(now_ns_());
+  }
+
+  // End-of-run [ADAPT] block, printed with the [READER]/[WRITER] diags.
+  void print_summary() const
+  {
+    if (opt_.verbosity < V_VERBOSE) return;
+    const uint64_t total = acc_[0] + acc_[1] + acc_[2] + acc_[3];
+    if (total == 0) return;
+    if (regime_ == AdaptRegime::WARMUP && transitions_ == 0) {
+      vlog(V_VERBOSE, opt_, "[ADAPT] run shorter than the "
+           + std::to_string((int)RAMP_SEC) + " s ramp — no regime classified\n");
+      return;
+    }
+    std::ostringstream os;
+    os << "[ADAPT] regime shares:";
+    static const AdaptRegime order[] = { AdaptRegime::SOURCE_BOUND,
+                                         AdaptRegime::COMPUTE_BOUND,
+                                         AdaptRegime::SINK_BOUND,
+                                         AdaptRegime::WARMUP };
+    for (AdaptRegime r : order) {
+      const uint64_t ns = acc_[(int)r];
+      if (ns == 0) continue;
+      char frag[64];
+      std::snprintf(frag, sizeof(frag), " %s %.1f s (%.0f%%)",
+                    adapt_regime_name(r), ns / 1e9, 100.0 * ns / total);
+      os << frag;
+    }
+    os << " | transitions " << transitions_
+       << " | actions: none (observe-only stage)\n";
+    vlog(V_VERBOSE, opt_, os.str());
+  }
+
+private:
+  static constexpr int64_t TICK_NS       = 100 * 1000 * 1000;  // 100 ms, = hybrid tick cadence
+  static constexpr double  RAMP_SEC      = 3.0;   // v0.14.52 ramp guard
+  static constexpr double  SINK_BUSY     = 0.55;  // v0.14.52 sink-freeze threshold
+  static constexpr double  SOURCE_BUSY   = 0.85;  // [READER] "reader saturated" threshold
+  static constexpr double  SOURCE_BLOCKED_MAX = 0.05;
+  static constexpr int     STICKY_TICKS  = 5;     // 0.5 s of agreement to switch regime
+
+  struct Snap {
+    uint64_t wdisk = 0, rio = 0, rparse = 0, rcopy = 0, rblocked = 0;
+  };
+
+  int64_t now_ns_() const
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t_start_).count();
+  }
+
+  void snap_(Snap & s) const
+  {
+    s.wdisk    = m_->writer_disk_ns.load(std::memory_order_relaxed);
+    s.rio      = m_->reader_io_ns.load(std::memory_order_relaxed);
+    s.rparse   = m_->reader_parse_ns.load(std::memory_order_relaxed);
+    s.rcopy    = m_->reader_copy_ns.load(std::memory_order_relaxed);
+    s.rblocked = m_->reader_blocked_ns.load(std::memory_order_relaxed);
+  }
+
+  void snap_baseline_() { snap_(prev_); prev_ns_ = now_ns_(); }
+
+  void tick_loop_()
+  {
+    std::unique_lock<std::mutex> lk(mtx_);
+    while (!done_) {
+      cv_.wait_for(lk, std::chrono::nanoseconds(TICK_NS), [&] { return done_; });
+      if (done_) break;
+      lk.unlock();
+      do_tick_();
+      lk.lock();
+    }
+  }
+
+  void do_tick_()
+  {
+    const int64_t t = now_ns_();
+    Snap cur;
+    snap_(cur);
+    // Meter::reset() (GPU-fault CPU rebuild) zeroes the counters under us —
+    // any negative delta means the window straddles a reset: re-baseline.
+    if (cur.wdisk < prev_.wdisk || cur.rio < prev_.rio
+        || cur.rparse < prev_.rparse || cur.rcopy < prev_.rcopy
+        || cur.rblocked < prev_.rblocked) {
+      prev_ = cur;
+      prev_ns_ = t;
+      return;
+    }
+    const double dt = double(t - prev_ns_);
+    if (dt <= 0) return;
+
+    AdaptRegime observed;
+    if (t < int64_t(RAMP_SEC * 1e9)) {
+      observed = AdaptRegime::WARMUP;
+    } else {
+      const double sink_busy = double(cur.wdisk - prev_.wdisk) / dt;
+      const int    rthreads  = std::max(1, m_->reader_threads.load(std::memory_order_relaxed));
+      const double rbusy     = double((cur.rio - prev_.rio) + (cur.rparse - prev_.rparse)
+                                      + (cur.rcopy - prev_.rcopy)) / (dt * rthreads);
+      const double rblocked  = double(cur.rblocked - prev_.rblocked) / (dt * rthreads);
+      if      (sink_busy >= SINK_BUSY)                                  observed = AdaptRegime::SINK_BOUND;
+      else if (rbusy >= SOURCE_BUSY && rblocked <= SOURCE_BLOCKED_MAX)  observed = AdaptRegime::SOURCE_BOUND;
+      else                                                              observed = AdaptRegime::COMPUTE_BOUND;
+    }
+    prev_ = cur;
+    prev_ns_ = t;
+
+    if (observed == regime_) {
+      candidate_ticks_ = 0;
+    } else if (observed == candidate_) {
+      if (++candidate_ticks_ >= STICKY_TICKS) transition_(observed, t);
+    } else {
+      candidate_ = observed;
+      candidate_ticks_ = 1;
+    }
+    // WARMUP → first classification switches immediately (the ramp guard
+    // already provided the damping; making it also wait STICKY_TICKS would
+    // just misfile 0.5 s of a classified regime under warmup).
+    if (regime_ == AdaptRegime::WARMUP && observed != AdaptRegime::WARMUP)
+      transition_(observed, t);
+  }
+
+  void transition_(AdaptRegime to, int64_t t)
+  {
+    account_(t);
+    const AdaptRegime from = regime_;
+    regime_ = to;
+    candidate_ = to;
+    candidate_ticks_ = 0;
+    if (from != AdaptRegime::WARMUP) ++transitions_;
+    char line[160];
+    std::snprintf(line, sizeof(line), "[ADAPT] regime: %s -> %s (t=%.1f s)\n",
+                  adapt_regime_name(from), adapt_regime_name(to), t / 1e9);
+    vlog(V_VERBOSE, opt_, line);
+  }
+
+  // Attribute wall time since the last regime edge to the current regime.
+  void account_(int64_t t)
+  {
+    acc_[(int)regime_] += uint64_t(std::max<int64_t>(0, t - regime_since_ns_));
+    regime_since_ns_ = t;
+  }
+
+  const Options & opt_;
+  const Meter *   m_;
+  std::chrono::steady_clock::time_point t_start_{};
+  std::thread thr_;
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  bool done_ = false;
+
+  Snap    prev_{};
+  int64_t prev_ns_ = 0;
+  AdaptRegime regime_ = AdaptRegime::WARMUP;
+  AdaptRegime candidate_ = AdaptRegime::WARMUP;
+  int     candidate_ticks_ = 0;
+  int64_t regime_since_ns_ = 0;
+  uint64_t acc_[4] = { 0, 0, 0, 0 };  // ns per AdaptRegime value
+  int transitions_ = 0;
+};
+
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
 static bool is_stdout_tty() { return isatty(fileno(stdout)) != 0; }
 // Format a byte count as a human-readable string (e.g. "3.14 GiB").
@@ -17060,14 +17319,26 @@ int main(int argc, char ** argv)
   // extractor; bypasses the single-output per-file loop below.
   if (opt.tar_mode && opt.mode == Mode::DECOMPRESS) {
     Meter meter;
-    return extract_tar(opt, &meter);
+    // --adapt on extract: the extractor's writer pool keeps its own busy
+    // counters (not Meter::writer_disk_ns), so sink-bound is invisible to
+    // the classifier here until the extract sink wiring lands — the
+    // governor still sees the source/compute split.
+    std::unique_ptr<AdaptGovernor> adapt;
+    if (opt.adapt) { adapt = std::make_unique<AdaptGovernor>(opt, &meter); adapt->start(); }
+    int rc = extract_tar(opt, &meter);
+    if (adapt) { adapt->stop(); adapt->print_summary(); }
+    return rc;
   }
   // -t --tar: decompress AND structurally validate the inner tar (header
   // checksums, completeness) without writing files — catches a corrupt/truncated
   // tar inside an otherwise-intact zstd stream, which plain -t misses.
   if (opt.tar_mode && opt.mode == Mode::TEST) {
     Meter meter;
-    return verify_tar(opt, &meter);
+    std::unique_ptr<AdaptGovernor> adapt;
+    if (opt.adapt) { adapt = std::make_unique<AdaptGovernor>(opt, &meter); adapt->start(); }
+    int rc = verify_tar(opt, &meter);
+    if (adapt) { adapt->stop(); adapt->print_summary(); }
+    return rc;
   }
 #endif
 
@@ -17208,6 +17479,13 @@ int main(int argc, char ** argv)
 #endif
 
   Meter meter;
+  // --adapt: per-operation governor alongside the Meter (observe/classify;
+  // summary prints with the [READER]/[WRITER] diags below).
+  std::unique_ptr<AdaptGovernor> adapt;
+  if (opt.adapt) {
+    adapt = std::make_unique<AdaptGovernor>(opt, &meter);
+    adapt->start();
+  }
   if (opt.verbosity >= V_DEBUG && opt.mode == Mode::COMPRESS) {
     std::ostringstream os;
 #ifdef HAVE_NVCOMP
@@ -17584,6 +17862,10 @@ int main(int argc, char ** argv)
       std::fflush(stderr);
     }
 
+    if (adapt) {
+      adapt->stop();
+      adapt->print_summary();
+    }
     std::fclose(in);
     continue;  // next file
   }
@@ -17850,6 +18132,10 @@ int main(int argc, char ** argv)
     }
   }
 
+  if (adapt) {
+    adapt->stop();
+    adapt->print_summary();
+  }
 
   } // end for (file_idx)
 
@@ -18332,6 +18618,8 @@ static Options parse_args(int argc, char ** argv)
       opt.verify = true;   // implied
     }
     else if (a == "--keep-going") opt.keep_going = true;
+    else if (a == "--adapt")    { opt.adapt = true;  opt.adapt_user_set = true; }
+    else if (a == "--no-adapt") { opt.adapt = false; opt.adapt_user_set = true; }
     else if (a == "--verify-retries" || a.rfind("--verify-retries=", 0) == 0) {
       std::string v = (a.size() > 16) ? a.substr(17)
                     : (i + 1 < argc ? std::string(argv[++i]) : std::string());
@@ -18518,8 +18806,17 @@ static Options parse_args(int argc, char ** argv)
     // Real mapping: --single-thread ≈ -T 1
     else if (a == "--single-thread") { opt.cpu_threads = 1; }
     // Warn no-ops: zstd features gzstd does not implement.
-    else if (a == "--adapt" || a.rfind("--adapt=", 0) == 0) {
-      warn_ignored_zstd_opt("--adapt", "gzstd does not adapt level during compression");
+    // (Bare --adapt is a REAL gzstd flag since v0.15.0 — the adaptive
+    // governor — parsed above; it deliberately takes over zstd's flag of
+    // the same name.  Only zstd's level-bounds value form lands here: it
+    // enables the governor but the min#/max# level bounds are ignored,
+    // because gzstd's --adapt adapts the pipeline, not the level.)
+    else if (a.rfind("--adapt=", 0) == 0) {
+      opt.adapt = true;
+      opt.adapt_user_set = true;
+      warn_ignored_zstd_opt("--adapt=min#,max#",
+                            "gzstd's --adapt governs the pipeline, not the "
+                            "compression level; bounds ignored, governor enabled");
     }
     else if (a == "--long" || a.rfind("--long=", 0) == 0) {
       warn_ignored_zstd_opt(a, "use --ultra for large window levels");

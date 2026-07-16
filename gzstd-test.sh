@@ -360,8 +360,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=310
-$EXTENSIVE && EXPECTED_TESTS=426
+EXPECTED_TESTS=316
+$EXTENSIVE && EXPECTED_TESTS=433
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2999,6 +2999,48 @@ else
   skip "--throttle-frames=1 --hybrid deadlock guard" "no GPU"
 fi
 
+section "--adapt observe-only skeleton"
+
+# v0.15.0 M1: --adapt runs a per-operation governor that classifies the
+# bottleneck regime and reports it — it must change NOTHING about the output.
+
+# Flags parse and the compress/decompress paths run under the governor.
+"$GZSTD" --adapt -k -f --cpu-only "$TMPDIR/large.bin" -o "$TMPDIR/adapt.zst" 2>/dev/null \
+  && pass "--adapt compress accepted (exit 0)" \
+  || fail "--adapt compress accepted" "rc=$?"
+"$GZSTD" --adapt -d -k -f --cpu-only "$TMPDIR/adapt.zst" -o "$TMPDIR/adapt.dec" 2>/dev/null
+files_match "$TMPDIR/large.bin" "$TMPDIR/adapt.dec" \
+  && pass "--adapt decompress round-trips" \
+  || fail "--adapt decompress round-trips"
+
+# --no-adapt is accepted (parsed now so scripts survive the eventual default flip).
+"$GZSTD" --no-adapt -t --cpu-only "$TMPDIR/adapt.zst" 2>/dev/null \
+  && pass "--no-adapt accepted (exit 0)" \
+  || fail "--no-adapt accepted" "rc=$?"
+
+# Observe-only guarantee: output bytes identical with and without --adapt.
+"$GZSTD" -k -f --cpu-only -c "$TMPDIR/large.bin" > "$TMPDIR/adapt-plain.zst" 2>/dev/null
+"$GZSTD" --adapt -k -f --cpu-only -c "$TMPDIR/large.bin" > "$TMPDIR/adapt-on.zst" 2>/dev/null
+files_match "$TMPDIR/adapt-plain.zst" "$TMPDIR/adapt-on.zst" \
+  && pass "--adapt output byte-identical to plain (observe-only)" \
+  || fail "--adapt output byte-identical to plain"
+
+# [ADAPT] telemetry prints at -v (regime summary, or the honest too-short
+# line on a fast run) — and only at -v, and only with --adapt.
+"$GZSTD" --adapt -v -k -f --cpu-only "$TMPDIR/large.bin" -o "$TMPDIR/adapt.zst" 2>"$TMPDIR/adapt-v.err"
+grep -q '\[ADAPT\]' "$TMPDIR/adapt-v.err" \
+  && pass "[ADAPT] summary printed at -v" \
+  || fail "[ADAPT] summary printed at -v"
+"$GZSTD" --adapt -k -f --cpu-only "$TMPDIR/large.bin" -o "$TMPDIR/adapt.zst" 2>"$TMPDIR/adapt-q.err"
+"$GZSTD" -v -k -f --cpu-only "$TMPDIR/large.bin" -o "$TMPDIR/adapt.zst" 2>"$TMPDIR/adapt-off.err"
+if ! grep -q '\[ADAPT\]' "$TMPDIR/adapt-q.err" && ! grep -q '\[ADAPT\]' "$TMPDIR/adapt-off.err"; then
+  pass "[ADAPT] silent without -v and without --adapt"
+else
+  fail "[ADAPT] silent without -v and without --adapt"
+fi
+rm -f "$TMPDIR/adapt.zst" "$TMPDIR/adapt.dec" "$TMPDIR/adapt-plain.zst" \
+      "$TMPDIR/adapt-on.zst" "$TMPDIR/adapt-v.err" "$TMPDIR/adapt-q.err" "$TMPDIR/adapt-off.err"
+
 section "Sliding-window compression"
 
 # Basic round-trip: compress with --sliding-window, decompress normally
@@ -3143,7 +3185,7 @@ for opt in --check --no-check --asyncio --no-asyncio --format=zstd \
 done
 
 # Warn no-ops (each should emit one compat warning)
-for opt in --adapt --long=27 --rsyncable --exclude-compressed \
+for opt in --long=27 --rsyncable --exclude-compressed \
            --format=gzip --pass-through; do
   out=$("$GZSTD" "$opt" -f "$TMPDIR/zc.bin" 2>&1)
   if echo "$out" | grep -qi "accepted for zstd compatibility but ignored"; then
@@ -3152,6 +3194,22 @@ for opt in --adapt --long=27 --rsyncable --exclude-compressed \
     fail "warn no-op: $opt" "missing compat warning"
   fi
 done
+
+# --adapt is a REAL gzstd flag since v0.15.0 (the adaptive governor takes
+# over zstd's same-named flag): bare form runs with NO compat warning;
+# zstd's level-bounds value form still runs but warns the bounds are ignored.
+out=$("$GZSTD" --adapt -f "$TMPDIR/zc.bin" 2>&1); rc=$?
+if [[ $rc -eq 0 ]] && ! echo "$out" | grep -qi "ignored"; then
+  pass "--adapt is real (no compat warning, exit 0)"
+else
+  fail "--adapt is real" "rc=$rc"
+fi
+out=$("$GZSTD" --adapt=min=1,max=19 -f "$TMPDIR/zc.bin" 2>&1); rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -qi "bounds ignored"; then
+  pass "--adapt=min#,max# runs, warns bounds ignored"
+else
+  fail "--adapt=min#,max# runs, warns bounds ignored" "rc=$rc"
+fi
 
 # Value-eating warn no-ops
 out=$("$GZSTD" --trace foo.log -f "$TMPDIR/zc.bin" 2>&1)
@@ -3194,8 +3252,8 @@ fi
 out=$("$GZSTD" -B128K -f "$TMPDIR/zc.bin" 2>&1)
 echo "$out" | grep -qi "chunk-size" && pass "-B# warns" || fail "-B# warns"
 
-# -q suppresses compat warnings
-out=$("$GZSTD" -q --adapt -f "$TMPDIR/zc.bin" 2>&1)
+# -q suppresses compat warnings (--adapt=… still warns; bare --adapt is real)
+out=$("$GZSTD" -q --adapt=min=1,max=19 -f "$TMPDIR/zc.bin" 2>&1)
 if ! echo "$out" | grep -qi warning; then
   pass "-q suppresses compat warnings"
 else

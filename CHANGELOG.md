@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.14.95  
+**Covers:** v0.9.50 → v0.15.0  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.0 — the --adapt chapter opens: AdaptGovernor skeleton (regime classifier, observe-only)
+
+**`--adapt` lands as the sensing half of the adaptive governor — classify the run's bottleneck, act on nothing yet.** The 0.15.x line builds measured-regime self-tuning per the reviewed design (ranked per-device engine dispatch, measured keep-or-revert I/O probes, persistent per-machine calibration); this first stage is the skeleton every later action hangs off. A per-operation `AdaptGovernor` runs a condition-variable-stoppable 100 ms tick thread (same cadence as the hybrid scheduler's tick loop; exists only under `--adapt`) that samples the Meter's reader/writer state counters as WINDOWED deltas — not cumulative fractions, so a regime change at t=30 s isn't diluted by the first 30 s — and classifies each window: **sink-bound** (write-path busy ≥ 0.55, the proven v0.14.52 sink-freeze threshold, checked first), **source-bound** (per-thread reader io+parse+copy ≥ 0.85 with blocked-downstream ≈ 0, the `[READER]` verdict thresholds), else **compute-bound**. Transitions need 5 consecutive agreeing windows (0.5 s hysteresis) after a 3 s ramp guard; `Meter::reset()` mid-run (GPU-fault CPU rebuild) makes a delta go negative and the governor re-baselines and skips the window. `[ADAPT]` lines print at `-v`: each transition live, and an end-of-run regime-share summary alongside `[READER]`/`[WRITER]` (a sub-ramp run reports "run shorter than the 3 s ramp" rather than pretending). Wired across plain compress/decompress/test AND the tar entry points; two documented sensing gaps carry to the action stages: the extractor's writer pool keeps its own busy counters (extract sink-bound invisible for now) and the mmap zero-copy reader leaves all four reader counters at zero (a source-starved mmap run classifies compute-bound until the queue-starvation fallback lands).
+
+**`--adapt` deliberately takes over zstd's same-named flag** (zstd's varies the compression LEVEL with I/O conditions; it was a warn-level compat no-op here since the compat layer landed). Bare `--adapt` is now the real governor flag; zstd's value form `--adapt=min#,max#` also enables the governor but warns that the level bounds are ignored — gzstd adapts the pipeline, not the level. Documented in the long help; the compat suite asserts all three behaviors (bare = real + silent, value form = runs + warns, `-q` still suppresses the warning).
+
+`--no-adapt` is parsed today so scripts keep working when the default flips (decision at v1.0). Explicitly gated observe-only: compressed output is byte-identical with and without `--adapt` (suite-asserted). A concurrency/lifecycle review angle ran clean (per-iteration governor+Meter share scope; stop covered on every loop exit including TEST's early `continue`; die()/std::exit safe with the thread alive since main's frame isn't unwound); its one hardening note — stop() is single-caller-thread only — is documented at the declaration. The 100 ms tick is a flagged deliberate exception to the no-fixed-waits rule: telemetry cadence, not a scheduling wait, and no correctness path ever waits on it.
+
+Suite: 316 normal / 433 extensive (6 new adapt-section tests: --adapt/--no-adapt accepted, round-trip under the governor, byte-parity with/without the flag, [ADAPT] present at -v, silent without -v/--adapt; compat section reworked: bare --adapt real + silent, --adapt=min#,max# runs + warns, -q suppression re-anchored to the value form).
 
 ## v0.14.95 — v0.14.xx close-out review: two pooled-reader deadlocks, malformed-tar abort, exit-code fidelity, help/doc accuracy
 
