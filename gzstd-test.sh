@@ -365,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=343
-$EXTENSIVE && EXPECTED_TESTS=460
+EXPECTED_TESTS=345
+$EXTENSIVE && EXPECTED_TESTS=462
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3412,6 +3412,42 @@ else
 fi
 rm -f "$TMPDIR/arank.zst" "$TMPDIR/arank.out" "$TMPDIR/arank1.err" \
       "$TMPDIR/arank2.err" "$TMPDIR/arank3.err" "$TMPDIR/arank4.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt reader scale-up (source-bound, io-dominant)"
+
+# The MT prefetch reader spawns dormant threads up to 2x (<=12) and wakes
+# them on the governor's source-bound + io-dominant signal.  Needs a
+# compressed input past the MT-reader gate (>128 MiB), so build one from
+# urandom (incompressible: compressed size ~= raw size).  -T8 pins the
+# derived reader count to 3 (cap 6) on every box.
+spin "reader scale-up corpus (192 MiB)"
+dd if=/dev/urandom bs=1M count=192 2>/dev/null > "$TMPDIR/arsu.bin"
+"$GZSTD" --cpu-only -f "$TMPDIR/arsu.bin" -o "$TMPDIR/arsu.zst" 2>/dev/null
+
+# 1. Forced source-bound wakes the dormant readers; output still exact.
+env GZSTD_DEBUG_ADAPT_REGIME=source-bound "$GZSTD" --adapt --no-profile -v -T8 \
+  --cpu-only -d -k -f "$TMPDIR/arsu.zst" -o "$TMPDIR/arsu.out" 2>"$TMPDIR/arsu1.err"
+if grep -q 'reader scale-up 3 -> 6' "$TMPDIR/arsu1.err" \
+   && grep -q 'actions:.*reader-scaleup' "$TMPDIR/arsu1.err" \
+   && files_match "$TMPDIR/arsu.bin" "$TMPDIR/arsu.out"; then
+  pass "source-bound wakes dormant prefetch readers"
+else
+  fail "source-bound wakes dormant prefetch readers"
+fi
+
+# 2. Without --adapt the dormant pool does not exist and nothing scales.
+env GZSTD_DEBUG_ADAPT_REGIME=source-bound "$GZSTD" -v -T8 \
+  --cpu-only -d -k -f "$TMPDIR/arsu.zst" -o "$TMPDIR/arsu.out" 2>"$TMPDIR/arsu2.err"
+if ! grep -q 'reader scale-up' "$TMPDIR/arsu2.err" \
+   && files_match "$TMPDIR/arsu.bin" "$TMPDIR/arsu.out"; then
+  pass "reader scale-up inert without --adapt"
+else
+  fail "reader scale-up inert without --adapt"
+fi
+
+rm -f "$TMPDIR/arsu.bin" "$TMPDIR/arsu.zst" "$TMPDIR/arsu.out" \
+      "$TMPDIR/arsu1.err" "$TMPDIR/arsu2.err"
 
 section "Sliding-window compression"
 

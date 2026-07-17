@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.4  
+**Covers:** v0.9.50 → v0.15.5  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.5 — --adapt M4 action 3: reader scale-up (source-bound, io-dominant)
+
+**The decompress parallel-prefetch reader can now grow under `--adapt`: dormant reader threads spawn up front (2× the initial count, ≤ 12) and wake when the governor classifies SOURCE_BOUND with the *io* state dominating the reader's 4-state split** — a copy-bound reader gains nothing from more prefetch threads (the per-frame copy sits on the single consumer), so io-dominance is the gate, computed as the io share within the reader's own time each tick. Mechanics per the plan: the slot ring's modulo geometry is frozen at spawn, so the ring is sized for the *cap* up front, while slot buffers allocate lazily on first claim AND the prefetch look-ahead is bounded by 2× the *active* reader count — lazy alloc alone wouldn't cap memory, since a lagging consumer lets the initial readers run ahead and touch every slot (review finding); together they keep the un-scaled run's resident footprint exactly what it was before the ring grew (a cap-sized ring at 64 MiB/slot would otherwise commit ~1.5 GiB). Work claiming is already dynamic (`next_block.fetch_add`), so woken readers integrate for free. Dormant threads park on a CV — no polling — and the wake flag is written under the same mutex every waiter re-checks under, so the wakeup cannot be lost (the v0.15.4 MAJOR-1 lesson applied at design time). User-pinned `--read-threads` never scales; `--direct-read` is exempt (O_DIRECT is single-stream by settled design). One `[ADAPT]` line on wake; `reader-scaleup` in the summary's action list. The forced-regime test hook asserts the io-dominance gate along with the verdict, making the suite tests deterministic.
+
+Deferred within action 3, explicitly: the tar-create member-reader pool gets the same treatment in a later slice (same mechanism, separate pool), and the mmap queue-starvation classifier fallback (mmap leaves all four reader counters at zero, so SOURCE_BOUND is invisible there) lands when a consumer for it exists — it needs queue-depth taps the governor doesn't have yet.
+
+Review angle: COMMIT-READY, one minor acted on (the active-bounded look-ahead above — the original lazy-alloc-only claim was inaccurate) plus exit-safety hardening: the scale CV/mutex are deliberately leaked heap objects, since `die()`/`std::exit` can fire while dormant readers are parked and destroying a CV with waiters is UB. Verified clean: both wake conditions written under the waiters' mutex, all joins dominate every exit path, forced-hook determinism, io-dominance consistent with the SOURCE_BOUND thresholds.
+
+Suite: 345 normal / 462 extensive (2 new: forced source-bound wakes the dormant readers 3→6 with exact output, inert without --adapt).
 
 ## v0.15.4 — --adapt M4 action 2: ranked-engine overflow dispatch (the heart of the chapter)
 

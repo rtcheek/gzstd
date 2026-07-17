@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.4";
+static constexpr const char * GZSTD_VERSION = "0.15.5";
 //
 // Architecture overview:
 //
@@ -2019,7 +2019,31 @@ static std::atomic<int> g_adapt_regime{0};
 // and reset at governor start.
 static constexpr uint32_t    ADAPT_ACT_SOURCE_LATCH   = 1u << 0;
 static constexpr uint32_t    ADAPT_ACT_DEVICE_QUIESCE = 1u << 1;
+static constexpr uint32_t    ADAPT_ACT_READER_SCALEUP = 1u << 2;
 static std::atomic<uint32_t> g_adapt_action_flags{0};
+
+// Reader scale-up signal (M4 action 3).  Dormant prefetch threads park on
+// this CV; the governor raises the flag when SOURCE_BOUND with the io state
+// dominating the reader's split.  One-way per operation, reset at governor
+// start.  Flag writes happen under the mutex (and are re-checked under it by
+// every waiter) so a waiter between its predicate check and its wait cannot
+// miss the only notification that will come — the v0.15.4 MAJOR-1 lesson.
+// Deliberately leaked (references to heap objects): die()/std::exit can run
+// while dormant readers are still parked here, and destroying a CV with
+// waiters is UB — a leaked object is never destroyed.
+static std::mutex              & g_adapt_scale_mtx = *new std::mutex;
+static std::condition_variable & g_adapt_scale_cv  = *new std::condition_variable;
+static std::atomic<bool>        g_adapt_reader_scaleup{false};
+
+static void adapt_request_reader_scaleup()
+{
+  {
+    std::lock_guard<std::mutex> lk(g_adapt_scale_mtx);
+    if (g_adapt_reader_scaleup.exchange(true, std::memory_order_relaxed))
+      return;   // already requested this run
+  }
+  g_adapt_scale_cv.notify_all();
+}
 
 class AdaptGovernor {
 public:
@@ -2041,10 +2065,15 @@ public:
     t_start_ = std::chrono::steady_clock::now();
     g_adapt_regime.store(0, std::memory_order_relaxed);
     g_adapt_action_flags.store(0, std::memory_order_relaxed);
+    g_adapt_reader_scaleup.store(false, std::memory_order_relaxed);
     snap_baseline_();
     // Forced regime (test hook) publishes before any worker runs, so even
-    // sub-tick operations exercise the acting paths.
-    if (forced_ != AdaptRegime::WARMUP) transition_(forced_, now_ns_());
+    // sub-tick operations exercise the acting paths.  A forced source-bound
+    // also asserts the io-dominance gate (the hook forces the whole verdict).
+    if (forced_ != AdaptRegime::WARMUP) {
+      transition_(forced_, now_ns_());
+      if (forced_ == AdaptRegime::SOURCE_BOUND) adapt_request_reader_scaleup();
+    }
     thr_ = std::thread(&AdaptGovernor::tick_loop_, this);
   }
 
@@ -2106,6 +2135,7 @@ public:
     if (acts == 0)                        os << " none";
     if (acts & ADAPT_ACT_SOURCE_LATCH)    os << " source-latch(gpu-batch)";
     if (acts & ADAPT_ACT_DEVICE_QUIESCE)  os << " device-quiesce(ranked)";
+    if (acts & ADAPT_ACT_READER_SCALEUP)  os << " reader-scaleup";
     os << "\n";
     vlog(V_VERBOSE, opt_, os.str());
   }
@@ -2179,6 +2209,14 @@ private:
       const double rbusy     = double((cur.rio - prev_.rio) + (cur.rparse - prev_.rparse)
                                       + (cur.rcopy - prev_.rcopy)) / (dt * rthreads);
       const double rblocked  = double(cur.rblocked - prev_.rblocked) / (dt * rthreads);
+      // io share WITHIN the reader's own time: the scale-up gate.  More
+      // prefetch threads only help when the reader's time is spent in
+      // pread, not in the per-frame copy (which sits on one consumer).
+      const double d_io  = double(cur.rio - prev_.rio);
+      const double d_all = d_io + double(cur.rparse - prev_.rparse)
+                         + double(cur.rcopy - prev_.rcopy)
+                         + double(cur.rblocked - prev_.rblocked);
+      last_io_frac_ = (d_all > 0.0) ? d_io / d_all : 0.0;
       if      (sink_busy >= SINK_BUSY)                                  observed = AdaptRegime::SINK_BOUND;
       else if (rbusy >= SOURCE_BUSY && rblocked <= SOURCE_BLOCKED_MAX)  observed = AdaptRegime::SOURCE_BOUND;
       else                                                              observed = AdaptRegime::COMPUTE_BOUND;
@@ -2199,6 +2237,12 @@ private:
     // just misfile 0.5 s of a classified regime under warmup).
     if (regime_ == AdaptRegime::WARMUP && observed != AdaptRegime::WARMUP)
       transition_(observed, t);
+
+    // M4 action 3: SOURCE_BOUND with io dominating the reader's split —
+    // more prefetch threads can help; wake any dormant readers.  The
+    // request latches one-way per run (see adapt_request_reader_scaleup).
+    if (regime_ == AdaptRegime::SOURCE_BOUND && last_io_frac_ >= 0.5)
+      adapt_request_reader_scaleup();
   }
 
   void transition_(AdaptRegime to, int64_t t)
@@ -2233,6 +2277,7 @@ private:
 
   Snap    prev_{};
   int64_t prev_ns_ = 0;
+  double  last_io_frac_ = 0.0;                 // tick-thread only
   AdaptRegime forced_ = AdaptRegime::WARMUP;   // GZSTD_DEBUG_ADAPT_REGIME
   AdaptRegime regime_ = AdaptRegime::WARMUP;
   AdaptRegime candidate_ = AdaptRegime::WARMUP;
@@ -7939,15 +7984,30 @@ static size_t stream_frames_to_queue_mt(
   const size_t BLOCK = (size_t)64 * ONE_MIB;
   const size_t STEP  = (size_t)4 * ONE_MIB;   // carry-growth increment
   const size_t n_blocks = (size_t)((file_size + BLOCK - 1) / BLOCK);
-  const int    n_slots  = std::max(n_readers * 2, n_readers + 1);
+
+  // --adapt reader scale-up (M4 action 3): size the slot ring for the CAP up
+  // front — the modulo geometry is frozen at spawn, so a late-woken reader
+  // must find the ring already sized for it.  Extra readers park dormant on
+  // the adapt CV (no polling) until the governor calls for them.  Never
+  // scales past a user-pinned --read-threads, and --direct-read is exempt
+  // (O_DIRECT is single-stream by settled design).
+  const bool can_scale = opt.adapt && opt.read_threads == 0 && !opt.direct_read;
+  const int  cap       = can_scale ? std::min(n_readers * 2, 12) : n_readers;
+  const int  n_slots   = std::max(cap * 2, cap + 1);
 
   struct Slot { std::vector<char> buf; size_t len = 0; size_t idx = SIZE_MAX; bool ready = false; };
   std::vector<Slot> slots((size_t)n_slots);
-  for (auto & s : slots) s.buf.resize(BLOCK);
+  // Slot buffers allocate lazily on first claim, and the prefetch look-ahead
+  // below is bounded by the ACTIVE reader count (2x active, <= n_slots) —
+  // together these keep the un-scaled run's resident footprint exactly what
+  // it was before the ring was sized for the cap: lazy alloc alone would
+  // not (a lagging consumer lets the initial readers run ahead and touch
+  // every slot).
 
   std::mutex mtx;
   std::condition_variable cv_filled, cv_freed;
   size_t consumed = 0;                 // blocks < consumed are free for reuse
+  std::atomic<int> active_readers{n_readers};   // grows when dormant readers wake
   std::atomic<size_t> next_block{0};
   std::atomic<bool> failed{false};
   std::string fail_msg;
@@ -7960,10 +8020,17 @@ static size_t stream_frames_to_queue_mt(
       Slot & s = slots[i % (size_t)n_slots];
       {
         std::unique_lock<std::mutex> lk(mtx);
-        // slot i%n last held block i-n; free once the consumer passed it
-        cv_freed.wait(lk, [&]{ return stop || consumed + (size_t)n_slots > i; });
+        // Free once the consumer passed the slot's previous tenant (ring
+        // safety: never beyond n_slots ahead), AND stay within the active
+        // pool's look-ahead (2x active readers) so an un-scaled run doesn't
+        // buffer — or lazily allocate — the dormant capacity.
+        cv_freed.wait(lk, [&]{
+          const size_t ahead = std::min((size_t)n_slots,
+              (size_t)(2 * std::max(1, active_readers.load(std::memory_order_relaxed))));
+          return stop || consumed + ahead > i; });
         if (stop) return;
       }
+      if (s.buf.size() < BLOCK) s.buf.resize(BLOCK);   // lazy first-touch alloc
       const off_t  off  = (off_t)i * (off_t)BLOCK;
       const size_t want = std::min(BLOCK, (size_t)(file_size - (uint64_t)off));
       uint64_t t0 = m ? now_ns() : 0;
@@ -7994,9 +8061,40 @@ static size_t stream_frames_to_queue_mt(
     }
   };
 
+  // Dormant scale-up readers: park on the global adapt CV until either the
+  // governor's scale-up request or this function's teardown (readers_done is
+  // written under g_adapt_scale_mtx so the wakeup cannot be lost).  A woken
+  // reader joins the same next_block claim loop — work claiming is dynamic,
+  // so integration is free.
+  std::atomic<bool> readers_done{false};
+  auto dormant = [&]() {
+    {
+      std::unique_lock<std::mutex> lk(g_adapt_scale_mtx);
+      g_adapt_scale_cv.wait(lk, [&]{
+        return readers_done.load(std::memory_order_relaxed)
+            || g_adapt_reader_scaleup.load(std::memory_order_relaxed); });
+    }
+    if (readers_done.load(std::memory_order_relaxed)) return;
+    active_readers.fetch_add(1, std::memory_order_relaxed);
+    { std::lock_guard<std::mutex> lk(mtx); }   // order the bump vs cv_freed predicates
+    cv_freed.notify_all();                     // look-ahead just widened
+    const uint32_t prev = g_adapt_action_flags.fetch_or(
+        ADAPT_ACT_READER_SCALEUP, std::memory_order_relaxed);
+    if (!(prev & ADAPT_ACT_READER_SCALEUP)) {
+      // First woken reader: retag the thread count (the governor's busy
+      // fractions divide by it) and say what happened, once.
+      if (m) m->reader_threads.store(cap, std::memory_order_relaxed);
+      if (opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt, "[ADAPT] source-bound (io-dominant): reader scale-up "
+             + std::to_string(n_readers) + " -> " + std::to_string(cap) + "\n");
+    }
+    prefetch();
+  };
+
   std::vector<std::thread> readers;
-  readers.reserve((size_t)n_readers);
+  readers.reserve((size_t)cap);
   for (int k = 0; k < n_readers; ++k) readers.emplace_back(prefetch);
+  for (int k = n_readers; k < cap; ++k) readers.emplace_back(dormant);
 
   size_t seq = 0, max_frame_decomp = 0;
   std::vector<char> carry;            // straddling-frame bytes from prior block(s)
@@ -8142,6 +8240,11 @@ static size_t stream_frames_to_queue_mt(
          + " trailing bytes after " + std::to_string(seq) + " frames");
 
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
+  {
+    std::lock_guard<std::mutex> lk(g_adapt_scale_mtx);
+    readers_done.store(true, std::memory_order_relaxed);
+  }
+  g_adapt_scale_cv.notify_all();
   cv_freed.notify_all(); cv_filled.notify_all();
   for (auto & th : readers) th.join();
 
