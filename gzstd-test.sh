@@ -365,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=348
-$EXTENSIVE && EXPECTED_TESTS=465
+EXPECTED_TESTS=351
+$EXTENSIVE && EXPECTED_TESTS=468
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3495,6 +3495,75 @@ fi
 
 rm -f "$TMPDIR/asg.zst" "$TMPDIR/asg.out" "$TMPDIR/asg1.err" \
       "$TMPDIR/asg2.err" "$TMPDIR/asg3.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt read-path priors (next-run probe)"
+
+ARP_XDG="$TMPDIR/xdg-rpath"
+ARP="$ARP_XDG/gzstd/profile.json"
+
+if has_nvcomp; then
+  # Harvest this box's fingerprint for profile crafting.
+  rm -rf "$ARP_XDG"
+  env XDG_CACHE_HOME="$ARP_XDG" "$GZSTD" --adapt -vv --cpu-only -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/arp.zst" 2>"$TMPDIR/arp-fp.err"
+  ARP_LINE=$(grep -o '\[ADAPT\] fingerprint [0-9a-f]* driver [^ ]*' "$TMPDIR/arp-fp.err" | head -1)
+  ARP_HASH=$(echo "$ARP_LINE" | awk '{print $3}')
+  ARP_DRV=$(echo  "$ARP_LINE" | awk '{print $5}')
+  [[ "$ARP_DRV" == "(none)" ]] && ARP_DRV=""
+  mkdir -p "$ARP_XDG/gzstd"
+
+  # 1. A source-bound history on the pread path probes --direct-read once.
+  cat > "$ARP" <<ARP_EOF
+{ "gzstd_profile": 1, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
+  "driver": "$ARP_DRV",
+  "decompress": { "runs": 3, "regime": "source-bound", "path_pread_gibs": 1.0 } } } }
+ARP_EOF
+  env XDG_CACHE_HOME="$ARP_XDG" "$GZSTD" --adapt -v -d --cpu-only -k -f \
+    "$TMPDIR/arp.zst" -o "$TMPDIR/arp.out" 2>"$TMPDIR/arp1.err"
+  if grep -q 'probing --direct-read' "$TMPDIR/arp1.err" \
+     && files_match "$TMPDIR/medium.txt" "$TMPDIR/arp.out"; then
+    pass "source-bound prior probes the alternative read path"
+  else
+    fail "source-bound prior probes the alternative read path"
+  fi
+
+  # 2. A worse-measured alternative never flips (5% margin).
+  cat > "$ARP" <<ARP_EOF
+{ "gzstd_profile": 1, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
+  "driver": "$ARP_DRV",
+  "decompress": { "runs": 3, "regime": "source-bound",
+                  "path_pread_gibs": 2.0, "path_direct_gibs": 1.0 } } } }
+ARP_EOF
+  env XDG_CACHE_HOME="$ARP_XDG" "$GZSTD" --adapt -v -d --cpu-only -k -f \
+    "$TMPDIR/arp.zst" -o "$TMPDIR/arp.out" 2>"$TMPDIR/arp2.err"
+  if ! grep -qE '\[ADAPT\] (source-bound prior|read-path prior)' "$TMPDIR/arp2.err" \
+     && files_match "$TMPDIR/medium.txt" "$TMPDIR/arp.out"; then
+    pass "worse-measured alternative never flips"
+  else
+    fail "worse-measured alternative never flips"
+  fi
+
+  # 3. An explicit --mmap pin beats a compress-side source-bound prior.
+  cat > "$ARP" <<ARP_EOF
+{ "gzstd_profile": 1, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
+  "driver": "$ARP_DRV",
+  "compress": { "runs": 3, "regime": "source-bound", "path_mmap_gibs": 1.0 } } } }
+ARP_EOF
+  env XDG_CACHE_HOME="$ARP_XDG" "$GZSTD" --adapt --mmap -v --cpu-only -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/arp.zst" 2>"$TMPDIR/arp3.err"
+  if ! grep -qE '\[ADAPT\] (source-bound prior|read-path prior)' "$TMPDIR/arp3.err"; then
+    pass "explicit --mmap pin beats the read-path prior"
+  else
+    fail "explicit --mmap pin beats the read-path prior"
+  fi
+else
+  skip "source-bound prior probes the alternative read path" "no nvCOMP build"
+  skip "worse-measured alternative never flips" "no nvCOMP build"
+  skip "explicit --mmap pin beats the read-path prior" "no nvCOMP build"
+fi
+rm -rf "$ARP_XDG" "$TMPDIR/arp.zst" "$TMPDIR/arp.out" "$TMPDIR/arp-fp.err" \
+       "$TMPDIR/arp1.err" "$TMPDIR/arp2.err" "$TMPDIR/arp3.err"
 
 section "Sliding-window compression"
 

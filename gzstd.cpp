@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.6";
+static constexpr const char * GZSTD_VERSION = "0.15.7";
 //
 // Architecture overview:
 //
@@ -2327,6 +2327,10 @@ private:
 static std::atomic<double>   g_adapt_cpu_ema_gibs{0.0};
 static std::atomic<double>   g_adapt_gpu_ema_gibs{0.0};
 static std::atomic<uint64_t> g_adapt_settled_batch{0};
+// Which read path actually engaged ("mmap" | "pread" | "direct") — stored
+// by the reader entry points (static string literals only), consumed by the
+// profile writer for the M4 action-5 read-path priors.  Last reader wins.
+static std::atomic<const char *> g_adapt_src_path{nullptr};
 
 // --adapt prior SEEDS (the reverse direction: profile -> this run).  Set by
 // apply_backend_defaults from the loaded priors; consumed once by the
@@ -2644,10 +2648,13 @@ struct AdaptObs {
   double   cpu_ema_gibs = 0, gpu_ema_gibs = 0;   // hybrid scheduler taps (0 = didn't run)
   uint64_t settled_batch = 0;                    // GPU tuner's last-used batch (0 = no GPU)
   std::string regime = "unclassified";           // governor's dominant regime, last file
+  std::string src_path;                          // read path that engaged ("" = untapped)
   bool fault = false;                            // a GPU fault/rebuild happened this process
 
   void add_meter(const Meter & m, uint64_t wall, bool compress_dir)
   {
+    if (const char * p = g_adapt_src_path.load(std::memory_order_relaxed))
+      src_path = p;
     payload_bytes += compress_dir ? m.read_bytes.load() : m.wrote_bytes.load();
     wall_ns += wall;
     reader_bytes += m.read_bytes.load();
@@ -2689,6 +2696,16 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     dir.put_num("settled_batch", (double)obs.settled_batch);   // discrete: latest wins
   if (obs.regime != "unclassified")
     dir.put_str("regime", obs.regime);
+  // Read-path record (M4 action 5): which path ran, and the end-to-end
+  // payload rate it achieved, keyed per path ("path_<p>_gibs") so the
+  // next-run prior can compare alternatives measured on THIS box.
+  if (!obs.src_path.empty()) {
+    dir.put_str("src_path", obs.src_path);
+    if (wall_s > 0 && obs.payload_bytes > 0)
+      dir.put_num("path_" + obs.src_path + "_gibs",
+                  ema(dir.gnum("path_" + obs.src_path + "_gibs", 0),
+                      obs.payload_bytes / GiB / wall_s));
+  }
 }
 
 // This machine's priors, read from the profile at startup (v0.15 M3).
@@ -2702,6 +2719,7 @@ struct AdaptPriors {
   struct Dir {
     double cpu_gibs = 0, gpu_gibs = 0, source_gibs = 0, sink_gibs = 0;
     double overall_gibs = 0, settled_batch = 0, runs = 0;
+    double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates
     std::string regime;
   } dir[2];                 // [0] = compress, [1] = decompress
 };
@@ -2731,6 +2749,9 @@ static AdaptPriors adapt_load_priors()
     D.overall_gibs  = dj->gnum("overall_gibs", 0);
     D.runs          = dj->gnum("runs", 0);
     D.regime        = dj->gstr("regime", "");
+    D.path_mmap     = dj->gnum("path_mmap_gibs", 0);
+    D.path_pread    = dj->gnum("path_pread_gibs", 0);
+    D.path_direct   = dj->gnum("path_direct_gibs", 0);
   }
   return P;
 }
@@ -8061,6 +8082,7 @@ static size_t stream_frames_to_queue_mt(
   if (fd < 0) return MT_READER_BAIL;
   try_boost_io_priority(!opt.gpu_only);
   if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
+  g_adapt_src_path.store("pread", std::memory_order_relaxed);
 
   // BLOCK comfortably larger than a typical frame so most frames sit fully
   // within one block (a straddling frame costs an extra small copy).  Frames
@@ -8400,6 +8422,7 @@ static size_t stream_frames_to_queue(
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
   *fallback = false;
   if (m) m->reader_threads.store(1, std::memory_order_relaxed);  // single sequential splitter
+  g_adapt_src_path.store("pread", std::memory_order_relaxed);
 
 #ifndef _WIN32
   // Parallel-prefetch fast path: any preadable source — a named regular
@@ -8462,6 +8485,12 @@ static size_t stream_frames_to_queue(
     din.fd = ::open(opt.input.c_str(), O_RDONLY | O_DIRECT);
     if (din.fd >= 0 && posix_memalign(&din.b, 4096, READ_CHUNK) == 0 && din.b) {
       use_direct = true;
+      // Re-tag the read-path tap: this function's entry stored "pread", but
+      // the O_DIRECT branch is what actually engages — without this the
+      // --adapt read-path probe records its own direct run under
+      // path_pread_gibs and the probe loop never closes (review v0.15.7
+      // CRITICAL).
+      g_adapt_src_path.store("direct", std::memory_order_relaxed);
       vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
     }
   }
@@ -9126,6 +9155,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
   if (o_direct || !pool) n_readers = 1;     // O_DIRECT contends; scratch path has one buffer
   if (n_readers < 1) n_readers = 1;
   if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
+  g_adapt_src_path.store(o_direct ? "direct" : "pread", std::memory_order_relaxed);
 
   void * scratch = nullptr;                 // only used when pool == nullptr (copy path)
   if (!pool) {
@@ -12915,6 +12945,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       && mmap_region.open(opt.input.c_str())) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[MMAP] using zero-copy reader\n");
+    g_adapt_src_path.store("mmap", std::memory_order_relaxed);
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
     size_t off = 0;
@@ -15438,6 +15469,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       && mmap_region.open(opt.input.c_str())) {
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, "[MMAP] using zero-copy reader\n");
+    g_adapt_src_path.store("mmap", std::memory_order_relaxed);
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
     size_t off = 0;
@@ -18675,6 +18707,10 @@ int main(int argc, char ** argv)
               std::chrono::steady_clock::now() - meter.t0).count(),
           /*compress_dir=*/false);
       obs.regime = adapt->dominant_regime();
+      // Tar runs are device-write-bound: their payload rate is not
+      // comparable with plain-decompress reads, so keep it out of the
+      // path_<p>_gibs keys the read-path prior compares (review v0.15.7).
+      obs.src_path.clear();
       if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= 3ull * 1000 * 1000 * 1000) {
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
@@ -18701,6 +18737,10 @@ int main(int argc, char ** argv)
               std::chrono::steady_clock::now() - meter.t0).count(),
           /*compress_dir=*/false);
       obs.regime = adapt->dominant_regime();
+      // Tar runs are device-write-bound: their payload rate is not
+      // comparable with plain-decompress reads, so keep it out of the
+      // path_<p>_gibs keys the read-path prior compares (review v0.15.7).
+      obs.src_path.clear();
       if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= 3ull * 1000 * 1000 * 1000) {
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
@@ -19873,6 +19913,70 @@ static void apply_backend_defaults(Options & opt)
   }
   if (priors.loaded && prior_dir.cpu_gibs > 0)
     g_adapt_seed_cpu_gibs.store(prior_dir.cpu_gibs, std::memory_order_relaxed);
+
+  // --adapt read-path prior (M4 action 5, the next-run half): a machine
+  // whose runs classify SOURCE_BOUND on read path P gets the alternative
+  // path tried once; thereafter the better measured payload rate (5%
+  // margin against flapping) wins.  Settled defaults stay as STARTING
+  // points — only measurement on this box moves it.  User pins (--mmap/
+  // --no-mmap, --direct-read) are never overridden; tar and -l keep their
+  // own paths; a non-regular input can't switch (O_DIRECT needs a seekable
+  // regular file, and mmap engagement already self-guards).
+  if (priors.loaded && !opt.tar_mode && !opt.list_mode) {
+    // The COMPARISON (both paths measured) applies regardless of the current
+    // regime: the rates are the settled verdict, the regime was only ever
+    // the reason to explore.  Gating it on source-bound produced a 2-cycle
+    // (review v0.15.7 MEDIUM): a winning alternative changes the regime,
+    // the next run reverts, goes source-bound again, re-flips — every other
+    // run on the measured-worse path.  The PROBE (alternative untried) stays
+    // source-bound-gated, and also skips runs the profile predicts will
+    // finish under the 3 s save gate — a probe that can never record would
+    // pay the alternative path indefinitely without closing the loop.
+    const bool src_bound = (prior_dir.regime == "source-bound");
+    auto long_enough = [&](uint64_t bytes) {
+      if (prior_dir.overall_gibs <= 0) return true;   // no estimate: allow
+      return double(bytes) / (prior_dir.overall_gibs * 1073741824.0) >= 3.0;
+    };
+    char pline[192]; pline[0] = '\0';
+    if (opt.mode == Mode::COMPRESS) {
+      if (!opt.mmap_user_set && opt.use_mmap) {
+        const double mm = prior_dir.path_mmap, pr = prior_dir.path_pread;
+        struct stat cst{};
+        const bool cst_ok = !opt.inputs.empty() && opt.inputs[0] != "-"
+            && ::stat(opt.inputs[0].c_str(), &cst) == 0 && S_ISREG(cst.st_mode);
+        if (mm > 0 && pr > mm * 1.05) {
+          opt.use_mmap = false;
+          std::snprintf(pline, sizeof(pline),
+            "[ADAPT] read-path prior: pooled pread (measured %.2f vs mmap %.2f "
+            "GiB/s)\n", pr, mm);
+        } else if (src_bound && mm > 0 && pr <= 0
+                   && cst_ok && long_enough((uint64_t)cst.st_size)) {
+          opt.use_mmap = false;
+          std::snprintf(pline, sizeof(pline),
+            "[ADAPT] source-bound prior (mmap %.2f GiB/s): probing the pooled "
+            "pread reader this run\n", mm);
+        }
+      }
+    } else if (!opt.direct_read && !opt.inputs.empty() && opt.inputs[0] != "-") {
+      struct stat pst{};
+      if (::stat(opt.inputs[0].c_str(), &pst) == 0 && S_ISREG(pst.st_mode)) {
+        const double pd = prior_dir.path_pread, dr = prior_dir.path_direct;
+        if (pd > 0 && dr > pd * 1.05) {
+          opt.direct_read = true;
+          std::snprintf(pline, sizeof(pline),
+            "[ADAPT] read-path prior: --direct-read (measured %.2f vs pread "
+            "%.2f GiB/s)\n", dr, pd);
+        } else if (src_bound && pd > 0 && dr <= 0
+                   && long_enough((uint64_t)pst.st_size)) {
+          opt.direct_read = true;
+          std::snprintf(pline, sizeof(pline),
+            "[ADAPT] source-bound prior (pread %.2f GiB/s): probing "
+            "--direct-read this run\n", pd);
+        }
+      }
+    }
+    if (pline[0] && opt.verbosity >= V_VERBOSE) vlog(V_VERBOSE, opt, pline);
+  }
 #endif
 
   if (opt.backend_user_set) return;

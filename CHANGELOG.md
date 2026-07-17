@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.6  
+**Covers:** v0.9.50 → v0.15.7  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.7 — --adapt M4 action 5 (first half): read-path priors — try the alternative next run
+
+**A machine whose runs classify SOURCE_BOUND on read path P now gets the alternative path tried on the next `--adapt` run, and thereafter the better *measured* payload rate wins (5% margin against flapping).** This is the plan's "settled designs stay respected as starting points — the profile can only move a box off them by measuring better on that box": mmap-on-6.4+ and the pooled pread reader remain the defaults everywhere; only a source-bound verdict plus a measured win on *this* fingerprint switches anything. Mechanics: the reader entry points tap which path actually engaged (`mmap` | `pread` | `direct` — the engaged path, not the requested one, so fallbacks record honestly); the profile records `src_path` and a per-path end-to-end payload rate (`path_<p>_gibs`, EMA-merged); at startup a source-bound history with an untried alternative flips to it once (`[ADAPT] … probing --direct-read this run`), and with both measured picks the winner. Pairs: compress mmap ↔ pooled pread; decompress/test pooled pread ↔ `--direct-read` (regular-file inputs only). User pins (`--mmap`/`--no-mmap`, `--direct-read`) are never overridden; `--tar` and `-l` keep their own paths. Verified live: a crafted pread-only source-bound profile flips a decompress run onto the real O_DIRECT reader (`[DIRECT-READ]` engaged, output exact); a worse-measured alternative stays put.
+
+Review angle: FIX-FIRST, all findings banked. **CRITICAL:** the decompress `--direct-read` probe run recorded itself as *pread* (the O_DIRECT branch lives inside the streaming reader whose entry tap says pread) — the probe would have re-fired forever, poisoning `path_pread_gibs`, with the comparison branch dead for organic profiles; fixed by re-tagging the tap at the `use_direct` engagement point, then verified end-to-end with a real ≥3 s run: probe → `path_direct_gibs` recorded → next run does not re-probe and picks the measured winner. **MEDIUM:** the comparison was regime-gated, producing a 2-cycle when the winning path changes the regime (win → compute-bound → revert → source-bound → re-flip); the comparison is now regime-free — the rates are the settled verdict, the regime only ever the reason to explore. **MED-LOW:** the probe now skips runs the profile's own overall rate predicts will finish under the 3 s save gate (a probe that can never record would pay the alternative path indefinitely). **LOW:** tar runs no longer record into the `path_<p>_gibs` keys (their write-bound payload rates aren't comparable with plain-decompress reads).
+
+The second half of action 5 — the mid-run writer-parallelism probe (try +1 pwrite writer when SINK_BOUND on O_DIRECT output, keep on ≥10% sustained gain, revert otherwise, verdict persisted) — is the next slice: it carries real concurrency surface and gets its own review angle.
+
+Suite: 351 normal / 468 extensive (3 new: source-bound prior probes the alternative path, worse-measured alternative never flips, explicit --mmap pin wins).
 
 ## v0.15.6 — --adapt M4 action 4: sink budget grow (bursty sink-bound)
 
