@@ -189,6 +189,67 @@ Subsequent runs read the profile and start with known-optimal settings. The runt
 ### 2.3 Automatic Profile Updates
 **Priority: Low | Complexity: Low | Status: SUBSUMED by v0.15.1/v0.15.7/v0.15.8** — every clean ≥3 s --adapt run EMA-merges its measurements; read-path and writer-probe verdicts persist latest-wins so hardware changes re-flip.
 
+### 2.4 Chunk-Size and GPU-Stream Priors (`--adapt` levers to explore)
+**Priority: Medium | Complexity: Medium | Status: NOT STARTED (proposed 2026-07-17)**
+
+The two most consequential knobs the v0.15.x governor does NOT touch:
+
+- **Chunk size** (`--chunk-size`, static 16 MiB): feeds the throttle math,
+  per-frame overhead, GPU batch geometry, and the parallelism/latency
+  trade — the right value plausibly differs between a 24-core Gen3 box and
+  a 256-core Gen4+ one. Candidate design: measure per-chunk overhead vs
+  throughput in `--calibrate` (compress a fixed corpus at 2-3 chunk sizes),
+  persist a `chunk_mib` prior per direction, seed the default from it
+  (user-set `--chunk-size` always wins). Caveat to design around: chunk
+  size changes the OUTPUT frame geometry, so unlike pure scheduling levers
+  it is observable in the artifact — the prior must never override
+  compatibility expectations (e.g. keep the default for piped/unknown-size
+  runs, document that archives from the same box may differ across
+  calibrations).
+- **GPU streams** (`--gpu-streams`, static per-device): the natural
+  companion to the persisted `settled_batch` — same pattern: let a probe
+  (or `--calibrate`) measure 1 vs 2 streams per device, persist
+  `settled_streams`, seed with tuner freedom. Interacts with the
+  v0.14.58 permit-hoarding fix and per-stream VRAM footprint (the
+  `--verify` VRAM doubling), so the probe must respect the existing
+  batch-floor deadlock guardrail.
+
+Both slot into the existing profile grammar (EMA or latest-wins discrete,
+driver-quarantine only for the GPU one) and the established review gates.
+
+### 2.5 `--adapt` × `--tar` Integration (proposed 2026-07-17)
+**Priority: Medium | Complexity: Medium | Status: NOT STARTED — the tar paths are the governor's blind spots**
+
+The v0.15.x governor runs on `--tar` operations but several of its senses
+and levers don't reach the tar-specific machinery (each was an explicit,
+documented deferral during M4):
+
+- **Extract sink is invisible (the big one):** `-d --tar`'s parallel
+  file-writer pool keeps its own busy counters, not `Meter::writer_disk_ns`,
+  so SINK_BOUND never classifies on extract — the governor only sees the
+  source/compute split there. Wire the extract pool's busy/starved time
+  into the Meter (or a parallel tap), then the sink-side actions apply;
+  the plan's Layer 2 explicitly names the extract writer-pool SIZE as
+  governable the same way (`--write-threads` today, static).
+- **Tar-create member-reader scale-up:** the v0.15.5 dormant-reader
+  mechanism covers only the plain-decompress prefetch pool; the tar-create
+  member readers (`--read-threads`, device-bound per the v0.14.x
+  measurements) are the same shape — dormant threads + the source-bound
+  wake — but a separate pool. Same design, second consumer.
+- **Read-path priors skip tar entirely:** v0.15.7 deliberately excludes
+  tar runs from `path_<p>_gibs` recording (write-bound payload rates
+  aren't comparable with plain-decompress reads). Tar could get its own
+  profile keys (e.g. `tar_extract_gibs` per path) rather than silence.
+- **Throttle grow is tar-exempt by design:** extract keeps its deliberate
+  16 GiB in-flight cap and the FrameSink's own v0.14.74 grow — revisit
+  only if extract measurements show the cap binding on big-RAM boxes.
+- **(General, unblocks tar-create too):** the mmap queue-starvation
+  classifier fallback — mmap leaves all four reader counters at zero, so
+  SOURCE_BOUND is invisible on mmap-fed runs; needs queue-depth taps.
+
+These are also listed as carried follow-ups in the v0.15.10 CHANGELOG
+entry; this item is their tracked home.
+
 After each run, if the auto-tuner found a different optimal than the profile predicted, update the profile. This handles hardware changes (new GPU, driver update, different NVMe) without requiring explicit recalibration.
 
 ---
@@ -766,6 +827,53 @@ one-time first-frame zeroing free).  Optional confirmation: A/B `gpu-only`
 throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
 
 </details>
+
+---
+
+## Phase 8: Multi-Format Codec Compatibility (zstd `--format=` parity)
+
+### 8.1 `--format=zstd|gzip|xz|lzma|lz4` (proposed 2026-07-17)
+**Priority: Medium | Complexity: High | Status: NOT STARTED**
+
+Implement as much as practical of zstd's multi-format support, in the same
+manner zstd does it: `--format=<codec>` selects the compression format for
+both directions (zstd's own build does gzip/xz/lzma/lz4 via zlib/liblzma/
+liblz4 when compiled in; decompression can also sniff magic bytes).
+
+**The flag collision, and its resolution (decided up front):** gzstd's
+existing `--format` selects the TAR archive format (`--format=gnu` vs the
+PAX-sparse default). Rather than renaming either flag, `--format` becomes
+domain-classified: every value after `=` is classified into its domain —
+codec ({zstd, gzip, xz, lzma, lz4}) or tar format ({gnu, ...}) — with BOTH
+spellings accepted and equivalent:
+
+    --format=gzip,gnu              # commas within one flag
+    --format=gzip --format=gnu     # or repeated flags
+
+Two values landing in the SAME domain is a usage error like any other
+invalid syntax (exit 2): `--format=gzip --format=zstd` errors, exactly as
+`--format=gnu,pax` would. Unknown values error with the full vocabulary
+listed. This keeps zstd-CLI compatibility (their `--format=gzip` works
+verbatim) without breaking existing gzstd scripts using `--format=gnu`.
+
+**Implementation landscape (why Complexity: High):**
+- gzstd's whole pipeline is frame-parallel on the zstd framing. lz4 has a
+  comparable frame format; gzip/xz/lzma do not map 1:1 — parallel COMPRESS
+  can emit independent members/blocks (pigz-style concatenated gzip
+  members, xz multi-block), but parallel DECOMPRESS of foreign
+  single-member files degrades to streaming (same fallback discipline as
+  today's unknown-content-size zstd path).
+- GPU: nvCOMP ships batched Deflate and LZ4 codecs, so gzip and lz4 could
+  keep GPU acceleration on our own frame-parallel output; xz/lzma are
+  CPU-only.
+- Deps: zlib, liblzma, liblz4 (all optional at build time, feature-gated
+  like nvCOMP; static-link implications for BUILD_STATIC).
+- Suite: each codec needs round-trip + foreign-file interop sections
+  (compress with gzstd, decompress with the reference tool, and vice
+  versa), added to the extensive `-e` compat runs.
+- Interactions to spec before starting: `--tar` (codec wraps the tar
+  stream — natural), seek-table/index (zstd-specific; skip for foreign
+  codecs), `--adapt` profile keys per codec, exit-code fidelity.
 
 ---
 
