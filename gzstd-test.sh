@@ -365,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=345
-$EXTENSIVE && EXPECTED_TESTS=462
+EXPECTED_TESTS=348
+$EXTENSIVE && EXPECTED_TESTS=465
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3296,15 +3296,17 @@ section "--adapt governor actions: source-bound batch latch"
 # layer out of these runs.
 
 # 1. A forced regime publishes and prints the transition line (no GPU needed).
-env GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" --adapt --no-profile -v --cpu-only \
+# compute-bound: the one regime with no cpu-only action attached (sink-bound
+# would grow the throttle since v0.15.6, source-bound wakes readers).
+env GZSTD_DEBUG_ADAPT_REGIME=compute-bound "$GZSTD" --adapt --no-profile -v --cpu-only \
   -k -f "$TMPDIR/large.bin" -o "$TMPDIR/alat.zst" 2>"$TMPDIR/alat1.err"
-if grep -q '\[ADAPT\] regime: warmup -> sink-bound' "$TMPDIR/alat1.err"; then
+if grep -q '\[ADAPT\] regime: warmup -> compute-bound' "$TMPDIR/alat1.err"; then
   pass "forced regime prints the transition"
 else
   fail "forced regime prints the transition"
 fi
 
-# 2. A cpu-only run has no GPU tuner to latch: summary reports actions: none.
+# 2. compute-bound triggers nothing: summary reports actions: none.
 if grep -q 'actions: none' "$TMPDIR/alat1.err"; then
   pass "cpu-only run reports no governor actions"
 else
@@ -3448,6 +3450,51 @@ fi
 
 rm -f "$TMPDIR/arsu.bin" "$TMPDIR/arsu.zst" "$TMPDIR/arsu.out" \
       "$TMPDIR/arsu1.err" "$TMPDIR/arsu2.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt sink budget grow (bursty sink-bound)"
+
+# A bursty SINK_BOUND tick grows the FrameThrottle budget one bounded step
+# (+25%, ceiling = min(RAM/2, 32 GiB, --memlimit)).  The forced hook
+# BYPASSES the burstiness predicate (one grow request at start); the arm
+# guards are what tests 2-3 exercise.  -T4 --chunk-size 4 keeps the initial
+# budget pipeline-capped (not RAM-capped) even on lean boxes, so the grow
+# ceiling is guaranteed to sit above it.
+
+# 1. Forced sink-bound compress grows the budget once; output round-trips.
+env GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" --adapt --no-profile -v \
+  -T4 --chunk-size 4 \
+  --cpu-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/asg.zst" 2>"$TMPDIR/asg1.err"
+"$GZSTD" -d --cpu-only -k -f "$TMPDIR/asg.zst" -o "$TMPDIR/asg.out" 2>/dev/null
+if grep -q 'throttle budget +' "$TMPDIR/asg1.err" \
+   && grep -q 'actions:.*sink-grow(throttle)' "$TMPDIR/asg1.err" \
+   && files_match "$TMPDIR/large.bin" "$TMPDIR/asg.out"; then
+  pass "bursty sink-bound grows the throttle budget"
+else
+  fail "bursty sink-bound grows the throttle budget"
+fi
+
+# 2. A user-pinned --throttle-frames never grows.
+env GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" --adapt --no-profile \
+  --throttle-frames 64 -v --cpu-only -k -f "$TMPDIR/large.bin" \
+  -o "$TMPDIR/asg.zst" 2>"$TMPDIR/asg2.err"
+if ! grep -q 'throttle budget +' "$TMPDIR/asg2.err"; then
+  pass "pinned --throttle-frames never grows"
+else
+  fail "pinned --throttle-frames never grows"
+fi
+
+# 3. Without --adapt the grow machinery is never armed.
+env GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" -v --cpu-only -k -f \
+  "$TMPDIR/large.bin" -o "$TMPDIR/asg.zst" 2>"$TMPDIR/asg3.err"
+if ! grep -q 'throttle budget +' "$TMPDIR/asg3.err"; then
+  pass "sink grow inert without --adapt"
+else
+  fail "sink grow inert without --adapt"
+fi
+
+rm -f "$TMPDIR/asg.zst" "$TMPDIR/asg.out" "$TMPDIR/asg1.err" \
+      "$TMPDIR/asg2.err" "$TMPDIR/asg3.err"
 
 section "Sliding-window compression"
 

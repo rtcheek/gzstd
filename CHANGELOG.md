@@ -1,11 +1,19 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.5  
+**Covers:** v0.9.50 → v0.15.6  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.6 — --adapt M4 action 4: sink budget grow (bursty sink-bound)
+
+**Under `--adapt`, a SINK_BOUND regime showing alternating starved/busy bursts grows the `FrameThrottle` budget** — the v0.14.74 smoothing insight generalized: when the tick window shows BOTH substantial device-busy AND substantial writer-starved time (each ≥ 20% of the window), a deeper in-flight budget can smooth the alternation; a purely-saturated sink cannot be helped by buffering more, so it never grows. Mechanics: the governor raises a one-per-tick request; the operation's `FrameThrottle` consumes it on its next `release()` and grows one bounded step (+25% of current max, ≥ 1 frame) — consumption-side wiring, so no governor→throttle pointer exists across their unrelated lifetimes. Growth is `{lock; max_ += n; permits_ += n;}` + n wakes, which never disturbs the FIFO deadlock-freedom argument (permits only ever get more plentiful). Ceiling per operation: min(available RAM / 2, 32 GiB hard cap, `--memlimit`) / frame size, armed at each of the four throttle construction sites. Guards: user-pinned `--throttle-frames` never grows, `--memlimit` stays authoritative, `--tar` extract keeps its deliberate 16 GiB cap (its FrameSink has its own v0.14.74 grow), disabled throttles stay disabled. One `[ADAPT]` line per step at `-v`; `sink-grow(throttle)` in the summary. Observed live: 384 → 480 frames on the first bursty tick, output exact.
+
+Honest limit (review finding, ship-with-follow-up): the CPU workers' per-worker output-buffer pools are sized once at spawn from the *initial* budget and deliberately never grow (the bounded-pool invariant is load-bearing history), so on cpu-only paths permit growth moves the block point from `throttle.acquire` to the pool's `wait_for_drain` rather than deepening realized in-flight — the GPU paths, whose buffers are per-batch, get the full benefit. Growing the pools on the same signal is the follow-up.
+
+Suite: 348 normal / 465 extensive (3 new: bursty sink-bound grows the budget with exact output, pinned --throttle-frames never grows, inert without --adapt).
 
 ## v0.15.5 — --adapt M4 action 3: reader scale-up (source-bound, io-dominant)
 

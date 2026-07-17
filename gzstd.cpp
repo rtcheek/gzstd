@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.5";
+static constexpr const char * GZSTD_VERSION = "0.15.6";
 //
 // Architecture overview:
 //
@@ -2020,7 +2020,16 @@ static std::atomic<int> g_adapt_regime{0};
 static constexpr uint32_t    ADAPT_ACT_SOURCE_LATCH   = 1u << 0;
 static constexpr uint32_t    ADAPT_ACT_DEVICE_QUIESCE = 1u << 1;
 static constexpr uint32_t    ADAPT_ACT_READER_SCALEUP = 1u << 2;
+static constexpr uint32_t    ADAPT_ACT_SINK_GROW      = 1u << 3;
 static std::atomic<uint32_t> g_adapt_action_flags{0};
+
+// Sink budget grow signal (M4 action 4).  The governor raises this at most
+// once per tick when SINK_BOUND shows alternating starved/busy bursts; the
+// operation's FrameThrottle consumes it on its next release() and grows one
+// bounded step.  Consumption-side wiring avoids any governor->throttle
+// pointer (lifetimes are per-operation and unrelated).  Reset at governor
+// start.
+static std::atomic<bool> g_adapt_sink_grow_tick{false};
 
 // Reader scale-up signal (M4 action 3).  Dormant prefetch threads park on
 // this CV; the governor raises the flag when SOURCE_BOUND with the io state
@@ -2066,6 +2075,7 @@ public:
     g_adapt_regime.store(0, std::memory_order_relaxed);
     g_adapt_action_flags.store(0, std::memory_order_relaxed);
     g_adapt_reader_scaleup.store(false, std::memory_order_relaxed);
+    g_adapt_sink_grow_tick.store(false, std::memory_order_relaxed);
     snap_baseline_();
     // Forced regime (test hook) publishes before any worker runs, so even
     // sub-tick operations exercise the acting paths.  A forced source-bound
@@ -2073,6 +2083,8 @@ public:
     if (forced_ != AdaptRegime::WARMUP) {
       transition_(forced_, now_ns_());
       if (forced_ == AdaptRegime::SOURCE_BOUND) adapt_request_reader_scaleup();
+      if (forced_ == AdaptRegime::SINK_BOUND)
+        g_adapt_sink_grow_tick.store(true, std::memory_order_relaxed);
     }
     thr_ = std::thread(&AdaptGovernor::tick_loop_, this);
   }
@@ -2136,6 +2148,7 @@ public:
     if (acts & ADAPT_ACT_SOURCE_LATCH)    os << " source-latch(gpu-batch)";
     if (acts & ADAPT_ACT_DEVICE_QUIESCE)  os << " device-quiesce(ranked)";
     if (acts & ADAPT_ACT_READER_SCALEUP)  os << " reader-scaleup";
+    if (acts & ADAPT_ACT_SINK_GROW)       os << " sink-grow(throttle)";
     os << "\n";
     vlog(V_VERBOSE, opt_, os.str());
   }
@@ -2149,7 +2162,7 @@ private:
   static constexpr int     STICKY_TICKS  = 5;     // 0.5 s of agreement to switch regime
 
   struct Snap {
-    uint64_t wdisk = 0, rio = 0, rparse = 0, rcopy = 0, rblocked = 0;
+    uint64_t wdisk = 0, wstarv = 0, rio = 0, rparse = 0, rcopy = 0, rblocked = 0;
   };
 
   int64_t now_ns_() const
@@ -2161,6 +2174,7 @@ private:
   void snap_(Snap & s) const
   {
     s.wdisk    = m_->writer_disk_ns.load(std::memory_order_relaxed);
+    s.wstarv   = m_->writer_starved_ns.load(std::memory_order_relaxed);
     s.rio      = m_->reader_io_ns.load(std::memory_order_relaxed);
     s.rparse   = m_->reader_parse_ns.load(std::memory_order_relaxed);
     s.rcopy    = m_->reader_copy_ns.load(std::memory_order_relaxed);
@@ -2188,7 +2202,8 @@ private:
     snap_(cur);
     // Meter::reset() (GPU-fault CPU rebuild) zeroes the counters under us —
     // any negative delta means the window straddles a reset: re-baseline.
-    if (cur.wdisk < prev_.wdisk || cur.rio < prev_.rio
+    if (cur.wdisk < prev_.wdisk || cur.wstarv < prev_.wstarv
+        || cur.rio < prev_.rio
         || cur.rparse < prev_.rparse || cur.rcopy < prev_.rcopy
         || cur.rblocked < prev_.rblocked) {
       prev_ = cur;
@@ -2217,6 +2232,14 @@ private:
                          + double(cur.rcopy - prev_.rcopy)
                          + double(cur.rblocked - prev_.rblocked);
       last_io_frac_ = (d_all > 0.0) ? d_io / d_all : 0.0;
+      // Alternating starved/busy sink bursts (the v0.14.74 smoothing
+      // precedent): the window shows BOTH substantial device-busy and
+      // substantial writer-starved time — a deeper in-flight budget can
+      // smooth the alternation; a purely-busy (saturated) sink cannot be
+      // helped by buffering more.
+      const double disk_frac  = double(cur.wdisk  - prev_.wdisk)  / dt;
+      const double starv_frac = double(cur.wstarv - prev_.wstarv) / dt;
+      last_sink_bursty_ = (disk_frac >= 0.2 && starv_frac >= 0.2);
       if      (sink_busy >= SINK_BUSY)                                  observed = AdaptRegime::SINK_BOUND;
       else if (rbusy >= SOURCE_BUSY && rblocked <= SOURCE_BLOCKED_MAX)  observed = AdaptRegime::SOURCE_BOUND;
       else                                                              observed = AdaptRegime::COMPUTE_BOUND;
@@ -2243,6 +2266,13 @@ private:
     // request latches one-way per run (see adapt_request_reader_scaleup).
     if (regime_ == AdaptRegime::SOURCE_BOUND && last_io_frac_ >= 0.5)
       adapt_request_reader_scaleup();
+
+    // M4 action 4: bursty SINK_BOUND — request one bounded throttle-budget
+    // grow step; the operation's FrameThrottle consumes it on its next
+    // release().  At most one step per tick, so growth is rate-limited by
+    // the tick cadence and bounded by the throttle's armed ceiling.
+    if (regime_ == AdaptRegime::SINK_BOUND && last_sink_bursty_)
+      g_adapt_sink_grow_tick.store(true, std::memory_order_relaxed);
   }
 
   void transition_(AdaptRegime to, int64_t t)
@@ -2278,6 +2308,7 @@ private:
   Snap    prev_{};
   int64_t prev_ns_ = 0;
   double  last_io_frac_ = 0.0;                 // tick-thread only
+  bool    last_sink_bursty_ = false;           // tick-thread only
   AdaptRegime forced_ = AdaptRegime::WARMUP;   // GZSTD_DEBUG_ADAPT_REGIME
   AdaptRegime regime_ = AdaptRegime::WARMUP;
   AdaptRegime candidate_ = AdaptRegime::WARMUP;
@@ -5368,6 +5399,19 @@ public:
     }
   }
 
+  // --adapt sink budget grow (M4 action 4).  Armed per-operation with a
+  // ceiling (permits) derived from the same guards as the initial budget:
+  // min(available RAM / 2, 32 GiB hard cap, --memlimit), never armed for a
+  // user-pinned --throttle-frames or a disabled throttle.  Consumed on the
+  // release path: one bounded step (+25% of current max, >= 1) per governor
+  // tick that observed bursty SINK_BOUND.  Growth never disturbs the FIFO
+  // deadlock-freedom argument — permits only ever get more plentiful.
+  void arm_grow(int ceiling, const Options * opt) {
+    if (disabled_ || ceiling <= max_) return;
+    grow_ceiling_ = ceiling;
+    grow_opt_ = opt;
+  }
+
   // Release n permits (called by writer after writing frames to disk).
   //
   // Wake exactly n waiters, not all: with 22+ workers saturated against the
@@ -5379,11 +5423,27 @@ public:
   // keeps the pipeline unblocked without the convoy.
   void release(int n = 1) {
     if (n <= 0 || disabled_) return;
+    int grew = 0, new_max = 0;
     {
       std::lock_guard<std::mutex> lk(m_);
       permits_ += n;
+      // Consume a pending governor grow request (one step per request).
+      if (grow_ceiling_ > max_
+          && g_adapt_sink_grow_tick.exchange(false, std::memory_order_relaxed)) {
+        grew = std::min(std::max(1, max_ / 4), grow_ceiling_ - max_);
+        max_     += grew;
+        permits_ += grew;
+        new_max   = max_;
+      }
     }
-    for (int i = 0; i < n; ++i) cv_.notify_one();
+    for (int i = 0; i < n + grew; ++i) cv_.notify_one();
+    if (grew) {
+      g_adapt_action_flags.fetch_or(ADAPT_ACT_SINK_GROW, std::memory_order_relaxed);
+      if (grow_opt_ && grow_opt_->verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, *grow_opt_, "[ADAPT] sink-bound bursty: throttle budget +"
+             + std::to_string(grew) + " frames (" + std::to_string(new_max)
+             + " total)\n");
+    }
   }
 
   // Signal shutdown -- wake all blocked workers so they can exit.
@@ -5401,6 +5461,8 @@ public:
     // Not locked -- advisory only (for stats/debug).
     return max_ - permits_;
   }
+
+  int grow_ceiling() const { return grow_ceiling_; }
 
   int max_permits() const { return max_; }
 
@@ -5453,6 +5515,8 @@ private:
   std::condition_variable drain_cv_;
   int permits_;
   int max_;
+  int grow_ceiling_ = 0;                 // 0 = growth not armed
+  const Options * grow_opt_ = nullptr;   // for the [ADAPT] grow line
   bool disabled_;        // true when constructed with max_in_flight <= 0
   bool done_ = false;
   std::mutex m_;
@@ -5530,6 +5594,27 @@ private:
   bool closed_ = false;
   std::atomic<uint64_t> prod_wait_ns_{0}, cons_wait_ns_{0};
 };
+
+// Arm --adapt sink-budget growth on an operation's FrameThrottle (M4
+// action 4).  Same guards as the initial budget: a user-pinned
+// --throttle-frames never grows, --memlimit stays authoritative, and the
+// tar-extract sink keeps its deliberate 16 GiB cap (its FrameSink has its
+// own v0.14.74 grow mechanism).  Ceiling = min(available RAM / 2, 32 GiB
+// hard cap, --memlimit) / frame_bytes.
+static void adapt_arm_throttle_grow(FrameThrottle & t, size_t frame_bytes,
+                                    const Options & opt)
+{
+  if (!opt.adapt || opt.throttle_frames > 0 || t.disabled()) return;
+  if (g_tar_decomp_sink) return;
+  size_t avail = get_available_ram_bytes();
+  if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;
+  size_t cap_bytes = std::min<size_t>(avail / 2, 32ULL * 1024 * 1024 * 1024);
+  if (opt.mem_limit_mib > 0)
+    cap_bytes = std::min(cap_bytes, (size_t)opt.mem_limit_mib * ONE_MIB);
+  const int ceiling = (int)std::min<size_t>((size_t)INT_MAX,
+      cap_bytes / std::max<size_t>(1, frame_bytes));
+  t.arm_grow(ceiling, &opt);
+}
 
 // g_tar_decomp_sink (defined above compute_throttle_budget, which needs it):
 // set by verify_tar() / extract_tar() for the duration of one archive's
@@ -8598,6 +8683,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   ResultStore results;
   FrameThrottle throttle(compute_throttle_budget(
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, 0, opt));
+  adapt_arm_throttle_grow(throttle, std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt);
   // Disable throttle in test mode: no disk I/O means permits are never released.
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
@@ -12739,6 +12825,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // frame size — a stale 16 MiB there over- or under-shoots the in-flight cap
   // on ultra / low-RAM runs.  (ROADMAP 7.3.)
   FrameThrottle throttle(compute_throttle_budget(host_chunk, threads, 0, opt));
+  adapt_arm_throttle_grow(throttle, host_chunk, opt);
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
@@ -15171,6 +15258,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   FrameThrottle throttle(compute_throttle_budget(
       std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism,
       comp_gpu_batch_floor, opt));
+  adapt_arm_throttle_grow(throttle, std::max<size_t>(1, chosen_mib) * ONE_MIB, opt);
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
@@ -16788,6 +16876,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   FrameThrottle throttle(compute_throttle_budget(
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism,
       decomp_gpu_batch_floor, opt));
+  adapt_arm_throttle_grow(throttle, std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt);
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // Bound queued (read-but-not-popped) frames to pipeline depth so a slow GPU
