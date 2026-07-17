@@ -1,11 +1,23 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.8  
+**Covers:** v0.9.50 → v0.15.9  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.9 — --adapt M4 action 6: GPU deadline demote + escalate (M4 complete)
+
+**The last governor action: a device whose oldest in-flight batch blows its deadline is demoted (no new intake for the run), and past a second larger deadline the wedge is treated as a fault and takes the existing proven abort → CPU-only rebuild path** — NOT duplicate-dispatch, per the design red-team that killed the re-enqueue idea twice (compress frees inputs post-H2D; `ResultStore` has no dedupe, so a late duplicate completion is a FrameThrottle permit leak — the v0.13.34 deadlock class). Mechanics: the workers publish each device's oldest in-flight submit time (front of the drain FIFO, maintained under the FIFO's own mutex) and an EMA batch duration; the governor tick compares age against max(4× EMA, 2 s) → demote, and max(2× that, 6 s) → escalate (compress only — decompress keeps its per-frame CPU rescue, which already covers erroring frames). The demote is consumed at the same refusal spot as ranked dispatch; **escalation is thrown by the device's *worker* thread — the drain thread is the one wedged in `cudaEventSynchronize` — into the same catch as a CUDA error.** One subtlety found live: a demoted worker parks in `wait_for_gpu_yield` and only re-evaluates its park predicate, so escalation makes that predicate return true — the worker unparks straight into the throw. Accepted residual (per plan): a truly never-returning CUDA call can still block the drain join at teardown, exactly as today for any wedged call.
+
+Fault-injection hook (plan-mandated): `GZSTD_DEBUG_ADAPT_STALL=-1:<secs>` stalls the first drain thread to pop a batch (wildcard device — a fixed id can miss on boxes where that device gets no work). Verified live on the 8-GPU box: 3 s stall → `[ADAPT] gpu6 deadline: batch in flight 2.1 s (limit 2.0 s) — demoted`, run completes exact; 8 s stall → escalation at 6.1 s → **rebuild banner printed before the stall even cleared** (the abort preempts the wedge) → exit 0 with exact output; inert without `--adapt`.
+
+Dedicated adversarial review (plan-mandated): FIX-FIRST, 2 highs + 1 medium + 3 lows, all banked. **HIGH-1:** during a *real* permanent wedge the worker is parked in its function-local stream-acquisition wait (its one stream never frees), whose CV the governor couldn't reach — escalation only fired for stalls that eventually cleared. Fix: an escalation wake registry (workers RAII-register their `{mutex, cv}` pair; the governor locks each pair's mutex before notifying — no lost-wakeup window — and re-notifies every tick while the escalation is pending), plus the stream-wait predicate and post-wait throw. **HIGH-2:** the demote/escalate consumption sat in `should_gpu_take`, but the park predicate calls `should_gpu_take_at` directly — moved there (also fixing a 64-vs-32 bound mismatch). **MEDIUM:** the escalation suite test could pass on the governor's *announcement* alone (finite stall + single-batch input completes normally) — it now uses a 256 MiB corpus with a pinned small batch and asserts the rebuild banner, pinning that the abort executed. **LOW (fixed):** an ordinary drain-error abort now clears the deadline tap so the log can't misattribute the fault. Accepted per review: front-of-FIFO is approximate toward *newer* (demote can only be late, never early); the cold-start 2 s floor can demote a pathologically slow first batch (plan constants); a truly never-returning CUDA call still blocks the drain join at teardown, as today.
+
+**M4 is complete.** All six governor actions shipped: source latch (v0.15.3), ranked-engine overflow dispatch (v0.15.4), reader scale-up (v0.15.5), sink budget grow (v0.15.6), read-path priors + writer-parallelism probe (v0.15.7/8), deadline demote/escalate (v0.15.9). M5 close-out (docs, ROADMAP reconciliation, A/B benchmarks on both boxes, `-e` suite) is next.
+
+Suite: 357 normal / 474 extensive (3 new: demote fires on a stalled batch, escalation takes the abort-and-rebuild path, inert without --adapt).
 
 ## v0.15.8 — --adapt M4 action 5 (second half): the writer-parallelism probe
 

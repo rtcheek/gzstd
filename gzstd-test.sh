@@ -365,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=354
-$EXTENSIVE && EXPECTED_TESTS=471
+EXPECTED_TESTS=357
+$EXTENSIVE && EXPECTED_TESTS=474
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3624,6 +3624,66 @@ fi
 
 rm -f "$TMPDIR/awp.zst" "$TMPDIR/awp.out" "$TMPDIR/awp1.err" \
       "$TMPDIR/awp2.err" "$TMPDIR/awp3.err" "$TMPDIR/awp-fp.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt GPU deadline demote + escalate (fault injection)"
+
+# GZSTD_DEBUG_ADAPT_STALL=-1:<secs> stalls the first drain thread to pop a
+# batch (any device), simulating a wedged CUDA event.  Deadlines: demote at
+# max(4x batch EMA, 2 s); escalate (compress) at max(2x that, 6 s) into the
+# proven abort -> CPU-only rebuild path.
+
+if has_gpu 2>/dev/null; then
+  # 1. A 3 s stall crosses the demote deadline only: the device is demoted,
+  # the run completes normally once the drain wakes, output exact.
+  env GZSTD_DEBUG_ADAPT_STALL=-1:3 "$GZSTD" --adapt --no-profile -v --gpu-only \
+    -k -f "$TMPDIR/large.bin" -o "$TMPDIR/adl.zst" 2>"$TMPDIR/adl1.err"
+  "$GZSTD" -d --cpu-only -k -f "$TMPDIR/adl.zst" -o "$TMPDIR/adl.out" 2>/dev/null
+  if grep -q 'deadline: batch in flight.*demoted' "$TMPDIR/adl1.err" \
+     && ! grep -q 'CPU-only rebuild' "$TMPDIR/adl1.err" \
+     && files_match "$TMPDIR/large.bin" "$TMPDIR/adl.out"; then
+    pass "stalled batch crosses the demote deadline"
+  else
+    fail "stalled batch crosses the demote deadline"
+  fi
+
+  # 2. An 8 s stall crosses the escalation deadline: the worker takes the
+  # proven abort -> CPU-only rebuild path and the run still exits 0 with
+  # exact output.  256 MiB + --gpu-batch 2 keeps the queue non-empty past
+  # the stall and the stalled worker parked in its stream wait — asserting
+  # the REBUILD BANNER pins that the abort actually executed, not merely
+  # that the governor announced it (review M4-6 MEDIUM-1).
+  spin "escalation corpus (256 MiB)"
+  dd if=/dev/urandom bs=1M count=256 2>/dev/null > "$TMPDIR/adl-big.bin"
+  if env GZSTD_DEBUG_ADAPT_STALL=-1:8 "$GZSTD" --adapt --no-profile -v --gpu-only \
+       --gpu-batch 2 -k -f "$TMPDIR/adl-big.bin" -o "$TMPDIR/adl.zst" 2>"$TMPDIR/adl2.err" \
+     && grep -q 'escalation limit.*CPU-only rebuild' "$TMPDIR/adl2.err" \
+     && grep -q 'rebuilding CPU-only' "$TMPDIR/adl2.err"; then
+    "$GZSTD" -d --cpu-only -k -f "$TMPDIR/adl.zst" -o "$TMPDIR/adl.out" 2>/dev/null
+    files_match "$TMPDIR/adl-big.bin" "$TMPDIR/adl.out" \
+      && pass "escalation takes the abort-and-rebuild path" \
+      || fail "escalation takes the abort-and-rebuild path"
+  else
+    fail "escalation takes the abort-and-rebuild path"
+  fi
+  rm -f "$TMPDIR/adl-big.bin"
+
+  # 3. Without --adapt the hook still stalls but deadlines never fire.
+  env GZSTD_DEBUG_ADAPT_STALL=-1:3 "$GZSTD" -v --gpu-only \
+    -k -f "$TMPDIR/large.bin" -o "$TMPDIR/adl.zst" 2>"$TMPDIR/adl3.err"
+  if ! grep -q 'deadline' "$TMPDIR/adl3.err" \
+     && "$GZSTD" -t --cpu-only "$TMPDIR/adl.zst" 2>/dev/null; then
+    pass "deadlines inert without --adapt"
+  else
+    fail "deadlines inert without --adapt"
+  fi
+else
+  skip "stalled batch crosses the demote deadline" "no GPU"
+  skip "escalation takes the abort-and-rebuild path" "no GPU"
+  skip "deadlines inert without --adapt" "no GPU"
+fi
+rm -f "$TMPDIR/adl.zst" "$TMPDIR/adl.out" "$TMPDIR/adl1.err" \
+      "$TMPDIR/adl2.err" "$TMPDIR/adl3.err"
 
 section "Sliding-window compression"
 

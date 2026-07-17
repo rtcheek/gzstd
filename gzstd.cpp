@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.8";
+static constexpr const char * GZSTD_VERSION = "0.15.9";
 //
 // Architecture overview:
 //
@@ -2035,6 +2035,51 @@ static std::atomic<int> g_adapt_writer_probe_verdict{0};  // +1 kept / -1 revert
 static std::atomic<int> g_adapt_writer_probe_allowed{1};  // 0 = profile said negative
 static std::atomic<bool> g_adapt_writer_probe_engaged{false};  // wt2 spawned this op
 
+// GPU deadline demote + escalate (M4 action 6).  The workers publish each
+// device's OLDEST in-flight batch submit time and an EMA batch duration;
+// the governor tick compares age against max(4x EMA, 2 s) — demote: the
+// device takes no new intake for the rest of the run (same refusal spot as
+// ranked dispatch) — and against max(2x demote, 6 s) — escalate (compress
+// only): the device's WORKER thread (not the wedged drain thread) throws
+// into the existing proven abort -> CPU-only rebuild path (v0.14.43).  A
+// truly never-returning CUDA call can still block the drain join at
+// teardown, exactly as it does today for any wedged call — the deadline
+// path does not worsen it.  All reset at governor start.
+static constexpr int ADAPT_DL_MAX = 32;
+static std::atomic<uint64_t> g_adapt_dev_front_ns[ADAPT_DL_MAX] = {};
+static std::atomic<uint64_t> g_adapt_dev_batch_ema_ns[ADAPT_DL_MAX] = {};
+static std::atomic<uint64_t> g_adapt_dev_demoted{0};       // bitmask, one-way
+static std::atomic<int>      g_adapt_deadline_escalate{0}; // device+1, 0=none
+
+// Escalation wake registry (review v0.15.9 HIGH-1): a wedged device's worker
+// is typically parked in its function-local stream-acquisition wait, whose
+// CV the governor cannot reach.  Workers register their {mutex, cv} pair;
+// while an escalation is pending, EVERY governor tick locks each pair's
+// mutex (ordering the wake against the waiter's predicate check) and
+// notifies — repeated notifies bound staleness at one tick with no lost-
+// wakeup window.  RAII-unregistered on every worker exit path.
+static std::mutex g_adapt_esc_reg_mtx;
+static std::vector<std::pair<std::mutex*, std::condition_variable*>> g_adapt_esc_reg;
+struct AdaptEscReg {
+  std::mutex * m; std::condition_variable * cv;
+  AdaptEscReg(std::mutex * mm, std::condition_variable * cc) : m(mm), cv(cc) {
+    std::lock_guard<std::mutex> lk(g_adapt_esc_reg_mtx);
+    g_adapt_esc_reg.emplace_back(m, cv);
+  }
+  ~AdaptEscReg() {
+    std::lock_guard<std::mutex> lk(g_adapt_esc_reg_mtx);
+    for (size_t i = 0; i < g_adapt_esc_reg.size(); ++i)
+      if (g_adapt_esc_reg[i].first == m) { g_adapt_esc_reg.erase(g_adapt_esc_reg.begin() + (long)i); break; }
+  }
+};
+static void adapt_esc_notify_all() {
+  std::lock_guard<std::mutex> lk(g_adapt_esc_reg_mtx);
+  for (auto & p : g_adapt_esc_reg) {
+    { std::lock_guard<std::mutex> wl(*p.first); }  // order vs predicate check
+    p.second->notify_all();
+  }
+}
+
 // Sink budget grow signal (M4 action 4).  The governor raises this at most
 // once per tick when SINK_BOUND shows alternating starved/busy bursts; the
 // operation's FrameThrottle consumes it on its next release() and grows one
@@ -2091,6 +2136,12 @@ public:
     g_adapt_writer_probe.store(0, std::memory_order_relaxed);
     g_adapt_writer_probe_verdict.store(0, std::memory_order_relaxed);
     g_adapt_writer_probe_engaged.store(false, std::memory_order_relaxed);
+    for (int i = 0; i < ADAPT_DL_MAX; ++i) {
+      g_adapt_dev_front_ns[i].store(0, std::memory_order_relaxed);
+      g_adapt_dev_batch_ema_ns[i].store(0, std::memory_order_relaxed);
+    }
+    g_adapt_dev_demoted.store(0, std::memory_order_relaxed);
+    g_adapt_deadline_escalate.store(0, std::memory_order_relaxed);
     snap_baseline_();
     // Forced regime (test hook) publishes before any worker runs, so even
     // sub-tick operations exercise the acting paths.  A forced source-bound
@@ -2220,9 +2271,49 @@ private:
     }
   }
 
+  // M4 action 6: per-device deadline check.  Real wall-clock ages — runs
+  // under forced regimes too (the deadline is not a regime signal).
+  void deadline_tick_()
+  {
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    for (int d = 0; d < ADAPT_DL_MAX; ++d) {
+      const uint64_t front = g_adapt_dev_front_ns[d].load(std::memory_order_relaxed);
+      if (front == 0 || now <= front) continue;
+      const uint64_t age = now - front;
+      const uint64_t ema = g_adapt_dev_batch_ema_ns[d].load(std::memory_order_relaxed);
+      const uint64_t d1  = std::max<uint64_t>(4 * ema, 2000000000ull);   // 2 s floor
+      if (age <= d1) continue;
+      const uint64_t bit = 1ull << d;
+      if (!(g_adapt_dev_demoted.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+        char l[128];
+        std::snprintf(l, sizeof(l),
+          "[ADAPT] gpu%d deadline: batch in flight %.1f s (limit %.1f s) — "
+          "demoted, no new intake\n", d, age / 1e9, d1 / 1e9);
+        vlog(V_VERBOSE, opt_, l);
+      }
+      const uint64_t d2 = std::max<uint64_t>(2 * d1, 6000000000ull);     // 6 s floor
+      if (age > d2 && opt_.mode == Mode::COMPRESS
+          && g_adapt_deadline_escalate.load(std::memory_order_relaxed) == 0) {
+        g_adapt_deadline_escalate.store(d + 1, std::memory_order_relaxed);
+        adapt_esc_notify_all();
+        char l[128];
+        std::snprintf(l, sizeof(l),
+          "[ADAPT] gpu%d deadline: batch in flight %.1f s (escalation limit "
+          "%.1f s) — treating as fault, CPU-only rebuild\n", d, age / 1e9, d2 / 1e9);
+        vlog(V_VERBOSE, opt_, l);
+      }
+    }
+  }
+
   void do_tick_()
   {
     const int64_t t = now_ns_();
+    deadline_tick_();
+    // Repeat the escalation wake every tick while pending: registered
+    // waiters can never miss it for longer than one tick.
+    if (g_adapt_deadline_escalate.load(std::memory_order_relaxed) != 0)
+      adapt_esc_notify_all();
     Snap cur;
     snap_(cur);
     // Meter::reset() (GPU-fault CPU rebuild) zeroes the counters under us —
@@ -6846,6 +6937,20 @@ public:
   // microseconds later.
   bool should_gpu_take_at(size_t depth_now, int device = -1,
                           bool under_queue_lock = false) {
+    // Deadline demote (M4 action 6, --adapt): a device whose oldest
+    // in-flight batch blew its deadline takes no new intake for the rest
+    // of the run.  Lives HERE — not in the should_gpu_take wrapper —
+    // because the park predicate calls this function directly (review
+    // v0.15.9 HIGH-2).  Escalation override: a parked (demoted) worker
+    // must UNPARK so its loop-top escalate check can throw into the abort
+    // path.
+    if (opt_.adapt && device >= 0 && device < ADAPT_DL_MAX
+        && (g_adapt_dev_demoted.load(std::memory_order_relaxed)
+            & (1ull << device))) {
+      if (g_adapt_deadline_escalate.load(std::memory_order_relaxed) == device + 1)
+        return true;
+      return false;
+    }
     // Ranked-engine path (--adapt): the generalized inequality.  Engine E
     // takes work only when the queue holds more than what all strictly
     // faster engines will drain within E's own batch window.  The fastest
@@ -13387,6 +13492,7 @@ extern "C" int gzv_kernel_available(void);
 
 struct StreamCtx {
   cudaStream_t stream{};
+  uint64_t submit_ns = 0;   // deadline tap: when this batch entered the drain FIFO
 
   // Device memory: contiguous buffers split into per-subchunk slots
   void * d_in_base   = nullptr;   // input data (N * gpu_chunk bytes)
@@ -14092,6 +14198,12 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   }
   double d2h_ms = (d2h_t0 > 0) ? double(now_ns() - d2h_t0) / 1e6 : 0.0;
   double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
+  if ((size_t)device_id < (size_t)ADAPT_DL_MAX) {   // deadline tap: EMA batch time
+    const uint64_t ns = (uint64_t)(tot_ms * 1e6);
+    const uint64_t prev = g_adapt_dev_batch_ema_ns[device_id].load(std::memory_order_relaxed);
+    g_adapt_dev_batch_ema_ns[device_id].store(
+        prev == 0 ? ns : prev - prev / 4 + ns / 4, std::memory_order_relaxed);
+  }
   if (g_perf) {
     g_perf->d2h_ns.fetch_add(uint64_t(d2h_ms * 1e6));
     g_perf->d2h_bytes.fetch_add(out_sum);
@@ -14217,6 +14329,11 @@ static void gpu_worker(
   // thread when a batch is pushed (or the FIFO is closed).
   std::mutex idle_m;
   std::condition_variable idle_cv;
+  // Escalation wake registration (RAII — unregisters on every exit path,
+  // including exceptions, before idle_m/idle_cv die).  Only under --adapt:
+  // the deadline machinery is the sole notifier.
+  std::unique_ptr<AdaptEscReg> esc_reg;
+  if (opt.adapt) esc_reg = std::make_unique<AdaptEscReg>(&idle_m, &idle_cv);
   std::condition_variable submit_cv;
   std::deque<StreamCtx*> submitted;     // in-flight streams, submit (= seq) order
   bool drain_closed = false;
@@ -14449,6 +14566,17 @@ static void gpu_worker(
           }
           wd_drain_beat(slot_index);
           wd_drain_phase(slot_index, WatchPhase::Drain);
+          // Fault-injection test hook (plan-mandated): stall this device's
+          // drain before its first sync, simulating a wedged event, so the
+          // suite can watch demote fire and escalate take the abort path.
+          if (const char * e = std::getenv("GZSTD_DEBUG_ADAPT_STALL")) {
+            static std::atomic<bool> stalled_once{false};
+            int sd = -1, ss = 0;
+            if (std::sscanf(e, "%d:%d", &sd, &ss) == 2
+                && (sd == device_id || sd == -1)
+                && !stalled_once.exchange(true))
+              std::this_thread::sleep_for(std::chrono::seconds(ss));
+          }
           cudaError_t st = cudaEventSynchronize(C->ev_done);
           wd_sync(slot_index, (int)C->stats.stream_index, (int)st);
           checkCuda(st, "cudaEventSynchronize(batch done)");
@@ -14460,6 +14588,10 @@ static void gpu_worker(
             C->busy = false;
             C->filled = 0;
             C->batch.clear();
+            if ((size_t)device_id < (size_t)ADAPT_DL_MAX)
+              g_adapt_dev_front_ns[device_id].store(
+                  submitted.empty() ? 0 : submitted.front()->submit_ns,
+                  std::memory_order_relaxed);
           }
           idle_cv.notify_all();
         }
@@ -14476,6 +14608,10 @@ static void gpu_worker(
           if (drain_err.empty())
             drain_err = std::string("drain: ") + e.what();
           drain_closed = true;
+          // Clear the deadline tap: a stale front would keep aging and
+          // misattribute this ordinary fault as a deadline escalation.
+          if ((size_t)device_id < (size_t)ADAPT_DL_MAX)
+            g_adapt_dev_front_ns[device_id].store(0, std::memory_order_relaxed);
         }
         { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
         queue->set_done();
@@ -14496,6 +14632,14 @@ static void gpu_worker(
     while (true) {
       wd_beat(slot_index);           // heartbeat: spinning vs blocked
       check_drain_err();
+      // M4 action 6 escalate: the governor declared this device wedged past
+      // the second deadline.  THIS thread throws (the drain thread is the
+      // one stuck in cudaEventSynchronize) into the same catch as a CUDA
+      // error — proven abort -> CPU-only rebuild path.
+      if (g_adapt_deadline_escalate.load(std::memory_order_relaxed) == device_id + 1)
+        throw std::runtime_error(
+            "deadline escalation: GPU batch wedged past the escalation "
+            "deadline (--adapt); treating as a device fault");
       // ---- Shared auto-tuner ----
       // All GPUs report throughput to SharedTuneState. Whichever worker
       // grabs the mutex first runs the tune logic for everyone.
@@ -14717,10 +14861,19 @@ static void gpu_worker(
         wd_phase(slot_index, WatchPhase::StreamWait);
         idle_cv.wait(lk, [&] {
           if (!drain_err.empty()) return true;
+          // Escalation reaches a worker parked HERE — the dominant state
+          // during a real wedge (its one stream never frees).  The
+          // governor's registry wake re-notifies every tick.
+          if (g_adapt_deadline_escalate.load(std::memory_order_relaxed)
+                == device_id + 1) return true;
           for (auto & X : ctxs) if (!X.busy) return true;
           return false;
         });
         if (!drain_err.empty()) throw std::runtime_error(drain_err);
+        if (g_adapt_deadline_escalate.load(std::memory_order_relaxed) == device_id + 1)
+          throw std::runtime_error(
+              "deadline escalation: GPU batch wedged past the escalation "
+              "deadline (--adapt); treating as a device fault");
         for (auto & X : ctxs) if (!X.busy) { Cp = &X; break; }
       }
       StreamCtx & C = *Cp;
@@ -14933,6 +15086,10 @@ static void gpu_worker(
         {
           std::lock_guard<std::mutex> lk(idle_m);
           C.busy = true;
+          C.submit_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+          if (submitted.empty() && (size_t)device_id < (size_t)ADAPT_DL_MAX)
+            g_adapt_dev_front_ns[device_id].store(C.submit_ns, std::memory_order_relaxed);
           submitted.push_back(&C);
         }
         submit_cv.notify_one();
