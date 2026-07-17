@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.7";
+static constexpr const char * GZSTD_VERSION = "0.15.8";
 //
 // Architecture overview:
 //
@@ -2021,7 +2021,19 @@ static constexpr uint32_t    ADAPT_ACT_SOURCE_LATCH   = 1u << 0;
 static constexpr uint32_t    ADAPT_ACT_DEVICE_QUIESCE = 1u << 1;
 static constexpr uint32_t    ADAPT_ACT_READER_SCALEUP = 1u << 2;
 static constexpr uint32_t    ADAPT_ACT_SINK_GROW      = 1u << 3;
+static constexpr uint32_t    ADAPT_ACT_WRITER_PROBE   = 1u << 4;
 static std::atomic<uint32_t> g_adapt_action_flags{0};
+
+// Writer-parallelism probe (M4 action 5b).  The governor raises the probe
+// flag on a SINK_BOUND O_DIRECT run; the DirectWriter's primary drain sees
+// it and spawns a second positional-pwrite drain thread.  Keep on >= 10%
+// sustained sink-rate gain over the probe window, revert otherwise (the
+// flag drops and the second thread parks), at most 2 rounds per run.  The
+// verdict persists to the profile so the next run starts at the answer.
+static std::atomic<int> g_adapt_writer_probe{0};          // 1 = second drain engaged
+static std::atomic<int> g_adapt_writer_probe_verdict{0};  // +1 kept / -1 reverted
+static std::atomic<int> g_adapt_writer_probe_allowed{1};  // 0 = profile said negative
+static std::atomic<bool> g_adapt_writer_probe_engaged{false};  // wt2 spawned this op
 
 // Sink budget grow signal (M4 action 4).  The governor raises this at most
 // once per tick when SINK_BOUND shows alternating starved/busy bursts; the
@@ -2076,6 +2088,9 @@ public:
     g_adapt_action_flags.store(0, std::memory_order_relaxed);
     g_adapt_reader_scaleup.store(false, std::memory_order_relaxed);
     g_adapt_sink_grow_tick.store(false, std::memory_order_relaxed);
+    g_adapt_writer_probe.store(0, std::memory_order_relaxed);
+    g_adapt_writer_probe_verdict.store(0, std::memory_order_relaxed);
+    g_adapt_writer_probe_engaged.store(false, std::memory_order_relaxed);
     snap_baseline_();
     // Forced regime (test hook) publishes before any worker runs, so even
     // sub-tick operations exercise the acting paths.  A forced source-bound
@@ -2083,8 +2098,13 @@ public:
     if (forced_ != AdaptRegime::WARMUP) {
       transition_(forced_, now_ns_());
       if (forced_ == AdaptRegime::SOURCE_BOUND) adapt_request_reader_scaleup();
-      if (forced_ == AdaptRegime::SINK_BOUND)
+      if (forced_ == AdaptRegime::SINK_BOUND) {
         g_adapt_sink_grow_tick.store(true, std::memory_order_relaxed);
+        // The forced hook also raises the writer probe (asserting its
+        // SINK_BOUND gate) so short suite runs exercise the dual drain.
+        if (g_adapt_writer_probe_allowed.load(std::memory_order_relaxed))
+          g_adapt_writer_probe.store(1, std::memory_order_relaxed);
+      }
     }
     thr_ = std::thread(&AdaptGovernor::tick_loop_, this);
   }
@@ -2149,6 +2169,9 @@ public:
     if (acts & ADAPT_ACT_DEVICE_QUIESCE)  os << " device-quiesce(ranked)";
     if (acts & ADAPT_ACT_READER_SCALEUP)  os << " reader-scaleup";
     if (acts & ADAPT_ACT_SINK_GROW)       os << " sink-grow(throttle)";
+    if (acts & ADAPT_ACT_WRITER_PROBE)    os << " writer-probe(kept)";
+    if (g_adapt_writer_probe_engaged.load(std::memory_order_relaxed)
+        && !(acts & ADAPT_ACT_WRITER_PROBE)) os << " writer-drain2(probed)";
     os << "\n";
     vlog(V_VERBOSE, opt_, os.str());
   }
@@ -2162,7 +2185,8 @@ private:
   static constexpr int     STICKY_TICKS  = 5;     // 0.5 s of agreement to switch regime
 
   struct Snap {
-    uint64_t wdisk = 0, wstarv = 0, rio = 0, rparse = 0, rcopy = 0, rblocked = 0;
+    uint64_t wdisk = 0, wstarv = 0, wbytes = 0,
+             rio = 0, rparse = 0, rcopy = 0, rblocked = 0;
   };
 
   int64_t now_ns_() const
@@ -2175,6 +2199,7 @@ private:
   {
     s.wdisk    = m_->writer_disk_ns.load(std::memory_order_relaxed);
     s.wstarv   = m_->writer_starved_ns.load(std::memory_order_relaxed);
+    s.wbytes   = m_->wrote_bytes.load(std::memory_order_relaxed);
     s.rio      = m_->reader_io_ns.load(std::memory_order_relaxed);
     s.rparse   = m_->reader_parse_ns.load(std::memory_order_relaxed);
     s.rcopy    = m_->reader_copy_ns.load(std::memory_order_relaxed);
@@ -2203,6 +2228,7 @@ private:
     // Meter::reset() (GPU-fault CPU rebuild) zeroes the counters under us —
     // any negative delta means the window straddles a reset: re-baseline.
     if (cur.wdisk < prev_.wdisk || cur.wstarv < prev_.wstarv
+        || cur.wbytes < prev_.wbytes
         || cur.rio < prev_.rio
         || cur.rparse < prev_.rparse || cur.rcopy < prev_.rcopy
         || cur.rblocked < prev_.rblocked) {
@@ -2273,6 +2299,58 @@ private:
     // the tick cadence and bounded by the throttle's armed ceiling.
     if (regime_ == AdaptRegime::SINK_BOUND && last_sink_bursty_)
       g_adapt_sink_grow_tick.store(true, std::memory_order_relaxed);
+
+    // M4 action 5b: writer-parallelism probe controller (real ticks only —
+    // the forced hook raises the flag at start and skips measurement).
+    // Try +1 drain thread when SINK_BOUND; judge by the sink byte rate over
+    // a 4-tick window against the pre-probe tick: keep on >= 10% gain,
+    // revert otherwise; at most 2 rounds per run; the verdict persists.
+    if (forced_ == AdaptRegime::WARMUP
+        && g_adapt_writer_probe_allowed.load(std::memory_order_relaxed)) {
+      const double wrate = double(cur.wbytes - prev_snapped_wbytes_) /
+                           std::max(1.0, dt);
+      prev_snapped_wbytes_ = cur.wbytes;
+      if (probe_phase_ == 1) {
+        probe_rate_acc_ += wrate;
+        if (++probe_ticks_ >= 4) {
+          const double post = probe_rate_acc_ / probe_ticks_;
+          const bool keep = post >= probe_pre_rate_ * 1.10;
+          char pl[160];
+          if (keep) {
+            g_adapt_writer_probe_verdict.store(1, std::memory_order_relaxed);
+            g_adapt_action_flags.fetch_or(ADAPT_ACT_WRITER_PROBE,
+                                          std::memory_order_relaxed);
+            probe_phase_ = 2;   // kept for the run
+            std::snprintf(pl, sizeof(pl),
+              "[ADAPT] writer probe KEPT: sink %.2f -> %.2f GiB/s (+1 drain "
+              "thread stays)\n", probe_pre_rate_ * 1e9 / 1073741824.0,
+              post * 1e9 / 1073741824.0);
+          } else {
+            g_adapt_writer_probe.store(0, std::memory_order_relaxed);
+            if (g_adapt_writer_probe_verdict.load(std::memory_order_relaxed) == 0)
+              g_adapt_writer_probe_verdict.store(-1, std::memory_order_relaxed);
+            probe_phase_ = 0;   // may re-probe (rounds capped)
+            std::snprintf(pl, sizeof(pl),
+              "[ADAPT] writer probe reverted: sink %.2f -> %.2f GiB/s (< +10%%)\n",
+              probe_pre_rate_ * 1e9 / 1073741824.0, post * 1e9 / 1073741824.0);
+          }
+          vlog(V_VERBOSE, opt_, pl);
+        }
+      } else if (probe_phase_ == 0 && regime_ == AdaptRegime::SINK_BOUND
+                 && probe_rounds_ < 2 && wrate > 0) {
+        probe_pre_rate_ = wrate;
+        probe_rate_acc_ = 0.0;
+        probe_ticks_ = 0;
+        ++probe_rounds_;
+        g_adapt_writer_probe.store(1, std::memory_order_relaxed);
+        char pl[96];
+        std::snprintf(pl, sizeof(pl),
+          "[ADAPT] sink-bound: probing +1 parallel writer (round %d)\n",
+          probe_rounds_);
+        vlog(V_VERBOSE, opt_, pl);
+        probe_phase_ = 1;
+      }
+    }
   }
 
   void transition_(AdaptRegime to, int64_t t)
@@ -2309,6 +2387,12 @@ private:
   int64_t prev_ns_ = 0;
   double  last_io_frac_ = 0.0;                 // tick-thread only
   bool    last_sink_bursty_ = false;           // tick-thread only
+  int     probe_phase_ = 0;                    // 0 idle / 1 running / 2 kept
+  int     probe_rounds_ = 0;                   // tick-thread only
+  int     probe_ticks_ = 0;                    // tick-thread only
+  double  probe_pre_rate_ = 0.0;               // bytes/ns
+  double  probe_rate_acc_ = 0.0;               // bytes/ns accumulator
+  uint64_t prev_snapped_wbytes_ = 0;           // tick-thread only
   AdaptRegime forced_ = AdaptRegime::WARMUP;   // GZSTD_DEBUG_ADAPT_REGIME
   AdaptRegime regime_ = AdaptRegime::WARMUP;
   AdaptRegime candidate_ = AdaptRegime::WARMUP;
@@ -2649,12 +2733,15 @@ struct AdaptObs {
   uint64_t settled_batch = 0;                    // GPU tuner's last-used batch (0 = no GPU)
   std::string regime = "unclassified";           // governor's dominant regime, last file
   std::string src_path;                          // read path that engaged ("" = untapped)
+  int writer_par = 0;                            // writer probe verdict (+1/-1, 0 = untried)
   bool fault = false;                            // a GPU fault/rebuild happened this process
 
   void add_meter(const Meter & m, uint64_t wall, bool compress_dir)
   {
     if (const char * p = g_adapt_src_path.load(std::memory_order_relaxed))
       src_path = p;
+    if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
+      writer_par = wp;
     payload_bytes += compress_dir ? m.read_bytes.load() : m.wrote_bytes.load();
     wall_ns += wall;
     reader_bytes += m.read_bytes.load();
@@ -2699,6 +2786,11 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
   // Read-path record (M4 action 5): which path ran, and the end-to-end
   // payload rate it achieved, keyed per path ("path_<p>_gibs") so the
   // next-run prior can compare alternatives measured on THIS box.
+  // Writer-probe verdict (M4 action 5b): latest-wins discrete value, so a
+  // later positive (hardware change, new filesystem) can overwrite an old
+  // negative and vice versa.
+  if (obs.writer_par != 0)
+    dir.put_num("writer_par", (double)obs.writer_par);
   if (!obs.src_path.empty()) {
     dir.put_str("src_path", obs.src_path);
     if (wall_s > 0 && obs.payload_bytes > 0)
@@ -2720,6 +2812,7 @@ struct AdaptPriors {
     double cpu_gibs = 0, gpu_gibs = 0, source_gibs = 0, sink_gibs = 0;
     double overall_gibs = 0, settled_batch = 0, runs = 0;
     double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates
+    double writer_par = 0;                                  // probe verdict
     std::string regime;
   } dir[2];                 // [0] = compress, [1] = decompress
 };
@@ -2752,6 +2845,7 @@ static AdaptPriors adapt_load_priors()
     D.path_mmap     = dj->gnum("path_mmap_gibs", 0);
     D.path_pread    = dj->gnum("path_pread_gibs", 0);
     D.path_direct   = dj->gnum("path_direct_gibs", 0);
+    D.writer_par    = dj->gnum("writer_par", 0);
   }
   return P;
 }
@@ -3282,7 +3376,7 @@ public:
       std::memcpy(static_cast<char*>(bufs_[cur_bi_]) + buf_used_, src, copy);
       buf_used_ += copy; src += copy; len -= copy;
       if (buf_used_ == BUF_CAP) {                 // full → hand off
-        enqueue({OP_WRITE, cur_bi_, BUF_CAP, 0});
+        enqueue({OP_WRITE, cur_bi_, BUF_CAP, 0, logical_written_});
         logical_written_ += BUF_CAP;
         cur_bi_ = acquire_free();
         if (cur_bi_ < 0) return false;            // write error surfaced
@@ -3300,13 +3394,14 @@ public:
     if (!wt_.joinable()) return !werr_.load(std::memory_order_relaxed);  // never opened/already done
     if (buf_used_ > 0) {
       size_t tail = buf_used_ - (buf_used_ / ALIGN) * ALIGN;
-      enqueue({OP_WRITE, cur_bi_, buf_used_, tail});
+      enqueue({OP_WRITE, cur_bi_, buf_used_, tail, logical_written_});
       logical_written_ += buf_used_;
       buf_used_ = 0;
     }
     { std::lock_guard<std::mutex> lk(mx_); wt_done_ = true; }
-    cv_op_.notify_one();
+    cv_op_.notify_all();
     wt_.join();
+    if (wt2_.joinable()) wt2_.join();
     if (werr_.load(std::memory_order_relaxed)) return false;
     if (preallocated_ > 0 && logical_written_ < preallocated_) {
       if (::ftruncate(fd_, (off_t)logical_written_) != 0) { /* best-effort */ }
@@ -3318,9 +3413,11 @@ public:
     // Join the write thread if finalize() didn't (e.g. an error/abort path).
     if (wt_.joinable()) {
       { std::lock_guard<std::mutex> lk(mx_); wt_done_ = true; }
-      cv_op_.notify_one();
+      cv_op_.notify_all();
       wt_.join();
     }
+    if (wt2_.joinable()) wt2_.join();
+    if (plain_fd_v_ >= 0) { ::close(plain_fd_v_); plain_fd_v_ = -1; }
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
     for (int i = 0; i < NBUF; ++i) if (bufs_[i]) { ::free(bufs_[i]); bufs_[i] = nullptr; }
   }
@@ -3354,14 +3451,15 @@ public:
     if (fd_ < 0 || werr_.load(std::memory_order_relaxed)) return false;
     if (buf_used_ > 0) {
       size_t tail = buf_used_ - (buf_used_ / ALIGN) * ALIGN;  // normally 0 (aligned seek point)
-      enqueue({OP_WRITE, cur_bi_, buf_used_, tail});
+      enqueue({OP_WRITE, cur_bi_, buf_used_, tail, logical_written_});
       logical_written_ += buf_used_;
       cur_bi_ = acquire_free();
       if (cur_bi_ < 0) return false;
       buf_used_ = 0;
     }
-    enqueue({OP_SEEK, -1, offset, 0});
+    enqueue({OP_SEEK, -1, offset, 0, logical_written_});
     logical_written_ += offset;
+    seek_seen_.store(true, std::memory_order_relaxed);   // sparse: probe stays off
     return !werr_.load(std::memory_order_relaxed);
   }
 
@@ -3462,17 +3560,54 @@ private:
   uint64_t phys_written_ = 0;      // write-thread physical position (hole-punch offset)
   uint64_t preallocated_ = 0;
   enum OpKind { OP_WRITE, OP_SEEK };
-  struct WOp { OpKind kind; int bi; size_t len; size_t tail; };
+  struct WOp { OpKind kind; int bi; size_t len; size_t tail; uint64_t off; };
   std::mutex mx_;
   std::condition_variable cv_op_, cv_free_;
   std::deque<WOp> ops_;            // ordered fd ops for the write thread
   std::deque<int> free_;           // free buffer indices
   bool wt_done_ = false;
   std::atomic<bool> werr_{false};  // a write/seek failed on the write thread
+  std::atomic<bool> seek_seen_{false};  // sparse stream: probe never engages
+  bool wt2_spawned_ = false;            // writer_loop-thread only
+  std::thread wt2_;                     // probe drain thread (lazy)
+  int plain_fd_v_ = -1;                 // lazy non-O_DIRECT fd for tails
   std::thread wt_;
 
-  // Write thread: drains ops in order (writes + sparse seeks), keeping all fd
-  // position changes sequential; returns each written buffer to the free list.
+  // Drain one op.  All writes are POSITIONAL (pwrite at op.off — every op
+  // carries the logical offset it was enqueued at), so op order no longer
+  // matters for OP_WRITE and a second drain thread can run concurrently
+  // (the --adapt writer-parallelism probe).  The sub-ALIGN tail goes through
+  // a separate plain (non-O_DIRECT) fd — flipping O_DIRECT on the shared fd
+  // would race a concurrent aligned pwrite on the other thread.
+  void drain_one(const WOp & op) {
+    if (op.kind == OP_SEEK) {
+#ifdef __linux__
+      if (preallocated_ > 0 && op.len > 0)  // punch the skipped region back to a hole
+        (void)::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                          (off_t)op.off, (off_t)op.len);
+#endif
+      // Positional writes need no lseek; the op's offset already accounts
+      // for the hole.
+    } else {
+      char * b = static_cast<char*>(bufs_[op.bi]);
+      size_t body = op.len - op.tail;       // aligned body (O_DIRECT) + optional sub-ALIGN tail
+      uint64_t t0 = now_ns();
+      bool ok = (body == 0) || pwrite_all(b, body, (off_t)op.off);
+      if (ok && op.tail > 0) {              // final unaligned tail: plain fd
+        int pfd = plain_fd_();
+        ok = pfd >= 0 && pwrite_plain_(pfd, b + body, op.tail, (off_t)(op.off + body));
+      }
+      g_odirect_write_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+      if (!ok) werr_.store(true, std::memory_order_relaxed);
+      { std::lock_guard<std::mutex> lk(mx_); free_.push_back(op.bi); }
+      cv_free_.notify_one();
+    }
+  }
+
+  // Write thread: drains ops (positionally, see drain_one) and returns each
+  // written buffer to the free list.  Also the probe supervisor: when the
+  // --adapt governor raises g_adapt_writer_probe and this stream has never
+  // seeked (dense output), it spawns the second drain thread once.
   void writer_loop() {
     for (;;) {
       WOp op;
@@ -3480,31 +3615,56 @@ private:
         cv_op_.wait(lk, [&]{ return !ops_.empty() || wt_done_; });
         if (ops_.empty()) return;            // done and drained
         op = ops_.front(); ops_.pop_front(); }
-      if (op.kind == OP_SEEK) {
-#ifdef __linux__
-        if (preallocated_ > 0 && op.len > 0)  // punch the skipped region back to a hole
-          (void)::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                            (off_t)phys_written_, (off_t)op.len);
-#endif
-        if (::lseek(fd_, (off_t)op.len, SEEK_CUR) < 0) werr_.store(true, std::memory_order_relaxed);
-        phys_written_ += op.len;
-      } else {
-        char * b = static_cast<char*>(bufs_[op.bi]);
-        size_t body = op.len - op.tail;       // aligned body (O_DIRECT) + optional sub-ALIGN tail
-        uint64_t t0 = now_ns();
-        bool ok = (body == 0) || write_raw(b, body);
-        if (ok && op.tail > 0) {              // final unaligned tail: O_DIRECT can't do it
-          int fl = ::fcntl(fd_, F_GETFL); if (fl >= 0) ::fcntl(fd_, F_SETFL, fl & ~O_DIRECT);
-          ok = write_raw(b + body, op.tail);
-          if (fl >= 0) ::fcntl(fd_, F_SETFL, fl);
-        }
-        g_odirect_write_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
-        phys_written_ += op.len;
-        if (!ok) werr_.store(true, std::memory_order_relaxed);
-        { std::lock_guard<std::mutex> lk(mx_); free_.push_back(op.bi); }
-        cv_free_.notify_one();
+      if (!wt2_spawned_ && !seek_seen_.load(std::memory_order_relaxed)
+          && g_adapt_writer_probe.load(std::memory_order_relaxed) != 0) {
+        wt2_spawned_ = true;
+        g_adapt_writer_probe_engaged.store(true, std::memory_order_relaxed);
+        wt2_ = std::thread(&DirectWriter::writer_loop2, this);
       }
+      drain_one(op);
     }
+  }
+
+  // Second drain thread (probe).  Participates only while the governor's
+  // probe flag stays up; a revert (flag -> 0) parks it back on the CV (it
+  // stops stealing ops but stays joinable for teardown, and re-engages if a
+  // later probe round raises the flag again).
+  void writer_loop2() {
+    for (;;) {
+      WOp op;
+      { std::unique_lock<std::mutex> lk(mx_);
+        cv_op_.wait(lk, [&]{
+          return wt_done_
+              || (!ops_.empty()
+                  && g_adapt_writer_probe.load(std::memory_order_relaxed) != 0); });
+        if (ops_.empty() && wt_done_) return;
+        if (ops_.empty()
+            || g_adapt_writer_probe.load(std::memory_order_relaxed) == 0) continue;
+        op = ops_.front(); ops_.pop_front(); }
+      drain_one(op);
+    }
+  }
+
+  // Lazily-opened plain (non-O_DIRECT) fd on the same file, for sub-ALIGN
+  // tails.  Serialized by tail rarity (exactly one tail op per stream).
+  int plain_fd_() {
+    if (plain_fd_v_ >= 0) return plain_fd_v_;
+    char link[64], path[4096];
+    std::snprintf(link, sizeof(link), "/proc/self/fd/%d", fd_);
+    ssize_t n = ::readlink(link, path, sizeof(path) - 1);
+    if (n <= 0) return -1;
+    path[n] = '\0';
+    plain_fd_v_ = ::open(path, O_WRONLY);
+    return plain_fd_v_;
+  }
+  static bool pwrite_plain_(int fd, const char * p, size_t len, off_t off) {
+    while (len > 0) {
+      ssize_t w = ::pwrite(fd, p, len, off);
+      if (w > 0) { p += w; len -= (size_t)w; off += w; }
+      else if (w < 0 && errno == EINTR) continue;
+      else return false;
+    }
+    return true;
   }
   // Caller: take a free buffer to fill, blocking until the write thread frees
   // one (backpressure).  Returns -1 on write error.
@@ -3516,7 +3676,10 @@ private:
   }
   void enqueue(WOp op) {
     { std::lock_guard<std::mutex> lk(mx_); ops_.push_back(op); }
-    cv_op_.notify_one();
+    // notify_all: two drain threads share this CV, and the parked probe
+    // thread re-waits without re-notifying when its flag is down — a
+    // notify_one it swallowed would strand the op for the primary drain.
+    cv_op_.notify_all();
   }
 };
 #endif // _WIN32
@@ -19977,6 +20140,13 @@ static void apply_backend_defaults(Options & opt)
     }
     if (pline[0] && opt.verbosity >= V_VERBOSE) vlog(V_VERBOSE, opt, pline);
   }
+  // Writer-probe verdict prior (M4 action 5b): a recorded negative means
+  // this machine measured no gain from a second drain thread — do not
+  // re-pay the probe every run.  A positive (or absent) verdict leaves the
+  // controller free to probe (and a positive typically re-keeps in one
+  // window).  Latest-wins on record, so hardware changes can flip it back.
+  if (priors.loaded && prior_dir.writer_par < 0)
+    g_adapt_writer_probe_allowed.store(0, std::memory_order_relaxed);
 #endif
 
   if (opt.backend_user_set) return;

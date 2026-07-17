@@ -365,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=351
-$EXTENSIVE && EXPECTED_TESTS=468
+EXPECTED_TESTS=354
+$EXTENSIVE && EXPECTED_TESTS=471
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3564,6 +3564,66 @@ else
 fi
 rm -rf "$ARP_XDG" "$TMPDIR/arp.zst" "$TMPDIR/arp.out" "$TMPDIR/arp-fp.err" \
        "$TMPDIR/arp1.err" "$TMPDIR/arp2.err" "$TMPDIR/arp3.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt writer-parallelism probe (dual O_DIRECT drain)"
+
+# Forced sink-bound raises the probe flag; the DirectWriter spawns a second
+# positional-pwrite drain thread.  --direct forces the O_DIRECT writer on
+# every box (Gen<4 doesn't auto-enable it).  Summary shows the engagement.
+
+# 1. Dual drain engages and output round-trips (the correctness property:
+# two threads pwrite disjoint offsets of the same file concurrently).
+env GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" --adapt --no-profile --direct \
+  -v --cpu-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/awp.zst" 2>"$TMPDIR/awp1.err"
+"$GZSTD" -d --cpu-only -k -f "$TMPDIR/awp.zst" -o "$TMPDIR/awp.out" 2>/dev/null
+if grep -qE 'actions:.*writer-(drain2\(probed\)|probe\(kept\))' "$TMPDIR/awp1.err" \
+   && files_match "$TMPDIR/large.bin" "$TMPDIR/awp.out"; then
+  pass "writer probe engages the second drain (round-trip exact)"
+else
+  fail "writer probe engages the second drain (round-trip exact)"
+fi
+
+# 2. A recorded negative verdict blocks the probe entirely.
+if has_nvcomp; then
+  AWP_XDG="$TMPDIR/xdg-wprobe"
+  rm -rf "$AWP_XDG"
+  env XDG_CACHE_HOME="$AWP_XDG" "$GZSTD" --adapt -vv --cpu-only -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/awp.zst" 2>"$TMPDIR/awp-fp.err"
+  AWP_LINE=$(grep -o '\[ADAPT\] fingerprint [0-9a-f]* driver [^ ]*' "$TMPDIR/awp-fp.err" | head -1)
+  AWP_HASH=$(echo "$AWP_LINE" | awk '{print $3}')
+  AWP_DRV=$(echo  "$AWP_LINE" | awk '{print $5}')
+  [[ "$AWP_DRV" == "(none)" ]] && AWP_DRV=""
+  mkdir -p "$AWP_XDG/gzstd"
+  cat > "$AWP_XDG/gzstd/profile.json" <<AWP_EOF
+{ "gzstd_profile": 1, "entries": { "$AWP_HASH": { "fingerprint": "crafted",
+  "driver": "$AWP_DRV", "compress": { "runs": 3, "writer_par": -1 } } } }
+AWP_EOF
+  env XDG_CACHE_HOME="$AWP_XDG" GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" \
+    --adapt --direct -v --cpu-only -k -f "$TMPDIR/large.bin" \
+    -o "$TMPDIR/awp.zst" 2>"$TMPDIR/awp2.err"
+  if ! grep -q 'writer-drain2' "$TMPDIR/awp2.err" \
+     && "$GZSTD" -t --cpu-only "$TMPDIR/awp.zst" 2>/dev/null; then
+    pass "negative writer_par verdict blocks the probe"
+  else
+    fail "negative writer_par verdict blocks the probe"
+  fi
+  rm -rf "$AWP_XDG"
+else
+  skip "negative writer_par verdict blocks the probe" "no nvCOMP build"
+fi
+
+# 3. Without --adapt the second drain never exists.
+env GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" --direct -v --cpu-only -k -f \
+  "$TMPDIR/large.bin" -o "$TMPDIR/awp.zst" 2>"$TMPDIR/awp3.err"
+if ! grep -q 'writer-drain2' "$TMPDIR/awp3.err"; then
+  pass "writer probe inert without --adapt"
+else
+  fail "writer probe inert without --adapt"
+fi
+
+rm -f "$TMPDIR/awp.zst" "$TMPDIR/awp.out" "$TMPDIR/awp1.err" \
+      "$TMPDIR/awp2.err" "$TMPDIR/awp3.err" "$TMPDIR/awp-fp.err"
 
 section "Sliding-window compression"
 

@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.7  
+**Covers:** v0.9.50 → v0.15.8  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.8 — --adapt M4 action 5 (second half): the writer-parallelism probe
+
+**The general "try it, measure it, keep or revert, persist the verdict" mechanism lands on the writer: a SINK_BOUND O_DIRECT run probes +1 parallel drain thread, keeps it on ≥ 10% sustained sink-rate gain, reverts otherwise (≤ 2 rounds per run), and the verdict persists so the next run starts at the answer.** This re-opens ROADMAP 4.2 as a per-machine question, exactly as the plan framed it — "tested negative for buffered" was *our* boxes; on ext4-class NVMe this will probe-negative once and the profile remembers, at the cost of one probe per fingerprint instead of a regression every run.
+
+The enabling refactor: **`DirectWriter`'s drain is now fully positional.** Every queued op carries the logical offset it was enqueued at, writes go through `pwrite` at explicit offsets (order-independent), sparse holes punch by the op's own offset (no `lseek` chaining), and the sub-ALIGN tail goes through a lazily-opened plain fd — the old in-place `fcntl` O_DIRECT flag-flip would race a concurrent aligned `pwrite` on the other thread. With ops order-free, the probe is just a second drain thread pulling from the same queue: the governor raises a flag on SINK_BOUND (real runs: the tick controller with a 4-tick measurement window against the pre-probe rate; forced hook: raised at start for deterministic tests); the primary drain spawns the second thread on first sight; a revert parks it (it stops stealing ops but stays joinable, re-engaging if a later round re-probes). `enqueue` notifies all — with two drain waiters on one CV, a `notify_one` swallowed by the parked probe thread would strand the op. Verdict → `writer_par` in the profile (latest-wins, so hardware changes can flip it back); a recorded negative blocks all future probing on that fingerprint.
+
+Verified live: 5/5 concurrent-drain round-trips exact on 256 MiB random, sparse (zero-heavy) output exact through the positional punch path, engagement token in the summary (`writer-drain2(probed)` / `writer-probe(kept)`), never spawns without `--adapt`.
+
+Suite: 354 normal / 471 extensive (3 new: dual drain engages with exact round-trip, negative writer_par verdict blocks the probe, inert without --adapt).
 
 ## v0.15.7 — --adapt M4 action 5 (first half): read-path priors — try the alternative next run
 
