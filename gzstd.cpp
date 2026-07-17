@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.9";
+static constexpr const char * GZSTD_VERSION = "0.15.10";
 //
 // Architecture overview:
 //
@@ -1085,11 +1085,20 @@ static void print_help_long()
 "     regime: source-bound (the input path is the faucet), compute-bound\n"
 "     (the CPU/GPU engines are the ceiling), or sink-bound (the output\n"
 "     device is).  Regime transitions and an end-of-run share summary\n"
-"     print at -v as [ADAPT] lines.  This stage is observe-only — it\n"
-"     changes no tuning decision; later 0.15.x stages wire the regimes to\n"
-"     actions (measured engine ranking, reader/writer scaling, cached\n"
-"     per-machine calibration).  --no-adapt is accepted now so scripts\n"
-"     keep working when the default flips (decision planned for v1.0).\n"
+"     print at -v as [ADAPT] lines.  The regimes drive actions, each\n"
+"     latched and reported in the summary's action list: source-bound\n"
+"     freezes GPU batch growth and wakes dormant prefetch readers;\n"
+"     sink-bound grows the in-flight budget on bursty output and probes\n"
+"     +1 parallel O_DIRECT drain thread (kept only on a measured >= 10%\n"
+"     gain); every engine (the CPU pool, each GPU device) is ranked by\n"
+"     live measured rate — the fastest feeds first, slower engines take\n"
+"     overflow, and a device whose batch blows its deadline is demoted\n"
+"     (or, past a second deadline, treated as a fault with a CPU-only\n"
+"     rebuild).  Measured verdicts persist to the per-machine profile\n"
+"     (see PROFILE below) so the next run starts at the answer.\n"
+"     Explicit flags always win: no action ever overrides a value you\n"
+"     set.  --no-adapt is accepted now so scripts keep working when the\n"
+"     default flips (decision planned for v1.0).\n"
 "     COMPATIBILITY: zstd has its own --adapt (it varies the compression\n"
 "     LEVEL with I/O conditions).  gzstd deliberately takes the name\n"
 "     over: bare --adapt enables the governor; zstd's value form\n"

@@ -31,7 +31,7 @@ effective_batch = base_batch * util_scale
 - No wasted GPU cycles, no blocking
 
 ### 1.3 Rate-Matched Dispatch (CPU/GPU Throughput Calibration)
-**Priority: Medium | Complexity: Medium | Status: PARTIALLY DONE**
+**Priority: Medium | Complexity: Medium | Status: SUBSUMED by v0.15.4 ranked-engine overflow dispatch** — every engine (CPU pool + each GPU device) is ranked by live per-device EMA and the generalized tail-yield inequality dispatches; the vestigial RateMatchState was deleted (its allowance was read by nothing).
 
 RateMatchState struct exists with EMA-smoothed throughput tracking and CPU frame allowance calculation. CPU throttle (`cpu_may_take()`) is implemented but **disabled for debugging** since v0.11.9.
 
@@ -119,7 +119,7 @@ Decompress is out of scope: its GPU worker synchronizes inline per batch (requir
 `GetTempSizeSync`) and has no poll loop.  See 1.11 for what decompress could still gain.
 
 ### 1.11 Decompress GPU Pipelining
-**Priority: Low (Gen4+ only) | Complexity: High | Status: EVALUATE — profile on the server first**
+**Priority: Low (Gen4+ only) | Complexity: High | Status: EVALUATE — premise narrowed by v0.15.2** — the Gen4+ decompress default is now residency-informed (warm inputs run cpu-only, where the GPU path isn't used at all), so this optimization only matters for cold/hybrid decompress; profile there before investing.
 
 The decompress GPU worker is deliberately simple, not optimal: each batch runs
 H2D → `GetTempSizeSync` (forced mid-submission sync) → kernel → sync → per-frame D2H,
@@ -149,7 +149,7 @@ path becomes the chosen backend and profiling shows kernel/H2D idle during D2H, 
 ## Phase 2: Persistent Auto-Tuning (`~/.gzstd/`)
 
 ### 2.1 Per-Machine Performance Profile
-**Priority: Medium | Complexity: Medium | Status: NOT STARTED**
+**Priority: Medium | Complexity: Medium | Status: SUBSUMED by v0.15.1** — `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json`, hardware-fingerprint-keyed, EMA-merged, driver-mismatch quarantine.
 
 Create `~/.gzstd/` directory on first run. Store tuning data:
 
@@ -176,7 +176,7 @@ Create `~/.gzstd/` directory on first run. Store tuning data:
 **Why it matters:** On 8 GiB files where total runtime is 3-6 seconds, the auto-tuner spends 2-3 seconds rediscovering optimal batch sizes every run. On the workstation where the answer is always "batch=8 for compress," this is pure waste. A cached profile would eliminate the exploration phase.
 
 ### 2.2 Calibration Run
-**Priority: Medium | Complexity: Medium | Status: NOT STARTED**
+**Priority: Medium | Complexity: Medium | Status: SUBSUMED by v0.15.1 `--calibrate`** — memfd corpus through the real readers, warmup passes off the clock, seeds the profile.
 
 `gzstd --calibrate` runs a quick benchmark suite (30-60 seconds):
 1. Small compress/decompress on CPU (measures per-core throughput)
@@ -187,7 +187,7 @@ Create `~/.gzstd/` directory on first run. Store tuning data:
 Subsequent runs read the profile and start with known-optimal settings. The runtime auto-tuner still runs but converges instantly since it starts at the right point.
 
 ### 2.3 Automatic Profile Updates
-**Priority: Low | Complexity: Low | Status: NOT STARTED**
+**Priority: Low | Complexity: Low | Status: SUBSUMED by v0.15.1/v0.15.7/v0.15.8** — every clean ≥3 s --adapt run EMA-merges its measurements; read-path and writer-probe verdicts persist latest-wins so hardware changes re-flip.
 
 After each run, if the auto-tuner found a different optimal than the profile predicted, update the profile. This handles hardware changes (new GPU, driver update, different NVMe) without requiring explicit recalibration.
 
@@ -196,7 +196,7 @@ After each run, if the auto-tuner found a different optimal than the profile pre
 ## Phase 3: Piped I/O Optimization
 
 ### 3.1 Pipe-Aware Scheduling
-**Priority: Medium | Complexity: Medium | Status: NOT STARTED**
+**Priority: Medium | Complexity: Medium | Status: SUBSUMED by the v0.15.x governor** — SOURCE_BOUND classification + the source-bound batch latch (v0.15.3) and ranked overflow dispatch (v0.15.4) adapt to a slow/piped source at runtime instead of by input-type special cases.
 
 Piped input (`stdin`) has unique constraints:
 - Can't seek → no parallel readers
@@ -219,7 +219,7 @@ Optimizations for piped output:
 - Skip sparse detection (can't seek on true pipes)
 
 ### 3.2 Streaming Mode for Unknown-Size Input
-**Priority: Low | Complexity: Low | Status: NOT STARTED**
+**Priority: Low | Complexity: Low | Status: SUBSUMED by v0.15.3** — the source-bound tuner latch replaces the "don't set tune_hi too high" heuristic with a measured stop (the conservative unknown-size start already shipped earlier).
 
 When input size is unknown (pipe), the frame count is unknown. The auto-tuner must be more conservative:
 - Don't set tune_hi too high (we might run out of frames before exploring)
@@ -265,7 +265,7 @@ When input size is unknown (pipe), the frame count is unknown. The auto-tuner mu
 **Net:** multi-reader shelved (negative result); the single-stream O_DIRECT zero-copy reader shipped as `--direct-read` for honest-cold benchmarking and one-pass reads that don't pollute the cache. On a big-RAM box the buffered/page-cache path is still the throughput king (reads served from RAM). The benchmark methodology was rebuilt around this: `gzstd-benchmark.sh` now reads cold via `--direct-read` and writes `/dev/null`; `gzstd-gendata.sh` builds a matching `.bin.zst` per profile. See CHANGELOG v0.13.44–v0.13.51.
 
 ### 4.2 Multi-Writer with pwrite()
-**Priority: Low | Complexity: Medium | Status: Tested, NEGATIVE for buffered I/O**
+**Priority: Low | Complexity: Medium | Status: RE-OPENED per-machine by v0.15.8** — the --adapt writer-parallelism probe tries +1 positional-pwrite drain thread on SINK_BOUND O_DIRECT runs, keeps on ≥10% measured gain, and persists the per-fingerprint verdict (buffered multi-writer remains negative by design; the probe is O_DIRECT-only).
 
 **Already tested in v0.10.29:** 4 pwrite threads through page cache was 2.5× slower due to page cache thrashing (38 minutes sys time vs 12 minutes with O_DIRECT).
 

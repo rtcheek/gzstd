@@ -1,11 +1,21 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.9  
+**Covers:** v0.9.50 → v0.15.10  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.10 — M5 close-out: docs, ROADMAP reconciliation, extensive suite, A/B
+
+**Docs:** the `--adapt` help no longer claims observe-only — it describes the shipped actions (latches, ranked dispatch, probes, deadlines) and the always-wins rule for explicit flags; CLAUDE.md gains `AdaptGovernor` in the key-classes table plus the profile path and the three deterministic test hooks. **ROADMAP reconciled:** 1.3 (rate-matched dispatch), 2.1–2.3 (profile/calibrate/auto-update), 3.1–3.2 (pipe-aware/unknown-size scheduling) marked SUBSUMED by their v0.15.x replacements; 1.11's premise narrowed by the residency default; 4.2 re-opened per-machine by the writer probe.
+
+**Extensive suite: 474/474** (`-e`, full zstd-CLI-compat sections included).
+
+**A/B on the 256-core Gen4+ box (mixed profile, 19.5 GiB, 3 runs each; the second box's matrix is still owed):** cold compress is the headline — the first `--adapt` run seeds the profile at parity, runs 2–3 use the accumulated prior and hit **1.94–1.96 vs 1.47 GiB/s no-adapt (+33%)**: the calibrate-seeded backend prior flipping compress to cpu-only, exactly the M3 design intent. Warm compress: parity within noise (2.02 vs 2.09 median). Decompress currently pays adapt's exploration cost on this box (warm 6.9 vs 9.9, cold 4.2 vs 5.0 GiB/s): the read-path probe tries `--direct-read`, which this box measures slower, and the run sequence sat at the edge of the shared box's documented ±30% noise band — the probe-once-then-remember design converges after the verdict lands, but these numbers need a quiet-box rerun before firm claims. Honest accounting either way: on a box whose static defaults were already measured-optimal, adapt's value is the floor it puts under *other* hardware, at the price of bounded exploration here.
+
+**The --adapt chapter (v0.15.0–v0.15.10) is complete** and remains opt-in; the default-flip decision stays at v1.0. Carried follow-ups: quiet-box + second-box A/B matrices; profile decompress `cpu_gibs` tap is compressed-unit (skews the 1.5× backend prior); CPU worker-pool grow on the sink signal; tar-create reader scale-up; mmap queue-starvation classifier fallback.
 
 ## v0.15.9 — --adapt M4 action 6: GPU deadline demote + escalate (M4 complete)
 

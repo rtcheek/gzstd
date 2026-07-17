@@ -86,6 +86,7 @@ Frames with compression ratio < 2% (trivially compressed) are always routed to C
 | `AsyncWritePool` | Background write thread; decouples workers from NVMe latency |
 | `HybridSched` | CPU/GPU throughput tracker and dispatch policy |
 | `StreamCtx` | Per-GPU-stream state (batches, CUDA buffers) |
+| `AdaptGovernor` | `--adapt` regime classifier + action driver (per-operation tick thread); actions consume its published globals — no governor→worker pointers |
 
 ### Exit codes
 
@@ -110,4 +111,5 @@ Frames with compression ratio < 2% (trivially compressed) are always routed to C
 
 - Documented optimization attempts (successful and failed) are in `CHANGELOG.md` — read before trying anything that sounds clever
 - `ROADMAP.md` lists planned work and open design questions
+- `--adapt` (v0.15.x, opt-in) adapts scheduling to the measured environment and persists per-machine verdicts to `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json`; its test hooks (`GZSTD_DEBUG_ADAPT_REGIME`, `GZSTD_DEBUG_ADAPT_RATES`, `GZSTD_DEBUG_ADAPT_STALL`) make the governor's actions deterministic in the suite
 - Verbosity levels (`-v`, `-vv`, `-vvv`) expose Meter counters and timing for profiling
