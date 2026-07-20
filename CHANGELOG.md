@@ -7,6 +7,16 @@
 
 ---
 
+## v0.15.14 — fix: non-root extraction of read-only files >4 MiB silently dropped them (data loss)
+
+**A restore-time data-loss bug, surfaced while regime-measuring a real `/usr` archive (403 files silently lost).** Extracting a read-only file (a mode with no owner-write bit, e.g. 0444 shared libraries) larger than 4 MiB, as a non-root user, on the O_DIRECT extract path (auto-enabled on Gen4+, or forced with `--direct`), failed with EACCES and skipped the file.
+
+Root cause: the big-file windowed-part path creates the file with its archived read-only mode, then the **O_DIRECT sub-4K tail reopens it `O_WRONLY` with no `O_CREAT`** — which rechecks write permission and is denied for the non-root owner of a 0444 file. Root never hit it (it bypasses the permission check); small files never hit it (they write through the create fd, no reopen); non-direct never hit it (writes go through the shared fd). Deterministic, not a race — the same files failed identically with and without `--adapt`.
+
+Fix (the pattern `make_dir` already uses for restrictive directory modes): `dispatch_large` creates the file with a scratch **owner-write** mode (`e.mode | 0200`), and `finalize_big` reapplies the TRUE stored mode via `set_meta_fd` once every part is written — and it runs on all completion paths (success, part failure, truncation), so the scratch bit is never the final mode. Verified against the real `/usr` repro: 403 write failures → 0, formerly-failing 0444 libraries now extract byte-identical with mode 444 restored.
+
+Suite: 344 normal (1 new: `--direct` extract of a read-only >4 MiB file round-trips with mode 444 restored; skipped when run as root or on a non-O_DIRECT fs).
+
 ## v0.15.13 — test-suite runtime: −270s off the default tier (measured, not guessed)
 
 **A per-section wall-time profile drove a set of targeted cuts to the default suite, none of which lose default-tier correctness coverage.** The measured baseline was ~950s; two sections alone were 27% of it.

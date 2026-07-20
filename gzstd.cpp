@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.13";
+static constexpr const char * GZSTD_VERSION = "0.15.14";
 //
 // Architecture overview:
 //
@@ -12039,10 +12039,18 @@ private:
     big->uid = e.uid; big->gid = e.gid; big->ext = e.ext; big->size = e.size;
     big->root = root;
     big->direct = opt_.direct_io;
-    int fd = create_file(rel, e.mode, big->direct, root);
+    // Create with owner-write forced on (like make_dir's scratch dir mode): the
+    // O_DIRECT sub-4K tail reopens the file O_WRONLY, and a read-only stored mode
+    // (e.g. 0444 shared libraries) would EACCES that reopen for a non-root
+    // extractor (root bypasses the check, which is why root restores never hit
+    // it).  finalize_big's set_meta_fd reapplies the TRUE stored mode once every
+    // part is written — and it runs on all completion paths (success, part
+    // failure, truncation), so the scratch bit is never the final mode.
+    const uint32_t scratch_mode = e.mode | 0200;
+    int fd = create_file(rel, scratch_mode, big->direct, root);
     if (fd < 0 && big->direct) {   // no O_DIRECT here (tmpfs, …): buffered parts
       big->direct = false;
-      fd = create_file(rel, e.mode, false, root);
+      fd = create_file(rel, scratch_mode, false, root);
     }
     if (fd < 0) { fail(rel, std::strerror(errno)); r.skip(e.size); return; }
     // Pre-size the file: parts pwrite their absolute offsets concurrently,

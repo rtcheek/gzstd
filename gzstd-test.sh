@@ -365,8 +365,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=343
-$EXTENSIVE && EXPECTED_TESTS=476
+EXPECTED_TESTS=344
+$EXTENSIVE && EXPECTED_TESTS=477
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -4708,6 +4708,11 @@ PYEOF
   head -c 5000000 /dev/urandom > "$DD/dense.bin"          # >4 MiB dense → O_DIRECT path
   head -c 5000000 /dev/urandom >  "$DD/holey.bin"
   printf '\0%.0s' $(seq 1 4194304) >> "$DD/holey.bin" 2>/dev/null  # + a 4 MiB zero run
+  # Read-only >4 MiB file: the O_DIRECT sub-4K tail reopens O_WRONLY, which a
+  # 0444 mode EACCES'd for a non-root extractor before the scratch-mode fix
+  # (create with owner-write, finalize reapplies the true mode).  Meaningful
+  # only run non-root on an O_DIRECT-capable fs.
+  head -c 5000001 /dev/urandom > "$DD/readonly.bin"; chmod 444 "$DD/readonly.bin"
   DDA="$TMPDIR/dd.tar.zst"
   "$GZSTD" --cpu-only -q -f -o "$DDA" --tar "$DD" 2>/dev/null
   rm -rf "$TMPDIR/dd_o"; mkdir -p "$TMPDIR/dd_o"
@@ -4719,9 +4724,23 @@ PYEOF
     cmp -s "$DD/holey.bin" "$TMPDIR/dd_o$DD/holey.bin" \
       && pass "O_DIRECT extract content correct (holey)" \
       || fail "O_DIRECT holey content" "differs"
+    # Read-only big file: present, content-identical, and restored to mode 444.
+    # Root would pass without the fix (bypasses the write-perm reopen check), so
+    # this only proves the fix when the suite runs non-root.
+    if [[ "$(id -u)" != 0 ]]; then
+      if cmp -s "$DD/readonly.bin" "$TMPDIR/dd_o$DD/readonly.bin" 2>/dev/null \
+         && [[ "$(stat -c '%a' "$TMPDIR/dd_o$DD/readonly.bin" 2>/dev/null)" == "444" ]]; then
+        pass "O_DIRECT read-only big-file extract (non-root, mode 444 restored)"
+      else
+        fail "O_DIRECT read-only big-file extract" "missing/content/mode — scratch-mode regression"
+      fi
+    else
+      skip "O_DIRECT read-only big-file extract (non-root, mode 444 restored)" "running as root (bypasses the check)"
+    fi
   else
     skip "O_DIRECT large-file extract (--direct) content correct" "O_DIRECT unsupported on fs"
     skip "O_DIRECT extract content correct (holey)" "O_DIRECT unsupported on fs"
+    skip "O_DIRECT read-only big-file extract (non-root, mode 444 restored)" "O_DIRECT unsupported on fs"
   fi
   rm -rf "$DD" "$DDA" "$TMPDIR/dd_o"
 
