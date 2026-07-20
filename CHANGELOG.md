@@ -7,6 +7,18 @@
 
 ---
 
+## v0.15.13 — test-suite runtime: −270s off the default tier (measured, not guessed)
+
+**A per-section wall-time profile drove a set of targeted cuts to the default suite, none of which lose default-tier correctness coverage.** The measured baseline was ~950s; two sections alone were 27% of it.
+
+- **`--adapt persistent profile` (127s → ~15s):** the cost was structural, not the fixture — five level-19 single-thread runs (9.8s each) to clear the 3s profile-save gate, plus two ~25s `--calibrate` corpus passes. Two **debug-only** env hooks fix it: `GZSTD_DEBUG_ADAPT_SAVE_MIN_MS` lowers the save-gate so a sub-second default-level run qualifies, and `GZSTD_DEBUG_CALIBRATE_BYTES` shrinks the calibrate corpus (1 GiB → 8 MiB). Both are read-once, never consulted in a real run (verified: the default 3s gate still blocks a fast run). The one test that asserts the *real* gate ("sub-3s run writes nothing") deliberately sets neither hook.
+- **Demoted to `-e` (−16 tests from the default tier):** Bounded-queue pooled-reader regressions (~47s — a stable guard for a fixed past bug in well-worn code) and the `--cpu-share` / hybrid-GPU-bringup sections (~108s, perf-shaped and GPU-gated). They still run under `-e`; normal 359→343, extensive stays 476.
+- **Parallelized the upfront fixture generation** — the independent fixtures build concurrently (medium.txt's ~400 subshell text lines dominated); the directory tree waits on its three inputs.
+
+**Honest non-result:** GPU acceleration (129s) and native tar extraction (80s) were investigated for fixture shrinking and left alone — both are operation-count-bound, not data-bound (medium.txt is 1 MiB; the tar fixtures are 5 MB and *deliberately* >4 MiB to exercise the large-file extract path). Shrinking would have saved ~nothing and risked silently dropping that path's coverage.
+
+Also fixes a pre-existing count drift (`EXPECTED_TESTS` was 357 while 358 ran).
+
 ## v0.15.12 — --adapt × --tar: the extract writer-pool ACTUATOR (ROADMAP 2.5 #1, action 5c)
 
 **v0.15.11 made SINK_BOUND classify on `-d --tar`; this makes it ACT.** On a write-bound extract the governor now grows the parallel file-writer pool, measures the sink rate, keeps the gain or reverts, and persists the settled pool size so the next run starts there. It is the extract twin of the plain writer probe (5b), but the actuator is different: the plain probe adds a second drain thread to the fixed-function `DirectWriter`; here the pool is a shared job queue, so the lever is *how many writers pull from it*.

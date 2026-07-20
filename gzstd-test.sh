@@ -365,7 +365,7 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=359
+EXPECTED_TESTS=343
 $EXTENSIVE && EXPECTED_TESTS=476
 count_tests() { echo "$EXPECTED_TESTS"; }
 
@@ -396,38 +396,37 @@ printf "  ${C_DIM}${SYM_BULLET}${C_RESET} ${C_BOLD}Tests${C_RESET}    ${C_DIM}%d
 echo ""
 printf "  ${C_BOLD}Generating test data...${C_RESET}\n"
 
-spin "small.txt (4 KiB text)"
-dd if=/dev/urandom bs=1024 count=4 2>/dev/null | base64 > "$TMPDIR/small.txt"
-spin_done
-
-spin "medium.txt (1 MiB mixed-compressible)"
-# Mix of text (compressible) and random bytes (not) for realistic ratios
-{
-  dd if=/dev/urandom bs=1024 count=256 2>/dev/null    # 256 KiB random
-  for i in $(seq 1 200); do                            # ~200 KiB varied text
-    echo "Log entry $i: user=$(head -c8 /dev/urandom 2>/dev/null | base64) action=request ts=$(date +%s%N) status=200 latency=$((RANDOM % 500))ms path=/api/v2/resource/$((RANDOM % 10000))"
-  done
-  dd if=/dev/zero bs=1024 count=128 2>/dev/null        # 128 KiB zeros
-  dd if=/dev/urandom bs=1024 count=256 2>/dev/null     # 256 KiB more random
-  for i in $(seq 1 200); do                            # ~200 KiB more text
-    echo "Event id=$(printf '%08x' $((RANDOM * RANDOM))) type=click element=button-$((RANDOM % 50)) page=/dashboard/$((RANDOM % 100)) session=$(head -c12 /dev/urandom 2>/dev/null | base64)"
-  done
-} | head -c $((1024*1024)) > "$TMPDIR/medium.txt"
-spin_done
-
-spin "large.bin (32 MiB mixed)"
-dd if=/dev/zero bs=1M count=16 2>/dev/null > "$TMPDIR/large.bin"
-dd if=/dev/urandom bs=1M count=16 2>/dev/null >> "$TMPDIR/large.bin"
-spin_done
-
-spin "random.bin (1 MiB incompressible)"
-dd if=/dev/urandom bs=1M count=1 2>/dev/null > "$TMPDIR/random.bin"
-spin_done
-
-spin "edge cases (empty, 1-byte, zeros)"
-touch "$TMPDIR/empty.txt"
-printf 'X' > "$TMPDIR/onebyte.txt"
-dd if=/dev/zero bs=1M count=2 2>/dev/null > "$TMPDIR/zeros.bin"
+spin "base fixtures (parallel)"
+# The independent fixtures generate concurrently — medium.txt's ~400 subshell
+# text lines dominate, so overlapping it with the dd-based ones cuts the upfront
+# wall to roughly the medium.txt time.  Content is unchanged (still per-run
+# non-deterministic).  The directory tree copies three of them, so it waits.
+( dd if=/dev/urandom bs=1024 count=4 2>/dev/null | base64 > "$TMPDIR/small.txt" ) &
+(
+  # medium.txt: text (compressible) + random (not) for realistic ratios
+  {
+    dd if=/dev/urandom bs=1024 count=256 2>/dev/null    # 256 KiB random
+    for i in $(seq 1 200); do                            # ~200 KiB varied text
+      echo "Log entry $i: user=$(head -c8 /dev/urandom 2>/dev/null | base64) action=request ts=$(date +%s%N) status=200 latency=$((RANDOM % 500))ms path=/api/v2/resource/$((RANDOM % 10000))"
+    done
+    dd if=/dev/zero bs=1024 count=128 2>/dev/null        # 128 KiB zeros
+    dd if=/dev/urandom bs=1024 count=256 2>/dev/null     # 256 KiB more random
+    for i in $(seq 1 200); do                            # ~200 KiB more text
+      echo "Event id=$(printf '%08x' $((RANDOM * RANDOM))) type=click element=button-$((RANDOM % 50)) page=/dashboard/$((RANDOM % 100)) session=$(head -c12 /dev/urandom 2>/dev/null | base64)"
+    done
+  } | head -c $((1024*1024)) > "$TMPDIR/medium.txt"
+) &
+(
+  dd if=/dev/zero bs=1M count=16 2>/dev/null > "$TMPDIR/large.bin"
+  dd if=/dev/urandom bs=1M count=16 2>/dev/null >> "$TMPDIR/large.bin"
+) &
+( dd if=/dev/urandom bs=1M count=1 2>/dev/null > "$TMPDIR/random.bin" ) &
+(
+  touch "$TMPDIR/empty.txt"
+  printf 'X' > "$TMPDIR/onebyte.txt"
+  dd if=/dev/zero bs=1M count=2 2>/dev/null > "$TMPDIR/zeros.bin"
+) &
+wait
 spin_done
 
 spin "directory tree for tar tests"
@@ -1503,6 +1502,10 @@ fi
 # its 1536 frames overflow both even at 256 threads.  Half zeros / half
 # random also routes some frames through the trivial-skip path.
 # ============================================================
+# Extensive-only (v0.15.13): stable regression guard for a fixed past bug in
+# well-worn code; ~47 s of large-fixture round-trips.  Moved out of the default
+# tier — run with -e.
+if $EXTENSIVE; then
 section "Bounded-queue pooled-reader regressions"
 
 POOL_TEST_TIMEOUT=120
@@ -1616,6 +1619,7 @@ else
   skip "gpu-only decomp locked batch × 16 streams" "no GPU"
 fi
 rm -f "$TMPDIR"/pool-*.zst "$TMPDIR"/pool-*.dec "$TMPDIR"/pool-*.log "$TMPDIR/pool-dwedge."* "$TMPDIR/pooltest.bin"
+fi  # $EXTENSIVE (bounded-queue pooled-reader regressions moved to -e)
 
 # ============================================================
 # Parallel-prefetch decompress reader (v0.13.71)
@@ -2027,7 +2031,10 @@ rm -f "$TMPDIR"/cpubatch* "$TMPDIR"/cpubl*
 
 # ============================================================
 # 25b. --cpu-share fixed CPU/GPU split (hybrid only)
+# Extensive-only (v0.15.13): perf-shaped hybrid-split + GPU-bringup-overlap
+# tests, ~108 s together, GPU-gated.  Moved out of the default tier — run with -e.
 # ============================================================
+if $EXTENSIVE; then
 section "--cpu-share scheduling (hybrid)"
 
 if has_gpu 2>/dev/null; then
@@ -2162,6 +2169,7 @@ else
   skip "hybrid decompress to stdout"            "no GPU"
   skip "hybrid decompress x5 stable"            "no GPU"
 fi
+fi  # $EXTENSIVE (cpu-share scheduling + hybrid GPU-bringup overlap moved to -e)
 
 # ============================================================
 # 25c. Asymmetric mode (PCIe gen → backend auto-selection)
@@ -3049,23 +3057,29 @@ rm -f "$TMPDIR/adapt.zst" "$TMPDIR/adapt.dec" "$TMPDIR/adapt-plain.zst" \
 # ────────────────────────────────────────────────────────────
 section "--adapt persistent profile"
 
-# All profile tests point XDG_CACHE_HOME at a scratch dir — never the
-# user's real cache.  A qualifying write needs a clean >=3 s run: 32 MiB
-# of compressible text at -19 on one thread stays comfortably past that
-# on any machine this suite runs on.
+# All profile tests point XDG_CACHE_HOME at a scratch dir — never the user's
+# real cache.  Two test hooks keep this section fast (it was ~127 s: five slow
+# level-19 single-thread runs to clear the 3 s save gate, plus two ~25 s
+# calibrate passes):
+#   $AQ  — GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 makes ANY run qualify for a profile
+#          save, so a sub-second default-level run replaces the -19 -T1 one.
+#   $ACB — GZSTD_DEBUG_CALIBRATE_BYTES shrinks the calibrate corpus 1 GiB -> 8 MiB.
+# Neither is ever set in a real run.  Test 5 deliberately sets NEITHER — it
+# asserts the REAL 3 s gate blocks a sub-3 s run.
+AQ="GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0"
+ACB="GZSTD_DEBUG_CALIBRATE_BYTES=8388608"
 APROF_XDG="$TMPDIR/xdg-cache"
 APROF="$APROF_XDG/gzstd/profile.json"
 APROF_SRC="$TMPDIR/aprof-src.txt"
 if [[ ! -f "$APROF_SRC" ]]; then
-  # seq|awk generates the identical bytes ~13x faster than a 400k-iteration
-  # bash echo loop (1.9s -> 0.14s measured); the content, not the method, is
-  # what needs to stay a clean >=3 s compressible run.
+  # Compressible text; seq|awk generates it ~13x faster than a 400k bash echo
+  # loop.  With $AQ the run no longer needs to last 3 s, only to succeed.
   seq 1 400000 | awk '{print "session="$1" commit delta backup index worker "($1*7919)}' > "$APROF_SRC"
 fi
 rm -rf "$APROF_XDG"
 
 # 1. A qualifying --adapt run creates the profile with this run's direction.
-env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -19 -T 1 --cpu-only -k -f \
+env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --cpu-only -k -f \
   "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
 if [[ -f "$APROF" ]] && grep -q '"compress"' "$APROF" && grep -q '"overall_gibs"' "$APROF"; then
   pass "qualifying --adapt run writes the profile"
@@ -3074,7 +3088,7 @@ else
 fi
 
 # 2. A second run EMA-merges into the same entry (runs: 2, one fingerprint).
-env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -19 -T 1 --cpu-only -k -f \
+env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --cpu-only -k -f \
   "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
 if grep -q '"runs": 2' "$APROF" && [[ $(grep -c '"fingerprint"' "$APROF") -eq 1 ]]; then
   pass "second run merges (runs: 2, one fingerprint)"
@@ -3084,7 +3098,7 @@ fi
 
 # 3. A corrupt profile is benign: run exits 0 and the file is rewritten fresh.
 echo '{"gzstd_profile": 1, "entries": {' > "$APROF"   # truncated JSON
-env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -19 -T 1 --cpu-only -k -f \
+env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --cpu-only -k -f \
   "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
 if [[ $? -eq 0 ]] && grep -q '"runs": 1' "$APROF"; then
   pass "corrupt profile discarded and rewritten (exit 0)"
@@ -3094,7 +3108,7 @@ fi
 
 # 4. --no-profile writes nothing.
 rm -rf "$APROF_XDG"
-env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt --no-profile -19 -T 1 --cpu-only -k -f \
+env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --no-profile --cpu-only -k -f \
   "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
 [[ ! -e "$APROF" ]] && pass "--no-profile writes nothing" || fail "--no-profile writes nothing"
 
@@ -3117,7 +3131,7 @@ fi
 # 7. An unwritable cache dir is benign (exit 0, no crash).
 mkdir -p "$APROF_XDG/gzstd"
 chmod 555 "$APROF_XDG/gzstd"
-env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -19 -T 1 --cpu-only -k -f \
+env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --cpu-only -k -f \
   "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
 rc=$?
 chmod 755 "$APROF_XDG/gzstd"
@@ -3125,7 +3139,7 @@ chmod 755 "$APROF_XDG/gzstd"
 
 # 8. --calibrate: measures, prints the table, records both directions.
 rm -rf "$APROF_XDG"
-env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --calibrate 2>"$TMPDIR/aprof-cal.err"
+env XDG_CACHE_HOME="$APROF_XDG" $ACB "$GZSTD" --calibrate 2>"$TMPDIR/aprof-cal.err"
 rc=$?
 if [[ $rc -eq 0 ]] && grep -q "cpu compress" "$TMPDIR/aprof-cal.err" \
    && grep -q '"compress"' "$APROF" && grep -q '"decompress"' "$APROF"; then
@@ -3136,7 +3150,7 @@ fi
 
 # 9. --calibrate --no-profile measures only.
 rm -rf "$APROF_XDG"
-env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --calibrate --no-profile 2>/dev/null
+env XDG_CACHE_HOME="$APROF_XDG" $ACB "$GZSTD" --calibrate --no-profile 2>/dev/null
 rc=$?
 [[ $rc -eq 0 && ! -e "$APROF" ]] && pass "--calibrate --no-profile records nothing" \
   || fail "--calibrate --no-profile records nothing" "rc=$rc"
@@ -3145,7 +3159,7 @@ rc=$?
 # the sink target is created and REMOVED, so a pre-existing file must never
 # be accepted (a user may read "-o FILE" as "write the report to FILE").
 echo "precious" > "$TMPDIR/aprof-precious.txt"
-env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --calibrate --no-profile \
+env XDG_CACHE_HOME="$APROF_XDG" $ACB "$GZSTD" --calibrate --no-profile \
   -o "$TMPDIR/aprof-precious.txt" 2>/dev/null
 rc=$?
 if [[ $rc -eq 2 ]] && [[ "$(cat "$TMPDIR/aprof-precious.txt")" == "precious" ]]; then

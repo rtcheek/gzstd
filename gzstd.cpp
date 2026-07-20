@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.12";
+static constexpr const char * GZSTD_VERSION = "0.15.13";
 //
 // Architecture overview:
 //
@@ -3117,9 +3117,27 @@ static AdaptPriors adapt_load_priors()
   return P;
 }
 
+// Minimum wall time for a run to qualify for a profile save.  3 s by default so
+// a trivial run never pollutes the per-machine profile with noisy rates.
+// GZSTD_DEBUG_ADAPT_SAVE_MIN_MS overrides it (test hook only): the persistence
+// tests then use fast sub-second runs instead of slow level-19 single-thread
+// ones.  Read once; never consulted in a normal (non-test) process.
+static uint64_t adapt_save_min_ns()
+{
+  static const uint64_t v = [] () -> uint64_t {
+    if (const char * e = std::getenv("GZSTD_DEBUG_ADAPT_SAVE_MIN_MS")) {
+      char * end = nullptr;
+      long ms = std::strtol(e, &end, 10);
+      if (end != e && ms >= 0) return (uint64_t)ms * 1000ull * 1000ull;
+    }
+    return 3ull * 1000 * 1000 * 1000;
+  }();
+  return v;
+}
+
 // Load -> merge -> atomically replace.  Called once per process, only when
-// the run qualifies (exit 0, --adapt, not --no-profile, wall >= 3 s or a
-// fault to count).  Never fatal.
+// the run qualifies (exit 0, --adapt, not --no-profile, wall >= the save
+// minimum or a fault to count).  Never fatal.
 static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
 {
   const std::string path = adapt_profile_path();
@@ -18954,6 +18972,15 @@ static int run_calibrate(Options opt)
     size_t eighth = (size_t)pages * (size_t)psz / 8;
     if (corpus_sz > eighth) corpus_sz = std::max((size_t)(64ull << 20), eighth);
   }
+  // Test hook only: shrink the corpus so the calibrate-behavior tests (records
+  // both directions, refuses -o existing, etc.) run in a fraction of a second
+  // instead of ~25 s.  The measured rates are meaningless at this size — the
+  // tests assert behavior, not accuracy — so never set this in a real run.
+  if (const char * e = std::getenv("GZSTD_DEBUG_CALIBRATE_BYTES")) {
+    char * end = nullptr;
+    unsigned long long v = std::strtoull(e, &end, 10);
+    if (end != e && v >= (1ull << 20)) corpus_sz = (size_t)v;   // floor 1 MiB
+  }
   std::fprintf(stderr, "[CALIBRATE] generating %.1f GiB corpus (half text-like, half random)...\n",
                corpus_sz / GiB);
   std::string corpus(corpus_sz, '\0');
@@ -19343,7 +19370,7 @@ int main(int argc, char ** argv)
       // comparable with plain-decompress reads, so keep it out of the
       // path_<p>_gibs keys the read-path prior compares (review v0.15.7).
       obs.src_path.clear();
-      if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= 3ull * 1000 * 1000 * 1000) {
+      if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= adapt_save_min_ns()) {
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
         obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
@@ -19373,7 +19400,7 @@ int main(int argc, char ** argv)
       // comparable with plain-decompress reads, so keep it out of the
       // path_<p>_gibs keys the read-path prior compares (review v0.15.7).
       obs.src_path.clear();
-      if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= 3ull * 1000 * 1000 * 1000) {
+      if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= adapt_save_min_ns()) {
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
         obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
@@ -20216,7 +20243,7 @@ int main(int argc, char ** argv)
   // run qualifies (exit 0); sub-3 s runs measured nothing worth keeping
   // unless there is a fault to count.
   if (opt.adapt && !opt.no_profile && exit_code == EXIT_OK
-      && (adapt_obs.wall_ns >= 3ull * 1000 * 1000 * 1000 || adapt_obs.fault)) {
+      && (adapt_obs.wall_ns >= adapt_save_min_ns() || adapt_obs.fault)) {
     adapt_obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
