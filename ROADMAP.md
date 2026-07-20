@@ -218,19 +218,27 @@ Both slot into the existing profile grammar (EMA or latest-wins discrete,
 driver-quarantine only for the GPU one) and the established review gates.
 
 ### 2.5 `--adapt` × `--tar` Integration (proposed 2026-07-17)
-**Priority: Medium | Complexity: Medium | Status: NOT STARTED — the tar paths are the governor's blind spots**
+**Priority: Medium | Complexity: Medium | Status: IN PROGRESS — #1 (extract sink signal) DONE v0.15.11; the rest are the governor's remaining blind spots**
 
 The v0.15.x governor runs on `--tar` operations but several of its senses
 and levers don't reach the tar-specific machinery (each was an explicit,
 documented deferral during M4):
 
-- **Extract sink is invisible (the big one):** `-d --tar`'s parallel
-  file-writer pool keeps its own busy counters, not `Meter::writer_disk_ns`,
-  so SINK_BOUND never classifies on extract — the governor only sees the
-  source/compute split there. Wire the extract pool's busy/starved time
-  into the Meter (or a parallel tap), then the sink-side actions apply;
-  the plan's Layer 2 explicitly names the extract writer-pool SIZE as
-  governable the same way (`--write-threads` today, static).
+- **Extract sink is invisible (the big one): DONE v0.15.11 — signal only.**
+  `-d --tar`'s parallel file-writer pool now feeds the governor its busy/
+  starved time via separate Meter fields (`extract_busy_ns`/`extract_starved_ns`
+  /`writer_pool_threads`), flushed live in coarse ~50 ms deltas (the pool's own
+  atomics still flush once-at-exit for the `-v` line), so `SINK_BOUND` finally
+  classifies on extract. Two subtleties the original framing missed: the
+  counters were `-v`-gated (now `verbose || adapt`) and flushed once-at-exit
+  (wrong shape for a 100 ms delta tick). The classifier takes
+  `max(disk-term, extract-term/writer_pool_threads)`. The writer-probe (action
+  5b) had to be **gated off extract** (`is_extract_`): its actuator is the plain
+  DirectWriter's second drain thread, absent on extract, so it would misreport a
+  phantom action and persist a bogus verdict. **Still future work: the ACTUATOR**
+  — the plan's Layer 2 names the extract writer-pool SIZE (`--write-threads`
+  today, static) as governable the same way; SINK_BOUND on extract is currently
+  classify-and-report only, driving no lever yet.
 - **Tar-create member-reader scale-up:** the v0.15.5 dormant-reader
   mechanism covers only the plain-decompress prefetch pool; the tar-create
   member readers (`--read-threads`, device-bound per the v0.14.x

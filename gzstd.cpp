@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.10";
+static constexpr const char * GZSTD_VERSION = "0.15.11";
 //
 // Architecture overview:
 //
@@ -1916,6 +1916,18 @@ struct Meter {
   std::atomic< uint64_t > writer_hol_ns     { 0 }; // head-of-line: waiting while later frames sit buffered
   std::atomic< uint64_t > writer_hol_depth_ns { 0 }; // ∑ wait_ns × frames buffered behind the gap (ns·frames)
   std::atomic< uint64_t > writer_starved_ns { 0 }; // waiting with nothing buffered
+  // Extract writer-pool sink accounting (-d --tar).  The parallel file-writer
+  // pool keeps its OWN busy/starved time: writer_disk_ns above stays ~0 on
+  // extract (the untar pool doesn't go through write_sparse), so it can't tell
+  // the --adapt governor that the output device is the ceiling.  These are
+  // flushed LIVE in coarse deltas (not once-at-exit like the -v-only pool
+  // atomics inside Extractor), so the governor's windowed tick can classify
+  // SINK_BOUND on extract.  busy/starved sum across writer_pool_threads worker
+  // threads, so the governor divides by that count.  Plain paths leave these at
+  // 0 / 1 (single AsyncWritePool writer uses writer_disk_ns instead).
+  std::atomic< uint64_t > extract_busy_ns    { 0 };
+  std::atomic< uint64_t > extract_starved_ns { 0 };
+  std::atomic< int >      writer_pool_threads { 1 };
   // Reader-state accounting, mirror of the writer's.  io = inside fread/pread;
   // parse = finding frame boundaries (decompress only — ZSTD_findFrameCompressedSize
   // / getFrameContentSize; zero for compress, which slices at fixed offsets);
@@ -1938,6 +1950,7 @@ struct Meter {
     total_out = 0; total_out_final = false; read_elapsed_ms = 0;
     writer_disk_ns = 0; writer_iowrite_ns = 0; writer_hol_ns = 0;
     writer_hol_depth_ns = 0; writer_starved_ns = 0;
+    extract_busy_ns = 0; extract_starved_ns = 0; writer_pool_threads = 1;
     reader_io_ns = 0; reader_parse_ns = 0; reader_copy_ns = 0;
     reader_blocked_ns = 0; reader_threads = 1;
     t0 = std::chrono::steady_clock::now();
@@ -2124,6 +2137,14 @@ class AdaptGovernor {
 public:
   AdaptGovernor(const Options & opt, const Meter * m) : opt_(opt), m_(m)
   {
+    // -d --tar extract: SINK_BOUND now classifies here (the writer-pool sink
+    // feed), but the writer-probe actuator is the plain DirectWriter's second
+    // drain thread — the extract writer pool doesn't consume g_adapt_writer_probe.
+    // So the probe controller must NOT run on extract, or it would "measure" a
+    // phantom action (wrote_bytes variance) and persist a bogus verdict.  The
+    // extract-side lever (governing --write-threads) is future work; until it
+    // lands, extract SINK_BOUND is classify-and-report only.
+    is_extract_ = opt_.tar_mode && opt_.mode == Mode::DECOMPRESS;
     // Test hook: force the classifier's verdict from the first tick (and
     // skip the ramp), so suite runs of any length exercise the acting
     // paths deterministically.  Same family as GZSTD_DEBUG_GPU_CORRUPT.
@@ -2161,8 +2182,10 @@ public:
       if (forced_ == AdaptRegime::SINK_BOUND) {
         g_adapt_sink_grow_tick.store(true, std::memory_order_relaxed);
         // The forced hook also raises the writer probe (asserting its
-        // SINK_BOUND gate) so short suite runs exercise the dual drain.
-        if (g_adapt_writer_probe_allowed.load(std::memory_order_relaxed))
+        // SINK_BOUND gate) so short suite runs exercise the dual drain — but
+        // NOT on -d --tar extract, which has no probe actuator (see is_extract_).
+        if (!is_extract_
+            && g_adapt_writer_probe_allowed.load(std::memory_order_relaxed))
           g_adapt_writer_probe.store(1, std::memory_order_relaxed);
       }
     }
@@ -2246,7 +2269,8 @@ private:
 
   struct Snap {
     uint64_t wdisk = 0, wstarv = 0, wbytes = 0,
-             rio = 0, rparse = 0, rcopy = 0, rblocked = 0;
+             rio = 0, rparse = 0, rcopy = 0, rblocked = 0,
+             ebusy = 0;   // -d --tar writer-pool busy (sums across writer_pool_threads)
   };
 
   int64_t now_ns_() const
@@ -2260,6 +2284,7 @@ private:
     s.wdisk    = m_->writer_disk_ns.load(std::memory_order_relaxed);
     s.wstarv   = m_->writer_starved_ns.load(std::memory_order_relaxed);
     s.wbytes   = m_->wrote_bytes.load(std::memory_order_relaxed);
+    s.ebusy    = m_->extract_busy_ns.load(std::memory_order_relaxed);
     s.rio      = m_->reader_io_ns.load(std::memory_order_relaxed);
     s.rparse   = m_->reader_parse_ns.load(std::memory_order_relaxed);
     s.rcopy    = m_->reader_copy_ns.load(std::memory_order_relaxed);
@@ -2345,7 +2370,15 @@ private:
     } else if (t < int64_t(RAMP_SEC * 1e9)) {
       observed = AdaptRegime::WARMUP;
     } else {
-      const double sink_busy = double(cur.wdisk - prev_.wdisk) / dt;
+      // Sink busy fraction.  Two mutually-exclusive sources, whichever is live:
+      //   * plain compress/decompress: the single AsyncWritePool writer's
+      //     writer_disk_ns (one thread, no divisor).
+      //   * -d --tar: the parallel file-writer pool's extract_busy_ns, which
+      //     sums across writer_pool_threads workers, so per-thread-average it.
+      //     writer_disk_ns stays ~0 on extract, so max() just picks this term.
+      const int    wthreads  = std::max(1, m_->writer_pool_threads.load(std::memory_order_relaxed));
+      const double sink_busy = std::max(double(cur.wdisk - prev_.wdisk) / dt,
+                                        double(cur.ebusy - prev_.ebusy) / (dt * wthreads));
       const int    rthreads  = std::max(1, m_->reader_threads.load(std::memory_order_relaxed));
       const double rbusy     = double((cur.rio - prev_.rio) + (cur.rparse - prev_.rparse)
                                       + (cur.rcopy - prev_.rcopy)) / (dt * rthreads);
@@ -2405,7 +2438,7 @@ private:
     // Try +1 drain thread when SINK_BOUND; judge by the sink byte rate over
     // a 4-tick window against the pre-probe tick: keep on >= 10% gain,
     // revert otherwise; at most 2 rounds per run; the verdict persists.
-    if (forced_ == AdaptRegime::WARMUP
+    if (forced_ == AdaptRegime::WARMUP && !is_extract_
         && g_adapt_writer_probe_allowed.load(std::memory_order_relaxed)) {
       const double wrate = double(cur.wbytes - prev_snapped_wbytes_) /
                            std::max(1.0, dt);
@@ -2494,6 +2527,7 @@ private:
   double  probe_rate_acc_ = 0.0;               // bytes/ns accumulator
   uint64_t prev_snapped_wbytes_ = 0;           // tick-thread only
   AdaptRegime forced_ = AdaptRegime::WARMUP;   // GZSTD_DEBUG_ADAPT_REGIME
+  bool        is_extract_ = false;             // -d --tar: gate off writer-probe (no actuator)
   AdaptRegime regime_ = AdaptRegime::WARMUP;
   AdaptRegime candidate_ = AdaptRegime::WARMUP;
   int     candidate_ticks_ = 0;
@@ -10979,6 +11013,13 @@ public:
   }
   int writer_threads() const { return n_writers_; }
 
+  // Live sink-timing feed for the --adapt governor.  DISTINCT from m_ (which is
+  // deliberately null on every extract construction to avoid double-counting
+  // bytes): this pointer carries ONLY the writer pool's busy/starved deltas into
+  // the operation Meter the governor watches, never byte counts.  null → no
+  // live flush (the -v-only pool atomics still accrue for the [WRITER] line).
+  void set_sink_meter(Meter * sm) { sink_meter_ = sm; }
+
   void run(int read_fd) {
     uint64_t t0 = now_ns();
     if (!read_only()) start_pool();
@@ -11508,6 +11549,7 @@ private:
   // add at exit, so the 16 writers never contend on a shared counter mid-run.
   int n_writers_ = 0;
   std::atomic<uint64_t> wpool_busy_ns_{0}, wpool_starved_ns_{0};
+  Meter * sink_meter_ = nullptr;   // live --adapt sink feed (set_sink_meter); NOT m_
 
   // Serial parse-thread phase timing for the -v [EXTRACT] line (all accumulated
   // on the one parse thread, so plain counters; harvested after join):
@@ -11537,6 +11579,9 @@ private:
                                    : std::min(resolve_cpu_threads(opt_.cpu_threads), 16);
     n = std::max(1, n);
     n_writers_ = n;
+    // Publish the pool size so the --adapt governor can per-thread-average the
+    // live extract_busy_ns deltas (busy sums across these n writers).
+    if (sink_meter_) sink_meter_->writer_pool_threads.store(n, std::memory_order_relaxed);
     // Enough queued part-jobs to keep every writer busy on large files (the
     // 256 MiB floor covers the many-small-files case).  This bounds pinned
     // frame memory: ~2 windows per writer + one frame per queued job.
@@ -11567,15 +11612,30 @@ private:
     q_.push_back(std::move(j));
     lk.unlock(); q_cv_cons_.notify_one();
   }
+  // Live sink feed cadence: push accrued busy/starved deltas to the Meter at
+  // most this often, so the --adapt governor's 100 ms tick sees a moving signal
+  // instead of one lump at exit — while keeping the per-thread atomic traffic to
+  // ~20/s (vs one add per job), preserving the original no-contention intent.
+  static constexpr uint64_t SINK_FLUSH_NS = 50ull * 1000 * 1000;   // 50 ms
   void writer_loop() {
-    // -v diagnosis: time job-waits (starved) and writes (busy) into thread-
-    // local counters, flushed once at exit so the pool never contends on a shared
-    // atomic.  measure off (no -v) → the now_ns() calls are skipped entirely.
-    const bool measure = opt_.verbosity >= V_VERBOSE;
-    uint64_t busy_ns = 0, starved_ns = 0;
+    // Time job-waits (starved) and writes (busy) into thread-local counters.
+    // Two consumers, both opt-in: the -v [WRITER] line (one atomic flush of the
+    // lifetime totals at exit) and the --adapt governor (coarse live deltas into
+    // sink_meter_).  measure off (neither -v nor --adapt) → the now_ns() calls
+    // are skipped entirely.
+    const bool measure = opt_.verbosity >= V_VERBOSE || opt_.adapt;
+    const bool live    = measure && sink_meter_;   // governor feed enabled
+    uint64_t busy_ns = 0, starved_ns = 0;                 // lifetime totals
+    uint64_t flushed_busy = 0, flushed_starved = 0;       // already pushed to sink_meter_
+    uint64_t last_flush = live ? now_ns() : 0;
     // Per-thread aligned bounce buffer for O_DIRECT large-file parts, allocated
     // lazily on the first direct part this thread writes.
     void * bounce = nullptr;
+    auto flush_live = [&](uint64_t nowt) {
+      sink_meter_->extract_busy_ns.fetch_add(busy_ns - flushed_busy, std::memory_order_relaxed);
+      sink_meter_->extract_starved_ns.fetch_add(starved_ns - flushed_starved, std::memory_order_relaxed);
+      flushed_busy = busy_ns; flushed_starved = starved_ns; last_flush = nowt;
+    };
     for (;;) {
       Job j;
       {
@@ -11595,13 +11655,18 @@ private:
       if (measure) {
         uint64_t t0 = now_ns();
         if (j.big) write_part(j, bounce); else write_small(j);
-        busy_ns += now_ns() - t0;
+        uint64_t nowt = now_ns();
+        busy_ns += nowt - t0;
+        // Coarse live flush for the governor once the cadence elapses (bounded
+        // by the write just completing, so at most ~SINK_FLUSH_NS stale).
+        if (live && nowt - last_flush >= SINK_FLUSH_NS) flush_live(nowt);
       } else {
         if (j.big) write_part(j, bounce); else write_small(j);
       }
     }
     if (bounce) ::free(bounce);
     if (measure) {
+      if (live) flush_live(now_ns());   // push the final residual delta
       wpool_busy_ns_.fetch_add(busy_ns, std::memory_order_relaxed);
       wpool_starved_ns_.fetch_add(starved_ns, std::memory_order_relaxed);
     }
@@ -17747,6 +17812,7 @@ static int extract_tar(const Options & opt, Meter * m)
             vlog(V_VERBOSE, opt, b);
           }
           tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
+          ex.set_sink_meter(m);   // live writer-pool sink timing → --adapt (not bytes)
           ex.run_parallel(in, pbounds, pst.c_off, pst.u_off, opt, m);
           if (opt.verbosity >= V_VERBOSE) {
             agg_wbusy_ns    += ex.writer_busy_ns();
@@ -17801,6 +17867,7 @@ static int extract_tar(const Options & opt, Meter * m)
     // stream it produces as wrote_bytes, and the Extractor writes that same
     // stream's file data to disk — counting both double-counts the output.
     tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
+    ex.set_sink_meter(m);   // live writer-pool sink timing → --adapt (not bytes)
     if (!members.empty()) ex.set_members(members, roots);
     std::thread exth([&] { ex.run_sink(&sink); });
 

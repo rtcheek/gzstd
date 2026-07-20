@@ -7,6 +7,19 @@
 
 ---
 
+## v0.15.11 — --adapt × --tar: the extract sink becomes visible to the governor (ROADMAP 2.5 #1)
+
+**The `-d --tar` writer pool now feeds the governor its busy/starved time, so `SINK_BOUND` classifies on extract — previously structurally impossible.** The parallel file-writer pool kept its own busy counters (`wpool_busy_ns_`), never `Meter::writer_disk_ns`, so the classifier's sink term read ~0 on the one path we've long measured as device-write-bound; the governor only ever saw the source/compute split there. Two problems had to be fixed, not one — the ROADMAP framing ("wire the existing counters into the Meter") under-described it:
+
+1. **Gating:** the pool timing was accumulated only under `-v` (`measure = verbosity >= V_VERBOSE`), so `--adapt` without `-v` saw nothing. Now `measure = verbose || adapt`.
+2. **Shape:** the pool flushed its counters *once at thread exit* (a deliberate anti-contention choice — 16 writers must not fetch_add per job). A governor that ticks every 100 ms on deltas would read zero all run, then everything at once. Fixed with a coarse ~50 ms live flush of thread-local deltas into a *separate* set of Meter fields (`extract_busy_ns`/`extract_starved_ns`/`writer_pool_threads`), bounding atomic traffic to ~20/s/thread — the no-contention intent preserved. The fields are deliberately kept distinct from `writer_disk_ns` (whose `-v` `[WRITER]` line and the auto-tuner's sink-freeze read it with their own semantics; reuse would have silently collided). Feed is via a dedicated `Extractor::sink_meter_` pointer, separate from the deliberately-null `m_` (which stays null to avoid double-counting bytes) — it carries only sink timing, never bytes. The classifier takes `max(disk-term, extract-term / writer_pool_threads)`, the divisor because pool busy sums across N writers.
+
+**A gate the change made necessary:** unlocking `SINK_BOUND` on extract also unlocked the writer-parallelism probe (M4 action 5b) on a path with **no actuator** — the probe's only consumer is the plain `DirectWriter`'s second drain thread; the extract pool doesn't read `g_adapt_writer_probe`. Left ungated it "measured" a phantom action (wrote_bytes variance over its 4-tick window), reported a false `+64%` KEPT, set `ADAPT_ACT_WRITER_PROBE`, and would have **persisted a bogus `writer_par` verdict** to the profile. Gated off extract (`is_extract_`), both the real-tick controller and the forced-hook raise. Action 4 (throttle-grow) was already naturally inert on extract (its `last_sink_bursty_` reads `writer_disk_ns`/`writer_starved_ns`, both ~0 there). So extract `SINK_BOUND` is now **classify-and-report only**; the extract-side actuator (governing `--write-threads`) remains future work.
+
+Verified live on the 256-core box: a write-bound extract (43 GiB compressible, 95:1) classifies `warmup -> sink-bound` (75% share, writer 92.6% busy) with `actions: none`; a genuinely upstream-bound cold extract (incompressible, writer 15.5% busy) correctly stays `compute-bound` — the signal isn't blindly flipping to sink.
+
+Suite: 358 normal (1 new: forced sink-bound on `-d --tar` classifies, round-trips exact, and shows no writer probe — the `is_extract_` gate).
+
 ## v0.15.10 — M5 close-out: docs, ROADMAP reconciliation, extensive suite, A/B
 
 **Docs:** the `--adapt` help no longer claims observe-only — it describes the shipped actions (latches, ranked dispatch, probes, deadlines) and the always-wins rule for explicit flags; CLAUDE.md gains `AdaptGovernor` in the key-classes table plus the profile path and the three deterministic test hooks. **ROADMAP reconciled:** 1.3 (rate-matched dispatch), 2.1–2.3 (profile/calibrate/auto-update), 3.1–3.2 (pipe-aware/unknown-size scheduling) marked SUBSUMED by their v0.15.x replacements; 1.11's premise narrowed by the residency default; 4.2 re-opened per-machine by the writer probe.

@@ -3057,7 +3057,10 @@ APROF_XDG="$TMPDIR/xdg-cache"
 APROF="$APROF_XDG/gzstd/profile.json"
 APROF_SRC="$TMPDIR/aprof-src.txt"
 if [[ ! -f "$APROF_SRC" ]]; then
-  for i in $(seq 1 400000); do echo "session=$i commit delta backup index worker $((i*7919))"; done > "$APROF_SRC"
+  # seq|awk generates the identical bytes ~13x faster than a 400k-iteration
+  # bash echo loop (1.9s -> 0.14s measured); the content, not the method, is
+  # what needs to stay a clean >=3 s compressible run.
+  seq 1 400000 | awk '{print "session="$1" commit delta backup index worker "($1*7919)}' > "$APROF_SRC"
 fi
 rm -rf "$APROF_XDG"
 
@@ -3624,6 +3627,45 @@ fi
 
 rm -f "$TMPDIR/awp.zst" "$TMPDIR/awp.out" "$TMPDIR/awp1.err" \
       "$TMPDIR/awp2.err" "$TMPDIR/awp3.err" "$TMPDIR/awp-fp.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt × --tar extract: sink classifies, probe stays gated"
+
+# The extract writer pool now feeds the governor its busy/starved time, so
+# SINK_BOUND classifies on -d --tar (previously structurally invisible: the pool
+# tracked its own time, never Meter::writer_disk_ns).  BUT the writer-probe
+# actuator is the plain DirectWriter's second drain thread, which the extract
+# pool does not consume — so the probe must NOT engage on extract, forced or
+# real, else it would "measure" a phantom action (wrote_bytes variance) and
+# persist a bogus writer_par verdict.  Forced sink-bound is the deterministic
+# assertion of that gate: the summary classifies sink-bound yet shows no probe.
+if ! command -v tar >/dev/null 2>&1; then
+  skip "--adapt × --tar extract probe gate" "tar not available"
+else
+  AXS="$TMPDIR/axsrc"; rm -rf "$AXS"; mkdir -p "$AXS/d"
+  echo "adapt tar payload" > "$AXS/d/f1.txt"
+  head -c 24000000 /dev/urandom > "$AXS/d/big.bin"    # >4 MiB → writer-pool part path
+  AXARC="$TMPDIR/ax.tar.zst"; AXOUT="$TMPDIR/axout"
+  "$GZSTD" --cpu-only -q -f -o "$AXARC" --tar "$AXS" 2>/dev/null
+  rm -rf "$AXOUT"; mkdir -p "$AXOUT"
+
+  # Forced sink-bound extract: succeeds, round-trips, the summary classifies
+  # sink-bound (proves the signal reached the classifier AND the summary
+  # printed), and shows NO writer-probe engagement (the is_extract_ gate).
+  env GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" -d --adapt --no-profile \
+    -v --cpu-only --tar -C "$AXOUT" "$AXARC" 2>"$TMPDIR/axt.err"; axrc=$?
+  if [[ $axrc -eq 0 ]] \
+     && diff -r --no-dereference "$AXS" "$AXOUT$AXS" >/dev/null 2>&1 \
+     && grep -q 'sink-bound' "$TMPDIR/axt.err" \
+     && ! grep -qE 'writer-(drain2|probe)' "$TMPDIR/axt.err"; then
+    pass "extract under forced sink-bound: classifies, no writer probe, round-trip exact"
+  else
+    fail "extract under forced sink-bound: classifies, no writer probe, round-trip exact" \
+         "rc=$axrc, tree/classify/probe mismatch"
+  fi
+
+  rm -rf "$AXS" "$AXOUT"; rm -f "$AXARC" "$TMPDIR/axt.err"
+fi
 
 # ────────────────────────────────────────────────────────────
 section "--adapt GPU deadline demote + escalate (fault injection)"
