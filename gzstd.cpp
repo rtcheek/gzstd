@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.11";
+static constexpr const char * GZSTD_VERSION = "0.15.12";
 //
 // Architecture overview:
 //
@@ -2044,6 +2044,7 @@ static constexpr uint32_t    ADAPT_ACT_DEVICE_QUIESCE = 1u << 1;
 static constexpr uint32_t    ADAPT_ACT_READER_SCALEUP = 1u << 2;
 static constexpr uint32_t    ADAPT_ACT_SINK_GROW      = 1u << 3;
 static constexpr uint32_t    ADAPT_ACT_WRITER_PROBE   = 1u << 4;
+static constexpr uint32_t    ADAPT_ACT_EWRITER_GROW   = 1u << 5;  // -d --tar pool grow
 static std::atomic<uint32_t> g_adapt_action_flags{0};
 
 // Writer-parallelism probe (M4 action 5b).  The governor raises the probe
@@ -2056,6 +2057,34 @@ static std::atomic<int> g_adapt_writer_probe{0};          // 1 = second drain en
 static std::atomic<int> g_adapt_writer_probe_verdict{0};  // +1 kept / -1 reverted
 static std::atomic<int> g_adapt_writer_probe_allowed{1};  // 0 = profile said negative
 static std::atomic<bool> g_adapt_writer_probe_engaged{false};  // wt2 spawned this op
+
+// Extract writer-pool grow actuator (ROADMAP 2.5 #1 actuator; the -d --tar twin
+// of the DirectWriter writer probe above).  On SINK_BOUND extract the governor
+// raises g_adapt_ewgrow_target (extra writers wanted on the shared Extractor job
+// queue); the Extractor's supervisor thread — woken via g_adapt_ewgrow_cv, the
+// ONLY governor->pool channel (a global CV, never a pointer; per CLAUDE.md the
+// governor drives published globals only) — spawns/reaps that many extra writer
+// threads.  Kept on a measured >=10% sink-rate gain, reverted otherwise; the
+// settled pool size persists as decompress.tar_write_threads and seeds the next
+// run's pool.  A run is EITHER plain (writer probe) or extract (this), never
+// both, so the governor's probe state machine is shared between them.
+static std::atomic<int>  g_adapt_ewgrow_target{0};    // extra writers wanted (0..cap)
+static std::atomic<int>  g_adapt_ewgrow_allowed{1};   // 0 = profile converged, don't probe
+static std::atomic<int>  g_adapt_ewgrow_settled{0};   // pool size to persist (0 = untried)
+static std::atomic<int>  g_adapt_ewgrow_converged{0}; // 1 = reverted w/ no gain (persist -> allowed=0 next run)
+static std::atomic<bool> g_adapt_ewgrow_engaged{false};
+static std::atomic<int>  g_adapt_ewgrow_prior_base{0}; // profile-seeded start pool size (0 = none)
+static std::mutex              g_adapt_ewgrow_mtx;     // guards the target->supervisor wake
+static std::condition_variable g_adapt_ewgrow_cv;
+
+// Publish a new extra-writer target and wake the Extractor supervisor.  The
+// governor's only reach into the pool: a global CV notify, no worker pointer.
+static void adapt_set_ewgrow(int target)
+{
+  { std::lock_guard<std::mutex> lk(g_adapt_ewgrow_mtx);
+    g_adapt_ewgrow_target.store(target, std::memory_order_relaxed); }
+  g_adapt_ewgrow_cv.notify_all();
+}
 
 // GPU deadline demote + escalate (M4 action 6).  The workers publish each
 // device's OLDEST in-flight batch submit time and an EMA batch duration;
@@ -2166,6 +2195,10 @@ public:
     g_adapt_writer_probe.store(0, std::memory_order_relaxed);
     g_adapt_writer_probe_verdict.store(0, std::memory_order_relaxed);
     g_adapt_writer_probe_engaged.store(false, std::memory_order_relaxed);
+    g_adapt_ewgrow_target.store(0, std::memory_order_relaxed);
+    g_adapt_ewgrow_settled.store(0, std::memory_order_relaxed);
+    g_adapt_ewgrow_converged.store(0, std::memory_order_relaxed);
+    g_adapt_ewgrow_engaged.store(false, std::memory_order_relaxed);
     for (int i = 0; i < ADAPT_DL_MAX; ++i) {
       g_adapt_dev_front_ns[i].store(0, std::memory_order_relaxed);
       g_adapt_dev_batch_ema_ns[i].store(0, std::memory_order_relaxed);
@@ -2181,12 +2214,17 @@ public:
       if (forced_ == AdaptRegime::SOURCE_BOUND) adapt_request_reader_scaleup();
       if (forced_ == AdaptRegime::SINK_BOUND) {
         g_adapt_sink_grow_tick.store(true, std::memory_order_relaxed);
-        // The forced hook also raises the writer probe (asserting its
-        // SINK_BOUND gate) so short suite runs exercise the dual drain — but
-        // NOT on -d --tar extract, which has no probe actuator (see is_extract_).
-        if (!is_extract_
-            && g_adapt_writer_probe_allowed.load(std::memory_order_relaxed))
+        // The forced hook also raises the SINK_BOUND writer actuator so short
+        // suite runs exercise it: on plain output the DirectWriter's second
+        // drain (writer probe); on -d --tar extract the writer-pool grow (a
+        // small fixed target — base is unknown until start_pool runs).  Each
+        // gated by its own allowed latch.
+        if (is_extract_) {
+          if (g_adapt_ewgrow_allowed.load(std::memory_order_relaxed))
+            adapt_set_ewgrow(4);
+        } else if (g_adapt_writer_probe_allowed.load(std::memory_order_relaxed)) {
           g_adapt_writer_probe.store(1, std::memory_order_relaxed);
+        }
       }
     }
     thr_ = std::thread(&AdaptGovernor::tick_loop_, this);
@@ -2255,6 +2293,9 @@ public:
     if (acts & ADAPT_ACT_WRITER_PROBE)    os << " writer-probe(kept)";
     if (g_adapt_writer_probe_engaged.load(std::memory_order_relaxed)
         && !(acts & ADAPT_ACT_WRITER_PROBE)) os << " writer-drain2(probed)";
+    if (acts & ADAPT_ACT_EWRITER_GROW)    os << " extract-writers(kept)";
+    if (g_adapt_ewgrow_engaged.load(std::memory_order_relaxed)
+        && !(acts & ADAPT_ACT_EWRITER_GROW)) os << " extract-writers(probed)";
     os << "\n";
     vlog(V_VERBOSE, opt_, os.str());
   }
@@ -2484,6 +2525,76 @@ private:
         probe_phase_ = 1;
       }
     }
+
+    // M4 action 5c: extract writer-POOL grow probe (SINK_BOUND -d --tar).  The
+    // same try/measure/keep-or-revert as 5b (shared phase members — a run is
+    // plain OR extract, never both), but the actuator is +step writer threads
+    // on the shared Extractor queue (supervisor-spawned via adapt_set_ewgrow),
+    // and the kept POOL SIZE persists.  Step = half the base pool, so the probe
+    // is a meaningful jump (a 16-pool +1 would never clear the 10% bar), not the
+    // plain probe's 1->2.  Keep re-opens phase 0 to try growing further; a
+    // revert converges (persist, latch off next run).
+    if (forced_ == AdaptRegime::WARMUP && is_extract_
+        && g_adapt_ewgrow_allowed.load(std::memory_order_relaxed)) {
+      const double wrate = double(cur.wbytes - prev_snapped_wbytes_) /
+                           std::max(1.0, dt);
+      prev_snapped_wbytes_ = cur.wbytes;
+      // Smoothed baseline: a +50% pool step is a smaller relative signal than
+      // the plain probe's 1->2, so a single-tick pre-rate (a transient lull like
+      // a large-file boundary or fsync) can drown it and force a false keep.
+      // The EMA is the reference the round-start snapshots instead.
+      wrate_ema_ = (wrate_ema_ <= 0.0) ? wrate : (wrate_ema_ * 0.6 + wrate * 0.4);
+      if (probe_phase_ == 1) {
+        probe_rate_acc_ += wrate;
+        if (++probe_ticks_ >= 4) {
+          const double post = probe_rate_acc_ / probe_ticks_;
+          const bool keep = post >= probe_pre_rate_ * 1.10;
+          char pl[192];
+          if (keep) {
+            g_adapt_ewgrow_settled.store(ewgrow_base_ + ewgrow_extra_,
+                                         std::memory_order_relaxed);
+            g_adapt_action_flags.fetch_or(ADAPT_ACT_EWRITER_GROW,
+                                          std::memory_order_relaxed);
+            std::snprintf(pl, sizeof(pl),
+              "[ADAPT] extract writer probe KEPT: sink %.2f -> %.2f GiB/s "
+              "(pool %d -> %d writers)\n", probe_pre_rate_ * 1e9 / 1073741824.0,
+              post * 1e9 / 1073741824.0, ewgrow_base_, ewgrow_base_ + ewgrow_extra_);
+            probe_phase_ = 0;   // kept — may probe another round (rounds capped)
+          } else {
+            ewgrow_extra_ = std::max(0, ewgrow_extra_ - ewgrow_step_);
+            adapt_set_ewgrow(ewgrow_extra_);   // reap the extras that didn't pay
+            g_adapt_ewgrow_converged.store(1, std::memory_order_relaxed);
+            // Persist the best kept size (base if the very first round reverted).
+            g_adapt_ewgrow_settled.store(ewgrow_base_ + ewgrow_extra_,
+                                         std::memory_order_relaxed);
+            probe_phase_ = 3;   // converged; no more rounds this run
+            std::snprintf(pl, sizeof(pl),
+              "[ADAPT] extract writer probe reverted: sink %.2f -> %.2f GiB/s "
+              "(< +10%%, pool stays %d)\n", probe_pre_rate_ * 1e9 / 1073741824.0,
+              post * 1e9 / 1073741824.0, ewgrow_base_ + ewgrow_extra_);
+          }
+          vlog(V_VERBOSE, opt_, pl);
+        }
+      } else if (probe_phase_ == 0 && regime_ == AdaptRegime::SINK_BOUND
+                 && probe_rounds_ < 2 && wrate > 0) {
+        if (ewgrow_base_ == 0)
+          ewgrow_base_ = std::max(1,
+              m_->writer_pool_threads.load(std::memory_order_relaxed));
+        ewgrow_step_ = std::max(1, ewgrow_base_ / 2);
+        probe_pre_rate_ = wrate_ema_ > 0.0 ? wrate_ema_ : wrate;  // smoothed baseline
+        probe_rate_acc_ = 0.0;
+        probe_ticks_ = 0;
+        ++probe_rounds_;
+        ewgrow_extra_ += ewgrow_step_;
+        adapt_set_ewgrow(ewgrow_extra_);
+        char pl[128];
+        std::snprintf(pl, sizeof(pl),
+          "[ADAPT] sink-bound: probing +%d extract writers (round %d, pool %d -> %d)\n",
+          ewgrow_step_, probe_rounds_, ewgrow_base_, ewgrow_base_ + ewgrow_extra_);
+        vlog(V_VERBOSE, opt_, pl);
+        probe_phase_ = 1;
+      }
+    }
   }
 
   void transition_(AdaptRegime to, int64_t t)
@@ -2520,8 +2631,12 @@ private:
   int64_t prev_ns_ = 0;
   double  last_io_frac_ = 0.0;                 // tick-thread only
   bool    last_sink_bursty_ = false;           // tick-thread only
-  int     probe_phase_ = 0;                    // 0 idle / 1 running / 2 kept
+  int     probe_phase_ = 0;                    // 0 idle / 1 running / 2 kept / 3 converged
   int     probe_rounds_ = 0;                   // tick-thread only
+  int     ewgrow_base_ = 0;                    // extract: base pool size at first probe
+  int     ewgrow_extra_ = 0;                   // extract: extra writers currently requested
+  int     ewgrow_step_ = 0;                    // extract: per-round grow step
+  double  wrate_ema_ = 0.0;                    // extract: smoothed write rate (robust probe baseline)
   int     probe_ticks_ = 0;                    // tick-thread only
   double  probe_pre_rate_ = 0.0;               // bytes/ns
   double  probe_rate_acc_ = 0.0;               // bytes/ns accumulator
@@ -2868,6 +2983,8 @@ struct AdaptObs {
   std::string regime = "unclassified";           // governor's dominant regime, last file
   std::string src_path;                          // read path that engaged ("" = untapped)
   int writer_par = 0;                            // writer probe verdict (+1/-1, 0 = untried)
+  int tar_write_threads = 0;                     // -d --tar: settled pool size (0 = untried)
+  bool tar_wt_converged = false;                 // -d --tar: probe found no further gain
   bool fault = false;                            // a GPU fault/rebuild happened this process
 
   void add_meter(const Meter & m, uint64_t wall, bool compress_dir)
@@ -2876,6 +2993,10 @@ struct AdaptObs {
       src_path = p;
     if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
       writer_par = wp;
+    if (int ws = g_adapt_ewgrow_settled.load(std::memory_order_relaxed))
+      tar_write_threads = ws;
+    if (g_adapt_ewgrow_converged.load(std::memory_order_relaxed))
+      tar_wt_converged = true;
     payload_bytes += compress_dir ? m.read_bytes.load() : m.wrote_bytes.load();
     wall_ns += wall;
     reader_bytes += m.read_bytes.load();
@@ -2925,6 +3046,14 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
   // negative and vice versa.
   if (obs.writer_par != 0)
     dir.put_num("writer_par", (double)obs.writer_par);
+  // Extract writer-pool grow verdict (M4 action 5c): the settled pool size
+  // (discrete latest-wins, seeds the next run's start) and a converged flag
+  // (the probe found no further gain — latch off next run's probing).  Latest-
+  // wins, so faster/slower hardware can move both.
+  if (obs.tar_write_threads > 0) {
+    dir.put_num("tar_write_threads", (double)obs.tar_write_threads);
+    dir.put_num("tar_wt_converged", obs.tar_wt_converged ? 1 : 0);
+  }
   if (!obs.src_path.empty()) {
     dir.put_str("src_path", obs.src_path);
     if (wall_s > 0 && obs.payload_bytes > 0)
@@ -2947,6 +3076,8 @@ struct AdaptPriors {
     double overall_gibs = 0, settled_batch = 0, runs = 0;
     double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates
     double writer_par = 0;                                  // probe verdict
+    double tar_write_threads = 0;                           // -d --tar settled pool size
+    double tar_wt_converged = 0;                            // -d --tar probe converged
     std::string regime;
   } dir[2];                 // [0] = compress, [1] = decompress
 };
@@ -2980,6 +3111,8 @@ static AdaptPriors adapt_load_priors()
     D.path_pread    = dj->gnum("path_pread_gibs", 0);
     D.path_direct   = dj->gnum("path_direct_gibs", 0);
     D.writer_par    = dj->gnum("writer_par", 0);
+    D.tar_write_threads = dj->gnum("tar_write_threads", 0);
+    D.tar_wt_converged  = dj->gnum("tar_wt_converged", 0);
   }
   return P;
 }
@@ -11011,7 +11144,11 @@ public:
   uint64_t writer_starved_ns() const {
     return wpool_starved_ns_.load(std::memory_order_relaxed);
   }
-  int writer_threads() const { return n_writers_; }
+  // Peak concurrent writer threads (base + the most probe-extras active at
+  // once), so the -v [WRITER] per-thread average divides by what actually ran —
+  // wpool_busy_ns_ sums across the extras too, so dividing by n_writers_ alone
+  // reads >100%.
+  int writer_threads() const { return n_writers_ + peak_extras_; }
 
   // Live sink-timing feed for the --adapt governor.  DISTINCT from m_ (which is
   // deliberately null on every extract construction to avoid double-counting
@@ -11551,6 +11688,19 @@ private:
   std::atomic<uint64_t> wpool_busy_ns_{0}, wpool_starved_ns_{0};
   Meter * sink_meter_ = nullptr;   // live --adapt sink feed (set_sink_meter); NOT m_
 
+  // --adapt extract writer-pool grow probe (action 5c): a supervisor thread
+  // spawns/retires EXTRA writers on the shared job queue as the governor moves
+  // g_adapt_ewgrow_target.  Extras pull the same jobs as the base pool; a
+  // retired extra (probe reverted) stops taking work via its own retire flag.
+  // All spawned extras (retired or not) are joined at stop_pool.  Only armed
+  // under --adapt.
+  std::thread ewsup_;                                   // supervisor
+  std::vector<std::thread> extra_writers_;              // probe extras (all spawned)
+  std::deque<std::unique_ptr<std::atomic<bool>>> retire_flags_;  // one per extra, stable addr
+  int  ewgrow_cap_ = 0;                                 // max extra writers this pool allows
+  int  peak_extras_ = 0;                                // most extras concurrently active (for -v divisor)
+  bool ewsup_stop_ = false;                             // guarded by g_adapt_ewgrow_mtx
+
   // Serial parse-thread phase timing for the -v [EXTRACT] line (all accumulated
   // on the one parse thread, so plain counters; harvested after join):
   //   wall     = run()/run_sink() duration
@@ -11573,10 +11723,20 @@ private:
   };
 
   void start_pool() {
-    // --write-threads overrides; auto = min(worker threads, 16) — beyond ~16 the
+    // Pool size: --write-threads pins it (user wins, always); else --adapt seeds
+    // the START from the profile's settled tar_write_threads (the probe still
+    // explores from there); else auto = min(worker threads, 16) — beyond ~16 the
     // gain plateaus on filesystem metadata/journal contention (tune per box).
-    int n = opt_.write_threads > 0 ? (int)opt_.write_threads
-                                   : std::min(resolve_cpu_threads(opt_.cpu_threads), 16);
+    const int cpu = resolve_cpu_threads(opt_.cpu_threads);
+    int n;
+    if (opt_.write_threads > 0) {
+      n = (int)opt_.write_threads;
+    } else if (opt_.adapt && g_adapt_ewgrow_prior_base.load(std::memory_order_relaxed) > 0) {
+      n = std::min(g_adapt_ewgrow_prior_base.load(std::memory_order_relaxed),
+                   std::max(1, 4 * cpu));   // clamp a hand-edited/foreign profile
+    } else {
+      n = std::min(cpu, 16);
+    }
     n = std::max(1, n);
     n_writers_ = n;
     // Publish the pool size so the --adapt governor can per-thread-average the
@@ -11590,11 +11750,25 @@ private:
     if (opt_.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt_, "[UNTAR] " + std::to_string(n) + " writer thread(s)\n");
     for (int i = 0; i < n; ++i) writers_.emplace_back([this] { writer_loop(); });
+    // --adapt: arm the grow-probe supervisor (extras cap at +base, i.e. up to a
+    // doubled pool).  The supervisor reconciles any target the forced hook or
+    // governor already raised before spawning.
+    if (opt_.adapt) {
+      ewgrow_cap_ = n;
+      ewsup_stop_ = false;
+      ewsup_ = std::thread([this] { ewriter_supervisor(); });
+    }
   }
   void stop_pool() {
     { std::lock_guard<std::mutex> lk(q_m_); q_done_ = true; } q_cv_cons_.notify_all();
+    if (ewsup_.joinable()) {
+      { std::lock_guard<std::mutex> lk(g_adapt_ewgrow_mtx); ewsup_stop_ = true; }
+      g_adapt_ewgrow_cv.notify_all();
+      ewsup_.join();
+    }
     for (auto & t : writers_) t.join();
-    writers_.clear();
+    for (auto & t : extra_writers_) t.join();   // retired + still-active extras
+    writers_.clear(); extra_writers_.clear(); retire_flags_.clear();
   }
   void enqueue(Job && j) {
     std::unique_lock<std::mutex> lk(q_m_);
@@ -11617,7 +11791,16 @@ private:
   // instead of one lump at exit — while keeping the per-thread atomic traffic to
   // ~20/s (vs one add per job), preserving the original no-contention intent.
   static constexpr uint64_t SINK_FLUSH_NS = 50ull * 1000 * 1000;   // 50 ms
-  void writer_loop() {
+  void writer_loop() { run_writer_loop(nullptr); }            // base pool writer
+  void ewriter_loop(std::atomic<bool> * retire) { run_writer_loop(retire); }  // probe extra
+
+  // The one writer body, shared by the base pool and the --adapt probe extras.
+  // retire == nullptr → a base writer (runs until the queue drains).  retire !=
+  // nullptr → a probe extra: it also retires promptly when the governor reverts
+  // its slot (retire flag set + the pool isn't already finishing).  Both feed
+  // the -v [WRITER] totals and the live governor deltas identically.
+  void run_writer_loop(std::atomic<bool> * retire) {
+    const bool is_extra = retire != nullptr;
     // Time job-waits (starved) and writes (busy) into thread-local counters.
     // Two consumers, both opt-in: the -v [WRITER] line (one atomic flush of the
     // lifetime totals at exit) and the --adapt governor (coarse live deltas into
@@ -11636,18 +11819,25 @@ private:
       sink_meter_->extract_starved_ns.fetch_add(starved_ns - flushed_starved, std::memory_order_relaxed);
       flushed_busy = busy_ns; flushed_starved = starved_ns; last_flush = nowt;
     };
+    auto retired = [&] {
+      return is_extra && retire->load(std::memory_order_relaxed);
+    };
     for (;;) {
       Job j;
       {
         std::unique_lock<std::mutex> lk(q_m_);
+        auto pred = [&] { return !q_.empty() || q_done_ || retired(); };
         if (measure) {
           uint64_t t0 = now_ns();
-          q_cv_cons_.wait(lk, [&] { return !q_.empty() || q_done_; });
+          q_cv_cons_.wait(lk, pred);
           starved_ns += now_ns() - t0;
         } else {
-          q_cv_cons_.wait(lk, [&] { return !q_.empty() || q_done_; });
+          q_cv_cons_.wait(lk, pred);
         }
-        if (q_.empty()) break;
+        // A reverted probe extra stops taking work at once (unless the pool is
+        // already finishing, in which case it helps drain the tail first).
+        if (retired() && !q_done_) break;
+        if (q_.empty()) break;   // q_done_ and drained
         j = std::move(q_.front()); q_.pop_front();
         q_bytes_ -= j.size;
         lk.unlock(); q_cv_prod_.notify_all();
@@ -11669,6 +11859,52 @@ private:
       if (live) flush_live(now_ns());   // push the final residual delta
       wpool_busy_ns_.fetch_add(busy_ns, std::memory_order_relaxed);
       wpool_starved_ns_.fetch_add(starved_ns, std::memory_order_relaxed);
+    }
+  }
+
+  // --adapt probe supervisor (only armed under --adapt).  The governor's sole
+  // reach into the pool: it moves g_adapt_ewgrow_target and notifies the global
+  // g_adapt_ewgrow_cv; this thread reconciles the live extra-writer count to
+  // that target (capped by ewgrow_cap_), spawning fresh extras to grow and
+  // setting retire flags (then waking the queue) to shrink.  active = current
+  // non-retired extras; every spawned thread is joined at stop_pool.
+  void ewriter_supervisor() {
+    int active = 0;
+    for (;;) {
+      int target;
+      {
+        std::unique_lock<std::mutex> lk(g_adapt_ewgrow_mtx);
+        g_adapt_ewgrow_cv.wait(lk, [&] {
+          return ewsup_stop_
+              || std::min(g_adapt_ewgrow_target.load(std::memory_order_relaxed),
+                          ewgrow_cap_) != active;
+        });
+        if (ewsup_stop_) break;
+        target = std::min(g_adapt_ewgrow_target.load(std::memory_order_relaxed), ewgrow_cap_);
+      }
+      if (target > active) {                       // grow: spawn fresh extras
+        g_adapt_ewgrow_engaged.store(true, std::memory_order_relaxed);
+        for (int i = active; i < target; ++i) {
+          retire_flags_.push_back(std::make_unique<std::atomic<bool>>(false));
+          std::atomic<bool> * rp = retire_flags_.back().get();
+          extra_writers_.emplace_back([this, rp] { ewriter_loop(rp); });
+        }
+      } else if (target < active) {                // shrink: retire the newest
+        int to_retire = active - target, marked = 0;
+        for (auto it = retire_flags_.rbegin();
+             it != retire_flags_.rend() && marked < to_retire; ++it) {
+          if (!(*it)->load(std::memory_order_relaxed)) {
+            (*it)->store(true, std::memory_order_relaxed);
+            ++marked;
+          }
+        }
+        std::lock_guard<std::mutex> lk(q_m_);
+        q_cv_cons_.notify_all();                   // wake the retirees so they exit
+      }
+      active = target;
+      peak_extras_ = std::max(peak_extras_, active);
+      if (sink_meter_)
+        sink_meter_->writer_pool_threads.store(n_writers_ + active, std::memory_order_relaxed);
     }
   }
 
@@ -20380,6 +20616,28 @@ static void apply_backend_defaults(Options & opt)
   // window).  Latest-wins on record, so hardware changes can flip it back.
   if (priors.loaded && prior_dir.writer_par < 0)
     g_adapt_writer_probe_allowed.store(0, std::memory_order_relaxed);
+
+  // Extract writer-pool grow prior (M4 action 5c): -d --tar starts its pool at
+  // the profile's settled tar_write_threads (the probe still explores upward
+  // from there unless converged), and a converged verdict latches the probe off
+  // so a settled machine doesn't re-pay it every run.  --write-threads (user
+  // pin) always wins in start_pool.  Latest-wins, so hardware changes reopen it.
+  if (priors.loaded && opt.tar_mode && opt.mode == Mode::DECOMPRESS) {
+    if (prior_dir.tar_write_threads >= 1) {
+      g_adapt_ewgrow_prior_base.store((int)std::min(prior_dir.tar_write_threads, 4096.0),
+                                      std::memory_order_relaxed);
+      if (opt.verbosity >= V_VERBOSE) {
+        char b[128];
+        std::snprintf(b, sizeof(b),
+          "[ADAPT] extract pool starts at the profile's settled %d writer(s)%s\n",
+          (int)prior_dir.tar_write_threads,
+          prior_dir.tar_wt_converged != 0 ? " (converged, probe off)" : " (probe still explores)");
+        vlog(V_VERBOSE, opt, b);
+      }
+    }
+    if (prior_dir.tar_wt_converged != 0)
+      g_adapt_ewgrow_allowed.store(0, std::memory_order_relaxed);
+  }
 #endif
 
   if (opt.backend_user_set) return;

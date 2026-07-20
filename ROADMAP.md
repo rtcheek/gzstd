@@ -218,7 +218,16 @@ Both slot into the existing profile grammar (EMA or latest-wins discrete,
 driver-quarantine only for the GPU one) and the established review gates.
 
 ### 2.5 `--adapt` × `--tar` Integration (proposed 2026-07-17)
-**Priority: Medium | Complexity: Medium | Status: IN PROGRESS — #1 (extract sink signal) DONE v0.15.11; the rest are the governor's remaining blind spots**
+**Priority: Medium | Complexity: Medium | Status: IN PROGRESS — #1 signal DONE v0.15.11, #1 ACTUATOR DONE v0.15.12; the rest are the governor's remaining blind spots**
+
+**Architecture note (found while building the actuator):** the extract levers are
+NOT uniform peers. Only the writer POOL is a clean in-run probe target (a shared
+job queue — spawn/reap writers live). Decompress concurrency in `run_parallel` is
+the partition count `N`, fixed at start; the `run_sink` parse is serial by design;
+the extract read is done by those same `N` partition workers (no separate read
+pool to govern); the FrameSink budget is tar-exempt. So decompress/read
+parallelism, if governed at all, is a cross-run profile START-size, not an in-run
+probe — a separate, coarser follow-up.
 
 The v0.15.x governor runs on `--tar` operations but several of its senses
 and levers don't reach the tar-specific machinery (each was an explicit,
@@ -235,10 +244,17 @@ documented deferral during M4):
   `max(disk-term, extract-term/writer_pool_threads)`. The writer-probe (action
   5b) had to be **gated off extract** (`is_extract_`): its actuator is the plain
   DirectWriter's second drain thread, absent on extract, so it would misreport a
-  phantom action and persist a bogus verdict. **Still future work: the ACTUATOR**
-  — the plan's Layer 2 names the extract writer-pool SIZE (`--write-threads`
-  today, static) as governable the same way; SINK_BOUND on extract is currently
-  classify-and-report only, driving no lever yet.
+  phantom action and persist a bogus verdict.
+  **ACTUATOR — DONE v0.15.12 (action 5c).** SINK_BOUND extract now GROWS the
+  writer pool: a supervisor thread (armed only under `--adapt`) spawns/reaps
+  extra writers on the shared job queue as the governor moves
+  `g_adapt_ewgrow_target` (woken via a global CV — the only governor→pool
+  channel, no pointer). Steps by half the base pool, EMA-baselined keep/revert,
+  caps at 2 rounds / doubled pool, persists `tar_write_threads` (+ `converged`
+  latch) to seed the next run. `--write-threads` (user pin) always wins. Found a
+  real +26% (16→24) optimum live on the 256-core box. Follow-up: periodic
+  re-probe (the converged latch freezes the size like 5b — accepted, shared
+  limitation) and positive-perf validation on the Gen<4 workstation.
 - **Tar-create member-reader scale-up:** the v0.15.5 dormant-reader
   mechanism covers only the plain-decompress prefetch pool; the tar-create
   member readers (`--read-threads`, device-bound per the v0.14.x
