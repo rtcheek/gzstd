@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.14";
+static constexpr const char * GZSTD_VERSION = "0.15.20";
 //
 // Architecture overview:
 //
@@ -11207,9 +11207,12 @@ public:
   // whose frame table (c_off/u_off) and per-entry boundaries (`bounds`[i] =
   // entry i's entry_end, ascending, entry 0 starting at offset 0) are known.
   // Partitions the entries into N contiguous groups balanced by data bytes;
-  // each worker preads + decompresses ONLY its own frames (like seek_feed) and
-  // runs the standard parse/handle_entry over its byte slice, dispatching file
-  // writes to the SHARED writer pool.  Dirs/symlinks/specials/sparse are handled
+  // each worker runs the standard parse/handle_entry over its byte slice,
+  // dispatching file writes to the SHARED writer pool.  Frame decode is either
+  // inline on the parse thread (the proven default) or, under --adapt, routed
+  // through a SHARED decode pool so a huge file stuck in one partition still
+  // decodes across every core and mixed huge+tiny partitions self-balance (see
+  // the pool block below).  Dirs/symlinks/specials/sparse are handled
   // by the one worker that owns the entry; hardlinks and dir metadata are
   // collected per worker (ParCtx) and merged in archive order for
   // finish_deferred.  `feed_meter` counts read/written bytes for the progress
@@ -11255,42 +11258,283 @@ public:
       }
     }
 
+    // Per-partition frame/byte geometry, used by both decode modes: entry byte
+    // range [start, end) and the frames [f0, f1] covering it (a boundary frame
+    // straddling a split is decoded once per owning partition, as before).
+    struct PG { size_t f0, f1; uint64_t start, end; };
+    std::vector<PG> pg(parts.size());
+    size_t total_items = 0;
+    for (size_t pi = 0; pi < parts.size(); ++pi) {
+      const Part pr = parts[pi];
+      const uint64_t start = pr.a == 0 ? 0 : bounds[pr.a - 1];
+      const uint64_t end   = bounds[pr.b - 1];
+      pg[pi] = PG{ frame_of(start), frame_of(end - 1), start, end };
+      total_items += pg[pi].f1 - pg[pi].f0 + 1;
+    }
+
+    // ---- shared frame-decode pool (Phase 1 of the decoupled extractor) ----
+    // The K parse partitions stay put, but under --adapt decode no longer runs
+    // inline on each parse thread: every partition's frames flow through ONE
+    // shared queue drained by `n_decoders` workers (all cores).  So a single
+    // huge file trapped in one partition decodes across every core, and a mix of
+    // huge+tiny partitions self-balances -- a parse thread that stalls on the
+    // writer pool stops dispatching, its queued frames drain, and the decoders
+    // move to whichever partitions still have work.  Each partition keeps a
+    // private in-order reorder buffer (frames finish out of order); a global
+    // frame budget bounds total buffered decode exactly as seek_feed does.  The
+    // default (no --adapt) path keeps the proven inline decode below.
+    // GZSTD_FORCE_POOL routes decode through the pool WITHOUT --adapt (no
+    // governor/probe/warmup) so the pure decode-pool cost can be A/B'd against
+    // the inline path under identical writer settings.
+    const bool use_pool = dopt.adapt || (std::getenv("GZSTD_FORCE_POOL") != nullptr);
+    uint64_t max_usz = 1;
+    for (size_t k = 0; k + 1 < u_off.size(); ++k)
+      max_usz = std::max<uint64_t>(max_usz, u_off[k + 1] - u_off[k]);
+    // Hard RAM ceiling on frames in flight: same 4 GiB accounting as seek_feed
+    // (each in-flight frame can hold a compressed + a decompressed buffer), so a
+    // count-only budget cannot balloon RAM on huge --chunk-size archives.
+    const size_t ram_cap_frames =
+        (size_t)std::max<uint64_t>(2, ((uint64_t)4 << 30) / (2 * max_usz));
+    // Decoder-pool CAP: the most decoders the adaptive controller may grow to
+    // (default all cores).  The pool starts EMPTY and grows only when writers
+    // starve; GZSTD_POOL_DECODERS overrides the cap for A/B measurement.  Never
+    // more than the RAM budget or the frame count allows.
+    int want_dec = resolve_cpu_threads(dopt.cpu_threads);
+    if (const char * e = std::getenv("GZSTD_POOL_DECODERS")) {
+      int v = std::atoi(e);
+      if (v > 0) want_dec = v;
+    }
+    const int n_dec_max = std::max<int>(1, (int)std::min<size_t>(
+        (size_t)std::max(1, want_dec), std::min<size_t>(ram_cap_frames, total_items)));
+    // Buffered-ahead budget = ~2 frames of runway per decoder, capped by the RAM
+    // ceiling.  Only consumed while OFFLOADING (decode-bound); when the pool is
+    // idle (write-bound) no frames are dispatched so nothing is buffered.
+    const size_t budget_frames = std::min<size_t>(
+        ram_cap_frames, std::max<size_t>(4, (size_t)n_dec_max * 2));
+
+    // ADAPTIVE HYBRID: parse threads decode INLINE by default (the proven, zero-
+    // cost, write-bound-optimal path); a controller flips `offload_active` true
+    // only when writers are decode-starved, routing frames through the pool so
+    // decode parallelizes across cores.  GZSTD_FORCE_POOL forces it fully on from
+    // the start (all decoders, offload always active) with no --adapt -- the old
+    // always-pool path, kept for A/B.
+    const bool force_pool = std::getenv("GZSTD_FORCE_POOL") != nullptr;
+    std::atomic<bool> offload_active{ force_pool };
+    std::atomic<int>  peak_decoders{0};
+    if (use_pool && dopt.verbosity >= V_VERBOSE) {
+      char b[184];
+      std::snprintf(b, sizeof b,
+        "[TAR] decode pool: %s, up to %d decoder(s), %zu-frame budget over %zu frames\n",
+        force_pool ? "forced on" : "adaptive (inline until writers starve)",
+        n_dec_max, budget_frames, total_items);
+      vlog(V_VERBOSE, dopt, b);
+    }
+
+    // Global frame budget.  A permit is held from the moment a frame is queued
+    // until the owning parse thread consumes it (its whole RAM lifetime).
+    // try_acquire (opportunistic prefetch) yields to any thread blocked in
+    // acquire, so a starved partition always wins the next permit over another
+    // partition's read-ahead -- fair and starvation-free.
+    struct Budget {
+      std::mutex mx; std::condition_variable cv; size_t permits; int waiters = 0;
+      explicit Budget(size_t p) : permits(p) {}
+      void acquire() {
+        std::unique_lock<std::mutex> lk(mx);
+        ++waiters; cv.wait(lk, [&] { return permits > 0; }); --waiters; --permits;
+      }
+      bool try_acquire() {
+        std::lock_guard<std::mutex> lk(mx);
+        if (waiters > 0 || permits == 0) return false;
+        --permits; return true;
+      }
+      void release() { { std::lock_guard<std::mutex> lk(mx); ++permits; } cv.notify_one(); }
+    } budget(budget_frames);
+
+    struct DItem { int pi; size_t k; bool count_read; };
+    std::mutex qmx; std::condition_variable qcv;
+    std::deque<DItem> dq; bool qdone = false;
+    struct PartSync { std::mutex mx; std::condition_variable cv; std::map<size_t, FrameBuf> ready; };
+    std::vector<PartSync> psync(parts.size());
+
+    // One decoder: pop a frame, decompress it (the verified seek_feed path),
+    // deposit it in its partition's reorder buffer.  Blocks only on the queue, so
+    // a dispatched frame is always eventually decoded; parks on an empty queue
+    // when nothing is being offloaded.
+    auto decoder_loop = [&] {
+      ZSTD_DCtx * dctx = ZSTD_createDCtx();
+      if (!dctx) die("failed to create ZSTD_DCtx");
+      apply_mem_limit_to_dctx(dctx, dopt);
+      std::vector<char> comp;
+      for (;;) {
+        DItem it;
+        {
+          std::unique_lock<std::mutex> lk(qmx);
+          qcv.wait(lk, [&] { return !dq.empty() || qdone; });
+          if (dq.empty()) break;                    // qdone with nothing left
+          it = dq.front(); dq.pop_front();
+        }
+        FrameBuf fb = decode_seek_frame(fd, c_off, u_off, it.k, comp, dctx,
+                                        feed_meter, it.count_read);
+        {
+          std::lock_guard<std::mutex> lk(psync[it.pi].mx);
+          psync[it.pi].ready.emplace(it.k, std::move(fb));
+        }
+        psync[it.pi].cv.notify_one();
+      }
+      ZSTD_freeDCtx(dctx);
+    };
+    // dworkers grows ONLY here (controller thread during the run, or up front for
+    // force_pool) and is joined by this thread after the controller has stopped --
+    // no concurrent access.  Reserve so growth never reallocates.
+    std::vector<std::thread> dworkers;
+    if (use_pool) dworkers.reserve((size_t)n_dec_max);
+    auto grow_decoders = [&](int target) {
+      target = std::min(target, n_dec_max);
+      while ((int)dworkers.size() < target) dworkers.emplace_back(decoder_loop);
+      if ((int)dworkers.size() > peak_decoders.load(std::memory_order_relaxed))
+        peak_decoders.store((int)dworkers.size(), std::memory_order_relaxed);
+    };
+
+    // Adaptive controller: sample the live writer busy/starved signal (fed into
+    // sink_meter_ by the writer pool under --adapt) and, when writers are decode-
+    // starved, turn offload ON and grow the decoder pool; when they are fed again,
+    // turn it OFF (back to zero-cost inline).  Hysteresis (revert only after a few
+    // calm windows) avoids flapping on mixed archives.
+    std::mutex ctl_mx; std::condition_variable ctl_cv; bool ctl_stop = false;
+    std::thread controller;
+    const bool flap = std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") != nullptr;
+    if (use_pool && force_pool) {
+      grow_decoders(n_dec_max);                       // A/B: all decoders up, offload forced on
+    } else if (use_pool && flap) {
+      // Test hook: rapidly toggle offload so producers constantly switch
+      // inline<->pool, exercising both transition directions + concurrent decode.
+      grow_decoders(n_dec_max);
+      controller = std::thread([&] {
+        bool on = false;
+        for (;;) {
+          {
+            std::unique_lock<std::mutex> lk(ctl_mx);
+            if (ctl_cv.wait_for(lk, std::chrono::milliseconds(2), [&] { return ctl_stop; })) break;
+          }
+          on = !on; offload_active.store(on, std::memory_order_relaxed);
+        }
+      });
+    } else if (use_pool) {
+      controller = std::thread([&] {
+        uint64_t pbusy = 0, pstarv = 0; int calm = 0, cooldown = 0;
+        const int step = std::max(2, n_dec_max / 8);
+        for (;;) {
+          {
+            std::unique_lock<std::mutex> lk(ctl_mx);
+            if (ctl_cv.wait_for(lk, std::chrono::milliseconds(120),
+                                [&] { return ctl_stop; })) break;
+          }
+          if (cooldown > 0) --cooldown;
+          if (!sink_meter_) continue;                 // no live signal (shouldn't happen under --adapt)
+          uint64_t b = sink_meter_->extract_busy_ns.load(std::memory_order_relaxed);
+          uint64_t s = sink_meter_->extract_starved_ns.load(std::memory_order_relaxed);
+          uint64_t db = b - pbusy, ds = s - pstarv; pbusy = b; pstarv = s;
+          if (db + ds < 2000000) continue;            // <2 ms of writer activity this window: no signal
+          double starv = (double)ds / (double)(db + ds);
+          if (starv > 0.20) {                         // decode-starved: offload on, grow the pool
+            offload_active.store(true, std::memory_order_relaxed);
+            // Grow ONE step, then wait a few windows for the signal to reflect the
+            // added decoders before growing again -- otherwise the loop laps the
+            // ~50 ms writer-flush lag and overshoots straight to the cap.
+            int cur = peak_decoders.load(std::memory_order_relaxed);
+            if (cooldown == 0 && cur < n_dec_max) { grow_decoders(cur + step); cooldown = 3; }
+            calm = 0;
+          } else if (starv < 0.05) {                  // writers fed: revert to inline after 3 calm windows
+            if (++calm >= 3) offload_active.store(false, std::memory_order_relaxed);
+          } else calm = 0;
+        }
+      });
+    }
+
     std::vector<ParCtx> pctx(parts.size());
     std::vector<std::thread> workers;
     workers.reserve(parts.size());
     for (size_t pi = 0; pi < parts.size(); ++pi) {
       workers.emplace_back([&, pi] {
-        const Part pr = parts[pi];
-        const uint64_t start = pr.a == 0 ? 0 : bounds[pr.a - 1];
-        const uint64_t end   = bounds[pr.b - 1];
-        const size_t f0 = frame_of(start);
-        const size_t f1 = frame_of(end - 1);
-        auto dctx = std::shared_ptr<ZSTD_DCtx>(ZSTD_createDCtx(), ZSTD_freeDCtx);
-        if (!dctx) die("failed to create ZSTD_DCtx");
-        apply_mem_limit_to_dctx(dctx.get(), dopt);
-        auto comp = std::make_shared<std::vector<char>>();
-        size_t f = f0;
-        std::function<FrameBuf()> producer =
-          [fd, &c_off, &u_off, f0, f1, start, end, dctx, comp, f, feed_meter]() mutable -> FrameBuf {
-            if (f > f1) return nullptr;
-            size_t k = f++;
-            // A boundary frame shared with the previous partition (this worker's
-            // leading frame when it straddles `start`) was already read+counted
-            // there; skip its read_bytes so the reported input isn't inflated.
-            bool count_read = !(k == f0 && start > u_off[f0]);
-            FrameBuf fb = decode_seek_frame(fd, c_off, u_off, k, *comp, dctx.get(), feed_meter, count_read);
-            if (feed_meter) {   // count the tar bytes this worker actually parses
-              uint64_t a = std::max(u_off[k], start), b = std::min(u_off[k + 1], end);
-              if (b > a) feed_meter->wrote_bytes.fetch_add(b - a, std::memory_order_relaxed);
+        const PG g = pg[pi];
+        // Each parse thread owns an inline DCtx (used whenever it decodes a frame
+        // itself).  next_dispatch = first frame not yet decoded-inline or
+        // dispatched-to-the-pool; frames in [next_consume, next_dispatch) are in
+        // the pool awaiting in-order consumption.  Both cursors are thread-local.
+        auto in_dctx = std::shared_ptr<ZSTD_DCtx>(ZSTD_createDCtx(), ZSTD_freeDCtx);
+        if (!in_dctx) die("failed to create ZSTD_DCtx");
+        apply_mem_limit_to_dctx(in_dctx.get(), dopt);
+        std::vector<char> in_comp;
+        size_t next_dispatch = g.f0, next_consume = g.f0;
+        std::function<FrameBuf()> producer = [&]() -> FrameBuf {
+          if (next_consume > g.f1) return nullptr;
+          const size_t k = next_consume;
+          // A boundary frame shared with the previous partition (this worker's
+          // leading frame when it straddles `start`) was already read+counted
+          // there; suppress its read_bytes so the reported input isn't inflated.
+          const bool count_read = !(k == g.f0 && g.start > u_off[g.f0]);
+          FrameBuf fb;
+          if (!use_pool) {                              // pure inline (no --adapt / no force)
+            fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx.get(), feed_meter, count_read);
+            next_dispatch = k + 1;
+          } else {
+            auto dispatch = [&](size_t j) {
+              const bool cr = !(j == g.f0 && g.start > u_off[g.f0]);
+              { std::lock_guard<std::mutex> lk(qmx); dq.push_back(DItem{ (int)pi, j, cr }); }
+              qcv.notify_one();
+            };
+            auto take_pool = [&](size_t kk) -> FrameBuf {
+              std::unique_lock<std::mutex> lk(psync[pi].mx);
+              psync[pi].cv.wait(lk, [&] { return psync[pi].ready.count(kk) != 0; });
+              auto itr = psync[pi].ready.find(kk);
+              FrameBuf f = std::move(itr->second); psync[pi].ready.erase(itr);
+              return f;
+            };
+            if (k < next_dispatch) {                    // already committed to the pool
+              fb = take_pool(k); budget.release();
+            } else if (offload_active.load(std::memory_order_relaxed)) {
+              // Offload: guarantee k is queued (blocking acquire; holds no permits
+              // here so it can't self-deadlock the budget) then prefetch ahead.
+              while (next_dispatch <= k) { budget.acquire(); dispatch(next_dispatch++); }
+              while (next_dispatch <= g.f1 && budget.try_acquire()) dispatch(next_dispatch++);
+              fb = take_pool(k); budget.release();
+            } else {                                    // inline (writers not decode-starved)
+              fb = decode_seek_frame(fd, c_off, u_off, k, in_comp, in_dctx.get(), feed_meter, count_read);
+              next_dispatch = k + 1;
             }
-            return fb;
-          };
-        StreamReader r(std::move(producer), u_off[f0], end);
-        if (start > u_off[f0]) r.skip(start - u_off[f0]);   // align to the entry boundary
+          }
+          if (feed_meter) {   // count the tar bytes this partition actually parses
+            uint64_t a = std::max(u_off[k], g.start), b = std::min(u_off[k + 1], g.end);
+            if (b > a) feed_meter->wrote_bytes.fetch_add(b - a, std::memory_order_relaxed);
+          }
+          ++next_consume;
+          return fb;
+        };
+        StreamReader r(std::move(producer), u_off[g.f0], g.end);
+        if (g.start > u_off[g.f0]) r.skip(g.start - u_off[g.f0]);   // align to the entry boundary
         parse(r, &pctx[pi]);
       });
     }
     for (auto & t : workers) t.join();
+    if (use_pool) {
+      // Stop the controller first (no more decoder spawning), then let the
+      // decoders drain the queue and exit.
+      if (controller.joinable()) {
+        { std::lock_guard<std::mutex> lk(ctl_mx); ctl_stop = true; }
+        ctl_cv.notify_all();
+        controller.join();
+      }
+      { std::lock_guard<std::mutex> lk(qmx); qdone = true; }
+      qcv.notify_all();
+      for (auto & t : dworkers) t.join();
+      if (!force_pool && dopt.verbosity >= V_VERBOSE) {
+        int pk = peak_decoders.load(std::memory_order_relaxed);
+        char b[128];
+        std::snprintf(b, sizeof b, "[TAR] decode pool: peak %d decoder(s) -- %s\n",
+                      pk, pk ? "offload engaged (decode-bound)" : "never engaged, stayed inline");
+        vlog(V_VERBOSE, dopt, b);
+      }
+    }
 
     // Merge per-worker deferred lists in partition (archive) order, so
     // finish_deferred still creates hardlinks after their targets exist and

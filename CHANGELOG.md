@@ -1,11 +1,29 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.10  
+**Covers:** v0.9.50 → v0.15.20  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.20 — -d --tar: adaptive hybrid decode pool (decode offloads to a pool only when writers starve)
+
+**Parallel full extraction (`run_parallel`) decoded each partition's frames inline on its one parse thread, so a huge file trapped in a single byte-balanced partition decoded on ONE core — starving the 16-writer pool whenever decode (not the disk) is the bottleneck. This adds a shared decoder pool so any partition's frames can decode across all cores, engaged adaptively so it never touches the write-bound fast path.**
+
+Measured behavior (both on genuine `run_parallel` archives — confirmed by the `[TAR] parallel-extract` line; see the methodology note):
+- **Decode-bound** (cmptest: 17 large files → tmpfs, writes ~free): inline left the writer pool **71–90% starved** (one core per file cannot feed 16 writers); the pool un-starved it to ~8% and cut the extract phase **~1.8×** (4.88 → 2.70 s). A handful of decoders saturates the sink — D=8 and D=96 were within noise.
+- **Write-bound** (usr: 814 K tiny files → disk): the pool is **free** — forced-always-on 26.5 s vs inline 25.5 s (within noise; both ~75% writer-busy / ~0.3% starved, ABCCBA-averaged). Decoupling decode adds no measurable cost when decode is not the limiter.
+
+So there is **no measured downside** and the always-on pool would be safe; extraction nonetheless engages it **adaptively** — zero-cost *by construction* on the write-bound path, not merely empirically. Under `--adapt` (no `--adapt` = pure inline, unchanged): each parse thread decodes inline by default; a controller samples the live writer starved-fraction (`Meter::extract_starved_ns`/`extract_busy_ns` deltas, 120 ms windows — the v0.15.11 signal) and flips a shared `offload_active` atomic. Starved >20% turns offload on and grows the pool one step (`n_dec_max/8`) with a settle-cooldown between grows (so growth does not lap the ~50 ms writer-flush lag and overshoot); starved <5% for a few windows turns it back off. The producer is hybrid: frames already handed to the pool always drain from it, and only *undispatched* frames pick inline-vs-pool live, with the dispatch cursor kept monotonic (`next_dispatch = k+1` after an inline decode) so no frame decodes twice across a transition. On cmptest it engages (peak ~36 decoders); on usr it engages only on brief write-bound transients (peak 12–24), harmlessly (the pool is free there).
+
+Deadlock-free by construction (a partition only does a blocking budget-acquire while holding zero permits); the frame budget scales with the live decoder count (`2·D`, capped by the seek_feed 4 GiB RAM ceiling) so an idle pool buffers nothing. Diagnostic env toggles kept in the binary: `GZSTD_FORCE_POOL` (offload forced on, `--adapt`-free, = the always-pool path for A/B), `GZSTD_POOL_DECODERS=N` (decoder cap), `GZSTD_DEBUG_OFFLOAD_FLAP` (toggle offload every 2 ms to stress the inline↔pool transitions).
+
+Correctness: the pooled / rapidly-flapped / forced paths are byte-identical to the serial walk across repeats (including a 3 GiB two-huge-file archive that exercises budget backpressure), and the full rpfrancis extraction (9,387,810 entries / 9,173,439 regular files) is byte-for-byte identical to GNU tar.
+
+**Measurement methodology (learned the hard way):** the `[WRITER]`/`[ADAPT]` diagnostics print on **both** the serial `run_sink` and the parallel `run_parallel` paths (both share the writer pool), so they do not identify which ran. `run_parallel` engages only when `build_full_parallel_plan` succeeds — an archive with a duplicate-normalized-name or a leaf/dir path collision (common in huge real trees) correctly falls back to serial. Confirm with the `[TAR] parallel-extract` line before attributing any extract measurement to the decode pool. An initial round of rpfrancis measurements did not: rpfrancis-native falls back to `run_sink`, so those numbers reflected the serial path plus shared-box contention, not the pool — which briefly produced a phantom "+7.6% write-bound cost" that the usr test (real `run_parallel`) disproved.
+
+Suite: 345 normal (1 new: `GZSTD_FORCE_POOL` routes the parallel path through the decode pool + reorder buffers and matches tar byte-for-byte).
 
 ## v0.15.14 — fix: non-root extraction of read-only files >4 MiB silently dropped them (data loss)
 

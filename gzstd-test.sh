@@ -365,7 +365,7 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=344
+EXPECTED_TESTS=345
 $EXTENSIVE && EXPECTED_TESTS=477
 count_tests() { echo "$EXPECTED_TESTS"; }
 
@@ -5224,6 +5224,17 @@ PYEOF
   if [[ "$lpar" == "1" ]] && diff -r "$SX/lout" "$SX/lref" >/dev/null 2>&1; then
     pass "parallel-extract: legit directory tree still engages + matches tar"
   else fail "parallel-extract legit" "engaged=$lpar or mismatch vs tar"; fi
+  # 11c. GZSTD_FORCE_POOL forces the adaptive decoder pool fully on (offload
+  #      active from the start), so the parallel path routes every frame through
+  #      the shared decode pool + per-partition reorder buffers — must round-trip
+  #      byte-identical to tar (the deterministic guard for the pool decode path).
+  rm -rf "$SX/fpout"; mkdir -p "$SX/fpout"
+  fpout=$(GZSTD_FORCE_POOL=1 "$GZSTD" -d --cpu-only -v --tar "$SX/legit.tar.zst" -C "$SX/fpout" 2>&1)
+  fppar=$(printf '%s' "$fpout" | grep -c 'parallel-extract' || true)
+  fppool=$(printf '%s' "$fpout" | grep -c 'decode pool' || true)
+  if [[ "$fppar" == "1" && "$fppool" -ge 1 ]] && diff -r "$SX/fpout" "$SX/lref" >/dev/null 2>&1; then
+    pass "parallel-extract: GZSTD_FORCE_POOL routes decode through the pool + matches tar"
+  else fail "parallel-extract force-pool" "par=$fppar pool=$fppool or mismatch vs tar"; fi
 
   # 12. Hostile inputs (audit round 1): a forged footer claiming 500M frames
   #     must not OOM (1 GiB table cap), and a forged base-256 size that
