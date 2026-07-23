@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.23";
+static constexpr const char * GZSTD_VERSION = "0.15.24";
 //
 // Architecture overview:
 //
@@ -2168,6 +2168,10 @@ static void adapt_request_reader_scaleup()
   g_adapt_scale_cv.notify_all();
 }
 
+// Defined far below; forward-declared so the writer-grow probe (action 5c) can
+// size its round cap to the machine's usable thread count.
+static int resolve_cpu_threads(int opt_threads);
+
 class AdaptGovernor {
 public:
   AdaptGovernor(const Options & opt, const Meter * m) : opt_(opt), m_(m)
@@ -2582,10 +2586,21 @@ private:
           vlog(V_VERBOSE, opt_, pl);
         }
       } else if (probe_phase_ == 0 && regime_ == AdaptRegime::SINK_BOUND
-                 && probe_rounds_ < 2 && wrate > 0) {
-        if (ewgrow_base_ == 0)
+                 && probe_rounds_ < ewgrow_rounds_cap_ && wrate > 0) {
+        if (ewgrow_base_ == 0) {
           ewgrow_base_ = std::max(1,
               m_->writer_pool_threads.load(std::memory_order_relaxed));
+          // Let the probe walk the pool from base up toward the machine's usable
+          // thread count (the supervisor enforces the same cpu ceiling), one
+          // base/2 step per round -- so a CPU/metadata-bound sink on a many-core
+          // box can pull idle cores onto the writers instead of stalling at the
+          // old 2xbase cap.  Each round still only proceeds while it pays >=10%,
+          // so it self-converges at the real per-box plateau well before this cap.
+          const int cpu = resolve_cpu_threads(opt_.cpu_threads);
+          const int step = std::max(1, ewgrow_base_ / 2);
+          const int max_extras = std::max(ewgrow_base_, cpu - ewgrow_base_);
+          ewgrow_rounds_cap_ = std::max(2, 1 + (max_extras + step - 1) / step);
+        }
         ewgrow_step_ = std::max(1, ewgrow_base_ / 2);
         probe_pre_rate_ = wrate_ema_ > 0.0 ? wrate_ema_ : wrate;  // smoothed baseline
         probe_rate_acc_ = 0.0;
@@ -2639,6 +2654,7 @@ private:
   bool    last_sink_bursty_ = false;           // tick-thread only
   int     probe_phase_ = 0;                    // 0 idle / 1 running / 2 kept / 3 converged
   int     probe_rounds_ = 0;                   // tick-thread only
+  int     ewgrow_rounds_cap_ = 2;              // extract: max grow rounds (sized to cpu at first probe)
   int     ewgrow_base_ = 0;                    // extract: base pool size at first probe
   int     ewgrow_extra_ = 0;                   // extract: extra writers currently requested
   int     ewgrow_step_ = 0;                    // extract: per-round grow step
@@ -11105,7 +11121,14 @@ static int match_tar_member(const std::string & rel,
 
 // Defined below (after the seek machinery); forward-declared so Extractor::
 // run_parallel can decode its partition's frames with the same verified path
-// seek_feed uses.
+// seek_feed uses.  decode_seek_frame is the fused pread+decompress used by the
+// inline path; the two halves are also exposed so the parallel pool can run
+// reading and decompression as independent, separately-scaled stages.
+static void pread_seek_frame(int fd, const std::vector<uint64_t> & c_off,
+                             size_t k, std::vector<char> & comp,
+                             Meter * m, bool count_read = true);
+static FrameBuf decompress_seek_frame(const char * comp, size_t csz, size_t usz,
+                                      size_t k, ZSTD_DCtx * dctx);
 static FrameBuf decode_seek_frame(int fd,
                                   const std::vector<uint64_t> & c_off,
                                   const std::vector<uint64_t> & u_off,
@@ -11143,9 +11166,8 @@ struct PoolGpuDecoder {
   size_t * d_comp_sizes = nullptr, * d_decomp_sizes = nullptr, * d_actual = nullptr;
   nvcompStatus_t * d_stats = nullptr;
 
-  std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual, h_off;
+  std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual;
   std::vector<nvcompStatus_t> h_stats;
-  std::vector<char> stage;   // pread staging, reused across batches
   std::string last_error;
 
   // Allocate device buffers for up to `batch` frames of the given strides,
@@ -11189,55 +11211,33 @@ struct PoolGpuDecoder {
     return true;
   }
 
-  // Decode frames ks[0..n) (n <= cap_batch).  out[i] is the decoded FrameBuf
-  // for ks[i], or null with rescue[i]=1 when that frame must fall back to CPU.
+  // Decode a batch of ALREADY-READ frames: comps[i]/cszs[i] are the host
+  // compressed buffer + size (owned by the caller for this call's duration),
+  // uszs[i] the expected decompressed size from the index.  out[i] is the decoded
+  // FrameBuf, or null with rescue[i]=1 when that frame must fall back to CPU.
   // Returns false on a stream/CUDA fault (out all null, rescue all set) so the
-  // caller rescues the whole batch and retires this GPU worker.  Does NOT touch
-  // any Meter: read-byte accounting is the caller's, so a GPU-then-CPU-rescued
-  // frame is counted exactly once.
-  bool decode(int fd,
-              const std::vector<uint64_t> & c_off,
-              const std::vector<uint64_t> & u_off,
-              const std::vector<size_t> & ks,
+  // caller rescues the whole batch and retires this GPU worker.  Reads no fd and
+  // touches no Meter -- the reader pool already did (and counted) the I/O.
+  bool decode(const std::vector<const char *> & comps,
+              const std::vector<size_t> & cszs,
+              const std::vector<size_t> & uszs,
               std::vector<FrameBuf> & out,
               std::vector<char> & rescue) {
-    const size_t n = ks.size();
+    const size_t n = comps.size();
     out.assign(n, nullptr);
     rescue.assign(n, 0);
     if (n == 0) return true;
     try {
       checkCuda(cudaSetDevice(device_id), "pool-gpu: cudaSetDevice");
-      // Two passes so the async H2D copies read a stable source: pass 1 preads
-      // every frame into its own slice of one contiguous staging buffer (which
-      // may reallocate as it grows, but no copy is in flight yet); pass 2 issues
-      // the async uploads from the now-fixed buffer.  A single reused buffer
-      // would let pass-2 frame i+1 overwrite bytes frame i's async copy is still
-      // reading.
-      size_t total_decomp = 0, total_comp = 0;
-      h_off.resize(n);
+      // H2D straight from the reader's owned buffers -- they stay stable until the
+      // stream sync below, so no staging copy is needed (each cszs[i] <= the
+      // stride the device slots were sized to).
+      size_t total_decomp = 0;
       for (size_t i = 0; i < n; ++i) {
-        const size_t k = ks[i];
-        const size_t csz = (size_t)(c_off[k + 1] - c_off[k]);
-        const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
-        h_off[i] = total_comp;   total_comp += csz;
-        h_comp_sizes[i] = csz;   h_decomp_sizes[i] = usz;   total_decomp += usz;
-      }
-      stage.resize(total_comp);
-      for (size_t i = 0; i < n; ++i) {
-        const uint64_t coff = c_off[ks[i]];
-        const size_t csz = h_comp_sizes[i];
-        for (size_t got = 0; got < csz;) {
-          ssize_t r = ::pread(fd, stage.data() + h_off[i] + got, csz - got, (off_t)(coff + got));
-          if (r < 0 && errno == EINTR) continue;
-          if (r <= 0) die_io("seek-extract (gpu): pread failed at frame "
-                             + std::to_string(ks[i]) + ": "
-                             + (r < 0 ? std::strerror(errno) : "unexpected EOF"));
-          got += (size_t)r;
-        }
+        h_comp_sizes[i] = cszs[i]; h_decomp_sizes[i] = uszs[i]; total_decomp += uszs[i];
       }
       for (size_t i = 0; i < n; ++i)
-        checkCuda(cudaMemcpyAsync((char*)d_comp + i * stride_comp,
-                                  stage.data() + h_off[i], h_comp_sizes[i],
+        checkCuda(cudaMemcpyAsync((char*)d_comp + i * stride_comp, comps[i], cszs[i],
                                   cudaMemcpyHostToDevice, stream), "pool-gpu: H2D input");
       checkCuda(cudaMemcpyAsync(d_comp_sizes, h_comp_sizes.data(), n * sizeof(size_t),
                                 cudaMemcpyHostToDevice, stream), "pool-gpu: H2D comp sizes");
@@ -11570,21 +11570,27 @@ public:
       }
     } budget(budget_frames);
 
-    struct DItem { int pi; size_t k; bool count_read; };
+    struct DItem { int pi; size_t k; bool count_read; };   // dispatch-queue item
     std::mutex qmx; std::condition_variable qcv;
     std::deque<DItem> dq; bool qdone = false;
+    // Read-done queue (the decouple): the reader pool preads each dispatched
+    // frame's compressed bytes into an owned buffer and hands it here; the
+    // decoder pool decompresses from it.  Splitting the fused pread+decompress
+    // into two stages lets reading and decoding scale INDEPENDENTLY -- a cold-
+    // read-bound extract feeds more readers, a decode-bound one more decoders --
+    // and mirrors how the rest of the codebase (decompress_cpu_mt, tar-create's
+    // assemble) already separates I/O from compute.  In flight frames stay
+    // bounded by the same permit budget (a permit spans dispatch->consume across
+    // BOTH queues), so ddq cannot grow past the budget.
+    struct RItem { int pi; size_t k; std::vector<char> comp; };
+    std::mutex ddmx; std::condition_variable ddcv;
+    std::deque<RItem> ddq; bool ddqdone = false;
     struct PartSync { std::mutex mx; std::condition_variable cv; std::map<size_t, FrameBuf> ready; };
     std::vector<PartSync> psync(parts.size());
 
-    // One decoder: pop a frame, decompress it (the verified seek_feed path),
-    // deposit it in its partition's reorder buffer.  Blocks only on the queue, so
-    // a dispatched frame is always eventually decoded; parks on an empty queue
-    // when nothing is being offloaded.
-    auto decoder_loop = [&] {
-      ZSTD_DCtx * dctx = ZSTD_createDCtx();
-      if (!dctx) die("failed to create ZSTD_DCtx");
-      apply_mem_limit_to_dctx(dctx, dopt);
-      std::vector<char> comp;
+    // One reader: pop a dispatched frame, pread its compressed bytes, hand the
+    // owned buffer to the decode queue.  I/O only -- no decompress.
+    auto reader_loop = [&] {
       for (;;) {
         DItem it;
         {
@@ -11593,8 +11599,31 @@ public:
           if (dq.empty()) break;                    // qdone with nothing left
           it = dq.front(); dq.pop_front();
         }
-        FrameBuf fb = decode_seek_frame(fd, c_off, u_off, it.k, comp, dctx,
-                                        feed_meter, it.count_read);
+        std::vector<char> comp;
+        pread_seek_frame(fd, c_off, it.k, comp, feed_meter, it.count_read);
+        {
+          std::lock_guard<std::mutex> lk(ddmx);
+          ddq.push_back(RItem{ it.pi, it.k, std::move(comp) });
+        }
+        ddcv.notify_one();
+      }
+    };
+    // One decoder: pop a read frame, decompress it (the verified seek path),
+    // deposit it in its partition's reorder buffer.
+    auto decoder_loop = [&] {
+      ZSTD_DCtx * dctx = ZSTD_createDCtx();
+      if (!dctx) die("failed to create ZSTD_DCtx");
+      apply_mem_limit_to_dctx(dctx, dopt);
+      for (;;) {
+        RItem it;
+        {
+          std::unique_lock<std::mutex> lk(ddmx);
+          ddcv.wait(lk, [&] { return !ddq.empty() || ddqdone; });
+          if (ddq.empty()) break;                   // ddqdone with nothing left
+          it = std::move(ddq.front()); ddq.pop_front();
+        }
+        const size_t usz = (size_t)(u_off[it.k + 1] - u_off[it.k]);
+        FrameBuf fb = decompress_seek_frame(it.comp.data(), it.comp.size(), usz, it.k, dctx);
         {
           std::lock_guard<std::mutex> lk(psync[it.pi].mx);
           psync[it.pi].ready.emplace(it.k, std::move(fb));
@@ -11603,13 +11632,15 @@ public:
       }
       ZSTD_freeDCtx(dctx);
     };
-    // dworkers grows ONLY here (controller thread during the run, or up front for
-    // force_pool) and is joined by this thread after the controller has stopped --
-    // no concurrent access.  Reserve so growth never reallocates.
-    std::vector<std::thread> dworkers;
-    if (use_pool) dworkers.reserve((size_t)n_dec_max);
-    auto grow_decoders = [&](int target) {
+    // Reader + decoder pools grow ONLY here (controller thread during the run, or
+    // up front for force_pool) and are joined by this thread after the controller
+    // has stopped -- no concurrent access.  v1 of the decouple scales the two in
+    // tandem (R=D); the unified controller will budget them independently.
+    std::vector<std::thread> readers, dworkers;
+    if (use_pool) { readers.reserve((size_t)n_dec_max); dworkers.reserve((size_t)n_dec_max); }
+    auto grow_pool = [&](int target) {
       target = std::min(target, n_dec_max);
+      while ((int)readers.size()  < target) readers.emplace_back(reader_loop);
       while ((int)dworkers.size() < target) dworkers.emplace_back(decoder_loop);
       if ((int)dworkers.size() > peak_decoders.load(std::memory_order_relaxed))
         peak_decoders.store((int)dworkers.size(), std::memory_order_relaxed);
@@ -11688,10 +11719,10 @@ public:
             ZSTD_DCtx * rescue_dctx = ZSTD_createDCtx();
             if (!rescue_dctx) die("failed to create ZSTD_DCtx");
             apply_mem_limit_to_dctx(rescue_dctx, dopt);
-            std::vector<char> rescue_comp;
-            std::vector<DItem> claimed;
-            std::vector<size_t> ks;          // GPU-eligible frame indices
-            std::vector<size_t> pos;         // claimed[j] -> index in ks, or npos
+            std::vector<RItem> claimed;        // pre-read buffers from the decode queue
+            std::vector<const char *> comps;   // eligible frames' host buffers
+            std::vector<size_t> cszs, uszs;
+            std::vector<size_t> pos;           // claimed[j] -> index in comps, or npos
             std::vector<FrameBuf> out;
             std::vector<char> resc;
             const size_t npos = (size_t)-1;
@@ -11699,36 +11730,40 @@ public:
             for (;;) {
               claimed.clear();
               {
-                std::unique_lock<std::mutex> lk(qmx);
-                qcv.wait(lk, [&] { return !dq.empty() || qdone; });
-                if (dq.empty()) break;                        // qdone, nothing left
-                const size_t take = std::min(dq.size(), gd.cap_batch);
-                for (size_t i = 0; i < take; ++i) { claimed.push_back(dq.front()); dq.pop_front(); }
+                std::unique_lock<std::mutex> lk(ddmx);
+                ddcv.wait(lk, [&] { return !ddq.empty() || ddqdone; });
+                if (ddq.empty()) break;                       // ddqdone, nothing left
+                const size_t take = std::min(ddq.size(), gd.cap_batch);
+                for (size_t i = 0; i < take; ++i) { claimed.push_back(std::move(ddq.front())); ddq.pop_front(); }
               }
-              ks.clear();
+              comps.clear(); cszs.clear(); uszs.clear();
               pos.assign(claimed.size(), npos);
               for (size_t j = 0; j < claimed.size(); ++j) {
                 const size_t k = claimed[j].k;
                 const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
-                if (usz > 0 && usz <= GPU_SUBCHUNK_MAX) { pos[j] = ks.size(); ks.push_back(k); }
+                if (usz > 0 && usz <= GPU_SUBCHUNK_MAX) {
+                  pos[j] = comps.size();
+                  comps.push_back(claimed[j].comp.data());
+                  cszs.push_back(claimed[j].comp.size());
+                  uszs.push_back(usz);
+                }
               }
-              if (!gd.decode(fd, c_off, u_off, ks, out, resc))
+              if (!gd.decode(comps, cszs, uszs, out, resc))
                 retire = true;   // stream fault: finish this batch on CPU, then stop
               for (size_t j = 0; j < claimed.size(); ++j) {
                 const size_t k = claimed[j].k;
                 FrameBuf fb;
                 if (pos[j] != npos && !resc[pos[j]] && out[pos[j]]) {
                   fb = std::move(out[pos[j]]);
-                  if (feed_meter && claimed[j].count_read)
-                    feed_meter->read_bytes.fetch_add(c_off[k + 1] - c_off[k],
-                                                     std::memory_order_relaxed);
                   gpu_dec_frames.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                  // Ineligible (huge) or nvCOMP-failed frame: authoritative CPU
-                  // decode -- succeeds on a transient glitch, dies clean on real
-                  // corruption, and counts its own read bytes exactly once.
-                  fb = decode_seek_frame(fd, c_off, u_off, k, rescue_comp,
-                                         rescue_dctx, feed_meter, claimed[j].count_read);
+                  // Ineligible (huge) or nvCOMP-failed frame: decompress the
+                  // ALREADY-READ buffer on CPU (authoritative -- succeeds on a
+                  // transient glitch, dies clean on real corruption).  No re-pread;
+                  // the reader already did (and counted) the I/O.
+                  const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
+                  fb = decompress_seek_frame(claimed[j].comp.data(), claimed[j].comp.size(),
+                                             usz, k, rescue_dctx);
                   if (pos[j] != npos)
                     gpu_resc_frames.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -11760,11 +11795,11 @@ public:
     std::thread controller;
     const bool flap = std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") != nullptr;
     if (use_pool && force_pool) {
-      grow_decoders(n_dec_max);                       // A/B: all decoders up, offload forced on
+      grow_pool(n_dec_max);                       // A/B: all decoders up, offload forced on
     } else if (use_pool && flap) {
       // Test hook: rapidly toggle offload so producers constantly switch
       // inline<->pool, exercising both transition directions + concurrent decode.
-      grow_decoders(n_dec_max);
+      grow_pool(n_dec_max);
       controller = std::thread([&] {
         bool on = false;
         for (;;) {
@@ -11799,7 +11834,7 @@ public:
             // added decoders before growing again -- otherwise the loop laps the
             // ~50 ms writer-flush lag and overshoots straight to the cap.
             int cur = peak_decoders.load(std::memory_order_relaxed);
-            if (cooldown == 0 && cur < n_dec_max) { grow_decoders(cur + step); cooldown = 3; }
+            if (cooldown == 0 && cur < n_dec_max) { grow_pool(cur + step); cooldown = 3; }
             else if (cur >= n_dec_max && gpu_lazy && ++gpu_starve >= 2) {
               // CPU pool maxed and writers STILL decode-starved for 2 windows ->
               // the CPU alone can't feed the sink.  Bring the GPU streams in, but
@@ -11902,10 +11937,16 @@ public:
         ctl_cv.notify_all();
         controller.join();
       }
+      // Drain the pipeline stage by stage: readers finish first (draining dq into
+      // ddq), THEN close the decode queue so no reader pushes after ddqdone, THEN
+      // let the decoders AND GPU workers (both now pop ddq) drain it and exit.
       { std::lock_guard<std::mutex> lk(qmx); qdone = true; }
       qcv.notify_all();
+      for (auto & t : readers) t.join();
+      { std::lock_guard<std::mutex> lk(ddmx); ddqdone = true; }
+      ddcv.notify_all();
       for (auto & t : dworkers) t.join();
-      for (auto & t : gpu_dworkers) t.join();   // GPU decoders wake on qdone too
+      for (auto & t : gpu_dworkers) t.join();
       if (!force_pool && dopt.verbosity >= V_VERBOSE) {
         int pk = peak_decoders.load(std::memory_order_relaxed);
         char b[128];
@@ -12400,11 +12441,14 @@ private:
     if (opt_.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt_, "[UNTAR] " + std::to_string(n) + " writer thread(s)\n");
     for (int i = 0; i < n; ++i) writers_.emplace_back([this] { writer_loop(); });
-    // --adapt: arm the grow-probe supervisor (extras cap at +base, i.e. up to a
-    // doubled pool).  The supervisor reconciles any target the forced hook or
-    // governor already raised before spawning.
+    // --adapt: arm the grow-probe supervisor.  Extras may bring the pool up to
+    // the machine's usable thread count (was capped at +base = a doubled pool),
+    // so a CPU/metadata-bound sink on a many-core box can put otherwise-idle
+    // cores on the writers.  The governor's keep-or-revert probe only grows into
+    // this headroom while each step pays, so a device- (bandwidth-) bound sink
+    // still settles low; low-core boxes keep the old ~2xbase behavior.
     if (opt_.adapt) {
-      ewgrow_cap_ = n;
+      ewgrow_cap_ = std::max(n, cpu - n);
       ewsup_stop_ = false;
       ewsup_ = std::thread([this] { ewriter_supervisor(); });
     }
@@ -13770,14 +13814,13 @@ static bool build_foreign_seek_plan(FILE * in,
 // (both physically pread it), so the later partition passes false for that one
 // leading frame to keep the reported compressed-input figure at the archive's
 // logical size rather than double-counting the re-read.
-static FrameBuf decode_seek_frame(int fd,
-                                  const std::vector<uint64_t> & c_off,
-                                  const std::vector<uint64_t> & u_off,
-                                  size_t k, std::vector<char> & comp,
-                                  ZSTD_DCtx * dctx, Meter * m, bool count_read) {
+// The pread half: fill `comp` with frame k's csz compressed bytes.  Cheap (I/O
+// only) so a reader pool can run it independently of the decompressors.
+static void pread_seek_frame(int fd, const std::vector<uint64_t> & c_off,
+                             size_t k, std::vector<char> & comp,
+                             Meter * m, bool count_read) {
   const uint64_t coff = c_off[k];
   const size_t csz = (size_t)(c_off[k + 1] - coff);
-  const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
   comp.resize(csz);
   for (size_t got = 0; got < csz;) {
     ssize_t r = ::pread(fd, comp.data() + got, csz - got, (off_t)(coff + got));
@@ -13787,9 +13830,16 @@ static FrameBuf decode_seek_frame(int fd,
     got += (size_t)r;
   }
   if (m && count_read) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+}
+
+// The decompress half: verify the already-read frame against the index and
+// decompress it into an owning FrameBuf.  `usz` is the expected size from the
+// member index; a decoder (CPU or the GPU rescue path) owns its own DCtx.
+static FrameBuf decompress_seek_frame(const char * comp, size_t csz, size_t usz,
+                                      size_t k, ZSTD_DCtx * dctx) {
   // GPU-written frames may omit the content size; when present it must
   // corroborate the index geometry before we allocate.
-  unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), csz);
+  unsigned long long fcs = ZSTD_getFrameContentSize(comp, csz);
   if (fcs == ZSTD_CONTENTSIZE_ERROR
       || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz))
     die_data("seek-extract: frame " + std::to_string(k)
@@ -13801,12 +13851,23 @@ static FrameBuf decode_seek_frame(int fd,
     die_data("seek-extract: frame " + std::to_string(k)
              + ": implausible frame size in seek table");
   FrameBuf fb = std::make_shared<FrameVec>(usz);
-  size_t dz = ZSTD_decompressDCtx(dctx, fb->data(), usz, comp.data(), csz);
+  size_t dz = ZSTD_decompressDCtx(dctx, fb->data(), usz, comp, csz);
   if (ZSTD_isError(dz) || dz != usz)
     die_data("seek-extract: frame " + std::to_string(k) + ": "
              + (ZSTD_isError(dz) ? ZSTD_getErrorName(dz)
                                  : "size mismatch vs member index"));
   return fb;
+}
+
+// Fused pread+decompress (the inline parse-thread path and seek_feed use this).
+static FrameBuf decode_seek_frame(int fd,
+                                  const std::vector<uint64_t> & c_off,
+                                  const std::vector<uint64_t> & u_off,
+                                  size_t k, std::vector<char> & comp,
+                                  ZSTD_DCtx * dctx, Meter * m, bool count_read) {
+  pread_seek_frame(fd, c_off, k, comp, m, count_read);
+  return decompress_seek_frame(comp.data(), comp.size(),
+                               (size_t)(u_off[k + 1] - u_off[k]), k, dctx);
 }
 
 static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
@@ -21285,10 +21346,17 @@ static void apply_backend_defaults(Options & opt)
     g_adapt_writer_probe_allowed.store(0, std::memory_order_relaxed);
 
   // Extract writer-pool grow prior (M4 action 5c): -d --tar starts its pool at
-  // the profile's settled tar_write_threads (the probe still explores upward
-  // from there unless converged), and a converged verdict latches the probe off
-  // so a settled machine doesn't re-pay it every run.  --write-threads (user
-  // pin) always wins in start_pool.  Latest-wins, so hardware changes reopen it.
+  // the profile's settled tar_write_threads and always keeps probing upward from
+  // there.  The old design latched the probe OFF once converged, but that verdict
+  // is keyed only to the hardware fingerprint while the writer-sink optimum is
+  // MEDIA- and WORKLOAD-dependent: a run that converged low on one target (an
+  // in-RAM/tmpfs sink where extra writers never pay, or a small archive) would
+  // then refuse to use idle cores on a real disk that wants a much larger pool.
+  // The probe is cheap and self-limiting (a single +step round reverts in ~0.5 s
+  // when there is nothing to gain), so re-probing every run is worth keeping the
+  // pool matched to the actual sink.  The settled size still seeds the start, so
+  // a stable box pays only that one confirming round.  --write-threads (user pin)
+  // always wins in start_pool.
   if (priors.loaded && opt.tar_mode && opt.mode == Mode::DECOMPRESS) {
     if (prior_dir.tar_write_threads >= 1) {
       g_adapt_ewgrow_prior_base.store((int)std::min(prior_dir.tar_write_threads, 4096.0),
@@ -21296,14 +21364,13 @@ static void apply_backend_defaults(Options & opt)
       if (opt.verbosity >= V_VERBOSE) {
         char b[128];
         std::snprintf(b, sizeof(b),
-          "[ADAPT] extract pool starts at the profile's settled %d writer(s)%s\n",
-          (int)prior_dir.tar_write_threads,
-          prior_dir.tar_wt_converged != 0 ? " (converged, probe off)" : " (probe still explores)");
+          "[ADAPT] extract pool starts at the profile's settled %d writer(s) (probe re-explores)\n",
+          (int)prior_dir.tar_write_threads);
         vlog(V_VERBOSE, opt, b);
       }
     }
-    if (prior_dir.tar_wt_converged != 0)
-      g_adapt_ewgrow_allowed.store(0, std::memory_order_relaxed);
+    // NOTE: tar_wt_converged is intentionally NOT used to disable the probe (see
+    // above) — it stays in the profile for diagnostics only.
   }
 #endif
 

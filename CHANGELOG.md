@@ -1,11 +1,29 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.23  
+**Covers:** v0.9.50 → v0.15.24  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.24 — -d --tar: decouple reading from decoding in parallel extract + uncap the writer-sink probe (Phase 3, part 1)
+
+**Groundwork for a bottleneck-aware extract controller: make reading, decoding, and writing independently scalable so spare CPU can flow to whichever stage is actually the limiter.** Two of the three stages needed work; the third (writers) needed its ceiling lifted.
+
+**Reader ↔ decoder decouple in `run_parallel`.** Every other decode path already separates I/O from compute — `decompress_cpu_mt`/`decompress_nvcomp` stream via a reader→TaskQueue→worker pipeline, and tar-*create*'s `assemble` runs `--read-threads` readers feeding the compress workers. Only `run_parallel` (the seek-based parallel extractor) fused them: `decode_seek_frame` did `pread` + `ZSTD_decompressDCtx` on one thread, so read concurrency and decode concurrency were the same knob. This splits it:
+```
+parse dispatch → dq → READER pool (pread only) → ddq → { CPU decoders, GPU workers } → psync → parse consume
+```
+`decode_seek_frame` is now `pread_seek_frame` (I/O) + `decompress_seek_frame` (verify + decompress); the fused form remains for the inline (non-offload) path and `seek_feed`. The **reader pool is the sole I/O stage** — the GPU pool decoder was converted to H2D straight from the reader's owned buffers (dropping its own `pread` and its staging copy; a rescued frame decompresses the buffer already in hand, no re-read), and read-byte accounting is now the reader's alone (counted once). In-flight frames stay bounded by the same permit budget (a permit spans dispatch→consume across *both* queues, so `ddq` cannot outgrow it); deadlock-freedom holds by the same argument extended one stage. This is the structural step — readers and decoders currently scale in tandem (R=D); the unified controller (part 2) will budget them independently.
+
+Byte-identical to the serial walk on real NVMe across serial / forced pipeline / `--adapt` / forced+GPU on a 390 K-file archive, and on a 6 GiB decode-heavy archive where the GPU decoded 250 frames through the new `ddq` route (0 rescued). Full suite 346, including the four `parallel-extract` metadata tests (symlink/hardlink tree byte-for-byte vs tar).
+
+**Writer-sink probe uncapped.** The `--adapt` writer-grow probe (action 5c) was hard-limited to `2×base` (≈32 on a many-core box), so a CPU/metadata-bound sink left most cores idle — on a real-NVMe 390 K-file extract the pool sat at 16 writers with the sink 79 % busy / 5 % starved and ~84 of 96 cores idle. The supervisor ceiling is now the machine's usable thread count and the probe does as many keep-or-revert rounds as needed; it still only grows while each `+step` round pays ≥10 %, so a device-bandwidth-bound sink settles low and low-core boxes keep the old ~`2×base` behavior.
+
+**Writer-probe latch no longer sticks across media.** A converged verdict (`tar_wt_converged`) used to disable the probe permanently, keyed only to the hardware fingerprint — but the writer-sink optimum is media- and workload-dependent. Testing on a tmpfs (bandwidth-infinite sink → extra writers never pay → the probe reverts at base and latched off) poisoned the per-machine profile so it then refused to probe on real disk. The settled size still seeds the start, but a stale convergence no longer disables re-probing (the probe is cheap and self-limiting, ~one confirming round when nothing has changed). **Hosts that ran tmpfs-based tests may have a `~/.cache/gzstd/profile.json` throttling extract writers to a low count — worth clearing.**
+
+Suite: 346 (no arg-parse change; the new env/structure is exercised by the existing `parallel-extract` + `GZSTD_FORCE_POOL`/`GZSTD_POOL_GPU` tests).
 
 ## v0.15.23 — -d --tar: adaptive (auto) GPU engagement in the decode pool + VRAM budget dimension (Phase 2)
 

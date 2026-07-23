@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.23
+**Current version:** v0.15.24
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -220,14 +220,25 @@ driver-quarantine only for the GPU one) and the established review gates.
 ### 2.5 `--adapt` × `--tar` Integration (proposed 2026-07-17)
 **Priority: Medium | Complexity: Medium | Status: IN PROGRESS — #1 signal DONE v0.15.11, #1 ACTUATOR DONE v0.15.12; the rest are the governor's remaining blind spots**
 
-**Architecture note (found while building the actuator):** the extract levers are
-NOT uniform peers. Only the writer POOL is a clean in-run probe target (a shared
-job queue — spawn/reap writers live). Decompress concurrency in `run_parallel` is
-the partition count `N`, fixed at start; the `run_sink` parse is serial by design;
-the extract read is done by those same `N` partition workers (no separate read
-pool to govern); the FrameSink budget is tar-exempt. So decompress/read
-parallelism, if governed at all, is a cross-run profile START-size, not an in-run
-probe — a separate, coarser follow-up.
+**Architecture note — UPDATED v0.15.24 (the decouple changed this).** The
+original finding was that only the writer POOL was a clean in-run probe target and
+`run_parallel`'s decode/read were fused and fixed-at-start. That is no longer true:
+v0.15.20–22 made decode a live-growable pool (the shared decode queue), and v0.15.24
+split reading from decoding into two independently-scalable stages (reader pool →
+`ddq` → decoders + GPU). So the extract now has THREE in-run levers — reader `R`,
+decoder `D`, writer `W` — all shared job queues with spawn/reap. `run_sink` still
+rides the streaming `decompress_cpu_mt` pipeline (already read/decode-decoupled) and
+its parse is serial by design; the FrameSink budget stays tar-exempt.
+
+**Bottleneck-aware unified controller (Phase 3, part 2 — IN PROGRESS).** With R/D/W
+all live levers, the goal is one governor-owned closed loop that maximizes end-to-end
+extract rate `d(wrote_bytes)/dt` by allocating a total CPU budget (usable cores) across
+the three stages: sense the bottleneck (writers starved → read/decode behind; writers
+busy / parse enqueue-blocked → sink-bound), grow the bottleneck stage, and AT BUDGET
+shrink a non-bottleneck stage (no oversubscription); keep-or-revert on the rate; persist
+a re-probeable R/D/W split. Subsumes today's split governor-5c (writers) + local decode
+controller. v0.15.24 shipped the structural decouple + uncapped writer probe; the
+unified budgeting is next.
 
 The v0.15.x governor runs on `--tar` operations but several of its senses
 and levers don't reach the tar-specific machinery (each was an explicit,
