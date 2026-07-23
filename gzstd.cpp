@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.20";
+static constexpr const char * GZSTD_VERSION = "0.15.21";
 //
 // Architecture overview:
 //
@@ -1096,6 +1096,12 @@ static void print_help_long()
 "     (or, past a second deadline, treated as a fault with a CPU-only\n"
 "     rebuild).  Measured verdicts persist to the per-machine profile\n"
 "     (see PROFILE below) so the next run starts at the answer.\n"
+"     On -d --tar extraction the same regimes drive extract-specific\n"
+"     actuators: sink-bound grows the parallel file-writer pool, and\n"
+"     decode-bound (the writers starving for frames) offloads frame\n"
+"     decode from the parse threads to a pool of decoders that grows\n"
+"     while the starvation lasts, then reverts to inline decode when\n"
+"     it clears.\n"
 "     Explicit flags always win: no action ever overrides a value you\n"
 "     set.  --no-adapt is accepted now so scripts keep working when the\n"
 "     default flips (decision planned for v1.0).\n"
