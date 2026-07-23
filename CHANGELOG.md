@@ -1,11 +1,27 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.22  
+**Covers:** v0.9.50 → v0.15.23  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.23 — -d --tar: adaptive (auto) GPU engagement in the decode pool + VRAM budget dimension (Phase 2)
+
+**Phase 1 (v0.15.22) added GPU-stream decoders to the parallel decode pool but only spawned them eagerly via `GZSTD_POOL_GPU`. This makes them engage AUTOMATICALLY under `--adapt` — but only on the box that actually benefits (CPU-poor / GPU-rich, decode-bound), never speculatively — and fixes the frame budget that was starving the GPU on exactly that box.**
+
+**Adaptive (lazy) engagement.** Under `--adapt` the decode pool's controller already grows the CPU decoder pool while the writers are decode-starved. It now has one more move: when the CPU pool has grown to its cap AND the writers are STILL decode-starved for a couple of windows, the CPU alone cannot feed the sink, so the controller brings the GPU streams in — spawning them lazily (the ~cuInit cost and the VRAM are paid only at that point, never up front). This is the decode-side analogue of the compress hybrid scheduler's CPU/GPU work-sharing.
+
+**Remaining-time guard (why this doesn't regress the common case).** Lazy engagement fires only if the estimated remaining extract time (from the live progress meter) exceeds cuInit by a margin (~4 s). A fast/short run whose CPU pool briefly reads as starved — e.g. extracting to tmpfs or a very fast NVMe on a many-core box, where even a full CPU pool cannot outrun a RAM-speed sink — finishes before the GPU could come online, so the guard skips it and never does the speculative multi-GB VRAM grab (which would be antisocial on a shared box). The slow CPU-poor box this targets always has plenty of work left, so it engages there. No core-count or machine-specific threshold is used — the separation falls out of "will the GPU be ready in time to help." `GZSTD_POOL_GPU` remains an eager force (spawn up front, for tests / when the user knows they want it).
+
+**VRAM dimension of the frame budget.** The in-flight frame budget was `2·D` in CPU decoders (capped by the seek_feed 4 GiB host ceiling) — sized for the CPU pool, so on a CPU-poor box (small `D`) it was tiny (e.g. 4–16 frames) and starved the GPU streams, which want batches of tens of frames. When GPU decoders engage, the budget now grows to also cover `ndev·gpu_batch` frames in flight, still capped by the same 4 GiB host ceiling so RAM stays bounded. The `Budget` semaphore gained a grow-only `grow()` (add permits + wake blocked acquirers) — monotonic, so it cannot break the pool's deadlock-freedom argument (more permits is strictly more concurrency).
+
+Validation (256-core + 8×H100, all byte-identical to the serial walk): under plain `--adapt` with the CPU pool throttled small and a decode-bound extract, the controller auto-engages the GPU and the streams decode real frames (a 10 GiB archive: budget grown 4→128, dozens of frames GPU-decoded, 0 rescued); the fast-tmpfs full-CPU-pool run correctly SKIPS the GPU via the remaining-time guard (no VRAM grab); the eager `GZSTD_POOL_GPU` path still engages and grows the budget; and the Phase 1 matrix (symlink/hardlink metadata, oversize-frame CPU routing, `GZSTD_DEBUG_OFFLOAD_FLAP` stress, no-GPU fallback) all still round-trip.
+
+**Still deferred:** the perf win itself needs a genuine CPU-poor / GPU-rich box to demonstrate (a CPU-rich box's pool clears the starvation before the GPU is worth engaging); Phase 3 (D2H-cost-aware routing — keep trivially-compressed / small frames on CPU per the existing <2% rule, decode-heavy frames on GPU) is unbuilt.
+
+Suite: 346 normal (the Phase 1 GPU-gated test now also exercises the budget-grow path; lazy engagement is validated manually — it is timing-dependent by construction and a deterministic suite test would need a multi-second extract).
 
 ## v0.15.22 — -d --tar: GPU-stream decoders in the parallel decode pool (opt-in, Phase 1: correctness)
 

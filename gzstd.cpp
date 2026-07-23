@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.22";
+static constexpr const char * GZSTD_VERSION = "0.15.23";
 //
 // Architecture overview:
 //
@@ -11559,6 +11559,15 @@ public:
         --permits; return true;
       }
       void release() { { std::lock_guard<std::mutex> lk(mx); ++permits; } cv.notify_one(); }
+      // Raise the ceiling mid-run (called once when GPU decoders engage): add
+      // permits and wake any blocked acquirers.  Only ever grows, so it cannot
+      // break the deadlock-freedom argument -- more permits is strictly more
+      // concurrency, never less.
+      void grow(size_t delta) {
+        if (!delta) return;
+        { std::lock_guard<std::mutex> lk(mx); permits += delta; }
+        cv.notify_all();
+      }
     } budget(budget_frames);
 
     struct DItem { int pi; size_t k; bool count_read; };
@@ -11606,108 +11615,67 @@ public:
         peak_decoders.store((int)dworkers.size(), std::memory_order_relaxed);
     };
 
-    // Adaptive controller: sample the live writer busy/starved signal (fed into
-    // sink_meter_ by the writer pool under --adapt) and, when writers are decode-
-    // starved, turn offload ON and grow the decoder pool; when they are fed again,
-    // turn it OFF (back to zero-cost inline).  Hysteresis (revert only after a few
-    // calm windows) avoids flapping on mixed archives.
-    std::mutex ctl_mx; std::condition_variable ctl_cv; bool ctl_stop = false;
-    std::thread controller;
-    const bool flap = std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") != nullptr;
-    if (use_pool && force_pool) {
-      grow_decoders(n_dec_max);                       // A/B: all decoders up, offload forced on
-    } else if (use_pool && flap) {
-      // Test hook: rapidly toggle offload so producers constantly switch
-      // inline<->pool, exercising both transition directions + concurrent decode.
-      grow_decoders(n_dec_max);
-      controller = std::thread([&] {
-        bool on = false;
-        for (;;) {
-          {
-            std::unique_lock<std::mutex> lk(ctl_mx);
-            if (ctl_cv.wait_for(lk, std::chrono::milliseconds(2), [&] { return ctl_stop; })) break;
-          }
-          on = !on; offload_active.store(on, std::memory_order_relaxed);
-        }
-      });
-    } else if (use_pool) {
-      controller = std::thread([&] {
-        uint64_t pbusy = 0, pstarv = 0; int calm = 0, cooldown = 0;
-        const int step = std::max(2, n_dec_max / 8);
-        for (;;) {
-          {
-            std::unique_lock<std::mutex> lk(ctl_mx);
-            if (ctl_cv.wait_for(lk, std::chrono::milliseconds(120),
-                                [&] { return ctl_stop; })) break;
-          }
-          if (cooldown > 0) --cooldown;
-          if (!sink_meter_) continue;                 // no live signal (shouldn't happen under --adapt)
-          uint64_t b = sink_meter_->extract_busy_ns.load(std::memory_order_relaxed);
-          uint64_t s = sink_meter_->extract_starved_ns.load(std::memory_order_relaxed);
-          uint64_t db = b - pbusy, ds = s - pstarv; pbusy = b; pstarv = s;
-          if (db + ds < 2000000) continue;            // <2 ms of writer activity this window: no signal
-          double starv = (double)ds / (double)(db + ds);
-          if (starv > 0.20) {                         // decode-starved: offload on, grow the pool
-            offload_active.store(true, std::memory_order_relaxed);
-            // Grow ONE step, then wait a few windows for the signal to reflect the
-            // added decoders before growing again -- otherwise the loop laps the
-            // ~50 ms writer-flush lag and overshoots straight to the cap.
-            int cur = peak_decoders.load(std::memory_order_relaxed);
-            if (cooldown == 0 && cur < n_dec_max) { grow_decoders(cur + step); cooldown = 3; }
-            calm = 0;
-          } else if (starv < 0.05) {                  // writers fed: revert to inline after 3 calm windows
-            if (++calm >= 3) offload_active.store(false, std::memory_order_relaxed);
-          } else calm = 0;
-        }
-      });
+    // ---- GPU-stream decoders in the pool (Phase 2: adaptive engagement) ----
+    // A GPU-rich box whose CPU decoders can't keep the writers fed adds GPU
+    // streams to the SAME shared queue: each batch-pops (partition,frame) items,
+    // nvCOMP-decodes on its own stream, and scatters into the same reorder
+    // buffers alongside the CPU decoders (the decode-side mirror of the compress
+    // hybrid scheduler).  Correctness never depends on the GPU -- oversize
+    // (> GPU_SUBCHUNK_MAX) and nvCOMP-failed frames fall back to
+    // decode_seek_frame in-thread; a whole-stream fault rescues its batch on CPU
+    // and retires the worker; and the CPU decoders are the guaranteed backstop
+    // (grown in the same controller branch that turns offload on).  Engagement:
+    //   * GZSTD_POOL_GPU -> EAGER (spawn up front; the force/test path).
+    //   * --adapt        -> LAZY: the controller spawns the streams only once the
+    //     CPU pool has grown to its cap AND writers are STILL decode-starved --
+    //     i.e. only on the CPU-poor/GPU-rich box where it helps, never
+    //     speculatively (cuInit + VRAM are paid only when needed; on a GPU-less
+    //     box the one deferred cudaGetDeviceCount just fails fast).
+    size_t g_usz = 0, g_csz = 0;   // largest GPU-eligible frame (sizes the VRAM)
+    for (size_t k = 0; k < nframes; ++k) {
+      const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
+      if (usz == 0 || usz > GPU_SUBCHUNK_MAX) continue;   // > 16 MiB -> CPU only
+      g_usz = std::max(g_usz, usz);
+      g_csz = std::max<size_t>(g_csz, (size_t)(c_off[k + 1] - c_off[k]));
     }
-
-    // ---- optional GPU-stream decoders (opt-in: GZSTD_POOL_GPU) ----
-    // A CPU-poor / GPU-rich box doing a clean full extract would leave its GPU
-    // streams idle while a handful of CPU decoders drain the pool.  When
-    // GZSTD_POOL_GPU is set (and this isn't --cpu-only), spawn one GPU-stream
-    // decoder per selected device ALONGSIDE the CPU decoders: each batch-pops
-    // the same shared queue, nvCOMP-decodes on its own stream, and scatters
-    // results into the same per-partition reorder buffers.  Purely additive: if
-    // the GPU can't initialise, or a stream faults mid-run, the CPU decoders
-    // still drain everything -- correctness never depends on the GPU.  Frames
-    // only reach the queue while offload_active (writers decode-starved), so a
-    // write-bound run just parks these workers on the empty queue.  The CPU
-    // decoders are guaranteed present too: the adaptive controller grows the
-    // pool in the same branch that turns offload on, and force_pool maxes it
-    // up front -- so even if every GPU init fails the queue still drains.
+    const bool gpu_capable = use_pool && !dopt.cpu_only && g_usz > 0;
     std::vector<std::thread> gpu_dworkers;
     std::atomic<uint64_t> gpu_dec_frames{0};   // frames decoded on a GPU stream
     std::atomic<uint64_t> gpu_resc_frames{0};  // GPU-eligible frames CPU-rescued
     std::atomic<int>      gpu_dev_up{0};        // GPU decoders that initialised
 #ifdef HAVE_NVCOMP
-    const bool pool_gpu = use_pool && !dopt.cpu_only
-                          && std::getenv("GZSTD_POOL_GPU") != nullptr;
-    if (pool_gpu) {
-      int dc = 0;
-      if (cudaGetDeviceCount(&dc) != cudaSuccess) dc = 0;
-      const int ndev = dopt.gpu_devices > 0 ? std::min(dopt.gpu_devices, dc) : dc;
-      // Device-buffer strides = the largest GPU-eligible frame (frames above
-      // GPU_SUBCHUNK_MAX are always CPU-decoded, so they don't size the VRAM).
-      size_t g_usz = 0, g_csz = 0;
-      for (size_t k = 0; k < nframes; ++k) {
-        const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
-        if (usz == 0 || usz > GPU_SUBCHUNK_MAX) continue;
-        g_usz = std::max(g_usz, usz);
-        g_csz = std::max<size_t>(g_csz, (size_t)(c_off[k + 1] - c_off[k]));
-      }
-      if (ndev >= 1 && g_usz > 0) {
-        const size_t gpu_batch = std::min<size_t>(std::max<size_t>(1, budget_frames), 64);
+    const bool gpu_force = gpu_capable && std::getenv("GZSTD_POOL_GPU") != nullptr;
+    const bool gpu_lazy  = gpu_capable && dopt.adapt && !gpu_force;
+    // Target GPU batch, capped by the host-RAM ceiling (no point buffering more
+    // frames than could ever be in flight).
+    const size_t gpu_batch = std::min<size_t>(ram_cap_frames, 64);
+    std::once_flag gpu_spawn_once;
+    auto spawn_gpu_workers = [&] {
+      std::call_once(gpu_spawn_once, [&] {
+        int dc = 0;
+        if (cudaGetDeviceCount(&dc) != cudaSuccess) dc = 0;
+        const int ndev = dopt.gpu_devices > 0 ? std::min(dopt.gpu_devices, dc) : dc;
+        if (ndev < 1) {   // no usable GPU (absent, or CUDA_VISIBLE_DEVICES-masked)
+          vlog(V_VERBOSE, dopt, "[TAR] decode pool: no GPU available; CPU decoders only\n");
+          return;
+        }
+        // VRAM dimension of the frame budget: the CPU-sized budget (2*n_dec_max)
+        // starves GPU batches on a CPU-poor box, so grow it to also cover
+        // ndev*gpu_batch frames in flight -- still capped by the 4 GiB host
+        // ceiling so RAM stays bounded.
+        const size_t target = std::min(ram_cap_frames,
+            (size_t)2 * (size_t)n_dec_max + (size_t)ndev * gpu_batch);
+        if (target > budget_frames) budget.grow(target - budget_frames);
         if (dopt.verbosity >= V_VERBOSE) {
-          char b[160];
+          char b[192];
           std::snprintf(b, sizeof b,
-            "[TAR] decode pool: GPU decode on %d device(s), batch up to %zu frame(s)\n",
-            ndev, gpu_batch);
+            "[TAR] decode pool: GPU decode on %d device(s), batch up to %zu frame(s), budget -> %zu\n",
+            ndev, gpu_batch, target);
           vlog(V_VERBOSE, dopt, b);
         }
-        gpu_dworkers.reserve((size_t)ndev);
+        gpu_dworkers.reserve(gpu_dworkers.size() + (size_t)ndev);
         for (int d = 0; d < ndev; ++d) {
-          gpu_dworkers.emplace_back([&, dev = d, gpu_batch, g_csz, g_usz] {
+          gpu_dworkers.emplace_back([&, dev = d] {
             PoolGpuDecoder gd;
             if (!gd.init(dev, gpu_batch, g_csz, g_usz)) {
               vlog(V_VERBOSE, dopt, "[TAR] decode pool: GPU " + std::to_string(dev)
@@ -11716,7 +11684,7 @@ public:
             }
             gpu_dev_up.fetch_add(1, std::memory_order_relaxed);
             // Per-worker CPU rescue context, used only when nvCOMP fails a frame
-            // or when a claimed frame is too large for the GPU (> 16 MiB).
+            // or a claimed frame is too large for the GPU (> GPU_SUBCHUNK_MAX).
             ZSTD_DCtx * rescue_dctx = ZSTD_createDCtx();
             if (!rescue_dctx) die("failed to create ZSTD_DCtx");
             apply_mem_limit_to_dctx(rescue_dctx, dopt);
@@ -11775,9 +11743,91 @@ public:
             ZSTD_freeDCtx(rescue_dctx);
           });
         }
-      }
-    }
+      });
+    };
+#else
+    const bool gpu_force = false, gpu_lazy = false;
+    auto spawn_gpu_workers = [] {};
+    (void)gpu_capable; (void)g_csz;
 #endif // HAVE_NVCOMP
+
+    // Adaptive controller: sample the live writer busy/starved signal (fed into
+    // sink_meter_ by the writer pool under --adapt) and, when writers are decode-
+    // starved, turn offload ON and grow the decoder pool; when they are fed again,
+    // turn it OFF (back to zero-cost inline).  Hysteresis (revert only after a few
+    // calm windows) avoids flapping on mixed archives.
+    std::mutex ctl_mx; std::condition_variable ctl_cv; bool ctl_stop = false;
+    std::thread controller;
+    const bool flap = std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") != nullptr;
+    if (use_pool && force_pool) {
+      grow_decoders(n_dec_max);                       // A/B: all decoders up, offload forced on
+    } else if (use_pool && flap) {
+      // Test hook: rapidly toggle offload so producers constantly switch
+      // inline<->pool, exercising both transition directions + concurrent decode.
+      grow_decoders(n_dec_max);
+      controller = std::thread([&] {
+        bool on = false;
+        for (;;) {
+          {
+            std::unique_lock<std::mutex> lk(ctl_mx);
+            if (ctl_cv.wait_for(lk, std::chrono::milliseconds(2), [&] { return ctl_stop; })) break;
+          }
+          on = !on; offload_active.store(on, std::memory_order_relaxed);
+        }
+      });
+    } else if (use_pool) {
+      controller = std::thread([&] {
+        uint64_t pbusy = 0, pstarv = 0; int calm = 0, cooldown = 0, gpu_starve = 0;
+        const int step = std::max(2, n_dec_max / 8);
+        const uint64_t stream_total = u_off.empty() ? 0 : u_off.back();
+        for (;;) {
+          {
+            std::unique_lock<std::mutex> lk(ctl_mx);
+            if (ctl_cv.wait_for(lk, std::chrono::milliseconds(120),
+                                [&] { return ctl_stop; })) break;
+          }
+          if (cooldown > 0) --cooldown;
+          if (!sink_meter_) continue;                 // no live signal (shouldn't happen under --adapt)
+          uint64_t b = sink_meter_->extract_busy_ns.load(std::memory_order_relaxed);
+          uint64_t s = sink_meter_->extract_starved_ns.load(std::memory_order_relaxed);
+          uint64_t db = b - pbusy, ds = s - pstarv; pbusy = b; pstarv = s;
+          if (db + ds < 2000000) continue;            // <2 ms of writer activity this window: no signal
+          double starv = (double)ds / (double)(db + ds);
+          if (starv > 0.20) {                         // decode-starved: offload on, grow the pool
+            offload_active.store(true, std::memory_order_relaxed);
+            // Grow ONE step, then wait a few windows for the signal to reflect the
+            // added decoders before growing again -- otherwise the loop laps the
+            // ~50 ms writer-flush lag and overshoots straight to the cap.
+            int cur = peak_decoders.load(std::memory_order_relaxed);
+            if (cooldown == 0 && cur < n_dec_max) { grow_decoders(cur + step); cooldown = 3; }
+            else if (cur >= n_dec_max && gpu_lazy && ++gpu_starve >= 2) {
+              // CPU pool maxed and writers STILL decode-starved for 2 windows ->
+              // the CPU alone can't feed the sink.  Bring the GPU streams in, but
+              // ONLY if enough extract remains to outlast cuInit (~a few seconds):
+              // on a fast/short run the streams would come online after the work
+              // is gone -- wasting cuInit + a speculative VRAM grab (bad on a
+              // shared box).  The slow CPU-poor box this targets always has plenty
+              // left, so it engages there and skips the fast CPU-rich case without
+              // any machine-specific tuning.  spawn_gpu_workers is idempotent.
+              uint64_t done = feed_meter ? feed_meter->wrote_bytes.load(std::memory_order_relaxed) : 0;
+              double p = stream_total ? (double)done / (double)stream_total : 1.0;
+              double remaining_s = (p > 0.02) ? (double)(now_ns() - t0) / 1e9 * (1.0 - p) / p : 1e9;
+              if (remaining_s > 4.0) spawn_gpu_workers();
+            }
+            calm = 0;
+          } else if (starv < 0.05) {                  // writers fed: revert to inline after 3 calm windows
+            if (++calm >= 3) offload_active.store(false, std::memory_order_relaxed);
+            gpu_starve = 0;
+          } else { calm = 0; gpu_starve = 0; }
+        }
+      });
+    }
+
+    // Eager GPU engagement: GZSTD_POOL_GPU spawns the GPU streams up front (the
+    // force/test path).  Under plain --adapt they are spawned lazily instead, by
+    // the controller above, only once the CPU pool is maxed and still starved --
+    // so a CPU-rich or write-bound run never pays cuInit or VRAM.
+    if (gpu_force) spawn_gpu_workers();
 
     std::vector<ParCtx> pctx(parts.size());
     std::vector<std::thread> workers;

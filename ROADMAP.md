@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.22
+**Current version:** v0.15.23
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -255,19 +255,24 @@ documented deferral during M4):
   real +26% (16→24) optimum live on the 256-core box. Follow-up: periodic
   re-probe (the converged latch freezes the size like 5b — accepted, shared
   limitation) and positive-perf validation on the Gen<4 workstation.
-- **GPU decoders in the extract decode pool: Phase 1 DONE v0.15.22 (opt-in,
-  correctness).** The v0.15.20 decode pool was CPU-only; `GZSTD_POOL_GPU` now
-  adds one GPU-stream decoder per device that batch-drains the same shared frame
-  queue and scatters into the same reorder buffers alongside the CPU decoders
-  (oversize/failed frames and stream faults fall back to `decode_seek_frame`; CPU
-  decoders are the guaranteed backstop, so correctness never depends on the GPU).
-  Byte-identical everywhere; the win is niche (CPU-poor + GPU-rich + decode-bound
-  — a CPU-rich box's pool claims the frames before `cuInit`). **Deferred:** Phase 2
-  = adaptive GPU engagement off the writer-starvation signal + a VRAM dimension on
-  the frame budget (today the budget is `2·D` in CPU decoders, which starves GPU
-  batches on the exact CPU-poor box the feature targets); Phase 3 = D2H-cost-aware
-  routing (keep trivially-compressed/small frames on CPU per the existing <2% rule);
-  and positive-perf validation on a genuine CPU-poor/GPU-rich box.
+- **GPU decoders in the extract decode pool: Phase 1 DONE v0.15.22, Phase 2 DONE
+  v0.15.23.** The v0.15.20 decode pool was CPU-only; GPU-stream decoders now
+  batch-drain the same shared frame queue and scatter into the same reorder
+  buffers alongside the CPU decoders (oversize/failed frames and stream faults
+  fall back to `decode_seek_frame`; CPU decoders are the guaranteed backstop, so
+  correctness never depends on the GPU). **Phase 1** = the machinery + `GZSTD_POOL_GPU`
+  eager spawn (correctness). **Phase 2** = they engage AUTOMATICALLY under `--adapt`:
+  the controller spawns them lazily once the CPU pool is maxed AND still
+  decode-starved, but only if the estimated remaining extract time outlasts cuInit
+  (~4 s) — so a fast/short or CPU-rich run never pays a speculative VRAM grab, with
+  no machine-specific threshold. The frame budget also gained a VRAM dimension:
+  when GPU engages it grows from the CPU-sized `2·D` to also cover `ndev·gpu_batch`
+  frames in flight (still capped by the 4 GiB host ceiling), so the streams get
+  real batches on the CPU-poor box. Byte-identical everywhere. **Deferred:** Phase 3
+  = D2H-cost-aware routing (keep trivially-compressed/small frames on CPU per the
+  existing <2% rule, decode-heavy frames on GPU); and positive-perf validation on a
+  genuine CPU-poor/GPU-rich box (a CPU-rich box's pool clears the starvation before
+  the GPU is worth engaging, so the win isn't demonstrable there).
 - **Tar-create member-reader scale-up:** the v0.15.5 dormant-reader
   mechanism covers only the plain-decompress prefetch pool; the tar-create
   member readers (`--read-threads`, device-bound per the v0.14.x
