@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.21";
+static constexpr const char * GZSTD_VERSION = "0.15.22";
 //
 // Architecture overview:
 //
@@ -9744,6 +9744,14 @@ static std::atomic<bool> g_tar_had_errors{false};
  entries for paths > 100 bytes, and base-256 numeric fields for files > 8 GiB
  or uid/gid > 2^21.
 ======================================================================*/
+#ifdef HAVE_NVCOMP
+// Defined with the other GPU machinery far below (global scope, internal
+// linkage); forward-declared here so tarx::PoolGpuDecoder can reuse the same
+// throw-on-error CUDA/nvCOMP checks.
+static void checkCuda(cudaError_t st, const char * msg);
+static void checkNvcomp(nvcompStatus_t st, const char * msg);
+#endif
+
 namespace tarx {
 
 static constexpr size_t TAR_BLK    = 512;
@@ -11104,6 +11112,203 @@ static FrameBuf decode_seek_frame(int fd,
                                   size_t k, std::vector<char> & comp,
                                   ZSTD_DCtx * dctx, Meter * m, bool count_read = true);
 
+#ifdef HAVE_NVCOMP
+// Self-contained batched GPU frame decoder for the -d --tar parallel decode
+// pool.  The pool's CPU primitive is decode_seek_frame (pread + one-frame
+// ZSTD_decompressDCtx); this is its GPU sibling: it preads a BATCH of frames'
+// compressed bytes, batched-decodes them on one CUDA stream via nvCOMP, copies
+// each result back, and hands the caller a FrameBuf per frame.  A frame that
+// nvCOMP can't decode (per-chunk status/size, or a whole-stream CUDA fault) is
+// flagged for CPU rescue — the pool's caller re-decodes it with
+// decode_seek_frame, which either succeeds (transient glitch) or dies with a
+// clean data error (genuine corruption), exactly matching the CPU path.
+//
+// Deliberately lean vs the streaming decompress_nvcomp worker: no auto-tuner,
+// no HybridSched, no ResultStore/RescueQueue, no pinned-memory budget, no
+// out-buffer recycling.  It just turns {frame indices} into {FrameBufs} on a
+// GPU-rich box whose few CPU decoders would otherwise leave the streams idle.
+// nvCOMP zstd decode is capped at GPU_SUBCHUNK_MAX per chunk, so the caller
+// must route any frame with a larger decompressed size to the CPU path; this
+// decoder assumes every k it is handed decompresses to <= GPU_SUBCHUNK_MAX.
+struct PoolGpuDecoder {
+  int device_id = -1;
+  cudaStream_t stream{};
+  size_t cap_batch    = 0;   // most frames per nvCOMP call (VRAM-fit clamped)
+  size_t stride_comp  = 0;   // per-slot compressed-input bytes
+  size_t stride_decomp = 0;  // per-slot decompressed-output bytes
+  size_t temp_bytes   = 0;   // current nvCOMP workspace size (grows on demand)
+
+  void *  d_comp = nullptr, * d_decomp = nullptr, * d_temp = nullptr;
+  void ** d_comp_ptrs = nullptr, ** d_decomp_ptrs = nullptr;
+  size_t * d_comp_sizes = nullptr, * d_decomp_sizes = nullptr, * d_actual = nullptr;
+  nvcompStatus_t * d_stats = nullptr;
+
+  std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual, h_off;
+  std::vector<nvcompStatus_t> h_stats;
+  std::vector<char> stage;   // pread staging, reused across batches
+  std::string last_error;
+
+  // Allocate device buffers for up to `batch` frames of the given strides,
+  // halving the batch until it fits in free VRAM.  Returns false on any CUDA
+  // failure (the caller then simply runs without this GPU — the CPU decoders
+  // still drain the queue).
+  bool init(int dev, size_t batch, size_t sc, size_t sd) {
+    device_id = dev; stride_comp = std::max<size_t>(1, sc); stride_decomp = std::max<size_t>(1, sd);
+    if (cudaSetDevice(dev) != cudaSuccess) return false;
+    if (cudaStreamCreate(&stream) != cudaSuccess) return false;
+    size_t b = std::max<size_t>(1, batch);
+    for (; b >= 1; b /= 2) {
+      size_t free_b = 0, total_b = 0;
+      if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+      size_t est = b * stride_comp + b * stride_decomp
+                 + b * (sizeof(void*) * 2 + sizeof(size_t) * 3 + sizeof(nvcompStatus_t))
+                 + (size_t)256 * ONE_MIB;   // nvCOMP temp headroom (queried per batch)
+      if ((double)est <= (double)free_b * 0.85) break;
+      if (b == 1) return false;             // can't fit even one frame
+    }
+    cap_batch = b;
+    if (cudaMalloc(&d_comp,        cap_batch * stride_comp)   != cudaSuccess) return false;
+    if (cudaMalloc(&d_decomp,      cap_batch * stride_decomp) != cudaSuccess) return false;
+    if (cudaMalloc(&d_comp_ptrs,   cap_batch * sizeof(void*))  != cudaSuccess) return false;
+    if (cudaMalloc(&d_decomp_ptrs, cap_batch * sizeof(void*))  != cudaSuccess) return false;
+    if (cudaMalloc(&d_comp_sizes,   cap_batch * sizeof(size_t)) != cudaSuccess) return false;
+    if (cudaMalloc(&d_decomp_sizes, cap_batch * sizeof(size_t)) != cudaSuccess) return false;
+    if (cudaMalloc(&d_actual,       cap_batch * sizeof(size_t)) != cudaSuccess) return false;
+    if (cudaMalloc(&d_stats, cap_batch * sizeof(nvcompStatus_t)) != cudaSuccess) return false;
+    // The slot pointer arrays are fixed for the buffer's lifetime, so upload
+    // them once here rather than every batch.
+    std::vector<void*> hcp(cap_batch), hdp(cap_batch);
+    for (size_t i = 0; i < cap_batch; ++i) {
+      hcp[i] = (char*)d_comp   + i * stride_comp;
+      hdp[i] = (char*)d_decomp + i * stride_decomp;
+    }
+    if (cudaMemcpy(d_comp_ptrs,   hcp.data(), cap_batch * sizeof(void*), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    if (cudaMemcpy(d_decomp_ptrs, hdp.data(), cap_batch * sizeof(void*), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    h_comp_sizes.resize(cap_batch); h_decomp_sizes.resize(cap_batch);
+    h_actual.resize(cap_batch);     h_stats.resize(cap_batch);
+    return true;
+  }
+
+  // Decode frames ks[0..n) (n <= cap_batch).  out[i] is the decoded FrameBuf
+  // for ks[i], or null with rescue[i]=1 when that frame must fall back to CPU.
+  // Returns false on a stream/CUDA fault (out all null, rescue all set) so the
+  // caller rescues the whole batch and retires this GPU worker.  Does NOT touch
+  // any Meter: read-byte accounting is the caller's, so a GPU-then-CPU-rescued
+  // frame is counted exactly once.
+  bool decode(int fd,
+              const std::vector<uint64_t> & c_off,
+              const std::vector<uint64_t> & u_off,
+              const std::vector<size_t> & ks,
+              std::vector<FrameBuf> & out,
+              std::vector<char> & rescue) {
+    const size_t n = ks.size();
+    out.assign(n, nullptr);
+    rescue.assign(n, 0);
+    if (n == 0) return true;
+    try {
+      checkCuda(cudaSetDevice(device_id), "pool-gpu: cudaSetDevice");
+      // Two passes so the async H2D copies read a stable source: pass 1 preads
+      // every frame into its own slice of one contiguous staging buffer (which
+      // may reallocate as it grows, but no copy is in flight yet); pass 2 issues
+      // the async uploads from the now-fixed buffer.  A single reused buffer
+      // would let pass-2 frame i+1 overwrite bytes frame i's async copy is still
+      // reading.
+      size_t total_decomp = 0, total_comp = 0;
+      h_off.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        const size_t k = ks[i];
+        const size_t csz = (size_t)(c_off[k + 1] - c_off[k]);
+        const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
+        h_off[i] = total_comp;   total_comp += csz;
+        h_comp_sizes[i] = csz;   h_decomp_sizes[i] = usz;   total_decomp += usz;
+      }
+      stage.resize(total_comp);
+      for (size_t i = 0; i < n; ++i) {
+        const uint64_t coff = c_off[ks[i]];
+        const size_t csz = h_comp_sizes[i];
+        for (size_t got = 0; got < csz;) {
+          ssize_t r = ::pread(fd, stage.data() + h_off[i] + got, csz - got, (off_t)(coff + got));
+          if (r < 0 && errno == EINTR) continue;
+          if (r <= 0) die_io("seek-extract (gpu): pread failed at frame "
+                             + std::to_string(ks[i]) + ": "
+                             + (r < 0 ? std::strerror(errno) : "unexpected EOF"));
+          got += (size_t)r;
+        }
+      }
+      for (size_t i = 0; i < n; ++i)
+        checkCuda(cudaMemcpyAsync((char*)d_comp + i * stride_comp,
+                                  stage.data() + h_off[i], h_comp_sizes[i],
+                                  cudaMemcpyHostToDevice, stream), "pool-gpu: H2D input");
+      checkCuda(cudaMemcpyAsync(d_comp_sizes, h_comp_sizes.data(), n * sizeof(size_t),
+                                cudaMemcpyHostToDevice, stream), "pool-gpu: H2D comp sizes");
+      checkCuda(cudaMemcpyAsync(d_decomp_sizes, h_decomp_sizes.data(), n * sizeof(size_t),
+                                cudaMemcpyHostToDevice, stream), "pool-gpu: H2D decomp sizes");
+      checkCuda(cudaStreamSynchronize(stream), "pool-gpu: sync pre-temp");
+
+      nvcompBatchedZstdDecompressOpts_t opts{};
+      size_t needed_temp = 0;
+      nvcompStatus_t tst = nvcompBatchedZstdDecompressGetTempSizeSync(
+          (const void * const *)d_comp_ptrs, d_comp_sizes, n, stride_decomp,
+          &needed_temp, total_decomp, opts, d_stats, stream);
+      if (tst != nvcompSuccess)
+        throw std::runtime_error("pool-gpu: decompress temp size (nvCOMP status "
+                                 + std::to_string((int)tst) + ")");
+      if (needed_temp > temp_bytes) {
+        if (d_temp) { cudaFree(d_temp); d_temp = nullptr; temp_bytes = 0; }
+        checkCuda(cudaMalloc(&d_temp, needed_temp), "pool-gpu: temp alloc");
+        temp_bytes = needed_temp;
+      }
+      checkNvcomp(nvcompBatchedZstdDecompressAsync(
+          (const void * const *)d_comp_ptrs, d_comp_sizes, d_decomp_sizes,
+          d_actual, n, d_temp, temp_bytes, (void * const *)d_decomp_ptrs,
+          opts, d_stats, stream), "pool-gpu: decompress");
+      checkCuda(cudaStreamSynchronize(stream), "pool-gpu: sync decompress");
+      checkCuda(cudaMemcpy(h_stats.data(), d_stats, n * sizeof(nvcompStatus_t),
+                           cudaMemcpyDeviceToHost), "pool-gpu: D2H statuses");
+      checkCuda(cudaMemcpy(h_actual.data(), d_actual, n * sizeof(size_t),
+                           cudaMemcpyDeviceToHost), "pool-gpu: D2H actual sizes");
+      for (size_t i = 0; i < n; ++i) {
+        const size_t usz = h_decomp_sizes[i];
+        // nvCOMP can report success yet a size that disagrees with the index
+        // (corrupt input / transient fault); flag for CPU rescue rather than
+        // trust it, mirroring the streaming worker's guard.
+        if (h_stats[i] != nvcompSuccess || h_actual[i] != usz) { rescue[i] = 1; continue; }
+        FrameBuf fb = std::make_shared<FrameVec>(usz);
+        checkCuda(cudaMemcpy(fb->data(), (char*)d_decomp + i * stride_decomp, usz,
+                             cudaMemcpyDeviceToHost), "pool-gpu: D2H output");
+        out[i] = std::move(fb);
+      }
+      return true;
+    } catch (const std::exception & e) {
+      // Whole-stream CUDA/nvCOMP fault: hand every frame to the CPU rescue path
+      // and let the caller retire this worker (a wedged GPU stays wedged —
+      // see the Turing fault-rebuild history).
+      last_error = e.what();
+      for (size_t i = 0; i < n; ++i) { out[i] = nullptr; rescue[i] = 1; }
+      return false;
+    }
+  }
+
+  ~PoolGpuDecoder() {
+    if (device_id >= 0) cudaSetDevice(device_id);
+    if (d_comp)        cudaFree(d_comp);
+    if (d_decomp)      cudaFree(d_decomp);
+    if (d_temp)        cudaFree(d_temp);
+    if (d_comp_ptrs)   cudaFree(d_comp_ptrs);
+    if (d_decomp_ptrs) cudaFree(d_decomp_ptrs);
+    if (d_comp_sizes)  cudaFree(d_comp_sizes);
+    if (d_decomp_sizes) cudaFree(d_decomp_sizes);
+    if (d_actual)      cudaFree(d_actual);
+    if (d_stats)       cudaFree(d_stats);
+    if (stream)        cudaStreamDestroy(stream);
+  }
+
+  PoolGpuDecoder() = default;
+  PoolGpuDecoder(const PoolGpuDecoder &) = delete;
+  PoolGpuDecoder & operator=(const PoolGpuDecoder &) = delete;
+};
+#endif // HAVE_NVCOMP
+
 class Extractor {
 public:
   // validate_only: parse and structurally verify the tar (header checksums,
@@ -11457,6 +11662,123 @@ public:
       });
     }
 
+    // ---- optional GPU-stream decoders (opt-in: GZSTD_POOL_GPU) ----
+    // A CPU-poor / GPU-rich box doing a clean full extract would leave its GPU
+    // streams idle while a handful of CPU decoders drain the pool.  When
+    // GZSTD_POOL_GPU is set (and this isn't --cpu-only), spawn one GPU-stream
+    // decoder per selected device ALONGSIDE the CPU decoders: each batch-pops
+    // the same shared queue, nvCOMP-decodes on its own stream, and scatters
+    // results into the same per-partition reorder buffers.  Purely additive: if
+    // the GPU can't initialise, or a stream faults mid-run, the CPU decoders
+    // still drain everything -- correctness never depends on the GPU.  Frames
+    // only reach the queue while offload_active (writers decode-starved), so a
+    // write-bound run just parks these workers on the empty queue.  The CPU
+    // decoders are guaranteed present too: the adaptive controller grows the
+    // pool in the same branch that turns offload on, and force_pool maxes it
+    // up front -- so even if every GPU init fails the queue still drains.
+    std::vector<std::thread> gpu_dworkers;
+    std::atomic<uint64_t> gpu_dec_frames{0};   // frames decoded on a GPU stream
+    std::atomic<uint64_t> gpu_resc_frames{0};  // GPU-eligible frames CPU-rescued
+    std::atomic<int>      gpu_dev_up{0};        // GPU decoders that initialised
+#ifdef HAVE_NVCOMP
+    const bool pool_gpu = use_pool && !dopt.cpu_only
+                          && std::getenv("GZSTD_POOL_GPU") != nullptr;
+    if (pool_gpu) {
+      int dc = 0;
+      if (cudaGetDeviceCount(&dc) != cudaSuccess) dc = 0;
+      const int ndev = dopt.gpu_devices > 0 ? std::min(dopt.gpu_devices, dc) : dc;
+      // Device-buffer strides = the largest GPU-eligible frame (frames above
+      // GPU_SUBCHUNK_MAX are always CPU-decoded, so they don't size the VRAM).
+      size_t g_usz = 0, g_csz = 0;
+      for (size_t k = 0; k < nframes; ++k) {
+        const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
+        if (usz == 0 || usz > GPU_SUBCHUNK_MAX) continue;
+        g_usz = std::max(g_usz, usz);
+        g_csz = std::max<size_t>(g_csz, (size_t)(c_off[k + 1] - c_off[k]));
+      }
+      if (ndev >= 1 && g_usz > 0) {
+        const size_t gpu_batch = std::min<size_t>(std::max<size_t>(1, budget_frames), 64);
+        if (dopt.verbosity >= V_VERBOSE) {
+          char b[160];
+          std::snprintf(b, sizeof b,
+            "[TAR] decode pool: GPU decode on %d device(s), batch up to %zu frame(s)\n",
+            ndev, gpu_batch);
+          vlog(V_VERBOSE, dopt, b);
+        }
+        gpu_dworkers.reserve((size_t)ndev);
+        for (int d = 0; d < ndev; ++d) {
+          gpu_dworkers.emplace_back([&, dev = d, gpu_batch, g_csz, g_usz] {
+            PoolGpuDecoder gd;
+            if (!gd.init(dev, gpu_batch, g_csz, g_usz)) {
+              vlog(V_VERBOSE, dopt, "[TAR] decode pool: GPU " + std::to_string(dev)
+                   + " unavailable; CPU decoders cover its share\n");
+              return;
+            }
+            gpu_dev_up.fetch_add(1, std::memory_order_relaxed);
+            // Per-worker CPU rescue context, used only when nvCOMP fails a frame
+            // or when a claimed frame is too large for the GPU (> 16 MiB).
+            ZSTD_DCtx * rescue_dctx = ZSTD_createDCtx();
+            if (!rescue_dctx) die("failed to create ZSTD_DCtx");
+            apply_mem_limit_to_dctx(rescue_dctx, dopt);
+            std::vector<char> rescue_comp;
+            std::vector<DItem> claimed;
+            std::vector<size_t> ks;          // GPU-eligible frame indices
+            std::vector<size_t> pos;         // claimed[j] -> index in ks, or npos
+            std::vector<FrameBuf> out;
+            std::vector<char> resc;
+            const size_t npos = (size_t)-1;
+            bool retire = false;
+            for (;;) {
+              claimed.clear();
+              {
+                std::unique_lock<std::mutex> lk(qmx);
+                qcv.wait(lk, [&] { return !dq.empty() || qdone; });
+                if (dq.empty()) break;                        // qdone, nothing left
+                const size_t take = std::min(dq.size(), gd.cap_batch);
+                for (size_t i = 0; i < take; ++i) { claimed.push_back(dq.front()); dq.pop_front(); }
+              }
+              ks.clear();
+              pos.assign(claimed.size(), npos);
+              for (size_t j = 0; j < claimed.size(); ++j) {
+                const size_t k = claimed[j].k;
+                const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
+                if (usz > 0 && usz <= GPU_SUBCHUNK_MAX) { pos[j] = ks.size(); ks.push_back(k); }
+              }
+              if (!gd.decode(fd, c_off, u_off, ks, out, resc))
+                retire = true;   // stream fault: finish this batch on CPU, then stop
+              for (size_t j = 0; j < claimed.size(); ++j) {
+                const size_t k = claimed[j].k;
+                FrameBuf fb;
+                if (pos[j] != npos && !resc[pos[j]] && out[pos[j]]) {
+                  fb = std::move(out[pos[j]]);
+                  if (feed_meter && claimed[j].count_read)
+                    feed_meter->read_bytes.fetch_add(c_off[k + 1] - c_off[k],
+                                                     std::memory_order_relaxed);
+                  gpu_dec_frames.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                  // Ineligible (huge) or nvCOMP-failed frame: authoritative CPU
+                  // decode -- succeeds on a transient glitch, dies clean on real
+                  // corruption, and counts its own read bytes exactly once.
+                  fb = decode_seek_frame(fd, c_off, u_off, k, rescue_comp,
+                                         rescue_dctx, feed_meter, claimed[j].count_read);
+                  if (pos[j] != npos)
+                    gpu_resc_frames.fetch_add(1, std::memory_order_relaxed);
+                }
+                {
+                  std::lock_guard<std::mutex> lk(psync[claimed[j].pi].mx);
+                  psync[claimed[j].pi].ready.emplace(k, std::move(fb));
+                }
+                psync[claimed[j].pi].cv.notify_one();
+              }
+              if (retire) break;
+            }
+            ZSTD_freeDCtx(rescue_dctx);
+          });
+        }
+      }
+    }
+#endif // HAVE_NVCOMP
+
     std::vector<ParCtx> pctx(parts.size());
     std::vector<std::thread> workers;
     workers.reserve(parts.size());
@@ -11533,11 +11855,21 @@ public:
       { std::lock_guard<std::mutex> lk(qmx); qdone = true; }
       qcv.notify_all();
       for (auto & t : dworkers) t.join();
+      for (auto & t : gpu_dworkers) t.join();   // GPU decoders wake on qdone too
       if (!force_pool && dopt.verbosity >= V_VERBOSE) {
         int pk = peak_decoders.load(std::memory_order_relaxed);
         char b[128];
         std::snprintf(b, sizeof b, "[TAR] decode pool: peak %d decoder(s) -- %s\n",
                       pk, pk ? "offload engaged (decode-bound)" : "never engaged, stayed inline");
+        vlog(V_VERBOSE, dopt, b);
+      }
+      if (dopt.verbosity >= V_VERBOSE && gpu_dev_up.load(std::memory_order_relaxed) > 0) {
+        char b[176];
+        std::snprintf(b, sizeof b,
+          "[TAR] decode pool: %d GPU stream(s), %llu frame(s) GPU-decoded, %llu rescued to CPU\n",
+          gpu_dev_up.load(std::memory_order_relaxed),
+          (unsigned long long)gpu_dec_frames.load(std::memory_order_relaxed),
+          (unsigned long long)gpu_resc_frames.load(std::memory_order_relaxed));
         vlog(V_VERBOSE, dopt, b);
       }
     }

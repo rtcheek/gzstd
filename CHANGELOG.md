@@ -1,11 +1,30 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.20  
+**Covers:** v0.9.50 → v0.15.22  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.22 — -d --tar: GPU-stream decoders in the parallel decode pool (opt-in, Phase 1: correctness)
+
+**The v0.15.20 decode pool is CPU-only: its one decode primitive is `decode_seek_frame` (pread + `ZSTD_decompressDCtx`). On a CPU-poor / GPU-rich box doing a clean full extract, that leaves the GPU streams idle while a handful of CPU decoders drain the pool. This adds GPU-stream decoders that batch-drain the SAME shared queue alongside the CPU decoders — the decode-side mirror of the compress hybrid scheduler. Niche by design (only helps CPU-poor + GPU-rich + decode-bound), so it stays opt-in and never touches the default or CPU-rich path.**
+
+The pool already decoupled decode from parse (a shared frame queue feeding per-partition reorder buffers, both engine-agnostic), so a GPU worker slots in cleanly: it batch-pops `(partition, frame)` items, preads their compressed bytes, `nvcompBatchedZstdDecompressAsync` on its own CUDA stream, copies each result back, and scatters each into the same `psync[pi].ready` reorder buffer the CPU decoders use. One GPU worker per selected device (honoring `--gpu-devices`), each a lean self-contained `PoolGpuDecoder` (its own stream + VRAM-fit-clamped buffers; no auto-tuner / HybridSched / ResultStore / pinned budget — those serve the streaming `decompress_nvcomp` path).
+
+**Correctness never depends on the GPU:**
+- A frame larger than `GPU_SUBCHUNK_MAX` (16 MiB, nvCOMP's per-chunk cap) and any per-frame nvCOMP status/size failure route to the CPU rescue path — the same `decode_seek_frame` the pool already trusts, which succeeds on a transient glitch and dies with a clean data error on genuine corruption, exactly matching CPU-only and stock zstd. A whole-stream CUDA fault rescues the in-hand batch on CPU and retires that GPU worker (a wedged GPU stays wedged — the Turing fault history).
+- The CPU decoders are a guaranteed backstop: the adaptive controller grows the CPU pool in the same branch that turns offload on, and `GZSTD_FORCE_POOL` maxes it up front — so even if every GPU init fails (or none is present) the queue still drains. GPU workers are purely additive.
+- Read-byte accounting stays exactly-once: the GPU decoder never touches the Meter; the worker counts a GPU-decoded frame's input once, and a CPU-rescued frame is counted by `decode_seek_frame` — a frame preaded on the GPU then rescued on CPU is still counted once.
+
+**Gating (opt-in):** GPU decoders engage only when `GZSTD_POOL_GPU` is set AND the run is not `--cpu-only` AND a GPU is present AND the pool is active (`--adapt` or `GZSTD_FORCE_POOL`). With the variable unset the path is inert — the default and every existing decompress mode are byte-for-byte unchanged. When built `USE_NVCOMP=OFF` the toggle is a harmless no-op.
+
+Correctness (all byte-identical to the serial walk): a 4.4 GiB archive with the CPU pool throttled so the GPU streams decode 100+ frames (repeated 3× to shake out the async-H2D staging race that an early single-buffer version had); symlink + hardlink metadata preserved (same inode); mixed archives where some frames exceed 16 MiB (routed to CPU) and where none are GPU-eligible (GPU spawn skipped entirely); the `GZSTD_DEBUG_OFFLOAD_FLAP` stress with GPU workers present (offload toggling every 2 ms while 8 streams decode); real `--adapt`; and the no-GPU fallback (`CUDA_VISIBLE_DEVICES=`). New `-v` lines: `[TAR] decode pool: GPU decode on N device(s)` and a per-run `N GPU stream(s), G frame(s) GPU-decoded, R rescued to CPU`.
+
+**Scope — this is Phase 1 (correctness + opt-in).** On a CPU-rich box the large CPU pool usually claims the frames before the GPUs finish `cuInit`, so the frame split there is ~0 (harmless); the real win needs a CPU-poor + GPU-rich box, where perf validation is still owed. Phase 2 (adaptive GPU engagement off the writer-starvation signal, plus a VRAM dimension on the frame budget) and Phase 3 (D2H-cost-aware CPU/GPU routing — keep trivially-compressed/small frames on CPU) are deferred.
+
+Suite: 346 normal (1 new, GPU-gated: `GZSTD_POOL_GPU` adds GPU decoders to the parallel pool and matches tar byte-for-byte; skipped when no GPU).
 
 ## v0.15.20 — -d --tar: adaptive hybrid decode pool (decode offloads to a pool only when writers starve)
 

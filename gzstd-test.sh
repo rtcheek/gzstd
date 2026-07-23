@@ -5235,6 +5235,24 @@ PYEOF
   if [[ "$fppar" == "1" && "$fppool" -ge 1 ]] && diff -r "$SX/fpout" "$SX/lref" >/dev/null 2>&1; then
     pass "parallel-extract: GZSTD_FORCE_POOL routes decode through the pool + matches tar"
   else fail "parallel-extract force-pool" "par=$fppar pool=$fppool or mismatch vs tar"; fi
+  # 11d. GZSTD_POOL_GPU adds GPU-stream decoders alongside the CPU decoders in
+  #      the same shared pool (opt-in; the niche CPU-poor/GPU-rich win).  The CPU
+  #      decoders are the guaranteed backstop + per-frame rescue, so correctness
+  #      never depends on the GPU: the run must engage the parallel path, spawn
+  #      at least one GPU stream, and stay byte-identical to tar.  (GPU-gated;
+  #      whether the GPU actually wins any frames off the CPU pool is timing-
+  #      dependent on this box, so we assert correctness, not the frame split.)
+  if has_gpu 2>/dev/null; then
+    rm -rf "$SX/gpout"; mkdir -p "$SX/gpout"
+    gpout=$(GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 "$GZSTD" -d -v --tar "$SX/legit.tar.zst" -C "$SX/gpout" 2>&1)
+    gppar=$(printf '%s' "$gpout" | grep -c 'parallel-extract' || true)
+    gpgpu=$(printf '%s' "$gpout" | grep -c 'GPU decode on' || true)
+    if [[ "$gppar" == "1" && "$gpgpu" -ge 1 ]] && diff -r "$SX/gpout" "$SX/lref" >/dev/null 2>&1; then
+      pass "parallel-extract: GZSTD_POOL_GPU adds GPU decoders to the pool + matches tar"
+    else fail "parallel-extract pool-gpu" "par=$gppar gpu=$gpgpu or mismatch vs tar"; fi
+  else
+    skip "parallel-extract: GZSTD_POOL_GPU adds GPU decoders to the pool" "no GPU"
+  fi
 
   # 12. Hostile inputs (audit round 1): a forged footer claiming 500M frames
   #     must not OOM (1 GiB table cap), and a forged base-256 size that
