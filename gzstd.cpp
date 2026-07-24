@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.24";
+static constexpr const char * GZSTD_VERSION = "0.15.25";
 //
 // Architecture overview:
 //
@@ -11530,7 +11530,14 @@ public:
     // the start (all decoders, offload always active) with no --adapt -- the old
     // always-pool path, kept for A/B.
     const bool force_pool = std::getenv("GZSTD_FORCE_POOL") != nullptr;
-    std::atomic<bool> offload_active{ force_pool };
+    // START-HIGH / CONTRACT: under the pool (--adapt or force), the decode pool is
+    // ON from t=0 -- readers+decoders are over-provisioned up front and the
+    // controller CONTRACTS what isn't needed, rather than growing reactively.
+    // Grow-from-zero can't adapt in time for short jobs (over before it ramps) and
+    // the reader, being first, would starve the pipe if slow off the draw; idle
+    // pool threads block on empty queues (~free), so over-provisioning is cheap.
+    // Inline decode stays the default only when there is no pool (!use_pool).
+    std::atomic<bool> offload_active{ use_pool };
     std::atomic<int>  peak_decoders{0};
     if (use_pool && dopt.verbosity >= V_VERBOSE) {
       char b[184];
@@ -11590,13 +11597,18 @@ public:
 
     // One reader: pop a dispatched frame, pread its compressed bytes, hand the
     // owned buffer to the decode queue.  I/O only -- no decompress.
-    auto reader_loop = [&] {
+    // A `retire` flag (per worker) lets the controller CONTRACT a stage: the
+    // worker observes it in the wait predicate and exits (a stage is never
+    // contracted below 1, so any leftover work is picked up by the survivors).
+    auto reader_loop = [&](std::atomic<bool> * retire) {
       for (;;) {
         DItem it;
         {
           std::unique_lock<std::mutex> lk(qmx);
-          qcv.wait(lk, [&] { return !dq.empty() || qdone; });
-          if (dq.empty()) break;                    // qdone with nothing left
+          qcv.wait(lk, [&] { return !dq.empty() || qdone
+                                    || retire->load(std::memory_order_relaxed); });
+          if (retire->load(std::memory_order_relaxed)) break;   // contracted
+          if (dq.empty()) break;                                 // qdone, nothing left
           it = dq.front(); dq.pop_front();
         }
         std::vector<char> comp;
@@ -11610,7 +11622,7 @@ public:
     };
     // One decoder: pop a read frame, decompress it (the verified seek path),
     // deposit it in its partition's reorder buffer.
-    auto decoder_loop = [&] {
+    auto decoder_loop = [&](std::atomic<bool> * retire) {
       ZSTD_DCtx * dctx = ZSTD_createDCtx();
       if (!dctx) die("failed to create ZSTD_DCtx");
       apply_mem_limit_to_dctx(dctx, dopt);
@@ -11618,8 +11630,10 @@ public:
         RItem it;
         {
           std::unique_lock<std::mutex> lk(ddmx);
-          ddcv.wait(lk, [&] { return !ddq.empty() || ddqdone; });
-          if (ddq.empty()) break;                   // ddqdone with nothing left
+          ddcv.wait(lk, [&] { return !ddq.empty() || ddqdone
+                                    || retire->load(std::memory_order_relaxed); });
+          if (retire->load(std::memory_order_relaxed)) break;   // contracted
+          if (ddq.empty()) break;                               // ddqdone, nothing left
           it = std::move(ddq.front()); ddq.pop_front();
         }
         const size_t usz = (size_t)(u_off[it.k + 1] - u_off[it.k]);
@@ -11632,18 +11646,43 @@ public:
       }
       ZSTD_freeDCtx(dctx);
     };
-    // Reader + decoder pools grow ONLY here (controller thread during the run, or
-    // up front for force_pool) and are joined by this thread after the controller
-    // has stopped -- no concurrent access.  v1 of the decouple scales the two in
-    // tandem (R=D); the unified controller will budget them independently.
+    // START-HIGH / CONTRACT pools.  Spawned up front and touched ONLY by the
+    // controller thread (or up front), joined after it stops -- no concurrent
+    // access; reserved so the vectors never reallocate while a worker holds a
+    // retire-flag pointer.
     std::vector<std::thread> readers, dworkers;
-    if (use_pool) { readers.reserve((size_t)n_dec_max); dworkers.reserve((size_t)n_dec_max); }
-    auto grow_pool = [&](int target) {
-      target = std::min(target, n_dec_max);
-      while ((int)readers.size()  < target) readers.emplace_back(reader_loop);
-      while ((int)dworkers.size() < target) dworkers.emplace_back(decoder_loop);
+    std::vector<std::unique_ptr<std::atomic<bool>>> r_retire, d_retire;
+    if (use_pool) {
+      readers.reserve((size_t)n_dec_max);  dworkers.reserve((size_t)n_dec_max);
+      r_retire.reserve((size_t)n_dec_max); d_retire.reserve((size_t)n_dec_max);
+    }
+    auto spawn_reader = [&] {
+      r_retire.push_back(std::make_unique<std::atomic<bool>>(false));
+      readers.emplace_back(reader_loop, r_retire.back().get());
+    };
+    auto spawn_decoder = [&] {
+      d_retire.push_back(std::make_unique<std::atomic<bool>>(false));
+      dworkers.emplace_back(decoder_loop, d_retire.back().get());
       if ((int)dworkers.size() > peak_decoders.load(std::memory_order_relaxed))
         peak_decoders.store((int)dworkers.size(), std::memory_order_relaxed);
+    };
+    // Retire the newest still-active worker of a stage and wake the queue so it
+    // observes the flag and exits.  Callers keep >= 1 active.
+    auto retire_reader = [&] {
+      for (auto it = r_retire.rbegin(); it != r_retire.rend(); ++it)
+        if (!(*it)->load(std::memory_order_relaxed)) { (*it)->store(true, std::memory_order_relaxed); break; }
+      qcv.notify_all();
+    };
+    auto retire_decoder = [&] {
+      for (auto it = d_retire.rbegin(); it != d_retire.rend(); ++it)
+        if (!(*it)->load(std::memory_order_relaxed)) { (*it)->store(true, std::memory_order_relaxed); break; }
+      ddcv.notify_all();
+    };
+    // Bring both pools up to `target` (the start-high spawn).
+    auto grow_pool = [&](int target) {
+      target = std::min(target, n_dec_max);
+      while ((int)readers.size()  < target) spawn_reader();
+      while ((int)dworkers.size() < target) spawn_decoder();
     };
 
     // ---- GPU-stream decoders in the pool (Phase 2: adaptive engagement) ----
@@ -11794,14 +11833,14 @@ public:
     std::mutex ctl_mx; std::condition_variable ctl_cv; bool ctl_stop = false;
     std::thread controller;
     const bool flap = std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") != nullptr;
+    if (use_pool) grow_pool(n_dec_max);   // START HIGH: readers + decoders up front
     if (use_pool && force_pool) {
-      grow_pool(n_dec_max);                       // A/B: all decoders up, offload forced on
+      // A/B baseline: fully-provisioned pool, no contraction (offload forced on).
     } else if (use_pool && flap) {
       // Test hook: rapidly toggle offload so producers constantly switch
       // inline<->pool, exercising both transition directions + concurrent decode.
-      grow_pool(n_dec_max);
       controller = std::thread([&] {
-        bool on = false;
+        bool on = true;
         for (;;) {
           {
             std::unique_lock<std::mutex> lk(ctl_mx);
@@ -11811,9 +11850,18 @@ public:
         }
       });
     } else if (use_pool) {
+      // CONTRACT controller (START-HIGH strategy): the pool starts fully
+      // provisioned; retire workers of any stage whose INPUT queue sits empty
+      // (over-provisioned), converging to just enough per stage to not be the
+      // bottleneck.  Queue depth is the whole signal -- the writer sink is
+      // governed separately (action 5c) and each stage blocks on its input queue,
+      // so only the bottleneck stage stays CPU-runnable (the budget is emergent,
+      // no N+R+D+W math).  Deadlock-free: never contracts below 1 per stage, and
+      // start-high means the pipeline flows from t=0 (no bootstrap to stall).
       controller = std::thread([&] {
-        uint64_t pbusy = 0, pstarv = 0; int calm = 0, cooldown = 0, gpu_starve = 0;
-        const int step = std::max(2, n_dec_max / 8);
+        int ar = n_dec_max, ad = n_dec_max;          // active readers / decoders
+        int r_empty = 0, d_empty = 0, ddq_back = 0, cooldown = 0;
+        const int rstep = std::max(1, n_dec_max / 8);
         const uint64_t stream_total = u_off.empty() ? 0 : u_off.back();
         for (;;) {
           {
@@ -11822,38 +11870,38 @@ public:
                                 [&] { return ctl_stop; })) break;
           }
           if (cooldown > 0) --cooldown;
-          if (!sink_meter_) continue;                 // no live signal (shouldn't happen under --adapt)
-          uint64_t b = sink_meter_->extract_busy_ns.load(std::memory_order_relaxed);
-          uint64_t s = sink_meter_->extract_starved_ns.load(std::memory_order_relaxed);
-          uint64_t db = b - pbusy, ds = s - pstarv; pbusy = b; pstarv = s;
-          if (db + ds < 2000000) continue;            // <2 ms of writer activity this window: no signal
-          double starv = (double)ds / (double)(db + ds);
-          if (starv > 0.20) {                         // decode-starved: offload on, grow the pool
-            offload_active.store(true, std::memory_order_relaxed);
-            // Grow ONE step, then wait a few windows for the signal to reflect the
-            // added decoders before growing again -- otherwise the loop laps the
-            // ~50 ms writer-flush lag and overshoots straight to the cap.
-            int cur = peak_decoders.load(std::memory_order_relaxed);
-            if (cooldown == 0 && cur < n_dec_max) { grow_pool(cur + step); cooldown = 3; }
-            else if (cur >= n_dec_max && gpu_lazy && ++gpu_starve >= 2) {
-              // CPU pool maxed and writers STILL decode-starved for 2 windows ->
-              // the CPU alone can't feed the sink.  Bring the GPU streams in, but
-              // ONLY if enough extract remains to outlast cuInit (~a few seconds):
-              // on a fast/short run the streams would come online after the work
-              // is gone -- wasting cuInit + a speculative VRAM grab (bad on a
-              // shared box).  The slow CPU-poor box this targets always has plenty
-              // left, so it engages there and skips the fast CPU-rich case without
-              // any machine-specific tuning.  spawn_gpu_workers is idempotent.
-              uint64_t done = feed_meter ? feed_meter->wrote_bytes.load(std::memory_order_relaxed) : 0;
-              double p = stream_total ? (double)done / (double)stream_total : 1.0;
-              double remaining_s = (p > 0.02) ? (double)(now_ns() - t0) / 1e9 * (1.0 - p) / p : 1e9;
-              if (remaining_s > 4.0) spawn_gpu_workers();
+          size_t dq_sz, ddq_sz;
+          { std::lock_guard<std::mutex> lk(qmx);  dq_sz  = dq.size();  }
+          { std::lock_guard<std::mutex> lk(ddmx); ddq_sz = ddq.size(); }
+          // A persistently-empty input queue means that stage keeps up with room
+          // to spare -> retire a step of its workers (keep >= 1).  A queue that
+          // backs up resets the counter -- that stage is at/over its right size.
+          r_empty = (dq_sz  == 0) ? r_empty + 1 : 0;
+          d_empty = (ddq_sz == 0) ? d_empty + 1 : 0;
+          if (cooldown == 0) {
+            if (r_empty >= 3 && ar > 1) {
+              int n = std::min(rstep, ar - 1);
+              for (int i = 0; i < n; ++i) retire_reader();
+              ar -= n; r_empty = 0; cooldown = 2;
+            } else if (d_empty >= 3 && ad > 1) {
+              int n = std::min(rstep, ad - 1);
+              for (int i = 0; i < n; ++i) retire_decoder();
+              ad -= n; d_empty = 0; cooldown = 2;
             }
-            calm = 0;
-          } else if (starv < 0.05) {                  // writers fed: revert to inline after 3 calm windows
-            if (++calm >= 3) offload_active.store(false, std::memory_order_relaxed);
-            gpu_starve = 0;
-          } else { calm = 0; gpu_starve = 0; }
+          }
+          // Decode-bound at full decoders (ddq stays backed up AND decoders were
+          // never contracted) => the CPU can't drain fast enough; bring the GPU
+          // in, but only if enough extract remains to outlast cuInit (else the
+          // streams come online after the work is gone -- wasting cuInit + a
+          // speculative VRAM grab).  A sink-bound run keeps ddq empty, so this
+          // never fires there.  spawn_gpu_workers is idempotent.
+          ddq_back = (ddq_sz > 0 && ad >= n_dec_max) ? ddq_back + 1 : 0;
+          if (ddq_back >= 3 && gpu_lazy) {
+            uint64_t done = feed_meter ? feed_meter->wrote_bytes.load(std::memory_order_relaxed) : 0;
+            double p = stream_total ? (double)done / (double)stream_total : 1.0;
+            double remaining_s = (p > 0.02) ? (double)(now_ns() - t0) / 1e9 * (1.0 - p) / p : 1e9;
+            if (remaining_s > 4.0) spawn_gpu_workers();
+          }
         }
       });
     }
@@ -11948,10 +11996,15 @@ public:
       for (auto & t : dworkers) t.join();
       for (auto & t : gpu_dworkers) t.join();
       if (!force_pool && dopt.verbosity >= V_VERBOSE) {
-        int pk = peak_decoders.load(std::memory_order_relaxed);
-        char b[128];
-        std::snprintf(b, sizeof b, "[TAR] decode pool: peak %d decoder(s) -- %s\n",
-                      pk, pk ? "offload engaged (decode-bound)" : "never engaged, stayed inline");
+        // Report the SETTLED (still-active, non-retired) pool -- start-high means
+        // the peak is always n_dec_max, so the contracted size is the useful one.
+        int ar = 0, ad = 0;
+        for (auto & f : r_retire) if (!f->load(std::memory_order_relaxed)) ++ar;
+        for (auto & f : d_retire) if (!f->load(std::memory_order_relaxed)) ++ad;
+        char b[176];
+        std::snprintf(b, sizeof b,
+                      "[TAR] decode pool: started %d, settled %d reader(s) + %d decoder(s)\n",
+                      n_dec_max, ar, ad);
         vlog(V_VERBOSE, dopt, b);
       }
       if (dopt.verbosity >= V_VERBOSE && gpu_dev_up.load(std::memory_order_relaxed) > 0) {

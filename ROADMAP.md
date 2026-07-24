@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.24
+**Current version:** v0.15.25
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -230,15 +230,22 @@ decoder `D`, writer `W` — all shared job queues with spawn/reap. `run_sink` st
 rides the streaming `decompress_cpu_mt` pipeline (already read/decode-decoupled) and
 its parse is serial by design; the FrameSink budget stays tar-exempt.
 
-**Bottleneck-aware unified controller (Phase 3, part 2 — IN PROGRESS).** With R/D/W
-all live levers, the goal is one governor-owned closed loop that maximizes end-to-end
-extract rate `d(wrote_bytes)/dt` by allocating a total CPU budget (usable cores) across
-the three stages: sense the bottleneck (writers starved → read/decode behind; writers
-busy / parse enqueue-blocked → sink-bound), grow the bottleneck stage, and AT BUDGET
-shrink a non-bottleneck stage (no oversubscription); keep-or-revert on the rate; persist
-a re-probeable R/D/W split. Subsumes today's split governor-5c (writers) + local decode
-controller. v0.15.24 shipped the structural decouple + uncapped writer probe; the
-unified budgeting is next.
+**Bottleneck-aware unified controller (Phase 3, part 2 — DONE v0.15.25, perf-validation owed).**
+Landed as START-HIGH / CONTRACT rather than grow-from-zero: reader + decoder pools come
+up fully provisioned at t=0 and the controller RETIRES workers of any stage whose input
+queue sits empty (over-provisioned), converging to just enough per stage. Rationale:
+grow can't adapt in time for short jobs, and the reader (first in the pipe) starves
+everything downstream if slow to ramp; idle pool workers block on their input queue
+(≈ free), so over-provisioning is cheap. Asymmetric by physics — R/D start high
+(no contention cliff), W stays moderate + grow-probe (fs journal/dentry contention past
+~16), GPU stays lazy (fixed cuInit/VRAM). No explicit `N+R+D+W ≤ cores` math: each stage
+blocks on its input queue so only the bottleneck stage is CPU-runnable — the budget is
+EMERGENT. Also structurally removed the bootstrap deadlock a reactive grow had (a
+decoupled pipe needs ≥1 reader AND ≥1 decoder to flow). Validated byte-identical + suite
+346 (sink-bound: started 96+96 → settled 1+1). **OWED:** perf validation on a CPU-poor
+box (this 256-core server is sink-bound at 96-way decode, so R/D always contract to
+minimal here — correct, but doesn't exercise the "keep the bottleneck stage high" win;
+needs a workstation-class box, ideally with a slower disk to reach read-bound).
 
 The v0.15.x governor runs on `--tar` operations but several of its senses
 and levers don't reach the tar-specific machinery (each was an explicit,

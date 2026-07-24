@@ -1,11 +1,28 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.24  
+**Covers:** v0.9.50 → v0.15.25  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.25 — -d --tar: unified extract controller — start-high, contract to the bottleneck (Phase 3, part 2)
+
+**With reading, decoding, and writing now independent stages (v0.15.24), this makes the parallel extractor allocate CPU by starting each stage OVER-provisioned and contracting the ones that aren't needed — instead of growing reactively from zero.**
+
+**Why start-high, not grow.** Growing from zero can't adapt in time for short jobs — the extract is over before the controller ramps, so it runs the whole time under-provisioned. And the reader is *first* in the pipeline: if it's slow off the draw, everything downstream idles at the start. Since idle pool workers just block on their empty input queue (≈ zero CPU), over-provisioning is cheap and under-provisioning is what hurts. So the pool comes up fully provisioned at t=0 and the controller retires what the workload doesn't use. This also **structurally eliminates the bootstrap problem** the reactive approach had (a decoupled pipeline needs ≥1 reader *and* ≥1 decoder to flow; growing them one at a time could stall the pipe and kill the very signal the controller watches — start-high means it flows from the first frame).
+
+**Asymmetric by each stage's physics:**
+- **Reader / decoder:** start at `n_dec_max`, contract. Idle = free; more never *hurts* (readers block on I/O, decoders are pure-CPU with no shared-resource contention).
+- **Writer:** unchanged — starts moderate (base/profiled) and grows via the keep-or-revert probe (action 5c). Writers are *not* started high: concurrent `open/write/close` thrash ext4's journal/dentry locks past ~16, so maxing W would make a short job slow from its first write — the opposite of the goal.
+- **GPU:** unchanged (lazy) — its ~3 s cuInit + VRAM are never speculative.
+
+**Contract signal + emergent budget.** A stage whose *input queue* sits empty for a few 120 ms windows is over-provisioned → retire a step of its workers (via per-worker retire flags, mirroring the writer supervisor), keeping ≥1; a queue that backs up resets the counter (that stage is at its right size). No explicit `N+R+D+W ≤ cores` accounting is needed: every stage blocks on its input queue, so only the *bottleneck* stage stays CPU-runnable while the others sit blocked — the budget is emergent. The GPU now engages on a clean decode-bound signal (`ddq` stays backed up while decoders were never contracted), which by construction can't fire on a sink-bound run.
+
+Validated (real NVMe): on a sink-bound 390 K-file archive the pool **started 96 readers + 96 decoders and settled to 1 + 1** (the sink is the limit — the writer probe took W to 24), byte-identical to the serial walk with no hang; force-pool byte-identical; full suite 346. `USE_NVCOMP=OFF` builds.
+
+**Perf validation still owed on a CPU-poor box.** This 256-core server is so CPU-rich that essentially every archive is sink-bound at 96-way decode, so R/D correctly contract to minimal here — which validates the *contraction* but not the "keep readers/decoders high because they're the bottleneck" win. That needs a workstation-class box (few cores, ideally a slower disk to reach read-bound); tracked for the incoming test hardware.
 
 ## v0.15.24 — -d --tar: decouple reading from decoding in parallel extract + uncap the writer-sink probe (Phase 3, part 1)
 
