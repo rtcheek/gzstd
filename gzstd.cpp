@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.25";
+static constexpr const char * GZSTD_VERSION = "0.15.26";
 //
 // Architecture overview:
 //
@@ -1097,11 +1097,12 @@ static void print_help_long()
 "     rebuild).  Measured verdicts persist to the per-machine profile\n"
 "     (see PROFILE below) so the next run starts at the answer.\n"
 "     On -d --tar extraction the same regimes drive extract-specific\n"
-"     actuators: sink-bound grows the parallel file-writer pool, and\n"
-"     decode-bound (the writers starving for frames) offloads frame\n"
-"     decode from the parse threads to a pool of decoders that grows\n"
-"     while the starvation lasts, then reverts to inline decode when\n"
-"     it clears.\n"
+"     actuators: sink-bound grows the parallel file-writer pool; and the\n"
+"     decode side is sized by measured throughput — a barely-compressed\n"
+"     archive (decode ~free) runs fused inline, while a compression-heavy\n"
+"     one splits reading from decoding across a pool whose reader and\n"
+"     decoder counts each contract to just what keeps the writers fed,\n"
+"     spawning a stage back if trimming it dropped throughput.\n"
 "     Explicit flags always win: no action ever overrides a value you\n"
 "     set.  --no-adapt is accepted now so scripts keep working when the\n"
 "     default flips (decision planned for v1.0).\n"
@@ -11530,21 +11531,50 @@ public:
     // the start (all decoders, offload always active) with no --adapt -- the old
     // always-pool path, kept for A/B.
     const bool force_pool = std::getenv("GZSTD_FORCE_POOL") != nullptr;
+    // TRIVIAL-DECODE SHORT-CIRCUIT: when the archive is barely compressed (stored
+    // or near-stored -- already-compressed media, encrypted backups), decode is
+    // ~free, so the decoupled read->queue->decode pool only adds per-frame handoff
+    // cost.  The fused inline path (each of the >=2 parse partitions reads AND
+    // decodes its own frames) has no handoff, and its per-partition parallelism is
+    // enough when reading is the only real work: measured ~3.0 GiB/s inline vs 1.9
+    // for the start-high pool once it contracts to 1R+1D -- a -28% regression the
+    // pool otherwise imposes on incompressible extract.  Because in a write-limited
+    // pipe every intermediate queue equilibrates near-empty, the pool's queue-depth
+    // contraction can't tell "surplus" from "throttled" and collapses R+D to 1+1,
+    // which then can't feed the writers.  So route trivial-decode extracts to inline
+    // and skip the pool entirely; a genuinely compressed archive (real decode work,
+    // where the decouple earns its keep) still gets the pool.  This is a property of
+    // the DATA (like the <2% D2H-cost rule), not a machine-specific tuning.
+    const double comp_ratio =
+        (!u_off.empty() && u_off.back() > 0) ? (double)c_off.back() / (double)u_off.back() : 0.0;
+    // Excludes the force/flap test hooks, which need the pool spawned (a flap toggle
+    // dispatching to an unspawned pool would wedge on the budget).
+    const bool prefer_inline = dopt.adapt && !force_pool
+        && std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") == nullptr
+        && std::getenv("GZSTD_NO_PREFER_INLINE") == nullptr   // test: run the pool on trivial decode
+        && comp_ratio > 0.90;
+    const bool pool_on = use_pool && !prefer_inline;   // actually spawn + drive the decode pool
     // START-HIGH / CONTRACT: under the pool (--adapt or force), the decode pool is
     // ON from t=0 -- readers+decoders are over-provisioned up front and the
     // controller CONTRACTS what isn't needed, rather than growing reactively.
     // Grow-from-zero can't adapt in time for short jobs (over before it ramps) and
     // the reader, being first, would starve the pipe if slow off the draw; idle
     // pool threads block on empty queues (~free), so over-provisioning is cheap.
-    // Inline decode stays the default only when there is no pool (!use_pool).
-    std::atomic<bool> offload_active{ use_pool };
+    // Inline decode is the default when there is no pool (!use_pool) or the archive
+    // is trivial-decode (prefer_inline, above).
+    std::atomic<bool> offload_active{ pool_on };
     std::atomic<int>  peak_decoders{0};
     if (use_pool && dopt.verbosity >= V_VERBOSE) {
-      char b[184];
-      std::snprintf(b, sizeof b,
-        "[TAR] decode pool: %s, up to %d decoder(s), %zu-frame budget over %zu frames\n",
-        force_pool ? "forced on" : "adaptive (inline until writers starve)",
-        n_dec_max, budget_frames, total_items);
+      char b[208];
+      if (prefer_inline)
+        std::snprintf(b, sizeof b,
+          "[TAR] decode pool: inline (archive stores at %.0f%% of source -- decode ~free, fused inline beats the decouple)\n",
+          comp_ratio * 100.0);
+      else
+        std::snprintf(b, sizeof b,
+          "[TAR] decode pool: %s, up to %d decoder(s), %zu-frame budget over %zu frames\n",
+          force_pool ? "forced on" : "adaptive (inline until writers starve)",
+          n_dec_max, budget_frames, total_items);
       vlog(V_VERBOSE, dopt, b);
     }
 
@@ -11652,9 +11682,12 @@ public:
     // retire-flag pointer.
     std::vector<std::thread> readers, dworkers;
     std::vector<std::unique_ptr<std::atomic<bool>>> r_retire, d_retire;
-    if (use_pool) {
-      readers.reserve((size_t)n_dec_max);  dworkers.reserve((size_t)n_dec_max);
-      r_retire.reserve((size_t)n_dec_max); d_retire.reserve((size_t)n_dec_max);
+    if (pool_on) {
+      // 2x: a keep-or-revert spawns a stage back after contracting it, so total
+      // spawns per stage can exceed n_dec_max (retire flags are heap-stable
+      // unique_ptrs + the vectors are controller-only, so this only avoids churn).
+      readers.reserve((size_t)n_dec_max * 2);  dworkers.reserve((size_t)n_dec_max * 2);
+      r_retire.reserve((size_t)n_dec_max * 2); d_retire.reserve((size_t)n_dec_max * 2);
     }
     auto spawn_reader = [&] {
       r_retire.push_back(std::make_unique<std::atomic<bool>>(false));
@@ -11708,7 +11741,7 @@ public:
       g_usz = std::max(g_usz, usz);
       g_csz = std::max<size_t>(g_csz, (size_t)(c_off[k + 1] - c_off[k]));
     }
-    const bool gpu_capable = use_pool && !dopt.cpu_only && g_usz > 0;
+    const bool gpu_capable = pool_on && !dopt.cpu_only && g_usz > 0;
     std::vector<std::thread> gpu_dworkers;
     std::atomic<uint64_t> gpu_dec_frames{0};   // frames decoded on a GPU stream
     std::atomic<uint64_t> gpu_resc_frames{0};  // GPU-eligible frames CPU-rescued
@@ -11833,7 +11866,7 @@ public:
     std::mutex ctl_mx; std::condition_variable ctl_cv; bool ctl_stop = false;
     std::thread controller;
     const bool flap = std::getenv("GZSTD_DEBUG_OFFLOAD_FLAP") != nullptr;
-    if (use_pool) grow_pool(n_dec_max);   // START HIGH: readers + decoders up front
+    if (pool_on) grow_pool(n_dec_max);   // START HIGH: readers + decoders up front
     if (use_pool && force_pool) {
       // A/B baseline: fully-provisioned pool, no contraction (offload forced on).
     } else if (use_pool && flap) {
@@ -11849,7 +11882,7 @@ public:
           on = !on; offload_active.store(on, std::memory_order_relaxed);
         }
       });
-    } else if (use_pool) {
+    } else if (pool_on) {
       // CONTRACT controller (START-HIGH strategy): the pool starts fully
       // provisioned; retire workers of any stage whose INPUT queue sits empty
       // (over-provisioned), converging to just enough per stage to not be the
@@ -11857,37 +11890,93 @@ public:
       // governed separately (action 5c) and each stage blocks on its input queue,
       // so only the bottleneck stage stays CPU-runnable (the budget is emergent,
       // no N+R+D+W math).  Deadlock-free: never contracts below 1 per stage, and
-      // start-high means the pipeline flows from t=0 (no bootstrap to stall).
+      // start-high means the pipeline flows from t=0 (no bootstrap to stall).  A
+      // trivial-decode archive never reaches here (prefer_inline routes it to the
+      // fused inline path, where the pool's collapse-to-1+1 would starve writers).
+      const bool ctl_dbg = std::getenv("GZSTD_DEBUG_POOL_CTL") != nullptr;
       controller = std::thread([&] {
         int ar = n_dec_max, ad = n_dec_max;          // active readers / decoders
+        int r_floor = 1, d_floor = 1;                // locked minimums (raised on a revert)
         int r_empty = 0, d_empty = 0, ddq_back = 0, cooldown = 0;
-        const int rstep = std::max(1, n_dec_max / 8);
         const uint64_t stream_total = u_off.empty() ? 0 : u_off.back();
+        // KEEP-OR-REVERT: an empty input queue LOOKS over-provisioned, but in a
+        // write-limited pipe every queue equilibrates near-empty, so contracting on
+        // that alone collapses R+D to 1+1 and starves a sink that could run faster.
+        // So after each contraction, MEASURE its effect on END-TO-END RATE (the
+        // live d(wrote_bytes)/dt): if throughput DROPS, the removed supply was load-
+        // bearing -> spawn it back and LOCK that stage's floor.  Rate is the direct
+        // outcome; the writer-starved ratio is NOT usable here -- with more writers
+        // than a fast sink needs it pins ~high regardless of R/D (each writer writes
+        // a frame then waits), so it is blind to the very thing being controlled.
+        // Both rates are INTEGRATED over ~0.8 s (see rate_back) because the sink
+        // drains in bursts -- a per-window rate is undersampled and false-reverts on
+        // a burst gap.  Steps are geometric (a third of the way to the floor) so it
+        // lands near the knee instead of overshooting in one jump.
+        int  pending = 0, pending_n = 0, verify_wait = 0, settle = 3, win = 0;
+        double r_pre = 0.0;
+        // Bursty-writer-robust throughput: the sink drains in BURSTS, so a single
+        // 120 ms window's rate swings 0..8 GiB/s -- undersampled.  Compare INTEGRATED
+        // rate over ~0.8 s spans (many burst/gap cycles average out) via a ring of
+        // recent (time, wrote_bytes).  rate_back(k) = GiB/s over the last k windows.
+        constexpr int RB = 24;
+        uint64_t rb_t[RB] = {0}, rb_b[RB] = {0}; int rb_n = 0;
+        auto rate_back = [&](int k) -> double {
+          const int span = std::min(k, std::min(rb_n - 1, RB - 1));
+          if (span < 1) return 0.0;
+          const int newest = (rb_n - 1) % RB, older = (rb_n - 1 - span) % RB;
+          const double dt = (double)(rb_t[newest] - rb_t[older]) / 1e9;
+          return dt > 0 ? (double)(rb_b[newest] - rb_b[older]) / dt / (double)(1u << 30) : 0.0;
+        };
         for (;;) {
           {
             std::unique_lock<std::mutex> lk(ctl_mx);
             if (ctl_cv.wait_for(lk, std::chrono::milliseconds(120),
                                 [&] { return ctl_stop; })) break;
           }
-          if (cooldown > 0) --cooldown;
+          ++win;
+          rb_t[rb_n % RB] = now_ns();
+          rb_b[rb_n % RB] = feed_meter ? feed_meter->wrote_bytes.load(std::memory_order_relaxed) : 0;
+          ++rb_n;
           size_t dq_sz, ddq_sz;
           { std::lock_guard<std::mutex> lk(qmx);  dq_sz  = dq.size();  }
           { std::lock_guard<std::mutex> lk(ddmx); ddq_sz = ddq.size(); }
-          // A persistently-empty input queue means that stage keeps up with room
-          // to spare -> retire a step of its workers (keep >= 1).  A queue that
-          // backs up resets the counter -- that stage is at/over its right size.
-          r_empty = (dq_sz  == 0) ? r_empty + 1 : 0;
-          d_empty = (ddq_sz == 0) ? d_empty + 1 : 0;
-          if (cooldown == 0) {
-            if (r_empty >= 3 && ar > 1) {
-              int n = std::min(rstep, ar - 1);
-              for (int i = 0; i < n; ++i) retire_reader();
-              ar -= n; r_empty = 0; cooldown = 2;
-            } else if (d_empty >= 3 && ad > 1) {
-              int n = std::min(rstep, ad - 1);
-              for (int i = 0; i < n; ++i) retire_decoder();
-              ad -= n; d_empty = 0; cooldown = 2;
+          const char * act = "";
+          if (settle > 0) { --settle; }
+          else {
+            if (cooldown > 0) --cooldown;
+            if (pending && --verify_wait <= 0) {
+              // Integrated rate over the ~0.7 s post-contraction, skipping the first
+              // ~2 windows (the re-balance transient a big retire kicks up).
+              const double r_post = rate_back(6);
+              if (r_post < r_pre * 0.85) {             // contraction dropped throughput -> undo + lock
+                if (pending == 1) { for (int i=0;i<pending_n;++i) spawn_reader();  ar += pending_n; r_floor = ar; act = "REVERT-R"; }
+                else              { for (int i=0;i<pending_n;++i) spawn_decoder(); ad += pending_n; d_floor = ad; act = "REVERT-D"; }
+                cooldown = 3;
+              } else act = "keep";
+              pending = 0;
             }
+            r_empty = (dq_sz  == 0) ? r_empty + 1 : 0;
+            d_empty = (ddq_sz == 0) ? d_empty + 1 : 0;
+            if (!pending && cooldown == 0) {
+              if (r_empty >= 3 && ar > r_floor) {
+                const int n = std::max(1, (ar - r_floor) / 3);
+                r_pre = rate_back(7);                  // integrated ~0.8 s before the contraction
+                for (int i = 0; i < n; ++i) retire_reader();
+                ar -= n; r_empty = 0; cooldown = 3; pending = 1; pending_n = n; verify_wait = 8; act = "contract-R";
+              } else if (d_empty >= 3 && ad > d_floor) {
+                const int n = std::max(1, (ad - d_floor) / 3);
+                r_pre = rate_back(7);
+                for (int i = 0; i < n; ++i) retire_decoder();
+                ad -= n; d_empty = 0; cooldown = 3; pending = 2; pending_n = n; verify_wait = 8; act = "contract-D";
+              }
+            }
+          }
+          if (ctl_dbg) {
+            char b[184];
+            std::snprintf(b, sizeof b,
+              "[POOLCTL] w%-3d rate=%.2f r_pre=%.2f dq=%zu ddq=%zu R=%d D=%d floor=%d/%d %s\n",
+              win, rate_back(6), r_pre, dq_sz, ddq_sz, ar, ad, r_floor, d_floor, act);
+            std::fputs(b, stderr);
           }
           // Decode-bound at full decoders (ddq stays backed up AND decoders were
           // never contracted) => the CPU can't drain fast enough; bring the GPU
@@ -11977,7 +12066,7 @@ public:
       });
     }
     for (auto & t : workers) t.join();
-    if (use_pool) {
+    if (pool_on) {
       // Stop the controller first (no more decoder spawning), then let the
       // decoders drain the queue and exit.
       if (controller.joinable()) {

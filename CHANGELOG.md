@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.25  
+**Covers:** v0.9.50 → v0.15.26  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.26 — -d --tar: fix a -28% incompressible-extract regression — inline trivial decode, size the pool by measured throughput
+
+**The v0.15.25 controller contracted the reader/decoder pool on queue depth alone, which collapses it to 1 reader + 1 decoder on a barely-compressible archive and starves the writers — a measured 28% regression versus not using the pool at all.** Found while building the "keep readers high" case that v0.15.25's entry said was still owed: extract a 30 GiB incompressible archive from one NVMe to another. `--adapt` ran at **2.3 GiB/s** while the plain inline path ran at **3.2**; the writers sat **57% starved**.
+
+**Why queue depth is the wrong signal.** In a write-limited pipe every *intermediate* queue equilibrates near-empty at steady state — the reader's input drains as fast as the writer consumes, whatever the thread counts. So "input queue empty ⇒ over-provisioned" can't distinguish real surplus from a stage that merely matches a throttled downstream. It retires readers and decoders down to the floor, and 1 + 1 (≈1.8 GiB/s here) can't feed a 3.2 GiB/s sink.
+
+**Two fixes, each matched to a real property:**
+
+- **Trivial decode ⇒ inline (a data property, like the <2% D2H rule).** When the archive stores at >90% of source (already-compressed media, encrypted backups), decode is ~free, so the decoupled read→queue→decode pipeline only adds per-frame handoff cost. The fused inline path — each of the ≥2 parse partitions reads *and* decodes its own frames — has no handoff and its per-partition parallelism is enough when reading is the only real work. Route those extracts to inline and never spawn the pool. Restores the writer/disk ceiling (~2.9–3.0 GiB/s).
+
+- **Compression-heavy ⇒ pool sized by measured throughput.** The pool still starts high and contracts, but each contraction is now **keep-or-revert**: measure end-to-end rate after retiring a step, and if throughput dropped, spawn the workers back and lock that stage's floor. This keeps readers/decoders high enough to feed the writers on a write-limited compressible archive, while still contracting to 1 + 1 on a genuinely sink-bound or CPU-constrained run (there, contracting reduces oversubscription so the rate holds — no revert). Reading and decoding are sized independently: an incompressible-but-pooled run keeps ~all readers (reads are the work) and trims decoders to a handful.
+
+**Signal notes (the two dead ends, so they aren't re-tried).** The writer-*starved* ratio is unusable as the keep-or-revert signal: with more writers than a fast sink needs, each writes a frame then waits, so the ratio pins ~85%+ regardless of reader/decoder count — blind to the very thing it would control. End-to-end **rate** is the direct outcome instead. But it must be **integrated over ~0.8 s**, not sampled per 120 ms window: the sink drains in bursts, so a single window's rate swings 0→8 GiB/s and a contraction landing next to a gap false-reverts. Integrating over several burst/gap cycles removes that.
+
+**Validated (real NVMe, all byte-identical):**
+- Incompressible 30 GiB (ratio 1.00) → inline, **2.9–3.0 GiB/s** (was 2.3); the residual gap to the raw inline default is `--adapt`'s own warmup + writer-probe overhead, not the decode path.
+- 2-core decode-bound (base64, ratio 0.75; `taskset -c 0,1 -T2`) → pool, contracts cleanly to **1R + 1D, 0 false reverts**, ~25% faster than inline.
+- Sink-bound 390 K-file archive (ratio 0.96) → inline, 16.4 s (no regression); the writer-growth actuator still fires (16 → 24).
+- Full suite 346; `USE_NVCOMP=OFF` builds. Test hooks: `GZSTD_DEBUG_POOL_CTL` (per-window controller trace — so the little AI is never a black box again), `GZSTD_NO_PREFER_INLINE` (run the pool on trivial decode for A/B).
+
+**Honest caveat.** On this 256-core box the throughput is a wide flat plateau (any R/D from ~4 to 96 hits the writer ceiling), so the pool's landing is imprecise — but functionally irrelevant, since every point on the plateau is the same speed. The signal is clean and the convergence precise exactly where it matters (the constrained/decode-bound box); it is only noisy where it doesn't (the plateau). A few-huge-file incompressible archive (Np≈2) still gets inline (~2.3) rather than the pool's ~2.9 — the one case a reader-count lever would add value, left for the workstation-class box.
 
 ## v0.15.25 — -d --tar: unified extract controller — start-high, contract to the bottleneck (Phase 3, part 2)
 
