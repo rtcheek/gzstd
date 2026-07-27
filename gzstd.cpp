@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.29";
+static constexpr const char * GZSTD_VERSION = "0.15.30";
 //
 // Architecture overview:
 //
@@ -3670,6 +3670,121 @@ static uint64_t gpu_min_useful_bytes(const Options & opt)
   }
   return (uint64_t)std::max<size_t>(1, opt.chunk_mib) * 1024 * 1024
        * (uint64_t)std::max<size_t>(1, opt.gpu_batch_cap);
+}
+
+// How long GPU bringup takes, near enough.  Same guard the -d --tar decode pool
+// already uses to decide whether to engage its GPU streams; kept identical so
+// the two lazy-engagement decisions can't disagree about what cuInit costs.
+static constexpr double GPU_INIT_GUARD_SEC = 4.0;
+// Startup ramp to discard before trusting the pipeline's rate, then the window
+// the rate is measured over.  Together ~0.25 s — trivial against a multi-second
+// cuInit, and the CPU pool is doing real work throughout.
+static constexpr double GPU_SAMPLE_WARMUP_SEC = 0.10;
+static constexpr double GPU_SAMPLE_WINDOW_SEC = 0.15;
+
+// Is bringing the GPU up still worth it?  Called from the background bringup
+// thread BEFORE the first CUDA call, so a "no" costs nothing at all.
+//
+// The size gate (gpu_min_useful_bytes) rules out inputs that cannot fill even
+// one GPU batch, but that is only a NECESSARY condition — it says nothing about
+// whether the job outlasts cuInit.  On a fast many-core box it badly
+// under-shoots: compressing 512 MB takes 0.22 s cpu-only but 5.5 s hybrid,
+// because ~5.4 s of that is bringup the job never recoups.  The honest test is
+// "does enough work remain to outlast the init", which is exactly what the
+// extract decode pool already asks before spawning GPU decoders.
+//
+// It cannot be answered up front — it needs a rate, and any rate model is wrong
+// (this box compresses at ~2.4 GiB/s aggregate whether it has 96 cores or 256:
+// the pool is memory-bound long before it is core-bound).  So MEASURE instead:
+// watch what the pipeline actually achieves for a fraction of a second and
+// extrapolate.  No rate constants, no core-count thresholds — it reads the box
+// it is running on.
+//
+// Conservative in every uncertain direction: an unknown total, an unreadable
+// meter, or a job too slow to sample all engage the GPU, i.e. keep today's
+// behaviour.  --gpu-only always engages — there is no CPU pool to fall back on.
+// `total_bytes` is whatever Meter::read_bytes counts up to — the source size in
+// both directions (uncompressed input when compressing, archive size when
+// decompressing).  Input-side progress is used rather than output-side because
+// it is known before the first frame is parsed.
+static bool gpu_bringup_worth_it(const Options & opt, const Meter * m,
+                                 uint64_t total_bytes,
+                                 std::mutex & mx, std::condition_variable & cv,
+                                 const std::function<bool()> & stop)
+{
+  if (opt.gpu_only) return true;
+  // GZSTD_DEBUG_GPU_GUARD_SEC overrides the guard; 0 disables the check so the
+  // GPU always engages.  The suite sets 0 globally for the same reason it zeroes
+  // GZSTD_DEBUG_GPU_MIN_BYTES — its fixtures are all far too small and quick to
+  // survive an honest "is this worth a GPU" test, and every GPU path would stop
+  // being exercised.  Test hook only.
+  double guard_sec = GPU_INIT_GUARD_SEC;
+  if (const char * e = std::getenv("GZSTD_DEBUG_GPU_GUARD_SEC")) {
+    char * end = nullptr;
+    const double v = std::strtod(e, &end);
+    if (end != e && v >= 0.0) guard_sec = v;
+  }
+  if (guard_sec <= 0.0) return true;
+  if (!m || total_bytes == 0) {                 // no denominator -> cannot judge
+    if (opt.verbosity >= V_DEBUG) {
+      char b[128];
+      std::snprintf(b, sizeof b,
+        "[GPU] bringup sample: no size signal (meter %s, total %llu) -> engage\n",
+        m ? "ok" : "null", (unsigned long long)total_bytes);
+      vlog(V_DEBUG, opt, b);
+    }
+    return true;
+  }
+  auto say = [&](bool engage, const char * why, double remaining, double p) {
+    if (opt.verbosity >= V_DEBUG) {
+      char b[208];
+      std::snprintf(b, sizeof b,
+        "[GPU] bringup sample: %.0f%% read, %s -> %.2f s remaining "
+        "(guard %.1f s) -> %s\n",
+        p * 100.0, why, remaining, guard_sec, engage ? "engage" : "skip");
+      vlog(V_DEBUG, opt, b);
+    }
+    return engage;
+  };
+  const auto t_start = std::chrono::steady_clock::now();
+  auto secs_in = [&] {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_start).count();
+  };
+  // Wait until `until` seconds in, or until the run ends.  Timed CV wait rather
+  // than a bare sleep so a job that finishes mid-sample cuts it short instead of
+  // waiting out the window.
+  auto hold = [&](double until) {
+    while (secs_in() < until) {
+      if (stop()) return false;
+      std::unique_lock<std::mutex> lk(mx);
+      cv.wait_for(lk, std::chrono::milliseconds(10), [&] { return stop(); });
+    }
+    return !stop();
+  };
+  auto frac = [&] {
+    return double(m->read_bytes.load(std::memory_order_relaxed)) / double(total_bytes);
+  };
+
+  // Let the pipeline reach steady state before believing it.  Extrapolating
+  // from cumulative bytes-since-zero folds in the startup ramp and badly
+  // overestimates what is left: measured on a 5.3 GB decompress, the first
+  // 151 ms covered 2% of the source and predicted 7.4 s remaining for a job
+  // that in fact had ~1.4 s to go — which would have engaged a GPU the run
+  // could not use.  So skip the ramp, then measure a RATE over a window.
+  if (!hold(GPU_SAMPLE_WARMUP_SEC)) return say(false, "run ended during warm-up", 0.0, frac());
+  if (frac() >= 0.98)              return say(false, "already done", 0.0, frac());
+  const double p1 = frac();
+  const double t1 = secs_in();
+  if (!hold(GPU_SAMPLE_WARMUP_SEC + GPU_SAMPLE_WINDOW_SEC))
+    return say(false, "run ended during sample", 0.0, frac());
+  const double p2 = frac();
+  const double t2 = secs_in();
+  if (p2 >= 0.98) return say(false, "already done", 0.0, p2);
+  const double rate = (p2 - p1) / std::max(1e-6, t2 - t1);   // fraction per second
+  if (rate <= 0.0) return say(true, "no measurable progress", -1.0, p2);
+  const double remaining = (1.0 - p2) / rate;
+  return say(remaining > guard_sec, "windowed rate", remaining, p2);
 }
 
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
@@ -18921,8 +19036,34 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // devices, init result slots, and spawn GPU workers.  Runs on a background
   // thread when defer_detect (hybrid adaptive or gpu-only) so the CPU pool
   // (hybrid) or the reader (gpu-only) overlaps cuInit; inline otherwise.
+  // Denominator for the "is the GPU still worth starting" sample: the archive's
+  // own size, which Meter::read_bytes counts up to.  0 (pipe/stdin) disables the
+  // check, keeping today's behaviour.
+  const uint64_t decomp_src_bytes = known_input_size(opt, in);
+  std::mutex bringup_mx;
+  std::condition_variable bringup_cv;
+  std::atomic<bool> bringup_stop{false};
+  // Cut the sample short at teardown so a run that finishes inside the window
+  // never waits it out — the sampler is a timed CV wait, not a sleep, exactly so
+  // this can interrupt it.
+  auto stop_bringup_sample = [&] {
+    { std::lock_guard<std::mutex> lk(bringup_mx);
+      bringup_stop.store(true, std::memory_order_relaxed); }
+    bringup_cv.notify_all();
+  };
+
   auto gpu_bringup = [&]() {
     if (defer_detect) {
+      // Is there still enough work left to outlast cuInit?  Asked BEFORE the
+      // first CUDA call, so a "no" costs nothing — which is the whole point:
+      // once cudaGetDeviceCount has run, the init is paid whether or not any
+      // GPU worker is ever spawned, and this thread still has to be joined.
+      if (!gpu_bringup_worth_it(opt, m, decomp_src_bytes, bringup_mx, bringup_cv,
+                                [&] { return bringup_stop.load(std::memory_order_relaxed); })) {
+        vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
+                             "skipping GPU bringup\n");
+        return;
+      }
       // Deferred device detection (the ~2s cuInit, off the critical path).
       int dc = 0;
       if (cudaGetDeviceCount(&dc) != cudaSuccess || dc <= 0) {
@@ -19026,6 +19167,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // Deferred bringup found no GPU for a --gpu-only request: error out as the
   // old synchronous path did, now that the reader has stopped streaming.
   if (gpu_only_no_device.load(std::memory_order_acquire)) {
+    stop_bringup_sample();
     if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
     die_usage("GPU requested (--gpu-only) but no CUDA devices available");
   }
@@ -19056,6 +19198,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     // populates that vector (data race otherwise), and leaving it joinable
     // made this std::thread's destructor call std::terminate — an abort on
     // every hybrid/gpu-only decompress of a streamed-zstd file (v0.13.54).
+    stop_bringup_sample();
     if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
     for (auto & th : gpu_workers) th.join();
     for (auto & th : cpu_pool) th.join();
@@ -19095,6 +19238,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // we must wait for it before iterating that vector.  (If CPU drained the
   // file during cuInit, the bringup thread may have spawned no GPU workers
   // or spawned ones that immediately hit the done+empty queue and exit.)
+  stop_bringup_sample();
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   for (auto & th : gpu_workers) th.join();
 

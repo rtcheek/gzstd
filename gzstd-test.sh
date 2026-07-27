@@ -342,6 +342,11 @@ files_match() {
 # cpu-only coverage.  Disable it globally and let the dedicated tests opt back
 # in, so the GPU paths stay exercised on small fixtures.
 export GZSTD_DEBUG_GPU_MIN_BYTES=0
+# Same reasoning for the "is the GPU still worth starting" sample: the suite's
+# fixtures all finish long before cuInit could, so an honest verdict would skip
+# the GPU everywhere and the GPU paths would stop being covered.  0 = always
+# engage.  The dedicated tests below set both hooks explicitly.
+export GZSTD_DEBUG_GPU_GUARD_SEC=0
 
 has_gpu() {
   ("$GZSTD" -V 2>&1 | grep -qi "nvcomp\|gpu\|cuda") 2>/dev/null && \
@@ -374,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=351
-$EXTENSIVE && EXPECTED_TESTS=484
+EXPECTED_TESTS=352
+$EXTENSIVE && EXPECTED_TESTS=485
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2407,6 +2412,26 @@ if has_gpu; then
          "(gate=$(echo "$sg_log5" | grep -c 'one GPU batch') walks=$sg_walks)"
   fi
 
+  # The bringup sample: a fixture that finishes long before cuInit could must
+  # skip GPU bringup, and the GUARD must be what decides it — so assert both
+  # directions on the same fixture (guard 60 s => skip, guard 0 => engage).
+  #
+  # --hybrid is required, not incidental: this input is small AND warm, so the
+  # residency rule already defaults it to cpu-only, decompress_nvcomp is never
+  # entered, and the sample under test never runs at all.
+  sg_log6=$(GZSTD_DEBUG_GPU_GUARD_SEC=60 "$GZSTD" -d --hybrid -vv -k -f "$sg_zst" \
+              -o "$TMPDIR/smallgate.out" 2>&1)
+  sg_log7=$(GZSTD_DEBUG_GPU_GUARD_SEC=0 "$GZSTD" -d --hybrid -vv -k -f "$sg_zst" \
+              -o "$TMPDIR/smallgate.out" 2>&1)
+  if echo "$sg_log6" | grep -q "bringup sample:.*-> skip" && \
+     ! echo "$sg_log7" | grep -q "bringup sample:.*-> skip"; then
+    pass "bringup sample skips the GPU only when the job outruns cuInit"
+  else
+    fail "bringup sample skips the GPU only when the job outruns cuInit" \
+         "(guard60: $(echo "$sg_log6" | grep -c 'bringup sample.*skip') skip(s), \
+guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
+  fi
+
   rm -f "$sg_src" "$sg_zst" "$TMPDIR/smallgate.out" "$TMPDIR/smallgate-tree.tar.zst"
   rm -rf "$sg_tree" "$TMPDIR/smallgate-tree.out"
 else
@@ -2415,6 +2440,7 @@ else
   skip "explicit --hybrid overrides the small-input gate"     "no GPU"
   skip "small archive decompress defaults to cpu-only"        "no GPU"
   skip "small --tar creation goes cpu-only, walks once, round-trips" "no GPU"
+  skip "bringup sample skips the GPU only when the job outruns cuInit" "no GPU"
 fi
 
 # ============================================================

@@ -31,6 +31,9 @@
 #                     Useful for verifying which "speed tricks" win
 #                     on the current hardware.  See v0.12.46 CHANGELOG.
 #   --sweep-all       Enable all sweeps (including --sweep-ultra)
+#   --adapt-warm      Add an adapt-warm row: --adapt WITH its learned
+#                     priors, primed by one untimed run per file, to
+#                     compare against the cold `adapt` row
 #   --no-decompress   Skip decomp benchmarks
 #   --help            Show this help
 #
@@ -40,6 +43,13 @@
 # + compute path is what's compared).  Decompress reads the .bin.zst that
 # gzstd-gendata.sh builds next to each .bin — run gzstd-gendata.sh first.
 # Reports wall-clock time and throughput in GiB/s.
+#
+# Baseline configs: cpu-only, gpu-only, hybrid, and adapt (the --adapt governor
+# choosing for itself).  The adapt row runs with --no-profile so a benchmark
+# cannot write calibration for a /dev/null sink into the machine's real profile;
+# that also means it measures --adapt WITHOUT its learned priors, so read it as
+# --adapt's floor rather than its typical speed.  See the CONFIGS block for the
+# full trade and how to measure the warm behaviour instead.
 #=====================================================================
 set -euo pipefail
 
@@ -61,6 +71,7 @@ OUTPUT="benchmark-results.json"
 ITERATIONS=3
 FILE_PATTERN="*"
 QUICK=false
+ADAPT_WARM=false
 GPU_ONLY=false
 CPU_ONLY=false
 HYBRID_ONLY=false
@@ -84,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --iterations)  ITERATIONS="$2"; shift 2 ;;
     --files)       FILE_PATTERN="$2"; shift 2 ;;
     --quick)       QUICK=true; ITERATIONS=1; shift ;;
+    --adapt-warm)  ADAPT_WARM=true; shift ;;
     --gpu-only)    GPU_ONLY=true; shift ;;
     --cpu-only)    CPU_ONLY=true; shift ;;
     --hybrid-only) HYBRID_ONLY=true; shift ;;
@@ -101,7 +113,10 @@ while [[ $# -gt 0 ]]; do
       SWEEP_MATRIX=true; shift ;;
     --no-decompress) DO_DECOMPRESS=false; shift ;;
     --help|-h)
-      head -42 "$0" | tail -37
+      # Print the header block from the title down to the closing ==== rule.
+      # This used to be a hardcoded `head -42 | tail -37`, so any edit to the
+      # header silently truncated the help instead of showing the new text.
+      awk 'NR>2 { if ($0 ~ /^#={10,}/) exit; print }' "$0"
       exit 0 ;;
     *) echo "Unknown option: $1"; exit 2 ;;
   esac
@@ -244,6 +259,52 @@ fi
 # and cpu-only/hybrid-decompress rows above by hardware gen — identical numbers,
 # no new benchmark data.  The *behavior* (compress→hybrid, decompress→cpu-only on
 # Gen<4 / hybrid on Gen4+) is asserted in gzstd-test.sh instead.)
+
+# --adapt: the governor picks its own backend and tunes itself while running, so
+# this is the row that answers "does --adapt actually beat the fixed backends on
+# this box?" — which is the whole point of the flag.  Not gated on a GPU build:
+# --adapt has plenty to do on a CPU-only machine (read path, writer parallelism,
+# extract pool sizing).  Skipped whenever the user pinned a backend, since
+# --adapt would simply override the pin and measure something else.
+#
+# --no-profile is deliberate, and it is a TRADE, not a free win.  It stops the
+# run from writing calibration into the machine's real profile — which matters
+# here because every output goes to /dev/null, so a benchmark would teach the
+# profile a sink rate for a device that does not exist and degrade the user's
+# actual runs afterwards.  But it disables profile READING too, so this row
+# measures --adapt WITHOUT its learned priors, i.e. the cold path.  Those priors
+# are worth real throughput (a measured +33% on cold compress), so treat this
+# number as --adapt's FLOOR, not its typical performance.  Reproducibility is
+# worth that: without it, each row would depend on hidden state left by whatever
+# ran before, and committed benchmark-results.json files would not be comparable.
+#
+# What it still measures honestly: everything --adapt does WITHIN a run —
+# regime classification and every in-run actuator.  What it cannot show: the
+# cross-run priors above, and the sink-side actuators, which have nothing to work
+# with when the sink is /dev/null.  To see warm behaviour, point XDG_CACHE_HOME
+# at a directory you keep and drop --no-profile from this line.
+if ! $GPU_ONLY && ! $HYBRID_ONLY && ! $CPU_ONLY; then
+  CONFIGS+=("adapt|--adapt --no-profile|--adapt --no-profile")
+
+  # --adapt-warm: the same governor allowed to KEEP what it learns, so the pair
+  # of rows brackets --adapt — `adapt` is its floor (no priors), `adapt-warm` its
+  # steady state.  One untimed priming run per file per direction seeds the
+  # profile first, so every timed iteration is genuinely warm rather than the
+  # median being a blend of one cold run and two warm ones.
+  #
+  # Safe only because XDG_CACHE_HOME is redirected into this run's temp dir
+  # (see below) — without that, this row would write /dev/null-sink calibration
+  # straight into the user's real profile.
+  #
+  # CAVEAT worth knowing before reading the delta: --adapt only records a run of
+  # 3 s or longer, so on a corpus whose files finish faster than that the priming
+  # run records nothing and this row lands on top of the cold one.  If the two
+  # rows come out identical, that is the reason — use a bigger --size, not a
+  # bigger --iterations.
+  if $ADAPT_WARM; then
+    CONFIGS+=("adapt-warm|--adapt|--adapt|warmup")
+  fi
+fi
 
 # Sweep GPU batch sizes
 if $SWEEP_BATCHES && $HAS_GPU_BUILD && ! $CPU_ONLY; then
@@ -565,6 +626,19 @@ throughput_gibs() {
 TMPDIR=$(mktemp -d /tmp/gzstd-bench.XXXXXX)
 trap "rm -rf $TMPDIR" EXIT
 
+# Belt and braces around the --adapt profile.
+#
+# The adapt config already passes --no-profile, which is what actually stops a
+# benchmark from writing calibration for a /dev/null sink into the machine's real
+# profile and degrading the user's later runs.  (Precedent: a tmpfs test once
+# poisoned the extract writer-pool prior exactly that way.)  This redirect makes
+# the guarantee structural rather than dependent on one flag staying on one line
+# — anyone adding another --adapt config, or dropping --no-profile to measure
+# warm behaviour, is still contained.  Configs without --adapt never touch the
+# profile at all, so it is a no-op for them.
+export XDG_CACHE_HOME="$TMPDIR/cache"
+mkdir -p "$XDG_CACHE_HOME"
+
 # Results accumulator (tab-separated for easy processing)
 RESULTS_FILE="$TMPDIR/results.tsv"
 _hdr="config\tfile\tmode\tfile_bytes\tcomp_bytes"
@@ -687,7 +761,12 @@ echo "$_bmsg"
 print_separator
 
 for config_str in "${CONFIGS[@]}"; do
-  IFS='|' read -r label comp_flags decomp_flags <<< "$config_str"
+  # Optional 4th field: config options for the harness itself (not gzstd flags).
+  # "warmup" = run once untimed before the timed iterations, so the config can
+  # measure its WARM behaviour.  Configs that omit the field leave it empty.
+  IFS='|' read -r label comp_flags decomp_flags cfg_opts <<< "$config_str"
+  cfg_warmup=false
+  [[ "$cfg_opts" == *warmup* ]] && cfg_warmup=true
 
   for test_file in "${TEST_FILES[@]}"; do
     file_base=$(basename "$test_file")
@@ -699,6 +778,17 @@ for config_str in "${CONFIGS[@]}"; do
     test_num=$((test_num + 1))
     print_status \
       "$test_num" "$total_tests" "$label" "$file_base" "compress"
+
+    # Priming pass (adapt-warm only): one UNTIMED run so the timed iterations
+    # below start from a profile this exact workload has already taught.  That is
+    # the whole difference between this row and the cold `adapt` one — without it,
+    # iteration 1 would be cold and only later ones warm, and the median would be
+    # a meaningless blend of the two.
+    if $cfg_warmup; then
+      # shellcheck disable=SC2086
+      run_timed "$GZSTD" --direct-read $comp_flags -f \
+        --output=/dev/null "$test_file" >/dev/null 2>&1 || true
+    fi
 
     times_c=()
     for ((i=1; i<=ITERATIONS; i++)); do
@@ -745,6 +835,16 @@ for config_str in "${CONFIGS[@]}"; do
                   || stat -f%z "$zst_in" 2>/dev/null || echo "0")
       dratio=$(python3 -c \
         "print(f'{$zst_bytes * 100 / $file_bytes:.1f}')" 2>/dev/null || echo "?")
+      # Priming pass (adapt-warm only) — see the compress side above.  The
+      # profile records per direction, so decompress needs its own.
+      if $cfg_warmup; then
+        warm_flags="-d"
+        [[ -n "$decomp_flags" ]] && warm_flags="$decomp_flags -d"
+        # shellcheck disable=SC2086
+        run_timed "$GZSTD" --direct-read $warm_flags -f \
+          --output=/dev/null "$zst_in" >/dev/null 2>&1 || true
+      fi
+
       times_d=()
       for ((i=1; i<=ITERATIONS; i++)); do
         # Use decomp_flags if set, otherwise just -d

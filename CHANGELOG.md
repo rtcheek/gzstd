@@ -1,11 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.29  
+**Covers:** v0.9.50 → v0.15.30  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.30 — the GPU has to prove it can still pay for itself
+
+### The measured test
+
+The size gate rules out inputs that cannot fill one GPU batch, but that is only a *necessary* condition — it says nothing about whether the job outlasts cuInit. On a fast many-core box it under-shoots badly. Measured, identical output both ways:
+
+| operation | `--cpu-only` | `--hybrid` (before) |
+|---|---|---|
+| compress 512 MB | 0.22 s | 5.51 s |
+| compress 5.3 GB | 2.93 s | 5.79 s |
+| decompress 5.3 GB | 1.88 s | 3.09 s |
+
+All of it bringup the job never recoups. The honest test is the one the `-d --tar` decode pool already applies before spawning GPU decoders: *does enough work remain to outlast the init?*
+
+That cannot be answered up front — it needs a rate, and any rate model is wrong here (this box compresses at ~2.4 GiB/s aggregate whether it has 96 cores or 256: the pool is memory-bound long before it is core-bound). So it is **measured**: the deferred bringup thread watches what the pipeline actually achieves for ~0.25 s and extrapolates, *before* the first CUDA call — so a "no" costs nothing. No rate constants and no core-count thresholds; it reads the box it is running on.
+
+**Measure a windowed rate, not cumulative progress.** The first attempt extrapolated from bytes-since-zero and got it backwards: on the 5.3 GB decompress it saw 2% of the source in 151 ms and predicted **7.4 s** remaining for a job that had ~1.4 s left — because cumulative progress folds in the startup ramp. Discarding a 0.10 s warm-up and measuring the rate over the next 0.15 s gives 11% read → 1.26 s remaining → skip. (Same shape as v0.15.26's integrated-rate fix, for the same reason.) The verdict is visible at `-vv` as `[GPU] bringup sample:` rather than being a black box.
+
+Decompressing 5.3 GB: **3.09 s → 1.55 s**. Conservative in every uncertain direction — an unknown size, an unreadable meter, or a job too slow to sample all engage the GPU, and `--gpu-only` always engages since it has no CPU pool to fall back on.
+
+**This is wired into decompress only.** Compress needs the same treatment but a larger restructure first — see below.
+
+**Validated:** default suite **352/0**, extensive **485/0**, no drift note. The new test asserts both directions on one fixture — guard 60 s ⇒ skip, guard 0 ⇒ engage — so it proves the *guard* is what decides rather than merely that something was skipped. A deliberately slow decompress (`-T 1`, 4.66 s remaining) still engages, and `GZSTD_DEBUG_GPU_GUARD_SEC=0` brings all 8 devices online.
+
+That test needed `--hybrid` passed explicitly, which is worth recording: its fixture is small *and* warm, so the pre-existing residency rule already defaults it to cpu-only, `decompress_nvcomp` is never entered, and the code under test never runs. The first version of the test passed no backend and silently exercised nothing.
+
+**Benchmark:** `gzstd-benchmark.sh` gains an `adapt` row (`--adapt --no-profile`, so a `/dev/null`-sink run cannot write bogus calibration into the machine's real profile) and an opt-in `--adapt-warm` row that lets the governor keep what it learns, primed by one untimed run per file so every timed iteration is genuinely warm. `XDG_CACHE_HOME` is redirected into the run's temp dir, which is what makes the warm row safe. The pair brackets `--adapt`: floor and steady state. First result on a 20 GB corpus is itself the argument for the compress work below — `--adapt` tracked hybrid exactly at 2.03 GiB/s while cpu-only did **4.48**.
+
+### Owed: the same guard on compress
+
+`compress_nvcomp` still calls `cudaGetDeviceCount` synchronously as its first act, so compress has neither the deferral nor the sample — the 512 MB / 24× case above is **not yet fixed**. The reason it is not a small change: in compress the *main thread is the producer*, and GPU workers are spawned before the reader runs, so nothing has made progress at the point a sample would be taken. Getting a measurement requires what decompress already does — a bringup thread that owns detection *and* worker spawn, so the main thread can proceed to the reader meanwhile. That means moving `per_dev`/`json_sink`/`fatal_msgs` sizing and the watchdog setup off the main thread onto that thread, with a provisional device count for the throttle and scheduler sizing (RAM-capped, so over-estimating is harmless — the same justification decompress uses). Deliberately left as its own change rather than rushed onto the archive-writing path.
 
 ## v0.15.29 — `--tar` creation gets the small-input gate too: walk before cuInit
 
@@ -22,8 +54,6 @@ The threshold itself moved into a shared `gpu_min_useful_bytes()` helper, so the
 **Still not covered:** compressing from a pipe or stdin, where the size is genuinely unknowable up front. That is inherent, not an oversight.
 
 **Also:** the `-v` gate message now says it is *overriding the announced backend*. The `[STARTUP]` banner is printed before the walk runs, so it still announces hybrid; the following line now makes the relationship explicit rather than appearing to contradict it.
-
-**Validated:** default suite 351/0, extensive 484/0, no drift note; small-tree creation round-trips byte-identically and walks once; a 5 GiB tree still brings up all 8 devices.
 
 ## v0.15.28 — small inputs no longer pay for a GPU they never use; writer prior keyed by archive shape
 

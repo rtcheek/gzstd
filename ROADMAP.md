@@ -296,6 +296,25 @@ documented deferral during M4):
   won only for the base pool, letting the probe override the pin).
   Follow-up: positive-perf validation on the Gen<4 workstation; the 3-bucket
   shape split (64 KiB / 4 MiB) is measured only at its extremes.
+- **OPEN — the same lazy-engagement guard on COMPRESS (v0.15.29 did decompress).**
+  `compress_nvcomp` still calls `cudaGetDeviceCount` synchronously as its first
+  act, so it has neither the deferral nor the "is the GPU still worth starting"
+  sample. Measured cost on the 256-core/8-GPU box, identical output both ways:
+  compressing 512 MB takes **0.22 s cpu-only vs 5.51 s hybrid**, 5.3 GB takes
+  2.93 s vs 5.79 s — all of it bringup the job never recoups. The size gate
+  (`gpu_min_useful_bytes`, one GPU batch ≈ 128 MiB) is far below the real
+  break-even, which is "does the job outlast cuInit" (~10 GB here).
+  **Why it isn't a small change:** in compress the MAIN THREAD is the producer,
+  and GPU workers spawn before the reader runs, so nothing has made progress when
+  a sample would be taken. It needs what decompress already has — a bringup
+  thread owning detection *and* worker spawn, so the main thread proceeds to the
+  reader meanwhile. That means moving `per_dev`/`json_sink`/`fatal_msgs` sizing
+  and the watchdog setup onto that thread, with a provisional device count for
+  the throttle and `HybridSched` sizing (RAM-capped, so over-estimating is
+  harmless — decompress's own justification). `--cpu-share` must keep the
+  synchronous bringup (the v0.13.11 regression: the GPU has to be warm before the
+  reader starts or the explicit split is silently ignored). Reuse
+  `gpu_bringup_worth_it()` unchanged.
 - **GPU decoders in the extract decode pool: Phase 1 DONE v0.15.22, Phase 2 DONE
   v0.15.23.** The v0.15.20 decode pool was CPU-only; GPU-stream decoders now
   batch-drain the same shared frame queue and scatter into the same reorder
