@@ -1,11 +1,44 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.26  
+**Covers:** v0.9.50 → v0.15.27  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.27 — --adapt: close the residual extract gap — procfs fingerprint, and a writer pool that contracts
+
+**v0.15.26 left `--adapt` extraction measurably SLOWER than the plain default on a trivial-decode archive and called the residual "warmup + writer-probe overhead, orthogonal". It was neither orthogonal nor warmup.** Measured on a 24 GiB incompressible archive (13 huge files, read from one NVMe and written to another): default **7.79 s**, `--adapt` **8.36 s** — a **7% regression** on exactly the workload where `--adapt` has the least to contribute. Two independent causes, both now fixed.
+
+### 1. A 300 ms NVML probe on the startup path
+
+`--adapt` builds a hardware fingerprint to key its per-machine profile. The GPU half of that fingerprint came from `nvmlInit_v2` + per-device enumerate + `nvmlShutdown`, which on an 8-GPU host measured **300 ms** — paid before any work begins, every run. It was the *entire* fixed cost of the flag: `--adapt --no-profile` (0.913 s on a trivial extract) matched the plain default (0.920 s) exactly, while `--adapt` took 1.159 s.
+
+The NVIDIA kernel module already publishes what the fingerprint needs as plain procfs text — per-GPU model names under `/proc/driver/nvidia/gpus/<pci-bdf>/information`, the driver version in `/proc/driver/nvidia/version`. Reading those costs microseconds. The directory names are PCI bus addresses, so iterating them sorted reproduces NVML's index order: the output is **byte-for-byte identical** to the NVML path (verified against a live 8-GPU entry with mixed PCIe/NVL models — same fingerprint hash, `b622a1e77b0f5f3a`, so no machine silently orphans the priors it has learned). NVML remains the fallback for hosts exposing the device nodes without procfs. The fingerprint is also memoized now, since it is hardware and cannot change within a process.
+
+**Fixed `--adapt` overhead on a trivial extract: 247 ms → 5 ms.**
+
+### 2. A writer-pool prior that could only ever grow
+
+The profile persists one settled `tar_write_threads` per machine — but the optimal writer count is **workload**-dependent, not just machine-dependent. This box measured 60 writers on a 390 K-small-file extract (metadata/syscall-bound, where parallelism genuinely pays: 60 writers run **92.8% busy / 0.6% starved**). Replay that prior on a few-huge-file extract and it is badly wrong: concurrent O_DIRECT streams contend, so the same 60 writers run **11.2% busy / 84.0% starved** and the extract is ~9% slower than at 16. Measured writer sweep on the incompressible archive (medians): 2 → 8.55 s, **4–16 → 7.6–7.8 s (a wide flat plateau)**, 60 → 8.47 s.
+
+Nothing could walk that back. The prior was baked into the *base* pool, which has no retire path, and the only corrective actuator (action 5c) grows and is gated on `SINK_BOUND` — a classification an over-provisioned extract never reaches, because the per-thread busy average is dragged under the sink threshold by the very surplus that needs correcting. So `--adapt` loaded a bad number and then had no mechanism to question it.
+
+- **The prior is now seeded as retirable extras** above the proven `min(cpu,16)` base, so the pool still *starts* where the profile says but can be contracted back.
+- **Action 5c is bidirectional.** The contract direction is driven by the writers' own busy/starved split — a starved writer is by definition one the pipeline doesn't need — and is deliberately *not* gated on `SINK_BOUND`, for the reason above. It fires only on an unambiguous surplus (>50% starved, EMA-smoothed, three consecutive ticks), which is far clear of both measured regimes (0.01 metadata-bound vs 0.84 over-provisioned).
+- **Every contraction is keep-or-revert on integrated rate**, reusing the v0.15.26 lesson: measure over ~0.8 s (the sink drains in bursts; a single window false-reverts on a gap), keep unless throughput dropped >15%, and on a drop spawn the writers back and lock the floor. Steps are geometric — half the distance to the floor, not the reader/decoder side's third, because each round costs ~0.9 s and a /3 walk from a large prior doesn't converge inside a short extract.
+- **Grow never fires into a measured surplus.** Without that gate the two directions fight: a sink-bound classification arriving mid-count grows the pool and resets the surplus counter, undoing the trim it was about to confirm (observed: 60 → 36, then straight back to 44).
+
+The controller walks **60 → 38 → 27 → 22 → 19 → 18 → 17 → 16 with zero false reverts**, and the settled size persists, so the next run on that workload starts at the answer.
+
+**Note on `--adapt`'s single per-machine writer prior:** it is workload-blind by construction, so alternating between a metadata-bound and a bandwidth-bound archive will keep re-teaching it. That is now self-healing rather than permanent — the contraction corrects it within a run, and fully across one or two — but a workload-keyed prior (archive geometry is known before `start_pool`, like `comp_ratio`) is the real answer if this proves annoying in practice.
+
+**Validated (real NVMe, all byte-identical, suite 346/0):**
+- Incompressible 24 GiB (ratio 1.00, write-bound): default 7.79 s → `--adapt` **7.87 s first run, 7.24 s at steady state** (was 8.36 s). Profile converges 60 → 27 → 16 over three runs.
+- 390 K-file metadata-bound (ratio 0.96): 14.82 s vs 14.92 s — parity. **No wrong trim** (0.4% starved, well under the bar) and the grow probe still fires (60 → 68 → 76).
+- Decode-bound base64 (ratio 0.75, pool path): default 4.82 s → `--adapt` **2.92 s (39% faster)**, up from 33%. A contraction attempt here correctly **reverted** ("load-bearing") — the safety net firing on the one case that needed it.
+- The `-v` `[WRITER]` line now reports the settled pool size alongside the peak, so a contracted run no longer reports only a high-water mark it spent little time at.
 
 ## v0.15.26 — -d --tar: fix a -28% incompressible-extract regression — inline trivial decode, size the pool by measured throughput
 

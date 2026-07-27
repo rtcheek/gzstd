@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.26";
+static constexpr const char * GZSTD_VERSION = "0.15.27";
 //
 // Architecture overview:
 //
@@ -2052,6 +2052,7 @@ static constexpr uint32_t    ADAPT_ACT_READER_SCALEUP = 1u << 2;
 static constexpr uint32_t    ADAPT_ACT_SINK_GROW      = 1u << 3;
 static constexpr uint32_t    ADAPT_ACT_WRITER_PROBE   = 1u << 4;
 static constexpr uint32_t    ADAPT_ACT_EWRITER_GROW   = 1u << 5;  // -d --tar pool grow
+static constexpr uint32_t    ADAPT_ACT_EWRITER_TRIM   = 1u << 6;  // -d --tar pool contraction
 static std::atomic<uint32_t> g_adapt_action_flags{0};
 
 // Writer-parallelism probe (M4 action 5b).  The governor raises the probe
@@ -2307,6 +2308,7 @@ public:
     if (acts & ADAPT_ACT_EWRITER_GROW)    os << " extract-writers(kept)";
     if (g_adapt_ewgrow_engaged.load(std::memory_order_relaxed)
         && !(acts & ADAPT_ACT_EWRITER_GROW)) os << " extract-writers(probed)";
+    if (acts & ADAPT_ACT_EWRITER_TRIM)    os << " extract-writers(trimmed)";
     os << "\n";
     vlog(V_VERBOSE, opt_, os.str());
   }
@@ -2318,11 +2320,17 @@ private:
   static constexpr double  SOURCE_BUSY   = 0.85;  // [READER] "reader saturated" threshold
   static constexpr double  SOURCE_BLOCKED_MAX = 0.05;
   static constexpr int     STICKY_TICKS  = 5;     // 0.5 s of agreement to switch regime
+  // -d --tar writer-pool surplus bar: above this starved share the pool has more
+  // writers than the pipe feeds.  Set well clear of both measured regimes (a
+  // metadata-bound sink sits at ~0.01, an over-provisioned bandwidth-bound one at
+  // ~0.84), so the contraction only fires on an unambiguous surplus.
+  static constexpr double  EW_SURPLUS    = 0.50;
 
   struct Snap {
     uint64_t wdisk = 0, wstarv = 0, wbytes = 0,
              rio = 0, rparse = 0, rcopy = 0, rblocked = 0,
-             ebusy = 0;   // -d --tar writer-pool busy (sums across writer_pool_threads)
+             ebusy = 0,   // -d --tar writer-pool busy (sums across writer_pool_threads)
+             estarv = 0;  // -d --tar writer-pool starved (same sum; the surplus signal)
   };
 
   int64_t now_ns_() const
@@ -2337,6 +2345,7 @@ private:
     s.wstarv   = m_->writer_starved_ns.load(std::memory_order_relaxed);
     s.wbytes   = m_->wrote_bytes.load(std::memory_order_relaxed);
     s.ebusy    = m_->extract_busy_ns.load(std::memory_order_relaxed);
+    s.estarv   = m_->extract_starved_ns.load(std::memory_order_relaxed);
     s.rio      = m_->reader_io_ns.load(std::memory_order_relaxed);
     s.rparse   = m_->reader_parse_ns.load(std::memory_order_relaxed);
     s.rcopy    = m_->reader_copy_ns.load(std::memory_order_relaxed);
@@ -2555,6 +2564,34 @@ private:
       // a large-file boundary or fsync) can drown it and force a false keep.
       // The EMA is the reference the round-start snapshots instead.
       wrate_ema_ = (wrate_ema_ <= 0.0) ? wrate : (wrate_ema_ * 0.6 + wrate * 0.4);
+      // WRITER-SURPLUS signal (the contract direction): the share of pool time
+      // spent WAITING for a job rather than writing.  A starved writer is, by
+      // definition, a writer the pipeline does not need — and past the plateau
+      // the surplus is not merely idle but actively harmful (concurrent O_DIRECT
+      // streams contend, so a 60-writer pool measured ~9% slower than 16 on a
+      // few-huge-files extract).  Contrast the two measured regimes: a
+      // metadata-bound extract at 60 writers runs busy 92.8% / starved 0.6% —
+      // every writer is real work, keep them; a bandwidth-bound one at 60 runs
+      // busy 11.2% / starved 84.0% — grossly over-provisioned.  This is the one
+      // thing this ratio is a good signal FOR: it is blind to reader/decoder
+      // sizing (v0.15.26) because it is dominated by writer over-provisioning,
+      // which is precisely what is being controlled here.  EMA-smoothed, and
+      // every contraction is still confirmed by keep-or-revert on the sink rate.
+      const double d_ebusy  = double(cur.ebusy  - prev_snapped_ebusy_);
+      const double d_estarv = double(cur.estarv - prev_snapped_estarv_);
+      prev_snapped_ebusy_ = cur.ebusy; prev_snapped_estarv_ = cur.estarv;
+      const double wsum = d_ebusy + d_estarv;
+      if (wsum > 0.0) {
+        const double sf = d_estarv / wsum;
+        starved_ema_ = (starved_ema_ < 0.0) ? sf : (starved_ema_ * 0.6 + sf * 0.4);
+      }
+      // Capture the pool geometry as soon as the pool is demonstrably LIVE (it
+      // has accrued busy/starved time, so start_pool has published its size).
+      // Doing it lazily inside the action branches instead would deadlock the
+      // contraction gate, which has to read ewgrow_extra_ to decide whether
+      // there is anything to retire; and doing it on the first tick would latch
+      // the pre-pool placeholder size of 1.
+      if (wsum > 0.0) ew_lazy_init_();
       if (probe_phase_ == 1) {
         probe_rate_acc_ += wrate;
         if (++probe_ticks_ >= 4) {
@@ -2569,7 +2606,8 @@ private:
             std::snprintf(pl, sizeof(pl),
               "[ADAPT] extract writer probe KEPT: sink %.2f -> %.2f GiB/s "
               "(pool %d -> %d writers)\n", probe_pre_rate_ * 1e9 / 1073741824.0,
-              post * 1e9 / 1073741824.0, ewgrow_base_, ewgrow_base_ + ewgrow_extra_);
+              post * 1e9 / 1073741824.0, ewgrow_base_ + ewgrow_extra_ - ewgrow_step_,
+              ewgrow_base_ + ewgrow_extra_);
             probe_phase_ = 0;   // kept — may probe another round (rounds capped)
           } else {
             ewgrow_extra_ = std::max(0, ewgrow_extra_ - ewgrow_step_);
@@ -2586,22 +2624,89 @@ private:
           }
           vlog(V_VERBOSE, opt_, pl);
         }
-      } else if (probe_phase_ == 0 && regime_ == AdaptRegime::SINK_BOUND
-                 && probe_rounds_ < ewgrow_rounds_cap_ && wrate > 0) {
-        if (ewgrow_base_ == 0) {
-          ewgrow_base_ = std::max(1,
-              m_->writer_pool_threads.load(std::memory_order_relaxed));
-          // Let the probe walk the pool from base up toward the machine's usable
-          // thread count (the supervisor enforces the same cpu ceiling), one
-          // base/2 step per round -- so a CPU/metadata-bound sink on a many-core
-          // box can pull idle cores onto the writers instead of stalling at the
-          // old 2xbase cap.  Each round still only proceeds while it pays >=10%,
-          // so it self-converges at the real per-box plateau well before this cap.
-          const int cpu = resolve_cpu_threads(opt_.cpu_threads);
-          const int step = std::max(1, ewgrow_base_ / 2);
-          const int max_extras = std::max(ewgrow_base_, cpu - ewgrow_base_);
-          ewgrow_rounds_cap_ = std::max(2, 1 + (max_extras + step - 1) / step);
+      } else if (probe_phase_ == 2) {
+        // Measuring a CONTRACTION.  Integrated over ~0.8 s (8 ticks), not the
+        // grow probe's 4: the sink drains in BURSTS, so a short window
+        // false-reverts on a burst gap (the v0.15.26 lesson, same reason the
+        // reader/decoder controller integrates rate_back over ~0.8 s).  Keep
+        // unless throughput actually DROPPED — removing surplus should be
+        // rate-neutral or better, so the bar is "did not lose >15%", the mirror
+        // of the grow probe's "must gain >=10%".
+        probe_rate_acc_ += wrate;
+        if (++probe_ticks_ >= 8) {
+          const double post = probe_rate_acc_ / probe_ticks_;
+          const bool keep = post >= probe_pre_rate_ * 0.85;
+          char pl[192];
+          if (keep) {
+            g_adapt_ewgrow_settled.store(ewgrow_base_ + ewgrow_extra_,
+                                         std::memory_order_relaxed);
+            g_adapt_action_flags.fetch_or(ADAPT_ACT_EWRITER_TRIM,
+                                          std::memory_order_relaxed);
+            std::snprintf(pl, sizeof(pl),
+              "[ADAPT] extract writer contraction KEPT: sink %.2f -> %.2f GiB/s "
+              "(pool %d writers, starved %.0f%%)\n",
+              probe_pre_rate_ * 1e9 / 1073741824.0, post * 1e9 / 1073741824.0,
+              ewgrow_base_ + ewgrow_extra_, starved_ema_ * 100.0);
+            probe_phase_ = 0;   // may contract further while the surplus persists
+          } else {
+            // The trimmed writers were load-bearing: put them back and LOCK the
+            // floor there, so the run stops trimming into a real bottleneck.
+            ewgrow_extra_ += ewgrow_ctr_n_;
+            adapt_set_ewgrow(ewgrow_extra_);
+            ewgrow_floor_extra_ = ewgrow_extra_;
+            g_adapt_ewgrow_settled.store(ewgrow_base_ + ewgrow_extra_,
+                                         std::memory_order_relaxed);
+            probe_phase_ = 3;   // converged; no more sizing rounds this run
+            std::snprintf(pl, sizeof(pl),
+              "[ADAPT] extract writer contraction reverted: sink %.2f -> %.2f GiB/s "
+              "(load-bearing, pool back to %d)\n",
+              probe_pre_rate_ * 1e9 / 1073741824.0, post * 1e9 / 1073741824.0,
+              ewgrow_base_ + ewgrow_extra_);
+          }
+          vlog(V_VERBOSE, opt_, pl);
         }
+      } else if (probe_phase_ == 0 && ewgrow_base_ != 0
+                 && ewgrow_extra_ > ewgrow_floor_extra_
+                 && starved_ema_ >= EW_SURPLUS && wrate_ema_ > 0
+                 && ++ew_surplus_ticks_ >= 3) {
+        // CONTRACT.  Deliberately NOT gated on regime_ == SINK_BOUND: an extract
+        // whose writers are over-provisioned classifies as COMPUTE_BOUND (the
+        // per-thread busy average is dragged under the sink threshold by the very
+        // surplus being corrected), so the sink-bound gate would never fire on the
+        // case that needs this most.  The writers' own busy/starved split is the
+        // direct, local signal for how many writers the pipe wants.
+        //
+        // Geometric step, like the reader/decoder contraction, but HALF the
+        // distance to the floor rather than a third: each round costs a full
+        // ~0.9 s (act + integrate), so a /3 walk from a large seeded prior does
+        // not converge inside a short extract.  Overshoot is what keep-or-revert
+        // is for, and the writer surplus signal is far cleaner than the
+        // queue-depth one the reader/decoder side has to work with.
+        ewgrow_ctr_n_ = std::max(1, (ewgrow_extra_ - ewgrow_floor_extra_) / 2);
+        probe_pre_rate_ = wrate_ema_;
+        probe_rate_acc_ = 0.0;
+        probe_ticks_ = 0;
+        ew_surplus_ticks_ = 0;
+        ewgrow_extra_ -= ewgrow_ctr_n_;
+        adapt_set_ewgrow(ewgrow_extra_);
+        char pl[160];
+        std::snprintf(pl, sizeof(pl),
+          "[ADAPT] writers starved %.0f%%: retiring %d extract writer(s) (pool %d -> %d)\n",
+          starved_ema_ * 100.0, ewgrow_ctr_n_,
+          ewgrow_base_ + ewgrow_extra_ + ewgrow_ctr_n_, ewgrow_base_ + ewgrow_extra_);
+        vlog(V_VERBOSE, opt_, pl);
+        probe_phase_ = 2;
+      } else if (probe_phase_ == 0 && regime_ == AdaptRegime::SINK_BOUND
+                 && starved_ema_ < EW_SURPLUS
+                 && probe_rounds_ < ewgrow_rounds_cap_ && wrate > 0) {
+        // Never grow into a measured surplus.  Without this gate the two
+        // directions fight: the contraction needs a few consecutive surplus
+        // ticks to commit, and a sink-bound classification arriving mid-count
+        // would grow the pool and reset that count, undoing the trim it was
+        // about to confirm (observed: a run contracted 60 -> 36, then grew
+        // straight back to 44).
+        ew_surplus_ticks_ = 0;
+        ew_lazy_init_();                 // no-op once the pool geometry is known
         ewgrow_step_ = std::max(1, ewgrow_base_ / 2);
         probe_pre_rate_ = wrate_ema_ > 0.0 ? wrate_ema_ : wrate;  // smoothed baseline
         probe_rate_acc_ = 0.0;
@@ -2612,11 +2717,36 @@ private:
         char pl[128];
         std::snprintf(pl, sizeof(pl),
           "[ADAPT] sink-bound: probing +%d extract writers (round %d, pool %d -> %d)\n",
-          ewgrow_step_, probe_rounds_, ewgrow_base_, ewgrow_base_ + ewgrow_extra_);
+          ewgrow_step_, probe_rounds_, ewgrow_base_ + ewgrow_extra_ - ewgrow_step_,
+          ewgrow_base_ + ewgrow_extra_);
         vlog(V_VERBOSE, opt_, pl);
         probe_phase_ = 1;
       }
     }
+  }
+
+  // One-time capture of the writer-pool geometry the sizing rounds step
+  // against: the immovable BASE pool and the extras already in flight.  A
+  // profile-seeded prior arrives as extras (see Extractor::start_pool), so
+  // ewgrow_extra_ must start at the live target rather than 0 — otherwise the
+  // first adapt_set_ewgrow would silently drop the seed.
+  void ew_lazy_init_()
+  {
+    if (ewgrow_base_ != 0) return;
+    const int live  = std::max(1, m_->writer_pool_threads.load(std::memory_order_relaxed));
+    const int inflt = g_adapt_ewgrow_target.load(std::memory_order_relaxed);
+    ewgrow_extra_ = std::max(0, std::min(inflt, live - 1));
+    ewgrow_base_  = std::max(1, live - ewgrow_extra_);
+    // Let a grow probe walk the pool from base up toward the machine's usable
+    // thread count (the supervisor enforces the same cpu ceiling), one base/2
+    // step per round -- so a CPU/metadata-bound sink on a many-core box can pull
+    // idle cores onto the writers instead of stalling at the old 2xbase cap.
+    // Each round still only proceeds while it pays >=10%, so it self-converges
+    // at the real per-box plateau well before this cap.
+    const int cpu  = resolve_cpu_threads(opt_.cpu_threads);
+    const int step = std::max(1, ewgrow_base_ / 2);
+    const int max_extras = std::max(ewgrow_base_, cpu - ewgrow_base_);
+    ewgrow_rounds_cap_ = std::max(2, 1 + (max_extras + step - 1) / step);
   }
 
   void transition_(AdaptRegime to, int64_t t)
@@ -2653,12 +2783,18 @@ private:
   int64_t prev_ns_ = 0;
   double  last_io_frac_ = 0.0;                 // tick-thread only
   bool    last_sink_bursty_ = false;           // tick-thread only
-  int     probe_phase_ = 0;                    // 0 idle / 1 running / 2 kept / 3 converged
+  int     probe_phase_ = 0;                    // 0 idle / 1 grow round / 2 contract round / 3 converged
   int     probe_rounds_ = 0;                   // tick-thread only
   int     ewgrow_rounds_cap_ = 2;              // extract: max grow rounds (sized to cpu at first probe)
   int     ewgrow_base_ = 0;                    // extract: base pool size at first probe
   int     ewgrow_extra_ = 0;                   // extract: extra writers currently requested
   int     ewgrow_step_ = 0;                    // extract: per-round grow step
+  int     ewgrow_floor_extra_ = 0;             // extract: locked minimum extras (raised on a revert)
+  int     ewgrow_ctr_n_ = 0;                   // extract: extras retired by the round being measured
+  int     ew_surplus_ticks_ = 0;               // extract: consecutive ticks of measured writer surplus
+  double  starved_ema_ = -1.0;                 // extract: smoothed writer starved share (<0 = unseeded)
+  uint64_t prev_snapped_ebusy_ = 0;            // extract: sizing-probe baselines (independent of prev_)
+  uint64_t prev_snapped_estarv_ = 0;
   double  wrate_ema_ = 0.0;                    // extract: smoothed write rate (robust probe baseline)
   int     probe_ticks_ = 0;                    // tick-thread only
   double  probe_pre_rate_ = 0.0;               // bytes/ns
@@ -2911,7 +3047,70 @@ struct AdaptFp {
   std::string driver;  // GPU driver version ("" without a driver); entry data, NOT key
 };
 
-static AdaptFp adapt_fingerprint()
+// GPU half of the fingerprint, read straight from the driver's procfs.
+//
+// This is the FAST PATH for what NVML would otherwise tell us.  The NVIDIA
+// kernel module publishes each GPU's marketing name under
+// /proc/driver/nvidia/gpus/<pci-bdf>/information and the driver version in
+// /proc/driver/nvidia/version — the two things the fingerprint needs.  Reading
+// them costs microseconds; an nvmlInit_v2 + per-device enumerate + nvmlShutdown
+// cycle measured 300 ms on an 8-GPU host, which was the ENTIRE fixed startup
+// cost of --adapt (a ~3% loss on a short extract, paid before any work begins).
+//
+// The output is byte-for-byte what NVML produces: the directory names are PCI
+// bus addresses, so iterating them in sorted order reproduces NVML's index
+// order (verified against a live 8-GPU profile entry, mixed PCIe/NVL models).
+// That matters — the string is hashed into the profile key, so a difference
+// would silently orphan every prior this machine has learned.
+//
+// false = nothing usable here (no driver, or a container exposing the device
+// nodes without procfs); the caller falls back to NVML.
+static bool adapt_fp_gpus_procfs(std::string & gpus, std::string & driver)
+{
+  std::error_code ec;
+  std::vector<std::string> bdf;
+  for (const auto & e : fs::directory_iterator("/proc/driver/nvidia/gpus", ec))
+    bdf.push_back(e.path().filename().string());
+  if (ec || bdf.empty()) return false;
+  std::sort(bdf.begin(), bdf.end());           // PCI order == NVML index order
+  std::string names;
+  for (const std::string & b : bdf) {
+    std::ifstream inf("/proc/driver/nvidia/gpus/" + b + "/information");
+    std::string line, model;
+    while (inf && std::getline(inf, line)) {
+      if (line.rfind("Model:", 0) != 0) continue;
+      const size_t s = line.find_first_not_of(" \t", 6);
+      if (s == std::string::npos) break;
+      size_t e2 = line.find_last_not_of(" \t\r");
+      model = line.substr(s, e2 + 1 - s);
+      break;
+    }
+    if (model.empty()) return false;           // unexpected layout: use NVML
+    if (!names.empty()) names += '+';
+    names += model;
+  }
+  // "NVRM version: NVIDIA UNIX x86_64 Kernel Module  570.207  Fri Nov 14 ..."
+  std::string drv;
+  {
+    std::ifstream vf("/proc/driver/nvidia/version");
+    std::string line;
+    while (vf && std::getline(vf, line)) {
+      const size_t k = line.find("Kernel Module");
+      if (k == std::string::npos) continue;
+      const size_t s = line.find_first_not_of(" \t", k + 13);
+      if (s == std::string::npos) break;
+      const size_t e2 = line.find_first_of(" \t", s);
+      drv = line.substr(s, e2 == std::string::npos ? e2 : e2 - s);
+      break;
+    }
+  }
+  if (drv.empty()) return false;               // no version line: use NVML
+  gpus = names;
+  driver = drv;
+  return true;
+}
+
+static AdaptFp adapt_fingerprint_probe_()
 {
   AdaptFp fp;
   std::string cpu = "unknown-cpu";
@@ -2937,6 +3136,7 @@ static AdaptFp adapt_fingerprint()
   }
   std::string gpus;
 #if defined(HAVE_NVCOMP) && defined(HAVE_NVML)
+  if (!adapt_fp_gpus_procfs(gpus, fp.driver))
   if (nvmlInit_v2() == NVML_SUCCESS) {
     unsigned n = 0;
     if (nvmlDeviceGetCount_v2(&n) == NVML_SUCCESS) {
@@ -2963,6 +3163,21 @@ static AdaptFp adapt_fingerprint()
   char hex[20];
   std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
   fp.hash = hex;
+  return fp;
+}
+
+// The fingerprint is HARDWARE — constant for the life of the process — but
+// building it costs an NVML init/enumerate/shutdown cycle, which on a
+// multi-GPU box is ~100 ms.  It used to be rebuilt on every profile touch
+// (load at startup, save at exit), so a --adapt run paid it twice: ~0.24 s of
+// pure startup latency, measurable as a ~3% loss on a short extract.  Memoize
+// it: one probe per process, and none at all when --adapt is off or
+// --no-profile is given (nothing calls this).  Function-local static init is
+// thread-safe (C++11), so the concurrent-caller case is a plain race-free
+// wait on the first probe.
+static const AdaptFp & adapt_fingerprint()
+{
+  static const AdaptFp fp = adapt_fingerprint_probe_();
   return fp;
 }
 
@@ -3110,7 +3325,7 @@ static AdaptPriors adapt_load_priors()
   AdaptPriors P;
   AdaptJv root;
   if (!adapt_profile_load(adapt_profile_path(), root)) return P;
-  const AdaptFp fp = adapt_fingerprint();
+  const AdaptFp & fp = adapt_fingerprint();
   const AdaptJv * entries = root.get("entries");
   if (!entries || entries->t != AdaptJv::OBJ) return P;
   const AdaptJv * entry = entries->get(fp.hash);
@@ -3175,7 +3390,7 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
       vlog(V_VERBOSE, opt, "[ADAPT] profile unreadable; rewriting: " + path + "\n");
   }
 
-  const AdaptFp fp = adapt_fingerprint();
+  const AdaptFp & fp = adapt_fingerprint();
   AdaptJv & entries = root.set("entries");
   entries.t = AdaptJv::OBJ;
   AdaptJv & entry = entries.set(fp.hash);
@@ -11379,6 +11594,10 @@ public:
   // wpool_busy_ns_ sums across the extras too, so dividing by n_writers_ alone
   // reads >100%.
   int writer_threads() const { return n_writers_ + peak_extras_; }
+  // Where the --adapt sizing rounds left the pool.  Differs from the peak when
+  // the governor contracted a seeded/probed surplus, so the -v line can say so
+  // instead of reporting only the high-water mark the run spent little time at.
+  int writer_threads_settled() const { return n_writers_ + settled_extras_; }
 
   // Live sink-timing feed for the --adapt governor.  DISTINCT from m_ (which is
   // deliberately null on every extract construction to avoid double-counting
@@ -12532,6 +12751,7 @@ private:
   std::deque<std::unique_ptr<std::atomic<bool>>> retire_flags_;  // one per extra, stable addr
   int  ewgrow_cap_ = 0;                                 // max extra writers this pool allows
   int  peak_extras_ = 0;                                // most extras concurrently active (for -v divisor)
+  int  settled_extras_ = 0;                             // extras still active when sizing stopped
   bool ewsup_stop_ = false;                             // guarded by g_adapt_ewgrow_mtx
 
   // Serial parse-thread phase timing for the -v [EXTRACT] line (all accumulated
@@ -12556,19 +12776,33 @@ private:
   };
 
   void start_pool() {
-    // Pool size: --write-threads pins it (user wins, always); else --adapt seeds
-    // the START from the profile's settled tar_write_threads (the probe still
-    // explores from there); else auto = min(worker threads, 16) — beyond ~16 the
-    // gain plateaus on filesystem metadata/journal contention (tune per box).
+    // Pool size: --write-threads pins it (user wins, always); else auto =
+    // min(worker threads, 16) — beyond ~16 the gain plateaus on filesystem
+    // metadata/journal contention (tune per box).
+    //
+    // --adapt still STARTS at the profile's settled tar_write_threads, but that
+    // prior is seeded as retirable EXTRAS above the auto base rather than baked
+    // into the base itself.  The optimum writer count is WORKLOAD-dependent, not
+    // just machine-dependent: a metadata-bound extract (hundreds of thousands of
+    // small files) measured 60 writers here, while a bandwidth-bound one (a few
+    // huge files, where concurrent O_DIRECT streams contend) wants ~4-16 and runs
+    // ~9% SLOWER at 60.  A prior learned on the first workload used to be
+    // unwalkable-back on the second, because the base pool has no retire path —
+    // so --adapt lost to the plain default on exactly the archives where decode
+    // is free.  Seeding the surplus as extras lets action 5c contract it back to
+    // the proven default when the writers measure as starved (see the governor).
     const int cpu = resolve_cpu_threads(opt_.cpu_threads);
-    int n;
+    const int auto_n = std::max(1, std::min(cpu, 16));
+    int n, seed_extra = 0;
     if (opt_.write_threads > 0) {
       n = (int)opt_.write_threads;
     } else if (opt_.adapt && g_adapt_ewgrow_prior_base.load(std::memory_order_relaxed) > 0) {
-      n = std::min(g_adapt_ewgrow_prior_base.load(std::memory_order_relaxed),
-                   std::max(1, 4 * cpu));   // clamp a hand-edited/foreign profile
+      const int want = std::min(g_adapt_ewgrow_prior_base.load(std::memory_order_relaxed),
+                                std::max(1, 4 * cpu));   // clamp a hand-edited/foreign profile
+      n = std::max(1, std::min(want, auto_n));           // base: never above the proven default
+      seed_extra = want - n;                             // the surplus, retirable
     } else {
-      n = std::min(cpu, 16);
+      n = auto_n;
     }
     n = std::max(1, n);
     n_writers_ = n;
@@ -12590,9 +12824,12 @@ private:
     // this headroom while each step pays, so a device- (bandwidth-) bound sink
     // still settles low; low-core boxes keep the old ~2xbase behavior.
     if (opt_.adapt) {
-      ewgrow_cap_ = std::max(n, cpu - n);
+      ewgrow_cap_ = std::max(std::max(n, cpu - n), seed_extra);
       ewsup_stop_ = false;
       ewsup_ = std::thread([this] { ewriter_supervisor(); });
+      // Seeded prior: bring the pool up to the profile's settled size right away
+      // (same start point as before), but as extras the governor can retire.
+      if (seed_extra > 0) adapt_set_ewgrow(seed_extra);
     }
   }
   void stop_pool() {
@@ -12739,6 +12976,7 @@ private:
       }
       active = target;
       peak_extras_ = std::max(peak_extras_, active);
+      settled_extras_ = active;
       if (sink_meter_)
         sink_meter_->writer_pool_threads.store(n_writers_ + active, std::memory_order_relaxed);
     }
@@ -18869,7 +19107,7 @@ static int extract_tar(const Options & opt, Meter * m)
   uint64_t agg_ex_wall_ns = 0, agg_ex_sink_ns = 0, agg_ex_enq_ns = 0;
   uint64_t agg_ex_inline_ns = 0, agg_ex_large_ns = 0;
   uint64_t agg_par_wall_ns = 0;   // parallel full-extract wall (distinct from the serial breakdown)
-  int wpool_threads = 0;
+  int wpool_threads = 0, wpool_settled = 0;
   for (const std::string & arc : opt.tar_sources) {
     if (opt.keep_going) { g_damage.reset(); g_member_ranges.reset(); }  // damage reported per archive
     FILE * in = open_input(arc);   // dies on failure
@@ -18916,6 +19154,7 @@ static int extract_tar(const Options & opt, Meter * m)
             agg_wstarved_ns += ex.writer_starved_ns();
             agg_par_wall_ns += ex.serial_wall_ns();
             wpool_threads    = std::max(wpool_threads, ex.writer_threads());
+            wpool_settled    = std::max(wpool_settled, ex.writer_threads_settled());
           }
           if (in && in != stdin) std::fclose(in);
           if (ex.had_error() && rc == EXIT_OK)
@@ -19007,6 +19246,7 @@ static int extract_tar(const Options & opt, Meter * m)
       agg_ex_inline_ns  += ex.serial_inline_ns();
       agg_ex_large_ns   += ex.serial_large_ns();
       wpool_threads      = std::max(wpool_threads, ex.writer_threads());
+      wpool_settled      = std::max(wpool_settled, ex.writer_threads_settled());
     }
     if (opt.verbosity >= V_DEBUG) {
       char b[200];
@@ -19068,10 +19308,17 @@ static int extract_tar(const Options & opt, Meter * m)
         // Per-thread average over the writer pool, like the [READER] line.
         const double w_wall = wall_ns * wpool_threads;
         char wline[224];
+        // Report the settled size too when --adapt contracted the pool: the peak
+        // (the divisor, since the busy/starved sums include every extra that ran)
+        // would otherwise be the only number shown, and the run may have spent
+        // most of its time well below it.
+        char wsettled[32] = {0};
+        if (wpool_settled > 0 && wpool_settled != wpool_threads)
+          std::snprintf(wsettled, sizeof(wsettled), ", settled %d", wpool_settled);
         std::snprintf(wline, sizeof(wline),
-          "[WRITER] write-path busy %.1f%% | starved %.1f%%  (per thread, %d writer%s, %.2f s run)\n",
+          "[WRITER] write-path busy %.1f%% | starved %.1f%%  (per thread, %d writer%s peak%s, %.2f s run)\n",
           double(agg_wbusy_ns) / w_wall * 100.0, double(agg_wstarved_ns) / w_wall * 100.0,
-          wpool_threads, wpool_threads > 1 ? "s" : "", wall_ns / 1e9);
+          wpool_threads, wpool_threads > 1 ? "s" : "", wsettled, wall_ns / 1e9);
         vlog(V_VERBOSE, opt, wline);
       }
       // [EXTRACT]: where the ONE serial parse thread's time went.  Residual
@@ -21300,7 +21547,7 @@ static void apply_backend_defaults(Options & opt)
   AdaptPriors priors;
   if (opt.adapt && !opt.no_profile) {
     if (opt.verbosity >= V_DEBUG) {   // -vv: lets users (and the suite) see the profile key
-      const AdaptFp fp = adapt_fingerprint();
+      const AdaptFp & fp = adapt_fingerprint();
       vlog(V_DEBUG, opt, "[ADAPT] fingerprint " + fp.hash + " driver "
            + (fp.driver.empty() ? "(none)" : fp.driver) + " (" + fp.human + ")\n");
     }
