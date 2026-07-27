@@ -334,6 +334,15 @@ files_match() {
   [[ "$a" == "$b" ]]
 }
 
+# gzstd defaults to cpu-only when the input is too small to fill even one GPU
+# batch (~128 MiB), because cuInit costs more than the whole job — see
+# "small-input GPU gate" below, which tests that behaviour deliberately.
+# Every OTHER test here runs on fixtures far below that bound, so leaving the
+# gate on would silently turn the suite's default-backend coverage into
+# cpu-only coverage.  Disable it globally and let the dedicated tests opt back
+# in, so the GPU paths stay exercised on small fixtures.
+export GZSTD_DEBUG_GPU_MIN_BYTES=0
+
 has_gpu() {
   ("$GZSTD" -V 2>&1 | grep -qi "nvcomp\|gpu\|cuda") 2>/dev/null && \
     command -v nvidia-smi &>/dev/null && \
@@ -365,8 +374,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=345
-$EXTENSIVE && EXPECTED_TESTS=477
+EXPECTED_TESTS=350
+$EXTENSIVE && EXPECTED_TESTS=483
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2320,6 +2329,69 @@ else
   skip "asymmetric mode: --cpu-share implies --hybrid"               "no GPU"
   skip "asymmetric mode: explicit --cpu-only beats tuning-flag promotion" "no GPU"
   skip "asymmetric mode: --cpu-batch + explicit --cpu-only triggers silencing" "no GPU"
+fi
+
+# ============================================================
+# 24b. Small-input GPU gate
+# ------------------------------------------------------------
+# An input too small to fill one GPU batch cannot repay cuInit (measured
+# 2.3 s decompress / 5.6 s compress on an 8-GPU host), so the default backend
+# drops to cpu-only.  These are the only tests that run with the gate ARMED —
+# the suite disables it globally (see GZSTD_DEBUG_GPU_MIN_BYTES at the top) so
+# every other test keeps exercising the GPU paths on small fixtures.  The hook
+# sets the bound explicitly here rather than relying on >128 MiB fixtures.
+# ============================================================
+section "Small-input GPU gate"
+
+if has_gpu; then
+  sg_src="$TMPDIR/smallgate.bin"
+  sg_zst="$TMPDIR/smallgate.zst"
+  head -c 1048576 /dev/urandom > "$sg_src" 2>/dev/null
+
+  # Bound well above the fixture: the gate must fire and say why.
+  sg_log=$(GZSTD_DEBUG_GPU_MIN_BYTES=104857600 "$GZSTD" -v -k -f "$sg_src" -o "$sg_zst" 2>&1)
+  if echo "$sg_log" | grep -q "COMPRESS (cpu-only)" && \
+     echo "$sg_log" | grep -q "< one GPU batch"; then
+    pass "small input below one GPU batch defaults to cpu-only"
+  else
+    fail "small input below one GPU batch defaults to cpu-only" \
+         "(banner: $(echo "$sg_log" | grep STARTUP || echo none))"
+  fi
+
+  # Same fixture, bound below it: the gate must NOT fire, proving it is the
+  # size that decides and not merely the flag's presence.
+  sg_log2=$(GZSTD_DEBUG_GPU_MIN_BYTES=1024 "$GZSTD" -v -k -f "$sg_src" -o "$sg_zst" 2>&1)
+  if echo "$sg_log2" | grep -q "< one GPU batch"; then
+    fail "input above the bound keeps the GPU default" \
+         "(gate fired on a fixture above the bound)"
+  else
+    pass "input above the bound keeps the GPU default"
+  fi
+
+  # An explicit backend outranks the gate entirely.
+  sg_log3=$(GZSTD_DEBUG_GPU_MIN_BYTES=104857600 "$GZSTD" -v -k -f --hybrid "$sg_src" -o "$sg_zst" 2>&1)
+  if echo "$sg_log3" | grep -q "< one GPU batch"; then
+    fail "explicit --hybrid overrides the small-input gate" \
+         "(gate fired despite an explicit backend)"
+  else
+    pass "explicit --hybrid overrides the small-input gate"
+  fi
+
+  # Decompress side: the archive, not stdin, is what gets sized.
+  sg_log4=$(GZSTD_DEBUG_GPU_MIN_BYTES=104857600 "$GZSTD" -d -v -k -f "$sg_zst" -o "$TMPDIR/smallgate.out" 2>&1)
+  if echo "$sg_log4" | grep -q "DECOMPRESS (cpu-only)"; then
+    pass "small archive decompress defaults to cpu-only"
+  else
+    fail "small archive decompress defaults to cpu-only" \
+         "(banner: $(echo "$sg_log4" | grep STARTUP || echo none))"
+  fi
+
+  rm -f "$sg_src" "$sg_zst" "$TMPDIR/smallgate.out"
+else
+  skip "small input below one GPU batch defaults to cpu-only" "no GPU"
+  skip "input above the bound keeps the GPU default"          "no GPU"
+  skip "explicit --hybrid overrides the small-input gate"     "no GPU"
+  skip "small archive decompress defaults to cpu-only"        "no GPU"
 fi
 
 # ============================================================

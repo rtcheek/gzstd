@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.27";
+static constexpr const char * GZSTD_VERSION = "0.15.28";
 //
 // Architecture overview:
 //
@@ -1097,8 +1097,16 @@ static void print_help_long()
 "     rebuild).  Measured verdicts persist to the per-machine profile\n"
 "     (see PROFILE below) so the next run starts at the answer.\n"
 "     On -d --tar extraction the same regimes drive extract-specific\n"
-"     actuators: sink-bound grows the parallel file-writer pool; and the\n"
-"     decode side is sized by measured throughput — a barely-compressed\n"
+"     actuators.  The parallel file-writer pool is sized in BOTH\n"
+"     directions from the writers' own measured busy/starved split: a\n"
+"     sink-bound extract grows it, and one whose writers sit starved\n"
+"     (more writers than the pipeline can feed — concurrent writes to\n"
+"     a few large files contend) retires the surplus.  Each step is\n"
+"     kept only if throughput held, so a wrong guess costs one round.\n"
+"     The settled size persists per archive SHAPE (bucketed by mean\n"
+"     bytes per entry), because a many-small-files extract and a\n"
+"     few-huge-files one want very different pools on the same box.\n"
+"     The decode side is sized by measured throughput — a barely-compressed\n"
 "     archive (decode ~free) runs fused inline, while a compression-heavy\n"
 "     one splits reading from decoding across a pool whose reader and\n"
 "     decoder counts each contract to just what keeps the writers fed,\n"
@@ -2085,6 +2093,50 @@ static std::atomic<int>  g_adapt_ewgrow_prior_base{0}; // profile-seeded start p
 static std::mutex              g_adapt_ewgrow_mtx;     // guards the target->supervisor wake
 static std::condition_variable g_adapt_ewgrow_cv;
 
+// -d --tar writer-pool WORKLOAD CLASS.
+//
+// The right writer count is a property of the ARCHIVE's geometry, not only of
+// the machine.  Measured on one box, one filesystem, one run each: an extract of
+// 390 K small files runs 92.8% busy / 0.6% starved at 60 writers (metadata- and
+// syscall-bound — the parallelism is real), while an extract of 13 huge files
+// runs 11.2% busy / 84.0% starved at the same 60 (bandwidth-bound — concurrent
+// O_DIRECT streams contend, and 16 is ~9% faster).  A single per-machine prior
+// therefore cannot be right for both: whichever archive class ran last would
+// teach the profile a number that mis-sizes the other.
+//
+// So bucket by MEAN BYTES PER ENTRY on a log scale and persist one settled size
+// per (machine, class).  Three buckets is a deliberate compromise: enough to
+// separate the metadata-bound and bandwidth-bound extremes that actually differ,
+// few enough that each still converges within a couple of runs.  An archive
+// whose class has no prior yet simply starts at the plain default and probes,
+// which is the pre-existing no-profile behaviour.
+static constexpr int ADAPT_TAR_WCLASSES = 3;
+static std::atomic<int> g_adapt_ewgrow_prior_class[ADAPT_TAR_WCLASSES];  // 0 = none
+static std::atomic<int> g_adapt_tar_wclass{-1};        // class of this extract (-1 = unknown)
+
+// Mean bytes per entry is the physically meaningful ratio here: it IS the
+// bytes-of-work per open/close, which is exactly the metadata-versus-bandwidth
+// tradeoff the writer count trades off.  The boundaries are where that balance
+// actually shifts, not round numbers:
+//   64 KiB — on NVMe at ~3 GiB/s a 64 KiB write takes ~20 us, the same order as
+//            the open+close pair around it, so below this the syscalls dominate.
+//   4 MiB  — Extractor::SMALL_FILE_MAX: at this size the writer itself changes
+//            strategy, from one job per file to windowed part-jobs that split a
+//            single file across the pool.  Above it, per-file overhead is <2% of
+//            the write and the pool is contending for bandwidth, not entries.
+static int adapt_tar_wclass(uint64_t total_bytes, uint64_t entries)
+{
+  if (entries == 0) return -1;
+  const uint64_t mean = total_bytes / entries;
+  if (mean <   64ull * 1024) return 0;     // "sm": metadata/syscall-bound
+  if (mean < 4096ull * 1024) return 1;     // "md": mixed
+  return 2;                                // "lg": bandwidth-bound
+}
+static const char * adapt_tar_wclass_name(int c)
+{
+  return c == 0 ? "sm" : c == 1 ? "md" : c == 2 ? "lg" : "?";
+}
+
 // Publish a new extra-writer target and wake the Extractor supervisor.  The
 // governor's only reach into the pool: a global CV notify, no worker pointer.
 static void adapt_set_ewgrow(int target)
@@ -2556,6 +2608,17 @@ private:
     // revert converges (persist, latch off next run).
     if (forced_ == AdaptRegime::WARMUP && is_extract_
         && g_adapt_ewgrow_allowed.load(std::memory_order_relaxed)) {
+      // Re-baseline rather than compute a delta across a Meter reset: these are
+      // unsigned counters, so a reset would wrap a negative delta into an
+      // enormous positive rate and force a false verdict.  Same convention as
+      // the regime snapshot above.
+      if (cur.wbytes < prev_snapped_wbytes_ || cur.ebusy < prev_snapped_ebusy_
+          || cur.estarv < prev_snapped_estarv_) {
+        prev_snapped_wbytes_ = cur.wbytes;
+        prev_snapped_ebusy_  = cur.ebusy;
+        prev_snapped_estarv_ = cur.estarv;
+        return;
+      }
       const double wrate = double(cur.wbytes - prev_snapped_wbytes_) /
                            std::max(1.0, dt);
       prev_snapped_wbytes_ = cur.wbytes;
@@ -2592,6 +2655,14 @@ private:
       // there is anything to retire; and doing it on the first tick would latch
       // the pre-pool placeholder size of 1.
       if (wsum > 0.0) ew_lazy_init_();
+      // Surplus run-length, evaluated every tick so the count is genuinely
+      // CONSECUTIVE: folding the increment into the action's condition chain
+      // would only ever count ticks that already passed the other gates, so an
+      // intermittent surplus could accumulate to the threshold across a long gap
+      // and act on evidence that was never contiguous.
+      const bool wsurplus = ewgrow_base_ != 0 && wrate_ema_ > 0
+                         && starved_ema_ >= EW_SURPLUS;
+      ew_surplus_ticks_ = wsurplus ? ew_surplus_ticks_ + 1 : 0;
       if (probe_phase_ == 1) {
         probe_rate_acc_ += wrate;
         if (++probe_ticks_ >= 4) {
@@ -2665,10 +2736,8 @@ private:
           }
           vlog(V_VERBOSE, opt_, pl);
         }
-      } else if (probe_phase_ == 0 && ewgrow_base_ != 0
-                 && ewgrow_extra_ > ewgrow_floor_extra_
-                 && starved_ema_ >= EW_SURPLUS && wrate_ema_ > 0
-                 && ++ew_surplus_ticks_ >= 3) {
+      } else if (probe_phase_ == 0 && wsurplus && ew_surplus_ticks_ >= 3
+                 && ewgrow_extra_ > ewgrow_floor_extra_) {
         // CONTRACT.  Deliberately NOT gated on regime_ == SINK_BOUND: an extract
         // whose writers are over-provisioned classifies as COMPUTE_BOUND (the
         // per-thread busy average is dragged under the sink threshold by the very
@@ -2705,7 +2774,6 @@ private:
         // would grow the pool and reset that count, undoing the trim it was
         // about to confirm (observed: a run contracted 60 -> 36, then grew
         // straight back to 44).
-        ew_surplus_ticks_ = 0;
         ew_lazy_init_();                 // no-op once the pool geometry is known
         ewgrow_step_ = std::max(1, ewgrow_base_ / 2);
         probe_pre_rate_ = wrate_ema_ > 0.0 ? wrate_ema_ : wrate;  // smoothed baseline
@@ -3222,6 +3290,7 @@ struct AdaptObs {
   std::string src_path;                          // read path that engaged ("" = untapped)
   int writer_par = 0;                            // writer probe verdict (+1/-1, 0 = untried)
   int tar_write_threads = 0;                     // -d --tar: settled pool size (0 = untried)
+  int tar_wclass = -1;                           // -d --tar: workload class the size belongs to
   bool tar_wt_converged = false;                 // -d --tar: probe found no further gain
   bool fault = false;                            // a GPU fault/rebuild happened this process
 
@@ -3231,8 +3300,10 @@ struct AdaptObs {
       src_path = p;
     if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
       writer_par = wp;
-    if (int ws = g_adapt_ewgrow_settled.load(std::memory_order_relaxed))
+    if (int ws = g_adapt_ewgrow_settled.load(std::memory_order_relaxed)) {
       tar_write_threads = ws;
+      tar_wclass = g_adapt_tar_wclass.load(std::memory_order_relaxed);
+    }
     if (g_adapt_ewgrow_converged.load(std::memory_order_relaxed))
       tar_wt_converged = true;
     payload_bytes += compress_dir ? m.read_bytes.load() : m.wrote_bytes.load();
@@ -3288,9 +3359,18 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
   // (discrete latest-wins, seeds the next run's start) and a converged flag
   // (the probe found no further gain — latch off next run's probing).  Latest-
   // wins, so faster/slower hardware can move both.
+  // Recorded twice on purpose: once under the archive's WORKLOAD CLASS (what the
+  // next run of a like archive seeds from) and once flat (the fallback for the
+  // streaming extract paths, which do not know the geometry up front, and for
+  // profiles written by an older build).  Writing the flat key from a classified
+  // run keeps it meaningful as a "most recent, whatever the shape" default.
   if (obs.tar_write_threads > 0) {
     dir.put_num("tar_write_threads", (double)obs.tar_write_threads);
     dir.put_num("tar_wt_converged", obs.tar_wt_converged ? 1 : 0);
+    if (obs.tar_wclass >= 0 && obs.tar_wclass < ADAPT_TAR_WCLASSES)
+      dir.put_num(std::string("tar_write_threads_")
+                    + adapt_tar_wclass_name(obs.tar_wclass),
+                  (double)obs.tar_write_threads);
   }
   if (!obs.src_path.empty()) {
     dir.put_str("src_path", obs.src_path);
@@ -3314,7 +3394,8 @@ struct AdaptPriors {
     double overall_gibs = 0, settled_batch = 0, runs = 0;
     double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates
     double writer_par = 0;                                  // probe verdict
-    double tar_write_threads = 0;                           // -d --tar settled pool size
+    double tar_write_threads = 0;                           // -d --tar settled pool size (flat fallback)
+    double tar_wt_class[ADAPT_TAR_WCLASSES] = {0, 0, 0};    // -d --tar settled size per workload class
     double tar_wt_converged = 0;                            // -d --tar probe converged
     std::string regime;
   } dir[2];                 // [0] = compress, [1] = decompress
@@ -3351,6 +3432,9 @@ static AdaptPriors adapt_load_priors()
     D.writer_par    = dj->gnum("writer_par", 0);
     D.tar_write_threads = dj->gnum("tar_write_threads", 0);
     D.tar_wt_converged  = dj->gnum("tar_wt_converged", 0);
+    for (int c = 0; c < ADAPT_TAR_WCLASSES; ++c)
+      D.tar_wt_class[c] = dj->gnum(std::string("tar_write_threads_")
+                                     + adapt_tar_wclass_name(c), 0);
   }
   return P;
 }
@@ -11655,6 +11739,12 @@ public:
                     const Options & dopt, Meter * feed_meter) {
     uint64_t t0 = now_ns();
     par_mode_ = true;
+    // Classify the archive BEFORE the pool starts: mean bytes per entry decides
+    // whether this extract is metadata-bound (wants many writers) or
+    // bandwidth-bound (wants few), and start_pool seeds from the profile entry
+    // for that class.  Only this path knows the geometry up front; the streaming
+    // extract paths leave wclass_ at -1 and fall back to the flat prior.
+    wclass_ = adapt_tar_wclass(u_off.empty() ? 0 : u_off.back(), bounds.size());
     start_pool();
     const int fd = fileno(in);
     const size_t nent = bounds.size();
@@ -12752,6 +12842,7 @@ private:
   int  ewgrow_cap_ = 0;                                 // max extra writers this pool allows
   int  peak_extras_ = 0;                                // most extras concurrently active (for -v divisor)
   int  settled_extras_ = 0;                             // extras still active when sizing stopped
+  int  wclass_ = -1;                                    // archive workload class (-1 = geometry unknown)
   bool ewsup_stop_ = false;                             // guarded by g_adapt_ewgrow_mtx
 
   // Serial parse-thread phase timing for the -v [EXTRACT] line (all accumulated
@@ -12780,31 +12871,62 @@ private:
     // min(worker threads, 16) — beyond ~16 the gain plateaus on filesystem
     // metadata/journal contention (tune per box).
     //
-    // --adapt still STARTS at the profile's settled tar_write_threads, but that
-    // prior is seeded as retirable EXTRAS above the auto base rather than baked
-    // into the base itself.  The optimum writer count is WORKLOAD-dependent, not
-    // just machine-dependent: a metadata-bound extract (hundreds of thousands of
-    // small files) measured 60 writers here, while a bandwidth-bound one (a few
-    // huge files, where concurrent O_DIRECT streams contend) wants ~4-16 and runs
-    // ~9% SLOWER at 60.  A prior learned on the first workload used to be
-    // unwalkable-back on the second, because the base pool has no retire path —
-    // so --adapt lost to the plain default on exactly the archives where decode
-    // is free.  Seeding the surplus as extras lets action 5c contract it back to
-    // the proven default when the writers measure as starved (see the governor).
+    // --adapt still STARTS at the profile's settled size, but from the entry for
+    // THIS archive's workload class (see adapt_tar_wclass), and the prior is
+    // seeded as retirable EXTRAS above the auto base rather than baked into the
+    // base itself.  Both parts matter, and each fixes a distinct failure:
+    //   * the wrong prior — one per machine mis-sizes whichever archive shape did
+    //     not run last (60 writers is right for 390 K small files, ~9% slow for a
+    //     few huge ones, where concurrent O_DIRECT streams contend);
+    //   * no way back — the base pool has no retire path, so a prior baked into
+    //     it could never be walked down, and --adapt lost to the plain default on
+    //     exactly the archives where decode is free.
+    // Classing picks the right start; seeding as extras keeps it correctable when
+    // the class boundary lands wrong for a particular archive (action 5c
+    // contracts it once the writers measure as starved).
+    //
+    // Publish the class from the one place every extract path passes through,
+    // so a run that never classifies (the streaming paths leave wclass_ at -1)
+    // cannot inherit the class of a previous archive in a multi-archive run and
+    // persist its settled size under the wrong key.
+    g_adapt_tar_wclass.store(wclass_, std::memory_order_relaxed);
     const int cpu = resolve_cpu_threads(opt_.cpu_threads);
     const int auto_n = std::max(1, std::min(cpu, 16));
-    int n, seed_extra = 0;
+    int n, seed_extra = 0, prior = 0;
+    const char * prior_src = "";
+    if (opt_.adapt) {
+      // Class-matched prior first; the flat key is the fallback for a class that
+      // has never run here and for the streaming extract paths, which do not know
+      // the geometry before the pool starts (wclass_ stays -1 there).
+      if (wclass_ >= 0 && wclass_ < ADAPT_TAR_WCLASSES) {
+        prior = g_adapt_ewgrow_prior_class[wclass_].load(std::memory_order_relaxed);
+        if (prior > 0) prior_src = "class";
+      }
+      if (prior <= 0) {
+        prior = g_adapt_ewgrow_prior_base.load(std::memory_order_relaxed);
+        if (prior > 0) prior_src = "flat";
+      }
+    }
     if (opt_.write_threads > 0) {
       n = (int)opt_.write_threads;
-    } else if (opt_.adapt && g_adapt_ewgrow_prior_base.load(std::memory_order_relaxed) > 0) {
-      const int want = std::min(g_adapt_ewgrow_prior_base.load(std::memory_order_relaxed),
-                                std::max(1, 4 * cpu));   // clamp a hand-edited/foreign profile
-      n = std::max(1, std::min(want, auto_n));           // base: never above the proven default
-      seed_extra = want - n;                             // the surplus, retirable
+    } else if (prior > 0) {
+      const int want = std::min(prior, std::max(1, 4 * cpu));  // clamp a hand-edited/foreign profile
+      n = std::max(1, std::min(want, auto_n));   // base: never above the proven default
+      seed_extra = want - n;                     // the surplus, retirable
     } else {
       n = auto_n;
     }
     n = std::max(1, n);
+    if (opt_.adapt && prior > 0 && opt_.write_threads == 0
+        && opt_.verbosity >= V_VERBOSE) {
+      char b[176];
+      std::snprintf(b, sizeof(b),
+        "[ADAPT] extract pool starts at the profile's settled %d writer(s) "
+        "(%s prior%s%s, probe re-explores)\n", prior, prior_src,
+        wclass_ >= 0 ? ", workload class " : "",
+        wclass_ >= 0 ? adapt_tar_wclass_name(wclass_) : "");
+      vlog(V_VERBOSE, opt_, b);
+    }
     n_writers_ = n;
     // Publish the pool size so the --adapt governor can per-thread-average the
     // live extract_busy_ns deltas (busy sums across these n writers).
@@ -12817,13 +12939,20 @@ private:
     if (opt_.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt_, "[UNTAR] " + std::to_string(n) + " writer thread(s)\n");
     for (int i = 0; i < n; ++i) writers_.emplace_back([this] { writer_loop(); });
-    // --adapt: arm the grow-probe supervisor.  Extras may bring the pool up to
-    // the machine's usable thread count (was capped at +base = a doubled pool),
-    // so a CPU/metadata-bound sink on a many-core box can put otherwise-idle
-    // cores on the writers.  The governor's keep-or-revert probe only grows into
-    // this headroom while each step pays, so a device- (bandwidth-) bound sink
-    // still settles low; low-core boxes keep the old ~2xbase behavior.
-    if (opt_.adapt) {
+    // --adapt: arm the sizing supervisor.  Extras may bring the pool up to the
+    // machine's usable thread count (was capped at +base = a doubled pool), so a
+    // CPU/metadata-bound sink on a many-core box can put otherwise-idle cores on
+    // the writers.  The governor's keep-or-revert rounds only grow into this
+    // headroom while each step pays, so a device- (bandwidth-) bound sink still
+    // settles low; low-core boxes keep the old ~2xbase behavior.
+    //
+    // NOT armed when --write-threads pinned the count: the flag documents itself
+    // as "number of parallel file-writer threads", so a user who names a number
+    // should get that number.  It used to win only for the BASE pool, leaving the
+    // governor free to probe writers on top of it — which quietly overrode the
+    // pin and made the flag untrustworthy for exactly the hand-tuning it exists
+    // for ("the optimum is hardware-dependent — tune it on the target box").
+    if (opt_.adapt && opt_.write_threads == 0) {
       ewgrow_cap_ = std::max(std::max(n, cpu - n), seed_extra);
       ewsup_stop_ = false;
       ewsup_ = std::thread([this] { ewriter_supervisor(); });
@@ -21374,10 +21503,75 @@ static std::string derive_output(const std::string & input, Mode mode)
  NVML is the primary path; /sys/bus/pci/devices walk is the fallback
  when the binary was built without NVML.
 ======================================================================*/
+// One sysfs link-speed file ("32.0 GT/s PCIe") -> PCIe generation, 0 = unknown.
+static int pcie_gen_of_speed_file(const fs::path & p)
+{
+  std::ifstream f(p);
+  std::string s;
+  if (!f || !std::getline(f, s)) return 0;
+  if (s.find("2.5 GT/s")  != std::string::npos) return 1;
+  if (s.find("5.0 GT/s")  != std::string::npos) return 2;
+  if (s.find("8.0 GT/s")  != std::string::npos) return 3;
+  if (s.find("16.0 GT/s") != std::string::npos) return 4;
+  if (s.find("32.0 GT/s") != std::string::npos) return 5;
+  if (s.find("64.0 GT/s") != std::string::npos) return 6;
+  return 0;
+}
+
 static int detect_min_pcie_gen()
 {
   int min_gen = -1;
+  // sysfs FIRST, NVML only as a fallback.  This runs on every GPU-capable run
+  // to pick a backend and the --direct default, and an nvmlInit_v2 +
+  // per-device-enumerate + nvmlShutdown cycle measures ~300 ms on an 8-GPU host
+  // — pure startup latency, paid before any work, to answer a question a few
+  // file reads answer just as well.  (Same cost the --adapt fingerprint used to
+  // pay; see adapt_fp_gpus_procfs.)
+  //
+  // Slot-aware, matching NVML's MaxPcieLinkGeneration: a device's own
+  // max_link_speed is what the CARD supports, so a Gen4 card in a Gen3 slot
+  // would read Gen4 and overstate the usable link.  The real ceiling is the
+  // min of the device and its upstream port, which sysfs exposes as the parent
+  // directory of the device's node in the PCI tree.  Max not Current
+  // throughout: an idle GPU drops its link to Gen1 for power management, so
+  // Current would misreport a Gen5 card at rest.
+  std::error_code ec;
+  const fs::path bus("/sys/bus/pci/devices");
+  if (fs::exists(bus, ec)) {
+    for (const auto & entry : fs::directory_iterator(bus, ec)) {
+      if (ec) break;
+      std::ifstream vf(entry.path() / "vendor");
+      std::string vstr;
+      if (!vf || !std::getline(vf, vstr)) continue;
+      while (!vstr.empty() && std::isspace((unsigned char)vstr.back())) vstr.pop_back();
+      if (vstr != "0x10de") continue;
+      // Display/3D controllers only (class 0x03xxxx).  An NVIDIA audio function
+      // or bridge is not the compute device, and folding one into this MIN
+      // could understate the GPU's own link.
+      std::ifstream cf(entry.path() / "class");
+      std::string cstr;
+      if (!cf || !std::getline(cf, cstr)) continue;
+      if (cstr.rfind("0x03", 0) != 0) continue;
+      int gen = pcie_gen_of_speed_file(entry.path() / "max_link_speed");
+      if (gen <= 0) continue;
+      // canonical() resolves the /sys/bus/pci/devices symlink into the real PCI
+      // tree, where the parent directory is the upstream port.  A GPU hanging
+      // straight off a root bus has no parent speed file — then the device's
+      // own figure stands.
+      const fs::path real = fs::canonical(entry.path(), ec);
+      if (!ec) {
+        const int up = pcie_gen_of_speed_file(real.parent_path() / "max_link_speed");
+        if (up > 0) gen = std::min(gen, up);
+      }
+      ec.clear();
+      if (min_gen < 0 || gen < min_gen) min_gen = gen;
+    }
+  }
+  if (min_gen > 0) return min_gen;
+
 #ifdef HAVE_NVML
+  // Fallback: no usable sysfs (a container without /sys/bus/pci, or an
+  // unrecognised link-speed string).
   if (nvmlInit_v2() == NVML_SUCCESS) {
     unsigned dev_count = 0;
     if (nvmlDeviceGetCount_v2(&dev_count) == NVML_SUCCESS) {
@@ -21398,38 +21592,6 @@ static int detect_min_pcie_gen()
     nvmlShutdown();
   }
 #endif
-  if (min_gen > 0) return min_gen;
-
-  // sysfs fallback: walk /sys/bus/pci/devices, find NVIDIA (0x10de),
-  // parse max_link_speed (not current_link_speed — idle GPUs drop their
-  // link to Gen1 for power management).
-  //   "2.5 GT/s"  → Gen1
-  //   "5.0 GT/s"  → Gen2
-  //   "8.0 GT/s"  → Gen3
-  //   "16.0 GT/s" → Gen4
-  //   "32.0 GT/s" → Gen5
-  std::error_code ec;
-  fs::path bus("/sys/bus/pci/devices");
-  if (!fs::exists(bus, ec)) return 0;
-  for (const auto & entry : fs::directory_iterator(bus, ec)) {
-    if (ec) break;
-    std::ifstream vf(entry.path() / "vendor");
-    std::string vstr;
-    if (!vf || !std::getline(vf, vstr)) continue;
-    while (!vstr.empty() && std::isspace((unsigned char)vstr.back())) vstr.pop_back();
-    if (vstr != "0x10de") continue;
-    std::ifstream sf(entry.path() / "max_link_speed");
-    std::string sstr;
-    if (!sf || !std::getline(sf, sstr)) continue;
-    int gen = 0;
-    if      (sstr.find("2.5 GT/s")  != std::string::npos) gen = 1;
-    else if (sstr.find("5.0 GT/s")  != std::string::npos) gen = 2;
-    else if (sstr.find("8.0 GT/s")  != std::string::npos) gen = 3;
-    else if (sstr.find("16.0 GT/s") != std::string::npos) gen = 4;
-    else if (sstr.find("32.0 GT/s") != std::string::npos) gen = 5;
-    else if (sstr.find("64.0 GT/s") != std::string::npos) gen = 6;
-    if (gen > 0 && (min_gen < 0 || gen < min_gen)) min_gen = gen;
-  }
   return (min_gen > 0) ? min_gen : 0;
 }
 
@@ -21746,26 +21908,98 @@ static void apply_backend_defaults(Options & opt)
   // pool matched to the actual sink.  The settled size still seeds the start, so
   // a stable box pays only that one confirming round.  --write-threads (user pin)
   // always wins in start_pool.
+  // The seeds are published here but CHOSEN in start_pool, which is the first
+  // point that knows the archive's geometry and therefore its workload class.
   if (priors.loaded && opt.tar_mode && opt.mode == Mode::DECOMPRESS) {
-    if (prior_dir.tar_write_threads >= 1) {
+    if (prior_dir.tar_write_threads >= 1)
       g_adapt_ewgrow_prior_base.store((int)std::min(prior_dir.tar_write_threads, 4096.0),
                                       std::memory_order_relaxed);
-      if (opt.verbosity >= V_VERBOSE) {
-        char b[128];
-        std::snprintf(b, sizeof(b),
-          "[ADAPT] extract pool starts at the profile's settled %d writer(s) (probe re-explores)\n",
-          (int)prior_dir.tar_write_threads);
-        vlog(V_VERBOSE, opt, b);
-      }
-    }
-    // NOTE: tar_wt_converged is intentionally NOT used to disable the probe (see
-    // above) — it stays in the profile for diagnostics only.
+    for (int c = 0; c < ADAPT_TAR_WCLASSES; ++c)
+      if (prior_dir.tar_wt_class[c] >= 1)
+        g_adapt_ewgrow_prior_class[c].store((int)std::min(prior_dir.tar_wt_class[c], 4096.0),
+                                            std::memory_order_relaxed);
+    // NOTE: tar_wt_converged is intentionally NOT used to disable the probe — the
+    // sink optimum is media- and workload-dependent, and the probe is cheap and
+    // self-limiting (a step that does not pay reverts in ~0.5 s).  It stays in
+    // the profile for diagnostics only.
   }
 #endif
 
   if (opt.backend_user_set) return;
 
 #ifndef _WIN32
+  // TOO SMALL TO PAY FOR A GPU AT ALL.
+  //
+  // Bringing up CUDA costs a fixed, unavoidable cuInit — measured 2.3 s for a
+  // decompress and 5.6 s for a compress on an 8-GPU host, and it is charged
+  // before any work happens.  On a small input the CPU pool finishes long
+  // before that completes, so the process does the whole job in ~20 ms and then
+  // sits waiting to join a GPU bringup that had nothing to do: 200 KB took
+  // 5.6 s to compress instead of 0.019 s.  There was already a guard for "the
+  // CPU drained everything during init, skip spawning GPU workers", but by then
+  // the init has been paid — the only real fix is not to start it.
+  //
+  // The threshold is the GPU's OWN batch geometry, not a tuned constant: one
+  // batch on one device is gpu_batch_cap frames of chunk_mib each (8 x 16 MiB =
+  // 128 MiB by default).  Below that the GPU cannot fill a single batch, so
+  // there is no amount of GPU throughput that could repay its initialization —
+  // and the bound moves correctly by construction if --gpu-batch or
+  // --chunk-size change it.  For decompress the figure is compared against the
+  // COMPRESSED size, which understates the work: that errs toward keeping the
+  // GPU, which is the safe direction.
+  //
+  // Only for inputs whose size is known (regular files).  stdin, FIFOs and
+  // --tar creation from a directory tree keep today's behaviour, since finding
+  // the size would cost more than it saves — a directory simply fails the
+  // S_ISREG test below, so tar-create opts out on its own.  An explicit
+  // --hybrid/--gpu-only has already returned above, so this only ever moves a
+  // DEFAULT.
+  //
+  // --tar reads its archive from tar_sources; opt.inputs holds a synthesized
+  // "-" there (same selection adapt_input_residency makes, and for the same
+  // reason: stdin is not the input being sized).
+  if (!opt.cpu_only) {
+    const std::vector<std::string> & srcs =
+        opt.tar_mode ? opt.tar_sources : opt.inputs;
+    uint64_t known = 0;
+    bool all_known = !srcs.empty();
+    for (const std::string & in : srcs) {
+      struct stat st{};
+      if (in == "-" || ::stat(in.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+        all_known = false;
+        break;
+      }
+      known += (uint64_t)st.st_size;
+    }
+    // GZSTD_DEBUG_GPU_MIN_BYTES overrides the bound (0 disables the gate) so
+    // the suite can exercise the backend-default rules below on small fixtures
+    // instead of needing >128 MiB of test data for every one of them.  Test hook
+    // only, same shape as GZSTD_DEBUG_ADAPT_SAVE_MIN_MS; never set in a normal
+    // process.
+    uint64_t one_batch =
+        (uint64_t)std::max<size_t>(1, opt.chunk_mib) * 1024 * 1024
+        * (uint64_t)std::max<size_t>(1, opt.gpu_batch_cap);
+    if (const char * e = std::getenv("GZSTD_DEBUG_GPU_MIN_BYTES")) {
+      char * end = nullptr;
+      const unsigned long long v = std::strtoull(e, &end, 10);
+      if (end != e) one_batch = (uint64_t)v;
+    }
+    if (one_batch && all_known && known < one_batch) {
+      opt.cpu_only = true;
+      opt.hybrid = false;
+      opt.gpu_only = false;
+      if (opt.verbosity >= V_VERBOSE) {
+        char b[176];
+        std::snprintf(b, sizeof(b),
+          "[GPU] input %.1f MiB < one GPU batch (%.0f MiB); cpu-only "
+          "(GPU init would cost more than the whole job)\n",
+          known / 1048576.0, one_batch / 1048576.0);
+        vlog(V_VERBOSE, opt, b);
+      }
+      return;
+    }
+  }
+
   // --adapt backend prior: measured engine ranking beats every static rule
   // below.  cpu-only when the CPU engine dominates outright (> 1.5x the GPU
   // engine — hybrid coordination overhead can't win back a gap that wide,

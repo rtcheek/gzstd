@@ -277,9 +277,25 @@ documented deferral during M4):
   channel, no pointer). Steps by half the base pool, EMA-baselined keep/revert,
   caps at 2 rounds / doubled pool, persists `tar_write_threads` (+ `converged`
   latch) to seed the next run. `--write-threads` (user pin) always wins. Found a
-  real +26% (16→24) optimum live on the 256-core box. Follow-up: periodic
-  re-probe (the converged latch freezes the size like 5b — accepted, shared
-  limitation) and positive-perf validation on the Gen<4 workstation.
+  real +26% (16→24) optimum live on the 256-core box.
+  **BIDIRECTIONAL + SHAPE-KEYED — DONE v0.15.27/v0.15.28.** Grow-only turned out
+  to be half a controller: a prior learned on one archive shape mis-sized the
+  other (60 writers = 92.8% busy on 390 K small files, 11.2% busy / 84.0%
+  starved and ~9% slower on 13 huge ones), and it could not be walked back
+  because the prior was baked into the base pool, which has no retire path — so
+  `--adapt` extract ran ~7% SLOWER than the plain default on trivial-decode
+  archives. Now: the prior seeds as retirable EXTRAS above the auto base; 5c
+  contracts on the writers' own busy/starved split (NOT gated on `SINK_BOUND` —
+  an over-provisioned extract classifies `COMPUTE_BOUND`, because the surplus
+  drags the per-thread busy average under the sink threshold); every step is
+  keep-or-revert on rate integrated over ~0.8 s; and the settled size persists
+  per (machine, archive SHAPE), bucketed by mean bytes per entry, so alternating
+  shapes no longer re-teach one shared number. The converged latch was already
+  removed in v0.15.24, so the earlier "periodic re-probe" follow-up is moot.
+  `--write-threads` now suppresses the sizing supervisor entirely (it previously
+  won only for the base pool, letting the probe override the pin).
+  Follow-up: positive-perf validation on the Gen<4 workstation; the 3-bucket
+  shape split (64 KiB / 4 MiB) is measured only at its extremes.
 - **GPU decoders in the extract decode pool: Phase 1 DONE v0.15.22, Phase 2 DONE
   v0.15.23.** The v0.15.20 decode pool was CPU-only; GPU-stream decoders now
   batch-drain the same shared frame queue and scatter into the same reorder

@@ -1,11 +1,81 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.27  
+**Covers:** v0.9.50 → v0.15.28  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.28 — small inputs no longer pay for a GPU they never use; writer prior keyed by archive shape
+
+### Compressing 200 KB took 5.6 seconds
+
+The largest find of this round, and it had nothing to do with `--adapt`. Bringing up CUDA costs a fixed cuInit — measured **2.3 s** before a decompress and **5.6 s** before a compress on this 8-GPU host — and it is charged before any work begins. On a small input the CPU pool finishes the entire job in ~20 ms and the process then sits waiting to join a GPU bringup that had nothing to do:
+
+| operation | before | after |
+|---|---|---|
+| compress a 200 KB file | 5.59 s | **0.018 s** |
+| decompress a 200 KB file | 2.27 s | **0.022 s** |
+| `-d --tar` a tiny archive | 3.47 s | **0.024 s** |
+
+There was already a guard for "the CPU drained everything during init — skip spawning GPU workers", but by the time it fires the init has been paid. The only real fix is not to start it.
+
+The threshold is the GPU's **own batch geometry**, not a tuned constant: one batch on one device is `gpu_batch_cap` frames of `chunk_mib` each — 8 × 16 MiB = 128 MiB by default. Below that the GPU cannot fill a single batch, so no amount of GPU throughput could repay its initialization, and the bound moves correctly by construction if `--gpu-batch` or `--chunk-size` change it. For decompress it is compared against the *compressed* size, which understates the work and so errs toward keeping the GPU — the safe direction. It applies only where the size is genuinely known (regular files); stdin, FIFOs, and `--tar` creation from a directory tree keep today's behaviour, and an explicit `--hybrid`/`--gpu-only` is untouched because a user-set backend returns before this runs.
+
+Verified at the boundary: a 200 MB input still brings up all 8 devices, a 95 MiB one goes cpu-only and says why at `-v`, and a 24 GiB archive still defaults to hybrid.
+
+This matters most for the small-file case that motivated it — a script invoking gzstd per file was paying multiple seconds of setup for milliseconds of work.
+
+**Not covered:** `--tar` creation from a directory tree still pays the init, because the backend default is chosen at startup and the tree's size is not known until the walk runs. Fixing that means deferring the backend decision past the walk rather than widening this gate, so it is left alone; the compress path already overlaps GPU bringup with a background thread, which hides most of it once the tree is more than trivially small.
+
+### The writer prior is per (machine, archive shape)
+
+**v0.15.27 closed the `--adapt` extract gap but left the writer prior workload-blind — one persisted number per machine, so alternating archive shapes kept re-teaching it.** That is now keyed by shape. Along the way, the same NVML startup cost fixed there turned out to be paid a *second* time, on a path that has nothing to do with `--adapt`.
+
+
+The optimal writer count depends on the archive, not just the box: 390 K small files run 92.8% busy / 0.6% starved at 60 writers (metadata- and syscall-bound — the parallelism is real), while 13 huge files run 11.2% busy / 84.0% starved at the same 60 (bandwidth-bound — concurrent O_DIRECT streams contend). v0.15.27 could *correct* a wrong prior mid-run, but the correction was thrown away: whichever shape ran last overwrote the single stored number.
+
+The archive's geometry is known before the pool starts — the parallel extractor already has per-entry boundaries and the frame table — so classify by **mean bytes per entry** and persist one settled size per class (`tar_write_threads_sm` / `_md` / `_lg`, buckets at 64 KiB and 4 MiB). That ratio is the physically meaningful one: it *is* bytes-of-work per open/close, which is exactly the metadata-versus-bandwidth tradeoff being sized for. Three buckets is a compromise — enough to separate the extremes that genuinely differ, few enough that each converges in a couple of runs. A class with no prior yet falls back to the flat key, then to the plain default, and probes from there; the flat key is still written, so profiles from older builds keep working and the streaming extract paths (which cannot know the geometry up front) still have something to seed from.
+
+Measured, alternating the two shapes on one profile — the run that used to be poisoned is run 5:
+
+| run | archive | pool start | settled |
+|-----|---------|-----------|---------|
+| 1 | 13 huge files | 60 (flat prior) | 16 |
+| 2 | 13 huge files | 17 (class `lg`) | 16 |
+| 3 | 390 K small files | 16 (flat prior) | 32 |
+| 4 | 390 K small files | 32 (class `sm`) | 48 |
+| 5 | 13 huge files | **16 (class `lg`)** — not 48 | 16 |
+
+All three classes verified end-to-end, including a 15 GiB / 15 000-file `md` archive (60 → 19 → 16 across three runs).
+
+### A second 300 ms NVML probe, on every GPU-capable run
+
+`detect_min_pcie_gen()` — which picks the decompress backend default and the `--direct` default, on **every** run, `--adapt` or not — opened NVML, enumerated every device, and shut it down: the same ~300 ms measured for the fingerprint in v0.15.27. It already had a sysfs fallback sitting directly beneath it, unused whenever NVML worked.
+
+Sysfs is now the primary path and NVML the fallback. The one thing NVML did better is preserved: its `MaxPcieLinkGeneration` is slot-aware (a Gen4 card in a Gen3 slot correctly reads Gen3), whereas a device's own `max_link_speed` is what the *card* supports. sysfs exposes the upstream port as the parent directory in the PCI tree, so taking `min(device, upstream port)` reproduces the same answer — verified against NVML on an 8-GPU host. The scan now also filters to display/3D controllers (class `0x03xxxx`); the old fallback matched any NVIDIA function, so an audio function or bridge could have dragged the MIN below the GPU's real link.
+
+### Two bugs found while reviewing v0.15.27's own code
+
+- **The "three consecutive ticks" surplus gate wasn't consecutive.** The counter was incremented inside the action's condition chain, so it only counted ticks that had already passed every other gate — an intermittent surplus could accumulate to the threshold across a long gap and act on evidence that was never contiguous. The run-length is now evaluated every tick, independent of the action.
+- **The sizing rounds could wrap across a `Meter` reset.** `wrate` and the new busy/starved deltas are unsigned differences; a reset (the GPU-fault rebuild path) would turn a negative delta into an enormous positive rate and force a false keep. They now re-baseline instead, the same convention the regime snapshot already used.
+
+### `--write-threads` is honoured again
+
+The flag documents itself as "number of parallel file-writer threads" and its own comment claimed the user pin "always wins" — but it only won for the *base* pool, leaving `--adapt`'s probe free to spawn writers on top of it. A user who pins a number now gets that number: the sizing supervisor is not armed at all when `--write-threads` is set. This matters precisely for the hand-tuning the flag exists for ("the optimum is hardware-dependent — tune it on the target box").
+
+**Also:** `gzstd-test.sh` had `EXPECTED_TESTS=345` while 346 ran, so every run ended with a drift note. Corrected.
+
+**Validated:** default suite **350/0** and extensive **483/0**, both with no drift note; byte-identical extraction on all four test archives (incompressible 24 GiB, 390 K-file metadata, 15 GiB mid-size, decode-bound base64).
+
+Extract, `--adapt` vs the plain default, each run starting from a pristine profile (the worst case for `--adapt`, since it has to re-derive the pool every time):
+
+| archive | default | `--adapt` at v0.15.26 | `--adapt` now |
+|---|---|---|---|
+| incompressible 24 GiB (write-bound) | 7.73 s | 8.36 s (**+7% slower**) | 7.50 s |
+| decode-bound base64 | 4.60 s | 3.20 s | **2.46 s (47% faster)** |
+| 390 K-file metadata | 14.8 s | 14.9 s | 14.9 s (parity) |
 
 ## v0.15.27 — --adapt: close the residual extract gap — procfs fingerprint, and a writer pool that contracts
 
