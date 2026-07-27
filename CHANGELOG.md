@@ -1,11 +1,42 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.30  
+**Covers:** v0.9.50 → v0.15.31  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.31 — compress gets it too: 512 MB went from 5.51 s to 0.25 s
+
+v0.15.30 gave decompress a measured "is the GPU still worth starting" test and recorded compress as owed. This is that debt paid.
+
+| compress | before | after | `--cpu-only` |
+|---|---|---|---|
+| 512 MB | 5.51 s | **0.25 s** | 0.26 s |
+| 5.3 GB | 5.79 s | **1.52 s** | 1.42 s |
+
+`compress_nvcomp` called `cudaGetDeviceCount` as its very first act, so ~5.4 s of cuInit was charged before the reader or the CPU pool had done anything. Detection now moves to a background bringup thread that owns the whole sequence — decide, detect, select, size the per-device state, spawn the workers — while the main thread goes on to be the producer. It has to own the *spawn*, not just the detection: the decision needs the pipeline to have made measurable progress, and in compress the reader **is** the main thread, so joining any earlier would reintroduce exactly the stall being removed.
+
+**Adaptive hybrid only.** Fixed-share (`--cpu-share`) keeps the synchronous bringup — the GPU must be warm before the reader starts or a small input drains entirely to CPU and the explicit split is silently ignored (the v0.13.11 regression). `--gpu-only` also stays synchronous: it has no CPU pool to overlap with, and "no devices" should stay a clean error rather than a new failure path threaded through the archive writer.
+
+### The bug this shook out: read progress is the wrong signal for compress
+
+The first working version skipped the GPU on *every* compress, including jobs long enough to want it. The trace said `0% read at 0 ms` — the sample was being cut short instantly.
+
+The cause was not the plumbing. The sampler was reusing decompress's progress signal, bytes read from the source, and tying its stop to teardown. Neither survives contact with compress: **with an mmap'd input the reader reaches the end almost immediately** — the pipeline's own note is "producer_done fires at t≈0 with mmap" — so the main thread arrives at teardown while the CPU pool still has seconds of work, and read progress reads ~100% when nearly all the compression is still to do.
+
+So compress now measures **work completed** — frames handed to the writer, scaled back to input bytes — and stops on that rather than on the reader. The verdicts are right in both directions and visible at `-vv`:
+
+- 512 MB → `100% done at 82 ms` → skip
+- 5.3 GB at `-T 2` → `8% done at 252 ms → 2.61 s remaining` → skip (correctly: less than cuInit)
+- 5.3 GB at `-T 1` → `4% done at 252 ms → 5.13 s remaining` → **engage**, 8 device workers online
+
+That last case round-trips byte-identically, which is the case that matters — it is the one with GPU-produced frames interleaved with CPU ones.
+
+**Structural note.** `DevStats` and `StatsSink` each hold a `std::mutex`, so they are neither movable nor resizable and cannot be sized from a provisional count and fixed up later. They are now built once, inside the bringup, from the real device count — held by `unique_ptr` at function scope so they outlive the workers holding pointers into them. The throttle and scheduler still size from a provisional count (RAM-capped, so over-estimating is harmless — decompress's own justification). Running with **zero** GPU workers is a supported state, verified rather than assumed: `HybridSched`'s queue floor is `streams × batch`, so with nothing registered it is 0 and the CPU pool competes freely.
+
+**Validated:** default suite 352/0, extensive 485/0. GPU-engaged compress round-trips byte-identically at 5.3 GB; `--gpu-only` and `--cpu-share` still take the synchronous path (confirmed by the absence of a bringup sample and 8 workers online).
 
 ## v0.15.30 — the GPU has to prove it can still pay for itself
 

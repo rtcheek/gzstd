@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.30";
+static constexpr const char * GZSTD_VERSION = "0.15.31";
 //
 // Architecture overview:
 //
@@ -3703,12 +3703,16 @@ static constexpr double GPU_SAMPLE_WINDOW_SEC = 0.15;
 // Conservative in every uncertain direction: an unknown total, an unreadable
 // meter, or a job too slow to sample all engage the GPU, i.e. keep today's
 // behaviour.  --gpu-only always engages — there is no CPU pool to fall back on.
-// `total_bytes` is whatever Meter::read_bytes counts up to — the source size in
-// both directions (uncompressed input when compressing, archive size when
-// decompressing).  Input-side progress is used rather than output-side because
-// it is known before the first frame is parsed.
-static bool gpu_bringup_worth_it(const Options & opt, const Meter * m,
-                                 uint64_t total_bytes,
+// `progress` returns the fraction of the JOB that is done (0..1), or <0 when it
+// cannot be known.  It is a callback because the two directions have to measure
+// different things: decompress can use bytes read from the archive, but compress
+// CANNOT — with an mmap'd input the reader reaches the end almost immediately
+// (the pipeline's own note: "producer_done fires at t~0 with mmap"), so read
+// progress there says 98% while nearly all the compression is still to do.  It
+// has to count work COMPLETED instead.  Getting this wrong is not a small error:
+// it made every compress skip the GPU, including jobs long enough to want it.
+static bool gpu_bringup_worth_it(const Options & opt,
+                                 const std::function<double()> & progress,
                                  std::mutex & mx, std::condition_variable & cv,
                                  const std::function<bool()> & stop)
 {
@@ -3725,28 +3729,25 @@ static bool gpu_bringup_worth_it(const Options & opt, const Meter * m,
     if (end != e && v >= 0.0) guard_sec = v;
   }
   if (guard_sec <= 0.0) return true;
-  if (!m || total_bytes == 0) {                 // no denominator -> cannot judge
-    if (opt.verbosity >= V_DEBUG) {
-      char b[128];
-      std::snprintf(b, sizeof b,
-        "[GPU] bringup sample: no size signal (meter %s, total %llu) -> engage\n",
-        m ? "ok" : "null", (unsigned long long)total_bytes);
-      vlog(V_DEBUG, opt, b);
-    }
+  if (progress() < 0.0) {                      // no denominator -> cannot judge
+    vlog(V_DEBUG, opt, "[GPU] bringup sample: no progress signal -> engage\n");
     return true;
   }
+  const auto t_start = std::chrono::steady_clock::now();
   auto say = [&](bool engage, const char * why, double remaining, double p) {
     if (opt.verbosity >= V_DEBUG) {
-      char b[208];
+      const double el = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_start).count();
+      char b[240];
       std::snprintf(b, sizeof b,
-        "[GPU] bringup sample: %.0f%% read, %s -> %.2f s remaining "
+        "[GPU] bringup sample: %.0f%% done at %.0f ms, %s -> %.2f s remaining "
         "(guard %.1f s) -> %s\n",
-        p * 100.0, why, remaining, guard_sec, engage ? "engage" : "skip");
+        p * 100.0, el * 1000.0, why, remaining, guard_sec,
+        engage ? "engage" : "skip");
       vlog(V_DEBUG, opt, b);
     }
     return engage;
   };
-  const auto t_start = std::chrono::steady_clock::now();
   auto secs_in = [&] {
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_start).count();
@@ -3762,9 +3763,7 @@ static bool gpu_bringup_worth_it(const Options & opt, const Meter * m,
     }
     return !stop();
   };
-  auto frac = [&] {
-    return double(m->read_bytes.load(std::memory_order_relaxed)) / double(total_bytes);
-  };
+  auto frac = [&] { return progress(); };
 
   // Let the pipeline reach steady state before believing it.  Extrapolating
   // from cumulative bytes-since-zero folds in the startup ramp and badly
@@ -17183,24 +17182,55 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #endif
 
   // ---- Detect GPU devices ----
+  //
+  // cudaGetDeviceCount triggers the one-time CUDA driver init (cuInit): measured
+  // ~5.4 s on an 8-GPU host for compress.  Running it here, first thing, charged
+  // that before the reader or the CPU pool had done anything — so a 512 MB
+  // compress took 5.51 s against 0.22 s cpu-only, all of it setup the job never
+  // recouped.  Decompress solved this in v0.13.13; compress never got it.
+  //
+  // ADAPTIVE HYBRID ONLY.  Fixed-share (--cpu-share) must keep the synchronous
+  // bringup: the GPU has to be warm before the reader starts, or a small input
+  // drains entirely to CPU before the GPU registers and the explicit split is
+  // silently ignored (the v0.13.11 regression).  --gpu-only also stays
+  // synchronous here: it has no CPU pool to overlap with, and "no devices" must
+  // still be a clean error from this thread rather than a new failure path
+  // threaded through the archive writer.
+  const bool defer_detect = opt.hybrid && !opt.cpu_only && !opt.gpu_only
+                            && opt.cpu_share < 0.0;
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-    if (opt.gpu_only)
-      die_usage("GPU requested (--gpu-only) but no CUDA devices available");
-    vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU\n");
+  int total_hw_devices = 0;
+  if (!defer_detect) {
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+      if (opt.gpu_only)
+        die_usage("GPU requested (--gpu-only) but no CUDA devices available");
+      vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU\n");
 #ifndef _WIN32
-    compress_cpu_mt(in, out, opt, m, pre_built ? &pre_layout : nullptr);
+      compress_cpu_mt(in, out, opt, m, pre_built ? &pre_layout : nullptr);
 #else
-    compress_cpu_mt(in, out, opt, m);
+      compress_cpu_mt(in, out, opt, m);
 #endif
-    return;
+      return;
+    }
+    total_hw_devices = device_count;
+  } else {
+    // Provisional count, used only to SIZE the throttle and scheduler before the
+    // real one is known.  Generous on purpose: the throttle budget is RAM-capped
+    // downstream, so over-estimating costs nothing, and the per-device arrays are
+    // built from the real count inside the bringup below.  Same trick, and the
+    // same justification, as decompress_nvcomp.
+    device_count = std::max(opt.gpu_devices, 8);
+    total_hw_devices = device_count;
   }
 
-  // Apply --gpu-devices limit (0 = all for compress)
-  const int total_hw_devices = device_count;
+  // Apply --gpu-devices limit (0 = all for compress).  When deferring, this only
+  // trims the provisional sizing figure — the real limit is applied against the
+  // real count in the bringup, which is also where the message belongs (the
+  // count here is a guess, and saying "N of 8" about a guess would be a lie).
   if (opt.gpu_devices > 0 && opt.gpu_devices < device_count) {
-    vlog(V_VERBOSE, opt, "[GPU] limiting to " + std::to_string(opt.gpu_devices)
-         + " of " + std::to_string(device_count) + " GPU devices\n");
+    if (!defer_detect)
+      vlog(V_VERBOSE, opt, "[GPU] limiting to " + std::to_string(opt.gpu_devices)
+           + " of " + std::to_string(device_count) + " GPU devices\n");
     device_count = opt.gpu_devices;
   }
 
@@ -17269,23 +17299,19 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<bool>   abort_on_failure{ opt.gpu_only };
   std::atomic<bool>   gpu_started{false};
 
-  // Select GPUs before allocating per-device arrays
-  const uint64_t gpu_sel_t0 = now_ns();
-  auto gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
-  // Fixed-share mode: warm GPU contexts before the pipeline so a small
-  // input isn't drained to CPU before the GPU registers (see
-  // warm_gpu_contexts).  Adaptive mode defers for fastest startup.
-  if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
-  if (opt.verbosity >= V_VERBOSE) {
-    std::ostringstream os;
-    os << "[GPU] device selection: " << std::fixed << std::setprecision(1)
-       << double(now_ns() - gpu_sel_t0) / 1e6 << " ms";
-    vlog(V_VERBOSE, opt, os.str() + "\n");
-  }
-  const int gpu_count_early = (int)gpu_ids.size();
-
-  std::vector<DevStats> per_dev(gpu_count_early);
-  StatsSink json_sink(gpu_count_early);
+  // Device selection and the per-device arrays move into gpu_bringup() below:
+  // selection needs a live CUDA context, and DevStats/StatsSink each hold a
+  // std::mutex, so they are neither movable nor resizable — they have to be
+  // built once, from the real device count.  Declared here so they outlive the
+  // GPU workers that hold pointers into them; filled in by the bringup.
+  std::vector<int> gpu_ids;
+  std::unique_ptr<DevStats[]> per_dev;
+  std::unique_ptr<StatsSink>  json_sink;
+  // Sizing figure for the throttle only — the post-limit device count, which is
+  // what select_best_gpus returns in the normal case and an upper bound always.
+  // Provisional when deferring; either way over-estimating is harmless, since
+  // the budget is RAM-capped downstream.
+  const int gpu_count_early = device_count;
   CpuAgg cpuagg{};
   cpuagg.threads = 0;
 
@@ -17406,13 +17432,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   }
 
   // ---- GPU workers (init CUDA context, allocate memory  CPUs already working) ----
-  const int gpu_count = gpu_count_early;
-  results.init_slots(gpu_count);  // per-GPU result slots (reduces lock contention)
+  // gpu_count is resolved by gpu_bringup() below — 0 until then, and 0 forever
+  // if the bringup decides the GPU cannot pay for itself or finds no device.
+  // Running with zero GPU workers is a supported state: HybridSched's queue
+  // floor is streams*batch, so with nothing registered it is 0 and the CPU pool
+  // competes freely (verified, not assumed — a non-zero floor with no GPU to
+  // claim it would deadlock the pool).
+  int gpu_count = 0;
   std::vector<std::thread> workers;
-  workers.reserve(gpu_count);
   Options opt_for_workers = opt;
   opt_for_workers.chunk_mib = chosen_mib;
-  std::vector<std::string> fatal_msgs(gpu_count);
+  std::vector<std::string> fatal_msgs;
 
   // Shared auto-tune state: all GPUs coordinate batch size through this
   SharedTuneState shared_tune;
@@ -17433,8 +17463,82 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   GzWatchdog wd;
   std::atomic<bool> watchdog_done{false};
   std::thread watchdog_thr;
-  if (opt.watchdog && opt.watchdog_secs > 0) {
-    {
+
+  // Everything that needs a live CUDA context, in one place so it can run either
+  // inline (fixed-share / gpu-only) or on a background thread while the main
+  // thread goes on to be the producer.  It owns the whole sequence — decide,
+  // detect, select, size the per-device state, spawn the workers — because the
+  // decision needs the pipeline to have made measurable progress first, and in
+  // compress the reader IS the main thread.  Anything less than owning the
+  // spawn would mean joining before the reader starts, which is precisely the
+  // stall being removed.
+  std::mutex bringup_mx;
+  std::condition_variable bringup_cv;
+  auto gpu_bringup = [&]() {
+    if (defer_detect) {
+      // Is the GPU still worth starting?  Asked BEFORE the first CUDA call, so a
+      // "no" costs nothing — the point of the exercise.  Deferring alone would
+      // not help: this thread still has to be joined, so the wall stays >= cuInit
+      // whenever CUDA is touched at all.
+      // Frames actually handed to the writer, scaled back to input bytes — the
+      // only honest measure of compress progress (see gpu_bringup_worth_it).
+      auto comp_progress = [&]() -> double {
+        if (!m || total_in == 0) return -1.0;
+        const double done = double(m->tasks_done.load(std::memory_order_relaxed))
+                          * double(host_chunk);
+        return std::min(1.0, done / double(total_in));
+      };
+      // Stop when the job is essentially finished rather than when the READER
+      // is: with mmap the reader is done almost at once, so a reader-tied stop
+      // would cut every sample short and skip the GPU unconditionally.
+      if (!gpu_bringup_worth_it(opt, comp_progress, bringup_mx, bringup_cv,
+                                [&] { return comp_progress() >= 0.98; })) {
+        vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
+                             "skipping GPU bringup\n");
+        return;
+      }
+      int dc = 0;
+      if (cudaGetDeviceCount(&dc) != cudaSuccess || dc <= 0) {
+        // No GPU after all.  The CPU pool is already running and owns the queue,
+        // so there is nothing to repair — hybrid simply runs CPU-only.
+        vlog(V_VERBOSE, opt, "[GPU] no devices found; hybrid running CPU-only\n");
+        return;
+      }
+      total_hw_devices = dc;
+      int target = opt.gpu_devices;
+      if (target == 0) target = dc;
+      device_count = std::min(target, dc);
+      if (opt.gpu_devices > 0 && opt.gpu_devices < dc)
+        vlog(V_VERBOSE, opt, "[GPU] limiting to " + std::to_string(device_count)
+             + " of " + std::to_string(dc) + " GPU devices\n");
+    }
+    if (device_count <= 0) return;
+
+    const uint64_t gpu_sel_t0 = now_ns();
+    gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
+    // Fixed-share mode: warm GPU contexts before the pipeline so a small input
+    // isn't drained to CPU before the GPU registers (see warm_gpu_contexts).
+    // Adaptive mode defers for fastest startup.
+    if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
+    if (opt.verbosity >= V_VERBOSE) {
+      std::ostringstream os;
+      os << "[GPU] device selection: " << std::fixed << std::setprecision(1)
+         << double(now_ns() - gpu_sel_t0) / 1e6 << " ms";
+      vlog(V_VERBOSE, opt, os.str() + "\n");
+    }
+    gpu_count = (int)gpu_ids.size();
+    if (gpu_count <= 0) return;
+
+    // Per-device state, built from the REAL count.  Both types hold a mutex, so
+    // they cannot be resized later — this is the one point where the count is
+    // known and no worker exists yet to race the construction.
+    per_dev.reset(new DevStats[(size_t)gpu_count]);
+    json_sink = std::make_unique<StatsSink>(gpu_count);
+    fatal_msgs.assign((size_t)gpu_count, std::string());
+    results.init_slots(gpu_count);   // per-GPU result slots (reduces lock contention)
+    workers.reserve((size_t)gpu_count);
+
+    if (opt.watchdog && opt.watchdog_secs > 0) {
       const int wsecs = opt.watchdog_secs;
       wd.n_workers   = gpu_count;
       wd.streams_per = (int)std::max<size_t>(1, opt.gpu_streams);
@@ -17444,23 +17548,27 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       g_wd.store(&wd, std::memory_order_release);
       watchdog_thr = std::thread(watchdog_loop, &watchdog_done, wsecs);
     }
-  }
 
-  for (int i = 0; i < gpu_count; ++i) {
-    workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
-                         &queue, &results,
-                         &per_dev[size_t(i)], &json_sink, m, sched,
-                         &any_gpu_failed, &abort_on_failure,
-                         &fatal_msgs[size_t(i)], &gpu_started,
-                         &shared_tune,
-                         &throttle, &gpu_failures, gpu_count);
-  }
-  if (opt.verbosity >= V_VERBOSE) {
-    std::ostringstream os;
-    os << "[GPU] " << gpu_count << " device worker"
-       << (gpu_count > 1 ? "s" : "") << " online";
-    vlog(V_VERBOSE, opt, os.str() + "\n");
-  }
+    for (int i = 0; i < gpu_count; ++i) {
+      workers.emplace_back(gpu_worker, gpu_ids[i], i, opt_for_workers,
+                           &queue, &results,
+                           &per_dev[size_t(i)], json_sink.get(), m, sched,
+                           &any_gpu_failed, &abort_on_failure,
+                           &fatal_msgs[size_t(i)], &gpu_started,
+                           &shared_tune,
+                           &throttle, &gpu_failures, gpu_count);
+    }
+    if (opt.verbosity >= V_VERBOSE) {
+      std::ostringstream os;
+      os << "[GPU] " << gpu_count << " device worker"
+         << (gpu_count > 1 ? "s" : "") << " online";
+      vlog(V_VERBOSE, opt, os.str() + "\n");
+    }
+  };
+
+  std::thread gpu_bringup_thr;
+  if (defer_detect) gpu_bringup_thr = std::thread(gpu_bringup);
+  else              gpu_bringup();
 
   // Fixed-share: wait for at least one GPU stream to register (or for all
   // GPUs to fail init) before streaming frames.  warm_gpu_contexts only
@@ -17655,6 +17763,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   results.cv.notify_all();
 
   // ---- Teardown: join all threads in correct order ----
+  // The bringup thread goes FIRST: it is what populates `workers` (and gpu_count,
+  // per_dev, fatal_msgs), so iterating that vector before joining it is a data
+  // race — and leaving the std::thread joinable would call std::terminate at
+  // scope exit.
+  //
+  // Deliberately NOT signalling the sampler here, unlike decompress: the main
+  // thread reaches this point when the READER is done, which with an mmap'd
+  // input is almost immediately — cutting the sample short there would skip the
+  // GPU on every compress.  The sampler bounds itself at ~0.25 s and stops early
+  // on its own progress signal, so the join is short regardless.
+  if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   // Do NOT call throttle.set_done() before join: workers must respect
   // throttle while draining the queue to avoid buffering entire output in RAM.
   for (auto & th : workers) th.join();
@@ -19058,7 +19177,13 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       // first CUDA call, so a "no" costs nothing — which is the whole point:
       // once cudaGetDeviceCount has run, the init is paid whether or not any
       // GPU worker is ever spawned, and this thread still has to be joined.
-      if (!gpu_bringup_worth_it(opt, m, decomp_src_bytes, bringup_mx, bringup_cv,
+      if (!gpu_bringup_worth_it(opt,
+                                [&] {
+                                  if (!m || decomp_src_bytes == 0) return -1.0;
+                                  return double(m->read_bytes.load(std::memory_order_relaxed))
+                                       / double(decomp_src_bytes);
+                                },
+                                bringup_mx, bringup_cv,
                                 [&] { return bringup_stop.load(std::memory_order_relaxed); })) {
         vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
                              "skipping GPU bringup\n");
