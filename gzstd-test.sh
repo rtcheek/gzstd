@@ -374,8 +374,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=350
-$EXTENSIVE && EXPECTED_TESTS=483
+EXPECTED_TESTS=351
+$EXTENSIVE && EXPECTED_TESTS=484
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2386,12 +2386,35 @@ if has_gpu; then
          "(banner: $(echo "$sg_log4" | grep STARTUP || echo none))"
   fi
 
-  rm -f "$sg_src" "$sg_zst" "$TMPDIR/smallgate.out"
+  # --tar creation: the size is not known until the source walk runs, so the
+  # gate is re-checked after the walk rather than at startup.  The tree must
+  # still be walked exactly ONCE and the archive must round-trip.
+  sg_tree="$TMPDIR/smallgate-tree"
+  rm -rf "$sg_tree"; mkdir -p "$sg_tree"
+  for i in 1 2 3 4 5; do head -c 4096 /dev/urandom > "$sg_tree/f$i.bin" 2>/dev/null; done
+  sg_log5=$(GZSTD_DEBUG_GPU_MIN_BYTES=104857600 "$GZSTD" -v -f \
+              -o "$TMPDIR/smallgate-tree.tar.zst" --tar "$sg_tree" 2>&1)
+  sg_walks=$(echo "$sg_log5" | grep -c "\[TAR\] scanning")
+  rm -rf "$TMPDIR/smallgate-tree.out"; mkdir -p "$TMPDIR/smallgate-tree.out"
+  "$GZSTD" -d --tar -C "$TMPDIR/smallgate-tree.out" \
+           "$TMPDIR/smallgate-tree.tar.zst" >/dev/null 2>&1
+  if echo "$sg_log5" | grep -q "archive .* < one GPU batch" && \
+     [[ "$sg_walks" == "1" ]] && \
+     diff -r "$sg_tree" "$TMPDIR/smallgate-tree.out$sg_tree" >/dev/null 2>&1; then
+    pass "small --tar creation goes cpu-only, walks once, round-trips"
+  else
+    fail "small --tar creation goes cpu-only, walks once, round-trips" \
+         "(gate=$(echo "$sg_log5" | grep -c 'one GPU batch') walks=$sg_walks)"
+  fi
+
+  rm -f "$sg_src" "$sg_zst" "$TMPDIR/smallgate.out" "$TMPDIR/smallgate-tree.tar.zst"
+  rm -rf "$sg_tree" "$TMPDIR/smallgate-tree.out"
 else
   skip "small input below one GPU batch defaults to cpu-only" "no GPU"
   skip "input above the bound keeps the GPU default"          "no GPU"
   skip "explicit --hybrid overrides the small-input gate"     "no GPU"
   skip "small archive decompress defaults to cpu-only"        "no GPU"
+  skip "small --tar creation goes cpu-only, walks once, round-trips" "no GPU"
 fi
 
 # ============================================================

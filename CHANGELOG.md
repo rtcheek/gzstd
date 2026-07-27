@@ -1,11 +1,29 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.28  
+**Covers:** v0.9.50 → v0.15.29  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.29 — `--tar` creation gets the small-input gate too: walk before cuInit
+
+v0.15.28 stopped small inputs paying for a GPU they never use, but explicitly left one case out: **`--tar` creation from a directory tree**. The startup gate can only `stat()` what it is handed, and a tree's real size is not known until it has been walked — so creating an archive from a small tree still paid the full init.
+
+**Creating a 4 MiB archive from 200 files took 4.78 s. It now takes 0.039 s.**
+
+The fix is a reorder, not a wider gate. `compress_nvcomp` called `cudaGetDeviceCount` as its very first act and did not build the tar layout until ~150 lines later; the walk now happens first, and the same `gpu_min_useful_bytes()` bound is applied to the real total. **Nothing is lost by the reorder** — that detection is synchronous, so it never overlapped the walk anyway. It simply ran first and charged cuInit before anyone knew whether it was worth paying.
+
+The layout is then handed to whichever path runs, so **the tree is walked exactly once either way** — `compress_cpu_mt` takes an optional prebuilt layout, used both by this gate and by the pre-existing "no CUDA devices found" fallback, which would otherwise have re-walked the whole source. The suite asserts the walk count is 1, along with the round-trip.
+
+The threshold itself moved into a shared `gpu_min_useful_bytes()` helper, so the startup gate and this deferred one cannot drift apart — they were duplicating the same `chunk_mib × gpu_batch_cap` computation and the same `GZSTD_DEBUG_GPU_MIN_BYTES` override.
+
+**Still not covered:** compressing from a pipe or stdin, where the size is genuinely unknowable up front. That is inherent, not an oversight.
+
+**Also:** the `-v` gate message now says it is *overriding the announced backend*. The `[STARTUP]` banner is printed before the walk runs, so it still announces hybrid; the following line now makes the relationship explicit rather than appearing to contradict it.
+
+**Validated:** default suite 351/0, extensive 484/0, no drift note; small-tree creation round-trips byte-identically and walks once; a 5 GiB tree still brings up all 8 devices.
 
 ## v0.15.28 — small inputs no longer pay for a GPU they never use; writer prior keyed by archive shape
 

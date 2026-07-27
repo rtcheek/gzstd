@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.28";
+static constexpr const char * GZSTD_VERSION = "0.15.29";
 //
 // Architecture overview:
 //
@@ -3642,6 +3642,34 @@ static uint64_t known_input_size(const Options & opt, FILE * in)
   }
 #endif
   return 0;                                 // true pipe / unknown
+}
+
+// Smallest input for which bringing up the GPU can pay for itself (bytes).
+//
+// cuInit is a fixed cost charged before any work — measured 2.3 s ahead of a
+// decompress and 5.6 s ahead of a compress on an 8-GPU host.  The bound is the
+// GPU's OWN batch geometry rather than a tuned constant: one batch on one device
+// is gpu_batch_cap frames of chunk_mib each (8 x 16 MiB = 128 MiB by default).
+// Below that the GPU cannot fill a single launch, so no amount of GPU throughput
+// could repay its initialization — and the bound moves by construction if
+// --gpu-batch or --chunk-size change it.
+//
+// Two callers, and they must agree: apply_backend_defaults decides up front for
+// inputs whose size is known by stat(), and compress_nvcomp re-checks for --tar
+// creation, whose real size is not known until the source walk has run.
+//
+// GZSTD_DEBUG_GPU_MIN_BYTES overrides the bound; 0 disables the gate entirely,
+// which is how the suite keeps exercising the GPU paths on small fixtures.  Test
+// hook only, same shape as GZSTD_DEBUG_ADAPT_SAVE_MIN_MS.
+static uint64_t gpu_min_useful_bytes(const Options & opt)
+{
+  if (const char * e = std::getenv("GZSTD_DEBUG_GPU_MIN_BYTES")) {
+    char * end = nullptr;
+    const unsigned long long v = std::strtoull(e, &end, 10);
+    if (end != e) return (uint64_t)v;
+  }
+  return (uint64_t)std::max<size_t>(1, opt.chunk_mib) * 1024 * 1024
+       * (uint64_t)std::max<size_t>(1, opt.gpu_batch_cap);
 }
 
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
@@ -14549,7 +14577,16 @@ static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
 }  // namespace tarx
 #endif  // !_WIN32
 
-static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
+// `prebuilt_layout` (--tar creation only, may be null): a source walk the caller
+// has already paid for.  compress_nvcomp needs the layout BEFORE it decides
+// whether the GPU is worth starting, and the walk is the expensive part on a
+// many-file tree — handing it over keeps a fall back to this function from
+// re-walking the whole source.
+static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m
+#ifndef _WIN32
+                            , const tarx::TarLayout * prebuilt_layout = nullptr
+#endif
+                            )
 {
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
@@ -14624,7 +14661,11 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 #ifndef _WIN32
   tarx::TarLayout tar_layout;
   bool tar_built = false;
-  if (opt.tar_mode) { tar_layout = tarx::build_layout(opt, m); tar_built = true; }
+  if (opt.tar_mode) {
+    if (prebuilt_layout) tar_layout = *prebuilt_layout;   // caller already walked
+    else                 tar_layout = tarx::build_layout(opt, m);
+    tar_built = true;
+  }
   uint64_t total_in = tar_built ? tar_layout.total_size : known_input_size(opt, in);
 #else
   uint64_t total_in = known_input_size(opt, in);
@@ -16991,13 +17032,52 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) g_perf = &perf_local;
 
+#ifndef _WIN32
+  // ---- --tar creation: walk BEFORE touching CUDA ----
+  // The startup gate in apply_backend_defaults skips GPU bringup for inputs too
+  // small to repay cuInit, but it can only stat() what it is given: a --tar
+  // creation is handed a directory tree whose size is not known until it has
+  // been walked.  So the walk moves ahead of device detection here, and the same
+  // bound is applied to the real total.  Nothing is lost by the reorder — the
+  // detection below is synchronous, so it never overlapped the walk anyway; it
+  // simply ran first and charged cuInit before anyone knew whether it was worth
+  // it.  The layout is handed to whichever path runs, so the tree is walked
+  // exactly once either way.
+  tarx::TarLayout pre_layout;
+  bool pre_built = false;
+  if (opt.tar_mode) {
+    pre_layout = tarx::build_layout(opt, m);
+    pre_built = true;
+    const uint64_t bound = gpu_min_useful_bytes(opt);
+    if (bound && pre_layout.total_size < bound && !opt.gpu_only) {
+      if (opt.verbosity >= V_VERBOSE) {
+        char b[192];
+        std::snprintf(b, sizeof(b),
+          "[GPU] archive %.1f MiB < one GPU batch (%.0f MiB); overriding the "
+          "announced backend to cpu-only (GPU init would cost more than the whole job)\n",
+          pre_layout.total_size / 1048576.0, bound / 1048576.0);
+        vlog(V_VERBOSE, opt, b);
+      }
+      Options cpu_opt = opt;
+      cpu_opt.cpu_only = true;
+      cpu_opt.hybrid = false;
+      compress_cpu_mt(in, out, cpu_opt, m, &pre_layout);
+      return;
+    }
+  }
+#endif
+
   // ---- Detect GPU devices ----
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
     if (opt.gpu_only)
       die_usage("GPU requested (--gpu-only) but no CUDA devices available");
     vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU\n");
+#ifndef _WIN32
+    compress_cpu_mt(in, out, opt, m, pre_built ? &pre_layout : nullptr);
+#else
     compress_cpu_mt(in, out, opt, m);
+#endif
     return;
   }
 
@@ -17099,7 +17179,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #ifndef _WIN32
   tarx::TarLayout tar_layout;
   bool tar_built = false;
-  if (opt.tar_mode) { tar_layout = tarx::build_layout(opt, m); tar_built = true; }
+  // Already walked above, before device detection — never walk twice.
+  if (opt.tar_mode) { tar_layout = std::move(pre_layout); tar_built = pre_built; }
   uint64_t total_in = tar_built ? tar_layout.total_size : known_input_size(opt, in);
 #else
   uint64_t total_in = known_input_size(opt, in);
@@ -21971,19 +22052,7 @@ static void apply_backend_defaults(Options & opt)
       }
       known += (uint64_t)st.st_size;
     }
-    // GZSTD_DEBUG_GPU_MIN_BYTES overrides the bound (0 disables the gate) so
-    // the suite can exercise the backend-default rules below on small fixtures
-    // instead of needing >128 MiB of test data for every one of them.  Test hook
-    // only, same shape as GZSTD_DEBUG_ADAPT_SAVE_MIN_MS; never set in a normal
-    // process.
-    uint64_t one_batch =
-        (uint64_t)std::max<size_t>(1, opt.chunk_mib) * 1024 * 1024
-        * (uint64_t)std::max<size_t>(1, opt.gpu_batch_cap);
-    if (const char * e = std::getenv("GZSTD_DEBUG_GPU_MIN_BYTES")) {
-      char * end = nullptr;
-      const unsigned long long v = std::strtoull(e, &end, 10);
-      if (end != e) one_batch = (uint64_t)v;
-    }
+    const uint64_t one_batch = gpu_min_useful_bytes(opt);
     if (one_batch && all_known && known < one_batch) {
       opt.cpu_only = true;
       opt.hybrid = false;
