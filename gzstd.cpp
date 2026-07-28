@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.35";
+static constexpr const char * GZSTD_VERSION = "0.15.36";
 //
 // Architecture overview:
 //
@@ -2141,6 +2141,21 @@ static constexpr double ADAPT_BACKEND_RECHECK_RUNS = 20;
 // overall_gibs_hybrid toward the cpu-only rate — corrupting the one comparison
 // the v0.15.33 backend prior is built on.  Set where GPU workers are spawned.
 static std::atomic<bool> g_adapt_gpu_engaged{false};
+// Page-cache residency class of THIS run's input: 1 = warm, 0 = cold, -1 = not
+// probed (compress, pipes, non-regular output, --list).  The backend prior is
+// keyed by it for decompress — see the prior for why bucketing beats picking a
+// winner between the two rules.  Set once, in apply_backend_defaults; never reset
+// by the governor, which starts after the probe has already run.
+static std::atomic<int> g_adapt_resid_class{-1};
+// Which backend this run is EXPLORING, if any (0 none, 1 cpu-only, 2 hybrid).
+// An exploration does not always produce a measurement of the thing it explored:
+// a hybrid probe whose lazy-engagement guard declines the GPU records a CPU rate,
+// leaving the hybrid side untried — so without a record of the ATTEMPT the prior
+// would explore again on every single run, forever.  The attempt stamps the
+// explored side's _run key (no rate), which the explore branches then use to hold
+// off for ADAPT_BACKEND_RECHECK_RUNS.
+static std::atomic<int> g_adapt_explored{0};
+static const char * adapt_resid_class_name(int c) { return c == 1 ? "warm" : "cold"; }
 static std::atomic<int> g_adapt_tar_wclass{-1};        // class of this extract (-1 = unknown)
 // Set when one operation extracts archives of DIFFERENT workload classes.  The
 // settled pool size is a single per-operation number and the governor's sizing
@@ -3330,6 +3345,8 @@ struct AdaptObs {
   int writer_par = 0;                            // writer probe verdict (+1/-1, 0 = untried)
   int tar_write_threads = 0;                     // -d --tar: settled pool size (0 = untried)
   int tar_wclass = -1;                           // -d --tar: workload class the size belongs to
+  int resid_class = -1;                          // input residency class the backend rate belongs to
+  int explored = 0;                              // backend this run was exploring (0/1/2)
   // Which backend actually ran, so the end-to-end rate is filed under it.
   // 0 = do not record (gpu-only, or a run that never chose): the backend prior
   // only ever picks between cpu-only and hybrid, so only those two are useful.
@@ -3341,6 +3358,8 @@ struct AdaptObs {
   {
     if (const char * p = g_adapt_src_path.load(std::memory_order_relaxed))
       src_path = p;
+    resid_class = g_adapt_resid_class.load(std::memory_order_relaxed);
+    explored    = g_adapt_explored.load(std::memory_order_relaxed);
     if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
       writer_par = wp;
     if (int ws = g_adapt_ewgrow_settled.load(std::memory_order_relaxed)) {
@@ -3386,12 +3405,44 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     // The companion _run key stamps WHEN each side was last measured, so the
     // prior can tell a fresh comparison from one where the loser's number has
     // been frozen for hundreds of runs (see ADAPT_BACKEND_RECHECK_RUNS).
+    //
+    // Recorded twice, exactly as tar_write_threads is: once flat, and once under
+    // this run's INPUT RESIDENCY CLASS when one was probed (decompress only).  A
+    // warm input feeds at memory speed and the run is compute-bound; a cold one
+    // is disk-bound.  Those are different questions with different answers, and a
+    // single per-machine EMA blending them is wrong for BOTH on a box that mixes
+    // them — the same defect the workload-class writer prior fixed in v0.15.28.
+    // Bucketing also dissolves the precedence fight with the residency rule: the
+    // probe SORTS runs, the end-to-end measurement still DECIDES within a bucket.
+    const char * rc = obs.resid_class >= 0
+                        ? adapt_resid_class_name(obs.resid_class) : nullptr;
     if (obs.backend_used == 1) {
       dir.put_num("overall_gibs_cpu", ema(dir.gnum("overall_gibs_cpu", 0), rate));
       dir.put_num("overall_gibs_cpu_run", dir.gnum("runs", 0));
+      if (rc) {
+        const std::string k = std::string("overall_gibs_cpu_") + rc;
+        dir.put_num(k, ema(dir.gnum(k, 0), rate));
+        dir.put_num(k + "_run", dir.gnum("runs", 0));
+      }
     } else if (obs.backend_used == 2) {
       dir.put_num("overall_gibs_hybrid", ema(dir.gnum("overall_gibs_hybrid", 0), rate));
       dir.put_num("overall_gibs_hybrid_run", dir.gnum("runs", 0));
+      if (rc) {
+        const std::string k = std::string("overall_gibs_hybrid_") + rc;
+        dir.put_num(k, ema(dir.gnum(k, 0), rate));
+        dir.put_num(k + "_run", dir.gnum("runs", 0));
+      }
+    }
+    // Record the ATTEMPT when an exploration failed to measure the backend it was
+    // exploring — a hybrid probe whose GPU never engaged lands in the cpu bucket,
+    // so the hybrid side stays untried and the prior would re-explore forever.
+    // Stamp the _run key WITHOUT a rate: still untried, but recently attempted.
+    if (obs.explored && obs.explored != obs.backend_used) {
+      const char * nm = obs.explored == 1 ? "cpu" : "hybrid";
+      dir.put_num(std::string("overall_gibs_") + nm + "_run", dir.gnum("runs", 0));
+      if (rc)
+        dir.put_num(std::string("overall_gibs_") + nm + "_" + rc + "_run",
+                    dir.gnum("runs", 0));
     }
   }
   if (obs.reader_io_ns > 0)
@@ -3455,6 +3506,9 @@ struct AdaptPriors {
     double overall_gibs = 0, settled_batch = 0, runs = 0;
     double overall_cpu = 0, overall_hybrid = 0;             // end-to-end, per backend
     double overall_cpu_run = 0, overall_hybrid_run = 0;     // run index each was last measured at
+    // Same pair, bucketed by input residency class ([0] = cold, [1] = warm).
+    double overall_cpu_cls[2] = {0, 0}, overall_hybrid_cls[2] = {0, 0};
+    double overall_cpu_cls_run[2] = {0, 0}, overall_hybrid_cls_run[2] = {0, 0};
     double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates
     double writer_par = 0;                                  // probe verdict
     double tar_write_threads = 0;                           // -d --tar settled pool size (flat fallback)
@@ -3491,6 +3545,13 @@ static AdaptPriors adapt_load_priors()
     D.overall_hybrid = dj->gnum("overall_gibs_hybrid", 0);
     D.overall_cpu_run    = dj->gnum("overall_gibs_cpu_run", 0);
     D.overall_hybrid_run = dj->gnum("overall_gibs_hybrid_run", 0);
+    for (int c = 0; c < 2; ++c) {
+      const std::string n = adapt_resid_class_name(c);
+      D.overall_cpu_cls[c]        = dj->gnum("overall_gibs_cpu_" + n, 0);
+      D.overall_hybrid_cls[c]     = dj->gnum("overall_gibs_hybrid_" + n, 0);
+      D.overall_cpu_cls_run[c]    = dj->gnum("overall_gibs_cpu_" + n + "_run", 0);
+      D.overall_hybrid_cls_run[c] = dj->gnum("overall_gibs_hybrid_" + n + "_run", 0);
+    }
     D.runs          = dj->gnum("runs", 0);
     D.regime        = dj->gstr("regime", "");
     D.path_mmap     = dj->gnum("path_mmap_gibs", 0);
@@ -22149,19 +22210,11 @@ static int detect_min_pcie_gen()
 // this early), samples mincore — which never faults pages in — and unmaps.
 // NEVER MAP_POPULATE (the mmap fault-storm rule).  Returns <0 for unknown
 // (pipe, unreadable, empty): callers keep today's defaults.
-static double adapt_input_residency(const Options & opt)
+// Residency of one path.  Empty path = probe fd 0 (stdin redirected from a
+// regular file).  Split out of adapt_input_residency so the backend prior can
+// ask the same question about EVERY input, not just the first.
+static double adapt_path_residency(const std::string & path)
 {
-  // --tar decompress/test reads its archive from tar_sources; opt.inputs
-  // holds a synthesized "-" there, which would route the probe to whatever
-  // stdin happens to be (review M3-1: a warm redirected stdin must not
-  // steer the backend for a cold archive).
-  std::string path;
-  if (opt.tar_mode) {
-    if (opt.tar_sources.empty()) return -1.0;
-    path = opt.tar_sources[0];
-  } else if (!opt.inputs.empty() && opt.inputs[0] != "-") {
-    path = opt.inputs[0];
-  }
   int fd = -1;
   bool close_fd = false;
   struct stat st{};
@@ -22185,6 +22238,45 @@ static double adapt_input_residency(const Options & opt)
   }
   if (close_fd) ::close(fd);
   return resid;
+}
+
+static double adapt_input_residency(const Options & opt)
+{
+  // --tar decompress/test reads its archive from tar_sources; opt.inputs
+  // holds a synthesized "-" there, which would route the probe to whatever
+  // stdin happens to be (review M3-1: a warm redirected stdin must not
+  // steer the backend for a cold archive).
+  std::string path;
+  if (opt.tar_mode) {
+    if (opt.tar_sources.empty()) return -1.0;
+    path = opt.tar_sources[0];
+  } else if (!opt.inputs.empty() && opt.inputs[0] != "-") {
+    path = opt.inputs[0];
+  }
+  return adapt_path_residency(path);
+}
+
+// Residency class across ALL inputs — not just the one the warm-input rule
+// probes.  Returns -1 when unknown OR when the inputs DISAGREE.
+//
+// One process handles every input and persists ONE rate, so a run mixing a warm
+// file with cold ones belongs in neither bucket: filing it under the first
+// file's class teaches the warm bucket a rate dominated by cold disk reads,
+// which is exactly the poisoning g_adapt_tar_wclass_mixed already prevents for
+// archive shapes.  Mixed runs fall back to the flat pair.
+static int adapt_inputs_resid_class(const Options & opt, double first)
+{
+  if (first < 0.0) return -1;
+  const int c0 = (first >= 0.95) ? 1 : 0;
+  const std::vector<std::string> & srcs =
+      opt.tar_mode ? opt.tar_sources : opt.inputs;
+  for (size_t i = 1; i < srcs.size(); ++i) {
+    if (srcs[i] == "-") return -1;              // unknowable: don't guess
+    const double r = adapt_path_residency(srcs[i]);
+    if (r < 0.0) return -1;
+    if (((r >= 0.95) ? 1 : 0) != c0) return -1; // mixed
+  }
+  return c0;
 }
 
 // True when the run's output lands in a regular file (or nowhere: TEST) —
@@ -22490,6 +22582,29 @@ static void apply_backend_defaults(Options & opt)
 #endif   // !_WIN32 — backend-agnostic priors end here
 
 #ifdef HAVE_NVCOMP
+  // Probe input residency ONCE, here.  Two consumers: it KEYS the backend prior's
+  // rate pair, and the warm-input rule far below reuses this value instead of
+  // sweeping mincore a second time.  Decompress only (compress returns before
+  // that rule), regular-file output only, and it never faults pages in.
+  //
+  // Deliberately ABOVE the backend_user_set return.  The probe is needed for
+  // RECORDING, not just for deciding: a run with an explicit --hybrid/--cpu-only
+  // still produces a measurement that belongs in a bucket, and if those runs were
+  // filed flat-only, a user who always names a backend could never fill both
+  // sides of a bucket and the pair would never become comparable.
+  double resid_probe = -1.0;
+  int resid_cls = -1;
+#ifndef _WIN32
+  if (opt.mode != Mode::COMPRESS && !opt.list_mode && adapt_output_is_regular(opt)) {
+    resid_probe = adapt_input_residency(opt);
+    // resid_probe (input[0]) still drives the warm-input RULE, unchanged.  The
+    // recorded CLASS additionally requires every input to agree — see
+    // adapt_inputs_resid_class.
+    resid_cls = adapt_inputs_resid_class(opt, resid_probe);
+  }
+#endif
+  g_adapt_resid_class.store(resid_cls, std::memory_order_relaxed);
+
   if (opt.backend_user_set) return;
 
 #ifndef _WIN32
@@ -22596,8 +22711,34 @@ static void apply_backend_defaults(Options & opt)
   // untried alternative once, then let the better measurement win with a margin
   // against flapping.  Apples to apples, and it prices cuInit and coordination
   // overhead by construction rather than modelling them.
+  //
+  // v0.15.35: the pair is additionally KEYED BY INPUT RESIDENCY for decompress.
+  // A single per-machine EMA blends warm runs (compute-bound, cpu-only wins) with
+  // cold ones (disk-bound, hybrid holds) and is then wrong for both on a box that
+  // mixes them -- the third instance of the defect the read-path and
+  // workload-class priors already fixed by keying.  It also settles the conflict
+  // with the warm-input rule below, which a decided prior used to skip entirely:
+  // residency now SORTS the runs and the end-to-end measurement still DECIDES
+  // within a bucket, so neither rule has to lose.
+  //
   if (priors.loaded) {
-    const double oc = prior_dir.overall_cpu, oh = prior_dir.overall_hybrid;
+    double oc = prior_dir.overall_cpu, oh = prior_dir.overall_hybrid;
+    double oc_run = prior_dir.overall_cpu_run, oh_run = prior_dir.overall_hybrid_run;
+    // Prefer the bucket matching THIS input's residency.  Once a bucket holds any
+    // measurement it is used exclusively — a missing side reads as untried and
+    // gets explored, which fills the pair honestly instead of comparing a warm
+    // number against a cold one.  An empty bucket falls back to the flat pair, so
+    // behaviour matches today's until the buckets fill (same fallback contract as
+    // tar_write_threads_<class>).
+    const char * key_note = "";
+    if (resid_cls >= 0 && (prior_dir.overall_cpu_cls[resid_cls] > 0
+                        || prior_dir.overall_hybrid_cls[resid_cls] > 0)) {
+      oc     = prior_dir.overall_cpu_cls[resid_cls];
+      oh     = prior_dir.overall_hybrid_cls[resid_cls];
+      oc_run = prior_dir.overall_cpu_cls_run[resid_cls];
+      oh_run = prior_dir.overall_hybrid_cls_run[resid_cls];
+      key_note = adapt_resid_class_name(resid_cls);
+    }
     // Would an exploratory run last long enough to be recorded?  Unknown size
     // (stdin, a tar-create tree) or no rate estimate yet -> allow it; the run
     // may well be long, and refusing to explore is the worse failure.
@@ -22605,8 +22746,42 @@ static void apply_backend_defaults(Options & opt)
         !all_known || prior_dir.overall_gibs <= 0
         || double(known) / (prior_dir.overall_gibs * 1073741824.0)
              >= double(adapt_save_min_ns()) / 1e9;
+    // Would the static rules below land on cpu-only if the prior stayed silent?
+    // Decompress does when the fabric is Gen<4 (D2H cost dwarfs the benefit) or
+    // the input is warm (compute-bound); compress always defaults to hybrid.
+    // Needed so the hybrid exploration below fires exactly where "letting the
+    // static rules run" would NOT constitute an exploration.
+    const bool static_picks_cpu =
+        opt.mode != Mode::COMPRESS
+        && ((gen > 0 && gen < 4) || resid_probe >= 0.95);
+    // An untried side is worth exploring only if it has not just BEEN tried: a
+    // probe that fails to measure what it explored (a hybrid run whose GPU
+    // declines to engage) stamps its _run key without a rate, and that stamp
+    // holds the next probe off for the recheck interval.  Without this the
+    // exploration repeats on every run — the same never-terminates shape the
+    // `explorable` guard closes for short runs.
+    auto untried_recently = [&](double try_run) {
+      return try_run <= 0.0
+          || prior_dir.runs - try_run >= ADAPT_BACKEND_RECHECK_RUNS;
+    };
     const char * why = nullptr;
-    bool choose_cpu = false, decided = false;
+    // `probing` = this run is a deliberate probe of a side we cannot currently
+    // compare, so the ATTEMPT must be stamped even if the run fails to measure
+    // that side.  An earlier version sniffed why[0]=='e' instead; that silently
+    // excluded "re-measuring the alternative" (an 'r'), leaving the recheck with
+    // no attempt stamp and therefore no way to terminate.  An explicit flag set
+    // at each decision site cannot drift out of sync with the message text.
+    //
+    // STATE TABLE — {oc measured} x {oh measured} x {static rule} -> next run:
+    //   both measured, neither stale      -> margin compare; stable
+    //   both measured, one side stale     -> probe the staler; it stamps -> holds
+    //                                        off RECHECK_RUNS; converges
+    //   only oh, static picks hybrid      -> probe cpu; stamps; converges
+    //   only oc, static picks hybrid      -> static rule IS the hybrid probe
+    //   only oc, static picks cpu         -> probe hybrid explicitly; stamps
+    //   neither measured                  -> static rules; first run records one
+    //   any of the above, run too short   -> no probe (explorable false); stable
+    bool choose_cpu = false, decided = false, probing = false;
     if (oc > 0 && oh > 0) {
       // RE-MEASURE THE LOSER PERIODICALLY.  Once both keys exist only the WINNER
       // ever runs again, so only the winner's EMA moves and the loser's number is
@@ -22617,18 +22792,24 @@ static void apply_backend_defaults(Options & opt)
       // loser again to correct it.  Re-measuring on a bounded cadence caps the
       // blast radius of any single bad sample at one run in RECHECK_RUNS, and
       // costs nothing on a box where the verdict is stable and correct.
-      const bool cpu_ahead   = oc > oh;
-      const double loser_run = cpu_ahead ? prior_dir.overall_hybrid_run
-                                         : prior_dir.overall_cpu_run;
-      if (explorable && prior_dir.runs - loser_run >= ADAPT_BACKEND_RECHECK_RUNS) {
-        choose_cpu = !cpu_ahead; decided = true; why = "re-measuring the alternative";
+      // Trigger on the STALER OF THE TWO, not on the loser.  Keying on the loser
+      // alone left the winner unfixable in a reachable state: when hybrid is the
+      // winner and its lazy guard declines the GPU, every run is filed as cpu, so
+      // the cpu stamp advances forever, `runs - loser_run` stays 0, the recheck
+      // can never fire — and the hybrid number driving the decision is frozen with
+      // nothing able to re-measure it.  That is precisely the latch this recheck
+      // was added to break, so it must watch both sides.
+      const double stale_run = std::min(oc_run, oh_run);
+      if (explorable && prior_dir.runs - stale_run >= ADAPT_BACKEND_RECHECK_RUNS) {
+        choose_cpu = (oc_run <= oh_run);   // re-measure whichever is staler
+        decided = true; probing = true; why = "re-measuring the alternative";
       }
       // Both measured.  5% margin so a tie does not flip the default every run
       // (the read-path prior's anti-flap margin, same reasoning).
       else if (oc > oh * 1.05) { choose_cpu = true;  decided = true; why = "measured"; }
       else if (oh > oc * 1.05) { choose_cpu = false; decided = true; why = "measured"; }
       // Within the margin: fall through to the static rules, no verdict to add.
-    } else if (oh > 0 && oc <= 0 && explorable) {
+    } else if (oh > 0 && oc <= 0 && explorable && untried_recently(oc_run)) {
       // Hybrid measured, cpu-only never tried -> explore it once, so the pair
       // can be compared next run.  One slow run at worst, and self-correcting.
       //
@@ -22636,14 +22817,28 @@ static void apply_backend_defaults(Options & opt)
       // reason its comment gives: a run predicted to finish under the save floor
       // records nothing, so cpu-only would read as untried FOREVER and every
       // single run would pay the exploration with no path to convergence.
-      choose_cpu = true; decided = true; why = "exploring cpu-only";
+      choose_cpu = true; decided = true; probing = true; why = "exploring cpu-only";
+    } else if (oc > 0 && oh <= 0 && explorable && static_picks_cpu
+               && untried_recently(oh_run)) {
+      // The mirror case, and it needs an EXPLICIT probe wherever the static rules
+      // would also land on cpu-only.  The original reasoning here was "hybrid
+      // untried -> the static rules below already favour hybrid, so letting them
+      // run IS the exploration" — true for a Gen4+ COLD decompress, false in two
+      // places: a WARM input (the residency rule picks cpu-only) and any Gen<4 box
+      // (that rule picks cpu-only too).  In both, hybrid was never measured, the
+      // pair never completed, and the prior could never decide anything — the same
+      // never-terminates shape as the cpu-only exploration above.  Keying by
+      // residency made it reachable on every box, not just Gen<4 ones.
+      choose_cpu = false; decided = true; probing = true; why = "exploring hybrid";
     }
-    // oc > 0 && oh <= 0 -> hybrid untried; the static rules below already favour
-    // hybrid, so letting them run IS the exploration.  Nothing measured at all
-    // -> nothing to say.
+    // Nothing measured at all -> nothing to say.
     if (decided) {
       if (choose_cpu) { opt.cpu_only = true;  opt.hybrid = false; }
       else            { opt.hybrid   = true;  opt.cpu_only = false; }
+      // Tell the save path this run is a probe, so a probe that fails to measure
+      // its own backend still records the attempt (see g_adapt_explored).
+      if (probing)
+        g_adapt_explored.store(choose_cpu ? 1 : 2, std::memory_order_relaxed);
       if (choose_cpu && opt.cpu_queue_min > 0) {   // mirror the Gen<4 silencing
         if (opt.verbosity >= V_ERROR)
           std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
@@ -22651,18 +22846,31 @@ static void apply_backend_defaults(Options & opt)
         opt.cpu_queue_min = 0;
       }
       if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
-        char line[288];
+        char line[352];
+        // Name the bucket when one was used.  A decided prior returns before the
+        // warm-input notice below, so without this the user loses the only
+        // explanation of why a resident input went cpu-only.
+        char kb[48] = {0};
+        if (key_note[0])
+          std::snprintf(kb, sizeof(kb), ", %s input %d%% resident",
+                        key_note, (int)(resid_probe * 100.0));
         if (oc > 0 && oh > 0)
           std::snprintf(line, sizeof(line),
-            "gzstd: profile prior (%s: cpu-only %.2f vs hybrid %.2f GiB/s end-to-end): "
+            "gzstd: profile prior (%s%s: cpu-only %.2f vs hybrid %.2f GiB/s end-to-end): "
             "defaulting %s to %s (override with --hybrid/--cpu-only/--gpu-only)\n",
-            why, oc, oh, opt.mode == Mode::COMPRESS ? "compress" : "decompress",
+            why, kb, oc, oh, opt.mode == Mode::COMPRESS ? "compress" : "decompress",
             choose_cpu ? "--cpu-only" : "--hybrid");
         else
+          // One side untried: report the side that WAS measured and the backend
+          // actually selected.  (This branch used to hardcode "--cpu-only" and the
+          // hybrid figure, which read as nonsense — "hybrid measured 0.00 ...
+          // defaulting to --cpu-only" — once a hybrid exploration could reach it.)
           std::snprintf(line, sizeof(line),
-            "gzstd: profile prior (%s; hybrid measured %.2f GiB/s end-to-end): "
-            "defaulting %s to --cpu-only (override with --hybrid/--cpu-only)\n",
-            why, oh, opt.mode == Mode::COMPRESS ? "compress" : "decompress");
+            "gzstd: profile prior (%s%s; %s measured %.2f GiB/s end-to-end): "
+            "defaulting %s to %s (override with --hybrid/--cpu-only)\n",
+            why, kb, oc > 0 ? "cpu-only" : "hybrid", oc > 0 ? oc : oh,
+            opt.mode == Mode::COMPRESS ? "compress" : "decompress",
+            choose_cpu ? "--cpu-only" : "--hybrid");
         std::fprintf(stderr, "%s", line);
       }
       return;
@@ -22703,11 +22911,9 @@ static void apply_backend_defaults(Options & opt)
     // hybrid; the probe costs microseconds and never faults pages in.
     // Regular-file output only (a warm input piped to a slow consumer is
     // sink-bound, not compute-bound); pipes/unknown keep today's default.
-    double resid = -1.0;
-#ifndef _WIN32
-    if (!opt.list_mode && adapt_output_is_regular(opt))
-      resid = adapt_input_residency(opt);
-#endif
+    // Probed once above (it also keys the backend prior); same value, no second
+    // mincore sweep.
+    const double resid = resid_probe;
     if (resid >= 0.95) {
       opt.cpu_only = true;
       if (opt.cpu_queue_min > 0) {   // mirror the Gen<4 silencing

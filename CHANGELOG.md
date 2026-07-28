@@ -1,11 +1,51 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.35  
+**Covers:** v0.9.50 → v0.15.36  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.36 — the backend prior is keyed by input residency, and the state machine that keying broke
+
+The six-angle review left exactly one finding unfixed: a decided backend prior `return`s before the warm-input residency rule, so `--adapt` with a populated profile disabled the v0.15.2 warm/cold distinction. Choosing which rule wins looked like a policy call — but that was the wrong question, because the two rules answer different ones.
+
+
+The review left one finding deliberately unfixed: a decided backend prior `return`s before the warm-input residency rule, so `--adapt` with a populated profile disabled the v0.15.2 warm/cold distinction entirely. Choosing which rule wins looked like a policy call needing measurement — but framed that way it was the wrong question, because the two rules answer different ones. The residency probe measures **this input** (≥95% page-cache resident → compute-bound → cpu-only; cold → disk-bound → hybrid). The prior measures **end-to-end outcome per backend, averaged over every run on the machine**.
+
+So neither has to lose: **residency now SORTS the runs and the end-to-end measurement still DECIDES within a bucket.** The rate pair is recorded under `overall_gibs_{cpu,hybrid}_{warm,cold}` alongside the flat keys, and the prior prefers the bucket matching the current input.
+
+This is the third time this codebase has hit the same defect and the third time keying has been the answer — after the read-path prior (keyed by path) and the v0.15.28 writer prior (keyed by archive shape, motivated by exactly this: one prior per machine was workload-blind, so alternating shapes kept re-teaching one number). A single blended EMA is not merely imprecise here, it is wrong for *both* regimes on any box that mixes them. Measured on the development box with a 1.4 GiB archive, the same file decompressed warm and cold: **2.28 GiB/s warm, 1.55 cold — and the flat key sat at 1.91, a number that describes neither.**
+
+Details that matter:
+
+- **Decompress only.** Compress returns before the residency rule, so its keys are untouched.
+- **No new constant** — the existing 0.95 residency threshold is the bucket boundary.
+- **Empty bucket falls back to the flat pair**, so a profile written by an older build decides exactly as it does today until the buckets fill (the same fallback contract as `tar_write_threads_<class>`). Verified against a flat-only profile.
+- **Once a bucket holds any measurement it is used exclusively.** A missing side reads as untried and gets explored, which fills the pair honestly rather than comparing a warm number against a cold one.
+- **The probe runs above the `backend_user_set` return**, because it is needed for *recording*, not only for deciding: a run with an explicit `--hybrid` still produces a measurement that belongs in a bucket, and filing those flat-only would mean a user who always names a backend could never fill both sides. (This was a real gap in the first cut of the change, caught by watching a `--hybrid` run fail to update its bucket.)
+- **The probe happens once** and the warm-input rule reuses the value instead of sweeping mincore a second time.
+- **The prior's message now names the bucket** — `profile prior (measured, warm input 100% resident: cpu-only 8.00 vs hybrid 2.00 GiB/s end-to-end)`. A deciding prior returns before the residency notice, so without this the user loses the only explanation of why a resident input went cpu-only.
+
+Verified end to end on one machine and one file: with the warm bucket favouring cpu-only and the cold bucket favouring hybrid, the identical command chooses opposite backends purely on the residency of its input. What is *not* yet measured is whether the split changes real throughput on the Gen<4 workstation — its Gen<4 branch takes cpu-only before residency is ever consulted, so the keyed prior may be a fast-fabric-only win. Worth confirming there before treating it as settled.
+
+
+### Four more defects, in the keying itself
+
+Keying a state machine changed which states are reachable, and four assumptions that had been true stopped being true. Three were found by review of the new code, one by hand before it.
+
+**The hybrid side of a bucket was never explored.** The inherited reasoning — "hybrid untried, so letting the static rules run IS the exploration" — holds only where the static rule picks hybrid. Inside a warm bucket it picks cpu-only, so the pair never completed and the prior could never decide anything. The same was already true on any Gen<4 box, making this a latent v0.15.33 bug the earlier angle missed by trusting the comment.
+
+**The first fix for that explored on every run, forever.** A hybrid probe whose lazy GPU-engagement guard declines is recorded as a CPU measurement, so the hybrid side stayed untried and the probe repeated indefinitely. Fixed by stamping the *attempt* — the `_run` key with no rate — which holds the next probe off for the recheck interval.
+
+**The recheck branch never terminated, because it never stamped.** The stamp was gated on a string sniff (`why[0] == 'e'`, for "exploring…"), which silently excluded `"re-measuring the alternative"` — an `'r'`. Two reachable states re-fired forever: workloads that record no backend rate by design (`-t`, `-d --tar`), and any run in the band where the save floor and the GPU-decline guard overlap. Each such run was forced onto the measured-slower backend. Control flow no longer depends on message text; an explicit flag is set at each decision site.
+
+**The recheck was blind to a frozen winner.** It keyed on the loser's staleness alone. When hybrid wins but its guard declines the GPU, every run files as cpu, so the cpu stamp advances forever while the hybrid number driving the decision is frozen with nothing able to re-measure it — precisely the latch the recheck exists to break. It now triggers on the staler of the two sides.
+
+**Multi-file runs were filed under the first file's residency.** `gzstd -d warm.zst cold1.zst cold2.zst` is one process with one recorded rate, dominated by cold reads, taught to the *warm* bucket. This is the poisoning `g_adapt_tar_wclass_mixed` already prevents for archive shapes; the residency key had no equivalent. Every input is now probed and a disagreement falls back to the flat pair.
+
+The full state table — `{cpu measured} × {hybrid measured} × {stamped-but-unmeasured} × {what the static rules would do}`, with the next-run outcome for each cell — is now a comment in the code. Every defect in this mechanism has been a missing row, so the table is the artifact worth maintaining, not the prose.
 
 ## v0.15.35 — reviewing the data-writing paths: a resize that could race the live writer, and priors that were never read
 
