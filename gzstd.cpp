@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.34";
+static constexpr const char * GZSTD_VERSION = "0.15.35";
 //
 // Architecture overview:
 //
@@ -393,6 +393,13 @@ struct Options {
   size_t mem_limit_mib = 0;
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
+  // The batch cap as parse_args resolved it, snapshotted before --adapt seeds
+  // gpu_batch_cap with the profile's settled value.  ONLY the "too small to pay
+  // for a GPU" size gate uses this: that gate asks whether the input can fill a
+  // batch, and an --adapt-inflated ceiling (up to HARD_BATCH_CAP) would raise the
+  // bar to gigabytes and silently route large inputs to the CPU.  0 = not yet
+  // snapshotted (gate falls back to gpu_batch_cap).
+  size_t gpu_batch_cap_gate = 0;
   bool gpu_batch_user_set = false;
   double gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   size_t gpu_streams = 0;            // 0=auto (1 for compress, 2 for test/verify)
@@ -1732,6 +1739,12 @@ static void print_version()
 // consumed so "--gpu-streams=12abc" is rejected rather than silently truncated.
 static uint64_t parse_u64_value(const std::string & pref, const std::string & v)
 {
+  // std::stoull is DEFINED to negate and wrap for a leading '-', with the whole
+  // string consumed and no exception — so "-1" would sail through every check
+  // below and arrive as 18446744073709551615.  Reject the sign explicitly; every
+  // caller here is a count or a size where negative is meaningless.
+  if (!v.empty() && v[0] == '-')
+    die_usage("value must not be negative for " + pref + ": " + v);
   try {
     size_t pos = 0;
     unsigned long long n = std::stoull(v, &pos);
@@ -2112,7 +2125,31 @@ static std::condition_variable g_adapt_ewgrow_cv;
 // which is the pre-existing no-profile behaviour.
 static constexpr int ADAPT_TAR_WCLASSES = 3;
 static std::atomic<int> g_adapt_ewgrow_prior_class[ADAPT_TAR_WCLASSES];  // 0 = none
+// How many recorded runs the backend prior lets pass before it re-measures the
+// side it is NOT choosing.  A policy constant like the 5% anti-flap margin, not a
+// tuned or machine-specific one: it trades one exploratory run per N against the
+// risk of a stale comparison latching forever.  See the prior for the failure it
+// bounds.
+static constexpr double ADAPT_BACKEND_RECHECK_RUNS = 20;
+
+// Did a GPU actually do work this run?  adapt_backend_used() files the run's
+// end-to-end rate under overall_gibs_cpu or _hybrid, and several paths decide at
+// RUNTIME not to use the GPU without ever clearing opt.hybrid: the --tar size
+// recheck hands a cpu_only COPY to compress_cpu_mt, "no devices found" falls back
+// in place, and the lazy-engagement guard declines before the first CUDA call.
+// Each of those measures the CPU while still calling itself hybrid, which drags
+// overall_gibs_hybrid toward the cpu-only rate — corrupting the one comparison
+// the v0.15.33 backend prior is built on.  Set where GPU workers are spawned.
+static std::atomic<bool> g_adapt_gpu_engaged{false};
 static std::atomic<int> g_adapt_tar_wclass{-1};        // class of this extract (-1 = unknown)
+// Set when one operation extracts archives of DIFFERENT workload classes.  The
+// settled pool size is a single per-operation number and the governor's sizing
+// geometry latches on the first archive, so in a mixed run that number belongs to
+// whichever archive was probed — filing it under the class of the LAST archive to
+// publish would write, say, the small-file answer into the large-file bucket and
+// poison the seed for every later run of that shape.  Mixed runs keep the flat
+// key (documented as "most recent, whatever the shape") and skip the class key.
+static std::atomic<bool> g_adapt_tar_wclass_mixed{false};
 
 // Mean bytes per entry is the physically meaningful ratio here: it IS the
 // bytes-of-work per open/close, which is exactly the metadata-versus-bandwidth
@@ -2261,6 +2298,8 @@ public:
     g_adapt_writer_probe_engaged.store(false, std::memory_order_relaxed);
     g_adapt_ewgrow_target.store(0, std::memory_order_relaxed);
     g_adapt_ewgrow_settled.store(0, std::memory_order_relaxed);
+    g_adapt_tar_wclass.store(-1, std::memory_order_relaxed);
+    g_adapt_tar_wclass_mixed.store(false, std::memory_order_relaxed);
     g_adapt_ewgrow_converged.store(0, std::memory_order_relaxed);
     g_adapt_ewgrow_engaged.store(false, std::memory_order_relaxed);
     for (int i = 0; i < ADAPT_DL_MAX; ++i) {
@@ -3306,7 +3345,9 @@ struct AdaptObs {
       writer_par = wp;
     if (int ws = g_adapt_ewgrow_settled.load(std::memory_order_relaxed)) {
       tar_write_threads = ws;
-      tar_wclass = g_adapt_tar_wclass.load(std::memory_order_relaxed);
+      tar_wclass = g_adapt_tar_wclass_mixed.load(std::memory_order_relaxed)
+                     ? -1   // mixed-shape run: flat key only, no class bucket
+                     : g_adapt_tar_wclass.load(std::memory_order_relaxed);
     }
     if (g_adapt_ewgrow_converged.load(std::memory_order_relaxed))
       tar_wt_converged = true;
@@ -3342,10 +3383,16 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     // see the note there for why the per-engine cpu_gibs/gpu_gibs pair cannot
     // answer the question.  Same value, keyed by what produced it, exactly as
     // tar_write_threads is keyed by workload class.
-    if (obs.backend_used == 1)
+    // The companion _run key stamps WHEN each side was last measured, so the
+    // prior can tell a fresh comparison from one where the loser's number has
+    // been frozen for hundreds of runs (see ADAPT_BACKEND_RECHECK_RUNS).
+    if (obs.backend_used == 1) {
       dir.put_num("overall_gibs_cpu", ema(dir.gnum("overall_gibs_cpu", 0), rate));
-    else if (obs.backend_used == 2)
+      dir.put_num("overall_gibs_cpu_run", dir.gnum("runs", 0));
+    } else if (obs.backend_used == 2) {
       dir.put_num("overall_gibs_hybrid", ema(dir.gnum("overall_gibs_hybrid", 0), rate));
+      dir.put_num("overall_gibs_hybrid_run", dir.gnum("runs", 0));
+    }
   }
   if (obs.reader_io_ns > 0)
     dir.put_num("source_gibs", ema(dir.gnum("source_gibs", 0),
@@ -3407,6 +3454,7 @@ struct AdaptPriors {
     double cpu_gibs = 0, gpu_gibs = 0, source_gibs = 0, sink_gibs = 0;
     double overall_gibs = 0, settled_batch = 0, runs = 0;
     double overall_cpu = 0, overall_hybrid = 0;             // end-to-end, per backend
+    double overall_cpu_run = 0, overall_hybrid_run = 0;     // run index each was last measured at
     double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates
     double writer_par = 0;                                  // probe verdict
     double tar_write_threads = 0;                           // -d --tar settled pool size (flat fallback)
@@ -3441,6 +3489,8 @@ static AdaptPriors adapt_load_priors()
     D.overall_gibs  = dj->gnum("overall_gibs", 0);
     D.overall_cpu    = dj->gnum("overall_gibs_cpu", 0);
     D.overall_hybrid = dj->gnum("overall_gibs_hybrid", 0);
+    D.overall_cpu_run    = dj->gnum("overall_gibs_cpu_run", 0);
+    D.overall_hybrid_run = dj->gnum("overall_gibs_hybrid_run", 0);
     D.runs          = dj->gnum("runs", 0);
     D.regime        = dj->gstr("regime", "");
     D.path_mmap     = dj->gnum("path_mmap_gibs", 0);
@@ -3464,7 +3514,14 @@ static int adapt_backend_used(const Options & opt)
 {
   if (opt.gpu_only) return 0;
   if (opt.cpu_only) return 1;
-  if (opt.hybrid)   return 2;
+  if (opt.hybrid) {
+    // "What really ran" has to include the runtime downgrades, not just the
+    // post-defaults flags: a hybrid run whose GPU never engaged measured the CPU,
+    // and filing it as hybrid is what poisons the comparison (see
+    // g_adapt_gpu_engaged).  The startup size gate DOES mutate opt, so it is
+    // already handled; these are the paths that cannot.
+    return g_adapt_gpu_engaged.load(std::memory_order_relaxed) ? 2 : 1;
+  }
   return 0;
 }
 
@@ -3700,8 +3757,21 @@ static uint64_t gpu_min_useful_bytes(const Options & opt)
     const unsigned long long v = std::strtoull(e, &end, 10);
     if (end != e) return (uint64_t)v;
   }
-  return (uint64_t)std::max<size_t>(1, opt.chunk_mib) * 1024 * 1024
-       * (uint64_t)std::max<size_t>(1, opt.gpu_batch_cap);
+  // Clamp the chunk to the GPU's real per-subchunk ceiling: compress_nvcomp
+  // hard-clamps chosen_mib to GPU_SUBCHUNK_MAX (a larger host chunk would
+  // overflow the device input slot), so --chunk-size=256 does NOT give the GPU
+  // 256 MiB frames — it still gets 16.  Sizing the gate off the unclamped
+  // request made the bound 16x the geometry the run would actually use, and
+  // routed inputs the GPU could easily have filled to the CPU instead.
+  const uint64_t gate_mib =
+      std::min<uint64_t>(std::max<size_t>(1, opt.chunk_mib),
+                         GPU_SUBCHUNK_MAX / ONE_MIB);
+  // The pre-adapt cap (see Options::gpu_batch_cap_gate): the question is whether
+  // the input can fill a batch of the geometry parse_args derived, not one the
+  // profile's settled ceiling inflated.
+  const size_t gate_batch =
+      opt.gpu_batch_cap_gate ? opt.gpu_batch_cap_gate : opt.gpu_batch_cap;
+  return gate_mib * 1024 * 1024 * (uint64_t)std::max<size_t>(1, gate_batch);
 }
 
 // How long GPU bringup takes, near enough.  Same guard the -d --tar decode pool
@@ -11533,11 +11603,18 @@ struct StreamReader {
     return true;
   }
   // Zero-copy read: hand out n bytes as views into the current frame(s).
-  // Sink mode appends one DataSeg per frame touched (shared_ptr copy, no byte
-  // copy).  fd mode has no owning frames, so it falls back to one copied,
-  // owned segment — same downstream interface either way.
+  // Sink AND producer mode append one DataSeg per frame touched (shared_ptr
+  // copy, no byte copy).  Only fd mode has no owning frames, so it falls back to
+  // one copied, owned segment — same downstream interface either way.
+  //
+  // The `!prod` half was missing: this test was written in v0.14.72, before
+  // producer mode existed (v0.14.86), and was never taught about it.  Every
+  // read_segs call from run_parallel therefore took the COPY branch — i.e. the
+  // parallel extract path memcpy'd every file byte, which is precisely the cost
+  // v0.14.72 was written to remove.  It went unnoticed because the copy is now
+  // spread across N partitions instead of one serial thread.
   bool read_segs(uint64_t n, std::vector<DataSeg> & out) {
-    if (!src) {                                  // fd mode: copy into an owned buffer
+    if (!src && !prod) {                         // fd mode: copy into an owned buffer
       if (!n) return true;
       auto own = std::make_shared<FrameVec>(n);
       if (!read_exact(own->data(), n)) return false;
@@ -12500,6 +12577,15 @@ public:
         apply_mem_limit_to_dctx(in_dctx.get(), dopt);
         std::vector<char> in_comp;
         size_t next_dispatch = g.f0, next_consume = g.f0;
+        // Hoisted to worker scope so the post-parse drain below can reclaim
+        // frames this partition prefetched but never consumed.
+        auto take_pool = [&](size_t kk) -> FrameBuf {
+          std::unique_lock<std::mutex> lk(psync[pi].mx);
+          psync[pi].cv.wait(lk, [&] { return psync[pi].ready.count(kk) != 0; });
+          auto itr = psync[pi].ready.find(kk);
+          FrameBuf f = std::move(itr->second); psync[pi].ready.erase(itr);
+          return f;
+        };
         std::function<FrameBuf()> producer = [&]() -> FrameBuf {
           if (next_consume > g.f1) return nullptr;
           const size_t k = next_consume;
@@ -12516,13 +12602,6 @@ public:
               const bool cr = !(j == g.f0 && g.start > u_off[g.f0]);
               { std::lock_guard<std::mutex> lk(qmx); dq.push_back(DItem{ (int)pi, j, cr }); }
               qcv.notify_one();
-            };
-            auto take_pool = [&](size_t kk) -> FrameBuf {
-              std::unique_lock<std::mutex> lk(psync[pi].mx);
-              psync[pi].cv.wait(lk, [&] { return psync[pi].ready.count(kk) != 0; });
-              auto itr = psync[pi].ready.find(kk);
-              FrameBuf f = std::move(itr->second); psync[pi].ready.erase(itr);
-              return f;
             };
             if (k < next_dispatch) {                    // already committed to the pool
               fb = take_pool(k); budget.release();
@@ -12547,6 +12626,18 @@ public:
         StreamReader r(std::move(producer), u_off[g.f0], g.end);
         if (g.start > u_off[g.f0]) r.skip(g.start - u_off[g.f0]);   // align to the entry boundary
         parse(r, &pctx[pi]);
+        // Reclaim permits for frames dispatched but never consumed.  parse()
+        // does NOT always run to the end of the slice: tar-level corruption (bad
+        // header checksum, truncated long-name/pax record) calls fail_data() and
+        // returns mid-slice.  The prefetch above is deliberately greedy, so this
+        // partition can be holding a large share of the budget — up to all of it
+        // when no other partition happens to be blocked at that moment.  Leaking
+        // those permits leaves every other parse thread parked forever in
+        // budget.acquire(), so a corrupt archive HANGS instead of exiting 4.
+        // Guaranteed to terminate: readers and decoders are still running (they
+        // are only stopped after this join), so every dispatched frame lands in
+        // psync[pi].ready.  This also drains the reorder buffer before psync dies.
+        while (next_consume < next_dispatch) { take_pool(next_consume++); budget.release(); }
       });
     }
     for (auto & t : workers) t.join();
@@ -13064,7 +13155,13 @@ private:
     // so a run that never classifies (the streaming paths leave wclass_ at -1)
     // cannot inherit the class of a previous archive in a multi-archive run and
     // persist its settled size under the wrong key.
-    g_adapt_tar_wclass.store(wclass_, std::memory_order_relaxed);
+    // A second, DIFFERENT class in the same operation makes the settled size
+    // unattributable (see g_adapt_tar_wclass_mixed) — record that so the
+    // write-back keeps to the flat key.
+    const int prev_wclass =
+        g_adapt_tar_wclass.exchange(wclass_, std::memory_order_relaxed);
+    if (prev_wclass != -1 && prev_wclass != wclass_)
+      g_adapt_tar_wclass_mixed.store(true, std::memory_order_relaxed);
     const int cpu = resolve_cpu_threads(opt_.cpu_threads);
     const int auto_n = std::max(1, std::min(cpu, 16));
     int n, seed_extra = 0, prior = 0;
@@ -13133,6 +13230,9 @@ private:
       ewsup_ = std::thread([this] { ewriter_supervisor(); });
       // Seeded prior: bring the pool up to the profile's settled size right away
       // (same start point as before), but as extras the governor can retire.
+      // Only when there IS a seed — publishing a 0 here would clobber a target
+      // the governor had already raised (its regime hook can fire at t=0, before
+      // this pool exists), which is what stop_pool's reset is for instead.
       if (seed_extra > 0) adapt_set_ewgrow(seed_extra);
     }
   }
@@ -13142,6 +13242,16 @@ private:
       { std::lock_guard<std::mutex> lk(g_adapt_ewgrow_mtx); ewsup_stop_ = true; }
       g_adapt_ewgrow_cv.notify_all();
       ewsup_.join();
+      // Retire this archive's target with its pool.  The governor zeroes the
+      // target once per OPERATION, but extract_tar loops over every archive in
+      // tar_sources with a fresh pool and a fresh supervisor — and a fresh
+      // supervisor starts at active = 0, so its first wait predicate compares
+      // against whatever target the previous archive left behind and force-grows
+      // to that size before this archive's own class or prior can say otherwise.
+      // Worst case is the one the workload classes exist to prevent: a small-file
+      // archive's extras inherited by a huge-file archive whose own prior is 0.
+      { std::lock_guard<std::mutex> lk(g_adapt_ewgrow_mtx);
+        g_adapt_ewgrow_target.store(0, std::memory_order_relaxed); }
     }
     for (auto & t : writers_) t.join();
     for (auto & t : extra_writers_) t.join();   // retired + still-active extras
@@ -17196,7 +17306,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     pre_layout = tarx::build_layout(opt, m);
     pre_built = true;
     const uint64_t bound = gpu_min_useful_bytes(opt);
-    if (bound && pre_layout.total_size < bound && !opt.gpu_only) {
+    // !backend_user_set mirrors apply_backend_defaults: the size gate only ever
+    // moves a DEFAULT.  An explicit --hybrid (or --cpu-share/--gpu-batch/
+    // --gpu-streams, which imply one) must not be silently downgraded here.
+    if (bound && pre_layout.total_size < bound && !opt.backend_user_set) {
       if (opt.verbosity >= V_VERBOSE) {
         char b[192];
         std::snprintf(b, sizeof(b),
@@ -17568,7 +17681,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     per_dev.reset(new DevStats[(size_t)gpu_count]);
     json_sink = std::make_unique<StatsSink>(gpu_count);
     fatal_msgs.assign((size_t)gpu_count, std::string());
-    results.init_slots(gpu_count);   // per-GPU result slots (reduces lock contention)
+    // Per-GPU result slots (reduces lock contention).  init_slots resizes
+    // ResultStore::slots, which the writer iterates in drain_slots_locked under
+    // results.m — and since v0.15.31 this runs on the background bringup thread,
+    // seconds into a run whose CPU workers are already waking the writer.  Take
+    // the lock so the resize cannot race a concurrent drain (decompress_nvcomp
+    // has always done this; compress was left behind by the restructure).
+    {
+      std::lock_guard<std::mutex> lk(results.m);
+      results.init_slots(gpu_count);
+    }
     workers.reserve((size_t)gpu_count);
 
     if (opt.watchdog && opt.watchdog_secs > 0) {
@@ -17591,6 +17713,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                            &shared_tune,
                            &throttle, &gpu_failures, gpu_count);
     }
+    // The run genuinely engaged a GPU — see g_adapt_gpu_engaged for why the
+    // profile cannot infer this from opt.hybrid alone.
+    g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
       os << "[GPU] " << gpu_count << " device worker"
@@ -19204,20 +19329,35 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     bringup_cv.notify_all();
   };
 
+  // Fraction of the job COMPLETED: decompress increments read_bytes in the
+  // workers as they consume frames, not in the reader, so this measures work
+  // done rather than work enqueued.
+  auto decomp_progress = [&]() -> double {
+    if (!m || decomp_src_bytes == 0) return -1.0;
+    return double(m->read_bytes.load(std::memory_order_relaxed))
+         / double(decomp_src_bytes);
+  };
+
   auto gpu_bringup = [&]() {
     if (defer_detect) {
       // Is there still enough work left to outlast cuInit?  Asked BEFORE the
       // first CUDA call, so a "no" costs nothing — which is the whole point:
       // once cudaGetDeviceCount has run, the init is paid whether or not any
       // GPU worker is ever spawned, and this thread still has to be joined.
-      if (!gpu_bringup_worth_it(opt,
-                                [&] {
-                                  if (!m || decomp_src_bytes == 0) return -1.0;
-                                  return double(m->read_bytes.load(std::memory_order_relaxed))
-                                       / double(decomp_src_bytes);
-                                },
+      //
+      // The stop predicate is JOB-tied, not reader-tied — the same trap compress
+      // documents.  bringup_stop alone used to end the sample the moment the
+      // reader finished enqueuing, which on a high-ratio archive (the reader
+      // never blocks: the queue caps sit far above the frame count) happens in a
+      // fraction of a second with the workers a few percent in.  The sampler then
+      // read that as "the run ended" and skipped the GPU on exactly the archives
+      // GPU decompress exists for.  bringup_stop now means only a genuine abort.
+      if (!gpu_bringup_worth_it(opt, decomp_progress,
                                 bringup_mx, bringup_cv,
-                                [&] { return bringup_stop.load(std::memory_order_relaxed); })) {
+                                [&] {
+                                  return bringup_stop.load(std::memory_order_relaxed)
+                                      || decomp_progress() >= 0.98;
+                                })) {
         vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
                              "skipping GPU bringup\n");
         return;
@@ -19280,6 +19420,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
                                &shared_tune_decomp,
                                bp_ptr, &gpu_failures, gpu_count);
     }
+    // See g_adapt_gpu_engaged: the profile must record what ran, not what was asked.
+    g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
       os << "[GPU] " << (int)gpu_ids.size() << " device(s) online";
@@ -19396,7 +19538,12 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // we must wait for it before iterating that vector.  (If CPU drained the
   // file during cuInit, the bringup thread may have spawned no GPU workers
   // or spawned ones that immediately hit the done+empty queue and exit.)
-  stop_bringup_sample();
+  //
+  // Wake the sampler rather than STOPPING it: reaching here means the reader is
+  // done, not that the job is.  Its stop predicate is job-tied, so it re-checks
+  // and returns immediately if the workers really have finished; otherwise it
+  // finishes its (bounded, sub-second) window and answers honestly.
+  bringup_cv.notify_all();
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   for (auto & th : gpu_workers) th.join();
 
@@ -20973,7 +21120,13 @@ int main(int argc, char ** argv)
       // path_<p>_gibs keys the read-path prior compares (review v0.15.7).
       obs.src_path.clear();
       if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= adapt_save_min_ns()) {
-        obs.backend_used  = adapt_backend_used(opt);
+        // For the same reason src_path is cleared: this rate is not comparable
+        // with the one the backend prior compares.  A --tar extract is
+        // device-write-bound at the box's write ceiling and the backend barely
+        // moves it (the decode pool is inline-CPU by default), so filing it in
+        // overall_gibs_cpu/_hybrid would pull the pair toward the sink rate and
+        // decide plain -d's backend from a measurement of the disk.
+        obs.backend_used  = 0;
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
         obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
@@ -21004,7 +21157,10 @@ int main(int argc, char ** argv)
       // path_<p>_gibs keys the read-path prior compares (review v0.15.7).
       obs.src_path.clear();
       if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= adapt_save_min_ns()) {
-        obs.backend_used  = adapt_backend_used(opt);
+        // Not comparable with plain -d either: -t has no sink at all, so it is
+        // systematically the fastest of the four decompress shapes.  Same
+        // reasoning as the extract path above.
+        obs.backend_used  = 0;
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
         obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
@@ -21848,7 +22004,11 @@ int main(int argc, char ** argv)
   // unless there is a fault to count.
   if (opt.adapt && !opt.no_profile && exit_code == EXIT_OK
       && (adapt_obs.wall_ns >= adapt_save_min_ns() || adapt_obs.fault)) {
-    adapt_obs.backend_used  = adapt_backend_used(opt);
+    // TEST mode writes nothing, so its rate is systematically faster than the
+    // -d it would be compared against; keep it out of the backend pair for the
+    // same reason --tar runs are (it still contributes runs/regime/read-path).
+    adapt_obs.backend_used  =
+        opt.mode == Mode::TEST ? 0 : adapt_backend_used(opt);
     adapt_obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
@@ -22069,6 +22229,38 @@ static bool adapt_output_is_regular(const Options & opt)
 static void apply_backend_defaults(Options & opt)
 {
 #ifdef HAVE_NVCOMP
+  // Freeze the batch geometry the size gate reasons about BEFORE --adapt seeds
+  // gpu_batch_cap from the profile (see Options::gpu_batch_cap_gate).
+  opt.gpu_batch_cap_gate = opt.gpu_batch_cap;
+#endif
+#ifndef _WIN32
+  // --adapt: load this machine's measured priors once.  They refine the
+  // static rules below (verify engine, GPU batch start, scheduler EMA
+  // seeds, initial backend) — always under the same user-flag guards.
+  //
+  // Loaded OUTSIDE HAVE_NVCOMP on purpose: most of what the profile carries
+  // (read path, writer probe, extract writer-pool size) has nothing to do with
+  // whether this binary has a GPU backend.  While this sat inside the GPU
+  // guard, a USE_NVCOMP=OFF build wrote a profile every run and never read one
+  // back — every --adapt prior in the program was dead in that configuration.
+  AdaptPriors priors;
+  if (opt.adapt && !opt.no_profile) {
+    if (opt.verbosity >= V_DEBUG) {   // -vv: lets users (and the suite) see the profile key
+      const AdaptFp & fp = adapt_fingerprint();
+      vlog(V_DEBUG, opt, "[ADAPT] fingerprint " + fp.hash + " driver "
+           + (fp.driver.empty() ? "(none)" : fp.driver) + " (" + fp.human + ")\n");
+    }
+    priors = adapt_load_priors();
+    if (priors.loaded && opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, std::string("[ADAPT] profile priors loaded")
+           + (priors.gpu_valid ? "" : " (driver changed: GPU rates/batch invalidated)")
+           + "\n");
+  }
+  const AdaptPriors::Dir & prior_dir =
+      priors.dir[opt.mode == Mode::COMPRESS ? 0 : 1];
+#endif
+
+#ifdef HAVE_NVCOMP
   // Promote tuning flags to implicit --hybrid: if the user passed any
   // GPU- or hybrid-only knob (--gpu-batch, --cpu-share, --hybrid-floor, etc.)
   // but no explicit backend flag, treat it as if they had asked for --hybrid.
@@ -22087,27 +22279,6 @@ static void apply_backend_defaults(Options & opt)
   // PCIe-gen probe — drives the --direct default (compress + decompress) and
   // the decompress backend default further down.
   int gen = detect_min_pcie_gen();
-
-#ifndef _WIN32
-  // --adapt: load this machine's measured priors once.  They refine the
-  // static rules below (verify engine, GPU batch start, scheduler EMA
-  // seeds, initial backend) — always under the same user-flag guards.
-  AdaptPriors priors;
-  if (opt.adapt && !opt.no_profile) {
-    if (opt.verbosity >= V_DEBUG) {   // -vv: lets users (and the suite) see the profile key
-      const AdaptFp & fp = adapt_fingerprint();
-      vlog(V_DEBUG, opt, "[ADAPT] fingerprint " + fp.hash + " driver "
-           + (fp.driver.empty() ? "(none)" : fp.driver) + " (" + fp.human + ")\n");
-    }
-    priors = adapt_load_priors();
-    if (priors.loaded && opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, std::string("[ADAPT] profile priors loaded")
-           + (priors.gpu_valid ? "" : " (driver changed: GPU rates/batch invalidated)")
-           + "\n");
-  }
-  const AdaptPriors::Dir & prior_dir =
-      priors.dir[opt.mode == Mode::COMPRESS ? 0 : 1];
-#endif
 
   // Resolve the --verify engine (compress only).  GPU verify (decompress + raw
   // byte-compare in VRAM) applies ONLY to gpu-only mode, where every frame flows
@@ -22210,6 +22381,13 @@ static void apply_backend_defaults(Options & opt)
   }
   if (priors.loaded && prior_dir.cpu_gibs > 0)
     g_adapt_seed_cpu_gibs.store(prior_dir.cpu_gibs, std::memory_order_relaxed);
+#endif   // !_WIN32
+#endif   // HAVE_NVCOMP — GPU-specific priors end here
+
+#ifndef _WIN32
+  // Backend-AGNOSTIC --adapt priors.  Deliberately outside HAVE_NVCOMP: the read
+  // path, the writer probe and the extract writer pool are the same code in a
+  // CPU-only build, so gating them on the GPU backend only made them dead there.
 
   // --adapt read-path prior (M4 action 5, the next-run half): a machine
   // whose runs classify SOURCE_BOUND on read path P gets the alternative
@@ -22309,8 +22487,9 @@ static void apply_backend_defaults(Options & opt)
     // self-limiting (a step that does not pay reverts in ~0.5 s).  It stays in
     // the profile for diagnostics only.
   }
-#endif
+#endif   // !_WIN32 — backend-agnostic priors end here
 
+#ifdef HAVE_NVCOMP
   if (opt.backend_user_set) return;
 
 #ifndef _WIN32
@@ -22330,9 +22509,18 @@ static void apply_backend_defaults(Options & opt)
   // 128 MiB by default).  Below that the GPU cannot fill a single batch, so
   // there is no amount of GPU throughput that could repay its initialization —
   // and the bound moves correctly by construction if --gpu-batch or
-  // --chunk-size change it.  For decompress the figure is compared against the
-  // COMPRESSED size, which understates the work: that errs toward keeping the
-  // GPU, which is the safe direction.
+  // --chunk-size change it.
+  //
+  // For decompress the figure is compared against the COMPRESSED size while the
+  // bound is in UNCOMPRESSED bytes, so the comparison understates the work — and
+  // since the test is "known < one_batch -> cpu-only", understating pushes toward
+  // DROPPING the GPU, not keeping it.  (An earlier comment here claimed the
+  // opposite; it was simply wrong about the direction.)  The error grows with the
+  // compression ratio: a 200 MiB archive that expands to 6 GiB is 24 full batches
+  // of work but reads as under one.  Left as-is deliberately — correcting it means
+  // assuming a ratio, and this project does not put tuned constants in defaults;
+  // the honest fix is to use the frame count when it is already known.  Bounded:
+  // the worst case is an archive just under one batch compressed.
   //
   // Only for inputs whose size is known (regular files).  stdin, FIFOs and
   // --tar creation from a directory tree keep today's behaviour, since finding
@@ -22344,11 +22532,15 @@ static void apply_backend_defaults(Options & opt)
   // --tar reads its archive from tar_sources; opt.inputs holds a synthesized
   // "-" there (same selection adapt_input_residency makes, and for the same
   // reason: stdin is not the input being sized).
-  if (!opt.cpu_only) {
+  // Hoisted out of the gate below: the backend prior's explore-once branch needs
+  // the same size estimate to tell whether an exploratory run could ever be
+  // recorded (see there).
+  uint64_t known = 0;
+  bool all_known = false;
+  {
     const std::vector<std::string> & srcs =
         opt.tar_mode ? opt.tar_sources : opt.inputs;
-    uint64_t known = 0;
-    bool all_known = !srcs.empty();
+    all_known = !srcs.empty();
     for (const std::string & in : srcs) {
       struct stat st{};
       if (in == "-" || ::stat(in.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -22357,6 +22549,8 @@ static void apply_backend_defaults(Options & opt)
       }
       known += (uint64_t)st.st_size;
     }
+  }
+  if (!opt.cpu_only) {
     const uint64_t one_batch = gpu_min_useful_bytes(opt);
     if (one_batch && all_known && known < one_batch) {
       opt.cpu_only = true;
@@ -22404,17 +22598,44 @@ static void apply_backend_defaults(Options & opt)
   // overhead by construction rather than modelling them.
   if (priors.loaded) {
     const double oc = prior_dir.overall_cpu, oh = prior_dir.overall_hybrid;
+    // Would an exploratory run last long enough to be recorded?  Unknown size
+    // (stdin, a tar-create tree) or no rate estimate yet -> allow it; the run
+    // may well be long, and refusing to explore is the worse failure.
+    const bool explorable =
+        !all_known || prior_dir.overall_gibs <= 0
+        || double(known) / (prior_dir.overall_gibs * 1073741824.0)
+             >= double(adapt_save_min_ns()) / 1e9;
     const char * why = nullptr;
     bool choose_cpu = false, decided = false;
     if (oc > 0 && oh > 0) {
+      // RE-MEASURE THE LOSER PERIODICALLY.  Once both keys exist only the WINNER
+      // ever runs again, so only the winner's EMA moves and the loser's number is
+      // frozen at whatever it was.  The EMA weights the newest sample at 50%, so
+      // two unrepresentative winner runs (a -19 compress, a contended box — the
+      // level is not part of the key) can walk the winner below the loser's stale
+      // value and latch the WRONG backend permanently: nothing ever measures the
+      // loser again to correct it.  Re-measuring on a bounded cadence caps the
+      // blast radius of any single bad sample at one run in RECHECK_RUNS, and
+      // costs nothing on a box where the verdict is stable and correct.
+      const bool cpu_ahead   = oc > oh;
+      const double loser_run = cpu_ahead ? prior_dir.overall_hybrid_run
+                                         : prior_dir.overall_cpu_run;
+      if (explorable && prior_dir.runs - loser_run >= ADAPT_BACKEND_RECHECK_RUNS) {
+        choose_cpu = !cpu_ahead; decided = true; why = "re-measuring the alternative";
+      }
       // Both measured.  5% margin so a tie does not flip the default every run
       // (the read-path prior's anti-flap margin, same reasoning).
-      if      (oc > oh * 1.05) { choose_cpu = true;  decided = true; why = "measured"; }
+      else if (oc > oh * 1.05) { choose_cpu = true;  decided = true; why = "measured"; }
       else if (oh > oc * 1.05) { choose_cpu = false; decided = true; why = "measured"; }
       // Within the margin: fall through to the static rules, no verdict to add.
-    } else if (oh > 0 && oc <= 0) {
+    } else if (oh > 0 && oc <= 0 && explorable) {
       // Hybrid measured, cpu-only never tried -> explore it once, so the pair
       // can be compared next run.  One slow run at worst, and self-correcting.
+      //
+      // `explorable` is the same guard the read-path prior carries, and for the
+      // reason its comment gives: a run predicted to finish under the save floor
+      // records nothing, so cpu-only would read as untried FOREVER and every
+      // single run would pay the exploration with no path to convergence.
       choose_cpu = true; decided = true; why = "exploring cpu-only";
     }
     // oc > 0 && oh <= 0 -> hybrid untried; the static rules below already favour
@@ -22788,11 +23009,14 @@ static Options parse_args(int argc, char ** argv)
       std::string v = (a.size() > 16) ? a.substr(17)
                     : (i + 1 < argc ? std::string(argv[++i]) : std::string());
       if (v.empty()) die_usage("missing value for --verify-retries");
-      char * end = nullptr;
-      long n = std::strtol(v.c_str(), &end, 10);
-      if (*end != '\0' || n < 0) die_usage("--verify-retries must be a non-negative integer (0 = unlimited)");
+      // The only integer flag that used to hand-roll strtol: without an ERANGE
+      // check it clamped to LONG_MAX, and (int)LONG_MAX == -1 turned a request to
+      // BOUND the retries into "0 = unlimited" — the opposite of what was asked.
+      // parse_int_value range-checks and throws-safely like every other flag.
+      const int n = parse_int_value("--verify-retries", v);
+      if (n < 0) die_usage("--verify-retries must be a non-negative integer (0 = unlimited)");
       opt.verify = true;          // implied: you asked for a retry bound
-      opt.verify_retries = (int)n;
+      opt.verify_retries = n;
     }
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
     else if (a == "-v" || a == "--verbose") opt.verbosity = V_VERBOSE;
@@ -23172,6 +23396,18 @@ static Options parse_args(int argc, char ** argv)
               "--one-file-system/-P require --tar");
 
 #ifndef HAVE_NVCOMP
+  // The v0.15.34 hint policy was applied only to the options inside the GPU
+  // #ifdef block.  These are parsed OUTSIDE it, so they were consumed, validated
+  // and then ignored with no note at all: --cpu-share / --hybrid-floor /
+  // --hybrid-floor-factor / --watchdog reach only GPU-build code, --hybrid gets
+  // its note solely on the compress path (so -d/-t said nothing), and
+  // --verify-engine=gpu — a DEMAND for the GPU — was swallowed silently even
+  // though the GPU build warns when it cannot honour it.
+  if (opt.cpu_share >= 0.0
+      || opt.hybrid_floor_mode != Options::HybridFloorMode::AUTO
+      || opt.hybrid_floor_factor >= 0.0 || opt.watchdog
+      || opt.hybrid || opt.verify_engine == VERIFY_ENGINE_GPU)
+    cpu_build_ignored_gpu_flag = true;
   // Say so rather than ignoring in silence: a user tuning --gpu-batch on a
   // CPU-only binary is otherwise left wondering why nothing changed.  Matches
   // the existing "[HYBRID] not available in CPU-only build" note.
@@ -23280,6 +23516,25 @@ static Options parse_args(int argc, char ** argv)
     die_usage("refusing to write compressed data to the terminal "
               "(use -o FILE, redirect stdout, or -f to force)");
 
+  // Thread counts are spawned in unbounded loops (`for i < n: emplace_back`), so
+  // an absurd value throws std::system_error out of a path that does not catch
+  // it — the process aborts instead of reporting a usage error.  Reject at parse
+  // time, where we can say why.  The ceiling is a sanity bound on user input, not
+  // a tuning constant: no real machine wants thousands of compression threads,
+  // and -T0 / auto never routes through here.
+  {
+    constexpr size_t THREAD_ARG_MAX = 4096;
+    if (opt.write_threads > THREAD_ARG_MAX)
+      die_usage("--write-threads is unreasonably large (max "
+                + std::to_string(THREAD_ARG_MAX) + ")");
+    if (opt.cpu_threads > (int)THREAD_ARG_MAX)
+      die_usage("-T/--threads is unreasonably large (max "
+                + std::to_string(THREAD_ARG_MAX) + ")");
+    if (opt.read_threads > THREAD_ARG_MAX)
+      die_usage("--read-threads is unreasonably large (max "
+                + std::to_string(THREAD_ARG_MAX) + ")");
+  }
+
   if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die_usage("--gpu-only cannot be combined with --cpu-only or --hybrid");
   if (opt.cpu_only && opt.hybrid) die_usage("--cpu-only cannot be combined with --hybrid");
   if (opt.level >= 20 && opt.level <= 22 && !opt.ultra) die_usage("levels 20..22 require --ultra (zstd-compatible behavior)");
@@ -23287,7 +23542,23 @@ static Options parse_args(int argc, char ** argv)
   // --cpu-batch is a hybrid-only tuning knob.  In --cpu-only mode it causes
   // a stop-and-go pattern (all threads idle until queue depth >= N, then stampede)
   // that wastes CPU time and hammers the kernel with CV contention.
+  //
+  // In a CPU-only BUILD there is no --cpu-only flag to key off: nothing ever sets
+  // opt.cpu_only (apply_backend_defaults is compiled out), so this guard never
+  // fired and the knob reached the workers' non-hybrid branch — which is compiled
+  // in both configs.  Past stop-and-go, that DEADLOCKS: workers wait for depth >=
+  // cpu_queue_min while the producer is blocked in TaskQueue::push on the byte
+  // cap, so if the cap admits fewer frames than cpu_queue_min neither side can
+  // advance and done_ is never set.  Reproduced on a USE_NVCOMP=OFF build:
+  // `gzstd -d -T 2 --cpu-batch=64` on a 1.4 GiB incompressible archive hangs
+  // indefinitely; the same command on the GPU build completes, because there the
+  // guard below resets the knob.  Hence: in a CPU-only build, every run is
+  // effectively --cpu-only, so the guard applies unconditionally.
+#ifndef HAVE_NVCOMP
+  if (opt.cpu_queue_min > 0) {
+#else
   if (opt.cpu_only && opt.cpu_queue_min > 0) {
+#endif
     if (opt.verbosity >= V_ERROR)
       std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode (hybrid-only option)\n";
     opt.cpu_queue_min = 0;
