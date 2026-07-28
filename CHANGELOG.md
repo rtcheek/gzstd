@@ -7,6 +7,30 @@
 
 ---
 
+## Follow-up validation (2026-07-27) — two open questions closed, no code change
+
+Both were recorded as untested rather than measured; both now have numbers, and neither needed a fix.
+
+**The `prefer_inline` threshold (`comp_ratio > 0.90`) was untested in the 0.80–0.95 band.** Built three 12 GiB archives of twelve ~1 GiB files at ratios 0.850 / 0.920 / 0.960 and measured both decode paths directly (`--cpu-only` throughout, to isolate the decode path and leave the GPUs alone):
+
+| ratio | inline | pool | gate chose | |
+|---|---|---|---|---|
+| 0.850 | 6.10 s | **5.90 s** | pool | picked the faster |
+| 0.920 | 6.31 s | 6.32 s | inline | tie |
+| 0.960 | 6.28 s | 6.50 s | inline | correct |
+
+The gate is right at every point, and the wider finding is that **inside the grey band the two paths are within ~3%** — the exact threshold placement barely matters there. The −28% divergence that motivated the gate lives at ratio 1.00, well clear of the band. So 0.90 is safe and there is nothing to re-tune.
+
+**The `md` writer-class bucket had its optimum untested** (only `sm` and `lg` were measured). Swept `--write-threads` over a 15 GiB / 15 000 × 1 MiB archive:
+
+```
+4 → 4.08 s    8 → 4.04 s    16 → 3.20/4.03 s    32 → 4.05 s    60 → 4.12 s
+```
+
+Flat from 4 to 60. Unlike `lg` — where 60 writers cost ~9% against 16 — the middle bucket simply does not care, so there is no optimum to miss. `--adapt` converges 60 → 19 → 16 across three runs and persists `tar_write_threads_md: 16`, which lands on the plateau. The three buckets are now characterised: `sm` wants many writers, `lg` wants few and is punished for too many, `md` is indifferent.
+
+**Not done: the engagement guard is still blind to a *busy* GPU.** Left deliberately — see the note at the end of v0.15.31.
+
 ## v0.15.31 — compress gets it too: 512 MB went from 5.51 s to 0.25 s
 
 v0.15.30 gave decompress a measured "is the GPU still worth starting" test and recorded compress as owed. This is that debt paid.
@@ -37,6 +61,8 @@ That last case round-trips byte-identically, which is the case that matters — 
 **Structural note.** `DevStats` and `StatsSink` each hold a `std::mutex`, so they are neither movable nor resizable and cannot be sized from a provisional count and fixed up later. They are now built once, inside the bringup, from the real device count — held by `unique_ptr` at function scope so they outlive the workers holding pointers into them. The throttle and scheduler still size from a provisional count (RAM-capped, so over-estimating is harmless — decompress's own justification). Running with **zero** GPU workers is a supported state, verified rather than assumed: `HybridSched`'s queue floor is `streams × batch`, so with nothing registered it is 0 and the CPU pool competes freely.
 
 **Validated:** default suite 352/0, extensive 485/0. GPU-engaged compress round-trips byte-identically at 5.3 GB; `--gpu-only` and `--cpu-share` still take the synchronous path (confirmed by the absence of a bringup sample and 8 workers online).
+
+**Known gap, deliberately not closed: the guard is blind to a *busy* GPU.** It asks only whether the job outlasts cuInit, not whether the device is available — observed live, with three GPUs at 78–98% and all eight holding another tenant's VRAM, it would still engage. Not fixed speculatively, for two reasons. `select_best_gpus` already ranks devices by utilisation and free VRAM, so contention is accounted for in *which* device is chosen, just not in an all-or-nothing abstain; and `HybridSched` already rebalances on measured rate, so a slow GPU sheds work on its own. The residual cost is cuInit plus a few slow batches before that rebalance — real, but not obviously worth a threshold that could refuse a briefly-busy GPU. It needs evidence it bites in practice and a contended machine to validate against, and running GPU benchmarks on someone else's saturated devices is its own problem.
 
 ## v0.15.30 — the GPU has to prove it can still pay for itself
 
