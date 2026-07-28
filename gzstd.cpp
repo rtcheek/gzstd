@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.33";
+static constexpr const char * GZSTD_VERSION = "0.15.34";
 //
 // Architecture overview:
 //
@@ -22645,7 +22645,12 @@ static Options parse_args(int argc, char ** argv)
   }
 
   std::string pinned_value_tmp; // scratch buffer for --pinned VALUE parsing
-  (void)pinned_value_tmp; // referenced only under HAVE_NVCOMP
+#ifndef HAVE_NVCOMP
+  // Scratch destinations so a CPU-only build consumes GPU tuning arguments
+  // exactly as the GPU build does, then discards them.
+  size_t ignored_sz = 0; double ignored_d = 0.0; int ignored_i = 0;
+  bool cpu_build_ignored_gpu_flag = false;
+#endif
   // EVERY positional goes through here: a post---tar positional must carry
   // the -C in effect at its position (the parallel tar_source_dest vector).
   // A push site that bypasses this desyncs the vectors and their consumers
@@ -22937,9 +22942,31 @@ static Options parse_args(int argc, char ** argv)
       opt.gpu_hybrid_tuning_seen = true;
     }
 #else
-    else if (a.rfind("--gpu-", 0) == 0 || a == "--gpu-only") {
-      // Ignored on CPU-only builds
-    }
+    // CPU-ONLY BUILD (USE_NVCOMP=OFF).  The policy is: a DEMAND for the GPU
+    // must fail loudly, a HINT about how to use one is accepted and ignored.
+    // It used to be exactly backwards -- `--gpu-only` was swallowed silently,
+    // so a script asking for the GPU got CPU compression and exit 0 while
+    // believing otherwise, and the conflict checks (--gpu-only --cpu-only,
+    // --sliding-window --gpu-only) could never fire because opt.gpu_only was
+    // never set.  Meanwhile --pinned was not recognised at all and died as an
+    // unknown option, which is the opposite treatment for a flag that is pure
+    // tuning.
+    //
+    // The catch-all prefix match was also silently wrong for the SEPARATED
+    // value form: `--gpu-batch 8` matched "--gpu-*", consumed the flag, and
+    // left "8" behind as a positional -- so the user got "-o cannot be used
+    // with multiple input files".  Each option is now matched by the same
+    // parse_*_arg helper the GPU build uses, so argument consumption is
+    // identical by construction; only the destination is a scratch variable.
+    else if (a == "--gpu-only")
+      die_usage("this binary was built without nvCOMP; --gpu-only cannot be "
+                "satisfied (rebuild with USE_NVCOMP=ON, or use --cpu-only)");
+    else if (parse_num_arg("gpu-batch", i, argc, argv, ignored_sz))     { cpu_build_ignored_gpu_flag = true; }
+    else if (parse_double_arg("gpu-mem-frac", i, argc, argv, ignored_d)) { cpu_build_ignored_gpu_flag = true; }
+    else if (parse_num_arg("gpu-streams", i, argc, argv, ignored_sz))   { cpu_build_ignored_gpu_flag = true; }
+    else if (parse_int_arg("gpu-devices", i, argc, argv, ignored_i))    { cpu_build_ignored_gpu_flag = true; }
+    else if (a == "--no-pinned")                                        { cpu_build_ignored_gpu_flag = true; }
+    else if (parse_str_arg("pinned", i, argc, argv, pinned_value_tmp))  { cpu_build_ignored_gpu_flag = true; }
 #endif
     else if (a == "--") {
       // End of options — everything after this is a literal path (archive
@@ -23143,6 +23170,15 @@ static Options parse_args(int argc, char ** argv)
            || opt.tar_absolute_names)
     die_usage("--exclude/--exclude-from/--exclude-vcs/--numeric-owner/"
               "--one-file-system/-P require --tar");
+
+#ifndef HAVE_NVCOMP
+  // Say so rather than ignoring in silence: a user tuning --gpu-batch on a
+  // CPU-only binary is otherwise left wondering why nothing changed.  Matches
+  // the existing "[HYBRID] not available in CPU-only build" note.
+  if (cpu_build_ignored_gpu_flag)
+    vlog(V_VERBOSE, opt, "note: GPU tuning flags are ignored in this CPU-only "
+                         "build (compiled without nvCOMP)\n");
+#endif
 
   if (opt.sliding_window) {
     if (opt.mode != Mode::COMPRESS)

@@ -1,11 +1,28 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.33  
+**Covers:** v0.9.50 → v0.15.34  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.34 — CPU-only builds treat GPU flags coherently (and stop mangling their arguments)
+
+The `USE_NVCOMP=OFF` build failed 7 suite tests, and had done for long enough that they read as background noise (verified identical at v0.15.26). They were pointing at a real policy inversion, plus a latent bug none of them tested.
+
+**The policy was backwards in both directions.** A *demand* for the GPU was swallowed silently; a *hint* about how to use one was a fatal error.
+
+- `--gpu-only` matched a catch-all `--gpu-*` branch that did nothing, so `opt.gpu_only` was never set. A script asking for GPU compression got CPU compression and **exit 0** while believing otherwise. It also meant the conflict checks could never fire: `--gpu-only --cpu-only` and `--sliding-window --gpu-only` both succeeded, because the flag they guard against was never recorded.
+- `--pinned` / `--no-pinned` weren't in that branch at all, so they died as *unknown option* — the opposite treatment for flags that are pure tuning.
+
+Now: a demand fails loudly (`--gpu-only` is a usage error naming the cause and the fix), a hint is accepted and ignored, with a `-v` note so the ignoring isn't silent.
+
+**The latent bug the tests never caught.** The catch-all matched by prefix and did not consume values, so the *separated* form `--gpu-batch 8` left `8` behind as a positional — and the user got `-o/--output cannot be used with multiple input files`, an error with no visible relationship to what they typed. Every GPU option in the CPU-only branch is now matched by the same `parse_*_arg` helper the GPU build uses, so argument consumption is identical **by construction** rather than by a second implementation that can drift.
+
+**Result:** CPU-only build goes from **266 passed / 7 failed** to **273 / 0**; GPU build unchanged at 354/0 default and 487/0 extensive.
+
+That these had been failing for many versions is the argument for building both configurations routinely — this is the second defect in two days found only by compiling the config nobody compiles (v0.15.32 fixed one that didn't build at all).
 
 ## v0.15.33 — the backend prior compares end-to-end rates, not per-engine ones
 

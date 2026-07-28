@@ -21,6 +21,14 @@ cmake --install build --prefix ./dist
 
 See `BUILD.md` for conda setup and static linking details.
 
+## Releasing
+
+`RELEASING.md` is the pre-tag checklist. Tagging *is* deployment (a `v*` tag triggers the
+Actions portable build and hosts auto-install), so there is no staging step. Most
+importantly: **build BOTH configurations** — `USE_NVCOMP=ON` and `USE_NVCOMP=OFF` — before
+tagging. The CPU-only build is the one nobody compiles and it has hidden two separate
+defects, including four versions where it did not compile at all.
+
 ## Tests
 
 ```bash
