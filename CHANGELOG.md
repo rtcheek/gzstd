@@ -1,11 +1,31 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.31  
+**Covers:** v0.9.50 → v0.15.32  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.32 — fix a broken CPU-only build, and pre-deployment checks
+
+**The `USE_NVCOMP=OFF` build did not compile.** `gpu_min_useful_bytes()` (added in v0.15.28) reads `opt.gpu_batch_cap`, which lives inside the `#ifdef HAVE_NVCOMP` block of `Options` — so every CPU-only build since v0.15.28 has been broken. It went unnoticed because nothing in this stretch of work rebuilt that configuration. Both GPU-engagement helpers are now `#ifdef HAVE_NVCOMP`-guarded; neither has any meaning without a GPU.
+
+This was found while checking whether the tree was safe to tag, which is the honest argument for running that check: the answer was no, for a reason nobody would have seen until the release build ran.
+
+**Pre-deployment checks now passing**, all on one machine by varying `CUDA_VISIBLE_DEVICES`:
+
+| configuration | result |
+|---|---|
+| 8 GPUs | 352/0 suite, round-trips |
+| 2 GPUs | workers spawn, round-trips |
+| 1 GPU | workers spawn, round-trips |
+| no GPU visible, forced engage | `no devices found; hybrid running CPU-only`, round-trips |
+| `USE_NVCOMP=OFF` build | compiles, 266/7 (see below) |
+
+The 1- and 2-GPU cases matter beyond the obvious: they are the first exercise of the **provisional-count over-estimate** path, where the throttle is sized for 8 devices but only 1–2 exist. On the 8-GPU box the provisional and real counts coincide, so that path had never run.
+
+**Pre-existing, not from this work:** the CPU-only build fails 7 tests (`--gpu-only no GPU`, the four `--pinned` forms, `conflicting flags`, `--sliding-window --gpu-only rejection`) — GPU flags are accepted rather than rejected when nvCOMP is compiled out. Verified against v0.15.26, built the same way: **identical 7 failures, identical 266 passes.** Worth fixing, but it is an older gap and not a regression.
 
 ## Follow-up validation (2026-07-27) — two open questions closed, no code change
 

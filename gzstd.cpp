@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.31";
+static constexpr const char * GZSTD_VERSION = "0.15.32";
 //
 // Architecture overview:
 //
@@ -3644,6 +3644,9 @@ static uint64_t known_input_size(const Options & opt, FILE * in)
   return 0;                                 // true pipe / unknown
 }
 
+// GPU-only: both helpers read GPU-specific Options members, which do not exist
+// in a CPU-only (USE_NVCOMP=OFF) build, and neither has any meaning there.
+#ifdef HAVE_NVCOMP
 // Smallest input for which bringing up the GPU can pay for itself (bytes).
 //
 // cuInit is a fixed cost charged before any work — measured 2.3 s ahead of a
@@ -3786,6 +3789,7 @@ static bool gpu_bringup_worth_it(const Options & opt,
   return say(remaining > guard_sec, "windowed rate", remaining, p2);
 }
 
+#endif  // HAVE_NVCOMP  (GPU engagement helpers)
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
 {
   // Progress bar at V_DEFAULT and V_VERBOSE only.
