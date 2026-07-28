@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.32";
+static constexpr const char * GZSTD_VERSION = "0.15.33";
 //
 // Architecture overview:
 //
@@ -3291,6 +3291,10 @@ struct AdaptObs {
   int writer_par = 0;                            // writer probe verdict (+1/-1, 0 = untried)
   int tar_write_threads = 0;                     // -d --tar: settled pool size (0 = untried)
   int tar_wclass = -1;                           // -d --tar: workload class the size belongs to
+  // Which backend actually ran, so the end-to-end rate is filed under it.
+  // 0 = do not record (gpu-only, or a run that never chose): the backend prior
+  // only ever picks between cpu-only and hybrid, so only those two are useful.
+  int backend_used = 0;                          // 1 = cpu-only, 2 = hybrid
   bool tar_wt_converged = false;                 // -d --tar: probe found no further gain
   bool fault = false;                            // a GPU fault/rebuild happened this process
 
@@ -3331,8 +3335,18 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
 
   const double wall_s = obs.wall_ns / 1e9;
   const double GiB = 1024.0 * 1024.0 * 1024.0;
-  if (wall_s > 0 && obs.payload_bytes > 0)
-    dir.put_num("overall_gibs", ema(dir.gnum("overall_gibs", 0), obs.payload_bytes / GiB / wall_s));
+  if (wall_s > 0 && obs.payload_bytes > 0) {
+    const double rate = obs.payload_bytes / GiB / wall_s;
+    dir.put_num("overall_gibs", ema(dir.gnum("overall_gibs", 0), rate));
+    // END-TO-END RATE PER BACKEND.  This is what the backend prior compares --
+    // see the note there for why the per-engine cpu_gibs/gpu_gibs pair cannot
+    // answer the question.  Same value, keyed by what produced it, exactly as
+    // tar_write_threads is keyed by workload class.
+    if (obs.backend_used == 1)
+      dir.put_num("overall_gibs_cpu", ema(dir.gnum("overall_gibs_cpu", 0), rate));
+    else if (obs.backend_used == 2)
+      dir.put_num("overall_gibs_hybrid", ema(dir.gnum("overall_gibs_hybrid", 0), rate));
+  }
   if (obs.reader_io_ns > 0)
     dir.put_num("source_gibs", ema(dir.gnum("source_gibs", 0),
                                    obs.reader_bytes / GiB / (obs.reader_io_ns / 1e9)));
@@ -3392,6 +3406,7 @@ struct AdaptPriors {
   struct Dir {
     double cpu_gibs = 0, gpu_gibs = 0, source_gibs = 0, sink_gibs = 0;
     double overall_gibs = 0, settled_batch = 0, runs = 0;
+    double overall_cpu = 0, overall_hybrid = 0;             // end-to-end, per backend
     double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates
     double writer_par = 0;                                  // probe verdict
     double tar_write_threads = 0;                           // -d --tar settled pool size (flat fallback)
@@ -3424,6 +3439,8 @@ static AdaptPriors adapt_load_priors()
     D.source_gibs   = dj->gnum("source_gibs", 0);
     D.sink_gibs     = dj->gnum("sink_gibs", 0);
     D.overall_gibs  = dj->gnum("overall_gibs", 0);
+    D.overall_cpu    = dj->gnum("overall_gibs_cpu", 0);
+    D.overall_hybrid = dj->gnum("overall_gibs_hybrid", 0);
     D.runs          = dj->gnum("runs", 0);
     D.regime        = dj->gstr("regime", "");
     D.path_mmap     = dj->gnum("path_mmap_gibs", 0);
@@ -3437,6 +3454,18 @@ static AdaptPriors adapt_load_priors()
                                      + adapt_tar_wclass_name(c), 0);
   }
   return P;
+}
+
+// Which backend a completed run actually used, for the end-to-end profile keys.
+// gpu-only returns 0: the backend prior never selects it by default, so recording
+// it would add a number nothing consumes.  Reads the POST-defaults opt, i.e. what
+// really ran, not what the user asked for.
+static int adapt_backend_used(const Options & opt)
+{
+  if (opt.gpu_only) return 0;
+  if (opt.cpu_only) return 1;
+  if (opt.hybrid)   return 2;
+  return 0;
 }
 
 // Minimum wall time for a run to qualify for a profile save.  3 s by default so
@@ -20944,6 +20973,7 @@ int main(int argc, char ** argv)
       // path_<p>_gibs keys the read-path prior compares (review v0.15.7).
       obs.src_path.clear();
       if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= adapt_save_min_ns()) {
+        obs.backend_used  = adapt_backend_used(opt);
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
         obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
@@ -20974,6 +21004,7 @@ int main(int argc, char ** argv)
       // path_<p>_gibs keys the read-path prior compares (review v0.15.7).
       obs.src_path.clear();
       if (!opt.no_profile && rc == EXIT_OK && obs.wall_ns >= adapt_save_min_ns()) {
+        obs.backend_used  = adapt_backend_used(opt);
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
         obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
@@ -21817,6 +21848,7 @@ int main(int argc, char ** argv)
   // unless there is a fault to count.
   if (opt.adapt && !opt.no_profile && exit_code == EXIT_OK
       && (adapt_obs.wall_ns >= adapt_save_min_ns() || adapt_obs.fault)) {
+    adapt_obs.backend_used  = adapt_backend_used(opt);
     adapt_obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
@@ -22342,33 +22374,78 @@ static void apply_backend_defaults(Options & opt)
     }
   }
 
-  // --adapt backend prior: measured engine ranking beats every static rule
-  // below.  cpu-only when the CPU engine dominates outright (> 1.5x the GPU
-  // engine — hybrid coordination overhead can't win back a gap that wide,
-  // the measured story of the fast-fabric boxes); anything closer keeps
-  // hybrid, where the scheduler splits by live rates.  Never gpu-ONLY by
-  // default: hybrid contains it, minus the single-engine failure mode.
-  if (priors.loaded && prior_dir.cpu_gibs > 0 && prior_dir.gpu_gibs > 0) {
-    const bool cpu_dominates = prior_dir.cpu_gibs > 1.5 * prior_dir.gpu_gibs;
-    if (cpu_dominates) opt.cpu_only = true;
-    else               opt.hybrid = true;
-    if (cpu_dominates && opt.cpu_queue_min > 0) {   // mirror the Gen<4 silencing
-      if (opt.verbosity >= V_ERROR)
-        std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
-                     "(profile prior; override with --hybrid)\n";
-      opt.cpu_queue_min = 0;
+  // --adapt backend prior: compare the two backends by their MEASURED END-TO-END
+  // rate, and never by per-engine rates.
+  //
+  // This used to compare cpu_gibs against gpu_gibs (the hybrid scheduler's
+  // per-engine EMAs) and pick cpu-only when the CPU "dominated" by 1.5x.  That
+  // comparison is invalid, and measurably so: on the 8-GPU box it recorded
+  // cpu 1.88 / gpu 4.06 GiB/s -- concluding the GPU was twice as fast -- while
+  // an actual benchmark had cpu-only at 4.24 and hybrid at 1.87, i.e. hybrid
+  // 2.3x SLOWER.  It was not failing to fire; it was firing the wrong way, on
+  // every profile of a 5-corpus run.  Three independent reasons:
+  //   * DUTY-CYCLE BIAS.  Each EMA only samples ticks where that engine moved
+  //     bytes ("idle ticks shouldn't collapse the EMA"), so a BURSTY engine is
+  //     measured only while it bursts.  The GPU batches; the CPU runs
+  //     continuously.  Tell-tale: the pair summed to ~3x the rate the run
+  //     actually achieved -- they are not shares of one clock.
+  //   * cuInit is invisible.  Seconds of bringup never appear in a 0.5 s window.
+  //   * The CPU is deliberately held back in hybrid (queue floor), so its
+  //     measured rate is not what cpu-only would do with the whole machine.
+  // The per-engine numbers stay in the profile -- the scheduler pre-warms its
+  // EMAs from them, which is a fair use of exactly what they measure.  Only the
+  // BACKEND CHOICE moves off them.
+  //
+  // What replaces it is the pattern this codebase has already proven twice (the
+  // read-path prior, and the workload-class writer prior): record the SAME
+  // end-to-end number under a key for the thing that produced it, try the
+  // untried alternative once, then let the better measurement win with a margin
+  // against flapping.  Apples to apples, and it prices cuInit and coordination
+  // overhead by construction rather than modelling them.
+  if (priors.loaded) {
+    const double oc = prior_dir.overall_cpu, oh = prior_dir.overall_hybrid;
+    const char * why = nullptr;
+    bool choose_cpu = false, decided = false;
+    if (oc > 0 && oh > 0) {
+      // Both measured.  5% margin so a tie does not flip the default every run
+      // (the read-path prior's anti-flap margin, same reasoning).
+      if      (oc > oh * 1.05) { choose_cpu = true;  decided = true; why = "measured"; }
+      else if (oh > oc * 1.05) { choose_cpu = false; decided = true; why = "measured"; }
+      // Within the margin: fall through to the static rules, no verdict to add.
+    } else if (oh > 0 && oc <= 0) {
+      // Hybrid measured, cpu-only never tried -> explore it once, so the pair
+      // can be compared next run.  One slow run at worst, and self-correcting.
+      choose_cpu = true; decided = true; why = "exploring cpu-only";
     }
-    if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
-      char line[256];
-      std::snprintf(line, sizeof(line),
-        "gzstd: profile prior (cpu %.1f vs gpu %.1f GiB/s): defaulting %s to %s "
-        "(override with --hybrid/--cpu-only/--gpu-only)\n",
-        prior_dir.cpu_gibs, prior_dir.gpu_gibs,
-        opt.mode == Mode::COMPRESS ? "compress" : "decompress",
-        cpu_dominates ? "--cpu-only" : "--hybrid");
-      std::fprintf(stderr, "%s", line);
+    // oc > 0 && oh <= 0 -> hybrid untried; the static rules below already favour
+    // hybrid, so letting them run IS the exploration.  Nothing measured at all
+    // -> nothing to say.
+    if (decided) {
+      if (choose_cpu) { opt.cpu_only = true;  opt.hybrid = false; }
+      else            { opt.hybrid   = true;  opt.cpu_only = false; }
+      if (choose_cpu && opt.cpu_queue_min > 0) {   // mirror the Gen<4 silencing
+        if (opt.verbosity >= V_ERROR)
+          std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
+                       "(profile prior; override with --hybrid)\n";
+        opt.cpu_queue_min = 0;
+      }
+      if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
+        char line[288];
+        if (oc > 0 && oh > 0)
+          std::snprintf(line, sizeof(line),
+            "gzstd: profile prior (%s: cpu-only %.2f vs hybrid %.2f GiB/s end-to-end): "
+            "defaulting %s to %s (override with --hybrid/--cpu-only/--gpu-only)\n",
+            why, oc, oh, opt.mode == Mode::COMPRESS ? "compress" : "decompress",
+            choose_cpu ? "--cpu-only" : "--hybrid");
+        else
+          std::snprintf(line, sizeof(line),
+            "gzstd: profile prior (%s; hybrid measured %.2f GiB/s end-to-end): "
+            "defaulting %s to --cpu-only (override with --hybrid/--cpu-only)\n",
+            why, oh, opt.mode == Mode::COMPRESS ? "compress" : "decompress");
+        std::fprintf(stderr, "%s", line);
+      }
+      return;
     }
-    return;
   }
 #endif
 

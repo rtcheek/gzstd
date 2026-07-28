@@ -1,11 +1,42 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.32  
+**Covers:** v0.9.50 → v0.15.33  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.33 — the backend prior compares end-to-end rates, not per-engine ones
+
+**`--adapt` was choosing the GPU for compress on a box where the CPU is 2.3× faster, and the prior that exists to prevent exactly that was firing the wrong way.** Found by the `--adapt-warm` benchmark: across all five 20 GiB profiles, `adapt` tracked hybrid at 1.86 GiB/s while `cpu-only` did 4.24 — a 2.1–2.5× loss on every single profile, with warm priors making no difference.
+
+The prior compared `cpu_gibs` against `gpu_gibs` (the hybrid scheduler's per-engine EMAs) and chose cpu-only when the CPU "dominated" by 1.5×. On this machine those record **cpu 1.88 / gpu 4.06** — concluding the GPU is twice as fast, when an actual benchmark of the same workload has hybrid 2.3× *slower*. Not a threshold that needed tuning: an invalid comparison.
+
+**Why those numbers can't answer the question.** Three independent reasons, any one of which would be enough:
+
+- **Duty-cycle bias.** Each EMA samples only ticks where that engine moved bytes — *"idle ticks shouldn't collapse the EMA"* — so a **bursty** engine is measured only while it bursts. The GPU works in batches; the CPU runs continuously. The tell-tale: the pair sums to ~3× the rate the run actually achieved, so they are plainly not shares of one clock.
+- **cuInit is invisible.** Seconds of bringup never appear in a 0.5 s tick window.
+- **The CPU is held back in hybrid** by the queue floor, so its measured rate is not what cpu-only would achieve with the whole machine.
+
+**The replacement** is the pattern already proven twice here — the read-path prior, and v0.15.28's workload-class writer prior: record the *same* end-to-end number under a key for the thing that produced it, try the untried alternative once, then let the better measurement win with a margin. `overall_gibs_cpu` and `overall_gibs_hybrid` are filed per direction by the backend that actually ran; with both present the faster wins with a 5% anti-flap margin; with only hybrid measured, cpu-only is explored once so the pair can be compared next run; within the margin the static rules keep their say. This prices cuInit and coordination overhead by construction instead of modelling them.
+
+The per-engine keys stay exactly as they were — the scheduler pre-warms its rate EMAs from them, which is a fair use of precisely what they measure. Only the *backend choice* moved off them.
+
+**Measured convergence** (20 GiB, cold, `--direct-read`):
+
+| run | compress | what it did |
+|---|---|---|
+| 1 | 9.87 s | no prior → hybrid, records `hybrid 2.19` |
+| 2 | 4.43 s | explores cpu-only, records `cpu 4.62` |
+| 3 | 4.48 s | both measured → picks cpu-only |
+| 4 | 4.45 s | stable |
+
+**2.2× faster, converged in two runs, self-measured.** Decompress converges the same way on this box (8.97 → 6.76 s, cpu-only 2.96 vs hybrid 2.45). Note this is not a hardcoded "CPU wins" — on a box where hybrid is genuinely faster the same two runs select hybrid, which is the entire point.
+
+**The suite test for this changed contract, and got better for it.** The old test seeded `cpu_gibs: 10 / gpu_gibs: 2` and asserted cpu-only — it could only ever check one direction, and it failed here exactly as it should have. It now seeds the end-to-end pair and covers three cases: cpu faster → cpu-only, **hybrid faster → hybrid**, and hybrid-only → explore cpu-only. The middle one matters most: without it this would be indistinguishable from a hardcoded "CPU wins" wearing a measurement. The crafted profile deliberately leaves the per-engine numbers pointing the *other* way, so if anything ever wires them back into the choice, the test catches it.
+
+**Validated:** default suite **354/0**, extensive **487/0**, no drift note; convergence measured end-to-end on 20 GiB corpora in both directions.
 
 ## v0.15.32 — fix a broken CPU-only build, and pre-deployment checks
 

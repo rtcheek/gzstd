@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=352
-$EXTENSIVE && EXPECTED_TESTS=485
+EXPECTED_TESTS=354
+$EXTENSIVE && EXPECTED_TESTS=487
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3359,22 +3359,54 @@ cat > "$APRI" <<APROF_EOF
     "$FP_HASH": {
       "fingerprint": "crafted",
       "driver": "$FP_DRV",
-      "compress": { "runs": 3, "cpu_gibs": 10.0, "gpu_gibs": 2.0, "regime": "compute-bound" }
+      "compress": { "runs": 3, "cpu_gibs": 10.0, "gpu_gibs": 2.0,
+                    "overall_gibs_cpu": 10.0, "overall_gibs_hybrid": 2.0,
+                    "regime": "compute-bound" }
     }
   }
 }
 APROF_EOF
 
 if has_gpu 2>/dev/null; then
-  # 4. The prior flips the compress default to cpu-only, announced.
+  # 4. The prior flips the compress default to whichever backend MEASURED faster
+  # end-to-end.  Per-engine cpu_gibs/gpu_gibs deliberately point the OTHER way in
+  # the crafted profile above (cpu 10 vs gpu 2 would once have been the whole
+  # input): if those ever drive the choice again, this test catches it.
   env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt -k -f \
     "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp.zst" 2>"$TMPDIR/apri-pri.err"
-  if grep -q "profile prior (cpu 10.0 vs gpu 2.0 GiB/s): defaulting compress to --cpu-only" \
+  if grep -q "cpu-only 10.00 vs hybrid 2.00 GiB/s end-to-end): defaulting compress to --cpu-only" \
        "$TMPDIR/apri-pri.err"; then
     pass "profile prior defaults compress to cpu-only"
   else
-    fail "profile prior defaults compress to cpu-only"
+    fail "profile prior defaults compress to cpu-only" \
+         "($(grep -o 'profile prior.*' "$TMPDIR/apri-pri.err" | head -1))"
   fi
+
+  # 4b. The SAME machinery must pick hybrid when hybrid is the faster measurement
+  # -- otherwise this is just a hardcoded "CPU wins" wearing a measurement.
+  sed -i 's/"overall_gibs_cpu": 10.0, "overall_gibs_hybrid": 2.0/"overall_gibs_cpu": 2.0, "overall_gibs_hybrid": 10.0/' "$APRI"
+  env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp2.zst" 2>"$TMPDIR/apri-pri2.err"
+  if grep -q "defaulting compress to --hybrid" "$TMPDIR/apri-pri2.err"; then
+    pass "profile prior defaults compress to hybrid when hybrid measured faster"
+  else
+    fail "profile prior defaults compress to hybrid when hybrid measured faster" \
+         "($(grep -o 'profile prior.*' "$TMPDIR/apri-pri2.err" | head -1))"
+  fi
+
+  # 4c. Only hybrid measured -> explore cpu-only once, so the pair becomes
+  # comparable on the next run.  Without this the prior can never learn.
+  sed -i 's/"overall_gibs_cpu": 2.0, "overall_gibs_hybrid": 10.0/"overall_gibs_hybrid": 10.0/' "$APRI"
+  env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt -k -f \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp3.zst" 2>"$TMPDIR/apri-pri3.err"
+  if grep -q "exploring cpu-only" "$TMPDIR/apri-pri3.err"; then
+    pass "profile prior explores cpu-only when only hybrid is measured"
+  else
+    fail "profile prior explores cpu-only when only hybrid is measured" \
+         "($(grep -o 'profile prior.*' "$TMPDIR/apri-pri3.err" | head -1))"
+  fi
+  # restore the cpu-dominant pair for the override test below
+  sed -i 's/"overall_gibs_hybrid": 10.0/"overall_gibs_cpu": 10.0, "overall_gibs_hybrid": 2.0/' "$APRI"
 
   # 5. An explicit backend flag beats the prior (no defaulting line).
   env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt --hybrid -k -f \
@@ -3386,6 +3418,8 @@ if has_gpu 2>/dev/null; then
   fi
 else
   skip "profile prior defaults compress to cpu-only" "no GPU"
+  skip "profile prior defaults compress to hybrid when hybrid measured faster" "no GPU"
+  skip "profile prior explores cpu-only when only hybrid is measured" "no GPU"
   skip "explicit --hybrid overrides the prior" "no GPU"
 fi
 
