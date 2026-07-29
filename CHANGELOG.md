@@ -1,11 +1,33 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.37  
+**Covers:** v0.9.50 → v0.15.38  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.38 — the independent reviewer finds a bug I shipped, and three of my own fixes overclaiming
+
+A bounded second pass by Codex CLI / GPT-5.6-sol over the v0.15.37 diff. Seven findings, two of them high severity, and two cases where the previous changelog entry claimed more than the code delivered. The most important is a defect introduced by v0.15.37 itself.
+
+**The adversarial clamps compared every stamp against a value that had not been loaded yet.** `D.runs` was read *seven lines after* the clamp block that validates against it, so it was still zero: `if (v > D.runs) v = 0` zeroed every legitimate positive stamp on every profile load. The consequences were exactly what the clamps were added alongside — `stale_run` became 0, so any profile with `runs >= 20` fired the recheck on *every run*, and the fault-attempt stamp introduced in the same version was erased, re-enabling the repeated fault-and-rebuild cycle it was meant to bound. `runs` is now loaded and validated first, and the 2^53 rebase test is `>=` rather than `>`, since at exactly 2^53 adding one already fails to count.
+
+**The driver-change invalidation only worked on load.** v0.15.37 masked stale hybrid rates when the stored driver differed — but the *save* path reloads the JSON, stamps the new driver onto the entry, and merges only the current direction, leaving those values in the file where the next run reads them as valid for a driver that never produced them. Because `driver` is entry-wide, a compress run re-blessed the decompress keys too. The save path now zeroes every GPU-derived key in **both** directions before the driver is overwritten.
+
+**Splitting one variable across two byte domains moved the bug rather than fixing it.** v0.15.37 corrected the size gate by scaling `known` to uncompressed bytes — but the duration predictor divides that same `known` by `input_gibs`, an input-domain rate. An archive expanding 16× then predicted 16× its real duration and admitted probes that finish under the save floor, recording nothing. There are now two variables: `known_work` for the batch gate, `known_input` for duration.
+
+**Two process-wide booleans could not represent "declined, then confirmed absent."** In a multi-input run a short first file can decline by policy before device detection ever runs, and a later file can then confirm there is no GPU at all — with nothing to clear the earlier flag, an all-CPU aggregate on a GPU-less host was filed as hybrid. Confirmed absence now outranks a policy decline.
+
+**The bounce budget sized itself against the wrong ceiling.** It ignored profile-seeded extras while the supervisor's actual cap includes them, so a foreign prior of 32 writers on an eight-core host sized for 16 threads while the live pool reached 32. It now matches the supervisor's own expression. The 1 MiB floor is documented as what it is: past 256 writers the floor wins and the aggregate grows again, accepted because smaller O_DIRECT writes would cost more than the memory saves.
+
+**`-o stdout` slipped past the new `-c`/`-o` conflict check**, because "stdout" is also the internal sentinel for the stdout destination. A named-output flag now distinguishes a real path from the sentinel; `-o -` remains exempt, since it requests the same destination `-c` does.
+
+Also recorded: the reviewer's verdict on the v0.15.37 attribution change. It accepted the semantics — a key meaning "performance of choosing hybrid" legitimately includes hybrid's decision not to initialise CUDA — while rejecting the implementation, both objections being the findings above. It notes one residual limitation, now on the open list: a residency bucket still mixes short workloads where hybrid declines with longer ones where it would engage, so a correction learned on a short run can be inherited by a longer one until the recheck cadence fires.
+
+Two claims in the v0.15.37 entry were wrong and are corrected here: the driver-change closure, and that the predictor had been made domain-correct.
+
+Suites: 354/0 default, 487/0 extensive, 273/0 CPU-only. Both configurations built.
 
 ## v0.15.37 — a second model reviews the keyed prior, and finds the fixes incomplete
 

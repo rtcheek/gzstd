@@ -86,6 +86,10 @@ silently compiled out.
 
 Most of the v0.15.37 ledger is closed. What remains, deliberately:
 
+- **A residency bucket mixes durations.** Short workloads where hybrid declines by
+  policy and longer ones where it would engage share a bucket, so a hybrid rate
+  corrected downward on a short run can be inherited by a longer GPU-worthy run
+  until the recheck cadence fires. Keying by duration/work class would close it.
 - **A sub-floor probe records nothing at all** — not even `runs` — so a probe the
   predictor allowed that then finishes under the save floor leaves no trace. The
   `explorable` predictor guards it (now using an input-domain rate), but a

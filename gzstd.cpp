@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.37";
+static constexpr const char * GZSTD_VERSION = "0.15.38";
 //
 // Architecture overview:
 //
@@ -416,6 +416,9 @@ struct Options {
   bool direct_io_user_set = false; // true if user passed --direct/--no-direct (suppresses the Gen4 decompress auto-default)
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
   bool mmap_user_set = false;     // true if --mmap/--no-mmap given (suppresses the pre-6.4 large-file auto-gate)
+  bool output_named = false;      // -o named a real path (not "-"): distinguishes it
+                                 // from the internal "stdout" sentinel, so `-o stdout`
+                                 // cannot slip past the -c/-o conflict check
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool watchdog = false;          // --watchdog: arm the GPU deadlock watchdog (diagnostic; dumps JSON + aborts on a stall)
   int  watchdog_secs = 30;        // --watchdog=SECS: stall timeout in seconds (default 30)
@@ -2150,6 +2153,12 @@ static std::atomic<bool> g_adapt_gpu_engaged{false};
 // stale hybrid rate that keeps winning can never be corrected: the recheck picks
 // hybrid, the guard declines, the run files as cpu, and the stale number wins again.
 static std::atomic<bool> g_adapt_gpu_declined{false};
+// Confirmed ABSENCE (no CUDA device found).  Outranks `declined`: in a multi-input
+// run a short first file can decline by policy before detection ever runs, and a
+// later file can then confirm there is no GPU at all.  With only the two booleans
+// the stale decline won and an all-CPU aggregate was filed as hybrid on a
+// GPU-less or CUDA-hidden host.
+static std::atomic<bool> g_adapt_gpu_absent{false};
 // Page-cache residency class of THIS run's input: 1 = warm, 0 = cold, -1 = not
 // probed (compress, pipes, non-regular output, --list).  The backend prior is
 // keyed by it for decompress — see the prior for why bucketing beats picking a
@@ -3592,8 +3601,15 @@ static AdaptPriors adapt_load_priors()
     // `runs` value past the exact-integer range of a double stops incrementing,
     // freezing the age-based cadence entirely.  Neither is reachable from our own
     // emitter, both are cheap to neutralise.
-    if (!(D.runs >= 0.0)) D.runs = 0.0;                 // also catches NaN
-    if (D.runs > 9007199254740992.0) D.runs = 0.0;      // 2^53: rebase, don't freeze
+    // ORDER IS LOAD-BEARING: `runs` must be read BEFORE anything is clamped
+    // against it.  Clamping first compared every stamp against a still-zero
+    // D.runs, so `v > D.runs` zeroed every legitimate positive stamp -- which made
+    // stale_run always 0 and fired the recheck on EVERY run of any profile with
+    // runs >= 20, besides erasing the fault-attempt stamp.  Exactly the
+    // never-terminating behaviour these clamps were added alongside.
+    D.runs          = dj->gnum("runs", 0);
+    if (!(D.runs >= 0.0)) D.runs = 0.0;                  // also catches NaN
+    if (D.runs >= 9007199254740992.0) D.runs = 0.0;      // 2^53: +1 no longer counts
     auto clamp_stamp = [&](double & v) {
       if (!(v >= 0.0)) v = 0.0;
       if (v > D.runs) v = 0.0;    // in the future: treat as never attempted
@@ -3609,7 +3625,6 @@ static AdaptPriors adapt_load_priors()
       D.overall_hybrid_cls_run[c] = P.gpu_valid ? dj->gnum("overall_gibs_hybrid_" + n + "_run", 0) : 0;
       clamp_stamp(D.overall_hybrid_cls_run[c]);
     }
-    D.runs          = dj->gnum("runs", 0);
     D.regime        = dj->gstr("regime", "");
     D.path_mmap     = dj->gnum("path_mmap_gibs", 0);
     D.path_pread    = dj->gnum("path_pread_gibs", 0);
@@ -3648,6 +3663,8 @@ static int adapt_backend_used(const Options & opt)
     // Declined by policy: hybrid ran and chose not to use the GPU.  Recording what
     // it actually delivered is what lets a stale hybrid rate be corrected downward
     // instead of winning forever.
+    // Absence outranks a policy decline recorded earlier in the same process.
+    if (g_adapt_gpu_absent.load(std::memory_order_relaxed)) return 1;
     if (g_adapt_gpu_declined.load(std::memory_order_relaxed)) return 2;
     return 1;   // GPU absent/hidden -- this measured the CPU, do not call it hybrid
   }
@@ -3695,6 +3712,35 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   AdaptJv & entry = entries.set(fp.hash);
   entry.t = AdaptJv::OBJ;
   entry.put_str("fingerprint", fp.human);
+  // DRIVER CHANGE MUST BE PERSISTED, not just masked on load.  adapt_load_priors
+  // hides GPU-derived values when the stored driver differs -- but this function
+  // then stamps the NEW driver onto the entry while leaving those values in the
+  // file, so the next run reads them as valid for a driver that never produced
+  // them.  Worse, a compress run re-blesses the decompress keys, because `driver`
+  // is entry-wide.  Zero them in BOTH directions first; 0 is what the loader
+  // already treats as "untried", so this is a clear without needing key deletion.
+  {
+    const std::string prev_drv = entry.gstr("driver", "");
+    if (!prev_drv.empty() && prev_drv != fp.driver) {
+      std::vector<std::string> gpu_keys = {
+        "gpu_gibs", "settled_batch",
+        "overall_gibs_hybrid", "overall_gibs_hybrid_run",
+      };
+      for (int c = 0; c < 2; ++c) {
+        const std::string n = adapt_resid_class_name(c);
+        gpu_keys.push_back("overall_gibs_hybrid_" + n);
+        gpu_keys.push_back("overall_gibs_hybrid_" + n + "_run");
+      }
+      for (const char * dn : { "compress", "decompress" }) {
+        if (!entry.get(dn)) continue;          // don't materialise absent directions
+        AdaptJv & d2 = entry.set(dn);
+        for (const std::string & k : gpu_keys)
+          if (d2.get(k)) d2.put_num(k, 0);
+      }
+      vlog(V_VERBOSE, opt, "[ADAPT] GPU driver changed (" + prev_drv + " -> "
+           + fp.driver + "); clearing GPU-derived priors\n");
+    }
+  }
   if (!fp.driver.empty()) entry.put_str("driver", fp.driver);
   const char * dname = (opt.mode == Mode::COMPRESS) ? "compress" : "decompress";
   AdaptJv & dir = entry.set(dname);
@@ -13336,15 +13382,26 @@ private:
     q_max_bytes_ = std::max<size_t>(256 * 1024 * 1024,
                                     (size_t)n * 2 * LARGE_WINDOW);
     {
-      // Widest the pool can get: base + the extras --adapt may spawn.
+      // Widest the pool can get.  This MUST match the supervisor's own ceiling,
+      // which is max(max(n, cpu - n), seed_extra) -- the seed_extra term matters:
+      // a foreign or hand-edited prior of 32 writers on an 8-core host yields base
+      // 8 + 24 seeded extras, so a computation that ignored seed_extra sized for
+      // 16 threads while the live pool reached 32 and doubled the budget.
       const size_t max_threads = (size_t)std::max(1, n)
           + (size_t)((opt_.adapt && opt_.write_threads == 0)
-                       ? std::max(0, std::max(n, cpu - n)) : 0);
+                       ? std::max(std::max(n, cpu - n), seed_extra) : 0);
       // Budget the AGGREGATE, not the per-thread size.  (An earlier version
       // divided q_max_bytes_ by the pool width -- but that already scales with
       // the width, so the quotient was constant and the cap never bound.)  The
       // 256 MiB floor is the same one q_max_bytes_ uses for the job queue: one
       // pipeline-sized allocation for staging, however wide the pool grows.
+      // 256 MiB aggregate: a resource-POLICY figure (one pipeline's worth of
+      // staging), the same magnitude the job queue reserves.  Not derived from the
+      // hardware, and deliberately so -- it is a memory ceiling, not a tuning knob.
+      // NOTE the floor below means the aggregate is only held to 256 MiB while the
+      // pool stays at or under 256 writers; past that, BOUNCE_MIN wins and the
+      // total grows again.  That is an accepted trade: dropping under 1 MiB would
+      // make each O_DIRECT write small enough to cost more than the memory saves.
       const size_t bounce_total = 256 * 1024 * 1024;
       bounce_sz_ = std::min(BOUNCE_CAP,
                             std::max(BOUNCE_MIN, bounce_total / max_threads));
@@ -17504,6 +17561,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       if (opt.gpu_only)
         die_usage("GPU requested (--gpu-only) but no CUDA devices available");
       vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU\n");
+      g_adapt_gpu_absent.store(true, std::memory_order_relaxed);
 #ifndef _WIN32
       compress_cpu_mt(in, out, opt, m, pre_built ? &pre_layout : nullptr);
 #else
@@ -17802,6 +17860,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         // No GPU after all.  The CPU pool is already running and owns the queue,
         // so there is nothing to repair — hybrid simply runs CPU-only.
         vlog(V_VERBOSE, opt, "[GPU] no devices found; hybrid running CPU-only\n");
+        g_adapt_gpu_absent.store(true, std::memory_order_relaxed);
         return;
       }
       total_hw_devices = dc;
@@ -19309,6 +19368,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       if (opt.gpu_only)
         die_usage("GPU requested (--gpu-only) but no CUDA devices available");
       vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU decompress\n");
+      g_adapt_gpu_absent.store(true, std::memory_order_relaxed);
       // Fall through with device_count=0; CPU pool will handle everything
     }
     // Apply --gpu-devices limit.  Default (0) = use all available GPUs.
@@ -19537,6 +19597,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         }
         // No GPU after all — the CPU pool (already running) does everything.
         vlog(V_VERBOSE, opt, "[GPU] no devices found; hybrid running CPU-only\n");
+        g_adapt_gpu_absent.store(true, std::memory_order_relaxed);
         return;
       }
       total_hw_devices = dc;
@@ -22812,7 +22873,8 @@ static void apply_backend_defaults(Options & opt)
   // Hoisted out of the gate below: the backend prior's explore-once branch needs
   // the same size estimate to tell whether an exploratory run could ever be
   // recorded (see there).
-  uint64_t known = 0;
+  uint64_t known_input = 0;   // on-disk bytes: duration prediction
+  uint64_t known_work  = 0;   // uncompressed bytes: the GPU batch gate
   bool all_known = false;
   {
     const std::vector<std::string> & srcs =
@@ -22824,18 +22886,22 @@ static void apply_backend_defaults(Options & opt)
         all_known = false;
         break;
       }
-      known += (uint64_t)st.st_size;
-      // Decompress compares against an UNCOMPRESSED bound, so scale by the
-      // archive's own measured expansion ratio (see the helper).  Compress needs
-      // no adjustment: its input already IS the uncompressed data.
-      if (opt.mode != Mode::COMPRESS)
-        known += adapt_decomp_uncompressed_est(in, (uint64_t)st.st_size)
-                 - (uint64_t)st.st_size;
+      known_input += (uint64_t)st.st_size;
+      // TWO DOMAINS, TWO VARIABLES.  `known_work` feeds the GPU batch gate, whose
+      // bound is in UNCOMPRESSED bytes, so decompress scales it by the archive's
+      // own measured expansion ratio.  `known_input` stays the on-disk size and
+      // feeds duration prediction, which divides by input_gibs -- an input-domain
+      // rate.  Overloading one variable for both simply moved the domain mix from
+      // the gate to the predictor: an archive expanding 16x predicted 16x its real
+      // duration and let through probes that finish under the save floor.
+      known_work += (opt.mode == Mode::COMPRESS)
+                      ? (uint64_t)st.st_size
+                      : adapt_decomp_uncompressed_est(in, (uint64_t)st.st_size);
     }
   }
   if (!opt.cpu_only) {
     const uint64_t one_batch = gpu_min_useful_bytes(opt);
-    if (one_batch && all_known && known < one_batch) {
+    if (one_batch && all_known && known_work < one_batch) {
       opt.cpu_only = true;
       opt.hybrid = false;
       opt.gpu_only = false;
@@ -22844,7 +22910,7 @@ static void apply_backend_defaults(Options & opt)
         std::snprintf(b, sizeof(b),
           "[GPU] input %.1f MiB < one GPU batch (%.0f MiB); cpu-only "
           "(GPU init would cost more than the whole job)\n",
-          known / 1048576.0, one_batch / 1048576.0);
+          known_work / 1048576.0, one_batch / 1048576.0);
         vlog(V_VERBOSE, opt, b);
       }
       return;
@@ -22912,7 +22978,7 @@ static void apply_backend_defaults(Options & opt)
     // may well be long, and refusing to explore is the worse failure.
     const bool explorable =
         !all_known || prior_dir.input_gibs <= 0
-        || double(known) / (prior_dir.input_gibs * 1073741824.0)
+        || double(known_input) / (prior_dir.input_gibs * 1073741824.0)
              >= double(adapt_save_min_ns()) / 1e9;
     // Would the static rules below land on cpu-only if the prior stayed silent?
     // Decompress does when the fabric is Gen<4 (D2H cost dwarfs the benefit) or
@@ -23461,10 +23527,12 @@ static Options parse_args(int argc, char ** argv)
       opt.output = argv[++i];
       // -o implies not-stdout unless the path is literally "stdout" or "-"
       if (opt.output == "-") { opt.to_stdout = true; opt.output = "stdout"; }
+      else opt.output_named = true;   // a real destination, not the stdout sentinel
     }
     else if (a.rfind("--output=", 0) == 0) {
       opt.output = a.substr(9);
       if (opt.output.empty()) die_usage("missing value for --output");
+      if (opt.output != "-") opt.output_named = true;
       if (opt.output == "-") { opt.to_stdout = true; opt.output = "stdout"; }
     }
     else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) {
@@ -23877,8 +23945,7 @@ static Options parse_args(int argc, char ** argv)
   // out.zst, with no diagnostic.  zstd rejects the combination; match it.  `-o -`
   // is NOT a conflict: it normalises to stdout above, which is the same request.
   // -t forces stdout below but writes nothing, so it is exempt.
-  if (opt.mode != Mode::TEST && opt.to_stdout
-      && !opt.output.empty() && opt.output != "stdout")
+  if (opt.mode != Mode::TEST && opt.to_stdout && opt.output_named)
     die_usage("-c/--stdout cannot be combined with -o/--output "
               "(they name different destinations)");
   if (opt.mode == Mode::TEST) { opt.to_stdout = true; opt.output = "stdout"; }
