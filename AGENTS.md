@@ -82,9 +82,9 @@ silently compiled out.
 - The per-engine `cpu_gibs`/`gpu_gibs` EMAs are duty-cycle-biased. They seed the
   scheduler, which is a fair use; the backend *choice* was deliberately moved off them.
 
-### `--adapt` backend prior — open findings (v0.15.37, all opt-in-only)
+### `--adapt` backend prior — open findings (as of v0.15.39, all opt-in-only)
 
-Most of the v0.15.37 ledger is closed. What remains, deliberately:
+What remains after four independent review passes, deliberately:
 
 - **A residency bucket mixes durations.** Short workloads where hybrid declines by
   policy and longer ones where it would engage share a bucket, so a hybrid rate
@@ -106,18 +106,18 @@ Most of the v0.15.37 ledger is closed. What remains, deliberately:
 - The extract governor never reads the supervisor's `ewgrow_cap_`, so a
   cap-clamped final grow round can persist a pool size that never existed.
 - `q_max_bytes_` is sized from the base pool and never resized when it grows.
-- **A leading `-` among several inputs routes EVERY input to stdout** (`gzstd - a.bin`
-  writes both to fd 1 and never creates `a.bin.zst`). Pre-existing — verified
-  identical in v0.15.38 and v0.15.39 by building both. Worth noting that the
-  obvious fix (make the implicit-stdin default single-input-only) also changes
-  DELETION: today `to_stdout` forces `keep`, so `a.bin` survives; per-file routing
-  would compress it to `a.bin.zst` and then remove the source under gzip
-  semantics. That makes it a deliberate semantics decision, not a routing tweak.
 - CLI ergonomics: `--watchdog SECS` accepts only the `=` form; `-T -5` is silently ignored;
   `-0` is a usage error where zstd maps it to its default level.
 - An exception escaping the compress reader region would meet ~6 joinable threads
   and call `std::terminate`. Pre-existing; `die()` is `std::exit`, so the fatal
-  path itself is safe.
+  path itself is safe. Fixing it means restructuring teardown in the same region a
+  review already found a race in, so it wants its own change and its own suite run.
+- The decompress size estimator opens and preads up to 1 MiB **per input**, so a
+  very long input list pays that at startup.
+- The O_DIRECT bounce aggregate is held near 256 MiB only while the writer pool
+  stays at or under 256 writers; past that the 1 MiB per-thread floor wins and the
+  total grows with the pool again. Accepted: smaller writes would cost more than
+  the memory saves.
 
 ## What good review output looks like
 
