@@ -1,11 +1,45 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.36  
+**Covers:** v0.9.50 → v0.15.37  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.37 — a second model reviews the keyed prior, and finds the fixes incomplete
+
+The v0.15.36 keying was reviewed independently by a different model (Codex CLI / GPT-5.6-sol) rather than another instance of the one that wrote it — the review agents used until now share the author's weights, and therefore its blind spots. It produced the full state-transition table and seven findings, including incomplete fixes for three of the four defects v0.15.36 claimed to close. Three are fixed here; the rest are recorded in `AGENTS.md` rather than rushed in ahead of a tag.
+
+**A faulted probe never recorded its attempt.** `adapt_merge_dir` increments `runs` and returns early on a GPU fault, and that return sits *above* the attempt-stamp block v0.15.36 added. So a probe that faulted left its `_run` stamp untouched and was selected again on the very next run — a machine with failing hardware re-paying the fault and the CPU rebuild forever. The stamp is now written on the fault path too, unconditionally: a fault means no backend rate was accepted, even when the run was attributed to the backend it was probing.
+
+**The exploration predictor mixed byte domains.** `explorable` divides a stat'd input size by `overall_gibs` — but `overall_gibs` is a *payload* rate, which for decompress means uncompressed output bytes. Dividing compressed bytes by an uncompressed rate understates a decompress run's duration by the compression ratio, so a 1 GiB archive expanding to 8 GiB predicted 0.5 s against a 3 s floor and was refused exploration entirely. Exactly the high-ratio archives that most deserve a probe were the ones it silently skipped. A companion `input_gibs` key now records the same wall clock against the input domain, and duration prediction uses it.
+
+**A driver change invalidated the GPU rate but not the hybrid one.** The profile loader already drops `gpu_gibs` and `settled_batch` when the driver string changes. The end-to-end `overall_gibs_hybrid` rates came from that same GPU stack and are just as stale, yet loaded unconditionally — so a pre-change measurement could select hybrid immediately on a driver the machine had never actually measured. Those rates and their stamps are now dropped too, so the next run explores afresh.
+
+### Closing the remaining known issues
+
+With a tag imminent, the rest of the open ledger was worked through rather than carried.
+
+**The `--adapt` prior no longer learns from runs that measured something else.** `--keep-going` (damaged-archive recovery: single reader, one-shot decode, deliberately slow) and `--sliding-window` (a compatibility constraint) both force cpu-only for reasons unrelated to speed, and were filing that as a cpu-only rate. **`--cold` and `--direct-read` leave the run unkeyed**: both bypass the page cache, so a resident input would be classed *warm* and then measured at device speed, teaching the warm bucket a cold number. **Multi-input runs without `-o`** no longer assume a regular sink — the destinations are derived later in the loop and any of them could be an existing FIFO or device, which would make the run sink-bound while the guard reported otherwise.
+
+**A stale hybrid rate can now be corrected.** The deeper half of the frozen-winner problem was that a run which *selects* hybrid and then has the GPU decline was filed as a cpu measurement — so the stale hybrid number survived and won again, forever. The fix is to distinguish *declined by policy* from *absent*: when the lazy-engagement guard or the drained-queue check keeps the GPU out, that is the hybrid backend correctly deciding the GPU would not pay for itself, and the resulting end-to-end rate is hybrid's honest rate for that workload. When the GPU is simply absent or hidden, the run measured the CPU and is still not called hybrid.
+
+**Compress gained the drained-queue guard decompress always had.** If the CPU pool finishes the whole input while `cuInit` runs, spawning GPU workers creates contexts for no work and only delays exit. This is the case that came up repeatedly in round-trip testing.
+
+**A hand-edited profile can no longer disable exploration.** A `_run` stamp greater than `runs` made the recheck condition false forever, silently retiring that side; a `runs` value past 2^53 stops incrementing and freezes the cadence entirely. Both are now clamped on load.
+
+**The O_DIRECT staging footprint is bounded.** Each writer lazily allocates an aligned bounce buffer for large-file part writes. At a fixed 16 MiB ceiling with a pool that `--adapt` may grow to the machine's thread count, the aggregate reached ~4 GiB on a 256-thread box — harmless here, an OOM on a small host. The per-thread size is now derived from an aggregate budget, so total staging stays around one pipeline's worth however wide the pool grows. Measured on a large-file archive with a 192-thread writer pool, median of three: **1.07 s → 0.98 s**, so the smaller chunks cost nothing.
+
+Also removed dead `peak_decoders`, and corrected the decode-pool comments and `-v` string, which still described the earlier "inline until writers starve" design rather than the START-HIGH/CONTRACT one that actually ships.
+
+### Pre-tag validation
+
+Three archive shapes round-tripped byte-identical (2.3 GB of huge files, 20 000 small files, 2.3 GB compressible). More usefully, the GPU path was finally exercised end-to-end — every earlier attempt had the GPU decline to engage, which turned out to be the feature working rather than a test failure.
+
+Forcing the question produced the clearest measurement yet of the v0.15.31 lazy-engagement guard. On a 2.3 GB compressible input at `-T 1`, hybrid with the guard disabled ran **5.88 s** with 8 device workers online; with the guard active it declined the GPU and finished in **3.24 s**. The sample it acted on: *8% done at 253 ms, 2.48 s remaining, guard 4.0 s.* The guard was right — engaging would have cost ~4 s of `cuInit` to save ~2 s of work. Decompress declines for a different documented reason: 96 CPU threads drain a 1.7 GB archive before `cuInit` returns.
+
+With the guard overridden, hybrid compress (8 workers), `--gpu-only` compress with GPU verify, and `--gpu-only` decompress (8 devices) all round-trip byte-identical.
 
 ## v0.15.36 — the backend prior is keyed by input residency, and the state machine that keying broke
 

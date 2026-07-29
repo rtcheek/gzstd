@@ -3352,7 +3352,17 @@ fi
 # Craft a cpu-dominant profile for this machine's fingerprint.
 [[ "$FP_DRV" == "(none)" ]] && FP_DRV=""
 mkdir -p "$APRI_XDG/gzstd"
-cat > "$APRI" <<APROF_EOF
+# Write the crafted profile FRESH for each sub-step.  These steps used to chain
+# sed edits over the previous file, which silently broke whenever a run actually
+# saved: step 4b picks hybrid, and GZSTD_DEBUG_GPU_GUARD_SEC=0 (exported above)
+# forces it to pay a full cuInit, pushing the run past the 3 s save floor.  The
+# emitter then rewrote the file — reformatting 2.0 as 2 and adding _run stamps —
+# so the next sed matched nothing and the step under test saw the wrong state.
+# It passed or failed on how warm the driver happened to be. Seed, do not patch.
+apri_seed() {   # $1 = overall_gibs_cpu ("" to omit), $2 = overall_gibs_hybrid
+  local cpu_kv=""
+  [[ -n "$1" ]] && cpu_kv="\"overall_gibs_cpu\": $1, "
+  cat > "$APRI" <<APROF_EOF
 {
   "gzstd_profile": 1,
   "entries": {
@@ -3360,12 +3370,14 @@ cat > "$APRI" <<APROF_EOF
       "fingerprint": "crafted",
       "driver": "$FP_DRV",
       "compress": { "runs": 3, "cpu_gibs": 10.0, "gpu_gibs": 2.0,
-                    "overall_gibs_cpu": 10.0, "overall_gibs_hybrid": 2.0,
+                    ${cpu_kv}"overall_gibs_hybrid": $2,
                     "regime": "compute-bound" }
     }
   }
 }
 APROF_EOF
+}
+apri_seed 10.0 2.0
 
 if has_gpu 2>/dev/null; then
   # 4. The prior flips the compress default to whichever backend MEASURED faster
@@ -3384,7 +3396,7 @@ if has_gpu 2>/dev/null; then
 
   # 4b. The SAME machinery must pick hybrid when hybrid is the faster measurement
   # -- otherwise this is just a hardcoded "CPU wins" wearing a measurement.
-  sed -i 's/"overall_gibs_cpu": 10.0, "overall_gibs_hybrid": 2.0/"overall_gibs_cpu": 2.0, "overall_gibs_hybrid": 10.0/' "$APRI"
+  apri_seed 2.0 10.0
   env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt -k -f \
     "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp2.zst" 2>"$TMPDIR/apri-pri2.err"
   if grep -q "defaulting compress to --hybrid" "$TMPDIR/apri-pri2.err"; then
@@ -3396,7 +3408,7 @@ if has_gpu 2>/dev/null; then
 
   # 4c. Only hybrid measured -> explore cpu-only once, so the pair becomes
   # comparable on the next run.  Without this the prior can never learn.
-  sed -i 's/"overall_gibs_cpu": 2.0, "overall_gibs_hybrid": 10.0/"overall_gibs_hybrid": 10.0/' "$APRI"
+  apri_seed "" 10.0
   env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt -k -f \
     "$TMPDIR/medium.txt" -o "$TMPDIR/apri-fp3.zst" 2>"$TMPDIR/apri-pri3.err"
   if grep -q "exploring cpu-only" "$TMPDIR/apri-pri3.err"; then
@@ -3406,7 +3418,7 @@ if has_gpu 2>/dev/null; then
          "($(grep -o 'profile prior.*' "$TMPDIR/apri-pri3.err" | head -1))"
   fi
   # restore the cpu-dominant pair for the override test below
-  sed -i 's/"overall_gibs_hybrid": 10.0/"overall_gibs_cpu": 10.0, "overall_gibs_hybrid": 2.0/' "$APRI"
+  apri_seed 10.0 2.0
 
   # 5. An explicit backend flag beats the prior (no defaulting line).
   env XDG_CACHE_HOME="$APRI_XDG" "$GZSTD" --adapt --hybrid -k -f \
