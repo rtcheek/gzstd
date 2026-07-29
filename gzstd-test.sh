@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=354
-$EXTENSIVE && EXPECTED_TESTS=487
+EXPECTED_TESTS=360
+$EXTENSIVE && EXPECTED_TESTS=493
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -688,6 +688,7 @@ cp "$TMPDIR/small.txt" "$TMPDIR/multi1.txt"; cp "$TMPDIR/medium.txt" "$TMPDIR/mu
 files_match "$TMPDIR/small.txt" "$TMPDIR/multi1.txt" && files_match "$TMPDIR/medium.txt" "$TMPDIR/multi2.txt" \
   && pass "decompress 2 files" || fail "decompress 2 files" "mismatch"
 rm -f "$TMPDIR/multi1.txt" "$TMPDIR/multi2.txt" "$TMPDIR/multi1.txt.zst" "$TMPDIR/multi2.txt.zst"
+
 
 # ============================================================
 # 9. Sparse files
@@ -5774,6 +5775,41 @@ else
 
   rm -rf "$LS" "$LA"
 fi
+
+# ============================================================
+# Multi-input "-" routing and --rm ordering (always run)
+# ============================================================
+section "Multi-input stdin routing and --rm ordering"
+
+# A "-" among several inputs must affect only ITS OWN destination.  Both bugs below
+# were order-dependent and silent, and neither was caught by the two-named-file
+# cases above: `gzstd - FILE` used to route EVERY input to stdout (so FILE.zst was
+# never created), and a stdout destination used to set opt.keep for the whole run,
+# suppressing --rm for every later input.  Encoded so they cannot come back quietly.
+for dash_pos in first second; do
+  MD="$TMPDIR/mdash"; rm -rf "$MD"; mkdir -p "$MD"
+  cp "$TMPDIR/medium.txt" "$MD/named.bin"
+  if [[ "$dash_pos" == first ]]; then ARGS=(- "$MD/named.bin"); else ARGS=("$MD/named.bin" -); fi
+  printf 'stdin-payload' | "$GZSTD" -q -f --cpu-only "${ARGS[@]}" > "$MD/piped.zst" 2>/dev/null
+  if [[ -s "$MD/piped.zst" && -f "$MD/named.bin.zst" ]]; then
+    pass "multi-input with '-' $dash_pos: stdin streams, named file gets its own .zst"
+  else
+    fail "multi-input with '-' $dash_pos" \
+         "piped=$([[ -s $MD/piped.zst ]] && echo yes || echo no) named.zst=$([[ -f $MD/named.bin.zst ]] && echo yes || echo MISSING)"
+  fi
+  # Default keeps the named source; --rm removes it, in EITHER order.
+  [[ -f "$MD/named.bin" ]] && pass "multi-input with '-' $dash_pos: default keeps the source" \
+                           || fail "multi-input with '-' $dash_pos: default keeps the source"
+  rm -f "$MD/named.bin.zst" "$MD/piped.zst"; cp "$TMPDIR/medium.txt" "$MD/named.bin"
+  printf 'stdin-payload' | "$GZSTD" -q -f --cpu-only --rm "${ARGS[@]}" > "$MD/piped.zst" 2>/dev/null
+  if [[ ! -f "$MD/named.bin" && -f "$MD/named.bin.zst" ]]; then
+    pass "multi-input with '-' $dash_pos: --rm removes the named source"
+  else
+    fail "multi-input with '-' $dash_pos: --rm removes the named source" \
+         "named.bin=$([[ -f $MD/named.bin ]] && echo still-there || echo gone)"
+  fi
+  rm -rf "$MD"
+done
 
 # ============================================================
 # Terminal-output guard (refuse compressed data to a TTY)

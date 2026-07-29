@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.38";
+static constexpr const char * GZSTD_VERSION = "0.15.39";
 //
 // Architecture overview:
 //
@@ -416,9 +416,14 @@ struct Options {
   bool direct_io_user_set = false; // true if user passed --direct/--no-direct (suppresses the Gen4 decompress auto-default)
   bool use_mmap = true;           // --mmap=on/off: zero-copy mmap reader for regular-file inputs
   bool mmap_user_set = false;     // true if --mmap/--no-mmap given (suppresses the pre-6.4 large-file auto-gate)
-  bool output_named = false;      // -o named a real path (not "-"): distinguishes it
-                                 // from the internal "stdout" sentinel, so `-o stdout`
-                                 // cannot slip past the -c/-o conflict check
+  // Destination provenance, kept separate from the resolved effect (to_stdout).
+  // Collapsing them made -o order-dependent: whichever of `-o -` / `-o FILE` came
+  // first won a flag the other could not clear, so one order reported a phantom
+  // -c/-o conflict.  Each -o occurrence now REPLACES both, and to_stdout is
+  // resolved from them once, after parsing.
+  bool stdout_flag = false;       // an explicit -c/--stdout/--to-stdout appeared
+  bool output_named = false;      // the last -o named a real path
+  bool output_dash  = false;      // the last -o was "-" (same destination as -c)
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool watchdog = false;          // --watchdog: arm the GPU deadlock watchdog (diagnostic; dumps JSON + aborts on a stall)
   int  watchdog_secs = 30;        // --watchdog=SECS: stall timeout in seconds (default 30)
@@ -3573,7 +3578,12 @@ static AdaptPriors adapt_load_priors()
   const AdaptJv * entry = entries->get(fp.hash);
   if (!entry || entry->t != AdaptJv::OBJ) return P;
   P.loaded = true;
-  P.gpu_valid = (entry->gstr("driver", "") == fp.driver);
+  {
+    // Same presence rule as the save path: a missing or non-string driver is NOT a
+    // match, even when the current probe also yields an empty string.
+    const AdaptJv * dvp = entry->get("driver");
+    P.gpu_valid = (dvp && dvp->t == AdaptJv::STR && dvp->str == fp.driver);
+  }
   static const char * names[2] = { "compress", "decompress" };
   for (int d = 0; d < 2; ++d) {
     const AdaptJv * dj = entry->get(names[d]);
@@ -3720,8 +3730,22 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   // is entry-wide.  Zero them in BOTH directions first; 0 is what the loader
   // already treats as "untried", so this is a clear without needing key deletion.
   {
-    const std::string prev_drv = entry.gstr("driver", "");
-    if (!prev_drv.empty() && prev_drv != fp.driver) {
+    // A MISSING or EMPTY stored driver counts as a mismatch, not as "no change".
+    // Skipping it left stale GPU keys in place for an entry whose driver was never
+    // recorded (an older profile, or a transient probe failure): the loader masked
+    // them, this function then stamped the new driver, and the next run read them
+    // as valid.  Only an exact match may skip the clear.
+    // `gstr()` cannot distinguish a missing key, a null/numeric value, and a
+    // genuine empty string -- all three yield "".  That mattered: an entry with no
+    // driver, on a host whose GPU enumeration works but whose version probe returns
+    // "", compared equal, so the loader called the GPU priors valid AND the save
+    // skipped clearing them.  Require the key to be PRESENT and a STRING before an
+    // equal comparison is allowed to skip the clear.  A genuine stored "" against a
+    // current "" is the one empty case that legitimately matches and skips.
+    const AdaptJv * dvp = entry.get("driver");
+    const bool have_drv = (dvp && dvp->t == AdaptJv::STR);
+    const std::string prev_drv = have_drv ? dvp->str : std::string();
+    if (!have_drv || prev_drv != fp.driver) {
       std::vector<std::string> gpu_keys = {
         "gpu_gibs", "settled_batch",
         "overall_gibs_hybrid", "overall_gibs_hybrid_run",
@@ -3741,7 +3765,10 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
            + fp.driver + "); clearing GPU-derived priors\n");
     }
   }
-  if (!fp.driver.empty()) entry.put_str("driver", fp.driver);
+  // Persist unconditionally, empty included: storing nothing when the probe found
+  // nothing left the OLD driver string behind, which re-triggered invalidation on
+  // every subsequent run.
+  entry.put_str("driver", fp.driver);
   const char * dname = (opt.mode == Mode::COMPRESS) ? "compress" : "decompress";
   AdaptJv & dir = entry.set(dname);
   dir.t = AdaptJv::OBJ;
@@ -21428,13 +21455,25 @@ int main(int argc, char ** argv)
     if (fd >= 0) (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
   }
 #endif
-  bool to_stdout = (opt.to_stdout || (!opt.output.empty() && opt.output == "stdout"));
+  // Do not infer the destination from the output STRING -- that made a file
+  // literally named "stdout" unreachable (`-o stdout` wrote to fd 1) and bypassed
+  // the write-to-a-terminal guard, since to_stdout stayed false.  But the run-wide
+  // flag alone is not sufficient either: with several inputs and no -o, each
+  // destination is DERIVED above, and derive_output("-") yields the stdout
+  // sentinel without anything setting the flag.  So decide per file, from the
+  // input rather than from the string: a "-" input whose destination was derived
+  // (not named by -o) goes to fd 1.
+  const bool to_stdout = opt.to_stdout
+      || (opt.input == "-" && !opt.output_named && opt.output == "stdout");
 
   // When writing to stdout, force keep (can't delete stdin) and set binary mode
-  if (to_stdout) {
-    opt.keep = true;
-    set_binary_mode(stdout);
-  }
+  // Writing THIS file to stdout means there is no output file to replace, so its
+  // source must survive -- but do NOT mutate opt.keep to say so.  opt persists
+  // across the per-file loop, so one stdout-destined input silently suppressed
+  // --rm for every input after it: `--rm - a.bin` left a.bin in place while
+  // `--rm a.bin -` removed it.  Keep it per file.
+  const bool keep_this_file = opt.keep || to_stdout;
+  if (to_stdout) set_binary_mode(stdout);
 
   std::string tmp;         // non-empty only when using atomic temp file (-f overwrite)
   bool use_atomic = false; // true when writing to .tmp then renaming
@@ -22053,7 +22092,7 @@ int main(int argc, char ** argv)
     }
     // Success: disarm cleanup (temp or direct output file is now final)
     clear_tmp_file();
-    if (!opt.keep && opt.input != "-") {
+    if (!keep_this_file && opt.input != "-") {
       std::error_code ec_rm;
       fs::remove(opt.input, ec_rm);
     }
@@ -23458,7 +23497,9 @@ static Options parse_args(int argc, char ** argv)
       opt.verify = true;          // implied: you asked for a retry bound
       opt.verify_retries = n;
     }
-    else if (a == "-c" || a == "--stdout" || a == "--to-stdout") opt.to_stdout = true;
+    else if (a == "-c" || a == "--stdout" || a == "--to-stdout") {
+      opt.stdout_flag = true; opt.to_stdout = true;
+    }
     else if (a == "-v" || a == "--verbose") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
     else if (a == "-vvv") opt.verbosity = V_TRACE;
@@ -23525,15 +23566,19 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "-o" || a == "--output") {
       if (i + 1 >= argc) die_usage("missing value for " + a);
       opt.output = argv[++i];
-      // -o implies not-stdout unless the path is literally "stdout" or "-"
-      if (opt.output == "-") { opt.to_stdout = true; opt.output = "stdout"; }
-      else opt.output_named = true;   // a real destination, not the stdout sentinel
+      // REPLACE both on every occurrence, in both directions, so neither order of
+      // `-o -` and `-o FILE` leaves the other's decision behind.  Note `-o stdout`
+      // is an ordinary NAMED file now, not a special case.
+      opt.output_dash  = (opt.output == "-");
+      opt.output_named = !opt.output_dash;
+      if (opt.output_dash) opt.output = "stdout";
     }
     else if (a.rfind("--output=", 0) == 0) {
       opt.output = a.substr(9);
       if (opt.output.empty()) die_usage("missing value for --output");
-      if (opt.output != "-") opt.output_named = true;
-      if (opt.output == "-") { opt.to_stdout = true; opt.output = "stdout"; }
+      opt.output_dash  = (opt.output == "-");
+      opt.output_named = !opt.output_dash;
+      if (opt.output_dash) opt.output = "stdout";
     }
     else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) {
       // Validate the documented range (parity with --hybrid-floor-factor;
@@ -23790,8 +23835,15 @@ static Options parse_args(int argc, char ** argv)
   // Set opt.input to first file for backward compat in single-file paths
   opt.input = opt.inputs[0];
 
-  // When reading from stdin, default to stdout output (pipe-friendly, like gzip/zstd)
-  if (opt.input == "-" && opt.output.empty()) opt.to_stdout = true;
+  // When reading from stdin, default to stdout output (pipe-friendly, like
+  // gzip/zstd).  SINGLE INPUT ONLY: this decision is taken from inputs[0] but was
+  // applied run-wide, so `gzstd - a.bin` skipped per-file output derivation for
+  // EVERY input and concatenated both archives onto fd 1 -- a.bin.zst was never
+  // created, while the same two arguments reversed (`gzstd a.bin -`) behaved
+  // correctly.  With several inputs each destination is derived per file, and the
+  // "-" among them is routed to fd 1 there.
+  if (opt.inputs.size() == 1 && opt.input == "-" && opt.output.empty())
+    opt.to_stdout = true;
 
   // When writing to stdout (-c), always keep the input file (can't delete stdin,
   // and deleting a named file when output goes to stdout matches gzip behavior)
@@ -23945,7 +23997,14 @@ static Options parse_args(int argc, char ** argv)
   // out.zst, with no diagnostic.  zstd rejects the combination; match it.  `-o -`
   // is NOT a conflict: it normalises to stdout above, which is the same request.
   // -t forces stdout below but writes nothing, so it is exempt.
-  if (opt.mode != Mode::TEST && opt.to_stdout && opt.output_named)
+  // Resolve the effect from the provenance -- by OR, never by assignment.  A plain
+  // assignment here silently dropped the implicit-stdin decision made earlier (and
+  // the implicit tar-create one), which skipped the terminal guard below and
+  // emitted compressed bytes straight at a tty without -f.  `-o` no longer touches
+  // to_stdout during parsing, so the only other writers are those implicit paths
+  // and -t, all of which must survive.
+  opt.to_stdout = opt.to_stdout || opt.stdout_flag || opt.output_dash;
+  if (opt.mode != Mode::TEST && opt.stdout_flag && opt.output_named)
     die_usage("-c/--stdout cannot be combined with -o/--output "
               "(they name different destinations)");
   if (opt.mode == Mode::TEST) { opt.to_stdout = true; opt.output = "stdout"; }
@@ -23962,7 +24021,15 @@ static Options parse_args(int argc, char ** argv)
   // zstd/gzip.  Catches the common slip of forgetting -o (e.g. `gzstd --tar
   // ~/backup` with no -o would otherwise spray a .tar.zst at the screen).
   // Compression only — decompressed output to a terminal is fine.  -f overrides.
-  if (opt.mode == Mode::COMPRESS && opt.to_stdout && !opt.force && is_stdout_tty())
+  // A "-" among SEVERAL inputs is routed to fd 1 per file, later, so run-wide
+  // to_stdout is false and this guard would miss it.  Ask the same question the
+  // per-file decision asks -- will anything end up on fd 1 -- without setting
+  // to_stdout, which would wrongly send the OTHER inputs there too.
+  bool any_stdout_dest = opt.to_stdout;
+  if (!any_stdout_dest && !opt.output_named)
+    for (const std::string & in : opt.inputs)
+      if (in == "-") { any_stdout_dest = true; break; }
+  if (opt.mode == Mode::COMPRESS && any_stdout_dest && !opt.force && is_stdout_tty())
     die_usage("refusing to write compressed data to the terminal "
               "(use -o FILE, redirect stdout, or -f to force)");
 

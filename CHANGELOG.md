@@ -1,11 +1,45 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.38  
+**Covers:** v0.9.50 → v0.15.39  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.39 — two fixes that were only half-fixes, and a flag that got sticky
+
+A third bounded pass by the independent reviewer, this time asked to confirm or reject each of its own previous findings as fixed rather than to review freely. Four of six confirmed; two were incomplete in ways the original triggers did not cover, and one fix introduced a small regression of its own.
+
+**Driver invalidation skipped entries whose driver was never recorded.** v0.15.38 cleared stale GPU-derived keys when the stored driver differed — but guarded on `!prev_drv.empty()`, so an entry with a missing or empty `driver` field (an older profile, or a run where the version probe failed transiently) skipped the clear entirely, then had the new driver stamped on top, and the next run read those stale values as valid. The mirror case was just as wrong: a non-empty driver becoming empty cleared the keys but left the old string stored, so invalidation re-triggered on every subsequent run. Now only an exact match skips the clear, and the driver is persisted unconditionally — empty included — so the stored state cannot drift from what was actually probed.
+
+**The stdout sentinel still collided where it mattered.** v0.15.38 stopped `-o stdout` from bypassing the `-c`/`-o` conflict check, but that was the parser half. Execution still inferred the destination from the output *string*: any output equal to `"stdout"` went to fd 1 regardless, so `gzstd -o stdout FILE` wrote compressed bytes to the terminal instead of creating a file named `stdout` — and because `to_stdout` remained false, it also bypassed the write-to-a-terminal guard. `opt.to_stdout` is now authoritative; `parse_args` already sets it for `-o -` and the no-args stdin case, so the flag alone suffices. A file named `stdout` is now reachable, which it had not been.
+
+**And the fix for that made `-o` sticky.** Marking a named output set the flag but never cleared it, so `gzstd -o out.zst -o - FILE` reported a `-c`/`-o` conflict for a command line containing no `-c`. The flag is now reassigned on every occurrence, including to false for `-`.
+
+Confirmed fixed and not re-examined: the clamp/load ordering, the two byte domains, absence outranking a policy decline, and the bounce-buffer ceiling — the reviewer verified the writer expression matches the supervisor in all four branches (pinned, no prior, seeded prior, no `--adapt`) and that the size is finalised before any writer starts.
+
+It also corrected three of my verification claims: the driver check proved only the non-empty-to-different case, the four `-c`/`-o` forms proved the parser check rather than the file-opening path, and zero-as-absent is genuinely equivalent for every consumer — that one I had asserted without checking all of them.
+
+**A fourth pass found all three of those fixes still incomplete**, each for a reason the original trigger did not reach — which is the argument for reviewing a fix against the *class* of bug rather than the instance.
+
+- **`gstr()` cannot tell a missing key from an empty string.** A missing, null, or numeric `driver` all read as `""`, so on a host whose GPU enumerates but whose version probe returns `""`, the stored and current values compared equal: the loader called the GPU priors valid *and* the save skipped clearing them. Both sides now require the key to be present *and* a string before equality may skip the clear. Verified across missing, `null`, numeric, and genuinely-empty stored values.
+- **The stdout fix broke multi-input routing.** With several inputs and no `-o`, each destination is derived in the loop, and `derive_output("-")` yields the stdout sentinel without setting the flag — so `cat data | gzstd FILE -` wrote a disk file named `stdout` instead of streaming. The decision is now made per file from the *input* (`-` with a derived destination) rather than from the output string, which keeps a literal `-o stdout` reachable without losing stdin routing.
+- **`-o` was order-dependent in the other direction.** `-o - -o FILE` left `to_stdout` set from the first occurrence, so it reported a phantom conflict too. Destination provenance is now separate from the resolved effect: `stdout_flag` records an explicit `-c`, each `-o` *replaces* both `output_named` and `output_dash`, and `to_stdout` is resolved once after parsing. The conflict check keys on the explicit `-c`, so neither order of two `-o` flags can fabricate one.
+
+**Two order-dependence bugs in multi-input handling, found by the same pass and fixed rather than filed.** Neither was introduced by this arc; the first has been there as long as the multi-input loop.
+
+`gzstd - a.bin` sent **both** inputs to stdout and never created `a.bin.zst`. The "reading stdin implies writing stdout" default is decided from `inputs[0]` alone but was applied run-wide, so the per-file output derivation was skipped for every input and the two archives were silently concatenated on fd 1. The same two arguments reversed — `gzstd a.bin -` — behaved correctly, which is the clearest statement of the defect: identical inputs, different results by position. The default is now taken only for a single input; with several, each destination is derived per file and the `-` among them is routed to fd 1 there. Verified against a build of the previous version: dash-first now matches dash-second.
+
+Fixing that exposed a second one. The per-file loop set `opt.keep = true` when a file's destination was stdout — mutating state that persists across the loop, so one stdout-destined input suppressed `--rm` for every input after it. `--rm - a.bin` left `a.bin` in place while `--rm a.bin -` removed it. The decision is now a per-file local. Verified in all six combinations: `--rm` deletes the named source in either order, the default keeps in either order, `--rm -c` keeps (nothing replaced the source), and stdin is never a deletion target.
+
+An earlier draft of this entry claimed the first fix would change deletion behaviour and needed a semantics decision. That was wrong: `keep` defaults to true, so deletion only ever happens under an explicit `--rm`, and that path already excluded `-`.
+
+One cost it flagged and I am leaving: the size estimator opens and preads up to 1 MiB per decompression input, so a very long input list pays that at startup. It predates this change and is not worsened by it.
+
+Six regression assertions were added for the two order-dependence bugs, after the reviewer pointed out that neither was encoded anywhere — the existing multi-file tests use two named files and the stdout tests only cover single-input `-c`, so both defects could have returned silently. They discriminate: run against a build of the previous version they fail exactly the two dash-first cases and pass the dash-second ones, which is the bug's signature. Getting them to run took two attempts, both instructive — first they went inside the `$EXTENSIVE` block and silently did not execute, then into a section whose conditional nesting I had misread. A test that does not run looks identical to a test that passes; only the `EXPECTED_TESTS` drift note caught it.
+
+Suites: 360/0 default, 493/0 extensive, 279/0 CPU-only. Both configurations built.
 
 ## v0.15.38 — the independent reviewer finds a bug I shipped, and three of my own fixes overclaiming
 

@@ -20,9 +20,9 @@ persists per-machine verdicts to `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json
 ```bash
 cmake -B build && cmake --build build -j$(nproc)     # GPU build (USE_NVCOMP=ON)
 cmake -B build-nogpu -DUSE_NVCOMP=OFF && cmake --build build-nogpu -j$(nproc)
-./gzstd-test.sh ./build/gzstd        # default suite    (expect 354/0)
-./gzstd-test.sh -e ./build/gzstd     # extensive        (expect 487/0)
-./gzstd-test.sh ./build-nogpu/gzstd  # CPU-only         (expect 273/0, 70 skipped)
+./gzstd-test.sh ./build/gzstd        # default suite    (expect 360/0)
+./gzstd-test.sh -e ./build/gzstd     # extensive        (expect 493/0)
+./gzstd-test.sh ./build-nogpu/gzstd  # CPU-only         (expect 279/0, 70 skipped)
 ```
 
 **Build BOTH configurations before claiming anything.** `USE_NVCOMP=OFF` is the config
@@ -106,8 +106,14 @@ Most of the v0.15.37 ledger is closed. What remains, deliberately:
 - The extract governor never reads the supervisor's `ewgrow_cap_`, so a
   cap-clamped final grow round can persist a pool size that never existed.
 - `q_max_bytes_` is sized from the base pool and never resized when it grows.
-- CLI ergonomics: `-c` silently overrides `-o` (zstd errors instead);
-  `--watchdog SECS` accepts only the `=` form; `-T -5` is silently ignored;
+- **A leading `-` among several inputs routes EVERY input to stdout** (`gzstd - a.bin`
+  writes both to fd 1 and never creates `a.bin.zst`). Pre-existing — verified
+  identical in v0.15.38 and v0.15.39 by building both. Worth noting that the
+  obvious fix (make the implicit-stdin default single-input-only) also changes
+  DELETION: today `to_stdout` forces `keep`, so `a.bin` survives; per-file routing
+  would compress it to `a.bin.zst` and then remove the source under gzip
+  semantics. That makes it a deliberate semantics decision, not a routing tweak.
+- CLI ergonomics: `--watchdog SECS` accepts only the `=` form; `-T -5` is silently ignored;
   `-0` is a usage error where zstd maps it to its default level.
 - An exception escaping the compress reader region would meet ~6 joinable threads
   and call `std::terminate`. Pre-existing; `die()` is `std::exit`, so the fatal
