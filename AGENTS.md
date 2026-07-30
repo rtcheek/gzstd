@@ -43,19 +43,73 @@ silently compiled out.
 
 ## Measured facts — do not report these as bugs
 
-- **cpu-only is genuinely the fastest backend for compress** on the 256-core box:
-  4.24 GiB/s vs 1.87 hybrid. Repeatedly measured. `--adapt` learning cpu-only is the
-  feature working, not a regression.
-- **Warm vs cold input is a real 1.5x split**: the same 1.4 GiB archive decompresses at
-  2.28 GiB/s warm (page-cache resident) and 1.55 GiB/s cold. A single blended average
-  (1.91) describes neither — this is why the backend prior is keyed by residency.
+- **cpu-only is genuinely the fastest backend for compress** on the 256-core box, and
+  `--adapt` learning cpu-only is the feature working, not a regression. The *margin*,
+  measured on 64 GiB of 28%-ratio data, median of 5, input and output on separate NVMe:
+
+  | | cpu-only | `--adapt` | `--hybrid` | `--hybrid`, GPU forced |
+  |---|---|---|---|---|
+  | warm | **7.80 GiB/s** | 7.28 (1.07x) | 6.96 (1.12x) | 6.20 (1.26x) |
+  | cold | **2.79 GiB/s** | 2.68 (1.04x) | 2.56 (1.09x) | 2.56 (1.09x) |
+
+  This replaces an earlier "4.24 vs 1.87 GiB/s" (a 2.27x gap) that no longer reproduces.
+  That figure predates the v0.15.31 lazy engagement guard, when `--hybrid` paid `cuInit`
+  unconditionally; with the guard the GPU is usually declined and the gap is ~1.1x. Do
+  not quote the old number to justify a default — the conclusion survived, the margin
+  did not.
+
+  **Most of hybrid's cost is not the GPU**, decomposed on the warm runs: hybrid runs where
+  the guard declined and no CUDA call was ever made *still* took 8.78 s vs cpu-only's
+  8.21 s. So ~+7% is paid before the GPU is involved at all, and engaging it adds only
+  another ~5%. **The cause of that +7% is NOT the CPU pool size** — a first pass here said
+  it was, and that was wrong: `--cpu-only` and `--hybrid` both start **96** worker threads
+  on this 256-core box (`[CPU] 96 worker threads online` vs `[HYBRID] starting CPU pool:
+  96 threads`). Verify before repeating either claim. The remaining candidates are the
+  hybrid scheduler's own overhead — `HybridSched` bookkeeping, the deferred-bringup
+  thread, and the greedy-batch queue discipline — none of which has been isolated yet.
+
+  **Caveat, stated because it bounds the claim:** the GPU arms were measured with another
+  tenant resident on all 8 GPUs (11–44% median utilization, bursts to 69%). The CPU was
+  quiet (load ~1.2 of 256). Contention can only have inflated the GPU-engaged rows, so
+  the ~1.1x is an upper bound on hybrid's true deficit and a quiet GPU might narrow it.
+  The +7% pool cost and the cpu-only figures are contention-independent.
+- **Warm vs cold input is a SMALL-INPUT effect, and it decays to nothing.** The backend
+  prior is keyed by residency (v0.15.36) on the strength of one 1.4 GiB sample measured at
+  2.28 GiB/s warm vs 1.55 cold (1.47x). A size sweep — decompress, cpu-only, median of 5,
+  warm vs cold at each point — does not reproduce that magnitude and shows the split
+  dying as input grows (split = warm rate / cold rate):
+
+  | archive | 0.15 | 0.31 | 0.57 | 1.14 | 2.27 | 4.54 | 9.09 | 18.18 GiB |
+  |---|---|---|---|---|---|---|---|---|
+  | to a file | 1.11x | 1.09x | 1.16x | 1.12x | 1.07x | 1.05x | 1.01x | 0.95x |
+  | to `/dev/null` | 1.15x | 1.20x | **1.34x** | **1.31x** | 1.16x | 1.06x | 0.99x | 0.96x |
+
+  Two readings. **The split peaks around a 0.6–1.1 GiB archive and is gone (<=1.06x) above
+  ~4.5 GiB** — at 18 GiB warm and cold are identical (20.12 s each, ranges overlapping).
+  And **it is always larger without a write bottleneck**, because a file sink partly masks
+  the read; even so, the realistic file-sink case never exceeds 1.16x at any size tested.
+
+  **Two hypotheses tested and REJECTED**, so they are not re-litigated:
+  - *Read/write device contention* is not the cause. With the output device held fixed, a
+    cold read from the same device gave 1.51 GiB/s vs 1.55 from a different one — 3%.
+  - *Page cache absorbing the write* is not the mechanism either; this box has 1.5 TB of
+    RAM, so a 64 GiB output fits in cache and the split is gone there anyway.
+
+  **What actually dominates is the OUTPUT device, which the prior does not key on at all**:
+  the same 1.14 GiB archive decompresses at 2.59 GiB/s writing to one NVMe and 1.67 to the
+  other — a 1.55x swing, larger than residency ever produced. Before trusting the residency
+  keying, weigh it against that. Open question, not yet a change: whether residency is
+  worth keying on at all above a few GiB, given it also feeds the known-open "residency
+  buckets mix durations" defect below.
 - **Zero GPU workers is a supported state**, verified not assumed.
 - **The provisional device count over-estimates on purpose** (`max(gpu_devices, 8)`); the
   throttle is RAM-capped downstream, so over-estimating is harmless.
 - **`--tar` extract is device-write-bound** at roughly the box's write ceiling; the
   backend barely moves it, and cpu-only is the correct default there.
 - **Compress progress must be measured as work COMPLETED, not bytes read.** With mmap the
-  reader finishes at t≈0. Anyone "fixing" that back re-breaks GPU engagement.
+  reader finishes at t≈0. Anyone "fixing" that back re-breaks GPU engagement. (Completed
+  work is the right *denominator* and this must not be reverted — but it is not the same
+  thing as wall-clock progress when the run is sink-bound; see the guard entry below.)
 
 ## Deliberate design decisions
 
@@ -82,6 +136,19 @@ silently compiled out.
 ## Known-open, already recorded — do not re-report as new
 
 - The GPU engagement guard is blind to a *busy* GPU (another tenant using it).
+- **The engagement guard extrapolates a pre-backpressure burst, so it underestimates
+  remaining work on a sink-bound run.** `comp_progress` (`gzstd.cpp:17907`) is
+  `tasks_done * host_chunk / total_in` — *compute* completion. The guard samples it over
+  a 150 ms window starting 100 ms in, while the compressors are still filling a
+  134 GiB in-flight allowance and have not yet met the sink. Traced on a 64 GiB compress:
+  at 253 ms it saw 4% done, computed ~16 GiB/s, and predicted **3.85 s remaining against
+  a 4.0 s guard → skip**. The run took **9.2 s**. Being decided by a 4% margin on a
+  mis-scaled signal, it also *flaps*: identical invocations engage or skip run to run.
+  Same family as the v0.15.33 EMA defect (measuring an engine only while it bursts).
+  **Deliberately not fixed yet**: on this box engaging the GPU is *slower* (see the
+  compress table above), so the guard reaches the right answer for the wrong reason, and
+  a fix cannot be justified until it is measured on a GPU-favourable box. Sampling later,
+  or over a window that has met backpressure, is the likely shape of the fix.
 - `--tar` creation from a pipe cannot be size-gated (inherent).
 - The per-engine `cpu_gibs`/`gpu_gibs` EMAs are duty-cycle-biased. They seed the
   scheduler, which is a fair use; the backend *choice* was deliberately moved off them.

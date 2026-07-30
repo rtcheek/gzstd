@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.40";
+static constexpr const char * GZSTD_VERSION = "0.15.41";
 //
 // Architecture overview:
 //
@@ -297,6 +297,24 @@ static void setup_signal_handlers()
 ======================================================================*/
 static const size_t ONE_MIB = size_t(1024) * size_t(1024);
 static const size_t DEFAULT_CHUNK_MIB = 16;
+
+// Cold-input read-path probe (compress, non-tar).  Each pass runs for this long
+// before the paths are compared.  TIME, not bytes: at the default 16 MiB chunk a
+// fixed 32 MiB window would be two reads — enough to measure device-queue ramp
+// and thread-pool startup and nothing else — and it would shrink to one read if
+// --chunk-size were raised.
+static const double READ_PROBE_SECS       = 0.20;
+// Floor, so a very fast device still gets a usable sample.  The buffered pass
+// raises this to cover every reader thread several times over: a pass shorter
+// than one full round would charge the pooled reader for its own startup and
+// hand the comparison to O_DIRECT for the wrong reason.
+static const size_t READ_PROBE_MIN_CHUNKS = 8;
+static const size_t READ_PROBE_ROUNDS     = 3;
+// Safety ceiling only; the clock normally stops a pass long before this.
+static const size_t READ_PROBE_MAX_CHUNKS = 512;
+// Below this the probe is not worth its own startup, and the two passes would be
+// a large fraction of the job.
+static const uint64_t READ_PROBE_MIN_INPUT = 4ull * 1024 * 1024 * 1024;
 // A first frame larger than this is treated as a single-frame file (zstd /
 // --sliding-window) and streamed directly from the file rather than buffered
 // through the queue.  Sits well above gzstd's largest practical chunk
@@ -428,6 +446,7 @@ struct Options {
   bool watchdog = false;          // --watchdog: arm the GPU deadlock watchdog (diagnostic; dumps JSON + aborts on a stall)
   int  watchdog_secs = 30;        // --watchdog=SECS: stall timeout in seconds (default 30)
   bool direct_read = false;       // --direct-read: O_DIRECT input — bypass the page cache (no populate/evict)
+  bool direct_read_user_set = false;  // true if --direct-read/--no-direct-read given (never auto-overridden)
   size_t read_threads = 0;        // --read-threads N: buffered pooled-reader threads
                                   //  (0 = auto: clamp(threads/8, 3, 12))
   size_t write_threads = 0;       // --write-threads N: -d --tar extractor writer pool (0 = auto: min(threads,16))
@@ -891,7 +910,9 @@ static void print_help()
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
 "  --watchdog[=SECS]   arm the GPU deadlock watchdog (DIAGNOSTIC ONLY: if a\n"
 "                      hybrid/GPU run stalls SECS s (default 30), dump JSON + abort)\n"
-"  --direct-read       O_DIRECT input, single stream: bypass the page cache\n"
+"  --direct-read / --no-direct-read\n"
+"                      O_DIRECT input, single stream: bypass the page cache\n"
+"                      (--adapt may enable it for a cold compress; --no- pins off)\n"
 "                      for one-pass speedups and honest cold benchmarks\n"
 "  --read-threads N    parallel readers for the BUFFERED input path (default:\n"
 "                      auto 3..12 by -T; 1 = single; n/a for pipes/--direct-read)\n"
@@ -1170,7 +1191,7 @@ static void print_help_long()
 "     to fread; on 6.4+ kernels mmap stays on (zero-copy wins there).\n"
 "     --mmap / --no-mmap force the choice and override the auto-gate.\n"
 "\n"
-"  --direct-read    (default: off)\n"
+"  --direct-read / --no-direct-read    (default: off)\n"
 "     Read the input with O_DIRECT: transfer straight from disk into an\n"
 "     aligned buffer, BYPASSING the page cache entirely (it neither\n"
 "     reads from nor populates it).  Two uses: (1) a one-pass speedup —\n"
@@ -1185,6 +1206,12 @@ static void print_help_long()
 "     big-RAM box the buffered path is usually faster (reads served from\n"
 "     cache), so this is mainly a benchmarking / one-pass tool.\n"
 "     Independent of --direct, which is O_DIRECT for OUTPUT.\n"
+"     Under --adapt this can switch itself ON for a COLD compress input:\n"
+"     mmap is much slower than O_DIRECT when nothing is cached, and the\n"
+"     ranking reverses once the input is warm, so residency picks the\n"
+"     reader.  It is measured per machine before being adopted, never\n"
+"     applied to --tar (where --direct-read is a no-op), and\n"
+"     --no-direct-read pins it off.\n"
 "\n"
 "  --read-threads N    (default: 0 = auto)\n"
 "     Number of parallel reader threads for the BUFFERED input path.  A\n"
@@ -2170,6 +2197,16 @@ static std::atomic<bool> g_adapt_gpu_absent{false};
 // winner between the two rules.  Set once, in apply_backend_defaults; never reset
 // by the governor, which starts after the probe has already run.
 static std::atomic<int> g_adapt_resid_class{-1};
+// Is THIS run's input cold, for READ-PATH purposes?  -1 unknown, 0 warm, 1 cold.
+// Deliberately separate from g_adapt_resid_class above: that one keys the BACKEND
+// prior and is decompress-only, whereas the read path wants the same question
+// answered for compress too — and reusing it would start bucketing compress
+// backend rates by residency as a side effect, which is a different change.
+// Measured 2026-07-30, 64 GiB single-file compress, median of 5: the mmap reader
+// runs 2.77 GiB/s cold but 7.99 warm, while O_DIRECT is residency-INDEPENDENT at
+// 4.88 either way.  So the best read path INVERTS with residency, and a rate
+// averaged across both classes describes neither — hence the separate bucket.
+static std::atomic<int> g_adapt_src_cold{-1};
 // Which backend this run is EXPLORING, if any (0 none, 1 cpu-only, 2 hybrid).
 // An exploration does not always produce a measurement of the thing it explored:
 // a hybrid probe whose lazy-engagement guard declines the GPU records a CPU rate,
@@ -3401,6 +3438,7 @@ struct AdaptObs {
   int tar_write_threads = 0;                     // -d --tar: settled pool size (0 = untried)
   int tar_wclass = -1;                           // -d --tar: workload class the size belongs to
   int resid_class = -1;                          // input residency class the backend rate belongs to
+  int src_cold = -1;                             // read-path residency (-1 unknown, 0 warm, 1 cold)
   int explored = 0;                              // backend this run was exploring (0/1/2)
   // Which backend actually ran, so the end-to-end rate is filed under it.
   // 0 = do not record (gpu-only, or a run that never chose): the backend prior
@@ -3414,6 +3452,7 @@ struct AdaptObs {
     if (const char * p = g_adapt_src_path.load(std::memory_order_relaxed))
       src_path = p;
     resid_class = g_adapt_resid_class.load(std::memory_order_relaxed);
+    src_cold    = g_adapt_src_cold.load(std::memory_order_relaxed);
     explored    = g_adapt_explored.load(std::memory_order_relaxed);
     if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
       writer_par = wp;
@@ -3566,10 +3605,20 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
   }
   if (!obs.src_path.empty()) {
     dir.put_str("src_path", obs.src_path);
-    if (wall_s > 0 && obs.payload_bytes > 0)
+    if (wall_s > 0 && obs.payload_bytes > 0) {
+      const double rate = obs.payload_bytes / GiB / wall_s;
       dir.put_num("path_" + obs.src_path + "_gibs",
-                  ema(dir.gnum("path_" + obs.src_path + "_gibs", 0),
-                      obs.payload_bytes / GiB / wall_s));
+                  ema(dir.gnum("path_" + obs.src_path + "_gibs", 0), rate));
+      // Additionally file COLD runs under their own key.  Dual-write rather than
+      // switching keys: the flat key has existing consumers (the decompress
+      // read-path prior) whose behaviour must not change, and a cold-only key
+      // that simply does not exist in an older profile reads back as 0 =
+      // "untried", which is exactly the right starting state.  So this is
+      // additive — no schema epoch bump, no host profile reset.
+      if (obs.src_cold == 1)
+        dir.put_num("path_" + obs.src_path + "_cold_gibs",
+                    ema(dir.gnum("path_" + obs.src_path + "_cold_gibs", 0), rate));
+    }
   }
 }
 
@@ -3590,7 +3639,9 @@ struct AdaptPriors {
     // Same pair, bucketed by input residency class ([0] = cold, [1] = warm).
     double overall_cpu_cls[2] = {0, 0}, overall_hybrid_cls[2] = {0, 0};
     double overall_cpu_cls_run[2] = {0, 0}, overall_hybrid_cls_run[2] = {0, 0};
-    double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates
+    double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates (all residencies)
+    // Same three, measured only on COLD input.  0 = never measured cold here.
+    double path_mmap_cold = 0, path_pread_cold = 0, path_direct_cold = 0;
     double writer_par = 0;                                  // probe verdict
     double tar_write_threads = 0;                           // -d --tar settled pool size (flat fallback)
     double tar_wt_class[ADAPT_TAR_WCLASSES] = {0, 0, 0};    // -d --tar settled size per workload class
@@ -3671,6 +3722,9 @@ static AdaptPriors adapt_load_priors()
     D.path_mmap     = dj->gnum("path_mmap_gibs", 0);
     D.path_pread    = dj->gnum("path_pread_gibs", 0);
     D.path_direct   = dj->gnum("path_direct_gibs", 0);
+    D.path_mmap_cold   = dj->gnum("path_mmap_cold_gibs", 0);
+    D.path_pread_cold  = dj->gnum("path_pread_cold_gibs", 0);
+    D.path_direct_cold = dj->gnum("path_direct_cold_gibs", 0);
     D.writer_par    = dj->gnum("writer_par", 0);
     D.tar_write_threads = dj->gnum("tar_write_threads", 0);
     D.tar_wt_converged  = dj->gnum("tar_wt_converged", 0);
@@ -10403,12 +10457,82 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 // the ResultStore with distant-seq frames, exhausts FrameThrottle permits
 // and then the pool, and starves the region the writer needs (the
 // re_enqueue FIFO-invariant deadlock).  O_DIRECT always stays 1 stream.
+// Is `path` backed by rotating media?  Only ever answers TRUE when the kernel
+// positively says so — an unknown device (no sysfs, network filesystem, device
+// mapper without the attribute) returns false, because this gates a fast path
+// and "don't know" must not silently disable it.
+//
+// Used as a cheap NEGATIVE filter before the O_DIRECT read probe: queue-depth-1
+// strided O_DIRECT on a spinning disk is pathological, and no measurement is
+// worth taking to discover that.  Costs ~60 us: one stat plus one small sysfs
+// read.  Note this says nothing about whether O_DIRECT is a WIN — both machines
+// on record are non-rotational and one of them regresses 20-40% — so it can
+// only rule the fast path out, never in.
+// Defined far below with the other --adapt probes, but the compress read path
+// needs it here and is NOT --adapt-gated: the cold-input read probe is a plain
+// default.  Returns the page-cache-resident fraction, or -1 if unknowable.
+static double adapt_path_residency(const std::string & path);
+
+static bool device_is_rotational(const std::string & path)
+{
+#ifdef _WIN32
+  (void)path; return false;
+#else
+  struct stat st{};
+  if (::stat(path.c_str(), &st) != 0) return false;
+  char p[128];
+  std::snprintf(p, sizeof p, "/sys/dev/block/%u:%u/queue/rotational",
+                (unsigned)major(st.st_dev), (unsigned)minor(st.st_dev));
+  FILE * f = std::fopen(p, "r");
+  if (!f) {
+    // Partitions carry no queue/ of their own; the attribute lives on the
+    // parent disk node.
+    std::snprintf(p, sizeof p, "/sys/dev/block/%u:%u/../queue/rotational",
+                  (unsigned)major(st.st_dev), (unsigned)minor(st.st_dev));
+    f = std::fopen(p, "r");
+  }
+  if (!f) return false;
+  int v = 0;
+  const bool got = (std::fscanf(f, "%d", &v) == 1);
+  std::fclose(f);
+  return got && v == 1;
+#endif
+}
+
+// A bounded pass over the input, so the same reader can be run twice at the
+// start of a job to MEASURE two read paths against each other on the real data
+// (see the cold-input O_DIRECT probe) and then run once more, unbounded, for the
+// remainder.  Chunk indices are absolute, so consecutive passes hand off at a
+// chunk boundary with `seq` still monotonic and no byte read twice.
+//
+// Bounded by TIME rather than bytes on purpose.  A fixed byte window would be
+// two 16 MiB reads at the default chunk size — long enough to measure queue
+// ramp and thread-pool startup, and nothing else — and would silently shrink to
+// a single read if someone raised --chunk-size.  A time box self-scales across
+// devices; min_chunks keeps a very fast device from sampling too few reads.
+struct ReadWindow {
+  size_t   start_chunk = 0;          // first absolute chunk index this pass reads
+  size_t   max_chunks  = SIZE_MAX;   // hard ceiling on chunks claimed by this pass
+  double   target_secs = 0.0;        // stop once this much time has elapsed...
+  size_t   min_chunks  = 0;          // ...but never before this many chunks land
+  std::atomic<size_t>   chunks{0};   // results: chunks actually read
+  std::atomic<uint64_t> bytes{0};    //          bytes actually read
+  double   secs = 0.0;               //          wall time this pass took
+  bool     eof  = false;             //          the FILE ended inside this pass
+};
+
 template <typename Emit>   // template so the lambda inlines (and -Wnonnull sees the
                            // pooled/aligned buffer as non-null)
 static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
                                Meter * m, DirectReadPool * pool, bool o_direct,
-                               int n_readers, int borrowed_fd, Emit && emit)
+                               int n_readers, int borrowed_fd, Emit && emit,
+                               ReadWindow * win = nullptr)
 {
+  const auto win_t0 = std::chrono::steady_clock::now();
+  auto win_elapsed = [&win_t0] {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - win_t0).count();
+  };
   // borrowed_fd >= 0: pread an already-open fd (an inherited, seekable stdin)
   // — don't close it.  Otherwise open the path ourselves (and close at exit).
   const bool owns_fd = (borrowed_fd < 0);
@@ -10437,7 +10561,23 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
   auto read_loop = [&]() {
     for (;;) {
       if (done.load(std::memory_order_relaxed)) break;
-      const size_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+      const size_t rel = next_idx.fetch_add(1, std::memory_order_relaxed);
+      if (win) {
+        // Stop claiming work when the pass is full or its time is up.  Setting
+        // `done` ends the pass for every reader thread, not just this one — the
+        // caller needs them all parked before it can time the next path.
+        // min_chunks wins over the clock so a very fast device still yields a
+        // usable sample; max_chunks is the hard ceiling either way.
+        // target_secs <= 0 means NO time limit — the final unbounded pass uses a
+        // window only to carry its start offset, and must not stop at once.
+        if (rel >= win->max_chunks
+            || (win->target_secs > 0.0 && rel >= win->min_chunks
+                && win_elapsed() >= win->target_secs)) {
+          done.store(true, std::memory_order_relaxed);
+          break;
+        }
+      }
+      const size_t idx = (win ? win->start_chunk : 0) + rel;
       int slot = -1;
       char * buf;
       if (pool) {                           // blocks when all bufs in flight = backpressure
@@ -10461,6 +10601,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
       }
       if (got == 0) {                       // at/past EOF (exact-multiple end, or a
         if (pool) pool->release(slot);      // racing thread's idx beyond the short read)
+        if (win) win->eof = true;           // the FILE ended, not just this pass
         done.store(true, std::memory_order_relaxed);
         break;
       }
@@ -10470,10 +10611,18 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
         if (g_perf) { g_perf->read_ns.fetch_add(r_dt); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
       }
       if (m) m->read_bytes.fetch_add((uint64_t)got);
+      if (win) {
+        win->chunks.fetch_add(1, std::memory_order_relaxed);
+        win->bytes.fetch_add((uint64_t)got, std::memory_order_relaxed);
+      }
       // emit takes ownership of `slot` in the pool path (the Task carries it and the
       // worker releases it); the reader must not touch the buffer after this.
       bool cont = emit(static_cast<const char *>(buf), (size_t)got, idx, slot);
       if (!cont || (size_t)got < cap) {     // abort, or short read ⇒ this was the last chunk
+        // A short read is end-of-FILE; !cont is a caller abort and must NOT be
+        // reported as eof, or the probe would treat an aborted pass as a
+        // finished job and skip the remainder.
+        if (win && (size_t)got < cap && cont) win->eof = true;
         done.store(true, std::memory_order_relaxed);
         break;
       }
@@ -10489,6 +10638,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
     read_loop();
     for (auto & th : rthr) th.join();
   }
+  if (win) win->secs = win_elapsed();
   if (!pool) free(scratch);
   if (owns_fd) ::close(fd);   // borrowed (inherited stdin) fd: leave it open
   if (io_error.load(std::memory_order_relaxed))
@@ -15270,7 +15420,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   bool dr_pool_ok = false, dr_pool_tried = false;
   // borrowed_fd >= 0: pread that already-open fd (a seekable stdin redirect),
   // sizing the pool from known_size; else read opt.input by path.
-  auto run_pooled_reader = [&](bool o_direct, int borrowed_fd, uint64_t known_size) -> bool {
+  auto run_pooled_reader = [&](bool o_direct, int borrowed_fd, uint64_t known_size,
+                               ReadWindow * win = nullptr) -> bool {
     const size_t cap = ((host_chunk + 4095) / 4096) * 4096;
     // Buffered mode fans the kernel copy out over several threads (the wall
     // is the per-thread cold-destination copy at ~2.5-3.5 GB/s, not the
@@ -15312,12 +15463,95 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
           enqueue_direct_chunk(queue, idx, buf, n);   // seq deterministic by file position
         }
         return true;
-      });
+      }, win);
+  };
+
+  // ---- Cold-input read-path probe ---------------------------------------
+  // Reads the FIRST window with O_DIRECT and the SECOND with the buffered pool,
+  // times both, then finishes the file with whichever won.  The probe bytes are
+  // real work — nothing is read twice and nothing is discarded — so the only
+  // cost is running one window on the losing path.
+  //
+  // Measured 2026-07-30, 64 GiB cold single-file compress, median of 5:
+  // O_DIRECT 4.88 GiB/s vs the best buffered configuration 3.94 and the mmap
+  // default 2.77.  O_DIRECT is residency-INDEPENDENT (it bypasses the cache and
+  // reads at device speed either way) while mmap collapses cold, so the winner
+  // inverts with residency and the choice has to be made per run.
+  //
+  // Why measure instead of ruling: --direct-read REGRESSES compress 20-40% on a
+  // low-core box, and neither PCIe generation nor "is it NVMe" separates that
+  // machine from this one — both are Gen4+ NVMe.  The only signal that
+  // distinguishes them is the rate itself.
+  auto run_probed_reader = [&]() -> bool {
+    ReadWindow a;                                   // pass 1: O_DIRECT
+    a.start_chunk  = 0;
+    a.target_secs  = READ_PROBE_SECS;
+    a.min_chunks   = READ_PROBE_MIN_CHUNKS;
+    a.max_chunks   = READ_PROBE_MAX_CHUNKS;
+    if (!run_pooled_reader(true, -1, 0, &a)) return false;
+    if (a.eof || a.chunks.load() == 0) return true; // file ended inside the probe
+
+    // The buffered pass must run at least READ_PROBE_ROUNDS full rounds across
+    // its reader threads, or it is timed while still spinning its pool up.
+    const int nb = opt.read_threads > 0
+                     ? (int)opt.read_threads
+                     : std::max(3, std::min(12, threads / 8));
+    ReadWindow b;                                   // pass 2: buffered pool
+    b.start_chunk  = a.start_chunk + a.chunks.load();
+    b.target_secs  = READ_PROBE_SECS;
+    b.min_chunks   = std::max(READ_PROBE_MIN_CHUNKS,
+                              READ_PROBE_ROUNDS * (size_t)nb);
+    b.max_chunks   = READ_PROBE_MAX_CHUNKS;
+    if (!run_pooled_reader(false, -1, 0, &b)) return false;
+    if (b.eof || b.chunks.load() == 0) return true;
+
+    const double ra = a.secs > 0 ? (double)a.bytes.load() / a.secs : 0.0;
+    const double rb = b.secs > 0 ? (double)b.bytes.load() / b.secs : 0.0;
+    // 5% margin, matching the backend prior: a tie keeps the buffered path,
+    // which is what a run without this probe would have used.
+    const bool take_direct = ra > rb * 1.05;
+    if (opt.verbosity >= V_VERBOSE) {
+      char pb[192];
+      std::snprintf(pb, sizeof pb,
+        "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over %.0f/%.0f ms "
+        "-> %s for the remainder\n",
+        ra / 1073741824.0, rb / 1073741824.0, a.secs * 1000.0, b.secs * 1000.0,
+        take_direct ? "O_DIRECT" : "buffered");
+      vlog(V_VERBOSE, opt, pb);
+    }
+    ReadWindow c;                                   // pass 3: the rest, unbounded
+    c.start_chunk = b.start_chunk + b.chunks.load();
+    return run_pooled_reader(take_direct, -1, 0, &c);
   };
   // --direct-read: O_DIRECT input (bypass the page cache).  Takes precedence over
   // mmap (mmap IS the page cache); falls through to fread if O_DIRECT can't open.
   if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input))
     reader_done = run_pooled_reader(true, -1, 0);
+
+  // Cold input, no reader pinned: measure the two paths on the real data and
+  // keep the winner (see run_probed_reader).  Every clause is a reason a
+  // measurement would be meaningless or unwanted:
+  //
+  //   reader_done          another reader already claimed the input
+  //   direct_read_user_set --direct-read / --no-direct-read: user decided
+  //   mmap_user_set        --mmap / --no-mmap: user picked a reader
+  //   cold_read            --cold evicts as it reads; the comparison is a lie
+  //   input == "-"         O_DIRECT needs a seekable regular file
+  //   !is_regular_file     same
+  //   size < 4 GiB         two passes would be a large fraction of the job
+  //   residency >= 0.95    WARM: mmap wins outright (7.99 vs 4.87 GiB/s), so
+  //                        there is nothing to measure
+  //   rotational           queue-depth-1 O_DIRECT on spinning media is
+  //                        pathological; do not spend a probe finding out
+  if (!reader_done && !opt.direct_read_user_set && !opt.mmap_user_set
+      && !opt.cold_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
+    std::error_code pec;
+    const uintmax_t psz_probe = fs::file_size(opt.input, pec);
+    if (!pec && (uint64_t)psz_probe >= READ_PROBE_MIN_INPUT
+        && !device_is_rotational(opt.input)
+        && adapt_path_residency(opt.input) < 0.95)
+      reader_done = run_probed_reader();
+  }
   if (!reader_done && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
       && fs::is_regular_file(opt.input)
       && mmap_ok_for_input(opt, opt.input)
@@ -22792,6 +23026,21 @@ static void apply_backend_defaults(Options & opt)
   // --no-mmap, --direct-read) are never overridden; tar and -l keep their
   // own paths; a non-regular input can't switch (O_DIRECT needs a seekable
   // regular file, and mmap engagement already self-guards).
+  // Read-path residency, for BOTH directions.  Probed here rather than reused
+  // from the backend prior's probe: that one lives under HAVE_NVCOMP and is
+  // decompress-only, so a CPU-only build or a compress run would never see it.
+  // mincore is non-perturbing and faults nothing in, so the (adapt-only,
+  // decompress-only) overlap with that probe costs a second cheap sweep.
+  if (priors.loaded && !opt.tar_mode && !opt.list_mode && !opt.cold_read
+      && !opt.direct_read_user_set) {
+    // adapt_inputs_resid_class: 1 = warm, 0 = cold, -1 = unknown OR inputs
+    // disagree.  Keep all THREE states — collapsing unknown into "warm" would
+    // file an unclassifiable run's rate into a bucket it does not belong to.
+    const int cls = adapt_inputs_resid_class(opt, adapt_input_residency(opt));
+    g_adapt_src_cold.store(cls < 0 ? -1 : (cls == 0 ? 1 : 0),
+                           std::memory_order_relaxed);
+  }
+
   if (priors.loaded && !opt.tar_mode && !opt.list_mode) {
     // The COMPARISON (both paths measured) applies regardless of the current
     // regime: the rates are the settled verdict, the regime was only ever
@@ -22809,7 +23058,69 @@ static void apply_backend_defaults(Options & opt)
     };
     char pline[192]; pline[0] = '\0';
     if (opt.mode == Mode::COMPRESS) {
-      if (!opt.mmap_user_set && opt.use_mmap) {
+      // ---- Cold input: consider the O_DIRECT reader -----------------------
+      // Measured 2026-07-30, 64 GiB single-file compress, median of 5:
+      //   cold  mmap 2.77  pooled-pread 3.38  O_DIRECT 4.88 GiB/s
+      //   warm  mmap 7.99  pooled-pread 10.04 O_DIRECT 4.87 GiB/s
+      // O_DIRECT is residency-independent (it bypasses the cache and reads at
+      // device speed); mmap collapses cold.  So the winner INVERTS, and the
+      // choice is only made for COLD input — warm keeps today's mmap/pread
+      // logic untouched.  Compared against COLD-keyed rates specifically: the
+      // flat path_* rates average both classes and would describe neither.
+      //
+      // Still measurement-gated, not a rule: --direct-read REGRESSES compress
+      // 20-40% on a low-core box (it is a memory-bandwidth win small machines
+      // cannot realise), so this box must measure it before adopting it. The
+      // probe mirrors the decompress branch below.  --tar never reaches here
+      // (gated above): --direct-read is a documented no-op for tar create.
+      //
+      // State table — take O_DIRECT iff every column says yes:
+      //  cold? | reader pinned? | direct_cold | base_cold | src_bound | long? |
+      //  ------+----------------+-------------+-----------+-----------+-------+->
+      //  warm  |       *        |      *      |     *     |     *     |   *   | no (mmap/pread wins warm)
+      //  unk   |       *        |      *      |     *     |     *     |   *   | no (cannot classify)
+      //  cold  |  --mmap/--no-  |      *      |     *     |     *     |   *   | no (user picked a reader)
+      //  cold  | --direct-read  |      *      |     *     |     *     |   *   | no (already on)
+      //  cold  |--no-direct-read|      *      |     *     |     *     |   *   | no (user pinned off)
+      //  cold  |      none      |  > base*1.05|    > 0    |     *     |   *   | YES (measured better)
+      //  cold  |      none      | <= base*1.05|    > 0    |     *     |   *   | no (measured no better)
+      //  cold  |      none      |      0      |    > 0    |     -     |  yes  | YES (probe it once)
+      //  cold  |      none      |      0      |    > 0    |     -     |  no   | no (too short to record)
+      //  cold  |      none      |      *      |     0     |     *     |   *   | no (no cold baseline yet —
+      //                                                                          this run creates one)
+      //
+      // The probe is deliberately NOT gated on source-bound, unlike its
+      // decompress sibling below.  MEASURED: a 64 GiB cold compress that is
+      // plainly read-limited (2.79 GiB/s cold vs 7.80 warm) still classifies
+      // COMPUTE-BOUND, because under mmap the read is paid as page faults
+      // *inside* the compression workers — so they look busy and the governor
+      // cannot see the stall.  mmap disguises I/O as compute, which would close
+      // the source-bound gate on precisely the case this exists to fix.  It is
+      // still bounded: one probe per machine (thereafter direct_cold > 0 and the
+      // 5% comparison decides), and only on runs long enough to be recorded.
+      bool took_direct = false;
+      if (g_adapt_src_cold.load(std::memory_order_relaxed) == 1
+          && !opt.direct_read_user_set && !opt.mmap_user_set) {
+        const double dr   = prior_dir.path_direct_cold;
+        const double base = std::max(prior_dir.path_mmap_cold, prior_dir.path_pread_cold);
+        struct stat dst{};
+        const bool dst_ok = !opt.inputs.empty() && opt.inputs[0] != "-"
+            && ::stat(opt.inputs[0].c_str(), &dst) == 0 && S_ISREG(dst.st_mode);
+        if (base > 0 && dr > base * 1.05) {
+          opt.direct_read = true; took_direct = true;
+          std::snprintf(pline, sizeof(pline),
+            "[ADAPT] cold input: --direct-read (measured %.2f vs %.2f GiB/s cold)\n",
+            dr, base);
+        } else if (base > 0 && dr <= 0
+                   && dst_ok && long_enough((uint64_t)dst.st_size)) {
+          opt.direct_read = true; took_direct = true;
+          std::snprintf(pline, sizeof(pline),
+            "[ADAPT] cold input (best cold read path %.2f GiB/s, O_DIRECT "
+            "untried here): probing --direct-read this run\n", base);
+        }
+      }
+      // mmap-vs-pread only when O_DIRECT was not taken: it supersedes both.
+      if (!took_direct && !opt.mmap_user_set && opt.use_mmap) {
         const double mm = prior_dir.path_mmap, pr = prior_dir.path_pread;
         struct stat cst{};
         const bool cst_ok = !opt.inputs.empty() && opt.inputs[0] != "-"
@@ -23432,7 +23743,11 @@ static Options parse_args(int argc, char ** argv)
       opt.watchdog_secs = parse_int_value("--watchdog", a.substr(11));
       if (opt.watchdog_secs < 0) die_usage("--watchdog seconds must be >= 0 (0 disables the stall check)");
     }
-    else if (a == "--direct-read") opt.direct_read = true;
+    else if (a == "--direct-read") { opt.direct_read = true;  opt.direct_read_user_set = true; }
+    // The negation exists because --adapt can now turn O_DIRECT reads ON by
+    // itself for a cold compress; anything enabled automatically needs a way to
+    // be turned off again.
+    else if (a == "--no-direct-read") { opt.direct_read = false; opt.direct_read_user_set = true; }
     else if (parse_num_arg("read-threads", i, argc, argv, opt.read_threads)) { }
     else if (parse_num_arg("write-threads", i, argc, argv, opt.write_threads)) { }
     // --tar introduces the archive sub-invocation: positionals that follow it

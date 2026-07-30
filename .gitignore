@@ -1,4 +1,5 @@
 build/
+build-cpu/
 build-static/
 build-portable/
 
@@ -13,3 +14,20 @@ td.tar
 td.tar.zst
 home/
 gzstd-help.txt
+
+# Ad-hoc perf/validation harnesses kept alongside the tracked scripts but
+# deliberately NOT committed (same treatment as verify-restore.sh): they encode
+# one box's paths and corpora, and go stale faster than they earn review.
+scripts/ab.sh
+scripts/ab3.sh
+scripts/ab3sum.sh
+scripts/sizesweep.sh
+scripts/sizesweepsum.sh
+scripts/readsweep.sh
+scripts/mktree.py
+scripts/tarreadsweep.sh
+scripts/wsweep.sh
+scripts/greyband.sh
+scripts/wclass.sh
+scripts/gendata.sh
+scripts/suites.sh
