@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.26
+**Current version:** v0.15.40
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -981,11 +981,11 @@ verbatim) without breaking existing gzstd scripts using `--format=gnu`.
 | Streaming decompression output | — | HIGH | DONE (v0.12.24) |
 | Asymmetric mode (PCIe Gen3 detection) | 5.1, 5.2 | HIGH | DONE (v0.13.0) |
 | Auto --direct for Gen4+ compress & decompress | 5.3 | HIGH | DONE (decompress v0.13.25, compress v0.13.26) |
-| Persistent auto-tuning (`~/.gzstd/`) | 2.12.3 | Medium | Not started |
+| Persistent auto-tuning (per-machine profile) | 2.1–2.3 | Medium | DONE (`--adapt`, v0.15.0–40) — `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json`, not `~/.gzstd/`; carries a schema epoch that self-resets on a format change (v0.15.40). Opt-in through v0.15.x; default-flip is a v1.0 decision |
 | Rate-matched dispatch (re-enable) | 1.3 | Medium | Disabled, needs eval |
 | Pipe-aware scheduling | 3.1 | Medium | Not started |
 | Streaming mode for unknown-size input | 3.2 | Low | Not started |
-| Multi-reader NVMe | 4.1 | Low | Research |
+| Multi-reader NVMe | 4.1 | Low | DONE for decompress (v0.13.71/75, incl. redirected-stdin and block-device pread); compress deliberately stays single-reader — concurrent O_DIRECT contends |
 | Multi-writer O_DIRECT pwrite | 4.2 | Low | Tested negative for buffered |
 | AsyncWritePool flush() final-batch error | 7.1 | HIGH | DONE (v0.13.23) |
 | GPU result buffer pool (compress + decompress) | 7.2 | HIGH | DONE (decompress v0.13.24, compress v0.13.33) |
@@ -1007,6 +1007,18 @@ verbatim) without breaking existing gzstd scripts using `--format=gnu`.
 | Seek table on PLAIN (non-tar) compress output | — | Low | DONE (v0.14.92) — all compress paths emit it (cpu/gpu/hybrid/serial/stdin verified; --sliding-window and --no-index excluded); self-validating geometry so a wrong table can never be emitted |
 | Warm/cold-adaptive `-l` fallback walk (mincore dispatch → buffered pread walk) | — | Low | DONE (v0.14.93) — warm 65 GiB single frame 3.0 s → 1.29 s (zstd-class; faults 560k → 4.4k); cold keeps the mmap+SEQUENTIAL walk (still beats zstd's QD1 strided reads 38.7 s vs 42.4 s); buffered walk is strictly validated, bails to the mmap walk on anything unmodeled |
 | Cold `-l` walk: batched posix_fadvise(WILLNEED) header prefetch | — | Low | Open — the remaining half: prefetch upcoming header offsets at deep queue so the cold walk reads ~2 GiB of header pages instead of streaming 65 GiB (should beat both tools cold); build on v0.14.93's buffered_frame_walk; validate with the cold umount methodology and scripts/drop_cache |
+| `--adapt`: sub-floor probe records nothing (not even `runs`), so a probe that finishes under the save floor leaves no trace | — | Low | Open (v0.15.39) — a stamp-only save for deliberate attempts would close it |
+| `--adapt`: `g_adapt_gpu_engaged` set at worker SPAWN, not at first completed batch | — | Low | Open (v0.15.39) — drained-queue guards cover the common false positive; move it to the first delivered batch for the complete fix |
+| `--adapt`: a residency bucket mixes durations (short runs where hybrid declines vs long ones where it engages) | — | Medium | Open (v0.15.39) — keying by duration/work class would close it |
+| `-d --tar` pool controller's rate signal is PARSE progress, not write progress (the GPU lazy-spawn estimate rides on it) | tar | Medium | Open (v0.15.39) |
+| GPU batch head-of-line blocking in the decode pool (a parse thread can wait a whole H2D+decode+D2H for a frame at the end of a 64-item batch) | tar | Low | Open |
+| Extract governor never reads the supervisor's `ewgrow_cap_` — a cap-clamped final grow round can persist a pool size that never existed | tar | Low | Open (v0.15.35) |
+| `q_max_bytes_` sized from the base writer pool, never resized when it grows | tar | Low | Open |
+| Decompress size estimator opens + preads 1 MiB PER INPUT (O(inputs) startup on very long lists) | — | Low | Open (v0.15.37) |
+| O_DIRECT bounce aggregate only held near 256 MiB while the writer pool stays ≤256 writers; past that the 1 MiB floor wins | tar | Low | Accepted (v0.15.39) — smaller writes would cost more than the memory saves |
+| `std::terminate` if an exception escapes the compress reader region (~6 joinable threads) | — | Low | Open, pre-existing — `die()` is `std::exit` so the fatal path is safe; fixing it restructures teardown where a review already found a race, so it wants its own change + suite run |
+| CLI ergonomics: `--watchdog SECS` accepts only the `=` form; `-T -5` silently ignored; `-0` a usage error where zstd maps it to its default level | — | Low | Open (v0.15.35) |
+| Quiet-box A/B: `--adapt` vs `--cpu-only` vs `--hybrid`, both directions, median of 3 | — | Medium | **OWED** — the numbers several decisions rest on were measured under ~12% GPU contention, and the warm/cold split quoted in `AGENTS.md` is a single sample |
 | Parallelize the `--tar` layout walk | tar | Medium | DONE (v0.14.9) — the lstat storm (Pass B) runs parallel; serial Pass A enumerate is the residual, unmeasured |
 | Cache-bypass member reads on `--tar` create (FADV_DONTNEED vs O_DIRECT) | tar | Low | Investigate + measure |
 | O_DIRECT extraction writes for large files (Gen4+) | tar | Low | Investigate + measure |
@@ -1328,3 +1340,10 @@ paths (one thread walks the stream in order). Open follow-ups:
 | v0.13.17–v0.13.22 | mmap fault-storm investigation: producer prefault and kernel-gated mmap/fread both tried and reverted (pre-6.4-kernel mmap_lock artifact); `--cold` flag for honest cold-cache benchmarking; mmap restored as default everywhere |
 | v0.13.23 | AsyncWritePool flush() waits for physical write completion (final-batch I/O errors no longer slip past had_error()) |
 | v0.13.24 | Recycled GPU decompress output-buffer pool (DecompStreamCtx::out_pool) — kills per-frame D2H alloc churn; Gen3 proxy −15% faults / −12% RSS on gpu-only -d |
+| v0.13.25–v0.14.95 | See `CHANGELOG.md` — the `--direct` defaults, `--tar` archiving and parallel extract, `--verify`, `--keep-going`, xattr/ACL/SELinux storage, the zero-copy extractor and its windowed part-jobs |
+| v0.15.0–v0.15.20 | `--adapt`: regime classifier + actuators, per-machine profile priors, the decoupled extract pipeline and its shared CPU/GPU decode pool, the unified start-high/contract bottleneck controller |
+| v0.15.21–v0.15.34 | GPU engagement guards (stop paying `cuInit` on inputs too small to use a GPU), the workload-keyed extract writer prior, the end-to-end backend prior, and the CPU-only-build arg-parsing repair |
+| v0.15.35 | **Six-angle code review, 17 defects fixed** — a `ResultStore` resize racing the live writer, every `--adapt` prior compiled out of the CPU-only build, a budget-permit leak that hung on a corrupt tar, a `--cpu-batch` deadlock, and the parallel extract path silently memcpy'ing every byte (peak RSS −27% once fixed) |
+| v0.15.36 | Backend prior **keyed by input residency** (warm 2.28 vs cold 1.55 GiB/s on the same file; the blended 1.91 described neither) + the four state-machine defects keying exposed |
+| v0.15.37–v0.15.39 | **Four independent review passes by a different model** (Codex CLI / GPT-5.6-sol). It found a bug v0.15.37 shipped, three of the fixes that were only half-fixes, and two order-dependence bugs in multi-input handling. Method: ask it to *confirm or reject its own prior findings*, and run it BEFORE the suite — it twice caught what a green suite hid |
+| v0.15.40 | The `--adapt` profile records its **schema epoch** and the writing build's version, and discards itself when the epoch changes — closing the "do the hosts need their cache cleared?" question permanently. The version is never the trigger: it bumps every build |
