@@ -1,11 +1,25 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.39  
+**Covers:** v0.9.50 → v0.15.40  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+## v0.15.40 — the --adapt profile knows which format it was written in
+
+The profile is a per-machine cache that accumulates measurements, and every format change so far has raised the same question by hand: do the deployed hosts need their `~/.cache/gzstd/profile.json` cleared? It now answers itself.
+
+**Two fields, two different jobs.** Every write stamps `gzstd_version` — which build last touched this file — purely as information. Every write also stamps `gzstd_profile`, a **schema epoch** bumped by hand only when a format change makes previously recorded values unsafe to reuse: a key whose meaning changed, a value that may have been written under a since-fixed bug, or a new key the old code could not populate. A run that finds a different epoch discards the whole file and measures fresh, saying so at default verbosity, because a machine that had converged suddenly exploring again would otherwise read as a regression.
+
+**The version is deliberately not the trigger.** `GZSTD_VERSION` bumps on every executable build here — several times a day during an arc like this one — so keying the reset on it would throw away everything each machine had learned, constantly. Verified: a profile carrying epoch 2 and version `0.9.50` is preserved intact (`runs` 99 → 100, rates untouched) while its version stamp is refreshed.
+
+**Epoch 2 is set now**, which resolves the open deployment question for this tag without anyone touching a cache file. Profiles predating it may hold a workload-class value written into the wrong bucket, or a `_run` stamp that suppressed exploration — both fixed during v0.15.35–39, but the recorded values are already wrong. Those hosts will discard and re-measure on their first `--adapt` run.
+
+A schema mismatch is also distinguished from a corrupt file in the `-v` note: "written under an older schema; starting fresh" versus "unreadable; rewriting". They had the same message before, which made a routine upgrade look like corruption.
+
+Verified: an epoch-1 profile with 99 runs of history is discarded and rewritten at epoch 2 with the current version; the next run does not reset again; a truncated file still reports unreadable rather than stale.
 
 ## v0.15.39 — two fixes that were only half-fixes, and a flag that got sticky
 

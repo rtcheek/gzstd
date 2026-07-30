@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.39";
+static constexpr const char * GZSTD_VERSION = "0.15.40";
 //
 // Architecture overview:
 //
@@ -3341,17 +3341,49 @@ static std::string adapt_profile_path()
 
 // Read + strictly parse the profile.  false = no usable profile (absent,
 // unreadable, oversized, or malformed — all benign; caller starts fresh).
-static bool adapt_profile_load(const std::string & path, AdaptJv & root)
+// PROFILE SCHEMA EPOCH.  Bump this — by hand, deliberately — whenever a format
+// change makes previously recorded values unsafe to reuse: a key whose MEANING
+// changed, a value that may have been written under a since-fixed bug, or a new
+// key the old code could not populate.  A run that finds a different epoch throws
+// the whole file away and starts fresh, which is always safe: the profile is a
+// regenerable cache, and a few runs of re-measurement beat learning from data that
+// means something else now.
+//
+// Deliberately NOT the gzstd version.  GZSTD_VERSION bumps on every executable
+// build in this project, so keying the reset on it would discard everything the
+// machine has learned several times a day.  The version IS recorded alongside, as
+// information — "which build last wrote this" — and never as a trigger.
+//
+// epoch 2 (v0.15.40): the v0.15.35–39 arc added the end-to-end backend rates, their
+// _run stamps, the residency buckets and input_gibs, AND fixed bugs that could have
+// written a workload-class value into the wrong bucket or a stamp that suppressed
+// exploration. Profiles predating it may hold values that were wrong when recorded.
+static constexpr double ADAPT_PROFILE_SCHEMA = 2;
+
+enum class AdaptProfileRead {
+  OK,          // usable
+  UNUSABLE,    // absent, oversized, or unparseable
+  STALE,       // parsed fine, but written under a different schema epoch
+};
+
+// Set when a load found a different epoch, so the caller (which has `opt`) can say
+// so.  The loader itself has no verbosity context.
+static bool g_adapt_schema_reset = false;
+
+static AdaptProfileRead adapt_profile_load(const std::string & path, AdaptJv & root)
 {
-  if (path.empty()) return false;
+  if (path.empty()) return AdaptProfileRead::UNUSABLE;
   std::ifstream f(path, std::ios::binary);
-  if (!f) return false;
+  if (!f) return AdaptProfileRead::UNUSABLE;
   std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-  if (text.empty() || text.size() > 1u << 20) return false;   // >1 MiB: not ours
+  if (text.empty() || text.size() > 1u << 20) return AdaptProfileRead::UNUSABLE;  // >1 MiB: not ours
   AdaptJsonParser p(text.data(), text.size());
-  if (!p.parse(root) || root.t != AdaptJv::OBJ) return false;
-  if (root.gnum("gzstd_profile", 0) != 1) return false;
-  return true;
+  if (!p.parse(root) || root.t != AdaptJv::OBJ) return AdaptProfileRead::UNUSABLE;
+  if (root.gnum("gzstd_profile", 0) != ADAPT_PROFILE_SCHEMA) {
+    g_adapt_schema_reset = true;
+    return AdaptProfileRead::STALE;
+  }
+  return AdaptProfileRead::OK;
 }
 
 // One process's accumulated observation, filled on the main thread as each
@@ -3571,7 +3603,7 @@ static AdaptPriors adapt_load_priors()
 {
   AdaptPriors P;
   AdaptJv root;
-  if (!adapt_profile_load(adapt_profile_path(), root)) return P;
+  if (adapt_profile_load(adapt_profile_path(), root) != AdaptProfileRead::OK) return P;
   const AdaptFp & fp = adapt_fingerprint();
   const AdaptJv * entries = root.get("entries");
   if (!entries || entries->t != AdaptJv::OBJ) return P;
@@ -3708,13 +3740,19 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   if (path.empty()) return;
 
   AdaptJv root;
-  if (!adapt_profile_load(path, root)) {
+  const AdaptProfileRead rd = adapt_profile_load(path, root);
+  if (rd != AdaptProfileRead::OK) {
     root = AdaptJv{};
     root.t = AdaptJv::OBJ;
-    root.put_num("gzstd_profile", 1);
     if (fs::exists(path))
-      vlog(V_VERBOSE, opt, "[ADAPT] profile unreadable; rewriting: " + path + "\n");
+      vlog(V_VERBOSE, opt, rd == AdaptProfileRead::STALE
+             ? "[ADAPT] profile written under an older schema; starting fresh: " + path + "\n"
+             : "[ADAPT] profile unreadable; rewriting: " + path + "\n");
   }
+  // Stamp both on every write: the epoch is the reset trigger, the version is
+  // information about which build last touched the file.
+  root.put_num("gzstd_profile", ADAPT_PROFILE_SCHEMA);
+  root.put_str("gzstd_version", GZSTD_VERSION);
 
   const AdaptFp & fp = adapt_fingerprint();
   AdaptJv & entries = root.set("entries");
@@ -22601,6 +22639,13 @@ static void apply_backend_defaults(Options & opt)
            + (fp.driver.empty() ? "(none)" : fp.driver) + " (" + fp.human + ")\n");
     }
     priors = adapt_load_priors();
+    // A schema reset is worth saying at DEFAULT verbosity, once: it explains why a
+    // machine that had converged is suddenly exploring again, which would otherwise
+    // look like a regression.
+    if (g_adapt_schema_reset && opt.verbosity >= V_DEFAULT)
+      vlog(V_DEFAULT, opt,
+           "gzstd: note: --adapt profile was written by an older gzstd whose format "
+           "differs; discarding it and measuring fresh\n");
     if (priors.loaded && opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, std::string("[ADAPT] profile priors loaded")
            + (priors.gpu_valid ? "" : " (driver changed: GPU rates/batch invalidated)")

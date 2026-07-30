@@ -60,6 +60,10 @@ silently compiled out.
 ## Deliberate design decisions
 
 - `--adapt` is opt-in through v0.15.x; making it the default is a v1.0 decision.
+- The `--adapt` profile carries a **schema epoch** (`gzstd_profile`) and the writing
+  build's **version** (`gzstd_version`). Only the EPOCH triggers a reset, and it is
+  bumped by hand when a format change makes old values unsafe to reuse. Never key a
+  reset on the version: it bumps on every executable build here.
 - Priors are *starting points*. Only measurement on the box moves them, and several
   probes deliberately re-explore each run because the optimum is media- and
   workload-dependent.

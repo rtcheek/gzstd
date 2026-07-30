@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=360
-$EXTENSIVE && EXPECTED_TESTS=493
+EXPECTED_TESTS=361
+$EXTENSIVE && EXPECTED_TESTS=494
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3218,8 +3218,24 @@ else
   fail "second run merges (runs: 2, one fingerprint)"
 fi
 
+# The profile carries a SCHEMA EPOCH (gzstd_profile).  A run that finds a different
+# epoch discards the file, so every crafted profile below must claim the CURRENT one
+# or the test would be measuring the reset path instead of what it means to test.
+# Learn the value from the binary under test rather than hardcoding it, so bumping
+# ADAPT_PROFILE_SCHEMA does not silently invalidate these tests.
+PROFILE_SCHEMA=$(
+  _d=$(mktemp -d)
+  env XDG_CACHE_HOME="$_d" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 "$GZSTD" --adapt --cpu-only \
+      -q -f -k "$APROF_SRC" -o "$_d/probe.zst" >/dev/null 2>&1
+  sed -n 's/.*"gzstd_profile": *\([0-9]*\).*/\1/p' "$_d/gzstd/profile.json" 2>/dev/null | head -1
+  rm -rf "$_d"
+)
+[[ -n "$PROFILE_SCHEMA" ]] && pass "profile schema epoch readable from a written profile ($PROFILE_SCHEMA)" \
+                          || fail "profile schema epoch readable from a written profile"
+[[ -n "$PROFILE_SCHEMA" ]] || PROFILE_SCHEMA=1
+
 # 3. A corrupt profile is benign: run exits 0 and the file is rewritten fresh.
-echo '{"gzstd_profile": 1, "entries": {' > "$APROF"   # truncated JSON
+echo '{"gzstd_profile": 1, "entries": {' > "$APROF"   # truncated JSON: unparseable, epoch never reached
 env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --cpu-only -k -f \
   "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>/dev/null
 if [[ $? -eq 0 ]] && grep -q '"runs": 1' "$APROF"; then
@@ -3365,7 +3381,7 @@ apri_seed() {   # $1 = overall_gibs_cpu ("" to omit), $2 = overall_gibs_hybrid
   [[ -n "$1" ]] && cpu_kv="\"overall_gibs_cpu\": $1, "
   cat > "$APRI" <<APROF_EOF
 {
-  "gzstd_profile": 1,
+  "gzstd_profile": $PROFILE_SCHEMA,
   "entries": {
     "$FP_HASH": {
       "fingerprint": "crafted",
@@ -3700,7 +3716,7 @@ if has_nvcomp; then
 
   # 1. A source-bound history on the pread path probes --direct-read once.
   cat > "$ARP" <<ARP_EOF
-{ "gzstd_profile": 1, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
+{ "gzstd_profile": $PROFILE_SCHEMA, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
   "driver": "$ARP_DRV",
   "decompress": { "runs": 3, "regime": "source-bound", "path_pread_gibs": 1.0 } } } }
 ARP_EOF
@@ -3715,7 +3731,7 @@ ARP_EOF
 
   # 2. A worse-measured alternative never flips (5% margin).
   cat > "$ARP" <<ARP_EOF
-{ "gzstd_profile": 1, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
+{ "gzstd_profile": $PROFILE_SCHEMA, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
   "driver": "$ARP_DRV",
   "decompress": { "runs": 3, "regime": "source-bound",
                   "path_pread_gibs": 2.0, "path_direct_gibs": 1.0 } } } }
@@ -3731,7 +3747,7 @@ ARP_EOF
 
   # 3. An explicit --mmap pin beats a compress-side source-bound prior.
   cat > "$ARP" <<ARP_EOF
-{ "gzstd_profile": 1, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
+{ "gzstd_profile": $PROFILE_SCHEMA, "entries": { "$ARP_HASH": { "fingerprint": "crafted",
   "driver": "$ARP_DRV",
   "compress": { "runs": 3, "regime": "source-bound", "path_mmap_gibs": 1.0 } } } }
 ARP_EOF
@@ -3781,7 +3797,7 @@ if has_nvcomp; then
   [[ "$AWP_DRV" == "(none)" ]] && AWP_DRV=""
   mkdir -p "$AWP_XDG/gzstd"
   cat > "$AWP_XDG/gzstd/profile.json" <<AWP_EOF
-{ "gzstd_profile": 1, "entries": { "$AWP_HASH": { "fingerprint": "crafted",
+{ "gzstd_profile": $PROFILE_SCHEMA, "entries": { "$AWP_HASH": { "fingerprint": "crafted",
   "driver": "$AWP_DRV", "compress": { "runs": 3, "writer_par": -1 } } } }
 AWP_EOF
   env XDG_CACHE_HOME="$AWP_XDG" GZSTD_DEBUG_ADAPT_REGIME=sink-bound "$GZSTD" \
