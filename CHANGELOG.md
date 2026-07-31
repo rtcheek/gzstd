@@ -1,9 +1,31 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.44  
+**Covers:** v0.9.50 → v0.15.45  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.45 — the settled reader count persists, keyed by the regime it was measured in
+
+v0.15.44 re-climbed from the static start on every run, costing about 1.5 s on a 32 GiB input. The settled count now persists — but **one number per machine would have been wrong**, because the count is regime-dependent: 27 copy-bound and 6–18 device-bound on the same machine, same direction. A flat prior would be re-taught on every alternation, which is the workload-blind failure the extract writer prior already hit once.
+
+**Keyed by the coordinates knowable BEFORE the run**, which is the constraint a seed has to live with — the governor's own regime verdict only exists once the run is over. Those coordinates are input residency and sink class, and they reproduce the three regimes actually measured:
+
+| bucket | regime | settled here |
+|---|---|---|
+| `cold_file` | device-bound | 6 |
+| `warm_nofile` | copy-bound | 27 |
+| `warm_file` | sink-bound | masked; any value performs the same |
+
+**No flat fallback for seeding**, and that was a real finding rather than a precaution: with one, a copy-bound run started at 6 because that was the cold bucket's number, when its own optimum is 27. Seeding from a different regime is worse than not seeding at all. An empty bucket means this machine has not measured this regime, so the run starts at the static default and goes and measures it. The flat key is still written, for diagnostics.
+
+**The geometry is recorded with the value** (`rd_ctx_chunk_mib`, `rd_ctx_threads`). The count is a property of chunk size and consumer count, not of the box alone, so a run whose shape differs materially declines the seed rather than inheriting it.
+
+A seed only moves the *starting* point; the controller still probes, so a machine whose media or workload changed re-measures instead of freezing on a stale verdict. Verified: cold runs climb 12 → 6 then start at 6 from the profile and stay there, while a copy-bound run in the same profile correctly ignores that bucket and starts at 12.
+
+**Known limitation:** a fast regime produces short runs, which fall under the profile's save floor — so the fastest regimes are the least likely to persist a verdict. The only cost is re-climbing, and the floor exists for good reasons, so it is left alone.
 
 ---
 

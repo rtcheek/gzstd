@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.44";
+static constexpr const char * GZSTD_VERSION = "0.15.45";
 //
 // Architecture overview:
 //
@@ -2162,6 +2162,25 @@ static std::atomic<int>  g_adapt_ewgrow_settled{0};   // pool size to persist (0
 static std::atomic<int>  g_adapt_ewgrow_converged{0}; // 1 = reverted w/ no gain (persist -> allowed=0 next run)
 static std::atomic<bool> g_adapt_ewgrow_engaged{false};
 static std::atomic<int>  g_adapt_ewgrow_prior_base{0}; // profile-seeded start pool size (0 = none)
+// Buffered reader pool: what this run's controller settled on (0 = it never ran),
+// and what the profile seeded it with (0 = no prior).  Keyed by residency at
+// save time for the same reason the read-path RATES are: the settled count is
+// regime-dependent, measured 27 copy-bound vs 18 device-bound on one machine and
+// direction.  A single per-machine number would be re-taught on every
+// alternation — the workload-blind failure the extract writer prior already hit.
+// Sink class of this run: 1 = output lands in a regular file, 0 = /dev/null, a
+// pipe or another non-regular sink.  The SECOND key dimension for the reader
+// count, because residency alone conflates two of the three measured regimes:
+// copy-bound (warm + sink not limiting, settled 27) and sink-bound (warm + real
+// NVMe sink, count masked entirely) are both "warm".
+static std::atomic<int>  g_adapt_sink_regular{-1};
+// Residency for READER-COUNT bucketing only; admitted more broadly than
+// g_adapt_src_cold, which keys rates and must exclude --cold/--direct-read.
+static std::atomic<int>  g_adapt_rd_resid{-1};
+static std::atomic<int>  g_adapt_rd_ctx_chunk{0};   // geometry the settled count belongs to
+static std::atomic<int>  g_adapt_rd_ctx_threads{0};
+static std::atomic<int>  g_adapt_rd_settled{0};
+static std::atomic<int>  g_adapt_rd_prior{0};
 static std::mutex              g_adapt_ewgrow_mtx;     // guards the target->supervisor wake
 static std::condition_variable g_adapt_ewgrow_cv;
 
@@ -2240,6 +2259,17 @@ static std::atomic<int> g_adapt_src_cold{-1};
 // off for ADAPT_BACKEND_RECHECK_RUNS.
 static std::atomic<int> g_adapt_explored{0};
 static const char * adapt_resid_class_name(int c) { return c == 1 ? "warm" : "cold"; }
+// Reader-count bucket: the regime coordinates that are knowable BEFORE the run,
+// which is the constraint a seed has to live with — the governor's own regime
+// verdict only exists once the run is over.  cold/warm x file/nofile reproduces
+// the three regimes actually measured (cold+file = device-bound, warm+nofile =
+// copy-bound, warm+file = sink-bound).  Returns nullptr when unclassifiable.
+static const char * adapt_rd_bucket(int src_cold, int sink_regular)
+{
+  if (src_cold < 0 || sink_regular < 0) return nullptr;
+  if (src_cold == 1) return sink_regular ? "cold_file" : "cold_nofile";
+  return sink_regular ? "warm_file" : "warm_nofile";
+}
 static std::atomic<int> g_adapt_tar_wclass{-1};        // class of this extract (-1 = unknown)
 // Set when one operation extracts archives of DIFFERENT workload classes.  The
 // settled pool size is a single per-operation number and the governor's sizing
@@ -3463,6 +3493,10 @@ struct AdaptObs {
   int tar_wclass = -1;                           // -d --tar: workload class the size belongs to
   int resid_class = -1;                          // input residency class the backend rate belongs to
   int src_cold = -1;                             // read-path residency (-1 unknown, 0 warm, 1 cold)
+  int rd_settled = 0;                            // buffered reader pool the controller settled on (0 = n/a)
+  int sink_regular = -1;                         // sink class this run ran with (-1 unknown)
+  int rd_resid = -1;                             // residency for the reader bucket
+  int rd_ctx_chunk_mib = 0, rd_ctx_threads = 0;  // config the settled count belongs to
   int explored = 0;                              // backend this run was exploring (0/1/2)
   // Which backend actually ran, so the end-to-end rate is filed under it.
   // 0 = do not record (gpu-only, or a run that never chose): the backend prior
@@ -3477,6 +3511,11 @@ struct AdaptObs {
       src_path = p;
     resid_class = g_adapt_resid_class.load(std::memory_order_relaxed);
     src_cold    = g_adapt_src_cold.load(std::memory_order_relaxed);
+    rd_settled  = g_adapt_rd_settled.load(std::memory_order_relaxed);
+    sink_regular = g_adapt_sink_regular.load(std::memory_order_relaxed);
+    rd_resid     = g_adapt_rd_resid.load(std::memory_order_relaxed);
+    rd_ctx_chunk_mib = g_adapt_rd_ctx_chunk.load(std::memory_order_relaxed);
+    rd_ctx_threads   = g_adapt_rd_ctx_threads.load(std::memory_order_relaxed);
     explored    = g_adapt_explored.load(std::memory_order_relaxed);
     if (int wp = g_adapt_writer_probe_verdict.load(std::memory_order_relaxed))
       writer_par = wp;
@@ -3627,6 +3666,20 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
                     + adapt_tar_wclass_name(obs.tar_wclass),
                   (double)obs.tar_write_threads);
   }
+  // Settled reader count: discrete, latest-wins, and written under the residency
+  // it was measured at as well as flat.  The flat key is the fallback for a run
+  // whose residency could not be classified.
+  if (obs.rd_settled > 0) {
+    dir.put_num("read_threads_settled", (double)obs.rd_settled);   // flat fallback
+    if (const char * b = adapt_rd_bucket(obs.rd_resid, obs.sink_regular))
+      dir.put_num(std::string("read_threads_settled_") + b, (double)obs.rd_settled);
+    // The count is only meaningful for the geometry it was measured under: chunk
+    // size sets what one read costs and the worker count sets who consumes it.
+    // Recorded so a later run with a different shape can decline a stale seed
+    // rather than inherit it.
+    if (obs.rd_ctx_chunk_mib > 0) dir.put_num("rd_ctx_chunk_mib", (double)obs.rd_ctx_chunk_mib);
+    if (obs.rd_ctx_threads   > 0) dir.put_num("rd_ctx_threads",   (double)obs.rd_ctx_threads);
+  }
   if (!obs.src_path.empty()) {
     dir.put_str("src_path", obs.src_path);
     if (wall_s > 0 && obs.payload_bytes > 0) {
@@ -3666,6 +3719,10 @@ struct AdaptPriors {
     double path_mmap = 0, path_pread = 0, path_direct = 0;  // per-path rates (all residencies)
     // Same three, measured only on COLD input.  0 = never measured cold here.
     double path_mmap_cold = 0, path_pread_cold = 0, path_direct_cold = 0;
+    // Settled buffered-reader count, flat (latest-wins fallback) and per residency.
+    double rd_settled = 0;                                    // flat fallback
+    double rd_bucket[4] = {0,0,0,0};   // cold_file, cold_nofile, warm_file, warm_nofile
+    double rd_ctx_chunk_mib = 0, rd_ctx_threads = 0;
     double writer_par = 0;                                  // probe verdict
     double tar_write_threads = 0;                           // -d --tar settled pool size (flat fallback)
     double tar_wt_class[ADAPT_TAR_WCLASSES] = {0, 0, 0};    // -d --tar settled size per workload class
@@ -3747,6 +3804,13 @@ static AdaptPriors adapt_load_priors()
     D.path_pread    = dj->gnum("path_pread_gibs", 0);
     D.path_direct   = dj->gnum("path_direct_gibs", 0);
     D.path_mmap_cold   = dj->gnum("path_mmap_cold_gibs", 0);
+    D.rd_settled       = dj->gnum("read_threads_settled", 0);
+    D.rd_bucket[0]     = dj->gnum("read_threads_settled_cold_file", 0);
+    D.rd_bucket[1]     = dj->gnum("read_threads_settled_cold_nofile", 0);
+    D.rd_bucket[2]     = dj->gnum("read_threads_settled_warm_file", 0);
+    D.rd_bucket[3]     = dj->gnum("read_threads_settled_warm_nofile", 0);
+    D.rd_ctx_chunk_mib = dj->gnum("rd_ctx_chunk_mib", 0);
+    D.rd_ctx_threads   = dj->gnum("rd_ctx_threads", 0);
     D.path_pread_cold  = dj->gnum("path_pread_cold_gibs", 0);
     D.path_direct_cold = dj->gnum("path_direct_cold_gibs", 0);
     D.writer_par    = dj->gnum("writer_par", 0);
@@ -10592,7 +10656,13 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
   const int  rd_ceil  = std::min(n_readers * 3, 32);
   const bool rd_adaptive = optp && optp->adapt && optp->read_threads == 0 && !o_direct
                         && pool != nullptr && win == nullptr && rd_ceil > n_readers;
-  std::atomic<int>  rd_want{n_readers};       // threads allowed to claim work
+  // Start from the profile's settled count when there is one — that is the whole
+  // point of persisting it: run 2 begins where run 1 finished instead of paying
+  // the climb again (~1.5 s on a 32 GiB input).  Clamped into this run's range,
+  // since chunk size or thread count may differ from when it was recorded.
+  const int rd_seed = g_adapt_rd_prior.load(std::memory_order_relaxed);
+  std::atomic<int>  rd_want{rd_seed > 0 ? std::min(rd_ceil, std::max(rd_floor, rd_seed))
+                                        : n_readers};   // threads allowed to claim work
   std::atomic<bool> rd_stop{false};
   std::mutex rd_mx; std::condition_variable rd_cv;
   std::atomic<uint64_t> rd_bytes{0};          // local tap: bytes this pass has read
@@ -10789,12 +10859,17 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
     { std::lock_guard<std::mutex> g(rd_mx); } rd_cv.notify_all();
     for (auto & th : rthr) th.join();
     if (rd_super.joinable()) rd_super.join();
-    if (rd_adaptive && optp->verbosity >= V_VERBOSE) {
-      char rb[128];
-      std::snprintf(rb, sizeof rb,
-        "[ADAPT] reader pool: started %d, settled %d (range %d-%d)\n",
-        n_readers, rd_want.load(), rd_floor, rd_ceil);
-      vlog(V_VERBOSE, *optp, rb);
+    if (rd_adaptive) {
+      g_adapt_rd_settled.store(rd_want.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+      if (optp->verbosity >= V_VERBOSE) {
+        char rb[160];
+        std::snprintf(rb, sizeof rb,
+          "[ADAPT] reader pool: started %d%s, settled %d (range %d-%d)\n",
+          rd_seed > 0 ? std::min(rd_ceil, std::max(rd_floor, rd_seed)) : n_readers,
+          rd_seed > 0 ? " (from profile)" : "", rd_want.load(), rd_floor, rd_ceil);
+        vlog(V_VERBOSE, *optp, rb);
+      }
     }
   }
   if (win) win->secs = win_elapsed();
@@ -23334,14 +23409,63 @@ static void apply_backend_defaults(Options & opt)
   // Keying it to priors.loaded meant a fresh profile never wrote a cold rate at
   // all, so the cold pair needed an extra run to become comparable — which is
   // why convergence took three runs instead of two.
-  if (opt.adapt && !opt.no_profile && !opt.tar_mode && !opt.list_mode
-      && !opt.cold_read && !opt.direct_read_user_set) {
+  if (opt.adapt && !opt.no_profile && !opt.tar_mode && !opt.list_mode) {
     // adapt_inputs_resid_class: 1 = warm, 0 = cold, -1 = unknown OR inputs
     // disagree.  Keep all THREE states — collapsing unknown into "warm" would
     // file an unclassifiable run's rate into a bucket it does not belong to.
-    const int cls = adapt_inputs_resid_class(opt, adapt_input_residency(opt));
-    g_adapt_src_cold.store(cls < 0 ? -1 : (cls == 0 ? 1 : 0),
-                           std::memory_order_relaxed);
+    const int cls  = adapt_inputs_resid_class(opt, adapt_input_residency(opt));
+    const int coldv = (cls < 0) ? -1 : (cls == 0 ? 1 : 0);
+    // Residency serves TWO consumers with different admission rules, and
+    // conflating them was a bug: the read-path RATE keys must exclude --cold and
+    // an explicit --direct-read (their rates are not representative of the
+    // residency they nominally ran at), but the reader-count BUCKET must not —
+    // such a run still uses the buffered pool and still has a real regime.
+    // Gating both on the narrow rule left every bucket without coordinates, so
+    // no per-regime count was ever written and no seed was ever applied.
+    g_adapt_rd_resid.store(coldv, std::memory_order_relaxed);
+    if (!opt.cold_read && !opt.direct_read_user_set)
+      g_adapt_src_cold.store(coldv, std::memory_order_relaxed);
+    // Seed the reader controller from the bucket matching THIS run's residency,
+    // falling back to the flat key when the bucket is empty or residency is
+    // unknowable.  A seed only moves the STARTING point: the controller still
+    // probes, so a machine whose media or workload changed re-measures instead
+    // of being frozen at a stale verdict (the extract writer pool's precedent).
+    g_adapt_sink_regular.store(adapt_output_is_regular(opt) ? 1 : 0,
+                               std::memory_order_relaxed);
+    g_adapt_rd_ctx_chunk.store((int)opt.chunk_mib, std::memory_order_relaxed);
+    g_adapt_rd_ctx_threads.store(resolve_cpu_threads(opt.cpu_threads),
+                                 std::memory_order_relaxed);
+    if (priors.loaded) {
+      const int c = g_adapt_rd_resid.load(std::memory_order_relaxed);
+      const int k = g_adapt_sink_regular.load(std::memory_order_relaxed);
+      const char * b = adapt_rd_bucket(c, k);
+      double seed = 0.0;
+      if (b) {
+        const int i = (c == 1) ? (k ? 0 : 1) : (k ? 2 : 3);
+        seed = prior_dir.rd_bucket[i];
+      }
+      // NO flat fallback.  Seeding from a value measured in a DIFFERENT regime
+      // is worse than not seeding: observed, a copy-bound run started at 6
+      // because that was the cold-file bucket's number, when its own optimum is
+      // 27.  An empty bucket means this machine has not measured this regime, and
+      // the honest answer is to start at the static default and go measure it.
+      // The flat key is still written, for diagnostics only.
+      // Decline a seed measured under a materially different geometry: the count
+      // is a property of (chunk size, consumer count), not of the box alone.
+      const int cur_chunk = (int)opt.chunk_mib;
+      const int cur_thr   = resolve_cpu_threads(opt.cpu_threads);
+      const bool ctx_ok =
+          (prior_dir.rd_ctx_chunk_mib <= 0 || cur_chunk <= 0
+             || prior_dir.rd_ctx_chunk_mib == (double)cur_chunk)
+       && (prior_dir.rd_ctx_threads   <= 0 || cur_thr   <= 0
+             || (cur_thr >= prior_dir.rd_ctx_threads / 2
+              && cur_thr <= prior_dir.rd_ctx_threads * 2));
+      if (seed > 0 && ctx_ok)
+        g_adapt_rd_prior.store((int)std::min(seed, 4096.0), std::memory_order_relaxed);
+      else if (seed > 0 && opt.verbosity >= V_DEBUG)
+        vlog(V_DEBUG, opt, "[ADAPT] reader seed declined: recorded under a "
+                           "different chunk size or thread count\n");
+    }
   }
 
   if (priors.loaded && !opt.tar_mode && !opt.list_mode) {
