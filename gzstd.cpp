@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.42";
+static constexpr const char * GZSTD_VERSION = "0.15.43";
 //
 // Architecture overview:
 //
@@ -912,7 +912,8 @@ static void print_help()
 "                      hybrid/GPU run stalls SECS s (default 30), dump JSON + abort)\n"
 "  --direct-read / --no-direct-read\n"
 "                      O_DIRECT input, single stream: bypass the page cache\n"
-"                      (--adapt may enable it for a cold compress; --no- pins off)\n"
+"                      (auto-chosen for a COLD compress after measuring both\n"
+"                      read paths on the real data; --no- pins it off)\n"
 "                      for one-pass speedups and honest cold benchmarks\n"
 "  --read-threads N    parallel readers for the BUFFERED input path (default:\n"
 "                      auto 3..12 by -T; 1 = single; n/a for pipes/--direct-read)\n"
@@ -1202,16 +1203,22 @@ static void print_help_long()
 "     compaction stall and no eviction of other users' cached data\n"
 "     (unlike --cold, which drops the cache via fadvise).  Always a\n"
 "     SINGLE stream: concurrent O_DIRECT reads contend on NVMe, so it\n"
-"     cannot use --read-threads and cannot go through mmap.  On a\n"
-"     big-RAM box the buffered path is usually faster (reads served from\n"
-"     cache), so this is mainly a benchmarking / one-pass tool.\n"
+"     cannot use --read-threads and cannot go through mmap.  When the\n"
+"     input is already cached the buffered path is faster, which is why\n"
+"     this is not simply the default.\n"
 "     Independent of --direct, which is O_DIRECT for OUTPUT.\n"
-"     Under --adapt this can switch itself ON for a COLD compress input:\n"
-"     mmap is much slower than O_DIRECT when nothing is cached, and the\n"
-"     ranking reverses once the input is warm, so residency picks the\n"
-"     reader.  It is measured per machine before being adopted, never\n"
-"     applied to --tar (where --direct-read is a no-op), and\n"
-"     --no-direct-read pins it off.\n"
+"\n"
+"     YOU RARELY NEED TO SET THIS.  Compressing a COLD regular file of\n"
+"     4 GiB or more, gzstd reads the first window with O_DIRECT and the\n"
+"     next with the buffered pool, times both, and finishes the file with\n"
+"     whichever won — so it adopts O_DIRECT only where it measurably\n"
+"     wins.  The probe bytes are real work: nothing is read twice.  No\n"
+"     --adapt required, though --adapt additionally remembers the verdict\n"
+"     per machine so later runs skip the measurement.\n"
+"     It is skipped for a WARM input (mmap wins outright), on rotational\n"
+"     media, under --tar (where --direct-read has no effect at all), below\n"
+"     4 GiB, and whenever you pin a reader yourself.  --no-direct-read\n"
+"     pins it off; --direct-read forces it on and skips the measurement.\n"
 "\n"
 "  --read-threads N    (default: 0 = auto)\n"
 "     Number of parallel reader threads for the BUFFERED input path.  A\n"
@@ -15483,6 +15490,16 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       const size_t pool_readers = (size_t)std::max(n_readers, pool_readers_hint);
       size_t pool_n = std::min<size_t>((size_t)threads + 128 + 32 * pool_readers,
                                        std::min<size_t>(file_chunks + 1, 1024));
+      // RAM cap, matching compress_nvcomp's pool.  Without it the only ceiling
+      // was 1024 buffers, which at the default 16 MiB chunk is a 16 GiB pool —
+      // and O_DIRECT asks for transparent huge pages, so much of it can become
+      // resident.  A larger --chunk-size raises that bound proportionally.  The
+      // preflight RAM check does not account for this pool, so it must bound
+      // itself: at most a quarter of what is available, never below 8 buffers.
+      const uint64_t ram_avail = get_available_ram_bytes();
+      if (ram_avail > 0)
+        pool_n = std::min<size_t>(pool_n,
+                                  std::max<size_t>(8, (size_t)(ram_avail / 4 / cap)));
       if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
       dr_pool_ok = dr_pool.init(cap, pool_n,
                                 /*want_thp=*/o_direct || kernel_has_per_vma_locks());

@@ -1,9 +1,58 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.40  
+**Covers:** v0.9.50 → v0.15.43  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.43 — the read probe reaches --gpu-only, and the compress buffer pool stops ignoring RAM
+
+Housekeeping on the two versions below, plus one measurement worth recording.
+
+**`--gpu-only` reaches the probe, and disagrees with everything else.** Same code path as `--hybrid`, so it inherited the probe for free — but on a cold 64 GiB compress it measured **O_DIRECT 1.78 GiB/s against buffered 3.48** and chose buffered, the opposite of every other configuration (cpu-only and hybrid both measure O_DIRECT around 4 GiB/s and take it). The reason matters more than the number: with the GPUs as consumer, the reader spends its time blocked on `pool->acquire()`, so a pass measures *the pipeline*, not the device. O_DIRECT is a single stream by design and cannot hide that latency behind other readers the way a 12-thread buffered pool can. The probe is therefore doing exactly what it claims — picking the faster path *in this configuration* — but the figure is not a device measurement and must not be quoted as one.
+
+**The compress buffer pool now has a RAM cap.** Its only ceiling was 1,024 buffers, which at the default 16 MiB chunk is a 16 GiB pool, and O_DIRECT requests transparent huge pages so much of it can become resident. The preflight RAM check does not account for it. It now bounds itself to at most a quarter of available memory, never below 8 buffers — the same rule `compress_nvcomp`'s pool has always used. Found by review, not by a failure.
+
+**Help text corrected.** `--direct-read` still described itself as "mainly a benchmarking / one-pass tool" and, after v0.15.41, as something `--adapt` might enable. Both were false: gzstd now measures and adopts it on any cold compress with no `--adapt` involved. Both the `-h` summary and the long entry say what actually happens, including every condition under which it declines.
+
+---
+
+## v0.15.42 — the cold-input read probe now actually runs, reads one file, and cannot mistake a short read for the end of it
+
+An independent review of v0.15.41 (Codex CLI, gpt-5.6-sol, high effort) returned **NOT SAFE TO TEST**. Every finding was reproduced before being fixed.
+
+**The probe never ran on the default path.** Compress sets `opt.hybrid`, so a plain `gzstd -f -o out.zst FILE` goes to `compress_nvcomp` — which had no probe gate at all. Only `compress_cpu_mt` did, and every manual test of v0.15.41 had passed `--cpu-only`, which is precisely how it was missed. Adding the gate to the GPU producer was not enough either: **mmap is decided first there and always won**, so eligibility is now computed *before* the mmap branch and mmap stands aside when the probe applies. If the probe then declines internally, the pooled buffered reader takes over — itself faster than mmap on a cold input (19.95 s vs 25.12 s). Default cold 64 GiB compress: **25.12 s → 14.06 s**.
+
+**A short read is no longer treated as end-of-file.** `pread` may legally return less than asked for while data remains. The reader treated any short read as the last chunk, dropping the rest of that chunk *and every chunk after it*, then reporting success — a silently truncated archive. Pre-existing, and present in v0.15.40; fixed rather than inherited. The chunk is filled to capacity, `EINTR` retries, and only a zero-length read means EOF. Under O_DIRECT a short read that cannot resume on an aligned boundary now fails loudly instead of truncating.
+
+**One file identity for the whole read.** Each pass reopened the input by pathname, so replacing the path between passes spliced a prefix of one inode onto a suffix of another and still reported success. O_DIRECT is a property of the open file description and cannot be shared with a buffered pass, so both descriptions are opened up front, checked to be the same inode, and held for the entire read; a mismatch declines the probe rather than guessing.
+
+**Two gates did not say what they meant.** `adapt_path_residency` returns −1 when it cannot tell, and −1 < 0.95 — so inputs of *unknown* residency were admitted to a branch justified entirely by the input being cold. Residency must now be known and cold. Separately, the cold-rate label was set only once a profile had loaded, so the first run on a machine recorded no cold rate and the pair needed an extra run to become comparable; it is now gated on `--adapt` itself.
+
+Also: `ReadWindow::eof` was a plain `bool` written by every reader thread and is now atomic, and the shared pool is sized for the largest reader count any pass will use rather than the first pass's single O_DIRECT reader. Measurement put that second bias within run-to-run noise, so the rationale originally given for it was wrong.
+
+---
+
+## v0.15.41 — a cold compress input is read with O_DIRECT, chosen by measuring both paths on the real data
+
+Measured on the server, 64 GiB single-file compress, median of 5:
+
+| | mmap | pooled pread | O_DIRECT |
+|---|---|---|---|
+| cold | 2.77 | 3.94 | **4.88 GiB/s** |
+| warm | 7.99 | **10.04** | 4.87 GiB/s |
+
+**O_DIRECT is residency-independent** — it bypasses the page cache and reads at device speed either way — while mmap collapses when nothing is cached. So the best read path *inverts* with residency, and no single default is right for both.
+
+**Why measure rather than rule.** `--direct-read` regresses compress 20–40% on the low-core workstation, and neither PCIe generation nor "is it NVMe" separates that machine from the server — both are Gen4+ NVMe. PCIe generation describes the *GPU* link and says nothing about storage. The rate is the only signal that distinguishes them, so a cold compress of a regular file ≥ 4 GiB reads its first window with O_DIRECT and its second with the buffered pool, times both, and finishes with whichever won. The probe bytes are real work — nothing read twice, nothing discarded — so the only cost is one window on the losing path: **13.35 s against 12.95 s with O_DIRECT pinned**, about 1.8%, versus 22.9 s for the mmap default.
+
+**Windows are bounded by time, not bytes.** At the default 16 MiB chunk a fixed 32 MiB window would be *two reads* — enough to measure device-queue ramp and thread-pool startup and nothing else — and it would shrink to a single read if `--chunk-size` were raised. The buffered pass additionally runs at least three full rounds across its reader threads, or it is timed while still spinning its pool up and hands the comparison to O_DIRECT for the wrong reason.
+
+**`--adapt` keeps a learned verdict** so later runs skip the measurement, recording read-path rates under a cold-only key dual-written alongside the existing flat keys. A cold key absent from an older profile reads back as zero, meaning untried — additive, so no schema epoch bump and no host profile reset.
+
+**A note on the regime classifier.** The `--adapt` probe is deliberately *not* gated on `SOURCE_BOUND`, unlike its decompress sibling. Gating it that way was tried first and never fired once: a 64 GiB cold compress that is plainly read-limited still classifies as **compute-bound**, because under mmap the read is paid as page faults *inside* the compression workers, so they look busy and the governor cannot see the stall. mmap disguises I/O as compute, closing the source-bound gate on precisely the case this exists for.
 
 ---
 
