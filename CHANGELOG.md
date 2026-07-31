@@ -1,9 +1,23 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.45  
+**Covers:** v0.9.50 → v0.15.46  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.46 — one reader controller for two of the three pools, and an honest stop at the third
+
+The sizing controller from v0.15.44 is now shared code (`ReaderPoolCtl`) rather than living inside the compress reader, and the **decompress prefetch reader** uses it. Deliberately shared: three copies of a park/unpark mechanism is exactly how this file has produced sibling-path defects before.
+
+**What the decompress reader had instead**, and why it went: dormant threads that woke once, at most doubling the pool, on the governor's `SOURCE_BOUND` verdict. That was inert on any box with ≥96 threads — `cap = min(n*2, 12)` with `n` already 12 leaves zero dormant readers — and its direction was not derivable anyway, since `SOURCE_BOUND` covers both a copy-bound reader wanting more threads and a saturated device wanting fewer. Measured: it climbs 12 → 18 and then starts at 18 from the profile on later runs.
+
+Its ceiling is **RAM-clamped**, unlike the compress one: the look-ahead ring is `n_slots × BLOCK` and BLOCK is 64 MiB here, so a flat ceiling of 32 would reserve 4 GiB of ring against 1.5 GiB today. It budgets an eighth of available memory, so a small box gets a small ceiling rather than a controller that can only make things worse.
+
+**`--tar` create is deliberately NOT wired, after trying.** Its readers *claim* a chunk and only then wait for it to come within the pusher's window, with the pusher blocking until the head chunk arrives — so parking a reader anywhere in that cycle strands work the pusher is waiting on. It deadlocked outright: a 20 GiB tree wedged with the archive 17.6 GB in, all 116 threads in `futex_wait`, while the same run without `--adapt` completed at 2.99 GiB/s. Two attempted fixes (waking parked readers on work exhaustion, then pinning the window to the ceiling) each moved the deadlock rather than removing it. The reorder buffer's invariants need working out before a controller belongs there, so it gets its own change instead of a rushed one.
+
+**A test was asserting the removed rule.** "Source-bound wakes dormant prefetch readers" tested the mechanism this replaces, so it now asserts what the new design actually guarantees: the controller arms under `--adapt`, reports its range, settles inside it, and does not exist without `--adapt`. Whether it *steps* depends on measured rates and on the run lasting long enough to take a window — which a fixture must not assume.
 
 ---
 

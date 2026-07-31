@@ -3617,32 +3617,43 @@ rm -f "$TMPDIR/arank.zst" "$TMPDIR/arank.out" "$TMPDIR/arank1.err" \
       "$TMPDIR/arank2.err" "$TMPDIR/arank3.err" "$TMPDIR/arank4.err"
 
 # ────────────────────────────────────────────────────────────
-section "--adapt reader scale-up (source-bound, io-dominant)"
+section "--adapt reader pool controller (measured sizing)"
 
-# The MT prefetch reader spawns dormant threads up to 2x (<=12) and wakes
-# them on the governor's source-bound + io-dominant signal.  Needs a
-# compressed input past the MT-reader gate (>128 MiB), so build one from
-# urandom (incompressible: compressed size ~= raw size).  -T8 pins the
-# derived reader count to 3 (cap 6) on every box.
+# The MT prefetch reader is sized by a MEASURED controller (v0.15.46), not by
+# the governor's regime label.  The old assertion here — that a forced
+# source-bound verdict wakes dormant readers — tested a rule that was removed on
+# purpose: SOURCE_BOUND covers both a copy-bound reader that wants MORE threads
+# and a saturated device that wants FEWER, so it cannot say which way to move.
+# What is deterministic now is that the controller ARMS under --adapt and does
+# not exist without it; whether it actually steps depends on measured rates and
+# on the run lasting long enough to take a window, which a fixture must not
+# assume.  Needs a compressed input past the MT-reader gate (>128 MiB), built
+# from urandom (incompressible: compressed size ~= raw size).
 spin "reader scale-up corpus (192 MiB)"
 dd if=/dev/urandom bs=1M count=192 2>/dev/null > "$TMPDIR/arsu.bin"
 "$GZSTD" --cpu-only -f "$TMPDIR/arsu.bin" -o "$TMPDIR/arsu.zst" 2>/dev/null
 
-# 1. Forced source-bound wakes the dormant readers; output still exact.
+# 1. The controller arms under --adapt, reports its range, and the output is
+#    still exact.  It must never settle outside the range it printed.
 env GZSTD_DEBUG_ADAPT_REGIME=source-bound "$GZSTD" --adapt --no-profile -v -T8 \
   --cpu-only -d -k -f "$TMPDIR/arsu.zst" -o "$TMPDIR/arsu.out" 2>"$TMPDIR/arsu1.err"
-if grep -q 'reader scale-up 3 -> 6' "$TMPDIR/arsu1.err" \
-   && grep -q 'actions:.*reader-scaleup' "$TMPDIR/arsu1.err" \
+rp=$(grep -ao 'reader pool: started [0-9]*[^,]*, settled [0-9]* (range [0-9]*-[0-9]*)' \
+     "$TMPDIR/arsu1.err" | head -1)
+if [ -n "$rp" ] \
+   && [ "$(printf '%s' "$rp" | sed -E 's/.*settled ([0-9]+).*/\1/')" -ge \
+        "$(printf '%s' "$rp" | sed -E 's/.*range ([0-9]+)-[0-9]+.*/\1/')" ] \
+   && [ "$(printf '%s' "$rp" | sed -E 's/.*settled ([0-9]+).*/\1/')" -le \
+        "$(printf '%s' "$rp" | sed -E 's/.*range [0-9]+-([0-9]+).*/\1/')" ] \
    && files_match "$TMPDIR/arsu.bin" "$TMPDIR/arsu.out"; then
-  pass "source-bound wakes dormant prefetch readers"
+  pass "reader controller arms and settles inside its range"
 else
-  fail "source-bound wakes dormant prefetch readers"
+  fail "reader controller arms and settles inside its range"
 fi
 
-# 2. Without --adapt the dormant pool does not exist and nothing scales.
+# 2. Without --adapt the controller does not exist and nothing resizes.
 env GZSTD_DEBUG_ADAPT_REGIME=source-bound "$GZSTD" -v -T8 \
   --cpu-only -d -k -f "$TMPDIR/arsu.zst" -o "$TMPDIR/arsu.out" 2>"$TMPDIR/arsu2.err"
-if ! grep -q 'reader scale-up' "$TMPDIR/arsu2.err" \
+if ! grep -q 'reader pool:' "$TMPDIR/arsu2.err" \
    && files_match "$TMPDIR/arsu.bin" "$TMPDIR/arsu.out"; then
   pass "reader scale-up inert without --adapt"
 else
