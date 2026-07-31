@@ -1,9 +1,31 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.43  
+**Covers:** v0.9.50 → v0.15.44  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.44 — the reader pool sizes itself by measuring, because the direction is not derivable
+
+The right number of buffered reader threads depends on which stage is the bottleneck, and that is not knowable before the run. Measured on the server, compress, median:
+
+| regime | 3 | 6 | 12 (auto) | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|
+| copy-bound (warm, sink removed) | 6.23 | 16.25 | 26.44 | 27.96 | — | — |
+| device-bound (cold, buffered) | — | 3.94 | 3.48 | 3.38 | 3.35 | 3.28 |
+| sink-bound (warm, real NVMe sink) | flat 3.58–3.74 — the count is masked entirely |
+
+**A static formula is wrong in at least one regime whatever value it picks**, which is why the auto count stays where it is: `max(3, min(12, hw/8))` is right for the copy-bound case, the one where the lever has real leverage.
+
+**The direction cannot be read off the regime label.** The governor's `SOURCE_BOUND` covers *both* the copy-bound case (wants more readers) and the device-saturated case (wants fewer). The pre-existing actuator grew the pool on `SOURCE_BOUND`, and cold compress classifies `SOURCE_BOUND` for 84% of its run while wanting the opposite — so a rule-based lever would have moved the wrong way on exactly the workload it was reaching for. It was also inert in practice: `cap = min(n*2, 12)` with `n` already 12 on any box with ≥96 threads means zero dormant readers.
+
+So the controller takes a step, measures it over a window, and keeps it only on a 5% gain — reverting and reversing direction otherwise, bounded to six rounds. Parked readers wait on a condition variable and hold no pool buffer, so they cannot deadlock the ones still running. `--adapt` only; O_DIRECT (single-stream by design), a user `--read-threads` pin, and the probe passes of the read-path measurement are all excluded — the last because timing one configuration while resizing underneath it measures a moving target.
+
+**The step is proportional, and that mattered more than expected.** A ±1 step cannot cross a 6–32 range inside a bounded round budget: measured, it settled at 14 where 24 was worth 16% more, purely because each probe costs two ticks and the run ended first. Halving/one-and-a-halving reaches the useful range in three steps. With it: **+12.8% copy-bound** (15.89 → 17.92 GiB/s, settling at 27 from a start of 12, reproducible across four runs), **+11% device-bound** (3.32 → 3.69), and **neutral when sink-bound** (8.09 → 8.11), where the count is masked and the exploration costs nothing measurable.
+
+**`--gpu-only`'s inverted verdict, resolved.** v0.15.43 recorded that the read probe chooses *buffered* under `--gpu-only` (O_DIRECT 1.78 vs buffered 3.48 GiB/s), the opposite of every other configuration, and flagged that those are pipeline rates rather than device rates because the reader sits blocked on the pool while the GPUs consume. Checked end-to-end on a cold 32 GiB compress: **buffered 2.37 GiB/s vs forced O_DIRECT 2.16** — the probe's choice is correct, and worth about 10%. The figures still must not be quoted as device measurements, but the decision they drive is sound.
 
 ---
 

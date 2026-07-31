@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.43";
+static constexpr const char * GZSTD_VERSION = "0.15.44";
 //
 // Architecture overview:
 //
@@ -315,6 +315,23 @@ static const size_t READ_PROBE_MAX_CHUNKS = 512;
 // Below this the probe is not worth its own startup, and the two passes would be
 // a large fraction of the job.
 static const uint64_t READ_PROBE_MIN_INPUT = 4ull * 1024 * 1024 * 1024;
+
+// ---- Adaptive reader-pool sizing (--adapt, buffered pooled reader) --------
+// The right reader count depends on which stage is the bottleneck, and that is
+// not knowable before the run.  Measured on the 256-core box, 64 GiB compress:
+//   copy-bound   (warm, sink not limiting):  3 -> 6.23   12 -> 26.44  16 -> 27.96 GiB/s
+//   device-bound (cold, buffered):           6 -> 3.94   12 -> 3.48   32 -> 3.28
+//   sink-bound   (warm, real NVMe sink):     flat 9.5-10.7 — the count is masked
+// A static formula is therefore wrong in at least one regime whatever it picks,
+// and — this is the part that matters — the DIRECTION to move cannot be read off
+// the regime label: the governor's SOURCE_BOUND covers both the copy-bound case
+// (wants more readers) and the device-saturated case (wants fewer).  An earlier
+// rule-based actuator grew the pool on SOURCE_BOUND and would have moved the
+// wrong way on cold compress, which classifies SOURCE_BOUND for 84% of its run.
+// So: take a step, measure it, keep it only if it pays.
+static const int    ADAPT_RD_TICK_MS    = 250;  // one measurement window
+static const int    ADAPT_RD_MAX_ROUNDS = 6;    // bounded search, then settle
+static const double ADAPT_RD_MARGIN     = 1.05; // anti-flap, as the backend prior uses
 // A first frame larger than this is treated as a single-frame file (zstd /
 // --sliding-window) and streamed directly from the file rather than buffered
 // through the queue.  Sits well above gzstd's largest practical chunk
@@ -10536,7 +10553,8 @@ template <typename Emit>   // template so the lambda inlines (and -Wnonnull sees
 static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
                                Meter * m, DirectReadPool * pool, bool o_direct,
                                int n_readers, int borrowed_fd, Emit && emit,
-                               ReadWindow * win = nullptr)
+                               ReadWindow * win = nullptr,
+                               const Options * optp = nullptr)
 {
   const auto win_t0 = std::chrono::steady_clock::now();
   auto win_elapsed = [&win_t0] {
@@ -10565,12 +10583,40 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
     if (posix_memalign(&scratch, ALIGN, cap) != 0 || !scratch) { if (owns_fd) ::close(fd); return false; }
   }
 
+  // Adaptive sizing applies only to the buffered pool: O_DIRECT is single-stream
+  // by settled design, a user pin is final, and without a pool there is nothing
+  // to park.  A bounded window (a probe pass) is excluded too — its whole point
+  // is to time ONE configuration, and resizing underneath it would measure a
+  // moving target.  Declared here because read_loop captures them.
+  const int  rd_floor = std::max(1, n_readers / 2);
+  const int  rd_ceil  = std::min(n_readers * 3, 32);
+  const bool rd_adaptive = optp && optp->adapt && optp->read_threads == 0 && !o_direct
+                        && pool != nullptr && win == nullptr && rd_ceil > n_readers;
+  std::atomic<int>  rd_want{n_readers};       // threads allowed to claim work
+  std::atomic<bool> rd_stop{false};
+  std::mutex rd_mx; std::condition_variable rd_cv;
+  std::atomic<uint64_t> rd_bytes{0};          // local tap: bytes this pass has read
+
   std::atomic<size_t> next_idx{0};
   std::atomic<bool>   done{false};
   std::atomic<bool>   io_error{false};
-  auto read_loop = [&]() {
+  auto read_loop = [&](int k) {
     for (;;) {
       if (done.load(std::memory_order_relaxed)) break;
+      // Park while this thread is above the wanted count.  Checked BEFORE a
+      // chunk is claimed and before a pool buffer is acquired, so a parked
+      // reader holds nothing and cannot deadlock the ones still running.
+      if (rd_adaptive && k >= rd_want.load(std::memory_order_relaxed)) {
+        std::unique_lock<std::mutex> lk(rd_mx);
+        rd_cv.wait(lk, [&] {
+          return rd_stop.load(std::memory_order_relaxed)
+              || done.load(std::memory_order_relaxed)
+              || k < rd_want.load(std::memory_order_relaxed);
+        });
+        if (rd_stop.load(std::memory_order_relaxed)
+            || done.load(std::memory_order_relaxed)) break;
+        continue;
+      }
       const size_t rel = next_idx.fetch_add(1, std::memory_order_relaxed);
       if (win) {
         // Stop claiming work when the pass is full or its time is up.  Setting
@@ -10651,6 +10697,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
         if (g_perf) { g_perf->read_ns.fetch_add(r_dt); g_perf->read_bytes_total.fetch_add((uint64_t)got); }
       }
       if (m) m->read_bytes.fetch_add((uint64_t)got);
+      rd_bytes.fetch_add((uint64_t)got, std::memory_order_relaxed);
       if (win) {
         win->chunks.fetch_add(1, std::memory_order_relaxed);
         win->bytes.fetch_add((uint64_t)got, std::memory_order_relaxed);
@@ -10669,14 +10716,86 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
     }
   };
 
-  if (n_readers == 1) {
-    read_loop();
+  // Adaptive sizing applies only to the buffered pool: O_DIRECT is single-stream
+  // by settled design, a user pin is final, and without a pool there is nothing
+  // to park.  A bounded window (a probe pass) is excluded too — its whole point
+  // is to time ONE configuration, and resizing underneath it would measure a
+  // moving target.
+  if (n_readers == 1 && !rd_adaptive) {
+    read_loop(0);
   } else {
+    const int spawn_n = rd_adaptive ? rd_ceil : n_readers;
     std::vector<std::thread> rthr;
-    rthr.reserve((size_t)n_readers - 1);
-    for (int i = 1; i < n_readers; ++i) rthr.emplace_back(read_loop);
-    read_loop();
+    rthr.reserve((size_t)spawn_n - 1);
+    for (int i = 1; i < spawn_n; ++i) rthr.emplace_back([&, i] { read_loop(i); });
+
+    // Supervisor: hill-climb rd_want, keeping a step only when it measurably
+    // pays.  Runs on its own thread so the reader that would otherwise be
+    // thread 0 keeps reading; ends as soon as the readers do.
+    std::thread rd_super;
+    if (rd_adaptive) rd_super = std::thread([&] {
+      uint64_t prev_b = 0; auto prev_t = std::chrono::steady_clock::now();
+      double  pre_rate = 0.0; int probe_from = 0, dir = +1, rounds = 0;
+      bool    probing = false, dir_exhausted = false;
+      for (;;) {
+        std::unique_lock<std::mutex> lk(rd_mx);
+        if (rd_cv.wait_for(lk, std::chrono::milliseconds(ADAPT_RD_TICK_MS),
+                           [&] { return rd_stop.load(std::memory_order_relaxed); }))
+          return;                                   // readers finished
+        lk.unlock();
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t b = rd_bytes.load(std::memory_order_relaxed);
+        const double dt = std::chrono::duration<double>(now - prev_t).count();
+        const double rate = dt > 0 ? double(b - prev_b) / dt : 0.0;
+        prev_b = b; prev_t = now;
+        if (rate <= 0.0 || rounds >= ADAPT_RD_MAX_ROUNDS) continue;
+
+        if (!probing) {
+          const int cur  = rd_want.load(std::memory_order_relaxed);
+          // PROPORTIONAL step, as the extract writer-pool controller uses.  A
+          // +/-1 step cannot cross a 6..32 range inside a bounded round budget:
+          // measured, it settled at 14 where 24 was worth 16% more, simply
+          // because each probe costs two ticks and the run ended first.  Halving
+          // or one-and-a-halving reaches the useful part of the range in three
+          // steps instead of twelve.
+          const int step = std::max(1, cur / 2);
+          const int next = std::min(rd_ceil, std::max(rd_floor, cur + dir * step));
+          if (next == cur) {                        // at a bound: try the other way
+            if (dir_exhausted) { rounds = ADAPT_RD_MAX_ROUNDS; continue; }
+            dir = -dir; dir_exhausted = true; continue;
+          }
+          pre_rate = rate; probe_from = cur; probing = true;
+          rd_want.store(next, std::memory_order_relaxed);
+          if (m) m->reader_threads.store(next, std::memory_order_relaxed);
+          { std::lock_guard<std::mutex> g(rd_mx); } rd_cv.notify_all();
+        } else {
+          probing = false; ++rounds;
+          if (rate > pre_rate * ADAPT_RD_MARGIN) {
+            dir_exhausted = false;                  // it paid: keep going this way
+          } else {
+            rd_want.store(probe_from, std::memory_order_relaxed);
+            if (m) m->reader_threads.store(probe_from, std::memory_order_relaxed);
+            { std::lock_guard<std::mutex> g(rd_mx); } rd_cv.notify_all();
+            if (dir_exhausted) { rounds = ADAPT_RD_MAX_ROUNDS; }
+            else { dir = -dir; dir_exhausted = true; }
+          }
+        }
+      }
+    });
+
+    read_loop(0);
+    // Readers are done: release anyone parked, then stop the supervisor.
+    rd_stop.store(true, std::memory_order_relaxed);
+    { std::lock_guard<std::mutex> g(rd_mx); } rd_cv.notify_all();
     for (auto & th : rthr) th.join();
+    if (rd_super.joinable()) rd_super.join();
+    if (rd_adaptive && optp->verbosity >= V_VERBOSE) {
+      char rb[128];
+      std::snprintf(rb, sizeof rb,
+        "[ADAPT] reader pool: started %d, settled %d (range %d-%d)\n",
+        n_readers, rd_want.load(), rd_floor, rd_ceil);
+      vlog(V_VERBOSE, *optp, rb);
+    }
   }
   if (win) win->secs = win_elapsed();
   if (!pool) free(scratch);
@@ -15521,7 +15640,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
           enqueue_direct_chunk(queue, idx, buf, n);   // seq deterministic by file position
         }
         return true;
-      }, win);
+      }, win, &opt);
   };
 
   // ---- Cold-input read-path probe ---------------------------------------
@@ -18572,7 +18691,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       }
       if (!nv_probed)
       reader_done = pooled_read_chunks(opt.input, gpu_chunk, m, &nv_pool,
-        /*o_direct=*/false, n_readers, dr_fd, nv_emit);
+        /*o_direct=*/false, n_readers, dr_fd, nv_emit, nullptr, &opt);
       if (!reader_done) g_direct_read_pool = nullptr;  // open failed; fread takes over
     }
     // pool alloc failure: fall through to fread+copy below.
