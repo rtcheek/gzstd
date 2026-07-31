@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.41";
+static constexpr const char * GZSTD_VERSION = "0.15.42";
 //
 // Architecture overview:
 //
@@ -10517,8 +10517,11 @@ struct ReadWindow {
   size_t   min_chunks  = 0;          // ...but never before this many chunks land
   std::atomic<size_t>   chunks{0};   // results: chunks actually read
   std::atomic<uint64_t> bytes{0};    //          bytes actually read
-  double   secs = 0.0;               //          wall time this pass took
-  bool     eof  = false;             //          the FILE ended inside this pass
+  double   secs = 0.0;               //          wall time this pass took (set after join)
+  // ATOMIC: every reader thread in the pass can observe EOF and write this
+  // concurrently.  A plain bool would be a data race even though every writer
+  // stores the same value.
+  std::atomic<bool>     eof{false};  //          the FILE ended inside this pass
 };
 
 template <typename Emit>   // template so the lambda inlines (and -Wnonnull sees the
@@ -10592,7 +10595,37 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
       }
       else      { buf = static_cast<char *>(scratch); }
       uint64_t t0 = (g_perf || m) ? now_ns() : 0;
-      ssize_t got = ::pread(fd, buf, cap, (off_t)idx * (off_t)cap);
+      // Fill the chunk completely.  A single pread may legally return LESS than
+      // asked for while data remains — a signal can cut it short, and very large
+      // requests are not guaranteed atomic — and the old code treated any short
+      // read as end-of-file.  That silently dropped the tail of the chunk AND
+      // every chunk after it, producing a truncated archive that reported
+      // success.  Only a zero-length read means EOF.
+      //
+      // O_DIRECT constrains the retry: the continuation offset, buffer and
+      // length must all stay block-aligned, so a short read that is not a
+      // multiple of ALIGN cannot be resumed.  That should not happen (the
+      // kernel returns whole blocks), but if it ever does, stop rather than
+      // issue a misaligned pread that would fail with EINVAL.
+      ssize_t got = 0;
+      {
+        size_t filled = 0;
+        for (;;) {
+          const ssize_t r = ::pread(fd, buf + filled, cap - filled,
+                                    (off_t)idx * (off_t)cap + (off_t)filled);
+          if (r < 0) {
+            if (errno == EINTR) continue;
+            got = -1; break;
+          }
+          if (r == 0) break;                       // genuine EOF
+          filled += (size_t)r;
+          if (filled >= cap) break;                // chunk complete
+          // Cannot resume aligned: fail loudly rather than return a short chunk
+          // that the caller would read as end-of-file and truncate on.
+          if (o_direct && (filled % ALIGN) != 0) { got = -1; break; }
+        }
+        if (got == 0) got = (ssize_t)filled;
+      }
       if (got < 0) {
         if (pool) pool->release(slot);
         io_error.store(true, std::memory_order_relaxed);
@@ -10601,7 +10634,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
       }
       if (got == 0) {                       // at/past EOF (exact-multiple end, or a
         if (pool) pool->release(slot);      // racing thread's idx beyond the short read)
-        if (win) win->eof = true;           // the FILE ended, not just this pass
+        if (win) win->eof.store(true, std::memory_order_relaxed);  // FILE ended, not just this pass
         done.store(true, std::memory_order_relaxed);
         break;
       }
@@ -10622,7 +10655,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
         // A short read is end-of-FILE; !cont is a caller abort and must NOT be
         // reported as eof, or the probe would treat an aborted pass as a
         // finished job and skip the remainder.
-        if (win && (size_t)got < cap && cont) win->eof = true;
+        if (win && (size_t)got < cap && cont) win->eof.store(true, std::memory_order_relaxed);
         done.store(true, std::memory_order_relaxed);
         break;
       }
@@ -15420,8 +15453,15 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   bool dr_pool_ok = false, dr_pool_tried = false;
   // borrowed_fd >= 0: pread that already-open fd (a seekable stdin redirect),
   // sizing the pool from known_size; else read opt.input by path.
+  // pool_readers_hint: size the SHARED buffer pool for the largest reader count
+  // any pass will use, not this pass's.  The pool is initialised once, on the
+  // first call; the read probe's first pass is O_DIRECT (single reader), so
+  // without this the buffered pass that follows runs 12 readers against a pool
+  // sized for 1 and is measured while starving for buffers — biasing the very
+  // comparison it exists to make.  0 = use this pass's own count.
   auto run_pooled_reader = [&](bool o_direct, int borrowed_fd, uint64_t known_size,
-                               ReadWindow * win = nullptr) -> bool {
+                               ReadWindow * win = nullptr,
+                               int pool_readers_hint = 0) -> bool {
     const size_t cap = ((host_chunk + 4095) / 4096) * 4096;
     // Buffered mode fans the kernel copy out over several threads (the wall
     // is the per-thread cold-destination copy at ~2.5-3.5 GB/s, not the
@@ -15440,7 +15480,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       // 32 extra buffers per reader: at 12 readers the original
       // threads+128 sizing showed 15% blocked-on-pool — the readers, not
       // the device, were starving for buffers.
-      size_t pool_n = std::min<size_t>((size_t)threads + 128 + 32 * (size_t)n_readers,
+      const size_t pool_readers = (size_t)std::max(n_readers, pool_readers_hint);
+      size_t pool_n = std::min<size_t>((size_t)threads + 128 + 32 * pool_readers,
                                        std::min<size_t>(file_chunks + 1, 1024));
       if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
       dr_pool_ok = dr_pool.init(cap, pool_n,
@@ -15483,27 +15524,56 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // machine from this one — both are Gen4+ NVMe.  The only signal that
   // distinguishes them is the rate itself.
   auto run_probed_reader = [&]() -> bool {
+    // Buffered reader count, needed up front: the pool is sized on the FIRST
+    // pass and the buffered pass must not be measured against a pool built for
+    // O_DIRECT's single reader.
+    const int nb = opt.read_threads > 0
+                     ? (int)opt.read_threads
+                     : std::max(3, std::min(12, threads / 8));
+
+    // ONE file identity for every pass.  Each pass would otherwise re-open
+    // opt.input by NAME, so replacing the path between passes would splice a
+    // prefix of one inode onto a suffix of another and still report success.
+    // O_DIRECT is a property of the open file description and cannot be shared
+    // with a buffered pass, so open both descriptions up front and check they
+    // are the same inode; anything else and we decline the probe rather than
+    // guess. Both stay open for the whole read, so a later rename or unlink
+    // cannot change what is read.
+    const int fd_d = ::open(opt.input.c_str(), O_RDONLY | O_DIRECT);
+    const int fd_b = ::open(opt.input.c_str(), O_RDONLY);
+    struct stat sd{}, sb{};
+    const bool same_file = fd_d >= 0 && fd_b >= 0
+        && ::fstat(fd_d, &sd) == 0 && ::fstat(fd_b, &sb) == 0
+        && sd.st_dev == sb.st_dev && sd.st_ino == sb.st_ino;
+    if (!same_file) {
+      if (fd_d >= 0) ::close(fd_d);
+      if (fd_b >= 0) ::close(fd_b);
+      return false;                       // caller falls through to its normal reader
+    }
+    struct FdPair {                       // closed on every exit path
+      int d, b;
+      ~FdPair() { if (d >= 0) ::close(d); if (b >= 0) ::close(b); }
+    } fds{fd_d, fd_b};
+    const uint64_t fsz_known = (uint64_t)sd.st_size;
+
     ReadWindow a;                                   // pass 1: O_DIRECT
     a.start_chunk  = 0;
     a.target_secs  = READ_PROBE_SECS;
     a.min_chunks   = READ_PROBE_MIN_CHUNKS;
     a.max_chunks   = READ_PROBE_MAX_CHUNKS;
-    if (!run_pooled_reader(true, -1, 0, &a)) return false;
-    if (a.eof || a.chunks.load() == 0) return true; // file ended inside the probe
+    if (!run_pooled_reader(true, fds.d, fsz_known, &a, nb)) return false;
+    if (a.eof.load() || a.chunks.load() == 0) return true; // file ended inside the probe
 
     // The buffered pass must run at least READ_PROBE_ROUNDS full rounds across
     // its reader threads, or it is timed while still spinning its pool up.
-    const int nb = opt.read_threads > 0
-                     ? (int)opt.read_threads
-                     : std::max(3, std::min(12, threads / 8));
     ReadWindow b;                                   // pass 2: buffered pool
     b.start_chunk  = a.start_chunk + a.chunks.load();
     b.target_secs  = READ_PROBE_SECS;
     b.min_chunks   = std::max(READ_PROBE_MIN_CHUNKS,
                               READ_PROBE_ROUNDS * (size_t)nb);
     b.max_chunks   = READ_PROBE_MAX_CHUNKS;
-    if (!run_pooled_reader(false, -1, 0, &b)) return false;
-    if (b.eof || b.chunks.load() == 0) return true;
+    if (!run_pooled_reader(false, fds.b, fsz_known, &b)) return false;
+    if (b.eof.load() || b.chunks.load() == 0) return true;
 
     const double ra = a.secs > 0 ? (double)a.bytes.load() / a.secs : 0.0;
     const double rb = b.secs > 0 ? (double)b.bytes.load() / b.secs : 0.0;
@@ -15521,7 +15591,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     }
     ReadWindow c;                                   // pass 3: the rest, unbounded
     c.start_chunk = b.start_chunk + b.chunks.load();
-    return run_pooled_reader(take_direct, -1, 0, &c);
+    return run_pooled_reader(take_direct, take_direct ? fds.d : fds.b,
+                             fsz_known, &c);
   };
   // --direct-read: O_DIRECT input (bypass the page cache).  Takes precedence over
   // mmap (mmap IS the page cache); falls through to fread if O_DIRECT can't open.
@@ -15547,9 +15618,14 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       && !opt.cold_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
     std::error_code pec;
     const uintmax_t psz_probe = fs::file_size(opt.input, pec);
+    // Residency must be KNOWN and cold.  adapt_path_residency returns -1 when it
+    // cannot tell, and -1 < 0.95 quietly admitted those runs to a branch whose
+    // whole justification is that the input is cold.  An unknowable input keeps
+    // today's reader.
+    const double resid_probe_r = adapt_path_residency(opt.input);
     if (!pec && (uint64_t)psz_probe >= READ_PROBE_MIN_INPUT
         && !device_is_rotational(opt.input)
-        && adapt_path_residency(opt.input) < 0.95)
+        && resid_probe_r >= 0.0 && resid_probe_r < 0.95)
       reader_done = run_probed_reader();
   }
   if (!reader_done && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
@@ -18304,7 +18380,28 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         return true;
       });
   }
-  if (!reader_done && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
+
+  // Would the cold-input read probe apply here?  Decided BEFORE the mmap branch:
+  // mmap is the default on this path and would otherwise claim the input before
+  // the probe (which lives below, in the pooled-reader branch) is ever reached.
+  // That ordering is precisely why the probe shipped in v0.15.41 never ran on a
+  // plain `gzstd FILE` invocation — compress defaults to hybrid, which comes
+  // here, and mmap always won.  When the probe applies, mmap stands aside; if it
+  // then declines internally, the pooled buffered reader takes over, which is
+  // itself faster than mmap on a cold input (19.95 s vs 25.12 s on 64 GiB).
+  const bool nv_probe_wanted =
+      !opt.direct_read_user_set && !opt.mmap_user_set && !opt.cold_read
+      && opt.input != "-" && fs::is_regular_file(opt.input)
+      && !device_is_rotational(opt.input)
+      && [&] {
+           std::error_code ec; const uintmax_t z = fs::file_size(opt.input, ec);
+           if (ec || (uint64_t)z < READ_PROBE_MIN_INPUT) return false;
+           const double r = adapt_path_residency(opt.input);
+           return r >= 0.0 && r < 0.95;
+         }();
+
+  if (!reader_done && !nv_probe_wanted
+      && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
       && fs::is_regular_file(opt.input)
       && mmap_ok_for_input(opt, opt.input)
       && mmap_region.open(opt.input.c_str())) {
@@ -18385,15 +18482,80 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, "[POOLED-READ] buffered input (page cache + readahead), zero-copy pool "
              + std::to_string(pool_n) + " buffers\n");
+      auto nv_emit = [&](const char * buf, size_t n, size_t idx, int slot) {
+        Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
+        queue.push(std::move(t));
+        // GPU-fault abort: push() dropped the task (queue is done) — stop
+        // the readers instead of streaming the rest of the file into drops.
+        return !g_gpu_aborted.load(std::memory_order_relaxed);
+      };
+
+      // Cold-input read-path probe on the GPU/hybrid producer.  This is the
+      // DEFAULT compress path (compress sets opt.hybrid), so without it the
+      // probe only ever ran under --cpu-only — i.e. never, for a plain
+      // invocation.  Same three passes as compress_cpu_mt, but expressed in
+      // this producer's terms: gpu_chunk units into nv_pool with seq == idx, so
+      // every pass shares one chunking and one sequence space and the handoff is
+      // a plain index continuation.  The O_DIRECT pass needs its own open file
+      // description (the flag cannot be toggled on the borrowed one), so it gets
+      // a second fd on the SAME inode, checked, and both live for the whole read.
+      bool nv_probed = false;
+      if (!opt.direct_read_user_set && !opt.mmap_user_set && !opt.cold_read
+          && opt.input != "-" && fs::is_regular_file(opt.input)
+          && dr_sz >= READ_PROBE_MIN_INPUT
+          && !device_is_rotational(opt.input)) {
+        const double rz = adapt_path_residency(opt.input);
+        if (rz >= 0.0 && rz < 0.95) {
+          const int fdd = ::open(opt.input.c_str(), O_RDONLY | O_DIRECT);
+          struct stat s1{}, s2{};
+          const bool same = fdd >= 0 && ::fstat(fdd, &s1) == 0
+                          && ::fstat(dr_fd, &s2) == 0
+                          && s1.st_dev == s2.st_dev && s1.st_ino == s2.st_ino;
+          if (!same) { if (fdd >= 0) ::close(fdd); }
+          else {
+            struct FdGuard { int f; ~FdGuard() { if (f >= 0) ::close(f); } } fg{fdd};
+            auto aborted = [&] { return g_gpu_aborted.load(std::memory_order_relaxed); };
+            ReadWindow a; a.target_secs = READ_PROBE_SECS;
+            a.min_chunks = READ_PROBE_MIN_CHUNKS; a.max_chunks = READ_PROBE_MAX_CHUNKS;
+            bool ok = pooled_read_chunks(opt.input, gpu_chunk, m, &nv_pool,
+                                         true, 1, fdd, nv_emit, &a);
+            // An emit that returned false (GPU abort) ends a pass exactly like a
+            // full window would; without this check the probe would read on past
+            // an abort and file the remaining chunks into drops.
+            if (ok && !a.eof.load() && a.chunks.load() > 0 && !aborted()) {
+              ReadWindow b; b.start_chunk = a.chunks.load();
+              b.target_secs = READ_PROBE_SECS;
+              b.min_chunks  = std::max(READ_PROBE_MIN_CHUNKS,
+                                       READ_PROBE_ROUNDS * (size_t)n_readers);
+              b.max_chunks  = READ_PROBE_MAX_CHUNKS;
+              ok = pooled_read_chunks(opt.input, gpu_chunk, m, &nv_pool,
+                                      false, n_readers, dr_fd, nv_emit, &b);
+              if (ok && !b.eof.load() && b.chunks.load() > 0 && !aborted()) {
+                const double ra = a.secs > 0 ? (double)a.bytes.load() / a.secs : 0.0;
+                const double rb = b.secs > 0 ? (double)b.bytes.load() / b.secs : 0.0;
+                const bool td = ra > rb * 1.05;
+                if (opt.verbosity >= V_VERBOSE) {
+                  char pb[192];
+                  std::snprintf(pb, sizeof pb,
+                    "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over "
+                    "%.0f/%.0f ms -> %s for the remainder\n",
+                    ra / 1073741824.0, rb / 1073741824.0,
+                    a.secs * 1000.0, b.secs * 1000.0, td ? "O_DIRECT" : "buffered");
+                  vlog(V_VERBOSE, opt, pb);
+                }
+                ReadWindow c; c.start_chunk = b.start_chunk + b.chunks.load();
+                ok = pooled_read_chunks(opt.input, gpu_chunk, m, &nv_pool,
+                                        td, td ? 1 : n_readers, td ? fdd : dr_fd,
+                                        nv_emit, &c);
+              }
+            }
+            reader_done = ok; nv_probed = true;
+          }
+        }
+      }
+      if (!nv_probed)
       reader_done = pooled_read_chunks(opt.input, gpu_chunk, m, &nv_pool,
-        /*o_direct=*/false, n_readers, dr_fd,
-        [&](const char * buf, size_t n, size_t idx, int slot) {
-          Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
-          queue.push(std::move(t));
-          // GPU-fault abort: push() dropped the task (queue is done) — stop
-          // the readers instead of streaming the rest of the file into drops.
-          return !g_gpu_aborted.load(std::memory_order_relaxed);
-        });
+        /*o_direct=*/false, n_readers, dr_fd, nv_emit);
       if (!reader_done) g_direct_read_pool = nullptr;  // open failed; fread takes over
     }
     // pool alloc failure: fall through to fread+copy below.
@@ -23031,8 +23193,13 @@ static void apply_backend_defaults(Options & opt)
   // decompress-only, so a CPU-only build or a compress run would never see it.
   // mincore is non-perturbing and faults nothing in, so the (adapt-only,
   // decompress-only) overlap with that probe costs a second cheap sweep.
-  if (priors.loaded && !opt.tar_mode && !opt.list_mode && !opt.cold_read
-      && !opt.direct_read_user_set) {
+  // Gated on --adapt, NOT on priors.loaded: this only labels the rate this run
+  // will RECORD, and the very first run on a machine has no profile to load.
+  // Keying it to priors.loaded meant a fresh profile never wrote a cold rate at
+  // all, so the cold pair needed an extra run to become comparable — which is
+  // why convergence took three runs instead of two.
+  if (opt.adapt && !opt.no_profile && !opt.tar_mode && !opt.list_mode
+      && !opt.cold_read && !opt.direct_read_user_set) {
     // adapt_inputs_resid_class: 1 = warm, 0 = cold, -1 = unknown OR inputs
     // disagree.  Keep all THREE states — collapsing unknown into "warm" would
     // file an unclassifiable run's rate into a bucket it does not belong to.
