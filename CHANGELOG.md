@@ -1,9 +1,31 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.46  
+**Covers:** v0.9.50 → v0.15.47  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.47 — `--tar` create joins the controller, and four liveness bugs go with it
+
+v0.15.46 stopped at `--tar` create because it deadlocked. It is wired now, and the cause was **neither** of the things two speculative fixes chased.
+
+**A wait predicate becoming true wakes nobody.** The final `fetch_add` sets `next_chunk == nchunks`, satisfying the parked readers' exit condition — but the controller's only notifiers were a supervisor step and `stop()`, and `stop()` runs *after* those threads are joined. So they slept through teardown and the join never returned. Found by making the program report its own state, since `gdb` cannot attach here (yama `ptrace_scope`): a watchdog printed every chunk claimed and pushed, `k0–k11 exit`, `k12–k31 parked`, once a second, forever. The fix is a `wake_all()` on the work-exhausted path, guaranteed to run because `floor >= 1` keeps a reader unparked to make the overrun claim. The instrumentation is kept behind `GZSTD_DEBUG_TAR_RD` — it found this in one run.
+
+An independent review (Codex CLI) of the fix returned **SAFE TO TEST** with a full stall table, and confirmed the two sibling pools do *not* share the bug: both call `stop()` before joining, so their teardown ordering supplies the notification. It also found three more defects, all fixed here.
+
+**A pre-existing backpressure deadlock.** An explicit fixed-share hybrid request with no usable GPU falls back to the CPU pipeline still carrying `--cpu-batch`'s queue floor. CPU workers then hold out for a depth the queue's byte cap cannot reach, so the producer never reaches `set_done()` to release them and blocks pushing. Trigger: `CUDA_VISIBLE_DEVICES="" gzstd -T1 --cpu-share=0.5 --cpu-batch=64 --throttle-factor=1 --tar BIG`. The parse-time guards only covered runs that were *already* `--cpu-only`, so they missed the fallback. Verified: hung indefinitely before, completes in 14.4 s now.
+
+**A member that becomes a FIFO between layout and assembly** made the blocking `open()` wait for a writer forever — and because that reader owned a claimed chunk, the pusher waited on it and the whole assembly wedged. Members are now opened `O_NONBLOCK` and verified still regular; anything else is treated exactly like an unreadable member (zero-filled, flagged, archive continues). Verified with a real mid-run swap: 0.2 s instead of a hang.
+
+**Abort was not cancellation.** A GPU fault released queue backpressure but never told the tar readers to stop, so a faulted run still paid the entire input read before reaching the CPU rebuild. They now check the abort flag before claiming.
+
+**The controller could persist a step it never validated.** If work ended mid-probe — or a tick produced zero reader bytes — the evaluation never ran and `want` stayed at the speculative value, which teardown then reported *and wrote to the profile* as though measured. It now reverts an unjudged probe at `stop()`. Verified: a short run reports the base count instead of a mid-probe one.
+
+Also: the diagnostic watchdog now writes with `poll` rather than `fprintf`, so stderr on an undrained pipe cannot stall teardown at `join()`.
+
+Three timeout-guarded regression tests cover the first three — a regression shows up as a timeout, not a suite that never returns.
 
 ---
 

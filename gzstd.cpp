@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.46";
+static constexpr const char * GZSTD_VERSION = "0.15.47";
 //
 // Architecture overview:
 //
@@ -83,7 +83,8 @@ static constexpr const char * GZSTD_VERSION = "0.15.46";
 #include <fnmatch.h>       // --exclude glob matching (GNU tar semantics)
 #include <grp.h>           // getgrgid_r — gname for tar headers
 #include <pwd.h>           // getpwuid_r — uname for tar headers
-#include <sys/sysmacros.h> // major()/minor() — device-node tar headers
+#include <sys/sysmacros.h>
+#include <poll.h> // major()/minor() — device-node tar headers
 #include <sys/xattr.h>     // --xattrs: l/f getxattr/setxattr/listxattr (glibc)
 #ifdef GZSTD_HAVE_ACL
 #include <sys/acl.h>       // --acls: POSIX.1e ACLs (libacl)
@@ -403,9 +404,12 @@ public:
           dir = -dir; dir_exhausted = true; continue;
         }
         pre_rate = rate; probe_from = cur; probing = true;
+        probe_from_.store(cur, std::memory_order_relaxed);
+        probing_.store(true, std::memory_order_relaxed);
         set_want(next);
       } else {
         probing = false; ++rounds;
+        probing_.store(false, std::memory_order_relaxed);
         if (rate > pre_rate * ADAPT_RD_MARGIN) { dir_exhausted = false; }
         else {
           set_want(probe_from);
@@ -418,6 +422,16 @@ public:
 
   void stop()
   {
+    // Revert a probe that never got measured.  A step is only supposed to be
+    // kept on a 5% gain, but if the run ends — or backpressure produces a tick
+    // with zero reader bytes — before the next positive-rate tick, the
+    // evaluation never happens and `want` is left at the SPECULATIVE value.
+    // Teardown then reports and persists it as though it had been validated,
+    // which is exactly the wrong number to seed the next run with.
+    if (probing_.load(std::memory_order_relaxed)) {
+      want_.store(probe_from_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      probing_.store(false, std::memory_order_relaxed);
+    }
     stop_.store(true, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> g(mx_); }
     cv_.notify_all();
@@ -436,6 +450,8 @@ private:
   std::atomic<int>      want_;
   const int             start_;
   const bool            seeded_;
+  std::atomic<bool>     probing_{false};   // a step is in flight, not yet judged
+  std::atomic<int>      probe_from_{0};    // what to revert it to
   std::atomic<uint64_t> bytes_{0};
   std::atomic<bool>     stop_{false};
   std::mutex              mx_;
@@ -12007,14 +12023,41 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   // within `window` of the push frontier (push_next) — this keeps the head
   // chunk always depositable (a deposit never blocks), so the head reader can't
   // be wedged behind later chunks.  window ≥ nreaders keeps every reader busy.
-  // NOT adaptively sized, unlike the compress and decompress readers — see the
-  // note at ReaderPoolCtl.  This pool's readers CLAIM a chunk and then wait for
-  // it to come within the push frontier's window, with a pusher blocking until
-  // the head chunk arrives; parking a reader anywhere in that cycle deadlocked a
-  // --tar create outright (verified: fine without --adapt, wedged with it, all
-  // threads in futex_wait with the archive 17.6 GB in).  It needs the reorder
-  // buffer's invariants worked out first, so it gets its own change.
-  const size_t window = std::max<size_t>(8, (size_t)nreaders * 2);
+  // ---- Adaptive reader-pool sizing ----------------------------------------
+  // Same ReaderPoolCtl as the compress and decompress readers.  Parking is safe
+  // HERE ONLY because it happens before a chunk is claimed: a parked reader
+  // holds no claim, no buffer and no reorder-buffer mutex, so it is not part of
+  // the `window reader -> push_next -> pusher -> queue -> writer` chain.
+  //
+  // This deadlocked on the first attempt, and the cause was NOT the claim/park
+  // interaction that two speculative fixes chased.  The final `fetch_add` sets
+  // next_chunk == nchunks and notifies NOBODY: a wait predicate becoming true
+  // wakes no one, and the controller's only notifiers were a supervisor step and
+  // stop() — which runs after these threads are joined.  Measured with an
+  // in-process watchdog (gdb cannot attach; yama ptrace_scope): every chunk
+  // claimed and pushed, k0-k11 exited, k12-k31 still parked, join never
+  // returning.  The wake_all() on the work-exhausted path below supplies that
+  // missing event; it is guaranteed to run because floor >= 1 keeps at least one
+  // reader unparked to make the overrun claim.
+  //
+  // GZSTD_DEBUG_TAR_RD arms a watchdog that prints, every second, which thread
+  // holds which chunk in which state plus the frontier and reorder-buffer head —
+  // what gdb would have shown.  Kept: it found this in one run.
+  const bool  rd_ad_t   = opt.adapt && opt.read_threads == 0;
+  const int   rd_ceil_t = rd_ad_t ? std::max(nreaders, std::min(nreaders * 3, 32)) : nreaders;
+  const int   rd_floor_t = std::max(1, nreaders / 2);
+  const int rd_seed_t = rd_ad_t ? g_adapt_rd_prior.load(std::memory_order_relaxed) : 0;
+  ReaderPoolCtl rd_ctl_t(nreaders, rd_floor_t, rd_ceil_t, rd_seed_t);
+  std::atomic<bool> rd_done_t{false};
+  const bool  rd_trace  = std::getenv("GZSTD_DEBUG_TAR_RD") != nullptr;
+  // Per-reader state, so a wedged run names its own culprit.
+  enum RdSt { RD_START = 0, RD_PARKED, RD_CLAIMED, RD_WINWAIT, RD_ASSEMBLE, RD_DEPOSIT, RD_EXIT };
+  static const char * rd_st_name[] = { "start","parked","claimed","winwait","assemble","deposit","exit" };
+  std::vector<std::atomic<int>>    rd_st((size_t)rd_ceil_t);
+  std::vector<std::atomic<size_t>> rd_hold((size_t)rd_ceil_t);
+  for (int i = 0; i < rd_ceil_t; ++i) { rd_st[(size_t)i].store(RD_START); rd_hold[(size_t)i].store(SIZE_MAX); }
+  std::atomic<int> pusher_st{0};          // 0 = waiting for head, 1 = pushing
+  const size_t window = std::max<size_t>(8, (size_t)rd_ceil_t * 2);
   std::mutex rb_mx;
   std::condition_variable rb_cv;        // signals: chunk arrived / frontier advanced
   std::map<size_t, Task> ready;
@@ -12049,8 +12092,26 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         if (e.data_off < b && de > a) {
           if (cur_path != e.src) {
             if (cur_fd >= 0) ::close(cur_fd);
-            cur_fd = ::open(e.src.c_str(), O_RDONLY);
+            // O_NONBLOCK on the open, then verify it is still a regular file.
+            // The layout was built earlier, so a member can have been replaced
+            // between then and now; if it became a FIFO, a blocking open waits
+            // for a writer FOREVER, and because this reader owns a claimed
+            // chunk the pusher then waits on it and the whole assembly wedges.
+            // A non-regular member is treated exactly like an unreadable one:
+            // zero-filled, flagged, and the archive continues.
+            cur_fd = ::open(e.src.c_str(), O_RDONLY | O_NONBLOCK);
             cur_errno = (cur_fd < 0) ? errno : 0;
+            if (cur_fd >= 0) {
+              struct stat mst{};
+              if (::fstat(cur_fd, &mst) != 0 || !S_ISREG(mst.st_mode)) {
+                ::close(cur_fd); cur_fd = -1; cur_errno = EINVAL;
+              } else {
+                // Clear O_NONBLOCK: on a regular file it does not affect reads,
+                // but leaving it set is a surprise for anything downstream.
+                const int fl = ::fcntl(cur_fd, F_GETFL);
+                if (fl >= 0) (void)::fcntl(cur_fd, F_SETFL, fl & ~O_NONBLOCK);
+              }
+            }
             cur_path = e.src;
           }
           // Read `len` bytes from file offset `foff` into the chunk at virtual
@@ -12117,22 +12178,56 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     return t;
   };
 
-  auto reader = [&]() {
+  auto reader = [&](int k) {
     std::string cur_path; int cur_fd = -1, cur_errno = 0;
+    auto mark = [&](int st, size_t ci) {
+      rd_st[(size_t)k].store(st, std::memory_order_relaxed);
+      rd_hold[(size_t)k].store(ci, std::memory_order_relaxed);
+    };
     for (;;) {
+      if (rd_ad_t) {
+        mark(RD_PARKED, SIZE_MAX);
+        if (!rd_ctl_t.wait_turn(k, [&] {
+              return rd_done_t.load(std::memory_order_relaxed)
+                  || next_chunk.load(std::memory_order_relaxed) >= nchunks; })) break;
+      }
+      // Abort is not just backpressure release: a GPU fault calls set_done() on
+      // the queue, which unblocks the pusher and drops later pushes, but nothing
+      // told these readers to stop — so a wedged run would still pay the full
+      // input read before reaching the CPU rebuild.  Stop claiming new work, and
+      // wake anyone parked so they exit too.
+      if (g_gpu_aborted.load(std::memory_order_relaxed)) {
+        if (rd_ad_t) rd_ctl_t.wake_all();
+        break;
+      }
       size_t ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
-      if (ci >= nchunks) break;
+      if (ci >= nchunks) {
+        // Work is exhausted.  Parked readers have `next_chunk >= nchunks` in
+        // their wait predicate, but a predicate becoming true wakes nobody — the
+        // only notifiers are a supervisor step and stop(), and stop() runs after
+        // these threads are joined.  Without this the parked readers sleep
+        // forever and the join never returns: MEASURED, k0-k11 exited while
+        // k12-k31 stayed parked with every chunk already pushed.
+        if (rd_ad_t) rd_ctl_t.wake_all();
+        break;
+      }
+      mark(RD_CLAIMED, ci);
       {  // throttle read-ahead to `window` chunks past the push frontier
         std::unique_lock<std::mutex> lk(rb_mx);
+        mark(RD_WINWAIT, ci);
         rb_cv.wait(lk, [&] { return ci < push_next + window; });
       }
+      mark(RD_ASSEMBLE, ci);
       Task t = assemble_chunk(ci, cur_path, cur_fd, cur_errno);  // concurrent preads (unlocked)
+      if (rd_ad_t) rd_ctl_t.add_bytes((uint64_t)t.data.size());
+      mark(RD_DEPOSIT, ci);
       {
         std::unique_lock<std::mutex> lk(rb_mx);
         ready.emplace(ci, std::move(t));
       }
       rb_cv.notify_all();
     }
+    mark(RD_EXIT, SIZE_MAX);
     if (cur_fd >= 0) ::close(cur_fd);
   };
 
@@ -12142,7 +12237,9 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       Task t;
       {
         std::unique_lock<std::mutex> lk(rb_mx);
+        pusher_st.store(0, std::memory_order_relaxed);
         rb_cv.wait(lk, [&] { return !ready.empty() && ready.begin()->first == push_next; });
+        pusher_st.store(1, std::memory_order_relaxed);
         t = std::move(ready.begin()->second);
         ready.erase(ready.begin());
         ++push_next;
@@ -12154,11 +12251,63 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   };
 
   std::vector<std::thread> pool;
-  pool.reserve((size_t)nreaders);
-  for (int i = 0; i < nreaders; ++i) pool.emplace_back(reader);
+  pool.reserve((size_t)rd_ceil_t);
+  for (int i = 0; i < rd_ceil_t; ++i) pool.emplace_back([&, i] { reader(i); });
   std::thread push_thr(pusher);
+  std::thread rd_super_t;
+  if (rd_ad_t)
+    rd_super_t = std::thread([&] {
+      rd_ctl_t.supervise([&] { return rd_done_t.load(std::memory_order_relaxed); });
+    });
+  // Watchdog: the program reports its own deadlock, since gdb cannot attach.
+  std::thread rd_wd;
+  if (rd_trace)
+    rd_wd = std::thread([&] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (rd_done_t.load(std::memory_order_relaxed)) return;
+        size_t pn, rsz, rhead = SIZE_MAX;
+        { std::lock_guard<std::mutex> lk(rb_mx);
+          pn = push_next; rsz = ready.size();
+          if (!ready.empty()) rhead = ready.begin()->first; }
+        std::string ln = "[TARRD] next_chunk=" + std::to_string(next_chunk.load())
+          + "/" + std::to_string(nchunks) + " push_next=" + std::to_string(pn)
+          + " ready=" + std::to_string(rsz) + " head="
+          + (rhead == SIZE_MAX ? std::string("-") : std::to_string(rhead))
+          + " window=" + std::to_string(window)
+          + " want=" + std::to_string(rd_ctl_t.want())
+          + " pusher=" + (pusher_st.load() ? "pushing" : "wait-head") + "\n        ";
+        for (int i = 0; i < rd_ceil_t; ++i) {
+          const size_t h = rd_hold[(size_t)i].load();
+          ln += "k" + std::to_string(i) + ":" + rd_st_name[rd_st[(size_t)i].load()]
+              + (h == SIZE_MAX ? "" : "(" + std::to_string(h) + ")") + " ";
+        }
+        // Never block here: with stderr on an undrained pipe a blocking write
+        // would stall, and main joins this thread at teardown.  Skip the line
+        // rather than hang the program on its own diagnostics.
+        struct pollfd pfd{ STDERR_FILENO, POLLOUT, 0 };
+        if (::poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLOUT))
+          (void)!::write(STDERR_FILENO, ln.c_str(), ln.size());
+      }
+    });
   for (auto & th : pool) th.join();
   push_thr.join();
+  rd_done_t.store(true, std::memory_order_relaxed);
+  rd_ctl_t.stop();
+  if (rd_super_t.joinable()) rd_super_t.join();
+  if (rd_wd.joinable()) rd_wd.join();
+  if (rd_ad_t) {
+    if (m) m->reader_threads.store(rd_ctl_t.want(), std::memory_order_relaxed);
+    g_adapt_rd_settled.store(rd_ctl_t.want(), std::memory_order_relaxed);
+    if (opt.verbosity >= V_VERBOSE) {
+      char rb[160];
+      std::snprintf(rb, sizeof rb,
+        "[TAR] reader pool: started %d%s, settled %d (range %d-%d)\n",
+        rd_ctl_t.start(), rd_ctl_t.seeded() ? " (from profile)" : "",
+        rd_ctl_t.want(), rd_ctl_t.floor_v(), rd_ctl_t.ceiling());
+      vlog(V_VERBOSE, opt, rb);
+    }
+  }
 }
 
 /*======================================================================
@@ -18243,10 +18392,28 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         die_usage("GPU requested (--gpu-only) but no CUDA devices available");
       vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU\n");
       g_adapt_gpu_absent.store(true, std::memory_order_relaxed);
+      // Clear the hybrid queue floor before handing this to the CPU pipeline.
+      // --cpu-batch sets a depth CPU workers wait for before they will pop, which
+      // only makes sense when a GPU is draining the queue too.  Falling through
+      // to compress_cpu_mt with it still set deadlocks: the workers hold out for
+      // a depth the queue's byte cap cannot reach, the producer therefore never
+      // reaches set_done() to release them, and the producer blocks pushing.
+      // Reachable with an EXPLICIT hybrid request and no usable GPU, e.g.
+      //   CUDA_VISIBLE_DEVICES="" gzstd -T1 --cpu-share=0.5 --cpu-batch=64 \
+      //     --throttle-factor=1 --tar BIGFILE
+      // The parse-time guards only cover runs that were already --cpu-only, so
+      // they miss this fallback.
+      Options cpu_fb = opt;
+      if (cpu_fb.cpu_queue_min > 0) {
+        if (opt.verbosity >= V_ERROR)
+          std::cerr << "gzstd: note: --cpu-batch is ignored with no usable GPU "
+                       "(fell back to CPU-only)\n";
+        cpu_fb.cpu_queue_min = 0;
+      }
 #ifndef _WIN32
-      compress_cpu_mt(in, out, opt, m, pre_built ? &pre_layout : nullptr);
+      compress_cpu_mt(in, out, cpu_fb, m, pre_built ? &pre_layout : nullptr);
 #else
-      compress_cpu_mt(in, out, opt, m);
+      compress_cpu_mt(in, out, cpu_fb, m);
 #endif
       return;
     }

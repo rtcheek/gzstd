@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=361
-$EXTENSIVE && EXPECTED_TESTS=494
+EXPECTED_TESTS=364
+$EXTENSIVE && EXPECTED_TESTS=497
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3617,6 +3617,54 @@ rm -f "$TMPDIR/arank.zst" "$TMPDIR/arank.out" "$TMPDIR/arank1.err" \
       "$TMPDIR/arank2.err" "$TMPDIR/arank3.err" "$TMPDIR/arank4.err"
 
 # ────────────────────────────────────────────────────────────
+section "reader/pusher liveness (deadlocks fixed v0.15.47)"
+
+# Every case here HUNG before its fix.  They are timeout-guarded: a regression
+# shows up as a timeout, not as a suite that never returns.
+mkdir -p "$TMPDIR/lv"
+for i in 1 2 3 4 5 6 7 8; do
+  dd if=/dev/urandom bs=1M count=6 2>/dev/null > "$TMPDIR/lv/f$i.bin"
+done
+
+# 1. Explicit fixed-share hybrid with NO usable GPU.  The fallback to the CPU
+#    pipeline used to carry --cpu-batch's queue floor with it: workers held out
+#    for a depth the queue cap could not reach, so the producer never reached
+#    set_done() to release them and blocked pushing.  (Codex review, v0.15.47.)
+if CUDA_VISIBLE_DEVICES="" timeout 120 "$GZSTD" -T1 --cpu-share=0.5 --cpu-batch=64 \
+     --throttle-factor=1 -f -o "$TMPDIR/lv1.tar.zst" --tar "$TMPDIR/lv" >/dev/null 2>&1 \
+   && [ -s "$TMPDIR/lv1.tar.zst" ]; then
+  pass "explicit hybrid + no GPU does not deadlock on the queue floor"
+else
+  fail "explicit hybrid + no GPU does not deadlock on the queue floor"
+fi
+
+# 2. A member that becomes a FIFO between layout and assembly.  A blocking
+#    open() waited for a writer forever, and because that reader owned a claimed
+#    chunk the pusher waited on it and the whole assembly wedged.
+cp -r "$TMPDIR/lv" "$TMPDIR/lv2" 2>/dev/null
+( sleep 0.3; rm -f "$TMPDIR/lv2/f4.bin"; mkfifo "$TMPDIR/lv2/f4.bin" 2>/dev/null ) &
+swap_pid=$!
+if timeout 120 "$GZSTD" --cpu-only -f -o "$TMPDIR/lv2.tar.zst" --tar "$TMPDIR/lv2" >/dev/null 2>&1; then
+  pass "member replaced by a FIFO mid-assembly does not wedge the pusher"
+else
+  fail "member replaced by a FIFO mid-assembly does not wedge the pusher"
+fi
+wait "$swap_pid" 2>/dev/null
+
+# 3. --tar create under --adapt: the reader pool's parked threads must be woken
+#    when work runs out.  The final claim satisfies their wait predicate, but a
+#    predicate becoming true notifies nobody, so they slept through teardown and
+#    the join never returned.
+if timeout 120 "$GZSTD" --adapt --no-profile --cpu-only -f \
+     -o "$TMPDIR/lv3.tar.zst" --tar "$TMPDIR/lv" >/dev/null 2>&1 \
+   && [ -s "$TMPDIR/lv3.tar.zst" ]; then
+  pass "--adapt --tar create wakes parked readers at work exhaustion"
+else
+  fail "--adapt --tar create wakes parked readers at work exhaustion"
+fi
+
+rm -rf "$TMPDIR/lv" "$TMPDIR/lv2" "$TMPDIR"/lv*.tar.zst
+
 section "--adapt reader pool controller (measured sizing)"
 
 # The MT prefetch reader is sized by a MEASURED controller (v0.15.46), not by
