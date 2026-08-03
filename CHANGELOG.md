@@ -1,9 +1,37 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.47  
+**Covers:** v0.9.50 → v0.15.48  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.48 — the open-items ledger, closed
+
+Eight items that had been carried as "open, low priority" — some since v0.15.35 — plus the `--gpu-only` `--tar` path that had never been run.
+
+**`--adapt` correctness cluster.** Three items in one subsystem:
+
+- **A sub-floor probe left no trace at all**, not even `runs`, so the predictor re-selected the same exploration forever. A deliberate exploration is now admitted under the floor to record its *attempt stamp only* — no rate, because a run that short measured nothing worth keeping.
+- **`g_adapt_gpu_engaged` was set at worker SPAWN**, so a worker that started and then failed made an all-CPU run file its rate under `hybrid`. It now fires at the first frame a GPU actually *delivers*, on both the compress and decompress paths. Care was needed picking the site: the obvious one is the shared `writer_thread`, where a CPU-only batch would have set it too.
+- **A residency bucket mixed durations.** A run too short for the GPU to engage cannot inform a cpu-vs-hybrid comparison — one side is unmeasurable at that size — yet it still filed a rate that a long, GPU-worthy run then inherited. Runs under the engagement guard no longer contribute to the backend pair; they still contribute runs, regime, read-path and reader count. Kept as a gate rather than a fourth key dimension, because the sub-guard side has no hybrid measurement to pair with.
+
+**The `--tar` reader bucket was never written.** v0.15.45 keys the settled reader count by residency, but `--tar` create's source is a *directory* and the residency probe answers −1 for anything that is not a regular file — so the tar half had no coordinates and silently re-climbed every run. It now samples up to 24 member files (a bounded walk; a backup source can hold millions). A second bug surfaced immediately behind it: the tar label was set inside `if (priors.loaded)`, so a *fresh* profile filed tar runs in the non-tar bucket — the same mistake already made once with `g_adapt_src_cold`, and worth naming as a pattern.
+
+**Extract pool.** The governor computed its settled size from what it *asked* for, while the supervisor clamps every round to `ewgrow_cap_` — so a cap-clamped final round persisted a pool size that never existed and the next run seeded from a fiction. And `q_max_bytes_` was sized once from the *base* pool width, so a grown pool kept a queue budget for a pool half its size and the new writers starved on an empty queue, which is the opposite of what growing was for.
+
+**The decompress size estimator opened and pread up to 1 MiB per input** — O(inputs) of startup before any work, noticeable on a shell glob over thousands of archives. Only the first four inputs are sampled now; the rest are scaled by the ratio those established. The consumer is a coarse "is there enough work for a GPU" gate, so a wrong guess costs a suboptimal backend choice, never correctness.
+
+**`std::terminate` on an exception escaping the compress reader region.** ~6 threads are live there, and destroying a joinable `std::thread` is an immediate abort: no unwinding, no message, no actionable exit code. An RAII guard now makes the unwind path do exactly what the success path does — mark the queue done, release the throttle, mark the result store, then join — so an unexpected throw surfaces as a normal error. The deliberate fatal paths were always safe (`die_*()` is `std::exit`).
+
+**CLI ergonomics.** `--watchdog SECS` accepts the separated form like every other valued flag (`--watchdog 60` used to arm a silent 30 s default). `-T -5` is a usage error instead of being quietly clamped away. And `-0` selects the default level, as **verified against real zstd v1.5.7** — it was a usage error here, so a script written against zstd failed for no reason. A suite test asserted the old behaviour and now asserts parity.
+
+**xattrs and SELinux contexts on symlinks and special files are restored.** They were stored on create and silently dropped on extract, because `apply_ext` is fd-based and a symlink or device node is never opened for writing. `apply_ext_path` opens the member `O_PATH|O_NOFOLLOW` through the same secure per-component walk and uses `lsetxattr`, so the link *itself* is labelled rather than whatever it points at — following it would be a way to write attributes onto an arbitrary target. **Stated plainly: this is unverified on the development box.** Linux forbids `user.*` xattrs on symlinks and FIFOs outright, so only `security.*` and `trusted.*` can exercise the path, and both need privilege. Verified only that the regular-file and directory paths did not regress. It wants an SELinux host or a root-capable CI job.
+
+**The `-d --tar` writer pool was steering on its own supply.** In parallel extract the Extractor's own meter is deliberately null (to avoid double-counting), and the controller's signal counted tar bytes *parsed* — but parse is decode-bound and runs ahead of the writers, which are device-bound. A pool sized from that is reacting to how fast work arrives, not to how fast the sink drains it. It now reads a dedicated write-completion counter, published where a file is actually closed.
+
+**`--gpu-only --tar` create, validated for the first time**: byte-identical round-trip on a 16 GiB tree, and correct alongside the reader controller seeding from the profile.
 
 ---
 

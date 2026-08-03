@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.47";
+static constexpr const char * GZSTD_VERSION = "0.15.48";
 //
 // Architecture overview:
 //
@@ -333,6 +333,12 @@ static const uint64_t READ_PROBE_MIN_INPUT = 4ull * 1024 * 1024 * 1024;
 static const int    ADAPT_RD_TICK_MS    = 250;  // one measurement window
 static const int    ADAPT_RD_MAX_ROUNDS = 6;    // bounded search, then settle
 static const double ADAPT_RD_MARGIN     = 1.05; // anti-flap, as the backend prior uses
+
+// Backend-pair duration floor.  Below this a run is too short for the GPU to be
+// engaged at all (it mirrors GPU_INIT_GUARD_SEC, which is defined later and only
+// under HAVE_NVCOMP — this one has to exist in the CPU-only build too, because
+// the profile-save path is backend-agnostic).  Keep the two in step.
+static const double ADAPT_BACKEND_MIN_SEC = 4.0;
 
 // One controller for every reader pool — compress pooled, decompress prefetch,
 // and --tar create.  Deliberately shared: triplicating a park/unpark mechanism
@@ -2282,8 +2288,27 @@ static std::atomic<bool> g_adapt_writer_probe_engaged{false};  // wt2 spawned th
 // run's pool.  A run is EITHER plain (writer probe) or extract (this), never
 // both, so the governor's probe state machine is shared between them.
 static std::atomic<int>  g_adapt_ewgrow_target{0};    // extra writers wanted (0..cap)
+// The pool's REAL ceiling on extras, published by start_pool.  The governor
+// computes its settled size from what it ASKED for, but the supervisor clamps
+// every round to this — so without it a cap-clamped final round persists a pool
+// size that never existed, and the next run seeds from a fiction.  0 = unset.
+static std::atomic<int>  g_adapt_ewgrow_cap{0};
+// Bytes the extract writers have actually COMMITTED to disk.  Distinct from the
+// progress meter's wrote_bytes, which in parallel extract counts tar bytes
+// PARSED — parse runs ahead of the writers (it is decode-bound, they are
+// device-bound), so a controller sizing the WRITER pool from it is steering on
+// its own supply rather than on the sink it is trying to fix.  Zeroed per run.
+static std::atomic<uint64_t> g_adapt_extract_written{0};
 static std::atomic<int>  g_adapt_ewgrow_allowed{1};   // 0 = profile converged, don't probe
-static std::atomic<int>  g_adapt_ewgrow_settled{0};   // pool size to persist (0 = untried)
+static std::atomic<int>  g_adapt_ewgrow_settled{0};
+// Settled pool size as the POOL could actually realise it: the governor's
+// requested extras clamped to the ceiling start_pool published.
+static inline int adapt_ewgrow_clamp(int base, int extra)
+{
+  const int cap = g_adapt_ewgrow_cap.load(std::memory_order_relaxed);
+  if (cap > 0 && extra > cap) extra = cap;
+  return base + extra;
+}   // pool size to persist (0 = untried)
 static std::atomic<int>  g_adapt_ewgrow_converged{0}; // 1 = reverted w/ no gain (persist -> allowed=0 next run)
 static std::atomic<bool> g_adapt_ewgrow_engaged{false};
 static std::atomic<int>  g_adapt_ewgrow_prior_base{0}; // profile-seeded start pool size (0 = none)
@@ -2699,7 +2724,15 @@ private:
   {
     s.wdisk    = m_->writer_disk_ns.load(std::memory_order_relaxed);
     s.wstarv   = m_->writer_starved_ns.load(std::memory_order_relaxed);
-    s.wbytes   = m_->wrote_bytes.load(std::memory_order_relaxed);
+    // EXTRACT sizes its writer pool from real write completions.  The progress
+    // meter counts tar bytes PARSED in parallel mode, and parse runs ahead of the
+    // writers, so sizing the pool from it steers on supply instead of on the sink.
+    // Everything else keeps the progress meter: it is the right signal there.
+    {
+      const uint64_t ew = g_adapt_extract_written.load(std::memory_order_relaxed);
+      s.wbytes = (is_extract_ && ew > 0)
+                   ? ew : m_->wrote_bytes.load(std::memory_order_relaxed);
+    }
     s.ebusy    = m_->extract_busy_ns.load(std::memory_order_relaxed);
     s.estarv   = m_->extract_starved_ns.load(std::memory_order_relaxed);
     s.rio      = m_->reader_io_ns.load(std::memory_order_relaxed);
@@ -2974,7 +3007,7 @@ private:
           const bool keep = post >= probe_pre_rate_ * 1.10;
           char pl[192];
           if (keep) {
-            g_adapt_ewgrow_settled.store(ewgrow_base_ + ewgrow_extra_,
+            g_adapt_ewgrow_settled.store(adapt_ewgrow_clamp(ewgrow_base_, ewgrow_extra_),
                                          std::memory_order_relaxed);
             g_adapt_action_flags.fetch_or(ADAPT_ACT_EWRITER_GROW,
                                           std::memory_order_relaxed);
@@ -2989,7 +3022,7 @@ private:
             adapt_set_ewgrow(ewgrow_extra_);   // reap the extras that didn't pay
             g_adapt_ewgrow_converged.store(1, std::memory_order_relaxed);
             // Persist the best kept size (base if the very first round reverted).
-            g_adapt_ewgrow_settled.store(ewgrow_base_ + ewgrow_extra_,
+            g_adapt_ewgrow_settled.store(adapt_ewgrow_clamp(ewgrow_base_, ewgrow_extra_),
                                          std::memory_order_relaxed);
             probe_phase_ = 3;   // converged; no more rounds this run
             std::snprintf(pl, sizeof(pl),
@@ -3013,7 +3046,7 @@ private:
           const bool keep = post >= probe_pre_rate_ * 0.85;
           char pl[192];
           if (keep) {
-            g_adapt_ewgrow_settled.store(ewgrow_base_ + ewgrow_extra_,
+            g_adapt_ewgrow_settled.store(adapt_ewgrow_clamp(ewgrow_base_, ewgrow_extra_),
                                          std::memory_order_relaxed);
             g_adapt_action_flags.fetch_or(ADAPT_ACT_EWRITER_TRIM,
                                           std::memory_order_relaxed);
@@ -3029,7 +3062,7 @@ private:
             ewgrow_extra_ += ewgrow_ctr_n_;
             adapt_set_ewgrow(ewgrow_extra_);
             ewgrow_floor_extra_ = ewgrow_extra_;
-            g_adapt_ewgrow_settled.store(ewgrow_base_ + ewgrow_extra_,
+            g_adapt_ewgrow_settled.store(adapt_ewgrow_clamp(ewgrow_base_, ewgrow_extra_),
                                          std::memory_order_relaxed);
             probe_phase_ = 3;   // converged; no more sizing rounds this run
             std::snprintf(pl, sizeof(pl),
@@ -3633,6 +3666,7 @@ struct AdaptObs {
   int sink_regular = -1;                         // sink class this run ran with (-1 unknown)
   int rd_resid = -1;                             // residency for the reader bucket
   int rd_tar = 0;                                // 1 = the count came from a --tar create
+  bool stamp_only = false;                       // sub-floor probe: record the ATTEMPT, no rates
   int rd_ctx_chunk_mib = 0, rd_ctx_threads = 0;  // config the settled count belongs to
   int explored = 0;                              // backend this run was exploring (0/1/2)
   // Which backend actually ran, so the end-to-end rate is filed under it.
@@ -3703,6 +3737,21 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     return;
   }
 
+  // Sub-floor exploration: stamp the attempt so the predictor holds off, and
+  // record nothing else.  The run was too short for any rate it produced to be
+  // meaningful, which is exactly why the floor exists.
+  if (obs.stamp_only) {
+    if (obs.explored) {
+      const char * nm = obs.explored == 1 ? "cpu" : "hybrid";
+      dir.put_num(std::string("overall_gibs_") + nm + "_run", dir.gnum("runs", 0));
+      if (obs.resid_class >= 0)
+        dir.put_num(std::string("overall_gibs_") + nm + "_"
+                      + adapt_resid_class_name(obs.resid_class) + "_run",
+                    dir.gnum("runs", 0));
+    }
+    return;
+  }
+
   const double wall_s = obs.wall_ns / 1e9;
   const double GiB = 1024.0 * 1024.0 * 1024.0;
   if (wall_s > 0 && obs.payload_bytes > 0) {
@@ -3736,7 +3785,20 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     // probe SORTS runs, the end-to-end measurement still DECIDES within a bucket.
     const char * rc = obs.resid_class >= 0
                         ? adapt_resid_class_name(obs.resid_class) : nullptr;
-    if (obs.backend_used == 1) {
+    // DURATION GATE.  A bucket must not mix runs of different work classes: a run
+    // too short for the GPU to engage at all cannot inform a cpu-vs-hybrid
+    // comparison, because one side of that comparison is unmeasurable at that
+    // size — the lazy guard declines by policy, the run files a CPU rate, and a
+    // long GPU-worthy run then inherits it.  The boundary is exactly the
+    // engagement guard: below it, hybrid is not a choice this machine has.
+    // Such runs still contribute runs/regime/read-path/reader-count, just not
+    // the backend pair.  (Keeping it a GATE rather than a fourth key dimension
+    // is deliberate: the sub-guard side has no hybrid measurement to compare
+    // against, so a bucket for it could never become a pair.)
+    const bool long_enough_for_backend = wall_s >= ADAPT_BACKEND_MIN_SEC;
+    if (!long_enough_for_backend) {
+      // fall through: no backend rate recorded for this run
+    } else if (obs.backend_used == 1) {
       dir.put_num("overall_gibs_cpu", ema(dir.gnum("overall_gibs_cpu", 0), rate));
       dir.put_num("overall_gibs_cpu_run", dir.gnum("runs", 0));
       if (rc) {
@@ -13845,6 +13907,40 @@ private:
 #endif
   }
 
+  // Path-based sibling of apply_ext, for members that are never opened for
+  // writing: symlinks, FIFOs and device nodes.  Their xattrs (including SELinux
+  // contexts) were STORED on create and then silently dropped on extract,
+  // because apply_ext is fd-based and there is no fd for these.  GNU tar
+  // restores them, so this closes a real fidelity gap for --xattrs/--selinux.
+  //
+  // Uses the same secure O_NOFOLLOW-per-component walk as everything else and
+  // then the *l* variants through /proc/self/fd, so the symlink ITSELF is
+  // labelled rather than whatever it points at — following it here would be a
+  // way to write attributes onto an arbitrary target.  ACLs are deliberately not
+  // attempted: symlinks cannot carry them, and a FIFO/device inherits the
+  // directory default.
+  void apply_ext_path(const std::string & rel, const ExtMeta & ext, int root = 0) {
+    if (ext.xattrs.empty()) return;
+#ifndef _WIN32
+    std::string leaf; int pfd = open_parent(rel, leaf, false, root);
+    if (pfd < 0) return;
+    // O_PATH|O_NOFOLLOW gives a handle to the LINK, not its target, and works
+    // for FIFOs and device nodes that must not be opened for real.
+    const int lfd = ::openat(pfd, leaf.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    ::close(pfd);
+    if (lfd < 0) return;
+    const std::string pp = "/proc/self/fd/" + std::to_string(lfd);
+    for (const auto & kv : ext.xattrs) {
+      if (::lsetxattr(pp.c_str(), kv.first.c_str(), kv.second.data(), kv.second.size(), 0) != 0)
+        vlog(V_VERBOSE, opt_, "gzstd: untar: xattr " + kv.first + " on " + rel
+                              + ": " + std::strerror(errno) + "\n");
+    }
+    ::close(lfd);
+#else
+    (void)rel; (void)ext; (void)root;
+#endif
+  }
+
   // Securely create/replace a regular file; returns an open write fd or -1.
   // o_direct: add O_DIRECT to the leaf open (large-file extract fast path).  The
   // secure O_NOFOLLOW-per-component walk is unchanged; only the final flag differs.
@@ -14119,6 +14215,7 @@ private:
     // for ("the optimum is hardware-dependent — tune it on the target box").
     if (opt_.adapt && opt_.write_threads == 0) {
       ewgrow_cap_ = std::max(std::max(n, cpu - n), seed_extra);
+      g_adapt_ewgrow_cap.store(ewgrow_cap_, std::memory_order_relaxed);
       ewsup_stop_ = false;
       ewsup_ = std::thread([this] { ewriter_supervisor(); });
       // Seeded prior: bring the pool up to the profile's settled size right away
@@ -14264,6 +14361,16 @@ private:
       }
       if (target > active) {                       // grow: spawn fresh extras
         g_adapt_ewgrow_engaged.store(true, std::memory_order_relaxed);
+        // Resize the job-queue budget with the pool.  It was sized once from the
+        // BASE width, so a grown pool kept a queue budget for a pool half its
+        // size and the new writers starved on an empty queue — the opposite of
+        // what growing was for.
+        {
+          std::lock_guard<std::mutex> qlk(q_m_);
+          q_max_bytes_ = std::max<size_t>(256 * 1024 * 1024,
+                                          (size_t)(n_writers_ + target) * 2 * LARGE_WINDOW);
+        }
+        q_cv_prod_.notify_all();   // a wider budget may admit a waiting producer
         for (int i = active; i < target; ++i) {
           retire_flags_.push_back(std::make_unique<std::atomic<bool>>(false));
           std::atomic<bool> * rp = retire_flags_.back().get();
@@ -14520,6 +14627,9 @@ private:
     apply_ext(fd, /*is_dir=*/false, j.ext);
     ::close(fd);
     if (m_) m_->wrote_bytes.fetch_add(j.size, std::memory_order_relaxed);
+    // Always published, even when m_ is null (parallel mode routes the progress
+    // meter elsewhere): this is the writer-pool controller's rate signal.
+    g_adapt_extract_written.fetch_add(j.size, std::memory_order_relaxed);
   }
 
   // ---- parsing ----
@@ -14821,6 +14931,7 @@ private:
       case '2': {                                  // symlink
         NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
         if (!make_symlink(rel, e.linkname, e.uid, e.gid, root)) fail(rel, "cannot create symlink");
+        apply_ext_path(rel, e.ext, root);   // xattrs/SELinux on the LINK itself
         break;
       }
       case '1':                                    // hardlink (deferred: target must exist)
@@ -14831,6 +14942,8 @@ private:
         if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor, root)) {
           if (errno == EPERM) vlog(V_VERBOSE, opt_, "gzstd: untar: " + rel + ": need privilege for device/special; skipped\n");
           else fail(rel, "cannot create special file");
+        } else {
+          apply_ext_path(rel, e.ext, root);   // FIFO/device nodes carry xattrs too
         }
         if (e.size) { r.skip(e.size); r.skip(pad); }
         break;
@@ -14917,6 +15030,7 @@ private:
     apply_ext(fd, /*is_dir=*/false, e.ext);
     ::close(fd);
     if (m_) m_->wrote_bytes.fetch_add(e.real_size, std::memory_order_relaxed);
+    g_adapt_extract_written.fetch_add(e.real_size, std::memory_order_relaxed);
   }
 
   void finish_deferred() {
@@ -15874,6 +15988,39 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     &cpuagg, &throttle);
   if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
 
+  // From here until the joins below, ~6 threads are live.  An exception escaping
+  // this region — std::bad_alloc from a frame buffer, an unexpected throw out of
+  // a library call — would destroy their std::thread objects while joinable, and
+  // that is an immediate std::terminate: no unwinding, no error message, no exit
+  // code the caller can act on.  (The deliberate fatal paths are safe already:
+  // die_*() is std::exit.)  This guard makes the unwind path do what the normal
+  // path does — unblock everyone, then join — so an unexpected throw surfaces as
+  // a normal error instead of an abort.
+  //
+  // ORDER MATTERS and mirrors the successful path exactly: the queue is marked
+  // done so workers stop waiting for input, the throttle is released so anyone
+  // parked on backpressure can leave, the result store is marked so the writer
+  // stops waiting for frames, and only then do we join.  Releasing the throttle
+  // BEFORE the workers are done is safe here and only here: the run is being
+  // abandoned, so bounding output memory no longer matters.
+  struct ThreadGuard {
+    std::vector<std::thread> & pool; std::thread & wthr; std::thread & pthr;
+    TaskQueue & q; FrameThrottle & thr; ResultStore & res;
+    std::atomic<bool> & pdone;
+    bool armed = true;
+    ~ThreadGuard() {
+      if (!armed) return;                 // normal path already joined everything
+      q.set_done();
+      thr.set_done();
+      { std::lock_guard<std::mutex> lk(res.m); res.workers_done = true; }
+      res.cv.notify_all();
+      for (auto & t : pool) if (t.joinable()) t.join();
+      pdone.store(true, std::memory_order_relaxed);
+      if (wthr.joinable()) wthr.join();
+      if (pthr.joinable()) pthr.join();
+    }
+  } thread_guard{pool, wthr, progress_thr, queue, throttle, results, progress_done};
+
   // Producer loop: read input in chunks and enqueue for compression.
   // For regular files, mmap the input for zero-copy: workers read directly
   // from the mapped pages, eliminating the fread + memcpy bottleneck that
@@ -16173,6 +16320,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // Wait for all workers to finish, then signal the writer.
   // Do NOT call throttle.set_done() before join: workers must respect
   // throttle while draining the queue to avoid buffering entire output in RAM.
+  thread_guard.armed = false;   // from here the normal path owns the joins
   for (auto & th : pool) th.join();
   g_direct_read_pool = nullptr;  // workers done: no more release() calls; safe to drop the pool
   throttle.set_done();  // safe now: all workers exited
@@ -17062,6 +17210,11 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
     }
     gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
     results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
+    // First frame this GPU actually DELIVERED — the earliest proof the device
+    // did real work.  Set here, not at worker spawn: a worker that starts and
+    // then fails delivers nothing, and counting it made an all-CPU run file its
+    // rate under `hybrid`.  Relaxed store, idempotent, off the hot path's lock.
+    g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
     C.delivered = i + 1;  // a mid-loop throw discards the run anyway; kept for parity
     // Test hook: deterministically simulate a GPU fault after N frames
     // (real illegal-access faults are intermittent) to exercise the
@@ -18783,9 +18936,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                            &shared_tune,
                            &throttle, &gpu_failures, gpu_count);
     }
-    // The run genuinely engaged a GPU — see g_adapt_gpu_engaged for why the
-    // profile cannot infer this from opt.hybrid alone.
-    g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
+    // NOT set here.  Spawning a worker is not engagement: a worker that starts
+    // and then fails before delivering anything would still have been counted,
+    // filing an all-CPU run's rate under `hybrid`.  The flag is raised where a
+    // batch is actually handed to the writer (search g_adapt_gpu_engaged), which
+    // is the first moment a GPU has demonstrably done work.
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
       os << "[GPU] " << gpu_count << " device worker"
@@ -20067,6 +20222,8 @@ static void gpu_decomp_worker(
 
           uint64_t rl_t0 = g_perf ? now_ns() : 0;
           results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
+          // See the compress site: engagement means a DELIVERED frame.
+          g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
           if (g_perf) g_perf->result_lock_ns.fetch_add(now_ns() - rl_t0);
           // Delivered: safe to free this frame's compressed input now.  A
           // mid-loop throw (bad status / failed D2H) re-enqueues only the
@@ -20580,8 +20737,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
                                &shared_tune_decomp,
                                bp_ptr, &gpu_failures, gpu_count);
     }
-    // See g_adapt_gpu_engaged: the profile must record what ran, not what was asked.
-    g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
+    // NOT set here — spawning is not engagement.  Raised at the first DELIVERED
+    // frame in gpu_decomp_worker, for the reason g_adapt_gpu_engaged documents.
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
       os << "[GPU] " << (int)gpu_ids.size() << " device(s) online";
@@ -23174,8 +23331,18 @@ int main(int argc, char ** argv)
   // --adapt: persist this process's calibration observation.  Only a clean
   // run qualifies (exit 0); sub-3 s runs measured nothing worth keeping
   // unless there is a fault to count.
+  // A deliberate EXPLORATION is admitted even under the floor: it records only
+  // its attempt stamp (no rate — the run was too short to have measured one),
+  // which is what stops the predictor re-selecting the same probe on every run
+  // forever.  Without this a probe that finished under the floor left no trace
+  // at all, not even `runs`.
+  const bool adapt_stamp_only =
+      adapt_obs.explored != 0 && adapt_obs.wall_ns < adapt_save_min_ns()
+      && !adapt_obs.fault;
   if (opt.adapt && !opt.no_profile && exit_code == EXIT_OK
-      && (adapt_obs.wall_ns >= adapt_save_min_ns() || adapt_obs.fault)) {
+      && (adapt_obs.wall_ns >= adapt_save_min_ns() || adapt_obs.fault
+          || adapt_stamp_only)) {
+    adapt_obs.stamp_only = adapt_stamp_only;
     // TEST mode writes nothing, so its rate is systematically faster than the
     // -d it would be compared against; keep it out of the backend pair for the
     // same reason --tar runs are (it still contributes runs/regime/read-path).
@@ -23412,6 +23579,32 @@ static double adapt_input_residency(const Options & opt)
   } else if (!opt.inputs.empty() && opt.inputs[0] != "-") {
     path = opt.inputs[0];
   }
+#ifndef _WIN32
+  // --tar CREATE's source is usually a DIRECTORY, and adapt_path_residency
+  // answers -1 for anything that is not a regular file — so the reader-count
+  // bucket had no coordinates and the tar half of the profile was never
+  // written (the count re-climbed on every run, harmlessly but pointlessly).
+  // Sample a bounded number of member files instead: residency of a tree is a
+  // real question, it just cannot be answered by stat'ing the directory.
+  struct stat dst{};
+  if (!path.empty() && ::stat(path.c_str(), &dst) == 0 && S_ISDIR(dst.st_mode)) {
+    // Cap the walk hard.  This runs before any work and must stay in the
+    // microseconds: a backup source can hold millions of files, and the answer
+    // does not get better after a few dozen samples.
+    const int WANT = 24;
+    int seen = 0; double sum = 0.0;
+    std::error_code wec;
+    for (fs::recursive_directory_iterator it(path, fs::directory_options::skip_permission_denied, wec), end;
+         it != end && seen < WANT; it.increment(wec)) {
+      if (wec) break;
+      std::error_code fec;
+      if (!it->is_regular_file(fec) || fec) continue;
+      const double r = adapt_path_residency(it->path().string());
+      if (r >= 0.0) { sum += r; ++seen; }
+    }
+    return seen > 0 ? sum / seen : -1.0;
+  }
+#endif
   return adapt_path_residency(path);
 }
 
@@ -23697,11 +23890,15 @@ static void apply_backend_defaults(Options & opt)
     g_adapt_rd_ctx_chunk.store((int)opt.chunk_mib, std::memory_order_relaxed);
     g_adapt_rd_ctx_threads.store(resolve_cpu_threads(opt.cpu_threads),
                                  std::memory_order_relaxed);
+    // Set OUTSIDE the priors.loaded guard: this LABELS the bucket this run will
+    // record into, and the first run on a machine has no profile to load.
+    // Gating it on priors.loaded filed a fresh tar run's count under the
+    // non-tar bucket — the same mistake already made once with g_adapt_src_cold.
+    const bool tarc = (opt.tar_mode && opt.mode == Mode::COMPRESS);
+    g_adapt_rd_tar.store(tarc ? 1 : 0, std::memory_order_relaxed);
     if (priors.loaded) {
       const int c = g_adapt_rd_resid.load(std::memory_order_relaxed);
       const int k = g_adapt_sink_regular.load(std::memory_order_relaxed);
-      const bool tarc = (opt.tar_mode && opt.mode == Mode::COMPRESS);
-      g_adapt_rd_tar.store(tarc ? 1 : 0, std::memory_order_relaxed);
       const int i = adapt_rd_bucket_idx(c, k);
       double seed = (i < 0) ? 0.0
                   : (tarc ? prior_dir.rd_bucket_tar[i] : prior_dir.rd_bucket[i]);
@@ -23963,6 +24160,8 @@ static void apply_backend_defaults(Options & opt)
     const std::vector<std::string> & srcs =
         opt.tar_mode ? opt.tar_sources : opt.inputs;
     all_known = !srcs.empty();
+    int    est_sampled  = 0;      // inputs actually probed for their expansion ratio
+    double est_ratio_sum = 0.0;   // sum of those ratios, for the average
     for (const std::string & in : srcs) {
       struct stat st{};
       if (in == "-" || ::stat(in.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -23977,9 +24176,29 @@ static void apply_backend_defaults(Options & opt)
       // rate.  Overloading one variable for both simply moved the domain mix from
       // the gate to the predictor: an archive expanding 16x predicted 16x its real
       // duration and let through probes that finish under the save floor.
-      known_work += (opt.mode == Mode::COMPRESS)
-                      ? (uint64_t)st.st_size
-                      : adapt_decomp_uncompressed_est(in, (uint64_t)st.st_size);
+      // The decompress estimator opens and preads up to 1 MiB PER INPUT, which
+      // is O(inputs) of startup latency before any work begins — noticeable on a
+      // long input list (a shell glob over thousands of archives).  Only the
+      // FIRST few inputs are actually sampled; the rest are scaled by the ratio
+      // those established.  The consumer is a coarse size GATE ("is there enough
+      // work to be worth a GPU?"), so a ratio carried across a batch of archives
+      // the user listed together is well within its tolerance, and a wrong guess
+      // costs a suboptimal backend choice, never correctness.
+      if (opt.mode == Mode::COMPRESS) {
+        known_work += (uint64_t)st.st_size;
+      } else {
+        static const int EST_SAMPLE_MAX = 4;
+        if (est_sampled < EST_SAMPLE_MAX) {
+          const uint64_t e = adapt_decomp_uncompressed_est(in, (uint64_t)st.st_size);
+          if (st.st_size > 0) {
+            est_ratio_sum += (double)e / (double)st.st_size;
+            ++est_sampled;
+          }
+          known_work += e;
+        } else {
+          known_work += (uint64_t)((double)st.st_size * (est_ratio_sum / est_sampled));
+        }
+      }
     }
   }
   if (!opt.cpu_only) {
@@ -24425,7 +24644,19 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--mmap" || a == "--mmap=on")  { opt.use_mmap = true;  opt.mmap_user_set = true; }
     else if (a == "--no-mmap" || a == "--mmap=off") { opt.use_mmap = false; opt.mmap_user_set = true; }
     else if (a == "--cold") opt.cold_read = true;
-    else if (a == "--watchdog") opt.watchdog = true;
+    else if (a == "--watchdog") {
+      opt.watchdog = true;
+      // Accept the SEPARATED value too, not just --watchdog=SECS.  Every other
+      // valued flag here takes both forms, so `--watchdog 60` silently arming a
+      // 30 s default was a trap.  Only consume the next token when it is
+      // actually an integer: a bare `--watchdog` before a filename must keep
+      // working.
+      if (i + 1 < argc && looks_like_int(argv[i + 1])) {
+        opt.watchdog_secs = parse_int_value("--watchdog", argv[++i]);
+        if (opt.watchdog_secs < 0)
+          die_usage("--watchdog seconds must be >= 0 (0 disables the stall check)");
+      }
+    }
     else if (a.rfind("--watchdog=", 0) == 0) {
       opt.watchdog = true;
       opt.watchdog_secs = parse_int_value("--watchdog", a.substr(11));
@@ -24569,7 +24800,11 @@ static Options parse_args(int argc, char ** argv)
       // default level).  parse_int_value also catches overflow (-9999999...).
       if (!all_digits) die_usage("unknown option: " + a);
       int lvl = parse_int_value(a, a.substr(1));
-      if (lvl < 1) die_usage("invalid compression level (must be 1..22)");
+      // zstd parity: `-0` selects the DEFAULT level rather than being an error.
+      // Documented behaviour there, and a script written against zstd should not
+      // fail here for it.
+      if (lvl == 0) lvl = Options{}.level;   // the struct default, single-sourced
+      if (lvl < 1) die_usage("invalid compression level (must be 0..22; 0 = default)");
       if (lvl > 22) die_usage("invalid compression level (max 22)");
       opt.level = lvl; opt.level_user_set = true; continue;
     }
@@ -24607,6 +24842,11 @@ static Options parse_args(int argc, char ** argv)
         opt.cpu_threads = (th == 0) ? -1 : th;
       } else if (i + 1 < argc && looks_like_int(argv[i + 1])) {
         int th = parse_int_value(a, argv[++i]);
+        // A NEGATIVE count is a mistake, not a request: it used to be accepted
+        // here and then quietly clamped away downstream, so `-T -5` ran at the
+        // default thread count and said nothing.  Reject it like any other bad
+        // value.  (0 keeps its documented meaning: auto.)
+        if (th < 0) die_usage("thread count must be >= 0 (0 = auto): " + a + " " + std::string(argv[i]));
         opt.cpu_threads = (th == 0) ? -1 : th;
       }
       // else: no usable numeric value — leave cpu_threads at its default (auto)

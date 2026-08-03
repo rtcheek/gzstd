@@ -2551,10 +2551,14 @@ rc=0; "$GZSTD" --gpu-only --cpu-only -k -f "$TMPDIR/small.txt" -o /dev/null 2>/d
 rc=0; "$GZSTD" --ultra -3 -k -f --cpu-only "$TMPDIR/small.txt" -o "$TMPDIR/ultra-low.zst" 2>/dev/null || rc=$?
 [[ $rc -eq 0 ]] && pass "--ultra -3 (ultra with low level)" || pass "--ultra -3" "(exit $rc, may reject)"
 
-# Level out of range
+# -0 is zstd-COMPATIBLE, not out of range: real zstd (verified against v1.5.7)
+# accepts it and uses its default level.  This used to be a usage error here,
+# which meant a script written against zstd failed for no reason.
 rc=0; "$GZSTD" -0 -k -f --cpu-only "$TMPDIR/small.txt" -o /dev/null 2>/dev/null || rc=$?
-[[ $rc -eq 2 ]] && pass "level -0 rejected" "(EXIT_USAGE)" \
-  || { [[ $rc -ne 0 ]] && pass "level -0 rejected" "(exit $rc)" || fail "level -0" "should reject"; }
+[[ $rc -eq 0 ]] && pass "level -0 accepted (zstd parity: default level)" \
+  || fail "level -0" "should be accepted like zstd (exit $rc)"
+
+# Level out of range
 
 rc=0; "$GZSTD" -23 --ultra -k -f --cpu-only "$TMPDIR/small.txt" -o /dev/null 2>/dev/null || rc=$?
 [[ $rc -eq 2 ]] && pass "level -23 rejected" "(EXIT_USAGE)" \
