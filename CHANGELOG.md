@@ -1,9 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.48  
+**Covers:** v0.9.50 → v0.15.54  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.50–54 — the v0.15.48 unwind guard never ran, and everything behind it was broken
+
+Five defects in one mechanism, found by running the suite on a PCIe Gen3 box for the first time and then chasing a `-Wunused-function` warning into the teardown code. They are reported together because **each one strictly hides the next**: nothing downstream of an unreachable code path can be observed, so fixing each defect is what made the following one appear. The last two were found only *because* the earlier fixes landed.
+
+**1. The guard was inert (v0.15.52).** v0.15.48 added an RAII `ThreadGuard` to `compress_cpu_mt` so an exception escaping the reader region would unblock and join ~6 live threads instead of destroying them joinable and hitting `std::terminate`. But **there was no `catch` anywhere in the program.** With no handler, `[except.terminate]` leaves unwinding implementation-defined and gcc calls `std::terminate` *at the throw point* — no stack unwinding, so no destructor between the throw and `main` ever runs, `ThreadGuard` included. Verified with a five-line program: the destructor does not run. So the guard could never have done what its comment claimed, and the changelog entry that said an unexpected throw would surface *as a normal error instead of an abort* was wrong — it aborted either way. `main` is now a thin exception boundary over `gzstd_main`, mapping an unexpected throw to `EXIT_ERROR` with a message. `die_*()` is still `std::exit`, so the deliberate fatal paths are untouched.
+
+**2. Once unwinding happens, it was a use-after-free (v0.15.50).** `MmapRegion` and `DirectReadPool` were declared *below* the guard, and destruction runs in reverse declaration order — so unwinding freed `dr_pool` and `munmap`ed the region **while the workers were still live and still holding zero-copy views into exactly that memory**. `~DirectReadPool` is a bare `free()`: it neither sets `done_` nor waits for outstanding slots, and `g_direct_read_pool` still pointed at the freed object. Both violated invariants were already written down and held everywhere else — the declaration comment claimed the pool *outlives the workers*, and the normal path is explicit (join, clear `g_direct_read_pool`, then leave scope). The fix makes lifetime enforce what the comments promised: the two objects are declared above the guard, and the global is cleared inside it once no worker can call `release()` again.
+
+Demonstrated rather than argued, under ASAN with the injection hook below:
+
+| build | result |
+|---|---|
+| old order, no handler | no unwind at all; `std::terminate` at the throw point |
+| old order + handler | **`AddressSanitizer: SEGV`, READ access, in `ZSTD_XXH64_update` ← `ZSTD_compress_frameChunk`, on a worker thread** |
+| new order + handler | clean, `EXIT_ERROR`, no sanitizer error |
+
+**3. The unwind path is now reachable and testable (v0.15.51).** `GZSTD_DEBUG_THROW_READER` throws out of the producer after its frames are queued but *before* `set_done()`, so the workers are provably mid-compress when the stack unwinds — the only way the suite can reach this path, since a real escaping exception there is a `bad_alloc` or an unexpected library throw and is not reproducible on demand. That absence is precisely why a guard written for this case shipped without ever running. One suite test now asserts the run exits diagnosably and neither segfaults (139) nor aborts (134).
+
+**4. The writer blamed itself for the producer's failure (v0.15.53).** With unwinding finally happening, `ThreadGuard` marked `workers_done` but never set `producer_done`/`total_tasks` — so the writer woke into what looked like a completed run with a hole in it, fired its stuck watchdog, and `die()`d with `internal error: writer stuck  workers_done but frame 0 of 0 missing`. Exit was non-zero and memory-safe, but it named the wrong component and pre-empted the real error. The GPU-fault path already had the right shape for this (`g_gpu_aborted` tells the writer that missing frames are *expected* and the output is discarded), so the concept is now generic: `g_run_abandoned` carries the same meaning for an unwind, and `run_abandoned()` is what the writer actually tests. It is set *first* in the guard, before anything that could wake the writer, so there is no window where `workers_done` is visible without it.
+
+**5. …and that fix exposed a deadlock the old `die()` had been hiding (v0.15.54).** Because the writer had always `std::exit`ed at defect 4, the guard's joins had *never once executed*. Letting the writer leave cleanly reached them for the first time — and hung. Backtraces showed the main thread inside `compress_cpu_mt [clone .cold]` blocked in `std::thread::join`, with every CPU worker parked in `acquire_out_buf` on the output-pool drain wait. The pool is bounded and refilled by the writer; the writer had exited, so no slot could ever come back, and the guard deadlocked waiting for workers that were waiting for it. The escapes for this already existed and were checked against `g_gpu_aborted` alone — the comment even says *the writer has stopped draining, so no slot will ever free*. They test `run_abandoned()` now, so a worker parked for a slot leaves on either cause. Verified: injection now exits 1 with `gzstd: fatal: …` from the top-level handler, ASAN-clean, and a normal round-trip is byte-identical.
+
+**First full suite run on the Gen3 workstation.** v0.15.x had never executed there at all — this is `RELEASING.md` item 4, and it is what surfaced the whole chain above. Final tallies at v0.15.54: **365/365 default, 498/498 extensive, 284 passed + 70 skipped CPU-only** (the CPU-only drift note is the documented one — GPU-gated sections compile out entirely). Both build configurations compile; the CPU-only config had never been built on this box before and emits four `-Wunused-function` warnings whose call sites are all legitimately inside `HAVE_NVCOMP`.
+
+**A `//` comment ended in a line-continuation backslash** (v0.15.49), splicing the following line into it and warning `-Wcomment` on every build. Nothing was actually lost, because the swallowed line was itself a comment; the reason to fix it is that any code later inserted at that point would have disappeared silently.
+
+**The GPU decode-pool test asserted nothing on Gen4 and failed outright on Gen3.** `parallel-extract: GZSTD_POOL_GPU adds GPU decoders to the pool` invoked `-d --tar` with no backend flag, so asymmetric mode defaulted decompress to `--cpu-only` on PCIe Gen<4 — which clears `gpu_capable` and makes `GZSTD_POOL_GPU` inert. It had been passing on Gen4+ because the fabric happened not to trigger that default, not because it verified engagement. It now passes `--hybrid` explicitly and asserts the same property on both fabrics. Output was byte-identical throughout; only the assertion was wrong.
 
 ---
 

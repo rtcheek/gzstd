@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.40
+**Current version:** v0.15.54
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -1000,6 +1000,7 @@ verbatim) without breaking existing gzstd scripts using `--format=gnu`.
 | `--keep-going` — recover a damaged archive on decompress | — | Medium | DONE (v0.14.41–42) |
 | Delete compress CPU-rescue → clean GPU-fault abort | — | Medium | DONE (v0.14.43) |
 | Checkpoint/resume on fault (resume from last good frame vs. rebuild from zero) | — | Low | Not started |
+| Compress `ThreadGuard` teardown does not signal ABANDONMENT to the writer | — | Low | DONE (v0.15.53–54) — `g_run_abandoned` + `run_abandoned()` generalise what `g_gpu_aborted` already meant to the writer: missing frames are EXPECTED and the output is discarded. Set first in the guard so `workers_done` is never visible without it. Fixing the misreport then exposed a deadlock the old `die()` had masked — the guard's joins had never executed, and workers parked in `acquire_out_buf` waiting for output-pool slots the departed writer could no longer return; those escapes now test `run_abandoned()` too |
 | `--tar` input ergonomics (`--exclude-from`/`-X`, `--files-from`, `-P`, `--exclude-vcs`) | tar | Low | DONE (v0.14.90) |
 | `--selinux` context storage (third leg of xattrs/ACLs) | tar | Low | DONE (v0.14.91) — spot-check a labeled-host round-trip if one appears |
 | Restore xattrs/contexts on symlinks & special files (extract side) | tar | Low | DONE (v0.15.48), UNVERIFIED HERE — `apply_ext_path` uses O_PATH\|O_NOFOLLOW + lsetxattr through /proc/self/fd, so the LINK is labelled, not its target. Cannot be demonstrated on this box: Linux forbids `user.*` xattrs on symlinks/FIFOs entirely, so only `security.*` (SELinux) and `trusted.*` exercise it, both privileged. Wants an SELinux host or a root-capable CI job |

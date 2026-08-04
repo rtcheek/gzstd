@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.48";
+static constexpr const char * GZSTD_VERSION = "0.15.54";
 //
 // Architecture overview:
 //
@@ -5773,6 +5773,26 @@ static std::atomic<bool> g_gpu_failed_restart{false};
 // there is finished on CPU and the output is KEPT) nor by --verify.
 static std::atomic<bool> g_gpu_aborted{false};
 
+// Set when a compress pass is abandoned by an exception unwinding out of the
+// reader region (the ThreadGuard in compress_cpu_mt).  To the writer this means
+// the same thing g_gpu_aborted does — frames WILL be missing and the partial
+// output is discarded — so its in-order wait must bail rather than fire the
+// "writer stuck" watchdog and report an internal error against the writer for
+// what is actually the producer's failure.  Kept distinct from g_gpu_aborted
+// because no GPU is involved and no CPU rebuild follows: the run is over and the
+// exception is already on its way to the top-level handler.  Never cleared, for
+// that reason — an abandoned pass is terminal.
+static std::atomic<bool> g_run_abandoned{false};
+
+// True when the current pass is being torn down and missing frames are EXPECTED.
+// Both causes are terminal for the in-order writer loop; only the follow-up
+// differs (GPU fault rebuilds CPU-only, an unwind exits).
+static inline bool run_abandoned()
+{
+  return g_gpu_aborted.load(std::memory_order_relaxed)
+      || g_run_abandoned.load(std::memory_order_relaxed);
+}
+
 // GPU-side --verify (gpu-only) stats, for the -v [GPU-VERIFY] summary.  Summed
 // across all device workers/streams; the time is aggregate GPU time on the
 // verify decompress+compare (overlaps compress across the 8 GPUs, so it's a work
@@ -5796,6 +5816,16 @@ static std::atomic<int64_t> g_verify_failed_seq{-1};
 // frames, to exercise the CPU-only restart path deterministically (real GPU
 // faults are intermittent).  -1 (default, env unset) = disabled.
 static int64_t g_debug_fail_gpu_after = -1;
+
+// Test-only fault injection (read once from $GZSTD_DEBUG_THROW_READER): throw out
+// of the compress producer region while the CPU workers are still live and still
+// holding zero-copy views into mmap_region / DirectReadPool, to exercise the
+// ThreadGuard unwind path deterministically.  Nothing else in the suite can reach
+// that path: a real escaping exception there is a bad_alloc or an unexpected throw
+// out of a library call, neither of which is reproducible on demand — which is why
+// the buffers-destroyed-before-the-joins ordering bug (v0.15.50) survived the
+// guard that was written to handle exactly this case.  false (unset) = disabled.
+static bool g_debug_throw_reader = false;
 
 // Test-only corruption injection (read once from $GZSTD_DEBUG_CORRUPT_FRAME):
 // flip a byte in the compressed payload of the frame with this sequence number
@@ -7705,7 +7735,7 @@ static void writer_thread(FILE * out, ResultStore & results,
     // if the next sequential frame is available.  Producers call notify_all
     // on every frame delivery, so the writer wakes promptly.
     while (results.data.count(results.next_to_write) == 0 && !all_done
-           && !g_gpu_aborted.load(std::memory_order_relaxed)) {
+           && !run_abandoned()) {
       results.drain_slots_locked();
       if (results.data.count(results.next_to_write) != 0) break;
       waited = true;
@@ -7732,13 +7762,14 @@ static void writer_thread(FILE * out, ResultStore & results,
         all_done = results.producer_done
                 && results.workers_done
                 && results.next_to_write >= results.total_tasks;
-        if (!all_done && !g_gpu_aborted.load(std::memory_order_relaxed)
+        if (!all_done && !run_abandoned()
             && results.data.count(results.next_to_write) == 0) {
           // Workers are all done but we're still missing frames  this is a bug.
           // Log diagnostics and abort to avoid producing corrupt output.
-          // (A GPU fault sets g_gpu_aborted, in which case missing frames are
-          // EXPECTED — the doomed output is discarded and rebuilt — so we exit
-          // cleanly below instead of treating it as an internal error.)
+          // (A GPU fault sets g_gpu_aborted and an exception unwinding out of the
+          // reader region sets g_run_abandoned; in either case missing frames are
+          // EXPECTED — the doomed output is discarded — so we exit cleanly below
+          // instead of treating it as an internal error.)
           std::ostringstream os;
           os << "internal error: writer stuck  workers_done but frame "
              << results.next_to_write << " of " << results.total_tasks
@@ -7770,7 +7801,7 @@ static void writer_thread(FILE * out, ResultStore & results,
       g_perf->writer_wait_count.fetch_add(1);
       g_perf->out_of_order_waits.fetch_add(1);
     }
-    if (all_done || g_gpu_aborted.load(std::memory_order_relaxed)) break;  // GPU-fault abort: stop, output is discarded
+    if (all_done || run_abandoned()) break;  // fault or unwind: stop, output is discarded
 
     // Batch drain: collect ALL consecutive ready frames
     std::vector<FrameBuf> batch;
@@ -8924,9 +8955,13 @@ static void cpu_worker(
 
   auto acquire_out_buf = [&]() -> FrameBuf {
     while (true) {
-      // GPU-fault abort: the writer has stopped draining, so no slot will ever
-      // free — return any buffer; the caller exits at the next loop top.
-      if (g_gpu_aborted.load(std::memory_order_relaxed)) return out_pool[0];
+      // Abandoned pass (GPU fault, or an exception unwinding out of the reader
+      // region): the writer has stopped draining, so no slot will ever free —
+      // return any buffer; the caller exits at the next loop top.  Both causes
+      // must be honoured here, not just the GPU one: on the unwind path the
+      // ThreadGuard joins these workers, so a worker parked for a slot that the
+      // departed writer can no longer return deadlocks the teardown itself.
+      if (run_abandoned()) return out_pool[0];
       for (auto & b : out_pool) {
         if (b.use_count() == 1) return b;
       }
@@ -8938,7 +8973,7 @@ static void cpu_worker(
       // safety net for any missed notify.
       if (bp) {
         bp->wait_for_drain([&]{
-          if (g_gpu_aborted.load(std::memory_order_relaxed)) return true;
+          if (run_abandoned()) return true;
           for (auto & b : out_pool) if (b.use_count() == 1) return true;
           return false;
         });
@@ -8948,7 +8983,7 @@ static void cpu_worker(
     }
   };
   while (true) {
-    if (g_gpu_aborted.load(std::memory_order_relaxed)) break;  // GPU fault: abort without draining the queue
+    if (run_abandoned()) break;  // fault or unwind: abort without draining the queue
     Task t;
     bool got_task = false;
 #ifdef HAVE_NVCOMP
@@ -15988,6 +16023,19 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     &cpuagg, &throttle);
   if (opt.verbosity >= V_VERBOSE) std::cerr << "[CPU] " << threads << " worker threads online\n";
 
+#ifndef _WIN32
+  // DECLARED BEFORE ThreadGuard DELIBERATELY -- do not move these down into the
+  // producer region below.  Workers hold zero-copy views into both objects, so
+  // both must outlive the joins.  Destruction runs in reverse declaration order,
+  // so anything declared AFTER the guard is torn down while the workers are
+  // still running on the unwind path: free(base_) under a reader still inside
+  // release(), then munmap of pages a worker is still compressing from.  The
+  // normal path asserts the same invariant explicitly further down (join, then
+  // clear g_direct_read_pool, and only then leave the scope).
+  MmapRegion     mmap_region;
+  DirectReadPool dr_pool;   // zero-copy --direct-read buffers; outlives the workers
+#endif
+
   // From here until the joins below, ~6 threads are live.  An exception escaping
   // this region — std::bad_alloc from a frame buffer, an unexpected throw out of
   // a library call — would destroy their std::thread objects while joinable, and
@@ -16003,6 +16051,11 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // stops waiting for frames, and only then do we join.  Releasing the throttle
   // BEFORE the workers are done is safe here and only here: the run is being
   // abandoned, so bounding output memory no longer matters.
+  //
+  // Joining is necessary but NOT sufficient: the buffers the workers read from
+  // must still be alive while they run.  That is a lifetime property, not a
+  // statement order one, and it is enforced by declaring mmap_region/dr_pool
+  // above this guard rather than below it.
   struct ThreadGuard {
     std::vector<std::thread> & pool; std::thread & wthr; std::thread & pthr;
     TaskQueue & q; FrameThrottle & thr; ResultStore & res;
@@ -16010,11 +16063,24 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     bool armed = true;
     ~ThreadGuard() {
       if (!armed) return;                 // normal path already joined everything
+      // FIRST, before anything that could wake the writer: mark the pass
+      // abandoned.  The writer's stuck watchdog fires on (workers_done && frame
+      // missing), so publishing workers_done without this flag lets it wake into
+      // a state that looks like a completed run with a hole in it and die() with
+      // an internal error against itself.  The producer threw; frames are missing
+      // by construction and the output is discarded.
+      g_run_abandoned.store(true, std::memory_order_relaxed);
       q.set_done();
       thr.set_done();
       { std::lock_guard<std::mutex> lk(res.m); res.workers_done = true; }
       res.cv.notify_all();
       for (auto & t : pool) if (t.joinable()) t.join();
+#ifndef _WIN32
+      // Mirrors the normal path: once no worker can call release() again, drop
+      // the global before the pool object is destroyed, so a late
+      // gz_direct_read_release/abort cannot reach a dead object.
+      g_direct_read_pool = nullptr;
+#endif
       pdone.store(true, std::memory_order_relaxed);
       if (wthr.joinable()) wthr.join();
       if (pthr.joinable()) pthr.join();
@@ -16028,8 +16094,6 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   try_boost_io_priority(true);
   std::atomic<size_t> seq{0};
 #ifndef _WIN32
-  MmapRegion mmap_region;
-  DirectReadPool dr_pool;   // zero-copy --direct-read buffers; outlives the workers
   bool reader_done = false;
   // --tar: the parallel archive assembler IS the producer (synthesizes the tar
   // stream + reads member files concurrently, pushing chunks in sequence order).
@@ -16297,6 +16361,14 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       queue.push(std::move(t));
     }
   }
+
+  // Test-only unwind injection (see g_debug_throw_reader).  Deliberately placed
+  // BEFORE set_done(): the workers are still compressing here, still holding
+  // zero-copy views into dr_pool/mmap_region, and still parked on the queue --
+  // exactly the state a real escaping exception would unwind from.  With mmap the
+  // reader completes at t~0, so every worker is guaranteed mid-flight.
+  if (g_debug_throw_reader)
+    throw std::runtime_error("simulated reader fault (GZSTD_DEBUG_THROW_READER)");
 
   // Signal workers that no more input is coming
   queue.set_done();
@@ -18552,7 +18624,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // a depth the queue's byte cap cannot reach, the producer therefore never
       // reaches set_done() to release them, and the producer blocks pushing.
       // Reachable with an EXPLICIT hybrid request and no usable GPU, e.g.
-      //   CUDA_VISIBLE_DEVICES="" gzstd -T1 --cpu-share=0.5 --cpu-batch=64 \
+      //   CUDA_VISIBLE_DEVICES="" gzstd -T1 --cpu-share=0.5 --cpu-batch=64
       //     --throttle-factor=1 --tar BIGFILE
       // The parse-time guards only cover runs that were already --cpu-only, so
       // they miss this fallback.
@@ -22312,13 +22384,17 @@ static int run_calibrate(Options opt)
 }
 #endif  // !_WIN32
 
-int main(int argc, char ** argv)
+static int gzstd_main(int argc, char ** argv)
 {
   setup_signal_handlers();
 
   // Test-only: deterministic GPU fault injection (see g_debug_fail_gpu_after).
   if (const char * fa = std::getenv("GZSTD_DEBUG_FAIL_GPU_AFTER"))
     g_debug_fail_gpu_after = std::atoll(fa);
+
+  // Test-only: deterministic producer-unwind injection (see g_debug_throw_reader).
+  if (const char * tr = std::getenv("GZSTD_DEBUG_THROW_READER"))
+    g_debug_throw_reader = (std::atoll(tr) != 0);
 
   // Test-only: deterministic frame-corruption injection (see g_debug_corrupt_frame).
   if (const char * cf = std::getenv("GZSTD_DEBUG_CORRUPT_FRAME"))
@@ -23356,6 +23432,32 @@ int main(int argc, char ** argv)
 #endif
 
   return exit_code;
+}
+
+// Top-level exception boundary.  This is load-bearing for more than tidiness:
+// with NO handler anywhere in the program, a throw does not unwind the stack at
+// all.  [except.terminate] leaves that implementation-defined and gcc calls
+// std::terminate directly at the throw point, so every destructor between the
+// throw and main is skipped -- including the compress reader region's
+// ThreadGuard, which therefore never ran in practice despite being written
+// exactly for that case (v0.15.48).  Catching here is what makes the unwind
+// happen, which is what makes the guard live, which is why the guard's own
+// buffer-lifetime ordering had to be fixed alongside it (v0.15.50).
+//
+// die_*() is still std::exit, so the deliberate fatal paths are unchanged; this
+// only turns an UNEXPECTED throw into a diagnosable EXIT_ERROR instead of an
+// abort with no exit code the caller can act on.
+int main(int argc, char ** argv)
+{
+  try {
+    return gzstd_main(argc, argv);
+  } catch (const std::exception & e) {
+    std::cerr << "gzstd: fatal: " << e.what() << "\n";
+    return EXIT_ERROR;
+  } catch (...) {
+    std::cerr << "gzstd: fatal: unknown exception\n";
+    return EXIT_ERROR;
+  }
 }
 
 // Derive the output filename for a given input file and mode.

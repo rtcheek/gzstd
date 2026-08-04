@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=364
-$EXTENSIVE && EXPECTED_TESTS=497
+EXPECTED_TESTS=365
+$EXTENSIVE && EXPECTED_TESTS=498
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1119,6 +1119,38 @@ else
   fail "--verify over a pipe dies loudly" "rc=$vp_rc (expected non-zero + message)"
 fi
 rm -f "$perr"
+
+# ============================================================
+# 18b2. Producer unwind path (exception safety)
+# ============================================================
+section "Producer unwind (exception escaping the compress reader)"
+
+# An exception escaping the compress reader region must unwind CLEANLY: the
+# ThreadGuard has to join the workers while the buffers they hold zero-copy views
+# into are still alive, and something has to catch it so the failure is
+# diagnosable.  Two independent defects each made that untrue, and this guards
+# both:
+#   * v0.15.50 - mmap_region/dr_pool were declared BELOW the guard, so unwinding
+#     munmap'd/freed them BEFORE the joins and a worker faulted inside zstd
+#     (demonstrated under ASAN: SEGV in ZSTD_XXH64_update on a worker thread).
+#   * v0.15.52 - with no handler anywhere in the program, gcc calls std::terminate
+#     AT the throw point without unwinding at all, so the guard never ran and the
+#     process simply aborted.
+# The injection fires after the reader has queued its frames but BEFORE
+# set_done(), so the workers are provably mid-compress when the stack unwinds.
+tu_rc=0
+GZSTD_DEBUG_THROW_READER=1 "$GZSTD" --cpu-only -T 2 -k -f "$TMPDIR/large.bin" \
+  -o "$TMPDIR/unwind.zst" 2>/dev/null || tu_rc=$?
+if [[ $tu_rc -eq 139 ]]; then
+  fail "producer unwind: no memory fault" "rc=139 (SIGSEGV: buffers destroyed before the joins)"
+elif [[ $tu_rc -eq 134 ]]; then
+  fail "producer unwind: no abort" "rc=134 (SIGABRT: stack never unwound, no top-level handler)"
+elif [[ $tu_rc -eq 0 ]]; then
+  fail "producer unwind: injection fired" "rc=0 (GZSTD_DEBUG_THROW_READER had no effect)"
+else
+  pass "producer unwind: clean exit, workers joined, no memory fault (rc=$tu_rc)"
+fi
+rm -f "$TMPDIR/unwind.zst"
 
 # ============================================================
 # 18c. --keep-going (decompress recovery + damage report)
@@ -5489,9 +5521,13 @@ PYEOF
   #      at least one GPU stream, and stay byte-identical to tar.  (GPU-gated;
   #      whether the GPU actually wins any frames off the CPU pool is timing-
   #      dependent on this box, so we assert correctness, not the frame split.)
+  #      --hybrid is REQUIRED, not incidental: with no explicit backend flag,
+  #      asymmetric mode defaults decompress to --cpu-only on PCIe Gen<4, which
+  #      clears gpu_capable and makes GZSTD_POOL_GPU inert -- so this test
+  #      silently asserted nothing on Gen4+ and failed outright on Gen3.
   if has_gpu 2>/dev/null; then
     rm -rf "$SX/gpout"; mkdir -p "$SX/gpout"
-    gpout=$(GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 "$GZSTD" -d -v --tar "$SX/legit.tar.zst" -C "$SX/gpout" 2>&1)
+    gpout=$(GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 "$GZSTD" -d -v --hybrid --tar "$SX/legit.tar.zst" -C "$SX/gpout" 2>&1)
     gppar=$(printf '%s' "$gpout" | grep -c 'parallel-extract' || true)
     gpgpu=$(printf '%s' "$gpout" | grep -c 'GPU decode on' || true)
     if [[ "$gppar" == "1" && "$gpgpu" -ge 1 ]] && diff -r "$SX/gpout" "$SX/lref" >/dev/null 2>&1; then
