@@ -1,9 +1,29 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.61  
+**Covers:** v0.9.50 → v0.15.62  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.62 — telemetry that said things it could not know
+
+Three small honesty fixes, plus two validation results that overturn assumptions this project has been carrying.
+
+**A virgin profile announced a driver change that never happened.** The invalidation guard is `!have_drv || prev_drv != fp.driver` — correct, because a *missing* key must also clear GPU priors. But on a machine's first-ever run it printed `GPU driver changed ( -> 570.207); clearing GPU-derived priors`, which reads as damage on exactly the run where nothing can be damaged, and the clear it announced was vacuous. Only the wording is now conditional; the clear still happens either way. Verified in both directions: silent on a virgin profile, and a forced `999.999 -> 570.207` is still reported.
+
+**`actions: none` after printing `probing +1 parallel writer` twice.** Not the contradiction it looked like. The governor sets a probe *request*; the summary reports whether a writer thread actually *engaged*. Nothing engaged, so "none" was literally true — the telemetry simply had no way to say "asked, never happened", which is the more interesting fact. Asked / engaged / kept are now three distinguishable states.
+
+**Extraction does not fsync, and the help now says so.** `--adapt`'s writer pool is documented as sized from the writers' measured busy/starved split, without saying what "busy" measures. Measured: a 10.36 GiB extract to a 0.81 GiB/s drive **returned in 1.63 s** while the kernel spent a further **13.19 s** flushing after the process exited (zero `fdatasync` call sites; O_DIRECT exists for the leaf open but is not the default). So on any box whose RAM absorbs the output, that busy share is the copy into page cache and the sink-bound grow has no device pressure to find. This documents the measurement limit — GNU tar does not fsync either and the behaviour is unchanged — but it also means the v0.15.27 +26% figure carries a precondition: write volume must outrun the cache.
+
+**Validation: two carried assumptions were wrong.**
+
+*The residency-keyed backend prior is NOT fast-fabric-only.* The concern was that a Gen<4 box takes cpu-only before residency is consulted, making v0.15.36 unreachable there. It is reachable: the prior is consulted first and `return`s on a hit, and the static Gen<4 rule is the cold-start fallback — the code even computes `static_picks_cpu` to know what the fallback would have chosen. Confirmed on Gen3 hardware: run 2 of a fresh profile logged `profile prior (exploring hybrid; cpu-only measured 7.00 GiB/s end-to-end)`, overriding the Gen3 default, then settled back on cpu-only after measuring hybrid slower. All four buckets populate — `overall_gibs_cpu_warm 2.58` / `_cold 1.03`, `overall_gibs_hybrid_warm 2.00` / `_cold 1.03` — and the unkeyed blend (1.80 / 1.51) describes neither, which is the whole argument for bucketing. **Trap for future benchmarking: residency is deliberately not probed for non-regular output, so measuring to `/dev/null` silently disables residency keying entirely.**
+
+Suites at v0.15.62: **366/366 default, 499/499 extensive, 285 passed + 70 skipped CPU-only** (the extensive run matters here: this version edits `--help` text).
+
+*The replaced GPU is sound.* First multi-GPU exercise since the card was replaced: `--gpu-only` compress and decompress each brought up 2 device workers, an 8.05 GiB round-trip was byte-identical, hybrid round-trip byte-identical, and zero faults or CPU rescues — no sign of the fault arc the previous card produced.
 
 ---
 

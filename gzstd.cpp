@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.61";
+static constexpr const char * GZSTD_VERSION = "0.15.62";
 //
 // Architecture overview:
 //
@@ -1384,6 +1384,16 @@ static void print_help_long()
 "     The settled size persists per archive SHAPE (bucketed by mean\n"
 "     bytes per entry), because a many-small-files extract and a\n"
 "     few-huge-files one want very different pools on the same box.\n"
+"     CAVEAT, worth knowing before trusting these figures: extraction\n"
+"     writes through the page cache and does not fsync, so gzstd can\n"
+"     finish long before the data is durable, and the writers' busy\n"
+"     share then measures the copy into cache rather than the device.\n"
+"     Measured: a 10 GiB extract to a slow disk returned in 1.6 s with\n"
+"     the kernel flushing for a further 13 s after exit.  Where RAM\n"
+"     absorbs the whole output the sink-bound grow therefore has no\n"
+"     device pressure to find; it engages when the write outruns the\n"
+"     cache.  (GNU tar does not fsync either — this documents the\n"
+"     measurement limit, it is not a behaviour change.)\n"
 "     The decode side is sized by measured throughput — a barely-compressed\n"
 "     archive (decode ~free) runs fused inline, while a compression-heavy\n"
 "     one splits reading from decoding across a pool whose reader and\n"
@@ -2375,6 +2385,13 @@ static std::atomic<int> g_adapt_writer_probe{0};          // 1 = second drain en
 static std::atomic<int> g_adapt_writer_probe_verdict{0};  // +1 kept / -1 reverted
 static std::atomic<int> g_adapt_writer_probe_allowed{1};  // 0 = profile said negative
 static std::atomic<bool> g_adapt_writer_probe_engaged{false};  // wt2 spawned this op
+// Sticky: the governor ASKED for a writer probe at least once this run.  Distinct
+// from _engaged (a thread actually spawned) and from the KEPT action flag.  Without
+// it the summary can only say "actions: none" after printing "probing +1 parallel
+// writer" twice — literally true, since nothing was kept or even engaged, but it
+// reads as a contradiction and hides the more interesting fact that the request
+// never took effect.
+static std::atomic<bool> g_adapt_writer_probe_asked{false};
 
 // Extract writer-pool grow actuator (ROADMAP 2.5 #1 actuator; the -d --tar twin
 // of the DirectWriter writer probe above).  On SINK_BOUND extract the governor
@@ -2685,6 +2702,7 @@ public:
     g_adapt_writer_probe.store(0, std::memory_order_relaxed);
     g_adapt_writer_probe_verdict.store(0, std::memory_order_relaxed);
     g_adapt_writer_probe_engaged.store(false, std::memory_order_relaxed);
+    g_adapt_writer_probe_asked.store(false, std::memory_order_relaxed);
     g_adapt_ewgrow_target.store(0, std::memory_order_relaxed);
     g_adapt_ewgrow_settled.store(0, std::memory_order_relaxed);
     g_adapt_tar_wclass.store(-1, std::memory_order_relaxed);
@@ -2716,6 +2734,7 @@ public:
             adapt_set_ewgrow(4);
         } else if (g_adapt_writer_probe_allowed.load(std::memory_order_relaxed)) {
           g_adapt_writer_probe.store(1, std::memory_order_relaxed);
+        g_adapt_writer_probe_asked.store(true, std::memory_order_relaxed);
         }
       }
     }
@@ -2820,6 +2839,9 @@ public:
     if (acts & ADAPT_ACT_WRITER_PROBE)    os << " writer-probe(kept)";
     if (g_adapt_writer_probe_engaged.load(std::memory_order_relaxed)
         && !(acts & ADAPT_ACT_WRITER_PROBE)) os << " writer-drain2(probed)";
+    else if (g_adapt_writer_probe_asked.load(std::memory_order_relaxed)
+             && !(acts & ADAPT_ACT_WRITER_PROBE))
+      os << " writer-probe(requested, never engaged)";
     if (acts & ADAPT_ACT_EWRITER_GROW)    os << " extract-writers(kept)";
     if (g_adapt_ewgrow_engaged.load(std::memory_order_relaxed)
         && !(acts & ADAPT_ACT_EWRITER_GROW)) os << " extract-writers(probed)";
@@ -4304,8 +4326,15 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
         for (const std::string & k : gpu_keys)
           if (d2.get(k)) d2.put_num(k, 0);
       }
-      vlog(V_VERBOSE, opt, "[ADAPT] GPU driver changed (" + prev_drv + " -> "
-           + fp.driver + "); clearing GPU-derived priors\n");
+      // Only announce a CHANGE when there was something to change from.  On a
+      // virgin profile have_drv is false, so this branch runs to establish the
+      // key — but the clear it performs is vacuous (no GPU priors exist yet) and
+      // saying "driver changed ( -> X); clearing GPU-derived priors" on a
+      // machine's very first run reads as damage. The clear still happens either
+      // way; only the wording is conditional.
+      if (have_drv)
+        vlog(V_VERBOSE, opt, "[ADAPT] GPU driver changed (" + prev_drv + " -> "
+             + fp.driver + "); clearing GPU-derived priors\n");
     }
   }
   // Persist unconditionally, empty included: storing nothing when the probe found
