@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.62";
+static constexpr const char * GZSTD_VERSION = "0.15.63";
 //
 // Architecture overview:
 //
@@ -11003,8 +11003,9 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 // strided O_DIRECT on a spinning disk is pathological, and no measurement is
 // worth taking to discover that.  Costs ~60 us: one stat plus one small sysfs
 // read.  Note this says nothing about whether O_DIRECT is a WIN — both machines
-// on record are non-rotational and one of them regresses 20-40% — so it can
-// only rule the fast path out, never in.
+// on record are non-rotational, and the one that was believed to regress on
+// O_DIRECT reads prefers them by 1.42x once its source link was repaired (see
+// the read probe) — so it can only rule the fast path out, never in.
 // Defined far below with the other --adapt probes, but the compress read path
 // needs it here and is NOT --adapt-gated: the cold-input read probe is a plain
 // default.  Returns the page-cache-resident fraction, or -1 if unknowable.
@@ -11086,6 +11087,12 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
 #endif
   const size_t ALIGN = 4096;
   const size_t cap = ((host_chunk + ALIGN - 1) / ALIGN) * ALIGN;
+  // The input's own size.  Needed only by the O_DIRECT path, which cannot tell a
+  // short read at EOF from a short read mid-file without it (see read_loop).
+  // 0 = unknown (non-regular fd — a block device's size is always aligned
+  // anyway), and the loop keeps its loud failure in that case.
+  off_t fsize = 0;
+  { struct stat st{}; if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) fsize = st.st_size; }
   if (o_direct || !pool) n_readers = 1;     // O_DIRECT contends; scratch path has one buffer
   if (n_readers < 1) n_readers = 1;
   if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
@@ -11183,8 +11190,18 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
           filled += (size_t)r;
           if (filled >= cap) break;                // chunk complete
           // Cannot resume aligned: fail loudly rather than return a short chunk
-          // that the caller would read as end-of-file and truncate on.
-          if (o_direct && (filled % ALIGN) != 0) { got = -1; break; }
+          // that the caller would read as end-of-file and truncate on.  UNLESS
+          // the short read ended exactly at EOF — the last block of a file whose
+          // size is not a multiple of ALIGN is partial (4095 of every 4096 real
+          // inputs), and the kernel hands that partial block back.  That is a
+          // complete final chunk with nothing left to fetch, not a resumable
+          // short read, and failing it made O_DIRECT reject almost every real
+          // file the moment the probe adopted it.
+          if (o_direct && (filled % ALIGN) != 0) {
+            const off_t end = (off_t)idx * (off_t)cap + (off_t)filled;
+            if (fsize > 0 && end >= fsize) break;    // last chunk, complete
+            got = -1; break;
+          }
         }
         if (got == 0) got = (ssize_t)filled;
       }
@@ -16424,10 +16441,20 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // reads at device speed either way) while mmap collapses cold, so the winner
   // inverts with residency and the choice has to be made per run.
   //
-  // Why measure instead of ruling: --direct-read REGRESSES compress 20-40% on a
-  // low-core box, and neither PCIe generation nor "is it NVMe" separates that
-  // machine from this one — both are Gen4+ NVMe.  The only signal that
-  // distinguishes them is the rate itself.
+  // Why measure instead of ruling: O_DIRECT was recorded REGRESSING compress
+  // 20-40% on a low-core box, and neither PCIe generation nor "is it NVMe"
+  // separates that machine from this one.  The only signal that distinguishes
+  // them is the rate itself — and measuring is what caught the rule being wrong.
+  // RE-MEASURED 2026-08-04 on that same low-core box, after its source NVMe was
+  // found linked at PCIe Gen1 (866 MB/s) and refitted to Gen3 x4 (2.9 GB/s):
+  // cold 32 GiB, median of 3, O_DIRECT 11.27 s vs buffered 16.06 s vs mmap
+  // 18.67 s.  O_DIRECT now WINS there by 1.42x.  What produced the old ranking
+  // was the crippled link plus, on the hybrid producer, a copy the flag took and
+  // the probe did not (v0.15.63) — not the core count, which predicts nothing
+  // here.  That is an argument for the probe, not against it.
+  // NOTE the 20-40% figure is on record for --direct (O_DIRECT OUTPUT), an
+  // independent flag whose asymmetry stands; these runs wrote to /dev/null and
+  // say nothing about it.
   auto run_probed_reader = [&]() -> bool {
     // Buffered reader count, needed up front: the pool is sized on the FIRST
     // pass and the buffered pass must not be measured against a pool built for
@@ -19293,32 +19320,24 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     tarx::assemble(queue, tar_layout, gpu_chunk, opt, m);
     reader_done = true;
   }
-  // --direct-read: O_DIRECT input (bypass page cache); splits each host chunk into
-  // gpu_chunk subchunks like the other readers.  Precedence over mmap; falls
-  // through to fread if O_DIRECT can't open.
-  if (opt.direct_read && opt.input != "-" && fs::is_regular_file(opt.input)) {
-    if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
-    const size_t subs_per_host = (host_chunk + gpu_chunk - 1) / gpu_chunk;
-    // GPU path keeps the copy: each host chunk is split into gpu_chunk subchunks, so
-    // one owning buffer per host read doesn't map to one Task (pool == nullptr).
-    // No early-abort on GPU failure: even if every GPU dies, the CPU
-    // fallback (gpu_only_cpu_fallback / hybrid CPU pool) consumes the queue,
-    // so the reader always streams the whole input.
-    reader_done = pooled_read_chunks(opt.input, host_chunk, m, nullptr, /*o_direct=*/true,
-      /*n_readers=*/1, /*borrowed_fd=*/-1,
-      [&](const char * buf, size_t n_host, size_t idx, int /*slot*/) {
-        // Deterministic, contiguous seq by file position: only the last (highest-
-        // idx) chunk is partial, so chunk idx owns [idx*subs_per_host, +n_subs).
-        size_t sub_off = 0, sub_i = 0;
-        while (sub_off < n_host) {
-          size_t sub_n = std::min(gpu_chunk, n_host - sub_off);
-          enqueue_direct_chunk(queue, idx * subs_per_host + sub_i, buf + sub_off, sub_n);
-          sub_off += sub_n; ++sub_i;
-        }
-        return true;
-      });
-  }
+  // --direct-read: O_DIRECT input (bypass page cache).  The READ itself happens
+  // in the pooled-reader branch below, on exactly the path the probe adopts when
+  // it picks O_DIRECT; this flag only records the intent and holds mmap off,
+  // which is the precedence --direct-read has always had.
+  //
+  // It used to read here, at HOST-chunk granularity into a single scratch buffer,
+  // memcpy'ing every gpu_chunk subchunk into its own Task — because "one owning
+  // buffer per host read doesn't map to one Task".  The pooled reader had since
+  // dissolved that constraint (read at gpu_chunk granularity and one pool buffer
+  // IS one Task, zero-copy), and compress_cpu_mt was converted; this producer,
+  // which is the one a plain `gzstd FILE` uses, was not.  Cost of the divergence,
+  // measured cold on a 32 GiB input, median of 3: the flag ran 17.65 s while the
+  // probe adopting the same physical read path ran 11.77 s — a 1.50x penalty for
+  // asking for O_DIRECT by name.  --adapt reaches the same branch (it sets
+  // opt.direct_read from its measured prior), so a machine that learned O_DIRECT
+  // wins then re-measured it through the slow copy every run afterwards.
+  const bool want_direct_read = opt.direct_read && opt.input != "-"
+                             && fs::is_regular_file(opt.input);
 
   // Would the cold-input read probe apply here?  Decided BEFORE the mmap branch:
   // mmap is the default on this path and would otherwise claim the input before
@@ -19328,8 +19347,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // here, and mmap always won.  When the probe applies, mmap stands aside; if it
   // then declines internally, the pooled buffered reader takes over, which is
   // itself faster than mmap on a cold input (19.95 s vs 25.12 s on 64 GiB).
+  // !want_direct_read: O_DIRECT is already decided for this run (--direct-read,
+  // or --adapt applying its measured prior, which does NOT set the user flag).
+  // Probing would re-litigate a settled choice and could overturn it.
   const bool nv_probe_wanted =
-      !opt.direct_read_user_set && !opt.mmap_user_set && !opt.cold_read
+      !want_direct_read
+      && !opt.direct_read_user_set && !opt.mmap_user_set && !opt.cold_read
       && opt.input != "-" && fs::is_regular_file(opt.input)
       && !device_is_rotational(opt.input)
       && [&] {
@@ -19339,7 +19362,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
            return r >= 0.0 && r < 0.95;
          }();
 
-  if (!reader_done && !nv_probe_wanted
+  if (!reader_done && !nv_probe_wanted && !want_direct_read
       && opt.use_mmap && opt.input != "-" && fs::exists(opt.input)
       && fs::is_regular_file(opt.input)
       && mmap_ok_for_input(opt, opt.input)
@@ -19385,7 +19408,15 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // decides; pipes (tar -I gzstd) fall through to fread below.
   bool dr_owns = false; uint64_t dr_sz = 0;
   int dr_fd = reader_done ? -1 : probe_preadable_input(opt, in, &dr_owns, &dr_sz);
-  if (dr_fd >= 0) {
+  // --direct-read: probe_preadable_input declines by design — it hands out a
+  // BUFFERED fd, and O_DIRECT cannot be toggled on an already-open description.
+  // The pooled reader opens its own (borrowed_fd = -1); all this block needs from
+  // here is the input size, to size the buffer pool.
+  if (dr_fd < 0 && !reader_done && want_direct_read) {
+    std::error_code dsec; const uintmax_t dz = fs::file_size(opt.input, dsec);
+    if (!dsec) dr_sz = (uint64_t)dz;
+  }
+  if (dr_fd >= 0 || (want_direct_read && dr_sz > 0)) {
     // Reader count scales with MACHINE parallelism, not the CPU pool:
     // cpu_threads is 0 in gpu-only mode, which silently capped gpu-only at
     // 3 readers (= 14.17 GiB/s measured) while the H100 pool had headroom.
@@ -19419,8 +19450,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // pool slot, so acquire() gates the producer strictly earlier.
       queue.set_max_depth(pool_n);
       if (opt.verbosity >= V_VERBOSE)
-        vlog(V_VERBOSE, opt, "[POOLED-READ] buffered input (page cache + readahead), zero-copy pool "
-             + std::to_string(pool_n) + " buffers\n");
+        vlog(V_VERBOSE, opt,
+             std::string(want_direct_read
+                           ? "[DIRECT-READ] O_DIRECT input (page cache bypassed)"
+                           : "[POOLED-READ] buffered input (page cache + readahead)")
+             + ", zero-copy pool " + std::to_string(pool_n) + " buffers\n");
       auto nv_emit = [&](const char * buf, size_t n, size_t idx, int slot) {
         Task t; t.seq = idx; t.view_ptr = buf; t.view_len = n; t.direct_buf = slot;
         queue.push(std::move(t));
@@ -19439,7 +19473,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // description (the flag cannot be toggled on the borrowed one), so it gets
       // a second fd on the SAME inode, checked, and both live for the whole read.
       bool nv_probed = false;
-      if (!opt.direct_read_user_set && !opt.mmap_user_set && !opt.cold_read
+      if (!want_direct_read
+          && !opt.direct_read_user_set && !opt.mmap_user_set && !opt.cold_read
           && opt.input != "-" && fs::is_regular_file(opt.input)
           && dr_sz >= READ_PROBE_MIN_INPUT
           && !device_is_rotational(opt.input)) {
@@ -19492,9 +19527,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           }
         }
       }
+      // --direct-read takes the same pooled zero-copy reader, single-stream and
+      // on its own fd: O_DIRECT cannot be toggled on the borrowed (buffered)
+      // description, so pass -1 and let pooled_read_chunks open it.  A failed
+      // O_DIRECT open returns false exactly as before and fread takes over.
       if (!nv_probed)
       reader_done = pooled_read_chunks(opt.input, gpu_chunk, m, &nv_pool,
-        /*o_direct=*/false, n_readers, dr_fd, nv_emit, nullptr, &opt);
+        want_direct_read, want_direct_read ? 1 : n_readers,
+        want_direct_read ? -1 : dr_fd, nv_emit, nullptr, &opt);
       if (!reader_done) g_direct_read_pool = nullptr;  // open failed; fread takes over
     }
     // pool alloc failure: fall through to fread+copy below.

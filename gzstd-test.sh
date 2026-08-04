@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=366
-$EXTENSIVE && EXPECTED_TESTS=499
+EXPECTED_TESTS=369
+$EXTENSIVE && EXPECTED_TESTS=502
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1667,6 +1667,36 @@ else
 fi
 rm -f "$TMPDIR"/pool-*.zst "$TMPDIR"/pool-*.dec "$TMPDIR"/pool-*.log "$TMPDIR/pool-dwedge."* "$TMPDIR/pooltest.bin"
 fi  # $EXTENSIVE (bounded-queue pooled-reader regressions moved to -e)
+
+# ============================================================
+# O_DIRECT compress reader, unaligned input size (v0.15.63)
+# The last block of a file whose size is not a multiple of 4096 is partial,
+# and an O_DIRECT pread returns exactly that partial block.  The short-read
+# retry guard (v0.15.41) treated any unaligned short read as unresumable and
+# failed the whole job — so --direct-read, and the default cold-input read
+# probe once it adopts O_DIRECT, rejected 4095 of every 4096 real inputs with
+# exit 3.  It went unseen because every generated test corpus is MiB-sized.
+# Sizes here are deliberately not multiples of 4096; chunk-size=1 makes the
+# tail a distinct chunk.  On a filesystem without O_DIRECT support the open
+# falls back to buffered and these still pass (they just stop testing it).
+# ============================================================
+section "O_DIRECT compress reader, unaligned input size"
+
+for sz in $((5 * 1024 * 1024 + 1234)) $((4 * 1024 * 1024 + 1)) $((3 * 1024 * 1024)); do
+  head -c "$sz" /dev/urandom > "$TMPDIR/odr.bin"
+  rem=$(( sz % 4096 ))
+  rc=0
+  "$GZSTD" -k -f --cpu-only --direct-read --chunk-size=1 \
+    "$TMPDIR/odr.bin" -o "$TMPDIR/odr.zst" 2>/dev/null || rc=$?
+  if [[ $rc -eq 0 ]] \
+     && "$GZSTD" -d -k -f --cpu-only "$TMPDIR/odr.zst" -o "$TMPDIR/odr.dec" 2>/dev/null \
+     && files_match "$TMPDIR/odr.bin" "$TMPDIR/odr.dec"; then
+    pass "--direct-read compress, size % 4096 = $rem" "round-trip OK"
+  else
+    fail "--direct-read compress, size % 4096 = $rem" "exit $rc / truncated or mismatch"
+  fi
+done
+rm -f "$TMPDIR/odr.bin" "$TMPDIR/odr.zst" "$TMPDIR/odr.dec"
 
 # ============================================================
 # Parallel-prefetch decompress reader (v0.13.71)

@@ -1,9 +1,82 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.62  
+**Covers:** v0.9.50 → v0.15.63  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.63 — O_DIRECT refused almost every real file, and the flag took the slow door
+
+Both defects were found by pointing the read path at repaired hardware. A low-core Gen3
+box had been carrying a source NVMe linked at PCIe **Gen1** (866 MB/s); refitted to Gen3 x4
+it sustains **2.9 GB/s**, and at that rate the cold read probe changes its mind — it adopts
+O_DIRECT where it had declined. Everything below was hiding behind a decision that had
+never been taken on this machine.
+
+**The first O_DIRECT read of a real file failed at 98.8%.** A 32 GiB cold compress, no
+flags, exited 3 with no output. The last block of a file whose size is not a multiple of
+4096 is partial, and an O_DIRECT `pread` returns exactly that partial block. The
+short-read retry loop (v0.15.41, added because a short read *mid-file* was being treated as
+EOF and silently truncating) classified any unaligned short read as unresumable and failed
+the job — including the one that is simply the end of the file. It could not tell the two
+apart because it did not know the input's size. It does now: a short read that ends exactly
+at EOF is a complete final chunk; anything else still fails loudly. **This rejected 4095 of
+every 4096 real inputs** on `--direct-read`, and on the default path for any cold input the
+probe adopted. It survived four versions because every generated test corpus is MiB-sized
+and therefore aligned — the regression test added here deliberately uses sizes that are not.
+
+**Asking for O_DIRECT by name was 1.50x slower than the probe choosing it.** With the tail
+fixed, the same 32 GiB cold input ran 11.77 s on the default path and **17.65 s** with
+`--direct-read` — the same physical read path, both single-stream O_DIRECT. The flag had
+its own branch in the GPU/hybrid producer that read at host-chunk granularity into one
+scratch buffer and memcpy'd every subchunk into a Task, on the reasoning that "one owning
+buffer per host read doesn't map to one Task". The pooled reader had since dissolved that
+constraint — read at GPU-chunk granularity and one pool buffer *is* one Task, zero-copy —
+and `compress_cpu_mt` was converted; this producer, the one a plain `gzstd FILE` uses, was
+not. The flag now takes the same pooled call the probe adopts: **17.65 s → 11.27 s**, with
+`[READER] task-copy` falling from 23.1% to 0.0%. `--adapt` reaches this branch too (it sets
+`direct_read` from its measured prior without setting the user flag), so a machine that
+learned O_DIRECT wins had been re-applying it through the slow copy on every subsequent run.
+
+**The premise that core count drives the O_DIRECT *read* regression is retired.** The
+rationale for building the read path measure-not-rule cites `--direct-read` regressing
+compress 20–40% on this low-core box. That figure needs a provenance note: the measurements
+on record matching it are for `--direct` — O_DIRECT **output** — at v0.13.22 (compress
+−20% to −40% here, +50% to +100% on the server), and no equivalent `--direct-read` compress
+dataset for this box appears in this log. The two flags are independent and always have
+been. Whatever its provenance, the read-side claim does not reproduce. Re-measured cold,
+32 GiB, median of 3, output to `/dev/null` so no sink clamps it:
+
+| read path | median | rate |
+|---|---|---|
+| default (probe decides → O_DIRECT) | 11.54 s | 2.79 GiB/s |
+| forced `--direct-read` | **11.27 s** | **2.86 GiB/s** |
+| forced buffered pool | 16.06 s | 2.01 GiB/s |
+| forced mmap | 18.67 s | 1.73 GiB/s |
+
+O_DIRECT **wins by 1.42x** on the machine that was the sole evidence for the opposite rule,
+and reaches the drive's raw `dd` ceiling. What produced the old ranking was the crippled
+link plus the copy above — not the core count, which predicts nothing here. The probe's
+verdict is correct on both machines on record, and it was measurement, not the rule, that
+caught the rule being wrong. Under `--adapt` this converges without flapping: SOURCE_BOUND
+every run, O_DIRECT adopted every run, 11.42–11.64 s across three.
+
+**`--direct` (O_DIRECT output) is NOT re-measured by any of this** and its v0.13.22
+asymmetry stands unchanged. Every run above wrote to `/dev/null`, which removes the write
+path from the measurement entirely — deliberately, so that a ~2.0 GiB/s sink could not clamp
+three read paths that differ well above it. The Gen4+ auto-`--direct` gate is untouched.
+
+**The reader-count sweep separates now that the device is not the wall.** At Gen1 speeds
+1 reader tied 12 and the sweep was worthless. At 2.9 GB/s, cold and buffered, it is
+monotonic — 1 reader **15.25 s**, 3 (this box's default) 16.07 s, 6 16.45 s, 9 16.58 s,
+12 16.86 s. More readers cost throughput against a source this fast, which agrees with the
+warm finding at v0.15.57. The lever is moot for cold compress here in any case: O_DIRECT is
+single-stream by design and beats every buffered configuration by 3.9 s.
+
+Suites at v0.15.63: **369/369 default, 502/502 extensive, 288 passed + 70 skipped
+CPU-only**, both build configurations.
 
 ---
 
