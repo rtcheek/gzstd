@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.57";
+static constexpr const char * GZSTD_VERSION = "0.15.61";
 //
 // Architecture overview:
 //
@@ -363,6 +363,22 @@ public:
       want_(seed > 0 ? std::min(ceil, std::max(floor, seed)) : base),
       start_(want_.load()), seeded_(seed > 0) {}
 
+  // Publish the LIVE active reader count (normally &Meter::reader_threads).
+  //
+  // The governor normalises its source-busy fraction by this number, so it must
+  // track what is actually reading RIGHT NOW, not what the pool started with.
+  // It used to be written only at teardown, after the readers had joined, which
+  // left the whole run divided by the base count: shrink 3->2 and a saturated
+  // reader measures 0.67 busy against a 0.85 threshold and is misread as
+  // compute-bound; grow 12->24 on a big box and it measures ~2x busy and
+  // manufactures a source-bound verdict that is not there.  Both directions are
+  // wrong, and neither is specific to a machine size.
+  void bind_live(std::atomic<int> * p)
+  {
+    live_ = p;
+    if (p) p->store(want_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  }
+
   int  want()    const { return want_.load(std::memory_order_relaxed); }
   int  start()   const { return start_; }
   bool seeded()  const { return seeded_; }
@@ -453,9 +469,30 @@ public:
 
       if (!probing) {
         const int cur = want();
-        // Proportional step: +/-1 cannot cross the range inside a bounded round
-        // budget — measured, it settled at 14 where 24 was worth 16% more.
-        const int step = std::max(1, cur / 2);
+        // SEARCHING vs VERIFYING — the step size is not one question.
+        //
+        //   seeded?  step           why
+        //   -------  -------------  ---------------------------------------
+        //   no       max(1, cur/2)  Cold start knows nothing, and must cross
+        //                           the whole range inside a bounded round
+        //                           budget: +/-1 measured settling at 14 where
+        //                           24 was worth 16% more (v0.15.44).
+        //   yes      1              The profile already carries a converged
+        //                           answer for this key, so the job is to
+        //                           confirm it is still a LOCAL optimum. A
+        //                           proportional probe overshoots into
+        //                           expensive territory to learn nothing: from
+        //                           a settled 4 it probes 2 and 6, and 2
+        //                           measured 7.31 s against the optimum's
+        //                           4.63 s. That probe is most of what a
+        //                           converged run pays (4.93 s auto vs 4.63 s
+        //                           forced) — a standing tax on an answer that
+        //                           was already right.
+        //
+        // A seeded controller can still travel: it moves one step per run and
+        // re-seeds from where it landed, so a genuinely changed environment is
+        // followed across a few runs rather than re-explored inside every one.
+        const int step = seeded_ ? 1 : std::max(1, cur / 2);
         const int next = std::min(ceil_, std::max(floor_, cur + dir * step));
         if (next == cur) {
           if (dir_exhausted) { rounds = ADAPT_RD_MAX_ROUNDS; continue; }
@@ -501,11 +538,15 @@ private:
   void set_want(int n)
   {
     want_.store(n, std::memory_order_relaxed);
+    // Publish before waking anyone: the governor's next window must divide by
+    // the count that is about to be active, not the one that just stopped.
+    if (live_) live_->store(n, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> g(mx_); }
     cv_.notify_all();
   }
   const int floor_, ceil_, base_;
   std::atomic<int>      want_;
+  std::atomic<int> *    live_ = nullptr;   // live active-reader publication target
   const int             start_;
   const bool            seeded_;
   std::atomic<bool>     probing_{false};   // a step is in flight, not yet judged
@@ -9883,6 +9924,7 @@ static size_t stream_frames_to_queue_mt(
   const int  n_slots   = std::max(cap * 2, cap + 1);
   const int  rd_seed_d = can_scale ? g_adapt_rd_prior.load(std::memory_order_relaxed) : 0;
   ReaderPoolCtl rd_ctl(n_readers, rd_floor_d, cap, rd_seed_d);
+  rd_ctl.bind_live(m ? &m->reader_threads : nullptr);
 
   struct Slot { std::vector<char> buf; size_t len = 0; size_t idx = SIZE_MAX; bool ready = false; };
   std::vector<Slot> slots((size_t)n_slots);
@@ -11040,6 +11082,7 @@ static bool pooled_read_chunks(const std::string & path, size_t host_chunk,
   // since chunk size or thread count may differ from when it was recorded.
   const int rd_seed = g_adapt_rd_prior.load(std::memory_order_relaxed);
   ReaderPoolCtl rd_ctl(n_readers, rd_floor, rd_ceil, rd_seed);
+  rd_ctl.bind_live(m ? &m->reader_threads : nullptr);
 
   std::atomic<size_t> next_idx{0};
   std::atomic<bool>   done{false};
@@ -12262,6 +12305,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   const int   rd_floor_t = std::max(1, nreaders / 2);
   const int rd_seed_t = rd_ad_t ? g_adapt_rd_prior.load(std::memory_order_relaxed) : 0;
   ReaderPoolCtl rd_ctl_t(nreaders, rd_floor_t, rd_ceil_t, rd_seed_t);
+  rd_ctl_t.bind_live(m ? &m->reader_threads : nullptr);
   std::atomic<bool> rd_done_t{false};
   const bool  rd_trace  = std::getenv("GZSTD_DEBUG_TAR_RD") != nullptr;
   // Per-reader state, so a wedged run names its own culprit.
@@ -12338,15 +12382,27 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
               // counter — so read_ns can exceed wall time and the reported rate
               // is the per-thread average.  Only real file bytes are counted;
               // synthesized headers/padding are not disk I/O.
-              uint64_t t0 = g_perf ? now_ns() : 0;
+              // Timed whenever a Meter exists, not just under -vvv: the GOVERNOR
+              // consumes reader_io_ns to compute its source-busy fraction, and
+              // it must see this path at every verbosity.  Before this, --tar
+              // create left all four reader counters at zero, so rbusy was
+              // identically 0 and a tar create could NEVER classify
+              // SOURCE_BOUND however read-bound it actually was — the same
+              // structural blindness already documented for the mmap reader.
+              const bool time_io = (g_perf != nullptr) || (m != nullptr);
+              uint64_t t0 = time_io ? now_ns() : 0;
               while (done < len) {
                 ssize_t r = ::pread(cur_fd, outp + (voff - a) + done, len - done, foff + (off_t)done);
                 if (r <= 0) break;
                 done += (size_t)r;
               }
-              if (g_perf) {
-                g_perf->read_ns.fetch_add(now_ns() - t0);
-                g_perf->read_bytes_total.fetch_add((uint64_t)done);
+              if (time_io) {
+                const uint64_t io_dt = now_ns() - t0;
+                if (g_perf) {
+                  g_perf->read_ns.fetch_add(io_dt);
+                  g_perf->read_bytes_total.fetch_add((uint64_t)done);
+                }
+                if (m) m->reader_io_ns.fetch_add(io_dt, std::memory_order_relaxed);
               }
             }
             if (done < len) {
@@ -12429,7 +12485,15 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       {  // throttle read-ahead to `window` chunks past the push frontier
         std::unique_lock<std::mutex> lk(rb_mx);
         mark(RD_WINWAIT, ci);
+        // Waiting for the push frontier is BLOCKED-DOWNSTREAM, the counter that
+        // stops a stalled-on-the-consumer reader from reading as source-bound.
+        // The wait_turn() park above is deliberately NOT counted: a parked
+        // reader is inactive by the controller's choice, not blocked by the
+        // pipeline, and charging it here would understate rbusy exactly when
+        // the pool is shrinking.
+        const uint64_t bt0 = m ? now_ns() : 0;
         rb_cv.wait(lk, [&] { return ci < push_next + window; });
+        if (m) m->reader_blocked_ns.fetch_add(now_ns() - bt0, std::memory_order_relaxed);
       }
       mark(RD_ASSEMBLE, ci);
       Task t = assemble_chunk(ci, cur_path, cur_fd, cur_errno);  // concurrent preads (unlocked)
@@ -13332,9 +13396,24 @@ public:
       readers.reserve((size_t)n_dec_max * 2);  dworkers.reserve((size_t)n_dec_max * 2);
       r_retire.reserve((size_t)n_dec_max * 2); d_retire.reserve((size_t)n_dec_max * 2);
     }
+    // Publish the LIVE active reader count.  The governor divides its
+    // source-busy fraction by Meter::reader_threads, which DEFAULTS TO 1 — so
+    // without this, ~15 concurrently preading pool readers would report ~15x
+    // busy and force a source-bound verdict regardless of the truth.  This pool
+    // starts high and contracts, so the count has to follow spawn/retire rather
+    // than be written once.  Same requirement ReaderPoolCtl::bind_live serves
+    // for the other reader pools; both are controller-only call sites, so the
+    // recount needs no extra synchronisation.
+    auto publish_readers = [&] {
+      if (!feed_meter) return;
+      int active = 0;
+      for (auto & f : r_retire) if (!f->load(std::memory_order_relaxed)) ++active;
+      feed_meter->reader_threads.store(std::max(1, active), std::memory_order_relaxed);
+    };
     auto spawn_reader = [&] {
       r_retire.push_back(std::make_unique<std::atomic<bool>>(false));
       readers.emplace_back(reader_loop, r_retire.back().get());
+      publish_readers();
     };
     auto spawn_decoder = [&] {
       d_retire.push_back(std::make_unique<std::atomic<bool>>(false));
@@ -13345,6 +13424,7 @@ public:
     auto retire_reader = [&] {
       for (auto it = r_retire.rbegin(); it != r_retire.rend(); ++it)
         if (!(*it)->load(std::memory_order_relaxed)) { (*it)->store(true, std::memory_order_relaxed); break; }
+      publish_readers();
       qcv.notify_all();
     };
     auto retire_decoder = [&] {
@@ -15785,6 +15865,8 @@ static void pread_seek_frame(int fd, const std::vector<uint64_t> & c_off,
   const uint64_t coff = c_off[k];
   const size_t csz = (size_t)(c_off[k + 1] - coff);
   comp.resize(csz);
+  const bool count = (m != nullptr) && count_read;
+  const uint64_t t0 = count ? now_ns() : 0;
   for (size_t got = 0; got < csz;) {
     ssize_t r = ::pread(fd, comp.data() + got, csz - got, (off_t)(coff + got));
     if (r < 0 && errno == EINTR) continue;
@@ -15792,7 +15874,18 @@ static void pread_seek_frame(int fd, const std::vector<uint64_t> & c_off,
                        + ": " + (r < 0 ? std::strerror(errno) : "unexpected EOF"));
     got += (size_t)r;
   }
-  if (m && count_read) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+  if (count) {
+    m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+    // Feed the governor's source-busy signal.  EVERY compressed byte of a
+    // -d --tar extract is pread here, and until now none of it reached
+    // reader_io_ns — so an extract that is entirely device-read-bound
+    // classified compute-bound (measured: archive on a Gen1-linked NVMe,
+    // 4.56 GiB at 0.81 GiB/s = 5.6 s of a 5.8 s run, writers starved 79.1%,
+    // regime recorded compute-bound).  Same structural blindness fixed for
+    // --tar create; the counters are aggregated across decode-pool readers and
+    // normalised by reader_threads, exactly like every other reader path.
+    m->reader_io_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+  }
 }
 
 // The decompress half: verify the already-read frame against the index and

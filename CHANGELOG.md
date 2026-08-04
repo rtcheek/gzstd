@@ -1,9 +1,53 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.57  
+**Covers:** v0.9.50 → v0.15.61  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.61 — a converged reader controller stopped paying to re-learn what it knew
+
+Searching and verifying are not the same problem, and the step size was answering only the first. The proportional step `max(1, cur/2)` exists so a COLD controller can cross its whole range inside a bounded round budget — `±1` measured settling at 14 where 24 was worth 16% more (v0.15.44). But a controller **seeded from the profile** already holds a converged answer for its key; its job is to confirm that is still a local optimum. Probing proportionally from a settled 4 means probing 2 and 6 — and 2 measured **7.31 s** against the optimum's 4.63 s. The probe was most of what a converged run paid.
+
+The step is now `1` when seeded and proportional when not. Nothing changes for a cold start, so the big-box search behaviour is untouched. A seeded controller can still travel — one step per run, re-seeding from where it lands — so a genuinely moved workload is followed across a few runs instead of re-explored inside every one.
+
+Measured, cold `--tar` create of a 10.36 GiB / 8,676-entry tree, converged steady state:
+
+| | wall |
+|---|---|
+| v0.15.60 (proportional probe) | 4.93 s |
+| **v0.15.61 (seeded ±1)** | **4.73 s** |
+| forced `--read-threads=4` (the optimum) | 4.63 s |
+
+The standing tax on an already-correct answer falls from ~6.5% to ~2.2%. Convergence costs one extra run (3 → 3, then 3 → 4, then stable), which is the right trade: slightly slower to find, materially cheaper once found.
+
+**What the storage actually costs, flush-inclusive.** The earlier figures in this file were taken without a flush inside the timed region, which lets a slow sink hide behind dirty page cache — a 4.56 GiB archive cannot durably reach a 0.81 GiB/s device in the 5.32 s once recorded. Re-measured with `sync` inside the timing, on the same tree:
+
+| | create | extract |
+|---|---|---|
+| Gen1-linked NVMe (0.81 GiB/s) | 11.42 s | 9.69 s |
+| Gen3-linked NVMe | 8.10 s | 6.79 s |
+| tmpfs (no storage at all) | 5.44 s | **1.50 s** |
+
+Extract in RAM runs at **6.91 GiB/s**, within noise of the measured CPU compress ceiling of 6.97 GiB/s — so the pipeline itself is not the constraint and storage is ~78% of extract wall time even on a healthy drive. That is independent corroboration of the v0.15.58–60 verdict: these runs are source-bound, and were being classified compute-bound.
+
+---
+
+## v0.15.58–60 — the governor could not see three of its own reader paths
+
+The `--adapt` governor decides everything from one number per subsystem. Its source-busy fraction is `reader_io_ns` summed across readers and divided by `reader_threads` — and **all three terms were wrong, in three different places**. Every fix here corrects a *measurement*; not one constant was retuned, because once the signal was right the existing policy already chose correctly.
+
+**1. The reader divisor was stale for the whole run (v0.15.58).** `Meter::reader_threads` was written only at teardown, *after* the readers had joined, so the governor normalised every window by the count the pool STARTED with. The error scales with how far the pool has moved, and it goes both ways: shrink 3→2 and a fully saturated reader measures 0.67 against a 0.85 threshold and reads as compute-bound; grow 12→24 on a big box and it measures ~2x busy and manufactures a source-bound verdict that is not there. `ReaderPoolCtl::bind_live()` now publishes the active count on every `set_want`, before waking the readers, so the window that grades a step divides by the count that was actually running during it. Measured: a cold device-bound read went from `source-bound 3% / compute-bound 89%` to `source-bound 91% / compute-bound 1%`, and the `[READER]` line's impossible **105.7%** became 91.5%.
+
+**2. `--tar` create fed the governor nothing at all (v0.15.59).** `tarx::assemble` set `reader_threads` but never touched `reader_io_ns`, `reader_copy_ns`, `reader_blocked_ns` or `reader_parse_ns`. All four stayed at zero, so `rbusy` was identically 0 and **a tar create could never classify SOURCE_BOUND however read-bound it was** — the same structural blindness already documented in the code for the mmap reader. The member `pread` now feeds `reader_io_ns` (timed whenever a Meter exists, not just under `-vvv`, because the governor needs it at every verbosity) and the push-frontier wait feeds `reader_blocked_ns`. The controller's own `wait_turn` park is deliberately NOT counted: a parked reader is inactive by the controller's choice, not blocked by the pipeline, and charging it there would understate `rbusy` exactly when the pool is shrinking. Measured on a 10.36 GiB / 8,676-entry tree: `compute-bound` became `source-bound 47%`, the `[READER]` line began to exist at all, and `source-latch(gpu-batch)` — a source-bound action that previously could never fire — now does.
+
+**3. `-d --tar` extract was blind twice over (v0.15.60).** Every compressed byte of an extract is read through `pread_seek_frame`, which counted `read_bytes` but not `reader_io_ns`; and the decode pool never published its reader count at all, leaving the governor's divisor at its default of **1** while ~15–22 readers preaded concurrently. Either bug alone produces a wrong verdict, and together they would have produced a right-looking one for the wrong reason — a ~15x inflated `rbusy` forcing source-bound regardless of truth. The pread is now timed, and the pool publishes its live active count from the same spawn/retire events that resize it (it starts high and contracts, so a write-once count cannot work). Measured with the archive on a Gen1-linked NVMe — 4.56 GiB at 0.81 GiB/s, i.e. 5.6 s of a 5.8 s run, with writers starved 79.1% — the regime went from `compute-bound 48%` to `source-bound 46%`, matching both the `[WRITER]` and `[READER]` verdicts. Extraction stayed byte-identical across 8,612 files.
+
+Suites at v0.15.61: **366/366 default, 499/499 extensive, 285 passed + 70 skipped CPU-only**, and a 10.36 GiB / 8,612-file archive round-tripped byte-identical.
+
+**What this bought, and why no parameter was touched.** With the signal correct, the reader controller converges to the measured optimum on its own. On cold `--tar` create of that tree it settles at **4** and holds; a forced sweep under the same flags puts the peak at exactly 4 (2 → 7.31 s, 3 → 5.24 s, **4 → 4.63 s**, 6 → 5.61 s, 9 → 6.52 s). Notably the optimum is 4 *with* `--adapt` and 6 without it, so measuring the wrong configuration would have sent a tuning effort at the wrong target. The remaining gap is that a converged controller still pays ~6% exploration every run (4.93 s auto vs 4.63 s forced) — recorded as a ROADMAP row rather than papered over with a constant.
 
 ---
 
