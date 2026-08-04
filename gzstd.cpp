@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.63";
+static constexpr const char * GZSTD_VERSION = "0.15.64";
 //
 // Architecture overview:
 //
@@ -502,11 +502,15 @@ public:
         probe_from_.store(cur, std::memory_order_relaxed);
         probing_.store(true, std::memory_order_relaxed);
         set_want(next);
+        trace("probe", cur, next, rate, 0.0, rounds);
       } else {
         probing = false; ++rounds;
         probing_.store(false, std::memory_order_relaxed);
-        if (rate > pre_rate * ADAPT_RD_MARGIN) { dir_exhausted = false; }
+        if (rate > pre_rate * ADAPT_RD_MARGIN) { dir_exhausted = false;
+          trace("KEEP", probe_from, want(), rate, pre_rate, rounds);
+        }
         else {
+          trace("revert", want(), probe_from, rate, pre_rate, rounds);
           set_want(probe_from);
           if (dir_exhausted) rounds = ADAPT_RD_MAX_ROUNDS;
           else { dir = -dir; dir_exhausted = true; }
@@ -535,6 +539,22 @@ public:
   void wake_all() { { std::lock_guard<std::mutex> g(mx_); } cv_.notify_all(); }
 
 private:
+  // GZSTD_DEBUG_RD_CTL=1: one line per decision, to stderr.  The teardown line
+  // reports only the SETTLED count, which cannot distinguish "probed both
+  // directions and correctly rejected them" from "never probed at all" — they
+  // print identically when the search returns to base.  Reading that difference
+  // is the whole diagnostic.
+  static void trace(const char * what, int from, int to,
+                    double rate, double pre, int rounds)
+  {
+    static const bool on = ::getenv("GZSTD_DEBUG_RD_CTL") != nullptr;
+    if (!on) return;
+    char was[48] = "";
+    if (pre > 0) std::snprintf(was, sizeof was, " (was %.3f)", pre / 1073741824.0);
+    std::fprintf(stderr, "[RD-CTL] %-6s %d -> %d  rate %.3f GiB/s%s  round %d\n",
+                 what, from, to, rate / 1073741824.0, was, rounds);
+  }
+
   void set_want(int n)
   {
     want_.store(n, std::memory_order_relaxed);

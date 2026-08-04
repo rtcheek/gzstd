@@ -1,9 +1,54 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.63  
+**Covers:** v0.9.50 → v0.15.64  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.64 — the reader search was right, and still could not reach the answer
+
+**`GZSTD_DEBUG_RD_CTL=1` prints one line per reader-controller decision.** The teardown
+line reports only the settled count, and that number cannot distinguish "probed both
+directions and correctly rejected them" from "never probed at all" — they print identically
+whenever a search returns to where it started. Reading that difference was the whole
+diagnostic below, and it was not previously possible from outside the process.
+
+**The reader-count objective is not unimodal, so the hill-climb cannot reach the optimum.**
+The controller takes a step, measures it, and keeps it only if it pays — which assumes one
+hill. Measured cold and buffered on a 24-thread Gen3 box, 32 GiB, median of 3:
+
+| readers | 1 | 2 | 3 (default here) | 6 | 9 | 12 |
+|---|---|---|---|---|---|---|
+| wall | **15.15 s** | 18.93 s | 16.14 s | 16.45 s | 16.58 s | 16.86 s |
+
+The best count is 1, and a **valley at 2** — 17% worse than either neighbour — sits between
+it and the default. The trace shows the controller probing 3→4 (2.061 → 1.999 GiB/s,
+reverted) and 3→2 (2.061 → 1.811, reverted), then settling: both rejections are correct
+measurements, 3 is a genuine local optimum, and no ±1 climb starting there can ever see 1.
+The implementation is doing exactly what it was designed to do; the design is what is wrong.
+Left open rather than patched — the fix (evaluate the floor explicitly, or coarse-scan
+before climbing) should be judged on the many-core box first, where the range is 6–32 from a
+start of 12 and a valley would cost more. In practice this costs nothing on the box that
+found it: the default path takes O_DIRECT at 11.27 s, better than any buffered count.
+
+**Baseline refreshed now that both M.2 slots link Gen3 x4.** Same 10.36 GiB / 8,612-file
+tree, flush-inclusive (`sync` inside the timed region), warm source, median of 3:
+
+| | before (one slot at Gen1) | now |
+|---|---|---|
+| `--tar` create → the refitted drive | 11.42 s | **5.41 s** |
+| `--tar` create → the always-Gen3 drive | 8.10 s | **5.42 s** |
+| `--tar` extract, refitted drive | 9.69 s | **5.37 s** |
+| `--tar` extract, always-Gen3 drive | 6.79 s | **5.51 s** |
+
+The ~30% drive-to-drive asymmetry is gone; both sustain ~1.9 GiB/s end-to-end. The refitted
+drive accounts for its own improvement, but the always-Gen3 column moved too — that part is
+software, v0.15.55 → v0.15.64 (v0.15.61's converged-reader fix alone was worth 4.93 → 4.63 s
+on this shape). Notably **create now matches what the same tree costs in tmpfs** (5.44 s),
+so create is no longer storage-bound at all on this machine; extract still is (1.50 s in
+tmpfs, ~72% of its wall time is the device).
 
 ---
 
