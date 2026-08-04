@@ -1,9 +1,37 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.54  
+**Covers:** v0.9.50 → v0.15.55  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.55 — `--adapt` persisted regime verdicts it never measured
+
+Found by the first deliberate `--adapt` cold-start run on a Gen3 workstation, where the profile had genuinely never existed.
+
+**The ramp and the save floor are the same three seconds.** `RAMP_SEC` is 3.0 s of warmup before the governor will classify anything, and `adapt_save_min_ns()` is a 3 s floor below which a run is considered too trivial to teach the per-machine profile. Because those numbers are equal, the threshold that qualifies a run to persist its verdict sits *precisely where measurement begins* — so every run in roughly the 3–6 s band saved a conclusion drawn from a sliver of evidence. `dominant_regime()` returned whichever non-warmup bucket owned the most time with **no minimum at all**; its only test was greater-than-zero, so 0.1 s won uncontested.
+
+Measured on a 24-core PCIe Gen3 box, same corpus, same flags, two sizes:
+
+| | 8 GiB (3.2 s) | 64 GiB (32 s) |
+|---|---|---|
+| warmup share | **96%** | 10% |
+| classified | 0.1 s (4%) compute-bound | 26.6 s (85%) sink-bound |
+| **persisted regime** | **`compute-bound`** | **`sink-bound`** |
+
+The short run's verdict was not merely thin, it was **backwards**, and contradicted by two other signals in the same run: the profile's own recorded rates (`cpu_gibs` 7.14 vs `sink_gibs` 2.17 — the CPU was 3.3x faster than the sink) and the `[WRITER]` verdict (*output device saturated — the sink is the bottleneck*). A modest compress on a fast box is the common case, not a corner case, so this was the default outcome rather than an edge one.
+
+`dominant_regime()` now carries its state table in the code and requires both an absolute floor (2 s classified) and a share (25% of the run) before it will name a regime; below either it returns `unclassified`, which the profile writer already handled by simply recording no regime. Rates are still recorded either way — those *are* measured. Both terms are load-bearing: the floor rejects the short-run band, the share rejects a long run that spent almost all of itself ramping. The floor is deliberately **not** derived from `adapt_save_min_ns()`, since collapsing "worth recording at all" into "measured what it claims" is what caused the bug.
+
+A rejected classification now says so at `-v` rather than failing silently, because the shares line showing a regime while the profile records none otherwise looks like an inconsistency. A **forced** regime (`GZSTD_DEBUG_ADAPT_REGIME`) bypasses the gate at any duration — it is a deliberate test assertion, not a measurement, and suite determinism depends on it.
+
+**What was already correct:** cold-start creation writes schema epoch 2 with a full fingerprint, and convergence is clean — `overall_gibs` over five identical runs went 2.3945 → 2.4771 → 2.5245 → 2.5517 → 2.5627, deltas roughly halving each time, settling by run 4–5.
+
+The regression test asserts the *invariant* (a sub-threshold classification must leave the profile's regime unset) rather than a fixed timing, so it holds at any machine speed instead of pinning the boundary this box happens to land on. It is also the only test in that section that runs a qualifying run, so it clears the profile afterwards — the tests that follow assert the profile is absent, and on first writing it this test failed its *neighbour* rather than itself.
+
+Suites at v0.15.55: **366/366 default, 499/499 extensive, 285 passed + 70 skipped CPU-only.**
 
 ---
 

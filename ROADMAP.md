@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.54
+**Current version:** v0.15.55
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -1000,6 +1000,9 @@ verbatim) without breaking existing gzstd scripts using `--format=gnu`.
 | `--keep-going` — recover a damaged archive on decompress | — | Medium | DONE (v0.14.41–42) |
 | Delete compress CPU-rescue → clean GPU-fault abort | — | Medium | DONE (v0.14.43) |
 | Checkpoint/resume on fault (resume from last good frame vs. rebuild from zero) | — | Low | Not started |
+| `--adapt` persisted a regime it never measured | — | Medium | DONE (v0.15.55) — `RAMP_SEC` and `adapt_save_min_ns()` are both 3 s, so the save threshold sat exactly where measurement begins; `dominant_regime()` had no minimum and returned whichever bucket owned the sliver. Same corpus persisted `compute-bound` at 8 GiB (0.1 s classified) and `sink-bound` at 64 GiB, with the short run contradicted by its own rates and the `[WRITER]` verdict. Now gated on 2 s AND 25% classified, state table in the code; forced regimes exempt |
+| `--adapt` reports `GPU driver changed` on a BRAND-NEW profile | — | Low | Open (found v0.15.55) — first run on a machine with no profile prints `GPU driver changed ( -> 570.207); clearing GPU-derived priors`, but there were no priors to clear. Empty-to-value counts as a change. Cosmetic, but it reads as damage on a cold start |
+| `--adapt` summary says `actions: none` while actions printed | — | Low | Open (found v0.15.55) — a 64 GiB sink-bound run printed `sink-bound: probing +1 parallel writer` twice, then summarised `actions: none`. Either a probe is not meant to count as an action (then the wording is wrong) or the flag is not set on that path |
 | Compress `ThreadGuard` teardown does not signal ABANDONMENT to the writer | — | Low | DONE (v0.15.53–54) — `g_run_abandoned` + `run_abandoned()` generalise what `g_gpu_aborted` already meant to the writer: missing frames are EXPECTED and the output is discarded. Set first in the guard so `workers_done` is never visible without it. Fixing the misreport then exposed a deadlock the old `die()` had masked — the guard's joins had never executed, and workers parked in `acquire_out_buf` waiting for output-pool slots the departed writer could no longer return; those escapes now test `run_abandoned()` too |
 | `--tar` input ergonomics (`--exclude-from`/`-X`, `--files-from`, `-P`, `--exclude-vcs`) | tar | Low | DONE (v0.14.90) |
 | `--selinux` context storage (third leg of xattrs/ACLs) | tar | Low | DONE (v0.14.91) — spot-check a labeled-host round-trip if one appears |

@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=365
-$EXTENSIVE && EXPECTED_TESTS=498
+EXPECTED_TESTS=366
+$EXTENSIVE && EXPECTED_TESTS=499
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3290,6 +3290,46 @@ env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --no-profile --cpu-only -k 
 env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt --cpu-only -k -f \
   "$TMPDIR/medium.txt" -o "$TMPDIR/aprof-fast.zst" 2>/dev/null
 [[ ! -e "$APROF" ]] && pass "sub-3s run writes nothing" || fail "sub-3s run writes nothing"
+
+# 5b. A run that CLEARS the save floor but is mostly RAMP must not persist a
+# regime.  RAMP_SEC and the save floor are both 3 s, so a run just over the floor
+# has only a sliver of classified time — and dominant_regime() used to return
+# whichever bucket owned that sliver, because its only test was "greater than
+# zero".  Measured (v0.15.55): an 8 GiB compress classified 0.1 s and persisted
+# compute-bound, while its own recorded rates (cpu 7.14 vs sink 2.17 GiB/s) and
+# the [WRITER] verdict both said sink-bound; the identical workload at 64 GiB
+# classified 85% sink-bound.  Same box, same work, opposite verdicts.
+#
+# Asserted as an INVARIANT rather than a fixed timing, so it holds at any machine
+# speed: whatever share this box achieves, the profile must agree with the gate.
+# -19 -T1 on ~8 MiB lands just past the ramp on a fast box and further past it on
+# a slow one; both branches are a pass, only disagreement fails.
+rm -rf "$APROF_XDG"
+head -c 8388608 "$APROF_SRC" > "$TMPDIR/aprof-ramp.txt"
+rampe="$TMPDIR/aprof-ramp.err"
+env XDG_CACHE_HOME="$APROF_XDG" "$GZSTD" --adapt -v --cpu-only -19 -T1 -k -f \
+  "$TMPDIR/aprof-ramp.txt" -o "$TMPDIR/aprof-ramp.zst" 2>"$rampe"
+if grep -q 'of this run was classified' "$rampe"; then
+  if grep -q '"regime"' "$APROF" 2>/dev/null; then
+    fail "thin classification persists no regime" "profile recorded a regime the run never measured"
+  else
+    pass "thin classification records rates but no regime verdict"
+  fi
+elif grep -q 'regime shares:' "$rampe"; then
+  if grep -q '"regime"' "$APROF" 2>/dev/null; then
+    pass "sufficient classification persists a regime"
+  else
+    fail "sufficient classification persists a regime" "gate accepted the run but recorded nothing"
+  fi
+else
+  skip "regime-evidence gate" "run never outlived the ramp on this machine"
+fi
+rm -f "$TMPDIR/aprof-ramp.txt" "$TMPDIR/aprof-ramp.zst" "$rampe"
+# This test is the only one in the section that runs a QUALIFYING run, so it is
+# the only one that leaves a profile on disk.  Tests 6+ assert the profile is
+# ABSENT, so clear it — otherwise this test silently fails its neighbour rather
+# than itself, which is exactly what happened when it was added.
+rm -rf "$APROF_XDG"
 
 # 6. A failing run writes nothing (corrupt input, nonzero exit).
 head -c 65536 /dev/urandom > "$TMPDIR/aprof-bad.zst"

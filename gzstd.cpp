@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.54";
+static constexpr const char * GZSTD_VERSION = "0.15.55";
 //
 // Architecture overview:
 //
@@ -2641,14 +2641,49 @@ public:
   }
 
   // Post-stop only (main thread after join): the regime that owned the most
-  // classified wall time, or "unclassified" when nothing outlived the ramp.
-  // Consumed by the profile writer as this run's dominant-regime observation.
+  // classified wall time, or "unclassified" when this run cannot honestly claim
+  // to have MEASURED one.  Consumed by the profile writer as this run's
+  // dominant-regime observation.
+  //
+  // The gate exists because the ramp and the profile save floor are the SAME
+  // 3 s (RAMP_SEC vs adapt_save_min_ns), so a run that just clears the floor has
+  // spent essentially all of itself in warmup and has a sliver of classified
+  // time -- which this function used to return unconditionally, because its only
+  // test was "greater than zero".
+  //
+  // Measured on a 24-core PCIe Gen3 box (v0.15.55): an 8 GiB compress ran 3.2 s,
+  // spent 96% in warmup, classified 0.1 s as compute-bound and persisted THAT --
+  // while its own recorded rates (cpu 7.14 vs sink 2.17 GiB/s) and the [WRITER]
+  // verdict both said sink-bound.  The identical workload at 64 GiB classified
+  // 85% sink-bound.  Same machine, same work, opposite verdicts.
+  //
+  //   classified time      share of run    ->  result
+  //   -----------------    ------------    ------------------------------------
+  //   0                    --                  unclassified  (nothing outlived the ramp)
+  //   > 0, < MIN_ABS       any                 unclassified  (the 3-6 s band)
+  //   >= MIN_ABS           < MIN_SHARE         unclassified  (long run, mostly ramping)
+  //   >= MIN_ABS           >= MIN_SHARE        the dominant bucket
+  //
+  // Both terms are load-bearing: the floor rejects the short-run band, and the
+  // share rejects a long run that spent almost all of itself ramping (a mid-run
+  // stall re-entering warmup, say).  A FORCED regime is exempt -- it is a
+  // deliberate assertion from a test hook, not a measurement, and the suite's
+  // determinism depends on it being honoured at any duration.
   const char * dominant_regime() const
   {
-    int best = -1; uint64_t best_ns = 0;
-    for (int r = 1; r < 4; ++r)   // skip WARMUP
+    int best = -1; uint64_t best_ns = 0, classified = 0;
+    for (int r = 1; r < 4; ++r) {   // skip WARMUP
+      classified += acc_[r];
       if (acc_[r] > best_ns) { best_ns = acc_[r]; best = r; }
-    return best < 0 ? "unclassified" : adapt_regime_name((AdaptRegime)best);
+    }
+    if (best < 0) return "unclassified";
+    if (forced_ != AdaptRegime::WARMUP)
+      return adapt_regime_name((AdaptRegime)best);
+    if (classified < MIN_CLASSIFIED_NS) return "unclassified";
+    const uint64_t total = acc_[0] + classified;
+    if (total > 0 && double(classified) / double(total) < MIN_CLASSIFIED_SHARE)
+      return "unclassified";
+    return adapt_regime_name((AdaptRegime)best);
   }
 
   // End-of-run [ADAPT] block, printed with the [READER]/[WRITER] diags.
@@ -2691,12 +2726,36 @@ public:
         && !(acts & ADAPT_ACT_EWRITER_GROW)) os << " extract-writers(probed)";
     if (acts & ADAPT_ACT_EWRITER_TRIM)    os << " extract-writers(trimmed)";
     os << "\n";
+    // Say so when a regime WAS classified but was too thin to persist.  Without
+    // this the rejection is invisible: the shares line shows a regime, the
+    // profile records none, and the two look inconsistent.
+    if (!std::strcmp(dominant_regime(), "unclassified")) {
+      uint64_t classified = 0;
+      for (int r = 1; r < 4; ++r) classified += acc_[r];
+      if (classified > 0) {
+        char note[192];
+        std::snprintf(note, sizeof(note),
+          "[ADAPT] only %.1f s (%.0f%%) of this run was classified — below the "
+          "%.0f s / %.0f%% needed to measure a regime; recording rates but no "
+          "regime verdict\n",
+          classified / 1e9, 100.0 * double(classified) / double(total),
+          MIN_CLASSIFIED_NS / 1e9, MIN_CLASSIFIED_SHARE * 100.0);
+        os << note;
+      }
+    }
     vlog(V_VERBOSE, opt_, os.str());
   }
 
 private:
   static constexpr int64_t TICK_NS       = 100 * 1000 * 1000;  // 100 ms, = hybrid tick cadence
   static constexpr double  RAMP_SEC      = 3.0;   // v0.14.52 ramp guard
+  // Minimum evidence before dominant_regime() will persist a verdict; see the
+  // state table there.  MIN_CLASSIFIED_NS is deliberately NOT derived from
+  // adapt_save_min_ns(): the save floor answers "is this run worth recording at
+  // all", this answers "did it measure the thing it is about to claim", and
+  // collapsing them is what produced the v0.15.55 bug in the first place.
+  static constexpr uint64_t MIN_CLASSIFIED_NS    = 2ull * 1000 * 1000 * 1000;  // 2 s
+  static constexpr double   MIN_CLASSIFIED_SHARE = 0.25;                       // 25% of the run
   static constexpr double  SINK_BUSY     = 0.55;  // v0.14.52 sink-freeze threshold
   static constexpr double  SOURCE_BUSY   = 0.85;  // [READER] "reader saturated" threshold
   static constexpr double  SOURCE_BLOCKED_MAX = 0.05;
