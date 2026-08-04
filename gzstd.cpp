@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.55";
+static constexpr const char * GZSTD_VERSION = "0.15.57";
 //
 // Architecture overview:
 //
@@ -350,6 +350,12 @@ static const double ADAPT_BACKEND_MIN_SEC = 4.0;
 // Threads park by INDEX: thread k participates iff k < want().  Parking is
 // checked before a work item is claimed and before any buffer is acquired, so a
 // parked reader holds nothing and cannot wedge the readers still running.
+// True when the governor's published regime is SOURCE_BOUND.  Declared here and
+// defined below with AdaptRegime/g_adapt_regime, so ReaderPoolCtl (which sits
+// far above them) can consume the regime as a published global — the same way
+// every other --adapt acting site does, with no governor->worker pointer.
+static bool adapt_regime_is_source_bound();
+
 class ReaderPoolCtl {
 public:
   ReaderPoolCtl(int base, int floor, int ceil, int seed)
@@ -381,6 +387,36 @@ public:
   template <typename DoneFn>
   void supervise(DoneFn && done)
   {
+    // WHEN THIS CONTROLLER IS ALLOWED TO STEP AT ALL.
+    //
+    // Its objective is READER throughput (bytes_), and that is only the right
+    // thing to maximise when the reader is what the pipeline is waiting on.  If
+    // the run is compute- or sink-bound, extra reader threads still raise reader
+    // throughput — they just take CPU from the workers and buffer further ahead
+    // — so the signal ANTI-CORRELATES with end-to-end time and the search
+    // ratchets to its ceiling.  Measured on a 24-thread Gen3 box, warm (a
+    // compute-bound run at ~6.97 GiB/s): the controller walked 3 -> 4 -> 6 -> 9,
+    // pinned there and persisted 9, while a fixed sweep put the optimum at 3
+    // (median-of-7: 5.22 s at 3 vs 5.35 s at 9, non-overlapping distributions).
+    // A confirm-window was tried first and did NOT help, which is the evidence
+    // that this is not noise: the gain at each step is real, it is just a gain
+    // in the wrong quantity.
+    //
+    // Every other --adapt action already gates on the published regime; this one
+    // did not, and it is the only one whose metric can improve while the run
+    // gets slower.
+    //
+    //   regime at tick   probing?  -> action
+    //   ---------------  --------  ------------------------------------------
+    //   WARMUP           any          hold (nothing classified yet)
+    //   SOURCE_BOUND     any          step/judge as normal — reader IS the wall
+    //   COMPUTE_BOUND    no           hold at the current size
+    //   SINK_BOUND       no           hold at the current size
+    //   COMPUTE/SINK     yes          revert the in-flight step, then hold
+    //
+    // Holding (rather than reverting to base) is deliberate: a size reached
+    // while genuinely source-bound was earned, and a run that later becomes
+    // compute-bound has not shown it to be wrong.
     uint64_t prev_b = 0; auto prev_t = std::chrono::steady_clock::now();
     double pre_rate = 0.0; int probe_from = 0, dir = +1, rounds = 0;
     bool probing = false, dir_exhausted = false;
@@ -398,6 +434,22 @@ public:
       const double rate = dt > 0 ? double(b - prev_b) / dt : 0.0;
       prev_b = b; prev_t = now;
       if (rate <= 0.0 || rounds >= ADAPT_RD_MAX_ROUNDS) continue;
+
+      // Regime gate — see the table above.  Only step while the reader is the
+      // thing the pipeline is waiting on; otherwise reader throughput is not a
+      // proxy for run time and climbing it makes the run slower.
+      if (!adapt_regime_is_source_bound()) {
+        if (probing) {
+          // A step is in flight that can no longer be judged fairly (the window
+          // that would grade it is not source-bound).  Undo it rather than let
+          // stop() persist a speculative size, and do not count a round: nothing
+          // was learned.
+          set_want(probe_from);
+          probing = false;
+          probing_.store(false, std::memory_order_relaxed);
+        }
+        continue;
+      }
 
       if (!probing) {
         const int cur = want();
@@ -2253,6 +2305,12 @@ static const char * adapt_regime_name(AdaptRegime r)
 // (int)AdaptRegime, stored on every transition, reset at governor start.
 // 0 (WARMUP) doubles as "no governor running" — actions treat it as inert.
 static std::atomic<int> g_adapt_regime{0};
+
+static bool adapt_regime_is_source_bound()
+{
+  return g_adapt_regime.load(std::memory_order_relaxed)
+           == (int)AdaptRegime::SOURCE_BOUND;
+}
 
 // Actions the governor's regime triggered this operation, as a bitmask —
 // set by the acting sites (GPU workers etc.), consumed by print_summary

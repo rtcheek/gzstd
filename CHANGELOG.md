@@ -1,9 +1,36 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.55  
+**Covers:** v0.9.50 → v0.15.57  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+## v0.15.57 — the reader-pool controller climbed the wrong quantity
+
+Found by the first execution of the reader controller's low-core range. `n_readers` starts at `max(3, min(12, threads/8))`, so a 24-thread box runs the controller in **1–9 starting at 3**, a band that does not overlap the server's 6–32 at the bottom and had never been exercised.
+
+**It ratcheted to its ceiling and persisted the result.** Across runs it walked 3 → 4 → 6 → 9, pinned there, and wrote `read_threads_settled: 9` into the profile to seed every later run — while a fixed sweep put the optimum at **3**. Warm, median-of-7, the distributions do not overlap:
+
+| readers | samples | median |
+|---|---|---|
+| **3** | 5.20 5.22 5.22 5.22 5.23 5.24 5.28 | **5.22 s** |
+| 9 | 5.33 5.34 5.34 5.35 5.35 5.38 5.40 | 5.35 s |
+
+**The cause is not noise, and proving that mattered.** The first fix attempted was a confirm-window — a step had to clear the 5% margin in two consecutive windows before being kept. It changed nothing; the climb was identical. That is the evidence that each step's measured gain is *real*: the controller maximises **reader** throughput, and on a pipeline that is not reader-bound, extra reader threads genuinely do raise reader throughput — by taking CPU from the workers and buffering further ahead. The signal anti-correlates with run time. Warm on this box the pipeline is compress-bound at ~6.97 GiB/s (saturating by `-T 16`) and the buffered pool is memory-bandwidth-capped near 5.7 GiB/s, so readers 1→16 span only ~4% and none of it is the reader's to win.
+
+The controller now gates on the governor's published regime, stepping only while `SOURCE_BOUND` and reverting an in-flight probe if the regime leaves it. **It was the only `--adapt` acting site that did not consult the regime** — the others already did — and it is the only one whose metric can improve while the run gets slower. A size reached while genuinely source-bound is held rather than reverted to base: it was earned, and a later compute-bound stretch has not shown it wrong. Verified: warm now holds 3 across five runs and persists 3.
+
+**No automated test covers this, and that is a real gap.** The controller only supervises while the reader is actually running, so exercising it needs a multi-GiB input held under active read for several seconds — the suite's fixtures finish in well under a tick. Forcing a regime with `GZSTD_DEBUG_ADAPT_REGIME` is deterministic but produces no reader-pool activity at that size, so the hook alone cannot stand in. The fix is verified by measurement instead (warm: holds 3 across five consecutive runs and persists 3, where the previous build walked to 9 every time; cold: still engages and steps), which is weaker than a regression test and should be treated as such.
+
+**Scope, stated honestly:** this stops the controller doing harm, but its reach depends on the regime classifier, and that classifier is under-reporting I/O-bound in at least two measured cases (see the new ROADMAP row — a cold read with `[READER] io 105.7%, blocked 0.0%, "reader saturated"` still recorded 89% compute-bound). Where a genuinely reader-bound run is misclassified, the controller now correctly stands down but also cannot help. That is a separate defect, upstream of this one, and deliberately not bundled.
+
+Also established, and not previously verified on such a machine: the code's claim that the reader optimum is **3 on a 24-thread box** is correct, and the residency inversion holds on Gen3 hardware — warm mmap 6.91 GiB/s beats buffered 5.74, while cold the order reverses to buffered 0.83 > mmap 0.79 > O_DIRECT 0.70 GiB/s.
+
+A measurement caveat worth recording with those numbers: the source drive used for the cold cells is linked at **PCIe Gen1** (2.5 GT/s against a Gen3-capable link, confirmed stuck under sustained load), capping cold reads at 866 MB/s. The *relative* ordering above is sound — every config met the same wall — but the absolute cold figures are not representative, and a first cold reader sweep was invalidated outright by it (1 reader tied 12 purely because the device, not the reader, was the constraint).
+
+Suites at v0.15.57: **366/366 default, 499/499 extensive, 285 passed + 70 skipped CPU-only.**
 
 ---
 
