@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.65";
+static constexpr const char * GZSTD_VERSION = "0.15.66";
 //
 // Architecture overview:
 //
@@ -6403,7 +6403,26 @@ public:
     // (leaked slots starve the reader's acquire() and wedge the teardown).
     if (done_) { t.release_input(); return; }
     queued_bytes_ += t.data.size();
-    q_.push_back(std::move(t));
+    // KEEP THE DEQUE SORTED BY SEQ — this is the invariant everything
+    // downstream rests on: the FrameThrottle's deadlock-freedom argument
+    // ("the frame the writer needs next is always among the oldest in-flight
+    // frames", see re_enqueue), the per-worker output pools, and the GPU
+    // batchers that pop from the front.  A SINGLE reader made it true for free,
+    // which is why it was only ever stated, never enforced.
+    //
+    // The MULTI-READER pooled reader does not: readers race, so seq k can be
+    // pushed after k+8.  Workers pop from the front, so they can consume every
+    // throttle permit on frames the writer cannot use yet while k waits in the
+    // queue — the writer never advances, never releases a permit, and k is
+    // never popped.  Classic circular wait; measured as a hard hang at >=9
+    // readers on a warm source (v0.15.65).
+    //
+    // Insert from the BACK: arrival is near-sorted (inversion is bounded by the
+    // reader count), so this is O(1) amortised, and exactly O(1) for the
+    // single-reader, stdin and re-enqueue paths that were already ordered.
+    auto it = q_.end();
+    while (it != q_.begin() && (it - 1)->seq > t.seq) --it;
+    q_.insert(it, std::move(t));
     ++total_tasks_;
     cv_.notify_all();      // wake all GPU workers waiting in wait_for_batch_or_cap
     cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
@@ -9206,34 +9225,37 @@ static void cpu_worker(
   for (auto & b : out_pool) b = std::make_shared<FrameVec>();
   uint64_t pool_wait_count = 0;
 
+  // OVERDRAFT, NEVER BLOCK — this pool is a per-worker RECYCLING CACHE, not a
+  // budget.  The FrameThrottle permits are the real global bound on in-flight
+  // frames (a worker acquires one before popping and the WRITER releases it
+  // after the frame is written), so handing back a fresh buffer when every slot
+  // is busy cannot push peak memory above what the permits already allow.  It
+  // only costs an allocation, and only in the case that used to wedge.
+  //
+  // Blocking here was a circular wait.  The old argument — stated at the other
+  // three pools too — was "frames are pushed in seq order, so the writer always
+  // has the oldest in-flight frame to write, drains it, and frees a slot".  The
+  // MULTI-READER pooled reader broke that premise: readers race, so frames reach
+  // the queue OUT OF seq order, and a worker can end up holding all `pool_size`
+  // slots with frames that sort AFTER the one it is now trying to emit.  That
+  // frame is precisely the one the writer needs next, so the writer never
+  // advances, never frees a slot, and the worker waits forever.
+  //
+  // Measured (v0.15.65, 24-thread box, warm 32 GiB, --cpu-only): >=9 readers
+  // wedged ~20-25% of runs with every thread in futex_wait; 3 readers never did;
+  // a 10x larger pool never did; and shrinking the pool to 2 slots raised it to
+  // 3/5.  Scaling with POOL SIZE, not reader count, is the signature of this
+  // cycle rather than of reader backpressure.
   auto acquire_out_buf = [&]() -> FrameBuf {
-    while (true) {
-      // Abandoned pass (GPU fault, or an exception unwinding out of the reader
-      // region): the writer has stopped draining, so no slot will ever free —
-      // return any buffer; the caller exits at the next loop top.  Both causes
-      // must be honoured here, not just the GPU one: on the unwind path the
-      // ThreadGuard joins these workers, so a worker parked for a slot that the
-      // departed writer can no longer return deadlocks the teardown itself.
-      if (run_abandoned()) return out_pool[0];
-      for (auto & b : out_pool) {
-        if (b.use_count() == 1) return b;
-      }
-      ++pool_wait_count;
-      // Wait on the writer's drain signal instead of sched_yield.
-      // Predicate checks for a free slot — wait_for() re-checks after
-      // wake, so a single notify_all is sufficient even if 96 workers
-      // race for ~5 slots.  The 10ms timeout in wait_for_drain is a
-      // safety net for any missed notify.
-      if (bp) {
-        bp->wait_for_drain([&]{
-          if (run_abandoned()) return true;
-          for (auto & b : out_pool) if (b.use_count() == 1) return true;
-          return false;
-        });
-      } else {
-        std::this_thread::yield();  // no throttle → fall back to yield
-      }
+    // Abandoned pass (GPU fault, or an exception unwinding out of the reader
+    // region): the writer has stopped draining.  Hand back any slot; the caller
+    // exits at the next loop top.
+    if (run_abandoned()) return out_pool[0];
+    for (auto & b : out_pool) {
+      if (b.use_count() == 1) return b;
     }
+    ++pool_wait_count;                     // now: overdrafts (pool misses)
+    return std::make_shared<FrameVec>();
   };
   while (true) {
     if (run_abandoned()) break;  // fault or unwind: abort without draining the queue
@@ -9421,7 +9443,7 @@ static void cpu_worker(
          << " in=" << in_s << " out=" << out_s
          << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
          << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s"
-         << " pool=" << pool_size << " waits=" << pool_wait_count;
+         << " pool=" << pool_size << " ovf=" << pool_wait_count;
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
   }
@@ -9484,25 +9506,18 @@ static void cpu_decomp_worker(
   for (auto & b : decomp_pool) b = std::make_shared<FrameVec>();
   uint64_t pool_wait_count = 0;  // telemetry — # of yields at -vv
 
+  // OVERDRAFT, NEVER BLOCK — see the identical note on the compress worker's
+  // out_pool.  Same cycle, and decompress is MORE exposed: its prefetch reader
+  // pool is adaptive and climbs well past the compress default (12 -> 18), so
+  // out-of-order arrival is the norm rather than the exception here.  Waiting on
+  // a per-worker recycling cache is a circular wait against the in-order writer;
+  // the FrameThrottle permits remain the real bound on in-flight frames.
   auto acquire_decomp_buf = [&]() -> FrameBuf {
-    while (true) {
-      for (auto & b : decomp_pool) {
-        if (b.use_count() == 1) return b;  // only ref is ours; safe to reuse
-      }
-      // All slots in flight — writer hasn't drained any yet.  Wait on
-      // the writer's drain signal (see FrameThrottle::wait_for_drain),
-      // not sched_yield — yielding 96 workers in lockstep burned ~50s
-      // of sys time on the v0.13.9 256-core decompress runs.
-      ++pool_wait_count;
-      if (bp) {
-        bp->wait_for_drain([&]{
-          for (auto & b : decomp_pool) if (b.use_count() == 1) return true;
-          return false;
-        });
-      } else {
-        std::this_thread::yield();  // no throttle → fall back to yield
-      }
+    for (auto & b : decomp_pool) {
+      if (b.use_count() == 1) return b;    // only ref is ours; safe to reuse
     }
+    ++pool_wait_count;                     // now: overdrafts (pool misses)
+    return std::make_shared<FrameVec>();
   };
 
   while (true) {
@@ -9809,7 +9824,7 @@ static void cpu_decomp_worker(
          << " comp=" << in_s << " decomp=" << out_s
          << " time=" << std::fixed << std::setprecision(2) << st.comp_ms << "ms"
          << " thr=" << std::fixed << std::setprecision(2) << thr_gib << " GiB/s"
-         << " pool=" << pool_size << " waits=" << pool_wait_count;
+         << " pool=" << pool_size << " ovf=" << pool_wait_count;
       vlog(V_DEBUG, *opt, os.str() + "\n");
     }
   }
@@ -16990,33 +17005,32 @@ struct StreamCtx {
   // it) instead of a fresh make_shared per frame.  Compress output is the
   // *compressed* bytes (smaller than decomp), so fault pressure is lower, but
   // the pool still removes the per-frame allocation churn.  Grows lazily to a
-  // cap; deadlock-free by the throttle FIFO argument (frames pushed in seq
-  // order, writer drains the oldest and frees a slot).
+  // cap.  NOT deadlock-free by the old "throttle FIFO argument" (frames pushed
+  // in seq order, writer drains the oldest and frees a slot) — the multi-reader
+  // pooled reader pushes out of seq order, so acquire_out_buf OVERDRAFTS past
+  // the cap instead of waiting.  See its body.
   std::vector<FrameBuf> out_pool;
   uint64_t out_pool_waits = 0;
   FrameBuf acquire_out_buf(size_t cap, FrameThrottle * bp) {
-    for (;;) {
-      // GPU-fault abort: the writer stops draining, so pool slots may never
-      // free — hand back any slot (output is discarded) instead of wedging
-      // the drain thread and blocking the worker's teardown join.
-      if (g_gpu_aborted.load(std::memory_order_relaxed))
-        return out_pool.empty() ? std::make_shared<FrameVec>() : out_pool[0];
-      for (auto & b : out_pool)
-        if (b.use_count() == 1) return b;
-      if (out_pool.size() < cap) {
-        out_pool.push_back(std::make_shared<FrameVec>());
-        return out_pool.back();
-      }
-      ++out_pool_waits;
-      if (bp) {
-        bp->wait_for_drain([&]{
-          for (auto & b : out_pool) if (b.use_count() == 1) return true;
-          return false;
-        });
-      } else {
-        std::this_thread::yield();
-      }
+    (void)bp;
+    // GPU-fault abort: the writer stops draining, so pool slots may never
+    // free — hand back any slot (output is discarded) instead of wedging
+    // the drain thread and blocking the worker's teardown join.
+    if (g_gpu_aborted.load(std::memory_order_relaxed))
+      return out_pool.empty() ? std::make_shared<FrameVec>() : out_pool[0];
+    for (auto & b : out_pool)
+      if (b.use_count() == 1) return b;
+    if (out_pool.size() < cap) {
+      out_pool.push_back(std::make_shared<FrameVec>());
+      return out_pool.back();
     }
+    // Past the cap: OVERDRAFT rather than wait.  The cap is a recycling target,
+    // not a memory budget (the throttle permits are), and blocking on it is a
+    // circular wait against the in-order writer — see the compress worker's
+    // out_pool note.  The "pushed in seq order" premise above does not hold once
+    // frames reach the queue from a multi-reader pooled reader.
+    ++out_pool_waits;                      // now: overdrafts (pool misses)
+    return std::make_shared<FrameVec>();
   }
 
   // (Per-stream EXPLORE/REFINE/SETTLE batch-size tuner removed v0.13.34: it was
@@ -19809,23 +19823,19 @@ static void gpu_decomp_worker(
     // ascending seq order, so the writer always has the oldest in-flight frame
     // to write, drops its ref after writing, and frees a slot.
     FrameBuf acquire_out_buf(size_t cap, FrameThrottle * bp) {
-      for (;;) {
-        for (auto & b : out_pool)
-          if (b.use_count() == 1) return b;
-        if (out_pool.size() < cap) {
-          out_pool.push_back(std::make_shared<FrameVec>());
-          return out_pool.back();
-        }
-        ++out_pool_waits;
-        if (bp) {
-          bp->wait_for_drain([&]{
-            for (auto & b : out_pool) if (b.use_count() == 1) return true;
-            return false;
-          });
-        } else {
-          std::this_thread::yield();
-        }
+      (void)bp;
+      for (auto & b : out_pool)
+        if (b.use_count() == 1) return b;
+      if (out_pool.size() < cap) {
+        out_pool.push_back(std::make_shared<FrameVec>());
+        return out_pool.back();
       }
+      // Past the cap: OVERDRAFT rather than wait — see the compress worker's
+      // out_pool note.  The ascending-seq premise stated above holds only WITHIN
+      // one stream; the writer needs the global minimum unwritten seq, which may
+      // be the very frame a blocked worker is trying to emit.
+      ++out_pool_waits;                    // now: overdrafts (pool misses)
+      return std::make_shared<FrameVec>();
     }
 
     void free_device() {

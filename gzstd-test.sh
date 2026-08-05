@@ -3769,6 +3769,35 @@ else
   fail "--adapt --tar create wakes parked readers at work exhaustion"
 fi
 
+# 4. MULTI-READER out-of-order pushes vs the in-order writer (fixed v0.15.66).
+#    Several readers race, so frames reached the queue out of seq order and broke
+#    the invariant the FrameThrottle's deadlock-freedom rests on ("the frame the
+#    writer needs next is always among the oldest in-flight frames").  Two cycles
+#    followed: workers spent every permit on frames the writer could not use yet
+#    while the frame it needed sat deeper in the deque, and a worker could fill
+#    its whole per-worker output pool with frames that sort AFTER the one it was
+#    trying to emit.  Both wedged permanently, all threads in futex_wait.
+#    Found in the field as a warm 32 GiB compress at >=9 readers hanging ~20-25%
+#    of runs; this is the compact, deterministic form of the same thing.
+#    The knobs matter: a WARM source (readers outrun the sink, so the buffer pool
+#    stays saturated), MANY readers (deep inversion), a SMALL throttle budget
+#    (scarce permits AND a 2-slot per-worker pool) and a SMALL chunk (many
+#    frames).  Verified 5/5 hangs on the pre-fix binary, 0/5 after.
+yes "the quick brown fox jumps over the lazy dog 0123456789" \
+  | head -c 134217728 > "$TMPDIR/lv4.bin" 2>/dev/null
+cat "$TMPDIR/lv4.bin" > /dev/null            # warm: the precondition, not incidental
+if timeout 120 "$GZSTD" --cpu-only --no-direct-read --no-mmap --read-threads 12 \
+     --throttle-frames=8 --chunk-size 1 -f -o "$TMPDIR/lv4.zst" "$TMPDIR/lv4.bin" \
+     >/dev/null 2>&1 \
+   && [ -s "$TMPDIR/lv4.zst" ] \
+   && timeout 120 "$GZSTD" -d -f -o "$TMPDIR/lv4.out" "$TMPDIR/lv4.zst" >/dev/null 2>&1 \
+   && cmp -s "$TMPDIR/lv4.bin" "$TMPDIR/lv4.out"; then
+  pass "multi-reader out-of-order frames do not wedge the in-order writer"
+else
+  fail "multi-reader out-of-order frames do not wedge the in-order writer"
+fi
+rm -f "$TMPDIR/lv4.bin" "$TMPDIR/lv4.zst" "$TMPDIR/lv4.out"
+
 rm -rf "$TMPDIR/lv" "$TMPDIR/lv2" "$TMPDIR"/lv*.tar.zst
 
 section "--adapt reader pool controller (measured sizing)"

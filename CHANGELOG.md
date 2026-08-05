@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.65  
+**Covers:** v0.9.50 → v0.15.66  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,25 @@
 ---
 
 
+## v0.15.66 — multiple readers had quietly broken the invariant everything else assumed
+
+v0.15.65 owed one test to the low-core box: does the new measured-noise-floor gate over-suppress where the real differences are small and the distributions tight? It does not — the floor measures **1.028-1.115x there against the 256-core box's 1.16-1.27x**, it self-calibrates exactly as designed, and all five runs probed both directions and correctly settled on 3. Re-running the sweep to establish that, however, wedged for 100 minutes on a three-second job.
+
+**`--cpu-only` compress of a WARM source with >=9 pooled readers deadlocks permanently**, ~20-25% of runs, every thread in `futex_wait`. Cold never does: the device is slower than compression, so the buffer pool never saturates. Warm reads run at 12-15 GiB/s against a ~2.8 GiB/s sink and the pool sits pinned at its limit, which is the precondition. This went unseen because `n_readers = max(3, min(12, hw/8))` is **3** on a 24-thread box — below the threshold. **On a 256-thread box it is 12, so that machine runs the default path inside the failing range**, in the mode its own A/B calls fastest for compress.
+
+**One false premise, stated in four places and enforced in none:** *"frames are pushed in seq order, so the writer always has the oldest in-flight frame to write, drains it, and frees a slot."* A single reader made that true for free, which is why it was only ever asserted. The multi-reader pooled reader races, so seq k can be pushed after k+8 — and two independent circular waits follow.
+
+**Cycle A, the per-worker output pool.** `out_pool` is a fixed per-worker partition of the throttle budget (`budget / n_workers` = 4 slots) whose slots are freed only by the in-order writer. A worker pops 100-103, fills all four, then pops 95 — and needs a fifth slot for the very frame the writer is waiting on. The wait is circular *inside one worker*. Fixed by making all four such pools (compress worker, decompress worker, both GPU-path ones) **overdraft rather than block**: allocate a fresh buffer when no slot is free. Safe because the FrameThrottle permits, not the pool, are the real global bound on in-flight frames — the pool is a recycling cache, and treating it as a budget is what deadlocked.
+
+**Cycle B, the throttle permits — and the first fix missed it.** Workers take a permit *before* popping and pop from the front, so they can spend every permit on frames > k while k sits deeper in the out-of-order deque; the writer never advances, so no permit is ever returned. `TaskQueue::re_enqueue` already describes this exact wait and defends its own path with `push_front`. Fixed at the source instead of hardening each consumer: **`TaskQueue::push` now inserts sorted by seq**, scanning from the back — arrival is near-sorted, so it is O(1) amortised and exactly O(1) for the single-reader, stdin and re-enqueue paths that were already ordered.
+
+**Cycle B is the reason to distrust a clean default-configuration result.** With only the pool fix, the defaults looked perfect — 0/15 at 9 readers, 0/10 at 12 — while `--throttle-frames=44` (two slots per worker) still hung 1/10. That harsher cell is the only thing that exposed the second cycle.
+
+**After both fixes: 0 hangs in 72 runs**, including 0/25 on the cell that survived the first fix, 0/8 at 16 readers, and 0/6 with the throttle disabled entirely. Round trip byte-identical on both builds. No cost: cold compress 14.12 s median, identical to v0.15.65; warm 9 readers 3.26 s against 3.31 s before. Suites 370/502/288 green.
+
+A timeout-guarded regression test covers it (128 MiB warm, 12 readers, `--throttle-frames=8 --chunk-size 1`): **5/5 hangs on the pre-fix binary, 0/5 after.** `RescueQueue` pushes unsorted too — same shape, but it is a low-volume GPU-failure fallback and was deliberately left alone.
+
+---
 ## v0.15.65 — the reader controller was grading noise, and now measures the noise first
 
 v0.15.64 left an open question: the reader objective is not unimodal on the low-core box (a valley at 2 hides the optimum at 1), and the fix was to be judged here, where the range is 6-32 from a start of 12. Mapping the curve here answered a different question instead.
