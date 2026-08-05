@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.64";
+static constexpr const char * GZSTD_VERSION = "0.15.65";
 //
 // Architecture overview:
 //
@@ -434,8 +434,40 @@ public:
     // while genuinely source-bound was earned, and a run that later becomes
     // compute-bound has not shown it to be wrong.
     uint64_t prev_b = 0; auto prev_t = std::chrono::steady_clock::now();
-    double pre_rate = 0.0; int probe_from = 0, dir = +1, rounds = 0;
+    double pre_rate = 0.0, req_ratio = ADAPT_RD_MARGIN;
+    int probe_from = 0, dir = +1, rounds = 0;
     bool probing = false, dir_exhausted = false;
+    // NOISE FLOOR, measured on this run rather than assumed.
+    //
+    // A probe is judged by comparing ONE 250 ms window against ONE earlier
+    // window.  Whether a 5% difference between them means anything depends
+    // entirely on how much consecutive windows of the SAME configuration
+    // already differ, and that varies enormously by regime.  Measured on the
+    // 256-core box, cold buffered 32 GiB: consecutive baseline windows at a
+    // fixed reader count came in at 3.561 and 4.121 GiB/s — 16% apart with
+    // nothing changed — while a fixed sweep put every count from 6 to 32 within
+    // ~10% of each other.  The fixed 5% margin is far below that floor, so the
+    // controller was grading noise: five identical runs settled at 12,12,6,12,12
+    // and the SAME settled value produced 3.14 and 2.57 GiB/s.  In the
+    // copy-bound regime the picture inverts — baseline windows are tight (±3-5%)
+    // and real differences are 160% — so a fixed margin is far too STRICT to be
+    // the only rule there either.
+    //
+    // So: remember the recent baseline windows and require a step to beat the
+    // spread they already show.  Where the signal is clean the gate stays at the
+    // 5% floor and the controller still finds a real 2.6x win; where the signal
+    // is mush it demands more than the mush and the controller correctly does
+    // nothing.  Self-calibrating per machine AND per regime, which no constant
+    // can be.
+    constexpr int NR = 4;
+    double nring[NR] = {0,0,0,0}; int nring_n = 0;
+    auto noise_ratio = [&]() -> double {
+      const int have = std::min(nring_n, NR);
+      if (have < 3) return 1.0;                 // too few samples to claim a floor
+      double lo = nring[0], hi = nring[0];
+      for (int i = 1; i < have; ++i) { lo = std::min(lo, nring[i]); hi = std::max(hi, nring[i]); }
+      return (lo > 0.0) ? hi / lo : 1.0;
+    };
     for (;;) {
       {
         std::unique_lock<std::mutex> lk(mx_);
@@ -450,6 +482,9 @@ public:
       const double rate = dt > 0 ? double(b - prev_b) / dt : 0.0;
       prev_b = b; prev_t = now;
       if (rate <= 0.0 || rounds >= ADAPT_RD_MAX_ROUNDS) continue;
+      // Baseline windows only: a probing window measures a DIFFERENT
+      // configuration and would inflate the estimated noise with real signal.
+      if (!probing) { nring[nring_n % NR] = rate; ++nring_n; }
 
       // Regime gate — see the table above.  Only step while the reader is the
       // thing the pipeline is waiting on; otherwise reader throughput is not a
@@ -499,14 +534,21 @@ public:
           dir = -dir; dir_exhausted = true; continue;
         }
         pre_rate = rate; probe_from = cur; probing = true;
+        req_ratio = std::max((double)ADAPT_RD_MARGIN, noise_ratio());
         probe_from_.store(cur, std::memory_order_relaxed);
         probing_.store(true, std::memory_order_relaxed);
         set_want(next);
+        if (rd_ctl_trace_on()) {
+          char nb[96];
+          std::snprintf(nb, sizeof nb, "[RD-CTL] noise floor %.3fx -> need %.3fx\n",
+                        noise_ratio(), req_ratio);
+          std::fputs(nb, stderr);
+        }
         trace("probe", cur, next, rate, 0.0, rounds);
       } else {
         probing = false; ++rounds;
         probing_.store(false, std::memory_order_relaxed);
-        if (rate > pre_rate * ADAPT_RD_MARGIN) { dir_exhausted = false;
+        if (rate > pre_rate * req_ratio) { dir_exhausted = false;
           trace("KEEP", probe_from, want(), rate, pre_rate, rounds);
         }
         else {
@@ -544,11 +586,15 @@ private:
   // directions and correctly rejected them" from "never probed at all" — they
   // print identically when the search returns to base.  Reading that difference
   // is the whole diagnostic.
+  static bool rd_ctl_trace_on()
+  {
+    static const bool on = ::getenv("GZSTD_DEBUG_RD_CTL") != nullptr;
+    return on;
+  }
   static void trace(const char * what, int from, int to,
                     double rate, double pre, int rounds)
   {
-    static const bool on = ::getenv("GZSTD_DEBUG_RD_CTL") != nullptr;
-    if (!on) return;
+    if (!rd_ctl_trace_on()) return;
     char was[48] = "";
     if (pre > 0) std::snprintf(was, sizeof was, " (was %.3f)", pre / 1073741824.0);
     std::fprintf(stderr, "[RD-CTL] %-6s %d -> %d  rate %.3f GiB/s%s  round %d\n",

@@ -1,12 +1,26 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.64  
+**Covers:** v0.9.50 → v0.15.65  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.15.65 — the reader controller was grading noise, and now measures the noise first
+
+v0.15.64 left an open question: the reader objective is not unimodal on the low-core box (a valley at 2 hides the optimum at 1), and the fix was to be judged here, where the range is 6-32 from a start of 12. Mapping the curve here answered a different question instead.
+
+**On this box there is no hill to climb — only noise.** Cold buffered 16 GiB, median-of-5: readers 6 → 2.90 (2.79-3.09), 9 → 2.59 (2.56-3.20), 12 → 2.70 (2.64-3.27). The ranges overlap almost entirely, and a first median-of-3 pass had reported a confident "peak at 9" of 3.29 GiB/s that simply evaporated with more samples. Five identical `--adapt` runs settled at 12, 12, 6, 12, 12 — and the *same* settled value of 12 produced 3.14 and 2.57 GiB/s, a 22% spread that the reader count cannot explain.
+
+**The mechanism, from `GZSTD_DEBUG_RD_CTL=1`:** a probe is graded by comparing one 250 ms window against one earlier window, against a fixed 5% margin. Consecutive *baseline* windows at an unchanged reader count came in at 3.561 and 4.121 GiB/s — **16% apart with nothing changed**. The margin sat far below the floor, so `KEEP 12 -> 11 rate 3.683 (was 3.248)` recorded a 13% "win" between two counts a median-of-5 says are identical.
+
+**So the gate now measures the floor instead of assuming it.** The last four baseline windows are kept, and a step must beat the spread they already show — `max(5%, observed spread)`. Where the signal is clean the gate stays at the 5% floor; where it is mush it demands more than the mush. Self-calibrating per machine *and* per regime, which no constant can be. Verified cold: the controller now measures a 1.16-1.27x floor, raises the bar to match, and **holds at 12 across three runs** instead of wandering. `GZSTD_DEBUG_RD_CTL=1` prints the floor and the requirement it produced.
+
+**What this does not do**, stated plainly: it is verified only for the *suppression* half. The other half — that a genuinely structured objective still gets found — cannot be shown here, because the one regime on this box with a large real effect (copy-bound, warm, sink removed: 3 → 5.72 vs 16 → 16.23 GiB/s) never reaches the controller at all. The v0.15.61 regime gate correctly holds there, since at the default 12 that run is compute-bound. **The low-core box is where the suppression could over-fire**, because its real differences were 6-17% with tight distributions. That is the test this change still owes.
+
+---
 ## v0.15.64 — the reader search was right, and still could not reach the answer
 
 **`GZSTD_DEBUG_RD_CTL=1` prints one line per reader-controller decision.** The teardown
