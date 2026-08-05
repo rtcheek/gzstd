@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=369
-$EXTENSIVE && EXPECTED_TESTS=502
+EXPECTED_TESTS=370
+$EXTENSIVE && EXPECTED_TESTS=503
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================

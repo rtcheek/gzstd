@@ -22,7 +22,7 @@ v0.15.65 owed one test to the low-core box: does the new measured-noise-floor ga
 
 **Cycle B is the reason to distrust a clean default-configuration result.** With only the pool fix, the defaults looked perfect — 0/15 at 9 readers, 0/10 at 12 — while `--throttle-frames=44` (two slots per worker) still hung 1/10. That harsher cell is the only thing that exposed the second cycle.
 
-**After both fixes: 0 hangs in 72 runs**, including 0/25 on the cell that survived the first fix, 0/8 at 16 readers, and 0/6 with the throttle disabled entirely. Round trip byte-identical on both builds. No cost: cold compress 14.12 s median, identical to v0.15.65; warm 9 readers 3.26 s against 3.31 s before. Suites 370/502/288 green.
+**After both fixes: 0 hangs in 72 runs**, including 0/25 on the cell that survived the first fix, 0/8 at 16 readers, and 0/6 with the throttle disabled entirely. Round trip byte-identical on both builds. No cost: cold compress 14.12 s median, identical to v0.15.65; warm 9 readers 3.26 s against 3.31 s before. Suites **370 / 503 / 289 + 70 skipped**, green on both build configurations.
 
 A timeout-guarded regression test covers it (128 MiB warm, 12 readers, `--throttle-frames=8 --chunk-size 1`): **5/5 hangs on the pre-fix binary, 0/5 after.** `RescueQueue` pushes unsorted too — same shape, but it is a low-volume GPU-failure fallback and was deliberately left alone.
 
