@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.68";
+static constexpr const char * GZSTD_VERSION = "0.15.69";
 //
 // Architecture overview:
 //
@@ -674,6 +674,12 @@ struct Options {
   //   V_TRACE(5)   = -vvv: per-chunk debug trace
   int verbosity = 2;         // V_DEFAULT
   bool force_progress = false; // --progress: show progress even when stderr is not a TTY
+  bool no_progress    = false; // --no-progress: suppress the meter unconditionally.
+                               // Needed as its own field: --no-progress used to
+                               // work by lowering DEFAULT verbosity to ERROR, so
+                               // `-v --no-progress` (in either order) left the
+                               // meter on — the flag was a no-op above default
+                               // verbosity, which is not what it says.
   bool cpu_only = false;
   bool gpu_only = false;
   bool hybrid = false;
@@ -1182,7 +1188,9 @@ static void print_help()
 "  --fast / --best     aliases for -1 / -19\n"
 "  --ultra             enable ultra levels (large window, more memory)\n"
 "\n"
-"Backend (auto: hybrid for compress; cpu-only for Gen3 decompress):\n"
+"Backend (auto is RUNTIME-DEPENDENT: small inputs and warm regular-file\n"
+"decompress go cpu-only; Gen<4 decompress goes cpu-only; otherwise hybrid.\n"
+"--adapt may override from the measured per-machine profile):\n"
 "  --cpu-only          CPU multithreaded, no GPU\n"
 "  --gpu-only          GPU only, no CPU workers\n"
 "  --hybrid            CPU + GPU\n"
@@ -1231,15 +1239,20 @@ static void print_help()
 "Integrity:\n"
 "  --verify            decompress-verify every frame while compressing; on any\n"
 "                      mismatch, rebuild CPU-only and retry until it verifies\n"
-"  --verify-retries N  cap verify rebuild attempts (0 = unlimited; default)\n"
+"  --verify-retries N  cap verify rebuild attempts (0 = unlimited; default).\n"
+"                      Implies --verify\n"
 "  --verify-engine E   verify on cpu|gpu|auto (gpu-only compress; auto = by\n"
-"                      PCIe generation)\n"
+"                      PCIe generation).  Implies --verify; falls back to CPU\n"
+"                      with a warning unless this is a --gpu-only compress\n"
 "  --keep-going        on -d, don't stop at a corrupt frame: recover what's\n"
-"                      readable, then report which file(s) are damaged\n"
+"                      readable, then report which file(s) are damaged.\n"
+"                      Implies --cpu-only and forces --read-threads 1\n"
 "\n"
 "Adaptive:\n"
 "  --adapt             adaptive governor: classify the run's bottleneck regime\n"
-"                      (source/compute/sink), report at -v; observe-only stage\n"
+"                      (source/compute/sink) and ACTIVELY TUNE reader pools,\n"
+"                      in-flight budget, writer parallelism, GPU batches and\n"
+"                      engine choice; persists verdicts per machine\n"
 "  --no-adapt          explicitly off (accepted now; default flip planned v1.0)\n"
 "  --no-profile        don't read or write the per-machine calibration profile\n"
 "  --calibrate         measure this machine's engine rates over generated data\n"
@@ -1270,10 +1283,15 @@ static void print_help_long()
 "\n"
 "Usage: gzstd [options] [file ...]\n"
 "\n"
-"gzstd is a drop-in-compatible replacement for the zstd CLI that can run\n"
+"gzstd accepts a useful subset of the zstd CLI for drop-in use, and can run\n"
 "compression and decompression simultaneously across CPU cores and one or\n"
 "more CUDA-capable GPUs.  It produces standard .zst files that can be read\n"
 "by any zstd implementation.\n"
+"\n"
+"Compatibility is NOT total: some zstd options are mapped, some are accepted\n"
+"and ignored silently, some warn, and dictionary/training options are not\n"
+"implemented at all.  See COMPATIBILITY OPTIONS near the end of this help for\n"
+"the exact classification of every one.\n"
 "\n"
 "With no file arguments (or file `-`), gzstd reads from stdin and writes\n"
 "to stdout.  Pipes are fully supported:\n"
@@ -1340,13 +1358,20 @@ static void print_help_long()
 "     compress, input with .zst stripped on decompress).\n"
 "\n"
 "  -f\n"
-"     Force overwrite.  Writes to `<output>.gzstd.tmp` then renames\n"
-"     atomically over the target.  On ext4 with large outputs the\n"
+"     Force overwrite.  Writes to a uniquely-named `<output>.gzstd.*.tmp`\n"
+"     in the same directory (created O_EXCL|O_NOFOLLOW, so it never\n"
+"     follows a pre-existing symlink and never shares an inode with a\n"
+"     concurrent writer), then renames atomically over the target.\n"
+"     On ext4 with large outputs the\n"
 "     rename can stall while the journal flushes dirty pages; use\n"
 "     --overwrite if that cost is unacceptable.\n"
 "\n"
 "  --overwrite\n"
-"     Force overwrite in place (truncate target, no tmp + rename).\n"
+"     Force overwrite without a temp file or rename.  An existing REGULAR\n"
+"     target is REMOVED and a new file is created at the same path — the\n"
+"     output is a NEW INODE, not the old one truncated.  Consequences:\n"
+"     hard links to the old inode keep the OLD content, and the old\n"
+"     inode's ownership/permissions/xattrs do not carry over.\n"
 "     Faster than -f on ext4 with large outputs, but NOT atomic: if\n"
 "     gzstd is killed mid-run the target is left corrupt/partial.\n"
 "     Implies -f.\n"
@@ -1373,8 +1398,10 @@ static void print_help_long()
 "     a clean shutdown but not guaranteed across power loss.\n"
 "\n"
 "  --verify\n"
-"     While compressing, independently decompress-verify every frame on\n"
-"     the CPU (the same round-trip as `gzstd -t`) using the XXH64\n"
+"     While compressing, independently decompress-verify every frame\n"
+"     (the same round-trip as `gzstd -t`) using the engine chosen by\n"
+"     --verify-engine — the CPU unless GPU verification is selected and\n"
+"     available for a --gpu-only compress — using the XXH64\n"
 "     (64-bit xxHash) content checksum each frame already carries.  zstd\n"
 "     — and gzstd by default — only WRITE that checksum; it is checked at\n"
 "     read time, never at creation.  That is fine for a CPU compressor\n"
@@ -1474,15 +1501,31 @@ static void print_help_long()
 "     --adapt=min#,max# also enables it, but the level bounds are\n"
 "     ignored with a warning (gzstd does not vary the level mid-stream).\n"
 "     PROFILE: a clean --adapt run of 3 s or longer records its measured\n"
-"     calibration (per-direction throughput, source/sink device rates,\n"
-"     settled GPU batch, dominant regime) to\n"
-"     ${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json, keyed by a\n"
-"     hardware fingerprint (CPU model + cores, GPU names, kernel).\n"
-"     Values merge as a running average, so drift converges over a few\n"
-"     runs; a GPU-fault run only counts the fault, never its rates.  The\n"
+"     calibration to ${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json, keyed\n"
+"     by a hardware fingerprint (CPU model + cores, GPU names, kernel).\n"
+"     Stored: per-direction throughput, source/sink device rates, backend\n"
+"     and residency verdicts with their stamps, input-domain rate,\n"
+"     reader-path rates and counts, the settled reader-pool count, writer\n"
+"     probe verdicts, extraction writer-pool sizes by workload class,\n"
+"     settled GPU batch, dominant regime, run and fault counts, and the\n"
+"     schema epoch plus the writing version.\n"
+"     Values merge as a 50/50 EMA (exponential moving average), so drift\n"
+"     converges over a few runs; a GPU-fault run only counts the fault,\n"
+"     never its rates.  A deliberate sub-floor backend probe may save only\n"
+"     an attempt stamp rather than a rate.  The\n"
 "     profile is a regenerable cache — corrupt or unreadable files are\n"
 "     ignored and rewritten.  --no-profile disables both reading and\n"
 "     writing (use it for honest benchmarks).\n"
+"\n"
+"  --calibrate\n"
+"     Measure this machine instead of processing input.  Runs generated\n"
+"     in-memory CPU and GPU compress AND decompress calibrations, prints\n"
+"     both directions, and records them to the profile.  Any input files\n"
+"     on the command line are NOT processed.\n"
+"     With `-o NEWFILE` (a path that does not exist) it also writes,\n"
+"     fsyncs, measures and then removes a scratch target, to calibrate the\n"
+"     sink rate of that filesystem.  --no-profile measures and prints\n"
+"     without saving.\n"
 "\n"
 "  --direct / --no-direct\n"
 "     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
@@ -1532,10 +1575,15 @@ static void print_help_long()
 "     wins.  The probe bytes are real work: nothing is read twice.  No\n"
 "     --adapt required, though --adapt additionally remembers the verdict\n"
 "     per machine so later runs skip the measurement.\n"
-"     It is skipped for a WARM input (mmap wins outright), on rotational\n"
-"     media, under --tar (where --direct-read has no effect at all), below\n"
-"     4 GiB, and whenever you pin a reader yourself.  --no-direct-read\n"
-"     pins it off; --direct-read forces it on and skips the measurement.\n"
+"     \"COLD\" here means MEASURED low page-cache residency, not the --cold\n"
+"     flag: --cold is a benchmarking evictor and it DISABLES this probe.\n"
+"     The probe is skipped for a WARM input (mmap wins outright), on\n"
+"     rotational media, under --tar (where --direct-read has no effect at\n"
+"     all), below 4 GiB, under --cold, and when --direct-read or\n"
+"     --no-direct-read pins the choice.\n"
+"     NOTE: --read-threads does NOT skip it.  That flag pins only the\n"
+"     BUFFERED arm; if O_DIRECT wins the comparison the remainder of the\n"
+"     file is read on its required SINGLE stream and your N has no effect.\n"
 "\n"
 "  --read-threads N    (default: 0 = auto)\n"
 "     Number of parallel reader threads for the BUFFERED input path.  A\n"
@@ -1544,9 +1592,13 @@ static void print_help_long()
 "     Applies to compress (the pooled reader — used when mmap is declined,\n"
 "     e.g. a >4 GiB input on a <6.4 kernel, or --no-mmap) and to\n"
 "     decompress (the parallel-prefetch frame reader), for seekable\n"
-"     regular-file inputs.  0 = auto: clamp(threads/8, 3, 12).  1 = force\n"
-"     a single reader.  Ignored for pipes and under --direct-read; a\n"
-"     seekable stdin redirect (gzstd < FILE) does use it.\n"
+"     regular-file inputs.  0 = auto: START at clamp(threads/8, 3, 12).\n"
+"     Under --adapt that is only a starting point — an unpinned pool is\n"
+"     measured and may contract to half the start or grow to as much as\n"
+"     min(3*start, 32), and a matching per-machine profile entry may seed\n"
+"     the starting count.  N > 0 PINS the buffered pool and disables that\n"
+"     search.  1 = force a single reader.  Ignored for pipes and under\n"
+"     --direct-read; a seekable stdin redirect (gzstd < FILE) does use it.\n"
 "     Unrelated to --direct-read beyond being mutually exclusive with it.\n"
 "\n"
 "  --cold    (default: off)\n"
@@ -1725,6 +1777,9 @@ static void print_help_long()
 "     Selects the SPARSE-file encoding only (the rest of the archive is\n"
 "     always ustar + GNU extensions).  posix, pax = PAX GNU.sparse.1.0\n"
 "     (default); gnu, oldgnu = legacy OLDGNU 'S'.  Inert without --sparse.\n"
+"     For CLI compatibility --format=zstd is accepted as a no-op, and\n"
+"     gzip, xz, lzma and lz4 are accepted with a warning and IGNORED —\n"
+"     gzstd always emits zstd.\n"
 "\n"
 "  --[no-]index (on create; default: on)\n"
 "     Append a member index to the archive so `-l --tar` lists it\n"
@@ -1838,10 +1893,26 @@ static void print_help_long()
 "     GPU is busy with other work.\n"
 "\n"
 "  --gpu-only\n"
-"     Force GPU-only.  Fails if no GPU is available or all GPUs fail\n"
-"     to initialize.  If a GPU faults mid-run, its output cannot be\n"
-"     trusted, so the whole archive is discarded and rebuilt CPU-only\n"
-"     from the original input.\n"
+"     Force GPU-only: no CPU compression workers during a healthy run.\n"
+"     CPU is still used for RESCUE/REBUILD after a GPU failure, and for\n"
+"     verification when --verify selects the CPU engine — \"no CPU\" is a\n"
+"     statement about the steady state, not a guarantee.\n"
+"     No GPU available (or all GPUs fail to initialise) is a USAGE error,\n"
+"     exit 2.  If a GPU faults mid-run its output cannot be trusted, so\n"
+"     the archive is discarded and rebuilt CPU-only from the original\n"
+"     input; when the input or output is a pipe/stream that cannot be\n"
+"     rewound and discarded, the run exits 5 instead.\n"
+"\n"
+"  NOTE — TUNING FLAGS IMPLY --hybrid.  Passing any GPU/hybrid tuning\n"
+"  option without an explicit --cpu-only / --gpu-only / --hybrid selects\n"
+"  --hybrid for you: --gpu-batch, --gpu-streams, --gpu-devices,\n"
+"  --gpu-mem-frac, --pinned / --no-pinned, --cpu-share, --cpu-batch,\n"
+"  --hybrid-floor and --hybrid-floor-factor.\n"
+"\n"
+"  NOTE — CPU-ONLY BUILD.  A binary built without nvCOMP ACCEPTS every\n"
+"  GPU/hybrid tuning option above and IGNORES it, so the same command line\n"
+"  works on both builds; a notice is printed only at -v.  --gpu-only is\n"
+"  the exception: it is rejected, because the request cannot be met.\n"
 "\n"
 "  --hybrid\n"
 "     Enable CPU + GPU scheduling (default when a GPU is present).\n"
@@ -1861,8 +1932,12 @@ static void print_help_long()
 " CPU TUNING\n"
 "============================================================\n"
 "  -T, --threads N\n"
-"     CPU worker threads.  0 = all cores, uncapped.  When -T is omitted\n"
-"     entirely, the default is all cores, capped at 96.\n"
+"     CPU worker threads.  N must be >= 0; every spelling (-T N, -TN,\n"
+"     -T=N, --threads N, --threads=N) rejects a negative value.\n"
+"     0 = all HARDWARE THREADS MINUS the cores reserved for gzstd's own\n"
+"     I/O threads, and it bypasses the automatic 96-worker cap.  It is not\n"
+"     literally uncapped: only --sliding-window uses every hardware thread.\n"
+"     When -T is omitted entirely, the default is all cores capped at 96.\n"
 "\n"
 "  --chunk-size N\n"
 "     Host I/O chunk size in MiB (default: 16).  Each independent\n"
@@ -1891,6 +1966,11 @@ static void print_help_long()
 "  --throttle-frames N / --no-throttle    [all modes]\n"
 "     Explicit in-flight frame cap.  Sentinel values:\n"
 "       N >= 1  : explicit cap (bypasses formula).  -v shows source=user.\n"
+"                 NOT an absolute ceiling: a GPU/hybrid run RAISES N to the\n"
+"                 concurrent GPU batch floor (devices*streams*per-stream\n"
+"                 batch) when N is below it, because a budget smaller than\n"
+"                 one round of batches deadlocks.  A warning reports the\n"
+"                 effective cap.\n"
 "       N == 0  : DISABLE the throttle entirely — no permits, no lock,\n"
 "                 no accounting.  Use for benchmarking the no-throttle\n"
 "                 baseline.  At -v: `[THROTTLE] DISABLED`.\n"
@@ -1903,9 +1983,14 @@ static void print_help_long()
 "  -M N, --memlimit=N, --memory=N    [all modes]\n"
 "     Memory usage limit in MiB (zstd-compatible).  On decompression,\n"
 "     frames requiring a window larger than N MiB are rejected (via\n"
-"     ZSTD_d_windowLogMax).  On compression, caps the in-flight\n"
-"     frame-throttle budget at roughly N MiB total — useful on shared\n"
-"     machines where the default `min(pipeline, RAM/2)` is too generous.\n"
+"     ZSTD_d_windowLogMax) — a hard limit.\n"
+"     On COMPRESSION it is NOT a hard process-memory limit: it constrains\n"
+"     only the AUTOMATIC frame-throttle calculation.  Effective in-flight\n"
+"     memory can still exceed N MiB, because the 32-frame safety floor and\n"
+"     the GPU batch floor are applied afterwards, and an explicit\n"
+"     --throttle-frames bypasses the memory calculation entirely.\n"
+"     Useful on shared machines where the default `min(pipeline, RAM/2)`\n"
+"     is too generous; not a guarantee.\n"
 "\n"
 #ifdef HAVE_NVCOMP
 "============================================================\n"
@@ -2008,8 +2093,10 @@ static void print_help_long()
 "  2  Bad command-line usage\n"
 "  3  I/O error (disk full, read failure, permissions)\n"
 "  4  Data error (corrupt input, integrity check failure)\n"
-"  5  Reserved: all GPUs failed (since v0.13.54 the run instead falls back\n"
-"     to CPU with a warning and exits 0 — data is never left incomplete)\n"
+"  5  All GPUs failed AND the run could not be rebuilt on CPU.  Normally a\n"
+"     GPU failure falls back to CPU with a warning and exits 0; this code\n"
+"     appears when the output could not be discarded and rebuilt, i.e. a\n"
+"     pipe/stream target.  --gpu-only with NO GPU present is exit 2, not 5.\n"
 "  6  --keep-going: finished, but one or more frames failed their checksum\n"
 "     (content written in full but UNVERIFIED)\n"
 "  7  --keep-going: finished, but some data could not be decoded at all\n"
@@ -2078,6 +2165,45 @@ static void print_help_long()
 "\n"
 "  # Write run statistics as JSON for later analysis\n"
 "  gzstd --stats-json run.json big.tar\n"
+"\n"
+"============================================================\n"
+" COMPATIBILITY OPTIONS (zstd / gzip spellings)\n"
+"============================================================\n"
+"gzstd accepts many zstd and gzip option spellings so it can stand in for\n"
+"them in existing scripts.  They fall into four groups, and the difference\n"
+"matters: an option that is accepted and IGNORED will not do what its name\n"
+"says, and gzstd will not stop you.\n"
+"\n"
+"  MAPPED — these do what you expect:\n"
+"     -H (= --help), --decompress / --uncompress (= -d), --test (= -t),\n"
+"     --keep (= -k), --force (= -f), --stdout / --to-stdout (= -c),\n"
+"     --verbose (= -v), --single-thread (= -T 1), -0 (default level),\n"
+"     -M / --memlimit / --memory, --mmap=on|off, --preallocate=on|off,\n"
+"     and bundled short flags such as -dc, -dkf, -dcf.\n"
+"\n"
+"  PARTIALLY MAPPED:\n"
+"     --fast=N     selects level 1; N is ignored (N>1 warns).\n"
+"     --adapt=min,max  enables gzstd's pipeline governor; the level bounds\n"
+"                  are ignored (gzstd's --adapt is not zstd's --adapt).\n"
+"     --format=zstd is a no-op (gzstd always emits zstd).\n"
+"     --format=posix|pax|gnu|oldgnu selects --tar SPARSE ENCODING only.\n"
+"\n"
+"  ACCEPTED AND SILENTLY IGNORED — no warning, no effect:\n"
+"     --[no-]asyncio, --[no-]check, --no-dictID, --[no-]compress-literals,\n"
+"     --[no-]row-match-finder, --[no-]mmap-dict, --stream-size=,\n"
+"     --size-hint=, --target-compressed-block-size=, --auto-threads=\n"
+"     NOTE: gzstd ALWAYS writes frame checksums, so --no-check has no\n"
+"     effect — it does not disable them.\n"
+"\n"
+"  ACCEPTED WITH A WARNING, THEN IGNORED:\n"
+"     --long, --patch-from, --rsyncable, --exclude-compressed,\n"
+"     --[no-]pass-through, -r / --recursive, --filelist, --output-dir-flat,\n"
+"     --output-dir-mirror, --trace, -D / --dict / --dictionary, -B,\n"
+"     -b# / -e# / -i#, -S, --priority=, --format=gzip|xz|lzma|lz4\n"
+"     DICTIONARY TRAINING IS NOT IMPLEMENTED: --train, every --train-*,\n"
+"     --maxdict*, and --dictID* warn and then continue as an ORDINARY\n"
+"     compression run.  No dictionary is produced.\n"
+"     -q / -qq suppress these warnings, regardless of argument order.\n"
 "\n"
 "For a condensed option list, run `gzstd -h`.\n";
 }
@@ -4739,6 +4865,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   // percentages.  Only a genuine pipe (total_in == 0: tar -I gzstd, cat |
   // gzstd, terminal) is suppressed.  --progress overrides everything but the
   // V_DEBUG cap.
+  if (opt.no_progress) return;                 // explicit suppression wins
   if (opt.verbosity < V_DEFAULT || opt.verbosity >= V_DEBUG) return;
   if (opt.verbosity == V_DEFAULT && !opt.force_progress) {
     if (!is_stderr_tty()) return;
@@ -4883,6 +5010,21 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
 /*======================================================================
  I/O helpers
 ======================================================================*/
+// fread(3) returns a SHORT OR ZERO count for both end-of-file and a hard I/O
+// error, and only ferror() distinguishes them.  Every streaming reader must ask.
+//
+// Treating an error as EOF is silent data loss with a success exit: the prefix
+// that was read compresses fine, the archive is installed, gzstd exits 0, and
+// with --rm the source file is then deleted.  Reachable on FUSE, NFS, a failing
+// disk, or a device that returns EIO partway through a file — anywhere a read
+// can fail after returning some bytes.
+static inline void check_read_error(FILE * f, const std::string & what)
+{
+  if (f && std::ferror(f))
+    die_io("read error on " + (what.empty() ? std::string("input") : what)
+           + " (" + std::strerror(errno) + ")");
+}
+
 static FILE * open_input(const std::string & path)
 {
   if (path == "-") {
@@ -4894,17 +5036,69 @@ static FILE * open_input(const std::string & path)
   return f;
 }
 // Open a temporary file for atomic write: write to .tmp, then rename on success.
+//
+// The name must be UNPREDICTABLE and the create must be EXCLUSIVE.  The old
+// version used a fixed `<out>.gzstd.tmp` opened with fopen("wb"), which had two
+// holes, both reproduced:
+//   * fopen follows symlinks.  Pre-creating `archive.zst.gzstd.tmp` as a symlink
+//     to any writable file made gzstd truncate and write through it, then rename
+//     the symlink over the output — arbitrary file clobbering from a guessable
+//     name in a shared directory.
+//   * two concurrent writers targeting the same output shared one temp inode and
+//     interleaved their writes into it.
+// O_EXCL makes the create fail rather than reuse anything already there, and
+// O_NOFOLLOW refuses a symlink at the final component.  The name carries the pid
+// and a random suffix so two writers cannot collide in the first place; on the
+// vanishingly rare EEXIST we simply draw again.
 static FILE * open_output_atomic(const std::string & out, std::string & tmp_path)
 {
-  tmp_path = out + ".gzstd.tmp";
+  // Same directory as the target: rename(2) must stay within one filesystem.
+  // Seeded from the clock + pid rather than <random> to keep the include set as
+  // it is; this picks a name, it is not a security primitive — O_EXCL|O_NOFOLLOW
+  // is what makes the operation safe.
+  unsigned seed = (unsigned)getpid()
+                ^ (unsigned)std::chrono::steady_clock::now().time_since_epoch().count();
+  int fd = -1;
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    seed = seed * 1664525u + 1013904223u;
+    char suffix[32];
+    std::snprintf(suffix, sizeof(suffix), ".gzstd.%d.%08x.tmp",
+                  (int)getpid(), seed);
+    tmp_path = out + suffix;
+    fd = ::open(tmp_path.c_str(),
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0) break;
+    if (errno != EEXIST) break;      // a real error: report it below
+  }
+  if (fd < 0) die_io("cannot open temp output: " + tmp_path
+                     + " (" + std::strerror(errno) + ")");
+  // Restore the mode fopen("wb") would have produced.  The temp is created 0600
+  // so it is never briefly world-readable, but this file gets RENAMED over the
+  // output, so shipping 0600 would silently tighten every archive's permissions
+  // — a behaviour change, not a fix.  0666 & ~umask reproduces the old result.
+  {
+    mode_t um = ::umask(0);
+    ::umask(um);
+    if (::fchmod(fd, (mode_t)(0666 & ~um)) != 0) { /* non-fatal: keep 0600 */ }
+  }
+  // Register only AFTER the exclusive create succeeded, so a failed attempt
+  // never arms cleanup against a path we do not own.
   register_tmp_file(tmp_path);
-  FILE * f = std::fopen(tmp_path.c_str(), "wb");
-  if (!f) die_io("cannot open temp output: " + tmp_path);
+  FILE * f = ::fdopen(fd, "wb");
+  if (!f) { ::close(fd); die_io("cannot open temp output: " + tmp_path); }
   std::setvbuf(f, nullptr, _IOFBF, 1 * 1024 * 1024);
   return f;
 }
-// Flush file data to disk (POSIX only).
-static void fsync_file(FILE * f)
+// Flush file data to disk (POSIX only).  Returns false if durability was
+// REQUESTED AND NOT ACHIEVED.
+//
+// fsync failure is not advisory: delayed ENOSPC, an EIO from the device, or a
+// quota rejection all surface here, and on many filesystems this is the only
+// point at which the error is ever reported — a later fclose can succeed on a
+// write that never reached stable storage.  Discarding it meant --sync-output
+// exited 0 having silently not synced, after which the atomic rename installed
+// the output and --rm deleted the source.
+static bool fsync_file(FILE * f)
 {
 #if defined(_POSIX_VERSION)
   // Flush the stdio buffer to the fd FIRST: the output FILE* has a 1 MiB
@@ -4912,11 +5106,18 @@ static void fsync_file(FILE * f)
   // already reached the fd and miss up to ~1 MiB of trailing output still in
   // the userspace buffer — defeating --sync-output's durability guarantee for
   // the tail (fclose flushes it afterward, but nothing fsyncs it then).
-  std::fflush(f);
+  if (std::fflush(f) != 0) return false;
   int fd = fileno(f);
-  fsync(fd);
+  // EINTR is not a durability failure; retry it.  EINVAL means the target does
+  // not support fsync (a pipe or some special files) — not a failure either.
+  for (;;) {
+    if (fsync(fd) == 0) return true;
+    if (errno == EINTR) continue;
+    return errno == EINVAL;
+  }
 #else
   (void)f;
+  return true;
 #endif
 }
 
@@ -5096,7 +5297,16 @@ public:
     if (wt2_.joinable()) wt2_.join();
     if (werr_.load(std::memory_order_relaxed)) return false;
     if (preallocated_ > 0 && logical_written_ < preallocated_) {
-      if (::ftruncate(fd_, (off_t)logical_written_) != 0) { /* best-effort */ }
+      // NOT best-effort.  --preallocate reserved `preallocated_` bytes up front;
+      // this call is what cuts the unwritten remainder back off.  If it fails,
+      // the file keeps a zero-filled tail past the real data — a CORRUPT archive
+      // — and returning true here made the caller accept it, exit 0, and with
+      // --rm delete the source.  A failure to shorten the output is an I/O
+      // error like any other.
+      if (::ftruncate(fd_, (off_t)logical_written_) != 0) {
+        werr_.store(true, std::memory_order_relaxed);
+        return false;
+      }
     }
     return true;
   }
@@ -5994,6 +6204,25 @@ struct PerfCounters {
   }
 };
 
+// Fixed-share GPU bringup barrier.  --cpu-share promises an EXACT CPU/GPU split,
+// so the pipeline must not start streaming frames until at least one GPU stream
+// has registered or every GPU has failed to initialise; otherwise a small input
+// drains to CPU through the drain-phase fast path and the requested split is
+// silently ignored.
+//
+// This was a 1 ms sleep/poll loop in a scheduling path, which this project's own
+// house rules forbid ("no sleep/poll loops in scheduling paths — timed condition
+// variable waits are used deliberately, even where the measured win is ~0").
+// Signalled by register_gpu_stream and by every terminal GPU-failure bump.
+static std::mutex              g_gpu_bringup_mx;
+static std::condition_variable g_gpu_bringup_cv;
+// Called with no other lock held.  The empty critical section fences against a
+// waiter that has evaluated its predicate but not yet parked.
+static inline void gpu_bringup_signal() {
+  { std::lock_guard<std::mutex> lk(g_gpu_bringup_mx); }
+  g_gpu_bringup_cv.notify_all();
+}
+
 // Global perf counters  only non-null when -vvv is active.
 // All instrumentation checks `if (g_perf)` before recording.
 // Set once in the top-level compress/decompress function BEFORE worker
@@ -6468,22 +6697,29 @@ public:
   }
 
   // Re-enqueue tasks that were popped but never processed (e.g., GPU trivial-skip,
-  // VRAM failure).  Pushes to the FRONT of the deque in original sequence order.
+  // VRAM failure).  Inserts each one in SEQ ORDER, exactly like push().
   //
-  // Why front, not back: the FrameThrottle is deadlock-free only when the FIFO
-  // invariant holds — "the frame the writer needs next is always among the oldest
-  // in-flight frames."  push_back breaks this: the writer needs frame 0, but it's
-  // behind 1200+ higher-sequence frames.  Workers process those higher frames,
-  // consuming all permits, and frame 0 can never be popped — classic circular wait.
-  // push_front restores the invariant: re-enqueued frames (lowest seq) are popped
-  // and processed first, so the writer can make progress and release permits.
+  // This used to push_front the whole batch, on the reasoning that re-enqueued
+  // frames are the oldest and belong at the head.  That was true of ONE batch in
+  // isolation and false as soon as two GPU workers requeued concurrently: the
+  // lower batch requeues first, the higher batch requeues on top of it, and the
+  // deque ends up with the higher sequences AHEAD of the lower ones — the exact
+  // inversion the sorted push() in v0.15.66 exists to prevent, reintroduced by
+  // the path whose own comment first described the hazard.
+  //
+  // Sorted insert is strictly better here: it puts these frames ahead of the
+  // newer queued work (which is the point) without asserting anything about how
+  // they order against each other.  Same scan-from-the-back as push(); these
+  // batches are small and land near the front, so the walk is short.
   void re_enqueue(std::vector<Task> & batch)
   {
     if (batch.empty()) return;
     std::unique_lock<std::mutex> lk(m_);
-    for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+    for (auto it = batch.begin(); it != batch.end(); ++it) {
       queued_bytes_ += it->data.size();
-      q_.push_front(std::move(*it));
+      auto pos = q_.end();
+      while (pos != q_.begin() && (pos - 1)->seq > it->seq) --pos;
+      q_.insert(pos, std::move(*it));
     }
     batch.clear();
     cv_.notify_all();
@@ -8394,7 +8630,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   size_t ret = 0;  // last decompressStream hint; >0 at EOF means truncated
   for (;;) {
     size_t n = std::fread(inbuf.data(), 1, IO_CHUNK, in);
-    if (n == 0) break;  // EOF
+    if (n == 0) { check_read_error(in, opt.input); break; }  // EOF (not an error)
     if (m) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
     ZSTD_inBuffer zin { inbuf.data(), n, 0 };
     while (zin.pos < zin.size) {
@@ -8766,6 +9002,7 @@ public:
       dev_[device].streams.fetch_add(1, std::memory_order_relaxed);
     int n = active_gpu_streams_.fetch_add(1, std::memory_order_relaxed) + 1;
     update_queue_floor(n, gpu_batch_size_.load(std::memory_order_relaxed));
+    gpu_bringup_signal();     // a stream is live: release the fixed-share barrier
   }
 
   // GPU workers call this when a stream is shutting down (trivial-skip exit,
@@ -10942,7 +11179,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
       g_perf->read_ns.fetch_add(now_ns() - rd_t0);
       g_perf->read_bytes_total.fetch_add(n);
     }
-    if (n == 0) break;
+    if (n == 0) { check_read_error(in, opt.input); break; }
     if (m) m->read_bytes.fetch_add(n);
     uint64_t comp_t0 = g_perf ? now_ns() : 0;
     size_t csz = ZSTD_compress2(cctx, outbuf.data(), outbuf.size(), inbuf.data(), n);
@@ -11019,6 +11256,10 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   bool finished = false;
   while (!finished) {
     size_t n = std::fread(inbuf.data(), 1, READ_CHUNK, in);
+    // A SHORT read is what ends this stream, so the error check belongs on the
+    // short branch too — not just on n == 0.  Otherwise a mid-file EIO is
+    // flushed as ZSTD_e_end and sealed into a valid, truncated archive.
+    if (n < READ_CHUNK) check_read_error(in, opt.input);
     if (m && n > 0) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
     bool last_chunk = (n < READ_CHUNK);
 
@@ -12652,6 +12893,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         mark(RD_PARKED, SIZE_MAX);
         if (!rd_ctl_t.wait_turn(k, [&] {
               return rd_done_t.load(std::memory_order_relaxed)
+                  || g_gpu_aborted.load(std::memory_order_relaxed)
                   || next_chunk.load(std::memory_order_relaxed) >= nchunks; })) break;
       }
       // Abort is not just backpressure release: a GPU fault calls set_done() on
@@ -12661,6 +12903,11 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       // wake anyone parked so they exit too.
       if (g_gpu_aborted.load(std::memory_order_relaxed)) {
         if (rd_ad_t) rd_ctl_t.wake_all();
+        // Wake the pusher too: it waits on this CV for an exact index, and an
+        // abort should not have to wait for another reader's deposit to be
+        // noticed.  (This reader has not claimed an index yet — the claim is
+        // below — so nothing it owned goes missing.)
+        rb_cv.notify_all();
         break;
       }
       size_t ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
@@ -12685,9 +12932,15 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         // pipeline, and charging it here would understate rbusy exactly when
         // the pool is shrinking.
         const uint64_t bt0 = m ? now_ns() : 0;
-        rb_cv.wait(lk, [&] { return ci < push_next + window; });
+        rb_cv.wait(lk, [&] {
+          return ci < push_next + window
+              || g_gpu_aborted.load(std::memory_order_relaxed);
+        });
         if (m) m->reader_blocked_ns.fetch_add(now_ns() - bt0, std::memory_order_relaxed);
       }
+      // Woken by the abort rather than by the frontier: do not assemble a chunk
+      // nobody will consume.
+      if (g_gpu_aborted.load(std::memory_order_relaxed)) { rb_cv.notify_all(); break; }
       mark(RD_ASSEMBLE, ci);
       Task t = assemble_chunk(ci, cur_path, cur_fd, cur_errno);  // concurrent preads (unlocked)
       if (rd_ad_t) rd_ctl_t.add_bytes((uint64_t)t.data.size());
@@ -12709,7 +12962,25 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       {
         std::unique_lock<std::mutex> lk(rb_mx);
         pusher_st.store(0, std::memory_order_relaxed);
-        rb_cv.wait(lk, [&] { return !ready.empty() && ready.begin()->first == push_next; });
+        // Abort escape.  This waits for one EXACT index (push_next), which is
+        // only ever satisfiable while every claimed index is guaranteed to be
+        // deposited.  Today it is: the abort check at the top of the reader loop
+        // runs BEFORE next_chunk.fetch_add, so a reader that already claimed an
+        // index still assembles and deposits it, and indices are claimed
+        // contiguously.
+        //
+        // A review reported this as a live hang; it was NOT reproducible — seven
+        // fault-injection timings (GZSTD_DEBUG_FAIL_GPU_AFTER=0,1,3,8,20,50, with
+        // and without --adapt) all completed on the pre-fix binary.  This term is
+        // kept anyway because the liveness argument above rests entirely on that
+        // check-before-claim ordering, which is invisible from here and one edit
+        // away from being wrong.  The output of an aborted pass is discarded, so
+        // stopping mid-sequence costs nothing.
+        rb_cv.wait(lk, [&] {
+          return g_gpu_aborted.load(std::memory_order_relaxed)
+              || (!ready.empty() && ready.begin()->first == push_next);
+        });
+        if (g_gpu_aborted.load(std::memory_order_relaxed)) break;
         pusher_st.store(1, std::memory_order_relaxed);
         t = std::move(ready.begin()->second);
         ready.erase(ready.begin());
@@ -15013,6 +15284,7 @@ private:
         while (w < chunk) {
           ssize_t r = ::pwrite(fd, data + off + w, chunk - w, fpos + (off_t)w);
           if (r < 0) { if (errno == EINTR) continue; return false; }
+          if (r == 0) return false;   // no progress possible: don't spin forever
           w += (size_t)r;
         }
       }
@@ -15042,6 +15314,7 @@ private:
         while (off < s.n) {
           ssize_t w = ::write(fd, s.p + off, s.n - off);
           if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
+          if (w == 0) { ok = false; break; }  // no progress possible: don't spin
           off += (size_t)w;
         }
         if (off < s.n) { ok = false; break; }
@@ -15365,8 +15638,16 @@ private:
       case '3': case '4': case '6': {              // char/block device, fifo
         NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
         if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor, root)) {
-          if (errno == EPERM) vlog(V_VERBOSE, opt_, "gzstd: untar: " + rel + ": need privilege for device/special; skipped\n");
-          else fail(rel, "cannot create special file");
+          // EPERM = no CAP_MKNOD, so a device node in the archive was NOT
+          // created.  That is a missing entry, and it must fail the extraction
+          // like any other creation error.  Logging it at -v and continuing
+          // produced a silently incomplete tree with exit 0 — a restore script
+          // had no way to tell.  GNU tar errors here too.  The privilege-specific
+          // wording is kept because it is the actionable part.
+          if (errno == EPERM)
+            fail(rel, "need privilege to create device/special file (CAP_MKNOD)");
+          else
+            fail(rel, "cannot create special file");
         } else {
           apply_ext_path(rel, e.ext, root);   // FIFO/device nodes carry xattrs too
         }
@@ -15441,6 +15722,7 @@ private:
         while (p < got) {
           ssize_t n = ::pwrite(fd, buf + p, got - p, (off_t)(base + w + p));
           if (n < 0) { if (errno == EINTR) continue; ok = false; break; }
+          if (n == 0) { ok = false; break; }  // no progress possible: don't spin
           p += (size_t)n;
         }
         w += got; consumed += got;
@@ -16764,7 +17046,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
           g_perf->read_bytes_total.fetch_add(n);
         }
       }
-      if (n == 0) break;
+      if (n == 0) { check_read_error(in, opt.input); break; }
       if (m) m->read_bytes.fetch_add(n);
 
       Task t;
@@ -17990,6 +18272,7 @@ static void gpu_worker(
           *fatal_msg = skip_msg;
           int fails = gpu_failures
               ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
+          gpu_bringup_signal();   // one fewer GPU that could satisfy the barrier
           // Wake writer and CPU workers in case they're waiting
           { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
           queue->notify_cpu_waiters();
@@ -19449,10 +19732,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // split to all-CPU.  Adaptive mode skips this — it promises no exact
   // split and wants the fastest possible start.  v0.13.14.
   if (sched && opt.cpu_share >= 0.0 && gpu_count > 0) {
-    while (!sched->any_gpu_active()
-           && gpu_failures.load(std::memory_order_acquire) < gpu_count) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    std::unique_lock<std::mutex> lk(g_gpu_bringup_mx);
+    g_gpu_bringup_cv.wait(lk, [&] {
+      return sched->any_gpu_active()
+          || gpu_failures.load(std::memory_order_acquire) >= gpu_count;
+    });
   }
 
   // ---- Producer: read input, split into GPU-sized subchunks, enqueue ----
@@ -19703,7 +19987,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           g_perf->read_bytes_total.fetch_add(n_host);
         }
       }
-      if (n_host == 0) break;
+      if (n_host == 0) { check_read_error(in, opt.input); break; }
       if (m) m->read_bytes.fetch_add(n_host);
       size_t off = 0;
       const uint64_t c_t0 = m ? now_ns() : 0;
@@ -20077,6 +20361,7 @@ static void gpu_decomp_worker(
           *fatal_msg = skip_msg;
           int fails = gpu_failures
               ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
+          gpu_bringup_signal();   // one fewer GPU that could satisfy the barrier
           { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
           queue->notify_cpu_waiters();
           // Last GPU standing just failed in --gpu-only: finish on CPU
@@ -20906,6 +21191,7 @@ static void gpu_decomp_worker(
     // re-enqueued frames (and everything still in the queue) have a consumer.
     int fails = gpu_failures
         ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
+    gpu_bringup_signal();       // one fewer GPU that could satisfy the barrier
     if (opt.gpu_only && fails == gpu_worker_count)
       gpu_only_cpu_fallback(true, queue, results, opt, m, bp);
   }
@@ -21264,10 +21550,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // inline (fixed-share) path — adaptive runs hybrid_overlap with gpu
   // workers spawned on the background thread and promises no exact split.
   if (sched && opt.cpu_share >= 0.0 && !gpu_workers.empty()) {
-    while (!sched->any_gpu_active()
-           && gpu_failures.load(std::memory_order_acquire) < (int)gpu_workers.size()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    std::unique_lock<std::mutex> lk(g_gpu_bringup_mx);
+    g_gpu_bringup_cv.wait(lk, [&] {
+      return sched->any_gpu_active()
+          || gpu_failures.load(std::memory_order_acquire) >= (int)gpu_workers.size();
+    });
   }
 
   // ---- Producer: stream frames into the queue while workers consume ----
@@ -22196,8 +22483,19 @@ static bool buffered_frame_walk(int fd, size_t fsize,
 
 static int list_zst(const Options & opt)
 {
-  std::printf("%7s %6s %12s %14s %7s %6s  %s\n",
-              "Frames", "Skips", "Compressed", "Uncompressed", "Ratio", "Check", "Filename");
+  // The header is printed LAZILY, before the first row that actually exists.
+  // Printing it up front meant `gzstd -l some-random-file` emitted a full table
+  // header and a row of zeros ("0 frames, 0.00 B, ratio 0.000, Check None")
+  // before admitting the file was not a zstd stream at all — the summary looked
+  // like a real answer about a real archive.  Nothing is printed for a file that
+  // does not parse, so a listing of only-invalid files is just the errors.
+  bool hdr_printed = false;
+  auto print_header_once = [&] {
+    if (hdr_printed) return;
+    hdr_printed = true;
+    std::printf("%7s %6s %12s %14s %7s %6s  %s\n",
+                "Frames", "Skips", "Compressed", "Uncompressed", "Ratio", "Check", "Filename");
+  };
   int rc = EXIT_OK;
   for (const std::string & fn : opt.inputs) {
     // Get a contiguous read-only view: mmap a regular file (lazy, zero-copy),
@@ -22208,7 +22506,9 @@ static int list_zst(const Options & opt)
 #ifndef _WIN32
     if (fn != "-") {
       int fd = ::open(fn.c_str(), O_RDONLY);
-      if (fd < 0) { vlog(V_ERROR, opt, "gzstd: list: " + fn + ": " + std::strerror(errno) + "\n"); rc = EXIT_DATA; continue; }
+      // Failing to OPEN the file (missing, permissions) is an I/O error;
+      // EXIT_DATA is for corrupt content and misreported this as a bad archive.
+      if (fd < 0) { vlog(V_ERROR, opt, "gzstd: list: " + fn + ": " + std::strerror(errno) + "\n"); rc = EXIT_IO; continue; }
       struct stat st;
       if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
         mp_len = (size_t)st.st_size;
@@ -22235,7 +22535,8 @@ static int list_zst(const Options & opt)
       // meter.  Same visibility rules as progress_loop: V_DEFAULT/V_VERBOSE
       // only, TTY unless --progress forces, silenced by -q.  First update
       // after 100 ms, so a fast small-file walk never flashes one.
-      const bool prog = opt.verbosity >= V_DEFAULT && opt.verbosity < V_DEBUG
+      const bool prog = !opt.no_progress
+                        && opt.verbosity >= V_DEFAULT && opt.verbosity < V_DEBUG
                         && (opt.force_progress || is_stderr_tty());
       auto prog_last = std::chrono::steady_clock::now();
       bool prog_shown = false;
@@ -22317,6 +22618,15 @@ static int list_zst(const Options & opt)
 #endif
     (void)wfd;
 
+    // Validate BEFORE emitting anything for this file.  An unparseable stream has
+    // no frame count, no ratio and no checksum kind to report, so the row would be
+    // zeros either way; report the error and move to the next file.
+    if (!ok) {
+      vlog(V_ERROR, opt, "gzstd: list: " + fn + ": not a valid zstd stream (truncated or corrupt)\n");
+      rc = EXIT_DATA;
+      continue;
+    }
+
     char comp_h[32], unc_h[32];
     human_bytes(double(fsize), comp_h, sizeof comp_h);
     if (uncomp_known) human_bytes(double(uncomp), unc_h, sizeof unc_h);
@@ -22325,14 +22635,11 @@ static int list_zst(const Options & opt)
     char ratio_s[16];
     if (uncomp_known) std::snprintf(ratio_s, sizeof ratio_s, "%.3f", ratio);
     else std::snprintf(ratio_s, sizeof ratio_s, "-");
+    print_header_once();
     std::printf("%7llu %6llu %12s %14s %7s %6s  %s\n",
                 (unsigned long long)nframes, (unsigned long long)nskips,
                 comp_h, unc_h, ratio_s, has_check ? "XXH64" : "None",
                 fn == "-" ? "(stdin)" : fn.c_str());
-    if (!ok) {
-      vlog(V_ERROR, opt, "gzstd: list: " + fn + ": not a valid zstd stream (truncated or corrupt)\n");
-      rc = EXIT_DATA;
-    }
   }
   std::fflush(stdout);
   return rc;
@@ -22413,7 +22720,7 @@ static int list_tar(const Options & opt, Meter * m)
       // parsed; the meter tracks the decompress underneath.
       std::atomic<bool> prog_done{false};
       std::thread prog_thr;
-      if (opt.force_progress || !is_stdout_tty()) {
+      if (!opt.no_progress && (opt.force_progress || !is_stdout_tty())) {
         uint64_t total_in = 0;
         if (arc != "-") {
           std::error_code ec; uintmax_t z = fs::file_size(arc, ec);
@@ -23048,6 +23355,23 @@ static int gzstd_main(int argc, char ** argv)
   if (to_stdout) {
     out = stdout;
   } else {
+    // REFUSE TO WRITE THE OUTPUT OVER THE INPUT.  With --rm this was total data
+    // loss reported as success: the temp file was renamed onto the input path,
+    // then the post-success unlink removed that same path, leaving neither the
+    // source nor the archive — and exiting 0.  Reproduced as
+    // `gzstd --rm -f -o data data`, which printed "75.37% (3.86 MiB => 2.91 MiB)"
+    // and left an empty directory.
+    //
+    // Compare by FILE IDENTITY, not by string: `-o link data` where link is a
+    // symlink or hard link to data is the same hazard and compares unequal as
+    // text.  fs::equivalent resolves both and answers on st_dev/st_ino.  It is
+    // only meaningful once the output exists — if it does not, the two cannot
+    // be the same file yet, and the paths below create it fresh.
+    if (opt.input != "-" && fs::exists(opt.output)) {
+      std::error_code ec_eq;
+      if (fs::equivalent(opt.input, opt.output, ec_eq) && !ec_eq)
+        die_usage("input and output are the same file: " + opt.output);
+    }
     // Only a pre-existing REGULAR file is a clobber risk.  A special output
     // target (/dev/null, a device node, a fifo) is a deliberate sink, not
     // something we overwrite — never block on it and never register it for
@@ -23598,7 +23922,16 @@ static int gzstd_main(int argc, char ** argv)
       // (device write cache + the size metadata set by finalize's ftruncate) so
       // --direct --sync-output is actually durable (ROADMAP 7.5).
       int dfd = g_direct_writer->fd();
-      if (dfd >= 0) ::fsync(dfd);
+      if (dfd >= 0) {
+        int fr;
+        do { fr = ::fsync(dfd); } while (fr != 0 && errno == EINTR);
+        // Same reasoning as fsync_file: a failure here means the durability the
+        // user asked for was not delivered.  Fail before the rename installs
+        // the output and before --rm removes the input.
+        if (fr != 0 && errno != EINVAL)
+          die_io("--sync-output: fsync of O_DIRECT output failed ("
+                 + std::string(std::strerror(errno)) + ")");
+      }
     }
     g_direct_writer = nullptr;
     direct_writer.reset();
@@ -23614,7 +23947,9 @@ static int gzstd_main(int argc, char ** argv)
   if (!to_stdout) {
     if (out) {
       if (opt.sync_output) {
-        fsync_file(out);
+        if (!fsync_file(out))
+          die_io("--sync-output: fsync of output failed ("
+                 + std::string(std::strerror(errno)) + ")");
       }
       // fclose flushes the final stdio buffer, and ferror carries any
       // earlier sticky write failure.  Either failing means the output is
@@ -23660,8 +23995,20 @@ static int gzstd_main(int argc, char ** argv)
     // Success: disarm cleanup (temp or direct output file is now final)
     clear_tmp_file();
     if (!keep_this_file && opt.input != "-") {
+      // --rm was REQUESTED, so failing to remove the source is a failure of the
+      // command, not a detail.  Discarding ec_rm exited 0 while the input was
+      // still there — e.g. compressing out of a directory the user cannot write
+      // to (`--rm -o /writable/out.zst /readonly/input`) silently left the
+      // source behind, and a caller that trusted the exit code would double it.
+      //
+      // The OUTPUT IS KEPT: it is complete and already installed, so deleting it
+      // here would throw away good work over a cleanup failure.  Report and exit
+      // EXIT_IO; the user removes the source themselves.
       std::error_code ec_rm;
       fs::remove(opt.input, ec_rm);
+      if (ec_rm)
+        die_io("--rm: cannot remove input after compressing it: " + opt.input
+               + " (" + ec_rm.message() + "); output kept at " + opt.output);
     }
   } else {
     // Flush stdout to ensure all data reaches the downstream pipe — and die
@@ -25319,7 +25666,7 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (a == "--no-progress") {
       opt.force_progress = false;
-      if (opt.verbosity == V_DEFAULT) opt.verbosity = V_ERROR;
+      opt.no_progress    = true;   // wins regardless of verbosity or flag order
     }
     else if (a.size() >= 2 && a[0] == '-' && a[1] >= '0' && a[1] <= '9') {
       bool all_digits = true;
@@ -25357,6 +25704,11 @@ static Options parse_args(int argc, char ** argv)
       if (!val.empty() && val[0] == '=') val = val.substr(1);
       if (val.empty()) die_usage("missing value for -T");
       int th = parse_int_value("-T", val);  // graceful error on a bad attached value
+      // Reject negatives in the ATTACHED form too.  The separated form (`-T -5`)
+      // has rejected them since v0.15.x, but `-T-5` and `-T=-5` were stored and
+      // then resolved as "auto" downstream, so the two spellings of the same
+      // mistake behaved differently and one of them said nothing.
+      if (th < 0) die_usage("thread count must be >= 0 (0 = auto): " + a);
       // -T0 means "use all available threads" (like zstd)
       opt.cpu_threads = (th == 0) ? -1 : th;
     }
@@ -25458,7 +25810,15 @@ static Options parse_args(int argc, char ** argv)
       opt.gpu_hybrid_tuning_seen = true;
     }
     else if (parse_num_arg("gpu-streams", i, argc, argv, opt.gpu_streams)) { opt.gpu_hybrid_tuning_seen = true; }
-    else if (parse_int_arg("gpu-devices", i, argc, argv, opt.gpu_devices)) { opt.gpu_hybrid_tuning_seen = true; }
+    else if (parse_int_arg("gpu-devices", i, argc, argv, opt.gpu_devices)) {
+      // 0 = auto (all available).  A NEGATIVE count was accepted and then
+      // propagated into the deferred device-count arithmetic, where it could
+      // drive the worker count below zero and leave a --gpu-only decompress
+      // with no workers at all.  Reject it here, where it is still a typo.
+      if (opt.gpu_devices < 0)
+        die_usage("--gpu-devices must be >= 0 (0 = all available)");
+      opt.gpu_hybrid_tuning_seen = true;
+    }
     else if (a == "--no-pinned") { opt.pin_mode = PinMode::OFF; opt.gpu_hybrid_tuning_seen = true; }
     else if (parse_str_arg("pinned", i, argc, argv, pinned_value_tmp)) {
       std::transform(pinned_value_tmp.begin(), pinned_value_tmp.end(),
@@ -25492,7 +25852,10 @@ static Options parse_args(int argc, char ** argv)
     else if (parse_num_arg("gpu-batch", i, argc, argv, ignored_sz))     { cpu_build_ignored_gpu_flag = true; }
     else if (parse_double_arg("gpu-mem-frac", i, argc, argv, ignored_d)) { cpu_build_ignored_gpu_flag = true; }
     else if (parse_num_arg("gpu-streams", i, argc, argv, ignored_sz))   { cpu_build_ignored_gpu_flag = true; }
-    else if (parse_int_arg("gpu-devices", i, argc, argv, ignored_i))    { cpu_build_ignored_gpu_flag = true; }
+    else if (parse_int_arg("gpu-devices", i, argc, argv, ignored_i))    {
+      if (ignored_i < 0) die_usage("--gpu-devices must be >= 0 (0 = all available)");
+      cpu_build_ignored_gpu_flag = true;
+    }
     else if (a == "--no-pinned")                                        { cpu_build_ignored_gpu_flag = true; }
     else if (parse_str_arg("pinned", i, argc, argv, pinned_value_tmp))  { cpu_build_ignored_gpu_flag = true; }
 #endif

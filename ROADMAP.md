@@ -1,7 +1,65 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.62
+**Current version:** v0.15.69
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
+
+---
+
+## Guiding goal: a faithful drop-in replacement for the zstd CLI
+
+**gzstd strives to be a drop-in replacement for the `zstd` CLI. This is a standing,
+ongoing commitment, not a finished state** — where gzstd and zstd disagree, gzstd is
+the one that is wrong, and closing the gap is legitimate work at any time.
+
+What that commits us to, in priority order:
+
+1. **Read anything zstd writes.** A file zstd produces must decompress correctly, or fail
+   loudly. This is the one rule with no acceptable exceptions.
+2. **Accept zstd's spelling.** Every option form — short, long, bundled, `=`-attached,
+   space-separated — should parse the way zstd parses it.
+3. **Mean the same thing.** An option that is accepted must either do what zstd does or
+   say plainly that it did not. Silent divergence is the worst outcome and is treated as a
+   defect, not a wart.
+4. **Match the observable contract.** Exit codes, stdout/stderr split, and `-q` behaviour
+   should be indistinguishable in scripts.
+
+Where full fidelity is not yet implemented, the help must say so — see the
+COMPATIBILITY OPTIONS section of `--help`, which classifies every accepted option as
+mapped, partially mapped, silently ignored, or warn-and-ignored. **An unqualified
+"drop-in-compatible replacement" claim in the help was itself a defect** (v0.15.69): it
+was true of the common path and false of roughly thirty options.
+
+### Measured state (2026-08-06, against zstd 1.5.7)
+
+- **Parser:** of zstd's 35 advertised long options, 5 are rejected in their bare form and
+  all 5 work as `--opt=VALUE`. 143 option spellings accepted overall. Bundled short flags,
+  gzip aliases, `-0`, `--single-thread` and `-M` all work.
+- **Decompression fidelity:** verified byte-identical round-trips of zstd-produced output
+  for `-19`, `--long=27`, `--no-check` and `--rsyncable`.
+- **The one hard incompatibility — dictionaries.** `gzstd -d -D dict file.zst` exits 4 on a
+  stream zstd reads fine, and `-D` on compress warns and compresses without the dictionary.
+  Anything using `-D`, `--train*`, `--patch-from` or `--maxdict*` is not portable to gzstd.
+  **This is the highest-value compatibility work outstanding.**
+- **Accepted but divergent** (each warns): `-r`/`--recursive` compresses nothing (exit 3
+  since v0.15.69 — it used to exit 0 having done nothing), `--format=gzip` emits zstd,
+  `--output-dir-flat`/`--output-dir-mirror` write nothing, `--no-check` still writes the
+  checksum.
+- **Accepted silently, no effect:** `--[no-]asyncio`, `--[no-]check`, `--no-dictID`,
+  `--[no-]compress-literals`, `--[no-]row-match-finder`, `--[no-]mmap-dict`,
+  `--stream-size=`, `--size-hint=`, `--target-compressed-block-size=`, `--auto-threads=`.
+
+### Ordered gap list
+
+| Gap | Size | Note |
+|---|---|---|
+| Dictionary support (`-D`, `--train*`, `--patch-from`, `--maxdict*`) | Large | The only correctness-class gap: gzstd cannot READ dict-compressed streams |
+| `-r` / `--output-dir-flat` / `--output-dir-mirror` | Small | Self-contained file-walking and output-path mapping |
+| `--long`, `--rsyncable`, `--no-check` | Small | Thin wrappers over zstd parameters gzstd already sets |
+| `--format=gzip\|xz\|lzma\|lz4` | High | Needs zlib/liblzma/liblz4; see Phase 8 |
+| `-b#`/`-e#`/`-i#` benchmark mode | Medium | Overlaps `--calibrate`; decide whether to map or keep separate |
+
+**Re-measure this table before each tag** — it is the only part of the roadmap that
+describes a moving target we do not control.
 
 ---
 
@@ -710,7 +768,9 @@ delete it (~40 lines of concurrency surface removed). Verify before removing.
 
 Fixed in v0.13.29: `TaskQueue` gained an optional `max_depth_` (0 = unbounded);
 `push()` blocks on `space_cv_` when full, woken by the pop paths a bounded queue
-uses + `set_done()` (`re_enqueue`/push_front bypasses it). Both decompress paths
+uses + `set_done()` (`re_enqueue` bypasses it — and since v0.15.69 it inserts by
+seq rather than `push_front`, because pushing a whole batch to the head inverted
+sequence order as soon as two GPU workers requeued concurrently). Both decompress paths
 cap the queue at `max(THROTTLE_MIN_FRAMES, parallelism * slack)`, so queued RAM is
 O(pipeline) not O(input) — skipped under `--no-throttle`. Cap is ≥ the auto-tuner's
 batch needs (no throughput risk). Verified: no deadlock across cpu/gpu/hybrid
@@ -987,6 +1047,76 @@ verbatim) without breaking existing gzstd scripts using `--format=gnu`.
 - Interactions to spec before starting: `--tar` (codec wraps the tar
   stream — natural), seek-table/index (zstd-specific; skip for foreign
   codecs), `--adapt` profile keys per codec, exit-code fidelity.
+
+---
+
+## Phase 9: GPUDirect Storage — NVMe-to-VRAM P2P DMA (research, proposed 2026-08-06)
+
+**Priority: Medium | Complexity: High | Status: NOT STARTED — measure first**
+
+Read compressed frames from NVMe **directly into GPU memory**, and write decompressed
+output **directly from GPU memory to NVMe**, via NVIDIA GPUDirect Storage (the `cuFile`
+API).  Today every GPU byte makes a round trip through host DRAM:
+
+    now:  NVMe -> PCIe -> host DRAM -> PCIe -> VRAM     (two traversals + DRAM bandwidth + CPU)
+    GDS:  NVMe -> PCIe -> VRAM                          (one traversal, DMA, no CPU)
+
+### Why gzstd is unusually well placed for it
+- **The O_DIRECT plumbing already exists.** `cuFile` needs O_DIRECT-style alignment, and
+  gzstd already has `--direct-read`, the cold-input read probe, and 4 KiB alignment handling.
+- **nvCOMP already operates on device buffers.** The change is narrow at the core: replace
+  `pread` into a host pool buffer + `cudaMemcpyAsync` H2D with `cuFileRead` straight into
+  the device buffer that nvCOMP was going to consume anyway.
+- **Frame-parallel access maps 1:1.** `cuFileRead(fd, devptr, size, file_offset, 0)` is
+  exactly the pattern `pooled_read_chunks` already generates.
+
+### THE CASE FOR IT (rtcheek, 2026-08-06) — and why the earlier "it will lose here" was wrong
+The first read of this said GDS would lose on this box because the page cache serves warm
+reads at ~14 GiB/s and GDS deliberately bypasses it.  **That reasoning only applies to WARM
+input, and real workloads here are COLD** — archives far larger than RAM, read once.  Cold
+is precisely where the page cache contributes nothing and where the host bounce is pure
+overhead.  The standing "cpu-only beats hybrid for compress" verdict was measured largely
+warm, so **GDS is a credible route to inverting it** and should be measured, not assumed.
+
+### Hardware reality on this box (measured, do not repeat the 128 GiB/s figure)
+- **GPUs: PCIe Gen5 x16** (~63 GB/s per direction).  That is NOT the constraint.
+- **NVMe: Gen4 x4, 16.0 GT/s** on all three devices (`0000:22:00.0`, `0000:23:00.0`,
+  `0000:82:00.0`, Samsung) — about **7 GB/s per drive**, ~21 GB/s aggregate across three.
+  **Storage is the narrow end of the link, not the bus.**
+- Cold single-stream O_DIRECT reads measure **3.57 GiB/s** today, roughly half the Gen4 x4
+  ceiling — so there IS headroom for a path that removes the host bounce.
+- **Topology is favourable**: NVMe `22/23` sit adjacent to GPU1 (`0000:21:00.0`) and NVMe
+  `82` next to GPU4 (`0000:81:00.0`), same root complex, matching NUMA node.  P2P is
+  topologically possible here without crossing the inter-socket link.
+- Filesystems are ext4 on both `/` and `/backup`, which GDS supports.
+
+### PREREQUISITE, AND THE TRAP
+`libcufile.so.1.13.1` is present (CUDA 12.8 ships it), but **`nvidia_fs` is NOT loaded and
+no GDS packages are installed**.  Without that kernel module `cuFile` silently falls back to
+**compatibility mode** — an ordinary POSIX read plus `cudaMemcpy`.  You get the whole API,
+none of the DMA, and a benchmark that shows nothing.  **It is entirely possible to "add GDS",
+measure neutral, and wrongly conclude the idea does not work.**  Verify the module is loaded
+and `cuFileDriverOpen` reports GDS (not compat) mode BEFORE trusting any number.
+
+### What to measure, here, before writing the integration
+1. Baseline the ceiling: cold `--gpu-only` decompress and compress of a large archive, with
+   `-vvv` to attribute Reader / H2D / Kernel / D2H / Writer time.  **If H2D+D2H is not a top
+   cost, stop — there is nothing for GDS to win.**
+2. Raw-path check with `gdscheck`/a `cuFile` microbenchmark: NVMe -> VRAM against
+   NVMe -> DRAM -> VRAM on the same cold file, same device.
+3. Only then decide.  Decompress is the better first target: output volume exceeds input, so
+   the `cuFileWrite` side moves more bytes than the read side.
+
+### Known design conflicts to resolve before any integration
+- **It fights `HybridSched`.** The scheduler picks CPU or GPU *per frame*, after the frame is
+  read.  A frame landed straight in VRAM cannot go to a CPU worker without a D2H, so the
+  backend decision would have to move BEFORE the read — inverting the current design.
+  `--gpu-only` has no such conflict and is the natural first target.
+- Trivially-compressed frames are routed to CPU by policy (ratio < 2%, to avoid D2H cost);
+  those need host data.
+- CPU-side `--verify` needs host data.
+- `--tar` create assembles chunks from many small files in host memory; GDS applies to the
+  single-large-file paths first.
 
 ---
 
@@ -1380,6 +1510,10 @@ paths (one thread walks the stream in order). Open follow-ups:
 | v0.15.35 | **Six-angle code review, 17 defects fixed** — a `ResultStore` resize racing the live writer, every `--adapt` prior compiled out of the CPU-only build, a budget-permit leak that hung on a corrupt tar, a `--cpu-batch` deadlock, and the parallel extract path silently memcpy'ing every byte (peak RSS −27% once fixed) |
 | v0.15.36 | Backend prior **keyed by input residency** (warm 2.28 vs cold 1.55 GiB/s on the same file; the blended 1.91 described neither) + the four state-machine defects keying exposed |
 | v0.15.37–v0.15.39 | **Four independent review passes by a different model** (Codex CLI / GPT-5.6-sol). It found a bug v0.15.37 shipped, three of the fixes that were only half-fixes, and two order-dependence bugs in multi-input handling. Method: ask it to *confirm or reject its own prior findings*, and run it BEFORE the suite — it twice caught what a green suite hid |
+| v0.15.69 | **An independent whole-codebase review before tagging.** 25,918 lines and the help text, reviewed by a different model primed with `AGENTS.md`: verdict NOT SAFE TO TAG, with **seven CRITICAL findings all of the form "destroys or corrupts data and exits 0"**. Two reproduced verbatim first: `--rm -f -o data data` deleted BOTH the source and the archive after printing a success line, and the fixed `<output>.gzstd.tmp` name was symlink-followed, letting a pre-created symlink redirect the write over any writable file. Also: `fread` errors read as clean EOF at five sites (compress a prefix, install it, exit 0, then `--rm` the source), ignored `ftruncate`/`fsync` failures, device nodes silently skipped on `EPERM`, and a discarded `--rm` failure. Plus three tar write loops that spun on `write()==0`, and `re_enqueue` reintroducing the v0.15.66 seq inversion. **One reported hang did NOT reproduce** (seven fault-injection timings) and is recorded as hardening, not a fix. Help audit: 143 parser spellings vs 79/89 documented, 33 discrepancies, 12 HIGH — including an unqualified "drop-in-compatible" claim over ~30 silently-ignored zstd options |
+| v0.15.68 | The last unsorted queue, `RescueQueue`, turned out to be **unreachable** — no producer, no consumer, only `set_done()` — so it was removed (73 lines) rather than guarded. Sorting an unreachable push would have documented a hazard that cannot occur. ROADMAP's own "deadlock-free by construction (FIFO queue guarantees...)" claim annotated with what actually enforces it |
+| v0.15.67 | **v0.15.66 fixed two of three cycles.** Validation on the 256-thread box reproduced the deadlock 5/5 pre-fix and **still hung 2/30 after** — rising to 34/40 at 48 readers. The survivor was the cycle the original root-cause note described first: `pooled_read_chunks` claims its chunk index BEFORE acquiring a buffer, so the writer's next frame can be absent from the queue entirely, and sorted insert cannot order a frame that is not there. Fixed with a **bounded (max 1) head-of-line permit overdraft**; the bound matters because `-M` makes the budget a user-visible memory cap (unbounded measured a 2.6x overshoot). Every failing cell to zero, no perf cost |
+| v0.15.66 | **Multiple readers had quietly broken the invariant everything else assumed.** `--cpu-only` compress of a WARM source with >=9 pooled readers deadlocked permanently, ~20-25% of runs. One false premise stated in four places and enforced in none: "frames are pushed in seq order". A single reader made it true for free. Fixed by sorted insert in `TaskQueue::push` and by making the four per-worker output pools overdraft instead of block |
 | v0.15.65 | The reader controller **was grading noise**: baseline windows 16% apart against a fixed 5% margin. The gate now MEASURES the floor (last 4 baseline windows, `max(5%, spread)`) and holds instead of wandering. Suppression half verified on the server; the "still finds real structure" half is owed on the low-core box |
 | v0.15.63–v0.15.64 | **O_DIRECT refused almost every real file** — the v0.15.41 short-read guard could not tell EOF from a mid-file stall, so any input whose size is not 4096-aligned failed with exit 3 and no output, **on the default path**. It survived four versions because every generated test corpus is MiB-sized, hence aligned. Also: `--direct-read` took a memcpy branch the probe did not (1.50x slower on the same input), and the reader search was shown to be non-unimodal on a low-core box |
 | v0.15.54–v0.15.62 | **First execution on a PCIe Gen3, low-core box, and it found what only that box could.** The v0.15.48 unwind guard never ran (four defects hid behind it); `--adapt` persisted regime verdicts it never measured; the reader-pool controller climbed the wrong quantity in the 1-9 band the server never enters; the governor could not see three of its own reader paths (all three inputs to its source-busy fraction were wrong, in three different places — every fix corrected a MEASUREMENT, no constant was retuned); and telemetry claimed things it could not know |

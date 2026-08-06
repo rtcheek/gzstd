@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=371
-$EXTENSIVE && EXPECTED_TESTS=504
+EXPECTED_TESTS=372
+$EXTENSIVE && EXPECTED_TESTS=505
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -5956,6 +5956,28 @@ else
   if [[ $rc -eq 0 ]] && grep -q "Frames" <<<"$out" && grep -q "l.tar.zst" <<<"$out"; then
     pass "-l prints a frame summary"
   else fail "-l frame summary" "rc=$rc out=[$out]"; fi
+
+  # 1b. A NON-zstd input must print NOTHING to stdout — no table header, no row.
+  #     It used to emit the full header plus a row of zeros ("0 frames, 0.00 B,
+  #     ratio 0.000, Check None") and only then report that the file was not a
+  #     zstd stream, so the summary read as a real answer about a real archive.
+  #     Checks all four shapes, because the header is printed lazily now and the
+  #     interesting cases are the mixed ones.
+  printf 'this is definitely not a zstd stream\n' > "$TMPDIR/notzstd.bin"
+  bad_out=$("$GZSTD" -l "$TMPDIR/notzstd.bin" 2>/dev/null); bad_rc=$?
+  mix1=$("$GZSTD" -l "$LA" "$TMPDIR/notzstd.bin" 2>/dev/null)
+  mix2=$("$GZSTD" -l "$TMPDIR/notzstd.bin" "$LA" 2>/dev/null)
+  allbad=$("$GZSTD" -l "$TMPDIR/notzstd.bin" "$TMPDIR/notzstd.bin" 2>/dev/null)
+  if [[ -z "$bad_out" ]] && [[ $bad_rc -eq 4 ]] \
+     && [[ -z "$allbad" ]] \
+     && [[ $(grep -c "Frames" <<<"$mix1") -eq 1 ]] \
+     && [[ $(grep -c "Frames" <<<"$mix2") -eq 1 ]] \
+     && ! grep -q "notzstd" <<<"$mix1$mix2"; then
+    pass "-l prints no header or row for a non-zstd input"
+  else
+    fail "-l non-zstd input" "rc=$bad_rc bad=[$bad_out] mix1=[$mix1] mix2=[$mix2] allbad=[$allbad]"
+  fi
+  rm -f "$TMPDIR/notzstd.bin"
 
   # 2. plain -l frame count matches zstd -l (both walk the same frames).
   if command -v zstd >/dev/null 2>&1; then

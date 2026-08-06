@@ -43,8 +43,13 @@ silently compiled out.
   number exists it is either derived from geometry (the GPU size gate is
   `chunk_mib * gpu_batch_cap`) or measured at runtime. Policy constants that express a
   *tradeoff* rather than a machine (a 5% anti-flap margin, a recheck cadence) are fine.
+  The automatic 96-worker cap is one of those tradeoff constants — diminishing returns per
+  added compressor, not a statement about any machine — and reviewers keep reading it as a
+  violation. `-T 0` bypasses it deliberately.
 - **No sleep/poll loops in scheduling paths.** Timed condition-variable waits are used
   deliberately, even where the measured win is ~0. Do not "simplify" a CV wait to a sleep.
+  The two fixed-share GPU-bringup loops that violated this were replaced with a real
+  condition variable in v0.15.69; the rule now holds everywhere.
 - **Measure before claiming a performance change.** Median of 3, and say which box.
 - **The CPU-only build is a supported target**, not an afterthought.
 
@@ -160,42 +165,32 @@ silently compiled out.
 - The per-engine `cpu_gibs`/`gpu_gibs` EMAs are duty-cycle-biased. They seed the
   scheduler, which is a fair use; the backend *choice* was deliberately moved off them.
 
-### `--adapt` backend prior — open findings (as of v0.15.39, all opt-in-only)
+### `--adapt` backend prior — open findings
 
-What remains after four independent review passes, deliberately:
+**Ten entries were REMOVED from this list on 2026-08-06** because the code had moved on
+and they were being re-reported as live by every reviewer. What is left is genuinely open:
 
-- **A residency bucket mixes durations.** Short workloads where hybrid declines by
-  policy and longer ones where it would engage share a bucket, so a hybrid rate
-  corrected downward on a short run can be inherited by a longer GPU-worthy run
-  until the recheck cadence fires. Keying by duration/work class would close it.
-- **A sub-floor probe records nothing at all** — not even `runs` — so a probe the
-  predictor allowed that then finishes under the save floor leaves no trace. The
-  `explorable` predictor guards it (now using an input-domain rate), but a
-  stamp-only save for deliberate attempts would close it properly.
-- **`g_adapt_gpu_engaged` is set when workers SPAWN, not when a batch completes.**
-  The drained-queue guards now prevent the common false positive (workers spawned
-  onto an empty queue), but a worker that spawns and then fails could still be
-  counted. Moving the flag to the first successfully delivered batch is the
-  complete fix.
-- The `-d --tar` pool controller's rate signal is parse progress, not write
-  progress, and the GPU lazy-spawn's remaining-work estimate rides on it.
-- GPU batch head-of-line blocking: a parse thread can wait a whole H2D + decode +
-  D2H round trip for a frame that landed at the end of a 64-item batch.
-- The extract governor never reads the supervisor's `ewgrow_cap_`, so a
-  cap-clamped final grow round can persist a pool size that never existed.
-- `q_max_bytes_` is sized from the base pool and never resized when it grows.
-- CLI ergonomics: `--watchdog SECS` accepts only the `=` form; `-T -5` is silently ignored;
-  `-0` is a usage error where zstd maps it to its default level.
-- An exception escaping the compress reader region would meet ~6 joinable threads
-  and call `std::terminate`. Pre-existing; `die()` is `std::exit`, so the fatal
-  path itself is safe. Fixing it means restructuring teardown in the same region a
-  review already found a race in, so it wants its own change and its own suite run.
-- The decompress size estimator opens and preads up to 1 MiB **per input**, so a
-  very long input list pays that at startup.
-- The O_DIRECT bounce aggregate is held near 256 MiB only while the writer pool
-  stays at or under 256 writers; past that the 1 MiB per-thread floor wins and the
-  total grows with the pool again. Accepted: smaller writes would cost more than
-  the memory saves.
+- GPU batch head-of-line blocking: a parse thread can wait a whole H2D + decode + D2H
+  round trip for a frame that landed at the end of a 64-item batch.
+- The O_DIRECT bounce aggregate is held near 256 MiB only while the writer pool stays at
+  or under 256 writers; past that the 1 MiB per-thread floor wins and the total grows with
+  the pool again. Accepted: smaller writes would cost more than the memory saves.
+
+**Closed since v0.15.39** (do not re-report; verified against the tree 2026-08-06):
+residency buckets are gated by the engagement-duration floor; deliberate sub-floor probes
+save an attempt stamp; `g_adapt_gpu_engaged` is set on the first DELIVERED frame, not at
+worker spawn (`gzstd.cpp`, search the flag — both compress and decompress carry the
+rationale inline); the `-d --tar` pool controller reads committed write bytes, not parse
+progress; the extract governor clamps against the supervisor's `ewgrow_cap_`;
+`q_max_bytes_` is resized when the pool grows; indexed full extraction is partitioned
+across parse workers, so tar parsing is no longer universally serial; the compress reader
+region has a `ThreadGuard` teardown plus a top-level exception boundary in `main` (thread
+*creation* failure before the guard is constructed remains uncovered); and the decompress
+size estimator samples at most four inputs and scales the rest.
+
+**CLI items closed:** separated `--watchdog SECS` works, `-T -5` is rejected in every
+spelling (v0.15.69 extended that to the attached `-T-5` / `-T=-5` forms), and `-0` maps to
+the default level.
 
 ## What good review output looks like
 

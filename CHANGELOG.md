@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.68  
+**Covers:** v0.9.50 → v0.15.69  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,87 @@
 ---
 
 
+## v0.15.69 — an independent whole-codebase review before tagging, and the seven ways output could be lost
+
+24 commits had landed since the last tag with no full-codebase review, and tagging is
+deployment here. An independent reviewer (a different model, primed with `AGENTS.md` and
+given the tree but not this project's conclusions) was pointed at all 25,918 lines, plus a
+separate pass auditing the built-in help against the parser. Verdict: **NOT SAFE TO TAG**.
+
+**Seven CRITICAL findings, every one of them "destroys or corrupts data and exits 0."**
+Two were reproduced verbatim before any fix was written:
+
+- **`--rm` with input and output naming the same file deleted both.** `gzstd --rm -f -o data data`
+  printed `75.37% (3.86 MiB => 2.91 MiB)`, exited 0, and left an empty directory: the temp
+  was renamed onto the input path, then the post-success unlink removed that same path.
+  Now rejected before the output is opened, by FILE IDENTITY rather than string compare, so
+  a symlink or hard link to the input is caught too.
+- **The atomic-overwrite temp file was a fixed name opened with `fopen("wb")`.** Pre-creating
+  `archive.zst.gzstd.tmp` as a symlink made gzstd truncate and write through it, then rename
+  the symlink over the output — arbitrary file clobbering from a guessable name in a shared
+  directory, confirmed by turning `archive.zst` into a symlink and overwriting a bystander
+  file with 2 MB of compressed data. Now a unique same-directory name created
+  `O_CREAT|O_EXCL|O_NOFOLLOW`, which also stops two concurrent writers sharing one temp
+  inode. The mode is restored to `0666 & ~umask` afterwards: an `O_EXCL` create at 0600 gets
+  renamed over the output, so shipping it would have silently tightened every archive's
+  permissions.
+- **`fread` errors were read as clean EOF at five sites.** A read failing partway through a
+  file ended the stream, the prefix compressed "successfully", the archive was installed,
+  exit was 0 — and with `--rm` the source was then deleted. Demonstrated with an input that
+  fails immediately: v0.15.68 produced a 0-byte archive and exit 0; now exit 3 with the
+  incomplete output removed. The sliding-window path checks the SHORT-read branch too,
+  because a short read is what ends that stream.
+- `DirectWriter::finalize()` ignored `ftruncate` failure, accepting an output with a
+  zero-filled tail past the real data. `--sync-output` ignored `fsync` failure at both the
+  buffered and O_DIRECT sites, so the durability the user asked for could silently not
+  happen before the rename and the source deletion. Non-root extraction skipped device nodes
+  on `EPERM` with only a `-v` message, producing a silently incomplete tree at exit 0 (GNU
+  tar errors here too). A failed `--rm` was discarded entirely; it now reports and exits 3,
+  keeping the completed output.
+
+**Two HIGH:** three tar-extract write loops spun forever on a zero-length `write()` return,
+now treated as I/O failure like `pwrite_all` already did; and `re_enqueue()` still pushed
+whole batches to the deque front, which reintroduced exactly the seq inversion v0.15.66
+exists to prevent as soon as two GPU workers requeued concurrently — the gap left by that
+fix, in the path whose own comment first described the hazard. It now inserts by seq.
+
+**Also:** `--gpu-devices` accepted negative values that could drive the worker count below
+zero; `-T-5` and `-T=-5` were silently treated as auto while the separated `-T -5` was
+rejected; `--no-progress` was implemented by lowering DEFAULT verbosity, so `-v --no-progress`
+in either order left the meter running; a `-l` input-open failure reported exit 4 (data
+error) instead of 3. The two fixed-share GPU-bringup loops that polled at 1 ms now wait on a
+condition variable, so the project's own no-sleep-in-scheduling-paths rule finally holds.
+
+**One reported finding did NOT reproduce and is recorded as such.** The review called a
+GPU-fault hang in `--tar` assembly "confirmed", and it was one of the four stated reasons for
+NOT SAFE TO TAG. Seven fault-injection timings (`GZSTD_DEBUG_FAIL_GPU_AFTER` = 0, 1, 3, 8,
+20, 50, with and without `--adapt`) all completed on the pre-fix binary. The abort check runs
+BEFORE `next_chunk.fetch_add`, so a reader that has already claimed an index still deposits
+it and the pusher's exact-index wait stays satisfiable. The abort escapes were added anyway —
+that liveness argument is invisible from the wait site and one edit away from being wrong —
+but the comments say plainly that the hang was not observed.
+
+**The help was audited against the parser: 33 discrepancies, 12 HIGH.** The parser accepts
+143 flag spellings; short help documented 79 and long help 89, with no phantom flags. Four of
+the 33 were fixed in code rather than in prose (above). The rest are corrected here, the
+largest being a new COMPATIBILITY OPTIONS section: the "drop-in-compatible replacement" claim
+was unqualified while roughly 30 zstd options were accepted and silently ignored — including
+`--no-check`, which does not disable checksums — and dictionary training warns and then
+compresses normally, producing no dictionary. Also corrected: `--overwrite` creates a new
+inode rather than truncating in place (hard links keep the old content); `--read-threads` does
+not disable the cold-input read probe and is ignored entirely if O_DIRECT wins it; `-M` is not
+a hard memory cap on compression; `--throttle-frames` is raised to the GPU batch floor;
+`--gpu-only` still uses CPU for rescue and verify, and exits 2 (not 5) with no GPU; GPU tuning
+flags imply `--hybrid`; `-T 0` reserves I/O cores rather than being uncapped; and `--calibrate`
+existed only in short help.
+
+`AGENTS.md` lost ten "known-open" entries that the tree had already closed — both review
+passes independently flagged them, and stale known-opens actively mislead the next reviewer.
+
+Suites green after every individual fix (371 default), and **371 / 504 / 290 + 70 skipped**
+on both build configurations at the end.
+
+---
 ## v0.15.68 — the last unsorted queue turned out to be unreachable, so it is gone instead of guarded
 
 v0.15.66 and v0.15.67 left one loose end on record: `RescueQueue::push` still appended
