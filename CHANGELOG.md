@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.67  
+**Covers:** v0.9.50 → v0.15.68  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,37 @@
 ---
 
 
+## v0.15.68 — the last unsorted queue turned out to be unreachable, so it is gone instead of guarded
+
+v0.15.66 and v0.15.67 left one loose end on record: `RescueQueue::push` still appended
+unsorted, the same shape as the bug that wedged `TaskQueue`. It was deliberately left alone
+as "a low-volume GPU-failure fallback". Going back to sort it found something better —
+**nothing ever calls it.**
+
+One instance, declared in `decompress_nvcomp` and passed to `gpu_decomp_worker`, which never
+references the parameter. The only method invoked on it anywhere in the file is `set_done()`.
+No producer, no consumer. Three separate comments already say why: the rescue path *was*
+deleted — *"the old rescue queue / re-enqueue / gpu_only_cpu_fallback machinery was
+deleted"*, *"the old rescue/fallback machinery (which re-compressed the tail only to throw it
+away) was deleted"*, and *"(No CPU 'rescue' pool: a GPU fault aborts the whole compress pass
+…)"*. The code that used the queue went away; the plumbing did not.
+
+Sorting an unreachable push would have added a comment describing a hazard that cannot occur
+— which is the exact species of claim that hid the original deadlock for months. The class,
+its instance, the unused worker parameter, the call-site argument and the `set_done()` call
+are removed instead: **73 lines deleted, 2 added.** No behaviour change; a GPU fault on
+decompress already finishes on CPU inside the worker and keeps its output.
+
+Also annotated in `ROADMAP.md`: the v0.12.0 entry's claim that the throttle is *"deadlock-free
+by construction (FIFO queue guarantees the writer's next frame is always in-flight)"*, and the
+v0.14.70 entry's *"submit order = pop order = seq order"*. **Those two sentences are the
+premise that was asserted in four places and enforced in none**, and they read as settled
+design rather than as an assumption. Both now carry what actually enforces them, and the
+warning not to restate the guarantee without naming the mechanism.
+
+Suites: 371 / 290 + 70 skipped, green on both build configurations.
+
+---
 ## v0.15.67 — v0.15.66 fixed two of the three cycles, and the third was the one written down first
 
 v0.15.66 was validated on the 256-thread box, which is where it was predicted to matter most. It reproduced there — **5/5 hangs on the pre-fix binary** on the deterministic cell, all 99 threads in `futex_wait_queue`, `rchar` frozen, `wchar: 0`. Then the same cell was run against the **fixed** binary: **2/30 hangs.** The fix was incomplete.

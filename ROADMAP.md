@@ -77,6 +77,18 @@ Prevents workers from producing data faster than the NVMe can write. Evolved thr
 1. **v0.11.24–v0.11.42:** `WriterBackpressure` with byte-based hysteresis (4 GiB high / 2 GiB low water marks). Required `writer_stalled_` escape hatch to avoid deadlock from out-of-order frames inflating the backlog.
 2. **v0.12.0:** `FrameThrottle` counting semaphore (512 max in-flight frames). Workers acquire permits before popping; writer releases permits after writing. Deadlock-free by construction (FIFO queue guarantees the writer's next frame is always in-flight). Removed ~60 lines of complexity.
 
+> **⚠️ That parenthesis was false for four years, and this is the sentence that hid it.**
+> "FIFO queue guarantees the writer's next frame is always in-flight" was true only while a
+> *single* reader existed to make it true for free — it was asserted here, in
+> `TaskQueue::re_enqueue`, and at two output pools, and enforced nowhere. The multi-reader
+> pooled reader broke it three separate ways, all of which wedged permanently
+> (v0.15.66–v0.15.67; see CHANGELOG). It now holds because it is *enforced*: `TaskQueue::push`
+> inserts sorted by seq, the four per-worker output pools overdraft instead of blocking, and
+> `FrameThrottle::acquire_or_overdraft` lets the writer's next-needed frame past an exhausted
+> budget — because a reader can claim a chunk index before the frame reaches the queue at all,
+> which no amount of queue ordering can fix. **Do not restate the guarantee without saying
+> which mechanism enforces it.**
+
 - Decompress (v0.11.24): sys time 19m → 6m, throughput +56% on 432 GiB hybrid
 - Compress (v0.11.29): wired for `compress_cpu_mt`, `compress_nvcomp`, and rescue workers
 - GPU throttle (v0.11.31): GPUs now wait before `pop_batch_greedy`  fixed 28% write drain issue where 8 H100s overwhelmed the NVMe
@@ -109,6 +121,10 @@ Design decisions (see CHANGELOG v0.14.70 for the full rationale):
 - FIFO (submit-order) drain is writer-optimal: submit order = pop order = seq order, so
   the in-order writer's head-of-line frame is always at the front of some device's FIFO —
   this strengthens the deadlock-freedom argument rather than weakening it.
+  **⚠️ "pop order = seq order" is another statement of the premise annotated at the
+  `FrameThrottle` entry above, and it needs the same caveat**: it holds only *within* one
+  device's FIFO. The writer needs the global minimum unwritten seq, which may sit in another
+  stream, in a per-worker pool, or — as v0.15.67 found — not yet in the queue at all.
 - `[[project_throttle_hybrid_deadlock]]` invariant preserved (wait without permits →
   acquire → non-blocking pop); the v0.14.60 self-busy special case is structurally
   obsolete and deleted.  Aligns with `[[feedback_no_fixed_waits]]` — no spin remains.

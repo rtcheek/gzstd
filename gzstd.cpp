@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.67";
+static constexpr const char * GZSTD_VERSION = "0.15.68";
 //
 // Architecture overview:
 //
@@ -6818,74 +6818,6 @@ private:
   std::atomic<size_t>     total_tasks_{0};
 };
 
-// Queue for "rescue" tasks: chunks that a failed GPU worker couldn't compress
-// get re-routed here for CPU fallback compression.
-class RescueQueue {
-public:
-  void push(Task && t)
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    q_.push_back(std::move(t));
-    cv_.notify_one();
-  }
-
-  bool pop_one(Task & t)
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    while (q_.empty() && !done_) cv_.wait(lk);
-    if (q_.empty() && done_) return false;
-
-    t = std::move(q_.front());
-    q_.pop_front();
-    return true;
-  }
-
-  // Block until the queue has at least one task or is done.
-  // Returns false when drained (caller should exit).
-  bool wait_for_work()
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    while (q_.empty() && !done_) cv_.wait(lk);
-    return !(q_.empty() && done_);
-  }
-
-  // Non-blocking pop: returns 1 if got a task, 0 if empty, -1 if drained.
-  int try_pop_one(Task & t)
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    if (q_.empty() && done_) return -1;
-    if (q_.empty()) return 0;
-    t = std::move(q_.front());
-    q_.pop_front();
-    return 1;
-  }
-
-  bool drained()
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    return q_.empty() && done_;
-  }
-
-  size_t size()
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    return q_.size();
-  }
-
-  void set_done()
-  {
-    std::unique_lock<std::mutex> lk(m_);
-    done_ = true;
-    cv_.notify_all();
-  }
-
-private:
-  std::mutex              m_;
-  std::condition_variable cv_;
-  std::deque<Task>        q_;
-  bool                    done_ = false;
-};
-
 // Holds compressed output frames indexed by sequence number, allowing the
 // writer thread to emit them in order even though workers finish out-of-order.
 // Output-frame buffer.  shared_ptr so that workers can hold a reference
@@ -13106,7 +13038,7 @@ static FrameBuf decode_seek_frame(int fd,
 // clean data error (genuine corruption), exactly matching the CPU path.
 //
 // Deliberately lean vs the streaming decompress_nvcomp worker: no auto-tuner,
-// no HybridSched, no ResultStore/RescueQueue, no pinned-memory budget, no
+// no HybridSched, no ResultStore, no pinned-memory budget, no
 // out-buffer recycling.  It just turns {frame indices} into {FrameBufs} on a
 // GPU-rich box whose few CPU decoders would otherwise leave the streams idle.
 // nvCOMP zstd decode is capped at GPU_SUBCHUNK_MAX per chunk, so the caller
@@ -19890,7 +19822,6 @@ static void gpu_decomp_worker(
   int slot_index,
   Options opt,
   TaskQueue * queue,
-  RescueQueue * rescue,
   ResultStore * results,
   Meter * m,
   HybridSched * sched,
@@ -21052,7 +20983,6 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 
   // ---- Shared state ----
   TaskQueue queue;
-  RescueQueue rescue;
   ResultStore results;
   std::atomic<bool> any_gpu_failed{false};
   std::atomic<bool> abort_on_failure{ opt.gpu_only };
@@ -21301,7 +21231,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 
     for (int i = 0; i < gpu_count; ++i) {
       gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], i, opt,
-                               &queue, &rescue, &results, m, sched,
+                               &queue, &results, m, sched,
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
                                &shared_tune_decomp,
@@ -21452,7 +21382,6 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         vlog(V_DEFAULT, opt, "WARNING: " + s + suffix);
   }
 
-  rescue.set_done();
   // After all GPUs have exited, ensure CPU workers are unblocked.
   // GPU unregister_gpu_stream already drops the floor and notifies, but
   // re-notify here as a safety net in case any CPU worker missed it.
