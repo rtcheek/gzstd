@@ -32,12 +32,30 @@ defects, including four versions where it did not compile at all.
 ## Tests
 
 ```bash
-./gzstd-test.sh                # run all tests (300+)
-./gzstd-test.sh ./build/gzstd  # explicit binary path
-./gzstd-test.sh -e             # extensive: adds zstd CLI-compat sections
+./gzstd-test.sh ./build/gzstd         # THE NORMAL RUN — before every commit
+./gzstd-test.sh ./build-cpu/gzstd     # CPU-only build (USE_NVCOMP=OFF) — cheap, ~1.4 min
+./gzstd-test.sh -e ./build/gzstd      # OPT-IN, see below
 ```
 
-GPU tests are automatically skipped if no GPU is detected. Run before every commit; run `-e` after any arg-parsing or zstd-compat change.
+(`RELEASING.md` and `AGENTS.md` call that second build directory `build-nogpu`; both names
+are in use for the same `USE_NVCOMP=OFF` configuration.)
+
+**The default run is the normal one.** Reach for `-e` only when the change is substantial
+enough to warrant it — always for `parse_args`, argument parsing, bundled-flag expansion or
+the zstd-compat flag layer, whose test sections are `$EXTENSIVE`-gated and therefore never
+run by default. The extensive run costs ~14 min against ~9.5 min for the default.
+
+**When you do run `-e`, do not also run the default** — `-e` is a strict superset. Every
+extensive gate is `if $EXTENSIVE; then … fi` and none exclude, so running both repeats the
+default's tests for ~9.5 min of nothing.
+
+**The CPU-only run is orthogonal to both** — a different *binary*, not a smaller test
+selection. `USE_NVCOMP=OFF` compiles ~50 conditional regions the other way, which no number
+of tests against the GPU build can reach. It is also the cheapest of the three, and the
+configuration where defects hide.
+
+GPU tests are automatically skipped if no GPU is detected, so the CPU-only run reports a
+lower total (skips, not failures).
 
 ## Benchmarks
 

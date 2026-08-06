@@ -32,16 +32,30 @@ hosts are real and the configuration is supported.
 
 ## 2. Test suites
 
+Two runs, one per build configuration:
+
 ```bash
-./gzstd-test.sh ./build/gzstd            # default, GPU build
-./gzstd-test.sh -e ./build/gzstd         # extensive: adds the zstd CLI-compat sections
+./gzstd-test.sh -e ./build/gzstd         # extensive, GPU build (superset of the default run)
 ./gzstd-test.sh ./build-nogpu/gzstd      # CPU-only build
 ```
 
-All three must be **0 failures**, and the default/extensive runs must show **no drift
-note** (`EXPECTED_TESTS` matching the number that ran). The CPU-only run reports a lower
-total because GPU sections skip — that is expected; `EXPECTED_TESTS` is documented as
-assuming a GPU is present.
+Both must be **0 failures**, and the extensive run must show **no drift note**
+(`EXPECTED_TESTS` matching the number that ran). The CPU-only run reports a lower total
+because GPU sections skip — that is expected; `EXPECTED_TESTS` is documented as assuming a
+GPU is present.
+
+**The default `./gzstd-test.sh ./build/gzstd` was dropped from this checklist (2026-08-06)
+because it is a strict subset of `-e`.** Every extensive gate in the script is
+`if $EXTENSIVE; then … fi`; none exclude, so `-e` runs the default set plus the compat
+sections. Measured on the 256-thread box: default 9.5 min, extensive 14 min, CPU-only
+1.4 min — dropping the default cut the pre-tag suite time from ~25 to ~15.5 min with no
+loss of coverage. **The CPU-only run stays**: it is a different binary (~50 `HAVE_NVCOMP`
+conditional regions compile the other way), so `-e` cannot substitute for it at any test
+count, and it is the cheapest of the three.
+
+**Pre-tag is the one place `-e` always runs.** Day to day the default run is the normal one
+and `-e` is opt-in for substantial changes — see `CLAUDE.md`. A tag is deployment, so the
+wider net is warranted here regardless of how small the change looked.
 
 Never rebuild the binary while a suite is running against it.
 

@@ -20,10 +20,17 @@ persists per-machine verdicts to `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json
 ```bash
 cmake -B build && cmake --build build -j$(nproc)     # GPU build (USE_NVCOMP=ON)
 cmake -B build-nogpu -DUSE_NVCOMP=OFF && cmake --build build-nogpu -j$(nproc)
-./gzstd-test.sh ./build/gzstd        # default suite    (expect 360/0)
-./gzstd-test.sh -e ./build/gzstd     # extensive        (expect 493/0)
-./gzstd-test.sh ./build-nogpu/gzstd  # CPU-only         (expect 279/0, 70 skipped)
+./gzstd-test.sh ./build/gzstd        # THE NORMAL RUN  (expect 371/0)
+./gzstd-test.sh ./build-nogpu/gzstd  # CPU-only        (expect 290/0, 70 skipped)
+./gzstd-test.sh -e ./build/gzstd     # opt-in          (expect 504/0)
 ```
+
+**The default run is the normal one.** Use `-e` only when the change is substantial enough
+to warrant it — always for arg parsing or the zstd-compat flag layer, whose sections are
+`$EXTENSIVE`-gated and never run by default. **When you do run `-e`, do not also run the
+default**: it is a strict subset (every extensive gate is `if $EXTENSIVE; then … fi`, none
+exclude). The CPU-only run is a subset of neither — it is a different binary, so `-e` cannot
+substitute for it.
 
 **Build BOTH configurations before claiming anything.** `USE_NVCOMP=OFF` is the config
 nobody compiles and it has hidden six defects in the last week, including one where it
