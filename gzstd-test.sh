@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=370
-$EXTENSIVE && EXPECTED_TESTS=503
+EXPECTED_TESTS=371
+$EXTENSIVE && EXPECTED_TESTS=504
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3797,6 +3797,38 @@ else
   fail "multi-reader out-of-order frames do not wedge the in-order writer"
 fi
 rm -f "$TMPDIR/lv4.bin" "$TMPDIR/lv4.zst" "$TMPDIR/lv4.out"
+
+# 5. The THIRD cycle, which case 4 above is too weak to catch (fixed v0.15.67).
+#    v0.15.66 made pushes seq-ordered, but pooled_read_chunks claims its chunk
+#    index BEFORE it acquires a buffer and preads — so the frame the writer needs
+#    can be claimed and not yet in the queue at all while workers spend every
+#    permit on later frames.  Sorted insert cannot order a frame that is absent.
+#    Fixed by letting the throttle OVERDRAFT one permit for the head-of-line
+#    frame (FrameThrottle::acquire_or_overdraft).
+#    Why these knobs: the failure rate scales with READER COUNT against a small
+#    permit budget, so this uses many more readers than case 4 (which hung only
+#    2/30 on the v0.15.66 binary — too flaky to regress on).  Measured on the
+#    256-thread box at 48 readers / 32 permits: 34/40 hangs before, 0/40 after.
+#    LOOPED 3x deliberately: a single run of an ~85% failure reproduces only 85%
+#    of the time, which is not a regression test.
+yes "the quick brown fox jumps over the lazy dog 0123456789" \
+  | head -c 134217728 > "$TMPDIR/lv5.bin" 2>/dev/null
+cat "$TMPDIR/lv5.bin" > /dev/null            # warm: the precondition, not incidental
+lv5_ok=1
+for _ in 1 2 3; do
+  timeout 60 "$GZSTD" --cpu-only --no-direct-read --no-mmap --read-threads 48 \
+       --throttle-frames=32 --chunk-size 1 -f -o "$TMPDIR/lv5.zst" "$TMPDIR/lv5.bin" \
+       >/dev/null 2>&1 || { lv5_ok=0; break; }
+  [ -s "$TMPDIR/lv5.zst" ] || { lv5_ok=0; break; }
+done
+if [ "$lv5_ok" = 1 ] \
+   && timeout 60 "$GZSTD" -d -f -o "$TMPDIR/lv5.out" "$TMPDIR/lv5.zst" >/dev/null 2>&1 \
+   && cmp -s "$TMPDIR/lv5.bin" "$TMPDIR/lv5.out"; then
+  pass "head-of-line frame absent from the queue does not wedge the throttle"
+else
+  fail "head-of-line frame absent from the queue does not wedge the throttle"
+fi
+rm -f "$TMPDIR/lv5.bin" "$TMPDIR/lv5.zst" "$TMPDIR/lv5.out"
 
 rm -rf "$TMPDIR/lv" "$TMPDIR/lv2" "$TMPDIR"/lv*.tar.zst
 

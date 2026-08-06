@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.66  
+**Covers:** v0.9.50 → v0.15.67  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,29 @@
 ---
 
 
+## v0.15.67 — v0.15.66 fixed two of the three cycles, and the third was the one written down first
+
+v0.15.66 was validated on the 256-thread box, which is where it was predicted to matter most. It reproduced there — **5/5 hangs on the pre-fix binary** on the deterministic cell, all 99 threads in `futex_wait_queue`, `rchar` frozen, `wchar: 0`. Then the same cell was run against the **fixed** binary: **2/30 hangs.** The fix was incomplete.
+
+The residual is not noise, and it does not scale with the thing v0.15.66 addressed. Warm, `--chunk-size 1`, `--throttle-frames=32`, 40 runs per cell:
+
+| readers | 4 | 8 | 12 | 16 | 24 | 32 | 48 |
+|---|---|---|---|---|---|---|---|
+| hangs / 40 | 0 | 0 | 1 | 7 | 13 | 25 | 34 |
+
+**Scaling with READER COUNT is the signature of the claim-ahead window, not of queue ordering** — and it points straight back at the cycle this project's own root-cause note described first, before cycles A and B were found and fixed. `pooled_read_chunks` claims its chunk index (`next_idx.fetch_add`) **before** it acquires a buffer and preads. So frame *k* can be claimed and **not yet queued at all** while workers commit every permit to frames > *k*. The writer needs *k*, so it never releases a permit; every worker parks in `acquire()`. **Sorted insert orders what is in the queue — it cannot order a frame that is not there to sort.**
+
+The fix is the principle v0.15.66 already applied to the four output pools, applied one level up to the permits themselves. `FrameThrottle::acquire_or_overdraft` takes a permit, or — when none is available and the frame at the head of the queue is the one the in-order writer is waiting for — **takes it anyway**, letting `permits_` go negative. Both paths decrement, so the writer's later `release(1)` stays symmetric and no caller needs to know which it took. `TaskQueue::push` keeps a pointer to the throttle and pokes it after each insert (with the queue lock **released**, so the only lock order is throttle → queue and there is no ABBA cycle), because in the wedge case no `release()` will ever come to signal the CV on its own.
+
+**At most one overdraft is outstanding** (`permits_` never goes below -1). That bound matters: `-M` makes the budget a user-visible memory cap, and an unbounded version measured `peak=83/32` — a 2.6x overshoot. Bounded, it is `peak=33/32`, exactly one frame. One is sufficient, because the cycle needs exactly the writer's next frame to get through, and once that frame is written its release repays the overdraft.
+
+**Every failing cell goes to zero**: 48 readers 0/40 (was 34/40), 32 readers 0/40 (was 25/40), 24 readers 0/40 (was 13/40), 12 readers 0/30 (was 2/30), plus 0/30 at 64 readers and 0/30 at 96 readers/16 permits — harsher than anything previously tested. Round trip byte-identical and stock `zstd -t` validates the output. `-vv` now reports `head_of_line_overdrafts=` so the mechanism is observable rather than inferred.
+
+**Reachability, measured rather than assumed.** The default path on the 256-thread box never wedged, pre- or post-fix — on a warm regular file it takes **mmap**, not the pooled multi-reader, and its compress sink is fast enough that reads never outrun it. The failure needs a small permit-to-reader ratio *and* small frames, which `-M` reaches with no debug knob: `-M 32 --chunk-size 1 --read-threads 24` hung **10/30** before this change and 0/30 after. So the earlier claim that a high core count is the risk factor was wrong — **the precondition is a slow sink relative to reads**, which is why the 24-thread box is where it bit at default settings.
+
+Also corrected: the GPU-path `acquire_out_buf` header comment still asserted the blocking behaviour and the ascending-seq premise that v0.15.66 had already removed from the code beneath it. That species of stale comment is what hid this bug for months.
+
+---
 ## v0.15.66 — multiple readers had quietly broken the invariant everything else assumed
 
 v0.15.65 owed one test to the low-core box: does the new measured-noise-floor gate over-suppress where the real differences are small and the distributions tight? It does not — the floor measures **1.028-1.115x there against the 256-core box's 1.16-1.27x**, it self-calibrates exactly as designed, and all five runs probed both directions and correctly settled on 3. Re-running the sweep to establish that, however, wedged for 100 minutes on a three-second job.

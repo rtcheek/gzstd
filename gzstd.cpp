@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.66";
+static constexpr const char * GZSTD_VERSION = "0.15.67";
 //
 // Architecture overview:
 //
@@ -6376,6 +6376,8 @@ static void gz_direct_read_abort() {
 #endif
 }
 
+class FrameThrottle;   // declared below; TaskQueue only pokes it through a pointer
+
 class TaskQueue {
 public:
   void push(Task && t)
@@ -6426,7 +6428,27 @@ public:
     ++total_tasks_;
     cv_.notify_all();      // wake all GPU workers waiting in wait_for_batch_or_cap
     cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
+    lk.unlock();           // MUST precede the poke — see notify_throttle_()
+    notify_throttle_();
   }
+
+  // The head of the deque is the lowest queued seq (push keeps it sorted), so
+  // this answers "is the frame the in-order writer is waiting for available to
+  // pop right now?".  Used as the overdraft predicate in
+  // FrameThrottle::acquire_or_overdraft; `<=` rather than `==` so a frame that
+  // somehow sorts below the write cursor still counts as urgent.
+  bool front_seq_at_most(size_t s) const
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    return !q_.empty() && q_.front().seq <= s;
+  }
+
+  // A worker parked in the throttle with zero permits cannot see that a push
+  // just made the writer's next-needed frame available — the throttle's CV is
+  // only signalled by release(), and in the wedge case no release will ever
+  // come.  Poking it re-runs every waiter's predicate.  Defined out of line
+  // because FrameThrottle is declared after this class.
+  void set_throttle(FrameThrottle * bp) { throttle_ = bp; }
 
   // Cap the number of queued (read-but-not-popped) frames for producer
   // backpressure.  0 = unbounded (default).  Set before the producer starts.
@@ -6466,6 +6488,8 @@ public:
     batch.clear();
     cv_.notify_all();
     cpu_cv_.notify_one();
+    lk.unlock();
+    notify_throttle_();   // these are the OLDEST frames — the writer may want one
   }
 
   // Pop a single task (used by CPU workers).
@@ -6778,10 +6802,13 @@ private:
     return t;
   }
 
-  std::mutex              m_;
+  void notify_throttle_();           // defined after FrameThrottle
+
+  mutable std::mutex      m_;        // mutable: front_seq_at_most() is a const probe
   std::condition_variable cv_;
   std::condition_variable cpu_cv_;   // dedicated CV for CPU workers (avoids spurious wakes from GPU pops)
   std::condition_variable space_cv_; // producer waits here when a bounded queue is full
+  FrameThrottle *         throttle_ = nullptr;  // optional; poked after each push
   std::deque<Task>        q_;
   bool                    done_ = false;
   size_t                  max_depth_ = 0;  // 0 = unbounded (default); >0 caps queued frames (ROADMAP 7.8)
@@ -7206,6 +7233,11 @@ struct ResultStore {
   std::condition_variable                        cv;
   std::unordered_map<size_t, FrameBuf>           data;           // seq -> compressed frame
   size_t                                         next_to_write = 0;
+  // Lock-free mirror of next_to_write for the throttle's overdraft predicate,
+  // which runs under the throttle mutex and must not reach for `m`.  Advisory:
+  // it may lag by one frame, which only ever costs a missed overdraft (the next
+  // push pokes again), never a spurious one that could unbound memory.
+  std::atomic<size_t>                            next_pub{0};
   size_t                                         total_tasks   = 0;
   bool                                           producer_done = false;
   bool                                           workers_done  = false;
@@ -7288,6 +7320,83 @@ public:
       disabled_(max_in_flight <= 0) {}
 
   bool disabled() const { return disabled_; }
+
+  // Acquire ONE permit, OR OVERDRAFT when the frame at the head of the queue is
+  // the one the in-order writer is waiting for.
+  //
+  // Why this exists (v0.15.67).  v0.15.66 restored seq-ordered pushes, but that
+  // only orders frames ALREADY in the queue.  `pooled_read_chunks` claims its
+  // chunk index (next_idx.fetch_add) BEFORE it acquires a buffer and preads, so
+  // frame k can be claimed and NOT YET QUEUED while workers commit every permit
+  // to frames > k.  The writer needs k, so it never releases a permit, and every
+  // worker parks in acquire() — a circular wait that sorted insert cannot break
+  // because the frame it would sort is not there to sort.
+  //
+  // Measured before this fix (256-thread box, warm, --chunk-size 1,
+  // --throttle-frames=32, 40 runs per cell): 4 readers 0 hangs, 8 -> 0, 12 -> 1,
+  // 16 -> 7, 24 -> 13, 32 -> 25, 48 -> 34.  Scaling with READER COUNT is the
+  // signature of the claim-ahead window, not of queue ordering.
+  //
+  // The fix is the same principle the four per-worker output pools already use:
+  // the head-of-line frame is about to be written and its permit returned, so
+  // letting exactly it through adds at most one frame of in-flight memory —
+  // which is why permits_ is ALLOWED TO GO NEGATIVE here.  Both paths decrement,
+  // so the writer's later release(1) stays symmetric and callers never need to
+  // know which one they took.
+  //
+  // `urgent` is evaluated under m_ and takes the TaskQueue lock; the poke() that
+  // wakes us is issued with NO queue lock held, so the order is only ever
+  // m_ -> queue lock and there is no ABBA cycle.
+  template <class Pred>
+  void acquire_or_overdraft(Pred urgent) {
+    if (disabled_) return;
+    std::unique_lock<std::mutex> lk(m_);
+    bool waited = false;
+    std::chrono::steady_clock::time_point t0;
+    for (;;) {
+      if (done_) break;                    // shutdown: take nothing, as acquire() does
+      if (permits_ > 0) { --permits_; break; }
+      // AT MOST ONE outstanding overdraft (permits_ never below -1), so peak
+      // in-flight is bounded by max_+1 — one frame, which matters because -M
+      // makes this a user-visible memory cap.  One is sufficient: the cycle
+      // needs exactly the writer's next frame to get through, and once it is
+      // written its release repays the overdraft and the pipeline moves again.
+      if (permits_ == 0 && urgent()) {
+        --permits_;
+        overdrafts_.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      if (!waited) { waited = true; t0 = std::chrono::steady_clock::now(); }
+      cv_.wait(lk, [&] {
+        return permits_ > 0 || done_ || (permits_ == 0 && urgent());
+      });
+    }
+    int observed = max_ - permits_;
+    int prev = peak_in_flight_.load(std::memory_order_relaxed);
+    while (observed > prev &&
+           !peak_in_flight_.compare_exchange_weak(prev, observed,
+                                                  std::memory_order_relaxed)) {}
+    if (waited) {
+      auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+      block_count_.fetch_add(1, std::memory_order_relaxed);
+      block_nanos_.fetch_add((uint64_t)ns, std::memory_order_relaxed);
+    }
+  }
+
+  // Re-evaluate every waiter's `urgent` predicate.  Called after a push makes a
+  // new frame visible, so a worker parked with zero permits can notice that the
+  // head of the queue is now the writer's next-needed frame.  MUST be called
+  // with no queue lock held (see acquire_or_overdraft's lock-order note); the
+  // empty critical section fences against a waiter that has evaluated its
+  // predicate but not yet parked, which would otherwise miss this wakeup.
+  void poke() {
+    if (disabled_) return;
+    { std::lock_guard<std::mutex> lk(m_); }
+    cv_.notify_all();
+  }
+
+  uint64_t overdrafts() const { return overdrafts_.load(std::memory_order_relaxed); }
 
   // Acquire n permits.  Blocks until enough are available (or done).
   // Greedy: takes whatever is available immediately, waits for the rest.
@@ -7396,6 +7505,7 @@ public:
     int peak_in_flight;
     uint64_t block_count;
     uint64_t block_nanos;
+    uint64_t overdrafts;   // head-of-line frames let past the cap (v0.15.67)
   };
   Stats stats() const {
     return Stats{
@@ -7403,6 +7513,7 @@ public:
       peak_in_flight_.load(std::memory_order_relaxed),
       block_count_.load(std::memory_order_relaxed),
       block_nanos_.load(std::memory_order_relaxed),
+      overdrafts_.load(std::memory_order_relaxed),
     };
   }
 
@@ -7449,7 +7560,12 @@ private:
   std::atomic<int>      peak_in_flight_{0};
   std::atomic<uint64_t> block_count_{0};
   std::atomic<uint64_t> block_nanos_{0};
+  std::atomic<uint64_t> overdrafts_{0};  // head-of-line permits taken past the cap
 };
+
+// Out of line: TaskQueue is declared before FrameThrottle, so it can only hold
+// the pointer, not call through it, at the point of definition.
+inline void TaskQueue::notify_throttle_() { if (throttle_) throttle_->poke(); }
 
 // In-order, byte-bounded hand-off of decompressed frames from the decompress
 // writer thread to an in-process consumer — the `-t --tar` validator.  It
@@ -7583,7 +7699,8 @@ static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
      << "peak=" << s.peak_in_flight << "/" << s.max
      << " (" << std::fixed << std::setprecision(1) << saturation << "%), "
      << "block_count=" << s.block_count
-     << ", block_time=" << std::fixed << std::setprecision(2) << ms << "ms";
+     << ", block_time=" << std::fixed << std::setprecision(2) << ms << "ms"
+     << ", head_of_line_overdrafts=" << s.overdrafts;
   vlog(V_DEBUG, opt, os.str() + "\n");
 }
 
@@ -8087,6 +8204,7 @@ static void writer_thread(FILE * out, ResultStore & results,
       results.data.erase(it);
       ++results.next_to_write;
     }
+    results.next_pub.store(results.next_to_write, std::memory_order_relaxed);
 
     if (batch.empty()) continue;
 
@@ -9201,6 +9319,14 @@ static void cpu_worker(
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
+  // Head-of-line overdraft predicate (v0.15.67).  True when the lowest-seq frame
+  // sitting in the queue is the one the in-order writer is waiting for, so a
+  // worker that can get no permit may take it anyway rather than park forever.
+  // See FrameThrottle::acquire_or_overdraft for the cycle this breaks.
+  auto head_of_line = [tq, results]() -> bool {
+    return tq->front_seq_at_most(results->next_pub.load(std::memory_order_relaxed));
+  };
+
   // Per-thread reusable scratch buffer.  compress_one_cpu_frame's resize()
   // grows this once on the first iteration (paying ~bound bytes of page
   // faults) and reuses the same resident pages on every subsequent call.
@@ -9302,7 +9428,7 @@ static void cpu_worker(
         // Step 1: wait for predicate (no permit held → no hoarding)
         if (!tq->wait_for_cpu(may_take)) { drained = true; break; }
         // Step 2: acquire permit (may block, but no task held → writer can progress)
-        if (bp) bp->acquire(1);
+        if (bp) bp->acquire_or_overdraft(head_of_line);
         // Step 3: non-blocking pop (state may have changed since wait)
         int rc = tq->try_pop_one_cpu(t, may_take);
         if (rc == 1) { got_task = true; break; }   // success: have task + permit
@@ -9326,7 +9452,7 @@ static void cpu_worker(
       bool drained = false;
       while (true) {
         if (!tq->wait_for_work()) { drained = true; break; }
-        if (bp) bp->acquire(1);
+        if (bp) bp->acquire_or_overdraft(head_of_line);
         int rc = tq->try_pop_one(t);
         if (rc == 1) { got_task = true; break; }
         if (bp) bp->release(1);
@@ -9472,6 +9598,13 @@ static void cpu_decomp_worker(
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
 #endif
+  // See the identical note on the compress worker.  Decompress is MORE exposed:
+  // its prefetch reader pool is adaptive and climbs past the compress default,
+  // so out-of-order arrival is the norm rather than the exception here.
+  auto head_of_line = [tq, results]() -> bool {
+    return tq->front_seq_at_most(results->next_pub.load(std::memory_order_relaxed));
+  };
+
   // Create a reusable decompression context for this thread
   if (!tl_dctx) {
     tl_dctx = ZSTD_createDCtx();
@@ -9550,7 +9683,7 @@ static void cpu_decomp_worker(
       bool drained = false;
       while (true) {
         if (!tq->wait_for_cpu(may_take)) { drained = true; break; }
-        if (bp) bp->acquire(1);
+        if (bp) bp->acquire_or_overdraft(head_of_line);
         int rc = tq->try_pop_one_cpu(t, may_take);
         if (rc == 1) { got_task = true; break; }
         if (bp) bp->release(1);
@@ -9582,7 +9715,7 @@ static void cpu_decomp_worker(
       bool drained = false;
       while (true) {
         if (!tq->wait_for_work()) { drained = true; break; }
-        if (bp) bp->acquire(1);
+        if (bp) bp->acquire_or_overdraft(head_of_line);
         int rc = tq->try_pop_one(t);
         if (rc == 1) { got_task = true; break; }
         if (bp) bp->release(1);
@@ -10654,6 +10787,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   FrameThrottle throttle(compute_throttle_budget(
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, 0, opt));
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt);
+  queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
   // Disable throttle in test mode: no disk I/O means permits are never released.
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
@@ -16349,6 +16483,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // on ultra / low-RAM runs.  (ROADMAP 7.3.)
   FrameThrottle throttle(compute_throttle_budget(host_chunk, threads, 0, opt));
   adapt_arm_throttle_grow(throttle, host_chunk, opt);
+  queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
@@ -19146,6 +19281,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism,
       comp_gpu_batch_floor, opt));
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, chosen_mib) * ONE_MIB, opt);
+  queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
 
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
@@ -19818,10 +19954,16 @@ static void gpu_decomp_worker(
     uint64_t out_pool_waits = 0;
 
     // Acquire a recycled output buffer.  Grows the pool up to `cap` slots, then
-    // waits on the writer's drain signal until a slot frees (so it never
-    // allocates beyond cap).  Deadlock-free: a stream pushes its frames in
+    // OVERDRAFTS past it rather than waiting — see the note in the body and the
+    // matching one on the compress worker's out_pool.
+    //
+    // This comment used to claim the opposite ("waits on the writer's drain
+    // signal until a slot frees ... Deadlock-free: a stream pushes its frames in
     // ascending seq order, so the writer always has the oldest in-flight frame
-    // to write, drops its ref after writing, and frees a slot.
+    // to write").  v0.15.66 changed the code and left the claim behind.  Both
+    // halves were wrong: the ascending-seq premise holds only WITHIN one stream,
+    // and that premise stated in four places and enforced in none is exactly
+    // what hid the multi-reader deadlock for months.
     FrameBuf acquire_out_buf(size_t cap, FrameThrottle * bp) {
       (void)bp;
       for (auto & b : out_pool)
@@ -20981,6 +21123,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism,
       decomp_gpu_batch_floor, opt));
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt);
+  queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // Bound queued (read-but-not-popped) frames to pipeline depth so a slow GPU
