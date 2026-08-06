@@ -12,8 +12,8 @@ because it caught a real bug, not because it seemed prudent.
 ## 1. Build BOTH configurations
 
 ```bash
-cmake -B build            && cmake --build build -j$(nproc)              # GPU (default)
-cmake -B build-nogpu -DUSE_NVCOMP=OFF && cmake --build build-nogpu -j$(nproc)   # CPU-only
+cmake -B build            && cmake --build build -j$(nproc)                # GPU (default)
+cmake -B build-cpu -DUSE_NVCOMP=OFF && cmake --build build-cpu -j$(nproc)  # CPU-only
 ```
 
 **Do not skip the CPU-only build.** It is the configuration nobody compiles, and it has
@@ -35,8 +35,8 @@ hosts are real and the configuration is supported.
 Two runs, one per build configuration:
 
 ```bash
-./gzstd-test.sh -e ./build/gzstd         # extensive, GPU build (superset of the default run)
-./gzstd-test.sh ./build-nogpu/gzstd      # CPU-only build
+./gzstd-test.sh -e ./build/gzstd   # extensive, GPU build (superset of the default run)
+./gzstd-test.sh ./build-cpu/gzstd  # CPU-only build
 ```
 
 Both must be **0 failures**, and the extensive run must show **no drift note**

@@ -37,9 +37,6 @@ defects, including four versions where it did not compile at all.
 ./gzstd-test.sh -e ./build/gzstd      # OPT-IN, see below
 ```
 
-(`RELEASING.md` and `AGENTS.md` call that second build directory `build-nogpu`; both names
-are in use for the same `USE_NVCOMP=OFF` configuration.)
-
 **The default run is the normal one.** Reach for `-e` only when the change is substantial
 enough to warrant it — always for `parse_args`, argument parsing, bundled-flag expansion or
 the zstd-compat flag layer, whose test sections are `$EXTENSIVE`-gated and therefore never
