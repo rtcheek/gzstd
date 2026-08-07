@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.72";
+static constexpr const char * GZSTD_VERSION = "0.15.73";
 //
 // Architecture overview:
 //
@@ -4477,8 +4477,17 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
       fd = ::open((p + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
       if (fd >= 0 && ::flock(fd, LOCK_EX) != 0) { ::close(fd); fd = -1; }
     }
+    bool held() const { return fd >= 0; }
     ~ProfileLock() { if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); } }
   } plock(path);
+  // Without the lock, the load/merge/rename below is the very lost-update race
+  // the lock exists to prevent — proceeding anyway just reintroduced it whenever
+  // the sidecar could not be opened.  The profile is a REGENERABLE CACHE, so the
+  // safe response to "cannot serialise" is to skip this save, not to race.
+  if (!plock.held()) {
+    vlog(V_VERBOSE, opt, "[ADAPT] profile lock unavailable; skipping this save\n");
+    return;
+  }
 
   AdaptJv root;
   const AdaptProfileRead rd = adapt_profile_load(path, root);
@@ -6670,6 +6679,27 @@ static int report_keep_going_damage_tar(const Options & opt) {
        ? EXIT_DECOMP_INCOMPLETE : EXIT_DECOMP_UNVERIFIED;
 }
 
+// Are these trailing bytes the remains of a truncated SKIPPABLE frame?
+//
+// This distinction decides whether trailing garbage is fatal.  A skippable frame
+// carries NO user data, so a clipped one at EOF cannot hide missing content — and
+// gzstd's own trailer (the seek table / --tar member index) is exactly that.
+// Losing it costs an optimization, not data, and `-l --tar` deliberately falls
+// back to the decompress walk when it is damaged.
+//
+// A truncated DATA frame is the opposite: bytes are missing from the stream.  That
+// is the case that used to pass as "OK" (appending the 4-byte magic 28 b5 2f fd
+// made `gzstd -t` exit 0 on a file stock zstd rejects), and it stays fatal.
+static bool trailing_is_truncated_skippable(const unsigned char * p, size_t n)
+{
+  if (n < 4) return false;                    // cannot even identify it: treat as damage
+  uint32_t magic = 0; std::memcpy(&magic, p, 4);
+  if ((magic & 0xFFFFFFF0u) != 0x184D2A50u) return false;   // not skippable
+  if (n < 8) return true;                     // header itself is cut: still a skippable stub
+  uint32_t ssz = 0; std::memcpy(&ssz, p + 4, 4);
+  return (uint64_t)n < 8ull + ssz;            // declared payload longer than what is here
+}
+
 // Fixed pool of page-aligned buffers for the zero-copy --direct-read path.
 // The single O_DIRECT reader preads each chunk straight into a pooled buffer and
 // hands it to a worker as a Task view (no per-chunk 16 MiB copy); the worker
@@ -8826,9 +8856,11 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   apply_mem_limit_to_dctx(dctx, opt);
 
   size_t ret = 0;  // last decompressStream hint; >0 at EOF means truncated
+  uint64_t total_in_bytes = 0;   // zero here means "not a zstd stream at all"
   for (;;) {
     size_t n = std::fread(inbuf.data(), 1, IO_CHUNK, in);
     if (n == 0) { check_read_error(in, opt.input); break; }  // EOF (not an error)
+    total_in_bytes += n;
     if (m) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
     ZSTD_inBuffer zin { inbuf.data(), n, 0 };
     while (zin.pos < zin.size) {
@@ -8862,6 +8894,15 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   if (ret > 0) {
     ZSTD_freeDCtx(dctx);
     die_data("truncated zstd stream (expected more data)");
+  }
+  // ZERO INPUT BYTES.  `ret` starts at 0 and ZSTD_decompressStream is never
+  // called for an empty file, so the truncation check above passes vacuously and
+  // this returned success having decoded nothing.  This is the THIRD decompress
+  // path (the sizeless-frame streamer) and an empty .zst routes here, which is
+  // why fixing the sequential splitter and the parallel reader did not move it.
+  if (total_in_bytes == 0) {
+    ZSTD_freeDCtx(dctx);
+    die_data("not a valid zstd stream (no frames found): " + opt.input);
   }
   ZSTD_freeDCtx(dctx);
 }
@@ -10765,10 +10806,20 @@ static size_t stream_frames_to_queue_mt(
 
   // Tail: a non-empty carry after the last block means trailing bytes that
   // never formed a complete frame — truncation/corruption (the single reader
-  // dies on the same condition).  A few trailing zero/pad bytes are tolerated.
-  if (!aborted && !failed.load(std::memory_order_relaxed) && carry.size() > 8)
+  // dies on the same condition).
+  // > 0, not > 8: see the sequential splitter's note — 8 bytes of tolerance was
+  // enough to hide a truncated trailing frame behind an exit-0 "OK".
+  if (!aborted && !failed.load(std::memory_order_relaxed) && !carry.empty()
+      && !trailing_is_truncated_skippable((const unsigned char *)carry.data(), carry.size()))
     fail("truncated zstd stream: " + std::to_string(carry.size())
          + " trailing bytes after " + std::to_string(seq) + " frames");
+  // ...and ZERO frames with zero carry is an empty file, which is not a zstd
+  // stream at all.  This reader handles the named-regular-file case, so without
+  // this an empty .zst exited 0 here even after the sequential splitter learned
+  // to reject it (that path only serves stdin/pipes).  Same defect, second
+  // reader — the two must agree on what a valid stream is.
+  if (!aborted && !failed.load(std::memory_order_relaxed) && seq == 0 && carry.empty())
+    fail("not a valid zstd stream (no frames found)");
 
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
   {
@@ -11049,7 +11100,9 @@ static size_t stream_frames_to_queue(
         }
         // At EOF: no more data coming
         if (seq == 0) {
-          // Never parsed any frame -- not a valid Zstd file
+          // Bytes present but no frame parsed: foreign or unknown-content-size
+          // stream — hand it to the CPU streaming decoder.  (The zero-BYTE case
+          // cannot reach here; it is handled after the loop.)
           *fallback = true;
           if (raw_data) {
             raw_data->assign(buf.data() + buf_off, buf.data() + buf_len);
@@ -11057,9 +11110,17 @@ static size_t stream_frames_to_queue(
           return 0;
         }
         // Parsed some frames OK; trailing bytes cannot form a valid frame.
-        // A few trailing null bytes could be padding; anything substantial
-        // indicates truncation or corruption.
-        if (remaining > 8) {
+        //
+        // ANY such bytes are damage.  This used to tolerate up to 8 of them as
+        // "could be padding", which meant appending the 4-byte zstd magic
+        // 28 b5 2f fd to a valid archive produced a file that stock zstd rejects
+        // ("premature end") while `gzstd -t` reported OK and exited 0 — and
+        // `gzstd -d --rm` decompressed the intact prefix and then DELETED the
+        // damaged archive.  zstd permits no trailing padding, and gzstd's own
+        // trailer (the seek table / tar index) is a complete SKIPPABLE FRAME that
+        // the loop above consumes, so nothing legitimate lands here.
+        if (remaining > 0
+            && !trailing_is_truncated_skippable((const unsigned char *)ptr, remaining)) {
           // Significant trailing data that isn't a valid frame = truncated
           *fallback = false;  // not a format problem, it's a data problem
           if (opt.keep_going) {
@@ -11145,12 +11206,44 @@ static size_t stream_frames_to_queue(
     }
   }
 
-  // Any leftover bytes are trailing garbage  warn if non-empty
+  // Any leftover bytes here are trailing garbage.  This used to be a -v warning
+  // and nothing else, which is the same false-success as the threshold above —
+  // and strictly worse, because it tolerated an ARBITRARY amount.  Under
+  // --keep-going it is a framing break (recoverable, exit 7); otherwise it is a
+  // data error, matching stock zstd.
   size_t leftover = buf_len - buf_off;
+  if (leftover > 0 && seq > 0
+      && trailing_is_truncated_skippable(
+             (const unsigned char *)(buf.data() + buf_off), leftover)) {
+    vlog(V_VERBOSE, opt, "warning: truncated trailing skippable frame ("
+         + std::to_string(leftover) + " bytes) — index/seek-table trailer damaged, "
+         "data frames are intact\n");
+    leftover = 0;
+  }
   if (leftover > 0 && seq > 0) {
-    vlog(V_VERBOSE, opt,
-         "warning: " + std::to_string(leftover)
-         + " trailing bytes after last Zstd frame (ignored)\n");
+    if (opt.keep_going) {
+      g_damage.set_framing_break((uint64_t)seq, out_off_acc,
+          std::to_string(leftover) + " trailing bytes after frame "
+          + std::to_string(seq) + " cannot form a valid frame");
+    } else {
+      die_data("truncated zstd stream: " + std::to_string(leftover)
+               + " trailing bytes after " + std::to_string(seq)
+               + " frame(s) do not form a valid frame");
+    }
+  }
+  // AN EMPTY INPUT NEVER ENTERS THE PARSE LOOP AT ALL, so the "no frame found"
+  // branch inside it cannot fire — the first read returns 0, eof is set, and the
+  // while(buf_off < buf_len) body is skipped.  That is how a zero-byte .zst
+  // reached exit 0 with no output while stock zstd says "unexpected end of file".
+  // Zero frames AND zero bytes is not a stream to fall back on; it is not a zstd
+  // file.  (Zero frames WITH bytes is the foreign/unknown-size case and must keep
+  // taking the fallback above.)
+  if (seq == 0 && leftover == 0) {
+    if (opt.keep_going) {
+      g_damage.set_framing_break(0, 0, "input contains no zstd frame");
+    } else {
+      die_data("not a valid zstd stream (no frames found): " + opt.input);
+    }
   }
 
   if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
@@ -11481,11 +11574,18 @@ namespace xxh {
   static constexpr uint64_t P4 =  9650029242287828579ULL;
   static constexpr uint64_t P5 =  2870177450012600261ULL;
   static inline uint64_t rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+  // XXH64 is defined over LITTLE-ENDIAN lanes.  memcpy alone gives host order, so
+  // on a big-endian host every checksum would differ from the spec and archives
+  // would be rejected by conforming zstd implementations.  Assemble explicitly:
+  // correct everywhere, and the compiler folds it back to a plain load on LE.
   static inline uint64_t rd8(const unsigned char * p) {
-    uint64_t v; std::memcpy(&v, p, 8); return v;              // x86/ARM: little-endian
+    return  (uint64_t)p[0]        | ((uint64_t)p[1] << 8)  | ((uint64_t)p[2] << 16)
+         | ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40)
+         | ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
   }
   static inline uint32_t rd4(const unsigned char * p) {
-    uint32_t v; std::memcpy(&v, p, 4); return v;
+    return  (uint32_t)p[0]        | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
   }
   static inline uint64_t round_(uint64_t acc, uint64_t in) {
     acc += in * P2; acc = rotl(acc, 31); acc *= P1; return acc;
@@ -11612,6 +11712,20 @@ public:
     if (th_.joinable()) th_.join();
     joined_ = true;
     if (failed_.load(std::memory_order_relaxed)) { ok_ = false; return ok_; }
+    // REQUIRE A CLEAN FRAME BOUNDARY.  Matching digests and byte counts are not
+    // sufficient: ZSTD_decompressStream can emit every plaintext byte and still
+    // return a POSITIVE "more input required" hint — a frame missing its trailing
+    // checksum does exactly that.  The digests then match, the lengths match, and
+    // a truncated frame verifies as good.  The older frame verifier already
+    // requires the final return to be 0; this one did not.
+    if (!saw_input_ || last_ret_ != 0) {
+      std::ostringstream os;
+      os << "[VERIFY] sliding-window output is not a complete frame ("
+         << (saw_input_ ? "decoder still expects more input"
+                        : "no compressed bytes were produced") << ")\n";
+      vlog(V_ERROR, opt_, os.str());
+      ok_ = false; return ok_;
+    }
     const uint64_t din = in_d_.digest(), dout = out_d_.digest();
     ok_ = (din == dout) && (out_bytes_ == in_bytes_);
     if (!ok_) {
@@ -11648,10 +11762,12 @@ private:
         buf = std::move(q_.front()); q_.pop_front();
       }
       not_full_.notify_one();
+      saw_input_ = true;
       ZSTD_inBuffer zin { buf->data(), buf->size(), 0 };
       while (zin.pos < zin.size) {
         ZSTD_outBuffer zout { plain.data(), plain.size(), 0 };
         size_t r = ZSTD_decompressStream(dctx_, &zout, &zin);
+        last_ret_ = r;
         if (ZSTD_isError(r)) {
           std::ostringstream os;
           os << "[VERIFY] sliding-window output failed to decode: "
@@ -11661,6 +11777,7 @@ private:
           not_full_.notify_all();
           return;
         }
+        if (ZSTD_isError(r)) { /* handled above */ }
         if (zout.pos) { out_d_.update(zout.dst, zout.pos); out_bytes_ += zout.pos; }
       }
     }
@@ -11673,6 +11790,8 @@ private:
   std::mutex       m_;
   std::condition_variable not_empty_, not_full_;
   bool             done_ = false, joined_ = false, ok_ = true;
+  bool             saw_input_ = false;   // any compressed bytes at all?
+  size_t           last_ret_ = 1;        // last ZSTD_decompressStream hint; 0 = frame complete
   std::atomic<bool> failed_{false};
   std::thread      th_;
 };
@@ -23178,6 +23297,12 @@ static int list_zst(const Options & opt)
         if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {           // skippable frame
           if (pos + 8 > fsize) { ok = false; break; }
           uint32_t ssz; std::memcpy(&ssz, base + pos + 4, 4);
+          // BOUNDS-CHECK the declared size before trusting it.  ssz comes from the
+          // file, so an 8-byte header claiming a payload that is not there walked
+          // `pos` past EOF and the loop simply ended — reporting one frame for a
+          // truncated archive.  The pread walk already checks this; the mmap walk
+          // did not, and they must agree.
+          if ((uint64_t)ssz > (uint64_t)(fsize - pos) - 8) { ok = false; break; }
           // zstd -l counts skippable frames in BOTH columns (Frames includes
           // them; Skips breaks them out) — match it, or the counts diverge on
           // archives carrying the --tar member index.
@@ -23204,6 +23329,10 @@ static int list_zst(const Options & opt)
 #endif
     (void)wfd;
 
+    // A file with NO frames at all is not an archive.  `ok` starts true and the
+    // walk simply finds nothing in an empty file, so `-l` listed it as a tidy
+    // "0 frames" row and exited 0 — the same false success the decompressors had.
+    if (ok && nframes == 0) ok = false;
     // Validate BEFORE emitting anything for this file.  An unparseable stream has
     // no frame count, no ratio and no checksum kind to report, so the row would be
     // zeros either way; report the error and move to the next file.
@@ -24011,25 +24140,71 @@ static int gzstd_main(int argc, char ** argv)
     std::vector<std::pair<dev_t, ino_t>> tar_src_ids;
     std::vector<int> tar_src_fds;
     if (opt.tar_mode) {
-      for (const std::string & src : opt.tar_sources) {
-        int sfd = ::open(src.c_str(), O_PATH | O_CLOEXEC);
-        if (sfd < 0) continue;                       // unreadable source: the walker reports it
+      for (size_t si = 0; si < opt.tar_sources.size(); ++si) {
+        // RESOLVE EXACTLY AS THE WALKER DOES.  The capture used the raw source
+        // string, but creation resolves a relative source against the positional
+        // -C directory (`-C /dir user-data` reads /dir/user-data).  So
+        // `gzstd --overwrite -o /tmp/root/data --tar -C /tmp/root data` opened
+        // "data" relative to the CWD, failed, was skipped — and the output path
+        // then removed /tmp/root/data before the walker archived the empty file it
+        // had just created.  Absolute sources ignore -C, exactly like tar.
+        const std::string & src = opt.tar_sources[si];
+        std::string fspath = src;
+        const std::string cdir =
+            si < opt.tar_source_dest.size() ? opt.tar_source_dest[si] : std::string(".");
+        if (!src.empty() && src[0] != '/' && cdir != ".") fspath = cdir + "/" + src;
+
+        int sfd = ::open(fspath.c_str(), O_PATH | O_CLOEXEC);
+        if (sfd < 0) {
+          // FAIL CLOSED.  Skipping an unopenable source silently left it
+          // unprotected, which is precisely the state the -C bug exploited.  If
+          // the source cannot be identified it cannot be proven distinct from the
+          // output, and the walker will report the real problem anyway.
+          for (int f : tar_src_fds) ::close(f);
+          die_io("--tar: cannot open source for safety check: " + fspath
+                 + " (" + std::strerror(errno) + ")");
+        }
         struct stat ss;
-        if (::fstat(sfd, &ss) == 0) {
-          tar_src_ids.emplace_back(ss.st_dev, ss.st_ino);
-          tar_src_fds.push_back(sfd);
-        } else {
+        if (::fstat(sfd, &ss) != 0) {
           ::close(sfd);
+          for (int f : tar_src_fds) ::close(f);
+          die_io("--tar: cannot stat source for safety check: " + fspath);
+        }
+        tar_src_ids.emplace_back(ss.st_dev, ss.st_ino);
+        tar_src_fds.push_back(sfd);
+        // A DIRECTORY source contributes its descendants too, and the output could
+        // alias one of them.  Comparing every descendant up front would mean
+        // walking the tree twice, so instead reject an output that lives ANYWHERE
+        // under a directory source when it would be destroyed (--overwrite unlinks
+        // it before the walk).  Writing INTO a source dir with -f stays allowed:
+        // that path creates a temp and renames, so the source is never unlinked.
+        if (S_ISDIR(ss.st_mode) && opt.unsafe_overwrite) {
+          std::error_code e1, e2;
+          const fs::path sc = fs::weakly_canonical(fspath, e1);
+          const fs::path oc = fs::weakly_canonical(opt.output, e2);
+          if (!e1 && !e2) {
+            auto it = std::mismatch(sc.begin(), sc.end(), oc.begin(), oc.end());
+            if (it.first == sc.end()) {
+              for (int f : tar_src_fds) ::close(f);
+              die_usage("--overwrite would delete the archive from inside --tar source "
+                        + fspath + "; write it elsewhere or use -f");
+            }
+          }
         }
       }
       // Cheap pre-check so the common mistake reports the SOURCE NAME rather than
       // the output name; the fd comparison below is what actually closes the race.
       if (fs::exists(opt.output)) {
-        for (const std::string & src : opt.tar_sources) {
+        for (size_t si = 0; si < opt.tar_sources.size(); ++si) {
+          const std::string & src = opt.tar_sources[si];
+          std::string fspath = src;
+          const std::string cdir =
+              si < opt.tar_source_dest.size() ? opt.tar_source_dest[si] : std::string(".");
+          if (!src.empty() && src[0] != '/' && cdir != ".") fspath = cdir + "/" + src;
           std::error_code ec_src;
-          if (fs::equivalent(src, opt.output, ec_src) && !ec_src) {
+          if (fs::equivalent(fspath, opt.output, ec_src) && !ec_src) {
             for (int f : tar_src_fds) ::close(f);
-            die_usage("--tar source and archive output are the same file: " + src);
+            die_usage("--tar source and archive output are the same file: " + fspath);
           }
         }
       }
@@ -24061,6 +24236,36 @@ static int gzstd_main(int argc, char ** argv)
         // immediately and the extents free in the background.  fopen then
         // creates a fresh empty file in O(1).
         if (is_regular) {
+          // IDENTIFY BEFORE DESTROYING.  This unlink is the destructive step, and
+          // it runs BEFORE open_output_verified() — so the fd-identity check there
+          // was comparing against a file this branch had already deleted, and
+          // `--overwrite -o root/data --tar -C root data` still lost the source.
+          // Open the EXISTING target and compare it here, while it still exists.
+          {
+            int ofd = ::open(opt.output.c_str(), O_PATH | O_CLOEXEC);
+            if (ofd >= 0) {
+              struct stat os_;
+              if (::fstat(ofd, &os_) == 0) {
+                for (const auto & id : tar_src_ids) {
+                  if (os_.st_dev == id.first && os_.st_ino == id.second) {
+                    ::close(ofd);
+                    for (int f : tar_src_fds) ::close(f);
+                    die_usage("--tar source and archive output are the same file: "
+                              + opt.output);
+                  }
+                }
+                if (in) {
+                  struct stat is_;
+                  if (::fstat(fileno(in), &is_) == 0
+                      && os_.st_dev == is_.st_dev && os_.st_ino == is_.st_ino) {
+                    ::close(ofd);
+                    die_usage("input and output are the same file: " + opt.output);
+                  }
+                }
+              }
+              ::close(ofd);
+            }
+          }
           std::error_code ec_unlink;
           fs::remove(opt.output, ec_unlink);
           // If unlink failed (permissions, race), fall through to fopen "wb"
@@ -24251,6 +24456,23 @@ static int gzstd_main(int argc, char ** argv)
         ZSTD_freeCCtx(ec);
         if (ZSTD_isError(ecsz))
           die_data(std::string("ZSTD error (empty input): ") + ZSTD_getErrorName(ecsz));
+        // --verify covers every OTHER frame; this one was written straight to the
+        // sink, so `gzstd -T1 --verify empty` produced a valid archive and still
+        // reported zero frames checked.  Submit it when a pool exists; when one
+        // does not (the pool is only built for some backends), validate inline —
+        // it is 13 bytes, so the round trip is free.
+        if (opt.verify) {
+          if (g_verify_pool) {
+            auto ef = std::make_shared<FrameVec>(ebuf, ebuf + ecsz);
+            g_verify_pool->submit(0, ef);
+          } else {
+            unsigned long long dsz = ZSTD_getFrameContentSize(ebuf, ecsz);
+            char probe[8];
+            const size_t got = ZSTD_decompress(probe, sizeof probe, ebuf, ecsz);
+            if (ZSTD_isError(got) || got != 0 || dsz != 0)
+              die_data("--verify: the generated empty frame does not round-trip");
+          }
+        }
 #ifndef _WIN32
         if (g_direct_writer) {
           if (!g_direct_writer->write(ebuf, ecsz)) die_io("direct write failed (disk full?)");

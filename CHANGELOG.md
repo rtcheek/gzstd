@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.72  
+**Covers:** v0.9.50 → v0.15.73  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,55 @@
 ---
 
 
+## v0.15.73 — false-success in the hot path, and an ordering bug that made last round's fix a no-op
+
+Round 5, open mandate. Seven findings — three HIGH — and two of them were in code nobody had
+touched in five rounds.
+
+**`gzstd -t` passed a damaged archive.** Append the four-byte zstd magic `28 b5 2f fd` to a
+valid file: stock zstd says *"premature end"*, gzstd said **OK and exited 0** — and
+`gzstd -d --rm` decompressed the intact prefix and then deleted the archive. Two readers
+tolerated up to 8 trailing bytes as "could be padding"; the sequential splitter was worse
+still, accepting an ARBITRARY amount behind a `-v` warning. An empty `.zst` was accepted too.
+Fixing it took **three** decompress paths, not the two reported: the empty-file case routes to
+the sizeless-frame streamer, so repairing the splitter and the parallel reader moved nothing.
+zstd's verdict and gzstd's now agree on every malformed shape tested.
+
+**One deliberate divergence, and it is the interesting part.** Making trailing bytes fatal
+broke gzstd's documented behaviour of falling back to the decompress walk when its own index
+trailer is damaged. The resolution is not leniency but a distinction: **a skippable frame
+carries no user data**, so a clipped one at EOF cannot hide missing content, while a truncated
+DATA frame can. A truncated trailing skippable frame now warns and falls back; everything else
+is fatal. gzstd is therefore *more* permissive than stock zstd for exactly one case — its own
+optimization trailer — which is a conscious trade against the drop-in goal, recorded at the
+predicate.
+
+**Last round's `--tar` fix was a no-op, and resolution was only half the reason.** The capture
+opened the RAW source strings while creation resolves them against the positional `-C`
+directory, so `--overwrite -o root/data --tar -C root data` still destroyed the file. Fixing
+resolution alone **still destroyed it**: `--overwrite` unlinks the output BEFORE
+`open_output_verified()` runs, so the fd-identity check was comparing against a file already
+deleted. The check had to move ahead of the unlink. Sources now also fail closed when they
+cannot be identified, and `--overwrite` refuses to place the archive inside a source directory
+(`-f` still may — that path renames rather than unlinking).
+
+**The sliding-window verifier accepted truncated frames.** Matching digests and byte counts are
+not sufficient: `ZSTD_decompressStream` can emit every plaintext byte and still return a
+positive "more input required" hint, which a frame missing its checksum does exactly. It now
+requires a clean frame boundary, as the older frame verifier always did.
+
+Also: the empty frame v0.15.72 introduced bypassed `--verify` (`-T1 --verify empty` produced a
+valid archive and reported zero frames checked); `-l` listed an empty file as a tidy zero-frame
+row and trusted an attacker-controlled skippable size without bounds-checking it in the mmap
+walk; the `--adapt` profile lock proceeded unlocked on failure, reinstating the lost-update
+race it exists to prevent; and the in-tree XXH64 read host-endian lanes, which would have
+produced spec-violating checksums on a big-endian host. XXH64 was re-validated 57/57 against
+libzstd after that change.
+
+Six of the nine round-4 fixes were confirmed. Suite: 374, green on both build configurations —
+including a regression the suite caught and this entry describes.
+
+---
 ## v0.15.72 — a feature attached to one of four write paths, and the checksum we never owned
 
 Round 4, open mandate again. Nine findings: four HIGH, four MEDIUM, one LOW — and an
