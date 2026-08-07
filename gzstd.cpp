@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.69";
+static constexpr const char * GZSTD_VERSION = "0.15.70";
 //
 // Architecture overview:
 //
@@ -5035,6 +5035,52 @@ static FILE * open_input(const std::string & path)
   if (!f) die_io("cannot open input: " + path);
   return f;
 }
+// Open the output file for writing, PROVING it is not the input before destroying
+// anything.
+//
+// The string/`fs::equivalent` check upstream is necessary but not sufficient: it can
+// only run when the output already exists, so for a NEW output there is a window
+// between "it does not exist" and `fopen(path, "wb")` in which another process can
+// create that name as a symlink to the input.  fopen follows it and truncates the
+// source — the same total-loss outcome the upstream check exists to prevent, just
+// won by a race.
+//
+// Closed by never truncating a file we have not identified:
+//   1. open O_WRONLY|O_CREAT WITHOUT O_TRUNC — nothing is destroyed yet;
+//   2. fstat the RESULTING FD and compare st_dev/st_ino against the input's fd, so
+//      the answer is about the object we actually opened, not about a path that may
+//      since have changed;
+//   3. only then ftruncate to 0, which is what "wb" would have done.
+// Symlinks are still followed, deliberately: `-o some-symlink` is legitimate, and a
+// symlink aimed at the INPUT is caught by step 2 like any other alias.
+static FILE * open_output_verified(const std::string & path, FILE * in_file)
+{
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
+  if (fd < 0) die_io("cannot open output: " + path + " (" + std::strerror(errno) + ")");
+  if (in_file) {
+    struct stat so, si;
+    if (::fstat(fd, &so) == 0 && ::fstat(fileno(in_file), &si) == 0
+        && so.st_dev == si.st_dev && so.st_ino == si.st_ino) {
+      ::close(fd);              // nothing was truncated: we never asked for O_TRUNC
+      die_usage("input and output are the same file: " + path);
+    }
+  }
+  // Regular files need the truncate that "wb" implies; a device or fifo neither
+  // needs nor tolerates it, and ftruncate on those is either a no-op or an error
+  // we must not treat as fatal.
+  struct stat st;
+  if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+    if (::ftruncate(fd, 0) != 0) {
+      int e = errno; ::close(fd);
+      die_io("cannot truncate output: " + path + " (" + std::strerror(e) + ")");
+    }
+  }
+  FILE * f = ::fdopen(fd, "wb");
+  if (!f) { ::close(fd); die_io("cannot open output: " + path); }
+  std::setvbuf(f, nullptr, _IOFBF, 1 * 1024 * 1024);
+  return f;
+}
+
 // Open a temporary file for atomic write: write to .tmp, then rename on success.
 //
 // The name must be UNPREDICTABLE and the create must be EXCLUSIVE.  The old
@@ -5089,6 +5135,40 @@ static FILE * open_output_atomic(const std::string & out, std::string & tmp_path
   std::setvbuf(f, nullptr, _IOFBF, 1 * 1024 * 1024);
   return f;
 }
+// fsync one descriptor.  Returns false only when durability was REQUESTED AND NOT
+// ACHIEVED.
+//
+// EINTR is retried; it is not a durability failure.
+//
+// EINVAL is the subtle one.  It is the errno a kernel returns for a descriptor
+// that does not support fsync at all — a pipe, a terminal, some special files —
+// and those cannot fail to be durable because there is nothing to persist.  But
+// treating EINVAL as success from the ERRNO ALONE is wrong: a filesystem (FUSE is
+// the realistic case) can return EINVAL for a REGULAR FILE, and then
+// --sync-output reported success, renamed the output over the target and removed
+// the source without ever obtaining the durability the user asked for.
+//
+// So ask the descriptor what it is, rather than inferring it from the error: a
+// regular file must sync, and only a non-regular target is allowed to decline.
+static bool fsync_fd_ok(int fd)
+{
+#if defined(_POSIX_VERSION)
+  if (fd < 0) return false;
+  for (;;) {
+    if (::fsync(fd) == 0) return true;
+    if (errno == EINTR) continue;
+    if (errno == EINVAL) {
+      struct stat st;
+      if (::fstat(fd, &st) == 0 && !S_ISREG(st.st_mode)) return true;  // nothing to persist
+    }
+    return false;
+  }
+#else
+  (void)fd;
+  return true;
+#endif
+}
+
 // Flush file data to disk (POSIX only).  Returns false if durability was
 // REQUESTED AND NOT ACHIEVED.
 //
@@ -5107,14 +5187,7 @@ static bool fsync_file(FILE * f)
   // the userspace buffer — defeating --sync-output's durability guarantee for
   // the tail (fclose flushes it afterward, but nothing fsyncs it then).
   if (std::fflush(f) != 0) return false;
-  int fd = fileno(f);
-  // EINTR is not a durability failure; retry it.  EINVAL means the target does
-  // not support fsync (a pipe or some special files) — not a failure either.
-  for (;;) {
-    if (fsync(fd) == 0) return true;
-    if (errno == EINTR) continue;
-    return errno == EINVAL;
-  }
+  return fsync_fd_ok(fileno(f));
 #else
   (void)f;
   return true;
@@ -5235,9 +5308,39 @@ public:
 
   // Open file with O_DIRECT.  Returns false if O_DIRECT not supported
   // (caller should fall back to FILE*).
+  // Take over an ALREADY-OPEN descriptor rather than resolving a path again.
+  //
+  // This exists because reopening by name threw away the guarantee the caller had
+  // just paid for.  `open_output_atomic` creates the temp with O_EXCL|O_NOFOLLOW,
+  // which makes pre-creating that name useless to an attacker — but the --direct
+  // path then did `stat(write_path)` + `open(write_path, ...O_TRUNC)`, with no
+  // O_EXCL and no O_NOFOLLOW.  An inotify watcher does not need to PREDICT the
+  // random name: it watches the directory, sees the temp appear, unlinks it and
+  // drops a symlink to a victim file in its place before this second open.  The
+  // victim is then followed and truncated.
+  //
+  // Adopting the fd removes the second name resolution entirely: the O_DIRECT
+  // description refers to the same inode the caller created and verified, and no
+  // window exists because no path is ever resolved twice.  O_DIRECT is toggled on
+  // a dup so the caller's FILE* can still be closed independently.
+  bool adopt_fd(int src_fd) {
+    if (src_fd < 0) return false;
+    int d = ::fcntl(src_fd, F_DUPFD_CLOEXEC, 0);
+    if (d < 0) return false;
+    int fl = ::fcntl(d, F_GETFL);
+    if (fl < 0 || ::fcntl(d, F_SETFL, fl | O_DIRECT) != 0) { ::close(d); return false; }
+    fd_ = d;
+    return init_after_open_();
+  }
+
   bool open(const std::string & path) {
     fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0666);
     if (fd_ < 0) return false;
+    return init_after_open_();
+  }
+
+private:
+  bool init_after_open_() {
     // Allocate the aligned buffer pool.
     for (int i = 0; i < NBUF; ++i) {
       if (posix_memalign(&bufs_[i], ALIGN, BUF_CAP) != 0) {
@@ -5255,6 +5358,7 @@ public:
     wt_ = std::thread(&DirectWriter::writer_loop, this);
     return true;
   }
+public:
 
   // Bounce-copy into the current aligned buffer; when it fills (BUF_CAP, a
   // multiple of ALIGN), hand it to the write thread and take a free one.  Only
@@ -10750,7 +10854,17 @@ static size_t stream_frames_to_queue(
       return (size_t)got;
     }
 #endif
-    return std::fread(dst, 1, READ_CHUNK, in);
+    {
+      size_t n = std::fread(dst, 1, READ_CHUNK, in);
+      // A short or zero count here is about to be read as end-of-stream by the
+      // caller (`if (n == 0) eof = true`), and every COMPLETE frame parsed so far
+      // is then returned as a successful decompression.  So an I/O error midway
+      // through a multi-frame archive silently drops the trailing frames — and
+      // with --rm the archive is removed afterwards.  ferror is the only way to
+      // tell that apart from a real EOF.
+      if (n < READ_CHUNK) check_read_error(in, opt.input);
+      return n;
+    }
   };
 
   while (!eof) {
@@ -18966,7 +19080,18 @@ static void gpu_worker(
     g_gpu_failed_restart.store(true);
     g_gpu_aborted.store(true);
     *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
-    (void)gpu_failures; (void)gpu_worker_count;   // no longer needed on the abort path
+    (void)gpu_worker_count;   // no CPU rescue on the compress abort path
+
+    // COUNT THE FAILURE, even though this path performs no rescue.  The
+    // fixed-share bringup barrier waits for "a stream registered OR every GPU
+    // failed", and a worker that throws BEFORE register_gpu_stream satisfies
+    // neither unless it is counted here.  Discarding the counter (as this line
+    // used to) meant `--cpu-share=X` with a GPU that failed during init — a bad
+    // cudaSetDevice, a stream/event creation error — left the main thread parked
+    // on that barrier forever.  Decompress's catch has always counted; this is
+    // the same bookkeeping, and gpu_bringup_signal() re-runs the predicate.
+    if (gpu_failures) gpu_failures->fetch_add(1, std::memory_order_acq_rel);
+    gpu_bringup_signal();
 
     // Retire the drain thread BEFORE touching the stream contexts below.  With
     // g_gpu_aborted set, its blocking points all resolve: acquire_out_buf
@@ -19734,8 +19859,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (sched && opt.cpu_share >= 0.0 && gpu_count > 0) {
     std::unique_lock<std::mutex> lk(g_gpu_bringup_mx);
     g_gpu_bringup_cv.wait(lk, [&] {
+      // g_gpu_aborted is a safety net, not the primary exit: a counted failure
+      // is the correct representation and the catch above now provides one.  But
+      // this barrier's failure mode is a PERMANENT HANG, so any abort releases it
+      // too — an aborted pass is discarded regardless, so leaving early costs
+      // nothing and closes whatever path forgets to count next time.
       return sched->any_gpu_active()
-          || gpu_failures.load(std::memory_order_acquire) >= gpu_count;
+          || gpu_failures.load(std::memory_order_acquire) >= gpu_count
+          || g_gpu_aborted.load(std::memory_order_relaxed);
     });
   }
 
@@ -21551,9 +21682,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // workers spawned on the background thread and promises no exact split.
   if (sched && opt.cpu_share >= 0.0 && !gpu_workers.empty()) {
     std::unique_lock<std::mutex> lk(g_gpu_bringup_mx);
-    g_gpu_bringup_cv.wait(lk, [&] {
+    g_gpu_bringup_cv.wait(lk, [&] {   // see the compress barrier for the abort term
       return sched->any_gpu_active()
-          || gpu_failures.load(std::memory_order_acquire) >= (int)gpu_workers.size();
+          || gpu_failures.load(std::memory_order_acquire) >= (int)gpu_workers.size()
+          || g_gpu_aborted.load(std::memory_order_relaxed);
     });
   }
 
@@ -22522,6 +22654,9 @@ static int list_zst(const Options & opt)
       FILE * f = open_input(fn);
       char tmp[1 << 20]; size_t n;
       while ((n = std::fread(tmp, 1, sizeof tmp, f)) > 0) buf.insert(buf.end(), tmp, tmp + n);
+      // Without this a truncated read looks like a complete file, so `-l` happily
+      // summarises the frames it managed to read and reports success.
+      check_read_error(f, fn);
       if (f && f != stdin) std::fclose(f);
       base = (const unsigned char *)buf.data(); fsize = buf.size();
     }
@@ -23063,21 +23198,30 @@ static int run_calibrate(Options opt)
       // fold the flush into the measured time so the recorded rate is the
       // observed writer rate through to media.
       const auto fs0 = std::chrono::steady_clock::now();
-      ::fflush(outf);
-      ::fsync(fileno(outf));
+      // A failed flush/fsync means the number below did not measure a durable
+      // write at all.  Recording it would teach the per-machine profile a sink
+      // rate for work that never reached the device, and every later run would
+      // schedule against that fiction — so measure the result and refuse to
+      // record when it is not real.
+      const bool cal_durable = (std::fflush(outf) == 0) && fsync_fd_ok(fileno(outf));
       const uint64_t fsync_ns =
           (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - fs0).count();
       std::fclose(outf);
       const uint64_t dns = m.writer_disk_ns.load() + fsync_ns;
-      if (dns > 0) {
+      if (dns > 0 && cal_durable) {
         rows[4].gibs = m.wrote_bytes.load() / GiB / (dns / 1e9);
         rows[4].ran = true;
         cobs.writer_bytes = m.wrote_bytes.load();
         cobs.writer_disk_ns = dns;
       }
-      std::fprintf(stderr, "[CALIBRATE] sink write      %7.2f GiB/s -> %s (removed)\n",
-                   rows[4].gibs, po.output.c_str());
+      if (cal_durable)
+        std::fprintf(stderr, "[CALIBRATE] sink write      %7.2f GiB/s -> %s (removed)\n",
+                     rows[4].gibs, po.output.c_str());
+      else
+        std::fprintf(stderr, "[CALIBRATE] sink write      NOT MEASURED — flush/fsync of %s "
+                             "failed (%s); nothing recorded\n",
+                     po.output.c_str(), std::strerror(errno));
     }
     if (in) std::fclose(in);
     ::unlink(po.output.c_str());
@@ -23400,15 +23544,11 @@ static int gzstd_main(int argc, char ** argv)
           // If unlink failed (permissions, race), fall through to fopen "wb"
           // which will return its own error.
         }
-        out = std::fopen(opt.output.c_str(), "wb");
-        if (!out) die_io("cannot open output: " + opt.output);
-        std::setvbuf(out, nullptr, _IOFBF, 1 * 1024 * 1024);
+        out = open_output_verified(opt.output, in);
         if (is_regular) register_tmp_file(opt.output);
       }
     } else {
-      out = std::fopen(opt.output.c_str(), "wb");
-      if (!out) die_io("cannot open output: " + opt.output);
-      std::setvbuf(out, nullptr, _IOFBF, 1 * 1024 * 1024);
+      out = open_output_verified(opt.output, in);
       // Register for cleanup-on-failure only if we are CREATING a new file;
       // never register a pre-existing special target like /dev/null.
       if (!existed_before) register_tmp_file(opt.output);
@@ -23423,14 +23563,21 @@ static int gzstd_main(int argc, char ** argv)
   // sequential large-file workloads.
 #ifndef _WIN32
   std::unique_ptr<DirectWriter> direct_writer;
-  if (opt.direct_io && !to_stdout && out != stdout) {
-    std::string write_path = use_atomic ? tmp : opt.output;
+  if (opt.direct_io && !to_stdout && out != stdout && out) {
+    // ADOPT the descriptor we already hold; never resolve the path a second time.
+    // `out` is the temp created O_EXCL|O_NOFOLLOW (atomic path) or the output we
+    // opened and identity-checked, so its inode is already the verified one.
+    // Re-opening `write_path` here is what let an attacker swap a symlink in
+    // between — see DirectWriter::adopt_fd.
     struct stat st;
-    bool is_regular = (stat(write_path.c_str(), &st) == 0 && S_ISREG(st.st_mode));
-    if (is_regular) {
+    const int ofd = fileno(out);
+    if (ofd >= 0 && ::fstat(ofd, &st) == 0 && S_ISREG(st.st_mode)) {
+      // Flush anything stdio buffered before the O_DIRECT description takes over
+      // the same file; otherwise the fclose below could write behind our back.
+      std::fflush(out);
       auto dw = std::make_unique<DirectWriter>();
-      if (dw->open(write_path)) {
-        if (out) { std::fclose(out); out = nullptr; }
+      if (dw->adopt_fd(ofd)) {
+        std::fclose(out); out = nullptr;   // our dup keeps the file alive
         direct_writer = std::move(dw);
       }
     }
@@ -23450,9 +23597,12 @@ static int gzstd_main(int argc, char ** argv)
       real_path[len] = '\0';
       if (std::strncmp(real_path, "/dev/", 5) == 0) break;
       if (std::strstr(real_path, "(deleted)")) break;
+      // Adopt fd 1 itself rather than reopening real_path: the readlink above is
+      // only used to REJECT unsuitable targets (/dev/*, deleted), never to open
+      // one, so a rename between readlink and open cannot redirect this write.
       auto dw = std::make_unique<DirectWriter>();
-      if (dw->open(std::string(real_path))) {
-        std::fflush(stdout);
+      std::fflush(stdout);
+      if (dw->adopt_fd(fd)) {
         out = nullptr;
         direct_writer = std::move(dw);
         vlog(V_VERBOSE, opt, "[O_DIRECT] stdout redirect using O_DIRECT (--direct)\n");
@@ -23678,11 +23828,25 @@ static int gzstd_main(int argc, char ** argv)
       // Reset the output to empty for the rebuild (input already rewound above).
 #ifndef _WIN32
       if (dw_ptr) {
-        std::string write_path = use_atomic ? tmp : opt.output;
-        direct_writer.reset();                 // dtor joins writer thread, closes fd
-        direct_writer = std::make_unique<DirectWriter>();
-        if (!direct_writer->open(write_path))
-          die_io("failed to reopen O_DIRECT output for CPU rebuild");
+        // Carry the VERIFIED descriptor across the rebuild instead of resolving
+        // the name again.  Dropping the writer and reopening `write_path` had the
+        // same hole adopt_fd exists to close — a rarer window (it needs a GPU
+        // fault or a --verify mismatch first), but the same one.  Dup before the
+        // reset so the inode survives the writer's destructor, rewind and empty
+        // it, then hand it back.
+        int keep = ::fcntl(dw_ptr->fd(), F_DUPFD_CLOEXEC, 0);
+        direct_writer.reset();                 // dtor joins writer thread, closes its fd
+        bool reopened = false;
+        if (keep >= 0) {
+          if (::ftruncate(keep, 0) == 0 && ::lseek(keep, 0, SEEK_SET) == 0) {
+            direct_writer = std::make_unique<DirectWriter>();
+            reopened = direct_writer->adopt_fd(keep);
+            if (!reopened) direct_writer.reset();
+          }
+          ::close(keep);                       // adopt_fd holds its own dup
+        }
+        if (!reopened)
+          die_io("failed to reset O_DIRECT output for CPU rebuild");
         dw_ptr = direct_writer.get();
         g_direct_writer = dw_ptr;
       } else
@@ -23922,16 +24086,9 @@ static int gzstd_main(int argc, char ** argv)
       // (device write cache + the size metadata set by finalize's ftruncate) so
       // --direct --sync-output is actually durable (ROADMAP 7.5).
       int dfd = g_direct_writer->fd();
-      if (dfd >= 0) {
-        int fr;
-        do { fr = ::fsync(dfd); } while (fr != 0 && errno == EINTR);
-        // Same reasoning as fsync_file: a failure here means the durability the
-        // user asked for was not delivered.  Fail before the rename installs
-        // the output and before --rm removes the input.
-        if (fr != 0 && errno != EINVAL)
-          die_io("--sync-output: fsync of O_DIRECT output failed ("
-                 + std::string(std::strerror(errno)) + ")");
-      }
+      if (dfd >= 0 && !fsync_fd_ok(dfd))
+        die_io("--sync-output: fsync of O_DIRECT output failed ("
+               + std::string(std::strerror(errno)) + ")");
     }
     g_direct_writer = nullptr;
     direct_writer.reset();

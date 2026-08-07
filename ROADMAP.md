@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.69
+**Current version:** v0.15.70
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -1107,6 +1107,56 @@ and `cuFileDriverOpen` reports GDS (not compat) mode BEFORE trusting any number.
 3. Only then decide.  Decompress is the better first target: output volume exceeds input, so
    the `cuFileWrite` side moves more bytes than the read side.
 
+### 9.1 Topology-aware GPU selection (stands alone; prerequisite for GDS)
+
+**Priority: Medium | Complexity: Low | Status: NOT STARTED**
+
+Device selection today is `min(gpu_devices, device_count)` (`gzstd.cpp:19356`) — the FIRST N
+devices, with no awareness of where the data is coming from. On this box that is measurably
+the wrong choice:
+
+    NVMe 0000:22:00.0, 0000:23:00.0  ->  adjacent to GPU1 (0000:21:00.0), NUMA 0
+    NVMe 0000:82:00.0                ->  adjacent to GPU4 (0000:81:00.0), NUMA 1
+    GPU0-3 = NUMA 0 | GPU4-7 = NUMA 1 | `SYS` between halves (crosses the inter-socket link)
+
+So `--gpu-devices 2` takes GPU0+GPU1 regardless of which NVMe holds the input, and reading
+from `/backup` (nvme0) to GPUs 0-3 crosses sockets for no reason. Select by PCIe/NUMA
+proximity to the *source* instead. Worth measuring on its own for H2D bandwidth, and it
+becomes load-bearing under GDS, where true P2P requires the NVMe and GPU to share a root
+complex.
+
+### 9.2 NVLink — what it does and does not buy us
+
+Measured here: these are **H100 PCIe cards with 2-way NVLink bridges**, not SXM boards on an
+NVSwitch. Bridged pairs are GPU2<->GPU3 and GPU6<->GPU7 (`NV12`); GPU1 reports `NV12` toward
+GPU0 while **GPU0 reports all links inactive**, which is an asymmetry worth investigating
+before relying on that pair. Everything else is `NODE` or `SYS`.
+
+**NVLink gives peer ACCESS, not a memory POOL.** `cudaDeviceEnablePeerAccess` plus UVA lets
+one GPU dereference a pointer into a bridged peer's memory at bridge speed, but a single
+`cudaMalloc` still cannot exceed one device's VRAM. There is no 8x95 GiB allocation.
+`cudaMallocManaged` can oversubscribe, but that is driver page migration with fault overhead,
+not a fast pool.
+
+**And gzstd does not need one.** The GPU work is embarrassingly parallel across frames: each
+device does H2D batch -> nvCOMP -> D2H independently and **GPUs never exchange data**. Nothing
+approaches 95 GiB — at the default 16 MiB chunk, ONE H100 already holds ~5,900 frames. VRAM
+pressure exists only in batch sizing, which the auto-tuner already clamps.
+
+**Specifically, "load a whole large file into pooled VRAM, then compress" would be a
+regression, not a win.** It serialises what is currently a pipeline: gzstd overlaps read,
+compress and write, so time-to-first-output is one frame, peak memory is bounded by the
+throttle, and a 400 GiB input works on a machine with far less RAM. Reading everything before
+computing anything gives up all three. The useful version of that instinct is **deeper
+in-VRAM prefetch depth** so the GPU never waits on PCIe — a buffering-depth knob on one
+device, not a pooling problem.
+
+**Where NVLink could genuinely earn its place** is as a second hop under GDS: DMA
+NVMe -> topologically adjacent GPU, then NVLink-forward to its bridged partner, avoiding a
+second PCIe traversal for the far GPU. That only helps actually-bridged pairs, and it is an
+optimisation layered on an unbuilt feature — sequence it after 9.1 and the Phase 9 baseline
+measurement, not before.
+
 ### Known design conflicts to resolve before any integration
 - **It fights `HybridSched`.** The scheduler picks CPU or GPU *per frame*, after the frame is
   read.  A frame landed straight in VRAM cannot go to a CPU worker without a D2H, so the
@@ -1510,6 +1560,7 @@ paths (one thread walks the stream in order). Open follow-ups:
 | v0.15.35 | **Six-angle code review, 17 defects fixed** — a `ResultStore` resize racing the live writer, every `--adapt` prior compiled out of the CPU-only build, a budget-permit leak that hung on a corrupt tar, a `--cpu-batch` deadlock, and the parallel extract path silently memcpy'ing every byte (peak RSS −27% once fixed) |
 | v0.15.36 | Backend prior **keyed by input residency** (warm 2.28 vs cold 1.55 GiB/s on the same file; the blended 1.91 described neither) + the four state-machine defects keying exposed |
 | v0.15.37–v0.15.39 | **Four independent review passes by a different model** (Codex CLI / GPT-5.6-sol). It found a bug v0.15.37 shipped, three of the fixes that were only half-fixes, and two order-dependence bugs in multi-input handling. Method: ask it to *confirm or reject its own prior findings*, and run it BEFORE the suite — it twice caught what a green suite hid |
+| v0.15.70 | **The re-review rejected five of the eleven v0.15.69 fixes**, each with a concrete trigger, and found no new regressions. The identity check had a TOCTOU window for a not-yet-existing output (now: open without O_TRUNC, `fstat` the FD against the input's, truncate only after); `--direct` discarded the `O_EXCL` guarantee by reopening the temp BY NAME (now `DirectWriter::adopt_fd`, three call sites incl. the rebuild path); two more read-error sites turned `EIO` into a clean EOF; `EINVAL` was forgiven from errno alone, which a FUSE regular file can return, so `--sync-output` could report durability it never obtained; and the compress GPU catch discarded the failure counter, hanging the fixed-share barrier forever when a GPU threw before registration. **Also corrected the record on the v0.15.69 tar-hang call: the finding stood, my rebuttal missed that the pusher waits for the first UNCLAIMED index** |
 | v0.15.69 | **An independent whole-codebase review before tagging.** 25,918 lines and the help text, reviewed by a different model primed with `AGENTS.md`: verdict NOT SAFE TO TAG, with **seven CRITICAL findings all of the form "destroys or corrupts data and exits 0"**. Two reproduced verbatim first: `--rm -f -o data data` deleted BOTH the source and the archive after printing a success line, and the fixed `<output>.gzstd.tmp` name was symlink-followed, letting a pre-created symlink redirect the write over any writable file. Also: `fread` errors read as clean EOF at five sites (compress a prefix, install it, exit 0, then `--rm` the source), ignored `ftruncate`/`fsync` failures, device nodes silently skipped on `EPERM`, and a discarded `--rm` failure. Plus three tar write loops that spun on `write()==0`, and `re_enqueue` reintroducing the v0.15.66 seq inversion. **One reported hang did NOT reproduce** (seven fault-injection timings) and is recorded as hardening, not a fix. Help audit: 143 parser spellings vs 79/89 documented, 33 discrepancies, 12 HIGH — including an unqualified "drop-in-compatible" claim over ~30 silently-ignored zstd options |
 | v0.15.68 | The last unsorted queue, `RescueQueue`, turned out to be **unreachable** — no producer, no consumer, only `set_done()` — so it was removed (73 lines) rather than guarded. Sorting an unreachable push would have documented a hazard that cannot occur. ROADMAP's own "deadlock-free by construction (FIFO queue guarantees...)" claim annotated with what actually enforces it |
 | v0.15.67 | **v0.15.66 fixed two of three cycles.** Validation on the 256-thread box reproduced the deadlock 5/5 pre-fix and **still hung 2/30 after** — rising to 34/40 at 48 readers. The survivor was the cycle the original root-cause note described first: `pooled_read_chunks` claims its chunk index BEFORE acquiring a buffer, so the writer's next frame can be absent from the queue entirely, and sorted insert cannot order a frame that is not there. Fixed with a **bounded (max 1) head-of-line permit overdraft**; the bound matters because `-M` makes the budget a user-visible memory cap (unbounded measured a 2.6x overshoot). Every failing cell to zero, no perf cost |

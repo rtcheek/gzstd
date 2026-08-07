@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.69  
+**Covers:** v0.9.50 → v0.15.70  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,71 @@
 ---
 
 
+## v0.15.70 — the re-review rejected five of eleven fixes, each with a trigger
+
+v0.15.69's fixes went back to the same independent reviewer, asked not to "review it again"
+but to **confirm or reject each of its own prior findings as fixed**, with my specific doubt
+about each stated up front. It confirmed six and **rejected five**, every rejection naming a
+concrete trigger. It also found **no new regressions** in the 531 changed lines.
+
+**1 — the identity check had a TOCTOU window.** `fs::equivalent` only runs when the output
+already exists, so for a NEW output there was a gap between "does not exist" and
+`fopen(path, "wb")` in which another process could create that name as a symlink to the
+input. Now the output is opened **without `O_TRUNC`**, the resulting **fd** is `fstat`ed
+against the input's fd, and only then truncated — nothing is destroyed even if the path
+changes underneath. Symlink outputs still work; a symlink aimed at the input is caught like
+any other alias.
+
+**2 — `--direct` threw away the protection `O_EXCL` had just bought.** The temp is created
+`O_EXCL|O_NOFOLLOW`, and then the O_DIRECT path did `stat(write_path)` + `open(write_path,
+O_TRUNC)` with neither flag. No prediction needed: an inotify watcher sees the temp appear,
+unlinks it, and drops a symlink to a victim before the second open. `DirectWriter` gained
+`adopt_fd()`, which takes over the descriptor the caller already holds and verified, so the
+name is never resolved twice. Three call sites converted — file output, redirected stdout
+(now adopting fd 1, with the `readlink` used only to *reject* unsuitable targets), and the
+GPU-fault/`--verify` rebuild path, which used to close the verified fd and reopen by name.
+
+**3 — five `fread` sites were not the complete set.** The sequential decompression splitter
+converted zero to EOF without checking `ferror`, then returned success for whatever complete
+frames it had already parsed: an `EIO` partway through a multi-frame archive silently dropped
+the trailing frames, and `--rm` then removed the archive. The non-mmap `-l` reader had the
+same hole. Both now check. Measured before/after: v0.15.68 exits **0** on an unreadable
+decompress and an unreadable `-l`; v0.15.70 exits 3 on both.
+
+**5 — `EINVAL` was suppressed from the errno alone.** That is right for a pipe or a terminal,
+which have nothing to persist, but a FUSE filesystem can return `EINVAL` for a **regular
+file** — and `--sync-output` then reported success, renamed the output over the target and
+removed the source without ever obtaining durability. `fsync_fd_ok()` now `fstat`s the
+descriptor and only forgives `EINVAL` on a non-regular target. The same audit found
+`--calibrate` ignoring both `fflush` and `fsync`, which could persist a sink rate for work
+that never reached the device; it now refuses to record a measurement it could not make
+durable.
+
+**11 — the fixed-share bringup barrier could hang forever.** The compress GPU catch set
+`g_gpu_aborted` and explicitly discarded the failure counter (`(void)gpu_failures;`), so a
+GPU that threw *before* `register_gpu_stream` — a bad `cudaSetDevice`, a stream or event
+creation error — satisfied neither barrier term and parked the main thread permanently.
+Decompress's catch had always counted. The compress catch now counts and signals, and both
+barriers additionally release on `g_gpu_aborted` as a safety net, since the failure mode here
+is a permanent hang and an aborted pass is discarded anyway.
+
+**Confirmed fixed and left alone:** the `ftruncate` propagation (coverage verified complete
+across `--tar` create and redirected stdout), the `EPERM` device-node failure, the `--rm`
+failure report, the three zero-length write loops (sibling set confirmed complete), and the
+sorted `re_enqueue`.
+
+**And I was wrong about the tar hang.** v0.15.69 recorded finding 8 as unreproducible and
+kept the escapes only as hardening. The reviewer withdrew "confirmed" as a statement of
+reproduction but **not the finding**, and identified what my rebuttal missed: after the pusher
+drains the contiguous *claimed* prefix it waits for the first **unclaimed** index, and
+checking abort before `next_chunk.fetch_add` guarantees only that claimed indices are
+deposited — not that every index is ever claimed. The trigger needs `--read-threads 1` and
+many more chunks than the claim window, which none of my seven configurations produced. The
+fix was warranted; the reasoning I published for keeping it was not.
+
+Suites: 372 / 505 / 291 + 70 skipped, green on both build configurations.
+
+---
 ## v0.15.69 — an independent whole-codebase review before tagging, and the seven ways output could be lost
 
 24 commits had landed since the last tag with no full-codebase review, and tagging is
