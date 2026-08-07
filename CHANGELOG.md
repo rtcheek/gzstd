@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.71  
+**Covers:** v0.9.50 → v0.15.72  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,84 @@
 ---
 
 
+## v0.15.72 — a feature attached to one of four write paths, and the checksum we never owned
+
+Round 4, open mandate again. Nine findings: four HIGH, four MEDIUM, one LOW — and an
+explicit answer to the question of whether the remainder was below the shipping bar:
+*"the remaining source-truncation race and the two silent integrity failures are
+independently tag blockers."*
+
+**`--verify` was verifying NOTHING on two of the four compress paths.** The verifier taps
+the ordered writer's in-order drain, and `-T1` and `--sliding-window` do not use an ordered
+writer — so they created a verification pool, checked zero frames, and exited 0. gzstd
+printed its own proof and nobody read it:
+
+    -T1 --verify              → [VERIFY] ... 0 frames (0.00 B) checked
+    --sliding-window --verify → [VERIFY] ... 0 frames (0.00 B) checked
+    default --verify          → [VERIFY] ... 1 frames (3.88 MiB) checked
+
+With `--rm` that removed the source after an integrity check that never happened. `-T1` now
+submits its frames directly. `--sliding-window` cannot — its whole output is ONE frame
+emitted incrementally, so there is no completed frame to hand over — and it gets a
+**streaming verifier** instead: a dedicated thread decompresses the bytes as they are
+written while the compressor digests the input, and the two rolling XXH64 digests must
+match. Constant memory, which matters precisely here, since this mode exists for very large
+windows and buffering the plaintext to compare would defeat it. (The obvious alternative,
+rejecting `--verify --sliding-window`, was declined: the user asked for verification and an
+extra thread is what that costs.)
+
+**gzstd never owned an XXH64 — and that was a load-time portability defect.** It had the
+plumbing to ATTACH a content checksum (`gpu_frame_add_checksum` flips the flag bit and
+appends four bytes) but not to COMPUTE one; the value came from `extern "C" ZSTD_XXH64`.
+libzstd compiles xxhash in but does not always EXPORT it: Ubuntu's libzstd 1.5.5 exports
+zero XXH symbols, so a dynamically linked GPU build died with `undefined symbol:
+ZSTD_XXH64` **before running any GPU code**. Release builds are static, which is why this
+never bit in the field. XXH64 is now implemented in-tree — validated byte-for-byte against
+libzstd's own across 57 cases (lengths 0–8192, three seeds, streaming fed in 1/3/7/32/33/100
+byte slices) — and both the GPU frame checksum and the new stream verifier use it. The
+binary now carries no XXH reference at all and loads against a stock distro libzstd.
+Note this never affected CHECKING: libzstd validates the frame checksum internally on every
+decompress, which needs no exported symbol. Only our producer-side computation did.
+
+**The same write-path divergence hid a second bug, wider than reported.** An empty input
+produced a ZERO-BYTE output — not a zstd stream at all — because the frame-parallel paths
+queue nothing and the writer writes nothing. The review found it in `-T1`; checking all four
+paths found `cpu_mt` and `hybrid` too, with `--sliding-window` correct only by accident
+(`ZSTD_e_end` flushes a frame regardless). Real zstd emits 13 bytes. Fixed once in
+`run_one_pass`, the single point every path funnels through, rather than four times.
+
+**`--tar` could still truncate a named source through an absent-output race.** The previous
+fix compared sources only when the output already existed, so for an absent output another
+process could create that name as a symlink to a source between check and open. Sources now
+have their identities captured — and `O_PATH` handles held, so the inodes cannot be recycled
+— before anything touches the output, and the OPENED FD is compared against them.
+
+**Redirected stdout still kept an old tail for excluded destinations.** The `/dev/` and
+`(deleted)` pathname tests were proxies for "is this a real file" and are obsolete now that
+the descriptor is adopted: a regular file under `/dev/shm`, or an unlinked regular fd, was
+excluded, took the buffered path, and kept the tail of a longer previous file. `S_ISREG`
+already answers the only question that matters. Truncation failure is now fatal rather than
+falling back — falling back reproduces exactly the corruption being prevented.
+
+Also: the buffered `--verify` rebuild ignored `ftruncate` failure, so a shorter CPU rebuild
+could overwrite the prefix of a rejected archive and leave stale bytes after it (the verify
+pool only checks the frames the rebuild produced); calibration cleanup did `lstat` then
+`unlink` as separate pathname operations, and now unlinks at creation and measures through
+the fd, leaving no name to race; global PAX extended metadata (`SCHILY.xattr.*`, ACLs,
+SELinux) still applied to one member, where only the scalar fields had been separated; the
+`--adapt` profile temp was a predictable `profile.json.tmp.<pid>` opened with a
+symlink-following `ofstream`; and concurrent `--adapt` saves lost each other's observations,
+now serialised by an advisory lock on a sidecar (never on `profile.json` itself, which is
+replaced by rename and would drop the lock with the inode).
+
+Six of the nine prior fixes were confirmed, and every judgment call flagged as uncertain was
+validated: exit 2 for the tar alias, the `setxattr`-through-the-magic-link security property,
+the broad `incomplete` promotion, the index-builder revert, and `S_ISREG || S_ISBLK` as the
+persistence-bearing set.
+
+Suite: 374, green on both build configurations.
+
+---
 ## v0.15.71 — a third review round, an open mandate, and a regression I had shipped
 
 Round 2 was scoped to adjudicating its own prior findings. Round 3 was deliberately left

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.71";
+static constexpr const char * GZSTD_VERSION = "0.15.72";
 //
 // Architecture overview:
 //
@@ -41,6 +41,7 @@ static constexpr const char * GZSTD_VERSION = "0.15.71";
 //  - -vv : per-worker summaries and per-GPU per-batch submit/complete lines
 //  - -vvv: per-CPU-chunk lines
 
+#include <sys/file.h>
 #include <zstd.h>
 #include <zstd_errors.h>
 #include <cstdio>
@@ -4458,6 +4459,27 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   const std::string path = adapt_profile_path();
   if (path.empty()) return;
 
+  // Serialise the whole READ-MODIFY-WRITE against other gzstd processes.
+  //
+  // The save loads the profile, merges this run's observation, and renames a new
+  // file over it.  Two qualifying runs (a compress and a decompress, say) both
+  // load state N, both write N+1, and the second rename silently discards the
+  // first one's rates, fault count and exploration stamps.  An advisory lock on a
+  // stable sidecar — never on profile.json itself, which is replaced by rename and
+  // would drop the lock with the inode — makes the transaction atomic between
+  // cooperating processes.  Best-effort by design: the profile is a regenerable
+  // cache, so failing to lock must not fail the run.
+  struct ProfileLock {
+    int fd = -1;
+    explicit ProfileLock(const std::string & p) {
+      std::error_code ec;
+      fs::create_directories(fs::path(p).parent_path(), ec);
+      fd = ::open((p + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+      if (fd >= 0 && ::flock(fd, LOCK_EX) != 0) { ::close(fd); fd = -1; }
+    }
+    ~ProfileLock() { if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); } }
+  } plock(path);
+
   AdaptJv root;
   const AdaptProfileRead rd = adapt_profile_load(path, root);
   if (rd != AdaptProfileRead::OK) {
@@ -4544,10 +4566,43 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
 
   std::error_code ec;
   fs::create_directories(fs::path(path).parent_path(), ec);
-  const std::string tmp = path + ".tmp." + std::to_string((long)getpid());
+  // Unpredictable name, created EXCLUSIVELY, written through the fd.
+  //
+  // This was `profile.json.tmp.<pid>` opened with std::ofstream(trunc), which
+  // follows symlinks — so with the cache directory writable by anyone,
+  // pre-creating that predictable name as a symlink to a victim file made a
+  // qualifying --adapt run truncate and overwrite it, and the rename then
+  // installed the symlink as profile.json.  Same shape as the output temp file
+  // fixed earlier; this one was simply in a quieter corner.
+  std::string tmp;
+  int tfd = -1;
   {
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    if (!f || !(f << text) || (f.close(), f.fail())) {
+    unsigned seed = (unsigned)getpid()
+                  ^ (unsigned)std::chrono::steady_clock::now().time_since_epoch().count();
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      seed = seed * 1664525u + 1013904223u;
+      char sfx[40];
+      std::snprintf(sfx, sizeof sfx, ".tmp.%d.%08x", (int)getpid(), seed);
+      tmp = path + sfx;
+      tfd = ::open(tmp.c_str(),
+                   O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+      if (tfd >= 0) break;
+      if (errno != EEXIST) break;
+    }
+    if (tfd < 0) {
+      vlog(V_VERBOSE, opt, "[ADAPT] profile write failed (ignored): " + tmp + "\n");
+      return;
+    }
+    size_t off = 0;
+    bool wrote_ok = true;
+    while (off < text.size()) {
+      ssize_t w = ::write(tfd, text.data() + off, text.size() - off);
+      if (w < 0) { if (errno == EINTR) continue; wrote_ok = false; break; }
+      if (w == 0) { wrote_ok = false; break; }
+      off += (size_t)w;
+    }
+    if (::close(tfd) != 0) wrote_ok = false;
+    if (!wrote_ok) {
       vlog(V_VERBOSE, opt, "[ADAPT] profile write failed (ignored): " + tmp + "\n");
       ::unlink(tmp.c_str());
       return;
@@ -5053,7 +5108,8 @@ static FILE * open_input(const std::string & path)
 //   3. only then ftruncate to 0, which is what "wb" would have done.
 // Symlinks are still followed, deliberately: `-o some-symlink` is legitimate, and a
 // symlink aimed at the INPUT is caught by step 2 like any other alias.
-static FILE * open_output_verified(const std::string & path, FILE * in_file)
+static FILE * open_output_verified(const std::string & path, FILE * in_file,
+                                   const std::vector<std::pair<dev_t, ino_t>> * forbidden = nullptr)
 {
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
   if (fd < 0) die_io("cannot open output: " + path + " (" + std::strerror(errno) + ")");
@@ -5063,6 +5119,21 @@ static FILE * open_output_verified(const std::string & path, FILE * in_file)
         && so.st_dev == si.st_dev && so.st_ino == si.st_ino) {
       ::close(fd);              // nothing was truncated: we never asked for O_TRUNC
       die_usage("input and output are the same file: " + path);
+    }
+  }
+  // --tar has no input FILE* to compare against, so the caller passes the
+  // identities of the sources it captured BEFORE this open.  Checking the
+  // OPENED FD closes the window the path-based check could not: the name may
+  // have become a symlink to a source between that check and this open.
+  if (forbidden && !forbidden->empty()) {
+    struct stat so;
+    if (::fstat(fd, &so) == 0) {
+      for (const auto & id : *forbidden) {
+        if (so.st_dev == id.first && so.st_ino == id.second) {
+          ::close(fd);          // untruncated: no O_TRUNC was requested
+          die_usage("--tar source and archive output are the same file: " + path);
+        }
+      }
     }
   }
   // Regular files need the truncate that "wb" implies; a device or fifo neither
@@ -11296,6 +11367,8 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
     g_tar_frame_csizes.clear();
   }
 
+  size_t seq_no = 0;      // frame sequence for the --verify pool (see the submit below)
+
   // Get total input size for progress percentage
   uint64_t total_in = known_input_size(opt, in);
 
@@ -11334,7 +11407,10 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
       g_perf->read_ns.fetch_add(now_ns() - rd_t0);
       g_perf->read_bytes_total.fetch_add(n);
     }
-    if (n == 0) { check_read_error(in, opt.input); break; }
+    if (n == 0) {
+      check_read_error(in, opt.input);
+      break;
+    }
     if (m) m->read_bytes.fetch_add(n);
     uint64_t comp_t0 = g_perf ? now_ns() : 0;
     size_t csz = ZSTD_compress2(cctx, outbuf.data(), outbuf.size(), inbuf.data(), n);
@@ -11343,6 +11419,16 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
       g_perf->cpu_compute_ns.fetch_add(now_ns() - comp_t0);
       g_perf->cpu_compute_count.fetch_add(1);
       g_perf->cpu_compute_bytes.fetch_add(n);
+    }
+    // --verify taps the ORDERED WRITER, and this serial path does not use one —
+    // so `-T1 --verify` created a verification pool, checked ZERO frames, and
+    // exited 0.  gzstd printed its own proof ("[VERIFY] ... 0 frames (0.00 B)
+    // checked") and with --rm then deleted the source after an integrity check
+    // that never happened.  Submit here, before the write, so the frame is
+    // verified whether or not the writer thread exists.
+    if (g_verify_pool) {
+      auto vframe = std::make_shared<FrameVec>(outbuf.data(), outbuf.data() + csz);
+      g_verify_pool->submit(seq_no++, vframe);
     }
     uint64_t w_t0 = g_perf ? now_ns() : 0;
 #ifndef _WIN32
@@ -11372,6 +11458,225 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
 // Single-frame compression using zstd's built-in MT with sliding window.
 // Produces one frame (like `zstd`) for maximum ratio on repetitive data.
 // Decompression will be single-threaded (one frame = one unit of work).
+// XXH64, implemented here rather than called out to libzstd.
+//
+// gzstd needs to COMPUTE a content checksum in two places — the GPU frame footer
+// (nvCOMP emits compressed bytes but not zstd's checksum) and the sliding-window
+// stream verifier — and it had only the plumbing to ATTACH one.  The computation
+// came from `extern "C" ZSTD_XXH64`, which libzstd compiles in but does not always
+// EXPORT: Ubuntu's libzstd 1.5.5 exports zero XXH symbols, so a dynamically linked
+// GPU build fails at LOAD with `undefined symbol: ZSTD_XXH64` — before any GPU code
+// runs.  (Release builds are static, which is why this never bit in the field.)
+//
+// Note this was never needed for checking: libzstd validates the frame checksum
+// INTERNALLY on every decompress, which requires no exported symbol.  Only our own
+// producer-side computation did.
+//
+// Verified byte-for-byte against ZSTD_XXH64 across sizes 0..8 KiB and random seeds
+// before the dependency was removed.
+namespace xxh {
+  static constexpr uint64_t P1 = 11400714785074694791ULL;
+  static constexpr uint64_t P2 = 14029467366897019727ULL;
+  static constexpr uint64_t P3 =  1609587929392839161ULL;
+  static constexpr uint64_t P4 =  9650029242287828579ULL;
+  static constexpr uint64_t P5 =  2870177450012600261ULL;
+  static inline uint64_t rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+  static inline uint64_t rd8(const unsigned char * p) {
+    uint64_t v; std::memcpy(&v, p, 8); return v;              // x86/ARM: little-endian
+  }
+  static inline uint32_t rd4(const unsigned char * p) {
+    uint32_t v; std::memcpy(&v, p, 4); return v;
+  }
+  static inline uint64_t round_(uint64_t acc, uint64_t in) {
+    acc += in * P2; acc = rotl(acc, 31); acc *= P1; return acc;
+  }
+  static inline uint64_t merge(uint64_t acc, uint64_t val) {
+    acc ^= round_(0, val); acc = acc * P1 + P4; return acc;
+  }
+  static inline uint64_t avalanche(uint64_t h) {
+    h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32; return h;
+  }
+  // Finish from an accumulator state plus the trailing bytes.
+  static inline uint64_t tail(uint64_t h, const unsigned char * p, size_t len) {
+    const unsigned char * end = p + len;
+    while (p + 8 <= end) { h ^= round_(0, rd8(p)); h = rotl(h, 27) * P1 + P4; p += 8; }
+    if (p + 4 <= end) { h ^= (uint64_t)rd4(p) * P1; h = rotl(h, 23) * P2 + P3; p += 4; }
+    while (p < end)   { h ^= (uint64_t)(*p) * P5;  h = rotl(h, 11) * P1;      ++p; }
+    return avalanche(h);
+  }
+  // Streaming state: buffers a partial 32-byte stripe between updates.
+  struct State {
+    uint64_t v1 = 0, v2 = 0, v3 = 0, v4 = 0, total = 0;
+    unsigned char buf[32]; size_t buflen = 0; uint64_t seed = 0;
+    explicit State(uint64_t s = 0) { reset(s); }
+    void reset(uint64_t s = 0) {
+      seed = s; v1 = s + P1 + P2; v2 = s + P2; v3 = s; v4 = s - P1;
+      total = 0; buflen = 0;
+    }
+    void update(const void * data, size_t len) {
+      const unsigned char * p = (const unsigned char *)data;
+      total += len;
+      if (buflen + len < 32) { std::memcpy(buf + buflen, p, len); buflen += len; return; }
+      if (buflen) {                                   // complete the held stripe
+        const size_t need = 32 - buflen;
+        std::memcpy(buf + buflen, p, need); p += need; len -= need;
+        const unsigned char * b = buf;
+        v1 = round_(v1, rd8(b)); v2 = round_(v2, rd8(b + 8));
+        v3 = round_(v3, rd8(b + 16)); v4 = round_(v4, rd8(b + 24));
+        buflen = 0;
+      }
+      while (len >= 32) {
+        v1 = round_(v1, rd8(p));      v2 = round_(v2, rd8(p + 8));
+        v3 = round_(v3, rd8(p + 16)); v4 = round_(v4, rd8(p + 24));
+        p += 32; len -= 32;
+      }
+      if (len) { std::memcpy(buf, p, len); buflen = len; }
+    }
+    uint64_t digest() const {
+      uint64_t h;
+      if (total >= 32) {
+        h = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18);
+        h = merge(h, v1); h = merge(h, v2); h = merge(h, v3); h = merge(h, v4);
+      } else {
+        h = seed + P5;
+      }
+      h += total;
+      return tail(h, buf, buflen);
+    }
+  };
+  // One-shot.
+  static inline uint64_t hash(const void * data, size_t len, uint64_t seed = 0) {
+    State st(seed); st.update(data, len); return st.digest();
+  }
+}  // namespace xxh
+
+// Streaming round-trip verifier for the single-frame paths.
+//
+// --verify taps the ORDERED WRITER, so the two compress paths that do not use one
+// (-T1 serial and --sliding-window) created a verify pool, checked ZERO frames,
+// and exited 0 — gzstd even printed "[VERIFY] ... 0 frames (0.00 B) checked" and
+// with --rm then removed the source.  -T1 is fixed by submitting its frames to
+// the pool directly; sliding-window cannot, because its whole output is ONE frame
+// emitted incrementally and there is no complete frame to hand over until the end.
+//
+// So verify it as a STREAM.  A dedicated thread decompresses the bytes as they are
+// written and folds the plaintext into a rolling digest; the compressor thread
+// folds the INPUT into a second digest.  Equal digests at the end prove the output
+// decodes back to exactly what was read.  Constant memory (a bounded queue plus two
+// hash states) — which matters here, because this mode exists for very large
+// windows and buffering the plaintext for comparison would defeat the point.
+//
+// The extra thread is deliberate and is what the user asked for by passing
+// --verify: even on a single-core box it simply time-slices against compression.
+class StreamVerifier {
+  // Uses the same XXH64 as every other checksum in gzstd (see namespace xxh),
+  // so this verifier and the frame footers agree on what "the content hash" means.
+public:
+  explicit StreamVerifier(const Options & opt) : opt_(opt) {
+    dctx_ = ZSTD_createDStream();
+    if (!dctx_) die("failed to create ZSTD_DStream for --verify");
+    ZSTD_initDStream(dctx_);
+    apply_mem_limit_to_dctx_stream();
+    th_ = std::thread(&StreamVerifier::run, this);
+  }
+  ~StreamVerifier() {
+    finish();
+    if (dctx_) ZSTD_freeDStream(dctx_);
+  }
+  StreamVerifier(const StreamVerifier &) = delete;
+  StreamVerifier & operator=(const StreamVerifier &) = delete;
+
+  // Compressor thread: the plaintext it just consumed.
+  void note_input(const void * p, size_t n) {
+    in_d_.update(p, n);
+    in_bytes_ += n;
+  }
+  // Compressor thread: compressed bytes as they are written.  Bounded — a full
+  // queue back-pressures compression, exactly like the frame verifier.
+  void note_output(const void * p, size_t n) {
+    if (!n || failed_.load(std::memory_order_relaxed)) return;
+    auto buf = std::make_shared<std::vector<char>>(
+        (const char *)p, (const char *)p + n);
+    std::unique_lock<std::mutex> lk(m_);
+    not_full_.wait(lk, [&]{ return q_.size() < MAXQ || failed_.load(std::memory_order_relaxed); });
+    if (failed_.load(std::memory_order_relaxed)) return;
+    q_.push_back(std::move(buf));
+    lk.unlock();
+    not_empty_.notify_one();
+  }
+  // Join and decide.  Returns false if the output does NOT round-trip.
+  bool finish() {
+    if (joined_) return ok_;
+    { std::lock_guard<std::mutex> lk(m_); done_ = true; }
+    not_empty_.notify_all(); not_full_.notify_all();
+    if (th_.joinable()) th_.join();
+    joined_ = true;
+    if (failed_.load(std::memory_order_relaxed)) { ok_ = false; return ok_; }
+    const uint64_t din = in_d_.digest(), dout = out_d_.digest();
+    ok_ = (din == dout) && (out_bytes_ == in_bytes_);
+    if (!ok_) {
+      std::ostringstream os;
+      os << "[VERIFY] sliding-window round-trip MISMATCH: read " << in_bytes_
+         << " bytes (digest " << std::hex << din << ") but the output decodes to "
+         << std::dec << out_bytes_ << " bytes (digest " << std::hex << dout << ")\n";
+      vlog(V_ERROR, opt_, os.str());
+    }
+    return ok_;
+  }
+  uint64_t verified_bytes() const { return out_bytes_; }
+
+private:
+  static constexpr size_t MAXQ = 64;
+  void apply_mem_limit_to_dctx_stream() {
+    if (opt_.mem_limit_mib > 0) {
+      unsigned wl = 10;
+      uint64_t cap = (uint64_t)opt_.mem_limit_mib * ONE_MIB;
+      while (wl < 31 && ((uint64_t)1 << (wl + 1)) <= cap) ++wl;
+      ZSTD_DCtx_setParameter(dctx_, ZSTD_d_windowLogMax, (int)wl);
+    } else {
+      ZSTD_DCtx_setParameter(dctx_, ZSTD_d_windowLogMax, 31);  // match ultra windows
+    }
+  }
+  void run() {
+    std::vector<char> plain(1 << 20);
+    for (;;) {
+      std::shared_ptr<std::vector<char>> buf;
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        not_empty_.wait(lk, [&]{ return !q_.empty() || done_; });
+        if (q_.empty()) { if (done_) break; else continue; }
+        buf = std::move(q_.front()); q_.pop_front();
+      }
+      not_full_.notify_one();
+      ZSTD_inBuffer zin { buf->data(), buf->size(), 0 };
+      while (zin.pos < zin.size) {
+        ZSTD_outBuffer zout { plain.data(), plain.size(), 0 };
+        size_t r = ZSTD_decompressStream(dctx_, &zout, &zin);
+        if (ZSTD_isError(r)) {
+          std::ostringstream os;
+          os << "[VERIFY] sliding-window output failed to decode: "
+             << ZSTD_getErrorName(r) << "\n";
+          vlog(V_ERROR, opt_, os.str());
+          failed_.store(true, std::memory_order_relaxed);
+          not_full_.notify_all();
+          return;
+        }
+        if (zout.pos) { out_d_.update(zout.dst, zout.pos); out_bytes_ += zout.pos; }
+      }
+    }
+  }
+  const Options &  opt_;
+  ZSTD_DStream *   dctx_ = nullptr;
+  xxh::State       in_d_, out_d_;
+  uint64_t         in_bytes_ = 0, out_bytes_ = 0;
+  std::deque<std::shared_ptr<std::vector<char>>> q_;
+  std::mutex       m_;
+  std::condition_variable not_empty_, not_full_;
+  bool             done_ = false, joined_ = false, ok_ = true;
+  std::atomic<bool> failed_{false};
+  std::thread      th_;
+};
+
 static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   unsigned n_threads = (unsigned)std::thread::hardware_concurrency();
@@ -11409,6 +11714,11 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   std::vector<char> outbuf(OUT_BUF);
 
   bool finished = false;
+  // --verify on this path is a STREAM round-trip (see StreamVerifier): there is
+  // no per-frame handoff to the pool because the whole output is one frame.
+  std::unique_ptr<StreamVerifier> sv;
+  if (opt.verify) sv = std::make_unique<StreamVerifier>(opt);
+
   while (!finished) {
     size_t n = std::fread(inbuf.data(), 1, READ_CHUNK, in);
     // A SHORT read is what ends this stream, so the error check belongs on the
@@ -11416,6 +11726,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
     // flushed as ZSTD_e_end and sealed into a valid, truncated archive.
     if (n < READ_CHUNK) check_read_error(in, opt.input);
     if (m && n > 0) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
+    if (sv && n) sv->note_input(inbuf.data(), n);
     bool last_chunk = (n < READ_CHUNK);
 
     ZSTD_inBuffer input = { inbuf.data(), n, 0 };
@@ -11438,6 +11749,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
           size_t w = robust_fwrite((const char *)output.dst, output.pos, out);
           if (w != output.pos) die_io("short write to output (broken pipe?)");
         }
+        if (sv) sv->note_output(output.dst, output.pos);
         if (m) m->wrote_bytes.fetch_add(output.pos, std::memory_order_relaxed);
       }
 
@@ -11447,6 +11759,23 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
 
   ZSTD_freeCCtx(cctx);
   progress_done = true; progress_thr.join();
+
+  // Decide the round trip.  A mismatch raises the SAME flag the frame verifier
+  // uses, so the driver's existing discard-and-rebuild-CPU-only path handles it
+  // identically — this path just proves the claim differently.
+  if (sv) {
+    const bool ok = sv->finish();
+    if (!ok) {
+      g_verify_failed.store(true, std::memory_order_relaxed);
+      if (g_verify_failed_seq.load(std::memory_order_relaxed) < 0)
+        g_verify_failed_seq.store(0, std::memory_order_relaxed);
+    } else if (opt.verbosity >= V_VERBOSE) {
+      std::ostringstream os;
+      os << "[VERIFY] sliding-window stream round-trip OK ("
+         << sv->verified_bytes() << " bytes decoded and compared)\n";
+      vlog(V_VERBOSE, opt, os.str());
+    }
+  }
 }
 
 // True if the running kernel has per-VMA locks (Linux >= 6.4).  Before 6.4 a
@@ -15532,6 +15861,12 @@ private:
     std::string gpax_uname, gpax_gname;
     bool gpax_has_uid = false, gpax_has_gid = false, gpax_has_mtime = false,
          gpax_has_uname = false, gpax_has_gname = false;
+    // Extended metadata (SCHILY.xattr.* / SCHILY.acl.* / SELinux) from a GLOBAL
+    // header.  Separating only the SCALAR fields above left these still living in
+    // the per-entry pax_ext, which the next member consumes and clears — so a
+    // global xattr reached exactly one file.  Merged into every entry below, with
+    // per-entry 'x' records overriding on key collision.
+    ExtMeta gpax_ext;
 
     bool pax_gnu_sparse = false;          // GNU.sparse.* records seen (PAX sparse format)
     int  pax_sp_major = 0, pax_sp_minor = 0;
@@ -15649,6 +15984,17 @@ private:
           if (pax_has_mtime) { gpax_mtime = pax_mtime; gpax_has_mtime = true; }
           if (pax_has_uname) { gpax_uname = pax_uname; gpax_has_uname = true; }
           if (pax_has_gname) { gpax_gname = pax_gname; gpax_has_gname = true; }
+          // Extended records too: later keys replace earlier ones, matching the
+          // scalar behaviour above.
+          for (const auto & kv : pax_ext.xattrs) {
+            bool replaced = false;
+            for (auto & g : gpax_ext.xattrs)
+              if (g.first == kv.first) { g.second = kv.second; replaced = true; break; }
+            if (!replaced) gpax_ext.xattrs.push_back(kv);
+          }
+          if (!pax_ext.acl_access.empty())  gpax_ext.acl_access  = pax_ext.acl_access;
+          if (!pax_ext.acl_default.empty()) gpax_ext.acl_default = pax_ext.acl_default;
+          pax_ext = ExtMeta{};
           pax_has_uid = pax_has_gid = pax_has_mtime = false;
           pax_has_uname = pax_has_gname = pax_has_size = false;
           pax_uname.clear(); pax_gname.clear();
@@ -15682,7 +16028,24 @@ private:
       e.typeflag = type;
       e.devmajor = (uint32_t)get_num(blk + 329, 8);
       e.devminor = (uint32_t)get_num(blk + 337, 8);
-      e.ext = std::move(pax_ext); pax_ext = ExtMeta{};
+      // Global extended metadata is the BASE; the entry's own 'x' records win on
+      // a key collision.
+      if (!gpax_ext.xattrs.empty() || !gpax_ext.acl_access.empty()
+          || !gpax_ext.acl_default.empty()) {
+        ExtMeta merged = gpax_ext;
+        for (const auto & kv : pax_ext.xattrs) {
+          bool replaced = false;
+          for (auto & g : merged.xattrs)
+            if (g.first == kv.first) { g.second = kv.second; replaced = true; break; }
+          if (!replaced) merged.xattrs.push_back(kv);
+        }
+        if (!pax_ext.acl_access.empty())  merged.acl_access  = pax_ext.acl_access;
+        if (!pax_ext.acl_default.empty()) merged.acl_default = pax_ext.acl_default;
+        e.ext = std::move(merged);
+      } else {
+        e.ext = std::move(pax_ext);
+      }
+      pax_ext = ExtMeta{};
       pax_has_size = pax_has_mtime = false;
       pax_has_uid = pax_has_gid = pax_has_uname = pax_has_gname = false;
       pax_uname.clear(); pax_gname.clear();
@@ -17854,19 +18217,9 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
 // nvCOMP's batched zstd compressor does NOT add the per-frame content checksum
 // that the CPU path emits (ZSTD_c_checksumFlag), so GPU/hybrid archives were not
 // self-verifying.  We add it ourselves: zstd's content checksum is the low 32
-// bits of XXH64(uncompressed_frame, 0).  ZSTD_XXH64 is exported by libzstd (it
-// builds xxHash under the ZSTD_ namespace for its own checksums), so no extra
-// dependency.  The checksum is computed at H2D staging (uncompressed data still
-// on the host) and stitched onto the frame after D2H.
-extern "C" unsigned long long ZSTD_XXH64(const void * input, size_t length,
-                                         unsigned long long seed);
 
-// Turn an nvCOMP-produced frame into a self-verifying one: set the
-// Frame_Header_Descriptor's content-checksum flag (bit 2 of the byte after the
-// 4-byte magic) and append the 4-byte XXH64-low32, little-endian — exactly what
-// a zstd decoder (and `zstd -l`, and gzstd -t) expects.  The FrameBuf is a heap
-// vector, so the append is free of the fixed-buffer overflow the GPU output
-// slots would have.
+// bits of XXH64(uncompressed_frame, 0), computed by our own xxh:: above so the
+// binary carries no undefined ZSTD_XXH64 reference (see that note).
 static inline void gpu_frame_add_checksum(FrameVec & f, uint32_t ck) {
   if (f.size() < 5) return;                 // not a well-formed zstd frame; leave as-is
   f[4] |= 0x04;                             // Content_Checksum_flag
@@ -19027,7 +19380,7 @@ static void gpu_worker(
           C.h_in_sizes[i] = t.len();
           // Compute the zstd content checksum now, while the uncompressed chunk
           // is still on the host (it may be released right after H2D below).
-          C.h_checksums[i] = (uint32_t)ZSTD_XXH64(t.ptr(), t.len(), 0);
+          C.h_checksums[i] = (uint32_t)xxh::hash(t.ptr(), t.len(), 0);
         }
         checkCuda(cudaMemcpyAsync(C.d_in_sizes, C.h_in_sizes.data(), sizeof(size_t)*C.filled, cudaMemcpyHostToDevice, C.stream), "cudaMemcpyAsync(d_in_sizes)");
         cudaEventRecord(C.ev_h2d_end, C.stream);
@@ -23299,10 +23652,14 @@ static int run_calibrate(Options opt)
     if (cfd < 0)
       die_io("--calibrate: cannot create sink target " + po.output
              + " (" + std::strerror(errno) + ")");
+    // UNLINK IT NOW, and measure through the descriptor.  The scratch file is
+    // written, timed and discarded, so it never needs a name — and holding one
+    // meant the cleanup had to find it again later by path, which is a second
+    // resolution an attacker can redirect.  Removing it here means there is no
+    // name left to race, and an abnormal exit cannot leave the file behind either.
+    ::unlink(po.output.c_str());
     FILE * outf = ::fdopen(cfd, "wb");
-    struct stat sink_st{};              // identity of the inode WE created
-    if (outf) { if (::fstat(cfd, &sink_st) != 0) sink_st = {}; }
-    else      { ::close(cfd); }
+    if (!outf) ::close(cfd);
     if (in && outf) {
       Meter m;
       compress_cpu_mt(in, outf, po, &m);
@@ -23337,19 +23694,11 @@ static int run_calibrate(Options opt)
                      po.output.c_str(), std::strerror(cal_errno));
     }
     if (in) std::fclose(in);
-    // Remove only the inode we created.  A blind unlink of the NAME would delete
-    // whatever occupies it now, which after a swap is somebody else's file.
-    {
-      struct stat now_st;
-      if (::lstat(po.output.c_str(), &now_st) == 0
-          && S_ISREG(now_st.st_mode)
-          && now_st.st_dev == sink_st.st_dev && now_st.st_ino == sink_st.st_ino) {
-        ::unlink(po.output.c_str());
-      } else if (sink_st.st_ino != 0) {
-        vlog(V_ERROR, opt, "gzstd: --calibrate: scratch target " + po.output
-             + " changed underneath us; leaving it alone\n");
-      }
-    }
+    // Nothing to remove: the name was unlinked immediately after creation (see
+    // the create above), so the file existed only as an open descriptor and the
+    // kernel reclaims it on close.  The previous lstat-then-unlink pair was two
+    // separate pathname operations, so a replacement installed between them was
+    // deleted instead of ours.
   } else {
     std::fprintf(stderr, "[CALIBRATE] no -o TARGET — sink rate not measured\n");
   }
@@ -23652,13 +24001,43 @@ static int gzstd_main(int argc, char ** argv)
     // Only a NAMED source is rejected here.  Writing the archive INTO a source
     // directory is a common, non-destructive pattern (gzstd records a 0-byte
     // placeholder member for it) and must keep working.
-    if (opt.tar_mode && fs::exists(opt.output)) {
+    // Capture the sources' IDENTITIES, and hold an O_PATH handle on each so the
+    // inode cannot be recycled underneath us, BEFORE anything touches the output.
+    // The path-based check alone lost a race: it only ran when the output already
+    // existed, so for an absent output another process could create that name as a
+    // symlink to a named source between the check and the open, and the open then
+    // followed it and truncated the source.  These identities are re-checked
+    // against the OPENED FD in open_output_verified().
+    std::vector<std::pair<dev_t, ino_t>> tar_src_ids;
+    std::vector<int> tar_src_fds;
+    if (opt.tar_mode) {
       for (const std::string & src : opt.tar_sources) {
-        std::error_code ec_src;
-        if (fs::equivalent(src, opt.output, ec_src) && !ec_src)
-          die_usage("--tar source and archive output are the same file: " + src);
+        int sfd = ::open(src.c_str(), O_PATH | O_CLOEXEC);
+        if (sfd < 0) continue;                       // unreadable source: the walker reports it
+        struct stat ss;
+        if (::fstat(sfd, &ss) == 0) {
+          tar_src_ids.emplace_back(ss.st_dev, ss.st_ino);
+          tar_src_fds.push_back(sfd);
+        } else {
+          ::close(sfd);
+        }
+      }
+      // Cheap pre-check so the common mistake reports the SOURCE NAME rather than
+      // the output name; the fd comparison below is what actually closes the race.
+      if (fs::exists(opt.output)) {
+        for (const std::string & src : opt.tar_sources) {
+          std::error_code ec_src;
+          if (fs::equivalent(src, opt.output, ec_src) && !ec_src) {
+            for (int f : tar_src_fds) ::close(f);
+            die_usage("--tar source and archive output are the same file: " + src);
+          }
+        }
       }
     }
+    struct TarSrcFdGuard {           // release the O_PATH handles however we leave
+      std::vector<int> & v;
+      ~TarSrcFdGuard() { for (int f : v) ::close(f); v.clear(); }
+    } tar_src_guard{tar_src_fds};
     // Only a pre-existing REGULAR file is a clobber risk.  A special output
     // target (/dev/null, a device node, a fifo) is a deliberate sink, not
     // something we overwrite — never block on it and never register it for
@@ -23687,11 +24066,11 @@ static int gzstd_main(int argc, char ** argv)
           // If unlink failed (permissions, race), fall through to fopen "wb"
           // which will return its own error.
         }
-        out = open_output_verified(opt.output, in);
+        out = open_output_verified(opt.output, in, &tar_src_ids);
         if (is_regular) register_tmp_file(opt.output);
       }
     } else {
-      out = open_output_verified(opt.output, in);
+      out = open_output_verified(opt.output, in, &tar_src_ids);
       // Register for cleanup-on-failure only if we are CREATING a new file;
       // never register a pre-existing special target like /dev/null.
       if (!existed_before) register_tmp_file(opt.output);
@@ -23729,33 +24108,36 @@ static int gzstd_main(int argc, char ** argv)
       int fd = fileno(stdout);
       if (fd < 0) break;
       struct stat st;
-      if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) break;
+      if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) break;   // S_ISREG is the real gate
       int flags = fcntl(fd, F_GETFL);
-      if (flags < 0 || (flags & O_APPEND)) break;
-      char link_path[64];
-      char real_path[4096];
-      std::snprintf(link_path, sizeof(link_path), "/proc/self/fd/%d", fd);
-      ssize_t len = readlink(link_path, real_path, sizeof(real_path) - 1);
-      if (len <= 0) break;
-      real_path[len] = '\0';
-      if (std::strncmp(real_path, "/dev/", 5) == 0) break;
-      if (std::strstr(real_path, "(deleted)")) break;
-      // Adopt fd 1 itself rather than reopening real_path: the readlink above is
-      // only used to REJECT unsuitable targets (/dev/*, deleted), never to open
-      // one, so a rename between readlink and open cannot redirect this write.
+      if (flags < 0 || (flags & O_APPEND)) break;                // append: never truncate
+
+      // NO pathname tests.  This used to readlink /proc/self/fd/1 and reject the
+      // result if it began "/dev/" or contained "(deleted)".  Both were proxies
+      // for "is this a real file", and both are wrong now that the DESCRIPTOR is
+      // adopted rather than a path reopened:
+      //   * a regular file under /dev/shm is a perfectly good target and was
+      //     being excluded — so it took the buffered path and, because nothing
+      //     truncated it, kept the tail of a longer previous file;
+      //   * an UNLINKED regular fd is equally writable and hit the same thing.
+      // fstat already answers the only question that matters.
       //
-      // TRUNCATE FIRST.  The path this replaced opened real_path with O_TRUNC, and
-      // dropping that was a silent output-corruption regression in v0.15.70:
-      // `exec 1<>old.zst; gzstd --direct -c input` wrote the new archive over the
-      // PREFIX of a longer old file and left its tail in place, exiting 0 with a
-      // corrupt concatenation (measured: a 9,000,000-byte target came back as
-      // 9,000,025 bytes and failed `-t`, where v0.15.68 produced 305,504 valid
-      // bytes).  Adopting a descriptor must reproduce every effect of the open it
-      // replaced, not just the data path.
+      // TRUNCATE, AND FAIL IF WE CANNOT.  The open this replaced carried O_TRUNC;
+      // dropping it was a silent output-corruption regression in v0.15.70
+      // (`exec 1<>old.zst; gzstd --direct -c input` left the old tail behind and
+      // exited 0).  Falling back to buffered on a truncate failure would reproduce
+      // exactly that corruption, so a failure here is fatal — we cannot deliver
+      // the truncating-write semantics the caller is entitled to.
+      if (std::fflush(stdout) != 0)
+        die_io("cannot flush stdout before O_DIRECT adoption");
+      if (::ftruncate(fd, 0) != 0)
+        die_io("cannot truncate redirected stdout (" + std::string(std::strerror(errno)) + ")");
+      if (::lseek(fd, 0, SEEK_SET) == (off_t)-1)
+        die_io("cannot rewind redirected stdout (" + std::string(std::strerror(errno)) + ")");
+
+      // From here a buffered fallback is SAFE: the file is already empty, so an
+      // O_DIRECT adoption failure costs speed, not correctness.
       auto dw = std::make_unique<DirectWriter>();
-      std::fflush(stdout);
-      if (::ftruncate(fd, 0) != 0) break;   // cannot honour "wb" semantics; stay buffered
-      if (::lseek(fd, 0, SEEK_SET) == (off_t)-1) break;
       if (dw->adopt_fd(fd)) {
         out = nullptr;
         direct_writer = std::move(dw);
@@ -23836,6 +24218,7 @@ static int gzstd_main(int argc, char ** argv)
     if (opt.hybrid) vlog(V_VERBOSE, opt, "[HYBRID] not available in CPU-only build; using MT CPU\n");
 #endif
     auto run_one_pass = [&](const Options & po) {
+      const uint64_t before = meter.wrote_bytes.load(std::memory_order_relaxed);
 #ifdef HAVE_NVCOMP
       if (po.cpu_only) {
         if (po.sliding_window) compress_cpu_sliding_window(in, out, po, &meter);
@@ -23847,6 +24230,38 @@ static int gzstd_main(int argc, char ** argv)
       if (po.sliding_window) compress_cpu_sliding_window(in, out, po, &meter);
       else                   compress_cpu_mt(in, out, po, &meter);
 #endif
+      // EMPTY INPUT MUST STILL PRODUCE A VALID ARCHIVE.
+      //
+      // A zero-byte source yields no chunks, so the frame-parallel paths queue
+      // nothing and the writer writes nothing — a ZERO-BYTE output that is not a
+      // zstd stream at all.  gzstd exited 0 and read it back happily; `zstd -t`
+      // called it "unexpected end of file", and real zstd produces a 13-byte empty
+      // frame.  Measured across the four paths: -T1 0 bytes, cpu_mt 0, hybrid 0,
+      // sliding-window 13 (it flushes via ZSTD_e_end and got this right by
+      // accident).  Fixed HERE, at the one point every path funnels through,
+      // rather than four times — the divergence between these paths is exactly
+      // what let --verify silently no-op on two of them as well.
+      if (meter.wrote_bytes.load(std::memory_order_relaxed) == before && !po.tar_mode) {
+        ZSTD_CCtx * ec = ZSTD_createCCtx();
+        if (!ec) die("failed to create ZSTD_CCtx for the empty-input frame");
+        ZSTD_CCtx_setParameter(ec, ZSTD_c_compressionLevel, po.level);
+        ZSTD_CCtx_setParameter(ec, ZSTD_c_checksumFlag, 1);
+        char ebuf[64];
+        const size_t ecsz = ZSTD_compress2(ec, ebuf, sizeof ebuf, "", 0);
+        ZSTD_freeCCtx(ec);
+        if (ZSTD_isError(ecsz))
+          die_data(std::string("ZSTD error (empty input): ") + ZSTD_getErrorName(ecsz));
+#ifndef _WIN32
+        if (g_direct_writer) {
+          if (!g_direct_writer->write(ebuf, ecsz)) die_io("direct write failed (disk full?)");
+        } else
+#endif
+        if (out) {
+          if (robust_fwrite(ebuf, ecsz, out) != ecsz)
+            die_io("short write to output (broken pipe?)");
+        }
+        meter.wrote_bytes.fetch_add(ecsz, std::memory_order_relaxed);
+      }
     };
 
     Options pass_opt = opt;
@@ -24006,8 +24421,21 @@ static int gzstd_main(int argc, char ** argv)
       } else
 #endif
       if (out) {
+        // NOT best-effort.  This discards a rejected archive before rebuilding it
+        // on CPU, and "the rebuild overwrites it anyway" is only true when the new
+        // archive is at least as long as the old one.  A shorter CPU rebuild
+        // overwrote the prefix and left stale compressed bytes after it — and the
+        // verify pool only checks the frames the REBUILD produced, so the corrupt
+        // concatenation could be installed at exit 0.  The O_DIRECT branch above
+        // already treats reset failure as fatal; match it.
+        if (std::fflush(out) != 0)
+          die_io("cannot flush output before --verify rebuild");
         std::rewind(out);
-        if (ftruncate(fileno(out), 0) != 0) { /* best-effort: rebuild overwrites */ }
+        if (std::ftell(out) != 0)
+          die_io("cannot rewind output for --verify rebuild");
+        if (ftruncate(fileno(out), 0) != 0)
+          die_io("cannot discard the rejected archive before --verify rebuild ("
+                 + std::string(std::strerror(errno)) + ")");
       }
       meter.reset();
 
