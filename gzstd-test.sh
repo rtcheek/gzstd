@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=374
-$EXTENSIVE && EXPECTED_TESTS=507
+EXPECTED_TESTS=377
+$EXTENSIVE && EXPECTED_TESTS=510
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -5956,6 +5956,70 @@ else
   if [[ $rc -eq 0 ]] && grep -q "Frames" <<<"$out" && grep -q "l.tar.zst" <<<"$out"; then
     pass "-l prints a frame summary"
   else fail "-l frame summary" "rc=$rc out=[$out]"; fi
+
+  # 1e. A TRUNCATED TRAILING FRAME must be rejected, and an EMPTY .zst is not an
+  #     archive.  Appending the 4-byte zstd magic to a valid file made `gzstd -t`
+  #     report OK and exit 0 where stock zstd says "premature end" — and
+  #     `gzstd -d --rm` decompressed the intact prefix and then DELETED the file.
+  #     Two readers tolerated <=8 trailing bytes as "padding"; a third accepted an
+  #     empty file outright.  Deterministic, and it needed fixes in all three.
+  #     A truncated trailing SKIPPABLE frame is deliberately NOT covered here: it
+  #     carries no user data and must still fall back (see "damaged trailer").
+  "$GZSTD" -q -f -o "$TMPDIR/tf.zst" "$TMPDIR/medium.txt" 2>/dev/null
+  cp "$TMPDIR/tf.zst" "$TMPDIR/tf_magic.zst"
+  printf '\x28\xb5\x2f\xfd' >> "$TMPDIR/tf_magic.zst"
+  : > "$TMPDIR/tf_empty.zst"
+  tf_ok=1
+  "$GZSTD" -t "$TMPDIR/tf.zst"        >/dev/null 2>&1 || tf_ok=0   # good: must pass
+  "$GZSTD" -t "$TMPDIR/tf_magic.zst"  >/dev/null 2>&1 && tf_ok=0   # truncated: must fail
+  "$GZSTD" -t "$TMPDIR/tf_empty.zst"  >/dev/null 2>&1 && tf_ok=0   # empty: must fail
+  "$GZSTD" -d -f -o "$TMPDIR/tf.out" "$TMPDIR/tf_magic.zst" >/dev/null 2>&1 && tf_ok=0
+  "$GZSTD" -l "$TMPDIR/tf_empty.zst"  >/dev/null 2>&1 && tf_ok=0   # -l too
+  if [ "$tf_ok" = 1 ]; then
+    pass "truncated trailing frame and empty .zst are rejected"
+  else
+    fail "truncated trailing frame and empty .zst are rejected"
+  fi
+  rm -f "$TMPDIR/tf.zst" "$TMPDIR/tf_magic.zst" "$TMPDIR/tf_empty.zst" "$TMPDIR/tf.out"
+
+  # 1f. --verify must actually verify on EVERY compress path.  The verifier taps
+  #     the ordered writer, and -T1 and --sliding-window do not use one — so both
+  #     built a pool, checked ZERO frames, and exited 0 while --rm deleted the
+  #     source.  Assert a non-zero checked count, not just a zero exit.
+  vf_ok=1
+  vout=$("$GZSTD" --cpu-only -T1 --verify -v -f -o "$TMPDIR/vf1.zst" "$TMPDIR/medium.txt" 2>&1)
+  grep -qa "0 frames (0.00 B) checked" <<<"$vout" && vf_ok=0
+  grep -qa "frames" <<<"$vout" || vf_ok=0
+  vout2=$("$GZSTD" --sliding-window --verify -v -f -o "$TMPDIR/vf2.zst" "$TMPDIR/medium.txt" 2>&1)
+  grep -qa "round-trip OK" <<<"$vout2" || vf_ok=0
+  if [ "$vf_ok" = 1 ]; then
+    pass "--verify checks frames on -T1 and --sliding-window"
+  else
+    fail "--verify checks frames on -T1 and --sliding-window" "T1=[$vout] sw=[$vout2]"
+  fi
+  rm -f "$TMPDIR/vf1.zst" "$TMPDIR/vf2.zst"
+
+  # 1g. EMPTY INPUT must still produce a valid zstd frame on every path.  The
+  #     frame-parallel paths queue nothing for a zero-byte source, so the writer
+  #     wrote nothing and the output was a ZERO-BYTE non-archive that gzstd read
+  #     back happily and stock zstd calls "unexpected end of file".  Real zstd
+  #     emits 13 bytes.  Was wrong on 3 of 4 paths.
+  : > "$TMPDIR/ei.in"
+  ei_ok=1
+  for eiflag in "-T1" "" "--sliding-window"; do
+    "$GZSTD" --cpu-only $eiflag -q -f -o "$TMPDIR/ei.zst" "$TMPDIR/ei.in" 2>/dev/null || ei_ok=0
+    [ -s "$TMPDIR/ei.zst" ] || ei_ok=0                       # must not be zero bytes
+    "$GZSTD" -t "$TMPDIR/ei.zst" >/dev/null 2>&1 || ei_ok=0  # must be a valid frame
+    if command -v zstd >/dev/null 2>&1; then
+      zstd -t "$TMPDIR/ei.zst" >/dev/null 2>&1 || ei_ok=0    # and stock zstd must agree
+    fi
+  done
+  if [ "$ei_ok" = 1 ]; then
+    pass "empty input produces a valid zstd frame on every path"
+  else
+    fail "empty input produces a valid zstd frame on every path"
+  fi
+  rm -f "$TMPDIR/ei.in" "$TMPDIR/ei.zst"
 
   # 1d. A GLOBAL pax header ('g') sets defaults for EVERY following member, where
   #     an 'x' header applies only to the next one.  Both used to write the same

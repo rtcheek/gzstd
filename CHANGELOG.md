@@ -53,8 +53,15 @@ race it exists to prevent; and the in-tree XXH64 read host-endian lanes, which w
 produced spec-violating checksums on a big-endian host. XXH64 was re-validated 57/57 against
 libzstd after that change.
 
-Six of the nine round-4 fixes were confirmed. Suite: 374, green on both build configurations —
-including a regression the suite caught and this entry describes.
+Six of the nine round-4 fixes were confirmed. Suite: **377**, green on both build
+configurations — including a regression the suite caught and this entry describes.
+
+**Three regression tests added**, closing the gap that produced most of these findings: a
+truncated trailing frame and an empty `.zst` are rejected (asserting `-t`, `-d` and `-l`);
+`--verify` reports a non-zero checked count on `-T1` and `--sliding-window`, not merely exit 0;
+and empty input yields a valid frame on every compress path, cross-checked against stock
+`zstd -t`. All three fail on the pre-fix binary — the assertions were verified to discriminate,
+not just to pass.
 
 ---
 ## v0.15.72 — a feature attached to one of four write paths, and the checksum we never owned
