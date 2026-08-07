@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.70  
+**Covers:** v0.9.50 → v0.15.71  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,77 @@
 ---
 
 
+## v0.15.71 — a third review round, an open mandate, and a regression I had shipped
+
+Round 2 was scoped to adjudicating its own prior findings. Round 3 was deliberately left
+**open** — adjudicate the five, then look anywhere — on the reasoning that if there are real
+flaws we want to know now rather than after a `v*` tag auto-installs on the hosts. It found
+nine, including one that v0.15.70 had introduced.
+
+**The regression was mine.** v0.15.70 taught `DirectWriter` to adopt an already-open
+descriptor instead of re-resolving a pathname. For redirected stdout that reproduced the
+*data path* of the `open(..., O_TRUNC)` it replaced but not the **truncation**:
+
+    exec 1<>old.zst; gzstd --direct -c input
+      v0.15.68 →   305,504 bytes, verifies
+      v0.15.70 → 9,000,025 bytes, CORRUPT   (new output over the prefix, old tail intact, exit 0)
+
+Fixed by truncating fd 1 before adoption. **Adopting a descriptor must reproduce every effect
+of the open it replaces, not just the writes.**
+
+**And v0.15.70's commit message was wrong.** It claimed adoption meant "the name is never
+resolved twice". `DirectWriter::plain_fd_()` was still doing `readlink` → `open(that string)`
+for every unaligned tail, so a rename after the readlink sent the file's final bytes
+positionally into somebody else's file. It now opens `/proc/self/fd/N` directly, which
+resolves through the kernel's descriptor table and has no substitutable name.
+
+**`--tar --overwrite` could delete a source before archiving it.** Tar mode leaves the input
+`FILE*` null, so neither the path check nor `open_output_verified()`'s fd comparison ever saw
+a tar source. `gzstd --overwrite -o data --tar data` unlinked `data` to make room for the
+output, then archived the empty file it had just created — printing `2.21% (10.00 KiB =>
+226.00 B)` and exiting 0. The output is now compared against every named `--tar` source.
+Writing the archive *into* a source directory stays legal, because that is a common pattern
+and is not destructive.
+
+**`--calibrate -o` kept the destructive symlink race** the main output opener had already
+lost: existence check, then `fopen(...,"wb")`, then an unconditional `unlink` of the name.
+Now created `O_CREAT|O_EXCL|O_NOFOLLOW`, and the cleanup removes only an inode it created and
+still owns. Measured: v0.15.68 followed a dangling symlink and created through it; the fixed
+build refuses.
+
+**The unknown-size frame fallback still turned `pread` failure into a clean EOF**, resizing to
+whatever prefix arrived and returning success — so an `EIO` in a multi-frame archive dropped
+the trailing frames, exited 0, and `--rm` then removed the archive. Now fatal, with `r == 0`
+before the known `fstat` size treated as unexpected EOF rather than success.
+
+**Two findings were pushed back on, and the record says so.** The xattr finding's stated
+trigger is **not constructible** — Linux refuses `user.*` xattrs on symlinks and FIFOs
+outright. A direct C probe confirmed the mechanism anyway: `lsetxattr("/proc/self/fd/N")`
+returns EPERM because it targets the procfs entry, while `setxattr` on the same path lands on
+the real inode. So attributes on symlinks/FIFOs/devices were silently dropped, reachable only
+for privileged namespaces. Fixed — and the old comment claiming the `l` prefix was what kept
+the attribute on the link is corrected: the `O_NOFOLLOW` on the `openat` is what does that.
+Separately, the global-PAX fix initially went into two parsers; the index builder turned out
+to reject `'g'` headers outright and defer to the authoritative reader, so that half was dead
+code and was reverted rather than shipped.
+
+**Global PAX (`g`) headers applied to only the first member.** `'x'` and `'g'` shared one
+pending state that is cleared after each entry. Verified against GNU tar with a hand-built
+archive (GNU tar does not emit `'g'` for ordinary `--format=pax` output): reference gives both
+members `mtime=1234567890`; v0.15.68 gave the second `mtime=999`; fixed matches the reference.
+
+**`--keep-going --tar` reported "unverified" over a truncated tree.** A corrupted frame can
+produce its full declared length and still destroy a tar header with the bytes it produced;
+the parser then stops, but `g_damage.incomplete` was only ever set when a frame yielded fewer
+bytes than declared. Measured on a corrupted archive: both builds extract 2 of 6 members,
+v0.15.68 exits **6**, v0.15.71 exits **7**. Also, `fsync_fd_ok()` forgave `EINVAL` for block
+devices — persistent by definition — and let `fstat`/`fclose` clobber the errno it reported.
+
+Three regression tests added (374 / 507 / 293 + 70 skipped), all for the deterministic findings: `--tar` output
+aliasing a source, global PAX scope, and the earlier `-l` header. Those were one-liners the
+suite had simply never tried — a coverage gap, not exotica.
+
+---
 ## v0.15.70 — the re-review rejected five of eleven fixes, each with a trigger
 
 v0.15.69's fixes went back to the same independent reviewer, asked not to "review it again"

@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=372
-$EXTENSIVE && EXPECTED_TESTS=505
+EXPECTED_TESTS=374
+$EXTENSIVE && EXPECTED_TESTS=507
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -5956,6 +5956,79 @@ else
   if [[ $rc -eq 0 ]] && grep -q "Frames" <<<"$out" && grep -q "l.tar.zst" <<<"$out"; then
     pass "-l prints a frame summary"
   else fail "-l frame summary" "rc=$rc out=[$out]"; fi
+
+  # 1d. A GLOBAL pax header ('g') sets defaults for EVERY following member, where
+  #     an 'x' header applies only to the next one.  Both used to write the same
+  #     pending state, which is cleared after each entry, so a global uid/gid/mtime
+  #     reached the FIRST member and every later one silently reverted to its base
+  #     ustar header.  Verified against GNU tar, which applies it to all members.
+  #     The archive is built by hand because GNU tar does not emit a 'g' header
+  #     for ordinary --format=pax output.
+  python3 - "$TMPDIR/glob.tar" <<'PYEOF'
+import sys
+def hdr(name,size,tf,mtime=1000000000,uid=0,gid=0):
+    b=bytearray(512)
+    def put(o,v,n):
+        v=v.encode() if isinstance(v,str) else v; b[o:o+len(v)]=v[:n]
+    put(0,name,100); put(100,"%07o\0"%0o644,8); put(108,"%07o\0"%uid,8)
+    put(116,"%07o\0"%gid,8); put(124,"%011o\0"%size,12); put(136,"%011o\0"%mtime,12)
+    b[148:156]=b" "*8; b[156]=ord(tf); put(257,"ustar\0",6); put(263,"00",2)
+    put(148,"%06o\0 "%(sum(b)&0o777777),8); return bytes(b)
+def pad(d):
+    r=len(d)%512; return d+(b"\0"*(512-r) if r else b"")
+def rec(k,v):
+    body=" %s=%s\n"%(k,v); n=len(body)+1
+    while len(str(n))+len(body)!=n: n=len(str(n))+len(body)
+    return ("%d%s"%(n,body)).encode()
+g=rec("mtime","1234567890")
+out=bytearray(); out+=hdr("GlobalHead.0",len(g),"g"); out+=pad(g)
+for nm,c in (("m1.txt",b"first\n"),("m2.txt",b"second\n")):
+    out+=hdr(nm,len(c),"0",mtime=999); out+=pad(c)
+out+=b"\0"*1024
+open(sys.argv[1],"wb").write(bytes(out))
+PYEOF
+  if [ -s "$TMPDIR/glob.tar" ]; then
+    "$GZSTD" -q -f -o "$TMPDIR/glob.tar.zst" "$TMPDIR/glob.tar" 2>/dev/null
+    rm -rf "$TMPDIR/globout"; mkdir -p "$TMPDIR/globout"
+    "$GZSTD" -d --tar "$TMPDIR/glob.tar.zst" -C "$TMPDIR/globout" >/dev/null 2>&1
+    gm1=$(stat -c%Y "$TMPDIR/globout/m1.txt" 2>/dev/null)
+    gm2=$(stat -c%Y "$TMPDIR/globout/m2.txt" 2>/dev/null)
+    if [ "$gm1" = "1234567890" ] && [ "$gm2" = "1234567890" ]; then
+      pass "global pax header applies to every member"
+    else
+      fail "global pax header applies to every member" "m1=$gm1 m2=$gm2 (want both 1234567890)"
+    fi
+  else
+    skip "global pax header applies to every member" "python3 unavailable"
+  fi
+  rm -rf "$TMPDIR/glob.tar" "$TMPDIR/glob.tar.zst" "$TMPDIR/globout"
+
+  # 1c. --tar must refuse an archive output that IS one of its sources.
+  #     Tar mode leaves the input FILE* null, so neither the path identity check
+  #     nor open_output_verified()'s fd comparison sees a tar source — and the
+  #     --overwrite path unlinks the output BEFORE the tar layout is built.  So
+  #     `gzstd --overwrite -o data --tar data` deleted data, archived the empty
+  #     file it had just created, and exited 0.  Deterministic, not a race.
+  #     Writing the archive INTO a source directory stays legal (common pattern).
+  printf 'must-survive\n' > "$TMPDIR/selfsrc"
+  cp "$TMPDIR/selfsrc" "$TMPDIR/selfsrc.bak"
+  self_ok=1
+  for flag in --overwrite -f; do
+    "$GZSTD" --cpu-only $flag -o "$TMPDIR/selfsrc" --tar "$TMPDIR/selfsrc" >/dev/null 2>&1
+    [ $? -eq 2 ] || self_ok=0
+    cmp -s "$TMPDIR/selfsrc" "$TMPDIR/selfsrc.bak" || self_ok=0
+  done
+  # and the archive-into-a-source-directory pattern must still succeed
+  rm -rf "$TMPDIR/selfdir"; mkdir -p "$TMPDIR/selfdir"
+  printf 'x\n' > "$TMPDIR/selfdir/a"
+  "$GZSTD" --cpu-only -f -o "$TMPDIR/selfdir/in.tar.zst" --tar "$TMPDIR/selfdir" >/dev/null 2>&1 \
+    || self_ok=0
+  if [ "$self_ok" = 1 ]; then
+    pass "--tar refuses an output that is also a source"
+  else
+    fail "--tar refuses an output that is also a source"
+  fi
+  rm -rf "$TMPDIR/selfsrc" "$TMPDIR/selfsrc.bak" "$TMPDIR/selfdir"
 
   # 1b. A NON-zstd input must print NOTHING to stdout — no table header, no row.
   #     It used to emit the full header plus a row of zeros ("0 frames, 0.00 B,

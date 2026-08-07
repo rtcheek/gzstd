@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.70";
+static constexpr const char * GZSTD_VERSION = "0.15.71";
 //
 // Architecture overview:
 //
@@ -5158,8 +5158,20 @@ static bool fsync_fd_ok(int fd)
     if (::fsync(fd) == 0) return true;
     if (errno == EINTR) continue;
     if (errno == EINVAL) {
+      // Forgive EINVAL only for endpoints that hold NO PERSISTENT STATE, so
+      // there is nothing a sync could have failed to persist: pipes, sockets,
+      // terminals, character devices like /dev/null.
+      //
+      // A REGULAR FILE must sync — a filesystem (FUSE, realistically) can return
+      // EINVAL for one, and forgiving it let --sync-output report durability it
+      // never obtained.  A BLOCK DEVICE must sync too: writing an image straight
+      // to /dev/sdX is persistent by definition, and it was being forgiven here
+      // because the first cut of this check asked only "is it regular?".
+      const int saved = errno;
       struct stat st;
-      if (::fstat(fd, &st) == 0 && !S_ISREG(st.st_mode)) return true;  // nothing to persist
+      if (::fstat(fd, &st) == 0 && !S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode))
+        return true;
+      errno = saved;      // fstat must not overwrite the error the caller reports
     }
     return false;
   }
@@ -5655,12 +5667,23 @@ private:
   // tails.  Serialized by tail rarity (exactly one tail op per stream).
   int plain_fd_() {
     if (plain_fd_v_ >= 0) return plain_fd_v_;
-    char link[64], path[4096];
+    // Open the MAGIC LINK ITSELF, not the pathname it points at.
+    //
+    // This used to readlink /proc/self/fd/N into a buffer and then open THAT
+    // STRING — a second resolution of a user-visible path, which is exactly the
+    // hazard adopt_fd() exists to remove, and it silently made the v0.15.70
+    // claim that "the name is never resolved twice" false.  Renaming the verified
+    // file after the readlink and dropping a symlink at the captured name sent
+    // the final unaligned tail positionally into somebody else's file.
+    //
+    // Opening /proc/self/fd/N goes through the kernel's descriptor table: it
+    // yields a NEW description on the SAME inode fd_ already holds, so there is
+    // no name to substitute and no window to do it in.  O_CLOEXEC because this
+    // fd outlives the call and must not leak across an exec.
+    if (fd_ < 0) return -1;
+    char link[64];
     std::snprintf(link, sizeof(link), "/proc/self/fd/%d", fd_);
-    ssize_t n = ::readlink(link, path, sizeof(path) - 1);
-    if (n <= 0) return -1;
-    path[n] = '\0';
-    plain_fd_v_ = ::open(path, O_WRONLY);
+    plain_fd_v_ = ::open(link, O_WRONLY | O_CLOEXEC);
     return plain_fd_v_;
   }
   static bool pwrite_plain_(int fd, const char * p, size_t len, off_t off) {
@@ -10715,7 +10738,25 @@ static size_t stream_frames_to_queue_mt(
         ssize_t r = ::pread(fd, raw_data_out->data() + got,
                             raw_data_out->size() - got,
                             (off_t)(fallback_off + (uint64_t)got));
-        if (r <= 0) break;     // short/erroring read: caller streams what we got
+        if (r < 0) {
+          if (errno == EINTR) continue;
+          if (owns_fd) ::close(fd);
+          die_io("read error in unknown-size frame fallback: " + opt.input
+                 + " (" + std::strerror(errno) + ")");
+        }
+        // r == 0 BEFORE the known file_size is a truncated read, not the end of
+        // anything: file_size came from fstat, so the bytes are supposed to be
+        // there.  Accepting it (the old `r <= 0 -> break`) resized the buffer to
+        // whatever prefix arrived and returned SUCCESS — if that prefix happened
+        // to end on a frame boundary the caller decoded it, omitted every frame
+        // after the failure, exited 0, and --rm then removed the archive.
+        if (r == 0) {
+          if (owns_fd) ::close(fd);
+          die_io("unexpected end of input in unknown-size frame fallback: "
+                 + opt.input + " (wanted "
+                 + std::to_string(raw_data_out->size()) + " bytes, got "
+                 + std::to_string(got) + ")");
+        }
         got += (size_t)r;
       }
       raw_data_out->resize(got);
@@ -14641,6 +14682,16 @@ private:
   // the generic 1 used for per-member restore failures (permissions etc.).
   void fail_data(const std::string & path, const std::string & why) {
     data_error_.store(true, std::memory_order_relaxed);
+    // Under --keep-going this is a STRUCTURAL stop: the tar parser lost its
+    // framing, so every member at or after this point is missing from the
+    // extracted tree.  That is INCOMPLETE (exit 7), not merely unverified
+    // (exit 6) — and nothing else would have said so, because g_damage.incomplete
+    // is otherwise set only when a frame yields fewer bytes than it declared.  A
+    // corrupted frame can produce its full declared length and still destroy a
+    // tar header with the bytes it did produce, which left the run reporting
+    // "content present but unverified" over a tree that was silently truncated.
+    if (opt_.keep_going)
+      g_damage.incomplete.store(true, std::memory_order_relaxed);
     fail(path, why);
   }
 
@@ -14723,12 +14774,25 @@ private:
   // because apply_ext is fd-based and there is no fd for these.  GNU tar
   // restores them, so this closes a real fidelity gap for --xattrs/--selinux.
   //
-  // Uses the same secure O_NOFOLLOW-per-component walk as everything else and
-  // then the *l* variants through /proc/self/fd, so the symlink ITSELF is
-  // labelled rather than whatever it points at — following it here would be a
-  // way to write attributes onto an arbitrary target.  ACLs are deliberately not
-  // attempted: symlinks cannot carry them, and a FIFO/device inherits the
-  // directory default.
+  // Uses the same secure O_NOFOLLOW-per-component walk as everything else, then
+  // sets attributes through /proc/self/fd/N.
+  //
+  // NOT the *l* variant.  This used lsetxattr on the proc path, on the reasoning
+  // that the "l" is what keeps the attribute on the symlink instead of its
+  // target.  That is wrong twice over: what guarantees we are operating on the
+  // LINK is the O_NOFOLLOW on the openat below (the fd is the link's own inode),
+  // and lsetxattr refuses to follow /proc/self/fd/N — which is itself a magic
+  // symlink — so it tried to label the PROCFS ENTRY and failed.  Measured
+  // directly: lsetxattr("/proc/self/fd/N") -> EPERM, setxattr(same path) -> ok,
+  // with the attribute landing on the real inode.  Every attribute on a symlink,
+  // FIFO or device node was therefore silently dropped, reported only at -v.
+  //
+  // (Note the trigger is narrower than it looks: Linux refuses user.* xattrs on
+  // symlinks and FIFOs outright, so this is reachable only for the privileged
+  // namespaces — security.*/trusted.*, e.g. SELinux labels restored as root.)
+  //
+  // ACLs are deliberately not attempted: symlinks cannot carry them, and a
+  // FIFO/device inherits the directory default.
   void apply_ext_path(const std::string & rel, const ExtMeta & ext, int root = 0) {
     if (ext.xattrs.empty()) return;
 #ifndef _WIN32
@@ -14741,7 +14805,7 @@ private:
     if (lfd < 0) return;
     const std::string pp = "/proc/self/fd/" + std::to_string(lfd);
     for (const auto & kv : ext.xattrs) {
-      if (::lsetxattr(pp.c_str(), kv.first.c_str(), kv.second.data(), kv.second.size(), 0) != 0)
+      if (::setxattr(pp.c_str(), kv.first.c_str(), kv.second.data(), kv.second.size(), 0) != 0)
         vlog(V_VERBOSE, opt_, "gzstd: untar: xattr " + kv.first + " on " + rel
                               + ": " + std::strerror(errno) + "\n");
     }
@@ -15458,6 +15522,17 @@ private:
     // longer than the 32-byte ustar fields as records; GNU tar honors them).
     uint64_t pax_uid = 0, pax_gid = 0; std::string pax_uname, pax_gname;
     bool pax_has_uid = false, pax_has_gid = false, pax_has_uname = false, pax_has_gname = false;
+    // GLOBAL pax ('g') defaults.  A 'g' header sets values for EVERY following
+    // member until overridden, where an 'x' header applies only to the next one.
+    // Both used to land in the same pending state, which was then cleared after
+    // the next entry — so a standards-compliant archive with a global uid/gid/
+    // mtime applied it to the FIRST member and silently reverted the rest to
+    // their base header values, exiting 0.  Kept separate and never cleared.
+    uint64_t gpax_uid = 0, gpax_gid = 0; int64_t gpax_mtime = 0;
+    std::string gpax_uname, gpax_gname;
+    bool gpax_has_uid = false, gpax_has_gid = false, gpax_has_mtime = false,
+         gpax_has_uname = false, gpax_has_gname = false;
+
     bool pax_gnu_sparse = false;          // GNU.sparse.* records seen (PAX sparse format)
     int  pax_sp_major = 0, pax_sp_minor = 0;
     std::string pax_sp_name;
@@ -15564,6 +15639,21 @@ private:
           }
           return true;   // the extract parser consumes every record; it never bails
         });
+        // Promote a GLOBAL header out of the per-entry pending state, so the next
+        // member does not consume-and-clear it.  path/linkpath/size are dropped
+        // deliberately: as a global default they would rename or resize every
+        // member, which is not what a 'g' header means.
+        if (type == 'g') {
+          if (pax_has_uid)   { gpax_uid   = pax_uid;   gpax_has_uid   = true; }
+          if (pax_has_gid)   { gpax_gid   = pax_gid;   gpax_has_gid   = true; }
+          if (pax_has_mtime) { gpax_mtime = pax_mtime; gpax_has_mtime = true; }
+          if (pax_has_uname) { gpax_uname = pax_uname; gpax_has_uname = true; }
+          if (pax_has_gname) { gpax_gname = pax_gname; gpax_has_gname = true; }
+          pax_has_uid = pax_has_gid = pax_has_mtime = false;
+          pax_has_uname = pax_has_gname = pax_has_size = false;
+          pax_uname.clear(); pax_gname.clear();
+          pax_path.clear(); pax_link.clear();
+        }
         continue;
       }
 
@@ -15578,12 +15668,17 @@ private:
       if (!pend_link.empty()) { e.linkname = pend_link; pend_link.clear(); }
       if (!pax_link.empty())  { e.linkname = pax_link;  pax_link.clear(); }
       e.mode = (uint32_t)get_num(blk + 100, 8);
-      e.uid = pax_has_uid ? pax_uid : get_num(blk + 108, 8);
-      e.gid = pax_has_gid ? pax_gid : get_num(blk + 116, 8);
-      e.uname = pax_has_uname ? pax_uname : get_str(blk + 265, 32);  // owner names: -l --tar
-      e.gname = pax_has_gname ? pax_gname : get_str(blk + 297, 32);  // and name-first chown
+      // Precedence: per-entry 'x' overrides a global 'g' default, which
+      // overrides the value in the member's own ustar header.
+      e.uid = pax_has_uid ? pax_uid : gpax_has_uid ? gpax_uid : get_num(blk + 108, 8);
+      e.gid = pax_has_gid ? pax_gid : gpax_has_gid ? gpax_gid : get_num(blk + 116, 8);
+      e.uname = pax_has_uname ? pax_uname
+              : gpax_has_uname ? gpax_uname : get_str(blk + 265, 32);  // owner names: -l --tar
+      e.gname = pax_has_gname ? pax_gname
+              : gpax_has_gname ? gpax_gname : get_str(blk + 297, 32);  // and name-first chown
       e.size = pax_has_size ? pax_size : size;
-      e.mtime = pax_has_mtime ? pax_mtime : (int64_t)get_num(blk + 136, 12);
+      e.mtime = pax_has_mtime ? pax_mtime
+              : gpax_has_mtime ? gpax_mtime : (int64_t)get_num(blk + 136, 12);
       e.typeflag = type;
       e.devmajor = (uint32_t)get_num(blk + 329, 8);
       e.devminor = (uint32_t)get_num(blk + 337, 8);
@@ -16368,6 +16463,9 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
         ie.mtime = pax_has_mtime ? pax_mtime : (int64_t)get_num(blk + 136, 12);
         ie.uname = pax_has_uname ? pax_uname : get_str(blk + 265, 32);
         ie.gname = pax_has_gname ? pax_gname : get_str(blk + 297, 32);
+        // NOTE: no global-'g' fallback here on purpose — this index builder
+        // rejects 'g' outright below and defers to the authoritative reader,
+        // which is where global pax defaults are resolved.
         ie.devmajor = (uint32_t)get_num(blk + 329, 8);
         ie.devminor = (uint32_t)get_num(blk + 337, 8);
         ie.hdr_off = entry_start; ie.data_off = cursor + TAR_BLK; ie.entry_end = eend;
@@ -23190,7 +23288,21 @@ static int run_calibrate(Options opt)
     po.output = opt.output;
     const size_t cap = std::min(corpus.size(), (size_t)(2ull << 30));
     FILE * in = fmemopen((void *)corpus.data(), cap, "rb");
-    FILE * outf = std::fopen(po.output.c_str(), "wb");
+    // Create the scratch sink EXCLUSIVELY.  The existence check above happens
+    // well before this open, and `fopen(...,"wb")` follows symlinks — so an
+    // attacker who drops a symlink at this name in the window truncates whatever
+    // it points at, and the unconditional unlink below then removes the symlink,
+    // leaving the victim destroyed and no trace.  O_EXCL means we either create
+    // this inode ourselves or fail; O_NOFOLLOW refuses a symlink outright.
+    int cfd = ::open(po.output.c_str(),
+                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (cfd < 0)
+      die_io("--calibrate: cannot create sink target " + po.output
+             + " (" + std::strerror(errno) + ")");
+    FILE * outf = ::fdopen(cfd, "wb");
+    struct stat sink_st{};              // identity of the inode WE created
+    if (outf) { if (::fstat(cfd, &sink_st) != 0) sink_st = {}; }
+    else      { ::close(cfd); }
     if (in && outf) {
       Meter m;
       compress_cpu_mt(in, outf, po, &m);
@@ -23204,6 +23316,7 @@ static int run_calibrate(Options opt)
       // schedule against that fiction — so measure the result and refuse to
       // record when it is not real.
       const bool cal_durable = (std::fflush(outf) == 0) && fsync_fd_ok(fileno(outf));
+      const int  cal_errno   = cal_durable ? 0 : errno;   // fclose below clobbers errno
       const uint64_t fsync_ns =
           (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - fs0).count();
@@ -23221,10 +23334,22 @@ static int run_calibrate(Options opt)
       else
         std::fprintf(stderr, "[CALIBRATE] sink write      NOT MEASURED — flush/fsync of %s "
                              "failed (%s); nothing recorded\n",
-                     po.output.c_str(), std::strerror(errno));
+                     po.output.c_str(), std::strerror(cal_errno));
     }
     if (in) std::fclose(in);
-    ::unlink(po.output.c_str());
+    // Remove only the inode we created.  A blind unlink of the NAME would delete
+    // whatever occupies it now, which after a swap is somebody else's file.
+    {
+      struct stat now_st;
+      if (::lstat(po.output.c_str(), &now_st) == 0
+          && S_ISREG(now_st.st_mode)
+          && now_st.st_dev == sink_st.st_dev && now_st.st_ino == sink_st.st_ino) {
+        ::unlink(po.output.c_str());
+      } else if (sink_st.st_ino != 0) {
+        vlog(V_ERROR, opt, "gzstd: --calibrate: scratch target " + po.output
+             + " changed underneath us; leaving it alone\n");
+      }
+    }
   } else {
     std::fprintf(stderr, "[CALIBRATE] no -o TARGET — sink rate not measured\n");
   }
@@ -23516,6 +23641,24 @@ static int gzstd_main(int argc, char ** argv)
       if (fs::equivalent(opt.input, opt.output, ec_eq) && !ec_eq)
         die_usage("input and output are the same file: " + opt.output);
     }
+    // --tar create has no `in` FILE* at all (tar mode leaves it null), so BOTH
+    // the check above and open_output_verified()'s fd comparison no-op — the
+    // sources live in opt.tar_sources instead.  That gap was deterministic data
+    // loss: `gzstd --overwrite -o data --tar data` unlinked `data` to make room
+    // for the output, THEN archived it, so the member was the empty file it had
+    // just created, the original content was gone, and the run exited 0
+    // ("2.21% (10.00 KiB => 226.00 B)").
+    //
+    // Only a NAMED source is rejected here.  Writing the archive INTO a source
+    // directory is a common, non-destructive pattern (gzstd records a 0-byte
+    // placeholder member for it) and must keep working.
+    if (opt.tar_mode && fs::exists(opt.output)) {
+      for (const std::string & src : opt.tar_sources) {
+        std::error_code ec_src;
+        if (fs::equivalent(src, opt.output, ec_src) && !ec_src)
+          die_usage("--tar source and archive output are the same file: " + src);
+      }
+    }
     // Only a pre-existing REGULAR file is a clobber risk.  A special output
     // target (/dev/null, a device node, a fifo) is a deliberate sink, not
     // something we overwrite — never block on it and never register it for
@@ -23600,8 +23743,19 @@ static int gzstd_main(int argc, char ** argv)
       // Adopt fd 1 itself rather than reopening real_path: the readlink above is
       // only used to REJECT unsuitable targets (/dev/*, deleted), never to open
       // one, so a rename between readlink and open cannot redirect this write.
+      //
+      // TRUNCATE FIRST.  The path this replaced opened real_path with O_TRUNC, and
+      // dropping that was a silent output-corruption regression in v0.15.70:
+      // `exec 1<>old.zst; gzstd --direct -c input` wrote the new archive over the
+      // PREFIX of a longer old file and left its tail in place, exiting 0 with a
+      // corrupt concatenation (measured: a 9,000,000-byte target came back as
+      // 9,000,025 bytes and failed `-t`, where v0.15.68 produced 305,504 valid
+      // bytes).  Adopting a descriptor must reproduce every effect of the open it
+      // replaced, not just the data path.
       auto dw = std::make_unique<DirectWriter>();
       std::fflush(stdout);
+      if (::ftruncate(fd, 0) != 0) break;   // cannot honour "wb" semantics; stay buffered
+      if (::lseek(fd, 0, SEEK_SET) == (off_t)-1) break;
       if (dw->adopt_fd(fd)) {
         out = nullptr;
         direct_writer = std::move(dw);
