@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=387
-$EXTENSIVE && EXPECTED_TESTS=520
+EXPECTED_TESTS=389
+$EXTENSIVE && EXPECTED_TESTS=522
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6307,6 +6307,56 @@ PYEOF
     fail "--tar surviving output symlink / undecidable containment"
   fi
   rm -rf "$TMPDIR/sl"
+
+  # 1c-6. THE FINAL OPEN MUST NOT RESOLVE A NAME.  Identity comparison can only
+  #     reject an object it has been told about, and for a directory source only
+  #     the directory's own inode is captured — so a symlink appearing at the
+  #     output name and pointing INSIDE a source opened cleanly, failed the
+  #     forbidden-ID check (the victim is not the directory), and was truncated.
+  #     A dangling link reproduces the same state deterministically: fs::exists()
+  #     is false, so the absent-output route runs and the open follows the link,
+  #     creating the archive INSIDE the source tree.  When sources are being
+  #     protected the output is now opened through a held parent descriptor with
+  #     O_NOFOLLOW, so there is no name left to swap.
+  rm -rf "$TMPDIR/nf"; mkdir -p "$TMPDIR/nf/root" "$TMPDIR/nf/out"
+  printf 'payload\n' > "$TMPDIR/nf/root/data"
+  ln -s "$TMPDIR/nf/root/planted.zst" "$TMPDIR/nf/out/a.tar.zst"   # target absent
+  nf_ok=1
+  "$GZSTD" --cpu-only -o "$TMPDIR/nf/out/a.tar.zst" --tar "$TMPDIR/nf/root" \
+    >/dev/null 2>&1 && nf_ok=0                       # must refuse
+  [ -e "$TMPDIR/nf/root/planted.zst" ] && nf_ok=0    # and must not write through
+  # A plain compress still follows a symlink output — that is deliberate and the
+  # refusal above must not have leaked into it.
+  printf 'data\n' > "$TMPDIR/nf/in.txt"
+  ln -s "$TMPDIR/nf/real.zst" "$TMPDIR/nf/link.zst"
+  "$GZSTD" --cpu-only -o "$TMPDIR/nf/link.zst" "$TMPDIR/nf/in.txt" >/dev/null 2>&1 || nf_ok=0
+  [ -e "$TMPDIR/nf/real.zst" ] || nf_ok=0
+  if [ "$nf_ok" = 1 ]; then
+    pass "--tar refuses to open its output through a symlink"
+  else
+    fail "--tar output symlink refusal"
+  fi
+  rm -rf "$TMPDIR/nf"
+
+  # 1c-7. A symlink SOURCE is archived as the link, so only the link may be
+  #     protected.  Capture followed the link while the walker lstat()s it, so
+  #     the TARGET directory joined the containment set and a perfectly safe
+  #     output inside it was refused.  Capture and walker now agree by using the
+  #     same semantics, not by two readings of the same intent.
+  rm -rf "$TMPDIR/sy"; mkdir -p "$TMPDIR/sy/real"
+  printf 'x\n' > "$TMPDIR/sy/real/f"
+  ln -s real "$TMPDIR/sy/link"
+  sy_ok=1
+  ( cd "$TMPDIR/sy" && "$GZSTD" --cpu-only --overwrite -o real/a.tar.zst --tar link \
+      >/dev/null 2>&1 ) || sy_ok=0                   # must be ALLOWED
+  "$GZSTD" --cpu-only -l --tar "$TMPDIR/sy/real/a.tar.zst" 2>/dev/null \
+    | grep -q -- "link -> real" || sy_ok=0           # and store the link itself
+  if [ "$sy_ok" = 1 ]; then
+    pass "--tar protects a symlink source as the link, not its target"
+  else
+    fail "--tar symlink source over-protection"
+  fi
+  rm -rf "$TMPDIR/sy"
 
   # 1c-4. The archive must be excluded from the walk on EVERY output route,
   #     including a REDIRECTED STDOUT — a regular file inside the tree that the

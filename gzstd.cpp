@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.77";
+static constexpr const char * GZSTD_VERSION = "0.15.78";
 //
 // Architecture overview:
 //
@@ -5196,33 +5196,89 @@ static FILE * open_input(const std::string & path)
 //      the answer is about the object we actually opened, not about a path that may
 //      since have changed;
 //   3. only then ftruncate to 0, which is what "wb" would have done.
-// Symlinks are still followed, deliberately: `-o some-symlink` is legitimate, and a
-// symlink aimed at the INPUT is caught by step 2 like any other alias.
+// Symlinks are still followed for an ordinary compress: `-o some-symlink` is
+// legitimate, and a symlink aimed at the INPUT is caught by step 2 like any alias.
+//
+// --tar IS DIFFERENT, and this is the round-8 HIGH.  Identity comparison can only
+// reject an object it has been TOLD about, and for a directory source only the
+// directory's own inode is captured — enumerating every descendant would mean
+// walking the tree twice.  So a symlink appearing at the output name between the
+// existence check and this open, pointing at a file INSIDE a source directory,
+// opened cleanly: the victim's inode is not the source directory's inode, the
+// forbidden comparison passed, and ftruncate destroyed it.  The walk then
+// recognised the victim as the output and skipped it, so the archive succeeded.
+// No --overwrite needed, and the same window reopens after --overwrite's unlink.
+//
+// Identity cannot close that, because the set is incomplete by construction. The
+// fix is to stop resolving a pathname at the moment of truth: when tar sources are
+// being protected, the final component is opened through a HELD PARENT DESCRIPTOR
+// with O_NOFOLLOW, so there is no name left for anyone to swap and a symlink at
+// that position is refused rather than followed.
 static FILE * open_output_verified(const std::string & path, FILE * in_file,
                                    const std::vector<std::pair<dev_t, ino_t>> * forbidden = nullptr)
 {
-  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
-  if (fd < 0) die_io("cannot open output: " + path + " (" + std::strerror(errno) + ")");
+  const bool protecting_sources = (forbidden && !forbidden->empty());
+  int fd = -1;
+  if (protecting_sources) {
+    // Split once, then work entirely from descriptors.
+    const size_t slash = path.find_last_of('/');
+    const std::string dir  = (slash == std::string::npos) ? std::string(".")
+                           : (slash == 0)                 ? std::string("/")
+                                                          : path.substr(0, slash);
+    const std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    if (base.empty())
+      die_io("cannot open output: " + path + " (not a file name)");
+    const int pfd = ::open(dir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (pfd < 0)
+      die_io("cannot open the output directory " + dir + " ("
+             + std::strerror(errno) + ")");
+    fd = ::openat(pfd, base.c_str(), O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0666);
+    const int e = errno;
+    ::close(pfd);
+    if (fd < 0) {
+      if (e == ELOOP)
+        die_usage("--tar: the archive output " + path + " is a symlink; refusing to "
+                  "write through it while source files are being protected — give -o "
+                  "a real path");
+      die_io("cannot open output: " + path + " (" + std::strerror(e) + ")");
+    }
+  } else {
+    fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
+    if (fd < 0) die_io("cannot open output: " + path + " (" + std::strerror(errno) + ")");
+  }
+  // A FAILED fstat IS NOT A PASS.  These comparisons used to be written as
+  // `fstat(...) == 0 && identities match`, so a failed stat fell through to the
+  // truncate having proven nothing — the same fail-open shape the containment
+  // walk was made tri-state to remove, still present two functions away.  Nothing
+  // has been destroyed at this point (no O_TRUNC), so refusing costs nothing.
   if (in_file) {
     struct stat so, si;
-    if (::fstat(fd, &so) == 0 && ::fstat(fileno(in_file), &si) == 0
-        && so.st_dev == si.st_dev && so.st_ino == si.st_ino) {
+    if (::fstat(fd, &so) != 0 || ::fstat(fileno(in_file), &si) != 0) {
+      const int e = errno; ::close(fd);
+      die_io("cannot identify the output " + path + " before truncating it ("
+             + std::strerror(e) + ")");
+    }
+    if (so.st_dev == si.st_dev && so.st_ino == si.st_ino) {
       ::close(fd);              // nothing was truncated: we never asked for O_TRUNC
       die_usage("input and output are the same file: " + path);
     }
   }
   // --tar has no input FILE* to compare against, so the caller passes the
-  // identities of the sources it captured BEFORE this open.  Checking the
-  // OPENED FD closes the window the path-based check could not: the name may
-  // have become a symlink to a source between that check and this open.
-  if (forbidden && !forbidden->empty()) {
+  // identities of the sources it captured BEFORE this open.  This catches an
+  // output that IS a named source.  It cannot catch an output inside a directory
+  // source — the set holds only the directory's own inode — which is why the open
+  // above refuses to follow a symlink at all when sources are being protected.
+  if (protecting_sources) {
     struct stat so;
-    if (::fstat(fd, &so) == 0) {
-      for (const auto & id : *forbidden) {
-        if (so.st_dev == id.first && so.st_ino == id.second) {
-          ::close(fd);          // untruncated: no O_TRUNC was requested
-          die_usage("--tar source and archive output are the same file: " + path);
-        }
+    if (::fstat(fd, &so) != 0) {
+      const int e = errno; ::close(fd);
+      die_io("cannot identify the output " + path + " before truncating it ("
+             + std::strerror(e) + ")");
+    }
+    for (const auto & id : *forbidden) {
+      if (so.st_dev == id.first && so.st_ino == id.second) {
+        ::close(fd);            // untruncated: no O_TRUNC was requested
+        die_usage("--tar source and archive output are the same file: " + path);
       }
     }
   }
@@ -7739,28 +7795,45 @@ private:
   uint64_t              t_start_ = 0, t_end_ = 0;
 };
 
-// Build the CPU verify pool for ONE PASS — or nothing, when this pass verifies
-// on the GPU instead.
+// The options for ONE PASS, in a type the request-level Options cannot silently
+// become.
 //
-// A FREE FUNCTION TAKING ONLY THE PASS'S OPTIONS, and that signature is the
-// point of it.  The compress driver holds two Options in the same scope: `opt`,
-// what the USER ASKED FOR, and `pass_opt`, what THIS PASS IS ACTUALLY DOING.
-// They diverge the moment a GPU fault or a failed GPU verify discards the output
-// and rebuilds CPU-only.  Both spellings compile, and the wrong one usually
+// The compress driver holds two Options in the same scope: `opt`, what the USER
+// ASKED FOR, and `pass_opt`, what THIS PASS IS ACTUALLY DOING. They diverge the
+// moment a GPU fault or a failed GPU verify discards the output and rebuilds
+// CPU-only. Both are `Options`, both spellings compile, and the wrong one usually
 // behaves — so the same misread landed twice:
 //
-//   v0.15.74  `opt.gpu_verify` decided WHETHER to build a pool, so the CPU
+//   v0.15.74  `opt.gpu_verify` decided WHETHER to build a verify pool, so the CPU
 //             rebuild got no CPU pool and had no GPU worker either: --verify
 //             checked nothing, exit 0, and --rm then deleted the source.
 //   v0.15.76  `opt.cpu_only` decided HOW TO SIZE it — three lines below the fix
 //             for the first one, found only by sweeping for it deliberately.
 //
-// Here `opt` is not in scope.  The wrong read is a compile error instead of the
-// next round's finding.  Anything genuinely request-level that this ever needs
-// must be passed as an explicit parameter, which forces the question to be
-// answered at the call site rather than assumed.
-static std::unique_ptr<VerifyPool> build_pass_verify_pool(const Options & pass_opt)
+// Moving the work into a function that takes `const Options &` fixed the wrong
+// READ (there is no `opt` inside it) and left the wrong ARGUMENT: at the call
+// site `build_pass_verify_pool(opt)` still compiled, so the class was not closed.
+// This wrapper closes it. The constructor is explicit and there is no conversion
+// from `Options`, so passing the request-level object is a compile error rather
+// than a silent behaviour change.
+//
+// DELIBERATELY NARROW: the retry driver and the pool builder only. A project-wide
+// PassOptions conversion would touch every compression entry point for no further
+// safety — this defect has recurred exactly at this boundary, twice.
+class PassOpt {
+public:
+  explicit PassOpt(const Options & pass) : o_(pass) {}
+  const Options & operator*()  const { return o_; }
+  const Options * operator->() const { return &o_; }
+private:
+  const Options & o_;
+};
+
+// Build the CPU verify pool for ONE PASS — or nothing, when this pass verifies
+// on the GPU instead.  Takes PassOpt, not Options: see above.
+static std::unique_ptr<VerifyPool> build_pass_verify_pool(PassOpt pass)
 {
+  const Options & pass_opt = *pass;
   // GPU verify (gpu-only) runs inside the GPU worker, not here.
   if (!pass_opt.verify || pass_opt.gpu_verify) return nullptr;
 
@@ -23966,6 +24039,9 @@ static int run_calibrate(Options opt)
       pos += (len > 0) ? (size_t)len : 1;
       ++n;
     }
+    // Host-order on purpose, and exempted in scripts/check-endian-reads.sh: this
+    // WRITES a synthetic pattern into an in-memory buffer that is compressed as
+    // opaque bytes. It is never read back as an integer and never an on-disk field.
     uint64_t x = 0x9E3779B97F4A7C15ull;
     for (size_t i = half; i + 8 <= corpus_sz; i += 8) {
       x ^= x << 13; x ^= x >> 7; x ^= x << 17;
@@ -24240,7 +24316,16 @@ static int run_calibrate(Options opt)
     dobs.regime = "calibrate";
     save_opt.mode = Mode::DECOMPRESS;
     if (dobs.wall_ns > 0) adapt_profile_save(save_opt, dobs);
-    std::fprintf(stderr, "[CALIBRATE] profile recorded: %s\n", adapt_profile_path().c_str());
+    // Report what actually happened.  This printed "profile recorded:" followed by
+    // an EMPTY path when there is no cache directory at all (HOME and
+    // XDG_CACHE_HOME both unset) — adapt_profile_save() correctly warns and saves
+    // nothing, and then this line said the opposite, louder.
+    const std::string cal_path = adapt_profile_path();
+    if (cal_path.empty())
+      std::fprintf(stderr, "[CALIBRATE] measured, but NOT recorded: no cache "
+                           "directory (neither XDG_CACHE_HOME nor HOME is set)\n");
+    else
+      std::fprintf(stderr, "[CALIBRATE] profile recorded: %s\n", cal_path.c_str());
   } else {
     std::fprintf(stderr, "[CALIBRATE] --no-profile: measured only, nothing recorded\n");
   }
@@ -24540,19 +24625,20 @@ static int gzstd_main(int argc, char ** argv)
             si < opt.tar_source_dest.size() ? opt.tar_source_dest[si] : std::string(".");
         if (!src.empty() && src[0] != '/' && cdir != ".") fspath = cdir + "/" + src;
 
-        int sfd = ::open(fspath.c_str(), O_PATH | O_CLOEXEC);
-        if (sfd < 0 && errno == ENOENT) {
-          // A DANGLING SYMLINK IS A VALID TAR SOURCE.  The walker lstat()s its
-          // sources and archives the link itself (GNU tar parity — it does not
-          // dereference a top-level symlink without -h), but O_PATH FOLLOWS the
-          // link and fails ENOENT on a broken one.  Failing closed on that turned
-          // `gzstd -f -o out.tar.zst --tar dangling` into a hard error against a
-          // source the walker supports.  Retry without following: O_PATH|O_NOFOLLOW
-          // opens the LINK, which is the object being archived and therefore the
-          // right identity to compare against.  A genuinely missing path still
-          // fails both ways and is still fatal.
-          sfd = ::open(fspath.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
-        }
+        // CAPTURE WHAT THE WALKER ARCHIVES, which means NOT following the link.
+        //
+        // The walker `lstat`s its sources and stores a top-level symlink as a
+        // symlink (GNU tar parity — no dereference without -h), and never descends
+        // into its target.  Capturing the TARGET therefore protected an object that
+        // is not a source: `ln -s real link; gzstd --overwrite -o real/a.zst --tar
+        // link` was refused for being "inside a --tar source directory" when the
+        // archive was only ever going to contain the link itself.
+        //
+        // O_NOFOLLOW unconditionally, so capture and walker agree by construction
+        // rather than by two people reading the same intent.  It also subsumes the
+        // dangling-symlink retry this used to need: O_PATH|O_NOFOLLOW opens a broken
+        // link fine, while a genuinely missing path still fails and is still fatal.
+        int sfd = ::open(fspath.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
         if (sfd < 0) {
           // FAIL CLOSED.  Skipping an unopenable source silently left it
           // unprotected, which is precisely the state the -C bug exploited.  If
@@ -24727,11 +24813,18 @@ static int gzstd_main(int argc, char ** argv)
           // require that nothing is there.
           std::error_code ec_unlink;
           fs::remove(opt.output, ec_unlink);
+          // ONLY ENOENT MEANS GONE.  `lstat(...) == 0` as the sole test made every
+          // other failure — EACCES on the directory, EIO — read as "absent", which
+          // is the fail-open shape again: the check that proves the symlink was
+          // neutralised would itself pass when it could not tell.
           struct stat still;
-          if (::lstat(opt.output.c_str(), &still) == 0) {
+          if (::lstat(opt.output.c_str(), &still) == 0 || errno != ENOENT) {
+            const int e = errno;
             for (int f : tar_src_fds) ::close(f);
-            die_io("--overwrite: cannot remove the existing output " + opt.output
-                   + (ec_unlink ? " (" + ec_unlink.message() + ")" : "")
+            die_io("--overwrite: cannot confirm the existing output " + opt.output
+                   + " was removed"
+                   + (ec_unlink ? " (" + ec_unlink.message() + ")"
+                                : std::string(" (") + std::strerror(e) + ")")
                    + "; refusing to write through whatever remains at that name");
           }
         }
@@ -25007,7 +25100,7 @@ static int gzstd_main(int argc, char ** argv)
       //   * queue depth — sized to available RAM so it can buffer the GPU's bursty
       //     delivery instead of back-pressuring the writer (see
       //     compute_verify_queue_depth); shallow on limited-RAM boxes, deep on big.
-      std::unique_ptr<VerifyPool> vpool = build_pass_verify_pool(pass_opt);
+      std::unique_ptr<VerifyPool> vpool = build_pass_verify_pool(PassOpt{pass_opt});
       if (vpool) g_verify_pool = vpool.get();
 
       run_one_pass(pass_opt);
@@ -25419,22 +25512,53 @@ static int gzstd_main(int argc, char ** argv)
       // Atomic overwrite: rename .tmp to final output
       std::error_code ec_rename; fs::rename(tmp, opt.output, ec_rename);
       if (ec_rename) {
+        // THIS FALLBACK MUST REPRODUCE WHAT THE RENAME WOULD HAVE DONE, and a
+        // rename REPLACES THE NAME.  It used to open the destination with a
+        // symlink-following, truncating ofstream, which writes THROUGH a link
+        // instead of replacing it — so on a filesystem that rejects rename while
+        // allowing writes, `-o some-symlink-into-a-tar-source` would truncate the
+        // source the atomic path exists to protect.  Same class as the v0.15.70
+        // descriptor adoption: an emulation has to reproduce every effect of the
+        // operation it stands in for, not just move the bytes.
+        //
+        // Drop the name, then create it fresh O_EXCL|O_NOFOLLOW so nothing can be
+        // substituted in between, and write through the descriptor.
         std::ifstream src(tmp, std::ios::binary);
-        std::ofstream dst(opt.output, std::ios::binary | std::ios::trunc);
-        if (!src || !dst) die_io("failed to finalize output file");
-        dst << src.rdbuf();
-        dst.flush();
-        // A short copy (ENOSPC/EIO) sets the stream error state silently —
-        // removing the temp and falling through would install a truncated
-        // output, delete the source, and exit 0 (the same silent-loss class
-        // the fclose/ferror gate above closes on the primary path).  Keep
-        // the complete temp file (disarm its atexit unlink) and die (exit 3)
-        // BEFORE the temp removal and the no-keep source unlink.
-        if (!src || !dst) {
+        if (!src) die_io("failed to finalize output file");
+        std::error_code ec_rm; fs::remove(opt.output, ec_rm);
+        const int dfd2 = ::open(opt.output.c_str(),
+                                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
+        if (dfd2 < 0) {
+          clear_tmp_file();
+          die_io("failed to finalize output file (cannot create " + opt.output + ": "
+                 + std::strerror(errno) + "; complete output kept at " + tmp + ")");
+        }
+        bool copy_ok = true;
+        {
+          std::vector<char> cbuf(1u << 20);
+          while (src.read(cbuf.data(), (std::streamsize)cbuf.size()) || src.gcount() > 0) {
+            size_t have = (size_t)src.gcount(), off = 0;
+            while (off < have) {
+              ssize_t w = ::write(dfd2, cbuf.data() + off, have - off);
+              if (w < 0) { if (errno == EINTR) continue; copy_ok = false; break; }
+              off += (size_t)w;
+            }
+            if (!copy_ok) break;
+          }
+          if (src.bad()) copy_ok = false;
+        }
+        if (::close(dfd2) != 0) copy_ok = false;
+        // A short copy (ENOSPC/EIO) used to set the stream error state silently —
+        // removing the temp and falling through would install a truncated output,
+        // delete the source, and exit 0 (the same silent-loss class the
+        // fclose/ferror gate above closes on the primary path).  Keep the complete
+        // temp file (disarm its atexit unlink) and die (exit 3) BEFORE the temp
+        // removal and the no-keep source unlink.
+        if (!copy_ok) {
           clear_tmp_file();
           die_io("failed to finalize output file (copy failed; complete output kept at " + tmp + ")");
         }
-        src.close(); dst.close(); fs::remove(tmp);
+        src.close(); fs::remove(tmp);
       }
       double rename_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
           std::chrono::steady_clock::now() - t_rename).count();

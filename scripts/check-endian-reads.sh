@@ -43,23 +43,102 @@ status=0
 # names reproduces, a third time, the mistake the whole file is about — assuming
 # you know how the next one will be spelled.
 #
-# So match the shape instead: ANY call whose first argument is the address of a
-# scalar and whose argument list contains a bare 4 or 8 (the width of the on-disk
-# fields — a magic, a frame size, an offset). That catches memcpy, pread, fread
-# and every wrapper anyone writes later, without naming any of them.
+# So match the shape instead: ANY call that takes the address of something AND
+# states a width in its arguments — a bare 4 or 8 (the size of the on-disk fields:
+# a magic, a frame size, an offset) or a `sizeof`. No callee names, no assumption
+# about WHICH argument the destination is.
 #
-# \w+ for the identifier, NOT [a-z_]+: the narrower class is what let
-# `memcpy(&m32, …)` through a hand-run audit, because of the digit.
-pattern='\w+\s*\(\s*&\s*\w+\s*,[^;]*\b[48]\b'
+# FIVE patterns now, each of which looked complete when written:
+#
+#   1. `memcpy\(&[a-z_]+,`         — missed `memcpy(&m32, …)`: the DIGIT.
+#   2. a sweep by eye              — missed two sites that `pread` into a uint32_t.
+#   3. readers listed BY NAME      — missed `pr(&magic, 4, pos)`, a local lambda.
+#   4. shape, but LITERAL width    — missed `pr(&magic, sizeof magic, pos)`.
+#   5. shape, but FIRST ARGUMENT   — missed `pread(fd, &magic, 4, off)`, which is
+#                                    the standard POSIX signature, while the
+#                                    script's own comment claimed it caught pread.
+#
+# Widen on discovery. A false positive costs one ALLOW entry with a reason; a
+# false negative ships a corrupt archive.
+#
+# WHAT THIS CANNOT DO — stated, because the last version of this comment claimed
+# to catch `pread` and did not, and a check that overstates itself is worse than
+# one that is merely narrow. It is a textual approximation of C++, not a parser.
+# Known holes, each verified rather than guessed:
+#
+#   * A WIDTH HELD IN A VARIABLE: `pr(&magic, w4, 0)` is not matched, because the
+#     width is what distinguishes a field read from every other out-parameter in
+#     the file, and dropping that requirement matches hundreds of innocent calls.
+#   * A read built through a struct overlay, a union, or `istream::read`.
+#   * An address taken into a variable on one line and passed on another.
+#
+# So: a clean run means "no instance of the KNOWN SHAPES", not "no host-order
+# read". This is a regression guard against the five forms that have actually
+# occurred here, not a proof of absence — the `static_assert` in gzstd.cpp is what
+# actually makes big-endian unreachable.
+#
+# \w+ for identifiers, NOT [a-z_]+: the narrower class is failure 1 above.
+# Anchored on ARGUMENT POSITION: an address-of argument follows `(` or `,`. That
+# is what distinguishes it from the logical `a && b`, which follows neither — and
+# excluding `&&` matters, because without it every conjunction in the file matches
+# and the check drowns in its own noise, which is how a lint gets switched off.
+#
+# Two earlier attempts at that exclusion were wrong in opposite directions: no
+# guard at all (drowned), then a `[^&]&` guard that could not match `memcpy(&x, …)`
+# because there is no character between the paren and the ampersand for it to
+# consume — so it silently stopped catching the very first form on the list above.
+pattern='[(,][[:space:]]*&[[:space:]]*[A-Za-z_][A-Za-z0-9_.]*[^;]*(\b[48]\b|sizeof)'
 
-# Deliberate exceptions, each justified. A line matching one of these is allowed.
-# Keep the reason in the code as a comment too, so the exemption is visible where
-# someone edits it and not only here.
-declare -a ALLOW=(
-  # Word-wise all-zero scans: the value is only ever compared against 0, which is
-  # byte-order independent, and neither reads an on-disk integer FIELD.
-  'std::memcpy(&w, p + i \* sizeof(size_t), sizeof(w));'
+# Deliberate exceptions, in two lists, each entry justified.
+#
+# Note the asymmetry with the pattern above, which is the point: INCLUSION is by
+# shape, because guessing how the next host-order read will be spelled has failed
+# four times. EXCLUSION may be by name, because getting an exclusion wrong only
+# produces a false positive — someone has to come here and justify it — whereas
+# getting an inclusion wrong ships a corrupt archive. Wrong in the safe direction.
+
+# Callees that cannot be reading an on-disk field, whatever their arguments look
+# like. Keep this list SHORT and keep the reasons.
+declare -a ALLOW_CALLEE=(
+  'cudaMalloc'                   # &ptr out-param for a device allocation, not a read
+  'cudaMemcpy'                   # device<->host copy; same endianness, no file
+  'localtime_r'                  # &time_t in, struct tm out; not a field read
+  'nvmlDeviceGetHandleByIndex'   # &handle out-param from the NVML driver
+  'getpwuid_r'                   # &passwd out-param; no on-disk integer field
+  'getgrgid_r'                   # &group out-param; likewise
 )
+
+# Whole-line exemptions for things the callee list cannot express. Comment the
+# exemption at the SITE as well, so it is visible where someone edits it.
+declare -a ALLOW=(
+  # Word-wise all-zero scan: the value is only ever compared against 0, which is
+  # the same in every byte order, and it reads a data block, not an integer FIELD.
+  'std::memcpy(&w, p + i * sizeof(size_t), sizeof(w));'
+  # --calibrate corpus generation: WRITES a synthetic PRNG pattern into an
+  # in-memory buffer that is then compressed as opaque bytes. Never read back as
+  # an integer, never an on-disk field.
+  'std::memcpy(&corpus[i], &x, 8);'
+)
+
+# A call split across lines is still one call.  Fold each source file into LOGICAL
+# lines — joining while parentheses are unbalanced — and report the line the call
+# STARTED on, so `pread(fd,\n  &magic, 4, off);` is seen the same as the one-liner.
+# Comment-only lines are dropped first so a `//` inside the fold cannot swallow the
+# rest of the statement.
+fold_logical_lines() {
+  awk '
+    { raw = $0
+      sub(/^[[:space:]]*/, "", raw)
+      if (raw ~ /^\/\//) { if (depth == 0) next; else raw = "" }
+      line = $0
+      if (depth == 0) { start = NR; acc = "" }
+      acc = acc " " line
+      n = gsub(/\(/, "(", line); m = gsub(/\)/, ")", line)
+      depth += n - m
+      if (depth <= 0) { depth = 0; print start ":" acc; acc = "" }
+    }
+  ' "$1"
+}
 
 for f in "${files[@]}"; do
   [[ -f "$f" ]] || { echo "check-endian-reads: no such file: $f" >&2; exit 2; }
@@ -67,17 +146,25 @@ for f in "${files[@]}"; do
     [[ -n "$lineno" ]] || continue
     allowed=0
     for a in "${ALLOW[@]}"; do
-      if [[ "$line" == *"${a//\\/}"* ]]; then allowed=1; break; fi
+      if [[ "$line" == *"$a"* ]]; then allowed=1; break; fi
     done
+    if (( ! allowed )); then
+      for c in "${ALLOW_CALLEE[@]}"; do
+        if [[ "$line" =~ (^|[^A-Za-z0-9_])"$c"[[:space:]]*\( ]]; then
+          allowed=1; break
+        fi
+      done
+    fi
     (( allowed )) && continue
     if (( status == 0 )); then
       echo "check-endian-reads: host-order read of an on-disk field — use rd_le32/rd_le64" >&2
       echo "  (if the value is genuinely byte-order independent, add it to ALLOW in $0" >&2
       echo "   WITH a reason, and comment the exemption at the site)" >&2
     fi
-    echo "  $f:$lineno: $(echo "$line" | sed 's/^[[:space:]]*//')" >&2
+    echo "  $f:$lineno: $(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]\+/ /g' \
+                          | cut -c1-160)" >&2
     status=1
-  done < <(grep -nE "$pattern" "$f" | grep -v '^\s*[0-9]*:\s*//')
+  done < <(fold_logical_lines "$f" | grep -E "$pattern")
 done
 
 if (( status == 0 )); then

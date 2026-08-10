@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.77  
+**Covers:** v0.9.50 → v0.15.78  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,74 @@
 ---
 
 
+## v0.15.78 — one abstraction boundary further
+
+Round 8 assessed the four structural mechanisms from v0.15.77 rather than the findings, and
+returned the most precise verdict of the arc:
+
+> *"Structural fixes are not inherently just larger patches for the same problem; **M3
+> demonstrates real closure**. Here, however, **two of four mechanisms stop one abstraction
+> boundary short**."*
+
+M3 (separate frame counters) closed its class outright. M2 closed the wrong *read* and left the
+wrong *argument*. M1 made a rigorous decision about a **pathname** while the destruction happens
+through a **descriptor**. This release moves the two short mechanisms across that boundary.
+
+**The output invariant now attaches to a descriptor, not a name.** Identity comparison can only
+reject an object it has been told about, and for a directory source only the directory's own
+inode is captured — enumerating every descendant would mean walking the tree twice. So a
+symlink appearing at the output name and pointing at a file *inside* a source opened cleanly:
+the victim's inode is not the directory's inode, the forbidden check passed, and `ftruncate`
+destroyed it. No `--overwrite` required, and the same window reopens after `--overwrite`'s
+unlink. Identity could never close that, because the set is incomplete by construction.
+
+When tar sources are being protected, the final component is now opened through a **held parent
+descriptor with `O_NOFOLLOW`**, so there is no name left for anyone to swap and a symlink at
+that position is refused rather than followed. A plain compress still follows a symlink output,
+which is deliberate and unchanged. Measured deterministically with a *dangling* link — the same
+state the race produces, since `fs::exists` is false and the absent-output route runs:
+v0.15.77 created a 281-byte archive inside the source tree through the link; v0.15.78 refuses.
+
+Two more fail-open checks in the same function are closed: a failed `fstat` proceeded to the
+truncate having proven nothing, and the post-unlink recheck treated *any* `lstat` failure —
+not only `ENOENT` — as "the name is gone".
+
+**`build_pass_verify_pool(opt)` no longer compiles.** v0.15.77 moved the pool builder into a
+function where the request-level `opt` is out of scope, which fixed the wrong read and left the
+wrong argument: both objects are `Options`, so passing the wrong one at the call site was still
+type-correct. A narrow `PassOpt` wrapper — explicit constructor, no conversion from `Options` —
+now makes that a compile error: *"could not convert 'opt' from 'Options' to 'PassOpt'"*.
+Deliberately narrow, per the reviewer's own recommendation: the retry driver and the pool
+builder, not a project-wide conversion.
+
+**The endian check caught its fifth form — its own.** It missed `pread(fd, &magic, 4, off)`,
+because the pattern required the address-of to be the *first* argument, while the script's
+comment claimed it caught `pread`. Fixing that produced two further mistakes worth recording,
+since the point of this file is that hand-written patterns fail: removing the first-argument
+constraint made every `a && b` match and the check drowned in its own noise; the `[^&]&` guard
+added to fix *that* could not match `memcpy(&x, …)`, because there is no character between the
+paren and the ampersand for it to consume — so it silently stopped catching the very first
+form on its own list. It is now anchored on **argument position** (an address-of argument
+follows `(` or `,`, which `&&` never does), folds multi-line calls into logical lines, and is
+verified against all five historical forms plus a member expression.
+
+It also **stops overstating itself**: a width held in a variable is not matched, and neither is
+a struct overlay, a union, or an `istream::read`. A clean run means "no instance of the known
+shapes", not "no host-order read" — the `static_assert` is what actually makes big-endian
+unreachable. A check that claims more than it does is worse than one that is merely narrow.
+
+Also: a symlink *source* is captured with `O_NOFOLLOW`, so capture and walker agree by
+construction — following it added the link's target directory to the containment set and
+refused a safe output inside it, when the archive was only ever going to contain the link;
+`--calibrate` no longer prints `profile recorded:` with an empty path when there is no cache
+directory; and the rename-failure fallback no longer writes through a symlink. That last one is
+the v0.15.70 lesson again — an emulation must reproduce every effect of the operation it stands
+in for, and a rename *replaces a name* rather than writing through it, so the fallback now drops
+the name and creates it `O_EXCL|O_NOFOLLOW`.
+
+Suite: **389** (522 extensive), green on both build configurations.
+
+---
 ## v0.15.77 — fixing the pattern instead of the findings
 
 Round 7 rejected five of my round-6 fixes and asked the question that mattered more than
@@ -71,9 +139,14 @@ demonstrably does not work here: v0.15.75's sweep left two sites that `pread` st
 `memcpy(&m32, magic, 4)` — my audit pattern had been `memcpy\(&[a-z_]+,` and the **digit** in
 `m32` fell outside the character class. The first draft of the checker then failed its own
 test by listing readers *by name*, missing `pr(&magic, 4, pos)` where `pr` is a local lambda —
-the same mistake a third time. It matches the **shape** now: any call whose first argument is
-the address of a scalar and whose arguments contain a bare 4 or 8. Verified to catch both
-historical misses and to pass clean on the current tree.
+the same mistake a third time. And the first shape-based draft required a *literal* width, so
+`pr(&magic, sizeof magic, pos)` — the same defect written the way a careful author would write
+it — passed: four consecutive patterns, each of which looked complete. It now matches any call
+whose first argument is the address of a scalar and whose arguments state a width, a bare 4/8
+**or** a `sizeof`. Inclusion is by shape; **exclusion is by callee name** (three CUDA/time
+functions, each with a reason), on the asymmetry that a wrong exclusion costs a false positive
+somebody has to justify while a wrong inclusion ships a corrupt archive. Verified against all
+four historical forms, and clean on the current tree.
 
 Also closed, from the same round: a redirected stdout is registered as the archive's identity,
 so `gzstd --tar root > root/a.tar.zst` no longer stores a zero-length member for itself
