@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.73";
+static constexpr const char * GZSTD_VERSION = "0.15.74";
 //
 // Architecture overview:
 //
@@ -6700,6 +6700,44 @@ static bool trailing_is_truncated_skippable(const unsigned char * p, size_t n)
   return (uint64_t)n < 8ull + ssz;            // declared payload longer than what is here
 }
 
+// ...and MAY we tolerate them?  Recognising the shape is not the whole decision,
+// and keeping the policy in one place is deliberate: THREE readers reach this
+// question, and a divergence between them is exactly what let `gzstd -t` pass a
+// damaged archive undetected for five review rounds.
+//
+// Two conditions beyond the shape:
+//
+//   * At least one DATA frame must have been recovered.  A stream that is
+//     NOTHING BUT a broken trailer has no payload to salvage, so there is no
+//     benefit to weigh against the damage — and without this,
+//     `printf '\x50\x2a\x4d\x18' | gzstd -t` printed OK and exited 0 on four
+//     bytes of garbage, because zero frames plus a non-empty leftover fell
+//     between the "no frames" and "trailing bytes" checks at every reader.
+//
+//   * NEVER for `-t`.  Testing is integrity validation, not payload salvage:
+//     the question `-t` answers is "is this file intact", and a physically
+//     truncated file is not, however much of it happens to be recoverable.
+//     `-d` and `-l` still recover the data frames and warn.  This keeps `-t`
+//     byte-for-byte in agreement with stock zstd on every malformed shape.
+static bool trailing_skippable_tolerated(const Options & opt, uint64_t frames,
+                                         const unsigned char * p, size_t n)
+{
+  return frames > 0
+      && opt.mode != Mode::TEST
+      && trailing_is_truncated_skippable(p, n);
+}
+
+// One emitter, for the same reason.  V_ERROR, not V_VERBOSE: this is silent
+// data damage the user cannot otherwise see, and a warning nobody reads at the
+// default verbosity is the same false success in a quieter font.  (It survives
+// -q too; only -qq suppresses it.)
+static void warn_damaged_trailer(const Options & opt, size_t n)
+{
+  vlog(V_ERROR, opt, "warning: truncated trailing skippable frame ("
+       + std::to_string(n) + " bytes) — the index/seek-table trailer is damaged. "
+       "All data frames are intact; use -t to fail on any truncation.\n");
+}
+
 // Fixed pool of page-aligned buffers for the zero-copy --direct-read path.
 // The single O_DIRECT reader preads each chunk straight into a pooled buffer and
 // hands it to a worker as a Task view (no per-chunk 16 MiB copy); the worker
@@ -10809,10 +10847,21 @@ static size_t stream_frames_to_queue_mt(
   // dies on the same condition).
   // > 0, not > 8: see the sequential splitter's note — 8 bytes of tolerance was
   // enough to hide a truncated trailing frame behind an exit-0 "OK".
-  if (!aborted && !failed.load(std::memory_order_relaxed) && !carry.empty()
-      && !trailing_is_truncated_skippable((const unsigned char *)carry.data(), carry.size()))
-    fail("truncated zstd stream: " + std::to_string(carry.size())
-         + " trailing bytes after " + std::to_string(seq) + " frames");
+  // The tolerance decision goes through the shared policy helper so this reader
+  // and the sequential splitter cannot answer it differently; note that helper
+  // also requires seq > 0, which is what rejects a carry that is the ONLY thing
+  // in the stream.
+  if (!aborted && !failed.load(std::memory_order_relaxed) && !carry.empty()) {
+    if (trailing_skippable_tolerated(opt, (uint64_t)seq,
+                                     (const unsigned char *)carry.data(), carry.size()))
+      // Previously this reader stayed silent even at -vvv — it merely skipped
+      // the fail() — so the same damaged archive warned on one path and said
+      // nothing on the other.
+      warn_damaged_trailer(opt, carry.size());
+    else
+      fail("truncated zstd stream: " + std::to_string(carry.size())
+           + " trailing bytes after " + std::to_string(seq) + " frames");
+  }
   // ...and ZERO frames with zero carry is an empty file, which is not a zstd
   // stream at all.  This reader handles the named-regular-file case, so without
   // this an empty .zst exited 0 here even after the sequential splitter learned
@@ -11120,7 +11169,8 @@ static size_t stream_frames_to_queue(
         // trailer (the seek table / tar index) is a complete SKIPPABLE FRAME that
         // the loop above consumes, so nothing legitimate lands here.
         if (remaining > 0
-            && !trailing_is_truncated_skippable((const unsigned char *)ptr, remaining)) {
+            && !trailing_skippable_tolerated(opt, (uint64_t)seq,
+                                             (const unsigned char *)ptr, remaining)) {
           // Significant trailing data that isn't a valid frame = truncated
           *fallback = false;  // not a format problem, it's a data problem
           if (opt.keep_going) {
@@ -11145,10 +11195,10 @@ static size_t stream_frames_to_queue(
           die_data("truncated zstd stream: " + std::to_string(remaining)
                    + " trailing bytes after " + std::to_string(seq) + " frames");
         }
-        vlog(V_VERBOSE, opt,
-             "warning: " + std::to_string(remaining)
-             + " trailing bytes after frame " + std::to_string(seq)
-             + " not a valid Zstd frame (ignored)\n");
+        // Tolerated damaged trailer.  Deliberately silent HERE: breaking out
+        // leaves buf_off where it is, so the post-loop leftover check sees the
+        // same bytes and emits the one warning.  Warning in both places printed
+        // it twice.
         break;
       }
 
@@ -11212,14 +11262,20 @@ static size_t stream_frames_to_queue(
   // --keep-going it is a framing break (recoverable, exit 7); otherwise it is a
   // data error, matching stock zstd.
   size_t leftover = buf_len - buf_off;
-  if (leftover > 0 && seq > 0
-      && trailing_is_truncated_skippable(
+  if (leftover > 0
+      && trailing_skippable_tolerated(opt, (uint64_t)seq,
              (const unsigned char *)(buf.data() + buf_off), leftover)) {
-    vlog(V_VERBOSE, opt, "warning: truncated trailing skippable frame ("
-         + std::to_string(leftover) + " bytes) — index/seek-table trailer damaged, "
-         "data frames are intact\n");
+    warn_damaged_trailer(opt, leftover);
     leftover = 0;
   }
+  // NOTE the missing `&& seq > 0` that used to guard this.  Zero frames plus a
+  // non-empty leftover fell between all three checks here: the tolerance above
+  // needed seq > 0, this needed seq > 0, and the no-frames check below needed
+  // leftover == 0.  So `printf '\x50\x2a\x4d\x18' | gzstd -t` — four bytes of
+  // skippable magic and nothing else — broke out of the parse loop at
+  // `remaining < 8`, matched no check, and returned zero frames as SUCCESS,
+  // printing "OK" on a file stock zstd rejects.  Both zero-frame shapes are now
+  // reported by the one branch below.
   if (leftover > 0 && seq > 0) {
     if (opt.keep_going) {
       g_damage.set_framing_break((uint64_t)seq, out_off_acc,
@@ -11231,14 +11287,22 @@ static size_t stream_frames_to_queue(
                + " frame(s) do not form a valid frame");
     }
   }
-  // AN EMPTY INPUT NEVER ENTERS THE PARSE LOOP AT ALL, so the "no frame found"
-  // branch inside it cannot fire — the first read returns 0, eof is set, and the
-  // while(buf_off < buf_len) body is skipped.  That is how a zero-byte .zst
-  // reached exit 0 with no output while stock zstd says "unexpected end of file".
-  // Zero frames AND zero bytes is not a stream to fall back on; it is not a zstd
-  // file.  (Zero frames WITH bytes is the foreign/unknown-size case and must keep
-  // taking the fallback above.)
-  if (seq == 0 && leftover == 0) {
+  // NO COMPLETE FRAME AT ALL — with or without leftover bytes.  Two distinct
+  // shapes reach here and BOTH used to return success:
+  //
+  //   * zero bytes: an empty input never enters the parse loop, so the "no frame
+  //     found" branch inside it cannot fire — the first read returns 0, eof is
+  //     set, and the while(buf_off < buf_len) body is skipped.  A zero-byte .zst
+  //     exited 0 with no output where stock zstd says "unexpected end of file".
+  //
+  //   * a few bytes that never became a frame: the loop broke early (too short
+  //     for a magic, or a skippable header cut mid-way) rather than reaching the
+  //     in-loop verdict, leaving seq == 0 with a non-empty leftover.
+  //
+  // Neither is a stream to fall back on.  A FOREIGN or unknown-content-size
+  // stream cannot reach here: that verdict is reached inside the loop, which
+  // sets *fallback and returns before this point.
+  if (seq == 0) {
     if (opt.keep_going) {
       g_damage.set_framing_break(0, 0, "input contains no zstd frame");
     } else {
@@ -12298,6 +12362,76 @@ static void enqueue_direct_chunk(TaskQueue & q, size_t seq, const char * buf, si
 // changed during read.  main() promotes it to a non-zero exit (GNU tar parity).
 static std::atomic<bool> g_tar_had_errors{false};
 
+// --tar create: the archive we are WRITING, by identity.  The output is opened
+// before the walk runs, so an archive placed inside the tree being archived is
+// just another file to the scan: `gzstd -f -o root/a.tar.zst --tar root` stored
+// a zero-length member for the archive itself, and re-running a backup nested
+// the previous archive inside the new one.  Holds up to two entries — the file
+// being written (the final output, or the temp on the atomic path) and the
+// existing archive the temp will replace.  Compared by (dev, ino) rather than by
+// name so a symlinked or bind-mounted alias of the same inode is caught too.
+// GNU tar reports this case as "file is the archive; not dumped".
+// Written once in main() before any walk thread starts; read-only thereafter.
+static std::vector<std::pair<dev_t, ino_t>> g_tar_output_ids;
+
+static bool tar_entry_is_the_archive(const struct stat & st)
+{
+  for (const auto & id : g_tar_output_ids)
+    if (st.st_dev == id.first && st.st_ino == id.second) return true;
+  return false;
+}
+
+// Does `path` live inside any of these directories, by IDENTITY?
+//
+// Walks the parent chain upward with openat("..") and compares (st_dev, st_ino)
+// at every level.  The string equivalent — comparing canonical path prefixes —
+// is defeated by any alias that is not a symlink, because canonicalization
+// resolves symlinks and knows nothing about mount points.  A bind mount is the
+// practical case: `mount --bind root alias` makes alias/data and root/data the
+// same inode under two paths that share no prefix.  Inode identity sees through
+// it, since a bind mount shares the superblock.
+//
+// Starts at the PARENT: the output may not exist yet, and the output itself is
+// compared by identity elsewhere.  Returns false if the chain cannot be walked
+// (a missing parent means nothing can be created there either).
+static bool path_is_inside_dir_ids(const std::string & path,
+                                   const std::vector<std::pair<dev_t, ino_t>> & dir_ids)
+{
+  if (dir_ids.empty()) return false;
+
+  const size_t slash = path.find_last_of('/');
+  const std::string start = (slash == std::string::npos) ? std::string(".")
+                          : (slash == 0)                 ? std::string("/")
+                                                         : path.substr(0, slash);
+
+  int fd = ::open(start.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) return false;
+
+  // Bounded: a symlink-free parent chain is finite, but the bound keeps a
+  // pathological mount arrangement from spinning.
+  for (int depth = 0; depth < 256; ++depth) {
+    struct stat here;
+    if (::fstat(fd, &here) != 0) { ::close(fd); return false; }
+    for (const auto & id : dir_ids)
+      if (here.st_dev == id.first && here.st_ino == id.second) { ::close(fd); return true; }
+
+    const int up = ::openat(fd, "..", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    ::close(fd);
+    if (up < 0) return false;
+    struct stat above;
+    // "/.." is "/" — identical identity means we reached the top and must stop,
+    // or we would loop until the depth bound.
+    if (::fstat(up, &above) != 0
+        || (above.st_dev == here.st_dev && above.st_ino == here.st_ino)) {
+      ::close(up);
+      return false;
+    }
+    fd = up;
+  }
+  ::close(fd);
+  return false;
+}
+
 // --tar create: the member index's globals (g_tar_index_raw and the frame
 // table) are declared above writer_thread, which records into them.
 
@@ -12895,6 +13029,17 @@ struct LayoutBuilder {
     for (Pending & p : pending_) {
       if (p.stat_err != 0) { warn_skip(p.fspath, std::strerror(p.stat_err)); continue; }
       const struct stat & st = p.st;
+
+      // Never archive the archive.  Done HERE, in Pass C, and not in Pass A's
+      // enumerate(): Pass A deliberately avoids an lstat on leaves (that is the
+      // cold-inode storm it exists to keep off the serial path), while Pass B has
+      // already stat'd everything by the time we get here — so identity is free
+      // at this point and would cost a syscall per leaf at the other.
+      if (!g_tar_output_ids.empty() && tar_entry_is_the_archive(st)) {
+        vlog(V_VERBOSE, opt, "[TAR] " + p.fspath
+             + ": file is the archive; not dumped\n");
+        continue;
+      }
 
       if (p.is_dir) {
         TarEntry e;
@@ -24138,6 +24283,9 @@ static int gzstd_main(int argc, char ** argv)
     // followed it and truncated the source.  These identities are re-checked
     // against the OPENED FD in open_output_verified().
     std::vector<std::pair<dev_t, ino_t>> tar_src_ids;
+    // Directory sources only, and only when --overwrite makes the output
+    // destructive — the set the containment check below walks against.
+    std::vector<std::pair<dev_t, ino_t>> tar_overwrite_dir_ids;
     std::vector<int> tar_src_fds;
     if (opt.tar_mode) {
       for (size_t si = 0; si < opt.tar_sources.size(); ++si) {
@@ -24155,6 +24303,18 @@ static int gzstd_main(int argc, char ** argv)
         if (!src.empty() && src[0] != '/' && cdir != ".") fspath = cdir + "/" + src;
 
         int sfd = ::open(fspath.c_str(), O_PATH | O_CLOEXEC);
+        if (sfd < 0 && errno == ENOENT) {
+          // A DANGLING SYMLINK IS A VALID TAR SOURCE.  The walker lstat()s its
+          // sources and archives the link itself (GNU tar parity — it does not
+          // dereference a top-level symlink without -h), but O_PATH FOLLOWS the
+          // link and fails ENOENT on a broken one.  Failing closed on that turned
+          // `gzstd -f -o out.tar.zst --tar dangling` into a hard error against a
+          // source the walker supports.  Retry without following: O_PATH|O_NOFOLLOW
+          // opens the LINK, which is the object being archived and therefore the
+          // right identity to compare against.  A genuinely missing path still
+          // fails both ways and is still fatal.
+          sfd = ::open(fspath.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        }
         if (sfd < 0) {
           // FAIL CLOSED.  Skipping an unopenable source silently left it
           // unprotected, which is precisely the state the -C bug exploited.  If
@@ -24172,25 +24332,37 @@ static int gzstd_main(int argc, char ** argv)
         }
         tar_src_ids.emplace_back(ss.st_dev, ss.st_ino);
         tar_src_fds.push_back(sfd);
-        // A DIRECTORY source contributes its descendants too, and the output could
-        // alias one of them.  Comparing every descendant up front would mean
-        // walking the tree twice, so instead reject an output that lives ANYWHERE
-        // under a directory source when it would be destroyed (--overwrite unlinks
-        // it before the walk).  Writing INTO a source dir with -f stays allowed:
-        // that path creates a temp and renames, so the source is never unlinked.
-        if (S_ISDIR(ss.st_mode) && opt.unsafe_overwrite) {
-          std::error_code e1, e2;
-          const fs::path sc = fs::weakly_canonical(fspath, e1);
-          const fs::path oc = fs::weakly_canonical(opt.output, e2);
-          if (!e1 && !e2) {
-            auto it = std::mismatch(sc.begin(), sc.end(), oc.begin(), oc.end());
-            if (it.first == sc.end()) {
-              for (int f : tar_src_fds) ::close(f);
-              die_usage("--overwrite would delete the archive from inside --tar source "
-                        + fspath + "; write it elsewhere or use -f");
-            }
-          }
-        }
+        // A DIRECTORY source contributes its descendants too, and the output
+        // could alias one of them.  Comparing every descendant up front would
+        // mean walking the tree twice, so instead reject an output that lives
+        // ANYWHERE under a directory source when it would be destroyed
+        // (--overwrite unlinks it before the walk).  Writing INTO a source dir
+        // with -f stays allowed: that path creates a temp and renames, so the
+        // source is never unlinked, and the walk now skips the archive itself.
+        if (S_ISDIR(ss.st_mode) && opt.unsafe_overwrite)
+          tar_overwrite_dir_ids.emplace_back(ss.st_dev, ss.st_ino);
+      }
+      // Containment is decided by INODE, walking the output's parent chain up
+      // with openat("..") — not by comparing canonical path strings.
+      //
+      // weakly_canonical() resolves symlinks and knows nothing about MOUNTS, so
+      // a bind mount is a second pathname for the same directory that shares no
+      // textual prefix with the first:
+      //
+      //     mount --bind root alias
+      //     gzstd --overwrite -o alias/data --tar root
+      //
+      // canonical("root") is not a prefix of canonical("alias/data"), the string
+      // test passed — and the unlink then destroyed root/data through the alias.
+      // Identity is immune to that: a bind mount shares the superblock, so
+      // alias and root report the same (st_dev, st_ino).  It also removes the
+      // silent skip the string form had when canonicalization failed.
+      if (!tar_overwrite_dir_ids.empty()
+          && path_is_inside_dir_ids(opt.output, tar_overwrite_dir_ids)) {
+        for (int f : tar_src_fds) ::close(f);
+        die_usage("--overwrite would delete the archive from inside a --tar "
+                  "source directory (" + opt.output
+                  + "); write it elsewhere or use -f");
       }
       // Cheap pre-check so the common mistake reports the SOURCE NAME rather than
       // the output name; the fd comparison below is what actually closes the race.
@@ -24281,6 +24453,29 @@ static int gzstd_main(int argc, char ** argv)
       if (!existed_before) register_tmp_file(opt.output);
     }
   }
+
+#ifndef _WIN32
+  // --tar CREATE: record the archive's identity now, while we hold the fd and
+  // before any walk begins, so the scan can skip it (see g_tar_output_ids).
+  // Every output route converges here, which is the point — attaching this to
+  // one of the branches above is how features in this file end up covering some
+  // paths and not others.
+  if (opt.tar_mode && opt.mode == Mode::COMPRESS && out && out != stdout) {
+    struct stat os_;
+    if (::fstat(fileno(out), &os_) == 0 && S_ISREG(os_.st_mode))
+      g_tar_output_ids.emplace_back(os_.st_dev, os_.st_ino);
+    // On the atomic path the fd above is the TEMP, and the archive it will
+    // replace is still sitting at opt.output — equally inside the tree, and the
+    // one a repeated backup would otherwise nest.
+    struct stat fs_;
+    if (!opt.output.empty() && ::stat(opt.output.c_str(), &fs_) == 0
+        && S_ISREG(fs_.st_mode)
+        && !(g_tar_output_ids.size() == 1
+             && g_tar_output_ids[0].first == fs_.st_dev
+             && g_tar_output_ids[0].second == fs_.st_ino))
+      g_tar_output_ids.emplace_back(fs_.st_dev, fs_.st_ino);
+  }
+#endif
 
   // O_DIRECT output: only when explicitly requested via --direct.
   // Default is buffered I/O (fwrite) which uses the OS page cache for
@@ -24506,7 +24701,16 @@ static int gzstd_main(int argc, char ** argv)
       //     delivery instead of back-pressuring the writer (see
       //     compute_verify_queue_depth); shallow on limited-RAM boxes, deep on big.
       std::unique_ptr<VerifyPool> vpool;
-      if (opt.verify && !opt.gpu_verify) {   // GPU verify (gpu-only) runs in the GPU worker, not here
+      // pass_opt, NOT opt.  "GPU verify runs in the GPU worker, so this pass
+      // needs no CPU pool" is a statement about THIS PASS's backend, and the
+      // backend changes underneath it: a GPU fault or a failed GPU verify
+      // discards the output and rebuilds CPU-only.  Reading the original opt
+      // meant the rebuild pass saw gpu_verify still true, built no CPU pool —
+      // and had no GPU worker either — so `--verify` checked NOTHING on the
+      // rebuild and exited 0.  With --rm that deleted the source after a
+      // verification that never ran.  The rebuild clears pass_opt.gpu_verify
+      // below; both halves are required, and either alone is a no-op.
+      if (pass_opt.verify && !pass_opt.gpu_verify) {
         const int cores = (opt.cpu_threads > 0)
             ? opt.cpu_threads
             : std::max(1, (int)std::thread::hardware_concurrency());
@@ -24535,7 +24739,9 @@ static int gzstd_main(int argc, char ** argv)
       if (vpool) { vpool->finish(); vpool->log_summary(opt, &meter); g_verify_pool = nullptr; vpool.reset(); }
 
       // GPU-side verify (gpu-only) summary — confirms it ran and at what GPU cost.
-      if (opt.gpu_verify && opt.verbosity >= V_VERBOSE
+      // pass_opt for the same reason as the pool condition above: it describes
+      // the pass that just ran, not the one the user asked for.
+      if (pass_opt.gpu_verify && opt.verbosity >= V_VERBOSE
           && g_gpu_verify_frames.load() > 0) {
         const uint64_t vf = g_gpu_verify_frames.load();
         const uint64_t vb = g_gpu_verify_bytes.load();
@@ -24669,6 +24875,11 @@ static int gzstd_main(int argc, char ** argv)
       // Every rebuild is CPU-only — the trustworthy, deterministic path.
       pass_opt = opt;
       pass_opt.cpu_only = true; pass_opt.gpu_only = false; pass_opt.hybrid = false;
+      // ...and a CPU-only pass cannot verify on the GPU.  Leaving this set left
+      // the rebuild with NO verifier of either kind (see the pool condition
+      // above): the run that exists precisely because verification failed was
+      // the one run that went unverified.
+      pass_opt.gpu_verify = false;
     }
 
     // CPU-only stats: written when the final (successful) pass ran on the CPU —

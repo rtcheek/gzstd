@@ -140,6 +140,15 @@ silently compiled out.
 - The GPU decode pool spawns lazily (only when the CPU pool is maxed, still starved, and
   enough work remains to outlast ~4 s of `cuInit`) to avoid a speculative VRAM grab.
 - The tar parse is serial by design; large files become windowed part-jobs on the pool.
+- **A truncated trailing SKIPPABLE frame warns and falls back instead of failing** — the
+  one place gzstd is deliberately *more* permissive than stock zstd (v0.15.73). Every other
+  trailing byte is fatal, matching zstd. The reasoning: a skippable frame carries no user
+  data, so a clipped one at EOF cannot hide missing content, and gzstd's own index /
+  seek-table trailer *is* a skippable frame whose damage is documented to fall back to the
+  decompress walk. Losing it costs an optimization, not data. The predicate is
+  `trailing_is_truncated_skippable` and it carries the rationale inline. This is a conscious
+  trade against the drop-in goal, not an oversight — but the *silence* of it (the warning is
+  `-v`-only, so `-t` exits 0 with no output on a file stock zstd rejects) is fair to argue.
 - `--gpu-only` deliberately records no `--adapt` backend rate.
 - Test hooks (`GZSTD_DEBUG_*`) are set by the suite on purpose — notably
   `GZSTD_DEBUG_GPU_MIN_BYTES=0`, without which the GPU paths stop being covered at all.

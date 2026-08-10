@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=377
-$EXTENSIVE && EXPECTED_TESTS=510
+EXPECTED_TESTS=380
+$EXTENSIVE && EXPECTED_TESTS=513
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1036,12 +1036,24 @@ if has_gpu 2>/dev/null; then
   fi
   # Corruption injected into the compressed output in VRAM must be caught by the
   # GPU compare and rebuilt CPU-only into a correct archive.
-  GZSTD_DEBUG_GPU_CORRUPT=1 "$GZSTD" $GVCFG -k -f "$gvsrc" -o "$gvz" 2>"$gverr"
+  #
+  # -v and a VERIFIED-FRAME COUNT, not just a round-trip: the CPU rebuild used to
+  # run with NO verifier of either kind.  The verify pool is built per pass, but
+  # its condition read the ORIGINAL opt ("gpu_verify is set, so the GPU worker
+  # verifies") while the rebuild had already switched the pass to CPU-only — so
+  # the one run that exists because verification failed was the one run that went
+  # unverified, and with --rm it deleted the source afterwards.  A trustworthy CPU
+  # compressor makes the round-trip check pass either way, which is exactly why
+  # that check could not see this.
+  GZSTD_DEBUG_GPU_CORRUPT=1 "$GZSTD" $GVCFG --verify -v -k -f "$gvsrc" -o "$gvz" 2>"$gverr"
   "$GZSTD" -d -k -f "$gvz" -o "$gvr" 2>/dev/null
-  if grep -qiE "GPU verify|rebuilding CPU-only" "$gverr" && files_match "$gvsrc" "$gvr"; then
-    pass "GPU verify catches VRAM corruption, rebuilds clean"
+  gv_reb=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$gverr" \
+           | grep -a "^\[VERIFY\] [0-9]" | tail -1)
+  if grep -qiE "GPU verify|rebuilding CPU-only" "$gverr" && files_match "$gvsrc" "$gvr" \
+     && [[ -n "$gv_reb" ]] && ! grep -q "0 frames (0.00 B) checked" <<<"$gv_reb"; then
+    pass "GPU verify catches VRAM corruption, rebuilds clean + verified"
   else
-    fail "GPU verify corruption catch" "no rebuild or output mismatch"
+    fail "GPU verify corruption catch" "no rebuild, mismatch, or unverified rebuild [$gv_reb]"
   fi
   # --verify-engine=gpu without --gpu-only can't run GPU verify: warn, fall back
   # to CPU verify, still produce a correct archive.
@@ -5975,12 +5987,60 @@ else
   "$GZSTD" -t "$TMPDIR/tf_empty.zst"  >/dev/null 2>&1 && tf_ok=0   # empty: must fail
   "$GZSTD" -d -f -o "$TMPDIR/tf.out" "$TMPDIR/tf_magic.zst" >/dev/null 2>&1 && tf_ok=0
   "$GZSTD" -l "$TMPDIR/tf_empty.zst"  >/dev/null 2>&1 && tf_ok=0   # -l too
+  # -l on the APPENDED MALFORMED TAIL, not only on the empty file: the previous
+  # revision of this test asserted -l for one of the two shapes and left the
+  # other unobserved.
+  "$GZSTD" -l "$TMPDIR/tf_magic.zst"  >/dev/null 2>&1 && tf_ok=0
   if [ "$tf_ok" = 1 ]; then
     pass "truncated trailing frame and empty .zst are rejected"
   else
     fail "truncated trailing frame and empty .zst are rejected"
   fi
   rm -f "$TMPDIR/tf.zst" "$TMPDIR/tf_magic.zst" "$TMPDIR/tf_empty.zst" "$TMPDIR/tf.out"
+
+  # 1e-2. A stream that is NOTHING BUT a broken trailer is not a stream.  Four
+  #     bytes of skippable magic on stdin fell between every check — the
+  #     truncated-skippable tolerance required seq>0, the trailing-bytes check
+  #     required seq>0, and the no-frames check required leftover==0 — so
+  #     `printf '\x50\x2a\x4d\x18' | gzstd -t` printed OK and exited 0 on four
+  #     bytes of garbage.  Covers both the stdin and the named-file reader.
+  st_ok=1
+  printf '\x50\x2a\x4d\x18' > "$TMPDIR/stub.zst"
+  printf '\x50\x2a\x4d\x18' | "$GZSTD" -t          >/dev/null 2>&1 && st_ok=0
+  printf '\x50\x2a\x4d\x18' | "$GZSTD" -d          >/dev/null 2>&1 && st_ok=0
+  "$GZSTD" -t "$TMPDIR/stub.zst"                   >/dev/null 2>&1 && st_ok=0
+  printf '\x50\x2a\x4d\x18\xff\xff\xff\x7f' | "$GZSTD" -t >/dev/null 2>&1 && st_ok=0
+  if [ "$st_ok" = 1 ]; then
+    pass "a lone truncated skippable frame is not a valid stream"
+  else
+    fail "a lone truncated skippable frame is not a valid stream"
+  fi
+  rm -f "$TMPDIR/stub.zst"
+
+  # 1e-3. THE DELIBERATE DIVERGENCE, split by command.  gzstd tolerates a
+  #     truncated trailing SKIPPABLE frame because that is its own seek-table /
+  #     member-index trailer and it carries no user data — but tolerance is for
+  #     RECOVERY, not for validation.  So:
+  #       -d  recovers every data byte AND warns at DEFAULT verbosity (no -v),
+  #       -t  fails, because a physically truncated file is not intact however
+  #           much of it is recoverable.
+  #     Both halves matter: -t used to exit 0 (silently agreeing the file was
+  #     fine), and the -d warning used to be -v-only, which is the same false
+  #     success in a quieter font.
+  "$GZSTD" -q -f -o "$TMPDIR/sk.zst" "$TMPDIR/medium.txt" 2>/dev/null
+  sk_full=$(stat -c%s "$TMPDIR/sk.zst")
+  head -c $((sk_full - 5)) "$TMPDIR/sk.zst" > "$TMPDIR/sk_cut.zst"   # into the trailer
+  sk_ok=1
+  "$GZSTD" -t "$TMPDIR/sk_cut.zst" >/dev/null 2>&1 && sk_ok=0        # -t: must fail
+  skerr=$("$GZSTD" -d -f -o "$TMPDIR/sk.out" "$TMPDIR/sk_cut.zst" 2>&1) || sk_ok=0
+  grep -qa "trailer is damaged" <<<"$skerr" || sk_ok=0               # warned WITHOUT -v
+  cmp -s "$TMPDIR/medium.txt" "$TMPDIR/sk.out" || sk_ok=0            # data fully recovered
+  if [ "$sk_ok" = 1 ]; then
+    pass "damaged trailer: -d recovers and warns by default, -t fails"
+  else
+    fail "damaged trailer -d/-t split" "err=[$skerr]"
+  fi
+  rm -f "$TMPDIR/sk.zst" "$TMPDIR/sk_cut.zst" "$TMPDIR/sk.out"
 
   # 1f. --verify must actually verify on EVERY compress path.  The verifier taps
   #     the ordered writer, and -T1 and --sliding-window do not use one — so both
@@ -6087,12 +6147,44 @@ PYEOF
   printf 'x\n' > "$TMPDIR/selfdir/a"
   "$GZSTD" --cpu-only -f -o "$TMPDIR/selfdir/in.tar.zst" --tar "$TMPDIR/selfdir" >/dev/null 2>&1 \
     || self_ok=0
+  # ...and the MEMBER LIST must not contain the archive.  Asserting the exit
+  # status alone passed happily while the archive stored a zero-length member
+  # for ITSELF, and a repeated backup nested the previous archive inside the new
+  # one.  Check the observable, not the return code.
+  selfmem=$("$GZSTD" --cpu-only -l --tar "$TMPDIR/selfdir/in.tar.zst" 2>/dev/null)
+  grep -q "in.tar.zst" <<<"$selfmem" && self_ok=0
+  # Run it a SECOND time: now the archive already exists, so the walk sees both
+  # the old archive and (on the atomic path) the temp that will replace it.
+  "$GZSTD" --cpu-only -f -o "$TMPDIR/selfdir/in.tar.zst" --tar "$TMPDIR/selfdir" >/dev/null 2>&1 \
+    || self_ok=0
+  selfmem2=$("$GZSTD" --cpu-only -l --tar "$TMPDIR/selfdir/in.tar.zst" 2>/dev/null)
+  grep -q "in.tar.zst" <<<"$selfmem2" && self_ok=0
   if [ "$self_ok" = 1 ]; then
     pass "--tar refuses an output that is also a source"
   else
-    fail "--tar refuses an output that is also a source"
+    fail "--tar refuses an output that is also a source" \
+         "members=[$selfmem] members2=[$selfmem2]"
   fi
   rm -rf "$TMPDIR/selfsrc" "$TMPDIR/selfsrc.bak" "$TMPDIR/selfdir"
+
+  # 1c-2. A DANGLING SYMLINK is a valid tar source — GNU tar archives the link
+  #     itself.  Capturing source identities with a symlink-FOLLOWING O_PATH made
+  #     it ENOENT, and failing closed on that turned a supported source into a
+  #     hard error.  A genuinely missing source must still be fatal.
+  rm -rf "$TMPDIR/dang"; mkdir -p "$TMPDIR/dang"
+  ln -s no-such-target "$TMPDIR/dang/link"
+  dang_ok=1
+  "$GZSTD" --cpu-only -f -o "$TMPDIR/dang.tar.zst" --tar "$TMPDIR/dang" >/dev/null 2>&1 || dang_ok=0
+  "$GZSTD" --cpu-only -l --tar "$TMPDIR/dang.tar.zst" 2>/dev/null \
+    | grep -q -- "link -> no-such-target" || dang_ok=0
+  "$GZSTD" --cpu-only -f -o "$TMPDIR/gone.tar.zst" --tar "$TMPDIR/definitely-not-here" \
+    >/dev/null 2>&1 && dang_ok=0
+  if [ "$dang_ok" = 1 ]; then
+    pass "--tar archives a dangling symlink, still rejects a missing source"
+  else
+    fail "--tar archives a dangling symlink, still rejects a missing source"
+  fi
+  rm -rf "$TMPDIR/dang" "$TMPDIR/dang.tar.zst" "$TMPDIR/gone.tar.zst"
 
   # 1b. A NON-zstd input must print NOTHING to stdout — no table header, no row.
   #     It used to emit the full header plus a row of zeros ("0 frames, 0.00 B,

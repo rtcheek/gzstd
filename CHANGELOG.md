@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.73  
+**Covers:** v0.9.50 → v0.15.74  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,105 @@
 ---
 
 
+## v0.15.74 — a guard that compared paths, and the one run that skipped verification
+
+Round 6. Six of the eight fixes from v0.15.73 were **rejected**, but the more useful number
+is the other one: *"I found no additional independent production defect outside the rejected
+fixes."* After five rounds of finding decade-old defects, the sixth found none — every
+finding here is a hole in the previous patch or in the question asked about it. The review is
+now reviewing the diff, not the codebase.
+
+**The `--tar` containment guard compared PATHS, so a bind mount walked straight through it.**
+v0.15.73 stopped `--overwrite` from placing the archive inside a directory source by testing
+whether `weakly_canonical(source)` was a path prefix of `weakly_canonical(output)`.
+Canonicalization resolves symlinks and knows nothing about **mounts**:
+
+    mount --bind root alias
+    gzstd --overwrite -o alias/data --tar root      # unlinks root/data through the alias
+
+`canonical("root")` is not a prefix of `canonical("alias/data")`, so the check passed and the
+unlink destroyed the source. No race, no fault injection. Containment is now decided by
+**identity** — walking the output's parent chain upward with `openat("..")` and comparing
+`(st_dev, st_ino)` at each level. A bind mount shares the superblock, so the alias and the
+original report the same inode and the walk sees through it. The string form also skipped the
+check silently whenever canonicalization failed; there is nothing to fail now. Every
+constructible aliasing shape (symlinked parent, symlinked source, `-C`-resolved, directory
+source) still refuses, and the legitimate case still works. *The bind-mount trigger itself
+could not be constructed here — no root, and user namespaces are disabled — so that one shape
+is reasoned, not measured.*
+
+**`--verify` checked nothing on the one run that most needed it.** The verify pool is built
+per pass, but its condition read the ORIGINAL `opt`: *"gpu_verify is set, so the GPU worker
+does the verifying, and this pass needs no CPU pool."* True — until a GPU fault or a failed
+GPU verify discards the output and rebuilds CPU-only. `pass_opt.cpu_only` flipped;
+`pass_opt.gpu_verify` did not. So the rebuild had no CPU pool (opt said the GPU verifies) and
+no GPU worker either, and the run that exists *because* verification failed was the one run
+that went unverified — exit 0, and with `--rm` the source deleted afterwards. Measured: a
+clean `--cpu-only --verify` prints `[VERIFY] … 1 frames (7.63 MiB) checked`; the rebuild
+printed no `[VERIFY]` line at all. Both halves are fixed — the condition now reads `pass_opt`,
+and the rebuild clears `gpu_verify` — because either alone is a no-op.
+
+This is the v0.15.72 lesson on a second axis. That one was a feature attached to one of four
+*paths*; this is a condition that stopped holding once the state changed underneath it. The
+question to ask is not only "which paths does this reach" but "does its predicate survive the
+state change".
+
+**Four bytes of garbage passed as a valid archive.** `printf '\x50\x2a\x4d\x18' | gzstd -t`
+printed OK and exited 0. Zero frames plus a non-empty leftover fell between three checks that
+each excluded it: the truncated-skippable tolerance required `seq > 0`, the trailing-bytes
+rejection required `seq > 0`, and the no-frames rejection required `leftover == 0`. Both
+zero-frame shapes — no bytes, and bytes that never became a frame — now go through one branch.
+
+**The deliberate divergence is now split by command, which is what it should always have
+been.** gzstd tolerates a truncated trailing *skippable* frame because that is its own
+seek-table trailer and it carries no user data. The reviewer accepted the payload-safety
+reasoning and rejected the scope, in one line worth keeping: *"`-t`'s job is integrity
+validation, not payload salvage."* So `-d` and `-l` still recover every data byte, and `-t`
+now fails — a physically truncated file is not intact, however much of it is recoverable.
+The recovery warning also moved from `-v`-only to **default verbosity**: a warning nobody
+reads at the default is the same false success in a quieter font. The parallel reader, which
+suppressed the failure and said nothing even at `-vvv`, now warns identically — the tolerance
+decision and the warning both live in one shared helper, because three readers answering this
+question separately is precisely how it went wrong.
+
+**A dangling symlink stopped being archivable.** v0.15.73's fail-closed source capture used a
+symlink-*following* `O_PATH`, which is ENOENT on a broken link — so `gzstd --tar dangling`
+became a hard error against a source the walker happily archives (it `lstat`s, as GNU tar
+does). It now retries with `O_NOFOLLOW`, capturing the link itself. A genuinely missing source
+is still fatal.
+
+**`-f` archived the archive.** The output is created before the walk, so it is just another
+file in the tree: `gzstd -f -o root/a.tar.zst --tar root` stored a zero-length member for
+itself, and a repeated backup nested the previous archive inside the new one. The walk now
+skips the archive by identity — the file being written and, on the atomic path, the existing
+archive its temp will replace. Done in Pass C, where everything has been `lstat`ed already, so
+it costs nothing; doing it in Pass A would have added a syscall per leaf to the one pass that
+deliberately avoids them. GNU tar reports this case the same way ("file is the archive; not
+dumped").
+
+**Three of the round-5 regression tests asserted the wrong thing** and this entry fixes them
+too — the point the reviewer made is that a test which passes for the wrong reason is
+indistinguishable from one that works. The trailing-frame test checked `-l` on the empty file
+but not on the appended malformed tail; the archive-inside-source test checked only the exit
+status while the archive contained itself; the GPU-verify test checked a final round-trip,
+which a trustworthy CPU compressor satisfies whether or not a verifier ran. All three now
+assert the observable. Three new tests cover the lone-stub stream, the `-d`/`-t` split with
+its default-verbosity warning, and the dangling-symlink source.
+
+Two fixes were **confirmed**: the sliding-window verifier's frame-boundary requirement (the
+zero-length-buffer worry was impossible — `note_output` returns early on `n == 0`), and the
+`--adapt` profile lock's skip-the-save behaviour.
+
+Still open and deliberately not in this patch: `-l` accepts 1–3 trailing bytes that `-t`
+rejects (both walks stop at `pos + 4 <= fsize` with no leftover check); the skippable
+tolerance is route-dependent above a 256 MiB first frame; and XXH64 is now endian-correct
+while ~13 other on-disk reads are still host-order `memcpy`, so big-endian remains
+non-functional either way — that one wants a decision (declare BE unsupported) rather than a
+patch.
+
+Suite: **380**, green on both build configurations.
+
+---
 ## v0.15.73 — false-success in the hot path, and an ordering bug that made last round's fix a no-op
 
 Round 5, open mandate. Seven findings — three HIGH — and two of them were in code nobody had
