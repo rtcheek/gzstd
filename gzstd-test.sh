@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=383
-$EXTENSIVE && EXPECTED_TESTS=516
+EXPECTED_TESTS=387
+$EXTENSIVE && EXPECTED_TESTS=520
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6119,6 +6119,34 @@ else
     skip "damaged trailer verdict is the same on the streaming route" "zstd CLI unavailable"
   fi
 
+  # 1e-6. --keep-going MUST MEAN THE SAME THING ON EVERY ROUTE.  The frame
+  #     splitter records a framing break and exits 7 with the recovered prefix;
+  #     the single-frame streaming decoder called die_data unconditionally, so the
+  #     same damage gave exit 4 and NO recovery whenever dispatch chose that path
+  #     — a sizeless first frame, or one over SINGLE_FRAME_STREAM_MIN.  Its error
+  #     message even told the user to re-run with --keep-going, which changed
+  #     nothing.  A piped `zstd` stream is sizeless, so it reaches that route
+  #     without needing a 256 MiB frame.
+  if command -v zstd >/dev/null 2>&1; then
+    kg_ok=1
+    cat "$TMPDIR/medium.txt" | zstd -q > "$TMPDIR/kg.zst" 2>/dev/null
+    kgsz=$(stat -c%s "$TMPDIR/kg.zst")
+    head -c $((kgsz - 400)) "$TMPDIR/kg.zst" > "$TMPDIR/kg_cut.zst"   # into a DATA frame
+    "$GZSTD" -d -f -o "$TMPDIR/kg.plain" "$TMPDIR/kg_cut.zst" >/dev/null 2>&1
+    [ $? -eq 4 ] || kg_ok=0                                          # plain: data error
+    "$GZSTD" -d --keep-going -f -o "$TMPDIR/kg.out" "$TMPDIR/kg_cut.zst" >/dev/null 2>&1
+    [ $? -eq 7 ] || kg_ok=0                                          # recovery: exit 7
+    [ -s "$TMPDIR/kg.out" ] || kg_ok=0                               # and it RECOVERED something
+    if [ "$kg_ok" = 1 ]; then
+      pass "--keep-going recovers on the streaming decode route"
+    else
+      fail "--keep-going on the streaming route"
+    fi
+    rm -f "$TMPDIR/kg.zst" "$TMPDIR/kg_cut.zst" "$TMPDIR/kg.out" "$TMPDIR/kg.plain"
+  else
+    skip "--keep-going recovers on the streaming decode route" "zstd CLI unavailable"
+  fi
+
   # 1f. --verify must actually verify on EVERY compress path.  The verifier taps
   #     the ordered writer, and -T1 and --sliding-window do not use one — so both
   #     built a pool, checked ZERO frames, and exited 0 while --rm deleted the
@@ -6243,6 +6271,81 @@ PYEOF
          "members=[$selfmem] members2=[$selfmem2]"
   fi
   rm -rf "$TMPDIR/selfsrc" "$TMPDIR/selfsrc.bak" "$TMPDIR/selfdir"
+
+  # 1c-3. A SURVIVING OUTPUT SYMLINK MUST NOT BE WRITTEN THROUGH.  The identity
+  #     containment walk clears an output whose own parent chain is outside the
+  #     sources — but a symlink there can still POINT inside one.  --overwrite
+  #     unlinks the output to neutralise exactly that, and when the unlink failed
+  #     the failure was ignored: the link survived, the open followed it, and the
+  #     source was truncated.  Exit 0, file destroyed, no root and no race:
+  #         ln -s root/data alias/out; chmod a-w alias
+  #         gzstd --overwrite -o alias/out --tar root
+  #     Two independent guards now: the containment check resolves an existing
+  #     output symlink, and a failed unlink is fatal.  Assert the SOURCE SURVIVES,
+  #     not merely that the exit is non-zero.
+  rm -rf "$TMPDIR/sl"; mkdir -p "$TMPDIR/sl/root" "$TMPDIR/sl/alias"
+  printf 'must-survive-verbatim\n' > "$TMPDIR/sl/root/data"
+  ln -s "$TMPDIR/sl/root/data" "$TMPDIR/sl/alias/out"
+  chmod a-w "$TMPDIR/sl/alias"
+  slk_ok=1
+  "$GZSTD" --cpu-only --overwrite -o "$TMPDIR/sl/alias/out" --tar "$TMPDIR/sl/root" \
+    >/dev/null 2>&1 && slk_ok=0                      # must refuse
+  grep -q "must-survive-verbatim" "$TMPDIR/sl/root/data" 2>/dev/null || slk_ok=0
+  # ...and an UNDECIDABLE containment question must refuse too, rather than being
+  # read as "outside".  An unopenable parent chain is the reachable form.
+  rm -rf "$TMPDIR/sl/hid"; mkdir -p "$TMPDIR/sl/hid/sub"
+  chmod a-rx "$TMPDIR/sl/hid"
+  "$GZSTD" --cpu-only --overwrite -o "$TMPDIR/sl/hid/sub/o.zst" --tar "$TMPDIR/sl/root" \
+    >/dev/null 2>&1 && slk_ok=0
+  chmod u+rx "$TMPDIR/sl/hid"; chmod u+w "$TMPDIR/sl/alias"
+  # ...while the ordinary case still works.
+  "$GZSTD" --cpu-only --overwrite -o "$TMPDIR/sl/ok.tar.zst" --tar "$TMPDIR/sl/root" \
+    >/dev/null 2>&1 || slk_ok=0
+  if [ "$slk_ok" = 1 ]; then
+    pass "--tar refuses a surviving output symlink and an undecidable output"
+  else
+    fail "--tar surviving output symlink / undecidable containment"
+  fi
+  rm -rf "$TMPDIR/sl"
+
+  # 1c-4. The archive must be excluded from the walk on EVERY output route,
+  #     including a REDIRECTED STDOUT — a regular file inside the tree that the
+  #     walk cannot distinguish from any other.  Identity registration skipped
+  #     stdout, so `gzstd --tar root > root/a.tar.zst` stored a zero-length member
+  #     for itself.
+  rm -rf "$TMPDIR/rso"; mkdir -p "$TMPDIR/rso"
+  printf 'x\n' > "$TMPDIR/rso/a"
+  ( cd "$TMPDIR" && "$GZSTD" --cpu-only --tar rso > rso/self.tar.zst 2>/dev/null )
+  if "$GZSTD" --cpu-only -l --tar "$TMPDIR/rso/self.tar.zst" 2>/dev/null \
+       | grep -q "self.tar.zst"; then
+    fail "--tar excludes a redirected-stdout archive from its own walk"
+  else
+    pass "--tar excludes a redirected-stdout archive from its own walk"
+  fi
+  rm -rf "$TMPDIR/rso"
+
+  # 1c-5. A stream of nothing but COMPLETE SKIPPABLE frames is valid — stock zstd
+  #     accepts it — and must decode to empty output on EVERY route.  `seq` counts
+  #     DATA frames and was doing double duty as "did any frame exist at all", so
+  #     the piped route rejected what the named route accepted.  A TRUNCATED
+  #     skippable stub stays fatal on both: that one really is damage.
+  sko_ok=1
+  printf '\x50\x2a\x4d\x18\x00\x00\x00\x00' > "$TMPDIR/skonly.zst"
+  printf '\x50\x2a\x4d\x18' > "$TMPDIR/skstub.zst"
+  "$GZSTD" -t "$TMPDIR/skonly.zst"          >/dev/null 2>&1 || sko_ok=0   # named: valid
+  "$GZSTD" -t < "$TMPDIR/skonly.zst"        >/dev/null 2>&1 || sko_ok=0   # piped: same
+  "$GZSTD" -d -c "$TMPDIR/skonly.zst"       >/dev/null 2>&1 || sko_ok=0
+  "$GZSTD" -t "$TMPDIR/skstub.zst"          >/dev/null 2>&1 && sko_ok=0   # truncated: fatal
+  "$GZSTD" -t < "$TMPDIR/skstub.zst"        >/dev/null 2>&1 && sko_ok=0
+  if command -v zstd >/dev/null 2>&1; then
+    zstd -t "$TMPDIR/skonly.zst" >/dev/null 2>&1 || sko_ok=0              # agrees with zstd
+  fi
+  if [ "$sko_ok" = 1 ]; then
+    pass "a skippable-only stream is valid on every route; a stub is not"
+  else
+    fail "skippable-only stream routing"
+  fi
+  rm -f "$TMPDIR/skonly.zst" "$TMPDIR/skstub.zst"
 
   # 1c-2. A DANGLING SYMLINK is a valid tar source — GNU tar archives the link
   #     itself.  Capturing source identities with a symlink-FOLLOWING O_PATH made

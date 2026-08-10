@@ -21,6 +21,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Fail the release BEFORE building if any on-disk integer is read in host
+      # order.  Cheap, and it is the one defect class that cannot be caught by
+      # testing here: every machine this project runs on is little-endian, so a
+      # host-order read behaves perfectly until it does not.  Two separate
+      # hand-run audits missed a site; this does not.
+      - name: Check for host-order on-disk reads
+        run: ./scripts/check-endian-reads.sh
+
       # Cache the nvCOMP tarball (~45 MB) across runs so we don't re-download
       # from NVIDIA's CDN every time.  Key includes the version so a bump
       # invalidates the cache automatically.

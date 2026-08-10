@@ -151,6 +151,21 @@ silently compiled out.
   all four readers ask; the previous divergence between three of them is what let `gzstd -t`
   pass a damaged archive for five review rounds. Tolerance also requires that at least one
   DATA frame was recovered, so a stream that is nothing but a broken trailer stays fatal.
+- **Safety checks that gate a destructive step are TRI-STATE** (`Containment` in
+  `path_containment`): inside / outside / **unknown**, and only *outside* proceeds. Two
+  successive versions of the `--tar` guard failed by folding "could not determine" into
+  "outside". Relatedly, a failed unlink whose purpose is to neutralise a symlink is FATAL —
+  ignoring it is what let a surviving link be followed into a source file.
+- **`opt` vs `pass_opt` in the compress driver**: `opt` is what the user asked for, `pass_opt`
+  is what THIS pass is doing, and they diverge when a GPU fault rebuilds CPU-only. Per-pass
+  work lives in functions that receive only `pass_opt` so the wrong read cannot compile. If
+  you add a pass-scoped helper, keep that signature.
+- **`seq` is DATA frames; `total_frames` is every frame.** Never ask `seq` whether any frame
+  existed — a stream of only skippable frames is valid and has `seq == 0`.
+- **`scripts/check-endian-reads.sh` is mechanical and runs in CI.** It matches the *shape* of a
+  host-order read (address-of a scalar plus a 4/8 width), not a list of function names,
+  because three separate hand-written patterns each missed a real site. Add exemptions to its
+  ALLOW list with a reason, and comment them at the site too.
 - **Little-endian only, asserted at build time.** Every on-disk integer is read through
   `rd_le32`/`rd_le64` and written with byte shifts, so the format handling is byte-order
   explicit — but that is code hygiene (one reader for one format, after eighteen open-coded

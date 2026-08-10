@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.75";
+static constexpr const char * GZSTD_VERSION = "0.15.77";
 //
 // Architecture overview:
 //
@@ -4528,7 +4528,17 @@ static void adapt_warn_save_failed(const Options & opt, const std::string & why)
 static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
 {
   const std::string path = adapt_profile_path();
-  if (path.empty()) return;
+  // NO PATH AT ALL is a persistence failure like any other, and it returned here
+  // silently — BEFORE the four instrumented I/O failures below, so the warning
+  // added for them never fired for it.  With HOME and XDG_CACHE_HOME both unset
+  // (systemd units, minimal containers, `env -i`), a qualifying --adapt run could
+  // never converge and said nothing about why.  Fixing only the failures I had
+  // already thought of is what left this one: the early return WAS the first
+  // failure path.
+  if (path.empty()) {
+    adapt_warn_save_failed(opt, "no cache directory: neither XDG_CACHE_HOME nor HOME is set");
+    return;
+  }
 
   // Serialise the whole READ-MODIFY-WRITE against other gzstd processes.
   //
@@ -7729,6 +7739,53 @@ private:
   uint64_t              t_start_ = 0, t_end_ = 0;
 };
 
+// Build the CPU verify pool for ONE PASS — or nothing, when this pass verifies
+// on the GPU instead.
+//
+// A FREE FUNCTION TAKING ONLY THE PASS'S OPTIONS, and that signature is the
+// point of it.  The compress driver holds two Options in the same scope: `opt`,
+// what the USER ASKED FOR, and `pass_opt`, what THIS PASS IS ACTUALLY DOING.
+// They diverge the moment a GPU fault or a failed GPU verify discards the output
+// and rebuilds CPU-only.  Both spellings compile, and the wrong one usually
+// behaves — so the same misread landed twice:
+//
+//   v0.15.74  `opt.gpu_verify` decided WHETHER to build a pool, so the CPU
+//             rebuild got no CPU pool and had no GPU worker either: --verify
+//             checked nothing, exit 0, and --rm then deleted the source.
+//   v0.15.76  `opt.cpu_only` decided HOW TO SIZE it — three lines below the fix
+//             for the first one, found only by sweeping for it deliberately.
+//
+// Here `opt` is not in scope.  The wrong read is a compile error instead of the
+// next round's finding.  Anything genuinely request-level that this ever needs
+// must be passed as an explicit parameter, which forces the question to be
+// answered at the call site rather than assumed.
+static std::unique_ptr<VerifyPool> build_pass_verify_pool(const Options & pass_opt)
+{
+  // GPU verify (gpu-only) runs inside the GPU worker, not here.
+  if (!pass_opt.verify || pass_opt.gpu_verify) return nullptr;
+
+  const int cores = (pass_opt.cpu_threads > 0)
+      ? pass_opt.cpu_threads
+      : std::max(1, (int)std::thread::hardware_concurrency());
+  // cpu-only: keep verify well clear of the compress pool (≤ cores/16).
+  // hybrid: the GPUs carry the compression, so the CPU pool has spare cores —
+  // raise the ceiling (≤ cores/8) so verify can match the faster hybrid producer
+  // instead of back-pressuring it (it hit the old cap of 16 and still fell behind
+  // on an 8-GPU box — though that turned out to be bursty GPU delivery
+  // overflowing the verify queue, not a lack of threads; verify has spare
+  // capacity there).  The rate-matched `helped` guard in maybe_grow halts growth
+  // once an added thread stops raising drain, so a higher ceiling only costs
+  // threads when they actually help.
+  const int vmax = pass_opt.cpu_only ? std::clamp(cores / 16, 2, 16)
+                                     : std::clamp(cores / 8,  4, 32);
+  // Queue depth is sized to available RAM so it can buffer the GPU's bursty
+  // delivery instead of back-pressuring the writer; shallow on limited-RAM
+  // boxes, deep on big ones.
+  size_t frame_est = std::max<size_t>(pass_opt.chunk_mib, 1) * ONE_MIB;   // worst-case frame
+  if (!pass_opt.cpu_only) frame_est = std::min(frame_est, GPU_SUBCHUNK_MAX);  // GPU frames ≤ 16 MiB
+  return std::make_unique<VerifyPool>(vmax, compute_verify_queue_depth(frame_est, pass_opt));
+}
+
 // Set by the compress driver while a --verify run is in flight; the writer's
 // in-order drain taps each finished frame into it.  null = verification off.
 static VerifyPool * g_verify_pool = nullptr;
@@ -8985,8 +9042,10 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   // frames plus a broken one stays fatal rather than decoding to silence.
   unsigned char head[8]; size_t head_n = 0;
   uint64_t cur_len = 0, data_frames = 0;
+  bool decode_broke = false;   // --keep-going: stop reading, keep what we wrote
 
   for (;;) {
+    if (decode_broke) break;
     size_t n = std::fread(inbuf.data(), 1, IO_CHUNK, in);
     if (n == 0) { check_read_error(in, opt.input); break; }  // EOF (not an error)
     total_in_bytes += n;
@@ -8997,6 +9056,15 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
       const size_t consumed_from = zin.pos;
       ret = ZSTD_decompressStream(dctx, &zout, &zin);
       if (ZSTD_isError(ret)) {
+        // The old message here told the user to "re-run with --keep-going" —
+        // from a decoder that ignored --keep-going, so following that advice
+        // produced the same exit 4 and the same nothing.  Honour it instead.
+        if (opt.keep_going) {
+          g_damage.set_framing_break(data_frames, m ? m->wrote_bytes.load() : 0,
+              std::string("frame decode failed: ") + ZSTD_getErrorName(ret));
+          decode_broke = true;
+          break;
+        }
         ZSTD_freeDCtx(dctx);
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
                + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
@@ -9031,7 +9099,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
       }
     }
   }
-  if (ret > 0) {
+  if (ret > 0 && !decode_broke) {
     // A truncated trailing SKIPPABLE frame is gzstd's own damaged index/seek
     // table and is recoverable for -d/-l (see trailing_skippable_tolerated —
     // which also rejects it for -t, and rejects it outright when no data frame
@@ -9039,6 +9107,17 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
     if (trailing_skippable_tolerated(opt, data_frames, head,
                                      (size_t)std::min<uint64_t>(cur_len, SIZE_MAX))) {
       warn_damaged_trailer(opt, (size_t)cur_len);
+    } else if (opt.keep_going) {
+      // --keep-going MUST MEAN THE SAME THING ON EVERY ROUTE.  The splitter
+      // records a framing break here and exits 7 with the recovered output; this
+      // decoder called die_data unconditionally, so the identical damage gave
+      // exit 4 and no recovery whenever dispatch chose the streaming path (a
+      // sizeless first frame, or one over SINGLE_FRAME_STREAM_MIN).  An option
+      // whose contract depends on the input's frame geometry is not a contract.
+      // Everything decoded so far has already been written; stop cleanly and let
+      // the driver report the damage and pick the exit code.
+      g_damage.set_framing_break(data_frames, m ? m->wrote_bytes.load() : 0,
+          "truncated zstd stream: the final frame is incomplete");
     } else {
       ZSTD_freeDCtx(dctx);
       die_data("truncated zstd stream (expected more data)");
@@ -10817,7 +10896,11 @@ static size_t stream_frames_to_queue_mt(
       rd_ctl.supervise([&] { return readers_done_early.load(std::memory_order_relaxed); });
     });
 
-  size_t seq = 0, max_frame_decomp = 0;
+  // seq counts DATA frames; total_frames counts every complete frame,
+  // skippable included.  The sequential splitter keeps the same pair for the
+  // same reason — asking `seq` "did any frame exist" is wrong for a stream of
+  // skippable frames, which is valid and carries no data.
+  size_t seq = 0, total_frames = 0, max_frame_decomp = 0;
   std::vector<char> carry;            // straddling-frame bytes from prior block(s)
   uint64_t carry_origin = 0;          // absolute file offset of carry[0] (for the fallback offset)
   bool aborted = false;
@@ -10844,6 +10927,7 @@ static size_t stream_frames_to_queue_mt(
       return false;
     }
     Task t; t.seq = seq++;
+    ++total_frames;
     uint64_t cp = m ? now_ns() : 0;
     t.data.assign(p, p + fc);
     if (m) m->reader_copy_ns.fetch_add(now_ns() - cp, std::memory_order_relaxed);
@@ -10889,7 +10973,8 @@ static size_t stream_frames_to_queue_mt(
             size_t step = std::min(STEP, len - appended);
             carry.insert(carry.end(), data + appended, data + appended + step); appended += step;
           }
-          if (carry.size() >= need) { pos = need - old; carry.clear(); resolved = true; }  // skipped
+          if (carry.size() >= need) { pos = need - old; carry.clear(); resolved = true;
+                                      ++total_frames; }                       // skipped
         }
       } else {
         // Complete a normal frame that straddled into this block.  zstd has no
@@ -10936,7 +11021,7 @@ static size_t stream_frames_to_queue_mt(
         const uint32_t ss = rd_le32(p + 4);
         size_t tot = 8 + (size_t)ss;
         if (tot > rem) { carry.assign(p, p + rem); break; }  // straddles
-        pos += tot; continue;
+        pos += tot; ++total_frames; continue;
       }
       uint64_t ps = m ? now_ns() : 0;
       size_t fc = ZSTD_findFrameCompressedSize(p, rem);
@@ -10978,7 +11063,8 @@ static size_t stream_frames_to_queue_mt(
   // this an empty .zst exited 0 here even after the sequential splitter learned
   // to reject it (that path only serves stdin/pipes).  Same defect, second
   // reader — the two must agree on what a valid stream is.
-  if (!aborted && !failed.load(std::memory_order_relaxed) && seq == 0 && carry.empty())
+  if (!aborted && !failed.load(std::memory_order_relaxed)
+      && total_frames == 0 && carry.empty())
     fail("not a valid zstd stream (no frames found)");
 
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
@@ -11135,7 +11221,14 @@ static size_t stream_frames_to_queue(
   size_t buf_len = 0;    // valid data in buf[0..buf_len)
   size_t buf_off = 0;    // parse cursor within buf
 
-  size_t seq = 0;
+  // THREE SEPARATE COUNTS, deliberately.  `seq` is DATA frames queued for the
+  // workers, and it was doing double duty as "did any frame exist at all" — which
+  // is false for a stream of skippable frames, a shape stock zstd accepts.  That
+  // conflation made `printf '\x50\x2a\x4d\x18\0\0\0\0' | gzstd -t` exit 4 while
+  // the identical bytes in a NAMED file exited 0, because the named route uses a
+  // different reader.  Trailing state is tracked separately again below.
+  size_t seq = 0;             // DATA frames handed to the workers
+  size_t total_frames = 0;    // every complete frame, skippable included
   uint64_t out_off_acc = 0;   // --keep-going: running decompressed-output offset
   bool eof = false;
 
@@ -11244,6 +11337,7 @@ static size_t stream_frames_to_queue(
           size_t total_skip = 8 + (size_t)skip_size;
           if (total_skip > remaining) break;  // need more data
           buf_off += total_skip;
+          ++total_frames;            // a complete frame, just not a DATA one
           continue;
         }
       }
@@ -11338,6 +11432,7 @@ static size_t stream_frames_to_queue(
       // Complete frame with known sizes -- push to the queue
       Task t;
       t.seq = seq++;
+      ++total_frames;
       uint64_t cp_t0 = m ? now_ns() : 0;
       t.data.assign(ptr, ptr + frame_comp);   // copy compressed bytes out of the parse buffer
       if (m) m->reader_copy_ns.fetch_add(now_ns() - cp_t0, std::memory_order_relaxed);
@@ -11379,27 +11474,27 @@ static size_t stream_frames_to_queue(
     warn_damaged_trailer(opt, leftover);
     leftover = 0;
   }
-  // NOTE the missing `&& seq > 0` that used to guard this.  Zero frames plus a
-  // non-empty leftover fell between all three checks here: the tolerance above
-  // needed seq > 0, this needed seq > 0, and the no-frames check below needed
-  // leftover == 0.  So `printf '\x50\x2a\x4d\x18' | gzstd -t` — four bytes of
-  // skippable magic and nothing else — broke out of the parse loop at
-  // `remaining < 8`, matched no check, and returned zero frames as SUCCESS,
-  // printing "OK" on a file stock zstd rejects.  Both zero-frame shapes are now
-  // reported by the one branch below.
-  if (leftover > 0 && seq > 0) {
+  // TRAILING BYTES, judged against TOTAL frames — not against `seq`.
+  //
+  // The guard here used to be `seq > 0`, so trailing garbage behind a stream of
+  // skippable frames matched nothing and returned success.  Widening it to
+  // "always" (v0.15.75) closed that but broke the opposite case, because the
+  // no-frames check below then fired for a valid all-skippable stream.  Both
+  // errors came from ONE cause: `seq` counts DATA frames and was being asked
+  // "did any frame exist at all", which are different questions.
+  if (leftover > 0 && total_frames > 0) {
     if (opt.keep_going) {
       g_damage.set_framing_break((uint64_t)seq, out_off_acc,
           std::to_string(leftover) + " trailing bytes after frame "
-          + std::to_string(seq) + " cannot form a valid frame");
+          + std::to_string(total_frames) + " cannot form a valid frame");
     } else {
       die_data("truncated zstd stream: " + std::to_string(leftover)
-               + " trailing bytes after " + std::to_string(seq)
+               + " trailing bytes after " + std::to_string(total_frames)
                + " frame(s) do not form a valid frame");
     }
   }
-  // NO COMPLETE FRAME AT ALL — with or without leftover bytes.  Two distinct
-  // shapes reach here and BOTH used to return success:
+  // NO COMPLETE FRAME OF ANY KIND — with or without leftover bytes.  Two shapes
+  // reach here and both used to return success:
   //
   //   * zero bytes: an empty input never enters the parse loop, so the "no frame
   //     found" branch inside it cannot fire — the first read returns 0, eof is
@@ -11408,12 +11503,16 @@ static size_t stream_frames_to_queue(
   //
   //   * a few bytes that never became a frame: the loop broke early (too short
   //     for a magic, or a skippable header cut mid-way) rather than reaching the
-  //     in-loop verdict, leaving seq == 0 with a non-empty leftover.
+  //     in-loop verdict.  `printf '\x50\x2a\x4d\x18' | gzstd -t` printed OK.
   //
-  // Neither is a stream to fall back on.  A FOREIGN or unknown-content-size
-  // stream cannot reach here: that verdict is reached inside the loop, which
-  // sets *fallback and returns before this point.
-  if (seq == 0) {
+  // `total_frames`, NOT `seq`: a stream of nothing but COMPLETE skippable frames
+  // carries no data but is perfectly valid — stock zstd accepts it, and so does
+  // gzstd's own named-file route — so it must decode to empty output here too,
+  // rather than being rejected because no DATA frame happened to appear.
+  //
+  // A FOREIGN or unknown-content-size stream cannot reach here: that verdict is
+  // reached inside the loop, which sets *fallback and returns before this point.
+  if (total_frames == 0) {
     if (opt.keep_going) {
       g_damage.set_framing_break(0, 0, "input contains no zstd frame");
     } else {
@@ -12493,21 +12592,34 @@ static bool tar_entry_is_the_archive(const struct stat & st)
 
 // Does `path` live inside any of these directories, by IDENTITY?
 //
-// Walks the parent chain upward with openat("..") and compares (st_dev, st_ino)
-// at every level.  The string equivalent — comparing canonical path prefixes —
-// is defeated by any alias that is not a symlink, because canonicalization
-// resolves symlinks and knows nothing about mount points.  A bind mount is the
-// practical case: `mount --bind root alias` makes alias/data and root/data the
-// same inode under two paths that share no prefix.  Inode identity sees through
-// it, since a bind mount shares the superblock.
+// TRI-STATE, and that is the whole point.  The first version of this returned a
+// bool, which forced every way of NOT KNOWING — an unopenable parent, a chain
+// longer than the bound, a failed fstat — to be reported as "outside", i.e. as
+// permission to proceed with a destructive overwrite.  That is the same
+// fail-open shape as the `weakly_canonical` version it replaced, which silently
+// skipped the check whenever canonicalization errored; I fixed the mechanism and
+// reproduced the failure mode in a new spelling.  A safety check that cannot
+// reach a verdict must say so, and the caller must refuse.
 //
-// Starts at the PARENT: the output may not exist yet, and the output itself is
-// compared by identity elsewhere.  Returns false if the chain cannot be walked
-// (a missing parent means nothing can be created there either).
-static bool path_is_inside_dir_ids(const std::string & path,
-                                   const std::vector<std::pair<dev_t, ino_t>> & dir_ids)
+// Identity, not paths: canonicalization resolves symlinks but knows nothing about
+// MOUNTS, so `mount --bind root alias` makes alias/data and root/data the same
+// inode under two paths sharing no prefix.  A bind mount shares the superblock,
+// so (st_dev, st_ino) match and the upward walk sees through it.
+//
+// Starts at the PARENT: the output may not exist yet.
+enum class Containment { OUTSIDE, INSIDE, UNKNOWN };
+
+// Deep, but finite: a chain longer than this is either a pathological mount
+// arrangement or an attempt to walk past the bound to force a verdict.  Either
+// way the answer is UNKNOWN, never OUTSIDE.  PATH_MAX/2 single-character
+// components is the practical ceiling, so this cannot be reached by an ordinary
+// tree while still bounding the loop.
+static constexpr int CONTAINMENT_MAX_DEPTH = 4096;
+
+static Containment path_containment(const std::string & path,
+                                    const std::vector<std::pair<dev_t, ino_t>> & dir_ids)
 {
-  if (dir_ids.empty()) return false;
+  if (dir_ids.empty()) return Containment::OUTSIDE;   // nothing to be inside of
 
   const size_t slash = path.find_last_of('/');
   const std::string start = (slash == std::string::npos) ? std::string(".")
@@ -12515,31 +12627,31 @@ static bool path_is_inside_dir_ids(const std::string & path,
                                                          : path.substr(0, slash);
 
   int fd = ::open(start.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
-  if (fd < 0) return false;
+  if (fd < 0) return Containment::UNKNOWN;
 
-  // Bounded: a symlink-free parent chain is finite, but the bound keeps a
-  // pathological mount arrangement from spinning.
-  for (int depth = 0; depth < 256; ++depth) {
+  for (int depth = 0; depth < CONTAINMENT_MAX_DEPTH; ++depth) {
     struct stat here;
-    if (::fstat(fd, &here) != 0) { ::close(fd); return false; }
+    if (::fstat(fd, &here) != 0) { ::close(fd); return Containment::UNKNOWN; }
     for (const auto & id : dir_ids)
-      if (here.st_dev == id.first && here.st_ino == id.second) { ::close(fd); return true; }
+      if (here.st_dev == id.first && here.st_ino == id.second) {
+        ::close(fd); return Containment::INSIDE;
+      }
 
     const int up = ::openat(fd, "..", O_PATH | O_DIRECTORY | O_CLOEXEC);
     ::close(fd);
-    if (up < 0) return false;
+    if (up < 0) return Containment::UNKNOWN;
     struct stat above;
-    // "/.." is "/" — identical identity means we reached the top and must stop,
-    // or we would loop until the depth bound.
-    if (::fstat(up, &above) != 0
-        || (above.st_dev == here.st_dev && above.st_ino == here.st_ino)) {
+    if (::fstat(up, &above) != 0) { ::close(up); return Containment::UNKNOWN; }
+    // "/.." is "/" — identical identity means we reached the top.  This is the
+    // ONE exit that legitimately means OUTSIDE: we saw every ancestor.
+    if (above.st_dev == here.st_dev && above.st_ino == here.st_ino) {
       ::close(up);
-      return false;
+      return Containment::OUTSIDE;
     }
     fd = up;
   }
   ::close(fd);
-  return false;
+  return Containment::UNKNOWN;                        // bound hit: no verdict
 }
 
 // --tar create: the member index's globals (g_tar_index_raw and the frame
@@ -15986,6 +16098,9 @@ private:
   // q_max_bytes_ regardless of how far the pool grows, instead of scaling with
   // the core count.  Derived, not tuned.
   size_t bounce_sz_ = BOUNCE_CAP;
+  // Like is_all_zero's word loop, this is deliberately NOT an rd_le64: the word
+  // is only tested against zero, which is the same value in every byte order,
+  // and it reads a data block rather than an on-disk integer field.
   static bool blk_zero_4k(const char * p) {
     const uint64_t * w = reinterpret_cast<const uint64_t *>(p);   // word-wise scan
     for (size_t i = 0; i < LD_ALIGN / sizeof(uint64_t); ++i) if (w[i]) return false;
@@ -24480,12 +24595,42 @@ static int gzstd_main(int argc, char ** argv)
       // Identity is immune to that: a bind mount shares the superblock, so
       // alias and root report the same (st_dev, st_ino).  It also removes the
       // silent skip the string form had when canonicalization failed.
-      if (!tar_overwrite_dir_ids.empty()
-          && path_is_inside_dir_ids(opt.output, tar_overwrite_dir_ids)) {
-        for (int f : tar_src_fds) ::close(f);
-        die_usage("--overwrite would delete the archive from inside a --tar "
-                  "source directory (" + opt.output
-                  + "); write it elsewhere or use -f");
+      // ...and it is TRI-STATE: INSIDE and UNKNOWN both refuse.  Treating "could
+      // not determine" as "outside" is how the previous two versions of this
+      // guard failed, in two different spellings.
+      //
+      // The output is also checked through its RESOLVED target when it is an
+      // existing symlink.  A symlink at the output name whose target lives inside
+      // a source is outside the sources by its own parent chain, so the walk
+      // above cannot see it; resolving it is what closes that.  (The unlink below
+      // is separately fatal if it fails, which stops the same symlink from
+      // surviving to be followed by the open — belt and braces, because that
+      // failure is what actually destroyed a file in review round 7.)
+      if (!tar_overwrite_dir_ids.empty()) {
+        std::vector<std::string> to_check{opt.output};
+        struct stat lst;
+        if (::lstat(opt.output.c_str(), &lst) == 0 && S_ISLNK(lst.st_mode)) {
+          std::error_code ec_rl;
+          const fs::path tgt = fs::weakly_canonical(opt.output, ec_rl);
+          if (ec_rl) {
+            for (int f : tar_src_fds) ::close(f);
+            die_usage("--overwrite: cannot resolve the output symlink "
+                      + opt.output + " to prove it is outside a --tar source");
+          }
+          to_check.push_back(tgt.string());
+        }
+        for (const std::string & cand : to_check) {
+          const Containment c = path_containment(cand, tar_overwrite_dir_ids);
+          if (c == Containment::OUTSIDE) continue;
+          for (int f : tar_src_fds) ::close(f);
+          if (c == Containment::INSIDE)
+            die_usage("--overwrite would delete the archive from inside a --tar "
+                      "source directory (" + cand
+                      + "); write it elsewhere or use -f");
+          die_io("--overwrite: cannot determine whether " + cand
+                 + " lies inside a --tar source directory, and refusing is the "
+                   "only safe answer; write the archive elsewhere or use -f");
+        }
       }
       // Cheap pre-check so the common mistake reports the SOURCE NAME rather than
       // the output name; the fd comparison below is what actually closes the race.
@@ -24561,10 +24706,34 @@ static int gzstd_main(int argc, char ** argv)
               ::close(ofd);
             }
           }
+          // A FAILED UNLINK HERE IS FATAL.  This is not merely "make room" — it
+          // is the step that NEUTRALISES a symlink sitting at the output name.
+          // Falling through on failure meant the symlink survived and the open
+          // below followed it, which is exactly how review round 7 destroyed a
+          // file inside a tar source with no root and no race:
+          //
+          //     ln -s root/data alias/out; chmod a-w alias
+          //     gzstd --overwrite -o alias/out --tar root
+          //
+          // The containment walk cleared alias/out (its own parent chain is
+          // outside the source), fs::remove failed on the unwritable directory
+          // and was IGNORED, and open_output_verified then followed the surviving
+          // link and truncated root/data — exit 0, source gone.  The old comment
+          // said fopen "will return its own error"; it did not, because the open
+          // succeeded on the wrong file.
+          //
+          // Judge by the NAME, not by the return value: fs::remove reports false
+          // both for "did not exist" (fine) and for some failures, so re-lstat and
+          // require that nothing is there.
           std::error_code ec_unlink;
           fs::remove(opt.output, ec_unlink);
-          // If unlink failed (permissions, race), fall through to fopen "wb"
-          // which will return its own error.
+          struct stat still;
+          if (::lstat(opt.output.c_str(), &still) == 0) {
+            for (int f : tar_src_fds) ::close(f);
+            die_io("--overwrite: cannot remove the existing output " + opt.output
+                   + (ec_unlink ? " (" + ec_unlink.message() + ")" : "")
+                   + "; refusing to write through whatever remains at that name");
+          }
         }
         out = open_output_verified(opt.output, in, &tar_src_ids);
         if (is_regular) register_tmp_file(opt.output);
@@ -24583,7 +24752,14 @@ static int gzstd_main(int argc, char ** argv)
   // Every output route converges here, which is the point — attaching this to
   // one of the branches above is how features in this file end up covering some
   // paths and not others.
-  if (opt.tar_mode && opt.mode == Mode::COMPRESS && out && out != stdout) {
+  // `out` INCLUDING stdout, deliberately.  Excluding it left the same defect
+  // reachable by redirection — `gzstd --tar root > root/archive.tar.zst` stored a
+  // zero-length member for the archive it was writing — because a redirected
+  // stdout is an ordinary regular file inside the tree, and the walk has no way
+  // to know it is the destination. S_ISREG below is the whole test: a pipe or a
+  // terminal has no inode the walk could collide with, so it simply does not
+  // match, and no special case is needed for it.
+  if (opt.tar_mode && opt.mode == Mode::COMPRESS && out) {
     struct stat os_;
     if (::fstat(fileno(out), &os_) == 0 && S_ISREG(os_.st_mode))
       g_tar_output_ids.emplace_back(os_.st_dev, os_.st_ino);
@@ -24789,6 +24965,14 @@ static int gzstd_main(int argc, char ** argv)
             const size_t got = ZSTD_decompress(probe, sizeof probe, ebuf, ecsz);
             if (ZSTD_isError(got) || got != 0 || dsz != 0)
               die_data("--verify: the generated empty frame does not round-trip");
+            // SAY SO when the engine the user picked is not the one that ran.
+            // An empty input produces no GPU work at all — this 13-byte frame is
+            // generated on the CPU — so `--verify-engine=gpu` prints "engine: GPU"
+            // and then no [GPU-VERIFY] summary ever appears.  Integrity is sound
+            // either way; the misleading part was the silence.
+            if (opt.gpu_verify)
+              vlog(V_VERBOSE, opt, "[VERIFY] empty input: no GPU work to verify; "
+                   "the generated empty frame was checked on the CPU\n");
           }
         }
 #ifndef _WIN32
@@ -24823,37 +25007,8 @@ static int gzstd_main(int argc, char ** argv)
       //   * queue depth — sized to available RAM so it can buffer the GPU's bursty
       //     delivery instead of back-pressuring the writer (see
       //     compute_verify_queue_depth); shallow on limited-RAM boxes, deep on big.
-      std::unique_ptr<VerifyPool> vpool;
-      // pass_opt, NOT opt.  "GPU verify runs in the GPU worker, so this pass
-      // needs no CPU pool" is a statement about THIS PASS's backend, and the
-      // backend changes underneath it: a GPU fault or a failed GPU verify
-      // discards the output and rebuilds CPU-only.  Reading the original opt
-      // meant the rebuild pass saw gpu_verify still true, built no CPU pool —
-      // and had no GPU worker either — so `--verify` checked NOTHING on the
-      // rebuild and exited 0.  With --rm that deleted the source after a
-      // verification that never ran.  The rebuild clears pass_opt.gpu_verify
-      // below; both halves are required, and either alone is a no-op.
-      if (pass_opt.verify && !pass_opt.gpu_verify) {
-        const int cores = (opt.cpu_threads > 0)
-            ? opt.cpu_threads
-            : std::max(1, (int)std::thread::hardware_concurrency());
-        // cpu-only: keep verify well clear of the compress pool (≤ cores/16).
-        // hybrid: the GPUs carry the compression, so the CPU pool has spare
-        // cores — raise the ceiling (≤ cores/8) so verify can match the faster
-        // hybrid producer instead of back-pressuring it (it hit the old cap of
-        // 16 and still fell behind on an 8-GPU box — though that turned out to be
-        // bursty GPU delivery overflowing the verify queue, not a lack of threads;
-        // verify has spare capacity there).  The rate-matched `helped` guard in
-        // maybe_grow halts growth once an added thread stops raising drain, so a
-        // higher ceiling only costs threads when they actually help.
-        const int vmax = opt.cpu_only ? std::clamp(cores / 16, 2, 16)
-                                      : std::clamp(cores / 8,  4, 32);
-        size_t frame_est = std::max<size_t>(opt.chunk_mib, 1) * ONE_MIB;  // worst-case frame size
-        if (!opt.cpu_only) frame_est = std::min(frame_est, GPU_SUBCHUNK_MAX);   // GPU frames ≤ 16 MiB
-        const size_t vqueue = compute_verify_queue_depth(frame_est, opt);
-        vpool = std::make_unique<VerifyPool>(vmax, vqueue);
-        g_verify_pool = vpool.get();
-      }
+      std::unique_ptr<VerifyPool> vpool = build_pass_verify_pool(pass_opt);
+      if (vpool) g_verify_pool = vpool.get();
 
       run_one_pass(pass_opt);
 
@@ -25032,8 +25187,7 @@ static int gzstd_main(int argc, char ** argv)
       unsigned char magic[4] = {0};
       size_t nr = std::fread(magic, 1, 4, in);
       if (nr == 4) {
-        uint32_t m32 = 0;
-        std::memcpy(&m32, magic, 4);
+        const uint32_t m32 = rd_le32(magic);
         bool is_zstd = (m32 == 0xFD2FB528u);
         bool is_skip = ((m32 & 0xFFFFFFF0u) == 0x184D2A50u);
         if (!is_zstd && !is_skip) {

@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.75  
+**Covers:** v0.9.50 → v0.15.77  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,124 @@
 ---
 
 
+## v0.15.77 — fixing the pattern instead of the findings
+
+Round 7 rejected five of my round-6 fixes and asked the question that mattered more than
+the list: *is this converging?* Its answer was precise —
+
+> *"The original defect set is converging, but this fix series is still generating fix-local
+> follow-ons… The failures cluster around **invariants being represented by the wrong state
+> or checked at only one spelling of a path**."*
+
+— and it prescribed four structural changes rather than five patches. This release makes
+those changes. Each one turns a class of defect into something that cannot recur silently,
+rather than repairing the instance that was found.
+
+**A safety check that cannot reach a verdict must say so.** The `--tar` containment guard
+returned a bool, which forced every way of NOT KNOWING — an unopenable parent, a chain past
+the depth bound, a failed `fstat` — to be reported as "outside", i.e. as permission to
+destroy. That is the same fail-open shape as the `weakly_canonical` version it replaced,
+which silently skipped whenever canonicalization errored: I fixed the mechanism in v0.15.74
+and reproduced the failure mode in a new spelling. It is now tri-state — `INSIDE`, `OUTSIDE`,
+`UNKNOWN` — and only `OUTSIDE` proceeds. There is exactly one exit that may return `OUTSIDE`:
+having walked every ancestor to the filesystem root.
+
+**And the destructive step's FAILURE must be fatal.** Round 7's trigger needed no root, no
+bind mount and no race:
+
+```
+ln -s root/data alias/out ; chmod a-w alias
+gzstd --overwrite -o alias/out --tar root      → exit 0, root/data destroyed
+```
+
+The containment walk cleared `alias/out` — its own parent chain really is outside the source
+— then `fs::remove` failed on the unwritable directory and **the failure was ignored**, so the
+symlink survived and the open followed it into `root/data`. The old comment said the fopen
+"will return its own error"; it did not, because the open succeeded on the wrong file. That
+unlink is not "make room", it is what neutralises a symlink at the output name, and a failed
+neutralising step is now fatal. The containment check separately resolves an existing output
+symlink, so both halves have to fail before anything is destroyed. Measured: 27 bytes of
+source content intact where v0.15.76 replaced them with 227 bytes of archive.
+
+**The `opt` / `pass_opt` misread is now a compile error.** The compress driver holds both what
+the user asked for and what this pass is doing; they diverge the moment a GPU fault rebuilds
+CPU-only. Both spellings compile and the wrong one usually behaves, which is why the same
+misread landed twice — v0.15.74 for *whether* to build a verify pool (the rebuild went
+unverified), v0.15.76 for *how to size it*, three lines below the first fix. Pool construction
+now lives in a free function that receives **only** the pass's options. `opt` is not in scope
+there. Anything genuinely request-level has to be passed as an explicit parameter, which
+forces the question to be answered rather than assumed.
+
+**`seq` counted DATA frames and was being asked "did any frame exist at all".** Two different
+questions, one variable, and both possible answers were wrong at different times: the original
+guard let trailing garbage behind a skippable-only stream pass, and widening it in v0.15.75
+then rejected a *valid* skippable-only stream — so `printf '\x50\x2a\x4d\x18\0\0\0\0' | gzstd
+-t` exited 4 while the identical bytes in a named file exited 0. Both readers now track `seq`
+and `total_frames` separately. A stream of complete skippable frames is valid on every route
+(stock zstd agrees); a truncated stub is fatal on every route.
+
+**A mechanical check replaces the audit that kept missing sites.** `scripts/check-endian-reads.sh`
+fails CI on any host-order read of an on-disk integer, and it exists because inspection
+demonstrably does not work here: v0.15.75's sweep left two sites that `pread` straight into a
+`uint32_t` (a grep for `memcpy` cannot see a `pread`), and round 7 found a third,
+`memcpy(&m32, magic, 4)` — my audit pattern had been `memcpy\(&[a-z_]+,` and the **digit** in
+`m32` fell outside the character class. The first draft of the checker then failed its own
+test by listing readers *by name*, missing `pr(&magic, 4, pos)` where `pr` is a local lambda —
+the same mistake a third time. It matches the **shape** now: any call whose first argument is
+the address of a scalar and whose arguments contain a bare 4 or 8. Verified to catch both
+historical misses and to pass clean on the current tree.
+
+Also closed, from the same round: a redirected stdout is registered as the archive's identity,
+so `gzstd --tar root > root/a.tar.zst` no longer stores a zero-length member for itself
+(`S_ISREG` is the whole test — a pipe has no inode to collide with); `--adapt` warns when it
+has **no cache directory at all** (`HOME` and `XDG_CACHE_HOME` both unset returned before the
+four instrumented failure points, so the warning added for them never fired for the first
+failure path); `--keep-going` now recovers on the single-frame streaming route, which had
+called `die_data` unconditionally while telling the user to re-run with `--keep-going` —
+measured, 2,995,004 of 3,000,000 bytes recovered at exit 7 where it previously recovered
+nothing at exit 4; and `--verify-engine=gpu` on an empty input says that the 13-byte frame was
+checked on the CPU instead of printing "engine: GPU" and going quiet.
+
+Six of round 7's items were **confirmed**, including the streaming frame-tracking added in
+v0.15.75 that I had flagged as the fix I trusted least.
+
+Suite: **387** (520 extensive), green on both build configurations.
+
+---
+## v0.15.76 — the same misread, three lines below its own fix
+
+Not a review finding. Sweeping the compress retry loop for other `opt.` reads that should be
+`pass_opt.` — the distinction v0.15.74 fixed for the verify pool's *existence* — turned up two
+more in the pool's own **sizing**, inside the block that fix had just edited:
+
+```
+const int vmax = opt.cpu_only ? clamp(cores/16, 2, 16) : clamp(cores/8, 4, 32);
+size_t frame_est = max(opt.chunk_mib, 1) * ONE_MIB;
+if (!opt.cpu_only) frame_est = min(frame_est, GPU_SUBCHUNK_MAX);
+```
+
+On a CPU rebuild after a GPU fault, `opt.cpu_only` is still false. So `vmax` took the hybrid
+branch — *"the GPUs carry the compression, so the CPU pool has spare cores"* — while the CPU
+was in fact carrying it, and `frame_est` clamped to the GPU subchunk size for frames that are
+now `chunk_mib`-sized. Sizing only, not correctness: the rebuild still verifies, just with a
+pool ceiling and queue depth computed for a pass that is not the one running.
+
+Worth recording for what it says about the defect rather than its severity. `opt` and
+`pass_opt` are both in scope, both spellings compile, and the wrong one usually behaves — so
+the misread survived the fix written for it, three lines away. The rule is: any read
+describing **what this pass is doing** must be `pass_opt`; any read describing **what the user
+asked for** must be `opt`. That is not enforceable by the type system as the code stands, and
+a structural fix (a pass-scoped view that makes the wrong read not compile) is the real
+answer if this recurs a third time.
+
+Also: the second all-zeros word scan (`blk_zero_4k`) is annotated like the first, recording
+that it is deliberately not an `rd_le64` — it tests a word against zero, which is the same
+value in every byte order, and reads a data block rather than an on-disk field. Both are now
+labelled so the next endianness audit does not have to re-derive it.
+
+Suite: **383** (516 extensive), green on both build configurations.
+
+---
 ## v0.15.75 — closing the round-6 remainder, and one reader for one format
 
 v0.15.74 fixed round 6's two HIGH findings and left four smaller ones open on the grounds
