@@ -140,15 +140,25 @@ silently compiled out.
 - The GPU decode pool spawns lazily (only when the CPU pool is maxed, still starved, and
   enough work remains to outlast ~4 s of `cuInit`) to avoid a speculative VRAM grab.
 - The tar parse is serial by design; large files become windowed part-jobs on the pool.
-- **A truncated trailing SKIPPABLE frame warns and falls back instead of failing** — the
-  one place gzstd is deliberately *more* permissive than stock zstd (v0.15.73). Every other
-  trailing byte is fatal, matching zstd. The reasoning: a skippable frame carries no user
-  data, so a clipped one at EOF cannot hide missing content, and gzstd's own index /
-  seek-table trailer *is* a skippable frame whose damage is documented to fall back to the
-  decompress walk. Losing it costs an optimization, not data. The predicate is
-  `trailing_is_truncated_skippable` and it carries the rationale inline. This is a conscious
-  trade against the drop-in goal, not an oversight — but the *silence* of it (the warning is
-  `-v`-only, so `-t` exits 0 with no output on a file stock zstd rejects) is fair to argue.
+- **A truncated trailing SKIPPABLE frame is recoverable for `-d`, fatal for `-t` and `-l`**
+  (v0.15.75; v0.15.73 tolerated it everywhere, which was wrong). A skippable frame carries no
+  user data, so a clipped one at EOF cannot hide missing content, and gzstd's own index /
+  seek-table trailer *is* a skippable frame — losing it costs an optimization, not data. So
+  `-d` recovers every byte and **warns at default verbosity**. But `-t` and `-l` answer *"is
+  this file intact"*, not *"get my data out"*, and a physically truncated file is not intact
+  however much of it is recoverable — they exit non-zero, agreeing with stock zstd on every
+  malformed shape. The split lives in `trailing_skippable_tolerated`, which is the ONE place
+  all four readers ask; the previous divergence between three of them is what let `gzstd -t`
+  pass a damaged archive for five review rounds. Tolerance also requires that at least one
+  DATA frame was recovered, so a stream that is nothing but a broken trailer stays fatal.
+- **Little-endian only, asserted at build time.** Every on-disk integer is read through
+  `rd_le32`/`rd_le64` and written with byte shifts, so the format handling is byte-order
+  explicit — but that is code hygiene (one reader for one format, after eighteen open-coded
+  host-order `memcpy`s and three duplicate reader lambdas), *not* a claim of big-endian
+  support. There is no BE hardware here to validate on, and a missed site is invisible on a
+  LE host, so a `static_assert` fails the build rather than shipping an untested claim. Do
+  not report the assert as a portability defect; do report any new `memcpy(&scalar, …)` read
+  of an on-disk field, which is the thing it cannot catch.
 - `--gpu-only` deliberately records no `--adapt` backend rate.
 - Test hooks (`GZSTD_DEBUG_*`) are set by the suite on purpose — notably
   `GZSTD_DEBUG_GPU_MIN_BYTES=0`, without which the GPU paths stop being covered at all.

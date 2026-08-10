@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=380
-$EXTENSIVE && EXPECTED_TESTS=513
+EXPECTED_TESTS=383
+$EXTENSIVE && EXPECTED_TESTS=516
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -3296,6 +3296,29 @@ else
   fail "second run merges (runs: 2, one fingerprint)"
 fi
 
+# 2b. A profile that CANNOT be persisted must say so at DEFAULT verbosity.  The
+#     failure paths (no lock, no temp file, write, rename) all logged at -v only,
+#     so on a read-only cache dir or a filesystem whose flock does nothing,
+#     --adapt silently never converged and looked exactly like "still learning".
+#     It must also stay silent when the save succeeds, and under -qq.
+apw_ok=1
+chmod a-w "$APROF_XDG/gzstd"
+apw=$(env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --cpu-only -k -f \
+        "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>&1 >/dev/null)
+grep -qa "could not persist its profile" <<<"$apw" || apw_ok=0
+apwq=$(env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --cpu-only -qq -k -f \
+         "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>&1 >/dev/null)
+grep -qa "could not persist" <<<"$apwq" && apw_ok=0
+chmod u+w "$APROF_XDG/gzstd"
+apwc=$(env XDG_CACHE_HOME="$APROF_XDG" $AQ "$GZSTD" --adapt --cpu-only -k -f \
+         "$APROF_SRC" -o "$TMPDIR/aprof.zst" 2>&1 >/dev/null)
+grep -qa "could not persist" <<<"$apwc" && apw_ok=0     # silent when it works
+if [ "$apw_ok" = 1 ]; then
+  pass "--adapt reports a profile it cannot persist"
+else
+  fail "--adapt persistence warning" "ro=[$apw] qq=[$apwq] ok=[$apwc]"
+fi
+
 # The profile carries a SCHEMA EPOCH (gzstd_profile).  A run that finds a different
 # epoch discards the file, so every crafted profile below must claim the CURRENT one
 # or the test would be measuring the reset path instead of what it means to test.
@@ -6035,12 +6058,66 @@ else
   skerr=$("$GZSTD" -d -f -o "$TMPDIR/sk.out" "$TMPDIR/sk_cut.zst" 2>&1) || sk_ok=0
   grep -qa "trailer is damaged" <<<"$skerr" || sk_ok=0               # warned WITHOUT -v
   cmp -s "$TMPDIR/medium.txt" "$TMPDIR/sk.out" || sk_ok=0            # data fully recovered
+  # -l answers the same question -t does ("is this file intact"), so it must
+  # reach the same verdict on the same file.
+  "$GZSTD" -l "$TMPDIR/sk_cut.zst" >/dev/null 2>&1 && sk_ok=0
   if [ "$sk_ok" = 1 ]; then
     pass "damaged trailer: -d recovers and warns by default, -t fails"
   else
     fail "damaged trailer -d/-t split" "err=[$skerr]"
   fi
   rm -f "$TMPDIR/sk.zst" "$TMPDIR/sk_cut.zst" "$TMPDIR/sk.out"
+
+  # 1e-4. -l MUST AGREE WITH -t ON A SHORT TAIL.  Both -l walks stopped without a
+  #     leftover check — the buffered one returned `fsize - pos < 4` outright, the
+  #     mmap one looped on `pos + 4 <= fsize` and simply ran out — so one, two or
+  #     three junk bytes appended to a valid archive made `-l` exit 0 while `-t`
+  #     exited 4 on the very same file.  Two mirrored implementations reaching the
+  #     same wrong answer is not corroboration.  Sweep 1..4 plus a clean control.
+  "$GZSTD" -q -f -o "$TMPDIR/tail.zst" "$TMPDIR/medium.txt" 2>/dev/null
+  tail_ok=1
+  "$GZSTD" -l "$TMPDIR/tail.zst" >/dev/null 2>&1 || tail_ok=0        # clean: must list
+  "$GZSTD" -t "$TMPDIR/tail.zst" >/dev/null 2>&1 || tail_ok=0
+  for nb in 1 2 3 4; do
+    cp "$TMPDIR/tail.zst" "$TMPDIR/tail_n.zst"
+    head -c "$nb" /dev/zero >> "$TMPDIR/tail_n.zst"
+    "$GZSTD" -l "$TMPDIR/tail_n.zst" >/dev/null 2>&1 && tail_ok=0    # both must reject
+    "$GZSTD" -t "$TMPDIR/tail_n.zst" >/dev/null 2>&1 && tail_ok=0
+  done
+  if [ "$tail_ok" = 1 ]; then
+    pass "-l and -t agree on a short trailing tail"
+  else
+    fail "-l/-t short-tail agreement"
+  fi
+  rm -f "$TMPDIR/tail.zst" "$TMPDIR/tail_n.zst"
+
+  # 1e-5. THE TOLERANCE MUST NOT DEPEND ON THE ROUTE.  An archive whose first
+  #     frame has no content-size header (or exceeds SINGLE_FRAME_STREAM_MIN)
+  #     goes to the single-frame streaming decoder rather than the frame
+  #     splitter, and that decoder had no truncated-skippable exception at all —
+  #     so identical damage was recoverable or fatal depending on chunk size.
+  #     A piped `zstd` stream is sizeless, which reaches the same route without
+  #     needing a 256 MiB frame.
+  if command -v zstd >/dev/null 2>&1; then
+    rt_ok=1
+    cat "$TMPDIR/medium.txt" | zstd -q > "$TMPDIR/rt.zst" 2>/dev/null
+    printf '\x5e\x2a\x4d\x18\x11\x00\x00\x00' >> "$TMPDIR/rt.zst"    # skippable hdr, 17B payload
+    head -c 17 /dev/zero >> "$TMPDIR/rt.zst"
+    "$GZSTD" -t "$TMPDIR/rt.zst" >/dev/null 2>&1 || rt_ok=0          # intact: must pass
+    cp "$TMPDIR/rt.zst" "$TMPDIR/rt_cut.zst"; truncate -s -5 "$TMPDIR/rt_cut.zst"
+    "$GZSTD" -t "$TMPDIR/rt_cut.zst" >/dev/null 2>&1 && rt_ok=0      # clipped: -t must fail
+    rterr=$("$GZSTD" -d -f -o "$TMPDIR/rt.out" "$TMPDIR/rt_cut.zst" 2>&1) || rt_ok=0
+    grep -qa "trailer is damaged" <<<"$rterr" || rt_ok=0             # -d recovers + warns
+    cmp -s "$TMPDIR/medium.txt" "$TMPDIR/rt.out" || rt_ok=0
+    if [ "$rt_ok" = 1 ]; then
+      pass "damaged trailer verdict is the same on the streaming route"
+    else
+      fail "streaming-route trailer verdict" "err=[$rterr]"
+    fi
+    rm -f "$TMPDIR/rt.zst" "$TMPDIR/rt_cut.zst" "$TMPDIR/rt.out"
+  else
+    skip "damaged trailer verdict is the same on the streaming route" "zstd CLI unavailable"
+  fi
 
   # 1f. --verify must actually verify on EVERY compress path.  The verifier taps
   #     the ordered writer, and -T1 and --sliding-window do not use one — so both

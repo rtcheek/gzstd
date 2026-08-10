@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.74";
+static constexpr const char * GZSTD_VERSION = "0.15.75";
 //
 // Architecture overview:
 //
@@ -860,6 +860,57 @@ static constexpr int EXIT_DECOMP_UNVERIFIED = 6;  // finished; >=1 frame had a c
                                                   // (content present but UNVERIFIED), no data lost
 static constexpr int EXIT_DECOMP_INCOMPLETE = 7;  // finished; >=1 frame could not fully decode
                                                   // (data missing/partial — outranks UNVERIFIED)
+
+/*======================================================================
+ On-disk byte order
+======================================================================*/
+// Every integer gzstd reads from or writes to a file is LITTLE-ENDIAN: the zstd
+// frame magic and skippable-frame sizes are defined that way by the format, and
+// gzstd's own trailers (the --tar member index, the seek table) follow suit.
+//
+// THESE HELPERS ARE NOT AN ENDIANNESS PORT — see the static_assert below.  They
+// exist because the alternative, `memcpy(&v, p, 4)`, is a HOST-order read that
+// merely happens to be right here, and it had been open-coded at eighteen sites
+// with three separate copies of the correct shift-based reader alongside it.
+// Two of those parsers are mirrored walks of the same on-disk structure, and
+// this project's most expensive review findings have all been mirrored code
+// paths drifting apart.  One reader for one format is the point; being explicit
+// about byte order is the side effect.
+//
+// No cost: every compiler folds these back to a single load (plus a bswap on a
+// big-endian target).  Verified against the XXH64 lanes, which use the same form.
+static inline uint32_t rd_le32(const unsigned char * p) {
+  return  (uint32_t)p[0]        | ((uint32_t)p[1] << 8)
+       | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static inline uint64_t rd_le64(const unsigned char * p) {
+  return  (uint64_t)p[0]        | ((uint64_t)p[1] << 8)  | ((uint64_t)p[2] << 16)
+       | ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40)
+       | ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+static inline uint32_t rd_le32(const char * p) {
+  return rd_le32((const unsigned char *)p);
+}
+
+// BIG-ENDIAN IS NOT SUPPORTED, and this fails the build rather than shipping a
+// binary that silently produces spec-violating archives.
+//
+// The readers above and the XXH64 lanes are byte-order explicit, so the on-disk
+// FORMAT handling would survive a port — but "would survive" is not a claim
+// worth shipping untested, and there is no big-endian hardware here to test on:
+// no s390x, no qemu-user, no cross toolchain.  Ubuntu's portable release targets
+// Linux x86_64 and nvCOMP publishes x86_64/aarch64 only, both little-endian, so
+// nothing currently reaches this line.
+//
+// To port: delete this assert, audit every read of an on-disk integer through
+// rd_le32/rd_le64 (grep for `memcpy(&` in the parsers — there should be none),
+// and run BOTH suites on the target.  A missed site is INVISIBLE on a
+// little-endian host, which is exactly why an untested claim of support would be
+// worse than this line.
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "gzstd is little-endian only: the on-disk readers are byte-order "
+              "explicit but have never been validated on a big-endian host. "
+              "See the note above this assert before removing it.");
 
 // Global verbosity for die() which doesn't take Options
 static int g_verbosity = V_DEFAULT;
@@ -4451,6 +4502,26 @@ static uint64_t adapt_save_min_ns()
   return v;
 }
 
+// A --adapt save that never lands means the profile never CONVERGES: every run
+// re-explores from the priors and the user sees only that "--adapt doesn't seem
+// to do anything".  At -v-only that is indistinguishable from "still learning",
+// which is why this is reported at default verbosity.
+//
+// V_ERROR rather than V_NORMAL so it survives -q — "the thing you explicitly
+// asked for is not happening" belongs with errors — while -qq still silences it.
+//
+// ONE-SHOT per process: save is attempted once per operation and any real cause
+// (read-only cache dir, a filesystem whose flock does nothing, a full disk) will
+// recur identically, so repeating it on a multi-file run would be noise.
+static void adapt_warn_save_failed(const Options & opt, const std::string & why)
+{
+  static std::atomic<bool> warned{false};
+  if (warned.exchange(true)) return;
+  vlog(V_ERROR, opt, "warning: --adapt could not persist its profile (" + why
+       + ") — this run's measurements are lost and the profile will not converge "
+         "until that is resolved\n");
+}
+
 // Load -> merge -> atomically replace.  Called once per process, only when
 // the run qualifies (exit 0, --adapt, not --no-profile, wall >= the save
 // minimum or a fault to count).  Never fatal.
@@ -4485,7 +4556,7 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   // the sidecar could not be opened.  The profile is a REGENERABLE CACHE, so the
   // safe response to "cannot serialise" is to skip this save, not to race.
   if (!plock.held()) {
-    vlog(V_VERBOSE, opt, "[ADAPT] profile lock unavailable; skipping this save\n");
+    adapt_warn_save_failed(opt, "cannot lock " + path + ".lock");
     return;
   }
 
@@ -4599,7 +4670,7 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
       if (errno != EEXIST) break;
     }
     if (tfd < 0) {
-      vlog(V_VERBOSE, opt, "[ADAPT] profile write failed (ignored): " + tmp + "\n");
+      adapt_warn_save_failed(opt, "cannot create a temp file beside " + path);
       return;
     }
     size_t off = 0;
@@ -4612,13 +4683,13 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
     }
     if (::close(tfd) != 0) wrote_ok = false;
     if (!wrote_ok) {
-      vlog(V_VERBOSE, opt, "[ADAPT] profile write failed (ignored): " + tmp + "\n");
+      adapt_warn_save_failed(opt, "write failed: " + tmp);
       ::unlink(tmp.c_str());
       return;
     }
   }
   if (::rename(tmp.c_str(), path.c_str()) != 0) {
-    vlog(V_VERBOSE, opt, "[ADAPT] profile rename failed (ignored): " + path + "\n");
+    adapt_warn_save_failed(opt, "cannot install " + path);
     ::unlink(tmp.c_str());
     return;
   }
@@ -6693,10 +6764,10 @@ static int report_keep_going_damage_tar(const Options & opt) {
 static bool trailing_is_truncated_skippable(const unsigned char * p, size_t n)
 {
   if (n < 4) return false;                    // cannot even identify it: treat as damage
-  uint32_t magic = 0; std::memcpy(&magic, p, 4);
+  const uint32_t magic = rd_le32(p);
   if ((magic & 0xFFFFFFF0u) != 0x184D2A50u) return false;   // not skippable
   if (n < 8) return true;                     // header itself is cut: still a skippable stub
-  uint32_t ssz = 0; std::memcpy(&ssz, p + 4, 4);
+  const uint32_t ssz = rd_le32(p + 4);
   return (uint64_t)n < 8ull + ssz;            // declared payload longer than what is here
 }
 
@@ -8215,6 +8286,9 @@ private:
     // unaligned reinterpret_cast: p is vector<char>::data() (not size_t-
     // aligned), so the cast is UB on strict-alignment targets.  With a constant
     // size this compiles to the same wide load on x86 (ROADMAP 7.6).
+    // This is the ONE host-order load that is deliberately not an rd_le*: the
+    // word is only ever compared against zero, which is the same value in every
+    // byte order.  It reads no on-disk field.
     size_t words = len / sizeof(size_t);
     for (size_t i = 0; i < words; ++i) {
       size_t w;
@@ -8895,6 +8969,23 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
 
   size_t ret = 0;  // last decompressStream hint; >0 at EOF means truncated
   uint64_t total_in_bytes = 0;   // zero here means "not a zstd stream at all"
+
+  // TRACK THE FRAME IN PROGRESS, so a truncated one at EOF can be classified the
+  // same way the frame-splitting readers classify it.  Without this the
+  // tolerance for a damaged optimization trailer was ROUTE-DEPENDENT: an archive
+  // whose resolved first frame exceeds SINGLE_FRAME_STREAM_MIN comes here, which
+  // rejected the damaged trailer outright, while a chunked archive went through
+  // the splitter and recovered from it.  Identical damage, opposite verdicts,
+  // decided by --chunk-size.
+  //
+  // head/head_n hold the first bytes of the current frame (all the predicate
+  // needs: magic + declared size); cur_len is its TRUE length, which can exceed
+  // the eight bytes retained.  data_frames counts COMPLETED DATA frames only —
+  // matching the splitter's `seq`, so a file that is nothing but skippable
+  // frames plus a broken one stays fatal rather than decoding to silence.
+  unsigned char head[8]; size_t head_n = 0;
+  uint64_t cur_len = 0, data_frames = 0;
+
   for (;;) {
     size_t n = std::fread(inbuf.data(), 1, IO_CHUNK, in);
     if (n == 0) { check_read_error(in, opt.input); break; }  // EOF (not an error)
@@ -8903,11 +8994,22 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
     ZSTD_inBuffer zin { inbuf.data(), n, 0 };
     while (zin.pos < zin.size) {
       ZSTD_outBuffer zout { outbuf.data(), outbuf.size(), 0 };
+      const size_t consumed_from = zin.pos;
       ret = ZSTD_decompressStream(dctx, &zout, &zin);
       if (ZSTD_isError(ret)) {
         ZSTD_freeDCtx(dctx);
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
                + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
+      }
+      // Bytes this call consumed belong to the frame that was in progress.
+      for (size_t i = consumed_from; i < zin.pos; ++i) {
+        if (head_n < sizeof head) head[head_n++] = (unsigned char)inbuf[i];
+        ++cur_len;
+      }
+      if (ret == 0) {
+        // Frame boundary: the frame whose head we captured has completed.
+        if (head_n >= 4 && rd_le32(head) == 0xFD2FB528u) ++data_frames;
+        head_n = 0; cur_len = 0;
       }
       if (zout.pos > 0) {
         if (g_tar_decomp_sink) {
@@ -8930,8 +9032,17 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
     }
   }
   if (ret > 0) {
-    ZSTD_freeDCtx(dctx);
-    die_data("truncated zstd stream (expected more data)");
+    // A truncated trailing SKIPPABLE frame is gzstd's own damaged index/seek
+    // table and is recoverable for -d/-l (see trailing_skippable_tolerated —
+    // which also rejects it for -t, and rejects it outright when no data frame
+    // was recovered).  Anything else here is a truncated DATA frame: fatal.
+    if (trailing_skippable_tolerated(opt, data_frames, head,
+                                     (size_t)std::min<uint64_t>(cur_len, SIZE_MAX))) {
+      warn_damaged_trailer(opt, (size_t)cur_len);
+    } else {
+      ZSTD_freeDCtx(dctx);
+      die_data("truncated zstd stream (expected more data)");
+    }
   }
   // ZERO INPUT BYTES.  `ret` starts at 0 and ZSTD_decompressStream is never
   // called for an empty file, so the truncation check above passes vacuously and
@@ -10484,9 +10595,9 @@ static int64_t peek_first_frame_decomp_size(FILE * in)
     if (std::fseek(in, at, SEEK_SET) != 0) break;
     size_t n = std::fread(buf, 1, sizeof(buf), in);
     if (n < 8) break;
-    uint32_t magic; std::memcpy(&magic, buf, 4);
+    const uint32_t magic = rd_le32(buf);
     if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {          // skippable frame
-      uint32_t ssz; std::memcpy(&ssz, buf + 4, 4);
+      const uint32_t ssz = rd_le32(buf + 4);
       at += 8 + (long)ssz;                               // hop to the next frame
       continue;
     }
@@ -10762,7 +10873,7 @@ static size_t stream_frames_to_queue_mt(
       const size_t old = carry.size();
       // Is the carried frame a skippable frame?
       uint32_t magic = 0;
-      if (carry.size() >= 4) std::memcpy(&magic, carry.data(), 4);
+      if (carry.size() >= 4) magic = rd_le32(carry.data());
       const bool skippable = (carry.size() >= 4) && ((magic & 0xFFFFFFF0u) == 0x184D2A50u);
       size_t appended = 0, need = 0; bool resolved = false;
       if (skippable) {
@@ -10772,7 +10883,7 @@ static size_t stream_frames_to_queue_mt(
           carry.insert(carry.end(), data + appended, data + appended + step); appended += step;
         }
         if (carry.size() >= 8) {
-          uint32_t ss = 0; std::memcpy(&ss, carry.data() + 4, 4);
+          const uint32_t ss = rd_le32(carry.data() + 4);
           need = 8 + (size_t)ss;
           while (carry.size() < need && appended < len) {
             size_t step = std::min(STEP, len - appended);
@@ -10819,10 +10930,10 @@ static size_t stream_frames_to_queue_mt(
       // and reused directly if this frame has no content-size header.
       carry_origin = (uint64_t)cur * BLOCK + pos;
       if (rem < 4) { carry.assign(p, p + rem); break; }
-      uint32_t magic = 0; std::memcpy(&magic, p, 4);
+      const uint32_t magic = rd_le32(p);
       if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {          // skippable frame
         if (rem < 8) { carry.assign(p, p + rem); break; }
-        uint32_t ss = 0; std::memcpy(&ss, p + 4, 4);
+        const uint32_t ss = rd_le32(p + 4);
         size_t tot = 8 + (size_t)ss;
         if (tot > rem) { carry.assign(p, p + rem); break; }  // straddles
         pos += tot; continue;
@@ -11125,11 +11236,11 @@ static size_t stream_frames_to_queue(
       // Skip skippable frames (magic 0x184D2A5?)
       {
         uint32_t magic = 0;
-        std::memcpy(&magic, ptr, 4);
+        magic = rd_le32(ptr);
         if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {
           if (remaining < 8) break;  // need more data for skip size
           uint32_t skip_size = 0;
-          std::memcpy(&skip_size, ptr + 4, 4);
+          skip_size = rd_le32(ptr + 4);
           size_t total_skip = 8 + (size_t)skip_size;
           if (total_skip > remaining) break;  // need more data
           buf_off += total_skip;
@@ -11841,7 +11952,6 @@ private:
           not_full_.notify_all();
           return;
         }
-        if (ZSTD_isError(r)) { /* handled above */ }
         if (zout.pos) { out_d_.update(zout.dst, zout.pos); out_bytes_ += zout.pos; }
       }
     }
@@ -16628,10 +16738,6 @@ struct TarSeekTable {
 // table leaves *st !valid() without failing the index as a whole.
 static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
                            TarSeekTable * st = nullptr) {
-  auto rd_u32 = [](const unsigned char * p) {
-    uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; };
-  auto rd_u64 = [](const unsigned char * p) {
-    uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; };
   bool ok = false;
   std::string comp, raw;
   std::vector<uint64_t> t_csz, t_dsz;   // seekable seek-table entries, if present
@@ -16649,8 +16755,8 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
     {
       unsigned char ft[9];
       if (std::fseek(in, -9, SEEK_END) == 0 && std::fread(ft, 1, 9, in) == 9
-          && rd_u32(ft + 5) == 0x8F92EAB1u) {
-        uint64_t nf = rd_u32(ft);
+          && rd_le32(ft + 5) == 0x8F92EAB1u) {
+        uint64_t nf = rd_le32(ft);
         const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);  // + per-frame checksum
         uint64_t tpay = nf * esz + 9;
         // 1 GiB cap (>100M frames) bounds what a forged frame count can make
@@ -16660,13 +16766,13 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
           std::vector<unsigned char> tb((size_t)(8 + tpay));
           if (std::fseek(in, (long)tstart, SEEK_SET) == 0
               && std::fread(tb.data(), 1, tb.size(), in) == tb.size()
-              && rd_u32(tb.data()) == 0x184D2A5Eu
-              && rd_u32(tb.data() + 4) == tpay) {
+              && rd_le32(tb.data()) == 0x184D2A5Eu
+              && rd_le32(tb.data() + 4) == tpay) {
             t_csz.reserve((size_t)nf); t_dsz.reserve((size_t)nf);
             const unsigned char * q = tb.data() + 8;
             for (uint64_t k = 0; k < nf; ++k, q += esz) {
-              t_csz.push_back(rd_u32(q));
-              t_dsz.push_back(rd_u32(q + 4));
+              t_csz.push_back(rd_le32(q));
+              t_dsz.push_back(rd_le32(q + 4));
             }
             idx_end = tstart;
           }
@@ -16678,7 +16784,7 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
     if (std::fseek(in, (long)(idx_end - 24), SEEK_SET) != 0
         || std::fread(tr, 1, 24, in) != 24) break;
     if (std::memcmp(tr + 16, TAR_INDEX_MAGIC, 8) != 0) break;
-    uint64_t usize = rd_u64(tr), csize = rd_u64(tr + 8);
+    uint64_t usize = rd_le64(tr), csize = rd_le64(tr + 8);
     // 1 GiB cap ≈ >10M members at ~100 B/record — generous for any real
     // index, and it bounds what a forged trailer can make us allocate.
     if (csize > idx_end - 32 || usize > (uint64_t)1 << 30) break;
@@ -16686,7 +16792,7 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
     unsigned char fh[8];
     if (std::fseek(in, (long)(idx_end - 32 - csize), SEEK_SET) != 0
         || std::fread(fh, 1, 8, in) != 8) break;
-    if (rd_u32(fh) != 0x184D2A50u || rd_u32(fh + 4) != csize + 24) break;
+    if (rd_le32(fh) != 0x184D2A50u || rd_le32(fh + 4) != csize + 24) break;
     comp.resize((size_t)csize);
     if (csize && std::fread(&comp[0], 1, (size_t)csize, in) != (size_t)csize) break;
     // The blob was written with ZSTD_compress, which embeds its content size:
@@ -16702,8 +16808,8 @@ static bool read_tar_index(FILE * in, std::vector<InEntry> & entries,
 
     size_t p = 0;
     auto have = [&](size_t n) { return raw.size() - p >= n; };
-    auto ru32 = [&] { uint32_t v = rd_u32((const unsigned char *)raw.data() + p); p += 4; return v; };
-    auto ru64 = [&] { uint64_t v = rd_u64((const unsigned char *)raw.data() + p); p += 8; return v; };
+    auto ru32 = [&] { uint32_t v = rd_le32((const unsigned char *)raw.data() + p); p += 4; return v; };
+    auto ru64 = [&] { uint64_t v = rd_le64((const unsigned char *)raw.data() + p); p += 8; return v; };
     if (!have(16)) break;
     uint64_t count = ru64(), tar_size = ru64();  // entry count, tar-stream size
     if (count > raw.size() / 94) break;          // 94 = minimum record size
@@ -16860,8 +16966,6 @@ static bool build_seek_plan(FILE * in,
 // arithmetic.  Big win on large-file archives; on many-small-file archives
 // headers sit in every frame and this degrades toward the full walk.
 static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
-  auto rd_u32 = [](const unsigned char * p) {
-    uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; };
   bool ok = false;
   do {
     if (std::fseek(in, 0, SEEK_END) != 0) break;
@@ -16870,8 +16974,8 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     uint64_t end = (uint64_t)endl;
     unsigned char ft[9];
     if (std::fseek(in, -9, SEEK_END) != 0 || std::fread(ft, 1, 9, in) != 9
-        || rd_u32(ft + 5) != 0x8F92EAB1u) break;
-    uint64_t nf = rd_u32(ft);
+        || rd_le32(ft + 5) != 0x8F92EAB1u) break;
+    uint64_t nf = rd_le32(ft);
     const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);
     uint64_t tpay = nf * esz + 9;
     // 1 GiB cap: bounds the allocation a forged frame count can demand.
@@ -16880,13 +16984,13 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     std::vector<unsigned char> tb((size_t)(8 + tpay));
     if (std::fseek(in, (long)tstart, SEEK_SET) != 0
         || std::fread(tb.data(), 1, tb.size(), in) != tb.size()
-        || rd_u32(tb.data()) != 0x184D2A5Eu || rd_u32(tb.data() + 4) != tpay) break;
+        || rd_le32(tb.data()) != 0x184D2A5Eu || rd_le32(tb.data() + 4) != tpay) break;
     std::vector<uint64_t> co{0}, uo{0};
     uint64_t c = 0, u = 0;
     bool bad = false, skips = false;
     const unsigned char * q = tb.data() + 8;
     for (uint64_t k = 0; k < nf && !bad; ++k, q += esz) {
-      uint64_t cz = rd_u32(q), dz = rd_u32(q + 4);
+      uint64_t cz = rd_le32(q), dz = rd_le32(q + 4);
       if (cz < 8 || cz > tstart - c) { bad = true; break; }
       if (dz == 0) { skips = true; c += cz; continue; }  // trailing skippables only
       // v1 restriction: data frames must be contiguous from offset 0 (true
@@ -16900,7 +17004,7 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     if (bad || uo.size() < 2 || c != tstart) break;
     unsigned char mg[4];
     if (std::fseek(in, 0, SEEK_SET) != 0 || std::fread(mg, 1, 4, in) != 4
-        || rd_u32(mg) != 0xFD2FB528u) break;
+        || rd_le32(mg) != 0xFD2FB528u) break;
     st.tar_size = u;
     st.c_off = std::move(co);
     st.u_off = std::move(uo);
@@ -22723,7 +22827,7 @@ static int extract_tar(const Options & opt, Meter * m)
     if (arc != "-") {              // validate zstd magic (skip for unseekable stdin)
       unsigned char magic[4] = {0};
       size_t nr = std::fread(magic, 1, 4, in);
-      uint32_t mg = 0; if (nr == 4) std::memcpy(&mg, magic, 4);
+      const uint32_t mg = (nr == 4) ? rd_le32(magic) : 0u;
       bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
       if (!ok_magic) {
         vlog(V_ERROR, opt, "gzstd: untar: not a zstd archive: " + arc + "\n");
@@ -23021,7 +23125,7 @@ static int verify_tar(const Options & opt, Meter * m)
     if (arc != "-") {
       unsigned char magic[4] = {0};
       size_t nr = std::fread(magic, 1, 4, in);
-      uint32_t mg = 0; if (nr == 4) std::memcpy(&mg, magic, 4);
+      const uint32_t mg = (nr == 4) ? rd_le32(magic) : 0u;
       bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
       if (!ok_magic) {
         vlog(V_ERROR, opt, "gzstd: test: not a zstd archive: " + arc + "\n");
@@ -23146,23 +23250,21 @@ static bool seek_table_frame_summary(const unsigned char * base, size_t fsize,
                                      uint64_t & nframes, uint64_t & nskips,
                                      uint64_t & uncomp, bool & uncomp_known,
                                      bool & has_check) {
-  auto rd_u32 = [](const unsigned char * p) {   // seekable format is little-endian
-    uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; };
   if (fsize < 9 + 8) return false;
   const unsigned char * ft = base + fsize - 9;              // Seek_Table_Footer
-  if (rd_u32(ft + 5) != 0x8F92EAB1u) return false;          // Seekable_Magic_Number
-  uint64_t nf = rd_u32(ft);
+  if (rd_le32(ft + 5) != 0x8F92EAB1u) return false;          // Seekable_Magic_Number
+  uint64_t nf = rd_le32(ft);
   const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);       // +checksum per entry?
   uint64_t tpay = nf * esz + 9;
   // 1 GiB cap (>100M frames) bounds what a forged frame count can make us read.
   if (nf == 0 || tpay > ((uint64_t)1 << 30) || tpay + 8 > fsize) return false;
   uint64_t tstart = fsize - 8 - tpay;                       // start of the seek-table frame
   const unsigned char * tb = base + tstart;
-  if (rd_u32(tb) != 0x184D2A5Eu || rd_u32(tb + 4) != tpay) return false;  // skippable header
+  if (rd_le32(tb) != 0x184D2A5Eu || rd_le32(tb + 4) != tpay) return false;  // skippable header
   const unsigned char * q = tb + 8;
   uint64_t c_all = 0, u = 0, skips = 0, first_data_off = 0; bool found_data = false;
   for (uint64_t k = 0; k < nf; ++k, q += esz) {
-    uint64_t foff = c_all, cz = rd_u32(q), dz = rd_u32(q + 4);
+    uint64_t foff = c_all, cz = rd_le32(q), dz = rd_le32(q + 4);
     if (cz < 8 || cz > fsize - c_all) return false;         // frame runs past EOF → forged
     c_all += cz;
     if (dz == 0) ++skips;                                   // skippable (e.g. our GZIDX index)
@@ -23178,7 +23280,7 @@ static bool seek_table_frame_summary(const unsigned char * base, size_t fsize,
   // XXH64 content-checksum flag: read the first data frame's header descriptor
   // (bit 2).  gzstd writes every frame with the same params, so one is enough.
   has_check = found_data && first_data_off + 5 <= fsize
-              && rd_u32(base + first_data_off) == 0xFD2FB528u
+              && rd_le32(base + first_data_off) == 0xFD2FB528u
               && (base[first_data_off + 4] & 0x04);
   return true;
 }
@@ -23204,7 +23306,7 @@ static void hop_frame_blocks(const unsigned char * base, size_t pos, size_t fsiz
                              Tick && tick) {
   size_t p = pos;
   if (p + 4 > fsize) return;
-  uint32_t magic; std::memcpy(&magic, base + p, 4);
+  const uint32_t magic = rd_le32(base + p);
   if (magic != 0xFD2FB528u) return;                    // not a zstd frame
   p += 4;
   if (p >= fsize) return;
@@ -23280,11 +23382,17 @@ static bool buffered_frame_walk(int fd, size_t fsize,
   unsigned char h[8];
   while (pos + 4 <= fsize) {
     if (prog) tick(pos);
-    uint32_t magic;
-    if (!pr(&magic, 4, pos)) return false;
+    // pread into BYTES, then rd_le32 — not straight into a uint32_t.  A pread
+    // into an integer is a host-order read of an on-disk field exactly like the
+    // memcpy form, and being spelled differently is precisely why this pair
+    // survived the sweep that converted the others.
+    unsigned char mb[4];
+    if (!pr(mb, 4, pos)) return false;
+    const uint32_t magic = rd_le32(mb);
     if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {          // skippable frame
-      uint32_t ssz;
-      if (!pr(&ssz, 4, pos + 4)) return false;
+      unsigned char sb[4];
+      if (!pr(sb, 4, pos + 4)) return false;
+      const uint32_t ssz = rd_le32(sb);
       if (8 + (uint64_t)ssz > fsize - pos) return false;
       pos += 8 + (size_t)ssz; ++nskips; ++nframes; continue;
     }
@@ -23324,7 +23432,14 @@ static bool buffered_frame_walk(int fd, size_t fsize,
     if (fhd & 0x04) { p2 += 4; if (p2 > fsize) return false; }  // XXH64 tail
     pos = p2; ++nframes;
   }
-  return fsize - pos < 4;   // same trailing-slack tolerance as the mmap walk
+  // EXACT TILING, no trailing slack.  This used to `return fsize - pos < 4`,
+  // and the mmap walk below reached the same verdict a different way (its loop
+  // condition is `pos + 4 <= fsize` with no post-loop check at all) — so both
+  // walks agreed, and both were wrong: `-l` exited 0 on an archive with one, two
+  // or three junk bytes appended while `-t` correctly exited 4 on the same file.
+  // Two mirrored implementations reaching the same wrong answer is not
+  // corroboration.  A valid stream tiles its file exactly.
+  return pos == fsize;
 }
 #endif  // !_WIN32
 
@@ -23438,10 +23553,10 @@ static int list_zst(const Options & opt)
       size_t pos = walked ? fsize : 0;
       while (pos + 4 <= fsize) {
         if (prog) prog_tick(pos);
-        uint32_t magic; std::memcpy(&magic, base + pos, 4);
+        const uint32_t magic = rd_le32(base + pos);
         if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {           // skippable frame
           if (pos + 8 > fsize) { ok = false; break; }
-          uint32_t ssz; std::memcpy(&ssz, base + pos + 4, 4);
+          const uint32_t ssz = rd_le32(base + pos + 4);
           // BOUNDS-CHECK the declared size before trusting it.  ssz comes from the
           // file, so an 8-byte header claiming a payload that is not there walked
           // `pos` past EOF and the loop simply ended — reporting one frame for a
@@ -23466,6 +23581,14 @@ static int list_zst(const Options & opt)
         if (pos + 4 < fsize && (base[pos + 4] & 0x04)) has_check = true;
         pos += csz; ++nframes;
       }
+      // TRAILING BYTES ARE DAMAGE, and the loop above cannot see them: its
+      // condition is `pos + 4 <= fsize`, so it simply stops with one, two or
+      // three bytes left and no verdict was ever reached.  `-l` therefore
+      // exited 0 on a file `-t` rejects.  (The buffered walk had the same hole
+      // spelled as an explicit `fsize - pos < 4` tolerance — mirrored code,
+      // mirrored defect.)  `walked` means the O(1) seek-table fast path already
+      // covered the file and set pos = fsize, so this is a no-op there.
+      if (ok && pos != fsize) ok = false;
       if (prog_shown) { std::fprintf(stderr, "\r%*s\r", 64, ""); std::fflush(stderr); }
     }
 #ifndef _WIN32
@@ -23517,7 +23640,7 @@ static int list_tar(const Options & opt, Meter * m)
     if (arc != "-") {
       unsigned char magic[4] = {0};
       size_t nr = std::fread(magic, 1, 4, in);
-      uint32_t mg = 0; if (nr == 4) std::memcpy(&mg, magic, 4);
+      const uint32_t mg = (nr == 4) ? rd_le32(magic) : 0u;
       bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
       if (!ok_magic) {
         vlog(V_ERROR, opt, "gzstd: list: not a zstd archive: " + arc + "\n");
@@ -25595,9 +25718,9 @@ static uint64_t adapt_decomp_uncompressed_est(const std::string & path,
   if (got <= 8) return comp_size;
   size_t off = 0;
   for (int hop = 0; hop < 16 && off + 8 <= (size_t)got; ++hop) {   // skip skippables
-    uint32_t magic; std::memcpy(&magic, buf.data() + off, 4);
+    const uint32_t magic = rd_le32(buf.data() + off);
     if ((magic & 0xFFFFFFF0u) != 0x184D2A50u) break;
-    uint32_t ssz; std::memcpy(&ssz, buf.data() + off + 4, 4);
+    const uint32_t ssz = rd_le32(buf.data() + off + 4);
     off += 8 + (size_t)ssz;
   }
   if (off + 8 > (size_t)got) return comp_size;

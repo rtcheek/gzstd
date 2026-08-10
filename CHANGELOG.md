@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.74  
+**Covers:** v0.9.50 → v0.15.75  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,67 @@
 ---
 
 
+## v0.15.75 — closing the round-6 remainder, and one reader for one format
+
+v0.15.74 fixed round 6's two HIGH findings and left four smaller ones open on the grounds
+that none were tag blockers. They are closed here, along with the duplication that produced
+two of them.
+
+**Eighteen open-coded host-order reads became one reader.** Every integer gzstd reads from a
+file is little-endian, and the correct shift-based reader already existed in the tree — three
+times, copy-pasted, as identical `rd_u32` lambdas — while eighteen other sites did
+`memcpy(&v, p, 4)`, which is a HOST-order read that merely happens to be right on x86. There
+is now a single `rd_le32`/`rd_le64`, and the three duplicate lambdas are gone. The change is
+net-negative in lines and free at runtime (every compiler folds it back to one load).
+
+The justification is not portability. Two of those parsers are **mirrored walks of the same
+on-disk structure**, and this project's most expensive findings have all been mirrored paths
+drifting apart — round 6 alone produced two more. One reader for one format removes the
+class. Big-endian correctness is a side effect, and the sweep immediately paid for itself:
+converting the `memcpy` sites left a pair in the `-l` buffered walk that `pread` **straight
+into a `uint32_t`**, which is the same host-order read spelled differently, and is exactly the
+kind of site a grep for `memcpy` cannot see.
+
+**Big-endian is now declared unsupported at build time** rather than implied to work. A
+`static_assert` fails the build on a big-endian target. The readers are byte-order explicit
+and the format handling would likely survive a port — but "would likely survive" is not worth
+shipping untested, and there is no big-endian hardware here: no s390x, no qemu-user, no cross
+toolchain. The one platform that would exercise it in 2026 is IBM Z, which nvCOMP does not
+build for. The previous state was worse than either honest position: a code comment asserting
+big-endian intent for XXH64 while the upfront magic check could not read its own format.
+
+**`-l` accepted trailing junk that `-t` rejected.** Append one, two or three bytes to a valid
+archive and `-l` exited 0 while `-t` exited 4 on the same file. Both `-l` walks got there
+independently — the buffered one returned an explicit `fsize - pos < 4` tolerance, the mmap
+one looped on `pos + 4 <= fsize` and simply ran out with no post-loop verdict at all. They
+agreed, and they were both wrong; two mirrored implementations reaching the same wrong answer
+is not corroboration. A valid stream tiles its file exactly, and both now require that.
+
+**The damaged-trailer verdict no longer depends on the route.** An archive whose first frame
+carries no content-size header, or exceeds 256 MiB, goes to the single-frame streaming decoder
+instead of the frame splitter — and that decoder had no truncated-skippable exception, so
+identical damage was recoverable or fatal depending on `--chunk-size`. It now tracks the frame
+in progress (its first bytes and true length) and asks the same shared predicate, counting
+completed DATA frames only, so a stream that is nothing but a broken trailer stays fatal there
+too. Verified on a sizeless piped-`zstd` stream, which takes that route without needing a
+256 MiB frame: `-d` recovers byte-identically and warns, `-t` fails.
+
+**`--adapt` could fail to persist forever without saying so.** All four failure paths — no
+lock, no temp file, write, rename — logged at `-v` only. On a read-only cache directory, or a
+filesystem whose `flock` does nothing, the profile never converged and the user saw only that
+`--adapt` didn't seem to do anything, which at default verbosity is indistinguishable from
+"still learning". It is now a one-shot warning at default verbosity (surviving `-q`, silenced
+by `-qq`), naming the specific cause. Silent when the save succeeds.
+
+Also: the dead `ZSTD_isError` line round 6 flagged in the sliding-window verifier is gone.
+
+**Four regression tests**, three of which discriminate against v0.15.74 (`-l` on a short tail
+0 → 4, `-d` on the streaming route 4 → 0, and the `--adapt` warning absent → present); the
+fourth guards behaviour that was already correct and is labelled as a guard, not a fix.
+
+Suite: **383** (516 extensive), green on both build configurations.
+
+---
 ## v0.15.74 — a guard that compared paths, and the one run that skipped verification
 
 Round 6. Six of the eight fixes from v0.15.73 were **rejected**, but the more useful number
