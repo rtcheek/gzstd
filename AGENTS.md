@@ -156,11 +156,15 @@ silently compiled out.
   successive versions of the `--tar` guard failed by folding "could not determine" into
   "outside". Relatedly, a failed unlink whose purpose is to neutralise a symlink is FATAL —
   ignoring it is what let a surviving link be followed into a source file.
-- **The output invariant attaches to a DESCRIPTOR, not a pathname.** With `--tar` sources to
-  protect, the output's final component is opened through a held parent dirfd with
-  `O_NOFOLLOW`. Identity comparison alone cannot secure this: only a directory source's own
-  inode is captured, so a symlink to a *descendant* passes every identity test. A plain
-  compress still follows a symlink output — that is deliberate; do not "unify" the two.
+- **The output is ONE TRANSACTION through one held directory descriptor** (`OutputDir`).
+  Existence/type, containment, identity, unlink, create, atomic temp, rename and the fallback
+  all use `fstatat`/`openat`/`unlinkat`/`renameat` against that same `fd`. Do not add a step
+  that resolves `opt.output` (or its parent) by name again — five separate resolutions is what
+  let an attacker swap an intermediate component between the approval and the unlink, and each
+  fix that converted only *some* of them left the hole open. Identity comparison alone cannot
+  secure this: only a directory source's own inode is captured, so a symlink to a *descendant*
+  passes every identity test. A plain compress still follows a symlink output (no `O_NOFOLLOW`)
+  — that is deliberate; do not "unify" the two.
 - **`opt` vs `pass_opt` in the compress driver**: `opt` is what the user asked for, `pass_opt`
   is what THIS pass is doing, and they diverge when a GPU fault rebuilds CPU-only. Per-pass
   work lives in functions that receive only `pass_opt` so the wrong read cannot compile. If

@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.78  
+**Covers:** v0.9.50 → v0.15.79  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,72 @@
 ---
 
 
+## v0.15.79 — the output becomes one transaction
+
+Round 9 confirmed the doubt this release started from, and made it worse than stated. The
+output's parent directory was resolved **five separate times** between deciding the
+destination was safe and writing it:
+
+```
+path_containment()   opens the parent to walk        ← the verdict came from here
+fs::exists(output)   resolves the whole path again
+open(output,O_PATH)  again, for the identity check
+fs::remove(output)   again — and this one destroys
+open(dir) in open_output_verified()                  ← v0.15.78 fixed only this one
+```
+
+Each lookup asked the filesystem afresh, so an attacker who can swap an intermediate
+component — no root, no mount, `renameat2(RENAME_EXCHANGE)` in a loop — could have the guard
+approve one directory while the unlink destroyed a file in another. v0.15.78 moved the *final*
+open to a descriptor, which was the last of the five and therefore the least useful one.
+
+**The destination directory is now opened once and held for the whole transaction.** Existence
+and type (`fstatat`, `AT_SYMLINK_NOFOLLOW`), the containment walk, the identity check
+(`openat`, `O_NOFOLLOW`), the unlink (`unlinkat`), the create, the atomic temp, the install
+(`renameat`, both ends through the same descriptor) and the fallback recreation all go through
+that one `fd`. The directory that was approved is the directory that gets written into by
+construction, not by re-checking. The final component never contains a slash, so no `*at()`
+call can walk out of the held directory.
+
+Two things fell out of doing it properly. The symlink-target resolution added in v0.15.78 is
+gone — `unlinkat` removes a link rather than its target and the create uses `O_NOFOLLOW`, so
+the target is unreachable either way; that was also the last caller of `weakly_canonical` on
+this path, a mount-blind function that had been guarding against a mount-based alias. And
+`exists` now means *the name exists*, not *its target exists*, so a dangling link no longer
+reads as absent and a link to a source no longer reads as a regular file.
+
+Round 9's other findings, all confirmed by inspection or measurement:
+
+**A third fail-open `fstat`, in the function whose other two were just fixed.** Written as
+`fstat(...) == 0 && S_ISREG(...) && size > 0`, a failed stat silently skipped the truncate — so
+a shorter archive written over a longer one kept the old tail, exited 0, and `--rm` deleted the
+input. It reads as a type test rather than a safety check, which is exactly why it survived two
+passes over the same function.
+
+**`--sync-output` did not sync what it installed.** The temp is fsynced before the rename; when
+the rename fails, the fallback copies into a *different inode*, closed it unsynced, and then
+removed the durable temp. Durability has to follow the bytes the user ends up with.
+
+**The endian check failed twice more — nine and ten.** An exemption applied to a whole logical
+line, and because a multi-line lambda folds into one logical line, a single permitted
+`cudaMalloc` silenced every forbidden call in the same body. Exemptions now **subtract**: each
+is deleted from the text and the remainder re-tested, so an allowed call can only ever excuse
+itself. And the pattern required the width to *follow* the address while the comments claimed
+order independence, so `copy_n(src, 4, reinterpret_cast<char*>(&magic))` was missed; both orders
+now match. Verified against all eight catchable shapes; the one known hole — a width held in a
+variable — is documented rather than implied away.
+
+**The check now runs in `gzstd-test.sh`**, not only in the release workflow. A host-order read
+behaves perfectly on every machine here, so the first thing that could catch it was a tag,
+which is far too late for a check that takes well under a second.
+
+M2 was confirmed as having crossed its boundary, and the judgement that `PassOpt{opt}` should
+remain constructible was endorsed: preventing deliberate misuse would mean restructuring
+ownership for no gain against the two historical accidental misreads.
+
+Suite: **390** (523 extensive), green on both build configurations.
+
+---
 ## v0.15.78 — one abstraction boundary further
 
 Round 8 assessed the four structural mechanisms from v0.15.77 rather than the findings, and

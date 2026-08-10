@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=389
-$EXTENSIVE && EXPECTED_TESTS=522
+EXPECTED_TESTS=390
+$EXTENSIVE && EXPECTED_TESTS=523
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -450,6 +450,27 @@ cp "$TMPDIR/medium.txt" "$TMPDIR/tree/"
 cp "$TMPDIR/random.bin" "$TMPDIR/tree/subdir/"
 echo "data inside subdir" > "$TMPDIR/tree/subdir/note.txt"
 spin_done
+
+# ============================================================
+# 0. Source guards (sub-second; run before anything that costs time)
+# ============================================================
+section "Source guards"
+
+# The endian check belongs in the ordinary development path, not only in the
+# release workflow: a host-order read of an on-disk field behaves perfectly on
+# every machine this project runs on, so the FIRST time it can bite is a tag,
+# which is far too late for a check that takes well under a second.  Skipped
+# rather than failed when the suite is pointed at a binary outside its own repo.
+_eg="$(cd "$(dirname "$0")" && pwd)/scripts/check-endian-reads.sh"
+if [[ -x "$_eg" && -f "$(dirname "$_eg")/../gzstd.cpp" ]]; then
+  if _egout=$("$_eg" 2>&1); then
+    pass "no host-order reads of on-disk fields"
+  else
+    fail "no host-order reads of on-disk fields" "$(printf '%s' "$_egout" | tail -3)"
+  fi
+else
+  skip "no host-order reads of on-disk fields" "checker or source not alongside this script"
+fi
 
 # ============================================================
 # 1. Basic compress/decompress round-trip

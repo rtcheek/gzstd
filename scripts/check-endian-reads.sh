@@ -87,7 +87,18 @@ status=0
 # guard at all (drowned), then a `[^&]&` guard that could not match `memcpy(&x, …)`
 # because there is no character between the paren and the ampersand for it to
 # consume — so it silently stopped catching the very first form on the list above.
-pattern='[(,][[:space:]]*&[[:space:]]*[A-Za-z_][A-Za-z0-9_.]*[^;]*(\b[48]\b|sizeof)'
+#
+# BOTH ORDERS.  The comments used to claim argument-order independence while the
+# pattern required the width to FOLLOW the address, so
+# `copy_n(src, 4, reinterpret_cast<char*>(&magic))` — width first, address inside
+# a cast — was missed. That was failure ten. Two alternatives now, one per order.
+addr='[(,][[:space:]]*&[[:space:]]*[A-Za-z_][A-Za-z0-9_.]*'
+width='(\b[48]\b|sizeof)'
+# The width-first arm additionally requires a CALL to have been opened, or
+# `std::string * fields[4] = {&a, &b}` matches it — an array of pointers, whose
+# `[4]` is the width and whose `, &b` is the address. The address-first arm needs
+# no such prefix: it is already anchored on an argument separator.
+pattern="(${addr}[^;]*${width}|\w+[[:space:]]*\([^;]*${width}[^;]*${addr})"
 
 # Deliberate exceptions, in two lists, each entry justified.
 #
@@ -106,9 +117,30 @@ declare -a ALLOW_CALLEE=(
   'nvmlDeviceGetHandleByIndex'   # &handle out-param from the NVML driver
   'getpwuid_r'                   # &passwd out-param; no on-disk integer field
   'getgrgid_r'                   # &group out-param; likewise
+  'pthread_setaffinity_np'       # &cpu_set_t in; scheduling, not a field read
+  'strftime'                     # &tm in, formatted text out; no on-disk integer
 )
 
-# Whole-line exemptions for things the callee list cannot express. Comment the
+# EXEMPTIONS SUBTRACT, THEY DO NOT EXCUSE.
+#
+# Both lists used to work by "if this appears anywhere on the line, skip the
+# line" — and because a multi-line lambda folds into ONE logical line, a single
+# permitted call anywhere inside it silenced every forbidden call in the same
+# body:
+#
+#     outer([&] {
+#       cudaMalloc(&p, 4);          // allowed …
+#       pread(fd, &magic, 4, off);  // … and this went unreported
+#     });
+#
+# So instead of skipping the line, each exemption is DELETED from the text and
+# the remainder is re-tested. An allowed call can then only ever excuse itself.
+# The deletion spans one level of nested parentheses, because `getpwuid_r((uid_t)
+# uid, &pw, …)` has a cast in its arguments and a `[^)]*` scrub stopped at that
+# inner `)`, leaving the rest of the call behind to match. Deeper nesting errs
+# toward REPORTING, which is the right direction to be wrong in.
+
+# Whole-text exemptions for things the callee list cannot express. Comment the
 # exemption at the SITE as well, so it is visible where someone edits it.
 declare -a ALLOW=(
   # Word-wise all-zero scan: the value is only ever compared against 0, which is
@@ -144,18 +176,19 @@ for f in "${files[@]}"; do
   [[ -f "$f" ]] || { echo "check-endian-reads: no such file: $f" >&2; exit 2; }
   while IFS=: read -r lineno line; do
     [[ -n "$lineno" ]] || continue
-    allowed=0
+    # Subtract every exemption, then re-test what is left.
+    scrub=$line
     for a in "${ALLOW[@]}"; do
-      if [[ "$line" == *"$a"* ]]; then allowed=1; break; fi
+      scrub=${scrub//"$a"/}
     done
-    if (( ! allowed )); then
-      for c in "${ALLOW_CALLEE[@]}"; do
-        if [[ "$line" =~ (^|[^A-Za-z0-9_])"$c"[[:space:]]*\( ]]; then
-          allowed=1; break
-        fi
-      done
-    fi
-    (( allowed )) && continue
+    for c in "${ALLOW_CALLEE[@]}"; do
+      # One level of nesting: `getpwuid_r((uid_t)uid, &pw, …)` has a cast in its
+      # arguments, and a `[^)]*` scrub stopped at that inner `)` and left the rest
+      # of the call behind to match.
+      scrub=$(printf '%s' "$scrub" \
+        | sed -E "s/(^|[^A-Za-z0-9_])${c}[[:space:]]*\([^()]*(\([^()]*\)[^()]*)*\)/\1/g")
+    done
+    printf '%s' "$scrub" | grep -qE "$pattern" || continue
     if (( status == 0 )); then
       echo "check-endian-reads: host-order read of an on-disk field — use rd_le32/rd_le64" >&2
       echo "  (if the value is genuinely byte-order independent, add it to ALLOW in $0" >&2
