@@ -156,6 +156,18 @@ silently compiled out.
   successive versions of the `--tar` guard failed by folding "could not determine" into
   "outside". Relatedly, a failed unlink whose purpose is to neutralise a symlink is FATAL —
   ignoring it is what let a surviving link be followed into a source file.
+- **THE THREAT MODEL IS BOUNDED, AND DELIBERATELY.** After a long hardening arc the line is:
+  a defect reachable with **no attacker** is always fixed; a **same-uid** peer is out of scope
+  (it can delete your files outright, no permission scheme helps); a **different-uid writer with
+  write access to your input/output directory** is defended where the defence is cheap and
+  self-contained, and documented where it is not.
+  **Known and accepted:** `--rm` on a *symlinked* input in a directory such a writer controls
+  can be defeated by an ABA exchange — the entry is identified and the target is checked in two
+  syscalls, and swapping A→B→A between them passes both. Closing it needs the entry itself to be
+  the starting object of the target open. It is not a bug report; do not re-file it.
+  For calibration: stock zstd has none of these protections at all (`stat`/`unlink`/`open` by
+  path, `AT_FDCWD`, no `O_EXCL`, no `O_NOFOLLOW`, `--rm` is a bare `unlink`). That does not
+  excuse a defect, but it is the baseline this tool is judged against.
 - **The output is ONE TRANSACTION through one held directory descriptor** (`OutputDir`).
   Existence/type, containment, identity, unlink, create, atomic temp, rename and the fallback
   all use `fstatat`/`openat`/`unlinkat`/`renameat` against that same `fd`. Do not add a step

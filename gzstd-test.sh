@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=401
-$EXTENSIVE && EXPECTED_TESTS=534
+EXPECTED_TESTS=402
+$EXTENSIVE && EXPECTED_TESTS=535
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6596,9 +6596,9 @@ dangling --overwrite 2 OK OK - symlink"
 
   # 1c-11. SIGINT REMOVES THE PARTIAL OUTPUT, matching stock zstd — measured, not
   #     assumed: `zstd -f` interrupted mid-compress removes its output and exits 2.
-  #     (Its behaviour on a WRITE ERROR is the opposite, and gzstd matches that
-  #     too — see the disk-full test, which asserts the partial is removed there
-  #     as well.)  A round of review recommended dropping this cleanup entirely
+  #     On a WRITE ERROR the two DIVERGE and that is deliberate: zstd leaves the
+  #     partial, gzstd removes it (see the disk-full test).  A truncated .zst is
+  #     not a checkpoint — neither tool can resume one.  A round of review recommended dropping this cleanup entirely
   #     because a signal handler must not use a BORROWED descriptor; the registry
   #     owns its own now, so the cleanup is safe and the behaviour is kept.
   #
@@ -6645,6 +6645,52 @@ dangling --overwrite 2 OK OK - symlink"
     fail "SIGINT cleanup" "$(ls -a "$TMPDIR/si" | tr '\n' ' ')"
   fi
   rm -rf "$TMPDIR/si"
+
+  # 1c-12. CLEANUP MUST NOT DELETE A SUBSTITUTED LEAF.  Owning the directory
+  #     descriptor stops the fd from meaning a different directory; it says
+  #     nothing about the leaf.  A writer can rename our partial away and drop
+  #     their file at that name, and an unconditional unlinkat() then deletes
+  #     theirs — the destructive step trusting a name again, one level down.
+  #
+  #     Cleanup now proves the entry is still the inode it registered, via a HELD
+  #     DESCRIPTOR rather than a remembered inode number: sig_atomic_t is 4 bytes
+  #     on this target and ino_t is 8, so storing the number would have compared
+  #     truncated halves.  Both stat structs stay local to the handler.
+  #
+  #     This also guards against the shape that made the first attempt useless:
+  #     there were TWO unlink sites (cleanup_tmp_file and an inline copy in the
+  #     handler), the guard went into one, and the attack still succeeded.
+  rm -rf "$TMPDIR/leaf"; mkdir -p "$TMPDIR/leaf"
+  head -c 60000000 /dev/urandom > "$TMPDIR/leaf/big.bin"
+  printf 'OLD-ARCHIVE\n' > "$TMPDIR/leaf/out.zst"
+  lf_ok=1
+  "$GZSTD" --cpu-only -q -f --no-direct -19 -o "$TMPDIR/leaf/out.zst" \
+    "$TMPDIR/leaf/big.bin" >/dev/null 2>&1 &
+  lf_pid=$!
+  lf_wait=0
+  while [ $lf_wait -lt 300 ]; do
+    ls "$TMPDIR/leaf" 2>/dev/null | grep -q 'gzstd\.' && break
+    kill -0 $lf_pid 2>/dev/null || break
+    sleep 0.05; lf_wait=$((lf_wait+1))
+  done
+  lf_tmp=$(ls "$TMPDIR/leaf" 2>/dev/null | grep 'gzstd\.' | head -1)
+  if [ -z "$lf_tmp" ] || ! kill -0 $lf_pid 2>/dev/null; then
+    wait $lf_pid 2>/dev/null
+    skip "cleanup refuses to delete a substituted leaf" "no temp appeared to substitute"
+    lf_ok=skip
+  else
+    mv "$TMPDIR/leaf/$lf_tmp" "$TMPDIR/leaf/ours-moved-away"
+    printf 'SOMEBODY-ELSES-FILE\n' > "$TMPDIR/leaf/$lf_tmp"
+    kill -INT $lf_pid 2>/dev/null; wait $lf_pid 2>/dev/null
+    grep -q "SOMEBODY-ELSES-FILE" "$TMPDIR/leaf/$lf_tmp" 2>/dev/null || lf_ok=0
+  fi
+  if [ "$lf_ok" = skip ]; then :
+  elif [ "$lf_ok" = 1 ]; then
+    pass "cleanup refuses to delete a substituted leaf"
+  else
+    fail "cleanup deleted a substituted leaf"
+  fi
+  rm -rf "$TMPDIR/leaf"
 
   # 1c-9. --rm DELETES THE FILE IT COMPRESSED, identified by inode rather than by
   #     re-resolving the name at the end of the run: renaming the input away

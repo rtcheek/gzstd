@@ -1,9 +1,133 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.84  
+**Covers:** v0.9.50 → v0.15.88  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+
+## v0.15.88 — closing the no-attacker defects, and drawing the line
+
+Two more review rounds on the quarantine machinery. The findings sorted cleanly along a
+distinction this release makes explicit, and `AGENTS.md` now records it as policy:
+
+> A defect reachable with **no attacker** is always fixed. A **same-uid** peer is out of scope —
+> it can delete your files outright and no permission scheme helps. A **different-uid writer
+> with write access to your input or output directory** is defended where the defence is cheap
+> and self-contained, and **documented** where it is not.
+
+### Fixed — reachable with no attacker
+
+**A setgid bug introduced by the previous round's own fix.** The quarantine directory's privacy
+proof tested `(mode & 07777) == 0700`, but a directory created beneath a setgid parent inherits
+`S_ISGID` and comes out `02700`. So `--overwrite` and `--rm` **failed outright in a conventional
+`2770` collaborative spool** — precisely the deployment the hardening exists to protect. The
+test now masks `0777`. Verified against a real `2770` directory.
+
+**Stranded entries were reported at the wrong path.** `release()` correctly refuses to forget a
+quarantine it could not remove, but the callers discarded that result: after a failed
+`unlinkat`, `--rm` named the original input while the file sat under `.gzstd-q.*/in`, and
+`--overwrite` did the same, including on a failed restoration where it claimed "nothing was
+removed". Both now report where the entry actually is. A FUSE or NFS `EIO` is sufficient to
+reach this — no hostile writer required, which is why it was treated as seriously as a HIGH.
+
+**Two `fstatat` calls per named input that only `--rm` consumed.** Now gated on `--rm`. This was
+the one avoidable cost in the whole transaction: nothing else here runs per file without being
+needed.
+
+### Documented, deliberately not fixed
+
+`--rm` on a **symlinked** input, in a directory a hostile different-uid writer controls, can be
+defeated by an **ABA exchange**: put symlink A at the name, let the no-follow stat record it,
+swap in B pointing at the real inode so the following stat passes, then restore A — both
+observations are individually true and the pair is meaningless. An ordinary recheck cannot beat
+ABA; closing it requires the entry itself to be the starting object of the target open. Recorded
+in `AGENTS.md` as accepted, with instructions not to re-file it.
+
+### Cost, measured by inspection rather than assumed
+
+Asked directly where the hardening lands:
+
+| | frequency |
+|---|---|
+| per frame / chunk / block | **none** |
+| per tar-create member | **none** |
+| per named input/output file | held parent descriptors, registration, one `renameat` |
+| quarantine + `getrandom` | only for an existing `--overwrite` target, and `--rm` |
+
+Large-file steady-state throughput does not contain any of it, and a `--tar` creation over a
+large tree pays one output transaction for the archive rather than one per member. Plain
+multi-file runs pay it linearly per file; "invisible" is not certified without measurement on
+metadata-cold or networked storage, and is not claimed here.
+
+For calibration, measured with `strace`: stock zstd 1.5.7 does `stat`/`unlink`/`open` by path
+through `AT_FDCWD`, with no `O_EXCL`, no `O_NOFOLLOW`, and `--rm` as a bare `unlink()`. That
+does not excuse a defect, and it does not establish that gzstd's remaining exposure is lower —
+only that the baseline this tool is judged against has none of these protections.
+
+---
+## v0.15.86 — a private directory, and the destructive step that trusted a name twice
+
+Round 13's two HIGHs were one root cause: **"rename aside, prove it is ours, unlink"** is three
+operations on a name another writer can substitute between. A random quarantine name does not
+close that — an inotify watcher learns it the moment the rename lands.
+
+**Both deletions now happen inside a private directory.** `--overwrite` and `--rm` create a
+0700 subdirectory beside the target, move the entry into it, validate it there, and unlink it
+there. Same filesystem, so the rename is atomic and cheap, and `--overwrite` keeps its one-copy
+space property.
+
+What that defends is stated in the code rather than implied: a **different-uid** writer with
+access to a shared output directory is fully excluded, which is the threat these findings
+describe. A **same-uid** process is not, and cannot be by any permission scheme — nor does it
+need a race, since it can delete the files outright.
+
+**Cleanup now proves the leaf, not just the directory.** Owning the directory descriptor stopped
+the fd from coming to mean a different directory; it said nothing about the entry. A writer
+could rename our partial away, drop their file at that name, and an unconditional `unlinkat()`
+deleted theirs. Cleanup now compares a **held descriptor** against the current entry and removes
+it only on a match.
+
+Not a remembered inode number, which was the first attempt: `sig_atomic_t` is 4 bytes on this
+target and `ino_t` is 8, so that would have silently compared truncated halves of every inode.
+Holding the descriptor keeps both `stat` structs local to the handler, where their width is
+nobody's problem.
+
+### The defect inside the fix, again
+
+The first version of that guard did nothing, because there were **two** unlink sites — one in
+`cleanup_tmp_file()` and an inline copy in the signal handler — and the guard went into one. The
+attack still succeeded and the new test said so. There is now a single implementation called
+from both paths.
+
+That is this project's signature defect appearing *inside a fix for a mirrored-path finding*.
+Three more of the same class were caught by testing during this round: a symlink `--rm` broke
+because an entry moved into a subdirectory has its relative target broken (`--rm` removes the
+LINK, so it must be validated by the link's own inode — "is this the data I compressed" is a
+question about the target, and one identity cannot answer both); a quarantine directory leaked
+because `die_io` calls `exit()`, which does not unwind; and the width bug above.
+
+### For context, measured rather than assumed
+
+`strace` on stock zstd 1.5.7 doing the same work:
+
+```
+stat("out.zst")                                        ← by path, follows symlinks
+unlink("out.zst")                                      ← by path, unconditional, no identity check
+openat(AT_FDCWD, "out.zst", O_WRONLY|O_CREAT|O_TRUNC)  ← no O_EXCL, no O_NOFOLLOW, no held dirfd
+```
+
+and `--rm` is a bare `unlink()` by path. **Every race raised against gzstd in this arc exists
+unmitigated in the reference implementation.** That does not make the findings wrong — they are
+real, and they are fixed — but it places the remaining exposure below what zstd ships today.
+
+Two earlier claims corrected while measuring: `zstd -f` is **unlink-first**, not truncate in
+place (the inode *number* is recycled, which is what made it look otherwise), and its symlink
+output survives its target only as an accident of unlinking first.
+
+Suite: **402** (535 extensive), green on both build configurations.
 
 ---
 
@@ -51,8 +175,10 @@ honest one, and it is now in `-h` and `--help`: **not atomic**, so a failed run 
 old nor new.
 
 **SIGINT removes the partial output, matching zstd.** Measured, not assumed: `zstd -f`
-interrupted mid-compress removes its output and exits 2. Note the asymmetry both tools now
-share — **signal → remove, write error → leave**. One place gzstd deliberately does NOT match:
+interrupted mid-compress removes its output and exits 2. gzstd deliberately **diverges on write
+errors**: zstd leaves the partial behind, gzstd removes it (the suite has asserted that for a
+long time). A truncated `.zst` is not a checkpoint — neither tool can resume one — so keeping it
+only invites someone to mistake it for output. One further place gzstd does NOT match:
 interrupted while overwriting, zstd destroys the old archive because it truncated in place;
 gzstd's `-f` is atomic, so the old archive survives. Copying that would be a downgrade.
 

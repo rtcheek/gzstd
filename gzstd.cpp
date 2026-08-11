@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.84";
+static constexpr const char * GZSTD_VERSION = "0.15.88";
 //
 // Architecture overview:
 //
@@ -248,6 +248,13 @@ static char g_tmp_base[4096] = {};
 static volatile sig_atomic_t g_tmp_active = 0;
 static volatile sig_atomic_t g_tmp_dirfd  = -1;   // NOT owned; do not close here
 static volatile sig_atomic_t g_termination_signal = 0;
+// A descriptor to the file itself, in a permanently-owned slot like the
+// directory's.  NOT the inode number in a shared variable: sig_atomic_t is 4
+// bytes here and ino_t is 8, so that would have silently truncated every inode
+// and compared halves of numbers.  Holding the fd keeps both stat structs LOCAL
+// to the handler, where their width is nobody's problem.
+static int g_tmp_file_slot = -1;
+static volatile sig_atomic_t g_tmp_filefd = -1;
 
 // SYNCHRONOUS cleanup only — never from a signal handler.
 //
@@ -262,7 +269,27 @@ static void cleanup_tmp_file()
 {
   if (g_tmp_active && g_tmp_base[0] != '\0') {
 #ifndef _WIN32
-    if (g_tmp_dirfd >= 0) ::unlinkat((int)g_tmp_dirfd, g_tmp_base, 0);
+    // PROVE IT IS STILL OURS BEFORE REMOVING IT.
+    //
+    // Owning the directory descriptor stops the fd from coming to mean a
+    // different directory; it says nothing about the LEAF.  A writer can rename
+    // our partial away and drop their own file at that name, and an
+    // unconditional unlinkat() then deletes theirs — the destructive step
+    // trusting a name again, one level down from where that was last fixed.
+    //
+    // fstatat + compare + unlinkat are all async-signal-safe, so the handler can
+    // do this.  It does not make the sequence atomic — nothing short of an
+    // unlink-by-inode syscall would — but it removes the case where the entry is
+    // ALREADY known to be somebody else's, which is the reachable one.  If it
+    // does not match, we leave it: a partial file of ours is a nuisance, another
+    // process's file is not ours to delete.
+    if (g_tmp_dirfd >= 0 && g_tmp_filefd >= 0) {
+      struct stat ours, now;
+      if (::fstat((int)g_tmp_filefd, &ours) == 0
+          && ::fstatat((int)g_tmp_dirfd, g_tmp_base, &now, AT_SYMLINK_NOFOLLOW) == 0
+          && ours.st_dev == now.st_dev && ours.st_ino == now.st_ino)
+        ::unlinkat((int)g_tmp_dirfd, g_tmp_base, 0);
+    }
 #else
     std::remove(g_tmp_base);
 #endif
@@ -287,7 +314,7 @@ static void cleanup_tmp_file()
 // the borrowing that was unsafe, not the unlink.
 static int g_tmp_dir_slot = -1;         // our permanent handle; dup2 target
 
-static void register_tmp_file_at(int dirfd, const std::string & base)
+static void register_tmp_file_at(int dirfd, const std::string & base, int created_fd)
 {
   if (base.size() >= sizeof(g_tmp_base)) return;
   if (g_tmp_dir_slot < 0) {
@@ -296,6 +323,18 @@ static void register_tmp_file_at(int dirfd, const std::string & base)
   } else if (::dup2(dirfd, g_tmp_dir_slot) < 0) {
     return;
   }
+  // THE CALLER'S DESCRIPTOR, duplicated — never a fresh lookup of the name.
+  // Reopening the basename here reintroduced the gap it was meant to close: the
+  // exclusive create returns the authoritative fd, and between that and this
+  // registration the entry can be renamed away and replaced, after which we would
+  // register the REPLACEMENT and cleanup would happily delete it (matching stats,
+  // wrong file).  Duplicating the create's own fd cannot bind anything else.
+  const int f = ::fcntl(created_fd, F_DUPFD_CLOEXEC, 0);
+  if (f < 0) { g_tmp_filefd = -1; return; }   // cannot prove it: do not arm
+  if (g_tmp_file_slot < 0) { g_tmp_file_slot = f; }
+  else { if (::dup2(f, g_tmp_file_slot) < 0) { ::close(f); g_tmp_filefd = -1; return; }
+         ::close(f); }
+  g_tmp_filefd = (sig_atomic_t)g_tmp_file_slot;
   std::strncpy(g_tmp_base, base.c_str(), sizeof(g_tmp_base) - 1);
   g_tmp_base[sizeof(g_tmp_base) - 1] = '\0';
   g_tmp_dirfd = (sig_atomic_t)g_tmp_dir_slot;
@@ -306,6 +345,7 @@ static void clear_tmp_file()
 {
   g_tmp_active = 0;
   g_tmp_dirfd  = -1;
+  g_tmp_filefd = -1;
   g_tmp_base[0] = '\0';
 }
 
@@ -317,10 +357,13 @@ static void clear_tmp_file()
 //
 // This MATCHES STOCK ZSTD, which was measured rather than assumed: `zstd -f`
 // interrupted mid-compress removes its output file and exits 2, whether the
-// output was new or was replacing an existing archive. (Its behaviour on a WRITE
-// ERROR is the opposite — it leaves the partial — and gzstd matches that too, in
-// cleanup_tmp_file's caller.) A gzstd that left partial archives behind on Ctrl-C
-// would surprise anyone who reaches for it as a zstd replacement.
+// output was new or was replacing an existing archive.
+//
+// gzstd DIVERGES from zstd on a WRITE ERROR, deliberately: zstd leaves the
+// partial behind (measured: 512000 bytes after an ENOSPC-class failure), gzstd
+// removes it. A truncated .zst is not a checkpoint — neither tool can resume one
+// — so keeping it only invites someone to mistake it for output. An earlier
+// version of this comment claimed the two tools agreed here; they do not.
 //
 // Safe from a handler only because the registry holds its OWN descriptor for the
 // directory (see register_tmp_file_at): unlinkat() through a slot whose number
@@ -328,16 +371,21 @@ static void clear_tmp_file()
 // identified the borrowed-descriptor version of this as unsafe and was correct;
 // the fix is to stop borrowing, not to stop cleaning up.
 //
-// Residual, stated rather than hidden: the base name and the directory slot are
-// two locations, so a handler that reads one before a new file's registration
-// and the other after could unlink the previous name in the new directory. It
-// needs a multi-file run interrupted inside a few instructions of a registration.
+// Residual, stated rather than hidden: the compare and the unlink are separate
+// syscalls, so a substitution made between them is not caught.  No
+// unlink-by-inode syscall exists; a mismatch SEEN at comparison time is refused,
+// a swap after it is not.
 static void signal_cleanup_handler(int signum)
 {
   g_termination_signal = signum;
-  if (g_tmp_active && g_tmp_base[0] != '\0' && g_tmp_dirfd >= 0)
-    ::unlinkat((int)g_tmp_dirfd, g_tmp_base, 0);   // async-signal-safe
-  g_tmp_active = 0;
+  // ONE cleanup implementation, called from both paths.  This used to be a
+  // second, inline unlinkat() — so when the identity check was added to
+  // cleanup_tmp_file(), the handler kept deleting unconditionally and the
+  // substitution it was meant to stop still succeeded.  Two copies of a
+  // destructive step is how every mirrored-path defect in this program has
+  // started; there is now one, and it is async-signal-safe (fstat, fstatat and
+  // unlinkat all are).
+  cleanup_tmp_file();
   std::signal(signum, SIG_DFL);
   std::raise(signum);
 }
@@ -350,8 +398,9 @@ static void setup_signal_handlers()
   std::signal(SIGPIPE, SIG_IGN);
 #endif
   // Both paths clean up, matching stock zstd on SIGINT (measured: it removes its
-  // output and exits 2). The handler is safe because the registry owns its own
-  // directory descriptor; the atexit path covers die()->exit().
+  // output and exits 2) — and diverging from it on a WRITE ERROR, where zstd
+  // leaves the partial and gzstd removes it. The handler is safe because the
+  // registry owns its own descriptors; the atexit path covers die()->exit().
   std::signal(SIGINT, signal_cleanup_handler);
   std::signal(SIGTERM, signal_cleanup_handler);
   std::atexit(cleanup_tmp_file);
@@ -383,6 +432,7 @@ struct HeldDir {
 
   ~HeldDir() { release(); }
 };
+
 
 static constexpr unsigned RENAME_NOREPLACE_FLAG = 1u;  // Linux renameat2 ABI
 
@@ -421,6 +471,97 @@ static bool random_u64(uint64_t & value)
   return false;
 #endif
 }
+
+// A PRIVATE DIRECTORY for destructive two-step operations.
+//
+// The problem it solves: "rename the entry aside, prove it is the inode we
+// identified, then unlink it" is three operations on a NAME, and between the
+// proof and the unlink another writer can substitute a different entry — so we
+// delete theirs. A random quarantine name does not close that; an inotify watcher
+// learns the name as soon as the rename happens.
+//
+// The fix is to do the validation and the deletion somewhere the other writer
+// cannot reach: a subdirectory we create with mode 0700. It is on the same
+// filesystem as the target (a child of the target's own directory), so renaming
+// into it is atomic and cheap.
+//
+// WHAT THIS DOES AND DOES NOT DEFEND, stated plainly because a security claim
+// that overstates itself is worse than none:
+//
+//   * A DIFFERENT-UID writer with access to a shared output directory (mode 1777
+//     /tmp, a group-writable spool) is fully excluded — 0700 means they cannot
+//     create, rename or unlink anything inside.  That is the threat these
+//     findings describe and it is closed.
+//   * A SAME-UID process is NOT excluded, and cannot be by any permission
+//     scheme. It also does not need to win a race: it can delete your files
+//     outright. Nothing here pretends otherwise.
+struct QuarantineDir {
+  int         fd = -1;
+  std::string name;                 // final component, within the parent
+  int         parent_fd = -1;       // NOT owned
+
+  bool valid() const { return fd >= 0; }
+
+  // Creates <parent>/.gzstd-q.<pid>.<random>/ with mode 0700.
+  bool acquire(int parent) {
+    parent_fd = parent;
+    if (parent_fd < 0) return false;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      uint64_t nonce;
+      if (!random_u64(nonce)) return false;
+      char buf[64];
+      std::snprintf(buf, sizeof buf, ".gzstd-q.%d.%016llx",
+                    (int)getpid(), (unsigned long long)nonce);
+      name = buf;
+      if (::mkdirat(parent_fd, name.c_str(), 0700) == 0) {
+        // O_NOFOLLOW, and then PROVE IT IS OURS.  mkdirat-then-openat is two
+        // operations on a name: in a non-sticky group-writable parent another
+        // writer can rename our 0700 directory away and win the openat with one
+        // of theirs, and the "private" descriptor would name an attacker's
+        // directory — reinstating the very race this type exists to close.
+        // A different-uid writer cannot produce a directory OWNED BY US, so
+        // owner plus mode is the proof.  PERMISSION BITS ONLY (0777, not 07777):
+        // a child of a setgid directory inherits S_ISGID and is mode 02700, and
+        // an exact 0700 test rejected it — breaking --overwrite and --rm in the
+        // 2770 collaborative spool that is the whole point of the exercise.  (Against a same-uid peer nothing here
+        // applies; it does not need a race.)
+        fd = ::openat(parent_fd, name.c_str(),
+                      O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        struct stat qs;
+        if (fd < 0 || ::fstat(fd, &qs) != 0
+            || qs.st_uid != ::geteuid() || (qs.st_mode & 0777) != 0700) {
+          if (fd >= 0) { ::close(fd); fd = -1; }
+          ::unlinkat(parent_fd, name.c_str(), AT_REMOVEDIR);
+          return false;
+        }
+        return true;
+      }
+      if (errno != EEXIST) return false;
+    }
+    return false;
+  }
+
+  // Move `base` out of the parent and into here, atomically.  NOREPLACE because
+  // nothing should ever already exist under our chosen name.
+  int take(const char * base, const char * as) const {
+    return renameat_noreplace(parent_fd, base, fd, as);
+  }
+
+  // Returns false when the directory could NOT be removed, keeping `name` so the
+  // caller can tell the user where the entry was stranded.  Clearing it
+  // unconditionally meant a failed unlink left the input under .gzstd-q.*/in
+  // while the error message named the original path.  No hostile writer needed —
+  // a FUSE or NFS EIO after an accepted rename is enough.
+  bool release() {
+    if (fd >= 0) { ::close(fd); fd = -1; }
+    if (parent_fd >= 0 && !name.empty()) {
+      if (::unlinkat(parent_fd, name.c_str(), AT_REMOVEDIR) != 0) return false;
+      name.clear();
+    }
+    return true;
+  }
+  ~QuarantineDir() { (void)release(); }
+};
 #endif
 
 /*======================================================================
@@ -5623,7 +5764,7 @@ static FILE * open_output_atomic(const std::string & out, std::string & tmp_path
   }
   // Register only AFTER the exclusive create succeeded, so a failed attempt
   // never arms cleanup against a path we do not own.
-  register_tmp_file_at(od.fd, tmp_base);
+  register_tmp_file_at(od.fd, tmp_base, fd);   // the fd the exclusive create returned
   FILE * f = ::fdopen(fd, "wb");
   if (!f) { ::close(fd); die_io("cannot open temp output: " + tmp_path); }
   std::setvbuf(f, nullptr, _IOFBF, 1 * 1024 * 1024);
@@ -24928,6 +25069,33 @@ static int gzstd_main(int argc, char ** argv)
   bool in_id_ok = false;
   struct stat in_id{};
   if (in && in != stdin && ::fstat(fileno(in), &in_id) == 0) in_id_ok = true;
+  // ...and the identity of the NAME itself, which is a different inode when the
+  // input is a symlink.  Both are needed: --rm removes the LINK (that is what
+  // `rm` does), so the entry it deletes must be proven to be that link — while
+  // "is this still the data I compressed" is a question about the TARGET.
+  // One identity cannot answer both, and using only the target's broke every
+  // symlinked input the moment the entry moved into a subdirectory, because a
+  // RELATIVE link target does not survive the move.
+  // Captured THROUGH THE HELD INPUT DIRECTORY, and coupled to the descriptor we
+  // actually opened.  A fresh full-path lstat() left the two snapshots
+  // independent: replace the input with a symlink between the open and the stat,
+  // and in_lid records the REPLACEMENT while compression proceeds from the
+  // original fd — so --rm would later validate that link against itself and
+  // delete it.  Requiring the name to still LEAD TO the opened inode at the
+  // moment we record the entry's identity is what ties them together.
+  bool in_lid_ok = false;
+  struct stat in_lid{};
+  // Only when --rm was requested: in_lid is consumed by nothing else, and two
+  // extra fstatat per input is a real cost on a many-small-files run over
+  // metadata-cold or networked storage.
+  if (!opt.keep && !opt.tar_mode && opt.input != "-" && in_id_ok && in_dir.valid()) {
+    struct stat lst, tst;
+    if (::fstatat(in_dir.fd, in_dir.base.c_str(), &lst, AT_SYMLINK_NOFOLLOW) == 0
+        && ::fstatat(in_dir.fd, in_dir.base.c_str(), &tst, 0) == 0
+        && tst.st_dev == in_id.st_dev && tst.st_ino == in_id.st_ino) {
+      in_lid = lst; in_lid_ok = true;
+    }
+  }
   if (in && in != stdin && !in_id_ok)
     die_io("cannot identify input before starting output transaction: " + opt.input);
 #ifndef _WIN32
@@ -25265,23 +25433,25 @@ static int gzstd_main(int argc, char ** argv)
           }
           ::close(ofd);
 
-          // Move it aside atomically, prove it is the entry we just identified,
-          // and only then remove it.  A plain unlink of the NAME could remove a
-          // file another process created in the meantime; this cannot.
-          std::string qname;
-          int qrc = -1;
-          for (int attempt = 0; attempt < 64; ++attempt) {
-            uint64_t nonce;
-            if (!random_u64(nonce)) break;
-            char suffix[56];
-            std::snprintf(suffix, sizeof suffix, ".gzstd-old.%d.%016llx",
-                          (int)getpid(), (unsigned long long)nonce);
-            qname = suffix;
-            qrc = renameat_noreplace(out_dir.fd, out_dir.base.c_str(),
-                                     out_dir.fd, qname.c_str());
-            if (qrc == 0 || errno != EEXIST) break;
+          // Move it into a PRIVATE DIRECTORY, prove it is the entry we just
+          // identified, and remove it there.
+          //
+          // Quarantining under a random name in the SAME directory was not
+          // enough: validate-then-unlink is two operations on a name another
+          // writer can still substitute between them, and a random name is not
+          // secret — an inotify watcher learns it the moment the rename lands.
+          // Inside a 0700 directory of our own there is nothing for a
+          // different-uid writer to substitute.  (Against a same-uid process no
+          // scheme helps, and none is needed: it can delete the file outright.)
+          QuarantineDir oq;
+          if (!oq.acquire(out_dir.fd)) {
+            const int e = errno;
+            for (int f : tar_src_fds) ::close(f);
+            die_io("--overwrite: cannot create a private directory beside "
+                   + opt.output + " to retire the old output ("
+                   + std::strerror(e) + ")");
           }
-          if (qrc != 0) {
+          if (oq.take(out_dir.base.c_str(), "old") != 0) {
             const int e = errno;
             for (int f : tar_src_fds) ::close(f);
             die_io("--overwrite: cannot set aside the existing output "
@@ -25289,30 +25459,42 @@ static int gzstd_main(int argc, char ** argv)
           }
           struct stat qid;
           const bool qmatch =
-              (::fstatat(out_dir.fd, qname.c_str(), &qid, AT_SYMLINK_NOFOLLOW) == 0
+              (::fstatat(oq.fd, "old", &qid, AT_SYMLINK_NOFOLLOW) == 0
                && qid.st_dev == overwrite_id.st_dev
                && qid.st_ino == overwrite_id.st_ino);
           if (!qmatch) {
-            (void)renameat_noreplace(out_dir.fd, qname.c_str(),
-                                     out_dir.fd, out_dir.base.c_str());
+            // Put it back exactly where it was; we do not delete what we cannot
+            // identify.  If restoration fails the entry stays quarantined, so say
+            // where — claiming "nothing was removed" while it sits under an
+            // unnamed directory is worse than the failure.
+            const bool restored =
+                renameat_noreplace(oq.fd, "old",
+                                   out_dir.fd, out_dir.base.c_str()) == 0;
+            const std::string kept = out_dir.dir + "/" + oq.name + "/old";
             for (int f : tar_src_fds) ::close(f);
-            die_io("--overwrite: " + opt.output + " changed while being replaced; "
-                   "nothing was removed");
+            if (restored)
+              die_io("--overwrite: " + opt.output + " changed while being replaced; "
+                     "nothing was removed");
+            die_io("--overwrite: " + opt.output + " changed while being replaced and "
+                   "the original could not be put back; it is at " + kept);
           }
           int urc;
-          do { urc = ::unlinkat(out_dir.fd, qname.c_str(), 0); }
+          do { urc = ::unlinkat(oq.fd, "old", 0); }
           while (urc != 0 && errno == EINTR);
           if (urc != 0) {
             const int e = errno;
+            const std::string kept = oq.release()
+                ? opt.output : (out_dir.dir + "/" + oq.name + "/old");
             for (int f : tar_src_fds) ::close(f);
-            die_io("--overwrite: cannot remove the existing output " + opt.output
-                   + " (" + std::strerror(e) + ")");
+            die_io("--overwrite: cannot remove the existing output; it is at "
+                   + kept + " (" + std::strerror(e) + ")");
           }
+          oq.release();   // rmdir now that it is empty
           // The name is now empty and was emptied by us: create exclusively, so a
           // newcomer is refused rather than clobbered.
           out = open_output_verified(opt.output, in, out_dir,
                                      /*must_create=*/true, &tar_src_ids);
-          register_tmp_file_at(out_dir.fd, out_dir.base);
+          if (out) register_tmp_file_at(out_dir.fd, out_dir.base, fileno(out));
         }
       }
     } else {
@@ -25327,7 +25509,8 @@ static int gzstd_main(int argc, char ** argv)
                                  /*must_create=*/!out_present, &tar_src_ids);
       // Register for cleanup-on-failure only if we are CREATING a new file;
       // never register a pre-existing special target like /dev/null.
-      if (!existed_before) register_tmp_file_at(out_dir.fd, out_dir.base);
+      if (!existed_before && out)
+        register_tmp_file_at(out_dir.fd, out_dir.base, fileno(out));
     }
   }
 
@@ -26123,54 +26306,72 @@ static int gzstd_main(int argc, char ** argv)
       // Move the leaf out of the user-visible name before deciding whether it is
       // ours.  renameat2(NOREPLACE) makes both the quarantine acquisition and a
       // mismatch restoration atomic with respect to a replacement at either
-      // name.  The quarantined name is never unlinked unless its followed
-      // identity matches the descriptor that was compressed.
-      std::string quarantine;
-      int qrc = -1;
-      for (int attempt = 0; attempt < 64; ++attempt) {
-        uint64_t nonce;
-        if (!random_u64(nonce)) break;
-        char suffix[56];
-        std::snprintf(suffix, sizeof suffix, ".gzstd-rm.%d.%016llx",
-                      (int)getpid(), (unsigned long long)nonce);
-        quarantine = suffix;
-        qrc = renameat_noreplace(in_dir.fd, in_dir.base.c_str(),
-                                 in_dir.fd, quarantine.c_str());
-        if (qrc == 0 || errno != EEXIST) break;
-      }
-      if (qrc != 0)
-        die_io("--rm: cannot quarantine input after compressing it: " + opt.input
+      // Into a PRIVATE DIRECTORY beside the input, for the same reason as
+      // --overwrite: validate-then-unlink on a name another writer can
+      // substitute is not safe, and the quarantine name is not secret.
+      QuarantineDir rq;
+      if (!rq.acquire(in_dir.fd))
+        die_io("--rm: cannot create a private directory beside " + opt.input
+               + " to retire it (" + std::strerror(errno)
+               + "); output kept at " + opt.output);
+      if (rq.take(in_dir.base.c_str(), "in") != 0) {
+        const int e = errno; rq.release();
+        errno = e;
+        die_io("--rm: cannot set aside the input after compressing it: " + opt.input
                + " (" + std::strerror(errno) + "); output kept at " + opt.output);
+      }
 
-      const std::string quarantine_path =
-          (in_dir.dir == "/" ? std::string("/") : in_dir.dir + "/") + quarantine;
+      // stat(), not lstat(): open() followed the name to get here, so "is this
+      // still what I compressed" must follow too — that is what keeps --rm
+      // working for a symlinked input (it removes the link, keeps the target).
+      // Compare the ENTRY against the entry we opened: its own inode if it is a
+      // symlink (that is what gets removed), the target's otherwise.  Following
+      // it here would resolve a relative target against the quarantine directory
+      // and fail for every symlinked input.
       struct stat qid;
-      const bool quarantine_matches =
-          (::fstatat(in_dir.fd, quarantine.c_str(), &qid, 0) == 0
-           && qid.st_dev == in_id.st_dev && qid.st_ino == in_id.st_ino);
+      bool quarantine_matches = false;
+      if (::fstatat(rq.fd, "in", &qid, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (S_ISLNK(qid.st_mode))
+          quarantine_matches = in_lid_ok && qid.st_dev == in_lid.st_dev
+                                         && qid.st_ino == in_lid.st_ino;
+        else
+          quarantine_matches = qid.st_dev == in_id.st_dev
+                            && qid.st_ino == in_id.st_ino;
+      }
       if (!quarantine_matches) {
-        const int restore_rc = renameat_noreplace(
-            in_dir.fd, quarantine.c_str(), in_dir.fd, in_dir.base.c_str());
+        const int restore_rc =
+            renameat_noreplace(rq.fd, "in", in_dir.fd, in_dir.base.c_str());
+        if (restore_rc == 0) rq.release();     // exit() will not unwind; rmdir now
         if (restore_rc == 0)
           die_io("--rm: " + opt.input + " was replaced during the run; replacement "
                  "restored and not removed — output kept at " + opt.output);
+        // Restoration failed: the entry stays in the private directory rather
+        // than being deleted, so it is NOT released here — the user is told where
+        // it is.  Never unlink what could not be identified.
+        const std::string kept = in_dir.dir + "/" + rq.name + "/in";
         if (errno == EEXIST)
           die_io("--rm: " + opt.input + " reappeared while restoring a replacement; "
-                 "both it and the quarantined entry " + quarantine_path
-                 + " were preserved — output kept at " + opt.output);
-        die_io("--rm: quarantined entry did not match the compressed input and could "
-               "not be restored; it was preserved at " + quarantine_path
+                 "both it and the set-aside entry (" + kept
+                 + ") were preserved — output kept at " + opt.output);
+        die_io("--rm: the set-aside entry did not match the compressed input and "
+               "could not be restored; it was preserved at " + kept
                + " — output kept at " + opt.output);
       }
 
       int rm_rc;
-      do {
-        rm_rc = ::unlinkat(in_dir.fd, quarantine.c_str(), 0);
-      } while (rm_rc != 0 && errno == EINTR);
-      if (rm_rc != 0)
-        die_io("--rm: cannot remove quarantined input after compressing it: "
-               + quarantine_path + " (" + std::strerror(errno)
-               + "); output kept at " + opt.output);
+      do { rm_rc = ::unlinkat(rq.fd, "in", 0); }
+      while (rm_rc != 0 && errno == EINTR);
+      if (rm_rc != 0) {
+        // NAME THE PLACE IT ACTUALLY IS.  release() fails with ENOTEMPTY here (the
+        // entry is still inside), keeps its name for exactly this reason, and
+        // reporting opt.input would send the user looking in the wrong place.
+        const int e = errno;
+        const std::string kept = rq.release()
+            ? opt.input : (in_dir.dir + "/" + rq.name + "/in");
+        die_io("--rm: cannot remove the input after compressing it; it is at "
+               + kept + " (" + std::strerror(e) + "); output kept at " + opt.output);
+      }
+      rq.release();   // empty now; rmdir before we leave the scope
     }
   } else {
     // Flush stdout to ensure all data reaches the downstream pipe — and die
