@@ -161,13 +161,32 @@ silently compiled out.
   (it can delete your files outright, no permission scheme helps); a **different-uid writer with
   write access to your input/output directory** is defended where the defence is cheap and
   self-contained, and documented where it is not.
-  **Known and accepted:** `--rm` on a *symlinked* input in a directory such a writer controls
-  can be defeated by an ABA exchange — the entry is identified and the target is checked in two
-  syscalls, and swapping A→B→A between them passes both. Closing it needs the entry itself to be
-  the starting object of the target open. It is not a bug report; do not re-file it.
+  **CLOSED in v0.15.89 (was the one accepted hole):** `--rm` on a *symlinked* input used to be
+  defeatable by an ABA exchange, because the entry and the target were established by two
+  independent lookups of the same name. `open_input_pinned()` now resolves the user's name
+  **exactly once** — `openat(O_PATH|O_NOFOLLOW)` pins the entry, and the data is derived from
+  that pinned handle (`readlinkat(fd,"")` + `openat(parent,target)` for a link, a
+  `/proc/self/fd/N` re-open otherwise). Do not "simplify" the two cases into one: re-opening
+  `/proc/self/fd/N` when N is an `O_PATH|O_NOFOLLOW` handle **on a symlink** fails `ELOOP`.
+  That is measured, and it is why the obvious one-line version of this fix does not work.
+  **Still accepted, and deliberately:** the compare-then-unlink window in abnormal-exit cleanup.
+  There is no unlink-by-inode syscall, so it cannot be closed; adding another recheck is not a
+  fix, it is another pair of lookups for an ABA to sit between. The alternative — never unlink
+  asynchronously and leave partial outputs behind — was rejected for zstd parity.
+  `QuarantineDir::release()` is the *different* case and IS closed: it verifies the held
+  descriptor against the name before `rmdir`, and its residual is bounded to removing an empty
+  directory, never data.
   For calibration: stock zstd has none of these protections at all (`stat`/`unlink`/`open` by
   path, `AT_FDCWD`, no `O_EXCL`, no `O_NOFOLLOW`, `--rm` is a bare `unlink`). That does not
   excuse a defect, but it is the baseline this tool is judged against.
+  **What is NOT covered by any test, here or anywhere:** an actual different-uid attacker. This
+  box cannot produce a second UID (no root; AppArmor sets
+  `kernel.apparmor_restrict_unprivileged_userns=1`, so `unshare -Ur` fails). Note the UID does
+  not change what gzstd observes — it only decides whether the attacker *can* perform the
+  substitution, which inside the quarantine is settled by 0700 + ownership and verified in
+  `acquire()`. So the coverage that matters is the structural one: **the `--rm` input-shape
+  matrix asserts what got COMPRESSED, not just what survived** — the column its predecessor
+  lacked, and the one that pins `open_input_pinned` down.
 - **The output is ONE TRANSACTION through one held directory descriptor** (`OutputDir`).
   Existence/type, containment, identity, unlink, create, atomic temp, rename and the fallback
   all use `fstatat`/`openat`/`unlinkat`/`renameat` against that same `fd`. Do not add a step

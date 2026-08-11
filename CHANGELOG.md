@@ -1,11 +1,101 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.88  
+**Covers:** v0.9.50 → v0.15.89  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.15.89 — one lookup for two questions, and a measurement that cancelled a project
+
+### Fixed — the one accepted hole from v0.15.88 is closed
+
+`--rm` on a **symlinked** input was defeatable by an ABA exchange. The entry's identity (the
+link, because that is what gets deleted) and the data's identity (its target, because that is
+what gets compressed) were established by **two independent lookups of the same name**, so
+swapping A→B→A between them satisfied both while they described different entries.
+
+`open_input_pinned()` now resolves the user's name **exactly once**:
+
+```
+openat(parent, base, O_PATH|O_NOFOLLOW)   pins the ENTRY — fstat of it is provably that entry
+  symlink  -> readlinkat(pinned, "")      the target is read FROM THE PINNED LINK
+              openat(parent, target)      (a relative target resolves against the parent, which
+                                           is where the link lives — so that is correct)
+  otherwise-> open("/proc/self/fd/N")     a new description on the SAME inode, no name left
+```
+
+**The two cases cannot be unified, and the obvious one-liner does not work.** Re-opening
+`/proc/self/fd/N` when `N` is an `O_PATH|O_NOFOLLOW` handle on a *symlink* fails `ELOOP` —
+exactly the case the fix exists for. That was measured, not assumed; the design recorded as
+"the concrete fix" before this release would have failed on every symlinked input. The readlink
+buffer **grows until a short read** rather than trusting `st_size`, which some filesystems
+report as `0` for symlinks. The pinning is gated behind `--rm` being in play, so a
+many-small-files run pays nothing.
+
+**`QuarantineDir::release()` no longer removes a directory it cannot prove is its own.** The
+interior was already proven private (owner + `0700` through the held fd), but the *basename*
+stayed movable afterwards, so an unconditional `unlinkat(name, AT_REMOVEDIR)` could remove a
+substituted directory while ours — possibly still holding the user's input — was stranded under
+a name nothing reports. The held descriptor now decides. The residual is bounded and stated:
+`AT_REMOVEDIR` refuses a non-empty directory, so the worst case is removing an empty directory
+that was not ours, never data.
+
+**An identity flag that was set but never read.** `--overwrite`'s quarantine match compared
+against `overwrite_id` without consulting `overwrite_id_ok`. Both paths that skip the `fstat`
+currently `die()`, so it was latent rather than live — but a check whose result nothing reads is
+how an identity test goes missing with no test failing. It is now required.
+
+### Tests
+
+**The `--rm` input-shape matrix asserts what got COMPRESSED**, which its predecessor did not.
+The old test checked exit status and what survived — so a change that deleted the right entry
+while reading the *wrong* data passed it. That is the same blind spot the output matrix had, and
+it is the column that pins this fix down. Seven cells: plain, hardlink, and symlinks that are
+relative, absolute, pointing outside the input directory, into a subdirectory, and chained — plus
+a dangling link, which `O_PATH|O_NOFOLLOW` opens happily and which must still refuse.
+
+Building the matrix immediately found a bug **in the matrix**: the chain case pointed at a link
+another cell had already deleted, so it failed for a reason that had nothing to do with the code
+under test. A matrix cell must not be able to fail because of another cell.
+
+Suite: **403** default / **536** extensive, plus **322** on the `USE_NVCOMP=OFF` build. All
+three green.
+
+### Not covered, and worth saying plainly
+
+No test here, or anywhere in the arc, uses an actual different-uid attacker. This box cannot
+produce a second UID (no root; AppArmor sets `kernel.apparmor_restrict_unprivileged_userns=1`,
+so `unshare -Ur` fails). The UID does not change what gzstd observes — it only decides whether
+the attacker *can* perform the substitution, which inside the quarantine is settled by `0700`
+plus ownership. The structural coverage is the matrix.
+
+### Measured — GPUDirect Storage was investigated and rejected
+
+Direct SSD→GPU compression was evaluated on the 8×H100 server and **is not worth building**:
+
+| | |
+|---|---|
+| NVMe cold sequential read, `O_DIRECT` | **4.9 GB/s** |
+| gzstd's *slowest current* H2D path | **25 GiB/s** |
+
+GDS removes a host bounce from a link that already has a **5× margin over the storage feeding
+it**, so it cannot raise any ceiling; its remaining benefit is CPU cycles, and compress uses 724%
+of 25600% available. It would also cost a `nvidia-fs-dkms` install and a reboot with the AMD
+IOMMU moved out of `DMA-FQ` mode. Not spent.
+
+The measurement did find something real, which is recorded for the next release rather than
+rushed into this one. `--gpu-only` compress runs at **2.03 GiB/s against `--cpu-only`'s 4.62** —
+the CPU path saturates the drive and the GPU path does not reach half of it. The `h2d` region
+holds a full XXH64 pass over every byte *and* a `cudaMemcpyAsync` from pageable memory, which is
+host-synchronous, so nothing overlaps. Registering the reader pool — already allocated as one
+contiguous 2 MiB-aligned region — measures **53.29 GiB/s against 25.17**, portable across all
+eight GPUs from a single call, while `--pinned on` measures **16.94** and is worse than doing
+nothing. That change also carries a trap: `release_input()` currently depends on pageable copies
+being synchronous, so pinning the source without moving the release behind the H2D event turns it
+into a use-after-free against an in-flight DMA.
 
 
 ## v0.15.88 — closing the no-attacker defects, and drawing the line

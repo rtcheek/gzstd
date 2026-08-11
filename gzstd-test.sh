@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=402
-$EXTENSIVE && EXPECTED_TESTS=535
+EXPECTED_TESTS=403
+$EXTENSIVE && EXPECTED_TESTS=536
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6721,6 +6721,83 @@ dangling --overwrite 2 OK OK - symlink"
     fail "--rm across input shapes"
   fi
   rm -rf "$TMPDIR/rmk"
+
+  # 1c-9b. THE INPUT-SHAPE MATRIX FOR --rm, WITH THE COLUMN 1c-9 IS MISSING.
+  #     1c-9 asserts exit status and what survives, but never what was actually
+  #     COMPRESSED — so a change that removed the right entry while reading the
+  #     WRONG data passes it.  That is the same blind spot the output matrix had
+  #     (an archive can succeed, destroy nothing, and still hold the wrong
+  #     bytes), and it is the column that pins down open_input_pinned: the data
+  #     must come from the target of the entry that gets deleted.
+  #
+  #     Shapes: the entry --rm deletes x how the data is reached.  A relative
+  #     target, an absolute one, one pointing OUTSIDE the input directory, one
+  #     into a subdirectory, and a chain — because the pinned entry is opened
+  #     with readlinkat + openat(parent, target), and only these distinguish
+  #     "resolved against the parent" from "resolved against the cwd".
+  rm -rf "$TMPDIR/rms"; mkdir -p "$TMPDIR/rms/sub" "$TMPDIR/rms/away"
+  rms_ok=1; rms_why=""
+  printf 'PLAIN\n'   > "$TMPDIR/rms/plain.txt"
+  printf 'TARGET\n'  > "$TMPDIR/rms/real.txt"
+  printf 'DEEP\n'    > "$TMPDIR/rms/sub/deep.txt"
+  printf 'OUTSIDE\n' > "$TMPDIR/rms/away/out.txt"
+  ln -s real.txt                  "$TMPDIR/rms/rel.lnk"
+  ln -s "$TMPDIR/rms/real.txt"    "$TMPDIR/rms/abs.lnk"
+  ln -s ../rms/away/out.txt       "$TMPDIR/rms/out.lnk"
+  ln -s sub/deep.txt              "$TMPDIR/rms/sub.lnk"
+  # The chain gets its OWN middle link: pointing it at rel.lnk made the case
+  # depend on loop ORDER, because the rel.lnk cell deletes rel.lnk before the
+  # chain cell runs and the chain then reports a (correct) dangling refusal.
+  # A matrix cell must not be able to fail because of another cell.
+  ln -s real.txt                  "$TMPDIR/rms/mid.lnk"
+  ln -s mid.lnk                   "$TMPDIR/rms/chain.lnk"
+  ln    "$TMPDIR/rms/plain.txt"   "$TMPDIR/rms/hard.txt"
+
+  # name | expected content | entry that must be GONE | file that must SURVIVE
+  while IFS='|' read -r rms_name rms_want rms_gone rms_keep; do
+    [ -n "$rms_name" ] || continue
+    rm -f "$TMPDIR/rms/o.zst"
+    if ! "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rms/o.zst" \
+                  "$TMPDIR/rms/$rms_name" >/dev/null 2>&1; then
+      rms_ok=0; rms_why="$rms_why $rms_name:exit"; continue
+    fi
+    # the column 1c-9 lacks: the archive holds the TARGET's bytes
+    rms_got=$("$GZSTD" -d -c "$TMPDIR/rms/o.zst" 2>/dev/null)
+    [ "$rms_got" = "$rms_want" ] || { rms_ok=0; rms_why="$rms_why $rms_name:content($rms_got)"; }
+    # the entry named on the command line is gone (-e follows, so test both)
+    if [ -e "$TMPDIR/rms/$rms_gone" ] || [ -L "$TMPDIR/rms/$rms_gone" ]; then
+      rms_ok=0; rms_why="$rms_why $rms_name:entry-survived"
+    fi
+    # ...and only the entry: a symlink's target is never touched
+    [ -z "$rms_keep" ] || [ -e "$TMPDIR/rms/$rms_keep" ] \
+      || { rms_ok=0; rms_why="$rms_why $rms_name:target-destroyed"; }
+  done <<'RMS_MATRIX'
+plain.txt|PLAIN|plain.txt|
+hard.txt|PLAIN|hard.txt|
+rel.lnk|TARGET|rel.lnk|real.txt
+abs.lnk|TARGET|abs.lnk|real.txt
+out.lnk|OUTSIDE|out.lnk|away/out.txt
+sub.lnk|DEEP|sub.lnk|sub/deep.txt
+chain.lnk|TARGET|chain.lnk|mid.lnk
+RMS_MATRIX
+
+  # A dangling symlink has no data to compress: refuse, remove nothing, and do
+  # not leave an output behind.  O_PATH|O_NOFOLLOW opens a broken link happily,
+  # so this is exactly where "pinned the entry" could wrongly report success.
+  ln -s nope.txt "$TMPDIR/rms/dangling.lnk"
+  rm -f "$TMPDIR/rms/d.zst"
+  if "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rms/d.zst" \
+              "$TMPDIR/rms/dangling.lnk" >/dev/null 2>&1; then
+    rms_ok=0; rms_why="$rms_why dangling:succeeded"
+  fi
+  [ -L "$TMPDIR/rms/dangling.lnk" ] || { rms_ok=0; rms_why="$rms_why dangling:removed"; }
+
+  if [ "$rms_ok" = 1 ]; then
+    pass "--rm input-shape matrix: deletes the entry, compresses its target"
+  else
+    fail "--rm input-shape matrix" "failing cells:$rms_why"
+  fi
+  rm -rf "$TMPDIR/rms"
 
   # 1c-8. THE CLOBBER GUARD ASKS ABOUT WHAT WILL BE DESTROYED, which for a plain
   #     compress means following the symlink — the open does. Answering it with a

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.88";
+static constexpr const char * GZSTD_VERSION = "0.15.89";
 //
 // Architecture overview:
 //
@@ -434,6 +434,79 @@ struct HeldDir {
 };
 
 
+// Open an input through a SINGLE resolution of the user's name, reporting the
+// identity of the ENTRY that name denotes.  Returns the data fd, or -1.
+//
+// --rm has to answer two different questions about one argument: "which ENTRY do
+// I delete" — the symlink itself, because that is what `rm` removes — and "which
+// DATA did I compress", which is its target.  Answering them with two lookups of
+// the same name is defeated by an A->B->A exchange between them: both lookups
+// succeed, and they describe DIFFERENT entries, so --rm could delete a link it
+// never read a byte through.  (One predicate, two questions — the recurring
+// shape; see AGENTS.md.)
+//
+// One lookup, then derive everything from what it pinned:
+//   openat(O_PATH|O_NOFOLLOW)   pins the ENTRY; fstat of it is provably that
+//                               entry, and it works on a dangling link too
+//   symlink -> readlinkat(pinned, "")   the target is read FROM THE PINNED LINK,
+//                                       not from the name, so a later exchange
+//                                       cannot redirect it; a relative target
+//                                       resolves against the parent, which is
+//                                       where the link lives, so that is correct
+//   otherwise -> open("/proc/self/fd/N")  a new description on the SAME inode,
+//                                       with no name left to substitute (the
+//                                       adopt_fd/plain_fd_ trick used elsewhere)
+//
+// THE TWO CASES CANNOT BE UNIFIED: re-opening /proc/self/fd/N when N is an
+// O_PATH|O_NOFOLLOW handle on a symlink fails ELOOP.  Measured, not assumed —
+// it is the reason the obvious one-line version of this fix does not work.
+static int open_input_pinned(const HeldDir & in_dir,
+                             struct stat & entry_id, bool & entry_id_ok)
+{
+  entry_id_ok = false;
+  const int efd = ::openat(in_dir.fd, in_dir.base.c_str(),
+                           O_PATH | O_NOFOLLOW | O_CLOEXEC);
+  if (efd < 0) return -1;
+  if (::fstat(efd, &entry_id) != 0) {
+    const int e = errno; ::close(efd); errno = e; return -1;
+  }
+
+  int ifd = -1;
+  if (S_ISLNK(entry_id.st_mode)) {
+    // st_size is the target length for a symlink, so it is the natural first
+    // guess — but it is NOT reliable: some filesystems report 0 for a symlink,
+    // and sizing the buffer from it alone would refuse every symlinked input
+    // there.  Grow until the read comes back SHORT, which is the only proof the
+    // target was not truncated; a truncated target is a DIFFERENT path, so it is
+    // refused rather than guessed at.
+    size_t cap = (entry_id.st_size > 0 ? (size_t)entry_id.st_size : (size_t)255) + 2;
+    for (;;) {
+      std::string tgt(cap, '\0');
+      const ssize_t n = ::readlinkat(efd, "", &tgt[0], cap);
+      if (n < 0) break;                               // errno set by readlinkat
+      if ((size_t)n < cap) {                          // short read ⇒ complete
+        if (n == 0) { errno = ENOENT; break; }        // empty target: not a path
+        tgt.resize((size_t)n);
+        ifd = ::openat(in_dir.fd, tgt.c_str(), O_RDONLY | O_CLOEXEC);
+        break;
+      }
+      if (cap >= (size_t)PATH_MAX) { errno = ENAMETOOLONG; break; }
+      cap = std::min<size_t>(cap * 2, (size_t)PATH_MAX);
+    }
+  } else {
+    char link[64];
+    std::snprintf(link, sizeof(link), "/proc/self/fd/%d", efd);
+    ifd = ::open(link, O_RDONLY | O_CLOEXEC);
+  }
+
+  const int e = errno;
+  ::close(efd);
+  if (ifd < 0) { errno = e; return -1; }
+  entry_id_ok = true;
+  return ifd;
+}
+
+
 static constexpr unsigned RENAME_NOREPLACE_FLAG = 1u;  // Linux renameat2 ABI
 
 static int renameat_noreplace(int olddirfd, const char * oldpath,
@@ -553,8 +626,35 @@ struct QuarantineDir {
   // while the error message named the original path.  No hostile writer needed —
   // a FUSE or NFS EIO after an accepted rename is enough.
   bool release() {
+    // PROVE THE NAME STILL LEADS TO THE DIRECTORY WE CREATED, before removing it.
+    // acquire() proves the INTERIOR is private (owner + 0700 through the held
+    // fd), but the basename stays movable afterwards: a writer in a non-sticky
+    // shared parent can rename our directory away and leave one of theirs at the
+    // name, and an unconditional unlinkat(name) then removed THEIRS while ours —
+    // possibly still holding the user's input — was stranded under a name nobody
+    // reports.  The held fd is the only thing that knows which directory is ours,
+    // so it decides.
+    //
+    // Residual, and it is bounded: an exchange between this comparison and the
+    // unlinkat cannot be excluded (there is no rmdir-by-descriptor), but
+    // AT_REMOVEDIR refuses a non-empty directory, so the worst outcome is
+    // removing an empty directory that was not ours — never data.  That is a
+    // different class from the compare-then-unlink window on FILES, which is why
+    // this one is worth closing and that one is documented instead.
+    bool ours = false;
+    if (fd >= 0 && parent_fd >= 0 && !name.empty()) {
+      struct stat held, byname;
+      if (::fstat(fd, &held) == 0
+          && ::fstatat(parent_fd, name.c_str(), &byname, AT_SYMLINK_NOFOLLOW) == 0
+          && held.st_dev == byname.st_dev && held.st_ino == byname.st_ino)
+        ours = true;
+    }
     if (fd >= 0) { ::close(fd); fd = -1; }
     if (parent_fd >= 0 && !name.empty()) {
+      // Not ours any more: remove NOTHING and report failure, so the caller
+      // tells the user where the entry went instead of silently deleting a
+      // stranger's directory and claiming success.
+      if (!ours) return false;
       if (::unlinkat(parent_fd, name.c_str(), AT_REMOVEDIR) != 0) return false;
       name.clear();
     }
@@ -25043,6 +25143,14 @@ static int gzstd_main(int argc, char ** argv)
   // --tar synthesizes its input from tar_sources; there is no input FILE*.
   HeldDir in_dir;                 // retained through --rm quarantine/removal
   FILE * in = nullptr;
+  // The entry --rm would delete, identified from the SAME lookup that opened the
+  // data (see open_input_pinned).  Only taken when --rm is in play: pinning costs
+  // two extra syscalls per input, which is a real cost on a many-small-files run
+  // over metadata-cold or networked storage, and nothing else consumes it.
+  const bool want_rm_identity =
+      (!opt.keep && !opt.tar_mode && opt.input != "-");
+  bool in_lid_ok = false;
+  struct stat in_lid{};
   if (!opt.tar_mode) {
     if (opt.input == "-") {
       in = open_input(opt.input);
@@ -25053,8 +25161,11 @@ static int gzstd_main(int argc, char ** argv)
       if (!in_dir.valid())
         die_io("cannot open the input directory " + in_dir.dir + " for "
                + opt.input + " (" + std::strerror(errno) + ")");
-      int ifd = ::openat(in_dir.fd, in_dir.base.c_str(), O_RDONLY | O_CLOEXEC);
-      if (ifd < 0) die_io("cannot open input: " + opt.input);
+      int ifd = want_rm_identity
+              ? open_input_pinned(in_dir, in_lid, in_lid_ok)
+              : ::openat(in_dir.fd, in_dir.base.c_str(), O_RDONLY | O_CLOEXEC);
+      if (ifd < 0) die_io("cannot open input: " + opt.input
+                          + " (" + std::strerror(errno) + ")");
       in = ::fdopen(ifd, "rb");
       if (!in) { const int e = errno; ::close(ifd);
         die_io("cannot open input: " + opt.input + " (" + std::strerror(e) + ")"); }
@@ -25076,26 +25187,14 @@ static int gzstd_main(int argc, char ** argv)
   // One identity cannot answer both, and using only the target's broke every
   // symlinked input the moment the entry moved into a subdirectory, because a
   // RELATIVE link target does not survive the move.
-  // Captured THROUGH THE HELD INPUT DIRECTORY, and coupled to the descriptor we
-  // actually opened.  A fresh full-path lstat() left the two snapshots
-  // independent: replace the input with a symlink between the open and the stat,
-  // and in_lid records the REPLACEMENT while compression proceeds from the
-  // original fd — so --rm would later validate that link against itself and
-  // delete it.  Requiring the name to still LEAD TO the opened inode at the
-  // moment we record the entry's identity is what ties them together.
-  bool in_lid_ok = false;
-  struct stat in_lid{};
-  // Only when --rm was requested: in_lid is consumed by nothing else, and two
-  // extra fstatat per input is a real cost on a many-small-files run over
-  // metadata-cold or networked storage.
-  if (!opt.keep && !opt.tar_mode && opt.input != "-" && in_id_ok && in_dir.valid()) {
-    struct stat lst, tst;
-    if (::fstatat(in_dir.fd, in_dir.base.c_str(), &lst, AT_SYMLINK_NOFOLLOW) == 0
-        && ::fstatat(in_dir.fd, in_dir.base.c_str(), &tst, 0) == 0
-        && tst.st_dev == in_id.st_dev && tst.st_ino == in_id.st_ino) {
-      in_lid = lst; in_lid_ok = true;
-    }
-  }
+  //
+  // in_lid was captured ABOVE, by open_input_pinned, from the same lookup that
+  // produced this descriptor.  It used to be taken here with a pair of fstatat
+  // calls against the name; that left the entry and the target established by
+  // two INDEPENDENT resolutions, which an A->B->A exchange between them defeats
+  // (both succeed, describing different entries).  Deriving both from one pinned
+  // entry is what closes it — the accepted limitation recorded in AGENTS.md
+  // through v0.15.88.
   if (in && in != stdin && !in_id_ok)
     die_io("cannot identify input before starting output transaction: " + opt.input);
 #ifndef _WIN32
@@ -25458,8 +25557,15 @@ static int gzstd_main(int argc, char ** argv)
                    + opt.output + " (" + std::strerror(e) + ")");
           }
           struct stat qid;
+          // overwrite_id_ok is REQUIRED, not decorative: without it this compares
+          // against a zero-initialised struct if any future path reaches here
+          // without the fstat above, and "did not match" would then be indistinguishable
+          // from "was never identified".  Both refuse, but only one of them is a
+          // decision.  (It was set-but-never-read until now, which is exactly how
+          // an identity check goes missing without anything failing.)
           const bool qmatch =
-              (::fstatat(oq.fd, "old", &qid, AT_SYMLINK_NOFOLLOW) == 0
+              (overwrite_id_ok
+               && ::fstatat(oq.fd, "old", &qid, AT_SYMLINK_NOFOLLOW) == 0
                && qid.st_dev == overwrite_id.st_dev
                && qid.st_ino == overwrite_id.st_ino);
           if (!qmatch) {
