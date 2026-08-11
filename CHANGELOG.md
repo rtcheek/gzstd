@@ -1,9 +1,81 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.81  
+**Covers:** v0.9.50 → v0.15.84  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+
+## v0.15.84 — the reviewer wrote the patch, and two product decisions
+
+Round 11 returned five HIGHs and named an exact correction for each, so the arrangement was
+inverted: **the reviewer wrote the code and I adjudicated it.** Eleven rounds of me writing the
+fixes had produced a regression in three consecutive releases, so the experiment was worth
+running.
+
+It applied eight corrections. **Six went in as written**, each verified against its own defect:
+the hardlink omission (a hardlink output has the same inode as its source, so the pre-existing
+archive must be excluded as a directory *entry* — parent dev/ino plus basename — not as an
+inode); `--rm` and `--overwrite` quarantine ordering; the `--adapt` profile transaction on a
+held directory; `--calibrate` confirming its unlink; and the dangling-symlink registration.
+
+**One was rejected in part.** It deleted `cleanup_tmp_file()` outright, taking the SYNCHRONOUS
+fatal-path cleanup along with the asynchronous one — so a disk-full compress started leaving a
+partial archive behind, against a test that asserts otherwise. The async reasoning was right; a
+signal handler must not use a BORROWED descriptor, because the owner can close it and the next
+`open()` reuses the number. But `die() → exit()` does not unwind main, so the descriptor is
+still the right one there. The fix is to stop borrowing, not to stop cleaning up.
+
+**And it broke the endian guard** with a `getrandom` call — a legitimate hit, not an on-disk
+read, needing an exemption. It could not have known: there is no toolchain in the review
+sandbox, which is why it was told to say the edits were unbuilt rather than claim otherwise.
+
+Its summary said the 30-cell matrix expectations were unchanged. That was true of the
+ASSERTIONS and false of the BEHAVIOUR — `-o dangling-symlink -f` now replaces the link instead
+of following it. The matrix asserted exit code, survival and completeness but not **what the
+output name became**. There is a KIND column now, and the new behaviour is better: dangling is
+consistent with every other symlink shape instead of being the one case that writes to a path
+the user never named.
+
+### Two product decisions, measured against stock zstd
+
+**`--overwrite` is unlink-first again.** The quarantine held the old output until installation,
+which closed a race but cost the flag both properties it exists for — peak usage became old +
+new, and a 400 GiB archive would need 800 GiB free. It now quarantines and unlinks
+**immediately**: `renameat2(RENAME_NOREPLACE)` is atomic, so the entry is moved aside, proven to
+be the one identified, and removed — same space and time profile as a plain unlink, and a file
+another process creates at that path still cannot be deleted. The trade that remains is the
+honest one, and it is now in `-h` and `--help`: **not atomic**, so a failed run leaves neither
+old nor new.
+
+**SIGINT removes the partial output, matching zstd.** Measured, not assumed: `zstd -f`
+interrupted mid-compress removes its output and exits 2. Note the asymmetry both tools now
+share — **signal → remove, write error → leave**. One place gzstd deliberately does NOT match:
+interrupted while overwriting, zstd destroys the old archive because it truncated in place;
+gzstd's `-f` is atomic, so the old archive survives. Copying that would be a downgrade.
+
+Also corrected while testing: the help claimed `--overwrite` produces "a NEW INODE". The inode
+NUMBER is recycled by the filesystem — measured — though the substantive claim holds (the old
+inode is released; a hard link to the old archive keeps its content and the link count drops).
+
+### The tests, including two of my own that were not fit to ship
+
+Codex added five matrix cases; the hardlink-descendant one catches its own HIGH. I added two
+more for the product decisions — and the first versions were **timing-dependent**, using
+`sleep 2` before acting. One extensive run failed exactly two tests; both are now event-driven,
+waiting until the temp file exists so the signal is guaranteed to land mid-write, with an
+explicit skip if the work finishes first. Five consecutive extensive runs clean since, with the
+SIGINT test confirmed to run rather than skip.
+
+A flaky test is worse than no test: it teaches people to re-run until green, which is exactly
+how a real intermittent failure gets waved through. Both were also checked to still FAIL
+against the design they were written to prevent — the `--overwrite` one initially passed on
+both designs, guarding the documentation and not the semantics, and needed a mid-run assertion
+to distinguish them.
+
+Suite: **401** (534 extensive), green on both build configurations.
 
 ---
 

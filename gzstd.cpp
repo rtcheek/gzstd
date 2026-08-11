@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.81";
+static constexpr const char * GZSTD_VERSION = "0.15.84";
 //
 // Architecture overview:
 //
@@ -231,7 +231,7 @@ static void set_binary_mode(FILE * f)
 }
 
 /*======================================================================
- Temp file cleanup  remove partial output on error / signal
+ Temp file registration for diagnostics and controlled disarming
 ======================================================================*/
 // The in-progress temp file: its FINAL COMPONENT plus a descriptor for the
 // directory holding it. Empty when no temp file is active.
@@ -244,17 +244,23 @@ static void set_binary_mode(FILE * f)
 // at the path. Cleanup is the last thing to run and was the last thing still
 // resolving a name.
 //
-// unlinkat(dirfd, base, 0) is async-signal-safe exactly as unlink() is, and the
-// descriptor is one the process already opened and validated.
 static char g_tmp_base[4096] = {};
 static volatile sig_atomic_t g_tmp_active = 0;
 static volatile sig_atomic_t g_tmp_dirfd  = -1;   // NOT owned; do not close here
+static volatile sig_atomic_t g_termination_signal = 0;
 
+// SYNCHRONOUS cleanup only — never from a signal handler.
+//
+// Round 11 was right that an ASYNC handler must not unlink: it can run on a
+// worker, be descheduled, and resume after main has closed and REUSED the
+// directory fd. But that race needs main to keep running. die() calls exit(),
+// which does not unwind main's scope, so the OutputDir and its descriptor are
+// still alive and still correct when atexit fires — and removing this along with
+// the handler's copy lost the tested guarantee that a failed compress leaves no
+// partial archive behind (the disk-full case exits 3 and must clean up).
 static void cleanup_tmp_file()
 {
   if (g_tmp_active && g_tmp_base[0] != '\0') {
-    // Runs from the SIGINT/SIGTERM handler: unlinkat() is async-signal-safe,
-    // unlike std::remove()'s libc wrapper.  Best-effort; ignore errors.
 #ifndef _WIN32
     if (g_tmp_dirfd >= 0) ::unlinkat((int)g_tmp_dirfd, g_tmp_base, 0);
 #else
@@ -267,14 +273,33 @@ static void cleanup_tmp_file()
 
 // `dirfd` must outlive the registration: the OutputDir holding it lives for the
 // whole output transaction, and clear_tmp_file() disarms this before it dies.
+//
+// The registry owns its OWN descriptor for the directory, installed with dup2()
+// into a slot it keeps for the life of the process. That is what makes the
+// SIGINT cleanup below safe to perform from a handler:
+//
+//   * the slot's fd NUMBER never changes and is never handed to anything else,
+//     so it can never come to mean a different directory the way a borrowed fd
+//     does when its owner closes it and the next open() reuses the number;
+//   * the caller may close its own copy whenever it likes.
+//
+// Round 11 was right that a handler must not use a BORROWED descriptor. It is
+// the borrowing that was unsafe, not the unlink.
+static int g_tmp_dir_slot = -1;         // our permanent handle; dup2 target
+
 static void register_tmp_file_at(int dirfd, const std::string & base)
 {
-  if (base.size() < sizeof(g_tmp_base)) {
-    std::strncpy(g_tmp_base, base.c_str(), sizeof(g_tmp_base) - 1);
-    g_tmp_base[sizeof(g_tmp_base) - 1] = '\0';
-    g_tmp_dirfd = (sig_atomic_t)dirfd;
-    g_tmp_active = 1;
+  if (base.size() >= sizeof(g_tmp_base)) return;
+  if (g_tmp_dir_slot < 0) {
+    g_tmp_dir_slot = ::dup(dirfd);      // first use: claim a number for good
+    if (g_tmp_dir_slot < 0) return;     // no slot, no async cleanup
+  } else if (::dup2(dirfd, g_tmp_dir_slot) < 0) {
+    return;
   }
+  std::strncpy(g_tmp_base, base.c_str(), sizeof(g_tmp_base) - 1);
+  g_tmp_base[sizeof(g_tmp_base) - 1] = '\0';
+  g_tmp_dirfd = (sig_atomic_t)g_tmp_dir_slot;
+  g_tmp_active = 1;
 }
 
 static void clear_tmp_file()
@@ -284,12 +309,35 @@ static void clear_tmp_file()
   g_tmp_base[0] = '\0';
 }
 
-// Signal handler for SIGINT / SIGTERM: clean up temp file, then re-raise
-// to get the correct exit status (128 + signum) for the parent process.
+// Signal handlers must not unlink a pathname while worker threads can still be
+// changing the output transaction.  Leave the registered partial file in place;
+// an unrelated unlink is worse than a partial output the user can inspect/remove.
+// Re-raise to retain the normal signal exit status.
+// Remove the partial output, then die of the signal.
+//
+// This MATCHES STOCK ZSTD, which was measured rather than assumed: `zstd -f`
+// interrupted mid-compress removes its output file and exits 2, whether the
+// output was new or was replacing an existing archive. (Its behaviour on a WRITE
+// ERROR is the opposite — it leaves the partial — and gzstd matches that too, in
+// cleanup_tmp_file's caller.) A gzstd that left partial archives behind on Ctrl-C
+// would surprise anyone who reaches for it as a zstd replacement.
+//
+// Safe from a handler only because the registry holds its OWN descriptor for the
+// directory (see register_tmp_file_at): unlinkat() through a slot whose number
+// this process owns permanently cannot resolve to some other directory. Round 11
+// identified the borrowed-descriptor version of this as unsafe and was correct;
+// the fix is to stop borrowing, not to stop cleaning up.
+//
+// Residual, stated rather than hidden: the base name and the directory slot are
+// two locations, so a handler that reads one before a new file's registration
+// and the other after could unlink the previous name in the new directory. It
+// needs a multi-file run interrupted inside a few instructions of a registration.
 static void signal_cleanup_handler(int signum)
 {
-  cleanup_tmp_file();
-  // Restore default handler and re-raise so the shell sees the signal exit
+  g_termination_signal = signum;
+  if (g_tmp_active && g_tmp_base[0] != '\0' && g_tmp_dirfd >= 0)
+    ::unlinkat((int)g_tmp_dirfd, g_tmp_base, 0);   // async-signal-safe
+  g_tmp_active = 0;
   std::signal(signum, SIG_DFL);
   std::raise(signum);
 }
@@ -301,13 +349,79 @@ static void setup_signal_handlers()
   // instead of killing the process  (critical for: gzstd | head)
   std::signal(SIGPIPE, SIG_IGN);
 #endif
-  // Clean up temp files on interrupt / termination
+  // Both paths clean up, matching stock zstd on SIGINT (measured: it removes its
+  // output and exits 2). The handler is safe because the registry owns its own
+  // directory descriptor; the atexit path covers die()->exit().
   std::signal(SIGINT, signal_cleanup_handler);
   std::signal(SIGTERM, signal_cleanup_handler);
-
-  // atexit covers die() and any other non-signal abnormal exit
   std::atexit(cleanup_tmp_file);
 }
+
+#ifndef _WIN32
+// A directory held across a pathname transaction.  Unlike OutputDir this has no
+// relationship with the process-global output cleanup registration, so profile
+// and input transactions can use it without disarming another operation.
+struct HeldDir {
+  int         fd = -1;
+  std::string dir, base;
+
+  bool valid() const { return fd >= 0; }
+
+  void acquire(const std::string & path) {
+    const size_t slash = path.find_last_of('/');
+    dir  = (slash == std::string::npos) ? std::string(".")
+         : (slash == 0)                 ? std::string("/")
+                                        : path.substr(0, slash);
+    base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    if (base.empty()) return;
+    fd = ::open(dir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+  }
+
+  void release() {
+    if (fd >= 0) { ::close(fd); fd = -1; }
+  }
+
+  ~HeldDir() { release(); }
+};
+
+static constexpr unsigned RENAME_NOREPLACE_FLAG = 1u;  // Linux renameat2 ABI
+
+static int renameat_noreplace(int olddirfd, const char * oldpath,
+                              int newdirfd, const char * newpath)
+{
+#ifdef SYS_renameat2
+  for (;;) {
+    const int rc = (int)::syscall(SYS_renameat2, olddirfd, oldpath,
+                                  newdirfd, newpath, RENAME_NOREPLACE_FLAG);
+    if (rc == 0 || errno != EINTR) return rc;
+  }
+#else
+  (void)olddirfd; (void)oldpath; (void)newdirfd; (void)newpath;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+static bool random_u64(uint64_t & value)
+{
+#ifdef SYS_getrandom
+  size_t off = 0;
+  while (off < sizeof value) {
+    ssize_t n = ::syscall(SYS_getrandom,
+                          reinterpret_cast<char *>(&value) + off,
+                          sizeof value - off, 0);
+    if (n < 0) { if (errno == EINTR) continue; return false; }
+    if (n == 0) { errno = EIO; return false; }
+    off += (size_t)n;
+  }
+  return true;
+#else
+  (void)value;
+  errno = ENOSYS;
+  return false;
+#endif
+}
+#endif
 
 /*======================================================================
  Constants
@@ -1190,6 +1304,10 @@ static void die(const std::string & msg, int code = EXIT_ERROR)
   if (g_verbosity >= V_ERROR) {
     std::cerr << "gzstd: ERROR: " << msg << "\n";
     if (g_tmp_active && g_tmp_base[0] != '\0')
+      // Says REMOVING, because the synchronous cleanup this path registers does
+      // remove it (see cleanup_tmp_file).  Round 12's patch changed this to "left
+      // at" when it deleted that cleanup wholesale; restoring the cleanup without
+      // restoring the message would have made the diagnostic contradict the act.
       std::cerr << "gzstd: removing incomplete output: " << g_tmp_base << "\n";
   }
   std::exit(code);
@@ -1222,7 +1340,9 @@ static void print_help()
 "  -c                  write to stdout\n"
 "  -o, --output FILE   explicit output path\n"
 "  -f                  overwrite existing file (atomic: .tmp + rename)\n"
-"  --overwrite         overwrite in place (faster on ext4; non-atomic)\n"
+"  --overwrite         remove the old output FIRST, then write (no temp copy;\n"
+"                      faster + no double space on ext4; NOT atomic — a failed\n"
+"                      run leaves you with neither old nor new)\n"
 "\n"
 "Archive (tar):\n"
 "  --tar SRC...        build one .tar.zst from the files/dirs listed after\n"
@@ -1434,13 +1554,34 @@ static void print_help_long()
 "     --overwrite if that cost is unacceptable.\n"
 "\n"
 "  --overwrite\n"
-"     Force overwrite without a temp file or rename.  An existing REGULAR\n"
-"     target is REMOVED and a new file is created at the same path — the\n"
-"     output is a NEW INODE, not the old one truncated.  Consequences:\n"
-"     hard links to the old inode keep the OLD content, and the old\n"
-"     inode's ownership/permissions/xattrs do not carry over.\n"
-"     Faster than -f on ext4 with large outputs, but NOT atomic: if\n"
-"     gzstd is killed mid-run the target is left corrupt/partial.\n"
+"     UNLINK-FIRST.  The existing output is removed BEFORE the new one is\n"
+"     written, which is the whole point of the flag:\n"
+"\n"
+"       * no second copy on disk.  -f writes a temp beside the target and\n"
+"         renames, so it needs room for the old AND new archive at once;\n"
+"         --overwrite needs room for one.  On a 400 GiB archive that is\n"
+"         the difference between 400 and 800 GiB free.\n"
+"       * no O(file_size) truncate.  Replacing a huge file in place makes\n"
+"         ext4 free every extent the inode references (10-30 s on 400+\n"
+"         GiB).  Unlinking releases the inode immediately and the extents\n"
+"         free in the background.\n"
+"\n"
+"     THE TRADE, and it is the reason this is not the default: the flag is\n"
+"     NOT ATOMIC.  The old archive is gone before the new one exists, so a\n"
+"     run that fails or is killed leaves you with NEITHER.  With -f the old\n"
+"     archive survives until the new one is complete.  Use --overwrite when\n"
+"     the output is large and you can regenerate it; use -f otherwise.\n"
+"\n"
+"     (The removal itself is safe: the entry is moved aside atomically and\n"
+"     proven to be the file that was identified before it is deleted, so a\n"
+"     file another process creates at that path is never removed.  What you\n"
+"     are trading away is atomicity of the REPLACEMENT, not integrity.)\n"
+"\n"
+"     The output is a NEW FILE, not the old one truncated — the old inode\n"
+"     is released rather than reused.  So hard links to the old archive\n"
+"     keep the OLD content, and its ownership/permissions/xattrs do not\n"
+"     carry over.  (The inode NUMBER may be recycled by the filesystem;\n"
+"     it is the same file only in the sense that ls shows one name.)\n"
 "     Implies -f.\n"
 "\n"
 "  --[no-]sparse\n"
@@ -4069,12 +4210,8 @@ enum class AdaptProfileRead {
 // so.  The loader itself has no verbosity context.
 static bool g_adapt_schema_reset = false;
 
-static AdaptProfileRead adapt_profile_load(const std::string & path, AdaptJv & root)
+static AdaptProfileRead adapt_profile_parse(const std::string & text, AdaptJv & root)
 {
-  if (path.empty()) return AdaptProfileRead::UNUSABLE;
-  std::ifstream f(path, std::ios::binary);
-  if (!f) return AdaptProfileRead::UNUSABLE;
-  std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   if (text.empty() || text.size() > 1u << 20) return AdaptProfileRead::UNUSABLE;  // >1 MiB: not ours
   AdaptJsonParser p(text.data(), text.size());
   if (!p.parse(root) || root.t != AdaptJv::OBJ) return AdaptProfileRead::UNUSABLE;
@@ -4084,6 +4221,36 @@ static AdaptProfileRead adapt_profile_load(const std::string & path, AdaptJv & r
   }
   return AdaptProfileRead::OK;
 }
+
+static AdaptProfileRead adapt_profile_load(const std::string & path, AdaptJv & root)
+{
+  if (path.empty()) return AdaptProfileRead::UNUSABLE;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return AdaptProfileRead::UNUSABLE;
+  std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  return adapt_profile_parse(text, root);
+}
+
+#ifndef _WIN32
+static AdaptProfileRead adapt_profile_load_at(int dirfd, const std::string & base,
+                                              AdaptJv & root)
+{
+  int fd = ::openat(dirfd, base.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return AdaptProfileRead::UNUSABLE;
+  std::string text;
+  char buf[64 * 1024];
+  bool ok = true;
+  for (;;) {
+    ssize_t n = ::read(fd, buf, sizeof buf);
+    if (n < 0) { if (errno == EINTR) continue; ok = false; break; }
+    if (n == 0) break;
+    text.append(buf, (size_t)n);
+    if (text.size() > 1u << 20) { ok = false; break; }
+  }
+  ::close(fd);
+  return ok ? adapt_profile_parse(text, root) : AdaptProfileRead::UNUSABLE;
+}
+#endif
 
 // One process's accumulated observation, filled on the main thread as each
 // operation finishes (multi-file runs sum; rates derive from the sums).
@@ -4565,17 +4732,25 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   // would drop the lock with the inode — makes the transaction atomic between
   // cooperating processes.  Best-effort by design: the profile is a regenerable
   // cache, so failing to lock must not fail the run.
+  std::error_code mkdir_ec;
+  fs::create_directories(fs::path(path).parent_path(), mkdir_ec);
+  HeldDir profile_dir;
+  profile_dir.acquire(path);
+  if (!profile_dir.valid()) {
+    adapt_warn_save_failed(opt, "cannot open the profile directory for " + path);
+    return;
+  }
+
   struct ProfileLock {
     int fd = -1;
-    explicit ProfileLock(const std::string & p) {
-      std::error_code ec;
-      fs::create_directories(fs::path(p).parent_path(), ec);
-      fd = ::open((p + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    ProfileLock(int dirfd, const std::string & base) {
+      fd = ::openat(dirfd, (base + ".lock").c_str(),
+                    O_RDWR | O_CREAT | O_CLOEXEC, 0600);
       if (fd >= 0 && ::flock(fd, LOCK_EX) != 0) { ::close(fd); fd = -1; }
     }
     bool held() const { return fd >= 0; }
     ~ProfileLock() { if (fd >= 0) { ::flock(fd, LOCK_UN); ::close(fd); } }
-  } plock(path);
+  } plock(profile_dir.fd, profile_dir.base);
   // Without the lock, the load/merge/rename below is the very lost-update race
   // the lock exists to prevent — proceeding anyway just reintroduced it whenever
   // the sidecar could not be opened.  The profile is a REGENERABLE CACHE, so the
@@ -4586,11 +4761,19 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   }
 
   AdaptJv root;
-  const AdaptProfileRead rd = adapt_profile_load(path, root);
+  const AdaptProfileRead rd = adapt_profile_load_at(profile_dir.fd, profile_dir.base, root);
   if (rd != AdaptProfileRead::OK) {
     root = AdaptJv{};
     root.t = AdaptJv::OBJ;
-    if (fs::exists(path))
+    struct stat pst;
+    const bool profile_present =
+        (::fstatat(profile_dir.fd, profile_dir.base.c_str(), &pst,
+                   AT_SYMLINK_NOFOLLOW) == 0);
+    if (!profile_present && errno != ENOENT) {
+      adapt_warn_save_failed(opt, "cannot identify " + path);
+      return;
+    }
+    if (profile_present)
       vlog(V_VERBOSE, opt, rd == AdaptProfileRead::STALE
              ? "[ADAPT] profile written under an older schema; starting fresh: " + path + "\n"
              : "[ADAPT] profile unreadable; rewriting: " + path + "\n");
@@ -4669,8 +4852,6 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   adapt_json_emit(root, text, 0);
   text += '\n';
 
-  std::error_code ec;
-  fs::create_directories(fs::path(path).parent_path(), ec);
   // Unpredictable name, created EXCLUSIVELY, written through the fd.
   //
   // This was `profile.json.tmp.<pid>` opened with std::ofstream(trunc), which
@@ -4679,7 +4860,7 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
   // qualifying --adapt run truncate and overwrite it, and the rename then
   // installed the symlink as profile.json.  Same shape as the output temp file
   // fixed earlier; this one was simply in a quieter corner.
-  std::string tmp;
+  std::string tmp, tmp_base;
   int tfd = -1;
   {
     unsigned seed = (unsigned)getpid()
@@ -4689,8 +4870,9 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
       char sfx[40];
       std::snprintf(sfx, sizeof sfx, ".tmp.%d.%08x", (int)getpid(), seed);
       tmp = path + sfx;
-      tfd = ::open(tmp.c_str(),
-                   O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+      tmp_base = profile_dir.base + sfx;
+      tfd = ::openat(profile_dir.fd, tmp_base.c_str(),
+                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
       if (tfd >= 0) break;
       if (errno != EEXIST) break;
     }
@@ -4709,13 +4891,14 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
     if (::close(tfd) != 0) wrote_ok = false;
     if (!wrote_ok) {
       adapt_warn_save_failed(opt, "write failed: " + tmp);
-      ::unlink(tmp.c_str());
+      ::unlinkat(profile_dir.fd, tmp_base.c_str(), 0);
       return;
     }
   }
-  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+  if (::renameat(profile_dir.fd, tmp_base.c_str(),
+                 profile_dir.fd, profile_dir.base.c_str()) != 0) {
     adapt_warn_save_failed(opt, "cannot install " + path);
-    ::unlink(tmp.c_str());
+    ::unlinkat(profile_dir.fd, tmp_base.c_str(), 0);
     return;
   }
   vlog(V_VERBOSE, opt, std::string("[ADAPT] profile updated (") + dname + ", "
@@ -5230,6 +5413,11 @@ struct OutputDir {
     if (base.empty()) return;                 // "dir/" is not a file name
     fd = ::open(dir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
   }
+  // Closing this descriptor must not leave the diagnostic registration pointing
+  // at an fd number that the next iteration can reuse.  Disarming here makes the
+  // registration's lifetime a subset of the descriptor's by construction.
+  // No longer disarms the registration: it holds its own dup of this directory
+  // (see register_tmp_file_at), so closing ours cannot invalidate it.
   void release() { if (fd >= 0) { ::close(fd); fd = -1; } }
   ~OutputDir() { release(); }
 };
@@ -12737,19 +12925,43 @@ static std::atomic<bool> g_tar_had_errors{false};
 // before the walk runs, so an archive placed inside the tree being archived is
 // just another file to the scan: `gzstd -f -o root/a.tar.zst --tar root` stored
 // a zero-length member for the archive itself, and re-running a backup nested
-// the previous archive inside the new one.  Holds up to two entries — the file
-// being written (the final output, or the temp on the atomic path) and the
-// existing archive the temp will replace.  Compared by (dev, ino) rather than by
-// name so a symlinked or bind-mounted alias of the same inode is caught too.
+// the previous archive inside the new one.  The descriptor being written (the
+// final output, or the temp on an atomic path) is compared by (dev, ino) so every
+// alias is caught.
 // GNU tar reports this case as "file is the archive; not dumped".
 // Written once in main() before any walk thread starts; read-only thereafter.
 static std::vector<std::pair<dev_t, ino_t>> g_tar_output_ids;
+
+// A pre-existing archive is different: another hardlink to that inode is source
+// data and must be archived.  Skip only the directory entry that the completed
+// temp will replace, identified by its held parent and final component.
+struct TarOutputEntryId {
+  dev_t parent_dev;
+  ino_t parent_ino;
+  std::string base;
+};
+static std::vector<TarOutputEntryId> g_tar_output_entries;
 
 static bool tar_entry_is_the_archive(const struct stat & st)
 {
   for (const auto & id : g_tar_output_ids)
     if (st.st_dev == id.first && st.st_ino == id.second) return true;
   return false;
+}
+
+enum class TarOutputEntryMatch { NO, YES, UNKNOWN };
+
+static TarOutputEntryMatch tar_entry_is_the_old_archive(
+    bool parent_id_ok, dev_t parent_dev, ino_t parent_ino,
+    const std::string & base)
+{
+  for (const auto & entry : g_tar_output_entries) {
+    if (entry.base != base) continue;
+    if (!parent_id_ok) return TarOutputEntryMatch::UNKNOWN;
+    if (entry.parent_dev == parent_dev && entry.parent_ino == parent_ino)
+      return TarOutputEntryMatch::YES;
+  }
+  return TarOutputEntryMatch::NO;
 }
 
 // Does `path` live inside any of these directories, by IDENTITY?
@@ -13194,6 +13406,10 @@ struct LayoutBuilder {
     std::string fspath, member;
     dev_t       boundary_dev;
     bool        is_dir;
+    bool        parent_id_ok;
+    dev_t       parent_dev;
+    ino_t       parent_ino;
+    std::string entry_base;
     // filled by Pass B (all default-initialized so partial aggregate-init is clean):
     struct stat st {};
     std::string link {};         // readlink target (symlinks)
@@ -13281,7 +13497,9 @@ struct LayoutBuilder {
   // learn dir-ness) or --one-file-system on a directory (st_dev drives the
   // mount-crossing / descent decision, which must be known before recursing).
   void enumerate(const std::string & fspath, const std::string & member,
-                 dev_t boundary_dev, int dtype) {
+                 dev_t boundary_dev, int dtype,
+                 bool parent_id_ok = false, dev_t parent_dev = 0,
+                 ino_t parent_ino = 0, const std::string & entry_base = {}) {
     if (excluded(fspath)) return;
 
     bool is_dir;
@@ -13299,7 +13517,8 @@ struct LayoutBuilder {
       // Leaf.  The --one-file-system cross-check is deferred to Pass C (a leaf
       // is on its parent's filesystem unless it is itself a bind-mount, the rare
       // case Pass C still catches via the parallel-lstat st_dev).  No lstat here.
-      pending_.push_back({fspath, member, boundary_dev, false});  // rest default-init
+      pending_.push_back({fspath, member, boundary_dev, false,
+                          parent_id_ok, parent_dev, parent_ino, entry_base});
       return;
     }
 
@@ -13320,12 +13539,15 @@ struct LayoutBuilder {
     // an absolute source's members are stored leading-'/'-stripped with no root
     // entry, matching GNU tar (`/` → `proc/`, `home/...`, not `./proc`).
     if (!member.empty())
-      pending_.push_back({fspath, member, boundary_dev, true});   // rest default-init
+      pending_.push_back({fspath, member, boundary_dev, true,
+                          parent_id_ok, parent_dev, parent_ino, entry_base});
 
     if (cross) return;  // mount-point stub recorded; do not descend
 
     DIR * d = ::opendir(fspath.c_str());
     if (!d) { warn_skip(fspath, std::strerror(errno)); return; }
+    struct stat dir_st;
+    const bool dir_id_ok = (::fstat(::dirfd(d), &dir_st) == 0);
     std::vector<std::pair<std::string, int>> kids;  // (name, d_type)
     for (struct dirent * de; (de = ::readdir(d)); ) {
       if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
@@ -13341,7 +13563,9 @@ struct LayoutBuilder {
     const std::string cpre = (member == "/") ? "/" : (base.empty() ? "" : base + "/");
     const std::string sep = (!fspath.empty() && fspath.back() == '/') ? "" : "/";
     for (const auto & k : kids)
-      enumerate(fspath + sep + k.first, cpre + k.first, child_boundary, k.second);
+      enumerate(fspath + sep + k.first, cpre + k.first, child_boundary, k.second,
+                dir_id_ok, dir_id_ok ? dir_st.st_dev : 0,
+                dir_id_ok ? dir_st.st_ino : 0, k.first);
   }
 
   // --sparse: build a regular file's data-segment map from filesystem hole
@@ -13427,6 +13651,17 @@ struct LayoutBuilder {
       // cold-inode storm it exists to keep off the serial path), while Pass B has
       // already stat'd everything by the time we get here — so identity is free
       // at this point and would cost a syscall per leaf at the other.
+      const TarOutputEntryMatch old_archive = tar_entry_is_the_old_archive(
+          p.parent_id_ok, p.parent_dev, p.parent_ino, p.entry_base);
+      if (old_archive == TarOutputEntryMatch::UNKNOWN) {
+        warn_skip(p.fspath, "cannot identify its parent while excluding the old archive");
+        continue;
+      }
+      if (old_archive == TarOutputEntryMatch::YES) {
+        vlog(V_VERBOSE, opt, "[TAR] " + p.fspath
+             + ": file is the archive; not dumped\n");
+        continue;
+      }
       if (!g_tar_output_ids.empty() && tar_entry_is_the_archive(st)) {
         vlog(V_VERBOSE, opt, "[TAR] " + p.fspath
              + ": file is the archive; not dumped\n");
@@ -13765,7 +14000,16 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
         si < opt.tar_source_dest.size() ? opt.tar_source_dest[si] : std::string(".");
     if (!src.empty() && src[0] != '/' && cdir != ".")
       fspath = cdir + "/" + src;
-    b.enumerate(fspath, member, (dev_t)-1, DT_UNKNOWN);
+    HeldDir source_parent;
+    source_parent.acquire(fspath);
+    struct stat source_parent_st;
+    const bool source_parent_ok = source_parent.valid()
+        && ::fstat(source_parent.fd, &source_parent_st) == 0;
+    b.enumerate(fspath, member, (dev_t)-1, DT_UNKNOWN,
+                source_parent_ok,
+                source_parent_ok ? source_parent_st.st_dev : 0,
+                source_parent_ok ? source_parent_st.st_ino : 0,
+                source_parent.base);
   }
   double enum_s = _secs(t_enum0, _clk::now());
   // Pass B: parallel lstat (the cold-inode storm).
@@ -24354,7 +24598,22 @@ static int run_calibrate(Options opt)
     // meant the cleanup had to find it again later by path, which is a second
     // resolution an attacker can redirect.  Removing it here means there is no
     // name left to race, and an abnormal exit cannot leave the file behind either.
-    ::unlinkat(cal_dir.fd, cal_dir.base.c_str(), 0);
+    int unlink_rc;
+    do {
+      unlink_rc = ::unlinkat(cal_dir.fd, cal_dir.base.c_str(), 0);
+    } while (unlink_rc != 0 && errno == EINTR);
+    if (unlink_rc != 0) {
+      const int unlink_err = errno;
+      struct stat still;
+      const int stat_rc = ::fstatat(cal_dir.fd, cal_dir.base.c_str(), &still,
+                                    AT_SYMLINK_NOFOLLOW);
+      if (stat_rc == 0 || errno != ENOENT) {
+        const int e = (stat_rc == 0) ? unlink_err : errno;
+        ::close(cfd);
+        die_io("--calibrate: cannot remove the sink target name before measuring "
+               + po.output + " (" + std::strerror(e) + ")");
+      }
+    }
     FILE * outf = ::fdopen(cfd, "wb");
     if (!outf) ::close(cfd);
     if (in && outf) {
@@ -24641,7 +24900,25 @@ static int gzstd_main(int argc, char ** argv)
   }
 
   // --tar synthesizes its input from tar_sources; there is no input FILE*.
-  FILE * in = opt.tar_mode ? nullptr : open_input(opt.input);
+  HeldDir in_dir;                 // retained through --rm quarantine/removal
+  FILE * in = nullptr;
+  if (!opt.tar_mode) {
+    if (opt.input == "-") {
+      in = open_input(opt.input);
+    } else {
+      // Hold the input parent before opening the leaf, then use that descriptor
+      // for both operations.  --rm must never re-resolve an exchanged parent.
+      in_dir.acquire(opt.input);
+      if (!in_dir.valid())
+        die_io("cannot open the input directory " + in_dir.dir + " for "
+               + opt.input + " (" + std::strerror(errno) + ")");
+      int ifd = ::openat(in_dir.fd, in_dir.base.c_str(), O_RDONLY | O_CLOEXEC);
+      if (ifd < 0) die_io("cannot open input: " + opt.input);
+      in = ::fdopen(ifd, "rb");
+      if (!in) { const int e = errno; ::close(ifd);
+        die_io("cannot open input: " + opt.input + " (" + std::strerror(e) + ")"); }
+    }
+  }
   // CAPTURE THE INPUT'S IDENTITY WHILE WE HOLD IT OPEN.  --rm removes opt.input
   // by a fresh pathname resolution at the very end of the run, so renaming the
   // input away mid-run and dropping another file at that name made gzstd
@@ -24651,6 +24928,8 @@ static int gzstd_main(int argc, char ** argv)
   bool in_id_ok = false;
   struct stat in_id{};
   if (in && in != stdin && ::fstat(fileno(in), &in_id) == 0) in_id_ok = true;
+  if (in && in != stdin && !in_id_ok)
+    die_io("cannot identify input before starting output transaction: " + opt.input);
 #ifndef _WIN32
   // --cold (benchmarking only): drop the input file from the kernel's page
   // cache before reading so repeated benchmark iterations don't measure
@@ -24684,6 +24963,9 @@ static int gzstd_main(int argc, char ** argv)
 
   std::string tmp;         // non-empty only when using atomic temp file (-f overwrite)
   bool use_atomic = false; // true when writing to .tmp then renaming
+  bool overwrite_id_ok = false;
+  struct stat overwrite_id{};
+  bool output_name_was_present = false;
   FILE * out = nullptr;
   OutputDir out_dir;              // held for the WHOLE output transaction
   std::string tmp_base;           // the temp's final component, for renameat
@@ -24727,6 +25009,7 @@ static int gzstd_main(int argc, char ** argv)
     struct stat out_lst, out_tst;
     const bool out_present =
         (::fstatat(out_dir.fd, out_dir.base.c_str(), &out_lst, AT_SYMLINK_NOFOLLOW) == 0);
+    output_name_was_present = out_present;
     if (!out_present && errno != ENOENT)
       die_io("cannot determine whether the output " + opt.output
              + " already exists (" + std::strerror(errno) + ")");
@@ -24833,8 +25116,8 @@ static int gzstd_main(int argc, char ** argv)
         // A DIRECTORY source contributes its descendants too, and the output
         // could alias one of them.  Comparing every descendant up front would
         // mean walking the tree twice, so instead reject an output that lives
-        // ANYWHERE under a directory source when it would be destroyed
-        // (--overwrite unlinks it before the walk).  Writing INTO a source dir
+        // ANYWHERE under a directory source when --overwrite would replace it.
+        // Writing INTO a source dir
         // with -f stays allowed: that path creates a temp and renames, so the
         // source is never unlinked, and the walk now skips the archive itself.
         if (S_ISDIR(ss.st_mode) && opt.unsafe_overwrite)
@@ -24918,121 +25201,119 @@ static int gzstd_main(int argc, char ** argv)
     // `out_is_reg` uses AT_SYMLINK_NOFOLLOW, so a symlink is no longer counted as
     // "a regular file exists here" — it is a symlink, and the routes below treat
     // it as one.
-    const bool existed_before = tgt_present;   // was fs::exists (follows)
+    const bool existed_before = out_present;   // final name, including dangling symlinks
     const bool exists = tgt_is_reg;            // was fs::is_regular_file (follows)
+    const bool replace_existing_name = exists
+        || (out_is_lnk && opt.force && (!opt.tar_mode || tgt_present));
     if (exists && !opt.force) {
       die_io("output exists (use -f to overwrite): " + opt.output);
     }
-    if (exists && opt.force) {
-      const bool is_regular = tgt_is_reg;
-      if (is_regular && !opt.unsafe_overwrite) {
+    if (replace_existing_name && opt.force) {
+      if (!opt.unsafe_overwrite) {
         out = open_output_atomic(opt.output, tmp, out_dir, tmp_base);
         use_atomic = true;
-        register_tmp_file_at(out_dir.fd, tmp_base);
       } else {
-        // --overwrite: replace target in place.  On ext4 fopen("wb") has to
-        // truncate the existing file, which means freeing every extent the
-        // inode references — O(file_size) for huge files (10-30+s on 400+ GiB
-        // outputs).  Unlink first instead: the inode is unreferenced
-        // immediately and the extents free in the background.  fopen then
-        // creates a fresh empty file in O(1).
-        if (is_regular) {
-          // IDENTIFY BEFORE DESTROYING.  This unlink is the destructive step, and
-          // it runs BEFORE open_output_verified() — so the fd-identity check there
-          // was comparing against a file this branch had already deleted, and
-          // `--overwrite -o root/data --tar -C root data` still lost the source.
-          // Open the EXISTING target and compare it here, while it still exists.
-          // Through the held directory, and O_NOFOLLOW: a symlink here is the
-          // object being replaced, not the thing it points at, so resolving it
-          // would compare the wrong inode.
-          {
-            int ofd = ::openat(out_dir.fd, out_dir.base.c_str(),
-                               O_PATH | O_NOFOLLOW | O_CLOEXEC);
-            // FAILING TO LOOK IS NOT PROOF OF INNOCENCE.  Both of these used to
-            // fall through silently to the unlink, so the check that decides
-            // whether we are about to delete one of our own sources passed
-            // whenever it could not run.
-            if (ofd < 0 && errno != ENOENT) {
-              const int e = errno;
-              for (int f : tar_src_fds) ::close(f);
-              die_io("--overwrite: cannot identify the existing output "
-                     + opt.output + " before removing it (" + std::strerror(e) + ")");
-            }
-            if (ofd >= 0) {
-              struct stat os_;
-              if (::fstat(ofd, &os_) != 0) {
-                const int e = errno; ::close(ofd);
-                for (int f : tar_src_fds) ::close(f);
-                die_io("--overwrite: cannot identify the existing output "
-                       + opt.output + " before removing it (" + std::strerror(e) + ")");
-              }
-              {
-                for (const auto & id : tar_src_ids) {
-                  if (os_.st_dev == id.first && os_.st_ino == id.second) {
-                    ::close(ofd);
-                    for (int f : tar_src_fds) ::close(f);
-                    die_usage("--tar source and archive output are the same file: "
-                              + opt.output);
-                  }
-                }
-                if (in) {
-                  struct stat is_;
-                  if (::fstat(fileno(in), &is_) == 0
-                      && os_.st_dev == is_.st_dev && os_.st_ino == is_.st_ino) {
-                    ::close(ofd);
-                    die_usage("input and output are the same file: " + opt.output);
-                  }
-                }
-              }
-              ::close(ofd);
-            }
-          }
-          // A FAILED UNLINK HERE IS FATAL.  This is not merely "make room" — it
-          // is the step that NEUTRALISES a symlink sitting at the output name.
-          // Falling through on failure meant the symlink survived and the open
-          // below followed it, which is exactly how review round 7 destroyed a
-          // file inside a tar source with no root and no race:
-          //
-          //     ln -s root/data alias/out; chmod a-w alias
-          //     gzstd --overwrite -o alias/out --tar root
-          //
-          // The containment walk cleared alias/out (its own parent chain is
-          // outside the source), fs::remove failed on the unwritable directory
-          // and was IGNORED, and open_output_verified then followed the surviving
-          // link and truncated root/data — exit 0, source gone.  The old comment
-          // said fopen "will return its own error"; it did not, because the open
-          // succeeded on the wrong file.
-          //
-          // Judge by the NAME, not by the return value: fs::remove reports false
-          // both for "did not exist" (fine) and for some failures, so re-lstat and
-          // require that nothing is there.
-          // unlinkat through the held directory, and it never follows a symlink,
-          // so this removes the LINK rather than its target.
-          const int urc = ::unlinkat(out_dir.fd, out_dir.base.c_str(), 0);
-          const int uerr = errno;
-          // ONLY ENOENT MEANS GONE.  `lstat(...) == 0` as the sole test made every
-          // other failure — EACCES on the directory, EIO — read as "absent", which
-          // is the fail-open shape again: the check that proves the symlink was
-          // neutralised would itself pass when it could not tell.
-          struct stat still;
-          const bool gone =
-              (::fstatat(out_dir.fd, out_dir.base.c_str(), &still,
-                         AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT);
-          if (!gone) {
+        // --overwrite MEANS UNLINK-FIRST, and that is the point of the flag: the
+        // old inode is released BEFORE the new archive is written, so its extents
+        // free in the background instead of costing an O(file_size) truncate
+        // (10-30 s on a 400+ GiB output), and the run never needs room for two
+        // copies at once.  The default -f path is the atomic one; this is the
+        // deliberate trade, and it is documented in --help.
+        //
+        // Round 12 replaced it with a quarantine held until installation, which
+        // closed a real race but silently cost the flag both properties — peak
+        // usage became old + new.  Quarantining and unlinking IMMEDIATELY keeps
+        // the space and time profile AND closes the race, because renameat2()
+        // NOREPLACE is atomic: nothing can be at the quarantine name, so what we
+        // validate is exactly what we remove, and a file that appears at the
+        // original name afterwards is refused by O_EXCL rather than deleted.
+        {
+          int ofd = ::openat(out_dir.fd, out_dir.base.c_str(),
+                             O_PATH | O_NOFOLLOW | O_CLOEXEC);
+          if (ofd < 0) {
             const int e = errno;
             for (int f : tar_src_fds) ::close(f);
-            die_io("--overwrite: cannot confirm the existing output " + opt.output
-                   + " was removed"
-                   + (urc != 0 ? std::string(" (") + std::strerror(uerr) + ")"
-                               : std::string(" (") + std::strerror(e) + ")")
-                   + "; refusing to write through whatever remains at that name");
+            die_io("--overwrite: cannot identify the existing output "
+                   + opt.output + " before replacing it (" + std::strerror(e) + ")");
           }
+          if (::fstat(ofd, &overwrite_id) != 0) {
+            const int e = errno; ::close(ofd);
+            for (int f : tar_src_fds) ::close(f);
+            die_io("--overwrite: cannot identify the existing output "
+                   + opt.output + " before replacing it (" + std::strerror(e) + ")");
+          }
+          overwrite_id_ok = true;
+          for (const auto & id : tar_src_ids) {
+            if (overwrite_id.st_dev == id.first && overwrite_id.st_ino == id.second) {
+              ::close(ofd);
+              for (int f : tar_src_fds) ::close(f);
+              die_usage("--tar source and archive output are the same file: "
+                        + opt.output);
+            }
+          }
+          if (in) {
+            if (!in_id_ok) {
+              ::close(ofd);
+              die_io("--overwrite: cannot identify the input before replacing "
+                     + opt.output);
+            }
+            if (overwrite_id.st_dev == in_id.st_dev
+                && overwrite_id.st_ino == in_id.st_ino) {
+              ::close(ofd);
+              die_usage("input and output are the same file: " + opt.output);
+            }
+          }
+          ::close(ofd);
+
+          // Move it aside atomically, prove it is the entry we just identified,
+          // and only then remove it.  A plain unlink of the NAME could remove a
+          // file another process created in the meantime; this cannot.
+          std::string qname;
+          int qrc = -1;
+          for (int attempt = 0; attempt < 64; ++attempt) {
+            uint64_t nonce;
+            if (!random_u64(nonce)) break;
+            char suffix[56];
+            std::snprintf(suffix, sizeof suffix, ".gzstd-old.%d.%016llx",
+                          (int)getpid(), (unsigned long long)nonce);
+            qname = suffix;
+            qrc = renameat_noreplace(out_dir.fd, out_dir.base.c_str(),
+                                     out_dir.fd, qname.c_str());
+            if (qrc == 0 || errno != EEXIST) break;
+          }
+          if (qrc != 0) {
+            const int e = errno;
+            for (int f : tar_src_fds) ::close(f);
+            die_io("--overwrite: cannot set aside the existing output "
+                   + opt.output + " (" + std::strerror(e) + ")");
+          }
+          struct stat qid;
+          const bool qmatch =
+              (::fstatat(out_dir.fd, qname.c_str(), &qid, AT_SYMLINK_NOFOLLOW) == 0
+               && qid.st_dev == overwrite_id.st_dev
+               && qid.st_ino == overwrite_id.st_ino);
+          if (!qmatch) {
+            (void)renameat_noreplace(out_dir.fd, qname.c_str(),
+                                     out_dir.fd, out_dir.base.c_str());
+            for (int f : tar_src_fds) ::close(f);
+            die_io("--overwrite: " + opt.output + " changed while being replaced; "
+                   "nothing was removed");
+          }
+          int urc;
+          do { urc = ::unlinkat(out_dir.fd, qname.c_str(), 0); }
+          while (urc != 0 && errno == EINTR);
+          if (urc != 0) {
+            const int e = errno;
+            for (int f : tar_src_fds) ::close(f);
+            die_io("--overwrite: cannot remove the existing output " + opt.output
+                   + " (" + std::strerror(e) + ")");
+          }
+          // The name is now empty and was emptied by us: create exclusively, so a
+          // newcomer is refused rather than clobbered.
+          out = open_output_verified(opt.output, in, out_dir,
+                                     /*must_create=*/true, &tar_src_ids);
+          register_tmp_file_at(out_dir.fd, out_dir.base);
         }
-        // The unlink above was CONFIRMED, so the name is empty and anything that
-        // reappears is an intruder: create exclusively.
-        out = open_output_verified(opt.output, in, out_dir, /*must_create=*/true,
-                                   &tar_src_ids);
-        if (is_regular) register_tmp_file_at(out_dir.fd, out_dir.base);
       }
     } else {
       // must_create keys on the NAME being empty (out_present, the nofollow stat),
@@ -25064,34 +25345,33 @@ static int gzstd_main(int argc, char ** argv)
   // terminal has no inode the walk could collide with, so it simply does not
   // match, and no special case is needed for it.
   if (opt.tar_mode && opt.mode == Mode::COMPRESS && out) {
+    g_tar_output_ids.clear();
+    g_tar_output_entries.clear();
     struct stat os_;
-    if (::fstat(fileno(out), &os_) == 0 && S_ISREG(os_.st_mode))
+    if (::fstat(fileno(out), &os_) != 0)
+      die_io("--tar: cannot identify the archive output before walking sources");
+    if (S_ISREG(os_.st_mode))
       g_tar_output_ids.emplace_back(os_.st_dev, os_.st_ino);
     // On the atomic path the fd above is the TEMP, and the archive it will
     // replace is still sitting at opt.output — equally inside the tree, and the
     // one a repeated backup would otherwise nest.
     //
-    // fstatat THROUGH THE HELD DIRECTORY, WITH AT_SYMLINK_NOFOLLOW.  This was a
-    // path-based `stat()`, which follows — so when the output was a symlink to a
-    // source file, this registered THE SOURCE's inode as "the archive" and the
-    // walk then skipped it:
+    // Record the old archive as the exact directory entry that the temp will
+    // replace.  Recording its inode would suppress every hardlink to it,
+    // including source data elsewhere in the tree:
     //
     //     ln -s root/data out.tar.zst
     //     gzstd -f -o out.tar.zst --tar root   → exit 0, root/data NOT in the archive
     //
-    // Nothing was destroyed and the command reported success, which is the worst
-    // shape a backup tool can take. The question here is "which inode will the
-    // walker see at this name" — the walker uses lstat, so this must not follow
-    // either. That is the opposite answer from the clobber guard twelve lines up,
-    // and getting the two mixed is what produced both of this area's regressions.
-    struct stat fs_;
-    if (out_dir.valid()
-        && ::fstatat(out_dir.fd, out_dir.base.c_str(), &fs_, AT_SYMLINK_NOFOLLOW) == 0
-        && S_ISREG(fs_.st_mode)
-        && !(g_tar_output_ids.size() == 1
-             && g_tar_output_ids[0].first == fs_.st_dev
-             && g_tar_output_ids[0].second == fs_.st_ino))
-      g_tar_output_ids.emplace_back(fs_.st_dev, fs_.st_ino);
+    // The walker carries each entry's parent identity from the directory handle
+    // used to enumerate it, so this comparison does not re-resolve a path.
+    if (use_atomic && output_name_was_present) {
+      struct stat parent_st;
+      if (!out_dir.valid() || ::fstat(out_dir.fd, &parent_st) != 0)
+        die_io("--tar: cannot identify the old archive's directory before walking sources");
+      g_tar_output_entries.push_back(
+          {parent_st.st_dev, parent_st.st_ino, out_dir.base});
+    }
   }
 #endif
 
@@ -25734,6 +26014,7 @@ static int gzstd_main(int argc, char ** argv)
     }
     if (in) std::fclose(in);  // null in --tar mode (no input FILE*)
     if (use_atomic) {
+      {
       auto t_rename = std::chrono::steady_clock::now();
       // Atomic overwrite: rename .tmp to final output — renameat through the SAME
       // held directory for both ends, so the install cannot land in a different
@@ -25817,6 +26098,7 @@ static int gzstd_main(int argc, char ** argv)
           std::chrono::steady_clock::now() - t_rename).count();
       if (opt.verbosity >= V_VERBOSE && rename_ms > 100)
         vlog(V_VERBOSE, opt, "[RENAME] atomic rename took " + std::to_string(int(rename_ms)) + " ms\n");
+      }
     }
     // Success: disarm cleanup (temp or direct output file is now final)
     clear_tmp_file();
@@ -25830,30 +26112,65 @@ static int gzstd_main(int argc, char ** argv)
       // The OUTPUT IS KEPT: it is complete and already installed, so deleting it
       // here would throw away good work over a cleanup failure.  Report and exit
       // EXIT_IO; the user removes the source themselves.
-      // Prove the name still refers to the inode we compressed before removing
-      // it. Refusing costs the user one `rm`; getting it wrong deletes a file
-      // that was never read.
-      struct stat now_id;
       if (!in_id_ok) {
         die_io("--rm: cannot confirm the identity of the input just compressed: "
                + opt.input + "; not removing it (output kept at " + opt.output + ")");
       }
-      // stat(), NOT lstat(): the question is "does this name still LEAD TO the
-      // file I compressed", and open() followed the link to get here. Comparing
-      // the link's own inode instead made `--rm` refuse for every symlinked
-      // input — removing the link and leaving its target is what `rm` does and
-      // what this did before.
-      if (::stat(opt.input.c_str(), &now_id) != 0
-          || now_id.st_dev != in_id.st_dev || now_id.st_ino != in_id.st_ino) {
-        die_io("--rm: " + opt.input + " is no longer the file that was compressed"
-               " (it was replaced during the run); NOT removing it — output kept at "
-               + opt.output);
+      if (!in_dir.valid())
+        die_io("--rm: input parent is no longer held for " + opt.input
+               + "; not removing it (output kept at " + opt.output + ")");
+
+      // Move the leaf out of the user-visible name before deciding whether it is
+      // ours.  renameat2(NOREPLACE) makes both the quarantine acquisition and a
+      // mismatch restoration atomic with respect to a replacement at either
+      // name.  The quarantined name is never unlinked unless its followed
+      // identity matches the descriptor that was compressed.
+      std::string quarantine;
+      int qrc = -1;
+      for (int attempt = 0; attempt < 64; ++attempt) {
+        uint64_t nonce;
+        if (!random_u64(nonce)) break;
+        char suffix[56];
+        std::snprintf(suffix, sizeof suffix, ".gzstd-rm.%d.%016llx",
+                      (int)getpid(), (unsigned long long)nonce);
+        quarantine = suffix;
+        qrc = renameat_noreplace(in_dir.fd, in_dir.base.c_str(),
+                                 in_dir.fd, quarantine.c_str());
+        if (qrc == 0 || errno != EEXIST) break;
       }
-      std::error_code ec_rm;
-      fs::remove(opt.input, ec_rm);
-      if (ec_rm)
-        die_io("--rm: cannot remove input after compressing it: " + opt.input
-               + " (" + ec_rm.message() + "); output kept at " + opt.output);
+      if (qrc != 0)
+        die_io("--rm: cannot quarantine input after compressing it: " + opt.input
+               + " (" + std::strerror(errno) + "); output kept at " + opt.output);
+
+      const std::string quarantine_path =
+          (in_dir.dir == "/" ? std::string("/") : in_dir.dir + "/") + quarantine;
+      struct stat qid;
+      const bool quarantine_matches =
+          (::fstatat(in_dir.fd, quarantine.c_str(), &qid, 0) == 0
+           && qid.st_dev == in_id.st_dev && qid.st_ino == in_id.st_ino);
+      if (!quarantine_matches) {
+        const int restore_rc = renameat_noreplace(
+            in_dir.fd, quarantine.c_str(), in_dir.fd, in_dir.base.c_str());
+        if (restore_rc == 0)
+          die_io("--rm: " + opt.input + " was replaced during the run; replacement "
+                 "restored and not removed — output kept at " + opt.output);
+        if (errno == EEXIST)
+          die_io("--rm: " + opt.input + " reappeared while restoring a replacement; "
+                 "both it and the quarantined entry " + quarantine_path
+                 + " were preserved — output kept at " + opt.output);
+        die_io("--rm: quarantined entry did not match the compressed input and could "
+               "not be restored; it was preserved at " + quarantine_path
+               + " — output kept at " + opt.output);
+      }
+
+      int rm_rc;
+      do {
+        rm_rc = ::unlinkat(in_dir.fd, quarantine.c_str(), 0);
+      } while (rm_rc != 0 && errno == EINTR);
+      if (rm_rc != 0)
+        die_io("--rm: cannot remove quarantined input after compressing it: "
+               + quarantine_path + " (" + std::strerror(errno)
+               + "); output kept at " + opt.output);
     }
   } else {
     // Flush stdout to ensure all data reaches the downstream pipe — and die

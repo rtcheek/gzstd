@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=394
-$EXTENSIVE && EXPECTED_TESTS=527
+EXPECTED_TESTS=401
+$EXTENSIVE && EXPECTED_TESTS=534
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6373,8 +6373,13 @@ PYEOF
   #     be produced successfully, destroy nothing, and still be missing a file.
   #
   #     Deliberate asymmetries pinned down here rather than left to drift:
-  #       * plain + dangling link  -> ALLOWED, creates the target (a symlink
-  #         output is legitimate for an ordinary compress and destroys nothing).
+  #       * plain + dangling link  -> ALLOWED, and -f/--overwrite REPLACE THE LINK
+  #         rather than creating its target. This changed when the output
+  #         transaction moved to quarantine-and-install, and it is an
+  #         improvement: dangling is now consistent with every other symlink
+  #         shape instead of being the one case that wrote to a path the user
+  #         never named. The KIND column exists because this changed while
+  #         every other assertion still passed.
   #       * --tar + any symlink    -> REFUSED (exit 2). With sources to protect the
   #         final component is opened O_NOFOLLOW, so a link at that name cannot be
   #         followed at all; refusing is the price of that guarantee.
@@ -6401,14 +6406,19 @@ PYEOF
       "$GZSTD" --cpu-only -q $mode -o "$TMPDIR/om/out/o.zst" --tar "$TMPDIR/om/root" \
         >/dev/null 2>&1; rc=$?
     fi
-    local vic=LOST src=LOST arc=-
+    local vic=LOST src=LOST arc=- kind=none
     grep -q OUTSIDE-VICTIM "$TMPDIR/om/victim"    2>/dev/null && vic=OK
     grep -q SOURCE-DATA    "$TMPDIR/om/root/data" 2>/dev/null && src=OK
+    # WHAT THE OUTPUT NAME IS AFTERWARDS. Added because a correction changed a
+    # symlink output into a regular file and every existing assertion still
+    # passed: the columns above ask what SURVIVED, not what the name became.
+    if   [ -L "$TMPDIR/om/out/o.zst" ]; then kind=symlink
+    elif [ -f "$TMPDIR/om/out/o.zst" ]; then kind=file; fi
     if [ "$3" = tar ] && [ "$rc" = 0 ]; then
       if "$GZSTD" --cpu-only -l --tar "$TMPDIR/om/out/o.zst" 2>/dev/null \
            | grep -q "root/data"; then arc=complete; else arc=INCOMPLETE; fi
     fi
-    printf '%s %s %s %s %s %s\n' "$1" "$2" "$rc" "$vic" "$src" "$arc"
+    printf '%s %s %s %s %s %s %s\n' "$1" "$2" "$rc" "$vic" "$src" "$arc" "$kind"
   }
   om_sweep() {  # $1 kind -> every cell, one line each
     local shape mode
@@ -6417,21 +6427,21 @@ PYEOF
     done
   }
 
-  om_plain_want="absent none 0 OK OK -
-absent -f 0 OK OK -
-absent --overwrite 0 OK OK -
-regular none 3 OK OK -
-regular -f 0 OK OK -
-regular --overwrite 0 OK OK -
-link_outside none 3 OK OK -
-link_outside -f 0 OK OK -
-link_outside --overwrite 0 OK OK -
-link_source none 3 OK OK -
-link_source -f 0 OK OK -
-link_source --overwrite 0 OK OK -
-dangling none 0 OK OK -
-dangling -f 0 OK OK -
-dangling --overwrite 0 OK OK -"
+  om_plain_want="absent none 0 OK OK - file
+absent -f 0 OK OK - file
+absent --overwrite 0 OK OK - file
+regular none 3 OK OK - file
+regular -f 0 OK OK - file
+regular --overwrite 0 OK OK - file
+link_outside none 3 OK OK - symlink
+link_outside -f 0 OK OK - file
+link_outside --overwrite 0 OK OK - file
+link_source none 3 OK OK - symlink
+link_source -f 0 OK OK - file
+link_source --overwrite 0 OK OK - file
+dangling none 0 OK OK - symlink
+dangling -f 0 OK OK - file
+dangling --overwrite 0 OK OK - file"
   om_plain_got=$(om_sweep plain)
   if [ "$om_plain_got" = "$om_plain_want" ]; then
     pass "output-shape matrix (plain): 15 cells"
@@ -6439,21 +6449,21 @@ dangling --overwrite 0 OK OK -"
     fail "output-shape matrix (plain)" "$(diff <(echo "$om_plain_want") <(echo "$om_plain_got") | head -12)"
   fi
 
-  om_tar_want="absent none 0 OK OK complete
-absent -f 0 OK OK complete
-absent --overwrite 0 OK OK complete
-regular none 3 OK OK -
-regular -f 0 OK OK complete
-regular --overwrite 0 OK OK complete
-link_outside none 3 OK OK -
-link_outside -f 0 OK OK complete
-link_outside --overwrite 0 OK OK complete
-link_source none 3 OK OK -
-link_source -f 0 OK OK complete
-link_source --overwrite 0 OK OK complete
-dangling none 2 OK OK -
-dangling -f 2 OK OK -
-dangling --overwrite 2 OK OK -"
+  om_tar_want="absent none 0 OK OK complete file
+absent -f 0 OK OK complete file
+absent --overwrite 0 OK OK complete file
+regular none 3 OK OK - file
+regular -f 0 OK OK complete file
+regular --overwrite 0 OK OK complete file
+link_outside none 3 OK OK - symlink
+link_outside -f 0 OK OK complete file
+link_outside --overwrite 0 OK OK complete file
+link_source none 3 OK OK - symlink
+link_source -f 0 OK OK complete file
+link_source --overwrite 0 OK OK complete file
+dangling none 2 OK OK - symlink
+dangling -f 2 OK OK - symlink
+dangling --overwrite 2 OK OK - symlink"
   om_tar_got=$(om_sweep tar)
   if [ "$om_tar_got" = "$om_tar_want" ]; then
     pass "output-shape matrix (--tar): 15 cells"
@@ -6461,6 +6471,180 @@ dangling --overwrite 2 OK OK -"
     fail "output-shape matrix (--tar)" "$(diff <(echo "$om_tar_want") <(echo "$om_tar_got") | head -12)"
   fi
   rm -rf "$TMPDIR/om"
+
+  # 1c-0a. HARDLINK / MULTI-SOURCE / ABNORMAL-EXIT ADDITIONS TO THE MATRIX.
+  rm -rf "$TMPDIR/omx"; mkdir -p "$TMPDIR/omx/root"
+  printf 'plain-hardlink-source\n' > "$TMPDIR/omx/plain.in"
+  ln "$TMPDIR/omx/plain.in" "$TMPDIR/omx/plain.zst"
+  "$GZSTD" --cpu-only -q -f -o "$TMPDIR/omx/plain.zst" "$TMPDIR/omx/plain.in" \
+    >/dev/null 2>&1
+  ph_rc=$?
+  if [ "$ph_rc" = 2 ] && grep -q plain-hardlink-source "$TMPDIR/omx/plain.in"; then
+    pass "output-shape matrix: plain hardlink to input is refused"
+  else
+    fail "output-shape matrix: plain hardlink to input" "rc=$ph_rc"
+  fi
+
+  printf 'tar-hardlink-source\n' > "$TMPDIR/omx/root/data"
+  rm -f "$TMPDIR/omx/out.tar.zst"
+  ln "$TMPDIR/omx/root/data" "$TMPDIR/omx/out.tar.zst"
+  "$GZSTD" --cpu-only -q -f -o "$TMPDIR/omx/out.tar.zst" --tar "$TMPDIR/omx/root" \
+    >/dev/null 2>&1
+  th_rc=$?
+  th_list=$([ "$th_rc" = 0 ] && "$GZSTD" --cpu-only -l --tar \
+    "$TMPDIR/omx/out.tar.zst" 2>/dev/null)
+  if [ "$th_rc" = 0 ] && grep -q 'root/data' <<<"$th_list" \
+       && grep -q tar-hardlink-source "$TMPDIR/omx/root/data"; then
+    pass "output-shape matrix: tar hardlink descendant remains archived"
+  else
+    fail "output-shape matrix: tar hardlink descendant" "rc=$th_rc members=[$th_list]"
+  fi
+
+  mkdir -p "$TMPDIR/omx/multi/first" "$TMPDIR/omx/multi/second"
+  printf 'first-source\n'  > "$TMPDIR/omx/multi/first/data"
+  printf 'second-source\n' > "$TMPDIR/omx/multi/second/data"
+  rm -f "$TMPDIR/omx/multi.tar.zst"
+  ln "$TMPDIR/omx/multi/second/data" "$TMPDIR/omx/multi.tar.zst"
+  ( cd "$TMPDIR/omx/multi" && "$GZSTD" --cpu-only -q -f \
+      -o "$TMPDIR/omx/multi.tar.zst" --tar first second >/dev/null 2>&1 )
+  mh_rc=$?
+  mh_list=$([ "$mh_rc" = 0 ] && "$GZSTD" --cpu-only -l --tar \
+    "$TMPDIR/omx/multi.tar.zst" 2>/dev/null)
+  if [ "$mh_rc" = 0 ] && grep -q 'first/data' <<<"$mh_list" \
+       && grep -q 'second/data' <<<"$mh_list"; then
+    pass "output-shape matrix: later tar source hardlink remains archived"
+  else
+    fail "output-shape matrix: later tar source hardlink" "rc=$mh_rc members=[$mh_list]"
+  fi
+
+  ln -s "$TMPDIR/omx/partial.zst" "$TMPDIR/omx/dangling.zst"
+  GZSTD_DEBUG_THROW_READER=1 "$GZSTD" --cpu-only -q \
+    -o "$TMPDIR/omx/dangling.zst" "$TMPDIR/medium.txt" >/dev/null 2>&1
+  ax_rc=$?
+  if [ "$ax_rc" != 0 ] && [ -L "$TMPDIR/omx/dangling.zst" ]; then
+    pass "output-shape matrix: abnormal exit preserves dangling output symlink"
+  else
+    fail "output-shape matrix: abnormal-exit dangling symlink" "rc=$ax_rc"
+  fi
+
+  mkdir "$TMPDIR/omx/output-dir"
+  "$GZSTD" --cpu-only -q -o "$TMPDIR/omx/output-dir" "$TMPDIR/omx/plain.in" \
+    >/dev/null 2>&1; dp_rc=$?
+  "$GZSTD" --cpu-only -q -o "$TMPDIR/omx/output-dir" --tar "$TMPDIR/omx/root" \
+    >/dev/null 2>&1; dt_rc=$?
+  if [ "$dp_rc" = 3 ] && [ "$dt_rc" = 3 ] && [ -d "$TMPDIR/omx/output-dir" ]; then
+    pass "output-shape matrix: directory output is refused"
+  else
+    fail "output-shape matrix: directory output refusal" "plain=$dp_rc tar=$dt_rc"
+  fi
+  rm -rf "$TMPDIR/omx"
+
+  # 1c-10. --overwrite IS UNLINK-FIRST, and that is a documented product decision,
+  #     not an implementation detail.  The flag exists so a huge output needs room
+  #     for ONE copy instead of two and skips an O(file_size) ext4 truncate; a
+  #     revision that quietly turned it into "-f with extra steps" cost both
+  #     properties while every test still passed.  Assert the observable ones:
+  #     no temp file is created, and the old inode is RELEASED (a hard link to the
+  #     old archive keeps the old content).  The trade — not atomic, so a failed
+  #     run leaves neither old nor new — is stated in --help and asserted there.
+  rm -rf "$TMPDIR/ov"; mkdir -p "$TMPDIR/ov"
+  printf 'ORIGINAL-ARCHIVE\n' > "$TMPDIR/ov/a.zst"
+  ln "$TMPDIR/ov/a.zst" "$TMPDIR/ov/hardlink.keep"
+  printf 'payload\n' > "$TMPDIR/ov/in.txt"
+  ov_ok=1
+  "$GZSTD" --cpu-only -q -f --overwrite -o "$TMPDIR/ov/a.zst" "$TMPDIR/ov/in.txt" \
+    >/dev/null 2>&1 || ov_ok=0
+  # the old inode survives under its other name, with its old content
+  grep -q "ORIGINAL-ARCHIVE" "$TMPDIR/ov/hardlink.keep" 2>/dev/null || ov_ok=0
+  # and the new archive is real
+  "$GZSTD" --cpu-only -t "$TMPDIR/ov/a.zst" >/dev/null 2>&1 || ov_ok=0
+  # no temp or quarantine litter left in the directory
+  [ "$(ls -a "$TMPDIR/ov" | grep -c 'gzstd\.\|gzstd-old')" -eq 0 ] || ov_ok=0
+  # THE SPACE PROPERTY, asserted DURING the run — this is the assertion that
+  # actually distinguishes unlink-first from "-f with extra steps".  A design that
+  # keeps the old file (under any name) until the new one is installed needs room
+  # for both, and every after-the-fact check still passes for it: the litter is
+  # cleaned up, the hard link still holds the old content, the archive is valid.
+  # Only the mid-run directory contents tell them apart.
+  printf 'OLD2\n' > "$TMPDIR/ov/b.zst"
+  head -c 60000000 /dev/urandom > "$TMPDIR/ov/big.bin"
+  "$GZSTD" --cpu-only -q -f --overwrite --no-direct -19 -o "$TMPDIR/ov/b.zst" \
+    "$TMPDIR/ov/big.bin" >/dev/null 2>&1 &
+  ov_pid=$!
+  # Sample while it is DEMONSTRABLY running, not after a fixed sleep: b.zst
+  # (being written) + big.bin + in.txt + a.zst + hardlink.keep = 5.  A design that
+  # retains the old output until installation would make 6.  If the run completes
+  # before we can sample, the count is the final one and still <= 5, so the check
+  # degrades to "no litter" rather than to a false failure.
+  ov_mid=99; ov_wait=0
+  while [ $ov_wait -lt 300 ]; do
+    if [ -e "$TMPDIR/ov/b.zst" ]; then ov_mid=$(ls "$TMPDIR/ov" | wc -l); break; fi
+    kill -0 $ov_pid 2>/dev/null || { ov_mid=$(ls "$TMPDIR/ov" | wc -l); break; }
+    sleep 0.05; ov_wait=$((ov_wait+1))
+  done
+  wait $ov_pid 2>/dev/null
+  [ "$ov_mid" -le 5 ] || ov_ok=0
+  # and the trade is documented where a user would look
+  "$GZSTD" --help 2>&1 | grep -qi "NOT ATOMIC" || ov_ok=0
+  "$GZSTD" -h 2>&1 | grep -qi "overwrite" || ov_ok=0
+  if [ "$ov_ok" = 1 ]; then
+    pass "--overwrite is unlink-first, releases the old inode, and is documented"
+  else
+    fail "--overwrite unlink-first semantics"
+  fi
+  rm -rf "$TMPDIR/ov"
+
+  # 1c-11. SIGINT REMOVES THE PARTIAL OUTPUT, matching stock zstd — measured, not
+  #     assumed: `zstd -f` interrupted mid-compress removes its output and exits 2.
+  #     (Its behaviour on a WRITE ERROR is the opposite, and gzstd matches that
+  #     too — see the disk-full test, which asserts the partial is removed there
+  #     as well.)  A round of review recommended dropping this cleanup entirely
+  #     because a signal handler must not use a BORROWED descriptor; the registry
+  #     owns its own now, so the cleanup is safe and the behaviour is kept.
+  #
+  #     -f over an EXISTING archive additionally leaves the old one intact, which
+  #     zstd does not do (it truncates in place).  That is -f being atomic and is
+  #     deliberately NOT matched to zstd.
+  rm -rf "$TMPDIR/si"; mkdir -p "$TMPDIR/si"
+  head -c 60000000 /dev/urandom > "$TMPDIR/si/big.bin"
+  printf 'PRECIOUS-OLD\n' > "$TMPDIR/si/out.zst"
+  si_ok=1
+  #     EVENT-DRIVEN, not `sleep N`: wait until the temp file actually exists, so
+  #     the signal is guaranteed to land mid-write.  A fixed sleep made this test
+  #     flaky — on a fast run the compress finished first and the kill was a
+  #     no-op, which reports as a failure of the thing being tested rather than of
+  #     the timing.  A flaky test is worse than no test: it teaches people to
+  #     ignore red.
+  "$GZSTD" --cpu-only -q -f --no-direct -19 -o "$TMPDIR/si/out.zst" "$TMPDIR/si/big.bin" \
+    >/dev/null 2>&1 &
+  si_pid=$!
+  si_wait=0
+  while [ $si_wait -lt 300 ]; do
+    ls "$TMPDIR/si" 2>/dev/null | grep -q 'gzstd\.' && break
+    kill -0 $si_pid 2>/dev/null || break        # it exited before we saw a temp
+    sleep 0.05; si_wait=$((si_wait+1))
+  done
+  if ! kill -0 $si_pid 2>/dev/null; then
+    wait $si_pid 2>/dev/null
+    si_skip=1                                    # finished too fast to interrupt
+  else
+    kill -INT $si_pid 2>/dev/null; wait $si_pid 2>/dev/null
+  fi
+  if [ "${si_skip:-0}" = 1 ]; then
+    skip "SIGINT removes the partial output and keeps the old archive" \
+         "compress finished before a temp appeared; nothing to interrupt"
+    si_ok=skip
+  else
+    grep -q "PRECIOUS-OLD" "$TMPDIR/si/out.zst" 2>/dev/null || si_ok=0  # old survives
+    [ "$(ls -a "$TMPDIR/si" | grep -c 'gzstd\.')" -eq 0 ] || si_ok=0    # partial removed
+  fi
+  if [ "$si_ok" = skip ]; then :
+  elif [ "$si_ok" = 1 ]; then
+    pass "SIGINT removes the partial output and keeps the old archive"
+  else
+    fail "SIGINT cleanup" "$(ls -a "$TMPDIR/si" | tr '\n' ' ')"
+  fi
+  rm -rf "$TMPDIR/si"
 
   # 1c-9. --rm DELETES THE FILE IT COMPRESSED, identified by inode rather than by
   #     re-resolving the name at the end of the run: renaming the input away

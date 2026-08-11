@@ -150,6 +150,9 @@ declare -a ALLOW=(
   # in-memory buffer that is then compressed as opaque bytes. Never read back as
   # an integer, never an on-disk field.
   'std::memcpy(&corpus[i], &x, 8);'
+  # getrandom(2) filling a nonce: randomness has no byte order, and this reads
+  # from the kernel rather than from a file. Used for quarantine/temp names.
+  'reinterpret_cast<char *>(&value) + off'
 )
 
 # A call split across lines is still one call.  Fold each source file into LOGICAL
