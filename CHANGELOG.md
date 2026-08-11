@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.79  
+**Covers:** v0.9.50 → v0.15.81  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,111 @@
 ---
 
 
+## v0.15.81 — the matrix first, then the seven
+
+Round 10 returned four HIGHs and answered the question I had asked about my own previous fix:
+*"is 'follow for the clobber guard, NOFOLLOW for identity' the right split, or have I now got
+it backwards somewhere else?"* Backwards somewhere else.
+
+**The archive silently omitted a source file.** The clobber guard follows (correct — the open
+follows), but the archive-identity registration was also a path-based `stat()`, which follows —
+so with the output a symlink to a source file, the SOURCE's inode was registered as "the
+archive", and the tar walk skips any inode on that list:
+
+```
+ln -s root/data out.tar.zst
+gzstd -f -o out.tar.zst --tar root     → exit 0, root/data NOT in the archive
+```
+
+Nothing destroyed, success reported, backup quietly incomplete — the worst shape this tool can
+take. The walker uses `lstat`, so the registration must not follow either: the opposite answer
+from the clobber guard twelve lines above it. That is the third appearance of one root cause in
+this area — **a single predicate answering two questions is wrong for one of them** — after
+`seq` (data frames vs any frames) and `opt`/`pass_opt` (request vs pass).
+
+### The matrix came first, and immediately earned it
+
+Before fixing anything: five output shapes (absent, regular, symlink→outside, symlink→source,
+dangling) × three force modes × {plain, `--tar`} = **30 asserted cells**, each checking the exit
+code, what survives, and — for `--tar` — whether the archive is COMPLETE. That last column is
+the one that matters: an archive can succeed, destroy nothing, and still be missing a file.
+
+It flagged exactly one cell red, confirming the finding and bounding it. Then it caught **two
+regressions in the fixes themselves**, before they shipped:
+
+- Keying the new `O_EXCL` on the wrong stat would have put it on `-o /dev/null` and on dangling
+  symlinks, breaking both. It keys on the NAME stat instead — a name that already held something
+  was never the no-clobber case.
+- The first `--rm` identity check compared `lstat` against a descriptor `open()` had followed,
+  so **every symlinked input** started refusing `--rm`.
+
+The two previous releases each shipped a silent defect in this exact area because nothing
+enumerated these shapes. Two more were caught within the hour of the matrix existing.
+
+### The seven items
+
+1. **Archive identity** registers through the held directory with `AT_SYMLINK_NOFOLLOW`.
+2. **The no-`-f` create is atomic.** Stat-then-open is not: a symlink dropped in that window was
+   followed and an unrelated file truncated with no `-f`. `O_EXCL` makes the decision and the
+   act one operation.
+3. **`--calibrate` creates AND unlinks through a held parent.** `O_EXCL` protects creation, not a
+   later unlink by pathname; I had called this out of scope and that was wrong.
+4. **Abnormal cleanup is descriptor-bound.** The signal/atexit path stored a full pathname and
+   `unlink()`ed it — after a parent exchange that deletes an unrelated file. "Best effort"
+   licenses leaving a partial file, not removing someone else's. `unlinkat` is equally
+   async-signal-safe.
+5. **`--rm` deletes the file it compressed**, verified by inode rather than by re-resolving the
+   name at the end of the run.
+6. **The fallback copy reads its temp through the transaction** — binding only the destination
+   is half a transaction.
+7. **Only `ENOENT` means absent**, and a pre-unlink identity check that cannot look is fatal.
+
+Suite: **394** (527 extensive), green on both build configurations.
+
+---
+
+
+## v0.15.80 — two questions, one stat, and a `-f` guard that stopped guarding
+
+Found while preparing v0.15.79 for review, not by the review. Converting the output path to
+`fstatat` I used `AT_SYMLINK_NOFOLLOW` for the existence and type test, reasoning that a symlink
+is a symlink and not the thing it points at. That is correct for **identity** questions and
+wrong for the **clobber guard**, because a symlink is not a regular file:
+
+```
+                      -o symlink-to-existing-file, NO -f
+v0.15.78              exit 3, target intact          ← correct
+v0.15.79              exit 0, TARGET DESTROYED       ← regression
+v0.15.80              exit 3, target intact
+```
+
+`-o link-to-file` stopped counting as "an output already exists here", skipped the `-f`
+requirement entirely, and truncated whatever the link pointed at. Silent, exit 0.
+
+There are two different questions and one stat cannot answer both:
+
+- **"Does a NAME exist here?"** — `AT_SYMLINK_NOFOLLOW`. Used for the symlink notice and to
+  confirm the unlink removed the link rather than its target.
+- **"Will I DESTROY existing data?"** — follows, because the plain-compress open follows. This
+  is what gates `-f`.
+
+Following is safe for the guard *precisely because* every destructive step below it is
+`*at()`-based and `O_NOFOLLOW`: the guard may ask about the target while the operations refuse
+to touch it. Verified against v0.15.78 across four shapes — symlink without `-f`, symlink with
+`-f`, dangling symlink, plain existing file — behaviour identical on all four, and the full
+round-6-to-9 aliasing matrix still refuses with both legitimate patterns still working.
+
+A regression test now covers it. Nothing caught this because every other test on that path uses
+real files, and the guard only fails for a symlink; the suite grew by 34 tests across this arc
+without once pointing `-o` at a link to something that mattered.
+
+The general lesson is the one this arc keeps producing in new costumes: **a single predicate
+answering two questions is wrong for one of them.** `seq` counted data frames and was asked
+whether any frame existed; `opt` described the request and was asked what the pass was doing;
+one stat described a name and was asked about its target. The fix each time is two names for two
+facts, not a cleverer single check.
+
+---
 ## v0.15.79 — the output becomes one transaction
 
 Round 9 confirmed the doubt this release started from, and made it worse than stated. The

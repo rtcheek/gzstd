@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.79";
+static constexpr const char * GZSTD_VERSION = "0.15.81";
 //
 // Architecture overview:
 //
@@ -233,32 +233,46 @@ static void set_binary_mode(FILE * f)
 /*======================================================================
  Temp file cleanup  remove partial output on error / signal
 ======================================================================*/
-// Global path to the in-progress temp file. Empty when no temp file is active.
-// Accessed from signal handlers, so we use a simple C string + atomic guard.
-static char g_tmp_path[4096] = {};
+// The in-progress temp file: its FINAL COMPONENT plus a descriptor for the
+// directory holding it. Empty when no temp file is active.
+//
+// This used to be a full pathname unlinked with `unlink(g_tmp_path)`. "Best
+// effort" is a fair description of leaving a partial file behind; it is not a
+// licence to DELETE AN UNRELATED ONE, which is what a path-based cleanup does
+// once an intermediate directory component has been exchanged — any later error,
+// SIGINT or SIGTERM then removes that basename from whatever directory now sits
+// at the path. Cleanup is the last thing to run and was the last thing still
+// resolving a name.
+//
+// unlinkat(dirfd, base, 0) is async-signal-safe exactly as unlink() is, and the
+// descriptor is one the process already opened and validated.
+static char g_tmp_base[4096] = {};
 static volatile sig_atomic_t g_tmp_active = 0;
+static volatile sig_atomic_t g_tmp_dirfd  = -1;   // NOT owned; do not close here
 
 static void cleanup_tmp_file()
 {
-  if (g_tmp_active && g_tmp_path[0] != '\0') {
-    // Runs from the SIGINT/SIGTERM handler: use unlink() (async-signal-safe)
-    // rather than std::remove(), whose libc wrapper isn't guaranteed safe to
-    // call from a signal handler.  best-effort; ignore errors.
+  if (g_tmp_active && g_tmp_base[0] != '\0') {
+    // Runs from the SIGINT/SIGTERM handler: unlinkat() is async-signal-safe,
+    // unlike std::remove()'s libc wrapper.  Best-effort; ignore errors.
 #ifndef _WIN32
-    ::unlink(g_tmp_path);
+    if (g_tmp_dirfd >= 0) ::unlinkat((int)g_tmp_dirfd, g_tmp_base, 0);
 #else
-    std::remove(g_tmp_path);
+    std::remove(g_tmp_base);
 #endif
     g_tmp_active = 0;
-    g_tmp_path[0] = '\0';
+    g_tmp_base[0] = '\0';
   }
 }
 
-static void register_tmp_file(const std::string & path)
+// `dirfd` must outlive the registration: the OutputDir holding it lives for the
+// whole output transaction, and clear_tmp_file() disarms this before it dies.
+static void register_tmp_file_at(int dirfd, const std::string & base)
 {
-  if (path.size() < sizeof(g_tmp_path)) {
-    std::strncpy(g_tmp_path, path.c_str(), sizeof(g_tmp_path) - 1);
-    g_tmp_path[sizeof(g_tmp_path) - 1] = '\0';
+  if (base.size() < sizeof(g_tmp_base)) {
+    std::strncpy(g_tmp_base, base.c_str(), sizeof(g_tmp_base) - 1);
+    g_tmp_base[sizeof(g_tmp_base) - 1] = '\0';
+    g_tmp_dirfd = (sig_atomic_t)dirfd;
     g_tmp_active = 1;
   }
 }
@@ -266,7 +280,8 @@ static void register_tmp_file(const std::string & path)
 static void clear_tmp_file()
 {
   g_tmp_active = 0;
-  g_tmp_path[0] = '\0';
+  g_tmp_dirfd  = -1;
+  g_tmp_base[0] = '\0';
 }
 
 // Signal handler for SIGINT / SIGTERM: clean up temp file, then re-raise
@@ -1174,8 +1189,8 @@ static void die(const std::string & msg, int code = EXIT_ERROR)
     for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
   if (g_verbosity >= V_ERROR) {
     std::cerr << "gzstd: ERROR: " << msg << "\n";
-    if (g_tmp_active && g_tmp_path[0] != '\0')
-      std::cerr << "gzstd: removing incomplete output: " << g_tmp_path << "\n";
+    if (g_tmp_active && g_tmp_base[0] != '\0')
+      std::cerr << "gzstd: removing incomplete output: " << g_tmp_base << "\n";
   }
   std::exit(code);
 }
@@ -5257,19 +5272,28 @@ struct OutputDir {
 // `od` is the transaction's directory — the SAME descriptor the containment walk
 // was answered from and the unlink was performed against. Opening our own copy of
 // it here (v0.15.78 did) was still a second resolution of the parent name.
+//
+// `must_create` says the caller observed NOTHING at this name and is therefore
+// not permitted to clobber (no -f). Stat-then-open is not atomic, so without
+// O_EXCL a symlink dropped at the name in that window is followed and an
+// unrelated file is truncated with no -f and exit 0. O_EXCL turns the decision
+// and the act into one operation: if anything is there now, the create fails.
 static FILE * open_output_verified(const std::string & path, FILE * in_file,
-                                   const OutputDir & od,
+                                   const OutputDir & od, bool must_create,
                                    const std::vector<std::pair<dev_t, ino_t>> * forbidden = nullptr)
 {
   const bool protecting_sources = (forbidden && !forbidden->empty());
+  const int excl = must_create ? O_EXCL : 0;
   int fd = -1;
   if (protecting_sources) {
     if (!od.valid())
       die_io("cannot open the output directory for " + path);
     fd = ::openat(od.fd, od.base.c_str(),
-                  O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0666);
+                  O_WRONLY | O_CREAT | O_NOFOLLOW | excl | O_CLOEXEC, 0666);
     const int e = errno;
     if (fd < 0) {
+      if (e == EEXIST)
+        die_io("output appeared while starting up (use -f to overwrite): " + path);
       if (e == ELOOP)
         die_usage("--tar: the archive output " + path + " is a symlink; refusing to "
                   "write through it while source files are being protected — give -o "
@@ -5283,8 +5307,12 @@ static FILE * open_output_verified(const std::string & path, FILE * in_file,
     // nothing and removes the last place the parent name was resolved twice.
     if (!od.valid())
       die_io("cannot open the output directory for " + path);
-    fd = ::openat(od.fd, od.base.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
-    if (fd < 0) die_io("cannot open output: " + path + " (" + std::strerror(errno) + ")");
+    fd = ::openat(od.fd, od.base.c_str(), O_WRONLY | O_CREAT | excl | O_CLOEXEC, 0666);
+    if (fd < 0) {
+      if (errno == EEXIST)
+        die_io("output appeared while starting up (use -f to overwrite): " + path);
+      die_io("cannot open output: " + path + " (" + std::strerror(errno) + ")");
+    }
   }
   // A FAILED fstat IS NOT A PASS.  These comparisons used to be written as
   // `fstat(...) == 0 && identities match`, so a failed stat fell through to the
@@ -5407,7 +5435,7 @@ static FILE * open_output_atomic(const std::string & out, std::string & tmp_path
   }
   // Register only AFTER the exclusive create succeeded, so a failed attempt
   // never arms cleanup against a path we do not own.
-  register_tmp_file(tmp_path);
+  register_tmp_file_at(od.fd, tmp_base);
   FILE * f = ::fdopen(fd, "wb");
   if (!f) { ::close(fd); die_io("cannot open temp output: " + tmp_path); }
   std::setvbuf(f, nullptr, _IOFBF, 1 * 1024 * 1024);
@@ -24304,8 +24332,20 @@ static int run_calibrate(Options opt)
     // it points at, and the unconditional unlink below then removes the symlink,
     // leaving the victim destroyed and no trace.  O_EXCL means we either create
     // this inode ourselves or fail; O_NOFOLLOW refuses a symlink outright.
-    int cfd = ::open(po.output.c_str(),
-                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    //
+    // Both the create and the unlink go through a HELD PARENT DESCRIPTOR, for the
+    // same reason as the compress output transaction: O_EXCL protects the
+    // CREATION, not the later removal by pathname.  Exchanging an intermediate
+    // component between the two turned the unlink below into "delete whatever has
+    // this basename in the substituted directory".  Treating calibration as a
+    // special case was wrong — it is the same threat model with the same fix.
+    OutputDir cal_dir;
+    cal_dir.acquire(po.output);
+    if (!cal_dir.valid())
+      die_io("--calibrate: cannot open the directory for sink target " + po.output
+             + " (" + std::strerror(errno) + ")");
+    int cfd = ::openat(cal_dir.fd, cal_dir.base.c_str(),
+                       O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (cfd < 0)
       die_io("--calibrate: cannot create sink target " + po.output
              + " (" + std::strerror(errno) + ")");
@@ -24314,7 +24354,7 @@ static int run_calibrate(Options opt)
     // meant the cleanup had to find it again later by path, which is a second
     // resolution an attacker can redirect.  Removing it here means there is no
     // name left to race, and an abnormal exit cannot leave the file behind either.
-    ::unlink(po.output.c_str());
+    ::unlinkat(cal_dir.fd, cal_dir.base.c_str(), 0);
     FILE * outf = ::fdopen(cfd, "wb");
     if (!outf) ::close(cfd);
     if (in && outf) {
@@ -24602,6 +24642,15 @@ static int gzstd_main(int argc, char ** argv)
 
   // --tar synthesizes its input from tar_sources; there is no input FILE*.
   FILE * in = opt.tar_mode ? nullptr : open_input(opt.input);
+  // CAPTURE THE INPUT'S IDENTITY WHILE WE HOLD IT OPEN.  --rm removes opt.input
+  // by a fresh pathname resolution at the very end of the run, so renaming the
+  // input away mid-run and dropping another file at that name made gzstd
+  // compress the original inode and then delete the REPLACEMENT. What --rm
+  // promises is "delete the file I just compressed", and only the inode can say
+  // which one that was.
+  bool in_id_ok = false;
+  struct stat in_id{};
+  if (in && in != stdin && ::fstat(fileno(in), &in_id) == 0) in_id_ok = true;
 #ifndef _WIN32
   // --cold (benchmarking only): drop the input file from the kernel's page
   // cache before reading so repeated benchmark iterations don't measure
@@ -24654,14 +24703,42 @@ static int gzstd_main(int argc, char ** argv)
 
     // Existence and type, answered ONCE through the held directory and reused.
     // AT_SYMLINK_NOFOLLOW: a symlink at the output name is a symlink, not the
-    // thing it points at — `exists` must not mean "its target exists", or a
-    // dangling link reads as absent and a link to a source reads as a regular
-    // file.
-    struct stat out_st;
+    // thing it points at.
+    //
+    // TWO STATS, because there are two different questions and answering both
+    // with one of them is a bug in either direction:
+    //
+    //   "does a NAME exist here?"        — AT_SYMLINK_NOFOLLOW. Used for the
+    //     symlink notice and to confirm the unlink removed the link itself.
+    //   "will I DESTROY existing data?"  — follows, because the plain-compress
+    //     open follows. This is what gates -f.
+    //
+    // Answering the clobber guard with the NOFOLLOW stat looked tidier and was a
+    // data-loss regression: a symlink is not a regular file, so `-o link-to-file`
+    // stopped counting as "output exists", skipped the -f requirement entirely,
+    // and truncated the target. Following is safe HERE precisely because every
+    // destructive step below is *at()-based and O_NOFOLLOW — the guard may ask
+    // about the target while the operations refuse to touch it.
+    // ONLY ENOENT MEANS ABSENT.  Collapsing every stat error into "nothing is
+    // there" is the fail-open shape again, and this pair gates BOTH the -f
+    // requirement and the O_EXCL create: on a filesystem where the lookup fails
+    // but the open succeeds, an existing file would be clobbered with no -f.
+    // A stat that cannot answer is a refusal, not a green light.
+    struct stat out_lst, out_tst;
     const bool out_present =
-        (::fstatat(out_dir.fd, out_dir.base.c_str(), &out_st, AT_SYMLINK_NOFOLLOW) == 0);
-    const bool out_is_reg = out_present && S_ISREG(out_st.st_mode);
-    const bool out_is_lnk = out_present && S_ISLNK(out_st.st_mode);
+        (::fstatat(out_dir.fd, out_dir.base.c_str(), &out_lst, AT_SYMLINK_NOFOLLOW) == 0);
+    if (!out_present && errno != ENOENT)
+      die_io("cannot determine whether the output " + opt.output
+             + " already exists (" + std::strerror(errno) + ")");
+    const bool out_is_lnk = out_present && S_ISLNK(out_lst.st_mode);
+    const bool tgt_present =
+        (::fstatat(out_dir.fd, out_dir.base.c_str(), &out_tst, 0) == 0);
+    // ENOENT here also covers a DANGLING symlink (the name exists, the target
+    // does not), which is a legitimate shape rather than an unanswerable stat.
+    if (!tgt_present && errno != ENOENT)
+      die_io("cannot determine what the output " + opt.output
+             + " refers to (" + std::strerror(errno) + ")");
+    const bool tgt_is_reg = tgt_present && S_ISREG(out_tst.st_mode);
 
     // REFUSE TO WRITE THE OUTPUT OVER THE INPUT.  With --rm this was total data
     // loss reported as success: the temp file was renamed onto the input path,
@@ -24679,7 +24756,7 @@ static int gzstd_main(int argc, char ** argv)
     // This whole check is advisory — it exists to name the mistake before any
     // work happens; the authoritative one is the fd comparison inside
     // open_output_verified(), which cannot be raced.
-    if (opt.input != "-" && out_present) {
+    if (opt.input != "-" && tgt_present) {
       std::error_code ec_eq;
       if (fs::equivalent(opt.input, opt.output, ec_eq) && !ec_eq)
         die_usage("input and output are the same file: " + opt.output);
@@ -24814,7 +24891,7 @@ static int gzstd_main(int argc, char ** argv)
       }
       // Cheap pre-check so the common mistake reports the SOURCE NAME rather than
       // the output name; the fd comparison below is what actually closes the race.
-      if (out_present) {
+      if (tgt_present) {
         for (size_t si = 0; si < opt.tar_sources.size(); ++si) {
           const std::string & src = opt.tar_sources[si];
           std::string fspath = src;
@@ -24841,17 +24918,17 @@ static int gzstd_main(int argc, char ** argv)
     // `out_is_reg` uses AT_SYMLINK_NOFOLLOW, so a symlink is no longer counted as
     // "a regular file exists here" — it is a symlink, and the routes below treat
     // it as one.
-    const bool existed_before = out_present;
-    const bool exists = out_is_reg;
+    const bool existed_before = tgt_present;   // was fs::exists (follows)
+    const bool exists = tgt_is_reg;            // was fs::is_regular_file (follows)
     if (exists && !opt.force) {
       die_io("output exists (use -f to overwrite): " + opt.output);
     }
     if (exists && opt.force) {
-      const bool is_regular = out_is_reg;
+      const bool is_regular = tgt_is_reg;
       if (is_regular && !opt.unsafe_overwrite) {
         out = open_output_atomic(opt.output, tmp, out_dir, tmp_base);
         use_atomic = true;
-        register_tmp_file(tmp);
+        register_tmp_file_at(out_dir.fd, tmp_base);
       } else {
         // --overwrite: replace target in place.  On ext4 fopen("wb") has to
         // truncate the existing file, which means freeing every extent the
@@ -24871,9 +24948,25 @@ static int gzstd_main(int argc, char ** argv)
           {
             int ofd = ::openat(out_dir.fd, out_dir.base.c_str(),
                                O_PATH | O_NOFOLLOW | O_CLOEXEC);
+            // FAILING TO LOOK IS NOT PROOF OF INNOCENCE.  Both of these used to
+            // fall through silently to the unlink, so the check that decides
+            // whether we are about to delete one of our own sources passed
+            // whenever it could not run.
+            if (ofd < 0 && errno != ENOENT) {
+              const int e = errno;
+              for (int f : tar_src_fds) ::close(f);
+              die_io("--overwrite: cannot identify the existing output "
+                     + opt.output + " before removing it (" + std::strerror(e) + ")");
+            }
             if (ofd >= 0) {
               struct stat os_;
-              if (::fstat(ofd, &os_) == 0) {
+              if (::fstat(ofd, &os_) != 0) {
+                const int e = errno; ::close(ofd);
+                for (int f : tar_src_fds) ::close(f);
+                die_io("--overwrite: cannot identify the existing output "
+                       + opt.output + " before removing it (" + std::strerror(e) + ")");
+              }
+              {
                 for (const auto & id : tar_src_ids) {
                   if (os_.st_dev == id.first && os_.st_ino == id.second) {
                     ::close(ofd);
@@ -24935,14 +25028,25 @@ static int gzstd_main(int argc, char ** argv)
                    + "; refusing to write through whatever remains at that name");
           }
         }
-        out = open_output_verified(opt.output, in, out_dir, &tar_src_ids);
-        if (is_regular) register_tmp_file(opt.output);
+        // The unlink above was CONFIRMED, so the name is empty and anything that
+        // reappears is an intruder: create exclusively.
+        out = open_output_verified(opt.output, in, out_dir, /*must_create=*/true,
+                                   &tar_src_ids);
+        if (is_regular) register_tmp_file_at(out_dir.fd, out_dir.base);
       }
     } else {
-      out = open_output_verified(opt.output, in, out_dir, &tar_src_ids);
+      // must_create keys on the NAME being empty (out_present, the nofollow stat),
+      // not on the target. That is the question this guard actually asked: "there
+      // was nothing here, so I am not clobbering anything." Keying it on the
+      // following stat instead would put O_EXCL on `-o /dev/null` (a char device
+      // is not a regular file, so the clobber guard lets it through) and on a
+      // dangling symlink, breaking both — while missing nothing, because a name
+      // that already held something was never the no-clobber case.
+      out = open_output_verified(opt.output, in, out_dir,
+                                 /*must_create=*/!out_present, &tar_src_ids);
       // Register for cleanup-on-failure only if we are CREATING a new file;
       // never register a pre-existing special target like /dev/null.
-      if (!existed_before) register_tmp_file(opt.output);
+      if (!existed_before) register_tmp_file_at(out_dir.fd, out_dir.base);
     }
   }
 
@@ -24966,8 +25070,23 @@ static int gzstd_main(int argc, char ** argv)
     // On the atomic path the fd above is the TEMP, and the archive it will
     // replace is still sitting at opt.output — equally inside the tree, and the
     // one a repeated backup would otherwise nest.
+    //
+    // fstatat THROUGH THE HELD DIRECTORY, WITH AT_SYMLINK_NOFOLLOW.  This was a
+    // path-based `stat()`, which follows — so when the output was a symlink to a
+    // source file, this registered THE SOURCE's inode as "the archive" and the
+    // walk then skipped it:
+    //
+    //     ln -s root/data out.tar.zst
+    //     gzstd -f -o out.tar.zst --tar root   → exit 0, root/data NOT in the archive
+    //
+    // Nothing was destroyed and the command reported success, which is the worst
+    // shape a backup tool can take. The question here is "which inode will the
+    // walker see at this name" — the walker uses lstat, so this must not follow
+    // either. That is the opposite answer from the clobber guard twelve lines up,
+    // and getting the two mixed is what produced both of this area's regressions.
     struct stat fs_;
-    if (!opt.output.empty() && ::stat(opt.output.c_str(), &fs_) == 0
+    if (out_dir.valid()
+        && ::fstatat(out_dir.fd, out_dir.base.c_str(), &fs_, AT_SYMLINK_NOFOLLOW) == 0
         && S_ISREG(fs_.st_mode)
         && !(g_tar_output_ids.size() == 1
              && g_tar_output_ids[0].first == fs_.st_dev
@@ -25635,8 +25754,14 @@ static int gzstd_main(int argc, char ** argv)
         //
         // Drop the name, then create it fresh O_EXCL|O_NOFOLLOW so nothing can be
         // substituted in between, and write through the descriptor.
-        std::ifstream src(tmp, std::ios::binary);
-        if (!src) die_io("failed to finalize output file");
+        // THE SOURCE OF THE COPY IS PART OF THE TRANSACTION TOO.  Reading the
+        // temp back through its pathname let a parent swap redirect what gets
+        // copied, even though the destination was already descriptor-bound —
+        // half a transaction is not one.
+        const int sfd2 = out_dir.valid()
+            ? ::openat(out_dir.fd, tmp_base.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            : -1;
+        if (sfd2 < 0) die_io("failed to finalize output file (cannot reopen " + tmp + ")");
         (void)::unlinkat(out_dir.fd, out_dir.base.c_str(), 0);
         const int dfd2 = ::openat(out_dir.fd, out_dir.base.c_str(),
                                   O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
@@ -25650,8 +25775,11 @@ static int gzstd_main(int argc, char ** argv)
         bool copy_ok = true;
         {
           std::vector<char> cbuf(1u << 20);
-          while (src.read(cbuf.data(), (std::streamsize)cbuf.size()) || src.gcount() > 0) {
-            size_t have = (size_t)src.gcount(), off = 0;
+          for (;;) {
+            ssize_t r = ::read(sfd2, cbuf.data(), cbuf.size());
+            if (r < 0) { if (errno == EINTR) continue; copy_ok = false; break; }
+            if (r == 0) break;
+            size_t have = (size_t)r, off = 0;
             while (off < have) {
               ssize_t w = ::write(dfd2, cbuf.data() + off, have - off);
               if (w < 0) { if (errno == EINTR) continue; copy_ok = false; break; }
@@ -25659,8 +25787,8 @@ static int gzstd_main(int argc, char ** argv)
             }
             if (!copy_ok) break;
           }
-          if (src.bad()) copy_ok = false;
         }
+        ::close(sfd2);
         // --sync-output DURABILITY FOLLOWS THE BYTES.  The fsync above was of the
         // TEMP's inode; this fallback copies into a DIFFERENT inode and then
         // deletes that durable temp.  Closing without syncing reported success on
@@ -25683,7 +25811,7 @@ static int gzstd_main(int argc, char ** argv)
           clear_tmp_file();
           die_io("failed to finalize output file (copy failed; complete output kept at " + tmp + ")");
         }
-        src.close(); (void)::unlinkat(out_dir.fd, tmp_base.c_str(), 0);
+        (void)::unlinkat(out_dir.fd, tmp_base.c_str(), 0);
       }
       double rename_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
           std::chrono::steady_clock::now() - t_rename).count();
@@ -25702,6 +25830,25 @@ static int gzstd_main(int argc, char ** argv)
       // The OUTPUT IS KEPT: it is complete and already installed, so deleting it
       // here would throw away good work over a cleanup failure.  Report and exit
       // EXIT_IO; the user removes the source themselves.
+      // Prove the name still refers to the inode we compressed before removing
+      // it. Refusing costs the user one `rm`; getting it wrong deletes a file
+      // that was never read.
+      struct stat now_id;
+      if (!in_id_ok) {
+        die_io("--rm: cannot confirm the identity of the input just compressed: "
+               + opt.input + "; not removing it (output kept at " + opt.output + ")");
+      }
+      // stat(), NOT lstat(): the question is "does this name still LEAD TO the
+      // file I compressed", and open() followed the link to get here. Comparing
+      // the link's own inode instead made `--rm` refuse for every symlinked
+      // input — removing the link and leaving its target is what `rm` does and
+      // what this did before.
+      if (::stat(opt.input.c_str(), &now_id) != 0
+          || now_id.st_dev != in_id.st_dev || now_id.st_ino != in_id.st_ino) {
+        die_io("--rm: " + opt.input + " is no longer the file that was compressed"
+               " (it was replaced during the run); NOT removing it — output kept at "
+               + opt.output);
+      }
       std::error_code ec_rm;
       fs::remove(opt.input, ec_rm);
       if (ec_rm)

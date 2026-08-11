@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=390
-$EXTENSIVE && EXPECTED_TESTS=523
+EXPECTED_TESTS=394
+$EXTENSIVE && EXPECTED_TESTS=527
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6358,6 +6358,168 @@ PYEOF
     fail "--tar output symlink refusal"
   fi
   rm -rf "$TMPDIR/nf"
+
+  # 1c-0. THE OUTPUT-SHAPE MATRIX.
+  #
+  #     Five output shapes x three force modes x {plain, --tar}. Written because
+  #     the incremental tests around it kept missing whole cells: two consecutive
+  #     releases each introduced a different silent defect in this exact area —
+  #     one destroyed a symlink's target with no -f, the next silently OMITTED a
+  #     source file from the archive — and neither was visible to any test here,
+  #     because every other test on this path points -o at a plain file.
+  #
+  #     Each cell asserts the exit code AND what survives AND, for --tar, that the
+  #     archive is complete. The last part is the one that matters: an archive can
+  #     be produced successfully, destroy nothing, and still be missing a file.
+  #
+  #     Deliberate asymmetries pinned down here rather than left to drift:
+  #       * plain + dangling link  -> ALLOWED, creates the target (a symlink
+  #         output is legitimate for an ordinary compress and destroys nothing).
+  #       * --tar + any symlink    -> REFUSED (exit 2). With sources to protect the
+  #         final component is opened O_NOFOLLOW, so a link at that name cannot be
+  #         followed at all; refusing is the price of that guarantee.
+  #       * -f / --overwrite on a symlink REPLACE THE LINK rather than writing
+  #         through it — the target is never touched.
+  om_run() {   # $1 shape  $2 mode  $3 kind -> one normalised result line
+    rm -rf "$TMPDIR/om"; mkdir -p "$TMPDIR/om/root" "$TMPDIR/om/out"
+    printf 'SOURCE-DATA\n'    > "$TMPDIR/om/root/data"
+    printf 'SECOND\n'         > "$TMPDIR/om/root/second"
+    printf 'OUTSIDE-VICTIM\n' > "$TMPDIR/om/victim"
+    printf 'plain input\n'    > "$TMPDIR/om/in.txt"
+    case "$1" in
+      regular)      printf 'OLD\n' > "$TMPDIR/om/out/o.zst" ;;
+      link_outside) ln -s "$TMPDIR/om/victim"    "$TMPDIR/om/out/o.zst" ;;
+      link_source)  ln -s "$TMPDIR/om/root/data" "$TMPDIR/om/out/o.zst" ;;
+      dangling)     ln -s "$TMPDIR/om/nope"      "$TMPDIR/om/out/o.zst" ;;
+    esac
+    local mode=""; [ "$2" != none ] && mode="$2"
+    local rc
+    if [ "$3" = plain ]; then
+      "$GZSTD" --cpu-only -q $mode -o "$TMPDIR/om/out/o.zst" "$TMPDIR/om/in.txt" \
+        >/dev/null 2>&1; rc=$?
+    else
+      "$GZSTD" --cpu-only -q $mode -o "$TMPDIR/om/out/o.zst" --tar "$TMPDIR/om/root" \
+        >/dev/null 2>&1; rc=$?
+    fi
+    local vic=LOST src=LOST arc=-
+    grep -q OUTSIDE-VICTIM "$TMPDIR/om/victim"    2>/dev/null && vic=OK
+    grep -q SOURCE-DATA    "$TMPDIR/om/root/data" 2>/dev/null && src=OK
+    if [ "$3" = tar ] && [ "$rc" = 0 ]; then
+      if "$GZSTD" --cpu-only -l --tar "$TMPDIR/om/out/o.zst" 2>/dev/null \
+           | grep -q "root/data"; then arc=complete; else arc=INCOMPLETE; fi
+    fi
+    printf '%s %s %s %s %s %s\n' "$1" "$2" "$rc" "$vic" "$src" "$arc"
+  }
+  om_sweep() {  # $1 kind -> every cell, one line each
+    local shape mode
+    for shape in absent regular link_outside link_source dangling; do
+      for mode in none -f --overwrite; do om_run "$shape" "$mode" "$1"; done
+    done
+  }
+
+  om_plain_want="absent none 0 OK OK -
+absent -f 0 OK OK -
+absent --overwrite 0 OK OK -
+regular none 3 OK OK -
+regular -f 0 OK OK -
+regular --overwrite 0 OK OK -
+link_outside none 3 OK OK -
+link_outside -f 0 OK OK -
+link_outside --overwrite 0 OK OK -
+link_source none 3 OK OK -
+link_source -f 0 OK OK -
+link_source --overwrite 0 OK OK -
+dangling none 0 OK OK -
+dangling -f 0 OK OK -
+dangling --overwrite 0 OK OK -"
+  om_plain_got=$(om_sweep plain)
+  if [ "$om_plain_got" = "$om_plain_want" ]; then
+    pass "output-shape matrix (plain): 15 cells"
+  else
+    fail "output-shape matrix (plain)" "$(diff <(echo "$om_plain_want") <(echo "$om_plain_got") | head -12)"
+  fi
+
+  om_tar_want="absent none 0 OK OK complete
+absent -f 0 OK OK complete
+absent --overwrite 0 OK OK complete
+regular none 3 OK OK -
+regular -f 0 OK OK complete
+regular --overwrite 0 OK OK complete
+link_outside none 3 OK OK -
+link_outside -f 0 OK OK complete
+link_outside --overwrite 0 OK OK complete
+link_source none 3 OK OK -
+link_source -f 0 OK OK complete
+link_source --overwrite 0 OK OK complete
+dangling none 2 OK OK -
+dangling -f 2 OK OK -
+dangling --overwrite 2 OK OK -"
+  om_tar_got=$(om_sweep tar)
+  if [ "$om_tar_got" = "$om_tar_want" ]; then
+    pass "output-shape matrix (--tar): 15 cells"
+  else
+    fail "output-shape matrix (--tar)" "$(diff <(echo "$om_tar_want") <(echo "$om_tar_got") | head -12)"
+  fi
+  rm -rf "$TMPDIR/om"
+
+  # 1c-9. --rm DELETES THE FILE IT COMPRESSED, identified by inode rather than by
+  #     re-resolving the name at the end of the run: renaming the input away
+  #     mid-run and dropping another file at that name made gzstd compress the
+  #     original inode and delete the REPLACEMENT.
+  #
+  #     The identity comparison must FOLLOW, because open() did. Comparing the
+  #     link's own inode instead makes --rm refuse for every symlinked input —
+  #     which is what the first version of this fix did, and what these cases
+  #     pin down. Removing the link and leaving its target is what `rm` does.
+  rm -rf "$TMPDIR/rmk"; mkdir -p "$TMPDIR/rmk"
+  rmk_ok=1
+  printf 'plain\n' > "$TMPDIR/rmk/a.txt"
+  "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmk/a.zst" "$TMPDIR/rmk/a.txt" >/dev/null 2>&1 || rmk_ok=0
+  [ -e "$TMPDIR/rmk/a.txt" ] && rmk_ok=0                       # plain input removed
+  printf 'target\n' > "$TMPDIR/rmk/real.txt"
+  ln -s real.txt "$TMPDIR/rmk/link.txt"
+  "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmk/l.zst" "$TMPDIR/rmk/link.txt" >/dev/null 2>&1 || rmk_ok=0
+  [ -L "$TMPDIR/rmk/link.txt" ] && rmk_ok=0                    # the LINK is removed
+  [ -e "$TMPDIR/rmk/real.txt" ] || rmk_ok=0                    # its target survives
+  printf 'hard\n' > "$TMPDIR/rmk/h.txt"; ln "$TMPDIR/rmk/h.txt" "$TMPDIR/rmk/h2.txt"
+  "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmk/h.zst" "$TMPDIR/rmk/h.txt" >/dev/null 2>&1 || rmk_ok=0
+  [ -e "$TMPDIR/rmk/h.txt" ] && rmk_ok=0
+  [ -e "$TMPDIR/rmk/h2.txt" ] || rmk_ok=0                      # the other link survives
+  if [ "$rmk_ok" = 1 ]; then
+    pass "--rm removes the compressed file across input shapes"
+  else
+    fail "--rm across input shapes"
+  fi
+  rm -rf "$TMPDIR/rmk"
+
+  # 1c-8. THE CLOBBER GUARD ASKS ABOUT WHAT WILL BE DESTROYED, which for a plain
+  #     compress means following the symlink — the open does. Answering it with a
+  #     NOFOLLOW stat (a symlink is not a regular file, so "no output exists
+  #     here") skipped the -f requirement entirely and truncated the target: a
+  #     data-loss regression introduced while converting this path to descriptors,
+  #     and invisible to every other test because they all use real files.
+  #     Safe to follow HERE only because the destructive steps are all *at()-based
+  #     and O_NOFOLLOW; the guard may ask about the target while the operations
+  #     refuse to touch it.
+  rm -rf "$TMPDIR/cg"; mkdir -p "$TMPDIR/cg"
+  printf 'precious-target\n' > "$TMPDIR/cg/real.zst"
+  ln -s real.zst "$TMPDIR/cg/link.zst"
+  ln -s no-such  "$TMPDIR/cg/dangling.zst"
+  printf 'payload\n' > "$TMPDIR/cg/in.txt"
+  cg_ok=1
+  # -o <symlink to an existing file> without -f must REFUSE and leave it alone.
+  "$GZSTD" --cpu-only -q -o "$TMPDIR/cg/link.zst" "$TMPDIR/cg/in.txt" >/dev/null 2>&1 && cg_ok=0
+  grep -q "precious-target" "$TMPDIR/cg/real.zst" || cg_ok=0
+  # ...with -f it is allowed, as before.
+  "$GZSTD" --cpu-only -q -f -o "$TMPDIR/cg/link.zst" "$TMPDIR/cg/in.txt" >/dev/null 2>&1 || cg_ok=0
+  # A DANGLING link destroys nothing, so it needs no -f.
+  "$GZSTD" --cpu-only -q -o "$TMPDIR/cg/dangling.zst" "$TMPDIR/cg/in.txt" >/dev/null 2>&1 || cg_ok=0
+  if [ "$cg_ok" = 1 ]; then
+    pass "-f is required to clobber through a symlink output"
+  else
+    fail "-f required to clobber through a symlink output"
+  fi
+  rm -rf "$TMPDIR/cg"
 
   # 1c-7. A symlink SOURCE is archived as the link, so only the link may be
   #     protected.  Capture followed the link while the walker lstat()s it, so
