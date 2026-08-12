@@ -1,12 +1,147 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.91  
+**Covers:** v0.9.50 → v0.15.94  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.15.94 — both tests for the deletion defects only ran when they happened to win the race
+
+The two cells that guard the code which deletes files were each racing for a window microseconds
+wide, and the suite was green either way.
+
+The `--tar --rm` cell (new in v0.15.93) polled for the output file, swapped, and hoped that landed
+between "the archive is installed" and "the first source is unlinked". On a tree of three small
+files it did not: it **passed on the GPU build and skipped on the CPU-only build**, so the only
+test covering the only code in gzstd that deletes a tree did not execute at all on the
+configuration where this project's defects hide.
+
+The plain `--rm` type-change cell — which guards the *shipped* v0.15.91 security fix — had the
+same structure and bought its window by brute force: it compressed **400 MB of `/dev/urandom` on
+every run of every configuration**, and still skipped when it lost. Widening a race is not closing
+one, and it was charging both suites for the privilege.
+
+The window is now explicit for both. `$GZSTD_DEBUG_RM_GATE` names a FIFO; when set, gzstd blocks
+on it once the output is complete and installed and before the source is touched, on both `--rm`
+paths. The test opens the write end — which returns *exactly* when gzstd opens the read end, so
+the swap cannot land too early, which is the half a poll loop cannot get right — performs the
+substitution, writes a byte, and gzstd proceeds. **There is no timing in the handshake at all.**
+Both cells now run on every build, deterministically, on ten-byte inputs; the 400 MB member is
+gone from both suites. Unset — every non-test run — is no syscalls and no gate.
+
+**Verified by mutation, not by observing green.** Each gate was checked by reintroducing the
+defect it exists to catch:
+
+- disable the dev/ino check and take `AT_REMOVEDIR` from the observed type again (v0.15.93's
+  defect) → the tar cell fails 3 of 3 on the CPU-only build, where it used to skip;
+- restore the consumer's type-dispatch, `S_ISLNK(quarantined) ? in_lid : in_id` (v0.15.91's
+  defect) → the plain cell fails 3 of 3 **at exit 0**, the original signature, on a ten-byte
+  input that the old 400 MB version needed bulk to catch at all.
+
+**The rule this makes concrete:** never gate a suite test on wall-clock timing — if a test must
+act inside a window, the program opens the window. The failure mode is not a false alarm but a
+silent *non*-failure, and `skip` is where it hides, invisible to a failure count. And a test that
+has never been seen to fail is not known to be a test: mutate it and watch it fail.
+
+## v0.15.93 — the new deletion code had the defect it was written right after fixing
+
+The `--tar --rm` removal list stored a **path string**. At removal it `stat`ed whatever was at
+that name and used *that* entry's type to choose `unlink` vs `rmdir`. So:
+
+```
+mv d/a.txt d/saved.txt        # move the archived file aside
+mv victim.txt d/a.txt         # drop an unarchived file at the name
+```
+
+deleted `victim.txt`, **a file that was never archived**. Reproduced. That is v0.15.90's finding
+reintroduced in brand-new code written hours after fixing it, and the comment above the function
+claimed the protection — "only what was archived is removed", "a path whose type changed is left
+alone" — while the code implemented none of it. The comment was the more dangerous half.
+
+The record now carries **dev+ino and the archived type**, both re-checked through the parent
+descriptor before anything is removed. A name that no longer leads to the archived inode is left
+alone and counted; `AT_REMOVEDIR` comes from the recorded type rather than the observed one, so
+the agreement is structural instead of incidental. The replacement chooses nothing: not whether
+it is removed, and not how.
+
+The feature's own tests could not catch this — every one of them is a substitution-free run, so
+they exercised only the paths that were already correct. There is now a test that performs the
+swap.
+
+**Documented, deliberately not fixed:** the identity proof is an `fstatat` and the removal is an
+`unlinkat` *by name*, so a different-uid writer with write access to the parent can substitute a
+**same-type** entry between the two and have that one unlinked. There is no unlink-by-inode
+syscall, and another recheck is not a fix — it is one more pair of lookups for an exchange to sit
+between, the same reasoning already recorded for the abnormal-exit cleanup window. Quarantining
+every member by `renameat2`, the way plain `--rm` treats its single input, was rejected: a rename
+per archived entry across a whole tree, to narrow a window measured in microseconds, is not the
+cheap self-contained defence the threat-model line asks for. The bound that makes it acceptable is
+that the attacker chooses only the *victim*, never the *treatment* — `AT_REMOVEDIR` still comes
+from the record. The function's comment now says so, rather than listing only the properties it
+does deliver: understating the code is how the defect above shipped.
+
+**The lesson, and it is not "be more careful":** a fix does not generalise to code written after
+it. The producer/consumer split from v0.15.90 was re-derived here from scratch and re-broken the
+same way, because the new code was reviewed against *its own* comments rather than against the
+defect class. New destructive code needs the class checklist run over it explicitly.
+
+
+## v0.15.92 — `--tar --rm` stops lying
+
+`gzstd --tar --rm` accepted the flag, exited 0, printed nothing, and **kept every source the
+user asked it to remove**. `--rm` set `opt.keep`; nothing in the tar path ever read it. A
+destructive flag that silently no-ops is worse than one that errors, and this one had been
+quietly not-deleting since `--tar` shipped.
+
+It now removes the archived sources, and `--remove-files` is accepted as an alias — GNU tar's
+spelling of the same intent. Both are documented in `-h` and `--help`.
+
+**Three properties, and the last two matter more than the first:**
+
+1. **Only what was archived is removed.** The list is built by the walker as it adds members, so
+   a file created during the run — which is not in the archive — is never a candidate. Removal
+   is not driven by the command-line source paths.
+2. **It is never a recursive force-delete.** Non-directories are `unlinkat`ed and directories
+   are `rmdir`ed, nothing more, walking the list in reverse so children go before parents. So
+   anything left behind — excluded by `--exclude`, created mid-run, or skipped — *keeps its
+   parent directory alive* instead of being destroyed with it. `ENOTEMPTY` is the designed
+   outcome, not an error to work around.
+3. **Nothing is removed unless the run was clean.** A non-zero exit covers a failed archive;
+   `g_tar_had_errors` covers the archive that *succeeded while skipping a member* — unreadable,
+   vanished, or changed mid-read. Removing sources in that case destroys data the archive does
+   not contain, which is precisely what the `--verify` work exists to prevent; the flag whose
+   whole job is deletion must not reintroduce it.
+
+Entries that could not be removed are named individually, and the run exits 3 with the archive
+kept: a destructive step you asked for and did not get must not exit 0.
+
+**Measured against GNU tar 1.35 side by side, not presumed.** The common case matches; the failure
+modes deliberately diverge, and that divergence is the point:
+
+| case | GNU tar 1.35 | gzstd |
+|---|---|---|
+| clean run | tree removed | tree removed — same |
+| excluded file present | file + parent dirs survive, named, exit 2 | same, exit 3 |
+| unreadable member (archive incomplete) | **deletes what it archived** | **removes nothing** |
+| SIGINT mid-run | **36 of 40 sources already destroyed** | **all 60 intact**, partial archive removed, exit 130 |
+
+GNU tar removes each file *as it archives it*; gzstd defers until the archive is complete and
+installed, and is all-or-nothing. So "just like GNU tar" is true for the happy path and
+deliberately false for every failure path.
+
+Verified by behaviour, not inspection: a clean tree is removed and the archive still
+round-trips; an excluded file survives *and so does its parent*; an unreadable member yields
+`--rm: the archive did not complete cleanly; no sources were removed` with every source intact;
+a single-file source does not take its parent directory with it; and without the flag nothing is
+ever removed.
+
+**Not changed, and worth knowing:** `-d --tar --rm` still does not remove the archive it just
+extracted. That is the same silent-no-op shape on the decompress side, it is pre-existing, and
+it is a separate destructive behaviour that deserves its own decision rather than being folded
+in here.
 
 
 ## v0.15.91 — the reviewer's fix was incomplete too, and a mirrored path went unfixed

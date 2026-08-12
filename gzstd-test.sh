@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=405
-$EXTENSIVE && EXPECTED_TESTS=538
+EXPECTED_TESTS=407
+$EXTENSIVE && EXPECTED_TESTS=540
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6809,31 +6809,38 @@ RMS_MATRIX
   #     The shape matrix above cannot reach this: every cell keeps one type from
   #     start to finish.
   #
-  #     Timed by POLLING FOR OBSERVABLE STATE (the output appearing), never a
-  #     fixed sleep — and if compression finishes before the swap lands, the case
-  #     simply did not apply and is skipped rather than failed.
+  #     THE SWAP IS A RENDEZVOUS, NOT A RACE.  This cell used to poll for the
+  #     output file and swap when it appeared, buying its window by compressing
+  #     400 MB of /dev/urandom on EVERY run of EVERY configuration — and still
+  #     skipping when it lost, which is the outcome that guards nothing.
+  #     $GZSTD_DEBUG_RM_GATE makes the window explicit instead: gzstd blocks on the
+  #     FIFO once the output is installed and before the source is touched, so a
+  #     few bytes of input suffice and the cell runs every time.  See the same
+  #     handshake at 1c-9f, and rm_debug_gate() in gzstd.cpp for why it is a FIFO.
   rm -rf "$TMPDIR/rmt"; mkdir -p "$TMPDIR/rmt"
-  # big enough that compression outlives the swap; incompressible so it stays big
-  head -c 400000000 /dev/urandom > "$TMPDIR/rmt/real" 2>/dev/null
+  printf 'REAL-DATA\n' > "$TMPDIR/rmt/real"
   ln -s real "$TMPDIR/rmt/link"
-  "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmt/out.zst" "$TMPDIR/rmt/link" \
-      >/dev/null 2>&1 &
+  mkfifo "$TMPDIR/rmt/gate"
+  GZSTD_DEBUG_RM_GATE="$TMPDIR/rmt/gate" \
+    timeout --foreground -k 10 120 \
+      "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmt/out.zst" "$TMPDIR/rmt/link" \
+        >/dev/null 2>&1 &
   rmt_pid=$!
-  rmt_swapped=0
-  for _ in $(seq 1 4000); do
-    if [ -e "$TMPDIR/rmt/out.zst" ]; then
-      if mv "$TMPDIR/rmt/link" "$TMPDIR/rmt/saved" 2>/dev/null \
-         && mv "$TMPDIR/rmt/real" "$TMPDIR/rmt/link" 2>/dev/null; then
-        rmt_swapped=1
-      fi
-      break
-    fi
-    kill -0 "$rmt_pid" 2>/dev/null || break     # finished before we could swap
-    sleep 0.005
-  done
+  # Replace the symlinked input with its OWN TARGET: the entry at the name becomes
+  # a regular file whose inode is the one that was just compressed, which is
+  # exactly the substitution the old consumer let through.
+  rmt_gated=0
+  timeout 60 sh -c '
+      exec 9>"$1/gate" || exit 1
+      mv "$1/link" "$1/saved" || exit 1
+      mv "$1/real" "$1/link"  || exit 1
+      printf go >&9
+      exec 9>&-
+    ' sh "$TMPDIR/rmt" && rmt_gated=1
   wait "$rmt_pid" 2>/dev/null
-  if [ "$rmt_swapped" != 1 ]; then
-    skip "--rm refuses a type-changed replacement (run finished before the swap)"
+  if [ "$rmt_gated" != 1 ]; then
+    fail "--rm refuses a type-changed replacement" \
+         "gzstd never reached the pre-removal gate (GZSTD_DEBUG_RM_GATE)"
   elif [ -e "$TMPDIR/rmt/link" ] || [ -e "$TMPDIR/rmt/saved" ]; then
     # the data survived under one name or the other: the replacement was refused
     pass "--rm refuses a type-changed replacement (the data file survives)"
@@ -6871,6 +6878,124 @@ RMS_MATRIX
     fail "--rm without procfs"
   fi
   rm -rf "$TMPDIR/rmp"
+
+  # 1c-9e. --tar --rm / --remove-files REMOVES THE ARCHIVED SOURCES.
+  #     Until v0.15.92 this was silently accepted and did nothing: --rm set
+  #     opt.keep, nothing in the tar path read it, and the run exited 0 having
+  #     kept every source the user asked to remove. A destructive flag that
+  #     no-ops quietly is worse than one that errors.
+  #
+  #     The three properties that make it safe are each a cell here, and the last
+  #     two matter more than the first: removal must be driven by what was
+  #     ARCHIVED, must never be a recursive force-delete, and must not happen at
+  #     all when the archive lost a member.
+  rm -rf "$TMPDIR/trm"; mkdir -p "$TMPDIR/trm"; trm_ok=1; trm_why=""
+  trm_mk() { rm -rf "$1"; mkdir -p "$1/sub"; printf 'A\n' > "$1/a.txt";
+             printf 'B\n' > "$1/sub/b.txt"; ln -s a.txt "$1/l.lnk"; }
+
+  # (a) a clean tree is removed, and the archive still round-trips
+  trm_mk "$TMPDIR/trm/s1"
+  "$GZSTD" --cpu-only -q --tar --rm -f -o "$TMPDIR/trm/t1.zst" "$TMPDIR/trm/s1" \
+      >/dev/null 2>&1 || { trm_ok=0; trm_why="$trm_why clean:exit"; }
+  [ -e "$TMPDIR/trm/s1" ] && { trm_ok=0; trm_why="$trm_why clean:source-kept"; }
+  ( mkdir -p "$TMPDIR/trm/x1" && cd "$TMPDIR/trm/x1" \
+    && "$GZSTD" -d --tar "$TMPDIR/trm/t1.zst" >/dev/null 2>&1 )
+  [ "$(cat "$TMPDIR/trm/x1$TMPDIR/trm/s1/sub/b.txt" 2>/dev/null \
+       || find "$TMPDIR/trm/x1" -name b.txt -exec cat {} \; 2>/dev/null)" = "B" ] \
+    || { trm_ok=0; trm_why="$trm_why clean:roundtrip"; }
+
+  # (b) --remove-files is the same flag (GNU tar's spelling)
+  trm_mk "$TMPDIR/trm/s2"
+  "$GZSTD" --cpu-only -q --tar --remove-files -f -o "$TMPDIR/trm/t2.zst" \
+      "$TMPDIR/trm/s2" >/dev/null 2>&1 || { trm_ok=0; trm_why="$trm_why alias:exit"; }
+  [ -e "$TMPDIR/trm/s2" ] && { trm_ok=0; trm_why="$trm_why alias:source-kept"; }
+
+  # (c) an EXCLUDED file was never archived, so it must survive — and because
+  #     removal only rmdir()s, its parent survives with it rather than being
+  #     force-deleted.  Exits non-zero because a requested removal did not
+  #     fully happen.
+  trm_mk "$TMPDIR/trm/s3"
+  "$GZSTD" --cpu-only -q --tar --rm --exclude='*b.txt' -f -o "$TMPDIR/trm/t3.zst" \
+      "$TMPDIR/trm/s3" >/dev/null 2>&1
+  [ -e "$TMPDIR/trm/s3/sub/b.txt" ] || { trm_ok=0; trm_why="$trm_why excluded:DELETED"; }
+
+  # (d) THE ONE THAT MATTERS MOST: a member the archive could not read is a
+  #     member the archive does not contain, so NOTHING is removed.
+  rm -rf "$TMPDIR/trm/s4"; mkdir -p "$TMPDIR/trm/s4"
+  printf 'keep\n' > "$TMPDIR/trm/s4/good.txt"
+  printf 'x\n'    > "$TMPDIR/trm/s4/bad.txt"; chmod 000 "$TMPDIR/trm/s4/bad.txt"
+  "$GZSTD" --cpu-only -q --tar --rm -f -o "$TMPDIR/trm/t4.zst" "$TMPDIR/trm/s4" \
+      >/dev/null 2>&1
+  [ -e "$TMPDIR/trm/s4/good.txt" ] \
+    || { trm_ok=0; trm_why="$trm_why skipped-member:REMOVED-ANYWAY"; }
+  chmod 644 "$TMPDIR/trm/s4/bad.txt" 2>/dev/null
+
+  # (e) without the flag nothing is ever removed
+  trm_mk "$TMPDIR/trm/s5"
+  "$GZSTD" --cpu-only -q --tar -f -o "$TMPDIR/trm/t5.zst" "$TMPDIR/trm/s5" \
+      >/dev/null 2>&1 || { trm_ok=0; trm_why="$trm_why default:exit"; }
+  [ -e "$TMPDIR/trm/s5" ] || { trm_ok=0; trm_why="$trm_why default:DELETED"; }
+
+  if [ "$trm_ok" = 1 ]; then
+    pass "--tar --rm removes archived sources (and refuses when the archive lost a member)"
+  else
+    fail "--tar --rm source removal" "failing cells:$trm_why"
+  fi
+  rm -rf "$TMPDIR/trm"
+
+  # 1c-9f. --tar --rm REMOVES AN INODE IT ARCHIVED, NOT A NAME.
+  #     The first version of the removal list stored only the path, stat'd it at
+  #     removal time, and let the CURRENT entry choose unlink-vs-rmdir. So
+  #         mv d/a.txt d/saved.txt ; mv victim.txt d/a.txt
+  #     deleted victim.txt, a file that had never been archived, at exit 0 —
+  #     v0.15.89's defect reintroduced in brand-new code hours after it was
+  #     fixed, with a comment claiming the protection the code did not have.
+  #     The cells above cannot catch it: every one of them is a substitution-free
+  #     run, so they exercise only the paths that were already correct.
+  #     THE SWAP IS A RENDEZVOUS, NOT A RACE.  The first version of this cell
+  #     polled for the output file and then swapped, which meant it only ran when
+  #     it happened to win: it PASSED on the GPU build and SKIPPED on CPU-only,
+  #     where the tiny tree finished compressing before the swap could land.  A
+  #     test that skips guards nothing.  $GZSTD_DEBUG_RM_GATE makes the window
+  #     explicit — gzstd blocks on the FIFO after the archive is installed and
+  #     before the first unlink, so the swap lands in the window every time, on
+  #     every build, at no cost in run time.
+  rm -rf "$TMPDIR/trs"; mkdir -p "$TMPDIR/trs/d"
+  printf 'ARCHIVED\n' > "$TMPDIR/trs/d/a.txt"
+  printf 'NEVER-ARCHIVED\n' > "$TMPDIR/trs/victim.txt"
+  mkfifo "$TMPDIR/trs/gate"
+  # Both timeouts are hang guards ONLY — neither can affect the verdict when the
+  # gate works, because the handshake below returns immediately in that case.
+  # They exist so a binary without the hook fails loudly instead of wedging the
+  # suite: gzstd would wait forever for a writer that never comes, and the writer
+  # would wait forever for a reader that already exited.
+  GZSTD_DEBUG_RM_GATE="$TMPDIR/trs/gate" \
+    timeout --foreground -k 10 120 \
+      "$GZSTD" --cpu-only -q --tar --rm -f -o "$TMPDIR/trs/t.zst" "$TMPDIR/trs/d" \
+        >/dev/null 2>&1 &
+  trs_pid=$!
+  # Opening the write end returns exactly when gzstd opens the read end, i.e.
+  # once the archive is complete and installed and no source has been touched.
+  # Only then is it meaningful to substitute the name.
+  trs_gated=0
+  timeout 60 sh -c '
+      exec 9>"$1/gate" || exit 1
+      mv "$1/d/a.txt" "$1/d/saved.txt" || exit 1
+      mv "$1/victim.txt" "$1/d/a.txt"  || exit 1
+      printf go >&9
+      exec 9>&-
+    ' sh "$TMPDIR/trs" && trs_gated=1
+  wait "$trs_pid" 2>/dev/null
+  if [ "$trs_gated" != 1 ]; then
+    fail "--tar --rm removes an archived inode, not a name" \
+         "gzstd never reached the pre-removal gate (GZSTD_DEBUG_RM_GATE)"
+  elif [ -e "$TMPDIR/trs/d/a.txt" ]; then
+    pass "--tar --rm removes an archived inode, not a name"
+  else
+    fail "--tar --rm removes an archived inode, not a name" \
+         "a file that was never archived was deleted through a substituted name"
+  fi
+  rm -rf "$TMPDIR/trs"
 
   # 1c-8. THE CLOBBER GUARD ASKS ABOUT WHAT WILL BE DESTROYED, which for a plain
   #     compress means following the symlink — the open does. Answering it with a

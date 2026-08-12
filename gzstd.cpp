@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.91";
+static constexpr const char * GZSTD_VERSION = "0.15.94";
 //
 // Architecture overview:
 //
@@ -1247,6 +1247,7 @@ struct Options {
   bool tar_exclude_vcs = false;          // --exclude-vcs: append GNU tar's version-control list
   bool tar_absolute_names = false;       // -P/--absolute-names: keep leading '/' on stored names (create)
   bool tar_files_from = false;           // --files-from FILE was given (creation-only validation)
+  bool tar_remove_sources = false;       // --tar --rm / --remove-files: delete the archived sources afterwards
   bool tar_numeric_owner = false;        // --numeric-owner: omit uname/gname lookup
   bool tar_one_file_system = false;      // --one-file-system: don't cross mount points
   bool tar_xattrs = false;               // --xattrs: store/restore extended attributes (SCHILY.xattr.*)
@@ -1632,7 +1633,9 @@ static void print_help()
 "  -l                  list .zst frame info (Frames/Skips/Sizes/Ratio/Check);\n"
 "                      with --tar, list the archive contents (tar -tvf style)\n"
 "  -k                  keep input after success (default)\n"
-"  --rm                remove input after success\n"
+"  --rm, --remove-files  remove input after success; with --tar removes the\n"
+"                      archived sources (only what was archived, only on a\n"
+"                      clean run, never a recursive force-delete)\n"
 "\n"
 "Output:\n"
 "  -c                  write to stdout\n"
@@ -1829,8 +1832,26 @@ static void print_help_long()
 "  -k\n"
 "     Keep input after success (this is the default).\n"
 "\n"
-"  --rm\n"
+"  --rm, --remove-files\n"
 "     Remove input after a successful operation.  Implies -k=off.\n"
+"     --remove-files is GNU tar's spelling of the same thing.\n"
+"\n"
+"     With --tar this removes the ARCHIVED SOURCES once the archive is\n"
+"     complete and installed.  Three properties, deliberately:\n"
+"       * Only what was archived is removed.  The list comes from the\n"
+"         walker's own members, so a file created during the run — which\n"
+"         is not in the archive — is never deleted.\n"
+"       * It is NOT a recursive force-delete.  Files are unlinked and\n"
+"         directories are rmdir'd, so anything left behind (excluded by\n"
+"         --exclude, or newly created) keeps its parent directory alive\n"
+"         instead of being destroyed with it.\n"
+"       * Nothing is removed unless the run was clean.  A failed archive,\n"
+"         or one that SKIPPED a member (unreadable, vanished, changed\n"
+"         mid-read), removes nothing — that archive does not contain what\n"
+"         the sources hold.\n"
+"     Entries that could not be removed are named, and the run exits 3\n"
+"     with the archive kept: a destructive step you asked for and did not\n"
+"     get must not exit 0.\n"
 "\n"
 "============================================================\n"
 " OUTPUT\n"
@@ -13240,6 +13261,171 @@ struct TarOutputEntryId {
 };
 static std::vector<TarOutputEntryId> g_tar_output_entries;
 
+// --tar --rm / --remove-files: what the walker ACTUALLY archived, in walk order
+// (parents before children).  Consumed once, in gzstd_main, after the archive is
+// complete and installed.  Removal walks it in REVERSE, so children go first.
+//
+// THE IDENTITY IS PART OF THE RECORD, not just the path.  A path string alone
+// names whatever occupies it at removal time, which is the defect this project
+// has now hit three times: the first version of this list stored only the path,
+// stat'd it at removal, and let the CURRENT entry choose unlink-vs-rmdir — so
+//     mv d/a d/saved ; mv victim d/a
+// deleted `victim`, a file that was never archived at all.  dev+ino says which
+// object was archived, and is_dir says how it must be removed; neither question
+// is the replacement's to answer.
+struct TarRemoval {
+  std::string path;
+  dev_t       dev;
+  ino_t       ino;
+  bool        is_dir;
+};
+static std::vector<TarRemoval> g_tar_removal_paths;
+
+// Test-only rendezvous (read from $GZSTD_DEBUG_RM_GATE, a FIFO path): block in the
+// window between "the output is complete and installed" and "the source is
+// removed" — for both --rm paths, the plain one and --tar's — so the suite can
+// substitute a name there and prove that removal follows the inode that was
+// actually compressed or archived, not whatever now answers to that name.
+// Nothing else in the suite can reach that window: every other --rm cell keeps one
+// entry, of one type, from start to finish, so they exercise only the paths that
+// were already correct.  That is how v0.15.91's defect reached a release and how
+// v0.15.89's was then reintroduced in the tar code.
+//
+// IT IS A FIFO AND NOT A SLEEP, DELIBERATELY.  Both of those tests originally
+// guessed at the window by polling for the output file and swapping when it
+// appeared.  Both raced.  The tar one SKIPPED on the CPU-only build — the tree
+// compressed before the swap could land — and the plain one bought its window by
+// compressing 400 MB of /dev/urandom on every run of every configuration, and
+// still skipped when it lost.  A test that skips guards nothing, and a suite test
+// gated on wall-clock timing hides its failure as a non-failure rather than as a
+// false alarm.  This handshake contains no timing at all: open(O_RDONLY) returns
+// exactly when the test opens the write end (that is the "I am in the window"
+// signal, and it is what stops the test swapping too early), and read() returns
+// exactly when the test writes (that is "the swap has landed, proceed").  Unset —
+// the normal case, including every non-test run — is no syscalls and no gate.
+static void rm_debug_gate()
+{
+  const char * fifo = ::getenv("GZSTD_DEBUG_RM_GATE");
+  if (!fifo || !*fifo) return;
+  const int fd = ::open(fifo, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  char c;
+  ssize_t n;
+  do { n = ::read(fd, &c, 1); } while (n < 0 && errno == EINTR);
+  ::close(fd);
+}
+
+// Remove the sources that were archived, children before parents.  Returns the
+// number of entries that could NOT be removed; the caller reports it.
+//
+// THE SAFETY PROPERTIES, because this is the only code in gzstd that deletes a
+// tree and every one of them is load-bearing:
+//
+//  * IT IS NEVER A RECURSIVE FORCE-DELETE.  Non-directories are unlinkat()ed and
+//    directories are rmdir()ed, nothing more.  So anything that was not archived
+//    — excluded by --exclude, created during the run, or skipped — survives, and
+//    its parent simply fails to go away with ENOTEMPTY.  That failure mode is the
+//    feature: the conservative outcome is "some directories are left", never
+//    "something unarchived was destroyed".
+//  * IT DELETES ONLY WHAT WAS ARCHIVED.  The list comes from the walker's own
+//    entries, not from the command-line source paths.
+//  * IT NEVER FOLLOWS A SYMLINK.  unlinkat() on a symlink removes the link, which
+//    is what was archived; the target is not ours to touch.  Directories are
+//    opened O_NOFOLLOW|O_DIRECTORY, so a directory swapped for a symlink between
+//    the walk and now is refused rather than descended.
+//  * IT REMOVES AN INODE IT ARCHIVED, NOT A NAME.  Every entry carries the dev+ino
+//    the walker saw, re-checked here through the parent descriptor before acting;
+//    a mismatch is left alone and counted.  The FIRST version of this function
+//    stored only the path, stat'd it at removal time, and used the CURRENT entry's
+//    type to pick unlink-vs-rmdir — so `mv d/a d/saved ; mv victim d/a` deleted
+//    `victim`, which had never been archived.  That is v0.15.89's defect
+//    reintroduced in new code, and the comment here claimed the protection while
+//    the code did not implement it.  The replacement chooses nothing: not whether
+//    it is removed, and not how.
+//
+// THE ONE WINDOW THAT REMAINS, STATED RATHER THAN GLOSSED — because a comment here
+// claiming more than the code delivers is exactly what shipped the defect above.
+// The identity proof is an fstatat() and the removal is an unlinkat() BY NAME, so a
+// different-uid writer with write access to the parent can substitute a SAME-TYPE
+// entry between the two and have that entry unlinked instead.  It is not closed
+// because it cannot be: there is no unlink-by-inode syscall, and another recheck is
+// not a fix, it is one more pair of lookups for an exchange to sit between — the
+// same reasoning AGENTS.md already records for the abnormal-exit cleanup window.
+// Quarantining every member by renameat2, the way plain --rm treats its single
+// input, was rejected: a rename per archived entry across a whole tree to narrow a
+// window measured in microseconds is not the cheap, self-contained defence the
+// threat-model line asks for.  What bounds it is that the attacker chooses only the
+// VICTIM and never the TREATMENT: AT_REMOVEDIR still comes from the record, so a
+// substituted directory is not rmdir'ed and a substituted file is not descended.
+//
+// Caller guarantees the archive is complete and had no skipped members.
+static size_t tar_remove_archived_sources(const std::vector<TarRemoval> & paths,
+                                          const Options & opt)
+{
+  size_t failed = 0;
+  // Reverse walk order = deepest first, so a directory is only attempted after
+  // everything the walker put inside it has already gone.
+  for (size_t i = paths.size(); i-- > 0; ) {
+    const std::string & p = paths[i].path;
+    if (p.empty()) continue;
+
+    const size_t slash = p.find_last_of('/');
+    const std::string dir  = (slash == std::string::npos) ? std::string(".")
+                           : (slash == 0)                 ? std::string("/")
+                                                          : p.substr(0, slash);
+    const std::string base = (slash == std::string::npos) ? p : p.substr(slash + 1);
+    if (base.empty() || base == "." || base == "..") continue;
+
+    const int dfd = ::open(dir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+      ++failed;
+      vlog(V_ERROR, opt, "gzstd: tar: cannot remove " + p + ": "
+           + std::strerror(errno) + "\n");
+      continue;
+    }
+    struct stat st;
+    if (::fstatat(dfd, base.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      // Already gone is not a failure — the archive still holds it.
+      if (errno != ENOENT) {
+        ++failed;
+        vlog(V_ERROR, opt, "gzstd: tar: cannot remove " + p + ": "
+             + std::strerror(errno) + "\n");
+      }
+      ::close(dfd);
+      continue;
+    }
+    // IS THIS STILL THE OBJECT WE ARCHIVED?  If the name now leads somewhere
+    // else, that somewhere else is not in the archive and must not be removed.
+    if (st.st_dev != paths[i].dev || st.st_ino != paths[i].ino) {
+      ++failed;
+      vlog(V_ERROR, opt, "gzstd: tar: kept " + p
+           + ": it is no longer the entry that was archived\n");
+      ::close(dfd);
+      continue;
+    }
+    int rc;
+    do {
+      // AT_REMOVEDIR from the RECORDED type, not the observed one.  Identity is
+      // already proven above, so these agree — but taking it from the record is
+      // what makes that structural instead of incidental.
+      rc = ::unlinkat(dfd, base.c_str(), paths[i].is_dir ? AT_REMOVEDIR : 0);
+    } while (rc != 0 && errno == EINTR);
+    if (rc != 0) {
+      ++failed;
+      // ENOTEMPTY is the EXPECTED outcome for a directory that still holds
+      // something we did not archive, so say what it means rather than just
+      // relaying errno — this is the case a user will actually hit.
+      const std::string why =
+          (errno == ENOTEMPTY || errno == EEXIST)
+            ? std::string("it still contains entries that were not archived")
+            : std::string(std::strerror(errno));
+      vlog(V_ERROR, opt, "gzstd: tar: kept " + p + ": " + why + "\n");
+    }
+    ::close(dfd);
+  }
+  return failed;
+}
+
 static bool tar_entry_is_the_archive(const struct stat & st)
 {
   for (const auto & id : g_tar_output_ids)
@@ -13733,7 +13919,18 @@ struct LayoutBuilder {
     }
   }
 
+  const std::string * cur_fspath_ = nullptr;   // set per-Pending by finalize_entries
+  const struct stat  * cur_st_    = nullptr;   // ...and the identity it was walked with
+
   void add(TarEntry e) {
+    // Recorded only for members that actually made it into the layout, so a
+    // skipped or ignored file is never a removal candidate — and recorded WITH
+    // its identity, so removal acts on the inode that was archived rather than
+    // on whatever holds the name later.
+    if (opt.tar_remove_sources && cur_fspath_ && !cur_fspath_->empty() && cur_st_)
+      g_tar_removal_paths.push_back(TarRemoval{*cur_fspath_, cur_st_->st_dev,
+                                               cur_st_->st_ino,
+                                               S_ISDIR(cur_st_->st_mode)});
     e.hdr_off   = off;
     e.hdr_len   = entry_header_len(e);
     e.data_off  = off + e.hdr_len;
@@ -13941,6 +14138,12 @@ struct LayoutBuilder {
   // serial walk — only the lstat I/O moved to the parallel Pass B.
   void finalize_entries() {
     for (Pending & p : pending_) {
+      // --rm / --remove-files: what add() records as removable.  Set from the
+      // pending entry rather than at each add() call site so a new member kind
+      // cannot be added without it — a missed one is only left behind, never
+      // wrongly deleted, but a directory it sits in would then never go either.
+      cur_fspath_ = &p.fspath;
+      cur_st_     = &p.st;
       if (p.stat_err != 0) { warn_skip(p.fspath, std::strerror(p.stat_err)); continue; }
       const struct stat & st = p.st;
 
@@ -26461,6 +26664,7 @@ static int gzstd_main(int argc, char ** argv)
     // Success: disarm cleanup (temp or direct output file is now final)
     clear_tmp_file();
     if (!keep_this_file && opt.input != "-") {
+      rm_debug_gate();   // test-only; see the definition. No-op when unset.
       // --rm was REQUESTED, so failing to remove the source is a failure of the
       // command, not a detail.  Discarding ec_rm exited 0 while the input was
       // still there — e.g. compressing out of a directory the user cannot write
@@ -26736,6 +26940,37 @@ static int gzstd_main(int argc, char ** argv)
   if (opt.tar_mode && g_tar_had_errors.load(std::memory_order_relaxed)
       && exit_code == EXIT_OK)
     exit_code = EXIT_ERROR;
+
+  // --tar --rm / --remove-files: remove the archived sources, and ONLY once the
+  // archive is complete, installed, and lost nothing.
+  //
+  // Both conditions are the point.  exit_code != EXIT_OK covers a failed or
+  // partial archive; g_tar_had_errors covers the archive that succeeded while
+  // SKIPPING a member (unreadable, vanished, changed mid-read).  Removing the
+  // sources in either case destroys data the archive does not contain — the
+  // exact failure the --verify work exists to prevent, so it must not be
+  // reintroduced by the flag whose whole job is deletion.
+  if (opt.tar_mode && opt.tar_remove_sources && !g_tar_removal_paths.empty()) {
+    if (exit_code != EXIT_OK) {
+      vlog(V_ERROR, opt, "gzstd: tar: --rm: the archive did not complete cleanly; "
+                         "no sources were removed\n");
+    } else {
+      rm_debug_gate();   // test-only; see the definition. No-op when unset.
+      const size_t kept = tar_remove_archived_sources(g_tar_removal_paths, opt);
+      if (kept != 0) {
+        // The user asked for removal and did not fully get it.  Same reasoning as
+        // the plain --rm path: a requested destructive step that silently did not
+        // happen must not exit 0.  The archive is kept — it is complete.
+        vlog(V_ERROR, opt, "gzstd: tar: --rm: " + std::to_string(kept)
+             + " source entr" + (kept == 1 ? "y was" : "ies were")
+             + " not removed (archive kept at " + opt.output + ")\n");
+        exit_code = EXIT_IO;
+      } else {
+        vlog(V_VERBOSE, opt, "[TAR] --rm: removed "
+             + std::to_string(g_tar_removal_paths.size()) + " archived source entries\n");
+      }
+    }
+  }
 
   // --adapt: persist this process's calibration observation.  Only a clean
   // run qualifies (exit 0); sub-3 s runs measured nothing worth keeping
@@ -28069,6 +28304,11 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "-t" || a == "--test") opt.mode = Mode::TEST;
     else if (a == "-k" || a == "--keep") opt.keep = true;
     else if (a == "--rm") { opt.keep = false; }
+    // GNU tar's spelling for the same intent.  An alias rather than a --tar-only
+    // flag: it means "remove the input after archiving it", which is exactly what
+    // --rm already means for a plain compress, and having the two spellings
+    // disagree outside --tar would be its own trap.
+    else if (a == "--remove-files") { opt.keep = false; }
     else if (a == "-f" || a == "--force") opt.force = true;
     else if (a == "--overwrite") { opt.force = true; opt.unsafe_overwrite = true; }
     else if (a == "--sparse") opt.sparse_mode = 1;
@@ -28598,6 +28838,14 @@ static Options parse_args(int argc, char ** argv)
 #endif
     if (opt.sliding_window)
       die_usage("--tar is incompatible with --sliding-window");
+    // --rm / --remove-files in --tar mode removes the ARCHIVED SOURCES.  Until
+    // v0.15.92 this was silently accepted and did nothing: the flag set opt.keep,
+    // nothing in the tar path read it, and the run exited 0 having kept every
+    // source the user asked to remove.  A destructive flag that no-ops quietly is
+    // worse than one that errors.  Decompression has no sources to remove, so it
+    // stays a plain input removal there.
+    if (!opt.keep && opt.mode == Mode::COMPRESS)
+      opt.tar_remove_sources = true;
     // Sources/archives follow --tar; anything in inputs leaked in before it
     // (opt.inputs is otherwise just the "-" placeholder added below).
     for (const std::string & s : opt.inputs)

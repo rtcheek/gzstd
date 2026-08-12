@@ -32,12 +32,25 @@ defects, including four versions where it did not compile at all.
 ## Tests
 
 ```bash
-./gzstd-test.sh ./build/gzstd         # THE NORMAL RUN — before every commit
+./gzstd-test.sh ./build/gzstd         # the default run
 ./gzstd-test.sh ./build-cpu/gzstd     # CPU-only build (USE_NVCOMP=OFF) — cheap, ~1.4 min
 ./gzstd-test.sh -e ./build/gzstd      # OPT-IN, see below
 ```
 
-**The default run is the normal one.** Reach for `-e` only when the change is substantial
+**ASK BEFORE STARTING A SUITE. It is not a reflex before commits, and never was worth what it
+cost.** This file used to say "before every commit"; that instruction produced sessions where
+the suite ran four times in an hour and found none of that session's defects — every one came
+from a targeted reproduction or an independent review. A suite run also blocks further editing,
+because bash reads `gzstd-test.sh` incrementally and a mid-run edit corrupts it.
+
+**The fast loop is a targeted reproduction of the actual defect** — ten lines of shell, an
+answer in seconds, and the thing that actually catches regressions. Run that freely after every
+change. Then say what you changed, say what you verified, and let the maintainer decide whether
+a suite run is worth the wall clock. The same applies to bumping `GZSTD_VERSION`: nothing is
+committed until the maintainer commits it, so rebuilding at one version while iterating is
+expected. Ask before bumping.
+
+**The default run is the normal one** when one is called for. Reach for `-e` only when the change is substantial
 enough to warrant it — always for `parse_args`, argument parsing, bundled-flag expansion or
 the zstd-compat flag layer, whose test sections are `$EXTENSIVE`-gated and therefore never
 run by default. The extensive run costs ~14 min against ~9.5 min for the default.
