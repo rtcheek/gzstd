@@ -173,9 +173,19 @@ silently compiled out.
   There is no unlink-by-inode syscall, so it cannot be closed; adding another recheck is not a
   fix, it is another pair of lookups for an ABA to sit between. The alternative — never unlink
   asynchronously and leave partial outputs behind — was rejected for zstd parity.
-  `QuarantineDir::release()` is the *different* case and IS closed: it verifies the held
-  descriptor against the name before `rmdir`, and its residual is bounded to removing an empty
-  directory, never data.
+  `QuarantineDir::release()` verifies the held descriptor against the name before `rmdir`, and
+  the object it can wrongly delete is bounded to an *empty* directory, never data. **That bound
+  is real but it was originally overstated as "closed":** in an error path — the entry could not
+  be removed, so it is still inside — an exchange can make `release()` succeed against a
+  substituted empty directory, leaving the original quarantine, *with the user's input in it*,
+  stranded under a name nothing reports. Hence the caller no longer asks a deletion where the
+  file is: on a failed removal it reports the quarantine path unconditionally.
+- **`--rm`'s identity check compares ONLY against the pinned entry (`in_lid`).** It must never
+  select its comparison from the *quarantined* entry's current type. Doing that let the
+  replacement choose which test it faced: `mv link saved-link; mv real link` turns the name into
+  a regular file whose inode is the compressed target's, which passed the non-symlink branch and
+  **deleted the data file at exit 0**. Reproduced, then fixed. A shape matrix cannot catch this —
+  every cell holds one type start to finish — so there is a separate type-change test.
   For calibration: stock zstd has none of these protections at all (`stat`/`unlink`/`open` by
   path, `AT_FDCWD`, no `O_EXCL`, no `O_NOFOLLOW`, `--rm` is a bare `unlink`). That does not
   excuse a defect, but it is the baseline this tool is judged against.

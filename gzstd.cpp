@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.89";
+static constexpr const char * GZSTD_VERSION = "0.15.91";
 //
 // Architecture overview:
 //
@@ -493,10 +493,64 @@ static int open_input_pinned(const HeldDir & in_dir,
       if (cap >= (size_t)PATH_MAX) { errno = ENAMETOOLONG; break; }
       cap = std::min<size_t>(cap * 2, (size_t)PATH_MAX);
     }
+    if (ifd < 0) {
+      // A SYMLINK'S TEXT NEED NOT BE A PATHNAME THE VFS CAN RESOLVE.  A procfs
+      // magic link reads back as pipe:[N] or socket:[N], so openat() of that text
+      // fails ENOENT — and requiring it turned a working invocation into a hard
+      // failure with no archive at all:
+      //     gzstd -f -o out.zst /proc/self/fd/3   works
+      //     gzstd --rm -f -o out.zst /proc/self/fd/3   exit 3, nothing produced
+      // (fd 3 on a pipe; measured). Gating on the OUTPUT destination cannot fix
+      // this — the problem is the input — and deciding by sniffing "/proc/" is a
+      // path-string test, which this project does not do.
+      //
+      // So DEGRADE THE GUARANTEE INSTEAD OF FAILING THE COMMAND: open the name
+      // normally, and mark the identity proof abandoned. The data is compressed
+      // and the archive is produced; --rm then REFUSES to delete rather than
+      // deleting on an unproven identity.
+      //
+      // Stated plainly because it is a real cost: this descriptor comes from a
+      // SECOND lookup of the user's name, so which data gets compressed is once
+      // again racy here. What it must never do is authorize a deletion — and it
+      // cannot, because entry_id_ok stays false and the removal block refuses
+      // before it quarantines anything.
+      ifd = ::openat(in_dir.fd, in_dir.base.c_str(), O_RDONLY | O_CLOEXEC);
+      if (ifd >= 0) { ::close(efd); return ifd; }   // entry_id_ok stays FALSE
+    }
   } else {
     char link[64];
     std::snprintf(link, sizeof(link), "/proc/self/fd/%d", efd);
-    ifd = ::open(link, O_RDONLY | O_CLOEXEC);
+    // GZSTD_DEBUG_NO_PROCFS forces the no-procfs branch: the real trigger is a
+    // chroot or mount namespace without /proc, which cannot be built on a host
+    // where unprivileged user namespaces are restricted, so the fallback would
+    // otherwise ship untested.  Same purpose as the other GZSTD_DEBUG_* hooks.
+    if (::getenv("GZSTD_DEBUG_NO_PROCFS")) { ifd = -1; errno = ENOENT; }
+    else ifd = ::open(link, O_RDONLY | O_CLOEXEC);
+    if (ifd < 0) {
+      // NO PROCFS (chroot, minimal mount namespace).  Requiring it would make
+      // --rm fail on inputs that are perfectly readable, which the plain openat
+      // this replaced never did.  Fall back to opening the name and PROVING it
+      // is the inode we pinned.
+      //
+      // Safe here in a way it is NOT for the symlink branch: this compares the
+      // SAME fact (the inode) from both lookups and demands equality, rather than
+      // combining two different facts. An A→B→A exchange therefore gains nothing
+      // — if the name leads back to the pinned inode, that inode IS what we
+      // opened.  O_NOFOLLOW because the entry we pinned was not a symlink, so a
+      // symlink appearing at the name is a substitution, not our file.
+      const int byname = ::openat(in_dir.fd, in_dir.base.c_str(),
+                                  O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+      if (byname >= 0) {
+        struct stat got;
+        if (::fstat(byname, &got) == 0
+            && got.st_dev == entry_id.st_dev && got.st_ino == entry_id.st_ino) {
+          ifd = byname;
+        } else {
+          ::close(byname);
+          errno = ESTALE;          // it moved: refuse, never compress a substitute
+        }
+      }
+    }
   }
 
   const int e = errno;
@@ -641,23 +695,26 @@ struct QuarantineDir {
     // removing an empty directory that was not ours — never data.  That is a
     // different class from the compare-then-unlink window on FILES, which is why
     // this one is worth closing and that one is documented instead.
-    bool ours = false;
-    if (fd >= 0 && parent_fd >= 0 && !name.empty()) {
-      struct stat held, byname;
-      if (::fstat(fd, &held) == 0
-          && ::fstatat(parent_fd, name.c_str(), &byname, AT_SYMLINK_NOFOLLOW) == 0
-          && held.st_dev == byname.st_dev && held.st_ino == byname.st_ino)
-        ours = true;
-    }
-    if (fd >= 0) { ::close(fd); fd = -1; }
     if (parent_fd >= 0 && !name.empty()) {
-      // Not ours any more: remove NOTHING and report failure, so the caller
-      // tells the user where the entry went instead of silently deleting a
-      // stranger's directory and claiming success.
-      if (!ours) return false;
+      // THE DESCRIPTOR STAYS OPEN UNTIL THE rmdir HAS ACTUALLY SUCCEEDED.  It is
+      // the only proof of which directory is ours, so closing it first made a
+      // transient rmdir failure permanent: the destructor's retry had no fd left,
+      // could not establish ownership, and silently stranded an empty
+      // .gzstd-q.* while the command exited 0.
+      if (fd < 0) return false;                 // already tried; cannot prove it now
+      struct stat held, byname;
+      const bool ours =
+          (::fstat(fd, &held) == 0
+           && ::fstatat(parent_fd, name.c_str(), &byname, AT_SYMLINK_NOFOLLOW) == 0
+           && held.st_dev == byname.st_dev && held.st_ino == byname.st_ino);
+      // Not ours any more: remove NOTHING and report failure, so the caller tells
+      // the user where the entry went instead of silently deleting a stranger's
+      // directory and claiming success.
+      if (!ours) { ::close(fd); fd = -1; return false; }
       if (::unlinkat(parent_fd, name.c_str(), AT_REMOVEDIR) != 0) return false;
       name.clear();
     }
+    if (fd >= 0) { ::close(fd); fd = -1; }
     return true;
   }
   ~QuarantineDir() { (void)release(); }
@@ -25588,9 +25645,21 @@ static int gzstd_main(int argc, char ** argv)
           do { urc = ::unlinkat(oq.fd, "old", 0); }
           while (urc != 0 && errno == EINTR);
           if (urc != 0) {
+            // SAME CORRECTION AS THE --rm SIDE, AND IT BELONGS HERE FOR THE SAME
+            // REASON.  We just failed to remove the old output, so it is still
+            // inside the quarantine; that is the truth to report, worked out
+            // BEFORE release() can change it.  Asking release() and reporting
+            // opt.output when it succeeded assumed a removable (empty) directory
+            // meant the entry was gone — but a release() that removes a
+            // SUBSTITUTED empty directory also succeeds, and then the message
+            // sends the user to the original pathname while their old output sits
+            // under a relocated quarantine nothing reports.
+            //
+            // This mirror was missed when the --rm side was fixed. Fixing one of
+            // two mirrored paths and leaving the other is this codebase's most
+            // repeated defect; when you touch one of these, diff the sibling.
             const int e = errno;
-            const std::string kept = oq.release()
-                ? opt.output : (out_dir.dir + "/" + oq.name + "/old");
+            const std::string kept = out_dir.dir + "/" + oq.name + "/old";
             for (int f : tar_src_fds) ::close(f);
             die_io("--overwrite: cannot remove the existing output; it is at "
                    + kept + " (" + std::strerror(e) + ")");
@@ -26401,6 +26470,17 @@ static int gzstd_main(int argc, char ** argv)
       // The OUTPUT IS KEPT: it is complete and already installed, so deleting it
       // here would throw away good work over a cleanup failure.  Report and exit
       // EXIT_IO; the user removes the source themselves.
+      // REFUSE BEFORE QUARANTINING ANYTHING when the entry's identity was never
+      // bound to the data (open_input_pinned fell back to an ordinary open for a
+      // magic link).  Without this the run reaches the quarantine comparison,
+      // fails it, and dies saying the input "was replaced during the run" — which
+      // is actively misleading: nothing was replaced, the proof was never
+      // available.  The archive is complete and is kept.
+      if (!in_lid_ok) {
+        die_io("--rm: cannot bind the identity of " + opt.input
+               + " to the data just compressed, so it will not be removed"
+               " (output kept at " + opt.output + ")");
+      }
       if (!in_id_ok) {
         die_io("--rm: cannot confirm the identity of the input just compressed: "
                + opt.input + "; not removing it (output kept at " + opt.output + ")");
@@ -26427,23 +26507,28 @@ static int gzstd_main(int argc, char ** argv)
                + " (" + std::strerror(errno) + "); output kept at " + opt.output);
       }
 
-      // stat(), not lstat(): open() followed the name to get here, so "is this
-      // still what I compressed" must follow too — that is what keeps --rm
-      // working for a symlinked input (it removes the link, keeps the target).
-      // Compare the ENTRY against the entry we opened: its own inode if it is a
-      // symlink (that is what gets removed), the target's otherwise.  Following
-      // it here would resolve a relative target against the quarantine directory
-      // and fail for every symlinked input.
+      // COMPARE AGAINST THE PINNED ENTRY, AND ONLY THAT.  in_lid is the inode
+      // open_input_pinned() pinned with O_PATH|O_NOFOLLOW — the symlink itself for
+      // a symlinked input, the file itself otherwise — which is by construction
+      // the entry --rm is supposed to remove.  One identity, one question.
+      //
+      // This used to pick the comparison from the QUARANTINED entry's current
+      // type: symlink → compare in_lid, anything else → compare in_id. That let
+      // the attacker choose which test to face, and the type-changing exchange
+      //     mv link saved-link ; mv real link
+      // turned the name into a regular file whose inode IS in_id, so it passed
+      // and the data file was DELETED while the archive held the right bytes —
+      // reproduced, exit 0, saved-link left dangling. `qid.st_mode` was being
+      // asked "which identity applies", which is not a question the replacement
+      // gets to answer.  (The recurring shape; see AGENTS.md.)
+      //
+      // AT_SYMLINK_NOFOLLOW: the entry itself, never through it. Following would
+      // resolve a relative target against the quarantine directory anyway.
       struct stat qid;
       bool quarantine_matches = false;
-      if (::fstatat(rq.fd, "in", &qid, AT_SYMLINK_NOFOLLOW) == 0) {
-        if (S_ISLNK(qid.st_mode))
-          quarantine_matches = in_lid_ok && qid.st_dev == in_lid.st_dev
-                                         && qid.st_ino == in_lid.st_ino;
-        else
-          quarantine_matches = qid.st_dev == in_id.st_dev
-                            && qid.st_ino == in_id.st_ino;
-      }
+      if (in_lid_ok && ::fstatat(rq.fd, "in", &qid, AT_SYMLINK_NOFOLLOW) == 0)
+        quarantine_matches = qid.st_dev == in_lid.st_dev
+                          && qid.st_ino == in_lid.st_ino;
       if (!quarantine_matches) {
         const int restore_rc =
             renameat_noreplace(rq.fd, "in", in_dir.fd, in_dir.base.c_str());
@@ -26468,12 +26553,17 @@ static int gzstd_main(int argc, char ** argv)
       do { rm_rc = ::unlinkat(rq.fd, "in", 0); }
       while (rm_rc != 0 && errno == EINTR);
       if (rm_rc != 0) {
-        // NAME THE PLACE IT ACTUALLY IS.  release() fails with ENOTEMPTY here (the
-        // entry is still inside), keeps its name for exactly this reason, and
-        // reporting opt.input would send the user looking in the wrong place.
+        // NAME THE PLACE IT ACTUALLY IS — and work that out BEFORE release() can
+        // change it.  We just failed to remove the entry, so it is still inside
+        // the quarantine; that is the truth to report.  This used to call
+        // release() and report opt.input when it succeeded, on the reasoning that
+        // a removable (empty) directory meant the entry was gone anyway.  A
+        // release() that removes a SUBSTITUTED empty directory also succeeds, and
+        // then the message sent the user back to the original pathname while the
+        // real quarantine — still holding their input — sat under a name nothing
+        // reported.  Do not let a deletion decide where to say the file is.
         const int e = errno;
-        const std::string kept = rq.release()
-            ? opt.input : (in_dir.dir + "/" + rq.name + "/in");
+        const std::string kept = in_dir.dir + "/" + rq.name + "/in";
         die_io("--rm: cannot remove the input after compressing it; it is at "
                + kept + " (" + std::strerror(e) + "); output kept at " + opt.output);
       }

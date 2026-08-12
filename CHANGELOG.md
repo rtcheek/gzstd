@@ -1,11 +1,102 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.89  
+**Covers:** v0.9.50 → v0.15.91  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+
+## v0.15.91 — the reviewer's fix was incomplete too, and a mirrored path went unfixed
+
+A follow-up pass put v0.15.90's four fixes back to the reviewer. It confirmed two and **rejected
+two as incomplete** — both correctly.
+
+**`--rm` broke procfs magic links, and narrowing the gate did not fix it.** v0.15.90 added a
+fallback for a missing `/proc`, but the reviewer supplied a trigger neither of us had
+considered: a magic link as *input*. `readlink` on `/proc/self/fd/3` for a pipe returns
+`pipe:[908921]`, which is not a pathname, so the `openat` of that text fails:
+
+```
+gzstd     -f -o out.zst /proc/self/fd/3   → exit 0, archive written
+gzstd --rm -f -o out.zst /proc/self/fd/3  → exit 3, nothing at all
+```
+
+`--rm` was the only difference. The reviewer's own fix narrowed the gate on `!opt.to_stdout`,
+which does not reach `--rm -o FILE` with a pipe magic link — still no archive. The shipped fix
+**fails soft instead**: fall back to a plain open, abandon the identity claim, and let `--rm`
+refuse to delete with a clear message. That does reintroduce a race over *which data gets
+compressed*, but not the destructive one, because the failed proof stops before quarantine.
+
+**The `--overwrite` mirror of the recovery-location fix was left unfixed.** v0.15.90 stopped a
+failed `--rm` removal from asking a *deletion* where the file was, and left the identical
+pattern in the `--overwrite` path. That is this project's own "diff mirrored code paths" rule,
+missed inside a fix for a finding about exactly that.
+
+
+
+## v0.15.90 — the fix was half a fix: the consumer let the replacement pick its own test
+
+An independent review round on v0.15.89 returned **NOT SAFE TO TAG**, and it was right. The
+previous release fixed the *producer* of the `--rm` identity and left the *consumer* choosing
+which identity to compare **based on the replacement's current type**:
+
+```
+if (S_ISLNK(quarantined))  compare against the pinned link
+else                       compare against the compressed target
+```
+
+So the attacker picked the test. Given `link -> real`, the exchange
+
+```
+mv link saved-link
+mv real link
+```
+
+makes the name a regular file whose inode **is** the compressed target's — it passes the
+non-symlink branch, and `real`, the actual data file, is **deleted at exit 0** with the user's
+relocated link left dangling. Reproduced before fixing, and it still reproduced against
+v0.15.89's "closed" ABA fix, because that fix never touched this decision.
+
+The comparison is now against the pinned entry and nothing else. `in_lid` is the inode
+`open_input_pinned()` pinned — the link for a symlinked input, the file otherwise — which is by
+construction the entry `--rm` removes. One identity, one question. **A shape matrix structurally
+cannot catch this** (every cell keeps one type from start to finish), so there is a separate
+type-change test that polls for observable state, never a fixed sleep, and skips explicitly if
+compression finishes before the swap lands.
+
+### Also fixed from the same round
+
+**`--rm` no longer requires procfs.** The pinned open reaches a non-symlink entry's data through
+`/proc/self/fd/N`, so in a chroot or a minimal mount namespace `--rm` began failing on inputs
+that were perfectly readable — something the plain `openat` it replaced never did. It now falls
+back to opening the name and proving it is the pinned inode. That is safe here in a way it is
+*not* for the symlink branch: it compares the **same fact** from both lookups and demands
+equality, so an A→B→A gains nothing. `GZSTD_DEBUG_NO_PROCFS` forces the branch, because the real
+trigger needs a user namespace this host restricts and the fallback would otherwise ship
+untested.
+
+**A failed removal no longer asks a deletion where the file is.** On `unlinkat` failure the
+caller used to call `release()` and report the *original* pathname when it succeeded. A
+`release()` that removes a **substituted** empty directory also succeeds — so the message sent
+the user back to a path that did not have their file, while the real quarantine still holding it
+sat under a name nothing reported. The quarantine path is now reported unconditionally.
+
+**`release()` keeps its descriptor until the `rmdir` actually succeeds.** Closing it first made a
+transient FUSE/NFS failure permanent: the destructor's retry had no descriptor, could not
+establish ownership, and silently stranded an empty `.gzstd-q.*` while the command exited 0.
+
+### What the reviewer confirmed rather than faulted
+
+No path runs the `--rm` block without a successful pinned capture; dangling-symlink behaviour is
+byte-identical to the old `openat` (exit 3, same diagnostic, nothing removed); relative target
+resolution through the held parent is correct including when that parent is renamed, and for
+`.`, `/`, and absolute targets; the readlink growth loop does not accept truncation; `errno` is
+preserved across `close(efd)` on every failing path.
+
+Suite: **405** default / **538** extensive, plus **322** on the `USE_NVCOMP=OFF` build.
 
 
 ## v0.15.89 — one lookup for two questions, and a measurement that cancelled a project

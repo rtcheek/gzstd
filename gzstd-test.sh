@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=403
-$EXTENSIVE && EXPECTED_TESTS=536
+EXPECTED_TESTS=405
+$EXTENSIVE && EXPECTED_TESTS=538
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6798,6 +6798,79 @@ RMS_MATRIX
     fail "--rm input-shape matrix" "failing cells:$rms_why"
   fi
   rm -rf "$TMPDIR/rms"
+
+  # 1c-9c. THE ENTRY'S TYPE MAY CHANGE BETWEEN THE OPEN AND THE REMOVAL, AND THE
+  #     REPLACEMENT DOES NOT GET TO PICK WHICH IDENTITY TEST IT FACES.
+  #     The quarantine check used to select its comparison from the quarantined
+  #     entry's CURRENT type — symlink compared the pinned link, anything else
+  #     compared the compressed target. So replacing a symlinked input with its
+  #     own target file passed the check and DELETED THE DATA FILE, exit 0, with
+  #     the user's relocated link left dangling. Reproduced before the fix.
+  #     The shape matrix above cannot reach this: every cell keeps one type from
+  #     start to finish.
+  #
+  #     Timed by POLLING FOR OBSERVABLE STATE (the output appearing), never a
+  #     fixed sleep — and if compression finishes before the swap lands, the case
+  #     simply did not apply and is skipped rather than failed.
+  rm -rf "$TMPDIR/rmt"; mkdir -p "$TMPDIR/rmt"
+  # big enough that compression outlives the swap; incompressible so it stays big
+  head -c 400000000 /dev/urandom > "$TMPDIR/rmt/real" 2>/dev/null
+  ln -s real "$TMPDIR/rmt/link"
+  "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmt/out.zst" "$TMPDIR/rmt/link" \
+      >/dev/null 2>&1 &
+  rmt_pid=$!
+  rmt_swapped=0
+  for _ in $(seq 1 4000); do
+    if [ -e "$TMPDIR/rmt/out.zst" ]; then
+      if mv "$TMPDIR/rmt/link" "$TMPDIR/rmt/saved" 2>/dev/null \
+         && mv "$TMPDIR/rmt/real" "$TMPDIR/rmt/link" 2>/dev/null; then
+        rmt_swapped=1
+      fi
+      break
+    fi
+    kill -0 "$rmt_pid" 2>/dev/null || break     # finished before we could swap
+    sleep 0.005
+  done
+  wait "$rmt_pid" 2>/dev/null
+  if [ "$rmt_swapped" != 1 ]; then
+    skip "--rm refuses a type-changed replacement (run finished before the swap)"
+  elif [ -e "$TMPDIR/rmt/link" ] || [ -e "$TMPDIR/rmt/saved" ]; then
+    # the data survived under one name or the other: the replacement was refused
+    pass "--rm refuses a type-changed replacement (the data file survives)"
+  else
+    fail "--rm refuses a type-changed replacement" \
+         "the compressed target was deleted through a substituted entry"
+  fi
+  rm -rf "$TMPDIR/rmt"
+
+  # 1c-9d. --rm MUST NOT REQUIRE PROCFS.  The pinned open reaches a non-symlink
+  #     entry's data through /proc/self/fd/N, which does not exist in a chroot or
+  #     a minimal mount namespace — so --rm began failing on inputs that were
+  #     perfectly readable, which the plain openat it replaced never did.  The
+  #     fallback opens the name and PROVES it is the pinned inode (the same fact
+  #     from both lookups, so an A->B->A gains nothing).  GZSTD_DEBUG_NO_PROCFS
+  #     forces it: the real trigger needs a user namespace this host restricts,
+  #     so the fallback would otherwise ship untested.
+  rm -rf "$TMPDIR/rmp"; mkdir -p "$TMPDIR/rmp"
+  rmp_ok=1
+  printf 'NOPROC\n' > "$TMPDIR/rmp/a.txt"
+  GZSTD_DEBUG_NO_PROCFS=1 "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmp/a.zst" \
+      "$TMPDIR/rmp/a.txt" >/dev/null 2>&1 || rmp_ok=0
+  [ "$("$GZSTD" -dc "$TMPDIR/rmp/a.zst" 2>/dev/null)" = "NOPROC" ] || rmp_ok=0
+  [ -e "$TMPDIR/rmp/a.txt" ] && rmp_ok=0                    # still removed
+  # a symlinked input never touches procfs, so it must be unaffected
+  printf 'TGT\n' > "$TMPDIR/rmp/t.txt"; ln -s t.txt "$TMPDIR/rmp/s.lnk"
+  GZSTD_DEBUG_NO_PROCFS=1 "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmp/s.zst" \
+      "$TMPDIR/rmp/s.lnk" >/dev/null 2>&1 || rmp_ok=0
+  [ "$("$GZSTD" -dc "$TMPDIR/rmp/s.zst" 2>/dev/null)" = "TGT" ] || rmp_ok=0
+  [ -L "$TMPDIR/rmp/s.lnk" ] && rmp_ok=0
+  [ -e "$TMPDIR/rmp/t.txt" ] || rmp_ok=0
+  if [ "$rmp_ok" = 1 ]; then
+    pass "--rm works without procfs (falls back to a verified re-open)"
+  else
+    fail "--rm without procfs"
+  fi
+  rm -rf "$TMPDIR/rmp"
 
   # 1c-8. THE CLOBBER GUARD ASKS ABOUT WHAT WILL BE DESTROYED, which for a plain
   #     compress means following the symlink — the open does. Answering it with a
