@@ -1,12 +1,63 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.94  
+**Covers:** v0.9.50 → v0.15.95  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.15.95 — one identity check was not enough; there were five things that decide the data
+
+v0.15.93 bound `--tar --rm`'s removal record to the inode the walker saw, and that closed the
+trigger it was given. Three independent review rounds then showed the record was the *only*
+thing bound. Everything that decides **what actually goes into the archive** still resolved the
+member by pathname, long after the walk — so the two halves could describe different objects
+while each looked correct on its own.
+
+Five operations decide member data. All five are now bound to the identity the layout recorded:
+
+| operation | what went wrong |
+|---|---|
+| the member read | opened by pathname, checked only `S_ISREG`; a same-size swap put another file's bytes under this member's header while `--rm` deleted the original |
+| descriptor reuse | cached by pathname alone, so a later member with the same `src` silently inherited a descriptor validated for a *different* record |
+| `--sparse` geometry | hole map taken from whatever the pathname opened; applied to the real file it stores a partial member with no short read, so nothing is flagged |
+| the symlink target | `lstat` then a separate pathname `readlink`, so the archived target could come from a link the record does not describe |
+| the directory type | emitted from enumeration's `is_dir` while the record took its type from a later `lstat`; disagreement archives a data-less directory member and unlinks a regular file |
+
+Each was reachable the same way — a writer with access to the source directory — and each ended
+the same way: the archive holds one object's data while `--rm` deletes another's inode, exit 0.
+The member read was reproduced directly (a same-size substitution during assembly puts
+`VICTIMXX` under the original's header) and confirmed by mutation.
+
+**And one that needed no attacker at all.** `gzstd --tar --rm -f -o a.zst d/.` recorded the root
+as `d/.`, whose basename the removal loop skipped silently — so `d` survived, and the run
+printed `removed 2 archived source entries` having removed one, and exited 0. A trailing dot a
+user is entitled to type. Paths are normalised before recording, an unusable basename is now a
+counted failure rather than a silent skip, and the count is taken at the `unlink` itself. The
+first attempt at that count was a no-op that read like a fix: `size() - kept` printed inside the
+`kept == 0` branch, where it is `size()` by construction.
+
+A missing parent directory is benign only when **we** removed it earlier in the same reverse
+walk; tracked, not assumed. Treating every missing parent as benign would have turned a renamed
+parent — sources still alive under the new name — into a silent exit 0, which is a worse failure
+than the false exit 3 it was fixing.
+
+`--rm`'s own input is now held, not just remembered. `open_input_pinned()` recorded
+`(st_dev, st_ino)` and closed the `O_PATH` handle, leaving the inode free to be released and its
+number reissued to a replacement that would then satisfy the comparison. The descriptor is kept
+until the removal decision, so the inode cannot be freed and the recorded pair stays an identity
+rather than a number. Tar cannot do the same — a held descriptor per walked entry would exhaust
+the table on a real tree — and that asymmetry is now stated in the code instead of implied.
+
+**Accepted, and written down rather than glossed:** the compare-then-unlink window (no
+unlink-by-inode syscall exists); that an entry of the same *removal class* can be substituted
+into it, which is broader than "same type"; that a hardlink reached through a swapped parent
+component is a distinct case from that window; and that `--acls/--xattrs` metadata is gathered
+by reopening the path and is not identity-bound. Every one of those was found by a reviewer
+reading a comment that claimed more than the code delivered — the failure mode this whole arc
+has been about.
 
 ## v0.15.94 — both tests for the deletion defects only ran when they happened to win the race
 

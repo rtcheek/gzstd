@@ -379,8 +379,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=407
-$EXTENSIVE && EXPECTED_TESTS=540
+EXPECTED_TESTS=408
+$EXTENSIVE && EXPECTED_TESTS=541
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -6849,6 +6849,67 @@ RMS_MATRIX
          "the compressed target was deleted through a substituted entry"
   fi
   rm -rf "$TMPDIR/rmt"
+
+  # 1c-9c2. THE PINNED ENTRY IS HELD OPEN UNTIL ITS IDENTITY IS USED.
+  #     A recorded (st_dev, st_ino) is only an identity while that inode exists.
+  #     The first version recorded the pair and closed the O_PATH handle, which
+  #     left the window an independent review found: unlink the entry, then create
+  #     files until the filesystem reissues the recorded inode NUMBER, and
+  #     something never compressed satisfies the comparison and is deleted. Inode
+  #     reuse is ordinary filesystem behaviour, so the fix is to remove the premise
+  #     — hold the descriptor, and the inode cannot be freed or reissued.
+  #
+  #     ASSERTED STRUCTURALLY, because reissue cannot be forced on demand: park
+  #     gzstd in the pre-removal window, then check from OUTSIDE that it still
+  #     holds a descriptor on the entry, and that unlinking the name does not free
+  #     the inode. That is the property; a reuse race would only sample it.
+  rm -rf "$TMPDIR/rmp"; mkdir -p "$TMPDIR/rmp"
+  printf 'REAL-DATA\n' > "$TMPDIR/rmp/real"
+  ln -s real "$TMPDIR/rmp/link"
+  rmp_ino=$(stat -c %i "$TMPDIR/rmp/link")
+  mkfifo "$TMPDIR/rmp/gate"
+  GZSTD_DEBUG_RM_GATE="$TMPDIR/rmp/gate" \
+    timeout --foreground -k 10 120 \
+      "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/rmp/out.zst" "$TMPDIR/rmp/link" \
+        >/dev/null 2>&1 &
+  rmp_pid=$!
+  # Same no-timing handshake as 1c-9c/1c-9f: the open returns exactly when gzstd
+  # parks, so the inspection happens inside the window by construction.  The whole
+  # inspection runs on the handshake side so the blocking open keeps its timeout
+  # hang guard; the verdict comes back through a file, never through timing.
+  rmp_ok=0; rmp_why=""
+  timeout 60 sh -c '
+      exec 9>"$1/gate" || exit 1
+      gpid=$(pgrep -P "$2" 2>/dev/null | head -1)
+      fd=""
+      if [ -n "$gpid" ]; then
+        for f in /proc/$gpid/fd/*; do
+          case "$(readlink "$f" 2>/dev/null)" in *"/link") fd="$f"; break;; esac
+        done
+      fi
+      if [ -z "$fd" ]; then
+        printf nofd > "$1/result"
+      else
+        rm -f "$1/link"                     # free the name, as an attacker would
+        stat -L -c %i "$fd" 2>/dev/null > "$1/result" || printf gone > "$1/result"
+      fi
+      printf go >&9
+      exec 9>&-
+    ' sh "$TMPDIR/rmp" "$rmp_pid"
+  wait "$rmp_pid" 2>/dev/null
+  rmp_live=$(cat "$TMPDIR/rmp/result" 2>/dev/null)
+  if [ "$rmp_live" = "$rmp_ino" ]; then rmp_ok=1
+  elif [ "$rmp_live" = "nofd" ]; then
+    rmp_why="no descriptor on the input entry at the removal decision"
+  else
+    rmp_why="inode $rmp_ino was released when the name was unlinked (saw '$rmp_live')"
+  fi
+  if [ "$rmp_ok" = 1 ]; then
+    pass "--rm holds the pinned entry open, so its inode cannot be reissued"
+  else
+    fail "--rm holds the pinned entry open" "$rmp_why"
+  fi
+  rm -rf "$TMPDIR/rmp"
 
   # 1c-9d. --rm MUST NOT REQUIRE PROCFS.  The pinned open reaches a non-symlink
   #     entry's data through /proc/self/fd/N, which does not exist in a chroot or

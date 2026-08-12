@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.94";
+static constexpr const char * GZSTD_VERSION = "0.15.95";
 //
 // Architecture overview:
 //
@@ -433,6 +433,28 @@ struct HeldDir {
   ~HeldDir() { release(); }
 };
 
+// The ENTRY --rm will delete, held open from the moment its identity is recorded
+// until the moment that identity is used.  An O_PATH handle is enough: it keeps
+// the inode referenced without granting read access, and works on a dangling
+// symlink or a device the process may not open for I/O.
+//
+// WHY IT IS HELD RATHER THAN JUST STAT'ED.  (st_dev, st_ino) is only an identity
+// for as long as that inode exists.  Recording the pair and closing the handle
+// left a window an independent review found: unlink the entry, then create
+// regular files until the filesystem hands the recorded inode NUMBER back out,
+// and a file that was never compressed satisfies the comparison and is deleted.
+// Inode reuse is ordinary filesystem behaviour, not a defect being exploited.
+// Holding the descriptor removes the premise instead of racing it — an inode
+// with a live reference is not freed, so its number cannot be reissued, and the
+// comparison at removal time is against an object that never stopped existing.
+struct HeldEntry {
+  int fd = -1;
+  bool valid() const { return fd >= 0; }
+  void adopt(int f) { release(); fd = f; }
+  void release() { if (fd >= 0) { ::close(fd); fd = -1; } }
+  ~HeldEntry() { release(); }
+};
+
 
 // Open an input through a SINGLE resolution of the user's name, reporting the
 // identity of the ENTRY that name denotes.  Returns the data fd, or -1.
@@ -460,10 +482,15 @@ struct HeldDir {
 // THE TWO CASES CANNOT BE UNIFIED: re-opening /proc/self/fd/N when N is an
 // O_PATH|O_NOFOLLOW handle on a symlink fails ELOOP.  Measured, not assumed —
 // it is the reason the obvious one-line version of this fix does not work.
+// entry_held receives the O_PATH handle on the entry, and the caller MUST keep it
+// open until the --rm identity has been used: see HeldEntry for why a recorded
+// (st_dev, st_ino) stops being an identity the moment the last reference drops.
 static int open_input_pinned(const HeldDir & in_dir,
-                             struct stat & entry_id, bool & entry_id_ok)
+                             struct stat & entry_id, bool & entry_id_ok,
+                             HeldEntry & entry_held)
 {
   entry_id_ok = false;
+  entry_held.release();
   const int efd = ::openat(in_dir.fd, in_dir.base.c_str(),
                            O_PATH | O_NOFOLLOW | O_CLOEXEC);
   if (efd < 0) return -1;
@@ -514,6 +541,9 @@ static int open_input_pinned(const HeldDir & in_dir,
       // again racy here. What it must never do is authorize a deletion — and it
       // cannot, because entry_id_ok stays false and the removal block refuses
       // before it quarantines anything.
+      // entry_held is deliberately left EMPTY here: there is no identity to keep
+      // alive, and handing back a pinned entry the caller must not act on would
+      // invite exactly the confusion this fails-closed to avoid.
       ifd = ::openat(in_dir.fd, in_dir.base.c_str(), O_RDONLY | O_CLOEXEC);
       if (ifd >= 0) { ::close(efd); return ifd; }   // entry_id_ok stays FALSE
     }
@@ -554,8 +584,13 @@ static int open_input_pinned(const HeldDir & in_dir,
   }
 
   const int e = errno;
-  ::close(efd);
-  if (ifd < 0) { errno = e; return -1; }
+  if (ifd < 0) { ::close(efd); errno = e; return -1; }
+  // SUCCESS: hand the pinned entry to the caller rather than closing it.  From
+  // here the recorded (st_dev, st_ino) stays a real identity because the inode
+  // behind it cannot be freed, and therefore cannot be reissued to something
+  // else, while this handle lives.  The caller holds it past the removal
+  // decision; see HeldEntry.
+  entry_held.adopt(efd);
   entry_id_ok = true;
   return ifd;
 }
@@ -1840,7 +1875,15 @@ static void print_help_long()
 "     complete and installed.  Three properties, deliberately:\n"
 "       * Only what was archived is removed.  The list comes from the\n"
 "         walker's own members, so a file created during the run — which\n"
-"         is not in the archive — is never deleted.\n"
+"         is not in the archive — is never deleted.  Each entry is removed\n"
+"         by the identity it was archived with, not by its name; if the\n"
+"         name leads somewhere else by then it is kept and reported.  The\n"
+"         one gap, and it needs someone able to write to your source\n"
+"         directory: between that check and the unlink itself the name can\n"
+"         be swapped for another entry removed the same way (any\n"
+"         non-directory for a non-directory, an empty directory for a\n"
+"         directory).  Closing it would need an unlink-by-inode call the\n"
+"         kernel does not provide.\n"
 "       * It is NOT a recursive force-delete.  Files are unlinked and\n"
 "         directories are rmdir'd, so anything left behind (excluded by\n"
 "         --exclude, or newly created) keeps its parent directory alive\n"
@@ -1852,6 +1895,16 @@ static void print_help_long()
 "     Entries that could not be removed are named, and the run exits 3\n"
 "     with the archive kept: a destructive step you asked for and did not\n"
 "     get must not exit 0.\n"
+"\n"
+"     THIS DIFFERS FROM GNU TAR ON PURPOSE, and only when something goes\n"
+"     wrong.  A clean run matches it.  But GNU tar removes each file AS IT\n"
+"     ARCHIVES IT, so an unreadable member leaves it having already deleted\n"
+"     what it wrote, and an interrupted run leaves most sources destroyed\n"
+"     alongside a partial archive.  gzstd waits for a complete, installed\n"
+"     archive and is all-or-nothing: on the same interrupted run every\n"
+"     source survives and the partial archive is removed instead.  If you\n"
+"     are relying on tar's incremental removal to free space DURING a run,\n"
+"     that is the one behaviour this does not reproduce.\n"
 "\n"
 "============================================================\n"
 " OUTPUT\n"
@@ -13270,15 +13323,63 @@ static std::vector<TarOutputEntryId> g_tar_output_entries;
 // has now hit three times: the first version of this list stored only the path,
 // stat'd it at removal, and let the CURRENT entry choose unlink-vs-rmdir — so
 //     mv d/a d/saved ; mv victim d/a
-// deleted `victim`, a file that was never archived at all.  dev+ino says which
-// object was archived, and is_dir says how it must be removed; neither question
-// is the replacement's to answer.
+// deleted `victim`, a file that was never archived at all.  dev+ino records the
+// object Pass B saw, and is_dir says how it must be removed; neither question is
+// the replacement's to answer.
+//
+// UNLIKE PLAIN --rm, TAR DOES NOT HOLD ONE DESCRIPTOR PER ENTRY until removal:
+// doing that for a real tree would exhaust the fd table.  This record rejects a
+// name whose current dev+ino differs from Pass B's, but it cannot distinguish
+// the archived inode from a later inode that reuses the same numbers after Pass
+// B, which retains no live reference.
 struct TarRemoval {
   std::string path;
   dev_t       dev;
   ino_t       ino;
   bool        is_dir;
 };
+
+// Collapse the "." components a user is entitled to type — `d/.`, `d/./f`, `./d`
+// — so the recorded path names the entry rather than a way of spelling it.
+//
+// THIS IS NOT A PURE STRING OPERATION IN ONE CASE, and an earlier version of this
+// comment claimed it was.  For a terminal `link/.` where link is a symlink to a
+// directory, the kernel resolves the name to the TARGET, while this produces
+// `link` — the symlink itself.  That is a different object.  It is safe only
+// because the removal loop proves identity before acting: the record carries the
+// inode the walker saw, the name now denotes something else, and the entry is
+// kept and counted rather than removed.  So the disagreement surfaces as a
+// reported failure, never as a wrong deletion — which is a bound, not an
+// equivalence.
+//
+// ".." IS DELIBERATELY LEFT ALONE.  Collapsing it textually is wrong in the
+// presence of symlinks: `a/b/..` is only `a` when b is a real directory, and
+// resolving that correctly requires the lookups this string is meant to avoid.
+// A terminal ".." is refused by the removal loop.  A non-terminal one remains
+// in the parent path (for example `d/../f` opens `d/..`) and is resolved by the
+// kernel; the final entry is still removed only if its dev+ino matches the
+// archived record.
+static std::string tar_normalize_removal_path(const std::string & in)
+{
+  if (in.find('.') == std::string::npos) return in;   // nothing to do, cheap path
+  const bool absolute = !in.empty() && in.front() == '/';
+  std::vector<std::string> comps;
+  size_t i = 0;
+  while (i < in.size()) {
+    size_t j = in.find('/', i);
+    if (j == std::string::npos) j = in.size();
+    const std::string c = in.substr(i, j - i);
+    if (!c.empty() && c != ".") comps.push_back(c);
+    i = j + 1;
+  }
+  if (comps.empty()) return absolute ? std::string("/") : std::string(".");
+  std::string out = absolute ? "/" : "";
+  for (size_t k = 0; k < comps.size(); ++k) {
+    if (k) out += '/';
+    out += comps[k];
+  }
+  return out;
+}
 static std::vector<TarRemoval> g_tar_removal_paths;
 
 // Test-only rendezvous (read from $GZSTD_DEBUG_RM_GATE, a FIFO path): block in the
@@ -13327,27 +13428,57 @@ static void rm_debug_gate()
 //    its parent simply fails to go away with ENOTEMPTY.  That failure mode is the
 //    feature: the conservative outcome is "some directories are left", never
 //    "something unarchived was destroyed".
-//  * IT DELETES ONLY WHAT WAS ARCHIVED.  The list comes from the walker's own
-//    entries, not from the command-line source paths.
-//  * IT NEVER FOLLOWS A SYMLINK.  unlinkat() on a symlink removes the link, which
-//    is what was archived; the target is not ours to touch.  Directories are
-//    opened O_NOFOLLOW|O_DIRECTORY, so a directory swapped for a symlink between
-//    the walk and now is refused rather than descended.
-//  * IT REMOVES AN INODE IT ARCHIVED, NOT A NAME.  Every entry carries the dev+ino
-//    the walker saw, re-checked here through the parent descriptor before acting;
-//    a mismatch is left alone and counted.  The FIRST version of this function
-//    stored only the path, stat'd it at removal time, and used the CURRENT entry's
-//    type to pick unlink-vs-rmdir — so `mv d/a d/saved ; mv victim d/a` deleted
-//    `victim`, which had never been archived.  That is v0.15.89's defect
-//    reintroduced in new code, and the comment here claimed the protection while
-//    the code did not implement it.  The replacement chooses nothing: not whether
-//    it is removed, and not how.
+//  * IT DELETES ONLY WHAT WAS ARCHIVED — and that is a claim about the DATA, not
+//    just the name.  The list comes from the walker's own entries, not from the
+//    command-line source paths.  It once meant less than it said: the record was
+//    keyed to the walked inode while the reader opened the member by PATHNAME
+//    later and checked only that it was regular, so a substitution during
+//    assembly put one file's bytes in the archive and deleted another's inode.
+//    Every operation that DETERMINES THE DATA is now bound to that identity: the
+//    reader proves the descriptor before storing a byte, descriptor reuse across
+//    members is keyed on the inode rather than the pathname, and --sparse takes
+//    its hole map only from the recorded inode.  A directory that stopped being
+//    one between enumeration and archiving is refused outright.  (Only the
+//    directory disagreement is tested there, and that is sufficient: every other
+//    member type takes both its header and its removal record from the SAME
+//    Pass B stat, so those two cannot disagree.)
+//    STILL NOT COVERED, deliberately: with --acls/--xattrs the extended metadata
+//    is gathered by reopening the path, so that metadata is not identity-bound.
+//    It is metadata, not member data — the claim above is about bytes.
+//  * IT NEVER FOLLOWS THE ARCHIVED ENTRY.  fstatat(AT_SYMLINK_NOFOLLOW) observes
+//    a final symlink as the link itself, and unlinkat() removes that link rather
+//    than its target.  The parent path is deliberately opened without
+//    O_NOFOLLOW: a legitimate source may have been reached through a symlinked
+//    directory.  That lookup only selects the directory in which the final
+//    dev+ino identity check is made; it does not authorize a different inode.
+//    It CAN select a different hardlink to the recorded inode: if an intermediate
+//    directory is redirected to a directory containing such a link, that alias
+//    passes the identity check and is unlinked while the archived name survives.
+//    Identity cannot distinguish two names for one inode.  This is distinct from
+//    the compare-then-unlink window below because the redirected parent may be
+//    stable before fstatat().
+//  * IT REFUSES A DIFFERENT INODE, NOT A DIFFERENT HARDLINK NAME.  Every entry
+//    carries the dev+ino the walker saw, re-checked here through the parent
+//    descriptor before acting; a mismatch is left alone and counted.  The FIRST
+//    version of this function stored only the path, stat'd it at removal time,
+//    and used the CURRENT entry's type to pick unlink-vs-rmdir — so
+//    `mv d/a d/saved ; mv victim d/a` deleted `victim`, which had never been
+//    archived.  That is v0.15.89's defect reintroduced in new code, and the
+//    comment here claimed the protection while the code did not implement it.
+//    A replacement of a different identity chooses nothing: not whether it is
+//    removed, and not how.  The dev+ino record is not held live; the inode-reuse
+//    limit is stated at TarRemoval above.
 //
-// THE ONE WINDOW THAT REMAINS, STATED RATHER THAN GLOSSED — because a comment here
-// claiming more than the code delivers is exactly what shipped the defect above.
+// THE COMPARE-THEN-UNLINK WINDOW, STATED RATHER THAN GLOSSED — because a comment
+// here claiming more than the code delivers is exactly what shipped the defect above.
 // The identity proof is an fstatat() and the removal is an unlinkat() BY NAME, so a
-// different-uid writer with write access to the parent can substitute a SAME-TYPE
-// entry between the two and have that entry unlinked instead.  It is not closed
+// different-uid writer with write access to the parent can substitute an entry of
+// the same REMOVAL CLASS between the two and have that entry unlinked instead.
+// Removal class, not type: regular files, symlinks, FIFOs, devices and sockets
+// all share the plain-unlink treatment, so any of them can stand in for another.
+// A recorded directory is narrower still — only an EMPTY directory can be
+// substituted, since a non-directory fails ENOTDIR, a populated one fails, and a
+// mount point fails EBUSY.  It is not closed
 // because it cannot be: there is no unlink-by-inode syscall, and another recheck is
 // not a fix, it is one more pair of lookups for an exchange to sit between — the
 // same reasoning AGENTS.md already records for the abnormal-exit cleanup window.
@@ -13359,10 +13490,20 @@ static void rm_debug_gate()
 // substituted directory is not rmdir'ed and a substituted file is not descended.
 //
 // Caller guarantees the archive is complete and had no skipped members.
+// `removed` receives the number of entries this actually unlinked — which is NOT
+// paths.size() - failed.  An entry already gone is counted as neither: it is not
+// a failure (the archive still holds it) but nothing here removed it, and
+// reporting it as removed overstated the work on every run with a duplicate
+// source argument or an external deletion.
 static size_t tar_remove_archived_sources(const std::vector<TarRemoval> & paths,
-                                          const Options & opt)
+                                          const Options & opt, size_t & removed)
 {
   size_t failed = 0;
+  removed = 0;
+  // Exact normalized paths of directories this loop successfully removed.
+  // A later duplicate/overlapping source can then encounter an absent parent
+  // without turning that known consequence of our own work into a false error.
+  std::unordered_set<std::string> removed_dirs;
   // Reverse walk order = deepest first, so a directory is only attempted after
   // everything the walker put inside it has already gone.
   for (size_t i = paths.size(); i-- > 0; ) {
@@ -13374,13 +13515,33 @@ static size_t tar_remove_archived_sources(const std::vector<TarRemoval> & paths,
                            : (slash == 0)                 ? std::string("/")
                                                           : p.substr(0, slash);
     const std::string base = (slash == std::string::npos) ? p : p.substr(slash + 1);
-    if (base.empty() || base == "." || base == "..") continue;
+    // A NAME WE CANNOT ACT ON IS A FAILURE, NOT A SKIP.  These used to `continue`
+    // silently, so `gzstd --tar --rm -o a.zst d/.` recorded the root as "d/.",
+    // removed the children, left d standing, reported "removed 2 entries" — and
+    // exited 0.  No attacker, no race: just a trailing dot a user is entitled to
+    // type.  Trailing "." is normalised away before recording now, so reaching
+    // here means the path resolves to something this loop must not unlink (".",
+    // "..", the cwd, a root).  Counting it makes the caller report it and exit
+    // non-zero, which is the rule the rest of this flag already follows: a
+    // destructive step you asked for and did not get must not exit 0.
+    if (base.empty() || base == "." || base == "..") {
+      ++failed;
+      vlog(V_ERROR, opt, "gzstd: tar: kept " + p
+           + ": it does not name a removable entry\n");
+      continue;
+    }
 
     const int dfd = ::open(dir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) {
-      ++failed;
-      vlog(V_ERROR, opt, "gzstd: tar: cannot remove " + p + ": "
-           + std::strerror(errno) + "\n");
+      const int e = errno;
+      // ENOENT is benign only when this exact parent is one we already removed
+      // during the reverse walk.  Otherwise it may merely have been renamed,
+      // leaving the archived sources alive elsewhere; report that uncertainty.
+      if (e != ENOENT || removed_dirs.find(dir) == removed_dirs.end()) {
+        ++failed;
+        vlog(V_ERROR, opt, "gzstd: tar: cannot remove " + p + ": "
+             + std::strerror(e) + "\n");
+      }
       continue;
     }
     struct stat st;
@@ -13420,6 +13581,9 @@ static size_t tar_remove_archived_sources(const std::vector<TarRemoval> & paths,
             ? std::string("it still contains entries that were not archived")
             : std::string(std::strerror(errno));
       vlog(V_ERROR, opt, "gzstd: tar: kept " + p + ": " + why + "\n");
+    } else {
+      ++removed;
+      if (paths[i].is_dir) removed_dirs.insert(p);
     }
     ::close(dfd);
   }
@@ -13570,6 +13734,15 @@ struct TarEntry {
   std::string link;       // symlink target or hardlink referent ("" otherwise)
   std::string src;        // filesystem path to pread (regular files); also set for
                           // every member when --acls/--xattrs is on (gather source)
+  // The identity `src` had when the layout was built.  Set for the members whose
+  // DATA is read (regular files); the reader checks it before storing a byte.
+  // Assembly opens `src` by NAME much later, so without this the bytes in the
+  // archive are not provably from the entry that was walked — and --rm's removal
+  // record, which is keyed to that entry, would then authorise deleting a file
+  // whose contents the archive does not hold.  A mismatch is a changed member.
+  dev_t       src_dev   = 0;
+  ino_t       src_ino   = 0;
+  bool        src_id_ok = false;
   std::string pax;        // serialized PAX SCHILY.* records ("" = no extended header)
   uint64_t    size      = 0;   // data bytes (0 for dir/symlink/hardlink/special)
   uint64_t    hdr_off   = 0;   // offset of the (first) header block
@@ -13928,9 +14101,9 @@ struct LayoutBuilder {
     // its identity, so removal acts on the inode that was archived rather than
     // on whatever holds the name later.
     if (opt.tar_remove_sources && cur_fspath_ && !cur_fspath_->empty() && cur_st_)
-      g_tar_removal_paths.push_back(TarRemoval{*cur_fspath_, cur_st_->st_dev,
-                                               cur_st_->st_ino,
-                                               S_ISDIR(cur_st_->st_mode)});
+      g_tar_removal_paths.push_back(TarRemoval{
+          tar_normalize_removal_path(*cur_fspath_), cur_st_->st_dev,
+          cur_st_->st_ino, S_ISDIR(cur_st_->st_mode)});
     e.hdr_off   = off;
     e.hdr_len   = entry_header_len(e);
     e.data_off  = off + e.hdr_len;
@@ -14068,8 +14241,25 @@ struct LayoutBuilder {
   // empty (→ stored normally) if the file has no holes, or if the fs/seek
   // doesn't support hole queries (graceful fallback to full storage).
   void probe_sparse(Pending & p) {
-    int fd = ::open(p.fspath.c_str(), O_RDONLY | O_CLOEXEC);
+    // O_NONBLOCK makes the pathname open safe against a regular-to-FIFO
+    // substitution between Pass B's lstat and this probe.  The fstat identity
+    // check below still decides whether any geometry may be used.
+    int fd = ::open(p.fspath.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return;
+    // THE GEOMETRY MUST COME FROM THE INODE THE LAYOUT RECORDED.  This opens by
+    // pathname, so without the check a substitution here supplies a DIFFERENT
+    // file's hole map for the entry that gets archived: assembly then reads the
+    // real file only at the offsets that map describes and synthesises the rest
+    // as holes.  There is no short read, so nothing is flagged — the archive
+    // quietly holds a partial file, and --tar --rm deletes the original at exit
+    // 0.  A data-determining operation that is not identity-bound is the same
+    // defect as the unbound reader, one step earlier.
+    struct stat pst{};
+    if (::fstat(fd, &pst) != 0
+        || pst.st_dev != p.st.st_dev || pst.st_ino != p.st.st_ino) {
+      ::close(fd);
+      return;                 // no map ⇒ stored normally; the reader re-checks
+    }
     const off_t size = p.st.st_size;
     std::vector<std::pair<uint64_t, uint64_t>> segs;
     off_t pos = 0; bool has_hole = false, ok = true;
@@ -14110,10 +14300,44 @@ struct LayoutBuilder {
         Pending & p = pending_[i];
         if (::lstat(p.fspath.c_str(), &p.st) != 0) { p.stat_err = errno; continue; }
         if (S_ISLNK(p.st.st_mode)) {
-          std::vector<char> tgt((size_t)p.st.st_size + 1);
-          ssize_t r = ::readlink(p.fspath.c_str(), tgt.data(), tgt.size());
-          if (r < 0) p.link_err = errno;
-          else       p.link.assign(tgt.data(), (size_t)r);
+          // Pin the link itself, make that descriptor's identity the Pass B
+          // record, then read its target from the same descriptor.  A pathname
+          // readlink here lets an A->B->A exchange archive B's target while
+          // --rm records A.  The preliminary lstat only selected this branch;
+          // it is not used as the identity after the held lookup succeeds.
+          const int lfd = ::open(p.fspath.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+          if (lfd < 0) {
+            p.link_err = errno;
+          } else {
+            struct stat lst{};
+            if (::fstat(lfd, &lst) != 0) {
+              p.link_err = errno;
+            } else if (S_ISLNK(lst.st_mode)) {
+              p.st = lst;
+              // st_size is normally the target length, but some filesystems
+              // report zero.  A short read is the only proof of no truncation.
+              size_t cap = (lst.st_size > 0 ? (size_t)lst.st_size : (size_t)255) + 2;
+              for (;;) {
+                std::vector<char> tgt(cap);
+                const ssize_t r = ::readlinkat(lfd, "", tgt.data(), tgt.size());
+                if (r < 0) { p.link_err = errno; break; }
+                if ((size_t)r < tgt.size()) {
+                  if (r == 0) p.link_err = ENOENT;  // empty target is not a path
+                  else        p.link.assign(tgt.data(), (size_t)r);
+                  break;
+                }
+                if (cap >= (size_t)PATH_MAX) { p.link_err = ENAMETOOLONG; break; }
+                cap = std::min<size_t>(cap * 2, (size_t)PATH_MAX);
+              }
+            } else {
+              // The entry changed type before it could be pinned.  Preserve the
+              // held observation as the one Pass B answer; Pass C will either
+              // reject a directory disagreement or archive this leaf type, and
+              // any later data open is checked against this identity.
+              p.st = lst;
+            }
+            ::close(lfd);
+          }
         }
         // --sparse: probe a regular file's hole structure via SEEK_DATA/SEEK_HOLE
         // (filesystem extent metadata — reads no data).  A file with real holes
@@ -14169,6 +14393,20 @@ struct LayoutBuilder {
         continue;
       }
 
+      // THE TYPE MUST COME FROM ONE OBSERVATION.  p.is_dir is Pass A's
+      // enumeration; st is Pass B's lstat, taken later.  When they disagree the
+      // entry was replaced between the two, and emitting on the stale answer
+      // splits the archive from the removal record: a '5' member carries NO
+      // DATA, while --rm's record takes its type from st and would unlink the
+      // replacement as a non-directory — deleting a regular file whose contents
+      // were never archived, at exit 0.  Two snapshots answering one question is
+      // the shape this code has been bitten by repeatedly; treat the
+      // disagreement as the changed-mid-run member it is.
+      if (p.is_dir != (bool)S_ISDIR(st.st_mode)) {
+        warn_skip(p.fspath, "type changed between enumeration and archiving");
+        continue;
+      }
+
       if (p.is_dir) {
         TarEntry e;
         e.path = p.member;
@@ -14201,6 +14439,9 @@ struct LayoutBuilder {
           hardlinks.emplace(key, p.member);  // first occurrence stores the data
         }
         e.typeflag = '0'; e.size = (uint64_t)st.st_size; e.src = p.fspath;
+        // Bind the bytes to the entry that was walked, so the reader can prove
+        // later that it opened the same inode this record describes.
+        e.src_dev = st.st_dev; e.src_ino = st.st_ino; e.src_id_ok = true;
         // --sparse: this file has holes (Pass B built the segment map).
         // real_size = logical size; only the data segments are stored.
         if (!p.sparse_map.empty()) {
@@ -14641,7 +14882,20 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   size_t push_next = 0;
 
   // Assemble one chunk [a,b) into a zero-filled owning buffer.
-  auto assemble_chunk = [&](size_t ci, std::string & cur_path, int & cur_fd, int & cur_errno) -> Task {
+  // One reader thread's open member file, carried across chunks so a member
+  // spanning several chunks is opened once.  It is a struct rather than four
+  // loose reference parameters because the IDENTITY fields are the reuse key,
+  // and a positional (dev_t, ino_t, bool) tail is exactly the kind of signature
+  // a later caller gets subtly wrong.
+  struct SrcCache {
+    std::string path;
+    int         fd    = -1;
+    int         err   = 0;
+    dev_t       dev   = 0;    // what fd actually refers to — checked before reuse
+    ino_t       ino   = 0;
+    bool        id_ok = false;
+  };
+  auto assemble_chunk = [&](size_t ci, SrcCache & sc) -> Task {
     uint64_t a = (uint64_t)ci * chunk_size;
     uint64_t b = std::min(total, a + chunk_size);
     size_t clen = (size_t)(b - a);
@@ -14667,8 +14921,22 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       if (e.size > 0) {
         uint64_t de = e.data_off + e.size;
         if (e.data_off < b && de > a) {
-          if (cur_path != e.src) {
-            if (cur_fd >= 0) ::close(cur_fd);
+          // THE CACHE KEY IS THE IDENTITY, NOT THE NAME.  Keying reuse on the
+          // pathname alone let one validated descriptor serve a LATER entry that
+          // recorded a different inode for the same name: two members with the
+          // same src, the first validating inode A, the second silently reusing
+          // A's descriptor although its own record says B.  The archive then held
+          // A's bytes twice while --rm deleted B, which had never been archived —
+          // and the A record's own removal hit ENOENT, which counts as success,
+          // so the run exited 0.  Reuse only when the open descriptor is the
+          // entry THIS record describes.
+          const bool same_src =
+              sc.path == e.src
+              && (!e.src_id_ok
+                  || (sc.fd >= 0 && sc.id_ok
+                      && sc.dev == e.src_dev && sc.ino == e.src_ino));
+          if (!same_src) {
+            if (sc.fd >= 0) ::close(sc.fd);
             // O_NONBLOCK on the open, then verify it is still a regular file.
             // The layout was built earlier, so a member can have been replaced
             // between then and now; if it became a FIFO, a blocking open waits
@@ -14676,26 +14944,43 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
             // chunk the pusher then waits on it and the whole assembly wedges.
             // A non-regular member is treated exactly like an unreadable one:
             // zero-filled, flagged, and the archive continues.
-            cur_fd = ::open(e.src.c_str(), O_RDONLY | O_NONBLOCK);
-            cur_errno = (cur_fd < 0) ? errno : 0;
-            if (cur_fd >= 0) {
+            sc.dev = 0; sc.ino = 0; sc.id_ok = false;
+            sc.fd = ::open(e.src.c_str(), O_RDONLY | O_NONBLOCK);
+            sc.err = (sc.fd < 0) ? errno : 0;
+            if (sc.fd >= 0) {
               struct stat mst{};
-              if (::fstat(cur_fd, &mst) != 0 || !S_ISREG(mst.st_mode)) {
-                ::close(cur_fd); cur_fd = -1; cur_errno = EINVAL;
+              if (::fstat(sc.fd, &mst) != 0 || !S_ISREG(mst.st_mode)) {
+                ::close(sc.fd); sc.fd = -1; sc.err = EINVAL;
+              } else if (e.src_id_ok
+                         && (mst.st_dev != e.src_dev || mst.st_ino != e.src_ino)) {
+                // IS THIS THE ENTRY THE LAYOUT DESCRIBED?  Being regular is not
+                // enough.  This open is by PATHNAME, long after the walk, so an
+                // exchange at that name puts a DIFFERENT file's bytes into the
+                // archive under this member's header — and with --tar --rm the
+                // removal record still names the walked inode, so the ORIGINAL
+                // gets deleted while the archive holds the substitute's bytes.
+                // Comparing against the walked identity is what makes "only what
+                // was archived is removed" true of the DATA and not just of the
+                // name.  A mismatch is exactly a changed-mid-read member, which
+                // is already a hard error that stops --rm entirely.
+                ::close(sc.fd); sc.fd = -1; sc.err = ESTALE;
               } else {
+                // Record what this descriptor actually is, so a later entry
+                // sharing the pathname must prove it wants THIS inode.
+                sc.dev = mst.st_dev; sc.ino = mst.st_ino; sc.id_ok = true;
                 // Clear O_NONBLOCK: on a regular file it does not affect reads,
                 // but leaving it set is a surprise for anything downstream.
-                const int fl = ::fcntl(cur_fd, F_GETFL);
-                if (fl >= 0) (void)::fcntl(cur_fd, F_SETFL, fl & ~O_NONBLOCK);
+                const int fl = ::fcntl(sc.fd, F_GETFL);
+                if (fl >= 0) (void)::fcntl(sc.fd, F_SETFL, fl & ~O_NONBLOCK);
               }
             }
-            cur_path = e.src;
+            sc.path = e.src;
           }
           // Read `len` bytes from file offset `foff` into the chunk at virtual
           // offset `voff`.  On short read the remainder stays zero (GNU parity).
           auto read_seg = [&](off_t foff, uint64_t voff, size_t len) {
             size_t done = 0;
-            if (cur_fd >= 0) {
+            if (sc.fd >= 0) {
               // Attribute member reads to the Reader line (-vvv).  Aggregate
               // across the parallel assembler threads, like the CPU-compute
               // counter — so read_ns can exceed wall time and the reported rate
@@ -14711,7 +14996,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
               const bool time_io = (g_perf != nullptr) || (m != nullptr);
               uint64_t t0 = time_io ? now_ns() : 0;
               while (done < len) {
-                ssize_t r = ::pread(cur_fd, outp + (voff - a) + done, len - done, foff + (off_t)done);
+                ssize_t r = ::pread(sc.fd, outp + (voff - a) + done, len - done, foff + (off_t)done);
                 if (r <= 0) break;
                 done += (size_t)r;
               }
@@ -14726,9 +15011,9 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
             }
             if (done < len) {
               g_tar_had_errors.store(true, std::memory_order_relaxed);
-              if (cur_fd < 0)
+              if (sc.fd < 0)
                 vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": cannot read ("
-                     + std::strerror(cur_errno) + ")\n");
+                     + std::strerror(sc.err) + ")\n");
               else
                 vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": file changed as we read it\n");
             }
@@ -14768,7 +15053,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   };
 
   auto reader = [&](int k) {
-    std::string cur_path; int cur_fd = -1, cur_errno = 0;
+    SrcCache sc;
     auto mark = [&](int st, size_t ci) {
       rd_st[(size_t)k].store(st, std::memory_order_relaxed);
       rd_hold[(size_t)k].store(ci, std::memory_order_relaxed);
@@ -14827,7 +15112,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       // nobody will consume.
       if (g_gpu_aborted.load(std::memory_order_relaxed)) { rb_cv.notify_all(); break; }
       mark(RD_ASSEMBLE, ci);
-      Task t = assemble_chunk(ci, cur_path, cur_fd, cur_errno);  // concurrent preads (unlocked)
+      Task t = assemble_chunk(ci, sc);  // concurrent preads (unlocked)
       if (rd_ad_t) rd_ctl_t.add_bytes((uint64_t)t.data.size());
       mark(RD_DEPOSIT, ci);
       {
@@ -14837,7 +15122,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       rb_cv.notify_all();
     }
     mark(RD_EXIT, SIZE_MAX);
-    if (cur_fd >= 0) ::close(cur_fd);
+    if (sc.fd >= 0) ::close(sc.fd);
   };
 
   // Pusher: drain `ready` to the queue in strict sequence order.
@@ -25402,6 +25687,7 @@ static int gzstd_main(int argc, char ** argv)
 
   // --tar synthesizes its input from tar_sources; there is no input FILE*.
   HeldDir in_dir;                 // retained through --rm quarantine/removal
+  HeldEntry in_held;              // ...and so is the ENTRY, so its inode cannot be reissued
   FILE * in = nullptr;
   // The entry --rm would delete, identified from the SAME lookup that opened the
   // data (see open_input_pinned).  Only taken when --rm is in play: pinning costs
@@ -25422,7 +25708,7 @@ static int gzstd_main(int argc, char ** argv)
         die_io("cannot open the input directory " + in_dir.dir + " for "
                + opt.input + " (" + std::strerror(errno) + ")");
       int ifd = want_rm_identity
-              ? open_input_pinned(in_dir, in_lid, in_lid_ok)
+              ? open_input_pinned(in_dir, in_lid, in_lid_ok, in_held)
               : ::openat(in_dir.fd, in_dir.base.c_str(), O_RDONLY | O_CLOEXEC);
       if (ifd < 0) die_io("cannot open input: " + opt.input
                           + " (" + std::strerror(errno) + ")");
@@ -26956,7 +27242,9 @@ static int gzstd_main(int argc, char ** argv)
                          "no sources were removed\n");
     } else {
       rm_debug_gate();   // test-only; see the definition. No-op when unset.
-      const size_t kept = tar_remove_archived_sources(g_tar_removal_paths, opt);
+      size_t removed = 0;
+      const size_t kept =
+          tar_remove_archived_sources(g_tar_removal_paths, opt, removed);
       if (kept != 0) {
         // The user asked for removal and did not fully get it.  Same reasoning as
         // the plain --rm path: a requested destructive step that silently did not
@@ -26966,8 +27254,12 @@ static int gzstd_main(int argc, char ** argv)
              + " not removed (archive kept at " + opt.output + ")\n");
         exit_code = EXIT_IO;
       } else {
-        vlog(V_VERBOSE, opt, "[TAR] --rm: removed "
-             + std::to_string(g_tar_removal_paths.size()) + " archived source entries\n");
+        // Report what was actually unlinked.  The previous attempt printed
+        // size() - kept inside the kept == 0 branch, where it is size() by
+        // construction — a rewrite that read like a fix and computed the same
+        // wrong number.  `removed` is counted at the unlink itself.
+        vlog(V_VERBOSE, opt, "[TAR] --rm: removed " + std::to_string(removed)
+             + " archived source entries\n");
       }
     }
   }
