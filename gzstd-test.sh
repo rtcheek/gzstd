@@ -118,7 +118,6 @@ TOTAL_TESTS=0    # set after counting
 SECTION_NUM=0
 SECTION_PASS=0
 SECTION_FAIL=0
-TEST_START_TIME=$(date +%s%N)  # nanoseconds for precision
 LAST_TEST_MS=0
 
 # WALL TIME ON EVERY RESULT LINE — the interval since the previous result, which
@@ -138,11 +137,20 @@ TIMING_FLOOR_MS="${GZSTD_TEST_TIMING_FLOOR:-500}"
 # paths can call it DIRECTLY.  Returning the value through `$(now_ms)` would
 # itself fork a shell subshell even though $EPOCHREALTIME needs no external
 # command — the same cost this instrumentation is meant to avoid.  Keep the
-# printing wrapper for the older, non-hot call sites below.  Bash 4 falls back
-# to date, where the extra process is the lesser evil against not working.
+# printing wrapper for the older, non-hot call sites below.  Bash 4 has no
+# EPOCHREALTIME, but Linux exposes a monotonic clock through /proc/uptime; `read`
+# consumes it without a subshell or external process.  Only a proc-less Bash 4
+# environment pays for date.
 NOW_MS=0
 if [[ -n "${EPOCHREALTIME:-}" ]]; then
   capture_now_ms() { local t=${EPOCHREALTIME/./}; NOW_MS=$(( ${t%???} )); }
+elif [[ -r /proc/uptime ]]; then
+  capture_now_ms() {
+    local sec frac rest
+    IFS='. ' read -r sec frac rest < /proc/uptime
+    frac=${frac}000
+    NOW_MS=$(( 10#$sec * 1000 + 10#${frac:0:3} ))
+  }
 else
   capture_now_ms() { NOW_MS=$(( $(date +%s%N) / 1000000 )); }
 fi
@@ -440,15 +448,31 @@ export GZSTD_DEBUG_GPU_GUARD_SEC=0
 # which is better coverage than the accident it replaces.
 #
 # GZSTD_TEST_ALL_GPUS=1 restores every device for the whole run, for when you are
-# actually chasing a multi-GPU problem.
-if [[ -z "${GZSTD_TEST_ALL_GPUS:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]] \
-   && command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-  GPU_ALL_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+# actually chasing a multi-GPU problem.  Distinguish an UNSET
+# CUDA_VISIBLE_DEVICES from an explicitly empty one: empty is the standard way
+# to request no CUDA devices and must not be silently turned into GPU 0.
+if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+  if [[ -n "${GZSTD_TEST_ALL_GPUS:-}" ]]; then
+    GPU_ALL_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+    unset CUDA_VISIBLE_DEVICES
+  elif [[ -z "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+    GPU_ALL_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+    export CUDA_VISIBLE_DEVICES=0
+  else
+    # Respect a caller-supplied mask; the deliberate multi-GPU cell may use the
+    # devices in that mask, but must not escape it and expose the rest of the host.
+    GPU_ALL_DEVICES=$CUDA_VISIBLE_DEVICES
+  fi
   export GPU_ALL_DEVICES
-  export CUDA_VISIBLE_DEVICES=0
 fi
 
 has_gpu() {
+  # An explicitly empty mask means "no CUDA devices" even though nvidia-smi can
+  # still see the physical host.  Treat it as such instead of running every GPU
+  # cell and failing them against a configuration the caller intentionally hid.
+  if [[ -n "${CUDA_VISIBLE_DEVICES+x}" && -z "$CUDA_VISIBLE_DEVICES" ]]; then
+    return 1
+  fi
   ("$GZSTD" -V 2>&1 | grep -qi "nvcomp\|gpu\|cuda") 2>/dev/null && \
     command -v nvidia-smi &>/dev/null && \
     nvidia-smi &>/dev/null
@@ -2689,37 +2713,50 @@ section "GPU-specific options"
 if has_gpu 2>/dev/null; then
   LAST_TEST_MS=0
 
-  # MULTI-GPU DISPATCH — the one test that opts back in to every device.
+  # MULTI-GPU DISPATCH — the one test that opts back in to multiple devices.
   # The suite pins CUDA_VISIBLE_DEVICES=0 because CUDA init scales with device
   # count and dominates its runtime (see the note at the top).  That trade is
   # only defensible if SOMETHING still drives more than one GPU deliberately,
   # which nothing did before: multi-GPU was covered by accident, and an accident
   # stops covering you the moment someone changes an unrelated default.
-  # Round-trips through every visible device and asserts the work actually
-  # reached more than one of them, rather than that the command merely exited 0.
+  # Round-trips through two visible devices and asserts the work actually reached
+  # both of them, rather than that the command merely exited 0.
+  # Expose exactly two from the saved all-device mask: the test-only rendezvous
+  # makes both claim a first batch before either may claim a second, so this is
+  # deterministic and the 32 MiB fixture always has enough 4 MiB frames.
   if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
-    mg_log=$(CUDA_VISIBLE_DEVICES="$GPU_ALL_DEVICES" "$GZSTD" --gpu-only -vv \
+    IFS=, read -r mg_dev0 mg_dev1 mg_rest <<< "$GPU_ALL_DEVICES"
+    mg_devices="$mg_dev0,$mg_dev1"
+    mg_log=$(CUDA_VISIBLE_DEVICES="$mg_devices" GZSTD_DEBUG_GPU_ALL_READY=1 \
+               timeout --foreground -k 10 120 \
+               "$GZSTD" --gpu-only -vv --gpu-streams=1 --gpu-batch=1 \
                --chunk-size 4 -k -f "$TMPDIR/large.bin" -o "$TMPDIR/mgpu.zst" 2>&1)
-    mg_used=$(printf '%s' "$mg_log" | grep -oE "GPU[0-9]+/S[0-9]+" \
+    mg_rc=$?
+    # Count only completed batches.  Bare GPUx/Sy tokens also occur in stream
+    # initialization and zero-batch summaries, which made the first version pass
+    # merely because two devices initialized even when one did all the work.
+    mg_used=$(printf '%s' "$mg_log" | grep -oE "GPU[0-9]+/S[0-9]+] done batch=[1-9][0-9]*" \
               | grep -oE "GPU[0-9]+" | sort -u | wc -l)
-    if [[ ! -s "$TMPDIR/mgpu.zst" ]]; then
+    if [[ $mg_rc -ne 0 ]]; then
+      fail "multi-GPU dispatch" "compress exited $mg_rc"
+    elif [[ ! -s "$TMPDIR/mgpu.zst" ]]; then
       fail "multi-GPU dispatch" "no output"
-    elif CUDA_VISIBLE_DEVICES="$GPU_ALL_DEVICES" "$GZSTD" -d --gpu-only -k -f \
+    elif CUDA_VISIBLE_DEVICES="$mg_devices" timeout --foreground -k 10 120 \
+           "$GZSTD" -d --gpu-only -k -f \
            "$TMPDIR/mgpu.zst" -o "$TMPDIR/mgpu.out" 2>/dev/null \
          && files_match "$TMPDIR/large.bin" "$TMPDIR/mgpu.out"; then
       if (( mg_used > 1 )); then
-        pass "multi-GPU dispatch round-trips across all devices" "($mg_used GPUs used)"
+        pass "multi-GPU dispatch round-trips across multiple devices" "($mg_used GPUs used)"
       else
-        # Not a failure: one device may legitimately absorb a small fixture.
-        skip "multi-GPU dispatch round-trips across all devices" \
-             "work landed on $mg_used GPU; nothing to check"
+        fail "multi-GPU dispatch round-trips across multiple devices" \
+             "work landed on only $mg_used GPU despite the all-ready rendezvous"
       fi
     else
-      fail "multi-GPU dispatch" "round-trip mismatch across $GPU_ALL_DEVICES"
+      fail "multi-GPU dispatch" "round-trip mismatch across $mg_devices"
     fi
     rm -f "$TMPDIR/mgpu.zst" "$TMPDIR/mgpu.out"
   else
-    skip "multi-GPU dispatch round-trips across all devices" "single GPU host"
+    skip "multi-GPU dispatch round-trips across multiple devices" "single GPU host"
   fi
 
   # --gpu-streams

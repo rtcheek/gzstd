@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.15.96
+**Current version:** v0.15.97
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -60,6 +60,47 @@ was true of the common path and false of roughly thirty options.
 
 **Re-measure this table before each tag** — it is the only part of the roadmap that
 describes a moving target we do not control.
+
+---
+
+## Future security enhancement: content-identity `--rm` (deferred, not a defect)
+
+`--rm` and `--tar --rm` refuse to remove a source whose **size or mtime** changed after its
+bytes were compressed. That is a *stat-visible* stability guarantee, and it has a known blind
+spot: a same-size rewrite that leaves the reported mtime unchanged — a deliberate restore, or a
+filesystem whose timestamp granularity is too coarse to notice — passes the check, so bytes the
+archive does not contain can be deleted at exit 0.
+
+**This is deferred rather than fixed, because it is GNU tar's contract for this flag and we measured it.**
+Against tar 1.35, a 1.5 GB source modified in place during the read:
+
+| case | GNU tar 1.35 | gzstd |
+|---|---|---|
+| modified mid-read, mtime advances | `file changed as we read it`, exit 1, source kept | refused, exit 3, source kept, entry named |
+| same-size rewrite, mtime restored | **exit 0, source removed, no warning** | same |
+
+tar uses the same size+mtime test and has the same blind spot. Closing it in gzstd alone would
+make `--rm` *diverge* from the reference behaviour GNU tar defines for this flag, and an ordinary concurrent writer
+advances mtime and is already caught — the residual needs a write that deliberately hides.
+
+**If it is ever taken, the shape is known** (proposed by the independent reviewer, round 24, and
+worth recording because it is the right design):
+
+1. **One `ArchivedSnapshot` abstraction** consumed by all four consumers — layout, sparse
+   probing, reader/descriptor reuse, and removal. The recurring defect in this area has been one
+   representation omitted from a rule the others share (ordinary, empty, PAX sparse, **wholly
+   sparse OLDGNU**, hardlink). A single abstraction makes omission a compile-time question
+   instead of a review-time one.
+2. **A fingerprint of the exact archived bytes**, taken during the compress read (which already
+   touches every byte, so it is one hash pass, not an extra read), and re-verified at removal.
+   **Cost: a full re-read of every source at removal time** — this is the real price, and it
+   roughly doubles read I/O for `--tar --rm` over a large tree. It should therefore be **opt-in**
+   (`--rm-verify` or similar), not the default, precisely because the default must stay tar's.
+3. **Mutation-tested per representation through deterministic gates**, not through races — every
+   one of the five representations above, each proven to fail when its own check is removed.
+
+Until then the bound is documented in `--help` and in the code, and the promise is stated as
+stat-visible stability rather than content identity.
 
 ---
 

@@ -1,12 +1,74 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.96  
+**Covers:** v0.9.50 → v0.15.97  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.15.97 — the suite got 54% faster, and the last HIGH turned out to be GNU tar's contract
+
+### `--rm`'s remaining blind spot is not a defect — measured against GNU tar 1.35
+
+An independent round called v0.15.96 NOT SAFE TO TAG: a same-size rewrite that leaves the
+reported mtime unchanged passes both the identity and content-stat checks, so bytes absent from
+the archive can still be deleted at exit 0. Before treating that as a defect, the reference
+implementation was measured. A 1.5 GB source modified in place during the read:
+
+| case | GNU tar 1.35 | gzstd |
+|---|---|---|
+| modified mid-read, mtime advances | `file changed as we read it`, exit 1, source kept | refused, exit 3, source kept, entry named |
+| same-size rewrite, mtime restored | **exit 0, source removed, no warning** | same |
+
+**GNU tar uses the same size+mtime test and has the same blind spot.** gzstd already matches it
+on the detected case and is stricter in reporting. Closing it here would make `--rm` diverge from
+the behaviour GNU tar defines for this flag, and cost a full re-read of every source at removal.
+So it is deferred as an opt-in enhancement, with the design recorded in `ROADMAP.md`, and the
+promise stated as *stat-visible stability* rather than content identity.
+
+The reviewer accepted the measurement, withdrew "ordinary concurrent activity" as a description
+of the trigger — an ordinary writer advances mtime and is caught — and revised its judgement:
+this round's findings are lower severity than the last, and **the surface is converging**. That
+is the first convergence signal in this arc, and it came from measuring the reference rather
+than arguing about severity.
+
+### One representation omitted from a shared rule, for the third time
+
+Wholly sparse **OLDGNU** members store size zero, so they never entered the reader path and
+skipped assembly-time validation entirely: a file changed after `probe_sparse()` could produce a
+stale all-hole archive at exit 0, and `--rm` would then delete the changed inode. Ordinary, empty
+and PAX-sparse members were all covered; this one representation was not — the same shape as the
+earlier misses, which is why the deferred design in `ROADMAP.md` starts with a single
+`ArchivedSnapshot` abstraction rather than with fingerprints. Descriptor validation now lives in
+one helper that every path calls, including zero-stored-byte members via their header path.
+
+### The suite: 15m03s → 6m56s
+
+CUDA initialisation scales with **visible devices**, not with work — 20 ms cpu-only, 1210 ms
+gpu-only on one device, 4550 ms on eight, for a 2 MB input. The suite now pins
+`CUDA_VISIBLE_DEVICES=0` (`GZSTD_TEST_ALL_GPUS=1` restores all), and the `--cpu-share` round-trip
+sweep drops from five values to three. Measured: **extensive 15m03s → 6m56s, a 54% cut**, with
+CPU-only unchanged at 1m27s as the control. The estimate beforehand was ~3 minutes; the gap was
+counting GPU-forcing *tests* rather than *invocations*, since most compress **and** decompress and
+so paid device init twice. `--rm input-shape matrix` fell 24.5s → 8.8s without losing a single
+assertion.
+
+Three bugs in that work, all found by review rather than by the green suite:
+
+- **A test that could be green without testing its subject.** The new multi-GPU cell counted any
+  `GPUx/Sy` token — including initialisation and zero-batch summaries — then *skipped* when only
+  one device did work. It now counts only completed non-zero batches and fails rather than skips.
+  A second flaw surfaced in the fix itself: readiness alone did not guarantee two workers got
+  work, since one could claim every batch. A test-only rendezvous (`GZSTD_DEBUG_GPU_ALL_READY`)
+  now holds each device after its first claim until the other has claimed or failed. It passed on
+  its first execution, driving 2 GPUs in 4.6s.
+- **The device pin overrode a caller's deliberate choice.** The guard tested `${VAR:-}`
+  (non-empty) instead of `${VAR+x}` (set), so running the suite with `CUDA_VISIBLE_DEVICES=""` to
+  simulate a GPU-less host got GPU 0 exposed anyway.
+- **Bash 4 still forked `date` per result line.** A `/proc/uptime` monotonic fallback removes it;
+  bash 5 continues to use `$EPOCHREALTIME`.
 
 ## v0.15.96 — an inode is not its contents, and five rounds of identity work never noticed
 

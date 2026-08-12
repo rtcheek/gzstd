@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.96";
+static constexpr const char * GZSTD_VERSION = "0.15.97";
 //
 // Architecture overview:
 //
@@ -15008,6 +15008,59 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     sc.fd = -1; sc.err = 0; sc.err_reported = false;
     sc.dev = 0; sc.ino = 0; sc.size = 0; sc.mtime = {}; sc.id_ok = false;
   };
+  // Select and validate the descriptor for one layout entry.  Keep this in ONE
+  // helper: the ordinary data reader and the zero-stored-byte sparse path must
+  // reject exactly the same identity/content-snapshot mismatches.
+  auto select_src = [&](const TarEntry & e, SrcCache & sc) {
+    const bool same_src =
+        sc.path == e.src
+        && (!e.src_id_ok
+            || (sc.fd >= 0 && sc.id_ok
+                && sc.dev == e.src_dev && sc.ino == e.src_ino
+                && sc.size == e.src_size
+                && (int64_t)sc.mtime.tv_sec == e.mtime
+                && (uint32_t)sc.mtime.tv_nsec == e.src_mtime_nsec));
+    if (same_src) return;
+
+    finish_src(sc);
+    // O_NONBLOCK on the open, then verify it is still a regular file.  The
+    // layout was built earlier, so a member can have become a FIFO; a blocking
+    // open would wedge the reader/pusher chain forever.
+    sc.dev = 0; sc.ino = 0; sc.size = 0; sc.mtime = {};
+    sc.id_ok = false; sc.err_reported = false;
+    sc.fd = ::open(e.src.c_str(), O_RDONLY | O_NONBLOCK);
+    sc.err = (sc.fd < 0) ? errno : 0;
+    if (sc.fd >= 0) {
+      struct stat mst{};
+      if (::fstat(sc.fd, &mst) != 0 || !S_ISREG(mst.st_mode)) {
+        ::close(sc.fd); sc.fd = -1; sc.err = EINVAL;
+      } else if (e.src_id_ok
+                 && (mst.st_dev != e.src_dev || mst.st_ino != e.src_ino
+                     || mst.st_size != e.src_size
+                     || (int64_t)mst.st_mtim.tv_sec != e.mtime
+                     || (uint32_t)mst.st_mtim.tv_nsec != e.src_mtime_nsec)) {
+        // This pathname open must describe the same inode and stat-visible
+        // generation Pass B recorded before any of its bytes or sparse geometry
+        // can be accepted into the archive.
+        ::close(sc.fd); sc.fd = -1; sc.err = ESTALE;
+      } else {
+        sc.dev = mst.st_dev; sc.ino = mst.st_ino;
+        sc.size = mst.st_size; sc.mtime = mst.st_mtim; sc.id_ok = true;
+        const int fl = ::fcntl(sc.fd, F_GETFL);
+        if (fl >= 0) (void)::fcntl(sc.fd, F_SETFL, fl & ~O_NONBLOCK);
+      }
+    }
+    sc.path = e.src;
+    // Report rejection here rather than relying on read_seg(): a wholly sparse
+    // OLDGNU member has e.size == 0, and a wholly sparse PAX member may synthesize
+    // only its map.  Neither representation guarantees a real file-byte read.
+    if (sc.fd < 0) {
+      g_tar_had_errors.store(true, std::memory_order_relaxed);
+      vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": cannot read ("
+           + std::strerror(sc.err) + ")\n");
+      sc.err_reported = true;
+    }
+  };
   auto assemble_chunk = [&](size_t ci, SrcCache & sc) -> Task {
     uint64_t a = (uint64_t)ci * chunk_size;
     uint64_t b = std::min(total, a + chunk_size);
@@ -15027,6 +15080,11 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         emit_header(e, lay, hdrbuf.data());
         uint64_t s = std::max<uint64_t>(e.hdr_off, a), en = std::min<uint64_t>(he, b);
         std::memcpy(outp + (s - a), hdrbuf.data() + (s - e.hdr_off), (size_t)(en - s));
+        // A regular member with zero STORED bytes still needs an assembly-time
+        // snapshot check.  This includes empty files and, critically, a wholly
+        // sparse OLDGNU member whose entire content is represented in its header:
+        // e.size == 0 means the data-region block below never runs at all.
+        if (e.size == 0 && e.src_id_ok) select_src(e, sc);
       }
       // Data region (file bytes); padding stays zero.  For a sparse entry the
       // data region holds the concatenated data segments, so a virtual (stored)
@@ -15043,72 +15101,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
           // and the A record's own removal hit ENOENT, which counts as success,
           // so the run exited 0.  Reuse only when the open descriptor is the
           // entry THIS record describes.
-          const bool same_src =
-              sc.path == e.src
-              && (!e.src_id_ok
-                  || (sc.fd >= 0 && sc.id_ok
-                      && sc.dev == e.src_dev && sc.ino == e.src_ino
-                      && sc.size == e.src_size
-                      && (int64_t)sc.mtime.tv_sec == e.mtime
-                      && (uint32_t)sc.mtime.tv_nsec == e.src_mtime_nsec));
-          if (!same_src) {
-            finish_src(sc);
-            // O_NONBLOCK on the open, then verify it is still a regular file.
-            // The layout was built earlier, so a member can have been replaced
-            // between then and now; if it became a FIFO, a blocking open waits
-            // for a writer FOREVER, and because this reader owns a claimed
-            // chunk the pusher then waits on it and the whole assembly wedges.
-            // A non-regular member is treated exactly like an unreadable one:
-            // zero-filled, flagged, and the archive continues.
-            sc.dev = 0; sc.ino = 0; sc.size = 0; sc.mtime = {};
-            sc.id_ok = false; sc.err_reported = false;
-            sc.fd = ::open(e.src.c_str(), O_RDONLY | O_NONBLOCK);
-            sc.err = (sc.fd < 0) ? errno : 0;
-            if (sc.fd >= 0) {
-              struct stat mst{};
-              if (::fstat(sc.fd, &mst) != 0 || !S_ISREG(mst.st_mode)) {
-                ::close(sc.fd); sc.fd = -1; sc.err = EINVAL;
-              } else if (e.src_id_ok
-                         && (mst.st_dev != e.src_dev || mst.st_ino != e.src_ino
-                             || mst.st_size != e.src_size
-                             || (int64_t)mst.st_mtim.tv_sec != e.mtime
-                             || (uint32_t)mst.st_mtim.tv_nsec != e.src_mtime_nsec)) {
-                // IS THIS THE ENTRY THE LAYOUT DESCRIBED?  Being regular is not
-                // enough.  This open is by PATHNAME, long after the walk, so an
-                // exchange at that name puts a DIFFERENT file's bytes into the
-                // archive under this member's header — and with --tar --rm the
-                // removal record still names the walked inode, so the ORIGINAL
-                // gets deleted while the archive holds the substitute's bytes.
-                // Comparing against the walked identity and size+mtime snapshot
-                // catches an ordinary changed-mid-read member before accepting
-                // any bytes.  It is already a hard error that stops --rm entirely.
-                // This is not a digest: same-size changed bytes with an unchanged
-                // reported mtime remain outside the stated bound.
-                ::close(sc.fd); sc.fd = -1; sc.err = ESTALE;
-              } else {
-                // Record what this descriptor actually is, so a later entry
-                // sharing the pathname must prove it wants THIS inode.
-                sc.dev = mst.st_dev; sc.ino = mst.st_ino;
-                sc.size = mst.st_size; sc.mtime = mst.st_mtim; sc.id_ok = true;
-                // Clear O_NONBLOCK: on a regular file it does not affect reads,
-                // but leaving it set is a surprise for anything downstream.
-                const int fl = ::fcntl(sc.fd, F_GETFL);
-                if (fl >= 0) (void)::fcntl(sc.fd, F_SETFL, fl & ~O_NONBLOCK);
-              }
-            }
-            sc.path = e.src;
-            // Report a rejected validated-open HERE, not only from read_seg.
-            // A wholly sparse PAX member can have a synthesized map block but no
-            // real data segment, so no read_seg call is guaranteed.  Missing this
-            // flag there allowed removal of other sources despite a member whose
-            // Pass B snapshot could not be validated at assembly time.
-            if (sc.fd < 0) {
-              g_tar_had_errors.store(true, std::memory_order_relaxed);
-              vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": cannot read ("
-                   + std::strerror(sc.err) + ")\n");
-              sc.err_reported = true;
-            }
-          }
+          select_src(e, sc);
           // Read `len` bytes from file offset `foff` into the chunk at virtual
           // offset `voff`.  On short read the remainder stays zero (GNU parity).
           auto read_seg = [&](off_t foff, uint64_t voff, size_t len) {
@@ -20491,6 +20484,8 @@ static void gpu_worker(
   std::atomic<bool> * abort_on_failure,
   std::string * fatal_msg,
   std::atomic<bool> * gpu_started_flag,
+  std::atomic<int> * gpu_ready_workers,  // test-only all-device rendezvous
+  std::atomic<int> * gpu_claimed_workers,// test-only first-batch rendezvous
   SharedTuneState * shared_tune,
   FrameThrottle * bp,
   std::atomic<int> * gpu_failures,   // terminal failures (init or mid-run), all workers
@@ -20808,6 +20803,28 @@ static void gpu_worker(
       std::lock_guard<std::mutex> lk(idle_m);
       if (!drain_err.empty()) throw std::runtime_error(drain_err);
     };
+
+    // Test-only rendezvous: hold every successfully initialized device before
+    // intake until every worker is either ready or has failed.  A tiny fixture
+    // otherwise tests CUDA initialization order, not multi-device dispatch: the
+    // first context can drain the queue before the second context exists.  The
+    // condition variable is the same event-driven bringup primitive used by the
+    // fixed-share path; unset (every non-test run) is one getenv and no wait.
+    const bool debug_all_ready = ::getenv("GZSTD_DEBUG_GPU_ALL_READY")
+                              && gpu_ready_workers && gpu_claimed_workers;
+    bool debug_first_claimed = false;
+    if (debug_all_ready) {
+      gpu_ready_workers->fetch_add(1, std::memory_order_release);
+      gpu_bringup_signal();
+      std::unique_lock<std::mutex> lk(g_gpu_bringup_mx);
+      g_gpu_bringup_cv.wait(lk, [&] {
+        const int ready = gpu_ready_workers->load(std::memory_order_acquire);
+        const int failed = gpu_failures
+            ? gpu_failures->load(std::memory_order_acquire) : 0;
+        return ready + failed >= gpu_worker_count
+            || g_gpu_aborted.load(std::memory_order_relaxed);
+      });
+    }
 
     while (true) {
       wd_beat(slot_index);           // heartbeat: spinning vs blocked
@@ -21144,6 +21161,27 @@ static void gpu_worker(
         if (g_perf) g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
         C.filled = C.batch.size();
         C.delivered = 0;
+
+        // The ready barrier above removes CUDA-initialization skew, but alone it
+        // does not prove multi-device dispatch: after release, one lucky worker
+        // could pop every batch before another is scheduled.  Under the test hook,
+        // make each initialized worker stop after its first successful claim until
+        // every worker has either claimed one or failed.  The suite exposes exactly
+        // two devices and supplies multiple one-frame batches, so this is a proof of
+        // dispatch rather than a probabilistic scheduler-fairness assertion.
+        if (debug_all_ready && !debug_first_claimed) {
+          debug_first_claimed = true;
+          gpu_claimed_workers->fetch_add(1, std::memory_order_release);
+          gpu_bringup_signal();
+          std::unique_lock<std::mutex> lk(g_gpu_bringup_mx);
+          g_gpu_bringup_cv.wait(lk, [&] {
+            const int claimed = gpu_claimed_workers->load(std::memory_order_acquire);
+            const int failed = gpu_failures
+                ? gpu_failures->load(std::memory_order_acquire) : 0;
+            return claimed + failed >= gpu_worker_count
+                || g_gpu_aborted.load(std::memory_order_relaxed);
+          });
+        }
 
         if (m) {
           // mmap views are counted here (their reader doesn't); --direct-read
@@ -21818,6 +21856,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::atomic<bool>   any_gpu_failed{false};
   std::atomic<bool>   abort_on_failure{ opt.gpu_only };
   std::atomic<bool>   gpu_started{false};
+  std::atomic<int>    gpu_ready_workers{0};  // GZSTD_DEBUG_GPU_ALL_READY only
+  std::atomic<int>    gpu_claimed_workers{0}; // GZSTD_DEBUG_GPU_ALL_READY only
 
   // Device selection and the per-device arrays move into gpu_bringup() below:
   // selection needs a live CUDA context, and DevStats/StatsSink each hold a
@@ -22095,7 +22135,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                            &queue, &results,
                            &per_dev[size_t(i)], json_sink.get(), m, sched,
                            &any_gpu_failed, &abort_on_failure,
-                           &fatal_msgs[size_t(i)], &gpu_started,
+                           &fatal_msgs[size_t(i)], &gpu_started, &gpu_ready_workers,
+                           &gpu_claimed_workers,
                            &shared_tune,
                            &throttle, &gpu_failures, gpu_count);
     }
