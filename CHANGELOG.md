@@ -1,12 +1,94 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.95  
+**Covers:** v0.9.50 → v0.15.96  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.15.96 — an inode is not its contents, and five rounds of identity work never noticed
+
+Every fix in v0.15.90 through v0.15.95 bound an identity: the removal record, the member read,
+descriptor reuse, the sparse map, the symlink target, the pinned input. All of them compared
+`(st_dev, st_ino)`. **A writer that rewrites a file in place keeps `(st_dev, st_ino)`.** So the
+whole arc's guarantee — that `--rm` removes only what the archive holds — was never true of a
+file whose *contents* changed after it was read:
+
+```
+gzstd --rm -o f.zst f          # with the removal gate held open
+  → overwrite f in place, touch its mtime
+  → f deleted, archive holds the OLD bytes, exit 0, no warning
+```
+
+Reproduced against the released v0.15.95 binary. **No attacker is required** — an ordinary
+concurrent writer between the read and the removal is enough, which is a log being appended to
+or an editor saving during a backup. That places it on the always-fix side of the threat-model
+line, not in the defended-where-cheap tier where the rest of this arc lived.
+
+`--rm` now records the size and nanosecond mtime of the inode it compressed and refuses to
+remove an entry whose snapshot moved, restoring the input and exiting non-zero with the archive
+kept. Both forms are covered: plain `--rm` compares against the `fstat` taken when the input was
+opened, and `--tar --rm` against Pass B's stat, with the reader and the sparse probe validating
+the same snapshot so a change between the walk and the read cannot reach the archive either.
+
+**The bound is stated rather than implied**, because this arc's recurring defect is a comment
+promising more than the code: size+mtime detects a writer who is not hiding. It does **not**
+detect a same-size rewrite with a restored mtime, or one hidden by coarse filesystem timestamp
+granularity. Byte-level certainty would mean re-reading and digesting every member. `--help`
+says so too.
+
+`ctime` is deliberately excluded: unlinking one archived hardlink bumps the shared inode's ctime
+before the next name is visited, so including it would make every multiply-linked archive refuse
+its own second alias. Data mtime does not move when a name is removed.
+
+**Found by the OPEN half of a review round.** The adjudication half — "are the five fixes we
+agreed actually applied?" — returned all five confirmed. A round scoped only to that question
+would have reported a clean bill on a version that silently deletes unarchived data. It is the
+second time in this arc that an open pass caught what a narrow one structurally could not.
+
+Two more from the same round, both about a guarantee being half-applied:
+
+- **A wholly sparse PAX member can synthesise its map without ever calling `read_seg()`.** The
+  reader's rejection of a changed member relied on that function to raise the error flag, so for
+  those members the rejection was recorded nowhere and the removal phase still ran. Found by
+  asking whether a reader failure *actually* stops removal, rather than assuming it.
+- **A regression test that could not fail for the right reason.** `1c-9f` checked only that the
+  substituted pathname still existed and ignored the exit status, so an implementation that
+  refused *every* removal would have passed it. It now requires a non-zero exit and verifies the
+  archived inode survived under its moved name.
+
+### The suite times itself now, and the profile said something surprising
+
+The old `[Ns]` came from a `run_test` wrapper used at 55 call sites, so it covered 102 of 546
+results and accounted for **443 s of a 913 s run**. Timing the *interval between result lines*
+instead needs no per-test edits and includes the fixture work before each test, so the intervals
+tile the whole run: coverage is now **100%** (903 s of 903 s). `-T` adds the slowest tests and
+that coverage figure; `GZSTD_TEST_TIMING_FLOOR=0` shows every line.
+
+Two bugs in the instrument itself, both worth recording. The first version had callers do
+`dt=$(result_ms ...)`, which runs the function in a **subshell** — the state update was discarded
+and every interval was measured from process start, reporting ~108 s per test and 15164% coverage.
+Absurd output caught it; a plausible wrong number would not have, which is the argument for the
+coverage line existing. The second: `now_ms()` forked `date` on every call and made the run 18 s
+slower — an instrument costing a fifth of what it was built to find. `$EPOCHREALTIME` removed the
+exec, and a later review caught that `local x=$(...)` still forks a subshell regardless.
+
+**The profile then refused to name a villain.** The top 10 tests are 16% of the run and the top 50
+are 50% — deleting the ten slowest buys 2.4 minutes of 15 and costs real coverage. What it did
+show is that **CUDA initialisation scales with visible devices, not with work**: on the 8-GPU host,
+a 2 MB input takes 20 ms cpu-only, 1210 ms gpu-only with one device, and 4550 ms with eight. About
+850 ms fixed plus ~470 ms per device, paid again by each of ~89 GPU-forcing invocations, to
+initialise seven GPUs the fixtures are far too small to use. The suite now pins
+`CUDA_VISIBLE_DEVICES=0` (`GZSTD_TEST_ALL_GPUS=1` restores them all).
+
+That trade removes *incidental* multi-GPU coverage — nothing ever asserted on it — so it is
+replaced by a deliberate test that opts back in to every device and checks the work actually
+reached more than one, rather than that the command exited 0. And the `--cpu-share` round-trip
+sweep drops from five values to three: the endpoints are the only distinct paths, and 0.25/0.75
+were 22 s spent re-evaluating arithmetic while the split's *response* to the value is measured
+separately at both extremes.
 
 ## v0.15.95 — one identity check was not enough; there were five things that decide the data
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.95";
+static constexpr const char * GZSTD_VERSION = "0.15.96";
 //
 // Architecture overview:
 //
@@ -1870,6 +1870,9 @@ static void print_help_long()
 "  --rm, --remove-files\n"
 "     Remove input after a successful operation.  Implies -k=off.\n"
 "     --remove-files is GNU tar's spelling of the same thing.\n"
+"     A regular input entry (not a symlink) whose size or modification time\n"
+"     changes after its pre-read snapshot is kept and the run fails; the\n"
+"     completed output is retained.\n"
 "\n"
 "     With --tar this removes the ARCHIVED SOURCES once the archive is\n"
 "     complete and installed.  Three properties, deliberately:\n"
@@ -1877,7 +1880,13 @@ static void print_help_long()
 "         walker's own members, so a file created during the run — which\n"
 "         is not in the archive — is never deleted.  Each entry is removed\n"
 "         by the identity it was archived with, not by its name; if the\n"
-"         name leads somewhere else by then it is kept and reported.  The\n"
+"         name leads somewhere else by then it is kept and reported.  For\n"
+"         regular files, a size or modification-time change also keeps the\n"
+"         file and makes the run fail: a live tree may therefore be only\n"
+"         partly removed.  This catches observable concurrent writes, not a\n"
+"         same-size rewrite for which the filesystem reports the old timestamp\n"
+"         (whether restored or hidden by timestamp granularity); proving\n"
+"         that would require reading and digesting every member again.  The\n"
 "         one gap, and it needs someone able to write to your source\n"
 "         directory: between that check and the unlink itself the name can\n"
 "         be swapped for another entry removed the same way (any\n"
@@ -13336,7 +13345,25 @@ struct TarRemoval {
   std::string path;
   dev_t       dev;
   ino_t       ino;
+  off_t       size;
+  int64_t     mtime_sec;
+  uint32_t    mtime_nsec;
   bool        is_dir;
+  // For a regular file, inode identity alone is not a snapshot of its DATA: an
+  // in-place writer keeps dev+ino while replacing bytes after assembly.  The
+  // removal-side fstatat already obtains these fields, so retain Pass B's values
+  // and refuse to delete when either field changed in the meantime.  This is
+  // evidence of an observable concurrent writer, NOT proof that the bytes are
+  // unchanged: a same-length rewrite for which the filesystem reports the same
+  // mtime (restored or hidden by coarse timestamp granularity) passes.  Closing
+  // that bound requires re-reading and digesting every member.
+  // mtime (not ctime) is deliberate: unlinking one archived hardlink changes the
+  // shared inode's ctime before the next name is visited, but not its data mtime.
+  // Conversely, a write through ANY hardlink before removal begins changes the
+  // shared inode's mtime, so every recorded name refuses and the new contents
+  // survive.  A write between two removal attempts can leave the already-unlinked
+  // alias gone, but the changed inode survives through the remaining alias.
+  bool        content_stat_ok;
 };
 
 // Collapse the "." components a user is entitled to type — `d/.`, `d/./f`, `./d`
@@ -13441,7 +13468,17 @@ static void rm_debug_gate()
 //    one between enumeration and archiving is refused outright.  (Only the
 //    directory disagreement is tested there, and that is sufficient: every other
 //    member type takes both its header and its removal record from the SAME
-//    Pass B stat, so those two cannot disagree.)
+//    Pass B stat, so those two cannot disagree.)  For regular files, removal
+//    additionally rejects a changed size or nanosecond mtime.  That catches an
+//    observable in-place writer after assembly, but it is NOT a content proof: a
+//    same-size rewrite whose mtime appears unchanged (restored or hidden by the
+//    filesystem's timestamp granularity) is invisible.
+//    A stronger promise would require re-reading and digesting every member.
+//    THERE ARE TWO OBSERVABLE WINDOWS.  Pass B -> reader-open (and mutation during
+//    pread) is checked by the reader's opening/final fstats; either path sets the
+//    process-wide g_tar_had_errors, so main skips ALL removal, not just this entry.
+//    Reader-close -> removal is checked again here against the same Pass B size
+//    and mtime.  Thus an observable change in either window retains the sources.
 //    STILL NOT COVERED, deliberately: with --acls/--xattrs the extended metadata
 //    is gathered by reopening the path, so that metadata is not identity-bound.
 //    It is metadata, not member data — the claim above is about bytes.
@@ -13561,6 +13598,27 @@ static size_t tar_remove_archived_sources(const std::vector<TarRemoval> & paths,
       ++failed;
       vlog(V_ERROR, opt, "gzstd: tar: kept " + p
            + ": it is no longer the entry that was archived\n");
+      ::close(dfd);
+      continue;
+    }
+    // SAME INODE DOES NOT MEAN SAME BYTES.  A normal writer can modify a regular
+    // file in place after the assembler read it and before --rm starts.  The
+    // dev+ino check above then succeeds and the old code deleted those NEW bytes,
+    // which the completed archive does not contain.  Size plus nanosecond mtime
+    // are the content-generation evidence available from the fstatat we already
+    // paid for.  This detects changed metadata, not arbitrary changed contents: a
+    // same-size rewrite whose mtime appears unchanged (restored or hidden by the
+    // filesystem's timestamp granularity) still passes.  This is
+    // intentionally regular-file-only: removing one hardlink
+    // changes ctime, and removing children changes directory mtime/ctime, while
+    // neither operation changes a regular file's size or data mtime.
+    if (paths[i].content_stat_ok
+        && (st.st_size != paths[i].size
+            || (int64_t)st.st_mtim.tv_sec != paths[i].mtime_sec
+            || (uint32_t)st.st_mtim.tv_nsec != paths[i].mtime_nsec)) {
+      ++failed;
+      vlog(V_ERROR, opt, "gzstd: tar: kept " + p
+           + ": its size or modification time changed after it was archived\n");
       ::close(dfd);
       continue;
     }
@@ -13734,14 +13792,19 @@ struct TarEntry {
   std::string link;       // symlink target or hardlink referent ("" otherwise)
   std::string src;        // filesystem path to pread (regular files); also set for
                           // every member when --acls/--xattrs is on (gather source)
-  // The identity `src` had when the layout was built.  Set for the members whose
-  // DATA is read (regular files); the reader checks it before storing a byte.
+  // The identity and stat-visible content generation `src` had when the layout
+  // was built.  Set for members whose DATA is read (regular files); the reader
+  // checks them before storing a byte and again before releasing the descriptor.
   // Assembly opens `src` by NAME much later, so without this the bytes in the
   // archive are not provably from the entry that was walked — and --rm's removal
   // record, which is keyed to that entry, would then authorise deleting a file
   // whose contents the archive does not hold.  A mismatch is a changed member.
   dev_t       src_dev   = 0;
   ino_t       src_ino   = 0;
+  off_t       src_size  = 0;
+  // Seconds already live in `mtime` below for the tar header; retain only the
+  // subsecond part here rather than adding a full timespec to every layout entry.
+  uint32_t    src_mtime_nsec = 0;
   bool        src_id_ok = false;
   std::string pax;        // serialized PAX SCHILY.* records ("" = no extended header)
   uint64_t    size      = 0;   // data bytes (0 for dir/symlink/hardlink/special)
@@ -14103,7 +14166,9 @@ struct LayoutBuilder {
     if (opt.tar_remove_sources && cur_fspath_ && !cur_fspath_->empty() && cur_st_)
       g_tar_removal_paths.push_back(TarRemoval{
           tar_normalize_removal_path(*cur_fspath_), cur_st_->st_dev,
-          cur_st_->st_ino, S_ISDIR(cur_st_->st_mode)});
+          cur_st_->st_ino, cur_st_->st_size, (int64_t)cur_st_->st_mtim.tv_sec,
+          (uint32_t)cur_st_->st_mtim.tv_nsec, S_ISDIR(cur_st_->st_mode),
+          S_ISREG(cur_st_->st_mode)});
     e.hdr_off   = off;
     e.hdr_len   = entry_header_len(e);
     e.data_off  = off + e.hdr_len;
@@ -14246,17 +14311,24 @@ struct LayoutBuilder {
     // check below still decides whether any geometry may be used.
     int fd = ::open(p.fspath.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return;
-    // THE GEOMETRY MUST COME FROM THE INODE THE LAYOUT RECORDED.  This opens by
+    // THE GEOMETRY MUST COME FROM THE INODE AND STAT SNAPSHOT THE LAYOUT RECORDED.
+    // This opens by
     // pathname, so without the check a substitution here supplies a DIFFERENT
     // file's hole map for the entry that gets archived: assembly then reads the
     // real file only at the offsets that map describes and synthesises the rest
     // as holes.  There is no short read, so nothing is flagged — the archive
     // quietly holds a partial file, and --tar --rm deletes the original at exit
     // 0.  A data-determining operation that is not identity-bound is the same
-    // defect as the unbound reader, one step earlier.
+    // defect as the unbound reader, one step earlier.  Size+mtime catches only
+    // observable mutation; same-size bytes can change while the reported mtime
+    // stays equal because it was restored or the filesystem clock is coarse.
     struct stat pst{};
     if (::fstat(fd, &pst) != 0
-        || pst.st_dev != p.st.st_dev || pst.st_ino != p.st.st_ino) {
+        || pst.st_dev != p.st.st_dev || pst.st_ino != p.st.st_ino
+        || !S_ISREG(pst.st_mode)
+        || pst.st_size != p.st.st_size
+        || pst.st_mtim.tv_sec  != p.st.st_mtim.tv_sec
+        || pst.st_mtim.tv_nsec != p.st.st_mtim.tv_nsec) {
       ::close(fd);
       return;                 // no map ⇒ stored normally; the reader re-checks
     }
@@ -14277,6 +14349,16 @@ struct LayoutBuilder {
       if (hole < size) has_hole = true;         // hole after this data run
       pos = hole;
     }
+    // A hole-punch, truncate, or write can race the SEEK_DATA/SEEK_HOLE walk
+    // without changing the inode.  Do not publish geometry assembled across two
+    // content generations: the full-file reader is the conservative fallback.
+    struct stat after{};
+    if (::fstat(fd, &after) != 0
+        || after.st_dev != pst.st_dev || after.st_ino != pst.st_ino
+        || after.st_size != pst.st_size
+        || after.st_mtim.tv_sec  != pst.st_mtim.tv_sec
+        || after.st_mtim.tv_nsec != pst.st_mtim.tv_nsec)
+      ok = false;
     ::close(fd);
     if (ok && has_hole) {
       // GNU tar terminates the segment map with a zero-length entry at the real
@@ -14441,7 +14523,9 @@ struct LayoutBuilder {
         e.typeflag = '0'; e.size = (uint64_t)st.st_size; e.src = p.fspath;
         // Bind the bytes to the entry that was walked, so the reader can prove
         // later that it opened the same inode this record describes.
-        e.src_dev = st.st_dev; e.src_ino = st.st_ino; e.src_id_ok = true;
+        e.src_dev = st.st_dev; e.src_ino = st.st_ino;
+        e.src_size = st.st_size;
+        e.src_mtime_nsec = (uint32_t)st.st_mtim.tv_nsec; e.src_id_ok = true;
         // --sparse: this file has holes (Pass B built the segment map).
         // real_size = logical size; only the data segments are stored.
         if (!p.sparse_map.empty()) {
@@ -14891,9 +14975,38 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     std::string path;
     int         fd    = -1;
     int         err   = 0;
+    bool        err_reported = false;
     dev_t       dev   = 0;    // what fd actually refers to — checked before reuse
     ino_t       ino   = 0;
+    off_t       size  = 0;
+    struct timespec mtime {};
     bool        id_ok = false;
+  };
+  auto finish_src = [&](SrcCache & sc) {
+    if (sc.fd >= 0) {
+      // The open-time size+mtime check below binds the descriptor to Pass B's
+      // stat-visible generation.  Check once more before releasing a cached descriptor so a
+      // truncate/write/hole-punch DURING its preads cannot silently assemble a
+      // cross-generation member.  A later write is harmless without --rm (the
+      // archive already has the earlier snapshot) and is caught by TarRemoval
+      // when --rm was requested.  This is deliberately not described as a byte
+      // digest: same-size changed bytes with an unchanged reported mtime remain
+      // outside the bound, whether the time was restored or merely too coarse.
+      struct stat fin{};
+      if (sc.id_ok
+          && (::fstat(sc.fd, &fin) != 0
+              || fin.st_dev != sc.dev || fin.st_ino != sc.ino
+              || fin.st_size != sc.size
+              || fin.st_mtim.tv_sec  != sc.mtime.tv_sec
+              || fin.st_mtim.tv_nsec != sc.mtime.tv_nsec)) {
+        g_tar_had_errors.store(true, std::memory_order_relaxed);
+        vlog(V_ERROR, opt, "gzstd: tar: " + sc.path
+             + ": file changed as we read it\n");
+      }
+      ::close(sc.fd);
+    }
+    sc.fd = -1; sc.err = 0; sc.err_reported = false;
+    sc.dev = 0; sc.ino = 0; sc.size = 0; sc.mtime = {}; sc.id_ok = false;
   };
   auto assemble_chunk = [&](size_t ci, SrcCache & sc) -> Task {
     uint64_t a = (uint64_t)ci * chunk_size;
@@ -14934,9 +15047,12 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
               sc.path == e.src
               && (!e.src_id_ok
                   || (sc.fd >= 0 && sc.id_ok
-                      && sc.dev == e.src_dev && sc.ino == e.src_ino));
+                      && sc.dev == e.src_dev && sc.ino == e.src_ino
+                      && sc.size == e.src_size
+                      && (int64_t)sc.mtime.tv_sec == e.mtime
+                      && (uint32_t)sc.mtime.tv_nsec == e.src_mtime_nsec));
           if (!same_src) {
-            if (sc.fd >= 0) ::close(sc.fd);
+            finish_src(sc);
             // O_NONBLOCK on the open, then verify it is still a regular file.
             // The layout was built earlier, so a member can have been replaced
             // between then and now; if it became a FIFO, a blocking open waits
@@ -14944,7 +15060,8 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
             // chunk the pusher then waits on it and the whole assembly wedges.
             // A non-regular member is treated exactly like an unreadable one:
             // zero-filled, flagged, and the archive continues.
-            sc.dev = 0; sc.ino = 0; sc.id_ok = false;
+            sc.dev = 0; sc.ino = 0; sc.size = 0; sc.mtime = {};
+            sc.id_ok = false; sc.err_reported = false;
             sc.fd = ::open(e.src.c_str(), O_RDONLY | O_NONBLOCK);
             sc.err = (sc.fd < 0) ? errno : 0;
             if (sc.fd >= 0) {
@@ -14952,22 +15069,27 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
               if (::fstat(sc.fd, &mst) != 0 || !S_ISREG(mst.st_mode)) {
                 ::close(sc.fd); sc.fd = -1; sc.err = EINVAL;
               } else if (e.src_id_ok
-                         && (mst.st_dev != e.src_dev || mst.st_ino != e.src_ino)) {
+                         && (mst.st_dev != e.src_dev || mst.st_ino != e.src_ino
+                             || mst.st_size != e.src_size
+                             || (int64_t)mst.st_mtim.tv_sec != e.mtime
+                             || (uint32_t)mst.st_mtim.tv_nsec != e.src_mtime_nsec)) {
                 // IS THIS THE ENTRY THE LAYOUT DESCRIBED?  Being regular is not
                 // enough.  This open is by PATHNAME, long after the walk, so an
                 // exchange at that name puts a DIFFERENT file's bytes into the
                 // archive under this member's header — and with --tar --rm the
                 // removal record still names the walked inode, so the ORIGINAL
                 // gets deleted while the archive holds the substitute's bytes.
-                // Comparing against the walked identity is what makes "only what
-                // was archived is removed" true of the DATA and not just of the
-                // name.  A mismatch is exactly a changed-mid-read member, which
-                // is already a hard error that stops --rm entirely.
+                // Comparing against the walked identity and size+mtime snapshot
+                // catches an ordinary changed-mid-read member before accepting
+                // any bytes.  It is already a hard error that stops --rm entirely.
+                // This is not a digest: same-size changed bytes with an unchanged
+                // reported mtime remain outside the stated bound.
                 ::close(sc.fd); sc.fd = -1; sc.err = ESTALE;
               } else {
                 // Record what this descriptor actually is, so a later entry
                 // sharing the pathname must prove it wants THIS inode.
-                sc.dev = mst.st_dev; sc.ino = mst.st_ino; sc.id_ok = true;
+                sc.dev = mst.st_dev; sc.ino = mst.st_ino;
+                sc.size = mst.st_size; sc.mtime = mst.st_mtim; sc.id_ok = true;
                 // Clear O_NONBLOCK: on a regular file it does not affect reads,
                 // but leaving it set is a surprise for anything downstream.
                 const int fl = ::fcntl(sc.fd, F_GETFL);
@@ -14975,6 +15097,17 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
               }
             }
             sc.path = e.src;
+            // Report a rejected validated-open HERE, not only from read_seg.
+            // A wholly sparse PAX member can have a synthesized map block but no
+            // real data segment, so no read_seg call is guaranteed.  Missing this
+            // flag there allowed removal of other sources despite a member whose
+            // Pass B snapshot could not be validated at assembly time.
+            if (sc.fd < 0) {
+              g_tar_had_errors.store(true, std::memory_order_relaxed);
+              vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": cannot read ("
+                   + std::strerror(sc.err) + ")\n");
+              sc.err_reported = true;
+            }
           }
           // Read `len` bytes from file offset `foff` into the chunk at virtual
           // offset `voff`.  On short read the remainder stays zero (GNU parity).
@@ -15011,11 +15144,13 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
             }
             if (done < len) {
               g_tar_had_errors.store(true, std::memory_order_relaxed);
-              if (sc.fd < 0)
+              if (sc.fd < 0 && !sc.err_reported) {
                 vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": cannot read ("
                      + std::strerror(sc.err) + ")\n");
-              else
+                sc.err_reported = true;
+              } else if (sc.fd >= 0) {
                 vlog(V_ERROR, opt, "gzstd: tar: " + e.src + ": file changed as we read it\n");
+              }
             }
           };
           uint64_t s = std::max<uint64_t>(e.data_off, a), en = std::min<uint64_t>(de, b);
@@ -15122,7 +15257,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       rb_cv.notify_all();
     }
     mark(RD_EXIT, SIZE_MAX);
-    if (sc.fd >= 0) ::close(sc.fd);
+    finish_src(sc);
   };
 
   // Pusher: drain `ready` to the queue in strict sequence order.
@@ -26982,7 +27117,8 @@ static int gzstd_main(int argc, char ** argv)
       // Move the leaf out of the user-visible name before deciding whether it is
       // ours.  renameat2(NOREPLACE) makes both the quarantine acquisition and a
       // mismatch restoration atomic with respect to a replacement at either
-      // Into a PRIVATE DIRECTORY beside the input, for the same reason as
+      // name.  Move it into a PRIVATE DIRECTORY beside the input, for the same
+      // reason as
       // --overwrite: validate-then-unlink on a name another writer can
       // substitute is not safe, and the quarantine name is not secret.
       QuarantineDir rq;
@@ -27019,13 +27155,32 @@ static int gzstd_main(int argc, char ** argv)
       if (in_lid_ok && ::fstatat(rq.fd, "in", &qid, AT_SYMLINK_NOFOLLOW) == 0)
         quarantine_matches = qid.st_dev == in_lid.st_dev
                           && qid.st_ino == in_lid.st_ino;
-      if (!quarantine_matches) {
+      // For a non-symlink regular input, the pinned entry IS the data inode.  A
+      // writer can change that inode in place after compression and before this
+      // gate without disturbing dev+ino; deleting it would then discard bytes the
+      // installed output never contained.  Reading changes atime only, so size +
+      // data mtime remain stable on an honest run.  This detects only observable
+      // writes, not same-size changed bytes whose reported mtime stays equal
+      // (restored or hidden by timestamp granularity); proving arbitrary byte
+      // equality would require re-reading and digesting the input.  A symlink
+      // input is excluded: --rm removes the link, while its (possibly changed)
+      // target survives.
+      const bool content_stat_changed = quarantine_matches
+          && !S_ISLNK(in_lid.st_mode) && S_ISREG(in_id.st_mode)
+          && (qid.st_size != in_id.st_size
+              || qid.st_mtim.tv_sec  != in_id.st_mtim.tv_sec
+              || qid.st_mtim.tv_nsec != in_id.st_mtim.tv_nsec);
+      if (!quarantine_matches || content_stat_changed) {
         const int restore_rc =
             renameat_noreplace(rq.fd, "in", in_dir.fd, in_dir.base.c_str());
         if (restore_rc == 0) rq.release();     // exit() will not unwind; rmdir now
-        if (restore_rc == 0)
+        if (restore_rc == 0) {
+          if (content_stat_changed)
+            die_io("--rm: " + opt.input + " changed size or modification time after compression; "
+                   "it was restored and not removed — output kept at " + opt.output);
           die_io("--rm: " + opt.input + " was replaced during the run; replacement "
                  "restored and not removed — output kept at " + opt.output);
+        }
         // Restoration failed: the entry stays in the private directory rather
         // than being deleted, so it is NOT released here — the user is told where
         // it is.  Never unlink what could not be identified.
@@ -27034,8 +27189,10 @@ static int gzstd_main(int argc, char ** argv)
           die_io("--rm: " + opt.input + " reappeared while restoring a replacement; "
                  "both it and the set-aside entry (" + kept
                  + ") were preserved — output kept at " + opt.output);
-        die_io("--rm: the set-aside entry did not match the compressed input and "
-               "could not be restored; it was preserved at " + kept
+        die_io(std::string("--rm: the set-aside entry ")
+               + (content_stat_changed ? "changed after compression" :
+                                         "did not match the compressed input")
+               + " and could not be restored; it was preserved at " + kept
                + " — output kept at " + opt.output);
       }
 

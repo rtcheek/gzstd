@@ -57,11 +57,16 @@ fi
 # heavier / lower-value test groups that are skipped by default to keep the
 # common run fast.  Gate extra tests with `if $EXTENSIVE; then ... fi`.
 EXTENSIVE=false
+WANT_TIMING=false
 GZSTD=""
 for arg in "$@"; do
   case "$arg" in
     --extensive|-e) EXTENSIVE=true ;;
-    --help|-h) echo "Usage: $0 [path/to/gzstd] [--extensive]"; exit 0 ;;
+    --timing|-T) WANT_TIMING=true ;;
+    --help|-h) echo "Usage: $0 [path/to/gzstd] [--extensive] [--timing]"
+               echo "  --timing, -T   print the slowest tests and a coverage line at the end"
+               echo "                 (GZSTD_TEST_TIMING_FLOOR=0 also shows every per-line time)"
+               exit 0 ;;
     *) [[ -z "$GZSTD" ]] && GZSTD="$arg" ;;
   esac
 done
@@ -77,6 +82,9 @@ fi
 GZSTD=$(realpath "$GZSTD")
 
 TMPDIR=$(mktemp -d /tmp/gzstd-test.XXXXXX)
+# -T: collect every result's wall time here for the end-of-run summary.  Lives in
+# TMPDIR so the existing cleanup takes it; the per-line times print regardless.
+$WANT_TIMING && TIMING_LOG="$TMPDIR/.timings" || TIMING_LOG=""
 
 # ============================================================
 # CTRL-C handler & cleanup
@@ -113,9 +121,50 @@ SECTION_FAIL=0
 TEST_START_TIME=$(date +%s%N)  # nanoseconds for precision
 LAST_TEST_MS=0
 
-# Millisecond clock
-now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
-START_MS=$(now_ms)
+# WALL TIME ON EVERY RESULT LINE — the interval since the previous result, which
+# is this test's own work PLUS whatever fixture setup ran before it.  Including
+# the setup is the point.  Only 55 call sites use run_test(), so the old [Ns]
+# covered 102 of 546 results and accounted for 443 s of a 913 s run; the missing
+# half was in fixture generation that nothing timed.  Intervals need no per-test
+# edits and cannot miss any of it, because they tile the entire run.
+RESULT_MS=0
+# TIMING_LOG is set from -T up at TMPDIR creation; do not reset it here.
+# Below this a line is noise, not a lead.  500 ms keeps the normal output as
+# readable as it was; GZSTD_TEST_TIMING_FLOOR=0 shows every line when you are
+# hunting where a run actually goes.
+TIMING_FLOOR_MS="${GZSTD_TEST_TIMING_FLOOR:-500}"
+
+# Millisecond clock.  capture_now_ms sets a global so the hot result/progress
+# paths can call it DIRECTLY.  Returning the value through `$(now_ms)` would
+# itself fork a shell subshell even though $EPOCHREALTIME needs no external
+# command — the same cost this instrumentation is meant to avoid.  Keep the
+# printing wrapper for the older, non-hot call sites below.  Bash 4 falls back
+# to date, where the extra process is the lesser evil against not working.
+NOW_MS=0
+if [[ -n "${EPOCHREALTIME:-}" ]]; then
+  capture_now_ms() { local t=${EPOCHREALTIME/./}; NOW_MS=$(( ${t%???} )); }
+else
+  capture_now_ms() { NOW_MS=$(( $(date +%s%N) / 1000000 )); }
+fi
+now_ms() { capture_now_ms; echo "$NOW_MS"; }
+capture_now_ms; START_MS=$NOW_MS
+RESULT_MS=$START_MS
+
+# Called by pass/fail/skip: how long since the previous result line.  Sets the
+# global RESULT_DT rather than echoing it — a caller writing dt=$(result_ms ...)
+# runs this in a SUBSHELL, so the RESULT_MS update is discarded and every
+# interval is silently measured from process start instead. That is exactly what
+# the first version did: every test reported ~108 s and the coverage line came
+# out at 15164%. Absurd output caught it; a plausible wrong number would not
+# have, which is the argument for the coverage line existing at all.
+RESULT_DT=0
+result_ms() {
+  capture_now_ms; local now=$NOW_MS
+  RESULT_DT=$(( now - RESULT_MS )); RESULT_MS=$now
+  (( RESULT_DT < 0 )) && RESULT_DT=0
+  [[ -n "$TIMING_LOG" ]] && printf '%s\t%s\n' "$RESULT_DT" "$1" >> "$TIMING_LOG"
+  return 0
+}
 
 # ============================================================
 # Progress bar
@@ -139,7 +188,7 @@ progress_bar() {
   local filled=$(( current * BAR_WIDTH / total ))
   [[ $filled -gt $BAR_WIDTH ]] && filled=$BAR_WIDTH
   local empty=$(( BAR_WIDTH - filled ))
-  local elapsed_ms=$(( $(now_ms) - START_MS ))
+  capture_now_ms; local elapsed_ms=$(( NOW_MS - START_MS ))
   local elapsed_s=$(( elapsed_ms / 1000 ))
 
   # ETA calculation
@@ -199,11 +248,12 @@ fmt_ms() {
 
 pass() {
   PASS=$((PASS+1)); SECTION_PASS=$((SECTION_PASS+1)); TEST_NUM=$((TEST_NUM+1))
+  result_ms "$1"; local dt=$RESULT_DT
   clear_progress
   printf "  ${C_GREEN}${SYM_PASS}${C_RESET}  %s" "$1"
   [[ -n "${2:-}" ]] && printf "  ${C_DIM}%s${C_RESET}" "$2"
-  if (( LAST_TEST_MS > 500 )); then
-    printf "  ${C_DIM}[$(fmt_ms $LAST_TEST_MS)]${C_RESET}"
+  if (( dt >= TIMING_FLOOR_MS )); then
+    printf "  ${C_DIM}[$(fmt_ms $dt)]${C_RESET}"
   fi
   echo ""
   update_progress
@@ -211,11 +261,12 @@ pass() {
 
 fail() {
   FAIL=$((FAIL+1)); SECTION_FAIL=$((SECTION_FAIL+1)); TEST_NUM=$((TEST_NUM+1))
+  result_ms "$1"; local dt=$RESULT_DT
   clear_progress
   printf "  ${C_RED}${SYM_FAIL}${C_RESET}  ${C_RED}%s${C_RESET}" "$1"
   [[ -n "${2:-}" ]] && printf "  ${C_DIM} %s${C_RESET}" "$2"
-  if (( LAST_TEST_MS > 500 )); then
-    printf "  ${C_DIM}[$(fmt_ms $LAST_TEST_MS)]${C_RESET}"
+  if (( dt >= TIMING_FLOOR_MS )); then
+    printf "  ${C_DIM}[$(fmt_ms $dt)]${C_RESET}"
   fi
   echo ""
   update_progress
@@ -223,9 +274,15 @@ fail() {
 
 skip() {
   SKIP=$((SKIP+1)); TEST_NUM=$((TEST_NUM+1))
+  # A skip is timed too: it still paid for whatever fixture ran ahead of it, and
+  # a skip that costs seconds is worth seeing.
+  result_ms "$1"; local dt=$RESULT_DT
   clear_progress
   printf "  ${C_YELLOW}${SYM_SKIP}${C_RESET}  ${C_DIM}%s${C_RESET}" "$1"
   [[ -n "${2:-}" ]] && printf "  ${C_DIM} %s${C_RESET}" "$2"
+  if (( dt >= TIMING_FLOOR_MS )); then
+    printf "  ${C_DIM}[$(fmt_ms $dt)]${C_RESET}"
+  fi
   echo ""
   update_progress
 }
@@ -284,7 +341,7 @@ print_summary() {
   section_summary
 
   local total=$((PASS + FAIL + SKIP))
-  local elapsed_ms=$(( $(now_ms) - START_MS ))
+  capture_now_ms; local elapsed_ms=$(( NOW_MS - START_MS ))
   local elapsed_s=$(( elapsed_ms / 1000 ))
 
   echo ""
@@ -314,6 +371,21 @@ print_summary() {
     printf "  ${C_DIM}Completed in %dm%ds${C_RESET}\n\n" "$(( elapsed_s / 60 ))" "$(( elapsed_s % 60 ))"
   else
     printf "  ${C_DIM}Completed in %ds${C_RESET}\n\n" "$elapsed_s"
+  fi
+
+  # WHERE THE TIME WENT.  Printed only with -T, because the point of it is to be
+  # acted on, not read every run.  The COVERAGE line is the part that matters:
+  # the intervals should sum to the whole run, so if accounted is far below
+  # elapsed there is still time hiding somewhere no result line can see.
+  if [[ -n "$TIMING_LOG" && -s "$TIMING_LOG" ]]; then
+    local acct_ms
+    acct_ms=$(awk -F'\t' '{s+=$1} END{print s+0}' "$TIMING_LOG")
+    printf "  ${C_DIM}slowest tests (wall time incl. the fixture work before each):${C_RESET}\n"
+    sort -t$'\t' -k1,1 -rn "$TIMING_LOG" | head -15 | \
+      awk -F'\t' '{printf "    %7.1fs  %s\n", $1/1000, $2}'
+    printf "  ${C_DIM}accounted: %ds of %ds elapsed (%d%%)${C_RESET}\n\n" \
+      "$(( acct_ms / 1000 ))" "$elapsed_s" \
+      "$(( elapsed_s > 0 ? acct_ms / 10 / elapsed_s : 0 ))"
   fi
 }
 
@@ -348,6 +420,34 @@ export GZSTD_DEBUG_GPU_MIN_BYTES=0
 # engage.  The dedicated tests below set both hooks explicitly.
 export GZSTD_DEBUG_GPU_GUARD_SEC=0
 
+# ONE GPU BY DEFAULT — the single biggest cost in this suite is CUDA init, and it
+# scales with the number of visible devices, not with the work.  Measured on the
+# 8-GPU host, median of 5, on a 2 MB input where the compression itself is
+# instant:
+#     --cpu-only                        20 ms
+#     --gpu-only, 8 devices           4550 ms
+#     --gpu-only, 1 device            1210 ms
+#     --gpu-only, 2 devices           1535 ms
+# So roughly 850 ms of fixed cost plus ~470 ms per device, paid AGAIN by every
+# one of the ~40 GPU-forcing invocations here.  The suite's fixtures are far too
+# small to need eight GPUs; it was paying to initialise seven it never used.
+#
+# WHAT THIS COSTS, STATED PLAINLY: multi-GPU dispatch stops being exercised
+# incidentally.  Nothing here ever asserted on it — the only other reference to
+# this variable in the file sets it EMPTY to simulate a GPU-less host — so the
+# coverage was accidental, not designed.  It is replaced with a deliberate
+# multi-GPU test that opts back in by unsetting this (see "multi-GPU dispatch"),
+# which is better coverage than the accident it replaces.
+#
+# GZSTD_TEST_ALL_GPUS=1 restores every device for the whole run, for when you are
+# actually chasing a multi-GPU problem.
+if [[ -z "${GZSTD_TEST_ALL_GPUS:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" ]] \
+   && command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+  GPU_ALL_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+  export GPU_ALL_DEVICES
+  export CUDA_VISIBLE_DEVICES=0
+fi
+
 has_gpu() {
   ("$GZSTD" -V 2>&1 | grep -qi "nvcomp\|gpu\|cuda") 2>/dev/null && \
     command -v nvidia-smi &>/dev/null && \
@@ -379,8 +479,8 @@ human_size() {
 # (File management, Multi-file, Sparse, Threading, Stress, Help/version,
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
-EXPECTED_TESTS=408
-$EXTENSIVE && EXPECTED_TESTS=541
+EXPECTED_TESTS=417
+$EXTENSIVE && EXPECTED_TESTS=548
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -2156,8 +2256,15 @@ if has_gpu 2>/dev/null; then
   dd if=/dev/urandom bs=1M count=256 2>/dev/null  > "$share_src"
   dd if=/dev/zero    bs=1M count=256 2>/dev/null >> "$share_src"
 
-  # Round-trip correctness across the share range.
-  for share in 0.0 0.25 0.5 0.75 1.0; do
+  # Round-trip correctness across the share range.  THREE VALUES, NOT FIVE: the
+  # endpoints are the only distinct code paths — 0.0 is all-GPU, 1.0 is all-CPU,
+  # and any interior value is the same mixed path with a different constant.
+  # 0.25 and 0.75 exercised no branch 0.5 does not, and each cost ~11 s (two
+  # 512 MiB round-trips paying GPU init twice), so the sweep was 22 s to
+  # re-evaluate arithmetic.  The split's actual RESPONSE to the value is measured
+  # separately below at both extremes, which is the regression this section
+  # exists for.
+  for share in 0.0 0.5 1.0; do
     compressed="$TMPDIR/share-${share}.zst"
     recovered="$TMPDIR/share-${share}.dec"
     run_test "$GZSTD" --hybrid --cpu-share $share --chunk-size 4 \
@@ -2218,9 +2325,7 @@ if has_gpu 2>/dev/null; then
   rm -f "$share_src"
 else
   skip "--cpu-share=0.0 round-trip"          "no GPU"
-  skip "--cpu-share=0.25 round-trip"         "no GPU"
   skip "--cpu-share=0.5 round-trip"          "no GPU"
-  skip "--cpu-share=0.75 round-trip"         "no GPU"
   skip "--cpu-share=1.0 round-trip"          "no GPU"
   skip "--cpu-share banner shows percentage" "no GPU"
   skip "--cpu-share split responds to value" "no GPU"
@@ -2583,6 +2688,39 @@ section "GPU-specific options"
 
 if has_gpu 2>/dev/null; then
   LAST_TEST_MS=0
+
+  # MULTI-GPU DISPATCH — the one test that opts back in to every device.
+  # The suite pins CUDA_VISIBLE_DEVICES=0 because CUDA init scales with device
+  # count and dominates its runtime (see the note at the top).  That trade is
+  # only defensible if SOMETHING still drives more than one GPU deliberately,
+  # which nothing did before: multi-GPU was covered by accident, and an accident
+  # stops covering you the moment someone changes an unrelated default.
+  # Round-trips through every visible device and asserts the work actually
+  # reached more than one of them, rather than that the command merely exited 0.
+  if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
+    mg_log=$(CUDA_VISIBLE_DEVICES="$GPU_ALL_DEVICES" "$GZSTD" --gpu-only -vv \
+               --chunk-size 4 -k -f "$TMPDIR/large.bin" -o "$TMPDIR/mgpu.zst" 2>&1)
+    mg_used=$(printf '%s' "$mg_log" | grep -oE "GPU[0-9]+/S[0-9]+" \
+              | grep -oE "GPU[0-9]+" | sort -u | wc -l)
+    if [[ ! -s "$TMPDIR/mgpu.zst" ]]; then
+      fail "multi-GPU dispatch" "no output"
+    elif CUDA_VISIBLE_DEVICES="$GPU_ALL_DEVICES" "$GZSTD" -d --gpu-only -k -f \
+           "$TMPDIR/mgpu.zst" -o "$TMPDIR/mgpu.out" 2>/dev/null \
+         && files_match "$TMPDIR/large.bin" "$TMPDIR/mgpu.out"; then
+      if (( mg_used > 1 )); then
+        pass "multi-GPU dispatch round-trips across all devices" "($mg_used GPUs used)"
+      else
+        # Not a failure: one device may legitimately absorb a small fixture.
+        skip "multi-GPU dispatch round-trips across all devices" \
+             "work landed on $mg_used GPU; nothing to check"
+      fi
+    else
+      fail "multi-GPU dispatch" "round-trip mismatch across $GPU_ALL_DEVICES"
+    fi
+    rm -f "$TMPDIR/mgpu.zst" "$TMPDIR/mgpu.out"
+  else
+    skip "multi-GPU dispatch round-trips across all devices" "single GPU host"
+  fi
 
   # --gpu-streams
   for streams in 1 2 4; do
@@ -7004,13 +7142,15 @@ RMS_MATRIX
   fi
   rm -rf "$TMPDIR/trm"
 
-  # 1c-9f. --tar --rm REMOVES AN INODE IT ARCHIVED, NOT A NAME.
+  # 1c-9f. --tar --rm AUTHORIZES REMOVAL BY THE ARCHIVED INODE, NOT THE NAME.
   #     The first version of the removal list stored only the path, stat'd it at
   #     removal time, and let the CURRENT entry choose unlink-vs-rmdir. So
   #         mv d/a.txt d/saved.txt ; mv victim.txt d/a.txt
   #     deleted victim.txt, a file that had never been archived, at exit 0 —
   #     v0.15.89's defect reintroduced in brand-new code hours after it was
-  #     fixed, with a comment claiming the protection the code did not have.
+  #     fixed, with a comment claiming the protection the code did not have.  If
+  #     the archived inode moved away, gzstd does not search for and delete its new
+  #     name: it refuses the substituted old name, preserves both, and exits nonzero.
   #     The cells above cannot catch it: every one of them is a substitution-free
   #     run, so they exercise only the paths that were already correct.
   #     THE SWAP IS A RENDEZVOUS, NOT A RACE.  The first version of this cell
@@ -7046,17 +7186,284 @@ RMS_MATRIX
       printf go >&9
       exec 9>&-
     ' sh "$TMPDIR/trs" && trs_gated=1
-  wait "$trs_pid" 2>/dev/null
+  wait "$trs_pid" 2>/dev/null; trs_rc=$?
+  trs_now=$(cat "$TMPDIR/trs/d/a.txt" 2>/dev/null)
+  trs_saved=$(cat "$TMPDIR/trs/d/saved.txt" 2>/dev/null)
   if [ "$trs_gated" != 1 ]; then
-    fail "--tar --rm removes an archived inode, not a name" \
+    fail "--tar --rm refuses a substituted removal name" \
          "gzstd never reached the pre-removal gate (GZSTD_DEBUG_RM_GATE)"
-  elif [ -e "$TMPDIR/trs/d/a.txt" ]; then
-    pass "--tar --rm removes an archived inode, not a name"
+  elif [ "$trs_rc" = 0 ]; then
+    fail "--tar --rm refuses a substituted removal name" \
+         "exited 0 although the archived inode moved and was not removed"
+  elif [ "$trs_now" = "NEVER-ARCHIVED" ] && [ "$trs_saved" = "ARCHIVED" ]; then
+    pass "--tar --rm refuses a substituted name and preserves both entries"
   else
-    fail "--tar --rm removes an archived inode, not a name" \
-         "a file that was never archived was deleted through a substituted name"
+    fail "--tar --rm refuses a substituted removal name" \
+         "current='$trs_now' saved='$trs_saved' (both entries must survive)"
   fi
   rm -rf "$TMPDIR/trs"
+
+  # 1c-9f2. INODE IDENTITY IS NOT CONTENT IDENTITY.  An in-place write after
+  #     assembly keeps dev+ino unchanged, so the identity-only removal guard used
+  #     to delete bytes that arrived after the archive was complete and therefore
+  #     were not in it.  The existing removal FIFO makes this deterministic: keep
+  #     the pathname and inode fixed, replace its bytes at the gate, and force an
+  #     unmistakably different mtime even on a coarse/quiet filesystem.
+  rm -rf "$TMPDIR/trc"; mkdir -p "$TMPDIR/trc/d" "$TMPDIR/trc/x"
+  printf 'ORIGINAL\n' > "$TMPDIR/trc/d/a.txt"
+  mkfifo "$TMPDIR/trc/gate"
+  GZSTD_DEBUG_RM_GATE="$TMPDIR/trc/gate" \
+    timeout --foreground -k 10 120 \
+      "$GZSTD" --cpu-only -q --tar --rm -f -o "$TMPDIR/trc/t.zst" "$TMPDIR/trc/d" \
+        >"$TMPDIR/trc/err" 2>&1 &
+  trc_pid=$!
+  trc_gated=0
+  timeout 60 sh -c '
+      exec 9>"$1/gate" || exit 1
+      printf "CHANGED!\n" > "$1/d/a.txt" || exit 1
+      touch -m -d @2000000000 "$1/d/a.txt" || exit 1
+      printf go >&9
+      exec 9>&-
+    ' sh "$TMPDIR/trc" && trc_gated=1
+  wait "$trc_pid" 2>/dev/null; trc_rc=$?
+  ( cd "$TMPDIR/trc/x" && "$GZSTD" -d --cpu-only -q --tar "$TMPDIR/trc/t.zst" \
+      >/dev/null 2>&1 )
+  trc_arc=$(find "$TMPDIR/trc/x" -name a.txt -type f -exec cat {} \; 2>/dev/null)
+  trc_src=$(cat "$TMPDIR/trc/d/a.txt" 2>/dev/null)
+  if [ "$trc_gated" != 1 ]; then
+    fail "--tar --rm keeps an archived inode whose contents changed" \
+         "gzstd never reached the pre-removal gate"
+  elif [ "$trc_rc" = 0 ]; then
+    fail "--tar --rm keeps an archived inode whose contents changed" \
+         "exited 0 after the archived inode acquired unarchived bytes"
+  elif [ "$trc_src" != "CHANGED!" ]; then
+    fail "--tar --rm keeps an archived inode whose contents changed" \
+         "the post-archive contents were deleted or altered"
+  elif [ "$trc_arc" != "ORIGINAL" ]; then
+    fail "--tar --rm keeps an archived inode whose contents changed" \
+         "archive held '$trc_arc', expected the pre-gate bytes"
+  else
+    pass "--tar --rm keeps an archived inode whose contents changed after assembly"
+  fi
+  rm -rf "$TMPDIR/trc"
+
+  # Hardlinks exercise both sides of the mtime-not-ctime decision.  On a clean
+  # run, unlinking the first name changes the shared inode's ctime and MUST NOT
+  # make the second fail.  If the DATA is rewritten through either name before
+  # removal, shared mtime changes and BOTH names must be kept.
+  rm -rf "$TMPDIR/trh"; mkdir -p "$TMPDIR/trh/clean" "$TMPDIR/trh/live" "$TMPDIR/trh/x"
+  printf 'ORIGINAL\n' > "$TMPDIR/trh/clean/a"; ln "$TMPDIR/trh/clean/a" "$TMPDIR/trh/clean/b"
+  "$GZSTD" --cpu-only -q --tar --rm -f -o "$TMPDIR/trh/clean.zst" "$TMPDIR/trh/clean" \
+      >/dev/null 2>&1; trh_clean_rc=$?
+  printf 'ORIGINAL\n' > "$TMPDIR/trh/live/a"; ln "$TMPDIR/trh/live/a" "$TMPDIR/trh/live/b"
+  mkfifo "$TMPDIR/trh/gate"
+  GZSTD_DEBUG_RM_GATE="$TMPDIR/trh/gate" \
+    timeout --foreground -k 10 120 \
+      "$GZSTD" --cpu-only -q --tar --rm -f -o "$TMPDIR/trh/live.zst" "$TMPDIR/trh/live" \
+        >"$TMPDIR/trh/err" 2>&1 &
+  trh_pid=$!
+  trh_gated=0
+  timeout 60 sh -c '
+      exec 9>"$1/gate" || exit 1
+      printf "CHANGED!\n" > "$1/live/b" || exit 1
+      touch -m -d @2000000000 "$1/live/b" || exit 1
+      printf go >&9
+      exec 9>&-
+    ' sh "$TMPDIR/trh" && trh_gated=1
+  wait "$trh_pid" 2>/dev/null; trh_rc=$?
+  ( cd "$TMPDIR/trh/x" && "$GZSTD" -d --cpu-only -q --tar "$TMPDIR/trh/live.zst" \
+      >/dev/null 2>&1 )
+  trh_arc_a=$(find "$TMPDIR/trh/x" -name a -type f -exec cat {} \; 2>/dev/null)
+  trh_arc_b=$(find "$TMPDIR/trh/x" -name b -type f -exec cat {} \; 2>/dev/null)
+  trh_src_a=$(cat "$TMPDIR/trh/live/a" 2>/dev/null)
+  trh_src_b=$(cat "$TMPDIR/trh/live/b" 2>/dev/null)
+  trh_ia=$(stat -c '%d:%i' "$TMPDIR/trh/live/a" 2>/dev/null)
+  trh_ib=$(stat -c '%d:%i' "$TMPDIR/trh/live/b" 2>/dev/null)
+  if [ "$trh_clean_rc" != 0 ] || [ -e "$TMPDIR/trh/clean" ]; then
+    fail "--tar --rm content guard handles hardlinks" \
+         "clean hardlinks were not both removed (rc=$trh_clean_rc)"
+  elif [ "$trh_gated" != 1 ]; then
+    fail "--tar --rm content guard handles hardlinks" \
+         "gzstd never reached the pre-removal gate"
+  elif [ "$trh_rc" = 0 ]; then
+    fail "--tar --rm content guard handles hardlinks" \
+         "rewritten shared inode exited 0"
+  elif [ "$trh_src_a" != "CHANGED!" ] || [ "$trh_src_b" != "CHANGED!" ] \
+       || [ -z "$trh_ia" ] || [ "$trh_ia" != "$trh_ib" ]; then
+    fail "--tar --rm content guard handles hardlinks" \
+         "both changed hardlink names did not survive on one inode"
+  elif [ "$trh_arc_a" != "ORIGINAL" ] || [ "$trh_arc_b" != "ORIGINAL" ]; then
+    fail "--tar --rm content guard handles hardlinks" \
+         "archive does not hold the original shared contents"
+  else
+    pass "--tar --rm ignores unlink ctime but refuses shared-inode data mtime changes"
+  fi
+  rm -rf "$TMPDIR/trh"
+
+  # The same content-generation rule applies to plain --rm.  Its held O_PATH
+  # descriptor prevents inode-number reuse, but does not make the inode's bytes
+  # immutable while the completed output waits at the removal rendezvous.
+  rm -rf "$TMPDIR/prc"; mkdir -p "$TMPDIR/prc"
+  printf 'ORIGINAL\n' > "$TMPDIR/prc/a.txt"
+  mkfifo "$TMPDIR/prc/gate"
+  GZSTD_DEBUG_RM_GATE="$TMPDIR/prc/gate" \
+    timeout --foreground -k 10 120 \
+      "$GZSTD" --cpu-only -q --rm -f -o "$TMPDIR/prc/a.zst" "$TMPDIR/prc/a.txt" \
+        >"$TMPDIR/prc/err" 2>&1 &
+  prc_pid=$!
+  prc_gated=0
+  timeout 60 sh -c '
+      exec 9>"$1/gate" || exit 1
+      printf "CHANGED!\n" > "$1/a.txt" || exit 1
+      touch -m -d @2000000000 "$1/a.txt" || exit 1
+      printf go >&9
+      exec 9>&-
+    ' sh "$TMPDIR/prc" && prc_gated=1
+  wait "$prc_pid" 2>/dev/null; prc_rc=$?
+  prc_arc=$("$GZSTD" -dc --cpu-only "$TMPDIR/prc/a.zst" 2>/dev/null)
+  prc_src=$(cat "$TMPDIR/prc/a.txt" 2>/dev/null)
+  if [ "$prc_gated" != 1 ]; then
+    fail "plain --rm keeps an input whose contents changed after compression" \
+         "gzstd never reached the pre-removal gate"
+  elif [ "$prc_rc" = 0 ]; then
+    fail "plain --rm keeps an input whose contents changed after compression" \
+         "exited 0 after the compressed inode acquired uncompressed bytes"
+  elif [ "$prc_src" != "CHANGED!" ]; then
+    fail "plain --rm keeps an input whose contents changed after compression" \
+         "the post-compression contents were deleted or altered"
+  elif [ "$prc_arc" != "ORIGINAL" ]; then
+    fail "plain --rm keeps an input whose contents changed after compression" \
+         "output held '$prc_arc', expected the pre-gate bytes"
+  else
+    pass "plain --rm keeps an input whose contents changed after compression"
+  fi
+  rm -rf "$TMPDIR/prc"
+
+  # 1c-9g. A PATH IS NOT A SPELLING: `d/.` MUST NOT LEAVE d STANDING AT EXIT 0.
+  #     The removal record was the literal walked path, and the loop skipped a "."
+  #     basename SILENTLY — so this removed d's contents, left d, reported
+  #     "removed 2 archived source entries" having removed one, and exited 0.
+  #     No attacker and no race: a trailing dot a user is entitled to type.
+  #     Asserts all three halves: d is gone, the exit is 0, and the count is true.
+  rm -rf "$TMPDIR/rmd"; mkdir -p "$TMPDIR/rmd/d"
+  printf 'x' > "$TMPDIR/rmd/d/f"
+  rmd_out=$( cd "$TMPDIR/rmd" && "$GZSTD" --cpu-only --tar --rm -vv -f -o a.zst d/. 2>&1 )
+  rmd_rc=$?
+  rmd_n=$(printf '%s' "$rmd_out" | sed -n 's/.*--rm: removed \([0-9]*\) archived.*/\1/p')
+  if [ -e "$TMPDIR/rmd/d" ]; then
+    fail "--tar --rm normalises a trailing dot" "d survived a d/. source"
+  elif [ "$rmd_rc" != 0 ]; then
+    fail "--tar --rm normalises a trailing dot" "clean run exited $rmd_rc"
+  elif [ "$rmd_n" != 2 ]; then
+    fail "--tar --rm normalises a trailing dot" \
+         "reported '$rmd_n' removed entries; 2 were actually unlinked"
+  else
+    pass "--tar --rm normalises a trailing dot (and counts what it unlinked)"
+  fi
+  rm -rf "$TMPDIR/rmd"
+
+  # 1c-9h. A MISSING PARENT IS BENIGN ONLY IF WE REMOVED IT OURSELVES.
+  #     Two cells, because the fix has two halves and the obvious version of it
+  #     gets the second one wrong:
+  #       (a) duplicate roots (`--rm d d`) record every entry twice.  The second
+  #           pass finds the parent already removed BY US, which is not a failure
+  #           — this used to exit 3 on a run where everything asked for was done.
+  #       (b) a parent that vanished for any OTHER reason must STILL fail.  The
+  #           first proposal treated every missing parent as benign, which turns a
+  #           RENAMED parent — sources alive under the new name, nothing removed —
+  #           into a silent exit 0.  That is worse than the false failure it fixes.
+  rm -rf "$TMPDIR/rmk"; mkdir -p "$TMPDIR/rmk/d"
+  printf 'x' > "$TMPDIR/rmk/d/f"
+  ( cd "$TMPDIR/rmk" && "$GZSTD" --cpu-only -q --tar --rm -f -o a.zst d d >/dev/null 2>&1 )
+  rmk_rc=$?
+  if [ "$rmk_rc" != 0 ]; then
+    fail "--tar --rm duplicate roots" "exited $rmk_rc although every source was removed"
+  elif [ -e "$TMPDIR/rmk/d" ]; then
+    fail "--tar --rm duplicate roots" "d survived"
+  else
+    pass "--tar --rm duplicate roots exit 0 (parent we removed is not a failure)"
+  fi
+  rm -rf "$TMPDIR/rmk"
+
+  rm -rf "$TMPDIR/rmv"; mkdir -p "$TMPDIR/rmv/d/sub"
+  printf 'x' > "$TMPDIR/rmv/d/sub/f"
+  mkfifo "$TMPDIR/rmv/gate"
+  GZSTD_DEBUG_RM_GATE="$TMPDIR/rmv/gate" \
+    timeout --foreground -k 10 120 \
+      "$GZSTD" --cpu-only --tar --rm -f -o "$TMPDIR/rmv/a.zst" "$TMPDIR/rmv/d" \
+        >"$TMPDIR/rmv/err" 2>&1 &
+  rmv_pid=$!
+  rmv_gated=0
+  timeout 60 sh -c 'exec 9>"$1/gate" || exit 1; mv "$1/d/sub" "$1/moved" || exit 1;
+                    printf go >&9; exec 9>&-' sh "$TMPDIR/rmv" && rmv_gated=1
+  wait "$rmv_pid" 2>/dev/null; rmv_rc=$?
+  if [ "$rmv_gated" != 1 ]; then
+    fail "--tar --rm reports a parent that vanished for another reason" \
+         "gzstd never reached the pre-removal gate"
+  elif [ "$rmv_rc" = 0 ]; then
+    fail "--tar --rm reports a parent that vanished for another reason" \
+         "exited 0 while the sources survive at a renamed parent"
+  elif [ ! -e "$TMPDIR/rmv/moved/f" ]; then
+    fail "--tar --rm reports a parent that vanished for another reason" \
+         "the relocated source was removed anyway"
+  else
+    pass "--tar --rm fails loudly when a parent vanished for another reason"
+  fi
+  rm -rf "$TMPDIR/rmv"
+
+  # 1c-9i. THE SYMLINK REWRITE MUST NOT BREAK ORDINARY SYMLINKS.  The target used
+  #     to come from a pathname readlink taken separately from the identifying
+  #     lstat; it now comes from a pinned O_PATH descriptor via readlinkat(fd,"").
+  #     That rewrite touches every symlink member, so this pins the ordinary
+  #     cases: a normal link, a DANGLING link (a valid tar source), and a link
+  #     whose target is long enough to exercise the grow-until-short-read loop.
+  rm -rf "$TMPDIR/rml"; mkdir -p "$TMPDIR/rml/d"
+  printf 'DATA\n' > "$TMPDIR/rml/d/real"
+  ln -s real "$TMPDIR/rml/d/link"
+  ln -s /nonexistent-target "$TMPDIR/rml/d/dangle"
+  rml_long=$(printf 'y%.0s' $(seq 1 300))
+  ln -s "$rml_long" "$TMPDIR/rml/d/longlink"
+  rml_ok=1; rml_why=""
+  "$GZSTD" --cpu-only -q --tar -f -o "$TMPDIR/rml/a.zst" "$TMPDIR/rml/d" >/dev/null 2>&1 \
+    || { rml_ok=0; rml_why="$rml_why create:exit"; }
+  mkdir -p "$TMPDIR/rml/x"
+  ( cd "$TMPDIR/rml/x" && "$GZSTD" -d --cpu-only -q --tar "$TMPDIR/rml/a.zst" >/dev/null 2>&1 )
+  rml_l=$(find "$TMPDIR/rml/x" -name link -type l -exec readlink {} \; 2>/dev/null)
+  rml_d=$(find "$TMPDIR/rml/x" -name dangle -exec readlink {} \; 2>/dev/null)
+  rml_g=$(find "$TMPDIR/rml/x" -name longlink -exec readlink {} \; 2>/dev/null)
+  [ "$rml_l" = "real" ]              || { rml_ok=0; rml_why="$rml_why link:'$rml_l'"; }
+  [ "$rml_d" = "/nonexistent-target" ] || { rml_ok=0; rml_why="$rml_why dangle:'$rml_d'"; }
+  [ "$rml_g" = "$rml_long" ]         || { rml_ok=0; rml_why="$rml_why long:len${#rml_g}"; }
+  if [ "$rml_ok" = 1 ]; then
+    pass "--tar symlink targets survive the pinned readlinkat rewrite"
+  else
+    fail "--tar symlink targets" "failing cells:$rml_why"
+  fi
+  rm -rf "$TMPDIR/rml"
+
+  # 1c-9j. THE SPARSE PROBE MUST NOT BREAK ORDINARY SPARSE FILES.  probe_sparse()
+  #     now fstats its own descriptor against the recorded inode and opens
+  #     O_NONBLOCK (a regular→FIFO substitution used to block the walk forever).
+  #     Both changes sit in front of every --sparse member, so this pins the
+  #     ordinary path: a real hole map must still round-trip byte-identically.
+  rm -rf "$TMPDIR/rms2"; mkdir -p "$TMPDIR/rms2/d"
+  dd if=/dev/zero of="$TMPDIR/rms2/d/sp" bs=1M count=1 seek=8 2>/dev/null
+  printf 'END\n' >> "$TMPDIR/rms2/d/sp"
+  rms2_sum=$(sha256sum < "$TMPDIR/rms2/d/sp")
+  if "$GZSTD" --cpu-only -q --tar --sparse -f -o "$TMPDIR/rms2/a.zst" "$TMPDIR/rms2/d" \
+        >/dev/null 2>&1; then
+    mkdir -p "$TMPDIR/rms2/x"
+    ( cd "$TMPDIR/rms2/x" && "$GZSTD" -d --cpu-only -q --tar "$TMPDIR/rms2/a.zst" >/dev/null 2>&1 )
+    rms2_got=$(find "$TMPDIR/rms2/x" -name sp -exec sha256sum {} \; 2>/dev/null | cut -d' ' -f1)
+    if [ "$rms2_got" = "$(printf '%s' "$rms2_sum" | cut -d' ' -f1)" ]; then
+      pass "--tar --sparse round-trips byte-identically after the identity check"
+    else
+      fail "--tar --sparse round-trip" "content differs after restore"
+    fi
+  else
+    fail "--tar --sparse round-trip" "create failed"
+  fi
+  rm -rf "$TMPDIR/rms2"
 
   # 1c-8. THE CLOBBER GUARD ASKS ABOUT WHAT WILL BE DESTROYED, which for a plain
   #     compress means following the symlink — the open does. Answering it with a
