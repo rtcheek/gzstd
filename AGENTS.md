@@ -20,9 +20,9 @@ persists per-machine verdicts to `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json
 ```bash
 cmake -B build && cmake --build build -j$(nproc)     # GPU build (USE_NVCOMP=ON)
 cmake -B build-cpu -DUSE_NVCOMP=OFF && cmake --build build-cpu -j$(nproc)
-./gzstd-test.sh ./build/gzstd      # THE NORMAL RUN  (expect 371/0)
-./gzstd-test.sh ./build-cpu/gzstd  # CPU-only        (expect 290/0, 70 skipped)
-./gzstd-test.sh -e ./build/gzstd   # opt-in          (expect 504/0)
+./gzstd-test.sh ./build/gzstd      # THE NORMAL RUN  (expect 417/0)
+./gzstd-test.sh ./build-cpu/gzstd  # CPU-only        (expect 335/0, 70 skipped)
+./gzstd-test.sh -e ./build/gzstd   # opt-in          (expect 548/0)
 ```
 
 **The default run is the normal one.** Use `-e` only when the change is substantial enough
@@ -135,6 +135,28 @@ silently compiled out.
   workload-dependent.
 - The extract **writer** pool starts moderate and grows (filesystem contention past ~16),
   while the reader/decoder pools start high and contract. The asymmetry is intentional.
+- **THE GPU COMPRESS PATH IS HOST-BOUND, AND THE NUMBERS ARE MEASURED — do not re-derive them.**
+  Kernels are **71.8 GiB/s aggregate** (8 × 8.98, from `-vv` batch records) against **19.34 GiB/s**
+  for all 256 CPU cores; the pipeline delivers **3.0**. Per-worker phase accounting (`-vvv`,
+  v0.16.1) says workers block **75–82% on `wait_idle_stream`** with **zero** time waiting for
+  input: one `drainer` thread per device holds the `StreamCtx` ~100 ms/batch against ~25 ms of
+  submit, so **the drain is the per-device serializer**. That is why `--gpu-streams=2` does
+  nothing — extra contexts still funnel through one drain.
+- **`--pinned on` is measurably WORSE for H2D and that is why `pin_mode` defaults to OFF**:
+  memcpy→`cudaHostAlloc` 12.33 GiB/s against 23.38 for pageable straight from the reader's buffer.
+  Do not propose enabling it. It is an **H2D** verdict only — reusing that flag to gate D2H is the
+  one-flag-two-questions mistake.
+- **A page-locked D2H staging slab was tried (v0.16.2) and REVERTED: 26% slower** (3.25 → 2.40).
+  Byte-identical, purely a loss. It turns one transfer into a transfer *plus* a ~160 MiB host
+  memcpy per batch. **Rule: on this path any design that adds a host-side copy loses** — the
+  transfer was never the expensive part (96.4 GiB/s available across 8 devices; the app uses 1.4).
+- **`FrameVec::resize()` does NOT zero-fill.** `default_init_allocator` has been in place since
+  **v0.13.39** precisely to kill that memset. Benchmarks that model a memset overstate the D2H
+  cost by ~33%; a reviewer flagging "resize zero-fills before the copy overwrites it" is wrong.
+- **This box's NVMe reads at 4.56 GiB/s, so it CANNOT MEASURE a storage-to-storage GPU win** —
+  `--cpu-only` already sits at 98.5% of that ceiling. Benchmark the GPU path against RAM
+  sources/sinks here. That is a property of this host, **not** a reason to stop optimising the GPU
+  path: gzstd must be fast on machines we do not own.
 - Inline decode is the default for `-d --tar`; offload to the decode pool happens only
   when writers starve. Free when write-bound, 1.8x when decode-bound.
 - The GPU decode pool spawns lazily (only when the CPU pool is maxed, still starved, and

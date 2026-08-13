@@ -50,6 +50,38 @@ now.
 `-vvv` only; one clock read per transition when enabled, and the watchdog store is untouched
 either way.
 
+### Tried and reverted: a page-locked D2H staging slab (**26% slower**)
+
+Recorded because this is the obvious next move and it loses. The phase accounting above says
+shrink the drain, and the transfer numbers say page-locked async D2H is 50.00 GiB/s against
+21.57 blocking — so: allocate a bounded staging slab (`d2h_pinned_base`, a field that already
+existed unused), issue all readbacks async into it, one `cudaStreamSynchronize`, then `memcpy`
+out into the frame buffers. Bounded at 256 MiB/stream with its own budget, deliberately *not*
+gated on `pin_mode` (that flag is an H2D verdict, and applying it to D2H would be the
+one-flag-two-questions mistake).
+
+**Measured: 3.25 → 2.40 GiB/s.** Byte-identical output, purely a performance loss. Reverted.
+
+**Why, and it is the same trap as `--pinned on`:** today the readback lands *directly in the
+frame buffer* — one transfer. Staging makes it two, adding a **host memcpy of ~160 MiB per
+batch**. That copy costs more than the faster DMA saves. It is exactly why `--pinned on` is worse
+for H2D (12.33 vs 23.38 GiB/s) — a number quoted in the very comment written above the new code,
+while making the same mistake in the other direction.
+
+**The rule this yields: on this path, any design that adds a host-side copy loses**, however much
+faster the DMA becomes. The transfer was never the expensive part — 96.4 GiB/s is available
+across eight devices and the pipeline uses 1.4.
+
+So the only shape left is async D2H **directly into the frame buffers**, i.e. `cudaHostRegister`
+over the `out_pool` rather than a separate slab. That is harder than it looks: `FrameVec` buffers
+are `shared_ptr`s held by the writer for arbitrary time, and any `resize()` past capacity
+reallocates and silently invalidates the registration. It needs every pooled buffer reserved to
+`max_out_chunk + 4` once and never grown — enforced structurally, not by a comment.
+
+One aside worth recording: the D2H loop's `resize()` was briefly suspected of zero-filling. It
+does not — **v0.13.39** replaced `FrameBuf`'s allocator with `default_init_allocator` precisely to
+kill that memset. A benchmark that modelled the memset overstated today's cost by ~33%.
+
 ## v0.16.0 — the GPUs are not slow; two staging defects, and a lesson about which one mattered
 
 Opens the GPU performance chapter. `--gpu-only` delivers **3.0 GiB/s** while the eight devices'

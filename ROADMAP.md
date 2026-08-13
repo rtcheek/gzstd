@@ -104,6 +104,35 @@ stat-visible stability rather than content identity.
 
 ---
 
+## ACTIVE: GPU staging — the drain thread is the per-device serializer
+
+**The GPU hardware is ~3.7× the CPU and the pipeline delivers 4.2% of it.** Kernels are
+**71.8 GiB/s aggregate** against **19.34** for all 256 cores; `--gpu-only` delivers **3.0**.
+Nothing is wrong with nvCOMP — everything is wrong with the host staging around it.
+
+Per-worker phase accounting (`-vvv`, v0.16.1) localised it in one line: workers block
+**75–82% on `wait_idle_stream`**, with **zero** time waiting for input. One `drainer` thread per
+device holds the `StreamCtx` ~100 ms/batch against ~25 ms of submit, so extra streams cannot help
+(`--gpu-streams=2` changes nothing — they funnel through the same drain).
+
+**Next change: async D2H directly into the frame buffers** — `cudaHostRegister` over the
+`out_pool`, so the readback is page-locked *and* copy-free.
+
+- **Do not use a staging slab.** Tried at v0.16.2, **26% slower** (3.25 → 2.40), reverted; see the
+  CHANGELOG. It adds a ~160 MiB host memcpy per batch, and *any design that adds a host-side copy
+  loses here* — the transfer was never the expensive part.
+- **The hard part is ownership, not CUDA.** `FrameVec` buffers are `shared_ptr`s held by the
+  writer for arbitrary time, and any `resize()` past capacity reallocates and **silently
+  invalidates the registration**. Every pooled buffer must be reserved to `max_out_chunk + 4`
+  once and never grown — enforced structurally, not by a comment saying "don't grow this".
+- **Benchmark against RAM sources/sinks on this host.** Its NVMe reads at 4.56 GiB/s and
+  `--cpu-only` already hits 98.5% of that, so a storage-to-storage run here cannot *measure* the
+  win. That is a limit of the box, not of the work.
+
+Also still unbound: `--acls/--xattrs` metadata gathering reopens the path, and the H2D content
+checksum is now parallelised but still host-side (a GPU-side XXH64 is awkward — the algorithm is
+sequential across stripes, so only ~4 lanes × chunks of parallelism).
+
 ## Tooling gap: `gzstd-benchmark.sh` has NO `--tar` coverage
 
 The benchmark sweeps plain compress/decompress across batch sizes, streams, threads and levels.
@@ -1123,7 +1152,21 @@ verbatim) without breaking existing gzstd scripts using `--format=gnu`.
 
 ## Phase 9: GPUDirect Storage — NVMe-to-VRAM P2P DMA (research, proposed 2026-08-06)
 
-**Priority: Medium | Complexity: High | Status: NOT STARTED — measure first**
+**Priority: Medium | Complexity: High | Status: NOT STARTED — and still NEVER ACTUALLY RUN**
+
+> **2026-08-13 note.** This was once written off on the arithmetic that the drive (4.56 GiB/s)
+> has 5× less bandwidth than the H2D link (25+ GiB/s), so removing the host bounce optimises a
+> link with margin. That reasoning is sound *for this host* and is not a verdict on the feature:
+> gzstd has to be fast on machines we do not own, and a box with a fast array or NVMe-oF inverts
+> the premise. **It has never been measured, only argued about, and it should be tried.**
+> The blocker here is environmental, not architectural: `nvidia-fs-dkms` is absent, so `cuFile`
+> falls back to compat mode — literally "POSIX read into a host bounce buffer, then cudaMemcpy",
+> strictly worse than today — and the IOMMU is in DMA-FQ mode, needing a GRUB change plus a
+> reboot of an 8×H100 box. Also note the GPU→SSD *write* direction has never been examined at
+> all; the original analysis only covered SSD→GPU.
+> **Before spending the reboot, finish the staging work above** — the pipeline currently delivers
+> 3.0 GiB/s against 71.8 GiB/s of kernel capability, so the host path, not the storage link, is
+> what is throwing performance away.
 
 Read compressed frames from NVMe **directly into GPU memory**, and write decompressed
 output **directly from GPU memory to NVMe**, via NVIDIA GPUDirect Storage (the `cuFile`
