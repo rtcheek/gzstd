@@ -104,6 +104,36 @@ stat-visible stability rather than content identity.
 
 ---
 
+## Tooling gap: `gzstd-benchmark.sh` has NO `--tar` coverage
+
+The benchmark sweeps plain compress/decompress across batch sizes, streams, threads and levels.
+It does not invoke `--tar` **at all** — zero occurrences in the script. So the entire tar path is
+unbenchmarked: archive creation, the assembly reader, the parallel extract path, and seek-extract.
+
+**Why this matters more than it looks.** Most of the correctness work in v0.14.x–v0.15.x landed in
+exactly that path, including per-member identity validation added to the assembly reader's hot
+loop in v0.15.95–97. When performance was finally checked after that arc, the benchmark could not
+answer the question — it exercises none of the changed code — and the check had to be done with a
+hand-built A/B against a `git worktree` of the previous release. That is not repeatable and it is
+not recorded anywhere the next person will look.
+
+What it should cover, in rough priority:
+
+1. **`--tar` create** on two corpora, because they stress different things and the first one
+   hides regressions in the second: a few large members (throughput-bound, ~12 GiB) and *many
+   small* members (per-member-bound, ~40k files). The v0.15.97 check found no regression on
+   either, but only the second could have detected a per-member cost at all.
+2. **`-d --tar` extract**, both the parallel and the serial fallback paths.
+3. **Seek-extract** (`-d --tar ARCHIVE MEMBER...`) against an indexed archive — the one path with
+   a completely different cost model, since it preads only the frames a selection touches.
+4. Compare against `tar --zstd` for the same reason the `-l` output is compared against
+   `tar -tvf`: parity claims need a measured baseline, not an assertion.
+
+Until this exists, **any statement about tar performance is unmeasured** — the suite proves
+correctness there and nothing proves speed.
+
+---
+
 ## Phase 1: Scheduling Overhaul
 
 ### 1.1 Remove 2-GPU Decompress Cap
