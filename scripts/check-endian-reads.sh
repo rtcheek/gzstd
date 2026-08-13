@@ -113,6 +113,12 @@ pattern="(${addr}[^;]*${width}|\w+[[:space:]]*\([^;]*${width}[^;]*${addr})"
 declare -a ALLOW_CALLEE=(
   'cudaMalloc'                   # &ptr out-param for a device allocation, not a read
   'cudaMemcpy'                   # device<->host copy; same endianness, no file
+  'cudaMemcpyAsync'              # likewise — and it must be listed SEPARATELY:
+                                 # exemptions are matched as `name(`, so the
+                                 # cudaMemcpy entry above does NOT cover the
+                                 # Async spelling.  v0.16.2 moved the drain's
+                                 # readbacks onto their own stream and the
+                                 # rename alone tripped this check.
   'localtime_r'                  # &time_t in, struct tm out; not a field read
   'nvmlDeviceGetHandleByIndex'   # &handle out-param from the NVML driver
   'getpwuid_r'                   # &passwd out-param; no on-disk integer field

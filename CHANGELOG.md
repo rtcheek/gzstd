@@ -1,11 +1,100 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.1  
+**Covers:** v0.9.50 → v0.16.2  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.16.2 — the drain was barriering the whole device, and two D2H fixes that lost
+
+v0.16.1 named the symptom: workers block 75–82% on `wait_idle_stream`, behind their own drain
+thread. This finds the mechanism, and it is one line of CUDA semantics.
+
+**gzstd creates its streams with `cudaStreamCreate` — *blocking* streams.** Anything issued on the
+legacy null stream is therefore an implicit **device-wide barrier**: it waits for every other
+stream on the device, and every other stream waits for it. And `gpu_drain_batch` read every frame
+back with a *blocking, null-stream* `cudaMemcpy` — two for the metadata plus **one per chunk**, so
+at batch=256 that is **up to 258 full-device barriers per batch**. `gpu_verify_check` added two
+more under `--verify`, and the decompress drain had the identical defect.
+
+That is why the three GPU stages measured as strictly serial, summing to 98 ms/batch instead of
+overlapping, and why `--gpu-streams=2` had never bought anything: a second context cannot overlap
+anything through a device-wide barrier. The "single stream avoids context-switch overhead"
+default was measuring this defect, not context switches.
+
+**The fix** issues every readback as `cudaMemcpyAsync` on the batch's own stream, closed by a
+single `cudaStreamSynchronize` — so frames are stamped and published in a second pass, because a
+copy has not landed until the sync. No page-locking, no extra allocation, no init cost.
+
+Measured at **195.3 GiB** (see below on why that size), 4 interleaved reps, min–max:
+
+| config | seconds |
+|---|---|
+| baseline `--gpu-streams=2` | 17.54–19.23 |
+| **fixed `--gpu-streams=2`** | **16.12–17.09** |
+| baseline `--gpu-streams=4` | 17.76–18.64 |
+| **fixed `--gpu-streams=4`** | **15.56–16.32** |
+
+Both matched pairs are non-overlapping. Every *baseline* stream count overlaps every other —
+extra streams really were inert before.
+
+### The stream default was split, because the two directions measured opposite ways
+
+| | compress / `-t` | decompress |
+|---|---|---|
+| new default | **2** | **1** |
+| sweep, 195 GiB | s1 17.00–18.95, s2 16.14–16.91, s4 15.72–16.80, s8 14.77–16.49 | s1 13.23–13.69, s2 14.40–14.88, s4 16.11–17.46, s8 21.68–23.19 |
+
+Compress: s1 is clearly worst and s2/s4/s8 are statistically tied, so take the cheapest — extra
+streams split one VRAM budget into smaller per-stream batches, which costs most on a small card.
+
+Decompress gets monotonically worse, every neighbour non-overlapping, and the reason is
+structural: **decompression expands.** Its D2H moves 195.31 GiB against 53.97 GiB of H2D, making
+D2H the dominant stage (21.3 s of 41.5 s of batch time) — and a device has one PCIe link, so more
+streams do not add bandwidth, they just split the same link and widen out-of-order completion
+against an in-order writer (head-of-line blocking 34.1%, average 131 frames stuck). There is
+nothing to hide the dominant stage behind. Compress shrinks 59.60 GiB to 16.51 GiB and has a
+39.7 ms/batch kernel for transfers to overlap with, which is why it benefits and decompress
+cannot.
+
+`gpu_streams == 0` already meant "auto" and is resolved in one place where the mode is known, so
+this needed no new user-set flag — and it mirrors the existing `DEFAULT_GPU_BATCH_CAP` /
+`DEFAULT_GPU_DECOMP_BATCH_CAP` split.
+
+### Benchmark at 195 GiB, not 20 — the old size was measuring ramp-up
+
+`--gpu-only` on this box is **3.25 GiB/s at 19.53 GiB, 6.55 at 59.60, and 10.7 at 195.3**. The
+batch tuner climbs 8 → 256 over the run and 1.4 s of CUDA init is a 23% tax on a 6 s run. Every
+GPU figure this project has recorded from a ~20 GiB file was measuring the ramp, so v0.16.0's
+headline — "the GPUs deliver 3.00 GiB/s, 4.2% of kernel capability" — was an artefact of
+benchmark size. Run-to-run spread here is ~10%; nothing under about four interleaved reps is a
+result. A single 64 GiB pair reported the exact opposite of the four-rep answer during this work.
+
+### Two D2H rewrites that were built, measured, and rejected
+
+Both made the transfer dramatically faster and both lost end-to-end. Recorded so neither is tried
+a third time.
+
+**A pinned staging slab** (async D2H into page-locked memory, then `memcpy` into the frame):
+3.25 → 2.40 GiB/s, a 26% regression. It turned one transfer into a transfer plus a ~160 MiB host
+memcpy per batch, and the transfer was never the expensive part.
+
+**`cudaHostRegister` over the frame buffers themselves** — the only shape with no extra copy.
+Mechanically it worked: D2H 2.72 → 6.88 GiB/s, per-batch total 60.7 → 45.3 ms. End-to-end it was
+*monotonically slower the more memory was page-locked* — 0/2/4/8/16 slots per stream measured
+5.81–6.29 / 6.34–6.70 / 6.58–6.82 / 7.06–7.50 / 8.05–8.49 s — and it still lost at 195 GiB
+(18.33–19.61 vs 15.89–17.80) with the interleaving isolated out.
+
+The reason is a rule worth keeping: **page-locking costs about as much per byte as the copy it
+accelerates** — `cudaHostRegister` runs at ~0.21 ms/MiB, is serialised driver-wide (eight threads
+on eight devices took the same wall time as one thread doing all of it), and is charged per-byte
+rather than per-call, so a slab cannot amortise it either. Meanwhile the D2H it replaces was
+already hidden behind the drain thread. It can only pay where D2H is genuinely on the critical
+path and the buffers are reused enough, which is not this pipeline. The patch is kept out of tree
+against a future where compression ratio is poor enough that D2H dominates.
 
 
 ## v0.16.1 — per-worker phase accounting, and it names the bottleneck in one line

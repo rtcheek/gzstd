@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.1";
+static constexpr const char * GZSTD_VERSION = "0.16.2";
 //
 // Architecture overview:
 //
@@ -1104,7 +1104,26 @@ static const size_t DEFAULT_GPU_DECOMP_BATCH_CAP = 16;  // sweet spot: amortizes
 // stream up front.  HARD_BATCH_CAP is the hard ceiling above this.
 static const size_t AUTO_TUNE_BATCH_CEILING = 256;
 static const double DEFAULT_GPU_MEM_FRACTION = 0.60; // fraction of free VRAM to use
-static const size_t DEFAULT_GPU_STREAMS = 1;       // single stream avoids context-switch overhead
+// Auto stream counts, per direction — they measured OPPOSITE ways, so one
+// number cannot serve both (same reason --gpu-batch already has two caps).
+//
+// This was 1 for everything, on the rationale that a single stream avoids
+// context-switch overhead.  That rationale was measuring a defect: the drain
+// read frames back with BLOCKING NULL-STREAM copies, and gzstd's streams are
+// created with cudaStreamCreate (blocking), so every one of those was an
+// implicit device-wide barrier — up to 258 per batch at batch=256.  Extra
+// streams could not overlap anything through it.  With the readbacks moved onto
+// their own stream, compress at 195 GiB measured s1 17.00-18.95 s against
+// s2 16.14-16.91 (non-overlapping); s2/s4/s8 are indistinguishable from each
+// other, so take the cheapest of them — more streams split the same VRAM budget
+// into smaller per-stream batches, which costs most on a small card.
+static const size_t DEFAULT_GPU_STREAMS = 2;
+// Decompress went the other way, monotonically and with NO overlap between
+// neighbours: s1 13.23-13.69, s2 14.40-14.88, s4 16.11-17.46, s8 21.68-23.19.
+// Its frames are whole decompressed chunks delivered one at a time so the writer
+// can drain frame N while N+1 transfers; extra streams add contention and
+// out-of-order delivery against that, with no phase left to overlap.
+static const size_t DEFAULT_GPU_DECOMP_STREAMS = 1;
 static const double GROW_CHECK_SEC = 0.3;  // auto-tune check interval (seconds)
 static const size_t HARD_BATCH_CAP = 1024;        // per stream safety cap
 #endif
@@ -19749,6 +19768,10 @@ struct StreamCtx {
   // the cap instead of waiting.  See its body.
   std::vector<FrameBuf> out_pool;
   uint64_t out_pool_waits = 0;
+  // Frames held across the drain's readback window.  The readback is issued on
+  // C.stream and only lands at the stream synchronize, so a frame cannot be
+  // checksummed or published in the same pass that starts its copy.
+  std::vector<FrameBuf> drain_bufs;
   FrameBuf acquire_out_buf(size_t cap, FrameThrottle * bp) {
     (void)bp;
     // GPU-fault abort: the writer stops draining, so pool slots may never
@@ -20064,12 +20087,14 @@ static inline void gpu_frame_set_checksum(FrameVec & f, size_t csz, uint32_t ck)
 static void gpu_verify_check(StreamCtx & C, const Options & opt)
 {
   if (!opt.verify || !C.d_verify_base) return;
-  checkCuda(cudaMemcpy(C.h_verify_stats.data(), C.d_verify_stats,
-                       sizeof(nvcompStatus_t) * C.filled, cudaMemcpyDeviceToHost),
-            "cudaMemcpy(D2H verify statuses)");
+  // On C.stream, not the null stream — see the barrier note in gpu_drain_batch.
+  checkCuda(cudaMemcpyAsync(C.h_verify_stats.data(), C.d_verify_stats,
+                            sizeof(nvcompStatus_t) * C.filled, cudaMemcpyDeviceToHost, C.stream),
+            "cudaMemcpyAsync(D2H verify statuses)");
   int v_mism = 0;
-  checkCuda(cudaMemcpy(&v_mism, C.d_verify_mismatch, sizeof(int), cudaMemcpyDeviceToHost),
-            "cudaMemcpy(D2H verify mismatch)");
+  checkCuda(cudaMemcpyAsync(&v_mism, C.d_verify_mismatch, sizeof(int), cudaMemcpyDeviceToHost, C.stream),
+            "cudaMemcpyAsync(D2H verify mismatch)");
+  checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(D2H verify)");
   for (size_t i = 0; i < C.filled; ++i)
     if (C.h_verify_stats[i] != nvcompSuccess)
       throw std::runtime_error("GPU verify: a frame failed to decompress (compressed output is corrupt)");
@@ -20368,8 +20393,18 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   const bool tr = (opt.verbosity >= V_TRACE);
   uint64_t ns_meta = 0, ns_acq = 0, ns_size = 0, ns_copy = 0, ns_ck = 0, ns_push = 0;
   uint64_t t_a = tr ? now_ns() : 0;
-  checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses)");
-  checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes)");
+  // EVERY readback in this function runs on THIS BATCH'S STREAM, never on the
+  // legacy default stream.  gzstd creates its streams with cudaStreamCreate,
+  // i.e. *blocking* streams, so a null-stream cudaMemcpy is an implicit
+  // device-wide barrier: it waits for every other stream on the device and every
+  // other stream waits for it.  The drain used to issue one per chunk plus two
+  // for the metadata — up to 258 full-device barriers per batch — which is why
+  // H2D, kernel and D2H measured as three SERIAL stages summing to 98 ms/batch
+  // instead of overlapping, and why --gpu-streams=2 bought nothing: a second
+  // context cannot overlap anything through a device-wide barrier.
+  checkCuda(cudaMemcpyAsync(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost, C.stream), "cudaMemcpyAsync(D2H statuses)");
+  checkCuda(cudaMemcpyAsync(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost, C.stream), "cudaMemcpyAsync(D2H comp_sizes)");
+  checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(D2H meta)");
   gpu_verify_check(C, opt);
   if (tr) ns_meta = now_ns() - t_a;
   // Measure per-phase timing from CUDA events
@@ -20385,39 +20420,69 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   }
 
   uint64_t in_sum = 0, out_sum = 0;
-  for (size_t i=0;i<C.filled;++i) {
+  // Statuses are already on the host, so check them ALL before issuing a copy.
+  // Throwing from inside the readback window below would unwind with a transfer
+  // still in flight into a frame buffer the unwind is about to release.
+  for (size_t i=0;i<C.filled;++i)
     if (C.h_stats[i] != nvcompSuccess) throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
-    const size_t csz = C.h_comp_sizes[i]; out_sum += csz; in_sum += C.h_in_sizes[i];
-    if (tr) t_a = now_ns();
-    auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
-    if (tr) ns_acq += now_ns() - t_a;
-    const void * d_src = static_cast<char*>(C.d_out_base)
-                         + i * C.max_out_chunk;
-    // Size ONCE for frame + checksum trailer, so stamping the checksum below
-    // cannot reallocate.  FrameVec's allocator default-inits, so this is a size
-    // change only — no zero-fill of the region the copy is about to overwrite.
-    if (tr) t_a = now_ns();
-    h_out->resize(csz + 4);
-    if (tr) { ns_size += now_ns() - t_a; t_a = now_ns(); }
-    if (C.h2d_pinned_base) {
-      // Reuse the H2D pinned slot for D2H — input was already
-      // consumed by the GPU, slot is free until next batch's pop.
-      void * pin_slot = static_cast<char*>(C.h2d_pinned_base)
-                        + i * C.h_io_slot_bytes;
-      checkCuda(cudaMemcpy(pin_slot, d_src, csz,
-                           cudaMemcpyDeviceToHost),
-                "cudaMemcpy(D2H pinned shared slot)");
-      std::memcpy(h_out->data(), pin_slot, csz);
-    } else {
-      checkCuda(cudaMemcpy(h_out->data(), d_src, csz,
-                           cudaMemcpyDeviceToHost),
-                "cudaMemcpy(D2H exact)");
+
+  // ---- PASS 1: size each frame and issue its readback on C.stream ----------
+  // Nothing may be checksummed or published here — the copies have not landed
+  // until the synchronize that closes the window.
+  C.drain_bufs.assign(C.filled, FrameBuf{});
+  try {
+    for (size_t i=0;i<C.filled;++i) {
+      const size_t csz = C.h_comp_sizes[i]; out_sum += csz; in_sum += C.h_in_sizes[i];
+      if (tr) t_a = now_ns();
+      auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
+      if (tr) ns_acq += now_ns() - t_a;
+      const void * d_src = static_cast<char*>(C.d_out_base)
+                           + i * C.max_out_chunk;
+      // Size ONCE for frame + checksum trailer, so stamping the checksum below
+      // cannot reallocate.  FrameVec's allocator default-inits, so this is a size
+      // change only — no zero-fill of the region the copy is about to overwrite.
+      if (tr) t_a = now_ns();
+      h_out->resize(csz + 4);
+      if (tr) { ns_size += now_ns() - t_a; t_a = now_ns(); }
+      if (C.h2d_pinned_base) {
+        // Reuse the H2D pinned slot for D2H — input was already
+        // consumed by the GPU, slot is free until next batch's pop.
+        void * pin_slot = static_cast<char*>(C.h2d_pinned_base)
+                          + i * C.h_io_slot_bytes;
+        checkCuda(cudaMemcpyAsync(pin_slot, d_src, csz,
+                                  cudaMemcpyDeviceToHost, C.stream),
+                  "cudaMemcpyAsync(D2H pinned shared slot)");
+        // The staging slot is reused per chunk, so this one must land before the
+        // memcpy out of it — and before the next chunk overwrites the slot.
+        checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(D2H pinned slot)");
+        std::memcpy(h_out->data(), pin_slot, csz);
+      } else {
+        checkCuda(cudaMemcpyAsync(h_out->data(), d_src, csz,
+                                  cudaMemcpyDeviceToHost, C.stream),
+                  "cudaMemcpyAsync(D2H exact)");
+      }
+      if (tr) ns_copy += now_ns() - t_a;
+      C.drain_bufs[i] = std::move(h_out);
     }
-    if (tr) ns_copy += now_ns() - t_a;
     if (tr) t_a = now_ns();
-    gpu_frame_set_checksum(*h_out, csz, C.h_checksums[i]);  // self-verifying frame
+    checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(D2H frames)");
+    if (tr) ns_copy += now_ns() - t_a;
+  } catch (...) {
+    // Close the window before unwinding, whatever went wrong: no transfer may
+    // still be landing in a buffer once these shared_ptrs are released.
+    cudaStreamSynchronize(C.stream);
+    cudaGetLastError();
+    C.drain_bufs.clear();
+    throw;
+  }
+
+  // ---- PASS 2: the bytes have landed — stamp and publish -------------------
+  for (size_t i=0;i<C.filled;++i) {
+    const size_t csz = C.h_comp_sizes[i];
+    if (tr) t_a = now_ns();
+    gpu_frame_set_checksum(*C.drain_bufs[i], csz, C.h_checksums[i]);  // self-verifying frame
     if (tr) { ns_ck += now_ns() - t_a; t_a = now_ns(); }
-    results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
+    results->push_to_slot(slot_index, C.batch[i].seq, std::move(C.drain_bufs[i]));
     if (tr) ns_push += now_ns() - t_a;
     // First frame this GPU actually DELIVERED — the earliest proof the device
     // did real work.  Set here, not at worker spawn: a worker that starts and
@@ -20430,10 +20495,13 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
     // CPU-only rebuild path.  Disabled unless GZSTD_DEBUG_FAIL_GPU_AFTER set.
     if (g_debug_fail_gpu_after >= 0) {
       static std::atomic<int64_t> dbg_delivered{0};
-      if (dbg_delivered.fetch_add(1) + 1 > g_debug_fail_gpu_after)
+      if (dbg_delivered.fetch_add(1) + 1 > g_debug_fail_gpu_after) {
+        C.drain_bufs.clear();
         throw std::runtime_error("simulated GPU fault (GZSTD_DEBUG_FAIL_GPU_AFTER)");
+      }
     }
   }
+  C.drain_bufs.clear();
   double d2h_ms = (d2h_t0 > 0) ? double(now_ns() - d2h_t0) / 1e6 : 0.0;
   if (tr) {
     // Where the drain phase ACTUALLY goes.  meta = status/size readback +
@@ -23543,12 +23611,18 @@ static void gpu_decomp_worker(
         // Read back statuses and actual sizes in bulk
         uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
         uint64_t d2h_bytes_batch = 0;
-        checkCuda(cudaMemcpy(C.h_statuses.data(), C.d_statuses,
-                             C.filled * sizeof(nvcompStatus_t),
-                             cudaMemcpyDeviceToHost), "D2H statuses");
-        checkCuda(cudaMemcpy(C.h_actual.data(), C.d_actual_sizes,
-                             C.filled * sizeof(size_t),
-                             cudaMemcpyDeviceToHost), "D2H actual sizes");
+        // On C.stream, never the null stream.  Streams here are created with
+        // cudaStreamCreate (blocking), so a null-stream copy is an implicit
+        // device-wide barrier that stalls every other stream on the device —
+        // the same defect the compress drain had, and the reason extra
+        // --gpu-streams bought nothing there.
+        checkCuda(cudaMemcpyAsync(C.h_statuses.data(), C.d_statuses,
+                                  C.filled * sizeof(nvcompStatus_t),
+                                  cudaMemcpyDeviceToHost, C.stream), "D2H statuses");
+        checkCuda(cudaMemcpyAsync(C.h_actual.data(), C.d_actual_sizes,
+                                  C.filled * sizeof(size_t),
+                                  cudaMemcpyDeviceToHost, C.stream), "D2H actual sizes");
+        checkCuda(cudaStreamSynchronize(C.stream), "D2H meta sync");
 
         float batch_ms = 0;
         cudaEventElapsedTime(&batch_ms, C.ev_begin, C.ev_end);
@@ -23595,8 +23669,14 @@ static void gpu_decomp_worker(
             // Pinned cudaMemcpy uses a faster DMA path than pageable.
             void * pin_slot = static_cast<char*>(C.h_decomp_pinned)
                               + i * C.alloc_decomp;
-            checkCuda(cudaMemcpy(pin_slot, d_src, actual,
-                                 cudaMemcpyDeviceToHost), "D2H decomp pinned");
+            // Async on C.stream + an immediate sync: identical host-side
+            // behaviour to the blocking copy this replaces (the frame must land
+            // before the assign below, and the slot is reused next iteration),
+            // but it no longer barriers the whole device.  The per-frame
+            // delivery documented above is deliberate and is preserved.
+            checkCuda(cudaMemcpyAsync(pin_slot, d_src, actual,
+                                      cudaMemcpyDeviceToHost, C.stream), "D2H decomp pinned");
+            checkCuda(cudaStreamSynchronize(C.stream), "D2H decomp pinned sync");
             // assign() copies from the pinned slot without the resize() zero-fill
             // the copy would immediately overwrite — and here `actual` is a FULL
             // decompressed frame (~16 MiB), so the saved memset is far from tiny
@@ -23605,8 +23685,12 @@ static void gpu_decomp_worker(
                           static_cast<char*>(pin_slot) + actual);
           } else {
             h_out->resize(actual);  // direct D2H needs the dst pre-sized
-            checkCuda(cudaMemcpy(h_out->data(), d_src, actual,
-                                 cudaMemcpyDeviceToHost), "D2H decomp data");
+            // Async on C.stream + immediate sync — see the pinned branch above.
+            // The frame must have landed before push_to_slot hands it to the
+            // writer, so the sync stays inside the loop.
+            checkCuda(cudaMemcpyAsync(h_out->data(), d_src, actual,
+                                      cudaMemcpyDeviceToHost, C.stream), "D2H decomp data");
+            checkCuda(cudaStreamSynchronize(C.stream), "D2H decomp data sync");
           }
 
           uint64_t rl_t0 = g_perf ? now_ns() : 0;
@@ -29618,9 +29702,12 @@ static Options parse_args(int argc, char ** argv)
     }
   }
   if (opt.gpu_streams == 0) {
-    // Auto: 2 streams for verify (-t) where no write bottleneck exists,
-    // 1 stream for compress/decompress (larger batches win over overlap)
-    opt.gpu_streams = (opt.mode == Mode::TEST) ? 2 : DEFAULT_GPU_STREAMS;
+    // Auto, by direction: decompress delivers whole frames one at a time to keep
+    // the writer fed and gets slower with every extra stream, while compress and
+    // verify (-t) overlap their stages and want more than one.  See the two
+    // DEFAULT_GPU_*STREAMS constants for the measurements.
+    opt.gpu_streams = (opt.mode == Mode::DECOMPRESS)
+                        ? DEFAULT_GPU_DECOMP_STREAMS : DEFAULT_GPU_STREAMS;
   }
   if (!(opt.gpu_mem_fraction > 0.0 && opt.gpu_mem_fraction < 1.0)) opt.gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   if (opt.gpu_mem_fraction < 0.10) opt.gpu_mem_fraction = 0.10;
