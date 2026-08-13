@@ -1,12 +1,67 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.15.97  
+**Covers:** v0.9.50 → v0.16.0  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.16.0 — the GPUs are not slow; two staging defects, and a lesson about which one mattered
+
+Opens the GPU performance chapter. `--gpu-only` delivers **3.0 GiB/s** while the eight devices'
+kernels are capable of **71.8 GiB/s aggregate** (8 × 8.98, from the per-batch records) — against
+**19.34 GiB/s** for all 256 CPU cores on the same input. The hardware is ~3.7× the CPU and the
+pipeline was getting 4.2% of it out, with devices busy only ~1.4 s of a 6.5 s run.
+
+Measured with the source in RAM and the sink `/dev/null`, deliberately: this host's NVMe reads at
+4.56 GiB/s, so a storage-to-storage run here cannot *measure* a GPU win. That is a property of
+this box, not of the design — gzstd has to be fast on machines we do not own.
+
+**Two defects, and the difference between them is the point.**
+
+**The frame checksum reallocated every frame.** `gpu_frame_add_checksum` did `resize(csz)` then
+four `push_back`s. `size == capacity` at that moment, so the first `push_back` reallocated the
+whole frame and copied every byte — megabytes of alloc-and-copy to append four bytes, 32 frames
+per batch, on eight drain threads at once. It was **60–93% of the entire drain phase**
+(`drain 97.3 ms = copy 7.5 + ck 89.7`). Now the buffer is sized `csz + 4` once and the trailer is
+written in place: **0.007 ms**.
+
+**End-to-end gain: zero.** The drain runs on its own thread, overlapped with the next batch, so a
+90 ms defect there cost nothing at all. *A phase being slow does not make it a bottleneck* — and
+this one looked exactly like the bottleneck.
+
+**The content checksum ran between the H2D copies.** A full XXH64 pass over every input byte,
+inline in the upload loop, so each chunk was: block in the copy, hash, block in the next copy.
+17.0 ms/batch against 19.7 ms of copying — **46% of a region that *is* on the critical path**. The
+copies are host-synchronous, so that thread is blocked in the DMA anyway and the hashing is free
+if it happens elsewhere; per-chunk hashes are independent and on a GPU run the CPUs are ~79% idle.
+Now computed on up to eight helper threads, joined before `release_input()`, which is what keeps
+the source pointers valid. **+8% (3.00 → ~3.25 GiB/s).**
+
+Those helper threads needed an RAII joiner: `checkCuda` throws on CUDA error and `gpu_worker`'s
+catch turns that into the abort → CPU-only rebuild, but `std::thread`'s destructor calls
+`std::terminate()` while joinable — so without it every *recoverable* GPU fault would have become
+a hard process abort. Verified with `GZSTD_DEBUG_FAIL_GPU_AFTER`: forced fault, exit 0, no abort,
+byte-identical output after the rebuild.
+
+**`-vvv` now breaks both staging regions down** (`drain … = meta + acq + size + copy + ck + push`,
+and `h2d-region: copy + checksum`). That instrumentation is what found both defects; the phase the
+logs call "d2h" was never the copy.
+
+**Ruled out by measurement — recorded so they are not re-investigated:** D2H bandwidth (pageable
+does 96.4 GiB/s across 8 devices; the app used 1.4), H2D bandwidth (78–87 GiB/s), mmap vs
+anonymous source for DMA (within 10%), cross-device contention on pageable transfers (it *scales*,
+21.6 → 96.4 GiB/s from 1 → 8 devices), batch/stream/chunk tuning (every setting lands 3.1–3.35),
+the FrameThrottle (peak 2.3%, zero blocks), and the queue byte cap (a documented no-op for mmap
+views). One of those was a claim this project had previously made about `resize()` zero-filling —
+`FrameVec` uses `default_init_allocator`, so it never did.
+
+**The root cause is not yet found.** The devices are starved and nothing upstream blocks. Next is
+per-worker phase accounting using the existing `wd_*`/`WatchPhase` hooks, which distinguish
+spinning from blocked — not another hypothesis. Four hypotheses were wrong in a row here, each
+costing a benchmark, which is the argument for instrumenting before guessing again.
 
 ## v0.15.97 — the suite got 54% faster, and the last HIGH turned out to be GNU tar's contract
 

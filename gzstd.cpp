@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.15.97";
+static constexpr const char * GZSTD_VERSION = "0.16.0";
 //
 // Architecture overview:
 //
@@ -20031,13 +20031,26 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
 
 // bits of XXH64(uncompressed_frame, 0), computed by our own xxh:: above so the
 // binary carries no undefined ZSTD_XXH64 reference (see that note).
-static inline void gpu_frame_add_checksum(FrameVec & f, uint32_t ck) {
-  if (f.size() < 5) return;                 // not a well-formed zstd frame; leave as-is
-  f[4] |= 0x04;                             // Content_Checksum_flag
-  f.push_back((char)(ck & 0xff));
-  f.push_back((char)((ck >> 8) & 0xff));
-  f.push_back((char)((ck >> 16) & 0xff));
-  f.push_back((char)((ck >> 24) & 0xff));
+// Stamp the zstd content-checksum trailer into a frame that ALREADY HAS ROOM for
+// it: the caller sizes the buffer to csz+4 and copies csz bytes of frame into it,
+// leaving [csz, csz+4) as the checksum slot.
+//
+// WHY IN PLACE, AND NOT push_back.  The previous version resized the buffer to
+// exactly the frame length and then push_back'ed four bytes.  size == capacity at
+// that point, so the FIRST push_back reallocated the whole buffer and copied
+// every byte of the frame — megabytes of alloc-and-copy to append four bytes,
+// once per frame, 32 frames per batch, on eight drain threads at once.
+// Measured before the fix: this call was 60-93% of the entire GPU drain phase
+// (e.g. drain 97.3 ms = copy 7.5 + checksum 89.7), which is why the phase the
+// logs call "d2h" ran at ~1.4 GiB/s while the transfer itself does 21.6 GiB/s on
+// one device and 96.4 across eight.  Nothing was wrong with the transfers.
+static inline void gpu_frame_set_checksum(FrameVec & f, size_t csz, uint32_t ck) {
+  if (csz < 5 || f.size() < csz + 4) return;  // not a well-formed frame; leave as-is
+  f[4] |= 0x04;                               // Content_Checksum_flag
+  f[csz + 0] = (char)(ck & 0xff);
+  f[csz + 1] = (char)((ck >> 8) & 0xff);
+  f[csz + 2] = (char)((ck >> 16) & 0xff);
+  f[csz + 3] = (char)((ck >> 24) & 0xff);
 }
 
 // --verify (gpu-only): read back the per-chunk decompress status + the GPU
@@ -20311,9 +20324,19 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
                             std::atomic<double> * util_scale)
 {
   uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
+  // SUB-PHASE TIMING (-vvv).  The figure this function reports as "d2h" is the
+  // whole drain, not the copy: measured 114 ms for 160 MiB, while the copy alone
+  // runs at 21.6 GiB/s single-device (96.4 GiB/s across 8) — i.e. ~7 ms.  So
+  // ~94% of the reported phase was never characterised, and two plausible
+  // explanations for it (pageable bandwidth, cross-device contention) were both
+  // wrong when measured.  Break it down rather than guess a third time.
+  const bool tr = (opt.verbosity >= V_TRACE);
+  uint64_t ns_meta = 0, ns_acq = 0, ns_size = 0, ns_copy = 0, ns_ck = 0, ns_push = 0;
+  uint64_t t_a = tr ? now_ns() : 0;
   checkCuda(cudaMemcpy(C.h_stats.data(), C.d_stats, sizeof(nvcompStatus_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H statuses)");
   checkCuda(cudaMemcpy(C.h_comp_sizes.data(), C.d_comp_sizes, sizeof(size_t)*C.filled, cudaMemcpyDeviceToHost), "cudaMemcpy(D2H comp_sizes)");
   gpu_verify_check(C, opt);
+  if (tr) ns_meta = now_ns() - t_a;
   // Measure per-phase timing from CUDA events
   float h2d_ms = 0, comp_ms = 0;
   cudaEventElapsedTime(&h2d_ms,  C.ev_h2d_begin, C.ev_h2d_end);
@@ -20330,9 +20353,17 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   for (size_t i=0;i<C.filled;++i) {
     if (C.h_stats[i] != nvcompSuccess) throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
     const size_t csz = C.h_comp_sizes[i]; out_sum += csz; in_sum += C.h_in_sizes[i];
+    if (tr) t_a = now_ns();
     auto h_out = C.acquire_out_buf(std::max<size_t>(2, C.per_stream_batch) * 2, bp);
+    if (tr) ns_acq += now_ns() - t_a;
     const void * d_src = static_cast<char*>(C.d_out_base)
                          + i * C.max_out_chunk;
+    // Size ONCE for frame + checksum trailer, so stamping the checksum below
+    // cannot reallocate.  FrameVec's allocator default-inits, so this is a size
+    // change only — no zero-fill of the region the copy is about to overwrite.
+    if (tr) t_a = now_ns();
+    h_out->resize(csz + 4);
+    if (tr) { ns_size += now_ns() - t_a; t_a = now_ns(); }
     if (C.h2d_pinned_base) {
       // Reuse the H2D pinned slot for D2H — input was already
       // consumed by the GPU, slot is free until next batch's pop.
@@ -20341,18 +20372,18 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
       checkCuda(cudaMemcpy(pin_slot, d_src, csz,
                            cudaMemcpyDeviceToHost),
                 "cudaMemcpy(D2H pinned shared slot)");
-      // assign() copies straight from the pinned slot — no resize() zero-fill
-      // (the copy would immediately overwrite it anyway).
-      h_out->assign(static_cast<char*>(pin_slot),
-                    static_cast<char*>(pin_slot) + csz);
+      std::memcpy(h_out->data(), pin_slot, csz);
     } else {
-      h_out->resize(csz);  // direct D2H needs the dst pre-sized
       checkCuda(cudaMemcpy(h_out->data(), d_src, csz,
                            cudaMemcpyDeviceToHost),
                 "cudaMemcpy(D2H exact)");
     }
-    gpu_frame_add_checksum(*h_out, C.h_checksums[i]);  // make the frame self-verifying
+    if (tr) ns_copy += now_ns() - t_a;
+    if (tr) t_a = now_ns();
+    gpu_frame_set_checksum(*h_out, csz, C.h_checksums[i]);  // self-verifying frame
+    if (tr) { ns_ck += now_ns() - t_a; t_a = now_ns(); }
     results->push_to_slot(slot_index, C.batch[i].seq, std::move(h_out));
+    if (tr) ns_push += now_ns() - t_a;
     // First frame this GPU actually DELIVERED — the earliest proof the device
     // did real work.  Set here, not at worker spawn: a worker that starts and
     // then fails delivers nothing, and counting it made an all-CPU run file its
@@ -20369,6 +20400,21 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
     }
   }
   double d2h_ms = (d2h_t0 > 0) ? double(now_ns() - d2h_t0) / 1e6 : 0.0;
+  if (tr) {
+    // Where the drain phase ACTUALLY goes.  meta = status/size readback +
+    // verify; acq = out-buffer acquisition (pool miss => allocation);
+    // copy = the D2H itself; ck = frame checksum append; push = ResultStore.
+    const double u = 1e6;
+    vlog(V_TRACE, opt, "[GPU" + std::to_string(device_id) + "] drain "
+         + std::to_string(d2h_ms) + "ms = meta " + std::to_string(ns_meta/u)
+         + " + acq " + std::to_string(ns_acq/u)
+         + " + size " + std::to_string(ns_size/u)
+         + " + copy " + std::to_string(ns_copy/u)
+         + " + ck " + std::to_string(ns_ck/u)
+         + " + push " + std::to_string(ns_push/u)
+         + " (unaccounted " + std::to_string(d2h_ms - (ns_meta+ns_acq+ns_size+ns_copy+ns_ck+ns_push)/u)
+         + ")\n");
+  }
   double tot_ms = double(h2d_ms) + double(comp_ms) + d2h_ms;
   if ((size_t)device_id < (size_t)ADAPT_DL_MAX) {   // deadline tap: EMA batch time
     const uint64_t ns = (uint64_t)(tot_ms * 1e6);
@@ -21210,6 +21256,49 @@ static void gpu_worker(
         }
 
         cudaEventRecord(C.ev_h2d_begin, C.stream);
+        // Sub-phase timing (-vvv): the H2D region interleaves the copies with a
+        // full XXH64 pass over every byte, and the copies are host-synchronous
+        // (pageable), so the two serialise.  Split them before optimising either.
+        const bool h_tr = (opt.verbosity >= V_TRACE);
+        uint64_t h_ns_copy = 0, h_ns_ck = 0, h_t = 0;
+
+        // THE CONTENT CHECKSUM RUNS ON OTHER THREADS, NOT BETWEEN THE COPIES.
+        // It is a full XXH64 pass over every input byte and it used to sit inline
+        // in the loop below, so each chunk was: block in the copy, then hash, then
+        // block in the next copy.  Measured at 17.0 ms/batch against 19.7 ms of
+        // copying — 46% of a region that IS on the critical path (unlike the drain
+        // phase, where a 90 ms defect turned out to cost nothing because it
+        // overlaps the next batch).
+        //
+        // The copies are host-synchronous (pageable cudaMemcpyAsync), so this
+        // thread is blocked inside the DMA anyway; the hashing costs nothing real
+        // as long as it happens somewhere else.  Per-chunk hashes are independent,
+        // and on a GPU run the CPUs are ~79% idle.  Joined before release_input()
+        // below, which is what keeps t.ptr() valid for the whole pass.
+        const size_t ck_threads = std::min<size_t>(C.filled, 8);
+        std::vector<std::thread> ck_workers;
+        // JOIN ON ANY EXIT, including an exception out of the copy loop below.
+        // checkCuda() throws on a CUDA error and gpu_worker's catch turns that
+        // into the abort -> CPU-only rebuild path; but std::thread's destructor
+        // calls std::terminate() if the thread is still joinable, so leaving the
+        // join to the normal path alone would convert every recoverable GPU fault
+        // into a hard process abort.  Same hazard the driver's ThreadGuard exists
+        // for, one scope down.  The explicit join below runs first on the normal
+        // path (it is what the -vvv timing measures); this is then a no-op.
+        struct CkJoin {
+          std::vector<std::thread> & w;
+          ~CkJoin() { for (auto & t : w) if (t.joinable()) t.join(); }
+        } ck_join{ck_workers};
+        if (ck_threads > 1) {
+          ck_workers.reserve(ck_threads);
+          for (size_t k = 0; k < ck_threads; ++k)
+            ck_workers.emplace_back([&C, k, ck_threads]{
+              for (size_t j = k; j < C.filled; j += ck_threads)
+                C.h_checksums[j] = (uint32_t)xxh::hash(C.batch[j].ptr(),
+                                                       C.batch[j].len(), 0);
+            });
+        }
+
         // Upload each subchunk to its slot in the device input buffer
         for (size_t i = 0; i < C.filled; ++i) {
           const Task & t = C.batch[i];
@@ -21222,6 +21311,7 @@ static void gpu_worker(
                 + " exceeds GPU subchunk slot " + std::to_string(C.gpu_chunk));
           void * d_dst = static_cast<char*>(C.d_in_base) + i * C.gpu_chunk;
 
+          if (h_tr) h_t = now_ns();
           if (C.h2d_pinned_base) {
             void * h_src = static_cast<char*>(C.h2d_pinned_base) + i * C.h_io_slot_bytes;
             std::memcpy(h_src, t.ptr(), t.len());
@@ -21233,10 +21323,21 @@ static void gpu_worker(
                                       cudaMemcpyHostToDevice, C.stream),
                       "cudaMemcpyAsync(H2D)");
           }
+          if (h_tr) { h_ns_copy += now_ns() - h_t; h_t = now_ns(); }
           C.h_in_sizes[i] = t.len();
-          // Compute the zstd content checksum now, while the uncompressed chunk
-          // is still on the host (it may be released right after H2D below).
-          C.h_checksums[i] = (uint32_t)xxh::hash(t.ptr(), t.len(), 0);
+          // Single-chunk batch: not worth a thread, hash inline.
+          if (ck_threads <= 1)
+            C.h_checksums[i] = (uint32_t)xxh::hash(t.ptr(), t.len(), 0);
+          if (h_tr) h_ns_ck += now_ns() - h_t;
+        }
+        // Join BEFORE release_input() below — the hashes read t.ptr().
+        if (h_tr) h_t = now_ns();
+        for (auto & w : ck_workers) w.join();
+        if (h_tr) {
+          h_ns_ck += now_ns() - h_t;
+          vlog(V_TRACE, opt, "[GPU" + std::to_string(device_id) + "] h2d-region: copy "
+               + std::to_string(h_ns_copy/1e6) + "ms + checksum-join "
+               + std::to_string(h_ns_ck/1e6) + "ms\n");
         }
         checkCuda(cudaMemcpyAsync(C.d_in_sizes, C.h_in_sizes.data(), sizeof(size_t)*C.filled, cudaMemcpyHostToDevice, C.stream), "cudaMemcpyAsync(d_in_sizes)");
         cudaEventRecord(C.ev_h2d_end, C.stream);
