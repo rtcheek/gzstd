@@ -1,12 +1,54 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.0  
+**Covers:** v0.9.50 → v0.16.1  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.16.1 — per-worker phase accounting, and it names the bottleneck in one line
+
+v0.16.0 established that the devices are starved with nothing upstream blocking, and left the
+root cause open after four wrong hypotheses. This closes it by measuring instead of guessing.
+
+The watchdog already marked *which* phase a GPU worker was in, at exactly the right places — it
+just never recorded how long it **stayed** there. Accumulating on the existing transitions needed
+no new call sites and no new hazards, and the answer is unambiguous:
+
+```
+[GPU2] phases (1.21s total):
+   wait_idle_stream        0.94s (78%)
+   intake_wait_batch       0.00s ( 0%)
+   intake_acquire_permits  0.00s ( 0%)
+   submit_h2d_kernel       0.26s (22%)
+```
+
+Every worker, 75–82%, blocked on `wait_idle_stream` — waiting for a free `StreamCtx`. Time spent
+waiting for input: **zero**. The devices were never short of work; they were blocked behind their
+own drain thread returning a context.
+
+**The structure explains it and corrects v0.16.0's conclusion.** There is one `drainer` thread per
+device serving N `StreamCtx`, so extra streams give the worker more contexts to fill but they all
+funnel through a single drain — which is why `--gpu-streams=2` moved nothing (3.13 vs 3.21).
+v0.16.0 concluded "the drain is off the critical path" because fixing a 90 ms defect there gained
+nothing end-to-end. Both observations were real; the inference was wrong. The drain **is** the
+per-device serializer: fixing the checksum realloc simply moved its 90 ms into the D2H copies,
+which then contended with the worker's H2D on the same device. Drain stayed ~100 ms/batch against
+~25 ms of submit, so the worker waits ~75% either way.
+
+The full chain, now measured end to end: worker blocks 78% on `wait_idle_stream` → one drain
+thread per device holds the context ~100 ms/batch → the drain is dominated by blocking, pageable,
+per-chunk `cudaMemcpy` contending with the worker's H2D → and one async slab into registered
+memory measures **52.78 GiB/s against 21.57** for blocking pageable, single-device.
+
+Also fixed here: the phase mark for the H2D upload sat *after* the kernel launch, so that batch's
+staging was charged to whatever the worker had been waiting on beforehand. Marked before the work
+now.
+
+`-vvv` only; one clock read per transition when enabled, and the watchdog store is untouched
+either way.
 
 ## v0.16.0 — the GPUs are not slow; two staging defects, and a lesson about which one mattered
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.0";
+static constexpr const char * GZSTD_VERSION = "0.16.1";
 //
 // Architecture overview:
 //
@@ -7232,6 +7232,9 @@ static inline void gpu_bringup_signal() {
 // pointer from any thread  it's set-once-read-many so no synchronization
 // needed beyond the thread-launch happens-before relationship.
 static PerfCounters * g_perf = nullptr;
+// -vvv gate for per-worker phase accounting; the accumulators live with the
+// watchdog phase hooks further down, but the flag is read from the drivers here.
+static std::atomic<bool> g_phase_on{false};
 
 // Global DirectWriter pointer  set when O_DIRECT output is active.
 // Writer thread checks this to decide between DirectWriter and fwrite.
@@ -12266,7 +12269,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 {
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
-  if (opt.verbosity >= V_TRACE) g_perf = &perf_local;
+  if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
 
   int threads = resolve_cpu_threads(opt.cpu_threads);
 
@@ -18970,7 +18973,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 {
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
-  if (opt.verbosity >= V_TRACE) g_perf = &perf_local;
+  if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
 
   int threads = resolve_cpu_threads(opt.cpu_threads);
 
@@ -20154,7 +20157,39 @@ struct GzWatchdog {
 static std::atomic<GzWatchdog*> g_wd{nullptr};
 
 static inline void wd_beat(int w){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).heartbeat.fetch_add(1,std::memory_order_relaxed); }
-static inline void wd_phase(int w, WatchPhase p){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).phase.store((int)p,std::memory_order_relaxed); }
+// PER-WORKER PHASE ACCOUNTING (-vvv).  The watchdog already marks which phase a
+// worker is in, at exactly the right places — it just never recorded how long it
+// STAYED there, so "the devices are starved and nothing upstream blocks" was as
+// far as the logs could take us.  Accumulating on the existing transitions turns
+// those marks into a time budget with no new call sites and no new hazards.
+//
+// Off by default: one clock read per transition (a handful per batch) only when
+// enabled, and the watchdog store is untouched either way.
+static constexpr int PHASE_MAX_WORKERS = 256;
+static constexpr int PHASE_COUNT       = (int)WatchPhase::Exiting + 1;
+struct PhaseAcct {
+  std::atomic<uint64_t> ns[PHASE_COUNT];
+  std::atomic<uint64_t> hits[PHASE_COUNT];
+  std::atomic<int>      cur{(int)WatchPhase::Idle};
+  std::atomic<uint64_t> since{0};
+};
+static PhaseAcct        g_phase[PHASE_MAX_WORKERS];
+
+static inline void phase_acct(int w, int p){
+  if (w < 0 || w >= PHASE_MAX_WORKERS) return;
+  PhaseAcct & a = g_phase[w];
+  const uint64_t now = now_ns();
+  const uint64_t t0  = a.since.exchange(now, std::memory_order_relaxed);
+  const int prev = a.cur.exchange(p, std::memory_order_relaxed);
+  if (t0 != 0 && prev >= 0 && prev < PHASE_COUNT)
+    a.ns[prev].fetch_add(now - t0, std::memory_order_relaxed);
+  if (p >= 0 && p < PHASE_COUNT) a.hits[p].fetch_add(1, std::memory_order_relaxed);
+}
+
+static inline void wd_phase(int w, WatchPhase p){
+  if (g_phase_on.load(std::memory_order_relaxed)) phase_acct(w, (int)p);
+  if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).phase.store((int)p,std::memory_order_relaxed);
+}
 static inline void wd_dev(int w,int dev){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).device_id.store(dev,std::memory_order_relaxed); }
 static inline void wd_submit(int w,int s,uint64_t lo,uint64_t hi,uint64_t filled){ if(auto*d=g_wd.load(std::memory_order_relaxed)){auto&x=d->st(w,s); x.seq_lo.store(lo);x.seq_hi.store(hi);x.filled.store(filled);x.busy_since_ns.store(now_ns());x.busy.store(true);} }
 static inline void wd_sync(int w,int s,int q){ if(auto*d=g_wd.load(std::memory_order_relaxed)){auto&x=d->st(w,s); x.last_sync.store(q);x.last_sync_ns.store(now_ns());} }
@@ -21255,6 +21290,10 @@ static void gpu_worker(
           vlog(V_DEBUG, opt, os.str() + "\n");
         }
 
+        // The H2D upload and kernel launch start HERE; mark the phase before
+        // the work, not after it, or the accounting charges this batch's
+        // staging to whatever the worker was waiting on beforehand.
+        wd_phase(slot_index, WatchPhase::Submit);
         cudaEventRecord(C.ev_h2d_begin, C.stream);
         // Sub-phase timing (-vvv): the H2D region interleaves the copies with a
         // full XXH64 pass over every byte, and the copies are host-synchronous
@@ -21453,6 +21492,29 @@ static void gpu_worker(
            << " thr="<<std::fixed<<std::setprecision(2)<<thr_gib<<" GiB/s";
         vlog(V_DEBUG, opt, os.str() + "\n");
       }
+    }
+
+    // WHERE THIS WORKER'S WALL CLOCK WENT (-vvv).  The per-device line above
+    // reports only time the device was BUSY; a run where the devices are busy
+    // 1.4 s of 6.5 s says nothing about the other 5.1 s.  This does: the phases
+    // are the worker's own states, so they sum to its lifetime.
+    if (g_phase_on.load(std::memory_order_relaxed)
+        && slot_index >= 0 && slot_index < PHASE_MAX_WORKERS) {
+      wd_phase(slot_index, WatchPhase::Exiting);   // close the final interval
+      const PhaseAcct & a = g_phase[slot_index];
+      uint64_t tot = 0;
+      for (int p = 0; p < PHASE_COUNT; ++p) tot += a.ns[p].load(std::memory_order_relaxed);
+      std::ostringstream ps;
+      ps << "[GPU" << device_id << "] phases (" << std::fixed << std::setprecision(2)
+         << tot / 1e9 << "s total):";
+      for (int p = 0; p < PHASE_COUNT; ++p) {
+        const uint64_t v = a.ns[p].load(std::memory_order_relaxed);
+        if (v == 0) continue;
+        ps << "  " << watch_phase_name(p) << " " << std::fixed << std::setprecision(2)
+           << v / 1e9 << "s (" << std::setprecision(0) << (tot ? 100.0 * v / tot : 0.0)
+           << "%, n=" << a.hits[p].load(std::memory_order_relaxed) << ")";
+      }
+      vlog(V_TRACE, opt, ps.str() + "\n");
     }
 
     // Free all GPU resources for this device
@@ -21781,7 +21843,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 {
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
-  if (opt.verbosity >= V_TRACE) g_perf = &perf_local;
+  if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
 
 #ifndef _WIN32
   // ---- --tar creation: walk BEFORE touching CUDA ----
@@ -23750,7 +23812,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
 {
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
-  if (opt.verbosity >= V_TRACE) g_perf = &perf_local;
+  if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
 
   // ---- Detect GPU devices ----
   // Note: must use cudaGetDeviceCount (not NVML) because NVML sees all
