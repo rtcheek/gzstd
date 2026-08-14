@@ -1,11 +1,67 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.3  
+**Covers:** v0.9.50 → v0.16.4  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.16.4 — a timeline for the host, and it corrects two claims from v0.16.3
+
+Every performance counter in this program measured time *inside* the compress loop. That is
+why none of them could explain the multi-GPU behaviour: measured solo against seven concurrent
+sibling processes, nvCOMP kernel time was **identical** (92.5 vs 92.6 ms/batch) and total GPU
+batch time grew 13%, while end-to-end degraded 2.5x. Roughly 6.5 s per process was falling
+*between* the counted phases, where nothing was looking.
+
+`-vvv` now prints a **Host timeline** that segments the whole operation — startup and CUDA init,
+queueing the input, compression, releasing the input mapping, writer drain, teardown. Seven
+timestamps, one clock read each, inert below `-vvv`.
+
+### What it found, in the configuration users actually run
+
+One process, eight GPUs, 195.3 GiB in tmpfs:
+
+| segment | `--gpu-batch=128 --gpu-streams=1` | default |
+|---|---|---|
+| startup + CUDA init | 2.932 s (20%) | 1.836 s (12%) |
+| queue the input | 0.001 s | 0.001 s |
+| compress (workers) | 6.925 s (46%) | 7.812 s (50%) |
+| **release input map** | **5.151 s (34%)** | **5.131 s (33%)** |
+| writer drain | 0.000 s | 0.760 s (5%) |
+
+### Two corrections to what v0.16.3 recorded
+
+**Compression scales far better than the end-to-end figures implied.** 195.3 GiB inside the
+6.925 s compress window is **28.2 GiB/s**, against 32 GiB/s ideal — eight times the measured
+single-GPU rate of 4.04. That is ~88%. Per-GPU *during compression* is 5.84 → 3.53 from one
+device to eight (~60%), not the 38% the previous release's table reported. **That table folded
+fixed overheads into the rate and should not be quoted as a compression-scaling number.**
+
+**Moving the unmap earlier did not overlap it.** v0.16.3 relocated `mmap_region.reset()` to just
+after the worker join expecting it to hide behind the writer drain. The timeline shows
+`writer drain = 0.000 s` immediately after it: the writer had already finished, so there was
+nothing left to hide behind. The ~8% that change measured was real but it was not the mechanism
+claimed for it. Unmapping costs **~26–29 ms/GiB** and is constant across scales — 0.697 s for
+24.2 GiB, 5.151 s for 195.3 GiB.
+
+### And the multi-process story is startup, not bandwidth
+
+Same process, solo versus alongside seven siblings: startup and CUDA init **1.000 → 7.370 s**,
+compression 4.145 → 6.937 s, unmap 0.697 → 0.741 s. CUDA and driver initialisation serialise
+across processes; host memory bandwidth is not implicated. Raw tmpfs reads sustain 69.0 GiB/s
+aggregate across eight concurrent readers while the pipeline uses about 12.7.
+
+So the remaining GPU-path work is specific: stop paying ~26 ms/GiB to unmap the input — retire
+it incrementally during compression, or avoid building one enormous mapping — and attack startup.
+Compression itself is close to done.
+
+Instrumented in the GPU compress driver only. `compress_cpu_mt` mmaps too and shows the same
+shape; its marks are deliberately deferred rather than added untested alongside a release.
+
+Verified: extensive suite **548/548** (6m48s), both build configurations compile clean.
 
 
 ## v0.16.3 — a back-off that never backed off, and teardown charged to the tail

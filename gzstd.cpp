@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.3";
+static constexpr const char * GZSTD_VERSION = "0.16.4";
 //
 // Architecture overview:
 //
@@ -7114,6 +7114,28 @@ struct PerfCounters {
   std::atomic<uint64_t> sched_cpu_tasks{0};
   std::atomic<uint64_t> sched_gpu_tasks{0};
 
+  // ---- Host-side macro timeline ----------------------------------------
+  // Every counter above measures time INSIDE the compress loop, and that is
+  // why they could not explain the multi-GPU scaling wall.  Measured solo
+  // against seven concurrent sibling processes: nvCOMP kernel time was
+  // IDENTICAL (92.5 vs 92.6 ms/batch) and total GPU batch time grew 13%, yet
+  // end-to-end degraded 2.5x — leaving roughly 6.5 s per process in no counter
+  // at all, because it falls BETWEEN the counted phases.
+  //
+  // These are absolute wall timestamps at operation milestones, so the whole
+  // run is segmented and the missing time has somewhere to land.  Last writer
+  // wins: each mark has a single call site, and a multi-file run simply
+  // reports its final file (the breakdown is a per-operation diagnostic).
+  static constexpr int HM_START           = 0;  // entry to the compress driver
+  static constexpr int HM_GPU_READY       = 1;  // devices initialised, workers live
+  static constexpr int HM_PRODUCER_DONE   = 2;  // every task queued
+  static constexpr int HM_WORKERS_JOINED  = 3;  // all compression finished
+  static constexpr int HM_INPUT_RELEASED  = 4;  // input mapping unmapped
+  static constexpr int HM_WRITER_JOINED   = 5;  // writer drained
+  static constexpr int HM_END             = 6;  // driver returning
+  static constexpr int HM_COUNT           = 7;
+  std::atomic<uint64_t> mark_ns[HM_COUNT] = {};
+
   void print_summary(const char * label) const {
     auto ns_to_s = [](uint64_t ns) { return double(ns) / 1e9; };
     auto ns_to_ms = [](uint64_t ns) { return double(ns) / 1e6; };
@@ -7221,6 +7243,32 @@ struct PerfCounters {
             CNT, (unsigned long long)sched_cpu_tasks.load(), RST,
             CNT, (unsigned long long)sched_gpu_tasks.load(), RST);
 
+    // ---- Host timeline ---------------------------------------------------
+    // Segments the WHOLE operation, unlike every row above it, which measures
+    // time inside the compress loop.  Read this first when wall-clock time and
+    // the phase rows disagree: the segment that grew is where to look, and the
+    // rows above cannot show it.
+    const uint64_t t0 = mark_ns[HM_START].load(std::memory_order_relaxed);
+    const uint64_t tN = mark_ns[HM_END].load(std::memory_order_relaxed);
+    if (t0 > 0 && tN > t0) {
+      static const char * seg_name[HM_COUNT - 1] = {
+        "startup + CUDA init", "queue the input", "compress (workers)",
+        "release input map", "writer drain", "teardown",
+      };
+      fprintf(stderr, "  %s──────────────────────────────────────────────────────%s\n", DIM, RST);
+      fprintf(stderr, "  %sHost timeline:%s   %s%.3f s%s total\n",
+              LBL, RST, TIM, ns_to_s(tN - t0), RST);
+      uint64_t prev = t0;
+      for (int i = 1; i < HM_COUNT; ++i) {
+        const uint64_t t = mark_ns[i].load(std::memory_order_relaxed);
+        if (t == 0) continue;               // milestone not reached (early exit)
+        const double pct = 100.0 * double(t - prev) / double(tN - t0);
+        fprintf(stderr, "    %-22s %s%8.3f s%s  (%s%.0f%%%s)\n",
+                seg_name[i - 1], TIM, ns_to_s(t - prev), RST, CNT, pct, RST);
+        prev = t;
+      }
+    }
+
     fprintf(stderr, "\n");
   }
 };
@@ -7251,6 +7299,12 @@ static inline void gpu_bringup_signal() {
 // pointer from any thread  it's set-once-read-many so no synchronization
 // needed beyond the thread-launch happens-before relationship.
 static PerfCounters * g_perf = nullptr;
+// Stamp a host-timeline milestone (see PerfCounters::HM_*).  One clock read,
+// only under -vvv; a no-op otherwise.
+static inline void perf_mark(int m) {
+  if (g_perf && m >= 0 && m < PerfCounters::HM_COUNT)
+    g_perf->mark_ns[m].store(now_ns(), std::memory_order_relaxed);
+}
 // -vvv gate for per-worker phase accounting; the accumulators live with the
 // watchdog phase hooks further down, but the flag is read from the drivers here.
 static std::atomic<bool> g_phase_on{false};
@@ -21945,6 +21999,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
+  perf_mark(PerfCounters::HM_START);   // must follow the g_perf assignment above
 
 #ifndef _WIN32
   // ---- --tar creation: walk BEFORE touching CUDA ----
@@ -22443,6 +22498,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
           || g_gpu_aborted.load(std::memory_order_relaxed);
     });
   }
+  perf_mark(PerfCounters::HM_GPU_READY);
 
   // ---- Producer: read input, split into GPU-sized subchunks, enqueue ----
   try_boost_io_priority(!opt.gpu_only);
@@ -22710,6 +22766,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Signal workers that all input has been read
   queue.set_done();
+  perf_mark(PerfCounters::HM_PRODUCER_DONE);
   if (sched) sched->set_producer_done();  // arm the tail-aware GPU intake check
   {
     std::lock_guard<std::mutex> lk(results.m);
@@ -22764,6 +22821,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     for (auto & th : cpu_pool) th.join();
 #ifndef _WIN32
   g_direct_read_pool = nullptr;  // all release() callers joined; safe to drop the pool
+  perf_mark(PerfCounters::HM_WORKERS_JOINED);
 #endif
   // Unmap the input HERE rather than at scope exit — see the matching comment in
   // the CPU path.  Every GPU worker and every hybrid CPU worker is joined above,
@@ -22771,6 +22829,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // compressed output, which is copied.  Doing it now overlaps the page-table
   // teardown with the writer drain instead of leaving it as pure tail latency.
   mmap_region.reset();
+  perf_mark(PerfCounters::HM_INPUT_RELEASED);
 
   // Signal writer that all workers are done
   {
@@ -22787,6 +22846,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 
   // Wait for writer and progress threads
   writer_thr.join();
+  perf_mark(PerfCounters::HM_WRITER_JOINED);
   // ---- GPU deadlock watchdog teardown (v0.14.59) ----
   if (watchdog_thr.joinable()) {
     watchdog_done.store(true, std::memory_order_relaxed);
@@ -22799,6 +22859,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                      opt.hybrid ? "compress-hybrid" :
                      opt.gpu_only ? "compress-gpu" : "compress-nvcomp");
 
+  perf_mark(PerfCounters::HM_END);
   if (g_perf) {
     g_perf->print_summary(opt.hybrid ? "HYBRID COMPRESS" :
                           opt.gpu_only ? "GPU-ONLY COMPRESS" : "COMPRESS");
