@@ -1,11 +1,89 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.6  
+**Covers:** v0.9.50 → v0.16.7  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.16.7 — --gpu-devices was slower than not using it, and NVML was reading the wrong GPU
+
+Two GPU-selection defects, found by measuring a flag nobody had timed and then by asking whether
+an index meant what it looked like.
+
+### --gpu-devices reduced parallelism without reducing cost
+
+`cudaGetDeviceCount` triggers `cuInit`, and `cuInit` initialises every **visible** device. So
+capping the device count inside gzstd bought the smaller fleet while still paying for the whole
+one. At 24.2 GiB the flag was **1.5x slower** than achieving the same thing with
+`CUDA_VISIBLE_DEVICES`:
+
+| devices | `--gpu-devices=N` before | same devices hidden by hand |
+|---|---|---|
+| 1 | 8.02–8.10 s | 5.49–5.64 s |
+| 2 | 6.72–6.98 s | 4.49–4.52 s |
+| 4 | 6.00–6.03 s | 4.26–4.44 s |
+
+`apply_backend_defaults` now sets `CUDA_VISIBLE_DEVICES` before the first CUDA call, so the
+driver never initialises devices the run will not use. It needs no device count to do this — the
+chicken-and-egg being that counting them is what costs — because CUDA ignores indices that do not
+exist, and devices can be named by `GPU-<uuid>` before any index exists. After: **5.46–5.51 /
+4.45–4.49 / 4.22–4.39 s**, identical to hiding them by hand.
+
+Which devices, not just how many: `select_best_gpus` already ranked by NVML utilization and free
+VRAM, but it maps NVML to CUDA through `cudaGetDeviceProperties`, so it cannot run until CUDA is
+up — by which point `cuInit` has charged for everything anyway. The same ranking now also runs
+*before* CUDA, through NVML alone, so the choice survives and the saving is collected. An explicit
+user `CUDA_VISIBLE_DEVICES` is never second-guessed: the first N of **their** list is taken,
+since they have already said which devices they want.
+
+### NVML indices are not CUDA indices, and three call sites assumed they were
+
+NVML enumerates in PCI order; CUDA defaults to fastest-first. On this box `nvml[0]` is PCI
+0000:01:00 while `cuda[0]` is PCI 0000:81:00 — different physical GPUs. NVML also ignores
+`CUDA_VISIBLE_DEVICES` entirely: with it set to a single device, NVML still reports all eight.
+
+Three sites passed a CUDA device index straight to `nvmlDeviceGetHandleByIndex`: the compress
+utilization probe, the decompress one, and the watchdog JSON dump. **All eight devices resolved
+to the wrong GPU** — a permutation, so not one was accidentally right:
+
+```
+cuda  |  naive nvmlByIndex(cuda_id)  |  PCI-mapped (correct)
+ 0    |  GPU-976d6911...             |  GPU-d628d3f1...
+ 3    |  GPU-c56a5d03...             |  GPU-976d6911...
+```
+
+The effect was that `util_scale` — which shrinks the next batch when a GPU is busy, the one
+feature written specifically for shared machines — throttled against an unrelated device's load.
+Under a user-set `CUDA_VISIBLE_DEVICES` it read a GPU the user had explicitly excluded.
+
+`gz_nvml_handle_for_cuda()` maps through `cudaGetDeviceProperties` PCI bus ID to
+`nvmlDeviceGetHandleByPciBusId`, the route `select_best_gpus` already used correctly, caching
+positive and negative results so a failed lookup is not retried every batch. The two remaining
+index call sites are genuine NVML enumerations and are unchanged.
+
+**The rule this leaves behind: correlate NVML and CUDA by UUID or PCI bus ID, never by index.**
+
+### Measured while doing this, and recorded because it is not obvious
+
+`cuInit` costs roughly **950 ms plus 250 ms per visible device** — 1009 ms with one visible,
+2960 ms with eight — and it is charged for devices that are never touched. `cudaMemGetInfo` is
+free once a context exists (0.0 ms) and reflects another process's allocations immediately and
+exactly. And the visible device set is frozen at `cuInit`: re-setting the environment variable
+or calling `cudaDeviceReset` does not reveal more devices, so the device set is a one-shot
+decision made before the first CUDA call.
+
+Decomposed with the driver API, essentially all of that is `cuInit` itself: `cuDeviceGet` and
+`cuMemGetInfo` are 0.0 ms, and context creation afterwards is ~150–200 ms. A bare binary linking
+only the CUDA runtime pays the same, so none of it is gzstd's. **Getting one GPU usable has a
+~1.03 s floor** (six reps: 2790, 1869, 1974, 1019, 1037, 1026 ms — it settles after other CUDA
+activity subsides). The only levers are how many devices are made visible, and what that second
+is allowed to overlap with. Note this is an H100 PCIe host on driver 570.207; a ~1 s
+single-device `cuInit` is high, so the figure should be re-measured elsewhere rather than assumed.
+
+Verified: extensive suite **548/548** (6m56s), both build configurations compile clean.
 
 
 ## v0.16.6 — bring the GPUs up one at a time, so the first one starts working immediately

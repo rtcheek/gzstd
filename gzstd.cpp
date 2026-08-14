@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.6";
+static constexpr const char * GZSTD_VERSION = "0.16.7";
 //
 // Architecture overview:
 //
@@ -147,6 +147,7 @@ struct GzNvmlApi {
   nvmlReturn_t (*DeviceGetCpuAffinity)(nvmlDevice_t, unsigned int, unsigned long *) = nullptr;
   nvmlReturn_t (*DeviceGetMaxPcieLinkGeneration)(nvmlDevice_t, unsigned int *) = nullptr;
   nvmlReturn_t (*DeviceGetName)(nvmlDevice_t, char *, unsigned int) = nullptr;
+  nvmlReturn_t (*DeviceGetUUID)(nvmlDevice_t, char *, unsigned int) = nullptr;
   nvmlReturn_t (*SystemGetDriverVersion)(char *, unsigned int) = nullptr;
 };
 
@@ -181,6 +182,11 @@ static const GzNvmlApi & gz_nvml()
         sym("nvmlDeviceGetMaxPcieLinkGeneration", nullptr);
     a.DeviceGetName = (nvmlReturn_t(*)(nvmlDevice_t, char *, unsigned int))
         sym("nvmlDeviceGetName", nullptr);
+    // UUID is how a device can be NAMED to CUDA_VISIBLE_DEVICES before any CUDA
+    // call exists to give it an index — see the pre-CUDA ranking in
+    // apply_backend_defaults.
+    a.DeviceGetUUID = (nvmlReturn_t(*)(nvmlDevice_t, char *, unsigned int))
+        sym("nvmlDeviceGetUUID_v2", "nvmlDeviceGetUUID");
     a.SystemGetDriverVersion = (nvmlReturn_t(*)(char *, unsigned int))
         sym("nvmlSystemGetDriverVersion", nullptr);
     return a;
@@ -211,6 +217,8 @@ static inline nvmlReturn_t nvmlDeviceGetMaxPcieLinkGeneration(nvmlDevice_t d, un
 { auto & a = gz_nvml(); return a.DeviceGetMaxPcieLinkGeneration ? a.DeviceGetMaxPcieLinkGeneration(d, gen) : GZ_NVML_UNAVAILABLE; }
 static inline nvmlReturn_t nvmlDeviceGetName(nvmlDevice_t d, char * buf, unsigned int len)
 { auto & a = gz_nvml(); return a.DeviceGetName ? a.DeviceGetName(d, buf, len) : GZ_NVML_UNAVAILABLE; }
+static inline nvmlReturn_t nvmlDeviceGetUUID(nvmlDevice_t d, char * buf, unsigned int len)
+{ auto & a = gz_nvml(); return a.DeviceGetUUID ? a.DeviceGetUUID(d, buf, len) : GZ_NVML_UNAVAILABLE; }
 static inline nvmlReturn_t nvmlSystemGetDriverVersion(char * buf, unsigned int len)
 { auto & a = gz_nvml(); return a.SystemGetDriverVersion ? a.SystemGetDriverVersion(buf, len) : GZ_NVML_UNAVAILABLE; }
  #endif // HAVE_NVML
@@ -20453,6 +20461,45 @@ static inline void wd_idle(int w,int s){ if(auto*d=g_wd.load(std::memory_order_r
 static inline void wd_drain_beat(int w){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).drain_heartbeat.fetch_add(1,std::memory_order_relaxed); }
 static inline void wd_drain_phase(int w, WatchPhase p){ if(auto*d=g_wd.load(std::memory_order_relaxed)) d->wk(w).drain_phase.store((int)p,std::memory_order_relaxed); }
 
+
+// Map a CUDA device index to its NVML handle.
+//
+// NVML AND CUDA DO NOT SHARE AN INDEX SPACE, and three call sites assumed they
+// did.  NVML enumerates in PCI order; CUDA defaults to fastest-first, so on an
+// 8xH100 box here nvml[0] is PCI 0000:01:00 while cuda[0] is PCI 0000:81:00 —
+// different physical GPUs.  NVML also ignores CUDA_VISIBLE_DEVICES entirely
+// (with it set to one device NVML still reports all eight), so a CUDA index fed
+// to NVML can name a GPU the user explicitly EXCLUDED.
+//
+// The only safe correlation is by PCI bus ID (or UUID).  select_best_gpus got
+// this right; the utilization probes did not.  Cached because the mapping is
+// fixed for the process and the drain asks once per batch.
+static bool gz_nvml_handle_for_cuda(int cuda_dev, nvmlDevice_t * out)
+{
+  struct Entry { bool ok; nvmlDevice_t h; };
+  static std::mutex m;
+  static std::map<int, Entry> cache;   // negative results cached too: a failed
+                                       // lookup must not be retried per batch
+  if (cuda_dev < 0 || !out) return false;
+  std::lock_guard<std::mutex> lk(m);
+  auto it = cache.find(cuda_dev);
+  if (it != cache.end()) { if (!it->second.ok) return false; *out = it->second.h; return true; }
+  cudaDeviceProp prop;
+  if (cudaGetDeviceProperties(&prop, cuda_dev) != cudaSuccess) {
+    cache[cuda_dev] = Entry{false, nvmlDevice_t{}}; return false;
+  }
+  char pci[32];
+  std::snprintf(pci, sizeof(pci), "%08x:%02x:%02x.0",
+                prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+  nvmlDevice_t h{};
+  if (nvmlDeviceGetHandleByPciBusId_v2(pci, &h) != NVML_SUCCESS) {
+    cache[cuda_dev] = Entry{false, nvmlDevice_t{}}; return false;
+  }
+  cache[cuda_dev] = Entry{true, h};
+  *out = h;
+  return true;
+}
+
 static std::string wd_json_escape(const std::string & s) {
   std::string o; o.reserve(s.size()+16);
   for (char c : s) {
@@ -20545,7 +20592,7 @@ static std::string wd_run_cmd(const char * cmd) {
       seen.push_back(dev);
       nvmlDevice_t h{}; nvmlUtilization_t u{}; nvmlMemory_t mem{};
       unsigned util=0; unsigned long long memused=0, memtot=0;
-      if (nvmlDeviceGetHandleByIndex((unsigned)dev,&h)==NVML_SUCCESS) {
+      if (gz_nvml_handle_for_cuda(dev,&h)) {   // PCI-mapped: dev is a CUDA index
         if (nvmlDeviceGetUtilizationRates(h,&u)==NVML_SUCCESS) util=u.gpu;
         if (nvmlDeviceGetMemoryInfo(h,&mem)==NVML_SUCCESS) { memused=mem.used; memtot=mem.total; }
       }
@@ -20839,7 +20886,7 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   {
     nvmlDevice_t dev;
     nvmlUtilization_t util;
-    if (nvmlDeviceGetHandleByIndex(device_id, &dev) == NVML_SUCCESS &&
+    if (gz_nvml_handle_for_cuda(device_id, &dev) &&   // NOT by index: see helper
         nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
       util_scale->store(std::max(0.05, (100.0 - util.gpu) / 100.0),
                         std::memory_order_relaxed);
@@ -24049,7 +24096,7 @@ static void gpu_decomp_worker(
         {
           nvmlDevice_t dev;
           nvmlUtilization_t util;
-          if (nvmlDeviceGetHandleByIndex(device_id, &dev) == NVML_SUCCESS &&
+          if (gz_nvml_handle_for_cuda(device_id, &dev) &&   // NOT by index: see helper
               nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
             util_scale = std::max(0.05, (100.0 - util.gpu) / 100.0);
           }
@@ -28350,6 +28397,84 @@ static bool adapt_output_is_regular(const Options & opt)
 static void apply_backend_defaults(Options & opt)
 {
 #ifdef HAVE_NVCOMP
+  // --gpu-devices=N must HIDE the other devices from CUDA, not just decline to
+  // use them.
+  //
+  // cudaGetDeviceCount triggers cuInit, and cuInit initialises every VISIBLE
+  // device — measured ~0.15 s each, serialised in the driver. So limiting the
+  // count in gzstd alone bought the smaller fleet without the smaller bill: at
+  // 24.2 GiB, --gpu-devices=1 ran 8.02-8.10 s against 5.49-5.64 s for the same
+  // one device hidden behind CUDA_VISIBLE_DEVICES, and every count was ~1.5x
+  // slower that way. The flag was reducing parallelism while still paying for
+  // all eight contexts, which is the worst of both.
+  //
+  // Setting the environment here works without knowing the device count (the
+  // chicken-and-egg being that counting them is what costs), because CUDA
+  // simply ignores indices that do not exist. An existing user setting is
+  // honoured by taking the first N of THEIR list, since CUDA renumbers the
+  // visible set from zero.
+  //
+  // WHICH devices, not just how many: select_best_gpus() already ranks by NVML
+  // utilization and free VRAM, but it maps NVML to CUDA through
+  // cudaGetDeviceProperties, so it cannot run until CUDA is up — by which point
+  // cuInit has charged for every device anyway. Ranking again HERE, through NVML
+  // alone, keeps that choice and collects the saving: CUDA_VISIBLE_DEVICES
+  // accepts GPU-<uuid>, so a device can be named before any CUDA call exists to
+  // give it an index. Least busy first, ties to more free memory — same rule as
+  // select_best_gpus, which still runs afterwards over whatever we expose.
+  //
+  // An explicit user setting is never second-guessed: we take the first N of
+  // THEIR list, because they have already said which devices they want.
+  if (opt.gpu_devices > 0) {
+    std::string sel;
+    if (const char * cur = ::getenv("CUDA_VISIBLE_DEVICES")) {
+      std::stringstream ss(cur); std::string tok; int taken = 0;
+      while (taken < opt.gpu_devices && std::getline(ss, tok, ',')) {
+        if (tok.empty()) continue;
+        if (!sel.empty()) sel += ",";
+        sel += tok; ++taken;
+      }
+    } else if (nvmlInit_v2() == NVML_SUCCESS) {
+      struct Cand { std::string uuid; unsigned util; unsigned long long freeb; };
+      std::vector<Cand> cands;
+      unsigned n = 0;
+      if (nvmlDeviceGetCount_v2(&n) == NVML_SUCCESS) {
+        for (unsigned i = 0; i < n; ++i) {
+          nvmlDevice_t h{};
+          if (nvmlDeviceGetHandleByIndex(i, &h) != NVML_SUCCESS) continue;
+          char uu[96] = {0};
+          if (nvmlDeviceGetUUID(h, uu, sizeof(uu)) != NVML_SUCCESS || !uu[0]) continue;
+          Cand c{uu, 0u, 0ull};
+          nvmlUtilization_t u{};
+          if (nvmlDeviceGetUtilizationRates(h, &u) == NVML_SUCCESS) c.util = u.gpu;
+          nvmlMemory_t mem{};
+          if (nvmlDeviceGetMemoryInfo(h, &mem) == NVML_SUCCESS) c.freeb = mem.free;
+          cands.push_back(std::move(c));
+        }
+      }
+      // Deliberately NOT nvmlShutdown(): NVML init is REFCOUNTED and costs
+      // ~290 ms only when the count goes 0 -> 1. Shutting down here would drop
+      // it to zero and make the drain's per-batch utilization probe re-pay the
+      // full price mid-run. The rest of this file follows the same rule ("no
+      // Shutdown (we _Exit)"), and leaving NVML up is what lets that probe work
+      // at all on this path.
+      std::stable_sort(cands.begin(), cands.end(), [](const Cand & a, const Cand & b) {
+        if (a.util != b.util) return a.util < b.util;      // idle first
+        return a.freeb > b.freeb;                          // then roomiest
+      });
+      for (size_t i = 0; i < cands.size() && (int)i < opt.gpu_devices; ++i) {
+        if (!sel.empty()) sel += ",";
+        sel += cands[i].uuid;   // nvml returns the "GPU-<uuid>" form CUDA wants
+      }
+    }
+    if (sel.empty()) {          // no NVML (driver-less box): fall back to indices
+      for (int i = 0; i < opt.gpu_devices; ++i) {
+        if (i) sel += ",";
+        sel += std::to_string(i);
+      }
+    }
+    ::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1);
+  }
   // Freeze the batch geometry the size gate reasons about BEFORE --adapt seeds
   // gpu_batch_cap from the profile (see Options::gpu_batch_cap_gate).
   opt.gpu_batch_cap_gate = opt.gpu_batch_cap;
