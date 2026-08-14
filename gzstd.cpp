@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.5";
+static constexpr const char * GZSTD_VERSION = "0.16.6";
 //
 // Architecture overview:
 //
@@ -20148,6 +20148,32 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   return true;
 }
 
+
+/*======================================================================
+ gpu_ctx_init_lock — create CUDA contexts ONE AT A TIME, so devices come up
+ staggered and each starts working the moment it is ready.
+
+ CUDA context creation serialises inside the driver regardless of what we do:
+ measured with nothing but cudaSetDevice + cudaFree(0) linked, 1/2/4/8 devices
+ cost 0.149 / 0.291 / 0.632 / 1.386 s.  gzstd cannot make that cheaper.
+
+ But it CAN stop paying for it as dead time.  Left concurrent -- every worker
+ calling cudaSetDevice at once, which is what this used to do -- the driver
+ finishes them all together and no device is usable until ~1.39 s:
+
+     concurrent : all 8 devices usable at 1.21-1.37 s
+     serialised : 0.145, 0.298, 0.445, 0.579, 0.728, 0.894, 1.048, 1.190 s
+
+ Serialised, the first device is compressing at 0.145 s while the eighth is
+ still coming up, which recovers **4.19 device-seconds** of otherwise-idle
+ time on an 8-GPU box -- and finishes the whole fleet SOONER (1.19 vs 1.39 s),
+ because the contended path wastes work.
+
+ Only context creation is held: VRAM probing and cudaMalloc stay concurrent, so
+ a device finishes its own setup while the next one takes the lock.
+======================================================================*/
+static std::mutex g_gpu_ctx_init_m;
+
 static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
 {
   if (C.d_in_base) { cudaFree(C.d_in_base); }
@@ -20879,10 +20905,20 @@ static void gpu_worker(
     // hard to reduce) from VRAM probing + cudaMalloc (potentially tunable).
     const uint64_t phase_t0 = now_ns();
     uint64_t probe_ns = 0, malloc_ns = 0;  // accumulated across streams
-    checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
     const size_t host_chunk_bytes = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
     const size_t gpu_chunk = std::min(host_chunk_bytes, GPU_SUBCHUNK_MAX);
     nvcompBatchedZstdCompressOpts_t comp_opts = nvcompBatchedZstdCompressDefaultOpts; size_t max_out_chunk=0;
+    {
+      // One device at a time — see g_gpu_ctx_init_m.  The lock covers ONLY
+      // context creation: cudaSetDevice is lazy, so cudaFree(0) is what forces
+      // the context to exist.  The current device is per-THREAD state and
+      // outlives the lock, so everything after this stays concurrent — holding
+      // the nvCOMP query in here too pushed the last device from 1.35 s to
+      // 1.68 s for no reason.
+      std::lock_guard<std::mutex> ctx_lk(g_gpu_ctx_init_m);
+      checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
+      checkCuda(cudaFree(0), "cudaFree(0) [force context]");
+    }
     checkNvcomp(nvcompBatchedZstdCompressGetMaxOutputChunkSize(gpu_chunk, comp_opts, &max_out_chunk), "nvcompBatchedZstdCompressGetMaxOutputChunkSize");
     const uint64_t ctx_done_ns = now_ns();  // cudaSetDevice forced context creation
     const size_t stream_count = std::max<size_t>(1, opt.gpu_streams);
@@ -23167,7 +23203,14 @@ static void gpu_decomp_worker(
   size_t vram_reserve_bytes = 0;
   try {
     uint64_t init_t0 = g_perf ? now_ns() : 0;
-    checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
+    {
+      // One device at a time — see g_gpu_ctx_init_m.  Same defect as the
+      // compress worker: concurrent creation makes the driver finish every
+      // device together, so none is usable until the last one is.
+      std::lock_guard<std::mutex> ctx_lk(g_gpu_ctx_init_m);
+      checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
+      checkCuda(cudaFree(0), "cudaFree(0) [force context]");
+    }
 
     // For decompress, gpu_batch_cap is PER STREAM (not divided across streams).
     // Kernel launch overhead dominates, so each stream needs large batches.

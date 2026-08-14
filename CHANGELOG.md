@@ -1,11 +1,76 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.5  
+**Covers:** v0.9.50 → v0.16.6  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.16.6 — bring the GPUs up one at a time, so the first one starts working immediately
+
+v0.16.5 measured CUDA context creation at 1.386 s for eight devices and concluded it was
+irreducible. The first half of that is true and the second half was a bad inference.
+
+The measurement behind it created all eight contexts **concurrently** and found they finish
+together, 1.21–1.37 s, with no device usable before the last. That is a fact about *concurrent*
+creation, not about the driver. Creating them **sequentially** gives a staircase:
+
+| device | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| usable at | 0.148 | 0.299 | 0.444 | 0.586 | 0.732 | 0.872 | 1.011 | **1.155 s** |
+
+Sequential creation also finishes the whole fleet **sooner** — 1.155 s against 1.386 — because
+the contended path wastes work on top of delivering nothing early.
+
+Context creation serialises inside the driver no matter what we do, so gzstd cannot make it
+cheaper. What it can do is stop paying for it as dead time. `g_gpu_ctx_init_m` holds context
+creation to one device at a time, in both the compress and decompress workers, so each device
+begins compressing the moment it is ready instead of waiting for the fleet. On eight devices that
+recovers **4.19 device-seconds** of otherwise-idle GPU time.
+
+Two details matter and both were measured:
+
+- **The lock must be narrow.** A first version also held the nvCOMP `GetMaxOutputChunkSize` query
+  inside it and pushed the last device from 1.35 s to 1.68 s for no benefit. Only creation is
+  serialised; VRAM probing and allocation stay concurrent.
+- **`cudaSetDevice` is lazy**, so `cudaFree(0)` is what actually forces the context to exist. The
+  current device is per-thread state and outlives the lock, so nothing after it needs holding.
+
+In-app the staircase is now visible in the `-vv` init breakdown — `ctx=` 329, 152, 500, 807,
+1024, 1238, 1430, 1610 ms — with GPU0 compressing at ~0.38 s instead of ~1.35 s.
+
+End-to-end, `--gpu-only`, three reps, min–max:
+
+| input | v0.16.5 | v0.16.6 |
+|---|---|---|
+| 1.9 GiB | 4.68–5.75 s | 4.47–4.71 s |
+| 8.0 GiB | 5.10–5.35 s | **4.69–4.89 s** (non-overlapping, ~9%) |
+| 24.2 GiB | 5.81–6.02 s | **5.27–5.73 s** (non-overlapping, ~6%) |
+| 195.3 GiB | 14.89–17.80 s | 13.06–15.85 s (medians 16.16 to 13.17) |
+
+### Still open, and unchanged by this
+
+Per-device init cost is linear in device count while throughput is sublinear, so **engaging every
+visible GPU is still not the right default**: measured best device counts are 1 GPU at 1.9 and
+8.0 GiB, 2 at 24.2, 4 at 48.4, and a tie between 2 and 8 at 195.3. The size gate answers whether
+to use a GPU at all and never how many. Staggering makes the eight-device case cheaper; it does
+not make it correct.
+
+### A side effect on the suite, and why it cost nothing
+
+Small fixtures now finish before the second device exists, so most GPU tests engage a single
+device — the emergent form of the same win, and measurably faster. That also deleted the suite's
+*accidental* multi-GPU coverage. It cost nothing only because that accident had already been
+turned into a deliberate test: the multi-GPU dispatch case pins two devices, uses the
+`GZSTD_DEBUG_GPU_ALL_READY` rendezvous so both must claim a first batch before either claims a
+second, and counts devices that **completed** batches rather than ones that merely initialised.
+It still reports *2 GPUs used*. Its own comment called this shot — *"an accident stops covering
+you the moment someone changes an unrelated default"* — and it is now the only multi-GPU
+coverage there is, so it should not be weakened or made conditional.
+
+Verified: extensive suite **548/548** (6m55s), both build configurations compile clean.
 
 
 ## v0.16.5 — hand the input back while the run is still using it
