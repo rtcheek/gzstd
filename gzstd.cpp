@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.4";
+static constexpr const char * GZSTD_VERSION = "0.16.5";
 //
 // Architecture overview:
 //
@@ -6150,6 +6150,13 @@ static size_t robust_fwrite(const void * ptr, size_t size, FILE * f)
  MADV_SEQUENTIAL tells the kernel to read ahead aggressively.
 ======================================================================*/
 #ifndef _WIN32
+// fwd: join the input-retirement thread (defined with InputRetirer, below).
+// MmapRegion::reset() calls it BEFORE munmap so the advising thread can never
+// outlive the mapping -- an exception unwinding past the explicit stop() in the
+// compress drivers would otherwise leave it advising an address range the kernel
+// has already handed to someone else.
+static void gz_input_retire_stop();
+
 class MmapRegion {
 public:
   MmapRegion() = default;
@@ -6172,7 +6179,7 @@ public:
   }
 
   void reset() {
-    if (ptr_) { ::munmap((void *)ptr_, size_); ptr_ = nullptr; size_ = 0; }
+    if (ptr_) { gz_input_retire_stop(); ::munmap((void *)ptr_, size_); ptr_ = nullptr; size_ = 0; }
   }
 
   const char * data() const { return ptr_; }
@@ -7015,6 +7022,114 @@ static size_t check_ram_budget(int threads, size_t chunk_mib, const Options & op
 // fwd: return a --direct-read zero-copy buffer to its pool (defined with DirectReadPool).
 static void gz_direct_read_release(int slot);
 
+/*======================================================================
+ InputRetirer — hand consumed pages of the input mapping back DURING the run
+
+ Unmapping the input costs ~28.7 ms per GiB, and it is pure tail latency: the
+ v0.16.4 host timeline put it at 5.15 s of a 15 s eight-GPU run (34%), after the
+ writer had already drained, so there was nothing left to overlap it with.
+
+ madvise(MADV_DONTNEED) over already-consumed regions moves that work instead of
+ removing it — measured on a 24.2 GiB tmpfs mapping:
+
+     plain munmap                    0.694 s   (28.7 ms/GiB)
+     madvise all, then munmap        0.700 s + 0.012 s
+
+ The final munmap becomes free. Granularity is irrelevant: 16 MiB, 64, 256, 1 GiB
+ and 4 GiB steps all measured 0.70 s, so this is per-byte page-table work, not a
+ per-call or TLB-shootdown effect, and there is no batch size to tune.
+
+ The point is therefore purely to OVERLAP it with compression, where the host
+ cores are idle because the GPUs are the bottleneck. So the madvise runs on its
+ own thread and never on a worker's critical path.
+
+ WHY THIS IS SAFE. The mapping is PROT_READ + MAP_PRIVATE, so nothing is dirty
+ and MADV_DONTNEED only drops PTEs. A read of a retired page re-faults it from
+ page cache and sees identical bytes. **Retiring a region too early is therefore
+ a performance bug, never a correctness bug** — which is what makes it acceptable
+ to drive this from release_input(), whose contract ("this task is done with its
+ input") is exactly the condition we need.
+
+ Regions are retired only as a CONTIGUOUS PREFIX: releases arrive out of order,
+ so an interval map holds the gaps until the prefix closes over them.
+======================================================================*/
+class InputRetirer {
+public:
+  void start(const char * base, size_t size) {
+    stop();
+    std::lock_guard<std::mutex> lk(m_);
+    base_ = base; size_ = size; watermark_ = 0; advised_ = 0; done_.clear();
+    quit_ = false; pending_lo_ = pending_hi_ = 0;
+    thr_ = std::thread([this]{ worker(); });
+  }
+  // Idempotent: safe to call when never started, and called on every teardown
+  // path so the thread cannot outlive the mapping it is advising.
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (!thr_.joinable()) { base_ = nullptr; return; }
+      quit_ = true;
+    }
+    cv_.notify_all();
+    thr_.join();
+    std::lock_guard<std::mutex> lk(m_);
+    base_ = nullptr; size_ = 0; done_.clear();
+  }
+  void release(const char * p, size_t len) {
+    if (!base_ || !p || !len) return;                 // not our mapping
+    if (p < base_ || p + len > base_ + size_) return; // ditto (pooled/heap views)
+    bool wake = false;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (!base_) return;
+      const size_t off = size_t(p - base_);
+      done_[off] = off + len;
+      for (auto it = done_.find(watermark_); it != done_.end(); it = done_.find(watermark_)) {
+        watermark_ = it->second;
+        done_.erase(it);
+      }
+      if (watermark_ > advised_ && pending_hi_ == pending_lo_) {
+        pending_lo_ = advised_; pending_hi_ = watermark_; advised_ = watermark_;
+        wake = true;
+      }
+    }
+    if (wake) cv_.notify_one();
+  }
+  ~InputRetirer() { stop(); }
+private:
+  void worker() {
+    for (;;) {
+      size_t lo, hi; const char * b;
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [this]{ return quit_ || pending_hi_ > pending_lo_; });
+        if (quit_ && pending_hi_ == pending_lo_) return;
+        lo = pending_lo_; hi = pending_hi_; b = base_;
+        pending_lo_ = pending_hi_ = 0;
+      }
+      // Outside the lock: this is the expensive call (~28.7 ms/GiB) and holding
+      // the lock across it would stall every releasing worker.  Ranges handed
+      // out here never overlap, because advised_ only ever moves forward.
+      if (b && hi > lo) { ::madvise((void *)(b + lo), hi - lo, MADV_DONTNEED); }
+    }
+  }
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::thread thr_;
+  const char * base_ = nullptr;
+  size_t size_ = 0;
+  size_t watermark_ = 0;     // contiguous prefix fully released
+  size_t advised_ = 0;       // prefix already handed to the advise thread
+  size_t pending_lo_ = 0, pending_hi_ = 0;
+  bool   quit_ = false;
+  std::map<size_t, size_t> done_;   // off -> end, released but not yet contiguous
+};
+static InputRetirer g_input_retirer;
+static inline void gz_input_retire(const char * p, size_t len) {
+  g_input_retirer.release(p, len);
+}
+static void gz_input_retire_stop() { g_input_retirer.stop(); }
+
 struct Task {
   size_t seq = 0;
   std::vector<char> data;
@@ -7030,7 +7145,7 @@ struct Task {
   size_t       len() const { return view_ptr ? view_len : data.size(); }
   void release_input() {
     if (direct_buf >= 0) { gz_direct_read_release(direct_buf); direct_buf = -1; view_ptr = nullptr; view_len = 0; }
-    else if (view_ptr)   { view_ptr = nullptr; view_len = 0; }
+    else if (view_ptr)   { gz_input_retire(view_ptr, view_len); view_ptr = nullptr; view_len = 0; }
     else                 { std::vector<char>().swap(data); }
   }
 };
@@ -19461,6 +19576,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     g_adapt_src_path.store("mmap", std::memory_order_relaxed);
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
+    // Hand consumed pages back while the run proceeds; see InputRetirer.
+    g_input_retirer.start(base, file_size);
     size_t off = 0;
     uint64_t mmap_rd_t0 = g_perf ? now_ns() : 0;
     while (off < file_size) {
@@ -19563,6 +19680,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // sampling /proc/<pid>/task/*/wchan during the post-work window shows several
   // threads in D state on __vm_munmap, and on a 195 GiB input the input mapping
   // alone accounts for roughly 3.3 s of it (~17 ms/GiB).
+  g_input_retirer.stop();   // join before the mapping goes away
   mmap_region.reset();
   throttle.set_done();  // safe now: all workers exited
   {
@@ -22565,6 +22683,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     g_adapt_src_path.store("mmap", std::memory_order_relaxed);
     const char * base = mmap_region.data();
     const size_t file_size = mmap_region.size();
+    // Hand consumed pages back while the run proceeds; see InputRetirer.
+    g_input_retirer.start(base, file_size);
     size_t off = 0;
     uint64_t mmap_rd_t0 = g_perf ? now_ns() : 0;
     while (off < file_size) {
@@ -22828,6 +22948,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // so no Task view into the mapping survives; the writer only ever holds
   // compressed output, which is copied.  Doing it now overlaps the page-table
   // teardown with the writer drain instead of leaving it as pure tail latency.
+  g_input_retirer.stop();   // join before the mapping goes away
   mmap_region.reset();
   perf_mark(PerfCounters::HM_INPUT_RELEASED);
 

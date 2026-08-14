@@ -1,11 +1,73 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.4  
+**Covers:** v0.9.50 → v0.16.5  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.16.5 — hand the input back while the run is still using it
+
+v0.16.4's host timeline put the input unmap at **5.131 s of a 15.5 s eight-GPU run — 33%** — and
+showed it was pure tail latency: `writer drain` read 0.000 s immediately after it, so there was
+nothing left to overlap with.
+
+`madvise(MADV_DONTNEED)` over already-consumed regions does not make that work cheaper, it
+**moves** it. Measured on a 24.2 GiB tmpfs mapping (`tool_madvbench.c`):
+
+| | madvise | final munmap |
+|---|---|---|
+| plain munmap | — | 0.694 s (28.7 ms/GiB) |
+| madvise all, then munmap | 0.700 s | **0.012 s** |
+
+**Granularity is irrelevant** — 16 MiB, 64 MiB, 256 MiB, 1 GiB and 4 GiB steps all cost 0.70 s.
+This is per-byte page-table work, not a per-call or TLB-shootdown effect, so there is no batch
+size to tune and no reason to fear issuing many small calls. Two prior concerns — a TLB-IPI storm
+and mmap-lock contention — were both wrong for a single-threaded retirement loop.
+
+So the entire win is overlap, and `InputRetirer` takes it: `release_input()` reports the consumed
+view, a contiguous-prefix watermark advances over out-of-order releases, and a dedicated thread
+advises the closed prefix while compression runs. The thread exists precisely so the expensive
+call never lands on a worker's critical path.
+
+| segment, 195.3 GiB, 8 GPUs | v0.16.4 | v0.16.5 |
+|---|---|---|
+| release input map | 5.131 s (33%) | **0.136 s (1%)** |
+| compress (workers) | 7.812 s | 10.927 s |
+| writer drain | 0.760 s | 0.000 s |
+
+End-to-end, 4 interleaved reps, min–max, both non-overlapping:
+
+| | v0.16.4 | v0.16.5 |
+|---|---|---|
+| `--gpu-only` | 16.96–18.90 s | **13.85–16.23 s** (~13%) |
+| `--cpu-only` | 7.48–7.64 s | **6.20–6.67 s** (~15%) |
+
+The CPU path gains more proportionally: same fixed unmap cost, shorter run.
+
+### Why release_input() is an acceptable trigger
+
+The mapping is `PROT_READ` + `MAP_PRIVATE`. Nothing is dirty, so `MADV_DONTNEED` only drops PTEs,
+and a read of a retired page re-faults it from page cache and sees identical bytes. **Retiring a
+region too early is therefore a performance bug and never a correctness bug** — which is what
+makes it safe to drive this from a per-task "done with its input" signal rather than from a
+global barrier.
+
+The thread's lifetime is structural rather than positional: `MmapRegion::reset()` stops the
+retirer before `munmap`, so an exception unwinding past the compress drivers' explicit stop
+cannot leave it advising an address range the kernel has already handed to something else.
+
+**Not fully hidden.** The compress window grew 7.812 to 10.927 s, so roughly 3.1 s of the 5.0 s
+reappeared inside the run: advising retired pages contends with faulting new ones. The net is
+clearly positive and measured, but retiring with a deliberate lag, or throttling the advise
+thread, may recover more.
+
+Verified: extensive suite **548/548** (6m51s), both build configurations compile clean, and
+byte-identical round-trips on `--gpu-only`, `--cpu-only` and `--hybrid` including a full
+195 GiB run, plus stock `zstd -t`, `--verify`, the GPU-fault CPU rebuild, and `--no-mmap` with
+the retirer correctly inactive.
 
 
 ## v0.16.4 — a timeline for the host, and it corrects two claims from v0.16.3
