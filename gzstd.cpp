@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.2";
+static constexpr const char * GZSTD_VERSION = "0.16.3";
 //
 // Architecture overview:
 //
@@ -19499,6 +19499,17 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   thread_guard.armed = false;   // from here the normal path owns the joins
   for (auto & th : pool) th.join();
   g_direct_read_pool = nullptr;  // workers done: no more release() calls; safe to drop the pool
+  // Unmap the input HERE, not at scope exit, so the kernel tears down the page
+  // tables while the writer is still draining instead of after it.  Same
+  // lifetime argument as the line above: only Tasks hold views into the
+  // mapping, every Task is consumed by a worker, and the workers are joined.
+  // The writer holds compressed output, which is copied, never a view.
+  //
+  // Worth doing because the unmap is not cheap and it is pure tail latency:
+  // sampling /proc/<pid>/task/*/wchan during the post-work window shows several
+  // threads in D state on __vm_munmap, and on a 195 GiB input the input mapping
+  // alone accounts for roughly 3.3 s of it (~17 ms/GiB).
+  mmap_region.reset();
   throttle.set_done();  // safe now: all workers exited
   {
     std::lock_guard<std::mutex> lk(results.m);
@@ -19996,13 +20007,35 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   if (C.ev_comp_end) { cudaEventDestroy(C.ev_comp_end); }
   if (C.ev_d2h_end) { cudaEventDestroy(C.ev_d2h_end); }
   if (C.ev_done) { cudaEventDestroy(C.ev_done); }
-  // Preserve accumulated per-stream stats (+ last_adjust) across the buffer
-  // reallocation: C = StreamCtx{} would otherwise wipe the JSON stats.
+  // Preserve what the CALLER still owns across the buffer reallocation:
+  // C = StreamCtx{} wipes every field, and four of them are read after this
+  // function returns.
+  //
+  //   stats/last_adjust  — accumulated per-stream JSON stats.
+  //   stream             — this function frees BUFFERS, not the stream.  Every
+  //                        caller either destroys it afterwards or reallocates
+  //                        onto it, and zeroing it made `if (C.stream)
+  //                        cudaStreamDestroy(...)` a silent no-op: the stream
+  //                        LEAKED on both teardown paths.
+  //   per_stream_batch   — the VRAM retry loop halves it and re-tests it.
+  //                        Zeroing it made the loop's `C.per_stream_batch <= 1`
+  //                        test fire on the FIRST failure, every time, so the
+  //                        documented 256 -> 128 -> 64 back-off never ran and a
+  //                        transient allocation failure killed the stream
+  //                        outright.  It also meant the retry's
+  //                        allocate_stream_buffers() call was handed batch 0 on
+  //                        a null stream.  Matters most on small cards, which
+  //                        are exactly where the back-off is supposed to save
+  //                        the run.
   auto save_adjust = C.last_adjust;
-  auto save_stats = C.stats;
+  auto save_stats  = C.stats;
+  auto save_stream = C.stream;
+  auto save_batch  = C.per_stream_batch;
   C = StreamCtx{};
-  C.last_adjust = save_adjust;
-  C.stats = save_stats;
+  C.last_adjust      = save_adjust;
+  C.stats            = save_stats;
+  C.stream           = save_stream;
+  C.per_stream_batch = save_batch;
 }
 
 
@@ -22732,6 +22765,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #ifndef _WIN32
   g_direct_read_pool = nullptr;  // all release() callers joined; safe to drop the pool
 #endif
+  // Unmap the input HERE rather than at scope exit — see the matching comment in
+  // the CPU path.  Every GPU worker and every hybrid CPU worker is joined above,
+  // so no Task view into the mapping survives; the writer only ever holds
+  // compressed output, which is copied.  Doing it now overlaps the page-table
+  // teardown with the writer drain instead of leaving it as pure tail latency.
+  mmap_region.reset();
 
   // Signal writer that all workers are done
   {

@@ -1,11 +1,91 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.2  
+**Covers:** v0.9.50 → v0.16.3  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.16.3 — a back-off that never backed off, and teardown charged to the tail
+
+Two independent fixes, both found while chasing where the wall clock actually goes
+rather than where the compression happens.
+
+### The VRAM back-off has never run
+
+`free_stream_buffers_only()` frees *buffers*, but it did so with `C = StreamCtx{}`, which
+wipes every field in the context. Two of them are read immediately afterwards.
+
+**`per_stream_batch`** is what the VRAM retry loop halves and re-tests. Zeroed, the loop's
+`C.per_stream_batch <= 1` guard fired on the **first** failure, every time — so the
+documented 256 → 128 → 64 back-off never executed once, and its "VRAM insufficient, reducing
+batch to N" line could never print. A single transient allocation failure abandoned the whole
+device with `insufficient VRAM for even 1 stream at batch=1`, a message that was itself false:
+the batch was 256 and had never been halved. The retry then handed batch 0 to
+`allocate_stream_buffers()` on a null stream.
+
+**`stream`** is destroyed by the caller, not by this function. Zeroed, every
+`if (C.stream) cudaStreamDestroy(C.stream)` became a silent no-op and the stream leaked on
+both teardown paths.
+
+Both are now preserved alongside `stats`/`last_adjust`. **This matters most on small cards,
+which are exactly where a back-off is supposed to save the run** — on a 95 GiB H100 the first
+allocation simply succeeds, which is why eight of them never exposed it.
+
+Mutation-tested in both directions, by forcing the first two allocations to fail: unfixed, one
+failure skips the device; fixed, the batch halves to 128 and the retry proceeds with the stream
+handle intact.
+
+### The input mapping was unmapped after the run instead of during it
+
+`gdb` and `perf` are both unavailable on this host (`ptrace_scope=1`,
+`perf_event_paranoid=4`), so the post-work window was profiled by sampling
+`/proc/PID/task/*/wchan`. It shows several threads in uninterruptible sleep on
+`__vm_munmap` while RSS drains — kernel page-table teardown, charged entirely to the tail.
+
+`mmap_region.reset()` now runs immediately after the workers join, in **both** compress paths,
+so the teardown overlaps the writer drain. The lifetime argument is the one already made by the
+adjacent `g_direct_read_pool = nullptr`: only Tasks hold views into the mapping, every Task is
+consumed by a worker, the workers are joined, and the writer holds compressed output, which is
+copied rather than viewed.
+
+195.3 GiB in tmpfs, 4 interleaved reps, min–max:
+
+| | before | after |
+|---|---|---|
+| `--gpu-only` | 16.67–17.82 s | **15.48–16.24 s** (~8%, non-overlapping) |
+| `--cpu-only` | 7.50–7.60 s | 7.38–7.69 s (overlapping — neutral) |
+
+The CPU path is neutral because that run is too short to leave much writer drain to hide the
+unmap behind.
+
+### What the measurements actually said, which was not what was being optimised
+
+A controlled scale-up — **constant 24.2 GiB per GPU**, batch pinned at 128, one stream — shows
+per-device throughput collapsing as devices are added:
+
+| GPUs | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| total GiB/s | 4.04 | 6.86 | 10.04 | 12.31 |
+| **per GPU** | **4.04** | 3.43 | 2.51 | **1.54** |
+| efficiency | 100% | 85% | 62% | **38%** |
+
+**One GPU sustains 4.04 GiB/s; eight deliver three times the work of one.** Per-device
+efficiency is not the problem — sharing is. Every staging and drain change up to this point was
+tuning the single-device number. Not yet isolated: the single host reader, host-memory/PCIe
+aggregate bandwidth, the single writer thread (zero-scan is 94.9% of its busy time), queue and
+ResultStore lock contention, and in-order head-of-line blocking (17–22%, averaging 306 frames
+stuck at eight devices).
+
+A single-device batch sweep also puts the optimum at **batch=128 (4.03 GiB/s)**, with **256 —
+where the shared auto-tuner settles — measurably worse** (5.99–6.02 s against 6.52–6.78,
+non-overlapping). Left alone deliberately: the right batch may move once sharing is fixed.
+
+Verified: extensive suite **548/548** (6m44s), both build configurations compile clean, and
+byte-identical round-trips on `--gpu-only`, `--cpu-only` and `--hybrid` plus stock `zstd -t`,
+`--verify`, and the GPU-fault CPU rebuild.
 
 
 ## v0.16.2 — the drain was barriering the whole device, and two D2H fixes that lost
