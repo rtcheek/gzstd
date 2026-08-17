@@ -1,11 +1,89 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.8  
+**Covers:** v0.9.50 → v0.16.9  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.16.9 — --adapt senses the core budget, because "the box is busy" is the wrong signal
+
+The GPU backend wins on a machine that is short of CPU cores, and loses on one that is not. That
+much was assumed. What was not known is *where* the line sits, or what signal finds it — and the
+obvious candidate, "is the box busy", turns out to be wrong.
+
+### The measurements
+
+195.3 GiB from tmpfs, cores varied with `-T`, best of 2:
+
+| cores | 4 | 8 | 12 | 16 | 24 |
+|---|---|---|---|---|---|
+| `--cpu-only` | 30.62 s | 15.11 | **10.12** | **7.78** | **5.75** |
+| `--hybrid` | 17.11 | **13.69** | 11.94 | 9.55 | 8.11 |
+| `--gpu-only` | **14.71** | 14.21 | 14.51 | 14.21 | 13.02 |
+
+`cpu_time × cores` is nearly constant — 122, 121, 121, 124, 138 core-seconds — so the CPU backend
+scales as ~K/cores, while the GPU backend is **flat**. The crossover is therefore K_cpu/K_gpu
+≈ 8.7 cores, and the winner really does change between 8 and 12.
+
+### Why "busy" is the wrong signal
+
+A full contention sweep, with load supplied by concurrent gzstd instances, found **no crossover at
+all**: every backend degraded by the same factor (1.8 / 1.7 / 1.76x) up to 73% CPU busy. The
+reason is that a 256-core box cannot starve gzstd of cores — even at 87% busy, ~33 remain, far
+above the crossover.
+
+Worse, "busy" conflates two different things:
+
+| load type | `--cpu-only` | `--gpu-only` |
+|---|---|---|
+| memory-heavy (gzstd compressing), 73% busy | 1.8x slower | **1.7x slower** |
+| core-only (arithmetic spinners), 87% busy | 1.9x slower | **1.23x slower** |
+
+The GPU path is largely immune to **core** contention and fully exposed to **memory-bandwidth**
+contention, because its H2D staging competes for the same bandwidth the CPU compressors use. So a
+busy-ness trigger predicts the wrong thing in one of those two cases. Available **cores** predicts
+both.
+
+### What changed
+
+`adapt_avail_cores()` reports the cores a run can actually expect: the affinity mask (taskset,
+cgroup, container), reduced by the current load as a *fraction*. Contention is applied as a
+fraction and never subtracted — a first version subtracted a system-wide load average from a
+per-process affinity count and reported **1 core available instead of 8** under `taskset -c 0-7`,
+because it charged the whole machine's load against an 8-core allowance.
+
+The profile now records `overall_gibs_cpu_cores` beside each cpu-only rate, because that rate is
+meaningless without the budget that produced it. At decision time the stored rate is rescaled to
+this run's budget, clamped so more cores than were measured can never inflate it (cpu-only
+saturates). The GPU side is left unscaled: hybrid does degrade with fewer cores, but far less, and
+scaling both would put hybrid at 0.94 against cpu's 1.01 at 8 cores and pick cpu-only — which is
+measurably wrong there. The state table for all four cases is written into the code.
+
+Observed on one machine, one profile:
+
+```
+247 cores:  cpu prior 30.76 -> 30.54 GiB/s  ->  defaulting compress to --cpu-only
+  8 cores:  cpu prior 32.64 ->  1.01 GiB/s  ->  defaulting compress to --hybrid
+```
+
+`--adapt` only. Runs without it are untouched, and profiles written before this release simply
+lack the core count, which skips the adjustment — so no schema epoch bump is required.
+
+The endian source-guard needed a `sched_getaffinity` exemption: a CPU mask taken from the kernel
+matches the `&addr` + `sizeof` shape the check looks for, but has no on-disk representation and
+no byte order. Mutation-tested — a genuine host-order `pread` is still caught, so the exemption
+did not widen into a hole.
+
+Verified: extensive suite **548/548** (6m46s), both build configurations compile clean, plus
+byte-identical round-trips on all three backends, GPU decompress, the GPU-fault CPU rebuild, and
+stock `zstd -t`. Non-`--adapt` runs are unchanged, including `--version` at 0.00 s.
+
+**Measured on one machine.** The shape generalises — cpu-only scales ~1/cores, the GPU path does
+not — and each machine derives its own crossover from its own recorded rate. The ~8.7-core figure
+is this host's; a box with a slower GPU or faster cores lands elsewhere.
 
 
 ## v0.16.8 — sample the GPUs in the background, and pick the idle one

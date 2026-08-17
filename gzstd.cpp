@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.8";
+static constexpr const char * GZSTD_VERSION = "0.16.9";
 //
 // Architecture overview:
 //
@@ -3455,6 +3455,9 @@ static std::atomic<bool> g_adapt_gpu_absent{false};
 // winner between the two rules.  Set once, in apply_backend_defaults; never reset
 // by the governor, which starts after the probe has already run.
 static std::atomic<int> g_adapt_resid_class{-1};
+// Cores available when the run STARTED — sampled before gzstd has loaded the box
+// itself, so the load average in it reflects other work rather than our own.
+static std::atomic<double> g_adapt_avail_cores{-1.0};
 // Is THIS run's input cold, for READ-PATH purposes?  -1 unknown, 0 warm, 1 cold.
 // Deliberately separate from g_adapt_resid_class above: that one keys the BACKEND
 // prior and is decompress-only, whereas the read path wants the same question
@@ -3474,6 +3477,62 @@ static std::atomic<int> g_adapt_src_cold{-1};
 // off for ADAPT_BACKEND_RECHECK_RUNS.
 static std::atomic<int> g_adapt_explored{0};
 static const char * adapt_resid_class_name(int c) { return c == 1 ? "warm" : "cold"; }
+
+// Cores this process can actually expect to get, right now.
+//
+// TWO CONSTRAINTS, and the smaller wins: how many CPUs we are ALLOWED (affinity
+// mask — taskset, cgroup, container) and how many are not already spoken for by
+// other work (1-minute load average, which at startup reflects everyone else,
+// since we have not begun).  Returns -1 when neither can be read, which callers
+// treat as "do not adjust" rather than guessing.
+//
+// WHY THIS IS THE SIGNAL, and "is the box busy" is not.  Measured on the 8xH100
+// host, 195.3 GiB, cores varied with -T:
+//
+//     cores      4       8      12      16      24
+//     cpu-only  30.62  15.11  10.12   7.78   5.75 s   <- ~ K/cores
+//     hybrid    17.11  13.69  11.94   9.55   8.11 s
+//     gpu-only  14.71  14.21  14.51  14.21  13.02 s   <- FLAT
+//
+// cpu_time x cores is nearly constant (122, 121, 121, 124, 138 core-seconds),
+// so the CPU backend scales ~1/cores, while the GPU backend does not care about
+// cores at all. The crossover is therefore K_cpu / K_gpu = 122/14.1 ~= 8.7
+// cores, and the backend that wins really does change at 8-12.
+//
+// A busy-ness signal cannot express this. Under CORE contention the GPU path
+// barely moves (1.23x at 87% busy) but under MEMORY-BANDWIDTH contention it
+// degrades as much as the CPU path (1.7x), so "the box is loaded" predicts the
+// wrong thing in one of those two cases. Available CORES predicts both.
+static double adapt_avail_cores()
+{
+  long allowed = 0;
+#ifndef _WIN32
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof(set), &set) == 0) allowed = CPU_COUNT(&set);
+#endif
+  if (allowed <= 0) {
+    const unsigned hc = std::thread::hardware_concurrency();
+    allowed = hc ? (long)hc : 0;
+  }
+  if (allowed <= 0) return -1.0;
+  // Contention is applied as a FRACTION, never subtracted.  The load average is
+  // system-wide while the affinity mask is per-process, so subtracting one from
+  // the other mixes scopes: under `taskset -c 0-7` on this 256-core box that
+  // arithmetic reported 1 core available instead of 8, because it charged the
+  // whole machine's load against an 8-core allowance.  Scaling by the busy
+  // fraction composes correctly with any allowance.
+  const unsigned hw = std::thread::hardware_concurrency();
+  const double total = hw ? (double)hw : (double)allowed;
+  double load1 = 0.0;
+  if (std::ifstream la("/proc/loadavg"); la) la >> load1;   // 1-minute average
+  double busy_frac = (total > 0 && load1 > 0) ? load1 / total : 0.0;
+  if (busy_frac < 0.0) busy_frac = 0.0;
+  if (busy_frac > 0.95) busy_frac = 0.95;      // never claim zero cores
+  const double effective = (double)allowed * (1.0 - busy_frac);
+  return effective < 1.0 ? 1.0 : effective;
+}
+
 // Reader-count bucket: the regime coordinates that are knowable BEFORE the run,
 // which is the constraint a seed has to live with — the governor's own regime
 // verdict only exists once the run is over.  cold/warm x file/nofile reproduces
@@ -4815,6 +4874,7 @@ struct AdaptObs {
   int tar_write_threads = 0;                     // -d --tar: settled pool size (0 = untried)
   int tar_wclass = -1;                           // -d --tar: workload class the size belongs to
   int resid_class = -1;                          // input residency class the backend rate belongs to
+  double avail_cores = -1.0;                     // cores available when the backend rate was produced
   int src_cold = -1;                             // read-path residency (-1 unknown, 0 warm, 1 cold)
   int rd_settled = 0;                            // buffered reader pool the controller settled on (0 = n/a)
   int sink_regular = -1;                         // sink class this run ran with (-1 unknown)
@@ -4835,6 +4895,7 @@ struct AdaptObs {
     if (const char * p = g_adapt_src_path.load(std::memory_order_relaxed))
       src_path = p;
     resid_class = g_adapt_resid_class.load(std::memory_order_relaxed);
+    avail_cores = g_adapt_avail_cores.load(std::memory_order_relaxed);
     src_cold    = g_adapt_src_cold.load(std::memory_order_relaxed);
     rd_settled  = g_adapt_rd_settled.load(std::memory_order_relaxed);
     sink_regular = g_adapt_sink_regular.load(std::memory_order_relaxed);
@@ -4955,6 +5016,13 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     } else if (obs.backend_used == 1) {
       dir.put_num("overall_gibs_cpu", ema(dir.gnum("overall_gibs_cpu", 0), rate));
       dir.put_num("overall_gibs_cpu_run", dir.gnum("runs", 0));
+      // How many cores produced that rate.  Without it the number is unusable on
+      // any run with a different core budget: cpu-only scales ~1/cores, so a rate
+      // measured on an idle 256-core box says nothing about the same box with 8
+      // cores free.  See adapt_avail_cores for the measurements.
+      if (obs.avail_cores > 0)
+        dir.put_num("overall_gibs_cpu_cores", ema(dir.gnum("overall_gibs_cpu_cores", 0),
+                                                  obs.avail_cores));
       if (rc) {
         const std::string k = std::string("overall_gibs_cpu_") + rc;
         dir.put_num(k, ema(dir.gnum(k, 0), rate));
@@ -5066,6 +5134,7 @@ struct AdaptPriors {
     double overall_gibs = 0, settled_batch = 0, runs = 0;
     double input_gibs = 0;   // input-domain rate, for duration prediction
     double overall_cpu = 0, overall_hybrid = 0;             // end-to-end, per backend
+    double overall_cpu_cores = 0;                          // cores that produced overall_cpu
     double overall_cpu_run = 0, overall_hybrid_run = 0;     // run index each was last measured at
     // Same pair, bucketed by input residency class ([0] = cold, [1] = warm).
     double overall_cpu_cls[2] = {0, 0}, overall_hybrid_cls[2] = {0, 0};
@@ -5116,6 +5185,7 @@ static AdaptPriors adapt_load_priors()
     D.overall_gibs  = dj->gnum("overall_gibs", 0);
     D.input_gibs    = dj->gnum("input_gibs", 0);
     D.overall_cpu    = dj->gnum("overall_gibs_cpu", 0);
+    D.overall_cpu_cores = dj->gnum("overall_gibs_cpu_cores", 0);
     // A driver change already invalidates gpu_gibs and settled_batch above; the
     // end-to-end HYBRID rates were produced by that same GPU stack, so they are
     // just as stale.  Leaving them loaded let a pre-change measurement select
@@ -28568,6 +28638,11 @@ static bool adapt_output_is_regular(const Options & opt)
 ======================================================================*/
 static void apply_backend_defaults(Options & opt)
 {
+  // Sample the core budget BEFORE any of our own work loads the machine, and
+  // BEFORE the early returns below — a run that pinned its backend on the
+  // command line still records a rate, and that rate is only interpretable
+  // alongside the core count that produced it.
+  g_adapt_avail_cores.store(adapt_avail_cores(), std::memory_order_relaxed);
 #ifdef HAVE_NVCOMP
   // --gpu-devices=N must HIDE the other devices from CUDA, not just decline to
   // use them.
@@ -29251,6 +29326,45 @@ static void apply_backend_defaults(Options & opt)
   if (priors.loaded) {
     double oc = prior_dir.overall_cpu, oh = prior_dir.overall_hybrid;
     double oc_run = prior_dir.overall_cpu_run, oh_run = prior_dir.overall_hybrid_run;
+    // CORE-BUDGET ADJUSTMENT.  A stored cpu-only rate is only valid at the core
+    // count that produced it: measured here, cpu_time x cores is nearly constant
+    // (122/121/121/124/138 core-seconds at 4/8/12/16/24 cores) while the GPU
+    // backend is flat (14.7/14.2/14.5/14.2/13.0 s). So the CPU side is rescaled
+    // to THIS run's budget and the GPU side is not, which is the whole crossover:
+    // K_cpu/K_gpu ~= 8.7 cores predicted, 8-12 measured.
+    //
+    // STATE TABLE — {cores now} x {cores when measured} -> what happens:
+    //   either unknown                 -> no adjustment; today's behaviour
+    //   now >= then                    -> clamped to 1.0x; more cores than were
+    //                                     measured cannot be assumed to help,
+    //                                     because cpu-only saturates
+    //   now <  then                    -> oc scaled DOWN by now/then; hybrid
+    //                                     becomes relatively better, which is
+    //                                     the intended shift
+    //   scaled below the margin        -> the existing compare picks hybrid; no
+    //                                     new decision path, no new flap risk
+    //
+    // Only the cpu side is scaled. Hybrid also carries CPU work and does degrade
+    // with fewer cores (17.11/13.69/11.94/9.55/8.11 s), just far less, so
+    // leaving it unscaled biases toward hybrid exactly where the measurements
+    // say hybrid wins — and never manufactures a cpu-only win that was not
+    // measured.
+    const double cores_now  = g_adapt_avail_cores.load(std::memory_order_relaxed);
+    const double cores_then = prior_dir.overall_cpu_cores;
+    double core_adj = 1.0;
+    if (oc > 0 && cores_now > 0 && cores_then > 0) {
+      core_adj = cores_now / cores_then;
+      if (core_adj > 1.0) core_adj = 1.0;      // saturation: never inflate
+      oc *= core_adj;
+      if (core_adj < 0.999 && opt.verbosity >= V_VERBOSE) {
+        char cl[192];
+        std::snprintf(cl, sizeof(cl),
+          "[ADAPT] core budget: %.0f cores now vs %.0f when measured -> cpu prior "
+          "%.2f scaled to %.2f GiB/s\n", cores_now, cores_then,
+          prior_dir.overall_cpu, oc);
+        vlog(V_VERBOSE, opt, cl);
+      }
+    }
     // Prefer the bucket matching THIS input's residency.  Once a bucket holds any
     // measurement it is used exclusively — a missing side reads as untried and
     // gets explored, which fills the pair honestly instead of comparing a warm

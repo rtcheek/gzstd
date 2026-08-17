@@ -124,6 +124,8 @@ declare -a ALLOW_CALLEE=(
   'getpwuid_r'                   # &passwd out-param; no on-disk integer field
   'getgrgid_r'                   # &group out-param; likewise
   'pthread_setaffinity_np'       # &cpu_set_t in; scheduling, not a field read
+  'sched_getaffinity'            # &cpu_set_t OUT from the kernel; a CPU mask has
+                                 # no on-disk representation and no byte order
   'strftime'                     # &tm in, formatted text out; no on-disk integer
 )
 
