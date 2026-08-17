@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.16.7";
+static constexpr const char * GZSTD_VERSION = "0.16.8";
 //
 // Architecture overview:
 //
@@ -221,6 +221,146 @@ static inline nvmlReturn_t nvmlDeviceGetUUID(nvmlDevice_t d, char * buf, unsigne
 { auto & a = gz_nvml(); return a.DeviceGetUUID ? a.DeviceGetUUID(d, buf, len) : GZ_NVML_UNAVAILABLE; }
 static inline nvmlReturn_t nvmlSystemGetDriverVersion(char * buf, unsigned int len)
 { auto & a = gz_nvml(); return a.SystemGetDriverVersion ? a.SystemGetDriverVersion(buf, len) : GZ_NVML_UNAVAILABLE; }
+
+/*======================================================================
+ GpuMonitor — one background NVML sampler, started at process entry
+
+ WHY A THREAD, AND WHY THIS EARLY.  NVML answers long before CUDA does. Started
+ at the same instant, measured on an 8xH100 host:
+
+     NVML full table for all 8 GPUs   0.390 s
+     first GPU usable, 1 visible      1.354 s
+     first GPU usable, 8 visible      3.391 s
+
+ So the ranking is ready roughly a second before there is a GPU to rank for —
+ but only if nobody waits for it synchronously. v0.16.7 paid ~347 ms inline in
+ apply_backend_defaults; started at process entry instead, gzstd's own startup
+ (arg parsing, opening the input, building the queue) overlaps it and the same
+ information costs nothing.
+
+ It also fixes a signal problem. A SINGLE utilization read is unreliable —
+ nvidia-smi was repeatedly observed reporting 0% while a gzstd job was actively
+ compressing on that device. A sampler can average over time, which one inline
+ probe never could.
+
+ TWO RULES THIS CODE MUST KEEP:
+   * NVML indices are NOT CUDA indices (NVML enumerates in PCI order, CUDA
+     defaults to fastest-first; all eight devices mismatched on this box). Rows
+     therefore carry UUID and PCI bus ID, never an index to hand to CUDA.
+   * NVML init is REFCOUNTED and costs ~290 ms only on 0 -> 1. Never shut it
+     down: the rest of the file follows the same rule ("no Shutdown, we _Exit"),
+     and dropping the count makes the next user re-pay in full.
+======================================================================*/
+class GpuMonitor {
+public:
+  struct Row {
+    std::string  uuid;        // "GPU-<uuid>", the form CUDA_VISIBLE_DEVICES accepts
+    std::string  pci;         // "%08x:%02x:%02x.0", for correlating with CUDA
+    unsigned     util = 0;    // smoothed 0-100, lower is better
+    unsigned long long free_bytes = 0;
+    unsigned long long total_bytes = 0;
+  };
+
+  // Non-blocking; safe to call when NVML is absent (the thread simply exits).
+  void start() {
+#ifdef HAVE_NVML
+    std::lock_guard<std::mutex> lk(m_);
+    if (started_) return;
+    started_ = true;
+    thr_ = std::thread([this]{ run(); });
+#endif
+  }
+  void stop() {
+#ifdef HAVE_NVML
+    { std::lock_guard<std::mutex> lk(m_); if (!thr_.joinable()) return; quit_ = true; }
+    cv_.notify_all();
+    thr_.join();
+#endif
+  }
+  ~GpuMonitor() { stop(); }
+
+  // Wait up to `ms` for the first sweep.  Returns false if NVML never came up.
+  bool wait_ready(int ms) {
+#ifdef HAVE_NVML
+    std::unique_lock<std::mutex> lk(m_);
+    cv_ready_.wait_for(lk, std::chrono::milliseconds(ms),
+                       [this]{ return ready_ || dead_; });
+    return ready_;
+#else
+    (void)ms; return false;
+#endif
+  }
+  std::vector<Row> snapshot() const {
+    std::lock_guard<std::mutex> lk(m_);
+    return rows_;
+  }
+
+private:
+#ifdef HAVE_NVML
+  void run() {
+    if (nvmlInit_v2() != NVML_SUCCESS) {           // no driver: publish nothing
+      { std::lock_guard<std::mutex> lk(m_); dead_ = true; }
+      cv_ready_.notify_all();
+      return;
+    }
+    unsigned n = 0;
+    if (nvmlDeviceGetCount_v2(&n) != NVML_SUCCESS || n == 0) {
+      { std::lock_guard<std::mutex> lk(m_); dead_ = true; }
+      cv_ready_.notify_all();
+      return;
+    }
+    // Identity is fixed for the run; sample only the changing fields below.
+    std::vector<nvmlDevice_t> handles;
+    std::vector<Row> rows;
+    for (unsigned i = 0; i < n; ++i) {
+      nvmlDevice_t h{};
+      if (nvmlDeviceGetHandleByIndex(i, &h) != NVML_SUCCESS) continue;
+      char uu[96] = {0};
+      if (nvmlDeviceGetUUID(h, uu, sizeof(uu)) != NVML_SUCCESS || !uu[0]) continue;
+      Row r; r.uuid = uu;
+      handles.push_back(h);
+      rows.push_back(std::move(r));
+    }
+    if (rows.empty()) {
+      { std::lock_guard<std::mutex> lk(m_); dead_ = true; }
+      cv_ready_.notify_all();
+      return;
+    }
+    for (;;) {
+      for (size_t i = 0; i < handles.size(); ++i) {
+        nvmlUtilization_t u{};
+        unsigned sample = rows[i].util;
+        if (nvmlDeviceGetUtilizationRates(handles[i], &u) == NVML_SUCCESS) sample = u.gpu;
+        nvmlMemory_t mem{};
+        if (nvmlDeviceGetMemoryInfo(handles[i], &mem) == NVML_SUCCESS) {
+          rows[i].free_bytes = mem.free; rows[i].total_bytes = mem.total;
+        }
+        // Smooth: one instantaneous read is not trustworthy (0% has been
+        // observed on a device that was demonstrably busy).  First sweep takes
+        // the raw value so the table is usable immediately.
+        rows[i].util = first_ ? sample : (rows[i].util * 3 + sample) / 4;
+      }
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        rows_ = rows;
+        ready_ = true;
+        first_ = false;
+      }
+      cv_ready_.notify_all();
+      std::unique_lock<std::mutex> lk(m_);
+      // Timed CV wait, not a sleep: stop() must not have to wait out a tick.
+      if (cv_.wait_for(lk, std::chrono::milliseconds(250), [this]{ return quit_; }))
+        return;
+    }
+  }
+  std::thread thr_;
+  std::condition_variable cv_, cv_ready_;
+  bool quit_ = false, started_ = false, ready_ = false, dead_ = false, first_ = true;
+#endif
+  mutable std::mutex m_;
+  std::vector<Row> rows_;
+};
+static GpuMonitor g_gpu_monitor;
  #endif // HAVE_NVML
 #endif
 
@@ -24774,6 +24914,38 @@ static void write_stats_json_cpu_only(const std::string & path, const Options & 
    4. Join progress thread, print summary, clean up
 ======================================================================*/
 static Options parse_args(int argc, char ** argv);
+// Every GPU's UUID, from /proc — no CUDA, no NVML, no cost.
+//
+// Two uses: answering "how many GPUs does this box have" before any driver is
+// touched, and naming devices for CUDA_VISIBLE_DEVICES when the NVML sampler
+// has not answered yet.  Sorted for a stable order across runs; callers that
+// want the least-contended guess take from the END, since device 0 is what
+// every other tool grabs first.  Cached — /proc does not change mid-run.
+static const std::vector<std::string> & gz_proc_gpu_uuids()
+{
+  static const std::vector<std::string> uuids = []{
+    std::vector<std::string> v;
+    std::error_code ec;
+    for (const auto & e : fs::directory_iterator("/proc/driver/nvidia/gpus", ec)) {
+      std::ifstream inf(e.path() / "information");
+      std::string line;
+      while (std::getline(inf, line)) {
+        if (line.find("GPU UUID:") == std::string::npos) continue;
+        const auto p = line.find("GPU-");
+        if (p == std::string::npos) break;
+        std::string u = line.substr(p);
+        while (!u.empty() && (u.back() == '\n' || u.back() == '\r' ||
+                              u.back() == ' '  || u.back() == '\t')) u.pop_back();
+        if (!u.empty()) v.push_back(u);
+        break;
+      }
+    }
+    std::sort(v.begin(), v.end());
+    return v;
+  }();
+  return uuids;
+}
+
 static void apply_backend_defaults(Options & opt);
 static std::string derive_output(const std::string & input, Mode mode);
 
@@ -28426,6 +28598,22 @@ static void apply_backend_defaults(Options & opt)
   // An explicit user setting is never second-guessed: we take the first N of
   // THEIR list, because they have already said which devices they want.
   if (opt.gpu_devices > 0) {
+    // Start the sampler HERE, not at process entry.
+    //
+    // Starting it in main() cost every invocation ~370 ms — including
+    // --version and --cpu-only runs that never touch a GPU — because the
+    // destructor joins a thread that is blocked in nvmlInit.  It doubled the
+    // test suite (6m50s -> 11m47s).  That is the same defect this project
+    // already fixed once for cuInit: never charge GPU setup to a run that will
+    // not use a GPU.
+    //
+    // The early start was theoretically free (NVML answers at ~0.39 s, CUDA's
+    // first device at ~1.35 s) but measured as unmeasurable — inline and
+    // background variants overlapped at 2.84-3.15 s across six reps. So there
+    // is nothing to give up by starting it at the point of use, which is also
+    // exactly where v0.16.7 paid for its inline probe: only when a subset of
+    // devices was requested and a ranking can therefore change something.
+    g_gpu_monitor.start();
     std::string sel;
     if (const char * cur = ::getenv("CUDA_VISIBLE_DEVICES")) {
       std::stringstream ss(cur); std::string tok; int taken = 0;
@@ -28434,37 +28622,44 @@ static void apply_backend_defaults(Options & opt)
         if (!sel.empty()) sel += ",";
         sel += tok; ++taken;
       }
-    } else if (nvmlInit_v2() == NVML_SUCCESS) {
-      struct Cand { std::string uuid; unsigned util; unsigned long long freeb; };
-      std::vector<Cand> cands;
-      unsigned n = 0;
-      if (nvmlDeviceGetCount_v2(&n) == NVML_SUCCESS) {
-        for (unsigned i = 0; i < n; ++i) {
-          nvmlDevice_t h{};
-          if (nvmlDeviceGetHandleByIndex(i, &h) != NVML_SUCCESS) continue;
-          char uu[96] = {0};
-          if (nvmlDeviceGetUUID(h, uu, sizeof(uu)) != NVML_SUCCESS || !uu[0]) continue;
-          Cand c{uu, 0u, 0ull};
-          nvmlUtilization_t u{};
-          if (nvmlDeviceGetUtilizationRates(h, &u) == NVML_SUCCESS) c.util = u.gpu;
-          nvmlMemory_t mem{};
-          if (nvmlDeviceGetMemoryInfo(h, &mem) == NVML_SUCCESS) c.freeb = mem.free;
-          cands.push_back(std::move(c));
+    } else {
+      // Wait for the sampler's FIRST sweep, but only when the answer can change
+      // anything.  The sampler starts at process entry and publishes at ~0.39 s
+      // while gzstd arrives here at ~0.3 s, so the wait is about 90 ms in
+      // practice (measured: 2.88-3.03 s with it against 2.88-2.91 s without) —
+      // originally assumed to be the full ~347 ms NVML cost, which it is not.
+      // 90 ms is cheap insurance against starting on a contended GPU, which on a
+      // shared machine costs seconds.
+      //
+      // Skipped entirely when there is no choice to make: if the run wants every
+      // GPU the box has, ranking them decides nothing.  /proc answers "how many"
+      // for free, without CUDA or NVML.  The bound is a backstop for a slow
+      // driver, not the expected path — a driver-less box sets the sampler dead
+      // and returns immediately rather than burning it.
+      const size_t hw_gpus = gz_proc_gpu_uuids().size();
+      if (hw_gpus == 0 || (size_t)opt.gpu_devices < hw_gpus)
+        g_gpu_monitor.wait_ready(500);
+      auto rows = g_gpu_monitor.snapshot();
+      if (!rows.empty()) {
+        std::stable_sort(rows.begin(), rows.end(),
+                         [](const GpuMonitor::Row & a, const GpuMonitor::Row & b) {
+          if (a.util != b.util) return a.util < b.util;   // idle first
+          return a.free_bytes > b.free_bytes;             // then roomiest
+        });
+        for (size_t i = 0; i < rows.size() && (int)i < opt.gpu_devices; ++i) {
+          if (!sel.empty()) sel += ",";
+          sel += rows[i].uuid;   // "GPU-<uuid>": names a device with no index
         }
-      }
-      // Deliberately NOT nvmlShutdown(): NVML init is REFCOUNTED and costs
-      // ~290 ms only when the count goes 0 -> 1. Shutting down here would drop
-      // it to zero and make the drain's per-batch utilization probe re-pay the
-      // full price mid-run. The rest of this file follows the same rule ("no
-      // Shutdown (we _Exit)"), and leaving NVML up is what lets that probe work
-      // at all on this path.
-      std::stable_sort(cands.begin(), cands.end(), [](const Cand & a, const Cand & b) {
-        if (a.util != b.util) return a.util < b.util;      // idle first
-        return a.freeb > b.freeb;                          // then roomiest
-      });
-      for (size_t i = 0; i < cands.size() && (int)i < opt.gpu_devices; ++i) {
-        if (!sel.empty()) sel += ",";
-        sel += cands[i].uuid;   // nvml returns the "GPU-<uuid>" form CUDA wants
+      } else {
+        // Blind fallback: the sampler has not answered (or there is no NVML).
+        // Take devices from the END of /proc's list — device 0 is what every
+        // other tool grabs first, so the tail is least likely to be in use.
+        // A guess, not a measurement.
+        std::vector<std::string> uuids = gz_proc_gpu_uuids();
+        for (size_t i = 0; i < uuids.size() && (int)i < opt.gpu_devices; ++i) {
+          if (!sel.empty()) sel += ",";
+          sel += uuids[uuids.size() - 1 - i];    // from the end
+        }
       }
     }
     if (sel.empty()) {          // no NVML (driver-less box): fall back to indices

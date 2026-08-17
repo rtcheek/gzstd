@@ -1,11 +1,77 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.7  
+**Covers:** v0.9.50 → v0.16.8  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.16.8 — sample the GPUs in the background, and pick the idle one
+
+v0.16.7 ranked devices by asking NVML inline, which cost ~347 ms at the moment the answer was
+needed. NVML is in fact much faster than CUDA — started at the same instant, it has a full table
+for all eight GPUs at **0.390 s** while the first GPU is not usable until **1.354 s** (one device
+visible) or **3.391 s** (eight). The information was never the slow part; asking for it at the
+wrong moment was.
+
+`GpuMonitor` publishes a table of every GPU's utilization and free memory, refreshed on a 250 ms
+timed condition-variable wait, and device selection consults that table instead of probing.
+
+It starts **at the point of use, not at process entry.** Starting it in `main()` was tried first,
+on the theory that argument parsing would pay for the NVML init. It cost every invocation
+**~370 ms** — including `--version` and `--cpu-only` runs that never touch a GPU — because the
+destructor joins a thread blocked in `nvmlInit`, and it doubled the test suite from 6m50s to
+11m47s. That is the same defect this project already fixed once for `cuInit`: **never charge GPU
+setup to a run that will not use a GPU.** The early start was theoretically free but measured as
+unmeasurable, so nothing is given up by starting it where its answer is consumed — which is also
+exactly where v0.16.7 paid for its inline probe.
+
+Three properties the code has to keep, each learned the hard way:
+
+- **Rows are keyed by UUID and PCI bus ID, never by index.** NVML enumerates in PCI order and
+  CUDA defaults to fastest-first; every one of the eight devices mismatched on this host. The
+  UUID form is also what `CUDA_VISIBLE_DEVICES` accepts, so a device can be named before any
+  CUDA index exists.
+- **Utilization is smoothed** as `(3*old + new)/4`. A single reading is not trustworthy —
+  `nvidia-smi` was repeatedly observed reporting 0% on a device that was demonstrably compressing.
+  A sampler can average over time; one inline probe never could. The first sweep takes the raw
+  value so the table is usable immediately.
+- **NVML is never shut down.** Its init is refcounted and costs ~290 ms only on the 0 to 1
+  transition; dropping the count makes the next user re-pay in full.
+
+### Waiting for the first sweep, and when not to
+
+Selection blocks on the sampler's first sweep, because starting on a contended GPU costs seconds
+on a shared machine and the wait does not. It is **skipped entirely when the run wants every GPU
+the box has** — ranking decides nothing then, and `/proc/driver/nvidia/gpus` answers "how many"
+for free without CUDA or NVML. If the sampler has not answered (or there is no NVML at all),
+selection falls back to `/proc` UUIDs taken from the **end** of the list, on the reasoning that
+device 0 is what every other tool grabs first. That is a guess, and labelled as one.
+
+### On the performance claim: there isn't one
+
+None of these variants is separable on this host. 1.9 GiB, `--gpu-devices=1`, six interleaved
+reps each:
+
+| variant | seconds |
+|---|---|
+| v0.16.7, inline NVML probe | 2.92–3.15 |
+| background sampler, 250 ms cadence | 2.84–3.02 |
+| background sampler, 2000 ms cadence | 2.87–3.01 |
+
+All three overlap. The run-to-run spread of about ±0.15 s on a 3 s run is larger than the
+90–350 ms effects involved, so **this release claims no startup win** — and equally, the sampler
+and its cadence cannot be shown to cost anything. What the monitor provides is a smoothed,
+continuously fresh table for decisions taken after bringup, where the alternative was a single
+unreliable sample. It is infrastructure for choosing and switching devices during a run, not a
+speedup.
+
+Verified: extensive suite **548/548** in **6m51s** — the same runtime as v0.16.7, which is the
+proof that the process-entry regression is gone (it had taken 11m47s) — and both build
+configurations compile clean. The `USE_NVCOMP=OFF` build caught a real compile error along the
+way: `g_gpu_monitor` lives inside `HAVE_NVML`, so its call site needed guarding.
 
 
 ## v0.16.7 — --gpu-devices was slower than not using it, and NVML was reading the wrong GPU
