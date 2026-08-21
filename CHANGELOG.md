@@ -1,12 +1,123 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.16.9  
+**Covers:** v0.9.50 → v0.17.0  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.0 — --gds-only: the drive writes into VRAM, and the CPU never sees the bytes
+
+GPUDirect Storage moves the input from NVMe into GPU memory by peer-to-peer DMA, so the
+uncompressed bytes never enter host memory. `--gds-only` implies `--gpu-only` — with no host copy
+there is nothing for a CPU worker to compress, so the split is not a policy choice, it is
+unrepresentable. Both directions are covered: compress reads NVMe → VRAM, decompress writes
+VRAM → NVMe.
+
+**Shipped as EXPERIMENTAL** and omitted from the short `-h` listing. Two reasons beyond novelty:
+the mode has no automated test coverage, because it needs hardware the suite cannot assume; and it
+can degrade invisibly, since a cuFile fallback to a host bounce buffer runs at 4.917 GiB/s against
+4.924 for the real thing. `-v` prints the nvidia-fs `Bar1-map` delta so a run can be checked.
+
+The path is narrow on purpose. It needs a GPU whose BAR1 aperture covers its own VRAM (resizable
+BAR; consumer cards are typically 256 MiB and can never qualify), the nvidia-fs kernel module, a
+filesystem cuFile accepts, and a kernel without the shadow-buffer pin regression.
+
+Rejected as usage errors: --cpu-only and --hybrid, stdin input, stdout output, a build without
+nvCOMP, and --tar in either direction — creation assembles the archive as it is written so there is
+no file to read, and extraction writes a tree rather than the single registered file GDS addresses.
+
+### What it buys — not throughput
+
+Both paths saturate the same drive. 572 MiB, 5 interleaved repetitions, server class host:
+
+| | wall | host CPU |
+|---|---|---|
+| compress `--gds-only` | **3.62–4.35 s** | **3.29 s** |
+| compress `--gpu-only` | 9.66–9.77 s | 10.19 s |
+| decompress `--gds-only` | **3.62–4.25 s** | **4.64 s** |
+| decompress `--gpu-only` | 9.71–9.77 s | 11.02 s |
+
+Ranges do not overlap. Against raw `gdsio` on the same host the peer-to-peer read cost 0.49 host
+CPU-seconds per GiB against 0.62 for the ordinary path, with *user* CPU falling about 6x — the copy
+through host memory stops happening. On an idle machine this measures as very nearly nothing; the
+win is contention resilience.
+
+### The content checksum had to move to the GPU
+
+Every gzstd frame carries zstd's XXH64 content checksum, which is what makes a GPU archive
+self-verifying. It was computed on the host during H2D staging, from a buffer that no longer
+exists. Hashing on the host would mean copying every byte back over PCIe — exactly the traffic this
+feature removes — so the hash now runs where the data already is (gzx_xxh64_kernel in gpuverify.cu).
+
+**Its parallelism is capped at four per frame, and that is the algorithm's limit, not the
+implementation's.** XXH64 keeps four accumulators, each a strictly sequential chain
+acc = rotl(acc + in*P2, 31) * P1, and rotl does not distribute over multiplication, so no closed
+form composes two stripes. The chain cannot be split, tree-reduced or skipped ahead.
+
+The useful consequence is a clean model: wall time is set by the CHUNK size alone and is nearly
+constant in frame count (13.8-14.0 ms at 4 MiB from 8 to 512 frames; 54.6-56.5 ms at 16 MiB), so
+throughput is ~0.28 GiB/s per frame in the batch, chunk-independent and linear to 512 frames:
+
+| frames | 8 | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|
+| GiB/s | 2.3 | 9.0 | 17.8 | 35.4 | 71.2 | 144.3 |
+
+Against a ~5 GiB/s drive that needs roughly 18 frames per batch. Do not size this kernel from a
+small batch and conclude it is slow.
+
+**Tried and it did nothing: unrolling the main loop 8x for memory-level parallelism** (57 → 56.4 ms,
+noise). The prediction was that dependent-load latency was going unhidden. It was wrong — this is a
+genuine dependency chain of emulated 64-bit multiplies at ~150 cycles per round. The unroll is
+harmless and stays; the experiment does not need repeating.
+
+Correctness is checked by GZSTD_DEBUG_XXH_SELFTEST=1, which compares the kernel against the CPU
+xxh:: implementation over every length from 0 to 200 (exhaustive across the tail logic) plus 17
+large sizes. It was mutation-tested four ways; the lane-2-seed mutation leaves exactly 32 of 201
+lengths matching, which are lengths 0-31 — the ones that skip the accumulator path entirely.
+
+### One device, one stream
+
+cuFileBufRegister is what maps VRAM through BAR1 so the drive can target it, and it is expensive:
+~600-950 ms for a 4 GiB slab uncontended, degrading to ~3.9 s with several running at once. Since
+this path is disk-bound at ~4.9 GiB/s and one server-class GPU compresses well above that, a second
+device cannot make the job faster, only slower to start. Wall time scaled almost linearly with
+device count — 5.1 s at one device, 30.9 s at eight — while the reads stayed near 4.9 GiB/s
+throughout. Defaults are one device, one stream, batch capped at 64, all overridable.
+
+### The defect worth recording: silent truncation
+
+Decompress writes at absolute offsets, so frames need no ordering and the ordered writer is
+bypassed. It cannot merely be starved: the writer ftruncates the output to what it personally
+wrote, so handing it empty frames would delete everything GDS had written.
+
+Bypassing it made gzstd own the final length, which recreated the same hazard one level up. An
+archive whose frames are not 4 KiB multiples tripped a mid-run alignment throw; the GPU-abort path
+caught it and rebuilt the whole output correctly on CPU — and then the finalising ftruncate cut
+that correct output back to the GDS high-water mark. A 30 MB archive came back 1000003 bytes long
+with exit 0.
+
+The fix settles the shape before the output is touched: peek the first frame, and if its
+decompressed size is not a multiple of 4 KiB, quietly use the ordinary writer instead. Workers read
+the resolved decision, never the flag. The per-frame check survives as a die_data(), never a throw,
+so it can never race a fallback that owns the same file. A mid-run failure that hands a half-written
+file to a rebuild path writing the same file is not a recoverable error, it is a corruption
+mechanism.
+
+### Fixed in passing: out_off was always zero on the parallel reader
+
+stream_frames_to_queue_mt never set Task::out_off; the serial stream_frames_to_queue always had.
+That reader is chosen for any seekable input over 128 MiB, --keep-going included — and --keep-going
+prints out_off .. out_off + decomp_size for each unrecoverable region, so every damaged range has
+been reported as starting at offset 0. Fixed with the same running prefix sum the serial path uses.
+
+Verified: extensive suite **548/548** (8m40s) and the CPU-only build **335/335** (70 GPU tests
+skipped, 1m30s), both configurations compile clean. The GDS path itself has **no suite coverage** —
+it needs hardware the suite cannot assume — so it was verified by hand: round-trip byte-identical
+through gzstd, stock zstd -d and the CPU-only build, zstd -t validating the GPU-computed checksum,
+and 11 edge sizes from 0 to 100 MB.
 
 ## v0.16.9 — --adapt senses the core budget, because "the box is busy" is the wrong signal
 
