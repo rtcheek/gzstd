@@ -1,12 +1,51 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.0  
+**Covers:** v0.9.50 → v0.17.1  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.1 — --gds-only decompress wedged at 97.8%, because bypassing the writer leaked its permits
+
+v0.17.0 shipped a deadlock. `--gds-only -d` on a 65 GiB archive stopped dead at 97.8% with every
+thread parked in a futex and no forward progress. It was never released — no v0.17.0 tag was cut, so
+the portable build never ran and no host auto-installed it — but the commit is on main, so this is
+the fix on top rather than a rewrite of it.
+
+The decompress intake acquires one FrameThrottle permit per popped frame, and the only thing that
+hands them back is the writer's AsyncWritePool, one per frame it writes. v0.17.0 bypasses the writer
+entirely, because peer-to-peer writes go to absolute offsets and need no ordering — and in doing so
+it inherited that release and never performed it. Every frame leaked a permit, so the run wedged the
+moment the throttle was exhausted: **8156 frames delivered against an 8192-frame throttle**, which
+is exactly the 97.8% it stopped at. Anything smaller never reaches the limit, which is why it
+survived every test written for the feature and took a real archive to surface.
+
+The permit is now released at the write site, where the frame is on disk — precisely the condition
+the writer releases on.
+
+### Bypassing a component means inheriting all of its responsibilities
+
+They have to be enumerated, not discovered. writer_thread does four things that matter here:
+releases throttle permits, updates wrote_bytes, updates tasks_done, and truncates the output at
+close. Three were handled when the writer was bypassed. The one missed was the only one with **no
+visible effect until a queue fills** — the failure mode is invisible at every size a test would
+plausibly use. The rest of writer_thread has since been audited; there is no fifth.
+
+### And a diagnosis failure worth more than the bug
+
+The permit-leak theory was correct on the first pass and was discarded because the test written for
+it passed. That test paired 2862 frames with the *default* 8192-frame throttle, and separately
+paired a floored 2048-frame throttle with a 36-frame file. Neither combination can exhaust anything,
+so it could not have failed. Reproducing the wedge needs both knobs at once: `--throttle-frames=1`
+(which floors to 2048) against an archive with more than 2048 frames, which `--chunk-size 1` builds.
+**A passing test only disproves a theory if the test could have failed.**
+
+Verified: extensive suite 548/548, CPU-only build 335/335, both configurations compile clean. The
+reproduction above hangs on v0.17.0 and completes byte-identical on this build; compress was checked
+for the same leak class and does not have it, because its writer is still spawned.
 
 ## v0.17.0 — --gds-only: the drive writes into VRAM, and the CPU never sees the bytes
 

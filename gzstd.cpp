@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.0";
+static constexpr const char * GZSTD_VERSION = "0.17.1";
 //
 // Architecture overview:
 //
@@ -23971,6 +23971,7 @@ static void gpu_decomp_worker(
     // Carried as a member because this is a LOCAL struct: its member functions
     // cannot reach the enclosing function's `opt` parameter.
     bool   gds_only = false;
+    bool   gds_reg_log = false;   // verbosity, carried for the same local-struct reason
     void * d_temp = nullptr;
     size_t temp_bytes = 0;
     void ** d_comp_ptrs = nullptr;
@@ -24073,9 +24074,22 @@ static void gpu_decomp_worker(
       if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) return false;
       if (gds_only) {
         std::string why;
+        const uint64_t reg_t0 = now_ns();
         if (!gds_out_reg.reg(d_decomp_buf, batch_n * max_decomp, &why)) {
           std::cerr << "gzstd: --gds-only: " << why << "\n";
           return false;
+        }
+        // Logged because this function RE-RUNS on every batch resize, not just at
+        // startup: each resize frees the slab and must re-register it, and
+        // registration is hundreds of ms.  If a tuner ever resizes repeatedly this
+        // is where the time goes, and without the log it looks like a hang.
+        if (gds_reg_log) {
+          char b[160];
+          std::snprintf(b, sizeof(b),
+                        "[GDS] cuFileBufRegister %.0f MiB took %.0f ms (decompress)\n",
+                        double(batch_n * max_decomp) / 1048576.0,
+                        double(now_ns() - reg_t0) / 1e6);
+          std::cerr << b;
         }
       }
       if (cudaMalloc(&d_comp_ptrs,    batch_n * sizeof(void*))   != cudaSuccess) return false;
@@ -24151,7 +24165,10 @@ static void gpu_decomp_worker(
     ctxs.resize(stream_count);
     // The resolved decision, not opt.gds_only: an archive whose frames are not
     // 4 KiB-aligned runs the ordinary delivery path even under --gds-only.
-    for (auto & C : ctxs) C.gds_only = g_gds_out_active.load(std::memory_order_relaxed);
+    for (auto & C : ctxs) {
+      C.gds_only    = g_gds_out_active.load(std::memory_order_relaxed);
+      C.gds_reg_log = (opt.verbosity >= V_VERBOSE);
+    }
     for (size_t s = 0; s < stream_count; ++s) {
       auto & C = ctxs[s];
       checkCuda(cudaStreamCreate(&C.stream), "cudaStreamCreate");
@@ -24886,6 +24903,15 @@ static void gpu_decomp_worker(
               m->wrote_bytes.fetch_add(actual, std::memory_order_relaxed);
               m->tasks_done.fetch_add(1, std::memory_order_relaxed);
             }
+            // RELEASE THE THROTTLE PERMIT THIS FRAME HOLDS.  Intake acquires one
+            // per popped frame and the ONLY thing that hands them back is the
+            // writer's AsyncWritePool, one per frame it writes.  Bypassing the
+            // writer therefore leaked a permit per frame, and the run wedged the
+            // moment the throttle was exhausted -- 8156 frames delivered against
+            // a 8192-frame throttle, at 97.8% of a 130 GiB decompress, every
+            // thread parked in a futex.  The frame is on disk here, which is
+            // exactly the condition the writer releases on.
+            if (bp) bp->release(1);
             g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
           } else {
             size_t out_pool_cap = std::max<size_t>(2, C.alloc_batch) * 2;
