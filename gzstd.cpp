@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.1";
+static constexpr const char * GZSTD_VERSION = "0.17.2";
 //
 // Architecture overview:
 //
@@ -2064,6 +2064,49 @@ static void die_io(const std::string & msg)
 { die(msg, EXIT_IO); }
 static void die_data(const std::string & msg)
 { die(msg, EXIT_DATA); }
+
+#ifdef HAVE_NVCOMP
+// Can this host register DEVICE memory with cuFile at all?  Answered BEFORE any
+// work is queued, and that ordering is the whole point.
+//
+// --gds-only Tasks carry no host bytes -- they name a region of the input file
+// and nothing else.  So if the GPU path dies AFTER the producer has queued them,
+// the CPU rescue pool inherits frames it cannot read.  MEASURED before this
+// existed, on a host whose BAR1 aperture cannot hold the slab: cuFileBufRegister
+// failed with CU_FILE_INVALID_MAPPING_SIZE, every GPU was marked dead, the
+// rescue pool picked up the data-less Tasks, and the run died with
+//     gzstd: ERROR: ZSTD error: Src size is incorrect
+// and exit 4 -- a DATA error, blaming the user's input for what is purely a host
+// configuration problem, after printing that the output was complete and correct.
+//
+// A small probe deliberately does NOT try to prove the full slab will fit.  It
+// separates "this host cannot do GDS at all" -- no nvidia-fs, BAR1 hopeless,
+// wrong kernel -- from "this batch is too big for its BAR1", which the stream
+// setup already retries at smaller sizes.  A 256 MiB-BAR1 card may well register
+// a modest batch, and that case should still run.
+static void gds_preflight_or_die(const Options & opt)
+{
+  if (!opt.gds_only) return;
+  const std::string why = gz_gds_unavailable_reason();
+  if (!why.empty()) die_usage("--gds-only is not available on this host: " + why);
+  void * probe = nullptr;
+  const size_t probe_bytes = 4 * ONE_MIB;
+  if (cudaMalloc(&probe, probe_bytes) != cudaSuccess) {
+    cudaGetLastError();
+    die_usage("--gds-only: no GPU memory available to test GPUDirect Storage");
+  }
+  std::string rwhy;
+  bool ok;
+  { GdsBuf b; ok = b.reg(probe, probe_bytes, &rwhy); }
+  cudaFree(probe);
+  if (!ok)
+    die_usage("--gds-only is not usable on this host: " + rwhy
+              + ".\n  GPUDirect Storage needs a GPU whose BAR1 aperture covers its VRAM"
+                " (resizable BAR --\n  consumer cards are often 256 MiB and cannot"
+                " qualify), the nvidia-fs kernel module,\n  and a filesystem cuFile"
+                " accepts.  Re-run without --gds-only.");
+}
+#endif
 
 // Short help — shown by -h and -?.  Groups flags by purpose with one-line
 // descriptions.  Point users at --help for details and examples.
@@ -11555,6 +11598,13 @@ static void cpu_worker(
 
     {
     const auto t0 = std::chrono::steady_clock::now();
+    // Unreachable by design (see gpu_only_cpu_fallback), so if it happens it is a
+    // bug and must say so.  t.len() is the frame length but t.ptr() is an empty
+    // vector for a GDS Task: reading it is undefined behaviour that only failed
+    // visibly last time because ZSTD happened to notice the size mismatch.
+    if (t.is_gds())
+      die("internal error: a --gds-only frame reached a CPU compress worker; "
+          "these name a file region and carry no host bytes");
     const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast< std::chrono::duration<double, std::milli> >(t1 - t0).count();
@@ -12056,6 +12106,19 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
                                   ResultStore * results, const Options & opt,
                                   Meter * m, FrameThrottle * bp)
 {
+  // THERE IS NO CPU FALLBACK FOR A --gds-only RUN, in either direction, and
+  // pretending otherwise is how a host-configuration problem turned into
+  // "ZSTD error: Src size is incorrect" with exit 4.
+  //   compress:   the queued Tasks carry no host bytes at all, so a CPU worker
+  //               would read t.len() bytes from an empty vector.
+  //   decompress: peer-to-peer writes bypass the ordered writer entirely, so
+  //               there is nothing draining the ResultStore this pool pushes to.
+  // The preflight makes reaching this unlikely; if it happens anyway, say what
+  // is actually wrong instead of handing the job to a pool that cannot do it.
+  if (opt.gds_only && (!decompress || g_gds_out_active.load(std::memory_order_relaxed)))
+    die_usage("--gds-only: the GPU path failed and there is no CPU fallback for it -- "
+              "frames read by GPUDirect Storage exist only in GPU memory.  "
+              "Re-run without --gds-only.");
   int threads = resolve_cpu_threads(opt.cpu_threads);
   // Compress with a pending restart (g_gpu_failed_restart): this drain only
   // tears the pipeline down cleanly; its output is about to be DISCARDED and
@@ -21776,7 +21839,9 @@ static void gpu_worker(
         if (s == 0) {
           // Couldn't fit even one stream — skip this GPU entirely.
           std::string skip_msg = "[GPU" + std::to_string(device_id)
-              + "] insufficient VRAM for even 1 stream at batch=1  skipping device";
+              + "] insufficient VRAM for even 1 stream at batch=1  skipping device"
+              + (opt.gds_only ? "  (under --gds-only this is usually the BAR1"
+                                " aperture, not VRAM)" : "");
           vlog(V_ERROR, opt, skip_msg + "\n");
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
@@ -22968,6 +23033,9 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
 
 static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  // Before ANY task is queued -- see the function's own note for why the order
+  // is the point rather than a detail.
+  gds_preflight_or_die(opt);
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
@@ -23488,8 +23556,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // set by the GPU workers popping batches, which is exactly where we want it.
   if (!reader_done && opt.gds_only) {
     if (opt.input == "-")
-      die("--gds-only needs a seekable file: GPUDirect Storage reads by offset "
-          "from a registered file handle, which a pipe cannot provide");
+      die_usage("--gds-only needs a seekable file: GPUDirect Storage reads by offset "
+                "from a registered file handle, which a pipe cannot provide.  This is "
+                "what `tar -I \'gzstd --gds-only\'` and any shell pipe hit");
     // O_DIRECT IS REQUIRED, NOT AN OPTIMISATION.  cuFile refuses the
     // peer-to-peer path on a buffered descriptor and would quietly fall back to
     // reading through the page cache — same bytes, none of the point.
@@ -24225,6 +24294,11 @@ static void gpu_decomp_worker(
               + "] insufficient VRAM for even 1 stream at batch=1 ("
               + std::to_string(init_comp / ONE_MIB) + " MiB comp + "
               + std::to_string(init_decomp / ONE_MIB) + " MiB decomp per frame)  skipping device";
+          // Under --gds-only the slab must also fit the GPU's BAR1 aperture, which
+          // is a different and usually much smaller resource than VRAM.  Naming
+          // VRAM alone sends the reader after the wrong one.
+          if (opt.gds_only)
+            skip_msg += "  (under --gds-only this is usually the BAR1 aperture, not VRAM)";
           vlog(V_ERROR, opt, skip_msg + "\n");
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
@@ -25148,6 +25222,9 @@ static void gpu_decomp_worker(
 ======================================================================*/
 static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  // Before ANY task is queued -- see the function's own note for why the order
+  // is the point rather than a detail.
+  gds_preflight_or_die(opt);
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }

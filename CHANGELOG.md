@@ -1,12 +1,65 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.1  
+**Covers:** v0.9.50 → v0.17.2  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.2 — what --gds-only did on a host that cannot run it, which is most of them
+
+The mode needs a GPU whose BAR1 aperture covers its VRAM, the nvidia-fs module, a filesystem cuFile
+accepts, and a kernel clear of the pin regression. Most hosts fail at least one of those, so the
+common case is not the happy path — it is a host that *nearly* qualifies. v0.17.1 handled that
+badly, and this fixes it.
+
+### And what --gds-only does on a host that cannot run it
+
+The likeliest configuration in practice is a host that *nearly* qualifies, and v0.17.0 handled it
+badly. Forcing the condition (capping cuFile's pinnable device memory reproduces a BAR1 aperture too
+small for the slab) produced:
+
+    gzstd: --gds-only: cuFileBufRegister failed (err 5016)      ... x7
+    [GPU0] insufficient VRAM for even 1 stream at batch=1 - skipping device
+    WARNING: all GPUs failed; finishing compression on CPU (96 threads).
+      Falling back for data safety: ... so the output is complete and correct
+    gzstd: ERROR: ZSTD error: Src size is incorrect
+    exit=4
+
+Three separate failures compounding. The retry blamed VRAM, when err 5016 is
+CU_FILE_INVALID_MAPPING_SIZE and the real constraint is the BAR1 aperture. The all-GPUs-failed path
+then handed the queue to the CPU rescue pool, announcing that the output would be complete and
+correct. And the pool inherited --gds-only Tasks, which carry NO host bytes -- len() is the frame
+length but ptr() is an empty vector -- so it read undefined memory, caught only because ZSTD noticed
+a size mismatch. The run then exited 4, a DATA error, blaming the user's input for what was purely a
+host configuration problem.
+
+Now: a preflight registers a small device buffer before any task is queued, so a host that cannot do
+GDS at all fails immediately with the actual reason and exit 2. The probe deliberately does not try
+to prove the full slab fits -- it separates "cannot do GDS" from "this batch is too big", which the
+setup retry already shrinks for, so a small-BAR1 card that can serve a modest batch still runs. If
+the GPU path fails anyway, gpu_only_cpu_fallback now refuses the job rather than mis-serving it, in
+both directions: compress Tasks have no host bytes, and decompress bypasses the ordered writer, so
+nothing would drain the ResultStore the pool pushes to. The CPU worker carries a matching assertion
+for a case that should now be unreachable. Every one of these exits 2, because the remedy is the
+same in all of them: this host cannot run --gds-only.
+
+The pipe case is unchanged in behaviour but now exits 2 rather than 1, and names the command that
+hits it: tar -I with --gds-only, or any shell pipe. cuFile rejects a pipe or FIFO at registration
+with CU_FILE_INVALID_FILE_TYPE, before any transfer -- it needs a regular file, because the drive
+DMAs into a BAR1 window for a block range of one. A stream assembled in host memory has already made
+the trip GDS exists to avoid.
+
+Verified: extensive suite 548/548 in 8m36s and the CPU-only build 335/335 in 1m33s, both
+configurations compile clean.
+
+The CPU-only run earned its keep again, failing 334/335 on a source guard: check-endian-reads.sh
+flagged size_t(4) << 20 in the new preflight as a possible host-order read of an on-disk field. A
+false positive — it is just 4 MiB — but the fix is to stop writing the pattern rather than widen the
+checker's ALLOW list, so it reads 4 * ONE_MIB now. A lint exemption that grows every time it fires
+stops being a lint.
 
 ## v0.17.1 — --gds-only decompress wedged at 97.8%, because bypassing the writer leaked its permits
 
