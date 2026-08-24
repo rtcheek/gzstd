@@ -1,12 +1,77 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.3  
+**Covers:** v0.9.50 → v0.17.4  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.4 — the rest of the review, and the discovery that --tar --gds-only mostly is not peer-to-peer
+
+Follow-up to v0.17.3, working through the remaining findings of the independent Codex review.
+
+### --tar was reporting peer-to-peer transfers it was not making
+
+The counter said every successful `cuFileRead` was a peer-to-peer transfer. It is not: the device
+offset has to sit on a 4 KiB boundary, and tar puts a 512-byte header in front of every member, so
+member data lands off the 4 KiB grid and cuFile routes it through a bounce while still returning
+success. Instrumenting the offsets actually passed:
+
+| archive | reads | unaligned |
+|---|---|---|
+| 20000 small members | 20000 | **20000 device offsets** |
+| 6 x 100 MB members | 40 | **28 file offsets** |
+
+So `--tar --gds-only` is substantially NOT peer-to-peer today, and the reporting said otherwise.
+It now counts only reads cuFile can actually route peer-to-peer, and says so at default verbosity:
+`6 frames peer-to-peer, 35 bounced through host memory`. The non-tar path is unaffected -- its
+offsets are whole MiB by construction -- and still reports zero bounced.
+
+Making tar genuinely peer-to-peer needs an aligned device scratch region for the edge blocks. That
+is not in this version.
+
+Worth recording that cuFile's own routing counter could not be used to establish this: setting
+`cufile_stats: 3` segfaults libcufile inside gzstd's threading, though the env var alone is
+harmless. The offsets had to be measured directly.
+
+### A sizeless tail after a peer-to-peer prefix now fails loudly instead of vanishing
+
+An archive whose later frames carry no content-size header falls back to the CPU streaming decoder
+for the remainder. Under `--gds-only` that tail **silently never appeared** -- 100 MB of a 130 MB
+output, exit 0.
+
+It resists a small fix. Peer-to-peer writes are absolute-offset and never advance the descriptor,
+and repositioning it is not enough: when DirectWriter owns the output it tracks its own logical
+offset, so an `lseek` on the fd changes nothing, and its `seek_forward()` cannot be borrowed because
+that PUNCHES A HOLE over the range -- which here is the prefix GDS just wrote. So this is now a
+usage error naming the workaround, and `die()` removes the incomplete output so there is no
+half-file to mistake for a good one.
+
+### Correctness
+
+* The plain GDS producer reopened `opt.input` by name, reintroducing the ABA window the `--rm` work
+  closed: the path can be replaced between the caller's open and this one, so GDS would archive one
+  file while `--rm` deleted the identity recorded for another. The reopened descriptor is now
+  verified against the already-open one. Verified rather than adopted, because dup'ing shares one
+  open file description -- setting `O_DIRECT` on the dup would set it for the caller's `FILE*` too,
+  and a later buffered read through it would start failing on alignment.
+* Assembler threads never called `cudaSetDevice`. CUDA's current device is thread-local, so they
+  operated on device 0 whatever device owned the staging slab. Unreachable today, since the path is
+  single-device and that device is 0 -- which is the point of writing the invariant down.
+* The assembler parks in `GdsStagePool::acquire()` waiting for slots that dead workers will never
+  release. It now gets the same abort wake `DirectReadPool` has, for the same reason.
+* The peer-to-peer decompress stride is rounded to 4 KiB, not merely its file offset: slot i sits at
+  i * alloc_decomp, so an unaligned stride puts every slot after the first off the boundary. The
+  rounding also reserves the padding the last frame's write needs.
+* `-o /dev/null` decompress became fatal when O_DIRECT was made mandatory, because /dev/null refuses
+  it. It demotes to the ordinary writer now, like every other destination cuFile will not take.
+* The degradation warning printed "bounced through host memory0 members cuFile would not take" when
+  nothing had been refused; the optional clause is now built separately.
+
+Verified: extensive suite **548/548** in 8m27s and the CPU-only build **335/335** in 1m27s, both
+configurations compile clean. `--tar` archives remain byte-identical to the ordinary path.
 
 ## v0.17.3 — --tar --gds-only, and the benchmark that said the whole thing was pointless
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.3";
+static constexpr const char * GZSTD_VERSION = "0.17.4";
 //
 // Architecture overview:
 //
@@ -635,6 +635,14 @@ class GdsStagePool {
 public:
   bool init(size_t buf_size, size_t n_bufs, std::string * why) {
     buf_size_ = buf_size;
+    // Record the device this slab belongs to.  CUDA's current device is
+    // THREAD-LOCAL, and the assembler threads that fill these buffers are not
+    // the thread that allocated them, so they must select it explicitly rather
+    // than inherit whatever their thread defaulted to.  Today --gds-only --tar
+    // is single-device and that device is 0, so this is currently an invariant
+    // being written down rather than a bug being fixed -- which is the point:
+    // the next person to allow a second device should not have to rediscover it.
+    if (cudaGetDevice(&device_) != cudaSuccess) device_ = 0;
     if (cudaMalloc(&base_, buf_size * n_bufs) != cudaSuccess) {
       cudaGetLastError();
       if (why) *why = "cannot allocate " + std::to_string((buf_size * n_bufs) >> 20)
@@ -669,6 +677,7 @@ public:
     { std::lock_guard<std::mutex> lk(m_); done_ = true; }
     cv_.notify_all();
   }
+  int    device() const { return device_; }
   void * base() const { return base_; }                       // the REGISTERED base
   size_t stride() const { return buf_size_; }
   off_t  offset_of(int slot) const { return (off_t)((size_t)slot * buf_size_); }
@@ -677,6 +686,7 @@ public:
 private:
   void *   base_ = nullptr;
   size_t   buf_size_ = 0;
+  int      device_ = 0;
   GdsBuf   reg_;
   std::vector<int> free_;
   std::mutex m_;
@@ -8532,6 +8542,15 @@ static void gz_direct_read_abort() {
   DirectReadPool * p = g_direct_read_pool.load(std::memory_order_acquire);
   if (p) p->set_done();
 #endif
+#ifdef HAVE_NVCOMP
+  // The --tar --gds-only assembler parks in GdsStagePool::acquire() waiting for a
+  // slot the dead workers will never release, so it needs the same wake for the
+  // same reason.  Adding a second pool without adding it here would hang the
+  // abort path instead of reaching the CPU-only rebuild -- which is precisely
+  // what this hook was written to prevent for the first pool.
+  GdsStagePool * sp = g_gds_stage_pool.load(std::memory_order_acquire);
+  if (sp) sp->set_done();
+#endif
 }
 
 class FrameThrottle;   // declared below; TaskQueue only pokes it through a pointer
@@ -16026,6 +16045,15 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
 #endif
 #ifdef HAVE_NVCOMP
     if (stage) {
+      // ONCE PER ASSEMBLER THREAD.  cudaSetDevice is thread-local state, so a
+      // thread that never calls it operates on device 0 no matter which device
+      // owns the staging slab.  thread_local so this is one comparison per
+      // frame, not a driver call.
+      static thread_local int t_dev = -1;
+      if (t_dev != stage->device()) {
+        gds_cu_or_die(cudaSetDevice(stage->device()), "select the staging device");
+        t_dev = stage->device();
+      }
       // Blocks while every buffer is still awaiting its worker -- this is the
       // producer's backpressure, exactly as DirectReadPool is for the plain
       // reader.  -1 means the run is aborting; hand back an empty frame rather
@@ -16130,10 +16158,23 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
                 // cuFileRead returns the whole count or a negative error, and a
                 // short return falls through to the same handling a short pread
                 // gets -- the destination is already zeroed.
-                const ssize_t r = sc.gds.read_dev(
-                    stage->base(), len, foff,
-                    stage->offset_of(slot) + (off_t)(voff - a));
-                if (r > 0) { done = (size_t)r; g_gds_frames_p2p.fetch_add(1, std::memory_order_relaxed); }
+                const off_t dv = stage->offset_of(slot) + (off_t)(voff - a);
+                const ssize_t r = sc.gds.read_dev(stage->base(), len, foff, dv);
+                // COUNT WHAT CUFILE CAN ACTUALLY DO, NOT WHETHER THE CALL
+                // RETURNED.  Peer-to-peer needs the device offset on a 4 KiB
+                // boundary; tar puts a 512-byte header before every member, so
+                // member data lands off the 4 KiB grid and cuFile must route
+                // those through a bounce even though the read succeeds.
+                // MEASURED: 20000 of 20000 reads unaligned on a small-file
+                // archive, 28 of 40 file offsets unaligned on a large-file one.
+                // Counting every success as peer-to-peer overstated this badly.
+                const bool p2p_eligible =
+                    ((dv & 4095) == 0) && ((foff & 4095) == 0) && ((len & 4095) == 0);
+                if (r > 0) {
+                  done = (size_t)r;
+                  if (p2p_eligible) g_gds_frames_p2p.fetch_add(1, std::memory_order_relaxed);
+                  else              g_gds_frames_fallback.fetch_add(1, std::memory_order_relaxed);
+                }
               } else if (slot >= 0) {
                 // Member cuFile would not register (see select_src): read it to
                 // a bounce and push it across, so one awkward file does not fail
@@ -23912,6 +23953,29 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       ::close(fd);
       die("--gds-only needs a regular file; " + opt.input + " is not one");
     }
+    // THIS OPEN RESOLVES THE PATH A SECOND TIME, so it must prove it landed on
+    // the same inode the caller already opened and recorded.  Otherwise a
+    // replacement between the two resolutions gives an ABA hole: GDS archives
+    // file B while --rm deletes the identity recorded for file A.  That is the
+    // hazard the whole --rm arc closed, and reopening by name reintroduces it.
+    //
+    // Verified rather than adopted: dup'ing the caller's descriptor would share
+    // one open file DESCRIPTION, so setting O_DIRECT on the dup sets it for the
+    // caller's FILE* too, and any later buffered read through it (a CPU rebuild
+    // re-reading the input) would start failing on alignment.
+    if (in) {
+      struct stat cst{};
+      if (::fstat(::fileno(in), &cst) != 0) {
+        ::close(fd);
+        die("--gds-only: cannot stat the already-open input");
+      }
+      if (cst.st_dev != st.st_dev || cst.st_ino != st.st_ino) {
+        ::close(fd);
+        die("--gds-only: " + opt.input + " changed identity between being opened "
+            "and being registered for GPUDirect Storage; refusing to archive a "
+            "different file than the one this run recorded");
+      }
+    }
     std::string why;
     if (!g_gds_input.open(fd, &why)) {
       ::close(fd);
@@ -24290,14 +24354,20 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     const bool bar1_moved = (b1 > g_gds_bar1_before);
     char b[320];
     if (fb || nofl || !bar1_moved) {
+      // Build the optional clauses separately: the single-snprintf version
+      // printed "bounced through host memory0 members cuFile would not take"
+      // whenever nothing was refused, because the count was formatted even when
+      // its separator was empty.
+      char nofl_s[96] = "";
+      if (nofl)
+        std::snprintf(nofl_s, sizeof(nofl_s), ", %llu members cuFile would not take",
+                      (unsigned long long)nofl);
       std::snprintf(b, sizeof(b),
         "WARNING: --gds-only did not run entirely on the peer-to-peer path: "
-        "%llu frames peer-to-peer, %llu bounced through host memory"
-        "%s%llu members cuFile would not take%s.\n"
+        "%llu frames peer-to-peer, %llu bounced through host memory%s%s.\n"
         "  The output is correct either way; what was lost is the acceleration "
         "the flag asks for.\n",
-        (unsigned long long)p2p, (unsigned long long)fb,
-        nofl ? ", " : "", (unsigned long long)nofl,
+        (unsigned long long)p2p, (unsigned long long)fb, nofl_s,
         bar1_moved ? "" : "; nvidia-fs Bar1-map never moved");
       vlog(V_ERROR, opt, b);       // loud: survives -q, silenced only by -qq
     } else if (opt.verbosity >= V_VERBOSE) {
@@ -25082,6 +25152,15 @@ static void gpu_decomp_worker(
           max_comp   = std::max(max_comp,   C.batch[i].len());
           max_decomp = std::max(max_decomp, C.batch[i].decomp_size);
         }
+        // --gds-only: the DEVICE STRIDE must be 4 KiB-aligned too, not just the
+        // file offset.  Peer-to-peer writes address slot i at i * alloc_decomp,
+        // so an unaligned stride makes every slot after the first start off a
+        // 4 KiB boundary and cuFile rejects or silently re-routes the write.
+        // Rounding up also RESERVES the padding the last frame's write needs:
+        // that write is rounded up to the block, and without the slack it would
+        // run past its slot into the next one.
+        if (C.gds_only)
+          max_decomp = (max_decomp + 4095) & ~size_t(4095);
 
         if (opt.verbosity >= V_DEBUG) {
           char in_s[32];
@@ -25350,6 +25429,9 @@ static void gpu_decomp_worker(
             // after the workers join trims it.  Only the archive's LAST frame is
             // ever short — an earlier short frame would misalign the next frame's
             // offset and be caught by the check above.
+            // alloc_decomp is 4 KiB-aligned on this path (see max_decomp above),
+            // so the rounded length always fits the slot and the clamp is a
+            // belt-and-braces bound rather than something that can unalign it.
             size_t wlen = (actual + 4095) & ~size_t(4095);
             if (wlen > C.alloc_decomp) wlen = C.alloc_decomp;
             const ssize_t w = g_gds_output.write_dev(
@@ -25831,9 +25913,15 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     // untouched.  Same move as adopt_fd.
     const int ofl = ::fcntl(ofd, F_GETFL);
     if (ofl < 0 || ::fcntl(ofd, F_SETFL, ofl | O_DIRECT) != 0) {
+      // DEMOTE, DON'T FAIL -- a destination that cannot take O_DIRECT is a
+      // reason to use the ordinary writer, not to refuse the job.  /dev/null is
+      // the everyday case (EINVAL), and it is exactly what benchmarks write to.
+      const int e = errno;
       ::close(ofd);
-      die("--gds-only: cannot put the output descriptor in O_DIRECT mode: "
-          + std::string(std::strerror(errno)));
+      if (opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt, std::string("[GDS] output will not take O_DIRECT (")
+             + std::strerror(e) + "); this decompress uses the ordinary writer\n");
+      goto gds_out_declined;
     }
     std::string why;
     if (!g_gds_output.open(ofd, &why)) {
@@ -26225,8 +26313,15 @@ gds_out_declined:
   // data; this trim is what makes the output byte-exact, and skipping it would
   // silently append padding to every decompressed file.  Workers have joined, so
   // the high-water mark is final.
+  int      gds_tail_fd  = -1;   // descriptor the sizeless tail must append through
+  uint64_t gds_tail_off = 0;    // where the peer-to-peer prefix ended
   if (g_gds_out_active.load(std::memory_order_relaxed) && g_gds_output_fd >= 0) {
     const uint64_t total = g_gds_out_total.load(std::memory_order_relaxed);
+    // Captured before the block below deregisters and closes ITS dup: the tail
+    // writes through the caller's descriptor, which stays open.
+    gds_tail_off = total;
+    gds_tail_fd  = out ? ::fileno(out)
+                       : (g_direct_writer ? g_direct_writer->fd() : -1);
     const unsigned long long b1 = gz_nvfs_bar1_ok();
     g_gds_output.close();                       // deregister before the fd goes
     if (::ftruncate(g_gds_output_fd, (off_t)total) != 0) {
@@ -26257,6 +26352,27 @@ gds_out_declined:
          "content-size header (zstd streaming output); the parallel reader "
          "can't split it, so the remaining data is decompressed with the CPU "
          "streaming decoder (slower, but nothing is lost).\n");
+#ifdef HAVE_NVCOMP
+    // A SIZELESS TAIL AFTER A PEER-TO-PEER PREFIX IS NOT SUPPORTED, AND MUST NOT
+    // BE SILENT.  Measured before this check: the tail simply never appeared and
+    // the run exited 0 with only the GDS prefix on disk -- 100 MB of a 130 MB
+    // output, silently.
+    //
+    // It resists a small fix.  GDS writes are absolute-offset and never advance
+    // the descriptor, and repositioning it is not enough: when DirectWriter owns
+    // the output it tracks its own logical offset, so an lseek on the fd changes
+    // nothing, and its seek_forward() cannot be borrowed because that PUNCHES A
+    // HOLE over the range -- which here is the prefix GDS just wrote.
+    //
+    // So this fails loudly and names the way out.  die() removes the incomplete
+    // output, so the user is left with no half-file to mistake for a good one.
+    if (gds_tail_fd >= 0 && gds_tail_off > 0)
+      die_usage("--gds-only cannot finish this archive: frame "
+                + std::to_string(n_frames) + " onward has no content-size header, "
+                "and the streaming decoder that handles such a tail cannot append "
+                "to a peer-to-peer-written prefix.  Decompress it without "
+                "--gds-only.");
+#endif
     decompress_from_buffer(raw_data, out, opt, m);
   }
 
