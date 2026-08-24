@@ -112,6 +112,9 @@ pattern="(${addr}[^;]*${width}|\w+[[:space:]]*\([^;]*${width}[^;]*${addr})"
 # like. Keep this list SHORT and keep the reasons.
 declare -a ALLOW_CALLEE=(
   'cudaMalloc'                   # &ptr out-param for a device allocation, not a read
+  'cudaHostAlloc'                # same shape as cudaMalloc: &ptr out-param for a
+                                 # page-locked HOST allocation. The width argument
+                                 # is the allocation size, never an on-disk field.
   'cudaMemcpy'                   # device<->host copy; same endianness, no file
   'cudaMemcpyAsync'              # likewise — and it must be listed SEPARATELY:
                                  # exemptions are matched as `name(`, so the

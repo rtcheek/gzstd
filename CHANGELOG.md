@@ -1,12 +1,97 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.2  
+**Covers:** v0.9.50 → v0.17.3  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.3 — --tar --gds-only, and the benchmark that said the whole thing was pointless
+
+`--tar` creation now works under `--gds-only`. A tar frame cannot be one file region -- it
+interleaves member data with headers gzstd synthesises -- so the assembler composes each frame in
+registered VRAM instead: `cuFileRead` for member extents, a small host copy for the headers, and a
+device-to-device copy into the compressor's slab. Extraction is still rejected, for a different
+reason that was checked rather than assumed: it writes a whole tree, while GPUDirect Storage
+addresses one registered file handle by offset.
+
+Archives are byte-identical to the ordinary `--tar` path, for large files and for 20000 small ones.
+
+### The performance claim in v0.17.0 was measured wrong
+
+v0.17.0 reported `--gds-only` about 2.4x faster than `--gpu-only`. That compared one GPU against
+eight, and eight is much slower on this box. Corrected for device count it inverted: GDS looked
+1.5x SLOWER. Both numbers were wrong, and the second one for a better reason -- **the input was
+100% resident in page cache**, so GDS was reading NVMe while the ordinary path read from RAM.
+
+Cold cache, storage-equivalent, 2.79 GiB, 3 interleaved reps, one device and one stream on both:
+
+| | wall | host CPU |
+|---|---|---|
+| `--gds-only` | 4.57-4.94 s | **3.90 s** |
+| `--gpu-only -d1 -s1` | 4.71-4.88 s | 6.98 s |
+
+Wall ranges overlap -- no measurable difference -- and host CPU is **44% lower**. The ordinary
+path's CPU nearly doubles when the cache is cold (3.50 -> 6.98 s); that is the kernel read path,
+and it is exactly the term GDS removes. On warm input the comparison is not storage-equivalent and
+should not be used.
+
+### Two bugs were most of the gap, and neither was structural
+
+* The per-stream tuner started at `DEFAULT_GPU_BATCH_CAP` (8) while the slab was registered for 64,
+  so batches averaged 5.6 frames. The GPU checksum's throughput is ~0.28 GiB/s PER FRAME IN THE
+  BATCH, so a 5.6-frame batch hashes at ~1.6 GiB/s and cost ~55 ms every batch. Registering 64
+  slots and filling 8 of them was the worst of both. Batches are now ~45 frames over 4 batches.
+* The checksum kernel was given its own stream so it could overlap the compressor, and it did not
+  overlap at all: the readback targeted a pageable `std::vector`, and `cudaMemcpyAsync` to pageable
+  memory is SYNCHRONOUS with respect to the host, so the submitting thread blocked on the hash
+  before it could enqueue nvCOMP. The stream was fine; the destination was the problem. The
+  checksums now land in page-locked memory.
+
+### Correctness
+
+* `-d --gds-only -f` over an EXISTING file wrote a 0-byte file and exited 0. Overwriting goes
+  through an atomic `<out>.gzstd.*.tmp`, so opening `opt.output` by name wrote the data to the final
+  name and then let the rename install the untouched temp on top of it. The output descriptor is now
+  adopted from whoever owns it -- and `out` is NULL whenever DirectWriter adopted it, which is the
+  default here, so `fileno(out)` segfaulted until that case was handled. Same
+  path-resolved-twice window `DirectWriter::adopt_fd` already existed for.
+* cuFile refuses some valid destinations, including that atomic temp. Rather than fail the job, an
+  output it will not take now falls back to the ordinary writer: the user asked for a decompressed
+  file, and the acceleration is the negotiable part.
+* Per-file GDS output state is reset. A second, shorter file inherited the first file's high-water
+  mark and was ftruncated up to it.
+* Three CUDA calls in the tar assembler ignored their return status. That is a silent-corruption
+  path rather than a missing diagnostic: **the frame's checksum is computed on the GPU from the same
+  buffer after it is filled**, so a failed zero-fill or header copy yields stale VRAM with a checksum
+  that MATCHES the stale bytes -- passing `zstd -t` and every round-trip check gzstd has.
+* `--tar --gds-only` with more than one GPU is rejected. The staging pool is one allocation
+  registered on one device; the forced `--gpu-devices=1` hid it, but an explicit override made a
+  worker copy device-to-device from another device's pointer with no peer access.
+* A 64-frame batch against a 16-slot staging pool deadlocked: the worker waited in
+  `wait_for_batch_or_cap` for frames the assembler could not supply while the assembler blocked on
+  slots that could not come back. The queue is now told the staging depth, and the pool is 32 slots.
+
+`--gds-only` degradation is now reported at DEFAULT verbosity, not under `-v`. A compat fallback
+returns correct bytes at nearly the same speed, so a degraded run is otherwise indistinguishable
+from a healthy one; it now says how many frames went peer-to-peer, how many bounced, how many
+members cuFile refused, and whether the nvidia-fs `Bar1-map` counter ever moved.
+
+Six of these came from an independent Codex review, including the two efficiency bugs and the
+`-f` data loss. It also supplied the page-cache objection, in a DISAGREEMENTS section that only
+exists because the review scope asks for one.
+
+Verified: extensive suite **548/548** in 8m32s and the CPU-only build **335/335** in 1m31s, both
+configurations compile clean. The CPU-only run failed first on the endian source guard, which
+flagged `cudaHostAlloc(&ptr, sizeof(unsigned int) * n)`. That one is genuinely what the ALLOW list
+is for -- the same out-param allocator shape as `cudaMalloc` beside it -- so it was exempted by
+callee with a reason, and the widened exemption was then mutation-tested to confirm the guard still
+catches a real `pread(fd, &magic, 4, 0)`.
+
+`--gds-only` still has NO suite coverage: it needs hardware the suite cannot assume, so everything
+above rests on hand verification. That is why it remains EXPERIMENTAL and out of the short `-h`.
 
 ## v0.17.2 — what --gds-only did on a host that cannot run it, which is most of them
 

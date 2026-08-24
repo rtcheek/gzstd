@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.2";
+static constexpr const char * GZSTD_VERSION = "0.17.3";
 //
 // Architecture overview:
 //
@@ -560,6 +560,13 @@ static unsigned long long g_gds_bar1_before = 0;
 // gzstd, not the writer, responsible for the file's final LOGICAL size: every
 // cuFileWrite is rounded up to the O_DIRECT block, and this high-water mark is
 // the ftruncate target that trims the padding off the last frame.
+// Accounting for the end-of-run report.  A --gds-only run that quietly does its
+// work some other way is the failure mode this whole feature is most exposed to
+// -- a compat fallback returns the right bytes at nearly the same speed -- so
+// what actually happened is reported at DEFAULT verbosity, not under -v.
+static std::atomic<uint64_t> g_gds_frames_p2p{0};      // frames staged via cuFileRead
+static std::atomic<uint64_t> g_gds_frames_fallback{0}; // frames that had to be bounced
+static std::atomic<uint64_t> g_gds_members_nofile{0};  // --tar members cuFile refused
 static GdsFile              g_gds_output;
 static int                  g_gds_output_fd = -1;
 static std::atomic<uint64_t> g_gds_out_total{0};
@@ -601,6 +608,90 @@ public:
 private:
   const void * p_ = nullptr;
 };
+
+/*======================================================================
+ GdsStagePool — device staging buffers for `--tar --gds-only`
+ -----------------------------------------------------------------------
+ The plain --gds-only producer emits Tasks that name a REGION OF THE INPUT
+ FILE, and the GPU worker cuFileReads it straight into its own slab.  A tar
+ chunk cannot work that way: it is assembled from many members plus headers
+ gzstd synthesises, so there is no single file region that IS the frame.
+
+ So the assembler composes the frame in VRAM instead, into a buffer from
+ this pool: cuFileRead each member extent to its offset within the buffer,
+ cudaMemcpy the 512-byte headers around them, zero the padding.  The Task
+ then carries a SLOT INDEX, and the GPU worker copies slot -> its own slab
+ device-to-device (~1 TB/s, roughly 16 us for a 16 MiB chunk, nothing
+ against a 4.9 GiB/s drive) before releasing the slot back.
+
+ WHY A POOL AND NOT A BUFFER PER CHUNK.  cuFileBufRegister is what maps the
+ memory through BAR1, and it costs hundreds of milliseconds per GiB — far
+ too much to pay per frame.  Registering a fixed set of buffers once and
+ recycling them makes that a startup cost.  The pool doubles as the
+ producer's backpressure, exactly like DirectReadPool: acquire() blocks
+ while every buffer is still awaiting its worker.
+======================================================================*/
+class GdsStagePool {
+public:
+  bool init(size_t buf_size, size_t n_bufs, std::string * why) {
+    buf_size_ = buf_size;
+    if (cudaMalloc(&base_, buf_size * n_bufs) != cudaSuccess) {
+      cudaGetLastError();
+      if (why) *why = "cannot allocate " + std::to_string((buf_size * n_bufs) >> 20)
+                    + " MiB of GPU memory for --tar staging";
+      base_ = nullptr;
+      return false;
+    }
+    // ONE registration for the whole pool, not one per buffer: cuFile keys its
+    // BAR1 mapping on the base pointer, and every read passes base + offset.
+    if (!reg_.reg(base_, buf_size * n_bufs, why)) {
+      cudaFree(base_); base_ = nullptr;
+      return false;
+    }
+    for (size_t i = 0; i < n_bufs; ++i) free_.push_back((int)i);
+    return true;
+  }
+  // Blocks until a buffer is free; -1 after set_done() (abort: no buffer is
+  // coming back, the assembler must stop rather than hang).
+  int acquire() {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&]{ return done_ || !free_.empty(); });
+    if (done_) return -1;
+    int s = free_.back(); free_.pop_back();
+    return s;
+  }
+  void release(int slot) {
+    if (slot < 0) return;
+    { std::lock_guard<std::mutex> lk(m_); free_.push_back(slot); }
+    cv_.notify_one();
+  }
+  void set_done() {
+    { std::lock_guard<std::mutex> lk(m_); done_ = true; }
+    cv_.notify_all();
+  }
+  void * base() const { return base_; }                       // the REGISTERED base
+  size_t stride() const { return buf_size_; }
+  off_t  offset_of(int slot) const { return (off_t)((size_t)slot * buf_size_); }
+  void * buf(int slot) const { return (char *)base_ + offset_of(slot); }
+  ~GdsStagePool() { reg_.dereg(); if (base_) cudaFree(base_); }
+private:
+  void *   base_ = nullptr;
+  size_t   buf_size_ = 0;
+  GdsBuf   reg_;
+  std::vector<int> free_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  bool done_ = false;
+};
+
+// Live only while a --tar --gds-only compress is running; the pool outlives
+// every releaser (cleared before the joins complete, destroyed after).  Same
+// shape and same reasoning as g_direct_read_pool.
+static std::atomic<GdsStagePool *> g_gds_stage_pool{nullptr};
+static void gz_gds_stage_release(int slot) {
+  GdsStagePool * p = g_gds_stage_pool.load(std::memory_order_acquire);
+  if (p) p->release(slot);
+}
 #endif
 
 namespace fs = std::filesystem;
@@ -2066,6 +2157,23 @@ static void die_data(const std::string & msg)
 { die(msg, EXIT_DATA); }
 
 #ifdef HAVE_NVCOMP
+// A failed CUDA op while composing a --tar frame in VRAM is NOT ignorable, and
+// this is the one place in gzstd where ignoring one is actively dangerous rather
+// than merely wrong: the frame's content checksum is computed on the GPU from
+// the same buffer AFTER it is filled.  So a silently failed zero-fill or header
+// copy does not produce a detectably bad frame -- it produces stale VRAM with a
+// checksum that MATCHES the stale bytes, which then passes zstd -t and every
+// round-trip check gzstd has.
+//
+// die() rather than throw: these run on the tar assembler's threads, which have
+// no exception boundary, so a throw would reach std::terminate instead of the
+// abort path.
+static void gds_cu_or_die(cudaError_t e, const char * what)
+{
+  if (e != cudaSuccess)
+    die(std::string("--gds-only --tar: ") + what + " failed: " + cudaGetErrorString(e));
+}
+
 // Can this host register DEVICE memory with cuFile at all?  Answered BEFORE any
 // work is queued, and that ordering is the whole point.
 //
@@ -7695,15 +7803,23 @@ struct Task {
   // the one that used to be unconditional (the XXH64 content checksum) now runs
   // on the device instead.
   off_t        gds_off = -1;
+  // --tar --gds-only: the frame was ASSEMBLED in VRAM (members + synthesised
+  // headers cannot come from one file region), so instead of a file offset the
+  // Task names a GdsStagePool slot the GPU worker copies out of and releases.
+  int          gds_stage = -1;
   size_t       gds_len = 0;
 
-  bool         is_gds() const { return gds_off >= 0; }
+  bool         is_gds() const { return gds_off >= 0 || gds_stage >= 0; }
   const char * ptr() const { return view_ptr ? view_ptr : data.data(); }
   size_t       len() const {
-    if (gds_off >= 0) return gds_len;
+    if (gds_off >= 0 || gds_stage >= 0) return gds_len;
     return view_ptr ? view_len : data.size();
   }
   void release_input() {
+#ifdef HAVE_NVCOMP
+    if (gds_stage >= 0)  { gz_gds_stage_release(gds_stage); gds_stage = -1; gds_len = 0; }
+    else
+#endif
     if (gds_off >= 0)    { gds_off = -1; gds_len = 0; }   // nothing was ever held
     else if (direct_buf >= 0) { gz_direct_read_release(direct_buf); direct_buf = -1; view_ptr = nullptr; view_len = 0; }
     else if (view_ptr)   { gz_input_retire(view_ptr, view_len); view_ptr = nullptr; view_len = 0; }
@@ -15766,8 +15882,17 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     off_t       size  = 0;
     struct timespec mtime {};
     bool        id_ok = false;
+#ifdef HAVE_NVCOMP
+    // --tar --gds-only: the member registered with cuFile, so its extents can be
+    // read peer-to-peer into the staging frame.  Registration is ~14 us per file
+    // measured at scale, so doing it per member-open is affordable.
+    GdsFile     gds;
+#endif
   };
   auto finish_src = [&](SrcCache & sc) {
+#ifdef HAVE_NVCOMP
+    sc.gds.close();          // deregister before the fd it refers to goes away
+#endif
     if (sc.fd >= 0) {
       // The open-time size+mtime check below binds the descriptor to Pass B's
       // stat-visible generation.  Check once more before releasing a cached descriptor so a
@@ -15813,7 +15938,16 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     // open would wedge the reader/pusher chain forever.
     sc.dev = 0; sc.ino = 0; sc.size = 0; sc.mtime = {};
     sc.id_ok = false; sc.err_reported = false;
-    sc.fd = ::open(e.src.c_str(), O_RDONLY | O_NONBLOCK);
+    // O_DIRECT IS REQUIRED FOR THE PEER-TO-PEER PATH, not an optimisation:
+    // cuFile accepts a buffered descriptor at registration and then quietly
+    // reads it through the page cache, which is the cost --gds-only exists to
+    // remove.  Only added when staging is live, so the ordinary tar path keeps
+    // its buffered reads and their alignment freedom.
+    int open_flags = O_RDONLY | O_NONBLOCK;
+#ifdef HAVE_NVCOMP
+    if (g_gds_stage_pool.load(std::memory_order_acquire)) open_flags |= O_DIRECT;
+#endif
+    sc.fd = ::open(e.src.c_str(), open_flags);
     sc.err = (sc.fd < 0) ? errno : 0;
     if (sc.fd >= 0) {
       struct stat mst{};
@@ -15831,6 +15965,38 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       } else {
         sc.dev = mst.st_dev; sc.ino = mst.st_ino;
         sc.size = mst.st_size; sc.mtime = mst.st_mtim; sc.id_ok = true;
+#ifdef HAVE_NVCOMP
+        // Register only AFTER the identity check has accepted this descriptor,
+        // so a stale or wrong-inode open is never handed to cuFile.
+        if (g_gds_stage_pool.load(std::memory_order_acquire)) {
+          // cuFile REJECTS O_NONBLOCK -- CU_FILE_INVALID_FILE_OPEN_FLAG, err
+          // 5019, on every member.  The flag is not optional at open time (the
+          // layout was built earlier, so a member may since have become a FIFO
+          // and a blocking open would wedge the assembler), but the fstat above
+          // has now confirmed a regular file, for which it means nothing.  Clear
+          // it here rather than opening without it.
+          const int fl = ::fcntl(sc.fd, F_GETFL);
+          if (fl >= 0) (void)::fcntl(sc.fd, F_SETFL, fl & ~O_NONBLOCK);
+          std::string gwhy;
+          if (!sc.gds.open(sc.fd, &gwhy)) {
+            // A member cuFile will not take is not fatal: read_seg reads it
+            // ordinarily and copies it across.  But the descriptor is O_DIRECT,
+            // whose alignment rules that bounce path cannot meet -- it would
+            // short-read every time and be reported as "file changed as we read
+            // it".  Drop O_DIRECT with the same fcntl rather than reopening,
+            // which would mean re-validating the identity all over again.
+            const int f2 = ::fcntl(sc.fd, F_GETFL);
+            if (f2 >= 0) (void)::fcntl(sc.fd, F_SETFL, f2 & ~O_DIRECT);
+            // COUNTED, NOT PRINTED PER MEMBER: an archive of 20000 files would
+            // bury the terminal.  The total is reported at default verbosity
+            // when the run ends.
+            g_gds_members_nofile.fetch_add(1, std::memory_order_relaxed);
+            vlog(V_VERBOSE, opt, "gzstd: tar: " + e.src
+                 + ": not readable by GPUDirect Storage (" + gwhy
+                 + "); using ordinary reads for it\n");
+          }
+        }
+#endif
         const int fl = ::fcntl(sc.fd, F_GETFL);
         if (fl >= 0) (void)::fcntl(sc.fd, F_SETFL, fl & ~O_NONBLOCK);
       }
@@ -15850,8 +16016,59 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     uint64_t a = (uint64_t)ci * chunk_size;
     uint64_t b = std::min(total, a + chunk_size);
     size_t clen = (size_t)(b - a);
-    Task t; t.seq = ci; t.data.assign(clen, 0);
-    char * outp = t.data.data();
+    Task t; t.seq = ci;
+    char * outp = nullptr;
+    int    slot = -1;
+#ifdef HAVE_NVCOMP
+    GdsStagePool * stage = g_gds_stage_pool.load(std::memory_order_acquire);
+#else
+    void * stage = nullptr;
+#endif
+#ifdef HAVE_NVCOMP
+    if (stage) {
+      // Blocks while every buffer is still awaiting its worker -- this is the
+      // producer's backpressure, exactly as DirectReadPool is for the plain
+      // reader.  -1 means the run is aborting; hand back an empty frame rather
+      // than hang.
+      slot = stage->acquire();
+      if (slot < 0) return t;
+      // ZERO THE WHOLE FRAME UP FRONT.  The host path gets this free from a
+      // zero-filled vector, and three separate things depend on it: tar's
+      // inter-member padding, the holes of a sparse member, and the tail of a
+      // short read (GNU parity).  Missing it would publish whatever the last
+      // frame left in the buffer.
+      // AND WAIT FOR IT.  cudaMemset on device memory is ASYNCHRONOUS with
+      // respect to the host -- it is queued on the default stream -- while
+      // cuFileRead is a driver DMA that is not stream-ordered at all.  So the
+      // zero-fill can land ON TOP OF bytes the drive has already delivered.
+      // A chunk that contains a header happens to get away with it, because the
+      // synchronous H2D copy of that header flushes the queue first; a chunk
+      // that is pure member data has nothing to flush it, which is why this
+      // corrupted large-file archives (byte 402653184 = chunk 24) and left
+      // small-file ones intact.
+      gds_cu_or_die(cudaMemset(stage->buf(slot), 0, clen), "frame zero-fill");
+      gds_cu_or_die(cudaStreamSynchronize(0), "frame zero-fill sync");
+      t.gds_stage = slot;
+      t.gds_len   = clen;
+    } else
+#endif
+    {
+      t.data.assign(clen, 0);
+      outp = t.data.data();
+    }
+    // One frame, two possible destinations: host bytes go through here so the
+    // assembly logic below stays identical in both.
+    auto put_host = [&](uint64_t voff, const void * src, size_t len) {
+#ifdef HAVE_NVCOMP
+      if (slot >= 0) {
+        gds_cu_or_die(cudaMemcpy(static_cast<char *>(stage->buf(slot)) + (voff - a),
+                                 src, len, cudaMemcpyHostToDevice),
+                      "tar header copy");
+        return;
+      }
+#endif
+      std::memcpy(outp + (voff - a), src, len);
+    };
     // First entry whose data/padding could reach into this chunk (entry_end > a).
     auto it = std::upper_bound(lay.entries.begin(), lay.entries.end(), a,
                 [](uint64_t v, const TarEntry & e) { return v < e.entry_end; });
@@ -15864,7 +16081,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         if (hdrbuf.size() < e.hdr_len) hdrbuf.resize(e.hdr_len);
         emit_header(e, lay, hdrbuf.data());
         uint64_t s = std::max<uint64_t>(e.hdr_off, a), en = std::min<uint64_t>(he, b);
-        std::memcpy(outp + (s - a), hdrbuf.data() + (s - e.hdr_off), (size_t)(en - s));
+        put_host(s, hdrbuf.data() + (s - e.hdr_off), (size_t)(en - s));
         // A regular member with zero STORED bytes still needs an assembly-time
         // snapshot check.  This includes empty files and, critically, a wholly
         // sparse OLDGNU member whose entire content is represented in its header:
@@ -15906,6 +16123,36 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
               // structural blindness already documented for the mmap reader.
               const bool time_io = (g_perf != nullptr) || (m != nullptr);
               uint64_t t0 = time_io ? now_ns() : 0;
+#ifdef HAVE_NVCOMP
+              if (slot >= 0 && sc.gds.valid()) {
+                // Straight from the drive into this frame's offset in the
+                // registered staging buffer.  One call rather than a loop:
+                // cuFileRead returns the whole count or a negative error, and a
+                // short return falls through to the same handling a short pread
+                // gets -- the destination is already zeroed.
+                const ssize_t r = sc.gds.read_dev(
+                    stage->base(), len, foff,
+                    stage->offset_of(slot) + (off_t)(voff - a));
+                if (r > 0) { done = (size_t)r; g_gds_frames_p2p.fetch_add(1, std::memory_order_relaxed); }
+              } else if (slot >= 0) {
+                // Member cuFile would not register (see select_src): read it to
+                // a bounce and push it across, so one awkward file does not fail
+                // the archive.
+                std::vector<char> bounce(len);
+                size_t got = 0;
+                while (got < len) {
+                  ssize_t r = ::pread(sc.fd, bounce.data() + got, len - got, foff + (off_t)got);
+                  if (r <= 0) break;
+                  got += (size_t)r;
+                }
+                if (got)
+                  gds_cu_or_die(cudaMemcpy(static_cast<char *>(stage->buf(slot)) + (voff - a),
+                                           bounce.data(), got, cudaMemcpyHostToDevice),
+                                "member bounce copy");
+                done = got;
+                g_gds_frames_fallback.fetch_add(1, std::memory_order_relaxed);
+              } else
+#endif
               while (done < len) {
                 ssize_t r = ::pread(sc.fd, outp + (voff - a) + done, len - done, foff + (off_t)done);
                 if (r <= 0) break;
@@ -15946,7 +16193,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
               if (ss < map_pad) {
                 uint64_t hi = std::min({se, map_pad, (uint64_t)mt.size()});
                 if (ss < hi)
-                  std::memcpy(outp + (e.data_off + ss) - a, mt.data() + (size_t)ss, (size_t)(hi - ss));
+                  put_host(e.data_off + ss, mt.data() + (size_t)ss, (size_t)(hi - ss));
               }
             }
             uint64_t cum = map_pad;
@@ -20626,6 +20873,12 @@ struct StreamCtx {
   // XXH64 kernel that replaces the host checksum.
   GdsBuf         gds_in_reg;
   unsigned int * d_checksums = nullptr;
+  // The checksum readback MUST land in page-locked memory.  cudaMemcpyAsync to a
+  // PAGEABLE destination is synchronous with respect to the host, so copying into
+  // the h_checksums vector made the submitting thread block until the hash
+  // finished -- which is why giving the kernel its own stream bought nothing
+  // measurable.  The stream was fine; the destination was the problem.
+  unsigned int * h_ck_pinned = nullptr;
 
   // Pinned host memory for H2D + D2H transfers (optional).
   // ONE buffer per stream is sized to max(gpu_chunk, max_out_chunk) per
@@ -20651,6 +20904,12 @@ struct StreamCtx {
   size_t      per_stream_batch = 0;   // max subchunks per batch
   cudaEvent_t ev_h2d_begin{};
   cudaEvent_t ev_h2d_end{};
+  // --gds-only: the content-checksum kernel gets its OWN stream so it overlaps
+  // the compressor instead of standing in front of it.  Both only READ
+  // d_in_base, so concurrent execution is safe; ck_done is what makes the drain
+  // wait for the hash it is about to stamp into the frame.
+  cudaStream_t ck_stream{};
+  cudaEvent_t  ck_done{};
   cudaEvent_t ev_comp_end{};
   cudaEvent_t ev_d2h_end{};
   // End-of-batch marker for the drain thread (ROADMAP 1.10): recorded after all
@@ -20763,6 +21022,14 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   if (opt.gds_only) {
     if (cudaMalloc(&C.d_checksums, sizeof(unsigned int) * C.per_stream_batch) != cudaSuccess)
       return false;
+    // (endian-lint exemption: cudaHostAlloc is an allocator out-param, listed in
+    // check-endian-reads.sh's ALLOW beside cudaMalloc -- the width here is the
+    // allocation size, not the width of a field read off disk.)
+    if (cudaHostAlloc(&C.h_ck_pinned, sizeof(unsigned int) * C.per_stream_batch,
+                      cudaHostAllocDefault) != cudaSuccess) {
+      C.h_ck_pinned = nullptr;
+      return false;      // a few hundred bytes; failing here means something worse
+    }
     // REGISTERING THE SLAB IS NOT BOOKKEEPING.  cuFileBufRegister is what maps
     // this VRAM through the GPU's BAR1 aperture so the drive can write into it
     // directly; without it every cuFileRead silently falls back to a bounce
@@ -20929,6 +21196,7 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   // pointer, and freeing underneath it leaves the driver mapping dead memory.
   C.gds_in_reg.dereg();
   if (C.d_checksums) { cudaFree(C.d_checksums); C.d_checksums = nullptr; }
+  if (C.h_ck_pinned) { cudaFreeHost(C.h_ck_pinned); C.h_ck_pinned = nullptr; }
   if (C.d_in_base) { cudaFree(C.d_in_base); }
   if (C.d_out_base) { cudaFree(C.d_out_base); }
   if (C.d_temp) { cudaFree(C.d_temp); }
@@ -21503,7 +21771,8 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   for (size_t i=0;i<C.filled;++i) {
     const size_t csz = C.h_comp_sizes[i];
     if (tr) t_a = now_ns();
-    gpu_frame_set_checksum(*C.drain_bufs[i], csz, C.h_checksums[i]);  // self-verifying frame
+    gpu_frame_set_checksum(*C.drain_bufs[i], csz,
+                           C.h_ck_pinned ? C.h_ck_pinned[i] : C.h_checksums[i]);
     if (tr) { ns_ck += now_ns() - t_a; t_a = now_ns(); }
     results->push_to_slot(slot_index, C.batch[i].seq, std::move(C.drain_bufs[i]));
     if (tr) ns_push += now_ns() - t_a;
@@ -21748,6 +22017,11 @@ static void gpu_worker(
     for (size_t s=0; s<stream_count; ++s) {
       StreamCtx & C = ctxs[s];
       checkCuda(cudaStreamCreate(&C.stream), "cudaStreamCreate");
+      if (opt.gds_only) {
+        checkCuda(cudaStreamCreate(&C.ck_stream), "cudaStreamCreate(checksum)");
+        checkCuda(cudaEventCreateWithFlags(&C.ck_done, cudaEventDisableTiming),
+                  "cudaEventCreate(checksum)");
+      }
       // Calculate how many subchunks this stream can hold based on free VRAM.
       // nvCOMP temp workspace can be very large (e.g., 5 GiB for batch=200),
       // so we use binary search to find the largest batch that fits in VRAM.
@@ -21819,6 +22093,8 @@ static void gpu_worker(
           // (auto-decrement of --gpu-streams when VRAM is tight).  Only if
           // no streams succeeded do we skip the GPU entirely.
           stream_init_failed = true;
+          if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+          if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
           if (C.stream) { cudaStreamDestroy(C.stream); C.stream = nullptr; }
           break;
         }
@@ -22454,11 +22730,37 @@ static void gpu_worker(
           std::atomic<bool> rd_failed{false};
           std::mutex        rd_err_m;
           std::string       rd_err;
+          // --tar frames were already ASSEMBLED in VRAM by the producer, so they
+          // arrive as a staging slot rather than a file region.  Copy those in
+          // device-to-device (~1 TB/s, about 16 us for a 16 MiB chunk) and read
+          // the rest from the drive.  Both land in the same slab slot, so
+          // everything downstream is identical.
+          bool staged_any = false;
+          for (size_t i = 0; i < C.filled; ++i) {
+            const Task & t = C.batch[i];
+            if (t.gds_stage < 0) continue;
+            GdsStagePool * sp = g_gds_stage_pool.load(std::memory_order_acquire);
+            if (!sp) throw std::runtime_error("--gds-only: staging pool vanished mid-run");
+            checkCuda(cudaMemcpyAsync(static_cast<char *>(C.d_in_base) + i * C.gpu_chunk,
+                                      sp->buf(t.gds_stage), t.len(),
+                                      cudaMemcpyDeviceToDevice, C.stream),
+                      "cudaMemcpyAsync(--tar staging -> slab)");
+            staged_any = true;
+          }
+          // The copies must LAND before release_input() hands these slots back,
+          // or the next frame assembled into a recycled slot would race a copy
+          // still reading it.
+          if (staged_any)
+            checkCuda(cudaStreamSynchronize(C.stream), "sync(--tar staging copies)");
+
           auto issue = [&](size_t k, size_t step) {
             for (size_t i = k; i < C.filled; i += step) {
               const Task & t = C.batch[i];
+              if (t.gds_stage >= 0) continue;          // already copied above
               const ssize_t got = g_gds_input.read_dev(
                   C.d_in_base, t.len(), (off_t)t.gds_off, (off_t)(i * C.gpu_chunk));
+              if (got == (ssize_t)t.len())
+                g_gds_frames_p2p.fetch_add(1, std::memory_order_relaxed);
               if (got != (ssize_t)t.len()) {
                 std::lock_guard<std::mutex> g(rd_err_m);
                 if (!rd_failed.exchange(true))
@@ -22558,6 +22860,8 @@ static void gpu_worker(
           }
         }
         checkCuda(cudaMemcpyAsync(C.d_in_sizes, C.h_in_sizes.data(), sizeof(size_t)*C.filled, cudaMemcpyHostToDevice, C.stream), "cudaMemcpyAsync(d_in_sizes)");
+        // Recorded AFTER the d_in_sizes copy: the checksum kernel reads those
+        // sizes, and ck_stream orders itself against this event.
         cudaEventRecord(C.ev_h2d_end, C.stream);
         // --gds-only: the content checksum the host used to compute during
         // staging.  MUST follow the d_in_sizes copy above — the kernel reads
@@ -22565,12 +22869,27 @@ static void gpu_worker(
         // The readback lands in the same h_checksums the drain already stamps
         // from, so nothing downstream changes.
         if (opt.gds_only) {
+          // OVERLAPPED, NOT SEQUENCED.  On C.stream this kernel sat between the
+          // staging and the compressor, and it is not cheap: its wall time is set
+          // by the chunk size alone, so at the ~5-frame batches a disk-bound
+          // producer actually delivers it runs near 1.4 GiB/s and cost ~60 ms per
+          // batch -- roughly 2 s of a 4.2 s run.  The host hashing it replaces
+          // runs on idle cores while the copy is in flight and costs nothing.
+          // ck_stream waits for the input to be staged, then runs ALONGSIDE
+          // nvCOMP, which only reads the same buffer.
+          checkCuda(cudaStreamWaitEvent(C.ck_stream, C.ev_h2d_end, 0),
+                    "cudaStreamWaitEvent(checksum <- staging)");
           gzx_launch_xxh64(C.d_in_base, C.gpu_chunk, C.d_in_sizes, C.filled,
-                           C.d_checksums, C.stream);
-          checkCuda(cudaMemcpyAsync(C.h_checksums.data(), C.d_checksums,
+                           C.d_checksums, C.ck_stream);
+          checkCuda(cudaMemcpyAsync(C.h_ck_pinned, C.d_checksums,
                                     sizeof(unsigned int) * C.filled,
-                                    cudaMemcpyDeviceToHost, C.stream),
+                                    cudaMemcpyDeviceToHost, C.ck_stream),
                     "cudaMemcpyAsync(D2H gds checksums)");
+          checkCuda(cudaEventRecord(C.ck_done, C.ck_stream), "cudaEventRecord(checksum)");
+          // NOTE: C.stream is joined to ck_done AFTER the compressor is enqueued,
+          // not here.  Waiting at this point would order the join ahead of the
+          // nvCOMP launch in program order and serialise them again -- which is
+          // exactly what the first attempt did, buying 0.3 s of an expected 2 s.
         }
 
         // Release host-side input data  it's on the GPU now (and the per-frame
@@ -22594,6 +22913,13 @@ static void gpu_worker(
           nvcompBatchedZstdCompressDefaultOpts,
           C.d_stats,
           C.stream), "nvcompBatchedZstdCompressAsync");
+        // --gds-only: the checksum kernel has been running on ck_stream since
+        // the input was staged.  Join it now that the compressor is enqueued:
+        // both read d_in_base and neither writes it, so they overlap, and the
+        // drain that stamps h_checksums is ordered after both.
+        if (opt.gds_only)
+          checkCuda(cudaStreamWaitEvent(C.stream, C.ck_done, 0),
+                    "cudaStreamWaitEvent(compress <- checksum)");
         cudaEventRecord(C.ev_comp_end, C.stream);
 
         // --verify (gpu-only): decompress the batch we just compressed straight
@@ -22713,6 +23039,8 @@ static void gpu_worker(
     if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
       free_stream_buffers_only(C, opt);
+      if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+      if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
       if (C.stream) cudaStreamDestroy(C.stream);
       C.stream = nullptr;
     }
@@ -22773,6 +23101,8 @@ static void gpu_worker(
           for (auto & t : C.batch) t.release_input();
           C.batch.clear();
           free_stream_buffers_only(C, opt);
+          if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+          if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
           if (C.stream) cudaStreamDestroy(C.stream);
         }
       }
@@ -23546,6 +23876,13 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 #ifndef _WIN32
   MmapRegion mmap_region;
   DirectReadPool nv_pool;   // buffered zero-copy pool; must outlive all workers
+  // --tar --gds-only staging.  MUST OUTLIVE THE WORKERS for exactly the reason
+  // nv_pool does, and it did not: scoped to the assemble() call, it was destroyed
+  // the moment assembly finished while workers were still holding staged frames.
+  // Every run then hit "staging pool vanished mid-run", faulted, and rebuilt the
+  // archive CPU-only -- producing correct output by the slow path, so nothing
+  // looked wrong until the timings were read.
+  std::unique_ptr<GdsStagePool> stage_pool;
   bool reader_done = false;
   // ---- --gds-only producer: names regions, reads nothing ----
   //
@@ -23554,7 +23891,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // cuFileRead landing straight in VRAM.  So there is no read here, no host
   // buffer, no page-cache footprint and no backpressure to apply — the pace is
   // set by the GPU workers popping batches, which is exactly where we want it.
-  if (!reader_done && opt.gds_only) {
+  // NOT in --tar mode: there the assembler is the producer and composes frames
+  // in the staging pool, so this branch must not claim the input first (it did,
+  // and reported a pipe that was never involved).
+  if (!reader_done && opt.gds_only && !opt.tar_mode) {
     if (opt.input == "-")
       die_usage("--gds-only needs a seekable file: GPUDirect Storage reads by offset "
                 "from a registered file handle, which a pipe cannot provide.  This is "
@@ -23605,6 +23945,38 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // --tar: parallel assembler at GPU-chunk granularity (≤16 MiB frames feed the
   // nvCOMP batched path unchanged).  Pushes in sequence order.
   if (opt.tar_mode) {
+#ifdef HAVE_NVCOMP
+    // --tar --gds-only: registered VRAM for the assembler to compose frames in.
+    // Registration is the expensive part (hundreds of ms per GiB), so the pool is
+    // built once and recycled; its depth is also the producer's backpressure.
+    // Torn down after the worker join below, NOT here -- see its declaration.
+    if (opt.gds_only) {
+      stage_pool = std::make_unique<GdsStagePool>();
+      std::string swhy;
+      // 32 x 16 MiB = 512 MiB.  Sized against the GDS compress batch, not picked:
+      // the checksum's throughput is ~0.28 GiB/s per frame in the batch, so a
+      // 32-frame batch hashes at ~9 GiB/s, comfortably over the ~4.9 GiB/s drive.
+      const size_t stage_bufs = 32;
+      if (!stage_pool->init(gpu_chunk, stage_bufs, &swhy))
+        die_usage("--gds-only --tar: " + swhy);
+      g_gds_stage_pool.store(stage_pool.get(), std::memory_order_release);
+      // THE QUEUE MUST KNOW THE STAGING DEPTH OR THE RUN DEADLOCKS.  The GPU
+      // worker waits in wait_for_batch_or_cap(pop_n) for pop_n frames; the
+      // assembler can never have more than stage_bufs in flight, because slot
+      // acquire() blocks once they are all queued.  With pop_n (64) above
+      // stage_bufs the worker waits for frames that cannot arrive while the
+      // assembler waits for slots that cannot come back -- a hang with no error.
+      // max_depth gives wait_for_batch_or_cap its escape.
+      queue.set_max_depth(stage_bufs);
+      if (opt.verbosity >= V_VERBOSE) {
+        char b[160];
+        std::snprintf(b, sizeof(b),
+          "[GDS] --tar staging: %zu x %zu MiB registered in VRAM\n",
+          stage_bufs, gpu_chunk / ONE_MIB);
+        vlog(V_VERBOSE, opt, b);
+      }
+    }
+#endif
     tarx::assemble(queue, tar_layout, gpu_chunk, opt, m);
     reader_done = true;
   }
@@ -23888,6 +24260,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Do NOT call throttle.set_done() before join: workers must respect
   // throttle while draining the queue to avoid buffering entire output in RAM.
   for (auto & th : workers) th.join();
+  // Workers are joined, so no staged slot can still be in flight.  Clear the
+  // global before destroying the pool: a releaser that loaded the pointer must
+  // never find it dangling.
+  g_gds_stage_pool.store(nullptr, std::memory_order_release);
+  stage_pool.reset();
   // --gds-only: the workers are done reading, so the registered handle can go.
   // Deregister BEFORE closing the fd — cuFile holds a reference to it.
   //
@@ -23902,16 +24279,31 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     const unsigned long long b1 = gz_nvfs_bar1_ok();
     g_gds_input.close();
     if (g_gds_input_fd >= 0) { ::close(g_gds_input_fd); g_gds_input_fd = -1; }
-    if (opt.verbosity >= V_VERBOSE) {
-      char b[240];
-      if (b1 > g_gds_bar1_before)
-        std::snprintf(b, sizeof(b),
-          "[GDS] nvidia-fs Bar1-map ok %llu -> %llu: the peer-to-peer path was used\n",
-          g_gds_bar1_before, b1);
-      else
-        std::snprintf(b, sizeof(b),
-          "[GDS] nvidia-fs Bar1-map did not move (%llu); either the counter is "
-          "unreadable or cuFile fell back to a host bounce buffer\n", b1);
+    // REPORTED AT DEFAULT VERBOSITY WHEN ANYTHING DEGRADED.  Asking for
+    // --gds-only and silently getting something else is this feature's worst
+    // failure mode: a compat fallback returns correct bytes at almost the same
+    // speed, so nothing looks wrong.  A degraded run therefore says so without
+    // being asked; only the all-clear needs -v.
+    const uint64_t p2p  = g_gds_frames_p2p.load(std::memory_order_relaxed);
+    const uint64_t fb   = g_gds_frames_fallback.load(std::memory_order_relaxed);
+    const uint64_t nofl = g_gds_members_nofile.load(std::memory_order_relaxed);
+    const bool bar1_moved = (b1 > g_gds_bar1_before);
+    char b[320];
+    if (fb || nofl || !bar1_moved) {
+      std::snprintf(b, sizeof(b),
+        "WARNING: --gds-only did not run entirely on the peer-to-peer path: "
+        "%llu frames peer-to-peer, %llu bounced through host memory"
+        "%s%llu members cuFile would not take%s.\n"
+        "  The output is correct either way; what was lost is the acceleration "
+        "the flag asks for.\n",
+        (unsigned long long)p2p, (unsigned long long)fb,
+        nofl ? ", " : "", (unsigned long long)nofl,
+        bar1_moved ? "" : "; nvidia-fs Bar1-map never moved");
+      vlog(V_ERROR, opt, b);       // loud: survives -q, silenced only by -qq
+    } else if (opt.verbosity >= V_VERBOSE) {
+      std::snprintf(b, sizeof(b),
+        "[GDS] %llu frames peer-to-peer, 0 bounced; nvidia-fs Bar1-map ok "
+        "%llu -> %llu\n", (unsigned long long)p2p, g_gds_bar1_before, b1);
       vlog(V_VERBOSE, opt, b);
     }
   }
@@ -25413,15 +25805,60 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       goto gds_out_declined;
     }
     {
-    const int ofd = ::open(opt.output.c_str(),
-                           O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    // ADOPT THE CALLER'S DESCRIPTOR; DO NOT RESOLVE THE PATH AGAIN.  `out` may be
+    // an atomic TEMP that gzstd renames over opt.output when the run succeeds.
+    // Opening opt.output by name therefore wrote the decompressed data to the
+    // final name and then let the rename install the untouched temp on top of it.
+    // MEASURED: `-d --gds-only -f -o <existing file>` left a 0-BYTE FILE AT EXIT
+    // 0, destroying whatever was there.  Writing through the descriptor the
+    // caller already created and verified means the rename installs OUR bytes,
+    // and closes the same path-resolved-twice window DirectWriter::adopt_fd
+    // exists for -- which is the precedent this now follows.
+    // `out` IS NULL whenever DirectWriter adopted the descriptor (see the
+    // `out = nullptr` where dw->adopt_fd succeeds) -- which is the default here,
+    // because gzstd auto-enables O_DIRECT output on Gen4/Gen5. fileno(nullptr)
+    // segfaults, so take the descriptor from whichever owner actually has it.
+    int base_fd = -1;
+    if (out) base_fd = ::fileno(out);
+    else if (g_direct_writer) base_fd = g_direct_writer->fd();
+    if (base_fd < 0)
+      die("--gds-only: the output has no descriptor to write through");
+    const int ofd = ::fcntl(base_fd, F_DUPFD_CLOEXEC, 0);   // dup so fclose(out) stays safe
     if (ofd < 0)
-      die("--gds-only: cannot open " + opt.output + " with O_DIRECT: "
-          + std::strerror(errno));
+      die("--gds-only: cannot duplicate the output descriptor: "
+          + std::string(std::strerror(errno)));
+    // cuFile needs O_DIRECT; toggling it on the DUP leaves the caller's FILE*
+    // untouched.  Same move as adopt_fd.
+    const int ofl = ::fcntl(ofd, F_GETFL);
+    if (ofl < 0 || ::fcntl(ofd, F_SETFL, ofl | O_DIRECT) != 0) {
+      ::close(ofd);
+      die("--gds-only: cannot put the output descriptor in O_DIRECT mode: "
+          + std::string(std::strerror(errno)));
+    }
     std::string why;
-    if (!g_gds_output.open(ofd, &why)) { ::close(ofd); die("--gds-only: " + why); }
+    if (!g_gds_output.open(ofd, &why)) {
+      // DEMOTE, DON'T FAIL -- the same rule the alignment preflight follows.
+      // cuFile refuses some perfectly good destinations: writing over an existing
+      // file goes through an atomic `<out>.gzstd.*.tmp`, and cuFile rejects that
+      // descriptor with CU_FILE_INVALID_FILE_OPEN_FLAG while accepting the plain
+      // one. Whatever the reason, an output it will not take is a reason to use
+      // the ordinary writer, not to refuse the job: the user asked for a
+      // decompressed file, and the acceleration is the negotiable part.
+      ::close(ofd);
+      if (opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt, "[GDS] cuFile will not take this output descriptor ("
+             + why + "); this decompress uses the ordinary writer\n");
+      goto gds_out_declined;
+    }
     g_gds_output_fd  = ofd;
     g_gds_bar1_before = gz_nvfs_bar1_ok();
+    // PER FILE, NOT PER RUN.  These are globals; a second, shorter file would
+    // otherwise inherit the first file's high-water mark and be ftruncated up to
+    // it, and a stale active=true would suppress the writer for a file that
+    // declined the peer-to-peer path.
+    g_gds_out_total.store(0, std::memory_order_relaxed);
+    g_gds_frames_p2p.store(0, std::memory_order_relaxed);
+    g_gds_frames_fallback.store(0, std::memory_order_relaxed);
     g_gds_out_active.store(true, std::memory_order_relaxed);
     }
   }
@@ -31283,6 +31720,15 @@ static Options parse_args(int argc, char ** argv)
 
 #ifdef HAVE_NVCOMP
   if (opt.gpu_batch_cap == 0) opt.gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
+  // --gds-only compress starts at the batch its slab is already sized for.
+  // Capping per_stream_cap at 64 sized the SLAB but left the tuner starting at
+  // DEFAULT_GPU_BATCH_CAP (8), so batches averaged 5.6 frames -- and the GPU
+  // checksum's throughput is ~0.28 GiB/s PER FRAME IN THE BATCH, so a 5.6-frame
+  // batch hashes at ~1.6 GiB/s and cost ~55 ms every batch. Registering 64 slots
+  // and then filling 8 of them was the worst of both.
+  if (opt.gds_only && opt.mode == Mode::COMPRESS && !opt.gpu_batch_user_set
+      && opt.gpu_batch_cap < 64)
+    opt.gpu_batch_cap = 64;
   // Decompress benefits massively from large batches  nvCOMP kernel launch
   // has significant per-launch overhead (Huffman table setup,
   // scratch allocation).  But very large batches delay the writer since it
@@ -31392,18 +31838,17 @@ static Options parse_args(int argc, char ** argv)
   if (opt.gds_only && (opt.cpu_only || opt.hybrid))
     die_usage("--gds-only cannot be combined with --cpu-only or --hybrid: the data "
               "lands in VRAM and is never available to a CPU worker");
-  // --tar is incompatible in BOTH directions, for two different reasons, and the
-  // second was checked rather than assumed.  Creation has no file to read: the
-  // archive is assembled as it is written.  EXTRACTION has no single file to
-  // write: it produces a whole tree, while GPUDirect Storage addresses one
-  // registered file handle by offset.  Both already failed, but each as a
-  // generic error blaming a pipe that is not involved, at exit 1 rather than the
-  // exit 2 a bad flag pairing deserves.
-  if (opt.gds_only && opt.tar_mode)
-    die_usage("--gds-only cannot be combined with --tar: creation assembles the "
-              "archive as it is written, so there is no file for GPUDirect Storage "
-              "to read, and extraction writes a tree rather than the single "
-              "registered file it can write to");
+  // --tar CREATION is supported since v0.17.3: the members are ordinary files on
+  // disk, so the assembler composes each frame in registered VRAM -- cuFileRead
+  // for member extents, a small copy for the headers it synthesises.
+  //
+  // EXTRACTION still is not, and for a different reason that was checked rather
+  // than assumed: it writes a whole TREE, while GPUDirect Storage addresses one
+  // registered file handle by offset.
+  if (opt.gds_only && opt.tar_mode && opt.mode != Mode::COMPRESS)
+    die_usage("--gds-only cannot be combined with --tar extraction: extraction "
+              "writes a tree of files, while GPUDirect Storage writes by offset "
+              "into a single registered file handle");
 #ifdef HAVE_NVCOMP
   if (opt.gds_only) {
     const std::string why = gz_gds_lib_reason();
@@ -31431,6 +31876,17 @@ static Options parse_args(int argc, char ** argv)
     // gpu_streams is defaulted where it is auto-resolved (search gds_only there);
     // by this point it is already non-zero, so testing it for 0 here would be a
     // no-op that reads like policy — the same trap the batch floor fell into.
+    //
+    // The --tar staging pool is ONE cudaMalloc, cuFile-registered on ONE device.
+    // The default below hides this, but an explicit --gpu-devices=2 does not: a
+    // worker on the second device would issue cudaMemcpyDeviceToDevice from a
+    // pointer that belongs to the first, which needs peer access it never
+    // establishes.  Refuse rather than allocate per-device pools for a path that
+    // is disk-bound on one device anyway.
+    if (opt.tar_mode && opt.gpu_devices > 1)
+      die_usage("--gds-only --tar requires --gpu-devices=1: the staging buffers are "
+                "allocated and cuFile-registered on a single GPU, so a worker on "
+                "another device cannot read them");
     if (opt.gpu_devices == 0) opt.gpu_devices = 1;
   }
 #endif
