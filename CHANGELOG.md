@@ -1,12 +1,92 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.4  
+**Covers:** v0.9.50 → v0.17.5  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.5 — the review round that rejected five of the previous round's fixes
+
+Round 2 of the independent Codex review, scoped to adjudicate its own earlier findings rather than
+re-review the code. It rejected **five of eleven** fixes as incomplete and one of my claims as
+factually wrong. Three of the rejections were reproduced here before adopting anything.
+
+### Two more silent data-loss paths, both now closed
+
+* `-d --gds-only --preallocate` produced a **0-byte file at exit 0**. Peer-to-peer writes leave
+  `DirectWriter::logical_written_` at zero, so finalisation saw a completed file as unwritten and
+  truncated it. DirectWriter can now adopt an externally written prefix as its logical cursor --
+  without punching a hole, unlike `seek_forward()`.
+* Decompressing several files in one run, where an earlier file used GDS and a later one declined
+  it, left the later file inheriting `active=true`: it suppressed its own writer and failed at
+  exit 2 with its output removed. Per-file state is now reset unconditionally on entry and cleared
+  during teardown.
+
+### A comment of mine was simply false
+
+The output-descriptor adoption carried a comment claiming that toggling `O_DIRECT` on a `F_DUPFD`
+duplicate leaves the caller's `FILE*` alone. `F_DUPFD` shares one open file DESCRIPTION, so it does
+no such thing -- confirmed against the kernel, where setting the flag on the duplicate flips it on
+the original. That is what made `--no-direct` demotion write unaligned through a descriptor that had
+silently become direct.
+
+Both the input and output descriptors are now reopened through `/proc/self/fd/N`, which gives an
+independent open description AND cannot resolve a substituted pathname. That is strictly stronger
+than the `st_dev`/`st_ino` verification it replaces: the held descriptor selects the inode, so the
+identity check is unnecessary rather than merely redundant.
+
+### The staging deadlock was still live
+
+`queue.set_max_depth()` sees the queue but not the tasks held in the tar assembler's reorder map.
+The interleaving: reader 0 claims sequence 0 and is descheduled before acquiring a slot; later
+readers consume every slot and deposit sequences 1..N into the reorder map; the pusher waits for the
+missing head; the queue never reaches its cap, so the depth escape never fires.
+
+Readers now acquire a staging slot BEFORE claiming a sequence number. This is the same head-of-line
+shape as the multi-reader deadlock closed in v0.15.66-67, reintroduced in a new pool.
+
+### The sizeless tail did not need refusing after all
+
+v0.17.4 turned a silently vanishing tail into a usage error, on the reasoning that a peer-to-peer
+prefix could not be handed to the streaming decoder. That was wrong: adopting the prefix as
+DirectWriter's logical cursor, and routing an unaligned continuation through an independent plain
+descriptor, appends correctly. The combination works now instead of being rejected.
+
+### Also
+
+* The staging slab was allocated on whatever device the main thread happened to leave current.
+  Device probing can finish on the last CUDA device while GPU ranking selects another, so the
+  worker's device-to-device copy could cross devices with no peer access. Allocation now selects the
+  chosen device explicitly.
+* `--adapt` with a profile carrying `settled_batch=8` overwrote the GDS compress batch of 64 after
+  it was set. GDS is now excluded from that prior.
+* The fixed 32-slot staging pool was a machine-tuned constant justified with this host's checksum
+  and drive rates -- against the house rule in `AGENTS.md`. It now starts from the requested batch
+  geometry and backs off only on real allocation or registration failure.
+* The adaptive reader controller charged `t.data.size()`, which is zero for every staged GDS task,
+  so `--tar --gds-only` fed the reader governor nothing but zeroes. It uses `t.len()` now.
+* A sizeless FIRST frame returned before GDS teardown, leaking the cuFile handle and descriptor and
+  leaving state set for the next file.
+* The counters called alignment eligibility "peer-to-peer" and tar member extents "frames", and a
+  final partial plain-file read counted as peer-to-peer despite an unaligned length. They now
+  classify aligned versus unaligned, and the report no longer implies that alignment or a box-wide
+  BAR1 delta proves routing.
+
+Codex also shipped one bug of its own: the input-reopen edit dropped `opt.input` from a string
+concatenation, leaving `const char[] + char*`, which failed to compile.
+
+Verified: extensive suite **548/548** in 8m35s and the CPU-only build **335/335** in 1m26s, both
+configurations compile clean. Every trigger above was reproduced before the fix and re-tested after,
+along with the staging deadlock at `--gpu-batch` 64 and 256, a 20000-member tar, and `--adapt` with
+and without `--tar`. `--tar` archives remain byte-identical to the ordinary path.
+
+Still open: `--tar --gds-only` remains mostly not peer-to-peer. The scratch-region design for edge
+blocks is specified but deliberately not implemented -- the deciding input is what cuFile's bounce
+path costs against an ordinary pread, which has not been measured, and a 100-byte member would see
+roughly 41x read amplification if the answer is wrong.
 
 ## v0.17.4 — the rest of the review, and the discovery that --tar --gds-only mostly is not peer-to-peer
 
