@@ -1,12 +1,106 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.5  
+**Covers:** v0.9.50 → v0.17.6  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.6 — --adapt filed a GDS batch under the ordinary key
+
+Round 3 of the Codex review, scoped OPEN over its own round-2 edits as shipped. It returned one
+medium finding, no data-loss and no deadlock, and confirmed the four pieces of reasoning I had
+flagged as unverified. Severity across the three rounds went data-loss/deadlock, then five of eleven
+fixes rejected, then this.
+
+### The finding
+
+`--adapt` kept one `settled_batch` key for both the ordinary GPU path and `--gds-only`. They do not
+have interchangeable batch geometry: GDS registers its input slab through BAR1 and runs the device
+checksum, and the ordinary path does neither. v0.17.5 stopped GDS from CONSUMING the shared key,
+which cured the poisoning but also made GDS discard its own measured verdict on every run.
+
+Split into additive `settled_batch` and `settled_batch_gds`, matched across save, load,
+driver-change invalidation and prior application. Additive, so no schema-epoch bump; an older
+profile simply lacks the GDS key and the cold start applies.
+
+Measured on this host after the split: the ordinary path settles at **4**, `--gds-only` at **64**.
+That 4 is precisely what had been overwriting the GDS starting point.
+
+The stamp is applied in `adapt_profile_save`, where the Options and the observation are both in
+hand — not at the call sites. There are five, and the first attempt at this set it at two of them,
+which turned out to be `--tar` extract and `-t` rather than plain compress. An observation that
+reaches the profile without knowing which geometry produced it is the whole bug.
+
+### Reasoning confirmed, and framing corrected
+
+* `adopt_external_prefix`: the happens-before holds. The flag and `plain_fd_v_` are written under
+  `mx_`, every op is enqueued under the same mutex, and each drain locks it before taking an op.
+* Staging slots: liveness holds, but "every slot is explicitly released" was too strong of me. On
+  terminal abort, tasks abandoned in the reorder map are not individually released; that is safe
+  only because `set_done()` wakes all acquirers and the pool outlives the producer and worker joins.
+* `/proc/self/fd/N` is identity-stronger, not unconditionally stronger: it adds a procfs and
+  current-permission dependency `dup` does not have. Input fails loudly, output demotes.
+* The staging backoff carries no partial state between attempts: allocation failure leaves the base
+  null, registration failure frees it, and the free list is populated only after complete success.
+* Checksum overlap remains permitted but unproven. `ev_comp_end` is recorded after the join, so it
+  cannot distinguish `max(checksum, compress)` from their sum.
+
+### Still open
+
+* **The GDS cold start is still a machine-tuned constant.** Batch 64 comes from this box's
+  0.28 GiB/s-per-frame checksum and 4.9 GiB/s drive. The new per-path prior lets a measured value
+  replace it after a qualifying run, but the cold start itself remains against the house rule.
+* `--tar --gds-only` is still mostly not peer-to-peer. See the measurement below for what that is
+  now known to cost, and why the obvious fix is not cheap.
+
+### Measured, then fixed: an unaligned cuFileRead costs more than reading it ourselves
+
+`--tar` puts a 512-byte header before every member, so member data does not land on the 4 KiB grid
+and cuFile cannot route it peer-to-peer. It does not fail on such an extent -- it degrades
+internally. The question was whether that degradation costs anything, and whether the aligned
+device-scratch region sketched in the round-2 review was worth building to avoid it.
+
+Fixture: 40 members of exactly 16 MiB - 512 bytes, so every tar entry occupies exactly 16 MiB and
+every extent sits 512 bytes off the grid -- **0 aligned, 80 unaligned** -- with no tiny-file
+registration overhead to confound it. Two arms on identical geometry (same inode, offsets, staging
+buffers, one GPU, one stream, batch 32, output to /dev/null), cache dropped before every rep, 3
+interleaved reps, `GZSTD_DEBUG_GDS_FORCE_BOUNCE=1` selecting the read-it-ourselves arm. Both arms
+are checked byte-identical, so only the routing differs.
+
+| host CPU, default readers | cuFile | read ourselves |
+|---|---|---|
+| 40 x (16 MiB - 512) | 4.33 s | **3.51 s** |
+| 6 x 100 MB (unaligned file offsets) | 3.91-4.03 s | **3.47-3.54 s** |
+
+Wall time is indistinguishable throughout (3.5-3.6 s, fully overlapping). The CPU ranges do not
+overlap: handing cuFile an extent it cannot route costs **12-23% more host CPU for no wall-clock
+benefit**. Unaligned extents are now routed deliberately, and the measured result on the same
+fixtures is 4.33 -> 3.59 s and 3.92 -> 3.63 s, tracking the read-it-ourselves arm.
+
+**THE FIRST ATTEMPT AT THAT ROUTING CORRUPTED ARCHIVES**, and the reason is the point. A registered
+member is open O_DIRECT precisely so cuFile can do peer-to-peer, and O_DIRECT cannot service an
+unaligned pread either: every extent short-read, reported "file changed as we read it", and left the
+frame's zero fill in place. The tar stream stopped matching the ordinary path at exactly a chunk
+boundary. Reading correctly means reading an ALIGNED WINDOW into an ALIGNED buffer and copying the
+interior -- round the offset down, round the length up, copy from the middle.
+
+That is the same machinery the review proposed putting on the DEVICE side as a scratch region. On
+the host it is about fifteen lines, and it captures the entire measured win. **So the scratch region
+is not deferred, it is unnecessary**: there is no remaining gap for it to close on this hardware,
+where wall time is set by the drive and the only cost in question was host CPU.
+
+**The measurement instrument had the same defect as the first fix, and nearly produced a reported
+number.** `GZSTD_DEBUG_GDS_FORCE_BOUNCE` corrupted the 100 MB fixture while producing correct output
+on the 16 MiB-512 one -- because that fixture's *file* offsets happen to be aligned even though its
+device offsets are not. The fixture the experiment was designed around was the single case where the
+broken control looked healthy. It is caught now by asserting both arms produce byte-identical
+archives as part of the measurement, which is the check that found it.
+
+Verified: extensive suite **548/548** in 8m36s and the CPU-only build **335/335** in 1m26s, both
+configurations compile clean, plus the full GDS trigger set from v0.17.5.
 
 ## v0.17.5 — the review round that rejected five of the previous round's fixes
 

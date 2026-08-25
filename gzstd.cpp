@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.5";
+static constexpr const char * GZSTD_VERSION = "0.17.6";
 //
 // Architecture overview:
 //
@@ -5316,6 +5316,12 @@ struct AdaptObs {
   uint64_t writer_bytes = 0, writer_disk_ns = 0; // sink device rate while writing
   double   cpu_ema_gibs = 0, gpu_ema_gibs = 0;   // hybrid scheduler taps (0 = didn't run)
   uint64_t settled_batch = 0;                    // GPU tuner's last-used batch (0 = no GPU)
+  // Which batch geometry that settled_batch belongs to.  --gds-only registers its
+  // input slab through BAR1 and runs the device checksum; the ordinary GPU path
+  // does neither, so their settled batches are not interchangeable and are keyed
+  // apart in the profile.  Carried on the observation because adapt_merge_dir
+  // records observations and has no Options.
+  bool     gds_only = false;
   std::string regime = "unclassified";           // governor's dominant regime, last file
   std::string src_path;                          // read path that engaged ("" = untapped)
   int writer_par = 0;                            // writer probe verdict (+1/-1, 0 = untried)
@@ -5507,8 +5513,16 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     dir.put_num("cpu_gibs", ema(dir.gnum("cpu_gibs", 0), obs.cpu_ema_gibs));
   if (obs.gpu_ema_gibs > 0)
     dir.put_num("gpu_gibs", ema(dir.gnum("gpu_gibs", 0), obs.gpu_ema_gibs));
-  if (obs.settled_batch > 0)
-    dir.put_num("settled_batch", (double)obs.settled_batch);   // discrete: latest wins
+  if (obs.settled_batch > 0) {
+    // GDS and ordinary GPU paths have different batch geometry: GDS registers
+    // its input slab through BAR1 and runs the device checksum, while the
+    // ordinary path does neither.  Sharing one latest-wins key let an ordinary
+    // batch of 8 override GDS's measured 64; ignoring the key under GDS fixed
+    // that poisoning but also threw away GDS's own measured verdict every run.
+    // Keep one additive key per path so both remain reusable starting points.
+    dir.put_num(obs.gds_only ? "settled_batch_gds" : "settled_batch",
+                (double)obs.settled_batch);                    // discrete: latest wins
+  }
   if (obs.regime != "unclassified")
     dir.put_str("regime", obs.regime);
   // Read-path record (M4 action 5): which path ran, and the end-to-end
@@ -5579,7 +5593,7 @@ struct AdaptPriors {
   bool gpu_valid = false;   // entry's driver == current driver
   struct Dir {
     double cpu_gibs = 0, gpu_gibs = 0, source_gibs = 0, sink_gibs = 0;
-    double overall_gibs = 0, settled_batch = 0, runs = 0;
+    double overall_gibs = 0, settled_batch = 0, settled_batch_gds = 0, runs = 0;
     double input_gibs = 0;   // input-domain rate, for duration prediction
     double overall_cpu = 0, overall_hybrid = 0;             // end-to-end, per backend
     double overall_cpu_cores = 0;                          // cores that produced overall_cpu
@@ -5628,6 +5642,7 @@ static AdaptPriors adapt_load_priors()
     D.cpu_gibs      = dj->gnum("cpu_gibs", 0);
     D.gpu_gibs      = P.gpu_valid ? dj->gnum("gpu_gibs", 0) : 0;
     D.settled_batch = P.gpu_valid ? dj->gnum("settled_batch", 0) : 0;
+    D.settled_batch_gds = P.gpu_valid ? dj->gnum("settled_batch_gds", 0) : 0;
     D.source_gibs   = dj->gnum("source_gibs", 0);
     D.sink_gibs     = dj->gnum("sink_gibs", 0);
     D.overall_gibs  = dj->gnum("overall_gibs", 0);
@@ -5773,8 +5788,15 @@ static void adapt_warn_save_failed(const Options & opt, const std::string & why)
 // Load -> merge -> atomically replace.  Called once per process, only when
 // the run qualifies (exit 0, --adapt, not --no-profile, wall >= the save
 // minimum or a fault to count).  Never fatal.
-static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
+static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
 {
+  // Stamp the batch geometry HERE, not at each call site.  There are five, and
+  // an observation that reaches the profile without knowing which geometry
+  // produced it files a GDS batch under the ordinary key -- which is the exact
+  // cross-contamination this split exists to prevent.  This is the one place
+  // where the Options and the observation are both in hand.
+  AdaptObs obs = obs_in;
+  obs.gds_only = opt.gds_only;
   const std::string path = adapt_profile_path();
   // NO PATH AT ALL is a persistence failure like any other, and it returned here
   // silently — BEFORE the four instrumented I/O failures below, so the warning
@@ -5880,7 +5902,7 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs)
     const std::string prev_drv = have_drv ? dvp->str : std::string();
     if (!have_drv || prev_drv != fp.driver) {
       std::vector<std::string> gpu_keys = {
-        "gpu_gibs", "settled_batch",
+        "gpu_gibs", "settled_batch", "settled_batch_gds",
         "overall_gibs_hybrid", "overall_gibs_hybrid_run",
       };
       for (int c = 0; c < 2; ++c) {
@@ -16188,7 +16210,41 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
               const bool time_io = (g_perf != nullptr) || (m != nullptr);
               uint64_t t0 = time_io ? now_ns() : 0;
 #ifdef HAVE_NVCOMP
-              if (slot >= 0 && sc.gds.valid()) {
+              // GZSTD_DEBUG_GDS_FORCE_BOUNCE=1 — route every tar member extent
+              // through the buffered pread + H2D copy instead of cuFileRead, so
+              // the two routings can be compared on the same inode, offsets,
+              // staging buffers, GPU and thread geometry.  Measurement only:
+              // it makes --gds-only do the thing --gds-only exists to avoid.
+              static const bool gds_force_bounce =
+                  ::getenv("GZSTD_DEBUG_GDS_FORCE_BOUNCE") != nullptr;
+              // WHY UNALIGNED EXTENTS ARE *NOT* ROUTED TO THE BOUNCE HERE.
+              // cuFile needs the device offset, file offset and length all on a
+              // 4 KiB boundary to do peer-to-peer; tar's 512-byte headers push
+              // member data off that grid, and handing cuFile an extent it
+              // cannot route does not fail -- it degrades internally.
+              //
+              // MEASURED, 40 members of 16 MiB-512 (every extent unaligned),
+              // 3 interleaved reps, cache dropped per rep, same inode/offsets/
+              // staging/GPU/threads, only the routing differing:
+              //   one reader   cuFile 3.51-3.60 s wall, 3.31-3.41 s CPU
+              //                bounce 3.52-3.62 s wall, 3.32-3.45 s CPU
+              //   default      cuFile 3.52-3.59 s wall, 4.29-4.35 s CPU
+              //                bounce 3.52-3.56 s wall, 3.54-3.64 s CPU
+              // Wall is indistinguishable in both; at reader concurrency the CPU
+              // ranges do not overlap.  So an extent cuFile cannot route
+              // peer-to-peer is cheaper read ourselves than handed to cuFile to
+              // decide the same thing internally.
+              //
+              // The first attempt at this CORRUPTED ARCHIVES, and the reason is
+              // worth keeping: a registered member is open O_DIRECT precisely so
+              // cuFile can do peer-to-peer, and O_DIRECT cannot service an
+              // unaligned pread either -- every extent short-read and left its
+              // zero fill.  The bounce below now reads an ALIGNED WINDOW and
+              // copies the interior, which is what makes this routing safe.
+              const off_t dv_pre = stage ? stage->offset_of(slot) + (off_t)(voff - a) : 0;
+              const bool p2p_ok  = ((dv_pre & 4095) == 0) && ((foff & 4095) == 0)
+                                && ((len & 4095) == 0);
+              if (slot >= 0 && sc.gds.valid() && p2p_ok && !gds_force_bounce) {
                 // Straight from the drive into this frame's offset in the
                 // registered staging buffer.  One call rather than a loop:
                 // cuFileRead returns the whole count or a negative error, and a
@@ -16215,16 +16271,57 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
                 // Member cuFile would not register (see select_src): read it to
                 // a bounce and push it across, so one awkward file does not fail
                 // the archive.
-                std::vector<char> bounce(len);
-                size_t got = 0;
-                while (got < len) {
-                  ssize_t r = ::pread(sc.fd, bounce.data() + got, len - got, foff + (off_t)got);
-                  if (r <= 0) break;
-                  got += (size_t)r;
+                //
+                // REUSED PER THREAD, not allocated per extent.  This path is also
+                // the control arm of the tar-routing measurement (see
+                // GZSTD_DEBUG_GDS_FORCE_BOUNCE below): a fresh allocation per
+                // extent would put malloc in the arm being measured and bias the
+                // comparison it exists to make.
+                // 4 KiB-ALIGNED AND REUSED.  A plain vector's data() is only
+                // as aligned as the allocator happened to make it, and after a
+                // resize that is not guaranteed at all -- which matters because
+                // this buffer is fed to preads on descriptors that may be
+                // O_DIRECT.  Reused so the measurement arm does not include
+                // malloc; aligned so it does not depend on luck.
+                struct AlignedBuf {
+                  void * p = nullptr; size_t cap = 0;
+                  ~AlignedBuf() { if (p) ::free(p); }
+                  char * get(size_t n) {
+                    if (cap < n) {
+                      if (p) { ::free(p); p = nullptr; }
+                      const size_t want = (n + 4095) & ~size_t(4095);
+                      if (posix_memalign(&p, 4096, want) != 0) { p = nullptr; cap = 0; return nullptr; }
+                      cap = want;
+                    }
+                    return static_cast<char *>(p);
+                  }
+                };
+                static thread_local AlignedBuf bounce_buf;
+                // READ AN ALIGNED WINDOW, NOT THE BARE EXTENT.  This descriptor is
+                // O_DIRECT (a registered member is opened that way so cuFile can do
+                // peer-to-peer), and O_DIRECT rejects an unaligned offset or length.
+                // Reading the extent directly therefore short-read every time the
+                // file offset was off the grid, and left the frame's zero fill in
+                // place -- a corrupt archive that only showed up on inputs whose
+                // extents straddle chunk boundaries.  Round the window out, read
+                // that, and copy the interior.
+                const off_t  win_lo = (off_t)(foff & ~(off_t)4095);
+                const size_t head   = (size_t)(foff - win_lo);
+                const size_t win_n  = (head + len + 4095) & ~size_t(4095);
+                char * window = bounce_buf.get(win_n);
+                if (!window) die("--gds-only --tar: cannot allocate a bounce buffer");
+                size_t wgot = 0;
+                while (wgot < win_n) {
+                  ssize_t r = ::pread(sc.fd, window + wgot, win_n - wgot, win_lo + (off_t)wgot);
+                  if (r <= 0) break;            // EOF is expected: the window is rounded up
+                  wgot += (size_t)r;
                 }
+                // Only the member bytes inside the window count as read.
+                const size_t got   = (wgot > head) ? std::min(len, wgot - head) : 0;
+                char * const bounce = window + head;
                 if (got)
                   gds_cu_or_die(cudaMemcpy(static_cast<char *>(stage->buf(slot)) + (voff - a),
-                                           bounce.data(), got, cudaMemcpyHostToDevice),
+                                           bounce, got, cudaMemcpyHostToDevice),
                                 "member bounce copy");
                 done = got;
                 g_gds_frames_fallback.fetch_add(1, std::memory_order_relaxed);
@@ -30402,16 +30499,18 @@ static void apply_backend_defaults(Options & opt)
   //   * Scheduler EMA seeds: consumed by the HybridSched constructor
   //     (samples seed to 1 — one live tick before any refusal can latch).
   if (priors.gpu_valid) {
-    if (!opt.gpu_batch_user_set && !opt.gds_only
-        && prior_dir.settled_batch >= 1) {
+    const double batch_prior = opt.gds_only ? prior_dir.settled_batch_gds
+                                            : prior_dir.settled_batch;
+    if (!opt.gpu_batch_user_set && batch_prior >= 1) {
       // Clamp before the cast: a foreign/hand-edited profile can legally
       // carry any finite double, and double->size_t above the type's range
       // is UB (same magnitude guard as the profile emitter's integer branch).
-      const size_t settled = (size_t)std::min(prior_dir.settled_batch,
-                                              (double)HARD_BATCH_CAP);
+      const size_t settled = (size_t)std::min(batch_prior, (double)HARD_BATCH_CAP);
       opt.gpu_batch_cap = settled;
       if (opt.verbosity >= V_VERBOSE)
-        vlog(V_VERBOSE, opt, "[ADAPT] GPU batch starts at the profile's settled "
+        vlog(V_VERBOSE, opt, std::string("[ADAPT] ")
+             + (opt.gds_only ? "GDS " : "")
+             + "GPU batch starts at the profile's settled "
              + std::to_string(settled) + " (tuner still explores)\n");
     }
     if (prior_dir.gpu_gibs > 0)
