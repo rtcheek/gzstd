@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.6";
+static constexpr const char * GZSTD_VERSION = "0.17.7";
 //
 // Architecture overview:
 //
@@ -22959,7 +22959,51 @@ static void gpu_worker(
             for (size_t i = k; i < C.filled; i += step) {
               const Task & t = C.batch[i];
               if (t.gds_stage >= 0) continue;          // already copied above
-              const ssize_t got = g_gds_input.read_dev(
+              // GZSTD_DEBUG_GDS_FORCE_BOUNCE=1 — read this frame with an
+              // ordinary pread into an aligned host buffer and push it across,
+              // instead of cuFileRead.  This path's offsets and lengths are whole
+              // MiB by construction, so it is the ALIGNED arm of the comparison
+              // the tar measurement could not make: what genuine peer-to-peer
+              // buys over reading it ourselves, rather than what a DEGRADED
+              // cuFileRead costs.  Measurement only.
+              static const bool force_bounce =
+                  ::getenv("GZSTD_DEBUG_GDS_FORCE_BOUNCE") != nullptr;
+              ssize_t got;
+              if (force_bounce) {
+                // Aligned buffer, reused per issuing thread: the descriptor is
+                // O_DIRECT, and a fresh allocation would put malloc inside the
+                // arm being measured.
+                struct ABuf {
+                  void * p = nullptr; size_t cap = 0;
+                  ~ABuf() { if (p) ::free(p); }
+                  char * get(size_t n) {
+                    if (cap < n) {
+                      if (p) { ::free(p); p = nullptr; }
+                      const size_t w = (n + 4095) & ~size_t(4095);
+                      if (posix_memalign(&p, 4096, w) != 0) { p = nullptr; cap = 0; return nullptr; }
+                      cap = w;
+                    }
+                    return static_cast<char *>(p);
+                  }
+                };
+                static thread_local ABuf hb;
+                const size_t want = (t.len() + 4095) & ~size_t(4095);
+                char * hp = hb.get(want);
+                if (!hp) die("--gds-only: cannot allocate the measurement bounce buffer");
+                size_t hgot = 0;
+                while (hgot < want) {
+                  ssize_t r = ::pread(g_gds_input_fd, hp + hgot, want - hgot,
+                                      (off_t)t.gds_off + (off_t)hgot);
+                  if (r <= 0) break;                 // rounded window may pass EOF
+                  hgot += (size_t)r;
+                }
+                got = (ssize_t)std::min(hgot, t.len());
+                if (got > 0)
+                  checkCuda(cudaMemcpy(static_cast<char *>(C.d_in_base) + i * C.gpu_chunk,
+                                       hp, (size_t)got, cudaMemcpyHostToDevice),
+                            "measurement bounce H2D");
+              } else
+              got = g_gds_input.read_dev(
                   C.d_in_base, t.len(), (off_t)t.gds_off, (off_t)(i * C.gpu_chunk));
               if (got == (ssize_t)t.len()) {
                 const off_t dv = (off_t)(i * C.gpu_chunk);

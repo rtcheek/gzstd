@@ -1,12 +1,52 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.6  
+**Covers:** v0.9.50 → v0.17.7  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.7 — 95% of what --gds-only saves is O_DIRECT, not peer-to-peer DMA
+
+v0.17.6 recorded `--gds-only` cutting host CPU 44% against `--gpu-only` on a cold cache. That number
+is real, but it compares peer-to-peer DMA against gzstd's ORDINARY reader, which goes through the
+kernel read path. It never asked what the peer-to-peer part specifically contributes.
+
+`GZSTD_DEBUG_GDS_FORCE_BOUNCE` now also covers the non-tar read site, whose offsets and lengths are
+whole MiB by construction and therefore genuinely peer-to-peer eligible (178 aligned transfers to 1
+unaligned, that one being the final partial frame). That makes the three-way comparison possible on
+one file, one geometry, cold cache, interleaved:
+
+| arm | wall | host CPU |
+|---|---|---|
+| gzstd's ordinary reader | 4.70-4.81 s | 7.55-7.79 s |
+| O_DIRECT pread + H2D into the same staging slab | 4.62-4.74 s | 4.05-4.19 s |
+| peer-to-peer cuFileRead | 4.62-4.72 s | **3.90-3.97 s** |
+
+Wall time is identical across all three; every range overlaps. The CPU decomposition is not:
+
+* total saving over the ordinary reader: **3.73 s**
+* attributable to O_DIRECT reads straight into the staging slab: **3.55 s (95%)**
+* attributable to peer-to-peer DMA itself: **0.19 s (5%)**
+
+**So the four gates this feature needs -- a resizable-BAR GPU whose BAR1 covers its VRAM, the
+nvidia-fs module, a filesystem cuFile accepts, and a kernel without the pin regression -- buy the
+last 5%.** The other 95% needs none of them: it is an O_DIRECT read landing directly in the buffer
+the compressor already owns, which any host can do. The `odirect` arm above still pays
+cuFileBufRegister and the staging setup, so a native implementation would likely be cheaper still.
+
+This does not retract the v0.17.6 measurement; `--gds-only` does roughly halve host CPU against the
+ordinary path. It reattributes it. And it settles the tar scratch region for good: that design exists
+to turn unaligned extents into aligned ones, and aligned-versus-unaligned is now measured at 4% of
+host CPU with a small wall-time penalty, against read amplification that reaches 41x on a
+100-byte member.
+
+The lesson is the one this feature keeps teaching: **a control arm has to be the thing you are
+actually claiming to beat.** Three times in this arc a conclusion rested on a comparison that was not
+measuring what it appeared to -- a device-count confound, a page-cache confound, and now an
+attribution confound.
 
 ## v0.17.6 — --adapt filed a GDS batch under the ordinary key
 
