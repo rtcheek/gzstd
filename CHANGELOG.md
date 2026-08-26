@@ -1,12 +1,70 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.7  
+**Covers:** v0.9.50 → v0.17.8  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.8 — the only way to prove --gds-only did what it says was the one setting that crashed it
+
+`--gds-only` reports `[GDS] N aligned transfers, 0 unaligned` and gzstd has been treating that as
+evidence the peer-to-peer path ran. It is not. The counter is computed from alignment alone -- file
+offset, device offset and length all on a 4 KiB boundary -- and says nothing about how the bytes
+actually travelled. Mutation-testing it settles the point: under `GZSTD_DEBUG_GDS_FORCE_BOUNCE=1`,
+which sends every frame through an ordinary host pread and a cudaMemcpy, the same run still prints
+384 aligned transfers, 0 unaligned. The `--help` text already said this ("Alignment and the
+system-wide Bar1-map counter show eligibility/activity, not definitive per-read routing"); nothing
+in the tooling acted on it.
+
+The one per-process discriminator is cuFile's own `posix=` counter, which needs `cufile_stats` set
+to a non-zero value in cufile.json. Turning it on segfaulted gzstd at exit, every time:
+
+    Thread 1 "gzstd" received signal SIGSEGV
+    #0  libcufile.so.0
+    #9  _dl_call_fini (elf/dl-call_fini.c:43)
+    #10 _dl_fini (elf/dl-fini.c:114)
+    #11 __run_exit_handlers (status=0)
+
+`status=0` -- the compression had already succeeded and the archive is byte-identical. The crash is
+in libcufile's ELF destructor, which is where it defers its counter dump.
+
+**This is not gzstd's defect and gzstd cannot fix it.** A 17-line C program that dlopens libcufile,
+calls cuFileDriverOpen and returns from main reproduces it with no CUDA, no I/O and no gzstd code;
+the same probe linked against libcufile instead of dlopening it exits cleanly. The crash is
+conditional on the library having been dlopened, and gzstd has to dlopen it -- a DT_NEEDED entry
+resolves before main, so linking libcufile would make the portable binary refuse to START on every
+host without GDS installed, which is nearly all of them.
+
+| libcufile loaded via | cufile_stats=0 | cufile_stats != 0 |
+|---|---|---|
+| linked | exit 0 | exit 0 |
+| dlopened | exit 0 | **SIGSEGV** |
+
+What gzstd *was* getting wrong is next to it. The driver was opened and deliberately never closed,
+under a comment reading "the teardown cost buys nothing in a process that is about to exit". That
+holds only while statistics are off. With them on, cuFileDriverClose is what flushes the counters,
+and skipping it meant they were never written at all -- so the one measurement that could confirm
+the feature works was unobtainable. Same config, same data, only the binary differing:
+
+| binary | exit | cufile.log | Read counters |
+|---|---|---|---|
+| before | 139 | 10.5 KB | none |
+| after | 139 | 12.7 KB | `n=768 posix=0` |
+
+The exit code is unchanged and will stay 139 until NVIDIA fixes the destructor. The counters now
+exist, and `posix=0` across 768 reads is the first direct confirmation in this repo that
+`--gds-only` transfers are not silently taking the POSIX compat path.
+
+The driver is closed from a scoped guard in main, so it runs on the exception paths too and always
+before exit() reaches the loader's finalizers.
+
+**Also: `--gds-only` still has no automated suite coverage** (it needs hardware the suite cannot
+assume) and this release does not change that. It does replace the pre-tag round-trip script, which
+was written at v0.15.40, hardcoded that version, and could not run at all -- it referenced an
+undefined variable four times and died under set -u before its first check.
 
 ## v0.17.7 — 95% of what --gds-only saves is O_DIRECT, not peer-to-peer DMA
 

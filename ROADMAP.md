@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.17.7
+**Current version:** v0.17.8
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -118,9 +118,15 @@ device holds the `StreamCtx` ~100 ms/batch against ~25 ms of submit, so extra st
 **Next change: async D2H directly into the frame buffers** — `cudaHostRegister` over the
 `out_pool`, so the readback is page-locked *and* copy-free.
 
-- **Do not use a staging slab.** Tried at v0.16.2, **26% slower** (3.25 → 2.40), reverted; see the
-  CHANGELOG. It adds a ~160 MiB host memcpy per batch, and *any design that adds a host-side copy
-  loses here* — the transfer was never the expensive part.
+- **Do not use a staging slab THAT ADDS A COPY.** Tried at v0.16.2, **26% slower** (3.25 → 2.40),
+  reverted; see the CHANGELOG. It adds a ~160 MiB host memcpy per batch, and *any design that adds
+  a host-side copy loses here* — the transfer was never the expensive part.
+  **READ THE QUALIFIER BEFORE CITING THIS ROW.** It rules out slab-plus-copy, not slabs. The
+  proposed `--direct-stage` (v0.17.7 follow-on) is the opposite shape: an O_DIRECT pread landing
+  **directly** in the pinned staging slab, with no intervening copy at all. v0.17.7 measured that
+  arm at **4.05–4.19 s host CPU against the ordinary reader's 7.55–7.79** — it is where 95% of the
+  whole `--gds-only` win actually comes from, and it needs none of GDS's four platform gates. This
+  row is not evidence against it.
 - **The hard part is ownership, not CUDA.** `FrameVec` buffers are `shared_ptr`s held by the
   writer for arbitrary time, and any `resize()` past capacity reallocates and **silently
   invalidates the registration**. Every pooled buffer must be reserved to `max_out_chunk + 4`
@@ -132,6 +138,30 @@ device holds the `StreamCtx` ~100 ms/batch against ~25 ms of submit, so extra st
 Also still unbound: `--acls/--xattrs` metadata gathering reopens the path, and the H2D content
 checksum is now parallelised but still host-side (a GPU-side XXH64 is awkward — the algorithm is
 sequential across stripes, so only ~4 lanes × chunks of parallelism).
+
+## Known external defect: libcufile segfaults at exit when dlopen'd with stats on
+
+Not gzstd's, and not fixable here — recorded so it is not re-investigated. Setting `cufile_stats`
+to any non-zero value in cufile.json makes the process die of SIGSEGV inside libcufile's ELF
+destructor at `_dl_fini`, **after `main` has returned 0 and with the archive byte-identical on
+disk**. Reproduced in 17 lines of C that dlopen libcufile, call `cuFileDriverOpen` and return —
+no CUDA, no I/O, no gzstd. The same probe *linked* against libcufile exits 0.
+
+| libcufile loaded via | `cufile_stats=0` | `cufile_stats != 0` |
+|---|---|---|
+| linked | exit 0 | exit 0 |
+| dlopened | exit 0 | **SIGSEGV** |
+
+gzstd cannot switch to linking: a `DT_NEEDED` entry resolves before `main`, so the portable binary
+would refuse to *start* on every host without GDS installed. Neither `cuFileDriverClose` nor
+`dlclose` prevents it, and it is **not** a libstdc++ ABI mismatch (`LD_PRELOAD`ing the system
+libstdc++ changes nothing).
+
+**Why it matters anyway:** that setting is the only way to read cuFile's per-process `posix=`
+counter, which is the only trustworthy proof `--gds-only` really used peer-to-peer DMA — the
+`[GDS] N aligned transfers, 0 unaligned` line counts alignment *eligibility* and was
+mutation-disproven as routing evidence at v0.17.8. So verifying the feature costs a crash at exit.
+Revisit if a future libcufile fixes the destructor.
 
 ## Tooling gap: `gzstd-benchmark.sh` has NO `--tar` coverage
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.7";
+static constexpr const char * GZSTD_VERSION = "0.17.8";
 //
 // Architecture overview:
 //
@@ -446,9 +446,21 @@ static const GzGdsApi & gz_gds_api()
 }
 
 // Open the driver once.  Empty string = ready; otherwise a reason fit to print.
-// Opening is refcounted inside libcufile and we deliberately never close it —
-// same rule as NVML, and for the same reason: the teardown cost buys nothing in
-// a process that is about to exit.
+// WE MUST CLOSE IT, and the comment that used to stand here said the opposite.
+// It read "we deliberately never close it — the teardown cost buys nothing in a
+// process that is about to exit", which is true only while cuFile statistics are
+// off.  Set "cufile_stats" to any non-zero value in cufile.json and libcufile
+// defers its counter dump to its own ELF destructor, which the loader runs from
+// _dl_fini AFTER the CUDA context has been torn down: it then dereferences dead
+// state and the process dies of SIGSEGV having already returned 0 from main.
+// Measured at v0.17.7 — stats 1, 2 and 3 all segfault, stats 0 does not, and the
+// archive is byte-identical every time because the crash lands after the data.
+// That is the worst shape a bug can have here: the ONLY trustworthy proof that
+// --gds-only really used peer-to-peer DMA is cuFile's per-process posix= counter
+// (alignment counts and Bar1-map are eligibility, not routing — see --help), and
+// turning that counter on was what crashed the run.  Closing the driver while the
+// context is still alive makes libcufile dump its stats there instead.
+static std::atomic<bool> g_gds_driver_opened{false};
 // CHEAP half: library presence only.  Split out deliberately so argument
 // validation can reject an impossible --gds-only without paying cuInit, which
 // costs ~950 ms plus ~250 ms per visible device before it can tell you anything.
@@ -473,11 +485,27 @@ static const std::string & gz_gds_unavailable_reason()
       return std::string("cuFileDriverOpen failed (err ") + std::to_string(e.err)
            + ", cuda " + std::to_string(e.cu_err)
            + ") — check that nvidia-fs is loaded and /dev/nvidia-fs0 exists";
+    g_gds_driver_opened.store(true, std::memory_order_release);
     return std::string();
   }();
   return reason;
 }
 static bool gz_gds_ready() { return gz_gds_unavailable_reason().empty(); }
+
+// Close the cuFile driver if this process ever opened it.  Must run while the
+// CUDA context is still up — see the note above gz_gds_driver_opened.  Idempotent
+// and safe to call when GDS was never touched, which is the common case: the flag
+// is only ever set by a successful DriverOpen.
+static void gz_gds_driver_shutdown()
+{
+  if (!g_gds_driver_opened.exchange(false, std::memory_order_acq_rel)) return;
+  const GzGdsApi & a = gz_gds_api();
+  if (a.DriverClose) a.DriverClose();
+}
+
+// Scoped so it runs on EVERY exit from main, including the exception paths, and
+// crucially before exit() reaches _dl_fini.
+struct GzGdsDriverGuard { ~GzGdsDriverGuard() { gz_gds_driver_shutdown(); } };
 
 // nvidia-fs's box-wide count of successful GPU BAR1 mappings.  MEASURED to be
 // the one rootless counter that moves on a real peer-to-peer transfer and stays
@@ -29956,6 +29984,12 @@ static int gzstd_main(int argc, char ** argv)
 // abort with no exit code the caller can act on.
 int main(int argc, char ** argv)
 {
+  // Tears the cuFile driver down before exit() runs the loader's finalizers.
+  // HAVE_NVCOMP-guarded: the whole cuFile loader lives inside that block, so an
+  // unguarded declaration here does not compile in the CPU-only build.
+#ifdef HAVE_NVCOMP
+  GzGdsDriverGuard gds_guard;
+#endif
   try {
 #ifdef HAVE_NVCOMP
     // Hidden hook: verify the --gds-only content-checksum kernel against the CPU
