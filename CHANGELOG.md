@@ -1,12 +1,72 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.9  
+**Covers:** v0.9.50 → v0.17.10  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.10 — the measurement hook had the defect its own finding fixed everywhere else
+
+Second independent review round over v0.17.9. It returned one low-severity finding and no further
+portability, data-loss or deadlock defect, which is the falling-severity signal this project treats
+as the readiness test: the previous round found something that would have made `--direct-stage` fail
+outright on the hosts it exists for.
+
+The finding is in `GZSTD_DEBUG_GDS_FORCE_BOUNCE`, the hidden measurement arm that produced the 95/5
+attribution `--direct-stage` was built on. That arm substitutes an ordinary pread and a `cudaMemcpy`
+for `cuFileRead`, so it has exactly the exposure the previous round fixed in the production path:
+its fan-out threads never called `cudaSetDevice`, and CUDA's current device is host-thread-local, so
+they operated on device 0 whatever device owned the slab. It also called `checkCuda`, which throws,
+and a throw escaping a `std::thread` calls `std::terminate` rather than reaching the abort and
+CPU-only rebuild. Triggered only with the environment variable set and a selected GPU that is not
+device 0; the failure was loud rather than silent, which is why it is a low finding and not a
+blocking one.
+
+**Worth recording as a pattern rather than an incident: the instrument had the same defect as the
+code it was built to measure, and was fixed a round later.** A debug hook that substitutes a
+different mechanism inherits every hazard of the mechanism it substitutes.
+
+**The fix is verified by inspection and by the measurement arm still producing byte-identical output;
+its actual trigger is NOT exercised.** Reproducing it needs the selected GPU to be something other
+than CUDA device 0, and device selection on this host would not move off device 0 even with that
+device starved of VRAM. Two attempts to force it failed in ways worth recording, because both are
+documented traps in this repo: `cudaMalloc` alone does not commit VRAM (78 GiB "allocated" in 4 ms
+with the free figure unmoved, so nothing was starved and nothing moved), and once a committing
+version was used, the device it starved was CUDA device 0 while `nvidia-smi` showed the drop on
+index 4 -- the NVML-to-CUDA index mismatch this codebase already knows about and correlates by
+UUID rather than index everywhere it matters.
+
+### What the class audit found, which is the more useful result
+
+The round was scoped to a class rather than a diff -- *where else does the portable path depend on a
+property only a GDS-capable host has?* -- because the previous round's finding was invisible to every
+test that can run on this machine, which has all four GDS gates open. Nothing further turned up, and
+the negative result is worth writing down:
+
+* Every cuFile entry point is gated on `gds_only`: the preflight, slab registration, file
+  registration, and the CLI library check.
+* The shared device checksum uses ordinary CUDA allocations, streams and kernel, and that kernel is
+  compiled into every nvCOMP build including forward-compatible `compute_75` PTX.
+* The 64-frame batch floor and the one-stream default are checksum and pipeline choices, not GDS
+  host gates.
+* `--direct-stage` teardown reaches `GdsBuf::dereg()`, but its registration pointer is null, so no
+  cuFile function is called.
+* On a staged-read failure the rebuild forces `pass_opt.cpu_only` and CPU dispatch never enters
+  `compress_nvcomp`, so a `direct_stage` flag left set on the rebuilt pass is inert.
+
+One naming wart it surfaced and this release does not fix: `g_gds_input_fd` is now the ordinary
+O_DIRECT descriptor shared by both backends, and the name implies a coupling that no longer exists.
+
+### And one question answered by narrowing rather than widening
+
+The previous round gated its `cudaSetDevice` fix on `direct_stage` alone, which looked like it might
+be incomplete. It is not, and the reason is checkable: `cuFileRead` receives the base pointer that
+was registered on the owning device plus an explicit byte offset into it, so device identity comes
+from the registration and the normal `--gds-only` fan-out performs no CUDA Runtime call at all. The
+declaration at the top of `GdsFile::read_dev` already says the base must be the registered pointer.
 
 ## v0.17.9 — --direct-stage: the 95% of --gds-only that needs none of its hardware
 

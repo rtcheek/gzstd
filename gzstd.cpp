@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.9";
+static constexpr const char * GZSTD_VERSION = "0.17.10";
 //
 // Architecture overview:
 //
@@ -23149,16 +23149,24 @@ static void gpu_worker(
           if (staged_any)
             checkCuda(cudaStreamSynchronize(C.stream), "sync(--tar staging copies)");
 
+          // The normal --gds-only arm below calls cuFileRead with the base
+          // pointer that was registered on the owning device; it performs no
+          // CUDA Runtime operation from these fan-out threads.  The measurement
+          // bounce arm DOES substitute a cudaMemcpy, so it needs the same
+          // thread-local device selection and non-throwing error handoff as
+          // --direct-stage even though the user-facing backend is still GDS.
+          const bool force_bounce = opt.gds_only
+                                 && ::getenv("GZSTD_DEBUG_GDS_FORCE_BOUNCE") != nullptr;
           auto issue = [&](size_t k, size_t step) {
             // CUDA's current device is host-thread-local.  issue(0) runs on the
             // GPU worker, which selected device_id during bringup, but every
             // fan-out thread starts on device 0.  --direct-stage performs its
             // H2D from those threads, so select the slab's owning device in each
             // one before touching C.d_in_base.
-            if (opt.direct_stage) {
+            if (opt.direct_stage || force_bounce) {
               const cudaError_t ds = cudaSetDevice(device_id);
               if (ds != cudaSuccess) {
-                note_rd_error(std::string("cudaSetDevice(--direct-stage reader): ")
+                note_rd_error(std::string("cudaSetDevice(staged reader): ")
                               + cudaGetErrorString(ds));
                 return;
               }
@@ -23252,8 +23260,6 @@ static void gpu_worker(
               // the tar measurement could not make: what genuine peer-to-peer
               // buys over reading it ourselves, rather than what a DEGRADED
               // cuFileRead costs.  Measurement only.
-              static const bool force_bounce =
-                  ::getenv("GZSTD_DEBUG_GDS_FORCE_BOUNCE") != nullptr;
               ssize_t got;
               if (force_bounce) {
                 // Aligned buffer, reused per issuing thread: the descriptor is
@@ -23275,7 +23281,10 @@ static void gpu_worker(
                 static thread_local ABuf hb;
                 const size_t want = (t.len() + 4095) & ~size_t(4095);
                 char * hp = hb.get(want);
-                if (!hp) die("--gds-only: cannot allocate the measurement bounce buffer");
+                if (!hp) {
+                  note_rd_error("--gds-only: cannot allocate the measurement bounce buffer");
+                  return;
+                }
                 size_t hgot = 0;
                 while (hgot < want) {
                   ssize_t r = ::pread(g_gds_input_fd, hp + hgot, want - hgot,
@@ -23284,10 +23293,19 @@ static void gpu_worker(
                   hgot += (size_t)r;
                 }
                 got = (ssize_t)std::min(hgot, t.len());
-                if (got > 0)
-                  checkCuda(cudaMemcpy(static_cast<char *>(C.d_in_base) + i * C.gpu_chunk,
-                                       hp, (size_t)got, cudaMemcpyHostToDevice),
-                            "measurement bounce H2D");
+                if (got > 0) {
+                  const cudaError_t cs = cudaMemcpy(
+                      static_cast<char *>(C.d_in_base) + i * C.gpu_chunk,
+                      hp, (size_t)got, cudaMemcpyHostToDevice);
+                  if (cs != cudaSuccess) {
+                    // As in --direct-stage above, throwing from a child thread
+                    // would call std::terminate before gpu_worker's recovery
+                    // boundary could turn this into the ordinary failed pass.
+                    note_rd_error(std::string("cudaMemcpy(measurement bounce H2D): ")
+                                  + cudaGetErrorString(cs));
+                    return;
+                  }
+                }
               } else
               got = g_gds_input.read_dev(
                   C.d_in_base, t.len(), (off_t)t.gds_off, (off_t)(i * C.gpu_chunk));

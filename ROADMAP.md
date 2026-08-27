@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.17.9
+**Current version:** v0.17.10
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -140,7 +140,18 @@ Also still unbound: `--acls/--xattrs` metadata gathering reopens the path, and t
 checksum is now parallelised but still host-side (a GPU-side XXH64 is awkward — the algorithm is
 sequential across stripes, so only ~4 lanes × chunks of parallelism).
 
-## SHIPPED v0.17.9: `--direct-stage` — and what is left of the GDS chapter
+## SHIPPED v0.17.9–v0.17.10: `--direct-stage` — and what is left of the GDS chapter
+
+**Two independent review rounds closed this arc.** Round one found a defect that would have made
+the flag fail outright on every host it exists for — it was calling `cuFileBufRegister`, which
+succeeds here because this machine has all four GDS gates open and fails everywhere else. Round two,
+scoped deliberately to *the class rather than the diff*, found one low-severity issue in a debug hook
+and confirmed no further host-property leak. **Falling severity across rounds is what this project
+treats as ready; a single clean round on new code is not the same thing.**
+
+**The lesson worth carrying: when a feature's entire claim is "works without X", no test on a machine
+that has X can check it.** Assert on the loaded-library set instead — the suite now fails if
+`libcufile` appears in `/proc/<pid>/maps` during a `--direct-stage` run.
 
 The portable 95% of `--gds-only` now exists as its own flag, so a host with a GPU and an NVMe no
 longer needs a resizable-BAR card, nvidia-fs, a cuFile-approved filesystem and an un-regressed
