@@ -1,12 +1,92 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.10  
+**Covers:** v0.9.50 → v0.17.11  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.11 — GPU device selection was correct; the reporting made it look broken
+
+### The investigation, which found no defect
+
+`--gds-only` and `--direct-stage` both pin themselves to one GPU, and every log line from such a
+run calls it `GPU0`. That looked wrong: this box has three cards with 95 GB free and five with 81,
+and starving a device did not move the choice. It appeared that selection was ignoring free VRAM.
+
+It is not. When a run asks for a subset of devices, gzstd ranks them through NVML **before any CUDA
+call exists**, names the winner by UUID in `CUDA_VISIBLE_DEVICES`, and only then lets CUDA start --
+which is what makes `--gpu-devices` faster than paying `cuInit` for eight contexts. CUDA renumbers
+whatever it can see from zero, so the chosen card is *always* device 0 from inside the process. The
+constant `GPU0` was the renumbering, not a stuck selection.
+
+Verified by asking the driver rather than the program: `nvidia-smi --query-compute-apps` reports the
+live process on `GPU-d628d3f1-…`, which is index 4 -- one of the 95 GB cards, i.e. exactly the
+roomiest device the documented rule should pick. Selection has been right the whole time.
+
+Two earlier attempts to disprove it failed for reasons worth recording, because both are traps this
+repo already documents. `cudaMalloc` does not commit VRAM, so a hog that "allocated" 78 GiB in 4 ms
+starved nothing and moved no ranking. A version that also `memset`s does commit -- and then starved
+CUDA device 0 while `nvidia-smi` showed the drop on index 4, which is the NVML-to-CUDA index
+mismatch that is the whole reason this codebase correlates by UUID and never by index.
+
+### What was actually wrong: nothing said which card it picked
+
+That is not cosmetic. It cost a full investigation into a bug that did not exist, and on a shared
+machine the physical identity is the only way to know where a job landed. Selection now says so at
+`-v`, naming the device, how it was chosen, and why every later line will disagree:
+
+    [GPU] selected GPU-d628d3f1-… (least busy, ties to most free VRAM); CUDA renumbers this set from 0, so later lines say GPU0
+
+The reason is reported too, because the three paths are not equally trustworthy: an NVML ranking, a
+blind guess at the tail of `/proc`'s list when the sampler has not answered, and a fall back to raw
+indices on a driver-less box. Only the first is a measurement. An explicit `CUDA_VISIBLE_DEVICES`
+is reported as the user's own choice.
+
+### Ranking now combines utilization and free VRAM instead of letting util dominate
+
+Three separate sort predicates ranked GPUs -- the pre-cuInit NVML pass, `select_best_gpus`'s NVML
+fast path, and its CUDA fallback -- and all three used utilization as the primary key with free VRAM
+only breaking ties. Any difference in util, however small, therefore outranked any difference in
+memory however large: a card 1% busy with 2 GiB free beat an idle one with 95 GiB. For a worker that
+wants a registered input slab plus nvCOMP scratch, that is the wrong trade.
+
+It had not bitten, and the reason is the interesting part: NVML was assumed to report 0% on busy
+devices, so util tied at zero everywhere and free VRAM decided by accident. **That assumption is
+wrong** -- a card driven to saturation reports 100% and was correctly ranked last -- which means the
+old rule was one working signal away from making bad choices.
+
+All three sites now call one helper. Each device is ranked twice, independently: utilization
+ascending and free VRAM descending, both by DENSE rank so a rank is a position in the preference
+order rather than a function of how many devices happen to tie. The device with the lowest sum wins.
+
+**The tie-break was wrong in the first version of this change, and measurement caught it.** Breaking
+ties on free VRAM looks natural. With the three 95 GiB cards driven to 100% and the five 81 GiB
+cards idle, every device scored 1 -- busy-and-roomy as 1+0, idle-and-smaller as 0+1 -- and that
+tie-break handed the job to a fully saturated GPU, which is worse than the rule being replaced. Ties
+now go to the idler card. The asymmetry is real rather than a preference: memory beyond what a
+worker needs buys nothing, while utilization is contention for the SMs we are about to run on.
+
+Verified across three states, with each device named by UUID so index confusion could not corrupt
+the setup: all idle still picks a 95 GiB card; the three roomy cards saturated now picks an idle
+81 GiB card rather than a busy 95 GiB one; and a card worse on both axes ranks last.
+`GZSTD_DEBUG_GPU_RANK=1` prints the table -- device, util, free, both ranks, and the sum -- because
+ranking happens before any log sink exists and its inputs change run to run.
+
+### Names that outlived their meaning
+
+`g_gds_input_fd` was the ordinary O_DIRECT descriptor **both** staged backends read with `pread`;
+the name implied a cuFile coupling it has not had since v0.17.9, and it cost an independent
+reviewer's attention to point out. It is now `g_stage_input_fd`. The Task fields `gds_off` and
+`gds_len` name a region of the input file, which is not a GPUDirect Storage concept at all --
+`src_off` and `src_len`. `is_gds()` asked whether a Task carries host bytes, not whether cuFile is
+involved -- `is_staged()`. Everything still called `gds_*` is genuinely cuFile-specific: the flag,
+the registration, the BAR1 accounting, the tar staging pool, the decompress output handle.
+
+Identifier renames only; verified by diffing a mechanically-renamed copy of the previous source
+against this one, whose only surviving difference is the new log line.
 
 ## v0.17.10 — the measurement hook had the defect its own finding fixed everywhere else
 

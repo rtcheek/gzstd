@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.10";
+static constexpr const char * GZSTD_VERSION = "0.17.11";
 //
 // Architecture overview:
 //
@@ -598,7 +598,7 @@ private:
 // registration is the expensive part, so one handle for all devices and streams
 // is both correct and the cheap arrangement.  Only ever touched by --gds-only.
 static GdsFile g_gds_input;
-static int                g_gds_input_fd    = -1;
+static int                g_stage_input_fd    = -1;
 static unsigned long long g_gds_bar1_before = 0;
 // --gds-only decompress writes VRAM -> NVMe at absolute offsets, so frames need
 // no ordering at all and the ordered writer is bypassed entirely.  That makes
@@ -1729,7 +1729,7 @@ struct Options {
   // region_staged() below, which is the predicate every shared site tests.
   bool direct_stage = false;
   // TRUE FOR BOTH BACKENDS THAT STAGE FILE REGIONS THEMSELVES.  Such a run's
-  // Tasks name a region of the input (gds_off/gds_len) and carry no host bytes,
+  // Tasks name a region of the input (src_off/src_len) and carry no host bytes,
   // so the GPU worker fetches them, the XXH64 runs on the device, and the batch
   // is capped where that kernel stops scaling.  What differs between the two is
   // ONLY how the bytes reach the slab, which is one branch in one lambda.
@@ -1908,6 +1908,103 @@ static std::string gz_stage_read_reason()
 {
   std::lock_guard<std::mutex> g(g_stage_read_err_m);
   return g_stage_read_err;
+}
+
+/*======================================================================
+ GPU device ranking — combine utilization AND free VRAM
+ -----------------------------------------------------------------------
+ THE POLICY, written here instead of being implied by three sort predicates
+ that had drifted into three slightly different answers:
+
+   util  ascending   -> util_rank   (0 = idlest)
+   free  descending  -> vram_rank   (0 = roomiest)
+   order by (util_rank + vram_rank), lowest wins
+
+ WHY NOT util-then-VRAM, which is what this used to be.  Utilization was the
+ primary key and free VRAM only broke ties, so ANY difference in util, however
+ small, outranked ANY difference in memory however large: a card at 1% busy with
+ 2 GiB free beat an idle one with 95 GiB.  For this workload that is the wrong
+ trade — a GPU worker wants a registered input slab plus nvCOMP scratch, and
+ losing that memory costs far more than 1% of someone else's kernel.
+
+ It had not bitten yet, and the reason is worth keeping: NVML reports 0% on
+ devices that are demonstrably busy, so util tied at zero across the board and
+ free VRAM decided everything by accident.  A rule that only works because its
+ primary signal is broken is a rule waiting to break the day it starts working.
+
+ DENSE RANKING — equal values share a rank and the next distinct value takes the
+ next integer.  A rank is therefore a POSITION IN THE PREFERENCE ORDER and not a
+ function of how many devices happen to tie, which is what keeps eight idle GPUs
+ from making the util dimension weigh eight times more than it should.
+
+ KNOWN AND ACCEPTED: ranks discard magnitude.  95330 MiB and 95329 MiB are a
+ whole rank apart, exactly like 95330 and 2048.  That is inherent to combining
+ two incommensurable units by rank rather than by an invented exchange rate, and
+ an exchange rate is the thing this codebase has no defensible way to pick
+ (it would be a machine-tuned constant in all but name).
+
+ Ties on the combined score go to more free VRAM, then to lower util — so the
+ all-idle case still lands on the roomiest card, which is what shipped before.
+======================================================================*/
+struct GzDevRank {
+  unsigned           util = 0;          // 0-100, lower better
+  unsigned long long free_bytes = 0;    // higher better
+};
+
+// Returns indices into `in`, best first.
+static std::vector<size_t> gz_rank_devices(const std::vector<GzDevRank> & in)
+{
+  const size_t n = in.size();
+  std::vector<size_t> idx(n);
+  for (size_t i = 0; i < n; ++i) idx[i] = i;
+  if (n < 2) return idx;
+
+  std::vector<unsigned> urank(n, 0), vrank(n, 0);
+  auto dense = [&](std::vector<unsigned> & out, auto worse_than) {
+    std::vector<size_t> o = idx;
+    std::stable_sort(o.begin(), o.end(), worse_than);
+    unsigned r = 0;
+    for (size_t k = 0; k < n; ++k) {
+      if (k && worse_than(o[k-1], o[k])) ++r;   // strictly better than previous
+      out[o[k]] = r;
+    }
+  };
+  dense(urank, [&](size_t a, size_t b){ return in[a].util < in[b].util; });
+  dense(vrank, [&](size_t a, size_t b){ return in[a].free_bytes > in[b].free_bytes; });
+
+  std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b){
+    const unsigned ca = urank[a] + vrank[a], cb = urank[b] + vrank[b];
+    if (ca != cb)                                 return ca < cb;
+    // TIE -> PREFER THE IDLER CARD, not the roomier one.  Breaking ties on free
+    // VRAM instead looks natural and is wrong, which was MEASURED rather than
+    // reasoned: with the three 95 GiB cards driven to 100% and the five 81 GiB
+    // cards idle, every device scored 1 (busy+roomy = 1+0, idle+smaller = 0+1)
+    // and the VRAM tie-break handed the job to a fully-saturated GPU.
+    //
+    // The asymmetry is real, not a preference.  Memory above what a worker
+    // actually needs -- a registered input slab plus nvCOMP scratch -- buys
+    // nothing at all, while utilization is contention for the SMs we are about
+    // to run on and costs throughput immediately.  So when the combined score
+    // cannot separate two devices, the idler one is the better bet every time.
+    if (in[a].util != in[b].util)                 return in[a].util < in[b].util;
+    return in[a].free_bytes > in[b].free_bytes;
+  });
+
+  // GZSTD_DEBUG_GPU_RANK=1 — dump the table.  Ranking is chosen before any log
+  // sink exists and its inputs vary run to run, so without this the only
+  // evidence of what it decided is which device ended up busy.
+  if (::getenv("GZSTD_DEBUG_GPU_RANK")) {
+    std::fprintf(stderr, "[RANK] %-4s %-6s %-12s %-5s %-5s %s\n",
+                 "dev", "util", "free_MiB", "u_rk", "v_rk", "sum");
+    for (size_t k = 0; k < n; ++k) {
+      const size_t d = idx[k];
+      std::fprintf(stderr, "[RANK] %-4zu %-6u %-12llu %-5u %-5u %u%s\n",
+                   d, in[d].util, (unsigned long long)(in[d].free_bytes >> 20),
+                   urank[d], vrank[d], urank[d] + vrank[d],
+                   k == 0 ? "   <- chosen" : "");
+    }
+  }
+  return idx;
 }
 
 // --verify-engine values (see Options::verify_engine).
@@ -8017,29 +8114,29 @@ struct Task {
 
   // --gds-only: this Task names a REGION OF THE INPUT FILE and carries no host
   // bytes at all — the GPU worker reads it straight into VRAM with cuFileRead.
-  // gds_off >= 0 is the discriminator.  ptr() is meaningless for such a Task and
+  // src_off >= 0 is the discriminator.  ptr() is meaningless for such a Task and
   // must never be called; every host-side consumer is gated on the GPU path, and
   // the one that used to be unconditional (the XXH64 content checksum) now runs
   // on the device instead.
-  off_t        gds_off = -1;
+  off_t        src_off = -1;
   // --tar --gds-only: the frame was ASSEMBLED in VRAM (members + synthesised
   // headers cannot come from one file region), so instead of a file offset the
   // Task names a GdsStagePool slot the GPU worker copies out of and releases.
   int          gds_stage = -1;
-  size_t       gds_len = 0;
+  size_t       src_len = 0;
 
-  bool         is_gds() const { return gds_off >= 0 || gds_stage >= 0; }
+  bool         is_staged() const { return src_off >= 0 || gds_stage >= 0; }
   const char * ptr() const { return view_ptr ? view_ptr : data.data(); }
   size_t       len() const {
-    if (gds_off >= 0 || gds_stage >= 0) return gds_len;
+    if (src_off >= 0 || gds_stage >= 0) return src_len;
     return view_ptr ? view_len : data.size();
   }
   void release_input() {
 #ifdef HAVE_NVCOMP
-    if (gds_stage >= 0)  { gz_gds_stage_release(gds_stage); gds_stage = -1; gds_len = 0; }
+    if (gds_stage >= 0)  { gz_gds_stage_release(gds_stage); gds_stage = -1; src_len = 0; }
     else
 #endif
-    if (gds_off >= 0)    { gds_off = -1; gds_len = 0; }   // nothing was ever held
+    if (src_off >= 0)    { src_off = -1; src_len = 0; }   // nothing was ever held
     else if (direct_buf >= 0) { gz_direct_read_release(direct_buf); direct_buf = -1; view_ptr = nullptr; view_len = 0; }
     else if (view_ptr)   { gz_input_retire(view_ptr, view_len); view_ptr = nullptr; view_len = 0; }
     else                 { std::vector<char>().swap(data); }
@@ -11946,7 +12043,7 @@ static void cpu_worker(
     // bug and must say so.  t.len() is the frame length but t.ptr() is an empty
     // vector for a GDS Task: reading it is undefined behaviour that only failed
     // visibly last time because ZSTD happened to notice the size mismatch.
-    if (t.is_gds())
+    if (t.is_staged())
       die("internal error: a --gds-only frame reached a CPU compress worker; "
           "these name a file region and carry no host bytes");
     const size_t csz = compress_one_cpu_frame(t.ptr(), t.len(), opt->level, opt->ultra, scratch);
@@ -16289,7 +16386,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
       gds_cu_or_die(cudaMemset(stage->buf(slot), 0, clen), "frame zero-fill");
       gds_cu_or_die(cudaStreamSynchronize(0), "frame zero-fill sync");
       t.gds_stage = slot;
-      t.gds_len   = clen;
+      t.src_len   = clen;
     } else
 #endif
     {
@@ -23201,8 +23298,8 @@ static void gpu_worker(
                 size_t hgot = 0;
                 bool   rerr = false;
                 while (hgot < want) {
-                  const ssize_t r = ::pread(g_gds_input_fd, hp + hgot, want - hgot,
-                                            (off_t)t.gds_off + (off_t)hgot);
+                  const ssize_t r = ::pread(g_stage_input_fd, hp + hgot, want - hgot,
+                                            (off_t)t.src_off + (off_t)hgot);
                   if (r < 0) {
                     if (errno == EINTR) continue;      // retriable, not a tail
                     rerr = true; break;
@@ -23243,13 +23340,13 @@ static void gpu_worker(
                       std::string("--direct-stage: ")
                     + (rerr ? std::string("pread failed (") + std::strerror(errno) + ")"
                             : "short read")
-                    + " at offset " + std::to_string((long long)t.gds_off));
+                    + " at offset " + std::to_string((long long)t.src_off));
                   note_rd_error(std::string("--direct-stage: ")
                       + (rerr ? std::string("pread failed (")
                                 + std::strerror(errno) + ")"
                               : "short read " + std::to_string(usable))
                       + " for " + std::to_string(t.len()) + " bytes at offset "
-                      + std::to_string((long long)t.gds_off));
+                      + std::to_string((long long)t.src_off));
                 }
                 continue;
               }
@@ -23287,8 +23384,8 @@ static void gpu_worker(
                 }
                 size_t hgot = 0;
                 while (hgot < want) {
-                  ssize_t r = ::pread(g_gds_input_fd, hp + hgot, want - hgot,
-                                      (off_t)t.gds_off + (off_t)hgot);
+                  ssize_t r = ::pread(g_stage_input_fd, hp + hgot, want - hgot,
+                                      (off_t)t.src_off + (off_t)hgot);
                   if (r <= 0) break;                 // rounded window may pass EOF
                   hgot += (size_t)r;
                 }
@@ -23308,10 +23405,10 @@ static void gpu_worker(
                 }
               } else
               got = g_gds_input.read_dev(
-                  C.d_in_base, t.len(), (off_t)t.gds_off, (off_t)(i * C.gpu_chunk));
+                  C.d_in_base, t.len(), (off_t)t.src_off, (off_t)(i * C.gpu_chunk));
               if (got == (ssize_t)t.len()) {
                 const off_t dv = (off_t)(i * C.gpu_chunk);
-                const bool p2p_eligible = ((t.gds_off & 4095) == 0)
+                const bool p2p_eligible = ((t.src_off & 4095) == 0)
                                        && ((dv & 4095) == 0)
                                        && ((t.len() & 4095) == 0);
                 (p2p_eligible ? g_gds_frames_p2p : g_gds_frames_fallback)
@@ -23321,11 +23418,11 @@ static void gpu_worker(
                 gz_note_stage_read_failure(
                     "--gds-only: cuFileRead returned "
                   + std::to_string((long long)got) + " at offset "
-                  + std::to_string((long long)t.gds_off));
+                  + std::to_string((long long)t.src_off));
                 note_rd_error("--gds-only: cuFileRead returned "
                     + std::to_string((long long)got) + " for "
                     + std::to_string(t.len()) + " bytes at offset "
-                    + std::to_string((long long)t.gds_off));
+                    + std::to_string((long long)t.src_off));
               }
             }
           };
@@ -23827,12 +23924,18 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
         }
       }
 
-      // Sort by effective score ascending, then free VRAM descending
-      std::sort(infos.begin(), infos.end(),
-                [](const NvmlInfo & a, const NvmlInfo & b) {
-                  if (a.score != b.score) return a.score < b.score;
-                  return a.free_bytes > b.free_bytes;
-                });
+      // Combined rank (see gz_rank_devices).  `score`, not raw util, so the
+      // NUMA penalty computed above still participates.
+      {
+        std::vector<GzDevRank> rin;
+        rin.reserve(infos.size());
+        for (const auto & i2 : infos) rin.push_back({i2.score, (unsigned long long)i2.free_bytes});
+        const std::vector<size_t> order = gz_rank_devices(rin);
+        std::vector<NvmlInfo> sorted;
+        sorted.reserve(infos.size());
+        for (size_t o : order) sorted.push_back(infos[o]);
+        infos.swap(sorted);
+      }
 
       std::vector<int> result;
       for (int i = 0; i < want; ++i)
@@ -23896,12 +23999,22 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
   if (nvml_ok) nvmlShutdown();
 #endif
 
-  std::sort(devs.begin(), devs.end(),
-            [](const DevInfo & a, const DevInfo & b) {
-              if (a.has_util && b.has_util && a.gpu_util != b.gpu_util)
-                return a.gpu_util < b.gpu_util;
-              return a.free_bytes > b.free_bytes;
-            });
+  // Combined rank (see gz_rank_devices).  A device whose utilization could not
+  // be read is scored 100 -- the same assume-busy default the NVML path above
+  // uses -- so an unknown never outranks a device we actually measured.  When
+  // NOTHING has util data they all tie there and free VRAM decides alone, which
+  // is what this did before.
+  {
+    std::vector<GzDevRank> rin;
+    rin.reserve(devs.size());
+    for (const auto & d2 : devs)
+      rin.push_back({ d2.has_util ? d2.gpu_util : 100u, (unsigned long long)d2.free_bytes });
+    const std::vector<size_t> order = gz_rank_devices(rin);
+    std::vector<DevInfo> sorted;
+    sorted.reserve(devs.size());
+    for (size_t o : order) sorted.push_back(devs[o]);
+    devs.swap(sorted);
+  }
 
   int n = std::min(want, (int)devs.size());
   std::vector<int> result;
@@ -24513,7 +24626,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       }
       g_gds_bar1_before = gz_nvfs_bar1_ok();
     }
-    g_gds_input_fd = fd;              // closed after the workers join
+    g_stage_input_fd = fd;              // closed after the workers join
     // Distinct read-path keys: --adapt compares paths measured on THIS box, and
     // filing the portable path under the peer-to-peer one would let a run that
     // never touched cuFile teach the profile about a backend it did not use.
@@ -24538,8 +24651,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       const size_t n = (size_t)std::min<uint64_t>(gpu_chunk, file_size - off);
       Task t;
       t.seq     = seq_counter.fetch_add(1, std::memory_order_relaxed);
-      t.gds_off = (off_t)off;
-      t.gds_len = n;
+      t.src_off = (off_t)off;
+      t.src_len = n;
       queue.push(std::move(t));
       off += n;
     }
@@ -24895,7 +25008,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (opt.gds_only) {
     const unsigned long long b1 = gz_nvfs_bar1_ok();
     g_gds_input.close();
-    if (g_gds_input_fd >= 0) { ::close(g_gds_input_fd); g_gds_input_fd = -1; }
+    if (g_stage_input_fd >= 0) { ::close(g_stage_input_fd); g_stage_input_fd = -1; }
     // REPORTED AT DEFAULT VERBOSITY WHEN ANYTHING DEGRADED.  Asking for
     // --gds-only and silently getting something else is this feature's worst
     // failure mode: a compat fallback returns correct bytes at almost the same
@@ -24933,7 +25046,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // The descriptor is opened by the SAME producer branch, so it has to be
     // closed on this side too -- it lived under the gds_only arm alone and would
     // otherwise leak one fd per run.
-    if (g_gds_input_fd >= 0) { ::close(g_gds_input_fd); g_gds_input_fd = -1; }
+    if (g_stage_input_fd >= 0) { ::close(g_stage_input_fd); g_stage_input_fd = -1; }
     if (opt.verbosity >= V_VERBOSE) {
       char b[192];
       // EXACT BYTES, not just MiB.  A failed O_DIRECT read throws, and the throw
@@ -30727,6 +30840,7 @@ static void apply_backend_defaults(Options & opt)
     // devices was requested and a ranking can therefore change something.
     g_gpu_monitor.start();
     std::string sel;
+    const char * how = "user's CUDA_VISIBLE_DEVICES, first N of their list";
     if (const char * cur = ::getenv("CUDA_VISIBLE_DEVICES")) {
       std::stringstream ss(cur); std::string tok; int taken = 0;
       while (taken < opt.gpu_devices && std::getline(ss, tok, ',')) {
@@ -30752,15 +30866,16 @@ static void apply_backend_defaults(Options & opt)
       if (hw_gpus == 0 || (size_t)opt.gpu_devices < hw_gpus)
         g_gpu_monitor.wait_ready(500);
       auto rows = g_gpu_monitor.snapshot();
+      how = rows.empty() ? "no NVML sample, took the tail of /proc's list (a guess)"
+                         : "combined rank: utilization + free VRAM";
       if (!rows.empty()) {
-        std::stable_sort(rows.begin(), rows.end(),
-                         [](const GpuMonitor::Row & a, const GpuMonitor::Row & b) {
-          if (a.util != b.util) return a.util < b.util;   // idle first
-          return a.free_bytes > b.free_bytes;             // then roomiest
-        });
-        for (size_t i = 0; i < rows.size() && (int)i < opt.gpu_devices; ++i) {
+        std::vector<GzDevRank> rin;
+        rin.reserve(rows.size());
+        for (const auto & r2 : rows) rin.push_back({r2.util, r2.free_bytes});
+        const std::vector<size_t> order = gz_rank_devices(rin);
+        for (size_t i = 0; i < order.size() && (int)i < opt.gpu_devices; ++i) {
           if (!sel.empty()) sel += ",";
-          sel += rows[i].uuid;   // "GPU-<uuid>": names a device with no index
+          sel += rows[order[i]].uuid;   // "GPU-<uuid>": names a device with no index
         }
       } else {
         // Blind fallback: the sampler has not answered (or there is no NVML).
@@ -30775,12 +30890,26 @@ static void apply_backend_defaults(Options & opt)
       }
     }
     if (sel.empty()) {          // no NVML (driver-less box): fall back to indices
+      how = "no NVML and no /proc list, fell back to indices";
       for (int i = 0; i < opt.gpu_devices; ++i) {
         if (i) sel += ",";
         sel += std::to_string(i);
       }
     }
     ::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1);
+    // SAY WHICH PHYSICAL DEVICE, because nothing downstream can.  Narrowing the
+    // visible set renumbers it from zero, so every later line calls the chosen
+    // GPU "GPU0" no matter which card it is -- which is not a cosmetic gap: it
+    // sent a reader (me) chasing a device-selection bug that did not exist,
+    // because a run pinned to physical GPU 4 reports itself as GPU0 throughout.
+    // On a shared box the identity is also the only way to tell which card a job
+    // actually landed on.
+    if (opt.verbosity >= V_VERBOSE) {
+      std::ostringstream os;
+      os << "[GPU] selected " << sel << " (" << how
+         << "); CUDA renumbers this set from 0, so later lines say GPU0\n";
+      vlog(V_VERBOSE, opt, os.str());
+    }
   }
   // Freeze the batch geometry the size gate reasons about BEFORE --adapt seeds
   // gpu_batch_cap from the profile (see Options::gpu_batch_cap_gate).
