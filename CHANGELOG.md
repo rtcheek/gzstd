@@ -1,12 +1,147 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.8  
+**Covers:** v0.9.50 → v0.17.9  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.9 — --direct-stage: the 95% of --gds-only that needs none of its hardware
+
+v0.17.7 decomposed what `--gds-only` actually saves. Of 3.73 host CPU-seconds against gzstd's
+ordinary reader, 3.55 came from an O_DIRECT read landing directly in the GPU staging slab and 0.19
+from peer-to-peer DMA itself. The four gates that feature demands -- a resizable-BAR GPU whose BAR1
+aperture covers its VRAM, the nvidia-fs kernel module, a filesystem cuFile accepts, and a kernel
+without the shadow-buffer pin regression -- buy the last 5%. `--direct-stage` is the other 95%,
+and it needs none of them.
+
+It reads each frame with O_DIRECT into page-locked host memory, pushes it once into the same slab,
+and hashes it with the same device-side XXH64 kernel. Everything else is shared: the producer
+emitting region-naming Tasks, the 64-frame batch floor, one GPU stream, the implied `--gpu-only`.
+A new predicate, `region_staged()`, marks the sites that are about staging rather than about
+cuFile, so the two backends differ in exactly one branch in one lambda.
+
+### Measured, one device on every arm, five cold runs, 6 GiB
+
+| arm | host CPU | wall |
+|---|---|---|
+| ordinary reader | 6.18-7.06 s | 4.90-6.97 s |
+| **--direct-stage** | **3.69-3.87 s** | **5.03-5.17 s** |
+| --gds-only | 4.59-4.77 s | 5.78-6.00 s |
+
+**About 44% less host CPU than the ordinary reader, and it beats peer-to-peer as well** -- every
+range non-overlapping. The flag was only ever meant to come close to `--gds-only` without its
+hardware; it is cheaper, because it does not pay `cuFileBufRegister` and does not carry cuFile in
+the per-read path at all. v0.17.7 predicted exactly this and said so: *the O_DIRECT arm still pays
+cuFileBufRegister, so a native version would likely be cheaper still.*
+
+An earlier draft of this entry reported 4.73-4.82 s and called the difference from `--gds-only`
+indistinguishable. That measurement was taken against a binary carrying the registration defect
+below, which cost it 761 ms it should never have spent.
+
+**The first version of this measurement said 3.4x and was wrong.** Plain `--gpu-only` defaults to
+all eight devices while both staged paths default to one, so the baseline was inflated by device
+count -- the same confound that produced a fake 2.4x in v0.17.0 and is recorded as one of the three
+in this arc. Every arm above is pinned to one device.
+
+### Byte-identity cannot verify this flag, so the report carries exact bytes
+
+A failed O_DIRECT read throws, and the throw lands in the existing abort -> discard -> CPU-only
+rebuild. The archive therefore comes out byte-identical at exit 0 whether the flag did its work or
+silently gave up -- the same shape as a cuFile compat fallback. `[DSTAGE]` now reports the exact
+staged byte count so a caller can compare it against the input size.
+
+That instrument is mutation-tested: removing the O_DIRECT round-up is caught on all six unaligned
+sizes and on none of the three aligned ones, where the round-up is a no-op. Two earlier mutants
+survived and were the useful part -- one showed the tail clamp is unreachable on a static file
+because EOF bounds the read (it is kept for an input growing under us), and the other showed that a
+MiB-rounded report cannot tell 4095 staged bytes from zero.
+
+The unaligned tail is the known trap here: v0.15.63 records O_DIRECT compress reads failing on every
+input whose size was not 4096-aligned, hidden for four versions because every generated corpus is
+MiB-sized. Eight tail shapes are covered, and this kernel does enforce the rule -- a 4095-byte
+O_DIRECT pread returns EINVAL.
+
+### A staged-read failure was announced as a GPU fault
+
+The recovery was already right and already loud: a failed staged read throws into the existing
+abort, discard and CPU-only rebuild, and the rebuild line runs at error verbosity so it survives
+`-q`. The EXPLANATION was wrong. That line assumed any non-verify rebuild was a GPU fault, so an
+O_DIRECT read the filesystem refused produced:
+
+    WARNING: a GPU faulted -- discarding output and rebuilding CPU-only from the original input
+
+No GPU faulted. A user seeing that goes to `journalctl -k` for Xid errors and driver versions, for a
+problem that is neither -- while the actual event is that the whole file was silently recompressed
+the slow way at correct output and exit 0. Both staged backends now record the real reason, and the
+rebuild says so:
+
+    WARNING: --direct-stage: pread failed (Input/output error) at offset 83886080
+      Input I/O or filesystem error.  Attempting recovery with a CPU-only rebuild
+      from the original input (attempt 1)...
+
+It names the error and the recovery rather than arguing with the reader about what the fault is not.
+Every branch of that line must end mid-sentence, because a shared suffix appends
+`from the original input (attempt N)...` -- the first version of this one closed its own sentence
+and printed `...skip the retry from the original input (attempt 1)...`, which is how the wording got
+looked at twice.
+
+`GZSTD_DEBUG_DSTAGE_FAIL_FRAME=N` forces frame N's read to fail, because this path is otherwise
+reachable only on a filesystem that accepts an O_DIRECT open and then refuses the read -- which a
+test cannot arrange. Verified at all three verbosities, and with the control that matters: a real
+GPU fault, injected with `GZSTD_DEBUG_FAIL_GPU_AFTER`, is still reported as a GPU fault. Without
+that control the change would be a relabel rather than a discriminator. The flag is reset per output
+file, so a multi-file run cannot let one file's I/O error relabel the next file's genuine fault.
+
+### --direct-stage was registering its slab with cuFile -- found by independent review
+
+The flag exists to need no cuFile. It was calling `cuFileBufRegister` anyway, because the
+allocation that sets up the shared device checksum was converted to the shared predicate wholesale
+and the BAR1 registration sits in the same block. On this host that was merely 761 ms of waste per
+run. **On the hosts the flag is FOR -- no nvidia-fs, no resizable BAR, no cuFile-approved
+filesystem -- the registration fails, the stream context fails to allocate, and the run dies
+printing a message naming `--gds-only`, a flag the user never passed.**
+
+It could not have been caught here. This machine has all four GDS gates open, so the wrong call
+succeeds. Registration is now gated on `gds_only` while the checksum allocation stays shared.
+Verified by the log line the registration emits: present under `--direct-stage` before the fix at
+761 ms, absent after, and unchanged under `--gds-only` at 157-161 ms.
+
+**A consequence worth stating, because it is now a property rather than an intention: with that
+call gone, `--direct-stage` never loads libcufile at all.** Checked directly -- the library does not
+appear in `/proc/<pid>/maps` for the life of the run, and under a cufile.json with statistics
+enabled the flag exits 0 and writes no `cufile.log`, where `--gds-only` on the same config exits 139
+in libcufile's own destructor. So `--direct-stage` is structurally immune to the v0.17.8 defect,
+not merely unaffected by it in practice. The suite now asserts the library stays unmapped, so a
+future cuFile call reintroduced into this path fails a test rather than quietly costing the
+portability the flag is named for.
+
+A second defect from the same review: the reader fan-out threads performed the H2D without ever
+calling `cudaSetDevice`. CUDA's current device is host-thread-local, so those threads operated on
+device 0 regardless of which device owned the slab -- and `--direct-stage` selects one device by
+free VRAM, which is frequently not device 0. **The sibling `--tar` assembler already carried the
+fix and a comment naming the hazard**, which is the fourth time in this codebase that a defect's
+correction was already written in a mirrored path. Related: those threads called `checkCuda`, which
+throws, and a throw escaping a `std::thread` calls `std::terminate` rather than reaching the
+abort and CPU-only rebuild. CUDA failures there now route through the same error channel as a
+failed read.
+
+### Two defects found while wiring it
+
+The input descriptor was closed only under the `gds_only` arm of the teardown, so `--direct-stage`
+leaked one fd per run. And the read-error throw prefixed its message with `--gds-only:`, so a
+`--direct-stage` failure reported a flag the user never passed.
+
+### Scope
+
+Compression only, and not with `--tar`. The decompress direction of `--gds-only` writes VRAM to
+NVMe through cuFile and has no O_DIRECT equivalent to stand in for; `--tar` composes each frame from
+many member extents rather than one contiguous region. Both are refused with exit 2 naming the
+reason rather than accepted and ignored. `--adapt` files the settled batch under its own
+`settled_batch_dstage` key, for the reason v0.17.6 split the GDS key out: one latest-wins key let an
+ordinary batch of 8 overwrite a measured 64.
 
 ## v0.17.8 — the only way to prove --gds-only did what it says was the one setting that crashed it
 

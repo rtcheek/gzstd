@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.8";
+static constexpr const char * GZSTD_VERSION = "0.17.9";
 //
 // Architecture overview:
 //
@@ -503,8 +503,25 @@ static void gz_gds_driver_shutdown()
   if (a.DriverClose) a.DriverClose();
 }
 
-// Scoped so it runs on EVERY exit from main, including the exception paths, and
-// crucially before exit() reaches _dl_fini.
+// Runs when main RETURNS -- normally, or after one of main's own catch blocks,
+// which between them cover every path that unwinds.  It runs before exit()
+// reaches _dl_fini, which is the ordering the whole guard exists for.
+//
+// IT DOES NOT RUN ON die().  That calls std::exit, which runs static destructors
+// and atexit handlers but does NOT unwind the stack, so this automatic object is
+// never destroyed on the abort paths -- and die() is this program's most common
+// abnormal exit.  An earlier version of this comment claimed "every exit from
+// main", which was false in exactly the case a reader would most want it to be
+// true.
+//
+// Left that way deliberately, on two grounds: a die() path is already fatal, and
+// calling cuFileDriverClose from it would race workers that are still live,
+// which is a worse failure than the one below.  The cost of not running is
+// confined to cuFile's deferred statistics dump -- so on a die() with
+// cufile_stats enabled, libcufile's destructor still faults at _dl_fini and the
+// process reports 139 rather than the code die() asked for.  That is the known
+// libcufile dlopen defect (see gz_gds_driver_opened), not a new one, and it
+// needs a non-default config to appear at all.
 struct GzGdsDriverGuard { ~GzGdsDriverGuard() { gz_gds_driver_shutdown(); } };
 
 // nvidia-fs's box-wide count of successful GPU BAR1 mappings.  MEASURED to be
@@ -592,6 +609,14 @@ static unsigned long long g_gds_bar1_before = 0;
 // work some other way is the failure mode this whole feature is most exposed to
 // -- a compat fallback returns the right bytes at nearly the same speed -- so
 // what actually happened is reported at DEFAULT verbosity, not under -v.
+// --direct-stage accounting.  Deliberately NOT folded into the GDS counters: an
+// aligned/unaligned split is meaningless here (every read is an ordinary pread,
+// so nothing can silently downgrade), and the failure this path CAN have is a
+// short read at the tail, which the transfer already turns into a hard error.
+// What is worth reporting is simply that the portable path ran and moved the
+// whole file.
+static std::atomic<uint64_t> g_dstage_bytes{0};
+static std::atomic<uint64_t> g_dstage_frames{0};
 static std::atomic<uint64_t> g_gds_frames_p2p{0};      // aligned cuFile transfers
 static std::atomic<uint64_t> g_gds_frames_fallback{0}; // transfers that had to be bounced
 static std::atomic<uint64_t> g_gds_members_nofile{0};  // --tar members cuFile refused
@@ -1686,6 +1711,31 @@ struct Options {
   // rejected at the bottom of parse_args.  Narrow by construction: a resizable-BAR GPU,
   // nvidia-fs, a GDS-capable filesystem and a kernel without the pin regression.
   bool gds_only = false;
+  // --direct-stage: the portable 95% of --gds-only.  v0.17.7 decomposed that
+  // feature's saving on one file, cold, interleaved: of 3.73 host CPU-seconds
+  // saved against the ordinary reader, 3.55 (95%) came from an O_DIRECT read
+  // landing straight in the GPU staging slab and only 0.19 (5%) from
+  // peer-to-peer DMA itself.  This flag is that 3.55: pread the frame O_DIRECT
+  // into an aligned host buffer, push it H2D into the same slab, and let the
+  // same device-side XXH64 kernel hash it there.
+  //
+  // WHAT IT DELIBERATELY DOES NOT NEED: cuFile, nvidia-fs, a resizable-BAR GPU
+  // whose BAR1 covers its VRAM, a cuFile-approved filesystem, or a kernel clear
+  // of the shadow-buffer pin regression.  Those four gates are what buy the last
+  // 5%, and they exclude nearly every host -- including boxes with a perfectly
+  // good GPU and NVMe that can never run --gds-only at all.
+  //
+  // Shares gds_only's Task shape, batch geometry and device checksum; see
+  // region_staged() below, which is the predicate every shared site tests.
+  bool direct_stage = false;
+  // TRUE FOR BOTH BACKENDS THAT STAGE FILE REGIONS THEMSELVES.  Such a run's
+  // Tasks name a region of the input (gds_off/gds_len) and carry no host bytes,
+  // so the GPU worker fetches them, the XXH64 runs on the device, and the batch
+  // is capped where that kernel stops scaling.  What differs between the two is
+  // ONLY how the bytes reach the slab, which is one branch in one lambda.
+  // Sites about cuFile specifically -- the preflight, BAR1 accounting, the
+  // registration, the tar staging pool -- must keep testing gds_only.
+  bool region_staged() const { return gds_only || direct_stage; }
   // True if the user explicitly passed --cpu-only, --gpu-only, or --hybrid.
   // When false, apply_backend_defaults() picks based on mode + PCIe gen
   // (asymmetric mode: hybrid for compress; PCIe Gen3 → cpu-only for decompress).
@@ -1832,6 +1882,33 @@ struct Options {
   bool tar_sparse_oldgnu = false;        // --format=gnu/oldgnu: emit OLDGNU 'S' sparse (default: PAX GNU.sparse.1.0)
   std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
 };
+
+// DECLARED HERE, OUTSIDE #ifdef HAVE_NVCOMP, BECAUSE ITS READERS ARE.  The two
+// setters are GPU-only, but the rebuild driver that reports the cause is shared
+// code compiled in both configurations -- putting these beside the other GDS
+// globals broke the CPU-only build, which is the second time in one release that
+// a declaration and its use landed in different preprocessor scopes.
+// A REGION-STAGED INPUT READ FAILED -- NOT A GPU FAULT.  --gds-only and
+// --direct-stage fetch their own input inside the GPU worker, so a storage or
+// filesystem error surfaces through the same abort -> discard -> CPU-only
+// rebuild that a faulting GPU uses.  The recovery is right; the EXPLANATION was
+// not.  Without this the user was told "a GPU faulted" for an O_DIRECT read the
+// filesystem refused, which sends them to Xid logs and driver versions for a
+// problem that is neither.  Holds the reason so the loud rebuild line can say
+// what actually happened.
+static std::mutex             g_stage_read_err_m;
+static std::string            g_stage_read_err;     // guarded by the mutex
+static std::atomic<bool>      g_stage_read_failed{false};
+static void gz_note_stage_read_failure(const std::string & why)
+{
+  std::lock_guard<std::mutex> g(g_stage_read_err_m);
+  if (!g_stage_read_failed.exchange(true)) g_stage_read_err = why;   // first one wins
+}
+static std::string gz_stage_read_reason()
+{
+  std::lock_guard<std::mutex> g(g_stage_read_err_m);
+  return g_stage_read_err;
+}
 
 // --verify-engine values (see Options::verify_engine).
 static constexpr int VERIFY_ENGINE_AUTO = 0;  // pick by PCIe gen / bottleneck heuristic
@@ -3134,6 +3211,43 @@ static void print_help_long()
 "     batch to 64 frames — its throughput scales with the frame count,\n"
 "     and a smaller batch would make it, not the drive, the bottleneck.\n"
 "     An explicit --gpu-batch always overrides.\n"
+"\n"
+"  --direct-stage                                        [EXPERIMENTAL]\n"
+"     THE PORTABLE 95% OF --gds-only, ON ANY HOST WITH A GPU.  Read each\n"
+"     frame with O_DIRECT (a read that bypasses the kernel page cache)\n"
+"     straight into page-locked host memory, push it once into the same\n"
+"     GPU staging slab --gds-only fills, and hash it with the same\n"
+"     device-side XXH64 kernel.  Compression only, and not with --tar.\n"
+"\n"
+"     WHY IT EXISTS.  --gds-only was measured against gzstd's ordinary\n"
+"     reader and credited with the whole difference.  Decomposing that on\n"
+"     one file, cold, showed otherwise: of 3.73 host CPU-seconds saved,\n"
+"     3.55 came from the O_DIRECT read landing directly in the staging\n"
+"     slab and only 0.19 from peer-to-peer DMA (direct memory access)\n"
+"     itself.  This flag is that 3.55, and it needs NONE of the four\n"
+"     things --gds-only needs: no cuFile, no nvidia-fs kernel module, no\n"
+"     resizable-BAR GPU whose PCI BAR1 aperture covers its VRAM (video\n"
+"     RAM), no cuFile-approved filesystem.  It runs where --gds-only\n"
+"     cannot, which is nearly everywhere.\n"
+"\n"
+"     MEASURED, same host, one device on every arm, five cold runs,\n"
+"     6 GiB: host CPU 3.69-3.87 s against the ordinary reader's\n"
+"     6.18-7.06, about 44% less.  It also beats --gds-only's\n"
+"     4.59-4.77, because it never pays cuFileBufRegister and carries\n"
+"     no cuFile in the per-read path.  Every range above is\n"
+"     non-overlapping.  Mostly a CPU-efficiency change: it hands cores\n"
+"     and memory bandwidth back to whatever else the machine is doing.\n"
+"\n"
+"     Implies --gpu-only, for the reason --gds-only does: the frame is\n"
+"     staged into VRAM and never exists as a host buffer a CPU worker\n"
+"     could compress.  Needs a seekable regular file (not a pipe) on a\n"
+"     filesystem that accepts O_DIRECT.  Raises the default GPU batch to\n"
+"     64 for the same reason --gds-only does -- the device checksum\n"
+"     kernel scales with frame count -- and defaults to one GPU, because\n"
+"     the drive sets the pace.  Both are overridable.\n"
+"\n"
+"     Distinct from --direct-read, which is O_DIRECT input for the CPU\n"
+"     path, and from --direct, which is O_DIRECT OUTPUT.\n"
 "\n"
 "  NOTE — TUNING FLAGS IMPLY --hybrid.  Passing any GPU/hybrid tuning\n"
 "  option without an explicit --cpu-only / --gpu-only / --hybrid selects\n"
@@ -5350,6 +5464,11 @@ struct AdaptObs {
   // apart in the profile.  Carried on the observation because adapt_merge_dir
   // records observations and has no Options.
   bool     gds_only = false;
+  // --direct-stage shares the device checksum and the 64-frame floor with
+  // --gds-only but not the cuFile registration, so its settled batch is a THIRD
+  // geometry.  Keyed apart for the reason the GDS split exists at all: one
+  // latest-wins key let an ordinary batch of 8 overwrite a measured 64.
+  bool     direct_stage = false;
   std::string regime = "unclassified";           // governor's dominant regime, last file
   std::string src_path;                          // read path that engaged ("" = untapped)
   int writer_par = 0;                            // writer probe verdict (+1/-1, 0 = untried)
@@ -5548,7 +5667,9 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
     // batch of 8 override GDS's measured 64; ignoring the key under GDS fixed
     // that poisoning but also threw away GDS's own measured verdict every run.
     // Keep one additive key per path so both remain reusable starting points.
-    dir.put_num(obs.gds_only ? "settled_batch_gds" : "settled_batch",
+    dir.put_num(obs.gds_only     ? "settled_batch_gds"
+              : obs.direct_stage ? "settled_batch_dstage"
+                                 : "settled_batch",
                 (double)obs.settled_batch);                    // discrete: latest wins
   }
   if (obs.regime != "unclassified")
@@ -5621,7 +5742,8 @@ struct AdaptPriors {
   bool gpu_valid = false;   // entry's driver == current driver
   struct Dir {
     double cpu_gibs = 0, gpu_gibs = 0, source_gibs = 0, sink_gibs = 0;
-    double overall_gibs = 0, settled_batch = 0, settled_batch_gds = 0, runs = 0;
+    double overall_gibs = 0, settled_batch = 0, settled_batch_gds = 0,
+           settled_batch_dstage = 0, runs = 0;
     double input_gibs = 0;   // input-domain rate, for duration prediction
     double overall_cpu = 0, overall_hybrid = 0;             // end-to-end, per backend
     double overall_cpu_cores = 0;                          // cores that produced overall_cpu
@@ -5671,6 +5793,7 @@ static AdaptPriors adapt_load_priors()
     D.gpu_gibs      = P.gpu_valid ? dj->gnum("gpu_gibs", 0) : 0;
     D.settled_batch = P.gpu_valid ? dj->gnum("settled_batch", 0) : 0;
     D.settled_batch_gds = P.gpu_valid ? dj->gnum("settled_batch_gds", 0) : 0;
+    D.settled_batch_dstage = P.gpu_valid ? dj->gnum("settled_batch_dstage", 0) : 0;
     D.source_gibs   = dj->gnum("source_gibs", 0);
     D.sink_gibs     = dj->gnum("sink_gibs", 0);
     D.overall_gibs  = dj->gnum("overall_gibs", 0);
@@ -5824,7 +5947,8 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
   // cross-contamination this split exists to prevent.  This is the one place
   // where the Options and the observation are both in hand.
   AdaptObs obs = obs_in;
-  obs.gds_only = opt.gds_only;
+  obs.gds_only     = opt.gds_only;
+  obs.direct_stage = opt.direct_stage;
   const std::string path = adapt_profile_path();
   // NO PATH AT ALL is a persistence failure like any other, and it returned here
   // silently — BEFORE the four instrumented I/O failures below, so the warning
@@ -5930,7 +6054,7 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
     const std::string prev_drv = have_drv ? dvp->str : std::string();
     if (!have_drv || prev_drv != fp.driver) {
       std::vector<std::string> gpu_keys = {
-        "gpu_gibs", "settled_batch", "settled_batch_gds",
+        "gpu_gibs", "settled_batch", "settled_batch_gds", "settled_batch_dstage",
         "overall_gibs_hybrid", "overall_gibs_hybrid_run",
       };
       for (int c = 0; c < 2; ++c) {
@@ -12335,10 +12459,12 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
   //               there is nothing draining the ResultStore this pool pushes to.
   // The preflight makes reaching this unlikely; if it happens anyway, say what
   // is actually wrong instead of handing the job to a pool that cannot do it.
-  if (opt.gds_only && (!decompress || g_gds_out_active.load(std::memory_order_relaxed)))
-    die_usage("--gds-only: the GPU path failed and there is no CPU fallback for it -- "
-              "frames read by GPUDirect Storage exist only in GPU memory.  "
-              "Re-run without --gds-only.");
+  if (opt.region_staged() && (!decompress || g_gds_out_active.load(std::memory_order_relaxed))) {
+    const char * f = opt.gds_only ? "--gds-only" : "--direct-stage";
+    die_usage(std::string(f) + ": the GPU path failed and there is no CPU fallback "
+              "for it -- these frames name a region of the input and their bytes "
+              "exist only in GPU memory.  Re-run without " + f + ".");
+  }
   int threads = resolve_cpu_threads(opt.cpu_threads);
   // Compress with a pending restart (g_gpu_failed_restart): this drain only
   // tears the pipeline down cleanly; its output is about to be DISCARDED and
@@ -21121,6 +21247,22 @@ struct StreamCtx {
   void * d2h_pinned_base = nullptr;
   size_t d2h_pinned_bytes = 0;
 
+  // --direct-stage host staging buffers: ONE PER READER THREAD, allocated once
+  // with the stream and reused for the life of the run.
+  //
+  // The measurement hook this path grew out of used a thread_local buffer, which
+  // was right for a throwaway A/B and wrong here: the reader threads are created
+  // and joined PER BATCH, so a thread_local would malloc and free 16 MiB eight
+  // times per batch -- precisely the kind of host-side cost the flag exists to
+  // remove.  Owning them here makes the allocation once-per-run.
+  //
+  // PINNED, and both halves of that matter: cudaHostAlloc memory is page-locked
+  // so the H2D is a straight DMA instead of the driver's own staged copy, and it
+  // is page-aligned, which is what O_DIRECT requires of the pread landing in it.
+  static constexpr size_t DSTAGE_MAX_READERS = 8;   // mirrors rd_threads' cap
+  std::vector<void *> h_dstage;      // DSTAGE_MAX_READERS entries when engaged
+  size_t h_dstage_slot_bytes = 0;
+
   // Host-side vectors (mirroring device arrays for readback)
   std::vector<size_t>         h_in_sizes;
   std::vector<size_t>         h_comp_sizes;
@@ -21249,7 +21391,23 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   if (cudaMalloc(&C.d_in_sizes,   sizeof(size_t)         * C.per_stream_batch) != cudaSuccess) return false;
   if (cudaMalloc(&C.d_comp_sizes, sizeof(size_t)         * C.per_stream_batch) != cudaSuccess) return false;
   if (cudaMalloc(&C.d_stats,      sizeof(nvcompStatus_t) * C.per_stream_batch) != cudaSuccess) return false;
-  if (opt.gds_only) {
+  if (opt.direct_stage) {
+    // Rounded to the O_DIRECT block: the tail frame is short and its read window
+    // is rounded UP, so the buffer must hold the rounded length, not the frame's.
+    C.h_dstage_slot_bytes = (C.gpu_chunk + 4095) & ~size_t(4095);
+    C.h_dstage.assign(StreamCtx::DSTAGE_MAX_READERS, nullptr);
+    for (size_t k = 0; k < StreamCtx::DSTAGE_MAX_READERS; ++k) {
+      // (endian-lint exemption: cudaHostAlloc is an allocator out-param, listed
+      // in check-endian-reads.sh's ALLOW beside cudaMalloc -- the width here is
+      // the allocation size, not the width of a field read off disk.)
+      if (cudaHostAlloc(&C.h_dstage[k], C.h_dstage_slot_bytes,
+                        cudaHostAllocDefault) != cudaSuccess) {
+        C.h_dstage[k] = nullptr;
+        return false;      // VRAM/pinned budget is already tight; fail cleanly
+      }
+    }
+  }
+  if (opt.region_staged()) {
     if (cudaMalloc(&C.d_checksums, sizeof(unsigned int) * C.per_stream_batch) != cudaSuccess)
       return false;
     // (endian-lint exemption: cudaHostAlloc is an allocator out-param, listed in
@@ -21260,6 +21418,8 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
       C.h_ck_pinned = nullptr;
       return false;      // a few hundred bytes; failing here means something worse
     }
+  }
+  if (opt.gds_only) {
     // REGISTERING THE SLAB IS NOT BOOKKEEPING.  cuFileBufRegister is what maps
     // this VRAM through the GPU's BAR1 aperture so the drive can write into it
     // directly; without it every cuFileRead silently falls back to a bounce
@@ -21427,6 +21587,8 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   C.gds_in_reg.dereg();
   if (C.d_checksums) { cudaFree(C.d_checksums); C.d_checksums = nullptr; }
   if (C.h_ck_pinned) { cudaFreeHost(C.h_ck_pinned); C.h_ck_pinned = nullptr; }
+  for (void *& hp : C.h_dstage) if (hp) { cudaFreeHost(hp); hp = nullptr; }
+  C.h_dstage.clear(); C.h_dstage_slot_bytes = 0;
   if (C.d_in_base) { cudaFree(C.d_in_base); }
   if (C.d_out_base) { cudaFree(C.d_out_base); }
   if (C.d_temp) { cudaFree(C.d_temp); }
@@ -22238,7 +22400,7 @@ static void gpu_worker(
     // kernel, whose throughput scales linearly at ~0.28 GiB/s per frame — 64
     // frames sustain 17.8 GiB/s, already 3.6x the drive.  So a larger slab buys
     // nothing at all here and costs startup.  An explicit --gpu-batch still wins.
-    if (opt.gds_only && !opt.gpu_batch_user_set)
+    if (opt.region_staged() && !opt.gpu_batch_user_set)
       per_stream_cap = std::min<size_t>(per_stream_cap, 64);
     double per_stream_frac = std::max(0.05, std::min(0.95, opt.gpu_mem_fraction / double(stream_count)));
 
@@ -22247,7 +22409,7 @@ static void gpu_worker(
     for (size_t s=0; s<stream_count; ++s) {
       StreamCtx & C = ctxs[s];
       checkCuda(cudaStreamCreate(&C.stream), "cudaStreamCreate");
-      if (opt.gds_only) {
+      if (opt.region_staged()) {
         checkCuda(cudaStreamCreate(&C.ck_stream), "cudaStreamCreate(checksum)");
         checkCuda(cudaEventCreateWithFlags(&C.ck_done, cudaEventDisableTiming),
                   "cudaEventCreate(checksum)");
@@ -22948,7 +23110,7 @@ static void gpu_worker(
         // hand the drive a queue depth of one.  The fan-out is the same shape,
         // and for the same reason, as the checksum pool it replaces: the thread
         // is parked inside a DMA either way, so the work is free.
-        if (opt.gds_only) {
+        if (opt.region_staged()) {
           for (size_t i = 0; i < C.filled; ++i) {
             const Task & t = C.batch[i];
             if (t.len() > C.gpu_chunk)
@@ -22960,6 +23122,10 @@ static void gpu_worker(
           std::atomic<bool> rd_failed{false};
           std::mutex        rd_err_m;
           std::string       rd_err;
+          auto note_rd_error = [&](std::string why) {
+            std::lock_guard<std::mutex> g(rd_err_m);
+            if (!rd_failed.exchange(true)) rd_err = std::move(why);
+          };
           // --tar frames were already ASSEMBLED in VRAM by the producer, so they
           // arrive as a staging slot rather than a file region.  Copy those in
           // device-to-device (~1 TB/s, about 16 us for a 16 MiB chunk) and read
@@ -22984,9 +23150,101 @@ static void gpu_worker(
             checkCuda(cudaStreamSynchronize(C.stream), "sync(--tar staging copies)");
 
           auto issue = [&](size_t k, size_t step) {
+            // CUDA's current device is host-thread-local.  issue(0) runs on the
+            // GPU worker, which selected device_id during bringup, but every
+            // fan-out thread starts on device 0.  --direct-stage performs its
+            // H2D from those threads, so select the slab's owning device in each
+            // one before touching C.d_in_base.
+            if (opt.direct_stage) {
+              const cudaError_t ds = cudaSetDevice(device_id);
+              if (ds != cudaSuccess) {
+                note_rd_error(std::string("cudaSetDevice(--direct-stage reader): ")
+                              + cudaGetErrorString(ds));
+                return;
+              }
+            }
             for (size_t i = k; i < C.filled; i += step) {
               const Task & t = C.batch[i];
               if (t.gds_stage >= 0) continue;          // already copied above
+              // ---- --direct-stage: O_DIRECT pread -> pinned host slot -> H2D ----
+              //
+              // This is the portable 95%.  No cuFile, so none of its four gates
+              // apply and nothing can silently downgrade: an ordinary pread
+              // either returns the bytes or it does not.
+              //
+              // THE TAIL FRAME IS THE TRAP, and it has bitten this codebase
+              // before (v0.15.63: O_DIRECT compress read failed on every input
+              // whose size was not 4096-aligned, hidden for four versions
+              // because every generated corpus is MiB-sized).  O_DIRECT requires
+              // an aligned length, the final frame is almost never aligned, so
+              // the window is rounded UP and the read is allowed to run past
+              // EOF -- the kernel simply returns fewer bytes.  What we hand the
+              // GPU is min(what arrived, what the frame actually is), and a
+              // short read below THAT is a real error rather than a tail.
+              if (opt.direct_stage) {
+                char * hp = static_cast<char *>(
+                    C.h_dstage[k % StreamCtx::DSTAGE_MAX_READERS]);
+                if (!hp) die("--direct-stage: staging slot missing for reader "
+                             + std::to_string(k));
+                const size_t want = (t.len() + 4095) & ~size_t(4095);
+                if (want > C.h_dstage_slot_bytes)
+                  die("internal error: --direct-stage frame " + std::to_string(want)
+                      + " exceeds staging slot " + std::to_string(C.h_dstage_slot_bytes));
+                size_t hgot = 0;
+                bool   rerr = false;
+                while (hgot < want) {
+                  const ssize_t r = ::pread(g_gds_input_fd, hp + hgot, want - hgot,
+                                            (off_t)t.gds_off + (off_t)hgot);
+                  if (r < 0) {
+                    if (errno == EINTR) continue;      // retriable, not a tail
+                    rerr = true; break;
+                  }
+                  if (r == 0) break;                   // EOF: rounded window only
+                  hgot += (size_t)r;
+                }
+                // GZSTD_DEBUG_DSTAGE_FAIL_FRAME=N -- force frame N's read to fail.
+                // The abort -> discard -> CPU-only rebuild this triggers is
+                // otherwise reachable only on a filesystem that accepts an
+                // O_DIRECT open and then refuses the read, which is not
+                // something a test can arrange.  Making the PROGRAM open the
+                // window is the only way to prove the warning below actually
+                // fires, rather than assuming it would.
+                {
+                  static const char * fenv = ::getenv("GZSTD_DEBUG_DSTAGE_FAIL_FRAME");
+                  if (fenv && t.seq == (uint64_t)::strtoull(fenv, nullptr, 10)) {
+                    rerr = true; errno = EIO;
+                  }
+                }
+                const size_t usable = std::min(hgot, t.len());
+                if (!rerr && usable == t.len()) {
+                  const cudaError_t cs = cudaMemcpy(
+                      static_cast<char *>(C.d_in_base) + i * C.gpu_chunk,
+                      hp, usable, cudaMemcpyHostToDevice);
+                  if (cs != cudaSuccess) {
+                    // Never throw out of a child std::thread: that calls
+                    // std::terminate instead of reaching gpu_worker's catch and
+                    // its abort -> discard -> CPU-only rebuild protocol.
+                    note_rd_error(std::string("cudaMemcpy(--direct-stage host -> slab): ")
+                                  + cudaGetErrorString(cs));
+                    return;
+                  }
+                  g_dstage_bytes.fetch_add(usable, std::memory_order_relaxed);
+                  g_dstage_frames.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                  gz_note_stage_read_failure(
+                      std::string("--direct-stage: ")
+                    + (rerr ? std::string("pread failed (") + std::strerror(errno) + ")"
+                            : "short read")
+                    + " at offset " + std::to_string((long long)t.gds_off));
+                  note_rd_error(std::string("--direct-stage: ")
+                      + (rerr ? std::string("pread failed (")
+                                + std::strerror(errno) + ")"
+                              : "short read " + std::to_string(usable))
+                      + " for " + std::to_string(t.len()) + " bytes at offset "
+                      + std::to_string((long long)t.gds_off));
+                }
+                continue;
+              }
               // GZSTD_DEBUG_GDS_FORCE_BOUNCE=1 — read this frame with an
               // ordinary pread into an aligned host buffer and push it across,
               // instead of cuFileRead.  This path's offsets and lengths are whole
@@ -23042,11 +23300,14 @@ static void gpu_worker(
                     .fetch_add(1, std::memory_order_relaxed);
               }
               if (got != (ssize_t)t.len()) {
-                std::lock_guard<std::mutex> g(rd_err_m);
-                if (!rd_failed.exchange(true))
-                  rd_err = "cuFileRead returned " + std::to_string((long long)got)
-                         + " for " + std::to_string(t.len()) + " bytes at offset "
-                         + std::to_string((long long)t.gds_off);
+                gz_note_stage_read_failure(
+                    "--gds-only: cuFileRead returned "
+                  + std::to_string((long long)got) + " at offset "
+                  + std::to_string((long long)t.gds_off));
+                note_rd_error("--gds-only: cuFileRead returned "
+                    + std::to_string((long long)got) + " for "
+                    + std::to_string(t.len()) + " bytes at offset "
+                    + std::to_string((long long)t.gds_off));
               }
             }
           };
@@ -23071,8 +23332,11 @@ static void gpu_worker(
           // Throwing here lands in gpu_worker's catch, which runs the standard
           // abort -> discard -> CPU-only rebuild.  A short read is not
           // recoverable in place: the slot holds a partial frame.
+          // rd_err already names the backend that failed (both arms prefix it),
+          // so do not prepend --gds-only here -- under --direct-stage that
+          // produced a message blaming a flag the user never passed.
           if (rd_failed.load())
-            throw std::runtime_error("--gds-only: " + rd_err);
+            throw std::runtime_error(rd_err);
         } else {
           const size_t ck_threads = std::min<size_t>(C.filled, 8);
           std::vector<std::thread> ck_workers;
@@ -23148,7 +23412,7 @@ static void gpu_worker(
         // those sizes — and both are on C.stream, which is what orders them.
         // The readback lands in the same h_checksums the drain already stamps
         // from, so nothing downstream changes.
-        if (opt.gds_only) {
+        if (opt.region_staged()) {
           // OVERLAPPED, NOT SEQUENCED.  On C.stream this kernel sat between the
           // staging and the compressor, and it is not cheap: its wall time is set
           // by the chunk size alone, so at the ~5-frame batches a disk-bound
@@ -23197,7 +23461,7 @@ static void gpu_worker(
         // the input was staged.  Join it now that the compressor is enqueued:
         // both read d_in_base and neither writes it, so they overlap, and the
         // drain that stamps h_checksums is ordered after both.
-        if (opt.gds_only)
+        if (opt.region_staged())
           checkCuda(cudaStreamWaitEvent(C.stream, C.ck_done, 0),
                     "cudaStreamWaitEvent(compress <- checksum)");
         cudaEventRecord(C.ev_comp_end, C.stream);
@@ -23646,6 +23910,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Before ANY task is queued -- see the function's own note for why the order
   // is the point rather than a detail.
   gds_preflight_or_die(opt);
+  // Reset UNCONDITIONALLY, not under a backend gate: these are process globals
+  // and a multi-file run would otherwise let one file's staged-read failure
+  // relabel the next file's genuine GPU fault.
+  {
+    std::lock_guard<std::mutex> g(g_stage_read_err_m);
+    g_stage_read_failed.store(false, std::memory_order_relaxed);
+    g_stage_read_err.clear();
+  }
+  g_dstage_bytes.store(0, std::memory_order_relaxed);
+  g_dstage_frames.store(0, std::memory_order_relaxed);
   if (opt.gds_only) {
     // Process-global diagnostics, but the report below is per output file.
     g_gds_frames_p2p.store(0, std::memory_order_relaxed);
@@ -24180,11 +24454,18 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // NOT in --tar mode: there the assembler is the producer and composes frames
   // in the staging pool, so this branch must not claim the input first (it did,
   // and reported a pipe that was never involved).
-  if (!reader_done && opt.gds_only && !opt.tar_mode) {
+  if (!reader_done && opt.region_staged() && !opt.tar_mode) {
+    // ONE PRODUCER, TWO BACKENDS.  Everything from here to the queue push is
+    // identical for --gds-only and --direct-stage: both need the same verified
+    // O_DIRECT descriptor and both emit the same region-naming Tasks.  Only the
+    // cuFile registration below is conditional, and only the GPU worker's
+    // per-frame transfer differs.  FLAG names the one the user actually typed,
+    // so no message ever blames a flag they did not pass.
+    const char * FLAG = opt.gds_only ? "--gds-only" : "--direct-stage";
     if (opt.input == "-")
-      die_usage("--gds-only needs a seekable file: GPUDirect Storage reads by offset "
-                "from a registered file handle, which a pipe cannot provide.  This is "
-                "what `tar -I \'gzstd --gds-only\'` and any shell pipe hit");
+      die_usage(std::string(FLAG) + " needs a seekable file: it reads by offset "
+                "from a file descriptor, which a pipe cannot provide.  This is "
+                "what `tar -I \'gzstd " + FLAG + "\'` and any shell pipe hit");
     // O_DIRECT IS REQUIRED, NOT AN OPTIMISATION.  cuFile refuses the
     // peer-to-peer path on a buffered descriptor and would quietly fall back to
     // reading through the page cache — same bytes, none of the point.
@@ -24193,33 +24474,44 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // the caller's buffered FILE*; unlike opening opt.input, it cannot resolve a
     // substituted name.  The held descriptor, not a pathname, selects the inode.
     if (!in || ::fileno(in) < 0)
-      die("--gds-only: the input has no descriptor to register");
+      die(std::string(FLAG) + ": the input has no descriptor to read by offset");
     char fd_link[64];
     std::snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%d", ::fileno(in));
     const int fd = ::open(fd_link, O_RDONLY | O_DIRECT | O_CLOEXEC);
     if (fd < 0)
-      die(std::string("--gds-only: cannot reopen the verified input with O_DIRECT: ")
+      die(std::string(FLAG) + ": cannot reopen the verified input with O_DIRECT: "
           + std::strerror(errno));
     struct stat st{};
-    if (::fstat(fd, &st) != 0) { ::close(fd); die("--gds-only: fstat failed on " + opt.input); }
+    if (::fstat(fd, &st) != 0) { ::close(fd); die(std::string(FLAG) + ": fstat failed on " + opt.input); }
     if (!S_ISREG(st.st_mode)) {
       ::close(fd);
-      die("--gds-only needs a regular file; " + opt.input + " is not one");
+      die(std::string(FLAG) + " needs a regular file; " + opt.input + " is not one");
     }
-    std::string why;
-    if (!g_gds_input.open(fd, &why)) {
-      ::close(fd);
-      die("--gds-only: " + why);
+    if (opt.gds_only) {
+      std::string why;
+      if (!g_gds_input.open(fd, &why)) {
+        ::close(fd);
+        die("--gds-only: " + why);
+      }
+      g_gds_bar1_before = gz_nvfs_bar1_ok();
     }
     g_gds_input_fd = fd;              // closed after the workers join
-    g_adapt_src_path.store("gds", std::memory_order_relaxed);
-    const uint64_t bar1_before = gz_nvfs_bar1_ok();
-    g_gds_bar1_before = bar1_before;
+    // Distinct read-path keys: --adapt compares paths measured on THIS box, and
+    // filing the portable path under the peer-to-peer one would let a run that
+    // never touched cuFile teach the profile about a backend it did not use.
+    g_adapt_src_path.store(opt.gds_only ? "gds" : "dstage", std::memory_order_relaxed);
+    g_dstage_bytes.store(0, std::memory_order_relaxed);
+    g_dstage_frames.store(0, std::memory_order_relaxed);
     if (opt.verbosity >= V_VERBOSE) {
       char b[256];
-      std::snprintf(b, sizeof(b),
-        "[GDS] %s registered with cuFile; %.1f MiB in %zu MiB frames\n",
-        opt.input.c_str(), double(st.st_size) / 1048576.0, gpu_chunk / ONE_MIB);
+      if (opt.gds_only)
+        std::snprintf(b, sizeof(b),
+          "[GDS] %s registered with cuFile; %.1f MiB in %zu MiB frames\n",
+          opt.input.c_str(), double(st.st_size) / 1048576.0, gpu_chunk / ONE_MIB);
+      else
+        std::snprintf(b, sizeof(b),
+          "[DSTAGE] %s opened O_DIRECT; %.1f MiB in %zu MiB frames, staged host -> VRAM\n",
+          opt.input.c_str(), double(st.st_size) / 1048576.0, gpu_chunk / ONE_MIB);
       vlog(V_VERBOSE, opt, b);
     }
     const uint64_t file_size = (uint64_t)st.st_size;
@@ -24617,6 +24909,27 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       std::snprintf(b, sizeof(b),
         "[GDS] %llu aligned transfers, 0 unaligned; nvidia-fs Bar1-map ok "
         "%llu -> %llu\n", (unsigned long long)p2p, g_gds_bar1_before, b1);
+      vlog(V_VERBOSE, opt, b);
+    }
+  } else if (opt.direct_stage) {
+    // The descriptor is opened by the SAME producer branch, so it has to be
+    // closed on this side too -- it lived under the gds_only arm alone and would
+    // otherwise leak one fd per run.
+    if (g_gds_input_fd >= 0) { ::close(g_gds_input_fd); g_gds_input_fd = -1; }
+    if (opt.verbosity >= V_VERBOSE) {
+      char b[192];
+      // EXACT BYTES, not just MiB.  A failed O_DIRECT read throws, and the throw
+      // lands in the standard abort -> discard -> CPU-only rebuild, so the
+      // archive comes out byte-identical at exit 0 whether this path ran or
+      // silently gave up -- the same shape as the --gds-only compat fallback.
+      // Rounded MiB cannot tell 4095 staged bytes from 0; the byte count can,
+      // and it is what a caller compares against the input size to know the
+      // portable path actually carried the whole file.
+      std::snprintf(b, sizeof(b),
+        "[DSTAGE] %llu frames, %llu bytes (%.1f MiB) staged O_DIRECT host -> VRAM (no cuFile)\n",
+        (unsigned long long)g_dstage_frames.load(std::memory_order_relaxed),
+        (unsigned long long)g_dstage_bytes.load(std::memory_order_relaxed),
+        double(g_dstage_bytes.load(std::memory_order_relaxed)) / 1048576.0);
       vlog(V_VERBOSE, opt, b);
     }
   }
@@ -29156,7 +29469,10 @@ static int gzstd_main(int argc, char ** argv)
               "  The compressed bytes are CORRUPT; do not use them.  Re-run with\n"
               "  regular files for input and output so --verify can recover.", EXIT_DATA);
         }
-        die(std::string("a GPU faulted during compression and the ")
+        die(std::string(g_stage_read_failed.load(std::memory_order_relaxed)
+                          ? "the staged input read failed during compression ("
+                            + gz_stage_read_reason() + ") and the "
+                          : "a GPU faulted during compression and the ")
             + (!in_rebuildable ? "input" : "output")
             + " is a pipe/stream — the partial output cannot be discarded and\n"
             "  rebuilt on the CPU, and a faulted GPU's output is NOT trustworthy.\n"
@@ -29192,6 +29508,19 @@ static int gzstd_main(int argc, char ** argv)
           const int64_t bad = g_verify_failed_seq.load(std::memory_order_relaxed);
           if (bad >= 0) os << " (sequence " << bad << ")";
           os << " — discarding output and rebuilding CPU-only";
+        } else if (g_stage_read_failed.load(std::memory_order_relaxed)) {
+          // Storage, not silicon -- shown by naming the error, not by arguing
+          // with the reader about what it is not.
+          //
+          // EVERY BRANCH HERE MUST END MID-SENTENCE: the shared suffix below
+          // appends " from the original input (attempt N)...", so a branch that
+          // closes its own sentence produces a garbled one.  The first version
+          // of this branch ended with "Re-run without it to skip the retry" and
+          // printed "...skip the retry from the original input (attempt 1)...".
+          const std::string why = gz_stage_read_reason();
+          os << "WARNING: " << (why.empty() ? std::string("the staged input read failed") : why)
+             << "\n  Input I/O or filesystem error.  Attempting recovery with a "
+                "CPU-only rebuild";
         } else {
           os << "WARNING: a GPU faulted — discarding output and rebuilding CPU-only";
         }
@@ -29984,7 +30313,8 @@ static int gzstd_main(int argc, char ** argv)
 // abort with no exit code the caller can act on.
 int main(int argc, char ** argv)
 {
-  // Tears the cuFile driver down before exit() runs the loader's finalizers.
+  // Tears the cuFile driver down before exit() runs the loader's finalizers, on
+  // the paths that unwind -- see GzGdsDriverGuard for the ones that do not.
   // HAVE_NVCOMP-guarded: the whole cuFile loader lives inside that block, so an
   // unguarded declaration here does not compile in the CPU-only build.
 #ifdef HAVE_NVCOMP
@@ -30577,8 +30907,9 @@ static void apply_backend_defaults(Options & opt)
   //   * Scheduler EMA seeds: consumed by the HybridSched constructor
   //     (samples seed to 1 — one live tick before any refusal can latch).
   if (priors.gpu_valid) {
-    const double batch_prior = opt.gds_only ? prior_dir.settled_batch_gds
-                                            : prior_dir.settled_batch;
+    const double batch_prior = opt.gds_only     ? prior_dir.settled_batch_gds
+                             : opt.direct_stage ? prior_dir.settled_batch_dstage
+                                                : prior_dir.settled_batch;
     if (!opt.gpu_batch_user_set && batch_prior >= 1) {
       // Clamp before the cast: a foreign/hand-edited profile can legally
       // carry any finite double, and double->size_t above the type's range
@@ -30587,7 +30918,7 @@ static void apply_backend_defaults(Options & opt)
       opt.gpu_batch_cap = settled;
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, std::string("[ADAPT] ")
-             + (opt.gds_only ? "GDS " : "")
+             + (opt.gds_only ? "GDS " : opt.direct_stage ? "direct-stage " : "")
              + "GPU batch starts at the profile's settled "
              + std::to_string(settled) + " (tuner still explores)\n");
     }
@@ -31721,6 +32052,11 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--gds-only") {
       opt.gds_only = true; opt.gpu_only = true; opt.backend_user_set = true;
     }
+    // Same reason --gds-only implies --gpu-only: the Task names a file region and
+    // carries no host bytes, so there is nothing for a CPU worker to compress.
+    else if (a == "--direct-stage") {
+      opt.direct_stage = true; opt.gpu_only = true; opt.backend_user_set = true;
+    }
     else if (parse_num_arg("gpu-batch", i, argc, argv, opt.gpu_batch_cap)) { opt.gpu_batch_user_set = true; opt.gpu_hybrid_tuning_seen = true; }
     else if (parse_double_arg("gpu-mem-frac", i, argc, argv, opt.gpu_mem_fraction)) {
       // Reject obvious nonsense; warn-and-clamp the soft bounds so existing
@@ -31784,6 +32120,10 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--gds-only")
       die_usage("this binary was built without nvCOMP; --gds-only cannot be "
                 "satisfied (rebuild with USE_NVCOMP=ON, or use --cpu-only)");
+    else if (a == "--direct-stage")
+      die_usage("this binary was built without nvCOMP; --direct-stage cannot be "
+                "satisfied (it stages into GPU memory; rebuild with "
+                "USE_NVCOMP=ON, or use --cpu-only --direct-read)");
     else if (parse_num_arg("gpu-batch", i, argc, argv, ignored_sz))     { cpu_build_ignored_gpu_flag = true; }
     else if (parse_double_arg("gpu-mem-frac", i, argc, argv, ignored_d)) { cpu_build_ignored_gpu_flag = true; }
     else if (parse_num_arg("gpu-streams", i, argc, argv, ignored_sz))   { cpu_build_ignored_gpu_flag = true; }
@@ -32085,7 +32425,12 @@ static Options parse_args(int argc, char ** argv)
   // checksum's throughput is ~0.28 GiB/s PER FRAME IN THE BATCH, so a 5.6-frame
   // batch hashes at ~1.6 GiB/s and cost ~55 ms every batch. Registering 64 slots
   // and then filling 8 of them was the worst of both.
-  if (opt.gds_only && opt.mode == Mode::COMPRESS && !opt.gpu_batch_user_set
+  // The 64 floor is set by the DEVICE XXH64 kernel, whose throughput scales with
+  // the frame count -- not by cuFile -- so it applies to --direct-stage for
+  // exactly the same reason.  STILL A MACHINE-TUNED CONSTANT: 64 comes from this
+  // box's 0.28 GiB/s-per-frame checksum against a 4.9 GiB/s drive, and remains
+  // the open [[feedback_code_to_general_goals]] item recorded for --gds-only.
+  if (opt.region_staged() && opt.mode == Mode::COMPRESS && !opt.gpu_batch_user_set
       && opt.gpu_batch_cap < 64)
     opt.gpu_batch_cap = 64;
   // Decompress benefits massively from large batches  nvCOMP kernel launch
@@ -32118,7 +32463,7 @@ static Options parse_args(int argc, char ** argv)
     // registers its own input slab into BAR1 (MEASURED ~490 ms for 1 GiB), and
     // this path is disk-bound at ~4.9 GiB/s, so the second stream buys no
     // overlap the drive can use and doubles the startup cost.
-    opt.gpu_streams = opt.gds_only ? 1
+    opt.gpu_streams = opt.region_staged() ? 1
                     : (opt.mode == Mode::DECOMPRESS)
                         ? DEFAULT_GPU_DECOMP_STREAMS : DEFAULT_GPU_STREAMS;
   }
@@ -32197,6 +32542,29 @@ static Options parse_args(int argc, char ** argv)
   if (opt.gds_only && (opt.cpu_only || opt.hybrid))
     die_usage("--gds-only cannot be combined with --cpu-only or --hybrid: the data "
               "lands in VRAM and is never available to a CPU worker");
+  if (opt.direct_stage && (opt.cpu_only || opt.hybrid))
+    die_usage("--direct-stage cannot be combined with --cpu-only or --hybrid: the "
+              "frame is staged into VRAM and is never available to a CPU worker");
+  // Both name the same slab and the same Task shape, so one run cannot be both.
+  // Say which one to drop rather than silently preferring either.
+  if (opt.direct_stage && opt.gds_only)
+    die_usage("--direct-stage and --gds-only cannot be combined: both stage the "
+              "input into the GPU slab and differ only in how the bytes get "
+              "there.  Use --gds-only for peer-to-peer DMA where the hardware "
+              "supports it, --direct-stage for the portable O_DIRECT path");
+  // COMPRESS ONLY, and not --tar.  The decompress direction of --gds-only writes
+  // VRAM -> NVMe through cuFile, which has no O_DIRECT-from-VRAM equivalent to
+  // stand in for; --tar create composes frames in a registered staging pool that
+  // is likewise cuFile-specific.  Both are reachable later; neither is wired now,
+  // and accepting the flag while ignoring it is the worst of the three options.
+  if (opt.direct_stage && opt.mode != Mode::COMPRESS)
+    die_usage("--direct-stage applies to compression only: it stages input frames "
+              "into GPU memory, and the decompress direction has no equivalent "
+              "O_DIRECT write out of VRAM");
+  if (opt.direct_stage && opt.tar_mode)
+    die_usage("--direct-stage cannot be combined with --tar: the tar assembler "
+              "composes each frame from many member extents rather than reading "
+              "one contiguous region of one file");
   // --tar CREATION is supported since v0.17.3: the members are ordinary files on
   // disk, so the assembler composes each frame in registered VRAM -- cuFileRead
   // for member extents, a small copy for the headers it synthesises.
@@ -32247,6 +32615,13 @@ static Options parse_args(int argc, char ** argv)
                 "another device cannot read them");
     if (opt.gpu_devices == 0) opt.gpu_devices = 1;
   }
+  // --direct-stage defaults to ONE device, for the reason --gds-only does: the
+  // drive sets the pace (this box reads ~4.9 GiB/s and one H100 compresses well
+  // past that), so extra devices buy nothing and are not free -- cuInit charges
+  // roughly 950 ms plus 250 ms per VISIBLE device, and each device carries its
+  // own set of pinned staging slots (8 x the frame size). An explicit
+  // --gpu-devices still wins, so the choice is a default and not a limit.
+  if (opt.direct_stage && opt.gpu_devices == 0) opt.gpu_devices = 1;
 #endif
   if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die_usage("--gpu-only cannot be combined with --cpu-only or --hybrid");
   if (opt.cpu_only && opt.hybrid) die_usage("--cpu-only cannot be combined with --hybrid");

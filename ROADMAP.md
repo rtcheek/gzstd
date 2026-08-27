@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.17.8
+**Current version:** v0.17.9
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -121,12 +121,13 @@ device holds the `StreamCtx` ~100 ms/batch against ~25 ms of submit, so extra st
 - **Do not use a staging slab THAT ADDS A COPY.** Tried at v0.16.2, **26% slower** (3.25 → 2.40),
   reverted; see the CHANGELOG. It adds a ~160 MiB host memcpy per batch, and *any design that adds
   a host-side copy loses here* — the transfer was never the expensive part.
-  **READ THE QUALIFIER BEFORE CITING THIS ROW.** It rules out slab-plus-copy, not slabs. The
-  proposed `--direct-stage` (v0.17.7 follow-on) is the opposite shape: an O_DIRECT pread landing
-  **directly** in the pinned staging slab, with no intervening copy at all. v0.17.7 measured that
-  arm at **4.05–4.19 s host CPU against the ordinary reader's 7.55–7.79** — it is where 95% of the
-  whole `--gds-only` win actually comes from, and it needs none of GDS's four platform gates. This
-  row is not evidence against it.
+  **READ THE QUALIFIER BEFORE CITING THIS ROW.** It rules out slab-plus-copy, not slabs.
+  `--direct-stage` (SHIPPED v0.17.9) is the opposite shape: an O_DIRECT pread landing **directly**
+  in the pinned staging slab, with no intervening copy at all. Measured at v0.17.9, one device on
+  every arm, five cold runs: **host CPU 3.69–3.87 s against the ordinary reader's 6.18–7.06** (~44%
+  less), and against `--gds-only`'s 4.59–4.77 — **it beats peer-to-peer**, because it pays no
+  `cuFileBufRegister` and carries no cuFile per read. All ranges non-overlapping. This row was
+  never evidence against it.
 - **The hard part is ownership, not CUDA.** `FrameVec` buffers are `shared_ptr`s held by the
   writer for arbitrary time, and any `resize()` past capacity reallocates and **silently
   invalidates the registration**. Every pooled buffer must be reserved to `max_out_chunk + 4`
@@ -138,6 +139,32 @@ device holds the `StreamCtx` ~100 ms/batch against ~25 ms of submit, so extra st
 Also still unbound: `--acls/--xattrs` metadata gathering reopens the path, and the H2D content
 checksum is now parallelised but still host-side (a GPU-side XXH64 is awkward — the algorithm is
 sequential across stripes, so only ~4 lanes × chunks of parallelism).
+
+## SHIPPED v0.17.9: `--direct-stage` — and what is left of the GDS chapter
+
+The portable 95% of `--gds-only` now exists as its own flag, so a host with a GPU and an NVMe no
+longer needs a resizable-BAR card, nvidia-fs, a cuFile-approved filesystem and an un-regressed
+kernel to get most of the benefit. That reframes the remaining GDS work: peer-to-peer DMA is worth
+roughly 5%, the four gates buy only that, and effort spent opening them on new hosts is
+correspondingly hard to justify.
+
+**Open, in rough order of value:**
+
+1. **`--direct-stage` for `--tar` create.** The tar assembler composes each frame from many member
+   extents, so it needs the aligned-window read v0.17.7 added on the cuFile side rather than one
+   contiguous pread. This is the case that would actually help archives of large media, and unlike
+   `--tar --gds-only` it would not be defeated by the 512-byte header knocking every member off the
+   4 KiB grid — a host read has no alignment requirement beyond the block size.
+2. **The 64-frame batch floor is still a machine-tuned constant** — it comes from this box's
+   0.28 GiB/s-per-frame device checksum against a 4.9 GiB/s drive, and now applies to two backends
+   instead of one. Unchanged `feedback_code_to_general_goals` violation; derive it from the measured
+   checksum rate and device rate instead.
+3. **Decompress has no equivalent.** `--gds-only` writes VRAM to NVMe through cuFile; there is no
+   O_DIRECT write out of VRAM, so the portable path stops at compression. Whether a D2H-into-pinned
+   plus O_DIRECT-pwrite arrangement beats the ordinary writer is unmeasured.
+4. **Second-machine validation.** Everything above is measured on one host. `--direct-stage` is
+   specifically the feature that *should* work on the workstation, which can never run `--gds-only`
+   at all — that is the whole point, and it has not been run there.
 
 ## Known external defect: libcufile segfaults at exit when dlopen'd with stats on
 
