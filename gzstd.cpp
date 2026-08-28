@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.13";
+static constexpr const char * GZSTD_VERSION = "0.17.14";
 //
 // Architecture overview:
 //
@@ -25577,11 +25577,24 @@ static void gpu_decomp_worker(
     size_t * d_comp_sizes = nullptr;
     size_t * d_decomp_sizes = nullptr;
     size_t * d_actual_sizes = nullptr;
+    // CONTENT-CHECKSUM VERIFICATION.  nvCOMP reports a status and a produced
+    // size, and gzstd checks both -- but neither sees WRONG BYTES OF THE RIGHT
+    // LENGTH, which is exactly what a payload bit flip produces: the frame
+    // header declares the size, nvCOMP emits that many bytes, and both checks
+    // pass.  Measured before this existed: 41 of 41 single-bit flips in a frame
+    // payload decoded "successfully" on the GPU while the CPU path and stock
+    // zstd both rejected them -- so `-d --gpu-only` wrote corrupt output at
+    // exit 0 and `-t --gpu-only` reported OK.  The CPU path gets this free from
+    // ZSTD_decompressStream; the GPU path never had an equivalent.
+    unsigned int * d_verify_ck = nullptr;
     nvcompStatus_t * d_statuses = nullptr;
 
     // Host-side arrays
     std::vector<void*> h_comp_ptrs, h_decomp_ptrs;
     std::vector<size_t> h_comp_sizes, h_decomp_sizes, h_actual;
+    std::vector<unsigned int> h_verify_ck;    // recomputed, device-side
+    std::vector<unsigned int> h_expect_ck;    // from each frame's trailer
+    std::vector<unsigned char> h_has_ck;      // frame carries a content checksum
     std::vector<nvcompStatus_t> h_statuses;
 
     // Pinned host buffer for D2H decompressed output (faster cudaMemcpy
@@ -25638,6 +25651,7 @@ static void gpu_decomp_worker(
       if (d_comp_sizes)  { cudaFree(d_comp_sizes);   d_comp_sizes = nullptr; }
       if (d_decomp_sizes){ cudaFree(d_decomp_sizes); d_decomp_sizes = nullptr; }
       if (d_actual_sizes){ cudaFree(d_actual_sizes); d_actual_sizes = nullptr; }
+      if (d_verify_ck)   { cudaFree(d_verify_ck);    d_verify_ck = nullptr; }
       if (d_statuses)    { cudaFree(d_statuses);     d_statuses = nullptr; }
       alloc_batch = 0; alloc_comp = 0; alloc_decomp = 0; temp_bytes = 0;
     }
@@ -25696,6 +25710,7 @@ static void gpu_decomp_worker(
       if (cudaMalloc(&d_decomp_sizes, batch_n * sizeof(size_t))  != cudaSuccess) return false;
       if (cudaMalloc(&d_actual_sizes, batch_n * sizeof(size_t))  != cudaSuccess) return false;
       if (cudaMalloc(&d_statuses,     batch_n * sizeof(nvcompStatus_t)) != cudaSuccess) return false;
+      if (cudaMalloc(&d_verify_ck,    batch_n * sizeof(unsigned int)) != cudaSuccess) return false;
       if (needed_temp > 0) {
         if (cudaMalloc(&d_temp, needed_temp) != cudaSuccess) return false;
         temp_bytes = needed_temp;
@@ -25719,6 +25734,9 @@ static void gpu_decomp_worker(
       h_decomp_sizes.resize(batch_n);
       h_actual.resize(batch_n);
       h_statuses.resize(batch_n);
+      h_verify_ck.resize(batch_n);
+      h_expect_ck.resize(batch_n);
+      h_has_ck.resize(batch_n);
       return true;
     }
   };
@@ -26299,6 +26317,23 @@ static void gpu_decomp_worker(
           h2d_bytes_batch += C.batch[i].len();
           C.h_comp_sizes[i]   = C.batch[i].len();
           C.h_decomp_sizes[i] = C.batch[i].decomp_size;
+          // The expected content checksum, read off the frame while it is still
+          // on the host.  Byte 4 of a zstd frame header is the Frame Header
+          // Descriptor; bit 2 (0x04) is Content_Checksum_flag, and when it is set
+          // the frame's last four bytes are XXH64(content) truncated to 32 bits,
+          // little-endian.  A frame without the flag cannot be verified this way.
+          {
+            const unsigned char * fp = (const unsigned char *)C.batch[i].ptr();
+            const size_t fl = C.batch[i].len();
+            C.h_has_ck[i] = 0; C.h_expect_ck[i] = 0;
+            if (fp && fl >= 9 && (fp[4] & 0x04)) {
+              C.h_has_ck[i] = 1;
+              C.h_expect_ck[i] = (unsigned int)fp[fl-4]
+                               | ((unsigned int)fp[fl-3] << 8)
+                               | ((unsigned int)fp[fl-2] << 16)
+                               | ((unsigned int)fp[fl-1] << 24);
+            }
+          }
         }
 
         // Upload size arrays (async)
@@ -26431,6 +26466,17 @@ static void gpu_decomp_worker(
         checkCuda(cudaMemcpyAsync(C.h_actual.data(), C.d_actual_sizes,
                                   C.filled * sizeof(size_t),
                                   cudaMemcpyDeviceToHost, C.stream), "D2H actual sizes");
+        // Recompute each frame's content checksum ON THE DEVICE, over the bytes
+        // nvCOMP just produced.  d_actual_sizes is already the per-frame length
+        // array the kernel wants, and the output frames sit at a uniform stride,
+        // so this is one launch per batch and no extra host traffic.  Ordered on
+        // C.stream after the decompress, and read back with the other metadata.
+        gzx_launch_xxh64(C.d_decomp_buf, C.alloc_decomp, C.d_actual_sizes,
+                         C.filled, C.d_verify_ck, C.stream);
+        checkCuda(cudaGetLastError(), "gzx_xxh64 launch (decompress verify)");
+        checkCuda(cudaMemcpyAsync(C.h_verify_ck.data(), C.d_verify_ck,
+                                  C.filled * sizeof(unsigned int),
+                                  cudaMemcpyDeviceToHost, C.stream), "D2H verify checksums");
         checkCuda(cudaStreamSynchronize(C.stream), "D2H meta sync");
 
         float batch_ms = 0;
@@ -26463,6 +26509,35 @@ static void gpu_decomp_worker(
                 + std::to_string(C.batch[i].decomp_size)
                 + " bytes, nvCOMP produced " + std::to_string(actual)
                 + " (corrupt input?)");
+          // CONTENT CHECK.  The two guards above see structure and length; only
+          // this one sees the BYTES.  Wrong-but-right-length output passed both
+          // of them, so a corrupt archive decompressed to garbage at exit 0.
+          // Throwing takes the same route as a size mismatch: the undelivered
+          // tail is re-enqueued and a CPU worker re-decodes it, which either
+          // succeeds (transient device glitch) or dies with a zstd data error,
+          // matching CPU-only and stock zstd.
+          // DIE, DO NOT THROW.  A size mismatch can be a transient device fault,
+          // so that one throws and lets another worker (or the CPU pool) retry.
+          // A CONTENT-CHECKSUM MISMATCH IS DETERMINISTIC: the same bytes hash the
+          // same way on every device, so a retry cannot change the answer, and
+          // routing it through the fault machinery is both pointless and unsafe.
+          // Unsafe because that path re-enqueues the frame for "another GPU to
+          // pick up" and only runs the CPU fallback once fails == gpu_worker_count
+          // -- with several devices the workers that never touched the bad frame
+          // exit cleanly, the count never completes, and the re-enqueued frame
+          // has no consumer.  Measured: --gpu-only on 8 devices ended in
+          // "internal error: writer stuck" and exit 1, while the same archive on
+          // one device or under --hybrid correctly reported a data error.
+          //
+          // EXIT_DATA matches the CPU path, stock zstd, and this project's own
+          // exit table (4 = corrupt input / integrity failure).
+          if (C.h_has_ck[i] && C.h_verify_ck[i] != C.h_expect_ck[i])
+            die("content-checksum mismatch at frame "
+                + std::to_string(batch_seqs[i]) + ": the frame declares "
+                + std::to_string(C.h_expect_ck[i]) + " but the decoded bytes hash to "
+                + std::to_string(C.h_verify_ck[i])
+                + " -- the archive is corrupt, or this GPU decoded it incorrectly."
+                + "  Re-run with --cpu-only to tell the two apart.", EXIT_DATA);
           out_sum += actual;
           d2h_bytes_batch += actual;
 

@@ -1,12 +1,68 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.13  
+**Covers:** v0.9.50 → v0.17.14  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.14 — GPU decompress never checked the content checksum, and wrote corrupt output at exit 0
+
+`gzstd -d --gpu-only` on a bit-rotted archive produced wrong bytes and exited 0. `gzstd -t
+--gpu-only` on the same archive reported OK. This is present in tagged v0.17.11 and every release
+before it, and has nothing to do with the peer-to-peer work; it was found while establishing a
+baseline for a device-side verification feature.
+
+The GPU path checked two things: nvCOMP's per-chunk status, and the produced size against the
+header-declared size. **Neither can see wrong bytes of the right length** — the frame header
+declares the size, nvCOMP emits exactly that many bytes, and both checks pass. The CPU path gets
+content-checksum validation free from `ZSTD_decompressStream`; the GPU path never had an equivalent.
+
+Measured with single-bit flips in a frame payload:
+
+| | exit | result |
+|---|---|---|
+| `-d --cpu-only` | 4 | correctly rejected |
+| stock `zstd -d` | 1 | `Restored data doesn't match checksum` |
+| **`-d --gpu-only`** | **0** | **67,108,864 bytes, differing at byte 50,770** |
+
+**41 of 41 offsets tried.** It is not a corner case; it is the normal outcome for payload
+corruption. `--hybrid` and the default path happened to catch it here only because frames that land
+on CPU workers are checked — on a machine where the GPU takes every frame, nothing is.
+
+Each frame's XXH64 is now recomputed **on the device** over the bytes nvCOMP produced, and compared
+against the checksum in the frame trailer. `d_actual_sizes` is already the per-frame length array
+the kernel needs and output frames sit at a uniform stride, so this is one launch per batch with no
+extra host traffic. The expected value is read while the compressed frame is still on the host,
+gated on the Content_Checksum_flag; frames without it are left alone rather than falsely reported
+as verified.
+
+### Why it dies rather than throwing, and the pre-existing bug that decided it
+
+The neighbouring size-mismatch check throws, which re-enqueues the frame so another worker can
+retry — correct there, because a size mismatch can be a transient device fault. **A content-checksum
+mismatch is deterministic**: the same bytes hash the same way on every device, so a retry cannot
+change the answer.
+
+Routing it through that machinery is also unsafe. The fault path re-enqueues the frame and runs the
+CPU fallback only once `fails == gpu_worker_count`; with eight devices, the workers that never
+touched the bad frame exit cleanly, the count never completes, and the re-enqueued frame has no
+consumer. Observed: `--gpu-only` across eight devices ended in `internal error: writer stuck` and
+exit 1, while the same archive on one device or under `--hybrid` correctly reported a data error.
+So the mismatch now calls `die(..., EXIT_DATA)`, which matches the CPU path, stock zstd, and this
+project's own exit table.
+
+**That multi-GPU fallback gap is a separate, pre-existing defect and is NOT fixed here.** Any
+deterministic per-frame GPU failure under `--gpu-only` with several devices can wedge the same way.
+It has never surfaced because nothing produced one. It needs its own change and its own testing.
+
+### Verified
+
+Clean archives pass and corrupt archives report exit 4 under `--cpu-only`, `--hybrid`,
+`--gpu-only --gpu-devices=1` and `--gpu-only` alike; `-d` writes no output rather than corrupt
+output; 41 of 41 corruptions detected.
 
 ## v0.17.13 — the review of v0.17.12 found a corrupt archive behind an ordinary flag
 
