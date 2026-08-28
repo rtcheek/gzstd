@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.11";
+static constexpr const char * GZSTD_VERSION = "0.17.12";
 //
 // Architecture overview:
 //
@@ -628,6 +628,45 @@ static std::atomic<uint64_t> g_gds_out_total{0};
 // gets a vote in (see the alignment preflight).  Workers read it to choose their
 // delivery path, so it must be settled before any worker starts.
 static std::atomic<bool>     g_gds_out_active{false};
+
+/*======================================================================
+ PURE PEER-TO-PEER COMPRESS OUTPUT  (--gds-only compress)
+ -----------------------------------------------------------------------
+ NVMe -> VRAM -> compress -> VRAM -> NVMe, with no payload byte in host RAM.
+ The read half already worked; this is the write half, which used to D2H every
+ frame into a pinned slot and hand it to the ordinary writer.
+
+ HOW THE ALIGNMENT PROBLEM IS AVOIDED, because it is the reason this could not
+ be done per frame.  cuFileWrite routes peer-to-peer only when file offset,
+ device offset and length are all 4 KiB aligned; compressed frames are variable
+ length, so writing them individually at packed offsets would leave nearly every
+ one misaligned and cuFile would silently bounce it through host memory --
+ correct bytes, none of the point.  So frames are PACKED CONTIGUOUSLY into one
+ device buffer and flushed in whole 4 KiB multiples: one aligned write covering
+ many frames.  The sub-block remainder is carried to the front and joins the
+ next flush.  The output is byte-identical to the ordinary path -- no padding
+ frames, no format change.
+
+ ORDERING is the other constraint: a frame's file offset depends on every
+ preceding frame's length.  --gds-only already pins itself to one device and one
+ stream, so drains arrive in sequence order; the mutex makes that explicit and
+ the seq check asserts it rather than trusting it.
+======================================================================*/
+static GdsFile               g_gds_cout;              // cuFile handle, compress output
+static int                   g_gds_cout_fd = -1;
+static std::atomic<bool>     g_gds_cout_active{false};
+static std::mutex            g_gds_cout_m;            // serialises pack/flush + offset
+static uint64_t              g_gds_cout_off = 0;      // bytes COMMITTED (always 4 KiB multiple)
+static uint64_t              g_gds_cout_logical = 0;  // true file length, incl. the partial tail
+static uint64_t              g_gds_cout_next_seq = 0; // sequence-order assertion
+static std::atomic<uint64_t> g_gds_cout_writes{0};    // aligned cuFileWrite count
+static std::atomic<uint64_t> g_gds_cout_bytes{0};
+// The peer-to-peer path bypasses the writer thread, which is what normally
+// advances the progress meter.  gpu_drain_batch has no Meter parameter, so the
+// one owner (compress_nvcomp) publishes it here for the duration of the run.
+// Forward-declared: Meter is defined well below this block.
+struct Meter;
+static Meter *               g_gds_cout_meter = nullptr;
 
 // A device buffer registered with cuFile.  Registration is what pins the GPU
 // memory into BAR1 so the NVMe can target it; skipping it makes every transfer
@@ -7237,6 +7276,17 @@ public:
   // Finalize: enqueue the last partial buffer (aligned body O_DIRECT + sub-ALIGN
   // tail without O_DIRECT, handled in writer_loop), drain and join the write
   // thread, then truncate off any preallocation slack.
+  // THE PEER-TO-PEER OUTPUT PATH WROTE THIS FILE ITSELF.  --gds-only compress
+  // bypasses this writer entirely and has already ftruncate'd the output to its
+  // exact length, so finalize() must not then apply its own --preallocate trim:
+  // logical_written_ is 0 here because nothing went through the writer, and the
+  // trim would cut a complete archive back to ZERO BYTES and still exit 0.
+  // Measured doing exactly that before this hook existed.
+  void adopt_external_write(uint64_t len) {
+    logical_written_ = len;
+    preallocated_    = 0;      // the P2P path did its own trimming
+  }
+
   bool finalize() {
     if (fd_ < 0) return false;
     if (!wt_.joinable()) return !werr_.load(std::memory_order_relaxed);  // never opened/already done
@@ -21169,6 +21219,10 @@ extern "C" int gzv_kernel_available(void);
 
 // GPU-side XXH64 batch hash (defined in gpuverify.cu) — the --gds-only content
 // checksum.  See the long note over the kernel for why it must run on the device.
+extern "C" void gzp_launch_finalize(void * pack, const void * d_off,
+                                    const void * d_csz, const void * d_ck,
+                                    int n, void * stream);
+
 extern "C" void gzx_launch_xxh64(const void * base, size_t stride,
                                  const size_t * sizes, size_t n_chunks,
                                  unsigned int * out, cudaStream_t stream);
@@ -21344,6 +21398,19 @@ struct StreamCtx {
   void * d2h_pinned_base = nullptr;
   size_t d2h_pinned_bytes = 0;
 
+  // Peer-to-peer compress output: frames are packed here contiguously and
+  // flushed in 4 KiB multiples.  Registered with cuFile so the NVMe can DMA
+  // straight out of it.  d_pack_scratch carries the sub-block remainder across
+  // a flush (a device-to-device copy cannot overlap source and destination).
+  void *              d_pack_base    = nullptr;
+  size_t              d_pack_cap     = 0;
+  size_t              d_pack_used    = 0;
+  void *              d_pack_scratch = nullptr;   // 8 KiB
+  unsigned long long * d_pack_off    = nullptr;   // per-frame offset within the pack
+  unsigned long long * d_pack_csz    = nullptr;   // per-frame compressed size
+  unsigned int *       d_pack_ck     = nullptr;   // per-frame checksum
+  GdsBuf              gds_pack_reg;               // BAR1 registration of d_pack_base
+
   // --direct-stage host staging buffers: ONE PER READER THREAD, allocated once
   // with the stream and reused for the life of the run.
   //
@@ -21488,6 +21555,30 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   if (cudaMalloc(&C.d_in_sizes,   sizeof(size_t)         * C.per_stream_batch) != cudaSuccess) return false;
   if (cudaMalloc(&C.d_comp_sizes, sizeof(size_t)         * C.per_stream_batch) != cudaSuccess) return false;
   if (cudaMalloc(&C.d_stats,      sizeof(nvcompStatus_t) * C.per_stream_batch) != cudaSuccess) return false;
+  if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+    // Sized to hold a whole batch's worth of worst-case output plus slack, so a
+    // flush is rare relative to frames.  Registered once; registration is what
+    // puts it in BAR1 and is the expensive part.
+    C.d_pack_cap = C.per_stream_batch * C.max_out_chunk + (8u << 20);
+    C.d_pack_cap = (C.d_pack_cap + 4095) & ~size_t(4095);
+    if (cudaMalloc(&C.d_pack_base, C.d_pack_cap) != cudaSuccess) return false;
+    if (cudaMalloc(&C.d_pack_scratch, 8192) != cudaSuccess) return false;
+    if (cudaMalloc(&C.d_pack_off, sizeof(unsigned long long) * C.per_stream_batch) != cudaSuccess) return false;
+    if (cudaMalloc(&C.d_pack_csz, sizeof(unsigned long long) * C.per_stream_batch) != cudaSuccess) return false;
+    if (cudaMalloc(&C.d_pack_ck,  sizeof(unsigned int)       * C.per_stream_batch) != cudaSuccess) return false;
+    // cudaMalloc guarantees only 256-byte alignment; peer-to-peer needs 4 KiB on
+    // the DEVICE offset too, and every write starts at the base, so verify it
+    // rather than discover a silent bounce later.
+    if (((uintptr_t)C.d_pack_base & 4095) != 0) {
+      std::cerr << "gzstd: --gds-only: device pack buffer is not 4 KiB aligned\n";
+      return false;
+    }
+    std::string pwhy;
+    if (!C.gds_pack_reg.reg(C.d_pack_base, C.d_pack_cap, &pwhy)) {
+      std::cerr << "gzstd: --gds-only: cannot register the output pack buffer: " << pwhy << "\n";
+      return false;
+    }
+  }
   if (opt.direct_stage) {
     // Rounded to the O_DIRECT block: the tail frame is short and its read window
     // is rounded UP, so the buffer must hold the rounded length, not the frame's.
@@ -21677,6 +21768,50 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
 ======================================================================*/
 static std::mutex g_gpu_ctx_init_m;
 
+// Flush whole 4 KiB blocks out of the pack buffer straight to the file.
+// Caller holds g_gds_cout_m.  `final` also commits the sub-block tail, which is
+// the only write in the run that is not a 4 KiB multiple -- it is padded up and
+// the file is ftruncate'd to the true length afterwards, the same trick the
+// decompress side uses.
+static void gds_cout_flush(StreamCtx & C, bool final_flush)
+{
+  if (C.d_pack_used == 0) return;
+  checkCuda(cudaStreamSynchronize(C.stream), "sync before peer-to-peer flush");
+  size_t n = (C.d_pack_used / 4096) * 4096;
+  size_t carry = C.d_pack_used - n;
+  if (final_flush && carry) {           // pad the tail up; ftruncate trims it
+    checkCuda(cudaMemsetAsync(static_cast<char*>(C.d_pack_base) + C.d_pack_used,
+                              0, 4096 - carry, C.stream), "pad the final block");
+    checkCuda(cudaStreamSynchronize(C.stream), "sync tail pad");
+    n += 4096; carry = 0;
+  }
+  if (::getenv("GZSTD_DEBUG_GDS_COUT"))
+    std::fprintf(stderr, "[COUT] flush used=%zu n=%zu carry=%zu file_off=%llu logical=%llu final=%d\n",
+                 C.d_pack_used, n, carry, (unsigned long long)g_gds_cout_off,
+                 (unsigned long long)g_gds_cout_logical, (int)final_flush);
+  if (n) {
+    const ssize_t w = g_gds_cout.write_dev(C.d_pack_base, n, (off_t)g_gds_cout_off, 0);
+    if (w != (ssize_t)n)
+      die("--gds-only: cuFileWrite returned " + std::to_string((long long)w)
+          + " for " + std::to_string(n) + " bytes at offset "
+          + std::to_string((long long)g_gds_cout_off), EXIT_IO);
+    g_gds_cout_off += n;
+    g_gds_cout_writes.fetch_add(1, std::memory_order_relaxed);
+    g_gds_cout_bytes.fetch_add(n, std::memory_order_relaxed);
+  }
+  if (carry) {
+    // Source and destination overlap, which cudaMemcpy does not define; bounce
+    // through the scratch block.  carry < 4096 by construction.
+    checkCuda(cudaMemcpyAsync(C.d_pack_scratch,
+                              static_cast<char*>(C.d_pack_base) + n, carry,
+                              cudaMemcpyDeviceToDevice, C.stream), "carry out");
+    checkCuda(cudaMemcpyAsync(C.d_pack_base, C.d_pack_scratch, carry,
+                              cudaMemcpyDeviceToDevice, C.stream), "carry back");
+    checkCuda(cudaStreamSynchronize(C.stream), "sync carry");
+  }
+  C.d_pack_used = carry;
+}
+
 static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
 {
   // Deregister BEFORE the free: cuFile holds a BAR1 mapping of this exact
@@ -21684,6 +21819,13 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   C.gds_in_reg.dereg();
   if (C.d_checksums) { cudaFree(C.d_checksums); C.d_checksums = nullptr; }
   if (C.h_ck_pinned) { cudaFreeHost(C.h_ck_pinned); C.h_ck_pinned = nullptr; }
+  C.gds_pack_reg.dereg();          // before the free: cuFile holds a BAR1 mapping
+  if (C.d_pack_base)    { cudaFree(C.d_pack_base);    C.d_pack_base = nullptr; }
+  if (C.d_pack_scratch) { cudaFree(C.d_pack_scratch); C.d_pack_scratch = nullptr; }
+  if (C.d_pack_off)     { cudaFree(C.d_pack_off);     C.d_pack_off = nullptr; }
+  if (C.d_pack_csz)     { cudaFree(C.d_pack_csz);     C.d_pack_csz = nullptr; }
+  if (C.d_pack_ck)      { cudaFree(C.d_pack_ck);      C.d_pack_ck = nullptr; }
+  C.d_pack_cap = C.d_pack_used = 0;
   for (void *& hp : C.h_dstage) if (hp) { cudaFreeHost(hp); hp = nullptr; }
   C.h_dstage.clear(); C.h_dstage_slot_bytes = 0;
   if (C.d_in_base) { cudaFree(C.d_in_base); }
@@ -22205,6 +22347,104 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   // still in flight into a frame buffer the unwind is about to release.
   for (size_t i=0;i<C.filled;++i)
     if (C.h_stats[i] != nvcompSuccess) throw std::runtime_error("nvCOMP per-chunk status != nvcompSuccess");
+
+  // ---- PURE PEER-TO-PEER OUTPUT: pack in VRAM, write VRAM -> NVMe ----------
+  // No D2H, no host buffer, no ResultStore, no writer thread.  Frames are
+  // appended to the device pack buffer, stamped there by gzp_finalize_kernel,
+  // and flushed in whole 4 KiB blocks so cuFile keeps the peer-to-peer route.
+  if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lk(g_gds_cout_m);
+    // One device, one stream under --gds-only, so drains arrive in order.
+    // Assert it: an out-of-order batch would corrupt every following offset.
+    if (C.filled && C.batch[0].seq != g_gds_cout_next_seq)
+      die("--gds-only: peer-to-peer output requires in-order drains (got seq "
+          + std::to_string(C.batch[0].seq) + ", expected "
+          + std::to_string(g_gds_cout_next_seq) + ")");
+    // A FRAME MUST BE FINALIZED BEFORE ITS BYTES CAN LEAVE.  gzp_finalize_kernel
+    // edits the frame in place -- header flag and 4-byte trailer -- so anything
+    // flushed before it runs goes to disk with the checksum flag clear and an
+    // uninitialised trailer.  Running it once at the end of the batch was wrong
+    // for exactly the frames a mid-batch flush had already written, which is why
+    // a 6 GiB input decoded 193 frames and then hit garbage.  So: finalize the
+    // pending run immediately BEFORE any flush, and again at the end.
+    std::vector<unsigned long long> h_off, h_csz;
+    std::vector<unsigned int>       h_ck;
+    h_off.reserve(C.filled); h_csz.reserve(C.filled); h_ck.reserve(C.filled);
+    auto finalize_pending = [&]() {
+      if (h_off.empty()) return;
+      const int n = (int)h_off.size();
+      // Frame metadata only -- offsets, sizes, checksums.  Payload never touches
+      // the host; this is a few KiB.
+      checkCuda(cudaMemcpyAsync(C.d_pack_off, h_off.data(),
+                                sizeof(unsigned long long) * n,
+                                cudaMemcpyHostToDevice, C.stream), "pack offsets H2D");
+      checkCuda(cudaMemcpyAsync(C.d_pack_csz, h_csz.data(),
+                                sizeof(unsigned long long) * n,
+                                cudaMemcpyHostToDevice, C.stream), "pack sizes H2D");
+      checkCuda(cudaMemcpyAsync(C.d_pack_ck, h_ck.data(),
+                                sizeof(unsigned int) * n,
+                                cudaMemcpyHostToDevice, C.stream), "pack checksums H2D");
+      gzp_launch_finalize(C.d_pack_base, C.d_pack_off, C.d_pack_csz,
+                          C.d_pack_ck, n, C.stream);
+      checkCuda(cudaGetLastError(), "gzp_finalize_kernel launch");
+      h_off.clear(); h_csz.clear(); h_ck.clear();
+    };
+    for (size_t i = 0; i < C.filled; ++i) {
+      const size_t csz  = C.h_comp_sizes[i];
+      const size_t need = csz + 4;                    // frame + checksum trailer
+      out_sum += csz; in_sum += C.h_in_sizes[i];
+      if (C.d_pack_used + need > C.d_pack_cap) {
+        finalize_pending();                 // stamp before the bytes go out
+        gds_cout_flush(C, false);
+      }
+      if (C.d_pack_used + need > C.d_pack_cap)
+        die("--gds-only: frame " + std::to_string(need)
+            + " B exceeds the device pack buffer " + std::to_string(C.d_pack_cap));
+      checkCuda(cudaMemcpyAsync(static_cast<char*>(C.d_pack_base) + C.d_pack_used,
+                                static_cast<char*>(C.d_out_base) + i * C.max_out_chunk,
+                                csz, cudaMemcpyDeviceToDevice, C.stream),
+                "cudaMemcpyAsync(frame -> device pack)");
+      h_off.push_back(C.d_pack_used);
+      h_csz.push_back(csz);
+      h_ck.push_back(C.h_ck_pinned ? C.h_ck_pinned[i] : C.h_checksums[i]);
+      C.d_pack_used += need;
+      g_gds_cout_logical += need;
+      // SEEK-TABLE GEOMETRY.  writer_thread records every frame's on-disk size
+      // so main() can pin the geometry and append the seek trailer; this path
+      // never starts that writer, so it records here instead -- same order
+      // guarantee (drains are asserted to arrive in sequence).  Without it the
+      // archive silently loses its index: -l reported 384 frames / 0 skips
+      // against the ordinary path's 385 / 1, and O(1) listing was gone.
+      if (opt.tar_index) g_tar_frame_csizes.push_back((uint64_t)need);
+    }
+    finalize_pending();
+    if (C.filled) {
+      g_gds_cout_next_seq = C.batch[C.filled - 1].seq + 1;
+      g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
+      C.delivered = C.filled;
+    }
+    if (Meter * pm = g_gds_cout_meter) {
+      pm->tasks_done.fetch_add(C.filled, std::memory_order_relaxed);
+      pm->wrote_bytes.fetch_add(out_sum, std::memory_order_relaxed);
+    }
+    // RELEASE THE FRAME PERMITS THE WORKER TOOK.  The ordered writer normally
+    // does this, one per frame, as it writes them; this path does not start a
+    // writer, so without it the throttle budget drains and every worker blocks
+    // forever in acquire.  Observed exactly that: wedged at 16.9% with the
+    // output file frozen.
+    //
+    // THIS IS v0.17.1 A SECOND TIME -- that release fixed the same leak on the
+    // decompress side, wedged at 97.8%, for the same reason.  Bypassing the
+    // writer means inheriting its bookkeeping, and the permit is the part that
+    // is invisible until the run stops moving.
+    //
+    // Releasing at PACK time rather than at write time is correct here: the
+    // permit bounds buffered output, and once a frame is copied into the device
+    // pack buffer its worker-side buffer is free.  What bounds the output now is
+    // d_pack_cap, which flushes when full.
+    if (bp) bp->release((int)C.filled);
+    return;
+  }
 
   // ---- PASS 1: size each frame and issue its readback on C.stream ----------
   // Nothing may be checksummed or published here — the copies have not landed
@@ -23694,6 +23934,14 @@ static void gpu_worker(
       vlog(V_TRACE, opt, ps.str() + "\n");
     }
 
+    // PURE PEER-TO-PEER OUTPUT: commit whatever this device still holds packed.
+    // Here, not in compress_nvcomp: this is the last point at which the stream
+    // and the registered pack buffer are both still alive.  Every batch for this
+    // device has drained by now.
+    if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+      std::lock_guard<std::mutex> lk(g_gds_cout_m);
+      for (auto & C : ctxs) gds_cout_flush(C, true);
+    }
     // Free all GPU resources for this device
     if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
@@ -24312,10 +24560,57 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, chosen_mib) * ONE_MIB, opt);
   queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
 
+  // ---- PURE PEER-TO-PEER OUTPUT PREFLIGHT (--gds-only compress) -----------
+  // Reopen the verified output descriptor through procfs with O_DIRECT and hand
+  // it to cuFile, exactly as the decompress side does.  DEMOTE, DON'T FAIL:
+  // cuFile refuses some perfectly good destinations (the atomic .tmp among
+  // them), and an output it will not take is a reason to use the ordinary
+  // writer, not to refuse the job.
+  g_gds_cout_active.store(false, std::memory_order_relaxed);
+  g_gds_cout_off = 0; g_gds_cout_logical = 0; g_gds_cout_next_seq = 0;
+  g_gds_cout_writes.store(0, std::memory_order_relaxed);
+  g_gds_cout_bytes.store(0, std::memory_order_relaxed);
+  g_gds_cout_meter = m;
+  if (opt.gds_only && !opt.tar_mode && !::getenv("GZSTD_DEBUG_GDS_NO_P2P_OUT")) {
+    int base_fd = -1;
+    if (out) base_fd = ::fileno(out);
+    else if (g_direct_writer) base_fd = g_direct_writer->fd();
+    if (base_fd < 0) {
+      vlog(V_ERROR, opt, "WARNING: --gds-only: the output has no descriptor to "
+           "write through; using the ordinary writer.\n");
+    } else {
+      char ofd_link[64];
+      std::snprintf(ofd_link, sizeof(ofd_link), "/proc/self/fd/%d", base_fd);
+      const int ofd = ::open(ofd_link, O_WRONLY | O_DIRECT | O_CLOEXEC);
+      if (ofd < 0) {
+        vlog(V_ERROR, opt, std::string("WARNING: --gds-only cannot reopen this "
+             "output for O_DIRECT (") + std::strerror(errno)
+             + "); this compress uses the ordinary writer.\n");
+      } else {
+        std::string owhy;
+        if (!g_gds_cout.open(ofd, &owhy)) {
+          ::close(ofd);
+          vlog(V_ERROR, opt, "WARNING: --gds-only cuFile will not take this output "
+               "descriptor (" + owhy + "); this compress uses the ordinary writer.\n");
+        } else {
+          g_gds_cout_fd = ofd;
+          g_gds_cout_active.store(true, std::memory_order_relaxed);
+          if (opt.verbosity >= V_VERBOSE)
+            vlog(V_VERBOSE, opt, "[GDS] output registered with cuFile; frames go "
+                 "VRAM -> NVMe with no host copy\n");
+        }
+      }
+    }
+  }
+
   // Start progress bar and ordered-writer threads
   std::atomic<bool> progress_done{false};
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
-  std::thread writer_thr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
+  // The peer-to-peer path writes from the drain itself, so the ordered writer
+  // would have nothing to do and its completion handshake would never fire.
+  std::thread writer_thr;
+  if (!g_gds_cout_active.load(std::memory_order_relaxed))
+    writer_thr = std::thread(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   // ---- Hybrid scheduler (adaptive CPU/GPU work-sharing) ----
   std::unique_ptr<HybridSched> sched_ptr;
@@ -25119,7 +25414,41 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   }
 
   // Wait for writer and progress threads
-  writer_thr.join();
+  if (writer_thr.joinable()) writer_thr.join();
+  // ---- PURE PEER-TO-PEER OUTPUT: commit the tail -------------------------
+  // Every worker has joined, so no drain can still be packing.  Flush what is
+  // left (padded up to the block), then ftruncate to the true logical length --
+  // O_DIRECT can only write whole blocks, so the file is longer than the archive
+  // until this runs, and the archive is not valid until it does.
+  if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+    // The workers flushed their own pack buffers as they tore down; all that is
+    // left is to trim the block padding off and make it durable.
+    if (g_gds_cout_fd >= 0) {
+      if (::ftruncate(g_gds_cout_fd, (off_t)g_gds_cout_logical) != 0)
+        die(std::string("--gds-only: cannot trim the output to its true length: ")
+            + std::strerror(errno), EXIT_IO);
+      if (::fsync(g_gds_cout_fd) != 0)
+        die(std::string("--gds-only: fsync of the peer-to-peer output failed: ")
+            + std::strerror(errno), EXIT_IO);
+      // The ordinary writer still owns this file's finalize path even though it
+      // wrote none of it.  Tell it the true length, or its --preallocate trim
+      // truncates the archive to nothing.
+      if (g_direct_writer) g_direct_writer->adopt_external_write(g_gds_cout_logical);
+    }
+    g_gds_cout.close();
+    if (g_gds_cout_fd >= 0) { ::close(g_gds_cout_fd); g_gds_cout_fd = -1; }
+    g_gds_cout_active.store(false, std::memory_order_relaxed);
+    if (opt.verbosity >= V_VERBOSE) {
+      char b[192];
+      std::snprintf(b, sizeof(b),
+        "[GDS] output: %llu aligned cuFileWrite(s), %.1f MiB VRAM -> NVMe, "
+        "no host copy\n",
+        (unsigned long long)g_gds_cout_writes.load(std::memory_order_relaxed),
+        double(g_gds_cout_bytes.load(std::memory_order_relaxed)) / 1048576.0);
+      vlog(V_VERBOSE, opt, b);
+    }
+  }
+  g_gds_cout_meter = nullptr;
   perf_mark(PerfCounters::HM_WRITER_JOINED);
   // ---- GPU deadlock watchdog teardown (v0.14.59) ----
   if (watchdog_thr.joinable()) {

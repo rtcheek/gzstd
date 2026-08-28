@@ -275,3 +275,48 @@ extern "C" void gzx_launch_xxh64(const void * base, size_t stride,
     gzx_xxh64_kernel<<<grid, block, 0, stream>>>(
         (const unsigned char *)base, stride, sizes, n_chunks, out);
 }
+
+/*======================================================================
+ gzp_finalize — stamp zstd frame headers/trailers IN VRAM
+ -----------------------------------------------------------------------
+ The ordinary compress drain copies each frame to the host and fixes it up
+ there: set the Content_Checksum_flag in header byte 4, then append the
+ 4-byte XXH64-low32 trailer.  A pure peer-to-peer output path never brings
+ the frame to the host, so the same two edits have to happen on the device.
+
+ One thread per frame; the work is two byte writes, so the launch overhead
+ dominates and a batched launch is the point -- 64 frames per batch would
+ otherwise be 64 launches.
+======================================================================*/
+__global__ void gzp_finalize_kernel(unsigned char * __restrict__ pack,
+                                    const unsigned long long * __restrict__ off,
+                                    const unsigned long long * __restrict__ csz,
+                                    const unsigned int * __restrict__ ck,
+                                    int n)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  unsigned char * f = pack + off[i];
+  const unsigned long long c = csz[i];
+  if (c < 5) return;                  // not a well-formed frame; leave as-is
+  f[4] |= 0x04;                       // Content_Checksum_flag
+  const unsigned int v = ck[i];
+  f[c + 0] = (unsigned char)( v        & 0xff);
+  f[c + 1] = (unsigned char)((v >>  8) & 0xff);
+  f[c + 2] = (unsigned char)((v >> 16) & 0xff);
+  f[c + 3] = (unsigned char)((v >> 24) & 0xff);
+}
+
+extern "C" void gzp_launch_finalize(void * pack,
+                                    const void * d_off, const void * d_csz,
+                                    const void * d_ck, int n, void * stream)
+{
+  if (n <= 0) return;
+  const int threads = 128;
+  const int blocks  = (n + threads - 1) / threads;
+  gzp_finalize_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+      (unsigned char *)pack,
+      (const unsigned long long *)d_off,
+      (const unsigned long long *)d_csz,
+      (const unsigned int *)d_ck, n);
+}

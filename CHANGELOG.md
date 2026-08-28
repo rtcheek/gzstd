@@ -1,12 +1,89 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.11  
+**Covers:** v0.9.50 → v0.17.12  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.12 — --gds-only compress is now pure peer-to-peer: NVMe to VRAM to NVMe
+
+The read half has been peer-to-peer since v0.17.0. The write half was not: every compressed frame
+came back to the host through a pinned slot, was memcpy'd into a frame buffer, and went out through
+the ordered writer. This finishes the path. No payload byte enters host RAM in either direction.
+
+Measured on 130 GiB, cold, same device:
+
+| | before | after |
+|---|---|---|
+| wall | 67.55 s | 59.93 s |
+| **user CPU** | 15.54 s | **2.69 s** |
+| total CPU | 49.38 s | 34.53 s |
+
+Proven by cuFile's own per-process counters rather than by alignment, which cannot distinguish
+peer-to-peer from a silent bounce: `Read n=768 posix=0 unalign=0`, `Write n=8 posix=0 unalign=0`.
+`zstd -t` validated all 139,964,108,800 bytes.
+
+**The gain is 5.8x on user CPU, not the ~0.3% predicted.** The D2H transfer really is nearly free --
+0.39-0.91 ms inside a 150-220 ms batch -- but costing the transfer missed the chain behind it: the
+pinned-slot memcpy, the frame buffers, the ResultStore, the ordered writer. Removing a copy removes
+everything downstream of it.
+
+### How the alignment problem is beaten, which is the design worth keeping
+
+`cuFileWrite` routes peer-to-peer only when file offset, device offset AND length are all 4 KiB
+aligned. Compressed frames are variable length, so writing them individually at packed offsets would
+leave nearly every one misaligned and cuFile would silently bounce it through host memory -- correct
+bytes, none of the point. So frames are **packed contiguously into a registered device buffer and
+flushed in whole 4 KiB multiples**: one aligned write covering many frames, with the sub-block
+remainder carried to the front for the next flush. A CUDA kernel (`gzp_finalize_kernel`, new in
+`gpuverify.cu`) stamps each frame's zstd Content_Checksum_flag and 4-byte trailer in place, work the
+host used to do after the D2H.
+
+**The output is byte-identical to the ordinary writer.** No padding frames, no format change.
+
+### Four defects, three of them invisible to a round-trip
+
+* **Wedged at 16.9% with the output frozen.** Bypassing the ordered writer means inheriting its
+  bookkeeping, and the FrameThrottle permit release is the invisible part: workers acquire per frame
+  and only the writer releases. This is v0.17.1 a second time -- the identical leak wedged
+  `--gds-only` decompress at 97.8%.
+* **Truncated stream after 193 frames.** The finalize kernel edits frames in place, and it ran once
+  per batch -- so every frame a MID-BATCH flush had already written went out with the checksum flag
+  clear and an uninitialised trailer. Only an input large enough to force a mid-batch flush exposed
+  it; the single-flush case passed cleanly.
+* **`--gds-only --preallocate` produced a ZERO-BYTE ARCHIVE AT EXIT 0.** `DirectWriter::finalize()`
+  trims the reservation back to `logical_written_`, which is 0 because this path writes the file
+  itself and never touches that writer. Our `ftruncate` set the correct size and finalize then cut
+  it to nothing. Fixed by telling the writer the true length rather than refusing the combination:
+  preallocate and peer-to-peer are compatible, since the reservation is exactly what the writes land
+  in.
+* **Every archive silently lost its seek index.** `writer_thread` records each frame's on-disk size
+  so the seek-table geometry can be pinned; with no writer the table was empty and no trailer was
+  emitted. `-l` read 384 frames / 0 skips against the ordinary path's 385 / 1 -- O(1) listing and
+  random access gone. The drain records it now.
+
+The last two were found only by compressing the same input down BOTH output paths and requiring
+byte-identical archives. That check is worth more than any round-trip: the archive decompressed
+perfectly while its index was missing.
+
+### Also measured, and it says the CPU cost that remains is not ours
+
+GDS's marginal kernel cost is **0.112 s/GiB, identical to plain O_DIRECT** (fitted across 5/20/80
+GiB gdsio transfers, separating 14.8 s of fixed setup). It redirects the DMA destination; it does
+not remove the syscall, the block-layer submission, or the DMA setup. Of gzstd's 34.5 s, roughly
+22 s is the irreducible cost of moving 196 GiB across the block layer. No cuFile transfer mode
+beats the one already in use: batch and async variants all cost MORE kernel CPU, and every mode
+issues the same number of DMAs, so batching groups submissions rather than transfers.
+
+Not adopted, having been built and measured: **ping-pong output banks**, where a writer thread
+drains one bank while the drain packs the other. It worked exactly as designed -- stream-wait fell
+from 53% to 20% -- and was **3.5% slower**, because the 18 seconds it saved reappeared as reads
+collapsing from 4.88 GiB/s (the device ceiling) to 2.81 once writes overlapped them. One saturated
+NVMe has nothing to give; serialising is the better trade here. It may still pay on a host with
+input and output on separate drives, which is untestable on this one.
 
 ## v0.17.11 — GPU device selection was correct; the reporting made it look broken
 
