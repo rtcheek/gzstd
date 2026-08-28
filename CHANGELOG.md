@@ -1,12 +1,62 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.12  
+**Covers:** v0.9.50 → v0.17.13  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.13 — the review of v0.17.12 found a corrupt archive behind an ordinary flag
+
+v0.17.12 shipped with 22 targeted validation checks and two clean suites, and still had a path that
+wrote a corrupt archive and exited 0. An independent review found it. Nothing had been tagged, so
+nothing deployed.
+
+### `--gds-only --no-direct` wrote the seek index over the start of the archive
+
+The peer-to-peer path writes through its own O_DIRECT descriptor, obtained by reopening the
+verified output through procfs. The ORIGINAL buffered `FILE*` therefore never moves: its position
+stays at 0. `append_tar_index()` then wrote the seek trailer through that `FILE*` — at offset zero,
+on top of the first frames. `-l` reports "not a valid zstd stream"; decompression warns that the
+first frame has no content-size header.
+
+**This was introduced by v0.17.12's own fix for the MISSING index**, hours after it. `--no-direct`
+had been checked by hand *before* that change, seen to pass, and never re-run; the validation suite
+did not cover the flag at all. The buffered stream is now positioned at the peer-to-peer prefix
+length before the append.
+
+### `--verify-engine=cpu` verified nothing and exited 0
+
+The CPU `VerifyPool` consumes host `FrameBuf` objects that the writer normally produces. The
+peer-to-peer branch returns before creating any, so the pool was fed zero frames and reported
+success. Also reachable through AUTOMATIC CPU selection on older PCIe hardware, where the GPU
+verifier is not chosen. Peer-to-peer output is now demoted when verification resolves to the CPU
+engine — that restores the D2H traffic, but only because a CPU verifier was explicitly asked for.
+
+### Two shapes that could not work were not refused
+
+`--gpu-devices=2` and `--gpu-streams=2` died mid-run on the in-order sequence assertion (exit 1,
+partial output removed — it failed safe, but it should never have started). An `O_APPEND`
+descriptor, as produced by `gzstd -c … >> existing.zst`, was accepted even though cuFile writes by
+absolute offset and append semantics would ignore it. Both now demote to the ordinary writer with a
+warning before any work begins.
+
+### The technique that found these, which is the reusable part
+
+The review was asked one question: *enumerate everything `writer_thread` and
+`DirectWriter::finalize` do, and for each say whether the peer-to-peer path does it, deliberately
+skips it, or misses it.* It walked nineteen responsibilities. Two of the three defects came out of
+that enumeration rather than from testing. **Bypassing a component means inheriting its bookkeeping;
+enumerate the bookkeeping instead of discovering it.** On this path that lesson has now cost four
+defects: throttle permits, the seek table, the CPU-verify tap, and the buffered append cursor.
+
+Also corrected: `wrote_bytes` omitted the four-byte checksum trailer per frame and `total_out` was
+never updated on this path. Reporting only, but wrong.
+
+The harness is now 26 checks and covers explicit multi-stream, `--no-direct`, append-mode
+redirected stdout, and forced CPU verification — the four shapes that were missing.
 
 ## v0.17.12 — --gds-only compress is now pure peer-to-peer: NVMe to VRAM to NVMe
 

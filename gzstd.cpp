@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.12";
+static constexpr const char * GZSTD_VERSION = "0.17.13";
 //
 // Architecture overview:
 //
@@ -22392,7 +22392,7 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
     for (size_t i = 0; i < C.filled; ++i) {
       const size_t csz  = C.h_comp_sizes[i];
       const size_t need = csz + 4;                    // frame + checksum trailer
-      out_sum += csz; in_sum += C.h_in_sizes[i];
+      out_sum += need; in_sum += C.h_in_sizes[i];
       if (C.d_pack_used + need > C.d_pack_cap) {
         finalize_pending();                 // stamp before the bytes go out
         gds_cout_flush(C, false);
@@ -22425,6 +22425,9 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
     }
     if (Meter * pm = g_gds_cout_meter) {
       pm->tasks_done.fetch_add(C.filled, std::memory_order_relaxed);
+      // Match writer_thread's accounting: both counters include the four-byte
+      // checksum trailer that is part of every on-disk FrameBuf.
+      pm->total_out.fetch_add(out_sum, std::memory_order_relaxed);
       pm->wrote_bytes.fetch_add(out_sum, std::memory_order_relaxed);
     }
     // RELEASE THE FRAME PERMITS THE WORKER TOOK.  The ordered writer normally
@@ -24571,13 +24574,47 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   g_gds_cout_writes.store(0, std::memory_order_relaxed);
   g_gds_cout_bytes.store(0, std::memory_order_relaxed);
   g_gds_cout_meter = m;
-  if (opt.gds_only && !opt.tar_mode && !::getenv("GZSTD_DEBUG_GDS_NO_P2P_OUT")) {
+  // The pack buffer belongs to a StreamCtx, while the output offset belongs to
+  // the whole run.  With more than one stream/device, accepting batches in seq
+  // order is not enough: stream 0 can retain frame 0 while stream 1 retains
+  // frame 64, then stream 0's next append/teardown can flush frame 128 before
+  // stream 1 ever emits frame 64.  Each context's final 4 KiB pad would also
+  // become an interior hole that the one end-of-file ftruncate cannot remove.
+  // Keep the GDS input path, but use the ordinary ordered output writer for a
+  // shape the per-context packer cannot represent safely.
+  const bool gds_cout_shape_ok = device_count == 1 && opt.gpu_streams == 1;
+  // CPU verification is fed by writer_thread's host FrameBuf taps.  The P2P
+  // branch intentionally creates neither, so engaging it with a CPU VerifyPool
+  // would report success after verifying zero frames.  GPU verification stays
+  // wholly in VRAM and is compatible with this output path.
+  const bool gds_cout_verify_ok = !opt.verify || opt.gpu_verify;
+  if (opt.gds_only && !opt.tar_mode && !gds_cout_shape_ok) {
+    vlog(V_ERROR, opt,
+         "WARNING: --gds-only peer-to-peer compress output requires exactly one "
+         "GPU and one stream; using the ordinary ordered writer for output.\n");
+  } else if (opt.gds_only && !opt.tar_mode && !gds_cout_verify_ok) {
+    vlog(V_ERROR, opt,
+         "WARNING: --gds-only CPU verification requires host frame taps; using "
+         "the ordinary ordered writer for output.\n");
+  }
+  if (opt.gds_only && !opt.tar_mode && gds_cout_shape_ok && gds_cout_verify_ok
+      && !::getenv("GZSTD_DEBUG_GDS_NO_P2P_OUT")) {
     int base_fd = -1;
     if (out) base_fd = ::fileno(out);
     else if (g_direct_writer) base_fd = g_direct_writer->fd();
     if (base_fd < 0) {
       vlog(V_ERROR, opt, "WARNING: --gds-only: the output has no descriptor to "
            "write through; using the ordinary writer.\n");
+    } else if (::fcntl(base_fd, F_GETFL) < 0) {
+      vlog(V_ERROR, opt, "WARNING: --gds-only cannot inspect the output "
+           "descriptor; using the ordinary ordered writer.\n");
+    } else if ((::fcntl(base_fd, F_GETFL) & O_APPEND) != 0) {
+      // Reopening /proc/self/fd/N with O_DIRECT creates a positional description;
+      // cuFileWrite below starts at offset zero and the final ftruncate adopts
+      // that new stream's length.  On `gzstd -c ... >> existing.zst` that would
+      // overwrite the old stream and then cut its tail off, despite exiting 0.
+      vlog(V_ERROR, opt, "WARNING: --gds-only cannot use peer-to-peer output on "
+           "an append-mode descriptor; using the ordinary ordered writer.\n");
     } else {
       char ofd_link[64];
       std::snprintf(ofd_link, sizeof(ofd_link), "/proc/self/fd/%d", base_fd);
@@ -25423,6 +25460,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (g_gds_cout_active.load(std::memory_order_relaxed)) {
     // The workers flushed their own pack buffers as they tore down; all that is
     // left is to trim the block padding off and make it durable.
+    if (!g_gpu_failed_restart.load(std::memory_order_relaxed)
+        && g_gds_cout_next_seq != results.total_tasks)
+      die("--gds-only: peer-to-peer output completed only "
+          + std::to_string(g_gds_cout_next_seq) + " of "
+          + std::to_string(results.total_tasks) + " frames");
     if (g_gds_cout_fd >= 0) {
       if (::ftruncate(g_gds_cout_fd, (off_t)g_gds_cout_logical) != 0)
         die(std::string("--gds-only: cannot trim the output to its true length: ")
@@ -25433,7 +25475,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // The ordinary writer still owns this file's finalize path even though it
       // wrote none of it.  Tell it the true length, or its --preallocate trim
       // truncates the archive to nothing.
-      if (g_direct_writer) g_direct_writer->adopt_external_write(g_gds_cout_logical);
+      if (g_direct_writer) {
+        g_direct_writer->adopt_external_write(g_gds_cout_logical);
+      } else if (out && ::fseeko(out, (off_t)g_gds_cout_logical, SEEK_SET) != 0) {
+        // cuFile wrote through an independent positional descriptor, so stdio's
+        // cursor is still zero.  append_tar_index() writes through this FILE*;
+        // without adopting the external EOF it overwrites the zstd header on
+        // `--gds-only --no-direct` and the corrupt archive still exits 0.
+        die(std::string("--gds-only: cannot position the buffered output after "
+                        "the peer-to-peer prefix: ") + std::strerror(errno), EXIT_IO);
+      }
     }
     g_gds_cout.close();
     if (g_gds_cout_fd >= 0) { ::close(g_gds_cout_fd); g_gds_cout_fd = -1; }
@@ -33073,8 +33124,10 @@ static Options parse_args(int argc, char ** argv)
     // 30.9 s at eight — while the reads themselves stayed near 4.9 GiB/s
     // throughout.  Eight devices at two streams would register 64 GiB of BAR1
     // to feed a pipeline the drive already saturates.
-    // Both remain overridable: an explicit --gpu-devices / --gpu-streams wins,
-    // which is what makes this a default rather than a restriction.
+    // Both remain overridable for the GPU input/compress pipeline.  The pure P2P
+    // OUTPUT packer is intentionally narrower: its buffer is per StreamCtx but
+    // its file offset is global, so the output preflight demotes to the ordinary
+    // ordered writer when either explicit override makes the shape >1.
     // gpu_streams is defaulted where it is auto-resolved (search gds_only there);
     // by this point it is already non-zero, so testing it for 0 here would be a
     // no-op that reads like policy — the same trap the batch floor fell into.
