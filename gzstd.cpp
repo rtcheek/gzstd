@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.14";
+static constexpr const char * GZSTD_VERSION = "0.17.15";
 //
 // Architecture overview:
 //
@@ -8534,6 +8534,23 @@ static std::atomic<int64_t> g_verify_failed_seq{-1};
 // frames, to exercise the CPU-only restart path deterministically (real GPU
 // faults are intermittent).  -1 (default, env unset) = disabled.
 static int64_t g_debug_fail_gpu_after = -1;
+
+// Test-only fault injection (read once from $GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST):
+// make exactly ONE gpu_decomp_worker throw while it holds the FINAL batch --
+// the queue drained behind it, so every other device has no work left, exits
+// normally, and is gone.  Its batch is then re-enqueued with no consumer alive.
+//
+// The drained() precondition is the entire point, and is why this is not just a
+// frame counter.  A fault EARLY is simply rescued by another GPU, which is the
+// designed behaviour and proves nothing (measured: exit 0, bytes correct).  Only
+// a fault after the others have exited reproduces the v0.17.15 wedge, where the
+// CPU rescue was keyed on failures that those clean exits never incremented.
+//
+// Nothing else reaches this deterministically: the real-world trigger is a
+// corrupt archive that walks nvCOMP off the end of a buffer, which raises an
+// illegal memory access, poisons the CUDA context, cascades to the other
+// devices, and cannot be conjured on demand.  false (unset) = disabled.
+static bool g_debug_fail_gpu_decomp_last = false;
 
 // Test-only fault injection (read once from $GZSTD_DEBUG_THROW_READER): throw out
 // of the compress producer region while the CPU workers are still live and still
@@ -25541,9 +25558,36 @@ static void gpu_decomp_worker(
   SharedTuneState * shared_tune,
   FrameThrottle * bp,
   std::atomic<int> * gpu_failures,   // terminal failures (init or mid-run), all workers
-  int gpu_worker_count)              // total GPU workers spawned (for last-failure detection)
+  // EXITS OF ANY KIND, distinct from failures on purpose.  The CPU rescue used
+  // to trigger on `fails == gpu_worker_count`, which a multi-GPU run can never
+  // reach: a worker that drains the queue and leaves exits NORMALLY and never
+  // touches gpu_failures, so once any device finishes cleanly the count is
+  // capped below the total forever.  A later failure then re-enqueues its
+  // undelivered frames "for another GPU to pick up", there is no other GPU, and
+  // the run ends in `internal error: writer stuck` at exit 1.  gpu_failures
+  // keeps its old meaning because the bringup barrier reads it.
+  std::atomic<int> * gpu_exits,
+  int gpu_worker_count)              // total GPU workers spawned
 {
   (void)m;
+  // Called on EVERY exit from this worker: clean drain, init skip, or fault.
+  // The LAST one out is the only thread that can decide whether frames are
+  // stranded, because until then another GPU might still take them.
+  // drained() is the right question and both halves matter: q_.empty() covers
+  // frames a fault re-enqueued, and done_ covers the init-skip path, which
+  // returns before the producer has finished -- there the queue can be
+  // momentarily empty and still owe everything.
+  bool exit_noted = false;
+  auto note_exit_and_rescue = [&]() {
+    if (exit_noted) return;                 // idempotent: paths can overlap
+    exit_noted = true;
+    if (!gpu_exits) return;
+    const int out = gpu_exits->fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (out != gpu_worker_count) return;    // not the last worker out
+    if (!opt.gpu_only || !queue) return;    // hybrid still has CPU consumers
+    if (queue->drained()) return;           // empty AND producer done: nothing owed
+    gpu_only_cpu_fallback(true, queue, results, opt, m, bp);
+  };
   const size_t stream_count = std::max<size_t>(1, (size_t)opt.gpu_streams);
 
   // Per-stream state for decompression (declared before try so catch can rescue)
@@ -25849,15 +25893,15 @@ static void gpu_decomp_worker(
           vlog(V_ERROR, opt, skip_msg + "\n");
           *any_gpu_failed = true;
           *fatal_msg = skip_msg;
-          int fails = gpu_failures
-              ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
+          (void)(gpu_failures
+              ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1);
           gpu_bringup_signal();   // one fewer GPU that could satisfy the barrier
           { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
           queue->notify_cpu_waiters();
-          // Last GPU standing just failed in --gpu-only: finish on CPU
-          // instead of stranding the queue (data safety over mode purity).
-          if (opt.gpu_only && fails == gpu_worker_count)
-            gpu_only_cpu_fallback(true, queue, results, opt, m, bp);
+          // Last GPU standing just left in --gpu-only: finish on CPU instead of
+          // stranding the queue (data safety over mode purity).  Keyed on EXITS,
+          // not failures -- see note_exit_and_rescue.
+          note_exit_and_rescue();
           return;
         }
         vlog(V_DEFAULT, opt,
@@ -26196,6 +26240,18 @@ static void gpu_decomp_worker(
         }
         if (bp && got < pop_n) bp->release((int)(pop_n - got));
 
+        // Nothing of THIS batch has been delivered yet.  This must be reset at
+        // INTAKE, not just before the decompress launch, because the catch
+        // block re-enqueues only C.batch[C.delivered ..] -- and every throw in
+        // batch setup below (device alloc, the H2D copies, nvCOMP temp sizing,
+        // the re-upload after a temp grow) happens BEFORE the launch.  Left at
+        // the launch, a fault in setup erased [0, previous batch's delivered)
+        // from a freshly popped batch and re-enqueued only what was left, so
+        // those frames were never delivered AND never requeued -- they simply
+        // vanished, and the writer waited forever for sequence numbers that
+        // were not coming.  v0.17.15.
+        C.delivered = 0;
+
         // In hybrid mode, skip batches where every frame is trivially
         // compressed (ratio < 2%).  CPU decompresses these faster than GPU
         // because it avoids PCIe D2H overhead.  More importantly, GPU
@@ -26426,7 +26482,7 @@ static void gpu_decomp_worker(
           batch_comp_sizes[i] = C.batch[i].len();
           batch_seqs[i] = C.batch[i].seq;
         }
-        C.delivered = 0;
+        // (C.delivered was zeroed at intake -- see the comment there.)
 
         checkNvcomp(nvcompBatchedZstdDecompressAsync(
             (const void * const *)C.d_comp_ptrs,
@@ -26647,6 +26703,23 @@ static void gpu_decomp_worker(
           // undelivered tail, whose inputs are still intact.
           C.batch[i].release_input();
           C.delivered = i + 1;
+          // Test hook: see g_debug_fail_gpu_decomp_last.  Fires ONCE, while
+          // holding the FINAL batch (queue drained behind it) with frames still
+          // undelivered, so the throw strands a real tail.
+          //
+          // BOTH conditions are load-bearing, and so is this LOCATION.  The
+          // other workers exit as soon as the queue drains; what gives them
+          // time to actually be gone is the H2D + kernel + D2H that has already
+          // happened by the time we are delivering.  A throw at batch intake is
+          // too early -- measured on both binaries at 1, 2, 3 and 15 frames:
+          // exit 0, bytes correct, because a still-live GPU picks the frames
+          // back up.  That is the designed rescue, not the bug.
+          if (g_debug_fail_gpu_decomp_last && i + 1 < C.filled && queue->drained()) {
+            static std::atomic<bool> dbg_dec_fired{false};
+            if (!dbg_dec_fired.exchange(true))
+              throw std::runtime_error(
+                  "simulated GPU decompress fault (GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST)");
+          }
         }
         uint64_t d2h_elapsed_ns = (d2h_t0 > 0) ? now_ns() - d2h_t0 : 0;
         double d2h_ms_v = double(d2h_elapsed_ns) / 1e6;
@@ -26819,14 +26892,16 @@ static void gpu_decomp_worker(
     }
     queue->notify_cpu_waiters();
 
-    // Last GPU just failed in --gpu-only: finish decompression on CPU so the
-    // re-enqueued frames (and everything still in the queue) have a consumer.
-    int fails = gpu_failures
-        ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
+    // The re-enqueue above happens-before this increment, so whichever worker
+    // is last out sees those frames when it decides whether a rescue is owed.
+    (void)(gpu_failures
+        ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1);
     gpu_bringup_signal();       // one fewer GPU that could satisfy the barrier
-    if (opt.gpu_only && fails == gpu_worker_count)
-      gpu_only_cpu_fallback(true, queue, results, opt, m, bp);
+    note_exit_and_rescue();
   }
+  // Normal drain also has to be counted, and it is the case the old
+  // failure-keyed trigger could never see.
+  note_exit_and_rescue();
 }
 
 /*======================================================================
@@ -27137,10 +27212,15 @@ gds_out_declined:
   shared_tune_decomp.batch_size.store(opt.gpu_batch_cap);
   shared_tune_decomp.locked.store(opt.gpu_batch_user_set);
 
-  // Counts GPUs that failed terminally (init or mid-run).  When the count
-  // reaches the worker count in --gpu-only mode, the last failing worker
-  // runs gpu_only_cpu_fallback to finish on CPU (v0.13.54).
+  // Counts GPUs that failed terminally (init or mid-run).  Read by the bringup
+  // barrier, which is why it cannot also count clean exits.
   std::atomic<int> gpu_failures{0};
+
+  // Counts GPUs that EXITED, however they exited.  The last worker out runs
+  // gpu_only_cpu_fallback if the queue still owes frames (v0.13.54, re-keyed
+  // from failures to exits in v0.17.15 -- a clean drain by any one device used
+  // to make the old failure count unreachable and wedge the writer).
+  std::atomic<int> gpu_exits{0};
 
   // GPU bringup: detect (when deferred — triggers the cuInit), select
   // devices, init result slots, and spawn GPU workers.  Runs on a background
@@ -27254,7 +27334,7 @@ gds_out_declined:
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
                                &shared_tune_decomp,
-                               bp_ptr, &gpu_failures, gpu_count);
+                               bp_ptr, &gpu_failures, &gpu_exits, gpu_count);
     }
     // NOT set here — spawning is not engagement.  Raised at the first DELIVERED
     // frame in gpu_decomp_worker, for the reason g_adapt_gpu_engaged documents.
@@ -27400,9 +27480,12 @@ gds_out_declined:
   for (auto & th : gpu_workers) th.join();
 
   // Report GPU failures.  Even when ALL GPUs failed in --gpu-only mode the
-  // job is already complete: the last failing worker ran
-  // gpu_only_cpu_fallback (with its own warning) and drained the queue on
-  // CPU, so the output is complete and correct.  Warn instead of dying.
+  // job is already complete: the last worker OUT ran gpu_only_cpu_fallback
+  // (with its own warning) and drained the queue on CPU, so the output is
+  // complete and correct.  Warn instead of dying.  (Keyed on exits, not
+  // failures, since v0.17.15 -- see note_exit_and_rescue.  While it was keyed
+  // on failures this paragraph was simply untrue on a multi-GPU host: nothing
+  // drained the queue and the run died in "writer stuck".)
   if (any_gpu_failed.load()) {
     int failed_count = 0;
     for (const auto & s : fatal_msgs)
@@ -29044,6 +29127,8 @@ static int gzstd_main(int argc, char ** argv)
   setup_signal_handlers();
 
   // Test-only: deterministic GPU fault injection (see g_debug_fail_gpu_after).
+  if (std::getenv("GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST"))
+    g_debug_fail_gpu_decomp_last = true;
   if (const char * fa = std::getenv("GZSTD_DEBUG_FAIL_GPU_AFTER"))
     g_debug_fail_gpu_after = std::atoll(fa);
 

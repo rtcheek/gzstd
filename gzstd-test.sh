@@ -1102,6 +1102,44 @@ if has_gpu 2>/dev/null; then
     && pass "gpu-only -t integrity" || fail "gpu-only -t integrity"
   rm -f "$TMPDIR/gpu-test.zst"
 
+  # v0.17.15 regression: one GPU faults while holding the FINAL batch and
+  # re-enqueues its undelivered frames; the other device has already drained the
+  # queue and exited.  The CPU rescue was keyed on FAILURES, which that clean
+  # exit never incremented, so on a multi-GPU host it could never fire -- the
+  # frames lost their last consumer and the run died with
+  # "internal error: writer stuck" at exit 1.
+  #
+  # WHY --gpu-devices=2 AND NOT THE DEFAULT: this is a race against the other
+  # workers exiting, and 2 is the minimum device count that exhibits the bug and
+  # the most reliable.  Measured on the pre-fix binary: 3/3 wedged at 2 and 3
+  # devices, 0/4 at 8 (with 8, a still-live GPU picks the frames back up, which
+  # is the designed rescue and proves nothing).  With ONE device it cannot fail
+  # at all -- "the one that failed" and "the last one out" are the same thread,
+  # so the old code was correct by accident.
+  if [[ $(nvidia-smi -L 2>/dev/null | wc -l) -ge 2 ]]; then
+    gw_src="$TMPDIR/large.bin"
+    gw_z="$TMPDIR/gpu-wedge.zst"
+    gw_r="$TMPDIR/gpu-wedge.out"
+    gw_e="$TMPDIR/gpu-wedge.err"
+    "$GZSTD" -k -f -3 --gpu-only "$gw_src" -o "$gw_z" 2>/dev/null
+    GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1 run_test "$GZSTD" -d --gpu-only \
+      --gpu-devices=2 -k -f "$gw_z" -o "$gw_r" 2>"$gw_e"
+    # CONTROL FIRST: if the injected fault never fired, this cell tested nothing.
+    # Report that rather than passing on silence.
+    if ! grep -q "FAIL_GPU_DECOMP_LAST" "$gw_e"; then
+      fail "GPU decompress fault -> CPU rescue" "fault never fired: NOT TESTED"
+    elif [[ $LAST_RC -eq 1 ]]; then
+      fail "GPU decompress fault -> CPU rescue" "exit 1: writer wedged"
+    elif files_match "$gw_src" "$gw_r"; then
+      pass "GPU decompress fault -> rescue finishes the job"
+    else
+      fail "GPU decompress fault -> CPU rescue" "exit $LAST_RC, output mismatch"
+    fi
+    rm -f "$gw_z" "$gw_r" "$gw_e"
+  else
+    skip "GPU decompress fault -> rescue finishes the job" "needs 2+ GPUs"
+  fi
+
   t0=$(now_ms)
   tar -I "$GZSTD" -cf "$TMPDIR/gpu-tree.tar.zst" -C "$TMPDIR" tree 2>/dev/null || \
     tar -I "$GZSTD --hybrid" -cf "$TMPDIR/gpu-tree.tar.zst" -C "$TMPDIR" tree 2>/dev/null
@@ -1217,6 +1255,7 @@ else
   skip "--verify-engine=gpu without --gpu-only warns + falls back to CPU verify" "no GPU"
   skip "hybrid compress/decompress" "no GPU"
   skip "gpu integrity test" "no GPU"
+  skip "GPU decompress fault -> rescue finishes the job" "no GPU"
   skip "gpu tar" "no GPU"
   skip "gpu batch sizes" "no GPU"
   skip "GPU fault -> CPU-only rebuild (round-trips)" "no GPU"

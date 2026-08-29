@@ -1,12 +1,98 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.14  
+**Covers:** v0.9.50 → v0.17.15  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.15 — the multi-GPU CPU rescue could never fire, so a bad archive wedged instead of failing
+
+`gzstd -t --gpu-only` on a corrupt archive exits **1** with `internal error: writer stuck —
+workers_done but frame 0 of 1 missing` instead of the data error every other backend reports.
+Reproduced 8 times out of 8 — this is deterministic, not a race. `--hybrid` and `--gpu-only
+--gpu-devices=1` are correct on the same file, which is why it survived this long.
+
+When a GPU decompress worker faults it re-enqueues its undelivered frames *"so other GPUs can
+pick them up"*, and the last worker to fail runs `gpu_only_cpu_fallback` so those frames still
+have a consumer. The trigger was `fails == gpu_worker_count` — counting only **failures**. But a
+worker that drains the queue and leaves exits *normally* and never touches that counter. On any
+multi-GPU run at least one device finishes cleanly, so the count is capped below the total
+forever and **the rescue can never fire**. The re-enqueued frames sit in the queue with nothing
+left to consume them, and the writer waits for a frame that will never arrive.
+
+Single-GPU runs were correct by accident: with one worker, "the one that failed" and "the last
+one out" are the same thread. The defect needs a device count above 1 and at least one clean
+drain — that is, the normal configuration on a multi-GPU host.
+
+Fixed by keying the rescue on **exits** rather than failures, in a separate counter incremented
+on all three exit paths (clean drain, VRAM-skip at init, fault). `gpu_failures` keeps its old
+meaning because the bringup barrier reads it — counting clean exits there would release that
+barrier early. The last worker out rescues only if `queue->drained()` is false, so a healthy run
+never spawns a fallback pool.
+
+Corrupt archive, 2 frames, 8 GPUs visible:
+
+| config | before | after |
+|---|---|---|
+| `--cpu-only` | 4 | 4 |
+| `--hybrid` | 4 | 4 |
+| `--gpu-only --gpu-devices=1` | 4 | 4 |
+| **`--gpu-only`** (8 devices) | **1 — wedged, 8/8 reps** | **4** |
+
+**What actually triggers it in the wild**, since this is not a hypothetical path: a corrupt
+archive that walks nvCOMP off the end of a buffer. The first device reports
+`cudaStreamSynchronize(decomp): an illegal memory access was encountered` and the poisoned CUDA
+context then cascades — the remaining devices fail with `CUDA-capable device(s) is/are busy or
+unavailable`. That is a **throw**, so it takes the re-enqueue path and wedges. A plain content
+checksum mismatch does *not* wedge: v0.17.14 made that `die(EXIT_DATA)`, which exits before any of
+this machinery runs. The distinction matters for testing — see below.
+
+### A second issue, found while building a deterministic test for the first — and NOT a live bug
+
+`C.delivered` — the count the catch block uses to decide which frames of the in-flight batch are
+still undelivered and must be re-enqueued — was reset to 0 **immediately before the nvCOMP
+decompress launch**. Every throw site in batch *setup* runs earlier: device allocation, the three
+H2D copies, nvCOMP temp sizing, and the re-upload after a temp grow. A fault there, on any batch
+after the first, would find `C.delivered` holding the **previous** batch's count and slice that
+many frames off a freshly popped batch, re-enqueueing only the remainder.
+
+**Then the instrument said otherwise, so here is what is actually true.** A probe printed
+`delivered` and `batch.size()` from inside the catch on every fault. Across 9 runs and 4 device
+and stream configurations, the erase **never once fired**:
+
+```
+[SCRATCH] catch: delivered=16 batch=5  -> no erase
+[SCRATCH] catch: delivered=16 batch=15 -> no erase
+[SCRATCH] catch: delivered=0  batch=16 -> no erase
+```
+
+The guard is `C.delivered <= C.batch.size()`, and the stale count is reliably *larger* than the
+fresh batch, because batches shrink as the queue drains. A run injecting setup faults produced
+byte-identical output 15 times out of 15. An earlier 1-in-3 wedge that prompted this investigation
+did not recur (0 of 6) and the probe shows no erase on those runs, so it was a flake and not this
+mechanism.
+
+So this is **not** a data-loss bug and should not be cited as one. It is a correct-by-accident
+invariant: the code was relying on "the next batch is always smaller" without saying so anywhere.
+Resetting `C.delivered` at batch **intake** — where it always describes the batch actually held —
+makes the guard unnecessary rather than load-bearing. Kept because it is a one-line move that
+removes a dependency on an accident, not because it fixes an observed failure.
+
+**Checked and ruled out**, so nobody re-derives it: the trivially-compressed batch path also
+calls `queue->re_enqueue()` and then exits the worker with a comment reading *"Let CPU workers
+drain the queue alone"* — which under `--gpu-only` is nobody. It is unreachable rather than
+wrong: the whole block is guarded by `if (sched)`, and `sched` is constructed only when
+`!opt.gpu_only && opt.hybrid`, so under `--gpu-only` it is dead code and under `--hybrid` the
+CPU pool it hands off to actually exists.
+
+The compress worker shares the `gpu_only_cpu_fallback` mechanism but not the defect: its mid-run
+catch deliberately does **not** re-enqueue — it raises `g_gpu_aborted` and lets the driver
+rebuild CPU-only from the still-present input — so it has no stranded-frame case to strand.
+
+---
 
 ## v0.17.14 — GPU decompress never checked the content checksum, and wrote corrupt output at exit 0
 
