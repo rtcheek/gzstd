@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.16";
+static constexpr const char * GZSTD_VERSION = "0.17.17";
 //
 // Architecture overview:
 //
@@ -602,6 +602,12 @@ static GdsFile g_gds_input;
 // NVMe -> VRAM (cuFileRead) -> nvCOMP decompress in VRAM -> device-side XXH64
 // against the frame trailer -> report.  Nothing is written, so unlike
 // --gds-only -d there is no output-side machinery here at all.
+// The READ side: input frames are file regions pulled NVMe -> VRAM by cuFileRead.
+// True for -t AND for -d; it is what makes decompress NVMe -> VRAM -> NVMe rather
+// than "host read, H2D, decompress, peer-to-peer write".
+static std::atomic<bool> g_gds_read_active{false};
+// TEST only: the payload is verified on the device and never copied D2H.  A -d
+// run reads the same way but still has to deliver its bytes somewhere.
 static std::atomic<bool> g_gds_verify_active{false};
 // Where the time actually goes on the verify path.  Added because two
 // plausible explanations for its cost (serial reads, then buffer registration)
@@ -12701,8 +12707,13 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
   // -t verify is the one staged case that CAN be rescued: the frames name
   // regions of an archive still open, so cpu_decomp_worker re-reads them (see
   // the materialise block there).  Refuse only when that descriptor is missing.
+  // Staged frames name regions of an archive still open, so cpu_decomp_worker
+  // can re-read them.  NOT rescuable when the peer-to-peer WRITER is live: that
+  // path bypasses the ordered writer, so a CPU pool would push into a
+  // ResultStore nothing drains.
   const bool verify_rescuable = decompress
-      && g_gds_verify_active.load(std::memory_order_relaxed)
+      && g_gds_read_active.load(std::memory_order_relaxed)
+      && !g_gds_out_active.load(std::memory_order_relaxed)
       && g_gds_verify_plain_fd >= 0;
   if (opt.region_staged() && !verify_rescuable
       && (!decompress
@@ -25699,7 +25710,8 @@ static void gpu_decomp_worker(
     // Carried as a member because this is a LOCAL struct: its member functions
     // cannot reach the enclosing function's `opt` parameter.
     bool   gds_only = false;
-    bool   gds_verify = false;    // --gds-only -t: read side is cuFile
+    bool   gds_read = false;      // --gds-only -t/-d: read side is cuFile
+    bool   gds_verify = false;    // --gds-only -t only: verified on device, no D2H
     bool   gds_reg_log = false;   // verbosity, carried for the same local-struct reason
     void * d_temp = nullptr;
     size_t temp_bytes = 0;
@@ -25816,7 +25828,7 @@ static void gpu_decomp_worker(
 
       if (cudaMalloc(&d_comp_buf,     batch_n * max_comp)    != cudaSuccess) return false;
       if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) return false;
-      if (gds_verify) {
+      if (gds_read) {
         // The READ target.  Skipping this registration does not fail: cuFile
         // silently bounces the transfer through a host buffer, so the run would
         // still be correct and still be reported as GDS while doing exactly the
@@ -25940,7 +25952,7 @@ static void gpu_decomp_worker(
     // --chunk-size 256 than at 16.  A count tuned here would be a constant that
     // happened to suit one machine's chunk size.  --gpu-batch still wins if the
     // user sets it: this only bounds the tuner's speculative headroom.
-    if (g_gds_verify_active.load(std::memory_order_relaxed)
+    if (g_gds_read_active.load(std::memory_order_relaxed)
         && !opt.gpu_batch_user_set) {
       const size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
       const size_t budget    = GDS_VERIFY_REGISTER_BUDGET;
@@ -25960,6 +25972,7 @@ static void gpu_decomp_worker(
     // 4 KiB-aligned runs the ordinary delivery path even under --gds-only.
     for (auto & C : ctxs) {
       C.gds_only    = g_gds_out_active.load(std::memory_order_relaxed);
+      C.gds_read    = g_gds_read_active.load(std::memory_order_relaxed);
       C.gds_verify  = g_gds_verify_active.load(std::memory_order_relaxed);
       C.gds_reg_log = (opt.verbosity >= V_VERBOSE);
     }
@@ -26440,7 +26453,7 @@ static void gpu_decomp_worker(
         // has to hold up to 4095 bytes of lead-in plus the tail round-up.  Two
         // pages of headroom, and the slot base stays 4 KiB-aligned so the
         // device offset is eligible for peer-to-peer.
-        if (C.gds_verify)
+        if (C.gds_read)
           max_comp = ((max_comp + 8191) & ~size_t(4095));
 
         if (opt.verbosity >= V_DEBUG) {
@@ -27185,7 +27198,7 @@ static void gpu_decomp_worker(
 // Returns the frame count, or GDS_VERIFY_DEMOTE if there is no usable table.
 static const size_t GDS_VERIFY_DEMOTE = SIZE_MAX;
 
-static size_t gds_verify_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m,
+static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m,
                                          const Options & opt,
                                          size_t * max_frame_decomp_out)
 {
@@ -27247,11 +27260,15 @@ static size_t gds_verify_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     m->total_out_final.store(true, std::memory_order_relaxed);
   }
   g_adapt_src_path.store("cufile", std::memory_order_relaxed);
-  for (Task & t : built) {
-    const size_t csz = t.src_len;
+  // DO NOT credit read_bytes here.  The GPU worker already adds each batch's
+  // compressed bytes as it CONSUMES them, and that is the meter's correct
+  // semantic -- bytes processed, not bytes enqueued.  Crediting the whole
+  // archive up front (this producer enqueues every frame before any is decoded)
+  // double-counted against the worker: a 65.38 GiB archive read "in: 100.0%
+  // 106.98 GiB @ 28.14 GiB/s" -- the total exceeded the file, and the rate was
+  // meaningless because the numerator arrived before any work happened.
+  for (Task & t : built)
     queue.push(std::move(t));
-    if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
-  }
   queue.set_done();
   if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
   if (opt.verbosity >= V_VERBOSE) {
@@ -27435,16 +27452,32 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // file" rule is not a rule about -t at all -- it is a rule about writing by
   // offset into a file handle.  --gds-only -t uses the READ side instead:
   // NVMe -> VRAM -> decompress in VRAM -> device-side XXH64 -> report.
-  if (opt.gds_only && opt.mode == Mode::TEST) {
-    // tar verification hands decompressed frames to the in-process tar parser,
-    // which is a HOST consumer -- there is no point pulling bytes into VRAM
-    // only to copy them straight back out, so that combination stays ordinary.
+  // THE READ SIDE, for -t and -d alike.  Until v0.17.17 only the WRITE half of
+  // --gds-only -d was peer-to-peer: compressed frames came in through the
+  // ordinary host reader and an H2D copy, so every compressed byte still went
+  // through host memory on the way to a device that then wrote its output
+  // straight back to the drive.  The seek-table producer built for -t supplies
+  // the missing half, and -d needs no ordering help to use it because
+  // offset-addressed writes already bypass the ordered writer.
+  // GZSTD_DEBUG_GDS_NO_STAGED_READ=1 -- run --gds-only with the ORDINARY host
+  // reader, so the peer-to-peer read can be measured against its own absence on
+  // one binary.  Without a control inside the tool, "P2P read is faster" cannot
+  // be separated from the batch pinning that landed alongside it, and the two
+  // were in fact worth very different amounts.
+  const bool gds_read_eligible = opt.gds_only
+      && (opt.mode == Mode::TEST || opt.mode == Mode::DECOMPRESS)
+      && ::getenv("GZSTD_DEBUG_GDS_NO_STAGED_READ") == nullptr;
+  if (gds_read_eligible) {
+    const char * what = (opt.mode == Mode::TEST) ? "-t" : "-d";
+    // --tar hands decompressed frames to the in-process tar parser, a HOST
+    // consumer -- no point pulling bytes into VRAM to copy them straight back.
     if (opt.tar_mode) {
-      vlog(V_NORMAL, opt, "warning: --gds-only -t --tar verifies through the tar "
-           "parser, which reads on the host; using the ordinary read path.\n");
-    } else if (device_count <= 0 || gpu_disabled_by_peek) {
-      vlog(V_NORMAL, opt, "warning: --gds-only -t needs a GPU; using the ordinary "
+      vlog(V_NORMAL, opt, std::string("warning: --gds-only ") + what + " --tar works "
+           "through the tar parser, which reads on the host; using the ordinary "
            "read path.\n");
+    } else if (device_count <= 0 || gpu_disabled_by_peek) {
+      vlog(V_NORMAL, opt, std::string("warning: --gds-only ") + what + " needs a GPU; "
+           "using the ordinary read path.\n");
     } else {
       // O_DIRECT IS REQUIRED, NOT AN OPTIMISATION -- cuFile refuses the
       // peer-to-peer path on a buffered descriptor and quietly reads through
@@ -27477,10 +27510,14 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         char pl[64];
         std::snprintf(pl, sizeof(pl), "/proc/self/fd/%d", cur);
         g_gds_verify_plain_fd = ::open(pl, O_RDONLY | O_CLOEXEC);
-        g_gds_verify_active.store(true, std::memory_order_release);
+        g_gds_read_active.store(true, std::memory_order_release);
+        // Only -t may skip the D2H: -d still owes its bytes to the drive.
+        if (opt.mode == Mode::TEST)
+          g_gds_verify_active.store(true, std::memory_order_release);
       }
     }
-  } else if (opt.gds_only) {
+  }
+  if (opt.gds_only && opt.mode != Mode::TEST) {
     if (opt.to_stdout)
       die("--gds-only decompress needs a real output file: GPUDirect Storage writes "
           "by offset into a registered file handle, which a pipe cannot provide");
@@ -27623,7 +27660,7 @@ gds_out_declined:
   // cold on a 1 GiB archive: tuner free 5.68 s wall / 2.70 s user, pinned at the
   // same ceiling 3.38 s / 0.31 s.  Nothing here needs the tuner: the frame size
   // is fixed by the archive and the budget already bounds the mapping.
-  if (g_gds_verify_active.load(std::memory_order_relaxed)
+  if (g_gds_read_active.load(std::memory_order_relaxed)
       && !opt.gpu_batch_user_set) {
     const size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
     const size_t fit = std::max<size_t>(1, GDS_VERIFY_REGISTER_BUDGET / frame_cap);
@@ -27798,19 +27835,20 @@ gds_out_declined:
   // is handled up front by peek_first_frame_decomp_size.
   size_t max_frame_decomp = 0;
   size_t n_frames = GDS_VERIFY_DEMOTE;
-  if (g_gds_verify_active.load(std::memory_order_acquire)) {
-    n_frames = gds_verify_frames_to_queue(in, queue, m, opt, &max_frame_decomp);
+  if (g_gds_read_active.load(std::memory_order_acquire)) {
+    n_frames = gds_staged_frames_to_queue(in, queue, m, opt, &max_frame_decomp);
     if (n_frames == GDS_VERIFY_DEMOTE) {
       // No usable seek table.  Stand down completely -- the workers read
       // g_gds_verify_active to decide whether a Task is a file region, so
       // leaving it set while the ordinary producer pushes host-backed Tasks
       // would have them read from a slab nobody filled.
+      g_gds_read_active.store(false, std::memory_order_release);
       g_gds_verify_active.store(false, std::memory_order_release);
       g_gds_input.close();
       if (g_gds_verify_fd >= 0) { ::close(g_gds_verify_fd); g_gds_verify_fd = -1; }
       if (g_gds_verify_plain_fd >= 0) { ::close(g_gds_verify_plain_fd); g_gds_verify_plain_fd = -1; }
       vlog(V_NORMAL, opt,
-           "warning: --gds-only -t needs the archive's seek table to locate frames "
+           "warning: --gds-only needs the archive's seek table to locate frames "
            "without reading them;\n  this archive has none, so the ordinary read "
            "path is used instead.\n");
       if (std::fseek(in, 0, SEEK_SET) != 0)
@@ -27919,7 +27957,7 @@ gds_out_declined:
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   for (auto & th : gpu_workers) th.join();
 
-  if (g_gds_verify_active.load(std::memory_order_relaxed)
+  if (g_gds_read_active.load(std::memory_order_relaxed)
       && opt.verbosity >= V_VERBOSE) {
     const uint64_t rn = g_gdsv_read_ns.load(std::memory_order_relaxed);
     const uint64_t rb = g_gdsv_read_bytes.load(std::memory_order_relaxed);

@@ -1,12 +1,88 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.16  
+**Covers:** v0.9.50 → v0.17.17  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.17 — `--gds-only -d` becomes NVMe → VRAM → NVMe, and the progress meter stops reading past 100%
+
+Until now only the **write** half of `--gds-only -d` was peer-to-peer. Compressed frames came in
+through the ordinary host reader and an H2D copy, so every compressed byte still crossed host
+memory on its way to a device that then wrote its output straight back to the drive. The
+seek-table producer built for `-t` in v0.17.16 supplies the missing half.
+
+`-d` needed no ordering work to use it: offset-addressed writes already bypass the ordered writer,
+and the producer was already carrying each frame's `out_off` from the table. The one flag was
+split in two — `g_gds_read_active` (frames are file regions read by `cuFileRead`; `-t` and `-d`)
+and `g_gds_verify_active` (TEST only: verified on the device, never copied D2H).
+
+Cold, 1 GiB, **one device on every arm** — the device-count confound has produced a wrong answer
+four times in this arc and is controlled here:
+
+| `-d` | wall | user | sys | host RSS |
+|---|---|---|---|---|
+| **P2P read + P2P write** (this version) | 4.37–4.42 s | **0.49–0.58 s** | 3.33–3.41 s | 8.67 GiB |
+| host read + P2P write (v0.17.16) | 6.30–8.51 s | 2.12–4.57 s | 5.97–6.04 s | 17.7 GiB |
+| `--gpu-only`, no GDS at all | **2.92–3.23 s** | 1.21–1.26 s | 3.65–3.90 s | **1.16 GiB** |
+
+Against the previous `-d`: **1.4–1.9x wall, 4–9x less user CPU, half the RSS**, and the
+run-to-run instability is gone (6.30 vs 8.51 s on the old path).
+
+**`--gpu-only` still wins wall clock at this size** — 2.92–3.23 s against 4.37–4.42 s — while GDS
+wins total CPU (3.90 s vs 4.91 s). That is the same verdict as everywhere else in this arc: GDS
+buys CPU efficiency, not throughput. It is measured on 1 GiB against one H100 on fast NVMe, which
+is the size where fixed costs dominate and therefore the least representative case for a decision.
+
+`GZSTD_DEBUG_GDS_NO_STAGED_READ=1` runs `--gds-only` through the ordinary host reader, so the
+peer-to-peer read can always be measured against its own absence on one binary. Without that
+control the read could not be separated from the batch pinning that landed beside it — and the two
+were worth very different amounts.
+
+### The progress meter read past the size of the file
+
+`--gds-only -d` on a 65 GiB archive reported `in: 100.0% 106.98 GiB @ 28.14 GiB/s` — a total
+larger than the file, at a rate no drive produced.
+
+The staged producer credited every frame's compressed size at **enqueue** time, while the GPU
+worker separately credits each batch as it **consumes** it. Both fired. At `out: 59.3%` that was
+65.38 GiB banked up front plus ~41.6 GiB actually consumed — exactly the 106.98 GiB reported, and
+the "28 GiB/s" was simply the whole archive appearing before any work had happened.
+
+The worker's count is the correct semantic — bytes processed, not bytes enqueued — so the
+producer's increment is gone. Output was byte-identical throughout; this was only ever cosmetic.
+But it was **invisible on every test corpus used to develop the feature**: at 1 GiB the producer
+finishes almost instantly, `in:` snaps to 100%, and it looks plausible. It took a 65 GiB archive,
+where producer and consumers are separated in time, for it to show at all.
+
+### Measured, for the optimisation work that follows
+
+`-vvv` on a 1 GiB decompress, 2 batches:
+
+| phase | time | share of the batch loop |
+|---|---|---|
+| staged reads | 0.132 s | 13% |
+| **decompress kernel** | **0.145 s** | **14%** |
+| writes (`cuFileWrite`) | 0.347 s | 34% |
+| syncs, temp queries, readbacks | ~0.38 s | 38% |
+
+**The GPU is busy 14% of the batch loop**, which is what watching nvtop sputter actually looks
+like. The reads are not the constraint (4023 MiB/s aggregate, 1.03 ms/call). `gpu_streams` is
+forced to 1 for every `region_staged()` path, so read, kernel and write cannot overlap: nothing
+reads while the kernel runs and nothing decompresses while frames go out. One stream × 64 frames ×
+16 MiB × 2 slabs is ~2 GiB of a 95 GiB card in play.
+
+Also visible: **192 reads for 128 frames** — a temp-buffer grow reallocated the slab and forced a
+re-read of one batch, so ~50% redundant read traffic on this workload.
+
+Not addressed here. Recorded because the next step is pipelining, and a bigger buffer alone will
+not fix it: a larger batch still runs read → kernel → write in series and simply idles the GPU for
+longer stretches instead of more often.
+
+---
 
 ## v0.17.16 — `--gds-only -t`: NVMe → VRAM → verify on the device, and the payload never reaches host memory
 
