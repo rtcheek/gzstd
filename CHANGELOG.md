@@ -1,12 +1,103 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.15  
+**Covers:** v0.9.50 → v0.17.16  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.16 — `--gds-only -t`: NVMe → VRAM → verify on the device, and the payload never reaches host memory
+
+`gzstd -t --gds-only` used to refuse outright: *"--gds-only decompress needs a real output file"*.
+That rule is about writing by offset into a registered handle, and `-t` writes nothing — it was
+never a rule about `-t`. The flag now drives the **read** side instead.
+
+Frame extents come from the archive's seek table, each frame is `cuFileRead` straight into VRAM,
+nvCOMP decompresses it there, and the device-side XXH64 added in v0.17.14 is compared against the
+frame's own trailer. No D2H, no writer thread, no host copy of the payload.
+
+**Why the seek table is required.** The ordinary decompress producer finds frame boundaries with
+`ZSTD_findFrameCompressedSize`, which walks each frame's block headers *in a host buffer* — so it
+must pull the compressed stream into host RAM just to learn where the next frame begins. Reading
+it again into VRAM afterwards would move every byte twice and make "NVMe → VRAM" a fiction. The
+seek table gives exact `(offset, csize, dsize)` per frame for free. Every gzstd archive carries
+one (v0.14.92), as does any zstd-seekable archive; anything else **demotes with a warning** rather
+than failing or pretending.
+
+**Compressed frame starts are almost never 4 KiB-aligned** — measured on real archives, only frame
+0 is. Peer-to-peer needs alignment on the file offset, the device offset *and* the length, and an
+unaligned `cuFileRead` does not fail, it silently bounces through host memory. So each frame is
+read as an aligned superset and nvCOMP is handed a pointer to where the frame actually starts
+inside that window.
+
+### The performance work, which was mostly undoing my own mistakes
+
+Reported from a 65 GiB archive: **151 MiB/s, 62 s user against 2.8 s system** — one core pegged
+while the drive idled. Two hypotheses were wrong and are recorded so nobody retries them:
+
+- **Serial `cuFileRead`.** The compress path fans its reads across threads and documents why
+  ("synchronous per call"), so a fan-out was built here too — and measured to do **nothing**
+  (7.63–7.94 s serial vs 8.01 s fanned out). Instrumentation said why: the reads are **0.52 s of a
+  7.84 s run**, 159 calls at 1282 MiB/s aggregate. They were never the constraint. The fan-out was
+  reverted rather than kept on a hypothesis measurement had refuted; the counters it took to find
+  that out are kept and print at `-vv`.
+- **Buffer registration.** 4 calls, ~115 ms total. Not it either.
+
+The actual cause was **a bound added in this same version**. Host RSS tracks the *registered*
+bytes (`--gpu-only` allocates identical device slabs for free — it just never registers them), so
+the compressed slab was capped at 256 MiB. That forced batch=16, and a smaller batch means more
+per-batch synchronisation, and **CUDA's default sync spin-waits in userspace**. Tidy-looking
+memory hygiene bought a pegged core. The auto-tuner then made it worse by exploring *smaller*
+batches still, so it is now pinned and locked on this path.
+
+Cold, caches dropped per run, 1 GiB archive:
+
+| | wall | user | sys | host RSS |
+|---|---|---|---|---|
+| 256 MiB budget, tuner free | 8.36 s | 5.43 s | 2.77 s | 1.28 GiB |
+| 1 GiB budget, tuner free | 5.68 s | 2.70 s | 2.90 s | 4.42 GiB |
+| **1 GiB budget, tuner pinned** | **3.41–3.50 s** | **0.32 s** | 2.87–2.98 s | 4.42 GiB |
+| *(control)* `--gpu-only`, 1 device | 2.99 s | 1.15 s | 3.35 s | — |
+
+**2.4x wall and 17x user CPU against where it started**, now below `--gpu-only` on user time. The
+1 GiB budget is a measured knee, not a round number: past it the mapping grows 4x to buy nothing
+(batch 256 was *slower*). The 4.42 GiB of host RSS is the honest price of the mapping.
+
+### What this does NOT claim
+
+Peer-to-peer **routing** is not claimed. Alignment counters show eligibility, not routing — only
+cuFile's `posix=` counter discriminates, and it was not run here. What is demonstrable is that the
+payload never enters host memory on gzstd's side.
+
+`--cpu-only -t` remains far faster in wall clock at this size (0.40 s cold on 1 GiB). Much of what
+looks like GPU slowness is fixed init: measured on a near-empty archive, `--gpu-only` costs
+**9.66 s with 8 devices visible and 1.78 s with one** — for `-t`, the effective fix is not
+initialising eight GPUs to check one file.
+
+### Safety, and three defects found while building it
+
+- **cuFile silently needs `O_DIRECT`** — a buffered `FILE*` registers fine and then reads through
+  the page cache. The archive is reopened through procfs so `O_DIRECT` cannot leak into the
+  caller's handle.
+- **The CPU rescue segfaulted** on staged Tasks, and on the runs where it did not it "verified"
+  garbage and **exited 0** — the worst possible answer for a command whose entire job is to say
+  whether an archive is intact. Staged Tasks are now re-read from the archive by the CPU path, so
+  the rescue produces a real verdict (exit 4) instead of refusing with a usage error.
+- **A second upload path** (after a temp grow reallocates the slab) also copied from a staged
+  Task's non-existent host pointer. Both paths now go through one routine; staged frames are
+  re-*read*, since their bytes only existed in the slab that was just freed.
+
+`gpu_only_cpu_fallback` also used to die without ever saying *why* the GPU failed; the cause is
+now logged.
+
+Suite gains `--gds-only -t verifies on the device`, which keeps three outcomes distinct on
+purpose: a demoted run **skips** (GDS has four platform gates and any of them can be shut), a run
+that silently never engaged **fails as NOT TESTED**, and only an engaged run may pass — then it
+must also reject a corrupted archive.
+
+---
 
 ## v0.17.15 — the multi-GPU CPU rescue could never fire, so a bad archive wedged instead of failing
 

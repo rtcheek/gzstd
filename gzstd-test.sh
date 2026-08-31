@@ -1140,6 +1140,44 @@ if has_gpu 2>/dev/null; then
     skip "GPU decompress fault -> rescue finishes the job" "needs 2+ GPUs"
   fi
 
+  # --gds-only -t (v0.17.16): frame extents from the seek table, cuFileRead into
+  # VRAM, nvCOMP decompress in VRAM, device-side XXH64 against the frame trailer.
+  # Nothing is written and the payload never reaches host memory.
+  #
+  # THREE OUTCOMES, KEPT DISTINCT ON PURPOSE.  GDS needs four platform gates
+  # (driver, filesystem, O_DIRECT, a seek table); when any is missing the path
+  # DEMOTES to the ordinary reader and still returns the right answer.  A test
+  # that only checked the exit code would pass on a machine where the feature
+  # never ran at all -- so demotion SKIPS, a silent non-engagement FAILS, and
+  # only an engaged run is allowed to pass.
+  gv_z="$TMPDIR/gdsv.zst"; gv_e="$TMPDIR/gdsv.err"; gv_bad="$TMPDIR/gdsv-bad.zst"
+  "$GZSTD" -k -f -3 "$TMPDIR/large.bin" -o "$gv_z" 2>/dev/null
+  "$GZSTD" -vv -t --gds-only "$gv_z" 2>"$gv_e" >/dev/null; gv_rc=$?
+  if grep -q "using the ordinary read path" "$gv_e"; then
+    skip "--gds-only -t verifies on the device" "GDS unavailable (demoted)"
+  elif ! grep -q "\[GDS\] verify:" "$gv_e"; then
+    fail "--gds-only -t verifies on the device" "path never engaged: NOT TESTED"
+  elif [[ $gv_rc -ne 0 ]]; then
+    fail "--gds-only -t verifies on the device" "clean archive exit $gv_rc"
+  else
+    # Engaged and clean.  It must also REJECT damage -- a verifier that only ever
+    # says OK is worse than no verifier.
+    cp "$gv_z" "$gv_bad"
+    python3 - "$gv_bad" <<'GVPY' 2>/dev/null
+import sys, os
+p = sys.argv[1]; n = os.path.getsize(p)
+with open(p, 'r+b') as f:
+    off = n // 2
+    f.seek(off); b = f.read(1)
+    f.seek(off); f.write(bytes([b[0] ^ 0x5A]))
+GVPY
+    run_test "$GZSTD" -q -t --gds-only "$gv_bad" 2>/dev/null
+    [[ $LAST_RC -eq 4 ]] \
+      && pass "--gds-only -t verifies on the device" \
+      || fail "--gds-only -t corrupt archive" "exit $LAST_RC, want 4"
+  fi
+  rm -f "$gv_z" "$gv_e" "$gv_bad"
+
   t0=$(now_ms)
   tar -I "$GZSTD" -cf "$TMPDIR/gpu-tree.tar.zst" -C "$TMPDIR" tree 2>/dev/null || \
     tar -I "$GZSTD --hybrid" -cf "$TMPDIR/gpu-tree.tar.zst" -C "$TMPDIR" tree 2>/dev/null
@@ -1256,6 +1294,7 @@ else
   skip "hybrid compress/decompress" "no GPU"
   skip "gpu integrity test" "no GPU"
   skip "GPU decompress fault -> rescue finishes the job" "no GPU"
+  skip "--gds-only -t verifies on the device" "no GPU"
   skip "gpu tar" "no GPU"
   skip "gpu batch sizes" "no GPU"
   skip "GPU fault -> CPU-only rebuild (round-trips)" "no GPU"

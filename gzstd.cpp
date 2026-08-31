@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.15";
+static constexpr const char * GZSTD_VERSION = "0.17.16";
 //
 // Architecture overview:
 //
@@ -598,6 +598,40 @@ private:
 // registration is the expensive part, so one handle for all devices and streams
 // is both correct and the cheap arrangement.  Only ever touched by --gds-only.
 static GdsFile g_gds_input;
+// --gds-only -t: verify an archive with the payload never entering host memory.
+// NVMe -> VRAM (cuFileRead) -> nvCOMP decompress in VRAM -> device-side XXH64
+// against the frame trailer -> report.  Nothing is written, so unlike
+// --gds-only -d there is no output-side machinery here at all.
+static std::atomic<bool> g_gds_verify_active{false};
+// Where the time actually goes on the verify path.  Added because two
+// plausible explanations for its cost (serial reads, then buffer registration)
+// were both wrong, and guessing a third would have been worse than measuring.
+static std::atomic<uint64_t> g_gdsv_read_ns{0};
+static std::atomic<uint64_t> g_gdsv_read_bytes{0};
+static std::atomic<uint64_t> g_gdsv_kernel_ns{0};
+static std::atomic<uint64_t> g_gdsv_reads{0};
+
+// How many bytes of compressed slab --gds-only -t may hand to cuFileBufRegister
+// per stream.  Host RSS tracks this number (see where it is applied), and a
+// verify only needs enough frames in flight to keep the device busy.  256 MiB is
+// 16 frames at the default 16 MiB chunk and one frame at --chunk-size 256.
+// 1 GiB, which is a MEASURED KNEE and not a round number.  Cold, 1 GiB archive:
+//   budget   batch   wall    user    host RSS
+//   256 MiB     16   8.36 s  5.43 s   1.28 GiB
+//     1 GiB     64   3.38 s  0.31 s   4.42 GiB
+//     4 GiB    256   4.04 s  0.17 s  17.0  GiB
+// The user-CPU column is the surprise and the reason this is not simply "as
+// small as possible": a smaller batch means MORE per-batch synchronisation, and
+// CUDA's default sync SPIN-WAITS in userspace, so shrinking the mapping to save
+// host RSS buys a pegged core instead.  256 MiB looked like the tidy answer and
+// cost 2.5x wall clock.  Past 1 GiB the mapping grows 4x to buy nothing.
+static const size_t GDS_VERIFY_REGISTER_BUDGET = 1024u * 1024u * 1024u;
+static int                   g_gds_verify_fd = -1;   // O_DIRECT dup of the archive
+// A BUFFERED dup as well, for the CPU rescue: it preads arbitrary
+// (offset, length) pairs, which an O_DIRECT descriptor rejects outright.
+static int                   g_gds_verify_plain_fd = -1;
+static std::atomic<uint64_t> g_gds_verify_frames{0};
+static std::atomic<uint64_t> g_gds_verify_bytes{0};
 static int                g_stage_input_fd    = -1;
 static unsigned long long g_gds_bar1_before = 0;
 // --gds-only decompress writes VRAM -> NVMe at absolute offsets, so frames need
@@ -8174,6 +8208,13 @@ struct Task {
   // Task names a GdsStagePool slot the GPU worker copies out of and releases.
   int          gds_stage = -1;
   size_t       src_len = 0;
+  // --gds-only -t: a staged Task has NO host bytes, so the two things the GPU
+  // worker normally reads off the frame header (the Content_Checksum_flag) and
+  // trailer (the expected XXH64) cannot be read from ptr().  The producer
+  // preads those 13 bytes -- header[0..8] and the last 4 -- and carries them
+  // here.  That is metadata, not payload: the frame body never touches host.
+  unsigned char stg_has_ck    = 0;
+  unsigned int  stg_expect_ck = 0;
 
   bool         is_staged() const { return src_off >= 0 || gds_stage >= 0; }
   const char * ptr() const { return view_ptr ? view_ptr : data.data(); }
@@ -12361,6 +12402,35 @@ static void cpu_decomp_worker(
 
     // Permit already acquired above (before pop).
 
+#ifdef HAVE_NVCOMP
+    // --gds-only -t: this Task names a REGION OF THE ARCHIVE and carries no
+    // host bytes -- the GPU worker would have cuFileRead it straight into VRAM.
+    // Materialise it ONCE, here, so every consumer below (three separate
+    // ZSTD_decompress* call sites) keeps working unchanged; patching each of
+    // them is how mirrored paths drift apart.
+    //
+    // This is what makes the GPU path FALLIBLE WITHOUT LYING.  Without it the
+    // rescue could only refuse, and a corrupt archive -- which is exactly what
+    // makes nvCOMP fault -- came back as exit 2 "bad usage" instead of exit 4
+    // "this archive is damaged", which is the one question -t exists to answer.
+    if (t.src_off >= 0 && g_gds_verify_plain_fd >= 0) {
+      std::vector<char> host(t.src_len);
+      size_t got = 0;
+      while (got < t.src_len) {
+        const ssize_t r = ::pread(g_gds_verify_plain_fd, host.data() + got,
+                                  t.src_len - got, (off_t)t.src_off + (off_t)got);
+        if (r <= 0) break;
+        got += (size_t)r;
+      }
+      if (got != t.src_len)
+        die("--gds-only -t: short read re-reading frame " + std::to_string(t.seq)
+            + " on the CPU rescue path", EXIT_IO);
+      t.data.swap(host);
+      t.src_off = -1;                 // now an ordinary host-backed Task
+      t.src_len = 0;
+    }
+#endif
+
     // Per-task take line (mirrors cpu_worker for compress).  Fires at -vv.
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32], ds_s[32];
@@ -12621,9 +12691,23 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
   //               would read t.len() bytes from an empty vector.
   //   decompress: peer-to-peer writes bypass the ordered writer entirely, so
   //               there is nothing draining the ResultStore this pool pushes to.
+  //   -t verify:   the Tasks name FILE REGIONS and carry no host bytes either,
+  //               so a CPU worker calling t.ptr() reads a null vector -- this
+  //               segfaulted, and on the runs where it did not it "verified"
+  //               garbage and exited 0, which is the worst outcome available
+  //               to a command whose entire job is to answer is-this-archive-ok.
   // The preflight makes reaching this unlikely; if it happens anyway, say what
   // is actually wrong instead of handing the job to a pool that cannot do it.
-  if (opt.region_staged() && (!decompress || g_gds_out_active.load(std::memory_order_relaxed))) {
+  // -t verify is the one staged case that CAN be rescued: the frames name
+  // regions of an archive still open, so cpu_decomp_worker re-reads them (see
+  // the materialise block there).  Refuse only when that descriptor is missing.
+  const bool verify_rescuable = decompress
+      && g_gds_verify_active.load(std::memory_order_relaxed)
+      && g_gds_verify_plain_fd >= 0;
+  if (opt.region_staged() && !verify_rescuable
+      && (!decompress
+          || g_gds_out_active.load(std::memory_order_relaxed)
+          || g_gds_verify_active.load(std::memory_order_relaxed))) {
     const char * f = opt.gds_only ? "--gds-only" : "--direct-stage";
     die_usage(std::string(f) + ": the GPU path failed and there is no CPU fallback "
               "for it -- these frames name a region of the input and their bytes "
@@ -25609,10 +25693,13 @@ static void gpu_decomp_worker(
     size_t alloc_decomp = 0;    // bytes per decompressed slot
     void * d_comp_buf = nullptr;
     void * d_decomp_buf = nullptr;
+    GdsBuf gds_in_reg;           // --gds-only -t: d_comp_buf mapped into BAR1
+    bool   ptrs_shifted = false;  // last batch rewrote the comp pointer table
     GdsBuf gds_out_reg;          // --gds-only: d_decomp_buf mapped into BAR1
     // Carried as a member because this is a LOCAL struct: its member functions
     // cannot reach the enclosing function's `opt` parameter.
     bool   gds_only = false;
+    bool   gds_verify = false;    // --gds-only -t: read side is cuFile
     bool   gds_reg_log = false;   // verbosity, carried for the same local-struct reason
     void * d_temp = nullptr;
     size_t temp_bytes = 0;
@@ -25687,6 +25774,7 @@ static void gpu_decomp_worker(
       if (d_comp_buf)    { cudaFree(d_comp_buf);    d_comp_buf = nullptr; }
       // Before the free: cuFile holds a BAR1 mapping of this exact pointer, and
       // this function runs again on every batch resize, not just at shutdown.
+      gds_in_reg.dereg();
       gds_out_reg.dereg();
       if (d_decomp_buf)  { cudaFree(d_decomp_buf);  d_decomp_buf = nullptr; }
       if (d_temp)        { cudaFree(d_temp);         d_temp = nullptr; }
@@ -25728,6 +25816,26 @@ static void gpu_decomp_worker(
 
       if (cudaMalloc(&d_comp_buf,     batch_n * max_comp)    != cudaSuccess) return false;
       if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) return false;
+      if (gds_verify) {
+        // The READ target.  Skipping this registration does not fail: cuFile
+        // silently bounces the transfer through a host buffer, so the run would
+        // still be correct and still be reported as GDS while doing exactly the
+        // copy this path exists to remove.
+        std::string why;
+        const uint64_t rin_t0 = now_ns();
+        if (!gds_in_reg.reg(d_comp_buf, batch_n * max_comp, &why)) {
+          std::cerr << "gzstd: --gds-only -t: " << why << "\n";
+          return false;
+        }
+        if (gds_reg_log) {
+          char b[160];
+          std::snprintf(b, sizeof(b),
+                        "[GDS] cuFileBufRegister %.0f MiB took %.0f ms (verify input)\n",
+                        double(batch_n * max_comp) / 1048576.0,
+                        double(now_ns() - rin_t0) / 1e6);
+          std::cerr << b;
+        }
+      }
       if (gds_only) {
         std::string why;
         const uint64_t reg_t0 = now_ns();
@@ -25815,6 +25923,31 @@ static void gpu_decomp_worker(
         ? std::min(opt.gpu_batch_cap, HARD_BATCH_CAP)
         : std::max(opt.gpu_batch_cap, AUTO_TUNE_BATCH_CEILING);
 
+    // --gds-only -t: BOUND THE REGISTERED BYTES, and derive the batch from that.
+    //
+    // cuFileBufRegister maps the compressed slab for peer-to-peer, and the host
+    // cost of that mapping scales with the REGISTERED SIZE -- not with the
+    // device allocation, which is why --gpu-only allocates identical slabs for
+    // free.  Measured on a 1 GiB archive, peak host RSS:
+    //     --gpu-only  (no registration)            1.69 GiB
+    //     --gds-only  (4 GiB registered)          16.2  GiB
+    //     --gds-only  --gpu-batch 16 (256 MiB)     1.21 GiB
+    // The auto-tuner's headroom batch of 256 x 16 MiB is 4 GiB of mapping for a
+    // verification that needs a few frames in flight, and it was SLOWER besides.
+    //
+    // A BYTE budget, not a frame count, deliberately: the frame size is
+    // opt.chunk_mib and a fixed count would mean 16x more mapping at
+    // --chunk-size 256 than at 16.  A count tuned here would be a constant that
+    // happened to suit one machine's chunk size.  --gpu-batch still wins if the
+    // user sets it: this only bounds the tuner's speculative headroom.
+    if (g_gds_verify_active.load(std::memory_order_relaxed)
+        && !opt.gpu_batch_user_set) {
+      const size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+      const size_t budget    = GDS_VERIFY_REGISTER_BUDGET;
+      const size_t fit       = std::max<size_t>(1, budget / std::max<size_t>(1, frame_cap));
+      if (fit < per_stream_cap) per_stream_cap = fit;
+    }
+
     // We need to allocate per-stream buffers.  Unlike compression, we need
     // to handle variable decompressed sizes.  We pre-allocate based on the
     // chunk size (which upper-bounds both compressed and decompressed size)
@@ -25827,6 +25960,7 @@ static void gpu_decomp_worker(
     // 4 KiB-aligned runs the ordinary delivery path even under --gds-only.
     for (auto & C : ctxs) {
       C.gds_only    = g_gds_out_active.load(std::memory_order_relaxed);
+      C.gds_verify  = g_gds_verify_active.load(std::memory_order_relaxed);
       C.gds_reg_log = (opt.verbosity >= V_VERBOSE);
     }
     for (size_t s = 0; s < stream_count; ++s) {
@@ -26302,6 +26436,12 @@ static void gpu_decomp_worker(
         // run past its slot into the next one.
         if (C.gds_only)
           max_decomp = (max_decomp + 4095) & ~size_t(4095);
+        // --gds-only -t reads an ALIGNED WINDOW around each frame, so the slot
+        // has to hold up to 4095 bytes of lead-in plus the tail round-up.  Two
+        // pages of headroom, and the slot base stays 4 KiB-aligned so the
+        // device offset is eligible for peer-to-peer.
+        if (C.gds_verify)
+          max_comp = ((max_comp + 8191) & ~size_t(4095));
 
         if (opt.verbosity >= V_DEBUG) {
           char in_s[32];
@@ -26364,14 +26504,90 @@ static void gpu_decomp_worker(
         uint64_t h2d_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
         uint64_t h2d_bytes_batch = 0;
         cudaEventRecord(C.ev_begin, C.stream);
-        for (size_t i = 0; i < C.filled; ++i) {
+        bool staged_batch = false;
+        // ONE definition of "get frame i's compressed bytes into its slot",
+        // because there are TWO callers: this loop, and the re-upload after a
+        // temp grow reallocates the slab.  When the staged arm existed only
+        // here, that second caller still did cudaMemcpyAsync from a staged
+        // Task's non-existent host pointer and every run died with
+        // "cudaMemcpyAsync(H2D decomp re-upload): invalid argument".
+        auto place_frame = [&](size_t i) {
           void * d_dst = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
+          if (C.batch[i].src_off >= 0) {
+            // ---- --gds-only -t: NVMe -> VRAM, no host bytes ----
+            //
+            // ALIGNED SUPERSET, and it is not optional: peer-to-peer requires
+            // 4 KiB alignment on the file offset, the device offset AND the
+            // length, and COMPRESSED FRAME STARTS ARE ALMOST NEVER ALIGNED
+            // (measured on real archives: only frame 0).  An unaligned
+            // cuFileRead does not fail, it silently bounces through host
+            // memory -- which would make this path a slower version of the
+            // ordinary one while still claiming to be peer-to-peer.  So read
+            // [align_down(off), align_up(off+len)) and hand nvCOMP a pointer
+            // to where the frame actually begins inside that window.
+            const off_t  raw = C.batch[i].src_off;
+            const off_t  fo  = raw & ~(off_t)4095;         // aligned file offset
+            const size_t pad = (size_t)(raw - fo);         // frame start within it
+            const size_t want = (pad + C.batch[i].len() + 4095) & ~size_t(4095);
+            if (want > C.alloc_comp)
+              throw std::runtime_error("--gds-only -t: frame window "
+                  + std::to_string(want) + " exceeds the device slot "
+                  + std::to_string(C.alloc_comp));
+            const off_t dv = (off_t)(i * C.alloc_comp);
+            // The read may run past EOF on the last frame; the driver simply
+            // returns fewer bytes, and short-of-the-frame is the real error.
+            //
+            // ISSUED SERIALLY, DELIBERATELY.  cuFileRead is synchronous per
+            // call, and the compress path fans its reads across threads for
+            // exactly that reason -- so a fan-out was built here too, and then
+            // MEASURED TO DO NOTHING: 7.63-7.94 s wall serial vs 8.01 s fanned
+            // out.  Instrumenting it said why, and the numbers are still printed
+            // at -vv: the reads are 0.52 s of a 7.84 s run (159 calls, 1282 MiB/s
+            // aggregate).  They are not the constraint on this path, so the
+            // threads, their mutex and the deferred error handoff were reverted.
+            // If reads ever do become the constraint, gpu_worker shows the shape.
+            const uint64_t rd_t0 = now_ns();
+            const ssize_t got = g_gds_input.read_dev(C.d_comp_buf, want, fo, dv);
+            g_gdsv_read_ns.fetch_add(now_ns() - rd_t0, std::memory_order_relaxed);
+            g_gdsv_read_bytes.fetch_add(want, std::memory_order_relaxed);
+            g_gdsv_reads.fetch_add(1, std::memory_order_relaxed);
+            const size_t usable = (got > 0) ? std::min((size_t)got - std::min((size_t)got, pad),
+                                                       C.batch[i].len()) : 0;
+            if (usable != C.batch[i].len())
+              throw std::runtime_error("--gds-only -t: cuFileRead returned "
+                  + std::to_string((long long)got) + " for frame "
+                  + std::to_string(C.batch[i].seq) + " at offset "
+                  + std::to_string((long long)raw));
+            const bool p2p = ((fo & 4095) == 0) && ((dv & 4095) == 0)
+                          && ((want & 4095) == 0);
+            (p2p ? g_gds_frames_p2p : g_gds_frames_fallback)
+                .fetch_add(1, std::memory_order_relaxed);
+            // nvCOMP must see the frame, not the window.
+            C.h_comp_ptrs[i] = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp + pad;
+            staged_batch = true;
+            return;
+          }
+          C.h_comp_ptrs[i] = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
           checkCuda(cudaMemcpyAsync(d_dst, C.batch[i].ptr(),
                                     C.batch[i].len(),
                                     cudaMemcpyHostToDevice, C.stream),
                     "cudaMemcpyAsync(H2D decomp)");
+        };
+
+        // FAN THE STAGED READS OUT.  cuFileRead is synchronous per call and a
+        // cuFile handle is safe for concurrent reads, so the only way to keep
+        // the drive busy is to have several in flight.  Host-backed frames are
+        // untouched here: their cudaMemcpyAsync is already asynchronous.
+        for (size_t i = 0; i < C.filled; ++i) {
+          place_frame(i);
           h2d_bytes_batch += C.batch[i].len();
           C.h_comp_sizes[i]   = C.batch[i].len();
+          if (C.batch[i].src_off >= 0) {
+            C.h_decomp_sizes[i] = C.batch[i].decomp_size;
+            C.h_has_ck[i]    = C.batch[i].stg_has_ck;
+            C.h_expect_ck[i] = C.batch[i].stg_expect_ck;
+            continue;
+          }
           C.h_decomp_sizes[i] = C.batch[i].decomp_size;
           // The expected content checksum, read off the frame while it is still
           // on the host.  Byte 4 of a zstd frame header is the Frame Header
@@ -26390,6 +26606,19 @@ static void gpu_decomp_worker(
                                | ((unsigned int)fp[fl-1] << 24);
             }
           }
+        }
+
+        // The pointer table is built once with fixed strides (see
+        // ensure_capacity).  A staged batch puts each frame at its own pad
+        // inside its slot, so the table is only right for THIS batch after a
+        // re-upload -- and the next non-staged batch would then be wrong, which
+        // is why the staged path rewrites it every time rather than once.
+        if (staged_batch || C.ptrs_shifted) {
+          checkCuda(cudaMemcpyAsync(C.d_comp_ptrs, C.h_comp_ptrs.data(),
+                                    C.filled * sizeof(void*),
+                                    cudaMemcpyHostToDevice, C.stream),
+                    "H2D staged comp ptrs");
+          C.ptrs_shifted = staged_batch;
         }
 
         // Upload size arrays (async)
@@ -26447,14 +26676,15 @@ static void gpu_decomp_worker(
               throw std::runtime_error("GPU decomp: failed to grow temp buffer");
             }
           }
-          // Re-upload pointer/size arrays since ensure_buffers may have reallocated
-          for (size_t i = 0; i < C.filled; ++i) {
-            void * d_dst = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
-            checkCuda(cudaMemcpyAsync(d_dst, C.batch[i].ptr(),
-                                      C.batch[i].len(),
-                                      cudaMemcpyHostToDevice, C.stream),
-                      "cudaMemcpyAsync(H2D decomp re-upload)");
-          }
+          // Re-upload pointer/size arrays since ensure_buffers may have reallocated.
+          // Staged frames are re-READ here, not re-copied: their bytes only ever
+          // existed in the slab that was just freed.
+          for (size_t i = 0; i < C.filled; ++i) place_frame(i);
+          checkCuda(cudaMemcpyAsync(C.d_comp_ptrs, C.h_comp_ptrs.data(),
+                                    C.filled * sizeof(void*),
+                                    cudaMemcpyHostToDevice, C.stream),
+                    "H2D comp ptrs (re-upload)");
+          C.ptrs_shifted = staged_batch;
           checkCuda(cudaMemcpyAsync(C.d_comp_sizes, C.h_comp_sizes.data(),
                                     C.filled * sizeof(size_t),
                                     cudaMemcpyHostToDevice, C.stream), "H2D sizes");
@@ -26595,6 +26825,28 @@ static void gpu_decomp_worker(
                 + " -- the archive is corrupt, or this GPU decoded it incorrectly."
                 + "  Re-run with --cpu-only to tell the two apart.", EXIT_DATA);
           out_sum += actual;
+
+          if (C.gds_verify) {
+            // ---- --gds-only -t: verified in VRAM, nothing leaves the device ----
+            //
+            // The comparison directly above IS the verification, and it ran on
+            // the device against the frame's own trailer.  Copying the frame D2H
+            // from here would move every decompressed byte to the host purely to
+            // hand it to a writer that discards it in TEST mode -- which is the
+            // whole cost this path exists to remove.
+            //
+            // FRAMES WITHOUT A CHECKSUM ARE NOT SILENTLY BLESSED.  They still get
+            // nvCOMP's per-chunk status and the produced-vs-declared size check,
+            // which is exactly and only what the ordinary GPU path has for them:
+            // the D2H verifies nothing, so skipping it loses nothing.
+            if (m) m->wrote_bytes.fetch_add(actual, std::memory_order_relaxed);
+            g_gds_verify_frames.fetch_add(1, std::memory_order_relaxed);
+            g_gds_verify_bytes.fetch_add(actual, std::memory_order_relaxed);
+            // Mirrors the loop tail below, which this branch skips.
+            C.batch[i].release_input();
+            C.delivered = i + 1;
+            continue;
+          }
           d2h_bytes_batch += actual;
 
           // Recycle a host buffer from this stream's pool rather than a fresh
@@ -26849,6 +27101,12 @@ static void gpu_decomp_worker(
   catch (const std::exception & e) {
     *any_gpu_failed = true;
     *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
+    // SAY WHAT HAPPENED, HERE.  fatal_msg is reported by the caller after the
+    // workers join -- but when this is the last worker out under --gpu-only the
+    // rescue can die() first, and the user then gets "the GPU path failed" with
+    // no cause at all.
+    vlog(V_VERBOSE, opt, std::string("[GPU") + std::to_string(device_id)
+         + "] fault: " + e.what() + "\n");
 
     // Rescue in-flight chunks back to queue so other GPUs can pick them up.
     // The batch was popped from the queue but not (fully) decompressed.
@@ -26911,6 +27169,99 @@ static void gpu_decomp_worker(
  Workers begin decompressing as soon as the first frame arrives.
  Falls back to streaming CPU if frame sizes can't be determined.
 ======================================================================*/
+// ---------------------------------------------------------------------------
+// --gds-only -t producer: frame extents from the SEEK TABLE, no payload reads.
+//
+// WHY THE TABLE IS REQUIRED, and why this demotes instead of trying harder:
+// the ordinary decompress producer finds frame boundaries with
+// ZSTD_findFrameCompressedSize, which walks each frame's block headers IN A
+// HOST BUFFER -- so it must pull the compressed stream into host RAM just to
+// learn where the next frame starts.  Reading it again into VRAM afterwards
+// would move every byte twice and make "NVMe -> VRAM" a fiction.  The seek
+// table gives exact (offset, csize, dsize) per frame for free, which is the
+// only way this path is honest.  Every gzstd archive carries one (v0.14.92),
+// as does any zstd-seekable archive; anything else demotes.
+//
+// Returns the frame count, or GDS_VERIFY_DEMOTE if there is no usable table.
+static const size_t GDS_VERIFY_DEMOTE = SIZE_MAX;
+
+static size_t gds_verify_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m,
+                                         const Options & opt,
+                                         size_t * max_frame_decomp_out)
+{
+  tarx::TarSeekTable st;
+  if (!tarx::parse_foreign_seek_table(in, st) || !st.valid())
+    return GDS_VERIFY_DEMOTE;
+  const size_t nframes = st.c_off.size() - 1;
+  if (nframes == 0) return GDS_VERIFY_DEMOTE;
+
+  const int fd = ::fileno(in);
+  if (fd < 0) return GDS_VERIFY_DEMOTE;
+
+  // BUILD FIRST, PUSH LAST.  Every demote below must leave the queue exactly as
+  // it was found: the caller falls through to the ordinary producer, which
+  // re-reads the archive from the start, so a half-filled queue would deliver
+  // every frame twice.
+  size_t max_frame_decomp = 0;
+  std::vector<Task> built;
+  built.reserve(nframes);
+  for (size_t k = 0; k < nframes; ++k) {
+    const uint64_t off  = st.c_off[k];
+    const uint64_t csz  = st.c_off[k + 1] - st.c_off[k];
+    const uint64_t dsz  = st.u_off[k + 1] - st.u_off[k];
+    if (csz < 9) return GDS_VERIFY_DEMOTE;          // not a frame we can read
+
+    Task t;
+    t.seq         = k;
+    t.src_off     = (off_t)off;
+    t.src_len     = (size_t)csz;
+    t.decomp_size = (size_t)dsz;
+    t.out_off     = st.u_off[k];
+
+    // METADATA ONLY: 9 header bytes + the 4-byte trailer.  Byte 4 of a zstd
+    // frame header is the Frame Header Descriptor and bit 0x04 is
+    // Content_Checksum_flag; when set, the frame's last four bytes are
+    // XXH64(content) truncated to 32 bits, little-endian.  The GPU worker
+    // normally reads these off the host copy of the frame, which this path
+    // does not have -- so they travel on the Task instead.
+    unsigned char hdr[9], tr[4];
+    if (::pread(fd, hdr, sizeof hdr, (off_t)off) != (ssize_t)sizeof hdr)
+      return GDS_VERIFY_DEMOTE;
+    if (hdr[0] != 0x28 || hdr[1] != 0xB5 || hdr[2] != 0x2F || hdr[3] != 0xFD)
+      return GDS_VERIFY_DEMOTE;                     // table disagrees with the file
+    if (hdr[4] & 0x04) {
+      if (::pread(fd, tr, sizeof tr, (off_t)(off + csz - 4)) != (ssize_t)sizeof tr)
+        return GDS_VERIFY_DEMOTE;
+      t.stg_has_ck    = 1;
+      t.stg_expect_ck = (unsigned int)tr[0] | ((unsigned int)tr[1] << 8)
+                      | ((unsigned int)tr[2] << 16) | ((unsigned int)tr[3] << 24);
+    }
+
+    if (t.decomp_size > max_frame_decomp) max_frame_decomp = t.decomp_size;
+    built.push_back(std::move(t));
+  }
+  // Only now that nothing can demote: publish the totals and claim the path.
+  if (m) {
+    m->reader_threads.store(1, std::memory_order_relaxed);
+    m->total_out.store(st.u_off.back(), std::memory_order_relaxed);
+    m->total_out_final.store(true, std::memory_order_relaxed);
+  }
+  g_adapt_src_path.store("cufile", std::memory_order_relaxed);
+  for (Task & t : built) {
+    const size_t csz = t.src_len;
+    queue.push(std::move(t));
+    if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+  }
+  queue.set_done();
+  if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
+  if (opt.verbosity >= V_VERBOSE) {
+    char sz[32]; human_bytes(double(st.u_off.back()), sz, sizeof(sz));
+    vlog(V_VERBOSE, opt, "[GDS] verify: " + std::to_string(nframes)
+         + " frames from the seek table, " + sz + " to check, no host payload\n");
+  }
+  return nframes;
+}
+
 static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // Before ANY task is queued -- see the function's own note for why the order
@@ -27079,7 +27430,57 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // a writer handed zero frames would delete the entire decompressed output.
   // Bypassing it also costs nothing here — ordering is what it provides, and
   // offset-addressed writes do not need any.
-  if (opt.gds_only) {
+  // -t IS NOT A DECOMPRESS-TO-SOMEWHERE.  It writes nothing, so none of the
+  // output-side machinery below applies to it and the "needs a real output
+  // file" rule is not a rule about -t at all -- it is a rule about writing by
+  // offset into a file handle.  --gds-only -t uses the READ side instead:
+  // NVMe -> VRAM -> decompress in VRAM -> device-side XXH64 -> report.
+  if (opt.gds_only && opt.mode == Mode::TEST) {
+    // tar verification hands decompressed frames to the in-process tar parser,
+    // which is a HOST consumer -- there is no point pulling bytes into VRAM
+    // only to copy them straight back out, so that combination stays ordinary.
+    if (opt.tar_mode) {
+      vlog(V_NORMAL, opt, "warning: --gds-only -t --tar verifies through the tar "
+           "parser, which reads on the host; using the ordinary read path.\n");
+    } else if (device_count <= 0 || gpu_disabled_by_peek) {
+      vlog(V_NORMAL, opt, "warning: --gds-only -t needs a GPU; using the ordinary "
+           "read path.\n");
+    } else {
+      // O_DIRECT IS REQUIRED, NOT AN OPTIMISATION -- cuFile refuses the
+      // peer-to-peer path on a buffered descriptor and quietly reads through
+      // the page cache instead: same bytes, none of the point.  Re-open the
+      // already-open archive through procfs so O_DIRECT cannot leak into the
+      // caller's buffered FILE* (dup() would share the file description) and
+      // so the held descriptor, not a pathname, selects the inode.
+      std::string why;
+      const int cur = in ? ::fileno(in) : -1;
+      int dfd = -1;
+      if (cur >= 0) {
+        char fd_link[64];
+        std::snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%d", cur);
+        dfd = ::open(fd_link, O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (dfd < 0) why = std::string("cannot reopen the archive with O_DIRECT: ")
+                         + std::strerror(errno);
+      } else {
+        why = "the archive has no descriptor to read by offset";
+      }
+      if (dfd >= 0 && !g_gds_input.open(dfd, &why)) { ::close(dfd); dfd = -1; }
+      if (dfd < 0) {
+        vlog(V_NORMAL, opt, "warning: --gds-only -t: " + (why.empty()
+             ? std::string("cannot register the archive with cuFile") : why)
+             + "; using the ordinary read path.\n");
+      } else {
+        g_gds_verify_fd = dfd;
+        // A second, BUFFERED descriptor for the CPU rescue.  Failing to get it
+        // is not fatal: it only costs the fallback, and the refusal in
+        // gpu_only_cpu_fallback still catches that case.
+        char pl[64];
+        std::snprintf(pl, sizeof(pl), "/proc/self/fd/%d", cur);
+        g_gds_verify_plain_fd = ::open(pl, O_RDONLY | O_CLOEXEC);
+        g_gds_verify_active.store(true, std::memory_order_release);
+      }
+    }
+  } else if (opt.gds_only) {
     if (opt.to_stdout)
       die("--gds-only decompress needs a real output file: GPUDirect Storage writes "
           "by offset into a registered file handle, which a pipe cannot provide");
@@ -27163,7 +27564,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   }
 gds_out_declined:
   std::thread writer_thr;
-  if (!g_gds_out_active.load(std::memory_order_relaxed))
+  // --gds-only -t delivers no frames at all (they are verified on the device and
+  // dropped), so the writer would sit waiting for sequence numbers that are never
+  // coming.  Same reasoning as the --gds-only output path above it.
+  if (!g_gds_out_active.load(std::memory_order_relaxed)
+      && !g_gds_verify_active.load(std::memory_order_relaxed))
     writer_thr = std::thread(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
 
   // ---- Hybrid scheduler ----
@@ -27211,6 +27616,20 @@ gds_out_declined:
   SharedTuneState shared_tune_decomp;
   shared_tune_decomp.batch_size.store(opt.gpu_batch_cap);
   shared_tune_decomp.locked.store(opt.gpu_batch_user_set);
+  // --gds-only -t: PIN the batch at what the register budget affords, and lock
+  // the tuner off.  Its hill-climb explores SMALLER batches, and on this path a
+  // smaller batch is not a cheap experiment -- it is more per-batch
+  // synchronisation, and CUDA's default sync spin-waits in userspace.  Measured
+  // cold on a 1 GiB archive: tuner free 5.68 s wall / 2.70 s user, pinned at the
+  // same ceiling 3.38 s / 0.31 s.  Nothing here needs the tuner: the frame size
+  // is fixed by the archive and the budget already bounds the mapping.
+  if (g_gds_verify_active.load(std::memory_order_relaxed)
+      && !opt.gpu_batch_user_set) {
+    const size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+    const size_t fit = std::max<size_t>(1, GDS_VERIFY_REGISTER_BUDGET / frame_cap);
+    shared_tune_decomp.batch_size.store((int)std::min<size_t>(fit, HARD_BATCH_CAP));
+    shared_tune_decomp.locked.store(true);
+  }
 
   // Counts GPUs that failed terminally (init or mid-run).  Read by the bringup
   // barrier, which is why it cannot also count clean exits.
@@ -27378,9 +27797,30 @@ gds_out_declined:
   // finishes" delay that v0.12.22-v0.12.36 introduced.  Oversize detection
   // is handled up front by peek_first_frame_decomp_size.
   size_t max_frame_decomp = 0;
-  size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback,
-                                           &raw_data, &max_frame_decomp,
-                                           &gpu_only_no_device);
+  size_t n_frames = GDS_VERIFY_DEMOTE;
+  if (g_gds_verify_active.load(std::memory_order_acquire)) {
+    n_frames = gds_verify_frames_to_queue(in, queue, m, opt, &max_frame_decomp);
+    if (n_frames == GDS_VERIFY_DEMOTE) {
+      // No usable seek table.  Stand down completely -- the workers read
+      // g_gds_verify_active to decide whether a Task is a file region, so
+      // leaving it set while the ordinary producer pushes host-backed Tasks
+      // would have them read from a slab nobody filled.
+      g_gds_verify_active.store(false, std::memory_order_release);
+      g_gds_input.close();
+      if (g_gds_verify_fd >= 0) { ::close(g_gds_verify_fd); g_gds_verify_fd = -1; }
+      if (g_gds_verify_plain_fd >= 0) { ::close(g_gds_verify_plain_fd); g_gds_verify_plain_fd = -1; }
+      vlog(V_NORMAL, opt,
+           "warning: --gds-only -t needs the archive's seek table to locate frames "
+           "without reading them;\n  this archive has none, so the ordinary read "
+           "path is used instead.\n");
+      if (std::fseek(in, 0, SEEK_SET) != 0)
+        die("--gds-only -t: cannot rewind the archive after standing down", EXIT_IO);
+    }
+  }
+  if (n_frames == GDS_VERIFY_DEMOTE)
+    n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback,
+                                      &raw_data, &max_frame_decomp,
+                                      &gpu_only_no_device);
 
   // Deferred bringup found no GPU for a --gpu-only request: error out as the
   // old synchronous path did, now that the reader has stopped streaming.
@@ -27478,6 +27918,21 @@ gds_out_declined:
   bringup_cv.notify_all();
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   for (auto & th : gpu_workers) th.join();
+
+  if (g_gds_verify_active.load(std::memory_order_relaxed)
+      && opt.verbosity >= V_VERBOSE) {
+    const uint64_t rn = g_gdsv_read_ns.load(std::memory_order_relaxed);
+    const uint64_t rb = g_gdsv_read_bytes.load(std::memory_order_relaxed);
+    const uint64_t rc = g_gdsv_reads.load(std::memory_order_relaxed);
+    char b[220];
+    std::snprintf(b, sizeof(b),
+        "[GDS] verify reads: %llu calls, %.1f MiB, %.2f s summed across readers"
+        " (%.0f MiB/s aggregate, %.2f ms/call)\n",
+        (unsigned long long)rc, double(rb) / 1048576.0, double(rn) / 1e9,
+        rn ? double(rb) / 1048576.0 / (double(rn) / 1e9) : 0.0,
+        rc ? double(rn) / 1e6 / double(rc) : 0.0);
+    std::cerr << b;
+  }
 
   // Report GPU failures.  Even when ALL GPUs failed in --gpu-only mode the
   // job is already complete: the last worker OUT ran gpu_only_cpu_fallback
