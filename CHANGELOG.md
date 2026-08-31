@@ -1,12 +1,59 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.17  
+**Covers:** v0.9.50 → v0.17.18  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.18 — the per-batch temp-size sync, and the 50% of reads nobody asked for
+
+`-vvv` put 38% of the GPU decompress batch loop in "syncs, temp queries,
+readbacks" — a larger share than the decompress kernel itself. Most of it was one
+call.
+
+nvCOMP offers two ways to size the decompress workspace.
+`nvcompBatchedZstdDecompressGetTempSizeSync` inspects the compressed frames already
+on the device: exact, but it costs a `cudaStreamSynchronize` on **every batch** —
+and when its answer grew, the slab was freed and reallocated, so every staged frame
+had to be **read from the drive again**. That is where `192 reads for 128 frames`
+came from: half the read traffic on that workload existed only to refill a buffer
+the temp query had just invalidated.
+
+`nvcompBatchedZstdDecompressGetTempSizeAsync` takes only
+`(chunks, max_uncompressed_chunk_bytes)`, touches no device memory and needs no
+stream. It returns a conservative bound, which is exactly what you want for
+*allocation* — and it is what the `--verify` path has always used to size its own
+workspace before any data exists. Sizing temp from that bound up front means the
+temp always fits, so the per-batch query and its sync never run and the grow path
+(with its re-read) never fires. The exact query stays as a fallback for a shape the
+bound does not cover.
+
+| | before | after |
+|---|---|---|
+| read calls for 128 frames | **192** | **128** |
+| `-d --gds-only`, cold 1 GiB | 4.37–4.46 s | **3.96–4.14 s** |
+| `-t --gds-only`, cold 1 GiB | 3.41–3.50 s | **3.31–3.35 s** |
+| "syncs / other" share of the batch loop | 38% | ~25% |
+
+**The wall-clock win is 5–10%, not 38%, and the reason is worth recording.**
+Allocating the conservative bound up front consumes VRAM, and the VRAM-fit loop
+answered by shrinking the batch from 64 frames to ~26 — so total kernel time rose
+0.145 s → 0.329 s across more, smaller launches, giving back much of what the
+removed syncs saved. Forcing the batch back measured 4.12 s against 4.14 s auto:
+overlapping ranges, no result, not worth chasing. The redundant read traffic is
+gone either way, and that part is unambiguous.
+
+Writes are now the largest block at ~36% — blocking `cuFileWrite` calls on the one
+host thread that also reads and launches kernels.
+
+Unchanged and verified: `-t` agrees across `--gds-only` / `--cpu-only` /
+`--gpu-only` (clean 0, two corrupt archives 4), `-d` byte-identical on all three,
+`--gpu-only` and `--hybrid` unaffected, both build configurations compile.
+
+---
 
 ## v0.17.17 — `--gds-only -d` becomes NVMe → VRAM → NVMe, and the progress meter stops reading past 100%
 
