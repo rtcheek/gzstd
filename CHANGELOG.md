@@ -1,12 +1,80 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.19  
+**Covers:** v0.9.50 → v0.17.20  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.20 — the compress progress meter, and the batch knee re-measured where it matters
+
+### `--gds-only` compress jumped to 100% long before it finished
+
+Same defect as the decompress meter in v0.17.17, in the mirror path, and it survived that fix
+because the two paths account for progress differently.
+
+The staged compress producer credited `read_bytes += file_size` — the **whole input** — the moment
+it finished enqueuing. Those Tasks only *name* regions of the file; not one byte had been read.
+Enqueuing is nearly instant, so the meter hit 100% almost immediately and then sat there.
+
+The GPU worker does credit frames as it consumes them, but that accounting is gated on
+`view_ptr && direct_buf < 0` — a staged Task has neither, so staged frames were skipped entirely
+and the bulk credit was the only one that ever fired. The producer's credit is gone, and the
+worker now counts each staged frame once its `cuFileRead` has actually delivered the bytes.
+Verified climbing 0% → 50% → 100% on a 4 GiB input and finishing at exactly 4.00 GiB, archive
+byte-identical.
+
+### The registration budget, measured against streams instead of guessed
+
+With batches no longer starved (v0.17.19), the batch/stream question could finally be asked
+properly — holding **total registered slots constant** so memory is not a confound. `-t`, 130 GiB,
+one device, cold:
+
+| slots (host RSS) | 2 streams | 1 stream |
+|---|---|---|
+| 512 (33.8 GB) | 27.81 s | **25.90 s** |
+| 256 (17.0 GB) | 29.49 s | **25.98 s** |
+
+**One stream wins at both memory levels**, so the deficit is the streams themselves and not the
+memory they cost. That vindicates the `region_staged() ? 1` decision, which until now rested on a
+1 GiB-era measurement.
+
+And 256 is the knee: `1×512` beats `1×256` by 0.08 s — noise — for another 16.8 GiB. So
+`GDS_VERIFY_REGISTER_BUDGET` goes 2 GiB → **4 GiB** (batch 256), and stops there.
+
+`-t` on the user's own 65 GiB archive, cumulative across this release series:
+
+| | wall |
+|---|---|
+| as first reported | 175.95 s |
+| + `util_scale` fix, 1 GiB budget (v0.17.19) | 36.15 s |
+| + 2 GiB budget (v0.17.19 as shipped) | 30.46 s |
+| **+ 4 GiB budget (this release)** | **25.69 s** |
+| *(reference)* `--gpu-only` | 28.49 s |
+| *(reference)* `--cpu-only` | 18.80 s |
+
+**6.8x overall**, and `--gds-only` now beats `--gpu-only` outright. The 17 GB of host RSS is a real
+cost and is chosen for a host that has it; `--gpu-batch` overrides the budget entirely, and
+`--gpu-batch 64` restores the old 4.4 GiB footprint for a smaller machine.
+
+### Also re-measured, since v0.17.19 invalidated every earlier verdict
+
+The staged peer-to-peer read was A/B'd at scale for the first time
+(`GZSTD_DEBUG_GDS_NO_STAGED_READ=1`): **24.80 s without it against 30.46 s with**, but 195.22 s of
+system CPU against 11.29 s. Turning it off is *faster* and burns 17x the kernel CPU — the page
+cache does the work instead. It stays on: this flag exists to spend less CPU, and that is now a
+number rather than an assumption.
+
+The compress worker's identical `util_scale` line was gated the same way as decompress and
+**measured to do nothing** — batches came out median 8 / mean 10.2 / max 32 either way, and
+`--gds-only` compress (which forces one stream) already takes full 64-frame batches. Reverted; the
+same line is not the same defect. Forcing `--gpu-streams=1` on `--gpu-only` compress was also
+tried: it does not unstarve the batches and costs 19% of wall clock, because the second stream is
+overlapping intake with compute.
+
+---
 
 ## v0.17.19 — a multi-GPU fairness heuristic was starving single-GPU batches to 3 frames
 

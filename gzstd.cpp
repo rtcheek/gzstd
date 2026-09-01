@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.19";
+static constexpr const char * GZSTD_VERSION = "0.17.20";
 //
 // Architecture overview:
 //
@@ -633,24 +633,26 @@ static std::atomic<uint64_t> g_gdsv_reads{0};
 // per stream.  Host RSS tracks this number (see where it is applied), and a
 // verify only needs enough frames in flight to keep the device busy.  256 MiB is
 // 16 frames at the default 16 MiB chunk and one frame at --chunk-size 256.
-// 2 GiB.  A smaller batch means MORE per-batch synchronisation, and CUDA's
-// default sync SPIN-WAITS in userspace, so shrinking this to save host RSS buys
-// a pegged core instead.
+// 4 GiB, which is a batch of 256 at the default 16 MiB chunk.  A smaller batch
+// means MORE per-batch synchronisation, and CUDA's default sync SPIN-WAITS in
+// userspace, so shrinking this to save host RSS buys a pegged core instead.
 //
 // THE FIRST VALUE HERE WAS 1 GiB, CHOSEN ON A 1 GiB ARCHIVE, AND THAT WAS TOO
-// SMALL A CORPUS TO CHOOSE ON.  Re-measured on a 65 GiB / 8344-frame archive
-// (-t, one device, cold, after the util_scale fix):
+// SMALL A CORPUS TO CHOOSE ON.  Measured on a 65 GiB / 8344-frame archive (-t,
+// one device, cold, after the util_scale fix):
 //   budget   batch    wall      user     host RSS
 //     1 GiB     64   35.89 s   16.69 s    4.4 GiB
 //     2 GiB    128   28.85 s    9.08 s    8.6 GiB
-//     4 GiB    256   25.83 s    4.98 s   17.0 GiB
-//     8 GiB    512   24.98 s    2.99 s   33.8 GiB
-// Returns fall off a cliff after 128: 64->128 buys 7.0 s for 4.2 GiB, while
-// 256->512 buys 0.85 s for 16.8 GiB.  RSS is linear in the batch (~66 MB per
-// frame), and this has to be affordable on a workstation, not just on a host
-// with 1.4 TiB.  --gpu-batch still overrides for anyone who wants to spend the
-// memory.
-static const size_t GDS_VERIFY_REGISTER_BUDGET = 2048ull * 1024u * 1024u;
+//     4 GiB    256   25.98 s    4.99 s   17.0 GiB   <-- here
+//     8 GiB    512   25.90 s    3.06 s   33.8 GiB
+// 256 IS THE KNEE: 512 costs another 16.8 GiB for 0.08 s, which is noise.  RSS
+// is linear in the batch (~66 MB per frame) and tracks the bytes handed to
+// cuFileBufRegister, not the cudaMalloc behind them.
+//
+// This is a real memory cost -- 17 GiB of host RSS -- and it is chosen for a
+// host that has it.  A smaller machine should pass --gpu-batch, which overrides
+// this entirely; --gpu-batch 64 restores the old 4.4 GiB footprint.
+static const size_t GDS_VERIFY_REGISTER_BUDGET = 4096ull * 1024u * 1024u;
 static int                   g_gds_verify_fd = -1;   // O_DIRECT dup of the archive
 // A BUFFERED dup as well, for the CPU rescue: it preads arbitrary
 // (offset, length) pairs, which an O_DIRECT descriptor rejects outright.
@@ -23450,7 +23452,30 @@ static void gpu_worker(
         pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
         // Keep scheduler's queue floor in sync with current batch size
         if (sched) sched->set_gpu_batch_size(pop_n);
-        // Apply utilization scaling (updated after each batch completion)
+        // Utilization scaling.  NOT gated on worker count here, unlike the
+        // decompress intake (v0.17.19) -- that gate was applied to this line too
+        // and MEASURED TO DO NOTHING: 4 GiB input, one device, batches came out
+        // median 8 / mean 10.2 / max 32 both with and without it, and the run
+        // time was unchanged (kernel 2.766 s vs 2.755 s).
+        //
+        // Compress is not batch-starved the way staged decompress was.  MEASURED
+        // on 4 GiB, one device: --gds-only compress (which forces one stream)
+        // takes FULL 64-frame batches, every one, with 0.644 s of kernel against
+        // --gpu-only's 2.766 s.  Plain --gpu-only sits at median 8 of a
+        // per_stream_batch of 32, but that is the reader's supply, not this line.
+        //
+        // The probable reason the scaling never bites here: the staged compress
+        // read is a BLOCKING cuFileRead, so the GPU idles during intake and NVML
+        // reports low utilization, leaving util_scale near 1.0.  Starved
+        // decompress was the mirror image -- a tight loop of tiny kernels held
+        // utilization high, which drove the scaler to its floor and fed back.
+        // (That mechanism is inferred from the batch sizes, not instrumented.)
+        //
+        // Also measured, since it is the obvious thing to try: forcing
+        // --gpu-streams=1 on --gpu-only compress does NOT unstarve it (median
+        // stays 8) and costs 19% of wall clock, 4.75 s against 4.00 s -- the
+        // second stream is overlapping intake with compute, and that is worth
+        // more than the stream-switch overhead it saves.
         pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
         // De-sync sink-limited completions so the in-order writer never flushes
         // one lockstep wave (which bursts the verify queue); no-op unless frozen.
@@ -23826,6 +23851,13 @@ static void gpu_worker(
           // produced a message blaming a flag the user never passed.
           if (rd_failed.load())
             throw std::runtime_error(rd_err);
+          // The reads for this batch have landed: credit them now.  Staged Tasks
+          // carry no host buffer, so the view_ptr-based accounting above skips
+          // them and this is the only place their bytes are counted.
+          if (m)
+            for (size_t i = 0; i < C.filled; ++i)
+              if (C.batch[i].src_off >= 0)
+                m->read_bytes.fetch_add(C.batch[i].len(), std::memory_order_relaxed);
         } else {
           const size_t ck_threads = std::min<size_t>(C.filled, 8);
           std::vector<std::thread> ck_workers;
@@ -25119,7 +25151,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       queue.push(std::move(t));
       off += n;
     }
-    if (m) m->read_bytes.fetch_add(file_size, std::memory_order_relaxed);
+    // DO NOT credit read_bytes here.  These Tasks name REGIONS -- not one byte
+    // has been read yet -- and enqueuing the whole file takes almost no time, so
+    // crediting file_size at this point drove the progress meter to 100% before
+    // any compression had happened.  Same defect the staged DECOMPRESS producer
+    // had (v0.17.17), same fix: the GPU worker credits each frame once its
+    // cuFileRead has actually delivered the bytes.
     reader_done = true;
   }
   // --tar: parallel assembler at GPU-chunk granularity (≤16 MiB frames feed the
