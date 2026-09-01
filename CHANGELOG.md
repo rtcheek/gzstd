@@ -1,12 +1,93 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.18  
+**Covers:** v0.9.50 → v0.17.19  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.19 — a multi-GPU fairness heuristic was starving single-GPU batches to 3 frames
+
+`gzstd -t --gds-only` on a 65 GiB / 8344-frame archive took **175.95 s**, against
+`--cpu-only`'s 18.80 s, with 161 s of that in **user** CPU and one core pegged. Every
+optimisation in v0.17.16–.18 was measured on 1–4 GiB corpora, and none of them could see this:
+the defect is invisible below a few hundred frames.
+
+The batch intake scales the pop size by GPU utilisation:
+
+```
+util_scale = max(0.05, (100.0 - util.gpu) / 100.0);
+pop_n      = max(1, pop_n * util_scale);
+```
+
+Its own comment scopes it correctly — *"a GPU at 50% utilization gets half the batch → finishes at
+roughly the same time as idle GPUs → results arrive in order for the writer"* — which is an
+argument about **several** GPUs sharing a queue. With one worker there is nothing to finish
+together with, and the scaling **feeds back on itself**: a busy GPU scores high utilisation → gets
+a smaller batch → needs more launches for the same work → stays busy → `util_scale` sits on its
+0.05 floor forever. 64 × 0.05 = 3.2.
+
+Measured, one device, cold, 130 GiB of data:
+
+| | before | after |
+|---|---|---|
+| median batch | **3 frames** (mean 5.6, max 64) | **64** |
+| batches | 1495 | 131 |
+| GPU kernel | 94.87 s (63.5 ms/batch, nearly all launch overhead) | **8.21 s** |
+| per-batch sync | 63.00 s | 7.39 s |
+| staged reads | 17.09 s @ 3.83 GiB/s | 17.03 s @ 3.84 GiB/s — unchanged, always at the ceiling |
+| **`-t` wall** | **175.95 s** | **36.15 s** |
+
+Confirmed twice before the fix was written: raising `--gpu-batch` — which `util_scale` simply
+multiplies — halved the runtime each time it doubled (auto 168 s → 128: 76 s → 256: 44 s).
+
+`--gpu-only` escapes the worst of it because its auto-tuner is free to grow toward 256 and partly
+cancels the scaling. The staged path **pins** that tuner (v0.17.16), so nothing offset it there —
+this release's own change is what exposed the trap.
+
+Gated on `gpu_worker_count > 1`. The compress worker carries the identical line and presumably the
+identical defect; it is deliberately left alone, because it has not been measured at scale.
+
+### The registration budget was also chosen on too small a corpus
+
+`GDS_VERIFY_REGISTER_BUDGET` was set to 1 GiB in v0.17.16 on the strength of a 1 GiB archive.
+Re-measured at 65 GiB with the batches no longer starved:
+
+| budget | batch | wall | user | host RSS |
+|---|---|---|---|---|
+| 1 GiB | 64 | 35.89 s | 16.69 s | 4.4 GiB |
+| **2 GiB** | **128** | **28.85 s** | 9.08 s | 8.6 GiB |
+| 4 GiB | 256 | 25.83 s | 4.98 s | 17.0 GiB |
+| 8 GiB | 512 | 24.98 s | 2.99 s | 33.8 GiB |
+
+Raised to 2 GiB. Returns fall off a cliff after 128: 64→128 buys 7.0 s for 4.2 GiB, while 256→512
+buys 0.85 s for 16.8 GiB, and this has to be affordable on a workstation rather than only on a
+host with 1.4 TiB. `--gpu-batch` still overrides.
+
+### At the scale that matters
+
+`-t`, the user's own invocation with all 8 GPUs visible (`--gds-only` narrows to one device by
+design, so the fix engages): **175.95 s → 28.80 s, 6.1x**, user CPU 161.07 s → 8.74 s.
+
+`-d` on the same archive, output **md5-identical** to `--cpu-only` across 139,964,108,800 bytes:
+
+| `-d` | wall | total CPU | cores busy |
+|---|---|---|---|
+| `--gds-only` | 72.63 s | **41.1 s** | **0.57** |
+| `--cpu-only` | **51.90 s** | 807.5 s | 15.6 |
+
+`--cpu-only` still wins wall clock by 1.4x; `--gds-only` does the same work with **19.6x less
+CPU**. On an idle 256-core host that trade is uninteresting, and on a machine doing anything else
+it is the entire point of the flag. This is the first measurement in this arc taken at a scale
+where that shows.
+
+**The lesson, and it applies to three constants introduced in this release series:** every one was
+tuned on a corpus ~1/100th the size of the real workload, and every one was wrong there. A GPU
+batching path cannot be characterised on an archive that fits in a few batches.
+
+---
 
 ## v0.17.18 — the per-batch temp-size sync, and the 50% of reads nobody asked for
 

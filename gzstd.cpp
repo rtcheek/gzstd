@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.18";
+static constexpr const char * GZSTD_VERSION = "0.17.19";
 //
 // Architecture overview:
 //
@@ -480,6 +480,18 @@ static const std::string & gz_gds_unavailable_reason()
     const GzGdsApi & a = gz_gds_api();
     const std::string lib = gz_gds_lib_reason();
     if (!lib.empty()) return lib;
+    // MEASURED 2489 ms on this host -- 78% of the 3.19 s it takes to decompress
+    // a 4 MiB archive, and by far the largest fixed cost --gds-only carries.  It
+    // is this expensive because it initialises CUDA internally (see the header
+    // note above), not because of anything gzstd does.
+    //
+    // BACKGROUNDING IT DOES NOT HELP, and was tried: started right after
+    // parse_args it measured 3.17-3.24 s against 3.19 s lazy, because almost
+    // nothing here can proceed without it -- GPU bringup needs the CUDA context
+    // this call creates, so there is no independent work to overlap with.  It
+    // also broke `-t` on a corrupt archive: die() is std::exit, which skips
+    // main's guard, leaving a joinable std::thread to terminate() at static
+    // destruction (exit 134 instead of 4).  Reverted.
     const GzCUfileError_t e = a.DriverOpen();
     if (e.err != GZ_CUFILE_SUCCESS)
       return std::string("cuFileDriverOpen failed (err ") + std::to_string(e.err)
@@ -621,17 +633,24 @@ static std::atomic<uint64_t> g_gdsv_reads{0};
 // per stream.  Host RSS tracks this number (see where it is applied), and a
 // verify only needs enough frames in flight to keep the device busy.  256 MiB is
 // 16 frames at the default 16 MiB chunk and one frame at --chunk-size 256.
-// 1 GiB, which is a MEASURED KNEE and not a round number.  Cold, 1 GiB archive:
-//   budget   batch   wall    user    host RSS
-//   256 MiB     16   8.36 s  5.43 s   1.28 GiB
-//     1 GiB     64   3.38 s  0.31 s   4.42 GiB
-//     4 GiB    256   4.04 s  0.17 s  17.0  GiB
-// The user-CPU column is the surprise and the reason this is not simply "as
-// small as possible": a smaller batch means MORE per-batch synchronisation, and
-// CUDA's default sync SPIN-WAITS in userspace, so shrinking the mapping to save
-// host RSS buys a pegged core instead.  256 MiB looked like the tidy answer and
-// cost 2.5x wall clock.  Past 1 GiB the mapping grows 4x to buy nothing.
-static const size_t GDS_VERIFY_REGISTER_BUDGET = 1024u * 1024u * 1024u;
+// 2 GiB.  A smaller batch means MORE per-batch synchronisation, and CUDA's
+// default sync SPIN-WAITS in userspace, so shrinking this to save host RSS buys
+// a pegged core instead.
+//
+// THE FIRST VALUE HERE WAS 1 GiB, CHOSEN ON A 1 GiB ARCHIVE, AND THAT WAS TOO
+// SMALL A CORPUS TO CHOOSE ON.  Re-measured on a 65 GiB / 8344-frame archive
+// (-t, one device, cold, after the util_scale fix):
+//   budget   batch    wall      user     host RSS
+//     1 GiB     64   35.89 s   16.69 s    4.4 GiB
+//     2 GiB    128   28.85 s    9.08 s    8.6 GiB
+//     4 GiB    256   25.83 s    4.98 s   17.0 GiB
+//     8 GiB    512   24.98 s    2.99 s   33.8 GiB
+// Returns fall off a cliff after 128: 64->128 buys 7.0 s for 4.2 GiB, while
+// 256->512 buys 0.85 s for 16.8 GiB.  RSS is linear in the batch (~66 MB per
+// frame), and this has to be affordable on a workstation, not just on a host
+// with 1.4 TiB.  --gpu-batch still overrides for anyone who wants to spend the
+// memory.
+static const size_t GDS_VERIFY_REGISTER_BUDGET = 2048ull * 1024u * 1024u;
 static int                   g_gds_verify_fd = -1;   // O_DIRECT dup of the archive
 // A BUFFERED dup as well, for the CPU rescue: it preads arbitrary
 // (offset, length) pairs, which an O_DIRECT descriptor rejects outright.
@@ -26355,8 +26374,28 @@ static void gpu_decomp_worker(
                      : per_stream_cap;
         // Keep scheduler's queue floor in sync with current batch size
         if (sched) sched->set_gpu_batch_size(pop_n);
-        // Apply utilization scaling (updated after each batch completion)
-        pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+        // Utilization scaling, ONLY WITH MORE THAN ONE GPU -- which is the only
+        // case the rationale above covers: it exists so a slower device takes
+        // proportionally less work and the devices finish together for the
+        // in-order writer.  With a single worker there is nothing to finish
+        // together with, and the scaling then feeds back on itself: a busy GPU
+        // scores high utilization -> smaller batch -> more launches for the same
+        // work -> still busy -> util_scale pinned at its 0.05 floor.
+        //
+        // MEASURED, -t on a 65 GiB / 8344-frame archive, one device: batches came
+        // out at a MEDIAN OF 3 frames (mean 5.6, max 64) -- 1495 launches at
+        // 63.5 ms each, 94.9 s of kernel time against 17.1 s of actual reads, and
+        // 175.9 s wall versus --cpu-only's 18.8 s.  64 * 0.05 = 3.2 is exactly the
+        // median observed.  --gpu-only escapes the worst of it only because its
+        // auto-tuner is free to grow toward 256 and partly cancels the scaling;
+        // the staged path pins the tuner, so nothing offsets it there.
+        //
+        // Invisible below a few hundred frames, which is why every corpus this was
+        // developed against missed it.  The compress worker has the identical
+        // line and presumably the identical problem; it is left alone here
+        // because it has not been measured at scale.
+        if (gpu_worker_count > 1)
+          pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
         // De-sync sink-limited completions so the in-order writer never flushes
         // one lockstep wave (see gpu_desync_batch); no-op unless frozen.
         pop_n = gpu_desync_batch(pop_n, shared_tune);
@@ -26925,6 +26964,34 @@ static void gpu_decomp_worker(
             // belt-and-braces bound rather than something that can unalign it.
             size_t wlen = (actual + 4095) & ~size_t(4095);
             if (wlen > C.alloc_decomp) wlen = C.alloc_decomp;
+            // WRITTEN INLINE, AND BOTH ALTERNATIVES WERE BUILT AND MEASURED.
+            //
+            // WIDER: 16-way fan-out of a batch's writes bought nothing --
+            // 0.454 s / 2.20 GiB/s against 0.429 s / 2.33 GiB/s inline -- because
+            // the drive is the limit.  dd on this filesystem: an O_DIRECT write
+            // alone runs 3.7 GB/s, but concurrent with a read, which is what this
+            // path does, 2.7 GB/s.  gzstd was already at that ceiling.
+            //
+            // OVERLAPPED: a write-behind thread per stream context worked exactly
+            // as designed -- the batch loop fell 1.110 s -> 0.773 s and writes left
+            // the critical path (0.454 s -> 0.057 s, just queueing).  It still lost,
+            // because the reads it then contended with collapsed 3.58 -> 1.96 GiB/s.
+            // A/B on one binary: 1 GiB 3.90-4.00 s overlapped vs 4.06-4.25 s inline
+            // (a small win), 4 GiB 6.29-6.61 s vs 6.11 s inline (a loss) -- and the
+            // larger size is the representative one.  Same reversal, same cause, as
+            // the compress path's ping-pong attempt.
+            //
+            // One drive cannot read and write concurrently at full speed, so there
+            // is nothing here to overlap INTO.  Leave it inline.
+            //
+            // AND IT IS THE DRIVE, NOT cuFILE.  The obvious suspicion -- that
+            // libcufile was serialising our threads through its own pool
+            // (execution.max_io_threads defaults to 4) -- was tested by pointing
+            // CUFILE_ENV_PATH_JSON at a config with max_io_threads=32.  No change:
+            // 4.19-4.41 s against 4.14-4.21 s stock, with reads still 3.89 GiB/s
+            // and writes still 2.50 GiB/s.  That write figure is 2.68 GB/s against
+            // dd's 2.7 GB/s concurrent-write ceiling on this filesystem -- the
+            // hardware limit, reached from two independent directions.
             const ssize_t w = g_gds_output.write_dev(
                 C.d_decomp_buf, wlen, (off_t)ooff, (off_t)(i * C.alloc_decomp));
             if (w != (ssize_t)wlen)
@@ -27239,6 +27306,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   const int fd = ::fileno(in);
   if (fd < 0) return GDS_VERIFY_DEMOTE;
 
+  const uint64_t prod_t0 = now_ns();
   // BUILD FIRST, PUSH LAST.  Every demote below must leave the queue exactly as
   // it was found: the caller falls through to the ordinary producer, which
   // re-reads the archive from the start, so a half-filled queue would deliver
@@ -27300,6 +27368,11 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   queue.set_done();
   if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
   if (opt.verbosity >= V_VERBOSE) {
+    char pb[160];
+    std::snprintf(pb, sizeof(pb),
+        "[GDS] producer: %zu frames, %zu metadata preads, %.2f s before any batch ran\n",
+        nframes, nframes * 2, double(now_ns() - prod_t0) / 1e9);
+    std::cerr << pb;
     char sz[32]; human_bytes(double(st.u_off.back()), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, "[GDS] verify: " + std::to_string(nframes)
          + " frames from the seek table, " + sz + " to check, no host payload\n");
