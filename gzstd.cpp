@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.24";
+static constexpr const char * GZSTD_VERSION = "0.17.25";
 //
 // Architecture overview:
 //
@@ -721,6 +721,17 @@ static int                   g_gds_verify_plain_fd = -1;
 // Deregister before closing: the cuFile handle refers to the descriptor.
 static void gds_decomp_read_close()
 {
+  // PER-INPUT DIAGNOSTICS, reset with the transaction they describe.  These were
+  // process-lifetime counters, so `-vv -t --gds-only A.zst B.zst` printed B's
+  // line with A's calls, bytes and elapsed time folded in -- and the derived
+  // ms/call was meaningless for both.  The report site runs before this
+  // function's exit call, so it still sees its own file's numbers.
+  g_gdsv_read_ns.store(0, std::memory_order_relaxed);
+  g_gdsv_read_bytes.store(0, std::memory_order_relaxed);
+  g_gdsv_reads.store(0, std::memory_order_relaxed);
+  // (g_gds_verify_frames / g_gds_verify_bytes are declared below this point and
+  // are write-only -- nothing reads them -- so they are left alone rather than
+  // reordering declarations to reset counters no report consumes.)
   g_gds_read_active.store(false, std::memory_order_release);
   g_gds_verify_active.store(false, std::memory_order_release);
   g_gds_input.close();
@@ -26058,8 +26069,16 @@ static void gpu_decomp_worker(
 
       // Need to reallocate -- but a write-behind thread may still be DMAing out
       // of the very buffer free_device() is about to release.
+      //
+      // AND ITS ERROR MUST BE OBSERVED HERE.  The thread cannot throw (an
+      // exception crossing a std::thread boundary calls std::terminate), so it
+      // records a failed cuFileWrite in wb_err.  The pre-kernel join checks
+      // that; this one used to join and clear the jobs without looking, which
+      // silently discards a write failure -- the frames are gone, the output is
+      // short, and nothing reports it.
       if (wb_thr.joinable()) wb_thr.join();
       wb_jobs.clear();
+      if (!wb_err.empty()) throw std::runtime_error(wb_err);
       free_device();
       alloc_batch  = batch_n;
       alloc_comp   = max_comp;
@@ -26702,6 +26721,17 @@ static void gpu_decomp_worker(
           max_comp   = std::max(max_comp,   C.batch[i].len());
           max_decomp = std::max(max_decomp, C.batch[i].decomp_size);
         }
+        // A BATCH CAN BE ENTIRELY EMPTY FRAMES, and a zero physical slot is not
+        // an allocation.  An empty zstd DATA frame is legal, the ordinary
+        // producers pass its decomp_size of 0 straight through, and if every
+        // frame in the batch is one then max_decomp is 0 -- which survives both
+        // roundings below ((0 + 4095) & ~4095 is still 0) and reaches
+        // ensure_buffers as cudaMalloc(batch_n * 0).  Under --gds-only there is
+        // no CPU fallback to recover with, so a PERFECTLY VALID ARCHIVE was
+        // rejected.  The logical sizes in h_decomp_sizes stay 0 -- nvCOMP is
+        // still asked to produce zero bytes, and the checksum kernel still hashes
+        // zero bytes -- this only guarantees the slab exists.
+        if (max_decomp == 0) max_decomp = 4096;
         // --gds-only: the DEVICE STRIDE must be 4 KiB-aligned too, not just the
         // file offset.  Peer-to-peer writes address slot i at i * alloc_decomp,
         // so an unaligned stride makes every slot after the first start off a
@@ -27264,7 +27294,16 @@ static void gpu_decomp_worker(
             // nvCOMP's per-chunk status and the produced-vs-declared size check,
             // which is exactly and only what the ordinary GPU path has for them:
             // the D2H verifies nothing, so skipping it loses nothing.
-            if (m) m->wrote_bytes.fetch_add(actual, std::memory_order_relaxed);
+            // BOTH counters, matching what writer_thread retires a frame with
+            // in TEST mode.  v0.17.24 added wrote_bytes to the CPU discard path
+            // and to here, but tasks_done only to the CPU side -- so every frame
+            // verified ON THE DEVICE was missing from the progress meter's frame
+            // count.  The two paths must credit identically or the totals depend
+            // on where the work happened to run.
+            if (m) {
+              m->wrote_bytes.fetch_add(actual, std::memory_order_relaxed);
+              m->tasks_done.fetch_add(1, std::memory_order_relaxed);
+            }
             g_gds_verify_frames.fetch_add(1, std::memory_order_relaxed);
             g_gds_verify_bytes.fetch_add(actual, std::memory_order_relaxed);
             // Mirrors the loop tail below, which this branch skips.
@@ -27319,6 +27358,11 @@ static void gpu_decomp_worker(
             // belt-and-braces bound rather than something that can unalign it.
             size_t wlen = (actual + 4095) & ~size_t(4095);
             if (wlen > C.alloc_decomp) wlen = C.alloc_decomp;
+            // An empty frame contributes no bytes and needs no write; asking
+            // cuFile for a zero-length transfer is pointless at best.  The
+            // high-water mark below is still updated, so the output file is
+            // still sized correctly past this frame.
+            if (wlen == 0) { /* nothing to write */ } else
             // WRITTEN INLINE, AND BOTH ALTERNATIVES WERE BUILT AND MEASURED.
             //
             // WIDER: 16-way fan-out of a batch's writes bought nothing --

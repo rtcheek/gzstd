@@ -1,12 +1,70 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.24  
+**Covers:** v0.9.50 → v0.17.25  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.25 — a valid archive rejected, and the other half of the v0.17.24 fix
+
+Fourth review pass over the GDS work.
+
+### An all-empty batch rejects a legal archive
+
+An empty zstd DATA frame is legal, and the ordinary producers pass its
+`decomp_size` of 0 straight through — demoting from the seek table does **not** keep such a frame
+away from the GPU, as v0.17.24's comment now says. If every frame in a batch is one, `max_decomp`
+is 0, which survives both roundings (`(0 + 4095) & ~4095` is still 0) and reaches `ensure_buffers`
+as `cudaMalloc(batch_n * 0)`. Under `--gds-only` there is no CPU fallback to recover with, so a
+valid archive is refused.
+
+The logical sizes stay 0 — nvCOMP is still asked for zero bytes and the checksum kernel still
+hashes zero bytes — but the physical slot now has a 4 KiB floor so the slab exists, and a
+zero-length `cuFileWrite` is skipped.
+
+**Not reproduced.** The trigger needs empty frames reaching `gpu_decomp_worker` *while GDS output
+is engaged*, and an all-empty archive produces no output bytes, so the output path declines before
+the two can coincide. `cudaMalloc(0)` is not a valid allocation and the floor costs one page, so
+the fix stands on construction rather than on a demonstration.
+
+### v0.17.24 fixed half of the accounting
+
+The CPU discard path got both `wrote_bytes` and `tasks_done`; the **GPU verify branch** got only
+`wrote_bytes`. So every frame verified on the device was missing from the progress meter's frame
+count, and the totals depended on where the work happened to run. Both paths now credit exactly
+what `writer_thread` retires a frame with in TEST mode.
+
+### The write-behind realloc boundary discarded a write failure
+
+`ensure_buffers()` correctly joins `wb_thr` before `free_device()` releases the slab it is DMAing
+out of — no use-after-free — but it then cleared the job list **without inspecting `wb_err`**. The
+thread cannot throw (an exception crossing a `std::thread` boundary calls `std::terminate`), so a
+failed `cuFileWrite` is recorded there and was silently dropped at this boundary: frames gone,
+output short, nothing reported. The pre-kernel join always checked it; this one now does too.
+
+### `-vv` read diagnostics accumulated across input files
+
+`g_gdsv_read_*` were process-lifetime counters, so `gzstd -vv -t --gds-only A.zst B.zst` printed
+B's line with A's calls, bytes and time folded in — and the derived ms/call was wrong for both.
+Measured before the fix: second file **256 calls, 1063.7 MiB**; after: **128 calls, 531.9 MiB**,
+matching the first. Reset with the transaction they describe.
+
+### Alignment claim, restated more strictly
+
+The v0.17.22 stride padding stands, but the earlier wording overstated what was shown. The four
+concatenated 1,000,003-byte frames *do* exercise the defect — slot bases land at 0, 3, 6 and 1
+modulo 8, and the frames are long enough to enter the 64-bit `__ldg` loop. The accurate claim:
+
+> The caller violated the kernel's documented 8-byte stride precondition; the H100 tolerated the
+> reproduced misaligned accesses, and no functional failure was observed there.
+
+An alignment-checking sanitizer or different hardware is likelier to make it visible than any
+other archive shape.
+
+---
 
 ## v0.17.24 — a test that could not fail, and two comments that claimed more than the code delivered
 
