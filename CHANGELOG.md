@@ -1,12 +1,66 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.23  
+**Covers:** v0.9.50 → v0.17.24  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.24 — a test that could not fail, and two comments that claimed more than the code delivered
+
+Third review pass. One real defect, and two places where the source asserted something untrue.
+
+### `--gds-only -t`'s CPU rescue reported the wrong size
+
+In TEST mode `writer_thread` credits both `tasks_done` and `wrote_bytes` for every frame it
+retires. The discard path added in v0.17.22 has no writer, so dropping the frame also dropped its
+accounting — while the GPU verify branch kept crediting its own. A run that verified part of the
+archive on the device and then lost the GPU therefore reported only that prefix. Measured:
+**8,388,608 bytes reported against 1,073,741,824 actual**, a 128x under-report, because exactly one
+frame had been delivered before the fault. The integrity verdict was always right; the size, ratio,
+throughput and stats JSON were not.
+
+### The test for that path could never have failed
+
+Worth recording separately, because it invalidates earlier claims in this changelog. The verify
+branch ends with `continue`, skipping the loop tail where `GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST`
+lives — so **the fault hook could not fire for `--gds-only -t` at all**, and every "GPU fault →
+CPU rescue" check run against the verify path was silently exercising nothing. The hook now also
+fires from the verify branch, and only with it in place does the under-report above become
+visible: without the hook, the fixed and unfixed binaries produce identical output.
+
+### Two comments that asserted invariants the code did not maintain
+
+- `gzx_xxh64_kernel` documents its precondition — `stride` a multiple of 8 for aligned 64-bit
+  loads — and claimed it "holds for every caller … always a whole number of MiB". True of the
+  compress-verify caller; **false of the decompress one**, which passes the largest declared frame
+  size in the batch. Four independently-compressed 1,000,003-byte frames concatenated produce an
+  odd stride, with no seek table involved. The caller was fixed in v0.17.22 to round up; the
+  comment now says the precondition holds *because the caller maintains it*, not because the shape
+  guarantees it. (On this H100 the unfixed binary passes that archive anyway — misaligned loads are
+  tolerated in hardware, which is why it looked harmless.)
+- The v0.17.22 seek-table comment justified demoting empty data frames as keeping zero-length
+  frames out of the GPU batch path. **That is not what it does**: the ordinary producers set
+  `t.decomp_size` straight from `ZSTD_getFrameContentSize` with no zero filter, so such a frame
+  reaches `gpu_decomp_worker` either way. The real reason is that admitting one to the seek table
+  creates a zero-width interval and a duplicate `u_off` that every consumer of that table would
+  then have to handle. Corrected, with the wrong version noted so it does not come back.
+
+### Also
+
+`gpu_only_cpu_fallback`'s `discard_results` default argument is gone — a caller that omits it is a
+caller that has not decided whether its pipeline has a writer, which is precisely what went wrong
+in v0.17.22. The compress caller states `false` explicitly.
+
+Still accepted on reasoning rather than demonstration: the multi-file wrong-file read closed in
+v0.17.22. The recipe needs a second input whose `O_DIRECT` reopen fails while the first archive's
+cuFile handle is still live; every filesystem reachable here supports `O_DIRECT`, tmpfs included.
+
+Suites: 419/419 GPU, 335 passed + 72 skipped CPU-only.
+
+---
 
 ## v0.17.23 — the fix in v0.17.22 reintroduced the bug it fixed, on the demote path
 

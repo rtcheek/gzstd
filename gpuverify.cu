@@ -159,9 +159,18 @@ __device__ __forceinline__ unsigned int gzx_rd4(const unsigned char * p)
 // Content_Checksum.
 //
 // PRECONDITION: `base` is 8-byte aligned and `stride` is a multiple of 8, so the
-// main loop can use aligned 64-bit loads.  Both hold for every caller — `base` is
-// cudaMalloc'd (256-byte aligned) and `stride` is the GPU subchunk size, always a
-// whole number of MiB.  The tail path makes no alignment assumption.
+// main loop can use aligned 64-bit loads.  The tail path makes no alignment
+// assumption.
+//
+// `base` is always cudaMalloc'd (256-byte aligned).  `stride` USED TO BE
+// DESCRIBED HERE as "the GPU subchunk size, always a whole number of MiB", and
+// that was true only of the compress-verify caller.  The DECOMPRESS verify
+// caller passes alloc_decomp, which is the largest DECLARED frame size in the
+// batch -- byte-granular, and odd for any archive whose frames are not whole
+// MiB.  Four independently-compressed 1,000,003-byte frames concatenated is
+// enough to produce it; no seek table required.  That caller now rounds the
+// stride up to 8 explicitly, so the precondition holds again, but it holds
+// because the caller maintains it and not because the shape guarantees it.
 __global__ void gzx_xxh64_kernel(const unsigned char * __restrict__ base,
                                  size_t stride,
                                  const size_t * __restrict__ sizes,

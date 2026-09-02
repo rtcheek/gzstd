@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.23";
+static constexpr const char * GZSTD_VERSION = "0.17.24";
 //
 // Architecture overview:
 //
@@ -12400,7 +12400,23 @@ static void cpu_decomp_worker(
   // writes, and with no writer this is the only place that can.
   const bool verify_discard = discard_results;
   auto deliver = [&](size_t seq, FrameBuf buf) {
-    if (verify_discard) { buf.reset(); if (bp) bp->release(1); return; }
+    if (verify_discard) {
+      // CREDIT WHAT THE WRITER WOULD HAVE.  In TEST mode writer_thread counts
+      // both tasks_done and wrote_bytes for every frame it retires; on this path
+      // there is no writer, so dropping the frame silently also dropped its
+      // accounting.  The GPU verify branch credits its own frames, so a run that
+      // verified part of the archive on the device and then lost the GPU
+      // reported only that prefix -- or 0 B when the GPU failed before finishing
+      // anything.  The verdict was still right; the size, ratio, throughput and
+      // stats JSON were not.
+      if (m) {
+        if (buf) m->wrote_bytes.fetch_add(buf->size(), std::memory_order_relaxed);
+        m->tasks_done.fetch_add(1, std::memory_order_relaxed);
+      }
+      buf.reset();
+      if (bp) bp->release(1);
+      return;
+    }
     results->push_to_slot(-1, seq, std::move(buf));
   };
 
@@ -12813,7 +12829,11 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
                                   // needs it: it exists precisely because the GPU
                                   // path failed, and under --gds-only -t there is
                                   // no writer for it to push to.
-                                  bool discard_results = false)
+                                  // NO DEFAULT ON PURPOSE.  A caller that omits
+                                  // this is a caller that has not decided whether
+                                  // its pipeline has a writer, and that decision
+                                  // is exactly what went wrong in v0.17.22.
+                                  bool discard_results)
 {
   // THERE IS NO CPU FALLBACK FOR A --gds-only RUN, in either direction, and
   // pretending otherwise is how a host-configuration problem turned into
@@ -20221,9 +20241,21 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
         // with the table about its physical extent.  Anything else -- including
         // a legal zstd DATA frame that happens to decompress to zero bytes --
         // demotes to the authoritative frame walk, which decodes every frame and
-        // reports the damage.  Demoting rather than admitting empty data frames
-        // is deliberate: it keeps zero-length frames out of the GPU batch path,
-        // which has never seen that shape.
+        // reports the damage.
+        //
+        // WHY DEMOTE an empty DATA frame rather than admit it to co/uo: doing so
+        // would push a ZERO-WIDTH interval and a DUPLICATE u_off, and every
+        // consumer of this table would then have to handle that deliberately --
+        // the staged producer's dsz subtraction, build_seek_plan, the tar
+        // header-hop.  Demotion costs that one archive its seek-table
+        // acceleration and nothing else: the frame walk still decodes and
+        // verifies every frame.
+        //
+        // (An earlier version of this comment claimed demotion keeps zero-length
+        // frames out of the GPU batch path.  That was wrong -- the ordinary
+        // producers set t.decomp_size straight from ZSTD_getFrameContentSize
+        // with no zero filter, so such a frame reaches gpu_decomp_worker either
+        // way.  The interval argument above is the real one.)
         unsigned char zh[8];
         const int zfd = ::fileno(in);
         if (zfd < 0 || ::pread(zfd, zh, sizeof zh, (off_t)c) != (ssize_t)sizeof zh) {
@@ -23126,7 +23158,11 @@ static void gpu_worker(
           // Last GPU standing just failed in --gpu-only: finish on CPU
           // instead of stranding the queue (data safety over mode purity).
           if (opt.gpu_only && fails == gpu_worker_count)
-            gpu_only_cpu_fallback(false, queue, results, opt, m, bp);
+            // Compress: this pool is cpu_worker, which never consults the flag,
+            // and this pipeline always has a writer.  Stated explicitly rather
+            // than defaulted.
+            gpu_only_cpu_fallback(false, queue, results, opt, m, bp,
+                                  /*discard_results=*/false);
           return;
         }
         // At least one stream is usable — shrink ctxs and continue.
@@ -27234,6 +27270,16 @@ static void gpu_decomp_worker(
             // Mirrors the loop tail below, which this branch skips.
             C.batch[i].release_input();
             C.delivered = i + 1;
+            // ...INCLUDING THE FAULT HOOK.  This branch `continue`s past the tail
+            // where GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST lives, so for --gds-only -t
+            // that hook could never fire and every "GPU fault -> CPU rescue" test
+            // of the verify path was silently testing nothing.
+            if (g_debug_fail_gpu_decomp_last && i + 1 < C.filled && queue->drained()) {
+              static std::atomic<bool> dbg_v_fired{false};
+              if (!dbg_v_fired.exchange(true))
+                throw std::runtime_error(
+                    "simulated GPU decompress fault (GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST)");
+            }
             continue;
           }
           d2h_bytes_batch += actual;
