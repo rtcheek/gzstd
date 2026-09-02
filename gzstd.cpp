@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.22";
+static constexpr const char * GZSTD_VERSION = "0.17.23";
 //
 // Architecture overview:
 //
@@ -12365,7 +12365,15 @@ static void cpu_decomp_worker(
   void * sched_ptr,
 #endif
   CpuAgg * cpuagg,
-  FrameThrottle * bp)
+  FrameThrottle * bp,
+  // WHETHER THIS POOL HAS A CONSUMER, decided once by the caller that also
+  // decides whether to spawn the writer.  It must NOT be re-read from
+  // g_gds_verify_active here: the writer decision is made before the producer
+  // runs, and a producer that later demotes (no usable seek table) clears that
+  // global -- so a worker reading it afterwards concludes it should push, into a
+  // ResultStore whose writer was never created.  On a large archive that is an
+  // unbounded accumulation and then a hang.
+  bool discard_results)
 {
 #ifdef HAVE_NVCOMP
   HybridSched * sched = static_cast<HybridSched*>(sched_ptr);
@@ -12390,11 +12398,7 @@ static void cpu_decomp_worker(
   //
   // The permit still has to come back: normally the writer frees it as it
   // writes, and with no writer this is the only place that can.
-#ifdef HAVE_NVCOMP
-  const bool verify_discard = g_gds_verify_active.load(std::memory_order_relaxed);
-#else
-  const bool verify_discard = false;
-#endif
+  const bool verify_discard = discard_results;
   auto deliver = [&](size_t seq, FrameBuf buf) {
     if (verify_discard) { buf.reset(); if (bp) bp->release(1); return; }
     results->push_to_slot(-1, seq, std::move(buf));
@@ -12802,7 +12806,14 @@ static void cpu_decomp_worker(
 ======================================================================*/
 static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
                                   ResultStore * results, const Options & opt,
-                                  Meter * m, FrameThrottle * bp)
+                                  Meter * m, FrameThrottle * bp,
+                                  // The caller's frozen sink decision -- see
+                                  // cpu_decomp_worker's parameter of the same
+                                  // name.  This rescue pool is the one that most
+                                  // needs it: it exists precisely because the GPU
+                                  // path failed, and under --gds-only -t there is
+                                  // no writer for it to push to.
+                                  bool discard_results = false)
 {
   // THERE IS NO CPU FALLBACK FOR A --gds-only RUN, in either direction, and
   // pretending otherwise is how a host-configuration problem turned into
@@ -12866,7 +12877,7 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
   for (int i = 0; i < threads; ++i) {
     if (decompress)
       pool.emplace_back(cpu_decomp_worker, i, queue, results, &opt, m,
-                        (void *)nullptr, &agg, bp);
+                        (void *)nullptr, &agg, bp, discard_results);
     else
       pool.emplace_back(cpu_worker, i, queue, results, &opt, m,
                         (void *)nullptr, &agg, bp);
@@ -13815,7 +13826,8 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 #ifdef HAVE_NVCOMP
                       nullptr,
 #endif
-                      &cpuagg, bp_ptr);
+                      &cpuagg, bp_ptr,
+                      /*discard_results=*/false);   // this path always has a writer
   }
   if (opt.verbosity >= V_VERBOSE)
     std::cerr << "[CPU] " << threads << " decompression threads online\n";
@@ -25837,7 +25849,12 @@ static void gpu_decomp_worker(
   // the run ends in `internal error: writer stuck` at exit 1.  gpu_failures
   // keeps its old meaning because the bringup barrier reads it.
   std::atomic<int> * gpu_exits,
-  int gpu_worker_count)              // total GPU workers spawned
+  int gpu_worker_count,              // total GPU workers spawned
+  // The frozen sink decision -- see cpu_decomp_worker's parameter of the same
+  // name.  Used for BOTH this worker's own delivery (C.gds_verify) and the CPU
+  // rescue it may start, so the two cannot disagree about whether a writer
+  // exists.
+  bool discard_results)
 {
   (void)m;
   // Called on EVERY exit from this worker: clean drain, init skip, or fault.
@@ -25856,7 +25873,7 @@ static void gpu_decomp_worker(
     if (out != gpu_worker_count) return;    // not the last worker out
     if (!opt.gpu_only || !queue) return;    // hybrid still has CPU consumers
     if (queue->drained()) return;           // empty AND producer done: nothing owed
-    gpu_only_cpu_fallback(true, queue, results, opt, m, bp);
+    gpu_only_cpu_fallback(true, queue, results, opt, m, bp, discard_results);
   };
   const size_t stream_count = std::max<size_t>(1, (size_t)opt.gpu_streams);
 
@@ -26159,7 +26176,10 @@ static void gpu_decomp_worker(
     for (auto & C : ctxs) {
       C.gds_only    = g_gds_out_active.load(std::memory_order_relaxed);
       C.gds_read    = g_gds_read_active.load(std::memory_order_relaxed);
-      C.gds_verify  = g_gds_verify_active.load(std::memory_order_relaxed);
+      // The frozen decision, not the live global: a later demotion clears that
+      // global but does not retroactively create the writer this pipeline chose
+      // not to spawn.
+      C.gds_verify  = discard_results;
       C.gds_reg_log = (opt.verbosity >= V_VERBOSE);
     }
     for (size_t s = 0; s < stream_count; ++s) {
@@ -28078,8 +28098,14 @@ gds_out_declined:
   // --gds-only -t delivers no frames at all (they are verified on the device and
   // dropped), so the writer would sit waiting for sequence numbers that are never
   // coming.  Same reasoning as the --gds-only output path above it.
-  if (!g_gds_out_active.load(std::memory_order_relaxed)
-      && !g_gds_verify_active.load(std::memory_order_relaxed))
+  // FREEZE THE SINK TOPOLOGY HERE.  Whether a writer exists is decided now, and
+  // every pool that pushes results has to be told the same answer.  Re-reading
+  // g_gds_verify_active later does not work: the producer runs AFTER this point
+  // and may demote (no usable seek table), which clears that global -- leaving
+  // workers to conclude they should push into a ResultStore whose writer was
+  // never created.
+  const bool discard_results = g_gds_verify_active.load(std::memory_order_relaxed);
+  if (!g_gds_out_active.load(std::memory_order_relaxed) && !discard_results)
     writer_thr = std::thread(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
 
   // ---- Hybrid scheduler ----
@@ -28115,7 +28141,7 @@ gds_out_declined:
     }
     for (int i = 0; i < cpu_threads; ++i)
       cpu_pool.emplace_back(cpu_decomp_worker, i, &queue, &results, &opt, m,
-                            (void*)sched, &cpuagg, bp_ptr);
+                            (void*)sched, &cpuagg, bp_ptr, discard_results);
   }
 
   // ---- GPU decompression workers ----
@@ -28264,7 +28290,8 @@ gds_out_declined:
                                &any_gpu_failed, &abort_on_failure,
                                &fatal_msgs[size_t(i)],
                                &shared_tune_decomp,
-                               bp_ptr, &gpu_failures, &gpu_exits, gpu_count);
+                               bp_ptr, &gpu_failures, &gpu_exits, gpu_count,
+                               discard_results);
     }
     // NOT set here — spawning is not engagement.  Raised at the first DELIVERED
     // frame in gpu_decomp_worker, for the reason g_adapt_gpu_engaged documents.

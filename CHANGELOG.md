@@ -1,12 +1,52 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.22  
+**Covers:** v0.9.50 → v0.17.23  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.23 — the fix in v0.17.22 reintroduced the bug it fixed, on the demote path
+
+Found by sending v0.17.22 back for a second review pass. This is a defect in
+yesterday's fix, not in the code it fixed.
+
+v0.17.22 stopped `--gds-only -t`'s CPU rescue from retaining the whole decompressed output by
+having `cpu_decomp_worker` discard each frame once `ZSTD_decompress` had validated it. It decided
+whether to discard by reading `g_gds_verify_active`.
+
+**That global is read at three different times, and it changes in between.** The writer-spawn
+decision reads it before the producer runs. A producer that then demotes — no usable seek table —
+calls `gds_decomp_read_close()`, which clears it. The worker reads it later still. So:
+
+```
+gate sets verify_active = true      ->  writer NOT spawned
+producer finds no seek table        ->  demotes, clears verify_active
+CPU workers read verify_active      ->  false, so they PUSH
+                                    ->  into a ResultStore with no writer
+```
+
+which is an unbounded accumulation and then a hang — the exact failure v0.17.22 existed to
+prevent, reached through a path it did not consider. The race also runs the other way: a worker
+that reads `true` after a demotion would discard frames the pipeline was supposed to deliver.
+
+The sink topology is now **frozen where the writer decision is made** and passed explicitly to
+every pool that produces results — `cpu_decomp_worker`, `gpu_decomp_worker`, and the
+`gpu_only_cpu_fallback` rescue. One decision, made once, so no two pools can disagree about
+whether a writer exists. The non-GDS call sites pass `false` explicitly rather than leaning on a
+default, and `gpu_decomp_worker` uses the same value for its own delivery (`C.gds_verify`) as for
+the rescue it may start.
+
+Verified on the shapes that exercise it: a truncated-table and a forged-table archive both demote
+and return 4, matching `--cpu-only`; clean and corrupt archives with **no seek table at all**
+return 0 and 4; normal staged `-t` and `-d` are unaffected and byte-identical; and the injected
+GPU-fault rescue still reports a correct verdict.
+
+Suites: 419/419 GPU, 335 passed + 72 skipped CPU-only.
+
+---
 
 ## v0.17.22 — seven defects from the first independent review of the GDS work
 
