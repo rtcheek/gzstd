@@ -1,12 +1,113 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.20  
+**Covers:** v0.9.50 → v0.17.21  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.21 — the read fan-out that a 1 GiB corpus said was worthless is worth 15%
+
+v0.17.19 unstarved the batches, which invalidated every performance verdict reached before it —
+all of them measured while batches were 3 frames instead of 256. This release re-tests the whole
+list on the real 65 GiB archive. Two verdicts flip.
+
+### Read fan-out: rejected once on 1 GiB, now the default
+
+`cuFileRead` is synchronous per call, so one thread gets the **single-request** rate and no more.
+Measured: a single thread sustains 3.97 GiB/s while `dd` shows the device doing ~4.9 GiB/s.
+
+| fan-out | `-t` wall, 130 GiB |
+|---|---|
+| 1 | 25.94 s |
+| 4 | 22.83 s |
+| **8** | **22.28 s** |
+| 16 | 22.08 s |
+
+Default is 8; 16 buys 0.2 s. Reads now measure **4.93 GiB/s — the device ceiling**.
+
+**This exact change was built, measured and reverted earlier in the arc**, correctly, because on a
+1 GiB corpus reads were 0.52 s of a 7.84 s run and parallelising 6.6% of the work changed nothing.
+At real scale reads are 17 s of 26 s. *A read-side idea cannot be judged on a corpus where reads
+are 7% of the work* — which is the same lesson as v0.17.19's, arrived at from the other direction.
+
+It also explains why raising cuFile's own `execution.max_io_threads` to 32 measured as a no-op,
+twice: that setting parallelises **within** one request, not **across** separate ones.
+
+### The v0.17.18 temp bound is not an optimisation, it is load-bearing
+
+It shipped on 1 GiB evidence as "5–10%". A/B at real scale, batch 256:
+
+| | wall | sys | host RSS |
+|---|---|---|---|
+| shape-derived bound | 25.76–25.94 s | 12.2 s | 17.0 GB |
+| exact per-batch query | 29.25–29.33 s | **1625 s** | **138 GB** |
+
+Those numbers understate it, because the second arm is not a slower GPU run at all: it **faults
+the device** (`cudaStreamSynchronize(decomp): an illegal memory access`) after ~256 frames and
+finishes the archive on 96 CPU threads, exiting 0 with correct output only because the v0.17.15
+CPU rescue catches it.
+
+The exact query remains in the code as the fallback for a shape the bound does not cover, so a
+failure of `GetTempSizeAsync` now **throws a diagnosable error** naming the batch size instead of
+falling through into the path measured to fault the GPU.
+
+### Verdicts that survived re-testing
+
+| idea | at scale |
+|---|---|
+| more streams | worse at both memory levels (see v0.17.20) |
+| write fan-out | **worse**, not neutral — 69.31 s → 71.15 s (4 threads) → 76.54 s (8) |
+| cuFile config tuning | no effect, now confirmed with reads dominant |
+| `--chunk-size` | worse — it shrinks the batch and never changes read granularity |
+
+**The read/write asymmetry explains all of them.** A single thread could not saturate reads, so
+fanning those out reached the ceiling. Writes were *already* at theirs (2.86 GiB/s), and reads and
+writes share one drive — `dd` gives 3.7 GB/s write-alone but 2.7 GB/s concurrent — so every
+write-side idea only takes bandwidth from reads already in flight.
+
+### Write-behind: kept, off by default
+
+`GZSTD_DEBUG_GDS_WRITE_BEHIND=1` overlaps a batch's writes with the next batch's reads. At scale it
+is **no result** — off 67.90–69.05 s, on 67.65–68.42 s, overlapping ranges — where hiding the
+13.25 s read phase inside the 45.62 s write phase should have been worth ~19%.
+
+It is kept rather than reverted because the code is correct when enabled (byte-identical output,
+md5-verified at 130 GiB, with joins before the kernel, before a realloc, at teardown and on the
+fault path) and **the reason it does not pay is a property of this host, not of the design**: one
+drive serving both directions. On a host with reads and writes on separate devices the contention
+that cancels it disappears. The diagnostic to watch is the `-vvv` `D2H transfers` rate — if it
+drops from 2.86 GiB/s with the switch on, the drive is the limit; if it holds, the read phase is
+genuinely being hidden.
+
+### `cuFileDriverOpen` explained, and no longer silent
+
+It costs ~2.5 s and is the first thing a `--gds-only` run does, so the tool looked hung. Measured
+standalone: cold 2.136 s; with the CUDA context warmed first, `cudaFree(0)` 1.511 s and
+`cuFileDriverOpen` 0.567 s. The costs are **additive** — ~71% of it is the cuInit it performs
+internally, which any GPU path pays anyway (`--gpu-only`'s entire fixed cost is 1.90 s of the same
+thing). Only ~0.57 s belongs to cuFile. That also explains why backgrounding it bought nothing
+earlier: the background thread and GPU bringup serialise on the same context creation.
+
+Nothing to reclaim, so it now says what it is doing instead: a transient
+`[GDS] opening the cuFile driver ...` that the progress bar paints over, on a terminal only, and
+suppressed by `-q`. The timing itself is reported at `-vv`.
+
+Also fixed: the `[GDS] verify reads` line divided bytes by **summed** thread time, so the fan-out
+made reads look 5x slower than serial. The misleading aggregate rate is gone.
+
+### Cumulative, on the archive that started this
+
+| | `-t` | `-d` |
+|---|---|---|
+| as first reported | 175.95 s | 72.63 s |
+| **now** | **22.15 s** | **~68 s** |
+
+**7.9x on `-t`.** Output md5-identical to `--cpu-only` across 139,964,108,800 bytes throughout.
+
+---
 
 ## v0.17.20 — the compress progress meter, and the batch knee re-measured where it matters
 

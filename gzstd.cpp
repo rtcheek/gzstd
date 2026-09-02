@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.20";
+static constexpr const char * GZSTD_VERSION = "0.17.21";
 //
 // Architecture overview:
 //
@@ -474,6 +474,20 @@ static std::string gz_gds_lib_reason()
   return std::string();
 }
 
+// How long cuFileDriverOpen took, ns.  Reported at -vv on the staged paths.
+static std::atomic<uint64_t> g_gds_driver_open_ns{0};
+// May the driver-open notice print?  Set once from gzstd_main, which is the only
+// place that has both the parsed verbosity and a terminal check -- this loader
+// block is compiled long before either exists.
+static std::atomic<bool> g_gds_notice_ok{false};
+// MEASURED, standalone, one device: cold cuFileDriverOpen = 2.136 s; with the
+// CUDA context warmed first, cudaFree(0) = 1.511 s and cuFileDriverOpen = 0.567 s.
+// The costs are ADDITIVE, so ~71% of what this call appears to cost is the cuInit
+// it performs internally -- which any GPU path pays anyway (--gpu-only's whole
+// fixed cost is 1.90 s of the same thing).  Only ~0.57 s is cuFile's own setup,
+// and that is also why backgrounding this call bought nothing: the background
+// thread and GPU bringup serialise on the same context creation.
+
 static const std::string & gz_gds_unavailable_reason()
 {
   static const std::string reason = []{
@@ -492,7 +506,29 @@ static const std::string & gz_gds_unavailable_reason()
     // also broke `-t` on a corrupt archive: die() is std::exit, which skips
     // main's guard, leaving a joinable std::thread to terminate() at static
     // destruction (exit 134 instead of 4).  Reverted.
+    // SAY SOMETHING FIRST.  This call takes ~2.5 s (see the note above) and it
+    // is the FIRST thing a --gds-only run does, before the progress bar has
+    // rendered anything -- so the tool looks hung for two and a half seconds.
+    //
+    // Transient, exactly like the "[done] finalizing" line: \r puts the cursor
+    // at column 0 and \033[K clears to end of line, so the first progress render
+    // paints straight over it.  Cleared explicitly below for the runs that finish
+    // before the bar ever draws (a small archive, or -t on a fast one).
+    //
+    // Only on a terminal: through a pipe or into a log, a \r-updated line is
+    // just noise with no cursor to move.  -q suppresses it with everything else.
+    const bool drv_notice = g_gds_notice_ok.load(std::memory_order_relaxed);
+    if (drv_notice) {
+      std::fprintf(stderr, "\r[GDS] opening the cuFile driver ...\033[K");
+      std::fflush(stderr);
+    }
+    const uint64_t drv_t0 = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     const GzCUfileError_t e = a.DriverOpen();
+    g_gds_driver_open_ns.store((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() - drv_t0,
+        std::memory_order_relaxed);
+    if (drv_notice) { std::fprintf(stderr, "\r\033[K"); std::fflush(stderr); }
     if (e.err != GZ_CUFILE_SUCCESS)
       return std::string("cuFileDriverOpen failed (err ") + std::to_string(e.err)
            + ", cuda " + std::to_string(e.cu_err)
@@ -652,6 +688,22 @@ static std::atomic<uint64_t> g_gdsv_reads{0};
 // This is a real memory cost -- 17 GiB of host RSS -- and it is chosen for a
 // host that has it.  A smaller machine should pass --gpu-batch, which overrides
 // this entirely; --gpu-batch 64 restores the old 4.4 GiB footprint.
+// How many staged cuFileReads to keep in flight.  cuFileRead is SYNCHRONOUS PER
+// CALL, so one thread gets the single-request rate and no more; cuFile's own
+// execution.max_io_threads parallelises WITHIN a request, not across them, which
+// is why raising it measured as a no-op.
+//
+// MEASURED, -t on a 65 GiB / 8344-frame archive, one device, cold:
+//   fan-out  1: 25.94 s      4: 22.83 s      8: 22.28 s      16: 22.08 s
+// 8 is the knee; 16 buys 0.2 s.  Raw device ceiling is ~4.9 GiB/s (dd) against
+// ~3.97 GiB/s from a single thread, and this is what closes that gap.
+//
+// THIS WAS RULED OUT ONCE, ON A 1 GiB CORPUS, WHERE IT MEASURED AS NOTHING --
+// correctly, because reads were 0.52 s of a 7.84 s run there.  At real scale
+// they are 17 s of 26 s, and the same change is worth 15%.  A read-side idea
+// cannot be judged on a corpus where reads are 7% of the work.
+static const int GDS_READ_FANOUT = 8;
+
 static const size_t GDS_VERIFY_REGISTER_BUDGET = 4096ull * 1024u * 1024u;
 static int                   g_gds_verify_fd = -1;   // O_DIRECT dup of the archive
 // A BUFFERED dup as well, for the CPU rescue: it preads arbitrary
@@ -25760,6 +25812,14 @@ static void gpu_decomp_worker(
     size_t alloc_decomp = 0;    // bytes per decompressed slot
     void * d_comp_buf = nullptr;
     void * d_decomp_buf = nullptr;
+    // WRITE-BEHIND, OFF BY DEFAULT (GZSTD_DEBUG_GDS_WRITE_BEHIND=1).  This
+    // batch's writes run on a background thread so the NEXT batch's reads overlap
+    // them.  Kept as an experiment hook, not because it pays here -- see the
+    // measurements at the write site.  Joined before anything can touch
+    // d_decomp_buf again: the kernel, a realloc, teardown, or a fault.
+    std::thread              wb_thr;
+    std::vector<std::array<uint64_t,3>> wb_jobs;   // {dev_off, file_off, len}
+    std::string              wb_err;
     GdsBuf gds_in_reg;           // --gds-only -t: d_comp_buf mapped into BAR1
     bool   ptrs_shifted = false;  // last batch rewrote the comp pointer table
     GdsBuf gds_out_reg;          // --gds-only: d_decomp_buf mapped into BAR1
@@ -25876,7 +25936,10 @@ static void gpu_decomp_worker(
           && max_decomp <= alloc_decomp && needed_temp <= temp_bytes)
         return true;  // already big enough
 
-      // Need to reallocate
+      // Need to reallocate -- but a write-behind thread may still be DMAing out
+      // of the very buffer free_device() is about to release.
+      if (wb_thr.joinable()) wb_thr.join();
+      wb_jobs.clear();
       free_device();
       alloc_batch  = batch_n;
       alloc_comp   = max_comp;
@@ -26563,14 +26626,37 @@ static void gpu_decomp_worker(
         // per-batch query and its sync are skipped entirely and the grow path
         // (with its re-read) never fires.  The exact query remains below as a
         // fallback for a shape the bound does not cover.
+        // THE SHAPE-DERIVED BOUND IS NOT AN OPTIMISATION; IT IS THE ONLY PATH
+        // THAT WORKS AT THESE BATCH SIZES.  A/B on the real 65 GiB archive, one
+        // device, batch 256 -- bound vs the pre-v0.17.18 exact-per-batch query:
+        //
+        //   bound            25.76-25.94 s   sys   12.2 s   RSS  17.0 GB
+        //   exact per-batch  29.25-29.33 s   sys 1625.0 s   RSS 138.0 GB
+        //
+        // and those numbers understate it, because the second arm is not a slower
+        // GPU run at all: it FAULTS THE DEVICE ("cudaStreamSynchronize(decomp):
+        // an illegal memory access") after ~256 frames and finishes the archive
+        // on 96 CPU threads.  It exits 0 with correct output only because the
+        // CPU rescue catches it.  v0.17.18 was measured on a 1 GiB corpus and
+        // filed as a 5-10% win; at real batch sizes it is load-bearing.
         size_t temp_bound = C.temp_bytes;
         {
           nvcompBatchedZstdDecompressOpts_t bopts{};
           size_t tb = 0;
-          if (nvcompBatchedZstdDecompressGetTempSizeAsync(
-                  C.filled, max_decomp, bopts, &tb, C.filled * max_decomp)
-              == nvcompSuccess && tb > temp_bound)
-            temp_bound = tb;
+          const nvcompStatus_t bst = nvcompBatchedZstdDecompressGetTempSizeAsync(
+              C.filled, max_decomp, bopts, &tb, C.filled * max_decomp);
+          // DO NOT FALL THROUGH TO THE EXACT QUERY IF THIS FAILS.  That path is
+          // still below (it is what runs when the bound does not cover a shape),
+          // and it is the one measured to fault the device.  Reaching it because
+          // the bound could not be computed would turn a diagnosable condition
+          // into an illegal memory access and a silent 96-thread CPU fallback.
+          if (bst != nvcompSuccess)
+            throw std::runtime_error(
+                "GPU decomp: nvcompBatchedZstdDecompressGetTempSizeAsync failed (status "
+                + std::to_string((int)bst) + ") -- cannot size the decompress "
+                "workspace for a batch of " + std::to_string(C.filled)
+                + "; re-run with a smaller --gpu-batch or without --gds-only");
+          if (tb > temp_bound) temp_bound = tb;
         }
         if (!C.ensure_buffers(C.filled, max_comp, max_decomp, temp_bound)) {
           throw std::runtime_error("GPU decomp: failed to allocate device buffers");
@@ -26615,7 +26701,16 @@ static void gpu_decomp_worker(
         uint64_t h2d_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
         uint64_t h2d_bytes_batch = 0;
         cudaEventRecord(C.ev_begin, C.stream);
+        static const bool wb_on = []{
+          const bool on = ::getenv("GZSTD_DEBUG_GDS_WRITE_BEHIND") != nullptr;
+          if (on) std::cerr << "[GDS] write-behind ENABLED (experimental): this "
+                               "batch's writes overlap the next batch's reads\n";
+          return on;
+        }();
         bool staged_batch = false;
+        bool staged_prefetched = false;   // fan-out already read this batch
+        std::mutex rd_err_m;
+        std::string rd_err;
         // ONE definition of "get frame i's compressed bytes into its slot",
         // because there are TWO callers: this loop, and the re-upload after a
         // temp grow reallocates the slab.  When the staged arm existed only
@@ -26664,11 +26759,15 @@ static void gpu_decomp_worker(
             g_gdsv_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t usable = (got > 0) ? std::min((size_t)got - std::min((size_t)got, pad),
                                                        C.batch[i].len()) : 0;
-            if (usable != C.batch[i].len())
-              throw std::runtime_error("--gds-only -t: cuFileRead returned "
-                  + std::to_string((long long)got) + " for frame "
-                  + std::to_string(C.batch[i].seq) + " at offset "
-                  + std::to_string((long long)raw));
+            if (usable != C.batch[i].len()) {
+              std::lock_guard<std::mutex> lk(rd_err_m);
+              if (rd_err.empty())
+                rd_err = "--gds-only: cuFileRead returned "
+                       + std::to_string((long long)got) + " for frame "
+                       + std::to_string(C.batch[i].seq) + " at offset "
+                       + std::to_string((long long)raw);
+              return;
+            }
             const bool p2p = ((fo & 4095) == 0) && ((dv & 4095) == 0)
                           && ((want & 4095) == 0);
             (p2p ? g_gds_frames_p2p : g_gds_frames_fallback)
@@ -26689,8 +26788,41 @@ static void gpu_decomp_worker(
         // cuFile handle is safe for concurrent reads, so the only way to keep
         // the drive busy is to have several in flight.  Host-backed frames are
         // untouched here: their cudaMemcpyAsync is already asynchronous.
+        // GZSTD_DEBUG_GDS_READ_FANOUT=N -- issue the staged reads N-at-a-time.
+        // cuFileRead is synchronous per call, so one thread gets the SINGLE
+        // REQUEST rate (~4.1 GB/s here) while the device sustains ~5.2 GB/s with
+        // several in flight.  This is the only lever left on the read side:
+        // cuFile's own max_io_threads parallelises WITHIN a request, not across
+        // them, which is why the config knob measured as a no-op.
+        {
+          static const int rd_fan = []{
+            const char * e = ::getenv("GZSTD_DEBUG_GDS_READ_FANOUT");
+            return e ? std::max(1, std::min(64, std::atoi(e))) : GDS_READ_FANOUT;
+          }();
+          size_t staged_n = 0;
+          for (size_t i = 0; i < C.filled; ++i)
+            if (C.batch[i].src_off >= 0) ++staged_n;
+          if (rd_fan > 1 && staged_n > 1) {
+            staged_prefetched = true;
+            const size_t nthr = std::min((size_t)rd_fan, staged_n);
+            auto issue = [&](size_t k, size_t step) {
+              for (size_t i = k; i < C.filled; i += step)
+                if (C.batch[i].src_off >= 0) place_frame(i);
+            };
+            std::vector<std::thread> pool;
+            pool.reserve(nthr - 1);
+            for (size_t k = 1; k < nthr; ++k) pool.emplace_back(issue, k, nthr);
+            issue(0, nthr);
+            for (auto & th : pool) th.join();
+            if (!rd_err.empty()) throw std::runtime_error(rd_err);
+          }
+        }
+
         for (size_t i = 0; i < C.filled; ++i) {
-          place_frame(i);
+          // Skip only what the fan-out above already read THIS batch.  Testing
+          // h_comp_ptrs for null would be wrong: it persists across batches, so
+          // every staged frame after the first batch would be silently skipped.
+          if (!(staged_prefetched && C.batch[i].src_off >= 0)) place_frame(i);
           h2d_bytes_batch += C.batch[i].len();
           C.h_comp_sizes[i]   = C.batch[i].len();
           if (C.batch[i].src_off >= 0) {
@@ -26830,6 +26962,17 @@ static void gpu_decomp_worker(
           batch_seqs[i] = C.batch[i].seq;
         }
         // (C.delivered was zeroed at intake -- see the comment there.)
+
+        // JOIN THE PREVIOUS BATCH'S WRITE-BEHIND, as late as possible.  Those
+        // writes DMA out of d_decomp_buf, which this kernel is about to
+        // overwrite; the reads above filled d_comp_buf, a DIFFERENT slab, so they
+        // were free to run alongside.  That gap is the entire overlap, and
+        // joining any earlier gives all of it back.
+        if (C.wb_thr.joinable()) {
+          C.wb_thr.join();
+          C.wb_jobs.clear();
+          if (!C.wb_err.empty()) throw std::runtime_error(C.wb_err);
+        }
 
         checkNvcomp(nvcompBatchedZstdDecompressAsync(
             (const void * const *)C.d_comp_ptrs,
@@ -27029,12 +27172,62 @@ static void gpu_decomp_worker(
             // and writes still 2.50 GiB/s.  That write figure is 2.68 GB/s against
             // dd's 2.7 GB/s concurrent-write ceiling on this filesystem -- the
             // hardware limit, reached from two independent directions.
-            const ssize_t w = g_gds_output.write_dev(
-                C.d_decomp_buf, wlen, (off_t)ooff, (off_t)(i * C.alloc_decomp));
-            if (w != (ssize_t)wlen)
-              throw std::runtime_error("--gds-only: cuFileWrite returned "
-                  + std::to_string((long long)w) + " for " + std::to_string(wlen)
-                  + " bytes at offset " + std::to_string((long long)ooff));
+            // WRITTEN INLINE.  Fanning these out was tried twice, and the second
+            // time at real scale with writes at 71% of the batch loop -- the one
+            // condition under which the first test could have been wrong.  It is
+            // WORSE, not neutral: -d on 130 GiB, 1 thread 69.31 s / sys 36.75,
+            // 4 threads 71.15 / 37.94, 8 threads 76.54 / 46.85 (md5-identical
+            // throughout).  Reads and writes share one drive -- dd measures
+            // 3.7 GB/s write-alone but 2.7 GB/s concurrent with a read -- so extra
+            // write concurrency takes bandwidth from the reads already in flight.
+            //
+            // THE READ SIDE IS THE OPPOSITE and the asymmetry is the point: a
+            // single thread could not saturate reads (3.97 vs 4.9 GiB/s) so
+            // fanning THOSE out is the default now, and it took them to 4.93 GiB/s
+            // -- the device ceiling.  Writes were already there.
+            // SYNCHRONOUS BY DEFAULT.  Two alternatives exist and both are
+            // measured; one is reverted, the other is kept behind a switch.
+            //
+            // WIDER (several writes at once): REVERTED, worse at scale rather than
+            // neutral -- -d on 130 GiB, 1 thread 69.31 s / sys 36.75, 4 threads
+            // 71.15 / 37.94, 8 threads 76.54 / 46.85.  One drive: dd gives
+            // 3.7 GB/s write-alone but 2.7 GB/s concurrent with a read, so extra
+            // write concurrency takes bandwidth from the reads already in flight.
+            //
+            // OVERLAPPED (GZSTD_DEBUG_GDS_WRITE_BEHIND=1, this batch's writes
+            // against the NEXT batch's reads): KEPT, OFF BY DEFAULT.  No result on
+            // this hardware -- off 67.90-69.05 s, on 67.65-68.42 s, overlapping
+            // ranges -- and 3.5% slower back at 4 GiB.  Hiding the 13.25 s read
+            // phase inside the 45.62 s write phase should have been worth ~19%; it
+            // is not, because the two contend on one drive and the writes slow by
+            // about what the overlap saves.
+            //
+            // It is kept because the code is correct when enabled (byte-identical
+            // output, md5-verified at 130 GiB) and the reason it does not pay is a
+            // property of THIS BOX, not of the design.  On a host that reads and
+            // writes on SEPARATE devices -- or a RAID/NVMe array with real
+            // concurrent bandwidth -- the contention that cancels it disappears
+            // and the ~19% should be there.  What to watch when trying it: the
+            // -vvv "D2H transfers" rate.  If it drops from 2.86 GiB/s when the
+            // switch is on, the drive is the limit and the overlap is a wash; if
+            // it holds, the read phase is genuinely being hidden.
+            //
+            // THE READ SIDE IS THE ASYMMETRY: a single thread could NOT saturate
+            // reads (3.97 vs 4.9 GiB/s), so fanning those out IS the default and
+            // took them to 4.93 GiB/s, the device ceiling.  Writes were already
+            // there at 2.86 GiB/s, which is why nothing on this side pays here.
+            if (wb_on) {
+              // Deferred to the write-behind thread launched after this loop.
+              C.wb_jobs.push_back({(uint64_t)(i * C.alloc_decomp), (uint64_t)ooff,
+                                   (uint64_t)wlen});
+            } else {
+              const ssize_t w = g_gds_output.write_dev(
+                  C.d_decomp_buf, wlen, (off_t)ooff, (off_t)(i * C.alloc_decomp));
+              if (w != (ssize_t)wlen)
+                throw std::runtime_error("--gds-only: cuFileWrite returned "
+                    + std::to_string((long long)w) + " for " + std::to_string(wlen)
+                    + " bytes at offset " + std::to_string((long long)ooff));
+            }
             // High-water mark of LOGICAL bytes — the ftruncate target.  Frames
             // land out of order, so this is a max, not a sum.
             uint64_t want = ooff + (uint64_t)actual;
@@ -27117,6 +27310,25 @@ static void gpu_decomp_worker(
               throw std::runtime_error(
                   "simulated GPU decompress fault (GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST)");
           }
+        }
+        if (!C.wb_jobs.empty()) {
+          DecompStreamCtx * cp = &C;
+          C.wb_thr = std::thread([cp]() {
+            for (const auto & w : cp->wb_jobs) {
+              const ssize_t got = g_gds_output.write_dev(cp->d_decomp_buf, (size_t)w[2],
+                                                         (off_t)w[1], (off_t)w[0]);
+              if (got != (ssize_t)w[2]) {
+                // Recorded, not thrown: an exception crossing a std::thread
+                // boundary calls std::terminate before gpu_decomp_worker's
+                // recovery boundary could turn it into an ordinary failed pass.
+                if (cp->wb_err.empty())
+                  cp->wb_err = "--gds-only: cuFileWrite returned "
+                             + std::to_string((long long)got) + " at offset "
+                             + std::to_string((long long)w[1]);
+                return;
+              }
+            }
+          });
         }
         uint64_t d2h_elapsed_ns = (d2h_t0 > 0) ? now_ns() - d2h_t0 : 0;
         double d2h_ms_v = double(d2h_elapsed_ns) / 1e6;
@@ -27223,7 +27435,13 @@ static void gpu_decomp_worker(
       if (!submitted_any) std::this_thread::yield();
     }
 
-    // Cleanup
+    // Cleanup.  Writers first: free_device() below releases the very slab they
+    // are reading from, so a pending write would DMA out of freed VRAM.
+    for (auto & C : ctxs)
+      if (C.wb_thr.joinable()) {
+        C.wb_thr.join();
+        if (!C.wb_err.empty()) throw std::runtime_error(C.wb_err);
+      }
     if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
       C.free_device();
@@ -27256,6 +27474,10 @@ static void gpu_decomp_worker(
     // Rescue in-flight chunks back to queue so other GPUs can pick them up.
     // The batch was popped from the queue but not (fully) decompressed.
     try {
+      // Writers first, same ordering rule as the clean path.  Errors are
+      // swallowed: we are already unwinding a fault and the output is discarded.
+      for (auto & C : ctxs)
+        if (C.wb_thr.joinable()) { try { C.wb_thr.join(); } catch (...) {} }
       if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
       for (auto & C : ctxs) {
         // Frames [0, delivered) already reached the ResultStore (and had
@@ -28097,15 +28319,21 @@ gds_out_declined:
 
   if (g_gds_read_active.load(std::memory_order_relaxed)
       && opt.verbosity >= V_VERBOSE) {
+    const uint64_t dnw = g_gds_driver_open_ns.load(std::memory_order_relaxed);
+    if (dnw) {
+      char db[140];
+      std::snprintf(db, sizeof(db), "[GDS] cuFileDriverOpen: %.0f ms\n", double(dnw) / 1e6);
+      std::cerr << db;
+    }
     const uint64_t rn = g_gdsv_read_ns.load(std::memory_order_relaxed);
     const uint64_t rb = g_gdsv_read_bytes.load(std::memory_order_relaxed);
     const uint64_t rc = g_gdsv_reads.load(std::memory_order_relaxed);
     char b[220];
     std::snprintf(b, sizeof(b),
-        "[GDS] verify reads: %llu calls, %.1f MiB, %.2f s summed across readers"
-        " (%.0f MiB/s aggregate, %.2f ms/call)\n",
+        "[GDS] verify reads: %llu calls, %.1f MiB, %.2f s summed across %d reader(s)"
+        " (%.2f ms/call)\n",
         (unsigned long long)rc, double(rb) / 1048576.0, double(rn) / 1e9,
-        rn ? double(rb) / 1048576.0 / (double(rn) / 1e9) : 0.0,
+        GDS_READ_FANOUT,
         rc ? double(rn) / 1e6 / double(rc) : 0.0);
     std::cerr << b;
   }
@@ -29795,6 +30023,13 @@ static int gzstd_main(int argc, char ** argv)
 #endif
 
   Options opt = parse_args(argc, argv);
+
+#ifdef HAVE_NVCOMP
+  // Arm the "opening the cuFile driver ..." notice: --gds-only only, not -q, and
+  // only on a terminal (through a pipe a \r-updated line is noise).
+  if (opt.gds_only && opt.verbosity >= V_DEFAULT && isatty(fileno(stderr)))
+    g_gds_notice_ok.store(true, std::memory_order_relaxed);
+#endif
 
   // Asymmetric-mode default: PCIe Gen3 → cpu-only decompress; otherwise
   // hybrid for compress and Gen4+ decompress.  No-op if user passed an
