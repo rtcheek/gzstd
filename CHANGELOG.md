@@ -1,12 +1,94 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.21  
+**Covers:** v0.9.50 → v0.17.22  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.22 — seven defects from the first independent review of the GDS work
+
+v0.17.13 through .21 shipped without an outside read. This is the first Codex pass over them.
+Every finding below was verified against the source before being changed, and the code compiled
+between each fix.
+
+### A forged seek table could make `-t` report OK on a corrupt archive
+
+The worst of the set, and reachable by corrupting **four bytes**. `parse_foreign_seek_table`
+treated a table entry with `dsize == 0` as a skippable frame: it advanced the running compressed
+offset but never added the frame to the extent lists. The structural check that follows
+(`c != tstart`) still passed, because the byte count was still accounted for.
+
+So zeroing the **last data frame's** `dsize` field removed that frame from everything built on the
+table while leaving the table valid — and `--gds-only -t`, which reads frame extents from exactly
+that table, verified every frame except the one that had been hidden. Mutation-tested: on an
+archive with a corrupted final frame *and* that frame hidden, the old code reports **exit 0** and
+the fixed code reports 4, matching `--cpu-only`.
+
+Now the entry's own magic decides. A real skippable must also agree with the table about its
+physical extent; anything else — including a legal zstd data frame that decompresses to zero
+bytes — demotes to the frame walk, which decodes everything and reports the damage.
+
+*Deviation from the proposed patch, deliberately:* the review's version admitted empty data frames
+into the extent lists with a duplicate uncompressed offset. That introduces `decomp_size == 0`
+frames into the GPU batch path, a shape it has never seen. Demoting closes the same hole without
+creating a new one.
+
+### Staged read state leaked between input files
+
+`decompress_nvcomp` runs once per input, but `g_gds_read_active`, the cuFile handle and two
+descriptors were only ever cleared on the demote path. After a **successful** staged run they
+stayed live, so the next input inherited an active flag and a handle to the previous archive; the
+two descriptors were also overwritten without being closed, leaking two per file. Now torn down at
+entry *and* exit, by one helper.
+
+The descriptor leak is plain in the source. The wrong-file read it enables is real by inspection
+but **was not reproduced**: every per-file failure path reachable here either re-opens the handle
+or routes away from `decompress_nvcomp` entirely.
+
+### The checksum kernel could read past its buffer, and off unaligned addresses
+
+Two separate defects in v0.17.14's device-side verification:
+
+- It was launched with `d_actual_sizes` — what nvCOMP *produced* — **before** any status had been
+  inspected. For a chunk nvCOMP failed on, that slot holds nothing trustworthy, and a large value
+  makes the kernel read past `d_decomp_buf`, raising an illegal memory access that poisons the
+  CUDA context before the ordinary per-chunk failure handling runs. It now hashes the
+  header-declared sizes, which are bounded by the slot size by construction. Nothing is lost: the
+  result is only consumed for a chunk whose status is success *and* whose actual size equals its
+  declared size.
+- `gzx_xxh64_kernel` reads frames as 64-bit words, so every slot base must be 8-byte aligned. The
+  stride was only rounded on the `--gds-only` **write** path. gzstd's own archives hide this
+  because their frames are whole MiB, but a foreign archive read through its seek table can have
+  arbitrary frame sizes. Padded to 8 bytes; logical sizes are unchanged.
+
+### Three defects in the v0.17.21 read fan-out
+
+- `place_frame` stored into the plain `bool staged_batch` from up to eight threads. Every store
+  wrote the same value and the read happened after the join, so it could not misbehave in
+  practice — but it is a data race, and therefore undefined. Computed once in the owning thread
+  from a count it already takes.
+- The `rd_err` check lived **inside** the fan-out block. A batch with a single staged frame, or a
+  run with the fan-out disabled, takes the sequential path instead — where a short `cuFileRead` was
+  recorded and then ignored, letting nvCOMP run on a partial or stale slot. A frame with no
+  content checksum could then yield wrong bytes of the right declared length. Checked on both
+  sequential paths now.
+- `--gds-only -t` spawns no writer, so nothing drains the ResultStore. A GPU fault sending work to
+  the CPU rescue therefore retained the entire decompressed output in RAM — 130 GiB on the test
+  archive. The rescue now drops each frame after `ZSTD_decompress` has validated it (that
+  validation *is* the verification) and releases the throttle permit the writer would have freed.
+
+**That last fix nearly introduced a worse bug.** The discard is keyed on `g_gds_verify_active`,
+which was cleared only on entry to `decompress_nvcomp` — so a later input routed to
+`decompress_cpu_mt` would have inherited a stale `true` and silently written an **empty output
+file**. Caught while checking the fix; the exit-path teardown closes it, and that exact sequence is
+now tested.
+
+Suites: 419/419 GPU, 335 passed + 72 skipped CPU-only. Both build configurations compile.
+
+---
 
 ## v0.17.21 — the read fan-out that a 1 GiB corpus said was worthless is worth 15%
 

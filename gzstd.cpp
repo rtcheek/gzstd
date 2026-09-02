@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.21";
+static constexpr const char * GZSTD_VERSION = "0.17.22";
 //
 // Architecture overview:
 //
@@ -709,6 +709,24 @@ static int                   g_gds_verify_fd = -1;   // O_DIRECT dup of the arch
 // A BUFFERED dup as well, for the CPU rescue: it preads arbitrary
 // (offset, length) pairs, which an O_DIRECT descriptor rejects outright.
 static int                   g_gds_verify_plain_fd = -1;
+
+// End one decompression's staged-read transaction.  PER FILE, not per process:
+// decompress_nvcomp() runs once per input, and only the demote path used to
+// clear any of this.  After a SUCCESSFUL staged run the flag stayed true and the
+// cuFile handle stayed open on the finished archive, so if the next input's
+// O_DIRECT/cuFile setup failed, its producer still saw read_active == true and
+// the workers read the NEW file's offsets through the OLD file's handle -- right
+// offsets, wrong file, no error.  The two descriptors also leaked per input.
+//
+// Deregister before closing: the cuFile handle refers to the descriptor.
+static void gds_decomp_read_close()
+{
+  g_gds_read_active.store(false, std::memory_order_release);
+  g_gds_verify_active.store(false, std::memory_order_release);
+  g_gds_input.close();
+  if (g_gds_verify_fd >= 0)       { ::close(g_gds_verify_fd);       g_gds_verify_fd = -1; }
+  if (g_gds_verify_plain_fd >= 0) { ::close(g_gds_verify_plain_fd); g_gds_verify_plain_fd = -1; }
+}
 static std::atomic<uint64_t> g_gds_verify_frames{0};
 static std::atomic<uint64_t> g_gds_verify_bytes{0};
 static int                g_stage_input_fd    = -1;
@@ -12359,6 +12377,29 @@ static void cpu_decomp_worker(
     return tq->front_seq_at_most(results->next_pub.load(std::memory_order_relaxed));
   };
 
+  // ONE PLACE THAT DECIDES PUSH-OR-DISCARD, so the three delivery sites below
+  // cannot drift apart on permit accounting.
+  //
+  // `--gds-only -t` runs with NO WRITER THREAD: the GPU verifies each frame on
+  // the device and drops it, so there is nothing to order and nothing draining
+  // the ResultStore.  If a GPU fault sends the remaining work to this CPU pool,
+  // every frame it pushes is retained forever -- on a 130 GiB archive that is
+  // the entire decompressed output held in RAM.  ZSTD_decompress has already
+  // validated the frame by then (that IS the verification this run exists to
+  // do), so the bytes have served their purpose and are dropped here.
+  //
+  // The permit still has to come back: normally the writer frees it as it
+  // writes, and with no writer this is the only place that can.
+#ifdef HAVE_NVCOMP
+  const bool verify_discard = g_gds_verify_active.load(std::memory_order_relaxed);
+#else
+  const bool verify_discard = false;
+#endif
+  auto deliver = [&](size_t seq, FrameBuf buf) {
+    if (verify_discard) { buf.reset(); if (bp) bp->release(1); return; }
+    results->push_to_slot(-1, seq, std::move(buf));
+  };
+
   // Create a reusable decompression context for this thread
   if (!tl_dctx) {
     tl_dctx = ZSTD_createDCtx();
@@ -12587,7 +12628,7 @@ static void cpu_decomp_worker(
         else          os << "could not decode (" << ZSTD_getErrorName(rc) << ") — data unreliable";
         vlog(V_ERROR, *opt, os.str() + "\n");
       }
-      results->push_to_slot(-1, t.seq, std::move(out_buf));
+      deliver(t.seq, std::move(out_buf));
     } else if (use_streaming) {
       static constexpr size_t CHUNK = 16 * ONE_MIB;
       size_t n_chunks_est = (t.decomp_size + CHUNK - 1) / CHUNK;
@@ -12630,7 +12671,7 @@ static void cpu_decomp_worker(
           // cap.  Deadlock-free: chunks ascend from the lowest seq, so the
           // writer always drains the oldest first and frees a permit.
           if (chunk_seq != t.seq && bp) bp->acquire(1);
-          results->push_to_slot(-1, chunk_seq, std::move(chunk));
+          deliver(chunk_seq, std::move(chunk));
           ++chunk_seq;
         }
         if (ret == 0) break;
@@ -12667,7 +12708,7 @@ static void cpu_decomp_worker(
       out_buf->resize(actual);
       t.release_input();
       if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
-      results->push_to_slot(-1, t.seq, std::move(out_buf));
+      deliver(t.seq, std::move(out_buf));
     }
 
     const auto t1_w = std::chrono::steady_clock::now();
@@ -20155,7 +20196,33 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     for (uint64_t k = 0; k < nf && !bad; ++k, q += esz) {
       uint64_t cz = rd_le32(q), dz = rd_le32(q + 4);
       if (cz < 8 || cz > tstart - c) { bad = true; break; }
-      if (dz == 0) { skips = true; c += cz; continue; }  // trailing skippables only
+      if (dz == 0) {
+        // A ZERO DECOMPRESSED SIZE DOES NOT PROVE A SKIPPABLE FRAME, and taking
+        // it on trust silently drops the entry from co/uo while still advancing
+        // c -- so the `c != tstart` check below still passes.  Zeroing the LAST
+        // data frame's dz field therefore removed that frame from everything
+        // built on this table while leaving the table structurally valid.  For
+        // `-t --gds-only`, whose whole job is to answer "is this archive
+        // intact", that meant reporting OK without ever decoding it.
+        //
+        // Check the frame's own magic, and require a real skippable to agree
+        // with the table about its physical extent.  Anything else -- including
+        // a legal zstd DATA frame that happens to decompress to zero bytes --
+        // demotes to the authoritative frame walk, which decodes every frame and
+        // reports the damage.  Demoting rather than admitting empty data frames
+        // is deliberate: it keeps zero-length frames out of the GPU batch path,
+        // which has never seen that shape.
+        unsigned char zh[8];
+        const int zfd = ::fileno(in);
+        if (zfd < 0 || ::pread(zfd, zh, sizeof zh, (off_t)c) != (ssize_t)sizeof zh) {
+          bad = true; break;
+        }
+        const uint32_t zmagic = rd_le32(zh);
+        const bool real_skippable = ((zmagic & 0xFFFFFFF0u) == 0x184D2A50u)
+                                 && (uint64_t(rd_le32(zh + 4)) + 8u == cz);
+        if (!real_skippable) { bad = true; break; }
+        skips = true; c += cz; continue;
+      }
       // v1 restriction: data frames must be contiguous from offset 0 (true
       // for t2sz output); mid-stream skippables would break csize slicing.
       if (skips || cz < 10) { bad = true; break; }
@@ -26588,6 +26655,16 @@ static void gpu_decomp_worker(
         // run past its slot into the next one.
         if (C.gds_only)
           max_decomp = (max_decomp + 4095) & ~size_t(4095);
+        // EVERY SLOT BASE MUST BE 8-BYTE ALIGNED.  gzx_xxh64_kernel reads the
+        // frame as 64-bit words -- reinterpret_cast<const unsigned long long *>
+        // of (base + chunk * stride) -- so an odd stride puts every frame after
+        // the first on a misaligned address and makes the checksum validation
+        // itself undefined.  gzstd's own archives hide this because their frames
+        // are whole MiB; a FOREIGN archive read through its seek table (which is
+        // exactly what --gds-only -t supports) can have arbitrary frame sizes, so
+        // max_decomp is whatever the largest one happens to be.
+        // h_decomp_sizes keeps the logical sizes, so this changes padding only.
+        max_decomp = (max_decomp + 7u) & ~size_t(7);
         // --gds-only -t reads an ALIGNED WINDOW around each frame, so the slot
         // has to hold up to 4095 bytes of lead-in plus the tail round-up.  Two
         // pages of headroom, and the slot base stays 4 KiB-aligned so the
@@ -26774,7 +26851,6 @@ static void gpu_decomp_worker(
                 .fetch_add(1, std::memory_order_relaxed);
             // nvCOMP must see the frame, not the window.
             C.h_comp_ptrs[i] = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp + pad;
-            staged_batch = true;
             return;
           }
           C.h_comp_ptrs[i] = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
@@ -26802,6 +26878,14 @@ static void gpu_decomp_worker(
           size_t staged_n = 0;
           for (size_t i = 0; i < C.filled; ++i)
             if (C.batch[i].src_off >= 0) ++staged_n;
+          // SET HERE, IN THE OWNING THREAD, not inside place_frame().  place_frame
+          // runs on up to GDS_READ_FANOUT threads at once, and every one of them
+          // used to store `true` into this plain bool.  The stores all agreed and
+          // the read happens after the join, so it could not misbehave in
+          // practice -- but it is still a data race, which is undefined
+          // behaviour, and the compiler is entitled to assume it cannot happen.
+          // staged_n is exactly the same information, counted where it is safe.
+          staged_batch = (staged_n > 0);
           if (rd_fan > 1 && staged_n > 1) {
             staged_prefetched = true;
             const size_t nthr = std::min((size_t)rd_fan, staged_n);
@@ -26850,6 +26934,17 @@ static void gpu_decomp_worker(
             }
           }
         }
+
+        // THE OTHER ERROR BOUNDARY.  place_frame() cannot throw from a fan-out
+        // child thread -- an exception crossing a std::thread boundary calls
+        // std::terminate before this worker's recovery boundary sees it -- so a
+        // short cuFileRead is recorded in rd_err instead.  The fan-out checks it
+        // after its join, but a batch with ONE staged frame (or with the fan-out
+        // disabled) is read by the sequential loop above, which had no check at
+        // all: the failure was recorded and then ignored, and nvCOMP ran on a
+        // partial or stale slot.  A frame with no content checksum could then
+        // produce wrong bytes of the right declared length and be accepted.
+        if (!rd_err.empty()) throw std::runtime_error(rd_err);
 
         // The pointer table is built once with fixed strides (see
         // ensure_capacity).  A staged batch puts each frame at its own pad
@@ -26929,6 +27024,9 @@ static void gpu_decomp_worker(
           // Staged frames are re-READ here, not re-copied: their bytes only ever
           // existed in the slab that was just freed.
           for (size_t i = 0; i < C.filled; ++i) place_frame(i);
+          // Same boundary as above: this re-read loop is always sequential, so
+          // the fan-out's post-join check cannot report a failure for it.
+          if (!rd_err.empty()) throw std::runtime_error(rd_err);
           checkCuda(cudaMemcpyAsync(C.d_comp_ptrs, C.h_comp_ptrs.data(),
                                     C.filled * sizeof(void*),
                                     cudaMemcpyHostToDevice, C.stream),
@@ -27013,11 +27111,22 @@ static void gpu_decomp_worker(
                                   C.filled * sizeof(size_t),
                                   cudaMemcpyDeviceToHost, C.stream), "D2H actual sizes");
         // Recompute each frame's content checksum ON THE DEVICE, over the bytes
-        // nvCOMP just produced.  d_actual_sizes is already the per-frame length
-        // array the kernel wants, and the output frames sit at a uniform stride,
-        // so this is one launch per batch and no extra host traffic.  Ordered on
+        // nvCOMP just produced.  Output frames sit at a uniform stride, so this
+        // is one launch per batch and no extra host traffic.  Ordered on
         // C.stream after the decompress, and read back with the other metadata.
-        gzx_launch_xxh64(C.d_decomp_buf, C.alloc_decomp, C.d_actual_sizes,
+        //
+        // HASH THE DECLARED SIZES, NOT d_actual_sizes.  This launch is queued
+        // BEFORE the stream synchronise below, so no status has been inspected
+        // yet -- and for a chunk nvCOMP failed on, its produced-size slot holds
+        // nothing we are entitled to trust.  A large or unspecified value there
+        // makes the kernel read past d_decomp_buf and raise an illegal memory
+        // access, which poisons the CUDA context before the ordinary per-chunk
+        // failure handling downstream ever runs.  h_decomp_sizes came from the
+        // frame headers on the host and is bounded by alloc_decomp by
+        // construction.  Nothing is lost: the checksum result is only ever
+        // consumed for a chunk whose status is success AND whose actual size
+        // equals its declared size, so on that path these are the same bytes.
+        gzx_launch_xxh64(C.d_decomp_buf, C.alloc_decomp, C.d_decomp_sizes,
                          C.filled, C.d_verify_ck, C.stream);
         checkCuda(cudaGetLastError(), "gzx_xxh64 launch (decompress verify)");
         checkCuda(cudaMemcpyAsync(C.h_verify_ck.data(), C.d_verify_ck,
@@ -27641,6 +27750,11 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
 
 static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  // NO INPUT INHERITS THE PREVIOUS ONE'S STAGED-READ STATE.  This is the call
+  // that actually closes the hole: it runs first, so it does not matter how the
+  // previous file's run ended -- cleanly, by demotion, or by a fault that
+  // unwound past the exit cleanup below.
+  gds_decomp_read_close();
   // Before ANY task is queued -- see the function's own note for why the order
   // is the point rather than a detail.
   gds_preflight_or_die(opt);
@@ -28202,11 +28316,7 @@ gds_out_declined:
       // g_gds_verify_active to decide whether a Task is a file region, so
       // leaving it set while the ordinary producer pushes host-backed Tasks
       // would have them read from a slab nobody filled.
-      g_gds_read_active.store(false, std::memory_order_release);
-      g_gds_verify_active.store(false, std::memory_order_release);
-      g_gds_input.close();
-      if (g_gds_verify_fd >= 0) { ::close(g_gds_verify_fd); g_gds_verify_fd = -1; }
-      if (g_gds_verify_plain_fd >= 0) { ::close(g_gds_verify_plain_fd); g_gds_verify_plain_fd = -1; }
+      gds_decomp_read_close();
       vlog(V_NORMAL, opt,
            "warning: --gds-only needs the archive's seek table to locate frames "
            "without reading them;\n  this archive has none, so the ordinary read "
@@ -28450,6 +28560,15 @@ gds_out_declined:
          "streaming decoder (slower, but nothing is lost).\n");
     decompress_from_buffer(raw_data, out, opt, m);
   }
+
+  // CLEAR ON THE WAY OUT TOO, not only on the way in.  Every GPU worker and any
+  // CPU rescue they spawned has joined by here, so nothing can still be reading
+  // either descriptor.  The entry call alone is not enough: cpu_decomp_worker
+  // consults g_gds_verify_active to decide whether to DISCARD its output, and a
+  // later input routed to decompress_cpu_mt (which never calls the entry
+  // teardown) would otherwise inherit a stale true and silently produce an empty
+  // file.
+  gds_decomp_read_close();
 
   log_throttle_stats(throttle, opt,
                      opt.hybrid ? "decompress-hybrid" :
