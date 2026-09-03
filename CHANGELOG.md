@@ -1,12 +1,82 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.27  
+**Covers:** v0.9.50 → v0.17.29  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.29 — the preflight proved one frame and trusted the rest, and a registration outlived its buffer
+
+Sixth review pass. Five findings, two of them serious, and one of them a defect that v0.17.27's own
+change had introduced.
+
+### A valid archive was rejected after partial output
+
+The `--gds-only` output preflight exists so an unsuitable archive demotes to the ordinary writer
+*before* anything is written — its own comment says silent truncation is "the worst failure this
+code could have". It checked **only frame 0**.
+
+Frame *k* starts at the sum of the decompressed sizes before it, so frame 0's alignment proves
+nothing about frame 2. A legal concatenation of 4096, 1001 and 17 byte frames starts them at 0,
+4096 and 5097: it passed the preflight, GDS wrote a prefix, and the worker's alignment guard then
+killed the run at frame 2. Reproduced exactly.
+
+Now every frame but the last must be a whole number of 4 KiB blocks, checked from the seek table —
+a trailer read and some arithmetic.
+
+*Divergence from the proposed patch:* it walked frame headers when no seek table is available.
+Advancing frame-to-frame needs each **compressed** size, so that walk reads the entire stream —
+65 GiB before any work starts on the archive this was measured against. A table-less archive now
+declines peer-to-peer writes instead. That costs an uncommon case (foreign archive, no table,
+conveniently aligned frames) nothing but the fast writer; gzstd's own archives always carry a
+table.
+
+### A cuFile registration outlived the VRAM it described
+
+`DecompStreamCtx::free_device()` freed `d_comp_buf` on the line **above** `gds_in_reg.dereg()`, so
+cuFile kept a BAR1 mapping of memory already returned to the driver — on every teardown *and every
+batch resize*, not just at shutdown. `d_decomp_buf`/`gds_out_reg` were always ordered correctly;
+the bug arrived with the second registration and inherited the first one's placement. Both slabs
+now deregister before either is freed.
+
+### A failed write was reported as a usage error
+
+A short or failed `cuFileWrite` threw into GPU recovery — but GDS output has no CPU sink, so
+`gpu_only_cpu_fallback` refused with "re-run without `--gds-only`": exit 2, saying nothing about
+the write that actually failed. The partial output was never committed, so this was a diagnostic
+defect rather than corruption. Four sites now `die(EXIT_IO)`, matching what the compress path has
+always done for the same condition.
+
+### Write-behind had stopped existing
+
+Worse than the vacuous test that revealed it. Coalescing (v0.17.27) runs as a pre-pass and wrote
+its span synchronously, so a batch that formed a single run never populated `wb_jobs` — **no
+background thread was ever created**, and `GZSTD_DEBUG_GDS_WRITE_BEHIND=1` silently did nothing on
+ordinary archives, which always coalesce. The regression test still passed, because it checked for
+the "ENABLED" banner that prints when the switch is *read*.
+
+The two now compose, and the composed shape is the better one for the hosts the switch exists for:
+one large asynchronous write per batch overlapping the next batch's reads, rather than thousands of
+small ones. Proven by a marker printed **from inside the thread** — absent by default, present with
+the switch, with coalescing on or off.
+
+### A data race in the byte-verify kernel
+
+`gzv_compare_kernel` set its mismatch flag with a plain store, arguing the race was benign because
+every writer stores the identical value. Agreeing on the value does not make concurrent
+unsynchronised writes defined. It only executes on the mismatch path, so `atomicExch` costs nothing
+on a healthy run. Corruption detection and the absence of false positives were both re-verified.
+
+### Release status
+
+Not tagged. Suites pass (419/419 GPU, 335 + 72 CPU-only), but those are the **default** runs, and
+the project's pre-tag set additionally wants the `-e` extensive suite with GDS cells engaged, the
+large round trips, and second-machine checks. `--gds-only` has still only ever run on one host.
+
+---
 
 ## v0.17.27 — 8,343 writes become 33, and the write phase reaches the device ceiling
 

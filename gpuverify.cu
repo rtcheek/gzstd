@@ -15,8 +15,15 @@
 #include <cstddef>
 
 // Compare the first `sizes[chunk]` bytes of each chunk of `a` against `b`, where
-// chunk N's data starts at `N * stride`.  On any mismatch, set *mismatch = 1 — a
-// benign race (every writer stores the identical value 1), so no atomics needed.
+// chunk N's data starts at `N * stride`.  On any mismatch, set *mismatch = 1.
+//
+// WRITTEN WITH atomicExch, NOT A PLAIN STORE.  Several blocks can find corruption
+// at once, and this used to argue the race was benign because every writer stores
+// the identical value.  Agreeing on the value does not make concurrent
+// unsynchronised writes defined under the CUDA memory model -- it is a data race,
+// and the compiler is entitled to assume races do not happen.  The store only
+// executes on the mismatch path, which is the rare one, so the atomic costs
+// nothing on a healthy run.
 __global__ void gzv_compare_kernel(const unsigned char * __restrict__ a,
                                    const unsigned char * __restrict__ b,
                                    const size_t * __restrict__ sizes,
@@ -28,7 +35,7 @@ __global__ void gzv_compare_kernel(const unsigned char * __restrict__ a,
     const unsigned char * pb = b + chunk * stride;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < len; i += (size_t)gridDim.x * blockDim.x) {
-        if (pa[i] != pb[i]) { *mismatch = 1; return; }
+        if (pa[i] != pb[i]) { atomicExch(mismatch, 1); return; }
     }
 }
 

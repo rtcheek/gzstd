@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.27";
+static constexpr const char * GZSTD_VERSION = "0.17.29";
 //
 // Architecture overview:
 //
@@ -26105,11 +26105,19 @@ static void gpu_decomp_worker(
     }
 
     void free_device() {
-      if (d_comp_buf)    { cudaFree(d_comp_buf);    d_comp_buf = nullptr; }
-      // Before the free: cuFile holds a BAR1 mapping of this exact pointer, and
-      // this function runs again on every batch resize, not just at shutdown.
+      // DEREGISTER BEFORE FREEING, for both slabs.  cuFile holds a BAR1 mapping
+      // of these exact pointers, and this function runs on every batch resize,
+      // not only at shutdown.
+      //
+      // d_comp_buf used to be freed on the line ABOVE these deregs -- so from the
+      // moment gds_in_reg existed (the staged read), every teardown and every
+      // resize left cuFile describing VRAM that had already been returned to the
+      // driver.  d_decomp_buf/gds_out_reg were always in the right order, which
+      // is why this survived: the bug arrived with the second registration and
+      // inherited the first one's placement.
       gds_in_reg.dereg();
       gds_out_reg.dereg();
+      if (d_comp_buf)    { cudaFree(d_comp_buf);    d_comp_buf = nullptr; }
       if (d_decomp_buf)  { cudaFree(d_decomp_buf);  d_decomp_buf = nullptr; }
       if (d_temp)        { cudaFree(d_temp);         d_temp = nullptr; }
       if (d_comp_ptrs)   { cudaFree(d_comp_ptrs);   d_comp_ptrs = nullptr; }
@@ -26153,7 +26161,7 @@ static void gpu_decomp_worker(
       // short, and nothing reports it.
       if (wb_thr.joinable()) wb_thr.join();
       wb_jobs.clear();
-      if (!wb_err.empty()) throw std::runtime_error(wb_err);
+      if (!wb_err.empty()) die(wb_err, EXIT_IO);   // see write_span: I/O, not a GPU fault
       free_device();
       alloc_batch  = batch_n;
       alloc_comp   = max_comp;
@@ -27230,7 +27238,7 @@ static void gpu_decomp_worker(
         if (C.wb_thr.joinable()) {
           C.wb_thr.join();
           C.wb_jobs.clear();
-          if (!C.wb_err.empty()) throw std::runtime_error(C.wb_err);
+          if (!C.wb_err.empty()) die(C.wb_err, EXIT_IO);   // see write_span
         }
 
         checkNvcomp(nvcompBatchedZstdDecompressAsync(
@@ -27361,15 +27369,37 @@ static void gpu_decomp_worker(
             ::getenv("GZSTD_DEBUG_GDS_NO_COALESCE_WRITES") == nullptr;
         auto write_span = [&](uint64_t dev_off, uint64_t file_off, uint64_t len) {
           if (!len) return;
+          // WRITE-BEHIND APPLIES HERE TOO.  Coalescing runs as a pre-pass and
+          // used to write synchronously, so once it became the default a batch
+          // that formed a single run never populated wb_jobs -- no background
+          // thread was ever created, and GZSTD_DEBUG_GDS_WRITE_BEHIND=1 silently
+          // did nothing on ordinary archives (which always coalesce).  Queuing
+          // the span instead makes the two compose, and the composed shape is
+          // the better one for the hosts the switch exists for: ONE large write
+          // overlapping the next batch's reads, rather than thousands of small
+          // ones.  The slab's lifetime is already covered -- the joins before
+          // the kernel, before a realloc, at teardown and on the fault path do
+          // not care how many spans are outstanding.
+          if (wb_on) {
+            C.wb_jobs.push_back({dev_off, file_off, len});
+            return;
+          }
           const uint64_t wt0 = now_ns();
           const ssize_t w = g_gds_output.write_dev(
               C.d_decomp_buf, (size_t)len, (off_t)file_off, (off_t)dev_off);
           g_gdsd_write_ns.fetch_add(now_ns() - wt0, std::memory_order_relaxed);
           g_gdsd_writes.fetch_add(1, std::memory_order_relaxed);
           if (w != (ssize_t)len)
-            throw std::runtime_error("--gds-only: cuFileWrite returned "
-                + std::to_string((long long)w) + " for " + std::to_string(len)
-                + " bytes at offset " + std::to_string(file_off));
+            // DIE AS AN I/O ERROR, do not throw.  A throw here lands in the GPU
+            // recovery path, and GDS output has no CPU sink -- so
+            // gpu_only_cpu_fallback refuses with "re-run without --gds-only",
+            // which is exit 2 (usage) and says nothing about the write that
+            // actually failed.  The compress side has always used die(EXIT_IO)
+            // for the same condition; this matches it.  Nothing is recoverable
+            // here and the partial output is not committed.
+            die("--gds-only: cuFileWrite returned " + std::to_string((long long)w)
+                + " for " + std::to_string(len) + " bytes at offset "
+                + std::to_string(file_off), EXIT_IO);
         };
 
         // gzstd's normal fixed-size frames form long runs that are contiguous in
@@ -27707,7 +27737,18 @@ static void gpu_decomp_worker(
         }
         if (!C.wb_jobs.empty()) {
           DecompStreamCtx * cp = &C;
-          C.wb_thr = std::thread([cp]() {
+          C.wb_thr = std::thread([cp, vb = (opt.verbosity >= V_VERBOSE)]() {
+            // PRINTED FROM INSIDE THE THREAD, once, because the "ENABLED" banner
+            // above proves only that the switch was read.  When coalescing began
+            // writing spans synchronously, wb_jobs stayed empty, no thread was
+            // ever created, and the banner still appeared -- so the regression
+            // test passed on a run that exercised nothing.  This marker cannot
+            // appear unless a background writer actually ran.
+            if (vb) {
+              static std::atomic<bool> said{false};
+              if (!said.exchange(true))
+                std::cerr << "[GDS] write-behind thread active\n";
+            }
             for (const auto & w : cp->wb_jobs) {
               const uint64_t wt0 = now_ns();
               const ssize_t got = g_gds_output.write_dev(cp->d_decomp_buf, (size_t)w[2],
@@ -27837,7 +27878,7 @@ static void gpu_decomp_worker(
     for (auto & C : ctxs)
       if (C.wb_thr.joinable()) {
         C.wb_thr.join();
-        if (!C.wb_err.empty()) throw std::runtime_error(C.wb_err);
+        if (!C.wb_err.empty()) die(C.wb_err, EXIT_IO);   // see write_span
       }
     if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
     for (auto & C : ctxs) {
@@ -28272,6 +28313,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         char pl[64];
         std::snprintf(pl, sizeof(pl), "/proc/self/fd/%d", cur);
         g_gds_verify_plain_fd = ::open(pl, O_RDONLY | O_CLOEXEC);
+        // BAR1 baseline for the ROUTING REPORT below.  The output arm captures
+        // this too, but -t never reaches that arm -- it writes nothing -- so
+        // without this the "before" value stayed 0 and every -t run reported the
+        // all-clear regardless of how its reads were actually routed.
+        g_gds_bar1_before = gz_nvfs_bar1_ok();
         g_gds_read_active.store(true, std::memory_order_release);
         // Only -t may skip the D2H: -d still owes its bytes to the drive.
         if (opt.mode == Mode::TEST)
@@ -28298,15 +28344,55 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     // bytes long with exit 0.  Silent truncation is the worst failure this code
     // could have, so the shape is settled up front and an unsuitable archive
     // uses the ordinary writer instead, with a default-verbosity warning.
-    const int64_t first_dz = peek_first_frame_decomp_size(in);
-    if (first_dz > 0 && (uint64_t)first_dz % 4096ull != 0) {
-      char b[256];
-      std::snprintf(b, sizeof(b),
-        "WARNING: --gds-only first frame is %lld bytes, not a multiple of 4 KiB; "
-        "peer-to-peer writes cannot address the frame boundaries, so this "
-        "decompress uses the ordinary writer.\n", (long long)first_dz);
-      vlog(V_ERROR, opt, b);
-      goto gds_out_declined;
+    // EVERY FRAME, NOT JUST THE FIRST.  Frame k starts at the sum of the
+    // decompressed sizes before it, so proving frame 0 is 4 KiB-aligned proves
+    // nothing about frame 2.  A legal concatenation of 4096, 1001 and 17 byte
+    // frames starts them at 0, 4096 and 5097: it passed this check, GDS wrote a
+    // prefix, and the worker's alignment guard then killed the run on frame 2 --
+    // a VALID ARCHIVE REJECTED after partial output, which is exactly what the
+    // "settle the shape up front" comment above exists to prevent.
+    //
+    // Every frame but the last must therefore be a whole number of 4 KiB blocks.
+    // The seek table carries all of those sizes, so the check is a trailer read
+    // and some arithmetic.
+    //
+    // WITHOUT A TABLE, DECLINE rather than walk.  Advancing frame-to-frame needs
+    // each COMPRESSED size, which means reading the whole stream -- 65 GiB before
+    // any work starts on the archive this was measured against.  Declining costs
+    // an uncommon case (a foreign archive with no seek table but conveniently
+    // aligned frames) the peer-to-peer writer and nothing else: the ordinary
+    // writer produces identical bytes.  gzstd's own archives always carry a
+    // table, so the common case keeps the fast path.
+    {
+      tarx::TarSeekTable pst;
+      const char * decline = nullptr;
+      char db[288];
+      if (!tarx::parse_foreign_seek_table(in, pst) || !pst.valid()) {
+        decline = "this archive has no usable seek table, so the frame boundaries "
+                  "cannot be proven 4 KiB-aligned without reading all of it";
+      } else {
+        const size_t nfr = pst.u_off.size() - 1;
+        for (size_t k = 0; k + 1 < nfr; ++k) {          // every frame but the last
+          const uint64_t dz = pst.u_off[k + 1] - pst.u_off[k];
+          if (dz % 4096ull != 0) {
+            std::snprintf(db, sizeof(db),
+              "this archive's frame %zu is %llu bytes, not a multiple of 4 KiB, "
+              "so frame %zu would not start on a block boundary",
+              k, (unsigned long long)dz, k + 1);
+            decline = db;
+            break;
+          }
+        }
+      }
+      if (decline) {
+        char b[420];
+        std::snprintf(b, sizeof(b),
+          "WARNING: --gds-only cannot use peer-to-peer writes here: %s.\n"
+          "  This decompress uses the ordinary writer; the output is identical.\n",
+          decline);
+        vlog(V_ERROR, opt, b);
+        goto gds_out_declined;
+      }
     }
     {
     // ADOPT THE CALLER'S DESCRIPTOR; DO NOT RESOLVE THE PATH AGAIN.  `out` may be
@@ -28722,6 +28808,54 @@ gds_out_declined:
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   for (auto & th : gpu_workers) th.join();
 
+  // THE SAME ROUTING REPORT THE COMPRESS PATH HAS, and for the same reason: a
+  // cuFile call that quietly bounces through host memory returns the right bytes
+  // at very nearly the same throughput, so a degraded run is indistinguishable
+  // from a healthy one unless something says so.  Decompress has incremented
+  // these counters since the staged read landed but never printed them, so
+  // --gds-only -t and -d were exactly the commands with no way to tell.
+  //
+  // Degradation is reported at DEFAULT verbosity; the all-clear needs -v.
+  if (g_gds_read_active.load(std::memory_order_relaxed)) {
+    const unsigned long long b1 = gz_nvfs_bar1_ok();
+    const uint64_t p2p = g_gds_frames_p2p.load(std::memory_order_relaxed);
+    const uint64_t fb  = g_gds_frames_fallback.load(std::memory_order_relaxed);
+    const bool bar1_moved = (b1 > g_gds_bar1_before);
+    char rb[360];
+    // WHAT THESE NUMBERS CAN AND CANNOT SAY, because getting this wrong would
+    // make the report worse than none.
+    //
+    // The alignment split is NOT routing evidence ON THIS PATH.  A staged read
+    // is issued as a 4 KiB-ALIGNED SUPERSET by construction -- the file offset
+    // is masked down, the length is rounded up, and the device offset is a
+    // multiple of a 4 KiB-aligned stride -- so `fb` is structurally always 0 and
+    // "0 unaligned" would print whether cuFile went peer-to-peer or bounced
+    // every transfer through host memory.  (The compress path's counters CAN
+    // register a bounce, which is why the same split means something there.)
+    //
+    // So report the transfer COUNT, which confirms the staged path ran and how
+    // much it moved, and the nvidia-fs BAR1 delta, which is the only signal here
+    // with any content -- and even that is box-wide, so a neighbour's GDS
+    // traffic moves it too.  Supporting evidence, not proof; the only actual
+    // discriminator is cuFile's own per-process posix= counter.
+    if (!bar1_moved) {
+      std::snprintf(rb, sizeof(rb),
+        "WARNING: --gds-only made %llu cuFile transfers but nvidia-fs Bar1-map "
+        "never moved -- the reads may have been served in compat mode (through "
+        "host memory) rather than peer-to-peer.\n"
+        "  The output is correct either way; what would be lost is the "
+        "acceleration the flag asks for.\n",
+        (unsigned long long)(p2p + fb));
+      vlog(V_ERROR, opt, rb);
+    } else if (opt.verbosity >= V_VERBOSE) {
+      std::snprintf(rb, sizeof(rb),
+        "[GDS] %llu cuFile transfers; nvidia-fs Bar1-map ok %llu -> %llu "
+        "(alignment is guaranteed by construction here, so it is not evidence "
+        "of routing)\n",
+        (unsigned long long)(p2p + fb), g_gds_bar1_before, b1);
+      vlog(V_VERBOSE, opt, rb);
+    }
+  }
   if (g_gds_read_active.load(std::memory_order_relaxed)
       && opt.verbosity >= V_VERBOSE) {
     const uint64_t dnw = g_gds_driver_open_ns.load(std::memory_order_relaxed);
