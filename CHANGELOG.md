@@ -1,12 +1,79 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.25  
+**Covers:** v0.9.50 → v0.17.27  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.27 — 8,343 writes become 33, and the write phase reaches the device ceiling
+
+Fifth review pass, this one performance-only, and the idea that paid is the **inverse** of one this
+project had already rejected.
+
+### Coalesced decompress writes — now the default
+
+Adjacent frames occupy adjacent VRAM slots *and* adjacent file intervals, so a batch's writes are
+one contiguous transfer. They were being issued one `cuFileWrite` per frame anyway — **8,343
+synchronous calls on a 65 GiB archive where 33 would do**.
+
+Measured on that archive, cold, output verified by md5 against the reference:
+
+| | calls | `cuFileWrite` | rate | wall | sys |
+|---|---|---|---|---|---|
+| per frame | 8,343 | 43.90 s | 2.85 GiB/s | 68.78 s | 36.66 s |
+| **coalesced** | **33** | 35.63 s | **3.48 GiB/s** | **60.77 s** | **24.39 s** |
+
+3.48 GiB/s is ~3.74 GB/s against `dd`'s 3.7 GB/s write-alone ceiling — this takes the write phase
+from 77% of what the device can do to all of it. Re-run under a harness that *asserts* no CPU
+fallback or seek-table demotion occurred: 69.55 s → 60.94 s, both arms `GPU-ok`. `-t`, which writes
+nothing, is correctly unmoved (22.35 s vs 22.24 s).
+
+**This is not the write fan-out rejected earlier.** That issued *more concurrent* requests and lost
+to read/write contention on one drive. This issues *fewer and larger* ones. The 2.7 GB/s
+concurrent-write ceiling that explained the fan-out's failure never applied to the default path at
+all, because the default does not overlap reads with writes — a distinction this changelog
+previously got wrong.
+
+Combining it with write-behind was also tried, since collapsing 8,343 tiny writes into 33 large
+ones changes the overlap opportunity completely: **60.69 s vs 60.77 s, no interaction.**
+
+### Compress: profiled at scale for the first time, and it is structurally sound
+
+The pure peer-to-peer branch returned before the ordinary drain accounting, so profiling was blind
+exactly where packing and writes happen. With that instrumented: on the same 130 GiB input,
+`cuFileWrite` is **17.92 s of 59.59 s** and pack/finalize sync is **0.02 s**. Compress does *not*
+have decompress's per-frame problem — its P2P path already packs frames before writing.
+
+Coalescing the compress-side reads into one ~1 GiB request per batch is a **trade, not a win**, and
+reproducible with interleaved reps: wall 59.39–59.67 s → 61.69–65.28 s, but user CPU
+**2.80–2.97 s → 0.26–0.28 s**. Ten times less user CPU for 4–10% more wall clock. Left opt-in as
+`GZSTD_DEBUG_GDS_COALESCE_READS=1`; it is the same shape of trade as the staged read itself.
+
+### Skipping the checksum pass when nothing carries a checksum
+
+The decompressor launched the full device XXH64 pass even when every frame in the batch had
+`Content_Checksum_flag == 0`, then ignored the results. Now conditional.
+
+gzstd always writes frame checksums, so this can only help **foreign** archives. Magnitude
+unmeasured: the detail line that would size it prints only on the staged paths, and a stock
+`zstd --no-check` archive has no seek table, so it runs `--gpu-only` instead. Verified only that it
+changes no verdict — on a checksumless archive `--gpu-only` and `--cpu-only` agree on both a clean
+and a corrupted copy (both exit 0 on the corrupt one, which is what `--no-check` means: there is no
+content checksum for either backend to fail).
+
+### Corrections to earlier entries
+
+- The "missing 25% of the batch loop" was an arithmetic error. The phases account for 61.46 of
+  64.26 s — 4.4% unassigned. The old `D2H transfers` figure was never write-only; it spanned status
+  readback and the checksum pass (43.90 s of writes + 1.86 s of post-decode work).
+- `cuFileDriverOpen`'s 2.5 s is **already amortised across input files** — it is a function-local
+  static, called once per process. The `-vv` line reprints the stored duration for each input,
+  which was misread as it running again. Only the ~0.3 s buffer registration repeats per file.
+
+---
 
 ## v0.17.25 — a valid archive rejected, and the other half of the v0.17.24 fix
 

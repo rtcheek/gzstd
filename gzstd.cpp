@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.25";
+static constexpr const char * GZSTD_VERSION = "0.17.27";
 //
 // Architecture overview:
 //
@@ -664,6 +664,13 @@ static std::atomic<uint64_t> g_gdsv_read_ns{0};
 static std::atomic<uint64_t> g_gdsv_read_bytes{0};
 static std::atomic<uint64_t> g_gdsv_kernel_ns{0};
 static std::atomic<uint64_t> g_gdsv_reads{0};
+// The generic -vvv "D2H" bucket on staged decompress starts before the
+// device checksum and ends after every cuFileWrite, so it cannot answer how
+// much of that phase is integrity work and how much is the output device.
+// These counters split the two without changing the default pipeline.
+static std::atomic<uint64_t> g_gdsd_post_ns{0};
+static std::atomic<uint64_t> g_gdsd_write_ns{0};
+static std::atomic<uint64_t> g_gdsd_writes{0};
 
 // How many bytes of compressed slab --gds-only -t may hand to cuFileBufRegister
 // per stream.  Host RSS tracks this number (see where it is applied), and a
@@ -728,7 +735,11 @@ static void gds_decomp_read_close()
   // function's exit call, so it still sees its own file's numbers.
   g_gdsv_read_ns.store(0, std::memory_order_relaxed);
   g_gdsv_read_bytes.store(0, std::memory_order_relaxed);
+  g_gdsv_kernel_ns.store(0, std::memory_order_relaxed);
   g_gdsv_reads.store(0, std::memory_order_relaxed);
+  g_gdsd_post_ns.store(0, std::memory_order_relaxed);
+  g_gdsd_write_ns.store(0, std::memory_order_relaxed);
+  g_gdsd_writes.store(0, std::memory_order_relaxed);
   // (g_gds_verify_frames / g_gds_verify_bytes are declared below this point and
   // are write-only -- nothing reads them -- so they are left alone rather than
   // reordering declarations to reset counters no report consumes.)
@@ -803,6 +814,9 @@ static uint64_t              g_gds_cout_logical = 0;  // true file length, incl.
 static uint64_t              g_gds_cout_next_seq = 0; // sequence-order assertion
 static std::atomic<uint64_t> g_gds_cout_writes{0};    // aligned cuFileWrite count
 static std::atomic<uint64_t> g_gds_cout_bytes{0};
+static std::atomic<uint64_t> g_gds_cout_drain_ns{0};  // whole P2P pack branch
+static std::atomic<uint64_t> g_gds_cout_sync_ns{0};   // pack/finalize/carry GPU wait
+static std::atomic<uint64_t> g_gds_cout_write_ns{0};  // synchronous cuFileWrite only
 // The peer-to-peer path bypasses the writer thread, which is what normally
 // advances the progress meter.  gpu_drain_batch has no Meter parameter, so the
 // one owner (compress_nvcomp) publishes it here for the duration of the run.
@@ -22083,13 +22097,17 @@ static std::mutex g_gpu_ctx_init_m;
 static void gds_cout_flush(StreamCtx & C, bool final_flush)
 {
   if (C.d_pack_used == 0) return;
+  uint64_t phase_t0 = now_ns();
   checkCuda(cudaStreamSynchronize(C.stream), "sync before peer-to-peer flush");
+  g_gds_cout_sync_ns.fetch_add(now_ns() - phase_t0, std::memory_order_relaxed);
   size_t n = (C.d_pack_used / 4096) * 4096;
   size_t carry = C.d_pack_used - n;
   if (final_flush && carry) {           // pad the tail up; ftruncate trims it
     checkCuda(cudaMemsetAsync(static_cast<char*>(C.d_pack_base) + C.d_pack_used,
                               0, 4096 - carry, C.stream), "pad the final block");
+    phase_t0 = now_ns();
     checkCuda(cudaStreamSynchronize(C.stream), "sync tail pad");
+    g_gds_cout_sync_ns.fetch_add(now_ns() - phase_t0, std::memory_order_relaxed);
     n += 4096; carry = 0;
   }
   if (::getenv("GZSTD_DEBUG_GDS_COUT"))
@@ -22097,7 +22115,9 @@ static void gds_cout_flush(StreamCtx & C, bool final_flush)
                  C.d_pack_used, n, carry, (unsigned long long)g_gds_cout_off,
                  (unsigned long long)g_gds_cout_logical, (int)final_flush);
   if (n) {
+    phase_t0 = now_ns();
     const ssize_t w = g_gds_cout.write_dev(C.d_pack_base, n, (off_t)g_gds_cout_off, 0);
+    g_gds_cout_write_ns.fetch_add(now_ns() - phase_t0, std::memory_order_relaxed);
     if (w != (ssize_t)n)
       die("--gds-only: cuFileWrite returned " + std::to_string((long long)w)
           + " for " + std::to_string(n) + " bytes at offset "
@@ -22114,7 +22134,9 @@ static void gds_cout_flush(StreamCtx & C, bool final_flush)
                               cudaMemcpyDeviceToDevice, C.stream), "carry out");
     checkCuda(cudaMemcpyAsync(C.d_pack_base, C.d_pack_scratch, carry,
                               cudaMemcpyDeviceToDevice, C.stream), "carry back");
+    phase_t0 = now_ns();
     checkCuda(cudaStreamSynchronize(C.stream), "sync carry");
+    g_gds_cout_sync_ns.fetch_add(now_ns() - phase_t0, std::memory_order_relaxed);
   }
   C.d_pack_used = carry;
 }
@@ -22660,6 +22682,7 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   // appended to the device pack buffer, stamped there by gzp_finalize_kernel,
   // and flushed in whole 4 KiB blocks so cuFile keeps the peer-to-peer route.
   if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+    const uint64_t cout_t0 = now_ns();
     std::lock_guard<std::mutex> lk(g_gds_cout_m);
     // One device, one stream under --gds-only, so drains arrive in order.
     // Assert it: an out-of-order batch would corrupt every following offset.
@@ -22753,6 +22776,7 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
     // pack buffer its worker-side buffer is free.  What bounds the output now is
     // d_pack_cap, which flushes when full.
     if (bp) bp->release((int)C.filled);
+    g_gds_cout_drain_ns.fetch_add(now_ns() - cout_t0, std::memory_order_relaxed);
     return;
   }
 
@@ -23831,6 +23855,47 @@ static void gpu_worker(
           // --direct-stage even though the user-facing backend is still GDS.
           const bool force_bounce = opt.gds_only
                                  && ::getenv("GZSTD_DEBUG_GDS_FORCE_BOUNCE") != nullptr;
+          // Measurement hook: a plain staged-compress batch is one contiguous
+          // file interval and its fixed-size device slots are contiguous too.
+          // Compare the existing fan-out of one request per frame with one
+          // batch-sized cuFileRead.  This is deliberately NOT used for tar
+          // staging, --direct-stage, the bounce experiment, or an unaligned
+          // tail: none of those has the same one-interval geometry.
+          static const bool coalesce_reads = [] {
+            const bool on = ::getenv("GZSTD_DEBUG_GDS_COALESCE_READS") != nullptr;
+            if (on) std::cerr << "[GDS] coalesced compress reads ENABLED (experimental): "
+                                 "one cuFileRead per contiguous batch\n";
+            return on;
+          }();
+          bool coalesced_read = false;
+          if (coalesce_reads && opt.gds_only && !opt.tar_mode && !force_bounce
+              && C.filled > 0) {
+            const off_t first = C.batch[0].src_off;
+            size_t total = 0;
+            bool contiguous = first >= 0;
+            for (size_t i = 0; contiguous && i < C.filled; ++i) {
+              const Task & t = C.batch[i];
+              contiguous = t.gds_stage < 0 && t.src_off == first + (off_t)total
+                        && total == i * C.gpu_chunk;
+              total += t.len();
+            }
+            // Keeping this arm 4 KiB-clean makes its routing claim testable.
+            // The ordinary per-frame path handles the uncommon short tail.
+            if (contiguous && (first & 4095) == 0 && (total & 4095) == 0) {
+              const ssize_t got = g_gds_input.read_dev(C.d_in_base, total, first, 0);
+              if (got == (ssize_t)total) {
+                g_gds_frames_p2p.fetch_add(C.filled, std::memory_order_relaxed);
+                coalesced_read = true;
+              } else if (opt.verbosity >= V_TRACE) {
+                // A very large request may exceed a cuFile/filesystem limit even
+                // though its component frame requests are valid.  This is a
+                // performance experiment, not a new availability requirement:
+                // fall back to the existing fan-out, which overwrites every slot.
+                vlog(V_TRACE, opt, "[GDS] coalesced cuFileRead returned "
+                     + std::to_string((long long)got) + "; retrying as frame reads\n");
+              }
+            }
+          }
           auto issue = [&](size_t k, size_t step) {
             // CUDA's current device is host-thread-local.  issue(0) runs on the
             // GPU worker, which selected device_id during bringup, but every
@@ -24004,7 +24069,7 @@ static void gpu_worker(
             }
           };
           if (h_tr) h_t = now_ns();
-          {
+          if (!coalesced_read) {
             std::vector<std::thread> rd;
             struct RdJoin {   // join on ANY exit, same hazard as CkJoin below
               std::vector<std::thread> & w;
@@ -24018,7 +24083,7 @@ static void gpu_worker(
           if (h_tr) {
             h_ns_copy += now_ns() - h_t;
             vlog(V_TRACE, opt, "[GPU" + std::to_string(device_id) + "] gds-region: "
-                 + std::to_string(C.filled) + " cuFileRead in "
+                 + std::to_string(coalesced_read ? 1 : C.filled) + " cuFileRead in "
                  + std::to_string(h_ns_copy/1e6) + "ms\n");
           }
           // Throwing here lands in gpu_worker's catch, which runs the standard
@@ -24914,6 +24979,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   g_gds_cout_off = 0; g_gds_cout_logical = 0; g_gds_cout_next_seq = 0;
   g_gds_cout_writes.store(0, std::memory_order_relaxed);
   g_gds_cout_bytes.store(0, std::memory_order_relaxed);
+  g_gds_cout_drain_ns.store(0, std::memory_order_relaxed);
+  g_gds_cout_sync_ns.store(0, std::memory_order_relaxed);
+  g_gds_cout_write_ns.store(0, std::memory_order_relaxed);
   g_gds_cout_meter = m;
   // The pack buffer belongs to a StreamCtx, while the output offset belongs to
   // the whole run.  With more than one stream/device, accepting batches in seq
@@ -25842,6 +25910,13 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         "no host copy\n",
         (unsigned long long)g_gds_cout_writes.load(std::memory_order_relaxed),
         double(g_gds_cout_bytes.load(std::memory_order_relaxed)) / 1048576.0);
+      vlog(V_VERBOSE, opt, b);
+      std::snprintf(b, sizeof(b),
+        "[GDS] compress drain: %.2f s total, %.2f s pack/finalize sync, "
+        "%.2f s cuFileWrite\n",
+        double(g_gds_cout_drain_ns.load(std::memory_order_relaxed)) / 1e9,
+        double(g_gds_cout_sync_ns.load(std::memory_order_relaxed)) / 1e9,
+        double(g_gds_cout_write_ns.load(std::memory_order_relaxed)) / 1e9);
       vlog(V_VERBOSE, opt, b);
     }
   }
@@ -27183,7 +27258,8 @@ static void gpu_decomp_worker(
         }
 
         // Read back statuses and actual sizes in bulk
-        uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
+        uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG
+                           || C.gds_read || C.gds_only) ? now_ns() : 0;
         uint64_t d2h_bytes_batch = 0;
         // On C.stream, never the null stream.  Streams here are created with
         // cudaStreamCreate (blocking), so a null-stream copy is an implicit
@@ -27212,17 +27288,130 @@ static void gpu_decomp_worker(
         // construction.  Nothing is lost: the checksum result is only ever
         // consumed for a chunk whose status is success AND whose actual size
         // equals its declared size, so on that path these are the same bytes.
-        gzx_launch_xxh64(C.d_decomp_buf, C.alloc_decomp, C.d_decomp_sizes,
-                         C.filled, C.d_verify_ck, C.stream);
-        checkCuda(cudaGetLastError(), "gzx_xxh64 launch (decompress verify)");
-        checkCuda(cudaMemcpyAsync(C.h_verify_ck.data(), C.d_verify_ck,
-                                  C.filled * sizeof(unsigned int),
-                                  cudaMemcpyDeviceToHost, C.stream), "D2H verify checksums");
+        bool any_content_ck = false;
+        for (size_t i = 0; i < C.filled; ++i)
+          if (C.h_has_ck[i]) { any_content_ck = true; break; }
+        // A checksumless zstd batch has nothing for this pass to validate.
+        // nvCOMP status and produced-size checks still run below; hashing every
+        // decoded byte and copying back results that no branch can consume was
+        // pure work on foreign/stock archives built with checksums disabled.
+        const uint64_t ck_t0 = (any_content_ck && (C.gds_read || C.gds_only))
+                             ? now_ns() : 0;
+        if (any_content_ck) {
+          gzx_launch_xxh64(C.d_decomp_buf, C.alloc_decomp, C.d_decomp_sizes,
+                           C.filled, C.d_verify_ck, C.stream);
+          checkCuda(cudaGetLastError(), "gzx_xxh64 launch (decompress verify)");
+          checkCuda(cudaMemcpyAsync(C.h_verify_ck.data(), C.d_verify_ck,
+                                    C.filled * sizeof(unsigned int),
+                                    cudaMemcpyDeviceToHost, C.stream), "D2H verify checksums");
+        }
         checkCuda(cudaStreamSynchronize(C.stream), "D2H meta sync");
+        if (ck_t0)
+          g_gdsv_kernel_ns.fetch_add(now_ns() - ck_t0, std::memory_order_relaxed);
+        if (C.gds_read || C.gds_only)
+          g_gdsd_post_ns.fetch_add(now_ns() - d2h_t0, std::memory_order_relaxed);
 
         float batch_ms = 0;
         cudaEventElapsedTime(&batch_ms, C.ev_begin, C.ev_end);
         uint64_t out_sum = 0;
+
+        // Keep validation in one place: the coalesced-write experiment validates
+        // the whole batch before issuing a large write, while the ordinary path
+        // validates immediately before each per-frame write/delivery.
+        auto checked_actual = [&](size_t i) -> size_t {
+          if (C.h_statuses[i] != nvcompSuccess)
+            throw std::runtime_error("nvCOMP decompress per-chunk status != success");
+          const size_t actual = C.h_actual[i];
+          if (actual != C.batch[i].decomp_size)
+            throw std::runtime_error(
+                "GPU decompress size mismatch at frame "
+                + std::to_string(batch_seqs[i]) + ": header declared "
+                + std::to_string(C.batch[i].decomp_size)
+                + " bytes, nvCOMP produced " + std::to_string(actual)
+                + " (corrupt input?)");
+          if (C.h_has_ck[i] && C.h_verify_ck[i] != C.h_expect_ck[i])
+            die("content-checksum mismatch at frame "
+                + std::to_string(batch_seqs[i]) + ": the frame declares "
+                + std::to_string(C.h_expect_ck[i]) + " but the decoded bytes hash to "
+                + std::to_string(C.h_verify_ck[i])
+                + " -- the archive is corrupt, or this GPU decoded it incorrectly."
+                + "  Re-run with --cpu-only to tell the two apart.", EXIT_DATA);
+          return actual;
+        };
+
+        // COALESCED BY DEFAULT.  Adjacent frames occupy adjacent VRAM slots AND
+        // adjacent file intervals, so a batch's writes are one contiguous
+        // transfer -- issuing them per frame was 8343 synchronous cuFileWrites on
+        // a 65 GiB archive where 33 would do.
+        //
+        // MEASURED, -d on that archive, cold, byte-verified by md5:
+        //   per frame   8343 calls   43.90 s   2.85 GiB/s   wall 68.78 s
+        //   coalesced     33 calls   35.63 s   3.48 GiB/s   wall 60.77 s
+        // 3.48 GiB/s is ~3.74 GB/s against dd's 3.7 GB/s write-alone ceiling, so
+        // this takes the write phase from 77% of what the device can do to all of
+        // it.  System CPU falls 36.66 -> 24.39 s with the syscall count.
+        //
+        // NOT the write fan-out that was rejected earlier: this issues FEWER and
+        // LARGER requests, where that issued more concurrent ones and lost to
+        // read/write contention.  Combining it with write-behind was also tried
+        // and adds nothing (60.69 s vs 60.77 s).
+        //
+        // GZSTD_DEBUG_GDS_NO_COALESCE_WRITES=1 restores the per-frame path.
+        static const bool coalesce_writes =
+            ::getenv("GZSTD_DEBUG_GDS_NO_COALESCE_WRITES") == nullptr;
+        auto write_span = [&](uint64_t dev_off, uint64_t file_off, uint64_t len) {
+          if (!len) return;
+          const uint64_t wt0 = now_ns();
+          const ssize_t w = g_gds_output.write_dev(
+              C.d_decomp_buf, (size_t)len, (off_t)file_off, (off_t)dev_off);
+          g_gdsd_write_ns.fetch_add(now_ns() - wt0, std::memory_order_relaxed);
+          g_gdsd_writes.fetch_add(1, std::memory_order_relaxed);
+          if (w != (ssize_t)len)
+            throw std::runtime_error("--gds-only: cuFileWrite returned "
+                + std::to_string((long long)w) + " for " + std::to_string(len)
+                + " bytes at offset " + std::to_string(file_off));
+        };
+
+        // gzstd's normal fixed-size frames form long runs that are contiguous in
+        // BOTH address spaces: slot i+1 immediately follows slot i in VRAM and
+        // its absolute output offset immediately follows the preceding frame.
+        // The default path still submits one 16 MiB request per frame.  This hook
+        // tests whether reducing 8343 driver calls to roughly one per batch moves
+        // the 2.86 GiB/s write rate; it adds no concurrency and therefore is not
+        // the already-rejected write fan-out experiment.
+        bool batch_coalesced = false;
+        if (coalesce_writes && C.gds_only) {
+          std::vector<std::array<uint64_t,3>> runs; // {dev_off, file_off, len}
+          runs.reserve(C.filled);
+          bool all_file_offsets_aligned = true;
+          for (size_t i = 0; i < C.filled; ++i) {
+            const size_t actual = checked_actual(i);
+            const uint64_t dev = (uint64_t)i * C.alloc_decomp;
+            const uint64_t file = C.batch[i].out_off;
+            // Preserve the established path's gate: the experiment must never
+            // issue a broad write before the per-frame arm can reject an
+            // unaligned output interval.
+            if ((file & 4095u) != 0) all_file_offsets_aligned = false;
+            uint64_t len = (actual + 4095) & ~uint64_t(4095);
+            if (len > C.alloc_decomp) len = C.alloc_decomp;
+            if (!len) continue;
+            if (!runs.empty() && runs.back()[0] + runs.back()[2] == dev
+                              && runs.back()[1] + runs.back()[2] == file)
+              runs.back()[2] += len;
+            else
+              runs.push_back({dev, file, len});
+          }
+          // Only exercise the interesting shape: one physical run for the whole
+          // batch.  Foreign variable-size frames may form several runs; leave
+          // those on the established per-frame path instead of partially writing
+          // a batch before a later large request can fail.
+          if (all_file_offsets_aligned && runs.size() == 1) {
+            write_span(runs[0][0], runs[0][1], runs[0][2]);
+            batch_coalesced = true;
+          } else if (all_file_offsets_aligned && runs.empty()) {
+            batch_coalesced = true;       // all-empty batch: nothing to write
+          }
+        }
 
         // Download decompressed frames one at a time and deliver to writer
         // immediately.  Per-frame D2H has slightly more DMA overhead than a
@@ -27230,10 +27419,7 @@ static void gpu_decomp_worker(
         // the writer can write frame 0 to disk while frame 1 is transferring.
         // A single batch D2H would stall the writer for the entire transfer.
         for (size_t i = 0; i < C.filled; ++i) {
-          if (C.h_statuses[i] != nvcompSuccess)
-            throw std::runtime_error("nvCOMP decompress per-chunk status != success");
-
-          size_t actual = C.h_actual[i];
+          size_t actual = checked_actual(i);
           // Integrity check: nvCOMP can report success yet produce a size that
           // disagrees with the frame header's declared content size (corrupt
           // input, or a transient device fault).  The CPU path gets this for
@@ -27243,13 +27429,6 @@ static void gpu_decomp_worker(
           // to the main queue (catch block); a CPU worker then re-decodes it and
           // either succeeds (transient glitch — run completes correctly) or dies
           // cleanly with a zstd data error, matching CPU-only and stock zstd.
-          if (actual != C.batch[i].decomp_size)
-            throw std::runtime_error(
-                "GPU decompress size mismatch at frame "
-                + std::to_string(batch_seqs[i]) + ": header declared "
-                + std::to_string(C.batch[i].decomp_size)
-                + " bytes, nvCOMP produced " + std::to_string(actual)
-                + " (corrupt input?)");
           // CONTENT CHECK.  The two guards above see structure and length; only
           // this one sees the BYTES.  Wrong-but-right-length output passed both
           // of them, so a corrupt archive decompressed to garbage at exit 0.
@@ -27272,13 +27451,6 @@ static void gpu_decomp_worker(
           //
           // EXIT_DATA matches the CPU path, stock zstd, and this project's own
           // exit table (4 = corrupt input / integrity failure).
-          if (C.h_has_ck[i] && C.h_verify_ck[i] != C.h_expect_ck[i])
-            die("content-checksum mismatch at frame "
-                + std::to_string(batch_seqs[i]) + ": the frame declares "
-                + std::to_string(C.h_expect_ck[i]) + " but the decoded bytes hash to "
-                + std::to_string(C.h_verify_ck[i])
-                + " -- the archive is corrupt, or this GPU decoded it incorrectly."
-                + "  Re-run with --cpu-only to tell the two apart.", EXIT_DATA);
           out_sum += actual;
 
           if (C.gds_verify) {
@@ -27368,8 +27540,10 @@ static void gpu_decomp_worker(
             // WIDER: 16-way fan-out of a batch's writes bought nothing --
             // 0.454 s / 2.20 GiB/s against 0.429 s / 2.33 GiB/s inline -- because
             // the drive is the limit.  dd on this filesystem: an O_DIRECT write
-            // alone runs 3.7 GB/s, but concurrent with a read, which is what this
-            // path does, 2.7 GB/s.  gzstd was already at that ceiling.
+            // alone runs 3.7 GB/s, but concurrent with a read it falls to 2.7
+            // GB/s.  That concurrent ceiling explains the write-BEHIND result
+            // below; it does not explain the default inline path, whose read
+            // fan-out has joined before the kernel and therefore before writes.
             //
             // OVERLAPPED: a write-behind thread per stream context worked exactly
             // as designed -- the batch loop fell 1.110 s -> 0.773 s and writes left
@@ -27388,9 +27562,9 @@ static void gpu_decomp_worker(
             // (execution.max_io_threads defaults to 4) -- was tested by pointing
             // CUFILE_ENV_PATH_JSON at a config with max_io_threads=32.  No change:
             // 4.19-4.41 s against 4.14-4.21 s stock, with reads still 3.89 GiB/s
-            // and writes still 2.50 GiB/s.  That write figure is 2.68 GB/s against
-            // dd's 2.7 GB/s concurrent-write ceiling on this filesystem -- the
-            // hardware limit, reached from two independent directions.
+            // and writes still 2.50 GiB/s.  The setting therefore does not help;
+            // that figure's proximity to the concurrent ceiling is relevant only
+            // to the write-behind topology, not proof that inline writes overlap.
             // WRITTEN INLINE.  Fanning these out was tried twice, and the second
             // time at real scale with writes at 71% of the batch loop -- the one
             // condition under which the first test could have been wrong.  It is
@@ -27410,8 +27584,9 @@ static void gpu_decomp_worker(
             // WIDER (several writes at once): REVERTED, worse at scale rather than
             // neutral -- -d on 130 GiB, 1 thread 69.31 s / sys 36.75, 4 threads
             // 71.15 / 37.94, 8 threads 76.54 / 46.85.  One drive: dd gives
-            // 3.7 GB/s write-alone but 2.7 GB/s concurrent with a read, so extra
-            // write concurrency takes bandwidth from the reads already in flight.
+            // 3.7 GB/s write-alone but 2.7 GB/s concurrent with a read.  Fan-out
+            // still loses decisively; the coalescing experiment above asks a
+            // different question by REDUCING requests without adding overlap.
             //
             // OVERLAPPED (GZSTD_DEBUG_GDS_WRITE_BEHIND=1, this batch's writes
             // against the NEXT batch's reads): KEPT, OFF BY DEFAULT.  No result on
@@ -27433,19 +27608,19 @@ static void gpu_decomp_worker(
             //
             // THE READ SIDE IS THE ASYMMETRY: a single thread could NOT saturate
             // reads (3.97 vs 4.9 GiB/s), so fanning those out IS the default and
-            // took them to 4.93 GiB/s, the device ceiling.  Writes were already
-            // there at 2.86 GiB/s, which is why nothing on this side pays here.
-            if (wb_on) {
+            // took them to 4.93 GiB/s, the device ceiling.  Inline writes reach
+            // 2.86 GiB/s (about 3.07 GB/s), below the 3.7 GB/s write-alone ceiling;
+            // the call-count experiment above isolates whether submission shape
+            // accounts for any of that remaining gap.
+            if (batch_coalesced) {
+              // The pre-pass above already wrote this frame as part of a
+              // validated contiguous run.
+            } else if (wb_on) {
               // Deferred to the write-behind thread launched after this loop.
               C.wb_jobs.push_back({(uint64_t)(i * C.alloc_decomp), (uint64_t)ooff,
                                    (uint64_t)wlen});
             } else {
-              const ssize_t w = g_gds_output.write_dev(
-                  C.d_decomp_buf, wlen, (off_t)ooff, (off_t)(i * C.alloc_decomp));
-              if (w != (ssize_t)wlen)
-                throw std::runtime_error("--gds-only: cuFileWrite returned "
-                    + std::to_string((long long)w) + " for " + std::to_string(wlen)
-                    + " bytes at offset " + std::to_string((long long)ooff));
+              write_span((uint64_t)i * C.alloc_decomp, ooff, wlen);
             }
             // High-water mark of LOGICAL bytes — the ftruncate target.  Frames
             // land out of order, so this is a max, not a sum.
@@ -27534,8 +27709,11 @@ static void gpu_decomp_worker(
           DecompStreamCtx * cp = &C;
           C.wb_thr = std::thread([cp]() {
             for (const auto & w : cp->wb_jobs) {
+              const uint64_t wt0 = now_ns();
               const ssize_t got = g_gds_output.write_dev(cp->d_decomp_buf, (size_t)w[2],
                                                          (off_t)w[1], (off_t)w[0]);
+              g_gdsd_write_ns.fetch_add(now_ns() - wt0, std::memory_order_relaxed);
+              g_gdsd_writes.fetch_add(1, std::memory_order_relaxed);
               if (got != (ssize_t)w[2]) {
                 // Recorded, not thrown: an exception crossing a std::thread
                 // boundary calls std::terminate before gpu_decomp_worker's
@@ -28562,6 +28740,16 @@ gds_out_declined:
         (unsigned long long)rc, double(rb) / 1048576.0, double(rn) / 1e9,
         GDS_READ_FANOUT,
         rc ? double(rn) / 1e6 / double(rc) : 0.0);
+    std::cerr << b;
+    const uint64_t post = g_gdsd_post_ns.load(std::memory_order_relaxed);
+    const uint64_t hash = g_gdsv_kernel_ns.load(std::memory_order_relaxed);
+    const uint64_t wns  = g_gdsd_write_ns.load(std::memory_order_relaxed);
+    const uint64_t wc   = g_gdsd_writes.load(std::memory_order_relaxed);
+    std::snprintf(b, sizeof(b),
+        "[GDS] decomp detail: post-decode %.2f s (XXH64 + readback %.2f s), "
+        "cuFileWrite %.2f s in %llu call(s)\n",
+        double(post) / 1e9, double(hash) / 1e9, double(wns) / 1e9,
+        (unsigned long long)wc);
     std::cerr << b;
   }
 
