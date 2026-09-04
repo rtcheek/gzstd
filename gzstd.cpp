@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.33";
+static constexpr const char * GZSTD_VERSION = "0.17.34";
 //
 // Architecture overview:
 //
@@ -854,6 +854,38 @@ static unsigned long long g_gds_bar1_before = 0;
 // whole file.
 static std::atomic<uint64_t> g_dstage_bytes{0};
 static std::atomic<uint64_t> g_dstage_frames{0};
+
+// Test-only rendezvous (read from $GZSTD_DEBUG_DSTAGE_GATE, a FIFO path): block
+// after --direct-stage has finished staging and before the process exits, so a
+// test can read /proc/PID/maps at a moment it CHOSE and prove the portable path
+// never loaded libcufile.  That property is the one the flag is named for, and
+// it was silently false until a review caught the staging slab being registered
+// through cuFile -- which succeeds on a host with the GDS gates open and fails
+// on exactly the hosts --direct-stage exists to serve.  Byte-identity cannot see
+// it; the loaded-library set can, but only if something holds the process still
+// while it is read.
+//
+// IT IS A FIFO AND NOT A POLL, DELIBERATELY -- the same reasoning as
+// rm_debug_gate() (search GZSTD_DEBUG_RM_GATE).  The check this replaces polled
+// /proc/<pid>/maps every 250 ms while the run lasted, so it could observe
+// NOTHING and report a PASS: a short run finishing between two polls, or a
+// mapping made and dropped inside one interval, both read as "never mapped".
+// A check that cannot distinguish "absent" from "not looked at" guards nothing.
+// This handshake contains no timing: open(O_RDONLY) returns exactly when the
+// test opens the write end (that is "staging is done, I am holding still"), and
+// read() returns exactly when the test writes (that is "I have read the maps,
+// proceed").  Unset -- every non-test run -- is no syscalls and no gate.
+static void dstage_debug_gate()
+{
+  const char * fifo = ::getenv("GZSTD_DEBUG_DSTAGE_GATE");
+  if (!fifo || !*fifo) return;
+  const int fd = ::open(fifo, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  char c;
+  ssize_t n;
+  do { n = ::read(fd, &c, 1); } while (n < 0 && errno == EINTR);
+  ::close(fd);
+}
 static std::atomic<uint64_t> g_gds_frames_p2p{0};      // aligned cuFile transfers
 static std::atomic<uint64_t> g_gds_frames_fallback{0}; // transfers that had to be bounced
 static std::atomic<uint64_t> g_gds_members_nofile{0};  // --tar members cuFile refused
@@ -26414,6 +26446,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         double(g_dstage_bytes.load(std::memory_order_relaxed)) / 1048576.0);
       vlog(V_VERBOSE, opt, b);
     }
+    // OUTSIDE the verbosity guard on purpose: the test that uses this runs -q.
+    dstage_debug_gate();
   }
   throttle.set_done();  // safe now: all workers exited
 

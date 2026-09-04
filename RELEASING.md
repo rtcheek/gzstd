@@ -47,11 +47,26 @@ the pre-tag box".
 **The total legitimately varies by host**, because `TOTAL_RAN` counts pass + fail and a skip
 is neither:
 
-| host | extensive | default |
-|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 557 | 417 |
-| GPU, GDS unavailable | 552 | 412 |
-| no GPU (the CPU-only build) | not yet observed | 336 |
+| host | extensive | default | reachable today? |
+|---|---|---|---|
+| GPU + GPUDirect Storage usable (the baseline) | 557 | 417 | **NO — see below** |
+| GPU, GDS unavailable | 552 | 412 | yes, both machines |
+| no GPU (the CPU-only build) | not yet observed | 336 | yes |
+
+**THE BASELINE ROW IS CURRENTLY UNREACHABLE ON BOTH MACHINES (2026-09-04), AND 557/417 IS
+THEREFORE A NUMBER NOBODY CAN CONFIRM.** The workstation's `nvidia-fs` was removed
+deliberately, and the server moved to kernel 6.8.0-139, where nvidia-fs still loads but the
+shadow-buffer pin returns `-EFAULT` — the decision was to stay there and use `--direct-stage`
+rather than pin the kernel back for a peer-to-peer path worth ~5%. Every real run now lands on
+the **GDS unavailable** row. Two consequences:
+
+- **The baseline stays the number to edit when adding or removing tests.** The deltas are
+  subtracted from it, so keeping it correct is what makes the reachable rows correct. It is
+  bookkeeping now, not an observation.
+- **`--gds-only` has no live coverage anywhere.** Its sections in `tool_pretag_validate.sh`
+  skip (gated on a one-shot host probe mirroring the suite's), and the suite's `--gds-only`
+  cells skip. What still runs everywhere is the *refusal* contract. Treat any change to that
+  code as unverified by test, and re-read it by hand.
 
 The GDS row is the five `--gds-only` cells that assert a successful run; they skip when the
 host cannot do peer-to-peer, which since v0.17.32 includes a host with no `nvidia-fs` module

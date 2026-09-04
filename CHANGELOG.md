@@ -1,12 +1,67 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.33  
+**Covers:** v0.9.50 → v0.17.34  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.34 — the check that guarded --direct-stage's whole claim could pass without looking
+
+`--direct-stage` exists to be the portable path: no cuFile, so none of GPUDirect Storage's four
+gates. That property was silently false once already — an independent review caught the staging slab
+being registered through cuFile, which SUCCEEDS on a host with the gates open and fails on exactly
+the hosts the flag exists to serve. Byte-identity cannot see it. The loaded-library set can, and the
+pre-tag tool checked it like this:
+
+```
+while kill -0 $mpid; do
+  grep -qa libcufile /proc/$mpid/maps && { mapped=yes; break; }
+  sleep 0.25
+done
+[[ $mapped == no ]] && ok "--direct-stage never maps libcufile"
+```
+
+**That reports a PASS when it has observed nothing.** A run that finishes between two samples, a
+mapping made and dropped inside one 250 ms interval, a `/proc` read that fails — every one of them
+reaches the same `mapped=no` as a genuinely clean run. It cannot distinguish *absent* from *not
+looked at*, which is the same defect class as this release series' other three: registration success
+read as routing evidence, an absent module read as unknown, a failed probe read read as silence.
+
+**`GZSTD_DEBUG_DSTAGE_GATE` replaces the poll with a rendezvous.** Set to a FIFO path, `--direct-stage`
+blocks after staging completes and before teardown, so the test reads `/proc/<pid>/maps` at a moment
+it chose. There is no timing in the handshake: `open(O_RDONLY)` returns exactly when the test opens
+the write end ("staging is done, I am holding still"), and `read()` returns exactly when the test
+writes ("I have read the maps, proceed"). Unset — every non-test run — is no syscalls and no gate.
+Same construction and the same reasoning as `GZSTD_DEBUG_RM_GATE` (v0.15.9x), which replaced two
+poll-and-hope tests for the same reason.
+
+The check around it was rebuilt to match, in `tool_pretag_validate.sh`:
+
+- **Never reaching the gate is now a FAILURE**, not a pass. Mutation-tested by pointing the script at
+  a binary that does not honour the hook: it reports `--direct-stage libcufile check DID NOT RUN`,
+  where the old poll would have reported a clean pass.
+- **The control lives inside the tool.** `LD_PRELOAD=libcufile.so` forces the library in and the SAME
+  detector must see it. Without that, "clean" is indistinguishable from a grep that can never match —
+  a wrong pattern, an unreadable maps file, the wrong pid. Verified both ways here: clean when
+  unforced, `mapped` when forced.
+
+### Also: the GDS-usable test baseline is no longer reachable, and the docs now say so
+
+`RELEASING.md`'s per-host table carried 557/417 as "the baseline" without recording that no machine
+can currently produce it. Neither can: the workstation's `nvidia-fs` was removed deliberately, and
+the server moved to kernel 6.8.0-139, where `nvidia-fs` still loads but the shadow-buffer pin returns
+`-EFAULT` — the decision was to stay there and use `--direct-stage` rather than pin the kernel back
+for a peer-to-peer path worth ~5%. The table now marks which rows are reachable and states the two
+consequences: the baseline remains the number to edit when tests are added or removed (the deltas are
+subtracted from it), and **`--gds-only` has no live coverage anywhere** — only its refusal contract
+still runs, so changes to that code are unverified by test and want a hand read.
+
+`tool_pretag_validate.sh` gained the matching gate: a one-shot host probe mirroring the suite's, so
+its `--gds-only` sections SKIP rather than report failures for a correct refusal.
+`PRETAG_FORCE_GDS_STATUS` exercises both branches from one host.
 
 ## v0.17.33 — the second stream is the double buffer, and a probe read that failed was read as silence
 
