@@ -35653,12 +35653,24 @@ static Options parse_args(int argc, char ** argv)
                 "another device cannot read them");
     if (opt.gpu_devices == 0) opt.gpu_devices = 1;
   }
-  // --direct-stage defaults to ONE device, for the reason --gds-only does: the
-  // drive sets the pace (this box reads ~4.9 GiB/s and one H100 compresses well
-  // past that), so extra devices buy nothing and are not free -- cuInit charges
-  // roughly 950 ms plus 250 ms per VISIBLE device, and each device carries its
-  // own set of pinned staging slots (8 x the frame size). An explicit
-  // --gpu-devices still wins, so the choice is a default and not a limit.
+  // --direct-stage defaults to ONE device.  Two reasons hold on every host:
+  // cuInit charges roughly 950 ms plus 250 ms per VISIBLE device, and each
+  // device carries its own set of pinned staging slots (8 x the frame size).
+  //
+  // THE THIRD REASON USED TO BE "the drive sets the pace", measured on a host
+  // whose NVMe reads ~4.9 GiB/s against one datacenter GPU that compresses well
+  // past it.  That is a property of that box, not of this flag.  On a PCIe Gen3
+  // host with a consumer GPU the staged path runs at 1.04 GiB/s against a
+  // measured 2.0 GB/s O_DIRECT ceiling, with the writer reporting
+  // "upstream-bound ... starved 96.0%" -- the drive is nowhere near the limit.
+  // What actually paces it is that each batch's staged reads are JOINED before
+  // that batch is launched, so this path pays read + compute where the ordinary
+  // reader pipelines a reader pool ahead of the workers and pays
+  // max(read, compute).  Extra devices do not fix that either, so the DEFAULT is
+  // unchanged and only the reason is corrected; see the --direct-stage help text
+  // for the measured numbers and ROADMAP's GPU-staging section for the fix.
+  //
+  // An explicit --gpu-devices still wins, so the choice is a default and not a limit.
   if (opt.direct_stage && opt.gpu_devices == 0) opt.gpu_devices = 1;
 #endif
   if (opt.gpu_only && (opt.cpu_only || opt.hybrid)) die_usage("--gpu-only cannot be combined with --cpu-only or --hybrid");
