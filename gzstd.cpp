@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.31";
+static constexpr const char * GZSTD_VERSION = "0.17.32";
 //
 // Architecture overview:
 //
@@ -595,6 +595,19 @@ static unsigned long long gz_nvfs_bar1_ok()
 // gz_nvfs_bar1_ok() folds both into 0, which is fine for a -v report and useless
 // for a gate: refusing to run because a file could not be opened would be a
 // worse failure than the one being prevented.
+// Is the nvidia-fs kernel module loaded at all?  DISTINCT from "its counter is
+// unreadable": /sys/module/<name> exists iff the module is in the kernel, so a
+// miss here is a POSITIVE determination that no transfer can be peer-to-peer,
+// not an unknown to fail open on.  Both spellings are checked because the module
+// is nvidia_fs to the kernel and nvidia-fs to /proc.
+static bool gz_nvfs_module_loaded()
+{
+  struct stat st;
+  return ::stat("/sys/module/nvidia_fs", &st) == 0
+      || ::stat("/sys/module/nvidia-fs", &st) == 0
+      || ::stat("/proc/driver/nvidia-fs", &st) == 0;
+}
+
 static bool gz_nvfs_bar1_read(unsigned long long * out)
 {
   std::ifstream f("/proc/driver/nvidia-fs/stats");
@@ -2727,6 +2740,40 @@ static void gds_preflight_or_die(const Options & opt)
   // FAIL OPEN on anything unknown.  No readable counter, no seekable input, a
   // read that could not be issued -- none of those are evidence of compat mode,
   // and refusing to run on them would be a worse failure than the quiet bounce.
+  // One refusal, several reasons.  Every path that concludes "peer-to-peer is
+  // impossible here" must say so the same way, and must keep naming
+  // --direct-stage -- that pointer is the only actionable part for the user.
+  auto refuse_no_p2p = [&](const std::string & why, const std::string & hint) {
+    die_usage("--gds-only cannot do peer-to-peer transfers on this host: " + why
+              + ".\n  Every transfer would bounce through host memory -- the exact"
+                " copy --gds-only\n  exists to remove.\n"
+              + hint
+              + "  Use --direct-stage instead: it needs none of GPUDirect Storage's"
+                " requirements\n  and captures most of the same win.");
+  };
+
+  // THE FORCED VERDICT MUST FIRE ANYWHERE, so it is tested before any host gate.
+  // It used to live INSIDE the counter block below, which is skipped whenever
+  // /proc/driver/nvidia-fs/stats cannot be read -- so on a host with no nvidia-fs
+  // the switch that exists to make this gate testable was itself unreachable, and
+  // the suite cell asserting the refusal failed there. A control that cannot fire
+  // on the host it describes is not a control.
+  if (std::getenv("GZSTD_DEBUG_GDS_FORCE_COMPAT"))
+    refuse_no_p2p("a compat-mode verdict was forced (GZSTD_DEBUG_GDS_FORCE_COMPAT)",
+                  "");
+
+  // ABSENT IS NOT UNKNOWN.  "Fail open on anything unknown" (below) is right for
+  // a counter we merely cannot read; it is wrong for a module that is not loaded
+  // at all.  Without nvidia-fs, cuFile runs in compat mode by construction and
+  // every byte bounces -- which is precisely what this flag exists to avoid, and
+  // exactly the silent-success shape the counter gate was added to kill.  The
+  // previous code fell through to a post-hoc WARNING at exit 0.
+  if (!gz_nvfs_module_loaded())
+    refuse_no_p2p("the nvidia-fs kernel module is not loaded, so cuFile can only "
+                  "run in\n  compat mode",
+                  "  Install and load nvidia-fs (nvidia-fs-dkms) if you meant to use"
+                  " GPUDirect\n  Storage.\n");
+
   unsigned long long b1_before = 0;
   if (!opt.input.empty() && opt.input != "-" && gz_nvfs_bar1_read(&b1_before)) {
     const int pfd = ::open(opt.input.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
@@ -2741,11 +2788,8 @@ static void gds_preflight_or_die(const Options & opt)
           if (pf.read_dev(pbuf, PB, 0, 0) == (ssize_t)PB) {
             unsigned long long b1_after = 0;
             if (gz_nvfs_bar1_read(&b1_after)) moved = (b1_after != b1_before);
-            // A gate that has never been seen to fire is not known to be a gate,
-            // and the host that fires it -- a card without resizable BAR -- is
-            // not the host this was written on.  Force the compat verdict so the
-            // refusal itself can be tested anywhere.
-            if (std::getenv("GZSTD_DEBUG_GDS_FORCE_COMPAT")) moved = false;
+            // (GZSTD_DEBUG_GDS_FORCE_COMPAT is handled above, before any host
+            // gate, so that it fires on hosts this block never reaches.)
           }
         }
         pb.dereg();
@@ -2753,16 +2797,12 @@ static void gds_preflight_or_die(const Options & opt)
         cudaFree(pbuf);
         if (!moved) {
           ::close(pfd);
-          die_usage(
-            "--gds-only cannot do peer-to-peer transfers on this host: cuFile "
-            "accepted the\n  buffer registration but the nvidia-fs BAR1 map "
-            "counter did not move for a real\n  read, which means cuFile is in "
-            "COMPAT MODE and every transfer would bounce\n  through host memory "
-            "-- the exact copy --gds-only exists to remove.\n"
-            "  This is usual on a GPU without resizable BAR (consumer cards are "
-            "often 256 MiB).\n"
-            "  Use --direct-stage instead: it needs none of GPUDirect Storage's "
-            "requirements\n  and captures most of the same win.");
+          refuse_no_p2p(
+            "cuFile accepted the buffer registration but the nvidia-fs BAR1\n"
+            "  map counter did not move for a real read, which means cuFile is in"
+            " COMPAT MODE",
+            "  This is usual on a GPU without resizable BAR (consumer cards are"
+            " often 256 MiB).\n");
         }
       } else {
         cudaGetLastError();

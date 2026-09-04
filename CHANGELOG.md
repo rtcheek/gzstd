@@ -1,12 +1,97 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.31  
+**Covers:** v0.9.50 → v0.17.32  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.32 — the refusal only worked on hosts that could already be diagnosed
+
+Removing `nvidia-fs` from a host that can never do peer-to-peer anyway — the reasonable
+housekeeping after concluding GDS will not work there — showed that v0.17.30's refusal had a
+precondition nobody had stated: **it only fires on a host that still has the module installed.**
+
+The gate asks "did `cuFileBufRegister` succeed while the nvidia-fs BAR1 counter stayed still?".
+With the module gone there is no counter to read, `gz_nvfs_bar1_read()` returns false, and the whole
+block is skipped. `--gds-only` then ran to completion at **exit 0**, emitting a WARNING after the
+fact that it "did not run entirely on the peer-to-peer-eligible path". That is the silent-success
+shape the counter gate was added to kill, reached by a different door.
+
+| host state | before | after |
+|---|---|---|
+| compat mode, nvidia-fs present | refuses, exit 2 | unchanged |
+| **nvidia-fs absent** | **runs, exit 0, warns afterwards** | **refuses, exit 2** |
+
+**ABSENT IS NOT UNKNOWN.** The block's own "fail open on anything unknown" rule is right for a
+counter that merely cannot be read; it is wrong for a module that is not loaded, which is a positive
+determination that no transfer can reach the GPU directly. A `/sys/module` check now settles that
+before the counter probe runs, and the refusal names the missing module and how to install it.
+
+### The control could not fire on the hosts it describes
+
+`GZSTD_DEBUG_GDS_FORCE_COMPAT` exists so the refusal can be tested on hardware that cannot reproduce
+it naturally. It lived **inside** the counter block, behind the same unreadable-counter guard — so on
+a host with no nvidia-fs the switch that exists to make the gate testable was itself unreachable, and
+the suite cell asserting the refusal failed there. It is now evaluated before any host gate. All
+three refusals share one code path, so their wording cannot drift apart, and each still names
+`--direct-stage`.
+
+### And the suite probe trusted a zero exit
+
+v0.17.31's host probe classified `rc == 0` as `engaged`. On this host that was exit 0 from a run
+whose per-batch registrations were failing (`err 5016`) and whose BAR1 map never moved — so the four
+`--gds-only` cells were handed a path that was not doing peer-to-peer. The probe now requires the
+**absence of failure evidence**, not merely a zero exit, and is mutation-tested against five stub
+shapes: a clean exit stays `engaged`, a demote message stays `demoted` (so hosts on the old contract
+are still fully tested), and `cuFileBufRegister failed`, `Bar1-map never moved` and the
+did-not-run-entirely warning each classify `refused`.
+
+### A fifth cell, found by running the suite rather than by reasoning about it
+
+`--gds-only -d accepts an archive of only empty frames` asserts exit 0 on a valid archive — the same
+old-contract shape as the four gated in v0.17.31 — but it had **passed** on the compat-mode host and
+so was never identified as one of them. It passed by accident: three empty frames is far under 4 KiB,
+so the old counter probe's 4096-byte `read_dev` never completed and that gate failed open on the
+small input. Refusing on an absent module regardless of input size removes the accident and exposed
+the cell. Now gated like the rest.
+
+**The general point:** a cell that passes is not evidence it does not encode a stale contract — it
+may be passing for a reason unrelated to what it asserts. The four were identified because they
+failed; this one needed the suite to be run.
+
+### EXPECTED_TESTS is now host-aware, everywhere
+
+A single constant could not describe every machine, because `TOTAL_RAN` counts pass + fail and a
+skip is neither. The CPU-only run therefore printed a drift note on every single invocation — one
+that was expected and correct, which is the fastest way to train a reader to ignore the one signal
+that is supposed to mean *a test was added or removed*.
+
+The check now subtracts documented, measured deltas for what the host could not run:
+
+| host | extensive | default |
+|---|---|---|
+| GPU + GDS usable (baseline) | 557 | 417 |
+| GPU, GDS unavailable | 552 | 412 |
+| no GPU (CPU-only build) | not yet observed | 336 |
+
+`-81` is the whole GPU section skipped as a group; `-5` is the `--gds-only` cells that assert a
+successful run. **The GDS cells live inside the GPU section, so the two deltas must never both
+apply** — the check uses `elif` for that reason. A host that needed an adjustment now says so
+(`552 ran, as expected on this host (baseline 557, -5 GDS unavailable: refused)`) instead of
+printing a note that looks like a defect. Verified by driving the check with stubbed capabilities
+across all four host shapes plus a +1 and a -1 mutation, which are still reported.
+
+`RELEASING.md` now states the rule uniformly: **neither** suite may show a drift note, on any host.
+
+*Measured on a 24-core / 2x consumer-GPU host after `gds-guard-deploy.sh purge`:* `--gds-only`
+compress exit 2 with the module named, forced-compat exit 2 naming `--direct-stage`, probe back to
+`refused`, CPU-only suite **336 passed / 0 failed**, extensive **552/1** before the fifth cell was
+gated and its raw command verified at exit 2 → SKIP afterwards.
+
+---
 
 ## v0.17.31 — the fit test that fit, and five tests that outlived their contract
 

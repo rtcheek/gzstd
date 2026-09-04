@@ -520,6 +520,14 @@ gds_host_status() {
     "$GZSTD" -vv -t --gds-only "$gp_z" >/dev/null 2>"$gp_e"; gp_rc=$?
     if [[ $gp_rc -eq 0 ]] && grep -q "using the ordinary read path" "$gp_e"; then
       GDS_HOST_STATUS=demoted
+    elif [[ $gp_rc -eq 0 ]] && grep -qiE 'cuFileBufRegister failed|Bar1-map never moved|did not run entirely on the peer-to-peer' "$gp_e"; then
+      # EXIT 0 IS NOT ENGAGEMENT.  Measured on a host whose nvidia-fs module had
+      # been removed while cuFile userspace stayed installed: the run completed
+      # at exit 0 while registration failed per batch and the BAR1 map never
+      # moved, so the old "rc==0 -> engaged" arm ran the --gds-only cells against
+      # a path that was not actually doing peer-to-peer. Require the ABSENCE of
+      # failure evidence, not merely a zero exit.
+      GDS_HOST_STATUS=refused
     elif [[ $gp_rc -eq 0 ]]; then
       GDS_HOST_STATUS=engaged
     else
@@ -555,13 +563,45 @@ human_size() {
 # auto-expand if you forget (so the display never shows > 100%),
 # but you should keep this in sync to get an accurate ETA.
 # ============================================================
-# Counts assume a GPU is present.  --extensive adds back the gated sections
-# (File management, Multi-file, Sparse, Threading, Stress, Help/version,
-# Output redirection, Sync output, Space-separated values, Thread option
-# forms, Verbose output validation, Completion summary format).
+# THE BASELINE ASSUMES THE MOST CAPABLE HOST: a GPU present AND GPUDirect
+# Storage actually usable.  --extensive adds back the gated sections (File
+# management, Multi-file, Sparse, Threading, Stress, Help/version, Output
+# redirection, Sync output, Space-separated values, Thread option forms,
+# Verbose output validation, Completion summary format).
 EXPECTED_TESTS=417
 $EXTENSIVE && EXPECTED_TESTS=557
 count_tests() { echo "$EXPECTED_TESTS"; }
+
+# ---- Host-dependent deltas, applied to the baseline at the drift check ----
+#
+# THE TOTAL LEGITIMATELY VARIES BY HOST, because TOTAL_RAN counts PASS + FAIL and
+# a skip is neither.  A single constant therefore cannot describe every machine,
+# and before v0.17.32 it did not try: the CPU-only run always printed a drift
+# note that was expected and correct, which trains the reader to ignore the one
+# signal that is supposed to mean "a test was added or removed".  Subtracting the
+# known deltas makes the note mean that again, on every host.
+#
+#   no GPU        -81  the whole "GPU acceleration" section is skipped as a
+#                      group (MEASURED: 417 baseline, 336 ran on a CPU-only
+#                      build).  The GDS cells live INSIDE that section, so this
+#                      delta already contains them -- do not also subtract the
+#                      GDS delta, which is why the check below uses elif.
+#   GPU, no GDS    -5  the five --gds-only cells that assert a successful run:
+#                      -t verifies on the device / -d misaligned frame starts /
+#                      -d lying seek table / forced small register budget /
+#                      -d all-empty archive.  They skip when gds_testable is
+#                      false (see gds_host_status).  MEASURED: extensive 557
+#                      baseline, 552 on a host whose nvidia-fs is absent.
+#                      The sixth GDS cell ("refuses a compat-mode host") still
+#                      RUNS and passes everywhere -- only its negative control is
+#                      gated -- so it is not part of this delta.
+#
+# MEASURED COMBINATIONS: default+noGPU (336) and extensive+GPU+noGDS (552).
+# Derived: default+GPU+noGDS (412) and extensive+GPU+GDS (557, the pre-tag host).
+# NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
+# -81 is the number to re-measure, not evidence of drift.
+EXPECTED_NOGPU_DELTA=81
+EXPECTED_NOGDS_DELTA=5
 
 # ============================================================
 # Banner & system info
@@ -1375,7 +1415,16 @@ GLPY
   "$GZSTD" --cpu-only -q -k -f "$TMPDIR/ge_zero" -o "$TMPDIR/ge_one.zst" 2>/dev/null
   cat "$TMPDIR/ge_one.zst" "$TMPDIR/ge_one.zst" "$TMPDIR/ge_one.zst" > "$ge_z"
   run_test "$GZSTD" -q -f -d --gds-only "$ge_z" -o "$ge_out" 2>/dev/null
-  if [[ $LAST_RC -eq 0 && -f "$ge_out" && ! -s "$ge_out" ]]; then
+  if ! gds_testable; then
+    # Same old-contract shape as the cells above: it asserts exit 0 on a valid
+    # archive.  It escaped the v0.17.31 gating because it PASSED on a compat-mode
+    # host by accident -- three empty frames is far under 4 KiB, so the counter
+    # probe's 4096-byte read never completed and that gate failed open.  v0.17.32
+    # refuses on an absent nvidia-fs module regardless of input size, which is
+    # correct and removes the accident.
+    skip "--gds-only -d accepts an archive of only empty frames" \
+         "GDS unavailable ($(gds_host_status))"
+  elif [[ $LAST_RC -eq 0 && -f "$ge_out" && ! -s "$ge_out" ]]; then
     pass "--gds-only -d accepts an archive of only empty frames"
   else
     fail "--gds-only -d all-empty archive" "exit $LAST_RC, output $(stat -c%s "$ge_out" 2>/dev/null || echo missing) bytes, want 0"
@@ -8196,9 +8245,25 @@ print_summary
 # Drift check: if the actual ran count differs from EXPECTED_TESTS,
 # nudge the maintainer to bump the constant.
 TOTAL_RAN=$(( PASS + FAIL ))
-if [[ $TOTAL_RAN -ne $EXPECTED_TESTS ]]; then
-  printf "\n  ${C_DIM}note: EXPECTED_TESTS=%d at top of script but %d ran — please update.${C_RESET}\n" \
-    "$EXPECTED_TESTS" "$TOTAL_RAN"
+# Adjust the baseline for what THIS host could not run, so the note means "a test
+# was added or removed" rather than "your machine differs from the pre-tag box".
+# See EXPECTED_NOGPU_DELTA / EXPECTED_NOGDS_DELTA for where the numbers come from.
+EXPECTED_HERE=$EXPECTED_TESTS
+EXPECTED_WHY=""
+if ! has_gpu 2>/dev/null; then
+  EXPECTED_HERE=$(( EXPECTED_HERE - EXPECTED_NOGPU_DELTA ))
+  EXPECTED_WHY=" (baseline $EXPECTED_TESTS, -$EXPECTED_NOGPU_DELTA no GPU)"
+elif ! gds_testable; then
+  # elif, not if: the GDS cells are inside the GPU section, so a GPU-less host
+  # has already subtracted them once.
+  EXPECTED_HERE=$(( EXPECTED_HERE - EXPECTED_NOGDS_DELTA ))
+  EXPECTED_WHY=" (baseline $EXPECTED_TESTS, -$EXPECTED_NOGDS_DELTA GDS unavailable: $(gds_host_status))"
+fi
+if [[ $TOTAL_RAN -ne $EXPECTED_HERE ]]; then
+  printf "\n  ${C_DIM}note: expected %d on this host%s but %d ran — please update EXPECTED_TESTS.${C_RESET}\n" \
+    "$EXPECTED_HERE" "$EXPECTED_WHY" "$TOTAL_RAN"
+elif [[ -n "$EXPECTED_WHY" ]]; then
+  printf "\n  ${C_DIM}%d ran, as expected on this host%s.${C_RESET}\n" "$TOTAL_RAN" "$EXPECTED_WHY"
 fi
 
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

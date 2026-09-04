@@ -39,10 +39,26 @@ Two runs, one per build configuration:
 ./gzstd-test.sh ./build-cpu/gzstd  # CPU-only build
 ```
 
-Both must be **0 failures**, and the extensive run must show **no drift note**
-(`EXPECTED_TESTS` matching the number that ran). The CPU-only run reports a lower total
-because GPU sections skip — that is expected; `EXPECTED_TESTS` is documented as assuming a
-GPU is present.
+Both must be **0 failures**, and **neither** must show a drift note. As of v0.17.32 that is
+a uniform rule: the suite adjusts its expected count for what the host could not run, so a
+note now means a test was genuinely added or removed rather than "this machine differs from
+the pre-tag box".
+
+**The total legitimately varies by host**, because `TOTAL_RAN` counts pass + fail and a skip
+is neither:
+
+| host | extensive | default |
+|---|---|---|
+| GPU + GPUDirect Storage usable (the baseline) | 557 | 417 |
+| GPU, GDS unavailable | 552 | 412 |
+| no GPU (the CPU-only build) | not yet observed | 336 |
+
+The GDS row is the five `--gds-only` cells that assert a successful run; they skip when the
+host cannot do peer-to-peer, which since v0.17.32 includes a host with no `nvidia-fs` module
+at all. The no-GPU row skips the whole GPU section as a group, and the GDS cells live inside
+it, so those two deltas must never both be applied — the script's drift check uses `elif` for
+exactly that reason. Both deltas live beside `EXPECTED_TESTS` at the top of the script with
+their provenance; when adding or removing tests, update the **baseline**.
 
 **The default `./gzstd-test.sh ./build/gzstd` was dropped from this checklist (2026-08-06)
 because it is a strict subset of `-e`.** Every extensive gate in the script is

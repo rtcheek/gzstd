@@ -220,13 +220,13 @@ Three ways to settle it, unresolved:
 3. **Refuse only when the user did not also pass a fallback**, e.g. an explicit
    `--gds-only --or-direct-stage` spelling, so the choice is the caller's.
 
-**Knock-on: `RELEASING.md`'s "both suites at 0 failures" is now host-dependent by construction.**
-Five cells encoded the old contract and failed on every non-GDS host. v0.17.31 makes the suite probe
-the host once (`engaged` / `demoted` / `refused` / `nogds`) and skip rather than fail, which restores
-a green run everywhere — but skips are not counted in `TOTAL_RAN`, so the same suite legitimately
-reports **553 on a non-GDS host and 557 on a GDS-capable one**. `EXPECTED_TESTS=557` is set for the
-pre-tag host. If option 2 is ever taken, those cells go back to running everywhere and the number
-converges again.
+**Knock-on, now settled.** Five cells encoded the old contract and failed on every non-GDS host.
+v0.17.31 made the suite probe the host once (`engaged` / `demoted` / `refused` / `nogds`) and skip
+rather than fail; v0.17.32 added a sixth cell to that set and made the expected COUNT host-aware,
+since skips are not counted in `TOTAL_RAN` and a single constant cannot describe every machine. The
+suite now subtracts documented deltas (−5 GDS cells, −81 the whole GPU section) so a drift note
+means a test was added or removed on **any** host — see the table in `RELEASING.md`. If option 2
+above is ever taken, those cells run everywhere and the GDS delta goes to zero.
 
 ## Known external defect: libcufile segfaults at exit when dlopen'd with stats on
 
