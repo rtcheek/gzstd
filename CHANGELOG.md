@@ -1,12 +1,107 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.30  
+**Covers:** v0.9.50 → v0.17.31  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.31 — the fit test that fit, and five tests that outlived their contract
+
+Both findings come from the second machine, and neither is visible on the development box.
+A 24-core host with 2x RTX 2080 Ti (11 GiB, 256 MiB BAR1) ran the release for the first time.
+
+### GPU decompress was silently dead on 11 GiB cards
+
+`-d --gpu-only` and `-t --gpu-only` never touched the GPU there. At the default `batch=256` the
+bringup pre-allocated its buffers, succeeded, and then died at the first device-checksum launch:
+
+    [GPU0/S0] pre-alloc batch=256 comp=16MiB decomp=16MiB
+    [GPU0] could not allocate VRAM reserve (non-fatal)
+    [GPU0] fault: gzx_xxh64 launch (decompress verify): out of memory
+    WARNING: all GPUs failed; finishing decompression on CPU (22 threads).
+
+Output stayed correct and the exit code stayed 0, so the only symptom was the feature quietly not
+happening — reported once, at `-vv`.
+
+**The guard for this case existed and could not fire.** The halving loop's own comment names
+"10 GiB consumer GPUs"; it only reacts to a `cudaMalloc` that *fails*, and every `cudaMalloc` here
+succeeded. 256 frames x (16 MiB + 16 MiB) is ~8 GiB, which fits in 11 GiB. What did not fit was
+everything allocated *after* the fit test: the VRAM reserve (a half-batch, i.e. half again as much
+as the buffers), nvCOMP's temp workspace, and the verify kernel's scratch. The temp estimate fed
+into the test was `per_stream_cap * 1024` — 256 KiB at batch 256 — which models none of them.
+
+*Measured, 10817 MiB free, 16 MiB chunks:* batch 192 runs; batch 224 allocates 10752 MiB of
+buffers-plus-reserve, leaves 65 MiB, and faults. The failure point tracks `batch * 48 MiB`, not the
+`batch * 32 MiB` the fit test checked.
+
+The compress bringup already caps itself at 80% of free VRAM via `cudaMemGetInfo`. Decompress now
+does the same, with the reserve added to the per-slot cost. On the 11 GiB card that yields 176-177
+and the GPU path runs; on a 95 GiB datacenter card it yields 1621, so it never binds and nothing
+about the development box changes.
+
+This also un-blocked the v0.17.15 multi-GPU rescue test, which had been reporting
+`fault never fired: NOT TESTED` — its injection point sits in the GPU delivery loop, which was
+never being entered.
+
+### Five suite cells still asserted the pre-v0.17.29 contract
+
+Until v0.17.28 a host that could not do peer-to-peer **demoted**: ordinary reader, exit 0. v0.17.30
+made the same host **refuse** with exit 2. Cells written against the old contract — four asserting
+exit 0 on a valid archive, one grepping stderr for the demote message — therefore failed on every
+host without working GDS, which per `--direct-stage`'s own help is nearly everywhere. A sixth used
+an unforced run as a negative control, which is invalid on a host that genuinely *is* compat mode.
+
+That made `RELEASING.md`'s "both suites at 0 failures" unreachable off the development box.
+
+The suite now probes the host once (`engaged` / `demoted` / `refused` / `nogds`) and those cells
+skip rather than fail; `demoted` still counts as testable, so hosts on the old behaviour are
+unaffected. The compat-mode cell keeps checking the forced arm and the `--direct-stage` pointer
+everywhere, and only its negative control is gated. Build capability is read from `-V`, not from
+`--help`, because a `USE_NVCOMP=OFF` binary documents `--gds-only` and rejects it at runtime.
+
+### And the reserve now earns its VRAM on both paths
+
+The reserve was allocated, held, and — outside one decompress site — never used. Three changes
+make its comment true rather than aspirational.
+
+**Bringup (decompress).** A reserve that will not allocate is the card saying it is full, one line
+before the checksum kernel finds out the expensive way. It used to be logged `(non-fatal)` and
+dropped. It now halves the batch, re-allocating every stream's buffers at the smaller size, and
+repeats down to a floor of 1 before giving up and running without a reserve. There is no retry
+counter: each pass strictly halves, so the floor already bounds the loop — the first version capped
+at 10, which is invisible at 176 (8 halvings) and wrong at 1621, where reaching 1 takes 11.
+
+**Mid-run (decompress).** Both per-batch allocation sites — the batch buffers and nvCOMP's temp
+growth — used to throw, dropping the whole device to the CPU rescue over what may be a transient
+shortfall. They now surrender the reserve and retry; failing that, they halve the pop and hand the
+batch back to the queue (the frames are intact — inputs are not released until delivery) so the next
+pop re-enters smaller. Only a single frame that will not fit is fatal.
+
+**Mid-run (compress).** Compress allocates *nothing* after bringup: buffers and temp are both sized
+once from fixed upper bounds, which is why its reserve had no consumer at all and its comment
+described a recovery that did not exist. The one way a VRAM race can reach that path is a **launch**
+that fails for want of memory — the same shape as the `gzx_xxh64` failure above. That status returns
+on the submitting thread, and the batch is fully re-runnable there: `release_input()` frees only the
+host copy, the bytes the launch reads are in `d_in_base`, and a second launch overwrites
+`d_out_base`. So the launch now surrenders the reserve and retries once before the throw aborts the
+output and rebuilds on the CPU.
+
+*Verified by injection, since none of these can be reached on a healthy card:*
+`GZSTD_DEBUG_FAIL_VRAM_RESERVE`, `GZSTD_DEBUG_FAIL_DECOMP_ALLOC` and
+`GZSTD_DEBUG_FAIL_COMPRESS_LAUNCH` force each one. Measured: one injected decompress failure
+recovers on the surrender alone; four recover with the surrender plus three shrinks and **no CPU
+fallback**; permanent pressure walks to the floor and then falls back, exit 0 and correct output at
+every step. One injected compress launch failure retries and completes on the GPU; two fall back to
+the CPU rebuild. Every arm round-trips byte-identical.
+
+`EXPECTED_TESTS` for the extensive run moves 548 -> 557. Skips are not counted, so a host where the
+five GDS cells skip legitimately reports 552 — the same host-dependence already documented for the
+CPU-only run.
+
+---
 
 ## v0.17.30 — the seek table is a claim, and the preflight believed it
 

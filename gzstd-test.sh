@@ -484,6 +484,62 @@ has_gpu() {
 # print there even though the profile writer itself works.
 has_nvcomp() { "$GZSTD" -V 2>&1 | grep -qi nvcomp; }
 
+# --gds-only host capability, probed ONCE and cached.
+#
+# WHY THIS EXISTS: v0.17.29-30 changed what an unavailable host GETS.  Until
+# v0.17.28 it DEMOTED -- the run used the ordinary reader, printed "using the
+# ordinary read path", and exited 0 -- so a cell could assert exit 0 on a valid
+# archive and that held on every host.  v0.17.30 makes the same host REFUSE with
+# exit 2 (cuFileBufRegister returns success in compat mode, so the old probe
+# proved nothing; the preflight now requires the nvidia-fs BAR1 counter to
+# actually MOVE).  Those exit-0 assertions then FAIL on every host without
+# working GDS -- which, per --direct-stage's own help text, is nearly
+# everywhere -- and RELEASING.md's "both suites at 0 failures" becomes
+# unreachable off the development box.  Measured on a 2x RTX 2080 Ti host
+# (256 MiB BAR1): five cells failed for this reason alone.
+#
+#   engaged - peer-to-peer really runs; every --gds-only cell is meaningful
+#   demoted - falls back to the ordinary reader, still exit 0 (pre-v0.17.29)
+#   refused - exit 2 with the compat-mode refusal (v0.17.30+)
+#   nogds   - the binary has no --gds-only at all (USE_NVCOMP=OFF)
+GDS_HOST_STATUS=""
+gds_host_status() {
+  if [[ -n "$GDS_HOST_STATUS" ]]; then printf '%s' "$GDS_HOST_STATUS"; return; fi
+  # BUILD capability first, via -V: a USE_NVCOMP=OFF binary still DOCUMENTS
+  # --gds-only in --help (and rejects it at runtime), so grepping the help text
+  # classifies a CPU-only build as a GDS host that merely refuses.
+  if ! has_nvcomp; then
+    GDS_HOST_STATUS=nogds
+  elif ! "$GZSTD" --help 2>&1 | grep -q -- '--gds-only'; then
+    GDS_HOST_STATUS=nogds
+  else
+    local gp_b="$TMPDIR/.gdsprobe.bin" gp_z="$TMPDIR/.gdsprobe.zst"
+    local gp_e="$TMPDIR/.gdsprobe.err" gp_rc
+    head -c 1048576 /dev/urandom > "$gp_b" 2>/dev/null
+    "$GZSTD" --cpu-only -q -k -f "$gp_b" -o "$gp_z" 2>/dev/null
+    "$GZSTD" -vv -t --gds-only "$gp_z" >/dev/null 2>"$gp_e"; gp_rc=$?
+    if [[ $gp_rc -eq 0 ]] && grep -q "using the ordinary read path" "$gp_e"; then
+      GDS_HOST_STATUS=demoted
+    elif [[ $gp_rc -eq 0 ]]; then
+      GDS_HOST_STATUS=engaged
+    else
+      # Any non-zero here means the path will not run: the compat-mode refusal,
+      # a missing driver, a filesystem cuFile will not take.  All are "not
+      # testable on this host", and none is a defect in the archive logic the
+      # cells below are trying to exercise.
+      GDS_HOST_STATUS=refused
+    fi
+    rm -f "$gp_b" "$gp_z" "$gp_e"
+  fi
+  printf '%s' "$GDS_HOST_STATUS"
+}
+
+# True when a --gds-only cell that asserts a SUCCESSFUL run can run here.
+gds_testable() {
+  local st; st="$(gds_host_status)"
+  [[ "$st" == engaged || "$st" == demoted ]]
+}
+
 human_size() {
   local bytes=$1
   if   [[ $bytes -ge 1073741824 ]]; then awk "BEGIN{printf \"%.1f GiB\", $bytes/1073741824}"
@@ -504,7 +560,7 @@ human_size() {
 # Output redirection, Sync output, Space-separated values, Thread option
 # forms, Verbose output validation, Completion summary format).
 EXPECTED_TESTS=417
-$EXTENSIVE && EXPECTED_TESTS=548
+$EXTENSIVE && EXPECTED_TESTS=557
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ============================================================
@@ -1153,7 +1209,9 @@ if has_gpu 2>/dev/null; then
   gv_z="$TMPDIR/gdsv.zst"; gv_e="$TMPDIR/gdsv.err"; gv_bad="$TMPDIR/gdsv-bad.zst"
   "$GZSTD" -k -f -3 "$TMPDIR/large.bin" -o "$gv_z" 2>/dev/null
   "$GZSTD" -vv -t --gds-only "$gv_z" 2>"$gv_e" >/dev/null; gv_rc=$?
-  if grep -q "using the ordinary read path" "$gv_e"; then
+  if ! gds_testable; then
+    skip "--gds-only -t verifies on the device" "GDS unavailable ($(gds_host_status))"
+  elif grep -q "using the ordinary read path" "$gv_e"; then
     skip "--gds-only -t verifies on the device" "GDS unavailable (demoted)"
   elif ! grep -q "\[GDS\] verify:" "$gv_e"; then
     fail "--gds-only -t verifies on the device" "path never engaged: NOT TESTED"
@@ -1198,7 +1256,10 @@ GVPY
   cat "$TMPDIR/ga_a.zst" "$TMPDIR/ga_b.zst" "$TMPDIR/ga_c.zst" > "$ga_z"
   cat "$TMPDIR/ga_a"     "$TMPDIR/ga_b"     "$TMPDIR/ga_c"     > "$ga_want"
   run_test "$GZSTD" -q -f -d --gds-only "$ga_z" -o "$ga_out" 2>"$ga_err"
-  if [[ $LAST_RC -ne 0 ]]; then
+  if ! gds_testable; then
+    skip "--gds-only -d demotes on misaligned frame starts, output intact" \
+         "GDS unavailable ($(gds_host_status))"
+  elif [[ $LAST_RC -ne 0 ]]; then
     fail "--gds-only -d misaligned frame starts" \
          "exit $LAST_RC on a valid archive ($(grep -oiE 'frame [0-9]+ starts at offset [0-9]+' "$ga_err" | head -1))"
   elif files_match "$ga_want" "$ga_out"; then
@@ -1269,7 +1330,10 @@ GLPY
       gl_ok=0; gl_why="$gl_shape shape: output differs from the source"
     fi
   done
-  if [[ $gl_ok -eq 1 ]]; then
+  if ! gds_testable; then
+    skip "--gds-only -d demotes on a seek table that lies" \
+         "GDS unavailable ($(gds_host_status))"
+  elif [[ $gl_ok -eq 1 ]]; then
     pass "--gds-only -d demotes on a seek table that lies"
   else
     fail "--gds-only -d lying seek table" "$gl_why"
@@ -1287,7 +1351,10 @@ GLPY
   "$GZSTD" -q -k -f -3 "$TMPDIR/large.bin" -o "$gb_z" 2>/dev/null
   if [[ -s "$gb_z" ]]; then
     GZSTD_DEBUG_GDS_BUDGET_MIB=256 run_test "$GZSTD" -q -f -d --gds-only "$gb_z" -o "$gb_out" 2>/dev/null
-    if [[ $LAST_RC -ne 0 ]]; then
+    if ! gds_testable; then
+      skip "--gds-only decodes correctly under a forced small register budget" \
+           "GDS unavailable ($(gds_host_status))"
+    elif [[ $LAST_RC -ne 0 ]]; then
       fail "--gds-only under a forced small register budget" "exit $LAST_RC"
     elif files_match "$TMPDIR/large.bin" "$gb_out"; then
       pass "--gds-only decodes correctly under a forced small register budget"
@@ -1547,8 +1614,12 @@ if has_gpu 2>/dev/null && "$GZSTD" --help 2>&1 | grep -q -- '--gds-only'; then
       fail "--gds-only refuses a compat-mode host" "forced compat still exited 0"
     elif ! grep -qi 'direct-stage' "$gc_err"; then
       fail "--gds-only refuses a compat-mode host" "refusal does not point at --direct-stage"
-    elif [[ $gc_plain -ne 0 ]]; then
-      # and it must NOT fire on a host that really can do peer-to-peer
+    elif [[ $gc_plain -ne 0 ]] && gds_testable; then
+      # and it must NOT fire on a host that really can do peer-to-peer.  THIS
+      # CONTROL IS ONLY VALID WHERE PEER-TO-PEER ACTUALLY WORKS: on a host that
+      # genuinely is compat mode the unforced run refuses too, and that is the
+      # correct answer, not a regression.  Guarding it is what lets the forced
+      # arm (which is the real subject) still be checked there.
       fail "--gds-only refuses a compat-mode host" "unforced run also refused (exit $gc_plain)"
     else
       pass "--gds-only refuses a compat-mode host and names --direct-stage"

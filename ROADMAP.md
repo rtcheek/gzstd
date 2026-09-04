@@ -173,9 +173,60 @@ correspondingly hard to justify.
 3. **Decompress has no equivalent.** `--gds-only` writes VRAM to NVMe through cuFile; there is no
    O_DIRECT write out of VRAM, so the portable path stops at compression. Whether a D2H-into-pinned
    plus O_DIRECT-pwrite arrangement beats the ordinary writer is unmeasured.
-4. **Second-machine validation.** Everything above is measured on one host. `--direct-stage` is
-   specifically the feature that *should* work on the workstation, which can never run `--gds-only`
-   at all — that is the whole point, and it has not been run there.
+4. ~~**Second-machine validation.**~~ **CLOSED 2026-09-04 (v0.17.30).** Run on the 24-core /
+   2x consumer-GPU host, which refuses `--gds-only` outright (256 MiB BAR1, compat mode) — the
+   configuration the flag exists for. **The claim survives falsification and is larger there:**
+   3 interleaved cold runs, 8 GiB, one device on every arm — host CPU **12.55-12.69 s -> 4.78-4.92**
+   (2.6x, against the 44% measured here) and peak RSS **9.5 GB -> 1.0 GB**, all ranges
+   non-overlapping. Correctness fully checked: the exact-byte instrument reports the whole input,
+   `GZSTD_DEBUG_DSTAGE_FAIL_FRAME` is caught by it, the CPU rebuild after a forced read failure
+   round-trips, and `gzstd -d`, `-d --cpu-only` and stock `zstd -d` all reproduce the source.
+   **The cost that host exposed is item 5 below.**
+
+5. **The staged reader serializes read and compute, per batch.** `RdJoin` joins a batch's reads
+   before that batch is launched, so `--direct-stage` pays **read + compute** where the ordinary
+   path pipelines a reader pool ahead of the workers and pays **max(read, compute)**. On a Gen4+
+   host with 8 datacenter GPUs this is invisible — reads are small next to the compute — but on a
+   Gen3 host with one consumer GPU it is **~29% of wall clock** (8.55-8.78 s vs the ordinary
+   reader's 6.33-7.30, non-overlapping). The staged path ran at **1.04 GiB/s against a measured
+   2.0 GB/s O_DIRECT ceiling** with the writer's own verdict reading
+   `upstream-bound ... starved 96.0%`, so the drive is demonstrably not the limit.
+   **This is the same shape of finding as "the drain thread is the per-device serializer" above:**
+   a serializer in the host staging, not in CUDA. Overlapping the reads of batch N+1 with the
+   compute of batch N is the obvious move; the ownership hazard is that the staging slot is reused,
+   so it needs either double-buffered slots or a slot count above the in-flight batch count.
+   Documented in `--help` as of v0.17.31 so the trade is not a surprise.
+
+## OPEN DESIGN QUESTION: `--gds-only` refuses where it used to demote
+
+**v0.17.29-30 changed the contract and the consequences are wider than the flag.** Until v0.17.28 a
+host that could not do peer-to-peer DEMOTED — ordinary reader, right answer, exit 0. It now REFUSES
+with exit 2 and points at `--direct-stage`. The refusal is well-founded: `cuFileBufRegister` returns
+success in compat mode, so the old probe proved nothing, and the preflight now requires the
+nvidia-fs BAR1 counter to actually move. **Silently bouncing every byte through host memory while
+reporting peer-to-peer is the failure mode this whole arc exists to kill** — see
+`project_gds_only_mode`'s two false instruments.
+
+**But it is a breaking change for a mixed fleet.** A script that ran `--gds-only` everywhere used to
+work everywhere; it now fails hard on any host without the four gates, which per `--direct-stage`'s
+own help is nearly everywhere.
+
+Three ways to settle it, unresolved:
+
+1. **Keep refusing** (today). Honest and loud; breaks mixed-fleet scripts.
+2. **Demote with a loud warning**, restoring exit 0 but naming compat mode explicitly on every run.
+   Restores the old contract without restoring the old lie — the objection is that a warning in a
+   long log is exactly how the original problem went unnoticed.
+3. **Refuse only when the user did not also pass a fallback**, e.g. an explicit
+   `--gds-only --or-direct-stage` spelling, so the choice is the caller's.
+
+**Knock-on: `RELEASING.md`'s "both suites at 0 failures" is now host-dependent by construction.**
+Five cells encoded the old contract and failed on every non-GDS host. v0.17.31 makes the suite probe
+the host once (`engaged` / `demoted` / `refused` / `nogds`) and skip rather than fail, which restores
+a green run everywhere — but skips are not counted in `TOTAL_RAN`, so the same suite legitimately
+reports **553 on a non-GDS host and 557 on a GDS-capable one**. `EXPECTED_TESTS=557` is set for the
+pre-tag host. If option 2 is ever taken, those cells go back to running everywhere and the number
+converges again.
 
 ## Known external defect: libcufile segfaults at exit when dlopen'd with stats on
 
@@ -321,15 +372,29 @@ Prevents workers from producing data faster than the NVMe can write. Evolved thr
 - `--cpu-batch` now ignored in `--cpu-only` mode (caused 10m26s sys time stop-and-go)
 
 ### 1.9 Graceful GPU VRAM Handling
-**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.26v0.11.29)**
+**Priority: HIGH | Complexity: Medium | Status: DONE (v0.11.26v0.11.29), EXTENDED v0.17.31**
 
 Survive VRAM exhaustion on shared GPU machines without hanging or producing truncated output.
 
-- Retry limit (10 attempts) prevents infinite allocation loop
 - Graceful GPU skip with frame re-enqueue to other GPUs/CPU
 - Reader never aborts on single GPU failure
 - Writer deadlock detection (5s timeout → hard error + cleanup)
 - `die()` reports cleanup of incomplete output files
+
+**v0.17.31 — the original DONE was true of its own guarantee and still left the feature dead.**
+Nothing hung and nothing was truncated, but on an 11 GiB consumer card *every* GPU decompress
+silently finished on the CPU at exit 0, because the fit test only reacts to a `cudaMalloc` that
+FAILS and 256 x (16+16) MiB genuinely fits in 11 GiB. What did not fit was everything allocated
+after it. **Surviving exhaustion and remaining usable are different properties, and only the first
+was being checked.** Now: a `cudaMemGetInfo` headroom cap at bringup (mirroring compress, with the
+reserve in the per-slot cost), and surrender-then-shrink at both mid-run allocation sites plus a
+launch-retry on compress — see the v0.17.31 CHANGELOG entry.
+
+- ~~Retry limit (10 attempts) prevents infinite allocation loop~~ **REMOVED v0.17.31 from the
+  reserve path.** A counter bounding a loop that already halves can only stop it EARLY: 10 is
+  invisible at batch 176 (8 halvings to reach 1) and wrong at 1621, where it takes 11 — it would
+  have given up at batch 2 on exactly the large-VRAM hardware it was meant to protect. Termination
+  comes from the batch-of-1 floor, not from counting.
 
 ### 1.10 Event-Driven GPU Completion (replace the completion-poll yield)
 **Priority: Medium | Complexity: High | Status: DONE (v0.14.70)**
