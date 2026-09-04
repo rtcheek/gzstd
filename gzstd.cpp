@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.29";
+static constexpr const char * GZSTD_VERSION = "0.17.30";
 //
 // Architecture overview:
 //
@@ -591,6 +591,25 @@ static unsigned long long gz_nvfs_bar1_ok()
   return 0;
 }
 
+// Same counter, but distinguishing "could not read it" from "it says zero".
+// gz_nvfs_bar1_ok() folds both into 0, which is fine for a -v report and useless
+// for a gate: refusing to run because a file could not be opened would be a
+// worse failure than the one being prevented.
+static bool gz_nvfs_bar1_read(unsigned long long * out)
+{
+  std::ifstream f("/proc/driver/nvidia-fs/stats");
+  if (!f) return false;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.compare(0, 8, "Bar1-map") != 0) continue;
+    const size_t k = line.find("ok=");
+    if (k == std::string::npos) return false;
+    if (out) *out = std::strtoull(line.c_str() + k + 3, nullptr, 10);
+    return true;
+  }
+  return false;
+}
+
 // A file registered with cuFile.  Non-copyable; deregisters on destruction.
 class GdsFile {
 public:
@@ -695,6 +714,21 @@ static std::atomic<uint64_t> g_gdsd_writes{0};
 // This is a real memory cost -- 17 GiB of host RSS -- and it is chosen for a
 // host that has it.  A smaller machine should pass --gpu-batch, which overrides
 // this entirely; --gpu-batch 64 restores the old 4.4 GiB footprint.
+//
+// ...AND THAT IS WHY THE VALUE ABOVE IS A CEILING, NOT THE ANSWER.  Expecting a
+// user to know they must pass --gpu-batch is not a memory policy; it is a
+// footgun with documentation.  The table is linear at ~4.2x the registered
+// bytes, and `-d` registers TWO slabs -- the NVMe->VRAM read target and the
+// VRAM->NVMe write source, opposite ends of one pipeline, so they are
+// necessarily live together -- which puts its peak near 8.4x the budget.
+// MEASURED at the 4 GiB ceiling: 16.2 GiB for -t, 32.3 GiB for -d.  Applied
+// unconditionally that is a default which OOMs or swap-thrashes any host much
+// smaller than the one it was tuned on, and no amount of Gate-4 validation on a
+// large machine can show it.  So derive it from what the host actually has free
+// and keep the ceiling as the ceiling.
+//
+// GZSTD_DEBUG_GDS_BUDGET_MIB forces a value, so a test can make the cap bind on
+// a machine where it otherwise never would.
 // How many staged cuFileReads to keep in flight.  cuFileRead is SYNCHRONOUS PER
 // CALL, so one thread gets the single-request rate and no more; cuFile's own
 // execution.max_io_threads parallelises WITHIN a request, not across them, which
@@ -712,6 +746,43 @@ static std::atomic<uint64_t> g_gdsd_writes{0};
 static const int GDS_READ_FANOUT = 8;
 
 static const size_t GDS_VERIFY_REGISTER_BUDGET = 4096ull * 1024u * 1024u;
+
+static size_t gds_register_budget()
+{
+  static const size_t v = []() -> size_t {
+    const size_t ceiling = GDS_VERIFY_REGISTER_BUDGET;
+    if (const char * e = std::getenv("GZSTD_DEBUG_GDS_BUDGET_MIB")) {
+      const long long mib = std::atoll(e);
+      if (mib > 0) return (size_t)mib * 1048576ull;
+    }
+    size_t avail = 0;
+    if (FILE * f = std::fopen("/proc/meminfo", "re")) {
+      char line[256];
+      while (std::fgets(line, sizeof line, f)) {
+        unsigned long long kb = 0;
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+          avail = (size_t)kb * 1024ull; break;
+        }
+      }
+      std::fclose(f);
+    }
+    // CANNOT TELL IS NOT PERMISSION TO ASSUME THE MOST.  Returning the ceiling
+    // here would put the 4 GiB default back on exactly the hosts whose memory
+    // could not be read, which is the footgun this function exists to remove.
+    // Take a conservative value instead -- measured at ~4.2 GiB RSS for -t and
+    // ~8.4 for -d, survivable nearly anywhere -- rather than refusing to run at
+    // all over a memory reading that is optional to begin with.
+    if (avail == 0) return 1024ull * 1048576ull;
+    // 8.4x amplification, aimed at half of what is free: avail / 17.
+    const size_t derived = avail / 17;
+    if (derived >= ceiling) return ceiling;
+    // NO FLOOR.  A floor is a promise to exceed the policy on precisely the host
+    // that can least afford it; the batch bottoms out at one frame on its own
+    // (max(1, budget / frame_cap)), which is slow but stays inside the bound.
+    return derived;
+  }();
+  return v;
+}
 static int                   g_gds_verify_fd = -1;   // O_DIRECT dup of the archive
 // A BUFFERED dup as well, for the CPU rescue: it preads arbitrary
 // (offset, length) pairs, which an O_DIRECT descriptor rejects outright.
@@ -2595,9 +2666,26 @@ static void gds_cu_or_die(cudaError_t e, const char * what)
 //
 // A small probe deliberately does NOT try to prove the full slab will fit.  It
 // separates "this host cannot do GDS at all" -- no nvidia-fs, BAR1 hopeless,
-// wrong kernel -- from "this batch is too big for its BAR1", which the stream
-// setup already retries at smaller sizes.  A 256 MiB-BAR1 card may well register
-// a modest batch, and that case should still run.
+// wrong kernel -- from "this batch is too big for its BAR1".
+//
+// THE SECOND HALF OF THAT SENTENCE USED TO CLAIM the stream setup "already
+// retries at smaller sizes", so a 256 MiB-BAR1 card would "still run" on a
+// modest batch.  IT DOES NOT RETRY.  ensure_buffers returns false, the caller
+// throws, the device is marked dead and the whole run demotes to CPU.  MEASURED
+// on a 2080 Ti (256 MiB BAR1, no resizable BAR), 512 MiB archive:
+//   --gpu-batch 8                 GPU path runs
+//   --gpu-batch 16/32/.../256     registration refused -> CPU rescue
+//   default (auto)                registration refused -> CPU rescue
+// So at defaults that card does ZERO GPU work and exits 0.  The comment's own
+// predicted case only happens if the batch is hand-picked.
+//
+// AND DO NOT "FIX" THIS WITH A BAR1-FITTING AUTOTUNER.  On that same card the
+// batch-8 run that did proceed was STILL in compat mode -- Bar1-map ok=0,
+// nvidia-fs Ops Read=0 -- so sizing the batch to fit the aperture buys no
+// peer-to-peer transfer at all; it only suppresses the demote and leaves every
+// byte bouncing through host memory with no warning.  A loud failure is worth
+// more than a quiet lie.  --direct-stage is the portable path and needs none of
+// GDS's gates.
 static void gds_preflight_or_die(const Options & opt)
 {
   if (!opt.gds_only) return;
@@ -2619,6 +2707,69 @@ static void gds_preflight_or_die(const Options & opt)
                 " (resizable BAR --\n  consumer cards are often 256 MiB and cannot"
                 " qualify), the nvidia-fs kernel module,\n  and a filesystem cuFile"
                 " accepts.  Re-run without --gds-only.");
+
+  // REGISTRATION SUCCESS IS NOT ROUTING EVIDENCE.  The check above proves only
+  // that cuFileBufRegister returned success, and it returns success in COMPAT
+  // MODE too -- where cuFile quietly bounces every transfer through host memory
+  // and nvidia-fs never sees a read at all.  MEASURED on a 2080 Ti (256 MiB
+  // BAR1, no resizable BAR): registration logged "128 MiB took 1 ms" while
+  // /proc/driver/nvidia-fs/stats showed Bar1-map n=7 ok=0 err=7 and Ops Read=0.
+  // The flag was accepted, the run completed, exit 0 -- and not one byte went
+  // peer-to-peer.  Same class of false instrument as the aligned-transfer
+  // counter that force-bounce disproved.
+  //
+  // So ask the question that actually matters: issue one real cuFileRead and see
+  // whether the kernel module's BAR1 map counter MOVES.  The counter is not
+  // proof in the positive direction -- a neighbour's GDS traffic moves it too --
+  // but it is reliable in the NEGATIVE one, which is the direction being used
+  // here: if it did not move for our own read, this host is in compat mode.
+  //
+  // FAIL OPEN on anything unknown.  No readable counter, no seekable input, a
+  // read that could not be issued -- none of those are evidence of compat mode,
+  // and refusing to run on them would be a worse failure than the quiet bounce.
+  unsigned long long b1_before = 0;
+  if (!opt.input.empty() && opt.input != "-" && gz_nvfs_bar1_read(&b1_before)) {
+    const int pfd = ::open(opt.input.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (pfd >= 0) {
+      void * pbuf = nullptr;
+      const size_t PB = 4096;
+      if (cudaMalloc(&pbuf, PB) == cudaSuccess) {
+        GdsFile pf;
+        GdsBuf   pb;
+        bool moved = true;                 // assume fine unless proven otherwise
+        if (pf.open(pfd) && pb.reg(pbuf, PB)) {
+          if (pf.read_dev(pbuf, PB, 0, 0) == (ssize_t)PB) {
+            unsigned long long b1_after = 0;
+            if (gz_nvfs_bar1_read(&b1_after)) moved = (b1_after != b1_before);
+            // A gate that has never been seen to fire is not known to be a gate,
+            // and the host that fires it -- a card without resizable BAR -- is
+            // not the host this was written on.  Force the compat verdict so the
+            // refusal itself can be tested anywhere.
+            if (std::getenv("GZSTD_DEBUG_GDS_FORCE_COMPAT")) moved = false;
+          }
+        }
+        pb.dereg();
+        pf.close();
+        cudaFree(pbuf);
+        if (!moved) {
+          ::close(pfd);
+          die_usage(
+            "--gds-only cannot do peer-to-peer transfers on this host: cuFile "
+            "accepted the\n  buffer registration but the nvidia-fs BAR1 map "
+            "counter did not move for a real\n  read, which means cuFile is in "
+            "COMPAT MODE and every transfer would bounce\n  through host memory "
+            "-- the exact copy --gds-only exists to remove.\n"
+            "  This is usual on a GPU without resizable BAR (consumer cards are "
+            "often 256 MiB).\n"
+            "  Use --direct-stage instead: it needs none of GPUDirect Storage's "
+            "requirements\n  and captures most of the same win.");
+        }
+      } else {
+        cudaGetLastError();
+      }
+      ::close(pfd);
+    }
+  }
 }
 #endif
 
@@ -11107,8 +11258,203 @@ static void apply_mem_limit_to_dctx(ZSTD_DCtx * dctx, const Options & opt)
 
 // Streaming decompress from an in-memory buffer (used when stream_frames_to_queue
 // already consumed stdin but couldn't parse frame boundaries).
+namespace xxh {
+  static constexpr uint64_t P1 = 11400714785074694791ULL;
+  static constexpr uint64_t P2 = 14029467366897019727ULL;
+  static constexpr uint64_t P3 =  1609587929392839161ULL;
+  static constexpr uint64_t P4 =  9650029242287828579ULL;
+  static constexpr uint64_t P5 =  2870177450012600261ULL;
+  static inline uint64_t rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+  // XXH64 is defined over LITTLE-ENDIAN lanes.  memcpy alone gives host order, so
+  // on a big-endian host every checksum would differ from the spec and archives
+  // would be rejected by conforming zstd implementations.  Assemble explicitly:
+  // correct everywhere, and the compiler folds it back to a plain load on LE.
+  static inline uint64_t rd8(const unsigned char * p) {
+    return  (uint64_t)p[0]        | ((uint64_t)p[1] << 8)  | ((uint64_t)p[2] << 16)
+         | ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40)
+         | ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+  }
+  static inline uint32_t rd4(const unsigned char * p) {
+    return  (uint32_t)p[0]        | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+  }
+  static inline uint64_t round_(uint64_t acc, uint64_t in) {
+    acc += in * P2; acc = rotl(acc, 31); acc *= P1; return acc;
+  }
+  static inline uint64_t merge(uint64_t acc, uint64_t val) {
+    acc ^= round_(0, val); acc = acc * P1 + P4; return acc;
+  }
+  static inline uint64_t avalanche(uint64_t h) {
+    h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32; return h;
+  }
+  // Finish from an accumulator state plus the trailing bytes.
+  static inline uint64_t tail(uint64_t h, const unsigned char * p, size_t len) {
+    const unsigned char * end = p + len;
+    while (p + 8 <= end) { h ^= round_(0, rd8(p)); h = rotl(h, 27) * P1 + P4; p += 8; }
+    if (p + 4 <= end) { h ^= (uint64_t)rd4(p) * P1; h = rotl(h, 23) * P2 + P3; p += 4; }
+    while (p < end)   { h ^= (uint64_t)(*p) * P5;  h = rotl(h, 11) * P1;      ++p; }
+    return avalanche(h);
+  }
+  // Streaming state: buffers a partial 32-byte stripe between updates.
+  struct State {
+    uint64_t v1 = 0, v2 = 0, v3 = 0, v4 = 0, total = 0;
+    unsigned char buf[32]; size_t buflen = 0; uint64_t seed = 0;
+    explicit State(uint64_t s = 0) { reset(s); }
+    void reset(uint64_t s = 0) {
+      seed = s; v1 = s + P1 + P2; v2 = s + P2; v3 = s; v4 = s - P1;
+      total = 0; buflen = 0;
+    }
+    void update(const void * data, size_t len) {
+      const unsigned char * p = (const unsigned char *)data;
+      total += len;
+      if (buflen + len < 32) { std::memcpy(buf + buflen, p, len); buflen += len; return; }
+      if (buflen) {                                   // complete the held stripe
+        const size_t need = 32 - buflen;
+        std::memcpy(buf + buflen, p, need); p += need; len -= need;
+        const unsigned char * b = buf;
+        v1 = round_(v1, rd8(b)); v2 = round_(v2, rd8(b + 8));
+        v3 = round_(v3, rd8(b + 16)); v4 = round_(v4, rd8(b + 24));
+        buflen = 0;
+      }
+      while (len >= 32) {
+        v1 = round_(v1, rd8(p));      v2 = round_(v2, rd8(p + 8));
+        v3 = round_(v3, rd8(p + 16)); v4 = round_(v4, rd8(p + 24));
+        p += 32; len -= 32;
+      }
+      if (len) { std::memcpy(buf, p, len); buflen = len; }
+    }
+    uint64_t digest() const {
+      uint64_t h;
+      if (total >= 32) {
+        h = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18);
+        h = merge(h, v1); h = merge(h, v2); h = merge(h, v3); h = merge(h, v4);
+      } else {
+        h = seed + P5;
+      }
+      h += total;
+      return tail(h, buf, buflen);
+    }
+  };
+  // One-shot.
+  static inline uint64_t hash(const void * data, size_t len, uint64_t seed = 0) {
+    State st(seed); st.update(data, len); return st.digest();
+  }
+}  // namespace xxh
+
+// zstd's content checksum is the low 32 bits of XXH64(content, 0) -- the same
+// value the seek table stores and the frame trailer carries.
+static uint32_t gz_content_ck32(const void * p, size_t n)
+{
+  return (uint32_t)xxh::hash(p, n, 0);
+}
+
+// ---- seek-table content checksums ------------------------------------------
+// A zstd-seekable table may carry a per-frame content checksum.  For a foreign
+// archive whose frames were written WITHOUT one of their own (`zstd
+// --no-check`), that is the ONLY byte-integrity evidence in the file -- and the
+// parser used to read the Checksum_Flag purely to size the entry stride and
+// then skip past the checksum itself.  MEASURED, on a single flipped payload
+// byte: `-d` decoded to wrong bytes at EXIT 0 on cpu-only, gpu-only and
+// gds-only alike, and `-t` reported the archive clean on all three.
+//
+// KEYED BY DECOMPRESSED OFFSET, NOT SEQUENCE NUMBER.  Three producers build
+// these tasks and each is free to number frames as it likes; the decompressed
+// offset is the frame's identity in the output, and it is exactly what the
+// table's u_off prefix sums already name.  A frame whose offset is not in the
+// table goes UNVERIFIED rather than being checked against its neighbour's hash
+// -- a wrong hash would report corruption on a sound archive, which is worse
+// than the gap it would be closing.
+//
+// PER INPUT: loaded at the top of each decompress and cleared when it ends.  A
+// table left from the previous file would verify this one against wrong hashes.
+static std::vector<uint64_t> g_tbl_ck_off;
+static std::vector<uint32_t> g_tbl_ck_val;
+// Largest DECOMPRESSED frame in the current input, from its seek table; 0 when
+// unknown.  Loaded alongside the checksums because it comes from the same parse
+// of the same table, and published as a global because the GPU worker sizes its
+// slabs from it and holds no descriptor of its own.
+static std::atomic<uint64_t> g_input_max_frame{0};
+
+static bool table_checksum_for(uint64_t uoff, uint32_t * ck)
+{
+  if (g_tbl_ck_off.empty()) return false;
+  const auto it = std::lower_bound(g_tbl_ck_off.begin(), g_tbl_ck_off.end(), uoff);
+  if (it == g_tbl_ck_off.end() || *it != uoff) return false;
+  if (ck) *ck = g_tbl_ck_val[(size_t)(it - g_tbl_ck_off.begin())];
+  return true;
+}
+// Defined further down, next to the code each depends on: the hash lives with
+// namespace xxh, the loader with the seek-table parser.
+static uint32_t gz_content_ck32(const void * p, size_t n);
+static void     table_checksums_load(FILE * in);
+static void     table_checksums_clear();
+
+// Loads the map for one input and drops it again however the decompress ends,
+// exceptions included.  NOT REENTRANT, and does not need to be:
+// decompress_nvcomp() and decompress_cpu_mt() are alternatives at every call
+// site, never nested.  If that ever changes, an inner scope would clear the map
+// out from under the outer one and its frames would silently go unverified --
+// so make this refcounted rather than assuming it still holds.
+struct TableCkScope {
+  explicit TableCkScope(FILE * in) { table_checksums_load(in); }
+  ~TableCkScope()                  { table_checksums_clear(); }
+  TableCkScope(const TableCkScope &)             = delete;
+  TableCkScope & operator=(const TableCkScope &) = delete;
+};
+
+// Verify seek-table checksums across a STREAMING decode, where a frame's bytes
+// never all exist in one buffer.  The one-shot decoders hash a finished frame;
+// these paths must hash as the bytes go past.
+//
+// WHY THIS EXISTS SEPARATELY.  The checksum map was consulted only where a whole
+// frame was decoded at once, so any archive that routes to a streaming decoder
+// kept decoding corrupt payload to EXIT 0 with the table's checksum sitting
+// unused.  MEASURED: a 3 MB frame piped through `zstd --no-check` (so it
+// declares no content size and routes here), one payload byte flipped, exit 0,
+// wrong bytes.
+//
+// SAME RULE AS THE ONE-SHOT PATH: only a frame carrying no checksum of its own
+// is checked against the table, because zstd has already authenticated one that
+// does, and a frame whose offset the table does not name is left unverified
+// rather than tested against its neighbour's hash.
+struct StreamFrameCk {
+  xxh::State h_;
+  uint64_t   frame_off_ = 0;    // output offset where the current frame starts
+  uint64_t   out_total_ = 0;    // bytes emitted so far across the stream
+  bool       own_ck_    = false;
+  bool       active_    = true; // false when the caller cannot place its frames
+
+  void head(const unsigned char * h, size_t n) {
+    own_ck_ = (n >= 5) && ((h[4] & 0x04) != 0);
+  }
+  void bytes(const void * p, size_t n) {
+    if (active_ && n) h_.update(p, n);
+    out_total_ += n;
+  }
+  void frame_end(uint64_t seq) {
+    uint32_t want = 0;
+    if (active_ && !own_ck_ && table_checksum_for(frame_off_, &want)
+        && (uint32_t)h_.digest() != want)
+      die_data("content-checksum mismatch at frame " + std::to_string(seq)
+               + ": the seek table says this frame hashes to "
+               + std::to_string(want)
+               + " but the decoded bytes do not -- the archive is corrupt");
+    h_.reset(0);
+    frame_off_ = out_total_;
+    own_ck_    = false;
+  }
+};
+
+// `base_off` is where this buffer's first frame begins in the DECOMPRESSED
+// output.  It is not always zero: this decoder is also the tail route for an
+// archive whose leading frames the parallel reader already wrote, and the
+// seek-table checksum map is keyed by output offset.  Callers pass the bytes
+// written so far; a base that is wrong simply misses the map and leaves those
+// frames unverified, which is the behaviour before any of this existed -- it
+// cannot turn into a false mismatch on a sound archive.
 static void decompress_from_buffer(const std::vector<char> & input,
-                                   FILE * out, const Options & opt, Meter * m)
+                                   FILE * out, const Options & opt, Meter * m,
+                                   uint64_t base_off = 0)
 {
   const size_t chunk_bytes = 4 * ONE_MIB;
   std::vector<char> outbuf(chunk_bytes);
@@ -11120,12 +11466,26 @@ static void decompress_from_buffer(const std::vector<char> & input,
   ZSTD_outBuffer zout { outbuf.data(), outbuf.size(), 0 };
   if (m) m->read_bytes.fetch_add(input.size());
 
+  // Frames here are the ones the splitter could not size, so their checksums --
+  // when the table carries any -- are the only evidence they have.
+  StreamFrameCk sck;
+  sck.frame_off_ = base_off;
+  sck.out_total_ = base_off;
+  uint64_t fb_frames = 0;
+  {
+    const unsigned char * ip = (const unsigned char *)input.data();
+    sck.head(ip, input.size());
+  }
+
   size_t ret = 0;
   while (zin.pos < zin.size) {
+    const size_t frame_in_at = zin.pos;
     ret = ZSTD_decompressStream(dctx, &zout, &zin);
     if (ZSTD_isError(ret))
       die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
                + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
+    (void)frame_in_at;
+    if (zout.pos > 0) sck.bytes(outbuf.data(), zout.pos);
     if (zout.pos > 0) {
       if (g_tar_decomp_sink) {
         // -t/-d --tar streaming/fallback path: hand the chunk to the tar parser.
@@ -11145,8 +11505,13 @@ static void decompress_from_buffer(const std::vector<char> & input,
       if (m) m->wrote_bytes.fetch_add(zout.pos);
       zout.pos = 0;
     }
-    if (ret == 0 && zin.pos < zin.size) {
-      // Frame boundary in multi-frame stream; continue
+    if (ret == 0) {
+      // Frame boundary: settle this frame's checksum, then arm the next one from
+      // the bytes that follow -- its header descriptor says whether it carries a
+      // checksum of its own.
+      sck.frame_end(fb_frames++);
+      if (zin.pos < zin.size)
+        sck.head((const unsigned char *)input.data() + zin.pos, input.size() - zin.pos);
     }
   }
 
@@ -11197,6 +11562,13 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   unsigned char head[8]; size_t head_n = 0;
   uint64_t cur_len = 0, data_frames = 0;
   bool decode_broke = false;   // --keep-going: stop reading, keep what we wrote
+  // Seek-table checksums for frames that carry none of their own.  This decoder
+  // sees the whole stream from offset 0, so it can place every frame exactly.
+  // It is reached DIRECTLY from the driver, not through decompress_cpu_mt, so it
+  // installs the per-input scope itself -- without this the map is empty here
+  // and every frame silently goes unverified.
+  TableCkScope tck_scope(in);
+  StreamFrameCk sck;
 
   for (;;) {
     if (decode_broke) break;
@@ -11228,11 +11600,15 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
         if (head_n < sizeof head) head[head_n++] = (unsigned char)inbuf[i];
         ++cur_len;
       }
-      if (ret == 0) {
+      sck.head(head, head_n);
+      // The frame's LAST output arrives on the same call that reports the
+      // boundary, so hash before settling the frame -- not after.
+      const bool frame_done = (ret == 0);
+      if (frame_done) {
         // Frame boundary: the frame whose head we captured has completed.
         if (head_n >= 4 && rd_le32(head) == 0xFD2FB528u) ++data_frames;
-        head_n = 0; cur_len = 0;
       }
+      if (zout.pos > 0) sck.bytes(outbuf.data(), zout.pos);
       if (zout.pos > 0) {
         if (g_tar_decomp_sink) {
           // -t/-d --tar single-frame path: hand the chunk to the tar parser.
@@ -11250,6 +11626,10 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
           }
         }
         if (m) m->wrote_bytes.fetch_add(zout.pos, std::memory_order_relaxed);
+      }
+      if (frame_done) {
+        sck.frame_end(data_frames);   // hashes are complete for this frame now
+        head_n = 0; cur_len = 0;
       }
     }
   }
@@ -12380,6 +12760,7 @@ static void cpu_worker(
 // Uses a thread-local DCtx to avoid repeated allocation/destruction overhead.
 static thread_local ZSTD_DCtx * tl_dctx = nullptr;
 
+
 static void cpu_decomp_worker(
   int worker_id,
   TaskQueue * tq,
@@ -12655,10 +13036,23 @@ static void cpu_decomp_worker(
                  "is corrupt and --keep-going cannot recover past an un-allocatable frame");
       }
       std::memset(out_buf->data(), 0, out_buf->size());
+      const unsigned char * fhk = (const unsigned char *)t.ptr();
+      const bool own_ck_k = fhk && t.len() >= 9 && (fhk[4] & 0x04);
       size_t rc = ZSTD_decompressDCtx(tl_dctx, out_buf->data(), out_buf->size(),
                                       t.ptr(), t.len());
       actual = t.decomp_size;            // always emit the full declared length (alignment)
       t.release_input();
+      // Same rule as the strict path, reported the --keep-going way: the content
+      // is present, so record it as recovered-but-unverified rather than dying.
+      if (!ZSTD_isError(rc) && !own_ck_k) {
+        uint32_t want_k = 0;
+        if (table_checksum_for(t.out_off, &want_k)
+            && gz_content_ck32(out_buf->data(), (size_t)t.decomp_size) != want_k) {
+          g_damage.record(t.out_off, (uint64_t)t.decomp_size, t.decomp_size);
+          vlog(V_ERROR, *opt, "WARNING: --keep-going: frame " + std::to_string(t.seq)
+               + ": seek-table checksum mismatch — content recovered but UNVERIFIED\n");
+        }
+      }
       if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
       if (ZSTD_isError(rc)) {
         const bool checksum = (ZSTD_getErrorCode(rc) == ZSTD_error_checksum_wrong);
@@ -12688,6 +13082,15 @@ static void cpu_decomp_worker(
       actual = 0;
       size_t chunk_seq = t.seq;
       size_t prev_zin_pos = 0;
+      // Seek-table checksum for a frame with none of its own.  This branch
+      // streams ONE frame in chunks, so the hash rolls across them and settles
+      // when ZSTD_decompressStream reports the frame complete.  Without it a
+      // frame that lands here -- 64 MiB to 256 MiB, or any size on the fallback
+      // -- decoded corrupt payload to exit 0 while the table's checksum sat
+      // unused, exactly as the one-shot branch above used to.
+      const unsigned char * sfh = (const unsigned char *)t.ptr();
+      const bool stream_own_ck = sfh && t.len() >= 9 && (sfh[4] & 0x04);
+      xxh::State stream_h;
       for (;;) {
         // Reuse the same pool — streaming chunks are bounded by CHUNK,
         // which fits comfortably within the per-frame max we'd otherwise
@@ -12707,6 +13110,7 @@ static void cpu_decomp_worker(
         }
         if (zout.pos > 0) {
           chunk->resize(zout.pos);
+          if (!stream_own_ck) stream_h.update(chunk->data(), chunk->size());
           // Each streamed chunk becomes an in-flight result frame, and the
           // writer releases one throttle permit per frame it writes.  We
           // entered holding exactly one permit (the pre-pop acquire): charge it
@@ -12719,7 +13123,16 @@ static void cpu_decomp_worker(
           deliver(chunk_seq, std::move(chunk));
           ++chunk_seq;
         }
-        if (ret == 0) break;
+        if (ret == 0) {
+          uint32_t want_s = 0;
+          if (!stream_own_ck && table_checksum_for(t.out_off, &want_s)
+              && (uint32_t)stream_h.digest() != want_s)
+            die_data("content-checksum mismatch at frame " + std::to_string(t.seq)
+                     + ": the seek table says this frame hashes to "
+                     + std::to_string(want_s)
+                     + " but the decoded bytes do not -- the archive is corrupt");
+          break;
+        }
         if (zin.pos == zin_before && zout.pos == 0)
           die_data("ZSTD decompressStream stalled: no progress");
       }
@@ -12745,12 +13158,30 @@ static void cpu_decomp_worker(
                  + std::to_string(t.decomp_size)
                  + " bytes; allocation failed (corrupt input?)");
       }
+      // Read the Content_Checksum_flag while the input is still held:
+      // release_input() below invalidates these bytes.
+      const unsigned char * fhp = (const unsigned char *)t.ptr();
+      const bool own_ck = fhp && t.len() >= 9 && (fhp[4] & 0x04);
       actual = ZSTD_decompressDCtx(tl_dctx, out_buf->data(), out_buf->size(),
                                    t.ptr(), t.len());
       if (ZSTD_isError(actual))
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual)
                  + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
       out_buf->resize(actual);
+      // A frame carrying its own checksum was just verified by zstd itself.  One
+      // WITHOUT is verified against the seek table's checksum, which for such an
+      // archive is the only byte-integrity evidence there is.  Only that case,
+      // deliberately: holding a sound frame against possibly-stale table
+      // metadata would fail good archives to close a gap they do not have.
+      if (!own_ck) {
+        uint32_t want_ck = 0;
+        if (table_checksum_for(t.out_off, &want_ck)
+            && gz_content_ck32(out_buf->data(), out_buf->size()) != want_ck)
+          die_data("content-checksum mismatch at frame " + std::to_string(t.seq)
+                   + ": the seek table says this frame hashes to "
+                   + std::to_string(want_ck)
+                   + " but the decoded bytes do not -- the archive is corrupt");
+      }
       t.release_input();
       if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
       deliver(t.seq, std::move(out_buf));
@@ -13824,6 +14255,7 @@ static size_t stream_frames_to_queue(
 ======================================================================*/
 static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  TableCkScope tck_scope(in);   // seek-table checksums for THIS input
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
@@ -13911,7 +14343,8 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 
     vlog(V_VERBOSE, opt,
          "cannot determine frame sizes; using streaming CPU decompress\n");
-    decompress_from_buffer(raw_data, out, opt, m);
+    decompress_from_buffer(raw_data, out, opt, m,
+                           m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
     return;
   }
 
@@ -13973,7 +14406,8 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
          "content-size header (zstd streaming output); the parallel reader "
          "can't split it, so the remaining data is decompressed with the CPU "
          "streaming decoder (slower, but nothing is lost).\n");
-    decompress_from_buffer(raw_data, out, opt, m);
+    decompress_from_buffer(raw_data, out, opt, m,
+                           m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
   }
 
   if (g_perf) {
@@ -14133,88 +14567,6 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
 //
 // Verified byte-for-byte against ZSTD_XXH64 across sizes 0..8 KiB and random seeds
 // before the dependency was removed.
-namespace xxh {
-  static constexpr uint64_t P1 = 11400714785074694791ULL;
-  static constexpr uint64_t P2 = 14029467366897019727ULL;
-  static constexpr uint64_t P3 =  1609587929392839161ULL;
-  static constexpr uint64_t P4 =  9650029242287828579ULL;
-  static constexpr uint64_t P5 =  2870177450012600261ULL;
-  static inline uint64_t rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
-  // XXH64 is defined over LITTLE-ENDIAN lanes.  memcpy alone gives host order, so
-  // on a big-endian host every checksum would differ from the spec and archives
-  // would be rejected by conforming zstd implementations.  Assemble explicitly:
-  // correct everywhere, and the compiler folds it back to a plain load on LE.
-  static inline uint64_t rd8(const unsigned char * p) {
-    return  (uint64_t)p[0]        | ((uint64_t)p[1] << 8)  | ((uint64_t)p[2] << 16)
-         | ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40)
-         | ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
-  }
-  static inline uint32_t rd4(const unsigned char * p) {
-    return  (uint32_t)p[0]        | ((uint32_t)p[1] << 8)
-         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-  }
-  static inline uint64_t round_(uint64_t acc, uint64_t in) {
-    acc += in * P2; acc = rotl(acc, 31); acc *= P1; return acc;
-  }
-  static inline uint64_t merge(uint64_t acc, uint64_t val) {
-    acc ^= round_(0, val); acc = acc * P1 + P4; return acc;
-  }
-  static inline uint64_t avalanche(uint64_t h) {
-    h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32; return h;
-  }
-  // Finish from an accumulator state plus the trailing bytes.
-  static inline uint64_t tail(uint64_t h, const unsigned char * p, size_t len) {
-    const unsigned char * end = p + len;
-    while (p + 8 <= end) { h ^= round_(0, rd8(p)); h = rotl(h, 27) * P1 + P4; p += 8; }
-    if (p + 4 <= end) { h ^= (uint64_t)rd4(p) * P1; h = rotl(h, 23) * P2 + P3; p += 4; }
-    while (p < end)   { h ^= (uint64_t)(*p) * P5;  h = rotl(h, 11) * P1;      ++p; }
-    return avalanche(h);
-  }
-  // Streaming state: buffers a partial 32-byte stripe between updates.
-  struct State {
-    uint64_t v1 = 0, v2 = 0, v3 = 0, v4 = 0, total = 0;
-    unsigned char buf[32]; size_t buflen = 0; uint64_t seed = 0;
-    explicit State(uint64_t s = 0) { reset(s); }
-    void reset(uint64_t s = 0) {
-      seed = s; v1 = s + P1 + P2; v2 = s + P2; v3 = s; v4 = s - P1;
-      total = 0; buflen = 0;
-    }
-    void update(const void * data, size_t len) {
-      const unsigned char * p = (const unsigned char *)data;
-      total += len;
-      if (buflen + len < 32) { std::memcpy(buf + buflen, p, len); buflen += len; return; }
-      if (buflen) {                                   // complete the held stripe
-        const size_t need = 32 - buflen;
-        std::memcpy(buf + buflen, p, need); p += need; len -= need;
-        const unsigned char * b = buf;
-        v1 = round_(v1, rd8(b)); v2 = round_(v2, rd8(b + 8));
-        v3 = round_(v3, rd8(b + 16)); v4 = round_(v4, rd8(b + 24));
-        buflen = 0;
-      }
-      while (len >= 32) {
-        v1 = round_(v1, rd8(p));      v2 = round_(v2, rd8(p + 8));
-        v3 = round_(v3, rd8(p + 16)); v4 = round_(v4, rd8(p + 24));
-        p += 32; len -= 32;
-      }
-      if (len) { std::memcpy(buf, p, len); buflen = len; }
-    }
-    uint64_t digest() const {
-      uint64_t h;
-      if (total >= 32) {
-        h = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18);
-        h = merge(h, v1); h = merge(h, v2); h = merge(h, v3); h = merge(h, v4);
-      } else {
-        h = seed + P5;
-      }
-      h += total;
-      return tail(h, buf, buflen);
-    }
-  };
-  // One-shot.
-  static inline uint64_t hash(const void * data, size_t len, uint64_t seed = 0) {
-    State st(seed); st.update(data, len); return st.digest();
-  }
-}  // namespace xxh
 
 // Streaming round-trip verifier for the single-frame paths.
 //
@@ -19985,6 +20337,11 @@ struct TarSeekTable {
   uint64_t tar_size = 0;              // total tar-stream size
   std::vector<uint64_t> c_off;        // nframes+1 prefix sums (archive offsets)
   std::vector<uint64_t> u_off;        // nframes+1 prefix sums (tar offsets)
+  // Per-frame content checksums, when the table carries them (Checksum_Flag):
+  // nframes entries, so checksums[k] belongs to the frame spanning
+  // [c_off[k], c_off[k+1]).  EMPTY when the table has none -- never assume
+  // this is populated just because the table parsed.
+  std::vector<uint32_t> checksums;
   bool valid() const { return c_off.size() >= 2 && u_off.size() == c_off.size(); }
 };
 
@@ -20237,7 +20594,13 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     if (std::fseek(in, -9, SEEK_END) != 0 || std::fread(ft, 1, 9, in) != 9
         || rd_le32(ft + 5) != 0x8F92EAB1u) break;
     uint64_t nf = rd_le32(ft);
-    const uint64_t esz = 8 + ((ft[4] & 0x80u) ? 4 : 0);
+    // Seek_Table_Descriptor: bit 7 is Checksum_Flag, bits 6-2 are reserved and
+    // must be zero, bits 1-0 are unused and may be anything.  A table that sets
+    // a reserved bit is using a layout this code does not know, so its stride
+    // arithmetic cannot be trusted -- decline it rather than parse it wrongly.
+    if (ft[4] & 0x7Cu) break;
+    const bool has_ck  = (ft[4] & 0x80u) != 0;
+    const uint64_t esz = 8 + (has_ck ? 4 : 0);
     uint64_t tpay = nf * esz + 9;
     // 1 GiB cap: bounds the allocation a forged frame count can demand.
     if (nf == 0 || tpay > ((uint64_t)1 << 30) || tpay + 8 > end) break;
@@ -20247,6 +20610,7 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
         || std::fread(tb.data(), 1, tb.size(), in) != tb.size()
         || rd_le32(tb.data()) != 0x184D2A5Eu || rd_le32(tb.data() + 4) != tpay) break;
     std::vector<uint64_t> co{0}, uo{0};
+    std::vector<uint32_t> cks;
     uint64_t c = 0, u = 0;
     bool bad = false, skips = false;
     const unsigned char * q = tb.data() + 8;
@@ -20297,6 +20661,14 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
       if (skips || cz < 10) { bad = true; break; }
       c += cz; co.push_back(c);
       u += dz; uo.push_back(u);
+      // THE TABLE'S CHECKSUM IS EVIDENCE, AND IT WAS BEING THROWN AWAY.  The
+      // flag was read only to pick the entry stride; the checksum itself was
+      // skipped over.  For a foreign archive whose frames carry no content
+      // checksum of their own -- `zstd --no-check` -- this is the ONLY
+      // byte-integrity evidence in the file, and discarding it made a corrupt
+      // payload decode to wrong bytes at exit 0 on every backend, with `-t`
+      // reporting the archive clean.  MEASURED on a one-byte flip.
+      if (has_ck) cks.push_back(rd_le32(q + 8));
     }
     // The data region must start at 0 and every byte before the seek table
     // must be accounted for; the first bytes must be a zstd data frame.
@@ -20307,6 +20679,7 @@ static bool parse_foreign_seek_table(FILE * in, TarSeekTable & st) {
     st.tar_size = u;
     st.c_off = std::move(co);
     st.u_off = std::move(uo);
+    st.checksums = std::move(cks);
     ok = true;
   } while (false);
   std::rewind(in);
@@ -20811,6 +21184,44 @@ static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
 }
 
 }  // namespace tarx
+
+// Load the current input's seek-table checksums, if it carries any.  Silent and
+// best-effort by design: an archive with no table, or a table without the
+// Checksum_Flag, simply leaves the map empty and every frame falls back to
+// whatever checksum it carries in its own trailer.
+static void table_checksums_clear()
+{
+  g_tbl_ck_off.clear();
+  g_tbl_ck_val.clear();
+  g_input_max_frame.store(0, std::memory_order_relaxed);
+}
+
+static void table_checksums_load(FILE * in)
+{
+  table_checksums_clear();
+  if (!in) return;
+  tarx::TarSeekTable st;
+  if (!tarx::parse_foreign_seek_table(in, st) || !st.valid()) return;
+  // Publish the real maximum frame size BEFORE the checksum early-outs: a table
+  // without checksums still tells the batch sizer how big this archive's frames
+  // actually are, which is a different question from whether they can be
+  // verified.
+  {
+    uint64_t mx = 0;
+    for (size_t k = 0; k + 1 < st.u_off.size(); ++k) {
+      const uint64_t dz = st.u_off[k + 1] - st.u_off[k];
+      if (dz > mx) mx = dz;
+    }
+    g_input_max_frame.store(mx, std::memory_order_relaxed);
+  }
+  if (st.checksums.empty()) return;                 // table carries no checksums
+  // u_off holds nframes+1 prefix sums and checksums holds nframes entries; if
+  // they disagree the table is not the shape this map assumes, so take nothing
+  // rather than pair offsets with the wrong hashes.
+  if (st.checksums.size() + 1 != st.u_off.size()) return;
+  g_tbl_ck_off.assign(st.u_off.begin(), st.u_off.end() - 1);
+  g_tbl_ck_val = std::move(st.checksums);
+}
 #endif  // !_WIN32
 
 // `prebuilt_layout` (--tar creation only, may be null): a source walk the caller
@@ -26142,10 +26553,21 @@ static void gpu_decomp_worker(
       return freed;
     }
 
+    // Set when the false below came from cuFileBufRegister rather than from
+    // cudaMalloc.  THE TWO ARE NOT THE SAME FAILURE and conflating them sent a
+    // reader hunting VRAM for a BAR1 problem: on a 2080 Ti (256 MiB BAR1, no
+    // resizable BAR) every batch >= 16 reported "failed to allocate device
+    // buffers" with 10.8 GiB of VRAM free, because the registration -- not the
+    // allocation -- was refused.  Registration maps into the PCIe aperture,
+    // which is a different and much smaller resource than device memory.
+    bool last_fail_was_registration = false;
+
     // Ensure buffers are large enough for the given batch parameters.
-    // Returns false on allocation failure.
+    // Returns false when the device buffers cannot be allocated OR registered;
+    // last_fail_was_registration says which.
     bool ensure_buffers(size_t batch_n, size_t max_comp, size_t max_decomp,
                         size_t needed_temp) {
+      last_fail_was_registration = false;
       if (batch_n <= alloc_batch && max_comp <= alloc_comp
           && max_decomp <= alloc_decomp && needed_temp <= temp_bytes)
         return true;  // already big enough
@@ -26178,6 +26600,7 @@ static void gpu_decomp_worker(
         const uint64_t rin_t0 = now_ns();
         if (!gds_in_reg.reg(d_comp_buf, batch_n * max_comp, &why)) {
           std::cerr << "gzstd: --gds-only -t: " << why << "\n";
+          last_fail_was_registration = true;
           return false;
         }
         if (gds_reg_log) {
@@ -26194,6 +26617,7 @@ static void gpu_decomp_worker(
         const uint64_t reg_t0 = now_ns();
         if (!gds_out_reg.reg(d_decomp_buf, batch_n * max_decomp, &why)) {
           std::cerr << "gzstd: --gds-only: " << why << "\n";
+          last_fail_was_registration = true;
           return false;
         }
         // Logged because this function RE-RUNS on every batch resize, not just at
@@ -26295,8 +26719,19 @@ static void gpu_decomp_worker(
     // user sets it: this only bounds the tuner's speculative headroom.
     if (g_gds_read_active.load(std::memory_order_relaxed)
         && !opt.gpu_batch_user_set) {
-      const size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
-      const size_t budget    = GDS_VERIFY_REGISTER_BUDGET;
+      size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+      {   // the archive's real frame size, not the one gzstd would have written
+        const uint64_t mx = g_input_max_frame.load(std::memory_order_relaxed);
+        if (mx > (uint64_t)frame_cap) frame_cap = (size_t)mx;
+      }
+      // THE BUDGET IS FOR THE PROCESS, AND THIS IS ONE STREAM OF ONE DEVICE.
+      // Applied whole here it promised a host-derived bound and then registered
+      // that much per stream per device -- `--gpu-streams 2` quietly doubled the
+      // footprint the cap exists to hold.  Divide the process budget across
+      // everything that will register concurrently.
+      const size_t budget    = gds_register_budget()
+                             / std::max<size_t>(1, (size_t)gpu_worker_count)
+                             / stream_count;
       const size_t fit       = std::max<size_t>(1, budget / std::max<size_t>(1, frame_cap));
       if (fit < per_stream_cap) per_stream_cap = fit;
     }
@@ -26905,6 +27340,18 @@ static void gpu_decomp_worker(
           if (tb > temp_bound) temp_bound = tb;
         }
         if (!C.ensure_buffers(C.filled, max_comp, max_decomp, temp_bound)) {
+          // Name the resource that actually ran out.  A registration failure is
+          // a PCIe BAR1 aperture limit, not a VRAM limit, and saying
+          // "allocate device buffers" on a card with free VRAM points every
+          // diagnosis in the wrong direction.
+          if (C.last_fail_was_registration)
+            throw std::runtime_error(
+                "GPU decomp: could not register the device buffers with cuFile "
+                "for a batch of " + std::to_string(C.filled)
+                + " -- this is the PCIe BAR1 aperture, not VRAM. A card without "
+                  "resizable BAR (256 MiB aperture is typical) cannot map a "
+                  "batch this large; use --direct-stage, which needs no BAR1 "
+                  "mapping, or a smaller --gpu-batch");
           throw std::runtime_error("GPU decomp: failed to allocate device buffers");
         }
 
@@ -27100,6 +27547,16 @@ static void gpu_decomp_worker(
                                | ((unsigned int)fp[fl-3] << 8)
                                | ((unsigned int)fp[fl-2] << 16)
                                | ((unsigned int)fp[fl-1] << 24);
+            } else {
+              // No checksum in the frame: fall back to the seek table's, which
+              // for a `zstd --no-check` archive is the only integrity evidence
+              // in the file.  Without this the device verifier was handed
+              // has_ck = 0 and wrong bytes decoded to exit 0.
+              uint32_t tck = 0;
+              if (table_checksum_for((uint64_t)C.batch[i].out_off, &tck)) {
+                C.h_has_ck[i]    = 1;
+                C.h_expect_ck[i] = (unsigned int)tck;
+              }
             }
           }
         }
@@ -27990,6 +28447,78 @@ static void gpu_decomp_worker(
 // Returns the frame count, or GDS_VERIFY_DEMOTE if there is no usable table.
 static const size_t GDS_VERIFY_DEMOTE = SIZE_MAX;
 
+// Prove a seek-table entry's COMPRESSED extent ends exactly where it claims.
+//
+// Checking a frame's start and its declared decompressed size is not enough.  A
+// table entry can begin at honest frame magic, declare the size that frame
+// really decodes to, and still span TWO concatenated frames -- the prefix sums
+// keep tiling the file, so nothing downstream notices that a frame has vanished
+// from the table.  MEASURED, and the worst outcome this path has produced: an
+// archive of three checksumless frames whose table merged the first two decoded
+// to 4113 bytes instead of 8209 AT EXIT 0, with `-t --gds-only` calling the
+// archive clean.  Silent data loss, not a refusal.  A content checksum happens
+// to catch the merged case (the trailer read lands on the wrong frame's hash),
+// which is precisely why the reproduction needs `zstd --no-check`.
+//
+// So walk the frame's block headers.  Each is 3 bytes and names the size of the
+// block that follows, so the walk SKIPS every payload by offset and reads only
+// 3 bytes per block -- it never touches the compressed data itself.  Reaching
+// Last_Block exactly at the claimed extent proves the entry describes one whole
+// frame and nothing more.
+static bool gds_frame_extent_matches(int fd, uint64_t off, uint64_t claimed,
+                                     const unsigned char * head, size_t head_n)
+{
+  if (fd < 0 || !head || head_n < 5 || claimed < 9) return false;
+  const unsigned char fhd = head[4];
+  if (fhd & 0x08u) return false;                 // reserved descriptor bit
+
+  // Frame_Header_Descriptor decides which optional fields follow it: the
+  // Window_Descriptor is absent in a single-segment frame, and the
+  // Frame_Content_Size field is the one place where a code of 0 does not mean
+  // "no field" -- it means one byte, but only when single-segment is set.
+  uint64_t pos = 5;                              // magic + descriptor
+  if (!(fhd & 0x20u)) ++pos;                     // Window_Descriptor
+  static const unsigned char did_len[4] = {0, 1, 2, 4};
+  pos += did_len[fhd & 3u];                      // Dictionary_ID
+  const unsigned fcs_code = fhd >> 6;
+  pos += fcs_code == 0 ? ((fhd & 0x20u) ? 1u : 0u)
+                       : ((uint64_t)1 << fcs_code);
+  if (pos > head_n || pos > claimed) return false;
+
+  auto pread3 = [&](uint64_t at, unsigned char (&bh)[3]) -> bool {
+    size_t have = 0;
+    while (have < sizeof bh) {
+      const ssize_t r = ::pread(fd, bh + have, sizeof bh - have,
+                                (off_t)(off + at + have));
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) return false;
+      have += (size_t)r;
+    }
+    return true;
+  };
+
+  for (;;) {
+    if (pos > claimed || claimed - pos < 3) return false;
+    unsigned char b[3];
+    if (!pread3(pos, b)) return false;
+    const uint32_t bh = (uint32_t)b[0] | ((uint32_t)b[1] << 8)
+                      | ((uint32_t)b[2] << 16);
+    const unsigned type  = (bh >> 1) & 3u;       // 0 raw, 1 RLE, 2 compressed
+    const uint64_t bsize = bh >> 3;
+    if (type == 3u || bsize > 128u * 1024u) return false;   // 3 is reserved
+    const uint64_t stored = type == 1u ? 1u : bsize;        // RLE stores 1 byte
+    pos += 3;
+    if (stored > claimed - pos) return false;
+    pos += stored;
+    if (bh & 1u) break;                          // Last_Block
+  }
+  if (fhd & 0x04u) {                             // Content_Checksum_flag
+    if (claimed - pos < 4) return false;
+    pos += 4;
+  }
+  return pos == claimed;
+}
+
 static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m,
                                          const Options & opt,
                                          size_t * max_frame_decomp_out)
@@ -28030,17 +28559,46 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     // XXH64(content) truncated to 32 bits, little-endian.  The GPU worker
     // normally reads these off the host copy of the frame, which this path
     // does not have -- so they travel on the Task instead.
-    unsigned char hdr[9], tr[4];
-    if (::pread(fd, hdr, sizeof hdr, (off_t)off) != (ssize_t)sizeof hdr)
-      return GDS_VERIFY_DEMOTE;
+    unsigned char hdr[18], tr[4];               // 18 = ZSTD_FRAMEHEADERSIZE_MAX
+    size_t hwant = sizeof hdr;
+    if (csz < (uint64_t)hwant) hwant = (size_t)csz;
+    const ssize_t hgot = ::pread(fd, hdr, hwant, (off_t)off);
+    if (hgot < 9) return GDS_VERIFY_DEMOTE;
     if (hdr[0] != 0x28 || hdr[1] != 0xB5 || hdr[2] != 0x2F || hdr[3] != 0xFD)
       return GDS_VERIFY_DEMOTE;                     // table disagrees with the file
+    // CHECK THE SIZE THE TABLE CLAIMS, NOT ONLY THE BOUNDARY.  `dsz` becomes
+    // t.decomp_size, which sizes the device buffer and places the frame in the
+    // output, so a table with honest boundaries and dishonest sizes misplaces
+    // every frame after the first bad one -- and the boundary check above cannot
+    // see it, because every frame really does start where the table says.
+    // MEASURED: such a table surfaced as "content-checksum mismatch at frame 0",
+    // blaming the GPU for a frame that decoded perfectly.  The frame header
+    // declares the very size the table is asserting, so hold the two against
+    // each other; a frame that declares nothing cannot be checked and is not
+    // taken on trust either.
+    {
+      const unsigned long long fcs = ZSTD_getFrameContentSize(hdr, (size_t)hgot);
+      if (fcs == ZSTD_CONTENTSIZE_ERROR || fcs == ZSTD_CONTENTSIZE_UNKNOWN ||
+          fcs != dsz)
+        return GDS_VERIFY_DEMOTE;
+    }
+    // The header proves where this frame BEGINS and what it decodes to; it
+    // cannot prove where it ENDS.  An entry that swallows the next frame keeps
+    // every check above happy and silently drops that frame's bytes.
+    if (!gds_frame_extent_matches(fd, off, csz, hdr, (size_t)hgot))
+      return GDS_VERIFY_DEMOTE;
     if (hdr[4] & 0x04) {
       if (::pread(fd, tr, sizeof tr, (off_t)(off + csz - 4)) != (ssize_t)sizeof tr)
         return GDS_VERIFY_DEMOTE;
       t.stg_has_ck    = 1;
       t.stg_expect_ck = (unsigned int)tr[0] | ((unsigned int)tr[1] << 8)
                       | ((unsigned int)tr[2] << 16) | ((unsigned int)tr[3] << 24);
+    } else if (!st.checksums.empty() && k < st.checksums.size()) {
+      // The frame carries no checksum, so take the seek table's.  A staged Task
+      // has no host bytes for the device verifier to read a trailer from, which
+      // is exactly why these travel on the Task itself.
+      t.stg_has_ck    = 1;
+      t.stg_expect_ck = (unsigned int)st.checksums[k];
     }
 
     if (t.decomp_size > max_frame_decomp) max_frame_decomp = t.decomp_size;
@@ -28079,6 +28637,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
 
 static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  TableCkScope tck_scope(in);   // seek-table checksums for THIS input
   // NO INPUT INHERITS THE PREVIOUS ONE'S STAGED-READ STATE.  This is the call
   // that actually closes the hole: it runs first, so it does not matter how the
   // previous file's run ended -- cleanly, by demotion, or by a fault that
@@ -28371,14 +28930,80 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         decline = "this archive has no usable seek table, so the frame boundaries "
                   "cannot be proven 4 KiB-aligned without reading all of it";
       } else {
+        // THE SEEK TABLE IS A CLAIM, NOT EVIDENCE.  Every decision below is made
+        // from this table, and a table is metadata the archive carries: it can
+        // disagree with the frames it describes -- through damage or forgery --
+        // and still parse cleanly, because parsing only checks that the prefix
+        // sums are self-consistent and that the stream starts with zstd magic.
+        //
+        // ARMING PEER-TO-PEER OUTPUT ON AN UNVERIFIED CLAIM REJECTED VALID
+        // ARCHIVES.  The workers freeze the output topology when they start,
+        // which is before the staged producer reads its first frame header, so
+        // the producer's own "table disagrees with the file" demote lands too
+        // late to change it.  MEASURED, on three archives `--cpu-only` decodes
+        // byte-identically -- a shifted boundary died at the alignment guard
+        // ("frame 2 starts at offset 5097"); a false decompressed size died as a
+        // "content-checksum mismatch", which blames the GPU for a bad table; and
+        // with no content checksum to catch it, as "the GPU path failed".  None
+        // corrupted output silently, but all three refused a good archive.
+        //
+        // So check the claim before trusting it.  The frame header carries both
+        // facts the table asserts -- that a frame begins here, and how much it
+        // decodes to -- so a table that survives this cannot misplace output.
+        // At 18 bytes a frame that is ~150 KB on the 65 GiB archive this was
+        // measured against, against the 65 GiB a boundary walk would read.
         const size_t nfr = pst.u_off.size() - 1;
-        for (size_t k = 0; k + 1 < nfr; ++k) {          // every frame but the last
+        const int pfd = ::fileno(in);
+        if (pfd < 0)
+          decline = "this archive has no seekable descriptor to check its seek "
+                    "table against";
+        for (size_t k = 0; !decline && k < nfr; ++k) {
           const uint64_t dz = pst.u_off[k + 1] - pst.u_off[k];
-          if (dz % 4096ull != 0) {
+          // Every frame but the last must be a whole number of 4 KiB blocks.
+          if (k + 1 < nfr && dz % 4096ull != 0) {
             std::snprintf(db, sizeof(db),
               "this archive's frame %zu is %llu bytes, not a multiple of 4 KiB, "
               "so frame %zu would not start on a block boundary",
               k, (unsigned long long)dz, k + 1);
+            decline = db;
+            break;
+          }
+          unsigned char fh[18];               // ZSTD_FRAMEHEADERSIZE_MAX
+          const uint64_t cz = pst.c_off[k + 1] - pst.c_off[k];
+          size_t want = sizeof fh;
+          if (cz < (uint64_t)want) want = (size_t)cz;
+          const ssize_t got = ::pread(pfd, fh, want, (off_t)pst.c_off[k]);
+          if (got < 5 || fh[0] != 0x28 || fh[1] != 0xB5 ||
+              fh[2] != 0x2F || fh[3] != 0xFD) {
+            std::snprintf(db, sizeof(db),
+              "this archive's seek table puts frame %zu at offset %llu, where "
+              "there is no zstd frame, so it does not describe this file",
+              k, (unsigned long long)pst.c_off[k]);
+            decline = db;
+            break;
+          }
+          const unsigned long long fcs =
+            ZSTD_getFrameContentSize(fh, (size_t)got);
+          if (fcs == ZSTD_CONTENTSIZE_ERROR || fcs == ZSTD_CONTENTSIZE_UNKNOWN) {
+            std::snprintf(db, sizeof(db),
+              "this archive's frame %zu does not declare its decompressed size, "
+              "so the seek table's claim about it cannot be checked", k);
+            decline = db;
+            break;
+          }
+          if (fcs != dz) {
+            std::snprintf(db, sizeof(db),
+              "this archive's seek table claims frame %zu decodes to %llu bytes "
+              "but the frame declares %llu, so the table would misplace output",
+              k, (unsigned long long)dz, fcs);
+            decline = db;
+            break;
+          }
+          if (!gds_frame_extent_matches(pfd, pst.c_off[k], cz, fh, (size_t)got)) {
+            std::snprintf(db, sizeof(db),
+              "this archive's seek table gives frame %zu a compressed extent "
+              "that does not end at that frame's real boundary, so the table "
+              "does not account for every frame in the file", k);
             decline = db;
             break;
           }
@@ -28516,8 +29141,25 @@ gds_out_declined:
   // is fixed by the archive and the budget already bounds the mapping.
   if (g_gds_read_active.load(std::memory_order_relaxed)
       && !opt.gpu_batch_user_set) {
-    const size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
-    const size_t fit = std::max<size_t>(1, GDS_VERIFY_REGISTER_BUDGET / frame_cap);
+    // THE ARCHIVE'S FRAMES, NOT OURS.  opt.chunk_mib is the size gzstd would
+    // WRITE; a foreign archive's frames can be larger, and the slabs are sized
+    // from the largest frame in the batch.  Deriving the batch from chunk_mib
+    // therefore registered more than the budget allows -- 64 MiB frames against
+    // a 16 MiB assumption is four times the intended mapping, which is the whole
+    // quantity the cap exists to bound.
+    size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+    {
+      const uint64_t mx = g_input_max_frame.load(std::memory_order_relaxed);
+      if (mx > (uint64_t)frame_cap) frame_cap = (size_t)mx;
+    }
+    // Same division as the -t site: the budget covers the process, but every
+    // device and stream registers its own slab.  --gds-only pins to one device
+    // by default, so this is usually a no-op -- and it is exactly the case where
+    // it is NOT that the cap would otherwise be silently multiplied.
+    const size_t share = gds_register_budget()
+                       / std::max<size_t>(1, (size_t)opt.gpu_devices)
+                       / std::max<size_t>(1, (size_t)opt.gpu_streams);
+    const size_t fit = std::max<size_t>(1, share / frame_cap);
     shared_tune_decomp.batch_size.store((int)std::min<size_t>(fit, HARD_BATCH_CAP));
     shared_tune_decomp.locked.store(true);
   }
@@ -28774,7 +29416,8 @@ gds_out_declined:
          "  A single frame of unknown size cannot be split across workers; "
          "the CPU decoder\n  guarantees a complete, correct output — this is "
          "for data safety, just slower.\n");
-    decompress_from_buffer(raw_data, out, opt, m);
+    decompress_from_buffer(raw_data, out, opt, m,
+                           m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
     return;
   }
 
@@ -28997,7 +29640,8 @@ gds_out_declined:
          "content-size header (zstd streaming output); the parallel reader "
          "can't split it, so the remaining data is decompressed with the CPU "
          "streaming decoder (slower, but nothing is lost).\n");
-    decompress_from_buffer(raw_data, out, opt, m);
+    decompress_from_buffer(raw_data, out, opt, m,
+                           m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
   }
 
   // CLEAR ON THE WAY OUT TOO, not only on the way in.  Every GPU worker and any

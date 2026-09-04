@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.29  
+**Covers:** v0.9.50 → v0.17.30  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,6 +8,179 @@
 ---
 
 
+## v0.17.30 — the seek table is a claim, and the preflight believed it
+
+Seventh review pass, and the finding is in v0.17.29's own fix. That pass made the `--gds-only`
+output preflight check **every** frame instead of only frame 0 — but it checked them against the
+seek table, and never asked whether the table describes the file it is attached to.
+
+A table is metadata the archive carries. It parses cleanly as long as its prefix sums are
+self-consistent and the stream starts with zstd magic; nothing forces it to agree with the frames.
+So the preflight armed peer-to-peer output on an unverified claim, the workers froze the output
+topology when they started — **before** the staged producer read its first frame header — and the
+producer's own "table disagrees with the file" demote arrived far too late to change anything.
+
+Three forged tables, each on an archive `--cpu-only` decodes byte-identically:
+
+| the table lies about | what the user got |
+|---|---|
+| frame boundaries (shifted one byte) | exit 4, `frame 2 starts at offset 5097` |
+| decompressed sizes, frames checksummed | exit 4, `content-checksum mismatch at frame 0` |
+| decompressed sizes, no content checksum | exit 2, `the GPU path failed` |
+
+Nothing was silently corrupted — the checksum and nvCOMP's own size check caught the payload — but
+all three refused a perfectly good archive, and the middle one blamed the GPU for a frame that had
+decoded correctly.
+
+### And a fourth, found by the review round that checked this fix
+
+Verifying where a frame *starts* and what it *decodes to* still leaves the **compressed extent**
+unverified. A table entry can begin at honest frame magic, declare the size that frame really
+decodes to, and still span **two** concatenated frames — the prefix sums keep tiling the file, so
+nothing notices that a frame has left the table.
+
+This one did not fail loudly. Three checksumless frames whose table merged the first two:
+
+| | exit | output |
+|---|---|---|
+| `--cpu-only` | 0 | 8209 bytes, correct |
+| `--gds-only -d` | 0 | **4113 bytes — a whole frame silently gone** |
+| `-t --gds-only` | 0 | reports the archive clean |
+
+Silent data loss at exit 0, and `-t` vouching for it. A content checksum happens to catch the
+merged case — the trailer read lands on the wrong frame's hash — which is exactly why reproducing
+it needs `zstd --no-check`.
+
+`gds_frame_extent_matches()` now walks the frame's block headers at both trust sites. Each block
+header is 3 bytes and names the size of the block after it, so the walk **skips every payload by
+offset** and never reads compressed data; reaching `Last_Block` exactly at the claimed extent
+proves the entry describes one whole frame and nothing more.
+
+*Cost, measured on the 65 GiB archive:* `-t` 22.34 → 23.38 s, `-d` 60.10 → 67.25 s. The `-d`
+figure is doubled because the walk runs in the preflight and again in the producer. User CPU is
+essentially unchanged (6.55 → 6.73 s), so what `--gds-only` is actually for — spending a fraction
+of a core instead of fifteen — is untouched.
+
+### A fifth: the table's own checksums were parsed and thrown away
+
+The zstd-seekable format lets a table carry a per-frame content checksum. The parser read the
+`Checksum_Flag` **only to size the entry stride** and skipped the checksum itself.
+
+For an archive whose frames were written without their own checksum — `zstd --no-check` — that
+table entry is the *only* byte-integrity evidence in the file. One flipped payload byte:
+
+| backend | `-d` | `-t` |
+|---|---|---|
+| `--cpu-only` | exit 0, **wrong bytes** | exit 0, clean |
+| `--gpu-only` | exit 0, **wrong bytes** | exit 0, clean |
+| `--gds-only` | exit 0, **wrong bytes** | exit 0, clean |
+
+Not a GDS defect at all — every backend, and latent in every released version. The checksums are
+now kept and used wherever a frame carries none of its own: the CPU worker hashes the decoded
+bytes, the GPU worker's device verifier is handed the table's value, and the staged producer puts
+it on the Task. Only that case, deliberately — a frame with its own checksum was already verified
+by zstd, and re-checking it against possibly-stale table metadata would fail sound archives to
+close a gap they do not have. The map is keyed by **decompressed offset**, not sequence number,
+because three different producers build these tasks and each numbers frames as it likes.
+
+### The checksum fix missed every streaming decoder
+
+The map was consulted only where a whole frame was decoded at once. Three routes decode a frame
+in pieces instead — a frame with no declared content size, a single frame between 64 and 256 MiB,
+and the unknown-size fallback tail — and all three sailed past it. Reproduced: a 3 MB frame piped
+through `zstd --no-check` (so it declares no size and routes to the streaming decoder), one payload
+byte flipped, **exit 0 and wrong bytes**, with the table's checksum sitting unused.
+
+All three now roll the hash as the bytes go past and settle it at the frame boundary.
+`decompress_from_buffer` also takes the output offset it starts at, since it is the *tail* route
+for an archive whose leading frames another decoder already wrote, and the map is keyed by offset.
+A base that is wrong simply misses the map and leaves those frames unverified — the behaviour
+before any of this existed — rather than turning into a false mismatch on a sound archive.
+
+### Three defects a second machine found that this one structurally cannot
+
+A 2× RTX 2080 Ti box — 256 MiB BAR1, no resizable BAR — reports `Bar1-map n=7 ok=0 err=7` and
+`Ops Read=0`. `--gds-only` has **never** been peer-to-peer there, at any batch size.
+
+- **Registration success is not routing evidence.** The preflight probed `cuFileBufRegister` and
+  it returns success in compat mode too, so the flag was accepted on a host where it can never do
+  what it asks — run completes, exit 0, not one byte peer-to-peer. The preflight now issues a real
+  `cuFileRead` and requires the nvidia-fs BAR1 counter to **move**. That counter is not proof in
+  the positive direction (a neighbour's traffic moves it too) but it is reliable in the negative
+  one, which is the direction used. It fails open on anything unknown — no readable counter, no
+  seekable input — because none of those are evidence of compat mode.
+- **A registration failure was reported as an allocation failure.** At any batch ≥ 16 that card
+  printed `failed to allocate device buffers` with 10.8 GiB of VRAM free. BAR1 is the PCIe
+  aperture, not VRAM, and the message sent diagnosis in the wrong direction. The two failures are
+  now distinguished and the message names the aperture and points at `--direct-stage`.
+- **A comment claimed a retry the code does not do.** It said an oversized batch "already retries
+  at smaller sizes", so a 256 MiB-BAR1 card would "still run". It does not retry: the device is
+  marked dead and the run demotes. At defaults that card does **zero GPU work** and exits 0.
+
+*Deliberately not built: a BAR1-fitting batch autotuner.* On that card the hand-picked batch that
+did proceed was still in compat mode — `ok=0`, `Ops Read=0` — so sizing the batch to fit the
+aperture buys no peer-to-peer transfer at all. It would only suppress the demote and leave every
+byte bouncing with no warning: a quiet lie in place of a loud failure, on precisely the hosts that
+motivate it. `--direct-stage` is the portable path and needs none of GDS's gates.
+
+`GZSTD_DEBUG_GDS_FORCE_COMPAT` forces the compat verdict, because a gate that has never been seen
+to fire is not known to be a gate and the host that fires it is not the host this was written on.
+
+### The batch was sized from our chunk size, not the archive's frames
+
+`opt.chunk_mib` is the size gzstd would *write*; a foreign archive's frames can be larger, and the
+slabs are allocated from the largest frame in the batch. Deriving the batch from `chunk_mib`
+therefore registered up to four times the intended mapping on a 64 MiB-frame archive — the whole
+quantity the cap exists to bound. The real maximum now comes from the seek table.
+
+### The budget was applied per stream, per device
+
+It bounded *each* registration rather than the process, so `--gpu-streams 2` quietly doubled the
+footprint the cap promised. It is now divided across everything that registers concurrently. The
+256 MiB floor is gone as well: a floor is a promise to exceed the policy on exactly the host that
+can least afford it, and the batch bottoms out at one frame on its own. An unreadable
+`/proc/meminfo` no longer falls back to the 4 GiB ceiling — that would restore the default on
+precisely the hosts whose memory could not be read.
+
+### The registration budget is derived from the host now, not assumed
+
+`GDS_VERIFY_REGISTER_BUDGET` was a hard 4 GiB, and host RSS tracks registered bytes at about 4.2×.
+`-d` registers **two** slabs — the NVMe→VRAM read target and the VRAM→NVMe write source, opposite
+ends of one pipeline, so they are necessarily live together — which is why its peak is double
+`-t`'s. Measured at the ceiling: **16.2 GiB for `-t`, 32.3 GiB for `-d`**, on any host, because the
+code never consulted memory at all. The advice to "pass `--gpu-batch` on a smaller machine" is not
+a memory policy; it is a footgun with documentation.
+
+The budget is now `min(4 GiB, MemAvailable / 17)`, the divisor chosen from the linear fit so peak
+RSS lands near half of what the host actually has free. The ceiling still wins on a large machine —
+this server derives 85 GiB and clamps, leaving `-t` at 23.19 s against a 23.38 s baseline — and an
+explicit `--gpu-batch` still overrides everything. Forcing the cap down confirms the fit from a
+second direction:
+
+| budget | wall | user | peak RSS |
+|---|---|---|---|
+| 4 GiB (ceiling) | 23.19 s | 6.40 s | 16.2 GiB |
+| 1 GiB | 33.64 s | 18.49 s | 4.2 GiB |
+| 512 MiB | 47.94 s | 33.52 s | 2.2 GiB |
+
+That cost is why the ceiling stays where it is: a smaller budget means more per-batch
+synchronisation, and CUDA's default sync spin-waits. `GZSTD_DEBUG_GDS_BUDGET_MIB` forces a value,
+which is the only way the reduced-budget path gets exercised on a machine that never triggers it.
+
+**Both** paths now hold the table against the file before trusting it. The frame header declares the
+two things the table asserts — that a frame begins here, and how much it decodes to — so the output
+preflight and the staged read producer each check magic and `ZSTD_getFrameContentSize` per frame,
+and a frame that declares nothing is not taken on trust either. A table that survives cannot
+misplace output.
+
+*Divergence from the proposed patch:* it offered an authoritative frame walk before arming output.
+That reads the whole stream — the same 65 GiB objection that shaped v0.17.29 — to guard a case that
+is nearly always damage or forgery. Verifying the claim costs **18 bytes per frame**, about 150 KB
+on that same archive, and closes the hole just as completely. The honest path is unchanged: a real
+archive still arms staged read and peer-to-peer output with no decline, and archives compressed
+from a pipe keep the fast path, since gzstd declares each frame's size regardless of its source.
+
+The suite cell is mutation-proven against a pre-fix binary, which fails both forgery shapes.
 ## v0.17.29 — the preflight proved one frame and trusted the rest, and a registration outlived its buffer
 
 Sixth review pass. Five findings, two of them serious, and one of them a defect that v0.17.27's own
@@ -70,11 +243,27 @@ every writer stores the identical value. Agreeing on the value does not make con
 unsynchronised writes defined. It only executes on the mismatch path, so `atomicExch` costs nothing
 on a healthy run. Corruption detection and the absence of false positives were both re-verified.
 
+### Three regression cells, ported by whether they can actually fail
+
+The review's suggested cells assert against its own implementation's message strings, so they were
+adapted rather than copied — and one was demoted on the evidence:
+
+- **`--gds-only -d demotes on misaligned frame starts`** — a genuine regression test for the
+  preflight defect above. Mutation-proven: the pre-fix binary exits 4 with no output on this valid
+  archive and names `frame 2 starts at offset 5097`; the fixed one exits 0 byte-identical.
+- **`--gds-only -d accepts an archive of only empty frames`** — kept, but named for the shape it
+  guards rather than as a regression test for the zero-size slot floor. The review expected this
+  cell to prove that fix reproduced; **it does not on this hardware**, because `cudaMalloc(size 0)`
+  succeeds here and a build without the floor passes identically (verified). That fix stays in the
+  same category as the stride padding: right by argument, not demonstrated.
+- **`--gds-only read report does not claim alignment proves routing`** — fails if the vacuous
+  "N aligned, 0 unaligned" wording ever returns to the staged-read report.
+
 ### Release status
 
-Not tagged. Suites pass (419/419 GPU, 335 + 72 CPU-only), but those are the **default** runs, and
-the project's pre-tag set additionally wants the `-e` extensive suite with GDS cells engaged, the
-large round trips, and second-machine checks. `--gds-only` has still only ever run on one host.
+Not tagged. Extensive suite 553/553 with no GPU or GDS cells skipped, CPU-only 335 + 72 skipped.
+Still outstanding before a tag: the large round trips re-run against this preflight change, and
+second-machine checks — `--gds-only` has only ever run on one host.
 
 ---
 

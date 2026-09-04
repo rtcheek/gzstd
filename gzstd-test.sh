@@ -1178,6 +1178,159 @@ GVPY
   fi
   rm -f "$gv_z" "$gv_e" "$gv_bad"
 
+  # v0.17.29: the --gds-only OUTPUT preflight must prove EVERY frame start, not
+  # infer the archive from frame 0.  Frame k begins at the sum of the
+  # decompressed sizes before it, so 4096/1001/17 byte frames start at 0, 4096
+  # and 5097.  The old first-frame-only gate engaged peer-to-peer output, wrote a
+  # prefix, and then killed the run at frame 2 -- a VALID ARCHIVE rejected after
+  # partial output.  A correct build demotes before touching the output.
+  #
+  # THIS CELL DISCRIMINATES: the pre-fix binary dies here with
+  # "needs 4 KiB-aligned frame boundaries ... frame 2".
+  ga_z="$TMPDIR/gds-align.zst"; ga_want="$TMPDIR/gds-align.want"
+  ga_out="$TMPDIR/gds-align.out"; ga_err="$TMPDIR/gds-align.err"
+  head -c 4096 /dev/urandom > "$TMPDIR/ga_a"
+  head -c 1001 /dev/urandom > "$TMPDIR/ga_b"
+  head -c 17   /dev/urandom > "$TMPDIR/ga_c"
+  for part in ga_a ga_b ga_c; do
+    "$GZSTD" --cpu-only -q -k -f "$TMPDIR/$part" -o "$TMPDIR/$part.zst" 2>/dev/null
+  done
+  cat "$TMPDIR/ga_a.zst" "$TMPDIR/ga_b.zst" "$TMPDIR/ga_c.zst" > "$ga_z"
+  cat "$TMPDIR/ga_a"     "$TMPDIR/ga_b"     "$TMPDIR/ga_c"     > "$ga_want"
+  run_test "$GZSTD" -q -f -d --gds-only "$ga_z" -o "$ga_out" 2>"$ga_err"
+  if [[ $LAST_RC -ne 0 ]]; then
+    fail "--gds-only -d misaligned frame starts" \
+         "exit $LAST_RC on a valid archive ($(grep -oiE 'frame [0-9]+ starts at offset [0-9]+' "$ga_err" | head -1))"
+  elif files_match "$ga_want" "$ga_out"; then
+    pass "--gds-only -d demotes on misaligned frame starts, output intact"
+  else
+    fail "--gds-only -d misaligned frame starts" "output differs from the source"
+  fi
+  rm -f "$ga_z" "$ga_want" "$ga_out" "$ga_err" "$TMPDIR"/ga_[abc] "$TMPDIR"/ga_[abc].zst
+
+  # v0.17.30: THE SEEK TABLE IS A CLAIM, NOT EVIDENCE, and the output preflight
+  # used to trust it.  A table can be syntactically valid -- self-consistent
+  # prefix sums, correct stream magic -- and still lie about where frames start
+  # or how much they decode to.  The preflight armed peer-to-peer output on that
+  # claim, and the workers froze the output topology BEFORE the staged producer
+  # read its first frame header, so the producer's own "table disagrees with the
+  # file" demote arrived too late to change anything.
+  #
+  # Both shapes below are VALID ARCHIVES that --cpu-only decodes byte-identically;
+  # only the appended table lies.  MEASURED on the pre-fix binary: shifted
+  # boundaries exited 4 at the alignment guard, and honest boundaries with false
+  # decompressed sizes exited 4 as a "content-checksum mismatch" -- blaming the
+  # GPU for a frame that had decoded perfectly.
+  #
+  # THIS CELL DISCRIMINATES: the pre-fix binary exits 4 on BOTH shapes.
+  gl_ok=1; gl_why=""
+  head -c 4096 /dev/urandom > "$TMPDIR/gl_a"
+  head -c 1001 /dev/urandom > "$TMPDIR/gl_b"
+  head -c 17   /dev/urandom > "$TMPDIR/gl_c"
+  for part in gl_a gl_b gl_c; do
+    "$GZSTD" --cpu-only -q -k -f "$TMPDIR/$part" -o "$TMPDIR/$part.zst" 2>/dev/null
+    command -v zstd >/dev/null 2>&1 && \
+      zstd -q --no-check -3 -f "$TMPDIR/$part" -o "$TMPDIR/$part.zst.nc" 2>/dev/null
+  done
+  cat "$TMPDIR/gl_a" "$TMPDIR/gl_b" "$TMPDIR/gl_c" > "$TMPDIR/gl.want"
+  # The 'merge' shape is the one that lost data SILENTLY: an entry that swallows
+  # the next frame keeps honest magic and an honest declared size, so the frame
+  # simply vanishes from the table.  Checksumless frames are what make it silent
+  # -- with a content checksum the trailer read lands on the wrong frame's hash
+  # and the run dies loudly instead -- so use stock zstd's --no-check when it is
+  # available, and fall back to gzstd's own (checksummed) frames when it is not.
+  # Both discriminate; only the checksumless one reproduces the silent loss.
+  if command -v zstd >/dev/null 2>&1; then gl_nocheck=1; else gl_nocheck=0; fi
+  for gl_shape in boundary size merge; do
+    python3 - "$TMPDIR" "$gl_shape" "$gl_nocheck" <<'GLPY' 2>/dev/null
+import os, struct, sys
+d, shape = sys.argv[1], sys.argv[2]
+sfx = '.nc' if shape == 'merge' and sys.argv[3] == '1' else ''
+body = b''.join(open(f'{d}/gl_{p}.zst{sfx}', 'rb').read() for p in 'abc')
+cs = [os.path.getsize(f'{d}/gl_{p}.zst{sfx}') for p in 'abc']
+if shape == 'merge':
+    # entries 0 and 1 become ONE: the middle frame leaves the table entirely
+    ent = (struct.pack('<II', cs[0] + cs[1], 4096)
+           + struct.pack('<II', cs[2], 17))
+    nf = 2
+else:
+    if shape == 'boundary':  # frame starts shifted off the real frames
+        cs = [cs[0] + 1, cs[1] - 1, cs[2]]
+    ds = [4096, 4096, 17]    # a lie either way: the middle frame is 1001 bytes
+    ent = b''.join(struct.pack('<II', c, u) for c, u in zip(cs, ds))
+    nf = 3
+pay = ent + struct.pack('<I', nf) + bytes([0]) + struct.pack('<I', 0x8F92EAB1)
+open(f'{d}/gl.zst', 'wb').write(body + struct.pack('<II', 0x184D2A5E, len(pay)) + pay)
+GLPY
+    run_test "$GZSTD" -q -f -d --gds-only "$TMPDIR/gl.zst" -o "$TMPDIR/gl.out" 2>/dev/null
+    if [[ $LAST_RC -ne 0 ]]; then
+      gl_ok=0; gl_why="$gl_shape shape: exit $LAST_RC on a valid archive"
+    elif ! files_match "$TMPDIR/gl.want" "$TMPDIR/gl.out"; then
+      gl_ok=0; gl_why="$gl_shape shape: output differs from the source"
+    fi
+  done
+  if [[ $gl_ok -eq 1 ]]; then
+    pass "--gds-only -d demotes on a seek table that lies"
+  else
+    fail "--gds-only -d lying seek table" "$gl_why"
+  fi
+  rm -f "$TMPDIR"/gl_[abc] "$TMPDIR"/gl_[abc].zst "$TMPDIR"/gl_[abc].zst.nc \
+        "$TMPDIR/gl.zst" "$TMPDIR/gl.out" "$TMPDIR/gl.want"
+
+
+  # v0.17.30: the cuFileBufRegister budget is derived from MemAvailable now, so a
+  # small host does not attempt the 4 GiB registration that costs ~32 GiB of host
+  # RSS under -d.  On a large machine the ceiling always wins and the cap can
+  # never be observed, so force it -- this is the only way the reduced-budget
+  # path is exercised anywhere.
+  gb_z="$TMPDIR/gds-budget.zst"; gb_out="$TMPDIR/gds-budget.out"
+  "$GZSTD" -q -k -f -3 "$TMPDIR/large.bin" -o "$gb_z" 2>/dev/null
+  if [[ -s "$gb_z" ]]; then
+    GZSTD_DEBUG_GDS_BUDGET_MIB=256 run_test "$GZSTD" -q -f -d --gds-only "$gb_z" -o "$gb_out" 2>/dev/null
+    if [[ $LAST_RC -ne 0 ]]; then
+      fail "--gds-only under a forced small register budget" "exit $LAST_RC"
+    elif files_match "$TMPDIR/large.bin" "$gb_out"; then
+      pass "--gds-only decodes correctly under a forced small register budget"
+    else
+      fail "--gds-only under a forced small register budget" "output differs from the source"
+    fi
+  else
+    skip "--gds-only decodes correctly under a forced small register budget" "no fixture"
+  fi
+  rm -f "$gb_z" "$gb_out"
+
+  # An archive of nothing but LEGAL EMPTY frames must round-trip.  Named for what
+  # it checks, NOT as a regression test for the zero-size slot allocation: on this
+  # hardware cudaMalloc(size 0) succeeds, so a build without that floor passes
+  # this too (verified).  It guards the shape, not the fix.
+  ge_z="$TMPDIR/gds-empty.zst"; ge_out="$TMPDIR/gds-empty.out"
+  : > "$TMPDIR/ge_zero"
+  "$GZSTD" --cpu-only -q -k -f "$TMPDIR/ge_zero" -o "$TMPDIR/ge_one.zst" 2>/dev/null
+  cat "$TMPDIR/ge_one.zst" "$TMPDIR/ge_one.zst" "$TMPDIR/ge_one.zst" > "$ge_z"
+  run_test "$GZSTD" -q -f -d --gds-only "$ge_z" -o "$ge_out" 2>/dev/null
+  if [[ $LAST_RC -eq 0 && -f "$ge_out" && ! -s "$ge_out" ]]; then
+    pass "--gds-only -d accepts an archive of only empty frames"
+  else
+    fail "--gds-only -d all-empty archive" "exit $LAST_RC, output $(stat -c%s "$ge_out" 2>/dev/null || echo missing) bytes, want 0"
+  fi
+  rm -f "$ge_z" "$ge_out" "$TMPDIR/ge_zero" "$TMPDIR/ge_one.zst"
+
+  # The staged-read routing report must not go back to claiming the alignment
+  # split is evidence.  On this path a read is issued as a 4 KiB-aligned superset
+  # BY CONSTRUCTION, so "0 unaligned" would print whether cuFile went
+  # peer-to-peer or bounced every transfer through host memory.
+  gr_err="$TMPDIR/gds-report.err"; gr_z="$TMPDIR/gds-report.zst"
+  "$GZSTD" -q -k -f -3 "$TMPDIR/large.bin" -o "$gr_z" 2>/dev/null
+  "$GZSTD" -v -t --gds-only "$gr_z" >/dev/null 2>"$gr_err" || true
+  if [[ ! -s "$gr_err" ]]; then
+    skip "--gds-only read report does not claim alignment proves routing" "no report emitted"
+  elif grep -qE 'aligned transfers, 0 unaligned' "$gr_err"; then
+    fail "--gds-only read report" "reverted to the vacuous 'N aligned, 0 unaligned' wording"
+  else
+    pass "--gds-only read report does not claim alignment proves routing"
+  fi
+  rm -f "$gr_err" "$gr_z"
+
   t0=$(now_ms)
   tar -I "$GZSTD" -cf "$TMPDIR/gpu-tree.tar.zst" -C "$TMPDIR" tree 2>/dev/null || \
     tar -I "$GZSTD --hybrid" -cf "$TMPDIR/gpu-tree.tar.zst" -C "$TMPDIR" tree 2>/dev/null
@@ -1300,6 +1453,113 @@ else
   skip "GPU fault -> CPU-only rebuild (round-trips)" "no GPU"
   skip "GPU fault -> CPU-only rebuild (--tar)" "no GPU"
   skip "GPU fault over a pipe dies loudly" "no GPU"
+fi
+
+# ============================================================
+# 18a. Seek-table content checksums (ALL backends, not just GPU)
+# ============================================================
+section "Seek-table content checksums"
+
+# v0.17.30: a zstd-seekable table may carry a per-frame content checksum, and
+# the parser used to read the Checksum_Flag ONLY to size the entry stride --
+# the checksum itself was skipped.  For an archive whose frames were written
+# WITHOUT their own checksum (`zstd --no-check`) that table entry is the only
+# byte-integrity evidence in the file, so discarding it meant a corrupt payload
+# decoded to WRONG BYTES AT EXIT 0 on cpu-only, gpu-only and gds-only alike,
+# with `-t` reporting the archive clean on all three.
+#
+# THIS CELL DISCRIMINATES: the pre-fix binary exits 0 on the corrupt archive.
+if command -v zstd >/dev/null 2>&1; then
+  tc_ok=1; tc_why=""
+  head -c 4096 /dev/urandom > "$TMPDIR/tc_a"
+  head -c 4096 /dev/urandom > "$TMPDIR/tc_b"
+  head -c 4096 /dev/urandom > "$TMPDIR/tc_c"
+  for part in tc_a tc_b tc_c; do
+    zstd -q -3 -f "$TMPDIR/$part" -o "$TMPDIR/$part.ck" 2>/dev/null           # trailer = XXH64-low32
+    zstd -q --no-check -3 -f "$TMPDIR/$part" -o "$TMPDIR/$part.nc" 2>/dev/null # what we ship
+  done
+  cat "$TMPDIR/tc_a" "$TMPDIR/tc_b" "$TMPDIR/tc_c" > "$TMPDIR/tc.want"
+  python3 - "$TMPDIR" <<'TCPY' 2>/dev/null
+import os, struct, sys
+d = sys.argv[1]
+cks, cs = [], []
+for n in ('tc_a', 'tc_b', 'tc_c'):
+  cks.append(struct.unpack('<I', open(f'{d}/{n}.ck', 'rb').read()[-4:])[0])
+  cs.append(os.path.getsize(f'{d}/{n}.nc'))
+body = b''.join(open(f'{d}/{n}.nc', 'rb').read() for n in ('tc_a', 'tc_b', 'tc_c'))
+ent = b''.join(struct.pack('<III', c, 4096, k) for c, k in zip(cs, cks))
+pay = ent + struct.pack('<I', 3) + bytes([0x80]) + struct.pack('<I', 0x8F92EAB1)
+tbl = struct.pack('<II', 0x184D2A5E, len(pay)) + pay
+open(f'{d}/tc.zst', 'wb').write(body + tbl)
+bad = bytearray(body + tbl)
+bad[cs[0] // 2] ^= 0xFF                      # one payload byte, length preserved
+open(f'{d}/tc-bad.zst', 'wb').write(bytes(bad))
+TCPY
+  if [[ -s "$TMPDIR/tc.zst" && -s "$TMPDIR/tc-bad.zst" ]]; then
+    for tc_mode in --cpu-only --gpu-only --gds-only; do
+      # the sound archive must still decode byte-for-byte
+      run_test "$GZSTD" -q -f -d $tc_mode "$TMPDIR/tc.zst" -o "$TMPDIR/tc.out" 2>/dev/null
+      if [[ $LAST_RC -ne 0 ]] || ! files_match "$TMPDIR/tc.want" "$TMPDIR/tc.out"; then
+        # a machine with no GPU legitimately cannot run the GPU arms
+        [[ $tc_mode == --cpu-only ]] && { tc_ok=0; tc_why="$tc_mode rejected a sound archive"; }
+        continue
+      fi
+      # and the corrupt one must NOT be reported as success
+      run_test "$GZSTD" -q -f -d $tc_mode "$TMPDIR/tc-bad.zst" -o "$TMPDIR/tc.out" 2>/dev/null
+      [[ $LAST_RC -eq 0 ]] && { tc_ok=0; tc_why="$tc_mode exited 0 on a corrupt payload"; }
+      run_test "$GZSTD" -q -t $tc_mode "$TMPDIR/tc-bad.zst" 2>/dev/null
+      [[ $LAST_RC -eq 0 ]] && { tc_ok=0; tc_why="$tc_mode -t called a corrupt archive clean"; }
+    done
+    if [[ $tc_ok -eq 1 ]]; then
+      pass "seek-table checksums verify frames that carry none of their own"
+    else
+      fail "seek-table checksum verification" "$tc_why"
+    fi
+  else
+    skip "seek-table checksums verify frames that carry none of their own" "could not build fixture"
+  fi
+  rm -f "$TMPDIR"/tc_[abc] "$TMPDIR"/tc_[abc].ck "$TMPDIR"/tc_[abc].nc \
+        "$TMPDIR/tc.zst" "$TMPDIR/tc-bad.zst" "$TMPDIR/tc.out" "$TMPDIR/tc.want"
+else
+  skip "seek-table checksums verify frames that carry none of their own" "no stock zstd"
+fi
+
+# v0.17.30: --gds-only used to be ACCEPTED on a host where cuFile can only run in
+# compat mode -- cuFileBufRegister returns success there, so the old probe proved
+# nothing and the run completed at exit 0 having bounced every byte through host
+# memory.  A 2x RTX 2080 Ti box (256 MiB BAR1, no resizable BAR) reports
+# Bar1-map ok=0 and Ops Read=0 for exactly this.  The preflight now issues a real
+# read and requires that counter to move.
+#
+# The refusal cannot be reproduced on a host whose BAR1 works, so the binary
+# carries a switch to force the verdict -- otherwise this gate could never be
+# seen to fire anywhere it is developed.
+if has_gpu 2>/dev/null && "$GZSTD" --help 2>&1 | grep -q -- '--gds-only'; then
+  gc_z="$TMPDIR/gds-compat.zst"
+  "$GZSTD" -q -k -f -3 "$TMPDIR/large.bin" -o "$gc_z" 2>/dev/null
+  if [[ -s "$gc_z" ]]; then
+    gc_err="$TMPDIR/gds-compat.err"
+    GZSTD_DEBUG_GDS_FORCE_COMPAT=1 run_test "$GZSTD" -t --gds-only "$gc_z" 2>"$gc_err"
+    gc_forced=$LAST_RC
+    run_test "$GZSTD" -t --gds-only "$gc_z" 2>/dev/null
+    gc_plain=$LAST_RC
+    if [[ $gc_forced -eq 0 ]]; then
+      fail "--gds-only refuses a compat-mode host" "forced compat still exited 0"
+    elif ! grep -qi 'direct-stage' "$gc_err"; then
+      fail "--gds-only refuses a compat-mode host" "refusal does not point at --direct-stage"
+    elif [[ $gc_plain -ne 0 ]]; then
+      # and it must NOT fire on a host that really can do peer-to-peer
+      fail "--gds-only refuses a compat-mode host" "unforced run also refused (exit $gc_plain)"
+    else
+      pass "--gds-only refuses a compat-mode host and names --direct-stage"
+    fi
+    rm -f "$gc_err"
+  else
+    skip "--gds-only refuses a compat-mode host and names --direct-stage" "no fixture"
+  fi
+  rm -f "$gc_z"
+else
+  skip "--gds-only refuses a compat-mode host and names --direct-stage" "no GPU or no --gds-only"
 fi
 
 # ============================================================
