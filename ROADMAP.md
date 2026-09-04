@@ -183,50 +183,69 @@ correspondingly hard to justify.
    round-trips, and `gzstd -d`, `-d --cpu-only` and stock `zstd -d` all reproduce the source.
    **The cost that host exposed is item 5 below.**
 
-5. **The staged reader serializes read and compute, per batch.** `RdJoin` joins a batch's reads
-   before that batch is launched, so `--direct-stage` pays **read + compute** where the ordinary
-   path pipelines a reader pool ahead of the workers and pays **max(read, compute)**. On a Gen4+
-   host with 8 datacenter GPUs this is invisible — reads are small next to the compute — but on a
-   Gen3 host with one consumer GPU it is **~29% of wall clock** (8.55-8.78 s vs the ordinary
-   reader's 6.33-7.30, non-overlapping). The staged path ran at **1.04 GiB/s against a measured
-   2.0 GB/s O_DIRECT ceiling** with the writer's own verdict reading
-   `upstream-bound ... starved 96.0%`, so the drive is demonstrably not the limit.
-   **This is the same shape of finding as "the drain thread is the per-device serializer" above:**
-   a serializer in the host staging, not in CUDA. Overlapping the reads of batch N+1 with the
-   compute of batch N is the obvious move; the ownership hazard is that the staging slot is reused,
-   so it needs either double-buffered slots or a slot count above the in-flight batch count.
-   Documented in `--help` as of v0.17.31 so the trade is not a surprise.
+5. ~~**The staged reader serializes read and compute, per batch.**~~ **CLOSED 2026-09-04
+   (v0.17.33).** `RdJoin` joins a batch's reads before that batch is launched, so `--direct-stage`
+   paid **read + compute** where the ordinary path pays **max(read, compute)** — ~29% of wall clock
+   on the Gen3 host, and visible here too (1.93 GiB/s of a 4.9 GiB/s drive, stream-wait 32%).
 
-## OPEN DESIGN QUESTION: `--gds-only` refuses where it used to demote
+   **The fix needed no new machinery, and the proposed one would have been wasted work.** This item
+   used to call for double-buffered staging slots. A second `StreamCtx` already IS that double
+   buffer: it owns its own device slab and its own pinned staging slots, and the worker acquires an
+   idle stream, stages into it, launches asynchronously and moves on while the drain thread returns
+   the previous one. The only thing preventing it was a line forcing every staged path to one
+   stream — justified entirely by costs belonging to `--gds-only` (per-stream BAR1 registration) plus
+   a "disk-bound at ~4.9 GiB/s" clause that is the same one-box generalisation corrected twice
+   already. `--direct-stage` now takes the ordinary compress default of two streams.
 
-**v0.17.29-30 changed the contract and the consequences are wider than the flag.** Until v0.17.28 a
-host that could not do peer-to-peer DEMOTED — ordinary reader, right answer, exit 0. It now REFUSES
-with exit 2 and points at `--direct-stage`. The refusal is well-founded: `cuFileBufRegister` returns
-success in compat mode, so the old probe proved nothing, and the preflight now requires the
-nvidia-fs BAR1 counter to actually move. **Silently bouncing every byte through host memory while
-reporting peer-to-peer is the failure mode this whole arc exists to kill** — see
-`project_gds_only_mode`'s two false instruments.
+   Measured, 16 GiB cold, interleaved, ranges non-overlapping: wall **8.79-8.92 -> 7.43-7.48**
+   (16%), which puts it at or below the ordinary reader's 7.56-7.72 instead of behind it, at the
+   cost of some of the CPU win (host CPU 4.89-5.86 -> 7.69-7.84, against the ordinary reader's
+   13.70-13.92). `--gpu-streams 1` restores the old trade.
 
-**But it is a breaking change for a mixed fleet.** A script that ran `--gds-only` everywhere used to
-work everywhere; it now fails hard on any host without the four gates, which per `--direct-stage`'s
-own help is nearly everywhere.
+   **NOT re-measured on the Gen3 host**, which is where the 29% was found. Its VRAM should admit the
+   second stream (the budget is `gpu_mem_fraction / stream_count`, ~4.3 GiB per stream on an 11 GiB
+   card against a ~3 GiB need at batch 64), and bringup auto-decrements if it does not — but that is
+   reasoning, not a measurement.
 
-Three ways to settle it, unresolved:
+## SETTLED: `--gds-only` REFUSES where it used to demote
 
-1. **Keep refusing** (today). Honest and loud; breaks mixed-fleet scripts.
-2. **Demote with a loud warning**, restoring exit 0 but naming compat mode explicitly on every run.
-   Restores the old contract without restoring the old lie — the objection is that a warning in a
-   long log is exactly how the original problem went unnoticed.
-3. **Refuse only when the user did not also pass a fallback**, e.g. an explicit
-   `--gds-only --or-direct-stage` spelling, so the choice is the caller's.
+**Decided 2026-09-04. Option 1 — keep refusing. No further work; this section records why so it
+is not reopened.**
 
-**Knock-on, now settled.** Five cells encoded the old contract and failed on every non-GDS host.
+**What changed.** Until v0.17.28 a host that could not do peer-to-peer DEMOTED — ordinary reader,
+right answer, exit 0. Since v0.17.29-30 it REFUSES with exit 2 and points at `--direct-stage`. The
+refusal is well-founded: `cuFileBufRegister` returns success in compat mode, so the old probe proved
+nothing, and the preflight now requires the nvidia-fs BAR1 counter to actually move. **Silently
+bouncing every byte through host memory while reporting peer-to-peer is the failure mode this whole
+arc exists to kill** — see `project_gds_only_mode`'s two false instruments.
+
+**Why refusing is right.** `--gds-only` is not a default and cannot be reached by accident: the user
+typed it, and what they typed names one specific hardware and software path. A flag whose whole
+meaning is "use peer-to-peer and nothing else" has no honest silent fallback — demoting is doing the
+opposite of what was asked, quietly. When it refuses, the host does not meet the requirements, and
+that is information the caller needs rather than something to paper over. Exit 2 (bad usage) is
+where a request the system cannot satisfy belongs.
+
+**The mixed-fleet objection is answered by the refusal itself.** It names `--direct-stage`, which
+needs none of GPUDirect Storage's four gates and captures the 95% of the win that was never
+peer-to-peer to begin with. A script that wants to run everywhere should use the flag that runs
+everywhere; a script that specifically wants peer-to-peer should fail where it is not available.
+
+**Rejected alternatives**, for the record:
+
+- **Demote with a loud warning.** Restores exit 0 without restoring the old lie, but a warning in a
+  long log is exactly how the original problem went unnoticed for the entire arc. It also puts the
+  decision back where the caller cannot see it.
+- **`--gds-only --or-direct-stage`.** A second spelling for what `--direct-stage` already does,
+  paid for with a permanent flag and a second contract to test.
+
+**Knock-on, settled.** Six cells encoded the old exit-0 contract and failed on every non-GDS host.
 v0.17.31 made the suite probe the host once (`engaged` / `demoted` / `refused` / `nogds`) and skip
-rather than fail; v0.17.32 added a sixth cell to that set and made the expected COUNT host-aware,
-since skips are not counted in `TOTAL_RAN` and a single constant cannot describe every machine. The
-suite now subtracts documented deltas (−5 GDS cells, −81 the whole GPU section) so a drift note
-means a test was added or removed on **any** host — see the table in `RELEASING.md`. If option 2
-above is ever taken, those cells run everywhere and the GDS delta goes to zero.
+rather than fail; v0.17.32 added the sixth and made the expected COUNT host-aware, since skips are
+not counted in `TOTAL_RAN` and a single constant cannot describe every machine. The suite subtracts
+documented deltas (−5 GDS cells, −81 the whole GPU section) so a drift note means a test was added
+or removed on **any** host — see the table in `RELEASING.md`. The `demoted` probe verdict stays: it
+costs nothing, and it keeps the cells meaningful on a host still running a pre-v0.17.29 contract.
 
 ## Known external defect: libcufile segfaults at exit when dlopen'd with stats on
 

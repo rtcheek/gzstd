@@ -1,12 +1,103 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.32  
+**Covers:** v0.9.50 → v0.17.33  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.33 — the second stream is the double buffer, and a probe read that failed was read as silence
+
+### `--direct-stage` stopped serialising read against compute
+
+v0.17.31 documented, as a permanent trade, that this path "costs wall clock on a slower link": a
+batch's staged reads are joined before that batch is launched, so it paid **read + compute** where
+the ordinary reader pipelines a pool ahead of its workers and pays **max(read, compute)**. The
+ROADMAP proposed double-buffering the staging slots to fix it.
+
+**No new machinery was needed. A second StreamCtx already IS that double buffer** — it owns its own
+device slab and its own pinned staging slots — and the only thing preventing one was a line that
+forced every staged path to a single stream. **The justification for that line was never about
+`--direct-stage`.** It cited two costs, both of which belong to `--gds-only`: per-stream BAR1
+registration (~490 ms for a 1 GiB slab), which `--direct-stage` never pays because it makes no
+cuFile call at all, and a third clause — *"this path is disk-bound at ~4.9 GiB/s, so the second
+stream buys no overlap the drive can use"* — which is the same one-box generalisation already
+corrected at the `--gpu-devices` default in v0.17.31 and the commit after it. It is false on both
+measured hosts: 1.93 GiB/s of a 4.9 GiB/s drive here, and 1.04 GiB/s against a measured 2.0 GB/s
+O_DIRECT ceiling on a PCIe Gen3 host whose writer reported `upstream-bound ... starved 96.0%`.
+
+`--gds-only` keeps its single stream, and now for stated reasons: the BAR1 cost is real, and its
+peer-to-peer output packer demotes to the ordinary writer unless the shape is exactly one device and
+one stream.
+
+Measured, 16 GiB cold, one device on every arm, three interleaved runs, flush inside the timed
+region. Every range non-overlapping:
+
+| arm | wall (s) | host CPU (s) |
+|---|---|---|
+| `--direct-stage --gpu-streams 1` (old default) | 8.79-8.92 | 4.89-5.86 |
+| `--direct-stage` (two streams, new default) | **7.43-7.48** | 7.69-7.84 |
+| `--gpu-only` (ordinary reader) | 7.56-7.72 | 13.70-13.92 |
+
+**16% off the wall clock, and the flag now lands at or below the ordinary reader instead of behind
+it** — the "do not expect it to go faster" caveat is gone. The second stream costs some of the CPU
+win (43% below the ordinary reader rather than 62%), which is the trade; `--gpu-streams 1` buys it
+back. Bringup sizes each stream against live free VRAM and auto-decrements the stream count if the
+second will not fit, so a tight card degrades to exactly the old behaviour rather than failing.
+
+Verified beyond wall clock, because byte-identity alone cannot check this path — a failed staged
+read silently rebuilds on the CPU at exit 0: the `[DSTAGE]` instrument reports `256 frames,
+4294967296 bytes`, the whole input, and both `[GPU0/S0]` and `[GPU0/S1]` appear at `-vv`.
+
+### The preflight refused an absent module and ran on a broken one
+
+A kernel move to **6.8.0-139** on the development server — past the 6.8.0-134/-138 nvidia-fs
+regression this project already had on record — produced the exact shape the v0.17.29-32 gate exists
+to kill, through a third door. nvidia-fs was still loaded, so v0.17.32's module check passed. Every
+`cuFileRead` then returned `-1`.
+
+The gate's verdict variable starts at "fine" and is only ever given a real value **when the probe
+read returns its bytes**:
+
+```
+bool moved = true;                              // assume fine unless proven otherwise
+if (pf.open(pfd) && pb.reg(pbuf, PB)) {
+  if (pf.read_dev(pbuf, PB, 0, 0) == (ssize_t)PB) {   // -1 on this host
+```
+
+So the whole check was skipped and `--gds-only` ran: it did all its work through a path that could
+not work, hit the failure on the first real read, discarded the output, rebuilt CPU-only, printed
+the post-hoc *"did not run entirely on the peer-to-peer-eligible path"* warning — **and then wedged,
+requiring a kill after 130 s.** The correct archive it produced was never the problem; running at
+all was.
+
+**"ABSENT is not UNKNOWN" was v0.17.32's lesson, and FAILED is not UNKNOWN either.** A read that
+cannot be issued is not missing evidence, it is the answer. The fail-open rule stays right for what
+it was written for — an unreadable counter, an unseekable input — and a **short** read still fails
+open, because the input may simply be smaller than the 4096-byte probe, which is the accident that
+hid a suite cell in v0.17.32. Only a negative return on a file large enough to have served the read
+is decisive. `GZSTD_DEBUG_GDS_FAIL_PROBE_READ=1` forces the branch so it can be seen to fire on a
+host whose cuFile works.
+
+On the affected host `--gds-only` now exits 2 in under a second with a message naming the
+kernel/nvidia-fs mismatch and pointing at `--direct-stage`, where it previously ran for 130 s and
+hung. This also unhangs the suite's own `--gds-only` host probe.
+
+### Two rationales that described one box
+
+Both comment-only; the behaviour they justify is unchanged and still correct.
+
+- The staged **batch cap of 64** was justified partly by the same "disk-bound at ~4.9 GiB/s" claim.
+  Its real reason survives alone: the device XXH64 kernel's throughput scales at ~0.28 GiB/s per
+  frame, so 64 frames sustain 17.8 GiB/s, past any drive this path has run against. Still a
+  machine-tuned constant, and still the open general-goals item recorded for `--gds-only`.
+- `ROADMAP.md`: the `--gds-only` refuse-vs-demote question is **settled as refuse**. The flag is never reached by accident — the user typed it, and it names one specific
+  hardware and software path, so a silent demote does the opposite of what was asked. Where it
+  refuses, the host does not meet the requirements, and the refusal names `--direct-stage`, which
+  needs none of the four gates. The rejected alternatives are recorded in `ROADMAP.md` so the
+  question is not reopened.
 
 ## v0.17.32 — the refusal only worked on hosts that could already be diagnosed
 

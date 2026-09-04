@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.32";
+static constexpr const char * GZSTD_VERSION = "0.17.33";
 //
 // Architecture overview:
 //
@@ -2784,17 +2784,56 @@ static void gds_preflight_or_die(const Options & opt)
         GdsFile pf;
         GdsBuf   pb;
         bool moved = true;                 // assume fine unless proven otherwise
+        // AND "FAILED" IS NOT "UNKNOWN" EITHER.  The module check above fixed
+        // this exact shape one level up (ABSENT is not UNKNOWN); the same hole
+        // was still here, one level down.  `moved` starts true and is only ever
+        // given a real value when the probe read RETURNS ITS BYTES -- so on a
+        // host where cuFileRead fails outright, the whole gate was skipped and
+        // --gds-only ran.  Observed after a kernel move to 6.8.0-139 with
+        // nvidia-fs still loaded: every cuFileRead returned -1, the preflight
+        // said nothing, the run did all its work through a path that could not
+        // work, discarded it, rebuilt CPU-only, and emitted the post-hoc
+        // "did not run entirely on the peer-to-peer-eligible path" warning at
+        // the end -- the silent-success shape this gate exists to kill, reached
+        // by a third door.  A read that cannot be issued at all is not missing
+        // evidence; it is the answer.
+        bool probe_read_failed = false;
         if (pf.open(pfd) && pb.reg(pbuf, PB)) {
-          if (pf.read_dev(pbuf, PB, 0, 0) == (ssize_t)PB) {
+          ssize_t pr = pf.read_dev(pbuf, PB, 0, 0);
+          // GZSTD_DEBUG_GDS_FAIL_PROBE_READ=1 -- force the probe read to report
+          // the failure this branch exists for, so the refusal can be seen to
+          // fire on a host whose cuFile works.  Without it the branch is
+          // reachable only on a broken driver stack, which is not something a
+          // test can arrange.
+          if (::getenv("GZSTD_DEBUG_GDS_FAIL_PROBE_READ")) pr = -1;
+          if (pr == (ssize_t)PB) {
             unsigned long long b1_after = 0;
             if (gz_nvfs_bar1_read(&b1_after)) moved = (b1_after != b1_before);
             // (GZSTD_DEBUG_GDS_FORCE_COMPAT is handled above, before any host
             // gate, so that it fires on hosts this block never reaches.)
+          } else if (pr < 0) {
+            // A SHORT read is still "unknown" and still fails open: the input
+            // may simply be smaller than the probe, which is the accident that
+            // hid a suite cell in v0.17.32.  Only a NEGATIVE return on a file
+            // that could have served the read is decisive.
+            struct stat pst;
+            if (::fstat(pfd, &pst) == 0 && pst.st_size >= (off_t)PB)
+              probe_read_failed = true;
           }
         }
         pb.dereg();
         pf.close();
         cudaFree(pbuf);
+        if (probe_read_failed) {
+          ::close(pfd);
+          refuse_no_p2p(
+            "the nvidia-fs module is loaded, but cuFile could not read from this\n"
+            "  input at all -- the GPUDirect Storage probe read failed",
+            "  This is usually a kernel/nvidia-fs mismatch: the module loads but its"
+            " pin does\n  not work on the running kernel (this project has seen it"
+            " regress between\n  6.8.0-134 and 6.8.0-138).  Check dmesg and the"
+            " nvidia-fs build against\n  `uname -r`.\n");
+        }
         if (!moved) {
           ::close(pfd);
           refuse_no_p2p(
@@ -3729,17 +3768,30 @@ static void print_help_long()
 "     kernel scales with frame count -- and defaults to one GPU.  Both\n"
 "     are overridable.\n"
 "\n"
-"     COSTS WALL CLOCK ON A SLOWER LINK.  Each batch's staged reads are\n"
-"     joined before that batch is launched, so this path pays\n"
-"     read + compute where the ordinary reader pipelines a reader pool\n"
-"     ahead of the workers and pays max(read, compute).  Measured on a\n"
-"     PCIe Gen3 host with one consumer GPU, 8 GiB cold, three\n"
-"     interleaved runs: wall 8.55-8.78 s against the ordinary reader's\n"
-"     6.33-7.30, about 29% slower, while host CPU fell 12.55-12.69 s ->\n"
-"     4.78-4.92 and peak resident set size (RSS, the process's real\n"
-"     memory) 9.5 GB -> 1.0 GB.  Ranges non-overlapping.  Spend the\n"
-"     wall clock when you want the cores and the memory back; do not\n"
-"     expect it to go faster.\n"
+"     READ AND COMPUTE OVERLAP ACROSS TWO STREAMS.  A batch's staged\n"
+"     reads are joined before that batch is launched, so a single stream\n"
+"     pays read + compute where the ordinary reader pipelines a pool\n"
+"     ahead of its workers and pays max(read, compute).  This path\n"
+"     therefore takes the ordinary compress default of two GPU streams:\n"
+"     each stream owns its own staging slots, so one reads while the\n"
+"     other's kernel runs.  Measured here, 16 GiB cold, three\n"
+"     interleaved runs: wall 8.79-8.92 s at one stream against\n"
+"     7.43-7.48 at two, about 16% faster, and now at or below the\n"
+"     ordinary reader's 7.56-7.72 rather than behind it.  Ranges\n"
+"     non-overlapping.\n"
+"\n"
+"     THE SECOND STREAM COSTS SOME OF THE CPU WIN, and that is the\n"
+"     trade: host CPU over the same runs was 4.89-5.86 s at one stream,\n"
+"     7.69-7.84 at two, against the ordinary reader's 13.70-13.92 --\n"
+"     still about 43% less, where one stream was about 62% less.  Pass\n"
+"     --gpu-streams 1 to buy the cores back and spend the wall clock.\n"
+"     Bringup sizes each stream against free VRAM and drops back to one\n"
+"     if the second will not fit, so a tight card loses nothing.\n"
+"\n"
+"     The earlier PCIe Gen3 measurement of this flag (wall about 29%\n"
+"     behind the ordinary reader, host CPU 12.55-12.69 s -> 4.78-4.92,\n"
+"     peak resident set size 9.5 GB -> 1.0 GB) was taken at one stream\n"
+"     and has NOT been re-run with this default.\n"
 "\n"
 "     Distinct from --direct-read, which is O_DIRECT input for the CPU\n"
 "     path, and from --direct, which is O_DIRECT OUTPUT.\n"
@@ -23577,12 +23629,20 @@ static void gpu_worker(
     // cuFileBufRegister MEASURED ~950 ms for the 4 GiB slab the auto ceiling
     // produces, once per stream, before any work starts.
     //
-    // The auto ceiling exists to give the compressor throughput.  This path
-    // cannot use it: it is disk-bound at ~4.9 GiB/s, well under what one GPU
-    // compresses.  The only other consumer of batch size is the GPU checksum
-    // kernel, whose throughput scales linearly at ~0.28 GiB/s per frame — 64
-    // frames sustain 17.8 GiB/s, already 3.6x the drive.  So a larger slab buys
-    // nothing at all here and costs startup.  An explicit --gpu-batch still wins.
+    // The auto ceiling exists to give the compressor throughput, and the batch
+    // size a staged path needs is set instead by the GPU CHECKSUM KERNEL, whose
+    // throughput scales linearly at ~0.28 GiB/s per frame: 64 frames sustain
+    // 17.8 GiB/s, past any drive this path has been run against, and a larger
+    // slab buys nothing while costing startup.  That reason holds on every host.
+    //
+    // The cap USED TO BE JUSTIFIED as "this path is disk-bound at ~4.9 GiB/s",
+    // which is the same one-box generalisation corrected at the --gpu-devices
+    // and --gpu-streams defaults: the staged path is NOT disk-bound on either
+    // measured host (1.93 GiB/s of a 4.9 GiB/s drive here; 1.04 GiB/s against a
+    // 2.0 GB/s ceiling on a PCIe Gen3 host).  The 64 stands on the checksum
+    // kernel alone.  STILL A MACHINE-TUNED CONSTANT -- 0.28 GiB/s per frame is
+    // this box's number -- and it remains the open [[feedback_code_to_general_goals]]
+    // item already recorded for --gds-only.  An explicit --gpu-batch still wins.
     if (opt.region_staged() && !opt.gpu_batch_user_set)
       per_stream_cap = std::min<size_t>(per_stream_cap, 64);
     double per_stream_frac = std::max(0.05, std::min(0.95, opt.gpu_mem_fraction / double(stream_count)));
@@ -35535,11 +35595,36 @@ static Options parse_args(int argc, char ** argv)
     // the writer fed and gets slower with every extra stream, while compress and
     // verify (-t) overlap their stages and want more than one.  See the two
     // DEFAULT_GPU_*STREAMS constants for the measurements.
-    // --gds-only takes one stream regardless of direction.  Every stream
-    // registers its own input slab into BAR1 (MEASURED ~490 ms for 1 GiB), and
-    // this path is disk-bound at ~4.9 GiB/s, so the second stream buys no
-    // overlap the drive can use and doubles the startup cost.
-    opt.gpu_streams = opt.region_staged() ? 1
+    // --gds-only takes one stream regardless of direction, for two reasons that
+    // are specific to it: every stream registers its own input slab into BAR1
+    // (MEASURED ~490 ms for 1 GiB), and the pure peer-to-peer OUTPUT packer
+    // demotes to the ordinary ordered writer unless the shape is exactly one
+    // device and one stream (its pack buffer is per StreamCtx while its file
+    // offset is global -- see gds_cout_shape_ok).
+    //
+    // --direct-stage USED TO INHERIT THAT and pays neither cost: it makes no
+    // cuFile call, so it registers nothing, and it has no peer-to-peer output
+    // packer to protect.  The third reason the comment here used to give --
+    // "this path is disk-bound at ~4.9 GiB/s, so the second stream buys no
+    // overlap the drive can use" -- is a property of one box, the same
+    // generalisation already corrected for --gpu-devices at the --direct-stage
+    // default below.  It is false on both measured hosts: the staged path runs
+    // at 1.93 GiB/s of a 4.9 GiB/s drive here, and at 1.04 GiB/s against a
+    // measured 2.0 GB/s O_DIRECT ceiling on a PCIe Gen3 host, where the writer
+    // itself reports "upstream-bound ... starved 96.0%".
+    //
+    // ONE STREAM IS WHAT SERIALISES READ AND COMPUTE.  The staged read is a
+    // blocking host pread joined before the batch is launched, and a worker
+    // cannot start the next batch until the drain thread returns an idle
+    // StreamCtx -- so at one stream the path pays read + compute where the
+    // ordinary reader pipelines a pool ahead of the workers and pays
+    // max(read, compute).  A second StreamCtx IS the double buffer the overlap
+    // needs: it owns its own device slab and its own pinned staging slots, so
+    // the worker reads into stream 1 while stream 0's kernel runs.  Bringup
+    // sizes each stream against live free VRAM and auto-decrements the stream
+    // count if the second one will not fit, so this cannot make a tight card
+    // fail -- it degrades back to the old behaviour.
+    opt.gpu_streams = opt.gds_only ? 1
                     : (opt.mode == Mode::DECOMPRESS)
                         ? DEFAULT_GPU_DECOMP_STREAMS : DEFAULT_GPU_STREAMS;
   }
