@@ -1812,7 +1812,17 @@ echo "another intact file" > "$kgtree/z_small.txt"
 kgarc="$TMPDIR/kg.tar.zst"; kgbadarc="$TMPDIR/kg-bad.tar.zst"
 run_test "$GZSTD" --cpu-only -f -o "$kgarc" --tar "$kgtree" 2>/dev/null
 cp "$kgarc" "$kgbadarc"
-printf '\xFF' | dd of="$kgbadarc" bs=1 seek=$(( 20 * 1024 * 1024 )) count=1 conv=notrunc 2>/dev/null
+# FLIP the byte, do not SET it.  This wrote 0xFF unconditionally into a member
+# built from /dev/urandom, so whenever that byte was already 0xFF the "damage"
+# was a no-op: the archive stayed valid, --keep-going exited 0, and the cell
+# failed.  That is 1 run in 256 -- rare enough to look like a real regression
+# and common enough to be seen (it fired once here, and cost a bisect to rule
+# out an unrelated change).  A gate that fails on a coin flip teaches the reader
+# to discount failures, which is the opposite of what it is for.
+kgoff=$(( 20 * 1024 * 1024 ))
+kgorig=$(od -An -tu1 -j "$kgoff" -N1 "$kgbadarc" | tr -d ' ')
+printf "$(printf '\\%03o' $(( kgorig ^ 0xFF )))" \
+  | dd of="$kgbadarc" bs=1 seek="$kgoff" count=1 conv=notrunc 2>/dev/null
 kgxd="$TMPDIR/kg-extract"; rm -rf "$kgxd"; mkdir -p "$kgxd"
 "$GZSTD" -d --tar --keep-going "$kgbadarc" -C "$kgxd" 2>"$TMPDIR/kg3.err"; kg3=$?
 a_ext=$(find "$kgxd" -name a_small.txt -print -quit 2>/dev/null)

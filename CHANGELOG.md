@@ -1,12 +1,82 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.36  
+**Covers:** v0.9.50 → v0.17.37  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.37 — the device ranking was never consulted at the default, and a fixture that damaged nothing 1 run in 256
+
+### gzstd ran on the one busy GPU while seven sat idle
+
+Reported from observation on a shared 8-GPU host. The ranking was not choosing badly — **it was not
+being called.**
+
+```c
+int gpu_devices = 0;            // 0 = auto (all GPUs)
+if (want >= total_devices) { for (int d = 0; d < total_devices; ++d) result.push_back(d); }
+```
+
+Auto means every device, so `select_best_gpus()` takes its trivial early return and
+`gz_rank_devices()` never runs. Confirmed at the command line: the default printed
+`device selection: 0.0 ms` with `8 device workers online` and no rank table at all, while
+`--gpu-devices=4` produced the full ranking and put the occupied card **last of eight**.
+
+The ranking function was right the whole time; nothing reached it.
+
+**What changed is the ORDER, never the count.** All devices are still used at the default, but they
+are now handed to CUDA in ranked order, so the least-contended card becomes CUDA GPU0 and takes the
+first batch — which matters because a run that never fills every device gives its work to whatever
+CUDA happened to list first, typically the same card every other tool on the box also grabs first.
+**Choosing how MANY devices is deliberately still not answered here:** this box's own numbers put the
+optimum at 1, 2, 4 and 4 devices across 1.9 / 8 / 24 / 195 GiB, so it is not a constant and belongs
+to `--adapt`. Ordering needs no such constant.
+
+`--gds-only` and `--direct-stage` were never affected: both force `gpu_devices = 1`, so they always
+took the ranked path.
+
+**The cost is why this had not been done, and it is real.** MEASURED on a 20 MiB input: starting the
+NVML sampler costs ~340 ms and waiting for its first sweep ~100 ms more, against a 44-64 ms run — a
+6-8x regression if paid unconditionally, the same mistake that once doubled the test suite. So the
+ordering runs only where the GPU will actually be engaged, reusing the existing size gate rather than
+inventing a threshold. Where it does run it more than pays for itself: at 4 GiB the ranked path
+measured **8.49-8.55 s against the unranked all-eight default's 9.56-10.07 s, 11-15% faster** despite
+the sampler.
+
+**Placement was found by testing, not by reading.** The first attempt put this at the end of
+`apply_backend_defaults()`, where it silently never ran: that function returns early for any explicit
+`--cpu-only` / `--gpu-only` / `--hybrid`, and again for auto compress, so its tail is nearly
+unreachable. It now sits in `main()` immediately after that call, where the backend and the device
+count are both final and no CUDA call has happened yet. Verified: small inputs unchanged (50-68 ms),
+`--cpu-only` never starts the sampler (51-57 ms).
+
+**A limitation worth stating.** Against a BURSTY GPU neighbour, `nvidia-smi` reported 0% utilization
+while a job was demonstrably running — the unreliability of a single utilization read that this
+codebase already documents. The combined rank still separated that card, but through the free-VRAM
+term (81066 vs 81089 MiB), not utilization. Ordering therefore degrades toward VRAM-only against
+bursty clients; a long-running neighbour is caught properly (15% utilization, ranked last of eight).
+
+### A corruption fixture that damaged nothing, 1 run in 256
+
+The `--keep-going --tar` cell wrote `\xFF` at a fixed offset into a member built from `/dev/urandom`.
+**When that byte was already `0xFF` the damage was a no-op**: the archive stayed valid, the run
+exited 0 instead of 6/7, and the cell failed. It fired on an otherwise clean 557-cell run and cost a
+real investigation to rule out the device-selection change above — which it was not, since
+`--keep-going` implies `--cpu-only` and the new block cannot run there.
+
+The diagnosis that settled it: **an uncorrupted archive reproduces the failing signature exactly.**
+When a corruption test's failure is indistinguishable from "no corruption happened", suspect the
+injection before the code under test.
+
+Now XORs with `0xFF` so the byte always changes, verified across `0x00 / 0x7f / 0xff / 0xa3`
+including the pathological `0xff -> 0x00`. A gate that fails on a coin flip teaches the reader to
+discount failures, which is the opposite of what it is for.
+
+Verified: extensive suite **557/557, zero failures, zero skips**; both configurations build and
+round-trip byte-identical.
 
 ## v0.17.36 — the readiness checker claimed more than its instrument could support
 

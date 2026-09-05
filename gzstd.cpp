@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.36";
+static constexpr const char * GZSTD_VERSION = "0.17.37";
 //
 // Architecture overview:
 //
@@ -31668,6 +31668,70 @@ static int gzstd_main(int argc, char ** argv)
   // explicit --cpu-only / --gpu-only / --hybrid.
   apply_backend_defaults(opt);
 
+#ifdef HAVE_NVCOMP
+  // RANK THE DEVICES EVEN WHEN TAKING ALL OF THEM.
+  //
+  // At --gpu-devices=0 (auto = every GPU) the selection block near the top of
+  // this function is skipped, on the stated grounds that "if the run wants every
+  // GPU the box has, ranking them decides nothing."  That is right about the
+  // COUNT and wrong about the ORDER.  CUDA renumbers the visible set from zero
+  // and workers are spawned in that order, so the first device takes the first
+  // batch -- and on a run that never fills every device, it may take all of
+  // them.  Unranked, "first" is whatever CUDA happens to list first, which is
+  // typically the same card every other tool on the box also grabs first.
+  // Observed: gzstd ran on the one card another user was working on while seven
+  // sat idle.
+  //
+  // Choosing HOW MANY devices to use is a different question and is deliberately
+  // not answered here: this box's own numbers say the optimum is not a constant
+  // (best at 1, 2, 4 and 4 devices across 1.9 / 8 / 24 / 195 GiB), so it belongs
+  // to --adapt.  Ordering needs no such constant.
+  //
+  // PLACED HERE, AFTER apply_backend_defaults() RETURNS, ON PURPOSE -- and not
+  // inside it, which was tried first and does not work: that function returns
+  // early for any explicit --cpu-only/--gpu-only/--hybrid (backend_user_set) and
+  // again for auto compress, so its tail is nearly unreachable and the ordering
+  // silently never ran.  Here the backend and the device count are both final,
+  // no CUDA call has happened yet, and a run that will not touch a GPU is
+  // guaranteed not to start the sampler.  That guarantee is the whole design: MEASURED on a
+  // 20 MB input, starting the sampler costs ~340 ms and waiting for its first
+  // sweep ~100 ms more, against a 44-64 ms run -- a 6-8x regression if it were
+  // paid unconditionally, which is the same mistake that once doubled the test
+  // suite.  On a run large enough to engage the GPU it vanishes into the noise:
+  // at 4 GiB the ranked path measured 8.49-8.55 s against the unranked all-eight
+  // default's 9.56-10.07, i.e. 11-15% FASTER despite paying it.
+  //
+  // --gds-only and --direct-stage already force gpu_devices=1, so they take the
+  // block above and were never affected by this gap.
+  if (opt.gpu_devices == 0 && !opt.cpu_only
+      && !::getenv("CUDA_VISIBLE_DEVICES")) {   // never second-guess the user
+    g_gpu_monitor.start();
+    g_gpu_monitor.wait_ready(500);
+    const auto rows = g_gpu_monitor.snapshot();
+    if (rows.size() > 1) {                      // ordering one device decides nothing
+      std::vector<GzDevRank> rin;
+      rin.reserve(rows.size());
+      for (const auto & r2 : rows) rin.push_back({r2.util, r2.free_bytes});
+      const std::vector<size_t> order = gz_rank_devices(rin);
+      std::string sel;
+      for (size_t i = 0; i < order.size(); ++i) {
+        if (!sel.empty()) sel += ",";
+        sel += rows[order[i]].uuid;             // "GPU-<uuid>": no index needed
+      }
+      if (!sel.empty()) {
+        ::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1);
+        if (opt.verbosity >= V_VERBOSE) {
+          std::ostringstream os;
+          os << "[GPU] all " << rows.size() << " devices kept, ordered by combined "
+                "rank (utilization + free VRAM); the least-contended card is CUDA "
+                "GPU0 and takes the first batch\n";
+          vlog(V_VERBOSE, opt, os.str());
+        }
+      }
+    }
+  }
+#endif
+
   // Early startup banner at -v+.  Printed BEFORE any heavy init (CUDA
   // device probe, file open, output preallocate) so users get immediate
   // feedback that gzstd is alive — important on loaded servers where
@@ -34797,6 +34861,7 @@ static void apply_backend_defaults(Options & opt)
       }
     }
   }
+
 #else
   (void)opt;
 #endif
