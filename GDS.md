@@ -32,9 +32,21 @@ idle box it measures as very nearly nothing.
 ./gzstd-gds-check.sh --path /mnt/nvme
 ```
 
-`--path` should be the filesystem you will actually read from. The script runs as an ordinary user,
-changes nothing, and either prints `READY` or tells you exactly which requirement failed and what to
-do about it.
+`--path` should be the filesystem you will actually read from. The script runs as an ordinary user
+and changes nothing. Its verdicts are deliberately graded, because the evidence available on this
+platform is:
+
+| verdict | exit | meaning |
+|---|---|---|
+| `NOT READY` | 1 | **decisive** — the counter did not move, the run degraded, or the read failed |
+| `LIKELY READY` | 0 | the read worked, the counter moved, and no competing GDS activity was observed during the idle sample |
+| `INCONCLUSIVE` | 3 | the BAR1 evidence was unavailable or could not be attributed to this run |
+| usage error | 2 | bad arguments |
+
+**There is no plain `READY`.** Attribution would need a per-process routing signal, which cuFile
+cannot currently provide here (see below), so claiming it would be exactly the over-reach this tool
+exists to catch. `NOT READY` is the only verdict that is certain — which is fine, because that is the
+one you act on.
 
 ## The four requirements
 
@@ -111,8 +123,21 @@ reach for is unreliable.**
 | gzstd's aligned-transfer count | counts *eligibility*, not routing |
 | `properties.use_compat_mode` | echoes configuration, not behaviour |
 
-**The one reliable signal is the kernel module's own BAR1 map counter, and you must watch it MOVE
-across a real read:**
+**The best available signal is the kernel module's own BAR1 map counter — but it is only half
+reliable, and it matters which half.** The counter is SYSTEM-WIDE:
+
+- **it did not move → decisive.** Nothing was routed peer-to-peer. gzstd's own preflight refuses on
+  exactly this, and only this.
+- **it moved → consistent, not conclusive.** Another GDS client on the same host moves the same
+  counter, so movement is only attributable to you if nothing else was using GDS at the time.
+- **it could not be read → inconclusive.** Missing evidence does not establish compat-mode routing.
+
+There is no per-process alternative available: cuFile's own routing counters would settle it, but
+their teardown crashes when the library is `dlopen`'d, which is how gzstd must load it.
+`gzstd-gds-check.sh` handles this by sampling the counter while idle first and reporting an
+unattributable result rather than a false positive.
+
+Watch it across a real read:
 
 ```bash
 grep Bar1-map /proc/driver/nvidia-fs/stats     # note ok=N
@@ -120,9 +145,11 @@ gzstd --gds-only BIGFILE -o /tmp/out.zst
 grep Bar1-map /proc/driver/nvidia-fs/stats     # ok must have INCREASED
 ```
 
-`ok=0 err=N` means every map failed and nothing went peer-to-peer. gzstd performs this same check
-itself before running and refuses if the counter does not move, so in practice a successful
-`--gds-only` run is already the proof — `gzstd-gds-check.sh` just makes it explicit.
+`ok=0 err=N` means every map failed and nothing went peer-to-peer — that reading is definite. gzstd
+performs this same negative check itself before running and refuses when the counter does not move,
+so a `--gds-only` run that completes has at least cleared that bar. Treat it as strong evidence
+rather than proof, for the reason above, and use `gzstd-gds-check.sh` when you want the idle-sample
+caveat applied for you.
 
 ## Tuning notes
 

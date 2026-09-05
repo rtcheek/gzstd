@@ -1,12 +1,83 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.35  
+**Covers:** v0.9.50 → v0.17.36  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.36 — the readiness checker claimed more than its instrument could support
+
+An independent review of v0.17.33-35 returned five findings, all of which survived verification
+against the tree. Four were mechanical. The fifth was the same defect this whole release series is
+about, committed by the tool built to detect it.
+
+### The blocker: a system-wide counter used as per-process proof
+
+`gzstd-gds-check.sh` ended with a real `--gds-only` read and treated **any** increase in the
+nvidia-fs BAR1 map counter as proof that *its* transfer went peer-to-peer. That counter is box-wide.
+The source already said so, in the very function v0.17.33 modified:
+
+> The counter is not proof in the positive direction -- a neighbour's GDS traffic moves it too --
+> but it is reliable in the NEGATIVE one.
+
+`--help` already called it *"eligibility/activity, not definitive per-read routing"*, and gzstd's own
+preflight only ever uses it negatively, to refuse. The checker and `GDS.md` both used it positively,
+contradicting the program they document. **The instrument was fine; the label on it was not** — which
+is precisely the failure mode v0.17.29-34 exist to close, arriving through the one door nobody was
+watching: the diagnostic tool itself.
+
+**The first fix was wrong too, and the review caught that as well.** Sampling the counter while idle
+and reporting an unattributable result is useful corroboration, but the branch that printed "cannot
+be attributed" then fell through to `exit 0`, so the verdict line still said `READY`. A fix that
+contradicts itself in the same file is worse than the original, because it reads as considered.
+
+**The verdicts are now graded to the evidence that actually exists:**
+
+| verdict | exit | meaning |
+|---|---|---|
+| `NOT READY` | 1 | **decisive** — no counter movement, a degraded run, or a failed read |
+| `LIKELY READY` | 0 | the read worked, the counter moved, no competing activity during the idle sample |
+| `INCONCLUSIVE` | 3 | the evidence was unavailable, or moved while another GDS client was active |
+
+**There is deliberately no plain `READY`.** Attribution needs a per-process routing signal, and
+cuFile's own counters cannot supply one here — their teardown crashes when the library is `dlopen`'d,
+which is how gzstd must load it. Claiming `READY` would be the same over-reach. `NOT READY` remains
+the only certain verdict, which is acceptable because it is the one a user acts on.
+
+`INCONCLUSIVE` was mutation-tested against a **real** competing GDS client — a background loop of
+`--gds-only` runs, not a stub — and returns exit 3; the same build returns `LIKELY READY` on an idle
+host.
+
+### The other four
+
+- **The checker could clobber files in a shared `--path`.** It created a `mktemp` file and then used
+  predictable `$tmp.zst` / `$tmp.err` beside it, either of which another user could pre-empt with a
+  symlink; the stderr redirect would truncate the target and `-f` would overwrite it. It now works
+  inside a mode-0700 directory, validated for ownership, mode and emptiness *after* `chdir`, using
+  fixed names relative to that pinned cwd, and never deletes recursively.
+- **An exit-0 CPU rebuild could be reported as success.** A GDS failure mid-run discards the output
+  and rebuilds CPU-only at exit 0, and the counter may have moved during the failed attempt. The
+  checker now rejects degradation and rebuild diagnostics before it considers the counter at all.
+- **A positive but short probe read was accepted.** The v0.17.33 preflight refused only on a negative
+  return. Since the real staged path requires every `cuFileRead` to return its complete frame, any
+  non-exact result on a file large enough to serve the probe is decisive, and now refuses.
+- **A bare `--path` or `--gzstd` looped forever.** `shift 2` fails when the value is missing, and
+  without `set -e` the loop never terminated. Reproduced directly, then fixed.
+
+### And the review's own patch had to be run, not just read
+
+The hardening above left a `.gdscheck.XXXXXX` directory behind in the user's `--path` on every
+successful run: its cleanup removed the three files it created, but **libcufile writes a `cufile.log`
+into the working directory whenever it initialises**, so `rmdir` failed. Replaced with a depth-1
+non-directory sweep, which stays as non-recursive as the named form while catching files neither side
+enumerated. Only running it surfaced this.
+
+Verified: the extensive suite passes **557/557 with zero failures and zero skips** — the documented
+baseline, and the first run in which the `--gds-only` cells execute rather than skip, since GDS only
+became functional on the development host earlier the same day. Both build configurations compile.
 
 ## v0.17.35 — the setup knowledge for --gds-only existed only in one person's head
 

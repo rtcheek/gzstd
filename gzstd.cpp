@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.35";
+static constexpr const char * GZSTD_VERSION = "0.17.36";
 //
 // Architecture overview:
 //
@@ -2769,9 +2769,11 @@ static void gds_preflight_or_die(const Options & opt)
   // but it is reliable in the NEGATIVE one, which is the direction being used
   // here: if it did not move for our own read, this host is in compat mode.
   //
-  // FAIL OPEN on anything unknown.  No readable counter, no seekable input, a
-  // read that could not be issued -- none of those are evidence of compat mode,
-  // and refusing to run on them would be a worse failure than the quiet bounce.
+  // FAIL OPEN on anything unknown.  No readable counter or no seekable input is
+  // not evidence of compat mode, and refusing to run on either would be a worse
+  // failure than the quiet bounce.  Once an exact probe read is attempted on a
+  // file large enough to serve it, however, any non-exact result is decisive:
+  // the real staged path requires the same exact-count contract.
   // One refusal, several reasons.  Every path that concludes "peer-to-peer is
   // impossible here" must say so the same way, and must keep naming
   // --direct-stage -- that pointer is the only actionable part for the user.
@@ -2843,11 +2845,11 @@ static void gds_preflight_or_die(const Options & opt)
             if (gz_nvfs_bar1_read(&b1_after)) moved = (b1_after != b1_before);
             // (GZSTD_DEBUG_GDS_FORCE_COMPAT is handled above, before any host
             // gate, so that it fires on hosts this block never reaches.)
-          } else if (pr < 0) {
-            // A SHORT read is still "unknown" and still fails open: the input
-            // may simply be smaller than the probe, which is the accident that
-            // hid a suite cell in v0.17.32.  Only a NEGATIVE return on a file
-            // that could have served the read is decisive.
+          } else {
+            // A short read is unknown only when the input itself is shorter
+            // than the probe.  If the file can serve PB bytes, ANY non-exact
+            // result is decisive: the real staged path also requires every
+            // cuFileRead to return its complete frame and aborts otherwise.
             struct stat pst;
             if (::fstat(pfd, &pst) == 0 && pst.st_size >= (off_t)PB)
               probe_read_failed = true;
@@ -2859,8 +2861,8 @@ static void gds_preflight_or_die(const Options & opt)
         if (probe_read_failed) {
           ::close(pfd);
           refuse_no_p2p(
-            "the nvidia-fs module is loaded, but cuFile could not read from this\n"
-            "  input at all -- the GPUDirect Storage probe read failed",
+            "the nvidia-fs module is loaded, but cuFile could not complete a read\n"
+            "  from this input -- the GPUDirect Storage probe read failed",
             "  This is usually a kernel/nvidia-fs mismatch: the module loads but its"
             " pin does\n  not work on the running kernel (this project has seen it"
             " regress between\n  6.8.0-134 and 6.8.0-138).  Check dmesg and the"
@@ -3772,10 +3774,12 @@ static void print_help_long()
 "     transfer silently bounces, on any kernel that enforces VMA flags\n"
 "     during page pinning.  To test a host, run\n"
 "       ./gzstd-gds-check.sh --path DIR\n"
-"     It checks each requirement, then settles the question with a real\n"
-"     read — the only thing that can, since registration success and\n"
-"     throughput both look identical in compat mode — and names what to\n"
-"     fix.  It runs as an ordinary user and changes nothing.\n"
+"     It checks each requirement, then exercises a real read, because\n"
+"     registration success and throughput look identical in compat mode.\n"
+"     A BAR1 counter that does not move is decisive; one that does is\n"
+"     only yours if no other GDS client is running, so the script samples\n"
+"     for that first and says so rather than claiming a false positive.\n"
+"     It runs as an ordinary user and changes nothing.\n"
 "\n"
 "  --direct-stage                                        [EXPERIMENTAL]\n"
 "     THE PORTABLE 95% OF --gds-only, ON ANY HOST WITH A GPU.  Read each\n"

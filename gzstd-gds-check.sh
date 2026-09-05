@@ -16,9 +16,24 @@
 #     update can leave it loading cleanly while every BAR1 map fails.
 #   * An aligned-transfer count does NOT prove routing; it counts
 #     eligibility.
-# So the authority here is a REAL READ: run one, and require the kernel
-# module's own BAR1 map counter to MOVE.  Every other check below exists
-# only to explain WHY that read failed.
+# So the authority here is a REAL READ: run one and watch the kernel
+# module's own BAR1 map counter.  Every other check below exists only to
+# explain WHY that read failed.
+#
+# AND THE COUNTER ITSELF IS ONLY HALF-RELIABLE, which this script must not
+# overstate.  It is SYSTEM-WIDE, so:
+#   * it did NOT move  -> DECISIVE.  Nothing was routed peer-to-peer.
+#   * it DID move      -> CONSISTENT with peer-to-peer, but not exclusive:
+#     another GDS client on this host moves the same counter.
+#   * it cannot be read -> INCONCLUSIVE.  Missing evidence is not evidence of
+#     compat-mode routing.
+# gzstd's own preflight uses it in the negative direction only, for exactly
+# this reason.  So before trusting a positive, this script samples the
+# counter while idle; if it is already moving on its own, somebody else is
+# using GDS and the result is reported as unattributable rather than as
+# proof.  A per-process routing signal would settle it outright, but
+# cuFile's own per-process counters are unusable here (their teardown
+# crashes when the library is dlopen'd).
 #
 # Usage: ./gzstd-gds-check.sh [options]
 #   --path DIR      directory to test on -- use the filesystem you will
@@ -26,9 +41,19 @@
 #   --gzstd PATH    gzstd binary (default: $GZSTD_BIN, ./build/gzstd, then PATH)
 #   -h, --help      this help
 #
-# Exit: 0 = ready (a real peer-to-peer read was observed)
-#       1 = not ready (every reason is printed, with what to do)
+# Exit: 0 = LIKELY READY  (the read worked, the counter moved, and nothing
+#                          else was seen using GDS -- strong evidence, and the
+#                          most this host can support without a per-process
+#                          routing signal)
+#       1 = NOT READY     (decisive: no counter movement, a degraded run, or a
+#                          failed read)
 #       2 = usage error
+#       3 = INCONCLUSIVE  (the BAR1 evidence was unavailable or could not be
+#                          attributed to this run)
+#
+# There is deliberately no plain "READY".  Attribution needs a per-process
+# signal this platform does not currently provide, so claiming it would be the
+# same over-reach this script exists to catch.
 #
 # Runs entirely as an ordinary user.  It writes one temporary file under
 # --path and removes it.  Nothing is installed, loaded or changed.
@@ -40,8 +65,12 @@ GZ="${GZSTD_BIN:-}"
 TESTDIR="."
 while [ $# -gt 0 ]; do
   case "$1" in
-    --path)  TESTDIR="${2:-}"; shift 2 ;;
-    --gzstd) GZ="${2:-}"; shift 2 ;;
+    --path)
+      [ $# -ge 2 ] || { echo "gzstd-gds-check.sh: missing value for --path" >&2; exit 2; }
+      TESTDIR="$2"; shift 2 ;;
+    --gzstd)
+      [ $# -ge 2 ] || { echo "gzstd-gds-check.sh: missing value for --gzstd" >&2; exit 2; }
+      GZ="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "gzstd-gds-check.sh: unknown option '$1' (try --help)" >&2; exit 2 ;;
@@ -53,9 +82,10 @@ if [ -z "$GZ" ]; then
   else GZ="$(command -v gzstd 2>/dev/null || true)"; fi
 fi
 
-fail=0; warn=0
+fail=0; diag_fail=0; warn=0; inconclusive=0
 ok()   { printf '  \033[32mOK\033[0m    %s\n' "$*"; }
 no()   { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=1; }
+diag_no() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; diag_fail=1; }
 note() { printf '  \033[33mWARN\033[0m  %s\n' "$*"; warn=1; }
 info() { printf '        %s\n' "$*"; }
 hdr()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -69,10 +99,16 @@ if [ -z "$GZ" ] || ! [ -x "$GZ" ]; then
   echo; echo "Cannot continue without gzstd."; exit 1
 fi
 ok "$GZ ($("$GZ" --version 2>/dev/null | head -1))"
+# The functional check runs from a private directory below.  Preserve the
+# caller-relative binary spelling by making it absolute before changing cwd.
+case "$GZ" in
+  /*) GZ_RUN="$GZ" ;;
+  *)  GZ_RUN="$(pwd -P)/$GZ" ;;
+esac
 if "$GZ" -V 2>&1 | grep -qi nvcomp; then
   ok "built with nvCOMP (GPU support compiled in)"
 else
-  no "this binary is CPU-only (built with USE_NVCOMP=OFF) -- --gds-only cannot work"
+  diag_no "this binary is CPU-only (built with USE_NVCOMP=OFF) -- --gds-only cannot work"
   info "Rebuild with -DUSE_NVCOMP=ON, or use a GPU build."
 fi
 
@@ -90,7 +126,7 @@ else
     if [ "$b1" -ge "$mem" ] 2>/dev/null; then
       ok "GPU$idx$name: BAR1 ${b1} MiB >= VRAM ${mem} MiB"
     else
-      no "GPU$idx$name: BAR1 ${b1} MiB < VRAM ${mem} MiB -- cannot do peer-to-peer"
+      diag_no "GPU$idx$name: BAR1 ${b1} MiB < VRAM ${mem} MiB -- cannot do peer-to-peer"
       bar_bad=1
     fi
   done < <(nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null)
@@ -110,12 +146,12 @@ if [ -r /sys/module/nvidia_fs/version ]; then
   ok "loaded, version $NVFS_VER"
 elif modinfo nvidia_fs >/dev/null 2>&1; then
   NVFS_VER="$(modinfo nvidia_fs 2>/dev/null | awk '/^version:/{print $2}')"
-  no "built (version ${NVFS_VER:-unknown}) but NOT LOADED"
+  diag_no "built (version ${NVFS_VER:-unknown}) but NOT LOADED"
   info "Load it with: sudo modprobe nvidia-fs"
   info "If it does not load at boot, your vendor's package may omit"
   info "/etc/modules-load.d/nvidia-fs.conf -- NVIDIA's own package ships it."
 else
-  no "not installed"
+  diag_no "not installed"
   info "Install nvidia-fs-dkms (NVIDIA's CUDA repo has it), then: sudo modprobe nvidia-fs"
 fi
 
@@ -140,7 +176,7 @@ fi
 if [ -r /proc/driver/nvidia-fs/stats ]; then
   ok "/proc/driver/nvidia-fs/stats readable (counters available)"
 else
-  no "/proc/driver/nvidia-fs/stats not readable -- cannot verify routing"
+  diag_no "/proc/driver/nvidia-fs/stats not readable -- cannot verify routing"
   info "Without this counter nothing can prove transfers are peer-to-peer."
 fi
 
@@ -149,19 +185,19 @@ hdr "3. cuFile userspace"
 if ldconfig -p 2>/dev/null | grep -q 'libcufile\.so'; then
   ok "libcufile present: $(ldconfig -p 2>/dev/null | grep -m1 'libcufile\.so' | awk '{print $NF}')"
 else
-  no "libcufile not found -- install gds-tools / libcufile"
+  diag_no "libcufile not found -- install gds-tools / libcufile"
 fi
 
 # ------------------------------------------------ gate 4: filesystem + O_DIRECT
 hdr "4. filesystem at --path ($TESTDIR)"
 if ! [ -d "$TESTDIR" ] || ! [ -w "$TESTDIR" ]; then
-  no "$TESTDIR is not a writable directory"
+  diag_no "$TESTDIR is not a writable directory"
 else
   fstype="$(stat -f -c %T "$TESTDIR" 2>/dev/null || echo unknown)"
   case "$fstype" in
     ext2/ext3|ext4|xfs) ok "filesystem type: $fstype (cuFile-supported)" ;;
     tmpfs|overlayfs|nfs|fuseblk|zfs|btrfs)
-        no "filesystem type: $fstype -- cuFile will not do peer-to-peer here"
+        diag_no "filesystem type: $fstype -- cuFile will not do peer-to-peer here"
         info "Test against a local ext4/xfs mount on the NVMe you will actually read from." ;;
     *)  note "filesystem type: $fstype (unrecognised; the functional test decides)" ;;
   esac
@@ -180,45 +216,142 @@ finally:
     if p: os.unlink(p)
 PY
     then ok "O_DIRECT accepted here"
-    else no "O_DIRECT refused on this filesystem -- cuFile cannot use it"; fi
+    else diag_no "O_DIRECT refused on this filesystem -- cuFile cannot use it"; fi
   fi
 fi
 
 # ------------------------------------------------------- THE FUNCTIONAL TEST
 hdr "5. THE AUTHORITY: does a real read actually go peer-to-peer?"
-if [ "$fail" = 1 ]; then
-  info "Skipped -- a gate above already rules it out.  Fix those first."
-else
-  b1_before="$(awk '/Bar1-map/{for(i=1;i<=NF;i++) if($i ~ /^ok=/){sub(/ok=/,"",$i); print $i; exit}}' \
-               /proc/driver/nvidia-fs/stats 2>/dev/null)"
-  tmp="$(mktemp "${TESTDIR%/}/.gdscheck.XXXXXX" 2>/dev/null)"
-  if [ -z "$tmp" ]; then
-    no "cannot create a temporary file in $TESTDIR"
-  else
-    # Big enough that the read is real; small enough to be polite on a busy box.
-    head -c 67108864 /dev/urandom > "$tmp" 2>/dev/null
-    out="$tmp.zst"; err="$tmp.err"
-    "$GZ" -f --gds-only "$tmp" -o "$out" >/dev/null 2>"$err"; rc=$?
-    b1_after="$(awk '/Bar1-map/{for(i=1;i<=NF;i++) if($i ~ /^ok=/){sub(/ok=/,"",$i); print $i; exit}}' \
-                /proc/driver/nvidia-fs/stats 2>/dev/null)"
-    if [ "$rc" -eq 0 ] && [ -n "${b1_before:-}" ] && [ -n "${b1_after:-}" ] \
-       && [ "$b1_after" -gt "$b1_before" ] 2>/dev/null; then
-      ok "a real read went peer-to-peer (BAR1 maps $b1_before -> $b1_after)"
-    elif [ "$rc" -eq 0 ]; then
-      no "gzstd ran, but the BAR1 map counter did not move ($b1_before -> $b1_after)"
-      info "Transfers are bouncing through host memory -- this is the silent fallback."
-    else
-      no "gzstd --gds-only refused or failed (exit $rc)"
-      sed -n '1,6p' "$err" | sed 's/^/        /'
-    fi
-    rm -f "$tmp" "$out" "$err"
+bar1_ok() { awk '/Bar1-map/{for(i=1;i<=NF;i++) if($i ~ /^ok=/){sub(/ok=/,"",$i); print $i; exit}}' \
+              /proc/driver/nvidia-fs/stats 2>/dev/null; }
+# IS ANYONE ELSE USING GDS RIGHT NOW?  The counter is system-wide, so sample
+# it while we are not reading.  This cannot prove exclusivity during the later
+# read, but any movement here is enough to disqualify attribution.
+gds_busy=0; gds_idle_known=0
+b1_idle="$(bar1_ok)"; sleep 2; b1_idle2="$(bar1_ok)"
+if [ -n "${b1_idle:-}" ] && [ -n "${b1_idle2:-}" ]; then
+  gds_idle_known=1
+  if [ "$b1_idle2" != "$b1_idle" ]; then
+    gds_busy=1
+    note "another process is doing GDS on this host (BAR1 moved $b1_idle -> $b1_idle2 while idle)"
   fi
+else
+  note "the BAR1 counter was not readable throughout the idle sample"
+fi
+b1_before="$(bar1_ok)"
+work="$(mktemp -d "${TESTDIR%/}/.gdscheck.XXXXXX" 2>/dev/null)"
+if [ -z "$work" ]; then
+  no "cannot create a temporary directory in $TESTDIR"
+else
+    # Work relative to a cwd that pins this mode-0700 directory.  A writer in
+    # the parent can rename the directory, but cannot substitute a symlink for
+    # input/output/stderr underneath our held cwd and make -f or redirection
+    # overwrite some unrelated target.
+    (
+      cd -- "$work" || exit 1
+      # Close the mkdir->chdir exchange window: if another uid replaced the
+      # name before cd, it cannot make the replacement both ours, mode 0700,
+      # and empty.  Once these checks pass, that uid cannot modify this cwd.
+      dir_meta="$(stat -Lc '%u:%a' . 2>/dev/null)"
+      first_entry="!unreadable!"
+      find_ok=0
+      if first_entry="$(find . -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
+        find_ok=1
+      fi
+      if [ "$dir_meta" != "$(id -u):700" ] || [ "$find_ok" != 1 ] \
+         || [ -n "$first_entry" ]; then
+        no "temporary work directory was replaced or is not private: $work"
+        exit 1
+      fi
+      # Sweep every plain file, not just the three we create: libcufile drops a
+      # cufile.log into the working directory whenever it initialises, which
+      # left the whole temp dir behind on a successful run.  Depth-1 and
+      # non-directory only, so this stays as non-recursive as the named form.
+      trap 'find . -mindepth 1 -maxdepth 1 ! -type d -delete 2>/dev/null' EXIT
+      trap 'exit 1' HUP INT TERM
+      # Big enough that the read is real; small enough to be polite on a busy box.
+      probe_bytes=""
+      if head -c 67108864 /dev/urandom > input 2>/dev/null; then
+        probe_bytes="$(wc -c < input 2>/dev/null)"
+      fi
+      if [ "$probe_bytes" != 67108864 ]; then
+        no "cannot write the 64 MiB probe input in $TESTDIR"
+        exit 1
+      fi
+      "$GZ_RUN" -f --gds-only input -o output >/dev/null 2>stderr; rc=$?
+      b1_after="$(awk '/Bar1-map/{for(i=1;i<=NF;i++) if($i ~ /^ok=/){sub(/ok=/,"",$i); print $i; exit}}' \
+                  /proc/driver/nvidia-fs/stats 2>/dev/null)"
+      if [ "$rc" -eq 0 ] \
+         && grep -qiE 'cuFileBufRegister failed|rebuilding CPU-only|[1-9][0-9]* unaligned/bounced transfers|[1-9][0-9]* members cuFile would not take' stderr; then
+        no "gzstd exited 0 only after the requested GDS path degraded or was rebuilt"
+        sed -n '1,6p' stderr | sed 's/^/        /'
+      elif [ "$rc" -eq 0 ] \
+         && { [ -z "${b1_before:-}" ] || [ -z "${b1_after:-}" ]; }; then
+        note "gzstd's read worked, but the BAR1 map counter was not readable"
+        info "Routing cannot be verified without before-and-after counter values."
+        exit 3
+      elif [ "$rc" -eq 0 ] && grep -qi 'Bar1-map never moved' stderr \
+         && [ "$b1_after" -ne "$b1_before" ] 2>/dev/null; then
+        note "gzstd's own sampling saw no BAR1 movement; the outer counter moved"
+        info "but that movement cannot be attributed to this read."
+        exit 3
+      elif [ "$rc" -eq 0 ] && [ -n "${b1_before:-}" ] && [ -n "${b1_after:-}" ] \
+         && [ "$b1_after" -gt "$b1_before" ] 2>/dev/null; then
+        if [ "$gds_busy" = 1 ]; then
+          # Somebody else was moving this counter before we started, so the
+          # movement below is not ours to claim.  Say so instead of counting it.
+          note "BAR1 maps moved $b1_before -> $b1_after, but another GDS client on"
+          info "this host is also moving that counter, so this run cannot be"
+          info "attributed.  Re-run when the host is otherwise idle for a stronger"
+          info "signal.  Nothing here indicates a fault."
+          exit 3
+        elif [ "$gds_idle_known" = 0 ]; then
+          note "BAR1 maps moved $b1_before -> $b1_after, but competing activity"
+          info "could not be checked because the idle sample was unavailable."
+          exit 3
+        else
+          ok "a real read moved the BAR1 map counter ($b1_before -> $b1_after)"
+          info "No competing GDS activity was observed during the idle sample."
+          info "That is strong evidence, not per-process attribution."
+        fi
+        exit 0
+      elif [ "$rc" -eq 0 ] && [ "$b1_after" -eq "$b1_before" ] 2>/dev/null; then
+        no "gzstd ran, but the BAR1 map counter did not move ($b1_before -> $b1_after)"
+        info "Transfers are bouncing through host memory -- this is the silent fallback."
+      elif [ "$rc" -eq 0 ]; then
+        note "gzstd's read worked, but the BAR1 counter changed unexpectedly"
+        info "($b1_before -> $b1_after); routing cannot be determined."
+        exit 3
+      else
+        no "gzstd --gds-only refused or failed (exit $rc)"
+        sed -n '1,6p' stderr | sed 's/^/        /'
+      fi
+      exit 1
+    ); sub_rc=$?
+    case "$sub_rc" in
+      0) ;;
+      3) inconclusive=1 ;;
+      *) fail=1 ;;
+    esac
+    # Never recurse here: if the parent-directory name was exchanged, rmdir can
+    # remove at most a substituted empty directory, not data.
+  rmdir -- "$work" 2>/dev/null || note "temporary directory could not be removed: $work"
 fi
 
 # ---------------------------------------------------------------- verdict
 hdr "VERDICT"
+if [ "$fail" = 0 ] && [ "$inconclusive" = 1 ]; then
+  printf '  \033[33mINCONCLUSIVE\033[0m — the read worked, but the BAR1 evidence was\n'
+  printf '  unavailable or could not be attributed to this run.\n'
+  info "Nothing here establishes either peer-to-peer routing or a fault."
+  exit 3
+fi
 if [ "$fail" = 0 ]; then
-  printf '  \033[32mREADY\033[0m — --gds-only works on this host.\n'
+  printf '  \033[32mLIKELY READY\033[0m — the read worked, the BAR1 counter moved, and no\n'
+  printf '  competing GDS activity was observed during the idle sample.  That is strong\n'
+  printf '  evidence, not attribution: the counter is system-wide and no per-process\n'
+  printf '  routing signal exists here.\n'
+  [ "$diag_fail" = 1 ] && info "(the functional result overrides one or more static checks above)"
   [ "$warn" = 1 ] && info "(warnings above are worth reading, but nothing blocks you)"
   exit 0
 fi
