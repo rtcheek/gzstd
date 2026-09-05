@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.34";
+static constexpr const char * GZSTD_VERSION = "0.17.35";
 //
 // Architecture overview:
 //
@@ -3765,6 +3765,17 @@ static void print_help_long()
 "     batch to 64 frames — its throughput scales with the frame count,\n"
 "     and a smaller batch would make it, not the drive, the bottleneck.\n"
 "     An explicit --gpu-batch always overrides.\n"
+"\n"
+"     SETUP AND DIAGNOSIS.  GDS.md covers the four requirements, how to\n"
+"     install nvidia-fs, and the version gate that matters most: before\n"
+"     2.26.6 the module builds, loads and reports healthy while EVERY\n"
+"     transfer silently bounces, on any kernel that enforces VMA flags\n"
+"     during page pinning.  To test a host, run\n"
+"       ./gzstd-gds-check.sh --path DIR\n"
+"     It checks each requirement, then settles the question with a real\n"
+"     read — the only thing that can, since registration success and\n"
+"     throughput both look identical in compat mode — and names what to\n"
+"     fix.  It runs as an ordinary user and changes nothing.\n"
 "\n"
 "  --direct-stage                                        [EXPERIMENTAL]\n"
 "     THE PORTABLE 95% OF --gds-only, ON ANY HOST WITH A GPU.  Read each\n"

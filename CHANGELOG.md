@@ -1,12 +1,55 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.34  
+**Covers:** v0.9.50 → v0.17.35  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.35 — the setup knowledge for --gds-only existed only in one person's head
+
+`--gds-only` has always documented its four requirements in `--help`, and always refused with a
+specific cause when one was missing. What it never told anyone was **how to get from "refused" to
+"working"** — and a full day of this project's own time proved that path is not obvious even to
+someone who wrote the flag.
+
+Two additions, plus a pointer to them from the `--gds-only` help:
+
+**`GDS.md`** — the setup guide. It opens by talking most readers out of the feature: of 3.73 host
+CPU-seconds saved against the ordinary reader, **3.55 came from the O_DIRECT read landing in the GPU
+staging buffer and 0.19 from peer-to-peer DMA itself**, and `--direct-stage` is that 95% with none of
+the four requirements. It also states plainly that neither flag buys throughput — both saturate the
+same drive; the win is host CPU handed back to whatever else is running.
+
+Beyond the requirements and installation, it documents three things that are not written down
+anywhere public and each cost real time here:
+
+- **The nvidia-fs version gate.** Before 2.26.6 the module marks its shadow-buffer region `VM_IO`,
+  and the kernel's `check_vma_flags()` returns `-EFAULT` for that, so the buffer cannot be pinned.
+  Older kernels satisfied the pin on a fast path that never consulted VMA flags; current ones do not.
+  **The module builds, loads, reports a healthy version, and fails every single transfer** — the
+  guide carries the exact `dmesg` signature to recognise it by.
+- **Vendor packages that omit `/etc/modules-load.d/nvidia-fs.conf`.** NVIDIA's own package ships it
+  and `depmod` resolves the driver ordering unaided, so this normally needs no thought — but where
+  that file is missing, nothing ever asks for the module and GDS is silently absent after every boot.
+- **A table of five signals that cannot prove peer-to-peer** — registration success, module loaded,
+  throughput, the aligned-transfer count, `use_compat_mode` — against the one that can.
+
+**`gzstd-gds-check.sh`** — a read-only readiness check, running as an ordinary user, changing
+nothing. It walks the requirements (BAR1 versus VRAM per GPU, module presence and version, cuFile,
+filesystem and `O_DIRECT`) and then **settles the question with a real read, requiring the nvidia-fs
+BAR1 map counter to move.** That ordering is the point: every check above the read exists to explain
+a failure, never to certify success, because each one of them can be satisfied on a host where
+nothing is routed peer-to-peer. When gzstd refuses, the script relays gzstd's own message rather than
+maintaining a second opinion about the cause.
+
+Its failure paths were mutation-tested rather than assumed: a tmpfs `--path`, a CPU-only binary and a
+forced compat verdict each produce `NOT READY` naming the right reason, and the healthy host reports
+`READY` with the counter movement quoted.
+
+Documentation and a new script; no behaviour change beyond the added `--help` text.
 
 ## v0.17.34 — the check that guarded --direct-stage's whole claim could pass without looking
 

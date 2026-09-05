@@ -49,26 +49,24 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 557 | 417 | **NO — see below** |
-| GPU, GDS unavailable | 552 | 412 | yes, both machines |
+| GPU + GPUDirect Storage usable (the baseline) | 557 | 417 | **yes, this server** |
+| GPU, GDS unavailable | 552 | 412 | yes, the workstation |
 | no GPU (the CPU-only build) | not yet observed | 336 | yes |
 
-**THE BASELINE ROW IS CURRENTLY UNREACHABLE ON BOTH MACHINES (2026-09-04), AND 557/417 IS
-THEREFORE A NUMBER NOBODY CAN CONFIRM.** The workstation's `nvidia-fs` was removed
-deliberately, and the server moved to kernel 6.8.0-139, where nvidia-fs still loads but the
-shadow-buffer pin returns `-EFAULT` — the decision was to stay there and use `--direct-stage`
-rather than pin the kernel back for a peer-to-peer path worth ~5%. Every real run now lands on
-the **GDS unavailable** row. Two consequences:
+**GDS was unusable on both machines for part of 2026-09-04 and is working again on this server since
+that afternoon.** It broke when the server moved to kernel 6.8.0-139: `nvidia-fs` still loaded, but
+every BAR1 map failed, because nvidia-fs 2.24.3 marks its shadow-buffer VMA `VM_IO` and the kernel's
+`check_vma_flags()` returns `-EFAULT` for that. NVIDIA removed the flag in **nvidia-fs 2.26.6**, and
+installing that (`nvidia-fs-dkms 2.26.6-1`, from NVIDIA's CUDA repo, on the same 570.x driver)
+restored peer-to-peer: `Bar1-map` went from `ok=0 err=517` to `ok=21 err=0`.
 
-- **The baseline stays the number to edit when adding or removing tests.** The deltas are
-  subtracted from it, so keeping it correct is what makes the reachable rows correct. It is
-  bookkeeping now, not an observation.
-- **`--gds-only` has no live coverage anywhere.** Its sections in `tool_pretag_validate.sh`
-  skip (gated on a one-shot host probe mirroring the suite's), and the suite's `--gds-only`
-  cells skip. What still runs everywhere is the *refusal* contract. Treat any change to that
-  code as unverified by test, and re-read it by hand.
+So the baseline row is produced by **this server only**. The workstation's `nvidia-fs` was removed
+deliberately and it cannot do peer-to-peer regardless (256 MiB BAR1), so it lands on the
+GDS-unavailable row and always will. If the GDS cells ever start skipping here again, suspect the
+kernel module before the test: `cat /sys/module/nvidia_fs/version` (2.26.6 or newer) and
+`grep Bar1-map /proc/driver/nvidia-fs/stats` (`ok` must be non-zero after a `--gds-only` run).
 
-The GDS row is the five `--gds-only` cells that assert a successful run; they skip when the
+The GDS row is the five `--gds-only` cells that assert a successful run;The GDS row is the five `--gds-only` cells that assert a successful run; they skip when the
 host cannot do peer-to-peer, which since v0.17.32 includes a host with no `nvidia-fs` module
 at all. The no-GPU row skips the whole GPU section as a group, and the GDS cells live inside
 it, so those two deltas must never both be applied — the script's drift check uses `elif` for
