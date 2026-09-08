@@ -1,12 +1,159 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.39  
+**Covers:** v0.9.50 → v0.17.40  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.40 — a check that read a million times to prove what the GPU already knew
+
+Reported as a hang: `--gds-only -t` on a cold 65 GiB archive showed
+`verified:0.00 B` for ~100 seconds. It was not hung — it completed in 111.57 s —
+but the staged producer builds every Task before pushing any, so the meter
+legitimately reads zero for the whole pre-pass.
+
+### One pread per zstd block, serially, at queue depth 1
+
+`gds_frame_extent_matches` (v0.17.30) walks every block header of every frame to
+prove the seek table's compressed extent ends where a frame really ends. It does
+that with a **3-byte `pread` per block**. Measured mid-run: main thread pinned in
+D state on `folio_wait_bit_common`, **1,712,476 read syscalls for 12.0 MB of
+`rchar`** — 7 bytes a call — pulling **4.2 GiB of the archive through the page
+cache**, on the one flag whose entire claim is that the payload never enters host
+memory. Warm, those same preads hit cache and cost 1.46 s, which is why it only
+ever appeared on a cold archive.
+
+Two things hid it. The `-vv` line reported `nframes * 2` — a formula for the two
+preads the producer itself makes, blind to the walk — so it printed "16686
+metadata preads" for a walk issuing ~1.7 million. And the comment directly above
+the check states the cost model it then broke: *"At 18 bytes a frame ... against
+the 65 GiB a boundary walk would read."* The walk it names as the expensive
+alternative was added immediately below it.
+
+**`project_seek_table_trust`'s own "6% cost" figure was warm-only and wrong by
+5x.** Counting bytes is not counting syscalls.
+
+### Walk only what the device cannot already prove
+
+A frame carrying its own content checksum does not need the walk: the trailer is
+read from the END of the CLAIMED extent, so an entry that swallows the next frame
+reads the wrong frame's hash, and the device-side XXH64 — computed in VRAM over
+bytes already there, at no host I/O — cannot match. The suite's own merge fixture
+has to disable checksums to reproduce silent loss, which is this fact written
+down a year earlier.
+
+Measured against a merged-extent forgery with the walk disabled: **checksummed
+exits 4** (caught); **checksumless exits 0 with a frame silently gone** (so those
+are still walked, and only those). **Disproved en route:** nvCOMP does not decode
+concatenated frames, so its produced-size report cannot catch a merge — it
+decodes only the first frame and the size check passes.
+
+### A lying seek table is an error, not a quiet demote
+
+Every shape used to demote and exit 0, so `-t` printed OK on an archive whose
+index is wrong — the one thing `-t` exists to report. Bad magic, wrong declared
+size and merged extent now report what is wrong and **exit 4**, on both `-t` and
+`-d`. `--keep-going` ignores the table and decodes the stream directly, which
+recovers such an archive completely, and the error message says so. Benign
+declines — no usable table, frames not 4 KiB aligned, a frame that declares no
+size — still demote silently: those are limits of the archive, not evidence
+against it.
+
+When the checksum catches it instead, the verdict pays for one frame's walk to
+say which it was, rather than reporting "the archive is corrupt, or this GPU
+decoded it incorrectly" about a table defect — the misattribution the v0.17.30
+notes already record. Genuine payload corruption still reports corruption.
+
+`--keep-going` walks everything, deliberately: recovery means ignoring the table,
+the demote that reaches it exists at producer time only, and a checksummed
+frame's proof arrives mid-batch, too late. That cost is paid only by a run that
+asked to tolerate damage. It also no longer turns `--gds-only`/`--direct-stage`
+into a usage error, and prints what it does not cover there — recovering past a
+corrupt frame still needs the CPU decoder.
+
+| cold `-t`, 65.38 GiB | wall | user | sys |
+|---|---|---|---|
+| `--gds-only` before | 111.57 s | 7.36 | 27.03 |
+| `--gpu-only` control | 28.57 s | 69.20 | 198.87 |
+| `--gds-only` after | **22.35 s** | 6.24 | 17.36 |
+
+Producer 100 s -> 0.62 s; metadata preads ~1.71M -> 16,686, now **counted**
+rather than assumed and reported with how many frames needed the walk.
+`--gds-only` went from 3.9x the slowest to the fastest of the three.
+
+### The startup notice was painted over by the progress bar it warned about
+
+`--gds-only -d`/`-t` then sat on `in: 0.0%  verified: 0.00 B` with nothing to say.
+The message existed — it was being overwritten. `[GDS] opening the cuFile driver
+...` is printed once because that call takes ~2.5 s, justified by a comment
+saying it lands "before the progress bar has rendered anything". True of
+COMPRESS, whose reader shows real bytes almost at once. On `-d`/`-t` the bar is
+ALREADY UP and still empty, so it repainted zeroes over the notice 200 ms later.
+Measured on a pty: bar up at 0.388 s, first byte at ~3.5 s, eleven renders of
+zeroes between.
+
+`g_init_phase` is a label the progress loop renders INSTEAD of a zeroed bar, and
+only while both counters are zero, so anything real takes the bar back and no
+phase can mask progress. It inherits the bar's guards (`-q`, non-TTY, true pipe
+stay silent). **The phases are not sequential** — VRAM registration runs on a GPU
+worker while the producer is still checking the table, so an unconditional clear
+from the worker blanked the producer's label and returned the run to zeroes: the
+exact symptom, reintroduced by its own fix. Clearing is now a compare-exchange
+against the label the site itself set. `GZSTD_DEBUG_PHASE=1` is kept because a
+phase shorter than the 200 ms sample is never DRAWN, so "I did not see it" is not
+evidence the setter did not run.
+
+`--direct-stage` needs no equivalent, checked rather than assumed: compress-only,
+and it makes no cuFile call at all.
+
+### "the ordinary writer" named a mechanism nobody outside the code can see
+
+When cuFile refuses a destination (`/dev/shm` gives `cuFileHandleRegister failed
+(err 5030)`) the warning said the run "uses the ordinary writer" — the accurate
+internal name, useless to a user. What it costs is the point of the flag: every
+byte comes back across PCIe into host memory before it is written. All ten of
+those messages, seven on compress and three on decompress, now say **"using
+device-to-host transfers for writing"**. The comments still say "ordinary
+writer": that is still the name of the thing, and only the user-facing claim
+moved from mechanism to consequence.
+
+### Three reasons the run re-registered BAR1 at startup, all found by that label
+
+Making the phase visible showed `registering VRAM with cuFile`, a flicker of
+progress bar, then the same label again. That was real: `ensure_buffers()` ran
+**three times**, each a full free/cudaMalloc/cuFileBufRegister cycle at ~620 ms
+per slab. `GZSTD_DEBUG_ENSURE=1` (kept) names the dimension that forced each.
+
+- **The workspace estimate was ~50,000x low.** `est_temp = per_stream_cap * 1024`
+  is 256 KiB at batch 256; nvCOMP's answer for that shape is **13,112,180,736
+  bytes**. The comment beneath it already admitted it "models none of them". It
+  now asks `nvcompBatchedZstdDecompressGetTempSizeAsync`, the same call the
+  per-batch path makes, and **re-asks on every halving** — the workspace scales
+  with the batch, and pinning the batch-256 answer would drive a small card's
+  retry loop to 1 for no reason (verified: 819 MB at batch 16).
+- **A realloc forced by ONE dimension shrank the others.** Cycle 2 rebuilt every
+  slab at that batch's sizes, and batch 0 of a real archive is highly
+  compressible (866.99 KiB across 256 frames), so the compressed slab collapsed
+  4096 MiB -> 2 MiB, guaranteeing cycle 3 when a normal 13 MiB frame arrived.
+  `ensure_buffers` is now grow-only, taken before `free_device()` zeroes the four
+  fields, so the deliberate VRAM-retry shrink still works.
+- **`init_comp = host_chunk_bytes  // compressed <= original chunk` is false.** An
+  incompressible frame is STORED, and a stored frame carries block headers, so it
+  exceeds its input: measured **16,785,408 against a 16,777,216-byte chunk**. Over
+  by 8 KiB — enough to force a full re-register of a 4 GiB slab. Now
+  `ZSTD_compressBound`, over-reserving 0.3%.
+
+Reallocations at startup **3 -> 1** on both directions; the two `-d`
+registrations that remain are its two distinct slabs in one cycle, not thrash.
+Cold `-t --gds-only` 22.35 s -> **20.51 s**.
+
+Verified: `--gds-only -d`, `--gds-only` compress and `--direct-stage` all
+round-trip byte-identical; the reduced-budget path still halves correctly; the
+seek-table contract holds across all 16 forgery cells; both build configurations
+compile clean.
 
 ## v0.17.39 — a wedged NVML driver can no longer hang the run, because it no longer has to answer
 

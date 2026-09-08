@@ -726,6 +726,12 @@ static std::atomic<uint64_t> g_gds_driver_open_ns{0};
 // place that has both the parsed verbosity and a terminal check -- this loader
 // block is compiled long before either exists.
 static std::atomic<bool> g_gds_notice_ok{false};
+// Declared here, defined with the progress bar it feeds.  A NAMED constant, not
+// a bare literal at each site: clear_init_phase compares POINTERS, and two
+// spellings of the same literal are only pooled by grace of the compiler.
+static const char * const GZ_PHASE_DRIVER_OPEN = "opening the cuFile driver";
+static void set_init_phase(const char * p);
+static void clear_init_phase(const char * mine);
 // MEASURED, standalone, one device: cold cuFileDriverOpen = 2.136 s; with the
 // CUDA context warmed first, cudaFree(0) = 1.511 s and cuFileDriverOpen = 0.567 s.
 // The costs are ADDITIVE, so ~71% of what this call appears to cost is the cuInit
@@ -753,8 +759,18 @@ static const std::string & gz_gds_unavailable_reason()
     // main's guard, leaving a joinable std::thread to terminate() at static
     // destruction (exit 134 instead of 4).  Reverted.
     // SAY SOMETHING FIRST.  This call takes ~2.5 s (see the note above) and it
-    // is the FIRST thing a --gds-only run does, before the progress bar has
-    // rendered anything -- so the tool looks hung for two and a half seconds.
+    // is the FIRST thing a --gds-only run does -- so the tool looks hung for two
+    // and a half seconds.
+    //
+    // 🔴 THE ONE-SHOT PRINT IS NOT ENOUGH ON THE DECOMPRESS SIDE, and the line
+    // below used to say it was ("before the progress bar has rendered
+    // anything").  That is true of COMPRESS, whose reader has the bar showing
+    // real bytes almost at once.  For -d/-t the bar is ALREADY UP and still
+    // empty, so it repaints `in: 0.0% 0.00 B  verified: 0.00 B` over this notice
+    // 200 ms later and holds it for the remaining ~2.2 s.  MEASURED: bar up at
+    // 0.388 s, first byte at ~3.5 s, eleven renders of zeroes in between.
+    // So publish it as a PHASE as well: the bar then draws it every tick until
+    // there is something truer to show.
     //
     // Transient, exactly like the "[done] finalizing" line: \r puts the cursor
     // at column 0 and \033[K clears to end of line, so the first progress render
@@ -764,6 +780,7 @@ static const std::string & gz_gds_unavailable_reason()
     // Only on a terminal: through a pipe or into a log, a \r-updated line is
     // just noise with no cursor to move.  -q suppresses it with everything else.
     const bool drv_notice = g_gds_notice_ok.load(std::memory_order_relaxed);
+    set_init_phase(GZ_PHASE_DRIVER_OPEN);
     if (drv_notice) {
       std::fprintf(stderr, "\r[GDS] opening the cuFile driver ...\033[K");
       std::fflush(stderr);
@@ -774,6 +791,7 @@ static const std::string & gz_gds_unavailable_reason()
     g_gds_driver_open_ns.store((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count() - drv_t0,
         std::memory_order_relaxed);
+    clear_init_phase(GZ_PHASE_DRIVER_OPEN);
     if (drv_notice) { std::fprintf(stderr, "\r\033[K"); std::fflush(stderr); }
     if (e.err != GZ_CUFILE_SUCCESS)
       return std::string("cuFileDriverOpen failed (err ") + std::to_string(e.err)
@@ -2688,6 +2706,63 @@ static bool g_color_stderr = false;
 // messages don't overlap the progress bar.  Set by progress_loop, cleared
 // when progress_loop exits.
 static std::atomic<bool> g_progress_active{false};
+
+// WHAT THE RUN IS DOING BEFORE IT HAS DONE ANYTHING.  A staged decompress does
+// real work -- open the cuFile driver, read and check the seek table, register
+// VRAM -- before a single byte reaches the Meter, and the bar renders `in: 0.0%
+// 0.00 B  verified: 0.00 B` throughout it.  Compression has no such gap: its
+// reader starts streaming immediately, so its counters move on the first render
+// and the phase is over before anyone can read a label.  That asymmetry is why
+// this exists on one side and not the other, and it is a REPORTING gap, not a
+// slow path -- v0.17.40 already cut the largest phase from ~100 s to 0.62 s.
+//
+// A plain pointer to a string LITERAL, never to a temporary: the progress thread
+// reads it while the producer writes it, and a literal's storage outlives both.
+// nullptr means "nothing to say"; the bar then renders as usual.
+static std::atomic<const char *> g_init_phase{nullptr};
+// Seconds since the process started, for the phase trace only.  FILE SCOPE, not
+// a function-local static: a local initialises on FIRST CALL, which is the first
+// phase transition, so every timestamp printed 0.000 and the trace could not
+// show what came before it.
+static const std::chrono::steady_clock::time_point g_proc_t0 =
+    std::chrono::steady_clock::now();
+static double gz_since_start_s()
+{ return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_proc_t0).count(); }
+static void set_init_phase(const char * p)
+{
+  // GZSTD_DEBUG_PHASE=1 -- trace the transitions.  A phase shorter than the
+  // bar's 200 ms sample is never DRAWN, so "I did not see it" is not evidence
+  // the setter did not run; this is what tells the two apart.  It is how the
+  // concurrency below was found: the trace showed the setters firing in the
+  // right order while the bar showed zeroes.
+  static const bool trace = ::getenv("GZSTD_DEBUG_PHASE") != nullptr;
+  if (trace) std::fprintf(stderr, "[PHASE %7.3fs] %s\n", gz_since_start_s(),
+                          p ? p : "(clear)");
+  g_init_phase.store(p, std::memory_order_relaxed);
+}
+// CLEAR ONLY YOUR OWN LABEL.  These phases are NOT sequential: VRAM registration
+// happens on a GPU worker while the producer is still checking the seek table,
+// so an unconditional clear from the worker blanked the producer's label and
+// left the rest of its run showing zeroes again -- the exact symptom this whole
+// change exists to remove, reintroduced by the fix for it.  A compare-exchange
+// makes a clear a no-op once someone else has taken over the line.
+static void clear_init_phase(const char * mine)
+{
+  const char * expect = mine;
+  g_init_phase.compare_exchange_strong(expect, nullptr,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed);
+}
+// Scope-bound phase: sets on entry, un-sets on every exit including the early
+// `return false`s in GPU bringup.
+struct InitPhase {
+  const char * mine;
+  explicit InitPhase(const char * p) : mine(p) { set_init_phase(p); }
+  void retarget(const char * p) { clear_init_phase(mine); mine = p; set_init_phase(p); }
+  ~InitPhase() { clear_init_phase(mine); }
+  InitPhase(const InitPhase &) = delete;
+  InitPhase & operator=(const InitPhase &) = delete;
+};
 
 // Emit a message to stderr if the current verbosity is >= min_level.
 // Caller must include \n or \r in msg as appropriate.
@@ -7341,6 +7416,8 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     if (!is_stderr_tty()) return;
     if (opt.input == "-" && total_in == 0) return;
   }
+  if (::getenv("GZSTD_DEBUG_PHASE"))
+    std::fprintf(stderr, "[PHASE %7.3fs] progress bar up\n", gz_since_start_s());
   g_progress_active.store(true, std::memory_order_relaxed);
   using namespace std::chrono; using namespace std::chrono_literals;
   const bool is_test = (opt.mode == Mode::TEST);
@@ -7357,6 +7434,18 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     uint64_t t_out    = m->total_out.load();
     uint64_t t_done   = m->tasks_done.load();
     uint64_t t_frames = m->total_frames.load();
+    // SAY WHAT IS HAPPENING INSTEAD OF SHOWING ZEROES.  Only while nothing has
+    // been read OR written: the moment either counter moves the bar has
+    // something true to show and takes over on its own, so this cannot mask
+    // real progress even if a phase is left set.  Same transient form as the
+    // driver-open notice (\r + \033[K), so the first real render paints over it.
+    if (const char * phase = g_init_phase.load(std::memory_order_relaxed)) {
+      if (in == 0 && out == 0) {
+        std::fprintf(stderr, "\r\033[36m[GDS]\033[0m %s ...\033[K", phase);
+        std::fflush(stderr);
+        continue;
+      }
+    }
     auto dt      = steady_clock::now() - m->t0;
     double secs  = duration_cast< duration<double> >(dt).count();
     // Freeze input rate once reading is complete: dividing fixed read_bytes
@@ -25945,11 +26034,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (opt.gds_only && !opt.tar_mode && !gds_cout_shape_ok) {
     vlog(V_ERROR, opt,
          "WARNING: --gds-only peer-to-peer compress output requires exactly one "
-         "GPU and one stream; using the ordinary ordered writer for output.\n");
+         "GPU and one stream; using device-to-host transfers for writing.\n");
   } else if (opt.gds_only && !opt.tar_mode && !gds_cout_verify_ok) {
     vlog(V_ERROR, opt,
          "WARNING: --gds-only CPU verification requires host frame taps; using "
-         "the ordinary ordered writer for output.\n");
+         "device-to-host transfers for writing.\n");
   }
   if (opt.gds_only && !opt.tar_mode && gds_cout_shape_ok && gds_cout_verify_ok
       && !::getenv("GZSTD_DEBUG_GDS_NO_P2P_OUT")) {
@@ -25958,17 +26047,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     else if (g_direct_writer) base_fd = g_direct_writer->fd();
     if (base_fd < 0) {
       vlog(V_ERROR, opt, "WARNING: --gds-only: the output has no descriptor to "
-           "write through; using the ordinary writer.\n");
+           "write through; using device-to-host transfers for writing.\n");
     } else if (::fcntl(base_fd, F_GETFL) < 0) {
       vlog(V_ERROR, opt, "WARNING: --gds-only cannot inspect the output "
-           "descriptor; using the ordinary ordered writer.\n");
+           "descriptor; using device-to-host transfers for writing.\n");
     } else if ((::fcntl(base_fd, F_GETFL) & O_APPEND) != 0) {
       // Reopening /proc/self/fd/N with O_DIRECT creates a positional description;
       // cuFileWrite below starts at offset zero and the final ftruncate adopts
       // that new stream's length.  On `gzstd -c ... >> existing.zst` that would
       // overwrite the old stream and then cut its tail off, despite exiting 0.
       vlog(V_ERROR, opt, "WARNING: --gds-only cannot use peer-to-peer output on "
-           "an append-mode descriptor; using the ordinary ordered writer.\n");
+           "an append-mode descriptor; using device-to-host transfers for writing.\n");
     } else {
       char ofd_link[64];
       std::snprintf(ofd_link, sizeof(ofd_link), "/proc/self/fd/%d", base_fd);
@@ -25976,13 +26065,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       if (ofd < 0) {
         vlog(V_ERROR, opt, std::string("WARNING: --gds-only cannot reopen this "
              "output for O_DIRECT (") + std::strerror(errno)
-             + "); this compress uses the ordinary writer.\n");
+             + "); this compress uses device-to-host transfers for writing.\n");
       } else {
         std::string owhy;
         if (!g_gds_cout.open(ofd, &owhy)) {
           ::close(ofd);
           vlog(V_ERROR, opt, "WARNING: --gds-only cuFile will not take this output "
-               "descriptor (" + owhy + "); this compress uses the ordinary writer.\n");
+               "descriptor (" + owhy + "); this compress uses device-to-host "
+               "transfers for writing.\n");
         } else {
           g_gds_cout_fd = ofd;
           g_gds_cout_active.store(true, std::memory_order_relaxed);
@@ -27108,6 +27198,38 @@ static void gpu_decomp_worker(
           && max_decomp <= alloc_decomp && needed_temp <= temp_bytes)
         return true;  // already big enough
 
+      // GZSTD_DEBUG_ENSURE=1 -- name the dimension that forced this realloc.
+      // Kept because the two fixes below are both proved by an ABSENCE (no
+      // second registration), and an absence is not evidence unless the same
+      // instrument can be seen reporting a presence.  It is what identified the
+      // temp term as the culprit in the first place.
+      if (::getenv("GZSTD_DEBUG_ENSURE"))
+        std::fprintf(stderr, "[ENSURE] realloc: batch %zu>%zu=%d comp %zu>%zu=%d "
+                     "decomp %zu>%zu=%d temp %zu>%zu=%d\n",
+                     batch_n, alloc_batch, (int)(batch_n > alloc_batch),
+                     max_comp, alloc_comp, (int)(max_comp > alloc_comp),
+                     max_decomp, alloc_decomp, (int)(max_decomp > alloc_decomp),
+                     needed_temp, temp_bytes, (int)(needed_temp > temp_bytes));
+
+      // GROW-ONLY.  A realloc forced by ONE dimension must not SHRINK the
+      // others, and this used to: nvCOMP's real workspace (13.1 GB, queried per
+      // batch) blows past whatever `est_temp` guessed, so the very first batch
+      // reallocates -- and it reallocated every dimension at THAT batch's sizes.
+      // On an archive whose first frames are highly compressible (measured:
+      // 866.99 KiB across 256 frames, ~3.4 KiB each) the compressed slab
+      // collapsed 4096 MiB -> 2 MiB, which then guaranteed a THIRD realloc the
+      // moment a normal 13 MiB frame arrived, back up to 4098 MiB.  Three
+      // free/alloc/cuFileBufRegister cycles where one would do, ~620 ms of BAR1
+      // registration each, the first one's work discarded 1.9 s later.
+      //
+      // Taken BEFORE free_device(), which zeroes all four -- so the deliberate
+      // shrink at the VRAM-retry site still works: it frees first, and max()
+      // against zero is the caller's smaller request.
+      batch_n     = std::max(batch_n,     alloc_batch);
+      max_comp    = std::max(max_comp,    alloc_comp);
+      max_decomp  = std::max(max_decomp,  alloc_decomp);
+      needed_temp = std::max(needed_temp, temp_bytes);
+
       // Need to reallocate -- but a write-behind thread may still be DMAing out
       // of the very buffer free_device() is about to release.
       //
@@ -27125,6 +27247,11 @@ static void gpu_decomp_worker(
       alloc_comp   = max_comp;
       alloc_decomp = max_decomp;
 
+      // Hundreds of ms with nothing on the Meter yet -- the same "looks like a
+      // hang" the resize log below was added for, seen by a user who has no
+      // -vv.  Only shows while both counters are still zero, so a mid-run
+      // resize (when they are not) never blanks a live bar.
+      InitPhase reg_phase("registering VRAM with cuFile");
       if (cudaMalloc(&d_comp_buf,     batch_n * max_comp)    != cudaSuccess) return false;
       if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) return false;
       if (gds_read) {
@@ -27169,6 +27296,7 @@ static void gpu_decomp_worker(
           std::cerr << b;
         }
       }
+      clear_init_phase(reg_phase.mine);
       if (cudaMalloc(&d_comp_ptrs,    batch_n * sizeof(void*))   != cudaSuccess) return false;
       if (cudaMalloc(&d_decomp_ptrs,  batch_n * sizeof(void*))   != cudaSuccess) return false;
       if (cudaMalloc(&d_comp_sizes,   batch_n * sizeof(size_t))  != cudaSuccess) return false;
@@ -27302,15 +27430,52 @@ static void gpu_decomp_worker(
       // Pre-allocate for the common case: batch_cap frames of chunk_size
       // The temp size query needs device pointers, so we estimate conservatively.
       // We'll resize later if a batch has larger frames.
-      size_t init_comp = host_chunk_bytes;  // compressed <= original chunk
+      // NOT host_chunk_bytes.  That line read "compressed <= original chunk",
+      // which is false and was the last of the three reasons this pipeline
+      // re-registered BAR1 at startup: an incompressible frame is STORED, and a
+      // stored frame carries block headers, so it comes out LARGER than its
+      // input.  MEASURED on a real archive: max compressed frame 16,785,408
+      // bytes against a 16,777,216-byte chunk -- over by 8 KiB, which is enough
+      // to force a full free/alloc/re-register of a 4 GiB slab.
+      // ZSTD_compressBound is the guaranteed ceiling; it over-reserves ~57 KiB
+      // per slot, which against 16 MiB slots is 0.3%.
+      size_t init_comp = ZSTD_compressBound(host_chunk_bytes);
       size_t init_decomp = host_chunk_bytes;
       // Pre-allocate device buffers.  If batch size is too large for VRAM,
       // halve it until it fits.  This handles --gpu-batch=256 on GPUs with
       // limited VRAM (e.g., 10 GiB consumer GPUs vs 80+ GiB datacenter GPUs).
       bool stream_init_failed = false;
       {
-        size_t est_temp = per_stream_cap * 1024;
         size_t try_batch = per_stream_cap;
+        // ASK, DO NOT GUESS.  This was `per_stream_cap * 1024` -- 256 KiB at
+        // batch 256 -- and the comment below already said it "models none of"
+        // the allocations that follow.  MEASURED against nvCOMP's own answer for
+        // the same shape: 13,112,180,736 bytes.  Being ~50,000x low did not just
+        // under-reserve; it guaranteed that the FIRST batch's exact query would
+        // exceed it and force a full reallocation, which is where the repeated
+        // "registering VRAM with cuFile" came from.
+        //
+        // Same call the per-batch path makes, so bringup and steady state agree
+        // on the shape.  A failure here is NOT fatal: this is a starting size,
+        // the per-batch query still runs and still throws if it cannot answer,
+        // so fall back to the old estimate rather than refusing to bring up.
+        //
+        // RE-ASKED ON EVERY HALVING, not computed once.  The loop below shrinks
+        // try_batch to fit VRAM, and the workspace scales with it -- pinning the
+        // batch-256 answer (13.1 GB) while offering the card a batch of 8 would
+        // reserve for a shape this stream is no longer going to run, and on a
+        // small card would drive the halving all the way to 1 for no reason.
+        auto temp_for = [&](size_t nb) -> size_t {
+          size_t est = nb * 1024;                    // the old guess, as a floor
+          nvcompBatchedZstdDecompressOpts_t eopts{};
+          size_t etb = 0;
+          if (nvcompBatchedZstdDecompressGetTempSizeAsync(
+                  nb, init_decomp, eopts, &etb, nb * init_decomp) == nvcompSuccess
+              && etb > est)
+            est = etb;
+          return est;
+        };
+        size_t est_temp = temp_for(try_batch);
         int vram_retries = 0;
         // HEADROOM, NOT JUST FIT.  The halving loop below only reacts to a
         // cudaMalloc that FAILS, and on a card with just enough VRAM for the
@@ -27369,6 +27534,7 @@ static void gpu_decomp_worker(
             break;
           }
           try_batch = std::max<size_t>(1, try_batch / 2);
+          est_temp   = temp_for(try_batch);
           {
             int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
             if (opt.verbosity >= min_verb) {
@@ -29303,11 +29469,16 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
                                          const Options & opt,
                                          size_t * max_frame_decomp_out)
 {
+  // SCOPE-BOUND, NOT A CLEAR AT EACH RETURN.  This function demotes from a dozen
+  // places; every one of them falls through to the ordinary producer, which
+  // would then run under a label describing a check it is not doing.
+  InitPhase phase("reading the archive's seek table");
   tarx::TarSeekTable st;
   if (!tarx::parse_foreign_seek_table(in, st) || !st.valid())
     return GDS_VERIFY_DEMOTE;
   const size_t nframes = st.c_off.size() - 1;
   if (nframes == 0) return GDS_VERIFY_DEMOTE;
+  phase.retarget("checking the seek table against the frames it describes");
 
   const int fd = ::fileno(in);
   if (fd < 0) return GDS_VERIFY_DEMOTE;
@@ -29460,6 +29631,10 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   for (Task & t : built)
     queue.push(std::move(t));
   queue.set_done();
+  // Handed off: the workers own the run now, and their first batch moves the
+  // Meter.  Anything still slow after this point (VRAM registration) sets its
+  // own phase; leaving this one set would attribute that wait to the table.
+  clear_init_phase(phase.mine);   // (the guard would too, one statement later)
   if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
   if (opt.verbosity >= V_VERBOSE) {
     char pb[160];
@@ -29880,7 +30055,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
           char b[420];
           std::snprintf(b, sizeof(b),
             "WARNING: --gds-only cannot use peer-to-peer writes here: %s.\n"
-            "  This decompress uses the ordinary writer; the output is identical.\n",
+            "  This decompress uses device-to-host transfers for writing; the "
+            "output is identical.\n",
             decline);
           vlog(V_ERROR, opt, b);
         }
@@ -29918,7 +30094,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       // is materially different from what the user requested.
       vlog(V_ERROR, opt, std::string("WARNING: --gds-only cannot reopen this output "
            "for O_DIRECT (") + std::strerror(errno)
-           + "); this decompress uses the ordinary writer.\n");
+           + "); this decompress uses device-to-host transfers for writing.\n");
       goto gds_out_declined;
     }
     std::string why;
@@ -29932,7 +30108,8 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       // decompressed file, and the acceleration is the negotiable part.
       ::close(ofd);
       vlog(V_ERROR, opt, "WARNING: --gds-only cuFile will not take this output "
-           "descriptor (" + why + "); this decompress uses the ordinary writer.\n");
+           "descriptor (" + why + "); this decompress uses device-to-host "
+           "transfers for writing.\n");
       goto gds_out_declined;
     }
     g_gds_output_fd  = ofd;
