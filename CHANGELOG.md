@@ -1,12 +1,73 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.38  
+**Covers:** v0.9.50 → v0.17.39  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.39 — a wedged NVML driver can no longer hang the run, because it no longer has to answer
+
+v0.17.38 bounded the sampler's destructor join and said plainly that five runtime NVML call sites
+remained exposed. This closes those, and the shape of the fix is the point.
+
+### Degrade, do not die
+
+The obvious response to "a driver call never returns" is a watchdog that kills the process with an
+error code. That was considered and rejected, because **every one of the six utilization call sites
+is ADVISORY and already handles failure**: the watchdog JSON reports `util=0`, `select_best_gpus`
+leaves `gpu_util` at its default of 100 ("assume busy"), and both `util_scale` sites keep their
+previous value. All six test `== NVML_SUCCESS`.
+
+So a WEDGED driver can be made indistinguishable from an ABSENT one — a configuration gzstd already
+runs on perfectly well. The run then finishes with correct output and merely loses
+utilization-informed device ranking. Terminating would have converted a recoverable situation into a
+failed run, and could have failed a run whose compression had already completed.
+
+### One chokepoint, and the out-parameter rule
+
+All twelve NVML entry points funnel through one set of same-name `static inline` wrappers dispatching
+via `gz_nvml()`, so the bound went there rather than at six call sites. That also covers the entries
+reachable BEFORE the sampler starts — `detect_min_pcie_gen()`'s NVML fallback and the `--adapt`
+fingerprint's — which a sampler-triggered latch would have missed.
+
+One detached service thread owns every call. Callers post a request and wait two seconds; on timeout
+a latch is set and subsequent calls return `GZ_NVML_UNAVAILABLE` without entering the driver.
+
+**THE SUBTLE PART IS THE OUT-PARAMETERS.** Most of these functions write through a caller-supplied
+pointer, and after a timeout the caller's frame is gone while the wedged driver may still write —
+so a naive bound would trade a hang for stack corruption, which is worse. No wrapper hands the driver
+caller memory: each allocates a `shared_ptr` result buffer, the lambda captures it BY VALUE, and the
+value is copied out only on success. A late-waking driver scribbles on a buffer that is still alive
+and owned by nobody.
+
+**The two-second wait is a bound, not a tuning.** A healthy NVML call is microseconds and the full
+8-GPU table measured 0.390 s, so two seconds is far above any healthy call on any hardware; it does
+not encode this machine's rates, and a false timeout costs only advisory information.
+
+### Measured against a stub driver
+
+gzstd `dlopen`s `libnvidia-ml.so.1` by soname, so a stub whose `nvmlDeviceGetUtilizationRates` never
+returns can be substituted on `LD_LIBRARY_PATH`:
+
+| case | before | after |
+|---|---|---|
+| wedged, full input, GPU workers | exit 124, hung forever, **0 bytes** | **exit 0 in 6 s, 55,493,032 bytes, round-trip byte-identical** |
+| wedged `nvmlInit_v2` | not survivable | exit 0 in 5 s, correct output |
+| no stub, same input | 5026 ms | 5026 ms |
+| small-input startup | 44-68 ms | 46-57 ms |
+
+Threads entering the driver in the wedged case went from three to one.
+
+`GpuMonitor::stop()`'s bounded join from v0.17.38 is kept as defence in depth: a sampler can still be
+inside its own two-second wrapper wait when the 500 ms shutdown bound expires.
+
+One claim was walked back after review: the latch stops any NEW call entering the driver, but a
+request already queued when the latch is set can still reach NVML if the slow call ahead of it
+returns. That is harmless — the caller already has its answer and the result buffer belongs to the
+request — but the comment no longer claims otherwise.
 
 ## v0.17.38 — a fix that looked applied and was not, and the current directory on the library search path
 

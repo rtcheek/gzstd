@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.38";
+static constexpr const char * GZSTD_VERSION = "0.17.39";
 //
 // Architecture overview:
 //
@@ -195,33 +195,188 @@ static const GzNvmlApi & gz_nvml()
   return api;
 }
 
+// ---- BOUNDED NVML DISPATCH -------------------------------------------------
+//
+// Every NVML call in this file goes through gz_nvml_bounded(), which turns a
+// WEDGED driver call into GZ_NVML_UNAVAILABLE -- exactly what a driver that is
+// simply ABSENT already returns, and exactly what every call site already
+// handles.  All six utilization call sites test == NVML_SUCCESS and have a
+// defined fallback (0% for the watchdog dump, "assume busy" for ranking, keep
+// the previous value for util_scale), so degrading is strictly better than
+// dying: the run completes with correct output, merely without
+// utilization-informed device ranking.
+//
+// NOT HYPOTHETICAL.  gzstd dlopen()s libnvidia-ml.so.1 by soname, so a stub
+// whose nvmlDeviceGetUtilizationRates never returns can be substituted on
+// LD_LIBRARY_PATH.  With one in place and GPU workers running, gzstd used to
+// write ZERO BYTES and never terminate: three threads sat inside the wedged
+// call and the main thread waited on them.  v0.17.38 bounded only the sampler's
+// destructor join, which that scenario never even reaches.
+//
+// ONE SERVICE THREAD, not one per call: the sampler alone issues roughly 64
+// calls a second, so thread-per-call would be absurd, and the marshalling cost
+// (two context switches) is invisible next to an NVML call.
+//
+// THE OUT-PARAMETER RULE, which is the subtle part.  Most of these functions
+// write through a caller-supplied pointer, and after a timeout the caller's
+// frame is gone while the wedged driver may still write.  So the driver is
+// never handed caller memory: each wrapper allocates a SHARED result buffer,
+// the lambda captures it BY VALUE, and the value is copied out only on success.
+// A late-waking driver then scribbles on a buffer that is still alive and owned
+// by nobody, instead of on a dead stack frame.
+//
+// THE TIMEOUT IS A BOUND, NOT A TUNING.  A healthy NVML call is microseconds;
+// the whole 8-GPU table measured 0.390 s on the development host.  Two seconds
+// is far above any healthy call on any hardware -- it does not encode this
+// machine's rates, it only decides how long to wait before concluding "never".
+// Once one call times out the latch is set and no NEW call enters the driver, so
+// the cost is paid once per process rather than once per call.  Precisely: a
+// request already queued when the latch is set can still reach NVML later if the
+// slow call ahead of it eventually returns.  That is harmless -- the caller has
+// already been given UNAVAILABLE and its result buffer is owned by the request,
+// not by the caller's frame -- but "nothing ever enters again" would be too
+// strong a claim, so it is not made.
+static std::atomic<bool> g_nvml_wedged{false};
+
+struct GzNvmlReq {
+  std::function<nvmlReturn_t()> fn;
+  nvmlReturn_t rc = GZ_NVML_UNAVAILABLE;
+  bool done = false;
+  std::mutex m;
+  std::condition_variable cv;
+};
+
+struct GzNvmlPump {
+  std::mutex m;
+  std::condition_variable cv;
+  std::deque<std::shared_ptr<GzNvmlReq>> q;
+  bool started = false;
+};
+
+// DELIBERATELY LEAKED.  The service thread is detached and runs for the life of
+// the process; a static object would be destroyed underneath it during static
+// destruction, which is the use-after-destruction shape this file already had
+// to fix once in GpuMonitor::stop().  Never destroying it removes the race
+// entirely, and the OS reclaims the one allocation at exit.
+static GzNvmlPump & gz_nvml_pump()
+{
+  static GzNvmlPump * p = new GzNvmlPump();
+  return *p;
+}
+
+static nvmlReturn_t gz_nvml_bounded(std::function<nvmlReturn_t()> fn)
+{
+  if (g_nvml_wedged.load(std::memory_order_relaxed)) return GZ_NVML_UNAVAILABLE;
+  GzNvmlPump & p = gz_nvml_pump();
+  auto req = std::make_shared<GzNvmlReq>();
+  req->fn = std::move(fn);
+  {
+    std::lock_guard<std::mutex> lk(p.m);
+    if (!p.started) {
+      p.started = true;
+      std::thread([&p]{
+        for (;;) {
+          std::shared_ptr<GzNvmlReq> r;
+          {
+            std::unique_lock<std::mutex> lk2(p.m);
+            p.cv.wait(lk2, [&p]{ return !p.q.empty(); });
+            r = p.q.front();
+            p.q.pop_front();
+          }
+          nvmlReturn_t rc;
+          try { rc = r->fn(); } catch (...) { rc = GZ_NVML_UNAVAILABLE; }
+          { std::lock_guard<std::mutex> lk3(r->m); r->rc = rc; r->done = true; }
+          r->cv.notify_all();
+        }
+      }).detach();
+    }
+    p.q.push_back(req);
+  }
+  p.cv.notify_one();
+
+  std::unique_lock<std::mutex> lk(req->m);
+  if (!req->cv.wait_for(lk, std::chrono::seconds(2), [&req]{ return req->done; })) {
+    g_nvml_wedged.store(true, std::memory_order_relaxed);
+    return GZ_NVML_UNAVAILABLE;   // req stays alive via the queue's shared_ptr
+  }
+  return req->rc;
+}
+
+// True once a driver call has been observed never to return.  Reported at -v so
+// a degraded ranking is explainable rather than mysterious.
+static inline bool gz_nvml_is_wedged() { return g_nvml_wedged.load(std::memory_order_relaxed); }
+
 // Same-name wrappers — every call site in this file compiles unchanged.
+// Each allocates its own result storage; see THE OUT-PARAMETER RULE above.
 static inline nvmlReturn_t nvmlInit_v2(void)
-{ auto & a = gz_nvml(); return a.Init ? a.Init() : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.Init) return GZ_NVML_UNAVAILABLE;
+  return gz_nvml_bounded([&a]{ return a.Init(); }); }
 static inline nvmlReturn_t nvmlShutdown(void)
-{ auto & a = gz_nvml(); return a.Shutdown ? a.Shutdown() : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.Shutdown) return GZ_NVML_UNAVAILABLE;
+  return gz_nvml_bounded([&a]{ return a.Shutdown(); }); }
 static inline nvmlReturn_t nvmlDeviceGetCount_v2(unsigned int * n)
-{ auto & a = gz_nvml(); return a.DeviceGetCount ? a.DeviceGetCount(n) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetCount) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<unsigned int>(0);
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, o]{ return a.DeviceGetCount(o.get()); });
+  if (rc == NVML_SUCCESS) *n = *o;
+  return rc; }
 static inline nvmlReturn_t nvmlDeviceGetHandleByIndex(unsigned int i, nvmlDevice_t * d)
-{ auto & a = gz_nvml(); return a.DeviceGetHandleByIndex ? a.DeviceGetHandleByIndex(i, d) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetHandleByIndex) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<nvmlDevice_t>(nullptr);
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, i, o]{ return a.DeviceGetHandleByIndex(i, o.get()); });
+  if (rc == NVML_SUCCESS) *d = *o;
+  return rc; }
 static inline nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int i, nvmlDevice_t * d)
 { return nvmlDeviceGetHandleByIndex(i, d); }
 static inline nvmlReturn_t nvmlDeviceGetHandleByPciBusId_v2(const char * id, nvmlDevice_t * d)
-{ auto & a = gz_nvml(); return a.DeviceGetHandleByPciBusId ? a.DeviceGetHandleByPciBusId(id, d) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetHandleByPciBusId) return GZ_NVML_UNAVAILABLE;
+  auto sid = std::make_shared<std::string>(id ? id : "");
+  auto o   = std::make_shared<nvmlDevice_t>(nullptr);
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, sid, o]{ return a.DeviceGetHandleByPciBusId(sid->c_str(), o.get()); });
+  if (rc == NVML_SUCCESS) *d = *o;
+  return rc; }
 static inline nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t d, nvmlUtilization_t * u)
-{ auto & a = gz_nvml(); return a.DeviceGetUtilizationRates ? a.DeviceGetUtilizationRates(d, u) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetUtilizationRates) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<nvmlUtilization_t>();
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, d, o]{ return a.DeviceGetUtilizationRates(d, o.get()); });
+  if (rc == NVML_SUCCESS) *u = *o;
+  return rc; }
 static inline nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t d, nvmlMemory_t * mem)
-{ auto & a = gz_nvml(); return a.DeviceGetMemoryInfo ? a.DeviceGetMemoryInfo(d, mem) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetMemoryInfo) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<nvmlMemory_t>();
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, d, o]{ return a.DeviceGetMemoryInfo(d, o.get()); });
+  if (rc == NVML_SUCCESS) *mem = *o;
+  return rc; }
 static inline nvmlReturn_t nvmlDeviceGetCpuAffinity(nvmlDevice_t d, unsigned int sz, unsigned long * set)
-{ auto & a = gz_nvml(); return a.DeviceGetCpuAffinity ? a.DeviceGetCpuAffinity(d, sz, set) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetCpuAffinity) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<std::vector<unsigned long>>(sz ? sz : 1, 0UL);
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, d, sz, o]{ return a.DeviceGetCpuAffinity(d, sz, o->data()); });
+  if (rc == NVML_SUCCESS) for (unsigned i = 0; i < sz; ++i) set[i] = (*o)[i];
+  return rc; }
 static inline nvmlReturn_t nvmlDeviceGetMaxPcieLinkGeneration(nvmlDevice_t d, unsigned int * gen)
-{ auto & a = gz_nvml(); return a.DeviceGetMaxPcieLinkGeneration ? a.DeviceGetMaxPcieLinkGeneration(d, gen) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetMaxPcieLinkGeneration) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<unsigned int>(0);
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, d, o]{ return a.DeviceGetMaxPcieLinkGeneration(d, o.get()); });
+  if (rc == NVML_SUCCESS) *gen = *o;
+  return rc; }
 static inline nvmlReturn_t nvmlDeviceGetName(nvmlDevice_t d, char * buf, unsigned int len)
-{ auto & a = gz_nvml(); return a.DeviceGetName ? a.DeviceGetName(d, buf, len) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetName || !len) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<std::vector<char>>(len, '\0');
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, d, len, o]{ return a.DeviceGetName(d, o->data(), len); });
+  if (rc == NVML_SUCCESS) { std::memcpy(buf, o->data(), len); buf[len - 1] = '\0'; }
+  return rc; }
 static inline nvmlReturn_t nvmlDeviceGetUUID(nvmlDevice_t d, char * buf, unsigned int len)
-{ auto & a = gz_nvml(); return a.DeviceGetUUID ? a.DeviceGetUUID(d, buf, len) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.DeviceGetUUID || !len) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<std::vector<char>>(len, '\0');
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, d, len, o]{ return a.DeviceGetUUID(d, o->data(), len); });
+  if (rc == NVML_SUCCESS) { std::memcpy(buf, o->data(), len); buf[len - 1] = '\0'; }
+  return rc; }
 static inline nvmlReturn_t nvmlSystemGetDriverVersion(char * buf, unsigned int len)
-{ auto & a = gz_nvml(); return a.SystemGetDriverVersion ? a.SystemGetDriverVersion(buf, len) : GZ_NVML_UNAVAILABLE; }
+{ auto & a = gz_nvml(); if (!a.SystemGetDriverVersion || !len) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<std::vector<char>>(len, '\0');
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, len, o]{ return a.SystemGetDriverVersion(o->data(), len); });
+  if (rc == NVML_SUCCESS) { std::memcpy(buf, o->data(), len); buf[len - 1] = '\0'; }
+  return rc; }
 
 /*======================================================================
  GpuMonitor — one background NVML sampler, started at process entry
