@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.37";
+static constexpr const char * GZSTD_VERSION = "0.17.38";
 //
 // Architecture overview:
 //
@@ -73,6 +73,7 @@ static constexpr const char * GZSTD_VERSION = "0.17.37";
 #include <iomanip>
 #include <type_traits>
 #include <stdexcept>
+#include <system_error>
 #include <memory>
 #include <functional>
 #include <cerrno>
@@ -264,16 +265,65 @@ public:
   // Non-blocking; safe to call when NVML is absent (the thread simply exits).
   void start() {
 #ifdef HAVE_NVML
-    std::lock_guard<std::mutex> lk(m_);
-    if (started_) return;
-    started_ = true;
-    thr_ = std::thread([this]{ run(); });
+    const auto state = state_;
+    std::lock_guard<std::mutex> lk(state->m);
+    if (state->started) return;
+    thr_ = std::thread([state]{
+      try {
+        run(state);
+      } catch (...) {
+        // The handler guarantees run() is unwound, so ExitSignal publishes
+        // exited.  Treat an optional sampler failure like unavailable NVML
+        // instead of letting an exception escape the thread and terminate the
+        // whole compression operation.
+        {
+          std::lock_guard<std::mutex> lk2(state->m);
+          state->dead = true;
+        }
+        state->cv_ready.notify_all();
+      }
+    });
+    state->started = true;  // publish only after construction succeeds
 #endif
   }
   void stop() {
 #ifdef HAVE_NVML
-    { std::lock_guard<std::mutex> lk(m_); if (!thr_.joinable()) return; quit_ = true; }
-    cv_.notify_all();
+    const auto state = state_;
+    {
+      std::lock_guard<std::mutex> lk(state->m);
+      if (!thr_.joinable()) return;
+      state->quit = true;
+    }
+    state->cv.notify_all();
+    // BOUNDED JOIN.  state->quit and the notify only wake a thread parked on OUR
+    // condition variable.  A thread blocked inside a WEDGED NVML call is not
+    // waiting on it and never will be, so an unconditional join() hangs the
+    // process at exit -- after the work is done and the output written, which
+    // is the worst possible moment to hang.  CONFIRMED, not theorised: a stub
+    // libnvidia-ml.so.1 whose nvmlDeviceGetUtilizationRates never returns makes
+    // gzstd produce its output and then never terminate.
+    //
+    // A bound is possible here only because run() makes its NVML calls OUTSIDE
+    // state->m (the lock is taken just to publish rows), so a wedged sampler
+    // cannot block this wait by holding the mutex.
+    //
+    // On timeout, DETACH and let process exit reap the thread.  The sampler
+    // captures shared ownership of every field it can touch, so a slow NVML
+    // call that returns after this object is destroyed still has valid state;
+    // timeout proves "not back yet", not "will never return".
+    //
+    // THIS BOUNDS THE EXIT HANG ONLY.  gzstd calls NVML from five other sites,
+    // and a wedged driver can still stall those mid-run; that is a larger
+    // question than this destructor.
+    {
+      std::unique_lock<std::mutex> lk(state->m);
+      if (!state->cv_exit.wait_for(lk, std::chrono::milliseconds(500),
+                                   [&state]{ return state->exited; })) {
+        lk.unlock();
+        thr_.detach();
+        return;
+      }
+    }
     thr_.join();
 #endif
   }
@@ -282,32 +332,73 @@ public:
   // Wait up to `ms` for the first sweep.  Returns false if NVML never came up.
   bool wait_ready(int ms) {
 #ifdef HAVE_NVML
-    std::unique_lock<std::mutex> lk(m_);
-    cv_ready_.wait_for(lk, std::chrono::milliseconds(ms),
-                       [this]{ return ready_ || dead_; });
-    return ready_;
+    const auto state = state_;
+    std::unique_lock<std::mutex> lk(state->m);
+    state->cv_ready.wait_for(lk, std::chrono::milliseconds(ms),
+                             [&state]{ return state->ready || state->dead; });
+    return state->ready;
 #else
     (void)ms; return false;
 #endif
   }
   std::vector<Row> snapshot() const {
-    std::lock_guard<std::mutex> lk(m_);
-    return rows_;
+#ifdef HAVE_NVML
+    const auto state = state_;
+    std::lock_guard<std::mutex> lk(state->m);
+    return state->rows;
+#else
+    return {};
+#endif
+  }
+  size_t device_count() const {
+#ifdef HAVE_NVML
+    const auto state = state_;
+    std::lock_guard<std::mutex> lk(state->m);
+    return state->device_count;
+#else
+    return 0;
+#endif
   }
 
 private:
 #ifdef HAVE_NVML
-  void run() {
+  struct State {
+    std::mutex m;
+    std::condition_variable cv, cv_ready, cv_exit;
+    std::vector<Row> rows;
+    bool exited = false;
+    bool quit = false, started = false, ready = false, dead = false, first = true;
+    size_t device_count = 0;
+  };
+
+  static void run(const std::shared_ptr<State> & state) {
+    // Publish "the sampler thread has left run()" on EVERY exit path, so
+    // stop()'s bounded wait can distinguish a finished thread from a wedged one.
+    struct ExitSignal {
+      std::shared_ptr<State> state;
+      ~ExitSignal() {
+        {
+          std::lock_guard<std::mutex> lk(state->m);
+          state->exited = true;
+        }
+        state->cv_exit.notify_all();
+      }
+    } exit_signal{state};
+    State & s = *state;
     if (nvmlInit_v2() != NVML_SUCCESS) {           // no driver: publish nothing
-      { std::lock_guard<std::mutex> lk(m_); dead_ = true; }
-      cv_ready_.notify_all();
+      { std::lock_guard<std::mutex> lk(s.m); s.dead = true; }
+      s.cv_ready.notify_all();
       return;
     }
     unsigned n = 0;
     if (nvmlDeviceGetCount_v2(&n) != NVML_SUCCESS || n == 0) {
-      { std::lock_guard<std::mutex> lk(m_); dead_ = true; }
-      cv_ready_.notify_all();
+      { std::lock_guard<std::mutex> lk(s.m); s.dead = true; }
+      s.cv_ready.notify_all();
       return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(s.m);
+      s.device_count = n;
     }
     // Identity is fixed for the run; sample only the changing fields below.
     std::vector<nvmlDevice_t> handles;
@@ -322,15 +413,18 @@ private:
       rows.push_back(std::move(r));
     }
     if (rows.empty()) {
-      { std::lock_guard<std::mutex> lk(m_); dead_ = true; }
-      cv_ready_.notify_all();
+      { std::lock_guard<std::mutex> lk(s.m); s.dead = true; }
+      s.cv_ready.notify_all();
       return;
     }
     for (;;) {
       for (size_t i = 0; i < handles.size(); ++i) {
         nvmlUtilization_t u{};
         unsigned sample = rows[i].util;
-        if (nvmlDeviceGetUtilizationRates(handles[i], &u) == NVML_SUCCESS) sample = u.gpu;
+        if (nvmlDeviceGetUtilizationRates(handles[i], &u) == NVML_SUCCESS)
+          sample = u.gpu;
+        else if (s.first)
+          sample = 100;  // unknown is not idle; 100 is the utilization scale's maximum
         nvmlMemory_t mem{};
         if (nvmlDeviceGetMemoryInfo(handles[i], &mem) == NVML_SUCCESS) {
           rows[i].free_bytes = mem.free; rows[i].total_bytes = mem.total;
@@ -338,27 +432,24 @@ private:
         // Smooth: one instantaneous read is not trustworthy (0% has been
         // observed on a device that was demonstrably busy).  First sweep takes
         // the raw value so the table is usable immediately.
-        rows[i].util = first_ ? sample : (rows[i].util * 3 + sample) / 4;
+        rows[i].util = s.first ? sample : (rows[i].util * 3 + sample) / 4;
       }
       {
-        std::lock_guard<std::mutex> lk(m_);
-        rows_ = rows;
-        ready_ = true;
-        first_ = false;
+        std::lock_guard<std::mutex> lk(s.m);
+        s.rows = rows;
+        s.ready = true;
+        s.first = false;
       }
-      cv_ready_.notify_all();
-      std::unique_lock<std::mutex> lk(m_);
+      s.cv_ready.notify_all();
+      std::unique_lock<std::mutex> lk(s.m);
       // Timed CV wait, not a sleep: stop() must not have to wait out a tick.
-      if (cv_.wait_for(lk, std::chrono::milliseconds(250), [this]{ return quit_; }))
+      if (s.cv.wait_for(lk, std::chrono::milliseconds(250), [&s]{ return s.quit; }))
         return;
     }
   }
+  std::shared_ptr<State> state_ = std::make_shared<State>();
   std::thread thr_;
-  std::condition_variable cv_, cv_ready_;
-  bool quit_ = false, started_ = false, ready_ = false, dead_ = false, first_ = true;
 #endif
-  mutable std::mutex m_;
-  std::vector<Row> rows_;
 };
 static GpuMonitor g_gpu_monitor;
  #endif // HAVE_NVML
@@ -31607,6 +31698,68 @@ static int run_calibrate(Options opt)
 }
 #endif  // !_WIN32
 
+#ifdef HAVE_NVCOMP
+// Put every GPU in CUDA's visible set, but order that set by the NVML ranking.
+// This must run before the first CUDA API call: CUDA reads and freezes
+// CUDA_VISIBLE_DEVICES during initialization.  It is normally called after
+// apply_backend_defaults(), when the backend is final.  GPU verify is the one
+// exception because its capability probe lives inside that function; that path
+// calls this helper immediately before the probe and the later call is a no-op.
+static void order_all_gpus_before_cuda(const Options & opt)
+{
+#ifdef HAVE_NVML
+  // Calibration runs both GPU passes even when a backend flag was also given;
+  // judge that mode by what run_calibrate() does, not by opt.cpu_only/list_mode.
+  if (opt.gpu_devices != 0 || (!opt.calibrate && (opt.cpu_only || opt.list_mode))
+      || ::getenv("CUDA_VISIBLE_DEVICES"))
+    return;
+
+  try {
+    g_gpu_monitor.start();
+  } catch (const std::system_error & e) {
+    vlog(V_ERROR, opt, std::string("gzstd: warning: cannot start GPU device sampler (")
+         + e.what() + "); keeping CUDA's original device order\n");
+    return;
+  }
+  g_gpu_monitor.wait_ready(500);
+  const auto rows = g_gpu_monitor.snapshot();
+
+  // ORDER ONLY, NEVER COUNT.  A per-device NVML handle/UUID lookup can fail
+  // even after DeviceGetCount succeeds.  Building the environment from that
+  // partial table would silently hide every omitted device, changing the
+  // gpu_devices=0 contract from "all" to "whatever NVML happened to report".
+  // With an incomplete sample the safe fallback is the original full set.
+  if (rows.size() <= 1 || rows.size() != g_gpu_monitor.device_count()) return;
+
+  std::vector<GzDevRank> rin;
+  rin.reserve(rows.size());
+  for (const auto & r : rows) rin.push_back({r.util, r.free_bytes});
+  const std::vector<size_t> order = gz_rank_devices(rin);
+  std::string sel;
+  for (size_t i = 0; i < order.size(); ++i) {
+    if (!sel.empty()) sel += ",";
+    sel += rows[order[i]].uuid;                  // "GPU-<uuid>": no index needed
+  }
+  if (sel.empty()) return;
+  if (::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1) != 0) {
+    const int e = errno;
+    vlog(V_ERROR, opt, std::string("gzstd: warning: cannot set CUDA_VISIBLE_DEVICES (")
+         + std::strerror(e) + "); keeping CUDA's original device order\n");
+    return;
+  }
+  if (opt.verbosity >= V_VERBOSE) {
+    std::ostringstream os;
+    os << "[GPU] all " << rows.size() << " devices kept, ordered by combined "
+          "rank (utilization + free VRAM); the least-contended card is CUDA "
+          "GPU0 and takes the first batch\n";
+    vlog(V_VERBOSE, opt, os.str());
+  }
+#else
+  (void)opt;
+#endif
+}
+#endif
+
 static int gzstd_main(int argc, char ** argv)
 {
   setup_signal_handlers();
@@ -31669,67 +31822,7 @@ static int gzstd_main(int argc, char ** argv)
   apply_backend_defaults(opt);
 
 #ifdef HAVE_NVCOMP
-  // RANK THE DEVICES EVEN WHEN TAKING ALL OF THEM.
-  //
-  // At --gpu-devices=0 (auto = every GPU) the selection block near the top of
-  // this function is skipped, on the stated grounds that "if the run wants every
-  // GPU the box has, ranking them decides nothing."  That is right about the
-  // COUNT and wrong about the ORDER.  CUDA renumbers the visible set from zero
-  // and workers are spawned in that order, so the first device takes the first
-  // batch -- and on a run that never fills every device, it may take all of
-  // them.  Unranked, "first" is whatever CUDA happens to list first, which is
-  // typically the same card every other tool on the box also grabs first.
-  // Observed: gzstd ran on the one card another user was working on while seven
-  // sat idle.
-  //
-  // Choosing HOW MANY devices to use is a different question and is deliberately
-  // not answered here: this box's own numbers say the optimum is not a constant
-  // (best at 1, 2, 4 and 4 devices across 1.9 / 8 / 24 / 195 GiB), so it belongs
-  // to --adapt.  Ordering needs no such constant.
-  //
-  // PLACED HERE, AFTER apply_backend_defaults() RETURNS, ON PURPOSE -- and not
-  // inside it, which was tried first and does not work: that function returns
-  // early for any explicit --cpu-only/--gpu-only/--hybrid (backend_user_set) and
-  // again for auto compress, so its tail is nearly unreachable and the ordering
-  // silently never ran.  Here the backend and the device count are both final,
-  // no CUDA call has happened yet, and a run that will not touch a GPU is
-  // guaranteed not to start the sampler.  That guarantee is the whole design: MEASURED on a
-  // 20 MB input, starting the sampler costs ~340 ms and waiting for its first
-  // sweep ~100 ms more, against a 44-64 ms run -- a 6-8x regression if it were
-  // paid unconditionally, which is the same mistake that once doubled the test
-  // suite.  On a run large enough to engage the GPU it vanishes into the noise:
-  // at 4 GiB the ranked path measured 8.49-8.55 s against the unranked all-eight
-  // default's 9.56-10.07, i.e. 11-15% FASTER despite paying it.
-  //
-  // --gds-only and --direct-stage already force gpu_devices=1, so they take the
-  // block above and were never affected by this gap.
-  if (opt.gpu_devices == 0 && !opt.cpu_only
-      && !::getenv("CUDA_VISIBLE_DEVICES")) {   // never second-guess the user
-    g_gpu_monitor.start();
-    g_gpu_monitor.wait_ready(500);
-    const auto rows = g_gpu_monitor.snapshot();
-    if (rows.size() > 1) {                      // ordering one device decides nothing
-      std::vector<GzDevRank> rin;
-      rin.reserve(rows.size());
-      for (const auto & r2 : rows) rin.push_back({r2.util, r2.free_bytes});
-      const std::vector<size_t> order = gz_rank_devices(rin);
-      std::string sel;
-      for (size_t i = 0; i < order.size(); ++i) {
-        if (!sel.empty()) sel += ",";
-        sel += rows[order[i]].uuid;             // "GPU-<uuid>": no index needed
-      }
-      if (!sel.empty()) {
-        ::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1);
-        if (opt.verbosity >= V_VERBOSE) {
-          std::ostringstream os;
-          os << "[GPU] all " << rows.size() << " devices kept, ordered by combined "
-                "rank (utilization + free VRAM); the least-contended card is CUDA "
-                "GPU0 and takes the first batch\n";
-          vlog(V_VERBOSE, opt, os.str());
-        }
-      }
-    }
-  }
+  order_all_gpus_before_cuda(opt);
 #endif
 
   // Early startup banner at -v+.  Printed BEFORE any heavy init (CUDA
@@ -34107,8 +34200,12 @@ static void apply_backend_defaults(Options & opt)
     // On a GPU outside that range the launch would fail with no-image-for-device
     // and abort the whole compress, so probe once and quietly demote to the CPU
     // VerifyPool (which covers every frame) instead.  The probe runs on the
-    // default device; in the common homogeneous-GPU box that is representative,
-    // and the embedded PTX makes the answer identical across same-or-newer cards.
+    // default device; order the all-device set first because this probe is also
+    // the first CUDA API call on this path, and CUDA freezes its visible-device
+    // order at initialization.  In the common homogeneous-GPU box that device is
+    // representative, and the embedded PTX makes the answer identical across
+    // same-or-newer cards.
+    if (opt.gpu_verify) order_all_gpus_before_cuda(opt);
     if (opt.gpu_verify && gzv_kernel_available() != 1) {
       opt.gpu_verify = false;
       vlog(V_ERROR, opt,

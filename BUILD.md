@@ -37,6 +37,33 @@ cmake --build build -j$(nproc)
 
 Requires all shared libraries (zstd, nvcomp, cudart) to be on `LD_LIBRARY_PATH` or in the RPATH at runtime. The RPATH is automatically configured for `$ORIGIN`, conda prefixes, and common system paths.
 
+### Known: the build-tree binary searches the current directory for libraries
+
+`./build/gzstd` — the binary CMake leaves in the build tree — has an empty element at the end of its
+RUNPATH, and an empty RUNPATH element means **the current working directory** to the dynamic loader.
+It will therefore load `libnvidia-ml.so.1`, `libcufile.so.0`, `libzstd`, `libnvcomp` or `libcudart`
+from whatever directory you run it in, and that library's constructors execute inside the process.
+
+**Installed binaries are not affected.** Anything from `cmake --install` — including the portable
+release artifact — has a clean RUNPATH with no empty element. This is not reachable through an
+archive or any input file, and it is not remotely triggerable; it needs a library file sitting in a
+directory you then run the *development* binary from.
+
+In practice this matters only if you run `./build/gzstd` with your working directory somewhere you do
+not control — a shared scratch area, or a tree you have just extracted from an untrusted archive. If
+that applies to you, run the installed binary instead:
+
+```bash
+cmake --install build --prefix ./dist
+./dist/bin/gzstd ...
+```
+
+The empty element is added by CMake's generated build-tree RPATH, not by this project's list. It is
+left in place deliberately: the two available fixes each cost more than the defect — one drops
+CMake's auto-discovered link directories (so a build whose zstd/nvCOMP live outside the listed
+prefixes links but will not run), and the other breaks `cmake --install` outright. See the v0.17.38
+CHANGELOG entry for the measurements.
+
 ### Static Build (portable)
 
 ```bash

@@ -1,12 +1,104 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.37  
+**Covers:** v0.9.50 → v0.17.38  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.38 — a fix that looked applied and was not, and the current directory on the library search path
+
+An independent review of v0.17.37 returned two blocking findings. Both were real, both were verified
+in source before adopting, and the first is one this project's own grep discipline could not have
+caught.
+
+### The device ordering silently did nothing under --verify
+
+v0.17.37 set `CUDA_VISIBLE_DEVICES` after `apply_backend_defaults()` returned, on the stated grounds
+that no CUDA call happens before that point. **That grep was run against `gzstd.cpp` alone.**
+`gzv_kernel_available()` is declared `extern "C"` at gzstd.cpp:22150 and DEFINED IN `gpuverify.cu`,
+where its first statement is `cudaMalloc` — and it is called at gzstd.cpp:34112, inside
+`apply_backend_defaults()`.
+
+So with `--verify --verify-engine=gpu` (and on eligible hardware, auto-verify), CUDA initialised
+first, froze its visible-device order, and the `setenv` afterwards was inert. **The ordering was not
+wrong; it never ran.** That is the same shape as the defect v0.17.37 itself fixed — a ranking that
+was correct and never consulted — reached this time through a call into another translation unit.
+
+The selection is now a helper invoked immediately before that capability probe as well as after
+backend resolution; it is idempotent, because it returns early when `CUDA_VISIBLE_DEVICES` is
+already set, which is what it sets itself.
+
+### "Order only, never count" was not true of a partial NVML enumeration
+
+The sampler `continue`s past a device whose `nvmlDeviceGetHandleByIndex` or `nvmlDeviceGetUUID`
+fails, so its row table can be shorter than the device count. Building `CUDA_VISIBLE_DEVICES` from
+that short list **silently hides every omitted device**, turning the `gpu_devices=0` contract from
+"all" into "whatever NVML happened to report". The selection now requires a complete sample and
+falls back to CUDA's original full set otherwise.
+
+Four smaller corrections from the same review: an unknown first utilization read counts as 100
+(busy), not 0 (idle); `-l` no longer starts the sampler; calibration is recognised as GPU-using even
+with `--cpu-only`; sampler-thread and `setenv` failures warn and fall back instead of aborting or
+claiming success.
+
+### A wedged NVML driver hangs gzstd — CONFIRMED, and only partly fixed
+
+The review flagged that a genuinely wedged NVML call could outlast the sampler's 500 ms wait and then
+hang the monitor's unconditional destructor join, but could not confirm it without a hanging NVML
+shim. gzstd `dlopen`s `libnvidia-ml.so.1` **by soname**, so one is buildable: every symbol succeeds
+except `nvmlDeviceGetUtilizationRates`, which never returns.
+
+**It hangs, and more broadly than the destructor.** With GPU workers running the process produces
+**zero bytes** and never terminates — three threads sit in the wedged call and the main thread waits
+on them. There are six call sites for that function, so the destructor is not even reached.
+
+`stop()` now waits up to 500 ms for the sampler to signal it left `run()`, then detaches. A bound is
+possible at all only because `run()` makes its NVML calls OUTSIDE the mutex, taking it just to
+publish the row table — a sampler that held it across the call would have blocked the wait too.
+
+Mutation-tested by isolating the destructor case (sampler started, input too small for GPU workers,
+so nothing else touches NVML): **the pre-fix binary hangs at the 30 s timeout; the fixed binary exits
+0 in 1 second** with correct output and the shim confirmed engaged.
+
+**This bounds the exit hang only.** A wedged driver still stalls the five other call sites mid-run,
+which is a larger question than this destructor and is left open deliberately.
+
+### KNOWN, NOT FIXED: the current working directory is on the BUILD-TREE library search path
+
+Found while building the NVML shim above: a "control" run with no `LD_LIBRARY_PATH` set also hung,
+because `./build/gzstd` loaded the shim **out of the current directory**. Its RUNPATH ends in an
+empty element, and an empty RUNPATH element means CWD to the dynamic loader:
+
+```
+0:'$ORIGIN'  …  6:'…/lib64'  7:''   <-- the current working directory
+```
+
+So the build-tree binary will take `libnvidia-ml.so.1`, `libcufile.so.0`, `libzstd`, `libnvcomp` or
+`libcudart` from whatever directory it is run in, and that library's constructors run inside the
+process. Demonstrated: same command, same directory, no environment tricks — the build-tree binary
+loads a planted `libnvidia-ml.so.1`, the installed binary does not.
+
+**THE INSTALLED BINARY IS NOT AFFECTED — 7 RUNPATH elements, zero empty.** Everything produced by
+`cmake --install`, including the portable artifact a `v*` tag builds, is clean. The exposure is to
+developers and the test suite running `./build/gzstd` with the working directory somewhere they do
+not control, and it is not reachable through any archive or input file.
+
+**Deliberately not fixed**, because every available fix costs more than the defect:
+
+| approach | build tree | `cmake --install` | cost |
+|---|---|---|---|
+| leave it (chosen) | 1 empty element | works | dev-only exposure, documented in BUILD.md |
+| `BUILD_WITH_INSTALL_RPATH` | clean | works | drops CMake's auto-discovered link dirs, so a build whose zstd/nvCOMP live outside the listed prefixes links but will not run |
+| `CMAKE_NO_BUILTIN_CHRPATH` | clean | **BREAKS** | needs a relink target; `cmake --install build` fails with "cannot find CMakeRelink.dir/gzstd", and that is the command BUILD.md documents |
+
+The empty element comes from CMake's generated build-tree RPATH, not from this project's list — ours
+is 7 entries with no blank, probed at configure time. Two theories were tested and disproved: it is
+not length padding for in-place `chrpath` editing (making `BUILD_RPATH` strictly longer leaves the
+empty element), and passing `-Wl,-rpath` through `target_link_options` emits it once per object,
+producing 148 entries of which 141 were the empty one.
 
 ## v0.17.37 — the device ranking was never consulted at the default, and a fixture that damaged nothing 1 run in 256
 
