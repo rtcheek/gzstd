@@ -1046,6 +1046,11 @@ static int                   g_gds_verify_fd = -1;   // O_DIRECT dup of the arch
 // A BUFFERED dup as well, for the CPU rescue: it preads arbitrary
 // (offset, length) pairs, which an O_DIRECT descriptor rejects outright.
 static int                   g_gds_verify_plain_fd = -1;
+// Defined with the staged producer far below; forward-declared because the
+// device-side checksum verdict needs it to tell a lying seek table apart from
+// corrupt data, and that verdict is reached first in file order.
+static bool gds_frame_extent_matches(int fd, uint64_t off, uint64_t claimed,
+                                     const unsigned char * head, size_t head_n);
 
 // End one decompression's staged-read transaction.  PER FILE, not per process:
 // decompress_nvcomp() runs once per input, and only the demote path used to
@@ -1081,6 +1086,22 @@ static void gds_decomp_read_close()
 }
 static std::atomic<uint64_t> g_gds_verify_frames{0};
 static std::atomic<uint64_t> g_gds_verify_bytes{0};
+// COUNTED, NOT COMPUTED.  The -vv producer line used to report `nframes * 2` --
+// a formula for the two preads this loop makes per frame, which silently
+// omitted every 3-byte read the block-header walk makes.  On a 65 GiB archive
+// it printed "16686 metadata preads" for a walk that really issued ~1.7 MILLION,
+// so the cold cost of the walk was invisible at every verbosity.  An instrument
+// that reports what it assumes cannot show you what it costs.
+static std::atomic<uint64_t> g_gds_meta_preads{0};
+// Set when the staged producer stood down because the table is DISHONEST rather
+// than absent.  The demote notice below says which, because "this archive has
+// none" is false and misleading when the archive has a table that was rejected.
+static std::atomic<bool> g_gds_table_rejected{false};
+// SAY IT ONCE.  The preflight and the producer check the table independently
+// and deliberately are NOT deduplicated (each pins the inode at a different
+// moment), so a defect they both find would otherwise be reported twice --
+// three times with the preflight's own decline notice.  One fact, one line.
+static std::atomic<bool> g_gds_defect_said{false};
 static int                g_stage_input_fd    = -1;
 static unsigned long long g_gds_bar1_before = 0;
 // --gds-only decompress writes VRAM -> NVMe at absolute offsets, so frames need
@@ -2394,6 +2415,15 @@ struct Options {
                                   //  error — write what decoded, record the damage, continue, then
                                   //  report which file(s)/byte ranges are affected.  Implies
                                   //  --cpu-only (the authoritative checksum validator).
+  bool keep_going_requested = false;  // WHAT THE USER TYPED, before the rewrites below.
+                                  //  `keep_going` is cleared for -t and forces --cpu-only, both of
+                                  //  which serve the frame-damage recovery machinery.  A DISHONEST
+                                  //  SEEK TABLE is a different failure: it is recovered by ignoring
+                                  //  the table (the ordinary producer finds real frame boundaries),
+                                  //  which needs neither -d nor the CPU decoder.  Reading
+                                  //  `keep_going` there would silently ignore the flag on exactly
+                                  //  the two spellings a user hits first, `-t --keep-going` and
+                                  //  `--gds-only --keep-going`.
   bool adapt = false;             // --adapt: adaptive governor — classify the run's bottleneck
                                   //  regime (source/compute/sink) from the Meter's state counters
                                   //  and steer tuning toward the measured-fastest configuration.
@@ -2924,6 +2954,15 @@ static void die_io(const std::string & msg)
 static void die_data(const std::string & msg)
 { die(msg, EXIT_DATA); }
 
+// Defined with the staged producer; declared here because the device-side
+// checksum verdict (far above it in file order) needs it to tell a dishonest
+// seek table apart from corrupt data.  Guarded like its definition: without
+// nvCOMP there is no staged path to report on, and an unguarded declaration
+// warns "declared static but never defined" in the CPU-only build.
+#ifdef HAVE_NVCOMP
+static bool gds_table_defect(const Options & opt, const std::string & what);
+#endif
+
 #ifdef HAVE_NVCOMP
 // A failed CUDA op while composing a --tar frame in VRAM is NOT ignorable, and
 // this is the one place in gzstd where ignoring one is actively dangerous rather
@@ -3246,9 +3285,10 @@ static void print_help()
 "  --verify-engine E   verify on cpu|gpu|auto (gpu-only compress; auto = by\n"
 "                      PCIe generation).  Implies --verify; falls back to CPU\n"
 "                      with a warning unless this is a --gpu-only compress\n"
-"  --keep-going        on -d, don't stop at a corrupt frame: recover what's\n"
-"                      readable, then report which file(s) are damaged.\n"
-"                      Implies --cpu-only and forces --read-threads 1\n"
+"  --keep-going        on -d/-t, don't stop at a corrupt frame or a seek table\n"
+"                      that lies: recover what's readable, then report which\n"
+"                      file(s) are damaged.  Implies --cpu-only and\n"
+"                      --read-threads 1 (not with --gds-only/--direct-stage)\n"
 "\n"
 "Adaptive:\n"
 "  --adapt             adaptive governor: classify the run's bottleneck regime\n"
@@ -3512,7 +3552,14 @@ static void print_help_long()
 "     UNVERIFIED (one or more bytes somewhere in it may be wrong); a frame\n"
 "     that cannot be decoded at all yields only what decoded before the\n"
 "     error.  Implies --cpu-only and a single reader thread (damage must\n"
-"     map to exact output offsets).  Existing files are overwritten as usual;\n"
+"     map to exact output offsets) — except with --gds-only or\n"
+"     --direct-stage, which reach recovery by standing down to the ordinary\n"
+"     read path instead.  It ALSO covers a second kind of damage: an archive\n"
+"     whose SEEK TABLE disagrees with the frames it describes is reported as\n"
+"     an error (exit 4), because an index that is wrong is a defect even when\n"
+"     the data is intact; --keep-going ignores the table and decodes the\n"
+"     stream directly, which recovers such an archive completely.\n"
+"     Existing files are overwritten as usual;\n"
 "     to recover alongside the originals, extract into a fresh directory\n"
 "     with -C DIR.  Exit codes: 6 = finished but some file(s) are\n"
 "     unverified; 7 = finished but some data could not be decoded\n"
@@ -28464,13 +28511,43 @@ static void gpu_decomp_worker(
                 + std::to_string(C.batch[i].decomp_size)
                 + " bytes, nvCOMP produced " + std::to_string(actual)
                 + " (corrupt input?)");
-          if (C.h_has_ck[i] && C.h_verify_ck[i] != C.h_expect_ck[i])
+          if (C.h_has_ck[i] && C.h_verify_ck[i] != C.h_expect_ck[i]) {
+            // WHICH OF THE TWO IS IT?  A staged frame's expected hash was read
+            // from the END OF THE EXTENT THE SEEK TABLE CLAIMED, so an entry that
+            // swallows the next frame lands this read on the WRONG frame's
+            // trailer and mismatches although both frames decoded perfectly.
+            // That is a defect in the table, not in the data or the GPU, and
+            // saying "the archive is corrupt" about it sent the reader looking
+            // in the wrong place -- the exact misattribution the v0.17.30 notes
+            // record ("blames the GPU for a frame that decoded perfectly").
+            //
+            // The producer skips the boundary walk for a self-checked frame
+            // because THIS check is its proof; so pay for the walk here, once,
+            // for the single frame that just failed, and say which it was.
+            if (C.batch[i].src_off >= 0 && g_gds_verify_plain_fd >= 0) {
+              unsigned char fh[18];
+              size_t want = sizeof fh;
+              const uint64_t csz = (uint64_t)C.batch[i].len();
+              if (csz < (uint64_t)want) want = (size_t)csz;
+              const ssize_t got = ::pread(g_gds_verify_plain_fd, fh, want,
+                                          (off_t)C.batch[i].src_off);
+              if (got >= 9 && !gds_frame_extent_matches(
+                                  g_gds_verify_plain_fd,
+                                  (uint64_t)C.batch[i].src_off, csz,
+                                  fh, (size_t)got))
+                gds_table_defect(opt,
+                    "this archive's seek table gives frame "
+                  + std::to_string(batch_seqs[i]) + " a compressed extent that "
+                    "does not end at that frame's real boundary, so the frame's "
+                    "own checksum was read from the wrong place");
+            }
             die("content-checksum mismatch at frame "
                 + std::to_string(batch_seqs[i]) + ": the frame declares "
                 + std::to_string(C.h_expect_ck[i]) + " but the decoded bytes hash to "
                 + std::to_string(C.h_verify_ck[i])
                 + " -- the archive is corrupt, or this GPU decoded it incorrectly."
                 + "  Re-run with --cpu-only to tell the two apart.", EXIT_DATA);
+          }
           return actual;
         };
 
@@ -29135,6 +29212,38 @@ static const size_t GDS_VERIFY_DEMOTE = SIZE_MAX;
 // 3 bytes per block -- it never touches the compressed data itself.  Reaching
 // Last_Block exactly at the claimed extent proves the entry describes one whole
 // frame and nothing more.
+// A SEEK TABLE THAT DISAGREES WITH THE FRAMES IT DESCRIBES IS A DEFECT IN THE
+// ARCHIVE, not a reason to quietly take a different read path.  Every shape that
+// reaches here used to demote to the ordinary producer and exit 0, so `-t`
+// printed OK on an archive whose index is wrong -- and `-t` is the one command
+// whose entire purpose is to tell you that.  The data may well be intact; the
+// index is not, and that is what the caller asked about.
+//
+// --keep-going is the escape hatch, and it means something precise here: the
+// ordinary producer finds real frame boundaries by walking the stream, so
+// IGNORING THE TABLE recovers the archive completely.  That needs neither -d nor
+// the CPU decoder, which is why this reads keep_going_requested rather than the
+// rewritten keep_going.
+//
+// Returns true if the caller should carry on (demote); does not return otherwise.
+static bool gds_table_defect(const Options & opt, const std::string & what)
+{
+  if (opt.keep_going_requested) {
+    g_gds_table_rejected.store(true, std::memory_order_relaxed);
+    if (g_gds_defect_said.exchange(true, std::memory_order_relaxed)) return true;
+    vlog(V_NORMAL, opt,
+         "WARNING: " + what + "\n"
+         "  --keep-going: ignoring the seek table and decoding the stream directly;\n"
+         "  the output is complete, but this archive's index is wrong.\n");
+    return true;
+  }
+  die_data(what + "\n"
+           "  The frame data itself may be intact -- it is the archive's seek table\n"
+           "  that is wrong.  Re-run with --keep-going to ignore the table and decode\n"
+           "  the stream directly.");
+  return false;                    // unreachable: die_data() exits
+}
+
 static bool gds_frame_extent_matches(int fd, uint64_t off, uint64_t claimed,
                                      const unsigned char * head, size_t head_n)
 {
@@ -29158,6 +29267,7 @@ static bool gds_frame_extent_matches(int fd, uint64_t off, uint64_t claimed,
   auto pread3 = [&](uint64_t at, unsigned char (&bh)[3]) -> bool {
     size_t have = 0;
     while (have < sizeof bh) {
+      g_gds_meta_preads.fetch_add(1, std::memory_order_relaxed);
       const ssize_t r = ::pread(fd, bh + have, sizeof bh - have,
                                 (off_t)(off + at + have));
       if (r < 0 && errno == EINTR) continue;
@@ -29203,6 +29313,9 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   if (fd < 0) return GDS_VERIFY_DEMOTE;
 
   const uint64_t prod_t0 = now_ns();
+  g_gds_meta_preads.store(0, std::memory_order_relaxed);
+  g_gds_table_rejected.store(false, std::memory_order_relaxed);
+  size_t walked_frames = 0;        // frames that needed the block-header walk
   // BUILD FIRST, PUSH LAST.  Every demote below must leave the queue exactly as
   // it was found: the caller falls through to the ordinary producer, which
   // re-reads the archive from the start, so a half-filled queue would deliver
@@ -29232,10 +29345,16 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     unsigned char hdr[18], tr[4];               // 18 = ZSTD_FRAMEHEADERSIZE_MAX
     size_t hwant = sizeof hdr;
     if (csz < (uint64_t)hwant) hwant = (size_t)csz;
+    g_gds_meta_preads.fetch_add(1, std::memory_order_relaxed);
     const ssize_t hgot = ::pread(fd, hdr, hwant, (off_t)off);
     if (hgot < 9) return GDS_VERIFY_DEMOTE;
-    if (hdr[0] != 0x28 || hdr[1] != 0xB5 || hdr[2] != 0x2F || hdr[3] != 0xFD)
-      return GDS_VERIFY_DEMOTE;                     // table disagrees with the file
+    if (hdr[0] != 0x28 || hdr[1] != 0xB5 || hdr[2] != 0x2F || hdr[3] != 0xFD) {
+      gds_table_defect(opt,                         // table disagrees with the file
+               "this archive's seek table puts frame " + std::to_string(k)
+             + " at offset " + std::to_string(off) + ", where there is no zstd "
+               "frame, so the table does not describe this file");
+      return GDS_VERIFY_DEMOTE;
+    }
     // CHECK THE SIZE THE TABLE CLAIMS, NOT ONLY THE BOUNDARY.  `dsz` becomes
     // t.decomp_size, which sizes the device buffer and places the frame in the
     // output, so a table with honest boundaries and dishonest sizes misplaces
@@ -29248,16 +29367,66 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     // taken on trust either.
     {
       const unsigned long long fcs = ZSTD_getFrameContentSize(hdr, (size_t)hgot);
-      if (fcs == ZSTD_CONTENTSIZE_ERROR || fcs == ZSTD_CONTENTSIZE_UNKNOWN ||
-          fcs != dsz)
+      // A frame that declares NOTHING cannot be checked -- that is a limit of the
+      // archive, not evidence against it, so it still demotes quietly.  A frame
+      // that declares a DIFFERENT size is the table contradicting the stream.
+      if (fcs == ZSTD_CONTENTSIZE_ERROR || fcs == ZSTD_CONTENTSIZE_UNKNOWN)
         return GDS_VERIFY_DEMOTE;
+      if (fcs != dsz) {
+        gds_table_defect(opt,
+                 "this archive's seek table claims frame " + std::to_string(k)
+               + " decodes to " + std::to_string(dsz) + " bytes but the frame "
+                 "itself declares " + std::to_string(fcs)
+               + ", so the table would misplace every frame after it");
+        return GDS_VERIFY_DEMOTE;
+      }
     }
     // The header proves where this frame BEGINS and what it decodes to; it
     // cannot prove where it ENDS.  An entry that swallows the next frame keeps
     // every check above happy and silently drops that frame's bytes.
-    if (!gds_frame_extent_matches(fd, off, csz, hdr, (size_t)hgot))
+    //
+    // 🔴 WALK ONLY WHAT THE DEVICE CANNOT ALREADY PROVE.  This is the one check
+    // here that reads the frame's INTERIOR, at one 3-byte pread per zstd block.
+    // MEASURED on a cold 65 GiB archive: ~1.7 MILLION serial QD1 preads, ~100 s
+    // in D state before a single byte was verified, pulling 4.2 GiB of payload
+    // through the page cache -- on the one flag whose entire claim is that the
+    // payload never enters host memory.  `-t` went 28.6 s (--gpu-only) to 111.6 s.
+    //
+    // A frame carrying its OWN content checksum does not need it.  The trailer
+    // read below sits at the END of the CLAIMED extent, so an entry that swallows
+    // the next frame reads the WRONG frame's hash, and the device-side XXH64 --
+    // computed in VRAM over bytes that are already there, costing no host I/O --
+    // cannot match.  MEASURED against a merged-extent forgery with the walk
+    // disabled: exit 4, caught.  The suite's own fixture has to build its merge
+    // case with `zstd --no-check` for exactly this reason.
+    //
+    // A CHECKSUMLESS frame has no such proof.  Its seek-table checksum is no
+    // help either: a forged table supplies that too.  MEASURED, same forgery
+    // without frame checksums and the walk disabled: exit 0, frame silently
+    // gone.  So those are still walked, and only those.
+    //
+    // --keep-going WALKS EVERYTHING, and that is not a contradiction.  Recovering
+    // from a dishonest table means IGNORING it, which only the ordinary producer
+    // can do -- and the demote that reaches it exists at producer time only (the
+    // workers freeze their topology at spawn, so a discovery made mid-batch is
+    // already too late; see the v0.17.29 ordering trap).  A checksummed frame's
+    // proof arrives exactly there, mid-batch, too late to demote.  So when the
+    // user has asked to survive a bad archive, find the defect while standing
+    // down is still possible.  The walk's cost is then paid only by a run that
+    // explicitly asked to tolerate damage, never by an ordinary one.
+    const bool self_checked = (hdr[4] & 0x04) != 0;
+    const bool must_walk    = !self_checked || opt.keep_going_requested;
+    if (must_walk) ++walked_frames;
+    if (must_walk
+        && !gds_frame_extent_matches(fd, off, csz, hdr, (size_t)hgot)) {
+      gds_table_defect(opt,
+               "this archive's seek table gives frame " + std::to_string(k)
+             + " a compressed extent that does not end at that frame's real "
+               "boundary, so the table does not account for every frame in the file");
       return GDS_VERIFY_DEMOTE;
+    }
     if (hdr[4] & 0x04) {
+      g_gds_meta_preads.fetch_add(1, std::memory_order_relaxed);
       if (::pread(fd, tr, sizeof tr, (off_t)(off + csz - 4)) != (ssize_t)sizeof tr)
         return GDS_VERIFY_DEMOTE;
       t.stg_has_ck    = 1;
@@ -29295,8 +29464,12 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   if (opt.verbosity >= V_VERBOSE) {
     char pb[160];
     std::snprintf(pb, sizeof(pb),
-        "[GDS] producer: %zu frames, %zu metadata preads, %.2f s before any batch ran\n",
-        nframes, nframes * 2, double(now_ns() - prod_t0) / 1e9);
+        "[GDS] producer: %zu frames, %llu metadata preads (%llu walked), "
+        "%.2f s before any batch ran\n",
+        nframes,
+        (unsigned long long)g_gds_meta_preads.load(std::memory_order_relaxed),
+        (unsigned long long)walked_frames,
+        double(now_ns() - prod_t0) / 1e9);
     std::cerr << pb;
     char sz[32]; human_bytes(double(st.u_off.back()), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, "[GDS] verify: " + std::to_string(nframes)
@@ -29313,6 +29486,11 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // previous file's run ended -- cleanly, by demotion, or by a fault that
   // unwound past the exit cleanup below.
   gds_decomp_read_close();
+  // Per INPUT, like everything above: `gzstd -t A.zst B.zst` must report B's
+  // bad table even though A already reported one.  Not inside
+  // gds_decomp_read_close(), whose own note explains that these counters are
+  // declared below it.
+  g_gds_defect_said.store(false, std::memory_order_relaxed);
   // Before ANY task is queued -- see the function's own note for why the order
   // is the point rather than a detail.
   gds_preflight_or_die(opt);
@@ -29649,6 +29827,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
               "this archive's seek table puts frame %zu at offset %llu, where "
               "there is no zstd frame, so it does not describe this file",
               k, (unsigned long long)pst.c_off[k]);
+            gds_table_defect(opt, db);       // exits unless --keep-going
             decline = db;
             break;
           }
@@ -29666,26 +29845,45 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
               "this archive's seek table claims frame %zu decodes to %llu bytes "
               "but the frame declares %llu, so the table would misplace output",
               k, (unsigned long long)dz, fcs);
+            gds_table_defect(opt, db);       // exits unless --keep-going
             decline = db;
             break;
           }
-          if (!gds_frame_extent_matches(pfd, pst.c_off[k], cz, fh, (size_t)got)) {
+          // SAME GATE AS THE PRODUCER, AND FOR THE SAME MEASURED REASON: this
+          // walk reads one 3-byte pread per zstd block, which on a cold 65 GiB
+          // archive is ~1.7M serial QD1 reads.  Gating only the producer would
+          // have left `-d --gds-only` paying the whole cost here -- the two walks
+          // are deliberately NOT deduplicated (the descriptor pins the inode, not
+          // its contents), so a fix applied to one of them is applied to neither.
+          // A self-checked frame is proven by its own trailer at decode time; a
+          // checksumless one has no other proof and is still walked.
+          const bool self_checked = (fh[4] & 0x04) != 0;
+          if ((!self_checked || opt.keep_going_requested)
+              && !gds_frame_extent_matches(pfd, pst.c_off[k], cz, fh, (size_t)got)) {
             std::snprintf(db, sizeof(db),
               "this archive's seek table gives frame %zu a compressed extent "
               "that does not end at that frame's real boundary, so the table "
               "does not account for every frame in the file", k);
+            gds_table_defect(opt, db);       // exits unless --keep-going
             decline = db;
             break;
           }
         }
       }
       if (decline) {
-        char b[420];
-        std::snprintf(b, sizeof(b),
-          "WARNING: --gds-only cannot use peer-to-peer writes here: %s.\n"
-          "  This decompress uses the ordinary writer; the output is identical.\n",
-          decline);
-        vlog(V_ERROR, opt, b);
+        // Not when the reason was a DEFECT that has already been reported in
+        // its own words: "cannot use peer-to-peer writes" describes a lost
+        // optimisation, which is the least interesting thing about an archive
+        // whose index is wrong, and repeating the same sentence under a milder
+        // headline reads like a second, smaller problem.
+        if (!g_gds_defect_said.load(std::memory_order_relaxed)) {
+          char b[420];
+          std::snprintf(b, sizeof(b),
+            "WARNING: --gds-only cannot use peer-to-peer writes here: %s.\n"
+            "  This decompress uses the ordinary writer; the output is identical.\n",
+            decline);
+          vlog(V_ERROR, opt, b);
+        }
         goto gds_out_declined;
       }
     }
@@ -30011,9 +30209,13 @@ gds_out_declined:
       // would have them read from a slab nobody filled.
       gds_decomp_read_close();
       vlog(V_NORMAL, opt,
-           "warning: --gds-only needs the archive's seek table to locate frames "
-           "without reading them;\n  this archive has none, so the ordinary read "
-           "path is used instead.\n");
+           g_gds_table_rejected.load(std::memory_order_relaxed)
+             ? "warning: --gds-only located frames from the archive's seek table, "
+               "which this archive\n  gets wrong; the ordinary read path is used "
+               "instead.\n"
+             : "warning: --gds-only needs the archive's seek table to locate frames "
+               "without reading them;\n  this archive has none, so the ordinary read "
+               "path is used instead.\n");
       if (std::fseek(in, 0, SEEK_SET) != 0)
         die("--gds-only -t: cannot rewind the archive after standing down", EXIT_IO);
     }
@@ -35393,7 +35595,7 @@ static Options parse_args(int argc, char ** argv)
       else die_usage("--verify-engine must be auto, cpu, or gpu");
       opt.verify = true;   // implied
     }
-    else if (a == "--keep-going") opt.keep_going = true;
+    else if (a == "--keep-going") { opt.keep_going = true; opt.keep_going_requested = true; }
     else if (a == "--adapt")      { opt.adapt = true;  opt.adapt_user_set = true; }
     else if (a == "--no-adapt")   { opt.adapt = false; opt.adapt_user_set = true; }
     else if (a == "--no-profile") { opt.no_profile = true; }
@@ -35904,7 +36106,29 @@ static Options parse_args(int argc, char ** argv)
       vlog(V_VERBOSE, opt, "note: --keep-going applies to decompression (-d); ignored otherwise\n");
       opt.keep_going = false;
     } else {
-      if (!opt.cpu_only) {
+      // NOT WHEN THE USER NAMED A STAGED BACKEND.  --gds-only and --direct-stage
+      // both refuse --cpu-only, so forcing it here turned `-d --gds-only
+      // --keep-going` into a USAGE ERROR (exit 2) -- the flag combination a user
+      // reaches for precisely when an archive is suspect.  The staged paths reach
+      // their own recovery by demoting to the ordinary producer, so leave the
+      // backend alone and let that happen.
+      if (opt.gds_only || opt.direct_stage) {
+        // SAY WHAT THE FLAG DOES *NOT* COVER HERE.  --keep-going means two
+        // different recoveries: ignoring a dishonest seek table (which needs
+        // only the ordinary producer, and works on every backend) and writing
+        // through a frame whose checksum fails (which lives in the CPU decoder
+        // and does not).  Forcing --cpu-only would deliver both but silently
+        // discard the backend the user named -- the demote --gds-only was
+        // deliberately stripped of in v0.17.29.  Refusing outright, as
+        // --gpu-only and --hybrid still do, would leave the exit-4 message
+        // above recommending a flag combination gzstd then rejects.  So allow
+        // it and be explicit about the half that is missing.
+        vlog(V_NORMAL, opt,
+             "note: --keep-going with a staged backend covers a dishonest seek "
+             "table only;\n  recovering past a CORRUPT FRAME needs the CPU "
+             "decoder — re-run without\n  --gds-only/--direct-stage for that.\n");
+      }
+      if (!opt.cpu_only && !opt.gds_only && !opt.direct_stage) {
         // The CPU decoder is the authoritative checksum validator and the recovery
         // path lives there; recovery is rare and not perf-critical, so route the
         // whole run through it rather than also threading it through nvCOMP.

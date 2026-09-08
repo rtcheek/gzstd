@@ -1363,20 +1363,32 @@ else:
 pay = ent + struct.pack('<I', nf) + bytes([0]) + struct.pack('<I', 0x8F92EAB1)
 open(f'{d}/gl.zst', 'wb').write(body + struct.pack('<II', 0x184D2A5E, len(pay)) + pay)
 GLPY
+    # A DISHONEST TABLE IS AN ERROR, AND --keep-going IS THE WAY PAST IT.
+    # Until v0.17.40 all three shapes demoted silently and exited 0, so `-t`
+    # printed OK on an archive whose index is wrong -- which is the one thing
+    # `-t` exists to tell you.  Both halves are asserted here, because either
+    # alone passes for the wrong reason: without the first, a build that never
+    # detects the lie still "recovers"; without the second, a build that simply
+    # refuses every archive also passes.
     run_test "$GZSTD" -q -f -d --gds-only "$TMPDIR/gl.zst" -o "$TMPDIR/gl.out" 2>/dev/null
+    if [[ $LAST_RC -ne 4 ]]; then
+      gl_ok=0; gl_why="$gl_shape shape: exit $LAST_RC, want 4 on a lying seek table"
+    fi
+    run_test "$GZSTD" -q -f -d --gds-only --keep-going "$TMPDIR/gl.zst" \
+             -o "$TMPDIR/gl.out" 2>/dev/null
     if [[ $LAST_RC -ne 0 ]]; then
-      gl_ok=0; gl_why="$gl_shape shape: exit $LAST_RC on a valid archive"
+      gl_ok=0; gl_why="$gl_shape shape: --keep-going exit $LAST_RC, want 0"
     elif ! files_match "$TMPDIR/gl.want" "$TMPDIR/gl.out"; then
-      gl_ok=0; gl_why="$gl_shape shape: output differs from the source"
+      gl_ok=0; gl_why="$gl_shape shape: --keep-going output differs from the source"
     fi
   done
   if ! gds_testable; then
-    skip "--gds-only -d demotes on a seek table that lies" \
+    skip "--gds-only reports a lying seek table; --keep-going decodes anyway" \
          "GDS unavailable ($(gds_host_status))"
   elif [[ $gl_ok -eq 1 ]]; then
-    pass "--gds-only -d demotes on a seek table that lies"
+    pass "--gds-only reports a lying seek table; --keep-going decodes anyway"
   else
-    fail "--gds-only -d lying seek table" "$gl_why"
+    fail "--gds-only lying seek table" "$gl_why"
   fi
   rm -f "$TMPDIR"/gl_[abc] "$TMPDIR"/gl_[abc].zst "$TMPDIR"/gl_[abc].zst.nc \
         "$TMPDIR/gl.zst" "$TMPDIR/gl.out" "$TMPDIR/gl.want"
