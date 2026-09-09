@@ -1,12 +1,65 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.43  
+**Covers:** v0.9.50 → v0.17.44  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.44 — a message that outgrew its buffer, and the host row that outgrew its number
+
+Two corrections found while preparing the second-machine validation run. Neither
+changes what gzstd computes; both are things a reader is misled by.
+
+### The reworded warning could be truncated
+
+v0.17.41 changed ten messages from "uses the ordinary writer" to "uses
+device-to-host transfers for writing" — the first names a mechanism, the second
+names its consequence. Nine build a `std::string`. The tenth wrote into a
+`char[420]` through `snprintf`, and the longer wording pushed the worst case past
+it: a 288-byte `decline` scratch plus ~145 bytes of surrounding text is **433**,
+and `-Wformat-truncation` said exactly that.
+
+It now builds a `std::string`, matching the sibling decline message twelve lines
+below. **Widening the array would only move the next edit's cliff** — the defect
+arrived because someone (me) changed the wording without recomputing a size nobody
+should have to recompute.
+
+**Thirty builds did not show it, and the reason is the useful part.** The build
+command used throughout that work was
+`cmake --build … | grep -E 'error|Built target'`, which filters warnings out **by
+construction**: an instrument that cannot report the thing it exists to report,
+which is the same defect shape v0.17.40–43 spent four versions removing from the
+code. The GPU build is now warning-clean; the CPU-only build's nine are
+pre-existing `unused-function`/`unused-variable` for code that only compiles under
+`HAVE_NVCOMP`.
+
+### The GDS-unavailable host's expected totals were stale
+
+The v0.17.43 cell `GPU decompress sizes slabs from the archive, not --chunk-size`
+needs a GPU but **not** GPUDirect Storage, so it RUNS on a host whose `nvidia-fs`
+is absent. Both baselines moved to 559/419 with it; the GDS-unavailable row did
+not, and should have — that host expects **553** extensive and **413** default
+(559−6, 419−6).
+
+**Nothing in the suite's behaviour changes.** `EXPECTED_TESTS`, both deltas and the
+drift check were already correct: the script computes `559 − EXPECTED_NOGDS_DELTA`
+and would have passed there silently. What was wrong is the number a HUMAN reads
+before deciding whether a run drifted, in the one document consulted immediately
+before a tag. A stale figure there does the same damage as a stale baseline — it
+trains the reader to discount the check.
+
+553/413 is marked **DERIVED, not MEASURED**, beside the 552 that was measured
+against the then-558 baseline. The workstation run that will confirm it has not
+happened yet, and quietly promoting a derivation to a measurement is precisely the
+drift that comment block exists to prevent.
+
+Verified: the decline message renders in full on both a short and a long reason and
+its output still matches the source; the defect path still suppresses it and says
+its own message exactly once; all 16 seek-table forgery cells hold; `--gds-only -d`
+round-trips byte-identical; both build configurations compile clean.
 
 ## v0.17.43 — the four pre-existing findings, and a sizing bug that only became visible once the slabs were right
 

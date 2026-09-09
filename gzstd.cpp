@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.43";
+static constexpr const char * GZSTD_VERSION = "0.17.44";
 //
 // Architecture overview:
 //
@@ -30544,13 +30544,19 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         // whose index is wrong, and repeating the same sentence under a milder
         // headline reads like a second, smaller problem.
         if (!g_gds_defect_said.load(std::memory_order_relaxed)) {
-          char b[420];
-          std::snprintf(b, sizeof(b),
-            "WARNING: --gds-only cannot use peer-to-peer writes here: %s.\n"
-            "  This decompress uses device-to-host transfers for writing; the "
-            "output is identical.\n",
-            decline);
-          vlog(V_ERROR, opt, b);
+          // std::string, NOT snprintf into a fixed buffer.  `decline` is a
+          // 288-byte scratch and the surrounding text is ~145, so the worst case
+          // is 433 bytes -- the char[420] this used to be truncated it, and
+          // -Wformat-truncation said so the moment the wording grew from "uses
+          // the ordinary writer" to "uses device-to-host transfers for writing".
+          // Widening the array would only move the next such edit's cliff; the
+          // sibling decline message below already builds a string, so this now
+          // matches it and the size stops being a thing anyone has to recompute.
+          vlog(V_ERROR, opt,
+               std::string("WARNING: --gds-only cannot use peer-to-peer writes "
+                           "here: ") + decline + ".\n"
+               "  This decompress uses device-to-host transfers for writing; the "
+               "output is identical.\n");
         }
         goto gds_out_declined;
       }

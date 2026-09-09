@@ -50,7 +50,7 @@ is neither:
 | host | extensive | default | reachable today? |
 |---|---|---|---|
 | GPU + GPUDirect Storage usable (the baseline) | 559 | 419 | **yes, this server** |
-| GPU, GDS unavailable | 552 | 412 | yes, the workstation |
+| GPU, GDS unavailable | 553 | 413 | yes, the workstation |  <!-- derived: 559-6; the v0.17.43 geometry cell needs a GPU but not GDS, so it RUNS there -->
 | no GPU (the CPU-only build) | not yet observed | 336 | yes |
 
 **GDS was unusable on both machines for part of 2026-09-04 and is working again on this server since

@@ -1,6 +1,9 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.17.40
+**Current version:** see `GZSTD_VERSION` at the top of `gzstd.cpp`, or the newest
+heading in `CHANGELOG.md`. *A literal number lived here and went stale three times
+in two days (v0.17.14 while the tree was at v0.17.39, then v0.17.40 twice) — nothing
+updates it, so it is now a pointer rather than a claim.*
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -188,6 +191,18 @@ correspondingly hard to justify.
 3. **Decompress has no equivalent.** `--gds-only` writes VRAM to NVMe through cuFile; there is no
    O_DIRECT write out of VRAM, so the portable path stops at compression. Whether a D2H-into-pinned
    plus O_DIRECT-pwrite arrangement beats the ordinary writer is unmeasured.
+
+4. **Extract each frame's trailer checksum ON THE DEVICE** (deferred from the v0.17.40 review,
+   deliberately not bundled with it). The staged producer preads 4 bytes per frame from the end of
+   the claimed extent to fill `stg_expect_ck` — and the GPU then reads those same bytes into VRAM
+   anyway as part of the frame's `cuFileRead`. MEASURED: 2 preads/frame is 16,686 queue-depth-1
+   reads costing **1.23 s of a ~21 s `-d` run** on the 65 GiB archive; the trailer is about half of
+   it. A `posix_fadvise(WILLNEED)` prefetch was BUILT AND REVERTED — 0.62 → 0.62 s on `-t`,
+   1.23 → 1.24 s on `-d`, no effect for 16,686 extra syscalls, because the reads are already near
+   this drive's QD1 latency. The honest fix extracts the last 4 bytes of each compressed frame from
+   the device slab, where they already are: a small kernel in `gpuverify.cu` plus a per-batch 4-byte
+   D2H, replacing 8,343 host preads with ~33 tiny copies. **It sits on the integrity path**, which
+   is why it wants its own change and its own review rather than riding along with six others.
 4. ~~**Second-machine validation.**~~ **CLOSED 2026-09-04 (v0.17.30).** Run on the 24-core /
    2x consumer-GPU host, which refuses `--gds-only` outright (256 MiB BAR1, compat mode) — the
    configuration the flag exists for. **The claim survives falsification and is larger there:**
@@ -317,6 +332,71 @@ Two rules this project already holds and did not apply here:
 
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
+
+## OPEN after the v0.17.40–44 review arc
+
+Three residuals from seven review rounds on `--gds-only -d`. None is a defect in
+shipped behaviour; each is a measurement or a decision that has not been made.
+
+### 1. `--direct-read` makes a COLD DECOMPRESS 31% SLOWER — decide what to do about it
+
+**MEASURED 2026-09-09, cold, 65 GiB `-t`, cache dropped between every run, ranges
+non-overlapping:**
+
+| `--cpu-only -t` cold | wall | host CPU |
+|---|---|---|
+| default read path | **18.98 / 19.49 / 19.69 s** | ~305–312 s |
+| `--direct-read` | **25.56 s** | ~96 s |
+
+The mechanism is documented and was never costed: `stream_frames_to_queue_mt` is
+`GATED: seekable regular file >128 MiB, NOT --direct-read`, so the flag does not
+merely change how bytes are read — it drops decompress to the single-threaded
+splitter and gives up all **12** parallel prefetch readers. `project_reader_paths`'
+"O_DIRECT > buffered > mmap cold" is a COMPRESS result and does not transfer.
+
+A user following that ranking on a cold decompress loses a third of their
+throughput. **Options, none taken yet:** warn when `--direct-read` is given on a
+decompress large enough to have used the MT reader; revisit whether the MT gate can
+admit O_DIRECT (the compress-side "concurrent O_DIRECT contends" rule was measured
+on a different reader); or document the direction split and leave the flag alone.
+Note the CPU columns invert — the fast path burns ~305 s of host CPU, 250 s of it
+SYSTEM time — so this is the same trade `project_gds_real_media` describes, one
+layer down, and "slower" is not the whole story on a loaded box.
+
+### 2. v0.17.42–43 shipped WITHOUT small-VRAM validation, and is now tagged
+
+Those versions changed the halve-until-it-fits loop, the decompressed slab
+geometry, the VRAM reserve formula and both compress fit estimates — every one of
+which only BINDS when VRAM is tight. On a 95 GiB H100 the halving loop is
+unreachable: `GZSTD_DEBUG_FAIL_BRINGUP_ALLOC` had to be added to exercise it at
+all, so everything known about that fix comes from fault injection rather than a
+card that actually ran out.
+
+`project_gpu_decomp_vram_consumer` records this hardware class biting before — GPU
+decompress silently dead on 11 GiB cards through v0.17.31, passing the fit test and
+OOMing in the verify kernel. **v0.17.43 is tagged, so this is deployed code.** The
+2080 Ti host cannot do `--gds-only` (256 MiB BAR1, nvidia-fs removed) but runs
+plain `--gpu-only` decompress, which is exactly where the new geometry applies.
+What to look for there: `GZSTD_DEBUG_ENSURE=1` showing ONE reallocation with
+`comp`/`decomp` tracking the archive; a REAL batch reduction (`VRAM-fit: batch=N`
+or `VRAM insufficient, reducing batch`) if one fires; and the failure mode from
+v0.17.31 — exit 0 with correct output while the GPU path silently fell back, which
+only `-vv` can distinguish. Expected suite totals there: **553 extensive / 413
+default** (derived, not yet measured).
+
+### 3. The comparison that would actually settle GDS's case is a LOADED box
+
+Cold and quiet on this server, `--cpu-only -t` at its default read path beats
+`--gds-only` on wall clock by ~9% (19.49 vs 21.35 s median) while burning
+**~305 s of host CPU against ~24 s — 15.8 cores against 1.2.**
+
+Every GDS number in this file is from a machine doing nothing else, which is the
+condition least able to show what the flag is for. `project_adapt_contention_curve`
+already says the crossover is CORES AVAILABLE, not "the box is busy". The missing
+experiment is both arms under concurrent load: at what point does 15.8 cores versus
+1.2 stop being an efficiency footnote and start deciding the wall clock? Until that
+is run, "GDS is a contention-resilience win" remains a reasoned claim rather than a
+measured one on this hardware.
 
 ## Known external defect: libcufile segfaults at exit when dlopen'd with stats on
 

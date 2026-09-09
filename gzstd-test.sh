@@ -592,8 +592,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 #                      forced small register budget / -d all-empty archive.  They
 #                      skip when gds_testable is false (see gds_host_status).
 #                      MEASURED: extensive 552 on a host whose nvidia-fs is
-#                      absent, against the 558 baseline (the halving cell skips
-#                      there too, so that host's number is unchanged by it).
+#                      absent, against the then-558 baseline.  The v0.17.43
+#                      archive-geometry cell needs a GPU but NOT GDS, so it RUNS
+#                      there: that host's expected total is now 553 (559 - 6) and
+#                      its default 413.  DERIVED -- not yet measured on that host,
+#                      which is the next thing to confirm there.
 #                      The sixth GDS cell ("refuses a compat-mode host") still
 #                      RUNS and passes everywhere -- only its negative control is
 #                      gated -- so it is not part of this delta.
