@@ -1,6 +1,6 @@
 # gzstd v1.0 Roadmap & Battle Plan
 
-**Current version:** v0.17.14
+**Current version:** v0.17.40
 **Target:** v1.0  production-ready hybrid CPU+GPU Zstd with intelligent scheduling
 
 ---
@@ -162,10 +162,25 @@ correspondingly hard to justify.
 **Open, in rough order of value:**
 
 1. **`--direct-stage` for `--tar` create.** The tar assembler composes each frame from many member
-   extents, so it needs the aligned-window read v0.17.7 added on the cuFile side rather than one
-   contiguous pread. This is the case that would actually help archives of large media, and unlike
-   `--tar --gds-only` it would not be defeated by the 512-byte header knocking every member off the
-   4 KiB grid — a host read has no alignment requirement beyond the block size.
+   extents rather than reading one contiguous region. This is the case that would actually help
+   archives of large media, and unlike `--tar --gds-only` it would not be defeated by the 512-byte
+   header knocking every member off the 4 KiB grid — a host read has no alignment requirement
+   beyond the block size.
+
+   **SMALLER THAN THIS ITEM USED TO CLAIM (checked 2026-09-08).** It said the work "needs the
+   aligned-window read v0.17.7 added on the cuFile side". That read already exists and is already
+   the arm a non-registered member takes: `read_seg`'s bounce path (gzstd.cpp:17818) does the
+   aligned-window pread and copies the interior, and `select_src` (gzstd.cpp:17542) already opens
+   members `O_DIRECT` gated on the staging pool being live, with cuFile registration as a separate
+   step after the identity check. What is actually left is: allow the flag with `--tar`, skip the
+   cuFile registration, make the per-thread transit buffer PINNED (`cudaHostAlloc`) rather than
+   `posix_memalign`, and point the `[DSTAGE]` counters at tar extents.
+
+   One caveat to state up front so it is not cited against the work later: the v0.16.2 "any design
+   that adds a host-side copy loses here" verdict does NOT bind. That ruled out adding a copy where
+   a copy-free path existed; a tar frame is *assembled* from disjoint extents at unaligned offsets,
+   so there is no copy-free alternative, and `--gds-only --tar` already pays the equivalent. Worth
+   measuring per-extent-H2D against assemble-in-pinned-then-one-H2D-per-frame rather than assuming.
 2. **The 64-frame batch floor is still a machine-tuned constant** — it comes from this box's
    0.28 GiB/s-per-frame device checksum against a 4.9 GiB/s drive, and now applies to two backends
    instead of one. Unchanged `feedback_code_to_general_goals` violation; derive it from the measured
@@ -246,6 +261,62 @@ not counted in `TOTAL_RAN` and a single constant cannot describe every machine. 
 documented deltas (−5 GDS cells, −81 the whole GPU section) so a drift note means a test was added
 or removed on **any** host — see the table in `RELEASING.md`. The `demoted` probe verdict stays: it
 costs nothing, and it keeps the cells meaningful on a host still running a pre-v0.17.29 contract.
+
+## SETTLED: a dishonest seek table is an ERROR, not a quiet demote
+
+**Decided 2026-09-08 (rtcheek), shipped v0.17.40. Recorded here so it is not reopened.**
+
+Until v0.17.40, a seek table that disagreed with the frames it describes — bad magic, a wrong
+declared size, an entry that swallows the next frame — made `--gds-only` demote to the ordinary
+producer and exit 0. So `-t` printed **OK** on an archive whose index is wrong, which is the one
+thing `-t` exists to report. All three shapes now report what is wrong and **exit 4**, on `-t` and
+`-d` alike. `--keep-going` ignores the table and decodes the stream directly, which recovers such an
+archive completely; the error message names the flag.
+
+**Why an error.** The table lying is a defect in the archive in its own right. The data may well be
+intact — that is exactly why the message says so — but an index that misplaces or drops frames is
+not something to paper over, and a caller asking `-t` is asking about the archive, not only its
+payload.
+
+**Benign declines still demote silently**, and the split is deliberate: no usable seek table, frames
+that are not 4 KiB multiples, a frame that declares no decompressed size. Those are limits of the
+archive or of the peer-to-peer path, not evidence that the table is lying.
+
+**`--keep-going` walks every frame, and that is not a contradiction.** Recovery means IGNORING the
+table, which only the ordinary producer can do, and the demote that reaches it exists at producer
+time only — the workers freeze their topology at spawn (see the v0.17.29 ordering trap), so a
+checksummed frame's proof, which arrives mid-batch, is already too late to demote on. So when the
+user has asked to survive a bad archive, the defect is found while standing down is still possible.
+The cost is paid only by a run that asked to tolerate damage.
+
+**Knock-on:** `--keep-going` no longer turns `--gds-only`/`--direct-stage` into a usage error (it
+forced `--cpu-only`, which they refuse) — the exit-4 message recommends the flag, so rejecting the
+combination would recommend something gzstd then refuses. It prints what it does not cover there:
+recovering past a CORRUPT FRAME still needs the CPU decoder.
+
+## The pre-tag checklist never says COLD, and that is how a 5x-wrong cost figure survived
+
+**Open, found 2026-09-08.** `RELEASING.md` §3 asks for a large-archive round-trip per shape. It
+never says to drop the page cache first, and every item in it can be satisfied warm.
+
+That is not hypothetical. v0.17.30's block-header walk was measured — on the right archive, at the
+right scale — as `-t` 22.34 → 23.38 s and `-d` 60.10 → 67.25 s, and recorded without the word
+*warm*. Cold, the same walk took `-t` from 28.57 s to **111.57 s**: +4.7% became +290%, and it
+shipped and stood through a Codex round. The measurement was real and taken in the one residency
+state that hides the defect.
+
+Two rules this project already holds and did not apply here:
+
+- **Read-path conclusions INVERT with residency** (`project_reader_paths`, `project_residency_reader_lever`).
+  A cost figure without a residency label is not reusable, and this one was reused.
+- **Counting bytes is not counting syscalls.** "3 bytes per block", "~150 KB on a 65 GiB archive"
+  and "skips every payload by offset" are all true as byte counts and all irrelevant: the cost was
+  1.7M `pread`s at queue depth 1, each faulting a distinct 4 KiB page. A seek is free in a buffer
+  and is the entire cost on cold storage. A per-item I/O cost stated in bytes must also state the
+  call count.
+
+Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
+convention that any cost figure entering CHANGELOG or memory states its residency.
 
 ## Known external defect: libcufile segfaults at exit when dlopen'd with stats on
 

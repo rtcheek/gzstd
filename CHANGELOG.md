@@ -1,12 +1,137 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.40  
+**Covers:** v0.9.50 → v0.17.41  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.41 — a review that was asked to count, and the two sizing promises it caught me breaking
+
+An independent review (Codex CLI, `gpt-5.6-sol` at max reasoning) of the
+`--gds-only -d` path, scoped deliberately AWAY from security and correctness —
+those have had six rounds — and toward one question: **does this path do what its
+comments claim, and is it doing work it does not need to do?**
+
+The scope pinned a concrete invocation and a concrete archive (65.38 GiB, 8,343
+checksummed 16 MiB frames, cold cache) and demanded a LEDGER: every read,
+allocation, registration and thread spawn from `decompress_nvcomp()` to the first
+frame written, with **every loop's iteration count stated as a function of that
+shape**. Adjectives without numbers were banned outright — the defect that
+motivated the round hid behind the word *"skips"*.
+
+**That framing is the finding.** The same reviewer had passed over this code in
+earlier rounds; asked to hunt bugs it found bugs, asked to count operations it
+found waste. Every claim below was verified in source before being acted on, and
+two were rejected as overstated.
+
+### Two sizing promises, both broken by v0.17.40's own fix
+
+`ZSTD_compressBound` was introduced in v0.17.40 because a stored frame is larger
+than its input. It changed the size that gets **registered** without changing
+either number that was supposed to **bound** it:
+
+- **The registration budget was exceeded by exactly 16 MiB.** The batch is
+  derived as `budget / frame_cap` (4 GiB / 16 MiB = 256), but the slab registered
+  is `batch × compressBound(frame_cap)` = 4 GiB + 16 MiB. Measured across the
+  v0.17.40 change: `cuFileBufRegister` went 4096 MiB -> 4112 MiB, exactly the
+  predicted overshoot, on a block whose own comment says "BOUND THE REGISTERED
+  BYTES". The divisor is now the size actually registered; the batch lands at 255
+  and registration is back inside 4 GiB.
+- **The VRAM reserve under-modelled by 8,388,608 bytes at batch 256.** Its
+  `per_frame` was `chunk * 2 + 4096`, labelled "comp + decomp + metadata", and
+  `comp` is no longer the chunk. That reserve exists to stop the device-checksum
+  kernel discovering the card is full the expensive way, so under-modelling it is
+  the v0.17.31 failure in miniature.
+
+**Budgeting by one size and registering at another is the same defect shape as
+the `est_temp` guess v0.17.40 removed** — and it went in with that fix.
+
+### Four comments that claimed more than the code delivered
+
+- **"ISSUED SERIALLY, DELIBERATELY"** described a read fan-out that had been built
+  and reverted. A different fan-out was added afterwards and the text left behind:
+  the default runs **eight lanes**, and `-vv` has been printing `summed across 8
+  reader(s)` all along.
+- **"The default path still submits one 16 MiB request per frame"** was made false
+  by v0.17.27, which turned coalescing on by default. It contradicted
+  `COALESCED BY DEFAULT` 55 lines above it: 33 writes, not 8,343.
+- **"Workers begin decompressing as soon as the first frame arrives"** is not true
+  of the staged path, which is build-first/push-last by design.
+- **The nvCOMP "exact query remains below as a fallback for a shape the bound does
+  not cover"** — there is no such shape. `ensure_buffers()` is called with that
+  same bound and throws if it cannot meet it, so the guard is necessarily true and
+  the fallback is **unreachable**. Kept (one bool, and it is the escape if the
+  bound is loosened) but no longer described as live.
+
+### The second round found two defects in the first round's fixes
+
+Falling severity across rounds is what this project treats as ready, so the fixes
+went back for a re-review. Both findings were real, and both were mine.
+
+- **Only one of two budget divisors was changed.** The worker moved to
+  `compressBound` and ran batch 255; a driver-side pin kept dividing by
+  `frame_cap`, published 256, and locked it — under a comment reading *"Same
+  division as the -t site"*, which the fix had just made false. Nothing
+  over-allocates, because the worker's own value wins. But the `--adapt` profile
+  tap records **that** number as "the batch this device last actually ran", so
+  `gzstd --adapt --gds-only -d` would persist `settled_batch_gds=256` for a run in
+  which every full batch was 255, and seed the next run from it. A wrong number in
+  a profile is worse than no number, because it is believed. This is the mirrored-
+  path class exactly — and the fix, not the original code, was the sibling that
+  got missed.
+
+- **Making `set_done()` idempotent suppressed an abort wake, and my argument for
+  it was false.** I added `if (done_) return;` to skip the one redundant lock and
+  three `notify_all()`s the staged path performs, arguing that every waiter tests
+  `done_` under the same lock before sleeping. That does not hold for
+  `wait_for_gpu_yield()`, which exits on `done_` only when the queue is **also
+  empty** — so with `done_` set and work still queued, a GPU can register and
+  sleep, and the abort path depends on a later `set_done()` to wake it (it stores
+  `g_gpu_aborted` first, precisely so that call is the wake). A multi-GPU abort
+  would have waited for the scheduler's 0.5 s tick instead. **Reverted:** what it
+  avoided was one lock and three notifications ONCE PER RUN, and it bought an
+  abort delay.
+
+The reviewer also confirmed the two rejections above and the four declines, and
+verified the reserve formula's termination: 255 -> 127 -> 63 -> 31 -> 15 -> 7 -> 3
+-> 1, seven reductions, at most eight allocation attempts.
+
+### Tried and reverted, with numbers
+
+The producer's 2 preads/frame are 16,686 queue-depth-1 reads costing **1.23 s** of
+a ~21 s `-d` run. Batching `posix_fadvise(WILLNEED)` over each frame's header and
+trailer page to turn them into one deep-queue burst: producer **0.62 -> 0.62 s**
+on `-t` and **1.23 -> 1.24 s** on `-d`. No effect either direction for 16,686
+extra syscalls, so it is not kept. The reads are already near this drive's QD1
+latency.
+
+The cost is real and stays open. Each frame's 4-byte trailer is read on the HOST
+and then arrives in VRAM anyway as part of that frame's `cuFileRead` — so the
+honest fix is to extract it **on the device**, where the bytes already are. That
+is a new kernel on the integrity path and wants its own change rather than riding
+along with six others.
+
+### Rejected after verification
+
+- *"A third seek-table parse builds an empty checksum map."* The early-out it asks
+  for **already exists** (`if (st.checksums.empty()) return;`), and the scan it
+  calls wasted computes `g_input_max_frame`, which the batch sizer consumes.
+  The residual is one redundant table parse, a few milliseconds.
+- *"The input BAR1 baseline is overwritten before use."* True, and harmless: both
+  baselines are captured before any staged transfer, so the delta is measured from
+  an equivalent zero. One redundant procfs read.
+- Two more were declined on cost/risk rather than being wrong: replacing 8,343
+  single-item `queue.push()` calls with a bulk push (~0.2% of wall, against the
+  sorted-insert and notify path where **three** separate deadlock cycles lived in
+  v0.15.66-67), and pooling the 231 per-batch reader threads (~11 ms).
+
+Verified: all 16 seek-table forgery cells hold; `--gds-only -d`, `--gds-only`
+compress and `--direct-stage` all round-trip byte-identical; the reduced-budget
+path still halves and its workspace still tracks the batch; both build
+configurations compile clean.
 
 ## v0.17.40 — a check that read a million times to prove what the GPU already knew
 

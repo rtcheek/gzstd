@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.39";
+static constexpr const char * GZSTD_VERSION = "0.17.41";
 //
 // Architecture overview:
 //
@@ -10077,6 +10077,18 @@ public:
   }
 
   // Signal that no more tasks will be pushed (producer is finished).
+  //
+  // NOT IDEMPOTENT, AND DELIBERATELY SO.  A v0.17.41 change added `if (done_)
+  // return;` here, to skip the one redundant lock + three notify_all()s the
+  // staged path performs when the producer and the driver both call this.  The
+  // justification was that every waiter tests done_ under this lock before it
+  // sleeps.  THAT IS FALSE for wait_for_gpu_yield(), which exits on done_ only
+  // when the queue is ALSO empty -- so with done_ set and work still queued a
+  // GPU can register and sleep, and the abort path depends on a LATER
+  // set_done() to wake it (it stores g_gpu_aborted first, precisely so this
+  // call is the wake).  The early return made a multi-GPU abort wait for the
+  // scheduler's 0.5 s tick instead.  Reverted: the cost avoided was one lock
+  // and three notifications ONCE PER RUN, and it bought an abort delay.
   void set_done()
   {
     std::unique_lock<std::mutex> lk(m_);
@@ -27396,7 +27408,16 @@ static void gpu_decomp_worker(
       const size_t budget    = gds_register_budget()
                              / std::max<size_t>(1, (size_t)gpu_worker_count)
                              / stream_count;
-      const size_t fit       = std::max<size_t>(1, budget / std::max<size_t>(1, frame_cap));
+      // DIVIDE BY WHAT IS ACTUALLY REGISTERED, not by the frame size.  The slab
+      // is `batch * ZSTD_compressBound(frame_cap)`, because a stored
+      // (incompressible) frame is larger than its input -- so dividing the
+      // budget by frame_cap picked a batch whose registration EXCEEDS the
+      // budget this block exists to enforce.  MEASURED after the compressBound
+      // fix: 4 GiB budget -> batch 256 -> 4112 MiB registered, over by exactly
+      // 16 MiB.  Budgeting by one size and registering at another is the same
+      // mismatch that made est_temp useless.
+      const size_t reg_slot  = ZSTD_compressBound(frame_cap);
+      const size_t fit       = std::max<size_t>(1, budget / std::max<size_t>(1, reg_slot));
       if (fit < per_stream_cap) per_stream_cap = fit;
     }
 
@@ -27614,7 +27635,14 @@ static void gpu_decomp_worker(
     // carrying on at a batch the card has already refused.
     {
       // Reserve = half-batch worth of (comp + decomp + overhead) per stream
-      const size_t per_frame = host_chunk_bytes * 2 + 4096;  // comp + decomp + metadata
+      // comp + decomp + metadata.  `comp` is compressBound, NOT the chunk: an
+      // incompressible frame is stored and comes out larger than its input, so
+      // `host_chunk_bytes * 2` under-modelled the half-batch reserve by
+      // (compressBound - chunk) per frame -- 8,388,608 bytes at batch 256, on a
+      // reserve whose whole job is to stop the device-checksum kernel finding
+      // the card full the expensive way.
+      const size_t per_frame = ZSTD_compressBound(host_chunk_bytes)
+                             + host_chunk_bytes + 4096;
       // NO RETRY COUNTER HERE ON PURPOSE.  Every iteration strictly halves
       // per_stream_cap, so the batch<=1 floor below already bounds this loop at
       // log2(batch) passes -- a counter can only stop it EARLY.  The first
@@ -28151,8 +28179,18 @@ static void gpu_decomp_worker(
         //
         // Sizing from the bound up front means the temp always fits, so the
         // per-batch query and its sync are skipped entirely and the grow path
-        // (with its re-read) never fires.  The exact query remains below as a
-        // fallback for a shape the bound does not cover.
+        // (with its re-read) never fires.
+        //
+        // AND THE EXACT QUERY BELOW IS UNREACHABLE ON THIS PATH, which this text
+        // used to deny ("remains below as a fallback for a shape the bound does
+        // not cover").  There is no such shape: `ensure_buffers(..., temp_bound)`
+        // is called with this same bound and THROWS if it cannot satisfy it, so
+        // by the time the guard `C.temp_bytes >= temp_bound` is evaluated it is
+        // necessarily true and the Sync query cannot run.  A shape the bound does
+        // not cover grows the allocation to the bound or fails before reaching
+        // the fallback.  Kept rather than deleted because the guard is one bool
+        // and the call is the documented escape if the bound is ever loosened --
+        // but it is dead today, and saying otherwise hid that.
         // THE SHAPE-DERIVED BOUND IS NOT AN OPTIMISATION; IT IS THE ONLY PATH
         // THAT WORKS AT THESE BATCH SIZES.  A/B on the real 65 GiB archive, one
         // device, batch 256 -- bound vs the pre-v0.17.18 exact-per-batch query:
@@ -28304,15 +28342,21 @@ static void gpu_decomp_worker(
             // The read may run past EOF on the last frame; the driver simply
             // returns fewer bytes, and short-of-the-frame is the real error.
             //
-            // ISSUED SERIALLY, DELIBERATELY.  cuFileRead is synchronous per
-            // call, and the compress path fans its reads across threads for
-            // exactly that reason -- so a fan-out was built here too, and then
-            // MEASURED TO DO NOTHING: 7.63-7.94 s wall serial vs 8.01 s fanned
-            // out.  Instrumenting it said why, and the numbers are still printed
-            // at -vv: the reads are 0.52 s of a 7.84 s run (159 calls, 1282 MiB/s
-            // aggregate).  They are not the constraint on this path, so the
-            // threads, their mutex and the deferred error handoff were reverted.
-            // If reads ever do become the constraint, gpu_worker shows the shape.
+            // THIS CALL is synchronous -- cuFileRead is synchronous per call --
+            // but the LOOP AROUND IT IS NOT SERIAL at the default.  This comment
+            // used to open "ISSUED SERIALLY, DELIBERATELY" and describe a
+            // fan-out that had been built and reverted; the fan-out above
+            // (`staged_prefetched`, rd_fan lanes) was added afterwards and left
+            // this text behind.  MEASURED on a 65 GiB archive: `[GDS] verify
+            // reads: ... summed across 8 reader(s)`, so the default is eight
+            // lanes, not one, and -vv has been printing so all along.
+            //
+            // The measurement the old text carried is still worth keeping and is
+            // WHY the fan-out is bounded rather than wide: on a 1 GiB archive
+            // serial was 7.63-7.94 s against 8.01 s fanned, with reads only 0.52 s
+            // of a 7.84 s run (159 calls, 1282 MiB/s aggregate).  Reads are not
+            // the constraint on this path; the lanes exist to keep them from
+            // becoming one on slower storage.
             const uint64_t rd_t0 = now_ns();
             const ssize_t got = g_gds_input.read_dev(C.d_comp_buf, want, fo, dv);
             g_gdsv_read_ns.fetch_add(now_ns() - rd_t0, std::memory_order_relaxed);
@@ -28775,10 +28819,14 @@ static void gpu_decomp_worker(
         // gzstd's normal fixed-size frames form long runs that are contiguous in
         // BOTH address spaces: slot i+1 immediately follows slot i in VRAM and
         // its absolute output offset immediately follows the preceding frame.
-        // The default path still submits one 16 MiB request per frame.  This hook
-        // tests whether reducing 8343 driver calls to roughly one per batch moves
-        // the 2.86 GiB/s write rate; it adds no concurrency and therefore is not
-        // the already-rejected write fan-out experiment.
+        // STALE UNTIL NOW: this said "the default path still submits one 16 MiB
+        // request per frame" and called the coalescing an experimental hook.
+        // v0.17.27 made coalescing the DEFAULT -- see "COALESCED BY DEFAULT"
+        // above -- so on a 65 GiB archive the default submits 33 writes, not
+        // 8343, and the two comments contradicted each other 55 lines apart.
+        // It adds no concurrency and is therefore not the already-rejected write
+        // fan-out experiment; GZSTD_DEBUG_GDS_NO_COALESCE_WRITES restores the
+        // per-frame path.
         bool batch_coalesced = false;
         if (coalesce_writes && C.gds_only) {
           std::vector<std::array<uint64_t,3>> runs; // {dev_off, file_off, len}
@@ -29341,7 +29389,12 @@ static void gpu_decomp_worker(
  GPU/Hybrid decompression entry point
  -----------------------------------------------------------------------
  Launches GPU + CPU workers first, then streams frames into the queue.
- Workers begin decompressing as soon as the first frame arrives.
+ Workers begin decompressing as soon as the first frame arrives -- EXCEPT on the
+ staged --gds-only path, whose producer is build-first/push-last: it reads and
+ checks every seek-table entry before the first Task becomes visible, so nothing
+ decodes until the whole table has been validated.  That is deliberate (a demote
+ must leave the queue exactly as it found it) and it is why that path publishes
+ an init phase to the progress bar instead of showing zeroes.
  Falls back to streaming CPU if frame sizes can't be determined.
 ======================================================================*/
 // ---------------------------------------------------------------------------
@@ -29494,6 +29547,21 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   size_t max_frame_decomp = 0;
   std::vector<Task> built;
   built.reserve(nframes);
+
+  // TRIED AND REVERTED (2026-09-09): batching `posix_fadvise(WILLNEED)` over the
+  // header and trailer page of every frame before this loop, to turn its
+  // 2*nframes queue-depth-1 preads into one deep-queue burst.  MEASURED on the
+  // 65 GiB archive, cold: producer 0.62 -> 0.62 s on `-t`, 1.23 -> 1.24 s on
+  // `-d`.  No effect either direction, for 16,686 extra syscalls, so it is not
+  // kept -- these reads are already near this drive's QD1 latency and the advice
+  // bought no overlap the kernel was not already getting.
+  //
+  // The cost is real and still open: 1.23 s of a ~21 s `-d` run reads metadata
+  // the GPU is about to read again, because each frame's 4-byte trailer is
+  // preaded on the HOST and then arrives in VRAM anyway as part of that frame's
+  // cuFileRead.  Removing it means extracting the trailer ON THE DEVICE, where
+  // the bytes already are -- a new kernel on the integrity path, which wants its
+  // own change rather than riding along with six others.
   for (size_t k = 0; k < nframes; ++k) {
     const uint64_t off  = st.c_off[k];
     const uint64_t csz  = st.c_off[k + 1] - st.c_off[k];
@@ -30204,7 +30272,15 @@ gds_out_declined:
     const size_t share = gds_register_budget()
                        / std::max<size_t>(1, (size_t)opt.gpu_devices)
                        / std::max<size_t>(1, (size_t)opt.gpu_streams);
-    const size_t fit = std::max<size_t>(1, share / frame_cap);
+    // DIVIDE BY WHAT IS REGISTERED, exactly as the -t site does.  Missing this
+    // mirror is how the first version of the fix went in: the worker moved to
+    // compressBound and ran 255, while this pin kept dividing by frame_cap and
+    // published 256.  Nothing over-allocated -- the worker's own value wins --
+    // but the --adapt profile tap records THIS number as "the batch this device
+    // last actually ran", so a qualifying run persisted settled_batch_gds=256
+    // for a run in which every full batch was 255, and seeded the next run from
+    // it.  A wrong number in a profile is worse than no number: it is believed.
+    const size_t fit = std::max<size_t>(1, share / ZSTD_compressBound(frame_cap));
     shared_tune_decomp.batch_size.store((int)std::min<size_t>(fit, HARD_BATCH_CAP));
     shared_tune_decomp.locked.store(true);
   }
