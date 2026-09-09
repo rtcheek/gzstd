@@ -49,7 +49,7 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 557 | 417 | **yes, this server** |
+| GPU + GPUDirect Storage usable (the baseline) | 558 | 418 | **yes, this server** |
 | GPU, GDS unavailable | 552 | 412 | yes, the workstation |
 | no GPU (the CPU-only build) | not yet observed | 336 | yes |
 
@@ -66,7 +66,7 @@ GDS-unavailable row and always will. If the GDS cells ever start skipping here a
 kernel module before the test: `cat /sys/module/nvidia_fs/version` (2.26.6 or newer) and
 `grep Bar1-map /proc/driver/nvidia-fs/stats` (`ok` must be non-zero after a `--gds-only` run).
 
-The GDS row is the five `--gds-only` cells that assert a successful run;The GDS row is the five `--gds-only` cells that assert a successful run; they skip when the
+The GDS row is the six `--gds-only` cells that assert a successful run; they skip when the
 host cannot do peer-to-peer, which since v0.17.32 includes a host with no `nvidia-fs` module
 at all. The no-GPU row skips the whole GPU section as a group, and the GDS cells live inside
 it, so those two deltas must never both be applied — the script's drift check uses `elif` for

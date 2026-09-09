@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.41";
+static constexpr const char * GZSTD_VERSION = "0.17.42";
 //
 // Architecture overview:
 //
@@ -9435,6 +9435,31 @@ static inline bool gz_debug_compress_launch_miss()
   }
   return false;
 }
+// Test-only fault injection (read once from $GZSTD_DEBUG_FAIL_BRINGUP_ALLOC):
+// make the next N BRINGUP buffer allocations fail (N < 0 = every one), so the
+// halve-until-it-fits loop can be exercised on a card that has plenty of VRAM.
+// The three hooks above deliberately spare bringup -- which left that loop
+// unreachable on every healthy host, and it is the file's own standard that such
+// code "has never been seen to run, which is the same thing as untested".
+//
+// IT WAS UNTESTED, AND IT BROKE.  v0.17.41 made ensure_buffers() grow-only, which
+// silently disabled the shrink: each retry was promoted back to the previous
+// maximum, so a card that failed at batch 256 re-asked for 256-slot slabs on
+// every attempt and was rejected outright.  Nothing could see that without this.
+// 0 (unset) = disabled.
+static std::atomic<int> g_debug_fail_bringup_alloc{0};
+static inline bool gz_debug_bringup_alloc_miss()
+{
+  int cur = g_debug_fail_bringup_alloc.load(std::memory_order_relaxed);
+  while (cur != 0) {
+    if (cur < 0) return true;
+    if (g_debug_fail_bringup_alloc.compare_exchange_weak(cur, cur - 1,
+                                                         std::memory_order_relaxed))
+      return true;
+  }
+  return false;
+}
+
 // Returns true when this call should pretend the allocation failed.
 static inline bool gz_debug_alloc_miss()
 {
@@ -26997,6 +27022,26 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
 // Each batch: upload compressed frames to GPU, call nvCOMP batched decompress,
 // download decompressed data.  Similar structure to gpu_worker for compression
 // but using the decompress API.
+// nvCOMP's decompress workspace for a given batch and slot size.  SHARED, not a
+// lambda per site: it is asked at bringup, on every VRAM halving, and again when
+// the reserve retry rebuilds -- and when the retry site kept its own `nb * 1024`
+// guess while the others asked nvCOMP, the rebuild handed the next batch an
+// allocation ~50,000x short that it had to discard and re-register.  One
+// question deserves one answer.
+//
+// The old `nb * 1024` guess is kept only as a floor, so a query failure degrades
+// to the previous behaviour rather than to zero.
+static size_t gds_decomp_temp_for(size_t nb, size_t max_decomp)
+{
+  size_t est = nb * 1024;
+  nvcompBatchedZstdDecompressOpts_t eopts{};
+  size_t etb = 0;
+  if (nvcompBatchedZstdDecompressGetTempSizeAsync(
+          nb, max_decomp, eopts, &etb, nb * max_decomp) == nvcompSuccess && etb > est)
+    est = etb;
+  return est;
+}
+
 static void gpu_decomp_worker(
   int device_id,
   int slot_index,
@@ -27486,16 +27531,7 @@ static void gpu_decomp_worker(
         // batch-256 answer (13.1 GB) while offering the card a batch of 8 would
         // reserve for a shape this stream is no longer going to run, and on a
         // small card would drive the halving all the way to 1 for no reason.
-        auto temp_for = [&](size_t nb) -> size_t {
-          size_t est = nb * 1024;                    // the old guess, as a floor
-          nvcompBatchedZstdDecompressOpts_t eopts{};
-          size_t etb = 0;
-          if (nvcompBatchedZstdDecompressGetTempSizeAsync(
-                  nb, init_decomp, eopts, &etb, nb * init_decomp) == nvcompSuccess
-              && etb > est)
-            est = etb;
-          return est;
-        };
+        auto temp_for = [&](size_t nb) { return gds_decomp_temp_for(nb, init_decomp); };
         size_t est_temp = temp_for(try_batch);
         int vram_retries = 0;
         // HEADROOM, NOT JUST FIT.  The halving loop below only reacts to a
@@ -27543,7 +27579,8 @@ static void gpu_decomp_worker(
             }
           }
         }
-        while (!C.ensure_buffers(try_batch, init_comp, init_decomp, est_temp)) {
+        while (!C.ensure_buffers(try_batch, init_comp, init_decomp, est_temp)
+               || gz_debug_bringup_alloc_miss()) {
           if (try_batch <= 1 || ++vram_retries > 10) {
             // Can't fit even batch=1 on this stream.  If we already have
             // working streams, stop adding more and run with what we have
@@ -27556,6 +27593,19 @@ static void gpu_decomp_worker(
           }
           try_batch = std::max<size_t>(1, try_batch / 2);
           est_temp   = temp_for(try_batch);
+          // GIVE THE BUFFERS BACK BEFORE ASKING FOR LESS -- the same rule the
+          // reserve-retry site below states, and the site that needed it and
+          // did not have it.  ensure_buffers() is grow-only as of v0.17.41, so
+          // it promotes every requested dimension back to the previous alloc_*
+          // maximum: without this free, halving stopped shrinking the SLABS and
+          // only the batch label moved.  A card that failed at 256 then re-asked
+          // for 256-slot slabs on all nine attempts and was rejected outright,
+          // even where batch 1 would have fitted -- which is exactly the "GPU
+          // decompress silently dead on an 11 GiB card" shape v0.17.31 fixed.
+          //
+          // The grow-only comment reasoned about the OTHER shrink site, saw that
+          // it frees first, and did not check whether every shrink site does.
+          C.free_device();
           {
             int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
             if (opt.verbosity >= min_verb) {
@@ -27694,8 +27744,18 @@ static void gpu_decomp_worker(
         bool restored = true;
         for (auto & C : ctxs) {
           C.free_device();
-          if (!C.ensure_buffers(reduced, host_chunk_bytes, host_chunk_bytes,
-                                reduced * 1024)) { restored = false; break; }
+          // THE SAME TWO EXPRESSIONS THE INITIAL PATH CORRECTED, which this
+          // rebuild kept in their superseded form: a compressed slot is
+          // compressBound(chunk), not chunk (a stored frame is larger than its
+          // input), and the workspace comes from nvCOMP, not `reduced * 1024`
+          // -- the guess that was measured ~50,000x low.  Rebuilding at the old
+          // sizes handed the next batch an allocation 16 MiB short on the
+          // compressed slab and 13.1 GB short on temp, which it then had to
+          // discard and re-register: ~1.24 s of BAR1 registration thrown away.
+          if (!C.ensure_buffers(reduced, ZSTD_compressBound(host_chunk_bytes),
+                                host_chunk_bytes,
+                                gds_decomp_temp_for(reduced, host_chunk_bytes)))
+            { restored = false; break; }
         }
         if (!restored) {
           // We freed strictly more than we asked back for, so reaching here
@@ -32385,6 +32445,8 @@ static int gzstd_main(int argc, char ** argv)
     g_debug_fail_decomp_alloc.store(int(std::atoll(fd)), std::memory_order_relaxed);
   if (const char * fc = std::getenv("GZSTD_DEBUG_FAIL_COMPRESS_LAUNCH"))
     g_debug_fail_compress_launch.store(int(std::atoll(fc)), std::memory_order_relaxed);
+  if (const char * fb = std::getenv("GZSTD_DEBUG_FAIL_BRINGUP_ALLOC"))
+    g_debug_fail_bringup_alloc.store(int(std::atoll(fb)), std::memory_order_relaxed);
 
   // Test-only: deterministic producer-unwind injection (see g_debug_throw_reader).
   if (const char * tr = std::getenv("GZSTD_DEBUG_THROW_READER"))

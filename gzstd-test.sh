@@ -568,8 +568,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=417
-$EXTENSIVE && EXPECTED_TESTS=557
+EXPECTED_TESTS=418
+$EXTENSIVE && EXPECTED_TESTS=558
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -581,27 +581,29 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # signal that is supposed to mean "a test was added or removed".  Subtracting the
 # known deltas makes the note mean that again, on every host.
 #
-#   no GPU        -81  the whole "GPU acceleration" section is skipped as a
-#                      group (MEASURED: 417 baseline, 336 ran on a CPU-only
+#   no GPU        -82  the whole "GPU acceleration" section is skipped as a
+#                      group (MEASURED: 418 baseline, 336 ran on a CPU-only
 #                      build).  The GDS cells live INSIDE that section, so this
 #                      delta already contains them -- do not also subtract the
 #                      GDS delta, which is why the check below uses elif.
-#   GPU, no GDS    -5  the five --gds-only cells that assert a successful run:
-#                      -t verifies on the device / -d misaligned frame starts /
-#                      -d lying seek table / forced small register budget /
-#                      -d all-empty archive.  They skip when gds_testable is
-#                      false (see gds_host_status).  MEASURED: extensive 557
-#                      baseline, 552 on a host whose nvidia-fs is absent.
+#   GPU, no GDS    -6  the six --gds-only cells that assert a successful run:
+#                      -t verifies on the device / bringup halving shrinks the
+#                      slabs / -d misaligned frame starts / -d lying seek table /
+#                      forced small register budget / -d all-empty archive.  They
+#                      skip when gds_testable is false (see gds_host_status).
+#                      MEASURED: extensive 552 on a host whose nvidia-fs is
+#                      absent, against the 558 baseline (the halving cell skips
+#                      there too, so that host's number is unchanged by it).
 #                      The sixth GDS cell ("refuses a compat-mode host") still
 #                      RUNS and passes everywhere -- only its negative control is
 #                      gated -- so it is not part of this delta.
 #
 # MEASURED COMBINATIONS: default+noGPU (336) and extensive+GPU+noGDS (552).
-# Derived: default+GPU+noGDS (412) and extensive+GPU+GDS (557, the pre-tag host).
+# Derived: default+GPU+noGDS (412) and extensive+GPU+GDS (558, the pre-tag host).
 # NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
 # -81 is the number to re-measure, not evidence of drift.
-EXPECTED_NOGPU_DELTA=81
-EXPECTED_NOGDS_DELTA=5
+EXPECTED_NOGPU_DELTA=82
+EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
 # Banner & system info
@@ -1275,6 +1277,58 @@ GVPY
       || fail "--gds-only -t corrupt archive" "exit $LAST_RC, want 4"
   fi
   rm -f "$gv_z" "$gv_e" "$gv_bad"
+
+  # v0.17.42: the bringup halve-until-it-fits loop must SHRINK THE SLABS, not
+  # merely relabel the batch.  v0.17.41 made ensure_buffers() grow-only -- so a
+  # realloc forced by one dimension stops shrinking the others -- and that
+  # promoted every halving retry straight back to the previous maximum.  A card
+  # that failed at its opening batch then re-asked for the SAME slabs on every
+  # attempt and was rejected outright, where batch 1 would have fitted: the shape
+  # v0.17.31 fixed (GPU decompress silently dead on an 11 GiB card), arrived at
+  # from the other end.
+  #
+  # IT SHIPPED THROUGH A GREEN SUITE because this loop is unreachable on a
+  # healthy host -- the three older VRAM fault hooks all spare bringup by design,
+  # and every fixture here fits a datacenter card many times over.
+  # GZSTD_DEBUG_FAIL_BRINGUP_ALLOC=N is what makes it reachable at all.
+  #
+  # THIS CELL DISCRIMINATES, and was mutation-proven against a build with the
+  # free removed: the broken build emits ONE [ENSURE] line, because after the
+  # first failure the retry satisfies ensure_buffers()'s early-return and reports
+  # SUCCESS WITHOUT ALLOCATING ANYTHING.  A correct build emits one per attempt,
+  # with a strictly decreasing batch.
+  bh_z="$TMPDIR/gds-halve.zst"; bh_e="$TMPDIR/gds-halve.err"
+  "$GZSTD" -k -f -3 "$TMPDIR/large.bin" -o "$bh_z" 2>/dev/null
+  GZSTD_DEBUG_FAIL_BRINGUP_ALLOC=3 GZSTD_DEBUG_ENSURE=1 \
+    run_test "$GZSTD" -q -t --gds-only "$bh_z" 2>"$bh_e"
+  bh_rc=$LAST_RC
+  bh_n=$(grep -c 'ENSURE. realloc' "$bh_e" 2>/dev/null || true)
+  bh_batches=$(grep -oE 'ENSURE. realloc: batch [0-9]+' "$bh_e" 2>/dev/null | awk '{print $4}' | tr '\n' ' ' || true)
+  bh_ok=1; bh_why=""
+  if [[ $bh_rc -ne 0 ]]; then
+    bh_ok=0; bh_why="exit $bh_rc after 3 forced bringup allocation failures"
+  elif [[ ${bh_n:-0} -lt 4 ]]; then
+    # The load-bearing assertion: one line per attempt means each retry really
+    # reallocated.  Fewer means the retries were absorbed by the early-return.
+    bh_ok=0; bh_why="${bh_n:-0} reallocation(s), want >=4 — halving did not shrink the slabs (batches: ${bh_batches:-none})"
+  else
+    bh_prev=0
+    for bh_b in $bh_batches; do
+      if [[ $bh_prev -ne 0 && $bh_b -ge $bh_prev ]]; then
+        bh_ok=0; bh_why="batch did not decrease across retries: $bh_batches"; break
+      fi
+      bh_prev=$bh_b
+    done
+  fi
+  if ! gds_testable; then
+    skip "--gds-only bringup halving shrinks the slabs" \
+         "GDS unavailable ($(gds_host_status))"
+  elif [[ $bh_ok -eq 1 ]]; then
+    pass "--gds-only bringup halving shrinks the slabs"
+  else
+    fail "--gds-only bringup halving" "$bh_why"
+  fi
+  rm -f "$bh_z" "$bh_e"
 
   # v0.17.29: the --gds-only OUTPUT preflight must prove EVERY frame start, not
   # infer the archive from frame 0.  Frame k begins at the sum of the

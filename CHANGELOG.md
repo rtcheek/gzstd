@@ -1,12 +1,96 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.41  
+**Covers:** v0.9.50 → v0.17.42  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.42 — the grow-only fix silently disabled the halve-until-it-fits loop
+
+Round 3 of the `--gds-only -d` review. **Severity did not fall this round**, and
+that is the finding: v0.17.41's grow-only `ensure_buffers()` broke the bringup
+retry loop, and that loop is unreachable on a healthy host, so nothing could see it.
+
+### The regression
+
+`ensure_buffers()` became grow-only in v0.17.41, so a realloc forced by one
+dimension stops shrinking the others. The bringup loop halves `try_batch` and
+retries on failure — and grow-only promoted every retry straight back to the
+previous maximum. **Halving stopped shrinking anything but the label.**
+
+Worse than that, measured. With the free removed, a forced failure at batch 255
+makes the retry at 127 satisfy `ensure_buffers()`'s early-return
+(`batch_n <= alloc_batch && ...`) and return **true without allocating anything**:
+
+| build | `[ENSURE]` lines on 3 forced bringup failures |
+|---|---|
+| v0.17.41 (broken) | **1** — attempts 2-4 allocate nothing and report success |
+| fixed | **4** — 255 -> 127 -> 63 -> 31, temp 13.06 GB -> 1.59 GB with it |
+
+A card that failed at its opening batch would re-ask for the same slabs on every
+attempt and be rejected outright, even where batch 1 would have fitted. That is
+the shape of the defect v0.17.31 fixed — GPU decompress silently dead on an
+11 GiB card — reintroduced from the other end.
+
+**The fix was already written in the sibling.** The reserve-retry site calls
+`free_device()` before asking for less, under a comment explaining exactly why
+("a shrink request against live buffers is a no-op that frees nothing"). The
+grow-only comment reasoned about *that* site, saw it frees first, and did not
+check whether every shrink site does. Now both do.
+
+### Why nothing caught it, and the hook that now can
+
+The three existing VRAM fault-injection hooks all spare bringup by design, so the
+halving loop could not be reached on any healthy host — "code that has never been
+seen to run, which is the same thing as untested", in this file's own words about
+a different loop. `GZSTD_DEBUG_FAIL_BRINGUP_ALLOC=N` closes that: it fails the
+next N bringup allocations, and it is what produced the table above. The fix is
+**mutation-proven** — the same test was run against a build with the fix removed,
+and detected it.
+
+### And the retry rebuild kept both superseded expressions
+
+The reserve-retry rebuild still called
+`ensure_buffers(reduced, host_chunk_bytes, host_chunk_bytes, reduced * 1024)` —
+the raw chunk where a compressed slot is `ZSTD_compressBound(chunk)`, and the
+`nb * 1024` guess that v0.17.41 measured ~50,000x low. It handed the next batch an
+allocation 16 MiB short on the compressed slab and 13.1 GB short on temp, which it
+then discarded and re-registered: ~1.24 s of BAR1 registration thrown away. The
+nvCOMP workspace query is now one shared helper rather than a lambda in a single
+scope, because three sites ask that question and they must not answer differently.
+
+### Confirmed unchanged
+
+Round 3 also confirmed both v0.17.41 fixes correct, and found independently that
+the two batch divisors can still disagree when **requested** devices exceed
+visible ones (`--gpu-devices=2` with one GPU visible: the pin computes 127, the
+worker 255). The worker's value is the one that allocates, so nothing overruns;
+the pin's is what `--adapt` persists. That asymmetry predates the divisor fix and
+is left open, recorded rather than fixed blind.
+
+### A suite cell, so it cannot regress silently again
+
+`--gds-only bringup halving shrinks the slabs` forces three bringup failures and
+asserts the reallocation COUNT, not just the exit code — on a 95 GiB card the
+broken build still exits 0, it merely runs with the wrong slabs. Mutation-proven
+in both directions: the real input gives 4 reallocations and batches
+`255 127 63 31`, while `FAIL_BRINGUP_ALLOC=0` gives 1 and the cell fails.
+
+Baselines move with it: `EXPECTED_TESTS` 417/557 -> **418/558**,
+`EXPECTED_NOGPU_DELTA` 81 -> **82**, `EXPECTED_NOGDS_DELTA` 5 -> **6**, with the
+provenance comments and the `RELEASING.md` host table updated to match — a stale
+baseline turns the drift note back into noise, which is the thing that check
+exists to prevent. The no-GDS host stays at 552 (the new cell skips there too),
+which is the arithmetic that confirms the three numbers still agree.
+
+Verified: healthy path still allocates once; all 16 seek-table forgery cells hold;
+`--gds-only -d`, `--gds-only` compress and `--direct-stage` round-trip
+byte-identical; both build configurations compile clean. **Pre-tag suite pair
+green on this host: CPU-only 336 passed / 0 failed, extensive 558 passed /
+0 failed, no drift note on either.**
 
 ## v0.17.41 — a review that was asked to count, and the two sizing promises it caught me breaking
 
