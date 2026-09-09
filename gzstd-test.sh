@@ -568,8 +568,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=418
-$EXTENSIVE && EXPECTED_TESTS=558
+EXPECTED_TESTS=419
+$EXTENSIVE && EXPECTED_TESTS=559
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -581,8 +581,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # signal that is supposed to mean "a test was added or removed".  Subtracting the
 # known deltas makes the note mean that again, on every host.
 #
-#   no GPU        -82  the whole "GPU acceleration" section is skipped as a
-#                      group (MEASURED: 418 baseline, 336 ran on a CPU-only
+#   no GPU        -83  the whole "GPU acceleration" section is skipped as a
+#                      group (MEASURED: 419 baseline, 336 ran on a CPU-only
 #                      build).  The GDS cells live INSIDE that section, so this
 #                      delta already contains them -- do not also subtract the
 #                      GDS delta, which is why the check below uses elif.
@@ -602,7 +602,7 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # Derived: default+GPU+noGDS (412) and extensive+GPU+GDS (558, the pre-tag host).
 # NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
 # -81 is the number to re-measure, not evidence of drift.
-EXPECTED_NOGPU_DELTA=82
+EXPECTED_NOGPU_DELTA=83
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -1329,6 +1329,42 @@ GVPY
     fail "--gds-only bringup halving" "$bh_why"
   fi
   rm -f "$bh_z" "$bh_e"
+
+  # v0.17.43: a GPU DECOMPRESS must size its device slabs from the ARCHIVE'S
+  # frame geometry, not from opt.chunk_mib -- which is the size gzstd would have
+  # WRITTEN and says nothing about a file it is reading.  Three sites used the
+  # CLI chunk under a comment claiming it "upper-bounds both compressed and
+  # decompressed size", true only of an archive this build produced at the
+  # current setting.  The disagreement runs both ways: 16 MiB frames read with
+  # --chunk-size=1 under-reserved by 15.97x, and 1 MiB frames read at the 16 MiB
+  # default allocated 8175.9 MiB of slabs where 510.99 would do.
+  #
+  # NOT --gds-only ON PURPOSE.  This sizing governs EVERY GPU decompress, so the
+  # cell exercises the general path and stays runnable on a host with no
+  # GPUDirect Storage.  Every other fixture in this suite is gzstd's own 16 MiB
+  # frames, which is exactly the shape that cannot see this defect.
+  #
+  # THIS CELL DISCRIMINATES: a pre-fix binary reports decomp 16777216 here
+  # (the CLI default) where a correct one reports 1048576 (the archive).
+  fg_z="$TMPDIR/fgeom.zst"; fg_e="$TMPDIR/fgeom.err"
+  "$GZSTD" -q -k -f --chunk-size=1 "$TMPDIR/large.bin" -o "$fg_z" 2>/dev/null
+  GZSTD_DEBUG_ENSURE=1 run_test "$GZSTD" -q -t --gpu-only "$fg_z" 2>"$fg_e"
+  fg_rc=$LAST_RC
+  fg_decomp=$(grep -oE 'decomp [0-9]+' "$fg_e" 2>/dev/null | head -1 | awk '{print $2}' || true)
+  if [[ $fg_rc -ne 0 ]]; then
+    fail "GPU decompress sizes slabs from the archive, not --chunk-size" "exit $fg_rc"
+  elif [[ -z "${fg_decomp:-}" ]]; then
+    # No instrument line at all means the GPU never brought buffers up -- the
+    # assertion below would then pass vacuously, which is worse than failing.
+    skip "GPU decompress sizes slabs from the archive, not --chunk-size" \
+         "no GPU bringup observed"
+  elif [[ $fg_decomp -gt 4194304 ]]; then
+    fail "GPU decompress sizes slabs from the archive, not --chunk-size" \
+         "decomp slot $fg_decomp bytes for a 1 MiB-frame archive — sized from the CLI chunk, not the seek table"
+  else
+    pass "GPU decompress sizes slabs from the archive, not --chunk-size"
+  fi
+  rm -f "$fg_z" "$fg_e"
 
   # v0.17.29: the --gds-only OUTPUT preflight must prove EVERY frame start, not
   # infer the archive from frame 0.  Frame k begins at the sum of the

@@ -1,12 +1,138 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.42  
+**Covers:** v0.9.50 → v0.17.43  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.43 — the four pre-existing findings, and a sizing bug that only became visible once the slabs were right
+
+The remainder of round 3's sweep. All four were pre-existing rather than
+regressions, and the first uncovered a fifth that the others had been hiding.
+
+### Decompress sized its slabs from the CLI chunk, not the archive
+
+`opt.chunk_mib` is the size gzstd would have WRITTEN and says nothing about an
+archive it is reading, but three sites used it anyway — under a comment claiming
+the chunk "upper-bounds both compressed and decompressed size", which holds only
+for an archive this build produced at the current setting. The seek table already
+answers the question exactly, and one site was reaching for it as
+`max(chunk, real)` — which corrects only the direction that under-reserves:
+
+| shape | before | after |
+|---|---|---|
+| 16 MiB frames read with `--chunk-size=1` | reserve models 254.99 MiB against 4072.43 MiB of real geometry — **15.97x shortfall** | modelled correctly |
+| 1 MiB frames read at the 16 MiB default | slabs of **8175.9 MiB** where 510.99 would do | **16x smaller** (measured: comp 1052672, decomp 1048576) |
+
+`decomp_frame_cap()` is now the single authority and all three sites ask it.
+
+### Which exposed a second reallocation that the waste had been masking
+
+With the slabs finally the right size, the 1 MiB-frame archive started
+reallocating twice. The staged reader reads an ALIGNED WINDOW, so its slot needs
+two pages of headroom — the per-batch consumer applied that and bringup did not.
+Invisible while every slab was 16x too big; immediate once they were not.
+
+Fixing it then broke the budget a third time, because the divisor was computing
+its own idea of the slot: batch 255 x 16846848 = 4096.9 MiB against a 4096 MiB
+budget. **Three sites had now each independently reconstructed "the size a frame
+registers", and each drift silently broke the bound its own comment promised.**
+There is now one expression, `gds_reg_slot()`, and the budget divisor, the
+`--adapt` batch pin and the bringup allocation all ask it. Measured: batch 254,
+registration **4081 MiB**, inside budget, one reallocation on both archives.
+
+### The budget's floor could exceed the budget
+
+`max(1, budget / slot)` floors the BATCH, not the bytes, so a share smaller than
+one slot is honoured by exceeding it — with `GZSTD_DEBUG_GDS_BUDGET_MIB=1` and
+16 MiB frames the single slot is 16x the stated budget, and that is reachable
+without the hook below ~273 MiB of MemAvailable. The floor is right (registering
+nothing is not an option), so the comment claiming it "stays inside the bound"
+was the defect. It now says what it does, and `-v` reports when the floor wins
+rather than printing a budget and quietly overrunning it.
+
+### `--direct-stage` retried a fixed request by changing something else
+
+Its 8 pinned staging slots are sized from the chunk and do not depend on the GPU
+batch — so when a pin failed, the outer loop's response (halve the batch, retry)
+changed nothing about the allocation that failed: **7 attempts, 56
+`cudaHostAlloc` calls, 49 allocated-and-freed pairs, the same 128 MiB requested
+every time**, and then the device rejected. It now takes the slots it got and
+narrows the read fan-out to match, because those slots are per-reader precisely
+so two lanes never share one. One slot still works — that is serial staging,
+which is what `--direct-stage` did before the fan-out existed.
+
+### The compress fit search omitted two of its own allocations
+
+"The largest batch that fits" modelled input, output, nvCOMP temp and base
+metadata, while bringup went on to allocate the peer-to-peer pack buffer (~1032
+MiB at batch 64) and, under `--verify`, a second full-size output slab (~1024
+MiB). Not an overrun — a failed allocation still halves the batch — but the
+search landed high and the retry loop did the real work: 7 attempts and 6
+reductions where the estimate should have chosen correctly the first time.
+
+### Rounds 4-7: the same shape, five more times
+
+Four further review rounds, each checking the previous round's fixes. The count
+per round went 6, 5, 4, 5 — but the character fell sharply, and what it exposed
+was mostly ONE defect repeating.
+
+**"The size a frame occupies" had been independently reconstructed at six sites**
+— budget divisor, `--adapt` pin, bringup, VRAM reserve, reserve-retry rebuild,
+per-batch consumer — and every drift silently broke a bound some comment
+promised. Unifying it took four rounds because each round revealed one more copy.
+It is now `decomp_frame_cap` / `gds_comp_slot` / `gds_reg_slot` /
+`decomp_comp_slot` / `decomp_out_slot`, and every site asks rather than derives.
+
+**Twice the fix was already written in the sibling.** `free_device()`-before-
+shrinking was documented at the reserve-retry site while the bringup loop lacked
+it. And `ck_stream`/`ck_done` were missing from a preserved-fields list whose own
+comment documents that exact bug for `stream` ("zeroing it made
+`cudaStreamDestroy` a silent no-op: the stream LEAKED") — so every staged compress
+run leaked a stream and an event per stream, and a retry found `ck_done` null,
+threw at `cudaEventRecord`, and took the whole file through a CPU rebuild.
+
+Also fixed across those rounds: the reserve-rebuild failure path leaked up to
+4.27 GB of slabs and three CUDA handles per context; the compress fit search
+omitted the verify decompression workspace (819 MiB at batch 16) while
+over-counting the pack buffer by 1032 MiB when `--gpu-streams=2` disables
+peer-to-peer output, and its inner mirror substituted the compression workspace
+for the decompression one; a pinning failure reported VRAM exhaustion and claimed
+a CPU fallback that cannot happen under `--gpu-only`.
+
+**And one review finding was wrong.** A reported case where an accepted seek table
+publishes a maximum frame size of zero — costed at 8144 MiB — does not exist: the
+parser rejects a zero-length DATA entry and requires at least one DATA interval.
+The reviewer confirmed it after being asked for a reachable archive. A 4096-byte
+floor added for that phantom was removed; it guarded nothing and inflated every
+slot for a real maximum of 1..4095. Verify before adopting, in both directions.
+
+The seventh round returned **"0 paths in these changes that alter computed bytes
+and 0 new failures on a healthy-host success path"**.
+
+### A second suite cell
+
+`GPU decompress sizes slabs from the archive, not --chunk-size` builds a
+`--chunk-size=1` archive, decompresses at the default and asserts the decompressed
+slot is <= 4 MiB. Mutation-proven: a build without the fix reports 16777216 where
+a correct one reports 1048576, and **both exit 0** — so the geometry assertion is
+the test, not the exit code. Deliberately `--gpu-only` rather than `--gds-only`:
+this sizing governs every GPU decompress, and every other fixture in the suite is
+gzstd's own 16 MiB frames, which is the one shape that cannot see the defect.
+
+Baselines: `EXPECTED_TESTS` 418/558 -> **419/559**, `EXPECTED_NOGPU_DELTA` 82 ->
+**83**, `EXPECTED_NOGDS_DELTA` unchanged at 6 (this cell needs no GDS).
+
+Verified: all 16 seek-table forgery cells hold; the halving cell still shrinks
+(254 -> 127 -> 63 -> 31); a 1,000,003-byte frame takes one allocation cycle, two
+under a forced reserve failure; `--gds-only -d`, `--gds-only` compress,
+`--gds-only --verify`, `--direct-stage` and a 1 MiB-frame archive all round-trip
+byte-identical; both build configurations compile clean. **Pre-tag suite pair
+green: CPU-only 336 passed / 0 failed, extensive 559 passed / 0 failed, no drift
+note on either, and both new cells RAN rather than skipped.**
 
 ## v0.17.42 — the grow-only fix silently disabled the halve-until-it-fits loop
 

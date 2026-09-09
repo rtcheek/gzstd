@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.42";
+static constexpr const char * GZSTD_VERSION = "0.17.43";
 //
 // Architecture overview:
 //
@@ -1055,7 +1055,20 @@ static size_t gds_register_budget()
     if (derived >= ceiling) return ceiling;
     // NO FLOOR.  A floor is a promise to exceed the policy on precisely the host
     // that can least afford it; the batch bottoms out at one frame on its own
-    // (max(1, budget / frame_cap)), which is slow but stays inside the bound.
+    // (max(1, budget / slot)).
+    //
+    // AND THAT LAST FRAME CAN EXCEED THIS BUDGET -- this comment used to claim it
+    // "stays inside the bound", which is false whenever ONE slot is larger than
+    // the share.  `max(1, ...)` floors the BATCH, not the bytes: with
+    // GZSTD_DEBUG_GDS_BUDGET_MIB=1 and 16 MiB frames the single registered slot
+    // is 16.06 MiB, 16x the stated budget.  Reachable without the debug hook at
+    // MemAvailable below ~273 MiB under the /17 policy, or by dividing a real
+    // budget across enough devices and streams.
+    //
+    // The floor is still right -- registering nothing is not an option and one
+    // frame is the smallest unit that works -- so the bound is best-effort by
+    // construction, and gds_register_min_exceeded() below lets the caller SAY so
+    // rather than quietly overrunning a number it printed.
     return derived;
   }();
   return v;
@@ -11988,11 +12001,134 @@ static uint32_t gz_content_ck32(const void * p, size_t n)
 // table left from the previous file would verify this one against wrong hashes.
 static std::vector<uint64_t> g_tbl_ck_off;
 static std::vector<uint32_t> g_tbl_ck_val;
-// Largest DECOMPRESSED frame in the current input, from its seek table; 0 when
-// unknown.  Loaded alongside the checksums because it comes from the same parse
+// Largest DECOMPRESSED frame in the current input, from its seek table.
+//
+// PAIRED WITH A KNOWN-FLAG so that "the table says X" and "there is no table" are
+// different answers rather than both being 0.
+//
+// THIS WAS ALMOST WRITTEN AS A BUG FIX AND IS NOT ONE.  A review reported that an
+// archive of only empty DATA frames publishes a maximum of exactly 0 and was
+// therefore being sized from the CLI chunk, at a cost of 8144 MiB of slabs.  The
+// case does not exist: `parse_foreign_seek_table` rejects a zero-length DATA
+// entry and requires at least one DATA interval, so a table that parses always
+// reports a maximum above zero -- and the suite's three-empty-frame fixture is
+// three concatenated archives with no describing table at all, so it leaves the
+// geometry unknown by the other route.  The flag is kept because it states the
+// invariant instead of inferring it, and because it stays correct if that parser
+// ever admits an empty frame.  A 4096-byte floor was added here for the same
+// phantom and removed again: it guarded nothing and inflated every slot for a
+// real maximum of 1..4095.  Loaded alongside the checksums because it comes from the same parse
 // of the same table, and published as a global because the GPU worker sizes its
 // slabs from it and holds no descriptor of its own.
 static std::atomic<uint64_t> g_input_max_frame{0};
+static std::atomic<bool>     g_input_geom_known{false};
+
+#ifdef HAVE_NVCOMP
+// GUARDED AS A GROUP: these size GPU device slabs and one of them reads
+// g_gds_read_active, which lives inside this same guard.  Without nvCOMP there
+// is no device allocation to size, and an unguarded definition is either a
+// compile error or an unused-function warning in the build nobody compiles.
+// The frame size a DECOMPRESS should size its device slabs from.
+//
+// NOT `opt.chunk_mib`, which is the size gzstd would have WRITTEN and says
+// nothing about an archive it is reading.  The comment at the slab site claimed
+// the chunk "upper-bounds both compressed and decompressed size"; that holds
+// only for an archive this build produced at the current setting, and the
+// disagreement runs BOTH ways:
+//
+//   16 MiB frames read with --chunk-size=1  -> the reserve modelled 254.99 MiB
+//                                              against 4072.43 MiB of real
+//                                              geometry, a 15.97x SHORTFALL
+//   1 MiB frames read at the 16 MiB default -> slabs of 8175.9 MiB where
+//                                              510.99 would do, 16x wasted
+//
+// The seek table already answers this exactly, and one site was already reaching
+// for it -- but as `max(chunk, real)`, which fixes only the shortfall direction
+// and leaves the 16x waste.  When the table is readable its answer is simply
+// authoritative.  `g_input_geom_known` says whether it is readable, rather than
+// reading a zero maximum as "no table": `parse_foreign_seek_table` rejects a
+// zero-length DATA entry and requires at least one DATA interval, so a parsed
+// table always reports a maximum above zero -- the flag and `mx > 0` agree today,
+// and the flag keeps them agreeing if that parser ever admits an empty frame.
+static size_t decomp_frame_cap(const Options & opt)
+{
+  if (g_input_geom_known.load(std::memory_order_relaxed)) {
+    // NO 4096 FLOOR.  One was added here to keep the allocator off zero, then
+    // measured as pure waste: the parser cannot publish a zero, so the floor
+    // never guarded anything, and for a real maximum between 1 and 4095 it
+    // inflated every slot -- a 1-byte frame at batch 256 costs 1,046,528 bytes
+    // of output slab against the 8 bytes the consumer actually strides, plus the
+    // same inflation carried into the compressed bound and the nvCOMP workspace.
+    return (size_t)g_input_max_frame.load(std::memory_order_relaxed);
+  }
+  // NO USABLE TABLE.  Not the same as a table reporting zero, and not the same
+  // as a table this run later REJECTS: a lying table (see gds_table_defect) is
+  // published before the per-frame validation that rejects it, so a run that
+  // demotes to the ordinary producer can be holding geometry from a table it has
+  // since disowned.  That does not overrun -- the per-batch ensure_buffers()
+  // grows -- but it is why this helper is authoritative about the TABLE, not
+  // about the archive.
+  return std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+}
+
+// The compressed SLOT a staged (--gds-only / -t) read needs for a frame of
+// `raw` compressed bytes: it reads an ALIGNED WINDOW, so the slot holds up to
+// 4095 bytes of lead-in plus the tail round-up, and its base stays 4 KiB-aligned
+// so the device offset remains peer-to-peer eligible.
+//
+// SHARED because the per-batch consumer applies it and bringup did not, which is
+// the decider/consumer split again: sizing the initial slab without this headroom
+// guaranteed a second reallocation -- and therefore a second cuFileBufRegister --
+// on any archive whose frames do not already carry 8 KiB of slack.  Invisible
+// while the slabs were oversized by the chunk-geometry bug above; the moment they
+// were sized correctly, it appeared.
+static inline size_t gds_comp_slot(size_t raw)
+{ return (raw + 8191) & ~size_t(4095); }
+
+// THE size a --gds-only run registers per frame.  Every site that budgets, pins
+// or allocates the compressed slab must ask this and nothing else: the budget
+// divisor, the --adapt batch pin, and the bringup allocation.  Each time one of
+// them has been computed independently it has drifted from the others -- by
+// 16 MiB when the divisor forgot compressBound, and by another ~1 MiB when it
+// forgot the aligned-window headroom -- and each drift silently broke the very
+// bound its own comment promised to enforce.
+static inline size_t gds_reg_slot(const Options & opt)
+{ return gds_comp_slot(ZSTD_compressBound(decomp_frame_cap(opt))); }
+
+// The compressed slot a DECOMPRESS bringup should allocate, staged or not.
+// Every site that allocates, reserves for, or rebuilds that slab asks this --
+// there are FOUR of them (bringup, the VRAM reserve, the reserve-retry rebuild,
+// and the budget divisor through gds_reg_slot), and each round of review has
+// found another that had been left on an older expression.  A slot that is
+// 4096 bytes short is not a rounding difference: it forces a full
+// free/alloc/cuFileBufRegister cycle on the first frame that does not fit.
+// The DECOMPRESSED slot stride, for a slab of `n`-byte frames.  Mirrors what the
+// per-batch consumer computes: 4 KiB when peer-to-peer output writes whole blocks
+// out of the slot, then 8-byte alignment because the XXH64 kernel reads each slot
+// base as 64-bit words.  Bringup allocated the raw size and the consumer rounded,
+// so a frame that is not already a multiple -- 1,000,003 bytes, say -- grew the
+// slab on the first batch and paid a full free/alloc/re-register cycle for
+// 3,517 bytes a slot.  The compressed term was unified three rounds ago; this is
+// its decompressed twin.
+static inline size_t decomp_out_slot(size_t n, bool gds_out)
+{
+  if (gds_out) n = (n + 4095) & ~size_t(4095);
+  return (n + 7u) & ~size_t(7);
+}
+
+// `staged` IS A PARAMETER, NOT A GLOBAL READ.  The worker freezes C.gds_read at
+// spawn and the consumer applies gds_comp_slot() from that frozen copy, but the
+// global it was frozen from is cleared when the producer demotes -- so a helper
+// that re-read the live global returned 16,842,752 while the consumer needed
+// 16,846,848, and the 4096-byte-a-slot difference bought a full reallocation and
+// re-registration. Two questions, one predicate: whoever owns the frozen decision
+// passes it in.
+static inline size_t decomp_comp_slot(const Options & opt, bool staged)
+{
+  const size_t bound = ZSTD_compressBound(decomp_frame_cap(opt));
+  return staged ? gds_comp_slot(bound) : bound;
+}
+#endif  // HAVE_NVCOMP
 
 static bool table_checksum_for(uint64_t uoff, uint32_t * ck)
 {
@@ -21813,6 +21949,7 @@ static void table_checksums_clear()
   g_tbl_ck_off.clear();
   g_tbl_ck_val.clear();
   g_input_max_frame.store(0, std::memory_order_relaxed);
+  g_input_geom_known.store(false, std::memory_order_relaxed);
 }
 
 static void table_checksums_load(FILE * in)
@@ -21832,6 +21969,7 @@ static void table_checksums_load(FILE * in)
       if (dz > mx) mx = dz;
     }
     g_input_max_frame.store(mx, std::memory_order_relaxed);
+    g_input_geom_known.store(true, std::memory_order_relaxed);
   }
   if (st.checksums.empty()) return;                 // table carries no checksums
   // u_off holds nframes+1 prefix sums and checksums holds nframes entries; if
@@ -22776,6 +22914,8 @@ struct StreamCtx {
   // is page-aligned, which is what O_DIRECT requires of the pread landing in it.
   static constexpr size_t DSTAGE_MAX_READERS = 8;   // mirrors rd_threads' cap
   std::vector<void *> h_dstage;      // DSTAGE_MAX_READERS entries when engaged
+  size_t h_dstage_n = 0;             // slots actually PINNED (<= DSTAGE_MAX_READERS)
+  bool   host_pin_failed = false;    // could not pin even ONE staging slot
   size_t h_dstage_slot_bytes = 0;
 
   // Host-side vectors (mirroring device arrays for readback)
@@ -22879,8 +23019,33 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
                       + per_stream_batch * max_out_chunk    // output
                       + temp_est                            // nvCOMP temp workspace
                       + per_stream_batch * (sizeof(void*)*2 + sizeof(size_t)*2 + sizeof(nvcompStatus_t));
-    if (opt.gpu_verify)                                      // GPU verify: + decompressed buffer + decomp temp
-      est_needed += per_stream_batch * gpu_chunk + temp_est;
+    if (opt.gpu_verify) {
+      // + decompressed buffer + ITS OWN decompression workspace.  This used to
+      // add `temp_est`, the COMPRESSION workspace already counted above, which is
+      // a different query against a different API: the source records 819 MiB for
+      // the decompression one at batch 16.  Substituting one for the other made
+      // this "estimate total VRAM" pre-check wrong by their difference, which is
+      // the whole quantity it exists to catch before cudaMalloc can hang.
+      nvcompBatchedZstdDecompressOpts_t vopts{};
+      size_t vtb = 0;
+      if (nvcompBatchedZstdDecompressGetTempSizeAsync(
+              per_stream_batch, gpu_chunk, vopts, &vtb,
+              per_stream_batch * gpu_chunk) != nvcompSuccess)
+        return false;                    // the consumer refuses this status too
+      est_needed += per_stream_batch * gpu_chunk + vtb;
+      est_needed += per_stream_batch * (sizeof(void*) + sizeof(size_t)
+                                        + sizeof(unsigned int)) + sizeof(unsigned int);
+    }
+    // The peer-to-peer pack buffer and the staged checksum array, on the same
+    // resolved predicates the outer search uses -- omitted here while the outer
+    // search counted them, so the two mirrors disagreed about the same bringup.
+    if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+      est_needed += ((per_stream_batch * max_out_chunk + 8u * ONE_MIB) + 4095u) & ~size_t(4095);
+      est_needed += 8192;
+      est_needed += per_stream_batch * (sizeof(unsigned long long) * 2 + sizeof(unsigned int));
+    }
+    if (opt.region_staged())
+      est_needed += sizeof(unsigned int) * per_stream_batch;
     if (opt.verbosity >= V_DEBUG) {
       fprintf(stderr, "[VRAM check] batch=%zu gpu_chunk=%zu max_out=%zu temp=%zu MiB est=%zu MiB free=%zu MiB\n",
               per_stream_batch, gpu_chunk/ONE_MIB, max_out_chunk/ONE_MIB,
@@ -22935,6 +23100,7 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
     // is rounded UP, so the buffer must hold the rounded length, not the frame's.
     C.h_dstage_slot_bytes = (C.gpu_chunk + 4095) & ~size_t(4095);
     C.h_dstage.assign(StreamCtx::DSTAGE_MAX_READERS, nullptr);
+    C.h_dstage_n = 0;
     for (size_t k = 0; k < StreamCtx::DSTAGE_MAX_READERS; ++k) {
       // (endian-lint exemption: cudaHostAlloc is an allocator out-param, listed
       // in check-endian-reads.sh's ALLOW beside cudaMalloc -- the width here is
@@ -22942,9 +23108,39 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
       if (cudaHostAlloc(&C.h_dstage[k], C.h_dstage_slot_bytes,
                         cudaHostAllocDefault) != cudaSuccess) {
         C.h_dstage[k] = nullptr;
-        return false;      // VRAM/pinned budget is already tight; fail cleanly
+        break;
       }
+      ++C.h_dstage_n;
     }
+    // TAKE WHAT WE GOT, AND NARROW THE FAN-OUT TO MATCH.  This used to return
+    // false on the first failed pin, which handed the caller a failure it could
+    // do nothing with: the request is 8 slots of gpu_chunk and does not depend on
+    // the GPU batch, so the outer loop's response -- halve the batch and retry --
+    // changed nothing about the allocation that failed.  MEASURED shape: 7
+    // attempts, 56 cudaHostAlloc calls, 49 successful pairs allocated and freed,
+    // and the same 128 MiB requested every time before the device was rejected.
+    //
+    // The slots are per-reader precisely so two lanes never share one, so fewer
+    // slots is only safe if fewer lanes run; h_dstage_n is what the read fan-out
+    // clamps to below.  One slot still works -- it is serial staging, which is
+    // what --direct-stage did before the fan-out existed.
+    if (C.h_dstage_n == 0) {
+      // NOT A BATCH PROBLEM, AND THE CALLER MUST KNOW THAT.  These slots are
+      // sized from the chunk and their count is fixed, so nothing about the GPU
+      // batch changes this request -- yet a bare `return false` sent the caller
+      // into the halve-and-retry loop, which asked for the SAME 16 MiB seven
+      // times (64, 32, 16, 8, 4, 2, 1) and, with a nonzero nvCOMP temp, threw
+      // away 8 device allocations per attempt to do it.  Narrowing the fan-out
+      // covers 1-7 slots; zero slots is a host-memory answer and retrying a
+      // device quantity cannot change it.
+      C.host_pin_failed = true;
+      return false;
+    }
+    if (C.h_dstage_n < StreamCtx::DSTAGE_MAX_READERS)
+      vlog(V_VERBOSE, opt,
+           "[DSTAGE] pinned " + std::to_string(C.h_dstage_n) + " of "
+           + std::to_string((size_t)StreamCtx::DSTAGE_MAX_READERS)
+           + " staging slots; read fan-out narrows to match\n");
   }
   if (opt.region_staged()) {
     if (cudaMalloc(&C.d_checksums, sizeof(unsigned int) * C.per_stream_batch) != cudaSuccess)
@@ -22955,6 +23151,13 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
     if (cudaHostAlloc(&C.h_ck_pinned, sizeof(unsigned int) * C.per_stream_batch,
                       cudaHostAllocDefault) != cudaSuccess) {
       C.h_ck_pinned = nullptr;
+      // SAME RESOURCE AS THE STAGING SLOTS, so the same flag.  This is pinned
+      // HOST memory, and without saying so the retry loop halved the GPU batch
+      // seven times -- requesting 256, 128, 64, 32, 16, 8 and finally 4 bytes --
+      // and then blamed VRAM.  A host that cannot pin four bytes is not short of
+      // VRAM, and under --direct-stage each of those attempts also re-ran the
+      // 8 x 16 MiB slot allocations.
+      C.host_pin_failed = true;
       return false;      // a few hundred bytes; failing here means something worse
     }
   }
@@ -23217,8 +23420,9 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   if (C.ev_d2h_end) { cudaEventDestroy(C.ev_d2h_end); }
   if (C.ev_done) { cudaEventDestroy(C.ev_done); }
   // Preserve what the CALLER still owns across the buffer reallocation:
-  // C = StreamCtx{} wipes every field, and four of them are read after this
-  // function returns.
+  // C = StreamCtx{} wipes every field, and SIX of them are read after this
+  // function returns.  (It said four until the two checksum handles below were
+  // added to the list -- a count in a comment is a claim like any other.)
   //
   //   stats/last_adjust  — accumulated per-stream JSON stats.
   //   stream             — this function frees BUFFERS, not the stream.  Every
@@ -23236,15 +23440,29 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   //                        a null stream.  Matters most on small cards, which
   //                        are exactly where the back-off is supposed to save
   //                        the run.
-  auto save_adjust = C.last_adjust;
-  auto save_stats  = C.stats;
-  auto save_stream = C.stream;
-  auto save_batch  = C.per_stream_batch;
+  //   ck_stream/ck_done  — THE SAME DEFECT AS `stream`, one field over, and it
+  //                        arrived after that note was written.  The staged
+  //                        paths create these once per stream; zeroing them here
+  //                        made every caller's `if (C.ck_done) cudaEventDestroy`
+  //                        a no-op, so a stream and an event LEAKED on every
+  //                        successful --gds-only/--direct-stage run (2 handles
+  //                        per stream per input file).  Worse on the retry path:
+  //                        the next attempt found ck_done null, and the first
+  //                        batch's cudaEventRecord(C.ck_done) threw and took the
+  //                        whole file through a CPU rebuild.
+  auto save_adjust    = C.last_adjust;
+  auto save_stats     = C.stats;
+  auto save_stream    = C.stream;
+  auto save_batch     = C.per_stream_batch;
+  auto save_ck_stream = C.ck_stream;
+  auto save_ck_done   = C.ck_done;
   C = StreamCtx{};
   C.last_adjust      = save_adjust;
   C.stats            = save_stats;
   C.stream           = save_stream;
   C.per_stream_batch = save_batch;
+  C.ck_stream        = save_ck_stream;
+  C.ck_done          = save_ck_done;
 }
 
 
@@ -24143,6 +24361,53 @@ static void gpu_worker(
           size_t est = mid * (gpu_chunk + max_out_chunk)
                      + temp_est
                      + mid * (sizeof(void*)*2 + sizeof(size_t)*2 + sizeof(nvcompStatus_t));
+          // COUNT WHAT THE CONSUMER WILL ALSO ALLOCATE.  This estimate covered
+          // input, output, nvCOMP temp and the base metadata, and then bringup
+          // allocated two more things it never modelled -- so "the largest batch
+          // that fits" was chosen against a number that was not the footprint.
+          // It does not overrun (a failed allocation still halves the batch),
+          // but the search lands high and the retry loop does the real work:
+          // MEASURED at batch 64, ~1032 MiB unmodelled for peer-to-peer output
+          // and ~1024 MiB for --verify, enough for 6 reductions and 7 attempts.
+          // THE RESOLVED DECISION, not the flags.  `--gds-only --gpu-streams=2`
+          // leaves gds_only set and disables peer-to-peer output, so budgeting
+          // on the flags alone charged 1032 MiB for a pack buffer that is never
+          // allocated -- the estimator's error in the opposite direction from
+          // the verify omission above.  g_gds_cout_active is resolved during
+          // output setup, before any worker reaches this search.
+          if (g_gds_cout_active.load(std::memory_order_relaxed)) {
+            // The peer-to-peer pack buffer, its carry scratch, and three
+            // per-frame arrays (offset, compressed size, checksum).
+            est += ((mid * max_out_chunk + 8u * ONE_MIB) + 4095u) & ~size_t(4095);
+            est += 8192;
+            est += mid * (sizeof(unsigned long long) * 2 + sizeof(unsigned int));
+          }
+          if (opt.gpu_verify) {
+            // The verify path decompresses each frame back into VRAM and hashes
+            // it, so it owns a second full-size output slab AND ITS OWN
+            // DECOMPRESSION WORKSPACE -- which is not the compression workspace
+            // already counted above and is far larger: the source records 819 MiB
+            // at batch 16 for this geometry.  Omitting it under-estimated
+            // `--gpu-only --verify --verify-engine=gpu --gpu-batch=16` by that
+            // much, so the search accepted a batch the allocator then had to
+            // halve up to five times.  Queried exactly as the consumer queries it.
+            est += mid * gpu_chunk;
+            nvcompBatchedZstdDecompressOpts_t vopts{};
+            size_t vtb = 0;
+            // A STATUS THIS SEARCH CANNOT READ IS NOT A ZERO-BYTE WORKSPACE.
+            // The consumer returns false on a non-success status, so accepting
+            // the candidate here on the same status would choose a batch that
+            // bringup then refuses.  Reject it the way the compression-temp
+            // query above already does.
+            if (nvcompBatchedZstdDecompressGetTempSizeAsync(
+                    mid, gpu_chunk, vopts, &vtb, mid * gpu_chunk) != nvcompSuccess) {
+              hi = mid - 1; continue;
+            }
+            est += vtb;
+            est += mid * (sizeof(void*) + sizeof(size_t) + sizeof(unsigned int))
+                 + sizeof(unsigned int);
+          }
+          if (opt.region_staged()) est += sizeof(unsigned int) * mid;  // d_checksums
           if (est <= static_cast<size_t>(free_b * per_stream_frac)) {
             best = mid;
             lo = mid + 1;
@@ -24185,9 +24450,39 @@ static void gpu_worker(
       const uint64_t malloc_t0 = now_ns();
       int vram_retries = 0;
       bool stream_init_failed = false;
+      // Set when the stream died of HOST pinning, so the two VRAM diagnoses below
+      // do not name a memory the run never ran out of.  A user who cannot pin
+      // 128 MiB was told, in order, that pinned host memory was exhausted, that
+      // VRAM was exhausted, and that there is no CPU fallback -- the middle one
+      // being false.
+      bool host_pin_hopeless = false;
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
         // Free any partial allocations from the failed attempt
+        const bool pin_hopeless = C.host_pin_failed;
         free_stream_buffers_only(C, opt);
+        if (pin_hopeless) {
+          // See host_pin_failed: halving the batch cannot change a fixed host
+          // pinning request, so stop instead of spending six more attempts
+          // proving it.  Say which resource ran out -- "VRAM insufficient" would
+          // point every diagnosis at the card.
+          // SAY WHAT HAPPENS, NOT WHAT WOULD BE CONVENIENT.  An earlier draft of
+          // this said the stream "falls back to the ordinary read path"; it does
+          // not -- --direct-stage implies --gpu-only and the staged compress path
+          // has no CPU fallback, so this stream is DISCARDED: the run continues
+          // on the remaining staged streams, or gives up on the GPU entirely if
+          // this was the only one.
+          vlog(V_ERROR, opt,
+               "WARNING: --direct-stage could not pin any host staging buffer "
+               "(pinned host memory exhausted, not VRAM);\n  the GPU batch cannot "
+               "change a fixed host request, so this stream is dropped rather than "
+               "retried.\n");
+          stream_init_failed = true;
+          host_pin_hopeless  = true;   // suppress the VRAM diagnoses below
+          if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+          if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
+          if (C.stream)    { cudaStreamDestroy(C.stream);    C.stream = nullptr; }
+          break;
+        }
         if (C.per_stream_batch <= 1 || ++vram_retries > 10) {
           // Can't fit even batch=1 on this stream.  If we already initialized
           // one or more streams, stop adding more and run with what we have
@@ -24215,8 +24510,11 @@ static void gpu_worker(
         // Auto-decrement stream count: keep streams [0..s) and stop here.
         if (s == 0) {
           // Couldn't fit even one stream — skip this GPU entirely.
-          std::string skip_msg = "[GPU" + std::to_string(device_id)
-              + "] insufficient VRAM for even 1 stream at batch=1  skipping device"
+          std::string skip_msg = host_pin_hopeless
+              ? "[GPU" + std::to_string(device_id)
+                + "] skipping device: no host staging buffer could be pinned"
+              : "[GPU" + std::to_string(device_id)
+                + "] insufficient VRAM for even 1 stream at batch=1  skipping device"
               + (opt.gds_only ? "  (under --gds-only this is usually the BAR1"
                                 " aperture, not VRAM)" : "");
           vlog(V_ERROR, opt, skip_msg + "\n");
@@ -24241,8 +24539,12 @@ static void gpu_worker(
         // At least one stream is usable — shrink ctxs and continue.
         vlog(V_DEFAULT, opt,
              "WARNING: [GPU" + std::to_string(device_id)
-             + "] VRAM insufficient for " + std::to_string(stream_count)
-             + " streams at batch=1; auto-reducing to " + std::to_string(s)
+             + (host_pin_hopeless ? "] no host staging buffer could be pinned for "
+                                  : "] VRAM insufficient for ")
+             + std::to_string(stream_count)
+             + (host_pin_hopeless ? " streams; auto-reducing to "
+                                  : " streams at batch=1; auto-reducing to ")
+             + std::to_string(s)
              + " stream" + (s == 1 ? "" : "s") + "\n");
         ctxs.resize(s);
         break;  // exit the stream-init loop
@@ -24867,7 +25169,16 @@ static void gpu_worker(
                   + " exceeds GPU subchunk slot " + std::to_string(C.gpu_chunk));
             C.h_in_sizes[i] = t.len();
           }
-          const size_t rd_threads = std::min<size_t>(C.filled, 8);
+          // NEVER MORE LANES THAN PINNED SLOTS.  place_frame indexes
+          // h_dstage[k % h_dstage_n], so a lane without its own slot would share
+          // one with a concurrent lane and corrupt both frames.  The cap was the
+          // constant 8 that DSTAGE_MAX_READERS mirrors; it is now whatever was
+          // actually pinned, which is what lets a short pin degrade instead of
+          // rejecting the device.
+          const size_t rd_cap = opt.direct_stage
+                              ? std::max<size_t>(1, C.h_dstage_n)
+                              : StreamCtx::DSTAGE_MAX_READERS;
+          const size_t rd_threads = std::min<size_t>(C.filled, rd_cap);
           std::atomic<bool> rd_failed{false};
           std::mutex        rd_err_m;
           std::string       rd_err;
@@ -24981,7 +25292,7 @@ static void gpu_worker(
               // short read below THAT is a real error rather than a tail.
               if (opt.direct_stage) {
                 char * hp = static_cast<char *>(
-                    C.h_dstage[k % StreamCtx::DSTAGE_MAX_READERS]);
+                    C.h_dstage[k % std::max<size_t>(1, C.h_dstage_n)]);
                 if (!hp) die("--direct-stage: staging slot missing for reader "
                              + std::to_string(k));
                 const size_t want = (t.len() + 4095) & ~size_t(4095);
@@ -27440,11 +27751,6 @@ static void gpu_decomp_worker(
     // user sets it: this only bounds the tuner's speculative headroom.
     if (g_gds_read_active.load(std::memory_order_relaxed)
         && !opt.gpu_batch_user_set) {
-      size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
-      {   // the archive's real frame size, not the one gzstd would have written
-        const uint64_t mx = g_input_max_frame.load(std::memory_order_relaxed);
-        if (mx > (uint64_t)frame_cap) frame_cap = (size_t)mx;
-      }
       // THE BUDGET IS FOR THE PROCESS, AND THIS IS ONE STREAM OF ONE DEVICE.
       // Applied whole here it promised a host-derived bound and then registered
       // that much per stream per device -- `--gpu-streams 2` quietly doubled the
@@ -27461,17 +27767,31 @@ static void gpu_decomp_worker(
       // fix: 4 GiB budget -> batch 256 -> 4112 MiB registered, over by exactly
       // 16 MiB.  Budgeting by one size and registering at another is the same
       // mismatch that made est_temp useless.
-      const size_t reg_slot  = ZSTD_compressBound(frame_cap);
+      const size_t reg_slot  = gds_reg_slot(opt);
       const size_t fit       = std::max<size_t>(1, budget / std::max<size_t>(1, reg_slot));
       if (fit < per_stream_cap) per_stream_cap = fit;
+      // SAY IT WHEN THE FLOOR WINS.  One frame is the smallest registrable unit,
+      // so a share smaller than one slot is honoured by exceeding it -- see the
+      // NO FLOOR note on gds_register_budget().  Printing the budget and then
+      // quietly registering 16x it is the kind of silent divergence this project
+      // treats as the defect; a host that hits this wants to know its bound was
+      // best-effort, not to discover it from a BAR1 failure later.
+      if (reg_slot > budget)
+        vlog(V_VERBOSE, opt,
+             "[GDS] registration budget " + std::to_string(budget / 1048576)
+             + " MiB is smaller than one frame slot ("
+             + std::to_string(reg_slot / 1048576) + " MiB); registering one frame "
+               "anyway -- the budget is a target, and one frame is the floor\n");
     }
 
     // We need to allocate per-stream buffers.  Unlike compression, we need
-    // to handle variable decompressed sizes.  We pre-allocate based on the
-    // chunk size (which upper-bounds both compressed and decompressed size)
-    // and reuse across batches to avoid per-batch cudaMalloc overhead.
-
-    const size_t host_chunk_bytes = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
+    // to handle variable decompressed sizes.  We pre-allocate from the ARCHIVE'S
+    // real frame geometry (see decomp_frame_cap) and reuse across batches to
+    // avoid per-batch cudaMalloc overhead.  This used to read opt.chunk_mib
+    // under a comment claiming the chunk "upper-bounds both compressed and
+    // decompressed size", which is true only of an archive this build wrote at
+    // the current setting.
+    const size_t host_chunk_bytes = decomp_frame_cap(opt);
 
     ctxs.resize(stream_count);
     // The resolved decision, not opt.gds_only: an archive whose frames are not
@@ -27505,8 +27825,13 @@ static void gpu_decomp_worker(
       // to force a full free/alloc/re-register of a 4 GiB slab.
       // ZSTD_compressBound is the guaranteed ceiling; it over-reserves ~57 KiB
       // per slot, which against 16 MiB slots is 0.3%.
-      size_t init_comp = ZSTD_compressBound(host_chunk_bytes);
-      size_t init_decomp = host_chunk_bytes;
+      // The same expression the budget divisor and the --adapt pin use, so the
+      // three cannot disagree: compressBound for a stored frame, plus the
+      // aligned-window headroom a staged reader demands (without which the first
+      // batch reallocates and re-registers purely to add two pages).
+      size_t init_comp = decomp_comp_slot(opt, C.gds_read);
+      size_t init_decomp = decomp_out_slot(host_chunk_bytes,
+                                           g_gds_out_active.load(std::memory_order_relaxed));
       // Pre-allocate device buffers.  If batch size is too large for VRAM,
       // halve it until it fits.  This handles --gpu-batch=256 on GPUs with
       // limited VRAM (e.g., 10 GiB consumer GPUs vs 80+ GiB datacenter GPUs).
@@ -27586,6 +27911,16 @@ static void gpu_decomp_worker(
             // working streams, stop adding more and run with what we have
             // (auto-decrement of --gpu-streams when VRAM is tight).
             stream_init_failed = true;
+            // GIVE BACK THE LAST ATTEMPT.  The retry path above frees before it
+            // asks for less, but this exit destroyed the stream and events and
+            // walked away from whatever the final attempt had already allocated
+            // -- with 16 MiB geometry that is a 16.07 MiB compressed slab, a
+            // 16 MiB decompressed one and the batch-1 temp, held until process
+            // teardown on a card that just said it was out of memory.  The GdsBuf
+            // destructors deregister the BAR1 mappings; the cudaMalloc'd bytes
+            // needed this.  Pre-existing, but GZSTD_DEBUG_FAIL_BRINGUP_ALLOC now
+            // makes it deterministic.
+            C.free_device();
             if (C.ev_begin) { cudaEventDestroy(C.ev_begin); C.ev_begin = nullptr; }
             if (C.ev_end)   { cudaEventDestroy(C.ev_end);   C.ev_end = nullptr; }
             if (C.stream)   { cudaStreamDestroy(C.stream);  C.stream = nullptr; }
@@ -27691,8 +28026,10 @@ static void gpu_decomp_worker(
       // (compressBound - chunk) per frame -- 8,388,608 bytes at batch 256, on a
       // reserve whose whole job is to stop the device-checksum kernel finding
       // the card full the expensive way.
-      const size_t per_frame = ZSTD_compressBound(host_chunk_bytes)
-                             + host_chunk_bytes + 4096;
+      const size_t per_frame = decomp_comp_slot(opt, ctxs[0].gds_read)
+                             + decomp_out_slot(host_chunk_bytes,
+                                   g_gds_out_active.load(std::memory_order_relaxed))
+                             + 4096;
       // NO RETRY COUNTER HERE ON PURPOSE.  Every iteration strictly halves
       // per_stream_cap, so the batch<=1 floor below already bounds this loop at
       // log2(batch) passes -- a counter can only stop it EARLY.  The first
@@ -27752,12 +28089,40 @@ static void gpu_decomp_worker(
           // sizes handed the next batch an allocation 16 MiB short on the
           // compressed slab and 13.1 GB short on temp, which it then had to
           // discard and re-register: ~1.24 s of BAR1 registration thrown away.
-          if (!C.ensure_buffers(reduced, ZSTD_compressBound(host_chunk_bytes),
-                                host_chunk_bytes,
-                                gds_decomp_temp_for(reduced, host_chunk_bytes)))
+          // BOTH shared expressions, not one: the compressed term was unified a
+          // round ago and the decompressed term was left raw here, so a frame of
+          // 1,000,003 bytes rebuilt a 1,000,003-byte stride against a consumer
+          // that strides 1,003,520 -- 3,517 bytes a slot, and one more full
+          // free/alloc/re-register cycle on the first batch.
+          const size_t reb_decomp =
+              decomp_out_slot(host_chunk_bytes,
+                              g_gds_out_active.load(std::memory_order_relaxed));
+          if (!C.ensure_buffers(reduced, decomp_comp_slot(opt, C.gds_read),
+                                reb_decomp,
+                                gds_decomp_temp_for(reduced, reb_decomp)))
             { restored = false; break; }
         }
         if (!restored) {
+          // FREE WHAT THE PARTIAL REBUILD LEFT.  This loop frees and rebuilds one
+          // stream at a time and breaks on the first failure, so on that exit the
+          // streams before it hold their REDUCED allocations, the failing one
+          // holds whatever it got before the failing call, and the streams after
+          // it still hold their ORIGINAL ones -- up to 4,270,256,128 bytes of
+          // slabs at batch 127, plus temp and arrays, held until process teardown
+          // on a card that has just refused an allocation.  DecompStreamCtx has
+          // raw CUDA pointers and no destructor, so nothing else reclaims them.
+          // Sibling of the terminal try_batch<=1 exit; free_device() is idempotent
+          // and nulls what it releases, so this is safe on every stream.
+          // ...and the three CUDA handles each context owns, which this early
+          // return bypasses the normal teardown for.  free_device() releases
+          // device MEMORY; a stream and two events per context are not memory
+          // and were surviving to process teardown.
+          for (auto & Cf : ctxs) {
+            Cf.free_device();
+            if (Cf.ev_begin) { cudaEventDestroy(Cf.ev_begin); Cf.ev_begin = nullptr; }
+            if (Cf.ev_end)   { cudaEventDestroy(Cf.ev_end);   Cf.ev_end   = nullptr; }
+            if (Cf.stream)   { cudaStreamDestroy(Cf.stream);  Cf.stream   = nullptr; }
+          }
           // We freed strictly more than we asked back for, so reaching here
           // needs another process to have taken the difference in between.  The
           // streams have no buffers now, so this device cannot continue: drop it
@@ -28191,8 +28556,7 @@ static void gpu_decomp_worker(
         // Rounding up also RESERVES the padding the last frame's write needs:
         // that write is rounded up to the block, and without the slack it would
         // run past its slot into the next one.
-        if (C.gds_only)
-          max_decomp = (max_decomp + 4095) & ~size_t(4095);
+        // (the two roundings below are decomp_out_slot(); see it for why)
         // EVERY SLOT BASE MUST BE 8-BYTE ALIGNED.  gzx_xxh64_kernel reads the
         // frame as 64-bit words -- reinterpret_cast<const unsigned long long *>
         // of (base + chunk * stride) -- so an odd stride puts every frame after
@@ -28202,13 +28566,13 @@ static void gpu_decomp_worker(
         // exactly what --gds-only -t supports) can have arbitrary frame sizes, so
         // max_decomp is whatever the largest one happens to be.
         // h_decomp_sizes keeps the logical sizes, so this changes padding only.
-        max_decomp = (max_decomp + 7u) & ~size_t(7);
+        max_decomp = decomp_out_slot(max_decomp, C.gds_only);
         // --gds-only -t reads an ALIGNED WINDOW around each frame, so the slot
         // has to hold up to 4095 bytes of lead-in plus the tail round-up.  Two
         // pages of headroom, and the slot base stays 4 KiB-aligned so the
         // device offset is eligible for peer-to-peer.
         if (C.gds_read)
-          max_comp = ((max_comp + 8191) & ~size_t(4095));
+          max_comp = gds_comp_slot(max_comp);
 
         if (opt.verbosity >= V_DEBUG) {
           char in_s[32];
@@ -30320,11 +30684,6 @@ gds_out_declined:
     // therefore registered more than the budget allows -- 64 MiB frames against
     // a 16 MiB assumption is four times the intended mapping, which is the whole
     // quantity the cap exists to bound.
-    size_t frame_cap = std::max<size_t>(1, opt.chunk_mib) * ONE_MIB;
-    {
-      const uint64_t mx = g_input_max_frame.load(std::memory_order_relaxed);
-      if (mx > (uint64_t)frame_cap) frame_cap = (size_t)mx;
-    }
     // Same division as the -t site: the budget covers the process, but every
     // device and stream registers its own slab.  --gds-only pins to one device
     // by default, so this is usually a no-op -- and it is exactly the case where
@@ -30340,7 +30699,7 @@ gds_out_declined:
     // last actually ran", so a qualifying run persisted settled_batch_gds=256
     // for a run in which every full batch was 255, and seeded the next run from
     // it.  A wrong number in a profile is worse than no number: it is believed.
-    const size_t fit = std::max<size_t>(1, share / ZSTD_compressBound(frame_cap));
+    const size_t fit = std::max<size_t>(1, share / gds_reg_slot(opt));
     shared_tune_decomp.batch_size.store((int)std::min<size_t>(fit, HARD_BATCH_CAP));
     shared_tune_decomp.locked.store(true);
   }

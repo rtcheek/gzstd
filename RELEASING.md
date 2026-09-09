@@ -49,7 +49,7 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 558 | 418 | **yes, this server** |
+| GPU + GPUDirect Storage usable (the baseline) | 559 | 419 | **yes, this server** |
 | GPU, GDS unavailable | 552 | 412 | yes, the workstation |
 | no GPU (the CPU-only build) | not yet observed | 336 | yes |
 
