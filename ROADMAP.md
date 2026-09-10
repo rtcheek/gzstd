@@ -395,7 +395,34 @@ sampled right after gzstd's own batch — so it reads 96–99% at any batch size
 its 0.05 floor. On two 11 GiB cards, disabling only the scaler made `-d --gpu-only` **11.0x** faster
 (CHANGELOG v0.17.45). `GZSTD_DEBUG_UTIL_SCALE=off` and the `-vv` `[UTIL]` trace exist to measure it.
 
-Options, none taken:
+**Whether the scaler runs at all depends on how gzstd was launched.** The two per-batch utilization
+reads (the compress drain and the decompress worker) are the only NVML readers that never call
+`nvmlInit_v2()` themselves — ranking, the PCIe probe, the `--adapt` fingerprint and the watchdog each
+do. They work only because `GpuMonitor` initialised NVML for device ordering, and that happens in two
+places: `order_all_gpus_before_cuda()`, which returns early when `--gpu-devices` or
+`CUDA_VISIBLE_DEVICES` is set, and the `--gpu-devices=N` path, which waits for the sampler only when N
+is below the device count and no `CUDA_VISIBLE_DEVICES` was given. `select_best_gpus()` also returns
+early when every visible device is wanted, and `gz_nvml_handle_for_cuda()` caches a failed lookup for
+the rest of the run. Measured on two 11 GiB cards, 3 GiB archive, reading the `-vv` trace
+(`sensed=NN%` means the scaler had a reading; `sensed=n/a` on every intake means it never did):
+
+| launch | scaler | `-d --gpu-only` wall |
+|---|---|---|
+| default | runs | 14.2 s |
+| `CUDA_VISIBLE_DEVICES=0,1`, or both UUIDs | never runs | 5.0–5.1 s |
+| `CUDA_VISIBLE_DEVICES=<one device>` | never runs | 6.4 s |
+| `--gpu-devices=2` (every device; sampler started, not awaited) | ran 3 of 3 — a race | 9.6–13.9 s |
+| `CUDA_VISIBLE_DEVICES=<list>` + `--gpu-devices=1` | ran 3 of 3 — a race | 6.4–6.6 s |
+
+Compress behaves the same way: the default launch runs the scaler, any `CUDA_VISIBLE_DEVICES` does not.
+So a host whose shell or job scheduler exports `CUDA_VISIBLE_DEVICES` has never run the scaler, and
+figures recorded there are unscaled. **Do not close this gap on its own** — initialising NVML for those
+reads without first deciding the scaler would switch a broken controller ON for every such user, up to
+~3x slower.
+
+Options, none taken. **Each must also remove the launch-style dependency:** the per-batch NVML reads
+either go away or initialise NVML themselves, and a lookup that failed only because NVML was not yet up
+must not be cached for the whole run.
 1. Remove the scaler at both intake sites. Its shared-machine yielding never worked as intended,
    because it could only see gzstd's own kernels.
 2. Keep the yielding but subtract gzstd's own share, using per-process NVML utilization. The
@@ -405,11 +432,18 @@ Options, none taken:
    throughput relative to the fastest card, not by utilization.
 
 Measurements that should precede the decision:
+- **Check `CUDA_VISIBLE_DEVICES` on the measuring host first**, and never set it in an arm meant to run
+  the stock scaler. To pin devices with the scaler still running, use
+  `CUDA_VISIBLE_DEVICES=<uuid list> --gpu-devices=N` (it takes the first N of the list — the race above)
+  and confirm `sensed=NN%` in the trace.
 - The 8-GPU host: `-d --gpu-only` and `-t --gds-only` with the scaler on vs off, at a corpus past the
   tuner's ramp, 4+ interleaved reps. The single-device path is already gated; every multi-device
   figure recorded there may be scaler-limited.
-- Compress: the compress intake applies the scaler with no worker-count gate, and on two cards its
-  batches averaged 1.1 frames. Measure unscaled on one device and many.
+- Compress, measured on two cards: scaler off 1.715–1.717 GiB/s, stock 0.703–0.717 — **2.43x** (96 GiB,
+  4 interleaved reps), with stock batches averaging 1.1 frames against 9.7. The intake has no
+  worker-count gate, and the scaler cut a single card's batches to 1 frame as well, but that run's
+  throughput ratio (2.90x) is confounded: `--gpu-devices=1` chose a different card for each arm. Still
+  owed: a single-card figure with both arms pinned to the same card, and the 8-GPU figures.
 - The residual: unscaled, two cards reached 91% of the two single cards combined. Find what the
   remaining 9% is before scaling to eight.
 - A state table for the chosen policy, in the code, before changing it.
