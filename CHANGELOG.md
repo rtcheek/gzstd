@@ -1,11 +1,116 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.44  
+**Covers:** v0.9.50 → v0.17.45  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.17.45 — an out-of-memory error that never happened, and a batch scaler that measures itself
+
+Both found validating v0.17.42–44 on the workstation's two 11 GiB cards — the small-VRAM run the
+ROADMAP said those versions had shipped without.
+
+### GPU decompress on 11 GiB cards reported an OOM that never happened
+
+`-d --gpu-only` on a default-geometry archive (16 MiB frames) put **0 of 193 frames on the GPU**,
+printed `gzx_xxh64 launch (decompress verify): out of memory (work completed on CPU)`, and exited 0
+with correct output — deterministic, and the same shape as v0.17.31's dead-GPU defect, loud this time.
+
+The chain, each link measured:
+
+1. v0.17.42 made bringup ask nvCOMP for its REAL temp size. At the headroom-capped batch (177 x
+   16 MiB) that is 12.2 GiB — more than the card — so the allocation genuinely fails. The old
+   `nb * 1024` estimate never failed, which is why v0.17.39 is clean.
+2. The failure is handled correctly: free, halve to 88, allocate, run.
+3. **But CUDA keeps the error in a per-thread last-error slot, and nothing consumed it.** Every site
+   was `if (cudaMalloc(...) != cudaSuccess) return false;` — the return value checked, the slot left
+   armed.
+4. The verify launch's `checkCuda(cudaGetLastError(), ...)` on the same worker thread read that
+   stale error and aborted the GPU path.
+
+**The GPU never ran out:** an explicit `--gpu-batch=88` produces byte-identical allocation lines
+and runs. The only difference is the failed attempt before it.
+
+**The fix is the rule `gzv_kernel_available()` already states: a handled failure consumes its
+error.** An audit of `gpu_decomp_worker` found **13** value-checked CUDA calls whose failure is
+handled — 10 in `ensure_buffers`, the VRAM headroom query, the VRAM reserve, and the pinned D2H
+staging buffer (only reachable under `--pinned on|auto`) — and each now calls `cudaGetLastError()`
+on failure. The first version of this fix covered 11; the headroom query and pinned staging were
+found by the audit, whose multi-line check had itself silently matched nothing until it was given
+a known site as a control.
+
+Other threads also have handled failures that do not consume — the compress worker's stream
+allocation and reserve, the seek-frame decode, the XXH64 self-test — but no last-error read happens
+on those threads, so they are latent, not live. Left unchanged here.
+
+**Why the suite could not see it.** `GZSTD_DEBUG_FAIL_BRINGUP_ALLOC` and its siblings report a
+failure the allocator never saw, so the slot stays clean; and a 95 GiB card never fails the real
+allocation. Two new hooks make the allocation REALLY fail, with an impossible size, at the real
+sites: `GZSTD_DEBUG_REAL_BRINGUP_OOM=N` (bringup temp) and `GZSTD_DEBUG_REAL_PINNED_OOM=N` (pinned
+D2H staging; needs `--pinned on`). A pinned-staging failure now says so at `-v`.
+
+Verified, 22 targeted checks plus the CPU-only build, each fix-claim paired with a control that fails:
+
+| | stock v0.17.44 | fixed | mutant (13 consumes removed) |
+|---|---|---|---|
+| natural trigger, both cards, auto batch | 0/193 on GPU | **193/193** | 0/193 |
+| `GZSTD_DEBUG_REAL_BRINGUP_OOM=1`, one card | — | **193/193** | 0/193 |
+| `GZSTD_DEBUG_REAL_PINNED_OOM=-1 --pinned on`, one card | — | **193/193** | 0/193 |
+
+Also: the pretend bringup, reserve and mid-run hooks still recover; `GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST`
+still surfaces its fault and rescues correct output (so consuming handled errors hides no real one);
+1 MiB frames 3078/3078 on GPU; `-t --gpu-only`; default and `--hybrid` decompress; every output
+byte-identical. Both builds compile — the GPU build warning-clean, the CPU-only build with the same
+nine pre-existing warnings — and the CPU-only binary round-trips.
+
+### The GPU utilization batch scaler measures gzstd's own load — `GZSTD_DEBUG_UTIL_SCALE` to A/B it
+
+**Not fixed in this version.** The fix is a design decision; this version adds the switch and a trace
+so it can be measured on any host, and changes no default behaviour.
+
+With the error above fixed, GPU decompress on two cards ran at ~0.33 GiB/s — and **one card alone
+was 6.4x faster than both together**. The cause is `util_scale`:
+
+```
+util_scale = max(0.05, (100 - NVML util%) / 100)     // queried after each batch
+pop_n      = max(1, min(tuner, per_stream_cap) * util_scale)
+```
+
+NVML's own definition of that utilization is *"percent of time over the past sample period during
+which one or more kernels was executing on the GPU"* — **time, not capacity** — and it is sampled
+right after gzstd's own batch, so it measures gzstd. A launch's time barely depends on its batch size
+(one 16 MiB frame 184 ms, 88 frames 324 ms: frames run as parallel lanes), so a single frame keeps
+the card ~100% "busy". gzstd's own reading at intake was **96% at full 88-frame batches and 99% at
+3-frame batches** — no information about load — so the scaler sits on its 0.05 floor and batches cap
+at floor(88 x 0.05) = 4.
+
+The premise dates to v0.11.4, which replaced a >50%-utilization backoff for a shared server with this
+proportional form, recorded positive without a measurement. v0.17.19 found the same feedback loop on
+one device and gated the scaler to `gpu_worker_count > 1` — which left every multi-GPU host exactly as
+it was. The shared auto-tuner is confounded by it (its "try 32 vs 64" launches batches of 1 vs 3), and
+because the cap applies before the scale, the tuner cannot grow its way out on small-VRAM cards.
+
+Measured, `-d --gpu-only`, 96 GiB, warm, output discarded, 4 interleaved reps, one binary:
+
+| | GiB/s |
+|---|---|
+| both cards, `GZSTD_DEBUG_UTIL_SCALE=off` | **3.680–3.732** |
+| both cards, stock | 0.334–0.336 |
+| card 0 alone | 2.132–2.158 |
+| card 1 alone | 1.907–1.933 |
+
+**Disabling only the scaler makes two cards 11.0x faster.** With it off, two cards reach 91% of the
+two single cards combined, non-overlapping — a residual cost when both run, not yet investigated.
+The `-vv` trace (`[UTIL] ... sensed=96% scale=0.050 pop 88 -> 88 applied=0`) records what the scaler
+sensed and would have chosen on every intake. The compress intake has the same line with no
+worker-count gate; on two cards its batches averaged 1.1 frames (floor(49 x 0.05) = 2 after warm-up).
+What compress does unscaled, and what the scaler costs on an 8-GPU host, are unmeasured.
+
+Also recorded: on that hardware, unstarved GPU decompress is still slower than 22 CPU threads on wall
+clock (the Gen3 auto-CPU default stays right) but ~3.3x more CPU-efficient per GiB.
 
 
 ## v0.17.44 — a message that outgrew its buffer, and the host row that outgrew its number

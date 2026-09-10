@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.44";
+static constexpr const char * GZSTD_VERSION = "0.17.45";
 //
 // Architecture overview:
 //
@@ -9448,6 +9448,57 @@ static inline bool gz_debug_compress_launch_miss()
   }
   return false;
 }
+// Test-only fault injection (read once from $GZSTD_DEBUG_REAL_BRINGUP_OOM and
+// $GZSTD_DEBUG_REAL_PINNED_OOM): make the next N decompress bringup temp
+// allocations, or the next N pinned D2H staging allocations, REALLY fail -- an
+// impossible size goes to cudaMalloc / cudaHostAlloc, so CUDA records a genuine
+// cudaErrorMemoryAllocation in this thread's last-error slot (N < 0 = every one).
+// 0 (unset) = disabled.  The pinned path only runs under --pinned on|auto.
+//
+// WHY THE PRETEND HOOKS COULD NOT CATCH THIS.  $GZSTD_DEBUG_FAIL_BRINGUP_ALLOC and
+// its siblings report a failure the allocator never saw, so the last-error slot
+// stays clean.  A REAL failure leaves cudaErrorMemoryAllocation behind, and the
+// decompress worker reads that slot after the verify-kernel launch.  v0.17.42 made
+// bringup ask nvCOMP for its real temp size, which on an 11 GiB card genuinely
+// fails at the headroom-capped batch; the handled failure left the error armed,
+// the verify launch then reported an OOM that never happened, and every GPU
+// decompress on that hardware finished on the CPU at exit 0.  A 95 GiB card cannot
+// fail that allocation naturally, so without a REAL failure the pre-tag host can
+// never see the defect.  See ensure_buffers().
+static std::atomic<int> g_debug_real_bringup_oom{0};
+static std::atomic<int> g_debug_real_pinned_oom{0};
+static inline bool gz_debug_count_down(std::atomic<int> & ctr)
+{
+  int cur = ctr.load(std::memory_order_relaxed);
+  while (cur != 0) {
+    if (cur < 0) return true;
+    if (ctr.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed))
+      return true;
+  }
+  return false;
+}
+// An allocation no device or host can satisfy (4 EiB).
+static constexpr size_t GZ_DEBUG_IMPOSSIBLE_BYTES = size_t(1) << 62;
+
+// GZSTD_DEBUG_UTIL_SCALE=off disables the NVML utilization batch scaler at BOTH GPU
+// intake sites (compress and decompress), and -vv traces every intake as
+// "[UTIL] ... pop A -> B applied=N" -- so the scaler can be A/B'd with every other
+// input held constant.  Any other value, or unset, keeps the stock behaviour.
+//
+// MEASURED on two 11 GiB cards, -d --gpu-only, 96 GiB, 4 interleaved reps: scaler
+// off 3.680-3.732 GiB/s, stock 0.334-0.336 (11.0x).  The scaler reads NVML
+// utilization -- the fraction of TIME any kernel ran -- right after gzstd's own
+// batch, so it sees 96-99% at any batch size and pins itself to its 0.05 floor.
+// The fix is an open design decision; this hook changes nothing unless set.
+static inline bool gz_debug_util_scale_off()
+{
+  static const bool off = [] {
+    const char * e = std::getenv("GZSTD_DEBUG_UTIL_SCALE");
+    return e != nullptr && std::string(e) == "off";
+  }();
+  return off;
+}
+
 // Test-only fault injection (read once from $GZSTD_DEBUG_FAIL_BRINGUP_ALLOC):
 // make the next N BRINGUP buffer allocations fail (N < 0 = every one), so the
 // halve-until-it-fits loop can be exercised on a card that has plenty of VRAM.
@@ -25031,7 +25082,20 @@ static void gpu_worker(
         // stays 8) and costs 19% of wall clock, 4.75 s against 4.00 s -- the
         // second stream is overlapping intake with compute, and that is worth
         // more than the stream-switch overhead it saves.
-        pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+        {
+          // GZSTD_DEBUG_UTIL_SCALE=off removes the scaler; -vv traces {decided}.
+          const size_t pop_pre = pop_n;
+          const double scale   = util_scale.load(std::memory_order_relaxed);
+          const bool   scaled  = !gz_debug_util_scale_off();
+          if (scaled)
+            pop_n = std::max<size_t>(1, (size_t)(pop_n * scale));
+          if (opt.verbosity >= V_DEBUG) {
+            std::ostringstream os;
+            os << "[UTIL] GPU" << device_id << " comp scale=" << std::fixed << std::setprecision(3)
+               << scale << " pop " << pop_pre << " -> " << pop_n << " applied=" << (scaled ? 1 : 0);
+            vlog(V_DEBUG, opt, os.str() + "\n");
+          }
+        }
         // De-sync sink-limited completions so the in-order writer never flushes
         // one lockstep wave (which bursts the verify queue); no-op unless frozen.
         pop_n = gpu_desync_batch(pop_n, shared_tune);
@@ -27620,8 +27684,20 @@ static void gpu_decomp_worker(
       // -vv.  Only shows while both counters are still zero, so a mid-run
       // resize (when they are not) never blanks a live bar.
       InitPhase reg_phase("registering VRAM with cuFile");
-      if (cudaMalloc(&d_comp_buf,     batch_n * max_comp)    != cudaSuccess) return false;
-      if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) return false;
+      // EVERY FAILURE BELOW IS HANDLED -- the callers shrink and retry -- SO EACH ONE
+      // CONSUMES ITS CUDA ERROR (the cudaGetLastError() before each return).  The
+      // last-error slot is per host thread, and this worker thread reads it after
+      // the verify-kernel launch: an error left behind by a correctly handled
+      // failure was reported there as "gzx_xxh64 launch (decompress verify): out of
+      // memory", aborting the GPU path for an OOM that never happened.  MEASURED on
+      // 11 GiB cards: every GPU decompress of a 16 MiB-frame archive finished on the
+      // CPU -- 0 of 193 frames on the GPU -- at exit 0 with correct output.  Same
+      // rule gzv_kernel_available() states: a handled failure consumes its error.
+      // Every other handled failure on this thread does the same (the VRAM headroom
+      // query, the reserve, the pinned staging buffer).  GZSTD_DEBUG_REAL_BRINGUP_OOM
+      // and GZSTD_DEBUG_REAL_PINNED_OOM reproduce the defect on any card.
+      if (cudaMalloc(&d_comp_buf,     batch_n * max_comp)    != cudaSuccess) { cudaGetLastError(); return false; }
+      if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) { cudaGetLastError(); return false; }
       if (gds_read) {
         // The READ target.  Skipping this registration does not fail: cuFile
         // silently bounces the transfer through a host buffer, so the run would
@@ -27665,15 +27741,15 @@ static void gpu_decomp_worker(
         }
       }
       clear_init_phase(reg_phase.mine);
-      if (cudaMalloc(&d_comp_ptrs,    batch_n * sizeof(void*))   != cudaSuccess) return false;
-      if (cudaMalloc(&d_decomp_ptrs,  batch_n * sizeof(void*))   != cudaSuccess) return false;
-      if (cudaMalloc(&d_comp_sizes,   batch_n * sizeof(size_t))  != cudaSuccess) return false;
-      if (cudaMalloc(&d_decomp_sizes, batch_n * sizeof(size_t))  != cudaSuccess) return false;
-      if (cudaMalloc(&d_actual_sizes, batch_n * sizeof(size_t))  != cudaSuccess) return false;
-      if (cudaMalloc(&d_statuses,     batch_n * sizeof(nvcompStatus_t)) != cudaSuccess) return false;
-      if (cudaMalloc(&d_verify_ck,    batch_n * sizeof(unsigned int)) != cudaSuccess) return false;
+      if (cudaMalloc(&d_comp_ptrs,    batch_n * sizeof(void*))   != cudaSuccess) { cudaGetLastError(); return false; }
+      if (cudaMalloc(&d_decomp_ptrs,  batch_n * sizeof(void*))   != cudaSuccess) { cudaGetLastError(); return false; }
+      if (cudaMalloc(&d_comp_sizes,   batch_n * sizeof(size_t))  != cudaSuccess) { cudaGetLastError(); return false; }
+      if (cudaMalloc(&d_decomp_sizes, batch_n * sizeof(size_t))  != cudaSuccess) { cudaGetLastError(); return false; }
+      if (cudaMalloc(&d_actual_sizes, batch_n * sizeof(size_t))  != cudaSuccess) { cudaGetLastError(); return false; }
+      if (cudaMalloc(&d_statuses,     batch_n * sizeof(nvcompStatus_t)) != cudaSuccess) { cudaGetLastError(); return false; }
+      if (cudaMalloc(&d_verify_ck,    batch_n * sizeof(unsigned int)) != cudaSuccess) { cudaGetLastError(); return false; }
       if (needed_temp > 0) {
-        if (cudaMalloc(&d_temp, needed_temp) != cudaSuccess) return false;
+        if (cudaMalloc(&d_temp, needed_temp) != cudaSuccess) { cudaGetLastError(); return false; }
         temp_bytes = needed_temp;
       }
 
@@ -27887,8 +27963,11 @@ static void gpu_decomp_worker(
           const size_t slot_buffers = init_comp + init_decomp;
           const size_t slot_reserve = (init_comp + init_decomp + 4096) / 2;
           const size_t per_slot     = slot_buffers + slot_reserve;
-          if (per_slot > 0 && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess
-              && free_b > 0) {
+          const bool   mem_known    = per_slot > 0
+                                   && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+          if (per_slot > 0 && !mem_known)
+            cudaGetLastError();   // handled (no cap) -- consume; see ensure_buffers()
+          if (mem_known && free_b > 0) {
             const size_t vram_cap =
                 std::max<size_t>(1, size_t(double(free_b) * 0.8) / per_slot);
             if (vram_cap < try_batch) {
@@ -27904,7 +27983,9 @@ static void gpu_decomp_worker(
             }
           }
         }
-        while (!C.ensure_buffers(try_batch, init_comp, init_decomp, est_temp)
+        while (!C.ensure_buffers(try_batch, init_comp, init_decomp,
+                                 gz_debug_count_down(g_debug_real_bringup_oom)
+                                     ? GZ_DEBUG_IMPOSSIBLE_BYTES : est_temp)
                || gz_debug_bringup_alloc_miss()) {
           if (try_batch <= 1 || ++vram_retries > 10) {
             // Can't fit even batch=1 on this stream.  If we already have
@@ -28061,6 +28142,7 @@ static void gpu_decomp_worker(
                  + " MiB (batch " + std::to_string(per_stream_cap) + ")\n");
           break;
         }
+        cudaGetLastError();   // handled (retry smaller) -- consume; see ensure_buffers()
         vram_reserve = nullptr;
         vram_reserve_bytes = 0;
         // batch=1 is the floor: nothing is left to give back.  Falling back to
@@ -28183,6 +28265,7 @@ static void gpu_decomp_worker(
     // Applied to batch size at next pop to match busy GPUs' completion time
     // with idle GPUs' completion time.
     double util_scale = 1.0;
+    unsigned util_last_pct = 101;   // NVML reading behind util_scale, for the -vv trace (101 = none yet)
 
     // Consecutive trivial-batch skips across all streams.  If we see too many
     // in a row without doing real GPU work, the remaining workload is
@@ -28453,8 +28536,21 @@ static void gpu_decomp_worker(
         // developed against missed it.  The compress worker has the identical
         // line and presumably the identical problem; it is left alone here
         // because it has not been measured at scale.
-        if (gpu_worker_count > 1)
-          pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+        {
+          // GZSTD_DEBUG_UTIL_SCALE=off removes the scaler; -vv traces {sensed, decided}.
+          const size_t pop_pre = pop_n;
+          const bool   scaled  = (gpu_worker_count > 1) && !gz_debug_util_scale_off();
+          if (scaled)
+            pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
+          if (opt.verbosity >= V_DEBUG) {
+            std::ostringstream os;
+            os << "[UTIL] GPU" << device_id << "/S" << C.stream_index << " decomp sensed="
+               << (util_last_pct > 100 ? std::string("n/a") : std::to_string(util_last_pct) + "%")
+               << " scale=" << std::fixed << std::setprecision(3) << util_scale
+               << " pop " << pop_pre << " -> " << pop_n << " applied=" << (scaled ? 1 : 0);
+            vlog(V_DEBUG, opt, os.str() + "\n");
+          }
+        }
         // De-sync sink-limited completions so the in-order writer never flushes
         // one lockstep wave (see gpu_desync_batch); no-op unless frozen.
         pop_n = gpu_desync_batch(pop_n, shared_tune);
@@ -28700,10 +28796,18 @@ static void gpu_decomp_worker(
               C.h_decomp_pinned_bytes = 0;
             }
             if (try_reserve_pinned(want, opt)) {
-              if (cudaHostAlloc(&C.h_decomp_pinned, want, cudaHostAllocDefault)
+              const size_t ask = gz_debug_count_down(g_debug_real_pinned_oom)
+                               ? GZ_DEBUG_IMPOSSIBLE_BYTES : want;
+              if (cudaHostAlloc(&C.h_decomp_pinned, ask, cudaHostAllocDefault)
                   != cudaSuccess) {
+                // Handled -- pageable D2H instead -- so consume the error; see
+                // ensure_buffers() for what an armed one does on this thread.
+                cudaGetLastError();
                 C.h_decomp_pinned = nullptr;
                 release_pinned(want, opt);
+                if (opt.verbosity >= V_VERBOSE)
+                  vlog(V_VERBOSE, opt, "[PINNED] D2H staging allocation failed; "
+                       "using pageable transfers (decompress)\n");
               } else {
                 C.h_decomp_pinned_bytes = want;
                 if (opt.verbosity >= V_VERBOSE) {
@@ -29694,6 +29798,7 @@ static void gpu_decomp_worker(
           if (gz_nvml_handle_for_cuda(device_id, &dev) &&   // NOT by index: see helper
               nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
             util_scale = std::max(0.05, (100.0 - util.gpu) / 100.0);
+            util_last_pct = util.gpu;
           }
         }
 #endif
@@ -32812,6 +32917,10 @@ static int gzstd_main(int argc, char ** argv)
     g_debug_fail_compress_launch.store(int(std::atoll(fc)), std::memory_order_relaxed);
   if (const char * fb = std::getenv("GZSTD_DEBUG_FAIL_BRINGUP_ALLOC"))
     g_debug_fail_bringup_alloc.store(int(std::atoll(fb)), std::memory_order_relaxed);
+  if (const char * ro = std::getenv("GZSTD_DEBUG_REAL_BRINGUP_OOM"))
+    g_debug_real_bringup_oom.store(int(std::atoll(ro)), std::memory_order_relaxed);
+  if (const char * rp = std::getenv("GZSTD_DEBUG_REAL_PINNED_OOM"))
+    g_debug_real_pinned_oom.store(int(std::atoll(rp)), std::memory_order_relaxed);
 
   // Test-only: deterministic producer-unwind injection (see g_debug_throw_reader).
   if (const char * tr = std::getenv("GZSTD_DEBUG_THROW_READER"))

@@ -363,26 +363,56 @@ Note the CPU columns invert — the fast path burns ~305 s of host CPU, 250 s of
 SYSTEM time — so this is the same trade `project_gds_real_media` describes, one
 layer down, and "slower" is not the whole story on a loaded box.
 
-### 2. v0.17.42–43 shipped WITHOUT small-VRAM validation, and is now tagged
+### 2. v0.17.42–43 small-VRAM validation — DONE, and it found a defect (fixed v0.17.45)
 
-Those versions changed the halve-until-it-fits loop, the decompressed slab
-geometry, the VRAM reserve formula and both compress fit estimates — every one of
-which only BINDS when VRAM is tight. On a 95 GiB H100 the halving loop is
-unreachable: `GZSTD_DEBUG_FAIL_BRINGUP_ALLOC` had to be added to exercise it at
-all, so everything known about that fix comes from fault injection rather than a
-card that actually ran out.
+Run on the workstation's two 11 GiB cards. The new geometry held: on a 1 MiB-frame archive
+`GZSTD_DEBUG_ENSURE=1` showed one allocation per stream with `comp 1052672` / `decomp 1048576`,
+and the halving loop and reserve retry fired for real (256 -> 177 -> 88), not just under fault
+injection. But GPU decompress of a default-geometry archive was lost entirely — 0 of 193 frames on
+the GPU at exit 0 — because a correctly handled allocation failure left CUDA's per-thread last error
+armed for the verify launch to read. See CHANGELOG v0.17.45; `GZSTD_DEBUG_REAL_BRINGUP_OOM` and
+`GZSTD_DEBUG_REAL_PINNED_OOM` now reproduce it on any card.
 
-`project_gpu_decomp_vram_consumer` records this hardware class biting before — GPU
-decompress silently dead on 11 GiB cards through v0.17.31, passing the fit test and
-OOMing in the verify kernel. **v0.17.43 is tagged, so this is deployed code.** The
-2080 Ti host cannot do `--gds-only` (256 MiB BAR1, nvidia-fs removed) but runs
-plain `--gpu-only` decompress, which is exactly where the new geometry applies.
-What to look for there: `GZSTD_DEBUG_ENSURE=1` showing ONE reallocation with
-`comp`/`decomp` tracking the archive; a REAL batch reduction (`VRAM-fit: batch=N`
-or `VRAM insufficient, reducing batch`) if one fires; and the failure mode from
-v0.17.31 — exit 0 with correct output while the GPU path silently fell back, which
-only `-vv` can distinguish. Expected suite totals there: **553 extensive / 413
-default** (derived, not yet measured).
+**Still owed:** the suite totals for the GDS-unavailable host — **553 extensive / 413 default** —
+remain DERIVED, not measured; the run was deferred because the host was needed for other work.
+v0.17.45 adds no suite tests, so those figures are unchanged by it.
+
+**Open follow-ups from that work:**
+- Suite regression tests for the two REAL-OOM hooks. The pre-tag host can never fail those
+  allocations naturally, so without them the fix is untested there. Adding them moves every
+  EXPECTED_TESTS baseline.
+- Latent instances of the same rule: handled CUDA failures that do not consume their error on the
+  compress worker (stream allocation, reserve), the seek-frame decode and the XXH64 self-test. No
+  last-error read happens on those threads today, so nothing is broken — but the rule is only
+  robust if every site follows it.
+- `AGENTS.md` lists suite totals (417 / 548 / 335) that predate the current baselines (419 / 559,
+  336 without a GPU).
+
+### 2b. The GPU utilization batch scaler measures gzstd's own load — the fix is an open decision
+
+`util_scale` shrinks each intake by NVML utilization, which is the fraction of TIME any kernel ran,
+sampled right after gzstd's own batch — so it reads 96–99% at any batch size and pins the scaler to
+its 0.05 floor. On two 11 GiB cards, disabling only the scaler made `-d --gpu-only` **11.0x** faster
+(CHANGELOG v0.17.45). `GZSTD_DEBUG_UTIL_SCALE=off` and the `-vv` `[UTIL]` trace exist to measure it.
+
+Options, none taken:
+1. Remove the scaler at both intake sites. Its shared-machine yielding never worked as intended,
+   because it could only see gzstd's own kernels.
+2. Keep the yielding but subtract gzstd's own share, using per-process NVML utilization. The
+   `gz_nvml` wrapper does not expose any per-process call today; new entries must go through the
+   bounded dispatch and its out-parameter rule.
+3. If the goal is balancing unequal cards for the in-order writer, scale by measured per-card
+   throughput relative to the fastest card, not by utilization.
+
+Measurements that should precede the decision:
+- The 8-GPU host: `-d --gpu-only` and `-t --gds-only` with the scaler on vs off, at a corpus past the
+  tuner's ramp, 4+ interleaved reps. The single-device path is already gated; every multi-device
+  figure recorded there may be scaler-limited.
+- Compress: the compress intake applies the scaler with no worker-count gate, and on two cards its
+  batches averaged 1.1 frames. Measure unscaled on one device and many.
+- The residual: unscaled, two cards reached 91% of the two single cards combined. Find what the
+  remaining 9% is before scaling to eight.
+- A state table for the chosen policy, in the code, before changing it.
 
 ### 3. The comparison that would actually settle GDS's case is a LOADED box
 
