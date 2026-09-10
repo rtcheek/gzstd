@@ -1,11 +1,116 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.45  
+**Covers:** v0.9.50 → v0.17.46  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.17.46 — the batch scaler is gone
+
+**The NVML utilization batch scaler is removed.** Both GPU intake sites (compress and decompress), their
+per-batch NVML reads, `GZSTD_DEBUG_UTIL_SCALE` and the `-vv` `[UTIL]` trace go with it. Utilization is
+still read where it informs a choice: device ranking at startup, and the watchdog dump.
+
+### Why it existed
+
+v0.11.3 paused GPU workers above 50% utilization (resuming at 30%) so gzstd would stay out of the way on
+a shared server. v0.11.4 made that proportional — `batch x max(0.05, (100 - util%) / 100)` — so a busy
+card "still contributes", and recorded it positive without a measurement. Its code comment later gave a
+different reason: a busier card takes a smaller batch, the cards finish together, and the in-order writer
+is not held up. v0.17.19 kept it for multi-GPU runs on the strength of that comment.
+
+### Why neither reason held
+
+NVML utilization is the fraction of *time* any kernel ran, and the scaler read it right after gzstd's own
+batch, so it measured gzstd. It could not tell a co-tenant from gzstd's own kernels, and it says nothing
+about how fast a card is. Keeping off a busy card is what device ranking already does.
+
+Measured on the server, `-d --gpu-only`, 261 GiB (a real 130 GiB archive twice, 16,686 frames), warm,
+output discarded, 4 interleaved reps, one v0.17.45 binary with `GZSTD_DEBUG_UTIL_SCALE` as the only
+variable, every run validated for device count, scaler state and frames on the GPU (32 of 32 valid).
+Other users' jobs held memory on every card throughout; their per-process utilization averaged 8–13%
+per arm.
+
+| cards | scaler on, GiB/s (median) | scaler off (median) | writer head-of-line, on / off |
+|---|---|---|---|
+| 8 | 9.04–12.62 (11.49) | 10.76–12.02 (11.70) | 31.9–45.0% / **17.3–24.2%** |
+| 4 | 8.46–11.72 (9.50) | 11.40–12.75 (12.73) | 27.2–33.1% / 12.0–28.6% |
+| 2 | 6.01–7.19 (6.54) | **9.37–10.86 (10.45)** | 9.4–27.0% / 0.1–11.1% |
+
+- **Two cards: 1.60x from the scaler alone**, non-overlapping. On the workstation's two 11 GiB cards the
+  same switch was worth 11.0x (v0.17.45).
+- **Eight cards: no throughput difference**, because the pipeline caps near 12 GiB/s before the GPUs do
+  (unscaled, two to eight cards are flat at 10.5–12.7 GiB/s with NVML reading 42–80%). The scaler still
+  cost 26% more CPU there (6.17 against 4.89 cores) and made runs about 3x noisier (a 40% spread against
+  12%).
+- **The head-of-line time the scaler was kept for was lower without it** in every multi-card arm, and
+  cleanly separated at eight cards. That figure is the writer's own count of time spent waiting while
+  later frames sat buffered.
+- Compress, eight cards, 64 GiB: 8.44–8.82 GiB/s with it against 8.86–9.48 without (~1.08x; 7 s runs).
+- Compress on the workstation's two 11 GiB cards, 96 GiB: 1.715–1.717 GiB/s without it against
+  0.703–0.717 with it (**2.43x**; batches of 9.7 frames against 1.1). One card, both arms pinned to the
+  same card, 24 GiB: 2.22x on card 0 and 2.67x on card 1 — the compress intake had no worker-count gate,
+  so a single card was starved too.
+
+The H100s did not read saturated the way the 11 GiB cards did (42–80% unscaled, against 96–99% at any
+batch size), so the scaler settled above its 0.05 floor there. That is why it cost less on them — not
+evidence that it worked.
+
+### What goes away with it
+
+The scaler only ran if device ordering had initialised NVML: any `CUDA_VISIBLE_DEVICES` left it off, so
+the same cards could be up to ~3x faster depending on how gzstd was launched. That launch-style
+dependency is gone rather than fixed, and the shared batch auto-tuner now controls the batches it picks.
+
+### Suite: two real-fault cells, and a default baseline nine behind
+
+The v0.17.45 defect had no coverage that could fail on a datacenter card. Two GPU cells now drive
+`GZSTD_DEBUG_REAL_BRINGUP_OOM` and `GZSTD_DEBUG_REAL_PINNED_OOM` on one device, and each proves its hook
+fired before trusting the frame count. Mutation-tested against a build with the 13 consumes removed:
+stock passes 3 of 3, the mutant fails 3 of 3 with 0 of 3 frames on the GPU, and with the hooks disabled
+both cells report NOT TESTED. Unpinned, a healthy device takes over the frames and the mutant passes, so
+the cells set `--gpu-devices=1` themselves.
+
+Adding them exposed a stale baseline: a default run on the server counted **428 against an expected
+419** with no cell missing. v0.17.31 moved only the extensive count (548 → 557) and left the default at
+417, and the no-GPU delta was later fitted to the CPU-only 336 against the low number, so the CPU-only
+drift note could never show it. Baselines are now 430 default, 561 extensive, no-GPU delta 94, with each
+published combination marked measured or derived. `AGENTS.md` now matches.
+
+Found on the way, not changed: the suite exports `CUDA_VISIBLE_DEVICES=0` by default (since v0.15.96), so
+the v0.17.15 multi-GPU wedge cell's `--gpu-devices=2` gets one device and has never been able to fail in
+a default run.
+
+### Verified
+
+- Both configurations build: the GPU build warning-clean, the CPU-only build with the same nine
+  pre-existing warnings.
+- 12 targeted checks on the server: 8-GPU decompress with every frame on the GPU and no scaler trace;
+  GPU compress round-trip; `-t --gpu-only`; `-t --gds-only` verifying on the device; injected decompress
+  and compress faults rescued byte-identical; default-backend decompress; CPU-only round-trip; both new
+  real-fault cells.
+- A card another tenant had filled (84 of 96 GiB) was skipped with "insufficient VRAM for even 1
+  stream", identically by v0.17.45, so the skip is the existing fit test working.
+- The default suite has not been run on this version; the 430 total above is derived.
+
+**Before/after:** this build against the v0.17.45 binary with the scaler switched off and on, 4
+interleaved reps per arm, every run validated (36 of 36). Six cards, because by then another tenant had
+filled the other two:
+
+| | v0.17.46 | v0.17.45, scaler off | v0.17.45 stock |
+|---|---|---|---|
+| compress, 6 cards, 64 GiB | 9.13–9.62 GiB/s | 8.77–10.09 | 8.27–8.71 |
+| decompress, 6 cards, 261 GiB | 11.21–12.92 | 10.99–12.51 | 8.82–12.33 |
+| decompress, 2 cards, 261 GiB | 8.10–11.40 | 9.68–12.28 | 5.80–7.75 |
+
+The build matches scaler-off everywhere (ranges overlap) and beats stock wherever stock cost something:
+2-card decompress 1.58x by median and 6-card compress 1.09x, both non-overlapping. At two cards its
+median sat 10% under scaler-off, but the harness's rotation ran it first or straight after the heaviest
+arm in every rep. A balanced A-B-B-A re-run after a warm-up put it at 10.06–11.42 GiB/s (median 11.05)
+against 8.51–12.17 (10.84): no difference.
 
 
 ## v0.17.45 — an out-of-memory error that never happened, and a batch scaler that measures itself

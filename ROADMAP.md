@@ -373,82 +373,48 @@ the GPU at exit 0 — because a correctly handled allocation failure left CUDA's
 armed for the verify launch to read. See CHANGELOG v0.17.45; `GZSTD_DEBUG_REAL_BRINGUP_OOM` and
 `GZSTD_DEBUG_REAL_PINNED_OOM` now reproduce it on any card.
 
-**Still owed:** the suite totals for the GDS-unavailable host — **553 extensive / 413 default** —
-remain DERIVED, not measured; the run was deferred because the host was needed for other work.
-v0.17.45 adds no suite tests, so those figures are unchanged by it.
+**Still owed:** the suite totals for the GDS-unavailable host — now **555 extensive / 424 default**
+after the baseline correction below — remain DERIVED, not measured; the run was deferred because
+the host was needed for other work.
 
-**Open follow-ups from that work:**
-- Suite regression tests for the two REAL-OOM hooks. The pre-tag host can never fail those
-  allocations naturally, so without them the fix is untested there. Adding them moves every
-  EXPECTED_TESTS baseline.
+**Follow-ups from that work:**
+- DONE: suite cells for the two REAL-OOM hooks, mutation-proven against a build with the 13
+  consumes removed (stock passes 3 of 3, the mutant fails 3 of 3, hooks disabled report NOT
+  TESTED). Adding them exposed a DEFAULT baseline 9 behind since v0.17.31 — a GPU+GDS host ran 428
+  against 419 — so `EXPECTED_TESTS` is now 430 / 561 with a no-GPU delta of 94, and `AGENTS.md`
+  matches.
 - Latent instances of the same rule: handled CUDA failures that do not consume their error on the
   compress worker (stream allocation, reserve), the seek-frame decode and the XXH64 self-test. No
   last-error read happens on those threads today, so nothing is broken — but the rule is only
   robust if every site follows it.
-- `AGENTS.md` lists suite totals (417 / 548 / 335) that predate the current baselines (419 / 559,
-  336 without a GPU).
+- **The v0.17.15 multi-GPU wedge cell has never discriminated in a default run.** The suite exports
+  `CUDA_VISIBLE_DEVICES=0` unless `GZSTD_TEST_ALL_GPUS=1` (since v0.15.96), so the cell's
+  `--gpu-devices=2` gets one device — the configuration its own comment says cannot fail. It should
+  opt back in the way the "multi-GPU dispatch" cell does, and be mutation-proven against the
+  pre-v0.17.15 rescue.
 
-### 2b. The GPU utilization batch scaler measures gzstd's own load — the fix is an open decision
+### 2b. The GPU utilization batch scaler — REMOVED in v0.17.46
 
-`util_scale` shrinks each intake by NVML utilization, which is the fraction of TIME any kernel ran,
-sampled right after gzstd's own batch — so it reads 96–99% at any batch size and pins the scaler to
-its 0.05 floor. On two 11 GiB cards, disabling only the scaler made `-d --gpu-only` **11.0x** faster
-(CHANGELOG v0.17.45). `GZSTD_DEBUG_UTIL_SCALE=off` and the `-vv` `[UTIL]` trace exist to measure it.
+`util_scale` shrank each GPU intake by NVML utilization — the fraction of TIME any kernel ran, read
+right after gzstd's own batch, so it measured gzstd. It began as v0.11.3's pause-when-busy backoff for
+a shared server, became proportional in v0.11.4 (recorded positive without a measurement), and its
+code comment later justified it as keeping multi-GPU completions in order for the writer.
 
-**Whether the scaler runs at all depends on how gzstd was launched.** The two per-batch utilization
-reads (the compress drain and the decompress worker) are the only NVML readers that never call
-`nvmlInit_v2()` themselves — ranking, the PCIe probe, the `--adapt` fingerprint and the watchdog each
-do. They work only because `GpuMonitor` initialised NVML for device ordering, and that happens in two
-places: `order_all_gpus_before_cuda()`, which returns early when `--gpu-devices` or
-`CUDA_VISIBLE_DEVICES` is set, and the `--gpu-devices=N` path, which waits for the sampler only when N
-is below the device count and no `CUDA_VISIBLE_DEVICES` was given. `select_best_gpus()` also returns
-early when every visible device is wanted, and `gz_nvml_handle_for_cuda()` caches a failed lookup for
-the rest of the run. Measured on two 11 GiB cards, 3 GiB archive, reading the `-vv` trace
-(`sensed=NN%` means the scaler had a reading; `sensed=n/a` on every intake means it never did):
+Measured before removal (CHANGELOG v0.17.45 and v0.17.46), scaler off against on, interleaved reps:
+two 11 GiB cards were **11.0x** faster without it, two H100s **1.60x**, eight H100s not measurably
+different — an upstream cap near 12 GiB/s binds first — though stock still burned 26% more CPU there
+and ran about 3x noisier. The writer's head-of-line time was lower without it in every multi-card
+arm (eight H100s: 17.3–24.2% against 31.9–45.0%), so it did not serve its stated purpose either. The
+launch-style dependency (it only ran when device ordering had initialised NVML) went with it.
 
-| launch | scaler | `-d --gpu-only` wall |
-|---|---|---|
-| default | runs | 14.2 s |
-| `CUDA_VISIBLE_DEVICES=0,1`, or both UUIDs | never runs | 5.0–5.1 s |
-| `CUDA_VISIBLE_DEVICES=<one device>` | never runs | 6.4 s |
-| `--gpu-devices=2` (every device; sampler started, not awaited) | ran 3 of 3 — a race | 9.6–13.9 s |
-| `CUDA_VISIBLE_DEVICES=<list>` + `--gpu-devices=1` | ran 3 of 3 — a race | 6.4–6.6 s |
-
-Compress behaves the same way: the default launch runs the scaler, any `CUDA_VISIBLE_DEVICES` does not.
-So a host whose shell or job scheduler exports `CUDA_VISIBLE_DEVICES` has never run the scaler, and
-figures recorded there are unscaled. **Do not close this gap on its own** — initialising NVML for those
-reads without first deciding the scaler would switch a broken controller ON for every such user, up to
-~3x slower.
-
-Options, none taken. **Each must also remove the launch-style dependency:** the per-batch NVML reads
-either go away or initialise NVML themselves, and a lookup that failed only because NVML was not yet up
-must not be cached for the whole run.
-1. Remove the scaler at both intake sites. Its shared-machine yielding never worked as intended,
-   because it could only see gzstd's own kernels.
-2. Keep the yielding but subtract gzstd's own share, using per-process NVML utilization. The
-   `gz_nvml` wrapper does not expose any per-process call today; new entries must go through the
-   bounded dispatch and its out-parameter rule.
-3. If the goal is balancing unequal cards for the in-order writer, scale by measured per-card
-   throughput relative to the fastest card, not by utilization.
-
-Measurements that should precede the decision:
-- **Check `CUDA_VISIBLE_DEVICES` on the measuring host first**, and never set it in an arm meant to run
-  the stock scaler. To pin devices with the scaler still running, use
-  `CUDA_VISIBLE_DEVICES=<uuid list> --gpu-devices=N` (it takes the first N of the list; it relies on the
-  race above, which it won in all 23 runs measured here) and confirm `sensed=NN%` in the trace.
-- The 8-GPU host: `-d --gpu-only` and `-t --gds-only` with the scaler on vs off, at a corpus past the
-  tuner's ramp, 4+ interleaved reps. The single-device path is already gated; every multi-device
-  figure recorded there may be scaler-limited.
-- Compress, measured. Two cards: scaler off 1.715–1.717 GiB/s, stock 0.703–0.717 — **2.43x** (96 GiB,
-  4 interleaved reps; stock batches averaged 1.1 frames against 9.7). **One card**, since the compress
-  intake has no worker-count gate, with both arms pinned to the same card and every run's scaler state
-  and device checked: card 0 0.886–0.890 unscaled against 0.395–0.405 stock (**2.22x**), card 1
-  0.831–0.838 against 0.310–0.317 (**2.67x**) — 24 GiB, 4 interleaved reps. Card 1 loses more because
-  its fixed cost per launch is higher, and a stock run makes ~1,400 one-frame launches against ~180
-  unscaled. Still owed: the 8-GPU figures.
-- The residual: unscaled, two cards reached 91% of the two single cards combined. Find what the
-  remaining 9% is before scaling to eight.
-- A state table for the chosen policy, in the code, before changing it.
+**Open from that work:**
+- **An upstream cap near 12 GiB/s on the 8-GPU host.** Unscaled `-d --gpu-only` is flat from two to
+  eight cards (10.5–12.7 GiB/s) with NVML reading 42–80% and ~4.9 cores. Not investigated.
+- **Two-card linearity cannot be read from the device-count curve.** One H100 ran 3.68 GiB/s and two
+  ran 10.45 (2.84x), because other resources (throttle budget, reader fan-out) follow the device
+  count. The ~9% two-card residual seen on the 11 GiB cards needs per-card arms with those held.
+- If unequal devices ever need balancing for the in-order writer, balance on measured per-device
+  throughput, not utilization.
 
 ### 3. The comparison that would actually settle GDS's case is a LOADED box
 
@@ -523,25 +489,19 @@ correctness there and nothing proves speed.
 ### 1.1 Remove 2-GPU Decompress Cap
 **Priority: High | Complexity: Low | Status: DONE (v0.11.x)**
 
-Previously decompress defaulted to 2 GPUs based on early PCIe bandwidth assumptions. Now uses all available GPUs with utilization-scaled batch sizing (1.2).
+Previously decompress defaulted to 2 GPUs based on early PCIe bandwidth assumptions. Now uses all available GPUs.
 
 - Removed hardcoded `device_count = std::min(device_count, 2)` for decompress
 - `select_best_gpus()` returns all viable GPUs
-- Utilization-scaled dispatch handles GPUs that are partially busy
+- (Utilization-scaled dispatch for partially busy GPUs was removed in v0.17.46 — see 1.2.)
 
 ### 1.2 Utilization-Scaled GPU Batch Sizing
-**Priority: High | Complexity: Medium | Status: DONE (v0.11.4)**
+**Priority: High | Complexity: Medium | Status: REMOVED (v0.17.46; was DONE v0.11.4)**
 
-NVML utilization queried at batch completion. Batch size scaled inversely with load:
-
-```
-util_scale = max(0.05, (100 - gpu_util%) / 100)
-effective_batch = base_batch * util_scale
-```
-
-- GPU at 0% → full batch, 50% → half, 90% → 10%
-- Updated via NVML after each batch completion
-- No wasted GPU cycles, no blocking
+Scaled each GPU intake by `max(0.05, (100 - gpu_util%) / 100)`, queried after every batch. NVML
+utilization is the fraction of time any kernel ran, so reading it right after gzstd's own batch
+measured gzstd itself: the scaler cut its own batches (11.0x slower on two 11 GiB cards, 1.60x on two
+H100s) and never reduced the writer's head-of-line time. See section 2b and CHANGELOG v0.17.46.
 
 ### 1.3 Rate-Matched Dispatch (CPU/GPU Throughput Calibration)
 **Priority: Medium | Complexity: Medium | Status: SUBSUMED by v0.15.4 ranked-engine overflow dispatch** — every engine (CPU pool + each GPU device) is ranked by live per-device EMA and the generalized tail-yield inequality dispatches; the vestigial RateMatchState was deleted (its allowance was read by nothing).

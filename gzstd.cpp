@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.45";
+static constexpr const char * GZSTD_VERSION = "0.17.46";
 //
 // Architecture overview:
 //
@@ -123,7 +123,7 @@ static constexpr const char * GZSTD_VERSION = "0.17.45";
  all.  With the driver present, behaviour is identical to linking.
  Without it, every wrapper returns GZ_NVML_UNAVAILABLE and the callers'
  existing fallbacks take over (free-VRAM device ranking, /sys PCIe-gen
- probe, util_scale staying at 1.0).
+ probe).
 
  The types below mirror nvml.h's stable v1 ABI for exactly the calls
  this file makes; the wrappers reuse the official function names so call
@@ -200,11 +200,10 @@ static const GzNvmlApi & gz_nvml()
 // Every NVML call in this file goes through gz_nvml_bounded(), which turns a
 // WEDGED driver call into GZ_NVML_UNAVAILABLE -- exactly what a driver that is
 // simply ABSENT already returns, and exactly what every call site already
-// handles.  All six utilization call sites test == NVML_SUCCESS and have a
-// defined fallback (0% for the watchdog dump, "assume busy" for ranking, keep
-// the previous value for util_scale), so degrading is strictly better than
-// dying: the run completes with correct output, merely without
-// utilization-informed device ranking.
+// handles.  All four utilization call sites test == NVML_SUCCESS and have a
+// defined fallback (0% for the watchdog dump, "assume busy" for ranking), so
+// degrading is strictly better than dying: the run completes with correct
+// output, merely without utilization-informed device ranking.
 //
 // NOT HYPOTHETICAL.  gzstd dlopen()s libnvidia-ml.so.1 by soname, so a stub
 // whose nvmlDeviceGetUtilizationRates never returns can be substituted on
@@ -978,7 +977,7 @@ static std::atomic<uint64_t> g_gdsd_writes{0};
 //
 // THE FIRST VALUE HERE WAS 1 GiB, CHOSEN ON A 1 GiB ARCHIVE, AND THAT WAS TOO
 // SMALL A CORPUS TO CHOOSE ON.  Measured on a 65 GiB / 8344-frame archive (-t,
-// one device, cold, after the util_scale fix):
+// one device, cold, after v0.17.19 stopped the batch scaler starving it):
 //   budget   batch    wall      user     host RSS
 //     1 GiB     64   35.89 s   16.69 s    4.4 GiB
 //     2 GiB    128   28.85 s    9.08 s    8.6 GiB
@@ -9479,25 +9478,6 @@ static inline bool gz_debug_count_down(std::atomic<int> & ctr)
 }
 // An allocation no device or host can satisfy (4 EiB).
 static constexpr size_t GZ_DEBUG_IMPOSSIBLE_BYTES = size_t(1) << 62;
-
-// GZSTD_DEBUG_UTIL_SCALE=off disables the NVML utilization batch scaler at BOTH GPU
-// intake sites (compress and decompress), and -vv traces every intake as
-// "[UTIL] ... pop A -> B applied=N" -- so the scaler can be A/B'd with every other
-// input held constant.  Any other value, or unset, keeps the stock behaviour.
-//
-// MEASURED on two 11 GiB cards, -d --gpu-only, 96 GiB, 4 interleaved reps: scaler
-// off 3.680-3.732 GiB/s, stock 0.334-0.336 (11.0x).  The scaler reads NVML
-// utilization -- the fraction of TIME any kernel ran -- right after gzstd's own
-// batch, so it sees 96-99% at any batch size and pins itself to its 0.05 floor.
-// The fix is an open design decision; this hook changes nothing unless set.
-static inline bool gz_debug_util_scale_off()
-{
-  static const bool off = [] {
-    const char * e = std::getenv("GZSTD_DEBUG_UTIL_SCALE");
-    return e != nullptr && std::string(e) == "off";
-  }();
-  return off;
-}
 
 // Test-only fault injection (read once from $GZSTD_DEBUG_FAIL_BRINGUP_ALLOC):
 // make the next N BRINGUP buffer allocations fail (N < 0 = every one), so the
@@ -23745,13 +23725,14 @@ static inline void wd_drain_phase(int w, WatchPhase p){ if(auto*d=g_wd.load(std:
 //
 // The only safe correlation is by PCI bus ID (or UUID).  select_best_gpus got
 // this right; the utilization probes did not.  Cached because the mapping is
-// fixed for the process and the drain asks once per batch.
+// fixed for the process.  The one remaining caller is the watchdog's JSON dump,
+// which initialises NVML itself first; the per-batch readers that did not were
+// removed with the batch scaler in v0.17.46.
 static bool gz_nvml_handle_for_cuda(int cuda_dev, nvmlDevice_t * out)
 {
   struct Entry { bool ok; nvmlDevice_t h; };
   static std::mutex m;
-  static std::map<int, Entry> cache;   // negative results cached too: a failed
-                                       // lookup must not be retried per batch
+  static std::map<int, Entry> cache;   // negative results cached too
   if (cuda_dev < 0 || !out) return false;
   std::lock_guard<std::mutex> lk(m);
   auto it = cache.find(cuda_dev);
@@ -23930,8 +23911,7 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
                             const Options & opt,
                             ResultStore * results, DevStats * devstats,
                             HybridSched * sched, SharedTuneState * shared_tune,
-                            FrameThrottle * bp,
-                            std::atomic<double> * util_scale)
+                            FrameThrottle * bp)
 {
   uint64_t d2h_t0 = (g_perf || opt.verbosity >= V_DEBUG) ? now_ns() : 0;
   // SUB-PHASE TIMING (-vvv).  The figure this function reports as "d2h" is the
@@ -24256,21 +24236,6 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   }
 
   results->cv.notify_one();  // wake writer for batch
-#ifdef HAVE_NVML
-  // Utilization scaling for the worker's next intake (shared machine: a busy
-  // GPU takes a smaller batch).  Queried post-batch, same cadence as before.
-  {
-    nvmlDevice_t dev;
-    nvmlUtilization_t util;
-    if (gz_nvml_handle_for_cuda(device_id, &dev) &&   // NOT by index: see helper
-        nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
-      util_scale->store(std::max(0.05, (100.0 - util.gpu) / 100.0),
-                        std::memory_order_relaxed);
-    }
-  }
-#else
-  (void)util_scale;
-#endif
 }
 
 static void gpu_worker(
@@ -24315,7 +24280,6 @@ static void gpu_worker(
   std::deque<StreamCtx*> submitted;     // in-flight streams, submit (= seq) order
   bool drain_closed = false;
   std::string drain_err;                // non-empty => drain thread aborted
-  std::atomic<double> util_scale{1.0};  // NVML batch scaling, written by drain
   std::thread drainer;
   auto close_drain_fifo = [&] {
     { std::lock_guard<std::mutex> lk(idle_m); drain_closed = true; }
@@ -24700,7 +24664,7 @@ static void gpu_worker(
           wd_sync(slot_index, (int)C->stats.stream_index, (int)st);
           checkCuda(st, "cudaEventSynchronize(batch done)");
           gpu_drain_batch(*C, device_id, slot_index, opt, results, devstats,
-                          sched, shared_tune, bp, &util_scale);
+                          sched, shared_tune, bp);
           wd_idle(slot_index, (int)C->stats.stream_index);
           {
             std::lock_guard<std::mutex> lk(idle_m);
@@ -25058,44 +25022,21 @@ static void gpu_worker(
         pop_n = std::min(pop_n, C.per_stream_batch);  // can't exceed allocated buffer
         // Keep scheduler's queue floor in sync with current batch size
         if (sched) sched->set_gpu_batch_size(pop_n);
-        // Utilization scaling.  NOT gated on worker count here, unlike the
-        // decompress intake (v0.17.19) -- that gate was applied to this line too
-        // and MEASURED TO DO NOTHING: 4 GiB input, one device, batches came out
-        // median 8 / mean 10.2 / max 32 both with and without it, and the run
-        // time was unchanged (kernel 2.766 s vs 2.755 s).
+        // No utilization scaling here: it was removed in v0.17.46 (the account is
+        // at the decompress intake).  On an 8-GPU host this intake averaged 12.5
+        // frames per launch with it against 17.1 without.
         //
-        // Compress is not batch-starved the way staged decompress was.  MEASURED
-        // on 4 GiB, one device: --gds-only compress (which forces one stream)
-        // takes FULL 64-frame batches, every one, with 0.644 s of kernel against
-        // --gpu-only's 2.766 s.  Plain --gpu-only sits at median 8 of a
-        // per_stream_batch of 32, but that is the reader's supply, not this line.
-        //
-        // The probable reason the scaling never bites here: the staged compress
-        // read is a BLOCKING cuFileRead, so the GPU idles during intake and NVML
-        // reports low utilization, leaving util_scale near 1.0.  Starved
-        // decompress was the mirror image -- a tight loop of tiny kernels held
-        // utilization high, which drove the scaler to its floor and fed back.
-        // (That mechanism is inferred from the batch sizes, not instrumented.)
+        // Batch size on this path is supply-bound, not policy-bound.  MEASURED on
+        // 4 GiB, one device: --gds-only compress (which forces one stream) takes
+        // FULL 64-frame batches, every one, with 0.644 s of kernel against
+        // --gpu-only's 2.766 s; plain --gpu-only sits at median 8 of a
+        // per_stream_batch of 32, which is the reader's supply.
         //
         // Also measured, since it is the obvious thing to try: forcing
         // --gpu-streams=1 on --gpu-only compress does NOT unstarve it (median
         // stays 8) and costs 19% of wall clock, 4.75 s against 4.00 s -- the
         // second stream is overlapping intake with compute, and that is worth
         // more than the stream-switch overhead it saves.
-        {
-          // GZSTD_DEBUG_UTIL_SCALE=off removes the scaler; -vv traces {decided}.
-          const size_t pop_pre = pop_n;
-          const double scale   = util_scale.load(std::memory_order_relaxed);
-          const bool   scaled  = !gz_debug_util_scale_off();
-          if (scaled)
-            pop_n = std::max<size_t>(1, (size_t)(pop_n * scale));
-          if (opt.verbosity >= V_DEBUG) {
-            std::ostringstream os;
-            os << "[UTIL] GPU" << device_id << " comp scale=" << std::fixed << std::setprecision(3)
-               << scale << " pop " << pop_pre << " -> " << pop_n << " applied=" << (scaled ? 1 : 0);
-            vlog(V_DEBUG, opt, os.str() + "\n");
-          }
-        }
         // De-sync sink-limited completions so the in-order writer never flushes
         // one lockstep wave (which bursts the verify queue); no-op unless frozen.
         pop_n = gpu_desync_batch(pop_n, shared_tune);
@@ -28260,13 +28201,6 @@ static void gpu_decomp_worker(
         sched->register_gpu_stream(device_id);
     }
 
-    // Utilization scaling factor: 1.0 = idle, 0.1 = 90% busy.
-    // Updated after each batch completion via NVML query.
-    // Applied to batch size at next pop to match busy GPUs' completion time
-    // with idle GPUs' completion time.
-    double util_scale = 1.0;
-    unsigned util_last_pct = 101;   // NVML reading behind util_scale, for the -vv trace (101 = none yet)
-
     // Consecutive trivial-batch skips across all streams.  If we see too many
     // in a row without doing real GPU work, the remaining workload is
     // CPU-preferred (all trivially-compressed frames) and this GPU should
@@ -28508,49 +28442,28 @@ static void gpu_decomp_worker(
         }
         C.batch.clear();
         uint64_t qw_t0 = g_perf ? now_ns() : 0;
-        // Use shared batch size from auto-tuner, scaled by GPU utilization.
-        // A GPU at 50% utilization gets half the batch → finishes at roughly
-        // the same time as idle GPUs → results arrive in order for the writer.
+        // Use the shared batch size from the auto-tuner, capped by the
+        // per-stream buffers.
         size_t pop_n = (shared_tune && !shared_tune->locked.load())
                      ? std::min(shared_tune->batch_size.load(std::memory_order_relaxed), per_stream_cap)
                      : per_stream_cap;
         // Keep scheduler's queue floor in sync with current batch size
         if (sched) sched->set_gpu_batch_size(pop_n);
-        // Utilization scaling, ONLY WITH MORE THAN ONE GPU -- which is the only
-        // case the rationale above covers: it exists so a slower device takes
-        // proportionally less work and the devices finish together for the
-        // in-order writer.  With a single worker there is nothing to finish
-        // together with, and the scaling then feeds back on itself: a busy GPU
-        // scores high utilization -> smaller batch -> more launches for the same
-        // work -> still busy -> util_scale pinned at its 0.05 floor.
-        //
-        // MEASURED, -t on a 65 GiB / 8344-frame archive, one device: batches came
-        // out at a MEDIAN OF 3 frames (mean 5.6, max 64) -- 1495 launches at
-        // 63.5 ms each, 94.9 s of kernel time against 17.1 s of actual reads, and
-        // 175.9 s wall versus --cpu-only's 18.8 s.  64 * 0.05 = 3.2 is exactly the
-        // median observed.  --gpu-only escapes the worst of it only because its
-        // auto-tuner is free to grow toward 256 and partly cancels the scaling;
-        // the staged path pins the tuner, so nothing offsets it there.
-        //
-        // Invisible below a few hundred frames, which is why every corpus this was
-        // developed against missed it.  The compress worker has the identical
-        // line and presumably the identical problem; it is left alone here
-        // because it has not been measured at scale.
-        {
-          // GZSTD_DEBUG_UTIL_SCALE=off removes the scaler; -vv traces {sensed, decided}.
-          const size_t pop_pre = pop_n;
-          const bool   scaled  = (gpu_worker_count > 1) && !gz_debug_util_scale_off();
-          if (scaled)
-            pop_n = std::max<size_t>(1, (size_t)(pop_n * util_scale));
-          if (opt.verbosity >= V_DEBUG) {
-            std::ostringstream os;
-            os << "[UTIL] GPU" << device_id << "/S" << C.stream_index << " decomp sensed="
-               << (util_last_pct > 100 ? std::string("n/a") : std::to_string(util_last_pct) + "%")
-               << " scale=" << std::fixed << std::setprecision(3) << util_scale
-               << " pop " << pop_pre << " -> " << pop_n << " applied=" << (scaled ? 1 : 0);
-            vlog(V_DEBUG, opt, os.str() + "\n");
-          }
-        }
+        // NO UTILIZATION SCALING.  From v0.11.4 to v0.17.45 this intake multiplied
+        // pop_n by max(0.05, (100 - NVML util%) / 100), so that a busier device
+        // would take less work and the devices would finish together for the
+        // in-order writer.  NVML utilization is the fraction of TIME any kernel ran,
+        // read right after this worker's own batch, so it measured gzstd: a 1-frame
+        // launch keeps a card as "busy" as an 88-frame one, and the scaler cut its
+        // own batches and fed back on itself.  REMOVED in v0.17.46.  MEASURED, -d
+        // --gpu-only, scaler off against on, interleaved reps:
+        //   2x 11 GiB cards, 96 GiB    3.68-3.73 vs 0.334-0.336 GiB/s   (11.0x)
+        //   2x H100, 261 GiB           9.37-10.86 vs 6.01-7.19          (1.60x)
+        //   8x H100, 261 GiB           ranges overlap -- the pipeline caps first
+        // Nor did it serve its purpose: the writer's head-of-line time (waiting
+        // while later frames sat buffered) was LOWER without it, 17.3-24.2% against
+        // 31.9-45.0% on 8x H100.  If unequal devices ever need balancing, balance
+        // on measured per-device throughput, never on utilization.
         // De-sync sink-limited completions so the in-order writer never flushes
         // one lockstep wave (see gpu_desync_batch); no-op unless frozen.
         pop_n = gpu_desync_batch(pop_n, shared_tune);
@@ -29789,19 +29702,6 @@ static void gpu_decomp_worker(
 
         // Notify writer that a full batch of frames is now available
         results->cv.notify_one();
-
-        // Update utilization scale for next batch
-#ifdef HAVE_NVML
-        {
-          nvmlDevice_t dev;
-          nvmlUtilization_t util;
-          if (gz_nvml_handle_for_cuda(device_id, &dev) &&   // NOT by index: see helper
-              nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
-            util_scale = std::max(0.05, (100.0 - util.gpu) / 100.0);
-            util_last_pct = util.gpu;
-          }
-        }
-#endif
       }
 
       // Exit if remaining workload is all trivially-compressed frames.

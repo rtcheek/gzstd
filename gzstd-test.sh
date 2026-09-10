@@ -568,8 +568,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=419
-$EXTENSIVE && EXPECTED_TESTS=559
+EXPECTED_TESTS=430
+$EXTENSIVE && EXPECTED_TESTS=561
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -581,11 +581,14 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # signal that is supposed to mean "a test was added or removed".  Subtracting the
 # known deltas makes the note mean that again, on every host.
 #
-#   no GPU        -83  the whole "GPU acceleration" section is skipped as a
-#                      group (MEASURED: 419 baseline, 336 ran on a CPU-only
-#                      build).  The GDS cells live INSIDE that section, so this
-#                      delta already contains them -- do not also subtract the
-#                      GDS delta, which is why the check below uses elif.
+#   no GPU        -94  the whole "GPU acceleration" section is skipped as a
+#                      group.  MEASURED: 428 ran on a GPU+GDS host at v0.17.45
+#                      and 336 on a CPU-only build at v0.17.43, with no cell
+#                      added in between (92), plus the two v0.17.45 real-fault
+#                      cells, which need a GPU.  The GDS cells live INSIDE that
+#                      section, so this delta already contains them -- do not
+#                      also subtract the GDS delta, which is why the check
+#                      below uses elif.
 #   GPU, no GDS    -6  the six --gds-only cells that assert a successful run:
 #                      -t verifies on the device / bringup halving shrinks the
 #                      slabs / -d misaligned frame starts / -d lying seek table /
@@ -593,19 +596,30 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 #                      skip when gds_testable is false (see gds_host_status).
 #                      MEASURED: extensive 552 on a host whose nvidia-fs is
 #                      absent, against the then-558 baseline.  The v0.17.43
-#                      archive-geometry cell needs a GPU but NOT GDS, so it RUNS
-#                      there: that host's expected total is now 553 (559 - 6) and
-#                      its default 413.  DERIVED -- not yet measured on that host,
+#                      archive-geometry cell and the two v0.17.45 real-fault
+#                      cells need a GPU but NOT GDS, so they RUN there: that
+#                      host's expected total is now 555 (561 - 6) and its
+#                      default 424.  DERIVED -- not yet measured on that host,
 #                      which is the next thing to confirm there.
 #                      The sixth GDS cell ("refuses a compat-mode host") still
 #                      RUNS and passes everywhere -- only its negative control is
 #                      gated -- so it is not part of this delta.
 #
-# MEASURED COMBINATIONS: default+noGPU (336) and extensive+GPU+noGDS (552).
-# Derived: default+GPU+noGDS (412) and extensive+GPU+GDS (558, the pre-tag host).
+# THE DEFAULT BASELINE HAD FALLEN 9 BEHIND by v0.17.45, and the no-GPU delta with
+# it: the next default run on a GPU+GDS host counted 428 against 419.  The
+# likeliest point is v0.17.31, which moved only the extensive count (548 -> 557,
+# nine more cells running on this host) and left the default at 417.  The
+# CPU-only note could not see it, because the no-GPU delta was fitted to make
+# that run match the low default.  A baseline that is only ever derived is not a
+# baseline: measure every combination listed here.
+#
+# MEASURED COMBINATIONS: default+GPU+GDS (428, v0.17.45), default+noGPU (336,
+# v0.17.43), extensive+GPU+GDS (559, v0.17.43), extensive+GPU+noGDS (552,
+# v0.17.42).  Derived: this baseline (430 / 561 -- those plus the two v0.17.45
+# cells) and default+GPU+noGDS (424).
 # NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
-# -81 is the number to re-measure, not evidence of drift.
-EXPECTED_NOGPU_DELTA=83
+# -94 is the number to re-measure, not evidence of drift.
+EXPECTED_NOGPU_DELTA=94
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -1369,6 +1383,80 @@ GVPY
   fi
   rm -f "$fg_z" "$fg_e"
 
+  # v0.17.45: a HANDLED CUDA allocation failure must not poison the next launch.
+  # cudaMalloc and cudaHostAlloc report a failure twice -- as the return value and
+  # in the thread's sticky last-error slot -- and the decompress verify launch reads
+  # the slot (checkCuda(cudaGetLastError(), "gzx_xxh64 launch ...")).  Thirteen
+  # handled-failure sites checked the return value, recovered correctly, and left
+  # the slot armed, so the verify launch reported an out-of-memory that never
+  # happened, the device was declared failed, and every GPU decompress on an 11 GiB
+  # card finished on the CPU at exit 0 with correct output.
+  #
+  # A DATACENTER CARD NEVER FAILS THOSE ALLOCATIONS, so these cells use the REAL
+  # fault hooks, which hand the allocator an impossible size and so arm the slot for
+  # real (the older pretend hooks report a failure CUDA never saw, and cannot):
+  # GZSTD_DEBUG_REAL_BRINGUP_OOM fails the bringup temp allocation once, and
+  # GZSTD_DEBUG_REAL_PINNED_OOM fails every pinned D2H staging allocation.
+  #
+  # ONE DEVICE ON PURPOSE.  With several GPUs a poisoned device's frames are picked
+  # up by a healthy one and the frame count comes out whole.  MEASURED on an 8-GPU
+  # host against a build with the 13 consumes removed: the bringup case put 0 of 5
+  # frames on the GPU with --gpu-devices=1, and 5 of 5 without it.  The suite
+  # already masks itself to GPU 0 by default, so the flag is what keeps these cells
+  # honest under GZSTD_TEST_ALL_GPUS=1 or a caller-supplied multi-device mask.
+  #
+  # THESE CELLS DISCRIMINATE, mutation-proven against that build: each reports 0
+  # frames on the GPU and a "gzx_xxh64 launch (decompress verify): out of memory"
+  # fault, where a correct build puts every frame on the GPU.  CONTROL FIRST: a
+  # correct build that recovers looks exactly like a hook that never fired, so each
+  # cell proves its hook ran before it trusts the frame count.
+  ro_src="$TMPDIR/realoom.bin"; ro_z="$TMPDIR/realoom.zst"
+  ro_out="$TMPDIR/realoom.out"; ro_e="$TMPDIR/realoom.err"
+  # Compressible but never trivial: a zero-filled frame could be routed off the GPU
+  # and short the count on a correct build.
+  head -c 24M /dev/urandom | base64 -w 76 > "$ro_src"
+  "$GZSTD" -q -k -f --cpu-only "$ro_src" -o "$ro_z" 2>/dev/null
+  for ro_hook in bringup pinned; do
+    rm -f "$ro_out"
+    if [[ $ro_hook == bringup ]]; then
+      ro_name="GPU decompress survives a handled bringup OOM (real fault)"
+      GZSTD_DEBUG_REAL_BRINGUP_OOM=1 GZSTD_DEBUG_ENSURE=1 run_test "$GZSTD" -vv -d --gpu-only \
+        --gpu-devices=1 --gpu-batch=16 -k -f "$ro_z" -o "$ro_out" 2>"$ro_e"
+      # Fired = bringup had to retry at a SMALLER batch than it first asked for.
+      ro_fired=0; ro_prev=0
+      for ro_b in $(grep -oE 'ENSURE. realloc: batch [0-9]+' "$ro_e" 2>/dev/null | awk '{print $4}'); do
+        if [[ $ro_prev -ne 0 && $ro_b -lt $ro_prev ]]; then ro_fired=1; fi
+        ro_prev=$ro_b
+      done
+    else
+      ro_name="GPU decompress survives a handled pinned-staging OOM (real fault)"
+      GZSTD_DEBUG_REAL_PINNED_OOM=-1 run_test "$GZSTD" -vv -d --gpu-only \
+        --gpu-devices=1 --gpu-batch=16 --pinned on -k -f "$ro_z" -o "$ro_out" 2>"$ro_e"
+      # Fired = the staging allocation really failed.  --pinned defaults OFF, so
+      # without "on" this path never runs and the cell would pass on nothing.
+      ro_fired=0
+      if grep -q 'D2H staging allocation failed' "$ro_e" 2>/dev/null; then ro_fired=1; fi
+    fi
+    ro_rc=$LAST_RC
+    ro_streamed=$(grep -oE 'streamed [0-9]+ frames for GPU' "$ro_e" 2>/dev/null | awk '{print $2; exit}')
+    ro_gpu=$(grep -oE '\] done batch=[0-9]+' "$ro_e" 2>/dev/null | awk -F= '{s+=$2} END{print s+0}')
+    ro_fault=$(grep -m1 -oE 'fault: .*' "$ro_e" 2>/dev/null || true)
+    if [[ $ro_fired -ne 1 ]]; then
+      fail "$ro_name" "hook never fired: NOT TESTED"
+    elif [[ $ro_rc -ne 0 ]]; then
+      fail "$ro_name" "exit $ro_rc"
+    elif [[ -z "${ro_streamed:-}" || $ro_streamed -eq 0 ]]; then
+      fail "$ro_name" "no frame count in the -vv trace: NOT TESTED"
+    elif [[ $ro_gpu -ne $ro_streamed || -n "$ro_fault" ]]; then
+      fail "$ro_name" "$ro_gpu of $ro_streamed frames on the GPU${ro_fault:+ — $ro_fault}"
+    elif ! files_match "$ro_src" "$ro_out"; then
+      fail "$ro_name" "output mismatch"
+    else
+      pass "$ro_name"
+    fi
+  done
+  rm -f "$ro_src" "$ro_z" "$ro_out" "$ro_e"
+
   # v0.17.29: the --gds-only OUTPUT preflight must prove EVERY frame start, not
   # infer the archive from frame 0.  Frame k begins at the sum of the
   # decompressed sizes before it, so 4096/1001/17 byte frames start at 0, 4096
@@ -1668,6 +1756,8 @@ else
   skip "hybrid compress/decompress" "no GPU"
   skip "gpu integrity test" "no GPU"
   skip "GPU decompress fault -> rescue finishes the job" "no GPU"
+  skip "GPU decompress survives a handled bringup OOM (real fault)" "no GPU"
+  skip "GPU decompress survives a handled pinned-staging OOM (real fault)" "no GPU"
   skip "--gds-only -t verifies on the device" "no GPU"
   skip "gpu tar" "no GPU"
   skip "gpu batch sizes" "no GPU"
