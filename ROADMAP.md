@@ -434,16 +434,18 @@ must not be cached for the whole run.
 Measurements that should precede the decision:
 - **Check `CUDA_VISIBLE_DEVICES` on the measuring host first**, and never set it in an arm meant to run
   the stock scaler. To pin devices with the scaler still running, use
-  `CUDA_VISIBLE_DEVICES=<uuid list> --gpu-devices=N` (it takes the first N of the list — the race above)
-  and confirm `sensed=NN%` in the trace.
+  `CUDA_VISIBLE_DEVICES=<uuid list> --gpu-devices=N` (it takes the first N of the list; it relies on the
+  race above, which it won in all 23 runs measured here) and confirm `sensed=NN%` in the trace.
 - The 8-GPU host: `-d --gpu-only` and `-t --gds-only` with the scaler on vs off, at a corpus past the
   tuner's ramp, 4+ interleaved reps. The single-device path is already gated; every multi-device
   figure recorded there may be scaler-limited.
-- Compress, measured on two cards: scaler off 1.715–1.717 GiB/s, stock 0.703–0.717 — **2.43x** (96 GiB,
-  4 interleaved reps), with stock batches averaging 1.1 frames against 9.7. The intake has no
-  worker-count gate, and the scaler cut a single card's batches to 1 frame as well, but that run's
-  throughput ratio (2.90x) is confounded: `--gpu-devices=1` chose a different card for each arm. Still
-  owed: a single-card figure with both arms pinned to the same card, and the 8-GPU figures.
+- Compress, measured. Two cards: scaler off 1.715–1.717 GiB/s, stock 0.703–0.717 — **2.43x** (96 GiB,
+  4 interleaved reps; stock batches averaged 1.1 frames against 9.7). **One card**, since the compress
+  intake has no worker-count gate, with both arms pinned to the same card and every run's scaler state
+  and device checked: card 0 0.886–0.890 unscaled against 0.395–0.405 stock (**2.22x**), card 1
+  0.831–0.838 against 0.310–0.317 (**2.67x**) — 24 GiB, 4 interleaved reps. Card 1 loses more because
+  its fixed cost per launch is higher, and a stock run makes ~1,400 one-frame launches against ~180
+  unscaled. Still owed: the 8-GPU figures.
 - The residual: unscaled, two cards reached 91% of the two single cards combined. Find what the
   remaining 9% is before scaling to eight.
 - A state table for the chosen policy, in the code, before changing it.
