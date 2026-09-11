@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.47";
+static constexpr const char * GZSTD_VERSION = "0.17.48";
 //
 // Architecture overview:
 //
@@ -4282,6 +4282,8 @@ static void print_help_long()
 "     too high wastes RAM with no upside.  Bump to 8 or 16 if you see\n"
 "     `source=pipeline` at -v and suspect the writer is bursty.\n"
 "     No effect with -T 1 or --sliding-window (no parallelism to bound).\n"
+"     On GPU decompress it also sets the read-ahead queue depth, which\n"
+"     otherwise holds one batch per GPU stream plus a frame per CPU thread.\n"
 "\n"
 "  --throttle-frames N / --no-throttle    [all modes]\n"
 "     Explicit in-flight frame cap.  Sentinel values:\n"
@@ -9017,10 +9019,11 @@ struct Task {
   const char * view_ptr = nullptr;
   size_t       view_len = 0;
   int          direct_buf = -1;   // >=0: view_ptr aliases DirectReadPool slot; recycle on release
-  // v0.17.47: view_ptr aliases a 64 MiB block of the parallel decompress reader
+  // v0.17.47: view_ptr aliases a block of the parallel decompress reader
   // (stream_frames_to_queue_mt), and this reference keeps the block alive until the
   // Task is released or destroyed.  Never retired as mmap input -- see release_input().
-  std::shared_ptr<std::vector<char>> block;
+  // Type-erased: a Task owns the block's lifetime, never its layout.
+  std::shared_ptr<const void> block;
 
   // --gds-only: this Task names a REGION OF THE INPUT FILE and carries no host
   // bytes at all — the GPU worker reads it straight into VRAM with cuFileRead.
@@ -14271,11 +14274,14 @@ static int probe_preadable_input(const Options & opt, FILE * in,
  off mid-stream.  Returns frames pushed, or MT_READER_BAIL if it could not
  even open the file (no frames pushed; caller uses the single reader).
 ======================================================================*/
+static bool kernel_has_per_vma_locks();   // Linux >= 6.4; defined below
+
 static size_t stream_frames_to_queue_mt(
     int fd, bool owns_fd, uint64_t file_size, int n_readers,
     TaskQueue & queue, Meter * m, const Options & opt,
     size_t * max_frame_decomp_out, const std::atomic<bool> * abort,
-    bool * fallback_out, std::vector<char> * raw_data_out)
+    bool * fallback_out, std::vector<char> * raw_data_out,
+    uint64_t first_frame_decomp)
 {
   if (fd < 0) return MT_READER_BAIL;
   try_boost_io_priority(!opt.gpu_only);
@@ -14284,12 +14290,37 @@ static size_t stream_frames_to_queue_mt(
   g_adapt_src_path.store("pread", std::memory_order_relaxed);
 
   // BLOCK comfortably larger than a typical frame so most frames sit fully
-  // within one block (a straddling frame costs an extra small copy).  Frames
-  // larger than BLOCK (e.g. huge --chunk-size) just span multiple blocks via
-  // carry — correct, merely with more copying.
+  // within one block.  Frames longer than the overlap below (e.g. huge
+  // --chunk-size) span blocks via carry — correct, merely with more copying.
   const size_t BLOCK = (size_t)64 * ONE_MIB;
   const size_t STEP  = (size_t)4 * ONE_MIB;   // carry-growth increment
   const size_t n_blocks = (size_t)((file_size + BLOCK - 1) / BLOCK);
+  // OVERLAP (v0.17.48).  Each block buffer also holds the OV bytes that follow its
+  // block, so a frame that starts in the block and crosses its end is still whole
+  // in one buffer and leaves as a view.  Without it about one frame per block (2,091 of
+  // 16,686 on a 16 MiB-chunk archive) was assembled in `carry` on the consumer
+  // thread -- the one serial copy zero-copy views left.  On --cpu-only that held
+  // the thread at 73-78% of a core in USER time (205k minor faults for the whole
+  // run, so not faults); on 8 GPUs the carry heap churn cost it 2.5M faults.
+  // A block owns only the frames that START inside it; the next block skips the
+  // bytes its predecessor's last frame took (`skip`).  OV is the compress bound
+  // of the first frame's content size -- every frame of a uniform-chunk archive
+  // shares it -- capped at half a block; a longer frame carries as before.
+  // The overlap bytes are read twice, by this block's reader and the next one's,
+  // but the second read is a page-cache copy: MEASURED cold, v0.17.47 and this
+  // both read exactly 130.73 GiB from the device for the 130.73 GiB archive, at
+  // the same wall time.  Warm --cpu-only on that archive: 38.4-39.7 GiB/s before,
+  // 57.5-66.1 after, with the huge pages below (CHANGELOG v0.17.48).
+  // IT DEPENDS ON THOSE HUGE PAGES.  At 4 KiB pages the faster producer grew the
+  // view pool until the readers were fault-bound, and 8-GPU decompress fell from
+  // 14.96-15.42 to 12.16-12.26 GiB/s -- see also the queue depth in decompress_nvcomp.
+  // GZSTD_DEBUG_READER_NO_OVERLAP=1 sets OV to 0 (the A/B control).
+  static const bool ov_off = [] {
+    const char * e = std::getenv("GZSTD_DEBUG_READER_NO_OVERLAP"); return e && *e == '1'; }();
+  const size_t OV = (ov_off || first_frame_decomp == 0) ? 0
+      : std::min(BLOCK / 2, ((ZSTD_compressBound((size_t)first_frame_decomp) + ONE_MIB - 1)
+                             / ONE_MIB) * ONE_MIB);
+  const size_t BUF = BLOCK + OV;              // bytes one block buffer holds
 
   // --adapt reader scale-up (M4 action 3): size the slot ring for the CAP up
   // front — the modulo geometry is frozen at spawn, so a late-woken reader
@@ -14300,14 +14331,14 @@ static size_t stream_frames_to_queue_mt(
   const bool can_scale = opt.adapt && opt.read_threads == 0 && !opt.direct_read;
   // Ceiling decoupled from the start (the old cap = min(n*2, 12) was INERT on
   // any box with >=96 threads, where n_readers is already 12), but clamped by
-  // RAM: the look-ahead ring is n_slots x BLOCK and BLOCK is 64 MiB here, so a
+  // RAM: the look-ahead ring is n_slots x BUF (a 64 MiB BLOCK plus OV), so a
   // ceiling of 32 would reserve 4 GiB of ring against 1.5 GiB today.  Budget an
   // eighth of available memory for it; a small box gets a small ceiling rather
   // than a controller that can only make things worse.
   int rd_ceil_d = std::min(n_readers * 3, 32);
   if (const uint64_t ram = get_available_ram_bytes())
     rd_ceil_d = (int)std::min<uint64_t>((uint64_t)rd_ceil_d,
-                                        std::max<uint64_t>(1, ram / 8 / (2 * BLOCK)));
+                                        std::max<uint64_t>(1, ram / 8 / (2 * BUF)));
   rd_ceil_d = std::max(rd_ceil_d, n_readers);
   const int  rd_floor_d = std::max(1, n_readers / 2);
   const int  cap       = can_scale ? rd_ceil_d : n_readers;
@@ -14325,31 +14356,69 @@ static size_t stream_frames_to_queue_mt(
   // later zero-copy pass can remove it)".  This is that pass: a block is a
   // refcounted buffer from a recycling pool (its pages stay faulted in), the slot
   // drops its reference once the consumer has parsed the block, and every frame
-  // wholly inside a block leaves as a view that holds the block until the frame
-  // is released.  Frames that cross a block boundary are assembled in `carry` as
-  // before, but handed over by move rather than copied again.
+  // wholly inside a block buffer leaves as a view that holds the block until the
+  // frame is released -- including a frame that ends in the OVERLAP (above).  A
+  // frame longer than the overlap is assembled in `carry` and handed over by move.
   // MEASURED on the prototype, 261 GiB, balanced A/B: --cpu-only 14.6 -> 35.2 GiB/s,
   // 8-GPU 12.4 -> 16.2 (CHANGELOG v0.17.47 has the release figures).
   // GZSTD_DEBUG_READER_COPY=1 restores the per-frame copy (the A/B control).
   static const bool zc_off = [] {
     const char * e = std::getenv("GZSTD_DEBUG_READER_COPY"); return e && *e == '1'; }();
+  // HUGE PAGES (v0.17.48).  Growing the view pool is first-touch page faults in the
+  // reader threads, and on a GPU run the pool reaches hundreds of blocks.  At 4 KiB
+  // pages the readers spent more kernel time faulting blocks in than reading them:
+  // MEASURED on 8 GPUs, 261 GiB archive, ~475k minor faults and 3.8 s of system
+  // time per reader for a 20 GiB pool.  So a block is 2 MiB-aligned storage advised
+  // MADV_HUGEPAGE and touched one byte per 2 MiB -- the pattern and the kernel gate
+  // (>= 6.4) of DirectReadPool, whose comment records why older kernels must not.
+  // Otherwise the block is zero-filled up front exactly as the std::vector it
+  // replaced was.  2 MiB pages alone, one binary with the overlap off, took that
+  // run from 14.96-15.42 to 17.51-18.66 GiB/s.  GZSTD_DEBUG_READER_THP=0/1 forces it.
+  static const bool blk_thp = [] {
+    const char * e = std::getenv("GZSTD_DEBUG_READER_THP");
+    if (e && *e == '0') return false;
+    if (e && *e == '1') return true;
+    return kernel_has_per_vma_locks();
+  }();
+  struct BlockBuf {
+    char * p = nullptr;
+    size_t cap = 0;
+    ~BlockBuf() { std::free(p); }
+  };
   struct BlockPool {
     std::mutex m;
-    std::vector<std::vector<char> *> free;
+    std::vector<BlockBuf *> free;
     std::atomic<size_t> alive{0};             // blocks handed out and not yet returned
-    ~BlockPool() { for (auto * v : free) delete v; }
+    ~BlockPool() { for (auto * b : free) delete b; }
   };
   const auto pool = std::make_shared<BlockPool>();
   // The deleter owns a reference to the pool, so the pool outlives every Task
   // still holding a block after this function returns.
   auto get_block = [pool](size_t n) {
-    std::vector<char> * v = nullptr;
+    BlockBuf * b = nullptr;
     { std::lock_guard<std::mutex> lk(pool->m);
-      if (!pool->free.empty()) { v = pool->free.back(); pool->free.pop_back(); } }
-    std::unique_ptr<std::vector<char>> owned(v ? v : new std::vector<char>());
-    if (owned->size() < n) owned->resize(n);
+      if (!pool->free.empty()) { b = pool->free.back(); pool->free.pop_back(); } }
+    std::unique_ptr<BlockBuf> owned(b ? b : new BlockBuf());
+    if (owned->cap < n) {
+      const size_t HP = 2 * ONE_MIB;
+      const size_t cap = ((n + HP - 1) / HP) * HP;
+      void * mem = nullptr;
+      if (posix_memalign(&mem, HP, cap) != 0 || !mem) throw std::bad_alloc();
+      if (blk_thp) {
+#ifdef MADV_HUGEPAGE
+        (void)madvise(mem, cap, MADV_HUGEPAGE);   // best-effort; a no-op if THP is off
+#endif
+        volatile char * vp = static_cast<volatile char *>(mem);
+        for (size_t o = 0; o < cap; o += HP) vp[o] = 0;
+      } else {
+        std::memset(mem, 0, cap);
+      }
+      std::free(owned->p);
+      owned->p = static_cast<char *>(mem);
+      owned->cap = cap;
+    }
     pool->alive.fetch_add(1, std::memory_order_relaxed);
-    return std::shared_ptr<std::vector<char>>(owned.release(), [pool](std::vector<char> * p) {
+    return std::shared_ptr<BlockBuf>(owned.release(), [pool](BlockBuf * p) {
       pool->alive.fetch_sub(1, std::memory_order_relaxed);
       std::lock_guard<std::mutex> lk(pool->m);
       pool->free.push_back(p);
@@ -14372,11 +14441,13 @@ static size_t stream_frames_to_queue_mt(
   // copy path instead of toward swap -- a cap of 64 still kept +32%.  No floor:
   // a fixed floor could exceed the whole budget on a small machine.
   const uint64_t zc_ram = get_available_ram_bytes();
-  size_t zc_cap = zc_ram ? (size_t)(zc_ram / 8 / BLOCK) : (size_t)n_slots * 2;
+  size_t zc_cap = zc_ram ? (size_t)(zc_ram / 8 / BUF) : (size_t)n_slots * 2;
   if (const char * e = std::getenv("GZSTD_DEBUG_ZC_MAX_BLOCKS"))
     zc_cap = (size_t)std::strtoull(e, nullptr, 10);
   size_t zc_views = 0, zc_carried = 0, zc_copied = 0, zc_peak = 0, max_frame_comp = 0;
-  struct Slot { std::shared_ptr<std::vector<char>> buf; size_t len = 0; size_t idx = SIZE_MAX; bool ready = false; };
+  size_t zc_overlap = 0;          // frames that ended in their block's overlap
+  uint64_t zc_wait_ns = 0;        // consumer time spent waiting for its next block
+  struct Slot { std::shared_ptr<BlockBuf> buf; size_t len = 0; size_t idx = SIZE_MAX; bool ready = false; };
   std::vector<Slot> slots((size_t)n_slots);
   // Slot buffers allocate lazily on first claim, and the prefetch look-ahead
   // below is bounded by the ACTIVE reader count (2x active, <= n_slots) —
@@ -14418,14 +14489,14 @@ static size_t stream_frames_to_queue_mt(
           return stop || consumed + ahead > i; });
         if (stop) return;
       }
-      if (!s.buf) s.buf = get_block(BLOCK);   // lazy: a slot takes a block on first claim
+      if (!s.buf) s.buf = get_block(BUF);     // lazy: a slot takes a block on first claim
       const off_t  off  = (off_t)i * (off_t)BLOCK;
-      const size_t want = std::min(BLOCK, (size_t)(file_size - (uint64_t)off));
+      const size_t want = std::min(BUF, (size_t)(file_size - (uint64_t)off));   // block + overlap
       uint64_t t0 = m ? now_ns() : 0;
       size_t got = 0;
       bool io_err = false;
       while (got < want) {
-        ssize_t r = ::pread(fd, s.buf->data() + got, want - got, off + (off_t)got);
+        ssize_t r = ::pread(fd, s.buf->p + got, want - got, off + (off_t)got);
         if (r < 0)  { io_err = true; break; }
         if (r == 0) break;            // file shrank under us; len<want flags it
         got += (size_t)r;
@@ -14503,7 +14574,7 @@ static size_t stream_frames_to_queue_mt(
   // Exactly one of: view_of (a view into that block), take_from (move the carry
   // buffer, which already holds the frame), or neither (copy the frame out).
   auto emit = [&](const char * p, size_t fc,
-                  const std::shared_ptr<std::vector<char>> * view_of,
+                  const std::shared_ptr<BlockBuf> * view_of,
                   std::vector<char> * take_from) -> bool {
     unsigned long long dz = ZSTD_getFrameContentSize(p, fc);
     if (dz == ZSTD_CONTENTSIZE_UNKNOWN || dz == ZSTD_CONTENTSIZE_ERROR) {
@@ -14531,18 +14602,24 @@ static size_t stream_frames_to_queue_mt(
     return true;
   };
 
+  size_t skip = 0;   // bytes of this block the previous block's last frame took (OVERLAP)
   for (size_t cur = 0; cur < n_blocks && !aborted; ++cur) {
     if (abort && abort->load(std::memory_order_acquire)) { aborted = true; break; }
     Slot & s = slots[cur % (size_t)n_slots];
     {
+      const uint64_t w0 = now_ns();
       std::unique_lock<std::mutex> lk(mtx);
       cv_filled.wait(lk, [&]{ return failed.load(std::memory_order_relaxed) || (s.ready && s.idx == cur); });
+      zc_wait_ns += now_ns() - w0;
       if (failed.load(std::memory_order_relaxed)) { aborted = true; break; }
     }
-    const std::shared_ptr<std::vector<char>> blk = s.buf;   // held while this block is parsed
-    const char * data = blk->data();
+    const std::shared_ptr<BlockBuf> blk = s.buf;   // held while this block is parsed
+    const char * data = blk->p;
     const size_t len  = s.len;
-    size_t pos = 0;
+    // The block OWNS the bytes before BLOCK; anything past it is overlap, read only
+    // so a frame starting in the block can finish in this buffer.
+    const size_t own  = std::min(len, BLOCK);
+    size_t pos = skip; skip = 0;
     const size_t alive_now = pool->alive.load(std::memory_order_relaxed);
     if (alive_now > zc_peak) zc_peak = alive_now;
     const bool as_views = !zc_off && alive_now <= zc_cap;   // see MEMORY CAP above
@@ -14572,15 +14649,15 @@ static size_t stream_frames_to_queue_mt(
       size_t appended = 0, need = 0; bool resolved = false;
       if (skippable) {
         // need 8 bytes for the size field, then 8 + skip_size total
-        while (carry.size() < 8 && appended < len) {
-          size_t step = std::min(STEP, len - appended);
+        while (carry.size() < 8 && appended < own) {
+          size_t step = std::min(STEP, own - appended);
           append_carry(data + appended, step); appended += step;
         }
         if (carry.size() >= 8) {
           const uint32_t ss = rd_le32(carry.data() + 4);
           need = 8 + (size_t)ss;
-          while (carry.size() < need && appended < len) {
-            size_t step = std::min(STEP, len - appended);
+          while (carry.size() < need && appended < own) {
+            size_t step = std::min(STEP, own - appended);
             append_carry(data + appended, step); appended += step;
           }
           if (carry.size() >= need) { pos = need - old; carry.clear(); resolved = true;
@@ -14599,7 +14676,7 @@ static size_t stream_frames_to_queue_mt(
         // re-parsed in place by (B), so correctness is unchanged.
         size_t fc = 0;
         size_t step = STEP;
-        while (appended <= len) {
+        while (appended <= own) {
           uint64_t ps = m ? now_ns() : 0;
           fc = ZSTD_findFrameCompressedSize(carry.data(), carry.size());
           if (m) m->reader_parse_ns.fetch_add(now_ns() - ps, std::memory_order_relaxed);
@@ -14607,39 +14684,45 @@ static size_t stream_frames_to_queue_mt(
             if (!emit(carry.data(), fc, nullptr, &carry)) { need_fallback = true; fallback_off = carry_origin; aborted = true; }
             pos = (fc > old) ? (fc - old) : 0; carry.clear(); resolved = true; break;
           }
-          if (appended >= len) break;       // exhausted this block; frame spans further
-          size_t take = std::min(step, len - appended);
+          if (appended >= own) break;       // exhausted this block; frame spans further
+          size_t take = std::min(step, own - appended);
           append_carry(data + appended, take); appended += take;
           step = std::min(step * 2, BLOCK); // geometric growth, capped at one block
         }
       }
       if (aborted) break;
-      if (!resolved) { pos = len; }         // whole block absorbed into carry; fetch next block
+      if (!resolved) { pos = own; }         // whole block absorbed into carry; fetch next block
     }
 
-    // (B) parse the rest of the block in place.
-    while (!aborted && pos < len) {
-      const char * p = data + pos; const size_t rem = len - pos;
+    // (B) parse the rest of the block in place.  A frame may END in the overlap
+    // (rem counts it), but a carry takes only the bytes this block owns (own_rem):
+    // the next block's data begins at BLOCK, so carrying overlap bytes would
+    // duplicate them.
+    while (!aborted && pos < own) {
+      const char * p = data + pos; const size_t rem = len - pos, own_rem = own - pos;
       // A frame starting here begins at this absolute file offset.  Recorded so
       // a carry assigned below carries its origin (for section A's fallback),
       // and reused directly if this frame has no content-size header.
       carry_origin = (uint64_t)cur * BLOCK + pos;
-      if (rem < 4) { start_carry(p, rem); break; }
+      if (rem < 4) { start_carry(p, own_rem); break; }
       const uint32_t magic = rd_le32(p);
       if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {          // skippable frame
-        if (rem < 8) { start_carry(p, rem); break; }
+        if (rem < 8) { start_carry(p, own_rem); break; }
         const uint32_t ss = rd_le32(p + 4);
         size_t tot = 8 + (size_t)ss;
-        if (tot > rem) { start_carry(p, rem); break; }  // straddles
+        if (tot > rem) { start_carry(p, own_rem); break; }  // straddles
         pos += tot; ++total_frames; continue;
       }
       uint64_t ps = m ? now_ns() : 0;
       size_t fc = ZSTD_findFrameCompressedSize(p, rem);
       if (m) m->reader_parse_ns.fetch_add(now_ns() - ps, std::memory_order_relaxed);
-      if (ZSTD_isError(fc) || fc > rem) { start_carry(p, rem); break; }  // straddles
+      if (ZSTD_isError(fc) || fc > rem) { start_carry(p, own_rem); break; }  // straddles
       if (!emit(p, fc, as_views ? &blk : nullptr, nullptr)) { need_fallback = true; fallback_off = carry_origin; aborted = true; break; }
+      if (pos + fc > own) ++zc_overlap;
       pos += fc;
     }
+    // A frame (or skippable) that ended in the overlap: the next block starts past it.
+    if (pos > own) skip = pos - own;
 
     {
       std::lock_guard<std::mutex> lk(mtx);
@@ -14679,13 +14762,17 @@ static size_t stream_frames_to_queue_mt(
 
   { std::lock_guard<std::mutex> lk(mtx); stop = true; }
   if (opt.verbosity >= V_VERBOSE) {
-    char zb[256];
+    char zb[384];
     std::snprintf(zb, sizeof zb,
       "[READER] zero-copy: %zu frames as views, %zu carried across block boundaries, "
-      "%zu copied%s; peak %zu blocks (%.1f GiB) alive, cap %zu\n",
+      "%zu copied%s; %zu ended in the %zu MiB overlap; peak %zu blocks (%.1f GiB%s) alive, "
+      "cap %zu; consumer waited %.2f s for blocks\n",
       zc_views, zc_carried, zc_copied,
       zc_off ? " (GZSTD_DEBUG_READER_COPY)" : " past the memory cap",
-      zc_peak, double(zc_peak) * double(BLOCK) / double(1ULL << 30), zc_cap);
+      zc_overlap, (size_t)(OV / ONE_MIB),
+      zc_peak, double(zc_peak) * double(BUF) / double(1ULL << 30),
+      blk_thp ? ", huge pages advised" : "", zc_cap,
+      double(zc_wait_ns) / 1e9);
     vlog(V_VERBOSE, opt, zb);
   }
   {
@@ -14815,15 +14902,16 @@ static size_t stream_frames_to_queue(
     if (pfd >= 0) {
       const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
                           : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
+      int64_t first_decomp = -1;   // the MT reader sizes its block overlap from it
       if (n_readers > 1 && fsz > (uint64_t)(2 * 64 * ONE_MIB)
-          && peek_first_frame_decomp_size(in) >= 0) {
+          && (first_decomp = peek_first_frame_decomp_size(in)) >= 0) {
         if (opt.verbosity >= V_VERBOSE)
           vlog(V_VERBOSE, opt, "[READER] parallel prefetch: " + std::to_string(n_readers)
                + " reader threads"
                + (opt.input == "-" ? " (stdin is a seekable file)" : "") + "\n");
         size_t r = stream_frames_to_queue_mt(pfd, owns, fsz, n_readers,
                                              queue, m, opt, max_frame_decomp_out, abort,
-                                             fallback, raw_data);
+                                             fallback, raw_data, (uint64_t)first_decomp);
         if (r != MT_READER_BAIL) return r;
         if (m) m->reader_threads.store(1, std::memory_order_relaxed);
       } else if (owns) {
@@ -30426,7 +30514,20 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // input in RAM — the gpu-only RSS blowup in ROADMAP 7.8.  Skip when
   // throttling is explicitly disabled.
   if (opt.throttle_frames != 0) {
-    int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : THROTTLE_SLACK_FACTOR;
+    // ONE BATCH PER CONSUMER, NOT FOUR (v0.17.48).  decomp_parallelism already counts
+    // a full auto-tuner batch for every GPU stream plus one frame per CPU thread, so a
+    // queue that deep lets every consumer's next pop find its batch -- which is also
+    // what keeps wait_for_batch_or_cap's escape reachable.  Everything past it is
+    // backlog.  The old default of 4x cost nothing while the producer was the
+    // bottleneck, as it was until v0.17.47; zero-copy views and the block overlap
+    // then let the parallel reader outrun GPU streams that were already the bound,
+    // and every queued view pins its 64 MiB block.  MEASURED, 8 GPUs, 261 GiB
+    // archive, huge-page blocks, two runs each: 4x 17.59-18.15 GiB/s at 139-141 GiB
+    // peak RSS (~1,375 blocks alive), 2x 17.39-20.41 at 102-106 GiB, 1x 18.53-18.69
+    // at 77-84 GiB -- no throughput difference, half the memory.  Without the
+    // overlap 1x and 4x also measured the same (16.28-18.28 GiB/s).
+    // --throttle-factor still sets this explicitly, as it sets the throttle's.
+    const int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : 1;
     const size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, decomp_parallelism * qslack);
     queue.set_max_depth(qfloor);
     // Byte ceiling — see decompress_cpu_mt: bounds queued RAM independent of

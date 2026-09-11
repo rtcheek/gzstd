@@ -1,12 +1,105 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.47  
+**Covers:** v0.9.50 → v0.17.48  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.48 — the reader's last serial copy, and the memory a faster reader exposed
+
+**v0.17.47 left one serial copy in the parallel decompress reader.** About one frame per 64 MiB block (2,091
+of 16,686 on a 16 MiB-chunk archive) crosses a block boundary, and those frames were still assembled on the
+ordered consumer thread, holding it at 73–78% on `--cpu-only`. Removing that copy then exposed two costs that
+had been hidden behind it, so this release is three changes that only work together.
+
+### How it was found
+
+- A per-thread profile of v0.17.47 `--cpu-only` put the consumer at 4.7 s user against 0.67 s system and
+  205k minor faults for the whole run: the carry copy itself, not page faults. Recycling carry buffers would
+  not have helped.
+- On 8 GPUs the same consumer took 2.5M faults, and `strace -k` put 792 `brk` calls on the carry buffer's
+  reservation.
+- 8-GPU stage timings showed no saturated stage: cards 13–32% busy, streams inside a batch 49% of the time,
+  D2H 76% of that.
+
+### The change
+
+- **Block overlap.** Each block buffer also holds the bytes that follow its block, so a frame that crosses the
+  block's end is still whole in one buffer and leaves as a view. The overlap is the compress bound of the first
+  frame's content size, capped at half a block (17 MiB for 16 MiB chunks). A block owns only the frames that
+  start inside it and the next block skips what its predecessor's last frame took; a frame longer than the
+  overlap is carried as before, and a carry copies only the bytes its block owns. The overlap bytes are read
+  twice, but the second read is a page-cache copy: cold, v0.17.47 and the overlap build both read exactly
+  130.73 GiB from the device for the 130.73 GiB archive, at the same wall time (7.05–7.37 against 7.13–7.25
+  GiB/s).
+- **The overlap alone made 8-GPU decompress slower**, 14.96–15.42 to 12.16–12.26 GiB/s in one binary. With the
+  consumer no longer bound, the reader ran ahead of GPU streams that already were, the queue let a ~57 GiB
+  backlog form, and every queued view pins its block: the view pool grew to ~900 blocks, and the 12 reader
+  threads spent 6.7–6.8 s of system time each first-touching 70 GiB at 4 KiB pages while the consumer starved.
+- **Huge-page blocks.** A block is now 2 MiB-aligned storage advised `MADV_HUGEPAGE`, behind the kernel 6.4
+  gate the O_DIRECT read pool already uses. v0.17.47 paid the same faults on a smaller pool (~475k faults and
+  3.8 s of system time per reader), so this helps without the overlap too: 8 GPUs 14.96–15.42 to 17.51–18.66
+  GiB/s in one binary, two runs each.
+- **GPU decompress queue: one batch per consumer, not four.** The queue was sized at 4x the pipeline's batch
+  parallelism, 8,192 frames and 64 GiB on 8 GPUs. Nothing filled it while the reader copied; the overlap build
+  filled it for no throughput. Queue slack 4 ran 17.59–18.15 GiB/s at 139–141 GiB peak RSS, slack 2 17.39–20.41
+  at 102–106 GiB, slack 1 18.53–18.69 at 77–84 GiB, two runs each. The default is now one batch per GPU stream
+  plus a frame per CPU thread, which is still at least any stream's batch, so a stream waiting for a full batch
+  keeps its escape. `--throttle-factor` still sets it explicitly, and the in-flight frame throttle keeps its
+  default of 4.
+- **Diagnostics.** The `-v` zero-copy line now also reports how many frames ended in the overlap and its size,
+  whether huge pages were advised, and how long the consumer waited for blocks.
+  `GZSTD_DEBUG_READER_NO_OVERLAP=1` and `GZSTD_DEBUG_READER_THP=0/1` are the A/B switches.
+
+### Measured
+
+v0.17.47 against v0.17.48 on the same host, 261 GiB archive, warm, output discarded, palindromic order, four
+runs each:
+
+| | v0.17.47 GiB/s (median) | v0.17.48 (median) | effect | max RSS |
+|---|---|---|---|---|
+| `-d --cpu-only` | 38.35–39.68 (39.55) | 57.47–66.06 (64.69) | **1.64x** | 10.5–10.9 to 16.1–16.5 GiB |
+| `-d --gpu-only`, 8 GPUs | 14.74–16.05 (15.20) | 16.14–19.27 (18.58) | **1.22x** | 59–61 to 77–88 GiB |
+| `-d` default mode, 8 GPUs | 12.96–16.15 (14.53) | 14.68–24.92 (18.61) | ranges overlap | 66–76 to 90–120 GiB |
+
+A third arm ran v0.17.48 with the old queue depth (`--throttle-factor 4 --throttle-frames 8192`): 18.69–20.61
+GiB/s at 138–142 GiB with `--gpu-only`, 14.66–18.48 at 99–151 GiB in default mode. The shallower queue's
+ranges overlap it in both modes.
+
+What binds next:
+- `--cpu-only`: the 12 reader threads, at 55–68% io each; the consumer now waits 1.0–1.9 s of a ~4 s run for
+  blocks.
+- 8 GPUs: the GPUs, with D2H the largest share of batch time. The GPU worker threads' ~1M minor faults each
+  are the output-buffer pool growing into new glibc arena heaps (`strace -k`); overdrafts past that pool are
+  counted but never reported.
+- Memory: GPU and default-mode runs hold more decompressed output in flight now that the reader is not the
+  bottleneck. The frame throttle (capped at half of RAM) and the view-pool cap (an eighth of RAM) bound it;
+  neither has been exercised on a small-RAM host.
+
+### Verified
+
+- Both builds compile, the GPU build warning-clean and the CPU-only build with its nine known warnings.
+- A 93-case overlap harness, every decode byte-identical: the six existing reader fixtures in four modes
+  (overlap, no overlap, copy path, one-block cap) plus GPU, each keeping its frame total, and without the
+  overlap reproducing v0.17.47's carried count exactly; eleven synthetic layouts built with skippable padding
+  to put a frame end exactly on a block boundary, on the overlap's last byte and one byte past it, a skippable
+  frame inside and past the overlap, and end of file inside it, where every view, overlap and carried count
+  matched a model of the reader with and without the overlap, and v0.17.47 matched the no-overlap model;
+  truncation, trailing garbage and a flipped byte inside the overlap failing with v0.17.47's exit code and
+  message; and a frame with no content size ending in the overlap taking the same streaming fallback.
+- The suite's ten parallel-reader cells pass verbatim. Two are new: the overlap against its control on the
+  existing fixture, and a frame ending on the overlap's last byte against the same frame one byte longer. Five
+  mutant builds each fail at least one of them: the overlap silently off (both), an off-by-one in the fit test
+  (the edge cell), the next block ignoring what the last frame took (both, and every round-trip), the control
+  ignored (the control cell), and a carry copying overlap bytes (the edge cell and the 128 MiB round-trip).
+- A `--no-index` tar archive extracts through the reader to an identical tree with and without the overlap
+  (3 frames in the overlap against 3 carried).
+- Cold `--cpu-only` on v0.17.48, overlap and huge pages: 7.41 GiB/s, 130.73 GiB read from the device.
+- Suite baselines: 438 default, 569 extensive, 342 CPU-only (no-GPU delta 96). The default suite has not been
+  run on this version.
 
 ## v0.17.47 — the decompress reader stops copying every frame
 

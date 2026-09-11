@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=436
-$EXTENSIVE && EXPECTED_TESTS=567
+EXPECTED_TESTS=438
+$EXTENSIVE && EXPECTED_TESTS=569
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -610,8 +610,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 #                      group.  MEASURED: 430 ran on a GPU+GDS host and 336 on
 #                      a CPU-only build at v0.17.46 -- 94 -- plus the two
 #                      v0.17.47 zero-copy GPU cells in the parallel-reader
-#                      section, which need a GPU (its four CPU cells run on
-#                      every host).  The GDS cells live INSIDE that
+#                      section, which need a GPU (its six CPU cells, four
+#                      zero-copy and two block-overlap, run on every host).  The GDS cells live INSIDE that
 #                      section, so this delta already contains them -- do not
 #                      also subtract the GDS delta, which is why the check
 #                      below uses elif.
@@ -624,8 +624,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 #                      absent, against the then-558 baseline.  The v0.17.43
 #                      archive-geometry cell and the two v0.17.45 real-fault
 #                      cells need a GPU but NOT GDS, so they RUN there: that
-#                      host's expected total is now 561 (567 - 6) and its
-#                      default 430.  DERIVED -- not yet measured on that host,
+#                      host's expected total is now 563 (569 - 6) and its
+#                      default 432.  DERIVED -- not yet measured on that host,
 #                      which is the next thing to confirm there.
 #                      The sixth GDS cell ("refuses a compat-mode host") still
 #                      RUNS and passes everywhere -- only its negative control is
@@ -639,11 +639,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # that run match the low default.  A baseline that is only ever derived is not a
 # baseline: measure every combination listed here.
 #
-# MEASURED COMBINATIONS: default+GPU+GDS (430, v0.17.46), default+noGPU (336,
+# MEASURED COMBINATIONS: default+GPU+GDS (436, v0.17.47), default+noGPU (336,
 # v0.17.43), extensive+GPU+GDS (559, v0.17.43), extensive+GPU+noGDS (552,
-# v0.17.42).  Derived: this baseline (436 / 567 -- those plus the six v0.17.47
-# zero-copy cells and, for extensive, the two v0.17.45 cells), default+noGPU
-# (340) and default+GPU+noGDS (430).
+# v0.17.42).  Derived: this baseline (438 / 569 -- those plus the two
+# v0.17.48 block-overlap cells and, for extensive, the six v0.17.47 zero-copy cells and
+# the two v0.17.45 cells), default+noGPU (342) and default+GPU+noGDS (432).
 # NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
 # -96 is the number to re-measure, not evidence of drift.
 EXPECTED_NOGPU_DELTA=96
@@ -2678,6 +2678,79 @@ elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-k.dec"; then
 else
   fail "frames larger than a block are carried across it" "output mismatch"
 fi
+# v0.17.48: BLOCK OVERLAP.  Each block buffer also holds the bytes that follow its block (the compress
+# bound of the first frame's content size, capped at half a block), so a frame that crosses the
+# block's end is still whole in one buffer and leaves as a view instead of being carried.  The
+# views run above already used it; GZSTD_DEBUG_READER_NO_OVERLAP=1 turns it off, and the frame
+# total must not move between the two.
+zc_ovl() {  # $1 = a -v stderr log; prints "frames_in_overlap overlap_mib", or nothing
+  grep -oE '[0-9]+ ended in the [0-9]+ MiB overlap' "$1" 2>/dev/null | head -1 | grep -oE '[0-9]+' | paste -sd' ' -
+}
+read -r zv_v zv_c zv_k <<< "$(zc_counts "$TMPDIR/zc-v.log")"
+read -r zo_n zo_mib <<< "$(zc_ovl "$TMPDIR/zc-v.log")"
+GZSTD_DEBUG_READER_NO_OVERLAP=1 "$GZSTD" -d -v --cpu-only -c "$TMPDIR/mt-1.zst" 2>"$TMPDIR/zc-o.log" >"$TMPDIR/zc-o.dec"
+read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-o.log")"
+read -r zn_n zn_mib <<< "$(zc_ovl "$TMPDIR/zc-o.log")"
+if [[ -z "${zo_n:-}" || -z "${zn_n:-}" || -z "${zc_v:-}" || -z "${zv_v:-}" ]]; then
+  fail "block overlap turns boundary frames into views" "no overlap counts in the -v line: NOT TESTED"
+elif (( zo_n == 0 || zv_c != 0 )); then
+  fail "block overlap turns boundary frames into views" "overlap=$zo_n carried=$zv_c (want boundary frames in the overlap, none carried)"
+elif (( zn_n != 0 || zn_mib != 0 || zc_c == 0 || zc_v + zc_c != zv_v )); then
+  fail "block overlap turns boundary frames into views" \
+       "no-overlap control: overlap=$zn_n (${zn_mib} MiB) views=$zc_v carried=$zc_c, want carried > 0 and views + carried = $zv_v"
+elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-o.dec"; then
+  pass "block overlap turns boundary frames into views" "($zo_n in the ${zo_mib} MiB overlap; $zc_c carried without it)"
+else
+  fail "block overlap turns boundary frames into views" "no-overlap output mismatch"
+fi
+
+# The overlap's EDGE, placed to the byte: a frame ending on the last byte block 1's buffer holds
+# must be a view, and the same frame one byte longer must be carried.  Both decode to the same
+# bytes either way, so an off-by-one in the fit test, the read length or the overlap size
+# changes nothing but the counts -- which are what this asserts.  Skippable padding positions
+# the frame; the first frame is 1 MiB, so the overlap is 2 MiB and block 1's buffer ends at 130 MiB.
+spin "overlap edge fixtures"
+head -c 1M  /dev/urandom > "$TMPDIR/ov-r1.bin"
+head -c 16M /dev/urandom > "$TMPDIR/ov-r16.bin"
+"$GZSTD" -q -f --cpu-only --no-index --chunk-size=1  "$TMPDIR/ov-r1.bin"  -o "$TMPDIR/ov-r1.zst"  2>/dev/null
+"$GZSTD" -q -f --cpu-only --no-index --chunk-size=16 "$TMPDIR/ov-r16.bin" -o "$TMPDIR/ov-r16.zst" 2>/dev/null
+spin_done
+ov_skippable() {  # $1 = total size in bytes (>= 8): one skippable frame of exactly that size
+  local n=$(( $1 - 8 ))
+  printf '\x50\x2a\x4d\x18'
+  printf "\\x$(printf %02x $(( n & 255 )))\\x$(printf %02x $(( (n >> 8) & 255 )))\\x$(printf %02x $(( (n >> 16) & 255 )))\\x$(printf %02x $(( (n >> 24) & 255 )))"
+  head -c "$n" /dev/zero
+}
+ov_build() {  # $1 = archive to write, $2 = file offset at which the 8th frame must END
+  local s1 s16 pad i
+  s1=$(stat -c %s "$TMPDIR/ov-r1.zst"); s16=$(stat -c %s "$TMPDIR/ov-r16.zst")
+  pad=$(( $2 - s16 - s1 - 6 * s16 ))
+  { cat "$TMPDIR/ov-r1.zst"; for i in 1 2 3 4 5 6; do cat "$TMPDIR/ov-r16.zst"; done
+    ov_skippable "$pad"; cat "$TMPDIR/ov-r16.zst" "$TMPDIR/ov-r16.zst" "$TMPDIR/ov-r1.zst"; } > "$1"
+}
+{ cat "$TMPDIR/ov-r1.bin"; for i in 1 2 3 4 5 6 7 8; do cat "$TMPDIR/ov-r16.bin"; done; cat "$TMPDIR/ov-r1.bin"; } > "$TMPDIR/ov-src.bin"
+ov_edge=$(( 130 * 1048576 ))
+ov_build "$TMPDIR/ov-edge.zst" "$ov_edge"
+ov_build "$TMPDIR/ov-past.zst" "$(( ov_edge + 1 ))"
+"$GZSTD" -d -v --cpu-only -c "$TMPDIR/ov-edge.zst" 2>"$TMPDIR/zc-e.log" >"$TMPDIR/zc-e.dec"
+read -r ze_v ze_c ze_k <<< "$(zc_counts "$TMPDIR/zc-e.log")"; read -r ze_n ze_mib <<< "$(zc_ovl "$TMPDIR/zc-e.log")"
+"$GZSTD" -d -v --cpu-only -c "$TMPDIR/ov-past.zst" 2>"$TMPDIR/zc-p.log" >"$TMPDIR/zc-p.dec"
+read -r zp_v zp_c zp_k <<< "$(zc_counts "$TMPDIR/zc-p.log")"; read -r zp_n zp_mib <<< "$(zc_ovl "$TMPDIR/zc-p.log")"
+# Ten data frames.  The 4th crosses 64 MiB by ~1 MiB, so it is in block 0's overlap in both
+# archives; the 8th is the one placed on the edge.
+if [[ -z "${ze_v:-}" || -z "${ze_n:-}" || -z "${zp_v:-}" || -z "${zp_n:-}" ]]; then
+  fail "a frame ending on the overlap's last byte is a view" "no zero-copy counts: NOT TESTED"
+elif [[ "${ze_mib:-}" != 2 ]]; then
+  fail "a frame ending on the overlap's last byte is a view" "overlap is ${ze_mib} MiB, the fixture assumes 2: NOT TESTED"
+elif (( ze_v != 10 || ze_c != 0 || ze_n != 2 )); then
+  fail "a frame ending on the overlap's last byte is a view" "on the edge: views=$ze_v carried=$ze_c overlap=$ze_n, want 10/0/2"
+elif (( zp_v != 9 || zp_c != 1 || zp_n != 1 )); then
+  fail "a frame ending on the overlap's last byte is a view" "one byte past: views=$zp_v carried=$zp_c overlap=$zp_n, want 9/1/1"
+elif files_match "$TMPDIR/ov-src.bin" "$TMPDIR/zc-e.dec" && files_match "$TMPDIR/ov-src.bin" "$TMPDIR/zc-p.dec"; then
+  pass "a frame ending on the overlap's last byte is a view" "(one byte later it is carried)"
+else
+  fail "a frame ending on the overlap's last byte is a view" "output mismatch"
+fi
 if has_gpu 2>/dev/null; then
   "$GZSTD" -d -v --gpu-only -c "$TMPDIR/mt-1.zst" 2>"$TMPDIR/zc-g.log" >"$TMPDIR/zc-g.dec"
   read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-g.log")"
@@ -2722,7 +2795,7 @@ else
   skip "GPU decompress reads zero-copy views" "no GPU"
   skip "GPU fault rescue with zero-copy views in flight" "no GPU"
 fi
-rm -f "$TMPDIR"/zc-*.log "$TMPDIR"/zc-*.dec
+rm -f "$TMPDIR"/zc-*.log "$TMPDIR"/zc-*.dec "$TMPDIR"/ov-*
 
 # Confirm the parallel path actually engaged (not silently single-threaded).
 if "$GZSTD" -d -k -f -v --cpu-only "$TMPDIR/mt-1.zst" -o /dev/null 2>&1 \

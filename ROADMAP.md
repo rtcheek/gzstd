@@ -333,6 +333,29 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.48: the reader's last serial copy, and the memory a faster reader exposed
+
+v0.17.47's frames that cross a 64 MiB block boundary were still copied on the ordered consumer. v0.17.48
+removes that copy with a block overlap, then fixes the two costs it exposed: huge-page view blocks and a GPU
+decompress queue one batch deep (CHANGELOG v0.17.48). `--cpu-only` 39.55 to 64.69 GiB/s median (1.64x),
+8 GPUs 15.20 to 18.58 (1.22x).
+
+**Open from that work:**
+- **`--cpu-only`: the 12 reader threads bind**, at 55–68% io each, while the consumer waits 1.0–1.9 s of a
+  ~4 s run for blocks. The reader count is a static 12 by default; `--adapt` can scale it. Measure the reader
+  count on this path before touching the default, which was left alone on compress for good reasons.
+- **8 GPUs: the GPUs bind.** No stage is saturated and D2H (pageable output) is the largest share of batch
+  time. The GPU worker threads' ~1M faults each are identified but not fixed: the output-buffer pool growing
+  into new glibc arena heaps. `out_pool_waits` counts overdrafts past that pool and nothing reports it; report
+  it before tuning the pool.
+- **In-flight memory.** With the reader no longer the bottleneck, default-mode 8-GPU runs peak at 90–120 GiB
+  (66–76 in v0.17.47), bounded by the frame throttle (8,192 frames, capped at half of RAM) and the view-pool cap
+  (an eighth of RAM). Neither bound has been exercised on a small-RAM host.
+- **Huge pages on a fragmented host.** `defrag=madvise` makes an advised allocation compact synchronously; only
+  measured on a host with most of its memory free.
+- **`--adapt`'s reader-pool controller** still has the per-reader normalisation blind spot (carried from
+  v0.17.47): state table first.
+
 ## SHIPPED v0.17.47: the decompress reader stops copying every frame — and what binds next
 
 The near-12 GiB/s 8-GPU decompress ceiling, and the near-15 GiB/s `--cpu-only` one, was the parallel prefetch
@@ -341,13 +364,14 @@ as views into the block (CHANGELOG v0.17.47): `--cpu-only` 14.66 to 40.08 GiB/s 
 (1.42x).
 
 **Open from that work:**
-- **`--cpu-only`: the consumer binds again**, at 73–78% of its thread, on the 12.5% of frames that cross a
-  64 MiB block boundary. Each is still copied piecemeal into a freshly reserved carry buffer, which may cost
+- **RESOLVED v0.17.48 (block overlap; profiled first: memcpy, not faults).** `--cpu-only`: the consumer binds
+  again, at 73–78% of its thread, on the 12.5% of frames that cross a 64 MiB block boundary. Each is still copied piecemeal into a freshly reserved carry buffer, which may cost
   first-touch page faults as much as memcpy (not yet profiled). Candidates: a recycled carry buffer; sizing
   the frame by walking zstd block headers across the boundary so it is copied once; blocks aligned to frames
   using the seek table, subject to its trust rules.
-- **8 GPUs: the GPU worker threads** take about a million minor page faults each per 261 GiB run and wait in
-  `munmap`, both present before v0.17.47. The source is not identified: output buffers are already pooled and
+- **IDENTIFIED v0.17.48, not fixed (output-buffer pool growth into new glibc arena heaps).** 8 GPUs: the GPU
+  worker threads take about a million minor page faults each per 261 GiB run and wait in `munmap`, both
+  present before v0.17.47. The source is not identified: output buffers are already pooled and
   gzstd already sets `M_MMAP_THRESHOLD` and `M_TRIM_THRESHOLD`.
 - **`--adapt`'s reader-pool controller** classifies SOURCE_BOUND from the same reader counters normalised per
   reader thread, so it has the blind spot the `[READER]` line had. Changing it is an `--adapt` policy change:
