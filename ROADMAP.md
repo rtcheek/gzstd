@@ -333,6 +333,29 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.49: the GPU bringup decision stops sampling before the work starts
+
+Default-mode decompress to stdout on the 8-GPU host ran at 25–26 GiB/s against 58–63 for `--cpu-only`: the
+hybrid bringup sampler decided on one 0.15 s window that closed before the parallel reader's workers had
+finished a frame, so it always engaged, and the run waited for a bringup it never used. v0.17.49 repeats the
+window (CHANGELOG v0.17.49): 8 GPUs 28.25 to 60.25 GiB/s median, one GPU 28.94 to 55.12.
+
+**Open from that work:**
+- **NEXT: a device-count-aware guard.** `GPU_INIT_GUARD_SEC` is 4.0 s, but bringup measured 2.07–2.23 s for one
+  GPU, 2.93–3.14 for two, 4.84–5.39 for four and 9.15–9.56 for eight. The decision runs before the first CUDA
+  call, so the device count has to come from somewhere that does not initialise CUDA. The constants must hold on
+  the 2-GPU workstation too, not only here.
+- **Bringup costs about a second per device.** Find where: if gzstd brings devices up one after another and the
+  driver does not force that, doing them in parallel helps every GPU run. The bringup thread spent 7.5 s of
+  system time in the NVIDIA driver on 8 GPUs (`os_acquire_rwlock_write`).
+- **An engaged GPU slows a warm decompress on this host** (one GPU: 38.8–47.3 against 58.4–63.0 GiB/s). That is
+  a hybrid scheduler policy question: state table first.
+- **`--cpu-only` reader count, measured:** 48 readers 66.27–71.40 GiB/s against 61.07–64.83 for the default
+  12 (+10%, non-overlapping) at +7 GiB RSS; the consumer then blocks on the queue 30–45% of its run.
+- **More than 96 decompress threads collapses.** `-T 128` ran 40.86–51.55 GiB/s with 358–601 s of system time;
+  `-T 192` was bimodal, 28.36–66.52 with up to 1,355 s. The automatic cap of 96 holds it off; `-T 0` would not.
+  Unattributed.
+
 ## SHIPPED v0.17.48: the reader's last serial copy, and the memory a faster reader exposed
 
 v0.17.47's frames that cross a 64 MiB block boundary were still copied on the ordered consumer. v0.17.48
@@ -341,8 +364,8 @@ decompress queue one batch deep (CHANGELOG v0.17.48). `--cpu-only` 39.55 to 64.6
 8 GPUs 15.20 to 18.58 (1.22x).
 
 **Open from that work:**
-- **`--cpu-only`: the 12 reader threads bind**, at 55–68% io each, while the consumer waits 1.0–1.9 s of a
-  ~4 s run for blocks. The reader count is a static 12 by default; `--adapt` can scale it. Measure the reader
+- **MEASURED, see SHIPPED v0.17.49 (+10% at 48 readers).** `--cpu-only`: the 12 reader threads bind, at 55–68%
+  io each, while the consumer waits 1.0–1.9 s of a ~4 s run for blocks. The reader count is a static 12 by default; `--adapt` can scale it. Measure the reader
   count on this path before touching the default, which was left alone on compress for good reasons.
 - **8 GPUs: the GPUs bind.** No stage is saturated and D2H (pageable output) is the largest share of batch
   time. The GPU worker threads' ~1M faults each are identified but not fixed: the output-buffer pool growing

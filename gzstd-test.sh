@@ -607,11 +607,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # known deltas makes the note mean that again, on every host.
 #
 #   no GPU        -96  the whole "GPU acceleration" section is skipped as a
-#                      group.  MEASURED: 430 ran on a GPU+GDS host and 336 on
-#                      a CPU-only build at v0.17.46 -- 94 -- plus the two
-#                      v0.17.47 zero-copy GPU cells in the parallel-reader
-#                      section, which need a GPU (its six CPU cells, four
-#                      zero-copy and two block-overlap, run on every host).  The GDS cells live INSIDE that
+#                      group, plus the two zero-copy GPU cells in the
+#                      parallel-reader section (its six CPU cells, four
+#                      zero-copy and two block-overlap, run on every host).
+#                      MEASURED at v0.17.48: 438 ran on a GPU+GDS host and 342
+#                      on a CPU-only build.  The GDS cells live INSIDE that
 #                      section, so this delta already contains them -- do not
 #                      also subtract the GDS delta, which is why the check
 #                      below uses elif.
@@ -639,11 +639,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # that run match the low default.  A baseline that is only ever derived is not a
 # baseline: measure every combination listed here.
 #
-# MEASURED COMBINATIONS: default+GPU+GDS (436, v0.17.47), default+noGPU (336,
-# v0.17.43), extensive+GPU+GDS (559, v0.17.43), extensive+GPU+noGDS (552,
-# v0.17.42).  Derived: this baseline (438 / 569 -- those plus the two
-# v0.17.48 block-overlap cells and, for extensive, the six v0.17.47 zero-copy cells and
-# the two v0.17.45 cells), default+noGPU (342) and default+GPU+noGDS (432).
+# MEASURED COMBINATIONS: default+GPU+GDS (438, v0.17.48), default+noGPU (342,
+# v0.17.48), extensive+GPU+GDS (559, v0.17.43), extensive+GPU+noGDS (552,
+# v0.17.42).  Derived: extensive 569 (559 plus the two v0.17.45 real-fault cells,
+# the six v0.17.47 zero-copy cells and the two v0.17.48 block-overlap cells) and
+# default+GPU+noGDS (432).
 # NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
 # -96 is the number to re-measure, not evidence of drift.
 EXPECTED_NOGPU_DELTA=96

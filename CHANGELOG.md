@@ -1,12 +1,75 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.48  
+**Covers:** v0.9.50 → v0.17.49  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.49 — the GPU bringup decision stops sampling before the work starts
+
+**Default-mode decompress to stdout ran at under half of `--cpu-only` on a many-core GPU host.** Hybrid mode
+brings the GPUs up in the background only if the CPU pool will not finish first, and decided that by
+extrapolating the pipeline's rate over a single 0.15 s window after a 0.10 s warm-up. On the parallel prefetch
+decompress reader that window closes before the workers have finished a frame, so it predicted thousands of
+seconds remaining and engaged every time.
+
+### How it was found
+
+- Default mode on the 261 GiB archive, stdout to `/dev/null`, 8 GPUs: 25.1–25.9 GiB/s against 58.4–63.0 for
+  `--cpu-only`, with the same 96 CPU threads and not one frame on a GPU. The hybrid scheduler's per-tick counts
+  showed all 16,686 frames done in the first 7 of 16 ticks at `--cpu-only` speed; the rest of the run waited
+  for an 8-GPU bringup it never used (`file already decompressed by CPU during init; skipping GPU`).
+- The decision itself logged `0% done at 252 ms, windowed rate -> 29869.44 s remaining (guard 4.0 s) ->
+  engage`.
+- With one GPU the bringup finished in time, the card engaged, and the run fell to 38.8–47.3 GiB/s: on this
+  host a warm decompress is faster on the CPU.
+- Regular-file output was not affected. The warm-input rule already sends a warm archive to `--cpu-only`, and it
+  deliberately skips non-regular sinks, where a slow consumer bounds the run instead.
+
+### The change
+
+- The sampler repeats its window. A window that predicts the job ends within the guard skips at once, because a
+  window taken during the startup ramp understates the rate. An engage waits until the rate stops rising (a
+  window within 1.25x of the one before) or until half the guard has passed, then decides on the latest window.
+- The log line keeps its format.
+
+### Measured
+
+v0.17.48 against v0.17.49 on the same host, 261 GiB archive, warm, default mode, stdout discarded, palindromic
+order, four runs each:
+
+| | v0.17.48 GiB/s (median) | v0.17.49 (median) | effect |
+|---|---|---|---|
+| 8 GPUs | 27.21–29.77 (28.25) | 56.85–62.43 (60.25) | **2.13x** |
+| 2 GPUs (`--gpu-devices=2`) | 49.35–55.17 (53.05) | 56.78–61.91 (58.12) | **1.10x** |
+| 1 GPU (`--gpu-devices=1`) | 23.95–39.79 (28.94) | 52.95–59.73 (55.12) | **1.90x**, max RSS 46–54 to 19–24 GiB |
+
+`--cpu-only` on the same runs: 59.36–63.44 GiB/s (63.22). v0.17.49 skips the bringup at about 0.40 s, having
+predicted 1.4–3.2 s left.
+
+Engagement where it pays is kept:
+- A cold decompress of the same archive engages at 706 ms on a settled rate, 23.6 s left (v0.17.48: 252 ms).
+- A cold compress of a 130 GiB tar engages at 1,465 ms, 52.2 s left (v0.17.48: 252 ms, no measurable progress).
+- A 3 GiB compress skips during warm-up on both.
+
+An engage now costs up to half the guard in decision time: the GPUs start about 1.2 s later on a 52 s job.
+
+What remains:
+- The guard is a fixed 4.0 s, and bringup on this host measured 2.07–2.23 s for one GPU, 2.93–3.14 for two,
+  4.84–5.39 for four and 9.15–9.56 for eight (a 1 MiB file). A job with 5–9 s left still engages eight GPUs it
+  cannot use.
+- An archive whose head is cached and whose tail is not can still skip wrongly, as the single window could.
+- The sampling-budget and no-measurable-progress branches did not run in any measurement.
+
+### Verified
+
+- Both builds compile, the GPU build warning-clean and the CPU-only build with its nine known warnings.
+- The suite's `bringup sample skips the GPU only when the job outruns cuInit` cell passes on v0.17.48 and on this
+  build.
+- The default suite passes, 438 of 438.
 
 ## v0.17.48 — the reader's last serial copy, and the memory a faster reader exposed
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.48";
+static constexpr const char * GZSTD_VERSION = "0.17.49";
 //
 // Architecture overview:
 //
@@ -7307,11 +7307,15 @@ static uint64_t gpu_min_useful_bytes(const Options & opt)
 // already uses to decide whether to engage its GPU streams; kept identical so
 // the two lazy-engagement decisions can't disagree about what cuInit costs.
 static constexpr double GPU_INIT_GUARD_SEC = 4.0;
-// Startup ramp to discard before trusting the pipeline's rate, then the window
-// the rate is measured over.  Together ~0.25 s — trivial against a multi-second
-// cuInit, and the CPU pool is doing real work throughout.
+// Startup ramp to discard before trusting the pipeline's rate, then the length of
+// each window the rate is measured over.  Windows repeat until the decision is
+// safe (see gpu_bringup_worth_it), so the CPU pool is doing real work throughout
+// and a job that does want the GPU starts it at most half a guard later.
 static constexpr double GPU_SAMPLE_WARMUP_SEC = 0.10;
 static constexpr double GPU_SAMPLE_WINDOW_SEC = 0.15;
+// A window whose rate is within this factor of the previous window's means the
+// startup ramp is over, and that rate is the one to extrapolate.
+static constexpr double GPU_SAMPLE_SETTLED = 1.25;
 
 // Is bringing the GPU up still worth it?  Called from the background bringup
 // thread BEFORE the first CUDA call, so a "no" costs nothing at all.
@@ -7402,19 +7406,50 @@ static bool gpu_bringup_worth_it(const Options & opt,
   // 151 ms covered 2% of the source and predicted 7.4 s remaining for a job
   // that in fact had ~1.4 s to go — which would have engaged a GPU the run
   // could not use.  So skip the ramp, then measure a RATE over a window.
+  //
+  // ONE WINDOW WAS NOT ENOUGH (v0.17.49).  On the parallel prefetch decompress reader the ramp
+  // outlasts the fixed warm-up: workers finish their first frames only after the
+  // readers have filled their first blocks.  A 261 GiB warm decompress that the CPU
+  // pool finishes in ~4 s logged "0% done at 252 ms, windowed rate -> 29869 s
+  // remaining -> engage", and with stdout output (hybrid: the warm-input rule skips
+  // non-regular sinks) the run then waited out an 8-GPU bringup it never used --
+  // 25.1-25.9 GiB/s against 58.4-63.0 for --cpu-only; with one GPU the card came up
+  // in time and cost ~25% instead.
+  //
+  // So windows repeat, and the two answers need different evidence.  A window taken
+  // during the startup ramp understates the steady rate, so the first window that
+  // predicts the job ends within the guard is a safe skip -- unless the rate later
+  // FALLS, as on an archive whose head is cached and whose tail is not; the single
+  // window this replaces had that exposure too.  An engage waits until the rate
+  // stops rising (a window within GPU_SAMPLE_SETTLED of the one before), or until
+  // half the guard has passed: a job still running then wants the GPU, and starting
+  // it that much later costs it little.  MEASURED on the same archive and host,
+  // four runs each: 8 GPUs 27.2-29.8 -> 56.9-62.4 GiB/s (skip at ~0.40 s), one GPU
+  // 24.0-39.8 -> 53.0-59.7, and a cold decompress still engages (settled at 706 ms).
   if (!hold(GPU_SAMPLE_WARMUP_SEC)) return say(false, "run ended during warm-up", 0.0, frac());
-  if (frac() >= 0.98)              return say(false, "already done", 0.0, frac());
-  const double p1 = frac();
-  const double t1 = secs_in();
-  if (!hold(GPU_SAMPLE_WARMUP_SEC + GPU_SAMPLE_WINDOW_SEC))
-    return say(false, "run ended during sample", 0.0, frac());
-  const double p2 = frac();
-  const double t2 = secs_in();
-  if (p2 >= 0.98) return say(false, "already done", 0.0, p2);
-  const double rate = (p2 - p1) / std::max(1e-6, t2 - t1);   // fraction per second
-  if (rate <= 0.0) return say(true, "no measurable progress", -1.0, p2);
-  const double remaining = (1.0 - p2) / rate;
-  return say(remaining > guard_sec, "windowed rate", remaining, p2);
+  double p_prev = frac();
+  double t_prev = secs_in();
+  if (p_prev >= 0.98) return say(false, "already done", 0.0, p_prev);
+  const double budget = GPU_SAMPLE_WARMUP_SEC + std::max(GPU_SAMPLE_WINDOW_SEC, 0.5 * guard_sec);
+  double prev_rate = 0.0;
+  for (;;) {
+    if (!hold(t_prev + GPU_SAMPLE_WINDOW_SEC))
+      return say(false, "run ended during sample", 0.0, frac());
+    const double p = frac();
+    const double t = secs_in();
+    if (p >= 0.98) return say(false, "already done", 0.0, p);
+    const double rate = (p - p_prev) / std::max(1e-6, t - t_prev);   // fraction per second
+    const double remaining = (rate > 0.0) ? (1.0 - p) / rate : -1.0;
+    if (rate > 0.0 && remaining <= guard_sec) return say(false, "windowed rate", remaining, p);
+    if (rate > 0.0 && prev_rate > 0.0 && rate <= prev_rate * GPU_SAMPLE_SETTLED)
+      return say(true, "settled rate", remaining, p);
+    if (t >= budget)
+      return (rate > 0.0) ? say(true, "rate at sampling budget", remaining, p)
+                          : say(true, "no measurable progress", -1.0, p);
+    prev_rate = rate;
+    p_prev = p;
+    t_prev = t;
+  }
 }
 
 #endif  // HAVE_NVCOMP  (GPU engagement helpers)
