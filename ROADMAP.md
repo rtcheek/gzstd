@@ -333,6 +333,28 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.47: the decompress reader stops copying every frame — and what binds next
+
+The near-12 GiB/s 8-GPU decompress ceiling, and the near-15 GiB/s `--cpu-only` one, was the parallel prefetch
+reader's single ordered consumer copying every frame out of its 64 MiB block. v0.17.47 hands those frames out
+as views into the block (CHANGELOG v0.17.47): `--cpu-only` 14.66 to 40.08 GiB/s (2.73x), 8 GPUs 12.03 to 17.09
+(1.42x).
+
+**Open from that work:**
+- **`--cpu-only`: the consumer binds again**, at 73–78% of its thread, on the 12.5% of frames that cross a
+  64 MiB block boundary. Each is still copied piecemeal into a freshly reserved carry buffer, which may cost
+  first-touch page faults as much as memcpy (not yet profiled). Candidates: a recycled carry buffer; sizing
+  the frame by walking zstd block headers across the boundary so it is copied once; blocks aligned to frames
+  using the seek table, subject to its trust rules.
+- **8 GPUs: the GPU worker threads** take about a million minor page faults each per 261 GiB run and wait in
+  `munmap`, both present before v0.17.47. The source is not identified: output buffers are already pooled and
+  gzstd already sets `M_MMAP_THRESHOLD` and `M_TRIM_THRESHOLD`.
+- **`--adapt`'s reader-pool controller** classifies SOURCE_BOUND from the same reader counters normalised per
+  reader thread, so it has the blind spot the `[READER]` line had. Changing it is an `--adapt` policy change:
+  state table first.
+- **Memory.** Views raise 8-GPU peak RSS by about 16 GiB (51–58 against 34–41 GiB). The cap bounds them at an
+  eighth of available RAM, but no small-RAM host has exercised it yet.
+
 ## OPEN after the v0.17.40–44 review arc
 
 Three residuals from seven review rounds on `--gds-only -d`. None is a defect in
@@ -408,8 +430,8 @@ arm (eight H100s: 17.3–24.2% against 31.9–45.0%), so it did not serve its st
 launch-style dependency (it only ran when device ordering had initialised NVML) went with it.
 
 **Open from that work:**
-- **An upstream cap near 12 GiB/s on the 8-GPU host.** Unscaled `-d --gpu-only` is flat from two to
-  eight cards (10.5–12.7 GiB/s) with NVML reading 42–80% and ~4.9 cores. Not investigated.
+- RESOLVED v0.17.47: the cap near 12 GiB/s on the 8-GPU host was the parallel reader's single ordered
+  consumer copying every frame. See "SHIPPED v0.17.47" above.
 - **Two-card linearity cannot be read from the device-count curve.** One H100 ran 3.68 GiB/s and two
   ran 10.45 (2.84x), because other resources (throttle budget, reader fan-out) follow the device
   count. The ~9% two-card residual seen on the 11 GiB cards needs per-card arms with those held.

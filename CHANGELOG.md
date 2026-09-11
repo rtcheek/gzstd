@@ -1,11 +1,92 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.46  
+**Covers:** v0.9.50 → v0.17.47  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.17.47 — the decompress reader stops copying every frame
+
+**Large decompresses were capped by one thread.** The parallel prefetch reader (v0.13.71) reads 64 MiB
+blocks on up to 12 threads, but a single ordered consumer then parses the frames and, until now, copied
+every frame out of its block into its own buffer before queueing it. v0.13.71 said so at the time: "the
+per-frame copy stays on the consumer (a later zero-copy pass can remove it)". That pass never came, and
+the copy became the ceiling of every large decompress.
+
+### How it was found
+
+Investigating why 8-GPU decompress stayed flat near 12 GiB/s from two cards to eight:
+- The GPU streams were idle about 70% of the time at eight cards, nvCOMP compute was only 6–17% of stream
+  time, the throttle never blocked, and the writer was starved.
+- A per-thread `/proc` profile put one thread at 82% of a core on GPU runs and 91% on `--cpu-only` (on-CPU in
+  29 of 30 samples) while the 96 CPU decompress threads barely ran. That thread is the main thread, which
+  runs the consumer loop.
+- The `[READER]` line said "task-copy 6% per thread": it divided the consumer's time by the 12 reader
+  threads, so the one diagnostic built to show a copy-bound reader hid it.
+- `--pinned on` halved 8-GPU decompress (11.1–11.8 to 5.6–6.0 GiB/s): one more host copy of the output cost
+  half the throughput. Host memory copies are the scarce resource.
+
+### The change
+
+- **Frames become views.** Blocks are refcounted buffers from a recycling pool, so their pages stay faulted
+  in. A frame wholly inside a block leaves as a view that holds the block until the frame is released; the
+  reader's slot drops its reference once the block is parsed. A frame crossing a block boundary is assembled
+  in the carry buffer as before, now reserved once and moved into its task instead of copied a second time.
+- **Memory cap.** A view pins its whole block and consumers finish out of order, so views can hold far more
+  than the frames themselves (+15–25 GiB peak RSS on 8-GPU runs with no cap). Past the cap the consumer copies
+  a block's frames instead, the old behaviour, which frees that block as soon as it is parsed. It is
+  deliberately not a wait: a reader blocked on a free block could deadlock a GPU stream waiting for a full
+  batch whose queued views are what pin the blocks. The cap is an eighth of available RAM counted in blocks,
+  the same budget the reader ring takes. Measured on 8 GPUs, median GiB/s of 3 alternating reps: copy path
+  11.29, cap 32 11.86, 64 14.86, 128 15.56, 256 16.48, 512 17.19, uncapped 16.65, with views peaking at
+  310–340 blocks. The default (about 2,900 blocks on that host) never binds there, and a small machine degrades
+  toward the copy path rather than toward swap.
+- **Backpressure unchanged.** The task queue's byte ceiling counts a view's frame bytes, which is what the copy
+  counted.
+- **Diagnostics.** `-v` prints `[READER] zero-copy: N frames as views, N carried across block boundaries, N
+  copied ...; peak N blocks alive, cap N`. For this reader the `[READER]` line now reports parse, copy and
+  blocked time against the consumer's one thread, with io still per reader thread; its saturation verdict uses
+  0.70, because a consumer measured at 91% CPU read 75–78% of timed work.
+- `GZSTD_DEBUG_READER_COPY=1` restores the per-frame copy, and `GZSTD_DEBUG_ZC_MAX_BLOCKS=N` overrides the cap.
+
+### Measured
+
+v0.17.46 against v0.17.47 on the same host, 261 GiB archive (16,686 frames), warm, output discarded,
+balanced A-B-B-A order:
+
+| | v0.17.46 GiB/s (median) | v0.17.47 (median) | effect | max RSS |
+|---|---|---|---|---|
+| `-d --cpu-only` | 13.48–17.24 (14.66) | 39.80–43.82 (40.08) | **2.73x** | 9–11 GiB, unchanged |
+| `-d --gpu-only`, 8 GPUs | 11.24–12.30 (12.03) | 16.51–18.10 (17.09) | **1.42x** | 34–41 to 51–58 GiB |
+
+`--cpu-only` decompress now uses 24–28 cores instead of 10–13. What binds next:
+- `--cpu-only`: the consumer again, at 73–78% of its thread, now on the 12.5% of frames that cross a block
+  boundary.
+- 8 GPUs: the GPU worker threads, which take about a million minor page faults each per run and wait in
+  `munmap`. That was already true before this change; it is now their busiest work.
+
+### Verified
+
+- Both builds compile, the GPU build warning-clean and the CPU-only build with its nine known warnings.
+- A 27-case correctness matrix, every case byte-identical: 1, 16, 64 and 128 MiB frames plus incompressible
+  128 MiB frames (the carry path), each with views, with the copy path forced and with the cap forced to one
+  block, on CPU and GPU; hybrid; two readers; a 3 GiB corpus; a GPU fault rescue with views in flight; and
+  truncated and trailing-garbage archives failing with the same exit code and message as the copy path.
+- `-t` reads views on CPU and GPU. An archive with one byte flipped fails `-t` with exit 4 under views and
+  under the copy path, on both backends, with the same message on CPU.
+- `-d --tar` on an indexed archive extracts through its own parallel path and never reaches this reader. A
+  211 MiB `--no-index` tar archive does (41 views, 3 carried), and extracts a tree identical to the source
+  with views and with the copy path.
+- Six new suite cells in the parallel-reader section (four CPU, two GPU), mutation-tested against a build
+  whose views dropped their block reference, which ignored the cap and `GZSTD_DEBUG_READER_COPY`, and which
+  counted carried frames as copies. All six fail there and pass on this build. The first version of the
+  memory-cap cell passed that build, because it only asserted that some frames were copied and the miscount
+  supplied them; it now asserts that views plus copies equal the in-block frame count.
+- Suite baselines: 436 default, 567 extensive, 340 CPU-only (no-GPU delta 96). The default suite has not been
+  run on this version.
 
 
 ## v0.17.46 — the batch scaler is gone

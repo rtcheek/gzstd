@@ -20,9 +20,9 @@ persists per-machine verdicts to `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json
 ```bash
 cmake -B build && cmake --build build -j$(nproc)     # GPU build (USE_NVCOMP=ON)
 cmake -B build-cpu -DUSE_NVCOMP=OFF && cmake --build build-cpu -j$(nproc)
-./gzstd-test.sh ./build/gzstd      # THE NORMAL RUN  (expect 430/0 on a GPU+GDS host)
-./gzstd-test.sh ./build-cpu/gzstd  # CPU-only        (expect 336/0)
-./gzstd-test.sh -e ./build/gzstd   # opt-in          (expect 561/0)
+./gzstd-test.sh ./build/gzstd      # THE NORMAL RUN  (expect 436/0 on a GPU+GDS host)
+./gzstd-test.sh ./build-cpu/gzstd  # CPU-only        (expect 340/0)
+./gzstd-test.sh -e ./build/gzstd   # opt-in          (expect 567/0)
 ```
 
 **The default run is the normal one.** Use `-e` only when the change is substantial enough

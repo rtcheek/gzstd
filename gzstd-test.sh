@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=430
-$EXTENSIVE && EXPECTED_TESTS=561
+EXPECTED_TESTS=436
+$EXTENSIVE && EXPECTED_TESTS=567
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -606,11 +606,12 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # signal that is supposed to mean "a test was added or removed".  Subtracting the
 # known deltas makes the note mean that again, on every host.
 #
-#   no GPU        -94  the whole "GPU acceleration" section is skipped as a
-#                      group.  MEASURED: 428 ran on a GPU+GDS host at v0.17.45
-#                      and 336 on a CPU-only build at v0.17.43, with no cell
-#                      added in between (92), plus the two v0.17.45 real-fault
-#                      cells, which need a GPU.  The GDS cells live INSIDE that
+#   no GPU        -96  the whole "GPU acceleration" section is skipped as a
+#                      group.  MEASURED: 430 ran on a GPU+GDS host and 336 on
+#                      a CPU-only build at v0.17.46 -- 94 -- plus the two
+#                      v0.17.47 zero-copy GPU cells in the parallel-reader
+#                      section, which need a GPU (its four CPU cells run on
+#                      every host).  The GDS cells live INSIDE that
 #                      section, so this delta already contains them -- do not
 #                      also subtract the GDS delta, which is why the check
 #                      below uses elif.
@@ -623,8 +624,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 #                      absent, against the then-558 baseline.  The v0.17.43
 #                      archive-geometry cell and the two v0.17.45 real-fault
 #                      cells need a GPU but NOT GDS, so they RUN there: that
-#                      host's expected total is now 555 (561 - 6) and its
-#                      default 424.  DERIVED -- not yet measured on that host,
+#                      host's expected total is now 561 (567 - 6) and its
+#                      default 430.  DERIVED -- not yet measured on that host,
 #                      which is the next thing to confirm there.
 #                      The sixth GDS cell ("refuses a compat-mode host") still
 #                      RUNS and passes everywhere -- only its negative control is
@@ -638,13 +639,14 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # that run match the low default.  A baseline that is only ever derived is not a
 # baseline: measure every combination listed here.
 #
-# MEASURED COMBINATIONS: default+GPU+GDS (428, v0.17.45), default+noGPU (336,
+# MEASURED COMBINATIONS: default+GPU+GDS (430, v0.17.46), default+noGPU (336,
 # v0.17.43), extensive+GPU+GDS (559, v0.17.43), extensive+GPU+noGDS (552,
-# v0.17.42).  Derived: this baseline (430 / 561 -- those plus the two v0.17.45
-# cells) and default+GPU+noGDS (424).
+# v0.17.42).  Derived: this baseline (436 / 567 -- those plus the six v0.17.47
+# zero-copy cells and, for extensive, the two v0.17.45 cells), default+noGPU
+# (340) and default+GPU+noGDS (430).
 # NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
-# -94 is the number to re-measure, not evidence of drift.
-EXPECTED_NOGPU_DELTA=94
+# -96 is the number to re-measure, not evidence of drift.
+EXPECTED_NOGPU_DELTA=96
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -2614,6 +2616,113 @@ for cs in 1 128; do
          "MT match: $(files_match "$TMPDIR/mtreader.bin" "$TMPDIR/mt-$cs.dec" && echo y || echo n), single: $(files_match "$TMPDIR/mtreader.bin" "$TMPDIR/sg-$cs.dec" && echo y || echo n)"
   fi
 done
+
+# v0.17.47: ZERO-COPY FRAMES.  The reader used to copy every frame out of its 64 MiB
+# block on ONE ordered consumer thread, and that copy capped every large decompress.
+# Frames wholly inside a block now leave as views into it; frames crossing a block
+# boundary are carried (moved, not copied a second time); past a memory cap the
+# consumer copies instead.  The round-trips above already run on views by default,
+# but every mode produces the same bytes -- so a silently disabled view path would
+# pass them.  These cells assert which path each run actually took.
+zc_counts() {  # $1 = a -v stderr log; prints "views carried copied", or nothing
+  grep -oE '\[READER\] zero-copy: [0-9]+ frames as views, [0-9]+ carried across block boundaries, [0-9]+ copied' "$1" 2>/dev/null \
+    | head -1 | grep -oE '[0-9]+' | paste -sd' ' -
+}
+"$GZSTD" -d -v --cpu-only -c "$TMPDIR/mt-1.zst" 2>"$TMPDIR/zc-v.log" >"$TMPDIR/zc-v.dec"
+read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-v.log")"
+zc_inblock=${zc_v:-}   # frames wholly inside a block: the cap cell below must account for every one
+if [[ -z "${zc_v:-}" ]]; then
+  fail "zero-copy views carry whole-block frames" "no [READER] zero-copy line: NOT TESTED"
+elif (( zc_v == 0 || zc_k != 0 )); then
+  fail "zero-copy views carry whole-block frames" "views=$zc_v copied=$zc_k (want views, no copies under the cap)"
+elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-v.dec"; then
+  pass "zero-copy views carry whole-block frames" "($zc_v views)"
+else
+  fail "zero-copy views carry whole-block frames" "output mismatch"
+fi
+GZSTD_DEBUG_READER_COPY=1 "$GZSTD" -d -v --cpu-only -c "$TMPDIR/mt-1.zst" 2>"$TMPDIR/zc-c.log" >"$TMPDIR/zc-c.dec"
+read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-c.log")"
+if [[ -z "${zc_v:-}" ]]; then
+  fail "GZSTD_DEBUG_READER_COPY restores the per-frame copy" "no [READER] zero-copy line: NOT TESTED"
+elif (( zc_v != 0 || zc_k == 0 )); then
+  fail "GZSTD_DEBUG_READER_COPY restores the per-frame copy" "views=$zc_v copied=$zc_k"
+elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-c.dec"; then
+  pass "GZSTD_DEBUG_READER_COPY restores the per-frame copy" "($zc_k copied)"
+else
+  fail "GZSTD_DEBUG_READER_COPY restores the per-frame copy" "output mismatch"
+fi
+GZSTD_DEBUG_ZC_MAX_BLOCKS=1 "$GZSTD" -d -v --cpu-only -c "$TMPDIR/mt-1.zst" 2>"$TMPDIR/zc-m.log" >"$TMPDIR/zc-m.dec"
+read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-m.log")"
+if [[ -z "${zc_v:-}" ]]; then
+  fail "the memory cap switches blocks to copies" "no [READER] zero-copy line: NOT TESTED"
+elif [[ -z "${zc_inblock:-}" ]]; then
+  fail "the memory cap switches blocks to copies" "no in-block frame count from the views run: NOT TESTED"
+elif (( zc_k == 0 || zc_v + zc_k != zc_inblock )); then
+  # Every in-block frame is either a view or a copy, so the two must add up to the
+  # views-run count.  "Some copies" alone passed a build that ignored the cap but
+  # miscounted carried frames as copies (mutation-tested).
+  fail "the memory cap switches blocks to copies" "views=$zc_v + copied=$zc_k, want $zc_inblock with copied > 0"
+elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-m.dec"; then
+  pass "the memory cap switches blocks to copies" "($zc_k copied, $zc_v views)"
+else
+  fail "the memory cap switches blocks to copies" "output mismatch"
+fi
+"$GZSTD" -d -v --cpu-only -c "$TMPDIR/mt-128.zst" 2>"$TMPDIR/zc-k.log" >"$TMPDIR/zc-k.dec"
+read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-k.log")"
+if [[ -z "${zc_v:-}" ]]; then
+  fail "frames larger than a block are carried across it" "no [READER] zero-copy line: NOT TESTED"
+elif (( zc_c == 0 )); then
+  fail "frames larger than a block are carried across it" "carried=0 for 128 MiB frames in 64 MiB blocks"
+elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-k.dec"; then
+  pass "frames larger than a block are carried across it" "($zc_c carried)"
+else
+  fail "frames larger than a block are carried across it" "output mismatch"
+fi
+if has_gpu 2>/dev/null; then
+  "$GZSTD" -d -v --gpu-only -c "$TMPDIR/mt-1.zst" 2>"$TMPDIR/zc-g.log" >"$TMPDIR/zc-g.dec"
+  read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-g.log")"
+  if [[ -z "${zc_v:-}" ]]; then
+    fail "GPU decompress reads zero-copy views" "no [READER] zero-copy line: NOT TESTED"
+  elif (( zc_v == 0 )); then
+    fail "GPU decompress reads zero-copy views" "views=0"
+  elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-g.dec"; then
+    pass "GPU decompress reads zero-copy views" "($zc_v views)"
+  else
+    fail "GPU decompress reads zero-copy views" "output mismatch"
+  fi
+  # A GPU fault re-enqueues the undelivered tail for the CPU rescue; those Tasks
+  # are views, so their blocks must still be alive when the CPU reads them.  Two
+  # real cards, as the wedge cell uses, so a surviving device and the rescue both run.
+  zr_min_mib=${GZSTD_TEST_MGPU_MIN_FREE_MIB:-4096}
+  zr_cards=()
+  if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+    mapfile -t zr_cards < <(gpu_uuids_by_free "$zr_min_mib" "$GPU_ALL_DEVICES")
+  fi
+  if (( ${#zr_cards[@]} >= 2 )); then
+    GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1 CUDA_VISIBLE_DEVICES="${zr_cards[0]},${zr_cards[1]}" \
+      run_test timeout --foreground -k 10 120 "$GZSTD" -vv -d --gpu-only --gpu-devices=2 \
+      -k -f "$TMPDIR/mt-1.zst" -o "$TMPDIR/zc-r.dec" 2>"$TMPDIR/zc-r.log"
+    read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-r.log")"
+    zr_engaged=$(grep -oE '\[GPU[0-9]+' "$TMPDIR/zc-r.log" 2>/dev/null | sort -u | wc -l)
+    if ! grep -q "FAIL_GPU_DECOMP_LAST" "$TMPDIR/zc-r.log"; then
+      fail "GPU fault rescue with zero-copy views in flight" "fault never fired: NOT TESTED"
+    elif (( zr_engaged < 2 )) || (( ${zc_v:-0} == 0 )); then
+      fail "GPU fault rescue with zero-copy views in flight" "engaged=$zr_engaged views=${zc_v:-0}: NOT TESTED"
+    elif [[ $LAST_RC -ne 0 ]]; then
+      fail "GPU fault rescue with zero-copy views in flight" "exit $LAST_RC"
+    elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-r.dec"; then
+      pass "GPU fault rescue with zero-copy views in flight" "($zc_v views)"
+    else
+      fail "GPU fault rescue with zero-copy views in flight" "output mismatch"
+    fi
+  else
+    skip "GPU fault rescue with zero-copy views in flight" "fewer than 2 GPUs with ${zr_min_mib} MiB of free VRAM"
+  fi
+else
+  skip "GPU decompress reads zero-copy views" "no GPU"
+  skip "GPU fault rescue with zero-copy views in flight" "no GPU"
+fi
+rm -f "$TMPDIR"/zc-*.log "$TMPDIR"/zc-*.dec
 
 # Confirm the parallel path actually engaged (not silently single-threaded).
 if "$GZSTD" -d -k -f -v --cpu-only "$TMPDIR/mt-1.zst" -o /dev/null 2>&1 \
