@@ -444,20 +444,45 @@ export GZSTD_DEBUG_GPU_GUARD_SEC=0
 # incidentally.  Nothing here ever asserted on it — the only other reference to
 # this variable in the file sets it EMPTY to simulate a GPU-less host — so the
 # coverage was accidental, not designed.  It is replaced with a deliberate
-# multi-GPU test that opts back in by unsetting this (see "multi-GPU dispatch"),
-# which is better coverage than the accident it replaces.
+# multi-GPU test that opts back in with its own two-card mask (see "multi-GPU
+# dispatch"), which is better coverage than the accident it replaces.
+#
+# EVERY MASK NAMES CARDS BY UUID, NEVER BY INDEX.  nvidia-smi numbers cards in PCI
+# order, but CUDA reads CUDA_VISIBLE_DEVICES indices in its own fastest-first
+# order, so an index names a different physical card to each: on the 8-GPU host
+# "0" was nvidia-smi's card 4.  That was harmless until another job filled two
+# cards -- then the multi-GPU cell's "0,1" reached one of them, gzstd correctly
+# skipped it for VRAM, and the cell failed.  The default card is the one with the
+# most free VRAM when the suite starts (ties keep PCI order).
 #
 # GZSTD_TEST_ALL_GPUS=1 restores every device for the whole run, for when you are
 # actually chasing a multi-GPU problem.  Distinguish an UNSET
 # CUDA_VISIBLE_DEVICES from an explicitly empty one: empty is the standard way
-# to request no CUDA devices and must not be silently turned into GPU 0.
+# to request no CUDA devices and must not be silently turned into a GPU.
+
+# Print the UUIDs among the comma-separated candidates ($2) that have at least $1
+# MiB of free VRAM, most free first.  One nvidia-smi query; its rows come in PCI
+# order and the sort is stable, so ties keep that order.
+gpu_uuids_by_free() {
+  local min=$1 cands=",$2,"
+  nvidia-smi --query-gpu=memory.free,uuid --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', *' -v min="$min" -v c="$cands" \
+        '$1 ~ /^[0-9]+$/ && $1 + 0 >= min && index(c, "," $2 ",") { print $1, $2 }' \
+    | sort -s -k1,1nr | awk '{ print $2 }'
+}
+
 if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+  GPU_HOST_UUIDS=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | paste -sd, -)
   if [[ -n "${GZSTD_TEST_ALL_GPUS:-}" ]]; then
-    GPU_ALL_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
+    GPU_ALL_DEVICES=$GPU_HOST_UUIDS
     unset CUDA_VISIBLE_DEVICES
   elif [[ -z "${CUDA_VISIBLE_DEVICES+x}" ]]; then
-    GPU_ALL_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)
-    export CUDA_VISIBLE_DEVICES=0
+    GPU_ALL_DEVICES=$GPU_HOST_UUIDS
+    gpu_default=$(gpu_uuids_by_free 0 "$GPU_HOST_UUIDS" | head -1)
+    gpu_default=${gpu_default:-${GPU_HOST_UUIDS%%,*}}
+    # "0" only if no UUID could be read at all -- never an empty mask, which
+    # would silently turn every GPU cell into a skip.
+    export CUDA_VISIBLE_DEVICES=${gpu_default:-0}
   else
     # Respect a caller-supplied mask; the deliberate multi-GPU cell may use the
     # devices in that mask, but must not escape it and expose the rest of the host.
@@ -633,7 +658,13 @@ printf "  ${C_DIM}${SYM_BULLET}${C_RESET} ${C_BOLD}Binary${C_RESET}   ${C_CYAN}%
 printf "  ${C_DIM}${SYM_BULLET}${C_RESET} ${C_BOLD}Version${C_RESET}  ${C_CYAN}%s${C_RESET}\n" "$VERSION"
 printf "  ${C_DIM}${SYM_BULLET}${C_RESET} ${C_BOLD}Temp${C_RESET}     ${C_DIM}%s${C_RESET}\n" "$TMPDIR"
 if has_gpu 2>/dev/null; then
-  gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1 || true)
+  # Describe the card the suite will actually use, not the first one on the host.
+  gpu_pin=${CUDA_VISIBLE_DEVICES:-}; gpu_pin=${gpu_pin%%,*}
+  if [[ "$gpu_pin" == GPU-* ]]; then
+    gpu_info="card $(nvidia-smi -i "$gpu_pin" --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null | head -1 || true)"
+  else
+    gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1 || true)
+  fi
   printf "  ${C_DIM}${SYM_BULLET}${C_RESET} ${C_BOLD}GPU${C_RESET}      ${C_GREEN}%s${C_RESET}\n" "$gpu_info"
 else
   printf "  ${C_DIM}${SYM_BULLET}${C_RESET} ${C_BOLD}GPU${C_RESET}      ${C_DIM}none  GPU tests will be skipped${C_RESET}\n"
@@ -1402,7 +1433,7 @@ GVPY
   # up by a healthy one and the frame count comes out whole.  MEASURED on an 8-GPU
   # host against a build with the 13 consumes removed: the bringup case put 0 of 5
   # frames on the GPU with --gpu-devices=1, and 5 of 5 without it.  The suite
-  # already masks itself to GPU 0 by default, so the flag is what keeps these cells
+  # already masks itself to one GPU by default, so the flag is what keeps these cells
   # honest under GZSTD_TEST_ALL_GPUS=1 or a caller-supplied multi-device mask.
   #
   # THESE CELLS DISCRIMINATE, mutation-proven against that build: each reports 0
@@ -3377,7 +3408,7 @@ if has_gpu 2>/dev/null; then
   LAST_TEST_MS=0
 
   # MULTI-GPU DISPATCH — the one test that opts back in to multiple devices.
-  # The suite pins CUDA_VISIBLE_DEVICES=0 because CUDA init scales with device
+  # The suite pins one GPU because CUDA init scales with device
   # count and dominates its runtime (see the note at the top).  That trade is
   # only defensible if SOMETHING still drives more than one GPU deliberately,
   # which nothing did before: multi-GPU was covered by accident, and an accident
@@ -3387,9 +3418,29 @@ if has_gpu 2>/dev/null; then
   # Expose exactly two from the saved all-device mask: the test-only rendezvous
   # makes both claim a first batch before either may claim a second, so this is
   # deterministic and the 32 MiB fixture always has enough 4 MiB frames.
+  #
+  # THE TWO CARDS WITH THE MOST FREE VRAM, BY UUID.  On a shared host another job
+  # can fill a card, and gzstd then correctly skips it -- which this cell would
+  # report as dispatch reaching only one GPU.  So it picks the two freest cards,
+  # and SKIPS rather than fails when fewer than two have the floor free.  A card
+  # that had room and still dropped out is a real failure and stays one.  The
+  # floor is 4096 MiB: gzstd's own estimate for this launch is 941 MiB plus an
+  # 8 MiB reserve per card (-vv [VRAM check], H100), before the CUDA context, and
+  # the headroom absorbs a neighbour growing between this query and the launch.
+  # GZSTD_TEST_MGPU_MIN_FREE_MIB overrides it, which is how the skip is tested.
+  # A caller-supplied INDEX mask is used as given: CUDA owns that numbering, and
+  # this shell cannot tell which physical cards the indices name.
+  mg_min_mib=${GZSTD_TEST_MGPU_MIN_FREE_MIB:-4096}
+  mg_cards=()
   if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
-    IFS=, read -r mg_dev0 mg_dev1 mg_rest <<< "$GPU_ALL_DEVICES"
-    mg_devices="$mg_dev0,$mg_dev1"
+    if [[ "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+      mapfile -t mg_cards < <(gpu_uuids_by_free "$mg_min_mib" "$GPU_ALL_DEVICES")
+    else
+      IFS=, read -r -a mg_cards <<< "$GPU_ALL_DEVICES"
+    fi
+  fi
+  if (( ${#mg_cards[@]} >= 2 )); then
+    mg_devices="${mg_cards[0]},${mg_cards[1]}"
     mg_log=$(CUDA_VISIBLE_DEVICES="$mg_devices" GZSTD_DEBUG_GPU_ALL_READY=1 \
                timeout --foreground -k 10 120 \
                "$GZSTD" --gpu-only -vv --gpu-streams=1 --gpu-batch=1 \
@@ -3411,13 +3462,17 @@ if has_gpu 2>/dev/null; then
       if (( mg_used > 1 )); then
         pass "multi-GPU dispatch round-trips across multiple devices" "($mg_used GPUs used)"
       else
+        mg_skipped=$(printf '%s' "$mg_log" | grep -m1 -oE '\[GPU[0-9]+\] insufficient VRAM[^(]*' || true)
         fail "multi-GPU dispatch round-trips across multiple devices" \
-             "work landed on only $mg_used GPU despite the all-ready rendezvous"
+             "work landed on only $mg_used GPU despite the all-ready rendezvous${mg_skipped:+ -- $mg_skipped}"
       fi
     else
       fail "multi-GPU dispatch" "round-trip mismatch across $mg_devices"
     fi
     rm -f "$TMPDIR/mgpu.zst" "$TMPDIR/mgpu.out"
+  elif [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
+    skip "multi-GPU dispatch round-trips across multiple devices" \
+         "fewer than 2 GPUs with ${mg_min_mib} MiB of free VRAM"
   else
     skip "multi-GPU dispatch round-trips across multiple devices" "single GPU host"
   fi

@@ -387,8 +387,8 @@ the host was needed for other work.
   compress worker (stream allocation, reserve), the seek-frame decode and the XXH64 self-test. No
   last-error read happens on those threads today, so nothing is broken — but the rule is only
   robust if every site follows it.
-- **The v0.17.15 multi-GPU wedge cell has never discriminated in a default run.** The suite exports
-  `CUDA_VISIBLE_DEVICES=0` unless `GZSTD_TEST_ALL_GPUS=1` (since v0.15.96), so the cell's
+- **The v0.17.15 multi-GPU wedge cell has never discriminated in a default run.** The suite masks itself
+  to one GPU unless `GZSTD_TEST_ALL_GPUS=1` (since v0.15.96), so the cell's
   `--gpu-devices=2` gets one device — the configuration its own comment says cannot fail. It should
   opt back in the way the "multi-GPU dispatch" cell does, and be mutation-proven against the
   pre-v0.17.15 rescue.
