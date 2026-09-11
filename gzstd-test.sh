@@ -1262,18 +1262,47 @@ if has_gpu 2>/dev/null; then
   # is the designed rescue and proves nothing).  With ONE device it cannot fail
   # at all -- "the one that failed" and "the last one out" are the same thread,
   # so the old code was correct by accident.
-  if [[ $(nvidia-smi -L 2>/dev/null | wc -l) -ge 2 ]]; then
+  #
+  # TWO REAL DEVICES, BY UUID.  The suite masks itself to one GPU, so asking for
+  # --gpu-devices=2 under that mask got ONE device -- the configuration the note
+  # above says cannot fail -- and this cell did not discriminate in a default run
+  # from v0.17.15 to v0.17.46.  It now picks the two cards with the most free VRAM,
+  # as the multi-GPU dispatch cell does, and SKIPS when fewer than two have the
+  # floor free.  It also asserts both devices engaged: a card dropping out would
+  # silently turn the run back into the single-device case.  The timeout is a hang
+  # guard only, for a regression that wedges instead of exiting.
+  #
+  # THIS CELL DISCRIMINATES, mutation-proven on the 8-GPU host: a build with the
+  # clean-drain note_exit_and_rescue() call removed (the pre-v0.17.15 failure-keyed
+  # rescue) failed 5 of 5 with "exit 1: writer wedged", both devices engaged; the
+  # fixed build passed 5 of 5 on the same two cards.
+  gw_min_mib=${GZSTD_TEST_MGPU_MIN_FREE_MIB:-4096}
+  gw_cards=()
+  if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
+    if [[ "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+      mapfile -t gw_cards < <(gpu_uuids_by_free "$gw_min_mib" "$GPU_ALL_DEVICES")
+    else
+      IFS=, read -r -a gw_cards <<< "$GPU_ALL_DEVICES"
+    fi
+  fi
+  if (( ${#gw_cards[@]} >= 2 )); then
     gw_src="$TMPDIR/large.bin"
     gw_z="$TMPDIR/gpu-wedge.zst"
     gw_r="$TMPDIR/gpu-wedge.out"
     gw_e="$TMPDIR/gpu-wedge.err"
     "$GZSTD" -k -f -3 --gpu-only "$gw_src" -o "$gw_z" 2>/dev/null
-    GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1 run_test "$GZSTD" -d --gpu-only \
+    GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1 CUDA_VISIBLE_DEVICES="${gw_cards[0]},${gw_cards[1]}" \
+      run_test timeout --foreground -k 10 120 "$GZSTD" -vv -d --gpu-only \
       --gpu-devices=2 -k -f "$gw_z" -o "$gw_r" 2>"$gw_e"
-    # CONTROL FIRST: if the injected fault never fired, this cell tested nothing.
-    # Report that rather than passing on silence.
+    gw_engaged=$(grep -oE '\[GPU[0-9]+' "$gw_e" 2>/dev/null | sort -u | wc -l)
+    # CONTROL FIRST: if the injected fault never fired, or only one device ran,
+    # this cell tested nothing.  Report that rather than passing on silence.
     if ! grep -q "FAIL_GPU_DECOMP_LAST" "$gw_e"; then
       fail "GPU decompress fault -> CPU rescue" "fault never fired: NOT TESTED"
+    elif (( gw_engaged < 2 )); then
+      fail "GPU decompress fault -> CPU rescue" "only $gw_engaged GPU engaged: NOT TESTED"
+    elif [[ $LAST_RC -eq 124 || $LAST_RC -eq 137 ]]; then
+      fail "GPU decompress fault -> CPU rescue" "hung: killed by the timeout"
     elif [[ $LAST_RC -eq 1 ]]; then
       fail "GPU decompress fault -> CPU rescue" "exit 1: writer wedged"
     elif files_match "$gw_src" "$gw_r"; then
@@ -1282,6 +1311,9 @@ if has_gpu 2>/dev/null; then
       fail "GPU decompress fault -> CPU rescue" "exit $LAST_RC, output mismatch"
     fi
     rm -f "$gw_z" "$gw_r" "$gw_e"
+  elif [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
+    skip "GPU decompress fault -> rescue finishes the job" \
+         "fewer than 2 GPUs with ${gw_min_mib} MiB of free VRAM"
   else
     skip "GPU decompress fault -> rescue finishes the job" "needs 2+ GPUs"
   fi
