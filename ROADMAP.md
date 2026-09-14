@@ -333,6 +333,36 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.50: the hybrid decompress queue floor reserved four times its own ceiling
+
+On a cold 261 GiB archive the default backend lost to `--cpu-only` and held ten times the memory (written to a
+real file: 120.78–135.93 s at 202.9–203.6 GiB peak RSS against 100.01–100.61 s at 20.5–20.8; v0.17.50 lands
+at 106.03–109.45 s and 78.4–81.7 GiB). The cause was not GPU
+throughput: `decompress_nvcomp` never told `HybridSched` its producer's depth ceiling, so the bounded-producer
+rule that releases the queue floor — added in v0.13.66, for this exact latch — could not fire on any hybrid
+decompress, and the AUTO factor drove the floor to 16,226 frames against a queue ceiling of 4,192. The 96-thread
+CPU pool took nothing for ~14 s of a 40 s run. v0.17.50 declares the ceiling and, second, sizes the in-flight
+budget of a decompress that ends at a writer by the sink rather than by consumer appetite (CHANGELOG v0.17.50).
+
+**Open from that work:**
+- **NEXT: the workstation check.** Releasing the floor is safe wherever the CPU pool is the faster engine, which
+  is every decompress workload this host can produce — 4 CPU threads beat 8 H100s on 70 GiB of incompressible
+  frames (3.84 s against 13.47). The 2-GPU workstation, where GPU decompress measured 11x the CPU pool, is the
+  one place a starved-GPU regression could appear. Run the cold `-t` and real-sink pairs there.
+- **The trivial-batch exit is one-way.** A device that meets `streams * 4` consecutive all-trivial batches
+  leaves for the rest of the run. On the benchmark archive all 8 exit within seconds and never return, whatever
+  the remaining content looks like. Backing off and re-probing is the shape the rest of the scheduler is moving
+  toward; exiting is not.
+- **The AUTO factor's input is in two units on decompress.** `compute_auto_factor_` compares `cpu_rate_ema_`
+  (COMPRESSED bytes/s on this path) against `gpu_rate_ema_` (decompressed), understating the CPU share by the
+  compression ratio and biasing the factor toward the lockout. Now mostly moot — a bounded producer zeroes that
+  floor — but still live wherever the producer is unbounded (`--throttle-frames 0`). `cpu_payload_ema_` already
+  holds the right number and is only updated under `--adapt`.
+- **What the GPUs contribute is still not measured in-run.** The scheduler's per-engine EMAs cannot answer it
+  (duty-cycle bias — see the backend prior's comment), and the floor defect masked the question: with it gone,
+  hybrid on this host is cpu-only plus a bringup. An in-run end-to-end probe (engaged window vs quiesced window,
+  compared on overall rate) is the shape that would; state table first.
+
 ## SHIPPED v0.17.49: the GPU bringup decision stops sampling before the work starts
 
 Default-mode decompress to stdout on the 8-GPU host ran at 25–26 GiB/s against 58–63 for `--cpu-only`: the

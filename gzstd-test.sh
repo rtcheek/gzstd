@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=438
-$EXTENSIVE && EXPECTED_TESTS=569
+EXPECTED_TESTS=439
+$EXTENSIVE && EXPECTED_TESTS=570
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -610,8 +610,9 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 #                      group, plus the two zero-copy GPU cells in the
 #                      parallel-reader section (its six CPU cells, four
 #                      zero-copy and two block-overlap, run on every host).
-#                      MEASURED at v0.17.48: 438 ran on a GPU+GDS host and 342
-#                      on a CPU-only build.  The GDS cells live INSIDE that
+#                      MEASURED at v0.17.50: 439 ran on a GPU+GDS host and 342
+#                      on a CPU-only build (438/342 at v0.17.48; the v0.17.50
+#                      queue-depth-ceiling cell skips without a GPU, the +1).  The GDS cells live INSIDE that
 #                      section, so this delta already contains them -- do not
 #                      also subtract the GDS delta, which is why the check
 #                      below uses elif.
@@ -639,14 +640,15 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # that run match the low default.  A baseline that is only ever derived is not a
 # baseline: measure every combination listed here.
 #
-# MEASURED COMBINATIONS: default+GPU+GDS (438, v0.17.48), default+noGPU (342,
-# v0.17.48), extensive+GPU+GDS (559, v0.17.43), extensive+GPU+noGDS (552,
-# v0.17.42).  Derived: extensive 569 (559 plus the two v0.17.45 real-fault cells,
+# MEASURED COMBINATIONS: default+GPU+GDS (439, v0.17.50), default+noGPU (342,
+# v0.17.50), extensive+GPU+GDS (559, v0.17.43), extensive+GPU+noGDS (552,
+# v0.17.42).  The no-GPU delta of 97 is measured at v0.17.50 too (439 - 342), the
+# queue-depth-ceiling cell included.  Derived: extensive 570.  Derived: extensive 569 (559 plus the two v0.17.45 real-fault cells,
 # the six v0.17.47 zero-copy cells and the two v0.17.48 block-overlap cells) and
 # default+GPU+noGDS (432).
 # NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
 # -96 is the number to re-measure, not evidence of drift.
-EXPECTED_NOGPU_DELTA=96
+EXPECTED_NOGPU_DELTA=97
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -3456,6 +3458,51 @@ if has_gpu 2>/dev/null; then
          "(expected silencing note, got: $(echo "$cb_log" | grep -i cpu-batch || echo none))"
   fi
 
+
+  # THE PRODUCER'S DEPTH CEILING, DECLARED TO THE SCHEDULER.  Hybrid decompress set
+  # the queue's max_depth but never told HybridSched, so update_queue_floor's
+  # bounded-producer arm could not fire on this path and the AUTO factor latched at
+  # 4 x streams x batch -- four times the queue's OWN ceiling, a depth no producer
+  # is allowed to reach, so the CPU pool took nothing for as long as GPU streams
+  # lived.  Measured cold, 261 GiB, 8 GPUs: 42.23-43.27 s reserved vs 37.64-37.84 s
+  # released (--cpu-only 35.98-38.19), and 261 GiB to a real file 122.20-130.92 s
+  # vs 110.84-111.00.  A missing call is invisible except through this line -- the
+  # floor it would have set only becomes observable seconds later, once streams
+  # register -- so the line, and the clamp arithmetic behind its two spellings, is
+  # what this asserts.
+  # Each spelling is matched on its OWN wording: a build that takes the explicit
+  # arm for an auto run must read as "no auto line", not as a number that happens
+  # to parse.
+  qcap_auto() {  # $1 = a -v log; prints the ceiling of the released-floor line
+    grep -oE '\[HYBRID\] producer depth ceiling: [0-9]+ frames; auto queue floor released' "$1" \
+      2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1
+  }
+  qcap_clamped() {  # $1 = a -v log; prints "ceiling clamp" of the explicit-floor line
+    grep -oE '\[HYBRID\] producer depth ceiling: [0-9]+ frames; requested queue floor clamped to <= [0-9]+' \
+      "$1" 2>/dev/null | head -1 | grep -oE '[0-9]+' | paste -sd' ' -
+  }
+  "$GZSTD" -d -v -f --hybrid "$asym_zst" -o "$TMPDIR/qcap-a.dec" 2>"$TMPDIR/qcap-a.log"
+  "$GZSTD" -d -v -f --hybrid --hybrid-floor=nominal "$asym_zst" \
+    -o "$TMPDIR/qcap-n.dec" 2>"$TMPDIR/qcap-n.log"
+  qc_a=$(qcap_auto "$TMPDIR/qcap-a.log")
+  read -r qc_nc qc_nl <<< "$(qcap_clamped "$TMPDIR/qcap-n.log")"
+  if [[ -z "${qc_a:-}" || -z "${qc_nl:-}" ]]; then
+    fail "hybrid decompress declares its queue-depth ceiling" \
+         "auto line: '${qc_a:-none}', explicit line: '${qc_nc:-none} ${qc_nl:-none}': NOT TESTED"
+  elif (( qc_a == 0 || qc_nc != qc_a )); then
+    fail "hybrid decompress declares its queue-depth ceiling" \
+         "ceiling auto=$qc_a explicit=$qc_nc (want the same nonzero ceiling)"
+  elif (( qc_nl != qc_a / 4 )); then
+    fail "hybrid decompress declares its queue-depth ceiling" \
+         "explicit floor clamped to $qc_nl, want ceiling/4 = $(( qc_a / 4 ))"
+  elif files_match "$asym_src" "$TMPDIR/qcap-a.dec" && files_match "$asym_src" "$TMPDIR/qcap-n.dec"; then
+    pass "hybrid decompress declares its queue-depth ceiling" \
+         "($qc_a frames; an explicit floor clamps to $qc_nl)"
+  else
+    fail "hybrid decompress declares its queue-depth ceiling" "output mismatch"
+  fi
+  rm -f "$TMPDIR"/qcap-*.dec "$TMPDIR"/qcap-*.log
+
   rm -f "$asym_src" "$asym_zst"
 else
   skip "asymmetric mode: PCIe gen detected"                          "no GPU"
@@ -3467,6 +3514,7 @@ else
   skip "asymmetric mode: --cpu-share implies --hybrid"               "no GPU"
   skip "asymmetric mode: explicit --cpu-only beats tuning-flag promotion" "no GPU"
   skip "asymmetric mode: --cpu-batch + explicit --cpu-only triggers silencing" "no GPU"
+  skip "hybrid decompress declares its queue-depth ceiling"          "no GPU"
 fi
 
 # ============================================================

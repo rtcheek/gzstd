@@ -1,12 +1,102 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.49  
+**Covers:** v0.9.50 → v0.17.50  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.50 — the hybrid decompress queue floor reserved four times its own ceiling
+
+**On a cold archive the default backend lost to `--cpu-only`, and held ten times the memory.** Decompressing a
+261 GiB archive that is not in page cache: `--cpu-only` 35.98–38.19 s with `-t`, the default (hybrid) 42.23–43.27;
+written to a real file, `--cpu-only` 100.01–100.61 s at 20.5–20.8 GiB peak RSS against 120.78–135.93 s at
+202.9–203.6 GiB. The GPUs were not slow. The 96-thread CPU pool was locked out while they ran.
+
+### How it was found
+
+- The per-tick scheduler counts (`-vv`) show `cpu_taken` at 0–4 frames per 0.5 s tick for ~14 s of a 40 s run —
+  96 threads idle — while `queue_floor` climbed 2,048 → 5,120 → 8,192 → 16,226 and the GPUs took 256 frames a
+  tick. Then every GPU exited and the CPU pool finished the archive alone at full speed.
+- **The floor was four times the queue's own ceiling.** `decompress_nvcomp` bounds its producer with
+  `queue.set_max_depth(4192)`; a floor of 16,226 is a depth the queue is not allowed to reach, so
+  `depth <= floor` was true forever and no CPU worker could take a frame.
+- `update_queue_floor` has released the floor for a bounded producer since **v0.13.66**, whose comment describes
+  this exact latch — starved CPU ⇒ under 5% share ⇒ factor 4 ⇒ starved CPU. It fires only when the producer has
+  declared its ceiling with `set_queue_depth_cap`, and only the compress path ever called it. Decompress has
+  been a bounded producer since v0.13.41 and never said so.
+- Confirmed on one binary before changing anything: `--hybrid-floor=off` on the shipped build ran the same cold
+  archive in 37.64–37.84 s against 42.23–43.27 by default, at 31–32 GiB RSS against 55.
+- The reservation bought nothing it cost that 12% for: with the floor the GPUs completed 20–44 batches of the
+  16,686 frames, and with it released they completed none — on this host the CPU pool is the faster engine for
+  decompress, and the run is bounded by the cold device either way.
+
+### The change
+
+- **Hybrid decompress declares its producer's depth ceiling** to `HybridSched`, as compress does. The AUTO floor
+  is then released (the bounded-producer arm), and an explicit `--hybrid-floor`/`--hybrid-floor-factor` is
+  clamped to a quarter of the ceiling, so a user floor can no longer re-create the lockout either. An unbounded
+  producer (`--throttle-frames 0`) keeps the old behaviour, where queue depth really can grow that far.
+- **The in-flight budget for a decompress that ends at a writer is now sized by the sink, not by consumer
+  appetite.** The parallelism formula asks for a full batch per GPU stream plus a frame per CPU thread, times
+  slack — 8,576 frames, 134 GiB, on this host — and everything past "every decode lane busy plus a few seconds
+  of write buffer" is backlog competing with the writer for memory bandwidth. `--tar` extract has capped this at
+  16 GiB of frames since it was measured there; the same cap now covers an ordinary `-d` to a file or pipe.
+  `-t` (no writer) and `--gds-only` (frames written from VRAM by offset) are excluded.
+- `-v` reports the declaration: `[HYBRID] producer depth ceiling: 2144 frames; auto queue floor released`, or
+  `; requested queue floor clamped to <= 536`. A path that forgets the call prints nothing, which is what the
+  new suite cell asserts — the floor itself only becomes observable seconds later, once streams register.
+
+### Measured end
+
+261 GiB archive, cold before every run, 8 GPUs, two runs each in palindromic order. Every batch carries its own
+`--cpu-only` reference: the cold device drifts a second or two between batches, so only within-batch
+comparisons mean anything.
+
+**Cold `-t`.** No writer, so the in-flight budget never binds — the floor release is the whole of what `-t` can
+show.
+
+| | wall | peak RSS |
+|---|---|---|
+| v0.17.49 | 42.23 / 43.27 s | 55 GiB |
+| v0.17.49 + `--hybrid-floor=off` (one-binary control) | 37.64 / 37.84 s | 31 / 32 GiB |
+| `--cpu-only`, same batch | 35.98 / 38.19 s | 21.5 / 35.3 GiB |
+| v0.17.50, next batch | 39.42 / 39.45 s | 28.9 / 36.4 GiB |
+| `--cpu-only`, that batch | 37.24 s | 19.0 GiB |
+
+**Cold to a real file** — the realistic case, and where the in-flight budget shows.
+
+| | wall | peak RSS |
+|---|---|---|
+| v0.17.49 | 120.78 / 135.93 s | 202.9 / 203.6 GiB |
+| floor release only | 110.84 / 111.00 s | 164 / 165 GiB |
+| **v0.17.50** (floor release + sink-sized budget) | **106.03 / 109.45 s** | **78.4 / 81.7 GiB** |
+| `--cpu-only` | 100.01 / 100.61 s | 20.5 / 20.8 GiB |
+
+No range overlaps another arm's within a batch. Hybrid's cost over `--cpu-only` on the realistic case falls from
++21–35% to +6–9%, and its peak memory from about 10x `--cpu-only`'s to about 4x. Every run exited 0 and wrote
+all 260.70 GiB; the byte-for-byte checks are the targeted round-trips and the suite.
+
+The in-flight budget for a hybrid `-d` to a file falls from 8,576 frames (134 GiB) to 2,144 (33.5 GiB — here the
+pipeline-parallelism floor rather than the 16 GiB ceiling, because one batch per stream already costs more than
+that); `--cpu-only` is unchanged at 384 frames (6 GiB), and `-t` and compress are untouched.
+
+### Tests
+
+- A new cell asserts the declaration itself (`[HYBRID] producer depth ceiling: N frames; ...`), on both the
+  released and the clamped spelling, and that the clamp is a quarter of the ceiling. Mutation-tested against
+  four builds — the call removed, the explicit arm taken for an auto run, the ceiling stored as 0 behind a
+  truthful-looking line, and the divisor changed — and it fails on all four, and on v0.17.49.
+- Suite: the default run passes, 439 of 439, and the CPU-only build 342 of 342 with 78 skipped — the
+  no-GPU delta of 97 measured rather than derived, including this cell's skip.
+
+**Not settled here.** This host has no decompress workload where the GPUs are the faster engine — 4 CPU threads
+beat 8 H100s on 70 GiB of incompressible frames (3.84 s against 13.47) — so the case where releasing the floor
+could starve a genuinely faster GPU pool has to be measured on the 2-GPU workstation.
+
+---
 
 ## v0.17.49 — the GPU bringup decision stops sampling before the work starts
 

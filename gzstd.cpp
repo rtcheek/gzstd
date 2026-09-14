@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.49";
+static constexpr const char * GZSTD_VERSION = "0.17.50";
 //
 // Architecture overview:
 //
@@ -8770,21 +8770,55 @@ static int compute_throttle_budget(size_t frame_bytes,
     source = (frames == THROTTLE_MIN_FRAMES && pipeline_frames < THROTTLE_MIN_FRAMES)
            ? "floor"
            : (pipeline_frames <= ram_frames ? "pipeline" : "ram");
-    // --tar decompress: the pipeline ends at the extract sink, whose drain
-    // rate is the target device's — in-flight frames beyond "every decode
-    // lane busy + a few seconds of write buffer" are pure RAM and a long
+    // A DECOMPRESS PIPELINE IS BOUNDED BY ITS SINK, NOT BY WHAT ITS CONSUMERS
+    // CAN HOLD.  The parallelism formula sizes the budget from consumer
+    // appetite — a full batch for every GPU stream plus a frame per CPU thread,
+    // times slack — and everything past that is backlog waiting on a writer
+    // whose drain rate is the target device's.  In-flight frames beyond "every
+    // decode lane busy + a few seconds of write buffer" are pure RAM and a long
     // end-of-run drain (observed on an 8-GPU box: the parallelism formula
-    // allowed 134 GiB in flight; decode raced the disk by the full budget
-    // and the writer drained a 100+ GiB backlog for 44 s after the last
-    // worker exited).  Cap at 16 GiB of frames, never below the GPU batch
-    // floor — the deadlock guardrail above stays authoritative because
-    // greedy permit acquisition can hold a partial batch while delivered-
-    // but-unwritten frames pin the rest.
-    if (g_tar_decomp_sink) {
-      int tar_cap = (int)std::min<size_t>(INT_MAX, std::max<size_t>(
-          (size_t)std::max(gpu_batch_floor, THROTTLE_MIN_FRAMES),
+    // allowed 134 GiB in flight; decode raced the disk by the full budget and
+    // the writer drained a 100+ GiB backlog for 44 s after the last worker
+    // exited).  Cap at 16 GiB of frames, never below the GPU batch floor — the
+    // deadlock guardrail above stays authoritative because greedy permit
+    // acquisition can hold a partial batch while delivered-but-unwritten frames
+    // pin the rest.
+    //
+    // --tar extract carried this cap alone until v0.17.50, on the reasoning
+    // that its FrameSink ends at a device.  So does an ordinary -d: the
+    // observation above was made on the tar path and reproduced unchanged on
+    // the plain one.  MEASURED, 8-GPU Gen5 host, 261 GiB archive decompressed
+    // cold to a real file, two runs each: uncapped (8,576 frames = 134 GiB)
+    // 117.35/118.59 s at 164-165 GiB peak RSS; capped (2,048 frames here — the
+    // GPU batch floor, since 16 GiB is below it at this frame size)
+    // 108.04/109.65 s at 75-78 GiB; --cpu-only, whose 96-thread parallelism
+    // asks for only 384 frames, 102.62/104.01 s at 21 GiB.  Less memory AND
+    // less wall: the backlog never bought throughput, it competed with the
+    // writer for memory bandwidth.
+    //
+    // -t is excluded because it has no writer at all (its workers are handed a
+    // null throttle and take no permits), and --gds-only because its frames are
+    // written from VRAM by offset and never pass through the ordered writer
+    // this reasoning is about.  g_gds_out_active is not readable here — it is
+    // stored later, after this sizing — so the option is what gates it.
+    // THE CAP'S OWN FLOOR IS "EVERY CONSUMER HOLDS ONE FRAME", not the GPU
+    // batch alone.  A budget below pipeline_parallelism starves the pool it is
+    // meant to pace — a permit no worker can get is the same shape of defect as
+    // a queue floor no producer can reach, and the GPU batch floor does not
+    // cover the CPU side: 1,024 threads on 128 MiB frames want 1,024 permits
+    // while 16 GiB of frames is 128.  So the cap is the LARGER of what keeps
+    // every lane busy and what a few seconds of write buffer costs; on this
+    // host that is 2,144 frames (33.5 GiB) for a hybrid -d and leaves
+    // --cpu-only's 384 untouched.
+    if (g_tar_decomp_sink
+        || (opt.mode == Mode::DECOMPRESS && !opt.gds_only)) {
+      int sink_cap = (int)std::min<size_t>(INT_MAX, std::max<size_t>(
+          (size_t)std::max({gpu_batch_floor, pipeline_parallelism, THROTTLE_MIN_FRAMES}),
           (16ULL * 1024 * 1024 * 1024) / frame_bytes));
-      if (frames > tar_cap) { frames = tar_cap; source = "tar-extract"; }
+      if (frames > sink_cap) {
+        frames = sink_cap;
+        source = g_tar_decomp_sink ? "tar-extract" : "sink";
+      }
     }
   }
 
@@ -12822,9 +12856,34 @@ public:
 
   // Producer with a bounded queue depth (pooled reader: pool size) declares
   // its ceiling so update_queue_floor's clamp can engage.  0 = unbounded.
+  //
+  // SAY IT OUT LOUD.  A path that forgets this call is invisible from the
+  // outside: the floor it then computes only becomes observable once GPU
+  // streams register, several seconds later, as a number no line explains —
+  // which is how hybrid decompress shipped from v0.13.66 to v0.17.49
+  // reserving four times its own queue ceiling.  The line states the two
+  // things known here (the ceiling, and which arm of update_queue_floor the
+  // floor will take), so its ABSENCE is what a test sees when the call goes
+  // missing again.
   void set_queue_depth_cap(size_t n) {
     queue_depth_cap_.store(n, std::memory_order_relaxed);
     refresh_queue_floor_();
+    // Report what was STORED, not what was passed, and derive the clamp from
+    // the same helper update_queue_floor applies: a line that recomputes the
+    // policy beside it is a line that can disagree with it.
+    const size_t cap = queue_depth_cap_.load(std::memory_order_relaxed);
+    if (cap > 0 && opt_.verbosity >= V_VERBOSE) {
+      char b[176];
+      if (user_floor_())
+        std::snprintf(b, sizeof(b),
+          "[HYBRID] producer depth ceiling: %zu frames; requested queue floor "
+          "clamped to <= %zu\n", cap, floor_ceiling_(cap));
+      else
+        std::snprintf(b, sizeof(b),
+          "[HYBRID] producer depth ceiling: %zu frames; auto queue floor "
+          "released (a bounded producer cannot fill a reservation)\n", cap);
+      vlog(V_VERBOSE, opt_, b);
+    }
   }
 
   // Minimum queue depth below which CPUs should not take work.
@@ -13240,6 +13299,18 @@ private:
     return 4.0 - t * (4.0 - 1.5);
   }
 
+  // Did the user ask for a floor by name?  One predicate, two readers (the
+  // clamp in update_queue_floor and the ceiling line in set_queue_depth_cap):
+  // spelling it twice is how the two drift apart.
+  bool user_floor_() const {
+    return opt_.hybrid_floor_factor >= 0.0
+        || opt_.hybrid_floor_mode != Options::HybridFloorMode::AUTO;
+  }
+
+  // The most an EXPLICIT floor may reserve out of a bounded producer's ceiling.
+  // One definition, two readers (the clamp, and the line that reports it).
+  static size_t floor_ceiling_(size_t cap) { return cap / 4; }
+
   // Resolve the active floor factor from Options + runtime EMA state.
   double resolve_factor_() const {
     if (opt_.hybrid_floor_factor >= 0.0) return opt_.hybrid_floor_factor;
@@ -13275,12 +13346,8 @@ private:
     // --hybrid-floor-factor is honored but still clamped to a quarter of
     // the ceiling so it cannot re-create the permanent lockout.
     const size_t cap = queue_depth_cap_.load(std::memory_order_relaxed);
-    if (cap > 0) {
-      const bool user_floor =
-          opt_.hybrid_floor_factor >= 0.0 ||
-          opt_.hybrid_floor_mode != Options::HybridFloorMode::AUTO;
-      floor = user_floor ? std::min(floor, cap / 4) : 0;
-    }
+    if (cap > 0)
+      floor = user_floor_() ? std::min(floor, floor_ceiling_(cap)) : 0;
     gpu_queue_floor_.store(floor, std::memory_order_relaxed);
   }
 
@@ -30548,6 +30615,9 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // consumer (D2H-bound) can't let the reader buffer the entire compressed
   // input in RAM — the gpu-only RSS blowup in ROADMAP 7.8.  Skip when
   // throttling is explicitly disabled.
+  // Published to the hybrid scheduler below: a producer with a depth ceiling
+  // must SAY SO, or the queue floor reserves depth the queue can never hold.
+  size_t queue_depth_ceiling = 0;   // 0 = unbounded producer
   if (opt.throttle_frames != 0) {
     // ONE BATCH PER CONSUMER, NOT FOUR (v0.17.48).  decomp_parallelism already counts
     // a full auto-tuner batch for every GPU stream plus one frame per CPU thread, so a
@@ -30565,6 +30635,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
     const int qslack = opt.throttle_factor > 0 ? opt.throttle_factor : 1;
     const size_t qfloor = (size_t)std::max(THROTTLE_MIN_FRAMES, decomp_parallelism * qslack);
     queue.set_max_depth(qfloor);
+    queue_depth_ceiling = qfloor;
     // Byte ceiling — see decompress_cpu_mt: bounds queued RAM independent of
     // compressibility (~8 MiB/slot).  Soft cap; tune via --throttle-factor.
     queue.set_max_bytes(qfloor * (8 * ONE_MIB));
@@ -30895,6 +30966,39 @@ gds_out_declined:
         device_count, opt);
     sched = sched_ptr.get();
     sched->set_queue(&queue);
+    // THE PRODUCER'S DEPTH CEILING, DECLARED — compress has done this since
+    // v0.13.66 (see the set_queue_depth_cap call in compress_nvcomp) and this
+    // path never did, so update_queue_floor's bounded-producer rule could not
+    // fire on ANY hybrid decompress.  The floor then reserved queue depth that
+    // the queue is not allowed to hold, and the AUTO factor latched exactly as
+    // that function's comment predicts: starved CPU -> cpu_share <= 5% ->
+    // factor 4 -> floor 4 x streams x batch -> starved CPU.
+    //
+    // MEASURED (8-GPU Gen5 host, 261 GiB archive, cold, -t, two runs each;
+    // --hybrid-floor=off is the one-binary control for the same effect):
+    // queue max_depth 4192 frames vs a floor that climbed to 15,555-16,226 —
+    // four times the ceiling, so no depth could ever satisfy it and the 96
+    // CPU threads took nothing for ~14 s while the reader ran at device speed.
+    // Default 42.23-43.27 s at 55 GiB peak RSS; floor off 37.64-37.84 s at
+    // 31-32 GiB; --cpu-only 35.98-38.19 s.  The GPUs completed 20-44 batches
+    // of the 16,686 frames in the reserved arm and zero in the released one,
+    // so the reservation bought nothing it cost 12% of the wall for.
+    //
+    // STATE TABLE — {producer bounded} x {--hybrid-floor} -> floor in effect:
+    //   unbounded (--throttle-frames 0)  x any      -> factor x streams x batch
+    //                                                  (today's behaviour; depth
+    //                                                  really can grow that far)
+    //   bounded                          x auto     -> 0; CPUs compete freely and
+    //                                                  should_cpu_take's yield to
+    //                                                  a waiting GPU remains the
+    //                                                  whole feeding mechanism
+    //   bounded                          x nominal/ -> min(asked, ceiling/4): the
+    //                                      factor      user keeps a reservation
+    //                                                  that cannot lock the pool out
+    // All three are update_queue_floor's existing arms; this call is what lets
+    // the last two be reached at all on decompress.
+    if (queue_depth_ceiling)
+      sched->set_queue_depth_cap(queue_depth_ceiling);
     tick_thr = std::thread(tick_loop_fn, std::ref(tick_done), sched);
   }
 
