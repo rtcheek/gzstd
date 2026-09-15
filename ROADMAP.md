@@ -333,6 +333,19 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.52: PCIe Gen3 decompress takes the same default as every other fabric
+
+From v0.13.0 through v0.17.51 a Gen<4 host decompressed `--cpu-only` whatever the input. On the Gen3 workstation
+those v0.11.20 measurements no longer held: flagless CPU-only against `--hybrid` on 20 GiB real-file outputs,
+hybrid was never slower (17.3 vs 19.4–20.4 s medium cold, 16.6–16.9 vs 20.0–20.3 s incompressible warm) — though
+the wins were in-flight buffering, not GPU work, and faded at 60 GiB. v0.17.52 applies the Gen4+ residency rule on
+every generation: warm input → `--cpu-only` (kept deliberately, for CPU time, VRAM and shared cards), cold or
+unknown → `--hybrid` (CHANGELOG v0.17.52).
+
+**Open from that work:**
+- **Run the default suite on the Gen4+ GDS host:** the rewritten asymmetric-mode cell now evicts its archive to
+  exercise the cold path; confirm eviction works there (a tmpfs `/tmp` would make those cells skip).
+
 ## SHIPPED v0.17.51: a trivially-compressed skip retired a GPU for the rest of the run
 
 In hybrid decompress a GPU stream skips an all-trivial batch (every frame under 2%) and hands it back to the CPU.
@@ -348,9 +361,10 @@ the exit on a generated 1 GiB fixture and was mutation-tested both ways.
 - **The 8-GPU server may not exercise the new cell:** slower GPU bringup can let the single CPU thread drain the
   1 GiB fixture before a GPU pops a trivial batch, and the cell then SKIPs. Read that cell's line in the next
   default run there.
-- **The Gen3 decompress default stays `--cpu-only`.** On 20 GiB real-file outputs `--hybrid` won without doing GPU
-  work — its larger in-flight budget buffered nearly the whole output. A 1,024-frame CPU-only sink floor matched
-  that at 20 GiB but bought nothing at 60 GiB (+3.6%, not significant) for 5× the RAM, so it was not shipped.
+- **The CPU-only sink floor was not shipped.** On 20 GiB real-file outputs `--hybrid` won without doing GPU work —
+  its larger in-flight budget buffered nearly the whole output. A 1,024-frame CPU-only sink floor matched that at
+  20 GiB but bought nothing at 60 GiB (+3.6%, not significant) for 5× the RAM. The Gen3 decompress default itself
+  was then unified with Gen4+ in v0.17.52.
 
 ## SHIPPED v0.17.50: the hybrid decompress queue floor reserved four times its own ceiling
 
@@ -1071,6 +1085,8 @@ On consumer GPUs with PCIe Gen3, the D2H transfer cost makes GPU decompression s
 - **Decompress:** Use CPU-only
 
 Implemented in v0.13.0: PCIe generation queried via NVML (with sysfs fallback). On Gen<4, decompress and `-t` default to `--cpu-only`. On Gen4+, default to `--hybrid`. User can override with `--gpu-only` or `--hybrid`.
+
+**Superseded in v0.17.52:** the Gen<4 decompress rule was retired once its measurements stopped holding on the Gen3 workstation; every generation now uses the residency rule (warm input → `--cpu-only`, cold or unknown → `--hybrid`). See CHANGELOG v0.17.52.
 
 Visible at `-v` as `[ASYMMETRIC] PCIe Gen3 detected; defaulting decompress to --cpu-only`.
 

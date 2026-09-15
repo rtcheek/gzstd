@@ -106,8 +106,8 @@ way to force engagement.
 The single hardest gap to close and the easiest to rationalise away. Varying
 `CUDA_VISIBLE_DEVICES` on one box exercises GPU *count* (and is worth doing — 0/1/2/8 all
 have distinct paths), but it does not vary PCIe generation, VRAM size, core count, kernel,
-or filesystem. Asymmetric mode takes a different branch below PCIe Gen4 that a Gen5 box
-never executes.
+or filesystem. The `--direct` and GPU-verify defaults take a different branch below PCIe Gen4
+that a Gen5 box never executes.
 
 Any second host helps, including a GPU-less one.
 

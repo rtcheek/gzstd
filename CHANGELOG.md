@@ -1,9 +1,73 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.51  
+**Covers:** v0.9.50 → v0.17.52  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+
+## v0.17.52 — PCIe Gen3 decompress takes the same default as every other fabric
+
+**A flagless `-d` on a PCIe Gen<4 host no longer forces `--cpu-only`.** From v0.13.0 through v0.17.51 any host
+whose GPUs link below Gen4 decompressed CPU-only whatever the input, on v0.11.20 measurements from a 24-core Gen3
+host with two 11 GiB cards: hybrid 6–39% slower on every data type, the D2H of the decompressed output being the
+cost. It now takes the rule Gen4+ hosts have used since v0.15.2: an input already ≥ 95% in page cache, written to
+a regular file, decompresses CPU-only; a cold or unknown one goes hybrid.
+
+### Why
+
+- **The rule's measurements no longer hold on that host.** Flagless (CPU-only) against `--hybrid`, 20 GiB outputs
+  to a real file beside the input, `sync` inside the timed region, palindromic, 2 runs each: medium-ratio cold
+  19.44–20.40 s vs 17.31–17.38; incompressible warm 19.99–20.34 vs 16.55–16.85; medium warm 16.86–19.10 vs
+  16.67–16.75; incompressible cold equal. Hybrid was never slower.
+- **Those wins were not GPU work** (0–1 GPU batches): hybrid's larger in-flight budget buffered the output, and at
+  60 GiB the advantage faded (a CPU-only run given hybrid's budget came in 6.8% faster, within noise). But nothing
+  measured shows the D2H cost the rule was written for.
+- On `mixed` (half raw random frames, half trivially compressed ones) `--cpu-only` and `--gpu-only` ran level on
+  wall time — 11.75 and 13.19 s against 12.07 and 11.69 — with the GPU arm using about twice the user CPU.
+
+### The change
+
+- The Gen<4 branch of `apply_backend_defaults` is removed; the residency rule applies on every generation. **A warm
+  input still goes CPU-only on Gen3,** although hybrid measured faster warm there. That is deliberate: one rule,
+  and a GPU run that does little still costs about twice the CPU time, holds VRAM, pays GPU bringup and shares the
+  cards with other users.
+- The `--adapt` backend prior's model of the static rule (`static_picks_cpu`) follows: decompress is predicted
+  CPU-only only for a warm input.
+- The cold-path `-v` line `[ASYMMETRIC] PCIe GenN detected; defaulting decompress to --hybrid (input N% resident:
+  cold/disk-bound)` now prints for any detected generation (it was Gen4+ only). The default-verbosity notice
+  `PCIe Gen3 detected; defaulting decompress to --cpu-only` is gone; a warm input prints the residency notice on
+  every fabric.
+- `--help` describes the residency rule instead of asymmetric mode. The `--direct` and GPU-verify defaults, which
+  also branch at Gen4, are unchanged.
+- The small-input gate still decides first: an input too small to fill one GPU batch decompresses CPU-only on any
+  fabric (a 144 MiB archive at 1 MiB frames hit it in testing — "input 192.1 MiB < one GPU batch (256 MiB)").
+
+### Verified on the Gen3 host
+
+`-t -v` on the 5.4 GiB medium-ratio test archive, no test hooks:
+- cold → `[ASYMMETRIC] PCIe Gen3 detected; defaulting decompress to --hybrid (input 0% resident: cold/disk-bound)`,
+  hybrid;
+- warm → `input is 100% page-cache resident (compute-bound); defaulting decompress to --cpu-only`;
+- the previous binary, cold → `PCIe Gen3 detected; defaulting decompress to --cpu-only`.
+
+### Test
+
+- The asymmetric-mode cell evicts its freshly written archive (`fdatasync`, then `POSIX_FADV_DONTNEED`) so the
+  detection run is cold, and asserts that a cold decompress defaults to hybrid on every generation — it asserted
+  CPU-only on Gen<4. Where eviction cannot work (a tmpfs `TMPDIR`) its cells skip. Same PASS/FAIL count.
+- The residency cell now requires the residency notice alone; the old Gen3 notice no longer satisfies it.
+- Mutation-tested by running both sections verbatim under the suite's single-card default: this build passes all
+  12 cells; v0.17.50 fails exactly two — "cold decompress defaults to hybrid" (its banner reads CPU-only) and
+  "warm-input decompress announces its backend default" (it prints the old PCIe notice) — and passes the other 10.
+
+**Test suite:** default run on a GPU host without GDS **434 passed, 0 failed, 6 skipped** (440 total; the drift
+check expected 434 = 440 − 6); CPU-only build **342 passed, 0 failed, 79 skipped** (expected 342 = 440 − 98). The
+rewritten asymmetric-mode cells ("PCIe gen detected", "Gen3 cold decompress defaults to hybrid") and the tightened
+residency cell passed; all three skip without a GPU. Not yet run at v0.17.52: the default suite on a GDS host
+(derived 440) and `--extensive` (derived 571).
 
 ---
 

@@ -3392,13 +3392,26 @@ if has_gpu 2>/dev/null; then
   dd if=/dev/urandom bs=1M count=64 2>/dev/null > "$asym_src"
   "$GZSTD" --hybrid -k -f "$asym_src" -o "$asym_zst" 2>/dev/null
 
-  # Trigger detection on a decompress run; the [ASYMMETRIC] line carries
-  # the detected gen, and the [STARTUP] line carries the chosen backend.
+  # Trigger detection on a COLD decompress run.  Every PCIe generation now follows
+  # one rule (warm input -> cpu-only, cold -> hybrid), and only the cold path logs
+  # [ASYMMETRIC] with the detected gen; the [STARTUP] line carries the backend.
+  # The archive was just written, so evict it first (fdatasync, then
+  # POSIX_FADV_DONTNEED -- rootless, like scripts/drop_cache).  On a tmpfs TMPDIR
+  # eviction cannot work, the run reports the input resident, and the cells skip.
+  python3 -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY); os.fdatasync(fd)
+os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)' "$asym_zst" 2>/dev/null
   asym_log=$("$GZSTD" -d -v -k -f "$asym_zst" -o "$asym_out" 2>&1)
   rm -f "$asym_out"
   asym_gen=$(echo "$asym_log" | grep -oE "PCIe Gen[0-9]+" | head -1 | grep -oE "[0-9]+")
 
-  if [[ -z "$asym_gen" ]]; then
+  if echo "$asym_log" | grep -q "page-cache resident"; then
+    skip "asymmetric mode: PCIe gen detected" "fixture still page-cache resident (tmpfs TMPDIR?)"
+    skip "asymmetric mode: gen-appropriate decompress default" "fixture not cold"
+    skip "asymmetric mode: compress always defaults to hybrid"  "fixture not cold"
+    skip "asymmetric mode: --hybrid override bypasses asymmetric" "fixture not cold"
+    skip "asymmetric mode: --cpu-only override bypasses asymmetric" "fixture not cold"
+  elif [[ -z "$asym_gen" ]]; then
     # No [ASYMMETRIC] line at all — detection unavailable (NVML missing,
     # no NVIDIA card visible).  Verify the fallback path: hybrid default.
     if echo "$asym_log" | grep -q "DECOMPRESS (hybrid"; then
@@ -3414,21 +3427,15 @@ if has_gpu 2>/dev/null; then
   else
     pass "asymmetric mode: PCIe gen detected" "(Gen$asym_gen)"
 
-    # Decompress backend default depends on gen.
-    if (( asym_gen < 4 )); then
-      if echo "$asym_log" | grep -q "DECOMPRESS (cpu-only)"; then
-        pass "asymmetric mode: Gen$asym_gen decompress defaults to cpu-only"
-      else
-        fail "asymmetric mode: Gen$asym_gen decompress defaults to cpu-only" \
-             "(banner: $(echo "$asym_log" | grep STARTUP || echo none))"
-      fi
+    # A cold decompress defaults to hybrid on EVERY generation.  Through v0.17.51 a
+    # Gen<4 host went cpu-only here whatever the residency; that rule was retired
+    # (see apply_backend_defaults), so a cpu-only banner on a Gen3 host is the old
+    # rule coming back.
+    if echo "$asym_log" | grep -q "DECOMPRESS (hybrid"; then
+      pass "asymmetric mode: Gen$asym_gen cold decompress defaults to hybrid"
     else
-      if echo "$asym_log" | grep -q "DECOMPRESS (hybrid"; then
-        pass "asymmetric mode: Gen$asym_gen decompress defaults to hybrid"
-      else
-        fail "asymmetric mode: Gen$asym_gen decompress defaults to hybrid" \
-             "(banner: $(echo "$asym_log" | grep STARTUP || echo none))"
-      fi
+      fail "asymmetric mode: Gen$asym_gen cold decompress defaults to hybrid" \
+           "(banner: $(echo "$asym_log" | grep STARTUP || echo none))"
     fi
 
     # Compress always defaults to hybrid regardless of gen.
@@ -4695,13 +4702,13 @@ APRI="$APRI_XDG/gzstd/profile.json"
 
 if has_gpu 2>/dev/null; then
   # 1. Warm input announces a decompress backend default at default verbosity:
-  # Gen4+ prints the residency notice, Gen<4 the PCIe notice — both mean the
-  # runtime chose cpu-only and said so.
+  # every PCIe generation prints the residency notice (through v0.17.51 a Gen<4
+  # host printed a PCIe notice instead) -- the runtime chose cpu-only and said so.
   "$GZSTD" --cpu-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/apri.zst" 2>/dev/null
   cat "$TMPDIR/apri.zst" > /dev/null    # warm it (O_DIRECT output leaves it cold)
   "$GZSTD" -d -k -f "$TMPDIR/apri.zst" -o "$TMPDIR/apri.out" 2>"$TMPDIR/apri.err"
   if files_match "$TMPDIR/large.bin" "$TMPDIR/apri.out" \
-     && grep -qE "page-cache resident|PCIe Gen" "$TMPDIR/apri.err"; then
+     && grep -q "page-cache resident" "$TMPDIR/apri.err"; then
     pass "warm-input decompress announces its backend default"
   else
     fail "warm-input decompress announces its backend default"

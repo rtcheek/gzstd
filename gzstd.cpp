@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.51";
+static constexpr const char * GZSTD_VERSION = "0.17.52";
 //
 // Architecture overview:
 //
@@ -3317,7 +3317,7 @@ static void print_help()
 "  --ultra             enable ultra levels (large window, more memory)\n"
 "\n"
 "Backend (auto is RUNTIME-DEPENDENT: small inputs and warm regular-file\n"
-"decompress go cpu-only; Gen<4 decompress goes cpu-only; otherwise hybrid.\n"
+"decompress go cpu-only; otherwise hybrid.\n"
 "--adapt may override from the measured per-machine profile):\n"
 "  --cpu-only          CPU multithreaded, no GPU\n"
 "  --gpu-only          GPU only, no CPU workers\n"
@@ -4080,15 +4080,15 @@ static void print_help_long()
 "gzstd picks a backend automatically based on hardware and operation:\n"
 "  * no GPU:                         --cpu-only\n"
 "  * compress, GPU present:          --hybrid (CPU + GPU)\n"
-"  * decompress, PCIe Gen<4 GPU:     --cpu-only  (asymmetric mode)\n"
-"  * decompress, PCIe Gen4+ GPU:     --hybrid\n"
+"  * decompress, input already in page cache (warm): --cpu-only\n"
+"  * decompress, otherwise (cold or unknown):         --hybrid\n"
+"  * inputs too small to fill one GPU batch:          --cpu-only\n"
 "\n"
-"Asymmetric mode (v0.13.0+): on PCIe Gen3 hardware the D2H\n"
-"(device-to-host) transfer cost makes hybrid decompress slower than\n"
-"CPU MT (multithreaded) for every measured data type.  Default\n"
-"decompress goes to CPU-only on Gen<4 to win that benchmark; compress\n"
-"still uses hybrid because GPU compress wins across all PCIe\n"
-"generations tested.  Override explicitly with one of these:\n"
+"A warm input decompresses at memory speed, so the CPU pool alone\n"
+"serves it without GPU bringup or VRAM.  The same rule applies on\n"
+"every PCIe generation: through v0.17.51 a PCIe Gen<4 host always\n"
+"decompressed CPU-only, a rule its own measurements no longer\n"
+"supported.  Override explicitly with one of these:\n"
 "\n"
 "  --cpu-only\n"
 "     Force CPU-only.  Useful for baseline measurements or when the\n"
@@ -35131,11 +35131,10 @@ static std::string derive_output(const std::string & input, Mode mode)
 /*======================================================================
  PCIe link generation detection (asymmetric mode v0.13.0+)
 
- GPU compress consistently wins on the hardware tier we target, but
- PCIe Gen3 D2H transfer cost makes hybrid *decompress* slower than CPU
- MT for every data type measured on consumer Gen3 GPUs (RTX 20-series
- and similar).  Default decompress to --cpu-only on Gen3 hardware to
- avoid that pitfall; on Gen4+ datacenter GPUs hybrid still wins.
+ Used for the Gen4+ --direct and GPU-verify defaults and to label logs.
+ From v0.13.0 through v0.17.51 it also sent Gen<4 decompress to
+ --cpu-only; that rule was retired when the measurements behind it
+ stopped holding (see apply_backend_defaults).
 
  Returns the minimum link generation across visible GPUs:
    1, 2, 3 → slow PCIe (D2H dominates decompress)
@@ -35424,14 +35423,12 @@ static bool adapt_output_is_regular(const Options & opt)
    COMPRESS                : hybrid (GPU compress wins on all tiers),
                              unless an --adapt profile prior says the CPU
                              engine dominates this box (then cpu-only)
-   DECOMPRESS / TEST       : profile prior first (--adapt), then PCIe gen:
-     Gen<4                 : cpu-only (D2H cost > GPU benefit)
-     Gen4+ or undetectable : residency-informed — a warm page-cache input
-                             feeds at memory speed (compute-bound regime,
-                             where cpu-only measures fastest on the fabric
-                             boxes), so warm + regular-file output →
-                             cpu-only; cold or unknown → hybrid (today's
-                             default)
+   DECOMPRESS / TEST       : profile prior first (--adapt), then residency,
+                             on every PCIe generation: a warm page-cache
+                             input feeds at memory speed (compute-bound), so
+                             warm + regular-file output → cpu-only; cold or
+                             unknown → hybrid.  (Gen<4 was cpu-only through
+                             v0.17.51.)
 ======================================================================*/
 static void apply_backend_defaults(Options & opt)
 {
@@ -36209,13 +36206,13 @@ static void apply_backend_defaults(Options & opt)
         || double(known_input) / (prior_dir.input_gibs * 1073741824.0)
              >= double(adapt_save_min_ns()) / 1e9;
     // Would the static rules below land on cpu-only if the prior stayed silent?
-    // Decompress does when the fabric is Gen<4 (D2H cost dwarfs the benefit) or
-    // the input is warm (compute-bound); compress always defaults to hybrid.
-    // Needed so the hybrid exploration below fires exactly where "letting the
-    // static rules run" would NOT constitute an exploration.
+    // Decompress does when the input is warm (compute-bound); compress always
+    // defaults to hybrid.  (Through v0.17.51 a Gen<4 fabric did too -- see the
+    // decompress default below for why that rule was retired.)  Needed so the
+    // hybrid exploration below fires exactly where "letting the static rules
+    // run" would NOT constitute an exploration.
     const bool static_picks_cpu =
-        opt.mode != Mode::COMPRESS
-        && ((gen > 0 && gen < 4) || resid_probe >= 0.95);
+        opt.mode != Mode::COMPRESS && resid_probe >= 0.95;
     // An untried side is worth exploring only if it has not just BEEN tried: a
     // probe that fails to measure what it explored (a hybrid run whose GPU
     // declines to engage) stamps its _run key without a rate, and that stamp
@@ -36285,12 +36282,12 @@ static void apply_backend_defaults(Options & opt)
       // The mirror case, and it needs an EXPLICIT probe wherever the static rules
       // would also land on cpu-only.  The original reasoning here was "hybrid
       // untried -> the static rules below already favour hybrid, so letting them
-      // run IS the exploration" — true for a Gen4+ COLD decompress, false in two
-      // places: a WARM input (the residency rule picks cpu-only) and any Gen<4 box
-      // (that rule picks cpu-only too).  In both, hybrid was never measured, the
-      // pair never completed, and the prior could never decide anything — the same
-      // never-terminates shape as the cpu-only exploration above.  Keying by
-      // residency made it reachable on every box, not just Gen<4 ones.
+      // run IS the exploration" — true for a COLD decompress, false for a WARM
+      // input (the residency rule picks cpu-only; through v0.17.51 so did any Gen<4
+      // box).  There hybrid was never measured, the pair never completed, and the
+      // prior could never decide anything — the same never-terminates shape as the
+      // cpu-only exploration above.  Keying by residency made it reachable on every
+      // box.
       choose_cpu = false; decided = true; probing = true; why = "exploring hybrid";
     }
     // Nothing measured at all -> nothing to say.
@@ -36301,7 +36298,7 @@ static void apply_backend_defaults(Options & opt)
       // its own backend still records the attempt (see g_adapt_explored).
       if (probing)
         g_adapt_explored.store(choose_cpu ? 1 : 2, std::memory_order_relaxed);
-      if (choose_cpu && opt.cpu_queue_min > 0) {   // mirror the Gen<4 silencing
+      if (choose_cpu && opt.cpu_queue_min > 0) {   // mirror parse_args's silencing
         if (opt.verbosity >= V_ERROR)
           std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
                        "(profile prior; override with --hybrid)\n";
@@ -36341,29 +36338,24 @@ static void apply_backend_defaults(Options & opt)
 #endif
 
   if (opt.mode == Mode::COMPRESS) { opt.hybrid = true; return; }
-  if (gen > 0 && gen < 4) {
-    opt.cpu_only = true;
-    // Mirror the parse_args silencing: --cpu-batch in cpu-only mode causes
-    // stop-and-go.  parse_args's own check ran before we flipped cpu_only,
-    // so it missed this auto-flip path; redo it here.
-    if (opt.cpu_queue_min > 0) {
-      if (opt.verbosity >= V_ERROR)
-        std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
-                     "(asymmetric default; override with --hybrid)\n";
-      opt.cpu_queue_min = 0;
-    }
-    // Show this at default verbosity: users on Gen3 hardware otherwise see
-    // no GPU activity and have no way to know the runtime made that choice.
-    // Suppress for -l: a listing shouldn't announce a decompress backend (plain
-    // -l doesn't even decompress).
-    if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
-      std::ostringstream os;
-      os << "gzstd: PCIe Gen" << gen
-         << " detected; defaulting decompress to --cpu-only "
-            "(override with --hybrid or --gpu-only)\n";
-      std::fprintf(stderr, "%s", os.str().c_str());
-    }
-  } else {
+  // ONE RULE ON EVERY PCIe GENERATION.  From v0.13.0 through v0.17.51 a Gen<4
+  // host defaulted decompress to --cpu-only, on v0.11.20 measurements from a
+  // 24-core Gen3 host with two 11 GiB cards: hybrid 6-39% slower than the CPU
+  // pool on every data type, the D2H of the decompressed output being the cost.
+  // It no longer held there.  MEASURED at v0.17.50-51 on that host (20 GiB
+  // outputs to a real file beside the input, `sync` inside the timed region,
+  // palindromic, 2 reps), flagless cpu-only against --hybrid: medium-ratio cold
+  // 19.44-20.40 s vs 17.31-17.38; incompressible warm 19.99-20.34 vs 16.55-16.85;
+  // medium warm 16.86-19.10 vs 16.67-16.75; incompressible cold equal.  Hybrid was
+  // never slower.  Its wins came from the larger in-flight budget buffering the
+  // output, not from GPU work (0-1 GPU batches), and they faded at 60 GiB -- but
+  // the D2H cost the rule was written for no longer decides anything measurable.
+  //
+  // A warm input still goes cpu-only on Gen<4, as on the fabric boxes, although
+  // hybrid measured faster warm there: that is a deliberate trade for one rule
+  // and for what a GPU run costs when the GPU does little -- about twice the CPU
+  // time (CUDA sync), VRAM held, bringup, and cards shared with other users.
+  {
     // Gen4+ (or undetectable): the blanket-hybrid default was measurably
     // wrong for warm inputs (v0.15.2) — a ~fully-resident input feeds at
     // memory speed, the run is compute-bound, and cpu-only wins on the
@@ -36378,14 +36370,14 @@ static void apply_backend_defaults(Options & opt)
     const double resid = resid_probe;
     if (resid >= 0.95) {
       opt.cpu_only = true;
-      if (opt.cpu_queue_min > 0) {   // mirror the Gen<4 silencing
+      if (opt.cpu_queue_min > 0) {   // mirror parse_args's silencing
         if (opt.verbosity >= V_ERROR)
           std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
                        "(warm-input default; override with --hybrid)\n";
         opt.cpu_queue_min = 0;
       }
-      // Default verbosity, like the Gen<4 notice: the user sees no GPU
-      // activity and must know the runtime chose that (and how to undo it).
+      // Default verbosity: the user sees no GPU activity and must know the
+      // runtime chose that (and how to undo it).
       if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
         // gen==0 = PCIe undetectable, possibly no GPU at all — don't
         // recommend a --gpu-only that would exit 2 there.
@@ -36399,7 +36391,7 @@ static void apply_backend_defaults(Options & opt)
       }
     } else {
       opt.hybrid = true;
-      if (gen >= 4 && opt.verbosity >= V_VERBOSE) {
+      if (gen > 0 && opt.verbosity >= V_VERBOSE) {
         std::ostringstream os;
         os << "[ASYMMETRIC] PCIe Gen" << gen
            << " detected; defaulting decompress to --hybrid";
