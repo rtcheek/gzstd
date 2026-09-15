@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=439
-$EXTENSIVE && EXPECTED_TESTS=570
+EXPECTED_TESTS=440
+$EXTENSIVE && EXPECTED_TESTS=571
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -648,7 +648,13 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # default+GPU+noGDS (432).
 # NOT YET OBSERVED: --extensive on a GPU-less host; if the note fires there, the
 # -96 is the number to re-measure, not evidence of drift.
-EXPECTED_NOGPU_DELTA=97
+# v0.17.51 adds one default-tier cell inside "GPU acceleration" (the trivial-skip
+# park), which skips without a GPU.  MEASURED at v0.17.51 on a GPU host WITHOUT
+# GDS: default 434 ran (440 - 6) and the CPU-only build 342 ran (440 - 98), both
+# "as expected" -- which also corrects the default+GPU+noGDS figure above (432 was
+# derived one low; it is 434 at v0.17.51).  Still DERIVED: default+GPU+GDS 440 and
+# extensive 571, until those run on a GDS host.
+EXPECTED_NOGPU_DELTA=98
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -1815,6 +1821,59 @@ GLPY
     fail "--verify-engine=gpu fallback warning" "no warning or round-trip mismatch"
   fi
   rm -f "$gvz" "$gvr" "$gverr"
+
+  # A TRIVIALLY-COMPRESSED SKIP MUST NEVER RETIRE A GPU FOR THE REST OF THE RUN.
+  # Through v0.17.50 every skip counted toward a per-device streak, and a device
+  # that reached streams x 4 exited: "all remaining work is trivially compressed".
+  # The skipped frames go back to the FRONT of the queue, so the device's other
+  # stream popped the SAME frames again while the lone CPU thread was still busy on
+  # a real frame, and one 4-8 frame batch crossed the streak in microseconds.  A
+  # skip now parks the stream until the front is not trivial.
+  #
+  # The fixture is load-bearing.  Medium-ratio layout: 64 MiB blocks, two of three
+  # a repeated line, one of three base64 of random bytes -- entropy-coded, so the
+  # single CPU thread is BUSY (raw random bytes decode as a memcpy and do not
+  # reproduce it) -- 1 GiB at 1 MiB frames, decompressed at -T1.  MEASURED on a host
+  # with two 11 GiB cards: v0.17.50 exited in 5/5 runs at 1 GiB and at 2 GiB, but in
+  # only 1/5 at 512 MiB.  A run with no skip line proves nothing either way (the CPU
+  # drained the fixture before a GPU popped a trivial batch), so it is a SKIP -- and
+  # the drift note then says this host cannot exercise the cell.  A timeout FAILS:
+  # a parked stream that misses its wakeup is a hang.
+  tr_src="$TMPDIR/trivial-runs.bin"; tr_zst="$TMPDIR/trivial-runs.zst"
+  tr_log="$TMPDIR/trivial-runs.log"
+  (
+    set +o pipefail
+    : > "$tr_src"
+    for k in $(seq 0 15); do
+      if (( k % 3 )); then
+        yes 'gzstd trivial-run fixture: this repeated line compresses to far below two percent of its size.' \
+          | head -c $((64*1048576)) >> "$tr_src"
+      else
+        head -c $((48*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576)) >> "$tr_src"
+      fi
+    done
+  )
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$tr_src" -o "$tr_zst" 2>/dev/null
+  rm -f "$tr_src"
+  t0=$(now_ms); rc=0
+  timeout --foreground -k 10 120 "$GZSTD" -t --hybrid -T1 -vv "$tr_zst" >"$tr_log" 2>&1 || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  tr_skips=$(grep -a -c 'skipping trivial batch' "$tr_log")
+  tr_parks=$(grep -a -c -E 'parked [0-9]+ ms until the front is not trivially compressed' "$tr_log")
+  tr_exits=$(grep -a -c 'exiting to let CPU drain' "$tr_log")
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "trivial skip parks, never retires a GPU" "TIMED OUT -- a parked stream missed its wakeup"
+  elif [[ $rc -ne 0 ]]; then
+    fail "trivial skip parks, never retires a GPU" "exit $rc"
+  elif [[ $tr_skips -eq 0 ]]; then
+    skip "trivial skip parks, never retires a GPU" "not exercised: no trivial batch reached a GPU"
+  elif [[ $tr_exits -eq 0 && $tr_parks -ge 1 ]]; then
+    pass "trivial skip parks, never retires a GPU" "($tr_skips skips, $tr_parks parks)"
+  else
+    fail "trivial skip parks, never retires a GPU" \
+         "$tr_exits device exit(s), $tr_parks park(s) after $tr_skips skip(s)"
+  fi
+  rm -f "$tr_zst" "$tr_log"
 else
   skip "gpu-only compress/decompress" "no GPU"
   skip "GPU verify (--verify-engine=gpu) runs + round-trips" "no GPU"
@@ -1831,6 +1890,7 @@ else
   skip "GPU fault -> CPU-only rebuild (round-trips)" "no GPU"
   skip "GPU fault -> CPU-only rebuild (--tar)" "no GPU"
   skip "GPU fault over a pipe dies loudly" "no GPU"
+  skip "trivial skip parks, never retires a GPU" "no GPU"
 fi
 
 # ============================================================

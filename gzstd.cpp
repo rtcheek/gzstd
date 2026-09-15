@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.50";
+static constexpr const char * GZSTD_VERSION = "0.17.51";
 //
 // Architecture overview:
 //
@@ -28503,13 +28503,6 @@ static void gpu_decomp_worker(
         sched->register_gpu_stream(device_id);
     }
 
-    // Consecutive trivial-batch skips across all streams.  If we see too many
-    // in a row without doing real GPU work, the remaining workload is
-    // CPU-preferred (all trivially-compressed frames) and this GPU should
-    // exit so CPU can drain the queue without GPU interference.
-    int trivial_skip_streak = 0;
-    const int trivial_skip_exit_threshold = (int)ctxs.size() * 4;
-
     while (true) {
       bool submitted_any = false;
 
@@ -28814,6 +28807,32 @@ static void gpu_decomp_worker(
         // batches of trivial frames cause head-of-line blocking: the GPU
         // holds early-sequence frames for ~200ms while CPU fills all
         // throttle permits waiting for the writer, freezing the pipeline.
+        //
+        // AFTER A SKIP, PARK.  DO NOT RE-POP, AND NEVER LEAVE FOR THE RUN.  Through
+        // v0.17.50 each skip counted toward a per-device streak (streams x 4), and a
+        // device that crossed it exited for the rest of the run: "all remaining work
+        // is trivially compressed".  Nothing measured that.  re_enqueue puts the
+        // skipped frames back at the FRONT (they are the oldest), so the device's other
+        // stream popped the SAME frames again within microseconds; with every CPU thread
+        // busy on a real frame, 8 pops of ONE 4-8 frame batch crossed the streak before
+        // any CPU took the first of them.  MEASURED (24-core PCIe Gen3 host, 2x 11 GiB
+        // cards, -t --hybrid -T1, warm): the exit fired in 8/8 runs on a 20 GiB
+        // medium-ratio archive, and every exit rested on one frame range seen 8-9 times
+        // (logged seq ranges).  Removing the exit alone made the streams spin instead —
+        // 2,304 skips of one range, and one run at 7.64 s against 4.24-4.64.  Parking
+        // until the front is no longer trivial: 4.67 s vs 5.94 (-21%), 0 exits vs 1.2
+        // per run, 60 GPU batches vs 12; the same archive followed by an all-zero tail,
+        // the case the exit was written for, 6.07 vs 6.73 s (the streams park through
+        // the tail and leave by the drained return); default threads unchanged, because
+        // the CPU pool takes a trivial front before any GPU pops it and no skip occurs.
+        //
+        // The park holds no throttle permit (released above: a parked stream must not
+        // sequester the budget, v0.14.58) and cannot miss its wakeup: push, every pop,
+        // re_enqueue and set_done notify cv_, and wait_for_gpu_yield tests its predicate
+        // under the queue lock.  An empty or unknown front (front_ratio -1) ends the park
+        // and falls through to the blocking batch wait; a drained queue ends the worker.
+        // CPU workers take a trivial front ahead of every share, floor and --cpu-batch
+        // gate, so the frame a stream parks behind is always taken.
         if (sched) {
           bool all_trivial = true;
           for (const auto & t : C.batch) {
@@ -28826,14 +28845,25 @@ static void gpu_decomp_worker(
               vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id)
                    + "/S" + std::to_string(C.stream_index)
                    + "] skipping trivial batch (" + std::to_string(C.batch.size())
-                   + " frames, ratio<2%) -> re-enqueue for CPU\n");
+                   + " frames, ratio<2%) seq=[" + std::to_string(C.batch.front().seq)
+                   + ".." + std::to_string(C.batch.back().seq)
+                   + "] -> re-enqueue for CPU\n");
             int held = (int)C.batch.size();
             queue->re_enqueue(C.batch);
             if (bp) bp->release(held);
-            ++trivial_skip_streak;
+            const uint64_t park_t0 = (opt.verbosity >= V_DEBUG) ? now_ns() : 0;
+            if (!queue->wait_for_gpu_yield([](const TaskQueue::QueueState & qs) {
+                  return !(qs.front_ratio >= 0.0 && qs.front_ratio < 0.02);
+                }))
+              producer_done_seen = true;
+            if (opt.verbosity >= V_DEBUG)
+              vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id)
+                   + "/S" + std::to_string(C.stream_index) + "] parked "
+                   + std::to_string((now_ns() - park_t0) / 1000000)
+                   + " ms until the front is not trivially compressed"
+                   + (producer_done_seen ? " (queue drained)" : "") + "\n");
             continue;
           }
-          trivial_skip_streak = 0;  // reset on any non-trivial batch
         }
 
         if (g_perf) {
@@ -30004,17 +30034,6 @@ static void gpu_decomp_worker(
 
         // Notify writer that a full batch of frames is now available
         results->cv.notify_one();
-      }
-
-      // Exit if remaining workload is all trivially-compressed frames.
-      // GPU is a net negative on that data (PCIe D2H overhead dominates,
-      // and HOL-blocks the writer by holding early-sequence frames).
-      // Let CPU workers drain the queue alone.
-      if (trivial_skip_streak >= trivial_skip_exit_threshold) {
-        if (opt.verbosity >= V_VERBOSE)
-          vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
-               + "] all remaining work is trivially compressed; exiting to let CPU drain\n");
-        break;
       }
 
       // Check termination (no in-flight check needed: batches complete inline)

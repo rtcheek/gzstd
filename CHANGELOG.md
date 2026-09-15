@@ -1,9 +1,80 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.50  
+**Covers:** v0.9.50 → v0.17.51  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+
+## v0.17.51 — a trivially-compressed skip retired a GPU for the rest of the run
+
+**One small batch the CPU had not reached yet took a GPU out of the job.** In hybrid decompress a GPU stream skips
+a batch whose frames are all trivially compressed (under 2%) and hands it back to the CPU. Through v0.17.50 each
+skip counted toward a per-device streak, and a device that reached streams × 4 left for the rest of the run:
+"all remaining work is trivially compressed". On a 24-core PCIe Gen3 host with two 11 GiB cards, decompressing a
+20 GiB medium-ratio archive at `-T1`, that exit fired in 8 of 8 runs; runs that lost both cards took 6.6–7.1 s
+against 5.2 s for runs that lost one.
+
+### How it was found
+
+- Validating v0.17.50 on its GPU-favourable shape (`-t --hybrid -T1`), 2 of 5 cold runs lost a card for the
+  whole run and took 39–50% longer — one run per binary. The exit, not the queue floor, decided the wall time.
+- A scratch build that logs the frame range and the streak on every skip showed that **every exit rested on ONE
+  range of 4–8 frames popped 8–9 times**, in consecutive log lines, by the device's two streams, before the lone
+  CPU thread took the first of them. In one run GPU0 skipped frames 316..323 eight times and exited; GPU1 then
+  skipped the same 316..323 eight times and exited too.
+- The mechanism is the v0.12.20 deadlock fix doing its job: `re_enqueue` puts skipped frames back at the FRONT
+  (they are the oldest), so the next pop, from either stream, takes the same frames again within microseconds.
+  The streak measured how long the CPU took to reach one batch, not how much of the remaining work was trivial.
+- The exit arrived in v0.12.21 without a CHANGELOG entry or a measurement. It was not part of the v0.12.20
+  deadlock fix, which the front re-insert alone provides.
+
+### The change
+
+- A skip now **parks** the stream in `wait_for_gpu_yield` until the front of the queue is not trivially
+  compressed, or the queue drains. The streak, its threshold and the exit are removed.
+- The parked stream holds no throttle permit (released before parking — a parked stream must not sequester the
+  budget, v0.14.58) and cannot miss its wakeup: `push`, every pop, `re_enqueue` and `set_done` notify the
+  queue's condition variable, and the predicate is tested under the queue lock. An empty or unknown front ends
+  the park and falls through to the blocking batch wait; a drained queue ends the worker. CPU workers take a
+  trivial front ahead of every share, floor and `--cpu-batch` gate, so the frame a stream parks behind is always
+  taken — including under a fixed `--cpu-share`.
+- `-vv`: the skip line now carries the frame range, and a new line reports each park's duration.
+
+### Measured
+
+Same binary, the exit and the park selected at run time; warm; `-t --hybrid`; 4 runs per arm in a balanced order.
+
+| | exit (v0.17.50 behaviour) | park |
+|---|---|---|
+| 20 GiB medium-ratio, `-T1` | 5.94 s (4.42–7.04), 1.2 exits/run, 12 GPU batches | **4.67 s** (4.42–5.02), 0 exits, 60 GPU batches |
+| the same followed by an all-zero tail, `-T1` | 6.73 s (5.62–8.45), 2 exits every run | **6.07 s** (5.41–6.42), 0 exits |
+| 234 GiB medium-ratio, default threads | 12.30 s (12.29–12.31) | 12.34 s (12.28–12.49) |
+
+- **Removing the exit alone is not a fix:** the streams spin, re-popping one range thousands of times (2,304 in
+  one `-vv` run), and one run took 7.64 s against 4.24–4.64.
+- The all-zero tail is the case the exit was written for. The park does not regress it: the streams park through
+  the tail and leave by the drained return (those two parks lasted ~1.3 s each).
+- At default threads no skip occurs — 22 free CPU threads take a trivial front before any GPU pops it — so the
+  change is inert there. Park durations on the `-T1` run: median 19 ms, max 50 ms.
+
+### Test
+
+New cell in the GPU section: a generated 1 GiB fixture in the medium-ratio layout (64 MiB blocks, two of three a
+repeated line, one of three base64 of random bytes, so the single CPU thread is busy on entropy-coded frames),
+compressed at 1 MiB frames and verified with `-t --hybrid -T1 -vv` under a timeout. PASS requires no device exit
+and at least one park; a run with no skip line is a SKIP (not exercised); a timeout FAILS (a missed park wakeup
+is a hang). Mutation-tested under the suite's single-card default: this build PASS 3/3; v0.17.50 FAIL 3/3
+(1 exit, 0 parks); the exit removed without the park FAIL 3/3 (0 exits, 0 parks, 10,367–14,474 skips). At
+512 MiB v0.17.50 exited in only 1 of 5 runs, so the fixture size is load-bearing. Not yet exercised on the 8-GPU
+host, where slower GPU bringup may leave the single CPU thread to drain the fixture first (the cell then SKIPs).
+
+**Test suite:** default run on a GPU host without GDS **434 passed, 0 failed, 6 skipped** (440 total; the drift
+check expected 434 = 440 − 6); CPU-only build **342 passed, 0 failed, 79 skipped** (expected 342 = 440 − 98). The
+new cell passed in the default run (2 skips, 2 parks, 2.5 s) and skips without a GPU. Not yet run at v0.17.51:
+the default suite on a GDS host (derived 440) and `--extensive` (derived 571).
 
 ---
 

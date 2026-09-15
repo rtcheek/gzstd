@@ -333,6 +333,25 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.51: a trivially-compressed skip retired a GPU for the rest of the run
+
+In hybrid decompress a GPU stream skips an all-trivial batch (every frame under 2%) and hands it back to the CPU.
+Through v0.17.50 each skip counted toward a per-device streak, and a device that reached streams × 4 exited for
+the rest of the run. `re_enqueue` returns skipped frames to the FRONT, so the device's other stream re-popped the
+same frames within microseconds; with the CPU busy, one 4–8 frame batch crossed the streak. Found while checking
+v0.17.50 on the 2-GPU workstation, where the exit fired in 8/8 `-t --hybrid -T1` runs of a 20 GiB medium-ratio
+archive. v0.17.51 parks the stream until the front is not trivial: −21% on that shape, the all-zero-tail case the
+exit was written for not regressed, inert at default threads (CHANGELOG v0.17.51). A new suite cell reproduces
+the exit on a generated 1 GiB fixture and was mutation-tested both ways.
+
+**Open from that work:**
+- **The 8-GPU server may not exercise the new cell:** slower GPU bringup can let the single CPU thread drain the
+  1 GiB fixture before a GPU pops a trivial batch, and the cell then SKIPs. Read that cell's line in the next
+  default run there.
+- **The Gen3 decompress default stays `--cpu-only`.** On 20 GiB real-file outputs `--hybrid` won without doing GPU
+  work — its larger in-flight budget buffered nearly the whole output. A 1,024-frame CPU-only sink floor matched
+  that at 20 GiB but bought nothing at 60 GiB (+3.6%, not significant) for 5× the RAM, so it was not shipped.
+
 ## SHIPPED v0.17.50: the hybrid decompress queue floor reserved four times its own ceiling
 
 On a cold 261 GiB archive the default backend lost to `--cpu-only` and held ten times the memory (written to a
@@ -345,10 +364,11 @@ CPU pool took nothing for ~14 s of a 40 s run. v0.17.50 declares the ceiling and
 budget of a decompress that ends at a writer by the sink rather than by consumer appetite (CHANGELOG v0.17.50).
 
 **Open from that work:**
-- **NEXT: the workstation check.** Releasing the floor is safe wherever the CPU pool is the faster engine, which
-  is every decompress workload this host can produce — 4 CPU threads beat 8 H100s on 70 GiB of incompressible
-  frames (3.84 s against 13.47). The 2-GPU workstation, where GPU decompress measured 11x the CPU pool, is the
-  one place a starved-GPU regression could appear. Run the cold `-t` and real-sink pairs there.
+- **DONE: the workstation check passed.** v0.17.50 was no slower than v0.17.49 in every shape measured (cold
+  `-t` at default threads and `-T1`, `-d` to `/dev/null`) and held 2–4× less memory. The premise above was wrong:
+  the "11x" was two cards with the utilization scaler off against stock, not GPU against CPU — there two cards
+  decompress ~4.5 GiB/s against ~20 GiB/s for 22 CPU threads. The check surfaced the one-way trivial exit, fixed
+  in v0.17.51.
 - **The trivial-batch exit is one-way.** A device that meets `streams * 4` consecutive all-trivial batches
   leaves for the rest of the run. On the benchmark archive all 8 exit within seconds and never return, whatever
   the remaining content looks like. Backing off and re-probing is the shape the rest of the scheduler is moving
