@@ -333,6 +333,18 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.53: a wedged GPU decompress batch hung the run
+
+A GPU decompress batch runs inline on its worker, so a CUDA call that never returned blocked the only thread that
+could react and the writer waited forever for that batch's sequence numbers — compress has had the `--adapt`
+deadline governor since v0.15.x, decompress had nothing under any flag. Measured with a stall injected before the
+batch sync on a Gen3 host with two 11 GiB cards: a 120 s wedge left `-t --gpu-only` stuck at exit 124/121.2 s.
+v0.17.53 adds an always-on watchdog that stops the device's intake at max(4x its batch EMA, 2 s), takes the batch
+away at max(2x that, 6 s) by copying the undelivered tail back to the CPU, retires and detaches the wedged worker,
+and exits fast once the output is complete: the same wedge now finishes at exit 0 in 13.2 s, byte-identical
+(CHANGELOG v0.17.53). Deferred from the same review: decompress tail-aware GPU intake, and `--direct-stage` for
+decompress.
+
 ## SHIPPED v0.17.52: PCIe Gen3 decompress takes the same default as every other fabric
 
 From v0.13.0 through v0.17.51 a Gen<4 host decompressed `--cpu-only` whatever the input. On the Gen3 workstation

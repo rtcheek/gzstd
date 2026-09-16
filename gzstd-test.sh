@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=440
-$EXTENSIVE && EXPECTED_TESTS=571
+EXPECTED_TESTS=443
+$EXTENSIVE && EXPECTED_TESTS=574
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -654,7 +654,10 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # "as expected" -- which also corrects the default+GPU+noGDS figure above (432 was
 # derived one low; it is 434 at v0.17.51).  Still DERIVED: default+GPU+GDS 440 and
 # extensive 571, until those run on a GDS host.
-EXPECTED_NOGPU_DELTA=98
+# v0.17.53 adds three default-tier cells (GPU decompress stuck-batch reclaim),
+# all three of which skip without a GPU: 440 -> 443 and the no-GPU delta 98 -> 101.
+# DERIVED until a suite run confirms it.
+EXPECTED_NOGPU_DELTA=101
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -5438,6 +5441,89 @@ else
 fi
 rm -f "$TMPDIR/adl.zst" "$TMPDIR/adl.out" "$TMPDIR/adl1.err" \
       "$TMPDIR/adl2.err" "$TMPDIR/adl3.err"
+
+# ────────────────────────────────────────────────────────────
+section "GPU decompress stuck-batch reclaim (fault injection)"
+
+# A decompress batch runs INLINE on its GPU worker, so a CUDA call that never
+# returns blocks the only thread that could react to it: the writer waits for
+# that batch's sequence numbers and the run hangs.  Unlike the compress side
+# there is no governor to notice, which is why the reclaimer is ALWAYS ON --
+# these cells deliberately pass no --adapt.
+#
+# GZSTD_DEBUG_DECOMP_STALL=-1:<secs> stalls the first device to publish a batch,
+# just before its sync.  Deadlines: stop new intake at max(4x that device's batch
+# EMA, 2 s), take the batch away at max(2x that, 6 s).
+#
+# THE SHAPE IS LOAD-BEARING, measured on a host with two 11 GiB cards:
+#   * --gpu-only, never --hybrid.  With --hybrid the CPU drained this corpus at
+#     16 GiB/s before any GPU popped a batch -- no [STALL] line at all, a cell
+#     that silently tests nothing.
+#   * The suite pins ONE card, so the wedge retires the only device and every
+#     remaining frame must come back through the CPU rescue pool.  That is the
+#     harder path and the one worth testing.
+#   * --chunk-size=1 for enough frames to have a batch in flight; base64 of
+#     random bytes so frames are entropy-coded (a trivially-compressed frame is
+#     routed to the CPU by design and would never reach a GPU batch).
+# The 45 s timeout is a HANG GUARD, not a performance assertion: v0.17.52 stays
+# stuck in the wedged call for the full 60 s stall and trips it.
+if has_gpu 2>/dev/null; then
+  dr_src="$TMPDIR/dreclaim.bin"; dr_zst="$TMPDIR/dreclaim.zst"
+  dr_out="$TMPDIR/dreclaim.out"; dr_log="$TMPDIR/dreclaim.log"
+  head -c $((48*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576)) > "$dr_src"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dr_src" -o "$dr_zst" 2>/dev/null
+
+  # 1. A wedged batch is taken away and finished on the CPU, with EVERY frame
+  # accounted for -- files_match, not -t, so a dropped frame cannot hide.
+  rc=0
+  timeout --foreground -k 10 45 env GZSTD_DEBUG_DECOMP_STALL=-1:60 \
+    "$GZSTD" -d --gpu-only -v -f "$dr_zst" -o "$dr_out" >"$dr_log" 2>&1 || rc=$?
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "wedged GPU decompress batch is reclaimed for the CPU" \
+         "TIMED OUT -- the wedged batch was never taken away"
+  elif [[ $rc -ne 0 ]]; then
+    fail "wedged GPU decompress batch is reclaimed for the CPU" "exit $rc"
+  elif ! grep -aqE 'batch wedged .* past its deadline.*reclaiming [0-9]+ frame' "$dr_log"; then
+    fail "wedged GPU decompress batch is reclaimed for the CPU" "no reclaim announced"
+  elif files_match "$dr_src" "$dr_out"; then
+    pass "wedged GPU decompress batch is reclaimed for the CPU"
+  else
+    fail "wedged GPU decompress batch is reclaimed for the CPU" "output differs"
+  fi
+
+  # 2. A 3 s stall crosses the intake deadline only: the device is demoted and
+  # keeps its batch.  Reclaiming here would retire a slow-but-healthy card.
+  rc=0
+  timeout --foreground -k 10 60 env GZSTD_DEBUG_DECOMP_STALL=-1:3 \
+    "$GZSTD" -d --gpu-only -v -f "$dr_zst" -o "$dr_out" >"$dr_log" 2>&1 || rc=$?
+  if [[ $rc -eq 0 ]] \
+     && grep -aq 'no new intake' "$dr_log" \
+     && ! grep -aq 'reclaiming' "$dr_log" \
+     && files_match "$dr_src" "$dr_out"; then
+    pass "a slow GPU decompress batch is demoted, not reclaimed"
+  else
+    fail "a slow GPU decompress batch is demoted, not reclaimed" "exit $rc"
+  fi
+
+  # 3. Guard (not a discriminator -- v0.17.52 passes it too): with no stall
+  # injected, neither deadline may fire.  A watchdog that retires healthy GPUs
+  # would be worse than the hang it replaces.
+  rc=0
+  timeout --foreground -k 10 60 "$GZSTD" -d --gpu-only -v -f "$dr_zst" -o "$dr_out" \
+    >"$dr_log" 2>&1 || rc=$?
+  if [[ $rc -eq 0 ]] \
+     && ! grep -aqE 'no new intake|reclaiming' "$dr_log" \
+     && files_match "$dr_src" "$dr_out"; then
+    pass "decompress reclaim stays quiet on a healthy run"
+  else
+    fail "decompress reclaim stays quiet on a healthy run" "exit $rc"
+  fi
+  rm -f "$dr_src" "$dr_zst" "$dr_out" "$dr_log"
+else
+  skip "wedged GPU decompress batch is reclaimed for the CPU" "no GPU"
+  skip "a slow GPU decompress batch is demoted, not reclaimed" "no GPU"
+  skip "decompress reclaim stays quiet on a healthy run" "no GPU"
+fi
 
 section "Sliding-window compression"
 

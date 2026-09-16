@@ -1,12 +1,115 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.52  
+**Covers:** v0.9.50 → v0.17.53  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.53 — a wedged GPU decompress batch hung the run with no way out
+
+**A CUDA call that never returns no longer hangs decompression.** A decompress batch runs *inline* on its GPU
+worker, so the thread that would have to react to a wedged call is the one stuck inside it, and the writer waits
+forever for that batch's sequence numbers. Compress has had a deadline governor since v0.15.x (`--adapt` action 6:
+demote at 4x the batch EMA, escalate into the proven abort → CPU-only rebuild). Decompress had nothing, under any
+flag, so the only outcome was a hang.
+
+### Why
+
+- **MEASURED on a 24-core Gen3 host with two 11 GiB cards**, a stall injected immediately before the batch sync
+  (`GZSTD_DEBUG_DECOMP_STALL`, mirroring the compress side's hook): an 8 s stall cost the run 8 s, and a 120 s
+  stall was still stuck when the harness killed it — `-t --gpu-only` exit 124 at 121.2 s, `-t --hybrid -T1` the
+  same, and `-d` to a real file 165.3 s. Nothing in the run noticed.
+- A real wedge is not hypothetical on this class of hardware: marginal cards and rare nvCOMP-on-Turing faults
+  already produce GPU faults that the CPU-rebuild path exists to absorb (CHANGELOG v0.14.x, v0.17.45).
+
+### The change
+
+**Always on, not `--adapt`-gated** — a hang is a correctness failure, not a tuning question.
+
+- Each GPU decompress worker publishes its in-flight batch (the batch, its delivered count, submit time, and the
+  device's batch EMA) to a process-lifetime registry just before the sync, and clears it on completion.
+- A watchdog scans that registry every 250 ms. At `max(4x that device's batch EMA, 2 s)` the device stops taking
+  **new intake** (a slow-but-healthy card loses only its intake). At `max(2x that, 6 s)` the watchdog takes the
+  batch away: it copies the undelivered tail, re-enqueues it for the CPU, releases the throttle permits, retires
+  the device, and performs the worker's exit accounting — which is what lets `--gpu-only`'s CPU rescue pool start.
+- **The intake brake is released when the overdue batch lands** — only the reclaim is one-way. A sticky demote
+  would retire a contended-but-healthy device for the rest of the invocation, later files included, and the
+  longest healthy batch measured here was 1.03 s against a 2 s floor, which a shared card can cross honestly. On
+  this inline path the brake cannot bite while the batch is in flight anyway (the worker is inside it, one worker
+  per device), so the intake check it guards is documented as a guard rather than a live path.
+- **The bytes are copied, not moved.** The wedged H2D is an async copy straight out of the frame's host view, so
+  handing that block to a CPU worker that frees it after decoding would be a use-after-free.
+- **The abandoned worker is never joined,** because it may never return. It parks forever on a leaked mutex and
+  condition variable — never returning means no `StreamCtx` destructors run and no pointer to its dead stack can
+  be reached — teardown detaches it, and `main` `_Exit()`s once the output is complete.
+- The 6 s floor is sized against measurement, not taste: the longest healthy GPU decompress batch across 101 `-vv`
+  logs on that host was 1.03 s, so the takeaway sits ~6x above real work.
+- `--gds-only`/`--direct-stage` frames carry no host bytes at all, so a wedge there cannot be rescued to the CPU;
+  it dies loudly (`EXIT_GPU_FAIL`) rather than silently returning short data.
+- **The in-flight record is retired on every worker exit path, not just successful completion.** The batch is
+  published before the sync, so a `checkCuda` throw inside it — the ordinary GPU-fault → CPU-rescue path that
+  predates this work — would otherwise leave the record pointing at a `StreamCtx` the unwind is about to destroy,
+  and the watchdog would copy bytes out of freed memory and re-enqueue them. Found by review of this change, not
+  by a failure: with the fault-injection hook the window is narrow (it faults only the final batch, so little work
+  remains before teardown stops the watchdog), but a real mid-run fault leaves the whole tail outstanding and the
+  window wide. The fault → rescue path now reports zero spurious reclaims.
+
+### The ordering bug that made the first version inert
+
+The producer finishes streaming frames long before the workers finish consuming them, so `decompress_nvcomp`
+reaches its teardown section early — while batches are still in flight. Stopping the watchdog there (as the first
+implementation did) killed it **~0.7 s into an 11 s run**, and no stuck batch could ever be reclaimed; the trace
+showed 52 batches published and 0 watchdog ticks. Nor is it a two-line swap: joining a wedged worker blocks
+forever, and the join loop must not choose join-vs-detach before a reclaim can mark the device abandoned. Teardown
+now waits on a condition variable until every spawned worker has accounted for its exit — the watchdog does that
+accounting for one it abandons, so the wait completes even when a worker never will — then detaches or joins, and
+stops the watchdog **last**.
+
+### Verified
+
+On the 5.40 GiB → 19.53 GiB medium-ratio archive, warm input, two cards:
+
+| shape | before | after |
+|---|---|---|
+| `-t --gpu-only`, 120 s wedge | exit 124 at 121.2 s | **exit 0 at 13.2 s** |
+| `-t --hybrid -T1`, 120 s wedge | exit 124 at 121.2 s | **exit 0 at 9.1 s** |
+| `-d` to a real file, 120 s wedge | 165.3 s | **completes, byte-identical** |
+
+- The 8 s stall reclaims 16 frames at 6.0–6.2 s past the deadline; the **3 s stall demotes only** (no reclaim);
+  the **no-stall control** runs 6.0 s with neither notice. Those last two matter as much as the wedge: they show
+  the watchdog is not a timer that retires healthy GPUs.
+- With **one card visible** — the suite's default shape, where a wedge retires the only device and every remaining
+  frame must return through the CPU rescue pool — exit 0 in 8.0 s, `no new intake` at 2.2 s, the reclaim at 6.2 s,
+  then `all GPUs failed; finishing decompression on CPU (22 threads)`.
+- `-d` output byte-identical to the original in every `-d` arm, single- and dual-card: the `_Exit` fast path does
+  not truncate the writer.
+
+### Test
+
+Three default-tier cells (`GPU decompress stuck-batch reclaim`), all three skipping without a GPU: a wedged batch
+is reclaimed and the output still matches byte-for-byte (`files_match`, not `-t`, so a dropped frame cannot hide);
+a 3 s stall is demoted and **not** reclaimed; and a healthy run raises neither notice. The shape is load-bearing
+and was chosen from measurement: `--gpu-only`, never `--hybrid` (with `--hybrid` the CPU drained this corpus at
+16 GiB/s before any GPU popped a batch — no stall line at all, a cell that silently tests nothing), `--chunk-size=1`
+for enough frames to have a batch in flight, and base64 of random bytes so the frames are entropy-coded rather
+than trivially compressed (a trivial frame is routed to the CPU by design and would never reach a GPU batch). The
+45 s `timeout` is a hang guard, not a performance assertion.
+
+Mutation-tested by running the section verbatim under the suite's single-card default: this build passes 3/3;
+the shipped v0.17.52 binary fails two of them (no reclaim announced, no demote notice) and passes the healthy-run
+guard, as a binary with no watchdog should; and a mutant built from this source with the fault hook and the demote
+intact but the takeaway deadline pushed out to 600 s fails the wedge cell **on the hang guard** — which is what
+shows that cell catches the hang itself, not merely a missing log line.
+
+**Test suite:** default run on a GPU host without GDS **437 passed, 0 failed, 6 skipped** (443 total; the drift
+check expected 437 = 443 − 6 GDS unavailable, confirming the new baseline). The three new cells passed in 7.4 s,
+4.0 s and 1.0 s. The no-GPU delta moves 98 → 101 (all three cells skip without a GPU). Not run at v0.17.53: the
+CPU-only suite and `--extensive` (derived 574). The CPU-only build (`USE_NVCOMP=OFF`) was compiled as a check and
+builds clean at 0.17.53; its 9 warnings are all pre-existing unused-symbol notices for GPU helpers that
+configuration compiles out of use, none of them in the lines this change touches, and the GPU build has none.
 
 ## v0.17.52 — PCIe Gen3 decompress takes the same default as every other fabric
 

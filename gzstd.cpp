@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.52";
+static constexpr const char * GZSTD_VERSION = "0.17.53";
 //
 // Architecture overview:
 //
@@ -27660,6 +27660,83 @@ static size_t gds_decomp_temp_for(size_t nb, size_t max_decomp)
   return est;
 }
 
+// ===========================================================================
+// STUCK-GPU RECLAIM (decompress).  A decompress batch runs INLINE on its worker
+// thread: H2D, kernel, cudaStreamSynchronize, read-back, per-frame D2H, push.
+// A CUDA call that never returns therefore blocks the only thread that could
+// react, and the writer waits forever for that batch's sequence numbers.
+// MEASURED at v0.17.52 on a 2-card Gen3 host with a stall injected before the
+// batch sync: an 8 s stall cost the run 8 s; a 120 s stall was still stuck when
+// the harness killed it at 45 s, with no recovery of any kind.  The compress
+// path survives the same fault because it submits and drains on SEPARATE
+// threads, so its worker can throw while the drain thread is wedged; nothing
+// equivalent exists here.
+//
+// So the reclaimer (started by decompress_nvcomp) takes the batch away from the
+// stuck worker instead: it copies the undelivered frames' bytes, re-enqueues
+// them for the CPU pool, releases their throttle permits and retires the device.
+// Each worker publishes its in-flight batch here while the batch is live.
+//
+// THIS REGISTRY OUTLIVES decompress_nvcomp ON PURPOSE (leaked, never destroyed).
+// An abandoned worker may return from CUDA at any later time -- after the queue,
+// result store and throttle it was handed have been destroyed -- and the only
+// thing it may legally touch then is this object.
+struct GzDecompInflight {
+  std::mutex            m;
+  std::vector<Task> *   batch     = nullptr;   // the worker's live batch, null when idle
+  size_t *              delivered = nullptr;   // frames of it already pushed
+  uint64_t              submit_ns = 0;         // when this batch went to the device
+  uint64_t              ema_ns    = 0;         // EMA of completed batch durations
+  bool                  active    = false;
+  bool                  reclaimed = false;     // set by the reclaimer; one-way
+};
+static GzDecompInflight * const g_decomp_inflight = new GzDecompInflight[ADAPT_DL_MAX];
+// Bitmask: no new intake (deadline passed, batch still in flight).
+static std::atomic<uint64_t> g_decomp_demoted{0};
+// Bitmask: the device's batch was reclaimed and its worker abandoned.  Read by
+// decompress_nvcomp (detach instead of join), by select_best_gpus (later files
+// in the same invocation must not touch it) and by main (fast exit).
+static std::atomic<uint64_t> g_decomp_abandoned{0};
+// Raised whenever a GPU decompress worker accounts for its exit -- by the worker
+// itself, or by the reclaimer on behalf of one it abandoned.  Teardown waits on
+// this instead of joining blindly: a wedged worker never returns, and the join
+// loop must not decide join-vs-detach before a reclaim can mark it abandoned.
+// Leaked (never destroyed) for the same reason as the registry: an abandoned
+// worker may touch it long after decompress_nvcomp's frame is gone.
+static std::mutex              & g_decomp_exit_mx = *new std::mutex;
+static std::condition_variable & g_decomp_exit_cv = *new std::condition_variable;
+
+// An abandoned worker parks HERE forever rather than returning: returning would
+// run its StreamCtx destructors (cudaFree on the wedged device -- the same call
+// that is already stuck) and its catch/rescue path, which dereference pointers
+// into a stack frame that is gone by then.  The thread leaks by design; main
+// _Exit()s once the output is complete.
+// Retire this device's in-flight record.  MUST run on EVERY worker exit path,
+// not just successful batch completion: the batch is published before the sync,
+// so a checkCuda throw inside the batch (the ordinary GPU-fault -> CPU-rescue
+// path) leaves the record pointing at a StreamCtx that the unwind is about to
+// destroy.  The reclaimer would then copy bytes out of freed memory and
+// re-enqueue them -- silent corruption on a path that predates this one.
+static void gz_decomp_unpublish(int device_id)
+{
+  if (device_id < 0 || device_id >= ADAPT_DL_MAX) return;
+  GzDecompInflight & R = g_decomp_inflight[device_id];
+  std::lock_guard<std::mutex> lk(R.m);
+  if (R.reclaimed) return;   // the reclaimer owns this batch now; leave it alone
+  R.active    = false;
+  R.batch     = nullptr;
+  R.delivered = nullptr;
+  R.submit_ns = 0;
+}
+
+[[noreturn]] static void gz_decomp_park_forever()
+{
+  static std::mutex              & pm  = *new std::mutex;
+  static std::condition_variable & pcv = *new std::condition_variable;
+  std::unique_lock<std::mutex> lk(pm);
+  for (;;) pcv.wait(lk);
+}
+
 static void gpu_decomp_worker(
   int device_id,
   int slot_index,
@@ -27702,12 +27779,31 @@ static void gpu_decomp_worker(
   auto note_exit_and_rescue = [&]() {
     if (exit_noted) return;                 // idempotent: paths can overlap
     exit_noted = true;
+    // Before anything else: this thread is leaving, so its published batch (if
+    // any) must stop being reclaimable.  See gz_decomp_unpublish.
+    gz_decomp_unpublish(device_id);
     if (!gpu_exits) return;
     const int out = gpu_exits->fetch_add(1, std::memory_order_acq_rel) + 1;
+    { std::lock_guard<std::mutex> lk(g_decomp_exit_mx); }
+    g_decomp_exit_cv.notify_all();
     if (out != gpu_worker_count) return;    // not the last worker out
     if (!opt.gpu_only || !queue) return;    // hybrid still has CPU consumers
     if (queue->drained()) return;           // empty AND producer done: nothing owed
     gpu_only_cpu_fallback(true, queue, results, opt, m, bp, discard_results);
+  };
+  // Reclaim plumbing (see GzDecompInflight).  A device beyond ADAPT_DL_MAX slots
+  // is simply unprotected -- no registry entry, no checks, today's behaviour.
+  const bool     rc_tracked = (device_id >= 0 && device_id < ADAPT_DL_MAX);
+  GzDecompInflight * const rc_slot = rc_tracked ? &g_decomp_inflight[device_id] : nullptr;
+  // Called after EVERY blocking CUDA call and before every delivery: if the
+  // reclaimer took this batch, this thread owns nothing any more.
+  auto rc_bail_if_reclaimed = [rc_slot]() {
+    if (!rc_slot) return;
+    {
+      std::lock_guard<std::mutex> lk(rc_slot->m);
+      if (!rc_slot->reclaimed) return;
+    }
+    gz_decomp_park_forever();
   };
   const size_t stream_count = std::max<size_t>(1, (size_t)opt.gpu_streams);
 
@@ -28714,6 +28810,18 @@ static void gpu_decomp_worker(
       // `busy` bookkeeping copied from compress was write-only-false here and
       // guarded states that cannot occur; removed v0.14.71.)
       for (auto & C : ctxs) {
+        // Deadline demote: this device has a batch overdue past its intake
+        // deadline, so it takes no new work.  A GUARD, NOT A LIVE PATH TODAY:
+        // there is one worker per device and batches complete inline, so this
+        // thread is itself inside the overdue batch and the bit is released when
+        // that batch lands -- it can only be seen here if that ever stops holding.
+        // The device holds nothing at this point, so the ordinary drained-exit
+        // path is the right way out.
+        if (rc_tracked
+            && (g_decomp_demoted.load(std::memory_order_relaxed) & (1ull << device_id))) {
+          producer_done_seen = true;
+          continue;
+        }
         // Fixed-share mode: GPU yields when CPU is below its target share.
         // If the queue is already drained, propagate that so the worker can
         // exit instead of spinning forever on the share check.
@@ -29289,8 +29397,10 @@ static void gpu_decomp_worker(
         // exact query -- and the synchronise it requires -- is skipped.  This was
         // 38% of the batch loop, more than the decompress kernel itself.
         const bool temp_preallocated = (C.temp_bytes >= temp_bound && temp_bound > 0);
-        if (!temp_preallocated)
+        if (!temp_preallocated) {
           checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(pre-temp)");
+          rc_bail_if_reclaimed();
+        }
         uint64_t h2d_elapsed_ns = (h2d_t0 > 0) ? now_ns() - h2d_t0 : 0;
         double h2d_ms_v = double(h2d_elapsed_ns) / 1e6;
         if (g_perf) {
@@ -29365,6 +29475,7 @@ static void gpu_decomp_worker(
                                     C.filled * sizeof(size_t),
                                     cudaMemcpyHostToDevice, C.stream), "H2D sizes");
           checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(re-upload)");
+          rc_bail_if_reclaimed();
         }
 
         // Launch batched decompression
@@ -29413,8 +29524,34 @@ static void gpu_decomp_worker(
 
         cudaEventRecord(C.ev_end, C.stream);
 
+        // Publish this batch so the reclaimer can take it if the sync below never
+        // returns.  Cleared at batch completion, which also feeds the EMA the
+        // deadline is scaled from.
+        if (rc_slot) {
+          std::lock_guard<std::mutex> lk(rc_slot->m);
+          rc_slot->batch     = &C.batch;
+          rc_slot->delivered = &C.delivered;
+          rc_slot->submit_ns = now_ns();
+          rc_slot->active    = true;
+        }
+        // Fault-injection test hook: stall this device's batch before its sync,
+        // simulating a wedged CUDA call, so the suite can watch the reclaim.
+        // Same shape as the compress side's GZSTD_DEBUG_ADAPT_STALL.
+        if (const char * e = std::getenv("GZSTD_DEBUG_DECOMP_STALL")) {
+          static std::atomic<bool> stalled_once{false};
+          int sd = -1, ss = 0;
+          if (std::sscanf(e, "%d:%d", &sd, &ss) == 2
+              && (sd == device_id || sd == -1)
+              && !stalled_once.exchange(true)) {
+            vlog(V_VERBOSE, opt, "[STALL] decompress GPU" + std::to_string(device_id)
+                 + " sleeping " + std::to_string(ss) + " s before its batch sync\n");
+            std::this_thread::sleep_for(std::chrono::seconds(ss));
+          }
+        }
+
         // Synchronize and read back results
         checkCuda(cudaStreamSynchronize(C.stream), "cudaStreamSynchronize(decomp)");
+        rc_bail_if_reclaimed();
         uint64_t kern_elapsed_ns = (kern_t0 > 0) ? now_ns() - kern_t0 : 0;
         double comp_ms_v = double(kern_elapsed_ns) / 1e6;
         if (g_perf) {
@@ -29471,6 +29608,7 @@ static void gpu_decomp_worker(
                                     cudaMemcpyDeviceToHost, C.stream), "D2H verify checksums");
         }
         checkCuda(cudaStreamSynchronize(C.stream), "D2H meta sync");
+        rc_bail_if_reclaimed();
         if (ck_t0)
           g_gdsv_kernel_ns.fetch_add(now_ns() - ck_t0, std::memory_order_relaxed);
         if (C.gds_read || C.gds_only)
@@ -29701,7 +29839,14 @@ static void gpu_decomp_worker(
             g_gds_verify_bytes.fetch_add(actual, std::memory_order_relaxed);
             // Mirrors the loop tail below, which this branch skips.
             C.batch[i].release_input();
-            C.delivered = i + 1;
+            // Under the registry lock so the reclaimer's snapshot of what is
+            // still undelivered cannot straddle this update.
+            if (rc_slot) {
+              std::lock_guard<std::mutex> lk(rc_slot->m);
+              C.delivered = i + 1;
+            } else {
+              C.delivered = i + 1;
+            }
             // ...INCLUDING THE FAULT HOOK.  This branch `continue`s past the tail
             // where GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST lives, so for --gds-only -t
             // that hook could never fire and every "GPU fault -> CPU rescue" test
@@ -29881,6 +30026,7 @@ static void gpu_decomp_worker(
               checkCuda(cudaMemcpyAsync(pin_slot, d_src, actual,
                                         cudaMemcpyDeviceToHost, C.stream), "D2H decomp pinned");
               checkCuda(cudaStreamSynchronize(C.stream), "D2H decomp pinned sync");
+              rc_bail_if_reclaimed();
               // assign() copies from the pinned slot without the resize() zero-fill
               // the copy would immediately overwrite — and here `actual` is a FULL
               // decompressed frame (~16 MiB), so the saved memset is far from tiny
@@ -29895,6 +30041,7 @@ static void gpu_decomp_worker(
               checkCuda(cudaMemcpyAsync(h_out->data(), d_src, actual,
                                         cudaMemcpyDeviceToHost, C.stream), "D2H decomp data");
               checkCuda(cudaStreamSynchronize(C.stream), "D2H decomp data sync");
+              rc_bail_if_reclaimed();
             }
 
             uint64_t rl_t0 = g_perf ? now_ns() : 0;
@@ -29907,7 +30054,13 @@ static void gpu_decomp_worker(
           // mid-loop throw (bad status / failed D2H) re-enqueues only the
           // undelivered tail, whose inputs are still intact.
           C.batch[i].release_input();
-          C.delivered = i + 1;
+          // Under the registry lock -- see the gds-verify site above.
+          if (rc_slot) {
+            std::lock_guard<std::mutex> lk(rc_slot->m);
+            C.delivered = i + 1;
+          } else {
+            C.delivered = i + 1;
+          }
           // Test hook: see g_debug_fail_gpu_decomp_last.  Fires ONCE, while
           // holding the FINAL batch (queue drained behind it) with frames still
           // undelivered, so the throw strands a real tail.
@@ -29959,6 +30112,27 @@ static void gpu_decomp_worker(
             }
           });
         }
+        // Batch complete: retire the in-flight record and fold its duration into
+        // the EMA the reclaim deadline scales from (same 1/4 weight as compress).
+        if (rc_slot) {
+          std::lock_guard<std::mutex> lk(rc_slot->m);
+          if (rc_slot->active && rc_slot->submit_ns) {
+            const uint64_t took = now_ns() - rc_slot->submit_ns;
+            rc_slot->ema_ns = rc_slot->ema_ns
+                            ? rc_slot->ema_ns - rc_slot->ema_ns / 4 + took / 4 : took;
+          }
+          rc_slot->active    = false;
+          rc_slot->batch     = nullptr;
+          rc_slot->delivered = nullptr;
+          rc_slot->submit_ns = 0;
+        }
+        // The intake brake is released when the batch lands.  ONLY THE RECLAIM IS
+        // ONE-WAY: a sticky demote would retire a contended-but-healthy device for
+        // the rest of the invocation (later files included), and the longest
+        // healthy batch measured here was 1.03 s against a 2 s floor -- a shared
+        // card can cross that honestly.
+        if (rc_tracked)
+          g_decomp_demoted.fetch_and(~(1ull << device_id), std::memory_order_relaxed);
         uint64_t d2h_elapsed_ns = (d2h_t0 > 0) ? now_ns() - d2h_t0 : 0;
         double d2h_ms_v = double(d2h_elapsed_ns) / 1e6;
         if (g_perf) {
@@ -31096,6 +31270,49 @@ gds_out_declined:
   // to make the old failure count unreachable and wedge the writer).
   std::atomic<int> gpu_exits{0};
 
+  // ---- Stuck-GPU reclaimer (see GzDecompInflight) -------------------------
+  // Always on: a decompress batch runs inline on its worker, so a CUDA call that
+  // never returns blocks the only thread that could react and the writer waits
+  // forever for that batch's sequence numbers.  MEASURED at v0.17.52 with a
+  // stall injected before the batch sync: an 8 s stall cost the run 8 s, and a
+  // 120 s stall was still stuck when the harness killed it at 45 s.
+  std::atomic<int>         gpu_spawned_total{0};   // published by the bringup lambda
+  std::thread              reclaim_thr;
+  std::atomic<bool>        reclaim_done{false};
+  std::mutex               reclaim_mx;
+  std::condition_variable  reclaim_cv;
+  auto gz_stop_reclaimer = [&]() {
+    if (!reclaim_thr.joinable()) return;
+    { std::lock_guard<std::mutex> lk(reclaim_mx);
+      reclaim_done.store(true, std::memory_order_relaxed); }
+    reclaim_cv.notify_all();
+    reclaim_thr.join();
+  };
+  // Wait until every spawned worker has accounted for its exit.  The reclaimer
+  // does that accounting for a worker it abandons, so this returns even when one
+  // is wedged forever.
+  auto gz_wait_for_worker_exits = [&]() {
+    const int total = gpu_spawned_total.load(std::memory_order_relaxed);
+    if (total <= 0) return;
+    std::unique_lock<std::mutex> lk(g_decomp_exit_mx);
+    g_decomp_exit_cv.wait(lk, [&] {
+      return gpu_exits.load(std::memory_order_acquire) >= total;
+    });
+  };
+  // A worker whose batch was reclaimed is parked in gz_decomp_park_forever, or
+  // still inside the CUDA call that wedged.  Joining it would hang the run its
+  // own rescue just saved, so detach it and let main _Exit once the output is
+  // complete.
+  auto gz_join_or_detach_workers = [&]() {
+    for (size_t i = 0; i < gpu_workers.size(); ++i) {
+      if (!gpu_workers[i].joinable()) continue;
+      const int dev = (i < gpu_ids.size()) ? gpu_ids[i] : -1;
+      const bool abandoned = dev >= 0 && dev < ADAPT_DL_MAX
+          && (g_decomp_abandoned.load(std::memory_order_relaxed) & (1ull << dev));
+      if (abandoned) gpu_workers[i].detach(); else gpu_workers[i].join();
+    }
+  };
+
   // GPU bringup: detect (when deferred — triggers the cuInit), select
   // devices, init result slots, and spawn GPU workers.  Runs on a background
   // thread when defer_detect (hybrid adaptive or gpu-only) so the CPU pool
@@ -31185,6 +31402,23 @@ gds_out_declined:
 
     const uint64_t gpu_sel_t0 = now_ns();
     gpu_ids = select_best_gpus(total_hw_devices, device_count, opt);
+    // A device whose batch was reclaimed still has a thread parked inside CUDA
+    // on it (this invocation may be decompressing several files).  Never hand it
+    // more work; if that leaves nothing, this file runs without a GPU.
+    {
+      const uint64_t gone = g_decomp_abandoned.load(std::memory_order_relaxed);
+      if (gone) {
+        const size_t before = gpu_ids.size();
+        gpu_ids.erase(std::remove_if(gpu_ids.begin(), gpu_ids.end(),
+                        [gone](int d) { return d >= 0 && d < ADAPT_DL_MAX
+                                            && (gone & (1ull << d)); }),
+                      gpu_ids.end());
+        if (gpu_ids.size() != before)
+          vlog(V_VERBOSE, opt, "[GPU] skipping " + std::to_string(before - gpu_ids.size())
+               + " device(s) retired by an earlier reclaim\n");
+        if (gpu_ids.empty()) return;
+      }
+    }
     if (opt.cpu_share >= 0.0) warm_gpu_contexts(gpu_ids);
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -31193,6 +31427,7 @@ gds_out_declined:
       vlog(V_VERBOSE, opt, os.str() + "\n");
     }
     const int gpu_count = (int)gpu_ids.size();
+    gpu_spawned_total.store(gpu_count, std::memory_order_relaxed);
     fatal_msgs.resize(gpu_count);
     // init_slots resizes ResultStore::slots, which the writer iterates in
     // drain_slots_locked under results.m — take that lock so the resize
@@ -31230,6 +31465,91 @@ gds_out_declined:
     // auto / fixed-share hybrid: bring up inline.
     gpu_bringup();
   }
+
+  // Deadlines mirror the compress deadline action, scaled by each device's own
+  // batch EMA: stop new intake at max(4x EMA, 2 s), take the batch away at
+  // max(2x that, 6 s).  MEASURED on this class of host: the longest healthy GPU
+  // decompress batch across 101 -vv logs was 1.03 s, so the reclaim floor sits
+  // ~6x above real work -- a slow-but-healthy device loses only its intake.
+  // It scans the registry, never gpu_ids: that vector is written by the bringup
+  // thread and reading it here would be a data race.
+  reclaim_thr = std::thread([&]() {
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(reclaim_mx);
+        reclaim_cv.wait_for(lk, std::chrono::milliseconds(250),
+                            [&] { return reclaim_done.load(std::memory_order_relaxed); });
+      }
+      if (reclaim_done.load(std::memory_order_relaxed)) return;
+      for (int dev = 0; dev < ADAPT_DL_MAX; ++dev) {
+        const uint64_t bit = 1ull << dev;
+        if (g_decomp_abandoned.load(std::memory_order_relaxed) & bit) continue;
+        GzDecompInflight & R = g_decomp_inflight[dev];
+        std::vector<Task> rescued;
+        uint64_t age = 0, d1 = 0, d2 = 0;
+        bool staged_frame = false;
+        {
+          std::lock_guard<std::mutex> lk(R.m);
+          if (!R.active || R.reclaimed || !R.batch || !R.delivered) continue;
+          age = now_ns() - R.submit_ns;
+          d1  = std::max<uint64_t>(4 * R.ema_ns, 2000000000ull);
+          d2  = std::max<uint64_t>(2 * d1,       6000000000ull);
+          if (age <= d1) continue;
+          if (!(g_decomp_demoted.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+            char l[176];
+            std::snprintf(l, sizeof(l),
+              "[GPU%d] batch in flight %.1f s (limit %.1f s) - no new intake\n",
+              dev, age / 1e9, d1 / 1e9);
+            vlog(V_VERBOSE, opt, l);
+          }
+          if (age <= d2) continue;
+          // Take the undelivered tail.  COPY the bytes: the wedged call may still
+          // be reading this frame's host view (the H2D is an async copy straight
+          // out of Task::ptr()), so handing the block itself to a CPU worker that
+          // frees it after decoding would be a use-after-free.
+          for (size_t i = *R.delivered; i < R.batch->size(); ++i) {
+            Task & src = (*R.batch)[i];
+            if (src.is_staged()) { staged_frame = true; break; }
+            Task t;
+            t.seq         = src.seq;
+            t.decomp_size = src.decomp_size;
+            t.out_off     = src.out_off;
+            t.data.assign(src.ptr(), src.ptr() + src.len());
+            rescued.push_back(std::move(t));
+          }
+          if (!staged_frame) { R.reclaimed = true; R.active = false; }
+        }
+        if (staged_frame)
+          die("--gds-only/--direct-stage: a GPU batch wedged and its frames carry no "
+              "host bytes, so they cannot be rescued to the CPU", EXIT_GPU_FAIL);
+        const int n = (int)rescued.size();
+        char l[208];
+        std::snprintf(l, sizeof(l),
+          "WARNING: [GPU%d] batch wedged %.1f s past its deadline (limit %.1f s); "
+          "reclaiming %d frame(s) for the CPU and retiring the device\n",
+          dev, age / 1e9, d2 / 1e9, n);
+        vlog(V_ERROR, opt, l);
+        if (n > 0) {
+          queue.re_enqueue(rescued);
+          if (bp_ptr) bp_ptr->release(n);
+        }
+        g_decomp_abandoned.fetch_or(bit, std::memory_order_relaxed);
+        if (sched)
+          for (size_t si = 0; si < std::max<size_t>(1, opt.gpu_streams); ++si)
+            sched->unregister_gpu_stream(dev);
+        queue.notify_cpu_waiters();
+        queue.notify_gpu_yield_waiters();
+        // The abandoned worker never runs its own exit accounting, so do it here:
+        // under --gpu-only the LAST worker out is what starts the CPU rescue pool.
+        const int total = gpu_spawned_total.load(std::memory_order_relaxed);
+        const int out   = gpu_exits.fetch_add(1, std::memory_order_acq_rel) + 1;
+        { std::lock_guard<std::mutex> lk(g_decomp_exit_mx); }
+        g_decomp_exit_cv.notify_all();
+        if (total > 0 && out == total && opt.gpu_only && !queue.drained())
+          gpu_only_cpu_fallback(true, &queue, &results, opt, m, bp_ptr, discard_results);
+      }
+    }
+  });
 
   // Fixed-share decompress: same barrier as compress (see compress_nvcomp).
   // The inline bringup above spawned GPU workers but didn't wait for them
@@ -31315,7 +31635,9 @@ gds_out_declined:
     // every hybrid/gpu-only decompress of a streamed-zstd file (v0.13.54).
     stop_bringup_sample();
     if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
-    for (auto & th : gpu_workers) th.join();
+    gz_wait_for_worker_exits();          // see the teardown site for the ordering
+    gz_join_or_detach_workers();
+    gz_stop_reclaimer();
     for (auto & th : cpu_pool) th.join();
     if (sched) { tick_done = true; if (tick_thr.joinable()) tick_thr.join(); }
     if (writer_thr.joinable()) writer_thr.join();
@@ -31375,7 +31697,15 @@ gds_out_declined:
   // finishes its (bounded, sub-second) window and answers honestly.
   bringup_cv.notify_all();
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
-  for (auto & th : gpu_workers) th.join();
+  // ORDER IS LOAD-BEARING.  The producer finishes long before the workers do, so
+  // this teardown is reached while batches are still in flight; stopping the
+  // watchdog here (as the first version did) killed it ~0.7 s into the run and
+  // no stuck batch could ever be reclaimed.  Wait for the workers to account for
+  // themselves WITH the watchdog still live, then detach whoever it abandoned,
+  // and only then stop it.
+  gz_wait_for_worker_exits();
+  gz_join_or_detach_workers();
+  gz_stop_reclaimer();
 
   // THE SAME ROUTING REPORT THE COMPRESS PATH HAS, and for the same reason: a
   // cuFile call that quietly bounces through host memory returns the right bytes
@@ -35105,7 +35435,21 @@ int main(int argc, char ** argv)
     // option handling so it can be used on a binary whose parser is in doubt.
     if (::getenv("GZSTD_DEBUG_XXH_SELFTEST")) return gzstd_xxh_gpu_selftest();
 #endif
-    return gzstd_main(argc, argv);
+    {
+      const int rc = gzstd_main(argc, argv);
+#ifdef HAVE_NVCOMP
+      // A reclaimed GPU left a thread parked inside CUDA (see GzDecompInflight).
+      // Output, --rm and the profile are all complete by here; an ordinary return
+      // would run cuFile/CUDA teardown that the wedged call can block, so flush
+      // what we own and leave.
+      if (g_decomp_abandoned.load(std::memory_order_relaxed)) {
+        cleanup_tmp_file();
+        std::fflush(nullptr);
+        std::_Exit(rc);
+      }
+#endif
+      return rc;
+    }
   } catch (const std::exception & e) {
     std::cerr << "gzstd: fatal: " << e.what() << "\n";
     return EXIT_ERROR;
