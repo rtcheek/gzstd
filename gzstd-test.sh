@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=443
-$EXTENSIVE && EXPECTED_TESTS=574
+EXPECTED_TESTS=445
+$EXTENSIVE && EXPECTED_TESTS=576
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -657,7 +657,10 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.53 adds three default-tier cells (GPU decompress stuck-batch reclaim),
 # all three of which skip without a GPU: 440 -> 443 and the no-GPU delta 98 -> 101.
 # DERIVED until a suite run confirms it.
-EXPECTED_NOGPU_DELTA=101
+# v0.17.54 adds two default-tier cells (decompress tail-aware GPU intake), both
+# skipping without a GPU: 443 -> 445 and the no-GPU delta 101 -> 103.  DERIVED
+# until a suite run confirms it.
+EXPECTED_NOGPU_DELTA=103
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -5524,6 +5527,85 @@ else
   skip "a slow GPU decompress batch is demoted, not reclaimed" "no GPU"
   skip "decompress reclaim stays quiet on a healthy run" "no GPU"
 fi
+
+# ────────────────────────────────────────────────────────────
+section "Decompress tail-aware GPU intake (pinned rates)"
+
+# v0.17.54: hybrid decompress declines GPU intake at the tail, as compress has
+# since v0.13.57.  A slower GPU that takes the last batches holds the whole run
+# while the CPU pool sits idle.  MEASURED on 48 GiB of entropy-coded frames at
+# -T8 (24-core host, two 11 GiB cards): 0.6-1.2 s between the reader finishing
+# and the last GPU batch, before; ~0 after.
+#
+# Live rates make the decision host-dependent, so GZSTD_DEBUG_HYBRID_RATES pins
+# them: a CPU 10,000x the GPU must decline EVERY intake once the check is armed.
+# And it is always armed by a GPU's first check -- for a file, the unread estimate
+# exists after 8 frames; for a pipe, only producer-done arms it.
+#
+# THE FIXTURE IS LOAD-BEARING.  base64 of random bytes: entropy-coded frames the
+# CPU decodes at ~1.3 GiB/s per thread, so at -T1 a GPU is online (cuInit, ~1 s)
+# while work remains -- MEASURED 770-875 of 1024 frames still queued at the
+# latch.  Raw random bytes decode as a memcpy and finish first.  If the CPU does
+# finish before any GPU exists, nothing was tested: SKIP, not PASS.
+if has_gpu 2>/dev/null; then
+  ty_src="$TMPDIR/tailyield.bin"; ty_zst="$TMPDIR/tailyield.zst"
+  ty_out="$TMPDIR/tailyield.out"; ty_log="$TMPDIR/tailyield.log"
+  (
+    set +o pipefail
+    head -c $((768*1048576)) /dev/urandom | base64 -w0 | head -c $((1024*1048576)) > "$ty_src"
+  )
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$ty_src" -o "$ty_zst" 2>/dev/null
+
+  # 1. File input.  Under pinned rates a GPU batch of ANY size means the check was
+  # never armed -- the regression this cell exists for (through v0.17.53 the check
+  # was simply off for decompress).
+  rc=0
+  env GZSTD_DEBUG_HYBRID_RATES=cpu=100,gpu=0.01 timeout --foreground -k 10 120 \
+    "$GZSTD" -d --hybrid -T1 -vv -f "$ty_zst" -o "$ty_out" >"$ty_log" 2>&1 || rc=$?
+  ty_b=$(grep -a -c 'done batch=' "$ty_log")
+  ty_l=$(grep -a -c 'decompress tail yield' "$ty_log")
+  if [[ $rc -ne 0 ]]; then
+    fail "decompress GPU yields the tail (file input)" "exit $rc"
+  elif [[ $ty_b -gt 0 ]]; then
+    fail "decompress GPU yields the tail (file input)" \
+         "$ty_b GPU batch(es) against a pinned 10,000x faster CPU: the check never armed"
+  elif [[ $ty_l -eq 0 ]]; then
+    skip "decompress GPU yields the tail (file input)" \
+         "not exercised: the CPU finished before a GPU reached intake"
+  elif files_match "$ty_src" "$ty_out"; then
+    pass "decompress GPU yields the tail (file input)"
+  else
+    fail "decompress GPU yields the tail (file input)" "output differs"
+  fi
+  rm -f "$ty_out"
+
+  # 2. Pipe input: no size, so no unread estimate -- only producer-done can arm the
+  # check.  The GPU may take batches first (correct: remaining work is unknown).
+  # A pipe producer's tasks own heap bytes, so the queue's byte cap blocks it and
+  # it finishes with frames still queued; the next intake must therefore latch.
+  rc=0
+  cat "$ty_zst" | env GZSTD_DEBUG_HYBRID_RATES=cpu=100,gpu=0.01 timeout --foreground -k 10 120 \
+    "$GZSTD" -d --hybrid -T1 -vv -c >"$ty_out" 2>"$ty_log" || rc=$?
+  ty_on=$(grep -a -c 'device(s) online' "$ty_log")
+  ty_l=$(grep -a -c 'decompress tail yield' "$ty_log")
+  if [[ $rc -ne 0 ]]; then
+    fail "decompress GPU yields the tail (pipe: producer-done arms it)" "exit $rc"
+  elif [[ $ty_on -eq 0 ]]; then
+    skip "decompress GPU yields the tail (pipe: producer-done arms it)" "not exercised: no GPU came online"
+  elif [[ $ty_l -eq 0 ]]; then
+    fail "decompress GPU yields the tail (pipe: producer-done arms it)" \
+         "a GPU was online but never yielded: producer-done did not arm the check"
+  elif files_match "$ty_src" "$ty_out"; then
+    pass "decompress GPU yields the tail (pipe: producer-done arms it)"
+  else
+    fail "decompress GPU yields the tail (pipe: producer-done arms it)" "output differs"
+  fi
+  rm -f "$ty_src" "$ty_zst" "$ty_out" "$ty_log"
+else
+  skip "decompress GPU yields the tail (file input)" "no GPU"
+  skip "decompress GPU yields the tail (pipe: producer-done arms it)" "no GPU"
+fi
+
 
 section "Sliding-window compression"
 

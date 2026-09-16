@@ -333,6 +333,17 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.54: a slower GPU held the end of a hybrid decompress
+
+Compress has declined GPU intake at the tail since v0.13.57; decompress never ran the check, and could not have: it
+waited for producer-done, which decompress never set and which arrives ~0.2 s before the end behind a bounded reader.
+Measured at `-T8` on 48 GiB of entropy-coded frames (24-core Gen3 host, two 11 GiB cards), the last GPU batches held
+the run 0.6–1.2 s with the CPU pool idle. v0.17.54 arms the check from an estimate of the frames the reader has not
+reached, compares payload-unit rates, and uses the makespan inequality: the stall fell to ~0 ms and the worst run from
+5.79 to 5.22 s, with a median gain inside the noise (CHANGELOG v0.17.54). Hybrid still trails `--cpu-only` by ~0.1 s
+there, and at `-T12` it ran 0.1–0.4 s slower **with zero GPU batches** — a bringup cost paid when the GPU never works,
+and the next thing worth measuring. Still deferred: `--direct-stage` for decompress.
+
 ## SHIPPED v0.17.53: a wedged GPU decompress batch hung the run
 
 A GPU decompress batch runs inline on its worker, so a CUDA call that never returned blocked the only thread that

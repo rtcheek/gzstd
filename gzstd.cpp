@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.53";
+static constexpr const char * GZSTD_VERSION = "0.17.54";
 //
 // Architecture overview:
 //
@@ -10005,6 +10005,7 @@ public:
     // pooled-view task returns its DirectReadPool slot instead of leaking it
     // (leaked slots starve the reader's acquire() and wedge the teardown).
     if (done_) { t.release_input(); return; }
+    pushed_comp_bytes_.fetch_add(t.len(), std::memory_order_relaxed);
     queued_bytes_ += t.queued_host_bytes();
     // KEEP THE DEQUE SORTED BY SEQ — this is the invariant everything
     // downstream rests on: the FrameThrottle's deadlock-freedom argument
@@ -10254,6 +10255,11 @@ public:
   }
 
   size_t total_tasks() const { return total_tasks_; }
+  // Input bytes pushed so far.  With total_tasks() it gives the mean frame size
+  // the decompress tail check uses to estimate what the reader has not reached
+  // yet.  Atomic, like total_tasks_: read inside the GPU yield predicate, which
+  // already holds this queue's lock.
+  uint64_t pushed_comp_bytes() const { return pushed_comp_bytes_.load(std::memory_order_relaxed); }
 
   bool drained()
   {
@@ -10437,6 +10443,7 @@ private:
   size_t                  queued_bytes_ = 0; // running sum of q_'s queued_host_bytes()
   int                     gpu_yield_waiters_ = 0; // GPUs parked in wait_for_gpu_yield (guarded by m_)
   std::atomic<size_t>     total_tasks_{0};
+  std::atomic<uint64_t>   pushed_comp_bytes_{0};
 };
 
 // Holds compressed output frames indexed by sequence number, allowing the
@@ -12641,6 +12648,22 @@ public:
         }
       }
     }
+    pin_rates_from_env_();   // after the --adapt priors and injected rates: pinned wins
+  }
+
+  // Test hook: pin the aggregate hybrid rates, so the tail-yield decision does not
+  // depend on how fast this host happens to be.  Format "cpu=100,gpu=0.01"
+  // (GiB/s, payload units).  Samples are set to 2 so the check is live at once,
+  // and tick() stops overwriting them.  Unlike GZSTD_DEBUG_ADAPT_RATES this needs
+  // no --adapt: it is the plain hybrid path it exists to test.
+  void pin_rates_from_env_() {
+    const char * e = std::getenv("GZSTD_DEBUG_HYBRID_RATES");
+    if (!e) return;
+    double hc = 0.0, hg = 0.0;
+    if (std::sscanf(e, "cpu=%lf,gpu=%lf", &hc, &hg) != 2 || hc <= 0.0 || hg <= 0.0) return;
+    cpu_rate_ema_.store(hc); cpu_payload_ema_.store(hc); cpu_samples_.store(2);
+    gpu_rate_ema_.store(hg); gpu_samples_.store(2);
+    rates_pinned_ = true;
   }
 
   // Set the task queue pointer so gpu_got_data() can wake CPU workers.
@@ -12686,7 +12709,7 @@ public:
   // yields when CPU is below its target share — symmetric counterpart
   // to should_cpu_take().
   //
-  // Adaptive mode (compress only, v0.13.57): tail-aware intake.  The old
+  // Adaptive mode (compress v0.13.57, decompress v0.17.54): tail-aware intake.  The old
   // "GPU always takes" policy let a slow GPU set the run's makespan:
   // profiled on a Gen3 2-GPU box (GPU pool ~1.1 GiB/s vs CPU pool ~15),
   // the GPU grabbed batches from the near-empty queue and the whole run
@@ -12702,11 +12725,37 @@ public:
   // streaming producer would starve the GPU (with mmap input the
   // producer finishes near t=0, so in the default path the check is
   // live for effectively the whole run).  It never engages during EMA
-  // warm-up (both engines need 2 samples) or for decompress (different
-  // economics — not validated there).  The first yield latches
+  // warm-up (both engines need 2 samples).  The first yield latches
   // tail_yield_, which zeroes cpu_queue_floor() — otherwise CPUs would
   // refuse the very frames the GPU just declined (reserved by the
   // floor) and the tail would strand.
+  //
+  // DECOMPRESS (v0.17.54) needed three changes, each of which alone did nothing:
+  //  1. The check was simply off (a mode test returned "take").
+  //  2. It could not have armed anyway: set_producer_done() had no decompress
+  //     caller.  And producer-done is too late there: the decompress reader is
+  //     BOUNDED and roughly supply-matched, so the queue holds a few hundred
+  //     frames and the producer finishes ~0.2 s before the run does -- after
+  //     the harmful intakes.  MEASURED with a per-intake trace (48 GiB of
+  //     entropy-coded frames, 24-core host, 2x 11 GiB cards, -T8): at every tail
+  //     intake the rule said decline, and every one came before producer-done.
+  //     So remaining work is queue depth PLUS the frames the reader has not
+  //     reached, estimated from the archive size and the mean frame size pushed
+  //     so far (unread_frames_est_), which is known from the eighth frame on.
+  //  3. Units: cpu_rate_ema_ counts COMPRESSED bytes on decompress while the GPU
+  //     counts decompressed, so the CPU looked slower by the compression ratio;
+  //     the check uses the payload-unit CPU EMA instead.
+  // And a different inequality.  Compress takes when t_cpu(depth - batch) >=
+  // 1.3 t_gpu(batch): "the CPU is still busy when this batch lands".  If the GPU
+  // declines, the CPU must do that batch too, so the makespan comparison is
+  // t_cpu(depth) >= 1.3 t_gpu(batch).  The two differ by t_cpu(batch), which is
+  // negligible when the CPU pool is far faster (every compress host) and not
+  // when the GPU is: at -T2 above, the GPU pool was ~2.6x the CPU's.  Both
+  // measured alike on decompress; this one is the correct algebra.
+  // RESULT at -T8: the wait from the reader finishing to the last GPU batch fell
+  // from 603/761/1159 ms to 28/-95/14, the worst run from 5.79 s to 5.22, median
+  // 5.24 -> 5.09; -T2 (GPU faster) 7.54-7.77 -> 7.44-7.76.  Hybrid still trails
+  // --cpu-only by ~0.1 s there; that gap is not the tail.
   bool should_gpu_take(int device = -1) {
     if (fixed_mode_) {
       const uint64_t cpu = cpu_taken_.load(std::memory_order_relaxed);
@@ -12727,16 +12776,49 @@ public:
       if (!queue_) return true;
       return should_gpu_take_at(queue_->size(), device);
     }
-    if (opt_.mode != Mode::COMPRESS) return true;
-    if (!producer_done_.load(std::memory_order_acquire)) return true;
+    if (!remaining_work_known_()) return true;
     if (!queue_) return true;
     return should_gpu_take_at(queue_->size());
+  }
+
+  // Does queue depth (plus, on decompress, the unread estimate) measure the work
+  // left yet?  Compress: once the producer is done.  Decompress: also as soon as
+  // the unread estimate exists.  Both inputs only ever turn true, which the park
+  // predicate relies on (it re-evaluates should_gpu_take_at alone).
+  bool remaining_work_known_() const {
+    if (producer_done_.load(std::memory_order_acquire)) return true;
+    return opt_.mode != Mode::COMPRESS && unread_frames_est_() >= 0.0;
+  }
+
+  // Frames the decompress reader has not pushed yet: unread archive bytes over
+  // the mean input bytes per frame pushed so far.  -1 when unknown -- a pipe or
+  // stdin (no size), or fewer than 8 frames to average -- and then only
+  // producer-done arms the check, as on compress.  It errs LOW when frames shrink
+  // late in the archive (MEASURED 0.53-0.55 of true near the tail on 24 GiB of
+  // ~12 MiB frames followed by 24 GiB of ~4.5 MiB ones), which yields early; that
+  // cost nothing measurable, because the decline threshold is only large when the
+  // GPU is the slower engine, and then handing it frames it declined is cheap.
+  // Atomics only: evaluated in the park predicate, under the queue lock.
+  double unread_frames_est_() const {
+    const uint64_t src = decomp_src_bytes_.load(std::memory_order_relaxed);
+    if (src == 0 || !queue_) return -1.0;
+    const uint64_t pushed = queue_->pushed_comp_bytes();
+    const double frames = (double)queue_->total_tasks();
+    if (frames < 8.0 || pushed == 0) return -1.0;
+    if (pushed >= src) return 0.0;
+    return double(src - pushed) * frames / double(pushed);
+  }
+
+  // The archive's size, for unread_frames_est_.  0 (pipe/stdin) leaves the
+  // estimate unknown.
+  void set_decomp_source_bytes(uint64_t b) {
+    decomp_src_bytes_.store(b, std::memory_order_relaxed);
   }
 
   // Core of the adaptive tail decision for a known queue depth.  Split out
   // so the wait_for_gpu_yield predicate can evaluate it under the queue
   // lock without calling back into TaskQueue (deadlock).  Only reached
-  // after the should_gpu_take() gates (adaptive, compress, producer done),
+  // after the should_gpu_take() gates (adaptive; remaining work known),
   // all of which are monotonic — once a worker parks, they can't unflip.
   // under_queue_lock: true only when called from a wait_for_cpu/
   // wait_for_gpu_yield predicate (caller holds TaskQueue::m_).  The
@@ -12820,7 +12902,11 @@ public:
     }
     if (cpu_samples_.load(std::memory_order_relaxed) < 2 ||
         gpu_samples_.load(std::memory_order_relaxed) < 2) return true;
-    const double c = cpu_rate_ema_.load(std::memory_order_relaxed);
+    // Payload units on both sides (see should_gpu_take): on decompress the
+    // aggregate CPU EMA counts compressed bytes.  On compress the two are equal.
+    const bool decomp = (opt_.mode != Mode::COMPRESS);
+    const double c = decomp ? cpu_payload_ema_.load(std::memory_order_relaxed)
+                            : cpu_rate_ema_.load(std::memory_order_relaxed);
     const double g = gpu_rate_ema_.load(std::memory_order_relaxed);
     if (c <= 0.0 || g <= 0.0) return true;
     const double depth = (double)depth_now;
@@ -12832,11 +12918,23 @@ public:
         (double)std::max<size_t>(1, gpu_batch_size_.load(std::memory_order_relaxed));
     const double streams =
         (double)std::max(1, active_gpu_streams_.load(std::memory_order_relaxed));
-    // CPU-seconds of work left after this batch vs GPU-seconds to finish it
-    // (per-stream rate = pool EMA / streams).
-    const bool take = (depth - batch) / c >= 1.3 * batch * streams / g;
+    // Compress: CPU-seconds of work left after this batch vs GPU-seconds to
+    // finish it (per-stream rate = pool EMA / streams).  Decompress: CPU-seconds
+    // for ALL remaining work, queued and unread, vs the same (see should_gpu_take).
+    const double unread = decomp ? std::max(0.0, unread_frames_est_()) : 0.0;
+    const bool take = decomp
+        ? (depth + unread) / c >= 1.3 * batch * streams / g
+        : (depth - batch) / c >= 1.3 * batch * streams / g;
     if (!take && under_queue_lock
         && !tail_yield_.exchange(true, std::memory_order_acq_rel)) {
+      if (decomp && opt_.verbosity >= V_DEBUG) {
+        char t[224];
+        std::snprintf(t, sizeof(t),
+          "[HYBRID] decompress tail yield: %.0f frames queued + ~%.0f unread; CPU %.2f vs "
+          "GPU %.2f GiB/s (batch %.0f x %.0f streams) -- the CPU finishes the rest\n",
+          depth, unread, c, g, batch, streams);
+        vlog(V_DEBUG, opt_, t);
+      }
       // First yield: the floor is now zero — wake CPUs sleeping on it,
       // since no push will arrive to re-evaluate their predicate.  Only
       // from a predicate caller (under the queue lock): that orders the
@@ -12976,10 +13074,11 @@ public:
     if (dev_valid_(device))
       dev_[device].bytes.fetch_add(b, std::memory_order_relaxed);
   }
-  // PAYLOAD-unit CPU bytes, for the ranked dispatcher only.  The aggregate
+  // PAYLOAD-unit CPU bytes, for comparing engine rates.  The aggregate
   // cpu_bytes_ above reports COMPRESSED bytes on the decompress path while
   // the GPU side reports decompressed — units that never mattered while
-  // decompress never declined, but the ranked inequality compares engine
+  // decompress never declined, but the ranked inequality and (v0.17.54) the
+  // decompress tail check compare engine
   // rates directly, so it gets its own consistently-payload-unit EMA
   // (frames are uniform in payload size, chunk_mib, making byte rates a
   // faithful frames/sec proxy).  On the compress path payload == input ==
@@ -13003,14 +13102,14 @@ public:
 
     // Feed EMAs (alpha = 0.3) for AUTO-mode floor scaling.  Only count
     // samples that carried real work; idle ticks shouldn't collapse the EMA.
-    if (cpu_b > 0) {
+    if (cpu_b > 0 && !rates_pinned_) {
       double prev = cpu_rate_ema_.load(std::memory_order_relaxed);
       double sample = cpu_rate / 1e9;  // GiB/s
       double next = (prev == 0.0) ? sample : prev * 0.7 + sample * 0.3;
       cpu_rate_ema_.store(next, std::memory_order_relaxed);
       cpu_samples_.fetch_add(1, std::memory_order_relaxed);
     }
-    if (gpu_b > 0) {
+    if (gpu_b > 0 && !rates_pinned_) {
       double prev = gpu_rate_ema_.load(std::memory_order_relaxed);
       double sample = gpu_rate / 1e9;  // GiB/s
       double next = (prev == 0.0) ? sample : prev * 0.7 + sample * 0.3;
@@ -13027,6 +13126,19 @@ public:
     // have been declining for QUIESCE_STICKY_TICKS.  All single-threaded
     // here (tick thread owns cand_/decline_ counters); the hot path only
     // reads the published atomics.
+    // CPU payload EMA.  Every tick, not only under --adapt: the decompress tail
+    // check compares it with the GPU EMA.  Before v0.17.54 only the ranked
+    // dispatcher read it, so it was updated in rank_tick_ alone and never moved
+    // without --adapt.
+    {
+      const uint64_t b = cpu_payload_bytes_.exchange(0, std::memory_order_relaxed);
+      if (b > 0 && !rates_pinned_) {
+        const double sample = (double(b) / std::max(1e-6, secs)) / 1e9;
+        const double prev = cpu_payload_ema_.load(std::memory_order_relaxed);
+        cpu_payload_ema_.store(prev == 0.0 ? sample : prev * 0.7 + sample * 0.3,
+                               std::memory_order_relaxed);
+      }
+    }
     if (ranked_active_()) rank_tick_(secs);
     refresh_queue_floor_();
     // EMA movement is the one yield-decision input with no queue event;
@@ -13079,6 +13191,8 @@ private:
   std::atomic<int> gpus_waiting_{0};
   std::atomic<bool> producer_done_{false};  // arms the tail-aware GPU intake check
   std::atomic<bool> tail_yield_{false};     // GPU declined the tail; floor released
+  std::atomic<uint64_t> decomp_src_bytes_{0};  // archive size, for unread_frames_est_ (0 = unknown)
+  bool rates_pinned_ = false;               // GZSTD_DEBUG_HYBRID_RATES; set before any thread starts
 
   // Queue-depth reservation: CPUs yield when depth <= floor.
   // Nominal floor = active_gpu_streams * gpu_batch_size.
@@ -13135,16 +13249,6 @@ private:
       D.ema.store(prev == 0.0 ? sample : prev * 0.7 + sample * 0.3,
                   std::memory_order_relaxed);
       D.samples.fetch_add(1, std::memory_order_relaxed);
-    }
-    // CPU payload EMA (ranked comparisons only).
-    {
-      const uint64_t b = cpu_payload_bytes_.exchange(0, std::memory_order_relaxed);
-      if (b > 0) {
-        const double sample = (double(b) / std::max(1e-6, secs)) / 1e9;
-        const double prev = cpu_payload_ema_.load(std::memory_order_relaxed);
-        cpu_payload_ema_.store(prev == 0.0 ? sample : prev * 0.7 + sample * 0.3,
-                               std::memory_order_relaxed);
-      }
     }
     // Faster set per device.  Contributors: the CPU pool (payload EMA) and
     // every other live, non-quiesced device with a strictly greater EMA.
@@ -25305,7 +25409,7 @@ static void gpu_worker(
             break;   // drained while parked
         } else {
           // Fixed mode keeps its spin: the share check is designed to
-          // oscillate per-batch.  (Adaptive decompress never declines.)
+          // oscillate per-batch.
           std::this_thread::yield();
         }
         continue;
@@ -28827,19 +28931,24 @@ static void gpu_decomp_worker(
         // exit instead of spinning forever on the share check.
         if (sched && !sched->should_gpu_take(device_id)) {
           if (queue->drained()) { producer_done_seen = true; continue; }
-          // Ranked overflow decline (--adapt) — the only way adaptive
-          // decompress reaches here (the aggregate tail check never arms
-          // for decompress).  Park on the queue CV until an event that
+          // Tail yield (the aggregate check, v0.17.54) or a ranked overflow
+          // decline (--adapt).  Park on the queue CV until an event that
           // could change the decision: a pop shrinks the queue, a push
           // deepens it, the queue drains, or a scheduler tick moves the
           // EMAs.  No polling, no fixed sleeps.  (Fixed mode keeps its
           // spin: the share check is designed to oscillate per-batch.)
           if (!sched->is_fixed_mode()) {
+            const uint64_t yp_t0 = (opt.verbosity >= V_DEBUG) ? now_ns() : 0;
             if (!queue->wait_for_gpu_yield(
                     [&](const TaskQueue::QueueState & qs) {
                       return sched->should_gpu_take_at(qs.depth, device_id, true);
                     }))
               producer_done_seen = true;
+            if (opt.verbosity >= V_DEBUG)
+              vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id) + "/S"
+                   + std::to_string(C.stream_index) + "] yielded for "
+                   + std::to_string((now_ns() - yp_t0) / 1000000) + " ms"
+                   + (producer_done_seen ? " (queue drained)" : " (resumed)") + "\n");
           }
           continue;
         }
@@ -31321,6 +31430,7 @@ gds_out_declined:
   // own size, which Meter::read_bytes counts up to.  0 (pipe/stdin) disables the
   // check, keeping today's behaviour.
   const uint64_t decomp_src_bytes = known_input_size(opt, in);
+  if (sched) sched->set_decomp_source_bytes(decomp_src_bytes);   // tail check's unread estimate
   std::mutex bringup_mx;
   std::condition_variable bringup_cv;
   std::atomic<bool> bringup_stop{false};
@@ -31674,6 +31784,11 @@ gds_out_declined:
 
   // ---- Signal that all frames have been enqueued ----
   queue.set_done();
+  // Arms the tail check when the unread estimate cannot (pipe/stdin).  Until
+  // v0.17.54 this call existed only on compress, so the check never armed here.
+  // It also arms --adapt's all-devices-decline floor release on decompress, the
+  // only other reader of producer_done_, which compress has always had.
+  if (sched) sched->set_producer_done();
   {
     std::lock_guard<std::mutex> lk(results.m);
     results.producer_done = true;

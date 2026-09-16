@@ -1,12 +1,108 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.53  
+**Covers:** v0.9.50 → v0.17.54  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.54 — a slower GPU held the end of a hybrid decompress
+
+**Hybrid decompress now declines GPU intake at the tail, as compress has since v0.13.57.** When the GPU pool is
+slower than the CPU pool, a GPU that takes the last batches holds the whole run while the CPU pool sits idle. Compress
+fixed that in v0.13.57; decompress never ran the check.
+
+### Why
+
+- **MEASURED on a 24-core Gen3 host with two 11 GiB cards**, 48 GiB of entropy-coded frames (base64 of random bytes,
+  ratio 0.75), warm, hybrid against `--cpu-only`. At `-T8`, where the GPU pool (~3.5 GiB/s) is slower than the CPU
+  pool (~9.5), hybrid lost in every run where the GPU took work: 5.18–5.58 s against 4.98–5.07. The `-vv` scheduler
+  ticks show the shape: as the reader finishes, both GPUs take 81 and 88 frames, `cpu_rate` falls to 0.25 and then
+  0.000 GiB/s, and the last batches take 0.70 and 1.05 s — work eight CPU threads would have cleared in ~0.35 s.
+- Not head-of-line blocking (`block_count=0`, no overdrafts, in every run), and not bringup (`cpu_rate` holds
+  through it).
+- **The standard test corpora cannot show this.** `low_compress` decodes as a memcpy and `medium`/`mixed` are mostly
+  trivially compressed frames, so 20 GiB decompresses in 1–2 s at any thread count, and the bringup gate correctly
+  never starts a GPU. It takes entropy-coded frames the CPU actually has to decode.
+
+### The change
+
+Each of these alone did nothing:
+
+- **The check was off.** `should_gpu_take` returned "take" for any mode but compress.
+- **It could not have armed.** It waits for the producer to finish, and `set_producer_done()` was called only on
+  compress. Adding the call is also not enough: the decompress reader is bounded and roughly supply-matched, so the
+  queue holds a few hundred frames and the producer finishes ~0.2 s before the run does. A per-intake trace showed the
+  rule would have declined at every tail intake — and that every one came before the producer finished. So remaining
+  work is now queue depth **plus the frames the reader has not reached**, estimated from the archive size and the mean
+  frame size pushed so far (known from the eighth frame). A pipe or stdin has no size, and there producer-done still
+  arms it — now also called on decompress.
+- **Units.** The aggregate CPU rate counts compressed bytes on decompress while the GPU counts decompressed ones, so
+  the CPU looked slower by the compression ratio. The check uses the payload-unit CPU rate, which until now was
+  updated only under `--adapt` and is now updated every tick.
+- **A different inequality.** Compress takes a batch when the CPU would still be busy when it lands:
+  `t_cpu(depth − batch) ≥ 1.3·t_gpu(batch)`. If the GPU declines, the CPU must do that batch too, so decompress uses
+  the makespan comparison `t_cpu(remaining) ≥ 1.3·t_gpu(batch)`. They differ by `t_cpu(batch)`: negligible when the
+  CPU pool is far faster, as on every compress host, and not when the GPU is (at `-T2` here the GPU pool was ~2.6× the
+  CPU's). Both measured alike on decompress; this one is the correct algebra. **Compress is unchanged.**
+- `-vv` prints one line when the yield latches (`[HYBRID] decompress tail yield: N frames queued + ~M unread; CPU … vs
+  GPU … GiB/s`) and one when a parked stream resumes or the queue drains.
+- Setting producer-done on decompress also arms `--adapt`'s all-devices-decline floor release there, the only other
+  reader of that flag, which compress has always had.
+- Test hook `GZSTD_DEBUG_HYBRID_RATES=cpu=…,gpu=…` pins the plain hybrid rates (GiB/s, payload units), so the decision
+  does not depend on the host. Unlike `GZSTD_DEBUG_ADAPT_RATES` it needs no `--adapt`.
+
+### Verified
+
+48 GiB, warm, Latin-rotated order, 3 runs per arm, one prototype binary with the rule switched by an environment
+variable (min / median / max, seconds). The shipped patch, re-measured interleaved against the unchanged v0.17.53
+binary at `-T8`: 5.07–5.20 s against 5.13–5.58, latching with 251–288 frames unread.
+
+| threads | `--cpu-only` | hybrid before | hybrid after |
+|---|---|---|---|
+| `-T8` (GPU slower) | 4.94 / 4.96 / 4.99 | 5.11 / 5.24 / 5.79 | 5.08 / 5.09 / 5.22 |
+| `-T2` (GPU faster) | — | 7.54 / 7.68 / 7.77 | 7.44 / 7.46 / 7.76 |
+
+- **The tail itself**, as the time from the reader finishing to the last GPU batch: 603, 761 and 1159 ms before; 28,
+  −95 and 14 ms after. The yield latched in 3 of 3 `-T8` runs, with 251–288 frames still unread — armed by the
+  estimate, before the reader finished.
+- **This is a small win, stated plainly.** The median gain (~3%) is inside the ~0.2 s run-to-run noise on this shape;
+  the dependable effect is the stall, and the worst run (5.79 → 5.22 s). Hybrid still trails `--cpu-only` by ~0.1 s at
+  `-T8` with the tail gone, so the tail was only part of that gap. At `-T12` and above the GPU is never started.
+- **Default runs mostly avoid the regime.** A warm input already defaults to `--cpu-only` (v0.17.52), and a cold one
+  is read-bound. It shows under an explicit `--hybrid` on warm, entropy-coded data at mid thread counts.
+- **Adversarial frame sizes.** On 24 GiB of ~12 MiB frames followed by 24 GiB of ~4.5 MiB ones, the whole-file mean
+  undercounts unread frames about 2× near the tail (0.53–0.55 of true), which yields early. At `-T2`, where yielding
+  early costs real work, runs were 8.04–8.37 s against 8.19–8.27 before — no measurable harm, because the decline
+  threshold is only large when the GPU is the slower engine, and then handing its frames to faster CPUs is cheap.
+- `--adapt` decompress and a hybrid compress round trip both complete byte-identical.
+
+### Test
+
+Two default-tier cells (`Decompress tail-aware GPU intake`), both skipping without a GPU, on a 1 GiB base64 fixture at
+1 MiB frames and `-T1` with rates pinned so the CPU is 10,000× the GPU. **File input:** any GPU batch fails the cell
+(the check never armed); a latch with zero batches and matching output passes; no latch and no batch — the CPU
+finished before a GPU existed — is a SKIP, not a pass. Measured on this host, 770–875 of 1,024 frames were still
+queued at the latch. **Pipe input:** only producer-done can arm it, so the GPU may take batches first; a GPU online
+that never yields fails. A pipe producer's tasks own heap bytes, so the queue's byte cap blocks it and it finishes
+with frames still queued, which makes the latch deterministic.
+
+Mutation-tested by running the section verbatim under the suite's single-card default, against mutants built from this
+source with one mechanism removed each. **This build passes both.** With the pre-v0.17.54 mode test restored, **both
+fail** — 23 GPU batches against the pinned CPU on the file, and no yield on the pipe. With `set_producer_done()` removed
+from decompress, **the file cell still passes and the pipe cell fails**: the unread estimate alone arms a file, and
+nothing arms a pipe. That second mutant is the estimator's coverage — the file fixture is smaller than the queue
+ceiling, so in the shipped build producer-done would also arm it, and only a build without producer-done shows the
+estimate doing it alone. The v0.17.53 binary fails both, though it also lacks the test hook.
+
+**Test suite:** default run on a GPU host without GDS **439 passed, 0 failed, 6 skipped** (445 total; the drift check
+expected 439 = 445 − 6 GDS unavailable, confirming the new baseline). Both new cells passed (7.6 s and 5.3 s, fixture
+included), as did the `--adapt` ranked-dispatch cells — including "injected slow ranking zeroes GPU decompress
+intake", the path whose floor release producer-done now also arms. The CPU-only build compiles clean (its 9 warnings are
+the pre-existing unused-symbol notices). Not run at v0.17.54: the CPU-only suite and `--extensive` (derived 576; no-GPU
+delta 103 derived).
 
 ## v0.17.53 — a wedged GPU decompress batch hung the run with no way out
 
