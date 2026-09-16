@@ -1,12 +1,83 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.54  
+**Covers:** v0.9.50 → v0.17.55  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.55 — every run slept up to 200 ms after its work was done
+
+**Three periodic loops that every run joins at the end now wake when told to stop, instead of finishing their
+sleep.** The progress bar slept 200 ms between updates, the hybrid scheduler tick 100 ms, and the GPU-compress stall
+watchdog in 100 ms slices; each tested its stop flag only after sleeping. Teardown sat out the rest of the sleep — and
+all of it for a run shorter than one period, because the loops sleep first. The project's own rule is no fixed waits
+in scheduling paths.
+
+### Why
+
+- **MEASURED** on a one-frame archive (~250 KiB), 20 runs per arm, `-d -c`, medians. With the progress bar on (it shows
+  on a terminal at the default verbosity, and at `-v`): `--cpu-only` **213 ms** against 25 ms with it off, the work
+  itself being ~20 ms. `--hybrid` with the bar off: **163 ms**. Per file — a multi-file command pays it for each.
+- **Found while chasing something else.** v0.17.54 left a lead: at `-T12` on a 48 GiB entropy-coded archive, hybrid
+  decompress ran 0.1–0.4 s slower than `--cpu-only` with **zero GPU batches**. None of the obvious causes held up, each
+  tested rather than assumed:
+  - **Not GPU bringup** — every such run logged `skipping GPU bringup`; no CUDA context was ever made.
+  - **Not the 32 GiB in-flight budget** hybrid is given — in-flight peaked at 23–43 frames against cpu-only's 27.
+  - **Not a reader copy** — both paths read zero-copy views (`task-copy 0.0%`).
+  - **Not queue depth** — pinning `--gpu-batch 4` cut hybrid's queue ceiling from 2060 frames to 44 and its read-ahead
+    to cpu-only's 15 blocks, with no change in time; raising cpu-only's throttle from 48 to 2048 changed nothing either.
+  The clue was the wall times themselves: they fell on a 200 ms grid (4.05 or 4.25 s, 4.31 or 4.51 s) for every mode.
+
+### The change
+
+- `progress_loop`, `tick_loop_fn` and `watchdog_loop` wait on one shared condition variable for their same period,
+  with their stop flag as the predicate. All 14 places that set one of those flags — including the exception-path
+  `ThreadGuard` — call `gz_wake_periodic_loops()` right after. A setter that were ever to miss it still works: its loop
+  wakes at the old period.
+- Periods and behaviour are otherwise unchanged. The bar still renders its final sample after the loop. The tick loop
+  still takes the one last `tick()` the old loop always took after its final sleep, because `tick()` feeds the
+  `--adapt` rate mirrors the profile writer persists.
+
+### Verified
+
+| one-frame archive, medians | before | after |
+|---|---|---|
+| `-d --cpu-only`, bar on | 213 ms | **24 ms** |
+| `-d --cpu-only`, bar off | 25 ms | 25 ms |
+| `-d --hybrid`, bar on | 264 ms | **71–80 ms** |
+| `-d --hybrid`, bar off | 163 ms | **73–85 ms** |
+| compress `--cpu-only -v` | 212 ms | **18 ms** |
+| compress `--hybrid -v` | 263 ms | **76 ms** |
+
+- **48 GiB, `-T12`, `-v`:** `--cpu-only` 4.05 / 4.25 / 4.26 s → 3.98 / 4.03 / 4.04; `--hybrid` 4.30 / 4.51 / 4.51 →
+  4.15 / 4.16 / 4.30. The 200 ms grid is gone and the hybrid gap about halved.
+- Output byte-identical in every latency run; hybrid, `--adapt`, GPU-only compress (the watchdog's path) and a forced
+  `--progress` bar all complete and round-trip.
+
+### Deliberately not changed
+
+**Hybrid's remaining ~60 ms is GPU discovery before the first CUDA call** (`order_all_gpus_before_cuda`): it starts the
+NVML sampler, waits for its first sample, ranks the cards and sets `CUDA_VISIBLE_DEVICES` — which must happen before
+CUDA initializes, since CUDA freezes device order then. Moving it onto the background bringup thread would call
+`setenv` while CPU workers may call `getenv`, which glibc does not make safe; avoiding the reorder would mean choosing
+devices by UUID instead, a much larger change. It is paid **once per process, not per file**, and not by small inputs:
+the small-input gate routes anything under one GPU batch (256 MiB) to `--cpu-only` before discovery runs. On the runs
+that do pay it, it is under 2%. (Traced with `strace`: a ~61 ms block from loading `libnvidia-ml` to the ranking line;
+the ~36 ms of library loading before it is paid by `--cpu-only` too.)
+
+### Test
+
+No new suite cell: the only observable is latency, and a suite cell must never be gated on wall-clock time. All three
+loops run under existing cells (progress at `-v`, hybrid and `--adapt` scheduling, GPU-only compress).
+
+**Test suite:** default run on a GPU host without GDS **439 passed, 0 failed, 6 skipped** (445 total; the drift check
+expected 439 = 445 − 6 GDS unavailable); CPU-only build **342 passed, 0 failed, 84 skipped** (expected 342 = 445 − 103,
+the first measurement of the no-GPU delta v0.17.54 derived). Not run: `--extensive` (derived 576). Incidentally, the
+default suite took 224 s against 250 s at v0.17.54 with the same cells — it runs hundreds of short invocations, many
+at `-v` or hybrid — but that is one run per version, so it is consistent with the fix rather than a measurement of it.
 
 ## v0.17.54 — a slower GPU held the end of a hybrid decompress
 

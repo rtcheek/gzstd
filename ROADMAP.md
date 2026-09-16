@@ -333,6 +333,18 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.55: every run slept up to 200 ms after its work was done
+
+The v0.17.54 lead — hybrid decompress 0.1–0.4 s behind `--cpu-only` at `-T12` with zero GPU batches — was not a
+hybrid cost. Bringup, the in-flight budget, a reader copy and queue depth were each measured and ruled out; the walls
+fell on a 200 ms grid. The progress bar (200 ms), the hybrid scheduler tick (100 ms) and the GPU-compress stall watchdog
+slept first and checked their stop flag after, so every run sat out the rest of the sleep at teardown: a one-frame
+decompress took 213 ms with the bar on against 25 ms off, and 163 ms under `--hybrid`, per file. The loops now wait on a
+condition variable their stop sites notify (CHANGELOG v0.17.55): 24 ms, and 71–85 ms under `--hybrid`. The remaining
+~60 ms is GPU discovery before the first CUDA call, paid once per process and never for inputs under one GPU batch;
+moving it needs device selection by UUID rather than `setenv`, which is not worth it for that cost. Still deferred:
+`--direct-stage` for decompress.
+
 ## SHIPPED v0.17.54: a slower GPU held the end of a hybrid decompress
 
 Compress has declined GPU intake at the tail since v0.13.57; decompress never ran the check, and could not have: it

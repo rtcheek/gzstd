@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.54";
+static constexpr const char * GZSTD_VERSION = "0.17.55";
 //
 // Architecture overview:
 //
@@ -7453,6 +7453,38 @@ static bool gpu_bringup_worth_it(const Options & opt,
 }
 
 #endif  // HAVE_NVCOMP  (GPU engagement helpers)
+// ---- Waking a periodic loop at teardown ------------------------------------
+// The progress bar, the hybrid scheduler tick and the GPU stall watchdog each run
+// a loop on a fixed period, and every run JOINS them at the end.  They used to
+// sleep_for() the period and test their stop flag afterwards, so teardown sat out
+// the rest of the sleep -- ALL of it for a run shorter than one period, because
+// the loops sleep first.  MEASURED (a one-frame archive, 20 runs each, -d -c):
+// --cpu-only 25 ms with the progress bar off and 213 ms with it on (the bar shows
+// on a terminal, and at -v); --hybrid 163 ms with it off.  Per file.
+// Now they wait on this condition variable for the period, and every place that
+// sets one of their stop flags calls gz_wake_periodic_loops() right after.  A
+// setter that forgets is still correct: its loop wakes at the old period.
+// Leaked, never destroyed: a detached thread may still be waiting at exit.
+static std::mutex              & g_loop_wake_mx = *new std::mutex;
+static std::condition_variable & g_loop_wake_cv = *new std::condition_variable;
+
+// Wait up to `period`; true as soon as `stop` is set (the loop should end).
+static bool gz_periodic_wait(const std::atomic<bool> & stop,
+                             std::chrono::milliseconds period)
+{
+  std::unique_lock<std::mutex> lk(g_loop_wake_mx);
+  return g_loop_wake_cv.wait_for(lk, period,
+                                 [&] { return stop.load(std::memory_order_relaxed); });
+}
+
+// Call AFTER storing true in a periodic loop's stop flag.  Taking the lock orders
+// this against a waiter's predicate check, so the wakeup cannot be lost.
+static void gz_wake_periodic_loops()
+{
+  { std::lock_guard<std::mutex> lk(g_loop_wake_mx); }
+  g_loop_wake_cv.notify_all();
+}
+
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
 {
   // Progress bar at V_DEFAULT and V_VERBOSE only.
@@ -7481,7 +7513,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   // brief forward stall is acceptable, going backwards is not.
   double out_pct_floor = 0.0;
   while (!done_flag->load()) {
-    std::this_thread::sleep_for(200ms);
+    if (gz_periodic_wait(*done_flag, 200ms)) break;   // the final sample below still renders
     uint64_t in       = m->read_bytes.load();
     uint64_t out      = m->wrote_bytes.load();
     uint64_t t_out    = m->total_out.load();
@@ -13475,7 +13507,10 @@ static void tick_loop_fn(std::atomic<bool> & done, HybridSched * sched)
 {
   using namespace std::chrono_literals;
   while (!done.load()) {
-    std::this_thread::sleep_for(100ms);
+    // On stop, still take the one last tick the old sleep_for loop always took
+    // after its final sleep: tick() feeds the --adapt rate mirrors the profile
+    // writer persists, and a short run's last window belongs in them.
+    if (gz_periodic_wait(done, 100ms)) { sched->tick(); break; }
     sched->tick();
   }
 }
@@ -15737,7 +15772,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   }
 
   ZSTD_freeCCtx(cctx);
-  progress_done = true; progress_thr.join();
+  progress_done = true; gz_wake_periodic_loops(); progress_thr.join();
 }
 
 // Single-frame compression using zstd's built-in MT with sliding window.
@@ -15986,7 +16021,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   }
 
   ZSTD_freeCCtx(cctx);
-  progress_done = true; progress_thr.join();
+  progress_done = true; gz_wake_periodic_loops(); progress_thr.join();
 
   // Decide the round trip.  A mismatch raises the SAME flag the frame verifier
   // uses, so the driver's existing discard-and-rebuild-CPU-only path handles it
@@ -22615,6 +22650,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
       g_direct_read_pool = nullptr;
 #endif
       pdone.store(true, std::memory_order_relaxed);
+      gz_wake_periodic_loops();
       if (wthr.joinable()) wthr.join();
       if (pthr.joinable()) pthr.join();
     }
@@ -22962,6 +22998,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // Wait for writer and progress threads to finish
   wthr.join();
   progress_done = true;
+  gz_wake_periodic_loops();
   progress_thr.join();
   log_throttle_stats(throttle, opt, "compress-cpu");
 
@@ -24287,8 +24324,7 @@ static void watchdog_loop(std::atomic<bool> * done, int timeout_secs) {
   uint64_t last_wrote = d->meter->wrote_bytes.load();
   uint64_t last_change = now_ns();
   while (!done->load(std::memory_order_relaxed)) {
-    for (int k=0; k<10 && !done->load(std::memory_order_relaxed); ++k)
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (gz_periodic_wait(*done, std::chrono::milliseconds(1000))) break;
     if (done->load(std::memory_order_relaxed)) break;
     uint64_t w = d->meter->wrote_bytes.load();
     uint64_t now = now_ns();
@@ -27657,6 +27693,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // Stop adaptive tick thread
   if (sched) {
     tick_done = true;
+    gz_wake_periodic_loops();
     if (tick_thr.joinable()) tick_thr.join();
   }
 
@@ -27721,10 +27758,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // ---- GPU deadlock watchdog teardown (v0.14.59) ----
   if (watchdog_thr.joinable()) {
     watchdog_done.store(true, std::memory_order_relaxed);
+    gz_wake_periodic_loops();
     watchdog_thr.join();
   }
   g_wd.store(nullptr, std::memory_order_release);
   progress_done = true;
+  gz_wake_periodic_loops();
   progress_thr.join();
   log_throttle_stats(throttle, opt,
                      opt.hybrid ? "compress-hybrid" :
@@ -31749,7 +31788,7 @@ gds_out_declined:
     gz_join_or_detach_workers();
     gz_stop_reclaimer();
     for (auto & th : cpu_pool) th.join();
-    if (sched) { tick_done = true; if (tick_thr.joinable()) tick_thr.join(); }
+    if (sched) { tick_done = true; gz_wake_periodic_loops(); if (tick_thr.joinable()) tick_thr.join(); }
     if (writer_thr.joinable()) writer_thr.join();
 
     // GDS output was registered before frame parsing, but a sizeless FIRST
@@ -31949,6 +31988,7 @@ gds_out_declined:
 
   if (sched) {
     tick_done = true;
+    gz_wake_periodic_loops();
     if (tick_thr.joinable()) tick_thr.join();
   }
 
@@ -32399,6 +32439,7 @@ static int extract_tar(const Options & opt, Meter * m)
   // main()'s DECOMPRESS summary).  in = total compressed read, out = total
   // extracted; the "output" label is the extraction directory.
   prog_done = true;
+  gz_wake_periodic_loops();
   if (prog_thr.joinable()) prog_thr.join();
   if (opt.verbosity >= V_DEFAULT) {
     uint64_t in_bytes  = m->read_bytes.load();
@@ -32621,6 +32662,7 @@ static int verify_tar(const Options & opt, Meter * m)
 
   // Stop the progress bar, then print the per-archive results on clean lines.
   prog_done = true;
+  gz_wake_periodic_loops();
   if (prog_thr.joinable()) prog_thr.join();
   if (opt.verbosity >= V_DEFAULT) {
     std::fprintf(stderr, "\r\033[K");  // clear any leftover progress line
@@ -33150,6 +33192,7 @@ static int list_tar(const Options & opt, Meter * m)
       exth.join();
       g_tar_decomp_sink = nullptr;
       prog_done = true;
+      gz_wake_periodic_loops();
       if (prog_thr.joinable()) prog_thr.join();   // meter off before the footer
     }
 
@@ -34924,6 +34967,7 @@ static int gzstd_main(int argc, char ** argv)
   // ---- Test mode: report integrity results and exit ----
   if (opt.mode == Mode::TEST) {
     prog_done = true;
+    gz_wake_periodic_loops();
     if (prog_thr.joinable()) prog_thr.join();
 
     // Compute compressed vs decompressed sizes
@@ -35299,6 +35343,7 @@ static int gzstd_main(int argc, char ** argv)
   // Stop decompress progress thread now that write drain is complete
   if (opt.mode == Mode::DECOMPRESS) {
     prog_done = true;
+    gz_wake_periodic_loops();
     if (prog_thr.joinable()) prog_thr.join();
   }
 
