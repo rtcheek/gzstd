@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.58";
+static constexpr const char * GZSTD_VERSION = "0.17.59";
 //
 // Architecture overview:
 //
@@ -2516,11 +2516,13 @@ struct Options {
 static std::mutex             g_stage_read_err_m;
 static std::string            g_stage_read_err;     // guarded by the mutex
 static std::atomic<bool>      g_stage_read_failed{false};
+#ifdef HAVE_NVCOMP
 static void gz_note_stage_read_failure(const std::string & why)
 {
   std::lock_guard<std::mutex> g(g_stage_read_err_m);
   if (!g_stage_read_failed.exchange(true)) g_stage_read_err = why;   // first one wins
 }
+#endif
 static std::string gz_stage_read_reason()
 {
   std::lock_guard<std::mutex> g(g_stage_read_err_m);
@@ -2563,6 +2565,7 @@ static std::string gz_stage_read_reason()
  Ties on the combined score go to more free VRAM, then to lower util — so the
  all-idle case still lands on the roomiest card, which is what shipped before.
 ======================================================================*/
+#ifdef HAVE_NVCOMP
 struct GzDevRank {
   unsigned           util = 0;          // 0-100, lower better
   unsigned long long free_bytes = 0;    // higher better
@@ -2623,6 +2626,7 @@ static std::vector<size_t> gz_rank_devices(const std::vector<GzDevRank> & in)
   }
   return idx;
 }
+#endif
 
 // --verify-engine values (see Options::verify_engine).
 static constexpr int VERIFY_ENGINE_AUTO = 0;  // pick by PCIe gen / bottleneck heuristic
@@ -6238,6 +6242,7 @@ struct AdaptFp {
   std::string driver;  // GPU driver version ("" without a driver); entry data, NOT key
 };
 
+#if defined(HAVE_NVCOMP) && defined(HAVE_NVML)
 // GPU half of the fingerprint, read straight from the driver's procfs.
 //
 // This is the FAST PATH for what NVML would otherwise tell us.  The NVIDIA
@@ -6300,6 +6305,7 @@ static bool adapt_fp_gpus_procfs(std::string & gpus, std::string & driver)
   driver = drv;
   return true;
 }
+#endif
 
 static AdaptFp adapt_fingerprint_probe_()
 {
@@ -10019,6 +10025,7 @@ static void gz_direct_read_release(int slot) {
 #endif
 }
 
+#ifdef HAVE_NVCOMP
 // GPU-fault abort protocol hook: wake a reader parked in DirectReadPool::acquire()
 // so the run can tear down and reach the CPU-only rebuild.  No-op when no pooled
 // read is active (mmap/fread paths, Windows).
@@ -10027,7 +10034,6 @@ static void gz_direct_read_abort() {
   DirectReadPool * p = g_direct_read_pool.load(std::memory_order_acquire);
   if (p) p->set_done();
 #endif
-#ifdef HAVE_NVCOMP
   // The --tar --gds-only assembler parks in GdsStagePool::acquire() waiting for a
   // slot the dead workers will never release, so it needs the same wake for the
   // same reason.  Adding a second pool without adding it here would hang the
@@ -10035,8 +10041,8 @@ static void gz_direct_read_abort() {
   // what this hook was written to prevent for the first pool.
   GdsStagePool * sp = g_gds_stage_pool.load(std::memory_order_acquire);
   if (sp) sp->set_done();
-#endif
 }
+#endif
 
 class FrameThrottle;   // declared below; TaskQueue only pokes it through a pointer
 
@@ -18316,11 +18322,9 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     size_t clen = (size_t)(b - a);
     Task t; t.seq = ci;
     char * outp = nullptr;
-    int    slot = staged_slot;
 #ifdef HAVE_NVCOMP
+    int    slot = staged_slot;
     GdsStagePool * stage = g_gds_stage_pool.load(std::memory_order_acquire);
-#else
-    void * stage = nullptr;
 #endif
 #ifdef HAVE_NVCOMP
     if (stage) {
@@ -27940,15 +27944,26 @@ static void gz_decomp_unpublish(int device_id)
 // summed over 8 lanes (~4.7 s of wall at ~2.6 GiB/s), pinned upload ~0.8 s, kernel
 // plus download 3.45 s, wall 9.5 s against the ordinary reader's 6.3-7.0.
 //
-// So readers here pread frames that are STILL IN THE QUEUE into pinned buffers, and
+// So readers here pread frames that are STILL IN THE QUEUE into cache buffers, and
 // place_frame claims them.  Nothing is popped early: throttle permits, the stuck-GPU
 // reclaim registry, the CPU rescue and teardown all see exactly the frames they saw
 // before, and a cache MISS is simply the old path -- the worker preads the frame
-// itself.  The buffers are PORTABLE pinned memory, so any device's worker can upload
-// from them.
+// itself.
+//
+// THE BUFFERS ARE PAGEABLE (4 KiB-aligned for O_DIRECT), NOT PINNED.  v0.17.57 pinned
+// them, per 16 MiB buffer, lazily, on the readers -- and pinning is neither cheap nor
+// parallel.  MEASURED (PCIe Gen5 H100, one device, 12 GiB archive, cold): 254 pinned
+// buffers took 49.4 s summed across the 8 readers, ~6 s of wall, all of it inside the
+// first batch.  Readers stuck pinning read nothing, so the worker read ~all 254 frames
+// itself (h2d 4.0-4.3 s where a pinning-free first batch took 0.2 s), and the run took
+// 11.85-12.50 s against 5.7-5.8 for the ordinary reader.  Pageable: 254 buffers in
+// 0.6-0.9 s summed, 6.15-6.24 s; 36 GiB 17.03-17.13 -> 11.43-11.58.  The upload from
+// pageable memory is slower (40 ms against 16 per 64-frame batch) and does not matter.
+// Any device's worker can upload from them, as it could from portable pinned memory.
 //
 // GZSTD_DEBUG_DSTAGE_AHEAD=N sets the cache to N frames; 0 turns read-ahead off --
-// the in-tool control that makes the A/B one binary.
+// the in-tool control that makes the A/B one binary.  GZSTD_DEBUG_DSTAGE_AHEAD_PINNED=1
+// restores the pinned buffers, for the same reason.
 class DStageAhead {
 public:
   DStageAhead(TaskQueue * q, int fd, size_t slot_bytes, size_t cap_frames)
@@ -27995,7 +28010,7 @@ public:
     for (auto & t : thr_) if (t.joinable()) t.join();
     thr_.clear();
     std::lock_guard<std::mutex> lk(m_);
-    for (void * b : bufs_) if (b) cudaFreeHost(b);
+    for (void * b : bufs_) if (b) { if (pinned_) cudaFreeHost(b); else std::free(b); }
     bufs_.clear(); free_.clear(); ents_.clear();
   }
 
@@ -28057,6 +28072,10 @@ public:
   uint64_t waits()  const { return waits_.load(std::memory_order_relaxed); }
   uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
   size_t   capacity() const { return cap_; }
+  uint64_t allocs()   const { return allocs_.load(std::memory_order_relaxed); }
+  uint64_t alloc_ns() const { return alloc_ns_.load(std::memory_order_relaxed); }
+  size_t   slot_bytes() const { return slot_; }
+  bool     pinned()   const { return pinned_; }
 
 private:
   enum St { READING, READY, IN_USE, FAILED };
@@ -28064,9 +28083,11 @@ private:
 
   static constexpr size_t NONE = (size_t)-1;
 
-  // A buffer this reader may fill: a free one, or a new portable pinned allocation
-  // (made OUTSIDE every lock -- pinning 16 MiB takes milliseconds) while under the
-  // cap.  Blocks while the cache is full; NONE on stop or if pinning fails.
+  // A buffer this reader may fill: a free one, or a new allocation (made OUTSIDE
+  // every lock) while under the cap.  Blocks while the cache is full; NONE on stop or
+  // if allocation fails.  alloc_ns_ times the allocation itself: it is the number that
+  // showed pinning here cost ~24 ms per 16 MiB buffer, not the "milliseconds" this
+  // comment used to promise.
   size_t take_buffer() {
     std::unique_lock<std::mutex> lk(m_);
     while (true) {
@@ -28076,8 +28097,13 @@ private:
         ++pending_alloc_;
         lk.unlock();
         void * p = nullptr;
-        const bool ok = cudaHostAlloc(&p, slot_, cudaHostAllocPortable) == cudaSuccess;
-        if (!ok) cudaGetLastError();       // handled: fewer buffers, not a device error
+        const uint64_t alloc_t0 = now_ns();
+        const bool ok = pinned_
+            ? cudaHostAlloc(&p, slot_, cudaHostAllocPortable) == cudaSuccess
+            : ::posix_memalign(&p, 4096, slot_) == 0;
+        alloc_ns_.fetch_add(now_ns() - alloc_t0, std::memory_order_relaxed);
+        allocs_.fetch_add(1, std::memory_order_relaxed);
+        if (!ok && pinned_) cudaGetLastError();   // handled: fewer buffers, not a device error
         lk.lock();
         --pending_alloc_;
         if (!ok) {
@@ -28145,6 +28171,7 @@ private:
   TaskQueue *                          q_;
   int                                  fd_;
   size_t                               slot_;
+  const bool                           pinned_ = ::getenv("GZSTD_DEBUG_DSTAGE_AHEAD_PINNED") != nullptr;
   size_t                               max_;
   size_t                               cap_;
   bool                                 shrunk_ = false;
@@ -28158,6 +28185,7 @@ private:
   std::atomic<bool>                    stop_{false};
   std::vector<std::thread>             thr_;
   std::atomic<uint64_t>                hits_{0}, waits_{0}, misses_{0};
+  std::atomic<uint64_t>                allocs_{0}, alloc_ns_{0};
 };
 static std::atomic<DStageAhead *> g_dstage_ahead{nullptr};
 
@@ -32171,7 +32199,13 @@ gds_out_declined:
   if (g_gds_read_active.load(std::memory_order_acquire) && opt.direct_stage
       && opt.mode == Mode::DECOMPRESS && g_gds_verify_fd >= 0) {
     const size_t slot = (decomp_comp_slot(opt, true) + 4095) & ~size_t(4095);
-    size_t frames = std::max<size_t>(1, opt.gpu_batch_cap)
+    // THE BATCH THE WORKERS WILL POP, not opt.gpu_batch_cap: without --gpu-batch the
+    // staged path pins shared_tune_decomp at its register budget (254 at 16 MiB
+    // frames) while gpu_batch_cap still holds the size-derived 64.  Sized from the
+    // latter, the cache grew only at the first pop, so ~230 of the first 254 frames
+    // were read by the worker (48 when the cache started at 254).
+    size_t frames = std::max<size_t>({1, opt.gpu_batch_cap,
+                                      (size_t)shared_tune_decomp.batch_size.load()})
                   * std::max<size_t>(1, opt.gpu_streams)
                   * (size_t)std::max(1, (int)opt.gpu_devices);
     frames = std::max<size_t>(16, frames);
@@ -32342,6 +32376,12 @@ gds_out_declined:
         dstage_ahead->capacity(),
         (unsigned long long)dstage_ahead->hits(), (unsigned long long)dstage_ahead->waits(),
         (unsigned long long)dstage_ahead->misses());
+      vlog(V_VERBOSE, opt, b);
+      std::snprintf(b, sizeof(b),
+        "[DSTAGE] allocated %llu %s cache buffers (%.0f MiB) in %.2f s summed across readers\n",
+        (unsigned long long)dstage_ahead->allocs(), dstage_ahead->pinned() ? "pinned" : "pageable",
+        double(dstage_ahead->allocs() * dstage_ahead->slot_bytes()) / 1048576.0,
+        double(dstage_ahead->alloc_ns()) / 1e9);
       vlog(V_VERBOSE, opt, b);
     }
   }
@@ -32600,6 +32640,7 @@ static void write_stats_json_cpu_only(const std::string & path, const Options & 
    4. Join progress thread, print summary, clean up
 ======================================================================*/
 static Options parse_args(int argc, char ** argv);
+#ifdef HAVE_NVCOMP
 // Every GPU's UUID, from /proc — no CUDA, no NVML, no cost.
 //
 // Two uses: answering "how many GPUs does this box have" before any driver is
@@ -32631,6 +32672,7 @@ static const std::vector<std::string> & gz_proc_gpu_uuids()
   }();
   return uuids;
 }
+#endif
 
 static void apply_backend_defaults(Options & opt);
 static std::string derive_output(const std::string & input, Mode mode);
@@ -36133,6 +36175,7 @@ static std::string derive_output(const std::string & input, Mode mode)
  NVML is the primary path; /sys/bus/pci/devices walk is the fallback
  when the binary was built without NVML.
 ======================================================================*/
+#ifdef HAVE_NVCOMP
 // One sysfs link-speed file ("32.0 GT/s PCIe") -> PCIe generation, 0 = unknown.
 static int pcie_gen_of_speed_file(const fs::path & p)
 {
@@ -36224,6 +36267,7 @@ static int detect_min_pcie_gen()
 #endif
   return (min_gen > 0) ? min_gen : 0;
 }
+#endif
 
 
 #ifndef _WIN32
@@ -36263,6 +36307,7 @@ static double adapt_path_residency(const std::string & path)
   return resid;
 }
 
+#ifdef HAVE_NVCOMP
 // Estimated UNCOMPRESSED size of a decompress input, for the "too small to pay
 // for a GPU" gate.  That gate's bound is in uncompressed bytes (one GPU batch is
 // gpu_batch_cap frames of chunk_mib each) but stat() gives the COMPRESSED size,
@@ -36310,6 +36355,7 @@ static uint64_t adapt_decomp_uncompressed_est(const std::string & path,
   if (!(est > 0.0) || est > 1e18) return comp_size;    // overflow guard
   return (uint64_t)est;
 }
+#endif
 
 static double adapt_input_residency(const Options & opt)
 {

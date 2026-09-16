@@ -1,12 +1,93 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.58  
+**Covers:** v0.9.50 → v0.17.59  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.59 — `-d --direct-stage` spent its first batch page-locking the read-ahead cache
+
+**Performance, `-d --direct-stage` only.** On the server (PCIe Gen5, H100), a default `-d --direct-stage` ran **twice as
+long as the ordinary reader**: 11.94–12.50 s against 5.70–5.86 s on a 12 GiB archive, cold, n=10. v0.17.57's read-ahead
+cache page-locked each 16 MiB buffer as a reader first needed it, and page-locking is neither cheap nor parallel: the
+254 buffers took **49.4 s summed across the 8 readers**, about 6 s of wall, all of it during the first batch. A reader
+waiting on a lock reads nothing, so the worker read almost the whole first batch itself (upload phase 4.0–4.3 s, against
+0.2 s for the same batch without the page-locking), and that one batch took 7.5 s of a 12 s run. Two changes:
+
+1. **The cache buffers are pageable** (4 KiB-aligned, as O_DIRECT requires). The same 254 buffers now take 0.6–0.9 s
+   summed. Uploading from pageable memory is slower — 40 ms against 16 ms per 64-frame batch here — and does not
+   matter next to what it replaces.
+2. **The cache starts at the batch the workers will take.** Without `--gpu-batch`, the staged path pins the batch at
+   its register budget (254 at 16 MiB frames), but the cache was sized from the input-size default (64) and only grew
+   at the first pop. ~230 of the first 254 frames were read by the worker; now 42–98 across the runs measured.
+
+Cold, every run verified 0.0% cached, `--gpu-devices=1`, output to `/dev/null`, arms interleaved:
+
+| | 12 GiB archive (n=3) | 36 GiB archive (n=2) |
+|---|---|---|
+| `-d --direct-stage`, v0.17.58 | 11.85–12.11 s | 17.03–17.13 s |
+| `-d --direct-stage`, v0.17.59 | **6.15–6.24 s** | **11.43–11.58 s** |
+| v0.17.59 with `GZSTD_DEBUG_DSTAGE_AHEAD_PINNED=1` | 11.93–12.13 s | — |
+| `-d --gpu-only` (ordinary reader) | 5.71–5.78 s | 10.35–10.43 s |
+| `-t --direct-stage`, v0.17.58 → v0.17.59 | — | 10.23–10.29 → 10.24–10.32 s |
+
+`GZSTD_DEBUG_DSTAGE_AHEAD_PINNED=1` restores the pinned buffers. It reproduces v0.17.58 to within noise, so the win
+belongs to this change and nothing else. A new `-v` line reports the allocation cost, which is how it was found:
+
+    [DSTAGE] allocated 254 pageable cache buffers (4081 MiB) in 0.76 s summed across readers
+
+Kernel CPU fell from 11.3 s to 7.6 s and peak RSS from 8.2 to 7.2 GiB on the 12 GiB archive (n=1).
+
+### How it was found, and a fix that was reverted
+
+Server validation of v0.17.56–58 (the workstation had measured read-ahead as a 19% win). `-vv` put the loss in the first
+batch, at 254 frames. That batch comes from v0.17.16's rule for `--gds-only -t`: pin the batch at the register budget
+and lock the tuner off. `--gpu-batch 64` ran 6.2–6.5 s, and a first fix let `-d --direct-stage` take the size-derived
+start and the tuner. That fix measured 7.93–8.11 s: the tuner explored slower sizes, and every step up paid the pinning
+again. Timing the allocation found the actual cost. With pageable buffers, **the 254 pin is faster than the tuner**
+(6.09–6.13 s against 6.40–6.43 s), so that fix was reverted and the batch rule is unchanged. `-t` is faster at 254
+anyway (4.5–4.9 s against 5.3–5.4 s at 64).
+
+### Still open
+
+- **Gen3 is unmeasured.** v0.17.56 moved these reads to pinned host lanes because a Gen3 upload from pageable memory
+  was 35% of GPU batch time there. The worker's own lanes are still pinned. Only the read-ahead cache is pageable now,
+  and on that host its reads (~2.6 GiB/s) are likely the limit, not its uploads — but that is an argument, not a
+  measurement. The switch above makes it a one-binary A/B.
+- **~7–10% behind the ordinary reader.** At batch 254 the GPU consumes faster than 8 O_DIRECT lanes read, so ~250 of
+  3,072 frames on the 36 GiB archive are still read by the worker.
+- **The first download of a large batch touches fresh host memory:** ~2.1–2.4 s at 254–256 frames, against ~0.3–0.4 s
+  for later batches. The ordinary reader pays it too (`--gpu-batch 256`: 2.16 s). Not addressed.
+
+### Build warnings
+
+The CPU-only build (`USE_NVCOMP=OFF`) now compiles with no warnings; it had nine. Every one was a GPU-only definition
+compiled into a build with no caller: seven functions (`gz_note_stage_read_failure`, `gz_rank_devices` with its
+`GzDevRank`, `adapt_fp_gpus_procfs`, `gz_direct_read_abort`, `gz_proc_gpu_uuids`, `detect_min_pcie_gen` with its only
+helper `pcie_gen_of_speed_file`, and `adapt_decomp_uncompressed_est`) and the `--tar` assembler's `slot`/`stage` locals.
+Each now sits under the same guard as its callers — `HAVE_NVCOMP`, or `HAVE_NVCOMP && HAVE_NVML` for the procfs
+fingerprint — rather than being marked unused. A known-warning count is how a new warning goes unnoticed. The staged-read
+failure *reason* stays outside the guard, because the rebuild line that prints it is shared code. The GPU build is
+unchanged: every guard is true there.
+
+### Test
+
+No new suite cell. The change is wall time, a wall-clock gate is not a test, and the only deterministic observable is the
+word "pageable" in a log line. The existing `--direct-stage` decompress cells were replayed by hand on the suite's own
+fixture (64 MiB + 12,345 bytes, 1 MiB frames), in both buffer modes: file and stdout round-trips, staged frames and bytes
+equal to the seek table, the injected read failure named and recovered, read-ahead serving frames, and `-t` starting no
+cache. All pass. On the 12 GiB archive the output matched `--cpu-only` byte for byte (md5), with 1,024 of 1,024 frames
+staged. Both configurations build warning-free, and a fresh CMake configure of each is clean; the CPU-only binary
+round-trips and still refuses `--direct-stage` (exit 2). The static portable build (Docker) was not checked.
+
+Default suite on the 8-GPU host: **451 passed, 0 failed, 1 skipped, of 452**, run before the warning guards went in.
+They change nothing in the GPU build: it rebuilt warning-free and was spot-checked with `--direct-stage`, hybrid and
+GPU-compress round-trips. The skip is `trivial skip parks, never retires a GPU`, which cannot run on this host: one CPU
+thread finishes its fixture before a GPU takes a trivial batch. That is the host case its comment anticipates, so
+`EXPECTED_TESTS` stays 452. The CPU-only suite was not run.
 
 ## v0.17.58 — the staged producer's timing line blamed the wrong cost
 

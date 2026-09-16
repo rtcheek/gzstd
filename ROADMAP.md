@@ -333,6 +333,18 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.59: `-d --direct-stage` spent its first batch page-locking the read-ahead cache
+
+Server validation of v0.17.56–58. On a PCIe Gen5 H100 host, the default `-d --direct-stage` took twice as long as the
+ordinary reader (12 GiB cold: 11.94–12.50 s against 5.70–5.86 s): v0.17.57's cache page-locked its 16 MiB buffers
+lazily, 49.4 s summed across 8 readers, all inside the first batch. The buffers are now pageable, and the cache starts
+at the batch the workers will pop: 6.15–6.24 s, and 36 GiB 17.1 → 11.5 s (CHANGELOG v0.17.59).
+`GZSTD_DEBUG_DSTAGE_AHEAD_PINNED=1` is the in-tool control.
+
+**OPEN — Gen3 A/B of pageable versus pinned read-ahead.** v0.17.56 pinned these reads because Gen3 pageable uploads were
+35% of GPU batch time there. The worker's lanes are still pinned; only the cache changed. Measure it on the workstation
+with the switch before calling this a win on Gen3.
+
 ## SHIPPED v0.17.58: the staged producer's timing line blamed the wrong cost
 
 v0.17.57's ROADMAP opened an item on the staged producer's metadata reads from its `-v` line, which reported queue
@@ -355,7 +367,10 @@ queue while workers drain it, so batches ran during most of it. Split, on a 3072
 6,144 metadata preads take **0.29 s**, then 5.8–6.0 s is queue backpressure. Parallel or coalesced reads would save
 ~0.2 s on a 20–50 s run — not worth touching the table-validation path for. The report now prints both numbers.
 
-**OPEN — ordinary buffered decompress stalls on the Gen3 workstation.** Cold `-d --gpu-only` wall ran 6.3–7.0 s in the
+**CLOSED (2026-09-16, server) — ordinary buffered decompress stalls on the Gen3 workstation: hardware.** They did not
+reproduce on the server: 40 cold interleaved runs on a 12 GiB entropy-coded archive, every one within 5% of its arm, 20 of
+them with the reader threads 97% busy (the stall regime), 240 GiB read without a stall where the workstation's rate
+predicts ~5. Original record follows. Cold `-d --gpu-only` wall ran 6.3–7.0 s in the
 morning and ~12 s that afternoon, with four runs stalling at 30–61 s, all with reader threads saturated in buffered
 reads. Present in v0.17.56 as released; not the GPU card; not page-cache pressure. O_DIRECT reads on the same file were
 unaffected. Cause unknown. Context from the maintainer: the workstation is about six years old and has shown
