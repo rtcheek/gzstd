@@ -1,12 +1,39 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.57  
+**Covers:** v0.9.50 → v0.17.58  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.58 — the staged producer's timing line blamed the wrong cost
+
+**Diagnostic output only.** The `--gds-only`/`--direct-stage` decompress producer's `-v` line reported one number,
+"N s before any batch ran". It was measured after the producer had pushed every frame — and `push()` blocks on the
+bounded queue while the GPU workers drain it, so batches were running for most of that time. It now reports the two
+separately:
+
+    [GDS] producer: 3072 frames, 6144 metadata preads (0 walked) in 0.29 s, then 5.83 s handing frames to the queue
+
+### Why it mattered
+
+The old line opened an investigation into a cost that does not exist. v0.17.57's ROADMAP (and its commit message) recorded
+"2,048 serial metadata preads, 4.48 s cold" as an open item from that line. Following it: a `strace` of the producer showed
+its metadata preads ending at ~8.8 s of a 23.8 s "producer", and a standalone replay of the same preads on the same cold
+file took 0.3 s. With the timer split and the cache **verified** 0% resident before each run, alternating with the replay
+on a 36 GiB, 3072-frame archive: **metadata reads 0.29 s in gzstd** (the replay: 0.44 s), then 5.83–6.04 s of queue
+handoff. The ROADMAP item is closed with no change to the reads.
+
+Three explanations were measured and rejected on the way, each suggested by reading the code: slow random reads on
+older QLC-resident data (the replay was fast), contention with GPU bringup and page-locking (another process under the
+same load slowed the replay 3–6×, not 40×; nothing else was in the kernel during the slow traced reads), and a
+sequential-readahead hint on the input descriptor (none is set on it).
+
+### Test
+
+No suite cell: the change is one `-v` line, and nothing in the suite or the validation tooling parses it (checked).
 
 ## v0.17.57 — `-d --direct-stage` reads ahead; `-t --direct-stage` takes one stream
 
@@ -98,7 +125,10 @@ source. This build passes all seven cells.
 | read-ahead enabled for `-t` | the read-ahead cell (`-t` started a cache) |
 | fault hook no longer refuses a cached frame | **the read-failure cell** — frame 3 was served from the cache, the injected read error never fired, and that cell would silently have stopped testing anything |
 
-**Test suite:** not yet run at v0.17.57. Baseline 451 → 452, `--extensive` 582 → 583, no-GPU delta 109 → 110 (derived).
+**Test suite:** default run on a GPU host without GDS **446 passed, 0 failed, 6 skipped** (452 total; the drift check
+expected 446 = 452 − 6 GDS unavailable), all seven `--direct-stage` cells included; CPU-only build **342 passed, 0 failed,
+91 skipped** (expected 342 = 452 − 110, confirming the new delta). The CPU-only build compiles with the shared `TaskQueue`
+change and only its 9 pre-existing warnings. Not run: `--extensive` (derived 583).
 
 ## v0.17.56 — `--direct-stage` reads the compressed frames for -d and -t
 

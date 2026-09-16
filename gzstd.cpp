@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.57";
+static constexpr const char * GZSTD_VERSION = "0.17.58";
 //
 // Architecture overview:
 //
@@ -31175,6 +31175,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     if (t.decomp_size > max_frame_decomp) max_frame_decomp = t.decomp_size;
     built.push_back(std::move(t));
   }
+  const uint64_t meta_ns = now_ns() - prod_t0;   // metadata reads + checks only
   // Only now that nothing can demote: publish the totals and claim the path.
   if (m) {
     m->reader_threads.store(1, std::memory_order_relaxed);
@@ -31198,14 +31199,21 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
   clear_init_phase(phase.mine);   // (the guard would too, one statement later)
   if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
   if (opt.verbosity >= V_VERBOSE) {
-    char pb[160];
+    // TWO NUMBERS, NOT ONE.  This used to print a single "N s before any batch
+    // ran", measured AFTER the loop below had pushed every frame -- and push()
+    // blocks on the bounded queue while workers drain it, so batches were running
+    // during most of it.  MEASURED on a 3072-frame archive: "23.76 s before any
+    // batch ran", of which the metadata reads were ~8 s; the rest was queue
+    // backpressure.  It sent an investigation after the wrong cost twice.
+    char pb[200];
     std::snprintf(pb, sizeof(pb),
-        "[GDS] producer: %zu frames, %llu metadata preads (%llu walked), "
-        "%.2f s before any batch ran\n",
+        "[GDS] producer: %zu frames, %llu metadata preads (%llu walked) in %.2f s, "
+        "then %.2f s handing frames to the queue\n",
         nframes,
         (unsigned long long)g_gds_meta_preads.load(std::memory_order_relaxed),
         (unsigned long long)walked_frames,
-        double(now_ns() - prod_t0) / 1e9);
+        double(meta_ns) / 1e9,
+        double(now_ns() - prod_t0 - meta_ns) / 1e9);
     std::cerr << pb;
     char sz[32]; human_bytes(double(st.u_off.back()), sz, sizeof(sz));
     vlog(V_VERBOSE, opt, "[GDS] verify: " + std::to_string(nframes)

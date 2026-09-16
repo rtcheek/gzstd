@@ -333,6 +333,13 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.58: the staged producer's timing line blamed the wrong cost
+
+v0.17.57's ROADMAP opened an item on the staged producer's metadata reads from its `-v` line, which reported queue
+backpressure as time "before any batch ran". Measured with the two separated, the metadata reads cost 0.29 s on a
+3072-frame archive; the item is closed with no optimization, and the line now reports metadata reads and queue handoff
+separately (CHANGELOG v0.17.58).
+
 ## SHIPPED v0.17.57: `-d --direct-stage` reads ahead; `-t --direct-stage` takes one stream
 
 Closes v0.17.56's open item. A read-ahead cache preads frames still in the queue into portable page-locked buffers
@@ -342,15 +349,17 @@ because `-t` downloads nothing and gained no wall time. The same work found `-t 
 streams, which starved the second of VRAM and ran 20.5 s against 6.1 s at one — a defect in v0.17.56 as released, now
 defaulting to one (CHANGELOG v0.17.57).
 
-**OPEN — staged producer metadata reads.** The seek-table producer makes two serial single-queue-depth preads per frame
-(header and trailer): 2,048 of them, 4.48 s cold on a 1024-frame archive, competing with the data reads. The ordinary
-reader gets the same metadata free from its sequential read. Reading headers from the data window, or batching the
-preads, would remove it.
+**CLOSED (v0.17.58) — staged producer metadata reads were not a cost.** Opened on the producer's `-v` line, "4.48 s
+before any batch ran". That number was taken after every frame had been pushed, and `push()` blocks on the bounded
+queue while workers drain it, so batches ran during most of it. Split, on a 3072-frame archive verified 0% cached: the
+6,144 metadata preads take **0.29 s**, then 5.8–6.0 s is queue backpressure. Parallel or coalesced reads would save
+~0.2 s on a 20–50 s run — not worth touching the table-validation path for. The report now prints both numbers.
 
 **OPEN — ordinary buffered decompress stalls on the Gen3 workstation.** Cold `-d --gpu-only` wall ran 6.3–7.0 s in the
 morning and ~12 s that afternoon, with four runs stalling at 30–61 s, all with reader threads saturated in buffered
 reads. Present in v0.17.56 as released; not the GPU card; not page-cache pressure. O_DIRECT reads on the same file were
-unaffected. Cause unknown.
+unaffected. Cause unknown. Context from the maintainer: the workstation is about six years old and has shown
+inconsistent timings across months of testing, so a hardware or platform cause is the leading suspect.
 
 ## SHIPPED v0.17.56: `--direct-stage` reads the compressed frames for -d and -t
 
