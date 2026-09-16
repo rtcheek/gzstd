@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.55";
+static constexpr const char * GZSTD_VERSION = "0.17.56";
 //
 // Architecture overview:
 //
@@ -4166,7 +4166,7 @@ static void print_help_long()
 "     frame with O_DIRECT (a read that bypasses the kernel page cache)\n"
 "     straight into page-locked host memory, push it once into the same\n"
 "     GPU staging slab --gds-only fills, and hash it with the same\n"
-"     device-side XXH64 kernel.  Compression only, and not with --tar.\n"
+"     device-side XXH64 kernel.  Compress, -d and -t; not with --tar.\n"
 "\n"
 "     WHY IT EXISTS.  --gds-only was measured against gzstd's ordinary\n"
 "     reader and credited with the whole difference.  Decomposing that on\n"
@@ -4219,6 +4219,26 @@ static void print_help_long()
 "     behind the ordinary reader, host CPU 12.55-12.69 s -> 4.78-4.92,\n"
 "     peak resident set size 9.5 GB -> 1.0 GB) was taken at one stream\n"
 "     and has NOT been re-run with this default.\n"
+"\n"
+"     DECOMPRESSION AND -t.  The same read, of the COMPRESSED frames:\n"
+"     located through the archive's seek table, read O_DIRECT into\n"
+"     page-locked memory and pushed once to the GPU, which decompresses\n"
+"     and checks them as usual.  An archive with no seek table stands\n"
+"     down to the ordinary reader and says so.  Output goes through the\n"
+"     ordinary writer, so -c (standard output) works.  MEASURED on a\n"
+"     PCIe Gen3 host with 11 GiB cards, one card, 16 GiB of entropy-coded\n"
+"     data, cold, one stream, every range non-overlapping:\n"
+"       -t  wall 6.38-6.42 s against the ordinary reader's 6.87-6.88;\n"
+"           host CPU about 4.9 s against 15.6; peak memory 0.21 GiB\n"
+"           against 4.1.  Better on every axis.\n"
+"       -d  host CPU about 7.3 s against 15.5, peak memory 1.2 GiB\n"
+"           against 5.1 -- but WALL 8.91-9.05 s against 6.26-7.01,\n"
+"           about 35% SLOWER.  A decompress batch runs start to finish on\n"
+"           its worker, so each batch's reads wait behind the previous\n"
+"           batch's download, where the ordinary reader fills a queue\n"
+"           ahead of the GPU.  A second GPU stream does not help: streams\n"
+"           take turns on the same worker.  Use -d --direct-stage when\n"
+"           cores and memory matter more than time.\n"
 "\n"
 "     Distinct from --direct-read, which is O_DIRECT input for the CPU\n"
 "     path, and from --direct, which is O_DIRECT OUTPUT.\n"
@@ -27983,7 +28003,11 @@ static void gpu_decomp_worker(
     // Carried as a member because this is a LOCAL struct: its member functions
     // cannot reach the enclosing function's `opt` parameter.
     bool   gds_only = false;
-    bool   gds_read = false;      // --gds-only -t/-d: read side is cuFile
+    bool   gds_read = false;      // staged read side: --gds-only (cuFile) or --direct-stage
+    bool   dstage = false;        // --direct-stage: O_DIRECT pread -> pinned lane -> H2D, NO cuFile
+    std::vector<void *> h_dstage; // pinned host lanes, one per staged-read thread (lazily sized)
+    size_t h_dstage_n = 0;        // lanes actually pinned
+    size_t h_dstage_slot_bytes = 0;
     bool   gds_verify = false;    // --gds-only -t only: verified on device, no D2H
     bool   gds_reg_log = false;   // verbosity, carried for the same local-struct reason
     void * d_temp = nullptr;
@@ -28084,6 +28108,11 @@ static void gpu_decomp_worker(
     // (we don't have access to Options here).  Returns the byte count freed.
     size_t free_host_pinned() {
       size_t freed = 0;
+      // Lanes are freed here but NOT added to `freed`: the caller hands that to
+      // release_pinned(), and the lanes were never reserved from the budget.
+      for (void *& hp : h_dstage)
+        if (hp) { cudaFreeHost(hp); hp = nullptr; }
+      h_dstage.clear(); h_dstage_n = 0;
       if (h_decomp_pinned) {
         cudaFreeHost(h_decomp_pinned);
         h_decomp_pinned = nullptr;
@@ -28180,7 +28209,7 @@ static void gpu_decomp_worker(
       // and GZSTD_DEBUG_REAL_PINNED_OOM reproduce the defect on any card.
       if (cudaMalloc(&d_comp_buf,     batch_n * max_comp)    != cudaSuccess) { cudaGetLastError(); return false; }
       if (cudaMalloc(&d_decomp_buf,   batch_n * max_decomp)  != cudaSuccess) { cudaGetLastError(); return false; }
-      if (gds_read) {
+      if (gds_read && !dstage) {   // cuFile only: --direct-stage never maps BAR1
         // The READ target.  Skipping this registration does not fail: cuFile
         // silently bounces the transfer through a host buffer, so the run would
         // still be correct and still be reported as GDS while doing exactly the
@@ -28357,6 +28386,7 @@ static void gpu_decomp_worker(
     for (auto & C : ctxs) {
       C.gds_only    = g_gds_out_active.load(std::memory_order_relaxed);
       C.gds_read    = g_gds_read_active.load(std::memory_order_relaxed);
+      C.dstage      = C.gds_read && opt.direct_stage;
       // The frozen decision, not the live global: a later demotion clears that
       // global but does not retroactively create the writer this pipeline chose
       // not to spawn.
@@ -29321,6 +29351,35 @@ static void gpu_decomp_worker(
           }
         }
 
+        // --direct-stage pinned lanes: one page-locked, page-aligned host buffer per
+        // staged-read thread, sized to this batch's largest aligned frame window and
+        // grown only when a batch needs more.  Pinned so the H2D is a DMA rather than
+        // the driver's own bounce copy; page-aligned because O_DIRECT requires it.
+        if (C.dstage && (C.h_dstage_n == 0 || max_comp > C.h_dstage_slot_bytes)) {
+          // NOT CHARGED TO THE --pinned BUDGET, like compress's staging slots: the
+          // budget governs the optional pinned D2H buffer, and these lanes are what
+          // the flag cannot work without.  Charging them let AUTO refuse the first
+          // 16 MiB lane, so every GPU worker faulted and the CPU rescue decoded the
+          // whole archive at exit 0 -- [DSTAGE] 0 frames was the only sign.
+          for (void *& hp : C.h_dstage)
+            if (hp) { cudaFreeHost(hp); hp = nullptr; }
+          const size_t slot = (max_comp + 4095) & ~size_t(4095);
+          C.h_dstage.assign((size_t)GDS_READ_FANOUT, nullptr);
+          C.h_dstage_n = 0;
+          C.h_dstage_slot_bytes = slot;
+          for (size_t k = 0; k < (size_t)GDS_READ_FANOUT; ++k) {
+            if (cudaHostAlloc(&C.h_dstage[k], slot, cudaHostAllocDefault) != cudaSuccess) {
+              cudaGetLastError();            // handled: fewer lanes, not a device error
+              C.h_dstage[k] = nullptr;
+              break;
+            }
+            ++C.h_dstage_n;
+          }
+          if (C.h_dstage_n == 0)
+            throw std::runtime_error("--direct-stage: could not pin even one host staging "
+                                     "buffer (page-lock limit: RLIMIT_MEMLOCK or host memory)");
+        }
+
         // Upload compressed data H2D (async into CUDA stream).
         // Per-frame cudaMemcpyAsync is efficient because CUDA batches them
         // internally in the stream  no host-side blocking between transfers.
@@ -29345,8 +29404,68 @@ static void gpu_decomp_worker(
         // here, that second caller still did cudaMemcpyAsync from a staged
         // Task's non-existent host pointer and every run died with
         // "cudaMemcpyAsync(H2D decomp re-upload): invalid argument".
-        auto place_frame = [&](size_t i) {
+        auto place_frame = [&](size_t i, size_t lane = 0) {
           void * d_dst = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
+          if (C.batch[i].src_off >= 0 && C.dstage) {
+            // ---- --direct-stage: O_DIRECT pread -> pinned lane -> H2D ----
+            // Same ALIGNED WINDOW as the cuFile arm below (O_DIRECT needs aligned
+            // offset and length on the HOST side too), read into this thread's own
+            // lane; only the frame itself crosses PCIe.  May run on a fan-out
+            // thread: record failures, never throw (a throw escaping a std::thread
+            // is std::terminate, not this worker's recovery).
+            const off_t  raw  = C.batch[i].src_off;
+            const off_t  fo   = raw & ~(off_t)4095;
+            const size_t pad  = (size_t)(raw - fo);
+            const size_t flen = C.batch[i].len();
+            const size_t want = (pad + flen + 4095) & ~size_t(4095);
+            auto fail = [&](std::string why) {
+              std::lock_guard<std::mutex> lk(rd_err_m);
+              if (rd_err.empty()) rd_err = std::move(why);
+            };
+            char * hp = (C.h_dstage_n > 0)
+                      ? static_cast<char *>(C.h_dstage[lane % C.h_dstage_n]) : nullptr;
+            if (!hp || want > C.h_dstage_slot_bytes) {
+              fail("--direct-stage: frame " + std::to_string(C.batch[i].seq) + " window "
+                   + std::to_string(want) + " exceeds the pinned staging lane "
+                   + std::to_string(C.h_dstage_slot_bytes));
+              return;
+            }
+            size_t hgot = 0;
+            int    rerrno = 0;
+            const uint64_t rd_t0 = now_ns();
+            while (hgot < want) {
+              const ssize_t r = ::pread(g_gds_verify_fd, hp + hgot, want - hgot,
+                                        fo + (off_t)hgot);
+              if (r < 0) { if (errno == EINTR) continue; rerrno = errno; break; }
+              if (r == 0) break;                 // EOF: the rounded tail window
+              hgot += (size_t)r;
+            }
+            g_gdsv_read_ns.fetch_add(now_ns() - rd_t0, std::memory_order_relaxed);
+            g_gdsv_read_bytes.fetch_add(hgot, std::memory_order_relaxed);
+            g_gdsv_reads.fetch_add(1, std::memory_order_relaxed);
+            {
+              static const char * fenv = ::getenv("GZSTD_DEBUG_DSTAGE_FAIL_FRAME");
+              if (fenv && C.batch[i].seq == (uint64_t)::strtoull(fenv, nullptr, 10))
+                rerrno = EIO;
+            }
+            const size_t usable = (hgot > pad) ? std::min(hgot - pad, flen) : 0;
+            if (rerrno != 0 || usable != flen) {
+              fail("--direct-stage: pread " + std::string(rerrno ? std::strerror(rerrno)
+                   : "returned short") + " for frame " + std::to_string(C.batch[i].seq)
+                   + " at offset " + std::to_string((long long)raw));
+              return;
+            }
+            const cudaError_t cs = cudaMemcpy(d_dst, hp + pad, flen, cudaMemcpyHostToDevice);
+            if (cs != cudaSuccess) {
+              fail(std::string("cudaMemcpy(--direct-stage lane -> slab): ")
+                   + cudaGetErrorString(cs));
+              return;
+            }
+            g_dstage_bytes.fetch_add(flen, std::memory_order_relaxed);
+            g_dstage_frames.fetch_add(1, std::memory_order_relaxed);
+            C.h_comp_ptrs[i] = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
+            return;
+          }
           if (C.batch[i].src_off >= 0) {
             // ---- --gds-only -t: NVMe -> VRAM, no host bytes ----
             //
@@ -29445,10 +29564,25 @@ static void gpu_decomp_worker(
           staged_batch = (staged_n > 0);
           if (rd_fan > 1 && staged_n > 1) {
             staged_prefetched = true;
-            const size_t nthr = std::min((size_t)rd_fan, staged_n);
+            size_t nthr = std::min((size_t)rd_fan, staged_n);
+            // NEVER MORE THREADS THAN PINNED LANES: two threads on one lane
+            // corrupt both frames.
+            if (C.dstage) nthr = std::min(nthr, std::max<size_t>(1, C.h_dstage_n));
             auto issue = [&](size_t k, size_t step) {
+              // CUDA's current device is host-thread-local and a spawned thread
+              // starts on device 0; --direct-stage performs its H2D from here.
+              if (C.dstage && k != 0) {
+                const cudaError_t ds = cudaSetDevice(device_id);
+                if (ds != cudaSuccess) {
+                  std::lock_guard<std::mutex> lk(rd_err_m);
+                  if (rd_err.empty())
+                    rd_err = std::string("cudaSetDevice(--direct-stage reader): ")
+                           + cudaGetErrorString(ds);
+                  return;
+                }
+              }
               for (size_t i = k; i < C.filled; i += step)
-                if (C.batch[i].src_off >= 0) place_frame(i);
+                if (C.batch[i].src_off >= 0) place_frame(i, k);
             };
             std::vector<std::thread> pool;
             pool.reserve(nthr - 1);
@@ -31006,19 +31140,20 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // one binary.  Without a control inside the tool, "P2P read is faster" cannot
   // be separated from the batch pinning that landed alongside it, and the two
   // were in fact worth very different amounts.
-  const bool gds_read_eligible = opt.gds_only
+  const bool gds_read_eligible = (opt.gds_only || opt.direct_stage)
       && (opt.mode == Mode::TEST || opt.mode == Mode::DECOMPRESS)
       && ::getenv("GZSTD_DEBUG_GDS_NO_STAGED_READ") == nullptr;
   if (gds_read_eligible) {
     const char * what = (opt.mode == Mode::TEST) ? "-t" : "-d";
+    const char * FLAG = opt.gds_only ? "--gds-only" : "--direct-stage";
     // --tar hands decompressed frames to the in-process tar parser, a HOST
     // consumer -- no point pulling bytes into VRAM to copy them straight back.
     if (opt.tar_mode) {
-      vlog(V_NORMAL, opt, std::string("warning: --gds-only ") + what + " --tar works "
+      vlog(V_NORMAL, opt, std::string("warning: ") + FLAG + " " + what + " --tar works "
            "through the tar parser, which reads on the host; using the ordinary "
            "read path.\n");
     } else if (device_count <= 0 || gpu_disabled_by_peek) {
-      vlog(V_NORMAL, opt, std::string("warning: --gds-only ") + what + " needs a GPU; "
+      vlog(V_NORMAL, opt, std::string("warning: ") + FLAG + " " + what + " needs a GPU; "
            "using the ordinary read path.\n");
     } else {
       // O_DIRECT IS REQUIRED, NOT AN OPTIMISATION -- cuFile refuses the
@@ -31039,9 +31174,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       } else {
         why = "the archive has no descriptor to read by offset";
       }
-      if (dfd >= 0 && !g_gds_input.open(dfd, &why)) { ::close(dfd); dfd = -1; }
+      // --direct-stage makes NO cuFile call: its workers pread this descriptor.
+      if (dfd >= 0 && opt.gds_only && !g_gds_input.open(dfd, &why)) { ::close(dfd); dfd = -1; }
       if (dfd < 0) {
-        vlog(V_NORMAL, opt, "warning: --gds-only -t: " + (why.empty()
+        vlog(V_NORMAL, opt, std::string("warning: ") + FLAG + " " + what + ": " + (why.empty()
              ? std::string("cannot register the archive with cuFile") : why)
              + "; using the ordinary read path.\n");
       } else {
@@ -31056,7 +31192,9 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
         // this too, but -t never reaches that arm -- it writes nothing -- so
         // without this the "before" value stayed 0 and every -t run reported the
         // all-clear regardless of how its reads were actually routed.
-        g_gds_bar1_before = gz_nvfs_bar1_ok();
+        if (opt.gds_only) g_gds_bar1_before = gz_nvfs_bar1_ok();   // cuFile routing report only
+        g_dstage_bytes.store(0, std::memory_order_relaxed);
+        g_dstage_frames.store(0, std::memory_order_relaxed);
         g_gds_read_active.store(true, std::memory_order_release);
         // Only -t may skip the D2H: -d still owes its bytes to the drive.
         if (opt.mode == Mode::TEST)
@@ -31731,16 +31869,17 @@ gds_out_declined:
       // leaving it set while the ordinary producer pushes host-backed Tasks
       // would have them read from a slab nobody filled.
       gds_decomp_read_close();
+      const std::string SF = opt.gds_only ? "--gds-only" : "--direct-stage";
       vlog(V_NORMAL, opt,
            g_gds_table_rejected.load(std::memory_order_relaxed)
-             ? "warning: --gds-only located frames from the archive's seek table, "
+             ? "warning: " + SF + " located frames from the archive's seek table, "
                "which this archive\n  gets wrong; the ordinary read path is used "
                "instead.\n"
-             : "warning: --gds-only needs the archive's seek table to locate frames "
+             : "warning: " + SF + " needs the archive's seek table to locate frames "
                "without reading them;\n  this archive has none, so the ordinary read "
                "path is used instead.\n");
       if (std::fseek(in, 0, SEEK_SET) != 0)
-        die("--gds-only -t: cannot rewind the archive after standing down", EXIT_IO);
+        die(SF + ": cannot rewind the archive after standing down", EXIT_IO);
     }
   }
   if (n_frames == GDS_VERIFY_DEMOTE)
@@ -31860,6 +31999,17 @@ gds_out_declined:
   gz_wait_for_worker_exits();
   gz_join_or_detach_workers();
   gz_stop_reclaimer();
+  // THE DISCRIMINATOR.  Output bytes cannot show whether this path ran: a
+  // missing seek table stands it down to the ordinary reader at exit 0.
+  if (opt.direct_stage && opt.verbosity >= V_VERBOSE) {
+    char b[200];
+    std::snprintf(b, sizeof(b),
+      "[DSTAGE] %llu frames, %llu bytes (%.1f MiB) staged O_DIRECT host -> VRAM (no cuFile)\n",
+      (unsigned long long)g_dstage_frames.load(std::memory_order_relaxed),
+      (unsigned long long)g_dstage_bytes.load(std::memory_order_relaxed),
+      double(g_dstage_bytes.load(std::memory_order_relaxed)) / 1048576.0);
+    vlog(V_VERBOSE, opt, b);
+  }
 
   // THE SAME ROUTING REPORT THE COMPRESS PATH HAS, and for the same reason: a
   // cuFile call that quietly bounces through host memory returns the right bytes
@@ -31869,7 +32019,7 @@ gds_out_declined:
   // --gds-only -t and -d were exactly the commands with no way to tell.
   //
   // Degradation is reported at DEFAULT verbosity; the all-clear needs -v.
-  if (g_gds_read_active.load(std::memory_order_relaxed)) {
+  if (opt.gds_only && g_gds_read_active.load(std::memory_order_relaxed)) {   // cuFile only
     const unsigned long long b1 = gz_nvfs_bar1_ok();
     const uint64_t p2p = g_gds_frames_p2p.load(std::memory_order_relaxed);
     const uint64_t fb  = g_gds_frames_fallback.load(std::memory_order_relaxed);
@@ -37894,15 +38044,14 @@ static Options parse_args(int argc, char ** argv)
               "input into the GPU slab and differ only in how the bytes get "
               "there.  Use --gds-only for peer-to-peer DMA where the hardware "
               "supports it, --direct-stage for the portable O_DIRECT path");
-  // COMPRESS ONLY, and not --tar.  The decompress direction of --gds-only writes
-  // VRAM -> NVMe through cuFile, which has no O_DIRECT-from-VRAM equivalent to
-  // stand in for; --tar create composes frames in a registered staging pool that
-  // is likewise cuFile-specific.  Both are reachable later; neither is wired now,
-  // and accepting the flag while ignoring it is the worst of the three options.
-  if (opt.direct_stage && opt.mode != Mode::COMPRESS)
-    die_usage("--direct-stage applies to compression only: it stages input frames "
-              "into GPU memory, and the decompress direction has no equivalent "
-              "O_DIRECT write out of VRAM");
+  // Compress, -d and -t; not --tar (below).  The decompress direction stages the
+  // COMPRESSED frames, reusing --gds-only's staged read side, and writes through
+  // the ordinary writer.  --gds-only -d's other half, the peer-to-peer VRAM ->
+  // NVMe write, has no O_DIRECT-from-VRAM equivalent -- and this flag does not
+  // need one, since its whole claim is the read.
+  if (opt.direct_stage && opt.mode != Mode::COMPRESS && opt.mode != Mode::DECOMPRESS
+      && opt.mode != Mode::TEST)
+    die_usage("--direct-stage applies to compression, decompression and -t");
   if (opt.direct_stage && opt.tar_mode)
     die_usage("--direct-stage cannot be combined with --tar: the tar assembler "
               "composes each frame from many member extents rather than reading "

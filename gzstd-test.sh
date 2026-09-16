@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=445
-$EXTENSIVE && EXPECTED_TESTS=576
+EXPECTED_TESTS=451
+$EXTENSIVE && EXPECTED_TESTS=582
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -660,7 +660,10 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.54 adds two default-tier cells (decompress tail-aware GPU intake), both
 # skipping without a GPU: 443 -> 445 and the no-GPU delta 101 -> 103.  DERIVED
 # until a suite run confirms it.
-EXPECTED_NOGPU_DELTA=103
+# v0.17.56 adds six default-tier cells (--direct-stage decompress and -t), all
+# skipping without a GPU: 445 -> 451 and the no-GPU delta 103 -> 109.  DERIVED
+# until a suite run confirms it.
+EXPECTED_NOGPU_DELTA=109
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -2109,7 +2112,16 @@ kgz="$TMPDIR/keepgoing.zst"; kgbad="$TMPDIR/keepgoing-bad.zst"; kgout="$TMPDIR/k
 run_test "$GZSTD" --cpu-only -k -f "$kgsrc" -o "$kgz" 2>/dev/null
 cp "$kgz" "$kgbad"
 kgsz=$(stat -c%s "$kgbad")
-printf '\xFF' | dd of="$kgbad" bs=1 seek=$(( kgsz / 2 )) count=1 conv=notrunc 2>/dev/null
+# FLIP the byte, do not SET it -- the same 1-in-256 no-op the --tar cell below was
+# fixed for, left behind here.  Writing 0xFF over a byte that already WAS 0xFF
+# damaged nothing: the v0.17.56 default suite failed BOTH cells in this section
+# (rc=0, and --keep-going rc=0 at full length), and a valid archive whose middle
+# byte is 0xFF reproduced both lines exactly, while flipping the same byte gave
+# rc=4 and rc=6 as these cells expect.
+kgmid=$(( kgsz / 2 ))
+kgmorig=$(od -An -tu1 -j "$kgmid" -N1 "$kgbad" | tr -d ' ')
+printf "$(printf '\\%03o' $(( kgmorig ^ 0xFF )))" \
+  | dd of="$kgbad" bs=1 seek="$kgmid" count=1 conv=notrunc 2>/dev/null
 
 # Without --keep-going: abort with a data error AND suggest --keep-going.
 "$GZSTD" -d -k -f "$kgbad" -o "$kgout" 2>"$TMPDIR/kg1.err"; kg1=$?
@@ -5604,6 +5616,155 @@ if has_gpu 2>/dev/null; then
 else
   skip "decompress GPU yields the tail (file input)" "no GPU"
   skip "decompress GPU yields the tail (pipe: producer-done arms it)" "no GPU"
+fi
+
+# ────────────────────────────────────────────────────────────
+section "--direct-stage decompress and -t"
+
+# v0.17.56: --direct-stage reads the COMPRESSED frames O_DIRECT into pinned host
+# lanes and pushes them once to the GPU -- no page cache, no pageable bounce copy,
+# no cuFile.  MEASURED (PCIe Gen3, one 11 GiB card, 16 GiB cold): -t host CPU
+# 15.6 -> 4.9 s and wall 6.9 -> 6.4 s; -d host CPU 15.5 -> 7.3 s but wall ~35%
+# slower (documented in --help).
+#
+# BYTE-IDENTITY CANNOT VERIFY THIS FLAG.  A failed staged read is rescued on the
+# CPU and an archive with no seek table stands down to the ordinary reader, both
+# at exit 0 with correct output.  The first prototype passed every identity check
+# with ZERO frames staged (its pinned lanes were refused and every GPU worker fell
+# back).  So each cell compares the [DSTAGE] count with what the archive's own seek
+# table says a staged run must read: exact frames AND exact bytes.
+#
+# The fixture's size is 64 MiB + 12,345 bytes: O_DIRECT rounds every read to 4 KiB,
+# and MiB-sized corpora hid a tail bug in this code class for four versions.
+if has_gpu 2>/dev/null; then
+  dsd_src="$TMPDIR/dstage-d.bin"; dsd_zst="$TMPDIR/dstage-d.zst"
+  dsd_out="$TMPDIR/dstage-d.out"; dsd_log="$TMPDIR/dstage-d.log"
+  (
+    set +o pipefail
+    head -c $((48*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576 + 12345)) > "$dsd_src"
+  )
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dsd_src" -o "$dsd_zst" 2>/dev/null
+  # "frames bytes" a staged run must read: the seek table's frame count, and the
+  # archive's size less the table itself (a skippable frame: 8-byte header, 8 or 12
+  # bytes per entry, 9-byte footer).
+  dsd_expect() {
+    python3 - "$1" <<'DSDPY'
+import os, struct, sys
+p = sys.argv[1]; n = os.path.getsize(p)
+with open(p, 'rb') as f:
+    f.seek(n - 9); frames, desc, magic = struct.unpack('<IBI', f.read(9))
+if magic != 0x8F92EAB1:
+    print("no-seek-table")
+else:
+    print(frames, n - (8 + frames * (12 if desc & 0x80 else 8) + 9))
+DSDPY
+  }
+  dsd_got() { grep -a -o '\[DSTAGE\] [0-9]* frames, [0-9]* bytes' "$1" | head -1 | awk '{print $2, $4}'; }
+  dsd_want=$(dsd_expect "$dsd_zst")
+
+  # 1. -d to a file.
+  rc=0
+  timeout --foreground -k 10 120 "$GZSTD" -d --direct-stage -v -f "$dsd_zst" -o "$dsd_out" 2>"$dsd_log" || rc=$?
+  dsd_have=$(dsd_got "$dsd_log")
+  if [[ $rc -ne 0 ]]; then
+    fail "--direct-stage -d stages every frame and round-trips" "exit $rc"
+  elif [[ "$dsd_have" != "$dsd_want" ]]; then
+    fail "--direct-stage -d stages every frame and round-trips" \
+         "staged '${dsd_have:-nothing}', the seek table says '$dsd_want' (frames bytes)"
+  elif grep -aq -e '--gds-only' -e 'cuFile transfers' "$dsd_log"; then
+    fail "--direct-stage -d stages every frame and round-trips" \
+         "a --gds-only / cuFile message printed under --direct-stage"
+  elif files_match "$dsd_src" "$dsd_out"; then
+    pass "--direct-stage -d stages every frame and round-trips"
+  else
+    fail "--direct-stage -d stages every frame and round-trips" "output differs"
+  fi
+  rm -f "$dsd_out"
+
+  # 2. -t: verified on the device, nothing downloaded.
+  rc=0
+  timeout --foreground -k 10 120 "$GZSTD" -t --direct-stage -v "$dsd_zst" >/dev/null 2>"$dsd_log" || rc=$?
+  dsd_have=$(dsd_got "$dsd_log")
+  if [[ $rc -eq 0 && "$dsd_have" == "$dsd_want" ]]; then
+    pass "--direct-stage -t stages every frame and verifies"
+  else
+    fail "--direct-stage -t stages every frame and verifies" \
+         "exit $rc; staged '${dsd_have:-nothing}', expected '$dsd_want'"
+  fi
+
+  # 3. -d to standard output: the writer is the ordinary one, so a pipe works.
+  rc=0
+  timeout --foreground -k 10 120 "$GZSTD" -d --direct-stage -v -c "$dsd_zst" >"$dsd_out" 2>"$dsd_log" || rc=$?
+  dsd_have=$(dsd_got "$dsd_log")
+  if [[ $rc -eq 0 && "$dsd_have" == "$dsd_want" ]] && files_match "$dsd_src" "$dsd_out"; then
+    pass "--direct-stage -d writes to standard output"
+  else
+    fail "--direct-stage -d writes to standard output" "exit $rc; staged '${dsd_have:-nothing}'"
+  fi
+  rm -f "$dsd_out"
+
+  # 4. No cuFile, ever: the flag exists for hosts where cuFile cannot run, and a
+  # stray cuFile call SUCCEEDS on a host where it can (that is how compress
+  # --direct-stage once shipped a cuFileBufRegister).  The dynamic loader reports
+  # every library it opens, dlopen included; --gds-only is the control that proves
+  # the detector sees libcufile at all.
+  LD_DEBUG=libs "$GZSTD" -t --direct-stage "$dsd_zst" >/dev/null 2>"$dsd_log"
+  dsd_cuf=$(grep -a -c -i 'cufile' "$dsd_log")
+  LD_DEBUG=libs "$GZSTD" -t --gds-only "$dsd_zst" >/dev/null 2>"$dsd_log.ctl"
+  dsd_ctl=$(grep -a -c -i 'cufile' "$dsd_log.ctl")
+  if [[ $dsd_ctl -eq 0 ]]; then
+    skip "--direct-stage decompress never loads libcufile" \
+         "not provable here: --gds-only loaded no libcufile either (static build, or no cuFile)"
+  elif [[ $dsd_cuf -gt 0 ]]; then
+    fail "--direct-stage decompress never loads libcufile" "libcufile appeared in the loader log"
+  else
+    pass "--direct-stage decompress never loads libcufile"
+  fi
+  rm -f "$dsd_log.ctl"
+
+  # 5. A staged read that fails is named, and the CPU finishes the archive.
+  rc=0
+  env GZSTD_DEBUG_DSTAGE_FAIL_FRAME=3 timeout --foreground -k 10 120 \
+    "$GZSTD" -d --direct-stage -v -f "$dsd_zst" -o "$dsd_out" 2>"$dsd_log" || rc=$?
+  if [[ $rc -eq 0 ]] && grep -aq -- '--direct-stage: pread' "$dsd_log" \
+     && ! grep -aq -e '--gds-only' "$dsd_log" && files_match "$dsd_src" "$dsd_out"; then
+    pass "--direct-stage read failure is named and recovered"
+  else
+    fail "--direct-stage read failure is named and recovered" "exit $rc"
+  fi
+  rm -f "$dsd_out"
+
+  # 6. No seek table: stand down to the ordinary reader, say so, stage nothing.
+  if command -v zstd >/dev/null 2>&1; then
+    dsd_parts="$TMPDIR/dstage-parts"; rm -rf "$dsd_parts"; mkdir -p "$dsd_parts"
+    split -b 1M -d -a 3 "$dsd_src" "$dsd_parts/p"
+    for f in "$dsd_parts"/p*; do zstd -q -f --content-size "$f" -o "$f.zst"; done
+    cat "$dsd_parts"/p*.zst > "$TMPDIR/dstage-nost.zst"
+    rm -rf "$dsd_parts"
+    rc=0
+    timeout --foreground -k 10 120 "$GZSTD" -d --direct-stage -v -f "$TMPDIR/dstage-nost.zst" \
+      -o "$dsd_out" 2>"$dsd_log" || rc=$?
+    dsd_have=$(dsd_got "$dsd_log")
+    if [[ $rc -eq 0 && "$dsd_have" == "0 0" ]] \
+       && grep -aq -- "--direct-stage needs the archive's seek table" "$dsd_log" \
+       && files_match "$dsd_src" "$dsd_out"; then
+      pass "--direct-stage without a seek table stands down and says so"
+    else
+      fail "--direct-stage without a seek table stands down and says so" \
+           "exit $rc; staged '${dsd_have:-nothing}'"
+    fi
+    rm -f "$TMPDIR/dstage-nost.zst" "$dsd_out"
+  else
+    skip "--direct-stage without a seek table stands down and says so" "no zstd CLI"
+  fi
+  rm -f "$dsd_src" "$dsd_zst" "$dsd_out" "$dsd_log"
+else
+  skip "--direct-stage -d stages every frame and round-trips" "no GPU"
+  skip "--direct-stage -t stages every frame and verifies" "no GPU"
+  skip "--direct-stage -d writes to standard output" "no GPU"
+  skip "--direct-stage decompress never loads libcufile" "no GPU"
+  skip "--direct-stage read failure is named and recovered" "no GPU"
+  skip "--direct-stage without a seek table stands down and says so" "no GPU"
 fi
 
 

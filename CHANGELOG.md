@@ -1,12 +1,113 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.55  
+**Covers:** v0.9.50 → v0.17.56  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.56 — `--direct-stage` reads the compressed frames for -d and -t
+
+**`--direct-stage` now works for decompression and `-t`, not only compression.** It reads each compressed frame with
+O_DIRECT into page-locked host memory and pushes it once to the GPU, with no page cache, no pageable bounce copy and no
+cuFile. For `-t` it is better on every axis measured. For `-d` it halves host CPU and cuts memory by three quarters,
+but on the host measured it is about 35% slower on wall, and `--help` says so.
+
+### Why
+
+My earlier note on this gap called the compressed input "the small side" of decompression, and that was wrong. On a
+PCIe Gen3 host (both cards at ×16), one 11 GiB card, 16 GiB of entropy-coded output from a 12 GiB archive, batch 64:
+
+- **Uploading the input was 35% of GPU batch time** — 1.9 s at 6.3 GiB/s, against 2.9 s to download 16 GiB. 6.3 GiB/s
+  is about half of what a Gen3 ×16 link does from pinned memory: it is the driver's bounce copy out of pageable memory.
+- **A cold run spent ~5.6 s more kernel CPU than a warm one** (sys 10.0–10.4 against 4.4) filling the page cache, for
+  only ~0.3 s of wall.
+- `--direct-read`, the existing O_DIRECT reader, is not a substitute: it is single-threaded, and ran 10–14 s.
+
+### The change
+
+- **The staged read side of decompress `--gds-only` is reused whole:** the producer that locates frames from the seek
+  table with host preads, the staged task shape, the device-side checksum, `-t`'s verify-without-download, and the CPU
+  rescue that re-reads a staged frame through a buffered descriptor. Only the read changes: instead of a cuFile read
+  into the device slot, each frame's 4 KiB-aligned window is pread into a **pinned host lane** — one per reader thread,
+  sized to the batch's largest window — and only the frame itself is copied to the device.
+- **Output goes through the ordinary writer,** so `-c` (standard output) works; `--gds-only -d`'s peer-to-peer write
+  has no O_DIRECT-from-VRAM counterpart, and the flag's claim does not need one.
+- **Four cuFile-only sites separated from the shared staging state,** each of which would otherwise have run under
+  `--direct-stage`: registering the archive with cuFile, the BAR1 baseline, **registering the device slab with
+  cuFile** (`gds_in_reg`, keyed on the shared staged-read bit — the same `cuFileBufRegister` defect compress
+  `--direct-stage` once shipped, which succeeds on a GDS host and fails on the hosts the flag exists for), and the
+  decompress routing report, which printed `--gds-only made 0 cuFile transfers …` under `--direct-stage`.
+- Every user-facing message on the staged read path names the flag actually passed.
+- The reader threads select the slab's device before copying and never throw (a throw escaping a thread is
+  `std::terminate`, not the worker's recovery); the fan-out never runs more threads than lanes pinned.
+- `-vv`/`-v` report `[DSTAGE] N frames, X bytes staged O_DIRECT host -> VRAM (no cuFile)` at the end of every run.
+
+**The first working prototype passed every identity check with nothing staged.** Its lanes were charged to the
+`--pinned` budget, which refused the first 16 MiB; every GPU worker faulted and the CPU rescue decoded the archive
+correctly at exit 0. `[DSTAGE] 0 frames` was the only sign. The lanes are now pinned outside the budget, as compress's
+staging slots always were — and are freed without being credited back to a budget they never reserved.
+
+### Verified
+
+Cold, one card, one stream, batch 64, 16 GiB out, three runs each in rotated order; **C is the same flag with
+`GZSTD_DEBUG_GDS_NO_STAGED_READ=1`** (the ordinary reader), the control that shows the difference is the staging:
+
+| | wall (s) | user (s) | sys (s) | peak RSS |
+|---|---|---|---|---|
+| `-d` ordinary `--gpu-only` | 6.26–7.01 | 5.23–5.55 | 10.04–10.40 | 5.05 GiB |
+| `-d --direct-stage` | **8.91–9.05** | 5.00–5.34 | **2.11–2.27** | **1.22 GiB** |
+| `-d` control C | 6.61–7.04 | 5.25–5.55 | 10.35–10.60 | 4.32 GiB |
+| `-t` ordinary `--gpu-only` | 6.87–6.88 | 5.20–5.25 | 10.36–10.38 | 4.1 GiB |
+| `-t --direct-stage` | **6.38–6.42** | **3.07–3.09** | **1.82–1.83** | **0.21 GiB** |
+
+- **`-t`:** wall −7%, host CPU ~15.6 → ~4.9 s (−69%), peak memory −95%.
+- **`-d`:** host CPU ~15.5 → ~7.3 s (−52%), peak memory −76%, **wall ~35% slower**. The upload phase grew from 1.9 s to
+  4.8 s because it now contains the reads: a decompress batch runs start to finish on its worker, so each batch's reads
+  wait behind the previous batch's download, where the ordinary reader keeps a queue filled ahead of the GPU. **A second
+  stream did not help** (streams take turns on one worker, unlike compress, where a second stream closed this gap).
+  Warm, the trade is the same shape: 8.84 s against 5.78, sys 2.1 against 4.4.
+- `[DSTAGE]` read 1024 of 1024 frames in every staged run and 0 in every control run.
+- Correctness, on a 1 GiB + 12,345-byte archive (unaligned tail): the staged byte count equals the archive less exactly
+  its 537-byte seek table; `-d` to a file, to standard output and across two cards (the second card's readers must
+  select device 1) all byte-identical; no `libcufile` opened (strace); an archive without a seek table stands down to
+  the ordinary reader naming `--direct-stage`; `GZSTD_DEBUG_DSTAGE_FAIL_FRAME=3` reports
+  `--direct-stage: pread Input/output error for frame 3 at offset …` and the CPU finishes both `-d` and `-t` correctly.
+- **A trap in measuring this:** an O_DIRECT read of a file written seconds earlier first flushes that file's dirty pages.
+  A compress `--direct-stage` probe of a just-written file showed 0.3 GiB/s uploads that were really QLC writeback.
+
+### Test
+
+Six default-tier cells (`--direct-stage decompress and -t`) — the first `--direct-stage` cells in the suite — all
+skipping without a GPU, on a 64 MiB + 12,345-byte archive. **Each compares `[DSTAGE]` with what the archive's own seek
+table says a staged run must read, exact frames and exact bytes**, because output bytes cannot show whether the path ran:
+`-d` to a file (also: no `--gds-only` or cuFile message), `-t`, `-d` to standard output, no `libcufile` in the dynamic
+loader's log (with `--gds-only` as the control that proves the detector sees it; SKIP where the control sees nothing),
+a forced read failure named and recovered, and an archive with no seek table standing down under its own flag's name.
+
+Mutation-tested by running the section verbatim under the suite's single-card default against five builds of this
+source, one mechanism broken in each. This build passes all six. **Every mutant fails at least one cell and every cell
+fails under at least one mutant:**
+
+| mutant | cells failing |
+|---|---|
+| lanes charged to the `--pinned` budget again | `-d`, `-t`, stdout, read failure (0 frames staged) |
+| cuFile slab registration restored for `--direct-stage` | `-d` (cuFile message), libcufile, read failure — **`-t` and stdout still staged every frame**: the stray registration does not break reads on a GDS-capable host, which is exactly why it went unnoticed on compress |
+| routing report ungated | `-d`, libcufile, read failure — the ungated report also **loaded libcufile**, so the gate removed a real cuFile dependency, not only a wrong message |
+| O_DIRECT round-up removed | `-d`, `-t`, stdout — every unaligned read failed and was rescued at exit 0 with correct output; only the exact count saw it |
+| no-seek-table warning worded as `--gds-only` | no seek table |
+
+**Test suite:** default run on a GPU host without GDS **445 passed, 0 failed, 6 skipped** (451 total; the drift check
+expected 445 = 451 − 6 GDS unavailable). All six new cells passed. The CPU-only build compiles clean (its 9
+pre-existing warnings); the CPU-only suite and `--extensive` were not run (582 and delta 109 derived).
+
+**Also fixes a suite flake this release's first run hit** (443 passed, 2 failed): the plain `.zst` `--keep-going` cells
+damaged their archive by WRITING `0xFF` into its middle byte, which damages nothing when that byte already is `0xFF` —
+1 run in 256 on random data — so decompress exited 0 and `--keep-going` exited 0 at full length. Reproduced on a valid
+archive whose middle byte is `0xFF`; flipping instead gives the expected `rc=4` and `rc=6`. The `--tar` cell right
+below had already been fixed for the identical defect. Both cells now flip the byte, and pass in the run above.
 
 ## v0.17.55 — every run slept up to 200 ms after its work was done
 

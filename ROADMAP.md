@@ -333,6 +333,20 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.56: `--direct-stage` reads the compressed frames for -d and -t
+
+The last deferred item from the decompress-versus-compress review. Measured first: on a Gen3 host the compressed input
+is not the small side — uploading it from pageable memory was 35% of GPU batch time, and a cold run spent ~5.6 s of
+kernel CPU on the page cache. v0.17.56 reuses decompress `--gds-only`'s staged read side with an O_DIRECT pread into
+pinned host lanes in place of cuFile (CHANGELOG v0.17.56). `-t`: wall −7%, host CPU −69%, memory −95%. `-d`: host CPU
+−52%, memory −76%, but wall ~35% slower on that host.
+
+**OPEN — read-ahead for `-d --direct-stage`.** The `-d` wall cost is structural: a decompress batch runs start to finish
+on its worker, so its staged reads wait behind the previous batch's download, and a second stream does not help because
+streams take turns on the same worker. Closing it means reading the NEXT batch into pinned lanes while the current one
+computes and downloads — popping that batch early, with its throttle permits, its reclaim-registry entry and its
+rescue path all still correct. Worth doing only if `-d` wall matters to a user of the flag; `-t` needs none of it.
+
 ## SHIPPED v0.17.55: every run slept up to 200 ms after its work was done
 
 The v0.17.54 lead — hybrid decompress 0.1–0.4 s behind `--cpu-only` at `-T12` with zero GPU batches — was not a
@@ -342,8 +356,7 @@ slept first and checked their stop flag after, so every run sat out the rest of 
 decompress took 213 ms with the bar on against 25 ms off, and 163 ms under `--hybrid`, per file. The loops now wait on a
 condition variable their stop sites notify (CHANGELOG v0.17.55): 24 ms, and 71–85 ms under `--hybrid`. The remaining
 ~60 ms is GPU discovery before the first CUDA call, paid once per process and never for inputs under one GPU batch;
-moving it needs device selection by UUID rather than `setenv`, which is not worth it for that cost. Still deferred:
-`--direct-stage` for decompress.
+moving it needs device selection by UUID rather than `setenv`, which is not worth it for that cost.
 
 ## SHIPPED v0.17.54: a slower GPU held the end of a hybrid decompress
 
