@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=452
-$EXTENSIVE && EXPECTED_TESTS=583
+EXPECTED_TESTS=456
+$EXTENSIVE && EXPECTED_TESTS=587
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -665,8 +665,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # until a suite run confirms it.
 # v0.17.57 adds one default-tier cell (--direct-stage read-ahead), skipping without a
 # GPU: 451 -> 452 and the no-GPU delta 109 -> 110.  DERIVED until a suite run confirms it.
-EXPECTED_NOGPU_DELTA=110
-EXPECTED_NOGDS_DELTA=6
+# v0.17.60 adds four default-tier cells (cuFile log placement), all skipping without
+# GDS: 452 -> 456, extensive 583 -> 587, the no-GPU delta 110 -> 114 and the no-GDS
+# delta 6 -> 10.  DERIVED until a suite run confirms it.
+EXPECTED_NOGPU_DELTA=114
+EXPECTED_NOGDS_DELTA=10
 
 # ============================================================
 # Banner & system info
@@ -1723,6 +1726,146 @@ GLPY
     pass "--gds-only read report does not claim alignment proves routing"
   fi
   rm -f "$gr_err" "$gr_z"
+
+  # >>> cufile-log cells
+  # v0.17.60: cuFile's LOG FILE.  cuFileDriverOpen creates cufile.log in the working
+  # directory, and on a healthy run it stays empty -- so every --gds-only invocation
+  # littered wherever it ran.  gzstd now points CUFILE_LOGFILE_PATH at a per-run file
+  # in its cache directory, deletes it at a clean exit when empty, keeps and names it
+  # when not, defers to CUFILE_LOGFILE_PATH and a config logging.dir, and sweeps empty
+  # logs whose process is gone.  Every run here has an EMPTY working directory and a
+  # PRIVATE cache (XDG_CACHE_HOME), so nothing is inferred from shared state.
+  cfl="$TMPDIR/cufile-log"; rm -rf "$cfl"; mkdir -p "$cfl"
+  cfl_z="$cfl/a.zst"
+  "$GZSTD" -q -k -f -3 "$TMPDIR/large.bin" -o "$cfl_z" 2>/dev/null
+  cfl_run() {   # cfl_run NAME [VAR=value ...] -- gzstd args ...; rc in $cfl/NAME/rc
+    local name=$1; shift; local envs=()
+    while [[ $1 != -- ]]; do envs+=("$1"); shift; done; shift
+    mkdir -p "$cfl/$name/cwd" "$cfl/$name/xdg"
+    ( cd "$cfl/$name/cwd" && env XDG_CACHE_HOME="$cfl/$name/xdg" "${envs[@]}" \
+        timeout --foreground -k 10 120 "$GZSTD" "$@" >/dev/null 2>"$cfl/$name/err"
+      echo $? > "$cfl/$name/rc" )
+  }
+  cfl_logs() { find "$cfl/$1/xdg" -name 'cufile-*.log' 2>/dev/null | wc -l; }
+
+  # 1. A healthy run leaves nothing: not in the working directory, not in the cache.
+  #    The -v removal line proves the cache path was used at all (no driver open, no log,
+  #    would also leave nothing).
+  cfl_run plain -- -t --gds-only -v "$cfl_z"
+  if ! gds_testable; then
+    skip "--gds-only leaves no cufile.log behind" "GDS unavailable ($(gds_host_status))"
+  elif [[ $(cat "$cfl/plain/rc") -ne 0 ]]; then
+    fail "--gds-only leaves no cufile.log behind" "exit $(cat "$cfl/plain/rc")"
+  elif [[ -e "$cfl/plain/cwd/cufile.log" ]]; then
+    fail "--gds-only leaves no cufile.log behind" "cufile.log created in the working directory"
+  elif [[ $(cfl_logs plain) -ne 0 ]]; then
+    fail "--gds-only leaves no cufile.log behind" "an empty cuFile log was left in the cache directory"
+  elif ! grep -aq 'cuFile log was empty; removed' "$cfl/plain/err"; then
+    fail "--gds-only leaves no cufile.log behind" "no removal reported: the log was never placed in the cache"
+  else
+    pass "--gds-only leaves no cufile.log behind"
+  fi
+
+  # 2. A NON-EMPTY log is cuFile reporting something: kept, and named by its exact path.
+  #    CUFILE_LOGGING_LEVEL=INFO makes a healthy run write one (~11 KB), deterministically.
+  cfl_run info CUFILE_LOGGING_LEVEL=INFO -- -t --gds-only "$cfl_z"
+  cfl_log=$(find "$cfl/info/xdg" -name 'cufile-*.log' 2>/dev/null | head -1)
+  if ! gds_testable; then
+    skip "a non-empty cuFile log is kept and named" "GDS unavailable ($(gds_host_status))"
+  elif [[ $(cat "$cfl/info/rc") -ne 0 ]]; then
+    fail "a non-empty cuFile log is kept and named" "exit $(cat "$cfl/info/rc")"
+  elif [[ -z "$cfl_log" || ! -s "$cfl_log" ]]; then
+    fail "a non-empty cuFile log is kept and named" "no non-empty log in the cache directory"
+  elif ! grep -aqF "cuFile wrote its log to $cfl_log" "$cfl/info/err"; then
+    fail "a non-empty cuFile log is kept and named" "the kept log's path was not reported"
+  elif [[ -e "$cfl/info/cwd/cufile.log" ]]; then
+    fail "a non-empty cuFile log is kept and named" "cufile.log created in the working directory"
+  else
+    pass "a non-empty cuFile log is kept and named"
+  fi
+
+  # 3. Somebody already chose: CUFILE_LOGFILE_PATH, or logging.dir in the config cuFile
+  #    reads.  MEASURED: the environment variable OVERRIDES logging.dir, so gzstd setting
+  #    it regardless would silently move an admin's logs -- the config must be checked.
+  cfl_run user CUFILE_LOGFILE_PATH="$cfl/user.log" -- -t --gds-only "$cfl_z"
+  cfl_cfg_src="${CUFILE_ENV_PATH_JSON:-/etc/cufile.json}"
+  mkdir -p "$cfl/confdir"
+  cfl_cfg_ok=0
+  if [[ -r "$cfl_cfg_src" ]] && python3 - "$cfl_cfg_src" "$cfl/withdir.json" "$cfl/confdir" <<'CFLPY'
+import re, sys
+src, dst, d = sys.argv[1:4]
+t = open(src).read()
+t2, n = re.subn(r'"logging"\s*:\s*\{', '"logging": {\n "dir": "%s",' % d, t, count=1)
+if n != 1: sys.exit(1)
+open(dst, 'w').write(t2)
+CFLPY
+  then
+    cfl_cfg_ok=1
+    cfl_run admin CUFILE_ENV_PATH_JSON="$cfl/withdir.json" -- -t --gds-only "$cfl_z"
+  fi
+  if ! gds_testable; then
+    skip "cuFile log defers to CUFILE_LOGFILE_PATH and logging.dir" "GDS unavailable ($(gds_host_status))"
+  elif [[ $cfl_cfg_ok -ne 1 ]]; then
+    skip "cuFile log defers to CUFILE_LOGFILE_PATH and logging.dir" "no editable logging object in $cfl_cfg_src"
+  elif [[ $(cat "$cfl/user/rc") -ne 0 || $(cat "$cfl/admin/rc") -ne 0 ]]; then
+    fail "cuFile log defers to CUFILE_LOGFILE_PATH and logging.dir" \
+         "exit $(cat "$cfl/user/rc") (CUFILE_LOGFILE_PATH), $(cat "$cfl/admin/rc") (logging.dir)"
+  elif [[ ! -e "$cfl/user.log" || $(cfl_logs user) -ne 0 ]]; then
+    fail "cuFile log defers to CUFILE_LOGFILE_PATH and logging.dir" "CUFILE_LOGFILE_PATH was overridden"
+  elif [[ -z "$(ls -A "$cfl/confdir")" || $(cfl_logs admin) -ne 0 ]]; then
+    fail "cuFile log defers to CUFILE_LOGFILE_PATH and logging.dir" "logging.dir was overridden"
+  elif [[ -e "$cfl/user/cwd/cufile.log" || -e "$cfl/admin/cwd/cufile.log" ]]; then
+    fail "cuFile log defers to CUFILE_LOGFILE_PATH and logging.dir" "cufile.log created in the working directory"
+  else
+    pass "cuFile log defers to CUFILE_LOGFILE_PATH and logging.dir"
+  fi
+
+  # 4. Only a CLEAN exit deletes: a run that dies may still have workers inside cuFile,
+  #    so its empty log stays -- and the next --gds-only start sweeps empty logs of THIS
+  #    host whose process is gone, and nothing else.  The corrupt archive fails the
+  #    in-VRAM content checksum after the driver is open (exit 4).
+  cp "$cfl_z" "$cfl/bad.zst"
+  python3 - "$cfl/bad.zst" <<'CFLPY'
+import os, sys
+p = sys.argv[1]; n = os.path.getsize(p)
+with open(p, 'r+b') as f:
+    f.seek(n // 2); b = f.read(64); f.seek(n // 2); f.write(bytes(x ^ 0xFF for x in b))
+CFLPY
+  cfl_run sweep -- -t --gds-only "$cfl/bad.zst"
+  cfl_died_rc=$(cat "$cfl/sweep/rc"); cfl_died_logs=$(cfl_logs sweep)
+  cfl_died_log=$(find "$cfl/sweep/xdg" -name 'cufile-*.log' 2>/dev/null | head -1)
+  cfl_host=$(hostname | sed 's/[^A-Za-z0-9._-]/_/g')
+  cfl_dead=$(( $(cat /proc/sys/kernel/pid_max) - 1 ))
+  while kill -0 "$cfl_dead" 2>/dev/null; do cfl_dead=$(( cfl_dead - 1 )); done
+  cfl_dir="$cfl/sweep/xdg/gzstd"; mkdir -p "$cfl_dir"
+  : > "$cfl_dir/cufile-$cfl_host-$cfl_dead.log"             # empty, gone        -> swept
+  : > "$cfl_dir/cufile-$cfl_host-$$.log"                     # empty, alive (us)  -> kept
+  echo x > "$cfl_dir/cufile-$cfl_host-$(( cfl_dead - 1 )).log"   # non-empty      -> kept
+  : > "$cfl_dir/cufile-otherhost-$cfl_dead.log"              # another host       -> kept
+  cfl_run sweep -- -t --gds-only "$cfl_z"
+  if ! gds_testable; then
+    skip "a failed --gds-only run keeps its empty log; the next run sweeps it" "GDS unavailable ($(gds_host_status))"
+  elif [[ $cfl_died_rc -ne 4 ]]; then
+    fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "corrupt archive exit $cfl_died_rc, want 4"
+  elif [[ $cfl_died_logs -ne 1 ]]; then
+    fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "$cfl_died_logs logs after the failed run, want 1"
+  elif [[ $(cat "$cfl/sweep/rc") -ne 0 ]]; then
+    fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "sweeping run exit $(cat "$cfl/sweep/rc")"
+  elif [[ -e "$cfl_died_log" || -e "$cfl_dir/cufile-$cfl_host-$cfl_dead.log" ]]; then
+    fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "an empty log of a finished process was not swept"
+  elif [[ ! -e "$cfl_dir/cufile-$cfl_host-$$.log" ]]; then
+    fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "swept the log of a LIVE process"
+  elif [[ ! -e "$cfl_dir/cufile-$cfl_host-$(( cfl_dead - 1 )).log" ]]; then
+    fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "swept a NON-EMPTY log"
+  elif [[ ! -e "$cfl_dir/cufile-otherhost-$cfl_dead.log" ]]; then
+    fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "swept another host's log"
+  elif [[ $(cfl_logs sweep) -ne 3 ]]; then
+    fail "a failed --gds-only run keeps its empty log; the next run sweeps it" "$(cfl_logs sweep) logs remain, want the 3 kept fixtures"
+  else
+    pass "a failed --gds-only run keeps its empty log; the next run sweeps it"
+  fi
+  rm -rf "$cfl"
+  # <<< cufile-log cells
 
   t0=$(now_ms)
   tar -I "$GZSTD" -cf "$TMPDIR/gpu-tree.tar.zst" -C "$TMPDIR" tree 2>/dev/null || \

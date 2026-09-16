@@ -265,7 +265,9 @@ else
       fi
       # Sweep every plain file, not just the three we create: libcufile drops a
       # cufile.log into the working directory whenever it initialises, which
-      # left the whole temp dir behind on a successful run.  Depth-1 and
+      # left the whole temp dir behind on a successful run.  gzstd v0.17.60+
+      # redirects that log to its cache directory; the sweep stays for older
+      # binaries and for a CUFILE_LOGFILE_PATH that points here.  Depth-1 and
       # non-directory only, so this stays as non-recursive as the named form.
       trap 'find . -mindepth 1 -maxdepth 1 ! -type d -delete 2>/dev/null' EXIT
       trap 'exit 1' HUP INT TERM

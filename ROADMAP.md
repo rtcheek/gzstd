@@ -333,6 +333,15 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.60: `--gds-only` stops leaving an empty `cufile.log` wherever it runs
+
+Found and fixed 2026-09-16. `cuFileDriverOpen` created `cufile.log` in the working directory, empty on a healthy run.
+gzstd now points `CUFILE_LOGFILE_PATH` at a per-run file in its cache directory. It deletes the file at a clean exit when
+empty, keeps and names it when not, and leaves an explicit `CUFILE_LOGFILE_PATH` or a config `logging.dir` alone. Only a
+clean exit deletes; the next `--gds-only` start sweeps empty logs whose process is gone. The measurements behind each rule
+are in CHANGELOG v0.17.60, among them that the environment variable overrides `logging.dir`, which is why the config has
+to be read.
+
 ## SHIPPED v0.17.59: `-d --direct-stage` spent its first batch page-locking the read-ahead cache
 
 Server validation of v0.17.56–58. On a PCIe Gen5 H100 host, the default `-d --direct-stage` took twice as long as the

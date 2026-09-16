@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.59";
+static constexpr const char * GZSTD_VERSION = "0.17.60";
 //
 // Architecture overview:
 //
@@ -4165,6 +4165,13 @@ static void print_help_long()
 "     for that first and says so rather than claiming a false positive.\n"
 "     It runs as an ordinary user and changes nothing.\n"
 "\n"
+"     cuFile's LOG goes to ${XDG_CACHE_HOME:-~/.cache}/gzstd/\n"
+"     cufile-<host>-<pid>.log instead of the working directory.  gzstd\n"
+"     deletes it after a successful run when cuFile wrote nothing, and\n"
+"     otherwise keeps it, naming it on stderr if it is not empty.  An\n"
+"     explicit CUFILE_LOGFILE_PATH, or logging.dir in cufile.json, is\n"
+"     left alone.\n"
+"\n"
 "  --direct-stage                                        [EXPERIMENTAL]\n"
 "     THE PORTABLE 95% OF --gds-only, ON ANY HOST WITH A GPU.  Read each\n"
 "     frame with O_DIRECT (a read that bypasses the kernel page cache)\n"
@@ -6390,6 +6397,186 @@ static std::string adapt_profile_path()
   }
   return base + "/gzstd/profile.json";
 }
+
+#ifdef HAVE_NVCOMP
+// ===========================================================================
+// cuFile's LOG FILE.  cuFileDriverOpen creates a log in the CURRENT DIRECTORY
+// unless something says otherwise, and on a healthy run it stays 0 bytes -- so
+// every --gds-only invocation left an empty cufile.log wherever it was run.
+// MEASURED against the installed libcufile (logging.level ERROR, no logging.dir):
+//   nothing set                        -> ./cufile.log, 0 bytes
+//   CUFILE_LOGFILE_PATH=<path>          -> created at <path> instead, nothing in cwd
+//   CUFILE_LOGGING_LEVEL=NONE           -> ./cufile.log still created
+//   logging.dir in the config           -> <dir>/cufile_<pid>_<date>.log
+//   logging.dir AND CUFILE_LOGFILE_PATH -> the ENVIRONMENT wins
+//   CUFILE_LOGFILE_PATH in a missing dir-> no log anywhere, errors silently lost
+// And the variable is read at cuFileDriverOpen, not at dlopen: set after the
+// library is loaded (parse_args loads it) it still takes effect.
+//
+// So: point the log at a per-run file in gzstd's cache directory, delete it at a
+// clean exit when cuFile left it empty, and KEEP AND NAME it when it is not --
+// at level ERROR a non-empty log is cuFile reporting a failure, and it is often
+// the only record of one.  Not /dev/null for exactly that reason.
+//
+// DEFERS to anyone who already chose: an explicit CUFILE_LOGFILE_PATH, or a
+// logging.dir in the config cuFile reads.  The environment would override the
+// latter (measured above), so that has to be checked here, not left to cuFile.
+//
+// ONLY A CLEAN EXIT DELETES.  On die(), a signal or the watchdog, workers may
+// still be inside cuFile and could log the failure after an unlink; those paths
+// leave the file, and the next --gds-only start sweeps empty logs whose process
+// is gone.  The name carries the host as well as the pid, because a home
+// directory shared across machines would otherwise let one host sweep another's
+// live log on the strength of a pid it cannot see.
+static char g_cufile_log_path[PATH_MAX] = {0};   // set before any thread; read-only after
+static std::atomic<bool> g_cufile_log_finished{false};
+
+// Does the cuFile config set logging.dir?  The config is JSON with // and /* */
+// comments; strip those outside strings, find the "logging" object, and look for
+// a non-empty "dir" string directly inside it.  Anything unreadable or odd is
+// "no": cuFile would then fall back to the working directory, which is the case
+// this code exists to replace.
+static bool gz_cufile_config_sets_log_dir(std::string * config_out)
+{
+  const char * envp = std::getenv("CUFILE_ENV_PATH_JSON");
+  const std::string path = (envp && *envp) ? envp : "/etc/cufile.json";
+  if (config_out) *config_out = path;
+  std::ifstream f(path);
+  if (!f) return false;
+  const std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  std::string t;
+  t.reserve(raw.size());
+  bool in_str = false;
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const char c = raw[i];
+    if (in_str) {
+      t += c;
+      if (c == '\\' && i + 1 < raw.size()) t += raw[++i];
+      else if (c == '"') in_str = false;
+    } else if (c == '"') {
+      in_str = true; t += c;
+    } else if (c == '/' && i + 1 < raw.size() && raw[i + 1] == '/') {
+      while (i < raw.size() && raw[i] != '\n') ++i;
+      t += '\n';
+    } else if (c == '/' && i + 1 < raw.size() && raw[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < raw.size() && !(raw[i] == '*' && raw[i + 1] == '/')) ++i;
+      ++i;
+    } else {
+      t += c;
+    }
+  }
+  // Read a JSON string starting at t[i] == '"'; returns its contents, i past it.
+  auto read_str = [&](size_t & i) {
+    std::string v;
+    for (++i; i < t.size() && t[i] != '"'; ++i) {
+      if (t[i] == '\\' && i + 1 < t.size()) ++i;
+      v += t[i];
+    }
+    ++i;
+    return v;
+  };
+  auto skip_ws = [&](size_t & i) { while (i < t.size() && std::isspace((unsigned char)t[i])) ++i; };
+  for (size_t i = 0; i < t.size(); ) {
+    if (t[i] != '"') { ++i; continue; }
+    const std::string key = read_str(i);
+    skip_ws(i);
+    if (key != "logging" || i >= t.size() || t[i] != ':') continue;
+    ++i; skip_ws(i);
+    if (i >= t.size() || t[i] != '{') return false;
+    int depth = 0;
+    while (i < t.size()) {
+      const char c = t[i];
+      if (c == '{') { ++depth; ++i; continue; }
+      if (c == '}') { if (--depth == 0) return false; ++i; continue; }
+      if (c != '"') { ++i; continue; }
+      const std::string k = read_str(i);
+      skip_ws(i);
+      if (depth != 1 || k != "dir" || i >= t.size() || t[i] != ':') continue;
+      ++i; skip_ws(i);
+      return i < t.size() && t[i] == '"' && !read_str(i).empty();
+    }
+    return false;
+  }
+  return false;
+}
+
+// At a clean exit (atexit, and main's abandoned-GPU _Exit): drop the log if cuFile
+// left it empty, name it if not.  After die() the file is only named, never
+// deleted -- see the block comment.  Idempotent.
+static void gz_cufile_log_finish()
+{
+  if (!g_cufile_log_path[0]) return;
+  if (g_cufile_log_finished.exchange(true, std::memory_order_acq_rel)) return;
+  struct stat st;
+  if (::stat(g_cufile_log_path, &st) != 0) return;   // the driver never opened
+  if (st.st_size > 0) {
+    if (g_verbosity >= V_DEFAULT)
+      std::fprintf(stderr, "gzstd: cuFile wrote its log to %s (%lld bytes)\n",
+                   g_cufile_log_path, (long long)st.st_size);
+    return;
+  }
+  if (g_dying.load(std::memory_order_acquire)) return;   // left for the next sweep
+  if (::unlink(g_cufile_log_path) == 0 && g_verbosity >= V_VERBOSE)
+    std::fprintf(stderr, "[GDS] cuFile log was empty; removed %s\n", g_cufile_log_path);
+}
+
+// From gzstd_main, after parse_args and before any thread exists: setenv() racing
+// a getenv() on another thread is undefined behaviour, and cuFileDriverOpen reads
+// the variable.
+static void gz_cufile_log_setup(const Options & opt)
+{
+  if (!opt.gds_only) return;
+  const char * user = std::getenv("CUFILE_LOGFILE_PATH");
+  if (user && *user) {
+    vlog(V_VERBOSE, opt, std::string("[GDS] cuFile log: CUFILE_LOGFILE_PATH is set (")
+         + user + "); left where it points\n");
+    return;
+  }
+  std::string config;
+  if (gz_cufile_config_sets_log_dir(&config)) {
+    vlog(V_VERBOSE, opt, "[GDS] cuFile log: " + config + " sets logging.dir; left there\n");
+    return;
+  }
+  const std::string profile = adapt_profile_path();
+  if (profile.empty()) return;             // no HOME and no XDG_CACHE_HOME: cuFile's default
+  const fs::path dir = fs::path(profile).parent_path();
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  if (ec) {
+    vlog(V_VERBOSE, opt, "[GDS] cuFile log: cannot create " + dir.string() + " ("
+         + ec.message() + "); cuFile writes to the working directory\n");
+    return;
+  }
+  char host[256] = {0};
+  if (::gethostname(host, sizeof(host) - 1) != 0 || !host[0]) std::strcpy(host, "host");
+  for (char * h = host; *h; ++h)
+    if (!std::isalnum((unsigned char)*h) && *h != '.' && *h != '_' && *h != '-') *h = '_';
+  const std::string mine = std::string("cufile-") + host + "-";
+
+  // Sweep: our host's empty logs whose process is gone.  kill(pid, 0) failing with
+  // ESRCH is "no such process"; EPERM means one exists, so it is left alone.
+  for (const auto & e : fs::directory_iterator(dir, ec)) {
+    const std::string n = e.path().filename().string();
+    if (n.size() <= mine.size() + 4 || n.compare(0, mine.size(), mine) != 0
+        || n.compare(n.size() - 4, 4, ".log") != 0) continue;
+    const std::string pid_s = n.substr(mine.size(), n.size() - mine.size() - 4);
+    if (pid_s.empty() || pid_s.find_first_not_of("0123456789") != std::string::npos) continue;
+    const long pid = std::atol(pid_s.c_str());
+    if (pid <= 0 || pid == (long)::getpid()) continue;
+    std::error_code sec;
+    if (fs::file_size(e.path(), sec) != 0 || sec) continue;
+    if (::kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;
+    fs::remove(e.path(), sec);
+  }
+
+  const std::string path = (dir / (mine + std::to_string((long)::getpid()) + ".log")).string();
+  if (path.size() >= sizeof(g_cufile_log_path)) return;
+  if (::setenv("CUFILE_LOGFILE_PATH", path.c_str(), 1) != 0) return;
+  std::memcpy(g_cufile_log_path, path.c_str(), path.size() + 1);
+  std::atexit(gz_cufile_log_finish);
+}
+#endif  // HAVE_NVCOMP
 
 // Read + strictly parse the profile.  false = no usable profile (absent,
 // unreadable, oversized, or malformed — all benign; caller starts fresh).
@@ -34276,6 +34463,10 @@ static int gzstd_main(int argc, char ** argv)
 
   Options opt = parse_args(argc, argv);
 
+#if defined(HAVE_NVCOMP) && !defined(_WIN32)
+  // Before any thread: it may setenv (see gz_cufile_log_setup).
+  gz_cufile_log_setup(opt);
+#endif
 #ifdef HAVE_NVCOMP
   // Arm the "opening the cuFile driver ..." notice: --gds-only only, not -q, and
   // only on a terminal (through a pipe a \r-updated line is noise).
@@ -36131,6 +36322,9 @@ int main(int argc, char ** argv)
       // what we own and leave.
       if (g_decomp_abandoned.load(std::memory_order_relaxed)) {
         cleanup_tmp_file();
+#ifndef _WIN32
+        gz_cufile_log_finish();   // _Exit skips atexit; the run itself completed
+#endif
         std::fflush(nullptr);
         std::_Exit(rc);
       }

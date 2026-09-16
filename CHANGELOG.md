@@ -1,12 +1,83 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.59  
+**Covers:** v0.9.50 → v0.17.60  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.60 — `--gds-only` stops leaving an empty `cufile.log` wherever it runs
+
+**Behaviour, `--gds-only` only.** `cuFileDriverOpen` creates `cufile.log` in the working directory unless told to put it
+elsewhere. With a stock config (`logging.level` `ERROR`, no `logging.dir`), the file stays 0 bytes on a healthy run, so every
+`--gds-only` invocation left one behind, including in the repository root. gzstd now:
+
+- **points `CUFILE_LOGFILE_PATH` at `${XDG_CACHE_HOME:-~/.cache}/gzstd/cufile-<host>-<pid>.log`**, the directory
+  `profile.json` already uses. This happens under `--gds-only` only, in `gzstd_main` before any thread exists, because a
+  `setenv` racing a `getenv` is undefined behaviour. Other modes never touch the cache directory.
+- **deletes the log at a clean exit if cuFile left it empty.** At `-v`: `[GDS] cuFile log was empty; removed <path>`.
+- **keeps a non-empty log and names it**, unless `-q`: `gzstd: cuFile wrote its log to <path> (N bytes)`. At `ERROR` level, a
+  non-empty log is cuFile reporting a failure and is often the only record of one, which is why the log is not sent to
+  `/dev/null`.
+- **leaves an existing choice alone:** an explicit `CUFILE_LOGFILE_PATH`, or a `logging.dir` in the config cuFile reads
+  (`CUFILE_ENV_PATH_JSON`, else `/etc/cufile.json`). The config is read as JSON with its comments stripped, so the stock
+  file's commented-out `//"dir"` does not count.
+- **deletes only at a clean exit.** After `die()`, a signal or the watchdog, workers may still be inside cuFile and could
+  log the failure after a delete, so the log stays (named, if non-empty). The next `--gds-only` start sweeps empty logs
+  from this host whose process is gone (`kill(pid, 0)` returning `ESRCH`). The hostname in the filename stops a home
+  directory shared across machines from letting one host sweep another host's live log because it cannot see that PID.
+
+### Measured before choosing
+
+Against the installed libcufile, `-t --gds-only` in an empty directory, every run exit 0:
+
+| setting | where the log went |
+|---|---|
+| nothing | `./cufile.log`, 0 bytes |
+| `CUFILE_LOGFILE_PATH=<path>` | `<path>`; nothing in the working directory |
+| `CUFILE_LOGFILE_PATH` in a directory that does not exist | **nowhere**: any errors would be lost silently |
+| `CUFILE_LOGGING_LEVEL=NONE` | `./cufile.log` still created |
+| `logging.dir` in the config | `<dir>/cufile_<pid>_<date>.log` |
+| `logging.dir` **and** `CUFILE_LOGFILE_PATH` | the environment variable wins |
+
+Three design constraints follow from the table:
+- **gzstd creates the directory** before pointing cuFile at it.
+- **gzstd reads the config itself**, because setting the variable would silently override an admin's `logging.dir`.
+- **The call site is after `parse_args`.** A ctypes probe showed the variable is read at `cuFileDriverOpen`, not at
+  `dlopen`, and `parse_args` already loads the library to validate `--gds-only`.
+
+### Test
+
+Four default-tier cells, all skipping without GDS. Each run uses an empty working directory and a private
+`XDG_CACHE_HOME`.
+
+1. **A healthy run leaves nothing:** no log in the working directory or the cache, and the removal is reported. The report
+   proves the log was placed in the cache at all.
+2. **A non-empty log is kept and named by its exact path.** `CUFILE_LOGGING_LEVEL=INFO` writes ~11 KB on a healthy run,
+   deterministically.
+3. **Existing choices win:** `CUFILE_LOGFILE_PATH`, and a config copy with `logging.dir` added.
+4. **A failed run keeps its log and the next run sweeps it.** A corrupt archive fails the in-VRAM checksum (exit 4) and
+   leaves its empty log. The next start sweeps that log and a planted dead-PID log, and keeps a live-PID log, a
+   non-empty log and another host's log.
+
+Each cell was seen to fail. Pre-fix v0.17.58 fails cells 1, 2 and 4; cell 3 can only fail against an overreach. Seven
+mutants, built from copies of the tracked files, each fail with a precise reason:
+
+| mutant | failing cells |
+|---|---|
+| no `setenv` | 1, 2, 4 |
+| never deletes | 1, 4 |
+| ignores `logging.dir` | 3 |
+| deletes a non-empty log | 2 |
+| deletes after `die()` | 4 |
+| sweep ignores liveness | 4 ("swept the log of a LIVE process") |
+| sweep ignores size | 4 ("swept a NON-EMPTY log") |
+
+Baselines move to 456 default and 587 extensive; the no-GPU delta becomes 114 and the no-GDS delta 10. All four are
+derived. Both builds are warning-free, and the CPU-only build still refuses `--gds-only`. The long `--help` for
+`--gds-only` now says where the log goes. Suites not yet run.
 
 ## v0.17.59 — `-d --direct-stage` spent its first batch page-locking the read-ahead cache
 
