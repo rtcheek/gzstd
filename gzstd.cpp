@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.56";
+static constexpr const char * GZSTD_VERSION = "0.17.57";
 //
 // Architecture overview:
 //
@@ -4225,20 +4225,29 @@ static void print_help_long()
 "     page-locked memory and pushed once to the GPU, which decompresses\n"
 "     and checks them as usual.  An archive with no seek table stands\n"
 "     down to the ordinary reader and says so.  Output goes through the\n"
-"     ordinary writer, so -c (standard output) works.  MEASURED on a\n"
-"     PCIe Gen3 host with 11 GiB cards, one card, 16 GiB of entropy-coded\n"
-"     data, cold, one stream, every range non-overlapping:\n"
-"       -t  wall 6.38-6.42 s against the ordinary reader's 6.87-6.88;\n"
-"           host CPU about 4.9 s against 15.6; peak memory 0.21 GiB\n"
-"           against 4.1.  Better on every axis.\n"
-"       -d  host CPU about 7.3 s against 15.5, peak memory 1.2 GiB\n"
-"           against 5.1 -- but WALL 8.91-9.05 s against 6.26-7.01,\n"
-"           about 35% SLOWER.  A decompress batch runs start to finish on\n"
-"           its worker, so each batch's reads wait behind the previous\n"
-"           batch's download, where the ordinary reader fills a queue\n"
-"           ahead of the GPU.  A second GPU stream does not help: streams\n"
-"           take turns on the same worker.  Use -d --direct-stage when\n"
-"           cores and memory matter more than time.\n"
+"     ordinary writer, so -c (standard output) works.  Defaults to ONE\n"
+"     GPU stream: a second is left almost no VRAM, and its tiny batches\n"
+"     made -t about three times slower.\n"
+"\n"
+"     -d READS AHEAD: frames still waiting in the queue are read into\n"
+"     page-locked buffers while the GPU works on the batch before them,\n"
+"     so the reads no longer wait behind that batch's download.  It uses\n"
+"     about one batch of extra page-locked memory (1-1.5 GiB at 16 MiB\n"
+"     frames).  -t downloads nothing, so it gains nothing from this and\n"
+"     does not do it.\n"
+"\n"
+"     MEASURED on a PCIe Gen3 host, one 11 GiB card, 16 GiB of\n"
+"     entropy-coded data, cold, default settings, every range\n"
+"     non-overlapping:\n"
+"       -d  wall 7.13-7.30 s (8.79-9.06 without read-ahead); host CPU\n"
+"           about 8.4 s against the ordinary reader's 18.1; peak memory\n"
+"           3.0 GiB against 3.8.\n"
+"       -t  wall 6.18-6.42 s; host CPU about 4.8 s against 18.2; peak\n"
+"           memory 0.21 GiB against 2.7.\n"
+"     Compare CPU and memory with the ordinary reader rather than wall:\n"
+"     its wall time on that host ranged from 6.3-7.0 s to 12 s between\n"
+"     sessions, and some runs stalled past 45 s in its buffered reads,\n"
+"     while these O_DIRECT reads stayed within 6.9-7.3 s.\n"
 "\n"
 "     Distinct from --direct-read, which is O_DIRECT input for the CPU\n"
 "     path, and from --direct, which is O_DIRECT OUTPUT.\n"
@@ -10397,6 +10406,36 @@ public:
       if (may_take(qs)) { --gpu_yield_waiters_; return true; }
       cv_.wait(lk);
     }
+  }
+
+  // --direct-stage READ-AHEAD support.  Offer each queued STAGED task (a file region,
+  // src_off >= 0) to `pick`, in queue order, until it accepts one -- or sleep until
+  // the queue changes.  Returns false when the queue has drained, the run aborted, or
+  // `stop` is set.  `pick` runs under this queue's lock: it must not call back into
+  // the queue (it takes the cache's own mutex, which is ALWAYS acquired after this
+  // one).  Woken by push, re_enqueue and set_done, which already notify cv_, and by
+  // notify_pickers() for the events the queue cannot see (a cache buffer freed, stop).
+  // Scans at most `scan_max` tasks per wake so a deep queue costs a bounded walk.
+  bool wait_pick_staged(const std::function<bool(const Task &)> & pick,
+                        const std::atomic<bool> & stop, size_t scan_max)
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    while (true) {
+      if (stop.load(std::memory_order_relaxed)) return false;
+      if (g_gpu_aborted.load(std::memory_order_relaxed)) return false;
+      if (done_ && q_.empty()) return false;
+      size_t n = 0;
+      for (const Task & t : q_) {
+        if (n++ >= scan_max) break;
+        if (t.src_off >= 0 && pick(t)) return true;
+      }
+      cv_.wait(lk);
+    }
+  }
+  void notify_pickers()
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    cv_.notify_all();
   }
 
   // Wake GPU workers parked in wait_for_gpu_yield().  Called by the
@@ -27892,6 +27931,236 @@ static void gz_decomp_unpublish(int device_id)
   R.submit_ns = 0;
 }
 
+// ===========================================================================
+// --direct-stage READ-AHEAD (decompress).  A decompress batch runs start to finish
+// on its worker -- upload, kernel, download, deliver -- so under --direct-stage a
+// batch's O_DIRECT reads used to wait behind the previous batch's download: the path
+// paid read + compute where the ordinary reader keeps a queue filled ahead of the
+// GPU.  MEASURED (PCIe Gen3, one 11 GiB card, 16 GiB cold, batch 64): reads 37.8 s
+// summed over 8 lanes (~4.7 s of wall at ~2.6 GiB/s), pinned upload ~0.8 s, kernel
+// plus download 3.45 s, wall 9.5 s against the ordinary reader's 6.3-7.0.
+//
+// So readers here pread frames that are STILL IN THE QUEUE into pinned buffers, and
+// place_frame claims them.  Nothing is popped early: throttle permits, the stuck-GPU
+// reclaim registry, the CPU rescue and teardown all see exactly the frames they saw
+// before, and a cache MISS is simply the old path -- the worker preads the frame
+// itself.  The buffers are PORTABLE pinned memory, so any device's worker can upload
+// from them.
+//
+// GZSTD_DEBUG_DSTAGE_AHEAD=N sets the cache to N frames; 0 turns read-ahead off --
+// the in-tool control that makes the A/B one binary.
+class DStageAhead {
+public:
+  DStageAhead(TaskQueue * q, int fd, size_t slot_bytes, size_t cap_frames)
+    : q_(q), fd_(fd), slot_(slot_bytes),
+      max_(std::max<size_t>(1, (4ull << 30) / std::max<size_t>(1, slot_bytes))),
+      cap_(std::min(cap_frames, max_)) {
+    // NEVER REALLOCATED: readers index bufs_ while other readers append to it, so
+    // the storage must not move under them.  Reserved to the byte bound, which is
+    // the most want_frames() can ever raise cap_ to.
+    bufs_.reserve(max_);
+  }
+
+  // Follow the batch actually being popped.  A default decompress does not have ONE
+  // batch size: gpu_batch_cap comes from the input size (16 under 10 GiB, 64, 256),
+  // the worker allocates for the auto-tuner's ceiling, and the tuner then grows the
+  // pop at run time.  MEASURED on a 16 GiB archive: the cache was sized to 64 and the
+  // tuner popped 88, so 291 of 1024 frames still fell back to the worker's own read.
+  // One batch per GPU worker, since each has at most one batch in flight; only
+  // upward, bounded, and never again after a pinning failure.
+  void want_frames(size_t n) {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      n = std::min(n, max_);
+      if (n <= cap_ || alloc_failed_ || shrunk_) return;
+      cap_ = n;
+    }
+    cv_.notify_all();            // readers waiting for a buffer may now allocate one
+  }
+  ~DStageAhead() { stop(); }
+  DStageAhead(const DStageAhead &) = delete;
+  DStageAhead & operator=(const DStageAhead &) = delete;
+
+  void start(int nthreads) {
+    for (int i = 0; i < nthreads; ++i) thr_.emplace_back([this] { reader(); });
+  }
+
+  // Idempotent.  Joins every reader BEFORE the caller may close fd_: a reader still
+  // in pread on a closed-and-reused descriptor number would read another file.
+  void stop() {
+    stop_.store(true, std::memory_order_relaxed);
+    { std::lock_guard<std::mutex> lk(m_); }
+    cv_.notify_all();
+    if (q_) q_->notify_pickers();
+    for (auto & t : thr_) if (t.joinable()) t.join();
+    thr_.clear();
+    std::lock_guard<std::mutex> lk(m_);
+    for (void * b : bufs_) if (b) cudaFreeHost(b);
+    bufs_.clear(); free_.clear(); ents_.clear();
+  }
+
+  // The staged frame (seq, off, len), already read: returns a pointer to its first
+  // byte, marked in use until release(seq).  Waits if a reader has THIS frame in
+  // flight.  nullptr = not cached (or the read failed): the caller preads it itself.
+  const char * claim(uint64_t seq, off_t off, size_t len) {
+    // The fault-injection hook must still reach the worker's own read, or its cell
+    // would silently stop testing anything once the cache served that frame.
+    static const char * fenv = ::getenv("GZSTD_DEBUG_DSTAGE_FAIL_FRAME");
+    if (fenv && seq == (uint64_t)::strtoull(fenv, nullptr, 10)) {
+      misses_.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    std::unique_lock<std::mutex> lk(m_);
+    auto it = ents_.find(seq);
+    if (it == ents_.end() || it->second.off != off || it->second.len != len) {
+      misses_.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    if (it->second.st == READING) {
+      waits_.fetch_add(1, std::memory_order_relaxed);
+      cv_.wait(lk, [&] {
+        auto j = ents_.find(seq);
+        return j == ents_.end() || j->second.st != READING;
+      });
+      it = ents_.find(seq);
+      if (it == ents_.end()) { misses_.fetch_add(1, std::memory_order_relaxed); return nullptr; }
+    }
+    if (it->second.st == FAILED) {                   // hand the read back
+      free_.push_back(it->second.buf);
+      ents_.erase(it);
+      lk.unlock();
+      cv_.notify_all();
+      misses_.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    if (it->second.st != READY) {                    // IN_USE elsewhere: never free it
+      misses_.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    it->second.st = IN_USE;
+    hits_.fetch_add(1, std::memory_order_relaxed);
+    return static_cast<const char *>(bufs_[it->second.buf]) + it->second.pad;
+  }
+
+  void release(uint64_t seq) {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      auto it = ents_.find(seq);
+      if (it == ents_.end()) return;
+      free_.push_back(it->second.buf);
+      ents_.erase(it);
+    }
+    cv_.notify_all();            // a reader waiting for a buffer
+  }
+
+  uint64_t hits()   const { return hits_.load(std::memory_order_relaxed); }
+  uint64_t waits()  const { return waits_.load(std::memory_order_relaxed); }
+  uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
+  size_t   capacity() const { return cap_; }
+
+private:
+  enum St { READING, READY, IN_USE, FAILED };
+  struct Ent { off_t off; size_t len; size_t pad; size_t buf; St st; };
+
+  static constexpr size_t NONE = (size_t)-1;
+
+  // A buffer this reader may fill: a free one, or a new portable pinned allocation
+  // (made OUTSIDE every lock -- pinning 16 MiB takes milliseconds) while under the
+  // cap.  Blocks while the cache is full; NONE on stop or if pinning fails.
+  size_t take_buffer() {
+    std::unique_lock<std::mutex> lk(m_);
+    while (true) {
+      if (stop_.load(std::memory_order_relaxed) || alloc_failed_) return NONE;
+      if (!free_.empty()) { size_t b = free_.back(); free_.pop_back(); return b; }
+      if (bufs_.size() + pending_alloc_ < cap_) {
+        ++pending_alloc_;
+        lk.unlock();
+        void * p = nullptr;
+        const bool ok = cudaHostAlloc(&p, slot_, cudaHostAllocPortable) == cudaSuccess;
+        if (!ok) cudaGetLastError();       // handled: fewer buffers, not a device error
+        lk.lock();
+        --pending_alloc_;
+        if (!ok) {
+          alloc_failed_ = bufs_.empty();
+          if (alloc_failed_) return NONE;
+          cap_ = bufs_.size();       // run with what pinned; stop growing
+          shrunk_ = true;
+          continue;
+        }
+        bufs_.push_back(p);
+        return bufs_.size() - 1;
+      }
+      cv_.wait(lk);
+    }
+  }
+
+  void reader() {
+    while (!stop_.load(std::memory_order_relaxed)) {
+      const size_t b = take_buffer();
+      if (b == NONE) return;
+      uint64_t seq = 0; off_t off = 0; size_t len = 0;
+      const bool picked = q_->wait_pick_staged([&](const Task & t) {
+        const off_t  fo  = t.src_off & ~(off_t)4095;
+        const size_t pad = (size_t)(t.src_off - fo);
+        const size_t want = (pad + t.len() + 4095) & ~size_t(4095);
+        if (want > slot_) return false;          // too big to cache: the worker reads it
+        std::lock_guard<std::mutex> lk(m_);
+        if (ents_.count(t.seq)) return false;    // cached, or another reader has it
+        ents_[t.seq] = Ent{t.src_off, t.len(), pad, b, READING};
+        seq = t.seq; off = t.src_off; len = t.len();
+        return true;
+      }, stop_, 4 * cap_ + 64);
+      if (!picked) {
+        { std::lock_guard<std::mutex> lk(m_); free_.push_back(b); }
+        cv_.notify_all();
+        return;
+      }
+      const off_t  fo   = off & ~(off_t)4095;
+      const size_t pad  = (size_t)(off - fo);
+      const size_t want = (pad + len + 4095) & ~size_t(4095);
+      char * hp = nullptr;
+      { std::lock_guard<std::mutex> lk(m_); hp = static_cast<char *>(bufs_[b]); }
+      size_t hgot = 0;
+      bool   rerr = false;
+      const uint64_t rd_t0 = now_ns();
+      while (hgot < want) {
+        const ssize_t r = ::pread(fd_, hp + hgot, want - hgot, fo + (off_t)hgot);
+        if (r < 0) { if (errno == EINTR) continue; rerr = true; break; }
+        if (r == 0) break;                         // EOF: the rounded tail window
+        hgot += (size_t)r;
+      }
+      g_gdsv_read_ns.fetch_add(now_ns() - rd_t0, std::memory_order_relaxed);
+      g_gdsv_read_bytes.fetch_add(hgot, std::memory_order_relaxed);
+      g_gdsv_reads.fetch_add(1, std::memory_order_relaxed);
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        auto it = ents_.find(seq);
+        if (it != ents_.end())
+          it->second.st = (!rerr && hgot >= pad + len) ? READY : FAILED;
+      }
+      cv_.notify_all();                            // a worker waiting on this frame
+    }
+  }
+
+  TaskQueue *                          q_;
+  int                                  fd_;
+  size_t                               slot_;
+  size_t                               max_;
+  size_t                               cap_;
+  bool                                 shrunk_ = false;
+  std::mutex                           m_;
+  std::condition_variable              cv_;
+  std::unordered_map<uint64_t, Ent>    ents_;
+  std::vector<void *>                  bufs_;
+  std::vector<size_t>                  free_;
+  size_t                               pending_alloc_ = 0;
+  bool                                 alloc_failed_  = false;
+  std::atomic<bool>                    stop_{false};
+  std::vector<std::thread>             thr_;
+  std::atomic<uint64_t>                hits_{0}, waits_{0}, misses_{0};
+};
+static std::atomic<DStageAhead *> g_dstage_ahead{nullptr};
+
 [[noreturn]] static void gz_decomp_park_forever()
 {
   static std::mutex              & pm  = *new std::mutex;
@@ -29065,6 +29334,8 @@ static void gpu_decomp_worker(
           continue;
         }
         if (bp) bp->acquire((int)pop_n);
+        if (DStageAhead * ah = g_dstage_ahead.load(std::memory_order_acquire))
+          ah->want_frames(pop_n * (size_t)std::max(1, gpu_worker_count));
         if (sched) sched->gpu_wants_data();
         size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
         if (sched) sched->gpu_got_data();
@@ -29422,6 +29693,22 @@ static void gpu_decomp_worker(
               std::lock_guard<std::mutex> lk(rd_err_m);
               if (rd_err.empty()) rd_err = std::move(why);
             };
+            // Already read ahead?  Then only the upload is left.
+            if (DStageAhead * ah = g_dstage_ahead.load(std::memory_order_acquire)) {
+              if (const char * fp = ah->claim(C.batch[i].seq, raw, flen)) {
+                const cudaError_t cs = cudaMemcpy(d_dst, fp, flen, cudaMemcpyHostToDevice);
+                ah->release(C.batch[i].seq);
+                if (cs != cudaSuccess) {
+                  fail(std::string("cudaMemcpy(--direct-stage read-ahead -> slab): ")
+                       + cudaGetErrorString(cs));
+                  return;
+                }
+                g_dstage_bytes.fetch_add(flen, std::memory_order_relaxed);
+                g_dstage_frames.fetch_add(1, std::memory_order_relaxed);
+                C.h_comp_ptrs[i] = static_cast<char*>(C.d_comp_buf) + i * C.alloc_comp;
+                return;
+              }
+            }
             char * hp = (C.h_dstage_n > 0)
                       ? static_cast<char *>(C.h_dstage[lane % C.h_dstage_n]) : nullptr;
             if (!hp || want > C.h_dstage_slot_bytes) {
@@ -31861,6 +32148,34 @@ gds_out_declined:
   // is handled up front by peek_first_frame_decomp_size.
   size_t max_frame_decomp = 0;
   size_t n_frames = GDS_VERIFY_DEMOTE;
+  // --direct-stage read-ahead (see DStageAhead).  Started before the producer so it
+  // reads frames as they arrive; destroyed -- readers joined -- before any path
+  // closes the O_DIRECT descriptor they read.
+  std::unique_ptr<DStageAhead> dstage_ahead;
+  auto stop_dstage_ahead = [&]() {
+    g_dstage_ahead.store(nullptr, std::memory_order_release);
+    if (dstage_ahead) dstage_ahead->stop();
+  };
+  // -d ONLY.  -t downloads nothing, so its reads never waited behind a download
+  // and there is nothing to overlap: MEASURED (16 GiB cold, x3) -t wall 6.15-6.17 s
+  // with read-ahead against 6.18-6.42 without, while peak memory rose from 0.21 GiB
+  // to 1.60.  -d: 7.13-7.30 against 8.79-9.06.
+  if (g_gds_read_active.load(std::memory_order_acquire) && opt.direct_stage
+      && opt.mode == Mode::DECOMPRESS && g_gds_verify_fd >= 0) {
+    const size_t slot = (decomp_comp_slot(opt, true) + 4095) & ~size_t(4095);
+    size_t frames = std::max<size_t>(1, opt.gpu_batch_cap)
+                  * std::max<size_t>(1, opt.gpu_streams)
+                  * (size_t)std::max(1, (int)opt.gpu_devices);
+    frames = std::max<size_t>(16, frames);
+    frames = std::min<size_t>(frames, std::max<size_t>(1, (4ull << 30) / slot));
+    if (const char * e = ::getenv("GZSTD_DEBUG_DSTAGE_AHEAD"))
+      frames = (size_t)::strtoull(e, nullptr, 10);
+    if (frames > 0) {
+      dstage_ahead = std::make_unique<DStageAhead>(&queue, g_gds_verify_fd, slot, frames);
+      dstage_ahead->start(GDS_READ_FANOUT);
+      g_dstage_ahead.store(dstage_ahead.get(), std::memory_order_release);
+    }
+  }
   if (g_gds_read_active.load(std::memory_order_acquire)) {
     n_frames = gds_staged_frames_to_queue(in, queue, m, opt, &max_frame_decomp);
     if (n_frames == GDS_VERIFY_DEMOTE) {
@@ -31868,6 +32183,7 @@ gds_out_declined:
       // g_gds_verify_active to decide whether a Task is a file region, so
       // leaving it set while the ordinary producer pushes host-backed Tasks
       // would have them read from a slab nobody filled.
+      stop_dstage_ahead();          // before the descriptor its readers use closes
       gds_decomp_read_close();
       const std::string SF = opt.gds_only ? "--gds-only" : "--direct-stage";
       vlog(V_NORMAL, opt,
@@ -31926,6 +32242,7 @@ gds_out_declined:
     gz_wait_for_worker_exits();          // see the teardown site for the ordering
     gz_join_or_detach_workers();
     gz_stop_reclaimer();
+    stop_dstage_ahead();
     for (auto & th : cpu_pool) th.join();
     if (sched) { tick_done = true; gz_wake_periodic_loops(); if (tick_thr.joinable()) tick_thr.join(); }
     if (writer_thr.joinable()) writer_thr.join();
@@ -31999,6 +32316,7 @@ gds_out_declined:
   gz_wait_for_worker_exits();
   gz_join_or_detach_workers();
   gz_stop_reclaimer();
+  stop_dstage_ahead();
   // THE DISCRIMINATOR.  Output bytes cannot show whether this path ran: a
   // missing seek table stands it down to the ordinary reader at exit 0.
   if (opt.direct_stage && opt.verbosity >= V_VERBOSE) {
@@ -32009,6 +32327,15 @@ gds_out_declined:
       (unsigned long long)g_dstage_bytes.load(std::memory_order_relaxed),
       double(g_dstage_bytes.load(std::memory_order_relaxed)) / 1048576.0);
     vlog(V_VERBOSE, opt, b);
+    if (dstage_ahead) {
+      std::snprintf(b, sizeof(b),
+        "[DSTAGE] read-ahead (%zu frames): %llu ready when claimed, %llu waited on an "
+        "in-flight read, %llu read by the worker\n",
+        dstage_ahead->capacity(),
+        (unsigned long long)dstage_ahead->hits(), (unsigned long long)dstage_ahead->waits(),
+        (unsigned long long)dstage_ahead->misses());
+      vlog(V_VERBOSE, opt, b);
+    }
   }
 
   // THE SAME ROUTING REPORT THE COMPRESS PATH HAS, and for the same reason: a
@@ -37955,7 +38282,16 @@ static Options parse_args(int argc, char ** argv)
     // sizes each stream against live free VRAM and auto-decrements the stream
     // count if the second one will not fit, so this cannot make a tight card
     // fail -- it degrades back to the old behaviour.
-    opt.gpu_streams = opt.gds_only ? 1
+    // ONE STREAM FOR --direct-stage -d AND -t, as for --gds-only.  -t used to fall
+    // through to the two-stream default, and a staged slab on stream 0 leaves stream
+    // 1 almost no VRAM: MEASURED (one 11 GiB card, 16 GiB cold) stream 1 ran batches
+    // of 6 and then 3, the constant tiny synchronisations spin-waited, and
+    // `-t --direct-stage` took 20.5 s with 18.5 s of user CPU -- against 6.1 s and
+    // 3.0 s at one stream.  A second stream buys staged DECOMPRESS nothing anyway:
+    // streams take turns on one worker (measured for -d: no gain).  Compress keeps
+    // its two, for the reasons above.
+    const bool staged_decomp = opt.region_staged() && opt.mode != Mode::COMPRESS;
+    opt.gpu_streams = (opt.gds_only || staged_decomp) ? 1
                     : (opt.mode == Mode::DECOMPRESS)
                         ? DEFAULT_GPU_DECOMP_STREAMS : DEFAULT_GPU_STREAMS;
   }

@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=451
-$EXTENSIVE && EXPECTED_TESTS=582
+EXPECTED_TESTS=452
+$EXTENSIVE && EXPECTED_TESTS=583
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -663,7 +663,9 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.56 adds six default-tier cells (--direct-stage decompress and -t), all
 # skipping without a GPU: 445 -> 451 and the no-GPU delta 103 -> 109.  DERIVED
 # until a suite run confirms it.
-EXPECTED_NOGPU_DELTA=109
+# v0.17.57 adds one default-tier cell (--direct-stage read-ahead), skipping without a
+# GPU: 451 -> 452 and the no-GPU delta 109 -> 110.  DERIVED until a suite run confirms it.
+EXPECTED_NOGPU_DELTA=110
 EXPECTED_NOGDS_DELTA=6
 
 # ============================================================
@@ -5734,6 +5736,34 @@ DSDPY
   fi
   rm -f "$dsd_out"
 
+  # 7. READ-AHEAD (v0.17.57): -d preads queued frames ahead of the GPU so a batch's
+  # reads no longer wait behind the previous batch's download (-d 8.8-9.1 s -> 7.1-7.3 s
+  # on 16 GiB cold).  Invisible to byte-identity like the staging itself -- a claim()
+  # that always missed would pass every cell above -- so assert the cache served
+  # frames.  Deterministic: its readers start before the producer, and GPU bringup
+  # takes far longer than reading a batch of 1 MiB frames.  -t must NOT read ahead:
+  # it downloads nothing, gained no wall time, and its peak memory rose 0.21 -> 1.60 GiB.
+  rc=0
+  timeout --foreground -k 10 120 "$GZSTD" -d --direct-stage -v -f "$dsd_zst" -o "$dsd_out" 2>"$dsd_log" || rc=$?
+  dsd_have=$(dsd_got "$dsd_log")
+  dsd_ready=$(grep -a -o 'read-ahead ([0-9]* frames): [0-9]* ready' "$dsd_log" | head -1 | awk '{print $4}')
+  timeout --foreground -k 10 120 "$GZSTD" -t --direct-stage -v "$dsd_zst" >/dev/null 2>"$dsd_log.t" || rc=$?
+  dsd_t_ahead=$(grep -a -c 'read-ahead (' "$dsd_log.t")
+  if [[ $rc -ne 0 ]]; then
+    fail "--direct-stage -d reads ahead; -t does not" "exit $rc"
+  elif [[ "$dsd_have" != "$dsd_want" ]]; then
+    fail "--direct-stage -d reads ahead; -t does not" "staged '${dsd_have:-nothing}', expected '$dsd_want'"
+  elif [[ -z "$dsd_ready" || "$dsd_ready" -eq 0 ]]; then
+    fail "--direct-stage -d reads ahead; -t does not" "no frame was ready when claimed ('${dsd_ready:-no read-ahead line}')"
+  elif [[ $dsd_t_ahead -ne 0 ]]; then
+    fail "--direct-stage -d reads ahead; -t does not" "-t started a read-ahead cache"
+  elif files_match "$dsd_src" "$dsd_out"; then
+    pass "--direct-stage -d reads ahead; -t does not" "($dsd_ready frames ready when claimed)"
+  else
+    fail "--direct-stage -d reads ahead; -t does not" "output differs"
+  fi
+  rm -f "$dsd_out" "$dsd_log.t"
+
   # 6. No seek table: stand down to the ordinary reader, say so, stage nothing.
   if command -v zstd >/dev/null 2>&1; then
     dsd_parts="$TMPDIR/dstage-parts"; rm -rf "$dsd_parts"; mkdir -p "$dsd_parts"
@@ -5765,6 +5795,7 @@ else
   skip "--direct-stage decompress never loads libcufile" "no GPU"
   skip "--direct-stage read failure is named and recovered" "no GPU"
   skip "--direct-stage without a seek table stands down and says so" "no GPU"
+  skip "--direct-stage -d reads ahead; -t does not" "no GPU"
 fi
 
 

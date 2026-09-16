@@ -1,12 +1,104 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.56  
+**Covers:** v0.9.50 → v0.17.57  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.57 — `-d --direct-stage` reads ahead; `-t --direct-stage` takes one stream
+
+**Two changes to v0.17.56's decompress `--direct-stage`.** `-d` now reads queued frames ahead while the GPU works on the
+batch before them, which removes the wall-time cost v0.17.56 documented. And `-t` defaults to one GPU stream: at two,
+plain `gzstd -t --direct-stage` was about three times slower than the `-t` numbers v0.17.56 published.
+
+### Why
+
+- **`-d`: reads serialized behind downloads.** A decompress batch runs start to finish on its worker, so a batch's
+  O_DIRECT reads waited for the previous batch's download. Measured cold (one 11 GiB card, 16 GiB, batch 64): reads
+  37.8 s summed over 8 reader threads — ~4.7 s of wall at ~2.6 GiB/s, the drive's parallel limit — pinned uploads only
+  ~0.8 s, kernel plus download 3.45 s, wall 9.5 s. Overlapping the reads with the kernel and download is worth seconds.
+- **`-t`: a defect in v0.17.56 as released.** `-t` fell through to the two-stream default. A staged slab on stream 0
+  leaves stream 1 almost no VRAM (`[GPU0/S1] VRAM headroom: reducing batch 127 -> 6 (380 MiB free)`, then 3), and the
+  constant tiny synchronisations spin-wait: **20.5 s with 18.5 s of user CPU, against 6.1 s and 3.0 s at one stream.**
+  v0.17.56's `-t` measurement pinned `--gpu-streams 1 --gpu-batch 64`, which hid it; its `--help` did say "one stream",
+  but plain `-t --direct-stage` never ran that way.
+
+### The change
+
+- **A read-ahead cache, not a batch pipeline.** Popping batch N+1 early would put two popped batches on a device at
+  once, breaking the stuck-GPU reclaim registry's one batch per device (an unpublished batch could never be rescued),
+  holding throttle permits early, and splitting the catch path's re-enqueue across threads. Instead, reader threads
+  pread frames **still in the queue** into portable page-locked buffers (`cudaHostAllocPortable`, usable from any
+  device's worker), and `place_frame` claims them by (seq, offset, length). A miss is v0.17.56's own read. Nothing
+  leaves the queue early, so permits, the reclaim registry, the CPU rescue and teardown see exactly what they saw.
+  - `TaskQueue::wait_pick_staged` offers queued staged frames to the cache under the queue lock and sleeps on the
+    queue's existing condition variable, which push, re-enqueue and done already signal; freeing a cache buffer and
+    stopping signal it too. The cache's own mutex is always taken after the queue's.
+  - **The cache follows the batch actually popped.** A default decompress has three batch numbers: `--gpu-batch`'s
+    default comes from input size (16 under 10 GiB, 64, 256), the worker allocates for the auto-tuner's ceiling, and the
+    tuner grows the pop at run time (it popped 88 on 16 GiB). Sized from the first, the cache served 72% of frames;
+    `want_frames(pop x GPU workers)` at each intake, upward only and bounded at 4 GiB, serves ~94% (the misses are the
+    first batch, popped before the cache learned its size).
+  - Readers stop before every close of the descriptor they read: the no-seek-table stand-down, both teardowns, and an
+    exception unwinding through the cache's owner.
+  - The fault-injection hook `GZSTD_DEBUG_DSTAGE_FAIL_FRAME` refuses a cached copy of its frame, so its test still
+    reaches the worker's read.
+  - `GZSTD_DEBUG_DSTAGE_AHEAD=N` sets the cache to N frames and 0 turns read-ahead off — the in-tool control.
+  - `-v` reports `[DSTAGE] read-ahead (N frames): R ready when claimed, W waited on an in-flight read, M read by the
+    worker`.
+- **`-d` only.** `-t` downloads nothing, so its reads never waited: with read-ahead its wall was 6.15–6.17 s against
+  6.18–6.42 without, while its peak memory rose from 0.21 GiB to 1.60.
+- **`--direct-stage` `-d` and `-t` default to one GPU stream**, as `--gds-only` does. Compress keeps two.
+- Two bugs found by rereading the cache before any test ran: buffer pointers were indexed outside the lock while
+  another reader could reallocate their vector (now reserved to its bound up front), and a claim of a frame already in
+  use would have freed its buffer mid-upload (unreachable today; fixed anyway).
+
+### Verified
+
+16 GiB of entropy-coded data, cold, default settings, three runs each in rotated order, one binary for the three
+`--direct-stage`-family arms (`AHEAD=0` is v0.17.56's behaviour):
+
+| | wall (s) | user + sys (s) | peak RSS |
+|---|---|---|---|
+| `-d` ordinary `--gpu-only` | 11.95–12.02 | ~18.1 | 3.82 GiB |
+| `-d --direct-stage` | **7.13–7.30** | ~8.4 | 2.97 GiB |
+| `-d --direct-stage`, `AHEAD=0` | 8.79–9.06 | ~7.5 | 1.59 GiB |
+| `-t` ordinary `--gpu-only` | 11.57–11.71 | ~18.2 | 2.68 GiB |
+| `-t --direct-stage` (one stream, no read-ahead) | **6.18–6.42** | ~4.8 | **0.21 GiB** |
+
+- **Read-ahead: `-d` wall −19%** against the same binary without it, for about 1.4 GiB of page-locked memory and ~1 s of
+  kernel CPU. Every staged run read all 1024 frames; 945–966 were ready when claimed.
+- **The ordinary reader is not a stable baseline on that host**, so compare CPU and memory with it, not wall. With the
+  same pinned settings its `-d` wall was 6.26–7.01 s in the morning and 13.5–14.0 s that afternoon, and four runs across
+  the day stalled at 30–61 s, all saturated in buffered reads, while `--direct-stage` stayed within 6.9–7.3 s. **It is
+  not a regression:** the committed v0.17.56 built from its tag, interleaved with this tree, showed the same 12 s and the
+  same stalls (49.1 / 12.1 / 12.0 s against 12.1 / 12.1 / 29.8). Ruled out: the GPU card (forced to either, 11.93–11.94
+  s) and page-cache pressure (evicting 66 GiB changed nothing).
+- Correctness on a 1 GiB + 12,345-byte archive with read-ahead on: exact staged counts; `-d` to a file, to standard
+  output and across two cards identical; no `libcufile`; the no-seek-table stand-down and the forced read failure
+  unchanged.
+
+### Test
+
+One new default-tier cell in `--direct-stage decompress and -t`, skipping without a GPU: `-d` must report frames ready
+when claimed (with exact staged counts and matching output) and `-t` must start no read-ahead at all. Read-ahead is
+invisible to output bytes like the staging itself — a cache that always missed would pass every other cell. The check
+is deterministic in practice: the readers start before the producer, and GPU bringup takes far longer than reading a
+batch of the fixture's 1 MiB frames.
+
+Mutation-tested by running the section verbatim under the suite's single-card default against three builds of this
+source. This build passes all seven cells.
+
+| mutant | cell failing |
+|---|---|
+| `claim()` always misses | the read-ahead cell (`0` frames ready) |
+| read-ahead enabled for `-t` | the read-ahead cell (`-t` started a cache) |
+| fault hook no longer refuses a cached frame | **the read-failure cell** — frame 3 was served from the cache, the injected read error never fired, and that cell would silently have stopped testing anything |
+
+**Test suite:** not yet run at v0.17.57. Baseline 451 → 452, `--extensive` 582 → 583, no-GPU delta 109 → 110 (derived).
 
 ## v0.17.56 — `--direct-stage` reads the compressed frames for -d and -t
 

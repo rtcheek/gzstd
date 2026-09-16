@@ -333,6 +333,25 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.57: `-d --direct-stage` reads ahead; `-t --direct-stage` takes one stream
+
+Closes v0.17.56's open item. A read-ahead cache preads frames still in the queue into portable page-locked buffers
+while the GPU works on the batch before them; nothing is popped early, so permits, the reclaim registry and the CPU
+rescue are untouched. `-d` wall 8.79–9.06 → 7.13–7.30 s on 16 GiB cold, for ~1.4 GiB of page-locked memory; `-d` only,
+because `-t` downloads nothing and gained no wall time. The same work found `-t --direct-stage` defaulting to two GPU
+streams, which starved the second of VRAM and ran 20.5 s against 6.1 s at one — a defect in v0.17.56 as released, now
+defaulting to one (CHANGELOG v0.17.57).
+
+**OPEN — staged producer metadata reads.** The seek-table producer makes two serial single-queue-depth preads per frame
+(header and trailer): 2,048 of them, 4.48 s cold on a 1024-frame archive, competing with the data reads. The ordinary
+reader gets the same metadata free from its sequential read. Reading headers from the data window, or batching the
+preads, would remove it.
+
+**OPEN — ordinary buffered decompress stalls on the Gen3 workstation.** Cold `-d --gpu-only` wall ran 6.3–7.0 s in the
+morning and ~12 s that afternoon, with four runs stalling at 30–61 s, all with reader threads saturated in buffered
+reads. Present in v0.17.56 as released; not the GPU card; not page-cache pressure. O_DIRECT reads on the same file were
+unaffected. Cause unknown.
+
 ## SHIPPED v0.17.56: `--direct-stage` reads the compressed frames for -d and -t
 
 The last deferred item from the decompress-versus-compress review. Measured first: on a Gen3 host the compressed input
@@ -341,11 +360,7 @@ kernel CPU on the page cache. v0.17.56 reuses decompress `--gds-only`'s staged r
 pinned host lanes in place of cuFile (CHANGELOG v0.17.56). `-t`: wall −7%, host CPU −69%, memory −95%. `-d`: host CPU
 −52%, memory −76%, but wall ~35% slower on that host.
 
-**OPEN — read-ahead for `-d --direct-stage`.** The `-d` wall cost is structural: a decompress batch runs start to finish
-on its worker, so its staged reads wait behind the previous batch's download, and a second stream does not help because
-streams take turns on the same worker. Closing it means reading the NEXT batch into pinned lanes while the current one
-computes and downloads — popping that batch early, with its throttle permits, its reclaim-registry entry and its
-rescue path all still correct. Worth doing only if `-d` wall matters to a user of the flag; `-t` needs none of it.
+**Read-ahead for `-d --direct-stage` — done in v0.17.57.**
 
 ## SHIPPED v0.17.55: every run slept up to 200 ms after its work was done
 
