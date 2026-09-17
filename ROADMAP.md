@@ -333,13 +333,31 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.62: pre-tag review of v0.17.44–61 — four CRITICALs that exited 0
+
+Independent review (Codex, four rounds, ending `SAFE TO TAG`) of everything since the v0.17.43 tag. Reproduced and
+fixed: readers re-opening the input by NAME after it was pinned, so `--rm` removed a different archive than the one
+written (101 of 400 runs under a rename stress); a short read accepted as the end of the input (a truncated archive at
+exit 0); and `--sliding-window` writing a corrupt archive at exit 0 when the pledged size came from the name or the
+input simply grew. Also fixed: stuck-GPU reclaim ownership and `--direct-stage` rescue, a SIGBUS with no cleanup, runtime
+staged failures exiting 2, and resource-failure paths into `std::terminate` (CHANGELOG v0.17.62).
+
+**Follow-ups recorded by the review, deliberately not done:**
+- No hook stalls `cuFileWrite`, so the reclaim/GDS-write ownership fix is inspection-only; experimental
+  `GZSTD_DEBUG_GDS_WRITE_BEHIND` is not covered by stuck-write reclaim.
+- The reclaimer covers only the published, post-launch interval; a CUDA call that never returns during bringup or
+  pre-publication H2D still hangs the run.
+- The resource-failure hardening (allocation and thread-creation failures) has no rlimit/cgroup test.
+- A compress input that grows under the chunked (mmap/pread) readers yields a valid archive of the captured snapshot,
+  not an error; only `--sliding-window`, which pledges a size, refuses it.
+
 ## OPEN: GPU ordering costs ~380 ms per `--hybrid` process on an 8-GPU host, even when no GPU is used
 
 **Found 2026-09-16, server validation of v0.17.55.** Before the first CUDA call, `order_all_gpus_before_cuda()` starts the
 NVML device sampler, waits up to 500 ms for its first sample (`g_gpu_monitor.wait_ready(500)`), ranks the devices, and
 sets `CUDA_VISIBLE_DEVICES` to that order. It has to run first because CUDA freezes the variable during initialization.
 On the 2-GPU workstation this cost ~60 ms, which the v0.17.55 note judged not worth moving. On the 8-GPU server it is
-**~380 ms**.
+**~380 ms**, nearly all of it `nvmlInit_v2`.
 
 MEASURED, one-frame (1 MiB) decompress to `/dev/null`, n=8 each, interleaved:
 
@@ -355,19 +373,25 @@ pays it. That run then logs `CPU pool will finish before GPU init could; skippin
 `--hybrid` job pays 380 ms to order GPUs it never touches. On a large run it is a fixed cost, and for `tar -I gzstd`
 over many archives it is paid per archive.
 
-**Measure first:** split the 380 ms into NVML init and enumeration versus the `wait_ready` wait for a first utilization
-sample. The strace showed `libnvidia-ml` open by 22 ms and the device nodes open by 36 ms. The rest is unaccounted for.
+**MEASURED, 2026-09-16** (ctypes probe of the same calls the sampler makes, 8 GPUs, n=3): `nvmlInit_v2` **306–314 ms**,
+`nvmlDeviceGetHandleByIndex` + `GetUUID` × 8 **58–60 ms**, utilization × 8 ~5 ms, memory × 8 ~0.1 ms — 369–379 ms total,
+which is the whole observed cost. **It is NVML initialization, not the wait for a utilization sample**, so ranking "on
+what is instant" (free VRAM) saves nothing: that query needs the same init.
 
-Options, cheapest first:
-1. **Order by what is instant.** Free VRAM from `nvmlDeviceGetMemoryInfo` needs no sampling window. If the wait is for
-   the utilization sample, rank on free VRAM plus a utilization value only when one is already available. NVML's
-   utilization reads 0% on busy devices anyway (see the ranking-policy comment above `GzDevRank`).
-2. **Skip ordering when the gate will decline.** The bringup guard decides "the CPU finishes first" on a background thread
-   after workers start, so it cannot gate a `setenv` that must precede CUDA without racing `getenv`. A cheaper,
-   synchronous size projection in `gzstd_main` could.
-3. **Select devices by UUID after CUDA initializes** (`cudaGetDeviceProperties` UUID mapped to the NVML ranking). This
-   removes the `setenv` constraint and lets the ordering run on the bringup thread, but it is the large change the
-   v0.17.55 note deferred.
+**And the cost is mostly worth paying.** v0.17.37 measured the ranked path 11–15% FASTER at 4 GiB than CUDA's own
+order (8.49–8.55 s against 9.56–10.07), and the small-input gate keeps DEFAULT runs under one GPU batch from starting
+the sampler at all. The waste is narrow: an EXPLICIT backend (`--hybrid`, or `--cpu-share`/`--gpu-batch`/
+`--gpu-streams`, which imply it) on an input under one GPU batch, where hybrid then skips GPU bringup anyway.
+
+Options, now that the split is known:
+1. **Skip only the ordering for an explicit hybrid run under one GPU batch** (never downgrade the backend, which the
+   gate's comments forbid for explicit flags). Needs the gate's size estimate for explicit runs too; `apply_backend_defaults`
+   returns before computing it, and for decompress it preads up to 1 MiB per input, so this is a small cost moved, not
+   removed. Worth it only if explicit `--hybrid` on small inputs is a real usage (`tar -I "gzstd --hybrid"` over many small
+   archives would be).
+2. **Select devices by UUID after CUDA initializes** so the ranking can run on the bringup thread, overlapping cuInit
+   (~950 ms + ~250 ms per device) instead of preceding it. Removes the startup cost for every ranked run; it is the large
+   change v0.17.55's note deferred, and it touches every place a CUDA ordinal is assumed to be the ranked order.
 
 ## SHIPPED v0.17.61: the GPU-only CPU rescue said "all GPUs failed" when one card of eight had
 

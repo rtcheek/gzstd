@@ -1,12 +1,185 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.61  
+**Covers:** v0.9.50 → v0.17.62  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.62 — pre-tag review: a reader that read a different file than `--rm` removed, and a truncated archive at exit 0
+
+**Correctness, found by independent review (Codex, max effort) of everything since the v0.17.43 tag.** Four rounds:
+seven blocking findings, then four blocking groups, then one HIGH, then `SAFE TO TAG` with no changes. Severity fell
+every round, and each round's fixes were built, reproduced where a trigger existed, and fed back for adjudication. Two defects are reproduced
+as CRITICAL, and the rest are fixed by inspection with a regression matrix. Each fix is in `gzstd.cpp`. The new suite
+cells were each seen to fail against a build with only that fix reverted.
+
+### The input was resolved by name again after it had been pinned — CRITICAL, reproduced
+
+`open_input_pinned()` resolves the input name exactly once, and `--rm` removes only that pinned entry (AGENTS.md). But
+several readers then opened `opt.input` BY NAME a second time and read their data from whatever the name held by then:
+
+- the parallel decompress reader (v0.17.47), through `probe_preadable_input()`;
+- both compress `mmap` sites (`MmapRegion::open(path)`);
+- decompress `--direct-read`;
+- `pooled_read_chunks()`, which opened the path itself when handed no descriptor (compress `--direct-read`, CPU and
+  GPU);
+- the cold read-path probe (`fd_d`/`fd_b`, two opens by name compared only with each other) and the GPU compress
+  probe's O_DIRECT pass.
+
+A rename between the pinned open and the reader's open made gzstd read one file while `--rm` removed another.
+**MEASURED on v0.17.61.** 400 runs of `gzstd -d --rm -f cur.zst -o out.bin` while a thread exchanged two archives' names
+with `renameat2(RENAME_EXCHANGE)`: **101 exited 0 having deleted the archive whose content was not the output**. The
+existing `--rm` replacement check caught 193, and 106 happened to be consistent. The same stress on v0.17.62: 0
+deletions of the wrong archive (224 consistent, 176 refused).
+
+Fix: readers that can share the driver's descriptor now borrow it (`probe_preadable_input()` returns `fileno(in)`,
+`MmapRegion::open_fd()` maps it without closing it). Readers that need their own open file description, because
+O_DIRECT cannot be toggled on a shared one, get it from `gz_reopen_input()`: `/proc/self/fd/N` plus a same-inode
+check, never the name. `pooled_read_chunks()` lost its by-name branch entirely. A stack-traced `strace` of every reader
+mode now shows each data read coming from the pinned descriptor or a `/proc/self/fd` reopen. The only remaining name
+lookups are policy estimates (`adapt_path_residency`, size and type probes) and the `--gds-only` preflight's 4 KiB BAR1
+probe, whose bytes are discarded.
+
+### A short read at a frame boundary was accepted as the end of the input — CRITICAL, reproduced
+
+The v0.17.47 parallel reader treated `pread() == 0` before the size it had measured as a normal end, and the comment
+claiming "len<want flags it" was false. If the archive shrinks to a frame boundary during the run, the prefix decodes
+cleanly. **MEASURED on v0.17.61:** a 2048-frame archive truncated to frame 1500's boundary mid-decompress exited 0,
+wrote 1500 MiB of 2048, and printed its normal success line; `--rm` would then remove it. Now: exit 4, `unexpected end
+of input (parallel decompress reader)`, and the incomplete output is removed. `EINTR` is retried.
+
+### Stuck-GPU reclaim (v0.17.53): four defects, found by inspection
+
+- **Delivery and reclaim were not one ownership transaction.** The worker pushed frame *i* and released its
+  zero-copy input *before* taking the registry lock to advance `delivered`. A reclaim scan in that gap copied frame
+  *i* again, possibly from a released block, and re-enqueued a sequence number already delivered. Push, release and
+  advance now happen under the registry lock (`push_to_slot` never blocks on the sink, so the hold is short), and a
+  batch whose delivery is already complete is never reclaimed.
+- **A late CUDA error after reclaim** reached the catch block, which dereferenced per-run objects owned by a
+  `decompress_nvcomp` that may already have returned. `gz_decomp_unpublish()` now reports whether reclaim owns the
+  batch, and both the catch block and exit accounting park before touching anything if it does. The same check stops
+  a reclaimed worker from counting its exit twice, which could skip the last-worker CPU rescue.
+- **Reclaim unregistered the requested `--gpu-streams` count**, not the streams the worker actually registered after a
+  VRAM auto-reduce. That could drive the scheduler's count negative, which fixed-share mode reads as a live GPU forever.
+- **v0.17.61's lost-GPU count used process-global state**, so a multi-file run counted devices retired by earlier files.
+  It now counts from a per-file baseline.
+
+Regression matrix on v0.17.62, 2 GiB of entropy-coded 1 MiB frames, all exit 0 and byte-identical: 8 GPUs with a 60 s
+stall (twice), a 3 s stall, no stall, one pinned card with a 60 s and a 3 s stall, every device failing bringup, and an
+injected fault in the last batch.
+
+### `--sliding-window` wrote a corrupt archive at exit 0 when the input's size moved — CRITICAL, reproduced twice
+
+`--sliding-window` writes one frame whose header declares the input's size, and it tells zstd that size up front
+(`ZSTD_CCtx_setPledgedSrcSize`). zstd's multithreaded mode, which this path always uses, does not check the bytes it is
+then given against that pledge when there are MORE of them. Two ways to reach it:
+
+- **The size was read from the name, not the held input** (`known_input_size()` stat'ed `opt.input`). With the name
+  replaced at `GZSTD_DEBUG_INPUT_GATE` (8 MiB held, 9 MiB replacement) the run exited 0 with an archive declaring
+  9.00 MiB around 8 MiB of data, which no decoder accepts. Found by review (predicted as an end-of-frame failure; it
+  was worse). The size now comes from the held descriptor, as do the summary's compressed size, the same-file check
+  and the `-l` fallback.
+- **The input grew while it was being compressed — no rename needed.** A log file still being written is enough.
+  MEASURED: a 2 GiB file with 1 MiB appended half a second into `--cpu-only -T1 --sliding-window` exited 0 with an
+  archive declaring 2.00 GiB that fails to decode; `--rm` would then have removed the source. A shrink is refused by
+  zstd itself at end of frame ("Src size is incorrect"). Now the path counts what it reads: more than the pledge dies
+  (exit 4) before the extra bytes reach the compressor, and a mismatch after the loop dies too. The growing run now
+  exits 4 and leaves no archive.
+
+### Stuck-GPU reclaim, round 2
+
+- **`--direct-stage` defeated the reclaim.** v0.17.53's reclaimer refused every task without host bytes, but a
+  `--direct-stage` decompress task names a region of the still-open archive that the CPU rescue (v0.17.56) can re-read.
+  `GZSTD_DEBUG_DECOMP_STALL=-1:60 gzstd -d --direct-stage` exited 5, measured; it now reclaims the staged frames by
+  their coordinates and finishes on the CPU, exit 0, byte-identical.
+- **A `--gds-only` write that returned after its batch was reclaimed** could still credit the frame and release its
+  throttle permit while the retry did the same. Every logical side effect of a peer-to-peer write now commits in the same
+  registry transaction as ordinary delivery (inspection; no hook stalls `cuFileWrite`).
+- **Resource failures in the new threads** — a failed allocation or thread creation in the parallel reader, the
+  `--direct-stage` read fan-out and read-ahead, the reclaimer, or the CPU rescue pool — reached `std::terminate`. They
+  now stop and join what started and fail normally, or degrade (a partial rescue pool; read-ahead off; reclaim
+  unavailable, with a warning). By inspection; no rlimit run.
+
+### Smaller fixes
+
+- **An input truncated while it was mapped for compression** raised SIGBUS, which gzstd did not handle, so the run died
+  with a partial archive left under the FINAL output name (measured, 2 of 2). SIGBUS now goes through the same cleanup
+  handler as SIGINT and SIGTERM: the incomplete output is removed and the process still exits by the signal, since the
+  mapped bytes are gone and the run cannot continue.
+- **The `--gds-only` preflight probed the name**, so it could approve or refuse GDS on a replacement file; it now probes
+  the held input. **`-l`'s non-mmap fallback** reopened the name; it now reads the descriptor it already opened.
+- **An explicit `--direct-read` that cannot engage O_DIRECT** on the held input (for example without procfs,
+  `GZSTD_DEBUG_NO_PROCFS=1`) now says so instead of silently reading buffered.
+- **A late `--gds-only -d` GPU failure exited 2 ("bad command-line usage")** for a valid command that had passed
+  preflight. It now exits 5, the GPU-failure code. Measured with `GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1`: 2 before, 5
+  after, no output left either way; 5 of 5 runs. `-t --gds-only` is rescued on the CPU by design and still exits 0.
+- **A data race on `DStageAhead::cap_`:** read-ahead threads read it without the lock `want_frames()` writes it under.
+- **Comments:** the reclaim registry's coverage (it covers only the post-launch interval, not bringup or pre-publication
+  setup), two backend-default comments still describing the retired Gen3 rule, and `EXIT_GPU_FAIL`'s "unused".
+
+### Test
+
+Nine new cells. Each reader cell requires the log line proving its reader engaged, and each fault cell the diagnostic
+proving its fault fired, so a cell that silently took another path fails instead of passing.
+
+- **Always run, no GPU needed (both builds, 3.5 s):**
+  - the parallel decompress reader, decompress `--direct-read`, and compress `mmap` + `--direct-read` must each read
+    the PINNED file when the name is swapped at `GZSTD_DEBUG_INPUT_GATE`;
+  - an archive truncated to a frame boundary at `GZSTD_DEBUG_MT_READER_GATE` must exit 4.
+- **GDS:** a late `--gds-only -d` failure must exit 5.
+- **Always run:** `--sliding-window` must pledge the held file's size when the name is swapped, and must refuse an
+  input that grows or shrinks at `GZSTD_DEBUG_SLIDING_GATE` (exit 4, no archive).
+- **GPU:** a `--direct-stage` batch stalled 60 s must be reclaimed from the held archive (exit 0, byte-identical).
+- **Always run:** an input truncated at `GZSTD_DEBUG_MMAP_GATE` (mapped, no page touched) must die without leaving a
+  partial output (a build without the SIGBUS handler fails it: "exit 135 with a partial output left at the final name").
+
+Each cell was checked against a build with only its own fix reverted, and each such build failed exactly that cell:
+by-name parallel reader ("it decompressed the REPLACEMENT"), by-name mmap, by-name decompress and compress
+`--direct-read`, a short read accepted ("exit 0, want 4"), exit 2 restored, size taken by name, the reclaimer refusing
+staged tasks ("exit 5"), and both sliding-window size checks removed ("grew: exit 0, want 4"; with only the in-loop check
+removed the post-loop check still exits 4). Baselines move to 465 default, 349 CPU-only, 596 extensive, no-GPU delta 116,
+no-GDS delta 11.
+
+**Suites on the final tree:** extensive (GPU build, 8-GPU GDS host) **595 passed, 0 failed, 1 skipped of 596** — the skip is
+the one cell this host cannot exercise — and CPU-only **349 passed, 0 failed, 92 skipped of 441**, "349 ran, as expected on
+this host (baseline 465, −116 no GPU)". That confirms 596, 349 and the no-GPU delta; the no-GDS delta (11) is still
+derived. Both builds are warning-free.
+
+Also from review round 3: the GDS exit-code cell now requires the injected fault's own diagnostic (so another runtime
+failure cannot satisfy it), the size-change cell rejects an empty leftover archive, and a partially-created CPU rescue
+pool no longer rewrites a thread count its running workers read without a lock.
+
+
+### Suite results for v0.17.60–61, and the baselines they confirm
+
+- **Default suite on v0.17.61: 455 passed, 0 failed, 1 skipped, of 456**, on the 8-GPU GDS host. That confirms the 456
+  v0.17.60 derived. The note "expected 456 but 455 ran" is the one cell this host cannot exercise ("trivial skip parks,
+  never retires a GPU": one CPU thread drains its fixture before a GPU takes a trivial batch). All four v0.17.60
+  `cufile.log` cells ran and passed on a GDS host for the first time, and the full suite left no `cufile.log` in the
+  repository or in the cache directory.
+- **CPU-only suite on v0.17.61: 342 passed, 0 failed, 91 skipped, of 433**, "342 ran, as expected on this host (baseline
+  456, −114 no GPU)", which confirms the no-GPU delta of 114. The extensive baseline of 587 is still derived.
+- `AGENTS.md`'s expected counts (439 / 342 / 570, three releases stale) now read 456 / 342 / 587.
+
+### A header comment that claimed the GPU sampler was free
+
+`GpuMonitor`'s header said the sampler is "started at process entry", so its cost "overlaps" startup and "costs
+nothing". v0.17.55 validation measured ~380 ms per ranked run on the 8-GPU host, and a probe of the sampler's own calls
+split it: `nvmlInit_v2` 306–314 ms, handles and UUIDs 58–60 ms, utilization and memory ~5 ms. The sampler is not
+started at process entry. v0.16.8 measured the early start as no better and moved it to the point of use, where
+`order_all_gpus_before_cuda()` waits for the first sweep. The comment now says what the code does and why v0.17.37
+accepted the cost: ranking ran 11–15% faster at 4 GiB, and default runs under one GPU batch never start the sampler.
+The ROADMAP OPEN item on the cost now carries the split and two real options in place of three guesses.
+
+### Measured, not changed: `--gds-only` as the third arm
+
+Cold 12 GiB entropy-coded archive, one H100, arms interleaved. `-t` (n=3): `--direct-stage` 4.49–4.61 s, `--gds-only`
+5.85–5.95 s, buffered `--gpu-only` 6.30–6.56 s. `-d` to a real file with `sync` inside the timing (n=2): buffered
+9.47–9.74 s, `--direct-stage` 10.56–10.92 s, `--gds-only` 11.23–11.40 s. With real output, the ordinary reader still wins
+`-d`. The `/dev/null` figures in v0.17.59 (6.2 against 5.8 s) understated that gap.
 
 ## v0.17.61 — the GPU-only CPU rescue said "all GPUs failed" when one card of eight had
 

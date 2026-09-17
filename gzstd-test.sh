@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=456
-$EXTENSIVE && EXPECTED_TESTS=587
+EXPECTED_TESTS=465
+$EXTENSIVE && EXPECTED_TESTS=596
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -668,8 +668,16 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.60 adds four default-tier cells (cuFile log placement), all skipping without
 # GDS: 452 -> 456, extensive 583 -> 587, the no-GPU delta 110 -> 114 and the no-GDS
 # delta 6 -> 10.  DERIVED until a suite run confirms it.
-EXPECTED_NOGPU_DELTA=114
-EXPECTED_NOGDS_DELTA=10
+# v0.17.62 adds seven always-run cells (pinned input identity x3, held-descriptor
+# sliding-window sizing, a sliding-window input that changes size, a mapped input
+# truncated mid-run, a shrinking input), none of which needs a GPU: 456 -> 463.
+# It also adds one GPU-only cell (a --direct-stage wedged batch is reclaimed from the
+# held archive) and one GDS cell (a late --gds-only -d failure exits 5): 463 -> 465,
+# extensive 587 -> 596, no-GPU delta 114 -> 116, no-GDS delta 10 -> 11.  CONFIRMED on
+# the 8-GPU GDS host: extensive 595/0/1 of 596, CPU-only 349/0/92 ("349 ran, as
+# expected ... -116 no GPU").  The no-GDS delta is still derived.
+EXPECTED_NOGPU_DELTA=116
+EXPECTED_NOGDS_DELTA=11
 
 # ============================================================
 # Banner & system info
@@ -1866,6 +1874,34 @@ CFLPY
   fi
   rm -rf "$cfl"
   # <<< cufile-log cells
+
+  # v0.17.62: a --gds-only -d run whose GPU path fails AFTER preflight has no CPU rescue
+  # (peer-to-peer writes bypass the ordered writer).  That refusal exited 2 -- "bad
+  # command-line usage" -- for a command line that was valid and had passed preflight;
+  # exit 5 is the GPU-failure code (AGENTS.md exit table).  GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST
+  # faults the final batch with frames still undelivered: deterministic, 5 of 5 runs.
+  # -t is deliberately not asserted here: its frames can be re-read, so it IS rescued.
+  gfx="$TMPDIR/gds-latefail"; rm -rf "$gfx"; mkdir -p "$gfx"
+  (
+    set +o pipefail
+    head -c $((48*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576 + 12345)) > "$gfx/src.bin"
+  )
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$gfx/src.bin" -o "$gfx/a.zst" 2>/dev/null
+  gfx_rc=0
+  GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1 timeout --foreground -k 10 120 \
+    "$GZSTD" -d --gds-only -v -f "$gfx/a.zst" -o "$gfx/out.bin" >"$gfx/log" 2>&1 || gfx_rc=$?
+  if ! gds_testable; then
+    skip "--gds-only -d late GPU failure exits 5, not 2" "GDS unavailable ($(gds_host_status))"
+  elif [[ $gfx_rc -ne 5 ]]; then
+    fail "--gds-only -d late GPU failure exits 5, not 2" "exit $gfx_rc"
+  elif ! grep -aFq 'simulated GPU decompress fault (GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST)' "$gfx/log"; then
+    fail "--gds-only -d late GPU failure exits 5, not 2" "the injected late GPU fault did not fire"
+  elif [[ -e "$gfx/out.bin" ]]; then
+    fail "--gds-only -d late GPU failure exits 5, not 2" "an incomplete output was left behind"
+  else
+    pass "--gds-only -d late GPU failure exits 5 (GPU failure), not 2 (usage)"
+  fi
+  rm -rf "$gfx"
 
   t0=$(now_ms)
   tar -I "$GZSTD" -cf "$TMPDIR/gpu-tree.tar.zst" -C "$TMPDIR" tree 2>/dev/null || \
@@ -5879,6 +5915,29 @@ DSDPY
   fi
   rm -f "$dsd_out"
 
+  # 6. Stuck-batch reclaim must preserve staged file coordinates.  v0.17.53's
+  # reclaimer rejected every Task without host bytes, but v0.17.56 taught the CPU
+  # rescue worker to materialise a src_off Task from the held buffered descriptor.
+  # Without the matching reclaimer change this valid --direct-stage command exits 5
+  # at the six-second reclaim deadline instead of finishing on CPU.
+  rc=0
+  timeout --foreground -k 10 45 env GZSTD_DEBUG_DECOMP_STALL=-1:60 \
+    "$GZSTD" -d --direct-stage -v -f "$dsd_zst" -o "$dsd_out" 2>"$dsd_log" || rc=$?
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "--direct-stage wedged batch is reclaimed from the held archive" \
+         "TIMED OUT -- the staged batch was never taken away"
+  elif [[ $rc -ne 0 ]]; then
+    fail "--direct-stage wedged batch is reclaimed from the held archive" "exit $rc"
+  elif ! grep -aqE 'batch wedged .* past its deadline.*reclaiming [0-9]+ frame' "$dsd_log"; then
+    fail "--direct-stage wedged batch is reclaimed from the held archive" \
+         "no reclaim announced"
+  elif files_match "$dsd_src" "$dsd_out"; then
+    pass "--direct-stage wedged batch is reclaimed from the held archive"
+  else
+    fail "--direct-stage wedged batch is reclaimed from the held archive" "output differs"
+  fi
+  rm -f "$dsd_out"
+
   # 7. READ-AHEAD (v0.17.57): -d preads queued frames ahead of the GPU so a batch's
   # reads no longer wait behind the previous batch's download (-d 8.8-9.1 s -> 7.1-7.3 s
   # on 16 GiB cold).  Invisible to byte-identity like the staging itself -- a claim()
@@ -5907,7 +5966,7 @@ DSDPY
   fi
   rm -f "$dsd_out" "$dsd_log.t"
 
-  # 6. No seek table: stand down to the ordinary reader, say so, stage nothing.
+  # 8. No seek table: stand down to the ordinary reader, say so, stage nothing.
   if command -v zstd >/dev/null 2>&1; then
     dsd_parts="$TMPDIR/dstage-parts"; rm -rf "$dsd_parts"; mkdir -p "$dsd_parts"
     split -b 1M -d -a 3 "$dsd_src" "$dsd_parts/p"
@@ -5937,6 +5996,7 @@ else
   skip "--direct-stage -d writes to standard output" "no GPU"
   skip "--direct-stage decompress never loads libcufile" "no GPU"
   skip "--direct-stage read failure is named and recovered" "no GPU"
+  skip "--direct-stage wedged batch is reclaimed from the held archive" "no GPU"
   skip "--direct-stage without a seek table stands down and says so" "no GPU"
   skip "--direct-stage -d reads ahead; -t does not" "no GPU"
 fi
@@ -9280,6 +9340,240 @@ for dash_pos in first second; do
   fi
   rm -rf "$MD"
 done
+
+# ============================================================
+# Readers use the PINNED input; an input that shrinks mid-read fails (always run)
+# ============================================================
+section "Pinned input identity and short reads"
+
+# v0.17.62.  The main per-file driver holds one opened input descriptor
+# (open_input_pinned() also binds --rm to that resolution), yet readers opened
+# opt.input BY NAME again afterwards: the parallel decompress reader (v0.17.47),
+# both compress mmap sites, and every O_DIRECT reader.  A rename between
+# the two opens made gzstd read one file while --rm removed another.  MEASURED before
+# the fix, 400 decompress --rm runs with the input name exchanged in a tight loop: 101
+# exited 0 having DELETED AN ARCHIVE WHOSE CONTENT WAS NOT THE OUTPUT.
+# GZSTD_DEBUG_INPUT_GATE parks gzstd right after pinning, so the swap is a rendezvous
+# and not a race (rm_debug_gate() in gzstd.cpp explains why a FIFO).  Every cell also
+# asserts that the reader it targets ENGAGED; a cell that silently took another reader
+# would pass while testing nothing.
+PIN="$TMPDIR/pin"; rm -rf "$PIN"; mkdir -p "$PIN"
+# pin_swap NAME REPLACEMENT LOG -- gzstd args: park gzstd at the gate, move NAME aside
+# (the pinned inode survives as NAME.pinned) and put REPLACEMENT at NAME, then release.
+pin_swap() {
+  local name=$1 repl=$2 log=$3; shift 4
+  rm -f "$PIN/gate"; mkfifo "$PIN/gate"
+  GZSTD_DEBUG_INPUT_GATE="$PIN/gate" timeout --foreground -k 10 120 "$GZSTD" "$@" >"$log" 2>&1 &
+  local pid=$!
+  PS_GATED=0
+  timeout 60 sh -c 'exec 9>"$1" || exit 1
+                    mv "$2" "$2.pinned" || exit 1
+                    mv "$3" "$2" || exit 1
+                    printf go >&9; exec 9>&-' sh "$PIN/gate" "$PIN/$name" "$PIN/$repl" && PS_GATED=1
+  PS_RC=0; wait "$pid" || PS_RC=$?
+}
+# 140/141 MiB of random bytes stay above 128 MiB compressed: the parallel reader's floor.
+head -c $((140*1048576)) /dev/urandom > "$PIN/A.bin"
+head -c $((141*1048576)) /dev/urandom > "$PIN/B.bin"
+"$GZSTD" -q -f --cpu-only "$PIN/A.bin" -o "$PIN/A.zst" 2>/dev/null
+"$GZSTD" -q -f --cpu-only "$PIN/B.bin" -o "$PIN/B.zst" 2>/dev/null
+
+# 1. The parallel decompress reader.
+cp "$PIN/A.zst" "$PIN/in.zst"; cp "$PIN/B.zst" "$PIN/repl.zst"
+pin_swap in.zst repl.zst "$PIN/d.log" -- -d --cpu-only -v -f "$PIN/in.zst" -o "$PIN/d.out"
+if [[ $PS_GATED -ne 1 ]]; then
+  fail "parallel decompress reader reads the pinned archive" "gzstd never reached GZSTD_DEBUG_INPUT_GATE"
+elif ! grep -aq 'parallel prefetch' "$PIN/d.log"; then
+  fail "parallel decompress reader reads the pinned archive" "the parallel reader did not engage, so this tested nothing"
+elif [[ $PS_RC -ne 0 ]]; then
+  fail "parallel decompress reader reads the pinned archive" "exit $PS_RC"
+elif files_match "$PIN/A.bin" "$PIN/d.out"; then
+  pass "parallel decompress reader reads the pinned archive, not a renamed replacement"
+elif files_match "$PIN/B.bin" "$PIN/d.out"; then
+  fail "parallel decompress reader reads the pinned archive" "it decompressed the REPLACEMENT"
+else
+  fail "parallel decompress reader reads the pinned archive" "output matches neither archive"
+fi
+rm -f "$PIN"/in.zst* "$PIN"/repl.zst "$PIN/d.out"
+
+# 2. Decompress --direct-read (its own O_DIRECT description).
+cp "$PIN/A.zst" "$PIN/in.zst"; cp "$PIN/B.zst" "$PIN/repl.zst"
+pin_swap in.zst repl.zst "$PIN/dd.log" -- -d --cpu-only --direct-read -v -f "$PIN/in.zst" -o "$PIN/dd.out"
+if [[ $PS_GATED -ne 1 ]]; then
+  fail "decompress --direct-read reads the pinned archive" "gzstd never reached GZSTD_DEBUG_INPUT_GATE"
+elif ! grep -aq 'DIRECT-READ\] O_DIRECT input' "$PIN/dd.log"; then
+  skip "decompress --direct-read reads the pinned archive" "O_DIRECT unavailable for $TMPDIR (the reader fell back)"
+elif [[ $PS_RC -eq 0 ]] && files_match "$PIN/A.bin" "$PIN/dd.out"; then
+  pass "decompress --direct-read reads the pinned archive, not a renamed replacement"
+else
+  fail "decompress --direct-read reads the pinned archive" \
+       "exit $PS_RC; output is $(files_match "$PIN/B.bin" "$PIN/dd.out" && echo 'the REPLACEMENT' || echo 'not the pinned archive')"
+fi
+rm -f "$PIN"/in.zst* "$PIN"/repl.zst "$PIN/dd.out"
+
+# 3. Compress: the mmap reader, and --direct-read's O_DIRECT reader.  Small inputs
+#    are enough -- both readers engage at any size.
+head -c $((8*1048576)) /dev/urandom > "$PIN/a8.bin"
+head -c $((9*1048576)) /dev/urandom > "$PIN/b8.bin"
+pc_ok=1; pc_skip=0; pc_why=""
+for pc_arm in mmap direct; do
+  cp "$PIN/a8.bin" "$PIN/in.bin"; cp "$PIN/b8.bin" "$PIN/repl.bin"
+  pc_flags=(--cpu-only -v -f); [[ $pc_arm == direct ]] && pc_flags+=(--direct-read)
+  pin_swap in.bin repl.bin "$PIN/c.log" -- "${pc_flags[@]}" "$PIN/in.bin" -o "$PIN/c.zst"
+  "$GZSTD" -q -d -c "$PIN/c.zst" > "$PIN/c.out" 2>/dev/null
+  if [[ $PS_GATED -ne 1 ]]; then pc_ok=0; pc_why="$pc_arm: never reached the gate"; break; fi
+  if [[ $pc_arm == mmap ]] && ! grep -aq 'MMAP\] using zero-copy reader' "$PIN/c.log"; then
+    pc_ok=0; pc_why="mmap: the mmap reader did not engage, so this tested nothing"; break
+  fi
+  if [[ $pc_arm == direct ]] && ! grep -aq 'DIRECT-READ\] O_DIRECT input' "$PIN/c.log"; then
+    pc_skip=1
+  fi
+  if [[ $PS_RC -ne 0 ]] || ! files_match "$PIN/a8.bin" "$PIN/c.out"; then
+    pc_ok=0
+    pc_why="$pc_arm: exit $PS_RC; archive holds $(files_match "$PIN/b8.bin" "$PIN/c.out" && echo 'the REPLACEMENT' || echo 'neither file')"
+    break
+  fi
+  rm -f "$PIN"/in.bin* "$PIN"/repl.bin "$PIN/c.zst" "$PIN/c.out"
+done
+if [[ $pc_ok -eq 1 && $pc_skip -eq 1 ]]; then
+  skip "compress readers (mmap, O_DIRECT) read the pinned file" \
+       "O_DIRECT unavailable for $TMPDIR (the mmap arm passed; the direct arm did not engage)"
+elif [[ $pc_ok -eq 1 ]]; then
+  pass "compress readers (mmap, O_DIRECT) read the pinned file, not a renamed replacement"
+else
+  fail "compress readers read the pinned file" "$pc_why"
+fi
+rm -f "$PIN"/in.bin* "$PIN"/repl.bin "$PIN/c.zst" "$PIN/c.out"
+
+# 4. A single-frame compressor must pledge the size of the held descriptor, not
+#    a replacement at the input name.  A mismatched pledge makes zstd reject the
+#    valid held input at end-of-frame.
+cp "$PIN/a8.bin" "$PIN/in.bin"; cp "$PIN/b8.bin" "$PIN/repl.bin"
+pin_swap in.bin repl.bin "$PIN/sw.log" -- --cpu-only -T1 --sliding-window -v -f \
+  "$PIN/in.bin" -o "$PIN/sw.zst"
+sw_dec=0
+"$GZSTD" -q -d -c "$PIN/sw.zst" > "$PIN/sw.out" 2>/dev/null || sw_dec=$?
+if [[ $PS_GATED -ne 1 ]]; then
+  fail "sliding-window sizes the held input descriptor" "gzstd never reached GZSTD_DEBUG_INPUT_GATE"
+elif ! grep -aq 'SLIDING-WINDOW' "$PIN/sw.log"; then
+  fail "sliding-window sizes the held input descriptor" "the sliding-window path did not engage"
+elif [[ $PS_RC -eq 0 && $sw_dec -eq 0 ]] && files_match "$PIN/a8.bin" "$PIN/sw.out"; then
+  pass "sliding-window pledges the pinned file's size, not a renamed replacement's"
+else
+  fail "sliding-window sizes the held input descriptor" \
+       "compress exit $PS_RC, decompress exit $sw_dec, or output was not the pinned file"
+fi
+rm -f "$PIN"/in.bin* "$PIN"/repl.bin "$PIN/sw.zst" "$PIN/sw.out" \
+      "$PIN"/a8.bin "$PIN"/b8.bin
+
+# 5a. An input that GROWS or SHRINKS while --sliding-window compresses it.  The frame
+#     header declares the size the input had when it was sized, and zstd's multithreaded
+#     mode does not check the bytes it is then fed against that pledge.  MEASURED before
+#     v0.17.62: a 2 GiB file that grew by 1 MiB mid-run exited 0 with an archive no
+#     decoder accepts ("Data corruption detected").  No rename is involved -- a log file
+#     still being written is enough.  GZSTD_DEBUG_SLIDING_GATE parks the run after the
+#     pledge and before the first read, so the change is a rendezvous, not a race.
+head -c $((12*1048576)) /dev/urandom > "$PIN/sz.bin"
+sz_ok=1; sz_why=""
+for sz_arm in grew shrank; do
+  cp "$PIN/sz.bin" "$PIN/sz_in.bin"; rm -f "$PIN/sz.zst" "$PIN/gate"; mkfifo "$PIN/gate"
+  GZSTD_DEBUG_SLIDING_GATE="$PIN/gate" timeout --foreground -k 10 120 \
+    "$GZSTD" --cpu-only -T1 --sliding-window -f "$PIN/sz_in.bin" -o "$PIN/sz.zst" >"$PIN/sz.log" 2>&1 &
+  sz_pid=$!
+  if [[ $sz_arm == grew ]]; then
+    sz_do='exec 9>"$1" || exit 1; head -c 1048576 /dev/urandom >> "$2" || exit 1; printf go >&9; exec 9>&-'
+  else
+    sz_do='exec 9>"$1" || exit 1; truncate -s 4194304 "$2" || exit 1; printf go >&9; exec 9>&-'
+  fi
+  sz_gated=0; timeout 60 sh -c "$sz_do" sh "$PIN/gate" "$PIN/sz_in.bin" && sz_gated=1
+  sz_rc=0; wait "$sz_pid" || sz_rc=$?
+  if [[ $sz_gated -ne 1 ]]; then sz_ok=0; sz_why="$sz_arm: gzstd never reached GZSTD_DEBUG_SLIDING_GATE"; break; fi
+  # A shrink is refused by zstd itself at end of frame ("Src size is incorrect"); growth
+  # is what zstd's multithreaded mode lets through, so only that arm names gzstd's check.
+  if [[ $sz_rc -ne 4 ]]; then
+    sz_ok=0; sz_why="$sz_arm: exit $sz_rc, want 4"; break
+  fi
+  if [[ $sz_arm == grew ]] && ! grep -aq "grew while it was being compressed" "$PIN/sz.log"; then
+    sz_ok=0; sz_why="grew: exit 4 but not from the size check"; break
+  fi
+  if [[ -e "$PIN/sz.zst" ]]; then sz_ok=0; sz_why="$sz_arm: an archive with the wrong declared size was left behind"; break; fi
+done
+if [[ $sz_ok -eq 1 ]]; then
+  pass "--sliding-window refuses an input that grew or shrank mid-run (exit 4, no archive)"
+else
+  fail "--sliding-window refuses an input that changed size mid-run" "$sz_why"
+fi
+rm -f "$PIN"/sz.bin "$PIN"/sz_in.bin "$PIN"/sz.zst
+
+# 5b. An input truncated while it is MAPPED for compression.  Touching a page past the
+#     new end raises SIGBUS; the run cannot continue (the bytes are gone), but it must
+#     still remove its incomplete output.  Before v0.17.62 gzstd handled SIGINT and
+#     SIGTERM only, so SIGBUS killed it with a partial archive left under the FINAL
+#     output name -- MEASURED, 2 of 2 runs.  GZSTD_DEBUG_MMAP_GATE parks the run after
+#     the mapping and before any page is touched.
+head -c $((64*1048576)) /dev/urandom > "$PIN/mm.bin"
+rm -f "$PIN/mm.zst" "$PIN/gate"; mkfifo "$PIN/gate"
+# The subshell owns the signaled child, so bash's "Bus error" job notice goes to its
+# discarded stderr instead of the suite log; the status is kept in mm.rc.
+( GZSTD_DEBUG_MMAP_GATE="$PIN/gate" timeout --foreground -k 10 120 \
+    "$GZSTD" --cpu-only -T4 --mmap -v -f "$PIN/mm.bin" -o "$PIN/mm.zst" >"$PIN/mm.log" 2>&1
+  echo $? > "$PIN/mm.rc" ) 2>/dev/null &
+mm_pid=$!
+mm_gated=0
+timeout 60 sh -c 'exec 9>"$1" || exit 1; truncate -s 0 "$2" || exit 1; printf go >&9; exec 9>&-' \
+  sh "$PIN/gate" "$PIN/mm.bin" && mm_gated=1
+wait "$mm_pid" 2>/dev/null
+mm_rc=$(cat "$PIN/mm.rc" 2>/dev/null || echo missing)
+if [[ $mm_gated -ne 1 ]]; then
+  fail "a mapped input truncated mid-run leaves no partial output" "gzstd never reached GZSTD_DEBUG_MMAP_GATE"
+elif ! grep -aq 'MMAP\] using zero-copy reader' "$PIN/mm.log"; then
+  fail "a mapped input truncated mid-run leaves no partial output" "the mmap reader did not engage, so this tested nothing"
+elif [[ "$mm_rc" == 0 || "$mm_rc" == missing ]]; then
+  fail "a mapped input truncated mid-run leaves no partial output" "exit 0 for an input that vanished under the mapping"
+elif [[ -e "$PIN/mm.zst" ]]; then
+  fail "a mapped input truncated mid-run leaves no partial output" "exit $mm_rc with a partial output left at the final name"
+else
+  pass "a mapped input truncated mid-run leaves no partial output" "(exit $mm_rc)"
+fi
+rm -f "$PIN"/mm.bin "$PIN"/mm.zst "$PIN"/mm.rc
+
+# 5. An archive that SHRINKS under the parallel reader, to an exact frame boundary.
+#    Before v0.17.62 a pread that hit the new end was taken as the end of the input:
+#    the prefix ended on a frame boundary, so it decoded cleanly and exited 0 --
+#    MEASURED, 1500 of 2048 frames written at exit 0, and --rm then removes the archive.
+#    GZSTD_DEBUG_MT_READER_GATE parks the reader after it has taken the size.
+cp "$PIN/A.zst" "$PIN/sh.zst"
+sh_cut=$(python3 - "$PIN/sh.zst" <<'PINPY'
+import os, struct, sys
+p = sys.argv[1]; n = os.path.getsize(p)
+with open(p, 'rb') as f:
+    f.seek(n - 9); frames, desc, magic = struct.unpack('<IBI', f.read(9))
+    if magic != 0x8F92EAB1 or frames < 4: print(-1); sys.exit()
+    esz = 12 if desc & 0x80 else 8
+    f.seek(n - 9 - frames * esz); tab = f.read(frames * esz)
+print(sum(struct.unpack_from('<I', tab, i * esz)[0] for i in range(frames // 2)))
+PINPY
+)
+if [[ -z "$sh_cut" || "$sh_cut" -le 0 ]]; then
+  fail "an archive that shrinks under the parallel reader fails" "fixture has no usable seek table"
+else
+  rm -f "$PIN/gate"; mkfifo "$PIN/gate"
+  GZSTD_DEBUG_MT_READER_GATE="$PIN/gate" timeout --foreground -k 10 120 \
+    "$GZSTD" -d --cpu-only -v -f "$PIN/sh.zst" -o "$PIN/sh.out" >"$PIN/sh.log" 2>&1 &
+  sh_pid=$!
+  sh_gated=0
+  timeout 60 sh -c 'exec 9>"$1" || exit 1; truncate -s "$3" "$2" || exit 1; printf go >&9; exec 9>&-' \
+    sh "$PIN/gate" "$PIN/sh.zst" "$sh_cut" && sh_gated=1
+  sh_rc=0; wait "$sh_pid" || sh_rc=$?
+  if [[ $sh_gated -ne 1 ]]; then
+    fail "an archive that shrinks under the parallel reader fails" "gzstd never reached GZSTD_DEBUG_MT_READER_GATE"
+  elif [[ $sh_rc -eq 4 ]] && grep -aq 'unexpected end of input' "$PIN/sh.log"; then
+    pass "an archive that shrinks under the parallel reader fails (exit 4), not a clean prefix"
+  else
+    fail "an archive that shrinks under the parallel reader fails" "exit $sh_rc, want 4 with 'unexpected end of input'"
+  fi
+fi
+rm -rf "$PIN"
 
 # ============================================================
 # Terminal-output guard (refuse compressed data to a TTY)
