@@ -1,12 +1,60 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.60  
+**Covers:** v0.9.50 → v0.17.61  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.61 — the GPU-only CPU rescue said "all GPUs failed" when one card of eight had
+
+**Diagnostic output, plus server validation of v0.17.53–55.** Since v0.17.15, the `--gpu-only` decompress rescue starts
+when the last GPU worker *exits* with frames still queued. An exit is not a failure, but the warning still said "all GPUs
+failed". On the 8-GPU server, v0.17.53's stuck-batch reclaim retired one card while the other seven finished their work,
+and the run printed:
+
+    WARNING: all GPUs failed; finishing decompression on CPU (96 threads).
+      Falling back for data safety: ... just without GPU acceleration.
+
+Both decompress call sites (the last worker's exit, and the reclaimer's accounting for an abandoned worker) now pass
+the number of GPUs actually lost: failures, plus devices retired by the reclaim. The warning names that number:
+
+    WARNING: 1 of 8 GPUs was lost (failed or retired) and the other 7 finished their work, with frames still queued; finishing those on CPU (96 threads).
+      The output is complete and correct.
+
+When every GPU was lost (one pinned card retired, every device failing at startup, or compress, whose rescue only fires
+once all have failed) the old wording stays, because it is accurate there. Seen on the server, all exit 0 and
+byte-identical: 8 GPUs with one stalled 60 s printed the new line when the rescue ran (1 of 4 runs; in the other 3 a
+still-running card took the reclaimed frames and no rescue was needed); one pinned card stalled, and all 8 failing
+bringup (`GZSTD_DEBUG_FAIL_BRINGUP_ALLOC=-1`), both printed the old one. No suite cell: whether the rescue fires with
+several cards depends on timing, and the suite's reclaim cells pin one card, where the old wording is the right one.
+
+### Server validation of v0.17.53–55 (8× H100, PCIe Gen5)
+
+- **v0.17.53 stuck-batch reclaim, first run on more than 2 GPUs.** 2 GiB of entropy-coded 1 MiB frames, `--gpu-only`
+  on all 8 cards. A 60 s stall had its 16 frames reclaimed at 6 s, and the run finished in 9.3–9.5 s (n=2) instead of
+  60+. The 7 healthy cards decoded everything else. A 3 s stall only paused intake (6.1 s), and an unstalled run stayed
+  quiet (3.4 s). Every run was byte-identical.
+- **v0.17.55 teardown.** A one-frame decompress takes 19–22 ms, and compress 15–19 ms, with the progress bar on or off (n=10). The
+  200 ms grid is gone. **Found:** an explicit `--hybrid` takes ~400 ms here. That is GPU ordering before CUDA
+  (408 ms against 24.5 ms with `CUDA_VISIBLE_DEVICES` set, n=8), about 60 ms on the 2-GPU workstation. The default
+  backend is unaffected (16–21 ms), because small inputs go CPU-only first. Recorded as a ROADMAP OPEN item.
+- **v0.17.54 decompress tail yield.** Against a v0.17.53 build, 48 GiB warm, `--hybrid -T8`, n=6: v0.17.53
+  4.84/6.58/6.65/6.74/6.75/6.77 s, v0.17.60 4.99/5.42/5.45/5.59/6.48/6.56, and `--cpu-only` 5.12–5.15. GPU bringup
+  timing adds ±0.5 s of noise. The yield does fire here. With the GPUs 4–8× faster than the CPU (`-T2`), it still
+  yields at 49–254 frames queued, and the 8 cards park for 0.16–1.0 s. A prototype that capped the GPU term at the frames
+  remaining was measured with an in-binary switch, in two independent batches, and **changed nothing measurable**.
+  Pooled over the two batches, `-T2` medians were 6.00 s (current) and 5.81 s (capped), n=22 each, rank z=+1.60,
+  inside the ~0.2 s noise band. `-T8` medians were 5.04 and 5.05, n=20, z=−0.03. The first batch's "smaller worst
+  case" did not replicate. The rule is unchanged and the prototype removed. Turning the yield off entirely brought back
+  the slow tail at `-T8` (3 of 8 runs at 6.45–6.62 s, against 1 of 8 with it on), so the yield itself is worth keeping
+  on this hardware.
+
+### Test
+
+Both builds are warning-free. Suites not yet run.
 
 ## v0.17.60 — `--gds-only` stops leaving an empty `cufile.log` wherever it runs
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.60";
+static constexpr const char * GZSTD_VERSION = "0.17.61";
 //
 // Architecture overview:
 //
@@ -14586,7 +14586,15 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
                                   // this is a caller that has not decided whether
                                   // its pipeline has a writer, and that decision
                                   // is exactly what went wrong in v0.17.22.
-                                  bool discard_results)
+                                  bool discard_results,
+                                  // How many of the GPU workers were LOST (failed,
+                                  // or retired by the stuck-batch reclaim) out of
+                                  // how many there were.  The rescue fires on the
+                                  // last worker's EXIT (v0.17.15), and an exit is
+                                  // not a failure: v0.17.53's reclaim retired one
+                                  // card of eight while the other seven finished
+                                  // their work, and this said "all GPUs failed".
+                                  int gpus_lost, int gpus_total)
 {
   // THERE IS NO CPU FALLBACK FOR A --gds-only RUN, in either direction, and
   // pretending otherwise is how a host-configuration problem turned into
@@ -14633,7 +14641,7 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
          std::string("WARNING: GPU fault — draining the pipeline on CPU (")
          + std::to_string(threads) + " threads); this partial output will be "
          "discarded and the whole archive rebuilt.\n");
-  } else {
+  } else if (gpus_lost >= gpus_total) {
     vlog(V_DEFAULT, opt,
          std::string("WARNING: all GPUs failed; finishing ")
          + (decompress ? "decompression" : "compression") + " on CPU ("
@@ -14641,6 +14649,18 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
          "  Falling back for data safety: the remaining frames are processed "
          "on the CPU instead,\n  so the output is complete and correct — just "
          "without GPU acceleration.\n");
+  } else {
+    const int done = gpus_total - gpus_lost;
+    const std::string what = gpus_lost == 0
+        ? "every GPU worker has exited"
+        : std::to_string(gpus_lost) + " of " + std::to_string(gpus_total) + " GPUs "
+          + (gpus_lost == 1 ? "was" : "were") + " lost (failed or retired) and "
+          + (done == 1 ? std::string("the other one finished its work")
+                       : "the other " + std::to_string(done) + " finished their work");
+    vlog(V_DEFAULT, opt,
+         "WARNING: " + what + ", with frames still queued; finishing those on CPU ("
+         + std::to_string(threads) + " threads).\n"
+         "  The output is complete and correct.\n");
   }
   CpuAgg agg{};
   agg.threads = threads;
@@ -25240,7 +25260,8 @@ static void gpu_worker(
             // and this pipeline always has a writer.  Stated explicitly rather
             // than defaulted.
             gpu_only_cpu_fallback(false, queue, results, opt, m, bp,
-                                  /*discard_results=*/false);
+                                  /*discard_results=*/false,
+                                  /*gpus_lost=*/fails, /*gpus_total=*/gpu_worker_count);
           return;
         }
         // At least one stream is usable — shrink ctxs and continue.
@@ -28436,7 +28457,11 @@ static void gpu_decomp_worker(
     if (out != gpu_worker_count) return;    // not the last worker out
     if (!opt.gpu_only || !queue) return;    // hybrid still has CPU consumers
     if (queue->drained()) return;           // empty AND producer done: nothing owed
-    gpu_only_cpu_fallback(true, queue, results, opt, m, bp, discard_results);
+    const int lost = std::min(gpu_worker_count,
+        (gpu_failures ? gpu_failures->load(std::memory_order_acquire) : 0)
+        + __builtin_popcountll(g_decomp_abandoned.load(std::memory_order_relaxed)));
+    gpu_only_cpu_fallback(true, queue, results, opt, m, bp, discard_results,
+                          lost, gpu_worker_count);
   };
   // Reclaim plumbing (see GzDecompInflight).  A device beyond ADAPT_DL_MAX slots
   // is simply unprotected -- no registry entry, no checks, today's behaviour.
@@ -32343,7 +32368,11 @@ gds_out_declined:
         { std::lock_guard<std::mutex> lk(g_decomp_exit_mx); }
         g_decomp_exit_cv.notify_all();
         if (total > 0 && out == total && opt.gpu_only && !queue.drained())
-          gpu_only_cpu_fallback(true, &queue, &results, opt, m, bp_ptr, discard_results);
+          gpu_only_cpu_fallback(true, &queue, &results, opt, m, bp_ptr, discard_results,
+              std::min(total, gpu_failures.load(std::memory_order_acquire)
+                              + __builtin_popcountll(g_decomp_abandoned.load(
+                                    std::memory_order_relaxed))),
+              total);
       }
     }
   });
