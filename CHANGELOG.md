@@ -1,12 +1,114 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.62  
+**Covers:** v0.9.50 → v0.17.63  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.63 — a default compress ranked eight GPUs, then used none of them
+
+**Startup latency, found in the ROADMAP OPEN item v0.17.61 recorded.** Before the first CUDA call,
+`order_all_gpus_before_cuda()` ranked every GPU through NVML and exported the order as `CUDA_VISIBLE_DEVICES`. It had to
+run on the main thread before any work began, because CUDA reads that variable once, when it initializes. That item
+first called the waste narrow: an explicit `--hybrid` on an input under one GPU batch. **It is not.** On the 8-GPU
+server, an ordinary `gzstd file` (no flags) resolves to hybrid, ranks all eight cards, and only then does its bringup
+sample find that the 96-thread CPU pool will finish first and log `skipping GPU bringup`. Every mid-size compress on a
+many-GPU host paid for GPUs it never touched.
+
+**MEASURED, where the time goes:** `nvmlInit_v2` 306–324 ms of ~375 ms. With the ranking skipped, a default 512 MiB
+compress took 0.224 s against 0.617 s ranked (n=4). **And NVML and CUDA initialization serialize in the driver:**
+`cuInit` alone took 788–794 ms and `nvmlInit_v2` alone 311–324 ms. Started together on two threads, `cuInit` stretched
+to 1100–1102 ms, and the pair took the same wall as running them one after the other (1101–1104 against 1088–1090 ms,
+n=3). So a run that brings GPUs up loses nothing by ranking after CUDA, and a run that does not can skip it entirely.
+
+**Fix.** For the all-devices case (`--gpu-devices` unset), `order_all_gpus_before_cuda()` now only records that the
+ranking was deferred (`g_rank_all_after_cuda`). `select_best_gpus()` does the ranking once bringup has decided to use
+the GPUs. It runs after `cudaGetDeviceCount`: on the background bringup thread for deferred detection, inline for
+synchronous bringup, and for `--tar` extraction either up front on the extraction thread (`GZSTD_POOL_GPU`) or on the
+decode-pool controller (`--adapt`'s lazy engagement). Deferred hybrid bringup overlaps it with the reader and CPU
+workers. `rank_all_cuda_devices()` starts the sampler and waits up to 500 ms for its first
+sweep, the same bound as before. It then matches each CUDA ordinal to its NVML row by PCI address and UUID, and
+reorders the ordinals the workers receive. There is no `setenv`, so nothing races a `getenv` on a live thread.
+Ordering only, never counting: an unready sampler, an incomplete table or a failed lookup keeps CUDA's own order and
+never hides a device. The `--tar` decode pool's GPU workers used ordinals `0..N-1` directly and now take the same
+ranked list. At `-v` the ranking line names the top-ranked card and prints the full order.
+
+**Review fix.** Deferred ranking made the process-global sampler reachable from background threads, including while
+another thread calls the fatal-error path (`std::exit`). Static destruction could therefore destroy the monitor object
+while a bringup thread was inside `wait_ready()` or entering `snapshot()`. The monitor object now has process lifetime;
+an automatic guard stops it on normal return and exception unwinding, while fatal exit and `_Exit` deliberately leave
+it alive for the operating system to reclaim. This preserves the sampler's bounded normal teardown without allowing
+`std::exit` to invalidate an object a live thread is using.
+
+The same review found a stale worker-slot record that per-file re-ranking would have made misleading: the `-vvv`
+phase counters and their final transition timestamp are process-global and were never reset, so a later file assigned
+to the same worker slot included the earlier file's counters and charged the gap since that worker ended to `Exiting`
+— and, once ordinals can be permuted, could put that stale total under a different card's name. Each GPU worker now
+clears its slot before recording its lifetime. **MEASURED**, three 400 MB files in one invocation at `--gpu-only
+--gpu-devices=1 -vvv`, where no deferred ranking runs at all: v0.17.62 reported 0.22 s, 0.59 s, 0.97 s for the same
+worker, and v0.17.63 reports 0.21 s, 0.33 s, 0.33 s. The stale accounting therefore predates this version; a changed
+permutation would also have added the wrong card's name. Diagnostics only: no compression path, output byte or exit
+status reads those counters.
+
+**Unchanged:**
+- **A user-set `CUDA_VISIBLE_DEVICES`** is honoured as given, with no ranking.
+- **`--gpu-devices N`** still ranks before CUDA and exposes only the N winners. Restricting visibility saves far more
+  CUDA initialization than the ranking costs (1 visible device 1.35 s against 8 visible 3.39 s).
+- **GPU `--verify`** still ranks eagerly (`order_all_gpus_before_cuda(opt, /*eager=*/true)`). Its kernel-capability
+  probe inside `apply_backend_defaults()` is the first CUDA call on that path and freezes the device order. The
+  deferred call then finds the variable set and does nothing.
+
+**MEASURED, v0.17.62 against v0.17.63, 8× H100, interleaved, n=5, median (min–max):**
+
+| Run | v0.17.62 | v0.17.63 |
+|---|---|---|
+| default compress, 512 MiB (GPU bringup skipped) | 0.608 s (0.457–0.699) | 0.241 s (0.220–0.362) |
+| default compress, 2 GiB (GPU bringup skipped) | 1.143 s (0.888–1.296) | 0.673 s (0.644–0.756) |
+| `-d --gpu-only`, 2 GiB entropy-coded | 4.319 s (3.988–6.340) | 4.309 s (3.767–4.609) |
+| `-d --hybrid -T8`, 36 GiB entropy-coded, warm | 5.049 s (4.745–5.557) | 5.148 s (4.946–6.208) |
+
+The case the OPEN item was first measured on is fixed as well. A one-frame (1 MiB) explicit `--hybrid` decompress to
+stdout took 410.9 ms (403.8–412.6) on v0.17.62 and 23.8 ms (23.5–25.2) on v0.17.63, against 21.4/20.7 ms for the
+default backend (n=8, interleaved). The runs that skip the GPU save 0.37–0.47 s. The two GPU runs differ by less than their own spread. The ranking chose
+the same card v0.17.62 exported first: the idle card with the most free VRAM. CUDA's unranked ordinal 0 is the one card
+on this host that another tenant was using.
+
+**Regression checks, all exit 0 and byte-identical against the input:**
+- **User `CUDA_VISIBLE_DEVICES`** (two UUIDs): no ranking line.
+- **`--gpu-devices=2`:** the two freest cards selected by UUID, as before.
+- **`--verify --verify-engine gpu`:** the eager ranking ran, and the deferred one did not.
+- **Stuck-batch reclaim with the device list actually permuted.** Before this change every all-device run handed the
+  workers `[0..N)`, so worker slot and CUDA ordinal were always equal. The reclaim registry, the join-or-detach step and
+  the stall hook key on the ordinal, and none of them had ever run with the two differing. With one card loaded by a
+  separate process, the ranked order was `1 2 3 4 5 6 7 0`. Stalling device 2 (worker slot 1) for 60 s while
+  decompressing two files in one invocation: reclaimed at 6.1 s, the stuck worker detached, and the second file logged
+  `skipping 1 device(s) retired by an earlier reclaim`. Exit 0, both outputs byte-identical.
+- **`--tar` extract with the GPU decode pool forced** (`GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1`, `-T2`, 8 GiB
+  entropy-coded, cold): 288 frames GPU-decoded on the ranked ordinals, 0 rescued, tree identical. v0.17.62 decoded 292.
+  Cold and warm runs on both versions resolved the same backends (cold hybrid, warm cpu-only).
+
+### Test
+
+Both builds are warning-free, including the review fixes. The regression checks above were re-run against the final
+binary, and 20 of 20 `--hybrid` runs on a truncated archive exited 4. Those runs are a stability check of the fatal
+path; the exact fatal-exit/bringup overlap was accepted by inspection rather than forced.
+
+**No existing cell could reach this code:** the suite exports `CUDA_VISIBLE_DEVICES` (one card by default, a two-card
+mask in the multi-GPU cell), and any value there keeps the pre-CUDA path. Two new cells therefore clear the mask for
+their own runs, which is also why they need more than one device. The first requires the ranking line to account for
+every device CUDA reported, each exactly once, and a byte-identical round-trip; the second sets a two-card mask and
+requires the ranking to stay silent. Both skip when fewer than two cards have free VRAM, as the multi-GPU cell does.
+A build with only the deferral reverted fails the first cell ("no 'ranked after CUDA startup' line at -v with no
+device mask") and passes the other 465.
+
+Suites on the 8-GPU host, before the new cells: default 464 passed, 0 failed, 1 skipped of 465 (7m6s; the skip is the
+trivial-park cell this host cannot exercise); CPU-only 349 passed, 0 failed, 92 skipped of 441, "349 ran, as expected
+on this host". With the cells, a `GZSTD_TEST_ALL_GPUS=1` run (no mask, so the ranking is live suite-wide): 466 passed,
+0 failed, 1 skipped of 467 (8m48s), the new cell reporting 8 devices in order 1,2,0,3,4,5,6,7. Baselines: 467 default,
+349 CPU-only, 598 extensive, no-GPU delta 118, no-GDS delta 11.
 
 ## v0.17.62 — pre-tag review: a reader that read a different file than `--rm` removed, and a truncated archive at exit 0
 

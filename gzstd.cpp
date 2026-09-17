@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.62";
+static constexpr const char * GZSTD_VERSION = "0.17.63";
 //
 // Architecture overview:
 //
@@ -378,25 +378,29 @@ static inline nvmlReturn_t nvmlSystemGetDriverVersion(char * buf, unsigned int l
   return rc; }
 
 /*======================================================================
- GpuMonitor — one background NVML sampler, started before GPU ordering
+ GpuMonitor — one background NVML sampler for GPU ordering
 
- WHY A THREAD, AND WHY THIS EARLY.  NVML answers long before CUDA does. Started
- at the same instant, measured on an 8xH100 host:
+ WHY A THREAD.  On the paths that must rank before CUDA, NVML answers long
+ before CUDA does.  Started at the same instant, measured on an 8xH100 host:
 
      NVML full table for all 8 GPUs   0.390 s
      first GPU usable, 1 visible      1.354 s
      first GPU usable, 8 visible      3.391 s
 
- So the ranking is ready roughly a second before there is a GPU to rank for.
+ So on those eager paths the ranking is ready roughly a second before there is
+ a GPU to rank for.  The all-device path deliberately starts it later, from
+ select_best_gpus() after CUDA startup, as described below.
  THAT DOES NOT MAKE IT FREE, and this header used to say it did ("started at
  process entry ... costs nothing").  It is not started at process entry: v0.16.8
  measured the early start as no better than starting at the point of use and
- moved it there, and order_all_gpus_before_cuda() starts it and then WAITS for
- the first sweep.  MEASURED on the 8-GPU host (v0.17.61): nvmlInit_v2 306-314 ms,
- handles + UUIDs 58-60 ms, utilization + memory ~5 ms -- ~375 ms of startup for
- every run that ranks.  v0.17.37 accepted that deliberately: at 4 GiB the ranked
- path ran 11-15% faster than CUDA's own order, and the small-input gate keeps
- default runs under one GPU batch from starting the sampler at all.
+ moved it there.  MEASURED on the 8-GPU host (v0.17.61): nvmlInit_v2 306-314 ms,
+ handles + UUIDs 58-60 ms, utilization + memory ~5 ms -- ~375 ms for every run
+ that ranks.  Until v0.17.62 that was paid on the main thread before any work
+ began, including by hybrid runs that then started no GPU at all.  Since v0.17.63
+ the all-device ranking starts the sampler from select_best_gpus(), after CUDA is
+ up and only when GPUs are actually being brought up (see g_rank_all_after_cuda);
+ the --gpu-devices N subset path and GPU verify still rank before CUDA, where
+ restricting visibility or the probe needs it.
 
  It also fixes a signal problem. A SINGLE utilization read is unreliable —
  nvidia-smi was repeatedly observed reporting 0% while a gzstd job was actively
@@ -610,7 +614,15 @@ private:
   std::thread thr_;
 #endif
 };
-static GpuMonitor g_gpu_monitor;
+// PROCESS-LIFETIME, with an explicit normal-return stop in main.  Ranking can
+// now run on a background bringup thread while a reader/writer thread calls
+// die(), and die() uses std::exit: static destructors run while the other
+// threads are still alive.  A static GpuMonitor could therefore be destroyed
+// between rank_all_cuda_devices()'s wait_ready() and snapshot() calls.  Leaking
+// the object keeps those method calls valid until the process is gone; main's
+// automatic guard below preserves the bounded clean-exit join.  std::exit,
+// signals and the abandoned-worker _Exit intentionally skip that guard.
+static GpuMonitor & g_gpu_monitor = *new GpuMonitor;
  #endif // HAVE_NVML
 
 /*======================================================================
@@ -17418,6 +17430,12 @@ static void checkCuda(cudaError_t st, const char * msg);
 static void checkNvcomp(nvcompStatus_t st, const char * msg);
 #endif
 
+#ifdef HAVE_NVCOMP
+// Defined with the GPU drivers far below; the --tar decode pool ranks its devices
+// through it too, so the all-device ranking has one implementation.
+static std::vector<int> select_best_gpus(int total_devices, int want, const Options & opt);
+#endif
+
 namespace tarx {
 
 static constexpr size_t TAR_BLK    = 512;
@@ -20154,7 +20172,8 @@ public:
           vlog(V_VERBOSE, dopt, b);
         }
         gpu_dworkers.reserve(gpu_dworkers.size() + (size_t)ndev);
-        for (int d = 0; d < ndev; ++d) {
+        const std::vector<int> pool_ids = select_best_gpus(dc, ndev, dopt);
+        for (int d : pool_ids) {
           gpu_dworkers.emplace_back([&, dev = d] {
             PoolGpuDecoder gd;
             if (!gd.init(dev, gpu_batch, g_csz, g_usz)) {
@@ -24647,6 +24666,23 @@ struct PhaseAcct {
 };
 static PhaseAcct        g_phase[PHASE_MAX_WORKERS];
 
+// Worker slots are rebuilt for every input file, and v0.17.63 permits a later
+// file to assign a different CUDA ordinal to the same slot.  The counters and
+// final transition timestamp are process-global, so begin each worker lifetime
+// from an empty record; otherwise a multi-file -vvv run includes the previous
+// lifetime, charges the gap between workers to Exiting, and can report both
+// under the new device's name.
+static inline void phase_reset(int w) {
+  if (w < 0 || w >= PHASE_MAX_WORKERS) return;
+  PhaseAcct & a = g_phase[w];
+  for (int p = 0; p < PHASE_COUNT; ++p) {
+    a.ns[p].store(0, std::memory_order_relaxed);
+    a.hits[p].store(0, std::memory_order_relaxed);
+  }
+  a.cur.store((int)WatchPhase::Idle, std::memory_order_relaxed);
+  a.since.store(0, std::memory_order_relaxed);
+}
+
 static inline void phase_acct(int w, int p){
   if (w < 0 || w >= PHASE_MAX_WORKERS) return;
   PhaseAcct & a = g_phase[w];
@@ -25217,6 +25253,7 @@ static void gpu_worker(
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   void * vram_reserve = nullptr;
   size_t vram_reserve_bytes = 0;
+  if (g_phase_on.load(std::memory_order_relaxed)) phase_reset(slot_index);
 
   // ---- Event-driven completion state (ROADMAP 1.10) ----
   // Declared before the try so the catch block can retire the drain thread
@@ -26818,6 +26855,85 @@ static void warm_gpu_contexts(const std::vector<int> & ids)
 // rank all devices via NVML (no CUDA contexts needed), then only call
 // cudaSetDevice on the winners.  This avoids creating throwaway CUDA
 // contexts on devices we won't use (~200ms each).
+// RANK THE FULL DEVICE SET AFTER CUDA, NOT BEFORE IT (v0.17.63).
+//
+// Up to v0.17.62, order_all_gpus_before_cuda() ranked every GPU on the MAIN thread
+// before any work started -- NVML init plus a first utilization sweep -- because
+// CUDA_VISIBLE_DEVICES must be set before CUDA initializes.  MEASURED on the 8-GPU
+// host: that is ~375 ms (nvmlInit_v2 306-314 ms), and a default 512 MiB compress
+// took 0.617 s ranked against 0.224 s unranked: the hybrid run ranked eight GPUs,
+// then its bringup sample decided the 96-thread CPU pool would finish first and
+// started none of them.  Every stage of the pipeline waited for that ranking.
+//
+// Ranking HERE instead -- on whichever thread brings the GPUs up, after
+// cudaGetDeviceCount, and only once bringup has decided to use them -- removes the
+// cost from every run that never starts a GPU.  It costs a GPU run nothing
+// measurable: NVML and CUDA initialization serialize in the driver (cuInit alone
+// ~790 ms; started together with nvmlInit_v2 on two threads it stretched to
+// ~1100 ms, the same wall as running them back to back).  Deferred hybrid paths
+// overlap it with reader/CPU work; synchronous paths pay it only after GPU
+// bringup is certain.  No setenv is involved, so nothing races a getenv on a
+// live thread: devices are named by the CUDA ordinals the caller already has,
+// reordered.
+//
+// ORDER ONLY, NEVER COUNT: every mismatch -- the sampler not ready, a table that
+// does not cover every device, a PCI or UUID lookup that fails -- keeps CUDA's own
+// order rather than hiding a device.
+//
+// Set by order_all_gpus_before_cuda() when it DEFERRED the ranking, so this path
+// never re-ranks a set the user (or the eager --verify path) already ordered with
+// CUDA_VISIBLE_DEVICES.
+static std::atomic<bool> g_rank_all_after_cuda{false};
+
+#ifdef HAVE_NVML
+static void rank_all_cuda_devices(std::vector<int> & ids, const Options & opt)
+{
+  if (ids.size() <= 1 || !g_rank_all_after_cuda.load(std::memory_order_relaxed)) return;
+  try {
+    g_gpu_monitor.start();
+  } catch (const std::system_error &) {
+    return;                                    // no sampler: CUDA's own order
+  }
+  if (!g_gpu_monitor.wait_ready(500)) return;
+  const auto rows = g_gpu_monitor.snapshot();
+  if (rows.size() < ids.size() || rows.size() != g_gpu_monitor.device_count()) return;
+  std::vector<GzDevRank> rin;
+  rin.reserve(ids.size());
+  for (int d : ids) {
+    // NVML and CUDA do not share an index space (see gz_nvml_handle_for_cuda):
+    // correlate by PCI address, then by the UUID the sampler keyed its rows on.
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) return;
+    char pci[32];
+    std::snprintf(pci, sizeof(pci), "%08x:%02x:%02x.0",
+                  prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+    nvmlDevice_t h{};
+    if (nvmlDeviceGetHandleByPciBusId_v2(pci, &h) != NVML_SUCCESS) return;
+    char uu[96] = {0};
+    if (nvmlDeviceGetUUID(h, uu, sizeof(uu)) != NVML_SUCCESS || !uu[0]) return;
+    const GpuMonitor::Row * row = nullptr;
+    for (const auto & r : rows) if (r.uuid == uu) { row = &r; break; }
+    if (!row) return;
+    rin.push_back({row->util, row->free_bytes});
+  }
+  const std::vector<size_t> order = gz_rank_devices(rin);
+  if (order.size() != ids.size()) return;
+  std::vector<int> ranked;
+  ranked.reserve(ids.size());
+  for (size_t o : order) ranked.push_back(ids[o]);
+  ids.swap(ranked);
+  if (opt.verbosity >= V_VERBOSE) {
+    std::ostringstream os;
+    os << "[GPU] all " << ids.size() << " devices ranked after CUDA startup by combined "
+          "rank (utilization + free VRAM); the top-ranked card is CUDA GPU"
+       << ids.front() << " and is first in the returned worker order (order";
+    for (int d : ids) os << ' ' << d;
+    os << ")\n";
+    vlog(V_VERBOSE, opt, os.str());
+  }
+}
+#endif
+
 static std::vector<int> select_best_gpus(int total_devices, int want,
                                           const Options & opt)
 {
@@ -26830,18 +26946,20 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
 
   want = std::min(want, total_devices);
 
-  // Using every device — there is nothing to rank, so skip the probe.
-  // The all-devices CUDA fallback below calls cudaSetDevice + cudaMemGetInfo
-  // per device, which forces serial CUDA context creation on the main
-  // thread (~0.6-1s per datacenter GPU → ~5s for 8 of them) BEFORE the
-  // reader, progress meter, and worker pool start.  Returning the trivial
-  // [0..N) list lets the GPU worker threads create their contexts in
-  // parallel at startup instead, overlapping with the reader and (in
-  // hybrid) the CPU pool.  v0.13.11.
+  // Using every device: keep the full count and rank only its ORDER.  Do not
+  // use the CUDA fallback below: its cudaSetDevice + cudaMemGetInfo per device
+  // forces serial CUDA context creation on the caller (~0.6-1s per datacenter
+  // GPU → ~5s for 8 of them).  Building [0..N) and permuting it from the NVML
+  // sample lets the GPU worker threads create their contexts in parallel,
+  // overlapping with the reader and (in hybrid) the CPU pool.  v0.13.11;
+  // order-only ranking moved here in v0.17.63.
   if (want >= total_devices) {
     std::vector<int> result;
     result.reserve(total_devices);
     for (int d = 0; d < total_devices; ++d) result.push_back(d);
+#ifdef HAVE_NVML
+    rank_all_cuda_devices(result, opt);   // after CUDA, no contexts -- see above
+#endif
     return result;
   }
 
@@ -34828,13 +34946,14 @@ static int run_calibrate(Options opt)
 #endif  // !_WIN32
 
 #ifdef HAVE_NVCOMP
-// Put every GPU in CUDA's visible set, but order that set by the NVML ranking.
-// This must run before the first CUDA API call: CUDA reads and freezes
-// CUDA_VISIBLE_DEVICES during initialization.  It is normally called after
-// apply_backend_defaults(), when the backend is final.  GPU verify is the one
-// exception because its capability probe lives inside that function; that path
-// calls this helper immediately before the probe and the later call is a no-op.
-static void order_all_gpus_before_cuda(const Options & opt)
+// Order the all-device set by the NVML ranking.  By default this only DEFERS the
+// ranking to select_best_gpus(), after CUDA is up and bringup has decided to use the
+// GPUs (see g_rank_all_after_cuda for why and what it measured).  EAGER is the old
+// behaviour -- rank now and set CUDA_VISIBLE_DEVICES before the first CUDA call --
+// and remains only for GPU verify, whose capability probe inside
+// apply_backend_defaults() is itself the first CUDA call on its path; the later
+// deferred call is then a no-op because the variable is set.
+static void order_all_gpus_before_cuda(const Options & opt, bool eager = false)
 {
 #ifdef HAVE_NVML
   // Calibration runs both GPU passes even when a backend flag was also given;
@@ -34842,6 +34961,10 @@ static void order_all_gpus_before_cuda(const Options & opt)
   if (opt.gpu_devices != 0 || (!opt.calibrate && (opt.cpu_only || opt.list_mode))
       || ::getenv("CUDA_VISIBLE_DEVICES"))
     return;
+  if (!eager) {
+    g_rank_all_after_cuda.store(true, std::memory_order_relaxed);
+    return;
+  }
 
   try {
     g_gpu_monitor.start();
@@ -36789,6 +36912,15 @@ int main(int argc, char ** argv)
 #ifdef HAVE_NVCOMP
   GzGdsDriverGuard gds_guard;
 #endif
+#if defined(HAVE_NVCOMP) && defined(HAVE_NVML)
+  // Automatic on purpose: a normal return/exception stops and joins the sampler
+  // within its 500 ms bound.  die() is std::exit and skips automatic objects;
+  // there the process-lifetime monitor above must remain valid for any ranking
+  // call still running on a bringup thread.
+  struct GzGpuMonitorGuard {
+    ~GzGpuMonitorGuard() { g_gpu_monitor.stop(); }
+  } gpu_monitor_guard;
+#endif
   try {
 #ifdef HAVE_NVCOMP
     // Hidden hook: verify the --gds-only content-checksum kernel against the CPU
@@ -37366,7 +37498,7 @@ static void apply_backend_defaults(Options & opt)
     // order at initialization.  In the common homogeneous-GPU box that device is
     // representative, and the embedded PTX makes the answer identical across
     // same-or-newer cards.
-    if (opt.gpu_verify) order_all_gpus_before_cuda(opt);
+    if (opt.gpu_verify) order_all_gpus_before_cuda(opt, /*eager=*/true);
     if (opt.gpu_verify && gzv_kernel_available() != 1) {
       opt.gpu_verify = false;
       vlog(V_ERROR, opt,

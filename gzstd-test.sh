@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=465
-$EXTENSIVE && EXPECTED_TESTS=596
+EXPECTED_TESTS=467
+$EXTENSIVE && EXPECTED_TESTS=598
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -676,7 +676,7 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # extensive 587 -> 596, no-GPU delta 114 -> 116, no-GDS delta 10 -> 11.  CONFIRMED on
 # the 8-GPU GDS host: extensive 595/0/1 of 596, CPU-only 349/0/92 ("349 ran, as
 # expected ... -116 no GPU").  The no-GDS delta is still derived.
-EXPECTED_NOGPU_DELTA=116
+EXPECTED_NOGPU_DELTA=118
 EXPECTED_NOGDS_DELTA=11
 
 # ============================================================
@@ -4005,6 +4005,79 @@ if has_gpu 2>/dev/null; then
     skip "multi-GPU dispatch round-trips across multiple devices" "single GPU host"
   fi
 
+  # THE ALL-DEVICE RANKING RUNS AFTER CUDA, AND ONLY AT GPU BRINGUP (v0.17.63).
+  # Nothing else in this suite can reach that code.  It is armed only when
+  # CUDA_VISIBLE_DEVICES is UNSET, and the suite always exports a mask -- one
+  # card by default, two in the multi-GPU cell above -- so every other cell
+  # keeps the pre-CUDA path.  This cell therefore clears the mask for its own
+  # runs, which is also why it needs more than one device: ranking one device
+  # decides nothing and prints nothing.  Clearing the mask exposes every card,
+  # so it asks for two cards with room first, exactly as the cell above does;
+  # gzstd skips a card without VRAM on its own, and the ranking still covers
+  # the full set.
+  # ORDER ONLY, NEVER COUNT is the contract under test: the line must account
+  # for every device CUDA reported, each exactly once.
+  dr_ranked='ranked after CUDA startup'
+  dr_min_mib=${GZSTD_TEST_RANK_MIN_FREE_MIB:-4096}
+  dr_cards=()
+  if [[ "${GPU_ALL_DEVICES:-}" == *,* && "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+    mapfile -t dr_cards < <(gpu_uuids_by_free "$dr_min_mib" "$GPU_ALL_DEVICES")
+  fi
+  if (( ${#dr_cards[@]} >= 2 )); then
+    dr_log=$(env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+               "$GZSTD" --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/rank.zst" 2>&1)
+    dr_rc=$?
+    dr_line=$(printf '%s' "$dr_log" | tr '\r' '\n' | grep -m1 -- "$dr_ranked" || true)
+    dr_n=$(printf '%s' "$dr_line" | sed -n 's/.*\[GPU\] all \([0-9]\+\) devices.*/\1/p')
+    dr_order=$(printf '%s' "$dr_line" | sed -n 's/.*(order \([0-9 ]*\)).*/\1/p')
+    dr_cnt=$(printf '%s\n' $dr_order | grep -c . || true)
+    dr_uniq=$(printf '%s\n' $dr_order | sort -u | grep -c . || true)
+    if [[ $dr_rc -ne 0 ]]; then
+      fail "all-device GPU ranking runs after CUDA startup" "compress exited $dr_rc"
+    elif [[ -z "$dr_line" ]]; then
+      fail "all-device GPU ranking runs after CUDA startup" \
+           "no '$dr_ranked' line at -v with no device mask"
+    elif [[ -z "$dr_n" || "$dr_n" -lt 2 || "$dr_cnt" != "$dr_n" || "$dr_uniq" != "$dr_n" ]]; then
+      fail "all-device GPU ranking runs after CUDA startup" \
+           "ranked $dr_n device(s) but the order lists $dr_cnt ($dr_uniq distinct): $dr_line"
+    elif env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+           "$GZSTD" -d --gpu-only -k -f "$TMPDIR/rank.zst" -o "$TMPDIR/rank.out" 2>/dev/null \
+         && files_match "$TMPDIR/large.bin" "$TMPDIR/rank.out"; then
+      pass "all-device GPU ranking runs after CUDA startup" "($dr_n devices, order ${dr_order// /,})"
+    else
+      fail "all-device GPU ranking runs after CUDA startup" "round-trip mismatch"
+    fi
+    rm -f "$TMPDIR/rank.zst" "$TMPDIR/rank.out"
+
+    # The other half of the contract: a mask the CALLER chose is never re-ranked,
+    # so the deferred path must stay silent and the named cards keep their order.
+    dr_two="${dr_cards[0]},${dr_cards[1]}"
+    dr_log2=$(CUDA_VISIBLE_DEVICES="$dr_two" timeout --foreground -k 10 120 \
+                "$GZSTD" --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/rank2.zst" 2>&1)
+    dr_rc2=$?
+    if [[ $dr_rc2 -ne 0 ]]; then
+      fail "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "compress exited $dr_rc2"
+    elif printf '%s' "$dr_log2" | grep -q -- "$dr_ranked"; then
+      fail "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" \
+           "ranked the set anyway with a mask set"
+    elif CUDA_VISIBLE_DEVICES="$dr_two" timeout --foreground -k 10 120 \
+           "$GZSTD" -d --gpu-only -k -f "$TMPDIR/rank2.zst" -o "$TMPDIR/rank2.out" 2>/dev/null \
+         && files_match "$TMPDIR/large.bin" "$TMPDIR/rank2.out"; then
+      pass "a caller's CUDA_VISIBLE_DEVICES is never re-ranked"
+    else
+      fail "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "round-trip mismatch"
+    fi
+    rm -f "$TMPDIR/rank2.zst" "$TMPDIR/rank2.out"
+  elif [[ "${GPU_ALL_DEVICES:-}" == *,* ]]; then
+    skip "all-device GPU ranking runs after CUDA startup" \
+         "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
+    skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" \
+         "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
+  else
+    skip "all-device GPU ranking runs after CUDA startup" "single GPU host"
+    skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "single GPU host"
+  fi
+
   # --gpu-streams
   for streams in 1 2 4; do
     run_test "$GZSTD" --hybrid --gpu-streams=$streams -k -f "$TMPDIR/medium.txt" -o "$TMPDIR/gstream-${streams}.zst" 2>/dev/null
@@ -4032,6 +4105,8 @@ if has_gpu 2>/dev/null; then
 
   rm -f "$TMPDIR"/gstream-* "$TMPDIR"/gmem-* "$TMPDIR"/gdev* "$TMPDIR"/cshare*
 else
+  skip "all-device GPU ranking runs after CUDA startup" "no GPU"
+  skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "no GPU"
   skip "--gpu-streams" "no GPU"
   skip "--gpu-mem-frac" "no GPU"
   skip "--gpu-devices" "no GPU"
