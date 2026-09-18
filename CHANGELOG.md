@@ -1,12 +1,42 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.63  
+**Covers:** v0.9.50 → v0.17.64  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.64 — a restored symlink carried the extraction time, not its own
+
+**Fidelity, found by the pre-tag `RELEASING.md` §3 round-trip** on the shape that checklist item exists for: many small
+files (20,003 files, 281 directories, a symlink, a hardlink, an empty file, a 120-character name 12 levels deep).
+Across all 20,285 entries exactly one field came back wrong — the symlink's own mtime, set to the moment of extraction.
+
+**GNU tar 1.35 restores it correctly from the very same gzstd archive**, so the timestamp was always stored and only
+gzstd's extractor dropped it. `make_symlink()` never called `utimensat` at all: `set_meta_fd()` works through a
+descriptor, and a symlink cannot supply one. The sibling path had the same gap — `make_special()` creates FIFOs and
+device nodes and also set no time, and opening a FIFO to get a descriptor would block until the other end appears.
+
+Both now stamp through the parent descriptor with `AT_SYMLINK_NOFOLLOW`, which is the point rather than a detail:
+without it the call follows the link and stamps the TARGET, which in an ordinary archive is a file the same extraction
+restores with a different time. Ownership was already correct (`fchownat(..., AT_SYMLINK_NOFOLLOW)`).
+
+**MEASURED**, a tree with deliberately distinct timestamps — regular file 2020-01-01, symlink 2021-06-15, FIFO
+2022-03-03, directory 2023-07-07 — archived by gzstd and extracted three ways. The full
+`path|type|mode|mtime` manifest of gzstd's extraction now equals the source and equals GNU tar's extraction of the same
+archive, on all four entries. The symlink's target kept its own 2020 stamp, so the link is stamped and its target is
+not. Re-checked on the 20,003-file tree: zero metadata differences, where v0.17.63 had one.
+
+Scope: extraction only. Archives written by earlier versions already carry the right times, so this fixes what is
+restored from them, not what was stored.
+
+### Test
+
+One new cell in the `-d --tar` extraction section, asserting the symlink's own mtime, that its target was NOT retimed,
+and the FIFO's mtime (skipped where `mkfifo` is unavailable). It is `--cpu-only`, so it runs in both build
+configurations. Baselines: 469 default, 351 CPU-only, 600 extensive, no-GPU delta 118, no-GDS delta 11.
 
 ## v0.17.63 — a default compress ranked eight GPUs, then used none of them
 

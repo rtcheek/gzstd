@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.63";
+static constexpr const char * GZSTD_VERSION = "0.17.64";
 //
 // Architecture overview:
 //
@@ -20921,25 +20921,44 @@ private:
     return ok;
   }
 
+  // Restore mtime on something that has no fd we can hold: a symlink, a FIFO or a
+  // device node.  AT_SYMLINK_NOFOLLOW is the whole point for a symlink -- without
+  // it the call stamps the TARGET, which for a link into the same tree would
+  // silently retime a file the archive also restores.  set_meta_fd() handles
+  // regular files and directories through their descriptors instead, which keeps
+  // the O_NOFOLLOW guarantee there; here the parent fd plus a leaf name is the
+  // equivalent, since open_parent() walked the path with O_NOFOLLOW.
+  // Best-effort like the rest of set_meta_fd: a filesystem that cannot store the
+  // timestamp must not fail an otherwise complete extraction.
+  void set_meta_nofollow(int pfd, const std::string & leaf, int64_t mtime) {
+    struct timespec ts[2]; ts[0].tv_sec = (time_t)mtime; ts[0].tv_nsec = 0; ts[1] = ts[0];
+    (void)::utimensat(pfd, leaf.c_str(), ts, AT_SYMLINK_NOFOLLOW);
+  }
+
   bool make_symlink(const std::string & rel, const std::string & target,
-                    uint64_t uid, uint64_t gid, int root = 0) {
+                    int64_t mtime, uint64_t uid, uint64_t gid, int root = 0) {
     std::string leaf; int pfd = open_parent(rel, leaf, true, root);
     if (pfd < 0) return false;
     ::unlinkat(pfd, leaf.c_str(), 0);
     bool ok = (::symlinkat(target.c_str(), pfd, leaf.c_str()) == 0);
     if (ok && as_root_ && ::fchownat(pfd, leaf.c_str(), (uid_t)uid, (gid_t)gid, AT_SYMLINK_NOFOLLOW) != 0) { /* best-effort */ }
+    if (ok) set_meta_nofollow(pfd, leaf, mtime);
     ::close(pfd);
     return ok;
   }
 
   bool make_special(const std::string & rel, uint32_t mode, char type,
-                    uint32_t major_, uint32_t minor_, int root = 0) {
+                    uint32_t major_, uint32_t minor_, int64_t mtime, int root = 0) {
     std::string leaf; int pfd = open_parent(rel, leaf, true, root);
     if (pfd < 0) return false;
     ::unlinkat(pfd, leaf.c_str(), 0);
     mode_t mt = (mode & 07777) | (type == '6' ? S_IFIFO : type == '3' ? S_IFCHR : S_IFBLK);
     dev_t dev = (type == '6') ? 0 : makedev(major_, minor_);
     bool ok = (::mknodat(pfd, leaf.c_str(), mt, dev) == 0);
+    // Same gap as the symlink above, same fix: opening a FIFO to get an fd would
+    // BLOCK until the other end appears, and a device node must not be opened at
+    // all during extraction, so both are stamped through the parent fd.
+    if (ok) set_meta_nofollow(pfd, leaf, mtime);
     ::close(pfd);
     return ok;
   }
@@ -21930,7 +21949,7 @@ private:
       }
       case '2': {                                  // symlink
         NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
-        if (!make_symlink(rel, e.linkname, e.uid, e.gid, root)) fail(rel, "cannot create symlink");
+        if (!make_symlink(rel, e.linkname, e.mtime, e.uid, e.gid, root)) fail(rel, "cannot create symlink");
         apply_ext_path(rel, e.ext, root);   // xattrs/SELinux on the LINK itself
         break;
       }
@@ -21939,7 +21958,7 @@ private:
         break;
       case '3': case '4': case '6': {              // char/block device, fifo
         NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
-        if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor, root)) {
+        if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor, e.mtime, root)) {
           // EPERM = no CAP_MKNOD, so a device node in the archive was NOT
           // created.  That is a missing entry, and it must fail the extraction
           // like any other creation error.  Logging it at -v and continuing

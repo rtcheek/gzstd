@@ -333,6 +333,20 @@ Two rules this project already holds and did not apply here:
 Wants: a cold arm in `RELEASING.md` §3 (`scripts/drop_cache` exists and is rootless), and a
 convention that any cost figure entering CHANGELOG or memory states its residency.
 
+## SHIPPED v0.17.64: a restored symlink carried the extraction time, not its own
+
+**Found 2026-09-18** doing the pre-tag §3 round-trip for the many-small-files shape: of 20,285 entries, exactly one
+field came back wrong — a symlink's own mtime. GNU tar 1.35 restores it from the SAME gzstd archive, so the value was
+stored and only the extractor dropped it.
+
+**Two corrections to this item as first written.** There was no `utimensat` call to blame: `make_symlink()` set no time
+at all, so nothing was ever retiming the link's target, and ownership already used `fchownat(..., AT_SYMLINK_NOFOLLOW)`.
+And the gap was not symlinks alone — the sibling `make_special()` (FIFOs, device nodes) had it too.
+
+Both now stamp through the parent descriptor with `AT_SYMLINK_NOFOLLOW`. gzstd's extraction of a tree with distinct
+timestamps per type now matches the source and GNU tar exactly, and the link's target keeps its own time. One new cell
+covers all three assertions; it is `--cpu-only`, so both build configurations run it. Details in CHANGELOG v0.17.64.
+
 ## SHIPPED v0.17.63: all-device GPU ordering is ranked after CUDA, once bringup is selected
 
 **Found 2026-09-16** validating v0.17.55 on the 8-GPU server: `order_all_gpus_before_cuda()` ranked every GPU through
@@ -367,6 +381,31 @@ Details and regression checks are in CHANGELOG v0.17.63.
 
 **Coverage:** two new cells clear the device mask for themselves, since the suite's own mask keeps every other cell on
 the pre-CUDA path. A build with only the deferral reverted fails the first of them.
+
+**MEASURED UNDER REAL CONTENTION (2026-09-18), which changes what the ranking is worth.** The server was carrying
+other tenants' work: six of eight GPUs pinned at 100% utilization, two idle but nearly full on VRAM, against a CPU
+load of ~14 of 256 cores. Same 2 GiB archive, n=5 interleaved: `--gpu-only` **4.35 s** (3.47-5.31), `--cpu-only`
+**0.22 s**, default backend **0.14 s** — GPU decompress is ~20x SLOWER than CPU when the cards belong to someone else,
+and the residency rule sent the default to the CPU without being told. Per-batch logs show the cost directly: 8-258 ms
+of compute for one 12 MiB batch, and the auto-tuner cutting the batch from 16 to 8.
+
+The ranking itself behaved correctly: every run produced a non-identity order (the natural permutation an idle host
+never makes), it put the VRAM-starved cards last, and those were exactly the cards that then had to shrink their
+batches (57, 84, 128 frames against 256 for the top five).
+
+**But its fixed cost is not repaid in that regime, and this is NOT specific to v0.17.63.** The `[GPU] device selection`
+line reads **310-323 ms** on a ranked run and **0.0 ms** when a mask is set. Rotated arms, n=5: v0.17.63 ranked
+**3.78 s** (3.48-3.83), v0.17.62 ranked **3.73 s** (3.45-3.89), v0.17.63 with a user mask **3.48 s** (3.42-4.06). The
+two versions are identical within noise -- the deferral neither costs nor saves a GPU-using run, as measured on the
+quiet box -- and the ~0.3 s gap is the ranking, in BOTH versions. On a 3.5 s run where every card is busy there is no
+placement win to repay it; v0.17.37's "ranked is 11-15% faster" was a QUIET box at 4 GiB. The load moved during the
+measurement (one card's free VRAM went 12 -> 40 GiB), so these are rotated medians with the instrument, not wall clock
+alone.
+
+**Open design question, not a plan:** the ranking is a snapshot whose cost is fixed and whose benefit scales with run
+length and with how much the cards actually differ. Worth considering whether it should be skipped when no card is a
+good choice (every device busy), or gated on the input size the way GPU bringup already is. Operationally, today:
+`--gpu-devices N` or an explicit `CUDA_VISIBLE_DEVICES` skips the ranking, and a warm input avoids the GPU entirely.
 
 **Follow-ups, not done:**
 - **The `--gpu-devices N` path still pays the ~380 ms before CUDA** on every run, including runs that then skip bringup.

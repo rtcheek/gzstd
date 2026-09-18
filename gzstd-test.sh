@@ -593,8 +593,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=467
-$EXTENSIVE && EXPECTED_TESTS=598
+EXPECTED_TESTS=469
+$EXTENSIVE && EXPECTED_TESTS=600
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -6837,6 +6837,50 @@ else
     fail "extract hardlink" "distinct inodes"
   fi
   [[ -L "$XOUT$XS/b/sym" ]] && pass "extract restores symlink" || fail "extract symlink" "not a symlink"
+
+  # 4b. THE MTIME OF THINGS THAT HAVE NO FD: a symlink, and a FIFO.  Until
+  # v0.17.64 both came out stamped with the EXTRACTION time: set_meta_fd() works
+  # through a descriptor, and neither of these can supply one (opening a FIFO
+  # blocks until the other end appears).  GNU tar restores both from the very
+  # same gzstd archive, which is how the gap was found -- so the timestamp was
+  # always stored, only never applied.  The third assertion is the reason the fix
+  # must use AT_SYMLINK_NOFOLLOW: without it the call stamps the link's TARGET,
+  # which here is a file the same archive restores with a different mtime.
+  MTD="$TMPDIR/lmtime"; rm -rf "$MTD"; mkdir -p "$MTD/tree"
+  echo payload > "$MTD/tree/a.bin"
+  ln -s a.bin "$MTD/tree/s"
+  mkfifo "$MTD/tree/p" 2>/dev/null
+  touch -d '2020-01-01 00:00:00' "$MTD/tree/a.bin"
+  touch -h -d '2021-06-15 12:34:56' "$MTD/tree/s"
+  [[ -p "$MTD/tree/p" ]] && touch -d '2022-03-03 03:03:03' "$MTD/tree/p"
+  mt_want_a=$(stat -c %Y "$MTD/tree/a.bin"); mt_want_s=$(stat -c %Y "$MTD/tree/s")
+  mt_want_p=""; [[ -p "$MTD/tree/p" ]] && mt_want_p=$(stat -c %Y "$MTD/tree/p")
+  "$GZSTD" -q -f --cpu-only -o "$MTD/t.tar.zst" --tar "$MTD/tree" 2>/dev/null
+  rm -rf "$MTD/out"; mkdir -p "$MTD/out"
+  "$GZSTD" -q -d --cpu-only --tar "$MTD/t.tar.zst" -C "$MTD/out" 2>/dev/null
+  mt_got_s=$(stat -c %Y "$MTD/out$MTD/tree/s" 2>/dev/null)
+  mt_got_a=$(stat -c %Y "$MTD/out$MTD/tree/a.bin" 2>/dev/null)
+  mt_got_p=""; [[ -p "$MTD/out$MTD/tree/p" ]] && mt_got_p=$(stat -c %Y "$MTD/out$MTD/tree/p")
+  if [[ -z "$mt_got_s" ]]; then
+    fail "extract restores a symlink's own mtime" "symlink missing after extract"
+  elif [[ "$mt_got_s" != "$mt_want_s" ]]; then
+    fail "extract restores a symlink's own mtime" "want $mt_want_s, got $mt_got_s"
+  elif [[ "$mt_got_a" != "$mt_want_a" ]]; then
+    fail "extract restores a symlink's own mtime" \
+         "the link's target was retimed too (want $mt_want_a, got $mt_got_a) -- AT_SYMLINK_NOFOLLOW"
+  else
+    pass "extract restores a symlink's own mtime, and not its target's"
+  fi
+  if [[ -z "$mt_want_p" ]]; then
+    skip "extract restores a FIFO's mtime" "mkfifo unavailable here"
+  elif [[ -z "$mt_got_p" ]]; then
+    fail "extract restores a FIFO's mtime" "FIFO missing after extract"
+  elif [[ "$mt_got_p" != "$mt_want_p" ]]; then
+    fail "extract restores a FIFO's mtime" "want $mt_want_p, got $mt_got_p"
+  else
+    pass "extract restores a FIFO's mtime"
+  fi
+  rm -rf "$MTD"
 
   # 5. Cross-tool: GNU tar creates, gzstd extracts.
   tar -cf - -C "$(dirname "$XS")" "$(basename "$XS")" 2>/dev/null | "$GZSTD" -q -f -o "$XARC" - 2>/dev/null
