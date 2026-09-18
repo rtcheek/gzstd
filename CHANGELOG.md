@@ -1,12 +1,98 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.65  
+**Covers:** v0.9.50 → v0.17.66  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.66 — the parallel decompress reader takes O_DIRECT, so the flag stops costing parallelism
+
+**v0.17.65 warned about this; this fixes it.** `probe_preadable_input()` refused an O_DIRECT input, so `--direct-read`
+dropped a decompress from 12 prefetch readers to one. The rule behind that refusal — "concurrent O_DIRECT reads
+contend on NVMe" — was measured on the COMPRESS reader. On this device it does not hold: 3 GiB per arm, cache dropped,
+1 reader O_DIRECT **4.17 GiB/s**, 4 readers **4.92**, 12 readers **4.41**, against buffered **2.31** and **3.70**.
+O_DIRECT beats buffered at every count and does not contend at 12-way, so the reader can have the parallelism AND the
+low system time instead of trading one for the other.
+
+The parallel reader now opens an O_DIRECT descriptor of its own through `gz_reopen_input()` (`/proc/self/fd` plus the
+same-inode check, never the name — v0.17.62), because O_DIRECT is a property of the open file description and cannot be
+toggled on the one the driver holds.
+
+**MEASURED, 12 GiB entropy-coded archive, `--cpu-only -t`, cache dropped before every run, n=3:**
+
+| arm | wall | user | sys |
+|---|---|---|---|
+| default (buffered, 12 readers) | 3.43 / 3.45 / 3.47 s | ~29 s | ~41 s |
+| `--direct-read` (O_DIRECT, 12 readers) | **3.68 / 3.68 / 3.69 s** | ~32 s | **~3.5 s** |
+| `--direct-read` before this version | 7.32 / 7.33 / 7.58 s | ~35 s | ~3.2 s |
+
+The flag went from **2.1x slower than the default to 7% slower**, at **half the total CPU** (~35 CPU-seconds against
+~70): the page cache's ~41 s of system time is simply not paid. The residual 7% is the overlap bytes each block shares
+with the next, which used to come from the page cache and now come from the device.
+
+**Alignment, which is the whole risk.** O_DIRECT needs the offset, the length and the buffer address aligned. Two are
+free: block offsets are 64 MiB multiples, and the block allocator already hands out `posix_memalign`'d 2 MiB storage
+with 2 MiB-rounded capacity. A tail-reaching block's length can be short (the overlap means this can also be the
+penultimate block), so the request is rounded up — it cannot overflow that capacity — and the kernel returns the bytes
+that exist, which is not a short read. A partial read that would leave
+the next request unaligned finishes on the ordinary descriptor.
+
+**Degrading, not failing.** A filesystem that opens O_DIRECT but refuses the reads (EINVAL) drops every reader to the
+held descriptor and retries the same span; the bytes are identical either way. It says so once at `-v`. Every local
+filesystem here accepts O_DIRECT reads — tmpfs included on this kernel — so `GZSTD_DEBUG_MT_DIRECT_EINVAL=1` forces the
+refusal, and the suite uses it: without a hook that path is unreachable and therefore untested.
+
+`GZSTD_DEBUG_MT_DIRECT=0` restores the pre-v0.17.66 single-stream shape, so the A/B is one binary on a machine whose
+storage may answer differently — the workstation has not measured this.
+
+### Review (Codex, effort high)
+
+Two reachable defects, neither of them in the read loop:
+
+- **`--adapt` filed a direct run as buffered.** `stream_frames_to_queue_mt()` stores its source tag at the top, which
+  overwrote the `direct` the caller had just set, so an `--adapt --direct-read` decompress wrote its rate to
+  `path_pread` and left `path_direct` unmeasured — the profile learned the opposite of what ran. The tag now comes
+  from the descriptor actually in use, and reverts to `pread` if the EINVAL degrade fires. Verified through the
+  written profile: `src_path = direct`, `path_direct_gibs = 4.54`.
+- **Indexed `--tar` extraction ignored the flag silently.** Those producers pread individual frames at unaligned
+  offsets and cannot honour O_DIRECT. The review's fix was to disable them under `--direct-read`; **that was not
+  adopted.** Selective extraction exists to read only the frames a selection touches — measured here at 28% of the
+  archive for one member — so standing it down to honour a cache-bypass preference trades a large, silent slowdown for
+  a small benefit. gzstd already had the right precedent (`--direct-read has no effect with --tar` on create), so the
+  optimized routes stay and the run says the flag does not reach them. Silence was the defect; the seek plan was not.
+
+It also caught that the first version of the new cell asserted a setup log line printed BEFORE any syscall, so all
+three of its assertions could have passed with the readers accidentally using the buffered descriptor throughout. The
+cell now counts successful preads on the direct descriptor.
+
+### Test
+
+The v0.17.65 warning cell is replaced (that warning is now wrong and is gone; what remains warns only if the O_DIRECT
+reopen itself fails). The new cell requires the flag to engage the parallel reader WITH O_DIRECT, the default to engage
+it WITHOUT, at least one successful `pread` return on the direct descriptor (not merely a setup log), the forced refusal
+to log exactly once with zero successful direct reads and still round-trip, and all three outputs to match the source.
+It requires a nonzero count of completed O_DIRECT preads on the flag arm and zero on the forced-refusal arm (3 and 0
+on a 176 MiB archive, which is three 64 MiB blocks). Counts unchanged: 471 default, 353 CPU-only, 602 extensive.
+
+**A pre-existing cell stopped testing anything, and the suite is what found it.** `decompress --direct-read reads the
+pinned archive` — a v0.17.62 regression test that renames the archive under the running process at a FIFO gate —
+detected O_DIRECT by the sequential splitter's log line, which this change replaced. It went quiet as a SKIP, taking
+the identity guarantee for the path that now runs with it. It accepts either marker now and passes: the O_DIRECT
+reader reads the PINNED inode, not the renamed replacement.
+
+Also documented, not changed: `-d --tar ARCHIVE MEMBER -C dir` extracts into the current directory, because `-C` is
+positional and applies to the members that follow it. Checked against GNU tar 1.35, which does the same; the help now
+states the rule.
+
+**Review corrections.** The MT reader now owns the `g_adapt_src_path` tag: a successful direct run records `direct`,
+while the EINVAL degrade records `pread`. The first cut tagged `direct` in the caller and immediately overwrote it with
+`pread` on entry, filing a large O_DIRECT decompress rate under the buffered prior. Also, explicit `--direct-read` now
+bypasses the indexed tar-extraction producers, whose arbitrary frame offsets cannot satisfy O_DIRECT alignment, and uses
+the ordinary aligned decompression reader instead of silently performing buffered reads. Help text now states that
+`--read-threads` controls eligible O_DIRECT decompression as well as buffered pools.
 
 ## v0.17.65 — two flags that did not say what they cost
 

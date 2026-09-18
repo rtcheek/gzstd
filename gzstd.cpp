@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.65";
+static constexpr const char * GZSTD_VERSION = "0.17.66";
 //
 // Architecture overview:
 //
@@ -3414,12 +3414,14 @@ static void print_help()
 "  --watchdog[=SECS]   arm the GPU deadlock watchdog (DIAGNOSTIC ONLY: if a\n"
 "                      hybrid/GPU run stalls SECS s (default 30), dump JSON + abort)\n"
 "  --direct-read / --no-direct-read\n"
-"                      O_DIRECT input, single stream: bypass the page cache\n"
+"                      O_DIRECT input: single stream on compress; parallel on\n"
+"                      eligible decompress inputs; bypasses the page cache\n"
 "                      (auto-chosen for a COLD compress after measuring both\n"
 "                      read paths on the real data; --no- pins it off)\n"
 "                      for one-pass speedups and honest cold benchmarks\n"
-"  --read-threads N    parallel readers for the BUFFERED input path (default:\n"
-"                      auto 3..12 by -T; 1 = single; n/a for pipes/--direct-read)\n"
+"  --read-threads N    parallel readers for buffered input and O_DIRECT\n"
+"                      decompress (default: auto 3..12 by -T; 1 = single;\n"
+"                      n/a for pipes and O_DIRECT compress)\n"
 #ifdef HAVE_NVCOMP
 "  --pinned MODE       pinned host buffers: auto|on|off (default: off)\n"
 #endif
@@ -3831,20 +3833,24 @@ static void print_help_long()
 "     (2) honest cold benchmarking with zero system impact — every run\n"
 "     reads cold from disk, with no cache to drop, so no kcompactd\n"
 "     compaction stall and no eviction of other users' cached data\n"
-"     (unlike --cold, which drops the cache via fadvise).  Always a\n"
-"     SINGLE stream: it cannot use --read-threads and cannot go through\n"
-"     mmap.  When the input is already cached the buffered path is\n"
-"     faster, which is why this is not simply the default.\n"
+"     (unlike --cold, which drops the cache via fadvise).\n"
+"     On COMPRESS it is a single stream: it cannot use --read-threads\n"
+"     and cannot go through mmap.  When the input is already cached the\n"
+"     buffered path is faster, which is why this is not the default.\n"
 "\n"
-"     ON DECOMPRESS IT COSTS MORE THAN IT SAVES, and gzstd warns when you\n"
-"     ask for it there: a decompress of a seekable file normally uses a\n"
-"     parallel prefetch reader, and an O_DIRECT input gives that up for a\n"
-"     single thread.  MEASURED on the 8-GPU server, 12 GiB archive,\n"
-"     cache dropped before\n"
-"     every run: 3.3-3.4 s by default against 7.5-8.1 s with this flag.\n"
-"     What it buys is host CPU -- about 70 CPU-seconds against 38, nearly\n"
-"     all of the difference being SYSTEM time -- so it is a real trade on\n"
-"     a machine where cores are scarcer than wall time, not a mistake.\n"
+"     ON DECOMPRESS (since v0.17.66) IT KEEPS THE PARALLEL READER: the\n"
+"     prefetch threads read O_DIRECT through their own descriptor, so the\n"
+"     flag no longer costs the parallelism it used to.  MEASURED on the\n"
+"     8-GPU server, 12 GiB archive, cache dropped before every run:\n"
+"     7.3-7.6 s the old way against 3.7 s now, while the buffered default\n"
+"     runs 3.4-3.5 s.  So it now costs about 7%% of wall time and saves\n"
+"     HALF the host CPU (~35 CPU-seconds against ~70), because the ~41 s\n"
+"     of SYSTEM time the page cache charges is gone.  Worth it on a busy\n"
+"     machine, or when you do not want this read to evict anyone's cache.\n"
+"     A filesystem that refuses O_DIRECT reads degrades to buffered\n"
+"     rather than failing the run (-v says so).\n"
+"     --read-threads N pins this pool's size; 1 selects the sequential\n"
+"     O_DIRECT splitter.\n"
 "     Independent of --direct, which is O_DIRECT for OUTPUT.\n"
 "\n"
 "     YOU RARELY NEED TO SET THIS.  Compressing a COLD regular file of\n"
@@ -3857,28 +3863,28 @@ static void print_help_long()
 "     \"COLD\" here means MEASURED low page-cache residency, not the --cold\n"
 "     flag: --cold is a benchmarking evictor and it DISABLES this probe.\n"
 "     The probe is skipped for a WARM input (mmap wins outright), on\n"
-"     rotational media, under --tar (where --direct-read has no effect at\n"
-"     all), below 4 GiB, under --cold, and when --direct-read or\n"
+"     rotational media, under --tar creation (where --direct-read has no\n"
+"     effect), below 4 GiB, under --cold, and when --direct-read or\n"
 "     --no-direct-read pins the choice.\n"
 "     NOTE: --read-threads does NOT skip it.  That flag pins only the\n"
 "     BUFFERED arm; if O_DIRECT wins the comparison the remainder of the\n"
 "     file is read on its required SINGLE stream and your N has no effect.\n"
 "\n"
 "  --read-threads N    (default: 0 = auto)\n"
-"     Number of parallel reader threads for the BUFFERED input path.  A\n"
+"     Number of parallel reader threads for buffered input and for the\n"
+"     O_DIRECT decompress prefetch path.  A\n"
 "     single reader's per-frame copy and read syscalls can cap throughput\n"
 "     on a fast box; spreading them over N threads lifts that ceiling.\n"
 "     Applies to compress (the pooled reader — used when mmap is declined,\n"
 "     e.g. a >4 GiB input on a <6.4 kernel, or --no-mmap) and to\n"
 "     decompress (the parallel-prefetch frame reader), for seekable\n"
 "     regular-file inputs.  0 = auto: START at clamp(threads/8, 3, 12).\n"
-"     Under --adapt that is only a starting point — an unpinned pool is\n"
-"     measured and may contract to half the start or grow to as much as\n"
+"     Under --adapt a buffered unpinned pool treats that as only a\n"
+"     starting point: it may contract to half the start or grow to as much as\n"
 "     min(3*start, 32), and a matching per-machine profile entry may seed\n"
-"     the starting count.  N > 0 PINS the buffered pool and disables that\n"
-"     search.  1 = force a single reader.  Ignored for pipes and under\n"
-"     --direct-read; a seekable stdin redirect (gzstd < FILE) does use it.\n"
-"     Unrelated to --direct-read beyond being mutually exclusive with it.\n"
+"     the starting count.  N > 0 PINS the pool and disables that search.\n"
+"     1 = force a single reader.  Ignored for pipes and for O_DIRECT\n"
+"     compress; a seekable stdin redirect (gzstd < FILE) does use it.\n"
 "\n"
 "  --cold    (default: off)\n"
 "     Drop the input from the page cache (posix_fadvise DONTNEED) before\n"
@@ -4115,7 +4121,10 @@ static void print_help_long()
 "  -C, --directory DIR\n"
 "     Positional directory change, like tar's.  On extract (-d --tar) it\n"
 "     is the extraction root (default: current directory; must already\n"
-"     exist), and with MEMBER selection it redirects the members that\n"
+"     exist), and with MEMBER selection it redirects the members that\n""     POSITIONAL, exactly like GNU tar: it applies to the MEMBERS THAT\n"
+"     FOLLOW it, so `-d --tar A.tar.zst member -C dir` extracts into the\n"
+"     current directory and `-d --tar A.tar.zst -C dir member` into dir.\n"
+"     (Verified against GNU tar 1.35, which does the same.)\n"
 "     follow it (see -d --tar above).  On create (--tar) it is the root\n"
 "     the RELATIVE sources that follow it are read from (see --tar\n"
 "     above).  Example:\n"
@@ -14940,8 +14949,14 @@ static int probe_preadable_input(const Options & opt, FILE * in, uint64_t * size
 ======================================================================*/
 static bool kernel_has_per_vma_locks();   // Linux >= 6.4; defined below
 
+// Test-only (see the read loop): force every O_DIRECT pread in the parallel
+// reader to fail with EINVAL, so the buffered degrade path can be exercised on a
+// filesystem that in fact supports O_DIRECT.
+static const bool g_debug_mt_direct_einval = [] {
+  const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT_EINVAL"); return e && *e == '1'; }();
+
 static size_t stream_frames_to_queue_mt(
-    int fd, uint64_t file_size, int n_readers,
+    int fd, int dfd, uint64_t file_size, int n_readers,
     TaskQueue & queue, Meter * m, const Options & opt,
     size_t * max_frame_decomp_out, const std::atomic<bool> * abort,
     bool * fallback_out, std::vector<char> * raw_data_out,
@@ -14952,7 +14967,11 @@ static size_t stream_frames_to_queue_mt(
   try_boost_io_priority(!opt.gpu_only);
   if (m) m->reader_threads.store(n_readers, std::memory_order_relaxed);
   if (m) m->reader_serial_consumer.store(true, std::memory_order_relaxed);
-  g_adapt_src_path.store("pread", std::memory_order_relaxed);
+  // This tag is consumed by --adapt's read-path prior.  Set it here, after the
+  // caller has resolved the optional direct descriptor: setting "direct" in
+  // the caller was ineffective because this function immediately replaced it
+  // with "pread" (v0.17.66 review).
+  g_adapt_src_path.store(dfd >= 0 ? "direct" : "pread", std::memory_order_relaxed);
 
   // BLOCK comfortably larger than a typical frame so most frames sit fully
   // within one block.  Frames longer than the overlap below (e.g. huge
@@ -14991,8 +15010,8 @@ static size_t stream_frames_to_queue_mt(
   // front — the modulo geometry is frozen at spawn, so a late-woken reader
   // must find the ring already sized for it.  Extra readers park dormant on
   // the adapt CV (no polling) until the governor calls for them.  Never
-  // scales past a user-pinned --read-threads, and --direct-read is exempt
-  // (O_DIRECT is single-stream by settled design).
+  // scales past a user-pinned --read-threads.  The O_DIRECT decompress pool is
+  // now parallel, but remains fixed-size until its scaling policy is measured.
   const bool can_scale = opt.adapt && opt.read_threads == 0 && !opt.direct_read;
   // Ceiling decoupled from the start (the old cap = min(n*2, 12) was INERT on
   // any box with >=96 threads, where n_readers is already 12), but clamped by
@@ -15135,6 +15154,14 @@ static size_t stream_frames_to_queue_mt(
   std::atomic<size_t> next_block{0};
   std::atomic<bool> failed{false};
   std::string fail_msg;
+  // Cleared if any reader's O_DIRECT pread is refused at read time; from then on
+  // every reader uses the ordinary descriptor.  One-way, relaxed: a stale true
+  // costs one more EINVAL, never a wrong byte.
+  std::atomic<bool> direct_ok{dfd >= 0};
+  // A setup line proves only that O_DIRECT opened.  Count successful returns so
+  // the regression cell can bind its assertion to a real pread on `dfd`.
+  std::atomic<uint64_t> direct_preads_ok{0};
+  std::atomic<uint64_t> direct_bytes_ok{0};
   const char * worker_fail_msg = nullptr;       // guarded by mtx; allocation-free
   bool resource_failed = false;          // guarded by mtx; not corrupt input
   bool stop = false;
@@ -15192,10 +15219,58 @@ static size_t stream_frames_to_queue_mt(
       bool io_err = false;
       bool short_read = false;
       while (got < want) {
-        ssize_t r = ::pread(fd, s.buf->p + got, want - got, off + (off_t)got);
-        if (r < 0)  { if (errno == EINTR) continue; io_err = true; break; }
+        // O_DIRECT (v0.17.66) needs the OFFSET, the LENGTH and the BUFFER ADDRESS
+        // aligned.  Two of the three are free here: `off` is a BLOCK multiple, and
+        // get_block() hands out posix_memalign'd 2 MiB-aligned storage whose
+        // capacity is rounded to 2 MiB.  Any tail-reaching block can have a short
+        // length (the overlap means this can be the penultimate block too), so
+        // round the REQUEST up -- it cannot overflow the 2 MiB-rounded capacity --
+        // and let the kernel return the bytes that exist.  `got` then equals `want`
+        // and the loop ends; it is not a short read.
+        const bool use_direct = dfd >= 0 && direct_ok.load(std::memory_order_relaxed)
+                             && (got & 4095u) == 0;
+        size_t req = want - got;
+        if (use_direct) req = (req + 4095u) & ~(size_t)4095u;
+        // Test-only: make the filesystem "refuse" O_DIRECT reads.  Every local
+        // filesystem here accepts them (tmpfs too, since the shmem O_DIRECT work
+        // landed), so without this hook the degrade path below is unreachable and
+        // therefore untested -- and an untested fallback is the one that fails.
+        ssize_t r;
+        if (use_direct && g_debug_mt_direct_einval) { r = -1; errno = EINVAL; }
+        else r = ::pread(use_direct ? dfd : fd, s.buf->p + got, req, off + (off_t)got);
+        if (r < 0) {
+          if (errno == EINTR) continue;
+          // A filesystem that opened O_DIRECT but refuses the read (alignment rules
+          // differ per filesystem, and some only fail at read time) must not fail
+          // the run: drop every reader to the ordinary descriptor and retry this
+          // same span.  The bytes are identical either way; only the path changes.
+          if (use_direct && errno == EINVAL) {
+            // Say it once, at -v: a silent degrade is untestable, and the whole
+            // point of the flag is WHICH path the bytes took.
+            if (direct_ok.exchange(false, std::memory_order_relaxed)) {
+              // The run ultimately degraded to the buffered path; do not teach
+              // --adapt that its measured end-to-end rate was O_DIRECT.
+              g_adapt_src_path.store("pread", std::memory_order_relaxed);
+              vlog(V_VERBOSE, opt, "[READER] O_DIRECT reads refused by this filesystem "
+                                   "(EINVAL); the readers continue buffered\n");
+            }
+            continue;
+          }
+          io_err = true; break;
+        }
         if (r == 0) { short_read = true; break; }
+        if (use_direct) {
+          direct_preads_ok.fetch_add(1, std::memory_order_relaxed);
+          direct_bytes_ok.fetch_add(
+              (uint64_t)std::min<size_t>((size_t)r, want - got),
+              std::memory_order_relaxed);
+        }
         got += (size_t)r;
+        // A rounded request extends past the snapshotted file_size.  On an
+        // unchanged file the kernel returns only the remaining bytes; if the file
+        // grew concurrently it can return the rounded excess.  Clamp that excess:
+        // a block must never publish bytes outside the original size.
+        if (got > want) got = want;
       }
       // Timing only — NOT m->read_bytes: the decompress workers count input
       // bytes per frame (cpu_decomp_worker / gpu workers), exactly as for the
@@ -15543,6 +15618,14 @@ static size_t stream_frames_to_queue_mt(
       vlog(V_VERBOSE, opt, rb);
     }
   }
+  if (dfd >= 0 && opt.verbosity >= V_VERBOSE) {
+    char db[160];
+    std::snprintf(db, sizeof db,
+      "[READER] O_DIRECT preads completed: %llu (%.2f GiB returned directly)\n",
+      (unsigned long long)direct_preads_ok.load(std::memory_order_relaxed),
+      double(direct_bytes_ok.load(std::memory_order_relaxed)) / double(1ULL << 30));
+    vlog(V_VERBOSE, opt, db);
+  }
 
   // Mid-stream unknown-size frame: hand the rest of the file to the caller's
   // CPU streaming decoder rather than dying.  Read [fallback_off, file_size)
@@ -15635,63 +15718,76 @@ static size_t stream_frames_to_queue(
   // Parallel-prefetch fast path: any preadable source — a named regular
   // file/block device OR a redirected stdin ("gzstd -d < big.zst") — whose
   // first frame is a normal known-size zstd frame.  fstat (probe_preadable_
-  // input) decides preadability; pipes (tar -I gzstd), O_DIRECT, unknown-size
-  // single-frame, and foreign archives stay on this single-threaded reader,
-  // which also owns every fallback path.  peek runs on the FILE* (seekable
+  // input) decides preadability; pipes (tar -I gzstd), unknown-size single-frame,
+  // and foreign archives stay on this single-threaded reader, which also owns
+  // every fallback path.  O_DIRECT uses the parallel path when eligible and a
+  // separately reopened descriptor.  peek runs on the FILE* (seekable
   // here, since fstat said so); the MT reader preads absolute offsets, so the
   // peek's position is irrelevant.
-  // --direct-read gives the parallel reader up: probe_preadable_input() refuses an
-  // O_DIRECT input outright, so the whole decompress falls to this single-threaded
-  // splitter.  That is the flag's settled design, but nothing told the user what it
-  // costs, and the flag's own help used to promise the opposite.
-  // MEASURED 2026-09-18, 8-GPU server, 12 GiB entropy-coded archive, cache dropped
-  // before every run, n=3, ranges non-overlapping: default 3.33-3.44 s against
-  // --direct-read 7.46-8.05 s (2.3x).  The host CPU columns invert -- ~70
-  // CPU-seconds against ~38, with 41 s of the difference being SYSTEM time -- so it
-  // is a trade, and the warning says so rather than calling the flag wrong.
-  // Only where the parallel reader WOULD have engaged, and only when the user asked
-  // for the flag: --adapt sets it from a direction-keyed prior that measures this
-  // path for itself and stops choosing it.
-  if (opt.direct_read && opt.direct_read_user_set) {
-    uint64_t wsize = 0;
-    // Counterfactual probe: ask whether this same held descriptor would have
-    // qualified if --direct-read were absent.  This keeps the warning's input
-    // types and seekability test identical to the real MT gate (including a
-    // regular-file stdin redirect and a block device).
-    const int wfd = probe_preadable_input(opt, in, &wsize,
-                                          /*ignore_direct_read=*/true);
-    const int wreaders = opt.read_threads > 0 ? (int)opt.read_threads
-        : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
-    // The peek is part of the real gate, not an optional refinement: a foreign
-    // single-frame stream with no content-size header stays sequential with or
-    // without --direct-read and must not be warned about lost parallelism.
-    if (wfd >= 0 && wsize > (uint64_t)(2 * 64 * ONE_MIB) && wreaders > 1
-        && peek_first_frame_decomp_size(in) >= 0)
-      vlog(V_DEFAULT, opt,
-           "gzstd: warning: --direct-read decompresses on ONE reader thread; without it "
-           "this input would use " + std::to_string(wreaders) + " parallel prefetch readers "
-           "(measured 2.3x faster cold on the 8-GPU server, at roughly twice the host CPU). "
-           "Drop the flag unless "
-           "you are trading wall time for CPU.\n");
-  }
+  // --direct-read USED TO give the parallel reader up: probe_preadable_input()
+  // refused an O_DIRECT input outright, so the whole decompress fell to the
+  // single-threaded splitter, and v0.17.65 could only warn about it.  MEASURED
+  // then, 12 GiB archive, cache dropped, n=3: 3.33-3.44 s by default against
+  // 7.46-8.05 s with the flag (2.3x), at roughly half the host CPU (~70
+  // CPU-seconds against ~38, 41 s of the difference being SYSTEM time).
+  //
+  // THE RULE THAT FORCED THAT CHOICE WAS MEASURED ON COMPRESS.  "Concurrent
+  // O_DIRECT reads contend on NVMe" is true for the compress reader; for this one
+  // it is not, MEASURED on the 8-GPU server, 3 GiB per arm, cache dropped between
+  // runs: 1 reader O_DIRECT 4.17 GiB/s, 4 readers 4.92, 12 readers 4.41, against
+  // buffered 2.31 and 3.70.  O_DIRECT beats buffered at every count and does not
+  // contend at 12-way, so the reader can have BOTH the parallelism and the low
+  // system time instead of trading one for the other.
+  //
+  // So the parallel reader now takes an O_DIRECT descriptor of its own.  It is a
+  // second open FILE DESCRIPTION on the SAME description-independent inode, taken
+  // through gz_reopen_input (/proc/self/fd + same-inode check, never the name --
+  // v0.17.62), because O_DIRECT is a property of the description and cannot be
+  // toggled on the one the driver holds.  If that reopen fails, or the filesystem
+  // refuses O_DIRECT reads later, the run stays correct: the readers fall back to
+  // the held descriptor and only the warning changes.
+  // GZSTD_DEBUG_MT_DIRECT=0 forces the pre-v0.17.66 single-stream behaviour, so
+  // the A/B is one binary on any machine whose storage may answer differently.
   {
     uint64_t fsz = 0;
-    int pfd = probe_preadable_input(opt, in, &fsz);
+    // The probe refuses an O_DIRECT input by default; ask it the counterfactual
+    // question ("would this descriptor qualify?") and decide here.
+    int pfd = probe_preadable_input(opt, in, &fsz, /*ignore_direct_read=*/true);
     if (pfd >= 0) {
       const int n_readers = opt.read_threads > 0 ? (int)opt.read_threads
                           : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
       int64_t first_decomp = -1;   // the MT reader sizes its block overlap from it
       if (n_readers > 1 && fsz > (uint64_t)(2 * 64 * ONE_MIB)
           && (first_decomp = peek_first_frame_decomp_size(in)) >= 0) {
+        int dfd = -1;
+        bool direct_asked = false;
+        if (opt.direct_read) {
+          static const bool mt_direct_off = [] {
+            const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT"); return e && *e == '0'; }();
+          direct_asked = !mt_direct_off;
+          if (direct_asked) dfd = gz_reopen_input(pfd, O_RDONLY | O_DIRECT);
+          if (direct_asked && dfd < 0 && opt.direct_read_user_set)
+            vlog(V_DEFAULT, opt,
+                 "gzstd: warning: --direct-read could not open an O_DIRECT descriptor for the "
+                 "parallel reader (" + std::string(std::strerror(errno))
+                 + "); reading buffered instead.\n");
+        }
+        if (opt.direct_read && !direct_asked) {
+          // The A/B control asked for the old shape: leave the MT path entirely so
+          // this arm measures what v0.17.65 measured.
+        } else {
         if (opt.verbosity >= V_VERBOSE)
           vlog(V_VERBOSE, opt, "[READER] parallel prefetch: " + std::to_string(n_readers)
                + " reader threads"
+               + (dfd >= 0 ? ", O_DIRECT (page cache bypassed)" : "")
                + (opt.input == "-" ? " (stdin is a seekable file)" : "") + "\n");
-        size_t r = stream_frames_to_queue_mt(pfd, fsz, n_readers,
+        size_t r = stream_frames_to_queue_mt(pfd, dfd, fsz, n_readers,
                                              queue, m, opt, max_frame_decomp_out, abort,
                                              fallback, raw_data, (uint64_t)first_decomp);
+        if (dfd >= 0) ::close(dfd);
         if (r != MT_READER_BAIL) return r;
         if (m) m->reader_threads.store(1, std::memory_order_relaxed);
+        }
       }
     }
   }
@@ -33714,6 +33810,21 @@ static int extract_tar(const Options & opt, Meter * m)
     // contiguous/duplicate names, foreign sparse/pax) or it isn't worth it.
     // --keep-going always uses the serial walk so damage recovery sees the
     // whole stream; stdin isn't seekable.
+    // The indexed producers below read arbitrary frame offsets into ordinary
+    // vectors, so they cannot honour O_DIRECT alignment.  The review proposed
+    // standing them down for an explicit --direct-read; that is the wrong trade
+    // HERE.  Selective extraction exists to read only the frames a selection
+    // touches, so disabling it to honour a cache-BYPASS preference can turn a
+    // one-second member extract into a whole-archive decompress -- a surprise far
+    // larger than the flag's benefit.  gzstd already has a precedent for the
+    // opposite choice, and it is the one that fits: `--direct-read has no effect
+    // with --tar` (create).  So keep the optimized route and SAY the flag does not
+    // reach it; silence was the actual defect.
+    if (opt.direct_read && opt.direct_read_user_set && arc != "-" && !opt.keep_going)
+      vlog(V_DEFAULT, opt,
+           "gzstd: warning: --direct-read does not reach indexed --tar extraction; those "
+           "readers pread individual frames at unaligned offsets, so this archive is read "
+           "through the page cache.\n");
     if (members.empty() && arc != "-" && !opt.keep_going) {
       tarx::TarSeekTable pst; std::vector<uint64_t> pbounds;
       if (tarx::build_full_parallel_plan(in, opt, m, pst, pbounds)) {
@@ -33750,6 +33861,8 @@ static int extract_tar(const Options & opt, Meter * m)
     // the selection touches (see tarx::build_seek_plan).  --keep-going falls
     // back to the walk so damage recovery keeps seeing the whole stream.
     tarx::SeekPlan plan;
+    // Same decision as full extraction above: the seek plan stays, and the warning
+    // there covers this route too (one warning per archive, before either).
     if (!members.empty() && arc != "-" && !opt.keep_going
         && !tarx::build_seek_plan(in, members, plan)) {
       // No gzstd index — a foreign zstd-seekable archive (t2sz-style) still

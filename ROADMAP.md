@@ -702,17 +702,15 @@ half the host CPU). `--adapt` is deliberately exempt: its read-path priors are d
 choosing this path by itself — checked, not assumed. The help no longer claims concurrent O_DIRECT contends, and one
 cell covers the warning (mutation-proven against a build without it).
 
-**The real fix is now costed, and the rule that blocked it does not hold here.** "Concurrent O_DIRECT reads contend on
-NVMe" was measured for COMPRESS with a different reader. MEASURED on this device, 3 GiB per arm, cache dropped: 1
-reader O_DIRECT **4.17 GiB/s**, 4 readers **4.92**, 12 readers **4.41**, against buffered 1 reader **2.31** and 12
-readers **3.70**. So O_DIRECT does not contend at 12-way here and beats buffered at every count — the parallel reader
-could take O_DIRECT and keep both the parallelism and the low system time, which is the only arm that would win on
-BOTH columns above.
-
-**What that costs to build:** the MT reader preads 64 MiB blocks plus a 1 MiB-granular overlap, so offsets and lengths
-are already 4 KiB-aligned; the work is an aligned block allocation, an O_DIRECT descriptor through `gz_reopen_input`,
-and a partial final block. It touches the decompress reader, which is where every v0.17.62 CRITICAL lived, so it wants
-its own version and its own review round rather than being folded into a release.
+**SHIPPED v0.17.66: the parallel reader takes O_DIRECT.** The blocking rule was a COMPRESS result. MEASURED on this
+device, 3 GiB per arm: 1 reader O_DIRECT 4.17 GiB/s, 4 readers 4.92, 12 readers 4.41, against buffered 2.31 and 3.70.
+Cold 12 GiB `-t`, n=3: the flag went from 7.32-7.58 s to 3.68-3.69 s against a 3.43-3.47 s buffered default, at half
+the host CPU (~35 CPU-seconds against ~70). Alignment is handled by rounding each tail-reaching block's request up into the
+allocator's 2 MiB-rounded capacity; a refusal at read time degrades to the held descriptor and says so once at -v
+(`GZSTD_DEBUG_MT_DIRECT_EINVAL=1` forces it, because no local filesystem here refuses). `GZSTD_DEBUG_MT_DIRECT=0`
+keeps the old single-stream shape for an A/B. **Still owed: the same A/B on the Gen3 workstation**, whose storage may
+answer the contention question differently — that is the one machine where "concurrent O_DIRECT contends" was ever
+true. See CHANGELOG v0.17.66.
 
 ### 2. v0.17.42–43 small-VRAM validation — DONE, and it found a defect (fixed v0.17.45)
 

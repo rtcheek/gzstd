@@ -2884,8 +2884,10 @@ for cs in 1 128; do
   "$GZSTD" -k -f --cpu-only --chunk-size=$cs "$TMPDIR/mtreader.bin" -o "$TMPDIR/mt-$cs.zst" 2>/dev/null
   # MT path (default cpu-only decompress on a > 128 MiB regular file)
   "$GZSTD" -d -k -f --cpu-only "$TMPDIR/mt-$cs.zst" -o "$TMPDIR/mt-$cs.dec" 2>/dev/null
-  # single-reader reference (--direct-read keeps one reader)
-  "$GZSTD" -d -k -f --cpu-only --direct-read "$TMPDIR/mt-$cs.zst" -o "$TMPDIR/sg-$cs.dec" 2>/dev/null
+  # single-reader reference (pin one explicitly; --direct-read is parallel on
+  # eligible decompress inputs since v0.17.66)
+  "$GZSTD" -d -k -f --cpu-only --direct-read --read-threads 1 \
+    "$TMPDIR/mt-$cs.zst" -o "$TMPDIR/sg-$cs.dec" 2>/dev/null
   if files_match "$TMPDIR/mtreader.bin" "$TMPDIR/mt-$cs.dec" \
      && files_match "$TMPDIR/mtreader.bin" "$TMPDIR/sg-$cs.dec"; then
     pass "parallel reader round-trip, chunk=$cs MiB" "MT == single == source"
@@ -2895,36 +2897,54 @@ for cs in 1 128; do
   fi
 done
 
-# THE FLAG THAT COSTS 2.3x AND USED TO SAY NOTHING.  --direct-read makes
-# probe_preadable_input() refuse the input, so a decompress that would have run on
-# 12 prefetch readers runs on one.  MEASURED cold on a 12 GiB archive: 3.3-3.4 s
-# without the flag against 7.5-8.1 s with it, at roughly HALF the host CPU -- a
-# real trade, but one the user was never told about.  The warning must fire only
-# where the parallel reader would have engaged (this fixture clears the 128 MiB
-# gate) and must stay silent without the flag.
-drw_rc=0; "$GZSTD" -d -k -f --cpu-only --direct-read "$TMPDIR/mt-1.zst" \
-  -o "$TMPDIR/drw.dec" >/dev/null 2>"$TMPDIR/drw.log" || drw_rc=$?
-drq_rc=0; "$GZSTD" -d -k -f --cpu-only "$TMPDIR/mt-1.zst" \
-  -o "$TMPDIR/drq.dec" >/dev/null 2>"$TMPDIR/drq.log" || drq_rc=$?
-dr_warn=$(tr '\r' '\n' < "$TMPDIR/drw.log")
-dr_quiet=$(tr '\r' '\n' < "$TMPDIR/drq.log")
-if [[ $drw_rc -ne 0 || $drq_rc -ne 0 ]]; then
-  fail "--direct-read warns that it gives up the parallel reader" \
-       "decompress failed (direct rc=$drw_rc, default rc=$drq_rc)"
-elif ! printf '%s' "$dr_warn" | grep -q 'ONE reader thread'; then
-  fail "--direct-read warns that it gives up the parallel reader" "no warning with the flag"
-elif ! printf '%s' "$dr_warn" | grep -qE '[0-9]+ parallel prefetch readers'; then
-  fail "--direct-read warns that it gives up the parallel reader" \
-       "warning does not name the reader count: $(printf '%s' "$dr_warn" | head -1)"
-elif printf '%s' "$dr_quiet" | grep -q 'ONE reader thread'; then
-  fail "--direct-read warns that it gives up the parallel reader" "warned without the flag"
-elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/drw.dec" \
-  && files_match "$TMPDIR/mtreader.bin" "$TMPDIR/drq.dec"; then
-  pass "--direct-read warns that it gives up the parallel reader"
+# --direct-read NOW KEEPS THE PARALLEL READER (v0.17.66).  Until v0.17.65 the flag
+# dropped decompress to one reader thread -- 2.3x slower cold -- because
+# probe_preadable_input() refused an O_DIRECT input; v0.17.65 could only warn.
+# The reader now takes an O_DIRECT descriptor of its own: MEASURED cold on a
+# 12 GiB archive, n=3, wall 7.32-7.58 s before against 3.68-3.69 s now, with the
+# host CPU HALVED against the buffered default (~35 CPU-seconds against ~70,
+# because the ~41 s of SYSTEM time the page cache costs is gone).
+# Three things must hold: the flag engages the parallel reader WITH O_DIRECT, the
+# default engages it WITHOUT, and a filesystem that refuses O_DIRECT reads degrades
+# to buffered instead of failing -- forced here, since every local filesystem
+# accepts them (tmpfs included, on this kernel), so the path is otherwise dead code.
+dr_d_rc=0; "$GZSTD" -d -k -f --cpu-only -v --direct-read "$TMPDIR/mt-1.zst" \
+  -o "$TMPDIR/drd.dec" >/dev/null 2>"$TMPDIR/drd.log" || dr_d_rc=$?
+dr_b_rc=0; "$GZSTD" -d -k -f --cpu-only -v "$TMPDIR/mt-1.zst" \
+  -o "$TMPDIR/drb.dec" >/dev/null 2>"$TMPDIR/drb.log" || dr_b_rc=$?
+dr_f_rc=0; GZSTD_DEBUG_MT_DIRECT_EINVAL=1 "$GZSTD" -d -k -f --cpu-only -v --direct-read \
+  "$TMPDIR/mt-1.zst" -o "$TMPDIR/drf.dec" >/dev/null 2>"$TMPDIR/drf.log" || dr_f_rc=$?
+dr_dline=$(tr '\r' '\n' < "$TMPDIR/drd.log" | grep -m1 'parallel prefetch:')
+dr_bline=$(tr '\r' '\n' < "$TMPDIR/drb.log" | grep -m1 'parallel prefetch:')
+dr_refused=$(tr '\r' '\n' < "$TMPDIR/drf.log" | grep -c 'O_DIRECT reads refused')
+dr_dcalls=$(tr '\r' '\n' < "$TMPDIR/drd.log" | sed -n 's/.*O_DIRECT preads completed: \([0-9][0-9]*\).*/\1/p' | head -1)
+dr_fcalls=$(tr '\r' '\n' < "$TMPDIR/drf.log" | sed -n 's/.*O_DIRECT preads completed: \([0-9][0-9]*\).*/\1/p' | head -1)
+if [[ $dr_d_rc -ne 0 || $dr_b_rc -ne 0 || $dr_f_rc -ne 0 ]]; then
+  fail "--direct-read keeps the parallel reader (O_DIRECT)" \
+       "decompress failed (direct rc=$dr_d_rc, buffered rc=$dr_b_rc, forced rc=$dr_f_rc)"
+elif ! printf '%s' "$dr_dline" | grep -q 'O_DIRECT'; then
+  fail "--direct-read keeps the parallel reader (O_DIRECT)" \
+       "the flag did not engage the parallel reader with O_DIRECT: ${dr_dline:-<no reader line>}"
+elif [[ -z "$dr_dcalls" || $dr_dcalls -le 0 ]]; then
+  fail "--direct-read keeps the parallel reader (O_DIRECT)" \
+       "the setup line appeared, but no successful O_DIRECT pread was reported"
+elif printf '%s' "$dr_bline" | grep -q 'O_DIRECT'; then
+  fail "--direct-read keeps the parallel reader (O_DIRECT)" \
+       "the DEFAULT path claimed O_DIRECT: $dr_bline"
+elif [[ $dr_refused -ne 1 ]]; then
+  fail "--direct-read keeps the parallel reader (O_DIRECT)" \
+       "refused-O_DIRECT degrade logged $dr_refused times, want exactly 1 (once per run, not per reader)"
+elif [[ -z "$dr_fcalls" || $dr_fcalls -ne 0 ]]; then
+  fail "--direct-read keeps the parallel reader (O_DIRECT)" \
+       "forced refusal completed ${dr_fcalls:-<unreported>} direct preads, want 0"
+elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/drd.dec" \
+  && files_match "$TMPDIR/mtreader.bin" "$TMPDIR/drb.dec" \
+  && files_match "$TMPDIR/mtreader.bin" "$TMPDIR/drf.dec"; then
+  pass "--direct-read keeps the parallel reader (O_DIRECT), and degrades when refused"
 else
-  fail "--direct-read warns that it gives up the parallel reader" "round-trip mismatch"
+  fail "--direct-read keeps the parallel reader (O_DIRECT)" "round-trip mismatch"
 fi
-rm -f "$TMPDIR/drw.dec" "$TMPDIR/drq.dec" "$TMPDIR/drw.log" "$TMPDIR/drq.log"
+rm -f "$TMPDIR"/drd.* "$TMPDIR"/drb.* "$TMPDIR"/drf.*
 
 # v0.17.47: ZERO-COPY FRAMES.  The reader used to copy every frame out of its 64 MiB
 # block on ONE ordered consumer thread, and that copy capped every large decompress.
@@ -9609,7 +9629,7 @@ cp "$PIN/A.zst" "$PIN/in.zst"; cp "$PIN/B.zst" "$PIN/repl.zst"
 pin_swap in.zst repl.zst "$PIN/dd.log" -- -d --cpu-only --direct-read -v -f "$PIN/in.zst" -o "$PIN/dd.out"
 if [[ $PS_GATED -ne 1 ]]; then
   fail "decompress --direct-read reads the pinned archive" "gzstd never reached GZSTD_DEBUG_INPUT_GATE"
-elif ! grep -aq 'DIRECT-READ\] O_DIRECT input' "$PIN/dd.log"; then
+elif ! grep -aqE 'O_DIRECT preads completed: [1-9][0-9]*' "$PIN/dd.log"; then
   skip "decompress --direct-read reads the pinned archive" "O_DIRECT unavailable for $TMPDIR (the reader fell back)"
 elif [[ $PS_RC -eq 0 ]] && files_match "$PIN/A.bin" "$PIN/dd.out"; then
   pass "decompress --direct-read reads the pinned archive, not a renamed replacement"
