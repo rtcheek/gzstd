@@ -113,6 +113,14 @@ trap cleanup EXIT
 PASS=0
 FAIL=0
 SKIP=0
+# Skips that are a property of THIS HOST, not of the test set: the cell ran, and
+# the machine could not produce the condition it asserts on.  Counted separately
+# because the drift note at the end must keep meaning "a test was added or
+# removed" (RELEASING.md section 2) rather than "your box differs from the
+# pre-tag box" -- the same reason EXPECTED_NOGPU_DELTA and EXPECTED_NOGDS_DELTA
+# exist.  Those two are known group sizes subtracted up front; this one is
+# counted as it happens, because whether it fires depends on the run.
+HOST_UNEXERCISABLE=0
 TEST_NUM=0
 TOTAL_TESTS=0    # set after counting
 SECTION_NUM=0
@@ -278,6 +286,15 @@ fail() {
   fi
   echo ""
   update_progress
+}
+
+# A skip for something THIS HOST cannot exercise (see HOST_UNEXERCISABLE).  Use
+# it only where the machine, not the binary, decides -- a GPU-less host skipping
+# the GPU section is already covered by EXPECTED_NOGPU_DELTA and must NOT be
+# counted here as well, or the expectation drops twice.
+skip_host() {
+  HOST_UNEXERCISABLE=$((HOST_UNEXERCISABLE+1))
+  skip "$@"
 }
 
 skip() {
@@ -593,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=469
-$EXTENSIVE && EXPECTED_TESTS=600
+EXPECTED_TESTS=471
+$EXTENSIVE && EXPECTED_TESTS=602
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -2027,7 +2044,7 @@ CFLPY
   # with two 11 GiB cards: v0.17.50 exited in 5/5 runs at 1 GiB and at 2 GiB, but in
   # only 1/5 at 512 MiB.  A run with no skip line proves nothing either way (the CPU
   # drained the fixture before a GPU popped a trivial batch), so it is a SKIP -- and
-  # the drift note then says this host cannot exercise the cell.  A timeout FAILS:
+  # the drift note then ACCOUNTS for it (skip_host) instead of reporting drift.  A timeout FAILS:
   # a parked stream that misses its wakeup is a hang.
   tr_src="$TMPDIR/trivial-runs.bin"; tr_zst="$TMPDIR/trivial-runs.zst"
   tr_log="$TMPDIR/trivial-runs.log"
@@ -2056,7 +2073,7 @@ CFLPY
   elif [[ $rc -ne 0 ]]; then
     fail "trivial skip parks, never retires a GPU" "exit $rc"
   elif [[ $tr_skips -eq 0 ]]; then
-    skip "trivial skip parks, never retires a GPU" "not exercised: no trivial batch reached a GPU"
+    skip_host "trivial skip parks, never retires a GPU" "not exercised: no trivial batch reached a GPU"
   elif [[ $tr_exits -eq 0 && $tr_parks -ge 1 ]]; then
     pass "trivial skip parks, never retires a GPU" "($tr_skips skips, $tr_parks parks)"
   else
@@ -2877,6 +2894,37 @@ for cs in 1 128; do
          "MT match: $(files_match "$TMPDIR/mtreader.bin" "$TMPDIR/mt-$cs.dec" && echo y || echo n), single: $(files_match "$TMPDIR/mtreader.bin" "$TMPDIR/sg-$cs.dec" && echo y || echo n)"
   fi
 done
+
+# THE FLAG THAT COSTS 2.3x AND USED TO SAY NOTHING.  --direct-read makes
+# probe_preadable_input() refuse the input, so a decompress that would have run on
+# 12 prefetch readers runs on one.  MEASURED cold on a 12 GiB archive: 3.3-3.4 s
+# without the flag against 7.5-8.1 s with it, at roughly HALF the host CPU -- a
+# real trade, but one the user was never told about.  The warning must fire only
+# where the parallel reader would have engaged (this fixture clears the 128 MiB
+# gate) and must stay silent without the flag.
+drw_rc=0; "$GZSTD" -d -k -f --cpu-only --direct-read "$TMPDIR/mt-1.zst" \
+  -o "$TMPDIR/drw.dec" >/dev/null 2>"$TMPDIR/drw.log" || drw_rc=$?
+drq_rc=0; "$GZSTD" -d -k -f --cpu-only "$TMPDIR/mt-1.zst" \
+  -o "$TMPDIR/drq.dec" >/dev/null 2>"$TMPDIR/drq.log" || drq_rc=$?
+dr_warn=$(tr '\r' '\n' < "$TMPDIR/drw.log")
+dr_quiet=$(tr '\r' '\n' < "$TMPDIR/drq.log")
+if [[ $drw_rc -ne 0 || $drq_rc -ne 0 ]]; then
+  fail "--direct-read warns that it gives up the parallel reader" \
+       "decompress failed (direct rc=$drw_rc, default rc=$drq_rc)"
+elif ! printf '%s' "$dr_warn" | grep -q 'ONE reader thread'; then
+  fail "--direct-read warns that it gives up the parallel reader" "no warning with the flag"
+elif ! printf '%s' "$dr_warn" | grep -qE '[0-9]+ parallel prefetch readers'; then
+  fail "--direct-read warns that it gives up the parallel reader" \
+       "warning does not name the reader count: $(printf '%s' "$dr_warn" | head -1)"
+elif printf '%s' "$dr_quiet" | grep -q 'ONE reader thread'; then
+  fail "--direct-read warns that it gives up the parallel reader" "warned without the flag"
+elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/drw.dec" \
+  && files_match "$TMPDIR/mtreader.bin" "$TMPDIR/drq.dec"; then
+  pass "--direct-read warns that it gives up the parallel reader"
+else
+  fail "--direct-read warns that it gives up the parallel reader" "round-trip mismatch"
+fi
+rm -f "$TMPDIR/drw.dec" "$TMPDIR/drq.dec" "$TMPDIR/drw.log" "$TMPDIR/drq.log"
 
 # v0.17.47: ZERO-COPY FRAMES.  The reader used to copy every frame out of its 64 MiB
 # block on ONE ordered consumer thread, and that copy capped every large decompress.
@@ -6882,6 +6930,38 @@ else
   fi
   rm -rf "$MTD"
 
+  # 4c. --sync-output on EXTRACTION (v0.17.65).  Until then the flag reached only
+  # the single-output-file paths, so an extract had no way to ask for durability:
+  # with buffered output it returns as soon as the page cache has the bytes.
+  # MEASURED on a 4 GiB tree, --no-direct: 1.47 s returned holding 4096 MiB dirty,
+  # durable only at 2.87 s; with --sync-output, 2.25 s returned, 0 MiB dirty,
+  # durable at 2.26 s -- FASTER end to end, because the writers interleave their
+  # fsyncs instead of leaving one flush for the kernel after exit.  This cell
+  # never gates on wall clock.  A round-trip alone would pass if the flag were
+  # ignored, so force fsync itself to fail on one small and one large member:
+  # both runs must be non-zero and name that member.  This mutation-proves the
+  # writer-pool and big-file finalizer call sites before the success round-trip.
+  rm -rf "$XOUT"; mkdir -p "$XOUT"
+  xs_rc=0; GZSTD_DEBUG_FAIL_EXTRACT_FSYNC=deep.txt \
+    "$GZSTD" -d --cpu-only --tar --no-direct --sync-output -C "$XOUT" "$XARC" \
+    > /dev/null 2>"$TMPDIR/xsync-small.log" || xs_rc=$?
+  rm -rf "$XOUT"; mkdir -p "$XOUT"
+  xb_rc=0; GZSTD_DEBUG_FAIL_EXTRACT_FSYNC=big.bin \
+    "$GZSTD" -d --cpu-only --tar --no-direct --sync-output -C "$XOUT" "$XARC" \
+    > /dev/null 2>"$TMPDIR/xsync-big.log" || xb_rc=$?
+  rm -rf "$XOUT"; mkdir -p "$XOUT"
+  if [[ $xs_rc -ne 0 && $xb_rc -ne 0 ]] \
+     && grep -q 'deep.txt: --sync-output: fsync failed' "$TMPDIR/xsync-small.log" \
+     && grep -q 'big.bin: --sync-output: fsync failed' "$TMPDIR/xsync-big.log" \
+     && "$GZSTD" -d --cpu-only -q --tar --no-direct --sync-output -C "$XOUT" "$XARC" 2>/dev/null \
+     && diff -r --no-dereference "$XS" "$XOUT$XS" >/dev/null 2>&1; then
+    pass "--sync-output extraction round-trips"
+  else
+    fail "--sync-output extraction" \
+         "fsync failure was not reported (small rc=$xs_rc, big rc=$xb_rc), or success round-trip failed"
+  fi
+  rm -f "$TMPDIR/xsync-small.log" "$TMPDIR/xsync-big.log"
+
   # 5. Cross-tool: GNU tar creates, gzstd extracts.
   tar -cf - -C "$(dirname "$XS")" "$(basename "$XS")" 2>/dev/null | "$GZSTD" -q -f -o "$XARC" - 2>/dev/null
   rm -rf "$XOUT"; mkdir -p "$XOUT"
@@ -7128,10 +7208,19 @@ PYEOF
     tar --sparse -cf - -C "$GS" sp.bin sib.txt 2>/dev/null | "$GZSTD" -q -f -o "$GSA" - 2>/dev/null
     rm -rf "$TMPDIR/gsout"; mkdir -p "$TMPDIR/gsout"
     "$GZSTD" -d --cpu-only -q --tar -C "$TMPDIR/gsout" "$GSA" 2>/dev/null
-    if cmp -s "$GS/sp.bin" "$TMPDIR/gsout/sp.bin" 2>/dev/null; then
+    # The explicit GNU-sparse writer is the extractor's third regular-file
+    # ownership path.  Force its fsync verdict too; the ordinary content run
+    # above and the forced-failure run below together pin both responsibilities.
+    rm -rf "$TMPDIR/gssync"; mkdir -p "$TMPDIR/gssync"
+    gs_sync_rc=0; GZSTD_DEBUG_FAIL_EXTRACT_FSYNC=sp.bin \
+      "$GZSTD" -d --cpu-only --sync-output --tar -C "$TMPDIR/gssync" "$GSA" \
+      >/dev/null 2>"$TMPDIR/gssync.log" || gs_sync_rc=$?
+    if cmp -s "$GS/sp.bin" "$TMPDIR/gsout/sp.bin" 2>/dev/null \
+       && [[ $gs_sync_rc -ne 0 ]] \
+       && grep -q 'sp.bin: --sync-output: fsync failed' "$TMPDIR/gssync.log"; then
       pass "reads GNU tar --sparse archive (content)"
     else
-      fail "GNU sparse read" "content mismatch or file missing"
+      fail "GNU sparse read" "content mismatch, file missing, or sparse fsync not reported (rc=$gs_sync_rc)"
     fi
     [[ -f "$TMPDIR/gsout/sib.txt" ]] \
       && pass "GNU sparse read keeps parser aligned (sibling present)" \
@@ -7148,7 +7237,7 @@ PYEOF
     else
       skip "reads PAX sparse (--format=posix) archive" "tar lacks --format=posix sparse"
     fi
-    rm -rf "$GSA" "$TMPDIR/gsout"
+    rm -rf "$GSA" "$TMPDIR/gsout" "$TMPDIR/gssync" "$TMPDIR/gssync.log"
   else
     skip "reads GNU tar --sparse archive (content)" "no tar --sparse / sparse fs"
     skip "GNU sparse read keeps parser aligned (sibling present)" "no tar --sparse / sparse fs"
@@ -9763,6 +9852,17 @@ elif ! gds_testable; then
   # has already subtracted them once.
   EXPECTED_HERE=$(( EXPECTED_HERE - EXPECTED_NOGDS_DELTA ))
   EXPECTED_WHY=" (baseline $EXPECTED_TESTS, -$EXPECTED_NOGDS_DELTA GDS unavailable: $(gds_host_status))"
+fi
+# Cells that RAN but could not reach their condition on this machine (skip_host).
+# Unlike the two deltas above this is not a known group size -- it depends on what
+# the run could provoke -- so it is subtracted from what this run could reach.
+if (( HOST_UNEXERCISABLE > 0 )); then
+  EXPECTED_HERE=$(( EXPECTED_HERE - HOST_UNEXERCISABLE ))
+  if [[ -z "$EXPECTED_WHY" ]]; then
+    EXPECTED_WHY=" (baseline $EXPECTED_TESTS, -$HOST_UNEXERCISABLE this host could not exercise)"
+  else
+    EXPECTED_WHY="${EXPECTED_WHY%)}, -$HOST_UNEXERCISABLE this host could not exercise)"
+  fi
 fi
 if [[ $TOTAL_RAN -ne $EXPECTED_HERE ]]; then
   printf "\n  ${C_DIM}note: expected %d on this host%s but %d ran — please update EXPECTED_TESTS.${C_RESET}\n" \

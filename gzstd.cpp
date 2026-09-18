@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.64";
+static constexpr const char * GZSTD_VERSION = "0.17.65";
 //
 // Architecture overview:
 //
@@ -3651,6 +3651,14 @@ static void print_help_long()
 "     fsync the output file before exit.  Default: off.  Without\n"
 "     this the OS flushes in the background; the data is durable on\n"
 "     a clean shutdown but not guaranteed across power loss.\n"
+"     On `-d --tar` extraction it fsyncs EACH RESTORED REGULAR FILE\n"
+"     as that file is finished (directory timestamps and directory\n"
+"     entries themselves are not covered).  Its visible cost is largest\n"
+"     with buffered output, which can return with gigabytes still dirty\n"
+"     and the kernel flushing after gzstd has exited -- measured 1.58 s\n"
+"     returned against 3.00 s durable on a 4 GiB tree.  O_DIRECT avoids\n"
+"     that page-cache backlog but is not a power-loss durability promise;\n"
+"     this flag fsyncs that output too.  Expect it to cost wall time.\n"
 "\n"
 "  --verify\n"
 "     While compressing, independently decompress-verify every frame\n"
@@ -3824,10 +3832,19 @@ static void print_help_long()
 "     reads cold from disk, with no cache to drop, so no kcompactd\n"
 "     compaction stall and no eviction of other users' cached data\n"
 "     (unlike --cold, which drops the cache via fadvise).  Always a\n"
-"     SINGLE stream: concurrent O_DIRECT reads contend on NVMe, so it\n"
-"     cannot use --read-threads and cannot go through mmap.  When the\n"
-"     input is already cached the buffered path is faster, which is why\n"
-"     this is not simply the default.\n"
+"     SINGLE stream: it cannot use --read-threads and cannot go through\n"
+"     mmap.  When the input is already cached the buffered path is\n"
+"     faster, which is why this is not simply the default.\n"
+"\n"
+"     ON DECOMPRESS IT COSTS MORE THAN IT SAVES, and gzstd warns when you\n"
+"     ask for it there: a decompress of a seekable file normally uses a\n"
+"     parallel prefetch reader, and an O_DIRECT input gives that up for a\n"
+"     single thread.  MEASURED on the 8-GPU server, 12 GiB archive,\n"
+"     cache dropped before\n"
+"     every run: 3.3-3.4 s by default against 7.5-8.1 s with this flag.\n"
+"     What it buys is host CPU -- about 70 CPU-seconds against 38, nearly\n"
+"     all of the difference being SYSTEM time -- so it is a real trade on\n"
+"     a machine where cores are scarcer than wall time, not a mistake.\n"
 "     Independent of --direct, which is O_DIRECT for OUTPUT.\n"
 "\n"
 "     YOU RARELY NEED TO SET THIS.  Compressing a COLD regular file of\n"
@@ -14874,11 +14891,13 @@ static constexpr size_t MT_READER_BAIL = SIZE_MAX;
 // pathname lookup can select a different inode after a concurrent rename, while
 // the rest of the input transaction (including --rm identity) remains bound to
 // the descriptor opened by the driver.  --direct-read is excluded because it
-// owns a separate O_DIRECT stream itself.
-static int probe_preadable_input(const Options & opt, FILE * in, uint64_t * size)
+// owns a separate O_DIRECT stream itself; the warning gate may explicitly
+// ignore that exclusion to ask whether this same fd would otherwise qualify.
+static int probe_preadable_input(const Options & opt, FILE * in, uint64_t * size,
+                                 bool ignore_direct_read = false)
 {
   *size = 0;
-  if (opt.direct_read) return -1;
+  if (opt.direct_read && !ignore_direct_read) return -1;
   const int fd = in ? ::fileno(in) : (opt.input == "-" ? 0 : -1);
   if (fd < 0) return -1;
 
@@ -15621,6 +15640,40 @@ static size_t stream_frames_to_queue(
   // which also owns every fallback path.  peek runs on the FILE* (seekable
   // here, since fstat said so); the MT reader preads absolute offsets, so the
   // peek's position is irrelevant.
+  // --direct-read gives the parallel reader up: probe_preadable_input() refuses an
+  // O_DIRECT input outright, so the whole decompress falls to this single-threaded
+  // splitter.  That is the flag's settled design, but nothing told the user what it
+  // costs, and the flag's own help used to promise the opposite.
+  // MEASURED 2026-09-18, 8-GPU server, 12 GiB entropy-coded archive, cache dropped
+  // before every run, n=3, ranges non-overlapping: default 3.33-3.44 s against
+  // --direct-read 7.46-8.05 s (2.3x).  The host CPU columns invert -- ~70
+  // CPU-seconds against ~38, with 41 s of the difference being SYSTEM time -- so it
+  // is a trade, and the warning says so rather than calling the flag wrong.
+  // Only where the parallel reader WOULD have engaged, and only when the user asked
+  // for the flag: --adapt sets it from a direction-keyed prior that measures this
+  // path for itself and stops choosing it.
+  if (opt.direct_read && opt.direct_read_user_set) {
+    uint64_t wsize = 0;
+    // Counterfactual probe: ask whether this same held descriptor would have
+    // qualified if --direct-read were absent.  This keeps the warning's input
+    // types and seekability test identical to the real MT gate (including a
+    // regular-file stdin redirect and a block device).
+    const int wfd = probe_preadable_input(opt, in, &wsize,
+                                          /*ignore_direct_read=*/true);
+    const int wreaders = opt.read_threads > 0 ? (int)opt.read_threads
+        : std::max(3, std::min(12, resolve_cpu_threads(opt.cpu_threads) / 8));
+    // The peek is part of the real gate, not an optional refinement: a foreign
+    // single-frame stream with no content-size header stays sequential with or
+    // without --direct-read and must not be warned about lost parallelism.
+    if (wfd >= 0 && wsize > (uint64_t)(2 * 64 * ONE_MIB) && wreaders > 1
+        && peek_first_frame_decomp_size(in) >= 0)
+      vlog(V_DEFAULT, opt,
+           "gzstd: warning: --direct-read decompresses on ONE reader thread; without it "
+           "this input would use " + std::to_string(wreaders) + " parallel prefetch readers "
+           "(measured 2.3x faster cold on the 8-GPU server, at roughly twice the host CPU). "
+           "Drop the flag unless "
+           "you are trading wall time for CPU.\n");
+  }
   {
     uint64_t fsz = 0;
     int pfd = probe_preadable_input(opt, in, &fsz);
@@ -20784,6 +20837,45 @@ private:
     return cur;
   }
 
+  // --sync-output, for extraction.  Without it an extract RETURNS AS SOON AS THE
+  // PAGE CACHE HAS THE BYTES -- there is no fsync/fdatasync anywhere in this path, by
+  // design, because GNU tar does not sync either and forcing it would slow every
+  // extract.  MEASURED 2026-09-18, 4 GiB tree, this server: the Gen4+ O_DIRECT
+  // output default returns in 1.40 s with 0 MiB dirty and a following sync costs
+  // 0.01 s; buffered output (`--no-direct`, and the default below Gen4) returns
+  // in 1.58 s holding 4096 MiB dirty and the kernel then spends 1.42 s.  O_DIRECT
+  // removes that page-cache backlog, but it does not promise power-loss
+  // durability (device caches and metadata still exist), so the flag fsyncs both
+  // paths.  The visible cost is on the buffered case, where the user who needs
+  // durability previously had no way to ask for it.
+  // Per REGULAR FILE, on the fd that just wrote it.  Directory mtimes are applied later
+  // from their own descriptors and are NOT covered; neither is the parent
+  // directory's entry for a new file, which needs the directory's own fsync.
+  // A FAILED fsync IS A FAILED EXTRACTION when the user asked for durability.
+  // Both other --sync-output sites die_io() on it (the O_DIRECT output fd, and
+  // the copy fallback that installs over a rename); dropping the result here
+  // would have made the flag a promise that reports success either way, which
+  // this project treats as a defect in its own right.  Reported per member
+  // through fail(), like every other write error in the extractor, so the run
+  // exits non-zero and names the file rather than aborting the whole tree.
+  void sync_if_asked(int fd, const std::string & rel) {
+    if (!opt_.sync_output) return;
+    // Test-only, exact/suffix member selector: a successful round-trip cannot
+    // prove fsync happened, so the suite forces the durability operation to fail
+    // on each regular-file ownership path and checks the per-member verdict.
+    bool forced = false;
+    if (const char * p = ::getenv("GZSTD_DEBUG_FAIL_EXTRACT_FSYNC")) {
+      const size_t n = std::strlen(p);
+      forced = n > 0 && (rel == p || (rel.size() > n && rel[rel.size() - n - 1] == '/'
+                                     && rel.compare(rel.size() - n, n, p) == 0));
+    }
+    const bool ok = forced ? (errno = EIO, false) : fsync_fd_ok(fd);
+    if (!ok) {
+      const int e = errno;  // keep the fsync error across message construction
+      fail(rel, "--sync-output: fsync failed (" + std::string(std::strerror(e)) + ")");
+    }
+  }
+
   void set_meta_fd(int fd, uint32_t mode, int64_t mtime, uint64_t uid, uint64_t gid) {
     (void)::fchmod(fd, mode & 07777);
     struct timespec ts[2]; ts[0].tv_sec = (time_t)mtime; ts[0].tv_nsec = 0; ts[1] = ts[0];
@@ -21457,6 +21549,7 @@ private:
   void finalize_big(BigFile & b) {
     set_meta_fd(b.mfd, b.mode, b.mtime, b.uid, b.gid);
     apply_ext(b.mfd, /*is_dir=*/false, b.ext);
+    sync_if_asked(b.mfd, b.rel);
     ::close(b.mfd);
     b.mfd = -1;
   }
@@ -21579,6 +21672,7 @@ private:
     if (!ok) fail(j.rel, std::strerror(errno));
     set_meta_fd(fd, j.mode, j.mtime, j.uid, j.gid);
     apply_ext(fd, /*is_dir=*/false, j.ext);
+    sync_if_asked(fd, j.rel);
     ::close(fd);
     if (m_) m_->wrote_bytes.fetch_add(j.size, std::memory_order_relaxed);
     // Always published, even when m_ is null (parallel mode routes the progress
@@ -22056,6 +22150,7 @@ private:
     if (!ok) fail(rel, "sparse write failed");
     set_meta_fd(fd, e.mode, e.mtime, e.uid, e.gid);
     apply_ext(fd, /*is_dir=*/false, e.ext);
+    sync_if_asked(fd, rel);
     ::close(fd);
     if (m_) m_->wrote_bytes.fetch_add(e.real_size, std::memory_order_relaxed);
     g_adapt_extract_written.fetch_add(e.real_size, std::memory_order_relaxed);

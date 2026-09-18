@@ -1,12 +1,55 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.64  
+**Covers:** v0.9.50 → v0.17.65  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.65 — two flags that did not say what they cost
+
+**Two long-open ROADMAP decisions, both settled by measurement rather than by argument.**
+
+### `--direct-read` gives up the parallel reader on decompress, and now says so
+
+`probe_preadable_input()` refuses an O_DIRECT input, so a decompress that would have run on 12 prefetch readers runs on
+one. The ROADMAP recorded 31% in 2026-09-09; **re-measured 2026-09-18 it is 2.3x**, because v0.17.47's zero-copy reader
+made the fast path faster while this one stayed single-threaded. 12 GiB entropy-coded archive, `--cpu-only -t`, cache
+dropped before every run, n=3, non-overlapping: default **3.33/3.44/3.44 s** against **7.46/7.86/8.05 s**. The host CPU
+columns invert — ~70 CPU-seconds against ~38, with 41 s of the difference being SYSTEM time — so it is a real trade for
+a machine where cores are scarcer than wall time, and the warning says that rather than calling the flag wrong.
+
+An explicitly-set `--direct-read` on a decompress large enough to have used the parallel reader now names the reader
+count it gave up and states both sides of the trade. `--adapt` is exempt: its read-path priors are direction-keyed, so a
+decompress compares decompress-measured rates and its explore-once probe stops choosing this path by itself — checked in
+the code, not assumed. The flag's help claimed "concurrent O_DIRECT reads contend on NVMe", which is a COMPRESS result:
+**measured on this device, 3 GiB per arm, cache dropped: 1 reader O_DIRECT 4.17 GiB/s, 4 readers 4.92, 12 readers 4.41,
+against buffered 2.31 and 3.70.** That claim is gone, and the ROADMAP now costs the real fix — letting the parallel
+reader take O_DIRECT, which is the only arm that would win on both columns.
+
+### `--sync-output` now covers `-d --tar` extraction
+
+Extraction had no `fsync`/`fdatasync` anywhere, by design — GNU tar does not sync either — so with buffered output it returned
+as soon as the page cache held the bytes, and `--sync-output` reached only the single-output-file paths. **MEASURED,
+4 GiB tree:** with the Gen4+ O_DIRECT default, extract returns in 1.40 s with 0 MiB dirty and a following `sync` costs
+0.01 s; with `--no-direct` it returns in 1.58 s holding **4096 MiB dirty** and
+the kernel then spends 1.42 s. The flag now fsyncs each restored regular file as that file is finished. On the buffered arm it
+is **faster end to end** — durable at 2.26 s against 2.87 s — because the writers interleave their fsyncs instead of
+leaving one flush to the kernel after exit. Directory timestamps and directory entries are not covered, and the help
+says so. A failed fsync fails the run: the other two `--sync-output` sites already `die_io()` on it, and a durability
+flag that reports success either way is the "verdict defaulting to OK" this project treats as a defect. The extractor
+reports it per member through `fail()`, so the run exits non-zero and names the file.
+O_DIRECT's lack of dirty page-cache bytes makes that arm's incremental sync cost small on this host; it is not itself
+a power-loss durability guarantee, so `--sync-output` fsyncs that arm too.
+
+### Test
+
+Two new cells: the `--direct-read` warning (fires with the flag on a >128 MiB archive, silent without it, names the
+reader count, round-trips) and `--sync-output` extraction. The first is mutation-proven against a build without the
+warning; the second forces fsync failures on the small-file writer, large-file finalizer and GNU-sparse writer, then
+does a success round-trip. Baselines: 471 default, 353 CPU-only, 602 extensive, no-GPU delta 118, no-GDS delta 11.
 
 ## v0.17.64 — a restored symlink carried the extraction time, not its own
 

@@ -681,30 +681,38 @@ as views into the block (CHANGELOG v0.17.47): `--cpu-only` 14.66 to 40.08 GiB/s 
 Three residuals from seven review rounds on `--gds-only -d`. None is a defect in
 shipped behaviour; each is a measurement or a decision that has not been made.
 
-### 1. `--direct-read` makes a COLD DECOMPRESS 31% SLOWER — decide what to do about it
+### 1. `--direct-read` on a cold decompress — DECIDED: warn, and the fix is now costed
 
-**MEASURED 2026-09-09, cold, 65 GiB `-t`, cache dropped between every run, ranges
-non-overlapping:**
+**RE-MEASURED 2026-09-18** on the 8-GPU server, 12 GiB entropy-coded archive, `--cpu-only -t`, cache dropped before
+every run, n=3, ranges non-overlapping:
 
-| `--cpu-only -t` cold | wall | host CPU |
+| arm | wall | host CPU (user + sys) |
 |---|---|---|
-| default read path | **18.98 / 19.49 / 19.69 s** | ~305–312 s |
-| `--direct-read` | **25.56 s** | ~96 s |
+| default | **3.33 / 3.44 / 3.44 s** | ~70 s (41 s of it SYSTEM) |
+| `--direct-read` | **7.46 / 7.86 / 8.05 s** | ~38 s (3.2 s system) |
 
-The mechanism is documented and was never costed: `stream_frames_to_queue_mt` is
-`GATED: seekable regular file >128 MiB, NOT --direct-read`, so the flag does not
-merely change how bytes are read — it drops decompress to the single-threaded
-splitter and gives up all **12** parallel prefetch readers. `project_reader_paths`'
-"O_DIRECT > buffered > mmap cold" is a COMPRESS result and does not transfer.
+The gap WIDENED from the 31% first recorded here to **2.3x**, because v0.17.47's zero-copy reader made the fast path
+faster while this one stayed single-threaded. The mechanism is one line: `probe_preadable_input()` returns -1 for
+`opt.direct_read`, so the parallel prefetch reader never engages.
 
-A user following that ranking on a cold decompress loses a third of their
-throughput. **Options, none taken yet:** warn when `--direct-read` is given on a
-decompress large enough to have used the MT reader; revisit whether the MT gate can
-admit O_DIRECT (the compress-side "concurrent O_DIRECT contends" rule was measured
-on a different reader); or document the direction split and leave the flag alone.
-Note the CPU columns invert — the fast path burns ~305 s of host CPU, 250 s of it
-SYSTEM time — so this is the same trade `project_gds_real_media` describes, one
-layer down, and "slower" is not the whole story on a loaded box.
+**Shipped: a warning.** An explicitly-set `--direct-read` on a decompress large enough to have used the parallel
+reader now says so, names the reader count it gave up, and states the trade in both directions (2.3x slower, about
+half the host CPU). `--adapt` is deliberately exempt: its read-path priors are direction-keyed
+(`priors.dir[compress?0:1]`), so a decompress compares decompress-measured rates and its explore-once probe stops
+choosing this path by itself — checked, not assumed. The help no longer claims concurrent O_DIRECT contends, and one
+cell covers the warning (mutation-proven against a build without it).
+
+**The real fix is now costed, and the rule that blocked it does not hold here.** "Concurrent O_DIRECT reads contend on
+NVMe" was measured for COMPRESS with a different reader. MEASURED on this device, 3 GiB per arm, cache dropped: 1
+reader O_DIRECT **4.17 GiB/s**, 4 readers **4.92**, 12 readers **4.41**, against buffered 1 reader **2.31** and 12
+readers **3.70**. So O_DIRECT does not contend at 12-way here and beats buffered at every count — the parallel reader
+could take O_DIRECT and keep both the parallelism and the low system time, which is the only arm that would win on
+BOTH columns above.
+
+**What that costs to build:** the MT reader preads 64 MiB blocks plus a 1 MiB-granular overlap, so offsets and lengths
+are already 4 KiB-aligned; the work is an aligned block allocation, an O_DIRECT descriptor through `gz_reopen_input`,
+and a partial final block. It touches the decompress reader, which is where every v0.17.62 CRITICAL lived, so it wants
+its own version and its own review round rather than being folded into a release.
 
 ### 2. v0.17.42–43 small-VRAM validation — DONE, and it found a defect (fixed v0.17.45)
 
@@ -1507,8 +1515,9 @@ ran). Confirmed via strace: `--direct --sync-output` issues one fsync, `--direct
 alone issues none.
 
 When the O_DIRECT writer owns output, the `FILE* out` was closed and nulled, so
-the `if (out) fsync(out)` branch in `main` is skipped. O_DIRECT data is durable
-but the `ftruncate`-set size metadata isn't fsync'd. If a user pairs
+the `if (out) fsync(out)` branch in `main` is skipped. O_DIRECT bypasses the page
+cache but does not by itself flush device caches, and the `ftruncate`-set size
+metadata isn't fsync'd either. If a user pairs
 `--direct --sync-output` expecting durability they don't get the fsync. Add an
 `fdatasync(dw->fd())` in `DirectWriter::finalize()` (or before close) when
 `sync_output` is set.
@@ -1984,7 +1993,7 @@ measurement, not before.
 | `--keep-going` — recover a damaged archive on decompress | — | Medium | DONE (v0.14.41–42) |
 | Delete compress CPU-rescue → clean GPU-fault abort | — | Medium | DONE (v0.14.43) |
 | Checkpoint/resume on fault (resume from last good frame vs. rebuild from zero) | — | Low | Not started |
-| `-d --tar` writer pool measures PAGE CACHE, not the device | tar | Medium | Open (found 2026-08-04) — extract never waits for durability (zero `fdatasync` call sites; O_DIRECT exists for the leaf open but is not the default), so it writes into page cache and returns. Measured: a 10.36 GiB extract to a 0.81 GiB/s drive **returned in 1.63 s** and the kernel then spent **13.19 s** flushing after the process exited. The writer pool's busy/starved split is therefore `memcpy` bandwidth, and the sink-bound grow lever (v0.15.27, +26% on the server) cannot calibrate against real storage on any box whose RAM absorbs the output — it only engages where write volume outruns page cache or trips dirty-page throttling, which is a fragile precondition rather than a general property. Not obviously a defect (GNU tar does not fsync either, and forcing it would slow every extract and change semantics), but it means (a) `--adapt`'s extract writer verdicts are not measuring what they appear to, and (b) gzstd's reported extract time is not durable time. Wants a decision: measure sink pressure some other way, or expose durability explicitly, or document the limit |
+| `-d --tar` writer pool measures PAGE CACHE, not the device | tar | Medium | RESOLVED 2026-09-18 as a HOST-DEPENDENT limit, plus a way to ask for durability. The premise held only for BUFFERED output. MEASURED on the 8-GPU server, 4 GiB tree: with the Gen4+ O_DIRECT output default the extract returns in 1.40 s with 0 MiB dirty and a following `sync` costs 0.01 s, so the page-cache backlog is absent and the writer pool's busy/starved split is measuring the device. (O_DIRECT alone is not a power-loss durability guarantee; the explicit flag still fsyncs this arm.) With `--no-direct` (which is the default below Gen4, i.e. the workstation where this row was first written) it returns in 1.58 s holding 4096 MiB dirty and the kernel then spends 1.42 s, so the reported time is about half the durable time and the pool's signal is memcpy bandwidth. Shipped v0.17.65: `--sync-output` now covers extraction, fsyncing each restored regular file as it is finished (directory timestamps and directory entries are NOT covered, and the help says so). It is also FASTER end to end on the buffered arm -- durable at 2.26 s against 2.87 s -- because the writers interleave their fsyncs instead of leaving one flush for the kernel after exit. What remains unchanged: `--adapt`'s extract writer verdicts are honest where output is O_DIRECT and measure memcpy where it is buffered; no attempt was made to re-derive sink pressure for that case |
 | `--adapt` does nothing for operations shorter than `RAMP_SEC` | — | Medium | Open (found 2026-08-04) — the governor classifies nothing for the first 3.0 s, so any run finishing inside ~4 s never leaves warmup and gets no adaptation at all. Measured: extract from a healthy drive completed its pipeline in 2.59 s and produced no `[ADAPT] regime shares` line whatsoever. **This gets WORSE as hardware gets faster** — more operations finish inside the ramp — so it will bite the 8xH100/256-core box harder than this one. Interacts with the v0.15.55 evidence gate (2 s / 25% classified) which correctly refuses to persist a verdict from such a run, so fast runs also teach the profile nothing. **DECIDED 2026-08-04 (rtcheek): leave the ramp as is.** Recorded as a known, accepted limit rather than a pending fix — short runs get no adaptation, and that is the deliberate trade for not classifying on startup transients. If it is ever revisited, derive the ramp from observed signal stability rather than shrinking the constant, which would trade one arbitrary number for another |
 | Reader-pool controller ratcheted to its CEILING when the reader was not the bottleneck | — | Medium | DONE (v0.15.57) — the controller maximises READER throughput, which is only a proxy for run time when the reader is the wall. Warm on a 24-thread Gen3 box (compute-bound, ~6.97 GiB/s) it walked 3→4→6→9, pinned and persisted 9, while a fixed sweep put the optimum at 3 (median-of-7: 5.22 s at 3 vs 5.35 s at 9, **non-overlapping**). A confirm-window was tried first and did NOT help — proof it was not noise but a real gain in the wrong quantity: extra readers do raise reader throughput, by taking CPU from the workers. It now gates on the published regime like every other `--adapt` acting site (it was the only one that did not), stepping only while SOURCE_BOUND and reverting an in-flight probe if the regime leaves it. Verified: warm now holds 3 across 5 runs and persists 3 |
 | `--adapt` governor classified clearly I/O-bound runs as COMPUTE_BOUND | — | Medium | DONE (v0.15.58-60) — three separate defects in the ONE signal the governor uses (`reader_io_ns` summed across readers / `reader_threads`): the divisor was written only at teardown so every window used the pool's STARTING count (wrong in both directions — shrink understates, grow overstates); `--tar` create never fed any of the four reader counters, so `rbusy` was identically 0 and it could never classify source-bound; and `-d --tar` extract neither timed its `pread_seek_frame` nor published the decode pool's reader count, leaving the divisor at its default of 1 against ~15-22 live readers. All three now measured. Verified: cold read 3%→91% source-bound, tar create compute→source-bound 47%, extract compute→source-bound 46%, and `[READER]` io went from an impossible 105.7% to 91.5% |

@@ -49,9 +49,15 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 559 | 419 | **yes, this server** |
-| GPU, GDS unavailable | 553 | 413 | yes, the workstation |  <!-- derived: 559-6; the v0.17.43 geometry cell needs a GPU but not GDS, so it RUNS there -->
-| no GPU (the CPU-only build) | not yet observed | 336 | yes |
+| GPU + GPUDirect Storage usable (the baseline) | 599 | 468 | **yes, this server** |
+| GPU, GDS unavailable | 589 | 458 | yes, the workstation |  <!-- derived: baseline - EXPECTED_NOGDS_DELTA (11); measured 456 default at the v0.17.63 baseline of 467 -->
+| no GPU (the CPU-only build) | not observed (`-e` adds no CPU-only cells) | 351 | yes |
+
+The baseline row counts what RAN, so it is the `EXPECTED_TESTS` constant (600 / 469) minus the one
+cell this server cannot provoke — the trivial-park cell needs a trivially-compressed batch to reach
+a GPU, and the CPU pool here drains the fixture first. Since v0.17.64 that skip goes through
+`skip_host`, which subtracts itself from the expectation, so the run says "as expected on this host"
+instead of raising a drift note; a note again means only what this section says it means.
 
 **GDS was unusable on both machines for part of 2026-09-04 and is working again on this server since
 that afternoon.** It broke when the server moved to kernel 6.8.0-139: `nvidia-fs` still loaded, but
@@ -76,9 +82,11 @@ their provenance; when adding or removing tests, update the **baseline**.
 **The default `./gzstd-test.sh ./build/gzstd` was dropped from this checklist (2026-08-06)
 because it is a strict subset of `-e`.** Every extensive gate in the script is
 `if $EXTENSIVE; then … fi`; none exclude, so `-e` runs the default set plus the compat
-sections. Measured on the 256-thread box: default 9.5 min, extensive 14 min, CPU-only
-1.4 min — dropping the default cut the pre-tag suite time from ~25 to ~15.5 min with no
-loss of coverage. **The CPU-only run stays**: it is a different binary (~50 `HAVE_NVCOMP`
+sections. Re-measured on the 256-thread box 2026-09-18: **default 7.0 min, extensive 8.4 min,
+CPU-only 1.6 min** — the 2026-08-06 figures (9.5 / 14 / 1.4) are superseded, and the arc that
+removed fixed costs is why (teardown sleeps in v0.17.55, GPU ordering in v0.17.63). The extensive
+run was timed while another tenant held six of eight GPUs at 100%: this suite is dominated by
+kernel I/O, not GPU time (2m25s user against 8m10s sys), so GPU contention barely moves it. **The CPU-only run stays**: it is a different binary (~50 `HAVE_NVCOMP`
 conditional regions compile the other way), so `-e` cannot substitute for it at any test
 count, and it is the cheapest of the three.
 
