@@ -718,6 +718,21 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # (471 - 353) and is unaffected by cells gated behind $EXTENSIVE.
 EXPECTED_NOGPU_DELTA=118
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=144   # MEASURED 2026-09-21 (607 - 463)
+# THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
+# MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
+# --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
+# kind that produced the wrong 118 + 5 above.  MEASURED 2026-09-21 on the 2-GPU
+# Gen3 workstation (GPUs present, nvidia-fs not loaded, so gds_host_status =
+# refused), --extensive: 596 ran, 0 failed, 11 skipped of 607 in 6m7s.
+#
+# THE COUNT WAS CONFIRMED BY DIFFING THE SKIP LIST, NOT BY MATCHING THE TOTAL.
+# TOTAL_RAN = 607 - (all skips) regardless of WHY each cell skipped, so a correct
+# total proves nothing about composition: a non-GDS skip plus a missing GDS skip
+# lands on the same number.  All 11 skips were read by name and every one is a
+# --gds-only cell reporting "GDS unavailable (refused)".  Nothing else skipped --
+# in particular the trivial-park cell, the lone skip on the 8-GPU host, RAN and
+# passed here, so the two hosts' skip lists are disjoint and between them every
+# one of the 607 cells has now been exercised.
 EXPECTED_NOGDS_DELTA=11
 
 # ============================================================

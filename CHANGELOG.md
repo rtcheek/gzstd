@@ -244,7 +244,51 @@ filesystem here accepts O_DIRECT reads — tmpfs included on this kernel — so 
 refusal, and the suite uses it: without a hook that path is unreachable and therefore untested.
 
 `GZSTD_DEBUG_MT_DIRECT=0` restores the pre-v0.17.66 single-stream shape, so the A/B is one binary on a machine whose
-storage may answer differently — the workstation has not measured this.
+storage may answer differently.
+
+**The workstation has now measured it, and it agrees — by a wider margin, in the opposite shape.** That box is the one
+host where "concurrent O_DIRECT reads contend on NVMe" was ever measured true, so it is the only one that could have
+falsified this change. 4.1 GiB archive on its data NVMe, `-t --cpu-only`, cache dropped and residency confirmed 0.0%
+before every run, median of 5 with the arm order rotated each rep:
+
+| arm | wall (median) | min–max | sys |
+|---|---|---|---|
+| buffered MT | 2.30 s | 2.29–2.31 | 4.44 s |
+| O_DIRECT MT | **1.64 s** | 1.63–1.66 | 0.70 s |
+| single stream (`GZSTD_DEBUG_MT_DIRECT=0`) | 2.71 s | 2.69–3.01 | 0.68 s |
+
+O_DIRECT MT is 1.40x the buffered reader and 1.65x the old single stream, at 6.3x less system time, and lands within
+0.3 s of what the raw device will give at all: `dd iflag=direct` reads the same 4 GiB in 1.34 s (buffered `dd`, 1.57 s).
+The noise floor is 0.02 s on both leading arms, so none of this is close.
+
+Note the shape **inverts** against the 8-GPU host, where buffered was marginally ahead (3.45 s vs 3.69 s). The two
+machines disagree about which read path wins and agree about the change: on both, the parallel O_DIRECT reader beats
+the single stream this release replaced, which is the only comparison the flag actually controls. The old contention
+finding stands where it was measured — the 12-way compress reader — and does not reach a 3-thread decompress reader.
+Each arm's shape was read out of its own `-v` log rather than inferred: `parallel prefetch: 3 reader threads`, the same
+line `+ O_DIRECT (page cache bypassed)` with `O_DIRECT preads completed: 65`, and the bare `[DIRECT-READ]` of the
+control.
+
+**On a block device, too.** v0.17.66 turned the block-device check from "does a warning print" into a behavioural one,
+and it needs a loop device, so it needs root and could not run on the 8-GPU host at all. A 168 MiB chunked archive on
+`/dev/loop*`, read with `-d -c --cpu-only --direct-read`: the reader engages (`parallel prefetch: 3 reader threads,
+O_DIRECT`), `O_DIRECT preads completed: 3` proves the reads actually served the data rather than the flag merely being
+accepted, and the md5 round-trips. No warnings.
+
+**The first attempt found the trailer contract by accident, and it held.** A loop device exposes whole 512-byte
+sectors, so an archive whose size is not a multiple of 512 is silently truncated at the end — here by 406 bytes, into
+the trailing skippable frame. gzstd named it exactly:
+
+```
+warning: truncated trailing skippable frame (955 bytes) — the index/seek-table trailer is damaged.
+All data frames are intact; use -t to fail on any truncation.
+```
+
+That is the documented "`-d` recovers and warns, `-t` fails" behaviour, reached on real hardware instead of through a
+suite fixture, and its claim that the data frames are intact was confirmed independently by the md5. The run was then
+repeated with the input length tuned so the archive lands on 512 exactly (176,007,168 bytes), which is the intact-trailer
+case: identical reader engagement, correct md5, zero warnings. Worth knowing for any future loop-device test — **an
+unaligned fixture tests trailer damage, not the clean path, and passes either way.**
 
 ### Review (Codex, effort high)
 
