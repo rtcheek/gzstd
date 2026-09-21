@@ -22,7 +22,7 @@ cmake -B build && cmake --build build -j$(nproc)     # GPU build (USE_NVCOMP=ON)
 cmake -B build-cpu -DUSE_NVCOMP=OFF && cmake --build build-cpu -j$(nproc)
 ./gzstd-test.sh ./build/gzstd      # THE NORMAL RUN  (expect 470/0/1 of 471 on the 8-GPU GDS host)
 ./gzstd-test.sh ./build-cpu/gzstd  # CPU-only        (expect 353/0)
-./gzstd-test.sh -e ./build/gzstd   # opt-in          (expect 602/0, derived)
+./gzstd-test.sh -e ./build/gzstd   # opt-in          (expect 607/0, derived; +5 VRAM-recovery cells)
 ```
 
 **The default run is the normal one.** Use `-e` only when the change is substantial enough

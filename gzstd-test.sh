@@ -611,7 +611,7 @@ human_size() {
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
 EXPECTED_TESTS=471
-$EXTENSIVE && EXPECTED_TESTS=602
+$EXTENSIVE && EXPECTED_TESTS=607
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -693,7 +693,16 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # extensive 587 -> 596, no-GPU delta 114 -> 116, no-GDS delta 10 -> 11.  CONFIRMED on
 # the 8-GPU GDS host: extensive 595/0/1 of 596, CPU-only 349/0/92 ("349 ran, as
 # expected ... -116 no GPU").  The no-GDS delta is still derived.
+# The VRAM-recovery group (cells for v0.17.67/68, added after those versions
+# shipped) adds five EXTENSIVE-only cells inside "GPU acceleration": control,
+# reserve re-arm, batch-cap regrow, honest realloc after a real failure, and
+# compress launch re-arm.  Extensive 602 -> 607.  They are
+# gated by $EXTENSIVE as well as has_gpu, so the DEFAULT baseline and the default
+# no-GPU delta are unchanged; only an --extensive run on a GPU-less host loses
+# these five, which is why the delta below is mode-dependent.  DERIVED until an
+# --extensive run confirms it.
 EXPECTED_NOGPU_DELTA=118
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=123
 EXPECTED_NOGDS_DELTA=11
 
 # ============================================================
@@ -1568,6 +1577,205 @@ GVPY
     fi
   done
   rm -f "$ro_src" "$ro_z" "$ro_out" "$ro_e"
+
+  if $EXTENSIVE; then
+  # v0.17.67/68: THE VRAM RECOVERIES, AND THE SHRINK THAT SHRANK NOTHING.
+  #
+  # $EXTENSIVE ON PURPOSE.  Every cell below drives a path that fires only when
+  # another tenant takes VRAM out from under a live run -- rare enough that
+  # paying for it on every default run buys nothing.  It is also the shape that
+  # HIDES: each defect here exited 0 with correct output and cost only the GPU.
+  #
+  # Three properties, in the order they were built:
+  #   1. a surrendered VRAM reserve is RE-ARMED once the pressure passes
+  #      (v0.17.67; it used to be spendable once per run)
+  #   2. a VRAM-shrunken decompress batch cap CLIMBS BACK to its bringup ceiling
+  #      (v0.17.67; it only ever halved, so one dip cost the whole run)
+  #   3. after a REAL allocation failure the next request is HONEST about its
+  #      size (v0.17.68) -- ensure_buffers() assigns alloc_batch/comp/decomp
+  #      BEFORE its cudaMallocs and is grow-only, so a failed call left those
+  #      maxima describing memory that was never allocated and max()'d the next
+  #      smaller request straight back to the size that had just failed.  The
+  #      shrink shrank nothing, every retry asked for what the card had already
+  #      refused, and the halving ran to its floor and dropped the device.
+  #
+  # WHY TWO DIFFERENT HOOKS, which is the whole lesson of v0.17.68:
+  # GZSTD_DEBUG_FAIL_DECOMP_ALLOC reports a miss AFTER ensure_buffers has
+  # SUCCEEDED, so the context's maxima still describe live buffers -- it drives
+  # the recovery but cannot produce the state property 3 is about, and four green
+  # arms on it said nothing.  GZSTD_DEBUG_REAL_DECOMP_TEMP_OOM asks cudaMalloc
+  # for an impossible size, so the allocation fails for real.
+  #
+  # ONE DEVICE ON PURPOSE: the real-OOM counter is GLOBAL, so on several cards
+  # the injected failures land wherever they land.  --gpu-devices=1 keeps this
+  # honest under GZSTD_TEST_ALL_GPUS=1 or a caller-supplied multi-device mask.
+  #
+  # CONTROL FIRST, then each hook: a build that never recovers looks exactly like
+  # a hook that never fired, so every cell proves its own trigger before it
+  # trusts what follows.
+  #
+  # THESE CELLS DISCRIMINATE, mutation-proven against a build with only the two
+  # free_device() calls reverted: the regrow/re-arm cells still pass there (the
+  # recovery runs; it is the SIZE that lies), and the honest-realloc cell fails
+  # with a promoted `batch N>M=0` -- the shrunken request asking for the size that
+  # just failed -- where a correct build reports `batch N>0=1`.
+  vr_src="$TMPDIR/vrec.bin"; vr_z="$TMPDIR/vrec.zst"
+  vr_out="$TMPDIR/vrec.out"; vr_e="$TMPDIR/vrec.err"
+  # Entropy-coded, because the standard corpora decode as memcpy and never engage
+  # a GPU at all.
+  #
+  # THE FIXTURE IS SIZED BY THE THRESHOLDS, AND THE MARGIN IS THE POINT.  A regrow
+  # needs 32 clean batches AFTER the shrink and a re-arm needs 8, so a cell whose
+  # run produces barely that many is decided by how greedily the GPU pops rather
+  # than by the code under test.  MEASURED: at --gpu-batch=8 this fixture is 8
+  # frames, the compress arm produced anywhere from 1 to 8 batches run to run,
+  # and it PASSED ONCE BY LUCK before failing -- while the decompress arm cleared
+  # 32 by exactly one batch, 33, which is the same defect wearing a green tick.
+  # At --gpu-batch=2 with 1 MiB frames the same data yields 82 decompress batches
+  # against a threshold of 32 and 130 compress batches against 8 (both stable
+  # across repeats).  If a future change moves GZ_BATCH_REGROW_BATCHES or
+  # GZ_RESERVE_RETRY_BATCHES, re-measure these counts -- do not assume the margin
+  # survived.
+  head -c 96M /dev/urandom | base64 -w 76 > "$vr_src"
+  "$GZSTD" -q -k -f --cpu-only --chunk-size=1 "$vr_src" -o "$vr_z" 2>/dev/null
+
+  # A HOOK THAT NEVER FIRED HAS TWO CAUSES, AND THEY DESERVE DIFFERENT VERDICTS.
+  # If the GPU ran batches and the hook still did nothing, the binary is wrong:
+  # fail, loudly, as NOT TESTED.  But on a SHARED card a tenant can take the VRAM
+  # between one cell and the next -- MEASURED here mid-development, free VRAM fell
+  # to 777 MiB and gzstd could not bring the device up at all, which needs ~1.1 GiB
+  # -- and that is the host declining to exercise the cell, not a defect.  The
+  # batch count separates them.  skip_host keeps the drift note meaningful (see
+  # HOST_UNEXERCISABLE); a bare fail here would make a busy neighbour look like a
+  # regression, which is the fastest way to train a reader to ignore this suite.
+  vr_engaged() { grep -ac '\] done batch=' "$vr_e" 2>/dev/null || true; }
+
+  # CONTROL: no hook, so no recovery line may appear.  This is what makes the
+  # greps below evidence rather than decoration.
+  run_test "$GZSTD" -q -t --gpu-only --gpu-devices=1 --gpu-batch=2 -vv "$vr_z" 2>"$vr_e"
+  vr_rc=$LAST_RC
+  vr_noise=$(grep -acE 'freeing VRAM reserve|VRAM reserve re-armed|VRAM shrank under us|VRAM pressure passed' "$vr_e" 2>/dev/null || true)
+  if [[ $vr_rc -ne 0 ]]; then
+    fail "VRAM recovery control: an unpressured run says nothing" "exit $vr_rc"
+  elif [[ ${vr_noise:-0} -ne 0 ]]; then
+    fail "VRAM recovery control: an unpressured run says nothing" \
+         "$vr_noise recovery line(s) with no hook set"
+  else
+    pass "VRAM recovery control: an unpressured run says nothing"
+  fi
+
+  # 1. Re-arm.  One reported miss surrenders the reserve; the retry then succeeds,
+  # so the cap never moves and the only thing to prove is that the cushion comes
+  # back.  Pre-v0.17.67 it never did.
+  GZSTD_DEBUG_FAIL_DECOMP_ALLOC=1 run_test "$GZSTD" -q -t --gpu-only \
+    --gpu-devices=1 --gpu-batch=2 -vv "$vr_z" 2>"$vr_e"
+  vr_rc=$LAST_RC
+  vr_surr=$(grep -ac 'freeing VRAM reserve' "$vr_e" 2>/dev/null || true)
+  vr_arm=$(grep -ac 'VRAM reserve re-armed' "$vr_e" 2>/dev/null || true)
+  if [[ ${vr_surr:-0} -eq 0 ]]; then
+    if [[ $(vr_engaged) -eq 0 ]]; then
+      skip_host "a surrendered VRAM reserve is re-armed" "no GPU bringup (card full?)"
+    else
+      fail "a surrendered VRAM reserve is re-armed" "hook never fired: NOT TESTED"
+    fi
+  elif [[ $vr_rc -ne 0 ]]; then
+    fail "a surrendered VRAM reserve is re-armed" "exit $vr_rc"
+  elif [[ ${vr_arm:-0} -eq 0 ]]; then
+    fail "a surrendered VRAM reserve is re-armed" \
+         "reserve surrendered $vr_surr time(s) and never taken back"
+  else
+    pass "a surrendered VRAM reserve is re-armed"
+  fi
+
+  # 2. Shrink, then regrow.  Two reported misses (the first try and the
+  # post-surrender retry) drive the cap down; the run must then climb back to the
+  # ceiling bringup settled on, and still verify.
+  GZSTD_DEBUG_FAIL_DECOMP_ALLOC=2 run_test "$GZSTD" -q -t --gpu-only \
+    --gpu-devices=1 --gpu-batch=2 -vv "$vr_z" 2>"$vr_e"
+  vr_rc=$LAST_RC
+  vr_shrink=$(grep -acE 'VRAM shrank under us|temp buffer would not grow' "$vr_e" 2>/dev/null || true)
+  vr_grow=$(grep -ac 'VRAM pressure passed' "$vr_e" 2>/dev/null || true)
+  if [[ ${vr_shrink:-0} -eq 0 ]]; then
+    if [[ $(vr_engaged) -eq 0 ]]; then
+      skip_host "a VRAM-shrunken batch cap climbs back" "no GPU bringup (card full?)"
+    else
+      fail "a VRAM-shrunken batch cap climbs back" "hook never fired: NOT TESTED"
+    fi
+  elif [[ $vr_rc -ne 0 ]]; then
+    fail "a VRAM-shrunken batch cap climbs back" "exit $vr_rc"
+  elif [[ ${vr_grow:-0} -eq 0 ]]; then
+    fail "a VRAM-shrunken batch cap climbs back" \
+         "cap halved $vr_shrink time(s) and never recovered"
+  else
+    pass "a VRAM-shrunken batch cap climbs back"
+  fi
+
+  # 3. THE ONE THAT MATTERS.  A REAL allocation failure, and the request that
+  # follows the shrink must ask for the smaller cap.  GZSTD_DEBUG_ENSURE prints
+  # `batch <asked>><allocated>=<grew?>`; after the shrink the asked-for batch
+  # must be compared against a ZEROED allocation (`N>0=1`), because free_device()
+  # cleared the maxima the failure left behind.  A build without that clear
+  # reports `4>8=0` -- promoted back to the size that just failed.
+  rm -f "$vr_out"
+  GZSTD_DEBUG_REAL_DECOMP_TEMP_OOM=2 GZSTD_DEBUG_ENSURE=1 run_test "$GZSTD" -q -d --gpu-only \
+    --gpu-devices=1 --gpu-batch=2 -vv -k -f "$vr_z" -o "$vr_out" 2>"$vr_e"
+  vr_rc=$LAST_RC
+  vr_shrink=$(grep -acE 'VRAM shrank under us|temp buffer would not grow' "$vr_e" 2>/dev/null || true)
+  # The first ENSURE line AFTER the shrink is the one under test.
+  vr_after=$(awk '/VRAM shrank under us|temp buffer would not grow/{seen=1; next}
+                  seen && /ENSURE. realloc: batch/{print; exit}' "$vr_e" 2>/dev/null || true)
+  vr_promoted=0
+  if [[ -n "$vr_after" ]]; then
+    # `batch 4>8=0` -- grew?=0 means the ask did not exceed what the context
+    # claims to hold, i.e. the failed maxima were still standing.
+    echo "$vr_after" | grep -qE 'batch [0-9]+>[0-9]+=0' && vr_promoted=1
+  fi
+  if [[ ${vr_shrink:-0} -eq 0 ]]; then
+    if [[ $(vr_engaged) -eq 0 ]]; then
+      skip_host "a failed VRAM allocation does not promote the next request" \
+                "no GPU bringup (card full?)"
+    else
+      fail "a failed VRAM allocation does not promote the next request" \
+           "real-OOM hook never fired: NOT TESTED"
+    fi
+  elif [[ -z "$vr_after" ]]; then
+    fail "a failed VRAM allocation does not promote the next request" \
+         "no [ENSURE] line after the shrink: NOT TESTED"
+  elif [[ $vr_promoted -eq 1 ]]; then
+    fail "a failed VRAM allocation does not promote the next request" \
+         "shrunken request promoted back to the failed size: $vr_after"
+  elif [[ $vr_rc -ne 0 ]]; then
+    fail "a failed VRAM allocation does not promote the next request" "exit $vr_rc"
+  elif ! files_match "$vr_src" "$vr_out"; then
+    fail "a failed VRAM allocation does not promote the next request" "output mismatch"
+  else
+    pass "a failed VRAM allocation does not promote the next request"
+  fi
+
+  # 4. The compress half of the reserve: a launch that fails for want of memory
+  # surrenders, retries, and the cushion comes back.  Compress allocates nothing
+  # after bringup, so this launch failure is the ONLY way a tenant reaches it.
+  GZSTD_DEBUG_FAIL_COMPRESS_LAUNCH=1 run_test "$GZSTD" -q -f --gpu-only \
+    --gpu-devices=1 --gpu-batch=2 --chunk-size=1 -vv "$vr_src" -o "$TMPDIR/vrec.out.zst" 2>"$vr_e"
+  vr_rc=$LAST_RC
+  vr_surr=$(grep -ac 'to retry the compress launch' "$vr_e" 2>/dev/null || true)
+  vr_arm=$(grep -ac 'VRAM reserve re-armed' "$vr_e" 2>/dev/null || true)
+  if [[ ${vr_surr:-0} -eq 0 ]]; then
+    if [[ $(vr_engaged) -eq 0 ]]; then
+      skip_host "a compress launch failure re-arms its reserve" "no GPU bringup (card full?)"
+    else
+      fail "a compress launch failure re-arms its reserve" "hook never fired: NOT TESTED"
+    fi
+  elif [[ $vr_rc -ne 0 ]]; then
+    fail "a compress launch failure re-arms its reserve" "exit $vr_rc"
+  elif [[ ${vr_arm:-0} -eq 0 ]]; then
+    fail "a compress launch failure re-arms its reserve" \
+         "reserve surrendered and never taken back"
+  else
+    pass "a compress launch failure re-arms its reserve"
+  fi
+  rm -f "$vr_src" "$vr_z" "$vr_out" "$vr_e" "$TMPDIR/vrec.out.zst"
+  fi  # $EXTENSIVE (VRAM recovery: rare by nature, not worth a default run)
 
   # v0.17.29: the --gds-only OUTPUT preflight must prove EVERY frame start, not
   # infer the archive from frame 0.  Frame k begins at the sum of the
