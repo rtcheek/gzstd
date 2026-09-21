@@ -676,6 +676,22 @@ as views into the block (CHANGELOG v0.17.47): `--cpu-only` 14.66 to 40.08 GiB/s 
 - **Memory.** Views raise 8-GPU peak RSS by about 16 GiB (51–58 against 34–41 GiB). The cap bounds them at an
   eighth of available RAM, but no small-RAM host has exercised it yet.
 
+## OPEN: the decompress tuner's shared VRAM ceiling never matches what a device runs
+
+Found by an independent round on v0.17.68, pre-existing and NOT introduced by it. Decompress leaves
+`SharedTuneState::vram_ceiling` at its default 1024 while real intake clamps locally,
+`pop_n = min(tuner_batch, per_stream_cap)`. So the tuner can propose — and `g_adapt_settled_batch`
+can persist to the per-machine profile — a batch size no device ever ran, and a throughput sample
+taken at the clamped size gets labelled with the unclamped one. Every mid-run shrink widens the
+gap, and v0.17.68's regrow narrows it again, so the error is not even stable within a run.
+
+Not a patch: `per_stream_cap` is per device and `vram_ceiling` is shared across devices, so lowering
+the shared one to match the weakest card would penalise healthy cards and needs reversible state of
+its own. The decision is whether the tuner should carry a per-device ceiling or whether its samples
+should be tagged with the batch actually executed. **Whichever way it goes, `--adapt`'s persisted
+verdict is the thing at risk** — a profile that records an unattainable batch is worse than one
+that records nothing.
+
 ## OPEN after the v0.17.40–44 review arc
 
 Three residuals from seven review rounds on `--gds-only -d`. None is a defect in

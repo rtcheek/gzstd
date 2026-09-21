@@ -1,11 +1,115 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.67  
+**Covers:** v0.9.50 → v0.17.68  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.17.68 — the shrink that shrank nothing, found by review of v0.17.67
+
+An independent round (Codex, effort high, one turn) on v0.17.67 returned **DO NOT SHIP** with three
+reachable findings. The serious one is older than that commit.
+
+### `ensure_buffers()` leaves its maxima describing memory it never allocated
+
+The function assigns `alloc_batch` / `alloc_comp` / `alloc_decomp` **before** its `cudaMalloc`s, and it is
+grow-only: the next call takes `max()` against those fields. So after a REAL allocation failure they describe the
+allocation that just failed, and the smaller request that follows is **promoted straight back to the size the card
+has already refused**. The mid-run shrink shrank nothing: every retry asked for the same amount, the halving ran to
+its floor, and the device dropped to the CPU rescue over a dip it was supposed to ride out.
+
+**The bringup retry path already knew this** — it calls `free_device()` before asking for less, with a comment
+explaining why. The two mid-run shrink sites did not. A mirrored-path defect of exactly the kind
+`feedback_mirror_paths_diff` describes: the fix was already written, one screen away, on the sibling path.
+
+v0.17.67's regrow did not introduce it, but gave it a new trigger — every regrow is another chance to fail an
+allocation, and every failure was landing in this state.
+
+**Why no existing hook could reach it.** `GZSTD_DEBUG_FAIL_DECOMP_ALLOC` reports a miss *after* `ensure_buffers`
+has already succeeded, so the maxima still describe live buffers — which is why v0.17.67's verification passed over
+this path without touching it. New hook `GZSTD_DEBUG_REAL_DECOMP_TEMP_OOM=N` makes the next N mid-run attempts ask
+`cudaMalloc` for an impossible size, so the allocation fails *for real*.
+
+**Mutation-proved** against a build with only the two `free_device()` calls reverted, same hook, same command, the
+`[ENSURE]` trace as the discriminator:
+
+| | after the shrink to batch 4 |
+|---|---|
+| mutant | `batch 4>8=0  comp 12585393>16842752=0` — promoted back to the failed size |
+| fixed | `batch 4>0=1  comp 12585393>0=1` — allocates at the cap it just chose |
+
+The mutant still finished at exit 0 with correct output, because this card had room for the promoted request. The
+end state it implies — halve, fail, halve, abandon the device — needs a card that refuses it, and is **not** what
+was reproduced here.
+
+### Two accounting defects in v0.17.67's own hysteresis
+
+- **`surrender_vram_reserve()` early-returns when the reserve is already gone**, so pressure that arrived while it
+  was absent did not restart the clean-batch streak. Four clean batches, pressure, four more, and the retake fired
+  after four — not the eight it promises. The reset now sits at the top of both lambdas, before the early return,
+  so no caller can miss it.
+- **The regrow cadence doubled on the first shrink**, before any regrow had happened, so the documented "restores
+  after 32 clean batches" was 64 from the start; several failures inside one pressure episode ratcheted it further.
+  It now stiffens only when a dip *follows* an actual regrow — one episode, one doubling.
+
+### Also corrected
+
+The compress clean-batch counter moved from the nvCOMP enqueue to after `submitted.push_back()`: the checksum join,
+the verify enqueue and the `ev_done` record all sit between the two and can fail, and a batch that never reached
+the drain is not evidence that pressure has eased.
+
+**And a comment that claimed more than the code delivers**, which this project treats as a defect in its own right:
+v0.17.67 called the compress retake site a "quiet point". It is not. Compress completes batches on a separate drain
+thread, so older submitted batches can still be in flight there and the retake's `cudaMalloc` may serialise against
+them. The policy is unchanged — the back-off bounds it to ~7 attempts over the first thousand batches, then one per
+512 — but the comment now says what actually happens. Decompress *is* device-idle at its site, because its batches
+complete inline.
+
+### Verification
+
+Five arms on one tenant-occupied H100, `--gpu-batch 8`, control included:
+
+| arm | surrender | re-arm | shrink | regrow | result |
+|---|---|---|---|---|---|
+| control (no hook) | 0 | 0 | 0 | 0 | OK |
+| `FAIL_DECOMP_ALLOC=1` | 1 | 1 | 0 | 0 | OK |
+| `FAIL_DECOMP_ALLOC=2` | 1 | 1 | 1 | 1 | OK |
+| `REAL_DECOMP_TEMP_OOM=2` (new) | 1 | 1 | 1 | 1 | OK |
+| `FAIL_COMPRESS_LAUNCH=1` | 1 | 1 | 0 | 0 | OK |
+
+A 16 GiB archive decompressed through the real-OOM shrink is byte-identical to the CPU-only reference
+(md5 9d2a043e...). Both build configurations compile warning-free. **No suite run and no throughput claim** — the
+host was under heavy tenant load throughout.
+
+### Round two: SAFE TO SHIP, with two qualifications about the new hook
+
+The same session reviewed the fixes. Verdict **SAFE TO SHIP**, no functional change requested; the one edit it
+made was documentation — a line still describing the compress retake as a "quiet point", now corrected.
+
+It confirmed the thing I was least sure of, which is that `free_device()` is safe at both shrink sites and needs no
+write-behind join: at the per-batch site no H2D for the current batch has begun, and at the temp-growth site
+reaching `needed_temp > C.temp_bytes` proves the preceding `cudaStreamSynchronize` has already run. A genuine
+allocation failure enters `ensure_buffers()`'s realloc path, which joins `wb_thr` before freeing anything.
+
+It also preferred the reset-at-top-of-lambda placement to its own per-site version, for a reason worth keeping:
+resetting after a SUCCESSFUL surrender is not incidental, it is necessary — the streak accumulated while the
+reserve was held would otherwise trigger a retake immediately after the retry instead of eight clean batches later.
+
+**Two properties of `GZSTD_DEBUG_REAL_DECOMP_TEMP_OOM` a future test must know**, now in the comment beside it: the
+counter is **global**, so on a multi-GPU run the next N attempts are process-wide rather than per-device (pin the
+run to one device); and of the two sites it feeds, **only the per-batch one is reachable today** — the exact-temp
+path below it is dead by construction, so a test expecting a miss there waits forever. This is why the hook was
+extended to the per-batch site after the first placement fired nothing.
+
+### Accepted from the review, not acted on
+
+Codex also reported a **pre-existing** tuner defect: decompress leaves `SharedTuneState::vram_ceiling` at its
+default 1024 while real intake clamps locally against `per_stream_cap`, so the tuner and `g_adapt_settled_batch`
+can label a capped measurement with a batch size the device never ran. Not introduced here, and the fix is a
+per-device-versus-shared ceiling design decision rather than a patch. Filed in ROADMAP.
 
 
 ## v0.17.67 — two VRAM recoveries that only worked once, and four things --help promised wrongly

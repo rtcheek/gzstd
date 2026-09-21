@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.67";
+static constexpr const char * GZSTD_VERSION = "0.17.68";
 //
 // Architecture overview:
 //
@@ -9932,6 +9932,25 @@ static inline bool gz_debug_compress_launch_miss()
 // fail that allocation naturally, so without a REAL failure the pre-tag host can
 // never see the defect.  See ensure_buffers().
 static std::atomic<int> g_debug_real_bringup_oom{0};
+
+// Test-only fault injection (read once from $GZSTD_DEBUG_REAL_DECOMP_TEMP_OOM):
+// make the next N MID-RUN temp growths ask cudaMalloc for an impossible size, so
+// ensure_buffers() fails for real instead of being told it failed.
+//
+// THE DIFFERENCE IS THE WHOLE POINT.  GZSTD_DEBUG_FAIL_DECOMP_ALLOC reports a
+// miss AFTER ensure_buffers has already succeeded, so the context's alloc_batch
+// / alloc_comp / alloc_decomp still describe live buffers.  A REAL failure
+// leaves those maxima describing memory that was never allocated -- which is
+// the state the v0.17.68 free_device() exists to clear -- and no existing hook
+// could reach it.  N < 0 = every one; 0 (unset) = disabled.
+//
+// TWO PROPERTIES A TEST USING THIS MUST KNOW.  The counter is GLOBAL, so on a
+// multi-GPU run the next N attempts are process-wide rather than per-device --
+// pin the run to one device, or the injected failures land wherever they land.
+// And of the two shrink sites it feeds, only the per-batch one is reachable
+// today: the exact-temp path below it is dead by construction, so a test that
+// expects a miss there will wait forever.
+static std::atomic<int> g_debug_real_decomp_temp_oom{0};
 static std::atomic<int> g_debug_real_pinned_oom{0};
 static inline bool gz_debug_count_down(std::atomic<int> & ctr)
 {
@@ -24730,9 +24749,11 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
 // HYSTERESIS, NOT POLLING.  Retake only after `retry_at` consecutive clean
 // batches, and DOUBLE that threshold on every failed attempt.  A card that
 // stays full therefore costs a handful of cudaMallocs over a long run instead
-// of one per batch, and it costs them at a quiet point in the worker loop —
-// cudaMalloc can serialise against this device's in-flight work, so this must
-// never sit between a pop and its launch.
+// of one per batch.  The call sits before the next pop, so it never holds a
+// claimed batch hostage.  DECOMPRESS is device-idle there (its batches complete
+// inline); COMPRESS is not, because its drain thread may still own older
+// submitted batches, so a retake there can impose a synchronization bubble.
+// That is the price of the cushion, and the back-off is what bounds it.
 //
 // A FAILED ATTEMPT IS HANDLED, SO ITS ERROR IS CONSUMED HERE.  Leaving one
 // armed is the v0.17.45 defect class, where a handled cudaMalloc failure left a
@@ -24740,7 +24761,7 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
 //
 // The caller counts its own clean batches into `ok_streak` (at the point a
 // batch is actually submitted, not once per loop iteration — a worker that
-// yields or re-pops must not age the streak) and calls this from a quiet point.
+// yields or re-pops must not age the streak) and calls this before its next pop.
 static const size_t GZ_RESERVE_RETRY_BATCHES = 8;     // clean batches before the first retry
 static const size_t GZ_RESERVE_RETRY_MAX     = 512;   // ceiling on the doubling back-off
 // Clean batches a device must complete before a VRAM-shrunken decompress batch
@@ -25895,6 +25916,11 @@ static void gpu_worker(
     // Give the reserve back so a launch that lost a VRAM race can be retried.
     // Mirrors the decompress worker's helper of the same name.
     auto surrender_vram_reserve = [&](const char * why) -> bool {
+      // PRESSURE HAPPENED, WHETHER OR NOT WE HAD ANYTHING TO GIVE.  Reset before
+      // the early return: when the reserve is already gone, a stale streak from
+      // before this dip could otherwise let the retake fire only a few clean
+      // batches after it, which is not the hysteresis this promises.
+      reserve_ok_streak = 0;
       if (!vram_reserve) return false;
       vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
            + "] freeing VRAM reserve (" + std::to_string(vram_reserve_bytes / ONE_MIB)
@@ -25902,9 +25928,6 @@ static void gpu_worker(
       cudaFree(vram_reserve);
       vram_reserve = nullptr;
       vram_reserve_bytes = 0;
-      // Real pressure just took it: start the clean-batch streak over, so the
-      // re-arm waits out the dip rather than racing the tenant for it.
-      reserve_ok_streak = 0;
       return true;
     };
 
@@ -26028,10 +26051,13 @@ static void gpu_worker(
     while (true) {
       wd_beat(slot_index);           // heartbeat: spinning vs blocked
       check_drain_err();
-      // Quiet point: no batch is being assembled here, so a cudaMalloc that
-      // serialises against this device's in-flight work costs the pipeline
-      // nothing.  No-op unless a dip took the reserve and enough clean batches
-      // have gone by since.
+      // Intake side, and NOT a quiet device: compress completes batches on a
+      // separate drain thread, so older submitted batches can still be in
+      // flight here and a retake's cudaMalloc may serialise against them.  It
+      // sits before the next pop so it can never hold a claimed batch hostage,
+      // and the back-off is what bounds how often that bubble can happen (~7
+      // attempts over the first thousand batches, then one per 512).  No-op
+      // unless a dip took the reserve and enough clean batches have gone by.
       gz_retake_vram_reserve(&vram_reserve, &vram_reserve_bytes,
                              vram_reserve_want, &reserve_ok_streak,
                              &reserve_retry_at, device_id, opt);
@@ -26919,10 +26945,6 @@ static void gpu_worker(
             && surrender_vram_reserve("to retry the compress launch"))
           cst = launch_compress();
         checkNvcomp(cst, "nvcompBatchedZstdCompressAsync");
-        // A batch that launched without needing the reserve is evidence the
-        // pressure has eased.  Counted here rather than at the top of the loop
-        // so yields and re-pops cannot age the streak on their own.
-        ++reserve_ok_streak;
         // --gds-only: the checksum kernel has been running on ck_stream since
         // the input was staged.  Join it now that the compressor is enqueued:
         // both read d_in_base and neither writes it, so they overlap, and the
@@ -26978,6 +27000,12 @@ static void gpu_worker(
             g_adapt_dev_front_ns[device_id].store(C.submit_ns, std::memory_order_relaxed);
           submitted.push_back(&C);
         }
+        // THE BATCH IS NOW THE DRAIN'S.  Counted here, not at the launch: the
+        // checksum join, the verify enqueue and the ev_done record all sit
+        // between the two and can still fail, and a batch that never reached
+        // the drain is not evidence that VRAM pressure has eased.  Not at the
+        // top of the loop either, where a yield or a re-pop would age it.
+        ++reserve_ok_streak;
         submit_cv.notify_one();
       }
     }
@@ -29554,6 +29582,10 @@ static void gpu_decomp_worker(
   size_t batch_cap_ceiling  = 0;     // what bringup settled on; 0 until then
   size_t batch_regrow_streak = 0;    // clean batches since the last shrink
   size_t batch_regrow_at     = GZ_BATCH_REGROW_BATCHES;
+  // Only a dip that follows an actual regrow stiffens the cadence; otherwise
+  // the first shrink of a run would double a threshold nothing had used yet,
+  // and the documented "restores after 32" would have been 64 all along.
+  bool   batch_regrew_since_pressure = false;
   try {
     uint64_t init_t0 = g_perf ? now_ns() : 0;
     {
@@ -30018,6 +30050,11 @@ static void gpu_decomp_worker(
     // Returns true only if there was actually a reserve to surrender, so a
     // caller can tell "freed something, worth retrying" from "nothing to give".
     auto surrender_vram_reserve = [&](const char * why) -> bool {
+      // PRESSURE HAPPENED, WHETHER OR NOT WE HAD ANYTHING TO GIVE.  Reset before
+      // the early return: when the reserve is already gone, a stale streak from
+      // before this dip could otherwise let the retake fire only a few clean
+      // batches after it, which is not the hysteresis this promises.
+      reserve_ok_streak = 0;
       if (!vram_reserve) return false;
       vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
            + "] freeing VRAM reserve (" + std::to_string(vram_reserve_bytes / ONE_MIB)
@@ -30025,9 +30062,6 @@ static void gpu_decomp_worker(
       cudaFree(vram_reserve);
       vram_reserve = nullptr;
       vram_reserve_bytes = 0;
-      // Real pressure just took it: start the clean-batch streak over, so the
-      // re-arm waits out the dip rather than racing the tenant for it.
-      reserve_ok_streak = 0;
       return true;
     };
 
@@ -30074,6 +30108,7 @@ static void gpu_decomp_worker(
         batch_regrow_streak = 0;
         if (grown > per_stream_cap) {
           per_stream_cap = grown;
+          batch_regrew_since_pressure = true;
           // A reserve HELD across this regrow stays sized for the smaller cap
           // until the next surrender re-arms it at the current one.  Left that
           // way on purpose: an undersized cushion is strictly better than
@@ -30586,7 +30621,13 @@ static void gpu_decomp_worker(
                 + "; re-run with a smaller --gpu-batch or without --gds-only");
           if (tb > temp_bound) temp_bound = tb;
         }
-        if (!C.ensure_buffers(C.filled, max_comp, max_decomp, temp_bound)
+        // See g_debug_real_decomp_temp_oom: an impossible ask fails the
+        // allocation ITSELF, leaving the context's grow-only maxima describing
+        // memory that was never allocated -- the state a reported miss cannot
+        // produce, and the one the free_device() below exists to clear.
+        const size_t ask_bound = gz_debug_count_down(g_debug_real_decomp_temp_oom)
+                                     ? GZ_DEBUG_IMPOSSIBLE_BYTES : temp_bound;
+        if (!C.ensure_buffers(C.filled, max_comp, max_decomp, ask_bound)
             || gz_debug_alloc_miss()) {
           // Name the resource that actually ran out.  A registration failure is
           // a PCIe BAR1 aperture limit, not a VRAM limit, and saying
@@ -30606,18 +30647,35 @@ static void gpu_decomp_worker(
           // frame means the card cannot hold a single frame's buffers, which is
           // genuinely unrecoverable.
           bool ok = surrender_vram_reserve("to allocate device buffers")
-                    && C.ensure_buffers(C.filled, max_comp, max_decomp, temp_bound)
+                    && C.ensure_buffers(C.filled, max_comp, max_decomp,
+                                        gz_debug_count_down(g_debug_real_decomp_temp_oom)
+                                            ? GZ_DEBUG_IMPOSSIBLE_BYTES : temp_bound)
                     && !gz_debug_alloc_miss();
           if (!ok) {
             if (per_stream_cap <= 1)
               throw std::runtime_error(
                   "GPU decomp: failed to allocate device buffers for a single frame");
             per_stream_cap = std::max<size_t>(1, per_stream_cap / 2);
-            // Pressure is live: restart the regrow streak and make the next
-            // recovery wait longer, so a contended card settles rather than
-            // oscillating between shrink and regrow.
+            // GIVE THE FAILED ALLOCATION BACK BEFORE ASKING FOR LESS — the same
+            // move the bringup retry path makes, and for the same reason.
+            // ensure_buffers() sets alloc_batch/alloc_comp/alloc_decomp BEFORE
+            // its cudaMallocs, so after a failure they describe an allocation
+            // that does not exist, and its grow-only maxima promote this
+            // smaller request straight back to the size that just failed: the
+            // shrink shrinks nothing, every retry asks for the amount the card
+            // has already refused, and the halving runs to 1 and drops the
+            // device to the CPU rescue over a transient dip.  free_device() is
+            // idempotent and zeroes those maxima, which is what makes the next
+            // call allocate at the cap we just chose.
+            C.free_device();
+            // Pressure is live: restart the regrow streak, and stiffen the
+            // cadence only if this dip FOLLOWED a recovery — several failures
+            // inside one pressure episode are one event, not several.
             batch_regrow_streak = 0;
-            if (batch_regrow_at <= GZ_BATCH_REGROW_MAX / 2) batch_regrow_at *= 2;
+            if (batch_regrew_since_pressure
+                && batch_regrow_at <= GZ_BATCH_REGROW_MAX / 2)
+              batch_regrow_at *= 2;
+            batch_regrew_since_pressure = false;
             vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
                  + "] VRAM shrank under us; batch -> " + std::to_string(per_stream_cap)
                  + ", returning " + std::to_string(C.batch.size())
@@ -31064,7 +31122,13 @@ static void gpu_decomp_worker(
 
         // Re-ensure buffers if temp grew
         if (needed_temp > C.temp_bytes) {
-          bool grew = C.ensure_buffers(C.filled, max_comp, max_decomp, needed_temp)
+          // See g_debug_real_decomp_temp_oom: an impossible ask makes the
+          // allocation itself fail, which is a different state from a reported
+          // miss.  Consumed per ATTEMPT, so =2 fails the retry below too.
+          const size_t ask_temp =
+              gz_debug_count_down(g_debug_real_decomp_temp_oom)
+                  ? GZ_DEBUG_IMPOSSIBLE_BYTES : needed_temp;
+          bool grew = C.ensure_buffers(C.filled, max_comp, max_decomp, ask_temp)
                       && !gz_debug_alloc_miss();
           if (!grew)
             // Free the VRAM reserve and retry -- the reserve exists for exactly
@@ -31073,7 +31137,9 @@ static void gpu_decomp_worker(
             // sizes, which is why decompress can need more mid-run and compress
             // cannot).
             grew = surrender_vram_reserve("to grow temp buffer")
-                   && C.ensure_buffers(C.filled, max_comp, max_decomp, needed_temp)
+                   && C.ensure_buffers(C.filled, max_comp, max_decomp,
+                                       gz_debug_count_down(g_debug_real_decomp_temp_oom)
+                                           ? GZ_DEBUG_IMPOSSIBLE_BYTES : needed_temp)
                    && !gz_debug_alloc_miss();
           if (!grew) {
             // Still short.  Halve the pop and hand this batch back instead of
@@ -31085,9 +31151,14 @@ static void gpu_decomp_worker(
               throw std::runtime_error(
                   "GPU decomp: failed to grow temp buffer for a single frame");
             per_stream_cap = std::max<size_t>(1, per_stream_cap / 2);
-            // Same accounting as the buffer-growth shrink above.
+            // Same failed-allocation reset and cadence accounting as the
+            // buffer-growth shrink above.
+            C.free_device();
             batch_regrow_streak = 0;
-            if (batch_regrow_at <= GZ_BATCH_REGROW_MAX / 2) batch_regrow_at *= 2;
+            if (batch_regrew_since_pressure
+                && batch_regrow_at <= GZ_BATCH_REGROW_MAX / 2)
+              batch_regrow_at *= 2;
+            batch_regrew_since_pressure = false;
             vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
                  + "] temp buffer would not grow; batch -> "
                  + std::to_string(per_stream_cap) + ", returning "
@@ -35444,6 +35515,8 @@ static int gzstd_main(int argc, char ** argv)
     g_debug_real_bringup_oom.store(int(std::atoll(ro)), std::memory_order_relaxed);
   if (const char * rp = std::getenv("GZSTD_DEBUG_REAL_PINNED_OOM"))
     g_debug_real_pinned_oom.store(int(std::atoll(rp)), std::memory_order_relaxed);
+  if (const char * rt = std::getenv("GZSTD_DEBUG_REAL_DECOMP_TEMP_OOM"))
+    g_debug_real_decomp_temp_oom.store(int(std::atoll(rt)), std::memory_order_relaxed);
 
   // Test-only: deterministic producer-unwind injection (see g_debug_throw_reader).
   if (const char * tr = std::getenv("GZSTD_DEBUG_THROW_READER"))
