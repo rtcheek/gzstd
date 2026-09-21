@@ -1,11 +1,105 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.66  
+**Covers:** v0.9.50 → v0.17.67  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.17.67 — two VRAM recoveries that only worked once, and four things --help promised wrongly
+
+Both GPU paths carry a VRAM reserve allocated at bringup whose only job is to be handed back when another tenant's
+allocation collides with ours — compress on a kernel launch that fails for want of memory, decompress on a per-batch
+buffer or temp growth. **Nothing ever took it back.** The cushion that exists to absorb a *transient* dip was
+spendable exactly once, and a transient dip is by definition the case where the memory comes back: a second dip on a
+run with hours left had no budget at all.
+
+**The decompress batch cap had the same shape and worse consequences.** `per_stream_cap` halves whenever a growth
+loses a VRAM race, and nothing raised it again — `pop_n` is `min(tuner, per_stream_cap)`, so the auto-tuner could not
+climb back past it either. One transient dip halved that device's batches for the rest of the run, and repeated dips
+ratcheted it toward 1 and left it there long after the card was empty again. **Same one-way door as the trivial-exit
+defect fixed in v0.17.51**, which is the second time this class has shipped: a guard that reacts to pressure and never
+reconsiders is a guard that mistakes a spike for a permanent property of the machine.
+
+Both now recover, **asymmetrically**: shrink on the first failure, restore only after a streak of clean batches, and
+double the required streak each time pressure returns, so a genuinely contended card settles instead of oscillating.
+
+| | restores after | back-off ceiling | why |
+|---|---|---|---|
+| VRAM reserve | 8 clean batches | 512 | one `cudaMalloc` |
+| decompress batch cap | 32 clean batches | 1024 | can cost an `ensure_buffers()` realloc — and under `--gds-only` a BAR1 re-registration this file already prices at ~620 ms |
+
+Both attempts sit at a quiet point in the worker loop where nothing of the device is in flight, since `cudaMalloc` can
+serialise against it; neither may sit between a pop and its launch. A failed retake **consumes its error** instead of
+leaving one armed for the next unrelated CUDA call to report — the v0.17.45 class. Clean batches are counted where a
+batch is known to have landed, not per loop iteration: a worker that yields or re-pops must not age the streak on its
+own.
+
+**One imprecision, left in deliberately and commented:** a reserve *held* across a regrow stays sized for the smaller
+cap until the next surrender re-arms it at the current one. Freeing a good allocation to ask for a bigger one, on a
+card that has just been under pressure, can hand back neither.
+
+### Not changed: why compress cannot do what decompress does
+
+Compress cannot shrink-and-retry, because `release_input()` has already freed the host copy of every frame in the
+batch — the bytes exist only in `d_in_base`, which is precisely the buffer a shrink would reallocate. Decompress can
+shrink because it holds its inputs until delivery. Moving the release later would open the same door here, but only
+for failures that surface **at enqueue**: the launch is async, so anything surfacing later at the drain's synchronize
+is past the release either way, and that narrow window is what the existing reserve retry already covers. Weighed,
+rejected, and written at the site so it is not "fixed" blind.
+
+### `--help` said four things the code does not do
+
+All four found by reading the text against the code, none by a test.
+
+- **`--gpu-only` was documented twice, and the second copy contradicted the first.** The main entry is careful — CPU
+  still performs rescue and rebuild, "no CPU" is a statement about the steady state — and the tuning-section copy said
+  "GPU only, no CPU workers (error if no GPU available)", i.e. exactly what the main entry exists to correct. The
+  one-line summary said the same and is fixed too.
+- **`--gpu-mem-frac` is a target with a floor under it.** One frame's buffers plus the nvCOMP workspace are the
+  smallest thing a stream can run — ~1.1 GiB at 16 MiB frames, most of it workspace — and that floor wins when the
+  fraction lands below it. Measured on a tenant-occupied card: `--gpu-mem-frac 0.1` against 10181 MiB free allocated
+  **1131 MiB, not 1018**. Free VRAM is also sampled per stream in turn, so with `--gpu-streams 2` the second stream
+  sizes itself against what the first already took (10181 → 7125 MiB in the same run).
+- **Nothing described what a mid-run VRAM loss does at all** — the shrink, the re-enqueue, the device drop to CPU
+  rescue — which is the shared-box case this tool actually runs in. Added under `--gpu-mem-frac`.
+- **"An explicit `--gpu-batch` always overrides"** reads global but is scoped to the raised `--gds-only` default; the
+  VRAM fit search still clamps it. Verified on a card with 3.6 GiB free: `--gpu-batch 512` ran at **batch=1**.
+
+### Verification
+
+The existing injection hooks, one tenant-occupied H100 per run, `--gpu-batch 8`, **with a control arm so the
+instrument is seen reporting absence as well as presence**:
+
+| arm | surrender | re-arm | shrink | regrow |
+|---|---|---|---|---|
+| control (no hook) | 0 | 0 | 0 | 0 |
+| `GZSTD_DEBUG_FAIL_DECOMP_ALLOC=1` | 1 | 1 | 0 | 0 |
+| `GZSTD_DEBUG_FAIL_DECOMP_ALLOC=2` | 1 | 1 | 1 | 1 |
+| `GZSTD_DEBUG_FAIL_COMPRESS_LAUNCH=1` | 1 | 1 | 0 | 0 |
+
+The shrink arm re-armed at 64 MiB against the halved cap and then logged `VRAM pressure passed; batch -> 8
+(ceiling 8)` — the reserve tracks the cap it is protecting. A 16 GiB entropy-coded archive decompressed through the
+forced shrink/regrow path is **byte-identical to the CPU-only reference**, and all four arms exit 0. Both build
+configurations compile warning-free.
+
+**NO SUITE RUN, AND NO THROUGHPUT CLAIM.** The host was under heavy tenant load throughout — five to seven of eight
+cards at 100%, load ~10 — which is what made the fault injection realistic and makes every duration in those logs
+unusable. The recoveries have **no suite cell yet**; adding one needs a mutation proof and a baseline bump.
+
+### Related, from the same session: the tight-VRAM paths on a real card
+
+Nine arms on a card whose tenant moved free VRAM from 11.2 GiB to 2.3 GiB mid-test, with no injection hooks: compress
+and decompress `--gpu-only` at default and `--gpu-mem-frac 0.1`, a forced `--gpu-batch 512`, `-t`, and two gzstd
+instances racing each other for the same card. All exit 0, all byte-identical, stock `zstd -t` accepts every archive;
+the fit search clamped 256 → 34/18 → 1/1 → 43 → 21 and always *down* rather than failing, and the GPU still delivered
+64 of 64 compress batches at batch=1. **`-v` prints no per-device totals — count `done batch=` at `-vv`, or a silent
+CPU fallback reads exactly like success.** What that could not reach is the fit-test-passes-then-`cudaMalloc`-fails
+window, because gzstd re-measures free VRAM immediately before each allocation and its per-stream footprint is only
+~1.1–1.5 GiB; forcing it needs memory taken *between* the check and the malloc, which is what the hooks above exist
+for.
 
 
 ## v0.17.66 — the parallel decompress reader takes O_DIRECT, so the flag stops costing parallelism

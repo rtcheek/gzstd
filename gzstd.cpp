@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.66";
+static constexpr const char * GZSTD_VERSION = "0.17.67";
 //
 // Architecture overview:
 //
@@ -3380,7 +3380,7 @@ static void print_help()
 "decompress go cpu-only; otherwise hybrid.\n"
 "--adapt may override from the measured per-machine profile):\n"
 "  --cpu-only          CPU multithreaded, no GPU\n"
-"  --gpu-only          GPU only, no CPU workers\n"
+"  --gpu-only          GPU only; CPU still rescues/rebuilds on failure\n"
 "  --hybrid            CPU + GPU\n"
 "  --sliding-window    single-frame max-ratio mode (implies --cpu-only)\n"
 "\n"
@@ -4233,7 +4233,8 @@ static void print_help_long()
 "     That checksum kernel is why --gds-only raises the default GPU\n"
 "     batch to 64 frames — its throughput scales with the frame count,\n"
 "     and a smaller batch would make it, not the drive, the bottleneck.\n"
-"     An explicit --gpu-batch always overrides.\n"
+"     An explicit --gpu-batch overrides that raised default (the VRAM\n"
+"     fit search still clamps it if the card cannot hold it).\n"
 "\n"
 "     SETUP AND DIAGNOSIS.  GDS.md covers the four requirements, how to\n"
 "     install nvidia-fs, and the version gate that matters most: before\n"
@@ -4464,9 +4465,28 @@ static void print_help_long()
 "  --gpu-mem-frac X\n"
 "     Fraction of free VRAM per device to allocate (0.1..0.95,\n"
 "     default: 0.60).  Split evenly across --gpu-streams.\n"
+"     A TARGET, WITH A FLOOR UNDER IT: one frame\'s buffers plus the\n"
+"     nvCOMP workspace are the smallest thing a stream can run, and\n"
+"     that floor wins if the fraction lands below it (at 16 MiB frames\n"
+"     it is around 1.1 GiB, most of it workspace).  A device is refused\n"
+"     only if even that does not fit.  Free VRAM is also sampled per\n"
+"     stream in turn, so with --gpu-streams 2 the second stream sizes\n"
+"     itself against what the first has already taken.\n"
+"\n"
+"     ON A SHARED GPU.  If another process takes VRAM mid-run, gzstd\n"
+"     gives back its reserve and retries; a decompress then halves its\n"
+"     batch and returns those frames to the queue (`VRAM shrank under\n"
+"     us`, -v), repeating down to one frame before it gives the device\n"
+"     up to the CPU rescue.  Both the reserve and the batch size are\n"
+"     restored once a run of clean batches shows the pressure has\n"
+"     passed.  A compress allocates nothing after bringup, so it is\n"
+"     reached only by a kernel launch that fails for want of memory;\n"
+"     that discards the pass and rebuilds CPU-only (see --gpu-only).\n"
 "\n"
 "  --gpu-only\n"
-"     GPU only, no CPU workers (error if no GPU available).\n"
+"     GPU only for the steady state; CPU still performs rescue and\n"
+"     rebuild after a GPU failure.  Error if no GPU is available.\n"
+"     See the full entry above for the exit codes.\n"
 "\n"
 "  --pinned {auto|on|off}    (default: off)\n"
 "     Control pinned (page-locked) host buffers for H2D\n"
@@ -24696,6 +24716,63 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
     throw std::runtime_error(std::string(msg) + " (nvCOMP status " + std::to_string(int(st)) + ")");
 }
 
+// Re-arm a surrendered VRAM reserve once the pressure that took it has passed.
+//
+// THE RESERVE IS A RETRY BUDGET, AND IT USED TO BE SPENDABLE ONCE.  Both GPU
+// paths allocate it at bringup and hand it back the first time another tenant's
+// allocation collides with ours — compress on a launch that fails for want of
+// memory, decompress on a per-batch buffer or temp growth.  Nothing ever took
+// it back, so the cushion whose entire purpose is to absorb a TRANSIENT dip was
+// gone for the rest of the run after the first one, and a transient dip is by
+// definition the case where the memory comes back.  The second dip then had no
+// budget to spend, on a run that may have hours left.
+//
+// HYSTERESIS, NOT POLLING.  Retake only after `retry_at` consecutive clean
+// batches, and DOUBLE that threshold on every failed attempt.  A card that
+// stays full therefore costs a handful of cudaMallocs over a long run instead
+// of one per batch, and it costs them at a quiet point in the worker loop —
+// cudaMalloc can serialise against this device's in-flight work, so this must
+// never sit between a pop and its launch.
+//
+// A FAILED ATTEMPT IS HANDLED, SO ITS ERROR IS CONSUMED HERE.  Leaving one
+// armed is the v0.17.45 defect class, where a handled cudaMalloc failure left a
+// sticky error for the next unrelated CUDA call to report as its own.
+//
+// The caller counts its own clean batches into `ok_streak` (at the point a
+// batch is actually submitted, not once per loop iteration — a worker that
+// yields or re-pops must not age the streak) and calls this from a quiet point.
+static const size_t GZ_RESERVE_RETRY_BATCHES = 8;     // clean batches before the first retry
+static const size_t GZ_RESERVE_RETRY_MAX     = 512;   // ceiling on the doubling back-off
+// Clean batches a device must complete before a VRAM-shrunken decompress batch
+// cap steps back up, and the ceiling on doubling that requirement when pressure
+// keeps returning.  Deliberately far larger than the reserve's threshold: a
+// regrow can cost an ensure_buffers() realloc (and, under --gds-only, a BAR1
+// re-registration the CHANGELOG prices at ~620 ms), while a reserve retake is
+// one cudaMalloc.
+static const size_t GZ_BATCH_REGROW_BATCHES = 32;
+static const size_t GZ_BATCH_REGROW_MAX     = 1024;
+static bool gz_retake_vram_reserve(void ** reserve, size_t * reserve_bytes,
+                                   size_t want, size_t * ok_streak,
+                                   size_t * retry_at, int device_id,
+                                   const Options & opt)
+{
+  if (*reserve || want == 0) return false;      // still held, or nothing to ask for
+  if (*ok_streak < *retry_at) return false;
+  *ok_streak = 0;
+  void * p = nullptr;
+  if (cudaMalloc(&p, want) != cudaSuccess) {
+    cudaGetLastError();      // handled (we simply stay without a reserve) — consume
+    if (*retry_at <= GZ_RESERVE_RETRY_MAX / 2) *retry_at *= 2;
+    return false;
+  }
+  *reserve = p;
+  *reserve_bytes = want;
+  vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
+       + "] VRAM reserve re-armed (" + std::to_string(want / ONE_MIB)
+       + " MiB) — the pressure that took it has passed\n");
+  return true;
+}
+
 /*----------------------------------------------------------------------
   GPU COMPRESS WORKER — event-driven completion (ROADMAP 1.10, v0.14.70)
   -----------------------------------------------------------------------
@@ -25463,6 +25540,10 @@ static void gpu_worker(
   (void)m; std::shared_ptr<std::vector<StreamCtx>> ctxs_ptr;
   void * vram_reserve = nullptr;
   size_t vram_reserve_bytes = 0;
+  // Re-arm state for a surrendered reserve (see gz_retake_vram_reserve).
+  size_t vram_reserve_want = 0;      // the size bringup settled on
+  size_t reserve_ok_streak = 0;      // clean batches since the last attempt
+  size_t reserve_retry_at  = GZ_RESERVE_RETRY_BATCHES;
   if (g_phase_on.load(std::memory_order_relaxed)) phase_reset(slot_index);
 
   // ---- Event-driven completion state (ROADMAP 1.10) ----
@@ -25796,7 +25877,11 @@ static void gpu_worker(
       size_t half_batch = std::max<size_t>(1, ctxs[0].per_stream_batch / 2);
       size_t per_frame = gpu_chunk + max_out_chunk + 4096;
       vram_reserve_bytes = half_batch * per_frame;
+      // Remembered so a surrendered reserve can be re-armed later at the same
+      // size; compress never resizes its buffers, so this figure never moves.
+      vram_reserve_want = vram_reserve_bytes;
       if (cudaMalloc(&vram_reserve, vram_reserve_bytes) != cudaSuccess) {
+        cudaGetLastError();   // handled (we run without one) — consume; see gz_retake_vram_reserve()
         vram_reserve = nullptr;
         vram_reserve_bytes = 0;
         vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
@@ -25817,6 +25902,9 @@ static void gpu_worker(
       cudaFree(vram_reserve);
       vram_reserve = nullptr;
       vram_reserve_bytes = 0;
+      // Real pressure just took it: start the clean-batch streak over, so the
+      // re-arm waits out the dip rather than racing the tenant for it.
+      reserve_ok_streak = 0;
       return true;
     };
 
@@ -25940,6 +26028,13 @@ static void gpu_worker(
     while (true) {
       wd_beat(slot_index);           // heartbeat: spinning vs blocked
       check_drain_err();
+      // Quiet point: no batch is being assembled here, so a cudaMalloc that
+      // serialises against this device's in-flight work costs the pipeline
+      // nothing.  No-op unless a dip took the reserve and enough clean batches
+      // have gone by since.
+      gz_retake_vram_reserve(&vram_reserve, &vram_reserve_bytes,
+                             vram_reserve_want, &reserve_ok_streak,
+                             &reserve_retry_at, device_id, opt);
       // M4 action 6 escalate: the governor declared this device wedged past
       // the second deadline.  THIS thread throws (the drain thread is the
       // one stuck in cudaEventSynchronize) into the same catch as a CUDA
@@ -26779,6 +26874,19 @@ static void gpu_worker(
         for (size_t i = 0; i < C.filled; ++i)
           C.batch[i].release_input();
 
+        // WHY COMPRESS CANNOT DO WHAT DECOMPRESS DOES HERE, i.e. shrink the
+        // batch and hand the frames back instead of failing the whole pass.
+        // release_input() above has already freed the host copy of every frame
+        // in this batch, so there is nothing left to re-enqueue: the bytes exist
+        // only in d_in_base, and shrinking means reallocating exactly that
+        // buffer.  Decompress can shrink because it holds its inputs until
+        // delivery.  Moving release_input() after the launch would open the same
+        // door here, but only for failures that surface AT ENQUEUE -- the launch
+        // is async, so anything surfacing later at the drain's synchronize is
+        // past the release either way, and that is the narrow window the retry
+        // below already covers.  Weighed and left alone deliberately; do not
+        // "fix" the asymmetry without re-reading this.
+        //
         // THE RESERVE'S ONE JOB ON THIS PATH.  Compress allocates nothing after
         // bringup -- its buffers and temp are both sized once, from fixed upper
         // bounds -- so the only way another tenant taking VRAM can reach us is a
@@ -26811,6 +26919,10 @@ static void gpu_worker(
             && surrender_vram_reserve("to retry the compress launch"))
           cst = launch_compress();
         checkNvcomp(cst, "nvcompBatchedZstdCompressAsync");
+        // A batch that launched without needing the reserve is evidence the
+        // pressure has eased.  Counted here rather than at the top of the loop
+        // so yields and re-pops cannot age the streak on their own.
+        ++reserve_ok_streak;
         // --gds-only: the checksum kernel has been running on ck_stream since
         // the input was staged.  Join it now that the compressor is enqueued:
         // both read d_in_base and neither writes it, so they overlap, and the
@@ -29432,6 +29544,16 @@ static void gpu_decomp_worker(
   std::vector<DecompStreamCtx> ctxs;  // declared here so catch block can rescue frames
   void * vram_reserve = nullptr;
   size_t vram_reserve_bytes = 0;
+  // Re-arm state for a surrendered reserve (see gz_retake_vram_reserve).
+  // Decompress sizes its reserve from the CURRENT batch cap, which moves, so it
+  // remembers the per-frame term and recomputes the ask rather than the total.
+  size_t reserve_per_frame = 0;
+  size_t reserve_ok_streak = 0;      // clean batches since the last attempt
+  size_t reserve_retry_at  = GZ_RESERVE_RETRY_BATCHES;
+  // Recovery state for a VRAM-shrunken batch cap (see the regrow in the loop).
+  size_t batch_cap_ceiling  = 0;     // what bringup settled on; 0 until then
+  size_t batch_regrow_streak = 0;    // clean batches since the last shrink
+  size_t batch_regrow_at     = GZ_BATCH_REGROW_BATCHES;
   try {
     uint64_t init_t0 = g_perf ? now_ns() : 0;
     {
@@ -29763,6 +29885,7 @@ static void gpu_decomp_worker(
                              + decomp_out_slot(host_chunk_bytes,
                                    g_gds_out_active.load(std::memory_order_relaxed))
                              + 4096;
+      reserve_per_frame = per_frame;   // kept for the mid-run re-arm
       // NO RETRY COUNTER HERE ON PURPOSE.  Every iteration strictly halves
       // per_stream_cap, so the batch<=1 floor below already bounds this loop at
       // log2(batch) passes -- a counter can only stop it EARLY.  The first
@@ -29902,6 +30025,9 @@ static void gpu_decomp_worker(
       cudaFree(vram_reserve);
       vram_reserve = nullptr;
       vram_reserve_bytes = 0;
+      // Real pressure just took it: start the clean-batch streak over, so the
+      // re-arm waits out the dip rather than racing the tenant for it.
+      reserve_ok_streak = 0;
       return true;
     };
 
@@ -29912,8 +30038,52 @@ static void gpu_decomp_worker(
         sched->register_gpu_stream(device_id);
     }
 
+    // Bringup has settled the cap (fit search, headroom cap, reserve retries).
+    // THIS is the ceiling a mid-run shrink may climb back to -- not the user's
+    // --gpu-batch, which the card already refused here.
+    batch_cap_ceiling = per_stream_cap;
+
     while (true) {
       bool submitted_any = false;
+
+      // Quiet point: nothing of this device is in flight here (batches complete
+      // inline), so a cudaMalloc that serialises against the device costs the
+      // pipeline nothing.  Both of these are no-ops unless a dip actually took
+      // something, and both recover from a dip that has since passed — see
+      // gz_retake_vram_reserve() and the batch-cap regrow below it.
+      gz_retake_vram_reserve(&vram_reserve, &vram_reserve_bytes,
+                             std::max<size_t>(1, per_stream_cap / 2) * reserve_per_frame,
+                             &reserve_ok_streak, &reserve_retry_at, device_id, opt);
+      // THE SHRINK USED TO BE A ONE-WAY DOOR.  per_stream_cap halves whenever a
+      // buffer or temp growth loses a VRAM race, and nothing ever raised it
+      // again — pop_n is min(tuner, per_stream_cap), so the tuner could not
+      // climb back past it either.  One transient dip therefore halved this
+      // device's batches for the rest of the run, and repeated dips ratcheted it
+      // toward 1 and left it there long after the card was empty again.  Same
+      // shape as the one-way trivial exit fixed in v0.17.51.
+      //
+      // ASYMMETRIC BY DESIGN: shrink on the first failure, grow only after a
+      // streak of clean batches, and double the required streak each time
+      // pressure returns, so a card that is genuinely contended settles instead
+      // of oscillating.  Raising the cap allocates nothing by itself — the next
+      // larger batch does, through ensure_buffers — which is also why growth
+      // must stay lazy under --gds-only, where that realloc re-registers BAR1.
+      if (per_stream_cap < batch_cap_ceiling
+          && batch_regrow_streak >= batch_regrow_at) {
+        const size_t grown = std::min(batch_cap_ceiling, per_stream_cap * 2);
+        batch_regrow_streak = 0;
+        if (grown > per_stream_cap) {
+          per_stream_cap = grown;
+          // A reserve HELD across this regrow stays sized for the smaller cap
+          // until the next surrender re-arms it at the current one.  Left that
+          // way on purpose: an undersized cushion is strictly better than
+          // freeing a good allocation to ask for a bigger one on a card that
+          // has just been under pressure, and might hand back neither.
+          vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
+               + "] VRAM pressure passed; batch -> " + std::to_string(per_stream_cap)
+               + " (ceiling " + std::to_string(batch_cap_ceiling) + ")\n");
+        }
+      }
 
       // ---- Shared auto-tuner (decompress) ----
       // All GPUs report throughput to SharedTuneState. Same logic as compress.
@@ -30443,6 +30613,11 @@ static void gpu_decomp_worker(
               throw std::runtime_error(
                   "GPU decomp: failed to allocate device buffers for a single frame");
             per_stream_cap = std::max<size_t>(1, per_stream_cap / 2);
+            // Pressure is live: restart the regrow streak and make the next
+            // recovery wait longer, so a contended card settles rather than
+            // oscillating between shrink and regrow.
+            batch_regrow_streak = 0;
+            if (batch_regrow_at <= GZ_BATCH_REGROW_MAX / 2) batch_regrow_at *= 2;
             vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
                  + "] VRAM shrank under us; batch -> " + std::to_string(per_stream_cap)
                  + ", returning " + std::to_string(C.batch.size())
@@ -30910,6 +31085,9 @@ static void gpu_decomp_worker(
               throw std::runtime_error(
                   "GPU decomp: failed to grow temp buffer for a single frame");
             per_stream_cap = std::max<size_t>(1, per_stream_cap / 2);
+            // Same accounting as the buffer-growth shrink above.
+            batch_regrow_streak = 0;
+            if (batch_regrow_at <= GZ_BATCH_REGROW_MAX / 2) batch_regrow_at *= 2;
             vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
                  + "] temp buffer would not grow; batch -> "
                  + std::to_string(per_stream_cap) + ", returning "
@@ -31683,6 +31861,12 @@ static void gpu_decomp_worker(
         C.filled = 0;
         C.batch.clear();
         submitted_any = true;
+        // A batch that ran start to finish without losing a VRAM race is the
+        // evidence both recoveries wait for.  Counted here, where the batch is
+        // known to have landed — not at the top of the loop, which a yield or a
+        // re-pop also reaches.
+        ++reserve_ok_streak;
+        ++batch_regrow_streak;
 
         // Notify writer that a full batch of frames is now available
         results->cv.notify_one();
