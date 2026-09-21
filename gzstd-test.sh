@@ -699,10 +699,25 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # compress launch re-arm.  Extensive 602 -> 607.  They are
 # gated by $EXTENSIVE as well as has_gpu, so the DEFAULT baseline and the default
 # no-GPU delta are unchanged; only an --extensive run on a GPU-less host loses
-# these five, which is why the delta below is mode-dependent.  DERIVED until an
-# --extensive run confirms it.
+# these five, which is why the delta below is mode-dependent.
+# MEASURED 2026-09-21 on the 8-GPU host WITH working GDS: 606 ran, 0 failed, 1
+# skipped of 607 in 8m46s, "as expected on this host" -- the one skip is the
+# trivial-park cell this host cannot provoke, and all five new cells RAN.  The
+# five cost ~16.6 s of the run.
+#
+# THE --extensive NO-GPU DELTA WAS DERIVED AND IT WAS WRONG BY 21.  It had been
+# carried as 118 + 5 (the default delta plus the new cells), on the unexamined
+# assumption that the two modes gate the same GPU cells.  They do not: --extensive
+# turns on GPU cells the default run never reaches, so every one of those skips
+# too.  MEASURED 2026-09-21, --extensive against the USE_NVCOMP=OFF binary on this
+# same host: 463 ran, 0 failed, 115 skipped in 2m15s, so the delta is 607 - 463 =
+# 144.  That combination -- "--extensive on a GPU-less configuration" -- had never
+# been run before; the file said as much a few lines up and predicted the -96 of
+# the day would be the number to re-measure.  It was the right warning aimed at
+# the wrong constant.  The DEFAULT no-GPU delta of 118 is separately measured
+# (471 - 353) and is unaffected by cells gated behind $EXTENSIVE.
 EXPECTED_NOGPU_DELTA=118
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=123
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=144   # MEASURED 2026-09-21 (607 - 463)
 EXPECTED_NOGDS_DELTA=11
 
 # ============================================================

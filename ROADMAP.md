@@ -107,37 +107,102 @@ stat-visible stability rather than content identity.
 
 ---
 
-## ACTIVE: GPU staging — the drain thread is the per-device serializer
+## OPEN QUESTION: is GPU compress worth another round? — read this before touching staging
 
-**The GPU hardware is ~3.7× the CPU and the pipeline delivers 4.2% of it.** Kernels are
-**71.8 GiB/s aggregate** against **19.34** for all 256 cores; `--gpu-only` delivers **3.0**.
-Nothing is wrong with nvCOMP — everything is wrong with the host staging around it.
+**This section replaces the old "ACTIVE: GPU staging" one, which survived from v0.16.1 (2026-08-12)
+to v0.17.68 (2026-09-21) on numbers its own successor had retracted a day later, and proposed as
+its next step a change that had already been built and measured as a loss in that same successor.**
+It cost at least one session a false start, working from the ROADMAP rather than the CHANGELOG.
+What follows is what is actually known.
 
-Per-worker phase accounting (`-vvv`, v0.16.1) localised it in one line: workers block
-**75–82% on `wait_idle_stream`**, with **zero** time waiting for input. One `drainer` thread per
-device holds the `StreamCtx` ~100 ms/batch against ~25 ms of submit, so extra streams cannot help
-(`--gpu-streams=2` changes nothing — they funnel through the same drain).
+### The headline that framed this chapter was an artefact, and is withdrawn
 
-**Next change: async D2H directly into the frame buffers** — `cudaHostRegister` over the
-`out_pool`, so the readback is page-locked *and* copy-free.
+v0.16.0 opened with "the GPU hardware is ~3.7× the CPU and the pipeline delivers 4.2% of it"
+(3.00 GiB/s against 71.8 of kernel capability). **That was measured on a ~20 GiB file, which on
+this box measures the ramp and not the pipeline** — the batch tuner climbs 8 → 256 over a run and
+1.4 s of CUDA init is a 23% tax on a 6 s one. Throughput rises with input size all the way out:
 
-- **Do not use a staging slab THAT ADDS A COPY.** Tried at v0.16.2, **26% slower** (3.25 → 2.40),
-  reverted; see the CHANGELOG. It adds a ~160 MiB host memcpy per batch, and *any design that adds
-  a host-side copy loses here* — the transfer was never the expensive part.
-  **READ THE QUALIFIER BEFORE CITING THIS ROW.** It rules out slab-plus-copy, not slabs.
-  `--direct-stage` (SHIPPED v0.17.9) is the opposite shape: an O_DIRECT pread landing **directly**
-  in the pinned staging slab, with no intervening copy at all. Measured at v0.17.9, one device on
-  every arm, five cold runs: **host CPU 3.69–3.87 s against the ordinary reader's 6.18–7.06** (~44%
-  less), and against `--gds-only`'s 4.59–4.77 — **it beats peer-to-peer**, because it pays no
-  `cuFileBufRegister` and carries no cuFile per read. All ranges non-overlapping. This row was
-  never evidence against it.
-- **The hard part is ownership, not CUDA.** `FrameVec` buffers are `shared_ptr`s held by the
-  writer for arbitrary time, and any `resize()` past capacity reallocates and **silently
-  invalidates the registration**. Every pooled buffer must be reserved to `max_out_chunk + 4`
-  once and never grown — enforced structurally, not by a comment saying "don't grow this".
-- **Benchmark against RAM sources/sinks on this host.** Its NVMe reads at 4.56 GiB/s and
-  `--cpu-only` already hits 98.5% of that, so a storage-to-storage run here cannot *measure* the
-  win. That is a limit of the box, not of the work.
+| input | 19.53 GiB | 59.60 GiB | 195.3 GiB |
+|---|---|---|---|
+| `--gpu-only` | 3.25 GiB/s | 6.55 | **10.7** |
+
+**At steady state, order-balanced reps at 195.3 GiB in tmpfs:**
+
+| `--cpu-only` | `--hybrid` (default) | `--gpu-only` |
+|---|---|---|
+| 7.66–7.69 s = **25.5 GiB/s** | 7.74–7.76 s = 25.2 | 17.26–18.79 s = **10.7** |
+
+So the honest statement is the opposite of the old one: **on this hardware the GPU compress path
+is about 2.4× SLOWER than the 256 CPU cores**, not 3.7× faster and starved. Nothing below 60 GiB
+on this box measures any of this.
+
+### Three staging redesigns have been built and measured. All three lost or drew.
+
+Each is recorded with its qualifier, because each was re-proposed at least once after being ruled
+out:
+
+| attempt | result | why |
+|---|---|---|
+| Pinned D2H staging slab (v0.16.2) | **26% slower**, 3.25 → 2.40 GiB/s, reverted | turns one transfer into a transfer plus a ~160 MiB host memcpy per batch |
+| `cudaHostRegister` over the frame buffers — no extra copy (v0.16.2) | **monotonically slower the more memory is page-locked**; still lost at 195 GiB (18.33–19.61 s vs 15.89–17.80) | registration costs ~0.21 ms/MiB, is serialised driver-wide, and is charged per byte; the D2H it accelerates was already hidden behind the drain thread |
+| One drain thread per stream instead of per device | **neutral**, reverted | ranges overlap (16.11–17.07 vs 16.42–17.29); two drains on one device contend for the same PCIe link, and per-batch D2H got *worse* (2.74 → 2.01 GiB/s) |
+
+Both patches are kept out of tree at `tool_gpu_d2h_hostregister.patch` and
+`tool_gpu_per_stream_drain.patch`. **The `cudaHostRegister` one is correct, complete and
+mutation-tested** — its `PinnedOutBuf` solves the ownership problem structurally, which is the part
+worth reusing if the conditions below ever change.
+
+**The rule those three yield:** page-locking costs about as much per byte as the copy it
+accelerates, and on this path the copy was never the expensive part. A design only pays here if
+D2H is *genuinely* on the critical path and the buffers are reused enough to amortise the
+registration — which on this box, at any slot count tried, they are not.
+
+### What v0.16.2 did fix, and it was real
+
+The drain read every frame back with a **blocking, null-stream** `cudaMemcpy` — and gzstd creates
+blocking streams, so each one is a device-wide barrier: up to 258 per batch at batch=256. That is
+why the three stages measured as strictly serial and why `--gpu-streams=2` had never bought
+anything. Fixed by issuing every readback async on the batch's own stream, closed by one
+synchronize. It also split the stream default, because the directions measure opposite ways:
+compress 2, decompress 1 (decompression *expands*, so its D2H dominates and more streams only
+split one PCIe link).
+
+### What is genuinely open
+
+- **Which stage dominates depends on the batch size, so no single-batch-size conclusion
+  transfers.** At batch≈14 the kernel dominated (40 ms/batch); at the settled batch=256, D2H was
+  40% of a 1232 ms batch and the kernel 27%; after the v0.16.2 fix another record put the kernel
+  at 68% and D2H at 10%. Any future claim here must state the batch size it was measured at.
+- **The post-batch tail.** At 195 GiB, ~6.5 s of a 16.5 s run happened after the last GPU batch,
+  and `--cpu-only` showed the same shape — so it is the shared pipeline, not a GPU problem. Parts
+  of this were since addressed (incremental input retirement, the v0.17.55 teardown sleeps), but
+  **it has not been re-measured at HEAD**. Do that before anything else here: it was bigger than
+  every staging effect on this list.
+- The kernel is nvCOMP's. Chunk size and batch shape are the only levers we own.
+
+### The decision this section exists to force
+
+The cheap work is done and the expensive work has lost three times. Before another round, answer:
+**is a GPU compress path that runs at 42% of the CPU pool's throughput worth more engineering on
+this hardware?** Three honest options — (a) keep it as-is for CPU-poor hosts, where the ratio
+inverts and the flag earns its place; (b) re-measure the tail at HEAD and decide with that number
+in hand; (c) close the chapter and say so in the help, so users stop reaching for `--gpu-only` on
+boxes like this one. **Do not open (d), another staging redesign, without a new measurement that
+contradicts the table above.**
+
+### Measurement discipline for anything in this section
+
+- **≥ 60 GiB, or it is ramp.** Four interleaved reps minimum; run-to-run spread here is ~10%.
+- **RAM source and sink.** This host's NVMe reads at 4.56 GiB/s and `--cpu-only` already hits 98.5%
+  of that, so a storage-to-storage run cannot measure a GPU win — a property of the box, not the
+  design.
+- **Entropy-coded input** (base64-of-random). The standard corpora decode as memcpy/memset and
+  never engage the GPU.
+- **Record the tenant state with every number.** On a shared box six of eight cards at 100% made
+  `--gpu-only` decompress 20× slower than CPU; a number without that context is unreadable later.
+- **Never size a pipelining win from `GPU batch total`** — it is `h2d + comp + d2h`, a SUM, which by
+  construction cannot show overlap. That error produced a "2.2× on the table" estimate that was
+  simply wrong.
 
 Also still unbound: `--acls/--xattrs` metadata gathering reopens the path, and the H2D content
 checksum is now parallelised but still host-side (a GPU-side XXH64 is awkward — the algorithm is
