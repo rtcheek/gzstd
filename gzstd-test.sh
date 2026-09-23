@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=471
-$EXTENSIVE && EXPECTED_TESTS=607
+EXPECTED_TESTS=479
+$EXTENSIVE && EXPECTED_TESTS=615
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -716,6 +716,14 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # the day would be the number to re-measure.  It was the right warning aimed at
 # the wrong constant.  The DEFAULT no-GPU delta of 118 is separately measured
 # (471 - 353) and is unaffected by cells gated behind $EXTENSIVE.
+# v0.17.69 added two always-run duplicate-member cells (471 -> 473, 607 -> 609).
+# The first pre-tag follow-up added four always-run CPU cells: ordinary-writer
+# ordering, mid-file stdin refusal, the offset-zero redirect control, and the
+# single-reader O_DIRECT EINVAL fallback (473 -> 477, 609 -> 613).  This review
+# adds two more: filesystem-alias rejection in the full-parallel planner and a
+# deterministic ordinary-writer -> GNU-sparse duplicate (477 -> 479,
+# 613 -> 615).  All run with or without GPU/GDS, so neither host delta changes.
+# DERIVED until the next suite pair confirms it.
 EXPECTED_NOGPU_DELTA=118
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=144   # MEASURED 2026-09-21 (607 - 463)
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
@@ -1785,11 +1793,22 @@ GVPY
   # 4. The compress half of the reserve: a launch that fails for want of memory
   # surrenders, retries, and the cushion comes back.  Compress allocates nothing
   # after bringup, so this launch failure is the ONLY way a tenant reaches it.
-  GZSTD_DEBUG_FAIL_COMPRESS_LAUNCH=1 run_test "$GZSTD" -q -f --gpu-only \
-    --gpu-devices=1 --gpu-batch=2 --chunk-size=1 -vv "$vr_src" -o "$TMPDIR/vrec.out.zst" 2>"$vr_e"
+  GZSTD_DEBUG_FAIL_COMPRESS_LAUNCH=1 \
+  GZSTD_DEBUG_COMPRESS_RESERVE_RETRY_FAST=1 \
+  GZSTD_DEBUG_ADAPT_STALL=-1:1 \
+    run_test "$GZSTD" -q -f --gpu-only --gpu-devices=1 --gpu-streams=1 \
+      --gpu-batch=2 --chunk-size=1 -vv "$vr_src" -o "$TMPDIR/vrec.out.zst" 2>"$vr_e"
   vr_rc=$LAST_RC
   vr_surr=$(grep -ac 'to retry the compress launch' "$vr_e" 2>/dev/null || true)
   vr_arm=$(grep -ac 'VRAM reserve re-armed' "$vr_e" 2>/dev/null || true)
+  vr_quiet=$(grep -ac 'VRAM reserve retry waited for in-flight streams' "$vr_e" 2>/dev/null || true)
+  vr_comp_ok=0
+  if [[ $vr_rc -eq 0 ]] \
+     && "$GZSTD" -q -d -c --cpu-only "$TMPDIR/vrec.out.zst" \
+          >"$TMPDIR/vrec.roundtrip" 2>/dev/null \
+     && files_match "$vr_src" "$TMPDIR/vrec.roundtrip"; then
+    vr_comp_ok=1
+  fi
   if [[ ${vr_surr:-0} -eq 0 ]]; then
     if [[ $(vr_engaged) -eq 0 ]]; then
       skip_host "a compress launch failure re-arms its reserve" "no GPU bringup (card full?)"
@@ -1801,10 +1820,17 @@ GVPY
   elif [[ ${vr_arm:-0} -eq 0 ]]; then
     fail "a compress launch failure re-arms its reserve" \
          "reserve surrendered and never taken back"
+  elif [[ ${vr_quiet:-0} -eq 0 ]]; then
+    fail "a compress launch failure re-arms its reserve" \
+         "re-arm never waited for the deliberately in-flight stream: NOT TESTED"
+  elif [[ $vr_comp_ok -ne 1 ]]; then
+    fail "a compress launch failure re-arms its reserve" \
+         "the recovered run did not produce a byte-correct archive"
   else
-    pass "a compress launch failure re-arms its reserve"
+    pass "a compress launch failure re-arms its reserve at a quiet device point"
   fi
-  rm -f "$vr_src" "$vr_z" "$vr_out" "$vr_e" "$TMPDIR/vrec.out.zst"
+  rm -f "$vr_src" "$vr_z" "$vr_out" "$vr_e" \
+        "$TMPDIR/vrec.out.zst" "$TMPDIR/vrec.roundtrip"
   fi  # $EXTENSIVE (VRAM recovery: rare by nature, not worth a default run)
 
   # v0.17.29: the --gds-only OUTPUT preflight must prove EVERY frame start, not
@@ -7123,6 +7149,249 @@ else
   chmod 750 "$XS/a"
   XARC="$TMPDIR/x.tar.zst"; XOUT="$TMPDIR/xout"
 
+  # 0. LAST MEMBER WINS, including for DEFERRED work.  An archive may legally
+  # name the same path twice -- `tar -rf` appends one every time it updates a
+  # file -- and tar's rule is that the last entry is what lands.  gzstd defers
+  # hardlinks (their target may not exist yet) and directory metadata (a child
+  # write would bump the parent's mtime) to a replay after the writer drains, and
+  # that replay used to run the EARLIER entry after the LATER member was already
+  # written.  BOTH exited 0 with the wrong content, which is this project's worst
+  # failure shape, and both are measured against GNU tar rather than against an
+  # opinion about what tar ought to do.
+  #
+  # THESE CELLS DISCRIMINATE: on a build without the supersede_deferred() calls,
+  # the hardlink case restores the TARGET's bytes over the newer regular file
+  # (and leaves the two sharing an inode), and the directory case keeps the FIRST
+  # header's mode because dirmeta replays in reverse.
+  DUP="$TMPDIR/dupmem"; rm -rf "$DUP"; mkdir -p "$DUP/src"
+  ( cd "$DUP/src" && echo "TARGET-CONTENT" > t && ln t f \
+      && tar -cf ../dup.tar t f && rm f \
+      && echo "NEW-REGULAR-CONTENT" > f && tar -rf ../dup.tar f ) 2>/dev/null
+  "$GZSTD" --cpu-only -q -f "$DUP/dup.tar" -o "$DUP/dup.tar.zst" 2>/dev/null
+  rm -rf "$DUP/ref" "$DUP/out"; mkdir -p "$DUP/ref" "$DUP/out"
+  tar -xf "$DUP/dup.tar" -C "$DUP/ref" 2>/dev/null
+  run_test "$GZSTD" -d --cpu-only -q --tar -C "$DUP/out" "$DUP/dup.tar.zst" 2>/dev/null
+  dup_rc=$LAST_RC
+  dup_ref=$(cat "$DUP/ref/f" 2>/dev/null || true)
+  dup_got=$(cat "$DUP/out/f" 2>/dev/null || true)
+  if [[ $dup_rc -ne 0 ]]; then
+    fail "a duplicate member's LAST entry wins over a deferred hardlink" "exit $dup_rc"
+  elif [[ "$dup_ref" != "NEW-REGULAR-CONTENT" ]]; then
+    # The reference is the contract; if this tar disagrees, the cell is not a test.
+    skip "a duplicate member's LAST entry wins over a deferred hardlink" \
+         "GNU tar gave '$dup_ref' — cannot use as reference"
+  elif [[ "$dup_got" != "$dup_ref" ]]; then
+    fail "a duplicate member's LAST entry wins over a deferred hardlink" \
+         "got '$dup_got', GNU tar gives '$dup_ref' — the earlier hardlink replayed over it"
+  else
+    pass "a duplicate member's LAST entry wins over a deferred hardlink"
+  fi
+
+  rm -rf "$DUP/d" "$DUP/dref" "$DUP/dout"; mkdir -p "$DUP/d/sub"
+  chmod 700 "$DUP/d/sub"; tar -cf "$DUP/dir.tar" -C "$DUP/d" sub 2>/dev/null
+  chmod 755 "$DUP/d/sub"; tar -rf "$DUP/dir.tar" -C "$DUP/d" sub 2>/dev/null
+  "$GZSTD" --cpu-only -q -f "$DUP/dir.tar" -o "$DUP/dir.tar.zst" 2>/dev/null
+  mkdir -p "$DUP/dref" "$DUP/dout"
+  tar -xf "$DUP/dir.tar" -C "$DUP/dref" 2>/dev/null
+  run_test "$GZSTD" -d --cpu-only -q --tar -C "$DUP/dout" "$DUP/dir.tar.zst" 2>/dev/null
+  dup_rc=$LAST_RC
+  dref_mode=$(stat -c %a "$DUP/dref/sub" 2>/dev/null || true)
+  dout_mode=$(stat -c %a "$DUP/dout/sub" 2>/dev/null || true)
+  if [[ $dup_rc -ne 0 ]]; then
+    fail "a duplicate directory's LAST metadata wins" "exit $dup_rc"
+  elif [[ "$dref_mode" != "755" ]]; then
+    skip "a duplicate directory's LAST metadata wins" \
+         "GNU tar gave mode $dref_mode — cannot use as reference"
+  elif [[ "$dout_mode" != "$dref_mode" ]]; then
+    fail "a duplicate directory's LAST metadata wins" \
+         "mode $dout_mode, GNU tar gives $dref_mode — reverse replay kept the first header"
+  else
+    pass "a duplicate directory's LAST metadata wins"
+  fi
+
+  # Ordinary regular-file jobs must obey the same rule.  The shared writer FIFO
+  # preserves POP order, not filesystem-mutation order: writer 0 can pop OLD and
+  # be descheduled before create_file(), writer 1 can install NEW, then writer 0
+  # can resume, unlink NEW and write OLD.  Both writers report success.  Three FIFO
+  # rendezvous make that interleaving exact rather than hoping the scheduler hits
+  # it: the first parks OLD after it is claimed; the second proves the parser saw
+  # OLD outstanding when it reached NEW; the third sits in the CV predicate and
+  # proves it saw q_active_ nonzero (not merely an empty queue) immediately before
+  # sleeping.  Only then is OLD released.  Removing or bypassing that wait makes
+  # the third handshake time out, so final-byte luck cannot turn the regression
+  # into a pass.
+  rm -rf "$DUP/r" "$DUP/rref" "$DUP/rout"; mkdir -p "$DUP/r/d" "$DUP/rref/d" "$DUP/rout/d"
+  printf 'OLD-REGULAR-CONTENT\n' > "$DUP/r/d/f"
+  # Exercise both aliases the ordering key must collapse: distinct archive
+  # spellings, and OVERLAPPING positional roots.  The first destination is
+  # root + d/f; the second is root/d + f -- the same leaf through different
+  # held directory inodes, so a root-index or root-inode prefix is insufficient.
+  tar --transform='s|^d/f$|d//f|' -cf "$DUP/reg.tar" -C "$DUP/r" d/f 2>/dev/null
+  printf 'NEW-REGULAR-CONTENT\n' > "$DUP/r/f"
+  tar -rf "$DUP/reg.tar" -C "$DUP/r" f 2>/dev/null
+  tar -xf "$DUP/reg.tar" -C "$DUP/rref" 'd//f' \
+      -C "$DUP/rref/d" f 2>/dev/null
+  "$GZSTD" --cpu-only -q -f "$DUP/reg.tar" -o "$DUP/reg.tar.zst" 2>/dev/null
+  reg_first=$(tar -tf "$DUP/reg.tar" 2>/dev/null | sed -n '1p')
+  reg_second=$(tar -tf "$DUP/reg.tar" 2>/dev/null | sed -n '2p')
+  dup_gated=0; dup_rc=0; dup_landed=0; dup_inode_ok=0
+  dup_noproc_ok=0; dup_noproc_one_ok=0
+  if [[ "$reg_first" == "d//f" && "$reg_second" == "f" ]]; then
+    mkfifo "$DUP/wgate" "$DUP/pgate" "$DUP/bgate"
+    GZSTD_DEBUG_EXTRACT_WRITER_GATE="$DUP/wgate" \
+    GZSTD_DEBUG_EXTRACT_PATH_GATE="$DUP/pgate" \
+    GZSTD_DEBUG_EXTRACT_BARRIER_GATE="$DUP/bgate" \
+      timeout --foreground -k 10 120 \
+        "$GZSTD" -d --cpu-only -vv --tar --write-threads 2 \
+          "$DUP/reg.tar.zst" -C "$DUP/rout" 'd//f' \
+          -C "$DUP/rout/d" f >"$DUP/gate.log" 2>&1 &
+    dup_pid=$!
+    timeout 60 sh -c '
+        exec 8>"$1/wgate" || exit 1
+        exec 9>"$1/pgate" || exit 1
+        printf parser >&9
+        exec 7>"$1/bgate" || exit 1
+        printf barrier >&7
+        printf writer >&8
+        exec 7>&-; exec 9>&-; exec 8>&-
+      ' sh "$DUP" && dup_gated=1
+    wait "$dup_pid" || dup_rc=$?
+    grep -aq "earlier writes landed before dispatch" "$DUP/gate.log" \
+      && dup_landed=1
+
+    # /proc/self/fd preserves a bind mount's own spelling, so two roots can
+    # still name one destination while their absolute-text keys differ.  Model
+    # exactly that without mount privilege: force the lexical root keys apart,
+    # then require the held-parent inode alias to trigger the completion diagnostic
+    # as well as produce the right bytes.
+    rm -rf "$DUP/inode"; mkdir -p "$DUP/inode/d"
+    dup_inode_rc=0
+    GZSTD_DEBUG_EXTRACT_DISTINCT_ROOT_KEYS=1 \
+      "$GZSTD" -d --cpu-only -vv --tar --write-threads 2 \
+        "$DUP/reg.tar.zst" -C "$DUP/inode" 'd//f' \
+        -C "$DUP/inode/d" f >"$DUP/inode.log" 2>&1 || dup_inode_rc=$?
+    if [[ $dup_inode_rc -eq 0 ]] \
+       && grep -aq "earlier writes landed before dispatch" "$DUP/inode.log" \
+       && cmp -s "$DUP/inode/d/f" "$DUP/rref/d/f"; then
+      dup_inode_ok=1
+    fi
+
+    # /proc is an optimisation dependency, never a correctness dependency.  If
+    # multiple positional roots cannot be identified, refusing before extraction
+    # is the safe answer; silently falling back to root indices reopens this race.
+    rm -rf "$DUP/noproc"; mkdir -p "$DUP/noproc/d"
+    dup_noproc_rc=0
+    GZSTD_DEBUG_NO_PROCFS=1 "$GZSTD" -d --cpu-only -vv --tar --write-threads 2 \
+      "$DUP/reg.tar.zst" -C "$DUP/noproc" 'd//f' \
+      -C "$DUP/noproc/d" f >"$DUP/noproc.log" 2>&1 || dup_noproc_rc=$?
+    if [[ $dup_noproc_rc -ne 0 && ! -e "$DUP/noproc/d/f" ]] \
+       && grep -aq "cannot identify multiple positional extraction roots" "$DUP/noproc.log"; then
+      dup_noproc_ok=1
+    fi
+
+    # roots_ contains the default destination even when no selector references
+    # it.  One REFERENCED -C root needs no cross-root identity and must remain
+    # usable without procfs; an earlier fail-closed draft rejected this valid case.
+    rm -rf "$DUP/noproc-one"; mkdir -p "$DUP/noproc-one/d"
+    dup_noproc_one_rc=0
+    GZSTD_DEBUG_NO_PROCFS=1 "$GZSTD" -d --cpu-only -q --tar --write-threads 2 \
+      "$DUP/reg.tar.zst" -C "$DUP/noproc-one/d" f \
+      >"$DUP/noproc-one.log" 2>&1 || dup_noproc_one_rc=$?
+    if [[ $dup_noproc_one_rc -eq 0 ]] \
+       && grep -aq "NEW-REGULAR-CONTENT" "$DUP/noproc-one/d/f"; then
+      dup_noproc_one_ok=1
+    fi
+  fi
+  if [[ "$reg_first" != "d//f" || "$reg_second" != "f" ]]; then
+    skip "ordinary duplicate regular members preserve archive order" \
+         "reference tar normalized the alias fixture ($reg_first, $reg_second)"
+  elif [[ $dup_gated -ne 1 ]]; then
+    fail "ordinary duplicate regular members preserve archive order" \
+         "one of the deterministic ordering gates was not reached"
+  elif [[ $dup_landed -ne 1 ]]; then
+    fail "ordinary duplicate regular members preserve archive order" \
+         "the completion diagnostic printed before or without the drain: NOT TESTED"
+  elif [[ $dup_rc -ne 0 ]]; then
+    fail "ordinary duplicate regular members preserve archive order" "exit $dup_rc"
+  elif [[ $dup_inode_ok -ne 1 ]]; then
+    fail "ordinary duplicate regular members preserve archive order" \
+         "held-parent inode aliases did not collapse distinct bind-mount spellings"
+  elif [[ $dup_noproc_ok -ne 1 ]]; then
+    fail "ordinary duplicate regular members preserve archive order" \
+         "multiple positional roots did not fail closed without procfs"
+  elif [[ $dup_noproc_one_ok -ne 1 ]]; then
+    fail "ordinary duplicate regular members preserve archive order" \
+         "without procfs, one referenced -C root was needlessly refused"
+  elif ! cmp -s "$DUP/rout/d/f" "$DUP/rref/d/f"; then
+    fail "ordinary duplicate regular members preserve archive order" \
+         "an older writer replaced the final member at exit 0"
+  else
+    pass "ordinary duplicate regular members preserve archive order (GNU tar parity)"
+  fi
+
+  # GNU sparse members are restored synchronously by the parser, not by the
+  # writer pool, but create_file()/ftruncate() still mutate the same destination.
+  # Park an older ordinary writer, then require the duplicate barrier to be
+  # reached with q_active_ nonzero before the newer sparse member can replace it.
+  # The three FIFO handshakes make the ordering exact; final-byte parity is checked
+  # against tar.
+  DUPS="$DUP/sparse-race"; mkdir -p "$DUPS/src" "$DUPS/out" "$DUPS/ref"
+  printf 'OLD-SPARSE-RACE\n' > "$DUPS/src/f"
+  tar -cf "$DUPS/s.tar" -C "$DUPS/src" f 2>/dev/null
+  rm -f "$DUPS/src/f"; truncate -s $((8*1048576)) "$DUPS/src/f" 2>/dev/null
+  printf 'NEW-SPARSE' | dd of="$DUPS/src/f" bs=1 seek=0 conv=notrunc 2>/dev/null
+  printf 'TAIL' | dd of="$DUPS/src/f" bs=1 seek=$((8*1048576-4)) conv=notrunc 2>/dev/null
+  sparse_fixture=0
+  if tar --sparse -rf "$DUPS/s.tar" -C "$DUPS/src" f 2>/dev/null \
+     && [[ $(tar -tf "$DUPS/s.tar" 2>/dev/null | grep -cx 'f' || true) -eq 2 ]] \
+     && { grep -aq 'GNU.sparse' "$DUPS/s.tar" \
+          || [[ "$(dd if="$DUPS/s.tar" bs=1 skip=1180 count=1 2>/dev/null)" == "S" ]]; }; then
+    sparse_fixture=1
+  fi
+  if [[ $sparse_fixture -eq 1 ]]; then
+    tar -xf "$DUPS/s.tar" -C "$DUPS/ref" 2>/dev/null
+    "$GZSTD" --cpu-only -q -f "$DUPS/s.tar" -o "$DUPS/s.tar.zst" 2>/dev/null
+    mkfifo "$DUPS/wgate" "$DUPS/pgate" "$DUPS/bgate"
+    sparse_gated=0; sparse_rc=0; sparse_landed=0
+    GZSTD_DEBUG_EXTRACT_WRITER_GATE="$DUPS/wgate" \
+    GZSTD_DEBUG_EXTRACT_PATH_GATE="$DUPS/pgate" \
+    GZSTD_DEBUG_EXTRACT_BARRIER_GATE="$DUPS/bgate" \
+      timeout --foreground -k 10 120 \
+        "$GZSTD" -d --cpu-only -vv --tar --write-threads 2 \
+          -C "$DUPS/out" "$DUPS/s.tar.zst" >"$DUPS/gate.log" 2>&1 &
+    sparse_pid=$!
+    timeout 60 sh -c '
+        exec 8>"$1/wgate" || exit 1
+        exec 9>"$1/pgate" || exit 1
+        printf parser >&9
+        exec 7>"$1/bgate" || exit 1
+        printf barrier >&7
+        printf writer >&8
+        exec 7>&-; exec 9>&-; exec 8>&-
+      ' sh "$DUPS" && sparse_gated=1
+    wait "$sparse_pid" || sparse_rc=$?
+    grep -aq "earlier writes landed before dispatch" "$DUPS/gate.log" \
+      && sparse_landed=1
+    if [[ $sparse_gated -ne 1 ]]; then
+      fail "a newer GNU sparse member waits for an older writer" \
+           "the sparse duplicate did not reach the deterministic barrier"
+    elif [[ $sparse_landed -ne 1 ]]; then
+      fail "a newer GNU sparse member waits for an older writer" \
+           "the completion diagnostic printed before or without the drain: NOT TESTED"
+    elif [[ $sparse_rc -ne 0 ]]; then
+      fail "a newer GNU sparse member waits for an older writer" "exit $sparse_rc"
+    elif cmp -s "$DUPS/out/f" "$DUPS/ref/f"; then
+      pass "a newer GNU sparse member waits for an older writer (GNU tar parity)"
+    else
+      fail "a newer GNU sparse member waits for an older writer" \
+           "the older queued write replaced the sparse member"
+    fi
+  else
+    skip "a newer GNU sparse member waits for an older writer" \
+         "tar did not create a recognizable GNU sparse append fixture"
+  fi
+  rm -rf "$DUP"
+
   # 1. gzstd create → gzstd extract → identical tree (incl. long name, big file).
   "$GZSTD" --cpu-only -q -f -o "$XARC" --tar "$XS" 2>/dev/null
   rm -rf "$XOUT"; mkdir -p "$XOUT"
@@ -7912,7 +8181,7 @@ tbl+=struct.pack('<IBI',len(ents),0,0x8F92EAB1)
 open(sys.argv[2],'wb').write(out+tbl)
 PYEOF
   }
-  python3 - "$SX/coll.tar" "$SX/legit.tar" <<'PYEOF'
+  python3 - "$SX/coll.tar" "$SX/legit.tar" "$SX/alias.tar" "$SX/bind.tar" <<'PYEOF'
 import tarfile, io, os, sys
 def build(path, entries):
     buf=io.BytesIO(); tf=tarfile.open(fileobj=buf,mode='w',format=tarfile.GNU_FORMAT)
@@ -7927,10 +8196,25 @@ def build(path, entries):
 build(sys.argv[1], [("f1.bin","big"),("x","f"),("f2.bin","big"),("x/y","f"),("f3.bin","big")])
 # legit: real dir entries with children (must NOT trip the collision guard)
 build(sys.argv[2], [("d","d"),("d/e","d"),("d/a","big"),("d/b","big"),("d/e/f","big")])
+# duplicate filesystem path under two archive spellings.  open_parent() ignores
+# empty/`.` components, so these are both a/b and the latter must win.
+build(sys.argv[3], [("f1.bin","big"),("a//b","f"),("f2.bin","big"),
+                    ("a/b","f"),("f3.bin","big")])
+# Distinct lexical paths which the test hook models as two bind spellings of
+# one directory.  This pins the planner's physical-alias fallback without mount
+# privilege; the serial cross-root test pins the real inode-key comparison.
+build(sys.argv[4], [("f1.bin","big"),("bind-a/f","f"),("f2.bin","big"),
+                    ("bind-b/f","f"),("f3.bin","big")])
 PYEOF
   chunk_seektable "$SX/coll.tar" "$SX/coll.tar.zst"
   chunk_seektable "$SX/legit.tar" "$SX/legit.tar.zst"
-  rm -rf "$SX/cout" "$SX/lout" "$SX/lref"; mkdir -p "$SX/cout" "$SX/lout" "$SX/lref"
+  chunk_seektable "$SX/alias.tar" "$SX/alias.tar.zst"
+  chunk_seektable "$SX/bind.tar" "$SX/bind.tar.zst"
+  rm -rf "$SX/cout" "$SX/lout" "$SX/lref" "$SX/aout" "$SX/aref" \
+         "$SX/bctl" "$SX/bout"
+  mkdir -p "$SX/cout" "$SX/lout" "$SX/lref" "$SX/aout" "$SX/aref" \
+           "$SX/bctl/bind-a" "$SX/bctl/bind-b" \
+           "$SX/bout/bind-a" "$SX/bout/bind-b"
   cpar=$("$GZSTD" -d --cpu-only -v --tar "$SX/coll.tar.zst" -C "$SX/cout" 2>&1 | grep -c 'parallel-extract' || true)
   ctype=$(stat -c %F "$SX/cout/x" 2>/dev/null)
   if [[ "$cpar" == "0" && "$ctype" == "regular file" && ! -e "$SX/cout/x/y" ]]; then
@@ -7941,6 +8225,35 @@ PYEOF
   if [[ "$lpar" == "1" ]] && diff -r "$SX/lout" "$SX/lref" >/dev/null 2>&1; then
     pass "parallel-extract: legit directory tree still engages + matches tar"
   else fail "parallel-extract legit" "engaged=$lpar or mismatch vs tar"; fi
+  # 11b2. The duplicate guard keys the filesystem path, not the raw archive
+  # spelling.  Before this check, a//b and a/b entered separate partitions even
+  # though the secure path walk resolves both to one leaf; their winner was then
+  # scheduler-dependent.  Route aliases through the ordered serial parser and
+  # compare the actual winner with GNU tar.
+  apar_rc=0
+  "$GZSTD" -d --cpu-only -v --tar "$SX/alias.tar.zst" -C "$SX/aout" \
+    >"$SX/alias.log" 2>&1 || apar_rc=$?
+  apar=$(grep -c 'parallel-extract' "$SX/alias.log" 2>/dev/null || true)
+  tar -xf "$SX/alias.tar" -C "$SX/aref" 2>/dev/null
+  # Control first: without the physical-alias hook this otherwise-ordinary
+  # archive MUST take the full-parallel route.  Merely seeing zero with the hook
+  # could mean the planner was never eligible, which would prove nothing.
+  bctl_rc=0
+  "$GZSTD" -d --cpu-only -v --tar "$SX/bind.tar.zst" -C "$SX/bctl" \
+    >"$SX/bctl.log" 2>&1 || bctl_rc=$?
+  bcpar=$(grep -c 'parallel-extract' "$SX/bctl.log" 2>/dev/null || true)
+  bout_rc=0
+  GZSTD_DEBUG_EXTRACT_BIND_ALIAS=1 \
+    "$GZSTD" -d --cpu-only -v --tar "$SX/bind.tar.zst" -C "$SX/bout" \
+      >"$SX/bind.log" 2>&1 || bout_rc=$?
+  bpar=$(grep -c 'parallel-extract' "$SX/bind.log" 2>/dev/null || true)
+  if [[ $apar_rc -eq 0 && "$apar" == "0" && $bctl_rc -eq 0 && "$bcpar" == "1" \
+        && $bout_rc -eq 0 && "$bpar" == "0" ]] \
+     && diff -r "$SX/aout" "$SX/aref" >/dev/null 2>&1 \
+     && diff -r "$SX/bout" "$SX/bctl" >/dev/null 2>&1; then
+    pass "parallel-extract: filesystem-path aliases fall back; last member wins"
+  else fail "parallel-extract path aliases" \
+       "lexical rc=$apar_rc par=$apar; bind control rc=$bctl_rc par=$bcpar; hook rc=$bout_rc par=$bpar; mismatch"; fi
   # 11c. GZSTD_FORCE_POOL forces the adaptive decoder pool fully on (offload
   #      active from the start), so the parallel path routes every frame through
   #      the shared decode pool + per-partition reorder buffers — must round-trip
@@ -9876,6 +10189,87 @@ else
        "exit $PS_RC; output is $(files_match "$PIN/B.bin" "$PIN/dd.out" && echo 'the REPLACEMENT' || echo 'not the pinned archive')"
 fi
 rm -f "$PIN"/in.zst* "$PIN"/repl.zst "$PIN/dd.out"
+
+# 2b. An inherited stdin can be a seekable open file description positioned
+# mid-file.  All absolute-offset fast paths would otherwise restart at byte 0,
+# so the acquisition boundary must refuse it before producing any output.
+so_a="$TMPDIR/soff_a.bin"; so_b="$TMPDIR/soff_b.bin"
+head -c 200000 /dev/urandom > "$so_a"; head -c 300000 /dev/urandom > "$so_b"
+"$GZSTD" --cpu-only -q -f "$so_a" -o "$TMPDIR/soff_a.zst" 2>/dev/null
+"$GZSTD" --cpu-only -q -f "$so_b" -o "$TMPDIR/soff_b.zst" 2>/dev/null
+cat "$TMPDIR/soff_a.zst" "$TMPDIR/soff_b.zst" > "$TMPDIR/soff_both.zst"
+so_off=$(stat -c %s "$TMPDIR/soff_a.zst")
+so_rc=0; so_bytes=0
+if command -v python3 >/dev/null 2>&1; then
+  cat > "$TMPDIR/soff_seek.py" <<'PYEOF'
+import os, sys
+path, off, gz = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+fd = os.open(path, os.O_RDONLY); os.lseek(fd, off, os.SEEK_SET); os.dup2(fd, 0)
+os.execv(gz, [gz] + sys.argv[4:])
+PYEOF
+  so_bytes=$(python3 "$TMPDIR/soff_seek.py" "$TMPDIR/soff_both.zst" "$so_off" "$GZSTD" \
+               -d -c -q --cpu-only - 2>"$TMPDIR/soff.err" | wc -c)
+  so_rc=${PIPESTATUS[0]}
+  run_test true
+  if [[ $so_rc -eq 0 ]]; then
+    fail "a mid-file seekable stdin is refused, not decoded from byte 0" \
+         "exit 0 with $so_bytes bytes"
+  elif [[ $so_bytes -ne 0 ]]; then
+    fail "a mid-file seekable stdin is refused, not decoded from byte 0" \
+         "refused but still wrote $so_bytes bytes"
+  elif ! grep -aq "stdin is a seekable file positioned at byte $so_off" "$TMPDIR/soff.err"; then
+    fail "a mid-file seekable stdin is refused, not decoded from byte 0" \
+         "nonzero exit came from the wrong path: acquisition guard NOT PROVED"
+  else
+    pass "a mid-file seekable stdin is refused, not decoded from byte 0"
+  fi
+
+  # The ordinary redirect (offset zero) must not be caught by the guard.
+  so_md5=$("$GZSTD" -d -c -q --cpu-only < "$TMPDIR/soff_b.zst" | md5sum | cut -d' ' -f1)
+  run_test true
+  if [[ "$so_md5" == "$(md5sum "$so_b" | cut -d' ' -f1)" ]]; then
+    pass "an ordinary stdin redirect still decodes from its start"
+  else
+    fail "an ordinary stdin redirect still decodes from its start" "output differs"
+  fi
+else
+  skip_host "a mid-file seekable stdin is refused, not decoded from byte 0" "python3 not available"
+  skip_host "an ordinary stdin redirect still decodes from its start" "python3 not available"
+fi
+rm -f "$TMPDIR"/soff_*
+
+# 2c. open(O_DIRECT) may succeed while a read returns EINVAL.  First force a
+# healthy buffered fallback and verify its bytes.  Then let exactly one complete
+# frame through O_DIRECT, refuse the next read, and make the fallback fread set
+# ferror: this second arm mutation-proves the shared check_read_error() call.
+# Without it, the first frame is accepted as EOF and the trailing frames vanish
+# at exit 0 -- the production defect this cell is meant to pin down.
+ei_src="$TMPDIR/einval.bin"; head -c $((12*1048576)) /dev/urandom > "$ei_src"
+"$GZSTD" --cpu-only -q -f --chunk-size=1 "$ei_src" -o "$TMPDIR/einval.zst" 2>/dev/null
+GZSTD_DEBUG_MT_DIRECT_EINVAL=1 run_test "$GZSTD" -d -c --cpu-only --direct-read \
+  --read-threads 1 "$TMPDIR/einval.zst" > "$TMPDIR/einval.out" 2>"$TMPDIR/einval.log"
+ei_rc=$LAST_RC
+GZSTD_DEBUG_DIRECT_FREAD_EIO=1 run_test "$GZSTD" -d -c --cpu-only --direct-read \
+  --read-threads 1 "$TMPDIR/einval.zst" > "$TMPDIR/einval-eio.out" \
+  2>"$TMPDIR/einval-eio.log"
+ei_eio_rc=$LAST_RC
+if [[ $ei_rc -ne 0 ]]; then
+  fail "a refused O_DIRECT read degrades to buffered instead of dying" "exit $ei_rc"
+elif ! grep -aq "refused an O_DIRECT read" "$TMPDIR/einval.log"; then
+  fail "a refused O_DIRECT read degrades to buffered instead of dying" \
+       "hook never fired: NOT TESTED"
+elif ! files_match "$ei_src" "$TMPDIR/einval.out"; then
+  fail "a refused O_DIRECT read degrades to buffered instead of dying" "output differs"
+elif [[ $ei_eio_rc -eq 0 ]]; then
+  fail "a refused O_DIRECT read degrades to buffered instead of dying" \
+       "buffered EIO was accepted as EOF: trailing frames silently dropped"
+elif ! grep -aFq "read error on $TMPDIR/einval.zst" "$TMPDIR/einval-eio.log"; then
+  fail "a refused O_DIRECT read degrades to buffered instead of dying" \
+       "buffered EIO failed for another reason: check_read_error NOT PROVED"
+else
+  pass "a refused O_DIRECT read degrades, and its buffered EIO remains fatal"
+fi
+rm -f "$TMPDIR"/einval.* "$TMPDIR"/einval-eio.*
 
 # 3. Compress: the mmap reader, and --direct-read's O_DIRECT reader.  Small inputs
 #    are enough -- both readers engage at any size.

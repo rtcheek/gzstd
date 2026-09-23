@@ -20,10 +20,10 @@ persists per-machine verdicts to `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json
 ```bash
 cmake -B build && cmake --build build -j$(nproc)     # GPU build (USE_NVCOMP=ON)
 cmake -B build-cpu -DUSE_NVCOMP=OFF && cmake --build build-cpu -j$(nproc)
-./gzstd-test.sh ./build/gzstd      # THE NORMAL RUN  (expect 470/0/1 of 471 on the 8-GPU GDS host)
+./gzstd-test.sh ./build/gzstd      # THE NORMAL RUN  (expect 478/0/1 of 479 on the 8-GPU GDS host)
 ./gzstd-test.sh ./build-cpu/gzstd  # CPU-only        (expect 353/0; a different BINARY, not a subset)
-./gzstd-test.sh -e ./build-cpu/gzstd                # 463/0/115 MEASURED 2026-09-21, 2m15s
-./gzstd-test.sh -e ./build/gzstd   # opt-in          (606/0/1 of 607 MEASURED 2026-09-21, 8m46s)
+./gzstd-test.sh -e ./build-cpu/gzstd                # 471/0/115 MEASURED at v0.17.69 final, 2m03s
+./gzstd-test.sh -e ./build/gzstd   # opt-in          (614/0/1 of 615 MEASURED at v0.17.69 final, 9m00s)
 ```
 
 **The default run is the normal one.** Use `-e` only when the change is substantial enough

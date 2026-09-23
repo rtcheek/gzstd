@@ -2171,6 +2171,212 @@ Normal multi-frame files (16 MiB frames from gzstd's default path) are unaffecte
 
 ---
 
+## FUTURE: Windows support — route undecided, hazards recorded
+
+**Not planned, not scoped, and deliberately vague on method.** Recorded now because the hazard list below
+is the durable part and it would otherwise be re-derived from scratch.
+
+**The motivating point (rtcheek): on Windows the ARCHIVER is the product.** A compression tool there is
+expected to package multiple files by default, so `--tar` matters MORE on Windows than here, not less —
+"plain files only, `--tar` refused" is not a useful first release. Likely wanted eventually: a
+**WinZip-style GUI**, which is its own question (see below) and not a CLI port.
+
+### Three routes, an order of magnitude apart, none chosen
+
+| route | effort | what it means |
+|---|---|---|
+| **WSL** | possibly zero — TEST IT FIRST | WSL2 is a real Linux kernel on ext4; gzstd may already build and run unchanged. Costs nothing to find out. |
+| **Cygwin / MSYS2** | days | The emulation layer implements `openat`, `pread`, `mmap`, symlinks and most of the `*at()` family, so the containment design survives and the ~100 POSIX call sites mostly just work. Costs a `cygwin1.dll` dependency and slower I/O; `O_DIRECT` and the GPU paths need verifying. |
+| **Native MSVC/clang-cl** | weeks | `pread`/`pwrite` → `OVERLAPPED`, `mmap` → `CreateFileMapping`, `O_DIRECT` → `FILE_FLAG_NO_BUFFERING`, and the `*at()` containment walk re-derived on `NtCreateFile` with `RootDirectory` handles. |
+
+Measured surface in `gzstd.cpp` at v0.17.69: 120 `pread`/`pwrite`, 129 `mmap`/`madvise`, 301 `O_DIRECT`,
+~100 `*at()` calls, 35 ACL/xattr, 5 `SEEK_HOLE`. 98 `_WIN32` references and an `MSVC` branch in
+`CMakeLists.txt` already exist, so the door is ajar but the POSIX surface is in the hot paths.
+
+**Out of scope on any route:** `--gds-only` (nvidia-fs is Linux-only), ACLs/xattrs, `/proc/self/fd` (the
+root-identity keying already fails closed without it).
+
+### 🔴 THE DECISION THAT COMES FIRST: which tar are we matching?
+
+This project settles behaviour by measuring the reference, not by arguing about it — GNU tar 1.35 decided
+the `--rm` blind spot (v0.15.97) and last-member-wins (v0.17.69). Windows has THREE references and they
+disagree:
+
+- **WSL** → GNU tar, POSIX semantics.
+- **Cygwin/MSYS2 tar** → TRANSLATES rather than refuses: illegal characters (`: \ * ? " < > |`) are encoded
+  into a Unicode private-use range, reserved device names escaped.
+- **Native `tar.exe`** (bsdtar/libarchive, shipped in Windows 10+) → its own rules again.
+
+Pick the reference, build the adversarial archive, run that tar, record what it produces, match it. Until
+then "refuse or translate?" is unanswerable, because the answer is whatever the chosen reference does.
+
+### The hazard list, which is the part worth keeping
+
+Extraction is the dangerous direction; CREATING archives (walk a tree, write a stream) has none of these
+and could ship far earlier on any route.
+
+- 🔴 **Case-insensitivity, and it is invisible to this code.** `F` and `f` are one file on NTFS and on
+  macOS's default APFS. **The v0.17.69 duplicate barrier cannot see it** — the two keys genuinely differ,
+  every syscall succeeds, and the archive's two members silently become one at exit 0. Same failure SHAPE
+  as the defect that version fixed, different cause, and none of that machinery catches it.
+  **Under WSL the hazard RELOCATES rather than disappearing:** the ext4 VHDX is case-sensitive, `/mnt/c` is
+  not. Windows 10 1803+ has a per-directory case-sensitivity flag (`fsutil file setCaseSensitiveInfo`) that
+  WSL honours, and `/etc/wsl.conf` `[automount] options=case=…` tunes it — **defaults have changed across
+  WSL versions; verify rather than assume.**
+  Cheap mitigation, testable on macOS TODAY without any Windows work: probe the destination once (create
+  `.gzstd-case-probe`, look for `.GZSTD-CASE-PROBE`), then either fold the duplicate keys to match the
+  filesystem or refuse the colliding members by name.
+- **Reserved device names** — `CON`, `NUL`, `AUX`, `PRN`, `COM1-9`, `LPT1-9`, including with extensions
+  (`aux.txt`).
+- **Alternate data streams** — a member named `a.txt:hidden` writes a stream most tools never display.
+- **Trailing dots and spaces** — Win32 strips them, so `evil.txt.` and `evil.txt` collide.
+- **Backslash as a separator** — `a\b` is ONE filename on POSIX and a PATH on Windows.
+- **Drive-relative and UNC paths** — `C:foo`, `\\server\share`, `\\?\`.
+- **Junctions and reparse points** as the component-swap vector that `O_NOFOLLOW` blocks today.
+- **Symlinks need privilege or Developer Mode; hardlinks need the same volume** — both currently assumed
+  to succeed.
+- **MAX_PATH 260** unless long paths are enabled.
+
+### The GUI is a different project, not a flag
+
+A WinZip-style front end implies a library/API boundary where today there is a CLI with `die()` on the
+error path, progress on stderr, and exit codes as the contract. It would need: a callable core (or a
+subprocess protocol), structured progress and error reporting instead of formatted stderr, cancellation,
+and file associations. **Worth deciding whether the GUI drives a library or shells out to `gzstd.exe`
+before any Windows code is written** — that choice constrains the port, not the other way round.
+
+### 🔴 THE GATE: Windows 11 ALREADY DOES THIS NATIVELY, so beat it or do not bother
+
+Confirmed 2026-09-22. **Extraction** landed in 23H2 (libarchive-backed File Explorer support for ~11
+formats including `.tar.zst`, `.tzst`, `.tar.xz`, `.7z`, `.rar`). **Creation** landed in 24H2: right-click
+→ Compress to → Additional options, pick TAR, and **Zstandard is one of the offered compression methods**.
+A stock Windows 11 therefore both makes and opens `.tar.zst` with no third-party tooling.
+
+**rtcheek's call, and it is the right gate: if gzstd cannot materially beat Explorer at create AND
+extract, the port is moot.** So the FIRST Windows task is not a line of porting — it is a benchmark:
+
+```
+same machine, same corpus, cold cache, n>=5 interleaved, both directions:
+  Explorer "Compress to / TAR + Zstandard"   vs  gzstd --tar
+  Explorer extract                            vs  gzstd -d --tar
+  also: bundled tar.exe (bsdtar), and 7-Zip   — these are what users actually have
+```
+
+**Run it on a REPRESENTATIVE consumer box, not a workstation** ([[feedback_code_to_general_goals]]): 8-16
+cores and a laptop NVMe, not 256 cores and a Gen5 array. And expect the honest answer to be storage-bound
+— this host reads at 4.56 GiB/s and `--cpu-only` already hits 98.5% of it, which is exactly why a
+storage-to-storage run here cannot measure a compute win. On a laptop the ceiling is lower still, so the
+CPU advantage may compress into the noise.
+
+**Where the durable advantage probably is, if throughput ties:**
+- **Selective extraction.** libarchive's tar.zst is SEQUENTIAL: pulling one member from a 50 GiB archive
+  reads the whole archive. gzstd's seek plan reads only the frames the selection touches, and `-l` is O(1)
+  off the index. That is a capability difference, not a percentage.
+- **Integrity.** Per-frame XXH64 content checksums, `--verify`, and `-t` that actually validates. Explorer
+  gives you none of that.
+- **Round-trip compatibility becomes a REQUIREMENT, not a nicety:** users can now produce `.tar.zst` from
+  Explorer, so an Explorer-made archive is an adversarial fixture the suite must read. Add one.
+
+## FUTURE: the GPU as a SEQUENCE PRODUCER, not as a codec
+
+**The one GPU idea in this arc whose shape matches what the measurements say is expensive.** The section
+above ("is GPU compress worth another round?") asks for a measurement that contradicts its table before
+anyone opens a fourth staging redesign. This is not that — it is a different split of the work, and it
+does not need the transfer to be free.
+
+### The observation
+
+zstd 1.5.4 added an **external sequence producer** hook (`ZSTD_registerSequenceProducer`, confirmed present
+in the 1.5.5 headers gzstd builds against). A plugin is called per BLOCK and returns the LZ77
+sequences — literals and matches — and zstd does the entropy coding itself.
+
+That splits the codec along the grain of the hardware:
+
+| stage | character | belongs on |
+|---|---|---|
+| match finding | parallel search over a window | GPU |
+| entropy coding (FSE/Huffman) | sequential, bit-level, data-dependent branching | CPU |
+
+**Running the WHOLE codec on the GPU puts the sequential half on the wrong processor and then pays PCIe
+staging on top of it.** That is consistent with what v0.16–v0.17 measured: after the staging defects were
+fixed, **the kernel became the dominant term, not the transfers**, and `--gpu-only` still lost to the CPU
+pool 10.7 GiB/s against 25.5.
+
+### Why this shape is different from the three attempts that lost
+
+- **The output is ordinary zstd**, produced by zstd itself. Seek tables, per-frame XXH64, `--verify`,
+  `zstd -t` compatibility and GNU-tar parity are all untouched. A sequence producer cannot corrupt the
+  format; at worst it produces poor matches and the ratio suffers.
+- **It composes with the existing CPU worker pool** instead of replacing it — each worker registers a
+  producer on its own `CCtx`. No new scheduler, no `ResultStore` interaction, no drain thread.
+- **It is vendor-neutral.** The hook is plain zstd; the kernel would be ours, so CUDA and HIP both work
+  (see the hipCOMP note) and nothing depends on nvCOMP's API or its zstd implementation.
+
+### Precedent that the hook is real, not theoretical
+
+Intel ships a producer for it today: the **QAT ZSTD Plugin**, where GEN4/GEN5 hardware emits LZ4s that is
+post-processed into zstd sequences, and GEN6 offloads zstd natively. Intel claims up to 3.2x throughput and
+3.3x perf/watt — **their figures, their configuration, and this project treats vendor numbers as a
+hypothesis.** It is on-die on 4th-gen+ Xeon Scalable, so AMD CPUs have no integrated equivalent; whether an
+Intel QAT PCIe ADD-IN card works in an EPYC host is unverified and worth checking before planning around it.
+
+### The honest difficulties
+
+- **The match finder is the work.** Writing a competitive one is not an afternoon; zstd's is heavily tuned
+  and the ratio has to survive the comparison, not just the throughput.
+- 🔴 **The block size is exactly the staging pattern that measured badly here.** zstd blocks are 128 KiB;
+  per-block round trips to the GPU are small transfers at high frequency, which is the regime where
+  `cudaHostRegister` cost ~0.21 ms/MiB serialised driver-wide and the drain thread became the per-device
+  serializer. **Batch many blocks per launch, or this dies the same death as v0.16.2.** Measure it before
+  believing otherwise.
+- The hook is a compression-only story. Decompression keeps whatever path it has.
+
+### The experiment that would settle it, before any kernel is written
+
+Register a DELIBERATELY TRIVIAL producer (e.g. one that returns "no sequences found" and lets zstd fall
+back) and measure the per-block call overhead across a real corpus. If the hook's own cost is already
+material at 128 KiB blocks, no kernel will rescue it, and this closes for the price of a few lines.
+
+## FUTURE: a full-screen text-mode interface (Linux)
+
+**rtcheek's idea, recorded vaguely on purpose — no library chosen, no scope fixed.** An `mc`/`ncdu`-style
+full-screen interface: browse an archive, select members, extract, watch progress.
+
+### It shares ONE prerequisite with the Windows GUI, and that is the point of writing both down together
+
+Today gzstd is a CLI: `die()` on the error path, progress formatted to stderr, exit codes as the contract.
+A TUI and a WinZip-style GUI both need the same thing underneath — a callable core with **structured**
+progress and errors, cancellation, and listing/extraction that does not mean spawning a process and
+scraping its output. **Design that boundary once, for both**, or it gets invented twice and differently.
+
+### What already fits, and it is more than it looks
+
+The archive index is the reason this is attractive rather than cosmetic:
+
+- **`-l` is O(1) off the seek table**, so a browser can open a 50 GiB archive instantly instead of reading
+  it. `tar -t` cannot do that, and neither can Explorer's sequential libarchive path.
+- **Selective extraction already reads only the frames a selection touches** (`tarx::build_seek_plan`), so
+  "tick three files, press extract" is a cheap operation, not a full decompress.
+- Per-frame checksums and `-t` give the interface something honest to show for integrity.
+- Terminal handling already exists in part: progress meter, colour, TTY detection, and the refusal to write
+  an archive to a terminal.
+
+### The open questions
+
+- **Dependency or not.** ncurses is the obvious choice and the obvious cost: this is a single-file monolith
+  that already ships `BUILD_STATIC` portable binaries, and `dlopen`-only/no-new-DEPS discipline runs
+  through the GPU code for the same reason. Raw ANSI + `termios` keeps that property and is more work.
+- **Where the code lives.** 40,000 lines in one translation unit is already the standing trade; a TUI is a
+  lot of state (scroll, selection, filter, key map). A separate binary against a core library is the
+  natural answer, which is the boundary question again.
+- 🔴 **How it gets TESTED.** This project's rule is that untested code rots and that a cell which cannot
+  fail is not a cell. A TUI resists that unless the MODEL is separable from the RENDERING: drive the state
+  machine with scripted key input, assert the resulting model (selection set, plan, exit action), and keep
+  the drawing layer thin enough to be uninteresting. **Decide this before writing the first screen** — it
+  is the difference between a feature and a permanently-unverified corner.
+- Scope discipline: an archive BROWSER (list, select, extract, verify) is a weekend-shaped idea; a file
+  manager is not. Say which one it is before starting.
+
 ## Future Ideas (v2.0+)
 
 ### Speculative CPU/GPU Racing

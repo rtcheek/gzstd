@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.68";
+static constexpr const char * GZSTD_VERSION = "0.17.69";
 //
 // Architecture overview:
 //
@@ -3843,7 +3843,7 @@ static void print_help_long()
 "     flag no longer costs the parallelism it used to.  MEASURED on the\n"
 "     8-GPU server, 12 GiB archive, cache dropped before every run:\n"
 "     7.3-7.6 s the old way against 3.7 s now, while the buffered default\n"
-"     runs 3.4-3.5 s.  So it now costs about 7%% of wall time and saves\n"
+"     runs 3.4-3.5 s.  So it now costs about 7% of wall time and saves\n"
 "     HALF the host CPU (~35 CPU-seconds against ~70), because the ~41 s\n"
 "     of SYSTEM time the page cache charges is gone.  Worth it on a busy\n"
 "     machine, or when you do not want this read to evict anyone's cache.\n"
@@ -4121,13 +4121,13 @@ static void print_help_long()
 "  -C, --directory DIR\n"
 "     Positional directory change, like tar's.  On extract (-d --tar) it\n"
 "     is the extraction root (default: current directory; must already\n"
-"     exist), and with MEMBER selection it redirects the members that\n""     POSITIONAL, exactly like GNU tar: it applies to the MEMBERS THAT\n"
-"     FOLLOW it, so `-d --tar A.tar.zst member -C dir` extracts into the\n"
-"     current directory and `-d --tar A.tar.zst -C dir member` into dir.\n"
+"     exist).  With MEMBER selection it is POSITIONAL, exactly like GNU\n"
+"     tar: it applies to the MEMBERS THAT FOLLOW it, so\n"
+"     `-d --tar A.tar.zst member -C dir` extracts into the current\n"
+"     directory and `-d --tar A.tar.zst -C dir member` into dir.\n"
 "     (Verified against GNU tar 1.35, which does the same.)\n"
-"     follow it (see -d --tar above).  On create (--tar) it is the root\n"
-"     the RELATIVE sources that follow it are read from (see --tar\n"
-"     above).  Example:\n"
+"     On create (--tar) it is the root that the RELATIVE sources which\n"
+"     follow it are read from (see --tar above).  Example:\n"
 "         gzstd -d --tar -C /restore backup.tar.zst\n"
 "     Like tar (which chdirs at each -C), a RELATIVE second -C is\n"
 "     resolved against the previous one; an absolute -C resets.\n"
@@ -8017,10 +8017,35 @@ static inline void check_read_error(FILE * f, const std::string & what)
            + " (" + std::strerror(errno) + ")");
 }
 
+// A SEEKABLE STDIN THAT IS NOT AT ITS START CANNOT BE READ CORRECTLY HERE.
+// Everything that makes a seekable stdin fast -- the parallel prefetch reader,
+// the pooled reader, the seek-table probes -- works in absolute offsets: they
+// pread from 0, size the stream from st_size, and the index probes finish with
+// rewind().  Handed a descriptor positioned mid-file they decode from byte 0.
+// MEASURED on v0.17.64 and every version since: two archives concatenated with
+// stdin seeked to the second emitted BOTH, 200,000,000 bytes where 100,000,000
+// was correct, exit 0.  Refused rather than rebased -- see CHANGELOG v0.17.69
+// for why, and ROADMAP for the base-relative design if the capability is ever
+// wanted.  A pipe has no offset to be wrong about and is unaffected.
+static void refuse_offset_stdin()
+{
+#ifndef _WIN32
+  const off_t at = ::lseek(0, 0, SEEK_CUR);
+  if (at > 0)
+    die("stdin is a seekable file positioned at byte " + std::to_string((long long)at)
+        + ", not at its start.\n"
+          "  gzstd reads a seekable stdin with absolute offsets, so it would decode from\n"
+          "  byte 0 and silently produce the wrong stream.  Pass the file by name, or pipe\n"
+          "  it (`tail -c +N file | gzstd ...`) so the input is read sequentially.",
+        EXIT_USAGE);
+#endif
+}
+
 static FILE * open_input(const std::string & path)
 {
   if (path == "-") {
     set_binary_mode(stdin);
+    refuse_offset_stdin();   // every caller of open_input inherits the guarantee
     return stdin;
   }
   FILE * f = std::fopen(path.c_str(), "rb");
@@ -14912,6 +14937,8 @@ static bool needs_stream_decode(int64_t ff) {
 //   GZSTD_DEBUG_MT_READER_GATE  in the parallel decompress reader, after the size is
 //                               fixed and before the first pread (proves a file that
 //                               shrinks under the readers fails instead of ending early)
+//   GZSTD_DEBUG_EXTRACT_*_GATE  around a duplicate-member writer/barrier handoff
+//                               (proves the later member waits for claimed work)
 static void gz_fifo_gate(const char * env)
 {
   const char * fifo = ::getenv(env);
@@ -14962,8 +14989,18 @@ static int probe_preadable_input(const Options & opt, FILE * in, uint64_t * size
     if (cur >= 0 && end > 0) { sz = (uint64_t)end; ok = true; ::lseek(fd, cur, SEEK_SET); }
   }
   // Seekability sanity — rejects anything that slipped through (ESPIPE etc.).
-  if (ok && ::lseek(fd, 0, SEEK_CUR) == (off_t)-1) ok = false;
+  const off_t at = ::lseek(fd, 0, SEEK_CUR);
+  if (ok && at == (off_t)-1) ok = false;
   if (!ok) return -1;
+
+  // NOTE: this deliberately does NOT test the descriptor's current position.
+  // Its callers pread in ABSOLUTE offsets, which is right for a named file --
+  // the stream starts at byte 0 however far a header peek has advanced the
+  // FILE* -- and wrong only for an INHERITED descriptor that starts mid-file.
+  // That case is refused where the input is acquired, which is the one place
+  // that can tell the difference.  An earlier version checked it here instead
+  // and broke every named-file fast path: 13 cells failed with "the parallel
+  // reader did not engage", because a peeked FILE* is routinely not at 0.
   *size = sz;
   return fd;
 }
@@ -14993,6 +15030,14 @@ static bool kernel_has_per_vma_locks();   // Linux >= 6.4; defined below
 // filesystem that in fact supports O_DIRECT.
 static const bool g_debug_mt_direct_einval = [] {
   const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT_EINVAL"); return e && *e == '1'; }();
+// Test-only companion for the SINGLE-reader fallback.  The first direct read is
+// trimmed to one complete frame; the next is refused with EINVAL, and after the
+// fallback seek the held buffered descriptor is closed so fread sets ferror.
+// With the historical bare-fread fallback that shape accepts the first frame as
+// a complete stream and exits 0, silently dropping the rest.  Falling through to
+// the shared check_read_error() must instead make it fatal.
+static const bool g_debug_direct_fread_eio = [] {
+  const char * e = std::getenv("GZSTD_DEBUG_DIRECT_FREAD_EIO"); return e && *e == '1'; }();
 
 static size_t stream_frames_to_queue_mt(
     int fd, int dfd, uint64_t file_size, int n_readers,
@@ -15867,8 +15912,21 @@ static size_t stream_frames_to_queue(
   struct stat direct_st{};
   const bool direct_regular = in && ::fstat(::fileno(in), &direct_st) == 0
                            && S_ISREG(direct_st.st_mode);
-  if (opt.direct_read && opt.input != "-" && direct_regular) {
-    din.fd = in ? gz_reopen_input(::fileno(in), O_RDONLY | O_DIRECT) : -1;
+  // A REDIRECTED STDIN CAN STILL BE A SEEKABLE REGULAR FILE, and since v0.17.66
+  // the parallel reader treats it as one -- it asks probe_preadable_input the
+  // counterfactual question rather than testing the NAME.  Keying this path on
+  // opt.input != "-" left the two disagreeing: `--direct-read < archive.zst`
+  // read O_DIRECT with two or more readers and buffered with one.  A pipe still
+  // fails the S_ISREG test above, so it keeps the documented no-op behaviour.
+  if (opt.direct_read && direct_regular) {
+    // SEED THE OFFSET FROM THE STREAM, NOT FROM ZERO.  A named input is freshly
+    // opened at 0, but a redirect may already have been read from, and pread()ing
+    // from 0 would hand the decoder those bytes a second time.  ftello() reports
+    // the logical position, so this is exact whether or not anything was buffered;
+    // if it cannot answer, refuse O_DIRECT rather than guess.
+    const off_t here = in ? ::ftello(in) : -1;
+    din.fd = (in && here >= 0) ? gz_reopen_input(::fileno(in), O_RDONLY | O_DIRECT) : -1;
+    din_off = here > 0 ? here : 0;
     if (din.fd >= 0 && posix_memalign(&din.b, 4096, READ_CHUNK) == 0 && din.b) {
       use_direct = true;
       // Re-tag the read-path tap: this function's entry stored "pread", but
@@ -15880,7 +15938,11 @@ static size_t stream_frames_to_queue(
       vlog(V_VERBOSE, opt, "[DIRECT-READ] O_DIRECT input (page cache bypassed)\n");
     }
   }
-  if (opt.direct_read && opt.direct_read_user_set && opt.input != "-" && !use_direct)
+  // Same widening as the gate: a seekable stdin redirect is a real candidate, so
+  // an explicit --direct-read that could not engage on one deserves the refusal
+  // warning too.  A pipe stays silent.
+  if (opt.direct_read && opt.direct_read_user_set
+      && (opt.input != "-" || direct_regular) && !use_direct)
     vlog(V_DEFAULT, opt,
          "warning: --direct-read could not engage O_DIRECT on the held input; "
          "using buffered input instead.\n");
@@ -15890,11 +15952,56 @@ static size_t stream_frames_to_queue(
 #ifndef _WIN32
     if (use_direct) {
       ssize_t got = ::pread(din.fd, din.b, READ_CHUNK, din_off);  // offset & len 4 KiB-aligned
-      if (got < 0) die_io("O_DIRECT read failed (--direct-read, decompress)");
-      if (got == 0) return 0;
-      std::memcpy(dst, din.b, (size_t)got);
-      din_off += got;
-      return (size_t)got;
+      if (got > 0 && g_debug_direct_fread_eio && din_off == 0) {
+        // Leave the parser at an exact frame boundary.  An error after an
+        // arbitrary 4 MiB cut would be rejected as a truncated current frame
+        // even if ferror() were ignored, and the regression would pass
+        // vacuously for the wrong reason.
+        const size_t one = ZSTD_findFrameCompressedSize(din.b, (size_t)got);
+        if (!ZSTD_isError(one) && one > 0 && one <= (size_t)got)
+          got = (ssize_t)one;
+      }
+      if (got >= 0 && (g_debug_mt_direct_einval
+                       || (g_debug_direct_fread_eio && din_off > 0))) {
+        got = -1; errno = EINVAL;
+      }
+      // A FILESYSTEM MAY ACCEPT open(O_DIRECT) AND STILL REFUSE THE READ.  The
+      // parallel reader degrades to the held descriptor when that happens
+      // (v0.17.66); this path died instead, so the same filesystem failed a
+      // one-reader run and survived a two-reader one.  Mirrored here: give the
+      // FILE* the exact offset the direct reader had reached and continue
+      // buffered.  Any other errno is a real I/O error and still fatal.
+      if (got < 0 && errno == EINVAL && in && ::fseeko(in, din_off, SEEK_SET) == 0) {
+        use_direct = false;
+        g_adapt_src_path.store("pread", std::memory_order_relaxed);
+        vlog(V_DEFAULT, opt,
+             "gzstd: warning: the filesystem refused an O_DIRECT read at offset "
+             + std::to_string((long long)din_off)
+             + "; continuing with buffered reads.\n");
+        if (g_debug_direct_fread_eio) {
+          // fseeko discarded stdio's read buffer.  Closing only the underlying
+          // descriptor makes the immediately-following fread return an error
+          // and set FILE's error indicator, exactly the branch under test.
+          (void)::close(::fileno(in));
+        }
+        // FALL THROUGH to the checked buffered read below rather than doing a
+        // bare fread here.  That branch calls check_read_error(): a short count
+        // is read by the caller as end-of-stream, so an I/O error mid-archive
+        // would silently drop every remaining frame -- and with --rm the input
+        // is then removed.  The comment on that branch says exactly this; an
+        // earlier version of this fallback returned its own fread and skipped it.
+      } else if (got < 0 && errno == EINVAL) {
+        die_io("O_DIRECT read failed and the buffered fallback could not seek "
+               "(--direct-read, decompress)");
+      }
+      if (use_direct) {
+        if (got < 0) die_io("O_DIRECT read failed (--direct-read, decompress)");
+        if (got == 0) return 0;
+        std::memcpy(dst, din.b, (size_t)got);
+        din_off += got;
+        return (size_t)got;
+      }
+      // degraded: fall through to the checked buffered read
     }
 #endif
     {
@@ -19869,6 +19976,180 @@ struct PoolGpuDecoder {
 };
 #endif // HAVE_NVCOMP
 
+// Conservative filesystem-object aliases used by the READ-ONLY full-extract
+// planner.  A pathname is not an object identity across bind mounts:
+// /proc/self/fd preserves the spelling of the mount used to open an fd.  For a
+// member `a/missing/f`, record the identity of every existing ancestor plus the
+// suffix below it:
+//
+//   inode(root) + a/missing/f
+//   inode(root/a) + missing/f
+//
+// If `a` and `b` are bind aliases, `a/missing/f` and `b/missing/f` meet on the
+// second key.  EVERY ancestor is intentional: one writer may create `missing`
+// before the later claim, so using only the deepest ancestor would make the key
+// depend on timing.  A false match can only make the planner choose the ordered
+// serial path, so this intentionally errs on that side.  The serial extractor
+// must not use these broad keys to retire deferred actions: two bind views can
+// share an ancestor and diverge at a nested mount below it.  It instead creates
+// missing parents synchronously and keys the EXACT held parent + leaf (below).
+// Positive and negative prefix results are cached.  A missing directory can
+// later be created by extraction, but extraction cannot turn it into a bind
+// alias; the already-recorded higher-ancestor key remains sufficient to make a
+// parallel plan stand down.
+class FsOrderKeyCache {
+#ifndef _WIN32
+  std::unordered_map<std::string, std::string> dir_ids_; // lexical prefix -> @dev:ino
+  std::unordered_set<std::string> unavailable_;          // secure walk stops here
+
+  static std::vector<std::string> components(const std::string & path) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < path.size()) {
+      const size_t j = path.find('/', i);
+      std::string c = path.substr(i, j == std::string::npos
+                                      ? std::string::npos : j - i);
+      if (!c.empty() && c != ".") {
+        if (c == "..") return {};
+        out.push_back(std::move(c));
+      }
+      if (j == std::string::npos) break;
+      i = j + 1;
+    }
+    return out;
+  }
+
+  static std::string prefix_key(int root, const std::vector<std::string> & c,
+                                size_t depth) {
+    std::string out = std::to_string(root);
+    out.push_back('\0');
+    for (size_t i = 0; i < depth; ++i) {
+      if (i) out.push_back('/');
+      out += c[i];
+    }
+    return out;
+  }
+
+  static std::string order_key(const std::string & id,
+                               const std::vector<std::string> & c,
+                               size_t from) {
+    std::string out = id;
+    for (size_t i = from; i < c.size(); ++i) {
+      out.push_back('/');
+      out += c[i];
+    }
+    return out;
+  }
+#endif
+
+public:
+  void clear() {
+#ifndef _WIN32
+    dir_ids_.clear();
+    unavailable_.clear();
+#endif
+  }
+
+  std::vector<std::string> keys(int root_fd, int root,
+                                const std::string & path,
+                                bool include_leaf_dir = false) {
+    std::vector<std::string> out;
+#ifndef _WIN32
+    const std::vector<std::string> c = components(path);
+    if (c.empty()) return out;
+    // Test-only stand-in for a pair of bind-mounted directories.  It exercises
+    // the full-parallel planner's physical-alias fallback on hosts where the
+    // suite cannot create mounts; the ordinary cross-root arm separately proves
+    // that real equal parent identities collapse distinct lexical root keys.
+    static const bool debug_bind_alias = [] {
+      const char * e = ::getenv("GZSTD_DEBUG_EXTRACT_BIND_ALIAS");
+      return e && *e == '1';
+    }();
+    if (debug_bind_alias && (c[0] == "bind-a" || c[0] == "bind-b")) {
+      std::string k = "@debug-bind";
+      for (size_t i = 1; i < c.size(); ++i) { k.push_back('/'); k += c[i]; }
+      out.push_back(std::move(k));
+    }
+
+    // Reuse cached prefixes first.  On an ordinary empty destination this makes
+    // the steady-state cost zero syscalls per file: root is cached once and a
+    // missing top-level directory is probed once, not once per child.
+    const size_t levels = c.size() + (include_leaf_dir ? 1 : 0);
+    bool unresolved = false;
+    for (size_t depth = 0; depth < levels; ++depth) {
+      const std::string pk = prefix_key(root, c, depth);
+      if (unavailable_.count(pk)) break;
+      auto it = dir_ids_.find(pk);
+      if (it == dir_ids_.end()) { unresolved = true; break; }
+      out.push_back(order_key(it->second, c, depth));
+    }
+    if (!unresolved) {
+      std::sort(out.begin(), out.end());
+      out.erase(std::unique(out.begin(), out.end()), out.end());
+      return out;
+    }
+
+    int cur = ::dup(root_fd);
+    if (cur < 0)
+      die_io("cannot duplicate extraction root while establishing tar path ordering ("
+             + std::string(std::strerror(errno)) + ")");
+    for (size_t depth = 0; depth < levels; ++depth) {
+      const std::string pk = prefix_key(root, c, depth);
+      if (unavailable_.count(pk)) break;
+      auto it = dir_ids_.find(pk);
+      if (it == dir_ids_.end()) {
+        struct stat st;
+        int sr;
+        do { sr = ::fstat(cur, &st); } while (sr != 0 && errno == EINTR);
+        if (sr != 0)
+          die_io("cannot identify an extraction directory while establishing tar path ordering ("
+                 + std::string(std::strerror(errno)) + ")");
+        std::string id = "@" + std::to_string((unsigned long long)st.st_dev)
+                       + ":" + std::to_string((unsigned long long)st.st_ino);
+        it = dir_ids_.emplace(pk, std::move(id)).first;
+      }
+      out.push_back(order_key(it->second, c, depth));
+
+      // Usually c.back() is the ordered leaf, not an ancestor to traverse.
+      // A directory header is the exception: directories have no ordinary
+      // hard-link aliases, so opening its existing leaf as a directory safely
+      // detects two bind spellings of the directory object itself.
+      if (depth + 1 >= levels) break;
+      const std::string child_pk = prefix_key(root, c, depth + 1);
+      if (unavailable_.count(child_pk)) break;
+      int nx;
+      do {
+        nx = ::openat(cur, c[depth].c_str(),
+                      O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC);
+      } while (nx < 0 && errno == EINTR);
+      if (nx < 0) {
+        const int e = errno;
+        // These mean the lexical prefix is not a securely traversable existing
+        // directory.  The real extraction walk will either create ENOENT or
+        // reject the member; neither can hide a pre-existing bind alias.
+        if (e == ENOENT || e == ENOTDIR || e == ELOOP || e == EACCES || e == EPERM) {
+          unavailable_.insert(child_pk);
+          break;
+        }
+        // Resource/I/O failures are UNKNOWN, not evidence of non-aliasing.  A
+        // later successful writer open must not turn this into exit-0 reordering.
+        ::close(cur);
+        die_io("cannot establish tar path ordering through '" + c[depth]
+               + "' (" + std::string(std::strerror(e)) + ")");
+      }
+      ::close(cur);
+      cur = nx;
+    }
+    ::close(cur);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+#else
+    (void)root_fd; (void)root; (void)path; (void)include_leaf_dir;
+#endif
+    return out;
+  }
+};
+
 class Extractor {
 public:
   // validate_only: parse and structurally verify the tar (header checksums,
@@ -19901,6 +20182,24 @@ public:
     }
     member_hit_.assign(members_.size(), 0);
     if (!roots.empty()) roots_ = std::move(roots);
+    // Resolve every referenced positional root before extraction starts.  A lazy
+    // failure after the parser had already dispatched members would leave a
+    // partial tree.
+    root_paths_.clear();
+    parent_order_ids_.clear();
+    dir_order_ids_.clear();
+    cross_root_ordering_ = false;
+    if (!read_only()) {
+      std::unordered_set<int> used;
+      for (const auto & mp : members_) {
+        if (mp.second < 0 || (size_t)mp.second >= roots_.size())
+          die("invalid extraction-root index", EXIT_IO);
+        used.insert(mp.second);
+      }
+      cross_root_ordering_ = used.size() > 1;
+      if (cross_root_ordering_)
+        for (int root : used) (void)root_path(root);
+    }
   }
 
   bool had_error() const { return had_error_.load(std::memory_order_relaxed); }
@@ -20903,10 +21202,318 @@ private:
   }
 
   // Deferred work applied after all data is written.
-  struct Hard { std::string name, target; int root = 0; };
-  struct DirMeta { std::string path; uint32_t mode; int64_t mtime; uint64_t uid, gid; ExtMeta ext; int root = 0; };
+  struct Hard { std::string name, target; int root = 0; bool superseded = false;
+                std::vector<std::string> order_keys; };
+  struct DirMeta { std::string path; uint32_t mode; int64_t mtime; uint64_t uid, gid;
+                   ExtMeta ext; int root = 0; bool superseded = false;
+                   std::vector<std::string> order_keys; };
   std::vector<Hard> hardlinks_;
   std::vector<DirMeta> dirmeta_;
+
+  // DEFERRED WORK MUST STILL OBEY tar's LAST-MEMBER-WINS RULE.
+  //
+  // Hardlinks and directory metadata cannot be applied where they are parsed --
+  // a hardlink's target may not exist yet, and a directory's mtime would be
+  // bumped by writing its own children -- so both are replayed after the writer
+  // drains.  An archive may legally name the same path twice (`tar -rf` appends
+  // one every time it updates a file), and replay then runs the EARLIER entry
+  // after the LATER member has already been written:
+  //
+  //   f as a hardlink to t, then f as a regular file   -> f became the hardlink,
+  //     losing the newer contents entirely.  GNU tar 1.35 keeps the regular file.
+  //   sub/ mode 700, then sub/ mode 755                -> 700 won, because
+  //     directory metadata replays in REVERSE order.  GNU tar leaves 755.
+  //
+  // Both exited 0 with the wrong result, which is this project's worst failure
+  // shape.  So a later member for the same path retires the earlier deferred
+  // action instead of letting replay reverse archive order.
+  //
+  // EXACT NAMES ONLY.  Ancestor/descendant relationships are handled by the
+  // ordinary secure path walk, and the parallel planner rejects duplicate
+  // normalized names outright (falling back to this serial parser), so a ParCtx
+  // never carries two entries for one path.
+  std::unordered_map<std::string, size_t> deferred_hard_tail_;
+  std::unordered_map<std::string, size_t> deferred_dir_tail_;
+  // Every path this archive has already created or replaced, in filesystem
+  // spelling.  A repeat means the writer pool may still be working on the
+  // earlier one (see the barrier at its use).
+  std::unordered_set<std::string> seen_paths_;
+
+  // Key on the FILESYSTEM SPELLING, not the archive's: "a//b", "a/./b" and "a/b"
+  // are one entry to open_parent, and a duplicate-name archive is exactly where
+  // the spellings differ.  norm() has already stripped the leading forms.
+  // Resolved path of each root fd, cached.  Two roots can NAME one directory --
+  // `-C /x` with member `d/f` and `-C /x/d` with member `f` are the same output
+  // file through different root indices -- so keying on the index alone let a
+  // duplicate slip past both the supersede and the write barrier.  /proc/self/fd
+  // resolves symlinked and ordinary overlapping roots to one namespace spelling.
+  // It does NOT collapse bind mounts: an fd opened through a bind mount reports
+  // that mount's spelling, not the source spelling.  ordering_keys() below adds
+  // filesystem-object identities for that case.
+  std::vector<std::string> root_paths_;
+  // Physical ordering identities are cached per held root + normalized relative
+  // directory.  The root index is part of the CACHE key so two fds which happen
+  // to have the same /proc spelling are still inspected independently; the
+  // stored VALUE is only (dev,ino), so genuine aliases compare equal.
+  std::unordered_map<std::string, std::string> parent_order_ids_;
+  std::unordered_map<std::string, std::string> dir_order_ids_;
+  // roots_ also contains the default destination even when every selector uses
+  // one -C.  Only two roots referenced by selectors need cross-root alias
+  // detection (and therefore the /proc identity below).
+  bool cross_root_ordering_ = false;
+  const std::string & root_path(int root) {
+    if (root < 0 || (size_t)root >= roots_.size())
+      die("invalid extraction-root index", EXIT_IO);
+    if (root_paths_.size() < roots_.size()) root_paths_.resize(roots_.size());
+    std::string & p = root_paths_[root];
+    if (p.empty()) {
+#ifndef _WIN32
+      const std::string lnk = "/proc/self/fd/" + std::to_string(roots_[root]);
+      // Test-only: model two bind-mount spellings without requiring CAP_SYS_ADMIN.
+      // The lexical keys are forced apart, so the duplicate-path regression can
+      // pass only if ordering_keys() recognises the shared held-parent inode.
+      const bool debug_distinct =
+          ::getenv("GZSTD_DEBUG_EXTRACT_DISTINCT_ROOT_KEYS") != nullptr;
+      if (debug_distinct)
+        p = "#debug-root-" + std::to_string(root);
+      // The existing hook models a chroot/minimal mount namespace without
+      // procfs.  Otherwise grow until readlink returns short: equality means the
+      // path was truncated, and a truncated root is not a safe ordering key.
+      if (!debug_distinct && !::getenv("GZSTD_DEBUG_NO_PROCFS")) {
+        for (size_t cap = 256;;) {
+          std::vector<char> buf(cap);
+          ssize_t n;
+          do { n = ::readlink(lnk.c_str(), buf.data(), buf.size()); }
+          while (n < 0 && errno == EINTR);
+          if (n < 0) break;
+          if ((size_t)n < buf.size()) {
+            p.assign(buf.data(), (size_t)n);
+            if (p.empty() || p.front() != '/') p.clear();
+            break;
+          }
+          if (cap >= (size_t)PATH_MAX) break;
+          cap = std::min<size_t>(cap * 2, (size_t)PATH_MAX);
+        }
+      }
+#endif
+      if (p.empty()) {
+        // One root needs no cross-root identity: every key shares this prefix.
+        // With TWO roots, however, falling back to their indices is incorrect:
+        // `/x` + `d/f` and `/x/d` + `f` again look unrelated and can race to an
+        // exit-0 wrong result.  Unknown is therefore fatal, before any member is
+        // dispatched, rather than silently weakening last-member-wins.  The
+        // inode aliases below close bind-mount spellings once the roots have
+        // passed this preflight; they do not weaken its fail-closed contract.
+        if (cross_root_ordering_)
+          die("cannot identify multiple positional extraction roots through "
+              "/proc/self/fd; refusing an extraction whose path ordering is unknown",
+              EXIT_IO);
+        p = "#" + std::to_string(root);
+      }
+    }
+    return p;
+  }
+  // ONE ABSOLUTE PATH, not a (root, path) PAIR.  Joining the two with a NUL --
+  // which is what an index-based key needed, to keep "1" + "0/x" unambiguous --
+  // defeats the whole point of resolving the root: `<ax>\0d/f` and `<ax/d>\0f`
+  // stay different strings for the same file, so the barrier never fired and the
+  // race stayed open.  It reproduced at 2 in 15 with --write-threads 8 and 0 in
+  // 12 at --write-threads 1, which is also why a first round of "it passes"
+  // proved nothing: the wrong order is the rarer outcome, not the only one.
+  static std::string order_rel(const std::string & path) {
+    std::string out;
+    size_t i = 0;
+    while (i < path.size()) {
+      const size_t j = path.find('/', i);
+      const std::string c = path.substr(i, j == std::string::npos ? std::string::npos : j - i);
+      if (!c.empty() && c != ".") { if (!out.empty()) out.push_back('/'); out += c; }
+      if (j == std::string::npos) break;
+      i = j + 1;
+    }
+    return out;
+  }
+  std::string deferred_key(const std::string & path, int root) {
+    std::string key = root_path(root);
+    while (!key.empty() && key.back() == '/') key.pop_back();
+    const std::string rel = order_rel(path);
+    if (!rel.empty()) { key.push_back('/'); key += rel; }
+    return key;
+  }
+
+  // Return the two exact ways this destination can be recognised: its absolute
+  // namespace spelling and (identity of the HELD immediate parent, leaf name).
+  // open_parent(create=true) deliberately prepares missing parents BEFORE any
+  // writer can be dispatched.  That makes the physical key stable instead of
+  // changing from "existing ancestor + suffix" to "new parent + leaf" depending
+  // on whether an earlier writer has run yet.  It is also exact across nested
+  // mounts: unlike a broad ancestor key, the immediate parent identifies the
+  // directory entry the mutation will actually touch.
+  //
+  // Directory metadata mutates the directory object rather than merely its
+  // parent entry.  For an already-existing directory leaf (including two bind
+  // mount points with different parent/name pairs), include that object's inode
+  // too.  A newly-created directory is already covered by parent+leaf; the
+  // remember_deferred_dir() call after make_dir() adds its object key as well.
+  std::vector<std::string> ordering_keys(const std::string & path, int root,
+                                         bool include_leaf_dir = false) {
+    std::vector<std::string> keys{deferred_key(path, root)};
+#ifndef _WIN32
+    const std::string rel = order_rel(path);
+    if (!rel.empty()) {
+      const size_t slash = rel.rfind('/');
+      const std::string parent = slash == std::string::npos ? std::string()
+                                                             : rel.substr(0, slash);
+      const std::string leaf = slash == std::string::npos ? rel : rel.substr(slash + 1);
+      std::string cache_key = std::to_string(root);
+      cache_key.push_back('\0');
+      cache_key += parent;
+      std::string dir_cache_key = cache_key;
+      dir_cache_key.push_back('\0');
+      dir_cache_key += leaf;
+      auto pit = parent_order_ids_.find(cache_key);
+      int pfd = -1;
+      std::string opened_leaf;
+      if (pit == parent_order_ids_.end()
+          || (include_leaf_dir && !dir_order_ids_.count(dir_cache_key))) {
+        pfd = open_parent(path, opened_leaf, /*create=*/true, root);
+      }
+      if (pit == parent_order_ids_.end() && pfd >= 0) {
+        struct stat st;
+        int sr;
+        do { sr = ::fstat(pfd, &st); } while (sr != 0 && errno == EINTR);
+        if (sr != 0) {
+          const int e = errno; ::close(pfd);
+          die_io("cannot identify an extraction parent while establishing tar path ordering ("
+                 + std::string(std::strerror(e)) + ")");
+        }
+        std::string id = "@entry:" + std::to_string((unsigned long long)st.st_dev)
+                       + ":" + std::to_string((unsigned long long)st.st_ino);
+        pit = parent_order_ids_.emplace(cache_key, std::move(id)).first;
+      }
+      if (pit != parent_order_ids_.end()) keys.push_back(pit->second + "/" + leaf);
+
+      if (include_leaf_dir) {
+        auto dit = dir_order_ids_.find(dir_cache_key);
+        if (dit == dir_order_ids_.end() && pfd >= 0) {
+          int dfd;
+          do {
+            dfd = ::openat(pfd, leaf.c_str(),
+                           O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+          } while (dfd < 0 && errno == EINTR);
+          if (dfd >= 0) {
+            struct stat st;
+            int sr;
+            do { sr = ::fstat(dfd, &st); } while (sr != 0 && errno == EINTR);
+            const int e = errno; ::close(dfd);
+            if (sr != 0) {
+              ::close(pfd);
+              die_io("cannot identify an extraction directory while establishing tar path ordering ("
+                     + std::string(std::strerror(e)) + ")");
+            }
+            std::string id = "@dir:" + std::to_string((unsigned long long)st.st_dev)
+                           + ":" + std::to_string((unsigned long long)st.st_ino);
+            dit = dir_order_ids_.emplace(dir_cache_key, std::move(id)).first;
+          } else if (errno != ENOENT && errno != ENOTDIR && errno != ELOOP) {
+            // Unknown is not evidence that two directory spellings are distinct:
+            // make_dir() may still succeed after a transient resource/I/O error,
+            // after which retiring the wrong deferred metadata is an exit-0 loss.
+            const int e = errno; ::close(pfd);
+            die_io("cannot identify an extraction directory while establishing tar path ordering ("
+                   + std::string(std::strerror(e)) + ")");
+          }
+        }
+        if (dit != dir_order_ids_.end()) keys.push_back(dit->second);
+      }
+      if (pfd >= 0) ::close(pfd);
+    }
+#else
+    (void)include_leaf_dir;
+#endif
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+  }
+
+  void retire_deferred_hard(size_t idx) {
+    if (idx >= hardlinks_.size() || hardlinks_[idx].superseded) return;
+    Hard & h = hardlinks_[idx];
+    h.superseded = true;
+    for (const std::string & key : h.order_keys) {
+      auto it = deferred_hard_tail_.find(key);
+      if (it != deferred_hard_tail_.end() && it->second == idx)
+        deferred_hard_tail_.erase(it);
+    }
+  }
+  void retire_deferred_dir(size_t idx) {
+    if (idx >= dirmeta_.size() || dirmeta_[idx].superseded) return;
+    DirMeta & d = dirmeta_[idx];
+    d.superseded = true;
+    for (const std::string & key : d.order_keys) {
+      auto it = deferred_dir_tail_.find(key);
+      if (it != deferred_dir_tail_.end() && it->second == idx)
+        deferred_dir_tail_.erase(it);
+    }
+  }
+  void supersede_deferred(const std::vector<std::string> & keys) {
+    // Retiring an action erases all of its aliases.  A later key in this loop
+    // can therefore only find another genuinely-active action, not a stale map
+    // entry that hides the current tail.
+    for (const std::string & key : keys) {
+      auto h = deferred_hard_tail_.find(key);
+      if (h != deferred_hard_tail_.end()) retire_deferred_hard(h->second);
+      auto d = deferred_dir_tail_.find(key);
+      if (d != deferred_dir_tail_.end()) retire_deferred_dir(d->second);
+    }
+  }
+  // THE WHOLE LAST-MEMBER-WINS RULE IN ONE CALL, so no entry point can take half
+  // of it.  A member that creates or replaces a path must (a) retire any earlier
+  // deferred action for it and (b) wait for the writer pool to finish anything
+  // already queued or in flight for it.  Splitting these is how the sparse
+  // branch first went uncovered: it returns before the typeflag switch, had the
+  // supersede and not the barrier, so a queued ordinary `f` followed by a sparse
+  // `f` could still be restored first and then overwritten at exit 0.
+  void claim_path(const std::string & rel, int root,
+                  bool include_leaf_dir = false) {
+    const std::vector<std::string> keys =
+        ordering_keys(rel, root, include_leaf_dir);
+    supersede_deferred(keys);
+    bool repeated = false;
+    for (const std::string & key : keys)
+      if (seen_paths_.find(key) != seen_paths_.end()) repeated = true;
+    for (const std::string & key : keys) seen_paths_.insert(key);
+    if (repeated) {
+      // Test-only second leg of the exact duplicate-member rendezvous.  It is
+      // reached only when the destination key compared equal; the barrier gate
+      // below separately proves that the actual CV predicate observed a live
+      // writer claim and returned false.
+      static const bool debug_gate = [] {
+        const char * p = ::getenv("GZSTD_DEBUG_EXTRACT_PATH_GATE"); return p && *p; }();
+      static std::atomic<bool> debug_gated{false};
+      if (debug_gate && !debug_gated.exchange(true, std::memory_order_relaxed))
+        gz_fifo_gate("GZSTD_DEBUG_EXTRACT_PATH_GATE");
+      // ANNOUNCE COMPLETION, because the outcome alone is a bad test.  The
+      // race this barrier closes resolves the RIGHT way most of the time: a
+      // build with a broken key still produced correct content in 26 of 30
+      // runs.  This line is deliberately AFTER the wait: observing it means the
+      // later member still has not been dispatched and the earlier writes have
+      // actually released every queue claim.
+      drain_inflight_writes();
+      vlog(V_DEBUG, opt_, "[EXTRACT] duplicate path '" + rel
+           + "'; earlier writes landed before dispatch\n");
+    }
+  }
+  void remember_deferred_hard(const std::string & path, int root) {
+    const size_t idx = hardlinks_.size() - 1;
+    hardlinks_[idx].order_keys = ordering_keys(path, root);
+    for (const std::string & key : hardlinks_[idx].order_keys)
+      deferred_hard_tail_[key] = idx;
+  }
+  void remember_deferred_dir(const std::string & path, int root) {
+    const size_t idx = dirmeta_.size() - 1;
+    dirmeta_[idx].order_keys = ordering_keys(path, root, /*include_leaf_dir=*/true);
+    for (const std::string & key : dirmeta_[idx].order_keys)
+      deferred_dir_tail_[key] = idx;
+  }
   // Per-worker deferred collections for the parallel full-extract path: each
   // partition worker parses into a private ParCtx (no shared-vector races);
   // run_parallel merges them in partition order after join, preserving global
@@ -21223,6 +21830,12 @@ private:
   };
   static constexpr uint64_t LARGE_WINDOW = 64 * 1024 * 1024;  // part-job size
   std::mutex q_m_; std::condition_variable q_cv_prod_, q_cv_cons_;
+  // Jobs POPPED but not yet written.  "q_ is empty" is not "the writes landed":
+  // a writer pops under the lock and writes outside it, so a producer that waits
+  // only for an empty queue can still race a write that is in progress.  This is
+  // what makes drain_inflight_writes() a real barrier.
+  size_t q_active_ = 0;
+  std::condition_variable q_cv_idle_;
   std::deque<Job> q_; size_t q_bytes_ = 0; bool q_done_ = false;
   size_t q_max_bytes_ = 256 * 1024 * 1024;   // raised in start_pool for part jobs
   std::vector<std::thread> writers_;
@@ -21423,6 +22036,27 @@ private:
     for (auto & t : extra_writers_) t.join();   // retired + still-active extras
     writers_.clear(); extra_writers_.clear(); retire_flags_.clear();
   }
+  // Wait until every queued AND in-flight write has landed.  Used only when a
+  // later member targets a path an earlier member already touched, so it costs
+  // nothing on an archive with unique names.
+  void drain_inflight_writes() {
+    std::unique_lock<std::mutex> lk(q_m_);
+    // Test-only third leg, INSIDE THE FALSE PREDICATE rather than merely before
+    // wait(): the parked writer has already incremented q_active_, so reaching
+    // this FIFO proves the queue is empty but a claimed write is still live and
+    // this CV is about to sleep.  A queue-only predicate, a removed wait, or a
+    // hook placed before the predicate cannot pass the rendezvous vacuously.
+    // Gate only once in case of a spurious wake while that writer is still live.
+    bool debug_gated = false;
+    q_cv_idle_.wait(lk, [&] {
+      const bool idle = q_.empty() && q_active_ == 0;
+      if (!idle && !debug_gated) {
+        debug_gated = true;
+        gz_fifo_gate("GZSTD_DEBUG_EXTRACT_BARRIER_GATE");
+      }
+      return idle;
+    });
+  }
   void enqueue(Job && j) {
     std::unique_lock<std::mutex> lk(q_m_);
     // Time blocked on a full job queue (-v): this is the "writer pool can't
@@ -21493,6 +22127,7 @@ private:
         if (q_.empty()) break;   // q_done_ and drained
         j = std::move(q_.front()); q_.pop_front();
         q_bytes_ -= j.size;
+        ++q_active_;                       // claimed; released after the write
         lk.unlock(); q_cv_prod_.notify_all();
       }
       if (measure) {
@@ -21505,6 +22140,11 @@ private:
         if (live && nowt - last_flush >= SINK_FLUSH_NS) flush_live(nowt);
       } else {
         if (j.big) write_part(j, bounce); else write_small(j);
+      }
+      {   // release the claim; wake a producer waiting on the barrier
+        std::lock_guard<std::mutex> lk(q_m_);
+        if (q_active_) --q_active_;
+        if (q_.empty() && q_active_ == 0) q_cv_idle_.notify_all();
       }
     }
     if (bounce) ::free(bounce);
@@ -21778,6 +22418,13 @@ private:
   }
 
   void write_small(const Job & j) {
+    // Test-only first leg: park the first claimed small-file job before it
+    // creates anything, making queued+active versus merely-empty observable.
+    static const bool debug_gate = [] {
+      const char * p = ::getenv("GZSTD_DEBUG_EXTRACT_WRITER_GATE"); return p && *p; }();
+    static std::atomic<bool> debug_gated{false};
+    if (debug_gate && !debug_gated.exchange(true, std::memory_order_relaxed))
+      gz_fifo_gate("GZSTD_DEBUG_EXTRACT_WRITER_GATE");
     int fd = create_file(j.rel, j.mode, false, j.root);
     if (fd < 0) { fail(j.rel, std::strerror(errno)); return; }
     bool ok = true;
@@ -22119,6 +22766,7 @@ private:
 
     // GNU sparse: place each stored segment at its logical offset, leaving holes.
     if (e.is_sparse) {
+      if (!par) claim_path(rel, root);   // same rule as the switch below
       NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
       extract_sparse(r, rel, e, pad, root);
       return;
@@ -22132,6 +22780,17 @@ private:
       if (e.size) { r.skip(e.size); r.skip(pad); }
       return;
     }
+
+    // Any member that creates or replaces this path retires an earlier deferred
+    // action for it, so replay cannot reverse archive order (see above).  'V'
+    // (volume header) and unknown types touch no path and are not listed.
+    const bool mutates_path = e.typeflag == '0' || e.typeflag == '\0'
+                           || e.typeflag == '7' || e.typeflag == '5'
+                           || e.typeflag == '2' || e.typeflag == '1'
+                           || e.typeflag == '3' || e.typeflag == '4'
+                           || e.typeflag == '6';
+    if (!par && mutates_path)
+      claim_path(rel, root, /*include_leaf_dir=*/e.typeflag == '5');
 
     switch (e.typeflag) {
       case '0': case '\0': case '7': {            // regular file
@@ -22173,7 +22832,12 @@ private:
       case '5': {                                  // directory
         NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
         if (!make_dir(rel, e.mode, root)) fail(rel, "cannot create directory");
-        else (par ? par->dirmeta : dirmeta_).push_back({rel, e.mode, e.mtime, e.uid, e.gid, e.ext, root});
+        else {
+          (par ? par->dirmeta : dirmeta_).push_back(
+              {rel, e.mode, e.mtime, e.uid, e.gid, e.ext, root, false,
+               std::vector<std::string>{}});
+          if (!par) remember_deferred_dir(rel, root);
+        }
         break;
       }
       case '2': {                                  // symlink
@@ -22182,9 +22846,12 @@ private:
         apply_ext_path(rel, e.ext, root);   // xattrs/SELinux on the LINK itself
         break;
       }
-      case '1':                                    // hardlink (deferred: target must exist)
-        (par ? par->hardlinks : hardlinks_).push_back({rel, norm(e.linkname), root});
+      case '1': {                                  // hardlink (deferred: target must exist)
+        (par ? par->hardlinks : hardlinks_).push_back(
+            {rel, norm(e.linkname), root, false, std::vector<std::string>{}});
+        if (!par) remember_deferred_hard(rel, root);
         break;
+      }
       case '3': case '4': case '6': {              // char/block device, fifo
         NsAdd t(ex_inline_ns_, opt_.verbosity >= V_VERBOSE && !par_mode_);
         if (!make_special(rel, e.mode, e.typeflag, e.devmajor, e.devminor, e.mtime, root)) {
@@ -22294,6 +22961,7 @@ private:
   void finish_deferred() {
     // Hardlinks: target file is now written.  Resolve both paths securely.
     for (const auto & h : hardlinks_) {
+      if (h.superseded) continue;      // a later member took this path
       std::string nleaf, tleaf;
       int npfd = open_parent(h.name, nleaf, true, h.root);
       int tpfd = (h.target.empty() ? -1 : open_parent(h.target, tleaf, false, h.root));
@@ -22305,6 +22973,7 @@ private:
     // Directory metadata in reverse order, so a parent's mtime isn't bumped by
     // writing its children after it.
     for (auto it = dirmeta_.rbegin(); it != dirmeta_.rend(); ++it) {
+      if (it->superseded) continue;    // a later member took this path
       std::string leaf; int pfd = open_parent(it->path, leaf, false, it->root);
       if (pfd < 0) continue;
       int dfd = ::openat(pfd, leaf.c_str(), O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC);
@@ -23092,8 +23761,9 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
 // member index first, then a foreign zstd-seekable header-hop scan.  Returns
 // false (→ the caller uses the serial walk) when there is no valid frame table +
 // entry list, the entries are not contiguous from offset 0, duplicate normalized
-// names exist (tar's last-writer-wins can't be preserved across partitions), or a
-// leaf/directory path collision exists (see tar_leaf_dir_collision).  Rewinds `in`.
+// names exist (tar's last-writer-wins can't be preserved across partitions), a
+// leaf/directory path collision exists, or distinct names resolve through bind
+// mounts to one output object.  Rewinds `in`.
 // True if some non-directory entry's path is also used as a directory — an
 // explicit directory entry OR a parent component of another entry.  Serial
 // extraction resolves such leaf/prefix collisions deterministically by archive
@@ -23116,19 +23786,55 @@ static bool tar_leaf_dir_collision(const std::vector<std::pair<std::string, char
   return false;
 }
 
-static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
+// Two distinct archive spellings can still be one output entry through bind-
+// mounted directories below the extraction root.  Parallel partition workers
+// have no archive-order barrier, so any shared object-identity key makes this
+// plan unsafe; fall back to the serial parser, whose claim_path() orders it.
+static bool tar_output_alias_collision(
+    int dest_fd, const std::vector<std::pair<std::string, char>> & ents) {
+  FsOrderKeyCache cache;
+  std::unordered_map<std::string, std::string> owner;
+  for (const auto & e : ents) {
+    if (e.first.empty()) continue;
+    const std::vector<std::string> keys =
+        cache.keys(dest_fd, 0, e.first, /*include_leaf_dir=*/e.second == '5');
+    for (const std::string & k : keys) {
+      auto it = owner.find(k);
+      if (it != owner.end() && it->second != e.first) return true;
+      if (it == owner.end()) owner.emplace(k, e.first);
+    }
+  }
+  return false;
+}
+
+static bool build_full_parallel_plan(FILE * in, int dest_fd,
+                                     const Options & opt, Meter * m,
                                      TarSeekTable & st, std::vector<uint64_t> & bounds) {
   bounds.clear();
-  auto no_dup = [](std::unordered_map<std::string, char> & seen, const std::string & name) {
-    std::string nm = norm_member_name(name);
+  // DUPLICATES ARE REJECTED ON THE FILESYSTEM SPELLING, NOT THE ARCHIVE'S.  This
+  // planner exists to partition members across workers, which is only safe when
+  // no two members name one output file -- and `a//b`, `a/./b` and `a/b` are one
+  // file.  Comparing raw normalized names let those land in DIFFERENT partitions,
+  // where nothing orders them and the later member could lose.  The serial
+  // parser (which this falls back to) handles duplicates correctly via
+  // claim_path(); the planner's job is only to recognise them.
+  auto fs_key = [](const std::string & name) {
+    const std::string nm = norm_member_name(name);
+    std::string out; size_t i = 0;
+    while (i < nm.size()) {
+      const size_t j = nm.find('/', i);
+      const std::string c = nm.substr(i, j == std::string::npos ? std::string::npos : j - i);
+      if (!c.empty() && c != ".") { if (!out.empty()) out.push_back('/'); out += c; }
+      if (j == std::string::npos) break;
+      i = j + 1;
+    }
+    return out;   // trailing slash is gone with the empty last component
+  };
+  auto no_dup = [&fs_key](std::unordered_map<std::string, char> & seen, const std::string & name) {
+    std::string nm = fs_key(name);
     return nm.empty() || seen.emplace(nm, 1).second;   // empty names never collide
   };
-  // Normalized name with any trailing slash stripped (for the leaf/dir check).
-  auto key = [](const std::string & name) {
-    std::string nm = norm_member_name(name);
-    while (!nm.empty() && nm.back() == '/') nm.pop_back();
-    return nm;
-  };
+  auto key = [&fs_key](const std::string & name) { return fs_key(name); };
   bool have = false;
 
   // Our own archives: the member index carries every entry's offsets directly.
@@ -23146,7 +23852,8 @@ static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
         bounds.push_back(e.entry_end);
         nt.emplace_back(key(e.name), e.typeflag);
       }
-      if (ok && tar_leaf_dir_collision(nt)) ok = false;
+      if (ok && (tar_leaf_dir_collision(nt)
+                 || tar_output_alias_collision(dest_fd, nt))) ok = false;
       if (ok) { st = std::move(s2); have = true; } else bounds.clear();
     }
   }
@@ -23166,7 +23873,8 @@ static bool build_full_parallel_plan(FILE * in, const Options & opt, Meter * m,
         bounds.push_back(e.entry_end);
         nt.emplace_back(key(e.name), e.typeflag);
       }
-      if (ok && tar_leaf_dir_collision(nt)) ok = false;
+      if (ok && (tar_leaf_dir_collision(nt)
+                 || tar_output_alias_collision(dest_fd, nt))) ok = false;
       if (ok) { st = std::move(s2); have = true; } else bounds.clear();
     }
   }
@@ -24750,10 +25458,11 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
 // batches, and DOUBLE that threshold on every failed attempt.  A card that
 // stays full therefore costs a handful of cudaMallocs over a long run instead
 // of one per batch.  The call sits before the next pop, so it never holds a
-// claimed batch hostage.  DECOMPRESS is device-idle there (its batches complete
-// inline); COMPRESS is not, because its drain thread may still own older
-// submitted batches, so a retake there can impose a synchronization bubble.
-// That is the price of the cushion, and the back-off is what bounds it.
+// claimed batch hostage.  DECOMPRESS is device-idle there because its batches
+// complete inline.  COMPRESS has a separate drainer, so its caller first waits
+// on the existing idle condition variable until every submitted stream has
+// returned; doing the synchronizing allocation before that wait can put the
+// deadline-observing worker behind the same wedged batch as its drainer.
 //
 // A FAILED ATTEMPT IS HANDLED, SO ITS ERROR IS CONSUMED HERE.  Leaving one
 // armed is the v0.17.45 defect class, where a handled cudaMalloc failure left a
@@ -24761,7 +25470,8 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg)
 //
 // The caller counts its own clean batches into `ok_streak` (at the point a
 // batch is actually submitted, not once per loop iteration — a worker that
-// yields or re-pops must not age the streak) and calls this before its next pop.
+// yields or re-pops must not age the streak).  Compress must first drain its
+// asynchronous streams to a quiet point; decompress already completes inline.
 static const size_t GZ_RESERVE_RETRY_BATCHES = 8;     // clean batches before the first retry
 static const size_t GZ_RESERVE_RETRY_MAX     = 512;   // ceiling on the doubling back-off
 // Clean batches a device must complete before a VRAM-shrunken decompress batch
@@ -25565,6 +26275,13 @@ static void gpu_worker(
   size_t vram_reserve_want = 0;      // the size bringup settled on
   size_t reserve_ok_streak = 0;      // clean batches since the last attempt
   size_t reserve_retry_at  = GZ_RESERVE_RETRY_BATCHES;
+  // Test-only: make the existing compress recovery cell reach the re-arm after
+  // one submitted batch, while its drain-stall hook still owns that stream.
+  // This proves the quiet-point wait below instead of merely proving that a
+  // reserve eventually comes back after the device happened to go idle.
+  const bool debug_fast_reserve_retry =
+      ::getenv("GZSTD_DEBUG_COMPRESS_RESERVE_RETRY_FAST") != nullptr;
+  if (debug_fast_reserve_retry) reserve_retry_at = 1;
   if (g_phase_on.load(std::memory_order_relaxed)) phase_reset(slot_index);
 
   // ---- Event-driven completion state (ROADMAP 1.10) ----
@@ -26051,13 +26768,41 @@ static void gpu_worker(
     while (true) {
       wd_beat(slot_index);           // heartbeat: spinning vs blocked
       check_drain_err();
-      // Intake side, and NOT a quiet device: compress completes batches on a
-      // separate drain thread, so older submitted batches can still be in
-      // flight here and a retake's cudaMalloc may serialise against them.  It
-      // sits before the next pop so it can never hold a claimed batch hostage,
-      // and the back-off is what bounds how often that bubble can happen (~7
-      // attempts over the first thousand batches, then one per 512).  No-op
-      // unless a dip took the reserve and enough clean batches have gone by.
+      // A legacy cudaMalloc may synchronise with older work.  Calling it while
+      // the drainer is stuck in that work can therefore wedge THIS worker too --
+      // the worker which must observe deadline escalation and enter the abort ->
+      // CPU-rebuild path.  When a retry is due, stop intake and let the existing
+      // event-driven drain return every stream first.  The wait holds no task or
+      // throttle permit, wakes on drain failure/escalation, and turns the intended
+      // synchronisation bubble into a genuinely quiet allocation point.  No-op
+      // unless a dip took the reserve and enough submitted batches have gone by.
+      const bool reserve_retry_due = !vram_reserve && vram_reserve_want > 0
+                                  && reserve_ok_streak >= reserve_retry_at;
+      if (reserve_retry_due) {
+        bool waited_for_busy = false;
+        {
+          std::unique_lock<std::mutex> lk(idle_m);
+          for (const auto & X : ctxs)
+            if (X.busy) { waited_for_busy = true; break; }
+          wd_phase(slot_index, WatchPhase::StreamWait);
+          idle_cv.wait(lk, [&] {
+            if (!drain_err.empty()) return true;
+            if (g_adapt_deadline_escalate.load(std::memory_order_relaxed)
+                  == device_id + 1) return true;
+            for (const auto & X : ctxs) if (X.busy) return false;
+            return true;
+          });
+          if (!drain_err.empty()) throw std::runtime_error(drain_err);
+          if (g_adapt_deadline_escalate.load(std::memory_order_relaxed)
+                == device_id + 1)
+            throw std::runtime_error(
+                "deadline escalation: GPU batch wedged past the escalation "
+                "deadline (--adapt); treating as a device fault");
+        }
+        if (debug_fast_reserve_retry && waited_for_busy)
+          vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id)
+               + "] VRAM reserve retry waited for in-flight streams\n");
+      }
       gz_retake_vram_reserve(&vram_reserve, &vram_reserve_bytes,
                              vram_reserve_want, &reserve_ok_streak,
                              &reserve_retry_at, device_id, opt);
@@ -28364,7 +29109,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // gz_reopen_input (never a second lookup of opt.input), closed on scope exit.
   struct DrFd { int f = -1; ~DrFd() { if (f >= 0) ::close(f); } } dr_direct;
   bool direct_desc_ready = false;
-  if (dr_fd < 0 && !reader_done && want_direct_read) {
+  // Same offset rule as probe_preadable_input: this reopen yields a FRESH
+  // description positioned at 0 and sizes itself from st_size, so a held input
+  // that is not at the start would be re-read from byte 0.
+  const off_t dr_at = in ? ::lseek(::fileno(in), 0, SEEK_CUR) : (off_t)-1;
+  if (dr_fd < 0 && !reader_done && want_direct_read && dr_at == 0) {
     dr_direct.f = gz_reopen_input(in ? ::fileno(in) : -1, O_RDONLY | O_DIRECT);
     struct stat dst{};
     if (dr_direct.f >= 0 && ::fstat(dr_direct.f, &dst) == 0 && S_ISREG(dst.st_mode)) {
@@ -34075,17 +34824,30 @@ static int extract_tar(const Options & opt, Meter * m)
     // opposite choice, and it is the one that fits: `--direct-read has no effect
     // with --tar` (create).  So keep the optimized route and SAY the flag does not
     // reach it; silence was the actual defect.
-    if (opt.direct_read && opt.direct_read_user_set && arc != "-" && !opt.keep_going)
+    //
+    // WARN ONLY ONCE AN INDEXED ROUTE IS ACTUALLY TAKEN.  This used to warn here,
+    // before either planner had run -- so a run that fell back to the ordinary
+    // FrameSink walk (no seek table, a plan that would not build, or fewer than
+    // two partitions) was told its archive went through the page cache when that
+    // walk honours --direct-read perfectly well.  A warning that is wrong on the
+    // fallback path teaches the user to ignore it.
+    bool warned_indexed_direct_read = false;
+    auto warn_indexed_direct_read = [&] {
+      if (!opt.direct_read || !opt.direct_read_user_set || opt.keep_going) return;
+      if (arc == "-" || warned_indexed_direct_read) return;
+      warned_indexed_direct_read = true;
       vlog(V_DEFAULT, opt,
            "gzstd: warning: --direct-read does not reach indexed --tar extraction; those "
            "readers pread individual frames at unaligned offsets, so this archive is read "
            "through the page cache.\n");
+    };
     if (members.empty() && arc != "-" && !opt.keep_going) {
       tarx::TarSeekTable pst; std::vector<uint64_t> pbounds;
-      if (tarx::build_full_parallel_plan(in, opt, m, pst, pbounds)) {
+      if (tarx::build_full_parallel_plan(in, dest_fd, opt, m, pst, pbounds)) {
         int Np = std::min<int>({resolve_cpu_threads(opt.cpu_threads), 16,
                                 (int)pbounds.size(), (int)(pst.c_off.size() - 1)});
         if (Np >= 2) {
+          warn_indexed_direct_read();   // this route really is page-cached
           if (opt.verbosity >= V_VERBOSE) {
             char b[160];
             std::snprintf(b, sizeof b,
@@ -34116,8 +34878,8 @@ static int extract_tar(const Options & opt, Meter * m)
     // the selection touches (see tarx::build_seek_plan).  --keep-going falls
     // back to the walk so damage recovery keeps seeing the whole stream.
     tarx::SeekPlan plan;
-    // Same decision as full extraction above: the seek plan stays, and the warning
-    // there covers this route too (one warning per archive, before either).
+    // Same decision as full extraction above: the seek plan stays; the warning
+    // fires below, once this route is known to have been selected.
     if (!members.empty() && arc != "-" && !opt.keep_going
         && !tarx::build_seek_plan(in, members, plan)) {
       // No gzstd index — a foreign zstd-seekable archive (t2sz-style) still
@@ -34126,6 +34888,7 @@ static int extract_tar(const Options & opt, Meter * m)
       if (!tarx::build_foreign_seek_plan(in, members, opt, plan, m))
         plan = tarx::SeekPlan();
     }
+    if (plan.active) warn_indexed_direct_read();
     if (plan.active && opt.verbosity >= V_VERBOSE) {
       uint64_t need = 0;
       for (size_t f : plan.frames) need += plan.c_off[f + 1] - plan.c_off[f];

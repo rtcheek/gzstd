@@ -1,11 +1,205 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.68  
+**Covers:** v0.9.50 → v0.17.69  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.17.69 — the pre-tag round found a wrong result that predates the whole arc
+
+A `max`-effort review of the four untagged versions (v0.17.65–68). Its best finding is in code none of
+them touched, which is this reviewer's documented strength — and it is the failure shape this project
+treats as worst: **exit 0 with the wrong bytes on disk.**
+
+### tar's last-member-wins rule did not reach deferred work
+
+An archive may legally name the same path twice — `tar -rf` appends a fresh entry every time it updates a
+file — and tar's rule is that the **last** entry is what lands. gzstd defers two kinds of work to a replay
+after the writer drains: hardlinks (their target may not exist yet) and directory metadata (writing a
+child would bump the parent's mtime). That replay ran the EARLIER entry after the LATER member had already
+been written. Reproduced against GNU tar 1.35:
+
+| archive | GNU tar 1.35 | gzstd before | gzstd now |
+|---|---|---|---|
+| `t`, then `f`→`t` hardlink, then `f` as a regular file | `f` = NEW-REGULAR-CONTENT | **`f` = TARGET-CONTENT, sharing t's inode** | NEW-REGULAR-CONTENT |
+| `sub/` mode 700, then `sub/` mode 755 | 755 | **700** (dirmeta replays in reverse) | 755 |
+
+Both exited 0. The hardlink case is data loss: the newer file's contents are discarded and replaced by a
+link to something else.
+
+A later member for the same path now retires the earlier deferred action, so replay cannot reverse archive
+order. Keyed on the FILESYSTEM spelling rather than the archive's, because `a//b`, `a/./b` and `a/b` are
+one entry to `open_parent` and a duplicate-name archive is exactly where those spellings differ. Exact
+names only — ancestor/descendant ordering is the secure path walk's job, and the parallel planner rejects
+duplicate normalized names outright (falling back to the serial parser), so a `ParCtx` never carries two
+entries for one path.
+
+**Two cells, mutation-proved** against a build with only the `supersede_deferred()` calls removed: it
+restores the target's bytes over the newer file and keeps mode 700, where the fixed build matches GNU tar.
+Both measure against `tar` itself rather than against an opinion about what tar ought to do, and both skip
+rather than fail if the reference tar disagrees.
+
+### Three more, from the same round, all older than the arc
+
+The review kept going after the tar finding and produced two more wrong-result-at-exit-0 defects, both
+present in **v0.17.64, the tag currently deployed**:
+
+**A duplicate member raced the writer pool.** The tar fix above covers deferred work; regular files go to
+the parallel writers, so the parser runs ahead of them. With several writers the OLDER member's job could
+still be queued or mid-write when the NEWER one was created, and it then wrote the stale bytes over it.
+Measured on an archive with `f` appended twice: **wrong in 5 of 10 extractions at `--write-threads 8` on
+v0.17.64, and 9 of 10 at v0.17.69** — the newer content lost, at exit 0. A wide pool makes it the common
+case rather than a rare race.
+
+The pool had no way to answer "have the writes landed": a writer pops under the lock and writes outside it,
+so an empty queue proves nothing. It now counts in-flight jobs, and a member whose path was already touched
+in this archive waits for queued **and** in-flight writes to drain before it is dispatched. Archives with
+unique names never reach that branch. 0 wrong in 45 extractions across `--write-threads` 2, 8 and 16.
+
+**A mid-file stdin decoded from byte 0.** A seekable stdin unlocks the parallel prefetch reader, the pooled
+reader and the seek-table probes, and every one of them works in absolute offsets — they pread from 0, size
+the stream from `st_size`, and the index probes finish with `rewind()`. Handed a descriptor already
+positioned mid-file, gzstd read the whole file: two archives concatenated with stdin seeked to the second
+emitted **both**, 200,000,000 bytes where 100,000,000 was correct, exit 0.
+
+**Refused rather than rebased, deliberately.** Making those paths base-relative means threading an offset
+through three readers, their fallbacks and four index probes, in the code where the v0.17.62 review found
+four CRITICALs — and missing one silently restores the wrong output. That is exactly how this defect
+survived: the reviewer's own patch fixed one of the four consumers. The refusal is one check at input open,
+with a message naming the offset and the two ways to get the intended result. A pipe is unaffected, an
+offset-0 redirect keeps the parallel reader, and ROADMAP carries the base-relative design for whoever wants
+the capability rather than the guarantee.
+
+**And the sequential O_DIRECT reader died where the parallel one degrades.** A filesystem may accept
+`open(O_DIRECT)` and still refuse the aligned `pread` with `EINVAL`; v0.17.66 taught the parallel reader to
+fall back to the held descriptor, and this path called `die_io()` instead — so the same filesystem failed a
+one-reader run and survived a two-reader one. Mirrored, reusing `GZSTD_DEBUG_MT_DIRECT_EINVAL` so it is
+testable where O_DIRECT does work.
+
+### A second review round found three gaps in those fixes, and a third found one more
+
+Each round reviewed the previous round's repairs, which is where the remaining defects were.
+
+**The barrier missed sparse members.** `extract_sparse()` returns before the typeflag switch, so the first
+version had the supersede and not the drain: a queued ordinary `f` followed by a GNU-sparse `f` let the
+sparse restore land first and the older writer overwrite it. Both entry points now go through one
+`claim_path()`, so no door can take half the rule.
+
+**The destination key used the root INDEX, not the destination.** `-C /x` with member `d/f` and `-C /x/d`
+with member `f` are one output file through different indices. Keys now resolve each root through
+`/proc/self/fd`, which collapses symlinked roots as well. The parallel planner's duplicate check moved to
+the same filesystem spelling, so `a//b` and `a/b` cannot land in different partitions.
+
+🔴 **And then that key was still wrong, because it joined root and path with a NUL.** That separator was
+right when the root was an index; with a resolved path it meant `…/ax\0d/f` and `…/ax/d\0f` stayed
+different strings for one file and the barrier never fired. **The key is now one absolute path.**
+
+🔴 **A fourth review found that an absolute path is still not an object identity across bind mounts.**
+`/proc/self/fd/N` preserves the mount spelling used to open an fd.  Thus an older member selected as
+`-C /dst d/f` and a newer member selected as `-C /alias/d f`, where `/alias` is a bind mount of `/dst`,
+still received different keys even though both writers mutate the same directory entry.  The old writer
+could land last and restore stale bytes at exit 0.
+
+`claim_path()` now keeps the absolute spelling and also records the held immediate parent directory's
+`(st_dev, st_ino)` plus the leaf name.  It securely creates missing parents before any writer is dispatched,
+so that exact key cannot change according to whether an earlier writer happened to run first.  This is
+deliberately the *immediate* parent, not every ancestor: two bind views may share an ancestor but diverge at
+a nested mount below it, and treating that broad match as object identity could retire metadata for the
+wrong directory.  Existing directory leaves also carry their own inode key because metadata mutates the
+directory object itself.  These keys cover bind aliases beneath a single extraction root as well.
+
+The read-only indexed full-extract planner cannot prepare missing parents.  It conservatively records every
+existing ancestor plus the remaining suffix and falls back to the ordered serial parser if two planned
+members share one; a false match there only declines parallelism, never drops work.  The existing no-procfs
+fail-closed rule is unchanged.  One test hook forces overlapping roots to have different lexical spellings,
+and another models two nested bind prefixes without mount privilege.  The serial arm requires the barrier's
+post-drain diagnostic as well as final bytes.  The planner arm first proves the same archive engages the
+parallel route without the hook, then requires it to stand down with the alias and checks both exit codes,
+so neither can pass on favourable timing or an archive that was never planner-eligible.
+
+**The EINVAL fallback skipped the error check.** The degraded read returned its own bare `fread`, bypassing
+the `check_read_error()` that the very comment it was mirroring exists for: a short count is read as
+end-of-stream, so an I/O error mid-archive silently drops every remaining frame — and with `--rm` the input
+is then removed. It now falls through to the shared checked read.  The regression cell now lets one
+complete frame through O_DIRECT, forces the next read through the EINVAL fallback, and makes that buffered
+read set `ferror`; deleting the shared check therefore reproduces the exit-0 truncated stream instead of
+passing on a healthy fallback read.
+
+**The compress reserve re-arm could take the deadline worker into the same GPU wedge as its drainer.**
+Compression completes asynchronously on a separate drain thread, but the worker called the synchronizing
+`cudaMalloc` re-arm while older streams were still busy.  If one of those batches wedged, the drainer was
+already stuck in it and the allocation could block the worker too; that worker is the thread which must
+observe `g_adapt_deadline_escalate` and enter the abort → CPU-only rebuild.  Exact sequence: surrender the
+reserve, submit the retry streak, leave an older stream in flight, then reach re-arm as the stream wedges.
+The worker now pauses intake on the existing `idle_cv` until every stream is idle.  Drain failure and
+deadline escalation are both predicates of that wait and are rechecked before allocation, so no task or
+throttle permit is held and the re-arm runs only at a genuinely quiet device point.  Decompress was already
+quiet because it completes each batch inline.  The existing extensive compress-recovery cell now shortens
+the test-only retry cadence to one batch and stalls that batch's drainer: it must observe the in-flight stream,
+wait it out, print the quiet-point diagnostic, re-arm, and still produce a valid archive.
+
+### The cells test the mechanism, because the outcome is a coin flip
+
+🔴 **A build with the NUL-joined key still produced correct content in 26 of 30 extractions.** The race
+resolves the right way most of the time, so a cell that compares only bytes misses the regression about two
+times in three — and that is exactly what happened: the alias cell passed 5 of 5 by hand and then failed in
+the suite. Two further self-inflicted lessons from the same hour: a "verification" of 3 runs against a 13%
+failure rate proved nothing, and a mutant whose edit threw before the build reported *30 of 30 wrong*,
+which is what a nonexistent binary looks like.
+
+So `claim_path()` now announces its drain at `-vv`, and all three duplicate-race cells assert that line as
+well as the bytes. Against the broken-key build the alias cell fails deterministically instead of
+occasionally. **Bind a cell to the mechanism whenever the outcome is a race.**
+
+### Three smaller findings in the range under review
+
+- **`--direct-read` disagreed with itself about a redirected stdin.** v0.17.66 taught the parallel reader
+  to ask `probe_preadable_input` the counterfactual question instead of testing the name, so
+  `--direct-read < archive.zst` read O_DIRECT with two or more readers and buffered with one. The
+  single-reader path now accepts a seekable redirect too — and seeds its `pread` offset from `ftello()`
+  rather than assuming 0, because a redirect may already have been read from and re-reading from the
+  start would hand the decoder those bytes twice. A pipe still fails `S_ISREG` and keeps its documented
+  no-op behaviour, warning included.
+- **The `--tar` O_DIRECT warning fired before either planner ran**, so a run that fell back to the ordinary
+  FrameSink walk — no seek table, a plan that would not build, or fewer than two partitions — was told its
+  archive went through the page cache when that walk honours the flag perfectly well. It now fires once, at
+  the point an indexed route is actually selected. A warning that is wrong on the fallback path teaches the
+  user to ignore it.
+- **Two `--help` defects, both user-visible.** The v0.17.66 text printed "about 7%% of wall time": this help
+  is emitted through `std::cout`, not `printf`, so `%%` is two characters, not an escape. And the `-C` entry
+  had two string literals spliced onto one source line by a botched edit, printing a sentence that breaks
+  mid-clause and an orphaned line after it — since v0.14.77, which is when the second version was pasted in.
+
+### Verification
+
+Both build configurations warning-free. The duplicate-member behaviour is measured against GNU tar 1.35 in
+both directions; ordinary hardlinks still share an inode after extraction; `--direct-read` round-trips
+byte-identically as a named input, as a redirected stdin with one reader, with the default reader count,
+and through a pipe; and the `--tar` warning fires on an indexed route, stays silent on a `--no-index`
+archive that falls back to the walk, and all three extracts are byte-correct.
+
+Baselines: default 471 → **479**, extensive 607 → **615** (eight always-run cells, no GPU, so both host
+deltas are unchanged).
+
+**Final validation, on the tree as shipped.** Both configurations compile **warning-free**, and both
+extensive suites are green with no drift note: GPU `-e` **614 / 0 / 1 of 615** (9m00s) and
+`USE_NVCOMP=OFF` `-e` **471 / 0 / 115** (2m03s). The single GPU-side skip is the trivial-park cell this
+host cannot provoke — the same skip as every prior run, so no existing cell silently became one.
+
+**Two regressions the review could not see, because it does not build.** Its aggregate initializers for
+`Hard` and `DirMeta` omitted the new `order_keys` member, producing `-Wmissing-field-initializers` on both
+configurations. Warning-free is an invariant here, so those were regressions; the members are now named
+explicitly rather than defaulted, which keeps the initializers complete if another field is added.
+
+🔴 **OWED: the bind-mount trigger has never actually executed.** This host refuses unprivileged user
+namespaces at `uid_map` and has no `bindfs`, `podman` or `docker`, so the two-mounts case cannot be built
+here. What IS exercised: the serial fix through real inodes via the aliased-root case (`-C /x` + `d/f`
+against `-C /x/d` + `f` — one parent identity, two spellings), and the planner path through the
+`GZSTD_DEBUG_EXTRACT_BIND_ALIAS` hook. **The genuine case wants a host with mount privileges**, and until
+it runs there the bind-alias fix is reasoned and hook-tested rather than reproduced.
 
 
 ## v0.17.68 — the shrink that shrank nothing, found by review of v0.17.67
