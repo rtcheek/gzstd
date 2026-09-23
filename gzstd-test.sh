@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=490
-$EXTENSIVE && EXPECTED_TESTS=637
+EXPECTED_TESTS=502
+$EXTENSIVE && EXPECTED_TESTS=653
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -730,6 +730,12 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # without the zstd CLI or python3 skips all twenty-one.  v0.17.70 also adds one
 # always-run liveness cell, the --adapt -d --tar exit hang (489 -> 490,
 # 636 -> 637); it runs on both builds, so again no host delta changes.
+# v0.17.71 -D compress + -d --patch-from: eleven always-run cells in the
+# dictionary section and four more in the -e compat block (490 -> 501,
+# 637 -> 652); two -e cells were rewritten in place (compress -D is real now).
+# Plus one always-run --verify cell: a failed --sliding-window round trip must
+# be rebuilt, never kept (501 -> 502, 652 -> 653).
+# All run on both builds; a host without zstd or python3 skips them.
 # DERIVED until the next suite pair confirms it.
 EXPECTED_NOGPU_DELTA=118
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=144   # MEASURED 2026-09-21 (607 - 463)
@@ -1286,7 +1292,7 @@ else
 fi
 
 # ============================================================
-# 16b. Dictionary decode (-D)
+# 16b. Dictionaries: -D (decode and compress), -d --patch-from
 # ============================================================
 # ROADMAP rule 1 -- read anything zstd writes -- had one hard exception until
 # v0.17.70: data written by `zstd -D`.  gzstd parsed -D and threw the path away,
@@ -1309,7 +1315,7 @@ fi
 # refusal cell uses --hybrid, which a USE_NVCOMP=OFF binary also parses), so no
 # host delta changes; only a host without zstd skips them.  The fixtures in
 # $TMPDIR/dict are reused by the -e cells in the zstd-compat section.
-section "Dictionary decode (-D)"
+section "Dictionaries (-D, --patch-from)"
 
 DICTD="$TMPDIR/dict"
 if command -v zstd &>/dev/null && command -v python3 &>/dev/null; then
@@ -1434,6 +1440,130 @@ PYEOF
   [[ $rc -eq 2 ]] && grep -q "incompatible with --hybrid" "$DICTD/err" \
     && pass "-D refuses --hybrid (exit 2)" \
     || fail "-D refuses --hybrid (exit 2)" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+
+  # ---- COMPRESSING with -D (v0.17.71) ----
+  # Each compressor is its own context, so each gets its own cell.  The check is
+  # the one that cannot pass by accident: zstd must decode the output WITH the
+  # dictionary to the original bytes, and must FAIL without it -- a frame that
+  # never used the dictionary decodes either way.
+  dict_c_cell() {   # dict_c_cell NAME OUT.zst GZSTD-ARGS... : compress body.json, check both ways
+    local name=$1 out=$2; shift 2
+    local t0 rc=0; t0=$(now_ms)
+    "$GZSTD" -q -f "$@" "$DICTD/body.json" -o "$out" 2>"$DICTD/err" || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    if [[ $rc -ne 0 ]]; then
+      fail "$name" "compress rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+    elif ! zstd -q -d -c -D "$DICTD/a.dict" "$out" 2>/dev/null | cmp -s - "$DICTD/body.json"; then
+      fail "$name" "zstd -d -D does not reproduce the input"
+    elif zstd -q -d -c "$out" >/dev/null 2>&1; then
+      fail "$name" "decodes WITHOUT the dictionary: it was never used"
+    else
+      pass "$name"
+    fi
+  }
+  dict_c_cell "gzstd -D ${SYM_ARROW} zstd -d -D (CPU workers, 5 frames)" "$DICTD/cw.zst" \
+    -D "$DICTD/a.dict" --chunk-size=1
+  dict_c_cell "gzstd -D ${SYM_ARROW} zstd -d -D (-T1 single stream)" "$DICTD/c1.zst" \
+    -D "$DICTD/a.dict" -T1
+  dict_c_cell "gzstd -D ${SYM_ARROW} zstd -d -D (--sliding-window)" "$DICTD/cs.zst" \
+    -D "$DICTD/a.dict" --sliding-window
+
+  # --verify decodes gzstd's OWN output, which now carries the dictionary.  A
+  # checker without it fails every frame, then every rebuild -- so the cell wants
+  # exit 0 AND no "--verify caught" line.  --verify-retries=1 and the timeout are
+  # load-bearing: the default is UNLIMITED rebuilds (by design, for unattended
+  # backups), so without them a regression here spins forever instead of failing
+  # -- measured, 1121 attempts in 9 minutes on a mutant.
+  for vmode in pool sliding; do
+    if [[ $vmode == pool ]]; then vname="-D --verify: the verify pool has the dictionary"; vargs=(--chunk-size=1)
+    else vname="-D --sliding-window --verify: the stream verifier has the dictionary"; vargs=(--sliding-window); fi
+    t0=$(now_ms); rc=0
+    timeout 120 "$GZSTD" -f -D "$DICTD/a.dict" --verify --verify-retries=1 "${vargs[@]}" \
+      "$DICTD/body.json" -o "$DICTD/cv.zst" 2>"$DICTD/err" || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    [[ $rc -eq 0 ]] && ! grep -q -- "--verify caught" "$DICTD/err" \
+      && pass "$vname" || fail "$vname" "rc=$rc: $(grep -E 'verify|ERROR' "$DICTD/err" | head -2 | tr '\n' ' ')"
+  done
+
+  # zstd -D writes the dictionary ID even into an empty file's frame; so must we,
+  # and --verify's inline check of that frame must then have the dictionary.
+  : > "$DICTD/empty"
+  t0=$(now_ms); rc=0
+  timeout 120 "$GZSTD" -q -f -D "$DICTD/a.dict" --verify --verify-retries=1 "$DICTD/empty" \
+    -o "$DICTD/ce.zst" 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 0 ]] && zstd -lv "$DICTD/ce.zst" 2>/dev/null | grep -q "DictID: 1111" \
+     && zstd -q -t -D "$DICTD/a.dict" "$DICTD/ce.zst" 2>/dev/null; then
+    pass "-D on an empty input: the frame names the dictionary, --verify passes"
+  else
+    fail "-D on an empty input: the frame names the dictionary, --verify passes" \
+         "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  fi
+
+  t0=$(now_ms); rc=0
+  "$GZSTD" -q -f -D "$DICTD/a.dict" --no-dictID "$DICTD/part.00" -o "$DICTD/cn.zst" 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 0 ]] && ! zstd -lv "$DICTD/cn.zst" 2>/dev/null | grep -q "DictID: 1111" \
+     && zstd -q -d -c -D "$DICTD/a.dict" "$DICTD/cn.zst" 2>/dev/null | cmp -s - "$DICTD/part.00"; then
+    pass "--no-dictID omits the dictionary ID; -D still decodes it"
+  else
+    fail "--no-dictID omits the dictionary ID; -D still decodes it" "rc=$rc"
+  fi
+
+  # A gzstd -D --tar archive is INDEXED, so selective extraction takes seek-extract.
+  t0=$(now_ms); rc=0; xrc=0
+  ( cd "$DICTD" && "$GZSTD" -q -f -D a.dict -o ct.tar.zst --tar s ) 2>"$DICTD/err" || rc=$?
+  rm -rf "$DICTD/ctx"; mkdir -p "$DICTD/ctx"
+  if [[ $rc -eq 0 ]]; then
+    "$GZSTD" -v -d --tar -D "$DICTD/a.dict" -C "$DICTD/ctx" "$DICTD/ct.tar.zst" s/42.json \
+      2>"$DICTD/err" || xrc=$?
+  fi
+  # ...and WITHOUT -D it must fail: an archive whose frames never used the
+  # dictionary would extract either way, so success with -D alone proves nothing.
+  nrc=0; rm -rf "$DICTD/cty"; mkdir -p "$DICTD/cty"
+  "$GZSTD" -q -d --tar -C "$DICTD/cty" "$DICTD/ct.tar.zst" s/42.json >/dev/null 2>&1 || nrc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ $rc -eq 0 && $xrc -eq 0 && $nrc -eq 4 ]] && grep -q "seek-extract: 1 of" "$DICTD/err" \
+    && cmp -s "$DICTD/s/42.json" "$DICTD/ctx/s/42.json" \
+    && pass "--tar -D create; seek-extract one member with -D" \
+    || fail "--tar -D create; seek-extract one member with -D" \
+            "create rc=$rc extract rc=$xrc without-D rc=$nrc (want 4): $(grep -E '\[TAR\]|ERROR' "$DICTD/err" | head -2 | tr '\n' ' ')"
+
+  t0=$(now_ms); rc=0
+  "$GZSTD" -f -D "$DICTD/a.dict" --hybrid "$DICTD/part.00" -o "$DICTD/ch.zst" >/dev/null 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ $rc -eq 2 ]] && grep -q "incompatible with --hybrid" "$DICTD/err" \
+    && pass "compress -D refuses --hybrid (exit 2)" \
+    || fail "compress -D refuses --hybrid (exit 2)" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+
+  # ---- -d --patch-from=OLD (v0.17.71) ----
+  # zstd's patch decode.  The reference is RAW CONTENT whatever its first bytes
+  # are: the second cell's reference begins with the dictionary magic but is not
+  # a dictionary, so reading it as one (-D) fails -- the control proves it.
+  head -c 2000000 "$DICTD/body.json" > "$DICTD/old.bin"
+  { cat "$DICTD/old.bin"; echo "a changed tail"; } > "$DICTD/new.bin"
+  zstd -q -f --patch-from="$DICTD/old.bin" "$DICTD/new.bin" -o "$DICTD/patch.zst"
+  t0=$(now_ms); rc=0
+  "$GZSTD" -q -d -c --patch-from="$DICTD/old.bin" "$DICTD/patch.zst" > "$DICTD/new.out" 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ $rc -eq 0 ]] && files_match "$DICTD/new.bin" "$DICTD/new.out" \
+    && pass "-d --patch-from=OLD decodes a zstd --patch-from patch" \
+    || fail "-d --patch-from=OLD decodes a zstd --patch-from patch" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  { printf '\x37\xa4\x30\xec'; head -c 3000 "$DICTD/body.json"; } > "$DICTD/magic.bin"
+  { head -c 2000 "$DICTD/magic.bin"; echo " changed"; } > "$DICTD/newm.bin"
+  zstd -q -f --patch-from="$DICTD/magic.bin" "$DICTD/newm.bin" -o "$DICTD/pm.zst"
+  t0=$(now_ms); rc=0; rcc=0
+  "$GZSTD" -q -d -c --patch-from="$DICTD/magic.bin" "$DICTD/pm.zst" > "$DICTD/newm.out" 2>"$DICTD/err" || rc=$?
+  "$GZSTD" -q -d -c -D "$DICTD/magic.bin" "$DICTD/pm.zst" >/dev/null 2>&1 || rcc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rcc -ne 4 ]]; then
+    fail "--patch-from reads a magic-prefixed reference as raw content" \
+         "control: -D on the same file exited $rcc, not 4 -- the fixture does not discriminate, NOT TESTED"
+  elif [[ $rc -eq 0 ]] && files_match "$DICTD/newm.bin" "$DICTD/newm.out"; then
+    pass "--patch-from reads a magic-prefixed reference as raw content"
+  else
+    fail "--patch-from reads a magic-prefixed reference as raw content" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  fi
 else
   for c in "zstd -D ${SYM_ARROW} gzstd -d -D (4 frames, CPU workers)" \
            "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, file)" \
@@ -1444,7 +1574,18 @@ else
            "foreign seekable -D archive: seek-extract engaged" \
            "-d without -D: exit 4 names dictionary ID, no --keep-going advice" \
            "-d with the wrong -D: exit 4 names both IDs" \
-           "-D refuses --hybrid (exit 2)"; do
+           "-D refuses --hybrid (exit 2)" \
+           "gzstd -D ${SYM_ARROW} zstd -d -D (CPU workers, 5 frames)" \
+           "gzstd -D ${SYM_ARROW} zstd -d -D (-T1 single stream)" \
+           "gzstd -D ${SYM_ARROW} zstd -d -D (--sliding-window)" \
+           "-D --verify: the verify pool has the dictionary" \
+           "-D --sliding-window --verify: the stream verifier has the dictionary" \
+           "-D on an empty input: the frame names the dictionary, --verify passes" \
+           "--no-dictID omits the dictionary ID; -D still decodes it" \
+           "--tar -D create; seek-extract one member with -D" \
+           "compress -D refuses --hybrid (exit 2)" \
+           "-d --patch-from=OLD decodes a zstd --patch-from patch" \
+           "--patch-from reads a magic-prefixed reference as raw content"; do
     skip "$c" "zstd or python3 not installed"
   done
 fi
@@ -6790,8 +6931,13 @@ fi
 # Value-eating warn no-ops
 out=$("$GZSTD" --trace foo.log -f "$TMPDIR/zc.bin" 2>&1)
 echo "$out" | grep -qi -- "trace.*compatibility" && pass "--trace eats value" || fail "--trace eats value"
-out=$("$GZSTD" -D /nonexistent -f "$TMPDIR/zc.bin" 2>&1)
-echo "$out" | grep -qi "D.*dictionary" && pass "-D eats value" || fail "-D eats value"
+# -D on COMPRESS is real since v0.17.71: a dictionary it cannot read is an I/O
+# error (exit 3), not a warning -- the run would otherwise write frames the user
+# believes carry a dictionary.
+dz_rc=0; out=$("$GZSTD" -D /nonexistent -f "$TMPDIR/zc.bin" 2>&1) || dz_rc=$?
+[[ $dz_rc -eq 3 ]] && echo "$out" | grep -q "cannot open dictionary: /nonexistent" \
+  && pass "-D on compress needs a readable dictionary (exit 3)" \
+  || fail "-D on compress needs a readable dictionary (exit 3)" "rc=$dz_rc"
 
 # -D on DECODE is real since v0.17.70 (the default-run "Dictionary decode"
 # section covers the decoder routes and the mismatch messages).  These cells are
@@ -6881,16 +7027,51 @@ if command -v zstd &>/dev/null && [[ -s "$DICTD/a.dict" ]]; then
   [[ -z "$why" ]] && pass "-D refuses an option or empty value (exit 2)" \
     || fail "-D refuses an option or empty value (exit 2)" "got$why"
 
-  # Compression with a dictionary is not implemented: it must warn AND write
-  # output that a plain decoder reads with no dictionary at all.
+  # Compressing with a RAW-CONTENT dictionary: zstd must need it to decode.
   t0=$(now_ms); rc=0
-  "$GZSTD" -f -D "$A" "$DICTD/part.03" -o "$DICTD/cz.zst" 2>"$DICTD/err" || rc=$?
+  "$GZSTD" -q -f -D "$DICTD/raw.dict" "$DICTD/part.03" -o "$DICTD/cz.zst" 2>"$DICTD/err" || rc=$?
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
-  if [[ $rc -eq 0 ]] && grep -q "compressing with a dictionary is not supported" "$DICTD/err" \
-     && zstd -q -d -c "$DICTD/cz.zst" 2>/dev/null | cmp -s - "$DICTD/part.03"; then
-    pass "compress -D warns; output needs no dictionary"
+  if [[ $rc -eq 0 ]] && zstd -q -d -c -D "$DICTD/raw.dict" "$DICTD/cz.zst" 2>/dev/null | cmp -s - "$DICTD/part.03" \
+     && ! zstd -q -d -c "$DICTD/cz.zst" >/dev/null 2>&1; then
+    pass "compress -D with a raw-content dictionary"
   else
-    fail "compress -D warns; output needs no dictionary" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+    fail "compress -D with a raw-content dictionary" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  fi
+
+  # --patch-from: the flag layer around the default-run decode cells.
+  dict_cell "--patch-from OLD (separated spelling)" "$DICTD/new.bin" \
+    "$GZSTD" -q -d -c --patch-from "$DICTD/old.bin" "$DICTD/patch.zst"
+
+  # A patch whose window is past the 128 MiB default.  zstd's own decoder caps
+  # the window at the reference's size and refuses such a patch without --long
+  # (measured at 200 MB); gzstd allows the format's maximum.
+  head -c 140000000 /dev/urandom > "$DICTD/old140.bin"
+  { cat "$DICTD/old140.bin"; echo "tail"; } > "$DICTD/new140.bin"
+  zstd -q -f --patch-from="$DICTD/old140.bin" "$DICTD/new140.bin" -o "$DICTD/p140.zst"
+  dict_cell "--patch-from with a window past 128 MiB" "$DICTD/new140.bin" \
+    "$GZSTD" -q -d -c --patch-from="$DICTD/old140.bin" "$DICTD/p140.zst"
+  rm -f "$DICTD/old140.bin" "$DICTD/new140.bin" "$DICTD/p140.zst" "$DICTD/cell.out"
+
+  t0=$(now_ms); why=""
+  "$GZSTD" -d -c -D "$A" --patch-from="$DICTD/old.bin" "$DICTD/patch.zst" >/dev/null 2>"$DICTD/err"; rc=$?
+  [[ $rc -eq 2 ]] && grep -q "can't use -D and --patch-from" "$DICTD/err" || why+=" with-D:$rc"
+  "$GZSTD" -d -c --patch-from= "$DICTD/patch.zst" >/dev/null 2>&1; rc=$?; [[ $rc -eq 2 ]] || why+=" empty:$rc"
+  "$GZSTD" -d --patch-from -c "$DICTD/patch.zst" >/dev/null 2>&1; rc=$?; [[ $rc -eq 2 ]] || why+=" option:$rc"
+  "$GZSTD" -d -c --patch-from="$DICTD/missing.bin" "$DICTD/patch.zst" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 3 ]] || why+=" missing:$rc"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--patch-from errors: with -D, empty, option 2; missing reference 3" \
+    || fail "--patch-from errors: with -D, empty, option 2; missing reference 3" "got$why"
+
+  # CREATING a patch is not implemented: it must warn and write a plain frame.
+  t0=$(now_ms); rc=0
+  "$GZSTD" -f --patch-from="$DICTD/old.bin" "$DICTD/new.bin" -o "$DICTD/pz.zst" 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 0 ]] && grep -q "creating patches is not supported" "$DICTD/err" \
+     && zstd -q -d -c "$DICTD/pz.zst" 2>/dev/null | cmp -s - "$DICTD/new.bin"; then
+    pass "compress --patch-from warns; output is a plain frame"
+  else
+    fail "compress --patch-from warns; output is a plain frame" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
   fi
 else
   for c in "-dD FILE (bundled, zstd spelling)" "-D=FILE (zstd spelling)" \
@@ -6900,7 +7081,11 @@ else
            "-D accepts a dictionary of exactly 32 MiB" \
            "-D refuses a dictionary over 32 MiB (exit 2)" \
            "-D refuses an option or empty value (exit 2)" \
-           "compress -D warns; output needs no dictionary"; do
+           "compress -D with a raw-content dictionary" \
+           "--patch-from OLD (separated spelling)" \
+           "--patch-from with a window past 128 MiB" \
+           "--patch-from errors: with -D, empty, option 2; missing reference 3" \
+           "compress --patch-from warns; output is a plain frame"; do
     skip "$c" "zstd or python3 not installed"
   done
 fi
@@ -9068,6 +9253,31 @@ else
     fail "--verify checks frames on -T1 and --sliding-window" "T1=[$vout] sw=[$vout2]"
   fi
   rm -f "$TMPDIR/vf1.zst" "$TMPDIR/vf2.zst"
+
+  # 1g. ...and a FAILED sliding-window round trip must be acted on (fixed
+  #     v0.17.71).  The stream verifier raised g_verify_failed but not the
+  #     restart flag the driver tests, so from v0.15.72 on a stream it caught
+  #     was kept at exit 0 -- measured with this hook: zstd -t "Data corruption
+  #     detected" on the kept archive.  The writer's corruption hook never
+  #     reached this path, so nothing could see it.  Once: caught, rebuilt,
+  #     clean.  Every pass (--verify-retries=1): exit 4 and no archive kept.
+  t0=$(now_ms); swv_why=""
+  rm -f "$TMPDIR/vf3.zst"; swv_rc=0
+  GZSTD_DEBUG_CORRUPT_FRAME=0 timeout 120 "$GZSTD" -f --sliding-window --verify \
+    "$TMPDIR/medium.txt" -o "$TMPDIR/vf3.zst" 2>"$TMPDIR/vf3.err" || swv_rc=$?
+  [[ $swv_rc -eq 0 ]] || swv_why+=" once:rc=$swv_rc"
+  grep -q -- "--verify caught" "$TMPDIR/vf3.err" || swv_why+=" once:not-caught"
+  "$GZSTD" -q -t "$TMPDIR/vf3.zst" 2>/dev/null || swv_why+=" once:archive-bad"
+  rm -f "$TMPDIR/vf3.zst"; swv_rc=0
+  GZSTD_DEBUG_CORRUPT_FRAME=0 GZSTD_DEBUG_CORRUPT_PERSIST=1 timeout 120 "$GZSTD" -f \
+    --sliding-window --verify --verify-retries=1 "$TMPDIR/medium.txt" -o "$TMPDIR/vf3.zst" \
+    2>/dev/null || swv_rc=$?
+  [[ $swv_rc -eq 4 ]] || swv_why+=" persist:rc=$swv_rc"
+  [[ -e "$TMPDIR/vf3.zst" ]] && swv_why+=" persist:archive-kept"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$swv_why" ]] && pass "--sliding-window --verify rebuilds a bad stream, never keeps one" \
+    || fail "--sliding-window --verify rebuilds a bad stream, never keeps one" "got$swv_why"
+  rm -f "$TMPDIR/vf3.zst" "$TMPDIR/vf3.err"
 
   # 1g. EMPTY INPUT must still produce a valid zstd frame on every path.  The
   #     frame-parallel paths queue nothing for a zero-byte source, so the writer

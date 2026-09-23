@@ -1,12 +1,107 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.70  
+**Covers:** v0.9.50 → v0.17.71  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.71 — `-D` compresses, `-d --patch-from` decodes zstd's patches, and `--sliding-window --verify` stops keeping bad streams
+
+### Compressing with a dictionary (Stage B)
+
+v0.17.70 taught `-D` to READ; on compression it still warned and wrote dictionary-free frames. It now
+writes what `zstd -D` writes: frames compressed against the dictionary, each carrying its ID (the ID is
+omitted with `--no-dictID`, which until now was a silent no-op), readable by `zstd -d -D` and by
+`gzstd -d -D`. On a 99-byte JSON record the frame shrinks from 96 bytes to 31 — and is **byte-identical
+to `zstd -D`'s** (same libzstd, 1.5.7); gzstd's file adds its usual 25-byte seek table either way.
+
+**One shared CDict per compression level, not a dictionary per thread.** Loading the dictionary into
+each compressor would give every thread its own dictionary tables — at level 19 on a 256-thread box,
+gigabytes. A CDict is read-only once built and zstd documents it as shareable, so the run builds one and
+every compressor references it. Per LEVEL, because a referenced CDict's level takes priority over the
+context's; the run's level is built before any thread starts, so a failure is reported there.
+
+**Every compressor and every checker gets it** — four compressors (the CPU workers, the `-T1` single
+stream, `--sliding-window`, the empty-input frame) and the three `--verify` decoders, which decode
+gzstd's OWN output and so need the dictionary exactly when this run writes with it. The verify pool used
+`ZSTD_initDStream` per frame, which is a reset **plus detaching the dictionary**; left as it was, every
+frame after the first would have failed verification and been rebuilt. It now resets the session only.
+zstd writes the dictionary ID even into an empty file's frame (measured), and so does gzstd.
+
+`-D` makes compression CPU-only, like decoding: nvCOMP takes no dictionary, and a NAMED GPU backend is
+refused (exit 2). `--verify-engine=gpu` already demotes to CPU verify outside `--gpu-only` with a warning.
+A dictionary that cannot be read is now an error on compression too (exit 3) rather than a warning.
+
+### `-d --patch-from=OLD`
+
+`zstd --patch-from=OLD NEW` writes a patch that rebuilds NEW from OLD. v0.17.70 could already decode
+small ones by accident, as `-D OLD` — within the 32 MiB dictionary cap, and only because the
+auto-detecting dictionary loader happened to treat OLD as raw content. zstd's own spellings
+`--patch-from=OLD` and `--patch-from OLD` now work on `-d`/`-t`:
+
+- **OLD is raw content, whatever its first bytes are.** A reference that begins with a dictionary's magic
+  number is parsed by the ordinary loader as a trained dictionary; the reference is now built with
+  `ZSTD_dct_rawContent`, by reference (no copy of up to 2 GiB). A cell uses a magic-prefixed file that is
+  NOT a dictionary: as `-D` it is refused as corrupt, as `--patch-from` it decodes.
+- **Up to 2 GiB**, zstd's own limit ("Can't handle files larger than 2 GB", measured).
+- **The window limit is lifted to the format's maximum.** A patch's window spans the whole reference.
+  zstd raises its limit to exactly the reference's size, and then refuses its own 200 MB patch because
+  the window is 5 bytes larger (`200000005 > 200000000 ... Use --long=28`, measured). gzstd decodes it.
+  An explicit `-M` still wins.
+- `-D` with `--patch-from` is refused, as zstd refuses it. CREATING a patch is not implemented: on
+  compression `--patch-from` still warns and writes an ordinary frame.
+
+This needs libzstd's experimental API (`ZSTD_STATIC_LINKING_ONLY`, for `ZSTD_createDDict_advanced`),
+which every libzstd gzstd builds against exports; the portable build links `libzstd.a`.
+
+### `--sliding-window --verify` kept a stream it had caught — shipped since v0.15.72
+
+Found by the mutation run below. The stream verifier behind `--sliding-window --verify` raised
+`g_verify_failed` when the round trip failed, but not `g_gpu_failed_restart`, the flag the driver actually
+tests before discarding and rebuilding; the frame verifier's `mark_failed` raises both. Its comment
+said it "raises the SAME flag the frame verifier uses". So a caught stream was treated as a clean run.
+With the corruption hook firing on this path (see below), measured:
+
+| | hook fires once | hook fires every pass, `--verify-retries=1` |
+|---|---|---|
+| through v0.17.70 | **exit 0, archive kept — `zstd -t`: "Data corruption detected"** | **exit 0, archive kept** |
+| now | caught, rebuilt, archive verifies, exit 0 | exit 4, no archive kept |
+
+It went unseen because nothing could reach it: `GZSTD_DEBUG_CORRUPT_FRAME` corrupts frames in the ordered
+writer, which this single-frame path never uses, and the one suite cell for it asserted only the
+"round-trip OK" message. The hook now also fires here (`=0`, this path's only frame), and a new
+always-run cell drives both columns.
+
+### Verification
+
+Every new site was mutated in turn (the change removed or neutralised alone) and run against the new
+cells:
+
+| mutant | caught by |
+|---|---|
+| CPU-worker compressor loses the dictionary | 3 cells (incl. `--tar -D`, which now also asserts extraction WITHOUT `-D` fails) |
+| `-T1` stream compressor | 1 |
+| `--sliding-window` compressor | 1 |
+| empty-input frame | 1 |
+| verify pool never attaches the dictionary | 2 |
+| verify pool keeps `ZSTD_initDStream` (detaches it per frame) | 2 |
+| stream verifier never attaches it | 1 — **only after the flag fix above**; before it, exit 0 |
+| `--patch-from` window limit not lifted | 1 |
+| reference loaded by the auto-detecting loader | 1 |
+| `--no-dictID` ignored | 1 |
+| empty-frame INLINE check without the dictionary | **0 — unreachable under `-D`**: it runs only when no verify pool exists, i.e. GPU verify, which `-D` refuses |
+
+The `--verify` cells pass `--verify-retries=1` and a `timeout`: the default is unlimited rebuilds (by
+design, for unattended backups), so a mutant there spun — 1121 attempts in 9 minutes — instead of failing.
+Cells: eleven always-run and four `-e` for this change, plus the sliding-window verify cell; two `-e`
+cells were rewritten because compress `-D` is real now. Baselines **490 → 502** default, **637 → 653**
+extensive. Both configurations build warning-free. **Suites, measured on the 8-GPU host before the
+version bump:** `-e` on the GPU build **652/0/1 of 653** in 13m12s (the trivial-park skip, unchanged);
+`-e` on `USE_NVCOMP=OFF` **509/0/115** in 2m7s — both "as expected on this host", and none of the new
+cells failed or skipped on either build. Not run after the bump, which changed only the version string.
 
 ## v0.17.70 — `-D` reads what `zstd -D` writes, and `--adapt -d --tar` stops hanging on a bad frame
 

@@ -39,13 +39,12 @@ was true of the common path and false of roughly thirty options.
   gzip aliases, `-0`, `--single-thread` and `-M` all work.
 - **Decompression fidelity:** verified byte-identical round-trips of zstd-produced output
   for `-19`, `--long=27`, `--no-check` and `--rsyncable`.
-- **Dictionaries — READ since v0.17.70, not yet WRITTEN.**
-  `gzstd -d -D dict file.zst` (and `-t`, `--tar`, stdin, `-dD`, `-D=`) decodes what `zstd -D`
-  wrote, byte-identical, CPU-only. Still missing: `-D` on compress warns and compresses without
-  the dictionary (Stage B), `--train*`/`--maxdict*` (Stage C), and `--patch-from` (both
-  directions). A `zstd --patch-from=OLD` patch already DECODES as `gzstd -d -D OLD` when OLD is
-  within the 32 MiB dictionary cap (measured: 8 MB reference, byte-identical); zstd's own
-  spelling `-d --patch-from=OLD` still warns and is ignored, and a larger reference is refused.
+- **Dictionaries — READ (v0.17.70) and WRITTEN (v0.17.71), CPU-only.**
+  `-D` compresses and decodes in every mode (`-t`, `--tar`, stdin, `-dD`, `-D=`, `--no-dictID`);
+  a gzstd `-D` frame is byte-identical to zstd's with the same libzstd. `-d --patch-from=OLD`
+  decodes zstd's patches (OLD as raw content, up to 2 GiB, window limit lifted). Still missing:
+  `--train*`/`--maxdict*`/`--dictID*` (Stage C), and CREATING patches (`--patch-from` on
+  compress warns). No zstd-written stream is now unreadable for want of a dictionary feature.
 - **Accepted but divergent** (each warns): `-r`/`--recursive` compresses nothing (exit 3
   since v0.15.69 — it used to exit 0 having done nothing), `--format=gzip` emits zstd,
   `--output-dir-flat`/`--output-dir-mirror` write nothing, `--no-check` still writes the
@@ -58,9 +57,8 @@ was true of the common path and false of roughly thirty options.
 
 | Gap | Size | Note |
 |---|---|---|
-| Dictionary compress (`-D` on compress; Stage B) | Medium | Decode shipped. The GPU compress path cannot take a dictionary, so `-D` must force CPU compress; the `--verify` checkers must then attach it too |
 | Dictionary training (`--train*`, `--maxdict*`, `--dictID*`; Stage C) | Medium | libzstd's ZDICT; today these warn and run an ordinary compression |
-| `--patch-from` (both directions) | Medium | Decode is mostly there: `-d -D OLD` reads a patch whose OLD is ≤ 32 MiB. Missing: the `-d --patch-from=OLD` spelling, references over 32 MiB (zstd lifts the cap for patches), long-mode windows past `-M`'s default, and creating patches |
+| Creating patches (`--patch-from` on compress) | Medium | Decode shipped. zstd's is ONE long-window frame referencing OLD (plus long-distance matching); gzstd's independent frames would each need OLD as their prefix and a window spanning it |
 | `-r` / `--output-dir-flat` / `--output-dir-mirror` | Small | Self-contained file-walking and output-path mapping |
 | `--long`, `--rsyncable`, `--no-check` | Small | Thin wrappers over zstd parameters gzstd already sets |
 | `--format=gzip\|xz\|lzma\|lz4` | High | Needs zlib/liblzma/liblz4; see Phase 8 |
