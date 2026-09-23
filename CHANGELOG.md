@@ -1,12 +1,115 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.69  
+**Covers:** v0.9.50 → v0.17.70  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.70 — `-D` reads what `zstd -D` writes, and `--adapt -d --tar` stops hanging on a bad frame
+
+### Dictionary decode
+
+ROADMAP rule 1 is "read anything zstd writes", and dictionary-compressed data was the one hard exception.
+gzstd accepted `-D FILE`, printed "accepted for zstd compatibility but ignored" and threw the path away,
+so even the **right** dictionary failed. Measured against zstd 1.5.7 on the same files:
+
+| command | zstd 1.5.7 | gzstd v0.17.69 | gzstd now |
+|---|---|---|---|
+| `-d -D dict f.zst` | decodes | exit 4 "Dictionary mismatch" | decodes, byte-identical |
+| `-dD dict f.zst` (bundled) | decodes | exit 2 "unknown option: -dD" | decodes |
+| `-D=dict -d f.zst` | decodes | exit 2 "unknown option" | decodes |
+| `-d f.zst` (no `-D`) | exit 1 "Dictionary mismatch" | exit 4, "re-run with --keep-going" | exit 4, names the dictionary ID the frame needs |
+| `-d -D wrong.dict f.zst` | exit 1 "Dictionary mismatch" | same as no `-D` | exit 4, names both IDs |
+
+The old message was worse than unhelpful: `--keep-going` decodes with the same missing dictionary, so
+following its advice cannot work.
+
+**What changed.** One `ZSTD_DDict` is built in `main` before any thread exists and shared read-only by
+every decoder. The helper every user-data decoder already called for `--memlimit` (renamed
+`apply_decode_options`) now also attaches the dictionary, so no path can get one and not the other.
+Decoders of gzstd's OWN output (the `--verify` checkers, the seek-index blob) deliberately do not. The
+reference survives `ZSTD_decompressDCtx`, `ZSTD_decompressStream` and a session-only reset; the only calls
+that drop it (`ZSTD_initDStream`, a parameter reset) appear only in the compress-side verifiers.
+
+- **Backend:** nvCOMP has no dictionary input, so `-D` makes decode CPU-only. A backend the user NAMED
+  (`--gpu-only`, `--hybrid`, `--gds-only`, `--direct-stage`) is refused with exit 2 rather than
+  overridden — the `--sliding-window` precedent.
+- **The file:** trained and raw-content dictionaries both work, as in zstd. Exit codes follow gzstd's
+  contract, not zstd's 31/32/34: unreadable → 3, not a regular file or over zstd's 32 MiB ceiling → 2, a
+  dictionary header that does not parse → 4. A `-D` value that looks like an option is refused, as zstd
+  refuses it, and so is an empty one: empty is the internal no-dictionary sentinel, so `-D ""` used to
+  drop the option silently (Codex review, round 1).
+- **Compression** with a dictionary is still not implemented: `-D` there warns and the output is
+  dictionary-free (a new cell checks that plain `zstd -d` reads it).
+- A mismatch with EQUAL IDs can only mean a decoder was not given the dictionary — a gzstd defect — and
+  the message says so instead of printing "needs ID N, but -D is ID N". Found by the mutation run below,
+  where that contradiction was exactly what the mutant printed.
+
+**Which decoders a dictionary frame can reach — measured, not assumed.** Each user-data decoder compiled
+into the CPU-only build was mutated in turn (dictionary detached from that decoder alone) and run against
+the reproduction and the new cells:
+
+| decoder | reached by | cells that fail when it loses the dictionary |
+|---|---|---|
+| CPU workers (`tl_dctx`) | frames carrying a content size, `--tar` of a `zstd -D` archive, `-t` | 9 |
+| `decompress_stream_from_file` | a FILE with no content size, a first frame > 256 MiB | 1 |
+| `decompress_from_buffer` | STDIN with no content size | 1 |
+| parallel-extract parse threads | a **foreign** seekable archive (t2sz-style), full extract | 1 |
+| foreign header-hop scan | a foreign seekable archive, full or selective extract | 3 |
+| decode pool (`decoder_loop`) | the same, under `--adapt` (the cell uses `GZSTD_FORCE_POOL`) | 1 |
+| `seek_feed` | a foreign seekable archive, selective extract | 1 |
+
+The last four rows were first written off as "only gzstd's own indexed archives, which carry no dictionary
+frames, so unreachable". Wrong: the seekable format is a standard one, and an archive another tool wrote
+with `-D` takes exactly those routes. Found by building one. The header-hop scan's mutant is the instructive
+one — it exits 0 with the right bytes, because a scan that cannot decode falls back to the serial walk —
+so those cells assert the route from `-v`, not just the output. The GPU decode pool's CPU-rescue context
+is unreachable under `-D` (CPU-only) and was not mutated.
+
+**Cells:** ten in the default run — the three plain routes, `--tar`, three foreign-seekable routes, both
+mismatch messages, and the `--hybrid` refusal — and eleven more in the `-e` zstd-compat section
+(spellings, `-t`, raw and `--no-dictID` dictionaries, the file-error exit codes, both sides of 32 MiB,
+`-D` followed by an option or an empty value, and compress). All twenty-one fail against v0.17.69, and each decoder's
+mutant fails at least one cell at suite fixture sizes. All run on both builds, so neither host delta
+changes.
+
+### `--adapt -d --tar` hung forever on any decode error — shipped, found while testing the above
+
+A corrupt archive under `gzstd --adapt -d --tar` printed its `gzstd: ERROR:` line and then **never exited**.
+Deterministic, not a race: 30 of 30 runs hung on v0.17.69, on gzstd-indexed, plain-`zstd` and foreign
+seekable archives alike, where the same archives without `--adapt` exit 4 in about 20 ms. Plain `-d
+--adapt` was unaffected. A script that set `--adapt` and hit a damaged archive waited forever.
+
+Found by a mutant: a pool decoder that lost the dictionary should have died with exit 4 and instead never
+exited, every thread idle in a futex wait. `gdb` (launching the program as its child, which `ptrace_scope=1` still permits) put the
+dying worker in `__run_exit_handlers → pthread_cond_destroy(g_adapt_ewgrow_cv)`. `die()` ends in
+`std::exit`, which destroys namespace-scope statics; the extract writer-grow condition variable was a plain
+static, and the Extractor's supervisor waits on it for the whole extraction. glibc's
+`pthread_cond_destroy` blocks until every waiter has left, and this one never would.
+
+The file already knew this hazard: three global CVs were deliberately leaked (`*new
+std::condition_variable`, never destroyed) with exactly that rationale in their comments. Two were not,
+and both are now: `g_adapt_ewgrow_cv`, the one that hung, and `g_gpu_bringup_cv`, which has the same shape
+but was not reproduced. Every other static CV and every global object that owns a thread was checked: the
+rest are leaked already, and `InputRetirer`'s destructor wakes and joins a thread that returns promptly.
+
+**One cell**, in the liveness section and always run: a corrupt gzstd tar archive must exit 4 under
+`--adapt` within 20 s, after a control run without `--adapt` proves the fixture really is corrupt. It
+fails (exit 124) against v0.17.69 and against a build that reverts only `g_adapt_ewgrow_cv`, and passes on
+both configurations with the fix.
+
+### Totals
+
+Baselines **479 → 490** default and **615 → 637** extensive (twenty-one dictionary cells plus the liveness
+cell; every one runs on both builds, so neither no-GPU delta changes). Both configurations build
+warning-free. **Suites, measured on the 8-GPU host:** `-e` on the GPU build **636/0/1 of 637** in 13m2s
+(the skip is the trivial-park cell this host cannot provoke, unchanged); `-e` on `USE_NVCOMP=OFF`
+**493/0/115** in 2m9s — both "as expected on this host", and all twenty-two new cells PASSED on both
+builds (none skipped). Codex (gpt-5.6-sol) reviewed the diff over two rounds: one LOW finding, adopted
+(the empty `-D ""` above), then SAFE TO COMMIT.
 
 ## v0.17.69 — the pre-tag round found a wrong result that predates the whole arc
 

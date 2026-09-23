@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.69";
+static constexpr const char * GZSTD_VERSION = "0.17.70";
 //
 // Architecture overview:
 //
@@ -2435,6 +2435,11 @@ struct Options {
   // window are rejected.  Compress: caps the in-flight RAM budget in
   // compute_throttle_budget.  0 = unlimited (zstd's default).
   size_t mem_limit_mib = 0;
+  // zstd-compat `-D FILE`: the dictionary to DECODE with (-d/-t, including
+  // --tar).  main() loads it into g_ddict once; every user-data decoder
+  // references it through apply_decode_options.  Compression with a
+  // dictionary is not implemented: parse_args warns and clears this there.
+  std::string dict_path;
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   // The batch cap as parse_args resolved it, snapshotted before --adapt seeds
@@ -3330,6 +3335,8 @@ static void print_help()
 "Operation:\n"
 "  -d                  decompress\n"
 "  -t                  test (verify integrity, no output)\n"
+"  -D FILE             decode with dictionary FILE (-d/-t only; implies\n"
+"                      --cpu-only).  Compressing with one is not supported.\n"
 "  -l                  list .zst frame info (Frames/Skips/Sizes/Ratio/Check);\n"
 "                      with --tar, list the archive contents (tar -tvf style)\n"
 "  -k                  keep input after success (default)\n"
@@ -3480,9 +3487,9 @@ static void print_help_long()
 "by any zstd implementation.\n"
 "\n"
 "Compatibility is NOT total: some zstd options are mapped, some are accepted\n"
-"and ignored silently, some warn, and dictionary/training options are not\n"
-"implemented at all.  See COMPATIBILITY OPTIONS near the end of this help for\n"
-"the exact classification of every one.\n"
+"and ignored silently, and some warn.  Dictionaries are READ (-D on -d/-t)\n"
+"but never written, and training is not implemented.  See COMPATIBILITY\n"
+"OPTIONS near the end of this help for the exact classification of every one.\n"
 "\n"
 "With no file arguments (or file `-`), gzstd reads from stdin and writes\n"
 "to stdout.  Pipes are fully supported:\n"
@@ -4441,6 +4448,18 @@ static void print_help_long()
 "     Useful on shared machines where the default `min(pipeline, RAM/2)`\n"
 "     is too generous; not a guarantee.\n"
 "\n"
+"  -D FILE, -D=FILE, --dict FILE, --dictionary FILE    [decompress/test]\n"
+"     Decode with the zstd dictionary FILE (zstd-compatible; the bundled\n"
+"     form -dD FILE works too, and the long forms also take =FILE).\n"
+"     Needed for data written by `zstd -D`.\n"
+"     A trained dictionary and raw content both work; a frame naming a\n"
+"     different dictionary ID is rejected with both IDs in the message.\n"
+"     FILE must be a regular file of at most 32 MiB, as in zstd.\n"
+"     Implies --cpu-only: nvCOMP cannot decode with a dictionary, so\n"
+"     --gpu-only, --hybrid, --gds-only and --direct-stage are refused.\n"
+"     On COMPRESSION -D warns and is ignored: gzstd does not write\n"
+"     dictionary-compressed data.\n"
+"\n"
 #ifdef HAVE_NVCOMP
 "============================================================\n"
 " GPU TUNING\n"
@@ -4647,7 +4666,8 @@ static void print_help_long()
 "     --keep (= -k), --force (= -f), --stdout / --to-stdout (= -c),\n"
 "     --verbose (= -v), --single-thread (= -T 1), -0 (default level),\n"
 "     -M / --memlimit / --memory, --mmap=on|off, --preallocate=on|off,\n"
-"     and bundled short flags such as -dc, -dkf, -dcf.\n"
+"     -D FILE / -D=FILE on -d and -t (decode with a dictionary),\n"
+"     and bundled short flags such as -dc, -dkf, -dcf, -dD FILE.\n"
 "\n"
 "  PARTIALLY MAPPED:\n"
 "     --fast=N     selects level 1; N is ignored (N>1 warns).\n"
@@ -4666,8 +4686,9 @@ static void print_help_long()
 "  ACCEPTED WITH A WARNING, THEN IGNORED:\n"
 "     --long, --patch-from, --rsyncable, --exclude-compressed,\n"
 "     --[no-]pass-through, -r / --recursive, --filelist, --output-dir-flat,\n"
-"     --output-dir-mirror, --trace, -D / --dict / --dictionary, -B,\n"
-"     -b# / -e# / -i#, -S, --priority=, --format=gzip|xz|lzma|lz4\n"
+"     --output-dir-mirror, --trace, -B, -b# / -e# / -i#, -S,\n"
+"     --priority=, --format=gzip|xz|lzma|lz4, and -D on COMPRESSION\n"
+"     (the output is written without the dictionary)\n"
 "     DICTIONARY TRAINING IS NOT IMPLEMENTED: --train, every --train-*,\n"
 "     --maxdict*, and --dictID* warn and then continue as an ORDINARY\n"
 "     compression run.  No dictionary is produced.\n"
@@ -5112,8 +5133,15 @@ static std::atomic<int>  g_adapt_rd_ctx_chunk{0};   // geometry the settled coun
 static std::atomic<int>  g_adapt_rd_ctx_threads{0};
 static std::atomic<int>  g_adapt_rd_settled{0};
 static std::atomic<int>  g_adapt_rd_prior{0};
-static std::mutex              g_adapt_ewgrow_mtx;     // guards the target->supervisor wake
-static std::condition_variable g_adapt_ewgrow_cv;
+// Leaked, never destroyed, like g_adapt_scale_cv: the Extractor's supervisor
+// waits on this CV for the WHOLE extraction, so when any thread dies (die ->
+// std::exit) it is parked here, and std::exit runs static destructors.
+// glibc's pthread_cond_destroy blocks until every waiter has left -- this one
+// never will.  As a plain static, every decode error in `--adapt -d --tar`
+// printed its ERROR and then hung forever instead of exiting 4 (30 of 30
+// runs, v0.17.69 and earlier).
+static std::mutex              & g_adapt_ewgrow_mtx = *new std::mutex;  // guards the target->supervisor wake
+static std::condition_variable & g_adapt_ewgrow_cv  = *new std::condition_variable;
 
 // -d --tar writer-pool WORKLOAD CLASS.
 //
@@ -9792,8 +9820,12 @@ struct PerfCounters {
 // house rules forbid ("no sleep/poll loops in scheduling paths — timed condition
 // variable waits are used deliberately, even where the measured win is ~0").
 // Signalled by register_gpu_stream and by every terminal GPU-failure bump.
-static std::mutex              g_gpu_bringup_mx;
-static std::condition_variable g_gpu_bringup_cv;
+// Leaked, never destroyed, for the reason g_adapt_ewgrow_cv gives: a thread
+// that dies while the pipeline waits here would otherwise hang std::exit in
+// pthread_cond_destroy.  Not reproduced for this one -- converted because it is
+// the same hazard, and the only other static CV that was not already leaked.
+static std::mutex              & g_gpu_bringup_mx = *new std::mutex;
+static std::condition_variable & g_gpu_bringup_cv = *new std::condition_variable;
 // Called with no other lock held.  The empty critical section fences against a
 // waiter that has evaluated its predicate but not yet parked.
 static inline void gpu_bringup_signal() {
@@ -12447,6 +12479,94 @@ static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, i
   return csz;
 }
 
+// ---- -D: the run's decode dictionary ----------------------------------------
+// Built ONCE in main (load_decode_dictionary), before any decoder thread
+// exists, and never freed: it lives exactly as long as the process, like the
+// other run-wide globals.  A ZSTD_DDict is read-only once built, so every
+// decoder in every thread references this one object.  nullptr = no -D.
+static ZSTD_DDict * g_ddict = nullptr;
+static unsigned     g_ddict_id = 0;      // 0 = raw-content dictionary (no ID)
+static std::string  g_ddict_path;        // for messages only
+
+// zstd's own ceiling for a -D file (DICTSIZE_MAX in programs/fileio.c).  The
+// same number, so a dictionary one tool accepts the other does too.
+static constexpr uint64_t DICT_FILE_MAX = 32ull * ONE_MIB;
+
+static void load_decode_dictionary(const Options & opt)
+{
+  if (opt.dict_path.empty()) return;
+  const std::string & p = opt.dict_path;
+  // Exit codes follow gzstd's contract, not zstd's (which exits 31/32/34 for
+  // these): a file that cannot be read is an I/O error, like a missing input;
+  // one that is not a dictionary FILE at all is a usage error.
+  FILE * f = std::fopen(p.c_str(), "rb");
+  if (!f) die_io("cannot open dictionary: " + p + " (" + std::strerror(errno) + ")");
+  struct stat st {};
+  if (::fstat(fileno(f), &st) != 0)
+    die_io("cannot stat dictionary: " + p + " (" + std::strerror(errno) + ")");
+  // A FIFO or device would be read to EOF with no size to check first, and
+  // zstd refuses them for the same reason.
+  if (!S_ISREG(st.st_mode)) die_usage("dictionary must be a regular file: " + p);
+  if ((uint64_t)st.st_size > DICT_FILE_MAX)
+    die_usage("dictionary " + p + " is too large (" + std::to_string((uint64_t)st.st_size)
+              + " bytes; the limit is " + std::to_string(DICT_FILE_MAX) + ", as in zstd)");
+  std::vector<char> buf((size_t)st.st_size);
+  if (!buf.empty() && std::fread(buf.data(), 1, buf.size(), f) != buf.size())
+    die_io("cannot read dictionary: " + p + (std::ferror(f) ? " (read error)" : " (file shrank while reading)"));
+  std::fclose(f);
+  // ZSTD_createDDict copies the bytes and accepts both forms zstd does: a
+  // trained dictionary (magic + entropy tables + content, which carries an ID)
+  // and raw content (no magic, ID 0).  It fails on a file that HAS the magic
+  // but whose tables do not parse -- a damaged dictionary is a damaged input.
+  g_ddict = ZSTD_createDDict(buf.data(), buf.size());
+  if (!g_ddict)
+    die_data("cannot load dictionary " + p + ": its zstd dictionary header is corrupt");
+  g_ddict_id = ZSTD_getDictID_fromDDict(g_ddict);
+  g_ddict_path = p;
+  if (opt.verbosity >= V_VERBOSE) {
+    std::string line = "[DICT] " + p + ": " + std::to_string(buf.size()) + " bytes, ";
+    line += g_ddict_id ? "dictionary ID " + std::to_string(g_ddict_id) : std::string("raw content (no ID)");
+    vlog(V_VERBOSE, opt, line + "\n");
+  }
+}
+
+// What a decode error means when it is a dictionary problem.  Returns "" for
+// every other error.  A frame that names a dictionary fails without it (or
+// with a different one) as ZSTD_error_dictionary_wrong, whose whole text is
+// "Dictionary mismatch" -- and the decode sites used to follow that with
+// "re-run with --keep-going", which cannot help: recovery decodes with the same
+// missing dictionary.  `frame` is the start of the failing frame when the
+// caller has it; null or a partial header only leaves the frame's ID out.
+static std::string dict_error_hint(size_t err, const void * frame, size_t len)
+{
+  if (ZSTD_getErrorCode(err) != ZSTD_error_dictionary_wrong) return "";
+  const unsigned want = frame ? ZSTD_getDictID_fromFrame(frame, len) : 0;
+  const std::string need = want ? "dictionary ID " + std::to_string(want)
+                                : std::string("a dictionary");
+  if (!g_ddict)
+    return "\n  (this data was compressed with " + need
+         + "; pass that dictionary with -D FILE)";
+  // zstd reports a mismatch only when the IDs differ, so equal IDs mean this
+  // decoder never had the dictionary attached -- a gzstd defect.  Printing
+  // "needs ID N, but -D is ID N" would state a contradiction as the diagnosis.
+  if (want && want == g_ddict_id)
+    return "\n  (internal error: the -D dictionary (ID " + std::to_string(want)
+         + ") is the right one, but this decoder was not given it -- please report this)";
+  return "\n  (this data needs " + need + ", but -D " + g_ddict_path + " is "
+       + (g_ddict_id ? "dictionary ID " + std::to_string(g_ddict_id)
+                     : std::string("raw content with no ID"))
+       + ")";
+}
+
+// The hint every user-data decode error ends with: the dictionary explanation
+// when that is the problem, otherwise the --keep-going pointer.
+static std::string decode_error_hint(size_t err, const void * frame, size_t len)
+{
+  std::string h = dict_error_hint(err, frame, len);
+  if (!h.empty()) return h;
+  return "\n  (re-run with --keep-going to recover what is readable and report the damage)";
+}
+
 // Apply --memlimit to a decompression context via ZSTD_d_windowLogMax.
 // zstd's decompressor refuses to allocate window buffers larger than 2^wlog,
 // so a user who passes `-M 50` gets streams with >64 MiB windows rejected
@@ -12465,6 +12585,27 @@ static void apply_mem_limit_to_dctx(ZSTD_DCtx * dctx, const Options & opt)
   if (ZSTD_isError(st) && opt.verbosity >= V_ERROR) {
     std::fprintf(stderr, "gzstd: warning: could not apply --memlimit (%s)\n",
                  ZSTD_getErrorName(st));
+  }
+}
+
+// Configure a context that decodes USER data: --memlimit (above) and the -D
+// dictionary.  Every such decoder calls this right after creating its context,
+// which is what keeps the paths from drifting -- one place attaches both.
+// Contexts that decode gzstd's OWN output (the --verify checkers, the
+// seek-index blob) deliberately do not: nothing gzstd writes uses a dictionary.
+//
+// The reference survives everything these paths do next: ZSTD_decompressDCtx,
+// ZSTD_decompressStream and ZSTD_DCtx_reset(session_only) all keep it.  Only
+// ZSTD_initDStream and a parameter reset drop it, and no user-data decoder
+// calls either.
+static void apply_decode_options(ZSTD_DCtx * dctx, const Options & opt)
+{
+  if (!dctx) return;
+  apply_mem_limit_to_dctx(dctx, opt);
+  if (g_ddict) {
+    const size_t st = ZSTD_DCtx_refDDict(dctx, g_ddict);
+    if (ZSTD_isError(st))
+      die(std::string("could not attach the -D dictionary to a decoder: ") + ZSTD_getErrorName(st));
   }
 }
 
@@ -12795,7 +12936,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
   std::vector<char> outbuf(chunk_bytes);
   ZSTD_DCtx * dctx = ZSTD_createDCtx();
   if (!dctx) die("failed to create ZSTD_DCtx");
-  apply_mem_limit_to_dctx(dctx, opt);
+  apply_decode_options(dctx, opt);
 
   ZSTD_inBuffer zin { input.data(), input.size(), 0 };
   ZSTD_outBuffer zout { outbuf.data(), outbuf.size(), 0 };
@@ -12813,13 +12954,12 @@ static void decompress_from_buffer(const std::vector<char> & input,
   }
 
   size_t ret = 0;
+  size_t frame_at = 0;   // where the frame in progress starts (for the error hint)
   while (zin.pos < zin.size) {
-    const size_t frame_in_at = zin.pos;
     ret = ZSTD_decompressStream(dctx, &zout, &zin);
     if (ZSTD_isError(ret))
       die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
-               + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
-    (void)frame_in_at;
+               + decode_error_hint(ret, input.data() + frame_at, input.size() - frame_at));
     if (zout.pos > 0) sck.bytes(outbuf.data(), zout.pos);
     if (zout.pos > 0) {
       if (g_tar_decomp_sink) {
@@ -12845,6 +12985,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
       // the bytes that follow -- its header descriptor says whether it carries a
       // checksum of its own.
       sck.frame_end(fb_frames++);
+      frame_at = zin.pos;   // one call never crosses a frame boundary
       if (zin.pos < zin.size)
         sck.head((const unsigned char *)input.data() + zin.pos, input.size() - zin.pos);
     }
@@ -12876,7 +13017,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   std::vector<char> outbuf(IO_CHUNK);
   ZSTD_DCtx * dctx = ZSTD_createDCtx();
   if (!dctx) die("failed to create ZSTD_DCtx");
-  apply_mem_limit_to_dctx(dctx, opt);
+  apply_decode_options(dctx, opt);
 
   size_t ret = 0;  // last decompressStream hint; >0 at EOF means truncated
   uint64_t total_in_bytes = 0;   // zero here means "not a zstd stream at all"
@@ -12927,8 +13068,15 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
           break;
         }
         ZSTD_freeDCtx(dctx);
+        // head_n == 0: the failing frame began with this call's input (a call
+        // never crosses a frame boundary).  Otherwise its first bytes are in
+        // head -- at most 8, which may stop short of the dictionary ID; the
+        // hint then just leaves the ID out.
+        const bool fresh = (head_n == 0);
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
-               + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
+               + decode_error_hint(ret, fresh ? (const void *)(inbuf.data() + consumed_from)
+                                              : (const void *)head,
+                                   fresh ? n - consumed_from : head_n));
       }
       // Bytes this call consumed belong to the frame that was in progress.
       for (size_t i = consumed_from; i < zin.pos; ++i) {
@@ -14298,7 +14446,7 @@ static void cpu_decomp_worker(
   if (!tl_dctx) {
     tl_dctx = ZSTD_createDCtx();
     if (!tl_dctx) die("failed to create ZSTD_DCtx");
-    apply_mem_limit_to_dctx(tl_dctx, *opt);
+    apply_decode_options(tl_dctx, *opt);
   }
 
   // Per-thread decompress-buffer pool.  BOUNDED size; never grows past
@@ -14571,7 +14719,7 @@ static void cpu_decomp_worker(
         size_t ret = ZSTD_decompressStream(tl_dctx, &zout, &zin);
         if (ZSTD_isError(ret))
           die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
-               + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
+               + decode_error_hint(ret, t.ptr(), t.len()));
         actual += zout.pos;
         if (m && zin.pos > prev_zin_pos) {
           m->read_bytes.fetch_add(zin.pos - prev_zin_pos, std::memory_order_relaxed);
@@ -14635,7 +14783,7 @@ static void cpu_decomp_worker(
                                    t.ptr(), t.len());
       if (ZSTD_isError(actual))
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(actual)
-                 + "\n  (re-run with --keep-going to recover what is readable and report the damage)");
+                 + decode_error_hint(actual, t.ptr(), t.len()));
       out_buf->resize(actual);
       // A frame carrying its own checksum was just verified by zstd itself.  One
       // WITHOUT is verified against the seek table's checksum, which for such an
@@ -20523,7 +20671,7 @@ public:
     auto decoder_loop = [&](std::atomic<bool> * retire) {
       ZSTD_DCtx * dctx = ZSTD_createDCtx();
       if (!dctx) die("failed to create ZSTD_DCtx");
-      apply_mem_limit_to_dctx(dctx, dopt);
+      apply_decode_options(dctx, dopt);
       for (;;) {
         RItem it;
         {
@@ -20673,7 +20821,7 @@ public:
             // or a claimed frame is too large for the GPU (> GPU_SUBCHUNK_MAX).
             ZSTD_DCtx * rescue_dctx = ZSTD_createDCtx();
             if (!rescue_dctx) die("failed to create ZSTD_DCtx");
-            apply_mem_limit_to_dctx(rescue_dctx, dopt);
+            apply_decode_options(rescue_dctx, dopt);
             std::vector<RItem> claimed;        // pre-read buffers from the decode queue
             std::vector<const char *> comps;   // eligible frames' host buffers
             std::vector<size_t> cszs, uszs;
@@ -20896,7 +21044,7 @@ public:
         // the pool awaiting in-order consumption.  Both cursors are thread-local.
         auto in_dctx = std::shared_ptr<ZSTD_DCtx>(ZSTD_createDCtx(), ZSTD_freeDCtx);
         if (!in_dctx) die("failed to create ZSTD_DCtx");
-        apply_mem_limit_to_dctx(in_dctx.get(), dopt);
+        apply_decode_options(in_dctx.get(), dopt);
         std::vector<char> in_comp;
         size_t next_dispatch = g.f0, next_consume = g.f0;
         // Hoisted to worker scope so the post-parse drain below can reclaim
@@ -23379,7 +23527,7 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
   // and the actual decompressed length.
   ZSTD_DCtx * dctx = ZSTD_createDCtx();
   if (!dctx) return false;                      // OOM: fall back to the walk
-  apply_mem_limit_to_dctx(dctx, opt);           // honor --memlimit like every decode path
+  apply_decode_options(dctx, opt);           // --memlimit and -D, like every decode path
   std::vector<char> fbuf, comp;
   size_t fcur = SIZE_MAX;
   auto load_frame = [&](size_t k) -> bool {
@@ -23661,8 +23809,8 @@ static FrameBuf decompress_seek_frame(const char * comp, size_t csz, size_t usz,
   size_t dz = ZSTD_decompressDCtx(dctx, fb->data(), usz, comp, csz);
   if (ZSTD_isError(dz) || dz != usz)
     die_data("seek-extract: frame " + std::to_string(k) + ": "
-             + (ZSTD_isError(dz) ? ZSTD_getErrorName(dz)
-                                 : "size mismatch vs member index"));
+             + (ZSTD_isError(dz) ? ZSTD_getErrorName(dz) + dict_error_hint(dz, comp, csz)
+                                 : std::string("size mismatch vs member index")));
   return fb;
 }
 
@@ -23703,7 +23851,7 @@ static void seek_feed(FILE * in, const SeekPlan & plan, FrameSink * sink,
     auto worker = [&] {
       ZSTD_DCtx * dctx = ZSTD_createDCtx();
       if (!dctx) die("failed to create ZSTD_DCtx");
-      apply_mem_limit_to_dctx(dctx, opt);   // honor --memlimit like every decode path
+      apply_decode_options(dctx, opt);   // --memlimit and -D, like every decode path
       std::vector<char> comp;
       size_t i;
       while ((i = next.fetch_add(1)) < nfr) {
@@ -36313,6 +36461,8 @@ static int gzstd_main(int argc, char ** argv)
 #endif
 
   Options opt = parse_args(argc, argv);
+  // -D: build the one shared dictionary before any decoder (or thread) exists.
+  load_decode_dictionary(opt);
 
 #if defined(HAVE_NVCOMP) && !defined(_WIN32)
   // Before any thread: it may setenv (see gz_cufile_log_setup).
@@ -39502,15 +39652,22 @@ static void apply_backend_defaults(Options & opt)
 // zstd/gzip compat: is `a` a bundled group of no-arg short flags like "-dcf"?
 // True only when every char after a single leading '-' is one of the no-arg
 // operation flags {d,t,k,f,c}.  Anything containing a value-taking flag
-// (-o/-T/-M/-B/-D), a digit (numeric levels, -M#, -b#), a long option ("--…"),
+// (-o/-T/-M/-B), a digit (numeric levels, -M#, -b#), a long option ("--…"),
 // or the repeat flags (-vv/-vvv/-qq — v/q aren't in the set) returns false and
 // is left for the exact-match loop to handle unchanged.  v/q are intentionally
 // excluded so their repeat semantics survive; bundle verbosity flags separately.
+//
+// The one value flag allowed is a TRAILING D: zstd reads `-dD DICT` and
+// `-dcD DICT` as the group plus `-D DICT`, taking the NEXT argument as the
+// dictionary, and scripts written for zstd spell it that way.  Expanding the
+// group leaves `-D` last, so its branch consumes the next argument unchanged.
+// D anywhere else (`-Dd`) is not a group; zstd rejects that spelling too.
 static bool is_bundleable_short_group(const std::string & a)
 {
   if (a.size() < 3 || a[0] != '-' || a[1] == '-') return false;
   for (size_t i = 1; i < a.size(); ++i) {
     char c = a[i];
+    if (c == 'D' && i + 1 == a.size()) continue;
     if (c != 'd' && c != 't' && c != 'k' && c != 'f' && c != 'c') return false;
   }
   return true;
@@ -40088,13 +40245,27 @@ static Options parse_args(int argc, char ** argv)
     else if (eat_zstd_value_opt("trace", i, argc, argv)) {
       warn_ignored_zstd_opt("--trace");
     }
-    // Dictionary flags (all warn-no-op)
+    // Dictionary: zstd's `-D FILE` and `-D=FILE` (the bundled `-dD FILE` was
+    // expanded to `-d -D FILE` above), plus gzstd's own --dict/--dictionary
+    // aliases, which zstd does not have.  Only the path is recorded here: the
+    // mode is not final until the whole line is read, and what -D means
+    // depends on it — see the dictionary block after this loop.
     else if (a == "-D" || a == "--dict" || a == "--dictionary") {
-      warn_ignored_zstd_opt(a, "dictionary compression not supported");
-      if (i + 1 < argc) ++i;
+      if (i + 1 >= argc) die_usage("missing value for " + a);
+      // Empty is the "no dictionary" sentinel, so `-D ""` would silently drop
+      // the option; refuse it as -D= already does.
+      if (argv[i + 1][0] == '\0') die_usage("missing value for " + a);
+      // zstd refuses a following argument that looks like an option, so
+      // `-D -d file.zst` is an error, not a dictionary named "-d".
+      if (argv[i + 1][0] == '-')
+        die_usage(a + " needs a dictionary file, not the option '"
+                  + std::string(argv[i + 1]) + "'");
+      opt.dict_path = argv[++i];
     }
-    else if (a.rfind("--dict=", 0) == 0 || a.rfind("--dictionary=", 0) == 0) {
-      warn_ignored_zstd_opt(a, "dictionary compression not supported");
+    else if (a.rfind("-D=", 0) == 0 || a.rfind("--dict=", 0) == 0
+          || a.rfind("--dictionary=", 0) == 0) {
+      opt.dict_path = a.substr(a.find('=') + 1);
+      if (opt.dict_path.empty()) die_usage("missing value for " + a.substr(0, a.find('=')));
     }
     // Training mode (warn; zstd exits early with these — gzstd will proceed
     // as normal compression, producing no dictionary)
@@ -40254,6 +40425,35 @@ static Options parse_args(int argc, char ** argv)
     vlog(V_VERBOSE, opt, "note: GPU tuning flags are ignored in this CPU-only "
                          "build (compiled without nvCOMP)\n");
 #endif
+
+  if (!opt.dict_path.empty()) {
+    if (opt.mode == Mode::COMPRESS) {
+      // Compressing WITH a dictionary is not implemented.  Say so and drop it:
+      // loading a file the run will not use would only add ways to fail.
+      warn_ignored_zstd_opt("-D", "compressing with a dictionary is not "
+                                  "supported; only -d/-t use it");
+      opt.dict_path.clear();
+    } else {
+      // nvCOMP has no dictionary input, so decoding with one is CPU work.  A
+      // backend the user NAMED is refused rather than overridden (the
+      // --sliding-window precedent); otherwise -D picks CPU-only, and
+      // backend_user_set keeps apply_backend_defaults from undoing it.
+      if (opt.gds_only)
+        die_usage("-D is incompatible with --gds-only (nvCOMP cannot decode with a dictionary)");
+      if (opt.direct_stage)
+        die_usage("-D is incompatible with --direct-stage (nvCOMP cannot decode with a dictionary)");
+      if (opt.gpu_only)
+        die_usage("-D is incompatible with --gpu-only (nvCOMP cannot decode with a dictionary)");
+      if (opt.hybrid)
+        die_usage("-D is incompatible with --hybrid (nvCOMP cannot decode with a dictionary)");
+#ifdef HAVE_NVCOMP
+      if (!opt.cpu_only)
+        vlog(V_VERBOSE, opt, "note: -D implies --cpu-only (nvCOMP cannot decode with a dictionary)\n");
+#endif
+      opt.cpu_only = true;
+      opt.backend_user_set = true;
+    }
+  }
 
   if (opt.sliding_window) {
     if (opt.mode != Mode::COMPRESS)

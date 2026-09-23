@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=479
-$EXTENSIVE && EXPECTED_TESTS=615
+EXPECTED_TESTS=490
+$EXTENSIVE && EXPECTED_TESTS=637
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -723,6 +723,13 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # adds two more: filesystem-alias rejection in the full-parallel planner and a
 # deterministic ordinary-writer -> GNU-sparse duplicate (477 -> 479,
 # 613 -> 615).  All run with or without GPU/GDS, so neither host delta changes.
+# v0.17.70 -D decode: ten always-run cells in "Dictionary decode (-D)" and
+# eleven more in the -e zstd-compat section (479 -> 489, 615 -> 636).  Every one
+# runs on both builds -- the backend-refusal cell uses --hybrid, which a
+# USE_NVCOMP=OFF binary parses too -- so neither host delta changes; a host
+# without the zstd CLI or python3 skips all twenty-one.  v0.17.70 also adds one
+# always-run liveness cell, the --adapt -d --tar exit hang (489 -> 490,
+# 636 -> 637); it runs on both builds, so again no host delta changes.
 # DERIVED until the next suite pair confirms it.
 EXPECTED_NOGPU_DELTA=118
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=144   # MEASURED 2026-09-21 (607 - 463)
@@ -1276,6 +1283,170 @@ else
   skip "gzstd ${SYM_ARROW} zstd" "zstd not installed"
   skip "zstd ${SYM_ARROW} gzstd" "zstd not installed"
   skip "pipe interop" "zstd not installed"
+fi
+
+# ============================================================
+# 16b. Dictionary decode (-D)
+# ============================================================
+# ROADMAP rule 1 -- read anything zstd writes -- had one hard exception until
+# v0.17.70: data written by `zstd -D`.  gzstd parsed -D and threw the path away,
+# so even the RIGHT dictionary exited 4 "Dictionary mismatch", and the message
+# recommended --keep-going, which decodes with the same missing dictionary.
+#
+# Seven decoders can receive a dictionary frame, and every one was
+# mutation-checked by detaching the dictionary from it alone -- each fails at
+# least one cell below:
+#   frames with content sizes (and --tar)  -> the CPU workers
+#   a FILE with no content size            -> decompress_stream_from_file
+#   STDIN with no content size             -> decompress_from_buffer
+#   a FOREIGN seekable archive, extracted  -> header-hop scan, inline parse
+#                                             decoders, decode pool, seek_feed
+# The foreign row was first written off as "gzstd's own archives only, so
+# unreachable by dictionary frames".  It is not: t2sz-style archives from other
+# tools take those routes, and the scan's mutant exits 0 with correct bytes by
+# falling back to the serial walk -- only the -v route assertion catches it.
+# Every cell here runs on every build (the
+# refusal cell uses --hybrid, which a USE_NVCOMP=OFF binary also parses), so no
+# host delta changes; only a host without zstd skips them.  The fixtures in
+# $TMPDIR/dict are reused by the -e cells in the zstd-compat section.
+section "Dictionary decode (-D)"
+
+DICTD="$TMPDIR/dict"
+if command -v zstd &>/dev/null && command -v python3 &>/dev/null; then
+  mkdir -p "$DICTD/s"
+  for i in $(seq 1 200); do
+    printf '{"id":%d,"name":"user%d","email":"user%d@example.com","role":"member","active":true}\n' \
+      "$i" "$i" "$i" > "$DICTD/s/$i.json"
+  done
+  # --dictID pins both IDs, so the messages can be matched exactly.
+  zstd -q -f --train "$DICTD"/s/*.json --maxdict=4096 --dictID=1111 -o "$DICTD/a.dict" 2>/dev/null
+  zstd -q -f --train "$DICTD"/s/*.json --maxdict=4096 --dictID=2222 -o "$DICTD/b.dict" 2>/dev/null
+  awk 'BEGIN { for (i = 1; i <= 50000; i++)
+         printf "{\"id\":%d,\"name\":\"user%d\",\"email\":\"user%d@example.com\",\"role\":\"member\",\"active\":true}\n", i, i, i * 7 }' \
+    > "$DICTD/body.json"
+  # Four frames, each carrying its content size -> the CPU workers.
+  split -n 4 -d "$DICTD/body.json" "$DICTD/part."
+  : > "$DICTD/multi.zst"
+  for p in "$DICTD"/part.*; do zstd -q -c -D "$DICTD/a.dict" "$p" >> "$DICTD/multi.zst"; done
+  # Compressed through a pipe, so the frame has NO content size.
+  zstd -q -c -D "$DICTD/a.dict" < "$DICTD/body.json" > "$DICTD/nosize.zst"
+
+  run_test "$GZSTD" -q -d -f -D "$DICTD/a.dict" "$DICTD/multi.zst" -o "$DICTD/multi.out" 2>"$DICTD/err"
+  [[ $LAST_RC -eq 0 ]] && files_match "$DICTD/body.json" "$DICTD/multi.out" \
+    && pass "zstd -D ${SYM_ARROW} gzstd -d -D (4 frames, CPU workers)" \
+    || fail "zstd -D ${SYM_ARROW} gzstd -d -D (4 frames, CPU workers)" \
+            "rc=$LAST_RC or mismatch: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+
+  run_test "$GZSTD" -q -d -f -D "$DICTD/a.dict" "$DICTD/nosize.zst" -o "$DICTD/nosize.out" 2>"$DICTD/err"
+  [[ $LAST_RC -eq 0 ]] && files_match "$DICTD/body.json" "$DICTD/nosize.out" \
+    && pass "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, file)" \
+    || fail "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, file)" \
+            "rc=$LAST_RC or mismatch: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+
+  t0=$(now_ms); rc=0
+  "$GZSTD" -q -d -D "$DICTD/a.dict" < "$DICTD/nosize.zst" > "$DICTD/stdin.out" 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ $rc -eq 0 ]] && files_match "$DICTD/body.json" "$DICTD/stdin.out" \
+    && pass "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, stdin)" \
+    || fail "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, stdin)" \
+            "rc=$rc or mismatch: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+
+  tar cf "$DICTD/s.tar" -C "$DICTD" s 2>/dev/null
+  zstd -q -f -D "$DICTD/a.dict" "$DICTD/s.tar" -o "$DICTD/s.tar.zst"
+  rm -rf "$DICTD/sx"; mkdir -p "$DICTD/sx"
+  run_test "$GZSTD" -q -d --tar -D "$DICTD/a.dict" -C "$DICTD/sx" "$DICTD/s.tar.zst" 2>"$DICTD/err"
+  [[ $LAST_RC -eq 0 ]] && diff -r "$DICTD/s" "$DICTD/sx/s" >/dev/null 2>&1 \
+    && pass "-d --tar -D extracts a zstd -D archive" \
+    || fail "-d --tar -D extracts a zstd -D archive" \
+            "rc=$LAST_RC or tree differs: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+
+  # A THIRD-PARTY seekable archive (t2sz-style: tar chunked into frames plus a
+  # spec seek table, no gzstd index) whose frames were compressed with -D.  This
+  # is what carries dictionary frames into the decoders gzstd otherwise feeds
+  # only its own archives: the foreign header-hop scan, the parallel-extract
+  # decoders and seek-extract.  The scan FALLS BACK to the serial walk when a
+  # frame will not decode, which still extracts the right bytes -- so each cell
+  # asserts the ROUTE from -v as well, or a decoder that lost the dictionary
+  # would pass as a slower run.
+  python3 - "$DICTD/s.tar" "$DICTD/a.dict" "$DICTD/fs.tar.zst" <<'PYEOF' 2>/dev/null
+import struct, subprocess, sys
+d = open(sys.argv[1], 'rb').read(); out = b''; ents = []
+for i in range(0, len(d), 32768):
+    c = subprocess.run(['zstd', '-q', '-c', '-D', sys.argv[2]], input=d[i:i+32768],
+                       capture_output=True, check=True).stdout
+    ents.append((len(c), len(d[i:i+32768]))); out += c
+tbl = struct.pack('<II', 0x184D2A5E, len(ents) * 8 + 9)
+for cz, dz in ents: tbl += struct.pack('<II', cz, dz)
+tbl += struct.pack('<IBI', len(ents), 0, 0x8F92EAB1)
+open(sys.argv[3], 'wb').write(out + tbl)
+PYEOF
+  rm -rf "$DICTD/fx"; mkdir -p "$DICTD/fx"
+  run_test "$GZSTD" -v -d --tar -D "$DICTD/a.dict" -C "$DICTD/fx" "$DICTD/fs.tar.zst" 2>"$DICTD/err"
+  [[ $LAST_RC -eq 0 ]] && grep -q "parallel-extract:" "$DICTD/err" \
+    && diff -r "$DICTD/s" "$DICTD/fx/s" >/dev/null 2>&1 \
+    && pass "foreign seekable -D archive: parallel extract engaged" \
+    || fail "foreign seekable -D archive: parallel extract engaged" \
+            "rc=$LAST_RC: $(grep -E '\[TAR\]|ERROR' "$DICTD/err" | head -2 | tr '\n' ' ')"
+  # The decode pool is a third set of decoders on the same route, engaged only
+  # under --adapt; GZSTD_FORCE_POOL reaches it without the governor.
+  rm -rf "$DICTD/fp"; mkdir -p "$DICTD/fp"
+  GZSTD_FORCE_POOL=1 run_test "$GZSTD" -v -d --tar -D "$DICTD/a.dict" -C "$DICTD/fp" "$DICTD/fs.tar.zst" 2>"$DICTD/err"
+  [[ $LAST_RC -eq 0 ]] && grep -q "decode pool: forced on" "$DICTD/err" \
+    && diff -r "$DICTD/s" "$DICTD/fp/s" >/dev/null 2>&1 \
+    && pass "foreign seekable -D archive: decode pool engaged" \
+    || fail "foreign seekable -D archive: decode pool engaged" \
+            "rc=$LAST_RC: $(grep -E 'decode pool|ERROR' "$DICTD/err" | head -2 | tr '\n' ' ')"
+  rm -rf "$DICTD/fy"; mkdir -p "$DICTD/fy"
+  run_test "$GZSTD" -v -d --tar -D "$DICTD/a.dict" -C "$DICTD/fy" "$DICTD/fs.tar.zst" s/117.json 2>"$DICTD/err"
+  [[ $LAST_RC -eq 0 ]] && grep -q "seek-extract: 1 of" "$DICTD/err" \
+    && cmp -s "$DICTD/s/117.json" "$DICTD/fy/s/117.json" \
+    && pass "foreign seekable -D archive: seek-extract engaged" \
+    || fail "foreign seekable -D archive: seek-extract engaged" \
+            "rc=$LAST_RC: $(grep -E '\[TAR\]|ERROR' "$DICTD/err" | head -2 | tr '\n' ' ')"
+
+  # Without -D: name the dictionary the frame needs, and do NOT send the user to
+  # --keep-going, which cannot decode it either.
+  t0=$(now_ms); rc=0
+  "$GZSTD" -d -c "$DICTD/multi.zst" >/dev/null 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 4 ]] && grep -q "compressed with dictionary ID 1111; pass that dictionary with -D" "$DICTD/err" \
+     && ! grep -q -- "--keep-going" "$DICTD/err"; then
+    pass "-d without -D: exit 4 names dictionary ID, no --keep-going advice"
+  else
+    fail "-d without -D: exit 4 names dictionary ID, no --keep-going advice" \
+         "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  fi
+
+  t0=$(now_ms); rc=0
+  "$GZSTD" -d -c -D "$DICTD/b.dict" "$DICTD/multi.zst" >/dev/null 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 4 ]] && grep -q "needs dictionary ID 1111, but -D .*b.dict is dictionary ID 2222" "$DICTD/err"; then
+    pass "-d with the wrong -D: exit 4 names both IDs"
+  else
+    fail "-d with the wrong -D: exit 4 names both IDs" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  fi
+
+  # nvCOMP has no dictionary input: a named GPU backend is refused, not
+  # silently replaced.
+  t0=$(now_ms); rc=0
+  "$GZSTD" -d -c -D "$DICTD/a.dict" --hybrid "$DICTD/multi.zst" >/dev/null 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ $rc -eq 2 ]] && grep -q "incompatible with --hybrid" "$DICTD/err" \
+    && pass "-D refuses --hybrid (exit 2)" \
+    || fail "-D refuses --hybrid (exit 2)" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+else
+  for c in "zstd -D ${SYM_ARROW} gzstd -d -D (4 frames, CPU workers)" \
+           "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, file)" \
+           "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, stdin)" \
+           "-d --tar -D extracts a zstd -D archive" \
+           "foreign seekable -D archive: parallel extract engaged" \
+           "foreign seekable -D archive: decode pool engaged" \
+           "foreign seekable -D archive: seek-extract engaged" \
+           "-d without -D: exit 4 names dictionary ID, no --keep-going advice" \
+           "-d with the wrong -D: exit 4 names both IDs" \
+           "-D refuses --hybrid (exit 2)"; do
+    skip "$c" "zstd or python3 not installed"
+  done
 fi
 
 # ============================================================
@@ -5714,6 +5885,43 @@ else
 fi
 rm -f "$TMPDIR/lv5.bin" "$TMPDIR/lv5.zst" "$TMPDIR/lv5.out"
 
+# 6. A decode error under --adapt -d --tar printed its ERROR and then NEVER
+#    EXITED (fixed v0.17.70).  die() calls std::exit, std::exit destroys
+#    namespace-scope statics, and the extract writer-grow CV was a plain static
+#    with the Extractor's supervisor parked on it for the whole extraction --
+#    glibc's pthread_cond_destroy waits for waiters that never leave.
+#    Deterministic, not a race: 30 of 30 runs hung on v0.17.69, on gzstd-indexed,
+#    plain-zstd and foreign seekable archives alike.  The control run (no
+#    --adapt) must exit 4 first, so a pass cannot come from a fixture that
+#    simply decoded.
+mkdir -p "$TMPDIR/lv6"
+for i in 1 2 3 4; do
+  awk -v f="$i" 'BEGIN { for (n = 0; n < 40000; n++) printf "file %d line %d payload %d\n", f, n, n * 7919 }' \
+    > "$TMPDIR/lv6/t$i.txt"
+done
+"$GZSTD" -q --cpu-only --chunk-size=1 -f -o "$TMPDIR/lv6.tar.zst" --tar "$TMPDIR/lv6" >/dev/null 2>&1
+lv6_off=$(( $(stat -c %s "$TMPDIR/lv6.tar.zst") / 3 ))
+lv6_b=$(od -An -tu1 -j "$lv6_off" -N1 "$TMPDIR/lv6.tar.zst" | tr -d ' ')
+printf "\\x$(printf %02x $(( lv6_b ^ 255 )))" \
+  | dd of="$TMPDIR/lv6.tar.zst" bs=1 seek="$lv6_off" conv=notrunc 2>/dev/null
+rm -rf "$TMPDIR/lv6c" "$TMPDIR/lv6a"; mkdir -p "$TMPDIR/lv6c" "$TMPDIR/lv6a"
+lv6_rc_c=0
+timeout 20 "$GZSTD" -q -d --tar -C "$TMPDIR/lv6c" "$TMPDIR/lv6.tar.zst" >/dev/null 2>&1 || lv6_rc_c=$?
+t0=$(now_ms); lv6_rc_a=0
+timeout 20 "$GZSTD" -q --adapt --no-profile -d --tar -C "$TMPDIR/lv6a" "$TMPDIR/lv6.tar.zst" \
+  >/dev/null 2>&1 || lv6_rc_a=$?
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+if [[ $lv6_rc_c -ne 4 ]]; then
+  fail "--adapt -d --tar exits 4 on a decode error (no hang in std::exit)" \
+       "control without --adapt exited $lv6_rc_c, not 4: the fixture is not corrupt, NOT TESTED"
+elif [[ $lv6_rc_a -eq 4 ]]; then
+  pass "--adapt -d --tar exits 4 on a decode error (no hang in std::exit)"
+else
+  fail "--adapt -d --tar exits 4 on a decode error (no hang in std::exit)" \
+       "exit $lv6_rc_a (124 = still running after 20 s: hung in std::exit)"
+fi
+rm -rf "$TMPDIR/lv6" "$TMPDIR/lv6c" "$TMPDIR/lv6a" "$TMPDIR/lv6.tar.zst"
+
 rm -rf "$TMPDIR/lv" "$TMPDIR/lv2" "$TMPDIR"/lv*.tar.zst
 
 section "--adapt reader pool controller (measured sizing)"
@@ -6584,6 +6792,118 @@ out=$("$GZSTD" --trace foo.log -f "$TMPDIR/zc.bin" 2>&1)
 echo "$out" | grep -qi -- "trace.*compatibility" && pass "--trace eats value" || fail "--trace eats value"
 out=$("$GZSTD" -D /nonexistent -f "$TMPDIR/zc.bin" 2>&1)
 echo "$out" | grep -qi "D.*dictionary" && pass "-D eats value" || fail "-D eats value"
+
+# -D on DECODE is real since v0.17.70 (the default-run "Dictionary decode"
+# section covers the decoder routes and the mismatch messages).  These cells are
+# the flag layer around it: zstd's other spellings, the dictionary forms, and
+# the exit code for each way the FILE can be wrong.  They reuse that section's
+# fixtures in $DICTD.
+if command -v zstd &>/dev/null && [[ -s "$DICTD/a.dict" ]]; then
+  dict_cell() {   # dict_cell NAME EXPECTED_FILE CMD... : exit 0 and stdout == file
+    local name=$1 want=$2; shift 2
+    local t0 rc=0; t0=$(now_ms)
+    "$@" > "$DICTD/cell.out" 2>"$DICTD/err" || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    [[ $rc -eq 0 ]] && files_match "$want" "$DICTD/cell.out" && pass "$name" \
+      || fail "$name" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  }
+  dict_rc() {     # dict_rc NAME RC PATTERN CMD... : exit RC and stderr matches
+    local name=$1 want=$2 pat=$3; shift 3
+    local t0 rc=0; t0=$(now_ms)
+    "$@" >/dev/null 2>"$DICTD/err" || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    [[ $rc -eq $want ]] && grep -q -E -- "$pat" "$DICTD/err" && pass "$name" \
+      || fail "$name" "rc=$rc (want $want): $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  }
+  A="$DICTD/a.dict"
+  dict_cell "-dD FILE (bundled, zstd spelling)" "$DICTD/body.json" \
+    "$GZSTD" -q -dD "$A" -c "$DICTD/multi.zst"
+  dict_cell "-D=FILE (zstd spelling)" "$DICTD/body.json" \
+    "$GZSTD" -q -D="$A" -d -c "$DICTD/multi.zst"
+  dict_cell "--dict=FILE (gzstd alias)" "$DICTD/body.json" \
+    "$GZSTD" -q --dict="$A" -d -c "$DICTD/multi.zst"
+
+  t0=$(now_ms); rc=0
+  "$GZSTD" -q -t -D "$A" "$DICTD/multi.zst" 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ $rc -eq 0 ]] && pass "-t -D verifies zstd -D data" \
+    || fail "-t -D verifies zstd -D data" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+
+  # A raw-content dictionary: plain bytes, no dictionary header, ID 0.
+  cat "$DICTD"/s/1.json "$DICTD"/s/2.json "$DICTD"/s/3.json > "$DICTD/raw.dict"
+  zstd -q -f -D "$DICTD/raw.dict" "$DICTD/part.00" -o "$DICTD/raw.zst"
+  dict_cell "-D with a raw-content dictionary" "$DICTD/part.00" \
+    "$GZSTD" -q -d -c -D "$DICTD/raw.dict" "$DICTD/raw.zst"
+
+  # zstd --no-dictID: the frame does not say which dictionary; -D still decodes.
+  zstd -q -f -D "$A" --no-dictID "$DICTD/part.01" -o "$DICTD/noid.zst"
+  dict_cell "-D decodes a --no-dictID frame" "$DICTD/part.01" \
+    "$GZSTD" -q -d -c -D "$A" "$DICTD/noid.zst"
+
+  # Exit codes follow gzstd's contract (zstd uses 31/32/34 here): unreadable is
+  # I/O (3), not a dictionary file is usage (2), a broken dictionary is data (4).
+  { head -c 8 "$A"; head -c 200 /dev/urandom; } > "$DICTD/corrupt.dict"
+  t0=$(now_ms); why=""
+  "$GZSTD" -d -c -D "$DICTD/missing.dict" "$DICTD/multi.zst" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 3 ]] || why+=" missing:$rc"
+  "$GZSTD" -d -c -D "$DICTD" "$DICTD/multi.zst" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 2 ]] || why+=" directory:$rc"
+  "$GZSTD" -d -c -D "$DICTD/corrupt.dict" "$DICTD/multi.zst" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 4 ]] || why+=" corrupt:$rc"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "-D FILE errors: missing 3, directory 2, corrupt header 4" \
+    || fail "-D FILE errors: missing 3, directory 2, corrupt header 4" "got$why"
+
+  # zstd's 32 MiB ceiling, both sides.  The dictionary at the limit is RAW
+  # content ending in the payload, so the frame really references it.
+  { head -c $(( 32 * 1024 * 1024 - $(stat -c %s "$DICTD/part.02") )) /dev/urandom
+    cat "$DICTD/part.02"; } > "$DICTD/max.dict"
+  zstd -q -f -D "$DICTD/max.dict" "$DICTD/part.02" -o "$DICTD/max.zst"
+  dict_cell "-D accepts a dictionary of exactly 32 MiB" "$DICTD/part.02" \
+    "$GZSTD" -q -d -c -D "$DICTD/max.dict" "$DICTD/max.zst"
+  printf x >> "$DICTD/max.dict"
+  dict_rc "-D refuses a dictionary over 32 MiB (exit 2)" 2 "too large" \
+    "$GZSTD" -d -c -D "$DICTD/max.dict" "$DICTD/max.zst"
+  rm -f "$DICTD/max.dict" "$DICTD/max.zst"
+
+  # zstd refuses a -D value that looks like an option; so does gzstd, rather than
+  # taking "-d" as the dictionary's file name.  An empty separated value must
+  # agree with -D=: empty is the sentinel for no dictionary internally, so
+  # accepting it would silently discard the option.
+  t0=$(now_ms); why=""
+  "$GZSTD" -D -d "$DICTD/multi.zst" >/dev/null 2>"$DICTD/err"; rc=$?
+  [[ $rc -eq 2 ]] && grep -q "needs a dictionary file" "$DICTD/err" \
+    || why+=" option:$rc"
+  "$GZSTD" -d -D "" "$DICTD/multi.zst" >/dev/null 2>"$DICTD/err"; rc=$?
+  [[ $rc -eq 2 ]] && grep -q "missing value for -D" "$DICTD/err" \
+    || why+=" empty:$rc"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "-D refuses an option or empty value (exit 2)" \
+    || fail "-D refuses an option or empty value (exit 2)" "got$why"
+
+  # Compression with a dictionary is not implemented: it must warn AND write
+  # output that a plain decoder reads with no dictionary at all.
+  t0=$(now_ms); rc=0
+  "$GZSTD" -f -D "$A" "$DICTD/part.03" -o "$DICTD/cz.zst" 2>"$DICTD/err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 0 ]] && grep -q "compressing with a dictionary is not supported" "$DICTD/err" \
+     && zstd -q -d -c "$DICTD/cz.zst" 2>/dev/null | cmp -s - "$DICTD/part.03"; then
+    pass "compress -D warns; output needs no dictionary"
+  else
+    fail "compress -D warns; output needs no dictionary" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
+  fi
+else
+  for c in "-dD FILE (bundled, zstd spelling)" "-D=FILE (zstd spelling)" \
+           "--dict=FILE (gzstd alias)" "-t -D verifies zstd -D data" \
+           "-D with a raw-content dictionary" "-D decodes a --no-dictID frame" \
+           "-D FILE errors: missing 3, directory 2, corrupt header 4" \
+           "-D accepts a dictionary of exactly 32 MiB" \
+           "-D refuses a dictionary over 32 MiB (exit 2)" \
+           "-D refuses an option or empty value (exit 2)" \
+           "compress -D warns; output needs no dictionary"; do
+    skip "$c" "zstd or python3 not installed"
+  done
+fi
 # -M / --memlimit / --memory are real flags (implemented v0.12.30)
 ("$GZSTD" -M256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "-M# accepted (real)" || fail "-M# accepted"
 ("$GZSTD" -M 256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "-M N accepted (real)" || fail "-M N accepted"
