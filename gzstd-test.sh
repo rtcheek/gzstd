@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=521
-$EXTENSIVE && EXPECTED_TESTS=679
+EXPECTED_TESTS=523
+$EXTENSIVE && EXPECTED_TESTS=681
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -752,8 +752,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # one GPU cell (the unmasked set keeps CUDA's order by default).  519 -> 521,
 # 677 -> 679; the no-GPU deltas grow by the GPU cell only: 129 -> 130 (the 129
 # was MEASURED by the v0.17.73 CPU-only run) and 157 -> 158.
-EXPECTED_NOGPU_DELTA=130
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=158   # MEASURED 2026-09-21 (607 - 463) + 14 derived since
+# v0.17.75: two GPU cells for the deferred subset mask (ranked on the bringup
+# thread; never waited for when bringup is skipped).  521 -> 523, 679 -> 681; the
+# no-GPU deltas 130 -> 132 (130 MEASURED by the v0.17.74 CPU-only run) and 158 -> 160.
+EXPECTED_NOGPU_DELTA=132
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=160   # MEASURED 2026-09-21 (607 - 463) + 16 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -4853,6 +4856,58 @@ if has_gpu 2>/dev/null; then
     [[ -z "$dr_why" ]] && pass "an all-device GPU set keeps CUDA's order by default" \
       || fail "an all-device GPU set keeps CUDA's order by default" "$dr_why"
     rm -f "$TMPDIR/rank3.zst" "$TMPDIR/rank4.zst" "$TMPDIR/rank5.zst"
+
+    # AN UNMASKED SUBSET PLACES A GUESS AND RANKS AT FIRST CUDA USE (v0.17.75).
+    # A hybrid run puts a guessed CUDA_VISIBLE_DEVICES in place with putenv
+    # before any thread exists, and the bringup thread -- not the main thread --
+    # waits for NVML, ranks, and rewrites the mask in place just before cuInit.
+    # The guess is FORCED to differ from the ranking (GZSTD_DEBUG_GPU_MASK_GUESS),
+    # so "CUDA sees" can only name the ranked card if the in-place write reached
+    # cuInit.  GZSTD_DEBUG_GPU_GUARD_SEC=0 (the suite default) forces bringup.
+    ds_uuids() { printf '%s' "$1" | command tr '\r' '\n' | sed -n "s/.*$2[ (]*\(GPU-[0-9a-f-]*\).*/\1/p" | head -1; }
+    ds_why=""; ds_log=""; ds_guess=""; ds_sel=""; ds_sees=""
+    for ds_idx in 0 $(( ${dr_proc_n:-0} > 1 ? dr_proc_n - 1 : 0 )); do
+      ds_rc=0
+      ds_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_GUARD_SEC=0 GZSTD_DEBUG_GPU_MASK_GUESS=$ds_idx \
+                 timeout --foreground -k 10 120 "$GZSTD" -vv -k -f --gpu-devices=1 \
+                 "$TMPDIR/large.bin" -o "$TMPDIR/dsub.zst" 2>&1) || ds_rc=$?
+      ds_guess=$(ds_uuids "$ds_log" 'placed a startup guess')
+      ds_sel=$(ds_uuids "$ds_log" '\[GPU\] selected')
+      ds_sees=$(ds_uuids "$ds_log" 'CUDA sees')
+      [[ -n "$ds_sel" && "$ds_sel" != "$ds_guess" ]] && break
+    done
+    if [[ $ds_rc -ne 0 ]]; then ds_why+=" [rc=$ds_rc]"
+    elif [[ -z "$ds_guess" ]]; then ds_why+=" [no startup guess placed]"
+    elif [[ -z "$ds_sel" ]]; then ds_why+=" [no ranked selection was made before CUDA started]"
+    elif [[ "$ds_sel" == "$ds_guess" ]]; then ds_why+=" [ranking never differed from the guess ($ds_guess)]"
+    else
+      printf '%s' "$ds_log" | grep -q 'waiting up to 500 ms for the NVML sample (hybrid bringup thread)' \
+        || ds_why+=" [the NVML wait was not on the hybrid bringup thread]"
+      printf '%s' "$ds_log" | grep -q 'NVML sample (main thread' && ds_why+=" [the main thread waited for NVML]"
+      [[ "$ds_sees" == "$ds_sel" ]] || ds_why+=" [CUDA saw '$ds_sees', ranked '$ds_sel', guessed '$ds_guess']"
+      env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+        "$GZSTD" -d -q -c "$TMPDIR/dsub.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || ds_why+=" [round-trip]"
+    fi
+    [[ -z "$ds_why" ]] && pass "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" \
+      || fail "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" "$ds_why"
+
+    # ...and a hybrid run that never brings a GPU up makes no ranking wait on
+    # its work path (v0.17.74 made the main thread wait ~0.4 s first).  The
+    # sampler may still take up to 500 ms to stop at exit; this trace check
+    # does not measure that join.  A huge guard makes bringup decline the GPU.
+    ds_why=""; ds_rc=0
+    ds_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_GUARD_SEC=100000 \
+               timeout --foreground -k 10 120 "$GZSTD" -vv -k -f --gpu-devices=1 \
+               "$TMPDIR/large.bin" -o "$TMPDIR/dsub2.zst" 2>&1) || ds_rc=$?
+    [[ $ds_rc -eq 0 ]] || ds_why+=" [rc=$ds_rc]"
+    printf '%s' "$ds_log" | grep -q 'placed a startup guess' || ds_why+=" [no startup guess placed]"
+    printf '%s' "$ds_log" | grep -q 'skipping GPU bringup' || ds_why+=" [GPU bringup was not skipped]"
+    printf '%s' "$ds_log" | grep -q 'waiting up to 500 ms for the NVML sample' && ds_why+=" [something waited for NVML]"
+    env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+      "$GZSTD" -d -q -c "$TMPDIR/dsub2.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || ds_why+=" [round-trip]"
+    [[ -z "$ds_why" ]] && pass "a hybrid GPU subset that skips GPU bringup has no ranking wait" \
+      || fail "a hybrid GPU subset that skips GPU bringup has no ranking wait" "$ds_why"
+    rm -f "$TMPDIR/dsub.zst" "$TMPDIR/dsub2.zst"
   elif [[ "${GPU_ALL_DEVICES:-}" == *,* ]]; then
     skip "--gpu-order=ranked ranks every device after CUDA startup" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
@@ -4860,10 +4915,16 @@ if has_gpu 2>/dev/null; then
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
     skip "an all-device GPU set keeps CUDA's order by default" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
+    skip "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" \
+         "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
+    skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" \
+         "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
   else
     skip "--gpu-order=ranked ranks every device after CUDA startup" "single GPU host"
     skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "single GPU host"
     skip "an all-device GPU set keeps CUDA's order by default" "single GPU host"
+    skip "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" "single GPU host"
+    skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" "single GPU host"
   fi
 
   # --gpu-streams
@@ -4896,6 +4957,8 @@ else
   skip "--gpu-order=ranked ranks every device after CUDA startup" "no GPU"
   skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "no GPU"
   skip "an all-device GPU set keeps CUDA's order by default" "no GPU"
+  skip "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" "no GPU"
+  skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" "no GPU"
   skip "--gpu-streams" "no GPU"
   skip "--gpu-mem-frac" "no GPU"
   skip "--gpu-devices" "no GPU"

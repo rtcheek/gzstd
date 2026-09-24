@@ -1,12 +1,104 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.74  
+**Covers:** v0.9.50 → v0.17.75  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.75 — a GPU subset is chosen at the first CUDA use, so a hybrid run no longer waits for NVML up front
+
+Choosing a SUBSET of the GPUs (`--gpu-devices N` below the card count, `--adapt`'s count) has to
+hide the other cards from CUDA, and CUDA reads `CUDA_VISIBLE_DEVICES` once, at `cuInit`. So until now
+the choice was made on the main thread before anything else ran: start NVML, wait for its first
+sample (~0.4 s: `nvmlInit` attaches every card), rank, `setenv`. A hybrid run often then decided the
+CPU pool would finish first and started no GPU at all, having waited for nothing. Measured on the
+8-GPU host, 20 GiB hybrid compress where the GPU is skipped: **1.40–1.44 s with `--gpu-devices=2`
+against 1.01–1.17 s without. Now 1.02–1.24 s against 1.04–1.18 s: identical.**
+
+**How.** `apply_backend_defaults()` places a GUESSED mask with `putenv` before any other thread
+exists: a random N of the `/proc` UUIDs, random so that two jobs do not both pick the same card.
+Only then does it start the NVML sampler, and it does not wait. Immediately before the first CUDA
+call, on whichever path gets there first, `finalize_gpu_mask()` waits for the sample, ranks, and
+rewrites the mask IN PLACE. The paths it covers are the hybrid bringup thread, a synchronous bringup,
+the GPU-verify probe, the `--tar` decode pool and calibrate. So:
+- a hybrid run that skips CUDA does not wait for ranking while it works; normal
+  exit can still wait up to 500 ms for the sampler to stop;
+- a hybrid run waits on its bringup thread while the CPU pool works;
+- a run that needs the GPU at once (`--gpu-only`, and `--gds-only`, `--direct-stage` and `--tar`,
+  which rank at startup as before) costs what it did.
+
+Waiting on the bringup thread is nearly free: the driver serializes NVML's attach with `cuInit`
+anyway (measured, run in parallel they finish only 45 ms sooner than back to back).
+
+**Why `putenv` and an in-place write.** POSIX says of `putenv` that the string "shall become part of
+the environment, so altering the string shall change the environment": the documented mechanism.
+v0.17.63 rejected overwriting `setenv`'s private copy, which relies on a glibc detail; this is not
+that. `setenv` itself is unsafe once other threads may call `getenv`, and the old path called it with
+the NVML sampler thread already running; the new path puts the string in place before the sampler
+starts. The write touches only the value bytes after `CUDA_VISIBLE_DEVICES=`. No in-tree second
+thread reads that value before `cuInit` on the writing thread. This does not synchronize an opaque
+library that might read or copy the full environment. The buffer holds the longest N UUIDs, so
+any ranked N-subset fits.
+
+**Failure is bounded.** A CUDA call before `finalize_gpu_mask()` would freeze the guess;
+a later rewrite could then make the environment disagree with CUDA, so every first-CUDA path must
+finalize. An incomplete NVML sample, or one that names
+cards outside the `/proc` inventory, leaves that N-card guess in place. A finalize that finds the
+variable no longer pointing at its buffer writes nothing. Without a `/proc` inventory (some
+containers), the old path runs unchanged.
+
+**Measured by hand on the 8-GPU host** (`-vv` traces the guess, which thread waited, the ranked
+choice, and the UUIDs CUDA actually enumerated):
+- **Hybrid compress with bringup forced:** guessed `1de0…`, the bringup thread waited, ranked
+  `d628…`, and CUDA saw `d628…`. The in-place write reached `cuInit`.
+- **Hybrid decompress:** the same, on the decompress bringup thread, and it round-trips.
+- **`--gpu-only --gpu-devices=2`:** ranks synchronously, as before.
+
+### Verification
+
+Two new GPU cells, in the multi-GPU block that clears the suite's one-card mask:
+- The guess is forced to differ from the ranking (`GZSTD_DEBUG_GPU_MASK_GUESS`), so "CUDA sees" can name
+  the ranked card only if the in-place write reached `cuInit`. The wait must be on the hybrid bringup
+  thread, never the main thread.
+- A hybrid run whose bringup sample declines the GPU places the guess and makes no ranking wait
+  on its work path; the sampler's bounded exit join is outside this cell's trace check.
+
+Four mutants, all caught:
+
+| mutant | cells that fail |
+|---|---|
+| the in-place write skipped | 1 — "CUDA saw the guess, not the ranked card" |
+| the main thread ranks up front (the v0.17.74 behaviour) | 2 |
+| the hybrid bringup never calls `finalize_gpu_mask()` | 1 |
+| no guess placed (the old `setenv` path) | 2 |
+
+Baselines 521 → 523 default, 679 → 681 extensive; no-GPU deltas 130 → 132 and 158 → 160. Both
+configurations build warning-free.
+
+**Review (Codex, GPT-6-Sol at max, one turn: SAFE TO COMMIT).** It traced every first-CUDA path to a
+finalize call, and found no application thread before the `putenv`. It confirmed that the old `setenv`,
+issued after the sampler thread started, was an unsynchronized race opportunity, though it found no
+conflicting read. **One wrong-choice defect, fixed:** NVML's first sweep can omit a card whose handle
+or UUID lookup failed. With `--gpu-devices=2` and three or more cards, that sample could name only
+one card, and finalize replaced the valid two-card guess with a one-card mask. It now ranks only
+distinct cards from the `/proc` inventory and keeps the guess unless it can rank N of them. No cell
+covers this: reproducing it needs NVML to drop a card. It also narrowed two claims of mine:
+- **"Never waits for NVML" was false:** normal exit can still spend up to 500 ms joining a sampler
+  that is inside `nvmlInit`.
+- **"Safe by construction" was too strong:** a CUDA call before finalize would freeze the guess, and a
+  later rewrite would leave the environment disagreeing with CUDA. That is why every first-CUDA path
+  must finalize.
+
+The edits built warning-free in both configurations, and all five ordering and subset cells pass on
+the rebuilt binary.
+
+**Suites (default run):** GPU build 521 passed, 0 failed, 2 skipped of 523; `USE_NVCOMP=OFF` 391 / 0 /
+108, exactly the 391 the no-GPU delta of 132 predicts, so that delta is measured. The two GPU skips are
+the trivial-park cell (never exercisable on this host) and the timing-dependent decompress tail-yield
+cell.
 
 ## v0.17.74 — an all-device GPU set keeps CUDA's order; the load ranking is opt-in (`--gpu-order=ranked`)
 

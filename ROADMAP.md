@@ -495,13 +495,31 @@ length and with how much the cards actually differ. Worth considering whether it
 good choice (every device busy), or gated on the input size the way GPU bringup already is. Operationally at v0.17.63:
 `--gpu-devices N` or an explicit `CUDA_VISIBLE_DEVICES` skips that all-device ranking, and a warm input avoids the GPU entirely.
 
+**OPEN (rtcheek, 2026-09-24): choose the GPU COUNT from the input size beyond `--gpu-only` compress.**
+Bigger inputs benefit from more GPUs, and every visible GPU costs startup (0.75 s each on the 8-GPU host with
+static BAR1; ~0.25 s without). v0.17.73's `--adapt` model already does this for a single-file `--gpu-only`
+compress (1 GPU at 19.5 GiB, 2 at 195 GiB, 8 at ~2 TB on that host). Not covered: decompress (the archive
+size is known; the decompressed size is in the frame headers), hybrid runs that bring GPUs up (all cards
+visible, the full startup), and runs without `--adapt`. Next step: measure device count x size for
+decompress and hybrid on the 195 GiB corpus. Prefer per-machine learning over a fixed size rule: the
+startup cost differs by a factor of ~3 between the static-BAR1 host and a normal one.
+
+**OPEN, >=1.0 territory: use DCGM when it is already there.** NVIDIA's `nv-hostengine` keeps NVML attached
+and samples every card; a client reads the table without attaching a GPU. gzstd could dlopen `libdcgm` and,
+when a host engine answers, rank from it at no cost (subset choice, `--gpu-order=ranked`), falling back
+to today's behaviour when not. Installing a service is out of scope before 1.0 (rtcheek); using one that is
+present is not. Not on the 8-GPU server and not in the Lambda repository (checked after `apt update`,
+2026-09-24); it comes from NVIDIA's CUDA repository. Query cost unmeasured; license unchecked. It holds no
+CUDA contexts, so it does nothing for cuInit or the static-BAR1 leak.
+
 **Follow-ups, not done:**
 - **The `--gpu-devices N` path still pays the ~380 ms before CUDA** on every run, including runs that then skip bringup.
   Restricting visibility is worth it when GPUs are used. For a small explicit `--gpu-devices N --hybrid` job it is the
   old waste. MEASURED 2026-09-24: 20 GiB hybrid that skips the GPU, 1.01-1.17 s default vs 1.40-1.44 s with
-  `--gpu-devices=2`. **PLANNED v0.17.75 (rtcheek):** in hybrid, place a guessed mask with `putenv` before any thread
-  exists, rank through NVML on a background thread nobody waits for, and overwrite the mask in place on the bringup
-  thread just before `cuInit` (POSIX: altering a putenv'd string changes the environment). Modes that need the GPU at
+  `--gpu-devices=2`. **SHIPPED v0.17.75: now 1.02-1.24 s vs 1.04-1.18 s** (CHANGELOG v0.17.75). The plan as built: in hybrid, place a guessed mask with `putenv` before any thread
+  exists, rank through NVML on a background thread whose result a hybrid run awaits at CUDA bringup, and overwrite the mask in place on the bringup
+  thread just before `cuInit` (POSIX: altering a putenv'd string changes the environment). Normal exit may still wait
+  up to 500 ms for the sampler to stop. Modes that need the GPU at
   once (`--gpu-only` subsets, `--gds-only`, `--direct-stage`) keep ranking first: CUDA freezes the visible set at
   `cuInit`, so there is nothing to switch to later, and a busy single card costs far more than 0.4 s.
 - **Multi-file runs re-rank per file.** The sampler keeps running, so later files avoid another sampler startup and

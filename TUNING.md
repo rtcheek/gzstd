@@ -162,6 +162,8 @@ When gzstd uses only some of the GPUs (`--gpu-devices N` below the device count,
 set `CUDA_VISIBLE_DEVICES`, it asks NVIDIA's management library (NVML) for each card's
 utilization and free VRAM, then picks the least-loaded cards. That costs about 0.4 s, and on a shared
 machine it's worth it: a card that is busy with someone else's work can make a run many times slower.
+In the default hybrid mode the choice is made only when the GPUs are actually started, while the CPU
+is already working, so a run that ends up not using a GPU never pays it.
 
 When it uses every GPU, it keeps CUDA's own order. Ranking all of them first costs the same 0.4 s, and in
 every case measured it saved less than that, because the work spreads across all the cards anyway.

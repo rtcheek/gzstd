@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.74";
+static constexpr const char * GZSTD_VERSION = "0.17.75";
 //
 // Architecture overview:
 //
@@ -71,6 +71,7 @@ static constexpr const char * GZSTD_VERSION = "0.17.74";
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <random>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -413,7 +414,12 @@ static inline nvmlReturn_t nvmlSystemGetDriverVersion(char * buf, unsigned int l
  restricting visibility or the probe needs it.  Since v0.17.74 the ALL-DEVICE
  ranking (both the deferred and the GPU-verify form) runs only under
  --gpu-order=ranked: it lost in every regime measured (see
- order_all_gpus_before_cuda).  Choosing a SUBSET still ranks by default.
+ order_all_gpus_before_cuda).  Choosing a SUBSET still ranks by default --
+ and since v0.17.75 it ranks at the FIRST CUDA USE, not on the main thread
+ before any work: a guessed mask is putenv'd at startup and rewritten in place
+ (see GzGpuMask), so a hybrid run that never brings a GPU up does not wait
+ for ranking on its work path.  The sampler may still take up to 500 ms to
+ stop at normal process exit.
 
  It also fixes a signal problem. A SINGLE utilization read is unreliable —
  nvidia-smi was repeatedly observed reporting 0% while a gzstd job was actively
@@ -18719,6 +18725,136 @@ static void checkNvcomp(nvcompStatus_t st, const char * msg);
 // Defined with the GPU drivers far below; the --tar decode pool ranks its devices
 // through it too, so the all-device ranking has one implementation.
 static std::vector<int> select_best_gpus(int total_devices, int want, const Options & opt);
+
+// ---- The subset mask, placed early and ranked late (v0.17.75) ----
+//
+// An unmasked SUBSET (--gpu-devices N below the /proc count, --adapt's device
+// count) must hide the other cards from CUDA, and CUDA reads
+// CUDA_VISIBLE_DEVICES exactly once, at cuInit.  Until v0.17.74 the choice was
+// made on the MAIN thread before anything else ran: start NVML, wait for its
+// first sample (~0.4 s on an 8-GPU host: nvmlInit attaches every card), rank,
+// setenv.  A hybrid run then often skipped GPU bringup altogether -- measured,
+// 20 GiB compress with --gpu-devices=2: 1.40-1.44 s against 1.01-1.17 s --
+// having paid that wait for nothing.
+//
+// Now: apply_backend_defaults() PUTENVs a guessed mask before any other thread
+// exists (a random N of the /proc UUIDs), then starts the sampler without
+// waiting.  finalize_gpu_mask() runs immediately before the first CUDA call of
+// whichever path gets there (hybrid bringup thread, a synchronous bringup, the
+// verify probe, ...): it waits for the sample, ranks, and rewrites the mask IN
+// PLACE.  So a hybrid main thread does not wait for ranking, a hybrid run
+// that skips CUDA does not wait for ranking on its work path (normal exit can
+// still wait up to 500 ms for the sampler), and a run that uses CUDA gets the
+// ranked cards when a complete sample is available.  Waiting there is nearly
+// free, because the driver serializes NVML's attach with cuInit anyway
+// (measured: run in parallel they finish 45 ms sooner than back to back).
+//
+// WHY PUTENV AND AN IN-PLACE WRITE.  setenv while other threads may call getenv
+// is not safe (it can reallocate environ under them).  POSIX putenv makes the
+// caller's string part of the environment, "so altering the string shall
+// change the environment" -- the in-place write is the documented mechanism,
+// not a glibc detail (v0.17.63 rejected overwriting setenv's copy for exactly
+// that reason; this is not that).  The write touches only the VALUE bytes after
+// "CUDA_VISIBLE_DEVICES=".  The in-tree callers do not read that value on a
+// second thread before cuInit; this does not synchronize any opaque library
+// that might read or copy the full environment.  Every candidate value fits:
+// the buffer is sized for the longest N /proc UUIDs.
+//
+// A CUDA call before finalize would freeze the guessed set.  A later rewrite
+// could then make getenv disagree with CUDA, so every first-CUDA path must call
+// finalize.  An incomplete or mismatched NVML sample keeps the N-card guess;
+// if another writer replaced the variable, finalize leaves it alone.
+struct GzGpuMask {
+  std::mutex mx;
+  bool   pending = false;           // guess placed, ranking not applied yet
+  char * env = nullptr;             // "CUDA_VISIBLE_DEVICES=<value>", leaked
+  char * value = nullptr;           // env + strlen("CUDA_VISIBLE_DEVICES=")
+  size_t cap = 0;                   // bytes available at value, NUL included
+  int    want = 0;
+  std::vector<std::string> candidates; // /proc UUIDs this mask may name
+};
+static GzGpuMask & g_gpu_mask = *new GzGpuMask;   // leaked: read at any exit
+
+// The UUIDs CUDA actually enumerated, in its order ("GPU-..."), for the -vv
+// trace that proves which mask cuInit read.  No context is created.
+static std::string gz_cuda_visible_uuids()
+{
+  int n = 0;
+  if (cudaGetDeviceCount(&n) != cudaSuccess) return "";
+  std::string out;
+  for (int d = 0; d < n; ++d) {
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, d) != cudaSuccess) return out;
+    const unsigned char * b = reinterpret_cast<const unsigned char *>(p.uuid.bytes);
+    char s[48];
+    std::snprintf(s, sizeof s, "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                  b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
+                  b[10], b[11], b[12], b[13], b[14], b[15]);
+    if (!out.empty()) out += ",";
+    out += s;
+  }
+  return out;
+}
+
+// Rank and apply the pending subset mask.  `who` names the calling site for
+// the -vv trace the suite reads ("waiting ... (hybrid bringup)" vs "(main
+// thread)").  Idempotent and thread-safe; a no-op when nothing is pending.
+static void finalize_gpu_mask(const Options & opt, const char * who)
+{
+  GzGpuMask & m = g_gpu_mask;
+  std::lock_guard<std::mutex> lk(m.mx);
+  if (!m.pending) return;
+  m.pending = false;
+  vlog(V_DEBUG, opt, std::string("[GPU] waiting up to 500 ms for the NVML sample (")
+                     + who + ")\n");
+  g_gpu_monitor.wait_ready(500);
+  const auto rows = g_gpu_monitor.snapshot();
+  std::string sel;
+  if (!rows.empty()) {
+    // The first sweep can omit a card whose NVML handle or UUID lookup failed.
+    // NVML and /proc can also expose different inventories in a container.
+    // Keep the valid N-card guess unless we can rank N distinct /proc cards.
+    std::vector<const GpuMonitor::Row *> eligible;
+    eligible.reserve(rows.size());
+    for (const auto & r : rows) {
+      if (std::find(m.candidates.begin(), m.candidates.end(), r.uuid) == m.candidates.end())
+        continue;
+      if (std::any_of(eligible.begin(), eligible.end(), [&](const auto * e) {
+            return e->uuid == r.uuid;
+          })) continue;
+      eligible.push_back(&r);
+    }
+    if (eligible.size() >= (size_t)m.want) {
+      std::vector<GzDevRank> rin;
+      rin.reserve(eligible.size());
+      for (const auto * r : eligible) rin.push_back({r->util, r->free_bytes});
+      const std::vector<size_t> order = gz_rank_devices(rin);
+      for (size_t i = 0; i < (size_t)m.want; ++i) {
+        if (!sel.empty()) sel += ",";
+        sel += eligible[order[i]]->uuid;
+      }
+    }
+  }
+  const char * how = "incomplete or mismatched NVML sample; kept the startup guess";
+  if (sel.empty()) {
+    sel = m.value;
+  } else if (sel.size() + 1 > m.cap) {
+    how = "ranked set does not fit the placed mask; kept the startup guess";
+    sel = m.value;
+  } else if (::getenv("CUDA_VISIBLE_DEVICES") != m.value) {
+    how = "CUDA_VISIBLE_DEVICES was replaced after startup; left it alone";
+    sel = ::getenv("CUDA_VISIBLE_DEVICES") ? ::getenv("CUDA_VISIBLE_DEVICES") : "";
+  } else {
+    std::memcpy(m.value, sel.c_str(), sel.size() + 1);
+    how = "combined rank: utilization + free VRAM";
+  }
+  if (opt.verbosity >= V_VERBOSE) {
+    std::ostringstream os;
+    os << "[GPU] selected " << sel << " (" << how
+       << "); CUDA renumbers this set from 0, so later lines say GPU0\n";
+    vlog(V_VERBOSE, opt, os.str());
+  }
+}
 #endif
 
 namespace tarx {
@@ -21628,6 +21764,7 @@ public:
     auto spawn_gpu_workers = [&] {
       std::call_once(gpu_spawn_once, [&] {
         int dc = 0;
+        finalize_gpu_mask(dopt, "tar decode pool");
         if (cudaGetDeviceCount(&dc) != cudaSuccess) dc = 0;
         const int ndev = dopt.gpu_devices > 0 ? std::min(dopt.gpu_devices, dc) : dc;
         if (ndev < 1) {   // no usable GPU (absent, or CUDA_VISIBLE_DEVICES-masked)
@@ -29326,6 +29463,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   int device_count = 0;
   int total_hw_devices = 0;
   if (!defer_detect) {
+    finalize_gpu_mask(opt, "compress, synchronous");
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
       if (opt.gpu_only)
         die_usage("GPU requested (--gpu-only) but no CUDA devices available");
@@ -29731,6 +29869,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         return;
       }
       int dc = 0;
+      finalize_gpu_mask(opt, "hybrid bringup thread");
+      if (g_gpu_mask.env && opt.verbosity >= V_DEBUG)
+        vlog(V_DEBUG, opt, "[GPU] CUDA sees " + gz_cuda_visible_uuids() + "\n");
       if (cudaGetDeviceCount(&dc) != cudaSuccess || dc <= 0) {
         // No GPU after all.  The CPU pool is already running and owns the queue,
         // so there is nothing to repair — hybrid simply runs CPU-only.
@@ -34207,6 +34348,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   int device_count = 0;
   int total_hw_devices = 0;
   if (!defer_detect) {
+    finalize_gpu_mask(opt, "decompress, synchronous");
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
       if (opt.gpu_only)
         die_usage("GPU requested (--gpu-only) but no CUDA devices available");
@@ -34877,6 +35019,9 @@ gds_out_declined:
       }
       // Deferred device detection (the ~2s cuInit, off the critical path).
       int dc = 0;
+      finalize_gpu_mask(opt, "decompress bringup thread");
+      if (g_gpu_mask.env && opt.verbosity >= V_DEBUG)
+        vlog(V_DEBUG, opt, "[GPU] CUDA sees " + gz_cuda_visible_uuids() + "\n");
       if (cudaGetDeviceCount(&dc) != cudaSuccess || dc <= 0) {
         if (opt.gpu_only) {
           // gpu-only with no GPU: tell the reader to stop so main can error
@@ -35659,6 +35804,74 @@ static const std::vector<std::string> & gz_proc_gpu_uuids()
   }();
   return uuids;
 }
+
+// Place a guessed N-card mask with putenv (see GzGpuMask for why and how it is
+// replaced).  MUST run before any other thread exists: putenv itself edits the
+// environ array.  Returns false -- leaving the caller's older path in charge --
+// unless this is an unmasked SUBSET of a /proc inventory whose UUIDs it can name.
+//
+// The guess is random rather than "the tail of the list": two gzstd jobs
+// guessing the same card would both land on it.  It cannot prefer the fastest
+// model -- nothing short of NVML or a CUDA context says which card that is --
+// but it is only what CUDA sees if NVML never answers.
+// GZSTD_DEBUG_GPU_MASK_GUESS=i[,j...] (indices into the sorted /proc list)
+// forces it, so the suite can make the guess and the ranking disagree.
+static bool place_gpu_mask_guess(const Options & opt)
+{
+  const auto & uuids = gz_proc_gpu_uuids();
+  const size_t want = opt.gpu_devices > 0 ? (size_t)opt.gpu_devices : 0;
+  if (want == 0 || uuids.empty() || want >= uuids.size()) return false;
+  for (const auto & u : uuids) if (u.rfind("GPU-", 0) != 0) return false;
+  std::vector<std::string> candidates = uuids; // copy before changing environ
+
+  std::vector<size_t> pick;
+  if (const char * g = std::getenv("GZSTD_DEBUG_GPU_MASK_GUESS")) {
+    std::stringstream ss(g); std::string tok;
+    while (std::getline(ss, tok, ',') && pick.size() < want) {
+      char * end = nullptr;
+      const unsigned long v = std::strtoul(tok.c_str(), &end, 10);
+      if (end != tok.c_str() && *end == '\0' && v < uuids.size()
+          && std::find(pick.begin(), pick.end(), (size_t)v) == pick.end())
+        pick.push_back((size_t)v);
+    }
+  }
+  if (pick.size() != want) {
+    pick.clear();
+    std::vector<size_t> all(uuids.size());
+    for (size_t i = 0; i < all.size(); ++i) all[i] = i;
+    std::mt19937_64 rng((uint64_t)::getpid() * 0x9E3779B97F4A7C15ull
+                        ^ (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
+    std::shuffle(all.begin(), all.end(), rng);
+    pick.assign(all.begin(), all.begin() + (long)want);
+  }
+  std::string guess;
+  for (size_t i : pick) { if (!guess.empty()) guess += ","; guess += uuids[i]; }
+
+  // Room for the LONGEST N UUIDs, so any ranked N-subset fits in place.
+  std::vector<size_t> lens;
+  for (const auto & u : uuids) lens.push_back(u.size());
+  std::sort(lens.rbegin(), lens.rend());
+  size_t cap = want;                             // N-1 commas + the NUL
+  for (size_t i = 0; i < want; ++i) cap += lens[i];
+
+  static const char kName[] = "CUDA_VISIBLE_DEVICES=";
+  const size_t pre = sizeof(kName) - 1;
+  char * env = static_cast<char *>(std::malloc(pre + cap));  // leaked: the environment owns it
+  if (!env) return false;
+  std::memcpy(env, kName, pre);
+  std::memcpy(env + pre, guess.c_str(), guess.size() + 1);
+  if (::putenv(env) != 0) { std::free(env); return false; }
+
+  GzGpuMask & m = g_gpu_mask;
+  std::lock_guard<std::mutex> lk(m.mx);
+  m.env = env; m.value = env + pre; m.cap = cap; m.want = (int)want;
+  m.candidates = std::move(candidates);
+  m.pending = true;
+  vlog(V_DEBUG, opt, "[GPU] " + std::to_string(want) + " of " + std::to_string(uuids.size())
+       + " cards: placed a startup guess (" + guess + "); NVML ranks them before CUDA starts\n");
+  return true;
+}
+
 #endif
 
 static void apply_backend_defaults(Options & opt);
@@ -37182,6 +37395,7 @@ static int run_calibrate(Options opt)
   // gpu rows only when a device is actually usable.
   {
     int ndev = 0;
+    finalize_gpu_mask(opt, "calibrate");
     if (cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0) {
       // A GPU fault during a measurement pass makes that row garbage (there
       // is no rebuild driver here) — discard it and say so.
@@ -39931,6 +40145,7 @@ static void apply_backend_defaults(Options & opt)
     // exactly where v0.16.7 paid for its inline probe: only when a subset of
     // devices was requested and a ranking can therefore change something.
     bool full_cuda_order_from_nvml = false;
+    bool mask_placed = false;       // v0.17.75: guess placed, ranked at first CUDA use
     std::string sel;
     const char * how = "user's CUDA_VISIBLE_DEVICES, first N of their list";
     const char * caller_mask = ::getenv("CUDA_VISIBLE_DEVICES");
@@ -39941,6 +40156,16 @@ static void apply_backend_defaults(Options & opt)
         if (!sel.empty()) sel += ",";
         sel += tok; ++taken;
       }
+    } else if (place_gpu_mask_guess(opt)) {
+      // v0.17.75: the guess is in place (putenv, before any other thread); the
+      // sampler starts only NOW, after it.  Ranking waits for the first CUDA
+      // call -- except where that call is effectively immediate on this
+      // thread (cuFile's --gds-only, --direct-stage's staging, --tar, and
+      // calibrate), which rank here exactly as before.
+      mask_placed = true;
+      g_gpu_monitor.start();
+      if (opt.gds_only || opt.direct_stage || opt.tar_mode || opt.calibrate)
+        finalize_gpu_mask(opt, "main thread, immediate GPU mode");
     } else {
       // A caller's mask already names the cards and their order.  Only an
       // unmasked subset or opted-in full ranking needs the NVML sampler.
@@ -39958,8 +40183,11 @@ static void apply_backend_defaults(Options & opt)
       // driver, not the expected path — a driver-less box sets the sampler dead
       // and returns immediately rather than burning it.
       const size_t hw_gpus = gz_proc_gpu_uuids().size();
-      if (hw_gpus == 0 || (size_t)opt.gpu_devices < hw_gpus || opt.gpu_order_ranked)
+      if (hw_gpus == 0 || (size_t)opt.gpu_devices < hw_gpus || opt.gpu_order_ranked) {
+        vlog(V_DEBUG, opt, "[GPU] waiting up to 500 ms for the NVML sample "
+                           "(main thread, before any work)\n");
         g_gpu_monitor.wait_ready(500);
+      }
       // A container may expose NVML but not the NVIDIA /proc inventory.
       // If NVML still tells us this count covers the whole fleet, preserve
       // CUDA's order instead of exporting a ranked full-length mask.
@@ -39992,14 +40220,14 @@ static void apply_backend_defaults(Options & opt)
         }
       }
     }
-    if (!full_cuda_order_from_nvml && sel.empty()) {  // no NVML: fall back to indices
+    if (!mask_placed && !full_cuda_order_from_nvml && sel.empty()) {  // no NVML: fall back to indices
       how = "no NVML and no /proc list, fell back to indices";
       for (int i = 0; i < opt.gpu_devices; ++i) {
         if (i) sel += ",";
         sel += std::to_string(i);
       }
     }
-    if (!full_cuda_order_from_nvml && (!caller_mask || sel != caller_mask))
+    if (!mask_placed && !full_cuda_order_from_nvml && (!caller_mask || sel != caller_mask))
       ::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1);
     // SAY WHICH PHYSICAL DEVICE, because nothing downstream can.  Narrowing the
     // visible set renumbers it from zero, so every later line calls the chosen
@@ -40008,7 +40236,7 @@ static void apply_backend_defaults(Options & opt)
     // because a run pinned to physical GPU 4 reports itself as GPU0 throughout.
     // On a shared box the identity is also the only way to tell which card a job
     // actually landed on.
-    if (!full_cuda_order_from_nvml && opt.verbosity >= V_VERBOSE) {
+    if (!mask_placed && !full_cuda_order_from_nvml && opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
       os << "[GPU] selected " << sel << " (" << how
          << "); CUDA renumbers this set from 0, so later lines say GPU0\n";
@@ -40116,6 +40344,7 @@ static void apply_backend_defaults(Options & opt)
     // representative, and the embedded PTX makes the answer identical across
     // same-or-newer cards.
     if (opt.gpu_verify) order_all_gpus_before_cuda(opt, /*eager=*/true);
+    if (opt.gpu_verify) finalize_gpu_mask(opt, "main thread, GPU verify probe");
     if (opt.gpu_verify && gzv_kernel_available() != 1) {
       opt.gpu_verify = false;
       vlog(V_ERROR, opt,
