@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.73";
+static constexpr const char * GZSTD_VERSION = "0.17.74";
 //
 // Architecture overview:
 //
@@ -409,8 +409,11 @@ static inline nvmlReturn_t nvmlSystemGetDriverVersion(char * buf, unsigned int l
  began, including by hybrid runs that then started no GPU at all.  Since v0.17.63
  the all-device ranking starts the sampler from select_best_gpus(), after CUDA is
  up and only when GPUs are actually being brought up (see g_rank_all_after_cuda);
- the --gpu-devices N subset path and GPU verify still rank before CUDA, where
- restricting visibility or the probe needs it.
+ the --gpu-devices N subset path and opted-in GPU verify still rank before CUDA, where
+ restricting visibility or the probe needs it.  Since v0.17.74 the ALL-DEVICE
+ ranking (both the deferred and the GPU-verify form) runs only under
+ --gpu-order=ranked: it lost in every regime measured (see
+ order_all_gpus_before_cuda).  Choosing a SUBSET still ranks by default.
 
  It also fixes a signal problem. A SINGLE utilization read is unreliable —
  nvidia-smi was repeatedly observed reporting 0% while a gzstd job was actively
@@ -2429,7 +2432,7 @@ struct Options {
   // hybrid compress; warm-file decompress CPU-only; cold/unknown hybrid on every PCIe gen.
   bool backend_user_set = false;
   // True if the user passed any flag that only makes sense in hybrid/GPU mode
-  // (--gpu-batch, --gpu-streams, --gpu-devices, --gpu-mem-frac, --pinned/-no-pinned,
+  // (--gpu-batch, --gpu-streams, --gpu-devices, --gpu-order, --gpu-mem-frac, --pinned/-no-pinned,
   // --cpu-share, --cpu-batch, --hybrid-floor, --hybrid-floor-factor).
   // apply_backend_defaults() promotes this to an implicit --hybrid when no
   // explicit backend flag was given, so asymmetric mode doesn't silently
@@ -2503,6 +2506,10 @@ struct Options {
   PinMode pin_mode = PinMode::OFF;  // empirical: pinned cudaMemcpy is slower
                                     // on our typical workloads (see CHANGELOG
                                     // v0.12.45).  Opt-in with --pinned=on.
+  bool gpu_order_ranked = false;    // --gpu-order=ranked: rank an all-device set
+                                    // through NVML (v0.17.37).  OFF since
+                                    // v0.17.74: it lost in every regime measured
+                                    // (see order_all_gpus_before_cuda).
 #endif
   std::string stats_json;
   int sparse_mode = -1;           // -1=auto (file:on, stdout:off), 0=off, 1=on
@@ -3453,6 +3460,7 @@ static void print_help()
 "                      16 decompress; decompress auto-scales by size)\n"
 "  --gpu-streams N     CUDA streams per device (default: 1)\n"
 "  --gpu-devices N     number of GPUs (0 = auto)\n"
+"  --gpu-order O       cuda (default) | ranked: rank all GPUs by load first\n"
 "  --gpu-mem-frac X    fraction of free VRAM per device (default: 0.60)\n";
 #endif
   std::cout <<
@@ -4449,7 +4457,8 @@ static void print_help_long()
 "  NOTE — TUNING FLAGS IMPLY --hybrid.  Passing any GPU/hybrid tuning\n"
 "  option without an explicit --cpu-only / --gpu-only / --hybrid selects\n"
 "  --hybrid for you: --gpu-batch, --gpu-streams, --gpu-devices,\n"
-"  --gpu-mem-frac, --pinned / --no-pinned, --cpu-share, --cpu-batch,\n"
+"  --gpu-order, --gpu-mem-frac, --pinned / --no-pinned,\n"
+"  --cpu-share, --cpu-batch,\n"
 "  --hybrid-floor and --hybrid-floor-factor.\n"
 "\n"
 "  NOTE — CPU-ONLY BUILD.  A binary built without nvCOMP ACCEPTS every\n"
@@ -4602,6 +4611,17 @@ static void print_help_long()
 "     Number of GPUs to use.  0 = auto (all available GPUs, for both\n"
 "     compress and decompress; with --adapt, a single-file --gpu-only compress uses\n"
 "     the count its profile predicts is fastest -- see --adapt).\n"
+"\n"
+"  --gpu-order {cuda|ranked}    (default: cuda)\n"
+"     The order an all-device set is handed to the workers in.  cuda\n"
+"     keeps CUDA's own order.  ranked asks NVML (the NVIDIA management\n"
+"     library) for each card's utilization and free VRAM first and puts\n"
+"     the least-loaded card first; that costs 0.25-0.40 s of driver time\n"
+"     per run on an 8-GPU host, and measured on one (v0.17.74) it never\n"
+"     paid for itself: with one card busy or nearly out of VRAM the\n"
+"     pipeline absorbed the slow card for less than the ranking cost.\n"
+"     Without a caller mask, --gpu-devices N below the full count\n"
+"     still ranks, since a busy card can be most of the capacity.\n"
 "\n"
 "  --gpu-mem-frac X\n"
 "     Fraction of free VRAM per device to allocate (0.1..0.95,\n"
@@ -28950,7 +28970,7 @@ static void warm_gpu_contexts(const std::vector<int> & ids)
 //
 // Set by order_all_gpus_before_cuda() when it DEFERRED the ranking, so this path
 // never re-ranks a set the user (or the eager --verify path) already ordered with
-// CUDA_VISIBLE_DEVICES.
+// CUDA_VISIBLE_DEVICES.  Since v0.17.74 that happens only under --gpu-order=ranked.
 static std::atomic<bool> g_rank_all_after_cuda{false};
 
 #ifdef HAVE_NVML
@@ -37090,6 +37110,7 @@ static int run_calibrate(Options opt)
         const std::string devs = "--gpu-devices=" + std::to_string(n);
         const std::string fdenv = "GZSTD_CALIBRATE_GPUC_FD=" + std::to_string(pfd[1]);
         const char * cargv[] = { "gzstd", "--adapt", "--no-profile", "--gpu-only", "-q", "-k", "-f",
+                                 opt.gpu_order_ranked ? "--gpu-order=ranked" : "--gpu-order=cuda",
                                  devs.c_str(), in_path.c_str(), "-o", "/dev/null", nullptr };
         std::vector<char *> cenv;
         for (char ** e = environ; *e; ++e)
@@ -37365,12 +37386,31 @@ static int run_calibrate(Options opt)
 // ranking to select_best_gpus(), after CUDA is up and bringup has decided to use the
 // GPUs (see g_rank_all_after_cuda for why and what it measured).  EAGER is the old
 // behaviour -- rank now and set CUDA_VISIBLE_DEVICES before the first CUDA call --
-// and remains only for GPU verify, whose capability probe inside
+// and remains only for opted-in GPU verify, whose capability probe inside
 // apply_backend_defaults() is itself the first CUDA call on its path; the later
 // deferred call is then a no-op because the variable is set.
+//
+// OPT-IN SINCE v0.17.74 (--gpu-order=ranked).  It cost 0.25-0.40 s of NVML driver
+// time and LOST IN EVERY REGIME MEASURED at v0.17.73 (8-GPU host, --gpu-only
+// compress, rotated n=3-4, CUDA's order = CUDA_VISIBLE_DEVICES set to every card):
+//   quiet host, 20 GiB                          ranked slower by 0.40 s
+//   one card at 100% compute: 512M/1G/4G/20G    by 0.2 / 0.25 / 0.15 / 0.3 s
+//   one card at 3 GiB free VRAM: 512M/4G/20G    by 0.2 / 0.25 / 0 s
+//   six of eight cards busy (v0.17.63, -d)      by 0.3 s
+// The ranking did its job in all of them -- the loaded card went last -- but the
+// pipeline now absorbs a slow card for less than the ranking costs: at 512 MiB
+// in CUDA's order the busy card took 2 of the 4 batches and the run was still
+// faster.  The cost cannot be hidden: nvmlInit attaches every GPU (~0.3 s; the
+// NO_ATTACH flag leaves NVML with no devices at all), it serializes with cuInit
+// (-45 ms run in parallel), and beside context creation 0.27 of its 0.40 s still
+// shows.  v0.17.37's "11-15% faster" was a different pipeline.  Choosing WHICH
+// devices (--gpu-devices N, --adapt's count, --gds-only/--direct-stage's one
+// card) is a different question and still ranks: picking 1 or 2 of 8 is where
+// a loaded card costs the whole run.
 static void order_all_gpus_before_cuda(const Options & opt, bool eager = false)
 {
 #ifdef HAVE_NVML
+  if (!opt.gpu_order_ranked) return;           // CUDA's own order (see above)
   // Calibration runs both GPU passes even when a backend flag was also given;
   // judge that mode by what run_calibrate() does, not by opt.cpu_only/list_mode.
   if (opt.gpu_devices != 0 || (!opt.calibrate && (opt.cpu_only || opt.list_mode))
@@ -39730,8 +39770,8 @@ static void apply_backend_defaults(Options & opt)
   // alongside the core count that produced it.
   g_adapt_avail_cores.store(adapt_avail_cores(), std::memory_order_relaxed);
 #ifdef HAVE_NVCOMP
-  // --gpu-devices=N must HIDE the other devices from CUDA, not just decline to
-  // use them.
+  // A proper --gpu-devices=N subset must HIDE the other devices from CUDA,
+  // not just decline to use them.  An explicit full count is handled below.
   //
   // cudaGetDeviceCount triggers cuInit, and cuInit initialises every VISIBLE
   // device — measured ~0.15 s each, serialised in the driver. So limiting the
@@ -39866,8 +39906,16 @@ static void apply_backend_defaults(Options & opt)
     }
   }
 #endif
-  if (opt.gpu_devices > 0) {
-    // Start the sampler HERE, not at process entry.
+  // An explicit count can still name the FULL fleet.  In that case there is
+  // nothing to hide or rank by default: leave CUDA_VISIBLE_DEVICES unset so
+  // CUDA retains its own order.  Keep the old branch when /proc cannot tell us
+  // the count, when the caller supplied a mask, or when ranking was requested.
+  const size_t proc_gpu_count = opt.gpu_devices > 0 ? gz_proc_gpu_uuids().size() : 0;
+  const bool full_cuda_order = !opt.gpu_order_ranked && !::getenv("CUDA_VISIBLE_DEVICES")
+      && proc_gpu_count > 0 && (size_t)opt.gpu_devices >= proc_gpu_count;
+  if (opt.gpu_devices > 0 && !full_cuda_order) {
+    // Start the sampler for an unmasked subset or opted-in full ranking HERE,
+    // not at process entry.
     //
     // Starting it in main() cost every invocation ~370 ms — including
     // --version and --cpu-only runs that never touch a GPU — because the
@@ -39882,65 +39930,77 @@ static void apply_backend_defaults(Options & opt)
     // is nothing to give up by starting it at the point of use, which is also
     // exactly where v0.16.7 paid for its inline probe: only when a subset of
     // devices was requested and a ranking can therefore change something.
-    g_gpu_monitor.start();
+    bool full_cuda_order_from_nvml = false;
     std::string sel;
     const char * how = "user's CUDA_VISIBLE_DEVICES, first N of their list";
-    if (const char * cur = ::getenv("CUDA_VISIBLE_DEVICES")) {
-      std::stringstream ss(cur); std::string tok; int taken = 0;
+    const char * caller_mask = ::getenv("CUDA_VISIBLE_DEVICES");
+    if (caller_mask) {
+      std::stringstream ss(caller_mask); std::string tok; int taken = 0;
       while (taken < opt.gpu_devices && std::getline(ss, tok, ',')) {
         if (tok.empty()) continue;
         if (!sel.empty()) sel += ",";
         sel += tok; ++taken;
       }
     } else {
+      // A caller's mask already names the cards and their order.  Only an
+      // unmasked subset or opted-in full ranking needs the NVML sampler.
+      g_gpu_monitor.start();
       // Wait for the sampler's FIRST sweep, but only when the answer can change
-      // anything.  The sampler starts at process entry and publishes at ~0.39 s
-      // while gzstd arrives here at ~0.3 s, so the wait is about 90 ms in
-      // practice (measured: 2.88-3.03 s with it against 2.88-2.91 s without) —
-      // originally assumed to be the full ~347 ms NVML cost, which it is not.
-      // 90 ms is cheap insurance against starting on a contended GPU, which on a
-      // shared machine costs seconds.
+      // anything.  The measured inline and background variants overlapped
+      // (2.88-3.03 s with a wait against 2.88-2.91 s without); the bound is
+      // cheap insurance against starting on a contended GPU, which on a shared
+      // machine costs seconds.
       //
-      // Skipped entirely when there is no choice to make: if the run wants every
-      // GPU the box has, ranking them decides nothing.  /proc answers "how many"
-      // for free, without CUDA or NVML.  The bound is a backstop for a slow
+      // Skipped when there is no choice to make under the default CUDA order:
+      // if the run wants every GPU the box has, subset selection decides
+      // nothing.  An opted-in full ranking still waits for its first sample.
+      // /proc answers "how many" for free, without CUDA or NVML.  The bound is a backstop for a slow
       // driver, not the expected path — a driver-less box sets the sampler dead
       // and returns immediately rather than burning it.
       const size_t hw_gpus = gz_proc_gpu_uuids().size();
-      if (hw_gpus == 0 || (size_t)opt.gpu_devices < hw_gpus)
+      if (hw_gpus == 0 || (size_t)opt.gpu_devices < hw_gpus || opt.gpu_order_ranked)
         g_gpu_monitor.wait_ready(500);
-      auto rows = g_gpu_monitor.snapshot();
-      how = rows.empty() ? "no NVML sample, took the tail of /proc's list (a guess)"
-                         : "combined rank: utilization + free VRAM";
-      if (!rows.empty()) {
-        std::vector<GzDevRank> rin;
-        rin.reserve(rows.size());
-        for (const auto & r2 : rows) rin.push_back({r2.util, r2.free_bytes});
-        const std::vector<size_t> order = gz_rank_devices(rin);
-        for (size_t i = 0; i < order.size() && (int)i < opt.gpu_devices; ++i) {
-          if (!sel.empty()) sel += ",";
-          sel += rows[order[i]].uuid;   // "GPU-<uuid>": names a device with no index
-        }
-      } else {
-        // Blind fallback: the sampler has not answered (or there is no NVML).
-        // Take devices from the END of /proc's list — device 0 is what every
-        // other tool grabs first, so the tail is least likely to be in use.
-        // A guess, not a measurement.
-        std::vector<std::string> uuids = gz_proc_gpu_uuids();
-        for (size_t i = 0; i < uuids.size() && (int)i < opt.gpu_devices; ++i) {
-          if (!sel.empty()) sel += ",";
-          sel += uuids[uuids.size() - 1 - i];    // from the end
+      // A container may expose NVML but not the NVIDIA /proc inventory.
+      // If NVML still tells us this count covers the whole fleet, preserve
+      // CUDA's order instead of exporting a ranked full-length mask.
+      const size_t nvml_gpus = g_gpu_monitor.device_count();
+      full_cuda_order_from_nvml = !opt.gpu_order_ranked && hw_gpus == 0
+          && nvml_gpus > 0 && (size_t)opt.gpu_devices >= nvml_gpus;
+      if (!full_cuda_order_from_nvml) {
+        auto rows = g_gpu_monitor.snapshot();
+        how = rows.empty() ? "no NVML sample, took the tail of /proc's list (a guess)"
+                           : "combined rank: utilization + free VRAM";
+        if (!rows.empty()) {
+          std::vector<GzDevRank> rin;
+          rin.reserve(rows.size());
+          for (const auto & r2 : rows) rin.push_back({r2.util, r2.free_bytes});
+          const std::vector<size_t> order = gz_rank_devices(rin);
+          for (size_t i = 0; i < order.size() && (int)i < opt.gpu_devices; ++i) {
+            if (!sel.empty()) sel += ",";
+            sel += rows[order[i]].uuid;   // "GPU-<uuid>": names a device with no index
+          }
+        } else {
+          // Blind fallback: the sampler has not answered (or there is no NVML).
+          // Take devices from the END of /proc's list — device 0 is what every
+          // other tool grabs first, so the tail is least likely to be in use.
+          // A guess, not a measurement.
+          std::vector<std::string> uuids = gz_proc_gpu_uuids();
+          for (size_t i = 0; i < uuids.size() && (int)i < opt.gpu_devices; ++i) {
+            if (!sel.empty()) sel += ",";
+            sel += uuids[uuids.size() - 1 - i];    // from the end
+          }
         }
       }
     }
-    if (sel.empty()) {          // no NVML (driver-less box): fall back to indices
+    if (!full_cuda_order_from_nvml && sel.empty()) {  // no NVML: fall back to indices
       how = "no NVML and no /proc list, fell back to indices";
       for (int i = 0; i < opt.gpu_devices; ++i) {
         if (i) sel += ",";
         sel += std::to_string(i);
       }
     }
-    ::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1);
+    if (!full_cuda_order_from_nvml && (!caller_mask || sel != caller_mask))
+      ::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1);
     // SAY WHICH PHYSICAL DEVICE, because nothing downstream can.  Narrowing the
     // visible set renumbers it from zero, so every later line calls the chosen
     // GPU "GPU0" no matter which card it is -- which is not a cosmetic gap: it
@@ -39948,7 +40008,7 @@ static void apply_backend_defaults(Options & opt)
     // because a run pinned to physical GPU 4 reports itself as GPU0 throughout.
     // On a shared box the identity is also the only way to tell which card a job
     // actually landed on.
-    if (opt.verbosity >= V_VERBOSE) {
+    if (!full_cuda_order_from_nvml && opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
       os << "[GPU] selected " << sel << " (" << how
          << "); CUDA renumbers this set from 0, so later lines say GPU0\n";
@@ -40049,9 +40109,10 @@ static void apply_backend_defaults(Options & opt)
     // On a GPU outside that range the launch would fail with no-image-for-device
     // and abort the whole compress, so probe once and quietly demote to the CPU
     // VerifyPool (which covers every frame) instead.  The probe runs on the
-    // default device; order the all-device set first because this probe is also
-    // the first CUDA API call on this path, and CUDA freezes its visible-device
-    // order at initialization.  In the common homogeneous-GPU box that device is
+    // default device; when --gpu-order=ranked was requested, order the
+    // all-device set first because this probe is also the first CUDA API call
+    // on this path, and CUDA freezes its visible-device order at initialization.
+    // In the common homogeneous-GPU box that device is
     // representative, and the embedded PTX makes the answer identical across
     // same-or-newer cards.
     if (opt.gpu_verify) order_all_gpus_before_cuda(opt, /*eager=*/true);
@@ -40934,6 +40995,7 @@ static Options parse_args(int argc, char ** argv)
   }
 
   std::string pinned_value_tmp; // scratch buffer for --pinned VALUE parsing
+  std::string gpu_order_tmp;    // scratch buffer for --gpu-order VALUE parsing
 #ifndef HAVE_NVCOMP
   // Scratch destinations so a CPU-only build consumes GPU tuning arguments
   // exactly as the GPU build does, then discards them.
@@ -41295,6 +41357,13 @@ static Options parse_args(int argc, char ** argv)
       else die_usage("invalid value for --pinned (expected auto|on|off)");
       opt.gpu_hybrid_tuning_seen = true;
     }
+    else if (parse_str_arg("gpu-order", i, argc, argv, gpu_order_tmp)) {
+      std::transform(gpu_order_tmp.begin(), gpu_order_tmp.end(), gpu_order_tmp.begin(), ::tolower);
+      if (gpu_order_tmp == "cuda") opt.gpu_order_ranked = false;
+      else if (gpu_order_tmp == "ranked") opt.gpu_order_ranked = true;
+      else die_usage("invalid value for --gpu-order (expected cuda|ranked)");
+      opt.gpu_hybrid_tuning_seen = true;
+    }
 #else
     // CPU-ONLY BUILD (USE_NVCOMP=OFF).  The policy is: a DEMAND for the GPU
     // must fail loudly, a HINT about how to use one is accepted and ignored.
@@ -41331,6 +41400,12 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (a == "--no-pinned")                                        { cpu_build_ignored_gpu_flag = true; }
     else if (parse_str_arg("pinned", i, argc, argv, pinned_value_tmp))  { cpu_build_ignored_gpu_flag = true; }
+    else if (parse_str_arg("gpu-order", i, argc, argv, gpu_order_tmp)) {
+      std::transform(gpu_order_tmp.begin(), gpu_order_tmp.end(), gpu_order_tmp.begin(), ::tolower);
+      if (gpu_order_tmp != "cuda" && gpu_order_tmp != "ranked")
+        die_usage("invalid value for --gpu-order (expected cuda|ranked)");
+      cpu_build_ignored_gpu_flag = true;
+    }
 #endif
     else if (a == "--") {
       // End of options — everything after this is a literal path (archive

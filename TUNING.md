@@ -155,6 +155,18 @@ Plain `--calibrate`, without a file, compresses generated data and records **onl
 each number of GPUs. A rate from generated data doesn't predict the rate on your data, so `--adapt`
 learns the rates from your real runs instead.
 
+### Which cards
+
+When gzstd uses only some of the GPUs (`--gpu-devices N` below the device count, the count
+`--adapt` chose, or the single card `--gds-only` and `--direct-stage` use), and you have not
+set `CUDA_VISIBLE_DEVICES`, it asks NVIDIA's management library (NVML) for each card's
+utilization and free VRAM, then picks the least-loaded cards. That costs about 0.4 s, and on a shared
+machine it's worth it: a card that is busy with someone else's work can make a run many times slower.
+
+When it uses every GPU, it keeps CUDA's own order. Ranking all of them first costs the same 0.4 s, and in
+every case measured it saved less than that, because the work spreads across all the cards anyway.
+`--gpu-order=ranked` turns that ranking back on.
+
 ## Host setup: GPU startup cost
 
 To see what GPU startup costs on your machine, compare one GPU against all of them, on a file too

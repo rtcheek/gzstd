@@ -1,12 +1,93 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.73  
+**Covers:** v0.9.50 → v0.17.74  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.74 — an all-device GPU set keeps CUDA's order; the load ranking is opt-in (`--gpu-order=ranked`)
+
+The ROADMAP's open item on GPU ordering asked whether the all-device ranking (v0.17.37) repays its cost.
+Measured at v0.17.73 on the 8-GPU host: **it does not, in any regime we could construct.**
+
+**The cost is fixed, and cannot be hidden.** Split by phase (n=4, rotated), the ranking is exactly
+0.39–0.40 s between CUDA being ready and the workers coming online. Almost all of it is `nvmlInit`
+attaching all eight GPUs (0.30 s). None of the ways around it work:
+- NVML's no-attach mode initializes in 9 ms, but then reports no devices at all, even by PCI address.
+- Run in parallel with `cuInit`, it saves 45 ms: the driver serializes the two. This re-verifies
+  v0.17.63's finding, which was measured when `cuInit` took 0.79 s rather than 7 s.
+- Run beside the workers' context creation, 0.27 s of the 0.40 s still shows.
+
+(A first reading of "1.0 s" was `cuInit`'s own run-to-run noise of ±0.3 s lining up with the ranking.
+Splitting by phase removed it.)
+
+**The benefit is gone.** `--gpu-only` compress, ranked (the default until now) against CUDA's order
+(every card named in `CUDA_VISIBLE_DEVICES`, which skips the ranking), rotated n=3–4:
+
+| regime | ranked minus CUDA order |
+|---|---|
+| quiet host, 20 GiB (cold startup) | +0.40 s |
+| one card at 100% compute (a burner kernel on CUDA device 0): 512 MiB / 1 GiB / 4 GiB / 20 GiB | +0.2 / +0.25 / +0.15 / +0.3 s |
+| one card with 3 GiB of VRAM left: 512 MiB / 4 GiB / 20 GiB | +0.2 / +0.25 / 0 s |
+| six of eight cards busy (2026-09-18, decompress) | +0.3 s |
+
+The ranking did its job every time: the loaded card went last. But today's pipeline absorbs a slow
+card for less than the ranking costs. At 512 MiB in CUDA's order, the busy card took 2 of the 4 batches
+and the run was still faster. VRAM starvation is absorbed the same way, by the fit search shrinking
+that card's batches. v0.17.37's "11–15% faster" was measured on a different pipeline.
+
+**So an all-device set now keeps CUDA's order**: no NVML ranking, saving its 0.25–0.40 s cost on
+the measured GPU runs. This covers `--gpu-only` compress and decompress, hybrid runs that bring GPUs up, the `--tar`
+decode pool, and GPU `--verify`, whose eager pre-CUDA ranking is gated too. `--gpu-order=ranked`
+restores the old behaviour for anyone who wants loaded cards visibly avoided; `--gpu-order=cuda` is the
+default. Like the other GPU tuning flags, `--gpu-order` implies hybrid when no backend is named. A
+CPU-only build accepts and ignores it, but refuses an unknown value (exit 2), as the GPU build does.
+
+**Choosing WHICH cards is unchanged and still ranks when there is no caller mask**: `--gpu-devices N` when N is a subset, `--adapt`'s device count,
+and the single card of `--gds-only` and `--direct-stage`. Picking 1 or 2 of 8 is where a loaded card
+costs the whole run: on the shared day, GPU decompress on busy cards ran about 20× slower than the CPU.
+
+**Also measured: what per-GPU data exists without NVML.** For an ordinary user, only identity and
+topology: model, UUID, PCI address, NUMA node, link speed and width, power state, error counters. The
+one counter that moves with activity, interrupts per GPU, measures how a program WAITS rather than how
+busy the card is: the spin-waiting burner at 100% produced 0 interrupts/s, gzstd 20–26/s per card. The
+H100s' link stays at 32 GT/s idle and busy. Utilization, VRAM and processes need NVML or a CUDA context.
+
+### Verification
+
+Three cells changed and two added, and seven single-point mutants, each caught by the cell meant for it:
+
+| mutant | cell that fails |
+|---|---|
+| the default gate removed (always rank) | the new "keeps CUDA's order by default", both halves |
+| `ranked` parsed as `cuda` | "`--gpu-order=ranked` ranks every device after CUDA startup" |
+| GPU build accepts an unknown value | the new parse cell |
+| CPU-only build accepts an unknown value | the new parse cell, on that build |
+| the GPU-verify eager ranking still runs by default | "keeps CUDA's order by default", verify half |
+| a caller's mask ranked anyway | "a caller's `CUDA_VISIBLE_DEVICES` is never re-ranked" |
+| an explicit full `--gpu-devices` count takes the subset path (review fix below) | "keeps CUDA's order by default", full-count half |
+
+The mask cell now passes `--gpu-order=ranked`: with nothing ranking by default it would have passed
+whatever the mask rule did. Baselines 519 → 521 default, 677 → 679 extensive; no-GPU deltas 129 → 130
+and 157 → 158. Both configurations build warning-free, including the review edits below.
+
+**Review (Codex, GPT-6-Sol at high, one turn: SAFE TO COMMIT) found one wrong-choice path, now fixed:**
+an explicit `--gpu-devices=N` with N covering the `/proc` GPU inventory also names an all-device set.
+Before, it started the NVML sampler without waiting, found no sample, and exported the "tail of /proc"
+fallback: a REVERSED mask of every card. It now leaves `CUDA_VISIBLE_DEVICES` untouched by default, while an opted-in ranked
+run still takes the pre-CUDA ranking path. If `/proc` is unavailable, an NVML count provides the same
+check after the sampler starts. An opted-in full-count run waits for the first NVML sample so the
+ranking has data. The default-order suite cell covers the `/proc` case. Calibration's
+GPU-count children now inherit `--gpu-order`. A caller-supplied device mask no longer starts the
+unused NVML sampler or gets rewritten when its first N entries already are the whole mask.
+
+**Suites (default run):** GPU build 519 passed, 0 failed, 2 skipped of 521; `USE_NVCOMP=OFF` 391 / 0 /
+106, exactly the 391 the new no-GPU delta of 130 predicts, so that delta is measured. The two GPU skips
+are the trivial-park cell (never exercisable on this host) and the timing-dependent decompress
+tail-yield cell.
 
 ## v0.17.73 — `--gpu-only` compress: fewer GPUs can finish sooner, and `--adapt` learns how many
 

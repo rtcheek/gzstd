@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=519
-$EXTENSIVE && EXPECTED_TESTS=677
+EXPECTED_TESTS=521
+$EXTENSIVE && EXPECTED_TESTS=679
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -748,8 +748,12 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # (A GPU-LESS host running the nvCOMP build still runs the nine state-table
 # cells; like every other has_nvcomp cell, that host is not what this delta
 # measures.)  DERIVED until the next suite pair confirms it.
-EXPECTED_NOGPU_DELTA=129
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=157   # MEASURED 2026-09-21 (607 - 463) + 13 derived since
+# v0.17.74 --gpu-order: one always-run parse cell (both builds, --cpu-only) and
+# one GPU cell (the unmasked set keeps CUDA's order by default).  519 -> 521,
+# 677 -> 679; the no-GPU deltas grow by the GPU cell only: 129 -> 130 (the 129
+# was MEASURED by the v0.17.73 CPU-only run) and 157 -> 158.
+EXPECTED_NOGPU_DELTA=130
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=158   # MEASURED 2026-09-21 (607 - 463) + 14 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -4645,6 +4649,23 @@ done
 
 rm -f "$TMPDIR"/pin-*
 
+# --gpu-order (v0.17.74): parsed identically by both builds -- a CPU-only binary
+# accepts and ignores it, as it does --pinned -- and an unknown value is exit 2 in
+# both, because a typo is a typo whether or not the binary has a GPU backend.
+t0=$(now_ms); why=""
+for go in "--gpu-order=cuda" "--gpu-order=ranked" "--gpu-order ranked" "--gpu-order=RANKED"; do
+  rm -f "$TMPDIR/gord.zst"
+  # shellcheck disable=SC2086  # the separated form must split into two words
+  "$GZSTD" -q -k -f --cpu-only $go "$TMPDIR/small.txt" -o "$TMPDIR/gord.zst" 2>/dev/null || why+=" [$go: rc=$?]"
+  [[ -s "$TMPDIR/gord.zst" ]] || why+=" [$go: no output]"
+done
+rc=0; "$GZSTD" -q -k -f --cpu-only --gpu-order=sideways "$TMPDIR/small.txt" -o "$TMPDIR/gord-bad.zst" 2>/dev/null || rc=$?
+[[ $rc -eq 2 && ! -e "$TMPDIR/gord-bad.zst" ]] || why+=" [unknown value: rc=$rc]"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--gpu-order accepts cuda|ranked (both spellings) and refuses anything else" \
+  || fail "--gpu-order accepts cuda|ranked (both spellings) and refuses anything else" "$why"
+rm -f "$TMPDIR"/gord*
+
 # ============================================================
 # 29. GPU-specific options (if GPU available)
 # ============================================================
@@ -4723,7 +4744,9 @@ if has_gpu 2>/dev/null; then
     skip "multi-GPU dispatch round-trips across multiple devices" "single GPU host"
   fi
 
-  # THE ALL-DEVICE RANKING RUNS AFTER CUDA, AND ONLY AT GPU BRINGUP (v0.17.63).
+  # THE ALL-DEVICE RANKING RUNS AFTER CUDA, AND ONLY AT GPU BRINGUP (v0.17.63),
+  # AND ONLY WHEN ASKED FOR (--gpu-order=ranked, v0.17.74: by default CUDA's own
+  # order is used, because the ranking lost in every regime measured).
   # Nothing else in this suite can reach that code.  It is armed only when
   # CUDA_VISIBLE_DEVICES is UNSET, and the suite always exports a mask -- one
   # card by default, two in the multi-GPU cell above -- so every other cell
@@ -4743,7 +4766,7 @@ if has_gpu 2>/dev/null; then
   fi
   if (( ${#dr_cards[@]} >= 2 )); then
     dr_log=$(env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
-               "$GZSTD" --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/rank.zst" 2>&1)
+               "$GZSTD" --gpu-only --gpu-order=ranked -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/rank.zst" 2>&1)
     dr_rc=$?
     dr_line=$(printf '%s' "$dr_log" | tr '\r' '\n' | grep -m1 -- "$dr_ranked" || true)
     dr_n=$(printf '%s' "$dr_line" | sed -n 's/.*\[GPU\] all \([0-9]\+\) devices.*/\1/p')
@@ -4751,27 +4774,29 @@ if has_gpu 2>/dev/null; then
     dr_cnt=$(printf '%s\n' $dr_order | grep -c . || true)
     dr_uniq=$(printf '%s\n' $dr_order | sort -u | grep -c . || true)
     if [[ $dr_rc -ne 0 ]]; then
-      fail "all-device GPU ranking runs after CUDA startup" "compress exited $dr_rc"
+      fail "--gpu-order=ranked ranks every device after CUDA startup" "compress exited $dr_rc"
     elif [[ -z "$dr_line" ]]; then
-      fail "all-device GPU ranking runs after CUDA startup" \
+      fail "--gpu-order=ranked ranks every device after CUDA startup" \
            "no '$dr_ranked' line at -v with no device mask"
     elif [[ -z "$dr_n" || "$dr_n" -lt 2 || "$dr_cnt" != "$dr_n" || "$dr_uniq" != "$dr_n" ]]; then
-      fail "all-device GPU ranking runs after CUDA startup" \
+      fail "--gpu-order=ranked ranks every device after CUDA startup" \
            "ranked $dr_n device(s) but the order lists $dr_cnt ($dr_uniq distinct): $dr_line"
     elif env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
            "$GZSTD" -d --gpu-only -k -f "$TMPDIR/rank.zst" -o "$TMPDIR/rank.out" 2>/dev/null \
          && files_match "$TMPDIR/large.bin" "$TMPDIR/rank.out"; then
-      pass "all-device GPU ranking runs after CUDA startup" "($dr_n devices, order ${dr_order// /,})"
+      pass "--gpu-order=ranked ranks every device after CUDA startup" "($dr_n devices, order ${dr_order// /,})"
     else
-      fail "all-device GPU ranking runs after CUDA startup" "round-trip mismatch"
+      fail "--gpu-order=ranked ranks every device after CUDA startup" "round-trip mismatch"
     fi
     rm -f "$TMPDIR/rank.zst" "$TMPDIR/rank.out"
 
     # The other half of the contract: a mask the CALLER chose is never re-ranked,
     # so the deferred path must stay silent and the named cards keep their order.
+    # With --gpu-order=ranked: without it nothing ranks, and the cell would pass
+    # whatever the mask rule did.
     dr_two="${dr_cards[0]},${dr_cards[1]}"
     dr_log2=$(CUDA_VISIBLE_DEVICES="$dr_two" timeout --foreground -k 10 120 \
-                "$GZSTD" --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/rank2.zst" 2>&1)
+                "$GZSTD" --gpu-only --gpu-order=ranked -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/rank2.zst" 2>&1)
     dr_rc2=$?
     if [[ $dr_rc2 -ne 0 ]]; then
       fail "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "compress exited $dr_rc2"
@@ -4786,14 +4811,59 @@ if has_gpu 2>/dev/null; then
       fail "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "round-trip mismatch"
     fi
     rm -f "$TMPDIR/rank2.zst" "$TMPDIR/rank2.out"
+
+    # THE DEFAULT DOES NOT RANK (v0.17.74).  Same unmasked set; neither the
+    # deferred ranking (compress) nor the eager one (GPU verify, whose probe is
+    # the first CUDA call) may run, and both must still round-trip.
+    dr_rc3=0; dr_why=""
+    dr_log3=$(env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+                "$GZSTD" --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/rank3.zst" 2>&1) || dr_rc3=$?
+    [[ $dr_rc3 -eq 0 ]] || dr_why+=" [compress rc=$dr_rc3]"
+    printf '%s' "$dr_log3" | grep -q -- "$dr_ranked" && dr_why+=" [compress ranked the set]"
+    dr_log4=$(env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+                "$GZSTD" --gpu-only --verify -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/rank4.zst" 2>&1) || dr_rc3=$?
+    [[ $dr_rc3 -eq 0 ]] || dr_why+=" [verify rc=$dr_rc3]"
+    printf '%s' "$dr_log4" | grep -q 'devices kept, ordered by combined' && dr_why+=" [verify ranked the set]"
+    for dr_z in rank3 rank4; do
+      env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+        "$GZSTD" -d -q -c "$TMPDIR/$dr_z.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" \
+        || dr_why+=" [$dr_z round-trip]"
+    done
+    # An explicit count equal to the whole /proc inventory is also an
+    # all-device set.  It must not take the pre-CUDA subset path and write a
+    # ranked (or reversed fallback) CUDA_VISIBLE_DEVICES list.
+    dr_proc_n=0
+    if [[ -d /proc/driver/nvidia/gpus ]]; then
+      dr_proc_n=$(grep -l 'GPU UUID:.*GPU-' /proc/driver/nvidia/gpus/*/information 2>/dev/null | wc -l)
+    fi
+    if (( dr_proc_n > 0 && dr_proc_n == dr_n )); then
+      dr_rc5=0
+      dr_log5=$(env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+                  "$GZSTD" --gpu-only --gpu-devices="$dr_n" -v -k -f \
+                  "$TMPDIR/large.bin" -o "$TMPDIR/rank5.zst" 2>&1) || dr_rc5=$?
+      [[ $dr_rc5 -eq 0 ]] || dr_why+=" [explicit full count rc=$dr_rc5]"
+      printf '%s' "$dr_log5" | grep -q '\[GPU\] selected' \
+        && dr_why+=" [explicit full count rewrote device order]"
+      printf '%s' "$dr_log5" | grep -q -- "$dr_ranked" \
+        && dr_why+=" [explicit full count ranked after CUDA]"
+      env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+        "$GZSTD" -d -q -c "$TMPDIR/rank5.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" \
+        || dr_why+=" [explicit full count round-trip]"
+    fi
+    [[ -z "$dr_why" ]] && pass "an all-device GPU set keeps CUDA's order by default" \
+      || fail "an all-device GPU set keeps CUDA's order by default" "$dr_why"
+    rm -f "$TMPDIR/rank3.zst" "$TMPDIR/rank4.zst" "$TMPDIR/rank5.zst"
   elif [[ "${GPU_ALL_DEVICES:-}" == *,* ]]; then
-    skip "all-device GPU ranking runs after CUDA startup" \
+    skip "--gpu-order=ranked ranks every device after CUDA startup" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
     skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
+    skip "an all-device GPU set keeps CUDA's order by default" \
+         "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
   else
-    skip "all-device GPU ranking runs after CUDA startup" "single GPU host"
+    skip "--gpu-order=ranked ranks every device after CUDA startup" "single GPU host"
     skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "single GPU host"
+    skip "an all-device GPU set keeps CUDA's order by default" "single GPU host"
   fi
 
   # --gpu-streams
@@ -4823,8 +4893,9 @@ if has_gpu 2>/dev/null; then
 
   rm -f "$TMPDIR"/gstream-* "$TMPDIR"/gmem-* "$TMPDIR"/gdev* "$TMPDIR"/cshare*
 else
-  skip "all-device GPU ranking runs after CUDA startup" "no GPU"
+  skip "--gpu-order=ranked ranks every device after CUDA startup" "no GPU"
   skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "no GPU"
+  skip "an all-device GPU set keeps CUDA's order by default" "no GPU"
   skip "--gpu-streams" "no GPU"
   skip "--gpu-mem-frac" "no GPU"
   skip "--gpu-devices" "no GPU"

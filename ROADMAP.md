@@ -487,15 +487,23 @@ placement win to repay it; v0.17.37's "ranked is 11-15% faster" was a QUIET box 
 measurement (one card's free VRAM went 12 -> 40 GiB), so these are rotated medians with the instrument, not wall clock
 alone.
 
-**Open design question, not a plan:** the ranking is a snapshot whose cost is fixed and whose benefit scales with run
+**ANSWERED v0.17.74: the all-device ranking is now opt-in (`--gpu-order=ranked`).** Re-measured at v0.17.73, it
+lost in every regime, including a burner-loaded card and a VRAM-starved card at 512 MiB to 20 GiB (details in CHANGELOG
+v0.17.74); its 0.25-0.40 s cannot be hidden (NVML attach serializes with CUDA in the driver). Subset choice still ranks.
+The original question, kept for the record: the ranking is a snapshot whose cost is fixed and whose benefit scales with run
 length and with how much the cards actually differ. Worth considering whether it should be skipped when no card is a
-good choice (every device busy), or gated on the input size the way GPU bringup already is. Operationally, today:
-`--gpu-devices N` or an explicit `CUDA_VISIBLE_DEVICES` skips the ranking, and a warm input avoids the GPU entirely.
+good choice (every device busy), or gated on the input size the way GPU bringup already is. Operationally at v0.17.63:
+`--gpu-devices N` or an explicit `CUDA_VISIBLE_DEVICES` skips that all-device ranking, and a warm input avoids the GPU entirely.
 
 **Follow-ups, not done:**
 - **The `--gpu-devices N` path still pays the ~380 ms before CUDA** on every run, including runs that then skip bringup.
   Restricting visibility is worth it when GPUs are used. For a small explicit `--gpu-devices N --hybrid` job it is the
-  old waste.
+  old waste. MEASURED 2026-09-24: 20 GiB hybrid that skips the GPU, 1.01-1.17 s default vs 1.40-1.44 s with
+  `--gpu-devices=2`. **PLANNED v0.17.75 (rtcheek):** in hybrid, place a guessed mask with `putenv` before any thread
+  exists, rank through NVML on a background thread nobody waits for, and overwrite the mask in place on the bringup
+  thread just before `cuInit` (POSIX: altering a putenv'd string changes the environment). Modes that need the GPU at
+  once (`--gpu-only` subsets, `--gds-only`, `--direct-stage`) keep ranking first: CUDA freezes the visible set at
+  `cuInit`, so there is nothing to switch to later, and a busy single card costs far more than 0.4 s.
 - **Multi-file runs re-rank per file.** The sampler keeps running, so later files avoid another sampler startup and
   first-sweep wait, but may start on a different card. That is harmless for an all-device set; recorded in case a
   per-process order is ever wanted.
