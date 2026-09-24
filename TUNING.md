@@ -181,6 +181,41 @@ on every GPU saves most of that time for each job that follows. The costs: the c
 memory on each GPU (typically a few hundred MiB), and the process shows up in `nvidia-smi` as a GPU
 user. gzstd doesn't provide such a process.
 
+### If GPUDirect Storage is configured: the static BAR1 setting
+
+On the 8-GPU host above, startup had risen from about 0.25 s per GPU to 0.75 s since an earlier
+measurement. The change in between was the NVIDIA driver option that GPUDirect Storage's kernel P2PDMA
+mode requires:
+
+```
+options nvidia NVreg_RegistryDwords="RMForceStaticBar1=1;..."
+```
+
+Check whether a host has it with `grep RegistryDwords /proc/driver/nvidia/params`.
+
+With static BAR1, the driver's unified-memory module (`nvidia-uvm`, 570.207) adds the GPU's whole
+BAR1 window, 128 GiB on an H100, to the kernel's peer-to-peer memory pool each time a process first
+opens that GPU. When the GPU is released, it unmaps the window, but the pool entry is never removed.
+Measured on that host:
+
+- **Kernel memory leaks with every GPU process.** Each process start grew each GPU's
+  `/sys/bus/pci/devices/*/p2pmem/size` by 128 GiB, and the kernel's `VmallocUsed` by 4 MiB per GPU.
+  None of it comes back until a reboot. After 18 days of uptime that was 5,234 additions and 20.4 GiB.
+- **Startup: probable, not yet proven.** Registering each GPU was one of the two slow driver calls
+  seen with `strace`. Removing the setting and rebooting would show how much of the per-GPU startup
+  cost it accounts for; that test has not been run yet.
+- **HMM is not the cause.** Reloading `nvidia_uvm` with `uvm_disable_hmm=1` changed nothing (6.93 s
+  against 6.91 s for 8 GPUs).
+
+A resident process that keeps every GPU open avoids both costs, because a GPU is only registered
+when its first user opens it. While one held all 8 GPUs, two further CUDA starts took 0.44 s each and
+leaked nothing.
+
+If you don't need GPUDirect Storage's peer-to-peer path, don't set static BAR1: `--direct-stage` gets
+about 95% of `--gds-only`'s benefit without it (see GDS.md).
+
+### What `--adapt` sees
+
 Whatever the host does, `--adapt` measures the startup cost as part of each number of GPUs'
 overhead. The measurement ends before process-exit teardown, so a device-count-dependent teardown
 cost is absent from the prediction. If startup cost changes, a later re-measurement picks that up.

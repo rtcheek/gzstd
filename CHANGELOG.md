@@ -184,6 +184,33 @@ with a real `pread(fd, &magic, 4, off)` on the same line still fails. The lint i
 on HEAD. The GPU run's two skips are the trivial-park cell (never exercisable on this host) and the
 timing-dependent decompress tail-yield cell; neither touches this change. Extensive deltas stay derived.
 
+### After the commit: the startup cost is GPUDirect Storage's static BAR1, and it leaks
+
+The suspect named above, the unified-memory module's HMM support, is ruled out: reloading
+`nvidia_uvm` with `uvm_disable_hmm=1` gave 6.93 s for 8 GPUs against 6.91 s.
+
+The host's GDS setup sets `RMForceStaticBar1=1`, which cuFile's kernel P2PDMA mode requires. It went
+in on 2026-08-19/20, after the August measurement of 0.25 s per GPU. In the 570.207 driver source
+(`nvidia-uvm/uvm_pmm_gpu.c`), every GPU REGISTRATION (the first process to open a GPU) calls
+`pci_p2pdma_add_resource()` over the whole 128 GiB BAR1, and unregistering only unmaps the pages: the
+kernel's pool entry is never removed. Measured:
+
+| per CUDA start, 8 GPUs | result |
+|---|---|
+| `/sys/bus/pci/devices/*/p2pmem/size` | +128 GiB on every GPU |
+| `VmallocUsed` | +32 MiB (4 MiB per GPU), never returned until reboot |
+| accumulated after 18 days | 5,234 additions, 20.4 GiB (`VmallocUsed` 21.9 GiB) |
+| back-to-back `cuInit` | 6.9, 6.4, 6.4 s: flat, not growing with the pool |
+| while another process holds all 8 GPUs | 0.44 s, pool +0, `VmallocUsed` +0 |
+
+The registration call is one of the two slow driver calls `strace` showed, so static BAR1 very
+probably accounts for most of the per-GPU startup cost. A reboot without the setting would prove how
+much, and also whether GDS works on this host through `nvidia-fs` alone; that test is deferred to the
+next maintenance window. TUNING.md and GDS.md now document the cost and the workaround (a resident
+process that keeps the GPUs open). The consumer-GPU workstation is unaffected either way: it has two
+independent blockers (a 256 MiB BAR1 with no resizable BAR, and `nvidia-fs` refusing every BAR1 map on
+that card), so `--direct-stage` remains its path.
+
 ## v0.17.72 — `--train` builds dictionaries, byte-identical to `zstd --train`
 
 The dictionary work's Stage C, and the last of it: gzstd now TRAINS dictionaries. Until now `--train`,

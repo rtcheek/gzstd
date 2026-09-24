@@ -182,11 +182,15 @@ split one PCIe link).
   ~0.95 s + 0.25 s in August.** A bare `cudaGetDeviceCount` program shows it, so it is the host's.
   Per GPU, two driver calls take ~0.63 s each (`UVM_REGISTER_GPU` and one RM control); only the
   FIRST process to open a GPU pays (6.97 s alone, 0.44 s while another process held all 8);
-  persistence mode does not keep it away. **OWED (root):** reload `nvidia_uvm` with
-  `uvm_disable_hmm=1` and re-time — HMM is enabled on a 1.5 TB host and is the prime suspect. If it
-  is the cause, it belongs in TUNING.md's host section; if not, that section's resident-context
-  advice stands alone. v0.17.73 made gzstd pay it less instead (next item), which helps whatever
-  the host does.
+  persistence mode does not keep it away. **HMM RULED OUT 2026-09-24** (`uvm_disable_hmm=1`: 6.93 s
+  against 6.91). **The cause is GPUDirect Storage's static BAR1** (`RMForceStaticBar1=1`, set
+  2026-08-19/20, after the August measurement): 570.207's `nvidia-uvm/uvm_pmm_gpu.c` adds each GPU's
+  128 GiB BAR1 to the kernel P2PDMA pool at every GPU registration and never removes it. MEASURED: +4
+  MiB kernel memory per GPU per process start (20.4 GiB after 18 days); a resident CUDA holder stops
+  both the cost (0.44 s) and the leak. **OWED (a reboot, deferred to the next update window):** the
+  A/B without static BAR1, which also answers whether GDS works here through `nvidia-fs` alone. Keep
+  the update reboot and the A/B separate. Documented in TUNING.md and GDS.md. v0.17.73 made gzstd pay
+  it less (next item), which helps whatever the host does.
 - **v0.17.73 shipped the two cheap levers:** `--gpu-only` compress reads through the reader pool
   (a pageable upload that takes its own page faults runs at 40% speed), and `--adapt` /
   `--calibrate FILE` learn the device count from `overhead + size / rate`. 195 GiB: 20.2–21.4 s →

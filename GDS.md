@@ -110,6 +110,16 @@ journalctl -b -u systemd-modules-load | grep -i nvidia
 
 If the file is missing, create it with the single line `nvidia-fs`.
 
+### The kernel P2PDMA mode leaks kernel memory on every GPU process (570 driver)
+
+cuFile's `use_pci_p2pdma` mode needs the NVIDIA driver option `RMForceStaticBar1=1`, which maps all
+of VRAM into BAR1. With it set, the 570.207 driver adds each GPU's whole BAR1 window to the kernel's
+peer-to-peer pool every time a process first opens that GPU, and never removes it. On an 8-GPU host
+this cost 4 MiB of kernel memory per GPU per process, 20.4 GiB after 18 days, and very probably
+most of the per-GPU CUDA startup time. That startup is paid by every GPU program on the machine, not
+only by GDS. Details, how to check, and the workaround are in TUNING.md, under "Host setup: GPU
+startup cost". Set it only if you need that mode.
+
 ## Verifying it actually works
 
 **This is the part people get wrong, so it is worth being precise: almost every signal you might
