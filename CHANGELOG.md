@@ -1,12 +1,188 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.72  
+**Covers:** v0.9.50 → v0.17.73  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.73 — `--gpu-only` compress: fewer GPUs can finish sooner, and `--adapt` learns how many
+
+The GPU compress staging question on the ROADMAP asked for the post-batch tail to be measured again
+first. It is gone: 0.18 s where it used to be 6.5 s. GPU compress had still become 20–25% SLOWER since
+August, though (all numbers: the 8-GPU server, quiet, 195 GiB from tmpfs to `/dev/null`):
+
+| mode | v0.17.72 | August |
+|---|---|---|
+| `--cpu-only` | 6.3–6.8 s (29 GiB/s) | 7.7 s |
+| `--gpu-only`, 8 GPUs | **20.2–21.4 s** | 16.1–17.1 s |
+
+**Where it went: starting CUDA, which is not gzstd's code.** `cuInit` now costs about 0.75 s plus
+0.75 s for each visible GPU (1 GPU 1.49 s, 2 → 2.11, 4 → 3.57, 8 → 6.71); in August it was 0.95 s plus
+0.25 s each. A bare program that only calls `cudaGetDeviceCount` shows the same. Under `strace`, two
+driver calls take about 0.63 s each per GPU: the unified-memory module's GPU registration
+(`UVM_REGISTER_GPU`) and one resource-manager control call. Only the FIRST process to open a GPU pays:
+6.97 s for all 8 alone, 0.44 s while another process held them. Persistence mode was on and does not
+keep it away. The prime suspect is the unified-memory module's HMM support, enabled on a host with
+1.5 TB of RAM; testing it needs root, and it is the host's setting, not gzstd's. A timestamped `-vv`
+run put the whole 20 s as 7 s of startup, 9.7 s of batches at about 20 GiB/s, 1.3 s of writer tail and
+1.5 s of driver teardown at exit.
+
+So on this host a GPU run is half startup, and extra GPUs mostly add startup. By device count:
+8 → 20.7–20.9 s, 4 → 18.1–18.6, **2 → 16.5–17.1**, 1 → 20.2–20.8.
+
+### `--gpu-only` compress reads through the reader pool, not mmap
+
+A pageable upload's speed depends on WHO takes the page faults. Measured with a standalone copy test:
+from a file mapping nobody has touched, 9.2 GiB/s; from the same memory already touched, 23.1 GiB/s,
+the same as anonymous memory (22.9). With mmap, the GPU worker's own upload takes the faults. The
+reader pool's threads touch the data ahead of the GPU workers, so the upload never does. 8 GPUs:
+20.2–21.2 → 18.7 s; with the count below, 4 GPUs went to 14.2–14.7 s.
+
+Scoped to `--gpu-only` compress on purpose: the same switch makes CPU compress slightly slower
+(6.5–7.0 s against 6.3–6.7) and the default hybrid much slower (10.1 s against 6.8–7.3), because the
+CPU workers read the mapping directly and cheaply. `--mmap=on` overrides; `--gds-only`,
+`--direct-stage` and `--tar` have their own readers and are untouched.
+
+**It costs memory.** The pool's buffers are private memory, where mmap's pages were the page cache's.
+At 2 GPUs on this host the peak RSS went from 26.5 GiB (mmap) to 37.3 GiB (pool), for 16.9 s → 14.1 s.
+That is the pool sizing every `--no-mmap` run already had here (1,408 buffers of 16 MiB, under a
+70 GiB in-flight throttle), and it scales with the host's memory.
+
+**Tried and reverted:** keeping mmap and faulting each batch in (`MADV_POPULATE_READ`) inside the GPU
+worker just before its upload. 30% SLOWER: a serial step on every batch, and 128 threads contending for
+one mapping. Populating is fast in itself (60 GiB/s on 8 threads, 27 on 16), so the loss is contention
+and placement, not the populate.
+
+### `--adapt` chooses the number of GPUs
+
+For each number of GPUs the profile now keeps two numbers: **overhead** (wall time minus the busy
+window, from the first upload to the last batch drained) and **rate** (bytes over that window). The
+prediction for an input is `overhead + size / rate`, and `--adapt` uses the count with the least. The
+candidates are 1, 2, 4, … below the device count, plus all. The state table sits beside
+`gpuc_choose`:
+
+- On an input of **8 GiB or more**, a count never measured is tried first: all, then half, then a
+  quarter, down to 1. A count becomes eligible for re-measurement after 20 compress runs; one stale
+  count is re-measured per large run.
+- **Smaller inputs never explore**: they take the best known count. An ordinary run records a rate
+  only after at least 2 s of GPU work; `--calibrate FILE` records its measured rate regardless.
+- **Within 3% of the best, the fewer GPUs**, which leaves the rest for anyone else on the machine.
+- **stdin**, of unknown size, takes the highest measured rate; within 3% of it, the fewer GPUs.
+- An explicit `--gpu-devices` always wins, and the choice is made before `cuInit`: that is where every
+  visible device is paid for.
+
+Measured: from an empty profile, runs explored 8, 4, 2, 1 and then settled on **2 GPUs: 13.2–14.7 s,
+about 36% faster than v0.17.72's 20.2–21.4 s.**
+
+### `--calibrate [FILE]` measures the device count
+
+`--calibrate` on a host with 2–64 GPUs now runs one child process per candidate count, each a
+`--gpu-only` compress, before the parent touches CUDA. That order is load-bearing: the first version
+ran the pass after the parent's own GPU rows, every child found the GPUs already open, and every count
+reported about 1.5 s of overhead, which is a model with no per-device cost at all.
+
+- **Without FILE, overhead only.** The generated corpus is half random bytes, and incompressible data
+  quadruples the GPU path's return traffic: at 2 GPUs it compressed at 8.7 GiB/s against 22.9 on real
+  data. A recorded synthetic rate chose 8 GPUs for a job 2 finish 20% faster. Rates come from real
+  runs.
+- **`--calibrate FILE`** compresses the user's own file at each count (read only, output to
+  `/dev/null`), records overhead AND rate, and prints the count it would choose at a tenth of, one and
+  ten times the file's size. It warns that rates from a file under ~60 GiB include the batch tuner's
+  ramp.
+  On the 195 GiB input: 1 GPU 3.19 s + 13.59 GiB/s, 2 → 4.43 s + 21.54, 4 → 5.06 s + 16.76,
+  8 → 11.48 s + 31.28; best 1 at 19.5 GiB, **2 at 195.3 GiB** (13.5 s predicted against 17.7 for all
+  8), 8 at 1,953 GiB. The whole `--calibrate` took 1 min 37 s.
+- An existing `-o` target is now refused before any measuring starts, not after it.
+
+### Also
+
+- `--help` printed `%%` in three places: the long help goes through `std::cout`, not `printf`.
+- New **TUNING.md**: calibrating gzstd for a machine, the GPU-count model, and measuring a host's GPU
+  startup cost.
+
+### Review (Codex, GPT-6-Sol at high): four wrong-choice defects and the taps' overhead, fixed before commit
+
+- **A GPU driver change kept the device-count model.** The save clears GPU-derived values when the
+  driver changes and then stamps the new one; the new `gpu_devices_N_*` keys were not in that list, so
+  the next run read an old driver's measurements as the new driver's.
+- **Several input files trained a model of one.** `--adapt --gpu-only A B` pays `cuInit` once but
+  has a writer tail per file; summing the two walls taught an overhead that predicts neither. Multi-file
+  runs now use all devices and record nothing.
+- **A malformed `CUDA_VISIBLE_DEVICES` could change what CUDA exposes.** Measured here: CUDA stops at
+  the first invalid entry (`0,9,1` → 1 device, `9,0,1` → 0) and ANY duplicate rejects the whole list
+  (`0,0,1` → 0, `0,1,1` → 0). Narrowing `0,1,1` to its first two entries exposes 2 devices where the
+  list as given exposes none, so `--adapt` could turn the same command's exit 2 into a success,
+  depending on the profile. The list is now validated against the GPUs `/proc` reports (indices in
+  range, UUID prefixes unambiguous, no duplicates, no mix of the two); a list that cannot be verified
+  before CUDA starts, MIG instances included, is left exactly as given.
+- **More than 64 visible devices** (the profile's limit) explored an unrecordable count forever;
+  such hosts now keep all devices, and `--calibrate` skips the pass.
+- The taps now arm only under `--adapt`, and a second start mark in the same batch was dropped.
+
+Pushed back, and agreed: the stdin rule keeps the 3% near-tie (fewer devices within 3% of the best
+rate: less startup for the same speed). The reviewer had removed it to match the docs; the docs were
+changed instead. The
+test hook first bypassed the new validation, so no cell could reach it; it now takes a synthetic GPU
+count (`GZSTD_DEBUG_GPUC_CHOICE_EXIT=8`) and validates against that. It also reports the branches
+that leave the count alone, which it previously never reached: a cell for them would have gone on to
+compress its 200 GiB sparse inputs.
+
+The closing pass found two defects in that restructure, both fixed and both now covered by cells.
+**An empty or malformed hook value (`1x`) exited 0 without compressing anything**; only a valid
+positive count now enables the hook. And the stdin tie compared inverse rates, so 29.11 GiB/s against
+30 (2.97% slower) missed the 3% tie; rates are now compared directly.
+
+### Verification
+
+Thirteen cells. Nine drive `gpuc_choose` and the choice site on any nvCOMP build, GPU or not: a debug
+hook (`GZSTD_DEBUG_GPUC_CHOICE_EXIT=N`) supplies N synthetic GPUs, validates `CUDA_VISIBLE_DEVICES`
+against them, prints the APPLIED count or the reason nothing was chosen, and exits before `cuInit`;
+sparse files set the input size, and the profile is written directly. Two GPU cells check that
+`--gpu-only` compress reads through the pool and round-trips, and that a multi-file run records no
+device-count sample while a one-file run does. Two `-e` cells run `--calibrate` with and without FILE
+on the two freest cards, because the suite masks every other run to one card.
+
+Nineteen single-point mutants, all caught:
+
+| mutant | cells that fail |
+|---|---|
+| the 3% tie rule off | 2 |
+| explore the fewest devices first | 2 |
+| never re-check a stale count | 1 |
+| short inputs explore too | 1 |
+| stdin scored by overhead instead of rate | 2 |
+| the choice never assigned to `--gpu-devices` | **7 — only because the hook prints the APPLIED count**: it first printed the choice, and every state-table cell passed with the assignment deleted |
+| `--gpu-only` compress keeps mmap | 1 |
+| `--calibrate FILE` records no rate | 1 |
+| plain `--calibrate` records a rate | 1 |
+| a driver change keeps the model | 1 |
+| a multi-file run trains the model | 1 |
+| a multi-file run chooses a count | 1 |
+| duplicate devices accepted | 1 |
+| an out-of-range index accepted | 1 |
+| a mix of indices and UUIDs accepted | 1 — **only after the probe changed**: its first form named device 0 twice, which the duplicate check refused anyway |
+| more than 64 devices chosen among | 1 |
+| UUID prefixes not matched | 1 |
+| a malformed hook value (`1x`, empty) still enables the hook | 1 |
+| the stdin tie compared by inverse rate | 1 |
+
+Baselines 508 → 519 default, 664 → 677 extensive; the `USE_NVCOMP=OFF` binary skips all thirteen
+(no-GPU deltas 118 → 129, 144 → 157). The existing `--adapt` profile section passes 13 of 13 on both
+builds. The startup-cost probe TUNING.md gives was run as written: 1.9–2.5 s on one GPU against 10.2 s
+on all 8, with `-vv` confirming the GPUs did the batches. Both configurations build warning-free.
+
+**Suites (default, at your call): GPU build 516 passed, 1 failed, 2 skipped of 519; `USE_NVCOMP=OFF`
+389 / 1 / 105, which is exactly the 390 the no-GPU delta of 129 predicts, so that delta is now
+measured.** The failure was the same on both: the endian source lint matched the `sscanf` that parses
+`--calibrate`'s child report lines (`&dv, &wl, &ac, &by) == 4` has the shape of a host-order field
+read, but it parses decimal text, which has no byte order). `sscanf` is now an exempt callee in
+`scripts/check-endian-reads.sh`, with the reason; exemptions subtract only the call itself, and a probe
+with a real `pread(fd, &magic, 4, off)` on the same line still fails. The lint is clean on the tree and
+on HEAD. The GPU run's two skips are the trivial-park cell (never exercisable on this host) and the
+timing-dependent decompress tail-yield cell; neither touches this change. Extensive deltas stay derived.
 
 ## v0.17.72 — `--train` builds dictionaries, byte-identical to `zstd --train`
 

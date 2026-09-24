@@ -176,20 +176,33 @@ split one PCIe link).
   transfers.** At batch≈14 the kernel dominated (40 ms/batch); at the settled batch=256, D2H was
   40% of a 1232 ms batch and the kernel 27%; after the v0.16.2 fix another record put the kernel
   at 68% and D2H at 10%. Any future claim here must state the batch size it was measured at.
-- **The post-batch tail.** At 195 GiB, ~6.5 s of a 16.5 s run happened after the last GPU batch,
-  and `--cpu-only` showed the same shape — so it is the shared pipeline, not a GPU problem. Parts
-  of this were since addressed (incremental input retirement, the v0.17.55 teardown sleeps), but
-  **it has not been re-measured at HEAD**. Do that before anything else here: it was bigger than
-  every staging effect on this list.
+- **The post-batch tail — RE-MEASURED 2026-09-24 (v0.17.72): GONE**, 0.18 s where it was 6.5 s.
+  What replaced it as the largest cost is `cuInit` (next item).
+- **`cuInit` on the 8-GPU server: ~0.75 s + ~0.75 s per visible GPU (6.7 s for 8), up from
+  ~0.95 s + 0.25 s in August.** A bare `cudaGetDeviceCount` program shows it, so it is the host's.
+  Per GPU, two driver calls take ~0.63 s each (`UVM_REGISTER_GPU` and one RM control); only the
+  FIRST process to open a GPU pays (6.97 s alone, 0.44 s while another process held all 8);
+  persistence mode does not keep it away. **OWED (root):** reload `nvidia_uvm` with
+  `uvm_disable_hmm=1` and re-time — HMM is enabled on a 1.5 TB host and is the prime suspect. If it
+  is the cause, it belongs in TUNING.md's host section; if not, that section's resident-context
+  advice stands alone. v0.17.73 made gzstd pay it less instead (next item), which helps whatever
+  the host does.
+- **v0.17.73 shipped the two cheap levers:** `--gpu-only` compress reads through the reader pool
+  (a pageable upload that takes its own page faults runs at 40% speed), and `--adapt` /
+  `--calibrate FILE` learn the device count from `overhead + size / rate`. 195 GiB: 20.2–21.4 s →
+  13.2–14.7 s on 2 GPUs. Still ~2× the 256 CPU cores' 6.3–6.8 s, so the decision below is unchanged
+  for this box; on the workstation the device-count model is **untested** — with 2 cards its only
+  question is 1 vs 2.
 - The kernel is nvCOMP's. Chunk size and batch shape are the only levers we own.
 
 ### The decision this section exists to force
 
 The cheap work is done and the expensive work has lost three times. Before another round, answer:
 **is a GPU compress path that runs at 42% of the CPU pool's throughput worth more engineering on
-this hardware?** Three honest options — (a) keep it as-is for CPU-poor hosts, where the ratio
+this hardware?** (v0.17.73: now ~48%, 13.2–14.7 s against 6.3–6.8, by paying less startup.) Three
+honest options — (a) keep it as-is for CPU-poor hosts, where the ratio
 inverts and the flag earns its place; (b) re-measure the tail at HEAD and decide with that number
-in hand; (c) close the chapter and say so in the help, so users stop reaching for `--gpu-only` on
+in hand (DONE 2026-09-24: the tail is gone; startup is the cost); (c) close the chapter and say so in the help, so users stop reaching for `--gpu-only` on
 boxes like this one. **Do not open (d), another staging redesign, without a new measurement that
 contradicts the table above.**
 

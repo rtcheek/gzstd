@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.72";
+static constexpr const char * GZSTD_VERSION = "0.17.73";
 //
 // Architecture overview:
 //
@@ -105,6 +105,7 @@ static constexpr const char * GZSTD_VERSION = "0.17.72";
 #include <unistd.h>
 #ifndef _WIN32
 #include <sys/syscall.h>   // SYS_memfd_create (--calibrate's RAM-backed corpus file)
+#include <sys/wait.h>      // waitpid (--calibrate's per-device-count children)
 #endif
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -3502,9 +3503,11 @@ static void print_help()
 "                      engine choice; persists verdicts per machine\n"
 "  --no-adapt          explicitly off (accepted now; default flip planned v1.0)\n"
 "  --no-profile        don't read or write the per-machine calibration profile\n"
-"  --calibrate         measure this machine's engine rates over generated data\n"
+"  --calibrate [FILE]  measure this machine's engine rates over generated data\n"
 "                      and record them to the profile; -o NEWFILE also measures\n"
-"                      the write sink (scratch file, created + removed)\n"
+"                      the write sink (scratch file, created + removed); on a\n"
+"                      multi-GPU host, FILE measures the GPU device count on\n"
+"                      your own data (see --help)\n"
 "\n"
 "Logging:\n"
 "  -v / -vv / -vvv     verbose / debug / trace\n"
@@ -3829,6 +3832,23 @@ static void print_help_long()
 "     over: bare --adapt enables the governor; zstd's value form\n"
 "     --adapt=min#,max# also enables it, but the level bounds are\n"
 "     ignored with a warning (gzstd does not vary the level mid-stream).\n"
+"     GPU DEVICE COUNT: a single-file --gpu-only compress runs on as many GPUs as the\n"
+"     profile predicts will finish THIS input soonest.  More devices are\n"
+"     not free: starting CUDA costs time for every visible device (measured\n"
+"     ~0.75 s each on an 8-GPU host, ~7 s for all 8), and past a few\n"
+"     devices the host, not the GPUs, sets the rate.  So each device count\n"
+"     keeps two numbers: its fixed overhead (wall time minus the time the\n"
+"     GPUs were busy) and its busy rate, and the predicted time is\n"
+"     overhead + size / rate.  On inputs of 8 GiB or more, counts that were\n"
+"     never measured are tried first -- all devices, then half, then a\n"
+"     quarter, down to 1 -- and stale counts are eligible after 20 runs; within 3%\n"
+"     of the best, the fewer devices win.  Smaller inputs never explore:\n"
+"     they take the best measured count.  stdin (size unknown) takes the\n"
+"     highest measured rate; within 3%, fewer devices win.  Ordinary runs\n"
+"     need 2 s or more of GPU work\n"
+"     to save a rate; shorter ones save overhead alone.  An explicit\n"
+"     --gpu-devices always wins.  To skip the exploring runs, measure once\n"
+"     with --calibrate FILE.\n"
 "     PROFILE: a clean --adapt run of 3 s or longer records its measured\n"
 "     calibration to ${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json, keyed\n"
 "     by a hardware fingerprint (CPU model + cores, GPU names, kernel).\n"
@@ -3836,7 +3856,8 @@ static void print_help_long()
 "     and residency verdicts with their stamps, input-domain rate,\n"
 "     reader-path rates and counts, the settled reader-pool count, writer\n"
 "     probe verdicts, extraction writer-pool sizes by workload class,\n"
-"     settled GPU batch, dominant regime, run and fault counts, and the\n"
+"     settled GPU batch, per-GPU-count overhead and rate, dominant regime,\n"
+"     run and fault counts, and the\n"
 "     schema epoch plus the writing version.\n"
 "     Values merge as a 50/50 EMA (exponential moving average), so drift\n"
 "     converges over a few runs; a GPU-fault run only counts the fault,\n"
@@ -3847,14 +3868,28 @@ static void print_help_long()
 "     writing (use it for honest benchmarks).\n"
 "\n"
 "  --calibrate\n"
-"     Measure this machine instead of processing input.  Runs generated\n"
-"     in-memory CPU and GPU compress AND decompress calibrations, prints\n"
-"     both directions, and records them to the profile.  Any input files\n"
-"     on the command line are NOT processed.\n"
+"     Measure this machine instead of producing an output archive.  Runs\n"
+"     generated in-memory CPU and GPU compress AND decompress calibrations,\n"
+"     prints both directions, and records them to the profile.  An optional\n"
+"     FILE is read by the GPU device-count pass described below.\n"
 "     With `-o NEWFILE` (a path that does not exist) it also writes,\n"
 "     fsyncs, measures and then removes a scratch target, to calibrate the\n"
 "     sink rate of that filesystem.  --no-profile measures and prints\n"
 "     without saving.\n"
+"     GPU DEVICE COUNT (hosts with 2 or more GPUs; see --adapt): first,\n"
+"     before this process touches CUDA, one child process per candidate\n"
+"     count (1, 2, 4, ... and all) runs a --gpu-only compress, because only\n"
+"     a process that opens a device first pays that device's startup.\n"
+"     Without FILE the children compress up to 4 GiB of generated data and record\n"
+"     each count's OVERHEAD only: a generated corpus's rate does not predict\n"
+"     real data's (measured 8.7 against 22.9 GiB/s at 2 devices).\n"
+"     --calibrate FILE compresses your file instead and records overhead\n"
+"     AND rate, then prints the count it would choose at a tenth, one and\n"
+"     ten times the file's size.  Use a file like the ones you compress\n"
+"     and, ideally, of 60 GiB or more: smaller runs include the batch\n"
+"     tuner's ramp, so their rates are right for files that size but low\n"
+"     for much larger ones.  FILE is only read, never written; the\n"
+"     generated-data rows are measured as without it.\n"
 "\n"
 "  --direct / --no-direct\n"
 "     Use O_DIRECT (bypass page cache) vs. buffered I/O.  Default is\n"
@@ -3963,7 +3998,7 @@ static void print_help_long()
 "     final size before writes begin.  Off by default: with O_DIRECT\n"
 "     output (the Gen4+ default), fallocate creates unwritten extents\n"
 "     and each O_DIRECT write then pays an unwritten-to-written extent\n"
-"     conversion — measured ~4-6%% slower on ext4/NVMe for both compress\n"
+"     conversion — measured ~4-6% slower on ext4/NVMe for both compress\n"
 "     and decompress.  --preallocate forces it on for filesystems or\n"
 "     workloads where reserving space up front helps (and for early\n"
 "     out-of-space detection).  Only ever applies to the O_DIRECT paths\n"
@@ -4247,6 +4282,10 @@ static void print_help_long()
 "     or rebuilds on CPU; when the input/output cannot be replayed or the\n"
 "     selected staged topology has no compatible CPU rescue, the run exits\n"
 "     5 instead.\n"
+"     A --gpu-only compress reads regular files through the reader pool,\n"
+"     not mmap: an upload from a mapping that is not yet populated takes\n"
+"     its own page faults and copies at ~40% of the speed of populated\n"
+"     memory (measured 9.2 against 23.1 GiB/s).  --mmap=on overrides.\n"
 "\n"
 "  --gds-only                                            [EXPERIMENTAL]\n"
 "     EXPERIMENTAL and hardware-specific: the suite exercises this mode\n"
@@ -4561,7 +4600,8 @@ static void print_help_long()
 "\n"
 "  --gpu-devices N\n"
 "     Number of GPUs to use.  0 = auto (all available GPUs, for both\n"
-"     compress and decompress).\n"
+"     compress and decompress; with --adapt, a single-file --gpu-only compress uses\n"
+"     the count its profile predicts is fastest -- see --adapt).\n"
 "\n"
 "  --gpu-mem-frac X\n"
 "     Fraction of free VRAM per device to allocate (0.1..0.95,\n"
@@ -4594,7 +4634,7 @@ static void print_help_long()
 "     (host-to-device) / D2H transfers.  Pinned cudaMemcpy uses a\n"
 "     different DMA (direct memory access) path than pageable; on our\n"
 "     typical workloads it has measured SLOWER than pageable (compress\n"
-"     ~15%% slower, decompress ~2.4x slower) — the cost of locking pages\n"
+"     ~15% slower, decompress ~2.4x slower) — the cost of locking pages\n"
 "     and the extra mmap-or-vector copy outweighs any DMA savings when\n"
 "     the input is already in the page cache.  Off is the default for\n"
 "     that reason.  The infrastructure is plumbed and exposed in case\n"
@@ -4602,7 +4642,7 @@ static void print_help_long()
 "       off (default): no pinned buffers; data goes pageable -> device\n"
 "              and device -> std::vector directly.  --no-pinned is an\n"
 "              alias for this.\n"
-"       auto:  ration to <=50%% of available RAM, summed across all GPU\n"
+"       auto:  ration to <=50% of available RAM, summed across all GPU\n"
 "              workers.  Streams that fit get pinned; streams that\n"
 "              don't fall back to pageable.  Visible at -v as\n"
 "              `[PINNED] H2D+D2H <size> reserved (shared per slot)`.\n"
@@ -6307,6 +6347,31 @@ private:
 static std::atomic<double>   g_adapt_cpu_ema_gibs{0.0};
 static std::atomic<double>   g_adapt_gpu_ema_gibs{0.0};
 static std::atomic<uint64_t> g_adapt_settled_batch{0};
+// GPU-count model taps (v0.17.73), --gpu-only compress only: the window in
+// which ANY device was working (first upload issued .. last batch drained) and
+// the device count.  The rest of the run's wall clock -- cuInit, contexts,
+// startup, the writer tail -- is the per-run overhead that more devices raise;
+// the window is where more devices might help.  See gpuc_choose.
+// Reset by compress_nvcomp, harvested and cleared by AdaptObs::add_meter.
+static std::atomic<uint64_t> g_gpuc_first_ns{0};
+static std::atomic<uint64_t> g_gpuc_last_ns{0};
+static std::atomic<uint64_t> g_gpuc_bytes{0};
+static std::atomic<int>      g_gpuc_devices{0};
+// A busy window shorter than this measures the batch tuner's ramp, not the
+// devices, so it records overhead but no rate.
+static constexpr double GPUC_RATE_MIN_S = 2.0;
+static inline void gpuc_mark_start(uint64_t t)
+{
+  uint64_t cur = g_gpuc_first_ns.load(std::memory_order_relaxed);
+  while ((cur == 0 || t < cur)
+         && !g_gpuc_first_ns.compare_exchange_weak(cur, t, std::memory_order_relaxed)) {}
+}
+static inline void gpuc_mark_done(uint64_t t, uint64_t bytes)
+{
+  g_gpuc_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  uint64_t cur = g_gpuc_last_ns.load(std::memory_order_relaxed);
+  while (t > cur && !g_gpuc_last_ns.compare_exchange_weak(cur, t, std::memory_order_relaxed)) {}
+}
 // Which read path actually engaged ("mmap" | "pread" | "direct") — stored
 // by the reader entry points (static string literals only), consumed by the
 // profile writer for the M4 action-5 read-path priors.  Last reader wins.
@@ -6978,6 +7043,21 @@ struct AdaptObs {
   int backend_used = 0;                          // 1 = cpu-only, 2 = hybrid
   bool tar_wt_converged = false;                 // -d --tar: probe found no further gain
   bool fault = false;                            // a GPU fault/rebuild happened this process
+  // GPU-count model (--gpu-only compress): per device count, the summed wall
+  // clock and busy window of the operations that ran on that many devices, and
+  // the bytes they took.  A normal run carries at most one sample; --calibrate
+  // carries one per candidate count, and marks them measured on purpose
+  // (force_rate), so a short deliberate window still records its rate.
+  struct GpucSample {
+    int devices = 0;
+    uint64_t wall_ns = 0, active_ns = 0, bytes = 0;
+    bool force_rate = false;
+    // --calibrate without FILE: the synthetic corpus says nothing about the
+    // rate on the user's data (half of it is random bytes, which on the GPU
+    // path quadruples the D2H traffic), so it records the overhead only.
+    bool no_rate = false;
+  };
+  std::vector<GpucSample> gpuc;
 
   void add_meter(const Meter & m, uint64_t wall, bool compress_dir)
   {
@@ -7003,6 +7083,20 @@ struct AdaptObs {
     }
     if (g_adapt_ewgrow_converged.load(std::memory_order_relaxed))
       tar_wt_converged = true;
+    if (compress_dir) {
+      const int      dv = g_gpuc_devices.exchange(0, std::memory_order_relaxed);
+      const uint64_t f  = g_gpuc_first_ns.exchange(0, std::memory_order_relaxed);
+      const uint64_t l  = g_gpuc_last_ns.exchange(0, std::memory_order_relaxed);
+      const uint64_t by = g_gpuc_bytes.exchange(0, std::memory_order_relaxed);
+      if (dv > 0 && f > 0 && l > f && by > 0 && wall > l - f) {
+        GpucSample * smp = nullptr;
+        for (auto & g : gpuc) if (g.devices == dv) smp = &g;
+        if (!smp) { gpuc.push_back({}); smp = &gpuc.back(); smp->devices = dv; }
+        smp->wall_ns   += wall;
+        smp->active_ns += l - f;
+        smp->bytes     += by;
+      }
+    }
     payload_bytes += compress_dir ? m.read_bytes.load() : m.wrote_bytes.load();
     wall_ns += wall;
     reader_bytes += m.read_bytes.load();
@@ -7058,6 +7152,22 @@ static void adapt_merge_dir(AdaptJv & dir, const AdaptObs & obs)
 
   const double wall_s = obs.wall_ns / 1e9;
   const double GiB = 1024.0 * 1024.0 * 1024.0;
+  // GPU-count model (v0.17.73): for the device count N this run used, its
+  // OVERHEAD -- wall clock outside the devices' busy window: cuInit, contexts,
+  // startup, the writer tail -- and the window's RATE.  gpuc_choose predicts a
+  // run as overhead + size / rate.  The rate needs GPUC_RATE_MIN_S of busy
+  // window; the overhead is real at any size.  _run stamps the measurement so a
+  // stale one is rechecked (a host change such as a driver setting moves both).
+  for (const AdaptObs::GpucSample & g : obs.gpuc) {
+    if (g.devices <= 0 || g.active_ns == 0 || g.wall_ns <= g.active_ns) continue;
+    const std::string k = "gpu_devices_" + std::to_string(g.devices);
+    const double active_s = g.active_ns / 1e9;
+    dir.put_num(k + "_overhead_s",
+                ema(dir.gnum(k + "_overhead_s", 0), (g.wall_ns - g.active_ns) / 1e9));
+    if ((active_s >= GPUC_RATE_MIN_S || g.force_rate) && !g.no_rate)
+      dir.put_num(k + "_gibs", ema(dir.gnum(k + "_gibs", 0), g.bytes / GiB / active_s));
+    dir.put_num(k + "_run", dir.gnum("runs", 0));
+  }
   if (wall_s > 0 && obs.payload_bytes > 0) {
     const double rate = obs.payload_bytes / GiB / wall_s;
     dir.put_num("overall_gibs", ema(dir.gnum("overall_gibs", 0), rate));
@@ -7251,9 +7361,131 @@ struct AdaptPriors {
     double tar_write_threads = 0;                           // -d --tar settled pool size (flat fallback)
     double tar_wt_class[ADAPT_TAR_WCLASSES] = {0, 0, 0};    // -d --tar settled size per workload class
     double tar_wt_converged = 0;                            // -d --tar probe converged
+    // GPU-count model, indexed by device count (compress only; see gpuc_choose).
+    // 0 = never measured.  Dropped with the other GPU values on a driver change.
+    static constexpr int GPUC_MAX = 64;
+    double gpuc_overhead_s[GPUC_MAX + 1] = {}, gpuc_gibs[GPUC_MAX + 1] = {},
+           gpuc_run[GPUC_MAX + 1] = {};
     std::string regime;
   } dir[2];                 // [0] = compress, [1] = decompress
 };
+
+/*---- GPU-count selection for --gpu-only compress (v0.17.73) ----------------
+ The device count must be fixed BEFORE cuInit: CUDA initialises every visible
+ device, and hiding one afterwards saves nothing -- which is exactly where the
+ per-device cost lands (measured on an 8-GPU host, 2026-09-24: cuInit 1.49 s
+ with 1 device visible, 3.57 s with 4, 6.71 s with 8).  Past a few devices the
+ run is fed by the host, not the GPUs (195 GiB: 8 devices 20.7 s, 4 18.1 s, 2
+ 16.5 s, 1 20.2 s), so the best count depends on the input size and on the
+ host, and is learned rather than assumed.
+
+ Model: a single-file run on N devices takes overhead(N) + size / rate(N),
+ measured by qualifying --gpu-only compresses on N devices (adapt_merge_dir).
+ Multi-file invocations keep the existing all-device behavior because one
+ cuInit is shared across files while each file has its own writer tail; those
+ runs do not update the single-file model.  Candidates are
+ 1, 2, 4, ... below the device count, and the device count itself.
+
+   profile for this machine            this run              device count
+   ----------------------------------  --------------------  ------------------------
+   (--gpu-devices given)               any                   the user's; nothing chosen
+   a candidate never measured          size >= EXPLORE_MIN   explore it: ALL devices
+                                                             first (today's default,
+                                                             so the first run costs
+                                                             nothing new), then halving
+   a candidate never measured          smaller, or unknown   best predicted among the
+                                                             measured; all if none
+   all measured, one >= RECHECK stale  size >= EXPLORE_MIN   re-measure the stalest
+   all measured                        known size            argmin overhead + size/rate;
+                                                             within 3%, fewer devices
+   all measured                        unknown size (stdin)  best rate; within
+                                                             3%, fewer devices
+
+ Every single-file choice is measurable by the run that makes it: whatever N
+ runs is recorded under N.  --calibrate fills the same keys for every candidate, so
+ an --adapt run after it starts converged.
+----------------------------------------------------------------------------*/
+static constexpr double GPUC_EXPLORE_MIN_GIB = 8.0;
+static constexpr double GPUC_TIE = 0.03;
+
+static std::vector<int> gpuc_candidates(int devices)
+{
+  std::vector<int> c;
+  for (int n = 1; n < devices; n *= 2) c.push_back(n);
+  c.push_back(devices);
+  return c;
+}
+
+struct GpucChoice { int n = 0; std::string why; };
+
+// size_gib < 0: unknown (stdin).  runs: the profile's run counter for staleness.
+template <typename Dir>
+static GpucChoice gpuc_choose(int devices, double size_gib, const Dir & d, double runs)
+{
+  GpucChoice ch;
+  if (devices <= 1) { ch.n = devices; ch.why = "one device"; return ch; }
+  if (devices > Dir::GPUC_MAX) {
+    ch.n = devices;
+    ch.why = "device count exceeds the profile model; all devices";
+    return ch;
+  }
+  const std::vector<int> cand = gpuc_candidates(devices);
+  auto known = [&](int n) { return n <= Dir::GPUC_MAX && d.gpuc_overhead_s[n] > 0 && d.gpuc_gibs[n] > 0; };
+  const bool measurable = size_gib >= GPUC_EXPLORE_MIN_GIB;
+  if (measurable) {
+    // Explore: all devices first, then halving (candidate list reversed).
+    for (auto it = cand.rbegin(); it != cand.rend(); ++it)
+      if (!known(*it)) {
+        ch.n = *it;
+        ch.why = "exploring " + std::to_string(*it) + " (never measured)";
+        return ch;
+      }
+    int stalest = 0;
+    double oldest = runs;
+    for (int n : cand)
+      if (runs - d.gpuc_run[n] >= ADAPT_BACKEND_RECHECK_RUNS && d.gpuc_run[n] < oldest) {
+        oldest = d.gpuc_run[n]; stalest = n;
+      }
+    if (stalest) {
+      ch.n = stalest;
+      ch.why = "rechecking " + std::to_string(stalest) + " (measured "
+             + std::to_string((long long)(runs - oldest)) + " runs ago)";
+      return ch;
+    }
+  }
+  // Exploit: predicted time, or rate when the size is unknown.
+  double best = 0;
+  for (int n : cand) {
+    if (!known(n)) continue;
+    const double score = size_gib >= 0 ? d.gpuc_overhead_s[n] + size_gib / d.gpuc_gibs[n]
+                                       : 1.0 / d.gpuc_gibs[n];
+    if (!ch.n || score < best) { best = score; ch.n = n; }
+  }
+  if (!ch.n) { ch.n = devices; ch.why = "no measurement yet; all devices"; return ch; }
+  // Near-ties go to fewer devices, including stdin: a small rate difference
+  // cannot justify startup on extra devices when the input size is unknown.
+  for (int n : cand) {
+    if (!known(n) || n >= ch.n) continue;
+    if (size_gib < 0) {
+      // Compare rates directly: 29.11 versus 30 GiB/s is within 3% in rate,
+      // although its inverse-rate score is more than 3% above the best.
+      if (d.gpuc_gibs[n] >= (1.0 - GPUC_TIE) / best) { ch.n = n; break; }
+    } else {
+      const double score = d.gpuc_overhead_s[n] + size_gib / d.gpuc_gibs[n];
+      if (score <= best * (1.0 + GPUC_TIE)) { ch.n = n; break; }
+    }
+  }
+  char buf[160];
+  if (size_gib >= 0)
+    std::snprintf(buf, sizeof buf, "predicted %.1f s for %.1f GiB (overhead %.1f s, %.1f GiB/s)",
+                  d.gpuc_overhead_s[ch.n] + size_gib / d.gpuc_gibs[ch.n], size_gib,
+                  d.gpuc_overhead_s[ch.n], d.gpuc_gibs[ch.n]);
+  else
+    std::snprintf(buf, sizeof buf, "best measured rate %.1f GiB/s (input size unknown)",
+                  d.gpuc_gibs[ch.n]);
+  ch.why = buf;
+  return ch;
+}
 
 static AdaptPriors adapt_load_priors()
 {
@@ -7327,6 +7559,14 @@ static AdaptPriors adapt_load_priors()
       clamp_stamp(D.overall_hybrid_cls_run[c]);
     }
     D.regime        = dj->gstr("regime", "");
+    if (P.gpu_valid)
+      for (int n = 1; n <= AdaptPriors::Dir::GPUC_MAX; ++n) {
+        const std::string k = "gpu_devices_" + std::to_string(n);
+        D.gpuc_overhead_s[n] = dj->gnum(k + "_overhead_s", 0);
+        D.gpuc_gibs[n]       = dj->gnum(k + "_gibs", 0);
+        D.gpuc_run[n]        = dj->gnum(k + "_run", 0);
+        clamp_stamp(D.gpuc_run[n]);
+      }
     D.path_mmap     = dj->gnum("path_mmap_gibs", 0);
     D.path_pread    = dj->gnum("path_pread_gibs", 0);
     D.path_direct   = dj->gnum("path_direct_gibs", 0);
@@ -7555,6 +7795,14 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
         AdaptJv & d2 = entry.set(dn);
         for (const std::string & k : gpu_keys)
           if (d2.get(k)) d2.put_num(k, 0);
+        // The count model is GPU-derived too.  Clearing only the older keys
+        // would stamp the new driver above stale count rates on this save;
+        // the next load would then accept them as measurements of that driver.
+        for (auto & kv : d2.obj)
+          if (kv.first.rfind("gpu_devices_", 0) == 0) {
+            kv.second.t = AdaptJv::NUM;
+            kv.second.num = 0;
+          }
       }
       // Only announce a CHANGE when there was something to change from.  On a
       // virgin profile have_drv is false, so this branch runs to establish the
@@ -26920,6 +27168,8 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   C.stats.batches  += 1;
   C.stats.chunks   += C.filled;
 
+  if (g_gpuc_devices.load(std::memory_order_relaxed) > 0) gpuc_mark_done(now_ns(), in_sum);
+
   // Report to shared auto-tuner
   if (shared_tune && !shared_tune->locked.load()) {
     shared_tune->window_bytes.fetch_add(in_sum, std::memory_order_relaxed);
@@ -27925,6 +28175,7 @@ static void gpu_worker(
         // the work, not after it, or the accounting charges this batch's
         // staging to whatever the worker was waiting on beforehand.
         wd_phase(slot_index, WatchPhase::Submit);
+        if (g_gpuc_devices.load(std::memory_order_relaxed) > 0) gpuc_mark_start(now_ns());
         cudaEventRecord(C.ev_h2d_begin, C.stream);
         // Sub-phase timing (-vvv): the H2D region interleaves the copies with a
         // full XXH64 pass over every byte, and the copies are host-synchronous
@@ -29500,6 +29751,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     }
     gpu_count = (int)gpu_ids.size();
     if (gpu_count <= 0) return;
+    // GPU-count model: arm the taps for this operation.  --gpu-only only: in
+    // hybrid the CPU carries part of the input, so the window would not be the
+    // devices' rate.
+    g_gpuc_first_ns.store(0, std::memory_order_relaxed);
+    g_gpuc_last_ns.store(0, std::memory_order_relaxed);
+    g_gpuc_bytes.store(0, std::memory_order_relaxed);
+    // Ordinary --gpu-only runs do not save the count model; calibration's
+    // children pass --adapt even though they use --no-profile.
+    g_gpuc_devices.store(opt.gpu_only && opt.adapt ? gpu_count : 0,
+                         std::memory_order_relaxed);
 
     // Per-device state, built from the REAL count.  Both types hold a mutex, so
     // they cannot be resized later — this is the one point where the count is
@@ -36557,6 +36818,12 @@ static void append_tar_index(int dfd, FILE * f, Meter & meter) {
 static int run_calibrate(Options opt)
 {
   const double GiB = 1024.0 * 1024.0 * 1024.0;
+  // Refuse an existing -o target BEFORE measuring anything: the device-count
+  // pass below can run for minutes, and the sink block that also checks this
+  // comes after it.
+  if (!opt.to_stdout && opt.output_named && !opt.output.empty() && fs::exists(opt.output))
+    die_usage("--calibrate -o target exists; it would be overwritten and "
+              "removed — give a path to create: " + opt.output);
 
   // Corpus: 1 GiB, clamped to an eighth of available RAM — the timed
   // passes hold up to 4 concatenated copies in a memfd alongside the
@@ -36713,6 +36980,183 @@ static int run_calibrate(Options opt)
   rows[2].ran = rows[2].gibs > 0;
   std::fprintf(stderr, "[CALIBRATE] cpu decompress  %7.2f GiB/s\n", rows[2].gibs);
 
+  std::vector<AdaptObs::GpucSample> gpuc_samples;   // recorded with cobs below
+  // GPU DEVICE COUNT (v0.17.73).  --gpu-only compress at every candidate count
+  // (gpuc_candidates), each in a CHILD process that sees only that many devices:
+  // cuInit charges every VISIBLE device, so a process that has already
+  // initialised all of them cannot measure what fewer would cost.  Each child
+  // runs the real pipeline (--adapt --no-profile --gpu-devices=N) and hands back
+  // the sample an --adapt run records -- overhead outside the busy window, and
+  // the window's rate -- under the same keys (see gpuc_choose).
+  //
+  //   --calibrate FILE   the children compress FILE: overhead AND rate, so the
+  //                      next --adapt run starts converged for data like it.
+  //   --calibrate        the children compress 4 GiB of the synthetic corpus:
+  //                      OVERHEAD ONLY.  Its rate does not transfer -- measured,
+  //                      2 devices 8.7 GiB/s on it against 22.9 on real data,
+  //                      because half of it is random bytes and on the GPU path
+  //                      incompressible data quadruples the D2H traffic.  A
+  //                      recorded synthetic rate chose 8 devices for a job 2
+  //                      finish 20% faster.  --adapt learns the rates on real runs.
+  //
+  // THIS RUNS BEFORE THIS PROCESS TOUCHES CUDA, and must.  cuInit's per-device
+  // cost is paid only by the FIRST process to open a device: measured, 6.97 s
+  // for 8 devices alone, 0.44 s while another process held all 8.  With the gpu
+  // rows below measured first, every child found the devices held by this
+  // process and reported ~1.5 s of overhead at every count.  (Another tenant
+  // holding the devices has the same effect, and is then the truth for this
+  // machine at this moment; gpuc_choose's stale-recheck re-measures later.)
+  // The children never recurse: they carry GZSTD_CALIBRATE_GPUC_FD.
+  //
+  // Test hook: under GZSTD_DEBUG_CALIBRATE_BYTES (the suite's tiny corpus) the
+  // pass is SKIPPED unless GZSTD_DEBUG_CALIBRATE_GPUC=1 asks for it -- every
+  // child pays its own cuInit, and a dozen calibrate cells x four children
+  // would add minutes to a suite that is testing something else.  When it is
+  // asked for, the synthetic stage is 64 MiB: the cell checks the rows, not
+  // the numbers.
+#ifdef HAVE_NVCOMP
+  const bool gpuc_test_hook = std::getenv("GZSTD_DEBUG_CALIBRATE_BYTES") != nullptr;
+  const bool gpuc_test_skip = gpuc_test_hook && !std::getenv("GZSTD_DEBUG_CALIBRATE_GPUC");
+  if (!std::getenv("GZSTD_CALIBRATE_GPUC_FD") && !gpuc_test_skip) {
+    int devices = 0;
+    if (const char * cur = ::getenv("CUDA_VISIBLE_DEVICES")) {
+      std::stringstream ss(cur); std::string tok;
+      while (std::getline(ss, tok, ',')) if (!tok.empty()) ++devices;
+    } else {
+      devices = (int)gz_proc_gpu_uuids().size();
+    }
+    // FILE mode: one named regular file.
+    std::string cal_file;
+    uint64_t cal_file_bytes = 0;
+    if (opt.inputs.size() == 1 && opt.inputs[0] != "-") {
+      struct stat st {};
+      if (::stat(opt.inputs[0].c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+        die_usage("--calibrate FILE: " + opt.inputs[0] + " is not a readable regular file");
+      cal_file = opt.inputs[0];
+      cal_file_bytes = (uint64_t)st.st_size;
+    } else if (opt.inputs.size() > 1) {
+      die_usage("--calibrate takes at most one FILE");
+    }
+    int gfd = -1;
+    std::string in_path;
+    double cal_gib = 0;
+    if (devices <= 1) {
+      std::fprintf(stderr, "[CALIBRATE] gpu devices: %s, nothing to choose\n",
+                   devices == 1 ? "one device" : "no device");
+    } else if (devices > AdaptPriors::Dir::GPUC_MAX) {
+      std::fprintf(stderr, "[CALIBRATE] gpu devices: %d exceeds the profile model's %d-device "
+                           "limit; count pass skipped\n", devices, AdaptPriors::Dir::GPUC_MAX);
+    } else if (!cal_file.empty()) {
+      in_path = cal_file;
+      cal_gib = double(cal_file_bytes) / GiB;
+    } else {
+      // Overhead only needs the devices to start and finish; 4 GiB, or a quarter
+      // of free RAM when that is less.
+      size_t want = size_t(4) << 30;
+      if (pages > 0 && psz > 0) want = std::min(want, (size_t)pages * (size_t)psz / 4);
+      if (gpuc_test_hook) want = std::min(want, size_t(64) << 20);   // the suite's cell: rows, not timing
+      const size_t reps = corpus.empty() ? 0 : std::max<size_t>(1, want / corpus.size());
+      gfd = (int)syscall(SYS_memfd_create, "gzstd-calibrate-gpuc", 0);   // inherited by the children
+      bool staged = gfd >= 0;
+      for (size_t r = 0; staged && r < reps; ++r)
+        for (size_t off = 0; off < corpus.size();) {
+          const ssize_t w = ::write(gfd, corpus.data() + off, corpus.size() - off);
+          if (w <= 0) { staged = false; break; }
+          off += (size_t)w;
+        }
+      if (staged) {
+        in_path = "/proc/self/fd/" + std::to_string(gfd);
+        cal_gib = double(reps * corpus.size()) / GiB;
+      } else {
+        std::fprintf(stderr, "[CALIBRATE] gpu devices: not measured (could not stage the corpus)\n");
+      }
+    }
+    if (!in_path.empty()) {
+      const bool with_rate = !cal_file.empty();
+      std::fprintf(stderr, "[CALIBRATE] gpu devices: --gpu-only compress of %.1f GiB (%s) at each "
+                           "count, one process each (each pays its own cuInit)\n", cal_gib,
+                   with_rate ? cal_file.c_str() : "synthetic; overhead only");
+      if (with_rate && cal_gib < 60)
+        std::fprintf(stderr, "[CALIBRATE]   (under ~60 GiB the rates include the batch tuner's "
+                             "ramp: right for files this size, low for much larger ones)\n");
+      for (int n : gpuc_candidates(devices)) {
+        int pfd[2];
+        if (::pipe(pfd) != 0) break;
+        (void)::fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+        // Everything the child needs is built HERE: between fork and exec only
+        // async-signal-safe calls are allowed, and this process may have
+        // threads (a malloc in the child can wait forever on a lock one of them
+        // held at fork time).
+        const std::string devs = "--gpu-devices=" + std::to_string(n);
+        const std::string fdenv = "GZSTD_CALIBRATE_GPUC_FD=" + std::to_string(pfd[1]);
+        const char * cargv[] = { "gzstd", "--adapt", "--no-profile", "--gpu-only", "-q", "-k", "-f",
+                                 devs.c_str(), in_path.c_str(), "-o", "/dev/null", nullptr };
+        std::vector<char *> cenv;
+        for (char ** e = environ; *e; ++e)
+          if (std::strncmp(*e, "GZSTD_CALIBRATE_GPUC_FD=", 24) != 0) cenv.push_back(*e);
+        cenv.push_back(const_cast<char *>(fdenv.c_str()));
+        cenv.push_back(nullptr);
+        const pid_t pid = ::fork();
+        if (pid == 0) {
+          ::close(pfd[0]);
+          ::execve("/proc/self/exe", const_cast<char * const *>(cargv), cenv.data());
+          ::_exit(127);
+        }
+        ::close(pfd[1]);
+        std::string rep;
+        char b[512];
+        for (ssize_t k; (k = ::read(pfd[0], b, sizeof b)) != 0;) {
+          if (k < 0) { if (errno == EINTR) continue; break; }
+          rep.append(b, (size_t)k);
+        }
+        ::close(pfd[0]);
+        int st = 0;
+        const bool ok = pid > 0 && ::waitpid(pid, &st, 0) == pid && WIFEXITED(st)
+                        && WEXITSTATUS(st) == 0;
+        AdaptObs::GpucSample g;
+        unsigned long long wl = 0, ac = 0, by = 0;
+        int dv = 0;
+        if (ok && std::sscanf(rep.c_str(), "gpuc %d %llu %llu %llu", &dv, &wl, &ac, &by) == 4
+            && dv == n && ac > 0 && wl > ac) {
+          g.devices = dv; g.wall_ns = wl; g.active_ns = ac; g.bytes = by;
+          g.force_rate = with_rate; g.no_rate = !with_rate;
+          gpuc_samples.push_back(g);
+          if (with_rate)
+            std::fprintf(stderr, "[CALIBRATE] gpu devices %2d: overhead %5.2f s, busy %6.2f GiB/s\n",
+                         n, (wl - ac) / 1e9, by / GiB / (ac / 1e9));
+          else
+            std::fprintf(stderr, "[CALIBRATE] gpu devices %2d: overhead %5.2f s\n", n, (wl - ac) / 1e9);
+        } else {
+          std::fprintf(stderr, "[CALIBRATE] gpu devices %2d: NOT MEASURED (child %s)\n", n,
+                       ok ? "reported nothing usable" : "failed");
+        }
+      }
+      if (with_rate && !gpuc_samples.empty()) {
+        // What the model now predicts at this file's size and around it.
+        AdaptPriors::Dir md;
+        for (const auto & g : gpuc_samples)
+          if (g.devices <= AdaptPriors::Dir::GPUC_MAX) {
+            md.gpuc_overhead_s[g.devices] = (g.wall_ns - g.active_ns) / 1e9;
+            md.gpuc_gibs[g.devices] = g.bytes / GiB / (g.active_ns / 1e9);
+          }
+        std::string line = "[CALIBRATE] gpu devices: best";
+        for (double f : {0.1, 1.0, 10.0}) {
+          const double sz = cal_gib * f;
+          const GpucChoice ch = gpuc_choose(devices, sz, md, 0);
+          char c[64];
+          std::snprintf(c, sizeof c, "%s %.1f GiB -> %d", f == 0.1 ? "" : ",", sz, ch.n);
+          line += c;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+      } else if (!with_rate && !gpuc_samples.empty()) {
+        std::fprintf(stderr, "[CALIBRATE] gpu devices: rates are learned by --adapt on real runs; "
+                             "for them now, run gzstd --calibrate FILE on a representative file\n");
+      }
+    }
+    if (gfd >= 0) ::close(gfd);
+  }
+#endif
+
 #ifdef HAVE_NVCOMP
   // gpu rows only when a device is actually usable.
   {
@@ -36766,7 +37210,10 @@ static int run_calibrate(Options opt)
   // no-args stdin mode leaves output == "stdout" with to_stdout set — that
   // must NOT create a file literally named "stdout" in the working dir).
   AdaptObs cobs;   // compress-direction observation
-  if (!opt.to_stdout && !opt.output.empty()) {
+  // output_named, not a non-empty output: with --calibrate FILE the run also
+  // DERIVES an output name from FILE (FILE.zst), and that measured -- and then
+  // removed -- a write the user never asked for.
+  if (!opt.to_stdout && opt.output_named && !opt.output.empty()) {
     // The sink target is created, written, and REMOVED — it must not
     // pre-exist (a user reading "-o FILE" as "write the report to FILE"
     // must never lose that file; -f semantics don't fit a file we delete).
@@ -36871,6 +37318,7 @@ static int run_calibrate(Options opt)
   }
   std::fclose(devnull);
 
+  cobs.gpuc = gpuc_samples;
   // Record both directions like qualifying --adapt runs.
   if (!opt.no_profile) {
     // Wall synthesis falls back to whichever engine measured, so one dead
@@ -38856,6 +39304,10 @@ static int gzstd_main(int argc, char ** argv)
       && (adapt_obs.wall_ns >= adapt_save_min_ns() || adapt_obs.fault
           || adapt_stamp_only)) {
     adapt_obs.stamp_only = adapt_stamp_only;
+    // The count model predicts one file's startup plus its active window.
+    // Several files share cuInit but each contributes a separate writer tail;
+    // summing their walls would teach a per-file overhead that predicts neither.
+    if (opt.inputs.size() != 1) adapt_obs.gpuc.clear();
     // TEST mode writes nothing, so its rate is systematically faster than the
     // -d it would be compared against; keep it out of the backend pair for the
     // same reason --tar runs are (it still contributes runs/regime/read-path).
@@ -38865,6 +39317,21 @@ static int gzstd_main(int argc, char ** argv)
     adapt_obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_obs.settled_batch = g_adapt_settled_batch.load(std::memory_order_relaxed);
     adapt_profile_save(opt, adapt_obs);
+  }
+  // --calibrate's GPU-count children (run_calibrate) hand their sample back
+  // through the pipe named here instead of saving a profile of their own.
+  if (const char * fdv = std::getenv("GZSTD_CALIBRATE_GPUC_FD")) {
+    const int rfd = std::atoi(fdv);
+    for (const AdaptObs::GpucSample & g : adapt_obs.gpuc) {
+      char line[160];
+      const int n = std::snprintf(line, sizeof line, "gpuc %d %llu %llu %llu\n", g.devices,
+                                  (unsigned long long)g.wall_ns, (unsigned long long)g.active_ns,
+                                  (unsigned long long)g.bytes);
+      if (n > 0) {
+        const ssize_t w = ::write(rfd, line, (size_t)n);   // a lost line = candidate unmeasured
+        (void)w;
+      }
+    }
   }
 #endif
 
@@ -39291,6 +39758,114 @@ static void apply_backend_defaults(Options & opt)
   //
   // An explicit user setting is never second-guessed: we take the first N of
   // THEIR list, because they have already said which devices they want.
+#ifndef _WIN32
+  // --adapt: a --gpu-only compress runs on the device count the profile says is
+  // fastest for this input size (see gpuc_choose for the state table).  Chosen
+  // HERE because the block below is the last point before cuInit, and cuInit is
+  // where every visible device is paid for.  An explicit --gpu-devices wins.
+  if (opt.adapt && !opt.no_profile && opt.mode == Mode::COMPRESS && opt.gpu_only
+      && opt.gpu_devices == 0 && !opt.gds_only && !opt.direct_stage && !opt.tar_mode) {
+    const char * choice_hook_value = ::getenv("GZSTD_DEBUG_GPUC_CHOICE_EXIT");
+    int fake_devices = 0;
+    if (choice_hook_value) {
+      char * end = nullptr;
+      errno = 0;
+      const long n = std::strtol(choice_hook_value, &end, 10);
+      // The largest useful fake inventory exercises the first unsupported
+      // count.  Reject malformed/empty values and larger requests instead of
+      // allocating an arbitrary number of synthetic UUIDs or exiting a real
+      // compression early because a debug variable was mistyped.
+      if (errno == 0 && end != choice_hook_value && *end == '\0' && n > 0
+          && n <= AdaptPriors::Dir::GPUC_MAX + 1)
+        fake_devices = (int)n;
+    }
+    const bool choice_hook = fake_devices > 0;
+    // The hook's positive value supplies a deterministic /proc inventory so
+    // the real validation path is exercised even on a GPU-less test host.
+    std::vector<std::string> fake_uuids;
+    for (int i = 0; i < fake_devices; ++i) {
+      char uuid[64];
+      std::snprintf(uuid, sizeof uuid, "GPU-%08x-0000-0000-0000-%012x", i, i);
+      fake_uuids.emplace_back(uuid);
+    }
+    const auto & uuids = fake_devices > 0 ? fake_uuids : gz_proc_gpu_uuids();
+    int devices = -1;  // unknown until the environment list is verified
+    std::string why;
+    bool chose = false;
+    if (opt.inputs.size() != 1) {
+      why = "several input files";
+    } else if (const char * cur = ::getenv("CUDA_VISIBLE_DEVICES")) {
+      // CUDA's own parser stops at the first invalid index: measured here,
+      // 0,9,1 -> one device and 9,0,1 -> none.  Any duplicate rejects the
+      // whole list (0,0,1 -> none).  Counting tokens then narrowing it can
+      // change the result: 0,1,1 exposes none, but its first two expose two.
+      // Validate distinct indices/UUID prefixes before changing the list.
+      std::unordered_set<size_t> seen;
+      bool valid = *cur == '\0' || cur[std::strlen(cur) - 1] != ',';
+      int count = 0;
+      int name_kind = 0; // CUDA indices and /proc UUIDs have no shared ordering
+      std::stringstream ss(cur); std::string tok;
+      while (std::getline(ss, tok, ',')) {
+        if (tok.empty()) { valid = false; break; }
+        size_t id = uuids.size();
+        const bool index = std::all_of(tok.begin(), tok.end(),
+                                       [](unsigned char c){ return c >= '0' && c <= '9'; });
+        const int kind = index ? 1 : (tok.rfind("GPU-", 0) == 0 ? 2 : 0);
+        if (kind == 0 || (name_kind != 0 && name_kind != kind)) { valid = false; break; }
+        name_kind = kind;
+        if (index) {
+          char * end = nullptr;
+          errno = 0;
+          const unsigned long v = std::strtoul(tok.c_str(), &end, 10);
+          if (errno == 0 && *end == '\0' && v < uuids.size()) id = (size_t)v;
+        } else {
+          for (size_t i = 0; i < uuids.size(); ++i)
+            if (uuids[i].rfind(tok, 0) == 0) {
+              if (id != uuids.size()) { id = uuids.size(); break; } // ambiguous prefix
+              id = i;
+            }
+        }
+        if (id == uuids.size() || !seen.insert(id).second) { valid = false; break; }
+        ++count;
+      }
+      if (valid) devices = count;
+      else why = "CUDA_VISIBLE_DEVICES not verifiable before CUDA starts";
+    } else {
+      devices = (int)uuids.size();
+    }
+    if (why.empty()) {
+      if (devices > AdaptPriors::Dir::GPUC_MAX)
+        why = "more than " + std::to_string(AdaptPriors::Dir::GPUC_MAX) + " devices";
+      else if (devices <= 1)
+        why = "fewer than two visible devices";
+    }
+    if (why.empty()) {
+      double size_gib = 0;
+      for (const std::string & in : opt.inputs) {
+        struct stat st {};
+        if (in == "-" || ::stat(in.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) { size_gib = -1; break; }
+        size_gib += (double)st.st_size / (1024.0 * 1024.0 * 1024.0);
+      }
+      const AdaptPriors pr = adapt_load_priors();
+      const GpucChoice ch = gpuc_choose(devices, size_gib, pr.dir[0], pr.dir[0].runs);
+      if (ch.n > 0 && ch.n < devices) opt.gpu_devices = ch.n;
+      chose = true;
+      why = ch.why;
+    }
+    const std::string count = devices >= 0 ? std::to_string(devices) : "?";
+    const std::string applied = chose
+        ? std::to_string(opt.gpu_devices > 0 ? opt.gpu_devices : devices) : "all";
+    vlog(V_VERBOSE, opt, "[ADAPT] GPU devices: " + applied
+                         + (chose ? " of " + count : "") + " (" + why + ")\n");
+    // Report the APPLIED option, not the predictor's ch.n.  Every eligible
+    // branch exits before cuInit, including those that leave the list alone.
+    if (choice_hook) {
+      std::fprintf(stderr, "gpuc-choice %s of %s: %s\n",
+                   applied.c_str(), count.c_str(), why.c_str());
+      std::exit(EXIT_OK);
+    }
+  }
+#endif
   if (opt.gpu_devices > 0) {
     // Start the sampler HERE, not at process entry.
     //
@@ -41113,6 +41688,27 @@ static Options parse_args(int argc, char ** argv)
     opt.cpu_only = true;
     opt.backend_user_set = true;
   }
+
+#ifdef HAVE_NVCOMP
+  // --gpu-only COMPRESS reads through the reader pool, not the zero-copy mmap
+  // reader (v0.17.73).  A pageable H2D copy that takes the page faults itself
+  // runs at ~40% of its speed: measured, one stream, 16 MiB copies, 9.2 GiB/s
+  // from a cold file mapping against 23.1 pre-touched -- the same as anonymous
+  // memory, so it is WHO faults, not what the pages are.  mmap hands the GPU
+  // workers untouched pages; the pool's reader threads fault them ahead of the
+  // workers, off the critical path.  End to end, 195 GiB tmpfs -> /dev/null:
+  // 8 devices 20.2-21.2 -> 17.6 s, 4 devices 18.1-18.6 -> 14.2-14.7 s.
+  // Faulting the batch in inside the worker instead (MADV_POPULATE_READ on 8
+  // threads) LOST 30%: it is a serial step on every batch.  Only --gpu-only:
+  // CPU compress and hybrid measured better with mmap (hybrid 6.8-7.3 s vs
+  // 10.1 without it), and the staged backends never map the input.
+  if (opt.mode == Mode::COMPRESS && opt.gpu_only && !opt.gds_only && !opt.direct_stage
+      && !opt.mmap_user_set && opt.use_mmap && !opt.tar_mode) {
+    opt.use_mmap = false;
+    vlog(V_VERBOSE, opt, "[READER] --gpu-only compress: reader pool, not mmap "
+                         "(the uploads would take the page faults; --mmap=on overrides)\n");
+  }
+#endif
 
   if (opt.sliding_window) {
     if (opt.mode != Mode::COMPRESS)

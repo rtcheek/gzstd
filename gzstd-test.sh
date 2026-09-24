@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=508
-$EXTENSIVE && EXPECTED_TESTS=664
+EXPECTED_TESTS=519
+$EXTENSIVE && EXPECTED_TESTS=677
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -739,9 +739,17 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # own trainer plus output/refusals) and five -e parity cells (502 -> 508,
 # 653 -> 664).  Both builds run them; a host without zstd or python3 skips all.
 # All run on both builds; a host without zstd or python3 skips them.
-# DERIVED until the next suite pair confirms it.
-EXPECTED_NOGPU_DELTA=118
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=144   # MEASURED 2026-09-21 (607 - 463)
+# v0.17.73 GPU device count: nine always-run state-table/validation cells (nvCOMP
+# build, no GPU needed: a debug hook exits before cuInit), two always-run GPU cells
+# (--gpu-only compress uses the reader pool; a multi-file run does not train) and
+# two -e GPU cells (--calibrate's device-count pass, on two cards).  508 -> 519,
+# 664 -> 677.  The USE_NVCOMP=OFF binary skips all thirteen, so the no-GPU deltas
+# grow 118 -> 129 and 144 -> 157.
+# (A GPU-LESS host running the nvCOMP build still runs the nine state-table
+# cells; like every other has_nvcomp cell, that host is not what this delta
+# measures.)  DERIVED until the next suite pair confirms it.
+EXPECTED_NOGPU_DELTA=129
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=157   # MEASURED 2026-09-21 (607 - 463) + 13 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -5677,6 +5685,277 @@ rm -f "$TMPDIR/aprof-precious.txt"
 
 rm -rf "$APROF_XDG" "$TMPDIR/aprof.zst" "$TMPDIR/aprof-fast.zst" "$TMPDIR/aprof-bad.zst" \
        "$TMPDIR/aprof-cal.err"
+
+# ────────────────────────────────────────────────────────────
+section "--adapt GPU device count (--gpu-only compress)"
+
+# v0.17.73.  The device count is fixed before cuInit, which charges every
+# visible device (measured on an 8-GPU host: 1.49 s with 1 visible, 6.71 s with
+# 8), and past a few devices the host, not the GPUs, feeds the run.  So --adapt
+# learns overhead(N) and rate(N) per device count and picks the count with the
+# lowest predicted time for the input (gpuc_choose, whose state table these
+# cells drive).  GZSTD_DEBUG_GPUC_CHOICE_EXIT=N supplies N synthetic physical
+# GPUs and reports the applied choice before cuInit; CUDA_VISIBLE_DEVICES is
+# validated against that inventory.  Sparse files set the input size, and the
+# profile is written directly -- so the table runs on any nvCOMP build.
+if has_nvcomp && command -v python3 >/dev/null 2>&1; then
+  GC="$TMPDIR/gpuc"; mkdir -p "$GC"
+  echo hello > "$GC/small.txt"
+  env XDG_CACHE_HOME="$GC/xdg" $AQ "$GZSTD" --adapt --cpu-only -q -k -f "$GC/small.txt" -o /dev/null 2>/dev/null
+  GCP="$GC/xdg/gzstd/profile.json"
+  truncate -s 200G "$GC/in200"; truncate -s 20G "$GC/in20"; truncate -s 1G "$GC/in1"
+  gpuc_set() {   # gpuc_set RUNS N:overhead_s:gibs:run ...  (gibs 0 = overhead only)
+    python3 - "$GCP" "$@" <<'PYEOF2'
+import json, sys
+p, runs, specs = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
+j = json.load(open(p))
+for e in j['entries'].values():
+    c = e.setdefault('compress', {})
+    for k in [k for k in c if k.startswith('gpu_devices_')]: del c[k]
+    c['runs'] = runs
+    for sp in specs:
+        n, o, g, r = sp.split(':')
+        c['gpu_devices_%s_overhead_s' % n] = float(o)
+        if float(g) > 0: c['gpu_devices_%s_gibs' % n] = float(g)
+        c['gpu_devices_%s_run' % n] = float(r)
+json.dump(j, open(p, 'w'))
+PYEOF2
+  }
+  gpuc_probe() { # gpuc_probe FAKE_GPU_COUNT CUDA_LIST INPUT... -> "applied of count: reason"
+    local fake=$1 visible=$2; shift 2
+    local sink=()
+    (( $# == 1 )) && sink=(-o /dev/null)
+    # Bounded: a build whose hook never fires would go on to compress the
+    # 200 GiB sparse inputs.
+    if [[ $visible == @unset ]]; then
+      env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$GC/xdg" GZSTD_DEBUG_GPUC_CHOICE_EXIT="$fake" \
+        timeout -k 5 60 "$GZSTD" --adapt --gpu-only -k -f "$@" "${sink[@]}"
+    else
+      env XDG_CACHE_HOME="$GC/xdg" CUDA_VISIBLE_DEVICES="$visible" GZSTD_DEBUG_GPUC_CHOICE_EXIT="$fake" \
+        timeout -k 5 60 "$GZSTD" --adapt --gpu-only -k -f "$@" "${sink[@]}"
+    fi 2>&1 | sed -n 's/^gpuc-choice //p'
+  }
+  gpuc_pick() {  # gpuc_pick INPUT -> "N reason"
+    gpuc_probe 8 0,1,2,3,4,5,6,7 "$1" \
+      | sed -n 's/^\([0-9]*\) of 8: \(.*\)/\1 \2/p'
+  }
+  gpuc_want() {  # gpuc_want LABEL INPUT N PATTERN -> appends to $why on a miss
+    local got; got=$(gpuc_pick "$2")
+    [[ ${got%% *} == "$3" && $got =~ $4 ]] || why+=" [$1: got '$got']"
+  }
+  [[ -s "$GCP" ]] || echo "  (no profile was created; the cells below will fail)"
+
+  t0=$(now_ms); why=""
+  gpuc_set 1;                                         gpuc_want empty      "$GC/in200" 8 "exploring 8"
+  gpuc_set 1 8:9:30:1;                                gpuc_want after-8    "$GC/in200" 4 "exploring 4"
+  gpuc_set 3 8:9:30:1 4:6:29:2 2:3.6:23:3;            gpuc_want after-8-4-2 "$GC/in200" 1 "exploring 1"
+  gpuc_set 1 4:6:0:1;                                 gpuc_want no-rate    "$GC/in200" 8 "exploring 8"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: explores all devices first, then halving" \
+    || fail "device count: explores all devices first, then halving" "$why"
+
+  t0=$(now_ms); why=""
+  gpuc_set 5 8:9:30:2 4:6:29:3 2:3.6:23:4 1:2.7:14.6:5
+  gpuc_want 200GiB "$GC/in200" 2 "predicted"
+  gpuc_want 20GiB  "$GC/in20"  1 "predicted"
+  gpuc_want stdin  -           8 "best measured rate"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: least predicted time for the input size; stdin takes the best rate" \
+    || fail "device count: least predicted time for the input size; stdin takes the best rate" "$why"
+
+  # 4 is strictly best (3.0 + 200/22.3 = 11.97 s); 2 at 21.9 GiB/s is within 3%
+  # (12.13 s) and at 20.0 is not (13.0 s).
+  t0=$(now_ms); why=""
+  gpuc_set 5 8:9:30:2 4:3.0:22.3:3 2:3.0:21.9:4 1:2.7:5:5;  gpuc_want within-3pct  "$GC/in200" 2 "predicted"
+  gpuc_set 5 8:9:30:2 4:3.0:22.3:3 2:3.0:20.0:4 1:2.7:5:5;  gpuc_want outside-3pct "$GC/in200" 4 "predicted"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: within 3% of the best, the fewer devices" \
+    || fail "device count: within 3% of the best, the fewer devices" "$why"
+
+  t0=$(now_ms); why=""
+  gpuc_set 1 8:9:30:1;                                   gpuc_want short-input "$GC/in1"   8 "predicted"
+  gpuc_set 30 8:9:30:25 4:6:29:26 2:3.6:23:28 1:2.7:14.6:5; gpuc_want stale      "$GC/in200" 1 "rechecking 1"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: short inputs never explore; stale counts are rechecked" \
+    || fail "device count: short inputs never explore; stale counts are rechecked" "$why"
+
+  t0=$(now_ms); why=""
+  got=$(gpuc_probe 8 0,0,1 "$GC/in200")
+  [[ $got == "all of ?: CUDA_VISIBLE_DEVICES not verifiable before CUDA starts" ]] \
+    || why+=" [duplicate: $got]"
+  got=$(gpuc_probe 8 0,9 "$GC/in200")
+  [[ $got == "all of ?: CUDA_VISIBLE_DEVICES not verifiable before CUDA starts" ]] \
+    || why+=" [invalid index: $got]"
+  got=$(gpuc_probe 8 0,GPU-00000001 "$GC/in200")   # distinct devices: only the mixing rule refuses it
+  [[ $got == "all of ?: CUDA_VISIBLE_DEVICES not verifiable before CUDA starts" ]] \
+    || why+=" [mixed identifiers: $got]"
+  # A malformed hook value must not turn a real no-GPU invocation into an
+  # early exit 0.  The input is tiny; CUDA_VISIBLE_DEVICES="" exposes no GPU.
+  for bad_hook in 1x ''; do
+    rc=0
+    got=$(env XDG_CACHE_HOME="$GC/xdg" CUDA_VISIBLE_DEVICES="" GZSTD_DEBUG_GPUC_CHOICE_EXIT="$bad_hook" \
+      timeout -k 5 60 "$GZSTD" --adapt --gpu-only -q -k -f "$GC/small.txt" -o /dev/null 2>&1) || rc=$?
+    [[ $rc -ne 0 && $got != *gpuc-choice* ]] || why+=" [bad hook '$bad_hook': rc=$rc, output=$got]"
+  done
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: invalid CUDA lists are left unchanged" \
+    || fail "device count: invalid CUDA lists are left unchanged" "$why"
+
+  t0=$(now_ms); why=""
+  gpuc_set 5 2:3:30:4 1:2:20:5
+  got=$(gpuc_probe 8 GPU-00000000,GPU-00000001 "$GC/in20")
+  [[ $got == "1 of 2: predicted"* ]] || why+=" [UUID prefixes: $got]"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: UUID prefixes are validated and applied" \
+    || fail "device count: UUID prefixes are validated and applied" "$why"
+
+  t0=$(now_ms); why=""
+  got=$(gpuc_probe 8 0,1,2,3,4,5,6,7 "$GC/in200" "$GC/in20")
+  [[ $got == "all of ?: several input files" ]] || why+=" [multi-file: $got]"
+  got=$(gpuc_probe 65 @unset "$GC/in200")
+  [[ $got == "all of 65: more than 64 devices" ]] || why+=" [over limit: $got]"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: unchanged branches exit before cuInit" \
+    || fail "device count: unchanged branches exit before cuInit" "$why"
+
+  t0=$(now_ms); why=""
+  gpuc_set 5 8:9:30:2 4:6:20:3 2:3.6:29.5:4 1:2.7:14.6:5
+  gpuc_want stdin-near-tie - 2 "best measured rate"
+  # 29.11 is 2.97% below 30 in rate, but its inverse rate is 3.06% higher.
+  gpuc_set 5 8:9:30:2 4:6:20:3 2:3.6:29.11:4 1:2.7:14.6:5
+  gpuc_want stdin-rate-boundary - 2 "best measured rate"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: stdin rate near-tie uses fewer devices" \
+    || fail "device count: stdin rate near-tie uses fewer devices" "$why"
+
+  # A GPU driver change clears the model.  The save stamps the NEW driver, so
+  # any count it kept would load as a measurement of a driver that never made
+  # it (review finding, v0.17.73).  An --adapt --cpu-only run is enough to save.
+  t0=$(now_ms); why=""
+  gpuc_set 5 8:9:30:2 4:6:29:3 2:3.6:23:4 1:2.7:14.6:5
+  gpuc_want before "$GC/in200" 2 "predicted"
+  python3 - "$GCP" <<'PYEOF2'
+import json, sys
+p = sys.argv[1]; j = json.load(open(p))
+for e in j['entries'].values(): e['driver'] = 'an-older-driver'
+json.dump(j, open(p, 'w'))
+PYEOF2
+  env XDG_CACHE_HOME="$GC/xdg" $AQ "$GZSTD" --adapt --cpu-only -q -k -f "$GC/small.txt" -o /dev/null 2>/dev/null
+  gpuc_want after "$GC/in200" 8 "exploring 8"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "device count: a GPU driver change clears the model" \
+    || fail "device count: a GPU driver change clears the model" "$why"
+  rm -rf "$GC"
+else
+  for c in "device count: explores all devices first, then halving" \
+           "device count: least predicted time for the input size; stdin takes the best rate" \
+           "device count: within 3% of the best, the fewer devices" \
+           "device count: short inputs never explore; stale counts are rechecked" \
+           "device count: invalid CUDA lists are left unchanged" \
+           "device count: UUID prefixes are validated and applied" \
+           "device count: unchanged branches exit before cuInit" \
+           "device count: stdin rate near-tie uses fewer devices" \
+           "device count: a GPU driver change clears the model"; do
+    skip "$c" "needs an nvCOMP build and python3"
+  done
+fi
+
+# --gpu-only COMPRESS reads through the reader pool, not mmap (v0.17.73): a
+# pageable upload that takes its own page faults runs at ~40% speed.
+if has_gpu; then
+  t0=$(now_ms); rc=0
+  "$GZSTD" -v -k -f --gpu-only "$TMPDIR/medium.txt" -o "$TMPDIR/gpupool.zst" 2>"$TMPDIR/gpupool.err" || rc=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if [[ $rc -eq 0 ]] && grep -q "reader pool, not mmap" "$TMPDIR/gpupool.err" \
+     && grep -q "POOLED-READ" "$TMPDIR/gpupool.err" \
+     && ! grep -q "MMAP\] using zero-copy reader" "$TMPDIR/gpupool.err" \
+     && "$GZSTD" -q -d -c "$TMPDIR/gpupool.zst" | cmp -s - "$TMPDIR/medium.txt"; then
+    pass "--gpu-only compress reads through the reader pool and round-trips"
+  else
+    fail "--gpu-only compress reads through the reader pool and round-trips" \
+         "rc=$rc: $(grep -E 'READER|MMAP|ERROR' "$TMPDIR/gpupool.err" | head -2 | tr '\n' ' ')"
+  fi
+  rm -f "$TMPDIR/gpupool.zst" "$TMPDIR/gpupool.err"
+
+  # Several input files share one cuInit but each has its own writer tail, so
+  # their summed wall is no single file's overhead: they must not train the
+  # model.  The control (one file) proves this cell can see a sample at all.
+  t0=$(now_ms); rc=0; why=""
+  GM="$TMPDIR/gpuc-multi"; mkdir -p "$GM"
+  cp "$TMPDIR/medium.txt" "$GM/a.txt"; cp "$TMPDIR/medium.txt" "$GM/b.txt"
+  gm_keys() { python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); print(sum(1 for e in j["entries"].values() for k in e.get("compress",{}) if k.startswith("gpu_devices_")))' "$1" 2>/dev/null; }
+  env XDG_CACHE_HOME="$GM/one" $AQ "$GZSTD" --adapt --gpu-only -q -k -f "$GM/a.txt" -o "$GM/a.zst" 2>/dev/null || rc=$?
+  [[ $rc -eq 0 && $(gm_keys "$GM/one/gzstd/profile.json") -gt 0 ]] || why+=" [one file: rc=$rc, recorded nothing]"
+  rc=0
+  env XDG_CACHE_HOME="$GM/two" $AQ "$GZSTD" --adapt --gpu-only -q -k -f "$GM/a.txt" "$GM/b.txt" 2>/dev/null || rc=$?
+  [[ $rc -eq 0 && -s "$GM/two/gzstd/profile.json" && $(gm_keys "$GM/two/gzstd/profile.json") == 0 ]] \
+    || why+=" [two files: rc=$rc, keys=$(gm_keys "$GM/two/gzstd/profile.json")]"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--adapt: a multi-file --gpu-only run does not train the device count" \
+    || fail "--adapt: a multi-file --gpu-only run does not train the device count" "$why"
+  rm -rf "$GM"
+else
+  skip "--gpu-only compress reads through the reader pool and round-trips" "no GPU"
+  skip "--adapt: a multi-file --gpu-only run does not train the device count" "no GPU"
+fi
+
+# --calibrate's device-count pass: one child per count, before the parent
+# touches CUDA.  FILE mode records overhead AND rate; without FILE, overhead
+# only (a synthetic rate does not transfer to the user's data).  -e: every
+# child pays its own cuInit.  The suite masks every run to one card, so these
+# cells opt back in with the two freest cards (as the multi-GPU dispatch cell
+# does): candidates 1 and 2, two children per calibrate.
+if $EXTENSIVE; then
+  gcal_cards=()
+  if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
+    if [[ "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+      mapfile -t gcal_cards < <(gpu_uuids_by_free 4096 "$GPU_ALL_DEVICES")
+    else
+      IFS=, read -r -a gcal_cards <<< "$GPU_ALL_DEVICES"
+    fi
+  fi
+  if has_gpu && (( ${#gcal_cards[@]} >= 2 )) && command -v python3 >/dev/null 2>&1; then
+    GCC="$TMPDIR/gpucal"; mkdir -p "$GCC"
+    gcal_devs="${gcal_cards[0]},${gcal_cards[1]}"
+    gpuc_keys() {  # gpuc_keys PROFILE -> "counts-with-overhead counts-with-rate"
+      python3 - "$1" <<'PYEOF2'
+import json, sys, re
+j = json.load(open(sys.argv[1])); o = set(); r = set()
+for e in j['entries'].values():
+    for k in e.get('compress', {}):
+        m = re.match(r'gpu_devices_(\d+)_(overhead_s|gibs)$', k)
+        if m: (o if m.group(2) == 'overhead_s' else r).add(int(m.group(1)))
+print(len(o), len(r))
+PYEOF2
+    }
+    t0=$(now_ms); rc=0
+    env XDG_CACHE_HOME="$GCC/xf" CUDA_VISIBLE_DEVICES="$gcal_devs" $ACB GZSTD_DEBUG_CALIBRATE_GPUC=1 \
+      timeout --foreground -k 10 300 "$GZSTD" --calibrate "$TMPDIR/large.bin" 2>"$GCC/f.err" || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    got=$(gpuc_keys "$GCC/xf/gzstd/profile.json" 2>/dev/null)
+    if [[ $rc -eq 0 && "$got" == "2 2" ]] && grep -q 'gpu devices: best' "$GCC/f.err"; then
+      pass "--calibrate FILE records every device count (overhead and rate)"
+    else
+      fail "--calibrate FILE records every device count (overhead and rate)" \
+           "rc=$rc, recorded [$got], want [2 2]: $(grep 'gpu devices' "$GCC/f.err" | head -3 | tr '\n' ' ')"
+    fi
+    t0=$(now_ms); rc=0
+    env XDG_CACHE_HOME="$GCC/xs" CUDA_VISIBLE_DEVICES="$gcal_devs" $ACB GZSTD_DEBUG_CALIBRATE_GPUC=1 \
+      timeout --foreground -k 10 300 "$GZSTD" --calibrate 2>"$GCC/s.err" || rc=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    got=$(gpuc_keys "$GCC/xs/gzstd/profile.json" 2>/dev/null)
+    if [[ $rc -eq 0 && "$got" == "2 0" ]]; then
+      pass "--calibrate without FILE records device-count overhead only"
+    else
+      fail "--calibrate without FILE records device-count overhead only" \
+           "rc=$rc, recorded [$got], want [2 0]: $(grep 'gpu devices' "$GCC/s.err" | head -3 | tr '\n' ' ')"
+    fi
+    rm -rf "$GCC"
+  else
+    skip "--calibrate FILE records every device count (overhead and rate)" "needs two GPUs with 4 GiB free"
+    skip "--calibrate without FILE records device-count overhead only" "needs two GPUs with 4 GiB free"
+  fi
+fi  # $EXTENSIVE (--calibrate device-count pass)
 
 # ────────────────────────────────────────────────────────────
 section "--adapt priors + residency-informed decompress default"

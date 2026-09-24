@@ -130,6 +130,9 @@ declare -a ALLOW_CALLEE=(
   'sched_getaffinity'            # &cpu_set_t OUT from the kernel; a CPU mask has
                                  # no on-disk representation and no byte order
   'strftime'                     # &tm in, formatted text out; no on-disk integer
+  'sscanf'                       # parses decimal TEXT into &ints; text has no byte
+                                 # order.  (v0.17.73: --calibrate reads its children's
+                                 # "gpuc N wall active bytes" report lines.)
 )
 
 # EXEMPTIONS SUBTRACT, THEY DO NOT EXCUSE.
