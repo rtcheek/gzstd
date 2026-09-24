@@ -39,12 +39,13 @@ was true of the common path and false of roughly thirty options.
   gzip aliases, `-0`, `--single-thread` and `-M` all work.
 - **Decompression fidelity:** verified byte-identical round-trips of zstd-produced output
   for `-19`, `--long=27`, `--no-check` and `--rsyncable`.
-- **Dictionaries — READ (v0.17.70) and WRITTEN (v0.17.71), CPU-only.**
+- **Dictionaries — READ (v0.17.70), WRITTEN (v0.17.71) and TRAINED (v0.17.72), CPU-only.**
   `-D` compresses and decodes in every mode (`-t`, `--tar`, stdin, `-dD`, `-D=`, `--no-dictID`);
   a gzstd `-D` frame is byte-identical to zstd's with the same libzstd. `-d --patch-from=OLD`
-  decodes zstd's patches (OLD as raw content, up to 2 GiB, window limit lifted). Still missing:
-  `--train*`/`--maxdict*`/`--dictID*` (Stage C), and CREATING patches (`--patch-from` on
-  compress warns). No zstd-written stream is now unreadable for want of a dictionary feature.
+  decodes zstd's patches (OLD as raw content, up to 2 GiB, window limit lifted). `--train`,
+  `--train-cover/-fastcover/-legacy`, `--maxdict`, `--dictID`, `-r` and `-B#` build dictionaries
+  byte-identical to `zstd --train`'s (20 of 20 option sets measured). Still missing: CREATING
+  patches (`--patch-from` on compress warns).
 - **Accepted but divergent** (each warns): `-r`/`--recursive` compresses nothing (exit 3
   since v0.15.69 — it used to exit 0 having done nothing), `--format=gzip` emits zstd,
   `--output-dir-flat`/`--output-dir-mirror` write nothing, `--no-check` still writes the
@@ -57,7 +58,6 @@ was true of the common path and false of roughly thirty options.
 
 | Gap | Size | Note |
 |---|---|---|
-| Dictionary training (`--train*`, `--maxdict*`, `--dictID*`; Stage C) | Medium | libzstd's ZDICT; today these warn and run an ordinary compression |
 | Creating patches (`--patch-from` on compress) | Medium | Decode shipped. zstd's is ONE long-window frame referencing OLD (plus long-distance matching); gzstd's independent frames would each need OLD as their prefix and a window spanning it |
 | `-r` / `--output-dir-flat` / `--output-dir-mirror` | Small | Self-contained file-walking and output-path mapping |
 | `--long`, `--rsyncable`, `--no-check` | Small | Thin wrappers over zstd parameters gzstd already sets |

@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=502
-$EXTENSIVE && EXPECTED_TESTS=653
+EXPECTED_TESTS=508
+$EXTENSIVE && EXPECTED_TESTS=664
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -735,6 +735,9 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 637 -> 652); two -e cells were rewritten in place (compress -D is real now).
 # Plus one always-run --verify cell: a failed --sliding-window round trip must
 # be rebuilt, never kept (501 -> 502, 652 -> 653).
+# v0.17.72 --train: six always-run cells (five byte-parity cells against zstd's
+# own trainer plus output/refusals) and five -e parity cells (502 -> 508,
+# 653 -> 664).  Both builds run them; a host without zstd or python3 skips all.
 # All run on both builds; a host without zstd or python3 skips them.
 # DERIVED until the next suite pair confirms it.
 EXPECTED_NOGPU_DELTA=118
@@ -1564,6 +1567,63 @@ PYEOF
   else
     fail "--patch-from reads a magic-prefixed reference as raw content" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
   fi
+
+  # ---- --train (v0.17.72) ----
+  # gzstd mirrors zstd's builder step for step -- directory walk, fixed-seed
+  # shuffle, per-sample cap, -B# chunking, load limit, ZDICT parameters -- so the
+  # oracle is zstd itself: the SAME dictionary bytes from the same samples.  One
+  # cell per route that changes which bytes reach the trainer, or how.
+  TRD="$DICTD/train"; mkdir -p "$TRD/set/sub"
+  awk -v d="$TRD/set" 'BEGIN { srand(5)
+    for (i = 0; i < 600; i++) {
+      f = d (i % 3 == 0 ? "/sub" : "") "/r" i ".json"
+      printf "{\"id\":%d,\"user\":\"user%05d\",\"role\":\"%s\",\"score\":%d}\n", i, int(rand()*99999),
+             (i % 4 ? "member" : "admin"), int(rand()*1000) > f; close(f) } }'
+  awk -v d="$TRD" 'BEGIN { srand(9)
+    for (j = 0; j < 3; j++) { f = d "/big" j ".txt"
+      for (i = 0; i < 5000; i++) printf "LOG %d level=%s msg=\"served %d in %dms\"\n", i,
+             (i % 3 ? "INFO" : "WARN"), i * 7 + j, int(rand()*500) > f; close(f) } }'
+  train_same() {   # train_same NAME ARGS... : gzstd and zstd must write identical dictionaries
+    local name=$1; shift
+    local t0 zr=0 gr=0; t0=$(now_ms)
+    rm -f "$TRD/z.dict" "$TRD/g.dict"
+    zstd -q -f "$@" -o "$TRD/z.dict" >/dev/null 2>&1 || zr=$?
+    "$GZSTD" -q -f "$@" -o "$TRD/g.dict" >/dev/null 2>"$DICTD/err" || gr=$?
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    if [[ $zr -ne 0 ]]; then fail "$name" "zstd itself failed (rc=$zr): NOT TESTED"
+    elif [[ $gr -eq 0 ]] && cmp -s "$TRD/z.dict" "$TRD/g.dict"; then pass "$name"
+    else fail "$name" "rc=$gr, $(stat -c %s "$TRD/g.dict" 2>/dev/null || echo no) vs $(stat -c %s "$TRD/z.dict") bytes: $(head -c 150 "$DICTD/err" | tr '\n' ' ')"; fi
+  }
+  TRF=( "$TRD"/set/*.json )
+  train_same "--train: same dictionary bytes as zstd --train" --train "${TRF[@]}"
+  # k AND d given: no parameter search, so split= is ignored (zstd trains on every
+  # sample).  A search would honour it and train on 80% -- different bytes.
+  train_same "--train-cover=k=64,d=8,split=80: same bytes as zstd (no search)" \
+    --train-cover=k=64,d=8,split=80 "${TRF[@]}"
+  train_same "--train-legacy: same bytes as zstd" --train-legacy "${TRF[@]}"
+  train_same "--train -r DIR: same bytes as zstd (directory walk + shuffle)" --train -r "$TRD/set"
+  train_same "--train -B1K: same bytes as zstd (files split into samples)" \
+    --train -B1K "$TRD"/big0.txt "$TRD"/big1.txt "$TRD"/big2.txt
+
+  # Output and refusals.  zstd replaces -o unasked; gzstd does too, through a
+  # temporary file, so nothing but the finished dictionary is ever left there.
+  t0=$(now_ms); why=""
+  ( cd "$TRD" && rm -f dictionary && "$GZSTD" -q --train set/*.json >/dev/null 2>&1 ) || why+=" default-name"
+  [[ -s "$TRD/dictionary" ]] || why+=" no-./dictionary"
+  echo stale > "$TRD/o.dict"
+  "$GZSTD" -q --train "${TRF[@]}" -o "$TRD/o.dict" 2>/dev/null
+  cmp -s "$TRD/o.dict" "$TRD/dictionary" || why+=" -o-not-replaced"
+  ls "$TRD"/o.dict.gzstd-tmp-* >/dev/null 2>&1 && why+=" temp-left"
+  "$GZSTD" -q --train -c "${TRF[@]}" 2>/dev/null | cmp -s - "$TRD/dictionary" || why+=" -c"
+  "$GZSTD" -q --train "$TRD"/set/r1.json "$TRD"/set/r2.json "$TRD"/set/r4.json -o "$TRD/x" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 2 ]] || why+=" few-samples:$rc"
+  "$GZSTD" -q --train "$TRD/set" -o "$TRD/x" >/dev/null 2>&1; rc=$?; [[ $rc -eq 2 ]] || why+=" dir-without-r:$rc"
+  "$GZSTD" -q --train "${TRF[@]}" "$TRD/missing.json" -o "$TRD/x" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 3 ]] || why+=" missing:$rc"
+  "$GZSTD" -q --train-cover=q=1 "${TRF[@]}" -o "$TRD/x" >/dev/null 2>&1; rc=$?; [[ $rc -eq 2 ]] || why+=" bad-params:$rc"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--train output (./dictionary, -o replaced, -c) and refusals" \
+    || fail "--train output (./dictionary, -o replaced, -c) and refusals" "got$why"
 else
   for c in "zstd -D ${SYM_ARROW} gzstd -d -D (4 frames, CPU workers)" \
            "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, file)" \
@@ -1585,7 +1645,13 @@ else
            "--tar -D create; seek-extract one member with -D" \
            "compress -D refuses --hybrid (exit 2)" \
            "-d --patch-from=OLD decodes a zstd --patch-from patch" \
-           "--patch-from reads a magic-prefixed reference as raw content"; do
+           "--patch-from reads a magic-prefixed reference as raw content" \
+           "--train: same dictionary bytes as zstd --train" \
+           "--train-cover=k=64,d=8,split=80: same bytes as zstd (no search)" \
+           "--train-legacy: same bytes as zstd" \
+           "--train -r DIR: same bytes as zstd (directory walk + shuffle)" \
+           "--train -B1K: same bytes as zstd (files split into samples)" \
+           "--train output (./dictionary, -o replaced, -c) and refusals"; do
     skip "$c" "zstd or python3 not installed"
   done
 fi
@@ -7073,6 +7139,17 @@ if command -v zstd &>/dev/null && [[ -s "$DICTD/a.dict" ]]; then
   else
     fail "compress --patch-from warns; output is a plain frame" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
   fi
+
+  # --train's remaining spellings and routes, each against zstd's own bytes.
+  train_same "--train-fastcover=k=200,d=8,f=18,accel=2: same bytes" \
+    --train-fastcover=k=200,d=8,f=18,accel=2 "${TRF[@]}"
+  # BARE --train-fastcover zeroes zstd's CLI defaults and lets the trainer pick.
+  train_same "--train-fastcover (bare): same bytes as zstd" --train-fastcover "${TRF[@]}"
+  # -19: the level the dictionary is tuned for.  ZDICT reads level 0 as its default
+  # of 3, which is also gzstd's, so only a non-default level shows it is passed.
+  train_same "--maxdict 8K --dictID=4242 -19: same bytes as zstd" --train --maxdict 8K --dictID=4242 -19 "${TRF[@]}"
+  train_same "--train-cover=d=8,steps=4 (parameter search): same bytes" --train-cover=d=8,steps=4 "${TRF[@]}"
+  train_same "samples over 128 KiB are capped as zstd caps them" --train "${TRF[@]}" "$TRD"/big0.txt "$TRD"/big1.txt
 else
   for c in "-dD FILE (bundled, zstd spelling)" "-D=FILE (zstd spelling)" \
            "--dict=FILE (gzstd alias)" "-t -D verifies zstd -D data" \
@@ -7085,7 +7162,12 @@ else
            "--patch-from OLD (separated spelling)" \
            "--patch-from with a window past 128 MiB" \
            "--patch-from errors: with -D, empty, option 2; missing reference 3" \
-           "compress --patch-from warns; output is a plain frame"; do
+           "compress --patch-from warns; output is a plain frame" \
+           "--train-fastcover=k=200,d=8,f=18,accel=2: same bytes" \
+           "--train-fastcover (bare): same bytes as zstd" \
+           "--maxdict 8K --dictID=4242 -19: same bytes as zstd" \
+           "--train-cover=d=8,steps=4 (parameter search): same bytes" \
+           "samples over 128 KiB are capped as zstd caps them"; do
     skip "$c" "zstd or python3 not installed"
   done
 fi

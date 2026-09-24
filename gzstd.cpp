@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.71";
+static constexpr const char * GZSTD_VERSION = "0.17.72";
 //
 // Architecture overview:
 //
@@ -48,6 +48,10 @@ static constexpr const char * GZSTD_VERSION = "0.17.71";
 // builds against (the portable build links libzstd.a).
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
+// --train*: the cover / fastcover / legacy trainers and their parameter structs
+// are ZDICT's experimental API, exported by the same libzstd builds.
+#define ZDICT_STATIC_LINKING_ONLY
+#include <zdict.h>
 #include <zstd_errors.h>
 #include <cstdio>
 #include <cstdlib>
@@ -2340,6 +2344,24 @@ enum class Mode { COMPRESS, DECOMPRESS, TEST };
 #ifdef HAVE_NVCOMP
 enum class PinMode { AUTO, ON, OFF };
 #endif
+// zstd's CLI defaults for dictionary training (programs/zstdcli.c,
+// defaultCoverParams / defaultFastCoverParams, v1.5.7).  --train with no
+// algorithm uses the fastcover set; a bare --train-cover / --train-fastcover
+// ZEROES its set instead, exactly as zstd does, and lets ZDICT pick.
+static ZDICT_cover_params_t zstd_default_cover_params()
+{
+  ZDICT_cover_params_t p {};
+  p.d = 8; p.steps = 4; p.splitPoint = 1.0; p.shrinkDictMaxRegression = 1;
+  return p;
+}
+static ZDICT_fastCover_params_t zstd_default_fastcover_params()
+{
+  ZDICT_fastCover_params_t p {};
+  p.d = 8; p.f = 20; p.steps = 4; p.splitPoint = 0.75; p.accel = 1;
+  p.shrinkDictMaxRegression = 1;
+  return p;
+}
+
 struct Options {
   Mode mode = Mode::COMPRESS;
   bool list_mode = false;    // -l/--list: list .zst frame info, or `-l --tar` archive contents
@@ -2451,6 +2473,19 @@ struct Options {
   // zstd-compat `--no-dictID`: omit the dictionary ID from frames compressed
   // with -D.  No effect without one, as in zstd.
   bool no_dict_id = false;
+  // zstd-compat dictionary TRAINING: `--train` and its algorithm variants build
+  // a dictionary from the input files and write it to -o (default "dictionary").
+  // run_train handles the whole operation; nothing else in the run applies.
+  enum class TrainAlgo { FASTCOVER, COVER, LEGACY };
+  bool train = false;
+  TrainAlgo train_algo = TrainAlgo::FASTCOVER;           // zstd's default
+  ZDICT_cover_params_t     train_cover     = zstd_default_cover_params();
+  ZDICT_fastCover_params_t train_fastcover = zstd_default_fastcover_params();
+  unsigned train_selectivity = 9;           // --train-legacy=s=#, zstd's default
+  unsigned train_maxdict = 110 * 1024;      // --maxdict=#, zstd's default (112640)
+  unsigned train_dict_id = 0;               // --dictID=#; 0 = derived from the content
+  size_t   train_block_size = 0;            // -B#: split samples into #-byte blocks
+  bool     recursive = false;               // -r: expand directories (training only)
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   // The batch cap as parse_args resolved it, snapshotted before --adapt seeds
@@ -3349,6 +3384,8 @@ static void print_help()
 "  -D FILE             compress or decode with dictionary FILE (implies\n"
 "                      --cpu-only; --no-dictID leaves its ID out of frames)\n"
 "  --patch-from=OLD    -d/-t: decode a zstd --patch-from patch against OLD\n"
+"  --train FILE...     build a dictionary from sample files into -o NAME\n"
+"                      (default: dictionary); same bytes as zstd --train\n"
 "  -l                  list .zst frame info (Frames/Skips/Sizes/Ratio/Check);\n"
 "                      with --tar, list the archive contents (tar -tvf style)\n"
 "  -k                  keep input after success (default)\n"
@@ -3499,9 +3536,9 @@ static void print_help_long()
 "by any zstd implementation.\n"
 "\n"
 "Compatibility is NOT total: some zstd options are mapped, some are accepted\n"
-"and ignored silently, and some warn.  Dictionaries work both ways (-D),\n"
-"patches decode (-d --patch-from) but are not created, and training is not\n"
-"implemented.  See COMPATIBILITY OPTIONS near the end of this help for the\n"
+"and ignored silently, and some warn.  Dictionaries are trained (--train),\n"
+"used both ways (-D), and patches decode (-d --patch-from) but are not\n"
+"created.  See COMPATIBILITY OPTIONS near the end of this help for the\n"
 "exact classification of every one.\n"
 "\n"
 "With no file arguments (or file `-`), gzstd reads from stdin and writes\n"
@@ -4482,6 +4519,29 @@ static void print_help_long()
 "     with -D.  Implies --cpu-only, like -D.  CREATING patches is not\n"
 "     implemented: on compression it warns and writes an ordinary frame.\n"
 "\n"
+"  --train FILE..., --train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#,\n"
+"  shrink[=#]], --train-cover[=k=#,d=#,steps=#,split=#,shrink[=#]],\n"
+"  --train-legacy[=s=#]\n"
+"     Build a dictionary from the sample files (one file per sample) and\n"
+"     write it to -o NAME, default ./dictionary, replacing any file there\n"
+"     (-c writes it to stdout).  Mirrors zstd's builder step for step, so\n"
+"     the same samples and options give the SAME dictionary bytes as\n"
+"     `zstd --train`: --train uses fastcover with zstd's defaults; a bare\n"
+"     --train-cover or --train-fastcover lets the trainer choose every\n"
+"     parameter, as in zstd; naming both k and d skips the search.\n"
+"       --maxdict=#   dictionary size limit (default 112640; K/M suffixes)\n"
+"       --dictID=#    the dictionary ID (default: derived from the content)\n"
+"       -#            the level the dictionary is tuned for (default 3)\n"
+"       -B#           split each sample file into #-byte samples\n"
+"       -r            train on every file under a directory (symbolic links\n"
+"                     are skipped); without -r a directory is refused\n"
+"       -T#           search threads (default: zstd's, 1 to 4 by cores)\n"
+"       -M N          load at most N MiB of samples (gzstd's -M is in MiB\n"
+"                     everywhere; zstd's --memory counts bytes)\n"
+"     Each sample is capped at 128 KiB and the set at 2 GiB, as in zstd;\n"
+"     fewer than 5 samples is refused (exit 2).  -r and -B# have no other\n"
+"     use in gzstd, and warn outside --train.\n"
+"\n"
 #ifdef HAVE_NVCOMP
 "============================================================\n"
 " GPU TUNING\n"
@@ -4690,6 +4750,8 @@ static void print_help_long()
 "     -M / --memlimit / --memory, --mmap=on|off, --preallocate=on|off,\n"
 "     -D FILE / -D=FILE (compress and decode with a dictionary),\n"
 "     --no-dictID, --patch-from=OLD / --patch-from OLD on -d and -t,\n"
+"     --train, --train-cover, --train-fastcover, --train-legacy (with\n"
+"     --maxdict, --dictID, and -r / -B# for the sample set),\n"
 "     and bundled short flags such as -dc, -dkf, -dcf, -dD FILE.\n"
 "\n"
 "  PARTIALLY MAPPED:\n"
@@ -4708,13 +4770,11 @@ static void print_help_long()
 "\n"
 "  ACCEPTED WITH A WARNING, THEN IGNORED:\n"
 "     --long, --rsyncable, --exclude-compressed,\n"
-"     --[no-]pass-through, -r / --recursive, --filelist, --output-dir-flat,\n"
+"     --[no-]pass-through, --filelist, --output-dir-flat,\n"
 "     --output-dir-mirror, --trace, -B, -b# / -e# / -i#, -S,\n"
-"     --priority=, --format=gzip|xz|lzma|lz4, and --patch-from on\n"
-"     COMPRESSION (creating a patch; an ordinary frame is written)\n"
-"     DICTIONARY TRAINING IS NOT IMPLEMENTED: --train, every --train-*,\n"
-"     --maxdict*, and --dictID* warn and then continue as an ORDINARY\n"
-"     compression run.  No dictionary is produced.\n"
+"     --priority=, --format=gzip|xz|lzma|lz4, --patch-from on\n"
+"     COMPRESSION (creating a patch; an ordinary frame is written), and\n"
+"     -r / --recursive and -B# outside --train\n"
 "     -q / -qq suppress these warnings, regardless of argument order.\n"
 "\n"
 "For a condensed option list, run `gzstd -h`.\n";
@@ -4902,6 +4962,75 @@ static void warn_ignored_zstd_opt(const std::string & opt_name,
   if (!reason.empty()) msg += " (" + reason + ")";
   std::fprintf(stderr, "gzstd: %s\n", msg.c_str());
 }
+// zstd's readU32FromChar: digits, then an optional K or M (x1024 / x1048576)
+// that may be followed by "i" and/or "B" -- so 110K, 110KB and 110KiB agree.
+// Advances `p`; false on overflow or when no digit is present.
+static bool zstd_read_u32(const char *& p, unsigned & out)
+{
+  if (*p < '0' || *p > '9') return false;
+  uint64_t v = 0;
+  for (; *p >= '0' && *p <= '9'; ++p) {
+    v = v * 10 + (uint64_t)(*p - '0');
+    if (v > 0xFFFFFFFFull) return false;
+  }
+  if (*p == 'K' || *p == 'M') {
+    v <<= (*p == 'M') ? 20 : 10;
+    if (v > 0xFFFFFFFFull) return false;
+    ++p;
+    if (*p == 'i') ++p;
+    if (*p == 'B') ++p;
+  }
+  out = (unsigned)v;
+  return true;
+}
+// A whole option value as zstd's NEXT_UINT32 reads it: a number with the
+// optional suffix above, and nothing after it.
+static unsigned zstd_u32_value(const std::string & flag, const std::string & v)
+{
+  const char * p = v.c_str();
+  unsigned out = 0;
+  if (!zstd_read_u32(p, out) || *p != '\0')
+    die_usage(flag + ": '" + v + "' is not a number (optional suffix K, KB, KiB, M, MB, MiB)");
+  return out;
+}
+// f= and accel= exist only in the fastcover set; these let one parser serve both.
+static void set_train_f(ZDICT_fastCover_params_t & p, unsigned v) { p.f = v; }
+static void set_train_f(ZDICT_cover_params_t &, unsigned) {}
+static void set_train_accel(ZDICT_fastCover_params_t & p, unsigned v) { p.accel = v; }
+static void set_train_accel(ZDICT_cover_params_t &, unsigned) {}
+
+// zstd's parseCoverParameters / parseFastCoverParameters: comma-separated
+// k=, d=, f= (fastcover only), steps=, split= (percent), accel= (fastcover
+// only), shrink[=#].  The set is ZEROED first, as zstd does, so any field not
+// named reverts to ZDICT's own default rather than the CLI's.
+template <typename P>
+static bool parse_train_params(const char * p, P & params, bool fastcover)
+{
+  params = P {};
+  auto key = [&](const char * k) {
+    const size_t n = std::strlen(k);
+    if (std::strncmp(p, k, n) != 0) return false;
+    p += n; return true;
+  };
+  for (;;) {
+    unsigned v = 0;
+    if (key("k="))                     { if (!zstd_read_u32(p, v)) return false; params.k = v; }
+    else if (key("d="))                { if (!zstd_read_u32(p, v)) return false; params.d = v; }
+    else if (key("steps="))            { if (!zstd_read_u32(p, v)) return false; params.steps = v; }
+    else if (key("split="))            { if (!zstd_read_u32(p, v)) return false; params.splitPoint = (double)v / 100.0; }
+    else if (key("shrink")) {
+      params.shrinkDict = 1;
+      params.shrinkDictMaxRegression = 1;
+      if (*p == '=') { ++p; if (!zstd_read_u32(p, v)) return false; params.shrinkDictMaxRegression = v; }
+    }
+    else if (fastcover && key("f="))   { if (!zstd_read_u32(p, v)) return false; set_train_f(params, v); }
+    else if (fastcover && key("accel=")) { if (!zstd_read_u32(p, v)) return false; set_train_accel(params, v); }
+    else return false;
+    if (*p == ',') { ++p; continue; }
+    return *p == '\0';
+  }
+}
+
 // Eat a VALUE that follows a zstd long option, whether as `--opt VALUE`
 // (separate argv) or `--opt=VALUE` (joined).  Returns true if the option name
 // matched.  The value itself is discarded — this is for zstd flags we warn on.
@@ -12663,6 +12792,285 @@ static void attach_verify_dict(ZSTD_DCtx * d)
   const size_t st = ZSTD_DCtx_refDDict(d, g_ddict);
   if (ZSTD_isError(st))
     die(std::string("could not attach the -D dictionary to a --verify checker: ") + ZSTD_getErrorName(st));
+}
+
+/*---- --train: build a dictionary from sample files -------------------------
+ Mirrors zstd's CLI (programs/dibio.c, zstdcli.c and util.c, v1.5.7) step for
+ step, so the same samples and options give the SAME dictionary bytes as
+ `zstd --train`: the same directory walk, the same fixed-seed shuffle of the
+ file list, the same per-sample cap and -B# chunking, the same load limit, and
+ the same ZDICT call with the same parameters.  Where zstd's behaviour is an
+ accident -- a missing sample is silently skipped, a directory given without -r
+ is counted as a sample of size -1 -- gzstd refuses instead: a clear error,
+ never different bytes from the same valid input.
+----------------------------------------------------------------------------*/
+namespace train {
+
+constexpr size_t   SAMPLE_MAX  = 128 * 1024;            // SAMPLESIZE_MAX
+constexpr uint64_t SAMPLES_MAX = uint64_t(2) << 30;     // MAX_SAMPLES_SIZE
+constexpr size_t   NOISE_LEN   = 32;                    // NOISELENGTH
+
+// UTIL_prepareFileList: readdir order (NOT sorted -- the shuffle below is
+// applied to this order, so sorting would change the dictionary), depth
+// first, "." and ".." skipped, symbolic links skipped with a warning.
+static void expand_dir(const std::string & dir, std::vector<std::string> & out,
+                       const Options & opt)
+{
+  DIR * d = opendir(dir.c_str());
+  if (!d) die_io("cannot open directory " + dir + " (" + std::strerror(errno) + ")");
+  errno = 0;
+  while (struct dirent * e = readdir(d)) {
+    if (!std::strcmp(e->d_name, ".") || !std::strcmp(e->d_name, "..")) continue;
+    const std::string path = dir + "/" + e->d_name;
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) == 0 && S_ISLNK(st.st_mode)) {
+      vlog(V_DEFAULT, opt, "gzstd: warning: " + path + " is a symbolic link, ignoring\n");
+    } else if (::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+      expand_dir(path, out, opt);
+    } else {
+      out.push_back(path);
+    }
+    errno = 0;
+  }
+  const int rerr = errno;
+  closedir(d);
+  if (rerr) die_io("cannot read directory " + dir + " (" + std::strerror(rerr) + ")");
+}
+
+// DiB_shuffle: a fixed-seed Fisher-Yates over the file list, so a sample set
+// too large to load is sampled across its whole extent, reproducibly.
+static void shuffle(std::vector<std::string> & files)
+{
+  uint32_t seed = 0xFD2FB528u;
+  auto rnd = [&seed] {
+    seed *= 2654435761u;
+    seed ^= 2246822519u;
+    seed = (seed << 13) | (seed >> 19);
+    return seed >> 5;
+  };
+  for (size_t i = files.size(); i-- > 1;) {
+    const size_t j = rnd() % (uint32_t)(i + 1);
+    std::swap(files[i], files[j]);
+  }
+}
+
+// DiB_findMaxMem: round the need up to 8 MiB, add a step, cap, then probe with
+// malloc, stepping down 8 MiB at a time -- and return one step less than the
+// size that succeeded, exactly as zstd's loop does.
+static size_t find_max_mem(uint64_t required)
+{
+  const uint64_t step = uint64_t(8) << 20;
+  const uint64_t cap  = (sizeof(size_t) == 4) ? (uint64_t(2) << 30) - (uint64_t(64) << 20)
+                                              : (uint64_t(512) << 20) << sizeof(size_t);
+  required = (((required >> 23) + 1) << 23) + step;
+  if (required > cap) required = cap;
+  for (;;) {
+    void * probe = std::malloc((size_t)required);
+    required -= step;
+    if (probe) { std::free(probe); return (size_t)required; }
+  }
+}
+
+} // namespace train
+
+static int run_train(const Options & opt)
+{
+  using namespace train;
+  // 1. The file list: inputs as given, directories expanded under -r.
+  std::vector<std::string> files;
+  for (const std::string & in : opt.inputs) {
+    struct stat st {};
+    if (::stat(in.c_str(), &st) != 0)
+      die_io("cannot open training sample " + in + " (" + std::strerror(errno) + ")");
+    if (S_ISDIR(st.st_mode)) {
+      if (!opt.recursive) die_usage(in + " is a directory: pass -r to train on the files under it");
+      expand_dir(in, files, opt);
+    } else {
+      files.push_back(in);
+    }
+  }
+  shuffle(files);
+
+  // 2. How much to load (DiB_fileStats).  Sizes are taken once, in shuffled order.
+  const size_t chunk = opt.train_block_size;
+  std::vector<uint64_t> sizes(files.size());
+  uint64_t total = 0;
+  size_t nb_samples = 0;
+  bool one_too_large = false;
+  for (size_t n = 0; n < files.size(); ++n) {
+    struct stat st {};
+    if (::stat(files[n].c_str(), &st) != 0)
+      die_io("cannot open training sample " + files[n] + " (" + std::strerror(errno) + ")");
+    if (!S_ISREG(st.st_mode))
+      die_usage("training sample " + files[n] + " is not a regular file");
+    sizes[n] = (uint64_t)st.st_size;
+    if (sizes[n] == 0) {
+      vlog(V_VERBOSE, opt, "Sample file '" + files[n] + "' has zero size, skipping...\n");
+      continue;
+    }
+    if (chunk > 0) {
+      nb_samples += (size_t)((sizes[n] + chunk - 1) / chunk);
+      total += sizes[n];
+    } else {
+      if (sizes[n] > SAMPLE_MAX) {
+        one_too_large |= sizes[n] > 2 * SAMPLE_MAX;
+        vlog(V_VERBOSE, opt, "Sample file '" + files[n] + "' is too large, limiting to "
+                             + std::to_string(SAMPLE_MAX / 1024) + " KB\n");
+      }
+      nb_samples += 1;
+      total += std::min<uint64_t>(sizes[n], SAMPLE_MAX);
+    }
+  }
+  const unsigned mem_mult = opt.train_algo == Options::TrainAlgo::LEGACY ? 11
+                          : opt.train_algo == Options::TrainAlgo::COVER  ? 9 : 1;
+  const uint64_t max_mem = find_max_mem(total * mem_mult) / mem_mult;
+  uint64_t loaded = std::min(std::min(max_mem, total), SAMPLES_MAX);
+  if (opt.mem_limit_mib) {
+    // gzstd's -M is in MiB everywhere, so here too (zstd's --memory counts bytes).
+    const uint64_t lim = (uint64_t)opt.mem_limit_mib << 20;
+    vlog(V_DEFAULT, opt, "!  Warning : setting manual memory limit for dictionary training data at "
+                         + std::to_string(opt.mem_limit_mib) + " MB \n");
+    loaded = std::min(loaded, lim);
+  }
+  if (one_too_large)
+    vlog(V_DEFAULT, opt, "!  Warning : some sample(s) are very large \n"
+                         "!  Note that dictionary is only useful for small samples. \n"
+                         "!  As a consequence, only the first " + std::to_string(SAMPLE_MAX)
+                         + " bytes of each sample are loaded \n");
+  if (nb_samples < 5)
+    die_usage("nb of samples too low (" + std::to_string(nb_samples) + "): provide one file per "
+              "sample, or split files into fixed-size blocks representative of samples with -B#");
+  if (total < (uint64_t)opt.train_maxdict * 8)
+    vlog(V_DEFAULT, opt, "!  Warning : data size of samples too small for target dictionary size \n"
+                         "!  Samples should be about 100x larger than target dictionary size \n");
+  if (loaded < total)
+    vlog(V_ERROR, opt, "Training samples set too large (" + std::to_string(total >> 20)
+                       + " MB); training on " + std::to_string(loaded >> 20) + " MB only...\n");
+
+  // 3. Load (DiB_loadFiles).  A FIRST chunk that does not fit ends loading
+  // outright; a later chunk that does not fit only ends this file.
+  std::vector<char> src((size_t)loaded + NOISE_LEN);
+  std::vector<size_t> sample_sizes(nb_samples);
+  size_t filled = 0, nloaded = 0;
+  for (size_t fi = 0; nloaded < nb_samples && fi < files.size(); ++fi) {
+    if (sizes[fi] == 0) continue;
+    FILE * f = std::fopen(files[fi].c_str(), "rb");
+    if (!f) die_io("cannot open training sample " + files[fi] + " (" + std::strerror(errno) + ")");
+    uint64_t got = std::min<uint64_t>(sizes[fi], chunk > 0 ? chunk : SAMPLE_MAX);
+    if (filled + got > loaded) { std::fclose(f); break; }
+    if (std::fread(src.data() + filled, 1, (size_t)got, f) != (size_t)got)
+      die_io("cannot read training sample " + files[fi]);
+    sample_sizes[nloaded++] = (size_t)got;
+    filled += (size_t)got;
+    if (chunk > 0) {
+      while (got < sizes[fi] && nloaded < nb_samples) {
+        const size_t c = (size_t)std::min<uint64_t>(sizes[fi] - got, chunk);
+        if (filled + c > loaded) break;
+        if (std::fread(src.data() + filled, 1, c, f) != c)
+          die_io("cannot read training sample " + files[fi]);
+        sample_sizes[nloaded++] = c;
+        filled += c;
+        got += c;
+      }
+    }
+    std::fclose(f);
+  }
+  vlog(V_DEBUG, opt, "Loaded " + std::to_string(filled / 1024) + " KB total training data, "
+                     + std::to_string(nloaded) + " nb samples \n");
+
+  // 4. Train, with zstd's parameters.  Threads only change the optimizer's
+  // speed; zstd's default is MAX(1, MIN(4, cores/4)), and gzstd uses the same
+  // when -T is not given so the two tools pick from the same candidates.
+  const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+  const unsigned threads = opt.cpu_threads > 0 ? (unsigned)opt.cpu_threads
+                         : opt.cpu_threads == -1 ? cores
+                         : std::max(1u, std::min(4u, cores / 4));
+  ZDICT_params_t zp {};
+  zp.compressionLevel  = opt.level;
+  zp.notificationLevel = (unsigned)std::max(0, std::min(4, opt.verbosity));
+  zp.dictID            = opt.train_dict_id;
+  std::vector<char> dict(opt.train_maxdict ? opt.train_maxdict : 1);
+  size_t dsize = 0;
+  std::string chose;
+  switch (opt.train_algo) {
+  case Options::TrainAlgo::LEGACY: {
+    // DiB_fillNoise: a guard band past the samples, for the legacy trainer.
+    unsigned acc = 2654435761u;
+    for (size_t p = 0; p < NOISE_LEN; ++p) { acc *= 2246822519u; src[filled + p] = (char)(unsigned char)(acc >> 21); }
+    ZDICT_legacy_params_t lp {};
+    lp.selectivityLevel = opt.train_selectivity;
+    lp.zParams = zp;
+    dsize = ZDICT_trainFromBuffer_legacy(dict.data(), opt.train_maxdict, src.data(),
+                                         sample_sizes.data(), (unsigned)nloaded, lp);
+    break;
+  }
+  case Options::TrainAlgo::COVER: {
+    ZDICT_cover_params_t cp = opt.train_cover;
+    const bool optimize = !cp.k || !cp.d;
+    cp.nbThreads = threads;
+    cp.zParams = zp;
+    dsize = optimize
+        ? ZDICT_optimizeTrainFromBuffer_cover(dict.data(), opt.train_maxdict, src.data(),
+                                              sample_sizes.data(), (unsigned)nloaded, &cp)
+        : ZDICT_trainFromBuffer_cover(dict.data(), opt.train_maxdict, src.data(),
+                                      sample_sizes.data(), (unsigned)nloaded, cp);
+    if (optimize && !ZDICT_isError(dsize))
+      chose = "k=" + std::to_string(cp.k) + "\nd=" + std::to_string(cp.d) + "\nsteps="
+            + std::to_string(cp.steps) + "\nsplit=" + std::to_string((unsigned)(cp.splitPoint * 100)) + "\n";
+    break;
+  }
+  case Options::TrainAlgo::FASTCOVER: {
+    ZDICT_fastCover_params_t fp = opt.train_fastcover;
+    const bool optimize = !fp.k || !fp.d;
+    fp.nbThreads = threads;
+    fp.zParams = zp;
+    dsize = optimize
+        ? ZDICT_optimizeTrainFromBuffer_fastCover(dict.data(), opt.train_maxdict, src.data(),
+                                                  sample_sizes.data(), (unsigned)nloaded, &fp)
+        : ZDICT_trainFromBuffer_fastCover(dict.data(), opt.train_maxdict, src.data(),
+                                          sample_sizes.data(), (unsigned)nloaded, fp);
+    if (optimize && !ZDICT_isError(dsize))
+      chose = "k=" + std::to_string(fp.k) + "\nd=" + std::to_string(fp.d) + "\nf="
+            + std::to_string(fp.f) + "\nsteps=" + std::to_string(fp.steps) + "\nsplit="
+            + std::to_string((unsigned)(fp.splitPoint * 100)) + "\naccel=" + std::to_string(fp.accel) + "\n";
+    break;
+  }
+  }
+  if (ZDICT_isError(dsize))
+    die(std::string("dictionary training failed: ") + ZDICT_getErrorName(dsize));
+  if (!chose.empty()) vlog(V_DEFAULT, opt, chose);
+
+  // 5. Save.  zstd overwrites the output unasked, and so does gzstd -- but
+  // through a temporary file and a rename, so a failure never leaves a
+  // truncated dictionary where a good one was.
+  const bool to_stdout = opt.to_stdout || opt.output_dash;
+  const std::string out = to_stdout ? std::string("stdout")
+                        : (opt.output_named ? opt.output : std::string("dictionary"));
+  if (to_stdout) {
+    if (std::fwrite(dict.data(), 1, dsize, stdout) != dsize || std::fflush(stdout) != 0)
+      die_io("write error writing the dictionary to stdout");
+  } else {
+    std::string tmp = out + ".gzstd-tmp-XXXXXX";
+    const int fd = ::mkstemp(&tmp[0]);
+    if (fd < 0) die_io("cannot create " + tmp + " (" + std::strerror(errno) + ")");
+    size_t w = 0;
+    while (w < dsize) {
+      const ssize_t r = ::write(fd, dict.data() + w, dsize - w);
+      if (r < 0 && errno == EINTR) continue;
+      if (r <= 0) { const int e = errno; ::close(fd); ::unlink(tmp.c_str());
+                    die_io("write error writing " + out + " (" + std::strerror(e) + ")"); }
+      w += (size_t)r;
+    }
+    // mkstemp creates 0600; a dictionary is ordinary data, so use what the
+    // umask would give a new file (zstd's fopen does).
+    const mode_t um = ::umask(0); ::umask(um);
+    if (::fchmod(fd, 0666 & ~um) != 0 || ::close(fd) != 0 || ::rename(tmp.c_str(), out.c_str()) != 0) {
+      const int e = errno; ::unlink(tmp.c_str());
+      die_io("cannot write dictionary " + out + " (" + std::strerror(e) + ")");
+    }
+  }
+  vlog(V_DEFAULT, opt, "Save dictionary of size " + std::to_string(dsize) + " into file " + out + " \n");
+  return EXIT_OK;
 }
 
 // What a decode error means when it is a dictionary problem.  Returns "" for
@@ -36627,6 +37035,8 @@ static int gzstd_main(int argc, char ** argv)
 #endif
 
   Options opt = parse_args(argc, argv);
+  // --train is its own operation: no compress/decompress setup applies.
+  if (opt.train) return run_train(opt);
   // -D / --patch-from: load the run's dictionary before any coder (or thread) exists.
   load_dictionaries(opt);
 
@@ -40410,7 +40820,7 @@ static Options parse_args(int argc, char ** argv)
       warn_ignored_zstd_opt(a);
     }
     else if (a == "-r" || a == "--recursive") {
-      warn_ignored_zstd_opt("-r/--recursive", "recurse into directories yourself");
+      opt.recursive = true;   // honoured by --train; warned about otherwise (after the loop)
     }
     else if (a == "-l" || a == "--list") {
       opt.list_mode = true;
@@ -40448,11 +40858,49 @@ static Options parse_args(int argc, char ** argv)
       opt.dict_path = a.substr(a.find('=') + 1);
       if (opt.dict_path.empty()) die_usage("missing value for " + a.substr(0, a.find('=')));
     }
-    // Training mode (warn; zstd exits early with these — gzstd will proceed
-    // as normal compression, producing no dictionary)
-    else if (a == "--train" || a.rfind("--train-", 0) == 0
-          || a.rfind("--maxdict", 0) == 0 || a.rfind("--dictID", 0) == 0) {
-      warn_ignored_zstd_opt(a, "dictionary training not supported");
+    // Dictionary training (run_train), in zstd's spellings -- including its
+    // rule that a BARE --train-cover / --train-fastcover zeroes the parameter
+    // set, while --train alone keeps the CLI's fastcover defaults.
+    else if (a == "--train") { opt.train = true; }
+    else if (a.rfind("--train-fastcover", 0) == 0) {
+      opt.train = true; opt.train_algo = Options::TrainAlgo::FASTCOVER;
+      const std::string rest = a.substr(std::strlen("--train-fastcover"));
+      if (rest.empty()) opt.train_fastcover = ZDICT_fastCover_params_t {};
+      else if (rest[0] != '=' || !parse_train_params(rest.c_str() + 1, opt.train_fastcover, true))
+        die_usage("bad --train-fastcover parameters: " + a
+                  + " (expected k=#,d=#,f=#,steps=#,split=#,accel=#,shrink[=#])");
+    }
+    else if (a.rfind("--train-cover", 0) == 0) {
+      opt.train = true; opt.train_algo = Options::TrainAlgo::COVER;
+      const std::string rest = a.substr(std::strlen("--train-cover"));
+      if (rest.empty()) opt.train_cover = ZDICT_cover_params_t {};
+      else if (rest[0] != '=' || !parse_train_params(rest.c_str() + 1, opt.train_cover, false))
+        die_usage("bad --train-cover parameters: " + a + " (expected k=#,d=#,steps=#,split=#,shrink[=#])");
+    }
+    else if (a.rfind("--train-legacy", 0) == 0) {
+      opt.train = true; opt.train_algo = Options::TrainAlgo::LEGACY;
+      const std::string rest = a.substr(std::strlen("--train-legacy"));
+      if (!rest.empty()) {
+        const char * p = nullptr;
+        if (rest.rfind("=s=", 0) == 0)                p = rest.c_str() + 3;
+        else if (rest.rfind("=selectivity=", 0) == 0) p = rest.c_str() + 13;
+        if (!p || !zstd_read_u32(p, opt.train_selectivity) || *p != '\0')
+          die_usage("bad --train-legacy parameters: " + a + " (expected s=# or selectivity=#)");
+      }
+    }
+    else if (a.rfind("--train", 0) == 0) die_usage("unknown training option: " + a);
+    else if (a == "--maxdict" || a.rfind("--maxdict=", 0) == 0
+          || a == "--dictID" || a.rfind("--dictID=", 0) == 0) {
+      const size_t eq = a.find('=');
+      const std::string flag = a.substr(0, eq);
+      std::string v;
+      if (eq != std::string::npos) v = a.substr(eq + 1);
+      else {
+        if (i + 1 >= argc || argv[i + 1][0] == '\0') die_usage("missing value for " + flag);
+        if (argv[i + 1][0] == '-') die_usage(flag + " needs a number, not the option '" + std::string(argv[i + 1]) + "'");
+        v = argv[++i];
+      }
+      (flag == "--maxdict" ? opt.train_maxdict : opt.train_dict_id) = zstd_u32_value(flag, v);
     }
     // Memory limit (zstd-compat `-M#` / `-M N` / `--memlimit[=N]` /
     // `--memory[=N]`, value in MiB).  Applied to decompress via
@@ -40483,7 +40931,9 @@ static Options parse_args(int argc, char ** argv)
     // with different semantics (one frame per chunk).  Warn.
     else if (a.size() > 2 && a[0] == '-' && a[1] == 'B'
           && (a[2] >= '0' && a[2] <= '9')) {
-      warn_ignored_zstd_opt(a, "use --chunk-size N (MiB) for frame size");
+      // zstd's -B#: in --train it splits samples into #-byte blocks (the
+      // block-size check and the compress-mode warning are after the loop).
+      opt.train_block_size = zstd_u32_value("-B", a.substr(2));
     }
     else if (a == "-B") {
       warn_ignored_zstd_opt("-B", "use --chunk-size N (MiB)");
@@ -40502,6 +40952,23 @@ static Options parse_args(int argc, char ** argv)
       die_usage("unknown option: " + a);
     }
     else push_positional(a);
+  }
+  // --train is its own operation: validate it and return now.  None of the
+  // compress/decompress checks below apply -- they would, for instance, refuse
+  // -o with several inputs (a training set IS several inputs) or add stdin when
+  // no file was named.  Here, where the whole line is known, -r and -B# may
+  // appear on either side of --train, as zstd allows.
+  if (opt.train) {
+    if (opt.mode != Mode::COMPRESS || opt.list_mode)
+      die_usage("--train cannot be combined with -d, -t or -l");
+    if (opt.tar_mode) die_usage("--train cannot be combined with --tar");
+    if (!opt.dict_path.empty() || !opt.patch_from.empty())
+      die_usage("--train cannot be combined with -D or --patch-from");
+    if (opt.inputs.empty() || (opt.inputs.size() == 1 && opt.inputs[0] == "-"))
+      die_usage("--train needs sample files to train on (or -r DIR)");
+    g_verbosity = opt.verbosity;
+    g_color_stderr = is_stderr_tty();
+    return opt;
   }
   // -d/-l --tar ARCHIVE MEMBER...: the first positional after --tar is the
   // archive; the rest select members (tar name-arg semantics), each bound to
@@ -40606,6 +41073,15 @@ static Options parse_args(int argc, char ** argv)
     vlog(V_VERBOSE, opt, "note: GPU tuning flags are ignored in this CPU-only "
                          "build (compiled without nvCOMP)\n");
 #endif
+
+  // -r and -B# are honoured only by --train (validated right after the loop).
+  {
+    if (opt.recursive)
+      warn_ignored_zstd_opt("-r/--recursive", "recurse into directories yourself; "
+                                              "only --train expands directories");
+    if (opt.train_block_size)
+      warn_ignored_zstd_opt("-B#", "use --chunk-size N (MiB) for frame size");
+  }
 
   // -D / --patch-from: recorded by the loop, decided here where the mode is final.
   if (!opt.dict_path.empty() && !opt.patch_from.empty())

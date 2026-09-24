@@ -1,12 +1,73 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.71  
+**Covers:** v0.9.50 → v0.17.72  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.72 — `--train` builds dictionaries, byte-identical to `zstd --train`
+
+The dictionary work's Stage C, and the last of it: gzstd now TRAINS dictionaries. Until now `--train`,
+every `--train-*`, `--maxdict` and `--dictID` warned and ran an ordinary compression — no dictionary, and
+a `--maxdict 8K` spelling even left `8K` behind as an input file name.
+
+**The goal was the same BYTES, not just a working dictionary.** A dictionary is an input to every later
+compression, so "a different but valid dictionary" would make gzstd and zstd outputs diverge forever
+after. gzstd therefore mirrors zstd's builder (programs/dibio.c, zstdcli.c and util.c, v1.5.7) step
+for step, and measures itself against zstd rather than against itself:
+
+- the `-r` directory walk in `readdir` order — NOT sorted, because the next step reorders that order —
+  skipping `.`, `..` and symbolic links;
+- the fixed-seed Fisher-Yates shuffle of the file list (zstd's `DiB_shuffle` and its generator);
+- the per-sample cap of 128 KiB, `-B#` chunking, and the load limit of `min(total, 2 GiB)` from zstd's
+  memory probe — including its loop, which returns one 8 MiB step below the size that succeeded;
+- loading that stops OUTRIGHT at the first file whose first chunk does not fit, but only moves to the
+  next file when a later chunk does not;
+- zstd's CLI parameter sets: `--train` is fastcover with d=8, f=20, steps=4, split=75, accel=1, and a
+  BARE `--train-cover` / `--train-fastcover` zeroes its set so the trainer picks everything;
+- the legacy trainer's 32-byte noise guard band past the samples;
+- search threads defaulting to zstd's own `max(1, min(4, cores/4))`.
+
+Measured against zstd 1.5.7 on a 1,500-file JSON set: **20 of 20 option combinations produced
+byte-identical dictionaries** — every algorithm, explicit and searched parameters, `--maxdict`/`--dictID`
+with suffixes, levels, `-T1`/`-T8`, `-r`, `-B#` chunking and the 128 KiB cap.
+
+Where zstd's behaviour is an accident, gzstd refuses rather than copying it: a missing sample (zstd skips
+it silently), a directory without `-r` (zstd counts it as a sample of size −1), a non-regular file. Fewer
+than 5 samples is exit 2, as zstd refuses it (zstd exits 14). The dictionary replaces an existing `-o`
+as zstd's does, but through a temporary file and a rename, so a failed run never truncates a good one.
+`-M` limits the sample load in MiB, gzstd's unit for `-M` everywhere; zstd's `--memory` counts bytes.
+`-r` and `-B#` are honoured only by `--train` and still warn elsewhere.
+
+**Verification.** Eleven cells compare gzstd's dictionary with zstd's own, byte for byte — six always run,
+five under `-e` — plus one for the output file and the refusals. Ten mutants, each changing one step of
+the mirror:
+
+| mutant | cells that fail |
+|---|---|
+| no shuffle | 10 — every parity cell |
+| the `-r` walk sorted | 1 (`-r DIR`) |
+| no 128 KiB per-sample cap | 1 |
+| a later `-B#` chunk not loaded | 1 |
+| a bare `--train-fastcover` keeps the CLI defaults | 1 |
+| fastcover's default split 75 → 100 | 5 |
+| `--dictID` not passed | 1 |
+| always run the parameter search | 1 — **only once the cell gave `split=80`**: with k and d named, cover's zeroed split means "all samples" either way, so the first cell could not tell |
+| the level not passed | 1 — **only once a cell used `-19`**: ZDICT reads level 0 as 3, gzstd's default |
+| the legacy trainer's noise guard band left zero | **0** — no input tried makes the trainer read past the samples, and the degenerate sets that might are ones zstd itself refuses to train on; the band is kept because zstd's code keeps it |
+
+**Suites, before the version bump:** `-e` on the GPU build 661 passed, **1 failed**, 2 skipped of 664
+(13m5s); `-e` on `USE_NVCOMP=OFF` 519 / **1** / 115 (2m12s). The failure was the same on both: the
+source lint `scripts/check-endian-reads.sh` matched the three `std::memset(&p, 0, sizeof p)` that zeroed
+the ZDICT parameter sets — the shape of a host-order read, though none reads a file. They are now
+value-initialisations (`P {}`), the lint is clean, and the parity cells were rerun on the rebuilt
+binaries (unchanged: 33/33 against zstd, and every dictionary cell). The GPU run's second skip is the
+timing-dependent "decompress GPU yields the tail" cell, which reported the CPU finishing before a GPU
+reached intake; it does not touch training. Every new cell passed on both builds. Both configurations
+build warning-free.
 
 ## v0.17.71 — `-D` compresses, `-d --patch-from` decodes zstd's patches, and `--sliding-window --verify` stops keeping bad streams
 
