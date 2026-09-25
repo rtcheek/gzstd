@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=525
-$EXTENSIVE && EXPECTED_TESTS=683
+EXPECTED_TESTS=532
+$EXTENSIVE && EXPECTED_TESTS=690
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -758,8 +758,16 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.76: two GDS cells (the capability refusal; stats on exits 0 with
 # posix=0).  523 -> 525, 681 -> 683.  Both need a working --gds-only host, so
 # the no-GPU deltas grow 132 -> 134 and 160 -> 162, and the no-GDS delta 11 -> 13.
-EXPECTED_NOGPU_DELTA=134
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=162   # MEASURED 2026-09-21 (607 - 463) + 18 derived since
+# v0.17.77: six GPU cells for the compute-capability floor (every card old: no
+# CUDA; one found after CUDA; -d --gpu-only with no device refuses at exit 2;
+# nvCOMP's refusal reported as one; and, with two cards, mixed generations and a
+# subset ranking).  525 -> 531, 683 -> 689; all six are GPU-section cells, so
+# the no-GPU deltas grow 134 -> 140 and 162 -> 168.  DERIVED; 140 then MEASURED
+# by the CPU-only run (391 = 531 - 140).  Plus one cell in the dictionary section
+# for the pre-tag review's file-loss fixes, run by both builds: 531 -> 532,
+# 689 -> 690, no-GPU deltas unchanged.
+EXPECTED_NOGPU_DELTA=140
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=168   # MEASURED 2026-09-21 (607 - 463) + 24 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -1642,6 +1650,72 @@ PYEOF
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "--train output (./dictionary, -o replaced, -c) and refusals" \
     || fail "--train output (./dictionary, -o replaced, -c) and refusals" "got$why"
+
+  # NOTHING AN ARCHIVE NEEDS IS DELETED, AND NOTHING A RUN DID NOT WRITE IS
+  # TRUNCATED (v0.17.77, the pre-tag review).  Three losses, each at exit 0 before:
+  #   -D FILE --rm FILE, or --tar --rm over a tree holding FILE: the dictionary the
+  #     archive needs went with the sources (a hard link to it in the tree is kept
+  #     at removal time instead, exit 3);
+  #   --train dictionary a b c: the default output ./dictionary was also a sample,
+  #     and the new dictionary was renamed over it;
+  #   -t --direct with stdout opened read-write on a file: -t writes nothing, but
+  #     the O_DIRECT stdout setup truncated the file (v0.17.69 too).
+  t0=$(now_ms); why=""
+  RMD="$DICTD/rmdep"; rm -rf "$RMD"; mkdir -p "$RMD/tree" "$RMD/tree2" "$RMD/tr"
+  cp "$DICTD/a.dict" "$RMD/d.dict"
+  "$GZSTD" -q -D "$RMD/d.dict" --rm -f "$RMD/d.dict" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 2 ]] || why+=" plain:$rc"
+  cmp -s "$RMD/d.dict" "$DICTD/a.dict" || why+=" plain-lost-the-dictionary"
+  cp "$DICTD"/s/1.json "$DICTD"/s/2.json "$RMD/tree/"; cp "$DICTD/a.dict" "$RMD/tree/d.dict"
+  "$GZSTD" -q -D "$RMD/tree/d.dict" --rm --tar -f -o "$RMD/t.tzst" "$RMD/tree" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 2 ]] || why+=" tar:$rc"
+  [[ -e "$RMD/tree/d.dict" && -e "$RMD/tree/1.json" ]] || why+=" tar-removed-sources"
+  [[ -e "$RMD/t.tzst" ]] && why+=" tar-wrote-an-archive"
+  cp "$DICTD"/s/1.json "$DICTD"/s/2.json "$RMD/tree2/"; ln "$RMD/d.dict" "$RMD/tree2/link.dict"
+  "$GZSTD" -q -D "$RMD/d.dict" --rm --tar -f -o "$RMD/t2.tzst" "$RMD/tree2" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 3 ]] || why+=" hardlink:$rc"
+  [[ -e "$RMD/tree2/link.dict" ]] || why+=" hardlink-removed"
+  [[ -e "$RMD/tree2/1.json" ]] && why+=" hardlink-kept-the-other-sources"
+  mkdir -p "$RMD/x"
+  "$GZSTD" -q -d -D "$RMD/d.dict" --tar -C "$RMD/x" "$RMD/t2.tzst" >/dev/null 2>&1 \
+    && cmp -s "$RMD/x$RMD/tree2/1.json" "$DICTD/s/1.json" 2>/dev/null \
+    || cmp -s "$RMD/x/${RMD#/}/tree2/1.json" "$DICTD/s/1.json" || why+=" hardlink-archive-round-trip"
+  cp "$DICTD"/s/*.json "$RMD/tr/"; cp "$DICTD/a.dict" "$RMD/tr/dictionary"
+  ( cd "$RMD/tr" && "$GZSTD" -q --train dictionary ./*.json >/dev/null 2>&1 ); rc=$?
+  [[ $rc -eq 2 ]] || why+=" train:$rc"
+  cmp -s "$RMD/tr/dictionary" "$DICTD/a.dict" || why+=" train-replaced-its-sample"
+  "$GZSTD" -q -k -f --cpu-only "$DICTD/body.json" -o "$RMD/b.zst" 2>/dev/null
+  printf 'victim\n' > "$RMD/victim"
+  ( exec 1<>"$RMD/victim"; "$GZSTD" -t --direct "$RMD/b.zst" 2>/dev/null ); rc=$?
+  [[ $rc -eq 0 ]] || why+=" test-direct:$rc"
+  [[ "$(cat "$RMD/victim")" == victim ]] || why+=" test-direct-truncated-stdout"
+  # ...and no OUTPUT may land on a file the run still needs (tag review, round 2):
+  # the archive onto its own dictionary (-f -o, or stdout opened on it), the
+  # training output onto a sample through stdout, and --stats-json -- which
+  # truncates its path -- onto the dictionary or the archive being tested.
+  cp "$DICTD/a.dict" "$RMD/o.dict"
+  "$GZSTD" -q -D "$RMD/o.dict" -f -o "$RMD/o.dict" "$DICTD/s/1.json" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 2 ]] || why+=" out-onto-dict:$rc"
+  cmp -s "$RMD/o.dict" "$DICTD/a.dict" || why+=" out-onto-dict-replaced"
+  ( exec 1<>"$RMD/o.dict"; "$GZSTD" -q -D "$RMD/o.dict" -c "$DICTD/s/1.json" 2>/dev/null ); rc=$?
+  [[ $rc -eq 2 ]] || why+=" stdout-onto-dict:$rc"
+  cmp -s "$RMD/o.dict" "$DICTD/a.dict" || why+=" stdout-onto-dict-replaced"
+  cp "$DICTD/s/1.json" "$RMD/tr/one.json"
+  ( cd "$RMD/tr" && exec 1<>one.json && "$GZSTD" -q --train -c ./*.json 2>/dev/null ); rc=$?
+  [[ $rc -eq 2 ]] || why+=" train-stdout-onto-sample:$rc"
+  cmp -s "$RMD/tr/one.json" "$DICTD/s/1.json" || why+=" train-stdout-replaced-a-sample"
+  cp "$RMD/b.zst" "$RMD/b2.zst"
+  "$GZSTD" -t --stats-json "$RMD/b2.zst" "$RMD/b2.zst" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 2 ]] || why+=" stats-onto-tested-archive:$rc"
+  cmp -s "$RMD/b2.zst" "$RMD/b.zst" || why+=" stats-replaced-the-archive"
+  "$GZSTD" -q -D "$RMD/o.dict" --stats-json "$RMD/o.dict" -k -f "$DICTD/s/1.json" \
+    -o "$RMD/s1.zst" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 2 ]] || why+=" stats-onto-dict:$rc"
+  cmp -s "$RMD/o.dict" "$DICTD/a.dict" || why+=" stats-replaced-the-dict"
+  rm -rf "$RMD"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--rm keeps the dictionary, --train keeps its samples, -t leaves stdout alone" \
+    || fail "--rm keeps the dictionary, --train keeps its samples, -t leaves stdout alone" "got$why"
 else
   for c in "zstd -D ${SYM_ARROW} gzstd -d -D (4 frames, CPU workers)" \
            "zstd -D ${SYM_ARROW} gzstd -d -D (no content size, file)" \
@@ -1669,7 +1743,8 @@ else
            "--train-legacy: same bytes as zstd" \
            "--train -r DIR: same bytes as zstd (directory walk + shuffle)" \
            "--train -B1K: same bytes as zstd (files split into samples)" \
-           "--train output (./dictionary, -o replaced, -c) and refusals"; do
+           "--train output (./dictionary, -o replaced, -c) and refusals" \
+           "--rm keeps the dictionary, --train keeps its samples, -t leaves stdout alone"; do
     skip "$c" "zstd or python3 not installed"
   done
 fi
@@ -5017,6 +5092,344 @@ if has_gpu 2>/dev/null; then
     skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" "single GPU host"
   fi
 
+  # THE COMPUTE-CAPABILITY FLOOR (v0.17.77).  gzstd's GPU code runs on compute
+  # capability 7.0 and newer (nvCOMP 5.2's own code, and gpuverify.cu's kernels,
+  # which were built for 7.5+ until this version).  Below it, v0.17.76 brought
+  # every card up and failed on each -- MEASURED on four GTX 1080 Ti: a false
+  # "insufficient VRAM" per card on compress, an nvCOMP fault per card on
+  # decompress -- before redoing the work on the CPU at exit 0.  Now a card below
+  # the floor is absent.  GZSTD_DEBUG_GPU_CC makes these real cards REPORT an old
+  # capability; the checks read it exactly where they read the real one.
+  #
+  # "CUDA never started" is the dynamic loader's own trace, not gzstd's log: the
+  # loader calls libcuda's initialiser exactly when CUDA comes up.  The control
+  # arm proves the detector sees a normal run's CUDA, so a zero is not vacuous.
+  fl_cuda_inits() { cat "$1".* 2>/dev/null | grep -c 'calling init: .*libcuda\.so'; rm -f "$1".*; }
+  fl_run() {  # fl_run LDPREFIX ENV... -- ARGS...   (sets fl_rc, fl_log)
+    local ld=$1 envs=(); shift
+    while [[ $1 != -- ]]; do envs+=("$1"); shift; done; shift
+    rm -f "$ld".*
+    fl_rc=0
+    fl_log=$(env "${envs[@]}" LD_DEBUG=libs LD_DEBUG_OUTPUT="$ld" \
+               timeout --foreground -k 10 120 "$GZSTD" "$@" 2>&1) || fl_rc=$?
+  }
+  "$GZSTD" -q -k -f --cpu-only "$TMPDIR/large.bin" -o "$TMPDIR/fl.zst" 2>/dev/null
+  fl_why=""
+  fl_run "$TMPDIR/fl-ld" -- --gpu-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl0.zst"
+  fl_n=$(fl_cuda_inits "$TMPDIR/fl-ld")
+  (( fl_rc == 0 && fl_n >= 1 )) || fl_why+=" [control: rc=$fl_rc, CUDA inits seen=$fl_n]"
+  fl_run "$TMPDIR/fl-ld" GZSTD_DEBUG_GPU_CC=6.1 -- --gpu-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl1.zst"
+  fl_n=$(fl_cuda_inits "$TMPDIR/fl-ld")
+  [[ $fl_rc -eq 2 ]] || fl_why+=" [--gpu-only rc=$fl_rc, want 2]"
+  printf '%s' "$fl_log" | grep -q 'but every GPU here (.*) is older than this build supports' \
+    || fl_why+=" [the refusal does not give the floor as the reason]"
+  [[ -e "$TMPDIR/fl1.zst" ]] && fl_why+=" [the refused compress left an output]"
+  (( fl_n == 0 )) || fl_why+=" [--gpu-only started CUDA]"
+  for fl_arm in "-d --gpu-only -k -f $TMPDIR/fl.zst -o $TMPDIR/fl1.dec" "-t --gpu-only $TMPDIR/fl.zst"; do
+    # shellcheck disable=SC2086
+    fl_run "$TMPDIR/fl-ld" GZSTD_DEBUG_GPU_CC=6.1 -- $fl_arm
+    fl_n=$(fl_cuda_inits "$TMPDIR/fl-ld")
+    [[ $fl_rc -eq 2 ]] || fl_why+=" [${fl_arm%% *} --gpu-only rc=$fl_rc, want 2]"
+    (( fl_n == 0 )) || fl_why+=" [${fl_arm%% *} --gpu-only started CUDA]"
+  done
+  [[ -e "$TMPDIR/fl1.dec" ]] && fl_why+=" [the refused decompress left an output]"
+  # --gds-only opens cuFile, which starts CUDA itself, in its preflight: the
+  # refusal must come first, and name the flag the user gave.
+  fl_run "$TMPDIR/fl-ld" GZSTD_DEBUG_GPU_CC=6.1 -- --gds-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl1g.zst"
+  fl_n=$(fl_cuda_inits "$TMPDIR/fl-ld")
+  [[ $fl_rc -eq 2 ]] || fl_why+=" [--gds-only rc=$fl_rc, want 2]"
+  printf '%s' "$fl_log" | grep -q 'GPU requested (--gds-only) but every GPU here' \
+    || fl_why+=" [the --gds-only refusal does not name --gds-only and the floor]"
+  (( fl_n == 0 )) || fl_why+=" [--gds-only started CUDA]"
+  [[ -e "$TMPDIR/fl1g.zst" ]] && fl_why+=" [the refused --gds-only left an output]"
+  # A seekable file whose frame declares no size goes straight to the CPU
+  # streaming decoder from the main dispatch, before any GPU path: the refusal
+  # must come before that shortcut too.
+  if command -v zstd >/dev/null 2>&1; then
+    zstd -q -c < "$TMPDIR/large.bin" > "$TMPDIR/fl-sl.zst" 2>/dev/null
+    fl_run "$TMPDIR/fl-ld" GZSTD_DEBUG_GPU_CC=6.1 -- -d --gpu-only -k -f "$TMPDIR/fl-sl.zst" -o "$TMPDIR/fl-sl.dec"
+    rm -f "$TMPDIR/fl-ld".*
+    [[ $fl_rc -eq 2 ]] || fl_why+=" [-d --gpu-only on a sizeless file rc=$fl_rc, want 2]"
+    [[ -e "$TMPDIR/fl-sl.dec" ]] && fl_why+=" [the refused sizeless decompress left an output]"
+    rm -f "$TMPDIR/fl-sl.zst" "$TMPDIR/fl-sl.dec"
+  fi
+  fl_run "$TMPDIR/fl-ld" GZSTD_DEBUG_GPU_CC=6.1 -- -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl2.zst"
+  fl_n=$(fl_cuda_inits "$TMPDIR/fl-ld")
+  [[ $fl_rc -eq 0 ]] || fl_why+=" [hybrid rc=$fl_rc]"
+  printf '%s' "$fl_log" | grep -q 'older than this build supports .*; not starting CUDA' \
+    || fl_why+=" [hybrid did not say why it used no GPU]"
+  (( fl_n == 0 )) || fl_why+=" [hybrid started CUDA]"
+  "$GZSTD" -d -q -c "$TMPDIR/fl2.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || fl_why+=" [hybrid round-trip]"
+  [[ -z "$fl_why" ]] && pass "every card below the compute-capability floor: CUDA never starts, --gpu-only refuses" \
+    || fail "every card below the compute-capability floor: CUDA never starts, --gpu-only refuses" "$fl_why"
+  rm -f "$TMPDIR/fl0.zst" "$TMPDIR/fl1.zst" "$TMPDIR/fl1.dec" "$TMPDIR/fl2.zst"
+
+  # ...and a card that only CUDA can classify.  The PCI-ID check before CUDA only
+  # answers "every card is old"; with another card on the host it passes, CUDA
+  # starts, and the check after it must drop the visible card.  Needs a UUID mask
+  # and a second card in /proc (on a one-card host the hook makes every card old,
+  # which is the cell above).
+  fl_proc=$(grep -h 'GPU UUID' /proc/driver/nvidia/gpus/*/information 2>/dev/null \
+              | grep -o 'GPU-[0-9a-f-]*' | LC_ALL=C sort)
+  fl_proc_n=$(printf '%s\n' "$fl_proc" | grep -c 'GPU-' || true)
+  if [[ "${CUDA_VISIBLE_DEVICES:-}" =~ ^GPU-[0-9a-f-]+$ ]] && (( fl_proc_n >= 2 )); then
+    fl_why=""
+    fl_vis=$CUDA_VISIBLE_DEVICES
+    fl_run "$TMPDIR/fl-ld" GZSTD_DEBUG_GPU_CC="6.1@$fl_vis" -- --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl3.zst"
+    fl_n=$(fl_cuda_inits "$TMPDIR/fl-ld")
+    [[ $fl_rc -eq 2 ]] || fl_why+=" [--gpu-only rc=$fl_rc, want 2]"
+    (( fl_n >= 1 )) || fl_why+=" [CUDA did not start, so the post-CUDA check was not reached]"
+    printf '%s' "$fl_log" | grep -q 'skipping CUDA GPU0 (.*compute capability 6\.1)' \
+      || fl_why+=" [no skip line for the visible card]"
+    printf '%s' "$fl_log" | grep -q 'but every visible GPU (.*) is older than this build supports' \
+      || fl_why+=" [the refusal does not give the floor as the reason]"
+    fl_run "$TMPDIR/fl-ld" GZSTD_DEBUG_GPU_CC="6.1@$fl_vis" -- -d --gpu-only -k -f "$TMPDIR/fl.zst" -o "$TMPDIR/fl3.dec"
+    rm -f "$TMPDIR/fl-ld".*
+    [[ $fl_rc -eq 2 ]] || fl_why+=" [-d --gpu-only rc=$fl_rc, want 2]"
+    fl_run "$TMPDIR/fl-ld" GZSTD_DEBUG_GPU_CC="6.1@$fl_vis" -- -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl4.zst"
+    rm -f "$TMPDIR/fl-ld".*
+    [[ $fl_rc -eq 0 ]] || fl_why+=" [hybrid rc=$fl_rc]"
+    printf '%s' "$fl_log" | grep -q 'no devices found; hybrid running CPU-only' \
+      || fl_why+=" [hybrid did not run CPU-only]"
+    "$GZSTD" -d -q -c "$TMPDIR/fl4.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || fl_why+=" [hybrid round-trip]"
+    [[ -z "$fl_why" ]] && pass "a card below the floor found after CUDA starts is dropped before any bringup" \
+      || fail "a card below the floor found after CUDA starts is dropped before any bringup" "$fl_why"
+    rm -f "$TMPDIR/fl3.zst" "$TMPDIR/fl3.dec" "$TMPDIR/fl4.zst"
+  else
+    skip "a card below the floor found after CUDA starts is dropped before any bringup" \
+         "needs a UUID mask and a second GPU"
+  fi
+
+  # -d --gpu-only WITH NO CUDA DEVICE REFUSES AT EXIT 2.  From at least v0.17.69
+  # to v0.17.76 it exited 1 with "internal error: writer stuck" instead: a small
+  # archive streams completely before the deferred bringup finds no device, so
+  # the refusal check right after the reader saw nothing yet, and teardown told
+  # the writer the workers were done with frame 0 missing.  Every run, not a
+  # race that needed luck; the floor above made every old-card box reach it.
+  fl_why=""
+  fl_rc=0
+  fl_log=$(CUDA_VISIBLE_DEVICES= timeout --foreground -k 10 120 \
+             "$GZSTD" -d --gpu-only -k -f "$TMPDIR/fl.zst" -o "$TMPDIR/fl5.dec" 2>&1) || fl_rc=$?
+  [[ $fl_rc -eq 2 ]] || fl_why+=" [rc=$fl_rc, want 2]"
+  printf '%s' "$fl_log" | grep -q 'GPU requested (--gpu-only) but no CUDA devices available' \
+    || fl_why+=" [no --gpu-only refusal: $(printf '%s' "$fl_log" | grep -m1 -o 'ERROR: .*' | cut -c1-80)]"
+  [[ -e "$TMPDIR/fl5.dec" ]] && fl_why+=" [the refused decompress left an output]"
+  # The same on an archive whose frame declares no size, read from stdin: that
+  # stream falls back to the CPU streaming decoder, a branch that returned
+  # before either check.  (zstd writes no content size for stdin input.)
+  if command -v zstd >/dev/null 2>&1; then
+    zstd -q -c < "$TMPDIR/large.bin" > "$TMPDIR/fl-sizeless.zst" 2>/dev/null
+    fl_rc=0
+    CUDA_VISIBLE_DEVICES= timeout --foreground -k 10 120 \
+      "$GZSTD" -d --gpu-only -c < "$TMPDIR/fl-sizeless.zst" > "$TMPDIR/fl5s.dec" 2>/dev/null || fl_rc=$?
+    [[ $fl_rc -eq 2 ]] || fl_why+=" [sizeless stdin rc=$fl_rc, want 2]"
+    [[ -s "$TMPDIR/fl5s.dec" ]] && fl_why+=" [the refused sizeless decompress wrote output]"
+    rm -f "$TMPDIR/fl5s.dec"      # the stdin arm's redirect target, not gzstd's
+    # ...and as a seekable FILE, which the main dispatch sends straight to the
+    # CPU streaming decoder whatever the hardware: --gpu-only means a usable GPU
+    # must exist, so it refuses there too (rtcheek, v0.17.77).
+    zstd -q -c < "$TMPDIR/large.bin" > "$TMPDIR/fl-sizeless.zst" 2>/dev/null
+    fl_rc=0
+    CUDA_VISIBLE_DEVICES= timeout --foreground -k 10 120 \
+      "$GZSTD" -d --gpu-only -k -f "$TMPDIR/fl-sizeless.zst" -o "$TMPDIR/fl5s.dec" 2>/dev/null || fl_rc=$?
+    [[ $fl_rc -eq 2 ]] || fl_why+=" [sizeless file rc=$fl_rc, want 2]"
+    [[ -e "$TMPDIR/fl5s.dec" ]] && fl_why+=" [the refused sizeless file left an output]"
+    rm -f "$TMPDIR/fl-sizeless.zst" "$TMPDIR/fl5s.dec"
+  fi
+  # --tar's indexed routes decode on the CPU too: full extraction in parallel
+  # partitions, and a member by seeking.  Both refuse; with a GPU both run.
+  # -l decodes nothing on an indexed archive, and refuses all the same.
+  mkdir -p "$TMPDIR/fl-tree"
+  for fl_i in $(seq 40); do head -c $(( fl_i * 50000 )) "$TMPDIR/large.bin" > "$TMPDIR/fl-tree/f$fl_i.bin"; done
+  "$GZSTD" --tar -q -f -o "$TMPDIR/fl.tzst" -C "$TMPDIR" fl-tree 2>/dev/null
+  for fl_arm in "-d --tar --gpu-only $TMPDIR/fl.tzst" "-d --tar --gpu-only $TMPDIR/fl.tzst fl-tree/f7.bin" \
+                "-l --gpu-only $TMPDIR/fl.zst" "-l --tar --gpu-only $TMPDIR/fl.tzst"; do
+    rm -rf "$TMPDIR/fl-x"; mkdir -p "$TMPDIR/fl-x"
+    fl_rc=0
+    # shellcheck disable=SC2086
+    CUDA_VISIBLE_DEVICES= timeout --foreground -k 10 120 "$GZSTD" -C "$TMPDIR/fl-x" $fl_arm \
+      >/dev/null 2>&1 || fl_rc=$?
+    [[ $fl_rc -eq 2 ]] || fl_why+=" [${fl_arm:0:24}...${fl_arm: -12} rc=$fl_rc, want 2]"
+    [[ -n "$(ls -A "$TMPDIR/fl-x")" ]] && fl_why+=" [${fl_arm:0:24}... extracted files]"
+  done
+  rm -rf "$TMPDIR/fl-x"; mkdir -p "$TMPDIR/fl-x"
+  "$GZSTD" -d --tar --gpu-only -C "$TMPDIR/fl-x" "$TMPDIR/fl.tzst" fl-tree/f7.bin >/dev/null 2>&1 \
+    || fl_why+=" [with a GPU, member extract rc=$?]"
+  cmp -s "$TMPDIR/fl-x/fl-tree/f7.bin" "$TMPDIR/fl-tree/f7.bin" || fl_why+=" [with a GPU, member round-trip]"
+  # A CALLER'S EMPTY MASK IS AN ANSWER.  --direct-stage defaults to one card, and
+  # through v0.17.76 the index fallback replaced CUDA_VISIBLE_DEVICES= with "0"
+  # and ran on the GPU the caller had hidden.  Now it refuses; a hybrid run with
+  # a count keeps the empty mask and runs on the CPU.
+  fl_run "$TMPDIR/fl-ld" CUDA_VISIBLE_DEVICES= -- --direct-stage -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl7.zst"
+  rm -f "$TMPDIR/fl-ld".*
+  [[ $fl_rc -eq 2 ]] || fl_why+=" [--direct-stage with an empty mask rc=$fl_rc, want 2]"
+  [[ -e "$TMPDIR/fl7.zst" ]] && fl_why+=" [--direct-stage ran with an empty mask]"
+  fl_run "$TMPDIR/fl-ld" CUDA_VISIBLE_DEVICES= -- --gpu-devices=1 -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl8.zst"
+  rm -f "$TMPDIR/fl-ld".*
+  [[ $fl_rc -eq 0 ]] || fl_why+=" [hybrid --gpu-devices=1 with an empty mask rc=$fl_rc]"
+  printf '%s' "$fl_log" | grep -q 'names no device; left it empty' \
+    || fl_why+=" [hybrid --gpu-devices=1 replaced the empty mask]"
+  # A REFUSAL MUST NOT COST THE USER A FILE.  --overwrite deletes the previous
+  # output before the coder starts, so a no-device refusal after that point left
+  # the user with neither file (v0.17.69 through v0.17.76).  And a dangling
+  # output symlink's target is created by the open, unregistered for cleanup.
+  printf 'precious\n' > "$TMPDIR/fl-keep.zst"
+  CUDA_VISIBLE_DEVICES= timeout --foreground -k 10 120 "$GZSTD" --gpu-only --overwrite -f -k \
+    "$TMPDIR/large.bin" -o "$TMPDIR/fl-keep.zst" >/dev/null 2>&1
+  fl_rc=$?
+  [[ $fl_rc -eq 2 ]] || fl_why+=" [--overwrite rc=$fl_rc, want 2]"
+  [[ "$(cat "$TMPDIR/fl-keep.zst" 2>/dev/null)" == precious ]] \
+    || fl_why+=" [--overwrite lost the previous output]"
+  rm -f "$TMPDIR/fl-dang.zst" "$TMPDIR/fl-tgt.zst"
+  ln -s "$TMPDIR/fl-tgt.zst" "$TMPDIR/fl-dang.zst"
+  # (No -f: with -f the output goes to an atomic temporary, which cleanup
+  # removes; without it the open follows the link and creates the target.)
+  CUDA_VISIBLE_DEVICES= timeout --foreground -k 10 120 "$GZSTD" --gpu-only -k \
+    "$TMPDIR/large.bin" -o "$TMPDIR/fl-dang.zst" >/dev/null 2>&1
+  fl_rc=$?
+  [[ $fl_rc -eq 2 ]] || fl_why+=" [dangling symlink rc=$fl_rc, want 2]"
+  [[ -e "$TMPDIR/fl-tgt.zst" ]] && fl_why+=" [the refusal left the dangling symlink's target]"
+  # ...nor stdout: opened read-write onto an existing file (1<>), which --direct
+  # (the default on PCIe Gen4+) truncates itself -- before v0.17.77, ahead of
+  # the no-device refusal, leaving the caller's file empty at exit 2.
+  printf 'precious\n' > "$TMPDIR/fl-keep.zst"
+  ( exec 1<>"$TMPDIR/fl-keep.zst"
+    CUDA_VISIBLE_DEVICES= timeout --foreground -k 10 120 "$GZSTD" --gpu-only --direct -c \
+      "$TMPDIR/large.bin" 2>/dev/null )
+  fl_rc=$?
+  [[ $fl_rc -eq 2 ]] || fl_why+=" [--direct -c onto a file rc=$fl_rc, want 2]"
+  [[ "$(cat "$TMPDIR/fl-keep.zst" 2>/dev/null)" == precious ]] \
+    || fl_why+=" [--direct -c truncated the caller's file before refusing]"
+  # --train never runs on a GPU: the flag is rejected rather than ignored.
+  fl_log=$(CUDA_VISIBLE_DEVICES= "$GZSTD" --train --gpu-only "$TMPDIR/large.bin" \
+             -o "$TMPDIR/fl.dict" 2>&1)
+  fl_rc=$?
+  [[ $fl_rc -eq 2 ]] || fl_why+=" [--train --gpu-only rc=$fl_rc, want 2]"
+  printf '%s' "$fl_log" | grep -q 'cannot be combined with --gpu-only' \
+    || fl_why+=" [--train --gpu-only was not rejected by name]"
+  rm -f "$TMPDIR/fl-keep.zst" "$TMPDIR/fl-dang.zst" "$TMPDIR/fl-tgt.zst" "$TMPDIR/fl.dict"
+  rm -rf "$TMPDIR/fl-tree" "$TMPDIR/fl-x" "$TMPDIR/fl.tzst" "$TMPDIR/fl7.zst" "$TMPDIR/fl8.zst"
+  [[ -z "$fl_why" ]] && pass "--gpu-only with no usable GPU refuses at exit 2 on every route" \
+    || fail "--gpu-only with no usable GPU refuses at exit 2 on every route" "$fl_why"
+
+  # A REFUSAL BY nvCOMP IS NOT A VRAM SHORTAGE.  nvCOMP's workspace query
+  # allocates nothing, so when it fails no batch size can help -- and on the
+  # GTX 1080 Ti with 11 GiB free the skip line said "insufficient VRAM".
+  # GZSTD_DEBUG_NVCOMP_REFUSE=1 answers as nvCOMP did there (status 1000).
+  fl_why=""
+  fl_rc=0
+  fl_log=$(GZSTD_DEBUG_NVCOMP_REFUSE=1 timeout --foreground -k 10 120 \
+             "$GZSTD" --gpu-only -v -k -f "$TMPDIR/large.bin" -o "$TMPDIR/fl6.zst" 2>&1) || fl_rc=$?
+  [[ $fl_rc -eq 0 ]] || fl_why+=" [rc=$fl_rc]"
+  printf '%s' "$fl_log" | grep -q 'skipping device: nvCOMP refused even batch=1 (.*status 1000' \
+    || fl_why+=" [the skip line does not report nvCOMP's refusal]"
+  printf '%s' "$fl_log" | grep -qi 'insufficient VRAM\|VRAM insufficient\|VRAM-fit' \
+    && fl_why+=" [a VRAM shortage was reported]"
+  "$GZSTD" -d -q -c "$TMPDIR/fl6.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || fl_why+=" [round-trip]"
+  [[ -z "$fl_why" ]] && pass "nvCOMP refusing a device is reported as a refusal, not a VRAM shortage" \
+    || fail "nvCOMP refusing a device is reported as a refusal, not a VRAM shortage" "$fl_why"
+  rm -f "$TMPDIR/fl5.dec" "$TMPDIR/fl6.zst"
+
+  # MIXED GENERATIONS.  With an old card and a new one visible, the work goes to
+  # the new one only: the old card is dropped after CUDA starts, before selection
+  # and bringup.  Under the hook the "old" card is a real one that would work, so
+  # a gate that let it through shows up as batches it completed.  128 MiB: enough
+  # frames that two workers would both take some.
+  fl_cards=()
+  if [[ "${GPU_ALL_DEVICES:-}" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+    mapfile -t fl_cards < <(gpu_uuids_by_free "${dr_min_mib:-4096}" "$GPU_ALL_DEVICES")
+  fi
+  if (( ${#fl_cards[@]} >= 2 )); then
+    for fl_i in 1 2 3 4; do cat "$TMPDIR/large.bin"; done > "$TMPDIR/fl-mixed.bin"
+    fl_why=""
+    fl_old=${fl_cards[0]}; fl_new=${fl_cards[1]}
+    for fl_arm in c d; do
+      fl_rc=0
+      if [[ $fl_arm == c ]]; then
+        fl_log=$(CUDA_VISIBLE_DEVICES="$fl_old,$fl_new" GZSTD_DEBUG_GPU_CC="6.1@$fl_old" \
+                   timeout --foreground -k 10 120 "$GZSTD" --gpu-only -vv -k -f \
+                   "$TMPDIR/fl-mixed.bin" -o "$TMPDIR/fl-mixed.zst" 2>&1) || fl_rc=$?
+      else
+        fl_log=$(CUDA_VISIBLE_DEVICES="$fl_old,$fl_new" GZSTD_DEBUG_GPU_CC="6.1@$fl_old" \
+                   timeout --foreground -k 10 120 "$GZSTD" -d --gpu-only -vv -k -f \
+                   "$TMPDIR/fl-mixed.zst" -o "$TMPDIR/fl-mixed.dec" 2>&1) || fl_rc=$?
+      fi
+      fl_done=$(printf '%s' "$fl_log" | command tr '\r' '\n' | grep -o '\[GPU[0-9]*[]/][^ ]* done batch' \
+                  | grep -o 'GPU[0-9]*' | sort | uniq -c | tr -s ' ' | tr '\n' ' ')
+      [[ $fl_rc -eq 0 ]] || fl_why+=" [$fl_arm rc=$fl_rc]"
+      printf '%s' "$fl_log" | grep -q 'skipping CUDA GPU0 (.*compute capability 6\.1)' \
+        || fl_why+=" [$fl_arm: no skip line for the old card]"
+      [[ "$fl_done" == *GPU1* ]] || fl_why+=" [$fl_arm: the new card did no batch ($fl_done)]"
+      [[ "$fl_done" == *GPU0* ]] && fl_why+=" [$fl_arm: the old card did work ($fl_done)]"
+    done
+    cmp -s "$TMPDIR/fl-mixed.dec" "$TMPDIR/fl-mixed.bin" || fl_why+=" [round-trip]"
+    [[ -z "$fl_why" ]] && pass "mixed card generations: only the card new enough does GPU work" \
+      || fail "mixed card generations: only the card new enough does GPU work" "$fl_why"
+
+    # A SUBSET RANKING NEVER CHOOSES A CARD BELOW THE FLOOR.  --gpu-devices=1 on
+    # the unmasked host, every card but one marked old, and the startup guess
+    # forced onto an old card: the ranking must land on the one card left.  Run
+    # for TWO different survivors -- a ranking that ignored the floor would pick
+    # its own favourite both times, so at least one run must then miss.
+    fl_why=""
+    for fl_keep in "${fl_cards[0]}" "${fl_cards[1]}"; do
+      fl_hook=$(printf '%s\n' "$fl_proc" | grep -v "^$fl_keep\$" | sed 's/^/6.1@/' | paste -sd, -)
+      fl_guess=$(printf '%s\n' "$fl_proc" | grep -n -v "^$fl_keep\$" | head -1 | cut -d: -f1)
+      fl_rc=0
+      fl_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_CC="$fl_hook" \
+                 GZSTD_DEBUG_GPU_MASK_GUESS=$(( fl_guess - 1 )) \
+                 timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -vv -k -f \
+                 "$TMPDIR/large.bin" -o "$TMPDIR/fl-sub.zst" 2>&1) || fl_rc=$?
+      fl_sel=$(printf '%s' "$fl_log" | sed -n 's/.*\[GPU\] selected \(GPU-[0-9a-f-]*\).*/\1/p' | head -1)
+      [[ $fl_rc -eq 0 ]] || fl_why+=" [subset rc=$fl_rc]"
+      [[ "$fl_sel" == "$fl_keep" ]] || fl_why+=" [kept ${fl_keep:0:12}, selected '${fl_sel:0:12}']"
+      "$GZSTD" -d -q -c "$TMPDIR/fl-sub.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" \
+        || fl_why+=" [subset round-trip]"
+    done
+    # ...and the startup guess, which is all CUDA sees if NVML never answers,
+    # leaves out a card the PCI-ID check knows is old.  One card is left, so an
+    # unfiltered random pick lands on it only 1 time in N per run; four runs.
+    for fl_i in 1 2 3 4; do
+      fl_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_CC="$fl_hook" GZSTD_DEBUG_GPU_GUARD_SEC=100000 \
+                 timeout --foreground -k 10 120 "$GZSTD" --gpu-devices=1 -vv -k -f \
+                 "$TMPDIR/large.bin" -o "$TMPDIR/fl-sub.zst" 2>&1) || true
+      fl_guess=$(printf '%s' "$fl_log" | sed -n 's/.*placed a startup guess (\(GPU-[0-9a-f-]*\)).*/\1/p' | head -1)
+      [[ "$fl_guess" == "$fl_keep" ]] || { fl_why+=" [startup guess '${fl_guess:0:12}', only ${fl_keep:0:12} is new enough]"; break; }
+    done
+    # ...and an NVML sample that happens to omit the one new card while listing
+    # N old ones is PARTIAL, not proof that nothing is new: the guess, which the
+    # PCI IDs put on the new card, must survive.  (Before the fix the ranking
+    # emptied the mask and --gpu-only refused on a box with a usable card.)
+    fl_rc=0
+    fl_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_CC="$fl_hook" GZSTD_DEBUG_NVML_DROP="$fl_keep" \
+               timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -vv -k -f \
+               "$TMPDIR/large.bin" -o "$TMPDIR/fl-sub.zst" 2>&1) || fl_rc=$?
+    fl_sees=$(printf '%s' "$fl_log" | sed -n 's/.*CUDA sees \(GPU-[0-9a-f-]*\).*/\1/p' | head -1)
+    [[ $fl_rc -eq 0 ]] || fl_why+=" [partial NVML sample: rc=$fl_rc]"
+    [[ -z "$fl_sees" || "$fl_sees" == "$fl_keep" ]] \
+      || fl_why+=" [partial NVML sample: CUDA saw '${fl_sees:0:12}', not ${fl_keep:0:12}]"
+    "$GZSTD" -d -q -c "$TMPDIR/fl-sub.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" \
+      || fl_why+=" [partial NVML sample: round-trip]"
+    # ...and a full-fleet ranked request (it takes the main-thread path, which
+    # never places a guess) must not shrink to what a partial NVML sweep saw: a
+    # card missing from the sample may be usable, so the fleet stays visible.
+    # Bringup is skipped (huge guard): the mask decision comes before CUDA.
+    fl_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_NVML_DROP="${fl_cards[0]}" GZSTD_DEBUG_GPU_GUARD_SEC=100000 \
+               timeout --foreground -k 10 120 "$GZSTD" --gpu-devices="$fl_proc_n" --gpu-order=ranked -v -k -f \
+               "$TMPDIR/large.bin" -o "$TMPDIR/fl-sub.zst" 2>&1) || fl_why+=" [ranked full fleet: rc=$?]"
+    printf '%s' "$fl_log" | grep -q 'checking all CUDA devices' \
+      || fl_why+=" [ranked full fleet shrank to the NVML sample: $(printf '%s' "$fl_log" | grep -o '\[GPU\] selected [^(]*' | head -1 | cut -c1-60)]"
+    [[ -z "$fl_why" ]] && pass "a GPU subset never guesses or ranks a card below the floor" \
+      || fail "a GPU subset never guesses or ranks a card below the floor" "$fl_why"
+    rm -f "$TMPDIR/fl-mixed.bin" "$TMPDIR/fl-mixed.zst" "$TMPDIR/fl-mixed.dec" "$TMPDIR/fl-sub.zst"
+  else
+    skip "mixed card generations: only the card new enough does GPU work" \
+         "fewer than 2 GPUs with ${dr_min_mib:-4096} MiB free, or an index mask"
+    skip "a GPU subset never guesses or ranks a card below the floor" \
+         "fewer than 2 GPUs with ${dr_min_mib:-4096} MiB free, or an index mask"
+  fi
+  rm -f "$TMPDIR/fl.zst"
+
   # --gpu-streams
   for streams in 1 2 4; do
     run_test "$GZSTD" --hybrid --gpu-streams=$streams -k -f "$TMPDIR/medium.txt" -o "$TMPDIR/gstream-${streams}.zst" 2>/dev/null
@@ -5049,6 +5462,12 @@ else
   skip "an all-device GPU set keeps CUDA's order by default" "no GPU"
   skip "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" "no GPU"
   skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" "no GPU"
+  skip "every card below the compute-capability floor: CUDA never starts, --gpu-only refuses" "no GPU"
+  skip "a card below the floor found after CUDA starts is dropped before any bringup" "no GPU"
+  skip "--gpu-only with no usable GPU refuses at exit 2 on every route" "no GPU"
+  skip "nvCOMP refusing a device is reported as a refusal, not a VRAM shortage" "no GPU"
+  skip "mixed card generations: only the card new enough does GPU work" "no GPU"
+  skip "a GPU subset never guesses or ranks a card below the floor" "no GPU"
   skip "--gpu-streams" "no GPU"
   skip "--gpu-mem-frac" "no GPU"
   skip "--gpu-devices" "no GPU"

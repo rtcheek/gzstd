@@ -515,6 +515,32 @@ present is not. Not on the 8-GPU server and not in the Lambda repository (checke
 2026-09-24); it comes from NVIDIA's CUDA repository. Query cost unmeasured; license unchecked. It holds no
 CUDA contexts, so it does nothing for cuInit or the static-BAR1 leak.
 
+**OPEN, next version (from the v0.17.77 pre-tag review): the rest of the "same file in two roles" list.**
+None loses data on an ordinary invocation; each needs one file named for two jobs. (1) `--tar --rm -D
+root/dict --exclude=dict root` is refused although `--exclude` keeps the dictionary out: the up-front
+check matches by path and does not apply excludes (safe direction, nothing is touched). (2) Suspected,
+not reproduced: `--stats-json b a b` truncating a later input, and `--tar --stats-json root/file root`
+overwriting an archived source after the archive is written. (3) An output symlink that points at the
+dictionary or the stats file is refused even where replacing the link would leave its target intact.
+Also: the decompress tail-yield pipe cell should answer "not exercised" when no GPU intake happened
+after producer-done (it fails under other tenants' GPU load; accepted as a known flake for the v0.17.77
+tag).
+
+**OPEN, >=1.0 territory: `gzstd-turbo-daemon` (name chosen by rtcheek, 2026-09-25).** An opt-in resident
+service that keeps every GPU registered with `nvidia-uvm`, so no gzstd run (or other CUDA program) pays the
+registration and, on a static-BAR1 host, none adds to the P2PDMA leak. Could also keep NVML attached and
+publish live per-card stats for subset choice and ranking. Measured on the 8-GPU host (driver 570.207):
+`cuInit` alone issues `UVM_REGISTER_GPU` and holds it until exit, and a `cuInit`-and-sleep process owns no
+VRAM and is not listed by nvidia-smi (a context would be 448 MiB, or 220 MiB with the stack, printf and heap
+limits at 0); with all 8 cards held, startup was 0.44 s against 6.4 s. `nvidia-persistenced` does not do
+this: it never uses CUDA, and the pools grew 126 times since boot with it running. Unverified: that the
+leak stops (needs an idle card: `p2pmem/size` should grow once, then stay flat), and what device-wide UVM
+state it keeps allocated. Other drivers may register at context creation instead, so check `p2pmem/size`
+and fall back to a context. It blocks driver unloads and GPU resets while it runs. **Less needed on newer
+drivers:** from the 595 branch on, NVIDIA's open kernel module registers each GPU's BAR1 once and reuses it
+until the driver unloads (source read 2026-09-25; not in 570, 575, 580 or 590 through 570.211.01 and
+580.178.04). Unmeasured whether 595+ also drops the rest of the per-registration startup cost.
+
 **Follow-ups, not done:**
 - **The `--gpu-devices N` path still pays the ~380 ms before CUDA** on every run, including runs that then skip bringup.
   Restricting visibility is worth it when GPUs are used. For a small explicit `--gpu-devices N --hybrid` job it is the

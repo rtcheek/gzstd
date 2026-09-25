@@ -128,6 +128,12 @@ is a straight trade: GDS peer-to-peer, or fast CUDA startup and no leak. Set it 
 `--gds-only`; `--direct-stage` needs none of this. TUNING.md, under "Host setup: GPU startup cost",
 covers checking a host and keeping a resident process as a workaround.
 
+NVIDIA changed this in the 595 driver branch. From its first release, the open kernel module adds each GPU's
+window to the pool once and reuses it until the driver unloads; its source says this avoids "expensive
+registration/unregistration cycles". That should remove the leak and the repeated startup cost, but it has
+not been measured here. The 570, 575, 580 and 590 branches still add the window at every registration (checked
+through 570.211.01 and 580.178.04).
+
 ## Verifying it actually works
 
 **This is the part people get wrong, so it is worth being precise: almost every signal you might

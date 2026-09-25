@@ -1,12 +1,204 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.76  
+**Covers:** v0.9.50 → v0.17.77  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.77 — GPUs older than the build supports are left alone, and a V100 can decompress
+
+Found by running the v0.17.69 release on a host with four GTX 1080 Ti (Pascal, compute capability 6.1,
+driver 570.207): a card generation still in service, below anything gzstd's GPU code can run on.
+
+**What that host did.** Every run gave the right bytes at exit 0, so nothing shipped bad archives. But:
+- `--gpu-only` compress: each card was rejected with "insufficient VRAM for even 1 stream at batch=1"
+  while reporting 11 GiB free, then "all GPUs failed; finishing compression on CPU".
+- `-d --gpu-only` and `-t --gpu-only`: each card was brought up, took a batch and faulted in
+  `nvcompBatchedZstdDecompressAsync` (status 1000, a CUDA error); the CPU redid the batch, then the
+  next card did the same.
+- The default and `--hybrid` runs escaped only because 4 GiB finished on the CPU first.
+
+**The floor.** nvCOMP 5.2 carries machine code for sm_70 to sm_120 and PTX for compute_70 only
+(`cuobjdump` of `libnvcomp.so.5.2.0.10`), so Volta (7.0) is its floor. gzstd's own kernels were
+built for 7.5 and newer, below the goal stated in CMakeLists.txt ("must run on every GPU nvCOMP
+itself supports"): a V100 could compress on the GPU, but every GPU decompress would fail its checksum
+kernel launch. The default architecture list now adds `70-real` for toolkits older than CUDA 13 (13
+dropped Volta), and nvcc 12.8's deprecation note for it is silenced so the build stays warning-free.
+CMake passes the oldest compiled architecture into the code, and the floor is the newer of that and
+nvCOMP's.
+
+**A card below the floor is absent.**
+- **Before CUDA.** If every GPU in `/proc/driver/nvidia/gpus` is older than the floor, CUDA never
+  starts. The test is the PCI device ID, against boundaries from NVIDIA's own driver packages: the 580
+  driver's supported-ID list has Pascal up to 0x1D52 and Volta at 0x1D81 to 0x1DF6, and the 595
+  driver's (Turing and newer) has nothing below 0x1E02. Above Turing the IDs are not in capability
+  order (Hopper's 0x2330 sits below Ada's 0x2684), so only the 7.0 and 7.5 floors get a rule. Any card
+  it cannot classify means "not all old", and the check after CUDA decides.
+- **After CUDA.** Two attribute queries per device (no context) drop each card below the floor
+  before device selection, and `-v` names it: `[GPU] skipping CUDA GPU0 (NVIDIA GeForce GTX 1080 Ti, compute
+  capability 6.1): this build needs compute capability 7.0 or newer`. Device selection maps its
+  positions onto the usable cards, so a box mixing generations uses only the new ones.
+- **In a subset ranking.** The NVML sampler now records each card's capability, and both subset
+  rankings (the deferred mask and the older main-thread path) skip cards below the floor. If NVML
+  identifies a card but cannot report its capability, its PCI classification is used; an unclassified
+  card cannot justify hiding another card before CUDA checks the floor. The random
+  startup guess takes cards known to meet the floor first, then unclassified cards, then known-old
+  cards. If neither PCI IDs nor NVML capability results can establish enough usable cards, all
+  candidates remain visible for the post-CUDA check. The main-thread ranking also leaves the fleet
+  visible when an NVML sweep omits a possibly usable `/proc` card.
+- **The GPU verify probe, and `--gds-only`'s preflight,** run on a usable card, not on whatever CUDA
+  calls device 0.
+- **`--gpu-only` on a box whose cards are all too old is refused at startup**, before any path can
+  start CUDA (cuFile does, in `--gds-only`'s preflight) or take a CPU shortcut (an archive whose
+  frame declares no size goes straight to the CPU streaming decoder).
+
+With no usable card, a hybrid run is a CPU run and says why at `-v`. **`--gpu-only` now refuses with
+exit 2**, as it always has with no GPU at all, and names the cards: `GPU requested (--gpu-only) but
+every GPU here (4x NVIDIA GeForce GTX 1080 Ti) is older than this build supports (compute capability
+7.0 or newer)`. That is a behaviour change on these hosts: v0.17.76 got there at exit 0 through the
+failures above.
+
+**`--gpu-only` means a usable GPU must exist** (the maintainer's decision). With none, every route now
+refuses at exit 2, including the ones that decode on the CPU whatever the hardware and used to finish
+at exit 0 with no GPU at all: a single huge or sizeless frame, `--tar`'s indexed parallel and seek
+extraction, and `-l`. Calibration with an explicit `--gpu-only` also refuses after its child count
+measurements if no device is usable, before an optional sink write; CPU-only dictionary training
+rejects an explicit GPU-only flag. An `--overwrite` run checks before removing an existing output,
+because cleanup of an incomplete new file cannot restore the old one: through v0.17.76 a no-device
+`--gpu-only --overwrite` deleted the previous output and then refused (reproduced, v0.17.69 too). A dangling output symlink is
+checked before its target is created, since that target is not registered for cleanup. Other routes check only
+when taken, so GPU decompression still detects devices in the background. A GPU that fails mid-run
+is a different case, and its rescue is unchanged.
+
+`--direct -c` with stdout redirected to an existing regular file through an already-open,
+non-append descriptor (`exec 1<>old.zst`) also checks before truncating that descriptor.
+With no usable GPU, a later refusal could not restore the caller-owned file.
+
+**An empty `CUDA_VISIBLE_DEVICES` was replaced with `0`** whenever a device count was asked for
+(`--gpu-devices=N`, or `--direct-stage` and `--gds-only`, which default to one card): the index
+fallback for "no NVML and no /proc list" also fired on a caller's mask that names no device. So a run
+used GPU 0 on a box whose owner had hidden every GPU, from at least v0.17.69. The empty mask now stays
+empty: `--direct-stage` refuses, and a hybrid run with a count runs on the CPU.
+
+**"Insufficient VRAM" when nvCOMP refused.** The batch-size search treated any failure of nvCOMP's
+workspace query as "does not fit", and the query allocates nothing. A refusal is now reported as one:
+`skipping device: nvCOMP refused even batch=1 (... status 1000); not a VRAM shortage`, and the fit
+line no longer claims a batch it never sized. The batch is still halved on a refusal, since a batch
+beyond nvCOMP's limits is refused too and a smaller one may be accepted; a batch capped that way is
+now labelled "batch limit", not "VRAM-fit". The allocation also stopped asking nvCOMP for the
+workspace size a second time, after the check that used the first answer.
+
+**`-d --gpu-only` with no CUDA device exited 1, "internal error: writer stuck".** Every time, from at
+least v0.17.69, with `CUDA_VISIBLE_DEVICES=`: a small archive streams completely before the deferred
+bringup finds no device, so the refusal check right after the reader saw nothing yet, and teardown
+told the writer the workers were done with frame 0 missing. A second check after the bringup thread
+is joined now refuses at exit 2 and removes the output, and so does the branch for a stream whose
+first frame declares no size, which returned before either check. (A first attempt marked the run abandoned
+from the bringup thread instead; that exited 0 with an empty output file, because nothing then
+refused.)
+
+**CMake compiled the kernels for sm_52 alone after any reconfigure.** "Was `CMAKE_CUDA_ARCHITECTURES`
+given by the user" was answered by whether it was defined, and CMake caches its own seed on the first
+configure, so every later configure of the same build directory (including the automatic one after a
+CMakeLists.txt edit) took the seed for a user override. The seed is now remembered and only a
+different value counts. The floor also resolves `native`, `all` and `all-major` through CMake's own
+lists; `native` used to leave it unknown, so a build made on an H100 passed a V100 whose kernels it
+did not carry. Fresh configures, such as the release build, were never affected. An existing
+build directory keeps the stale value until `cmake -B build -UCMAKE_CUDA_ARCHITECTURES`.
+
+**Tests.** Six GPU cells. `GZSTD_DEBUG_GPU_CC` makes real cards report another capability (`6.1`,
+or `6.1@GPU-<uuid>,...`), read wherever the real one is. `GZSTD_DEBUG_NVCOMP_REFUSE=1` answers as
+nvCOMP did on the 1080 Ti, and `GZSTD_DEBUG_NVML_DROP=GPU-<uuid>` leaves a card out of NVML's
+sample, as a failed lookup does. "CUDA never started" is the dynamic loader's trace (`LD_DEBUG=libs`: no
+call to libcuda's initialiser), with a control arm that must see a normal run's. The cells cover every
+card old (no CUDA; `--gpu-only`, `-d`, `-t`, `--gds-only` and a sizeless file refuse; a hybrid run
+round-trips on the CPU), one old card found after CUDA, `--gpu-only` with no device on every route (a
+sized file, a sizeless stream on stdin and as a file, `--tar` parallel and seek extraction, `-l`,
+`--direct-stage` under an empty mask, `--overwrite` keeping the previous output, a dangling output
+symlink, stdout opened read-write onto an existing file, and `--train`), nvCOMP's refusal, mixed generations on two cards (only the new one
+completes batches), and a subset ranking run for two different survivors plus four random startup
+guesses, a partial NVML sample and a full-fleet ranked request with a card missing from NVML.
+A seventh cell, in the dictionary section and run by both builds, covers
+the pre-tag review's losses and the hard-link case. Thirty-one mutants, one per check, each failed its
+cell. Baselines 525 to 532 default and 683 to 690
+extensive; no-GPU deltas 134 to 140 and 162 to 168.
+
+**Review.** Codex (GPT-6-Sol, max) found four more paths, now fixed: cuFile starting CUDA in
+`--gds-only`'s preflight on an all-old box, the preflight probing an old device 0 on a mixed box, the
+sizeless-stream branch skipping the no-device check, and `native` builds. It also noted eight
+`cudaGetDeviceProperties` calls on the main thread; measured at 9 to 12 ms for eight devices on every
+call, they became attribute queries (under 1 us). Its fix for a startup guess that hides every
+usable card when NVML never answers was to stop placing the subset mask on any box with an old or
+unclassifiable card; the guess now skips known-old cards instead, which keeps the mask. A second
+round found two defects in that repair, both where the inventory is incomplete: an NVML sample that
+omits the one new card while listing N old ones emptied the mask, and an unclassifiable card could
+take the guess ahead of one proved new. Rankings now decide only from a complete sample, the guess
+orders cards known new, then unclassified, then known old, and when neither source establishes N
+usable cards every candidate stays visible for the check after CUDA. A third round found two more
+where NVML is incomplete: a card whose capability NVML could not report counted as new and could
+win a one-card subset, and a full-fleet `--gpu-order=ranked` request shrank to the cards a partial
+NVML sweep happened to list (that one predates this version). Both fixed as it proposed. A
+fourth round, held to findings reachable on the fleet's own hosts or touching data safety and exit
+codes, was clean: SAFE TO COMMIT. A fifth, on the `--gpu-only` contract below, found that a no-device
+refusal could come after `--overwrite` had already deleted the previous output (reproduced, and
+older than this version), plus `--train` and `--calibrate` accepting `--gpu-only` without a GPU. A
+sixth found the same loss through stdout: `--direct` (the default on PCIe Gen4+) truncates a regular
+file on stdout itself, and with it opened read-write (`1<>`) that happened before the refusal, leaving
+the caller's file empty at exit 2 (reproduced on v0.17.69 and v0.17.76).
+
+**The pre-tag review (Codex, max, over everything since v0.17.69) found three more ways to lose a
+file at exit 0,** all reproduced first:
+- **`--rm` deleted the dictionary the archive needs** (since v0.17.71). `gzstd -D d --rm d`, or
+  `--tar --rm` over a tree holding the dictionary, removed the only copy, leaving an archive nothing
+  could decode. Both are now refused before any work (by identity for a plain input; by path, through
+  each source's `-C`, for a tar tree), and a hard link to the dictionary elsewhere in the tree is kept
+  at removal time with exit 3, since the removal asked for did not fully happen. `--patch-from` needs
+  no guard: gzstd ignores it when compressing, so the archive does not depend on the reference.
+- **`--train` replaced one of its own samples** (since v0.17.72). The default output is `./dictionary`,
+  so `gzstd --train dictionary a b c` read an old dictionary as a sample and renamed the new one over
+  it. An output that is also a sample is now refused before training.
+- **`-t --direct` truncated a file on stdout** (v0.17.69 too). Test mode writes nothing, but with stdout
+  opened read-write on a regular file the O_DIRECT stdout setup truncated it, and the test still passed
+  at exit 0. Test mode no longer takes that path.
+
+A second round of that review found five more, each an output landing on a file the run still needed,
+all reproduced and now refused with exit 2:
+- the archive onto its own dictionary, `-D d -f -o d` (or `--overwrite`), and through stdout opened on
+  the dictionary (`exec 1<>d; gzstd -D d -c in`);
+- the training output onto a sample through stdout (`exec 1<>s; gzstd --train -c s ...`);
+- `--stats-json`, which truncates its path, onto the archive being tested
+  (`gzstd -t --stats-json a.zst a.zst` replaced the archive with JSON at exit 0, v0.17.69 too), onto
+  the dictionary, onto the archive output, or onto redirected stdout.
+The up-front `--rm` check now looks at the entry `--rm` would actually remove (a symlink to the
+dictionary is removed as a link, so it is no hit), and the plain removal re-checks the pinned input
+just before unlinking.
+
+**Suites (pre-tag), on the final code.** `-e` on the GPU build: 689 passed, 0 failed, 1 skipped of
+690, and 689 ran as expected for this host (no drift). CPU-only build: 392 passed, 0 failed, as expected.
+An earlier pre-tag run of the same pair, before the review's last round of fixes, failed one cell: the
+decompress tail-yield pipe cell, a pre-existing flake while another user's jobs load the GPUs (five of
+eight at 100%). Re-run alone five times it passed 3 and failed 2, while its file-input arm, which
+exercises the same yield, passed all 5; the maintainer accepted it as a known flake for this tag, and
+v0.17.78 is to give that cell a "not exercised" answer instead of a failure.
+
+**Real-data round trips (RELEASING.md 3), all byte-identical:** a 20 GiB file, compressed and
+decompressed with the defaults and again at `-T1`, where all eight GPUs came online for both directions
+(tight VRAM on shared cards; batches reduced, work done); a `--tar` of 30,000 files of 1-64 KiB, created
+and extracted and compared with `diff -r`; and a compression-heavy `--tar` of 4 GiB of base64 random
+data, extracted through the parallel extractor.
+
+**Docs.** BUILD.md and `--help` state the floor. GDS.md records that NVIDIA fixed the static-BAR1
+P2PDMA leak in its 595 driver branch (the open kernel module now adds each GPU's window once per
+driver load; read in its source, not measured here), which the 570 to 590 branches still carry.
+ROADMAP.md adds `gzstd-turbo-daemon` (a resident process keeping every GPU registered, >= 1.0): `cuInit`
+alone registers each GPU with `nvidia-uvm` on the 570 driver, so the holder needs no context and no
+VRAM of its own.
+
+**Not yet run on the real cards.** Everything above was driven on H100s through the hooks. The
+Pascal host needs a manually triggered portable build (no tag), and no Volta card was available.
 
 ## v0.17.76 — `--gds-only` stops running in compat mode, and cuFile statistics stop crashing it
 

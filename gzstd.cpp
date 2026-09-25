@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.76";
+static constexpr const char * GZSTD_VERSION = "0.17.77";
 //
 // Architecture overview:
 //
@@ -117,6 +117,69 @@ static constexpr const char * GZSTD_VERSION = "0.17.76";
 #ifdef HAVE_NVCOMP
  #include <cuda_runtime.h>
  #include <nvcomp/zstd.h>
+
+/*======================================================================
+ THE OLDEST GPU THIS BUILD RUNS ON (v0.17.77)
+ -----------------------------------------------------------------------
+ Two things set it, and a card must pass both:
+   * nvCOMP's own code.  libnvcomp.so.5.2.0.10 carries machine code for
+     sm_70..sm_120 and PTX for compute_70 only (cuobjdump --list-elf /
+     --list-ptx), so Volta (7.0) is its floor.  Checked for 5.2; a new
+     nvCOMP major needs this constant rechecked.
+   * gzstd's own kernels (gpuverify.cu): the oldest architecture CMake
+     compiled them for, passed in as GZSTD_CUDA_KERNEL_MIN_CC (0 when the
+     arch list is not all numeric, e.g. "native").  7.0 in the default list
+     since v0.17.77; it was 7.5, which left a V100 unable to decompress.
+ Below the floor nothing fails cleanly on its own.  MEASURED on four
+ GTX 1080 Ti (6.1): compress reported "insufficient VRAM for even 1 stream"
+ with 11 GiB free (nvCOMP's workspace query fails and the fit search
+ read that as "does not fit"); decompress brought up every card, took a
+ batch and faulted in nvCOMP (status 1000) before the CPU redid it.
+ Correct bytes at exit 0, after CUDA startup, contexts and VRAM for
+ nothing, and error messages blaming memory.  So a card below the floor
+ is treated as absent: the -v log says which card and why.
+======================================================================*/
+#ifndef GZSTD_CUDA_KERNEL_MIN_CC
+#define GZSTD_CUDA_KERNEL_MIN_CC 0
+#endif
+static constexpr int kGzNvcompMinCc = 70;               // compute capability x10
+static constexpr int kGzGpuMinCc =
+    GZSTD_CUDA_KERNEL_MIN_CC > kGzNvcompMinCc ? GZSTD_CUDA_KERNEL_MIN_CC : kGzNvcompMinCc;
+
+// GZSTD_DEBUG_GPU_CC: make cards REPORT another compute capability, so the
+// suite can drive the gate on cards that really pass it.  "6.1" applies to
+// every card; "6.1@GPU-<uuid>[,6.1@GPU-<uuid>...]" to the named ones.  Read by
+// the pre-CUDA check, the NVML sampler and the post-CUDA check alike, keyed by
+// UUID because CUDA and NVML do not share an index space.  Returns the
+// capability x10, or -1 when the hook does not cover this card.
+static int gz_debug_gpu_cc(const std::string & uuid)
+{
+  struct Hook { int all = -1; std::vector<std::pair<std::string, int>> per; };
+  static const Hook hook = []{
+    Hook h;
+    const char * e = std::getenv("GZSTD_DEBUG_GPU_CC");
+    if (!e) return h;
+    std::stringstream ss(e);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      const size_t at = tok.find('@');
+      const std::string v = tok.substr(0, at);
+      char * end = nullptr;
+      const long maj = std::strtol(v.c_str(), &end, 10);
+      if (end == v.c_str() || *end != '.') continue;
+      const char * mp = end + 1;
+      const long mnr = std::strtol(mp, &end, 10);
+      if (end == mp || *end != '\0' || maj < 0 || maj > 99 || mnr < 0 || mnr > 9) continue;
+      const int cc = int(maj * 10 + mnr);
+      if (at == std::string::npos) h.all = cc;
+      else h.per.emplace_back(tok.substr(at + 1), cc);
+    }
+    return h;
+  }();
+  for (const auto & p : hook.per) if (p.first == uuid) return p.second;
+  return hook.all;
+}
+
  #ifdef HAVE_NVML
  #include <dlfcn.h>
 
@@ -161,6 +224,7 @@ struct GzNvmlApi {
   nvmlReturn_t (*DeviceGetName)(nvmlDevice_t, char *, unsigned int) = nullptr;
   nvmlReturn_t (*DeviceGetUUID)(nvmlDevice_t, char *, unsigned int) = nullptr;
   nvmlReturn_t (*SystemGetDriverVersion)(char *, unsigned int) = nullptr;
+  nvmlReturn_t (*DeviceGetCudaComputeCapability)(nvmlDevice_t, int *, int *) = nullptr;
 };
 
 // Resolve once, thread-safely (magic static).  RTLD_LOCAL keeps the driver's
@@ -201,6 +265,10 @@ static const GzNvmlApi & gz_nvml()
         sym("nvmlDeviceGetUUID_v2", "nvmlDeviceGetUUID");
     a.SystemGetDriverVersion = (nvmlReturn_t(*)(char *, unsigned int))
         sym("nvmlSystemGetDriverVersion", nullptr);
+    // The card's architecture before CUDA starts, so a ranking that chooses a
+    // SUBSET of the cards never chooses one this build cannot run on.
+    a.DeviceGetCudaComputeCapability = (nvmlReturn_t(*)(nvmlDevice_t, int *, int *))
+        sym("nvmlDeviceGetCudaComputeCapability", nullptr);
     return a;
   }();
   return api;
@@ -387,6 +455,13 @@ static inline nvmlReturn_t nvmlSystemGetDriverVersion(char * buf, unsigned int l
   const nvmlReturn_t rc = gz_nvml_bounded([&a, len, o]{ return a.SystemGetDriverVersion(o->data(), len); });
   if (rc == NVML_SUCCESS) { std::memcpy(buf, o->data(), len); buf[len - 1] = '\0'; }
   return rc; }
+static inline nvmlReturn_t nvmlDeviceGetCudaComputeCapability(nvmlDevice_t d, int * major, int * minor)
+{ auto & a = gz_nvml(); if (!a.DeviceGetCudaComputeCapability) return GZ_NVML_UNAVAILABLE;
+  auto o = std::make_shared<std::pair<int, int>>(0, 0);
+  const nvmlReturn_t rc = gz_nvml_bounded([&a, d, o]{
+    return a.DeviceGetCudaComputeCapability(d, &o->first, &o->second); });
+  if (rc == NVML_SUCCESS) { *major = o->first; *minor = o->second; }
+  return rc; }
 
 /*======================================================================
  GpuMonitor — one background NVML sampler for GPU ordering
@@ -442,6 +517,7 @@ public:
     unsigned     util = 0;    // smoothed 0-100, lower is better
     unsigned long long free_bytes = 0;
     unsigned long long total_bytes = 0;
+    int          cc = -1;     // compute capability x10; -1 = unknown
   };
 
   // Non-blocking; safe to call when NVML is absent (the thread simply exits).
@@ -590,7 +666,19 @@ private:
       if (nvmlDeviceGetHandleByIndex(i, &h) != NVML_SUCCESS) continue;
       char uu[96] = {0};
       if (nvmlDeviceGetUUID(h, uu, sizeof(uu)) != NVML_SUCCESS || !uu[0]) continue;
+      // GZSTD_DEBUG_NVML_DROP=GPU-<uuid>[,...]: leave those cards out of the
+      // sample, as a failed handle or UUID lookup above does, so the suite can
+      // hand the ranking a partial inventory (v0.17.77).
+      if (const char * drop = std::getenv("GZSTD_DEBUG_NVML_DROP"))
+        if (std::string(",") .append(drop).append(",").find(std::string(",") + uu + ",")
+            != std::string::npos)
+          continue;
       Row r; r.uuid = uu;
+      int maj = 0, mnr = 0;
+      if (nvmlDeviceGetCudaComputeCapability(h, &maj, &mnr) == NVML_SUCCESS)
+        r.cc = maj * 10 + mnr;
+      const int forced = gz_debug_gpu_cc(r.uuid);
+      if (forced >= 0) r.cc = forced;
       handles.push_back(h);
       rows.push_back(std::move(r));
     }
@@ -3261,9 +3349,18 @@ static void gds_cu_or_die(cudaError_t e, const char * what)
 // byte bouncing through host memory with no warning.  A loud failure is worth
 // more than a quiet lie.  --direct-stage is the portable path and needs none of
 // GDS's gates.
+static void gz_refuse_all_old_before_cuda(const Options & opt);
+static void gz_select_usable_gds_preflight_device(const Options & opt);
+
 static void gds_preflight_or_die(const Options & opt, FILE * in)
 {
   if (!opt.gds_only) return;
+  // cuFileDriverOpen starts CUDA internally.  On an all-old host the ordinary
+  // device check would refuse the run, but this preflight reaches cuFile first.
+  gz_refuse_all_old_before_cuda(opt);
+  // On a mixed host the preflight's cudaMalloc and cuFile registration must
+  // probe a supported card, not CUDA's possibly old default device 0.
+  gz_select_usable_gds_preflight_device(opt);
   const std::string why = gz_gds_unavailable_reason();
   if (!why.empty()) die_usage("--gds-only is not available on this host: " + why);
   void * probe = nullptr;
@@ -4373,11 +4470,17 @@ static void print_help_long()
 "     CPU is still used for RESCUE/REBUILD after a GPU failure, and for\n"
 "     verification when --verify selects the CPU engine — \"no CPU\" is a\n"
 "     statement about the steady state, not a guarantee.\n"
-"     No CUDA device available is a USAGE error, exit 2.  If devices were\n"
-"     found but the GPU path fails, a compatible regular-file job finishes\n"
-"     or rebuilds on CPU; when the input/output cannot be replayed or the\n"
-"     selected staged topology has no compatible CPU rescue, the run exits\n"
-"     5 instead.\n"
+"     No usable CUDA device is a USAGE error, exit 2, on every route --\n"
+"     including those that decode on the CPU anyway (a single huge or\n"
+"     sizeless frame, --tar's indexed extraction).  A card older\n"
+"     than this build supports counts as absent: the GPU code needs\n"
+"     compute capability 7.0 (Volta, e.g. V100) or newer (7.5 in a build\n"
+"     made with CUDA 13), so a GTX 10xx (Pascal) or older is never\n"
+"     started, and -v names the card.  If devices were found but the GPU\n"
+"     path fails, a compatible regular-file job finishes or rebuilds on\n"
+"     CPU; when the input/output cannot be replayed or the selected\n"
+"     staged topology has no compatible CPU rescue, the run exits 5\n"
+"     instead.\n"
 "     A --gpu-only compress reads regular files through the reader pool,\n"
 "     not mmap: an upload from a mapping that is not yet populated takes\n"
 "     its own page faults and copies at ~40% of the speed of populated\n"
@@ -13218,6 +13321,20 @@ static constexpr uint64_t PATCH_REF_MAX = uint64_t(1) << 31;
 // needs from it.  Exit codes follow gzstd's contract, not zstd's (which exits
 // 31/32/34 for these): a file that cannot be read is an I/O error, like a missing
 // input; one that is not a usable FILE at all is a usage error.
+// The file an archive being written will NEED to decompress: the -D dictionary
+// or the --patch-from reference.  --rm must never delete it (v0.17.77): archiving
+// a tree with a dictionary that lives inside it, or `-D d --rm d`, deleted the
+// only copy at exit 0, leaving an archive nothing could decode.  Identity, not
+// name, so a hard link or another spelling is still caught.
+static bool        g_dep_known = false;
+static dev_t       g_dep_dev   = 0;
+static ino_t       g_dep_ino   = 0;
+static std::string g_dep_what, g_dep_path;
+static bool gz_is_decode_dependency(const struct stat & st)
+{
+  return g_dep_known && st.st_dev == g_dep_dev && st.st_ino == g_dep_ino;
+}
+
 static void load_dictionaries(const Options & opt)
 {
   const bool patch = !opt.patch_from.empty();
@@ -13229,6 +13346,8 @@ static void load_dictionaries(const Options & opt)
   struct stat st {};
   if (::fstat(fileno(f), &st) != 0)
     die_io("cannot stat " + what + ": " + p + " (" + std::strerror(errno) + ")");
+  g_dep_known = true; g_dep_dev = st.st_dev; g_dep_ino = st.st_ino;
+  g_dep_what = what; g_dep_path = p;
   // A FIFO or device would be read to EOF with no size to check first, and
   // zstd refuses them for the same reason.
   if (!S_ISREG(st.st_mode)) die_usage(what + " must be a regular file: " + p);
@@ -13429,6 +13548,25 @@ static int run_train(const Options & opt)
       files.push_back(in);
     }
   }
+  // THE OUTPUT MUST NOT BE ONE OF THE SAMPLES (v0.17.77).  The default output is
+  // ./dictionary, so `gzstd --train dictionary a b c d` in a directory holding an
+  // old dictionary read it as a sample and then renamed the new one over it, at
+  // exit 0 -- losing a dictionary existing archives may need.  Refused before
+  // any training work.  (zstd --train does the same replace; gzstd need not.)
+  const bool train_stdout = opt.to_stdout || opt.output_dash;
+  const std::string out_path = train_stdout ? std::string("stdout")
+                             : (opt.output_named ? opt.output : std::string("dictionary"));
+  struct stat ost {};
+  const bool out_exists = train_stdout
+      ? (::fstat(fileno(stdout), &ost) == 0)
+      : (::stat(out_path.c_str(), &ost) == 0);
+  if (out_exists && S_ISREG(ost.st_mode))
+    for (const std::string & f : files) {
+      struct stat fst {};
+      if (::stat(f.c_str(), &fst) == 0 && fst.st_dev == ost.st_dev && fst.st_ino == ost.st_ino)
+        die_usage("--train: the output " + out_path + " is also one of the samples (" + f
+                  + "); writing it would replace that sample. Name another output with -o");
+    }
   shuffle(files);
 
   // 2. How much to load (DiB_fileStats).  Sizes are taken once, in shuffled order.
@@ -14104,9 +14242,16 @@ static void decompress_from_buffer(const std::vector<char> & input,
 // path as decompress_from_buffer.  ZSTD_decompressStream also decodes the rare
 // trailing-frames-after-a-large-first-frame case correctly.  Used only for
 // seekable inputs whose first frame exceeds SINGLE_FRAME_STREAM_MIN.
+#ifdef HAVE_NVCOMP
+static void gz_require_usable_gpu(const Options & opt, const char * who);
+#endif
 static void decompress_stream_from_file(FILE * in, FILE * out,
                                         const Options & opt, Meter * m)
 {
+#ifdef HAVE_NVCOMP
+  // Decodes on the CPU whatever the hardware; --gpu-only still needs a GPU.
+  gz_require_usable_gpu(opt, "single-frame stream decode");
+#endif
   const size_t IO_CHUNK = 4 * ONE_MIB;
   std::vector<char> inbuf(IO_CHUNK);
   std::vector<char> outbuf(IO_CHUNK);
@@ -19024,15 +19169,18 @@ static std::vector<int> select_best_gpus(int total_devices, int want, const Opti
 // "CUDA_VISIBLE_DEVICES=".  The in-tree callers do not read that value on a
 // second thread before cuInit; this does not synchronize any opaque library
 // that might read or copy the full environment.  Every candidate value fits:
-// the buffer is sized for the longest N /proc UUIDs.
+// the buffer holds the longest N /proc UUIDs, or all of them when an unknown
+// capability may require exposing the full fleet for the post-CUDA check.
 //
 // A CUDA call before finalize would freeze the guessed set.  A later rewrite
 // could then make getenv disagree with CUDA, so every first-CUDA path must call
-// finalize.  An incomplete or mismatched NVML sample keeps the N-card guess;
-// if another writer replaced the variable, finalize leaves it alone.
+// finalize.  An incomplete or mismatched NVML sample keeps a guess made from
+// known usable cards; if the PCI IDs cannot establish enough usable cards, it
+// expands the mask to all /proc candidates.  A replaced variable is left alone.
 struct GzGpuMask {
   std::mutex mx;
   bool   pending = false;           // guess placed, ranking not applied yet
+  bool   expand_on_unknown = false; // no safe N-card guess if NVML also lacks a rank
   char * env = nullptr;             // "CUDA_VISIBLE_DEVICES=<value>", leaked
   char * value = nullptr;           // env + strlen("CUDA_VISIBLE_DEVICES=")
   size_t cap = 0;                   // bytes available at value, NUL included
@@ -19040,6 +19188,21 @@ struct GzGpuMask {
   std::vector<std::string> candidates; // /proc UUIDs this mask may name
 };
 static GzGpuMask & g_gpu_mask = *new GzGpuMask;   // leaked: read at any exit
+
+// -1: PCI ID proves old; +1: proves usable; 0: no PCI classification.
+static int gz_pre_uuid_floor(const std::string & uuid);
+
+// A CUDA device's UUID in the "GPU-..." form /proc, NVML and
+// CUDA_VISIBLE_DEVICES all use.
+static std::string gz_cuda_uuid_str(const cudaDeviceProp & p)
+{
+  const unsigned char * b = reinterpret_cast<const unsigned char *>(p.uuid.bytes);
+  char s[48];
+  std::snprintf(s, sizeof s, "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
+                b[10], b[11], b[12], b[13], b[14], b[15]);
+  return s;
+}
 
 // The UUIDs CUDA actually enumerated, in its order ("GPU-..."), for the -vv
 // trace that proves which mask cuInit read.  No context is created.
@@ -19051,13 +19214,8 @@ static std::string gz_cuda_visible_uuids()
   for (int d = 0; d < n; ++d) {
     cudaDeviceProp p{};
     if (cudaGetDeviceProperties(&p, d) != cudaSuccess) return out;
-    const unsigned char * b = reinterpret_cast<const unsigned char *>(p.uuid.bytes);
-    char s[48];
-    std::snprintf(s, sizeof s, "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                  b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
-                  b[10], b[11], b[12], b[13], b[14], b[15]);
     if (!out.empty()) out += ",";
-    out += s;
+    out += gz_cuda_uuid_str(p);
   }
   return out;
 }
@@ -19076,10 +19234,14 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
   g_gpu_monitor.wait_ready(500);
   const auto rows = g_gpu_monitor.snapshot();
   std::string sel;
+  size_t too_old = 0;           // v0.17.77: complete sample, cards below the floor
+  bool none_new_enough = false;
+  bool rank_decided = false;
   if (!rows.empty()) {
     // The first sweep can omit a card whose NVML handle or UUID lookup failed.
     // NVML and /proc can also expose different inventories in a container.
-    // Keep the valid N-card guess unless we can rank N distinct /proc cards.
+    // Rank only from a sufficient sample.  A partial old-only sample cannot
+    // prove that the omitted cards are below the floor.
     std::vector<const GpuMonitor::Row *> eligible;
     eligible.reserve(rows.size());
     for (const auto & r : rows) {
@@ -19091,18 +19253,57 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
       eligible.push_back(&r);
     }
     if (eligible.size() >= (size_t)m.want) {
-      std::vector<GzDevRank> rin;
-      rin.reserve(eligible.size());
-      for (const auto * r : eligible) rin.push_back({r->util, r->free_bytes});
-      const std::vector<size_t> order = gz_rank_devices(rin);
-      for (size_t i = 0; i < (size_t)m.want; ++i) {
-        if (!sel.empty()) sel += ",";
-        sel += eligible[order[i]]->uuid;
+      // An NVML row can have a UUID but no capability: the optional query may
+      // be unavailable or fail for this card.  Use the PCI classification in
+      // that case.  An unclassified card cannot justify narrowing the mask.
+      std::vector<const GpuMonitor::Row *> fit;
+      size_t unresolved = 0;
+      for (const auto * r : eligible) {
+        const int pci = gz_pre_uuid_floor(r->uuid);
+        if (pci < 0 || (r->cc >= 0 && r->cc < kGzGpuMinCc)) continue;
+        if (pci > 0 || r->cc >= kGzGpuMinCc) fit.push_back(r);
+        else ++unresolved;
+      }
+      // A partial NVML sweep can contain N old cards while omitting a new one.
+      // Emptying the mask then hides the new card even when the startup guess
+      // selected it.  Fewer than N usable rows decide the mask only when NVML
+      // accounted for every /proc candidate; otherwise keep the guess.
+      if (fit.size() >= (size_t)m.want
+          || (eligible.size() == m.candidates.size() && unresolved == 0)) {
+        rank_decided = true;
+        too_old = eligible.size() - fit.size() - unresolved;
+        none_new_enough = fit.empty();
+        std::vector<GzDevRank> rin;
+        rin.reserve(fit.size());
+        for (const auto * r : fit) rin.push_back({r->util, r->free_bytes});
+        const std::vector<size_t> order = gz_rank_devices(rin);
+        for (size_t i = 0; i < order.size() && i < (size_t)m.want; ++i) {
+          if (!sel.empty()) sel += ",";
+          sel += fit[order[i]]->uuid;
+        }
       }
     }
   }
   const char * how = "incomplete or mismatched NVML sample; kept the startup guess";
-  if (sel.empty()) {
+  if (none_new_enough && ::getenv("CUDA_VISIBLE_DEVICES") == m.value) {
+    // Name no card: CUDA then enumerates none, and every path runs as it does on
+    // a host without GPUs.  Normally the pre-CUDA check has already said so;
+    // this is the floor it has no PCI-ID rule for.
+    m.value[0] = '\0';
+    sel.clear();
+    how = "no card is new enough for this build";
+  } else if (!rank_decided && m.expand_on_unknown
+             && ::getenv("CUDA_VISIBLE_DEVICES") == m.value) {
+    // /proc could not classify enough cards and NVML did not supply a usable
+    // rank.  Expose every candidate so the post-CUDA floor can find a newer
+    // card outside the random guess.  The placed buffer reserves this value.
+    for (const auto & u : m.candidates) {
+      if (!sel.empty()) sel += ",";
+      sel += u;
+    }
+    std::memcpy(m.value, sel.c_str(), sel.size() + 1);
+    how = "incomplete GPU inventory; checking all visible cards after CUDA starts";
+  } else if (sel.empty()) {
     sel = m.value;
   } else if (sel.size() + 1 > m.cap) {
     how = "ranked set does not fit the placed mask; kept the startup guess";
@@ -19112,7 +19313,9 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
     sel = ::getenv("CUDA_VISIBLE_DEVICES") ? ::getenv("CUDA_VISIBLE_DEVICES") : "";
   } else {
     std::memcpy(m.value, sel.c_str(), sel.size() + 1);
-    how = "combined rank: utilization + free VRAM";
+    how = too_old ? "combined rank: utilization + free VRAM, over the cards new enough "
+                    "for this build"
+                  : "combined rank: utilization + free VRAM";
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
@@ -19120,6 +19323,271 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
        << "); CUDA renumbers this set from 0, so later lines say GPU0\n";
     vlog(V_VERBOSE, opt, os.str());
   }
+}
+// ---- CARDS BELOW THE FLOOR (see kGzGpuMinCc) --------------------------------
+static std::string gz_cc_str(int cc)
+{
+  return std::to_string(cc / 10) + "." + std::to_string(cc % 10);
+}
+
+// The first NVIDIA PCI device ID of the architecture at each floor this build
+// can have; every NVIDIA GPU with a LOWER ID is an older architecture.  Taken
+// from NVIDIA's own driver packages, whose supported-ID lists are the only
+// authority short of starting CUDA: the 580 driver's (Maxwell to Blackwell) has
+// Pascal up to 0x1D52 and Volta at 0x1D81-0x1DF6, and the 595 driver's (Turing
+// and newer) has nothing below 0x1E02.  Above Turing the IDs are NOT in
+// capability order -- Hopper's 0x2330 sits below Ada's 0x2684 -- so no other
+// floor gets a rule, and 0 means "cannot tell from the ID".
+static unsigned gz_first_pci_id_at_floor(int floor_cc)
+{
+  return floor_cc == 70 ? 0x1D80u : floor_cc == 75 ? 0x1E00u : 0u;
+}
+
+// EVERY GPU the driver lists is older than the floor, decided from /proc and
+// sysfs alone -- no CUDA, no NVML, microseconds.  Then the run behaves as a
+// host without GPUs and CUDA never starts.  Conservative by construction: a
+// card it cannot classify (no ID rule for this floor, an unreadable or
+// non-NVIDIA ID) answers "not all old", and gz_floor_postcuda() decides after
+// CUDA starts.  A box mixing old and new cards is left to that check too.
+struct GzFloorPre {
+  bool all_old = false;
+  bool some_old = false;
+  bool uncertain = false;       // an unreadable ID or a floor with no PCI rule
+  bool unnamed_gpu = false;     // /proc lists a card that a UUID mask cannot name
+  std::vector<std::string> old_uuids;   // cards known to be below the floor
+  std::vector<std::string> new_uuids;   // cards known to meet the floor
+  std::string note;
+};
+static const GzFloorPre & gz_floor_precuda()
+{
+  static const GzFloorPre result = []{
+    GzFloorPre r;
+    const unsigned first_ok = gz_first_pci_id_at_floor(kGzGpuMinCc);
+    std::error_code ec;
+    std::vector<std::string> bdfs;
+    for (const auto & e : fs::directory_iterator("/proc/driver/nvidia/gpus", ec))
+      bdfs.push_back(e.path().filename().string());
+    if (ec || bdfs.empty()) { r.uncertain = true; return r; }
+    std::sort(bdfs.begin(), bdfs.end());
+    std::vector<std::pair<std::string, int>> models;    // name, count, in order
+    bool all_old = true;
+    auto read_hex = [](const std::string & path, unsigned & v) -> bool {
+      std::ifstream f(path);
+      std::string t;
+      if (!(f >> t)) return false;
+      char * end = nullptr;
+      const unsigned long x = std::strtoul(t.c_str(), &end, 16);
+      if (end == t.c_str() || *end != '\0') return false;
+      v = unsigned(x);
+      return true;
+    };
+    for (const auto & b : bdfs) {
+      std::string uuid, model, line;
+      std::ifstream inf("/proc/driver/nvidia/gpus/" + b + "/information");
+      while (std::getline(inf, line)) {
+        if (line.rfind("Model:", 0) == 0) {
+          const size_t a = line.find_first_not_of(" \t", 6);
+          const size_t z = line.find_last_not_of(" \t\r");
+          if (a != std::string::npos) model = line.substr(a, z + 1 - a);
+        } else if (line.find("GPU UUID:") != std::string::npos) {
+          const size_t a = line.find("GPU-");
+          if (a != std::string::npos) {
+            const size_t z = line.find_last_not_of(" \t\r");
+            uuid = line.substr(a, z + 1 - a);
+          }
+        }
+      }
+      if (uuid.empty()) r.unnamed_gpu = true;
+      const int forced = uuid.empty() ? -1 : gz_debug_gpu_cc(uuid);
+      bool old;
+      if (forced >= 0) {
+        old = forced < kGzGpuMinCc;
+      } else {
+        unsigned vendor = 0, device = 0;
+        if (!first_ok
+            || !read_hex("/sys/bus/pci/devices/" + b + "/vendor", vendor) || vendor != 0x10de
+            || !read_hex("/sys/bus/pci/devices/" + b + "/device", device)) {
+          r.uncertain = true;
+          all_old = false;
+          continue;
+        }
+        old = device < first_ok;
+      }
+      if (!old) {
+        all_old = false;
+        if (!uuid.empty()) r.new_uuids.push_back(uuid);
+        continue;
+      }
+      r.some_old = true;
+      if (!uuid.empty()) r.old_uuids.push_back(uuid);
+      if (model.empty()) model = b;
+      auto it = std::find_if(models.begin(), models.end(),
+                             [&](const auto & m) { return m.first == model; });
+      if (it == models.end()) models.emplace_back(model, 1);
+      else ++it->second;
+    }
+    if (!all_old) return r;
+    std::string names;
+    for (const auto & m : models) {
+      if (!names.empty()) names += ", ";
+      if (m.second > 1) names += std::to_string(m.second) + "x ";
+      names += m.first;
+    }
+    r.all_old = true;
+    r.note = "every GPU here (" + names + ") is older than this build supports "
+             "(compute capability " + gz_cc_str(kGzGpuMinCc) + " or newer)";
+    return r;
+  }();
+  return result;
+}
+
+static int gz_pre_uuid_floor(const std::string & uuid)
+{
+  const GzFloorPre & pre = gz_floor_precuda();
+  if (std::find(pre.old_uuids.begin(), pre.old_uuids.end(), uuid) != pre.old_uuids.end())
+    return -1;
+  if (std::find(pre.new_uuids.begin(), pre.new_uuids.end(), uuid) != pre.new_uuids.end())
+    return 1;
+  return 0;
+}
+
+// The CUDA devices this build can run on, in CUDA's order, after CUDA starts.
+// Two attribute queries per device, no context.  NOT cudaGetDeviceProperties:
+// MEASURED on the 8-GPU host, 9-12 ms for eight devices on every call (it is not
+// cached) against under 1 us for the attributes, and this runs on the main
+// thread of every GPU run.  The full properties are read only for a card being
+// skipped (its name, for the message) or when the test hook needs the UUID.  A
+// device whose capability cannot be read is kept: bringup then fails or works
+// on its own, as before this check existed.
+struct GzFloorPost { std::vector<int> ids; std::vector<std::string> skipped; };
+static const GzFloorPost & gz_floor_postcuda()
+{
+  static const GzFloorPost result = []{
+    GzFloorPost r;
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) {
+      cudaGetLastError();            // a handled "no device" must not linger
+      return r;
+    }
+    static const bool hooked = std::getenv("GZSTD_DEBUG_GPU_CC") != nullptr;
+    for (int d = 0; d < n; ++d) {
+      int maj = 0, mnr = 0;
+      if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess
+          || cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, d) != cudaSuccess) {
+        cudaGetLastError();
+        r.ids.push_back(d);
+        continue;
+      }
+      int cc = maj * 10 + mnr;
+      cudaDeviceProp p{};
+      bool have_props = false;
+      if (hooked) {
+        have_props = cudaGetDeviceProperties(&p, d) == cudaSuccess;
+        if (!have_props) cudaGetLastError();
+        const int forced = have_props ? gz_debug_gpu_cc(gz_cuda_uuid_str(p)) : -1;
+        if (forced >= 0) cc = forced;
+      }
+      if (cc >= kGzGpuMinCc) { r.ids.push_back(d); continue; }
+      if (!have_props) {
+        have_props = cudaGetDeviceProperties(&p, d) == cudaSuccess;
+        if (!have_props) cudaGetLastError();
+      }
+      r.skipped.push_back("CUDA GPU" + std::to_string(d) + " ("
+                          + (have_props ? std::string(p.name) : std::string("name unknown"))
+                          + ", compute capability " + gz_cc_str(cc) + ")");
+    }
+    return r;
+  }();
+  return result;
+}
+
+// Why no GPU could be used, for a --gpu-only refusal; empty when the floor is
+// not the reason.  Set once, by gz_cuda_usable_count().
+static std::mutex g_gpu_floor_mx;
+static std::string g_gpu_floor_note;
+static std::string gz_gpu_floor_note()
+{
+  std::lock_guard<std::mutex> lk(g_gpu_floor_mx);
+  return g_gpu_floor_note;
+}
+
+// The --gpu-only refusal when no device is usable: the floor's reason when it is
+// the reason, the long-standing wording otherwise.  Names the flag actually
+// given: --gds-only and --direct-stage imply --gpu-only, and a user who typed
+// one of them should not read about the other.
+static std::string gz_no_gpu_usage_msg(const Options & opt)
+{
+  const char * flag = opt.gds_only ? "--gds-only" : opt.direct_stage ? "--direct-stage"
+                                                                     : "--gpu-only";
+  const std::string why = gz_gpu_floor_note();
+  return std::string("GPU requested (") + flag + ") but "
+         + (why.empty() ? std::string("no CUDA devices available") : why);
+}
+
+// --gpu-only MEANS A USABLE GPU MUST EXIST (rtcheek, v0.17.77).  With none, every
+// route refuses at exit 2 -- including the routes that decode on the CPU whatever
+// the hardware (a single huge or sizeless frame, --tar's indexed parallel and seek
+// extraction), which used to finish at exit 0 on a box with no usable GPU.  A GPU
+// that FAILS mid-run is a different case: the rescue that keeps the user's data is
+// unchanged.  Called only on those CPU routes, so the routes that bring the GPU up
+// themselves keep detecting it in the background.
+static void gz_require_usable_gpu(const Options & opt, const char * who);
+
+// THE OPENING OF EVERY FIRST-CUDA SITE: the number of devices this build can
+// run on, with the subset mask finalized first.  0 means "behave exactly as a
+// host without GPUs".  When the PCI IDs already show every card is too old,
+// CUDA is never started, and neither is the wait for an NVML ranking.
+static int gz_cuda_usable_count(const Options & opt, const char * who)
+{
+  static std::once_flag said;
+  const GzFloorPre & pre = gz_floor_precuda();
+  if (pre.all_old) {
+    std::call_once(said, [&]{
+      { std::lock_guard<std::mutex> lk(g_gpu_floor_mx); g_gpu_floor_note = pre.note; }
+      vlog(V_VERBOSE, opt, "[GPU] " + pre.note + "; not starting CUDA\n");
+    });
+    return 0;
+  }
+  finalize_gpu_mask(opt, who);
+  const GzFloorPost & post = gz_floor_postcuda();
+  std::call_once(said, [&]{
+    for (const auto & sk : post.skipped)
+      vlog(V_VERBOSE, opt, "[GPU] skipping " + sk + ": this build needs compute capability "
+           + gz_cc_str(kGzGpuMinCc) + " or newer\n");
+    if (post.ids.empty() && !post.skipped.empty()) {
+      std::string all;
+      for (const auto & sk : post.skipped) all += (all.empty() ? "" : ", ") + sk;
+      std::lock_guard<std::mutex> lk(g_gpu_floor_mx);
+      g_gpu_floor_note = "every visible GPU (" + all + ") is older than this build supports "
+                         "(compute capability " + gz_cc_str(kGzGpuMinCc) + " or newer)";
+    }
+  });
+  return (int)post.ids.size();
+}
+
+static void gz_require_usable_gpu(const Options & opt, const char * who)
+{
+  if (opt.gpu_only && gz_cuda_usable_count(opt, who) <= 0)
+    die_usage(gz_no_gpu_usage_msg(opt));
+}
+
+static void gz_refuse_all_old_before_cuda(const Options & opt)
+{
+  if (!gz_floor_precuda().all_old) return;
+  (void)gz_cuda_usable_count(opt, "pre-CUDA floor");  // records the floor reason; no CUDA call
+  die_usage(gz_no_gpu_usage_msg(opt));
+}
+
+static void gz_select_usable_gds_preflight_device(const Options & opt)
+{
+  const GzFloorPre & pre = gz_floor_precuda();
+  if (!pre.some_old && !pre.uncertain) return;  // unchanged first-CUDA order on a known all-new host
+  if (gz_cuda_usable_count(opt, "GDS preflight on mixed GPUs") <= 0)
+    die_usage(gz_no_gpu_usage_msg(opt));
+  const cudaError_t st = cudaSetDevice(gz_floor_postcuda().ids.front());
+  if (st != cudaSuccess)
+    die(std::string("--gds-only: cannot select a supported GPU for preflight: ")
+        + cudaGetErrorString(st), EXIT_GPU_FAIL);
 }
 #endif
 
@@ -22039,9 +22507,7 @@ public:
     std::once_flag gpu_spawn_once;
     auto spawn_gpu_workers = [&] {
       std::call_once(gpu_spawn_once, [&] {
-        int dc = 0;
-        finalize_gpu_mask(dopt, "tar decode pool");
-        if (cudaGetDeviceCount(&dc) != cudaSuccess) dc = 0;
+        const int dc = gz_cuda_usable_count(dopt, "tar decode pool");
         const int ndev = dopt.gpu_devices > 0 ? std::min(dopt.gpu_devices, dc) : dc;
         if (ndev < 1) {   // no usable GPU (absent, or CUDA_VISIBLE_DEVICES-masked)
           vlog(V_VERBOSE, dopt, "[TAR] decode pool: no GPU available; CPU decoders only\n");
@@ -26053,6 +26519,12 @@ static inline nvcompStatus_t call_get_temp_size_async(size_t chunks, size_t gpu_
 }
 static inline size_t get_nvcomp_temp_size(size_t chunks, size_t gpu_chunk, nvcompBatchedZstdCompressOpts_t comp_opts, cudaStream_t stream)
 {
+  // GZSTD_DEBUG_NVCOMP_REFUSE=1: answer as nvCOMP does on a card it has no code
+  // for (status 1000, measured on a GTX 1080 Ti), so the suite can see the
+  // refusal reported as one rather than as a VRAM shortage.
+  static const bool refuse = std::getenv("GZSTD_DEBUG_NVCOMP_REFUSE") != nullptr;
+  if (refuse)
+    throw std::runtime_error("nvcompBatchedZstdCompressGetTempSizeAsync failed (status 1000)");
   size_t t=0; nvcompStatus_t st = call_get_temp_size_async<NVCOMP_GETTEMP_USES_BYTES>(chunks, gpu_chunk, comp_opts, &t, stream);
   if (st != nvcompSuccess) throw std::runtime_error("nvcompBatchedZstdCompressGetTempSizeAsync failed (status " + std::to_string(int(st)) + ")");
   return t;
@@ -26282,6 +26754,11 @@ struct StreamCtx {
   std::vector<void *> h_dstage;      // DSTAGE_MAX_READERS entries when engaged
   size_t h_dstage_n = 0;             // slots actually PINNED (<= DSTAGE_MAX_READERS)
   bool   host_pin_failed = false;    // could not pin even ONE staging slot
+  // nvCOMP REFUSED to size its workspace (v0.17.77).  That is not a memory
+  // shortage -- the query allocates nothing -- so halving the batch cannot fix
+  // it, and "insufficient VRAM" would be false.  MEASURED on a GTX 1080 Ti with
+  // 11 GiB free, which nvCOMP has no code for.  Holds nvCOMP's own message.
+  std::string nvcomp_refused;
   size_t h_dstage_slot_bytes = 0;
 
   // Host-side vectors (mirroring device arrays for readback)
@@ -26369,21 +26846,22 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
   // Pre-check: estimate total VRAM needed and compare to free memory.
   // cudaMalloc can hang on some drivers if the request exceeds VRAM,
   // so we fail fast here instead of letting the driver block.
+  size_t temp_bytes = 0;
   {
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
 
     // Get actual temp workspace size from nvCOMP (can be very large for big batches)
-    size_t temp_est = 0;
     try {
-      temp_est = get_nvcomp_temp_size(per_stream_batch, gpu_chunk, comp_opts, C.stream);
-    } catch (...) {
-      return false;  // nvCOMP can't even compute temp size for this config
+      temp_bytes = get_nvcomp_temp_size(per_stream_batch, gpu_chunk, comp_opts, C.stream);
+    } catch (const std::exception & e) {
+      C.nvcomp_refused = e.what();   // see StreamCtx::nvcomp_refused
+      return false;
     }
 
     size_t est_needed = per_stream_batch * gpu_chunk        // input
                       + per_stream_batch * max_out_chunk    // output
-                      + temp_est                            // nvCOMP temp workspace
+                      + temp_bytes                          // nvCOMP temp workspace
                       + per_stream_batch * (sizeof(void*)*2 + sizeof(size_t)*2 + sizeof(nvcompStatus_t));
     if (opt.gpu_verify) {
       // + decompressed buffer + ITS OWN decompression workspace.  This used to
@@ -26394,10 +26872,13 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
       // the whole quantity it exists to catch before cudaMalloc can hang.
       nvcompBatchedZstdDecompressOpts_t vopts{};
       size_t vtb = 0;
-      if (nvcompBatchedZstdDecompressGetTempSizeAsync(
-              per_stream_batch, gpu_chunk, vopts, &vtb,
-              per_stream_batch * gpu_chunk) != nvcompSuccess)
-        return false;                    // the consumer refuses this status too
+      const nvcompStatus_t st = nvcompBatchedZstdDecompressGetTempSizeAsync(
+          per_stream_batch, gpu_chunk, vopts, &vtb, per_stream_batch * gpu_chunk);
+      if (st != nvcompSuccess) {
+        C.nvcomp_refused = "nvcompBatchedZstdDecompressGetTempSizeAsync failed (status "
+                           + std::to_string(int(st)) + ")";
+        return false;
+      }
       est_needed += per_stream_batch * gpu_chunk + vtb;
       est_needed += per_stream_batch * (sizeof(void*) + sizeof(size_t)
                                         + sizeof(unsigned int)) + sizeof(unsigned int);
@@ -26415,15 +26896,15 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
     if (opt.verbosity >= V_DEBUG) {
       fprintf(stderr, "[VRAM check] batch=%zu gpu_chunk=%zu max_out=%zu temp=%zu MiB est=%zu MiB free=%zu MiB\n",
               per_stream_batch, gpu_chunk/ONE_MIB, max_out_chunk/ONE_MIB,
-              temp_est/ONE_MIB, est_needed/ONE_MIB, free_b/ONE_MIB);
+              temp_bytes/ONE_MIB, est_needed/ONE_MIB, free_b/ONE_MIB);
     }
     if (est_needed > free_b * 0.90) {
       return false;
     }
   }
 
-  // Get temporary workspace size required by nvCOMP
-  size_t temp_bytes = get_nvcomp_temp_size(per_stream_batch, gpu_chunk, comp_opts, C.stream);
+  // Reuse the workspace query above; a second query could give a different
+  // answer after the fit decision, or throw outside its refusal handler.
   C.temp_bytes_used = temp_bytes;
 
   // Allocate device buffers for input, output, and metadata
@@ -27793,12 +28274,18 @@ static void gpu_worker(
         // Binary search for largest batch that fits
         size_t lo = 1, hi = std::min(per_stream_cap, HARD_BATCH_CAP);
         size_t best = 1;
+        bool sized_any = false;         // nvCOMP answered for at least one size
+        bool fit_any = false;           // at least one answered size passed the VRAM check
+        bool vram_rejected = false;
+        bool verify_refused = false;
+        std::string refused;            // ...and what it said when it did not
         while (lo <= hi) {
           size_t mid = lo + (hi - lo) / 2;
           // Estimate total VRAM for this batch size
           size_t temp_est = 0;
           try { temp_est = get_nvcomp_temp_size(mid, gpu_chunk, comp_opts, C.stream); }
-          catch (...) { hi = mid - 1; continue; }
+          catch (const std::exception & e) { refused = e.what(); hi = mid - 1; continue; }
+          sized_any = true;
           size_t est = mid * (gpu_chunk + max_out_chunk)
                      + temp_est
                      + mid * (sizeof(void*)*2 + sizeof(size_t)*2 + sizeof(nvcompStatus_t));
@@ -27842,6 +28329,7 @@ static void gpu_worker(
             // query above already does.
             if (nvcompBatchedZstdDecompressGetTempSizeAsync(
                     mid, gpu_chunk, vopts, &vtb, mid * gpu_chunk) != nvcompSuccess) {
+              verify_refused = true;
               hi = mid - 1; continue;
             }
             est += vtb;
@@ -27850,21 +28338,34 @@ static void gpu_worker(
           }
           if (opt.region_staged()) est += sizeof(unsigned int) * mid;  // d_checksums
           if (est <= static_cast<size_t>(free_b * per_stream_frac)) {
+            fit_any = true;
             best = mid;
             lo = mid + 1;
           } else {
+            vram_rejected = true;
             hi = mid - 1;
           }
         }
         C.per_stream_batch = best;
-        if (best < per_stream_cap) {
+        if (!sized_any && !refused.empty()) {
+          // Not a fit at all: batch=1 below is the search's starting value, not
+          // a size anything confirmed.  The allocation reports the refusal.
+          vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id) + "/S" + std::to_string(s)
+               + "] nvCOMP could not size any batch (" + refused + ")\n");
+        } else if (fit_any && best < per_stream_cap) {
           // Always report when user explicitly set batch size; otherwise only at -v
           int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
           if (opt.verbosity >= min_verb) {
             std::ostringstream os;
-            os << "[GPU" << device_id << "/S" << s
-               << "] VRAM-fit: batch=" << best << " (requested " << per_stream_cap
+            os << "[GPU" << device_id << "/S" << s << "] "
+               << (vram_rejected && refused.empty() && !verify_refused
+                     ? "VRAM-fit" : "batch limit")
+               << ": batch=" << best << " (requested " << per_stream_cap
                << ", free=" << (free_b / ONE_MIB) << " MiB)";
+            if (!refused.empty()) os << "; nvCOMP refused larger candidates (" << refused << ")";
+            if (verify_refused) os << "; nvCOMP verify workspace query refused larger candidates";
+            if (vram_rejected && (!refused.empty() || verify_refused))
+              os << "; VRAM also rejected candidates";
             vlog(min_verb, opt, os.str() + "\n");
           }
         }
@@ -27897,9 +28398,12 @@ static void gpu_worker(
       // VRAM was exhausted, and that there is no CPU fallback -- the middle one
       // being false.
       bool host_pin_hopeless = false;
+      std::string nvcomp_refused;     // the last attempt's refusal, if it was one
       while (!allocate_stream_buffers(C, C.per_stream_batch, gpu_chunk, max_out_chunk, comp_opts, opt)) {
         // Free any partial allocations from the failed attempt
         const bool pin_hopeless = C.host_pin_failed;
+        nvcomp_refused = C.nvcomp_refused;
+        C.nvcomp_refused.clear();
         free_stream_buffers_only(C, opt);
         if (pin_hopeless) {
           // See host_pin_failed: halving the batch cannot change a fixed host
@@ -27935,13 +28439,17 @@ static void gpu_worker(
           if (C.stream) { cudaStreamDestroy(C.stream); C.stream = nullptr; }
           break;
         }
+        // Keep halving even on a refusal: a batch too large for nvCOMP's limits
+        // is refused too, and a smaller one may then be accepted.
         C.per_stream_batch = std::max<size_t>(1, C.per_stream_batch/2);
         {
           int min_verb = opt.gpu_batch_user_set ? V_NORMAL : V_VERBOSE;
           if (opt.verbosity >= min_verb) {
             std::ostringstream os;
-            os << "[GPU" << device_id << "/S" << s
-               << "] VRAM insufficient, reducing batch to " << C.per_stream_batch;
+            os << "[GPU" << device_id << "/S" << s << "] "
+               << (nvcomp_refused.empty() ? "VRAM insufficient"
+                                          : "nvCOMP refused the batch (" + nvcomp_refused + ")")
+               << ", reducing batch to " << C.per_stream_batch;
             vlog(min_verb, opt, os.str() + "\n");
           }
         }
@@ -27954,6 +28462,9 @@ static void gpu_worker(
           std::string skip_msg = host_pin_hopeless
               ? "[GPU" + std::to_string(device_id)
                 + "] skipping device: no host staging buffer could be pinned"
+              : !nvcomp_refused.empty()
+              ? "[GPU" + std::to_string(device_id) + "] skipping device: nvCOMP refused "
+                "even batch=1 (" + nvcomp_refused + "); not a VRAM shortage"
               : "[GPU" + std::to_string(device_id)
                 + "] insufficient VRAM for even 1 stream at batch=1  skipping device"
               + (opt.gds_only ? "  (under --gds-only this is usually the BAR1"
@@ -29445,6 +29956,14 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
     bool has_util;
   };
 
+  // Only devices this build can run on (v0.17.77).  Callers pass the count
+  // gz_cuda_usable_count() returned, so `total_devices` counts USABLE devices
+  // and position k names CUDA device raw(k).  On a box with no card below the
+  // floor raw(k) == k, as before.
+  const std::vector<int> & usable = gz_floor_postcuda().ids;
+  total_devices = std::min(total_devices, (int)usable.size());
+  auto raw = [&usable](int k) { return usable[(size_t)k]; };
+
   want = std::min(want, total_devices);
 
   // Using every device: keep the full count and rank only its ORDER.  Do not
@@ -29457,7 +29976,7 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
   if (want >= total_devices) {
     std::vector<int> result;
     result.reserve(total_devices);
-    for (int d = 0; d < total_devices; ++d) result.push_back(d);
+    for (int d = 0; d < total_devices; ++d) result.push_back(raw(d));
 #ifdef HAVE_NVML
     rank_all_cuda_devices(result, opt);   // after CUDA, no contexts -- see above
 #endif
@@ -29482,9 +30001,9 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
       std::vector<NvmlInfo> infos(total_devices);
 
       for (int d = 0; d < total_devices; ++d) {
-        infos[d] = {d, 100, 100, 0, -1, false};  // default: assume busy
+        infos[d] = {raw(d), 100, 100, 0, -1, false};  // default: assume busy
         cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+        if (cudaGetDeviceProperties(&prop, raw(d)) == cudaSuccess) {
           char pci_bus_id[32];
           snprintf(pci_bus_id, sizeof(pci_bus_id), "%08x:%02x:%02x.0",
                    prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
@@ -29586,8 +30105,8 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
 #endif
 
   for (int d = 0; d < total_devices; ++d) {
-    DevInfo info{d, 0, 0, false};
-    if (cudaSetDevice(d) == cudaSuccess) {
+    DevInfo info{raw(d), 0, 0, false};
+    if (cudaSetDevice(raw(d)) == cudaSuccess) {
       size_t free_b = 0, total_b = 0;
       if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
         info.free_bytes = free_b;
@@ -29595,7 +30114,7 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
 #ifdef HAVE_NVML
       if (nvml_ok) {
         cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+        if (cudaGetDeviceProperties(&prop, raw(d)) == cudaSuccess) {
           char pci_bus_id[32];
           snprintf(pci_bus_id, sizeof(pci_bus_id), "%08x:%02x:%02x.0",
                    prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
@@ -29739,10 +30258,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   int device_count = 0;
   int total_hw_devices = 0;
   if (!defer_detect) {
-    finalize_gpu_mask(opt, "compress, synchronous");
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    device_count = gz_cuda_usable_count(opt, "compress, synchronous");
+    if (device_count <= 0) {
       if (opt.gpu_only)
-        die_usage("GPU requested (--gpu-only) but no CUDA devices available");
+        die_usage(gz_no_gpu_usage_msg(opt));
       vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU\n");
       g_adapt_gpu_absent.store(true, std::memory_order_relaxed);
       // Clear the hybrid queue floor before handing this to the CPU pipeline.
@@ -30144,11 +30663,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
       }
-      int dc = 0;
-      finalize_gpu_mask(opt, "hybrid bringup thread");
-      if (g_gpu_mask.env && opt.verbosity >= V_DEBUG)
+      const int dc = gz_cuda_usable_count(opt, "hybrid bringup thread");
+      if (g_gpu_mask.env && opt.verbosity >= V_DEBUG && !gz_floor_precuda().all_old)
         vlog(V_DEBUG, opt, "[GPU] CUDA sees " + gz_cuda_visible_uuids() + "\n");
-      if (cudaGetDeviceCount(&dc) != cudaSuccess || dc <= 0) {
+      if (dc <= 0) {
         // No GPU after all.  The CPU pool is already running and owns the queue,
         // so there is nothing to repair — hybrid simply runs CPU-only.
         vlog(V_VERBOSE, opt, "[GPU] no devices found; hybrid running CPU-only\n");
@@ -34624,10 +35142,10 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   int device_count = 0;
   int total_hw_devices = 0;
   if (!defer_detect) {
-    finalize_gpu_mask(opt, "decompress, synchronous");
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    device_count = gz_cuda_usable_count(opt, "decompress, synchronous");
+    if (device_count <= 0) {
       if (opt.gpu_only)
-        die_usage("GPU requested (--gpu-only) but no CUDA devices available");
+        die_usage(gz_no_gpu_usage_msg(opt));
       vlog(V_VERBOSE, opt, "[GPU] no devices found; falling back to MT CPU decompress\n");
       g_adapt_gpu_absent.store(true, std::memory_order_relaxed);
       // Fall through with device_count=0; CPU pool will handle everything
@@ -35294,14 +35812,14 @@ gds_out_declined:
         return;
       }
       // Deferred device detection (the ~2s cuInit, off the critical path).
-      int dc = 0;
-      finalize_gpu_mask(opt, "decompress bringup thread");
-      if (g_gpu_mask.env && opt.verbosity >= V_DEBUG)
+      const int dc = gz_cuda_usable_count(opt, "decompress bringup thread");
+      if (g_gpu_mask.env && opt.verbosity >= V_DEBUG && !gz_floor_precuda().all_old)
         vlog(V_DEBUG, opt, "[GPU] CUDA sees " + gz_cuda_visible_uuids() + "\n");
-      if (cudaGetDeviceCount(&dc) != cudaSuccess || dc <= 0) {
+      if (dc <= 0) {
         if (opt.gpu_only) {
           // gpu-only with no GPU: tell the reader to stop so main can error
-          // cleanly (the synchronous path used to die_usage here).
+          // cleanly (the synchronous path used to die_usage here).  Main checks
+          // twice: the reader can finish first -- see the second check.
           gpu_only_no_device.store(true, std::memory_order_release);
           return;
         }
@@ -35655,7 +36173,7 @@ gds_out_declined:
   if (gpu_only_no_device.load(std::memory_order_acquire)) {
     stop_bringup_sample();
     if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
-    die_usage("GPU requested (--gpu-only) but no CUDA devices available");
+    die_usage(gz_no_gpu_usage_msg(opt));
   }
 
   // Preallocate output file to avoid per-write extent allocation overhead.
@@ -35686,6 +36204,8 @@ gds_out_declined:
     // every hybrid/gpu-only decompress of a streamed-zstd file (v0.13.54).
     stop_bringup_sample();
     if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
+    if (gpu_only_no_device.load(std::memory_order_acquire))
+      die_usage(gz_no_gpu_usage_msg(opt));
     gz_wait_for_worker_exits();          // see the teardown site for the ordering
     gz_join_or_detach_workers();
     gz_stop_reclaimer();
@@ -35754,6 +36274,16 @@ gds_out_declined:
   // finishes its (bounded, sub-second) window and answers honestly.
   bringup_cv.notify_all();
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
+  // THE SECOND CHECK, now that the bringup's answer is final.  An archive small
+  // enough to stream before CUDA answers passed the first check (right after the
+  // reader) with the flag still clear; the teardown below then published
+  // workers_done with no worker to decode frame 0, and the writer reported
+  // "internal error: writer stuck" at exit 1 -- every time, since at least
+  // v0.17.69, for -d --gpu-only with CUDA_VISIBLE_DEVICES= (and, with the
+  // compute-capability floor, on any box whose cards are all too old).  Refusing
+  // here, before workers_done exists, is the refusal the first check gives.
+  if (gpu_only_no_device.load(std::memory_order_acquire))
+    die_usage(gz_no_gpu_usage_msg(opt));
   // ORDER IS LOAD-BEARING.  The producer finishes long before the workers do, so
   // this teardown is reached while batches are still in flight; stopping the
   // watchdog here (as the first version did) killed it ~0.7 s into the run and
@@ -36089,13 +36619,19 @@ static const std::vector<std::string> & gz_proc_gpu_uuids()
 // The guess is random rather than "the tail of the list": two gzstd jobs
 // guessing the same card would both land on it.  It cannot prefer the fastest
 // model -- nothing short of NVML or a CUDA context says which card that is --
-// but it is only what CUDA sees if NVML never answers.
+// but it is only what CUDA sees if NVML never answers.  Cards known to meet
+// the floor lead the random order; unknown cards follow, then known-old ones.
+// If those facts cannot establish N usable cards, finalize expands the mask
+// before CUDA starts so the post-CUDA check sees every /proc candidate.
 // GZSTD_DEBUG_GPU_MASK_GUESS=i[,j...] (indices into the sorted /proc list)
 // forces it, so the suite can make the guess and the ranking disagree.
 static bool place_gpu_mask_guess(const Options & opt)
 {
   const auto & uuids = gz_proc_gpu_uuids();
   const size_t want = opt.gpu_devices > 0 ? (size_t)opt.gpu_devices : 0;
+  // A /proc entry without a UUID can still be a supported CUDA device.  A
+  // guessed UUID subset cannot recover it, even by expanding to all UUIDs.
+  if (gz_floor_precuda().unnamed_gpu) return false;
   if (want == 0 || uuids.empty() || want >= uuids.size()) return false;
   for (const auto & u : uuids) if (u.rfind("GPU-", 0) != 0) return false;
   std::vector<std::string> candidates = uuids; // copy before changing environ
@@ -36118,17 +36654,40 @@ static bool place_gpu_mask_guess(const Options & opt)
     std::mt19937_64 rng((uint64_t)::getpid() * 0x9E3779B97F4A7C15ull
                         ^ (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
     std::shuffle(all.begin(), all.end(), rng);
+    const GzFloorPre & floor = gz_floor_precuda();
+    auto class_of = [&](size_t i) {
+      if (std::find(floor.new_uuids.begin(), floor.new_uuids.end(), uuids[i])
+          != floor.new_uuids.end()) return 0;
+      if (std::find(floor.old_uuids.begin(), floor.old_uuids.end(), uuids[i])
+          != floor.old_uuids.end()) return 2;
+      return 1;  // ID unreadable: keep it behind proven usable cards
+    };
+    // The initial shuffle stays uniform within each class.  An unknown card
+    // must not beat a card whose PCI ID already proves it meets the floor.
+    std::stable_sort(all.begin(), all.end(), [&](size_t a, size_t b) {
+      return class_of(a) < class_of(b);
+    });
     pick.assign(all.begin(), all.begin() + (long)want);
   }
   std::string guess;
   for (size_t i : pick) { if (!guess.empty()) guess += ","; guess += uuids[i]; }
 
-  // Room for the LONGEST N UUIDs, so any ranked N-subset fits in place.
+  // Room for the LONGEST N UUIDs, so any ranked N-subset fits in place.  When
+  // fewer than N cards are known usable and some IDs could not be classified,
+  // reserve room for ALL candidates: an incomplete NVML sample then expands
+  // the mask before CUDA starts rather than freezing a possibly all-old guess.
+  const GzFloorPre & floor = gz_floor_precuda();
+  const size_t known_new = std::count_if(uuids.begin(), uuids.end(), [&](const auto & u) {
+    return std::find(floor.new_uuids.begin(), floor.new_uuids.end(), u)
+           != floor.new_uuids.end();
+  });
+  const bool expand_on_unknown = floor.uncertain && known_new < want;
   std::vector<size_t> lens;
   for (const auto & u : uuids) lens.push_back(u.size());
   std::sort(lens.rbegin(), lens.rend());
-  size_t cap = want;                             // N-1 commas + the NUL
-  for (size_t i = 0; i < want; ++i) cap += lens[i];
+  const size_t cap_count = expand_on_unknown ? uuids.size() : want;
+  size_t cap = cap_count;                        // commas + the NUL
+  for (size_t i = 0; i < cap_count; ++i) cap += lens[i];
 
   static const char kName[] = "CUDA_VISIBLE_DEVICES=";
   const size_t pre = sizeof(kName) - 1;
@@ -36141,6 +36700,7 @@ static bool place_gpu_mask_guess(const Options & opt)
   GzGpuMask & m = g_gpu_mask;
   std::lock_guard<std::mutex> lk(m.mx);
   m.env = env; m.value = env + pre; m.cap = cap; m.want = (int)want;
+  m.expand_on_unknown = expand_on_unknown;
   m.candidates = std::move(candidates);
   m.pending = true;
   vlog(V_DEBUG, opt, "[GPU] " + std::to_string(want) + " of " + std::to_string(uuids.size())
@@ -36347,6 +36907,9 @@ static int extract_tar(const Options & opt, Meter * m)
               Np, pbounds.size(), pst.c_off.size() - 1);
             vlog(V_VERBOSE, opt, b);
           }
+#ifdef HAVE_NVCOMP
+          gz_require_usable_gpu(opt, "--tar parallel extract");   // CPU route
+#endif
           tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
           ex.set_sink_meter(m);   // live writer-pool sink timing → --adapt (not bytes)
           ex.run_parallel(in, pbounds, pst.c_off, pst.u_off, opt, m);
@@ -36419,6 +36982,9 @@ static int extract_tar(const Options & opt, Meter * m)
     // g_tar_decomp_sink is set, so the FILE* is never touched.
     if (plan.active) {
       // Selective seek path: feed the sliced tar stream straight to the sink.
+#ifdef HAVE_NVCOMP
+      gz_require_usable_gpu(dopt, "--tar seek extract");       // CPU route
+#endif
       tarx::seek_feed(in, plan, &sink, dopt, m);
     } else {
       int64_t ff = (arc != "-") ? peek_first_frame_decomp_size(in) : -1;
@@ -37671,8 +38237,13 @@ static int run_calibrate(Options opt)
   // gpu rows only when a device is actually usable.
   {
     int ndev = 0;
-    finalize_gpu_mask(opt, "calibrate");
-    if (cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0) {
+    ndev = gz_cuda_usable_count(opt, "calibrate");
+    // The child process count pass above must run before this process starts
+    // CUDA.  Once it is done, an explicit --gpu-only request cannot silently
+    // skip the GPU rows and report a successful CPU-only calibration.
+    if (opt.gpu_only && ndev <= 0)
+      die_usage(gz_no_gpu_usage_msg(opt));
+    if (ndev > 0) {
       // A GPU fault during a measurement pass makes that row garbage (there
       // is no rebuild driver here) — discard it and say so.
       g_gpu_failed_restart.store(false);
@@ -38023,6 +38594,60 @@ static int gzstd_main(int argc, char ** argv)
   if (opt.train) return run_train(opt);
   // -D / --patch-from: load the run's dictionary before any coder (or thread) exists.
   load_dictionaries(opt);
+  // The stats writer opens its path with truncation.  It must not replace a
+  // dictionary or reference that this run still needs, even if compression's
+  // main -o destination is elsewhere.
+  if (g_dep_known && !opt.stats_json.empty()) {
+    struct stat stats_st {};
+    if (::stat(opt.stats_json.c_str(), &stats_st) == 0
+        && gz_is_decode_dependency(stats_st))
+      die_usage("--stats-json would overwrite the " + g_dep_what
+                + " this run needs: " + g_dep_path);
+  }
+  // --rm MUST NOT DELETE WHAT THE OUTPUT NEEDS TO DECOMPRESS (see g_dep_known).
+  // Refused before any work: a plain input that IS the file, or a --tar source
+  // tree that CONTAINS it (by path; a hard link elsewhere in the tree is caught
+  // again at removal time, by identity).
+  if (g_dep_known && opt.mode == Mode::COMPRESS
+      && ((opt.tar_mode && opt.tar_remove_sources) || (!opt.tar_mode && !opt.keep))) {
+    std::error_code ec;
+    const fs::path dep = fs::weakly_canonical(g_dep_path, ec);
+    // --tar create reads its sources from tar_sources, each under the -C in effect
+    // at its position (tar_source_dest, "." = none); a plain compress, from inputs.
+    std::vector<std::string> srcs;
+    if (opt.tar_mode) {
+      for (size_t i = 0; i < opt.tar_sources.size(); ++i) {
+        const std::string & d = i < opt.tar_source_dest.size() ? opt.tar_source_dest[i] : ".";
+        const std::string & t = opt.tar_sources[i];
+        srcs.push_back(d == "." || (!t.empty() && t[0] == '/') ? t : d + "/" + t);
+      }
+    } else {
+      srcs = opt.inputs;
+    }
+    for (const std::string & in : srcs) {
+      if (in == "-" && !opt.tar_mode) continue;  // tar treats "-" as a source name
+      struct stat source_entry {};
+      const bool entry_known = ::lstat(in.c_str(), &source_entry) == 0;
+      // --rm removes the named entry.  For a symlink, that is the link, not
+      // its target; both plain --rm and the tar walker use this identity.
+      bool hit = entry_known && gz_is_decode_dependency(source_entry);
+      // Tar records a symlink source as a link and never walks its target.
+      // Only a directory entry can cause its descendants to be removed.
+      if (!hit && opt.tar_mode && !ec && entry_known
+          && S_ISDIR(source_entry.st_mode)) {
+        std::error_code ec2;
+        const fs::path root = fs::weakly_canonical(in, ec2);
+        if (!ec2) {
+          const auto mm = std::mismatch(root.begin(), root.end(), dep.begin(), dep.end());
+          hit = mm.first == root.end();     // dep is root, or lies under it
+        }
+      }
+      if (hit)
+        die_usage("--rm would delete the " + g_dep_what + " the archive needs to "
+                  "decompress (" + g_dep_path + (opt.tar_mode ? ", inside " + in : "")
+                  + "); drop --rm, or keep the " + g_dep_what + " outside the inputs");
+    }
+  }
 
 #if defined(HAVE_NVCOMP) && !defined(_WIN32)
   // Before any thread: it may setenv (see gz_cufile_log_setup).
@@ -38039,6 +38664,15 @@ static int gzstd_main(int argc, char ** argv)
   // generation, warm regular-file input → cpu-only and cold/unknown → hybrid.
   // No-op if the user passed an explicit --cpu-only / --gpu-only / --hybrid.
   apply_backend_defaults(opt);
+
+#ifdef HAVE_NVCOMP
+  // The seekable single-frame streaming decoder bypasses decompress_nvcomp()
+  // entirely.  Refuse an all-old host here for --gpu-only, before that CPU
+  // shortcut (and before cuFile preflight) can turn a no-device request into
+  // a successful CPU run.  Calibrate and list have their own dispatch paths.
+  if (opt.gpu_only && !opt.calibrate && !opt.list_mode)
+    gz_refuse_all_old_before_cuda(opt);
+#endif
 
 #ifdef HAVE_NVCOMP
   order_all_gpus_before_cuda(opt);
@@ -38099,6 +38733,12 @@ static int gzstd_main(int argc, char ** argv)
   // -l: list .zst frame info (plain) or archive contents (`-l --tar`).  Checked
   // before the extract/verify dispatch so it doesn't fall through to either.
   if (opt.list_mode) {
+#ifdef HAVE_NVCOMP
+    // Listing an indexed archive decodes nothing, but --gpu-only still means a
+    // usable GPU: otherwise the exit code would depend on the archive's format
+    // (an unindexed one decodes, and refuses, through the GPU path).
+    gz_require_usable_gpu(opt, "-l");
+#endif
     if (opt.tar_mode) { Meter meter; return list_tar(opt, &meter); }
     return list_zst(opt);
   }
@@ -38240,6 +38880,18 @@ static int gzstd_main(int argc, char ** argv)
   bool in_id_ok = false;
   struct stat in_id{};
   if (in && in != stdin && ::fstat(fileno(in), &in_id) == 0) in_id_ok = true;
+  // --stats-json opens its path with truncation after the coder finishes.
+  // A test could therefore validate an archive, replace that same archive
+  // with JSON, and still exit 0.  Check the opened input descriptor, including
+  // stdin redirected from a regular file, before any output transaction.
+  if (in && !opt.stats_json.empty()) {
+    struct stat stats_st {}, input_st {};
+    if (::stat(opt.stats_json.c_str(), &stats_st) == 0
+        && ::fstat(fileno(in), &input_st) == 0
+        && stats_st.st_dev == input_st.st_dev
+        && stats_st.st_ino == input_st.st_ino)
+      die_usage("--stats-json output is also the input: " + opt.stats_json);
+  }
   // ...and the identity of the NAME itself, which is a different inode when the
   // input is a symlink.  Both are needed: --rm removes the LINK (that is what
   // `rm` does), so the entry it deletes must be proven to be that link — while
@@ -38278,6 +38930,23 @@ static int gzstd_main(int argc, char ** argv)
   // (not named by -o) goes to fd 1.
   const bool to_stdout = opt.to_stdout
       || (opt.input == "-" && !opt.output_named && opt.output == "stdout");
+
+  // A dictionary-backed archive must not replace the dictionary through a
+  // caller-owned stdout descriptor either.  `exec 1<>dict; gzstd -D dict -c in`
+  // keeps the file intact until we start writing, then overwrites it at exit 0.
+  if (to_stdout && (g_dict_compress || !opt.stats_json.empty())) {
+    struct stat stdout_st {};
+    if (::fstat(fileno(stdout), &stdout_st) == 0) {
+      if (g_dict_compress && gz_is_decode_dependency(stdout_st))
+        die_usage("dictionary and output are the same file: " + g_dep_path);
+      struct stat stats_st {};
+      if (!opt.stats_json.empty()
+          && ::stat(opt.stats_json.c_str(), &stats_st) == 0
+          && stats_st.st_dev == stdout_st.st_dev
+          && stats_st.st_ino == stdout_st.st_ino)
+        die_usage("--stats-json output is also redirected stdout: " + opt.stats_json);
+    }
+  }
 
   // When writing to stdout, force keep (can't delete stdin) and set binary mode
   // Writing THIS file to stdout means there is no output file to replace, so its
@@ -38349,6 +39018,48 @@ static int gzstd_main(int argc, char ** argv)
       die_io("cannot determine what the output " + opt.output
              + " refers to (" + std::strerror(errno) + ")");
     const bool tgt_is_reg = tgt_present && S_ISREG(out_tst.st_mode);
+
+    // The stats writer runs before this output is closed and opens its own
+    // path with truncation.  If both destinations name the same file, it can
+    // replace a completed archive with JSON and still report success.  Compare
+    // the final names through held parent descriptors so an absent output is
+    // covered too, then compare targets for existing hard-link aliases.
+    if (!opt.stats_json.empty()) {
+      // A stats symlink may point at an output that does not exist YET.  stat()
+      // then reports ENOENT, so follow final-component symlinks by name before
+      // comparing parent descriptors and basenames.  The stats writer follows
+      // the same chain when it opens the path.
+      fs::path stats_target = opt.stats_json;
+      for (int hop = 0; hop < 40; ++hop) {
+        std::error_code link_ec;
+        const fs::path link = fs::read_symlink(stats_target, link_ec);
+        if (link_ec) break;
+        stats_target = link.is_absolute() ? link : stats_target.parent_path() / link;
+      }
+      HeldDir stats_dir;
+      stats_dir.acquire(stats_target.string());
+      struct stat stats_parent_st {}, output_parent_st {}, stats_target_st {};
+      const bool same_name = stats_dir.valid()
+          && stats_dir.base == out_dir.base
+          && ::fstat(stats_dir.fd, &stats_parent_st) == 0
+          && ::fstat(out_dir.fd, &output_parent_st) == 0
+          && stats_parent_st.st_dev == output_parent_st.st_dev
+          && stats_parent_st.st_ino == output_parent_st.st_ino;
+      const bool same_target = tgt_present
+          && ::stat(opt.stats_json.c_str(), &stats_target_st) == 0
+          && stats_target_st.st_dev == out_tst.st_dev
+          && stats_target_st.st_ino == out_tst.st_ino;
+      if (same_name || same_target)
+        die_usage("--stats-json output is also the archive output: " + opt.stats_json);
+    }
+
+    // -f installs a temporary archive over this name; --overwrite removes it
+    // before compression.  Either route would destroy a dictionary that the
+    // new archive needs, even though the dictionary is not a compression input.
+    // Compare the resolved target so symlink and hard-link aliases are covered.
+    if (g_dict_compress && opt.force && tgt_present
+        && gz_is_decode_dependency(out_tst))
+      die_usage("dictionary and output are the same file: " + opt.output);
 
     // REFUSE TO WRITE THE OUTPUT OVER THE INPUT.  With --rm this was total data
     // loss reported as success: the temp file was renamed onto the input path,
@@ -38531,10 +39242,24 @@ static int gzstd_main(int argc, char ** argv)
     const bool exists = tgt_is_reg;            // was fs::is_regular_file (follows)
     const bool replace_existing_name = exists
         || (out_is_lnk && opt.force && (!opt.tar_mode || tgt_present));
+#ifdef HAVE_NVCOMP
+    // A dangling output symlink can cause open_output_verified() to create
+    // its target.  The link existed before this run, so that target is not
+    // registered as a new output for die() to remove on a no-device refusal.
+    if (opt.gpu_only && out_is_lnk && !tgt_present && !replace_existing_name)
+      gz_require_usable_gpu(opt, "before following dangling output symlink");
+#endif
     if (exists && !opt.force) {
       die_io("output exists (use -f to overwrite): " + opt.output);
     }
     if (replace_existing_name && opt.force) {
+#ifdef HAVE_NVCOMP
+      // --overwrite removes the previous output before the coder starts.
+      // Refuse a no-device --gpu-only run while that output still exists;
+      // cleanup of the new incomplete file cannot restore the old one.
+      if (opt.unsafe_overwrite)
+        gz_require_usable_gpu(opt, "before --overwrite removal");
+#endif
       if (!opt.unsafe_overwrite) {
         out = open_output_atomic(opt.output, tmp, out_dir, tmp_base);
         use_atomic = true;
@@ -38761,7 +39486,10 @@ static int gzstd_main(int argc, char ** argv)
         direct_writer = std::move(dw);
       }
     }
-  } else if (opt.direct_io && to_stdout && out == stdout) {
+  } else if (opt.direct_io && to_stdout && out == stdout && opt.mode != Mode::TEST) {
+    // NOT IN TEST MODE: -t writes no result, and this setup TRUNCATES a regular
+    // file on stdout.  `exec 1<>file; gzstd -t --direct x.zst` emptied the file
+    // and reported a passing test at exit 0 (v0.17.69 through v0.17.76).
     do {
       int fd = fileno(stdout);
       if (fd < 0) break;
@@ -38769,6 +39497,11 @@ static int gzstd_main(int argc, char ** argv)
       if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) break;   // S_ISREG is the real gate
       int flags = fcntl(fd, F_GETFL);
       if (flags < 0 || (flags & O_APPEND)) break;                // append: never truncate
+#ifdef HAVE_NVCOMP
+      // This is a caller-owned file, so die() cannot restore its previous
+      // contents if a later --gpu-only check finds no usable device.
+      gz_require_usable_gpu(opt, "before O_DIRECT stdout truncate");
+#endif
 
       // NO pathname tests.  This used to readlink /proc/self/fd/1 and reject the
       // result if it began "/dev/" or contained "(deleted)".  Both were proxies
@@ -39509,6 +40242,15 @@ static int gzstd_main(int argc, char ** argv)
                + " to the data just compressed, so it will not be removed"
                " (output kept at " + opt.output + ")");
       }
+      // The up-front dependency check protects the ordinary path and keeps a
+      // multi-file run from removing earlier inputs before discovering the
+      // dictionary later.  A changed name can still make the entry we pinned
+      // for THIS file be the dictionary.  Use that pinned entry, not a fresh
+      // lookup of opt.input, before the destructive step.
+      if (g_dep_known && gz_is_decode_dependency(in_lid))
+        die_io("--rm: kept " + opt.input + ": it is the " + g_dep_what
+               + " this archive needs to decompress (" + g_dep_path
+               + "); output kept at " + opt.output);
       if (!in_id_ok) {
         die_io("--rm: cannot confirm the identity of the input just compressed: "
                + opt.input + "; not removing it (output kept at " + opt.output + ")");
@@ -39803,8 +40545,21 @@ static int gzstd_main(int argc, char ** argv)
                          "no sources were removed\n");
     } else {
       rm_debug_gate();   // test-only; see the definition. No-op when unset.
+      // Never remove the file the archive needs to decompress, under any name
+      // (the up-front check caught it by path; this catches a hard link).
+      size_t dep_kept = 0;
+      if (g_dep_known) {
+        auto & v = g_tar_removal_paths;
+        const size_t before = v.size();
+        v.erase(std::remove_if(v.begin(), v.end(), [&](const TarRemoval & r) {
+                  if (r.dev != g_dep_dev || r.ino != g_dep_ino) return false;
+                  vlog(V_ERROR, opt, "gzstd: tar: --rm: kept " + r.path + ": it is the "
+                       + g_dep_what + " this archive needs to decompress (" + g_dep_path + ")\n");
+                  return true; }), v.end());
+        dep_kept = before - v.size();
+      }
       size_t removed = 0;
-      const size_t kept =
+      const size_t kept = dep_kept +
           tar_remove_archived_sources(g_tar_removal_paths, opt, removed);
       if (kept != 0) {
         // The user asked for removal and did not fully get it.  Same reasoning as
@@ -39910,7 +40665,13 @@ int main(int argc, char ** argv)
     // Hidden hook: verify the --gds-only content-checksum kernel against the CPU
     // hash and exit.  Kept out of parse_args deliberately — it runs before any
     // option handling so it can be used on a binary whose parser is in doubt.
-    if (::getenv("GZSTD_DEBUG_XXH_SELFTEST")) return gzstd_xxh_gpu_selftest();
+    if (::getenv("GZSTD_DEBUG_XXH_SELFTEST")) {
+      Options test_opt;
+      if (gz_cuda_usable_count(test_opt, "XXH GPU selftest") <= 0)
+        die_usage(gz_no_gpu_usage_msg(test_opt));
+      checkCuda(cudaSetDevice(gz_floor_postcuda().ids.front()), "XXH GPU selftest: cudaSetDevice");
+      return gzstd_xxh_gpu_selftest();
+    }
 #endif
     {
       const int rc = gzstd_main(argc, argv);
@@ -40428,6 +41189,7 @@ static void apply_backend_defaults(Options & opt)
     // devices was requested and a ranking can therefore change something.
     bool full_cuda_order_from_nvml = false;
     bool mask_placed = false;       // v0.17.75: guess placed, ranked at first CUDA use
+    bool leave_unmasked = false;    // no inventory can justify a subset mask
     std::string sel;
     const char * how = "user's CUDA_VISIBLE_DEVICES, first N of their list";
     const char * caller_mask = ::getenv("CUDA_VISIBLE_DEVICES");
@@ -40446,7 +41208,8 @@ static void apply_backend_defaults(Options & opt)
       // calibrate), which rank here exactly as before.
       mask_placed = true;
       g_gpu_monitor.start();
-      if (opt.gds_only || opt.direct_stage || opt.tar_mode || opt.calibrate)
+      if ((opt.gds_only || opt.direct_stage || opt.tar_mode || opt.calibrate)
+          && !gz_floor_precuda().all_old)
         finalize_gpu_mask(opt, "main thread, immediate GPU mode");
     } else {
       // A caller's mask already names the cards and their order.  Only an
@@ -40478,9 +41241,38 @@ static void apply_backend_defaults(Options & opt)
           && nvml_gpus > 0 && (size_t)opt.gpu_devices >= nvml_gpus;
       if (!full_cuda_order_from_nvml) {
         auto rows = g_gpu_monitor.snapshot();
+        // A UUID without an NVML capability is not proof that the card is
+        // usable.  Fall back to its PCI classification, if available.
+        rows.erase(std::remove_if(rows.begin(), rows.end(), [](const GpuMonitor::Row & r) {
+                     return gz_pre_uuid_floor(r.uuid) < 0
+                         || (r.cc >= 0 && r.cc < kGzGpuMinCc); }), rows.end());
+        auto proven_new = [](const GpuMonitor::Row & r) {
+          return gz_pre_uuid_floor(r.uuid) > 0 || r.cc >= kGzGpuMinCc;
+        };
+        const size_t proven = std::count_if(rows.begin(), rows.end(), proven_new);
+        // Even a complete /proc inventory is not enough when this NVML sweep
+        // omitted one of its possibly usable cards (including a full-fleet
+        // --gpu-order=ranked request).  The index fallback could hide it too.
+        const auto & proc_uuids = gz_proc_gpu_uuids();
+        const bool missing_possible = std::any_of(proc_uuids.begin(), proc_uuids.end(),
+            [&](const std::string & u) {
+              return gz_pre_uuid_floor(u) >= 0
+                  && std::none_of(rows.begin(), rows.end(), [&](const GpuMonitor::Row & r) {
+                       return r.uuid == u;
+                     });
+            });
+        leave_unmasked = !caller_mask
+            && (hw_gpus == 0 || gz_floor_precuda().unnamed_gpu
+                || gz_floor_precuda().uncertain || missing_possible)
+            && proven < (size_t)opt.gpu_devices;
+        if (!leave_unmasked && proven >= (size_t)opt.gpu_devices)
+          rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const GpuMonitor::Row & r) {
+                       return !proven_new(r); }), rows.end());
         how = rows.empty() ? "no NVML sample, took the tail of /proc's list (a guess)"
                            : "combined rank: utilization + free VRAM";
-        if (!rows.empty()) {
+        if (leave_unmasked) {
+          how = "no complete /proc or NVML inventory; checking all CUDA devices";
+        } else if (!rows.empty()) {
           std::vector<GzDevRank> rin;
           rin.reserve(rows.size());
           for (const auto & r2 : rows) rin.push_back({r2.util, r2.free_bytes});
@@ -40502,14 +41294,25 @@ static void apply_backend_defaults(Options & opt)
         }
       }
     }
-    if (!mask_placed && !full_cuda_order_from_nvml && sel.empty()) {  // no NVML: fall back to indices
+    // A CALLER'S EMPTY MASK IS AN ANSWER, NOT A MISSING ONE.  CUDA_VISIBLE_DEVICES=
+    // (or a list of only commas) is the standard way to hide every GPU, and the
+    // index fallback below used to replace it with "0" whenever a device count
+    // was asked for -- --gpu-devices=N, or --direct-stage / --gds-only, which
+    // default to one card -- so the run used GPU 0 on a box whose owner had
+    // hidden it (v0.17.69 through v0.17.76).  It now stays empty: CUDA sees no
+    // device, and --gpu-only and its implying flags refuse.
+    if (caller_mask && sel.empty())
+      how = "the caller's CUDA_VISIBLE_DEVICES names no device; left it empty";
+    if (!mask_placed && !full_cuda_order_from_nvml && !leave_unmasked
+        && !caller_mask && sel.empty()) {  // no NVML: fall back to indices
       how = "no NVML and no /proc list, fell back to indices";
       for (int i = 0; i < opt.gpu_devices; ++i) {
         if (i) sel += ",";
         sel += std::to_string(i);
       }
     }
-    if (!mask_placed && !full_cuda_order_from_nvml && (!caller_mask || sel != caller_mask))
+    if (!mask_placed && !full_cuda_order_from_nvml && !leave_unmasked
+        && (!caller_mask || sel != caller_mask))
       ::setenv("CUDA_VISIBLE_DEVICES", sel.c_str(), 1);
     // SAY WHICH PHYSICAL DEVICE, because nothing downstream can.  Narrowing the
     // visible set renumbers it from zero, so every later line calls the chosen
@@ -40520,8 +41323,11 @@ static void apply_backend_defaults(Options & opt)
     // actually landed on.
     if (!mask_placed && !full_cuda_order_from_nvml && opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
-      os << "[GPU] selected " << sel << " (" << how
-         << "); CUDA renumbers this set from 0, so later lines say GPU0\n";
+      if (leave_unmasked)
+        os << "[GPU] " << how << "; CUDA keeps its original device order\n";
+      else
+        os << "[GPU] selected " << sel << " (" << how
+           << "); CUDA renumbers this set from 0, so later lines say GPU0\n";
       vlog(V_VERBOSE, opt, os.str());
     }
   }
@@ -40626,12 +41432,22 @@ static void apply_backend_defaults(Options & opt)
     // representative, and the embedded PTX makes the answer identical across
     // same-or-newer cards.
     if (opt.gpu_verify) order_all_gpus_before_cuda(opt, /*eager=*/true);
-    if (opt.gpu_verify) finalize_gpu_mask(opt, "main thread, GPU verify probe");
-    if (opt.gpu_verify && gzv_kernel_available() != 1) {
-      opt.gpu_verify = false;
-      vlog(V_ERROR, opt,
-           "warning: GPU verify kernel has no compatible image for this device; "
-           "falling back to CPU verify\n");
+    if (opt.gpu_verify) {
+      // Probe a device this build can run on (v0.17.77): on a box mixing card
+      // generations, CUDA's device 0 can be one the run will never use.  With
+      // none usable there is nothing to probe; the compress refuses --gpu-only
+      // with the reason.
+      const int usable = gz_cuda_usable_count(opt, "main thread, GPU verify probe");
+      if (usable > 0 && gz_floor_postcuda().ids.front() != 0)
+        cudaSetDevice(gz_floor_postcuda().ids.front());
+      if (usable <= 0) {
+        opt.gpu_verify = false;
+      } else if (gzv_kernel_available() != 1) {
+        opt.gpu_verify = false;
+        vlog(V_ERROR, opt,
+             "warning: GPU verify kernel has no compatible image for this device; "
+             "falling back to CPU verify\n");
+      }
     }
     if (opt.verbosity >= V_VERBOSE)
       vlog(V_VERBOSE, opt, std::string("[VERIFY] engine: ")
@@ -42123,6 +42939,14 @@ static Options parse_args(int argc, char ** argv)
     if (opt.mode != Mode::COMPRESS || opt.list_mode)
       die_usage("--train cannot be combined with -d, -t or -l");
     if (opt.tar_mode) die_usage("--train cannot be combined with --tar");
+#ifdef HAVE_NVCOMP
+    // Training never enters the compressor's GPU dispatch.  Its early return
+    // would otherwise accept --gpu-only at exit 0 even with no CUDA device.
+    if (opt.gpu_only)
+      die_usage(std::string("--train cannot be combined with ")
+                + (opt.gds_only ? "--gds-only" : opt.direct_stage ? "--direct-stage"
+                                                       : "--gpu-only"));
+#endif
     if (!opt.dict_path.empty() || !opt.patch_from.empty())
       die_usage("--train cannot be combined with -D or --patch-from");
     if (opt.inputs.empty() || (opt.inputs.size() == 1 && opt.inputs[0] == "-"))

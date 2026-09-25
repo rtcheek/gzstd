@@ -176,12 +176,23 @@ if(HAVE_NVCOMP)
   # override from CMake's fallback.  The architecture list itself is applied to
   # the gzstd target further down — once enable_language has told us the nvcc
   # version, which gates the newest -real arches.
-  if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+  #
+  # "Defined" alone was only right on the FIRST configure.  The seed is cached,
+  # so every later configure of the same build directory -- including the one
+  # CMake runs by itself after any CMakeLists.txt edit -- saw it as a user
+  # override and compiled the kernels for the seed alone (sm_52).  So remember
+  # the seed, and treat the variable as the user's only when it differs from it.
+  if(DEFINED CMAKE_CUDA_ARCHITECTURES
+     AND NOT "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "${GZSTD_CUDA_ARCH_SEED}")
     set(GZSTD_CUDA_ARCH_USER_SET TRUE)
   else()
     set(GZSTD_CUDA_ARCH_USER_SET FALSE)
   endif()
   enable_language(CUDA)
+  if(NOT GZSTD_CUDA_ARCH_USER_SET)
+    set(GZSTD_CUDA_ARCH_SEED "${CMAKE_CUDA_ARCHITECTURES}" CACHE INTERNAL
+        "CMake's own CMAKE_CUDA_ARCHITECTURES seed, to tell it from a user override")
+  endif()
 endif()
 
 # =====================================================
@@ -224,8 +235,18 @@ if(HAVE_NVCOMP)
   # real cubins are just a JIT-skip optimization for known cards.  Applied as a
   # target property (not the CMAKE_ variable) so it overrides the default CMake
   # seeds at enable_language regardless.  Skipped when the user pinned arches.
+  #
+  # VOLTA (sm_70) since v0.17.77.  The list started at Turing, below the goal
+  # stated above: nvCOMP 5.2 carries code for sm_70, so a V100 could compress on
+  # the GPU but every GPU decompress would fail its checksum kernel launch.  A
+  # 70-real cubin also runs on later 7.x parts, and the compute_75 PTX still
+  # serves everything newer than the cubins.  CUDA 13 dropped sm_70, so it is
+  # added only for older toolkits.
   if(NOT GZSTD_CUDA_ARCH_USER_SET)
     set(_gz_arches 75-real 80-real 86-real 89-real 90-real)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+      list(PREPEND _gz_arches 70-real)
+    endif()
     # sm_100 (Blackwell datacenter) and sm_120 (Blackwell consumer) can only be
     # emitted as native cubins by nvcc >= 12.8.  On older toolkits we skip them
     # rather than failing the build — the compute_75 PTX below already JITs onto
@@ -237,6 +258,47 @@ if(HAVE_NVCOMP)
     set_target_properties(gzstd PROPERTIES CUDA_ARCHITECTURES "${_gz_arches}")
     message(STATUS "gzstd verify-kernel CUDA architectures: ${_gz_arches}")
   endif()
+
+  # The OLDEST architecture the kernels were compiled for, as a compute
+  # capability x10 (70 = 7.0).  gzstd refuses to bring up a GPU older than this
+  # or nvCOMP's own floor, whichever is newer; below it every launch fails.
+  # The symbolic forms are resolved through the lists CMake itself computed:
+  # "native" left this 0 = unknown, so a build for the H100 it was made on
+  # passed a V100 whose kernels it did not carry.  Anything still not numeric
+  # leaves it 0, and only nvCOMP's floor applies.  The floor is a LOWER bound
+  # only: a list of -real entries alone runs on no later major architecture.
+  get_target_property(_gz_arch_list gzstd CUDA_ARCHITECTURES)
+  set(_gz_arch_resolved "")
+  foreach(_a IN LISTS _gz_arch_list)
+    if(_a STREQUAL "native" AND DEFINED CMAKE_CUDA_ARCHITECTURES_NATIVE)
+      list(APPEND _gz_arch_resolved ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+    elseif(_a STREQUAL "all" AND DEFINED CMAKE_CUDA_ARCHITECTURES_ALL)
+      list(APPEND _gz_arch_resolved ${CMAKE_CUDA_ARCHITECTURES_ALL})
+    elseif(_a STREQUAL "all-major" AND DEFINED CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR)
+      list(APPEND _gz_arch_resolved ${CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR})
+    else()
+      list(APPEND _gz_arch_resolved ${_a})
+    endif()
+  endforeach()
+  set(_gz_min_cc 0)
+  foreach(_a IN LISTS _gz_arch_resolved)
+    string(REGEX MATCH "^([0-9]+)(-real|-virtual)?$" _m "${_a}")
+    if(NOT _m)
+      set(_gz_min_cc 0)
+      break()
+    endif()
+    if(_gz_min_cc EQUAL 0 OR CMAKE_MATCH_1 LESS _gz_min_cc)
+      set(_gz_min_cc ${CMAKE_MATCH_1})
+    endif()
+  endforeach()
+  target_compile_definitions(gzstd PRIVATE GZSTD_CUDA_KERNEL_MIN_CC=${_gz_min_cc})
+  # nvcc 12.8+ warns that pre-Turing targets will be removed "in a future
+  # release".  Known, and handled above for the release that does (13.0); keep
+  # the build warning-free.
+  if(_gz_min_cc GREATER 0 AND _gz_min_cc LESS 75)
+    target_compile_options(gzstd PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
+  endif()
+  message(STATUS "gzstd GPU kernels: oldest compute capability ${_gz_min_cc} (0 = unknown)")
 endif()
 if(HAVE_NVML)
   target_compile_definitions(gzstd PRIVATE HAVE_NVML)

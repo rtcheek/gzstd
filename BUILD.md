@@ -104,6 +104,7 @@ Output: `build-portable/gzstd`, ~60–80 MB.
 **Runtime requirements on target:**
 - glibc ≥ 2.31 (Ubuntu 20.04 / Debian 11 / RHEL 8 / Fedora 33+)
 - NVIDIA driver — optional. Since v0.13.55 NVML is loaded via dlopen at runtime, so the binary starts (and runs CPU-only) on machines without any NVIDIA driver. With a driver present, GPU paths work as usual.
+- For the GPU paths, a GPU of compute capability 7.0 or newer: Volta (V100) and later. nvCOMP 5.2 carries no code for anything older, and gzstd's own kernels are built for the same range. Older cards, such as Pascal (GTX 10xx, P100), are treated as absent: gzstd runs on the CPU without starting CUDA, and `--gpu-only` refuses with exit 2 and names the card (v0.17.77). A build made with CUDA 13 raises the floor to 7.5 (Turing), because CUDA 13 cannot compile for Volta.
 - That's it. No CUDA, no nvCOMP, no Python, no nothing.
 
 **Customizing:**
