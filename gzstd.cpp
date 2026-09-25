@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.75";
+static constexpr const char * GZSTD_VERSION = "0.17.76";
 //
 // Architecture overview:
 //
@@ -669,6 +669,9 @@ static GpuMonitor & g_gpu_monitor = *new GpuMonitor;
 ======================================================================*/
 #include <dlfcn.h>
 #include <cstddef>
+#ifndef _WIN32
+#include <sys/vfs.h>
+#endif
 
 typedef struct { int err; int cu_err; } GzCUfileError_t;
 typedef void * GzCUfileHandle_t;
@@ -685,6 +688,55 @@ static_assert(sizeof(GzCUfileDescr_t) == 24,              "cuFile ABI: CUfileDes
 static_assert(offsetof(GzCUfileDescr_t, handle) == 8,     "cuFile ABI: descr.handle offset");
 static_assert(offsetof(GzCUfileDescr_t, fs_ops) == 16,    "cuFile ABI: descr.fs_ops offset");
 
+// CUfileDrvProps_t's documented prefix (cufile.h): the nvfs block whose
+// dstatusflags says which storage the driver can move data to or from
+// directly.  Only the prefix is read.  The tail gives 1024 bytes of space for
+// the remaining fields in the libcufile version this was measured against; the
+// API has no size argument, so this is not a promise about arbitrary future ABI
+// growth.
+struct alignas(std::max_align_t) GzCUfileDrvProps {
+  struct {
+    unsigned int major_version, minor_version;
+    size_t       poll_thresh_size, max_direct_io_size;
+    unsigned int dstatusflags, dcontrolflags;
+  } nvfs;
+  unsigned char tail[1024];
+};
+static_assert(offsetof(GzCUfileDrvProps, nvfs.dstatusflags) == 24, "cuFile ABI: nvfs.dstatusflags offset");
+static_assert(offsetof(GzCUfileDrvProps, nvfs.dcontrolflags) == 28, "cuFile ABI: nvfs.dcontrolflags offset");
+static_assert(offsetof(GzCUfileDrvProps, tail) == 32, "cuFile ABI: nvfs prefix size");
+static_assert(sizeof(GzCUfileDrvProps) == 1056, "cuFile ABI: properties buffer size on LP64");
+// CUfileDriverStatusFlags_t: BIT INDICES into dstatusflags (measured: the
+// control flags decode the same way -- 0x2 = CU_FILE_ALLOW_COMPAT_MODE).
+static constexpr unsigned GZ_CUFILE_NVME_SUPPORTED     = 4;   // plain NVMe via nvidia-fs
+static constexpr unsigned GZ_CUFILE_NVME_P2P_SUPPORTED = 11;  // NVMe via PCI P2PDMA
+#ifndef _WIN32
+// Any BLOCK transport cuFile can drive without the POSIX path: NVMe (4),
+// NVMe-oF (5), SCSI (6), ScaleFlux CSD (7), NVMesh (8), NVMe via P2PDMA (11).
+// An ext4/xfs file can sit on any of them, and refusing one whose own bit is
+// set would turn away a run that is genuinely peer-to-peer.  Measured states:
+// 0x2 (none of these; every read POSIX) and 0x802 (bit 11; posix=0).
+static constexpr unsigned GZ_CUFILE_NVME_MASK =
+    (1u << GZ_CUFILE_NVME_SUPPORTED) | (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8)
+    | (1u << GZ_CUFILE_NVME_P2P_SUPPORTED);
+// The tar assembler opens each member after the run-wide preflight.  Retain
+// the driver's report so those held input descriptors get the same gate.
+static std::atomic<unsigned> g_gds_driver_status_flags{0};
+static std::atomic<bool> g_gds_driver_status_known{false};
+
+static bool gz_gds_no_nvme_support_on_fd(int fd, unsigned * flags_out)
+{
+  if (!g_gds_driver_status_known.load(std::memory_order_acquire)) return false;
+  const unsigned flags = g_gds_driver_status_flags.load(std::memory_order_relaxed);
+  if (flags & GZ_CUFILE_NVME_MASK) return false;
+  struct statfs sf {};
+  if (::fstatfs(fd, &sf) != 0) return false;
+  if (flags_out) *flags_out = flags;
+  return sf.f_type == 0xEF53 /* EXT4 (ext2/3 share it) */
+      || sf.f_type == 0x58465342 /* XFS */;
+}
+#endif
+
 struct GzGdsApi {
   GzCUfileError_t (*DriverOpen)(void) = nullptr;
   GzCUfileError_t (*DriverClose)(void) = nullptr;
@@ -695,6 +747,7 @@ struct GzGdsApi {
   ssize_t         (*Read)(GzCUfileHandle_t, void *, size_t, off_t, off_t) = nullptr;
   ssize_t         (*Write)(GzCUfileHandle_t, const void *, size_t, off_t, off_t) = nullptr;
   GzCUfileError_t (*GetVersion)(int *) = nullptr;
+  GzCUfileError_t (*DriverGetProperties)(GzCUfileDrvProps *) = nullptr;   // optional
   void *          lib = nullptr;
   bool            usable = false;
 };
@@ -708,7 +761,12 @@ static const GzGdsApi & gz_gds_api()
     if (!a.lib) return a;
     auto sym = [&](const char * n) { return dlsym(a.lib, n); };
     a.DriverOpen       = (GzCUfileError_t(*)(void))sym("cuFileDriverOpen");
-    a.DriverClose      = (GzCUfileError_t(*)(void))sym("cuFileDriverClose");
+    // cufile.h compiles every call of cuFileDriverClose into cuFileDriverClose_v2
+    // (#define), so that is the entry point real clients use; resolve it first
+    // (see gz_gds_driver_shutdown).  The unversioned name is the fallback.
+    a.DriverClose      = (GzCUfileError_t(*)(void))sym("cuFileDriverClose_v2");
+    if (!a.DriverClose)
+      a.DriverClose    = (GzCUfileError_t(*)(void))sym("cuFileDriverClose");
     a.HandleRegister   = (GzCUfileError_t(*)(GzCUfileHandle_t *, GzCUfileDescr_t *))
                          sym("cuFileHandleRegister");
     a.HandleDeregister = (void(*)(GzCUfileHandle_t))sym("cuFileHandleDeregister");
@@ -719,6 +777,7 @@ static const GzGdsApi & gz_gds_api()
     a.Write            = (ssize_t(*)(GzCUfileHandle_t, const void *, size_t, off_t, off_t))
                          sym("cuFileWrite");
     a.GetVersion       = (GzCUfileError_t(*)(int *))sym("cuFileGetVersion");
+    a.DriverGetProperties = (GzCUfileError_t(*)(GzCUfileDrvProps *))sym("cuFileDriverGetProperties");
     a.usable = a.DriverOpen && a.HandleRegister && a.HandleDeregister
             && a.BufRegister && a.BufDeregister && a.Read && a.Write;
     return a;
@@ -727,20 +786,9 @@ static const GzGdsApi & gz_gds_api()
 }
 
 // Open the driver once.  Empty string = ready; otherwise a reason fit to print.
-// WE MUST CLOSE IT, and the comment that used to stand here said the opposite.
-// It read "we deliberately never close it — the teardown cost buys nothing in a
-// process that is about to exit", which is true only while cuFile statistics are
-// off.  Set "cufile_stats" to any non-zero value in cufile.json and libcufile
-// defers its counter dump to its own ELF destructor, which the loader runs from
-// _dl_fini AFTER the CUDA context has been torn down: it then dereferences dead
-// state and the process dies of SIGSEGV having already returned 0 from main.
-// Measured at v0.17.7 — stats 1, 2 and 3 all segfault, stats 0 does not, and the
-// archive is byte-identical every time because the crash lands after the data.
-// That is the worst shape a bug can have here: the ONLY trustworthy proof that
-// --gds-only really used peer-to-peer DMA is cuFile's per-process posix= counter
-// (alignment counts and Bar1-map are eligibility, not routing — see --help), and
-// turning that counter on was what crashed the run.  Closing the driver while the
-// context is still alive makes libcufile dump its stats there instead.
+// Close the driver while CUDA is still available.  This does not itself write
+// cuFile's statistics: libcufile 1.13 writes those from its ELF destructor.  The
+// preload re-exec below fixes that destructor's ordering when stats are enabled.
 static std::atomic<bool> g_gds_driver_opened{false};
 // CHEAP half: library presence only.  Split out deliberately so argument
 // validation can reject an impossible --gds-only without paying cuInit, which
@@ -854,21 +902,10 @@ static void gz_gds_driver_shutdown()
 // which between them cover every path that unwinds.  It runs before exit()
 // reaches _dl_fini, which is the ordering the whole guard exists for.
 //
-// IT DOES NOT RUN ON die().  That calls std::exit, which runs static destructors
-// and atexit handlers but does NOT unwind the stack, so this automatic object is
-// never destroyed on the abort paths -- and die() is this program's most common
-// abnormal exit.  An earlier version of this comment claimed "every exit from
-// main", which was false in exactly the case a reader would most want it to be
-// true.
-//
-// Left that way deliberately, on two grounds: a die() path is already fatal, and
-// calling cuFileDriverClose from it would race workers that are still live,
-// which is a worse failure than the one below.  The cost of not running is
-// confined to cuFile's deferred statistics dump -- so on a die() with
-// cufile_stats enabled, libcufile's destructor still faults at _dl_fini and the
-// process reports 139 rather than the code die() asked for.  That is the known
-// libcufile dlopen defect (see gz_gds_driver_opened), not a new one, and it
-// needs a non-default config to appear at all.
+// IT DOES NOT RUN ON die().  That calls std::exit without unwinding automatic
+// objects.  Closing a driver while workers may still be inside cuFile would race
+// them; with statistics enabled, the preloaded library can finish its own dump
+// at process exit instead.
 struct GzGdsDriverGuard { ~GzGdsDriverGuard() { gz_gds_driver_shutdown(); } };
 
 // nvidia-fs's box-wide count of successful GPU BAR1 mappings.  MEASURED to be
@@ -3301,6 +3338,51 @@ static void gds_preflight_or_die(const Options & opt, FILE * in)
                   "  Install and load nvidia-fs (nvidia-fs-dkms) if you meant to use"
                   " GPUDirect\n  Storage.\n");
 
+  // THE DRIVER'S OWN CAPABILITY REPORT (v0.17.76).  The BAR1-counter probe below
+  // is NOT enough, and it was shown to pass falsely: on an 8-GPU host with the
+  // NVIDIA option RMForceStaticBar1 removed, cuFileBufRegister moved Bar1-map
+  // (ok 2 -> 6, err 0), the probe read returned its bytes, --gds-only exited 0 --
+  // and cuFile's own per-process counter showed every read taking the POSIX
+  // path (n=302 posix=302; gdsio agreed, n=1024 posix=1024).  Registration maps
+  // BAR1; it says nothing about where reads go.
+  //
+  // What does say it, before any I/O: the driver properties gdscheck -p prints.
+  // In that state both NVMe lines read "Unsupported" (dstatusflags 0x2); while
+  // GDS was measurably native on the same host it read "NVMe P2PDMA :
+  // Supported".  Apply the owner's ext4/xfs input gate to the held file (or
+  // each held tar member); other filesystems retain the existing checks below.
+  // Filesystem type alone does not prove the backing device is local NVMe.
+#ifndef _WIN32
+  const GzGdsApi & api = gz_gds_api();
+  GzCUfileDrvProps props {};
+  const bool have_props = api.DriverGetProperties
+      && api.DriverGetProperties(&props).err == GZ_CUFILE_SUCCESS;
+  // Test hook: replace the driver's status flags (hex) AFTER the real call, so
+  // the suite can drive both answers on one host.  0x2 is what this check saw
+  // with P2PDMA unavailable; 0x802 what it saw with GDS native.
+  if (have_props)
+    if (const char * f = std::getenv("GZSTD_DEBUG_GDS_DRIVER_FLAGS"))
+      props.nvfs.dstatusflags = (unsigned)std::strtoul(f, nullptr, 16);
+  g_gds_driver_status_known.store(false, std::memory_order_relaxed);
+  if (have_props) {
+    g_gds_driver_status_flags.store(props.nvfs.dstatusflags, std::memory_order_relaxed);
+    g_gds_driver_status_known.store(true, std::memory_order_release);
+  }
+  if (in && in != stdin) {
+    unsigned driver_flags = 0;
+    if (gz_gds_no_nvme_support_on_fd(::fileno(in), &driver_flags)) {
+      char flags[32];
+      std::snprintf(flags, sizeof flags, "0x%x", driver_flags);
+      refuse_no_p2p(std::string("cuFile reports no NVMe support (no \"NVMe\", \"NVMe P2PDMA\" or other"
+                                " block-storage\n  bit; driver status flags ") + flags + "), so every read of this "
+                    "ext4/xfs file would take the POSIX path",
+                    "  Check with: /usr/libexec/gds/tools/gdscheck -p.  With the NVIDIA 570 driver,"
+                    " NVMe P2PDMA\n  needs the module option RMForceStaticBar1=1 (see GDS.md)."
+                    "\n");
+    }
+  }
+#endif
+
   unsigned long long b1_before = 0;
   if (in && in != stdin && gz_nvfs_bar1_read(&b1_before)) {
     // Probe the input the driver already holds.  Opening opt.input here used to
@@ -4309,14 +4391,18 @@ static void print_help_long()
 "     speed (measured 4.917 against 4.924 GiB/s), so gzstd warns at\n"
 "     default verbosity when alignment or registration proves a known\n"
 "     degradation.  Alignment and the system-wide Bar1-map counter show\n"
-"     eligibility/activity, not definitive per-read routing; cuFile's own\n"
-"     route counters are unavailable here.  And note that a kernel\n"
-"     upgrade can disable it outright, with nothing gzstd can do about\n"
-"     it: the nvidia-fs pin this depends on regressed between 6.8.0-134\n"
+"     eligibility/activity, not definitive per-read routing.  Before it\n"
+"     starts, gzstd also refuses when cuFile's capability report (what\n"
+"     gdscheck -p prints) has no block-storage transport bit for a file\n"
+"     on ext4/xfs.  For proof, enable \"cufile_stats\" and INFO logging in\n"
+"     cufile.json and read posix= in cuFile's log: 0 means peer-to-peer\n"
+"     (gzstd re-runs itself with libcufile preloaded so that dump works).\n"
+"     A kernel upgrade can disable it outright, with nothing gzstd can do\n"
+"     about it. The nvidia-fs pin regressed between 6.8.0-134\n"
 "     and 6.8.0-138.\n"
 "\n"
-"     GPUDirect Storage (GDS): read the input straight from the NVMe\n"
-"     drive into GPU memory by peer-to-peer DMA (direct memory access),\n"
+"     GPUDirect Storage (GDS): read the input straight from supported\n"
+"     block storage into GPU memory by peer-to-peer DMA (direct memory access),\n"
 "     so the uncompressed bytes never enter host memory at all.  Implies\n"
 "     --gpu-only: with no host copy there is nothing for a CPU worker to\n"
 "     compress, so the split is not a policy choice, it is unavailable.\n"
@@ -6813,13 +6899,16 @@ static std::atomic<bool> g_cufile_log_finished{false};
 // a non-empty "dir" string directly inside it.  Anything unreadable or odd is
 // "no": cuFile would then fall back to the working directory, which is the case
 // this code exists to replace.
-static bool gz_cufile_config_sets_log_dir(std::string * config_out)
+// The cuFile config the driver will read (CUFILE_ENV_PATH_JSON, else
+// /etc/cufile.json), with // and /* */ comments stripped outside strings.
+// Empty when unreadable.
+static std::string gz_cufile_config_text(std::string * config_out)
 {
   const char * envp = std::getenv("CUFILE_ENV_PATH_JSON");
   const std::string path = (envp && *envp) ? envp : "/etc/cufile.json";
   if (config_out) *config_out = path;
   std::ifstream f(path);
-  if (!f) return false;
+  if (!f) return std::string();
   const std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   std::string t;
   t.reserve(raw.size());
@@ -6843,6 +6932,13 @@ static bool gz_cufile_config_sets_log_dir(std::string * config_out)
       t += c;
     }
   }
+  return t;
+}
+
+static bool gz_cufile_config_sets_log_dir(std::string * config_out)
+{
+  const std::string t = gz_cufile_config_text(config_out);
+  if (t.empty()) return false;
   // Read a JSON string starting at t[i] == '"'; returns its contents, i past it.
   auto read_str = [&](size_t & i) {
     std::string v;
@@ -6876,6 +6972,176 @@ static bool gz_cufile_config_sets_log_dir(std::string * config_out)
     return false;
   }
   return false;
+}
+
+// The cufile_stats level the active cuFile config asks for (the "cufile_stats"
+// key, wherever it sits; NVIDIA's template keeps it under "profile").  0 when
+// absent, unreadable or not a number: stats are off by default.
+static int gz_cufile_config_stats_level()
+{
+  const std::string t = gz_cufile_config_text(nullptr);
+  int level = 0;  // any positive duplicate warrants the safe preload
+  for (size_t i = 0; i < t.size(); ) {
+    if (t[i] != '"') { ++i; continue; }
+    std::string key;
+    for (++i; i < t.size() && t[i] != '"'; ++i) {
+      if (t[i] == '\\' && i + 1 < t.size()) { ++i; continue; }
+      key += t[i];
+    }
+    if (i < t.size()) ++i;
+    if (key != "cufile_stats") continue;
+    size_t j = i;
+    while (j < t.size() && std::isspace((unsigned char)t[j])) ++j;
+    if (j >= t.size() || t[j] != ':') continue;
+    ++j;
+    while (j < t.size() && std::isspace((unsigned char)t[j])) ++j;
+    int v = 0; bool digits = false;
+    while (j < t.size() && std::isdigit((unsigned char)t[j])) {
+      const int d = t[j++] - '0';
+      v = v > (INT_MAX - d) / 10 ? INT_MAX : v * 10 + d;
+      digits = true;
+    }
+    if (digits && (j == t.size() || std::isspace((unsigned char)t[j])
+                   || t[j] == ',' || t[j] == '}' || t[j] == ']'))
+      level = std::max(level, v);
+  }
+  return level;
+}
+
+// cuFile STATISTICS NEED libcufile LOADED AT STARTUP (v0.17.76).
+//
+// With cufile_stats >= 1, libcufile 1.13 writes its counters only from its own
+// ELF destructor -- cuFileDriverClose (v1 or _v2) writes nothing -- and in a
+// process that dlopen'ed it, that destructor crashes: SIGSEGV in an ostream
+// write of "Read" with a garbage length, AFTER main returned 0 and the archive
+// was complete, so the run exits 139.  MEASURED: the same run exits 0 with the
+// library preloaded (LD_PRELOAD, or linked at build time as gdsio is), and a
+// conda-vs-system libstdc++ swap under gdsio changes nothing.  The mechanism is
+// exit order: a DSO loaded after main started registers its C++ statics with
+// __cxa_atexit after the loader registered _dl_fini, so exit() destroys them
+// first and _dl_fini then runs libcufile's destructor over them.  dlclose cannot
+// run it earlier: libcufile is built NODELETE.  And the stats are not optional
+// decoration -- cuFile's per-process posix= counter is the only trustworthy
+// proof that --gds-only really moved data peer-to-peer.
+//
+// So when --gds-only runs with stats on and libcufile is not already loaded,
+// re-execute once, before argument parsing consumes any user input, with it
+// preloaded.  The child restores the caller's LD_PRELOAD at once (so nothing it
+// spawns inherits it);
+// the library stays mapped.  If exec fails the run continues and says why.
+// Was libcufile already mapped when gzstd_main began -- linked at build time or
+// preloaded -- as opposed to dlopen'ed later by gz_gds_api() (which argument
+// parsing itself calls to reject an impossible --gds-only early)?  Only the
+// former exits safely with statistics on.  Set once, before parse_args.
+static bool g_cufile_loaded_at_startup = false;
+
+// This decision must precede parse_args: --files-from and --exclude-from can
+// consume stdin (or a FIFO) while parsing.  The raw argv is passed unchanged to
+// execv, and the child must be the first process to consume those lists.  Only
+// exact option tokens count; --gds-only after -- or as a string-valued option's
+// argument is a filename/value, not a request for GDS.  Numeric value options
+// need no skip: --gds-only is not a number, and -T consumes only numeric tokens.
+static bool gz_cufile_preload_requested(int argc, char ** argv, Options & opt)
+{
+  bool gds_only = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i] ? argv[i] : "";
+    if (a == "--") break;
+    if (a == "-o" || a == "--output" || a == "--exclude" || a == "--exclude-from"
+        || a == "-X" || a == "--files-from" || a == "--format" || a == "-C"
+        || a == "--directory" || a == "--verify-engine" || a == "--stats-json"
+        || a == "--pinned" || a == "--gpu-order" || a == "--patch-from"
+        || a == "-D" || a == "--dict" || a == "--dictionary"
+        || a == "--filelist" || a == "--output-dir-flat"
+        || a == "--output-dir-mirror" || a == "--trace") {
+      if (i + 1 < argc) ++i;
+      continue;
+    }
+    if (a == "-h" || a == "-?" || a == "--help" || a == "-H"
+        || a == "-V" || a == "--version") return false;
+    if (a == "--gds-only") gds_only = true;
+    else if (a == "-v" || a == "--verbose") opt.verbosity = V_VERBOSE;
+    else if (a == "-vv") opt.verbosity = V_DEBUG;
+    else if (a == "-vvv") opt.verbosity = V_TRACE;
+    else if (a == "-q" || a == "--quiet") opt.verbosity = V_ERROR;
+    else if (a == "-qq" || a == "--silent") opt.verbosity = V_SILENT;
+  }
+  return gds_only;
+}
+
+static void gz_cufile_stats_preload(int argc, char ** argv)
+{
+  Options opt;
+  if (!gz_cufile_preload_requested(argc, argv, opt)) return;
+  // Only now, and only for --gds-only: even RTLD_NOLOAD makes the loader SEARCH
+  // the library path for the name (visible under LD_DEBUG=libs), and a run that
+  // never asked for cuFile -- --direct-stage above all -- must not touch it.
+  // Still before parse_args, so "mapped now" still means "mapped at startup".
+  {
+    void * h = dlopen("libcufile.so.0", RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = dlopen("libcufile.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (h) { g_cufile_loaded_at_startup = true; dlclose(h); }
+  }
+  if (const char * done = std::getenv("GZSTD_CUFILE_PRELOADED")) {
+    // The re-executed child: hand back the caller's environment.
+    if (!g_cufile_loaded_at_startup)
+      die_usage("--gds-only: libcufile was not loaded by the preload re-exec; "
+                "check LD_PRELOAD and secure-execution restrictions");
+    if (std::strcmp(done, "set") == 0) {
+      if (const char * orig = std::getenv("GZSTD_CUFILE_PRELOAD_ORIG"))
+        ::setenv("LD_PRELOAD", std::string(orig).c_str(), 1);
+    } else {
+      ::unsetenv("LD_PRELOAD");
+    }
+    ::unsetenv("GZSTD_CUFILE_PRELOAD_ORIG");
+    ::unsetenv("GZSTD_CUFILE_PRELOADED");
+    vlog(V_VERBOSE, opt, "[GDS] libcufile preloaded for cufile_stats; environment restored\n");
+    return;
+  }
+  if (g_cufile_loaded_at_startup) return;
+  const int level = gz_cufile_config_stats_level();
+  if (level <= 0) return;
+  // Name the library by the path the loader would pick, so the preload cannot
+  // resolve differently from the dlopen it replaces.
+  std::string soname = "libcufile.so.0";
+  void * h = dlopen(soname.c_str(), RTLD_LAZY | RTLD_LOCAL);
+  if (!h) { soname = "libcufile.so"; h = dlopen(soname.c_str(), RTLD_LAZY | RTLD_LOCAL); }
+  std::string path = soname;
+  if (h) {
+    Dl_info di{};
+    if (void * sym = dlsym(h, "cuFileDriverOpen");
+        sym && dladdr(sym, &di) && di.dli_fname && *di.dli_fname)
+      path = di.dli_fname;
+  } else {
+    return;                        // no libcufile: the preflight will say so
+  }
+  // LD_PRELOAD has no quoting for pathnames containing separators.  In that
+  // case use the same soname that dlopen successfully resolved above.
+  if (path.find_first_of(": \t\n") != std::string::npos)
+    path = soname;
+  const char * old_preload = std::getenv("LD_PRELOAD");
+  const bool had_preload = old_preload != nullptr;
+  const std::string orig = had_preload ? old_preload : "";
+  const std::string pre = !orig.empty() ? path + ":" + orig : path;
+  if ((had_preload && ::setenv("GZSTD_CUFILE_PRELOAD_ORIG", orig.c_str(), 1) != 0)
+      || ::setenv("GZSTD_CUFILE_PRELOADED", had_preload ? "set" : "unset", 1) != 0
+      || ::setenv("LD_PRELOAD", pre.c_str(), 1) != 0) {
+    if (had_preload) ::setenv("LD_PRELOAD", orig.c_str(), 1); else ::unsetenv("LD_PRELOAD");
+    ::unsetenv("GZSTD_CUFILE_PRELOAD_ORIG");
+    ::unsetenv("GZSTD_CUFILE_PRELOADED");
+    die_usage("--gds-only: cannot prepare the cuFile preload environment");
+  }
+  vlog(V_VERBOSE, opt, "[GDS] cufile_stats=" + std::to_string(level) + " in the cuFile config: "
+       "re-executing with " + path + " preloaded (a dlopen'ed libcufile crashes writing its "
+       "statistics at exit)\n");
+  ::execv("/proc/self/exe", argv);
+  const int e = errno;              // still here: exec failed; undo and carry on
+  if (had_preload) ::setenv("LD_PRELOAD", orig.c_str(), 1); else ::unsetenv("LD_PRELOAD");
+  ::unsetenv("GZSTD_CUFILE_PRELOAD_ORIG");
+  ::unsetenv("GZSTD_CUFILE_PRELOADED");
+  vlog(V_ERROR, opt, std::string("gzstd: warning: cufile_stats is on and re-executing with "
+       "libcufile preloaded failed (") + std::strerror(e) + "); libcufile will likely crash "
+       "this run at exit (exit status 139) after the output is complete\n");
 }
 
 // At a clean exit (atexit, and main's abandoned-GPU _Exit): drop the log if cuFile
@@ -20146,6 +20412,16 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
         // Register only AFTER the identity check has accepted this descriptor,
         // so a stale or wrong-inode open is never handed to cuFile.
         if (g_gds_stage_pool.load(std::memory_order_acquire)) {
+#ifndef _WIN32
+          unsigned driver_flags = 0;
+          if (gz_gds_no_nvme_support_on_fd(sc.fd, &driver_flags)) {
+            char flags[32];
+            std::snprintf(flags, sizeof flags, "0x%x", driver_flags);
+            die_usage(std::string("--gds-only --tar: cuFile reports no NVMe support for ")
+                      + e.src + " (driver status flags " + flags + "); this ext4/xfs member "
+                      "would use the POSIX path. Omit --gds-only for tar creation");
+          }
+#endif
           // cuFile REJECTS O_NONBLOCK -- CU_FILE_INVALID_FILE_OPEN_FLAG, err
           // 5019, on every member.  The flag is not optional at open time (the
           // layout was built earlier, so a member may since have become a FIFO
@@ -37736,6 +38012,12 @@ static int gzstd_main(int argc, char ** argv)
   mallopt(M_TRIM_THRESHOLD, 256 * 1024 * 1024);  // keep the recycled heap resident
 #endif
 
+#if defined(HAVE_NVCOMP) && !defined(_WIN32)
+  // BEFORE parse_args: argument validation dlopen's libcufile itself, and
+  // parsing can read --files-from/--exclude-from (including stdin).  Re-exec
+  // first so those streams are read exactly once, by the child.
+  gz_cufile_stats_preload(argc, argv);
+#endif
   Options opt = parse_args(argc, argv);
   // --train is its own operation: no compress/decompress setup applies.
   if (opt.train) return run_train(opt);

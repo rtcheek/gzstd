@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=523
-$EXTENSIVE && EXPECTED_TESTS=681
+EXPECTED_TESTS=525
+$EXTENSIVE && EXPECTED_TESTS=683
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -755,8 +755,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.75: two GPU cells for the deferred subset mask (ranked on the bringup
 # thread; never waited for when bringup is skipped).  521 -> 523, 679 -> 681; the
 # no-GPU deltas 130 -> 132 (130 MEASURED by the v0.17.74 CPU-only run) and 158 -> 160.
-EXPECTED_NOGPU_DELTA=132
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=160   # MEASURED 2026-09-21 (607 - 463) + 16 derived since
+# v0.17.76: two GDS cells (the capability refusal; stats on exits 0 with
+# posix=0).  523 -> 525, 681 -> 683.  Both need a working --gds-only host, so
+# the no-GPU deltas grow 132 -> 134 and 160 -> 162, and the no-GDS delta 11 -> 13.
+EXPECTED_NOGPU_DELTA=134
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=162   # MEASURED 2026-09-21 (607 - 463) + 18 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -772,7 +775,7 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=160   # MEASURED 2026-09-21 (607 - 463) + 16 
 # in particular the trivial-park cell, the lone skip on the 8-GPU host, RAN and
 # passed here, so the two hosts' skip lists are disjoint and between them every
 # one of the 607 cells has now been exercised.
-EXPECTED_NOGDS_DELTA=11
+EXPECTED_NOGDS_DELTA=13   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells, derived
 
 # ============================================================
 # Banner & system info
@@ -2866,6 +2869,93 @@ if has_gpu 2>/dev/null && "$GZSTD" --help 2>&1 | grep -q -- '--gds-only'; then
   rm -f "$gc_z"
 else
   skip "--gds-only refuses a compat-mode host and names --direct-stage" "no GPU or no --gds-only"
+fi
+
+# v0.17.76: the preflight above passed FALSELY on an 8-GPU host with the NVIDIA
+# option RMForceStaticBar1 removed -- buffer registration moved Bar1-map while
+# cuFile's own counter showed every read on the POSIX path (n=302 posix=302).
+# It now also reads cuFile's capability report (cuFileDriverGetProperties, what
+# gdscheck -p prints) and, for a file on ext4/xfs, refuses when no block-storage
+# transport bit is set.  Measured: 0x2 with P2PDMA unavailable, 0x802
+# with GDS native.  GZSTD_DEBUG_GDS_DRIVER_FLAGS replaces the flags after the
+# real call so both answers are driven on one host; the check sits after the
+# module gate, so only a host where --gds-only really runs can reach it.
+gn_fs=$(stat -f -c %T "$TMPDIR" 2>/dev/null)
+if has_gpu 2>/dev/null && gds_testable && [[ "$gn_fs" == ext2/ext3 || "$gn_fs" == xfs ]]; then
+  gn_z="$TMPDIR/gds-nvme.zst"; gn_why=""
+  "$GZSTD" -q -k -f -3 "$TMPDIR/large.bin" -o "$gn_z" 2>/dev/null
+  t0=$(now_ms); rc=0
+  GZSTD_DEBUG_GDS_DRIVER_FLAGS=0x2 "$GZSTD" -t --gds-only "$gn_z" 2>"$TMPDIR/gn.err" || rc=$?
+  [[ $rc -eq 2 ]] || gn_why+=" [flags 0x2 exited $rc, want 2]"
+  grep -q 'no NVMe support' "$TMPDIR/gn.err" || gn_why+=" [refusal does not name the missing NVMe support]"
+  grep -q 'direct-stage' "$TMPDIR/gn.err" || gn_why+=" [refusal does not point at --direct-stage]"
+  # --tar has no single input FILE* at the run-wide preflight.  Its held member
+  # descriptor must reach the same capability gate before a cuFileRead.
+  rc=0
+  GZSTD_DEBUG_GDS_DRIVER_FLAGS=0x2 "$GZSTD" --gds-only --tar \
+    -C "$TMPDIR" large.bin -o "$TMPDIR/gn-tar.zst" 2>"$TMPDIR/gn-tar.err" || rc=$?
+  [[ $rc -eq 2 ]] || gn_why+=" [tar member with flags 0x2 exited $rc, want 2]"
+  grep -q 'no NVMe support' "$TMPDIR/gn-tar.err" || gn_why+=" [tar refusal does not name NVMe support]"
+  for gn_f in 0x802 0x10; do
+    rc=0; GZSTD_DEBUG_GDS_DRIVER_FLAGS=$gn_f "$GZSTD" -t --gds-only "$gn_z" 2>/dev/null || rc=$?
+    [[ $rc -eq 0 ]] || gn_why+=" [flags $gn_f (a supported bit) exited $rc]"
+  done
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$gn_why" ]] && pass "--gds-only refuses when cuFile reports no NVMe support" \
+    || fail "--gds-only refuses when cuFile reports no NVMe support" "$gn_why"
+
+  # And cuFile STATISTICS must not crash the run.  libcufile writes them only from
+  # its own ELF destructor, which faults at exit when the library was dlopen'ed
+  # mid-run (exit 139 after complete output); gzstd now re-executes once with it
+  # preloaded.  The counter it then writes is also the ONLY proof that the run was
+  # peer-to-peer: this host is gds_testable, so every read must be posix=0.
+  gs_src="${CUFILE_ENV_PATH_JSON:-/etc/cufile.json}"
+  if [[ -r "$gs_src" ]] && grep -q '"cufile_stats"' "$gs_src"; then
+    sed -e 's/"cufile_stats"[[:space:]]*:[[:space:]]*[0-9]*/"cufile_stats": 3/' \
+        -e 's/"level"[[:space:]]*:[[:space:]]*"[A-Za-z]*"/"level": "INFO"/' "$gs_src" > "$TMPDIR/gs.json"
+    t0=$(now_ms); rc=0; gs_why=""
+    CUFILE_ENV_PATH_JSON="$TMPDIR/gs.json" CUFILE_LOGFILE_PATH="$TMPDIR/gs.log" \
+      "$GZSTD" -v -t --gds-only "$gn_z" 2>"$TMPDIR/gs.err" || rc=$?
+    [[ $rc -eq 0 ]] || gs_why+=" [exited $rc]"
+    grep -q 're-executing with' "$TMPDIR/gs.err" || gs_why+=" [no preload re-exec]"
+    grep -qE 'Read: .* n=[1-9][0-9]* posix=0 ' "$TMPDIR/gs.log" 2>/dev/null \
+      || gs_why+=" [no posix=0 read counter: $(grep -oE 'n=[0-9]+ posix=[0-9]+' "$TMPDIR/gs.log" 2>/dev/null | head -1)]"
+    # Parsing --files-from - used to drain stdin in the parent, then the
+    # re-executed child found no tar sources.  It must now read the list once.
+    rc=0
+    printf 'large.bin\n' | CUFILE_ENV_PATH_JSON="$TMPDIR/gs.json" \
+      CUFILE_LOGFILE_PATH="$TMPDIR/gs-list.log" "$GZSTD" --gds-only --tar \
+      -C "$TMPDIR" --files-from - -o "$TMPDIR/gs-list.zst" \
+      2>"$TMPDIR/gs-list.err" || rc=$?
+    [[ $rc -eq 0 ]] || gs_why+=" [--files-from stdin exited $rc after preload]"
+    if [[ $rc -eq 0 ]]; then
+      "$GZSTD" -l --tar "$TMPDIR/gs-list.zst" >"$TMPDIR/gs-list.out" 2>/dev/null \
+        || gs_why+=" [cannot list the tar made from stdin]"
+      grep -q 'large.bin' "$TMPDIR/gs-list.out" \
+        || gs_why+=" [tar made from stdin lacks large.bin]"
+    fi
+    # Ignored zstd value options still consume the next token.  Here the
+    # literal --gds-only is --filelist's value, not a GDS request.
+    rc=0
+    CUFILE_ENV_PATH_JSON="$TMPDIR/gs.json" "$GZSTD" -v --filelist --gds-only \
+      -t "$gn_z" 2>"$TMPDIR/gs-value.err" || rc=$?
+    [[ $rc -eq 0 ]] || gs_why+=" [--filelist value exited $rc]"
+    if grep -q 're-executing with' "$TMPDIR/gs-value.err"; then
+      gs_why+=" [--filelist value triggered a needless preload re-exec]"
+    fi
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    [[ -z "$gs_why" ]] && pass "--gds-only with cuFile statistics on exits 0 and proves peer-to-peer (posix=0)" \
+      || fail "--gds-only with cuFile statistics on exits 0 and proves peer-to-peer (posix=0)" "$gs_why"
+    rm -f "$TMPDIR/gs.json" "$TMPDIR/gs.log" "$TMPDIR/gs.err" \
+      "$TMPDIR/gs-list.log" "$TMPDIR/gs-list.err" "$TMPDIR/gs-list.out" "$TMPDIR/gs-list.zst" \
+      "$TMPDIR/gs-value.err"
+  else
+    skip "--gds-only with cuFile statistics on exits 0 and proves peer-to-peer (posix=0)" "no cufile.json with a cufile_stats key"
+  fi
+  rm -f "$gn_z" "$TMPDIR/gn.err" "$TMPDIR/gn-tar.zst" "$TMPDIR/gn-tar.err"
+else
+  skip "--gds-only refuses when cuFile reports no NVMe support" "needs a host where --gds-only runs, on ext4/xfs"
+  skip "--gds-only with cuFile statistics on exits 0 and proves peer-to-peer (posix=0)" "needs a host where --gds-only runs"
 fi
 
 # ============================================================

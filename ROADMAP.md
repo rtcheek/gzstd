@@ -187,9 +187,12 @@ split one PCIe link).
   2026-08-19/20, after the August measurement): 570.207's `nvidia-uvm/uvm_pmm_gpu.c` adds each GPU's
   128 GiB BAR1 to the kernel P2PDMA pool at every GPU registration and never removes it. MEASURED: +4
   MiB kernel memory per GPU per process start (20.4 GiB after 18 days); a resident CUDA holder stops
-  both the cost (0.44 s) and the leak. **OWED (a reboot, deferred to the next update window):** the
-  A/B without static BAR1, which also answers whether GDS works here through `nvidia-fs` alone. Keep
-  the update reboot and the A/B separate. Documented in TUNING.md and GDS.md. v0.17.73 made gzstd pay
+  both the cost (0.44 s) and the leak. **A/B DONE 2026-09-24 (kernel 6.8.0-142):** without static BAR1,
+  CUDA startup for 8 GPUs 6.34-6.41 -> 1.90-1.96 s and no leak, but every GDS read goes through POSIX in
+  either cuFile mode (`nvidia-fs` alone does not do it here); with it, `posix=0`. A straight trade on
+  this driver: GDS peer-to-peer, or fast startup and no leak (the host's setting is the owner's call).
+  The A/B also exposed two gzstd GDS defects, fixed in v0.17.76: a preflight that passed in compat mode,
+  and a cuFile-statistics exit crash. Documented in TUNING.md and GDS.md. v0.17.73 made gzstd pay
   it less (next item), which helps whatever the host does.
 - **v0.17.73 shipped the two cheap levers:** `--gpu-only` compress reads through the reader pool
   (a pageable upload that takes its own page faults runs at 40% speed), and `--adapt` /
@@ -906,9 +909,9 @@ experiment is both arms under concurrent load: at what point does 15.8 cores ver
 is run, "GDS is a contention-resilience win" remains a reasoned claim rather than a
 measured one on this hardware.
 
-## Known external defect: libcufile segfaults at exit when dlopen'd with stats on
+## libcufile statistics when loaded with dlopen
 
-Not gzstd's, and not fixable here — recorded so it is not re-investigated. Setting `cufile_stats`
+The underlying libcufile 1.13 defect remains: setting `cufile_stats`
 to any non-zero value in cufile.json makes the process die of SIGSEGV inside libcufile's ELF
 destructor at `_dl_fini`, **after `main` has returned 0 and with the archive byte-identical on
 disk**. Reproduced in 17 lines of C that dlopen libcufile, call `cuFileDriverOpen` and return —
@@ -922,13 +925,15 @@ no CUDA, no I/O, no gzstd. The same probe *linked* against libcufile exits 0.
 gzstd cannot switch to linking: a `DT_NEEDED` entry resolves before `main`, so the portable binary
 would refuse to *start* on every host without GDS installed. Neither `cuFileDriverClose` nor
 `dlclose` prevents it, and it is **not** a libstdc++ ABI mismatch (`LD_PRELOAD`ing the system
-libstdc++ changes nothing).
+libstdc++ changes nothing). Since v0.17.76, a `--gds-only` run with statistics enabled re-executes
+once with libcufile preloaded before it consumes any input, so its counters can be read without
+the exit crash. The table above describes the underlying library behavior without that workaround.
 
 **Why it matters anyway:** that setting is the only way to read cuFile's per-process `posix=`
 counter, which is the only trustworthy proof `--gds-only` really used peer-to-peer DMA — the
 `[GDS] N aligned transfers, 0 unaligned` line counts alignment *eligibility* and was
-mutation-disproven as routing evidence at v0.17.8. So verifying the feature costs a crash at exit.
-Revisit if a future libcufile fixes the destructor.
+mutation-disproven as routing evidence at v0.17.8. The preload workaround makes the counter
+usable; revisit it if a future libcufile fixes the destructor.
 
 ## Tooling gap: `gzstd-benchmark.sh` has NO `--tar` coverage
 

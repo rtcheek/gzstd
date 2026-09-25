@@ -1,11 +1,142 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.75  
+**Covers:** v0.9.50 → v0.17.76  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.17.76 — `--gds-only` stops running in compat mode, and cuFile statistics stop crashing it
+
+Found by the static-BAR1 A/B reboot of the 8-GPU host (see "The startup cost is GPUDirect Storage's
+static BAR1" under v0.17.73).
+
+**The measurement.** Rebooted with the NVIDIA option `RMForceStaticBar1=1` removed:
+- **Startup:** CUDA startup for 8 GPUs fell from 6.34–6.41 s to 1.90–1.96 s (1/2/4 GPUs: 0.53 /
+  0.65 / 1.44 s against 1.49 / 2.11 / 3.57 s).
+- **The leak:** gone. `VmallocUsed` +0 per process, and no p2p pool at all.
+- **GPUDirect Storage:** also gone. cuFile's per-process counter, the one trustworthy routing signal,
+  showed every read on the POSIX path, from gzstd (`n=302 posix=302`) and from NVIDIA's `gdsio`
+  (`n=1024 posix=1024`), with `use_pci_p2pdma` on and off.
+- **With the option restored:** gzstd's `--gds-only` measured `n=513 posix=0`, the first
+  per-process proof on record that its reads are peer-to-peer.
+
+On this driver, the option is the price of GDS.
+
+### `--gds-only`'s preflight passed in compat mode
+
+The preflight required `nvidia-fs`'s BAR1 map counter to move across a real read. It did move (ok 2
+→ 6, err 0), because *registering* a buffer maps BAR1. Meanwhile every read took the POSIX path.
+`--gds-only` exited 0, doing exactly the host-memory bounce it exists to refuse.
+
+It now also reads cuFile's own capability report, `cuFileDriverGetProperties`, which is what
+`gdscheck -p` prints. For a file on ext4 or xfs, if none of the block-storage transport bits is
+set, it refuses with exit 2. Any such bit counts as possible support (NVMe, NVMe-oF, SCSI, ScaleFlux,
+NVMesh, NVMe P2PDMA): filesystem type alone does not identify the transport, and an ext4 file on
+NVMe-oF with that bit set must not be turned away. The message names the flags,
+`gdscheck -p`, `RMForceStaticBar1` and `--direct-stage`. Measured in both states:
+- Option off: flags `0x2`, `gdscheck` says both lines "Unsupported"; gzstd refuses.
+- Option on: flags `0x802` (bit 11), `gdscheck` says "NVMe P2PDMA : Supported"; gzstd runs, `posix=0`.
+- Option on but `use_pci_p2pdma` off in the config: bit 11 clears and gzstd refuses. That's the
+  configuration cuFile's counter showed going through POSIX.
+
+The new negative gate is limited to ext4/xfs; other filesystems keep the existing checks.
+
+### cuFile statistics crashed every `--gds-only` run at exit (status 139)
+
+With `cufile_stats` at 1, 2 or 3, the run completed, printed its summary, wrote a valid archive, and
+then died of SIGSEGV. v0.17.7 had "fixed" this by closing the cuFile driver while CUDA was still up.
+Under `gdb` that close did run, returned 0, and left every buffer and file handle deregistered, and
+the crash still followed.
+
+It is the library's exit order, not gzstd's use of it:
+- cuFile writes its statistics **only** from its own ELF destructor. `cuFileDriverClose` writes
+  nothing, v1 or `_v2`, and there is no statistics API in 1.13.
+- A library `dlopen`ed after `main` started registers its C++ objects for destruction after the
+  loader registered its own final cleanup, so `exit()` destroys them first. The loader then runs
+  cuFile's destructor over the dead objects (the backtrace ends in an `ostream` write of "Read" with a
+  garbage length).
+- Preloaded at startup instead, the same run exits 0. Swapping `gdsio` onto conda's `libstdc++`
+  changed nothing, so it is not a C++ runtime mismatch.
+- `dlclose` cannot help, because the library is built NODELETE.
+
+So when `--gds-only` runs with statistics enabled in the active `cufile.json`, and `libcufile` was not
+already loaded at startup, gzstd re-executes itself once with it preloaded, before argument parsing
+can consume `--files-from` or `--exclude-from` (including stdin), and the child restores the caller's
+`LD_PRELOAD`. The startup check has to run before argument parsing, because parsing itself `dlopen`s
+cuFile to reject an impossible `--gds-only` early. The first version checked after it and never fired.
+gzstd also resolves `cuFileDriverClose_v2`, which `cufile.h` maps every call of `cuFileDriverClose` to.
+
+The capability check also applies to held ext4/xfs tar-member descriptors during `--gds-only --tar`
+creation. The run-wide preflight has no single input descriptor for a tar archive.
+
+**This makes cuFile's `posix=` counter usable with gzstd for the first time.** GDS.md now shows how.
+
+### Also
+
+- GDS.md and TUNING.md replace "probably most of the startup cost" with the measured numbers above,
+  and state the trade-off plainly: GDS peer-to-peer, or fast startup and no leak.
+- The long `--help` no longer says cuFile's routing counters are unavailable.
+
+### Verification
+
+Two new cells, both needing a host where `--gds-only` runs, on ext4/xfs:
+- A test hook (`GZSTD_DEBUG_GDS_DRIVER_FLAGS`) replaces the capability flags after the real call.
+  `0x2` must refuse with the NVMe wording and name `--direct-stage`; `0x802` and `0x10` must run.
+  The widened mask was also checked by hand: `0x20` runs.
+- A run with statistics at 3 and INFO logging must exit 0, show the preload re-exec, and log a read
+  counter with `posix=0`.
+
+Three mutants, all caught: the capability check removed; the re-exec disabled (exit 139); the
+startup check moved after argument parsing (exit 139). Baselines 523 → 525 default, 681 → 683
+extensive; no-GPU deltas 132 → 134 and 160 → 162; no-GDS delta 11 → 13. Both configurations build
+warning-free.
+
+**Review (Codex, GPT-6-Sol at max, one turn: SAFE TO COMMIT) found two defects in the first version,
+both fixed. The cells cover the tar-member gate and the stdin-consumption regression:**
+- **A data-loss path.** The re-exec ran after argument parsing, and parsing reads `--files-from` and
+  `--exclude-from` lists, including from stdin. With statistics on,
+  `--gds-only --tar --exclude-from - --rm DIR` read the exclusions in the parent. The re-executed
+  child then found stdin empty, saw no exclusions, and could archive and remove files the caller meant
+  to keep. The preload decision now comes first, from a scan of the raw argument list that skips
+  string option values and stops at `--`, and the untouched argument vector is what gets re-executed.
+- **`--gds-only --tar` skipped the capability check,** because a tar archive has no single input
+  descriptor at the run-wide preflight. Each held member descriptor is now checked before cuFile reads
+  it.
+
+Also from the review: a re-executed child whose preload did not load (for example, a secure-execution
+context can drop `LD_PRELOAD`) now refuses before touching any data, instead of running into the exit
+crash. I widened the accepted bits from the two NVMe ones to every block transport after the review
+flagged that an ext4 file on NVMe-oF could be refused while genuinely peer-to-peer.
+
+Mutants against the merged code, all caught: the capability check removed; the tar-member check
+removed; the re-exec disabled (exit 139); and **the re-exec moved back after argument parsing**, which
+fails the new `--files-from -` arm. The `--exclude-from - --rm` deletion shape is not directly tested.
+
+A closing review found that ignored zstd options such as `--filelist` also consume a following string
+value. The raw preload scan now skips them; otherwise `--filelist --gds-only` would re-exec despite no
+GDS request. The statistics cell checks that example.
+
+**Suites (default run), on a box another user's jobs were loading** (62–88 GiB used and 100% utilization
+on six of eight cards): `USE_NVCOMP=OFF` 391 passed, 0 failed, 110 skipped, exactly the 391 the no-GPU
+delta of 134 predicts. The GPU build: 522 passed, 2 failed, 1 skipped of 525. With static BAR1 on,
+every `--gds-only` cell ran against real peer-to-peer.
+
+- **"`--direct-stage` decompress never loads libcufile" was a real regression, now fixed.** The new
+  startup check called `dlopen(..., RTLD_NOLOAD)` on every run, and even that makes the loader search
+  the library path for the name (visible under `LD_DEBUG=libs`). It now probes only when the command
+  line asks for `--gds-only`, still before argument parsing. Re-verified by hand: `--direct-stage`
+  shows 0 `libcufile` lines, the `--gds-only` control 29, and both new GDS cells pass.
+- **"decompress GPU yields the tail (pipe)" is a pre-existing flake under contention.** Interleaved on
+  the loaded card, the committed v0.17.75 also missed the yield (1 of 3: one GPU batch, then the queue
+  drained before a second intake), and this version yielded 3 of 3. The cell counts "no second
+  intake" as a failure rather than "not exercised".
+- The skip is the trivial-park cell, never exercisable on this host.
+
+The fix above changed `gzstd.cpp` after the suites ran. It is GPU-build code (the CPU-only binary does
+not compile it), and the cell it fixes was re-checked by hand.
 
 
 ## v0.17.75 — a GPU subset is chosen at the first CUDA use, so a hybrid run no longer waits for NVML up front

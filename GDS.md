@@ -114,11 +114,19 @@ If the file is missing, create it with the single line `nvidia-fs`.
 
 cuFile's `use_pci_p2pdma` mode needs the NVIDIA driver option `RMForceStaticBar1=1`, which maps all
 of VRAM into BAR1. With it set, the 570.207 driver adds each GPU's whole BAR1 window to the kernel's
-peer-to-peer pool every time a process first opens that GPU, and never removes it. On an 8-GPU host
-this cost 4 MiB of kernel memory per GPU per process, 20.4 GiB after 18 days, and very probably
-most of the per-GPU CUDA startup time. That startup is paid by every GPU program on the machine, not
-only by GDS. Details, how to check, and the workaround are in TUNING.md, under "Host setup: GPU
-startup cost". Set it only if you need that mode.
+peer-to-peer pool every time a process first opens that GPU, and never removes it. Measured on an
+8-GPU host by rebooting with and without it:
+
+| | `RMForceStaticBar1=1` | without |
+|---|---|---|
+| CUDA startup, 8 GPUs | 6.34–6.41 s | 1.90–1.96 s |
+| kernel memory leaked per process | 4 MiB per GPU (20.4 GiB after 18 days) | none |
+| GDS reads (cuFile's `posix=` counter) | all peer-to-peer (`posix=0`) | all POSIX, in either cuFile mode |
+
+The startup cost is paid by every GPU program on the machine, not only by GDS. So on that driver it
+is a straight trade: GDS peer-to-peer, or fast CUDA startup and no leak. Set it only if you need
+`--gds-only`; `--direct-stage` needs none of this. TUNING.md, under "Host setup: GPU startup cost",
+covers checking a host and keeping a resident process as a workaround.
 
 ## Verifying it actually works
 
@@ -132,6 +140,35 @@ reach for is unreliable.**
 | throughput looks good | compat mode measured 4.917 vs 4.924 GiB/s — indistinguishable |
 | gzstd's aligned-transfer count | counts *eligibility*, not routing |
 | `properties.use_compat_mode` | echoes configuration, not behaviour |
+| the BAR1 map counter moved | buffer *registration* moves it; measured moving (ok 2 → 6) while every read took the POSIX path |
+
+**The one signal that settles it is cuFile's own per-process counter**, and since v0.17.76 it works
+with gzstd. Enable statistics in a copy of the config, point cuFile at it, and read the log:
+
+```bash
+sed -e 's/"cufile_stats"[[:space:]]*:[[:space:]]*[0-9]*/"cufile_stats": 3/' \
+    -e 's/"level"[[:space:]]*:[[:space:]]*"[A-Za-z]*"/"level": "INFO"/' /etc/cufile.json > ~/cufile-stats.json
+CUFILE_ENV_PATH_JSON=~/cufile-stats.json CUFILE_LOGFILE_PATH=~/cufile.log \
+    gzstd --gds-only BIGFILE -o BIGFILE.zst
+grep -o 'Read: .* n=[0-9]* posix=[0-9]*' ~/cufile.log
+```
+
+`posix=0` with `n` above zero means every read was peer-to-peer; `posix` equal to `n` means every read
+fell back to ordinary POSIX I/O. It is per process, so another GDS user on the machine cannot fake it.
+The stats dump is written only at log level INFO. (Before v0.17.76 this crashed gzstd at exit: cuFile
+writes these counters from its own library destructor, which faults when the library was loaded with
+`dlopen`, as gzstd loads it. gzstd now re-runs itself once with the library preloaded whenever the
+active config enables statistics; `-v` says so.)
+
+**gzstd also reads cuFile's capability report before work starts** (v0.17.76). This is what
+`/usr/libexec/gds/tools/gdscheck -p` prints as `NVMe P2PDMA` and `NVMe`. For a file on ext4 or xfs,
+if neither is `Supported`, `--gds-only` refuses with exit 2. This gate addresses the measured local
+NVMe case; the capability bits describe the driver, not the route of an individual file read.
+The same gate checks each held ext4/xfs source during `--gds-only --tar` creation.
+On an 8-GPU host with the 570 driver, `NVMe P2PDMA` read `Supported` only with the NVIDIA option
+`RMForceStaticBar1=1` set. Without it both lines read `Unsupported`, and cuFile's counter confirmed
+every read went through POSIX, including with `use_pci_p2pdma` switched off. See the P2PDMA section
+above for what that option costs.
 
 **The best available signal is the kernel module's own BAR1 map counter — but it is only half
 reliable, and it matters which half.** The counter is SYSTEM-WIDE:
@@ -142,10 +179,8 @@ reliable, and it matters which half.** The counter is SYSTEM-WIDE:
   counter, so movement is only attributable to you if nothing else was using GDS at the time.
 - **it could not be read → inconclusive.** Missing evidence does not establish compat-mode routing.
 
-There is no per-process alternative available: cuFile's own routing counters would settle it, but
-their teardown crashes when the library is `dlopen`'d, which is how gzstd must load it.
-`gzstd-gds-check.sh` handles this by sampling the counter while idle first and reporting an
-unattributable result rather than a false positive.
+`gzstd-gds-check.sh` samples the counter while idle first and reports an unattributable result
+rather than a false positive. For proof, use cuFile's counter above.
 
 Watch it across a real read:
 
@@ -156,10 +191,9 @@ grep Bar1-map /proc/driver/nvidia-fs/stats     # ok must have INCREASED
 ```
 
 `ok=0 err=N` means every map failed and nothing went peer-to-peer — that reading is definite. gzstd
-performs this same negative check itself before running and refuses when the counter does not move,
-so a `--gds-only` run that completes has at least cleared that bar. Treat it as strong evidence
-rather than proof, for the reason above, and use `gzstd-gds-check.sh` when you want the idle-sample
-caveat applied for you.
+performs this same negative check itself before running, plus the capability check above, and
+refuses when either fails. A `--gds-only` run that completes has cleared both, but only cuFile's
+`posix=` counter proves the routing.
 
 ## Tuning notes
 

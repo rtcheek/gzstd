@@ -215,9 +215,12 @@ Measured on that host:
 - **Kernel memory leaks with every GPU process.** Each process start grew each GPU's
   `/sys/bus/pci/devices/*/p2pmem/size` by 128 GiB, and the kernel's `VmallocUsed` by 4 MiB per GPU.
   None of it comes back until a reboot. After 18 days of uptime that was 5,234 additions and 20.4 GiB.
-- **Startup: probable, not yet proven.** Registering each GPU was one of the two slow driver calls
-  seen with `strace`. Removing the setting and rebooting would show how much of the per-GPU startup
-  cost it accounts for; that test has not been run yet.
+- **Startup: most of the per-GPU cost.** Rebooted without the setting, CUDA startup for 8 GPUs fell
+  from 6.34–6.41 s to 1.90–1.96 s (1, 2 and 4 GPUs: 0.53, 0.65 and 1.44 s, against 1.49, 2.11 and
+  3.57 s with it), and the leak disappeared.
+- **On this host, GPUDirect Storage needs it.** Without it, cuFile's own counter showed every read falling
+  back to POSIX I/O, whichever cuFile mode was configured. Since v0.17.76 `gzstd --gds-only` refuses
+  in that state instead of running in compat mode.
 - **HMM is not the cause.** Reloading `nvidia_uvm` with `uvm_disable_hmm=1` changed nothing (6.93 s
   against 6.91 s for 8 GPUs).
 
