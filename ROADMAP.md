@@ -522,9 +522,8 @@ check matches by path and does not apply excludes (safe direction, nothing is to
 not reproduced: `--stats-json b a b` truncating a later input, and `--tar --stats-json root/file root`
 overwriting an archived source after the archive is written. (3) An output symlink that points at the
 dictionary or the stats file is refused even where replacing the link would leave its target intact.
-Also: the decompress tail-yield pipe cell should answer "not exercised" when no GPU intake happened
-after producer-done (it fails under other tenants' GPU load; accepted as a known flake for the v0.17.77
-tag).
+(The decompress tail-yield pipe cell's "not exercised" answer, the other item from that review, is
+DONE in v0.17.78.)
 
 **OPEN, >=1.0 territory: `gzstd-turbo-daemon` (name chosen by rtcheek, 2026-09-25).** An opt-in resident
 service that keeps every GPU registered with `nvidia-uvm`, so no gzstd run (or other CUDA program) pays the

@@ -7501,13 +7501,19 @@ if has_gpu 2>/dev/null; then
     "$GZSTD" -d --hybrid -T1 -vv -f "$ty_zst" -o "$ty_out" >"$ty_log" 2>&1 || rc=$?
   ty_b=$(grep -a -c 'done batch=' "$ty_log")
   ty_l=$(grep -a -c 'decompress tail yield' "$ty_log")
+  ty_d=$(grep -a -c 'decompress tail check decided' "$ty_log")   # v0.17.78, see the pipe arm
   if [[ $rc -ne 0 ]]; then
     fail "decompress GPU yields the tail (file input)" "exit $rc"
   elif [[ $ty_b -gt 0 ]]; then
     fail "decompress GPU yields the tail (file input)" \
          "$ty_b GPU batch(es) against a pinned 10,000x faster CPU: the check never armed"
+  elif [[ $ty_l -eq 0 && $ty_d -gt 0 ]]; then
+    fail "decompress GPU yields the tail (file input)" \
+         "the armed check decided a GPU intake but never yielded against a pinned 10,000x faster CPU"
   elif [[ $ty_l -eq 0 ]]; then
-    skip "decompress GPU yields the tail (file input)" \
+    # skip_host: the HOST decides this (a GPU busy with other work comes online
+    # late), so it must not raise the drift note that means a test was removed.
+    skip_host "decompress GPU yields the tail (file input)" \
          "not exercised: the CPU finished before a GPU reached intake"
   elif files_match "$ty_src" "$ty_out"; then
     pass "decompress GPU yields the tail (file input)"
@@ -7525,13 +7531,22 @@ if has_gpu 2>/dev/null; then
     "$GZSTD" -d --hybrid -T1 -vv -c >"$ty_out" 2>"$ty_log" || rc=$?
   ty_on=$(grep -a -c 'device(s) online' "$ty_log")
   ty_l=$(grep -a -c 'decompress tail yield' "$ty_log")
+  # v0.17.78: the check says when it first DECIDES.  Under pinned rates any
+  # decision must be a decline, so "decided, no yield" is the defect, and "never
+  # decided" means no GPU intake reached the armed check -- on a shared host the
+  # GPU can come online only after the -T1 CPU has drained the queue.  That was
+  # reported as a failure about 1 run in 3; it tested nothing.
+  ty_d=$(grep -a -c 'decompress tail check decided' "$ty_log")
   if [[ $rc -ne 0 ]]; then
     fail "decompress GPU yields the tail (pipe: producer-done arms it)" "exit $rc"
   elif [[ $ty_on -eq 0 ]]; then
     skip "decompress GPU yields the tail (pipe: producer-done arms it)" "not exercised: no GPU came online"
+  elif [[ $ty_l -eq 0 && $ty_d -eq 0 ]]; then
+    skip_host "decompress GPU yields the tail (pipe: producer-done arms it)" \
+         "not exercised: no GPU intake reached the armed check (the CPU drained the queue first)"
   elif [[ $ty_l -eq 0 ]]; then
     fail "decompress GPU yields the tail (pipe: producer-done arms it)" \
-         "a GPU was online but never yielded: producer-done did not arm the check"
+         "the armed check decided a GPU intake but never yielded against a pinned 10,000x faster CPU"
   elif files_match "$ty_src" "$ty_out"; then
     pass "decompress GPU yields the tail (pipe: producer-done arms it)"
   else

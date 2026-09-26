@@ -1,12 +1,40 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.77  
+**Covers:** v0.9.50 → v0.17.78  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.78 — the decompress tail-yield cell says "not exercised" instead of failing
+
+The v0.17.77 pre-tag suites failed one cell about 1 run in 3 on a host whose GPUs other users' jobs
+were loading: the pipe arm of "decompress GPU yields the tail". It was accepted for the v0.17.77 tag
+as a known flake, on condition that it be made to tell a defect from an untested run.
+
+**What the cell could not see.** It pins a CPU 10,000x faster than the GPU, so a GPU intake the tail
+check decides must be declined, which prints the yield line. With no yield line it reported "a GPU
+was online but never yielded: producer-done did not arm the check". But a missing line has two causes:
+the check deciding wrongly (a defect), or no GPU intake ever reaching the check after it armed
+(nothing tested). On a loaded card the second is what happens: cuInit and bringup finish only after
+the `-T1` CPU has drained the queue. MEASURED: pinned to a card at 100% from another user's job, 6 of
+6 runs reached no decision; on an idle card, 6 of 6 decided and yielded.
+
+**The trace.** The first time the tail check decides (armed, both rates known), `-vv` now prints
+`[HYBRID] decompress tail check decided at a GPU intake: N frames queued + ~M unread -> take|decline`,
+once per run. Both arms of the cell use it: a decision with no yield fails, and no decision is a
+`skip_host` "not exercised" (a host condition, so it does not raise the suite's drift note).
+
+**Tests.** A mutant with the yield latch disabled fails both arms on an idle card, where before it
+only made the file arm skip. The real build passes both arms on an idle card and skips the pipe arm
+on a loaded one.
+
+Default suites: GPU build 531 passed, 0 failed, 1 skipped of 532; CPU-only 392 passed, 0 failed; both
+as expected for their hosts, no drift.
+
+The same-file-in-two-roles notes from the v0.17.77 review stay open in ROADMAP.md.
 
 ## v0.17.77 — GPUs older than the build supports are left alone, and a V100 can decompress
 

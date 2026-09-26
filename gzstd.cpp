@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.77";
+static constexpr const char * GZSTD_VERSION = "0.17.78";
 //
 // Architecture overview:
 //
@@ -14768,6 +14768,21 @@ public:
     const bool take = decomp
         ? (depth + unread) / c >= 1.3 * batch * streams / g
         : (depth - batch) / c >= 1.3 * batch * streams / g;
+    // THE CHECK WAS EXERCISED (v0.17.78): the first time it actually DECIDES --
+    // armed, with both rates -- say so, whichever way it went.  Without this a
+    // run with no yield line was ambiguous: the check deciding "take" when it
+    // should decline (a defect), or no GPU intake ever reaching it after it
+    // armed, e.g. cuInit finishing only after a -T1 CPU had drained the queue on
+    // a GPU busy with another tenant's jobs (nothing tested).  The suite's pipe
+    // cell failed on the second, about 1 run in 3 on a shared host.
+    if (decomp && opt_.verbosity >= V_DEBUG
+        && !tail_decided_logged_.exchange(true, std::memory_order_relaxed)) {
+      char t[176];
+      std::snprintf(t, sizeof(t),
+        "[HYBRID] decompress tail check decided at a GPU intake: %.0f frames queued + ~%.0f "
+        "unread -> %s\n", depth, unread, take ? "take" : "decline");
+      vlog(V_DEBUG, opt_, t);
+    }
     if (!take && under_queue_lock
         && !tail_yield_.exchange(true, std::memory_order_acq_rel)) {
       if (decomp && opt_.verbosity >= V_DEBUG) {
@@ -15034,6 +15049,7 @@ private:
   std::atomic<int> gpus_waiting_{0};
   std::atomic<bool> producer_done_{false};  // arms the tail-aware GPU intake check
   std::atomic<bool> tail_yield_{false};     // GPU declined the tail; floor released
+  std::atomic<bool> tail_decided_logged_{false};  // -vv: the check has decided once
   std::atomic<uint64_t> decomp_src_bytes_{0};  // archive size, for unread_frames_est_ (0 = unknown)
   bool rates_pinned_ = false;               // GZSTD_DEBUG_HYBRID_RATES; set before any thread starts
 
