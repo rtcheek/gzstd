@@ -1,12 +1,106 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.78  
+**Covers:** v0.9.50 → v0.17.79  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.79 — --stats-json is written on the GPU, and stops overwriting a later input or an archived source
+
+The rest of the "same file in two roles" list from the v0.17.77 pre-tag review. Both suspected losses
+reproduced. Working through them turned up a third collision, one that corrupts the archive at exit 0.
+
+**A later input.** The stats file is rewritten after every input, but each input was compared with the
+stats path only when that input was opened, which was too late for any input after the first.
+`--stats-json b a b` compressed a, wrote a's JSON over b, then refused b at exit 2. By then b's data was
+gone. The same happened with `-d` and `-t` on archives, and with a later `-` input whose stdin was
+redirected from the stats file. The stats path is now compared with every input before any is read.
+
+**An archived source.** `--tar --stats-json root/file root` exited 0 with root/file replaced by JSON (the
+archive held the original). A new check predicts, before the output is opened, whether the create walk
+will read the stats file. It matches a source that is the file under any name (by identity), or a
+directory source that the file lies under (by canonical path). Either way `--exclude` and
+`--one-file-system` must leave the file in the walk. The walk's own source path and exclude matcher are
+factored out and shared, so the prediction cannot drift from the walk. A hard link to the stats file from
+deeper in the tree is invisible to names. The layout catches it by identity before any member is read.
+That point is after the output is opened, so `-f` keeps the old archive but `--overwrite` has already
+removed it.
+
+**The dictionary under `--tar --rm`.** The same prediction replaces the v0.17.77 path-prefix check, which
+ignored `--exclude`. `--tar --rm -D root/dict --exclude=dict root` was refused. It now archives around the
+dictionary and exits 3, as any `--rm --exclude` does when the excluded file keeps its directory in place.
+
+**Output written through a dangling symlink (new defect).** `ln -s T link; gzstd -o link --stats-json T
+in` exited 0 with the JSON over the start of the archive (`gzstd -t T`: bad magic). Reproduced on
+v0.17.78. The output check compared the stats path with the output NAME, but a dangling link without
+`-f` sends the archive to the link's target.
+
+**Output symlinks were refused the other way round.** With `-f` or `--overwrite`, the archive is a new
+file at the output name, and a symlink there is replaced, not followed. MEASURED: the link's target is
+left intact under `-f` and `--overwrite`, with and without `--direct`. So v0.17.77's refusal of `-f -o
+link` for a link to the dictionary or the stats file was over-cautious. Now the output check first asks
+where the bytes land: a new file at the name, or into what the name resolves to. It compares names for
+the first and follows the link for the second. The dictionary check compares the entry being replaced. A
+hard link to the dictionary is still refused, conservatively.
+
+**/dev/null named twice.** The v0.17.77 guards refused `-c --stats-json /dev/null > /dev/null`, `-o
+/dev/null --stats-json /dev/null` and `--stats-json /dev/null - < /dev/null`. A character device keeps
+nothing, so it no longer counts as a collision. A pipe or regular file stays refused: `-c --stats-json
+/dev/stdout | ...` would put JSON inside the compressed stream.
+
+**`--stats-json` on a GPU compress: never written, since the flag existed.** On the GPU build, a
+compress through `compress_nvcomp()` exited 0 with no stats file. Affected: default `--tar` create,
+`--gpu-only`, and hybrid above the GPU size gate, even when the CPU compressed every frame. `main()`
+wrote the file only after a CPU-only pass, on the claim that "the nvCOMP path writes its own stats".
+That was never true: the per-device stats sink has been filled and never emitted since v0.9.21. The
+suite missed this because its only `--stats-json` cell passes `--cpu-only`.
+
+Now the pass publishes what it did (`g_compress_pass_stats`), and `main()` writes one file for the final
+pass on every route:
+- The top-level fields are unchanged.
+- `cpu.threads` is the pipeline's actual CPU pool, 0 under `--gpu-only`, not the CPU route's
+  hardware-derived count (which would say 255 there).
+- A `gpu` object is added when the nvCOMP pipeline ran. It lists each device's CUDA ordinal, UUID,
+  batches, frames, and input and output bytes. An empty list means the GPUs did no work, which is how a
+  reader tells a GPU run from a silent CPU fallback; `-v` cannot.
+- A pass that `compress_nvcomp()` handed to the CPU pipeline is reported as a CPU run, and so is a
+  `--verify` or fault rebuild.
+
+MEASURED on the 8-GPU host:
+- `--gpu-only` on two cards: per-device input summed to exactly the 400 MB input.
+- A fixed-share hybrid run: 7 + 8 GPU frames of 24, matching the `-vvv` per-stream totals.
+- Adaptive hybrid on 256 cores: `devices: []`, matching zero `done batch` lines.
+- The UUID matters: CUDA's default order is fastest-first, so `CUDA_VISIBLE_DEVICES=0,1` picked
+  nvidia-smi's GPUs 4 and 6.
+
+**Tests.** Five two-roles cells, all run by default:
+- a later input;
+- `--tar` sources, including `--overwrite` arms that only an up-front refusal passes, a `-C` arm and a
+  hard-link arm;
+- `/dev/null` versus a pipe and a regular stdout;
+- `--rm -D` with `--exclude`;
+- output symlinks.
+
+The v0.17.78 binary fails all five. Thirteen mutants each fail their own cells: 9 on the checks, 4 on the
+output logic.
+
+One GPU cell covers `--stats-json` on `--gpu-only` compress: per-device input must equal the input, and
+`--gpu-batch=2` spreads the frames over both streams. v0.17.78 fails it, and four mutants each fail it:
+- the old CPU-only gate;
+- no devices;
+- the first stream only;
+- the formula thread count.
+
+The two-roles `--tar` arms no longer need `--cpu-only`.
+
+Default suites:
+- GPU build: 537 passed, 0 failed, 1 skipped of 538. The skip is the trivial-skip cell, not exercised
+  on this host.
+- CPU-only: 397 passed, 0 failed. That measures the new no-GPU delta of 141. Untested: `--one-file-system` (needs a mount inside the tree). Its model is the file's
+`st_dev`, so a nested mount of the same filesystem is over-refused, which is the safe direction.
 
 ## v0.17.78 — the decompress tail-yield cell says "not exercised" instead of failing
 

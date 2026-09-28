@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.78";
+static constexpr const char * GZSTD_VERSION = "0.17.79";
 //
 // Architecture overview:
 //
@@ -13335,6 +13335,17 @@ static bool gz_is_decode_dependency(const struct stat & st)
   return g_dep_known && st.st_dev == g_dep_dev && st.st_ino == g_dep_ino;
 }
 
+// Whether a --stats-json path that ALSO names another file of this run can
+// destroy anything through it: a regular file is truncated, a pipe or socket
+// gets JSON inside the stream, a block device is overwritten.  A character
+// device (/dev/null, a terminal) keeps nothing, so `-o /dev/null --stats-json
+// /dev/null` and `-c --stats-json /dev/null > /dev/null` are not collisions --
+// the v0.17.77 guards refused both.
+static bool gz_stats_target_holds_data(const struct stat & st)
+{
+  return !S_ISCHR(st.st_mode);
+}
+
 static void load_dictionaries(const Options & opt)
 {
   const bool patch = !opt.patch_from.empty();
@@ -14407,6 +14418,22 @@ struct CpuAgg {
   double                       comp_ms  = 0.0;
   int                          threads  = 0;
   std::vector<CpuThreadStats>  per_thread;
+};
+
+// What one compress pass through compress_nvcomp() did, for --stats-json.
+// main() writes the file once it knows which pass was final; it used to write
+// it only when that pass was CPU-only, so every run through compress_nvcomp()
+// (default --tar create, --gpu-only, hybrid above the GPU size gate) exited 0
+// with no stats file at all -- from the first version of --stats-json on.
+struct GpuPassDevice {
+  int         device = 0;      // CUDA ordinal, as in the [GPUn] log lines
+  std::string uuid;            // survives CUDA_VISIBLE_DEVICES and subset masks
+  uint64_t    batches = 0, frames = 0, in_bytes = 0, out_bytes = 0;
+};
+struct CompressPassStats {
+  bool pipeline    = false;    // its own CPU/GPU pipeline ran (not a CPU hand-off)
+  int  cpu_threads = 0;        // that pipeline's CPU pool; 0 under --gpu-only
+  std::vector<GpuPassDevice> devices;   // each GPU worker that finished
 };
 
 #ifdef HAVE_NVCOMP
@@ -19935,6 +19962,85 @@ static size_t emit_header(const TarEntry & e, const TarLayout & lay, char * out)
   return off + TAR_BLK;
 }
 
+// The path the create walk reads source `si` from: trailing slashes dropped (a
+// lone "/" kept) and a RELATIVE source read from the -C in effect at its
+// position.  build_layout() walks from it and tar_create_reads() predicts that
+// walk, so both take it from here.
+static std::string tar_source_fspath(const Options & opt, size_t si) {
+  std::string src = opt.tar_sources[si];
+  while (src.size() > 1 && src.back() == '/') src.pop_back();
+  const std::string cdir =
+      si < opt.tar_source_dest.size() ? opt.tar_source_dest[si] : std::string(".");
+  if (!src.empty() && src[0] != '/' && cdir != ".") return cdir + "/" + src;
+  return src;
+}
+
+// True if the create walk skips `path`, spelled as the walk spells it (a
+// tar_source_fspath plus the components below it).  GNU tar's --exclude rules:
+// see LayoutBuilder::excluded.  Because of FNM_LEADING_DIR, a pattern that
+// drops a directory also matches every path under it, so asking about a file's
+// own path answers for its ancestors too.
+static bool tar_path_excluded(const Options & opt, const std::string & path) {
+  if (opt.tar_excludes.empty()) return false;
+  std::string name = path;
+  if (name.size() > 1 && name.back() == '/') name.pop_back();
+  for (const std::string & pat : opt.tar_excludes) {
+    std::string p = pat;
+    if (p.size() > 1 && p.back() == '/') p.pop_back();
+    for (size_t pos = 0; ; ) {
+      if (fnmatch(p.c_str(), name.c_str() + pos, FNM_LEADING_DIR) == 0) return true;
+      size_t slash = name.find('/', pos);
+      if (slash == std::string::npos) break;
+      pos = slash + 1;
+    }
+  }
+  return false;
+}
+
+// Will a --tar create read the regular file `path` names (its final symlinks
+// followed) as a member's data?  Answered before the walk, so a refusal comes before any
+// output exists (or --overwrite has removed the old one): a source that IS the
+// file under any name (identity), or a directory source it lies under (by
+// canonical path), and either way only if --exclude and --one-file-system
+// leave it in the walk.  `via` gets the source.  A hard link to the file from
+// deeper in a tree is invisible to names; only the walk's identities see it.
+static bool tar_create_reads(const Options & opt, const std::string & path,
+                             std::string & via) {
+  struct stat tst {};
+  if (::stat(path.c_str(), &tst) != 0 || !S_ISREG(tst.st_mode)) return false;
+  std::error_code ec;
+  const fs::path target = fs::weakly_canonical(path, ec);
+  if (ec) return false;
+  for (size_t si = 0; si < opt.tar_sources.size(); ++si) {
+    const std::string fspath = tar_source_fspath(opt, si);
+    struct stat sst {};
+    if (fspath.empty() || ::lstat(fspath.c_str(), &sst) != 0) continue;
+    // lstat: the walk records a symlink source as a link and never follows it.
+    std::string walk;
+    if (sst.st_dev == tst.st_dev && sst.st_ino == tst.st_ino) {
+      walk = fspath;
+    } else if (S_ISDIR(sst.st_mode)) {
+      if (opt.tar_one_file_system && tst.st_dev != sst.st_dev) continue;
+      std::error_code ec2;
+      const fs::path root = fs::weakly_canonical(fspath, ec2);
+      if (ec2) continue;
+      const auto mm = std::mismatch(root.begin(), root.end(), target.begin(), target.end());
+      if (mm.first != root.end()) continue;           // not under this source
+      walk = fspath;
+      for (auto it = mm.second; it != target.end(); ++it) {
+        if (walk.back() != '/') walk += '/';
+        walk += it->string();
+      }
+    } else {
+      continue;
+    }
+    if (tar_path_excluded(opt, walk)) continue;
+    via = fspath;
+    return true;
+  }
+  return false;
+}
+
 // ---- Phase 1: walk the source tree and lay out the virtual tar stream. ----
 struct LayoutBuilder {
   const Options & opt;
@@ -20014,22 +20120,7 @@ struct LayoutBuilder {
   // with a leading '/' can only match at the full path (its slash can't match a
   // mid-path suffix start), so `/tmp` is effectively anchored to the source root
   // and does NOT drop `var/tmp` — matching GNU tar.  Trailing '/' is ignored.
-  bool excluded(const std::string & path) const {
-    if (opt.tar_excludes.empty()) return false;
-    std::string name = path;
-    if (name.size() > 1 && name.back() == '/') name.pop_back();
-    for (const std::string & pat : opt.tar_excludes) {
-      std::string p = pat;
-      if (p.size() > 1 && p.back() == '/') p.pop_back();
-      for (size_t pos = 0; ; ) {
-        if (fnmatch(p.c_str(), name.c_str() + pos, FNM_LEADING_DIR) == 0) return true;
-        size_t slash = name.find('/', pos);
-        if (slash == std::string::npos) break;
-        pos = slash + 1;
-      }
-    }
-    return false;
-  }
+  bool excluded(const std::string & path) const { return tar_path_excluded(opt, path); }
 
   // A genuine failure (cannot stat/open/readlink, file changed mid-read): shown
   // by default and promoted to a non-zero exit, like GNU tar's errors.
@@ -20649,11 +20740,7 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
     // -C directory in effect at its position, but store the name as typed
     // (`-C /dir1 user-data` reads /dir1/user-data, stores "user-data").
     // An absolute source ignores -C, exactly like tar.
-    std::string fspath = src;
-    const std::string cdir =
-        si < opt.tar_source_dest.size() ? opt.tar_source_dest[si] : std::string(".");
-    if (!src.empty() && src[0] != '/' && cdir != ".")
-      fspath = cdir + "/" + src;
+    const std::string fspath = tar_source_fspath(opt, si);
     HeldDir source_parent;
     source_parent.acquire(fspath);
     struct stat source_parent_st;
@@ -20672,6 +20759,19 @@ static TarLayout build_layout(const Options & opt, Meter * m) {
   double stat_s = _secs(t_stat0, _clk::now());
   // Pass C: serial finalize (hardlinks, owners, offsets — byte-stable order).
   b.finalize_entries();
+  // --stats-json truncates its path once the archive is written.  main()
+  // refused the names that reach an archived file (tar_create_reads); a hard
+  // link from deeper in the tree is only visible here, as an identity.  Refused
+  // before a byte of the stream is read.  This is after the output was opened,
+  // so -f keeps the old archive but --overwrite has already removed it.
+  if (!opt.stats_json.empty()) {
+    struct stat sst {};
+    if (::stat(opt.stats_json.c_str(), &sst) == 0)
+      for (const TarEntry & e : b.lay.entries)
+        if (e.src_id_ok && e.src_dev == sst.st_dev && e.src_ino == sst.st_ino)
+          die_usage("--stats-json output is also an archived source: " + opt.stats_json
+                    + " (" + e.src + ")");
+  }
   double walk_s = _secs(t_enum0, _clk::now());
   double gather_s = 0.0;
   // Run the PAX recompute when any member will carry a pax block: --xattrs/--acls,
@@ -30190,8 +30290,14 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
   return result;
 }
 
+// The last compress_nvcomp() pass, published at its end for main()'s
+// --stats-json.  Reset on entry, so a pass that hands its input to
+// compress_cpu_mt() (the size gate, no usable GPU) leaves `pipeline` false.
+static CompressPassStats g_compress_pass_stats;
+
 static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  g_compress_pass_stats = CompressPassStats{};
   // Before ANY task is queued -- see the function's own note for why the order
   // is the point rather than a detail.
   gds_preflight_or_die(opt, in);
@@ -31465,6 +31571,30 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   log_throttle_stats(throttle, opt,
                      opt.hybrid ? "compress-hybrid" :
                      opt.gpu_only ? "compress-gpu" : "compress-nvcomp");
+
+  // --stats-json: what this pass did.  Every worker has joined, so the sink is
+  // complete; a worker that never finished exported nothing and is absent.
+  g_compress_pass_stats.pipeline = true;
+  g_compress_pass_stats.cpu_threads = cpuagg.threads;
+  if (json_sink && !opt.stats_json.empty()) {
+    std::lock_guard<std::mutex> lk(json_sink->m);
+    for (const std::vector<StreamStats> & streams : json_sink->per_dev) {
+      if (streams.empty()) continue;
+      GpuPassDevice d;
+      d.device = int(streams.front().dev_index);
+      // Once per device per run, and only for --stats-json (the properties
+      // query is ~1.5 ms a device and not cached).  A failed query must not
+      // leave an error for a later cudaGetLastError() to find.
+      cudaDeviceProp p {};
+      if (cudaGetDeviceProperties(&p, d.device) == cudaSuccess) d.uuid = gz_cuda_uuid_str(p);
+      else (void)cudaGetLastError();
+      for (const StreamStats & st : streams) {
+        d.batches += st.batches;  d.frames    += st.chunks;
+        d.in_bytes += st.in_bytes; d.out_bytes += st.out_bytes;
+      }
+      g_compress_pass_stats.devices.push_back(std::move(d));
+    }
+  }
 
   perf_mark(PerfCounters::HM_END);
   if (g_perf) {
@@ -36562,7 +36692,13 @@ gds_out_declined:
 #if __cplusplus >= 201703L
 [[maybe_unused]]
 #endif
-static void write_stats_json_cpu_only(const std::string & path, const Options & opt, const Meter & meter, double elapsed_sec, const CpuAgg & cpuagg)
+// `gpu`: the compress_nvcomp() pass that produced the output, or null when a
+// CPU path did (every decompress, and any compress that ended CPU-only).  Its
+// "gpu" object lists each device's share, which is how a reader tells GPU work
+// from a silent CPU fallback: a GPU pass with no devices did none.
+static void write_stats_json(const std::string & path, const Options & opt, const Meter & meter,
+                             double elapsed_sec, int cpu_threads,
+                             const CompressPassStats * gpu = nullptr)
 {
   std::ofstream js(path, std::ios::out | std::ios::binary | std::ios::trunc);
   if (!js) { return; }
@@ -36578,8 +36714,20 @@ static void write_stats_json_cpu_only(const std::string & path, const Options & 
      << "  \"elapsed_sec\": " << std::fixed << std::setprecision(6) << elapsed_sec << ",\n"
      << "  \"input_bytes\": " << in_bytes << ",\n"
      << "  \"output_bytes\": " << out_bytes << ",\n"
-     << "  \"cpu\": { \"threads\": " << cpuagg.threads << " }\n"
-     << "}\n";
+     << "  \"cpu\": { \"threads\": " << cpu_threads << " }";
+  if (gpu) {
+    js << ",\n  \"gpu\": { \"devices\": [";
+    for (size_t i = 0; i < gpu->devices.size(); ++i) {
+      const GpuPassDevice & d = gpu->devices[i];
+      js << (i ? "," : "") << "\n    { \"device\": " << d.device
+         << ", \"uuid\": \"" << d.uuid << "\""
+         << ", \"batches\": " << d.batches << ", \"frames\": " << d.frames
+         << ", \"input_bytes\": " << d.in_bytes
+         << ", \"output_bytes\": " << d.out_bytes << " }";
+    }
+    js << (gpu->devices.empty() ? "" : "\n  ") << "] }";
+  }
+  js << "\n}\n";
 }
 
 /*======================================================================
@@ -38620,49 +38768,63 @@ static int gzstd_main(int argc, char ** argv)
       die_usage("--stats-json would overwrite the " + g_dep_what
                 + " this run needs: " + g_dep_path);
   }
+  // --stats-json is rewritten after EVERY input, so naming a later input
+  // replaced that input with the previous file's JSON before it was read:
+  // `--stats-json b a b` compressed a, wrote its stats over b, and only then
+  // refused b (exit 2) -- whose data was already gone.  Compare against every
+  // input up front; the per-file check below remains for the one opened.
+  if (!opt.stats_json.empty() && !opt.tar_mode) {
+    struct stat stats_st {};
+    if (::stat(opt.stats_json.c_str(), &stats_st) == 0
+        && gz_stats_target_holds_data(stats_st))
+      for (const std::string & in : opt.inputs) {
+        struct stat input_st {};
+        const bool known = in == "-" ? ::fstat(STDIN_FILENO, &input_st) == 0
+                                     : ::stat(in.c_str(), &input_st) == 0;
+        if (known && input_st.st_dev == stats_st.st_dev
+            && input_st.st_ino == stats_st.st_ino)
+          die_usage("--stats-json output is also an input: " + opt.stats_json
+                    + (in == opt.stats_json ? "" : " (" + in + ")"));
+      }
+  }
+#ifndef _WIN32
+  // The same for --tar create, whose stats were written over an archived
+  // source at exit 0 (`--tar --stats-json root/file root`; the archive held the
+  // original, the tree held JSON).  A hard-link alias deeper in the tree is
+  // caught by the walk (build_layout).
+  if (!opt.stats_json.empty() && opt.tar_mode && opt.mode == Mode::COMPRESS) {
+    std::string via;
+    if (tarx::tar_create_reads(opt, opt.stats_json, via))
+      die_usage("--stats-json output is also an archived source: " + opt.stats_json
+                + " (inside " + via + ")");
+  }
+#endif
   // --rm MUST NOT DELETE WHAT THE OUTPUT NEEDS TO DECOMPRESS (see g_dep_known).
   // Refused before any work: a plain input that IS the file, or a --tar source
-  // tree that CONTAINS it (by path; a hard link elsewhere in the tree is caught
-  // again at removal time, by identity).
+  // the walk would reach it through -- honouring --exclude, which the old
+  // path-only test ignored and so refused an excluded dictionary.  A hard link
+  // elsewhere in the tree is caught again at removal time, by identity.
   if (g_dep_known && opt.mode == Mode::COMPRESS
       && ((opt.tar_mode && opt.tar_remove_sources) || (!opt.tar_mode && !opt.keep))) {
-    std::error_code ec;
-    const fs::path dep = fs::weakly_canonical(g_dep_path, ec);
-    // --tar create reads its sources from tar_sources, each under the -C in effect
-    // at its position (tar_source_dest, "." = none); a plain compress, from inputs.
-    std::vector<std::string> srcs;
+    std::string via;
+    bool hit = false;
     if (opt.tar_mode) {
-      for (size_t i = 0; i < opt.tar_sources.size(); ++i) {
-        const std::string & d = i < opt.tar_source_dest.size() ? opt.tar_source_dest[i] : ".";
-        const std::string & t = opt.tar_sources[i];
-        srcs.push_back(d == "." || (!t.empty() && t[0] == '/') ? t : d + "/" + t);
-      }
+#ifndef _WIN32
+      hit = tarx::tar_create_reads(opt, g_dep_path, via);
+#endif
     } else {
-      srcs = opt.inputs;
-    }
-    for (const std::string & in : srcs) {
-      if (in == "-" && !opt.tar_mode) continue;  // tar treats "-" as a source name
-      struct stat source_entry {};
-      const bool entry_known = ::lstat(in.c_str(), &source_entry) == 0;
-      // --rm removes the named entry.  For a symlink, that is the link, not
-      // its target; both plain --rm and the tar walker use this identity.
-      bool hit = entry_known && gz_is_decode_dependency(source_entry);
-      // Tar records a symlink source as a link and never walks its target.
-      // Only a directory entry can cause its descendants to be removed.
-      if (!hit && opt.tar_mode && !ec && entry_known
-          && S_ISDIR(source_entry.st_mode)) {
-        std::error_code ec2;
-        const fs::path root = fs::weakly_canonical(in, ec2);
-        if (!ec2) {
-          const auto mm = std::mismatch(root.begin(), root.end(), dep.begin(), dep.end());
-          hit = mm.first == root.end();     // dep is root, or lies under it
-        }
+      for (const std::string & in : opt.inputs) {
+        if (in == "-") continue;
+        // --rm removes the named entry: for a symlink, the link, not its target.
+        struct stat source_entry {};
+        if (::lstat(in.c_str(), &source_entry) == 0
+            && gz_is_decode_dependency(source_entry)) { hit = true; break; }
       }
-      if (hit)
-        die_usage("--rm would delete the " + g_dep_what + " the archive needs to "
-                  "decompress (" + g_dep_path + (opt.tar_mode ? ", inside " + in : "")
-                  + "); drop --rm, or keep the " + g_dep_what + " outside the inputs");
     }
+    if (hit)
+      die_usage("--rm would delete the " + g_dep_what + " the archive needs to "
+                "decompress (" + g_dep_path + (opt.tar_mode ? ", inside " + via : "")
+                + "); drop --rm, or keep the " + g_dep_what + " outside the inputs");
   }
 
 #if defined(HAVE_NVCOMP) && !defined(_WIN32)
@@ -38903,6 +39065,7 @@ static int gzstd_main(int argc, char ** argv)
   if (in && !opt.stats_json.empty()) {
     struct stat stats_st {}, input_st {};
     if (::stat(opt.stats_json.c_str(), &stats_st) == 0
+        && gz_stats_target_holds_data(stats_st)
         && ::fstat(fileno(in), &input_st) == 0
         && stats_st.st_dev == input_st.st_dev
         && stats_st.st_ino == input_st.st_ino)
@@ -38958,6 +39121,7 @@ static int gzstd_main(int argc, char ** argv)
       struct stat stats_st {};
       if (!opt.stats_json.empty()
           && ::stat(opt.stats_json.c_str(), &stats_st) == 0
+          && gz_stats_target_holds_data(stats_st)
           && stats_st.st_dev == stdout_st.st_dev
           && stats_st.st_ino == stdout_st.st_ino)
         die_usage("--stats-json output is also redirected stdout: " + opt.stats_json);
@@ -39034,47 +39198,79 @@ static int gzstd_main(int argc, char ** argv)
       die_io("cannot determine what the output " + opt.output
              + " refers to (" + std::strerror(errno) + ")");
     const bool tgt_is_reg = tgt_present && S_ISREG(out_tst.st_mode);
+    // Only a pre-existing REGULAR file is a clobber risk.  A special output
+    // target (/dev/null, a device node, a fifo) is a deliberate sink, not
+    // something we overwrite — never block on it and never register it for
+    // cleanup-unlink (we must not delete /dev/null on failure).
+    // From the single stat above, not three more resolutions of the name.  Note
+    // `out_is_reg` uses AT_SYMLINK_NOFOLLOW, so a symlink is no longer counted as
+    // "a regular file exists here" — it is a symlink, and the routes below treat
+    // it as one.
+    const bool exists = tgt_is_reg;            // was fs::is_regular_file (follows)
+    const bool replace_existing_name = exists
+        || (out_is_lnk && opt.force && (!opt.tar_mode || tgt_present));
+    // Where the archive's bytes land.  A NEW file at the output name when the
+    // name is absent or -f/--overwrite replaces it (a symlink there is replaced,
+    // not followed); otherwise INTO what the name resolves to -- the target a
+    // dangling symlink creates, or a device or fifo written in place.
+    const bool out_fresh_at_name = !out_present || (replace_existing_name && opt.force);
 
     // The stats writer runs before this output is closed and opens its own
     // path with truncation.  If both destinations name the same file, it can
     // replace a completed archive with JSON and still report success.  Compare
     // the final names through held parent descriptors so an absent output is
-    // covered too, then compare targets for existing hard-link aliases.
+    // covered too.  The two sides resolve differently: the stats writer follows
+    // every symlink, while the archive is either a new file AT the output name
+    // (a symlink there is replaced, so `-f -o link-to-stats` is no collision) or
+    // written THROUGH it -- `-o dangling-link --stats-json its-target` put the
+    // JSON over the archive at exit 0.  Only the written-through output can
+    // share an existing file with the stats path under another name.
     if (!opt.stats_json.empty()) {
-      // A stats symlink may point at an output that does not exist YET.  stat()
-      // then reports ENOENT, so follow final-component symlinks by name before
-      // comparing parent descriptors and basenames.  The stats writer follows
-      // the same chain when it opens the path.
-      fs::path stats_target = opt.stats_json;
-      for (int hop = 0; hop < 40; ++hop) {
-        std::error_code link_ec;
-        const fs::path link = fs::read_symlink(stats_target, link_ec);
-        if (link_ec) break;
-        stats_target = link.is_absolute() ? link : stats_target.parent_path() / link;
-      }
+      auto follow_by_name = [](fs::path p) {
+        for (int hop = 0; hop < 40; ++hop) {
+          std::error_code link_ec;
+          const fs::path link = fs::read_symlink(p, link_ec);
+          if (link_ec) break;
+          p = link.is_absolute() ? link : p.parent_path() / link;
+        }
+        return p;
+      };
+      // A stats symlink may point at an output that does not exist YET, so
+      // stat() cannot compare them: follow final-component symlinks by name.
       HeldDir stats_dir;
-      stats_dir.acquire(stats_target.string());
+      stats_dir.acquire(follow_by_name(opt.stats_json).string());
+      const bool through_link = !out_fresh_at_name && out_is_lnk;
+      HeldDir through_dir;
+      if (through_link) through_dir.acquire(follow_by_name(opt.output).string());
+      const int final_fd = through_link ? through_dir.fd : out_dir.fd;
+      const std::string & final_base = through_link ? through_dir.base : out_dir.base;
       struct stat stats_parent_st {}, output_parent_st {}, stats_target_st {};
-      const bool same_name = stats_dir.valid()
-          && stats_dir.base == out_dir.base
+      const bool same_name = stats_dir.valid() && final_fd >= 0
+          && stats_dir.base == final_base
           && ::fstat(stats_dir.fd, &stats_parent_st) == 0
-          && ::fstat(out_dir.fd, &output_parent_st) == 0
+          && ::fstat(final_fd, &output_parent_st) == 0
           && stats_parent_st.st_dev == output_parent_st.st_dev
           && stats_parent_st.st_ino == output_parent_st.st_ino;
-      const bool same_target = tgt_present
+      const bool same_target = !out_fresh_at_name && tgt_present
           && ::stat(opt.stats_json.c_str(), &stats_target_st) == 0
           && stats_target_st.st_dev == out_tst.st_dev
           && stats_target_st.st_ino == out_tst.st_ino;
-      if (same_name || same_target)
+      // Written in place, the shared file is the output's target, and a
+      // character device there (-o /dev/null) is harmless.
+      if ((same_name || same_target)
+          && (out_fresh_at_name || !tgt_present || gz_stats_target_holds_data(out_tst)))
         die_usage("--stats-json output is also the archive output: " + opt.stats_json);
     }
 
     // -f installs a temporary archive over this name; --overwrite removes it
     // before compression.  Either route would destroy a dictionary that the
     // new archive needs, even though the dictionary is not a compression input.
-    // Compare the resolved target so symlink and hard-link aliases are covered.
-    if (g_dict_compress && opt.force && tgt_present
-        && gz_is_decode_dependency(out_tst))
+    // Both replace the output NAME, so compare the entry itself: a hard link to
+    // the dictionary is refused (conservatively -- the dictionary's own name
+    // would survive), a symlink to it is not (the link is replaced, its target
+    // left alone; v0.17.77 compared the target and refused it).
+    if (g_dict_compress && opt.force && out_present
+        && gz_is_decode_dependency(out_lst))
       die_usage("dictionary and output are the same file: " + opt.output);
 
     // REFUSE TO WRITE THE OUTPUT OVER THE INPUT.  With --rm this was total data
@@ -39246,18 +39442,8 @@ static int gzstd_main(int argc, char ** argv)
       std::vector<int> & v;
       ~TarSrcFdGuard() { for (int f : v) ::close(f); v.clear(); }
     } tar_src_guard{tar_src_fds};
-    // Only a pre-existing REGULAR file is a clobber risk.  A special output
-    // target (/dev/null, a device node, a fifo) is a deliberate sink, not
-    // something we overwrite — never block on it and never register it for
-    // cleanup-unlink (we must not delete /dev/null on failure).
-    // From the single stat above, not three more resolutions of the name.  Note
-    // `out_is_reg` uses AT_SYMLINK_NOFOLLOW, so a symlink is no longer counted as
-    // "a regular file exists here" — it is a symlink, and the routes below treat
-    // it as one.
+    // (exists / replace_existing_name: computed with the output's stats, above.)
     const bool existed_before = out_present;   // final name, including dangling symlinks
-    const bool exists = tgt_is_reg;            // was fs::is_regular_file (follows)
-    const bool replace_existing_name = exists
-        || (out_is_lnk && opt.force && (!opt.tar_mode || tgt_present));
 #ifdef HAVE_NVCOMP
     // A dangling output symlink can cause open_output_verified() to create
     // its target.  The link existed before this run, so that target is not
@@ -39892,22 +40078,26 @@ static int gzstd_main(int argc, char ** argv)
       pass_opt.gpu_verify = false;
     }
 
-    // CPU-only stats: written when the final (successful) pass ran on the CPU —
-    // the original cpu-only path, any rebuild, or a no-NVCOMP build.  The nvCOMP
-    // path writes its own stats internally.
-#ifdef HAVE_NVCOMP
-    const bool final_pass_cpu = pass_opt.cpu_only;
-#else
-    const bool final_pass_cpu = true;
-#endif
-    if (final_pass_cpu && !opt.stats_json.empty()) {
-      CpuAgg agg{};
-      agg.threads = (opt.cpu_threads > 0)
+    // --stats-json describes the FINAL pass: a rebuild replaced the output and
+    // reset the meter.  A compress_nvcomp() pass that ran its own pipeline
+    // reports that pipeline's CPU pool and each GPU's share; one that handed its
+    // input to compress_cpu_mt() is a CPU run like any other.  (This used to be
+    // written only after a CPU-only pass, on the claim that "the nvCOMP path
+    // writes its own stats" -- it never did.)
+    if (!opt.stats_json.empty()) {
+      int threads = (opt.cpu_threads > 0)
                     ? opt.cpu_threads
                     : std::max(1, int(std::thread::hardware_concurrency()) - 1);
+      const CompressPassStats * gpu = nullptr;
+#ifdef HAVE_NVCOMP
+      if (!pass_opt.cpu_only && g_compress_pass_stats.pipeline) {
+        gpu = &g_compress_pass_stats;
+        threads = gpu->cpu_threads;
+      }
+#endif
       double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
           std::chrono::steady_clock::now() - t0).count();
-      write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, agg);
+      write_stats_json(opt.stats_json, opt, meter, elapsed, threads, gpu);
     }
   } else {
     // Decompression / test mode
@@ -39986,9 +40176,7 @@ static int gzstd_main(int argc, char ** argv)
     if (!opt.stats_json.empty()) {
       double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
           std::chrono::steady_clock::now() - t0).count();
-      CpuAgg dummy{};
-      dummy.threads = 1;
-      write_stats_json_cpu_only(opt.stats_json, opt, meter, elapsed, dummy);
+      write_stats_json(opt.stats_json, opt, meter, elapsed, 1);
     }
 
     // --keep-going: summarize the damage and choose the recovery exit code.  The

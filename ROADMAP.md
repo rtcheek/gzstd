@@ -515,15 +515,18 @@ present is not. Not on the 8-GPU server and not in the Lambda repository (checke
 2026-09-24); it comes from NVIDIA's CUDA repository. Query cost unmeasured; license unchecked. It holds no
 CUDA contexts, so it does nothing for cuInit or the static-BAR1 leak.
 
-**OPEN, next version (from the v0.17.77 pre-tag review): the rest of the "same file in two roles" list.**
-None loses data on an ordinary invocation; each needs one file named for two jobs. (1) `--tar --rm -D
-root/dict --exclude=dict root` is refused although `--exclude` keeps the dictionary out: the up-front
-check matches by path and does not apply excludes (safe direction, nothing is touched). (2) Suspected,
-not reproduced: `--stats-json b a b` truncating a later input, and `--tar --stats-json root/file root`
-overwriting an archived source after the archive is written. (3) An output symlink that points at the
-dictionary or the stats file is refused even where replacing the link would leave its target intact.
-(The decompress tail-yield pipe cell's "not exercised" answer, the other item from that review, is
-DONE in v0.17.78.)
+**DONE v0.17.79: the rest of the "same file in two roles" list** (see CHANGELOG). Both suspected losses
+were real: `--stats-json b a b` lost b at exit 2, and `--tar --stats-json root/file root` put JSON in an
+archived source at exit 0. The `--exclude`d dictionary is archived around, and output symlinks are no
+longer refused where `-f`/`--overwrite` replace them. A new corruption was found and fixed on the way:
+`-o dangling-link --stats-json its-target` exited 0 with JSON over the archive. Still conservative: a
+hard link to the dictionary as `-o` (the dictionary's own name would survive), and `--one-file-system`
+modelled by `st_dev` only.
+
+**DONE v0.17.79: `--stats-json` on a GPU compress.** It was never written on the nvCOMP compress path
+(exit 0, no file) from v0.9.21 on. It is now written on every route, with a `gpu.devices` list (ordinal,
+UUID, batches, frames, bytes) whenever the nvCOMP pipeline ran. Not covered: decompress still reports no
+per-device split (`decompress_nvcomp` has no sink); add one if the question comes up.
 
 **OPEN, >=1.0 territory: `gzstd-turbo-daemon` (name chosen by rtcheek, 2026-09-25).** An opt-in resident
 service that keeps every GPU registered with `nvidia-uvm`, so no gzstd run (or other CUDA program) pays the

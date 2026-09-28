@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=532
-$EXTENSIVE && EXPECTED_TESTS=690
+EXPECTED_TESTS=538
+$EXTENSIVE && EXPECTED_TESTS=696
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -766,8 +766,12 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # by the CPU-only run (391 = 531 - 140).  Plus one cell in the dictionary section
 # for the pre-tag review's file-loss fixes, run by both builds: 531 -> 532,
 # 689 -> 690, no-GPU deltas unchanged.
-EXPECTED_NOGPU_DELTA=140
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=168   # MEASURED 2026-09-21 (607 - 463) + 24 derived since
+# v0.17.79: five two-roles cells run by both builds (532 -> 537, 690 -> 695) and
+# one GPU cell for the GPU compress --stats-json (538, 696), so the no-GPU deltas
+# grow 140 -> 141 and 168 -> 169.  DERIVED; 141 then MEASURED by the CPU-only
+# run (397 = 538 - 141).
+EXPECTED_NOGPU_DELTA=141
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=169   # MEASURED 2026-09-21 (607 - 463) + 25 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -1200,6 +1204,45 @@ else
   skip "--stats-json" "file not created"
 fi
 rm -f "$json_file" "$TMPDIR/medium.txt.zst"
+
+# The GPU build's nvCOMP compress path wrote no --stats-json file at all until
+# v0.17.79, at exit 0 (the cell above passes --cpu-only, so it never saw that).
+# --gpu-only puts every frame on a GPU, so the devices' input must add up to the
+# whole input; --gpu-batch=2 spreads the frames over both streams, so a writer
+# that summed one stream per device cannot pass.  A CPU-only pass has no "gpu".
+# Parsed with grep/awk (the writer's layout is fixed); python3 only validates.
+if has_gpu 2>/dev/null; then
+  t0=$(now_ms); why=""
+  gsrc="$TMPDIR/stats-gpu.src"
+  head -c 12000000 /dev/urandom | base64 -w0 > "$gsrc"
+  rm -f "$json_file"
+  "$GZSTD" -q -f --gpu-only --chunk-size=1 --gpu-batch=2 --stats-json "$json_file" \
+    "$gsrc" -o "$gsrc.zst" 2>/dev/null; rc=$?
+  [[ $rc -eq 0 ]] || why+=" gpu-only:$rc"
+  if [[ -s "$json_file" ]]; then
+    gtotal=$(grep -o '^  "input_bytes": [0-9]*' "$json_file" | grep -o '[0-9]*$')
+    gsum=$(grep '"device":' "$json_file" | grep -o '"input_bytes": [0-9]*' | awk '{s += $2} END {print s + 0}')
+    (( $(grep -c '"device":' "$json_file") >= 1 )) || why+=" no-devices"
+    [[ -n "$gtotal" && "$gsum" == "$gtotal" ]] || why+=" device-input-$gsum-of-${gtotal:-?}"
+    grep -q '"uuid": "GPU-' "$json_file" || why+=" no-uuid"
+    grep -q '"cpu": { "threads": 0 }' "$json_file" || why+=" gpu-only-reports-cpu-threads"
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$json_file" 2>/dev/null || why+=" invalid-json"
+    fi
+  else
+    why+=" no-stats-file"
+  fi
+  rm -f "$json_file"
+  "$GZSTD" -q -f --cpu-only --stats-json "$json_file" "$gsrc" -o "$gsrc.zst" 2>/dev/null
+  [[ -s "$json_file" ]] || why+=" cpu-only-no-stats-file"
+  grep -q '"gpu"' "$json_file" 2>/dev/null && why+=" cpu-only-has-gpu"
+  rm -f "$json_file" "$gsrc" "$gsrc.zst"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--stats-json on a GPU compress: written, with each device's share" \
+    || fail "--stats-json on a GPU compress: written, with each device's share" "got$why"
+else
+  skip "--stats-json on a GPU compress: written, with each device's share" "no GPU"
+fi
 
 # ============================================================
 # 14. Exit codes
@@ -1748,6 +1791,176 @@ else
     skip "$c" "zstd or python3 not installed"
   done
 fi
+
+# --- The rest of the same-file-in-two-roles list (v0.17.79) ---
+# --stats-json is rewritten after EVERY input and after a --tar archive, so the
+# per-file check came too late for a LATER input (`--stats-json b a b` put a's
+# JSON in b, then refused b at exit 2) and never looked inside a --tar tree
+# (`--tar --stats-json root/file root` put JSON in an archived source at exit 0).
+# --tar --rm -D refused an --exclude'd dictionary, and the v0.17.77 guards
+# refused /dev/null named twice.  No zstd needed: any file is a raw dictionary.
+TR="$TMPDIR/tworoles"; rm -rf "$TR"
+mk_b64() { head -c "${2:-60000}" /dev/urandom | base64 > "$1"; }
+
+t0=$(now_ms); why=""
+mkdir -p "$TR/in"; mk_b64 "$TR/in/a"; mk_b64 "$TR/in/b"; cp "$TR/in/b" "$TR/b.orig"
+"$GZSTD" -q --stats-json "$TR/in/b" "$TR/in/a" "$TR/in/b" 2>/dev/null; rc=$?
+[[ $rc -eq 2 ]] || why+=" compress:$rc"
+cmp -s "$TR/in/b" "$TR/b.orig" || why+=" compress-replaced-a-later-input"
+[[ -e "$TR/in/a.zst" ]] && why+=" compress-ran-before-refusing"
+"$GZSTD" -q -f "$TR/in/a" "$TR/in/b" 2>/dev/null; cp "$TR/in/b.zst" "$TR/bz.orig"
+for m in -d -t; do
+  rm -f "$TR/in/a" "$TR/in/b"
+  "$GZSTD" -q $m --stats-json "$TR/in/b.zst" "$TR/in/a.zst" "$TR/in/b.zst" 2>/dev/null; rc=$?
+  [[ $rc -eq 2 ]] || why+=" $m:$rc"
+  cmp -s "$TR/in/b.zst" "$TR/bz.orig" || { why+=" $m-replaced-a-later-archive"; cp "$TR/bz.orig" "$TR/in/b.zst"; }
+  [[ -e "$TR/in/a" ]] && why+=" $m-ran-before-refusing"
+done
+mk_b64 "$TR/in/s"; cp "$TR/in/s" "$TR/s.orig"
+"$GZSTD" -q -f --stats-json "$TR/in/s" "$TR/in/a.zst" - < "$TR/in/s" >/dev/null 2>&1; rc=$?
+[[ $rc -eq 2 ]] || why+=" stdin:$rc"
+cmp -s "$TR/in/s" "$TR/s.orig" || why+=" stdin-source-replaced"
+"$GZSTD" -q -f --stats-json "$TR/st.json" "$TR/in/a.zst" "$TR/in/b.zst" 2>/dev/null; rc=$?
+[[ $rc -eq 0 && -s "$TR/st.json" ]] || why+=" separate-stats:$rc"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--stats-json naming a later input is refused before any input is read" \
+  || fail "--stats-json naming a later input is refused before any input is read" "got$why"
+
+# The up-front refusal must come BEFORE --overwrite removes the old archive: the
+# walk's identity backstop (a hard link deeper in the tree) runs after that.
+t0=$(now_ms); why=""
+mkdir -p "$TR/t/root/sub" "$TR/t/cd"; mk_b64 "$TR/t/root/file"; mk_b64 "$TR/t/root/sub/deep"
+cp "$TR/t/root/file" "$TR/file.orig"; cp "$TR/t/root/sub/deep" "$TR/deep.orig"
+ln -s root/file "$TR/t/slink"
+for arm in name symlink; do
+  st="$TR/t/root/file"; [[ $arm == symlink ]] && st="$TR/t/slink"
+  echo old > "$TR/t/a.tzst"
+  "$GZSTD" -q --overwrite --tar --stats-json "$st" -o "$TR/t/a.tzst" "$TR/t/root" 2>/dev/null; rc=$?
+  [[ $rc -eq 2 ]] || why+=" $arm:$rc"
+  cmp -s "$TR/t/root/file" "$TR/file.orig" || { why+=" $arm-replaced-the-source"; cp "$TR/file.orig" "$TR/t/root/file"; }
+  [[ "$(cat "$TR/t/a.tzst")" == old ]] || why+=" $arm-refused-after-overwrite"
+done
+# The source IS the stats file (by identity: the walk reads a file source's data).
+echo old > "$TR/t/a.tzst"
+"$GZSTD" -q --overwrite --tar --stats-json "$TR/t/root/file" -o "$TR/t/a.tzst" "$TR/t/root/file" 2>/dev/null; rc=$?
+[[ $rc -eq 2 ]] || why+=" file-source:$rc"
+cmp -s "$TR/t/root/file" "$TR/file.orig" || { why+=" file-source-replaced"; cp "$TR/file.orig" "$TR/t/root/file"; }
+[[ "$(cat "$TR/t/a.tzst")" == old ]] || why+=" file-source-refused-after-overwrite"
+mv "$TR/t/root" "$TR/t/cd/"; echo old > "$TR/t/a.tzst"
+"$GZSTD" -q --overwrite --tar -C "$TR/t/cd" --stats-json "$TR/t/cd/root/file" \
+  -o "$TR/t/a.tzst" root 2>/dev/null; rc=$?
+[[ $rc -eq 2 ]] || why+=" -C:$rc"
+cmp -s "$TR/t/cd/root/file" "$TR/file.orig" || why+=" -C-replaced-the-source"
+[[ "$(cat "$TR/t/a.tzst")" == old ]] || why+=" -C-refused-after-overwrite"
+mv "$TR/t/cd/root" "$TR/t/"; rm -f "$TR/t/a.tzst"
+ln "$TR/t/root/sub/deep" "$TR/t/hl"
+for be in default --cpu-only; do
+  bf=(); [[ $be == default ]] || bf=("$be")
+  echo old > "$TR/t/a.tzst"
+  "$GZSTD" -q "${bf[@]}" -f --tar --stats-json "$TR/t/hl" -o "$TR/t/a.tzst" "$TR/t/root" 2>/dev/null; rc=$?
+  [[ $rc -eq 2 ]] || why+=" hardlink-$be:$rc"
+  cmp -s "$TR/t/root/sub/deep" "$TR/deep.orig" || { why+=" hardlink-$be-replaced-the-source"; cp "$TR/deep.orig" "$TR/t/root/sub/deep"; }
+  [[ "$(cat "$TR/t/a.tzst")" == old ]] || why+=" hardlink-$be-lost-the-old-archive"
+done
+rm -f "$TR/t/hl" "$TR/t/a.tzst"
+# Allowed: an --exclude'd source, a stats file the walk has not seen, and an
+# in-tree symlink whose target lies outside the walk (tar stores the link).
+"$GZSTD" -q --tar --exclude=file --stats-json "$TR/t/root/file" \
+  -o "$TR/t/a.tzst" "$TR/t/root" 2>/dev/null; rc=$?
+[[ $rc -eq 0 ]] || why+=" excluded:$rc"
+grep -q '"mode"' "$TR/t/root/file" || why+=" excluded-no-stats"
+cp "$TR/file.orig" "$TR/t/root/file"; rm -f "$TR/t/a.tzst"
+"$GZSTD" -q --tar --stats-json "$TR/t/root/new.json" -o "$TR/t/a.tzst" "$TR/t/root" 2>/dev/null; rc=$?
+[[ $rc -eq 0 && -s "$TR/t/root/new.json" ]] || why+=" new-in-tree:$rc"
+rm -f "$TR/t/a.tzst" "$TR/t/root/new.json"
+mk_b64 "$TR/t/outside"; ln -s ../outside "$TR/t/root/olink"
+"$GZSTD" -q --tar --stats-json "$TR/t/outside" -o "$TR/t/a.tzst" "$TR/t/root" 2>/dev/null; rc=$?
+[[ $rc -eq 0 ]] || why+=" link-target-outside:$rc"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--tar --stats-json on an archived source: refused before --overwrite; hard link by the walk" \
+  || fail "--tar --stats-json on an archived source: refused before --overwrite; hard link by the walk" "got$why"
+
+# A character device keeps nothing, so /dev/null may be named twice; a pipe or a
+# regular file on stdout may not (JSON would land in, or replace, the archive).
+t0=$(now_ms); why=""
+"$GZSTD" -q -f --stats-json /dev/null - < /dev/null > "$TR/n.zst" 2>/dev/null || why+=" null-stdin:$?"
+"$GZSTD" -q -c --stats-json /dev/null "$TR/in/a.zst" > /dev/null 2>/dev/null || why+=" null-stdout:$?"
+"$GZSTD" -q -f -o /dev/null --stats-json /dev/null "$TR/in/a.zst" 2>/dev/null || why+=" null-output:$?"
+"$GZSTD" -q -c --stats-json /dev/stdout "$TR/in/a.zst" 2>/dev/null | cat > "$TR/piped"; rc=${PIPESTATUS[0]}
+[[ $rc -eq 2 && ! -s "$TR/piped" ]] || why+=" pipe:$rc"
+cp "$TR/in/a.zst" "$TR/reg"; cp "$TR/in/a.zst" "$TR/reg.orig"
+( exec 1<>"$TR/reg"; "$GZSTD" -q -c --stats-json "$TR/reg" "$TR/in/b.zst" 2>/dev/null ); rc=$?
+[[ $rc -eq 2 ]] || why+=" regular-stdout:$rc"
+cmp -s "$TR/reg" "$TR/reg.orig" || why+=" regular-stdout-replaced"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--stats-json /dev/null may also be stdin, stdout or -o; a pipe or file may not" \
+  || fail "--stats-json /dev/null may also be stdin, stdout or -o; a pipe or file may not" "got$why"
+
+t0=$(now_ms); why=""
+mkdir -p "$TR/r/root/sub"; head -c 5000 /dev/urandom > "$TR/dict.orig"
+mk_b64 "$TR/r/root/a"; cp "$TR/dict.orig" "$TR/r/root/dict"
+# Any --rm with an --exclude keeps the excluded file's directory, so exit 3.
+"$GZSTD" -q --tar --rm -D "$TR/r/root/dict" --exclude=dict -o "$TR/r/a.tzst" "$TR/r/root" 2>/dev/null; rc=$?
+[[ $rc -eq 3 && -s "$TR/r/a.tzst" ]] || why+=" excluded:$rc"
+cmp -s "$TR/r/root/dict" "$TR/dict.orig" || why+=" excluded-lost-the-dictionary"
+[[ -e "$TR/r/root/a" ]] && why+=" excluded-kept-the-sources"
+mk_b64 "$TR/r/root/a"; rm -f "$TR/r/a.tzst"
+"$GZSTD" -q --tar --rm -D "$TR/r/root/dict" -o "$TR/r/a.tzst" "$TR/r/root" 2>/dev/null; rc=$?
+[[ $rc -eq 2 && -e "$TR/r/root/a" && ! -e "$TR/r/a.tzst" ]] || why+=" in-tree:$rc"
+mkdir -p "$TR/r/root/sub"; mv "$TR/r/root/dict" "$TR/r/root/sub/dict"
+"$GZSTD" -q --tar --rm -D "$TR/r/root/sub/dict" --exclude=sub -o "$TR/r/a.tzst" "$TR/r/root" 2>/dev/null; rc=$?
+[[ $rc -eq 3 && -s "$TR/r/a.tzst" ]] || why+=" excluded-dir:$rc"
+cmp -s "$TR/r/root/sub/dict" "$TR/dict.orig" || why+=" excluded-dir-lost-the-dictionary"
+# A leading '/' anchors to the whole walked path, which this one is not.
+mk_b64 "$TR/r/root/a"; rm -f "$TR/r/a.tzst"
+"$GZSTD" -q --tar --rm -D "$TR/r/root/sub/dict" --exclude=/root/sub -o "$TR/r/a.tzst" "$TR/r/root" 2>/dev/null; rc=$?
+[[ $rc -eq 2 && -e "$TR/r/root/a" ]] || why+=" anchored-pattern-not-applied:$rc"
+# The dictionary as a file source is still refused up front (not kept at removal).
+cp "$TR/dict.orig" "$TR/r/d"
+"$GZSTD" -q --tar --rm -D "$TR/r/d" -o "$TR/r/d.tzst" "$TR/r/d" 2>/dev/null; rc=$?
+[[ $rc -eq 2 && ! -e "$TR/r/d.tzst" ]] || why+=" file-source:$rc"
+cmp -s "$TR/r/d" "$TR/dict.orig" || why+=" file-source-lost-the-dictionary"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "--tar --rm -D: an --exclude'd dictionary is archived around, not refused" \
+  || fail "--tar --rm -D: an --exclude'd dictionary is archived around, not refused" "got$why"
+
+# -f and --overwrite put a NEW file at the output name and replace a symlink
+# there rather than follow it, so a symlink to the dictionary or the stats file
+# is no collision (v0.17.77 refused both).  An output written THROUGH a dangling
+# symlink is: `-o dangling --stats-json its-target` put JSON over the archive at
+# exit 0.  A hard link to the dictionary stays refused (conservatively).
+t0=$(now_ms); why=""
+mkdir -p "$TR/o"; mk_b64 "$TR/o/f"; head -c 5000 /dev/urandom > "$TR/o/d.orig"
+for m in -f --overwrite; do
+  cp "$TR/o/d.orig" "$TR/o/d"; rm -f "$TR/o/link" "$TR/o/h" "$TR/o/s"; ln -s d "$TR/o/link"
+  "$GZSTD" -q -D "$TR/o/d" $m -o "$TR/o/link" "$TR/o/f" 2>/dev/null; rc=$?
+  [[ $rc -eq 0 && ! -L "$TR/o/link" ]] || why+=" $m-link-to-dict:$rc"
+  cmp -s "$TR/o/d" "$TR/o/d.orig" || why+=" $m-link-to-dict-wrote-through"
+  "$GZSTD" -q -t -D "$TR/o/d" "$TR/o/link" 2>/dev/null || why+=" $m-link-to-dict-bad-archive"
+  ln "$TR/o/d" "$TR/o/h"
+  "$GZSTD" -q -D "$TR/o/d" $m -o "$TR/o/h" "$TR/o/f" 2>/dev/null; rc=$?
+  [[ $rc -eq 2 ]] || why+=" $m-hardlink-to-dict:$rc"
+  cmp -s "$TR/o/d" "$TR/o/d.orig" || why+=" $m-hardlink-to-dict-replaced"
+  rm -f "$TR/o/link"; echo old > "$TR/o/s"; ln -s s "$TR/o/link"
+  "$GZSTD" -q $m --stats-json "$TR/o/s" -o "$TR/o/link" "$TR/o/f" 2>/dev/null; rc=$?
+  [[ $rc -eq 0 && ! -L "$TR/o/link" ]] || why+=" $m-link-to-stats:$rc"
+  "$GZSTD" -q -t "$TR/o/link" 2>/dev/null || why+=" $m-link-to-stats-bad-archive"
+  grep -q '"mode"' "$TR/o/s" || why+=" $m-link-to-stats-no-stats"
+  echo old > "$TR/o/x"
+  "$GZSTD" -q $m --stats-json "$TR/o/x" -o "$TR/o/x" "$TR/o/f" 2>/dev/null; rc=$?
+  [[ $rc -eq 2 ]] || why+=" $m-same-name:$rc"
+done
+rm -f "$TR/o/T" "$TR/o/dl"; ln -s T "$TR/o/dl"
+"$GZSTD" -q -o "$TR/o/dl" --stats-json "$TR/o/T" "$TR/o/f" 2>/dev/null; rc=$?
+[[ $rc -eq 2 ]] || why+=" dangling-onto-stats:$rc"
+[[ -e "$TR/o/T" ]] && why+=" dangling-onto-stats-wrote"
+"$GZSTD" -q -f -o "$TR/o/dl" --stats-json "$TR/o/T" "$TR/o/f" 2>/dev/null; rc=$?
+[[ $rc -eq 0 && ! -L "$TR/o/dl" ]] || why+=" dangling-replaced:$rc"
+"$GZSTD" -q -t "$TR/o/dl" 2>/dev/null || why+=" dangling-replaced-bad-archive"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "-o symlink to the dictionary or stats file is replaced; through a dangling one, refused" \
+  || fail "-o symlink to the dictionary or stats file is replaced; through a dangling one, refused" "got$why"
+rm -rf "$TR"
 
 # ============================================================
 # 17. Tar advanced
