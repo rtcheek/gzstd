@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=538
-$EXTENSIVE && EXPECTED_TESTS=696
+EXPECTED_TESTS=540
+$EXTENSIVE && EXPECTED_TESTS=698
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -770,8 +770,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # one GPU cell for the GPU compress --stats-json (538, 696), so the no-GPU deltas
 # grow 140 -> 141 and 168 -> 169.  DERIVED; 141 then MEASURED by the CPU-only
 # run (397 = 538 - 141).
-EXPECTED_NOGPU_DELTA=141
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=169   # MEASURED 2026-09-21 (607 - 463) + 25 derived since
+# v0.17.80: two GPU cells for the per-device batch tuner (538 -> 540, 696 ->
+# 698), so the no-GPU deltas grow 141 -> 143 and 169 -> 171.  DERIVED; 143 then
+# MEASURED by the CPU-only run (397 = 540 - 143).
+EXPECTED_NOGPU_DELTA=143
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=171   # MEASURED 2026-09-21 (607 - 463) + 27 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7045,6 +7048,104 @@ else
   skip "latched run output round-trips" "no GPU"
 fi
 rm -f "$TMPDIR/alat.zst" "$TMPDIR/alat.out" "$TMPDIR/alat1.err" "$TMPDIR/alat2.err"
+
+# ────────────────────────────────────────────────────────────
+section "GPU batch tuner: per device, measured, explores (v0.17.80)"
+
+# Until v0.17.79 one tuner served every device and labelled its samples with
+# its PROPOSAL: on one H100 it refined over [512..1024] while nothing above 256
+# ever ran, the profile kept 769, and the next run ALLOCATED 769.  These cells
+# drive the real tuner with a synthetic throughput curve
+# (GZSTD_DEBUG_TUNE_CURVE: a peak per device) and a decision per batch
+# (GZSTD_DEBUG_TUNE_FAST), so where it settles is deterministic.  Validity (did
+# the batch run full?), allocation and the profile are all real.
+#
+# 1. Decompress, one stream, peak 512, 1 MiB frames, ~1100 frames.  The tuner
+#    climbs 16..256, finds itself still improving at its 256 allocation, and
+#    EXPLORES 512 (buffers grow lazily); still improving, it tries 1024, which the
+#    input's tail cannot fill.  The profile must keep what was MEASURED: batch 512,
+#    max 512 -- never 1024.  A second run starts there and, because it settled at
+#    the top of what it measured, allocates the next size up (1024).
+#    --throttle-frames/--throttle-factor fix the bounds that decide how far it may
+#    explore (throttle permits per stream; queue depth), so the cell does not
+#    depend on this host's RAM or core count.
+if has_gpu 2>/dev/null; then
+  TUN="$TMPDIR/tune"; rm -rf "$TUN"; mkdir -p "$TUN"
+  head -c $((825 * 1024 * 1024)) /dev/urandom | base64 -w0 | head -c $((1100 * 1024 * 1024)) > "$TUN/src"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$TUN/src" -o "$TUN/a.zst" 2>/dev/null
+  rm -f "$TUN/src"
+  # GZSTD_DEBUG_TUNE_EXPLORE_FRACTION lifts the cost gate (one exploratory window
+  # may read at most a tenth of the input left), which this small input could
+  # never pass; the gate arm below runs it as shipped and expects a refusal.
+  tune_run() {   # tune_run LOG [extra args]
+    local log=$1; shift
+    env XDG_CACHE_HOME="$TUN/xdg" $AQ GZSTD_DEBUG_TUNE_CURVE=512 GZSTD_DEBUG_TUNE_FAST=1 \
+      GZSTD_DEBUG_TUNE_EXPLORE_FRACTION=${TUNE_FRACTION:-100} \
+      "$GZSTD" --adapt -v --no-progress -f -d --gpu-only --gpu-streams=1 \
+      --throttle-frames=2048 --throttle-factor=8 "$@" "$TUN/a.zst" -o /dev/null 2>"$log"
+  }
+  t0=$(now_ms); why=""
+  tune_run "$TUN/r1.err"; rc=$?
+  [[ $rc -eq 0 ]] || why+=" run1:$rc"
+  grep -q 'exploring 512' "$TUN/r1.err" || why+=" no-exploration-past-256"
+  # The profile is pretty-printed: strip whitespace, then read the f1 record.
+  rec=$(tr -d ' \n' < "$TUN/xdg/gzstd/profile.json" 2>/dev/null | grep -o '"f1":{[^}]*}' | head -1)
+  rb=$(sed -n 's/.*"batch":\([0-9]*\).*/\1/p' <<<"$rec"); rm_=$(sed -n 's/.*"max":\([0-9]*\).*/\1/p' <<<"$rec")
+  [[ "$rb" == 512 ]] || why+=" profile-batch-${rb:-none}"
+  [[ "$rm_" == 512 ]] || why+=" profile-max-${rm_:-none}"
+  tune_run "$TUN/r2.err"; rc=$?
+  [[ $rc -eq 0 ]] || why+=" run2:$rc"
+  grep -q "starts at the profile's 512 for f1 frames (measured up to 512; allocating 1024" "$TUN/r2.err" \
+    || why+=" run2-not-seeded"
+  # The gate as shipped: a window at 512 would read most of what is left of
+  # this input, so the tuner must settle at its 256 allocation, not explore.
+  rm -rf "$TUN/xdg"
+  TUNE_FRACTION=0.1 tune_run "$TUN/r3.err"; rc=$?
+  [[ $rc -eq 0 ]] || why+=" gate:$rc"
+  grep -q 'would read ~[0-9]* MiB of ~[0-9]* MiB left; not exploring' "$TUN/r3.err" \
+    || why+=" gate-did-not-refuse"
+  grep -q 'exploring 512' "$TUN/r3.err" && why+=" gate-explored-anyway"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "tuner explores past its allocation; the profile keeps only what ran" \
+    || fail "tuner explores past its allocation; the profile keeps only what ran" "got$why"
+
+  # 2. Two devices, two peaks: each settles on its own.  (One tuner for every
+  #    device settled both on one answer.)  Compress, 1 MiB chunks, peaks 16 and
+  #    64 -- both below the 256 allocation, so neither needs to explore.
+  tune_cards=()
+  if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
+    if [[ "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+      mapfile -t tune_cards < <(gpu_uuids_by_free 4096 "$GPU_ALL_DEVICES")
+    else
+      IFS=, read -r -a tune_cards <<< "$GPU_ALL_DEVICES"
+    fi
+  fi
+  if (( ${#tune_cards[@]} >= 2 )); then
+    t0=$(now_ms); why=""
+    head -c $((768 * 1024 * 1024)) /dev/urandom | base64 -w0 | head -c $((1024 * 1024 * 1024)) > "$TUN/csrc"
+    env CUDA_VISIBLE_DEVICES="${tune_cards[0]},${tune_cards[1]}" GZSTD_DEBUG_TUNE_CURVE=0:16,1:64 \
+      GZSTD_DEBUG_TUNE_FAST=1 "$GZSTD" -v --no-progress -f --gpu-only --gpu-devices=2 \
+      --chunk-size=1 "$TUN/csrc" -o "$TUN/c.zst" 2>"$TUN/c.err"; rc=$?
+    [[ $rc -eq 0 ]] || why+=" rc:$rc"
+    grep -q 'GPU0 f1: settled 16,' "$TUN/c.err" || why+=" gpu0-not-16($(grep -o 'GPU0 f1: settled [0-9]*' "$TUN/c.err"))"
+    grep -q 'GPU1 f1: settled 64,' "$TUN/c.err" || why+=" gpu1-not-64($(grep -o 'GPU1 f1: settled [0-9]*' "$TUN/c.err"))"
+    # Two streams keep a batch in flight at most decisions: a batch popped for an
+    # older proposal must be left out, not counted as evidence for the new one.
+    stale=$(grep -o '[0-9]* stale batches left out' "$TUN/c.err" | awk '{s += $1} END {print s + 0}')
+    (( stale > 0 )) || why+=" no-stale-batch-left-out"
+    "$GZSTD" -q -t "$TUN/c.zst" 2>/dev/null || why+=" archive-invalid"
+    rm -f "$TUN/csrc" "$TUN/c.zst"
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+    [[ -z "$why" ]] && pass "each GPU tunes its own batch (two devices, two peaks)" \
+      || fail "each GPU tunes its own batch (two devices, two peaks)" "got$why"
+  else
+    skip_host "each GPU tunes its own batch (two devices, two peaks)" "needs two GPUs"
+  fi
+  rm -rf "$TUN"
+else
+  skip "tuner explores past its allocation; the profile keeps only what ran" "no GPU"
+  skip "each GPU tunes its own batch (two devices, two peaks)" "no GPU"
+fi
 
 # ────────────────────────────────────────────────────────────
 section "--adapt ranked-engine overflow dispatch"

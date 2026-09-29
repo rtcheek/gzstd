@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.79  
+**Covers:** v0.9.50 → v0.17.80  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,7 +8,140 @@
 ---
 
 
-## v0.17.79 — --stats-json is written on the GPU, and stops overwriting a later input or an archived source
+## v0.17.80 — each GPU tunes its own batch, measures only what ran, and explores past 256
+
+**What was wrong (measured, one H100, v0.17.79).** One batch tuner served every device of a run.
+It labelled each throughput sample with its own PROPOSAL, while intake clamps a proposal to the
+device's allocation.
+- Decompress never set its ceiling, which stayed at 1024. With 256 allocated, the tuner refined over
+  [512..1024] while nothing above 256 ever executed.
+- The `--adapt` profile then saved the proposal: 769. The next run ALLOCATED 769 per stream on the
+  strength of it and saved 577.
+- Compress took its ceiling as the minimum across GPUs of a free-VRAM estimate, not what was
+  allocated, and saved 269 the same way.
+
+The fix removes that shared answer, which was also wrong on its own terms. This host mixes H100 PCIe
+and NVL cards, and the best batch moves with frame size as much as with the card. Pinned sweeps, 48
+GiB entropy-coded corpora, one H100 PCIe:
+- Decompress 1 MiB frames: best at 512-1024 (8.0-8.7 s), 256 gives 9.1-9.8.
+- Decompress 16 MiB frames: best at 128 (9.1 s); 512 is 22% slower.
+- Compress 1 MiB chunks: best at 512 (15.0-15.3 s).
+- Compress 16 MiB chunks: best at 32 (16.2-16.4 s); 512 is 24% slower.
+
+**Now** (the STATE TABLE above DeviceTune in gzstd.cpp is the specification):
+- **One tuner per device.** Run-wide signals stay shared: `--gpu-batch`, a path pin, and the sink
+  and source latches. The two copies of the tuner, one per direction, are one function now.
+- **It measures only what ran.** A window counts when three quarters of its batches ran at the full
+  proposal. A window the queue could not fill is SUPPLY-LIMITED: it never moves `best` and never
+  reaches the profile. Batches popped under an older proposal are left out, and counted in the -v
+  summary.
+- **The rate is the device's wall rate**, bytes over [earliest pop, latest completion]. The old
+  metric summed each batch's own duration, which counts overlapping streams twice. On a correct
+  start at 1024 it halved its way down to 384 and cost 1.6 s of a 10 s run.
+- **The ceiling is the device's allocation.** It follows the VRAM back-off and the regrow.
+- **Decompress explores past its allocation** when still improving at it. Its buffers grow lazily,
+  so the next pop allocates. A failed allocation ends exploration for the run and stops the regrow
+  from climbing back into it. No pop may exceed what the frame throttle can always grant
+  (permits / streams): FrameThrottle::acquire holds permits while it waits, so a larger pop would
+  wait forever.
+- **Compress explores across runs.** The profile's rule: a device that settled at the top of what it
+  measured allocates twice that next time; otherwise it allocates enough to re-check. MEASURED at 1
+  MiB chunks: run 2 allocated 512 and settled there; run 3 measured 1024 and kept 512, the pinned
+  sweep's best.
+- **Profile schema 3.** Old profiles are discarded; their batches were proposals.
+  - A `gpu_batch` object per direction, keyed by device UUID, geometry (plain, gds, dstage) and
+    frame-size class, holds the settled batch and the largest batch measured.
+  - A prior starts the device SETTLED there, with its usual probes, instead of re-running the
+    halving walk.
+  - A driver change drops the batch priors.
+  - The prior no longer rewrites `--gpu-batch`'s default, which had sized every device's allocation
+    from one number.
+- **The hybrid scheduler** takes each device's own batch for its decisions. The queue floor and the
+  pool's appetite sum streams x batch over the devices.
+
+**Exploration must be cheap next to what is left.** Decompress explores only when one window at the
+larger size (four batches at this window's input bytes per frame) would read at most a tenth of the
+input still unread. An unknown size, such as a pipe, never explores. MEASURED without it: 16 MiB frames
+explored 512, 8 GiB a batch and 22% slower there. The window consumed most of the run, and the 48 GiB
+decompress went from 10.4 s to 12.6 s. With the gate that window refuses (~24 GiB of ~8 GiB left),
+while 1 MiB frames still explore to 1024.
+
+**Measured end to end.** 48 GiB entropy-coded corpora, one idle H100 PCIe, old and new interleaved,
+three runs each. The rows marked "later" come from the same measurement on the same card, taken
+before the cost gate went in, which does not affect compress.
+
+| workload | default: old | default: new | `--adapt` run 3: old | `--adapt` run 3: new |
+|---|---|---|---|---|
+| decompress, 1 MiB frames | 9.64-9.65 s | **8.57-8.63 s** | 9.56 s | **8.02 s** |
+| decompress, 16 MiB frames | 10.42-10.49 s | 10.43-10.45 s | 9.24 s | **8.82 s** |
+| compress, 16 MiB chunks (later) | 16.86-17.82 s | **16.05-16.42 s** | 17.56 s | **15.54 s** |
+| compress, 1 MiB chunks (later) | 15.94-16.14 s | **15.66-15.95 s** | 14.46 s | **13.81 s** |
+
+- The old tuner's `--adapt` runs seeded from proposals: 216 on 1 MiB frames, and 112 then 269 on
+  compress, sizes nothing had run.
+- The new tuner seeds from what ran, and on 1 MiB compress it reaches 368-512 by run 3, the pinned
+  sweep's best.
+- A second model (H100 NVL) showed the same 1 MiB decompress gain (9.16-9.24 s against 10.18-10.44)
+  before another user's jobs took it.
+
+**Tests.** Two GPU cells drive the real tuner with a synthetic curve (GZSTD_DEBUG_TUNE_CURVE, a peak
+per device) and a decision per batch (GZSTD_DEBUG_TUNE_FAST):
+- Explore past 256. Leave out the tail that cannot run full. Keep batch 512 and max 512 in the
+  profile, never 1024. Seed the next run at 512 with an allocation of 1024.
+- Two devices with two peaks, each settling on its own, with stale batches left out.
+
+A third arm runs the cost gate as shipped and expects it to refuse. The v0.17.79 binary fails both
+cells. These mutants fail them:
+- no validity test;
+- no exploration;
+- max taken from proposals;
+- priors ignored;
+- the wrong allocation rule;
+- one tuner shared by every device;
+- no cost gate.
+
+A seventh mutant keeps stale batches. It survived the first design of the cells, because a synthetic
+rate cannot tell them apart. So the -v summary now counts stale batches left out, the two-device cell
+asserts the count is above zero, and the mutant fails. The wall-rate metric cannot be told apart under
+a synthetic curve; it rests on the measurements above.
+
+**Review (Codex, GPT-6-Sol; six rounds in one session, the first three at max effort).** No CRITICAL
+findings. The fixes below were adopted:
+- **Round 1: the compress window could tear (HIGH).** The drain thread recorded a batch between the
+  tick's separate resets. The window fields are now recorded and reset under `tune_mtx`. Every pop
+  carries a proposal epoch, so an in-flight batch cannot enter a later window even when the proposal
+  returns to the same number.
+- **Round 1: an allocation above the per-stream throttle share (HIGH).** Deferred bringup sizes the
+  throttle before the device count is final. Each device's initial allocation is now capped at
+  permits / (devices x streams), with a warning if that trims an explicit `--gpu-batch`.
+- **Round 1: the latch ordering (MEDIUM).** The latch could publish before its reason. The reason is
+  now the latch (one CAS), and a sink clamp applies only when sink won.
+- **Round 1: the loader and multi-file runs (MEDIUM).** The profile loader now requires two integral
+  counts with 1 <= batch <= max <= 1024. A multi-file command keeps every (device, frame class)
+  verdict, not just the last file's.
+- **Round 1, declined: a run-wide tick mutex** that would lock on every worker iteration. The CAS latch
+  already covers it: what is left is one more decision on a valid window. Codex conceded in round 2.
+- **Round 2: the throttle size read (MEDIUM).** Bringup read the throttle's size without the lock
+  that the `--adapt` writer uses to grow it.
+- **Round 2: in-flight memory past RAM.** Codex also refuted my first argument, that priors of absent
+  devices were harmless because the throttle is RAM-capped. The GPU floor overrides that cap, and a
+  1024-slot prior at 16 MiB frames on eight GPUs is ~132 GiB in flight. A prior may now raise the
+  floor only to what the throttle's own RAM cap affords per GPU stream.
+- **Round 3: `--memlimit` (MEDIUM).** That RAM cap ignored `--memlimit`, which the throttle honours.
+- **Round 4: none. SAFE TO COMMIT.**
+- **Round 5, on the cost gate (added after the clean measurement): two MEDIUM.**
+  - A valid window may hold one short batch, so bytes per frame now comes from full batches only. The
+    probe is charged a whole stream sweep, and an exploratory window is decided as soon as its batches
+    finish.
+  - Skippable frames count in the input size but never in decode progress, so the readers now count
+    them separately and the gate subtracts them.
+- **Round 6: none. SAFE TO COMMIT.**
+
+Default suites:
+- GPU build: 539 passed, 0 failed, 1 skipped of 540. The skip is the trivial-skip cell, not exercised
+  on this host.
+- CPU-only: 397 passed, 0 failed. That measures the new no-GPU delta of 143.
+
 
 The rest of the "same file in two roles" list from the v0.17.77 pre-tag review. Both suspected losses
 reproduced. Working through them turned up a third collision, one that corrupts the archive at exit 0.

@@ -818,7 +818,10 @@ as views into the block (CHANGELOG v0.17.47): `--cpu-only` 14.66 to 40.08 GiB/s 
 - **Memory.** Views raise 8-GPU peak RSS by about 16 GiB (51–58 against 34–41 GiB). The cap bounds them at an
   eighth of available RAM, but no small-RAM host has exercised it yet.
 
-## OPEN: the decompress tuner's shared VRAM ceiling never matches what a device runs
+## FIXED v0.17.80: the decompress tuner's shared VRAM ceiling never matched what a device ran
+
+Replaced by per-device tuners that measure only what ran (see CHANGELOG v0.17.80). The original
+report follows.
 
 Found by an independent round on v0.17.68, pre-existing and NOT introduced by it. Decompress leaves
 `SharedTuneState::vram_ceiling` at its default 1024 while real intake clamps locally,
