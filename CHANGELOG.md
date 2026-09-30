@@ -1,12 +1,94 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.80  
+**Covers:** v0.9.50 → v0.17.81  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.81 — the batch tuner ignores a size's first batch, and starts by frame size
+
+v0.17.80 left 16 MiB decompress about 13% behind the best pinned batch without `--adapt`. A trace
+(`-vv`, 48 GiB, one H100 PCIe) found three causes; this version fixes all three.
+
+**1. The first batch at a new size pays for new buffers.** A batch larger than any before it grows
+the device's buffers, and that one batch is slow.
+- MEASURED: the first 64-frame batch's D2H took 606 ms against ~108 ms steady, and the first
+  128-frame one 637 ms against ~161.
+- Kept in a four-batch window, it rated 64 at 2.7 GiB/s instead of 6.3. The tuner walked DOWN to 32
+  and 16, then refined 128 toward 112.
+- v0.17.79's tuner had the same bias. A revisit of an already-grown size shows no outlier.
+
+Now, after the proposal CHANGES, the device's first batch per stream is left out as warm-up, and
+the -v summary counts it. The exploration cost gate charges those batches too.
+
+**2. Windows were four batches even when each batch was huge.** At 256 x 16 MiB, one decision read
+20 GiB, and the device reached its final size with 4 GiB of 48 left. A window now closes at two kept
+batches once they span the tuner's 0.3 s minimum. Short batches still need four.
+
+**3. The start ignored frame size.** Decompress started at 16, 64 or 256 by input size, and compress at
+8. So 16 MiB frames began at a size 15% slower than the best and first tried one 50% slower, and 1 MiB
+compress climbed from 8.
+- The start is now BYTES per batch: ~2 GiB for decompress, ~512 MiB for compress (the plateaus of the
+  pinned sweeps below). The target is at most a sixteenth of known input, subject to
+  the eight-frame floor on tiny inputs. The start is a power of two in 8..256.
+- It applies only with known input size, no prior, no `--gpu-batch`, and no staged path.
+  An unknown-size input uses the direction's automatic default (8 compress, 16 decompress),
+  including after a larger file in a multi-file run; greedy intake need not wait for the full
+  byte target or EOF.
+- The byte targets are a guide from one card, not an answer: the tuner halves and doubles from there
+  on any card.
+
+**Measured.** 48 GiB entropy-coded corpora, `--gpu-only`, v0.17.80 against v0.17.81, runs alternating
+between the two builds:
+
+| workload | one H100 PCIe (x3): v0.17.80 | v0.17.81 | pinned best | PCIe + NVL (x2): v0.17.80 | v0.17.81 |
+|---|---|---|---|---|---|
+| decompress, 16 MiB frames | 10.30-10.42 s | **9.14-9.20 s** | 9.1 s | 6.93-7.07 s | **6.74-6.83 s** |
+| decompress, 1 MiB frames | 8.55-8.57 s | **8.24-8.30 s** | 8.0-8.7 s | 5.83-5.86 s | **5.21-5.24 s** |
+| compress, 16 MiB chunks | 16.11-17.48 s | **15.95-16.16 s** | 16.2-16.4 s | 8.96-9.35 s | **8.25-8.38 s** |
+| compress, 1 MiB chunks | 15.77-16.15 s | **14.64-14.71 s** | 15.0-15.3 s | 8.52-8.67 s | **7.61-7.89 s** |
+
+The default tuner now matches or beats the pinned sweeps without a profile.
+
+**Mixed cards (follow-up from v0.17.80).** The first real mixed run: an H100 PCIe and an H100 NVL
+together. They want the same batch on these workloads; they share an architecture. Each device now
+finds it on its own. v0.17.80's warm-up bias sometimes left the NVL lower: 64 against 128 at 16 MiB,
+and 384 against 512 at 1 MiB. A pair that genuinely differs (an H100 with a 2080 Ti) is not
+available on one host.
+
+**Tests.**
+- Under GZSTD_DEBUG_TUNE_FAST a change of size arms no warm-up. The cells budget their frames per
+  decision, and one warm-up batch per change would double that. The bringup warm-up still applies,
+  and cell 1 asserts it is counted.
+- Cell 1 also asserts the start: a sixteenth of its input, 64. Its input is sized so that the 1024
+  attempt runs short, the supply-limited case that must never be persisted.
+- Ten mutants each fail the cells for their own reason, adding no warm-up and the old start.
+- The per-change warm-up has no cell. It is covered by the traces above.
+- Cell 2's input grows from 2 GiB to 3 GiB. The new start is a sixteenth of the input, 128 frames. With
+  two streams, the 128 stage alone takes about five batches per card. On the NVL pair, the peak-16 card
+  ran out of input at 32 in 2 to 3 of every 5 runs, both with and without the review's fixes. At 3 GiB it
+  settled at 16 in 6 of 6 runs. The shared-tuner mutant still fails the cell.
+
+**Review.** An independent review found three defects, all fixed:
+- **Warm-up was counted per device, not per stream.** With two streams, one stream can finish twice
+  before the other runs at the new size. Both credits went to the first stream, and the other stream's
+  buffer-growth batch was counted as evidence. Each stream now has its own flag.
+- **A pipe started at 256 frames.** With no input size there is no sixteenth-of-input bound, and greedy
+  intake would wait for the whole first batch before any output. An unknown-size input starts at 8 for
+  compress or 16 for decompress, even if a previous input raised the parse-time cap.
+- **Test-only:** under GZSTD_DEBUG_TUNE_FAST, the bringup ceiling clamp could clear the bringup
+  warm-up, and the cost gate charged for warm-up batches that FAST skips.
+
+**Also: the -v summary counted a frozen run's batches as stale (since v0.17.80).** After a
+sink-limited freeze, `gpu_desync_batch` randomizes each pop in [pop_n/2, pop_n] (above 8 frames), and
+every pop below the proposal failed the stale test. A 36 GiB decompress piped to a slow reader
+reported "100 stale" batches, though none of them could change the frozen device's tuner. A
+completion that sees the freeze is no longer counted, and the same run now reports 0. (Another device
+already inside a tick may still make one last decision from batches recorded before it saw the
+freeze; that is the latch race the state table already describes.)
 
 ## v0.17.80 — each GPU tunes its own batch, measures only what ran, and explores past 256
 

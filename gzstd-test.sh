@@ -7060,8 +7060,8 @@ section "GPU batch tuner: per device, measured, explores (v0.17.80)"
 # (GZSTD_DEBUG_TUNE_FAST), so where it settles is deterministic.  Validity (did
 # the batch run full?), allocation and the profile are all real.
 #
-# 1. Decompress, one stream, peak 512, 1 MiB frames, ~1100 frames.  The tuner
-#    climbs 16..256, finds itself still improving at its 256 allocation, and
+# 1. Decompress, one stream, peak 512, 1 MiB frames, ~1500 frames.  The tuner
+#    climbs from its start to 256, finds itself still improving at its 256 allocation, and
 #    EXPLORES 512 (buffers grow lazily); still improving, it tries 1024, which the
 #    input's tail cannot fill.  The profile must keep what was MEASURED: batch 512,
 #    max 512 -- never 1024.  A second run starts there and, because it settled at
@@ -7071,7 +7071,11 @@ section "GPU batch tuner: per device, measured, explores (v0.17.80)"
 #    depend on this host's RAM or core count.
 if has_gpu 2>/dev/null; then
   TUN="$TMPDIR/tune"; rm -rf "$TUN"; mkdir -p "$TUN"
-  head -c $((825 * 1024 * 1024)) /dev/urandom | base64 -w0 | head -c $((1100 * 1024 * 1024)) > "$TUN/src"
+  # ~1500 frames, SIZED ON PURPOSE: the start (64 for this input), the climb and
+  # the 512 window leave ~380 frames, so the 1024 attempt runs SHORT -- a
+  # supply-limited window that must never reach the profile.  A larger input
+  # lets 1024 run full, and then the profile rightly records it.
+  head -c $((1125 * 1024 * 1024)) /dev/urandom | base64 -w0 | head -c $((1500 * 1024 * 1024)) > "$TUN/src"
   "$GZSTD" -q -f --cpu-only --chunk-size=1 "$TUN/src" -o "$TUN/a.zst" 2>/dev/null
   rm -f "$TUN/src"
   # GZSTD_DEBUG_TUNE_EXPLORE_FRACTION lifts the cost gate (one exploratory window
@@ -7087,7 +7091,12 @@ if has_gpu 2>/dev/null; then
   t0=$(now_ms); why=""
   tune_run "$TUN/r1.err"; rc=$?
   [[ $rc -eq 0 ]] || why+=" run1:$rc"
+  # The start is bytes per batch, capped at a sixteenth of the input: ~1125 MiB
+  # compressed / 16 = ~70 frames of 1 MiB, rounded down to a power of two.
+  grep -q 'GPU[0-9]* f1: starting at 64$' "$TUN/r1.err" || why+=" start-not-64($(grep -o 'starting at [0-9]*' "$TUN/r1.err" | head -1))"
   grep -q 'exploring 512' "$TUN/r1.err" || why+=" no-exploration-past-256"
+  # The device's first batch pays for new buffers and is left out as warm-up.
+  grep -q '[1-9][0-9]* warm-up batches left out' "$TUN/r1.err" || why+=" no-warm-up-left-out"
   # The profile is pretty-printed: strip whitespace, then read the f1 record.
   rec=$(tr -d ' \n' < "$TUN/xdg/gzstd/profile.json" 2>/dev/null | grep -o '"f1":{[^}]*}' | head -1)
   rb=$(sed -n 's/.*"batch":\([0-9]*\).*/\1/p' <<<"$rec"); rm_=$(sed -n 's/.*"max":\([0-9]*\).*/\1/p' <<<"$rec")
@@ -7112,6 +7121,11 @@ if has_gpu 2>/dev/null; then
   # 2. Two devices, two peaks: each settles on its own.  (One tuner for every
   #    device settled both on one answer.)  Compress, 1 MiB chunks, peaks 16 and
   #    64 -- both below the 256 allocation, so neither needs to explore.
+  #    3 GiB, SIZED ON PURPOSE: the start is a sixteenth of the input (128
+  #    frames here), and with two streams the 128 stage takes ~5 batches (two
+  #    warm-up, one kept, two stale) before the descent begins.  At 2 GiB the
+  #    peak-16 card ran out of input at 32 in 2-3 of 5 runs on the NVL cards,
+  #    before AND after the per-stream warm-up; at 3 GiB 6/6 settled at 16.
   tune_cards=()
   if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
     if [[ "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
@@ -7122,7 +7136,7 @@ if has_gpu 2>/dev/null; then
   fi
   if (( ${#tune_cards[@]} >= 2 )); then
     t0=$(now_ms); why=""
-    head -c $((768 * 1024 * 1024)) /dev/urandom | base64 -w0 | head -c $((1024 * 1024 * 1024)) > "$TUN/csrc"
+    head -c $((2304 * 1024 * 1024)) /dev/urandom | base64 -w0 | head -c $((3072 * 1024 * 1024)) > "$TUN/csrc"
     env CUDA_VISIBLE_DEVICES="${tune_cards[0]},${tune_cards[1]}" GZSTD_DEBUG_TUNE_CURVE=0:16,1:64 \
       GZSTD_DEBUG_TUNE_FAST=1 "$GZSTD" -v --no-progress -f --gpu-only --gpu-devices=2 \
       --chunk-size=1 "$TUN/csrc" -o "$TUN/c.zst" 2>"$TUN/c.err"; rc=$?
@@ -7131,7 +7145,7 @@ if has_gpu 2>/dev/null; then
     grep -q 'GPU1 f1: settled 64,' "$TUN/c.err" || why+=" gpu1-not-64($(grep -o 'GPU1 f1: settled [0-9]*' "$TUN/c.err"))"
     # Two streams keep a batch in flight at most decisions: a batch popped for an
     # older proposal must be left out, not counted as evidence for the new one.
-    stale=$(grep -o '[0-9]* stale batches left out' "$TUN/c.err" | awk '{s += $1} END {print s + 0}')
+    stale=$(grep -o '[0-9]* stale and [0-9]* warm-up batches left out' "$TUN/c.err" | awk '{s += $1} END {print s + 0}')
     (( stale > 0 )) || why+=" no-stale-batch-left-out"
     "$GZSTD" -q -t "$TUN/c.zst" 2>/dev/null || why+=" archive-invalid"
     rm -f "$TUN/csrc" "$TUN/c.zst"

@@ -44,13 +44,14 @@ was true of the common path and false of roughly thirty options.
   a gzstd `-D` frame is byte-identical to zstd's with the same libzstd. `-d --patch-from=OLD`
   decodes zstd's patches (OLD as raw content, up to 2 GiB, window limit lifted). `--train`,
   `--train-cover/-fastcover/-legacy`, `--maxdict`, `--dictID`, `-r` and `-B#` build dictionaries
-  byte-identical to `zstd --train`'s (20 of 20 option sets measured). Still missing: CREATING
-  patches (`--patch-from` on compress warns).
+  byte-identical to `zstd --train`'s (20 of 20 option sets measured). `--no-dictID` is MAPPED
+  since v0.17.71 (it leaves the ID out of frames gzstd writes); it used to be on the silent list
+  below. Still missing: CREATING patches (`--patch-from` on compress warns).
 - **Accepted but divergent** (each warns): `-r`/`--recursive` compresses nothing (exit 3
   since v0.15.69 — it used to exit 0 having done nothing), `--format=gzip` emits zstd,
   `--output-dir-flat`/`--output-dir-mirror` write nothing, `--no-check` still writes the
   checksum.
-- **Accepted silently, no effect:** `--[no-]asyncio`, `--[no-]check`, `--no-dictID`,
+- **Accepted silently, no effect:** `--[no-]asyncio`, `--[no-]check`,
   `--[no-]compress-literals`, `--[no-]row-match-finder`, `--[no-]mmap-dict`,
   `--stream-size=`, `--size-hint=`, `--target-compressed-block-size=`, `--auto-threads=`.
 
@@ -279,6 +280,10 @@ correspondingly hard to justify.
 3. **Decompress has no equivalent.** `--gds-only` writes VRAM to NVMe through cuFile; there is no
    O_DIRECT write out of VRAM, so the portable path stops at compression. Whether a D2H-into-pinned
    plus O_DIRECT-pwrite arrangement beats the ordinary writer is unmeasured.
+   **HALF CLOSED (v0.17.56–59): the READ side shipped.** `-d` and `-t --direct-stage` now read the
+   compressed frames through the staged path (see "SHIPPED v0.17.56" below). The WRITE side — the
+   decompressed output out of VRAM — is still the ordinary writer, and the question above is still
+   unmeasured.
 
 4. **Extract each frame's trailer checksum ON THE DEVICE** (deferred from the v0.17.40 review,
    deliberately not bundled with it). The staged producer preads 4 bytes per frame from the end of
@@ -605,9 +610,15 @@ lazily, 49.4 s summed across 8 readers, all inside the first batch. The buffers 
 at the batch the workers will pop: 6.15–6.24 s, and 36 GiB 17.1 → 11.5 s (CHANGELOG v0.17.59).
 `GZSTD_DEBUG_DSTAGE_AHEAD_PINNED=1` is the in-tool control.
 
-**OPEN — Gen3 A/B of pageable versus pinned read-ahead.** v0.17.56 pinned these reads because Gen3 pageable uploads were
-35% of GPU batch time there. The worker's lanes are still pinned; only the cache changed. Measure it on the workstation
-with the switch before calling this a win on Gen3.
+**CLOSED (2026-09-17, workstation): the Gen3 A/B of pageable versus pinned read-ahead — pageable wins there too.**
+v0.17.56 pinned these reads because Gen3 pageable uploads were 35% of GPU batch time there. Measured with the switch on the
+PCIe Gen3 2x RTX 2080 Ti host, two independently rotated batches (n=6 per arm, 7.19 GiB cold, output byte-identical):
+- The pinned cache cost a median **24.4 s summed across readers** (22.6-26.4) against pageable's 0.05 s. This is the same
+  lazy page-locking defect v0.17.59 fixed on the server, reproduced on Gen3.
+- Wall clock: pageable 22.57 s against pinned 23.70 s median. The ranges overlap, but every pinned run was slower than
+  pageable's median.
+- Read-ahead effectiveness was identical in both arms, so pinning bought nothing to trade against its cost.
+- The v0.17.59 default stands on every fabric: no fabric-dependent rule and no revert.
 
 ## SHIPPED v0.17.58: the staged producer's timing line blamed the wrong cost
 
@@ -823,6 +834,19 @@ as views into the block (CHANGELOG v0.17.47): `--cpu-only` 14.66 to 40.08 GiB/s 
 Replaced by per-device tuners that measure only what ran (see CHANGELOG v0.17.80). The original
 report follows.
 
+**Follow-ups, 2026-09-29.**
+- **CLOSED v0.17.81:** the 16 MiB decompress loss without `--adapt`. The tuner now drops each
+  stream's first batch at a new size (it pays for buffer growth), closes long windows at two
+  batches, and starts from bytes per batch by frame size. The result: 10.3 s became 9.1 s, the
+  best pinned batch.
+- **CLOSED v0.17.81:** a real mixed-card run, an H100 PCIe with an H100 NVL. Each card found the
+  same batch on its own.
+- **OPEN, before the tag:** the start's byte targets (~2 GiB for decompress, ~512 MiB for
+  compress) were derived on one H100. On a small-VRAM card the allocation caps them, and the tuner
+  corrects from there, but that is reasoning. Validate them on the 11 GiB consumer cards.
+- **OPEN:** a pair of cards that genuinely want different batches (an H100 with a 2080 Ti) is not
+  available on one host, so only the synthetic two-peak cell covers it.
+
 Found by an independent round on v0.17.68, pre-existing and NOT introduced by it. Decompress leaves
 `SharedTuneState::vram_ceiling` at its default 1024 while real intake clamps locally,
 `pop_n = min(tuner_batch, per_stream_cap)`. So the tuner can propose — and `g_adapt_settled_batch`
@@ -837,7 +861,7 @@ should be tagged with the batch actually executed. **Whichever way it goes, `--a
 verdict is the thing at risk** — a profile that records an unattainable batch is worse than one
 that records nothing.
 
-## OPEN after the v0.17.40–44 review arc
+## After the v0.17.40–44 review arc: 1 and 2 CLOSED; 2b's two-card question and 3 still OPEN
 
 Three residuals from seven review rounds on `--gds-only -d`. None is a defect in
 shipped behaviour; each is a measurement or a decision that has not been made.
@@ -869,9 +893,20 @@ Cold 12 GiB `-t`, n=3: the flag went from 7.32-7.58 s to 3.68-3.69 s against a 3
 the host CPU (~35 CPU-seconds against ~70). Alignment is handled by rounding each tail-reaching block's request up into the
 allocator's 2 MiB-rounded capacity; a refusal at read time degrades to the held descriptor and says so once at -v
 (`GZSTD_DEBUG_MT_DIRECT_EINVAL=1` forces it, because no local filesystem here refuses). `GZSTD_DEBUG_MT_DIRECT=0`
-keeps the old single-stream shape for an A/B. **Still owed: the same A/B on the Gen3 workstation**, whose storage may
-answer the contention question differently — that is the one machine where "concurrent O_DIRECT contends" was ever
-true. See CHANGELOG v0.17.66.
+keeps the old single-stream shape for an A/B. See CHANGELOG v0.17.66.
+
+**CLOSED 2026-09-21: the Gen3 workstation A/B confirmed it.** 4.1 GiB cold archive, `-t --cpu-only`, median of 5 with
+rotated arm order:
+- O_DIRECT MT **1.64 s** (1.63-1.66, 0.70 s sys);
+- buffered MT 2.30 s (4.44 s sys);
+- the old single stream 2.71 s.
+
+That is 1.40x over buffered and 1.65x over the single stream. The device ceiling is `dd iflag=direct` at 1.34 s, and even
+raw `dd` prefers O_DIRECT on that fabric.
+
+The shape INVERTS against the server, where buffered led (3.45 against 3.69 s). But both boxes agree on what the flag
+controls: parallel O_DIRECT beats the single stream. The "concurrent O_DIRECT contends" rule stands only where it was
+measured, the 12-way COMPRESS reader. No rule and no revert.
 
 ### 2. v0.17.42–43 small-VRAM validation — DONE, and it found a defect (fixed v0.17.45)
 
@@ -883,9 +918,10 @@ the GPU at exit 0 — because a correctly handled allocation failure left CUDA's
 armed for the verify launch to read. See CHANGELOG v0.17.45; `GZSTD_DEBUG_REAL_BRINGUP_OOM` and
 `GZSTD_DEBUG_REAL_PINNED_OOM` now reproduce it on any card.
 
-**Still owed:** the suite totals for the GDS-unavailable host — now **555 extensive / 424 default**
-after the baseline correction below — remain DERIVED, not measured; the run was deferred because
-the host was needed for other work.
+**CLOSED 2026-09-21: the suite totals for the GDS-unavailable host were MEASURED.** On the workstation
+(v0.17.68), the `-e` run was green at 596 ran / 0 failed / 11 skipped of 607. The GDS delta of 11 was
+taken from the skip-list diff, and it holds in `--extensive` as well as the default run. (The 555 / 424
+derived here earlier described an older baseline.)
 
 **Follow-ups from that work:**
 - DONE: suite cells for the two REAL-OOM hooks, mutation-proven against a build with the 13
@@ -1222,9 +1258,10 @@ The two most consequential knobs the v0.15.x governor does NOT touch:
   runs, document that archives from the same box may differ across
   calibrations).
 - **GPU streams** (`--gpu-streams`, static per-device): the natural
-  companion to the persisted `settled_batch` — same pattern: let a probe
+  companion to the persisted batch (since v0.17.80 a per-device, per-frame-class
+  `gpu_batch` record, not one `settled_batch`) — same pattern: let a probe
   (or `--calibrate`) measure 1 vs 2 streams per device, persist
-  `settled_streams`, seed with tuner freedom. Interacts with the
+  `settled_streams` (per device, beside `gpu_batch`), seed with tuner freedom. Interacts with the
   v0.14.58 permit-hoarding fix and per-stream VRAM footprint (the
   `--verify` VRAM doubling), so the probe must respect the existing
   batch-floor deadlock guardrail.
@@ -1996,9 +2033,37 @@ verbatim) without breaking existing gzstd scripts using `--format=gnu`.
 
 ## Phase 9: GPUDirect Storage — NVMe-to-VRAM P2P DMA (research, proposed 2026-08-06)
 
-**Priority: Medium | Complexity: High | Status: NOT STARTED — and still NEVER ACTUALLY RUN**
+**Priority: Medium | Complexity: High | Status: SHIPPED — `--gds-only` (v0.17.0–7: compress reads
+AND decompress writes), then its portable 95%, `--direct-stage` (v0.17.9–10). Opt-in, not a default.**
 
-> **2026-08-13 note.** This was once written off on the arithmetic that the drive (4.56 GiB/s)
+> **RESOLVED (2026-08-20 to 2026-09-28). It was run, measured, and shipped. The text below the
+> resolution is the original proposal, kept for its reasoning; where it disagrees, this wins.**
+> - **Peer-to-peer is PROVEN, not assumed.** cuFile's per-process `posix=` counter reads 0 for
+>   gzstd's own transfers (`Read n=768 posix=0` and `Write n=8 posix=0` on a 140 GB run that
+>   `zstd -t` validated; `n=513 posix=0` again at v0.17.76), as it did for `gdsio`'s 48,784 reads.
+>   That counter is the only trustworthy instrument: the `[GDS] N aligned transfers`
+>   line counts alignment eligibility and was mutation-disproven as routing evidence (v0.17.8), and
+>   throughput cannot tell the arms apart (compat 4.917 vs native 4.924 GiB/s). Reading it needs the
+>   v0.17.76 preload workaround — see "libcufile statistics when loaded with dlopen" above.
+> - **What it buys is host CPU, not throughput.** Both paths saturate the same drive. A three-way
+>   split (2026-08-25) put **95% of the host-CPU saving in O_DIRECT into the GPU staging slab and
+>   5% in peer-to-peer DMA**. That 95% shipped as `--direct-stage`, which needs none of GDS's platform
+>   gates — see "SHIPPED v0.17.9–v0.17.10" at the top of this file.
+> - **The blockers the note below names were the wrong ones.** The IOMMU is not on the static-BAR1
+>   path (verified in the driver source), and the ACS and IOMMU boot-option experiments changed
+>   nothing. The real gates are four: a BAR1
+>   aperture that covers VRAM, the nvidia-fs module, a filesystem cuFile accepts, and a kernel without
+>   the shadow-buffer pin regression. A kernel update broke the last one and a newer nvidia-fs
+>   (2.26.6) fixed it. Since v0.17.29–30, `--gds-only` REFUSES (exit 2) naming the missing gate, where
+>   it used to demote silently — see "SETTLED: `--gds-only` REFUSES".
+> - **The "finish the staging work first" premise is withdrawn.** "3.0 of 71.8 GiB/s" was the batch
+>   tuner's ramp on a ~20 GiB input, not the pipeline — see "OPEN QUESTION: is GPU compress worth
+>   another round?" at the top.
+> - **Still open:** the loaded-box comparison ("3. The comparison that would actually settle GDS's
+>   case is a LOADED box"), `--direct-stage` for `--tar` create, and a portable O_DIRECT write of
+>   decompressed output out of VRAM (items 1 and 3 under the `--direct-stage` section).
+
+> **2026-08-13 note (SUPERSEDED — see above).** This was once written off on the arithmetic that the drive (4.56 GiB/s)
 > has 5× less bandwidth than the H2D link (25+ GiB/s), so removing the host bounce optimises a
 > link with margin. That reasoning is sound *for this host* and is not a verdict on the feature:
 > gzstd has to be fast on machines we do not own, and a box with a fast array or NVMe-oF inverts
@@ -2049,6 +2114,10 @@ warm, so **GDS is a credible route to inverting it** and should be measured, not
 - Filesystems are ext4 on both `/` and `/backup`, which GDS supports.
 
 ### PREREQUISITE, AND THE TRAP
+**MET 2026-08-20, and the trap was real.** nvidia-fs was installed and the other three gates opened;
+the trap is why `posix=` became the verdict. Compat mode and peer-to-peer differ by 0.1% in
+throughput, so a benchmark alone would have "confirmed" either one.
+
 `libcufile.so.1.13.1` is present (CUDA 12.8 ships it), but **`nvidia_fs` is NOT loaded and
 no GDS packages are installed**.  Without that kernel module `cuFile` silently falls back to
 **compatibility mode** — an ordinary POSIX read plus `cudaMemcpy`.  You get the whole API,
@@ -2057,6 +2126,9 @@ measure neutral, and wrongly conclude the idea does not work.**  Verify the modu
 and `cuFileDriverOpen` reports GDS (not compat) mode BEFORE trusting any number.
 
 ### What to measure, here, before writing the integration
+**DONE — all three, and both directions shipped** (the resolution above has the verdict; the
+per-arm numbers are in CHANGELOG v0.17.0–10).
+
 1. Baseline the ceiling: cold `--gpu-only` decompress and compress of a large archive, with
    `-vvv` to attribute Reader / H2D / Kernel / D2H / Writer time.  **If H2D+D2H is not a top
    cost, stop — there is nothing for GDS to win.**
@@ -2065,11 +2137,19 @@ and `cuFileDriverOpen` reports GDS (not compat) mode BEFORE trusting any number.
 3. Only then decide.  Decompress is the better first target: output volume exceeds input, so
    the `cuFileWrite` side moves more bytes than the read side.
 
-### 9.1 Topology-aware GPU selection (stands alone; prerequisite for GDS)
+### 9.1 Topology-aware GPU selection (stands alone; NOT a prerequisite for GDS after all)
 
-**Priority: Medium | Complexity: Low | Status: NOT STARTED**
+**Priority: Medium | Complexity: Low | Status: NOT STARTED — premise partly stale (2026-09-29)**
 
-Device selection today is `min(gpu_devices, device_count)` (`gzstd.cpp:19356`) — the FIRST N
+> **What changed since this was written.** GDS shipped without it, so "prerequisite for GDS" is
+> withdrawn: peer-to-peer was proven (`posix=0`) on the device gzstd picked anyway. Selection is also
+> no longer "the first N devices": `select_best_gpus()` ranks by NVML utilization and free VRAM with a
+> penalty for a busy neighbour on the same NUMA node, and since v0.17.63 the all-devices case is
+> ranked at bringup, after CUDA. **What is still true:** nothing looks at where the INPUT lives. A
+> source-proximity rank (NVMe root complex / NUMA node of the input's block device) is still unbuilt
+> and still unmeasured for H2D bandwidth.
+
+Device selection at the time was `min(gpu_devices, device_count)` — the FIRST N
 devices, with no awareness of where the data is coming from. On this box that is measurably
 the wrong choice:
 
@@ -2113,9 +2193,13 @@ device, not a pooling problem.
 NVMe -> topologically adjacent GPU, then NVLink-forward to its bridged partner, avoiding a
 second PCIe traversal for the far GPU. That only helps actually-bridged pairs, and it is an
 optimisation layered on an unbuilt feature — sequence it after 9.1 and the Phase 9 baseline
-measurement, not before.
+measurement, not before. (2026-09-29: the baseline was measured and GDS shipped; the forwarding hop
+is still unbuilt, and with peer-to-peer worth ~5% of the host-CPU saving, it is correspondingly hard
+to justify.)
 
 ### Known design conflicts to resolve before any integration
+**Resolved the way the first bullet proposes:** `--gds-only` implies `--gpu-only` (with no host copy
+there is nothing for a CPU worker to compress), so `HybridSched` never sees a VRAM-resident frame.
 - **It fights `HybridSched`.** The scheduler picks CPU or GPU *per frame*, after the frame is
   read.  A frame landed straight in VRAM cannot go to a CPU worker without a D2H, so the
   backend decision would have to move BEFORE the read — inverting the current design.
@@ -2136,11 +2220,11 @@ measurement, not before.
 | Asymmetric mode (PCIe Gen3 detection) | 5.1, 5.2 | HIGH | DONE (v0.13.0) |
 | Auto --direct for Gen4+ compress & decompress | 5.3 | HIGH | DONE (decompress v0.13.25, compress v0.13.26) |
 | Persistent auto-tuning (per-machine profile) | 2.1–2.3 | Medium | DONE (`--adapt`, v0.15.0–40) — `${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json`, not `~/.gzstd/`; carries a schema epoch that self-resets on a format change (v0.15.40). Opt-in through v0.15.x; default-flip is a v1.0 decision |
-| Rate-matched dispatch (re-enable) | 1.3 | Medium | Disabled, needs eval |
-| Pipe-aware scheduling | 3.1 | Medium | Not started |
-| Streaming mode for unknown-size input | 3.2 | Low | Not started |
+| Rate-matched dispatch (re-enable) | 1.3 | Medium | SUBSUMED (v0.15.4) — ranked-engine overflow dispatch ranks every engine by live per-device EMA; the vestigial `RateMatchState` was deleted |
+| Pipe-aware scheduling | 3.1 | Medium | SUBSUMED (v0.15.3–4) — the governor's SOURCE_BOUND classification, the source-bound batch latch and ranked overflow dispatch adapt to a slow or piped source at run time |
+| Streaming mode for unknown-size input | 3.2 | Low | SUBSUMED (v0.15.3) — the source-bound tuner latch replaces the heuristic; an unknown size keeps the conservative start (re-confirmed v0.17.81: a pipe does not take the byte-target start) |
 | Multi-reader NVMe | 4.1 | Low | DONE for decompress (v0.13.71/75, incl. redirected-stdin and block-device pread); compress deliberately stays single-reader — concurrent O_DIRECT contends |
-| Multi-writer O_DIRECT pwrite | 4.2 | Low | Tested negative for buffered |
+| Multi-writer O_DIRECT pwrite | 4.2 | Low | Buffered: tested negative. O_DIRECT: a per-machine `--adapt` probe since v0.15.8 (+1 positional-pwrite drain thread on SINK_BOUND runs, kept on a >=10% gain, persisted per fingerprint) |
 | AsyncWritePool flush() final-batch error | 7.1 | HIGH | DONE (v0.13.23) |
 | GPU result buffer pool (compress + decompress) | 7.2 | HIGH | DONE (decompress v0.13.24, compress v0.13.33) |
 | Throttle budget uses resolved chunk size | 7.3 | Medium | DONE (v0.13.28) |

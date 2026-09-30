@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.80";
+static constexpr const char * GZSTD_VERSION = "0.17.81";
 //
 // Architecture overview:
 //
@@ -26624,8 +26624,10 @@ struct DevStats {
 //
 // STATE TABLE.  "P" is the device's proposal, "C" its ceiling -- the largest
 // batch it can run now (its allocation, which a VRAM dip lowers and a recovery
-// or an exploration raises).  Intake pops min(P, C).  A window is >= MIN_BATCHES
-// batches and >= TUNE_SEC; batches popped under an older P are not in it.
+// or an exploration raises).  Intake pops min(P, C).  A window closes after
+// >= MIN_BATCHES kept batches and >= TUNE_SEC, or after two kept batches whose
+// pop-to-completion span is >= TUNE_SEC.  Batches popped under an older P are
+// not in it.
 //
 //   state      window is VALID (>= 3/4 of its     window is SUPPLY-LIMITED (the queue
 //              batches ran at full P)              could not fill P)
@@ -26759,6 +26761,20 @@ struct DeviceTune {
   // for (compress pipelines two streams, so one is usually in flight at a
   // decision) and were left out as evidence.  Reported, so the filter is visible.
   std::atomic<uint32_t> stale_dropped{0};
+  // WARM-UP: after the proposal CHANGES, the device's first batch per stream is
+  // left out too.  A batch at a new largest size grows the device's buffers and
+  // pays that once: MEASURED on 16 MiB frames, the first 64-frame batch's D2H
+  // took 606 ms against ~108 steady, the first 128-frame one 637 against ~161.
+  // Kept, that one batch rated 64 at 2.7 GiB/s instead of 6.3, the tuner walked
+  // DOWN to 32 and 16, and a 48 GiB decompress lost ~1 s.  `streams` is set by
+  // the worker at bringup.  A device-wide completion count is insufficient:
+  // one stream can finish twice before another runs its first batch at the new
+  // size.  The count, flags, and stream count are protected by tune_mtx;
+  // warm_dropped is an atomic summary counter.
+  uint32_t streams = 1;
+  uint32_t warm_left = 0;
+  std::vector<uint8_t> warm_pending;       // first batch at this proposal, per stream
+  std::atomic<uint32_t> warm_dropped{0};
 
   // What was actually measured (tick thread; published under tune_mtx).
   size_t   settled = 0;                  // best batch from a VALID window
@@ -26877,6 +26893,26 @@ static size_t tune_prior_budget(size_t frame_bytes, size_t gpu_streams,
   return std::min(want, std::max(AUTO_TUNE_BATCH_CEILING, per_stream));
 }
 
+// The first proposal of a device with no prior and no --gpu-batch: BYTES per
+// batch for this frame size, not a frame count.  Call only with a known input
+// size: a pipe cannot supply the input/16 bound, and greedy intake would wait
+// for a large first batch before producing output.  MEASURED on one H100 (48 GiB,
+// pinned sweeps): decompress runs best at 1-2+ GiB a batch (128 x 16 MiB,
+// 512-1024 x 1 MiB) and compress at ~512 MiB (32 x 16 MiB, 512 x 1 MiB).  The
+// old starts ignored frame size -- decompress 16/64/256 by input size, compress
+// 8 -- so 16 MiB frames began at a size 15% slower and first tried one 50%
+// slower, and 1 MiB compress climbed from 8.  A GUIDE, not an answer: the tuner
+// halves and doubles from here on any card, and the allocation caps it.  The
+// input/16 target is subject to the eight-frame floor on tiny inputs.
+static size_t tune_default_start(size_t frame_bytes, uint64_t input_bytes, bool decompress) {
+  uint64_t target = decompress ? (uint64_t(2) << 30) : (uint64_t(512) << 20);
+  if (input_bytes) target = std::min<uint64_t>(target, input_bytes / 16);
+  const size_t n = size_t(target / std::max<size_t>(1, frame_bytes));
+  size_t p = 1;
+  while (p * 2 <= n) p <<= 1;
+  return std::min<size_t>(std::max<size_t>(p, 8), AUTO_TUNE_BATCH_CEILING);
+}
+
 // Build one tuner per device for an operation.  Called where the real device
 // count is known, before any worker starts.  `start` is the batch a device
 // without a prior begins at; `frame_bytes` sets the frame class; the throttle's
@@ -26923,6 +26959,9 @@ static void tune_init_devices(DeviceTune * tunes, int n, const std::vector<int> 
       }
     }
     T.batch_size.store(std::max<size_t>(1, std::min<size_t>(b, HARD_BATCH_CAP)));
+    if (T.phase == DeviceTune::Phase::BASELINE && !run.locked.load() && opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "[AUTO-TUNE] GPU" + std::to_string(ids[i]) + " " + fc
+           + ": starting at " + std::to_string(T.batch_size.load()) + "\n");
   }
 }
 
@@ -26953,24 +26992,64 @@ static void tune_publish_devices(DeviceTune * tunes, int n, const Options & opt)
            + std::to_string(T.measured_max) + ", ceiling " + std::to_string(T.ceiling.load())
            + " (" + std::to_string(T.valid_windows) + " valid / "
            + std::to_string(T.supply_windows) + " supply-limited windows, "
-           + std::to_string(T.stale_dropped.load()) + " stale batches left out)\n");
+           + std::to_string(T.stale_dropped.load()) + " stale and "
+           + std::to_string(T.warm_dropped.load()) + " warm-up batches left out)\n");
     if (T.run->locked.load() || !T.valid_windows || !T.settled || T.uuid.empty()) continue;
     g_tune_published.push_back({T.uuid, T.fclass, T.settled, T.measured_max});
   }
 }
 
+// Set the device's proposal.  Caller holds tune_mtx (or no worker exists yet).
+// A CHANGE arms the warm-up: each stream's first batch is left out.  Under
+// GZSTD_DEBUG_TUNE_FAST (a decision per batch, so that small test inputs reach
+// a verdict) a change arms none -- the cells budget their frames per decision --
+// but the bringup warm-up still applies (device_tune_set_streams).
+static inline void tune_propose(DeviceTune & T, size_t p) {
+  p = std::max<size_t>(1, p);
+  if (T.batch_size.load(std::memory_order_relaxed) != p) {
+    T.batch_size.store(p, std::memory_order_relaxed);
+    const uint8_t pending = gz_debug_tune_fast() ? 0 : 1;
+    std::fill(T.warm_pending.begin(), T.warm_pending.end(), pending);
+    T.warm_left = pending ? (uint32_t)T.warm_pending.size() : 0;
+  }
+}
+// The worker's real stream count, at bringup.  The very first batches of a run
+// are warm-up too (every buffer is new).  Call after the initial ceiling clamp:
+// in FAST mode a proposal change clears warm-up, but bringup must still arm it.
+static void device_tune_set_streams(DeviceTune * T, size_t n) {
+  if (!T) return;
+  std::lock_guard<std::mutex> lk(T->tune_mtx);
+  T->streams = (uint32_t)std::max<size_t>(1, n);
+  T->warm_pending.assign(T->streams, 1);
+  T->warm_left = T->streams;
+}
+
 // A batch finished.  `popped` is the pop size intake asked for; a batch from an
 // older proposal is not evidence about this one and is left out of the window.
 // `pop_ns`/`done_ns` (now_ns clock) bound the batch for the wall-rate window.
-static inline void device_tune_record(DeviceTune * T, size_t popped, size_t filled,
+static inline void device_tune_record(DeviceTune * T, size_t stream_index,
+                                      size_t popped, size_t filled,
                                       uint64_t bytes, uint64_t pop_ns, uint64_t done_ns,
                                       uint64_t pop_epoch) {
   if (!T || !T->run || T->run->locked.load(std::memory_order_relaxed)) return;
   if (popped == 0) return;
+  // After observing a freeze, this completion is neither evidence nor stale.
+  // Another device may finish one tick that passed its latch check, using
+  // samples whose record path has not observed the latch. Sink-frozen pops can
+  // be smaller than the proposal; counting them made a 36 GiB decompress report
+  // "100 stale".
+  if (T->run->freeze_reason.load(std::memory_order_acquire) != 0) return;
   std::lock_guard<std::mutex> lk(T->tune_mtx);
   if (pop_epoch != T->proposal_epoch
       || popped != T->batch_size.load(std::memory_order_relaxed)) {
     T->stale_dropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (T->warm_left && stream_index < T->warm_pending.size()
+      && T->warm_pending[stream_index]) {
+    T->warm_pending[stream_index] = 0;
+    --T->warm_left;
+    T->warm_dropped.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   T->window_bytes += bytes;
@@ -27001,7 +27080,7 @@ static size_t device_tune_set_ceiling(DeviceTune * T, size_t c) {
   }
   // A proposal above what the device can now run could never form a window.
   if (T->batch_size.load(std::memory_order_relaxed) > c) {
-    T->batch_size.store(std::max<size_t>(1, c), std::memory_order_relaxed);
+    tune_propose(*T, c);
     ++T->proposal_epoch;
     T->window_bytes = 0;
     T->window_full_bytes = 0;
@@ -27063,14 +27142,22 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     size_t b = T.best_batch ? T.best_batch : T.batch_size.load();
     if (R.freeze_reason.load() == TuneRun::FREEZE_SINK) b = TuneRun::sink_freeze_clamp(b);
     const size_t c = T.ceiling.load();
-    T.batch_size.store(std::max<size_t>(1, c ? std::min(b, c) : b));
+    tune_propose(T, std::max<size_t>(1, c ? std::min(b, c) : b));
     T.phase = DeviceTune::Phase::SETTLED;
     return 0;
   }
   const bool fast = gz_debug_tune_fast();
   std::unique_lock<std::mutex> lk(T.tune_mtx, std::try_to_lock);
   if (!lk.owns_lock()) return 0;
-  if (T.window_batches < (fast ? 1u : DeviceTune::MIN_BATCHES)) return 0;
+  // A window is MIN_BATCHES kept batches -- or just two once they span TUNE_SEC.
+  // Long batches measure as well in two as in four, and at big frames four is
+  // a lot of input: MEASURED, 16 MiB frames spent 5 x 256 x 16 MiB = 20 GiB on
+  // the window at 256 alone and reached their final size with 4 GiB of 48 left.
+  // Short batches still need four (their rate is noisier batch to batch).
+  const bool long_window = T.window_batches >= 2 && T.window_last_ns > T.window_first_ns
+      && double(T.window_last_ns - T.window_first_ns) / 1e9 >= DeviceTune::TUNE_SEC;
+  if (T.window_batches < (fast ? 1u : DeviceTune::MIN_BATCHES) && !(!fast && long_window))
+    return 0;
   const auto now = std::chrono::steady_clock::now();
   const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
       now - T.last_tune).count();
@@ -27118,7 +27205,7 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     const size_t b = R.freeze_reason.load(std::memory_order_acquire) == TuneRun::FREEZE_SINK
         ? TuneRun::sink_freeze_clamp(T.best_batch ? T.best_batch : cur)
         : (T.best_batch ? T.best_batch : cur);
-    T.batch_size.store(std::max<size_t>(1, std::min(b, C)));
+    tune_propose(T, std::max<size_t>(1, std::min(b, C)));
     T.phase = DeviceTune::Phase::SETTLED;
     return 0;
   }
@@ -27129,7 +27216,7 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     ++T.supply_windows;
     if (T.best_batch && cur > T.best_batch
         && (T.phase == DeviceTune::Phase::DOUBLE || T.phase == DeviceTune::Phase::SETTLED)) {
-      T.batch_size.store(std::min(T.best_batch, C));
+      tune_propose(T, std::min(T.best_batch, C));
       T.phase = DeviceTune::Phase::SETTLED; T.settle_ticks = 0;
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, tag + "batch " + std::to_string(cur) + " never ran full ("
@@ -27144,7 +27231,7 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
   if (T.explored_from && cur > T.explored_from) T.explored_from = 0;
 
   auto settle = [&](const char * why) {
-    T.batch_size.store(std::min(T.best_batch, C));
+    tune_propose(T, std::min(T.best_batch, C));
     T.phase = DeviceTune::Phase::SETTLED; T.settle_ticks = 0;
     if (opt.verbosity >= V_VERBOSE) {
       std::ostringstream os;
@@ -27172,9 +27259,12 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
       const double left = total > done ? double(total - done) : 0.0;
       const double per_frame = double(full_bytes) / double(full)
                              / double(std::max<size_t>(1, cur));
-      const size_t streams = std::max<size_t>(1, opt.gpu_streams);
+      // ...plus the warm-up batches a change of size leaves out in normal runs.
+      // FAST skips per-change warm-up, so its cost gate must skip that charge.
+      const size_t streams = std::max<size_t>(1, T.streams);
       const size_t min_batches = fast ? 1u : DeviceTune::MIN_BATCHES;
-      const size_t probe_batches = (1 + (min_batches - 1) / streams) * streams;
+      const size_t probe_batches = (1 + (min_batches - 1) / streams) * streams
+                                 + (fast ? 0 : streams);
       const double cost = double(probe_batches) * double(next) * per_frame;
       affordable = total > 0 && cost <= tune_explore_fraction() * left;
       if (!affordable && opt.verbosity >= V_VERBOSE)
@@ -27186,7 +27276,7 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     if (affordable) {
       want = std::min<size_t>(C * 2, xmax);
       if (!T.explored_from) T.explored_from = C;
-      T.batch_size.store(want);
+      tune_propose(T, want);
       T.phase = DeviceTune::Phase::DOUBLE;
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, tag + "still improving at its allocation (" + std::to_string(C)
@@ -27201,7 +27291,7 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     T.prev_batch = cur; T.prev_thr = cur_thr;
     const size_t half = std::max<size_t>(1, cur / 2);
     if (half < cur) {
-      T.batch_size.store(half);
+      tune_propose(T, half);
       T.phase = DeviceTune::Phase::HALVE;
       if (opt.verbosity >= V_VERBOSE) {
         std::ostringstream os;
@@ -27210,7 +27300,7 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
         vlog(V_VERBOSE, opt, os.str() + "\n");
       }
     } else if (std::min(cur * 2, C) > cur) {
-      T.batch_size.store(std::min(cur * 2, C));
+      tune_propose(T, std::min(cur * 2, C));
       T.phase = DeviceTune::Phase::DOUBLE;
     } else {
       top_out();
@@ -27220,11 +27310,11 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     if (cur_thr >= T.prev_thr * 0.98) {
       T.prev_thr = cur_thr; T.prev_batch = cur;
       const size_t half = std::max<size_t>(1, cur / 2);
-      if (half < cur) T.batch_size.store(half);
+      if (half < cur) tune_propose(T, half);
       else settle("settled at");
     } else {
       T.prev_thr = T.best_thr; T.prev_batch = T.best_batch;
-      T.batch_size.store(std::min(T.best_batch, C));
+      tune_propose(T, std::min(T.best_batch, C));
       T.phase = DeviceTune::Phase::DOUBLE;
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, tag + "halving worse, will try doubling (best="
@@ -27243,14 +27333,14 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     }
     if (improving) {
       const size_t dbl = std::min(cur * 2, C);
-      if (dbl > cur) T.batch_size.store(dbl);
+      if (dbl > cur) tune_propose(T, dbl);
       else if (cur == T.best_batch) top_out();
       else settle("settled at");
     } else if ((cur > T.best_batch ? cur - T.best_batch : T.best_batch - cur) > 2) {
       T.refine_lo = std::min(T.best_batch, cur);
       T.refine_hi = std::max(T.best_batch, cur);
       const size_t mid = T.refine_lo + (T.refine_hi - T.refine_lo) / 2;
-      T.batch_size.store(mid);
+      tune_propose(T, mid);
       T.phase = DeviceTune::Phase::REFINE; T.refine_iters = 0;
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt, tag + "refining [" + std::to_string(T.refine_lo) + ".."
@@ -27268,7 +27358,7 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     } else {
       size_t mid = T.refine_lo + (T.refine_hi - T.refine_lo) / 2;
       if (mid == cur) mid++;
-      T.batch_size.store(std::min(mid, C));
+      tune_propose(T, std::min(mid, C));
     }
   } else {
     if (cur == T.best_batch) T.best_thr = cur_thr;   // track drift at the settled size
@@ -27287,7 +27377,7 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
       }
       if (probe != T.best_batch) {
         T.prev_thr = cur_thr; T.prev_batch = T.best_batch;
-        T.batch_size.store(probe);
+        tune_propose(T, probe);
         T.phase = probe > T.best_batch ? DeviceTune::Phase::DOUBLE : DeviceTune::Phase::HALVE;
         if (opt.verbosity >= V_VERBOSE) {
           std::ostringstream os;
@@ -28949,7 +29039,8 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   if (g_gpuc_devices.load(std::memory_order_relaxed) > 0) gpuc_mark_done(now_ns(), in_sum);
 
   // This device's tuner: what ran, at the size intake asked for.
-  device_tune_record(tune, C.pop_req, C.filled, in_sum, C.pop_ns, now_ns(),
+  device_tune_record(tune, C.stats.stream_index, C.pop_req, C.filled,
+                     in_sum, C.pop_ns, now_ns(),
                      C.pop_tune_epoch);
   // -vv: batch completion line
   if (opt.verbosity >= V_DEBUG) {
@@ -29425,6 +29516,7 @@ static void gpu_worker(
       size_t c = ctxs[0].per_stream_batch;
       for (const auto & X : ctxs) c = std::min(c, X.per_stream_batch);
       device_tune_set_ceiling(tune, c);
+      device_tune_set_streams(tune, ctxs.size());
       if (sched) sched->set_gpu_batch_size(tune->batch_size.load(), device_id);
     }
 
@@ -31396,7 +31488,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     per_dev.reset(new DevStats[(size_t)gpu_count]);
     json_sink = std::make_unique<StatsSink>(gpu_count);
     tunes.reset(new DeviceTune[(size_t)gpu_count]);
-    tune_init_devices(tunes.get(), gpu_count, gpu_ids, tune_run, opt, opt.gpu_batch_cap,
+    tune_init_devices(tunes.get(), gpu_count, gpu_ids, tune_run, opt,
+                      opt.gpu_batch_user_set || opt.region_staged()
+                        ? opt.gpu_batch_cap
+                        : total_in == 0 ? DEFAULT_GPU_BATCH_CAP
+                        : tune_default_start(tune_frame_bytes, total_in, /*decompress=*/false),
                       tune_frame_bytes, throttle.max_permits());
     fatal_msgs.assign((size_t)gpu_count, std::string());
     // Per-GPU result slots (reduces lock contention).  init_slots resizes
@@ -33469,6 +33565,7 @@ static void gpu_decomp_worker(
     // --gpu-batch, which the card already refused here.
     batch_cap_ceiling = per_stream_cap;
     device_tune_set_ceiling(tune, per_stream_cap);
+    device_tune_set_streams(tune, ctxs.size());
     if (sched && tune) sched->set_gpu_batch_size(tune->batch_size.load(), device_id);
 
     while (true) {
@@ -35096,7 +35193,8 @@ static void gpu_decomp_worker(
             in_sum += batch_comp_sizes[i];
           if (m) m->read_bytes.fetch_add(in_sum, std::memory_order_relaxed);
           // This device's tuner: what ran, at the size intake asked for.
-          device_tune_record(tune, C.pop_req, C.filled, in_sum, batch_t0, now_ns(),
+          device_tune_record(tune, C.stream_index, C.pop_req, C.filled,
+                             in_sum, batch_t0, now_ns(),
                              C.pop_tune_epoch);
         }
 
@@ -36433,7 +36531,11 @@ gds_out_declined:
 
     tunes_decomp.reset(new DeviceTune[(size_t)gpu_count]);
     tune_init_devices(tunes_decomp.get(), gpu_count, gpu_ids, tune_run_decomp, opt,
-                      tune_pinned_decomp ? tune_pinned_decomp : opt.gpu_batch_cap,
+                      tune_pinned_decomp ? tune_pinned_decomp
+                      : opt.gpu_batch_user_set || opt.region_staged()
+                        ? opt.gpu_batch_cap
+                      : decomp_src_bytes == 0 ? DEFAULT_GPU_DECOMP_BATCH_CAP
+                      : tune_default_start(decomp_frame_cap(opt), decomp_src_bytes, /*decompress=*/true),
                       decomp_frame_cap(opt), bp_ptr ? bp_ptr->max_permits() : 0);
     for (int i = 0; i < gpu_count; ++i) {
       gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], i, opt,
@@ -43817,6 +43919,10 @@ static Options parse_args(int argc, char ** argv)
   // can't start until the batch finishes.  Auto-tune for ~4 batches total
   // to balance kernel efficiency with GPU-writer overlap.
   // Decompress batch: start based on file size, auto-tuner refines from there.
+  // Since v0.17.81 a KNOWN size starts from tune_default_start (bytes per batch
+  // by frame size) instead.  This value starts a staged path and contributes to
+  // the throttle budget.  An unknown-size input uses the direction's default
+  // start (8/16): on a multi-file run this cap may describe the FIRST file.
   // Small files: start low (16) so the tuner converges quickly.
   // Large files (>75 GiB): start high (256)  benchmarks show H100s perform
   // well at large batch sizes, and starting low wastes minutes exploring upward.
