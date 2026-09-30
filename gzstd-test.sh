@@ -611,7 +611,7 @@ human_size() {
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
 EXPECTED_TESTS=547
-$EXTENSIVE && EXPECTED_TESTS=705
+$EXTENSIVE && EXPECTED_TESTS=706
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -778,8 +778,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # tree refused by --gds-only, a GDS cell; -d refused; two devices sharing the
 # pool; the ordinary allocation).  540 -> 547, 698 -> 705; the no-GPU deltas grow
 # 143 -> 150 and 171 -> 178, and the no-GDS delta 13 -> 14.  DERIVED.
+# v0.17.83: one --extensive GDS cell (an nvidia-fs built for another driver is
+# refused before any GPU pin).  Default unchanged at 547; 705 -> 706, and the
+# --extensive no-GPU delta 178 -> 179.  DERIVED.
 EXPECTED_NOGPU_DELTA=150
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=178   # MEASURED 2026-09-21 (607 - 463) + 27 derived since
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=179   # MEASURED 2026-09-21 (607 - 463) + 27 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -795,7 +798,10 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=178   # MEASURED 2026-09-21 (607 - 463) + 27 
 # in particular the trivial-park cell, the lone skip on the 8-GPU host, RAN and
 # passed here, so the two hosts' skip lists are disjoint and between them every
 # one of the 607 cells has now been exercised.
+# v0.17.83 made it mode-DEPENDENT by one: its nvidia-fs staleness cell is a GDS
+# cell that exists only under --extensive.
 EXPECTED_NOGDS_DELTA=14   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82, derived
+$EXTENSIVE && EXPECTED_NOGDS_DELTA=15   # + the v0.17.83 --extensive cell
 
 # ============================================================
 # Banner & system info
@@ -3248,10 +3254,69 @@ if has_gpu 2>/dev/null && gds_testable && [[ "$gn_fs" == ext2/ext3 || "$gn_fs" =
   else
     skip "--gds-only with cuFile statistics on exits 0 and proves peer-to-peer (posix=0)" "no cufile.json with a cufile_stats key"
   fi
+
+  # --extensive only (rtcheek): the shape needs a driver change without an nvidia-fs
+  # rebuild, which is rare -- but when it happens the alternative is a kernel oops.
+  if $EXTENSIVE; then
+  # v0.17.83: an nvidia-fs built against ANOTHER driver is refused before anything
+  # pins GPU pages.  Going from driver 570 to 595 without rebuilding it, the first
+  # GDS read logged "Incompatible page table version 0x00020000" and hit BUG() in
+  # nvidia-fs -- a kernel oops, twice, each leaving an unkillable process.  DKMS
+  # never rebuilds nvidia-fs when only the driver changes.  GZSTD_DEBUG_NVFS_ROOT
+  # points the check at a fake /sys/module, DKMS tree and module directory, so both
+  # stale shapes are driven without root and without touching the real module.
+  ns_root="$TMPDIR/nvfs-root"; ns_why=""; ns_k=$(uname -r)
+  ns_mk() {   # ns_mk LOG_DRIVER MODULE_FILE_MTIME
+    rm -rf "$ns_root"
+    mkdir -p "$ns_root/sys/module/nvidia_fs" "$ns_root/sys/module/nvidia" \
+             "$ns_root/var/lib/dkms/nvidia-fs/2.26.6/$ns_k/x86_64/log" \
+             "$ns_root/lib/modules/$ns_k/updates/dkms"
+    echo 2.26.6 > "$ns_root/sys/module/nvidia_fs/version"
+    echo 595.91.07 > "$ns_root/sys/module/nvidia/version"
+    [[ -n "$1" ]] && echo "Picking NVIDIA driver sources from NVIDIA_SRC_DIR=/usr/src/nvidia-$1/nvidia-peermem." \
+      > "$ns_root/var/lib/dkms/nvidia-fs/2.26.6/$ns_k/x86_64/log/make.log"
+    touch -d "$2" "$ns_root/lib/modules/$ns_k/updates/dkms/nvidia-fs.ko.zst"
+    touch -d "2026-09-30 18:17:28" "$ns_root/sys/module/nvidia_fs"
+  }
+  t0=$(now_ms)
+  # Built against 570, 595 running: refused in BOTH directions, before any cuFile work.
+  ns_mk 570.207 "2026-09-24 18:04"
+  rc=0; GZSTD_DEBUG_NVFS_ROOT="$ns_root" "$GZSTD" -v -t --gds-only "$gn_z" 2>"$TMPDIR/ns.err" || rc=$?
+  [[ $rc -eq 2 ]] || ns_why+=" [stale -t exited $rc, want 2]"
+  grep -q 'built against driver 570.207, but driver 595.91.07 is running' "$TMPDIR/ns.err" \
+    || ns_why+=" [-t refusal does not name both drivers]"
+  grep -q 'After ANY NVIDIA driver change' "$TMPDIR/ns.err" || ns_why+=" [refusal does not point at the fix]"
+  grep -qi 'cufile' "$TMPDIR/ns.err" && ns_why+=" [cuFile ran before the refusal]"
+  rc=0; GZSTD_DEBUG_NVFS_ROOT="$ns_root" "$GZSTD" -q -f -k --gds-only "$TMPDIR/large.bin" \
+    -o "$TMPDIR/ns.zst" 2>"$TMPDIR/ns-c.err" || rc=$?
+  [[ $rc -eq 2 ]] || ns_why+=" [stale compress exited $rc, want 2]"
+  [[ -e "$TMPDIR/ns.zst" ]] && ns_why+=" [stale compress left an output]"
+  # Rebuilt on disk but still the OLD build in memory (loaded before the rebuild).
+  ns_mk 595.91.07 "2026-09-30 18:30"
+  rc=0; GZSTD_DEBUG_NVFS_ROOT="$ns_root" "$GZSTD" -t --gds-only "$gn_z" 2>"$TMPDIR/ns.err" || rc=$?
+  [[ $rc -eq 2 ]] || ns_why+=" [resident-old exited $rc, want 2]"
+  grep -q 'predates its rebuilt module' "$TMPDIR/ns.err" || ns_why+=" [resident-old refusal unnamed]"
+  # Consistent, and no build log at all: no false refusal (the real run proceeds).
+  ns_mk 595.91.07 "2026-09-30 18:01"
+  rc=0; GZSTD_DEBUG_NVFS_ROOT="$ns_root" "$GZSTD" -v -t --gds-only "$gn_z" 2>"$TMPDIR/ns.err" || rc=$?
+  [[ $rc -eq 0 ]] || ns_why+=" [consistent tree exited $rc]"
+  grep -q 'built against the running driver 595.91.07' "$TMPDIR/ns.err" || ns_why+=" [consistent tree not verified]"
+  ns_mk "" "2026-09-30 18:01"
+  rc=0; GZSTD_DEBUG_NVFS_ROOT="$ns_root" "$GZSTD" -v -t --gds-only "$gn_z" 2>"$TMPDIR/ns.err" || rc=$?
+  [[ $rc -eq 0 ]] || ns_why+=" [no build log exited $rc]"
+  grep -q 'cannot tell which driver' "$TMPDIR/ns.err" || ns_why+=" [no-log case not reported]"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$ns_why" ]] && pass "--gds-only refuses an nvidia-fs built for another driver, before any GPU pin" \
+    || fail "--gds-only refuses an nvidia-fs built for another driver, before any GPU pin" "$ns_why"
+  rm -rf "$ns_root" "$TMPDIR/ns.err" "$TMPDIR/ns-c.err" "$TMPDIR/ns.zst"
+  fi
   rm -f "$gn_z" "$TMPDIR/gn.err" "$TMPDIR/gn-tar.zst" "$TMPDIR/gn-tar.err"
 else
   skip "--gds-only refuses when cuFile reports no NVMe support" "needs a host where --gds-only runs, on ext4/xfs"
   skip "--gds-only with cuFile statistics on exits 0 and proves peer-to-peer (posix=0)" "needs a host where --gds-only runs"
+  if $EXTENSIVE; then
+    skip "--gds-only refuses an nvidia-fs built for another driver, before any GPU pin" "needs a host where --gds-only runs"
+  fi
 fi
 
 # ============================================================

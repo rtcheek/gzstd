@@ -1,12 +1,73 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.82  
+**Covers:** v0.9.50 → v0.17.83  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.83 — --gds-only refuses an nvidia-fs built for a different driver, instead of crashing the kernel
+
+**What happened.** A host moved from NVIDIA driver 570 to 595 (the branch that stops static BAR1 leaking
+kernel memory on every CUDA start). DKMS rebuilt the driver for every kernel but not nvidia-fs, which was
+already "installed" for those kernels, so `dkms autoinstall` skipped it. The first `--gds-only` read then
+pinned GPU pages through a module compiled against 570's `nv-p2p.h`:
+
+```
+nvidia-fs:nvfs_pin_gpu_pages:1383 Incompatible page table version 0x00020000
+kernel BUG at /var/lib/dkms/nvidia-fs/2.26.6/build/nvfs-stat.c:407!
+```
+
+That is a kernel oops, and it happened twice from gzstd. Each time the gzstd process hung as a zombie
+until killed, the module's references leaked so it could not be unloaded, and only a reboot recovered.
+gzstd's preflight could not see it coming: its checks all pass on such a host, and its own buffer
+registration and probe read are GPU pins.
+
+**Now `--gds-only` checks, before CUDA starts and before any cuFile call, that the LOADED nvidia-fs was
+built for the RUNNING driver.** It refuses with exit 2 in two cases:
+- DKMS's build log names another driver. The nvidia-fs Makefile writes
+  `NVIDIA_SRC_DIR=/usr/src/nvidia-<version>/...`, which is compared with `/sys/module/nvidia/version`.
+- The loaded module predates its file on disk: it was rebuilt, but the kernel still runs the old one. The
+  load time is the mtime of `/sys/module/nvidia_fs`. `srcversion` cannot tell the two builds apart,
+  because it hashes the module's own sources and was identical before and after the rebuild.
+
+The check reads only world-readable files. Anything it cannot read (the module not loaded, a non-DKMS
+install, a log without that line) counts as "cannot tell", and the later checks decide as before. `-v`
+says which case applied.
+
+**Documentation.** GDS.md now states the driver requirements it never did:
+- NVIDIA's OPEN kernel module, since nvidia-fs is GPL and cannot link against the proprietary one;
+- static BAR1 with both registry keys (`RMForceStaticBar1=1;RmForceDisableIomapWC=1`; only the first was
+  documented);
+- driver 595 or newer recommended, with the 570-versus-595 measurements that replace "not measured here";
+- the tested combinations.
+
+It also gains a section on rebuilding nvidia-fs after ANY driver change. That section includes pinning
+`NVIDIA_SRC_DIR`, because the nvidia-fs Makefile takes the first `nv-p2p.h` under `/usr/src/nvidia-*`,
+which can be the old driver's. `--help` states the same in brief.
+
+**Measured, same 8-GPU host and kernel, static BAR1 on, driver 570.207 against 595.91.07:**
+
+| | 570.207 | 595.91.07 |
+|---|---|---|
+| CUDA startup, 8 GPUs | 6.34-6.41 s | 2.97 s |
+| CUDA startup, 1 GPU | 1.49 s | 0.88 s |
+| P2PDMA pool / kernel memory | +128 GiB and +32 MiB per CUDA start | created once, then flat |
+| GDS (`posix=` counter) | all peer-to-peer | all peer-to-peer, compress and decompress |
+
+**Tests.** One `--extensive` GDS cell, using the hook `GZSTD_DEBUG_NVFS_ROOT`, which points the check at a
+fake `/sys/module`, DKMS tree and module directory so no root is needed:
+- a log naming 570 is refused in both directions, naming both drivers, with no cuFile activity and no
+  output;
+- a module loaded before its rebuild is refused;
+- a consistent tree and a tree with no log both proceed.
+
+Four mutants fail it: the call removed, the comparison inverted, the loaded-module check removed, and
+the version parser broken. It is `--extensive` only, because the shape needs a driver change without a
+rebuild. That makes the no-GDS skip delta mode-dependent for the first time: 14 by default, 15 with
+`-e`.
 
 ## v0.17.82 — --direct-stage creates tar archives, and stops capping its GPU batch at 64
 

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.82";
+static constexpr const char * GZSTD_VERSION = "0.17.83";
 //
 // Architecture overview:
 //
@@ -3399,9 +3399,122 @@ static void gds_cu_or_throw(cudaError_t e, const char * what)
 static void gz_refuse_all_old_before_cuda(const Options & opt);
 static void gz_select_usable_gds_preflight_device(const Options & opt);
 
+// IS THE LOADED nvidia-fs BUILT FOR THE RUNNING DRIVER?  Empty = yes, or cannot
+// tell; otherwise the reason it is not.
+//
+// nvidia-fs compiles against the driver's nv-p2p.h, whose GPU page-table format
+// is versioned, and DKMS never rebuilds it when only the driver changes: it is
+// already "installed" for every kernel, so `dkms autoinstall` skips it.  MEASURED
+// going from driver 570 to 595 (page tables v1 -> v2): the first GPU pin logged
+//     nvidia-fs:nvfs_pin_gpu_pages:1383 Incompatible page table version 0x00020000
+// and its error path hit BUG() in nvfs_update_free_gpustat -- a KERNEL OOPS.  The
+// process hung, the module's references leaked so it could never be unloaded,
+// and only a reboot recovered.  Everything else in this preflight -- the buffer
+// registration, the probe read -- would pin GPU pages first, so this runs before
+// any of it, and before CUDA starts.
+//
+// Two ways to be stale, both read without root:
+//   - DKMS's build log names another driver.  The nvidia-fs Makefile writes
+//       Picking NVIDIA driver sources from NVIDIA_SRC_DIR=/usr/src/nvidia-570.207/nvidia-peermem.
+//   - The LOADED module predates its file on disk: it was rebuilt after it loaded
+//     and is still the old build.  sysfs creates /sys/module/<mod> at load time,
+//     so that directory's mtime is the load time.  (srcversion cannot tell: it
+//     hashes the module's own sources, not the driver headers, and was identical
+//     before and after the rebuild.)
+// Anything missing -- not loaded, not a DKMS install, a Makefile that no longer
+// prints that line -- is "cannot tell", and the checks below decide as before.
+//
+// Test-only: GZSTD_DEBUG_NVFS_ROOT=DIR reads DIR/sys/module, DIR/var/lib/dkms and
+// DIR/lib/modules instead, so the suite can build a stale tree without root.
+static std::string gz_nvfs_stale_reason(const Options & opt)
+{
+#ifdef _WIN32
+  (void)opt;
+  return {};
+#else
+  const char * root_env = ::getenv("GZSTD_DEBUG_NVFS_ROOT");
+  const std::string root = (root_env && *root_env) ? root_env : "";
+  auto first_line = [](const std::string & p) {
+    std::ifstream f(p);
+    std::string v;
+    std::getline(f, v);
+    while (!v.empty() && (v.back() == '\n' || v.back() == ' ' || v.back() == '\r')) v.pop_back();
+    return v;
+  };
+  const std::string fsver = first_line(root + "/sys/module/nvidia_fs/version");
+  const std::string drv   = first_line(root + "/sys/module/nvidia/version");
+  if (fsver.empty() || drv.empty()) return {};
+  struct utsname u {};
+  if (::uname(&u) != 0) return {};
+  const std::string kver = u.release;
+
+  // 1. Loaded before its file was rebuilt.
+  struct stat loaded {};
+  if (::stat((root + "/sys/module/nvidia_fs").c_str(), &loaded) == 0) {
+    for (const char * name : {"nvidia-fs.ko.zst", "nvidia-fs.ko.xz", "nvidia-fs.ko",
+                              "nvidia_fs.ko.zst", "nvidia_fs.ko.xz", "nvidia_fs.ko"}) {
+      struct stat file {};
+      if (::stat((root + "/lib/modules/" + kver + "/updates/dkms/" + name).c_str(), &file) != 0)
+        continue;
+      const bool newer = file.st_mtim.tv_sec > loaded.st_mtim.tv_sec
+          || (file.st_mtim.tv_sec == loaded.st_mtim.tv_sec
+              && file.st_mtim.tv_nsec > loaded.st_mtim.tv_nsec);
+      if (newer)
+        return "the LOADED nvidia-fs " + fsver + " predates its rebuilt module on disk, so the "
+               "kernel is still running the old build.  Reload it (modprobe -r nvidia_fs && "
+               "modprobe nvidia_fs) or reboot";
+      break;
+    }
+  }
+
+  // 2. Built against another driver, per DKMS's own log.
+  std::error_code ec;
+  const fs::path kdir = fs::path(root + "/var/lib/dkms/nvidia-fs") / fsver / kver;
+  std::string built;
+  for (fs::directory_iterator it(kdir, ec), end; !ec && it != end; it.increment(ec)) {
+    std::ifstream log(it->path() / "log" / "make.log");
+    std::string line;
+    static const std::string key = "NVIDIA_SRC_DIR=/usr/src/";
+    while (std::getline(log, line)) {
+      const size_t k = line.find(key);
+      if (k == std::string::npos) continue;
+      const size_t b = k + key.size();
+      const size_t e = line.find('/', b);
+      const std::string dir = line.substr(b, e == std::string::npos ? std::string::npos : e - b);
+      const size_t dash = dir.rfind('-');
+      if (dash == std::string::npos) continue;
+      const std::string v = dir.substr(dash + 1);
+      if (!v.empty() && v.find_first_not_of("0123456789.") == std::string::npos) built = v;
+    }
+    if (!built.empty()) break;
+  }
+  if (built.empty()) {
+    vlog(V_VERBOSE, opt, "[GDS] cannot tell which driver nvidia-fs " + fsver
+         + " was built against (no DKMS build log naming one)\n");
+    return {};
+  }
+  if (built != drv)
+    return "nvidia-fs " + fsver + " was built against driver " + built + ", but driver " + drv
+           + " is running.  DKMS does not rebuild nvidia-fs when only the driver changes; "
+             "rebuild it for every kernel (GDS.md, \"After ANY NVIDIA driver change\")";
+  vlog(V_VERBOSE, opt, "[GDS] nvidia-fs " + fsver + " was built against the running driver "
+       + drv + "\n");
+  return {};
+#endif
+}
+
 static void gds_preflight_or_die(const Options & opt, FILE * in)
 {
   if (!opt.gds_only) return;
+  // FIRST, before CUDA and before any cuFile call: every later step here pins
+  // GPU pages, and a stale nvidia-fs turns the first pin into a kernel oops.
+  {
+    const std::string stale = gz_nvfs_stale_reason(opt);
+    if (!stale.empty())
+      die_usage("--gds-only: " + stale + ".\n  A GDS read through it would pin GPU pages "
+                "in a page-table format it was not built for; going from driver 570 to 595\n"
+                "  that is a kernel oops.  Nothing was read.  --direct-stage needs no nvidia-fs.");
+  }
   // cuFileDriverOpen starts CUDA internally.  On an all-old host the ordinary
   // device check would refuse the run, but this preflight reaches cuFile first.
   gz_refuse_all_old_before_cuda(opt);
@@ -4564,6 +4677,14 @@ static void print_help_long()
 "     plus the nvidia-fs kernel module, a filesystem cuFile will accept,\n"
 "     and a kernel without the shadow-buffer pin regression.  Anything\n"
 "     missing is a usage error (exit 2) naming the specific cause.\n"
+"\n"
+"     THE DRIVER: NVIDIA's OPEN kernel module (nvidia-fs cannot link\n"
+"     against the proprietary one) with static BAR1 enabled; 595 or newer\n"
+"     is recommended, since 570 with static BAR1 slows every CUDA start\n"
+"     and leaks kernel memory.  nvidia-fs 2.26.6 or newer, BUILT AGAINST\n"
+"     THE RUNNING DRIVER: DKMS does not rebuild it when only the driver\n"
+"     changes, and a stale build turns the first GDS read into a kernel\n"
+"     oops, so gzstd refuses one before any GPU access.  See GDS.md.\n"
 "\n"
 "     WHAT IT BUYS IS NOT THROUGHPUT.  Both paths saturate the same\n"
 "     drive.  Measured on a Gen4 NVMe host, GDS cost 0.49 host CPU-\n"
