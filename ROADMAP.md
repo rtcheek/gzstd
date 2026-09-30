@@ -253,7 +253,7 @@ correspondingly hard to justify.
 
 **Open, in rough order of value:**
 
-1. **`--direct-stage` for `--tar` create.** The tar assembler composes each frame from many member
+1. ~~**`--direct-stage` for `--tar` create.**~~ **SHIPPED v0.17.82 -- see the end of this item.** The tar assembler composes each frame from many member
    extents rather than reading one contiguous region. This is the case that would actually help
    archives of large media, and unlike `--tar --gds-only` it would not be defeated by the 512-byte
    header knocking every member off the 4 KiB grid — a host read has no alignment requirement
@@ -273,10 +273,28 @@ correspondingly hard to justify.
    a copy-free path existed; a tar frame is *assembled* from disjoint extents at unaligned offsets,
    so there is no copy-free alternative, and `--gds-only --tar` already pays the equivalent. Worth
    measuring per-extent-H2D against assemble-in-pinned-then-one-H2D-per-frame rather than assuming.
+
+   **SHIPPED v0.17.82, as assemble-in-pinned-then-one-DMA-per-frame.** The per-extent shape was
+   measured first, and it already existed: `--tar --gds-only` with `GZSTD_DEBUG_GDS_FORCE_BOUNCE`
+   is exactly per-extent H2D. It ran 16 GiB cold at 10.9 s against the ordinary path's 6.9 s. Its
+   12 readers sat at 51% I/O, and each one did a synchronous cudaMemset, a default-stream sync and a
+   cudaMemcpy per extent. So the frame is now composed in page-locked HOST slots with plain writes
+   and O_DIRECT reads, and the worker moves it with one DMA. The result is 6.2-6.6 s wall and 9.4-10.1 s
+   host CPU, against the ordinary path's 6.5-7.0 s and 21-50 s (CHANGELOG v0.17.82). What decided the
+   design was the POOL SIZE, not the copy: at 16 MiB frames, 32 slots ran 6.2 s and 144 ran 8.7 s,
+   because pinning, pipeline fill and the last batch's drain all grow with the pool.
+   - **Follow-up, now the top item: plain-file `--direct-stage` onto the same producer.** On one 16 GiB file it
+     runs 8.8-9.0 s against the ordinary reader's 7.3-7.7, because its reads happen inside the worker
+     and are joined before each launch. The tar path's readers fill a pinned pool AHEAD of the GPU,
+     and it is the faster of the two. A plain file is the easy case of that producer: its regions
+     are MiB-aligned, so every O_DIRECT read lands in place with no window and no copy.
 2. **The 64-frame batch floor is still a machine-tuned constant** — it comes from this box's
-   0.28 GiB/s-per-frame device checksum against a 4.9 GiB/s drive, and now applies to two backends
-   instead of one. Unchanged `feedback_code_to_general_goals` violation; derive it from the measured
-   checksum rate and device rate instead.
+   0.28 GiB/s-per-frame device checksum against a 4.9 GiB/s drive. Unchanged
+   `feedback_code_to_general_goals` violation; derive it from the measured checksum rate and device
+   rate instead. **Narrowed in v0.17.82 to `--gds-only`.** `--direct-stage` no longer takes the floor or
+   the 64-frame cap. It starts at the tuner's byte target and takes the ordinary allocation, because
+   the cap existed for cuFile registration cost, which it never pays. At 1 MiB frames the cap had held
+   it at 64 against the ordinary path's 256: 14.6 s against 8.9 s on 16 GiB.
 3. **Decompress has no equivalent.** `--gds-only` writes VRAM to NVMe through cuFile; there is no
    O_DIRECT write out of VRAM, so the portable path stops at compression. Whether a D2H-into-pinned
    plus O_DIRECT-pwrite arrangement beats the ordinary writer is unmeasured.
@@ -828,6 +846,16 @@ as views into the block (CHANGELOG v0.17.47): `--cpu-only` 14.66 to 40.08 GiB/s 
   state table first.
 - **Memory.** Views raise 8-GPU peak RSS by about 16 GiB (51–58 against 34–41 GiB). The cap bounds them at an
   eighth of available RAM, but no small-RAM host has exercised it yet.
+
+## OPEN (observed 2026-09-30, unreproduced): one tail-yield pipe run decided a GPU intake and never yielded
+
+v0.17.82's suite run skipped the tail-yield pipe cell ("no GPU came online"), which is host timing.
+Of one standalone batch of five runs of that arm, run 1 brought a GPU online and hit the cell's FAIL
+condition: the check decided a GPU intake (`tail check decided`) and logged no yield, against pinned
+rates of 10,000x in the CPU's favour. The decision line was not captured. In 24 further runs, 12 each
+of v0.17.81 and v0.17.82 (the decompress code is identical), no GPU came online at all. If it
+recurs, capture the `-vv` log: the decided line says `take` or `decline`, and a `take` against
+those rates is the defect v0.17.78's trace was added to catch.
 
 ## FIXED v0.17.80: the decompress tuner's shared VRAM ceiling never matched what a device ran
 
@@ -2060,8 +2088,9 @@ AND decompress writes), then its portable 95%, `--direct-stage` (v0.17.9–10). 
 >   tuner's ramp on a ~20 GiB input, not the pipeline — see "OPEN QUESTION: is GPU compress worth
 >   another round?" at the top.
 > - **Still open:** the loaded-box comparison ("3. The comparison that would actually settle GDS's
->   case is a LOADED box"), `--direct-stage` for `--tar` create, and a portable O_DIRECT write of
->   decompressed output out of VRAM (items 1 and 3 under the `--direct-stage` section).
+>   case is a LOADED box"), plain-file `--direct-stage` onto the pinned-pool producer, and a
+>   portable O_DIRECT write of decompressed output out of VRAM (the `--direct-stage` section).
+>   `--direct-stage` for `--tar` create SHIPPED in v0.17.82.
 
 > **2026-08-13 note (SUPERSEDED — see above).** This was once written off on the arithmetic that the drive (4.56 GiB/s)
 > has 5× less bandwidth than the H2D link (25+ GiB/s), so removing the host bounce optimises a

@@ -1,12 +1,142 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.81  
+**Covers:** v0.9.50 → v0.17.82  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.82 — --direct-stage creates tar archives, and stops capping its GPU batch at 64
+
+`--direct-stage` refused `--tar`, because a tar frame is not one region of one file: it is many member
+extents plus headers gzstd writes. The ROADMAP had this as the case that would actually help archives
+of large media, since the ordinary tar path reads every member through the page cache.
+
+**How.** The tar assembler composes each frame in a slot of PAGE-LOCKED HOST memory, not in VRAM as
+`--tar --gds-only` does. There is no CUDA call on the assembler threads:
+- member data is read with O_DIRECT, in place where it sits on the 4 KiB grid, and through an aligned
+  window where tar's 512-byte headers push it off;
+- headers and zero padding are written with plain memset and memcpy;
+- the worker moves each finished frame into its slab with one DMA and frees the slot before it
+  compresses.
+
+No cuFile is loaded, so there is no alignment penalty either. The pool is portable pinned memory, so
+unlike `--gds-only --tar`, several GPUs may share it.
+
+**Measured.** 16 GiB, cold before every run, output to /dev/null, one H100 PCIe, runs interleaved
+(three runs each unless noted):
+
+| corpus | ordinary `--tar --gpu-only` | `--tar --direct-stage` |
+|---|---|---|
+| sixteen 1 GiB files | 6.53-7.04 s, host CPU ~50 s | **6.20-6.57 s, 9.4-9.5 s** |
+| 7,217-file backup-shaped tree | 6.77-6.96 s, 20.7-21.0 s | **6.19-6.26 s, 9.6-10.1 s** |
+| sixteen 1 GiB files, 1 MiB chunks (x2) | 6.36-6.48 s, ~50 s | **5.95-6.08 s, 11.7-12.0 s** |
+
+The ordinary path spends about 2.9 s of kernel CPU per GiB on buffered reads of large files. That is
+the cost this flag removes.
+
+**The pool is sized to one starting batch per device, and no more.** A worker frees its slots before
+compressing, so the readers refill while the GPU works. A deeper pool only adds pinning (about 0.55 s
+per GiB, all of it before the first read), a longer pipeline fill and a bigger last batch to drain. At
+16 MiB frames: 32 slots 6.20-6.57 s, 48 6.64-6.66, 64 7.02-7.32, 80 7.63-7.66, and the first sizing
+rule's 144 slots 8.74 s. 16 slots matched 32 on wall but cost 15-25% more host CPU in smaller
+batches. The start is the tuner's byte target (~512 MiB), so the pool is ~512 MiB at any frame size,
+bounded by RAM and `--memlimit`.
+
+**A member on a filesystem that refuses O_DIRECT** (squashfs, many FUSE mounts) now reads through the
+page cache under `--direct-stage` instead of failing. The run reports how much at default verbosity.
+This was found by archiving a snap's squashfs next to an ext4 tree. `--gds-only --tar` REFUSES such a
+tree instead (exit 2, naming the member and pointing at `--direct-stage`), because its contract is
+the peer-to-peer path or nothing. It refuses before any worker starts: one O_DIRECT open per
+data member, on the main thread. The cuFile NVMe-status refusal runs there as well.
+
+**Also: `--direct-stage` stopped inheriting `--gds-only`'s 64-frame batch cap.** That cap exists
+because `--gds-only` registers its slab with cuFile (~950 ms per 4 GiB). `--direct-stage` registers
+nothing. At 1 MiB frames the cap held it at 64 (2.54 GiB/s) where the ordinary path runs 256
+(3.35 GiB/s). It now starts at the tuner's byte target and takes the ordinary allocation:
+
+| one 16 GiB file, cold (x2) | v0.17.81 | v0.17.82 | ordinary `--gpu-only` |
+|---|---|---|---|
+| 16 MiB chunks | 9.19-9.28 s | 8.83-8.97 s | 7.29-7.67 s |
+| 1 MiB chunks | **14.61 s** | **8.67-9.03 s** | 6.49-6.84 s |
+
+Plain-file `--direct-stage` is still behind the ordinary reader on wall, because its reads happen
+inside the worker and are joined before each launch. The tar path's readers fill the pool ahead of the
+GPU instead, which is why it is the faster of the two. See ROADMAP.
+
+**Diagnostics.**
+- A reader waiting for a staging slot now counts as blocked-downstream. Before, 60% of a reader's time
+  showed up nowhere, and the governor could not tell a consumer-bound tar create from a
+  source-bound one.
+- `-v` prints `[DSTAGE] --tar: N frames, B bytes ... member data X bytes O_DIRECT, Y buffered`. The
+  frame bytes equal the tar stream's size exactly, so a caller can check that every frame went this
+  way.
+
+**Review.** An independent review's first round found three defects, all fixed:
+- **`--gds-only --tar` would have run a tree with an O_DIRECT-refusing member** entirely through the
+  page cache, against its refusal contract. Its first fix refused from inside the assembler. On a
+  squashfs tree, whose FIRST member refuses, that called `exit()` while GPU bringup was still
+  running, which crashed (SIGSEGV) and left a partial archive. The refusal now happens in a preflight
+  before the run; reproduced clean 5 of 5 times.
+- **A filesystem can accept O_DIRECT at open and still refuse a read** that needs more than 4 KiB
+  alignment (EINVAL). That used to leave the member zero-filled and reported as "changed as we read
+  it". Now O_DIRECT is cleared on that descriptor and the whole segment is reread buffered. Checked
+  with a test build whose in-place reads fail this way: the archive is identical, and 45.5 MiB is
+  reported as buffered.
+- **A failed staging copy could let the fault path release slots** while an earlier copy of the same
+  batch was still queued. The stream is now joined before the error propagates.
+
+A second round found that the crash above was one of a class. Every `die()` reachable from the tar
+assembler threads, or from the staging setup after the workers start, called `exit()` while GPU
+work was live. There were nine sites: the cuFile NVMe-status refusal (which predates this version),
+the CUDA zero-fill, sync and copies, device selection, the bounce-buffer allocation, and two
+invariants.
+- **The NVMe-status refusal** moved into the preflight. The preflight now checks every data member
+  rather than one per filesystem, since overlayfs and FUSE can decide per file. MEASURED on the
+  7,217-file tree: no wall-clock cost.
+- **An assembler failure** now aborts the pass and rebuilds from the sources, as a GPU fault does.
+  Injected, three times each: exit 0, a correct archive, and a warning naming the cause, in both
+  staging modes.
+- **A staging setup failure** is held until the workers and writer have joined, then reported.
+  Injected pinning failure: exit 1, no output left, no crash, 3 of 3.
+
+A third round found a lost wakeup on that abort path, and it also applied to the older path taken
+when a reader notices a GPU fault. The abort set its flag and notified the tar pusher without holding
+the pusher's mutex. A notify landing between the pusher's predicate check and its sleep was lost, and
+the run would hang joining the pusher instead of reaching the rebuild. Every abort notification now
+takes the mutex. The timing was found by inspection and not reproduced; the injected failures above
+all pass on the fixed code, including with one reader.
+
+**Tests.** A new section of seven GPU cells (one needs a working GPUDirect Storage host):
+- every frame staged, exact counts and the same archive as the ordinary path on a tree built for the
+  edges (sizes either side of 512, 4096 and 1 MiB; a long name; a symlink; a hard link; empty and
+  sparse files);
+- a member refusing O_DIRECT (hook `GZSTD_DEBUG_TAR_REFUSE_ODIRECT`) is read buffered, counted
+  exactly and named;
+- no libcufile, with `--gds-only` as the control;
+- the same tree refused by `--gds-only --tar` before it starts, leaving no output;
+- `-d --tar --direct-stage` refused;
+- two devices sharing the pool;
+- plain `--direct-stage` taking the ordinary allocation.
+
+Ten mutants each fail their cell: the in-place read offset, the window offset, the tail's file
+offset, the frame credit, the fallback, the note, a libcufile load, the `-d` refusal, the old cap,
+and the `--gds-only` preflight.
+The `-d --tar --direct-stage` refusal cell extracts with `-C` into its own directory. The mutant
+without the refusal had extracted the tree into the suite's working directory.
+
+The v0.17.78 tail-yield pipe cell's "no GPU came online" branch now skips as host-decided, like its
+other "not exercised" branches. It raised the drift note in this version's suite run. v0.17.81 and
+v0.17.82 behave identically there: on a busy afternoon, 0 of 18 runs of each brought a GPU online
+before a one-thread CPU finished the 1 GiB pipe. One earlier standalone run did reach the cell's FAIL
+condition (a decision with no yield), and 24 further runs did not reproduce it. That observation is
+open and recorded in ROADMAP.
+
+Checked by hand as well: `--sparse` and 1 MiB chunks give byte-identical archives, the system `tar`
+extracts the tree identically (the sparse file stays sparse), and 16 GiB of both corpora match
+byte for byte.
 
 ## v0.17.81 — the batch tuner ignores a size's first batch, and starts by frame size
 

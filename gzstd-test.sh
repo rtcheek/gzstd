@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=540
-$EXTENSIVE && EXPECTED_TESTS=698
+EXPECTED_TESTS=547
+$EXTENSIVE && EXPECTED_TESTS=705
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -773,8 +773,13 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.80: two GPU cells for the per-device batch tuner (538 -> 540, 696 ->
 # 698), so the no-GPU deltas grow 141 -> 143 and 169 -> 171.  DERIVED; 143 then
 # MEASURED by the CPU-only run (397 = 540 - 143).
-EXPECTED_NOGPU_DELTA=143
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=171   # MEASURED 2026-09-21 (607 - 463) + 27 derived since
+# v0.17.82: seven GPU cells for --tar --direct-stage (every frame staged and the
+# same archive; an O_DIRECT-refusing member read buffered; no libcufile; the same
+# tree refused by --gds-only, a GDS cell; -d refused; two devices sharing the
+# pool; the ordinary allocation).  540 -> 547, 698 -> 705; the no-GPU deltas grow
+# 143 -> 150 and 171 -> 178, and the no-GDS delta 13 -> 14.  DERIVED.
+EXPECTED_NOGPU_DELTA=150
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=178   # MEASURED 2026-09-21 (607 - 463) + 27 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -790,7 +795,7 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=171   # MEASURED 2026-09-21 (607 - 463) + 27 
 # in particular the trivial-park cell, the lone skip on the 8-GPU host, RAN and
 # passed here, so the two hosts' skip lists are disjoint and between them every
 # one of the 607 cells has now been exercised.
-EXPECTED_NOGDS_DELTA=13   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells, derived
+EXPECTED_NOGDS_DELTA=14   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82, derived
 
 # ============================================================
 # Banner & system info
@@ -7868,7 +7873,10 @@ if has_gpu 2>/dev/null; then
   if [[ $rc -ne 0 ]]; then
     fail "decompress GPU yields the tail (pipe: producer-done arms it)" "exit $rc"
   elif [[ $ty_on -eq 0 ]]; then
-    skip "decompress GPU yields the tail (pipe: producer-done arms it)" "not exercised: no GPU came online"
+    # skip_host, like the branches below: the HOST decides whether bringup beats
+    # a -T1 CPU through a 1 GiB pipe (v0.17.81 and v0.17.82 alike: 0 of 18 runs
+    # came online on a busy afternoon), so it must not raise the drift note.
+    skip_host "decompress GPU yields the tail (pipe: producer-done arms it)" "not exercised: no GPU came online"
   elif [[ $ty_l -eq 0 && $ty_d -eq 0 ]]; then
     skip_host "decompress GPU yields the tail (pipe: producer-done arms it)" \
          "not exercised: no GPU intake reached the armed check (the CPU drained the queue first)"
@@ -8086,6 +8094,214 @@ else
   skip "--direct-stage wedged batch is reclaimed from the held archive" "no GPU"
   skip "--direct-stage without a seek table stands down and says so" "no GPU"
   skip "--direct-stage -d reads ahead; -t does not" "no GPU"
+fi
+
+
+section "--direct-stage --tar creation"
+
+# v0.17.82: --tar --direct-stage composes each frame in page-locked HOST slots --
+# member extents read O_DIRECT, headers written in place, no CUDA call on the
+# assembler threads -- and the worker moves each finished frame with one DMA.
+# MEASURED, 16 GiB cold, one H100: wall 6.2-6.6 s against the ordinary path's
+# 6.5-7.0, host CPU 9.4-10.1 s against 21 (small-file tree) and 50 (large files).
+#
+# AS WITH EVERY STAGED PATH, BYTE-IDENTITY ALONE PROVES NOTHING: a failed or
+# stood-down stage still produces the right archive.  So the cells also compare
+# the [DSTAGE] totals with what the tar stream must contain -- every frame, every
+# byte, and every member byte by the route it took.
+#
+# The tree is built to hit the edges: sizes either side of 512, 4096 and 1 MiB
+# (O_DIRECT is 4 KiB-aligned; tar headers are 512 bytes, so most member data lands
+# off that grid and must go through the aligned window, while some lands on it and
+# is read in place), a long name (a PAX header), a symlink, a hard link, an empty
+# file and a sparse one.  --chunk-size=1 gives ~40 frames from a small tree.
+if has_gpu 2>/dev/null; then
+  dst_tree="$TMPDIR/dst-tree"; dst_log="$TMPDIR/dst.log"; dst_zst="$TMPDIR/dst.zst"
+  dst_ord="$TMPDIR/dst-ord.zst"
+  rm -rf "$dst_tree"; mkdir -p "$dst_tree/sub/deep"
+  (
+    set +o pipefail
+    head -c $((12*1048576)) /dev/urandom | base64 -w0 | head -c $((16*1048576)) > "$TMPDIR/dst-seed"
+  )
+  : > "$dst_tree/empty"
+  for n in 1 511 512 513 4095 4096 4097 1048575 1048576 1048577 5000123; do
+    head -c "$n" "$TMPDIR/dst-seed" > "$dst_tree/sz_$n"
+  done
+  for i in $(seq 1 64); do
+    head -c $(( (i * 7919) % 300000 + 1 )) "$TMPDIR/dst-seed" > "$dst_tree/sub/deep/f$i"
+  done
+  head -c 7777 "$TMPDIR/dst-seed" > "$dst_tree/sub/$(printf 'n%.0s' $(seq 1 150))"
+  ln -s sz_4097 "$dst_tree/link"
+  ln "$dst_tree/sz_513" "$dst_tree/hard_513"
+  truncate -s 8M "$dst_tree/sparse"
+  dd if="$TMPDIR/dst-seed" of="$dst_tree/sparse" bs=4096 seek=700 count=9 conv=notrunc status=none
+  rm -f "$TMPDIR/dst-seed"
+  "$GZSTD" -q -f --tar --gpu-only --chunk-size=1 "$dst_tree" -o "$dst_ord" 2>/dev/null
+  dst_size=$("$GZSTD" -d -q -c "$dst_ord" | wc -c)
+  dst_want="$(( (dst_size + 1048575) / 1048576 )) $dst_size"
+  # Member bytes: one copy per inode (a hard link's second name carries no data).
+  dst_members=$(find "$dst_tree" -type f -printf '%i %s\n' | sort -u | awk '{s += $2} END {print s + 0}')
+  dst_deep=$(find "$dst_tree/sub/deep" -type f -printf '%s\n' | awk '{s += $1} END {print s + 0}')
+  dst_got() { grep -a -o '\[DSTAGE\] --tar: [0-9]* frames, [0-9]* bytes' "$1" | awk '{print $3, $5}'; }
+  dst_mem() { grep -a -o 'member data [0-9]* bytes O_DIRECT, [0-9]* buffered' "$1" | awk '{print $3, $6}'; }
+
+  # 1. Every frame staged, every member byte read O_DIRECT, and the same archive.
+  rc=0
+  timeout --foreground -k 10 120 "$GZSTD" --tar --direct-stage --chunk-size=1 -v -f \
+    "$dst_tree" -o "$dst_zst" 2>"$dst_log" || rc=$?
+  dst_have=$(dst_got "$dst_log"); dst_route=$(dst_mem "$dst_log")
+  if [[ $rc -ne 0 ]]; then
+    fail "--tar --direct-stage stages every frame and matches the ordinary archive" "exit $rc"
+  elif [[ "$dst_have" != "$dst_want" ]]; then
+    fail "--tar --direct-stage stages every frame and matches the ordinary archive" \
+         "staged '${dst_have:-nothing}', expected '$dst_want'"
+  elif [[ "$dst_route" != "$dst_members 0" ]]; then
+    fail "--tar --direct-stage stages every frame and matches the ordinary archive" \
+         "member bytes O_DIRECT/buffered '${dst_route:-none}', expected '$dst_members 0'"
+  elif ! files_match "$dst_ord" "$dst_zst"; then
+    fail "--tar --direct-stage stages every frame and matches the ordinary archive" "archive differs"
+  else
+    pass "--tar --direct-stage stages every frame and matches the ordinary archive"
+  fi
+
+  # 2. A member whose filesystem refuses O_DIRECT (squashfs, most FUSE) is read
+  # through the page cache, counted as such, and named at DEFAULT verbosity.  The
+  # hook refuses the open exactly as such a filesystem does (EINVAL).
+  rc=0
+  env GZSTD_DEBUG_TAR_REFUSE_ODIRECT=/sub/deep/ timeout --foreground -k 10 120 \
+    "$GZSTD" --tar --direct-stage --chunk-size=1 -v -f "$dst_tree" -o "$dst_zst" 2>"$dst_log" || rc=$?
+  dst_route=$(dst_mem "$dst_log")
+  if [[ $rc -ne 0 ]]; then
+    fail "--tar --direct-stage reads an O_DIRECT-refusing member buffered" "exit $rc"
+  elif [[ "$dst_route" != "$((dst_members - dst_deep)) $dst_deep" ]]; then
+    fail "--tar --direct-stage reads an O_DIRECT-refusing member buffered" \
+         "member bytes O_DIRECT/buffered '${dst_route:-none}', expected '$((dst_members - dst_deep)) $dst_deep'"
+  elif ! grep -aq 'read through the page cache, because its filesystem refused O_DIRECT' "$dst_log"; then
+    fail "--tar --direct-stage reads an O_DIRECT-refusing member buffered" "no note"
+  elif ! files_match "$dst_ord" "$dst_zst"; then
+    fail "--tar --direct-stage reads an O_DIRECT-refusing member buffered" "archive differs"
+  else
+    pass "--tar --direct-stage reads an O_DIRECT-refusing member buffered"
+  fi
+
+  # 3. No cuFile.  --gds-only is the control that proves the detector sees it.
+  LD_DEBUG=libs "$GZSTD" --tar --direct-stage --chunk-size=1 -q -f "$dst_tree" -o "$dst_zst" 2>"$dst_log"
+  dst_cuf=$(grep -a -c -i 'cufile' "$dst_log")
+  LD_DEBUG=libs "$GZSTD" --tar --gds-only --chunk-size=1 -q -f "$dst_tree" -o "$dst_zst" 2>"$dst_log.ctl"
+  dst_ctl=$(grep -a -c -i 'cufile' "$dst_log.ctl")
+  if [[ $dst_ctl -eq 0 ]]; then
+    skip "--tar --direct-stage never loads libcufile" \
+         "not provable here: --gds-only loaded no libcufile either (static build, or no cuFile)"
+  elif [[ $dst_cuf -gt 0 ]]; then
+    fail "--tar --direct-stage never loads libcufile" "libcufile appeared in the loader log"
+  else
+    pass "--tar --direct-stage never loads libcufile"
+  fi
+  rm -f "$dst_log.ctl"
+
+  # 3b. --gds-only must REFUSE that tree (ROADMAP "SETTLED: --gds-only REFUSES"):
+  # the member could only be read through the page cache.  Refused BEFORE the run
+  # -- the first version refused from an assembler thread, and exit() there, with
+  # GPU workers running, crashed (SIGSEGV) and left a partial archive.
+  rm -f "$dst_zst"
+  if ! gds_testable; then
+    skip "--tar --gds-only refuses an O_DIRECT-refusing tree before it starts" \
+         "GDS unavailable ($(gds_host_status))"
+  else
+    rc=0
+    env GZSTD_DEBUG_TAR_REFUSE_ODIRECT=/sub/deep/ timeout --foreground -k 10 120 \
+      "$GZSTD" --tar --gds-only --chunk-size=1 -f "$dst_tree" -o "$dst_zst" 2>"$dst_log" || rc=$?
+    if [[ $rc -eq 2 ]] && grep -aq 'does not accept O_DIRECT' "$dst_log" && [[ ! -e "$dst_zst" ]]; then
+      pass "--tar --gds-only refuses an O_DIRECT-refusing tree before it starts"
+    else
+      fail "--tar --gds-only refuses an O_DIRECT-refusing tree before it starts" \
+           "exit $rc; output $([[ -e "$dst_zst" ]] && echo left || echo absent)"
+    fi
+  fi
+
+  # 4. Extraction has nothing to stage: refused as usage, before touching anything.
+  # -C, not -o: extraction writes relative to -C, so a regressed refusal must land
+  # in $TMPDIR (and be seen there), not in the suite's working directory -- which
+  # is where the mutant with this refusal removed extracted the tree.
+  rc=0; mkdir -p "$TMPDIR/dst-x"
+  "$GZSTD" -d --tar --direct-stage -f "$dst_ord" -C "$TMPDIR/dst-x" 2>"$dst_log" || rc=$?
+  if [[ $rc -eq 2 ]] && grep -aq 'applies to --tar creation' "$dst_log" \
+     && [[ -z "$(ls -A "$TMPDIR/dst-x")" ]]; then
+    pass "-d --tar --direct-stage is refused (creation only)"
+  else
+    fail "-d --tar --direct-stage is refused (creation only)" "exit $rc"
+  fi
+  rm -rf "$TMPDIR/dst-x"
+
+  # 5. The pool is PORTABLE page-locked memory, so unlike --gds-only --tar (one
+  # cuFile-registered VRAM pool) two devices may share it.
+  dst_cards=()
+  if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
+    if [[ "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+      mapfile -t dst_cards < <(gpu_uuids_by_free 4096 "$GPU_ALL_DEVICES")
+    else
+      IFS=, read -r -a dst_cards <<< "$GPU_ALL_DEVICES"
+    fi
+  fi
+  if (( ${#dst_cards[@]} >= 2 )); then
+    rc=0
+    env CUDA_VISIBLE_DEVICES="${dst_cards[0]},${dst_cards[1]}" timeout --foreground -k 10 120 \
+      "$GZSTD" --tar --direct-stage --gpu-devices=2 --chunk-size=1 -v -f "$dst_tree" \
+      -o "$dst_zst" 2>"$dst_log" || rc=$?
+    dst_have=$(dst_got "$dst_log")
+    if [[ $rc -eq 0 && "$dst_have" == "$dst_want" ]] && files_match "$dst_ord" "$dst_zst"; then
+      pass "--tar --direct-stage shares its pool across two devices"
+    else
+      fail "--tar --direct-stage shares its pool across two devices" \
+           "exit $rc; staged '${dst_have:-nothing}', expected '$dst_want'"
+    fi
+  else
+    skip_host "--tar --direct-stage shares its pool across two devices" "needs two GPUs"
+  fi
+  rm -rf "$dst_tree" "$dst_zst" "$dst_ord" "$dst_log"
+
+  # 6. --direct-stage takes the ordinary GPU allocation.  Its 64-frame cap was
+  # there for --gds-only, whose slab is cuFile-registered (~950 ms per 4 GiB);
+  # --direct-stage registers nothing, and at 1 MiB frames the cap held it at 64
+  # (2.54 GiB/s) where the ordinary path ran 256 (3.35).  Compared with the
+  # ordinary path on the same card, so a card whose own ceiling is <= 64 cannot
+  # tell the two apart and says so.
+  dst_one="$TMPDIR/dst-one.bin"
+  (
+    set +o pipefail
+    head -c $((72*1048576)) /dev/urandom | base64 -w0 | head -c $((96*1048576)) > "$dst_one"
+  )
+  dst_ceil() { grep -a -o 'f1: settled [0-9]*, measured up to [0-9]*, ceiling [0-9]*' "$1" | awk '{print $NF}' | head -1; }
+  # GZSTD_DEBUG_TUNE_FAST: the summary line needs one closed window.  96 frames
+  # at the start of 8 are twelve batches: a 32-frame input was four, two of them
+  # bringup warm-up and two still in flight at exit, so no window ever closed.
+  # The ceiling itself does not depend on either.
+  rc=0
+  env GZSTD_DEBUG_TUNE_FAST=1 "$GZSTD" --gpu-only --chunk-size=1 -v -f "$dst_one" -o "$dst_zst" 2>"$dst_log" || rc=$?
+  dst_c_ord=$(dst_ceil "$dst_log")
+  env GZSTD_DEBUG_TUNE_FAST=1 "$GZSTD" --direct-stage --chunk-size=1 -v -f "$dst_one" -o "$dst_zst" 2>"$dst_log" || rc=$?
+  dst_c_ds=$(dst_ceil "$dst_log")
+  if [[ $rc -ne 0 || -z "$dst_c_ord" || -z "$dst_c_ds" ]]; then
+    fail "--direct-stage takes the ordinary GPU allocation" \
+         "exit $rc; ceilings ordinary '${dst_c_ord:-none}' staged '${dst_c_ds:-none}'"
+  elif (( dst_c_ord <= 64 )); then
+    skip_host "--direct-stage takes the ordinary GPU allocation" \
+              "not exercised: this card's own ceiling is $dst_c_ord"
+  elif [[ "$dst_c_ds" == "$dst_c_ord" ]]; then
+    pass "--direct-stage takes the ordinary GPU allocation" "(ceiling $dst_c_ds)"
+  else
+    fail "--direct-stage takes the ordinary GPU allocation" \
+         "ceiling $dst_c_ds under --direct-stage, $dst_c_ord ordinary"
+  fi
+  rm -f "$dst_one" "$dst_zst" "$dst_log"
+else
+  skip "--tar --direct-stage stages every frame and matches the ordinary archive" "no GPU"
+  skip "--tar --direct-stage reads an O_DIRECT-refusing member buffered" "no GPU"
+  skip "--tar --direct-stage never loads libcufile" "no GPU"
+  skip "--tar --gds-only refuses an O_DIRECT-refusing tree before it starts" "no GPU"
+  skip "-d --tar --direct-stage is refused (creation only)" "no GPU"
+  skip "--tar --direct-stage shares its pool across two devices" "no GPU"
+  skip "--direct-stage takes the ordinary GPU allocation" "no GPU"
 fi
 
 
