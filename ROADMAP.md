@@ -70,22 +70,13 @@ describes a moving target we do not control.
 
 ---
 
-## OPEN DEFECT (found v0.17.84 review, unreproduced): GPU intake + multi-reader pooled read can deadlock
+## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
-Codex's analysis while reviewing v0.17.84. `pooled_read_chunks` claims a chunk before it takes a buffer and
-pushes out of order (sorted insert), and the GPU intake takes its batch's permits with a plain
-`bp->acquire(pop_n)`, holding what it gets while it waits for the rest. With a throttle smaller than the
-read-ahead (`--gpu-only --no-mmap --no-direct-read --chunk-size=1 --read-threads=4 --gpu-batch=8
---gpu-streams=2 --throttle-frames=1`: 16 permits, 66 buffers) and a stalled first read, the other readers
-queue frames 1-16, two GPU pops hold all 16 permits, the writer waits for frame 0, and when frame 0 arrives
-the intake cannot get its 8 permits. v0.15.67's head-of-line overdraft covers CPU workers only. The same
-cycle was REPRODUCED for plain `--direct-stage` before v0.17.84 made that producer push in order (40 s
-timeout, 4 of 4); the default throttle's GPU floor (512 permits at 1 MiB frames) hides it.
-
-- **Fix:** the shared GPU intake takes the permits available now (up to `pop_n`), or ONE head-of-line overdraft
-  when none are, and pops only that many. Taking one overdraft and then waiting for the rest keeps the cycle.
-  Exclude throttle-limited batches from the tuner's samples.
-- **Reproduce first:** the pooled reader needs a stall hook like `GZSTD_DEBUG_DSTAGE_STALL_FRAME`.
+Found by Codex while reviewing v0.17.84, reproduced in v0.17.85 with a stall hook
+(`GZSTD_DEBUG_POOLED_STALL_CHUNK`), at the DEFAULT throttle as well as a small one. The GPU intake took a
+batch's permits with a plain `acquire(n)`: no head-of-line case, and it slept holding a partial batch. It now
+reserves a whole batch or, when the writer's frame is at the queue front, whatever is free down to a
+one-frame overdraft (`FrameThrottle::acquire_batch_or_head`). Details and measurements: CHANGELOG v0.17.85.
 
 ## Future security enhancement: content-identity `--rm` (deferred, not a defect)
 

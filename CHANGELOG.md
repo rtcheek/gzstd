@@ -1,12 +1,92 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.84  
+**Covers:** v0.9.50 → v0.17.85  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.85 — --gpu-only compression could hang forever after one slow read
+
+**The hang.** `--gpu-only` compression of a warm file reads with several threads, so frames reach the queue
+out of order. If one read stalls, the other readers keep feeding later frames. The GPU pops them, and each
+holds a throttle permit until the in-order writer writes it, but the writer is waiting for the stalled frame.
+Once every permit is held, the GPU's intake cannot take the stalled frame when it finally arrives: it asks
+for a whole batch of permits, and only that frame can free any. Nothing moves again.
+
+Codex described this cycle while reviewing v0.17.84. v0.15.67 had fixed the same cycle for the CPU workers
+with a one-frame head-of-line overdraft; the GPU intake was left on a plain `acquire(batch)`. Its comment
+said a stream "never sleeps while holding permits"; `acquire(n)` takes what is free and sleeps for the rest.
+
+**Reproduced first, at the default throttle.** A new hook, `GZSTD_DEBUG_POOLED_STALL_CHUNK=N:MS`, holds one
+chunk's reader after its read. On v0.17.84's code plus the hook, one H100:
+
+| shape | result |
+|---|---|
+| 65 MiB file, 1 MiB frames, `--gpu-batch=8 --throttle-frames=1` (16 permits), chunk 0 stalled 2 s | hung, 3 of 3 (40 s timeout) |
+| 4 GiB file, `--gpu-only --chunk-size=1`, DEFAULT throttle (2432 permits), stalled 1 s, 2 s, 5 s | hung, 3 of 3 (60 s timeout) |
+| 4 GiB file, default 16 MiB frames, stalled 5 s | finished (256 frames, fewer than the permits) |
+| `--cpu-only`, 16 permits, stalled 5 s (the v0.15.67 overdraft) | finished |
+
+So no flag is needed: the conditions are a multi-reader buffered read (a warm input), the GPU as the only
+consumer, more frames behind the slow read than the throttle has permits, and a read slow enough for the GPU
+to work through them. At 1 MiB frames the default budget is 2.4 GiB of frames, under a second for one H100.
+At the default 16 MiB frames it is 38 GiB.
+
+**The fix.** The intake now reserves through `FrameThrottle::acquire_batch_or_head`:
+- a whole batch of permits when that many are free;
+- when they are not, and the writer's next frame is at the front of the queue, whatever is free, down to a
+  one-frame overdraft, and it pops only that many frames;
+- otherwise it waits, holding nothing.
+
+A batch is still a batch. With permits short and the writer's frame not at the front, the intake waits for
+all of them. Popping at each returned permit would cut a sink-bound run's batches to a frame or two.
+The decompress intake makes the same call. Its producer pushes in order, so the cycle is not reachable
+there; it is the same call so the two intakes cannot drift apart.
+
+**A batch the throttle cut short is kept from the batch tuner** (review). The tuner records a batch that
+came up short of the QUEUE's supply and merely does not count it as full, so one short batch among three
+full ones still forms a valid window, and under `--adapt` a window can reach the saved profile. A
+head-of-line batch runs right after a wedge, at a size the tuner never proposed, so it is not recorded at
+all. The first draft's comment said the tuner already left such a batch out; it did not.
+
+**After the fix, same shapes:** the 16-permit shape finishes in 3.2-3.3 s (3 of 3) with 2 head-of-line
+overdrafts and a peak of 17 frames against 16 permits; the default-throttle shape finishes with a 1 s
+and a 5 s stall; outputs decode to the input.
+
+**No cost when nothing stalls.** Against v0.17.84, 4 GiB warm, one H100, old/new/new/old:
+
+| shape | v0.17.84 | v0.17.85 |
+|---|---|---|
+| compress, 16 MiB frames | 2.57-2.69 s, 20 batches | 2.49-2.56 s, 20 batches |
+| compress, 1 MiB frames | 2.55-2.56 s, 30 batches | 2.54-2.56 s, 30 batches |
+| decompress | 3.74 s, 20 batches | 3.75-3.76 s, 20 batches |
+| decompress, throttle at its floor, to disk | 3.79-3.80 s | 3.78 s |
+| compress, 1 MiB, throttle at its floor, `/dev/null`, six interleaved reps | 2.45-2.62 s | 2.44-2.59 s |
+| the same, to disk | 2.56-2.92 s | 2.45-2.68 s |
+
+**Nor when the sink is slow**, which is where a head-of-line rule could cut batches to slivers: the writer
+has collected every finished frame and permits come back one at a time. Output through a rate-limited pipe,
+throttle full the whole run (peak = budget), batch sizes from `-vv`:
+
+| shape | v0.17.84 | v0.17.85 |
+|---|---|---|
+| 64 MiB, 16 permits, sink 20 MiB/s, one reader (in order) | 9 batches, median 8 of 8 | the same |
+| the same, four readers (out of order) | 9 batches, median 8 of 8 | the same |
+| 4 GiB, 512 permits, sink 100 MiB/s, one reader | 59 batches, median 51, 31.0 s | 64 batches, median 49, 31.0 s |
+| 4 GiB, 512 permits, sink 150 MiB/s, twelve readers | 64 batches, median 49, 20.7 s | 65 batches, median 48, 20.7 s |
+
+No run added a batch of one or two frames, and none recorded a head-of-line overdraft: without a stalled
+read the new path does not fire.
+
+**Tests.** One GPU cell in the reader/pusher liveness section: the 16-permit shape with chunk 0 stalled 2 s
+must finish, decode, and report at least one head-of-line overdraft. The counter is asserted so the cell
+cannot pass because the stall did not bite: v0.17.84's binary, which has no hook, fails it on that line.
+Mutants: removing the head-of-line case, and allowing it only while a permit is still free, both time out.
+A third mutant passes and is NOT caught: popping a full batch against a smaller reservation, which breaks
+the permit count without hanging (the peak counter is derived from the permit count, so it cannot see it).
 
 ## v0.17.84 — --direct-stage reads a file ahead of the GPU, and stops pinning more memory per GPU
 
@@ -96,7 +176,8 @@ throttle deadlock under `--gpu-only`. It claims a chunk before taking a buffer, 
 and the GPU intake waits for its whole batch of permits. A small throttle and a stalled first read
 (`--no-mmap --no-direct-read --read-threads=4 --gpu-batch=8 --throttle-frames=1`) give the same cycle. It
 is unreproduced (the pooled reader has no stall hook), and the fix belongs in the shared GPU intake: take
-the permits available, or one head-of-line overdraft, and pop only that many. ROADMAP has it.
+the permits available, or one head-of-line overdraft, and pop only that many. ROADMAP has it. **Reproduced and fixed
+in v0.17.85.**
 
 **A fixture that never had its tail.** The `--direct-stage` decompress fixture is described as
 "64 MiB + 12,345 bytes", so that O_DIRECT tail handling is exercised. But 48 MiB of random bytes

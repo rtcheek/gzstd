@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.84";
+static constexpr const char * GZSTD_VERSION = "0.17.85";
 //
 // Architecture overview:
 //
@@ -12576,6 +12576,67 @@ public:
     }
   }
 
+  // A GPU intake's reservation: a WHOLE batch of permits, or -- when the frame
+  // the in-order writer is waiting for sits at the front of the queue -- whatever
+  // is free, down to a one-frame overdraft.  Returns how many frames the caller
+  // may pop (n after shutdown, so the caller's flow is unchanged: it pops nothing
+  // from a queue that is done).  NEVER SLEEPS HOLDING A PERMIT.
+  //
+  // Why (v0.17.85).  The intake used acquire(n), which takes what is free and
+  // sleeps for the rest, and has no head-of-line case at all.  v0.15.67 gave the
+  // CPU workers the overdraft above; the GPU intake was left on acquire(n), and
+  // with a producer that pushes out of order (the multi-reader pooled read) it
+  // closes the same cycle: one read stalls, the other readers feed later frames,
+  // the GPU pops them until every permit is held by a frame the writer cannot
+  // write, and when the stalled frame arrives the intake waits for a batch of
+  // permits that only that frame can free.  MEASURED, --gpu-only, 1 MiB frames,
+  // a 4 GiB file, DEFAULT throttle (2432 permits), GZSTD_DEBUG_POOLED_STALL_CHUNK
+  // holding chunk 0 for 1 s: hung 3 of 3 (60 s timeout).  With 16 permits
+  // (--gpu-batch=8 --throttle-frames=1) a 65-frame file hung 3 of 3.
+  //
+  // A batch is still a batch: with fewer than n permits free and the writer's
+  // frame NOT at the queue front, this waits for all n rather than launching a
+  // sliver -- a sink-bound run returns permits one frame at a time, and popping
+  // at each would cut every batch to a frame or two (small batches burn host CPU
+  // in CUDA's sync spin and starve the kernel; see util_scale, v0.17.46).  n is
+  // clamped to the budget, so a batch larger than the whole throttle still runs.
+  //
+  // Lock order as acquire_or_overdraft: m_ -> queue lock, inside `urgent`.
+  template <class Pred>
+  int acquire_batch_or_head(int n, Pred urgent) {
+    if (n <= 0 || disabled_) return n;
+    std::unique_lock<std::mutex> lk(m_);
+    bool waited = false;
+    std::chrono::steady_clock::time_point t0;
+    int taken = n;
+    for (;;) {
+      if (done_) break;                    // shutdown: take nothing, report n
+      const int full = std::min(n, max_);
+      if (permits_ >= full) { taken = full; permits_ -= full; break; }
+      if (permits_ >= 0 && urgent()) {
+        if (permits_ > 0) { taken = permits_; permits_ = 0; }
+        else { taken = 1; --permits_; overdrafts_.fetch_add(1, std::memory_order_relaxed); }
+        break;
+      }
+      if (!waited) { waited = true; t0 = std::chrono::steady_clock::now(); }
+      cv_.wait(lk, [&] {
+        return done_ || permits_ >= std::min(n, max_) || (permits_ >= 0 && urgent());
+      });
+    }
+    int observed = max_ - permits_;
+    int prev = peak_in_flight_.load(std::memory_order_relaxed);
+    while (observed > prev &&
+           !peak_in_flight_.compare_exchange_weak(prev, observed,
+                                                  std::memory_order_relaxed)) {}
+    if (waited) {
+      auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+      block_count_.fetch_add(1, std::memory_order_relaxed);
+      block_nanos_.fetch_add((uint64_t)ns, std::memory_order_relaxed);
+    }
+    return taken;
+  }
+
   // Re-evaluate every waiter's `urgent` predicate.  Called after a push makes a
   // new frame visible, so a worker parked with zero permits can notice that the
   // head of the queue is now the writer's next-needed frame.  MUST be called
@@ -18913,6 +18974,19 @@ static bool pooled_read_chunks(size_t host_chunk,
       if (win) {
         win->chunks.fetch_add(1, std::memory_order_relaxed);
         win->bytes.fetch_add((uint64_t)got, std::memory_order_relaxed);
+      }
+      // GZSTD_DEBUG_POOLED_STALL_CHUNK=N:MS: hold chunk N's reader MS ms after its
+      // read -- one slow read while the other readers run ahead.  Test-only; it is
+      // what opens the window for the claim-ahead cycles (v0.15.67, v0.17.85).
+      {
+        static const std::pair<long long, long long> stall = [] {
+          long long n = -1, ms = 0;
+          if (const char * e = ::getenv("GZSTD_DEBUG_POOLED_STALL_CHUNK"))
+            if (std::sscanf(e, "%lld:%lld", &n, &ms) != 2) n = -1;
+          return std::make_pair(n, ms);
+        }();
+        if (stall.first >= 0 && idx == (size_t)stall.first)
+          std::this_thread::sleep_for(std::chrono::milliseconds(stall.second));
       }
       // emit takes ownership of `slot` in the pool path (the Task carries it and the
       // worker releases it); the reader must not touch the buffer after this.
@@ -28129,6 +28203,12 @@ struct StreamCtx {
   // counts a window only when its batches ran at the full proposal, and rates it
   // over [earliest pop, latest completion] (see DeviceTune).
   size_t   pop_req = 0;
+  // The throttle, not the queue, cut this batch short (acquire_batch_or_head's
+  // head-of-line case).  The tuner must not see it at all: a batch short of the
+  // QUEUE's supply is recorded and merely not counted as full, so one such
+  // batch among three full ones still forms a valid window -- and this one ran
+  // right after a wedge, at a size the proposal never asked for.
+  bool     throttle_limited = false;
   uint64_t pop_ns = 0;
   uint64_t pop_tune_epoch = 0;
 };
@@ -29332,9 +29412,10 @@ static void gpu_drain_batch(StreamCtx & C, int device_id, int slot_index,
   if (g_gpuc_devices.load(std::memory_order_relaxed) > 0) gpuc_mark_done(now_ns(), in_sum);
 
   // This device's tuner: what ran, at the size intake asked for.
-  device_tune_record(tune, C.stats.stream_index, C.pop_req, C.filled,
-                     in_sum, C.pop_ns, now_ns(),
-                     C.pop_tune_epoch);
+  if (!C.throttle_limited)
+    device_tune_record(tune, C.stats.stream_index, C.pop_req, C.filled,
+                       in_sum, C.pop_ns, now_ns(),
+                       C.pop_tune_epoch);
   // -vv: batch completion line
   if (opt.verbosity >= V_DEBUG) {
     char in_s[32], out_s[32];
@@ -30074,10 +30155,11 @@ static void gpu_worker(
         C.pop_tune_epoch = tune ? tune->proposal_epoch : 0;
         // Deadlock-free batch intake (v0.14.58): wait for a full batch — or the
         // queue's bounded capacity / producer-done — WITHOUT holding any throttle
-        // permit, THEN acquire and non-blocking-pop.  A stream therefore never
-        // sleeps while holding permits, so streams cannot sequester the whole
-        // budget and wedge the in-order writer behind a head-of-line frame no one
-        // can pop.  The producer never touches the throttle, so a permit-free
+        // permit, THEN reserve and non-blocking-pop.  The reservation itself
+        // never sleeps holding a permit either, and admits the writer's
+        // head-of-line frame when the budget is spent (v0.17.85; this comment
+        // claimed as much before that, while acquire(n) held partial batches
+        // and had no head-of-line case -- see acquire_batch_or_head).  The producer never touches the throttle, so a permit-free
         // waiter is always eventually fed; the user's --gpu-batch is honored as
         // the pop size when the queue can supply it, and capped when it can't.
         // Blocking here is ALWAYS safe now: completion runs on the drain thread,
@@ -30089,26 +30171,35 @@ static void gpu_worker(
           break;   // drained: flush in-flight batches below and exit
         }
         wd_phase(slot_index, WatchPhase::IntakeAcquire);
-        if (bp) bp->acquire((int)pop_n);
+        // Fewer than pop_n when the throttle is spent and the writer's frame is
+        // at the queue front.  Such a batch is kept from the tuner entirely
+        // (throttle_limited; review, v0.17.85).
+        const int reserved = bp
+            ? bp->acquire_batch_or_head((int)pop_n, [&] {
+                return queue->front_seq_at_most(
+                    results->next_pub.load(std::memory_order_relaxed));
+              })
+            : (int)pop_n;
+        C.throttle_limited = reserved < (int)pop_n;
         // If the drain thread aborted while we slept, the queue and throttle
         // were set_done and the waits fell through — don't feed a dead device.
         {
           std::lock_guard<std::mutex> lk(idle_m);
           if (!drain_err.empty()) {
-            if (bp) bp->release((int)pop_n);
+            if (bp) bp->release(reserved);
             throw std::runtime_error(drain_err);
           }
         }
         if (sched) sched->gpu_wants_data();
-        size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
+        size_t got = queue->try_pop_batch_signal((size_t)reserved, C.batch);
         if (sched) sched->gpu_got_data();
         if (got == 0) {   // raced: another worker drained the queue — retry
-          if (bp) bp->release((int)pop_n);
+          if (bp) bp->release(reserved);
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           continue;
         }
-        // Release excess permits if we got fewer frames than requested
-        if (bp && got < pop_n) bp->release((int)(pop_n - got));
+        // Release excess permits if we got fewer frames than reserved
+        if (bp && got < (size_t)reserved) bp->release(reserved - (int)got);
         if (gpu_started_flag) { gpu_started_flag->store(true, std::memory_order_release); }
         if (sched) { sched->mark_gpu_take(C.batch.size()); }
         if (g_perf) g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
@@ -33375,6 +33466,7 @@ static void gpu_decomp_worker(
     // (Per-stream auto-tune tracking removed v0.13.34.  Batch size comes from the
     // device's DeviceTune, shared by its streams.)
     size_t pop_req = 0;     // the pop size intake asked for (the tuner's validity test)
+    bool   throttle_limited = false;  // cut short by the throttle: kept from the tuner
     uint64_t pop_tune_epoch = 0;
 
     // Pre-allocated device buffers (reused across batches)
@@ -34345,18 +34437,28 @@ static void gpu_decomp_worker(
           producer_done_seen = true;
           continue;
         }
-        if (bp) bp->acquire((int)pop_n);
+        // The same reservation as the compress intake (acquire_batch_or_head).
+        // This producer pushes in order, so the cycle that one closes is not
+        // reachable here; it is the same call so the two intakes cannot drift,
+        // and so this one also stops sleeping on a partial batch of permits.
+        const int reserved = bp
+            ? bp->acquire_batch_or_head((int)pop_n, [&] {
+                return queue->front_seq_at_most(
+                    results->next_pub.load(std::memory_order_relaxed));
+              })
+            : (int)pop_n;
+        C.throttle_limited = reserved < (int)pop_n;
         if (DStageAhead * ah = g_dstage_ahead.load(std::memory_order_acquire))
           ah->want_frames(pop_n * (size_t)std::max(1, gpu_worker_count));
         if (sched) sched->gpu_wants_data();
-        size_t got = queue->try_pop_batch_signal(pop_n, C.batch);
+        size_t got = queue->try_pop_batch_signal((size_t)reserved, C.batch);
         if (sched) sched->gpu_got_data();
         if (got == 0) {   // raced: another stream drained the queue — retry
-          if (bp) bp->release((int)pop_n);
+          if (bp) bp->release(reserved);
           if (g_perf) { g_perf->queue_wait_ns.fetch_add(now_ns() - qw_t0); g_perf->queue_wait_count.fetch_add(1); }
           continue;
         }
-        if (bp && got < pop_n) bp->release((int)(pop_n - got));
+        if (bp && got < (size_t)reserved) bp->release(reserved - (int)got);
 
         // Nothing of THIS batch has been delivered yet.  This must be reset at
         // INTAKE, not just before the decompress launch, because the catch
@@ -35821,9 +35923,10 @@ static void gpu_decomp_worker(
             in_sum += batch_comp_sizes[i];
           if (m) m->read_bytes.fetch_add(in_sum, std::memory_order_relaxed);
           // This device's tuner: what ran, at the size intake asked for.
-          device_tune_record(tune, C.stream_index, C.pop_req, C.filled,
-                             in_sum, batch_t0, now_ns(),
-                             C.pop_tune_epoch);
+          if (!C.throttle_limited)
+            device_tune_record(tune, C.stream_index, C.pop_req, C.filled,
+                               in_sum, batch_t0, now_ns(),
+                               C.pop_tune_epoch);
         }
 
         if (sched) sched->add_gpu_bytes(out_sum, device_id);

@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=552
-$EXTENSIVE && EXPECTED_TESTS=711
+EXPECTED_TESTS=553
+$EXTENSIVE && EXPECTED_TESTS=712
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -785,8 +785,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # staged and the same archive; a failed read named and recovered; a stalled read
 # with a small throttle; no libcufile; one pool however many GPUs).  547 -> 552,
 # 706 -> 711; the no-GPU deltas grow 150 -> 155 and 179 -> 184.  DERIVED.
-EXPECTED_NOGPU_DELTA=155
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=184   # MEASURED 2026-09-21 (607 - 463) + 32 derived since
+# v0.17.85: one GPU cell (a stalled read does not wedge the GPU intake behind the
+# throttle).  552 -> 553, 711 -> 712; the no-GPU deltas grow 155 -> 156 and
+# 184 -> 185.  DERIVED.  (155 was MEASURED by the v0.17.84 CPU-only run.)
+EXPECTED_NOGPU_DELTA=156
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=185   # MEASURED 2026-09-21 (607 - 463) + 33 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7415,6 +7418,50 @@ else
   fail "head-of-line frame absent from the queue does not wedge the throttle"
 fi
 rm -f "$TMPDIR/lv5.bin" "$TMPDIR/lv5.zst" "$TMPDIR/lv5.out"
+
+# 5b. The same cycle through the GPU INTAKE, which case 5's fix never reached
+#    (fixed v0.17.85).  The overdraft went to the CPU workers; the GPU intake kept
+#    a plain acquire(batch), which takes what is free, sleeps for the rest, and
+#    has no head-of-line case.  Under --gpu-only one stalled read is enough: the
+#    other readers feed later frames, the GPU pops them until every permit is
+#    held by a frame the writer cannot write, and when the stalled frame arrives
+#    the intake waits for a batch of permits that only that frame can free.
+#    The PROGRAM opens the window: GZSTD_DEBUG_POOLED_STALL_CHUNK holds chunk 0's
+#    reader for 2 s.  --gpu-batch=8 x 2 streams puts the throttle at its floor of
+#    16 permits, under the fixture's 65 frames.  MEASURED: v0.17.84 hung 3 of 3
+#    (40 s timeout); fixed, 3.2-3.3 s.  The same stall hung a 4 GiB file at the
+#    DEFAULT throttle (2432 permits, 1 MiB frames) -- too big for the suite.
+#    The overdraft counter is asserted so the cell cannot pass by the stall
+#    simply not biting: it proves the intake took the head-of-line path.
+if has_gpu 2>/dev/null; then
+  (
+    set +o pipefail
+    head -c $((49*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576 + 12345)) > "$TMPDIR/lv5b.bin"
+  )
+  cat "$TMPDIR/lv5b.bin" > /dev/null
+  rc=0
+  env GZSTD_DEBUG_POOLED_STALL_CHUNK=0:2000 timeout --foreground -k 10 60 \
+    "$GZSTD" --gpu-only --gpu-devices=1 --no-mmap --no-direct-read --chunk-size=1 --read-threads=4 \
+    --gpu-batch=8 --gpu-streams=2 --throttle-frames=1 -vv -f "$TMPDIR/lv5b.bin" -o "$TMPDIR/lv5b.zst" \
+    >/dev/null 2>"$TMPDIR/lv5b.log" || rc=$?
+  lv5b_od=$(tr '\r' '\n' < "$TMPDIR/lv5b.log" | grep -a -o 'head_of_line_overdrafts=[0-9]*' | head -1 | cut -d= -f2)
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "a stalled read does not wedge the GPU intake behind the throttle" \
+         "TIMED OUT -- the GPU held every permit and could not take the writer's frame"
+  elif [[ $rc -ne 0 ]]; then
+    fail "a stalled read does not wedge the GPU intake behind the throttle" "exit $rc"
+  elif [[ -z "$lv5b_od" || "$lv5b_od" -lt 1 ]]; then
+    fail "a stalled read does not wedge the GPU intake behind the throttle" \
+         "no head-of-line overdraft recorded (${lv5b_od:-none}): the stall did not bite"
+  elif ! "$GZSTD" -d -q -c "$TMPDIR/lv5b.zst" | cmp -s - "$TMPDIR/lv5b.bin"; then
+    fail "a stalled read does not wedge the GPU intake behind the throttle" "does not decode to the input"
+  else
+    pass "a stalled read does not wedge the GPU intake behind the throttle" "($lv5b_od overdrafts)"
+  fi
+  rm -f "$TMPDIR/lv5b.bin" "$TMPDIR/lv5b.zst" "$TMPDIR/lv5b.log"
+else
+  skip "a stalled read does not wedge the GPU intake behind the throttle" "no GPU"
+fi
 
 # 6. A decode error under --adapt -d --tar printed its ERROR and then NEVER
 #    EXITED (fixed v0.17.70).  die() calls std::exit, std::exit destroys
