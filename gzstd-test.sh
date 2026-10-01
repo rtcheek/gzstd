@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=553
-$EXTENSIVE && EXPECTED_TESTS=712
+EXPECTED_TESTS=554
+$EXTENSIVE && EXPECTED_TESTS=713
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -788,8 +788,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.85: one GPU cell (a stalled read does not wedge the GPU intake behind the
 # throttle).  552 -> 553, 711 -> 712; the no-GPU deltas grow 155 -> 156 and
 # 184 -> 185.  DERIVED.  (155 was MEASURED by the v0.17.84 CPU-only run.)
-EXPECTED_NOGPU_DELTA=156
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=185   # MEASURED 2026-09-21 (607 - 463) + 33 derived since
+# v0.17.86: one GPU cell (a tail decline holds when the queue drains before the
+# GPU parks).  553 -> 554, 712 -> 713; the no-GPU deltas grow 156 -> 157 and
+# 185 -> 186.  DERIVED.  (156 was MEASURED by the v0.17.85 CPU-only run.)
+EXPECTED_NOGPU_DELTA=157
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=186   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -4774,12 +4777,12 @@ if has_gpu 2>/dev/null; then
   dd if=/dev/urandom bs=1M count=64 2>/dev/null > "$asym_src"
   "$GZSTD" --hybrid -k -f "$asym_src" -o "$asym_zst" 2>/dev/null
 
-  # Trigger detection on a COLD decompress run.  Every PCIe generation now follows
-  # one rule (warm input -> cpu-only, cold -> hybrid), and only the cold path logs
-  # [ASYMMETRIC] with the detected gen; the [STARTUP] line carries the backend.
-  # The archive was just written, so evict it first (fdatasync, then
-  # POSIX_FADV_DONTNEED -- rootless, like scripts/drop_cache).  On a tmpfs TMPDIR
-  # eviction cannot work, the run reports the input resident, and the cells skip.
+  # Trigger detection on a decompress run.  Decompress defaults to hybrid on every
+  # PCIe generation and at any residency (v0.17.86 removed the warm-input cpu-only
+  # rule), and -v logs [ASYMMETRIC] with the detected gen; the [STARTUP] line
+  # carries the backend.  The archive is evicted first (fdatasync, then
+  # POSIX_FADV_DONTNEED -- rootless, like scripts/drop_cache) so the run is the
+  # cold one these cells were written against; warm would now behave the same.
   python3 -c 'import os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY); os.fdatasync(fd)
 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)' "$asym_zst" 2>/dev/null
@@ -4787,13 +4790,7 @@ os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)' "$asym_zst" 2>
   rm -f "$asym_out"
   asym_gen=$(echo "$asym_log" | grep -oE "PCIe Gen[0-9]+" | head -1 | grep -oE "[0-9]+")
 
-  if echo "$asym_log" | grep -q "page-cache resident"; then
-    skip "asymmetric mode: PCIe gen detected" "fixture still page-cache resident (tmpfs TMPDIR?)"
-    skip "asymmetric mode: gen-appropriate decompress default" "fixture not cold"
-    skip "asymmetric mode: compress always defaults to hybrid"  "fixture not cold"
-    skip "asymmetric mode: --hybrid override bypasses asymmetric" "fixture not cold"
-    skip "asymmetric mode: --cpu-only override bypasses asymmetric" "fixture not cold"
-  elif [[ -z "$asym_gen" ]]; then
+  if [[ -z "$asym_gen" ]]; then
     # No [ASYMMETRIC] line at all — detection unavailable (NVML missing,
     # no NVIDIA card visible).  Verify the fallback path: hybrid default.
     if echo "$asym_log" | grep -q "DECOMPRESS (hybrid"; then
@@ -6900,32 +6897,48 @@ APRI_XDG="$TMPDIR/xdg-priors"
 APRI="$APRI_XDG/gzstd/profile.json"
 
 if has_gpu 2>/dev/null; then
-  # 1. Warm input announces a decompress backend default at default verbosity:
-  # every PCIe generation prints the residency notice (through v0.17.51 a Gen<4
-  # host printed a PCIe notice instead) -- the runtime chose cpu-only and said so.
+  # 1. A WARM input decompresses in hybrid, like every other default (v0.17.86).
+  # From v0.15.2 through v0.17.85 a page-cache-resident input switched itself to
+  # --cpu-only and said so; hybrid now makes that call itself (it skips GPU
+  # bringup when the CPU pool will finish first), so the static rule is gone.
+  # Asserted three ways: no cpu-only notice, the -v default line names hybrid and
+  # the residency it probed, and the [STARTUP] line says hybrid.  -t takes the
+  # same default.
   "$GZSTD" --cpu-only -k -f "$TMPDIR/large.bin" -o "$TMPDIR/apri.zst" 2>/dev/null
   cat "$TMPDIR/apri.zst" > /dev/null    # warm it (O_DIRECT output leaves it cold)
-  "$GZSTD" -d -k -f "$TMPDIR/apri.zst" -o "$TMPDIR/apri.out" 2>"$TMPDIR/apri.err"
-  if files_match "$TMPDIR/large.bin" "$TMPDIR/apri.out" \
-     && grep -q "page-cache resident" "$TMPDIR/apri.err"; then
-    pass "warm-input decompress announces its backend default"
+  "$GZSTD" -d -v -k -f "$TMPDIR/apri.zst" -o "$TMPDIR/apri.out" 2>"$TMPDIR/apri.err"
+  cat "$TMPDIR/apri.zst" > /dev/null
+  "$GZSTD" -t -v "$TMPDIR/apri.zst" 2>"$TMPDIR/apri-t.err"
+  apri_why=""
+  files_match "$TMPDIR/large.bin" "$TMPDIR/apri.out" || apri_why+=" [output differs]"
+  grep -aq "page-cache resident\|defaulting decompress to --cpu-only" "$TMPDIR/apri.err" "$TMPDIR/apri-t.err" \
+    && apri_why+=" [a cpu-only default was announced]"
+  grep -aqE "defaulting decompress to --hybrid \(input (9[5-9]|100)% resident\)" "$TMPDIR/apri.err" \
+    || apri_why+=" [-d: no hybrid default line with a warm residency]"
+  grep -aqE "defaulting decompress to --hybrid \(input (9[5-9]|100)% resident\)" "$TMPDIR/apri-t.err" \
+    || apri_why+=" [-t: no hybrid default line with a warm residency]"
+  grep -aq "\[STARTUP\].*hybrid" "$TMPDIR/apri.err" || apri_why+=" [-d did not start in hybrid]"
+  grep -aq "\[STARTUP\].*hybrid" "$TMPDIR/apri-t.err" || apri_why+=" [-t did not start in hybrid]"
+  if [[ -z "$apri_why" ]]; then
+    pass "a warm input decompresses and tests in hybrid by default"
   else
-    fail "warm-input decompress announces its backend default"
+    fail "a warm input decompresses and tests in hybrid by default" "$apri_why"
   fi
 
-  # 2. Warm input piped to stdout: the residency default must NOT engage
-  # (sink could be the bottleneck) — no resident notice.
+  # 2. --cpu-only is still the way to keep a warm run off the GPUs, and it is
+  # honoured: the run starts cpu-only and brings no device online.
   cat "$TMPDIR/apri.zst" > /dev/null
-  "$GZSTD" -d -c "$TMPDIR/apri.zst" 2>"$TMPDIR/apri-pipe.err" | cat > "$TMPDIR/apri.out"
+  "$GZSTD" -d --cpu-only -v -k -f "$TMPDIR/apri.zst" -o "$TMPDIR/apri.out" 2>"$TMPDIR/apri-c.err"
   if files_match "$TMPDIR/large.bin" "$TMPDIR/apri.out" \
-     && ! grep -q "page-cache resident" "$TMPDIR/apri-pipe.err"; then
-    pass "piped output skips the residency default"
+     && grep -aq "\[STARTUP\].*cpu-only" "$TMPDIR/apri-c.err" \
+     && ! grep -aq "device(s) online" "$TMPDIR/apri-c.err"; then
+    pass "an explicit --cpu-only keeps a warm decompress off the GPUs"
   else
-    fail "piped output skips the residency default"
+    fail "an explicit --cpu-only keeps a warm decompress off the GPUs"
   fi
 else
-  skip "warm-input decompress announces its backend default" "no GPU"
-  skip "piped output skips the residency default" "no GPU"
+  skip "a warm input decompresses and tests in hybrid by default" "no GPU"
+  skip "an explicit --cpu-only keeps a warm decompress off the GPUs" "no GPU"
 fi
 
 # 3. -vv --adapt prints the fingerprint (hash + driver) — harvest it for the
@@ -7052,12 +7065,13 @@ fi
 # 7. --tar test/decompress probes the ARCHIVE's residency, not stdin
 # (review M3-1: tar mode keeps its archive in tar_sources and synthesizes
 # opt.inputs = "-", which used to send the probe to fd 0).  Warm archive +
-# stdin pointed elsewhere must still announce the backend default.
+# stdin pointed elsewhere must still report the ARCHIVE's residency: the -v
+# default line carries it (through v0.17.85 the warm-input notice did).
 if has_gpu 2>/dev/null; then
   "$GZSTD" --tar -f -o "$TMPDIR/apri-t.tzst" "$TMPDIR/medium.txt" 2>/dev/null
   cat "$TMPDIR/apri-t.tzst" > /dev/null
-  if "$GZSTD" -t --tar "$TMPDIR/apri-t.tzst" </dev/null 2>"$TMPDIR/apri-tar.err" \
-     && grep -qE "page-cache resident|PCIe Gen" "$TMPDIR/apri-tar.err"; then
+  if "$GZSTD" -t -v --tar "$TMPDIR/apri-t.tzst" </dev/null 2>"$TMPDIR/apri-tar.err" \
+     && grep -aqE "\(input (9[5-9]|100)% resident\)" "$TMPDIR/apri-tar.err"; then
     pass "-t --tar probes the archive's residency (not stdin)"
   else
     fail "-t --tar probes the archive's residency (not stdin)"
@@ -7949,17 +7963,19 @@ if has_gpu 2>/dev/null; then
   env GZSTD_DEBUG_HYBRID_RATES=cpu=100,gpu=0.01 timeout --foreground -k 10 120 \
     "$GZSTD" -d --hybrid -T1 -vv -f "$ty_zst" -o "$ty_out" >"$ty_log" 2>&1 || rc=$?
   ty_b=$(grep -a -c 'done batch=' "$ty_log")
-  ty_l=$(grep -a -c 'decompress tail yield' "$ty_log")
-  ty_d=$(grep -a -c 'decompress tail check decided' "$ty_log")   # v0.17.78, see the pipe arm
+  # v0.17.78: the check says when it first DECIDES, and which way (see the pipe
+  # arm).  v0.17.86: the DIRECTION is what is asserted, not the yield line.
+  ty_take=$(grep -a -c 'decompress tail check decided.*-> take' "$ty_log")
+  ty_decl=$(grep -a -c 'decompress tail check decided.*-> decline' "$ty_log")
   if [[ $rc -ne 0 ]]; then
     fail "decompress GPU yields the tail (file input)" "exit $rc"
   elif [[ $ty_b -gt 0 ]]; then
     fail "decompress GPU yields the tail (file input)" \
          "$ty_b GPU batch(es) against a pinned 10,000x faster CPU: the check never armed"
-  elif [[ $ty_l -eq 0 && $ty_d -gt 0 ]]; then
+  elif [[ $ty_take -gt 0 ]]; then
     fail "decompress GPU yields the tail (file input)" \
-         "the armed check decided a GPU intake but never yielded against a pinned 10,000x faster CPU"
-  elif [[ $ty_l -eq 0 ]]; then
+         "the armed check decided to TAKE against a pinned 10,000x faster CPU"
+  elif [[ $ty_decl -eq 0 ]]; then
     # skip_host: the HOST decides this (a GPU busy with other work comes online
     # late), so it must not raise the drift note that means a test was removed.
     skip_host "decompress GPU yields the tail (file input)" \
@@ -7979,13 +7995,22 @@ if has_gpu 2>/dev/null; then
   cat "$ty_zst" | env GZSTD_DEBUG_HYBRID_RATES=cpu=100,gpu=0.01 timeout --foreground -k 10 120 \
     "$GZSTD" -d --hybrid -T1 -vv -c >"$ty_out" 2>"$ty_log" || rc=$?
   ty_on=$(grep -a -c 'device(s) online' "$ty_log")
-  ty_l=$(grep -a -c 'decompress tail yield' "$ty_log")
   # v0.17.78: the check says when it first DECIDES.  Under pinned rates any
-  # decision must be a decline, so "decided, no yield" is the defect, and "never
-  # decided" means no GPU intake reached the armed check -- on a shared host the
-  # GPU can come online only after the -T1 CPU has drained the queue.  That was
-  # reported as a failure about 1 run in 3; it tested nothing.
-  ty_d=$(grep -a -c 'decompress tail check decided' "$ty_log")
+  # decision must be a DECLINE, and "never decided" means no GPU intake reached
+  # the armed check -- on a shared host the GPU can come online only after the
+  # -T1 CPU has drained the queue.  That was reported as a failure about 1 run in
+  # 3; it tested nothing.
+  #
+  # v0.17.86: assert the decision's DIRECTION, not the yield line.  Through
+  # v0.17.85 this cell failed "decided, no yield" -- and that is a correct run.
+  # The decision is logged by the worker's unlocked check; the yield line only by
+  # its park, under the queue lock.  If the CPU drains the queue in between, the
+  # worker never parks: declined, nothing taken, no yield line.  Observed once in
+  # the suite (2026-09-30, direction not captured); GZSTD_DEBUG_TAIL_PARK_DELAY_MS
+  # reproduces it 6 of 6 -- "-> decline", 0 batches, output identical.  Cell 3
+  # below holds that window open on purpose.
+  ty_take=$(grep -a -c 'decompress tail check decided.*-> take' "$ty_log")
+  ty_decl=$(grep -a -c 'decompress tail check decided.*-> decline' "$ty_log")
   if [[ $rc -ne 0 ]]; then
     fail "decompress GPU yields the tail (pipe: producer-done arms it)" "exit $rc"
   elif [[ $ty_on -eq 0 ]]; then
@@ -7993,21 +8018,54 @@ if has_gpu 2>/dev/null; then
     # a -T1 CPU through a 1 GiB pipe (v0.17.81 and v0.17.82 alike: 0 of 18 runs
     # came online on a busy afternoon), so it must not raise the drift note.
     skip_host "decompress GPU yields the tail (pipe: producer-done arms it)" "not exercised: no GPU came online"
-  elif [[ $ty_l -eq 0 && $ty_d -eq 0 ]]; then
+  elif [[ $ty_take -gt 0 ]]; then
+    fail "decompress GPU yields the tail (pipe: producer-done arms it)" \
+         "the armed check decided to TAKE against a pinned 10,000x faster CPU"
+  elif [[ $ty_decl -eq 0 ]]; then
     skip_host "decompress GPU yields the tail (pipe: producer-done arms it)" \
          "not exercised: no GPU intake reached the armed check (the CPU drained the queue first)"
-  elif [[ $ty_l -eq 0 ]]; then
-    fail "decompress GPU yields the tail (pipe: producer-done arms it)" \
-         "the armed check decided a GPU intake but never yielded against a pinned 10,000x faster CPU"
   elif files_match "$ty_src" "$ty_out"; then
     pass "decompress GPU yields the tail (pipe: producer-done arms it)"
   else
     fail "decompress GPU yields the tail (pipe: producer-done arms it)" "output differs"
   fi
+  rm -f "$ty_out"
+
+  # 3. THE WINDOW, HELD OPEN: the worker declines, then is held 4 s before it can
+  # park, while the -T1 CPU drains the queue (file input, so the check is armed
+  # from the eighth frame and the first decision is a decline).  The run must be
+  # clean -- declined, not one GPU batch, output identical -- and must show NO
+  # yield line, which is what proves the window was open.  A yield line means the
+  # CPU had not finished within the delay (a slower host): nothing tested, SKIP.
+  rc=0
+  env GZSTD_DEBUG_HYBRID_RATES=cpu=100,gpu=0.01 GZSTD_DEBUG_TAIL_PARK_DELAY_MS=4000 \
+    timeout --foreground -k 10 120 \
+    "$GZSTD" -d --hybrid -T1 -vv -f "$ty_zst" -o "$ty_out" >"$ty_log" 2>&1 || rc=$?
+  ty_b=$(grep -a -c 'done batch=' "$ty_log")
+  ty_l=$(grep -a -c 'decompress tail yield' "$ty_log")
+  ty_take=$(grep -a -c 'decompress tail check decided.*-> take' "$ty_log")
+  ty_decl=$(grep -a -c 'decompress tail check decided.*-> decline' "$ty_log")
+  if [[ $rc -ne 0 ]]; then
+    fail "a tail decline holds when the queue drains before the GPU parks" "exit $rc"
+  elif [[ $ty_take -gt 0 || $ty_b -gt 0 ]]; then
+    fail "a tail decline holds when the queue drains before the GPU parks" \
+         "decided take $ty_take time(s), $ty_b GPU batch(es), against a pinned 10,000x faster CPU"
+  elif [[ $ty_decl -eq 0 ]]; then
+    skip_host "a tail decline holds when the queue drains before the GPU parks" \
+         "not exercised: the CPU finished before a GPU reached intake"
+  elif [[ $ty_l -gt 0 ]]; then
+    skip_host "a tail decline holds when the queue drains before the GPU parks" \
+         "not exercised: the queue had not drained within the hook's delay, so the worker parked"
+  elif files_match "$ty_src" "$ty_out"; then
+    pass "a tail decline holds when the queue drains before the GPU parks"
+  else
+    fail "a tail decline holds when the queue drains before the GPU parks" "output differs"
+  fi
   rm -f "$ty_src" "$ty_zst" "$ty_out" "$ty_log"
 else
   skip "decompress GPU yields the tail (file input)" "no GPU"
   skip "decompress GPU yields the tail (pipe: producer-done arms it)" "no GPU"
+  skip "a tail decline holds when the queue drains before the GPU parks" "no GPU"
 fi
 
 # ────────────────────────────────────────────────────────────

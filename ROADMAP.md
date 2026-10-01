@@ -730,7 +730,8 @@ those v0.11.20 measurements no longer held: flagless CPU-only against `--hybrid`
 hybrid was never slower (17.3 vs 19.4–20.4 s medium cold, 16.6–16.9 vs 20.0–20.3 s incompressible warm) — though
 the wins were in-flight buffering, not GPU work, and faded at 60 GiB. v0.17.52 applies the Gen4+ residency rule on
 every generation: warm input → `--cpu-only` (kept deliberately, for CPU time, VRAM and shared cards), cold or
-unknown → `--hybrid` (CHANGELOG v0.17.52).
+unknown → `--hybrid` (CHANGELOG v0.17.52). **v0.17.86 removed the warm-input rule too:** decompress and `-t`
+default to hybrid at any residency, and hybrid's own bringup check decides whether the GPUs start.
 
 **Open from that work:**
 - **Run the default suite on the Gen4+ GDS host:** the rewritten asymmetric-mode cell now evicts its archive to
@@ -856,15 +857,14 @@ as views into the block (CHANGELOG v0.17.47): `--cpu-only` 14.66 to 40.08 GiB/s 
 - **Memory.** Views raise 8-GPU peak RSS by about 16 GiB (51–58 against 34–41 GiB). The cap bounds them at an
   eighth of available RAM, but no small-RAM host has exercised it yet.
 
-## OPEN (observed 2026-09-30, unreproduced): one tail-yield pipe run decided a GPU intake and never yielded
+## CLOSED v0.17.86: the tail-yield run that "decided a GPU intake and never yielded" was a correct decline
 
-v0.17.82's suite run skipped the tail-yield pipe cell ("no GPU came online"), which is host timing.
-Of one standalone batch of five runs of that arm, run 1 brought a GPU online and hit the cell's FAIL
-condition: the check decided a GPU intake (`tail check decided`) and logged no yield, against pinned
-rates of 10,000x in the CPU's favour. The decision line was not captured. In 24 further runs, 12 each
-of v0.17.81 and v0.17.82 (the decompress code is identical), no GPU came online at all. If it
-recurs, capture the `-vv` log: the decided line says `take` or `decline`, and a `take` against
-those rates is the defect v0.17.78's trace was added to catch.
+Observed once in v0.17.82's suite run; the decision's direction was not captured. Reproduced in v0.17.86 with
+`GZSTD_DEBUG_TAIL_PARK_DELAY_MS`: the worker's unlocked check logs the decision, the yield line is logged only
+when it parks under the queue lock, and if the CPU drains the queue in between it never parks. 6 of 6 hooked
+runs: `-> decline`, 0 GPU batches, output identical, no yield line. Not a product defect; the suite cell read
+a correct run as a failure. The cells now assert the decision's direction, and a third cell holds the window
+open (CHANGELOG v0.17.86).
 
 ## FIXED v0.17.80: the decompress tuner's shared VRAM ceiling never matched what a device ran
 
@@ -1207,7 +1207,7 @@ Decompress is out of scope: its GPU worker synchronizes inline per batch (requir
 `GetTempSizeSync`) and has no poll loop.  See 1.11 for what decompress could still gain.
 
 ### 1.11 Decompress GPU Pipelining
-**Priority: Low (Gen4+ only) | Complexity: High | Status: EVALUATE — premise narrowed by v0.15.2** — the Gen4+ decompress default is now residency-informed (warm inputs run cpu-only, where the GPU path isn't used at all), so this optimization only matters for cold/hybrid decompress; profile there before investing.
+**Priority: Low (Gen4+ only) | Complexity: High | Status: EVALUATE — premise narrowed by v0.15.2** — the Gen4+ decompress default is now residency-informed (warm inputs run cpu-only, where the GPU path isn't used at all), so this optimization only matters for cold/hybrid decompress; profile there before investing. (v0.17.86: warm inputs default to hybrid as well; the GPU path is still unused there whenever hybrid's bringup check skips it.)
 
 The decompress GPU worker is deliberately simple, not optimal: each batch runs
 H2D → `GetTempSizeSync` (forced mid-submission sync) → kernel → sync → per-frame D2H,
@@ -1539,7 +1539,7 @@ On consumer GPUs with PCIe Gen3, the D2H transfer cost makes GPU decompression s
 
 Implemented in v0.13.0: PCIe generation queried via NVML (with sysfs fallback). On Gen<4, decompress and `-t` default to `--cpu-only`. On Gen4+, default to `--hybrid`. User can override with `--gpu-only` or `--hybrid`.
 
-**Superseded in v0.17.52:** the Gen<4 decompress rule was retired once its measurements stopped holding on the Gen3 workstation; every generation now uses the residency rule (warm input → `--cpu-only`, cold or unknown → `--hybrid`). See CHANGELOG v0.17.52.
+**Superseded in v0.17.52:** the Gen<4 decompress rule was retired once its measurements stopped holding on the Gen3 workstation; every generation now uses the residency rule (warm input → `--cpu-only`, cold or unknown → `--hybrid`). See CHANGELOG v0.17.52. **v0.17.86 removed that rule as well: hybrid is the default at any residency.**
 
 Visible at `-v` as `[ASYMMETRIC] PCIe Gen3 detected; defaulting decompress to --cpu-only`.
 

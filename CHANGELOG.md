@@ -1,12 +1,87 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.85  
+**Covers:** v0.9.50 → v0.17.86  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.86 — decompress and -t default to hybrid whatever the page cache holds
+
+**What changed.** `gzstd -t FILE` and `gzstd -d FILE` on an input already in the page cache used to
+switch themselves to `--cpu-only` and print "input is 100% page-cache resident (compute-bound); defaulting
+decompress to --cpu-only (override with --hybrid or --gpu-only)". That rule is removed. Decompress and `-t`
+now default to hybrid like compression does. cpu-only happens when it is asked for (`--cpu-only`), when
+there is no GPU, or when an `--adapt` profile has measured it faster.
+
+**Why it could go.** The rule dates from v0.15.2, when blanket hybrid measured slower on a warm input
+(12 against 16-18 GiB/s) and paid a GPU bringup it could not use. Hybrid has since learned to decline its
+own GPUs: the CPU workers start at once, a background thread measures the pipeline, and CUDA is started
+only if the remaining work will outlast GPU startup (v0.15.30, repaired in v0.17.49). So the rule only
+duplicated that decision. It also made `-t FILE` the one command whose default backend depended on what
+the page cache held, and its notice told the user to "override with --hybrid", which then skipped the GPUs
+anyway and said so only at `-v`.
+
+**MEASURED before removing it.** 65 GiB archive (130 GiB out), fully resident, `-t`, 8 H100s visible,
+`--cpu-only` against `--hybrid`, interleaved:
+
+| CPU threads | `--cpu-only` | `--hybrid` | GPUs under hybrid |
+|---|---|---|---|
+| 96 | 2.21-2.22 s | 2.24-2.29 s | skipped |
+| 32 | 3.03 s | 2.86-2.88 s | skipped |
+| 16 | 3.81-3.89 s | 3.67-3.73 s | skipped |
+| 8 | 4.58-4.60 s | 4.17-4.35 s | skipped |
+| 2 | 10.46-10.64 s | 10.36-10.39 s | 8 online; host CPU 45-47 s against 31-32 |
+| 1 | 20.56-20.86 s | 12.17-12.86 s | 8 online; host CPU 48-49 s against 34-35 |
+
+Old default against new, a cached 12 GiB entropy-coded archive (16 GiB out), two runs each: `-d` to a file
+with `sync` timed, 5.52-5.64 s against 5.43-5.92 s; `-t`, 0.70-0.80 s against 0.68-0.76 s. Hybrid skipped
+the GPUs in all four.
+
+For scale, forcing the GPUs onto the 65 GiB job costs 6 to 7 times the wall clock: `--hybrid
+--cpu-share=0.5` 15.1 s and `--gpu-only` 11.7 s, against 2.0 s.
+
+**The cost, stated.** Hybrid was never slower. But where a cached job is long enough for hybrid to start
+the GPUs (the 1- and 2-thread rows), it now uses them where the old default stayed on the CPU: more host
+CPU time, VRAM held, and cards other users may want, for a wall-clock gain only when the CPU pool is
+small. `--cpu-only` keeps a run off the GPUs, as before.
+
+**`--adapt`.** Its backend prior is unchanged where it has measurements: it can still choose cpu-only.
+One row left its state table: "only cpu-only measured, static rule picks cpu-only -> probe hybrid
+explicitly". With hybrid the static default everywhere, the default run is that probe, as it already was
+for a cold input.
+
+**Messages and help.** `-v` prints the default on every decompress, warm or cold, with the residency it
+probed: `[ASYMMETRIC] PCIe Gen5 detected; defaulting decompress to --hybrid (input 100% resident)`. The
+BACKEND SELECTION section of `--help` is rewritten: one default, how hybrid decides whether to start the
+GPUs, and that `--gpu-only` or `--hybrid --cpu-share` always start them. `--hybrid`'s own entry says the
+same in brief.
+
+**The tail-yield run that "decided a GPU intake and never yielded": reproduced, and it is a correct run.**
+v0.17.82's suite run once hit the pipe cell's failure branch: the hybrid decompress tail check had decided at
+a GPU intake and no "tail yield" line followed, against rates pinned 10,000x in the CPU's favour. The
+direction of that decision was not captured, and 24 further runs never brought a GPU online.
+
+The two lines come from different calls. The worker's first check runs WITHOUT the queue lock and logs
+"tail check decided ... -> decline". The "tail yield" line is logged only when the worker then parks and
+re-checks under the lock. If the CPU drains the queue between the two, the worker never parks: it declined,
+took nothing, and no yield line exists. A new hook, `GZSTD_DEBUG_TAIL_PARK_DELAY_MS`, holds the worker in
+that gap. With it, 6 of 6 runs (file and pipe input): `-> decline`, 0 GPU batches, output identical, no
+yield line. Without it, 4 of 4 runs showed both lines. So there was no product defect; the cell read a
+correct decline as "never yielded".
+
+The tail-yield cells now assert the decision's DIRECTION: a `-> take` against the pinned rates fails, a
+`-> decline` passes whether or not the worker went on to park. A third cell holds the window open with the
+hook and requires a clean run with no yield line. A mutant whose tail check always takes fails all three.
+
+**Tests.** One new cell (above); three rewritten. "A warm input decompresses and tests in hybrid by default"
+replaces the cell that asserted the cpu-only notice (it checks `-d` and `-t`: no cpu-only notice, the `-v`
+default line with a warm residency, `[STARTUP]` hybrid), and fails on v0.17.85. "An explicit --cpu-only
+keeps a warm decompress off the GPUs" replaces the piped-output cell, whose rule no longer exists. The
+`-t --tar` residency-probe cell reads the residency from the `-v` line. The asymmetric-mode section loses
+its "fixture still resident" skip branch.
 
 ## v0.17.85 — --gpu-only compression could hang forever after one slow read
 

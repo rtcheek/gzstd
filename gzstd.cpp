@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.85";
+static constexpr const char * GZSTD_VERSION = "0.17.86";
 //
 // Architecture overview:
 //
@@ -4617,17 +4617,23 @@ static void print_help_long()
 " BACKEND SELECTION\n"
 "============================================================\n"
 "gzstd picks a backend automatically based on hardware and operation:\n"
-"  * no GPU:                         --cpu-only\n"
-"  * compress, GPU present:          --hybrid (CPU + GPU)\n"
-"  * decompress, input already in page cache (warm): --cpu-only\n"
-"  * decompress, otherwise (cold or unknown):         --hybrid\n"
-"  * inputs too small to fill one GPU batch:          --cpu-only\n"
+"  * no GPU:                                  --cpu-only\n"
+"  * compress, decompress and -t, GPU present: --hybrid (CPU + GPU)\n"
+"  * inputs too small to fill one GPU batch:  --cpu-only\n"
 "\n"
-"A warm input decompresses at memory speed, so the CPU pool alone\n"
-"serves it without GPU bringup or VRAM.  The same rule applies on\n"
-"every PCIe generation: through v0.17.51 a PCIe Gen<4 host always\n"
-"decompressed CPU-only, a rule its own measurements no longer\n"
-"supported.  Override explicitly with one of these:\n"
+"HYBRID DECIDES FOR ITSELF WHETHER THE GPUS ARE WORTH STARTING.  The\n"
+"CPU workers start at once.  A background thread measures how fast\n"
+"the job is going and starts CUDA only if the work that remains will\n"
+"outlast GPU startup (a few seconds); otherwise the run finishes on\n"
+"the CPU and never touches a GPU.  -v says which happened.  So a\n"
+"short job, or one the CPU pool decodes at memory speed, costs no\n"
+"GPU bringup and no VRAM under the default.\n"
+"\n"
+"Through v0.17.85, decompressing (or testing) an input that was\n"
+"already in the page cache switched to --cpu-only on its own.  That\n"
+"rule is gone: it predated the check above and only duplicated it.\n"
+"A long job on a cached input can now use the GPUs; pass --cpu-only\n"
+"to keep it off them.  Override explicitly with one of these:\n"
 "\n"
 "  --cpu-only\n"
 "     Force CPU-only.  Useful for baseline measurements or when the\n"
@@ -4855,6 +4861,9 @@ static void print_help_long()
 "     CPU workers pop single frames; GPU workers pop greedy batches.\n"
 "     An EMA (exponential moving average)-based scheduler tracks\n"
 "     observed throughput and adapts the CPU/GPU split over time.\n"
+"     It does not force the GPUs on: they start only if the job will\n"
+"     outlast their startup (see BACKEND SELECTION).  --gpu-only, or\n"
+"     --hybrid with --cpu-share, always starts them.\n"
 "\n"
 "  --sliding-window\n"
 "     Compress the whole file as a single frame with zstd's built-in\n"
@@ -34371,6 +34380,21 @@ static void gpu_decomp_worker(
         // If the queue is already drained, propagate that so the worker can
         // exit instead of spinning forever on the share check.
         if (sched && !sched->should_gpu_take(device_id)) {
+          // GZSTD_DEBUG_TAIL_PARK_DELAY_MS=N: hold this worker N ms between its
+          // unlocked decline and its park.  The decline is logged ("tail check
+          // decided ... -> decline") by the unlocked call above; the "tail yield"
+          // line is logged only by the park predicate, under the queue lock.  If
+          // the CPU drains the queue in between, the worker never parks and no
+          // yield line exists -- a correct run that the suite once read as "decided
+          // a GPU intake and never yielded" (observed once, 2026-09-30).  The hook
+          // makes that window deterministic.  Test-only.
+          {
+            static const long tpd = [] {
+              const char * e = ::getenv("GZSTD_DEBUG_TAIL_PARK_DELAY_MS");
+              return e ? std::strtol(e, nullptr, 10) : 0L;
+            }();
+            if (tpd > 0) std::this_thread::sleep_for(std::chrono::milliseconds(tpd));
+          }
           if (queue->drained()) { producer_done_seen = true; continue; }
           // Tail yield (the aggregate check, v0.17.54) or a ranked overflow
           // decline (--adapt).  Park on the queue CV until an event that
@@ -42392,7 +42416,7 @@ static double adapt_input_residency(const Options & opt)
   return adapt_path_residency(path);
 }
 
-// Residency class across ALL inputs — not just the one the warm-input rule
+// Residency class across ALL inputs — not just the one the residency probe
 // probes.  Returns -1 when unknown OR when the inputs DISAGREE.
 //
 // One process handles every input and persists ONE rate, so a run mixing a warm
@@ -43195,10 +43219,10 @@ static void apply_backend_defaults(Options & opt)
 #endif   // !_WIN32 — backend-agnostic priors end here
 
 #ifdef HAVE_NVCOMP
-  // Probe input residency ONCE, here.  Two consumers: it KEYS the backend prior's
-  // rate pair, and the warm-input rule far below reuses this value instead of
-  // sweeping mincore a second time.  Decompress only (compress returns before
-  // that rule), regular-file output only, and it never faults pages in.
+  // Probe input residency ONCE, here.  It KEYS the backend prior's rate pair,
+  // and the -v default-backend line reports it.  (Through v0.17.85 a warm-input
+  // cpu-only rule far below was its second consumer.)  Decompress only,
+  // regular-file output only, and it never faults pages in.
   //
   // Deliberately ABOVE the backend_user_set return.  The probe is needed for
   // RECORDING, not just for deciding: a run with an explicit --hybrid/--cpu-only
@@ -43216,9 +43240,10 @@ static void apply_backend_defaults(Options & opt)
   if (opt.mode != Mode::COMPRESS && !opt.list_mode && resid_meaningful
       && adapt_output_is_regular(opt)) {
     resid_probe = adapt_input_residency(opt);
-    // resid_probe (input[0]) still drives the warm-input RULE, unchanged.  The
+    // resid_probe (input[0]) is reported at -v and keys the prior's bucket.  The
     // recorded CLASS additionally requires every input to agree — see
-    // adapt_inputs_resid_class.
+    // adapt_inputs_resid_class.  (Through v0.17.85 it also drove a warm-input
+    // cpu-only rule.)
     resid_cls = adapt_inputs_resid_class(opt, resid_probe);
   }
 #endif
@@ -43366,10 +43391,9 @@ static void apply_backend_defaults(Options & opt)
   // A single per-machine EMA blends warm runs (compute-bound, cpu-only wins) with
   // cold ones (disk-bound, hybrid holds) and is then wrong for both on a box that
   // mixes them -- the third instance of the defect the read-path and
-  // workload-class priors already fixed by keying.  It also settles the conflict
-  // with the warm-input rule below, which a decided prior used to skip entirely:
-  // residency now SORTS the runs and the end-to-end measurement still DECIDES
-  // within a bucket, so neither rule has to lose.
+  // workload-class priors already fixed by keying.  Residency SORTS the runs and
+  // the end-to-end measurement DECIDES within a bucket.  (It also settled a
+  // conflict with the static warm-input rule, which v0.17.86 removed.)
   //
   if (priors.loaded) {
     double oc = prior_dir.overall_cpu, oh = prior_dir.overall_hybrid;
@@ -43435,14 +43459,11 @@ static void apply_backend_defaults(Options & opt)
         !all_known || prior_dir.input_gibs <= 0
         || double(known_input) / (prior_dir.input_gibs * 1073741824.0)
              >= double(adapt_save_min_ns()) / 1e9;
-    // Would the static rules below land on cpu-only if the prior stayed silent?
-    // Decompress does when the input is warm (compute-bound); compress always
-    // defaults to hybrid.  (Through v0.17.51 a Gen<4 fabric did too -- see the
-    // decompress default below for why that rule was retired.)  Needed so the
-    // hybrid exploration below fires exactly where "letting the static rules
-    // run" would NOT constitute an exploration.
-    const bool static_picks_cpu =
-        opt.mode != Mode::COMPRESS && resid_probe >= 0.95;
+    // The static default below is hybrid in every direction (v0.17.86), so
+    // "letting the static rules run" always IS the hybrid exploration.  Through
+    // v0.17.85 a warm decompress went cpu-only there (and through v0.17.51 any
+    // Gen<4 fabric did), which needed an explicit "exploring hybrid" probe here;
+    // that row left the table with the rule.
     // An untried side is worth exploring only if it has not just BEEN tried: a
     // probe that fails to measure what it explored (a hybrid run whose GPU
     // declines to engage) stamps its _run key without a rate, and that stamp
@@ -43465,10 +43486,10 @@ static void apply_backend_defaults(Options & opt)
     //   both measured, neither stale      -> margin compare; stable
     //   both measured, one side stale     -> probe the staler; it stamps -> holds
     //                                        off RECHECK_RUNS; converges
-    //   only oh, static picks hybrid      -> probe cpu; stamps; converges
-    //   only oc, static picks hybrid      -> static rule IS the hybrid probe
-    //   only oc, static picks cpu         -> probe hybrid explicitly; stamps
-    //   neither measured                  -> static rules; first run records one
+    //   only oh                           -> probe cpu; stamps; converges
+    //   only oc                           -> the static default (hybrid) IS the
+    //                                        probe
+    //   neither measured                  -> static default; first run records one
     //   any of the above, run too short   -> no probe (explorable false); stable
     bool choose_cpu = false, decided = false, probing = false;
     if (oc > 0 && oh > 0) {
@@ -43507,18 +43528,6 @@ static void apply_backend_defaults(Options & opt)
       // records nothing, so cpu-only would read as untried FOREVER and every
       // single run would pay the exploration with no path to convergence.
       choose_cpu = true; decided = true; probing = true; why = "exploring cpu-only";
-    } else if (oc > 0 && oh <= 0 && explorable && static_picks_cpu
-               && untried_recently(oh_run)) {
-      // The mirror case, and it needs an EXPLICIT probe wherever the static rules
-      // would also land on cpu-only.  The original reasoning here was "hybrid
-      // untried -> the static rules below already favour hybrid, so letting them
-      // run IS the exploration" — true for a COLD decompress, false for a WARM
-      // input (the residency rule picks cpu-only; through v0.17.51 so did any Gen<4
-      // box).  There hybrid was never measured, the pair never completed, and the
-      // prior could never decide anything — the same never-terminates shape as the
-      // cpu-only exploration above.  Keying by residency made it reachable on every
-      // box.
-      choose_cpu = false; decided = true; probing = true; why = "exploring hybrid";
     }
     // Nothing measured at all -> nothing to say.
     if (decided) {
@@ -43567,70 +43576,46 @@ static void apply_backend_defaults(Options & opt)
   }
 #endif
 
-  if (opt.mode == Mode::COMPRESS) { opt.hybrid = true; return; }
-  // ONE RULE ON EVERY PCIe GENERATION.  From v0.13.0 through v0.17.51 a Gen<4
-  // host defaulted decompress to --cpu-only, on v0.11.20 measurements from a
-  // 24-core Gen3 host with two 11 GiB cards: hybrid 6-39% slower than the CPU
-  // pool on every data type, the D2H of the decompressed output being the cost.
-  // It no longer held there.  MEASURED at v0.17.50-51 on that host (20 GiB
-  // outputs to a real file beside the input, `sync` inside the timed region,
-  // palindromic, 2 reps), flagless cpu-only against --hybrid: medium-ratio cold
-  // 19.44-20.40 s vs 17.31-17.38; incompressible warm 19.99-20.34 vs 16.55-16.85;
-  // medium warm 16.86-19.10 vs 16.67-16.75; incompressible cold equal.  Hybrid was
-  // never slower.  Its wins came from the larger in-flight budget buffering the
-  // output, not from GPU work (0-1 GPU batches), and they faded at 60 GiB -- but
-  // the D2H cost the rule was written for no longer decides anything measurable.
+  // HYBRID IS THE DEFAULT IN EVERY DIRECTION (v0.17.86).  cpu-only happens when
+  // the user asks for it, when there is no GPU, or when an --adapt profile has
+  // measured it faster -- never because of a static rule here.
   //
-  // A warm input goes cpu-only on every generation, although hybrid measured
-  // faster warm on that Gen3 host: that is a deliberate trade for one rule
-  // and for what a GPU run costs when the GPU does little -- about twice the CPU
-  // time (CUDA sync), VRAM held, bringup, and cards shared with other users.
-  {
-    // On every generation, the blanket-hybrid default was measurably
-    // wrong for warm inputs (v0.15.2) — a ~fully-resident input feeds at
-    // memory speed, the run is compute-bound, and cpu-only wins on the
-    // fast-fabric boxes (measured 16-18 vs ~12 GiB/s).  Cold inputs keep
-    // hybrid: the disk is the ceiling and the GPU-favoring default holds.
-    // Unconditional (no --adapt needed) — both branches beat blanket
-    // hybrid; the probe costs microseconds and never faults pages in.
-    // Regular-file output only (a warm input piped to a slow consumer is
-    // sink-bound, not compute-bound); pipes/unknown keep today's default.
-    // Probed once above (it also keys the backend prior); same value, no second
-    // mincore sweep.
-    const double resid = resid_probe;
-    if (resid >= 0.95) {
-      opt.cpu_only = true;
-      if (opt.cpu_queue_min > 0) {   // mirror parse_args's silencing
-        if (opt.verbosity >= V_ERROR)
-          std::cerr << "gzstd: note: --cpu-batch is ignored in --cpu-only mode "
-                       "(warm-input default; override with --hybrid)\n";
-        opt.cpu_queue_min = 0;
-      }
-      // Default verbosity: the user sees no GPU activity and must know the
-      // runtime chose that (and how to undo it).
-      if (opt.verbosity >= V_DEFAULT && !opt.list_mode) {
-        // gen==0 = PCIe undetectable, possibly no GPU at all — don't
-        // recommend a --gpu-only that would exit 2 there.
-        char line[224];
-        std::snprintf(line, sizeof(line),
-          "gzstd: input is %d%% page-cache resident (compute-bound); defaulting "
-          "decompress to --cpu-only (override with %s)\n",
-          (int)(resid * 100.0),
-          gen > 0 ? "--hybrid or --gpu-only" : "--hybrid");
-        std::fprintf(stderr, "%s", line);
-      }
-    } else {
-      opt.hybrid = true;
-      if (gen > 0 && opt.verbosity >= V_VERBOSE) {
-        std::ostringstream os;
-        os << "[ASYMMETRIC] PCIe Gen" << gen
-           << " detected; defaulting decompress to --hybrid";
-        if (resid >= 0.0) {
-          os << " (input " << (int)(resid * 100.0) << "% resident: cold/disk-bound)";
-        }
-        vlog(V_VERBOSE, opt, os.str() + "\n");
-      }
-    }
+  // Two such rules have stood here and both are gone:
+  //   * v0.13.0 - v0.17.51: a PCIe Gen<4 host decompressed cpu-only, on v0.11.20
+  //     measurements (hybrid 6-39% slower there, the D2H of the output being the
+  //     cost).  Re-measured at v0.17.50-51 on that host, hybrid was never slower.
+  //   * v0.15.2 - v0.17.85: a page-cache-resident input decompressed cpu-only (to
+  //     a regular file, and under -t), because blanket hybrid measured slower warm
+  //     (12 against 16-18 GiB/s) and paid a GPU bringup the run could not use.
+  //     That was written before hybrid could decline its own GPUs.  Since
+  //     v0.15.30 / v0.17.49 the bringup thread measures the pipeline and skips
+  //     CUDA entirely when the CPU pool will finish first (gpu_bringup_worth_it),
+  //     so the rule only duplicated that decision -- and made `-t FILE` the one
+  //     command whose default backend depended on what the page cache held.
+  //
+  // MEASURED before removing it, 65 GiB archive (130 GiB out), fully resident,
+  // -t, 8 H100s visible, cpu-only against hybrid, interleaved:
+  //   96 threads   2.21-2.22 s   2.24-2.29 s   GPUs skipped
+  //   32           3.03          2.86-2.88     skipped
+  //   16           3.81-3.89     3.67-3.73     skipped
+  //    8           4.58-4.60     4.17-4.35     skipped
+  //    2          10.46-10.64   10.36-10.39    8 GPUs online; host CPU 45-47 s
+  //                                            against 31-32
+  //    1          20.56-20.86   12.17-12.86    8 GPUs online; 48-49 s against 34-35
+  // Never slower.  THE COST, where the job is long enough for the GPUs to start:
+  // more host CPU time (CUDA's sync spin), VRAM held, and cards other users may
+  // want -- for a wall-clock gain only when the CPU pool is small.  --cpu-only
+  // remains the way to keep a run off the GPUs.
+  opt.hybrid = true;
+  if (opt.mode != Mode::COMPRESS && opt.verbosity >= V_VERBOSE
+      && (gen > 0 || resid_probe >= 0.0)) {
+    std::ostringstream os;
+    os << "[ASYMMETRIC] ";
+    if (gen > 0) os << "PCIe Gen" << gen << " detected; ";
+    os << "defaulting decompress to --hybrid";
+    if (resid_probe >= 0.0)
+      os << " (input " << (int)(resid_probe * 100.0) << "% resident)";
+    vlog(V_VERBOSE, opt, os.str() + "\n");
   }
 
 #else
