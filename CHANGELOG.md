@@ -1,12 +1,113 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.83  
+**Covers:** v0.9.50 → v0.17.84  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.84 — --direct-stage reads a file ahead of the GPU, and stops pinning more memory per GPU
+
+**What was slow.** Plain-file `--direct-stage` compression read each batch's frames inside the GPU worker:
+O_DIRECT preads fanned out into per-worker pinned lanes and were joined before the batch launched. So the
+drive and the GPU took turns. On one 16 GiB file it was the slowest of the three ways to compress it.
+`--tar --direct-stage` (v0.17.82) was faster than both, because its assembler fills a shared pool of pinned
+host slots ahead of the workers.
+
+**Now a plain file uses that producer.** Two O_DIRECT readers fill the pool ahead of the workers, one whole
+frame per read straight into its slot, and each worker moves a frame with one DMA (the `--tar` path's slot
+copy, unchanged). Frames are whole MiB, so every read is 4 KiB-aligned in offset, address and length; the
+unaligned tail rounds its window up inside its slot, and the kernel stops at end of file. The per-worker
+lanes and the in-worker read are gone.
+
+- **Each reader takes its slot BEFORE it claims a frame, and frames reach the queue IN ORDER.** The lowest
+  unfinished frame always belongs to a reader doing nothing but its own read. A frame read ahead of it waits
+  in a small map, keeping its slot, and whoever completes the head pushes it and every consecutive frame
+  behind it (the `--tar` assembler's reorder buffer, without its pusher thread).
+- **Out of order, it deadlocked: found by review, then reproduced.** The first version pushed each frame
+  as its read finished, relying on the queue's sorted insert. While one read stalled, the other reader ran
+  ahead. The GPU popped the later frames and held a throttle permit for each until the writer wrote it, but
+  the writer was waiting for the stalled frame. With every permit held, the GPU's intake could not take the
+  stalled frame when it finally arrived. The default throttle's GPU floor (512 permits at 1 MiB frames,
+  against 192 the GPU ever held here) hides it; `--gpu-batch=8 --throttle-frames=1` lowers the floor to 16
+  permits. With a test hook stalling frame 0's read for 2-3 s, a 65-frame file then hung every time (40 s
+  timeout, 4 of 4), and the in-order producer finished in 3-4 s.
+- **A failed read aborts the pass, it does not `die()`.** The workers and the writer are running, and an exit
+  from a reader thread raced their teardown under `--tar` (a crash and a partial archive, v0.17.82). The abort
+  is the `--tar` assembler's: the output is discarded and rebuilt on the CPU, and the warning names the read.
+  An exception on a reader thread takes the same path instead of `std::terminate`, and a reader thread that
+  cannot be started just means fewer readers.
+- **The tail stops at its logical length** (review). Each read asks for the frame's window rounded up to
+  4 KiB, and the tail's first read returns just its bytes. Reading on toward the rounded length re-reads at an
+  unaligned offset; ext4 answers that with end of file, but a filesystem that checks alignment first returns
+  EINVAL, which would abort into a CPU rebuild.
+- **Two readers, measured.** One large read is in flight while the other hands its frame to the queue, so the
+  drive never waits on gzstd; more readers only interleave requests on it. `--read-threads` overrides, for a
+  striped array.
+
+**The pool no longer scales with the device count.** v0.17.82 sized it as one starting batch PER DEVICE, so
+that each worker could take a full batch. But the slots are read-ahead: a worker releases them right after its
+copy, before it compresses, and the producer's rate is the drive's. On eight GPUs that rule pinned 4 GiB
+(2.0-2.1 s) before the first read, and made both plain and `--tar --direct-stage` slower than the ordinary
+reader. Now the pool is one starting batch (about 512 MiB) however many GPUs share it.
+
+**MEASURED, 16 GiB of base64-of-random data, cold, a 4.7 GiB/s drive (single-stream `dd`), H100s, output to
+`/dev/null`:**
+
+| | wall | host CPU |
+|---|---|---|
+| one GPU, this version (4 readers) | 5.92-5.93 s | 5.1-5.4 s |
+| one GPU, v0.17.83 `--direct-stage` | 8.38-8.41 s | 8.9-9.3 s |
+| one GPU, ordinary `--gpu-only` reader | 6.67-7.10 s | 9.8-10.4 s |
+| two GPUs, this version (2 readers, 32 slots) | 5.71-5.80 s | 6.5-6.9 s |
+| two GPUs, v0.17.83 | 6.70-6.99 s | 9.8-9.9 s |
+| two GPUs, ordinary | 5.92-6.42 s | 10.7-11.7 s |
+| eight GPUs, 32 slots (this version's pool) | 8.43-8.51 s | 11.2-12.4 s |
+| eight GPUs, 256 slots (the v0.17.82 rule) | 10.81-10.85 s | 16.1-16.9 s |
+| eight GPUs, ordinary | 8.49-9.26 s | 16.6-17.2 s |
+| eight GPUs, `--tar`, 32 slots / 256 slots | 8.61-9.01 / 11.00-11.79 s | |
+
+The one-GPU arms are three interleaved rotations; the two-GPU pool comparison is ABBA. Readers at one GPU:
+1 = 6.42-6.74 s, 2 = 5.74-5.87, 4 = 5.92-5.94, 8 = 6.04-6.05, 12 = 6.07. At two GPUs: 2 = 5.61-5.74,
+4 = 5.94-5.96, 8 = 6.08-6.13. Two and four are close at one GPU (which is the bottleneck there); two wins
+at two GPUs, where the drive is. The eight-GPU runs are drive-bound, so what they show is the cost of the
+pinning.
+
+**Tests.** Until this version the suite had no cell for plain-file `--direct-stage` compression at all.
+A new section adds five GPU cells:
+- every frame is staged (the `[DSTAGE]` frame and byte totals equal the file's, including a 12,345-byte
+  unaligned tail), the archive is byte-identical to the ordinary GPU path's, and it decodes;
+- a failed read (`GZSTD_DEBUG_DSTAGE_FAIL_FRAME`) is named, and the rebuilt archive decodes;
+- a stalled read (`GZSTD_DEBUG_DSTAGE_STALL_FRAME=N:MS`, new) with a 16-permit throttle finishes;
+- no libcufile is loaded;
+- the pool is the same size on one GPU and on two.
+
+Mutants: restoring the per-device pool, an unrounded tail read, ignoring a failed read, the old
+region-naming producer, out-of-order pushes, and an abort without its wakeups each fail at least one cell.
+The last is new with in-order delivery (review): a frame read ahead of a failed one waits for a push that
+never comes, and keeps its slot. With one slot and four readers, the readers still waiting for that slot
+are freed only by the abort's wakeup of the pool. Without it the run hung (40 s timeout, 2 of 2); with it,
+3.4 s. The failure cell now runs that shape.
+
+**Found by the same review, NOT fixed here.** The ordinary multi-reader pooled reader has the same
+throttle deadlock under `--gpu-only`. It claims a chunk before taking a buffer, and it pushes out of order,
+and the GPU intake waits for its whole batch of permits. A small throttle and a stalled first read
+(`--no-mmap --no-direct-read --read-threads=4 --gpu-batch=8 --throttle-frames=1`) give the same cycle. It
+is unreproduced (the pooled reader has no stall hook), and the fix belongs in the shared GPU intake: take
+the permits available, or one head-of-line overdraft, and pop only that many. ROADMAP has it.
+
+**A fixture that never had its tail.** The `--direct-stage` decompress fixture is described as
+"64 MiB + 12,345 bytes", so that O_DIRECT tail handling is exercised. But 48 MiB of random bytes
+base64-encodes to exactly 64 MiB, so `head -c` had nothing more to take. The fixture was exactly 64 MiB in
+every run since v0.17.56. It now starts from 49 MiB. (A `--gds-only` cell builds its fixture the same way
+but makes no claim about a tail; it is unchanged.)
+
+**Also measured, not changed.** An explicit `--hybrid -t` on a page-cache-resident 65 GiB archive never
+starts the GPUs. That is deliberate: `-v` says "CPU pool will finish before GPU init could; skipping GPU
+bringup". 96 CPU threads decoded at 65-80 GiB/s, so the run took about 2.4 s, against about 3 s to start
+CUDA on 8 cards.
 
 ## v0.17.83 — --gds-only refuses an nvidia-fs built for a different driver, instead of crashing the kernel
 

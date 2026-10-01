@@ -70,6 +70,23 @@ describes a moving target we do not control.
 
 ---
 
+## OPEN DEFECT (found v0.17.84 review, unreproduced): GPU intake + multi-reader pooled read can deadlock
+
+Codex's analysis while reviewing v0.17.84. `pooled_read_chunks` claims a chunk before it takes a buffer and
+pushes out of order (sorted insert), and the GPU intake takes its batch's permits with a plain
+`bp->acquire(pop_n)`, holding what it gets while it waits for the rest. With a throttle smaller than the
+read-ahead (`--gpu-only --no-mmap --no-direct-read --chunk-size=1 --read-threads=4 --gpu-batch=8
+--gpu-streams=2 --throttle-frames=1`: 16 permits, 66 buffers) and a stalled first read, the other readers
+queue frames 1-16, two GPU pops hold all 16 permits, the writer waits for frame 0, and when frame 0 arrives
+the intake cannot get its 8 permits. v0.15.67's head-of-line overdraft covers CPU workers only. The same
+cycle was REPRODUCED for plain `--direct-stage` before v0.17.84 made that producer push in order (40 s
+timeout, 4 of 4); the default throttle's GPU floor (512 permits at 1 MiB frames) hides it.
+
+- **Fix:** the shared GPU intake takes the permits available now (up to `pop_n`), or ONE head-of-line overdraft
+  when none are, and pops only that many. Taking one overdraft and then waiting for the rest keeps the cycle.
+  Exclude throttle-limited batches from the tuner's samples.
+- **Reproduce first:** the pooled reader needs a stall hook like `GZSTD_DEBUG_DSTAGE_STALL_FRAME`.
+
 ## Future security enhancement: content-identity `--rm` (deferred, not a defect)
 
 `--rm` and `--tar --rm` refuse to remove a source whose **size or mtime** changed after its
@@ -283,11 +300,12 @@ correspondingly hard to justify.
    host CPU, against the ordinary path's 6.5-7.0 s and 21-50 s (CHANGELOG v0.17.82). What decided the
    design was the POOL SIZE, not the copy: at 16 MiB frames, 32 slots ran 6.2 s and 144 ran 8.7 s,
    because pinning, pipeline fill and the last batch's drain all grow with the pool.
-   - **Follow-up, now the top item: plain-file `--direct-stage` onto the same producer.** On one 16 GiB file it
-     runs 8.8-9.0 s against the ordinary reader's 7.3-7.7, because its reads happen inside the worker
-     and are joined before each launch. The tar path's readers fill a pinned pool AHEAD of the GPU,
-     and it is the faster of the two. A plain file is the easy case of that producer: its regions
-     are MiB-aligned, so every O_DIRECT read lands in place with no window and no copy.
+   - **SHIPPED v0.17.84: plain-file `--direct-stage` onto the same producer.** Two O_DIRECT readers fill the
+     pinned pool ahead of the workers, one whole frame per read into its slot. 16 GiB cold, one H100:
+     5.92-5.93 s and 5.1-5.4 s host CPU, against 8.38-8.41 s before and the ordinary reader's
+     6.67-7.10 s. The pool also stopped scaling with the device count, which had made eight GPUs pin
+     4 GiB before the first read and run slower than the ordinary path (`--tar` too); see CHANGELOG
+     v0.17.84.
 2. **The 64-frame batch floor is still a machine-tuned constant** — it comes from this box's
    0.28 GiB/s-per-frame device checksum against a 4.9 GiB/s drive. Unchanged
    `feedback_code_to_general_goals` violation; derive it from the measured checksum rate and device
@@ -2088,9 +2106,10 @@ AND decompress writes), then its portable 95%, `--direct-stage` (v0.17.9–10). 
 >   tuner's ramp on a ~20 GiB input, not the pipeline — see "OPEN QUESTION: is GPU compress worth
 >   another round?" at the top.
 > - **Still open:** the loaded-box comparison ("3. The comparison that would actually settle GDS's
->   case is a LOADED box"), plain-file `--direct-stage` onto the pinned-pool producer, and a
+>   case is a LOADED box"), and a
 >   portable O_DIRECT write of decompressed output out of VRAM (the `--direct-stage` section).
->   `--direct-stage` for `--tar` create SHIPPED in v0.17.82.
+>   `--direct-stage` for `--tar` create SHIPPED in v0.17.82; plain-file `--direct-stage` onto the
+>   pinned-pool producer SHIPPED in v0.17.84.
 
 > **2026-08-13 note (SUPERSEDED — see above).** This was once written off on the arithmetic that the drive (4.56 GiB/s)
 > has 5× less bandwidth than the H2D link (25+ GiB/s), so removing the host bounce optimises a

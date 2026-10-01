@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=547
-$EXTENSIVE && EXPECTED_TESTS=706
+EXPECTED_TESTS=552
+$EXTENSIVE && EXPECTED_TESTS=711
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -781,8 +781,12 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.83: one --extensive GDS cell (an nvidia-fs built for another driver is
 # refused before any GPU pin).  Default unchanged at 547; 705 -> 706, and the
 # --extensive no-GPU delta 178 -> 179.  DERIVED.
-EXPECTED_NOGPU_DELTA=150
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=179   # MEASURED 2026-09-21 (607 - 463) + 27 derived since
+# v0.17.84: five GPU cells for plain-file --direct-stage compression (every frame
+# staged and the same archive; a failed read named and recovered; a stalled read
+# with a small throttle; no libcufile; one pool however many GPUs).  547 -> 552,
+# 706 -> 711; the no-GPU deltas grow 150 -> 155 and 179 -> 184.  DERIVED.
+EXPECTED_NOGPU_DELTA=155
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=184   # MEASURED 2026-09-21 (607 - 463) + 32 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7982,7 +7986,9 @@ if has_gpu 2>/dev/null; then
   dsd_out="$TMPDIR/dstage-d.out"; dsd_log="$TMPDIR/dstage-d.log"
   (
     set +o pipefail
-    head -c $((48*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576 + 12345)) > "$dsd_src"
+    # 49 MiB, not 48: 48 MiB of random bytes base64-encodes to EXACTLY 64 MiB, so
+    # the "+ 12345" tail this fixture exists for was never there (v0.17.84).
+    head -c $((49*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576 + 12345)) > "$dsd_src"
   )
   "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dsd_src" -o "$dsd_zst" 2>/dev/null
   # "frames bytes" a staged run must read: the seek table's frame count, and the
@@ -8161,6 +8167,160 @@ else
   skip "--direct-stage -d reads ahead; -t does not" "no GPU"
 fi
 
+
+# ────────────────────────────────────────────────────────────
+section "--direct-stage compression (plain file)"
+
+# v0.17.84: a plain file's frames are read AHEAD of the GPU -- two O_DIRECT readers
+# fill the pinned host pool --tar uses, one whole frame per read into its slot --
+# where each batch's reads used to run inside the GPU worker and be joined before
+# it launched.  MEASURED, 16 GiB cold, one H100: 5.92 s against 8.38-8.41 before
+# and the ordinary reader's 6.67-7.10.  Until this section the suite had no cell
+# for plain-file --direct-stage compression at all.
+#
+# BYTE-IDENTITY ALONE PROVES NOTHING HERE EITHER: a failed staged read aborts into
+# a CPU rebuild that writes a correct archive at exit 0.  So cell 1 also compares
+# the [DSTAGE] totals with the file: every frame, every byte.  The fixture ends in
+# a 12,345-byte tail, so the last read is NOT 4 KiB-aligned and must round its
+# window up inside its slot.
+if has_gpu 2>/dev/null; then
+  dsc_src="$TMPDIR/dsc.bin"; dsc_ord="$TMPDIR/dsc-ord.zst"; dsc_zst="$TMPDIR/dsc.zst"
+  dsc_out="$TMPDIR/dsc.out"; dsc_log="$TMPDIR/dsc.log"
+  (
+    set +o pipefail
+    head -c $((49*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576 + 12345)) > "$dsc_src"
+  )
+  dsc_size=$(stat -c %s "$dsc_src")
+  dsc_want="$(( (dsc_size + 1048575) / 1048576 )) $dsc_size"
+  dsc_got() { grep -a -o '\[DSTAGE\] [0-9]* frames, [0-9]* bytes' "$1" | head -1 | awk '{print $2, $4}'; }
+  dsc_pool() { grep -a -o 'staging: [0-9]* x [0-9]* MiB of pinned host memory' "$1" | head -1 | awk '{print $2}'; }
+  "$GZSTD" -q -f --gpu-only --chunk-size=1 "$dsc_src" -o "$dsc_ord" 2>/dev/null
+
+  # 1. Every frame staged, the same archive as the ordinary GPU path, and it decodes.
+  rc=0
+  timeout --foreground -k 10 120 "$GZSTD" --direct-stage --chunk-size=1 -v -f \
+    "$dsc_src" -o "$dsc_zst" 2>"$dsc_log" || rc=$?
+  dsc_have=$(dsc_got "$dsc_log")
+  if [[ $rc -ne 0 ]]; then
+    fail "--direct-stage stages every frame of a file and matches the ordinary archive" "exit $rc"
+  elif [[ "$dsc_have" != "$dsc_want" ]]; then
+    fail "--direct-stage stages every frame of a file and matches the ordinary archive" \
+         "staged '${dsc_have:-nothing}', expected '$dsc_want' (frames bytes)"
+  elif ! files_match "$dsc_ord" "$dsc_zst"; then
+    fail "--direct-stage stages every frame of a file and matches the ordinary archive" "archive differs"
+  elif ! "$GZSTD" -d -q -c "$dsc_zst" | cmp -s - "$dsc_src"; then
+    fail "--direct-stage stages every frame of a file and matches the ordinary archive" "does not decode to the input"
+  else
+    pass "--direct-stage stages every frame of a file and matches the ordinary archive"
+  fi
+
+  # 2. A read that fails is named, and the CPU rebuild still writes a correct
+  # archive -- with readers PARKED on the pool when it fails.  One slot, four
+  # readers: frame 0 holds the slot through a 2 s stall while three wait for it,
+  # then fails and returns it; one waiter reads frame 1, which can never be
+  # pushed (frame 0 never will be) and so keeps the slot.  Only the abort's
+  # wakeup of the pool frees the other two (review, v0.17.84).  MEASURED: without
+  # it, 40 s timeout 2 of 2; with it, 3.4 s.
+  rc=0
+  env GZSTD_DEBUG_DSTAGE_SLOTS=1 GZSTD_DEBUG_DSTAGE_FAIL_FRAME=0 GZSTD_DEBUG_DSTAGE_STALL_FRAME=0:2000 \
+    timeout --foreground -k 10 60 \
+    "$GZSTD" --direct-stage --read-threads=4 --chunk-size=1 -f "$dsc_src" -o "$dsc_zst" 2>"$dsc_log" || rc=$?
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "--direct-stage compress read failure is named and recovered" "TIMED OUT -- the abort did not wake the pipeline"
+  elif [[ $rc -ne 0 ]]; then
+    fail "--direct-stage compress read failure is named and recovered" "exit $rc"
+  elif ! grep -aq -- '--direct-stage: pread failed' "$dsc_log"; then
+    fail "--direct-stage compress read failure is named and recovered" "the failed read was not named"
+  elif grep -aq -e '--gds-only' "$dsc_log"; then
+    fail "--direct-stage compress read failure is named and recovered" "a --gds-only message under --direct-stage"
+  elif ! "$GZSTD" -d -q -c "$dsc_zst" | cmp -s - "$dsc_src"; then
+    fail "--direct-stage compress read failure is named and recovered" "the rebuilt archive does not decode to the input"
+  else
+    pass "--direct-stage compress read failure is named and recovered"
+  fi
+
+  # 2b. A STALLED READ CANNOT DEADLOCK THE THROTTLE.  Frames reach the queue in
+  # order.  Pushed out of order (the v0.17.84 draft, found by review), the other
+  # reader ran ahead while frame 0's read stalled; the GPU popped those frames and
+  # held a throttle permit for each until the writer -- waiting for frame 0 --
+  # wrote them, and with the permits gone it could never take frame 0.  The hook
+  # stalls frame 0's reader; --gpu-batch=8 lowers the throttle's GPU floor to 16
+  # permits, under the fixture's 65 frames.  MEASURED: the out-of-order producer
+  # hangs (40 s timeout, 4 of 4), in order finishes in 3-4 s.
+  rc=0
+  env GZSTD_DEBUG_DSTAGE_STALL_FRAME=0:2000 timeout --foreground -k 10 60 \
+    "$GZSTD" --direct-stage --chunk-size=1 --gpu-batch=8 --gpu-streams=2 --throttle-frames=1 \
+    -q -f "$dsc_src" -o "$dsc_zst" 2>"$dsc_log" || rc=$?
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "--direct-stage survives a stalled read with a small throttle" \
+         "TIMED OUT -- frames pushed past the stalled one held every permit"
+  elif [[ $rc -ne 0 ]]; then
+    fail "--direct-stage survives a stalled read with a small throttle" "exit $rc"
+  elif ! "$GZSTD" -d -q -c "$dsc_zst" | cmp -s - "$dsc_src"; then
+    fail "--direct-stage survives a stalled read with a small throttle" "does not decode to the input"
+  else
+    pass "--direct-stage survives a stalled read with a small throttle"
+  fi
+
+  # 3. No cuFile, ever (the same detector and control as the decompress cell).
+  LD_DEBUG=libs "$GZSTD" --direct-stage --chunk-size=1 -q -f "$dsc_src" -o "$dsc_zst" 2>"$dsc_log"
+  dsc_cuf=$(grep -a -c -i 'cufile' "$dsc_log")
+  LD_DEBUG=libs "$GZSTD" -t --gds-only "$dsc_ord" >/dev/null 2>"$dsc_log.ctl"
+  dsc_ctl=$(grep -a -c -i 'cufile' "$dsc_log.ctl")
+  if [[ $dsc_ctl -eq 0 ]]; then
+    skip "--direct-stage compress never loads libcufile" \
+         "not provable here: --gds-only loaded no libcufile either (static build, or no cuFile)"
+  elif [[ $dsc_cuf -gt 0 ]]; then
+    fail "--direct-stage compress never loads libcufile" "libcufile appeared in the loader log"
+  else
+    pass "--direct-stage compress never loads libcufile"
+  fi
+  rm -f "$dsc_log.ctl"
+
+  # 4. The pool is READ-AHEAD, so it does not grow with the device count.
+  # v0.17.82 multiplied it by the devices: eight H100s pinned 4 GiB (2 s) before
+  # the first read and ran slower than the ordinary path, plain and --tar alike.
+  # The helper is shared, so this cell guards both.
+  dsc_cards=()
+  if [[ -n "${GPU_ALL_DEVICES:-}" && "$GPU_ALL_DEVICES" == *,* ]]; then
+    if [[ "$GPU_ALL_DEVICES" =~ ^GPU-[^,]+(,GPU-[^,]+)+$ ]]; then
+      mapfile -t dsc_cards < <(gpu_uuids_by_free 4096 "$GPU_ALL_DEVICES")
+    else
+      IFS=, read -r -a dsc_cards <<< "$GPU_ALL_DEVICES"
+    fi
+  fi
+  if (( ${#dsc_cards[@]} >= 2 )); then
+    rc=0
+    env CUDA_VISIBLE_DEVICES="${dsc_cards[0]}" timeout --foreground -k 10 120 \
+      "$GZSTD" --direct-stage --chunk-size=1 -v -f "$dsc_src" -o "$dsc_zst" 2>"$dsc_log" || rc=$?
+    dsc_p1=$(dsc_pool "$dsc_log")
+    env CUDA_VISIBLE_DEVICES="${dsc_cards[0]},${dsc_cards[1]}" timeout --foreground -k 10 120 \
+      "$GZSTD" --direct-stage --gpu-devices=2 --chunk-size=1 -v -f "$dsc_src" -o "$dsc_zst" \
+      2>"$dsc_log" || rc=$?
+    dsc_p2=$(dsc_pool "$dsc_log"); dsc_have=$(dsc_got "$dsc_log")
+    if [[ $rc -ne 0 || -z "$dsc_p1" || -z "$dsc_p2" ]]; then
+      fail "--direct-stage pins one pool however many GPUs share it" \
+           "exit $rc; pools '${dsc_p1:-none}' and '${dsc_p2:-none}'"
+    elif [[ "$dsc_p2" != "$dsc_p1" ]]; then
+      fail "--direct-stage pins one pool however many GPUs share it" \
+           "$dsc_p1 slots on one GPU, $dsc_p2 on two"
+    elif [[ "$dsc_have" != "$dsc_want" ]] || ! files_match "$dsc_ord" "$dsc_zst"; then
+      fail "--direct-stage pins one pool however many GPUs share it" \
+           "two GPUs staged '${dsc_have:-nothing}', expected '$dsc_want', or the archive differs"
+    else
+      pass "--direct-stage pins one pool however many GPUs share it" "($dsc_p1 slots)"
+    fi
+  else
+    skip_host "--direct-stage pins one pool however many GPUs share it" "needs two GPUs"
+  fi
+  rm -f "$dsc_src" "$dsc_ord" "$dsc_zst" "$dsc_out" "$dsc_log"
+else
+  skip "--direct-stage stages every frame of a file and matches the ordinary archive" "no GPU"
+  skip "--direct-stage compress read failure is named and recovered" "no GPU"
+  skip "--direct-stage survives a stalled read with a small throttle" "no GPU"
+  skip "--direct-stage compress never loads libcufile" "no GPU"
+  skip "--direct-stage pins one pool however many GPUs share it" "no GPU"
+fi
 
 section "--direct-stage --tar creation"
 

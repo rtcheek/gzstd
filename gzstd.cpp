@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.83";
+static constexpr const char * GZSTD_VERSION = "0.17.84";
 //
 // Architecture overview:
 //
@@ -1496,7 +1496,7 @@ public:
     if (cudaHostAlloc(&base_, buf_size * n_bufs, cudaHostAllocPortable) != cudaSuccess) {
       cudaGetLastError();
       if (why) *why = "cannot pin " + std::to_string((buf_size * n_bufs) >> 20)
-                    + " MiB of host memory for --tar staging";
+                    + " MiB of host memory for the staging pool";
       base_ = nullptr;
       return false;
     }
@@ -1568,8 +1568,8 @@ private:
   bool done_ = false;
 };
 
-// Live only while a --tar --gds-only compress is running; the pool outlives
-// every releaser (cleared before the joins complete, destroyed after).  Same
+// Live while a --tar --gds-only or a --direct-stage compress is running; the pool
+// outlives every releaser (cleared after the joins, destroyed after that).  Same
 // shape and same reasoning as g_direct_read_pool.
 static std::atomic<GdsStagePool *> g_gds_stage_pool{nullptr};
 static void gz_gds_stage_release(int slot) {
@@ -2492,6 +2492,14 @@ static const size_t SINGLE_FRAME_STREAM_MIN = size_t(256) * ONE_MIB;
 // references it from CPU-visible code (dead branch when cpu_only, but it must
 // compile), and v0.14.81 broke USE_NVCOMP=OFF builds by guarding it.
 static const size_t GPU_SUBCHUNK_MAX = size_t(16) * ONE_MIB;
+// --direct-stage, plain file: O_DIRECT readers filling the pinned pool ahead of
+// the GPU (dstage_read_plain); --read-threads overrides, for a striped array.
+// TWO IS THE DOUBLE BUFFER: one large read in flight while the other hands its
+// frame to the queue, so the drive never waits on us; more only interleaves
+// requests on it.  MEASURED, 16 GiB cold, 4.7 GiB/s drive, 16 MiB frames:
+// one H100 -- 1 reader 6.42-6.74 s, 2: 5.74-5.87, 4: 5.92-5.94, 8: 6.04-6.05,
+// 12: 6.07; two H100s -- 2: 5.61-5.74, 4: 5.94-5.96, 8: 6.08-6.13.
+static const int DSTAGE_PLAIN_READERS = 2;
 #ifdef HAVE_NVCOMP
 static const size_t DEFAULT_GPU_BATCH_CAP = 8;    // per device  smaller batches launch sooner
 static const size_t DEFAULT_GPU_DECOMP_BATCH_CAP = 16;  // sweet spot: amortizes kernel launch without starving writer
@@ -4777,30 +4785,25 @@ static void print_help_long()
 "     verbosity.  Unlike --gds-only --tar, several GPUs may share the\n"
 "     staging memory.\n"
 "\n"
-"     READ AND COMPUTE OVERLAP ACROSS TWO STREAMS.  A batch's staged\n"
-"     reads are joined before that batch is launched, so a single stream\n"
-"     pays read + compute where the ordinary reader pipelines a pool\n"
-"     ahead of its workers and pays max(read, compute).  This path\n"
-"     therefore takes the ordinary compress default of two GPU streams:\n"
-"     each stream owns its own staging slots, so one reads while the\n"
-"     other's kernel runs.  Measured here, 16 GiB cold, three\n"
-"     interleaved runs: wall 8.79-8.92 s at one stream against\n"
-"     7.43-7.48 at two, about 16% faster, and now at or below the\n"
-"     ordinary reader's 7.56-7.72 rather than behind it.  Ranges\n"
-"     non-overlapping.\n"
+"     READ AHEAD OF THE GPU (since v0.17.84).  A plain file is read the\n"
+"     way --tar frames are assembled: two O_DIRECT readers fill a pool of\n"
+"     page-locked host slots ahead of the workers, one whole frame per\n"
+"     read straight into its slot, and each worker moves a frame with one\n"
+"     DMA.  Until then each batch's reads ran inside its GPU worker and\n"
+"     were joined before the batch launched, so the drive and the GPU\n"
+"     took turns.  The pool is one starting batch (about 512 MiB) however\n"
+"     many GPUs share it: its slots are read-ahead, released before the\n"
+"     GPU compresses, so the drive sets its pace, not the device count.\n"
+"     --read-threads sets the reader count (for a striped array).\n"
 "\n"
-"     THE SECOND STREAM COSTS SOME OF THE CPU WIN, and that is the\n"
-"     trade: host CPU over the same runs was 4.89-5.86 s at one stream,\n"
-"     7.69-7.84 at two, against the ordinary reader's 13.70-13.92 --\n"
-"     still about 43% less, where one stream was about 62% less.  Pass\n"
-"     --gpu-streams 1 to buy the cores back and spend the wall clock.\n"
-"     Bringup sizes each stream against free VRAM and drops back to one\n"
-"     if the second will not fit, so a tight card loses nothing.\n"
-"\n"
-"     The earlier PCIe Gen3 measurement of this flag (wall about 29%\n"
-"     behind the ordinary reader, host CPU 12.55-12.69 s -> 4.78-4.92,\n"
-"     peak resident set size 9.5 GB -> 1.0 GB) was taken at one stream\n"
-"     and has NOT been re-run with this default.\n"
+"     MEASURED, 16 GiB cold, a 4.7 GiB/s drive, one H100, three\n"
+"     interleaved runs, ranges non-overlapping:\n"
+"       this path       wall 5.92-5.93 s, host CPU 5.1-5.4 s\n"
+"                       (4 readers; at the default 2, 5.74-5.87 s)\n"
+"       before v0.17.84 wall 8.38-8.41 s, host CPU 8.9-9.3 s\n"
+"       ordinary reader wall 6.67-7.10 s, host CPU 9.8-10.4 s\n"
+"     Two H100s: 5.71-5.80 s against the ordinary reader's 5.92-6.42.\n"
+"     Eight: 8.43-8.51 s against 8.49-9.26 (both drive-bound).\n"
 "\n"
 "     DECOMPRESSION AND -t.  The same read, of the COMPRESSED frames:\n"
 "     located through the archive's seek table, read O_DIRECT into\n"
@@ -11467,9 +11470,9 @@ static void gz_direct_read_abort() {
   DirectReadPool * p = g_direct_read_pool.load(std::memory_order_acquire);
   if (p) p->set_done();
 #endif
-  // The --tar --gds-only assembler parks in GdsStagePool::acquire() waiting for a
-  // slot the dead workers will never release, so it needs the same wake for the
-  // same reason.  Adding a second pool without adding it here would hang the
+  // The --tar assembler and the plain --direct-stage readers park in
+  // GdsStagePool::acquire() waiting for a slot dead workers may never release,
+  // so they need the same wake for the same reason.  Adding a second pool without adding it here would hang the
   // abort path instead of reaching the CPU-only rebuild -- which is precisely
   // what this hook was written to prevent for the first pool.
   GdsStagePool * sp = g_gds_stage_pool.load(std::memory_order_acquire);
@@ -28037,28 +28040,17 @@ struct StreamCtx {
   unsigned int *       d_pack_ck     = nullptr;   // per-frame checksum
   GdsBuf              gds_pack_reg;               // BAR1 registration of d_pack_base
 
-  // --direct-stage host staging buffers: ONE PER READER THREAD, allocated once
-  // with the stream and reused for the life of the run.
-  //
-  // The measurement hook this path grew out of used a thread_local buffer, which
-  // was right for a throwaway A/B and wrong here: the reader threads are created
-  // and joined PER BATCH, so a thread_local would malloc and free 16 MiB eight
-  // times per batch -- precisely the kind of host-side cost the flag exists to
-  // remove.  Owning them here makes the allocation once-per-run.
-  //
-  // PINNED, and both halves of that matter: cudaHostAlloc memory is page-locked
-  // so the H2D is a straight DMA instead of the driver's own staged copy, and it
-  // is page-aligned, which is what O_DIRECT requires of the pread landing in it.
+  // --gds-only's per-batch cuFileRead fan-out.  (--direct-stage used to run its
+  // O_DIRECT preads from the same fan-out, into per-worker pinned lanes, joined
+  // before each launch; since v0.17.84 its frames arrive already read, in the
+  // shared GdsStagePool -- see the region producer in compress_nvcomp.)
   static constexpr size_t DSTAGE_MAX_READERS = 8;   // mirrors rd_threads' cap
-  std::vector<void *> h_dstage;      // DSTAGE_MAX_READERS entries when engaged
-  size_t h_dstage_n = 0;             // slots actually PINNED (<= DSTAGE_MAX_READERS)
   bool   host_pin_failed = false;    // could not pin even ONE staging slot
   // nvCOMP REFUSED to size its workspace (v0.17.77).  That is not a memory
   // shortage -- the query allocates nothing -- so halving the batch cannot fix
   // it, and "insufficient VRAM" would be false.  MEASURED on a GTX 1080 Ti with
   // 11 GiB free, which nvCOMP has no code for.  Holds nvCOMP's own message.
   std::string nvcomp_refused;
-  size_t h_dstage_slot_bytes = 0;
 
   // Host-side vectors (mirroring device arrays for readback)
   std::vector<size_t>         h_in_sizes;
@@ -28245,55 +28237,6 @@ static bool allocate_stream_buffers(StreamCtx & C, size_t per_stream_batch, size
       std::cerr << "gzstd: --gds-only: cannot register the output pack buffer: " << pwhy << "\n";
       return false;
     }
-  }
-  // Not for --tar: its frames arrive assembled in the shared host pool, so no
-  // worker ever reads a region and these lanes would be pinned for nothing.
-  if (opt.direct_stage && !opt.tar_mode) {
-    // Rounded to the O_DIRECT block: the tail frame is short and its read window
-    // is rounded UP, so the buffer must hold the rounded length, not the frame's.
-    C.h_dstage_slot_bytes = (C.gpu_chunk + 4095) & ~size_t(4095);
-    C.h_dstage.assign(StreamCtx::DSTAGE_MAX_READERS, nullptr);
-    C.h_dstage_n = 0;
-    for (size_t k = 0; k < StreamCtx::DSTAGE_MAX_READERS; ++k) {
-      // (endian-lint exemption: cudaHostAlloc is an allocator out-param, listed
-      // in check-endian-reads.sh's ALLOW beside cudaMalloc -- the width here is
-      // the allocation size, not the width of a field read off disk.)
-      if (cudaHostAlloc(&C.h_dstage[k], C.h_dstage_slot_bytes,
-                        cudaHostAllocDefault) != cudaSuccess) {
-        C.h_dstage[k] = nullptr;
-        break;
-      }
-      ++C.h_dstage_n;
-    }
-    // TAKE WHAT WE GOT, AND NARROW THE FAN-OUT TO MATCH.  This used to return
-    // false on the first failed pin, which handed the caller a failure it could
-    // do nothing with: the request is 8 slots of gpu_chunk and does not depend on
-    // the GPU batch, so the outer loop's response -- halve the batch and retry --
-    // changed nothing about the allocation that failed.  MEASURED shape: 7
-    // attempts, 56 cudaHostAlloc calls, 49 successful pairs allocated and freed,
-    // and the same 128 MiB requested every time before the device was rejected.
-    //
-    // The slots are per-reader precisely so two lanes never share one, so fewer
-    // slots is only safe if fewer lanes run; h_dstage_n is what the read fan-out
-    // clamps to below.  One slot still works -- it is serial staging, which is
-    // what --direct-stage did before the fan-out existed.
-    if (C.h_dstage_n == 0) {
-      // NOT A BATCH PROBLEM, AND THE CALLER MUST KNOW THAT.  These slots are
-      // sized from the chunk and their count is fixed, so nothing about the GPU
-      // batch changes this request -- yet a bare `return false` sent the caller
-      // into the halve-and-retry loop, which asked for the SAME 16 MiB seven
-      // times (64, 32, 16, 8, 4, 2, 1) and, with a nonzero nvCOMP temp, threw
-      // away 8 device allocations per attempt to do it.  Narrowing the fan-out
-      // covers 1-7 slots; zero slots is a host-memory answer and retrying a
-      // device quantity cannot change it.
-      C.host_pin_failed = true;
-      return false;
-    }
-    if (C.h_dstage_n < StreamCtx::DSTAGE_MAX_READERS)
-      vlog(V_VERBOSE, opt,
-           "[DSTAGE] pinned " + std::to_string(C.h_dstage_n) + " of "
-           + std::to_string((size_t)StreamCtx::DSTAGE_MAX_READERS)
-           + " staging slots; read fan-out narrows to match\n");
   }
   if (opt.region_staged()) {
     if (cudaMalloc(&C.d_checksums, sizeof(unsigned int) * C.per_stream_batch) != cudaSuccess)
@@ -28541,8 +28484,6 @@ static void free_stream_buffers_only(StreamCtx & C, const Options & opt)
   if (C.d_pack_csz)     { cudaFree(C.d_pack_csz);     C.d_pack_csz = nullptr; }
   if (C.d_pack_ck)      { cudaFree(C.d_pack_ck);      C.d_pack_ck = nullptr; }
   C.d_pack_cap = C.d_pack_used = 0;
-  for (void *& hp : C.h_dstage) if (hp) { cudaFreeHost(hp); hp = nullptr; }
-  C.h_dstage.clear(); C.h_dstage_slot_bytes = 0;
   if (C.d_in_base) { cudaFree(C.d_in_base); }
   if (C.d_out_base) { cudaFree(C.d_out_base); }
   if (C.d_temp) { cudaFree(C.d_temp); }
@@ -30267,15 +30208,10 @@ static void gpu_worker(
                   + " exceeds GPU subchunk slot " + std::to_string(C.gpu_chunk));
             C.h_in_sizes[i] = t.len();
           }
-          // NEVER MORE LANES THAN PINNED SLOTS.  place_frame indexes
-          // h_dstage[k % h_dstage_n], so a lane without its own slot would share
-          // one with a concurrent lane and corrupt both frames.  The cap was the
-          // constant 8 that DSTAGE_MAX_READERS mirrors; it is now whatever was
-          // actually pinned, which is what lets a short pin degrade instead of
-          // rejecting the device.
-          const size_t rd_cap = opt.direct_stage
-                              ? std::max<size_t>(1, C.h_dstage_n)
-                              : StreamCtx::DSTAGE_MAX_READERS;
+          // --direct-stage frames all arrive already read, in the shared host
+          // pool (the gds_stage copies above), so its pass below only confirms
+          // that; one thread is enough.  --gds-only fans its cuFileReads out.
+          const size_t rd_cap = opt.direct_stage ? 1 : StreamCtx::DSTAGE_MAX_READERS;
           const size_t rd_threads = std::min<size_t>(C.filled, rd_cap);
           std::atomic<bool> rd_failed{false};
           std::mutex        rd_err_m;
@@ -30284,10 +30220,12 @@ static void gpu_worker(
             std::lock_guard<std::mutex> g(rd_err_m);
             if (!rd_failed.exchange(true)) rd_err = std::move(why);
           };
-          // --tar frames were already ASSEMBLED by the producer, so they arrive
-          // as a staging slot rather than a file region: in VRAM for --gds-only
-          // (device-to-device, ~1 TB/s, about 16 us for a 16 MiB chunk), in
-          // page-locked host memory for --direct-stage (one DMA per frame).
+          // --tar frames were already ASSEMBLED by the producer, and every
+          // --direct-stage frame was already READ by it (v0.17.84), so they
+          // arrive as a staging slot rather than a file region: in VRAM for
+          // --tar --gds-only (device-to-device, ~1 TB/s, about 16 us for a 16 MiB
+          // chunk), in page-locked host memory for --direct-stage (one DMA per
+          // frame).
           // Both land in the same slab slot, so everything downstream is
           // identical.
           bool staged_any = false;
@@ -30307,13 +30245,13 @@ static void gpu_worker(
                                         sp->buf(t.gds_stage), t.len(),
                                         sp->host() ? cudaMemcpyHostToDevice
                                                    : cudaMemcpyDeviceToDevice, C.stream),
-                        "cudaMemcpyAsync(--tar staging -> slab)");
+                        "cudaMemcpyAsync(staging pool -> slab)");
               if (sp->host()) { host_staged_bytes += t.len(); ++host_staged_frames; }
             }
             // The copies must LAND before release_input() hands these slots
             // back, or the next frame could overwrite a slot still being read.
             if (staged_any)
-              checkCuda(cudaStreamSynchronize(C.stream), "sync(--tar staging copies)");
+              checkCuda(cudaStreamSynchronize(C.stream), "sync(staging pool copies)");
           } catch (...) {
             // Mirror the D2H readback window: a later copy can fail after an
             // earlier one was queued.  Join before gpu_worker's outer catch
@@ -30385,10 +30323,10 @@ static void gpu_worker(
           auto issue = [&](size_t k, size_t step) {
             // CUDA's current device is host-thread-local.  issue(0) runs on the
             // GPU worker, which selected device_id during bringup, but every
-            // fan-out thread starts on device 0.  --direct-stage performs its
-            // H2D from those threads, so select the slab's owning device in each
-            // one before touching C.d_in_base.
-            if (opt.direct_stage || force_bounce) {
+            // fan-out thread starts on device 0.  The measurement bounce performs
+            // its H2D from those threads, so select the slab's owning device in
+            // each one before touching C.d_in_base.
+            if (force_bounce) {
               const cudaError_t ds = cudaSetDevice(device_id);
               if (ds != cudaSuccess) {
                 note_rd_error(std::string("cudaSetDevice(staged reader): ")
@@ -30399,86 +30337,13 @@ static void gpu_worker(
             for (size_t i = k; i < C.filled; i += step) {
               const Task & t = C.batch[i];
               if (t.gds_stage >= 0) continue;          // already copied above
-              // ---- --direct-stage: O_DIRECT pread -> pinned host slot -> H2D ----
-              //
-              // This is the portable 95%.  No cuFile, so none of its four gates
-              // apply and nothing can silently downgrade: an ordinary pread
-              // either returns the bytes or it does not.
-              //
-              // THE TAIL FRAME IS THE TRAP, and it has bitten this codebase
-              // before (v0.15.63: O_DIRECT compress read failed on every input
-              // whose size was not 4096-aligned, hidden for four versions
-              // because every generated corpus is MiB-sized).  O_DIRECT requires
-              // an aligned length, the final frame is almost never aligned, so
-              // the window is rounded UP and the read is allowed to run past
-              // EOF -- the kernel simply returns fewer bytes.  What we hand the
-              // GPU is min(what arrived, what the frame actually is), and a
-              // short read below THAT is a real error rather than a tail.
+              // --direct-stage never names a region: its producer reads every
+              // frame into the host pool before pushing it (see compress_nvcomp's
+              // region producer).  A region frame here would be read by nobody.
               if (opt.direct_stage) {
-                // No lanes at all is the --tar shape (frames arrive in slots),
-                // so a region frame here is an internal error, not an index.
-                char * hp = C.h_dstage_n
-                          ? static_cast<char *>(C.h_dstage[k % C.h_dstage_n]) : nullptr;
-                if (!hp) die("--direct-stage: staging slot missing for reader "
-                             + std::to_string(k));
-                const size_t want = (t.len() + 4095) & ~size_t(4095);
-                if (want > C.h_dstage_slot_bytes)
-                  die("internal error: --direct-stage frame " + std::to_string(want)
-                      + " exceeds staging slot " + std::to_string(C.h_dstage_slot_bytes));
-                size_t hgot = 0;
-                bool   rerr = false;
-                while (hgot < want) {
-                  const ssize_t r = ::pread(g_stage_input_fd, hp + hgot, want - hgot,
-                                            (off_t)t.src_off + (off_t)hgot);
-                  if (r < 0) {
-                    if (errno == EINTR) continue;      // retriable, not a tail
-                    rerr = true; break;
-                  }
-                  if (r == 0) break;                   // EOF: rounded window only
-                  hgot += (size_t)r;
-                }
-                // GZSTD_DEBUG_DSTAGE_FAIL_FRAME=N -- force frame N's read to fail.
-                // The abort -> discard -> CPU-only rebuild this triggers is
-                // otherwise reachable only on a filesystem that accepts an
-                // O_DIRECT open and then refuses the read, which is not
-                // something a test can arrange.  Making the PROGRAM open the
-                // window is the only way to prove the warning below actually
-                // fires, rather than assuming it would.
-                {
-                  static const char * fenv = ::getenv("GZSTD_DEBUG_DSTAGE_FAIL_FRAME");
-                  if (fenv && t.seq == (uint64_t)::strtoull(fenv, nullptr, 10)) {
-                    rerr = true; errno = EIO;
-                  }
-                }
-                const size_t usable = std::min(hgot, t.len());
-                if (!rerr && usable == t.len()) {
-                  const cudaError_t cs = cudaMemcpy(
-                      static_cast<char *>(C.d_in_base) + i * C.gpu_chunk,
-                      hp, usable, cudaMemcpyHostToDevice);
-                  if (cs != cudaSuccess) {
-                    // Never throw out of a child std::thread: that calls
-                    // std::terminate instead of reaching gpu_worker's catch and
-                    // its abort -> discard -> CPU-only rebuild protocol.
-                    note_rd_error(std::string("cudaMemcpy(--direct-stage host -> slab): ")
-                                  + cudaGetErrorString(cs));
-                    return;
-                  }
-                  g_dstage_bytes.fetch_add(usable, std::memory_order_relaxed);
-                  g_dstage_frames.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                  gz_note_stage_read_failure(
-                      std::string("--direct-stage: ")
-                    + (rerr ? std::string("pread failed (") + std::strerror(errno) + ")"
-                            : "short read")
-                    + " at offset " + std::to_string((long long)t.src_off));
-                  note_rd_error(std::string("--direct-stage: ")
-                      + (rerr ? std::string("pread failed (")
-                                + std::strerror(errno) + ")"
-                              : "short read " + std::to_string(usable))
-                      + " for " + std::to_string(t.len()) + " bytes at offset "
-                      + std::to_string((long long)t.src_off));
-                }
-                continue;
+                note_rd_error("internal error: --direct-stage frame "
+                              + std::to_string(t.seq) + " arrived unread");
+                return;
               }
               // GZSTD_DEBUG_GDS_FORCE_BOUNCE=1 — read this frame with an
               // ordinary pread into an aligned host buffer and push it across,
@@ -31352,6 +31217,164 @@ static void gz_gds_tar_odirect_preflight(const tarx::TarLayout & lay) {
 }
 #endif
 
+#ifndef _WIN32
+/*======================================================================
+ --direct-stage, plain file: READ AHEAD OF THE GPU into the pinned host pool
+ -----------------------------------------------------------------------
+ Until v0.17.84 a plain file's frames were read INSIDE the GPU worker: each
+ batch's O_DIRECT preads ran on a per-batch fan-out into per-worker pinned
+ lanes, and were joined before the batch launched.  So the drive and the GPU
+ took turns.  MEASURED, 16 GiB cold, one H100: 8.8-9.0 s, against 7.3-7.7 s for
+ the ordinary reader -- and --tar --direct-stage, whose assembler fills a
+ shared pinned pool AHEAD of the workers (v0.17.82), ran faster than both.
+
+ A plain file is the easy case of that producer.  Frames are whole MiB (the
+ chunk is always a MiB multiple), so every read is 4 KiB-aligned in file
+ offset, slot address and length (the tail's window rounds up inside its slot
+ and the kernel stops at EOF): each frame is ONE pread straight into its slot,
+ with no window and no copy.  The worker then moves it with one DMA -- the
+ existing gds_stage path, shared with --tar.
+
+ SLOT FIRST, THEN THE CLAIM, AND PUSHED IN ORDER.  A reader holds its slot
+ before it claims a frame, so the lowest unfinished frame always belongs to a
+ reader doing nothing but its own read.  And frames reach the queue strictly in
+ sequence: a frame read ahead of the head waits in a small map, keeping its
+ slot, and whoever completes the head pushes it and every consecutive frame
+ behind it (the --tar assembler's reorder buffer, without its pusher thread).
+ Out-of-order pushes DEADLOCKED (Codex review, v0.17.84): while one read
+ stalled, the other reader fed later frames that the GPU popped, each holding a
+ throttle permit until the writer -- waiting for the stalled frame -- wrote it;
+ once every permit was held, the GPU intake could not take the stalled frame
+ when it finally arrived.  At ~3.4 ms per 16 MiB frame, a one-second I/O stall
+ is enough.  In order, the frames the GPU holds are always a prefix the writer
+ can drain, as on every other compress path.  Run-ahead is bounded by the pool:
+ a waiting frame keeps its slot.
+
+ A FAILED READ ABORTS THE PASS, it does not die(): the GPU workers and the
+ ordered writer are live, and exit() from here raced their teardown (a crash
+ and a partial archive under --tar, v0.17.82).  The abort is the tar
+ assembler's: mark the restart, wake everything that can park, and let the
+ driver discard the output and rebuild it on the CPU, naming the cause.  An
+ exception on a reader thread takes the same path; it would otherwise be
+ std::terminate.
+======================================================================*/
+static void dstage_read_plain(TaskQueue & queue, GdsStagePool & pool, int fd,
+                              uint64_t file_size, size_t chunk, uint64_t seq_base,
+                              int nreaders, Meter * m, FrameThrottle & throttle,
+                              ResultStore & results)
+{
+  const uint64_t nchunks = chunk ? (file_size + chunk - 1) / chunk : 0;
+  std::atomic<uint64_t> next{0};
+  std::atomic<bool>     failed{false};
+  std::mutex               ord_m;
+  std::map<uint64_t, Task> waiting;      // read, but not yet the head
+  uint64_t                 push_next = 0;  // the head: next frame the queue gets
+  auto abort_pass = [&](const std::string & why) {
+    if (failed.exchange(true)) return;           // the first failure is the cause
+    try { gz_note_stage_read_failure(why); } catch (...) {}
+    g_gpu_failed_restart.store(true, std::memory_order_relaxed);
+    g_gpu_aborted.store(true, std::memory_order_relaxed);
+    queue.set_done();
+    throttle.set_done();
+    gz_direct_read_abort();                      // pool.set_done(): wakes acquire()
+    std::lock_guard<std::mutex> lk(results.m);
+    results.cv.notify_all();
+  };
+  // Never blocks for long: queue.push() cannot reach the depth cap here, because
+  // every queued Task holds a slot and the frame being pushed still holds one,
+  // so at most (slots - 1) are queued (TaskQueue's byte cap is 0 for staged
+  // Tasks).  After an abort, push() drops the Task and returns its slot.
+  auto deliver = [&](uint64_t c, Task && t) {
+    std::lock_guard<std::mutex> lk(ord_m);
+    waiting.emplace(c, std::move(t));
+    while (!waiting.empty() && waiting.begin()->first == push_next) {
+      queue.push(std::move(waiting.begin()->second));
+      waiting.erase(waiting.begin());
+      ++push_next;
+    }
+  };
+  // GZSTD_DEBUG_DSTAGE_FAIL_FRAME=N: force frame N's read to fail.  A filesystem
+  // that accepts the O_DIRECT open and then refuses the read is not something a
+  // test can arrange, so the PROGRAM opens the window.
+  static const char * fail_env = ::getenv("GZSTD_DEBUG_DSTAGE_FAIL_FRAME");
+  long long stall_frame = -1, stall_ms = 0;
+  if (const char * e = ::getenv("GZSTD_DEBUG_DSTAGE_STALL_FRAME"))
+    if (std::sscanf(e, "%lld:%lld", &stall_frame, &stall_ms) != 2) stall_frame = -1;
+  auto reader = [&] {
+    try {
+      for (;;) {
+        if (failed.load(std::memory_order_relaxed)
+            || g_gpu_aborted.load(std::memory_order_relaxed)) return;
+        const int slot = pool.acquire();
+        if (slot < 0) return;                      // the pass was aborted
+        const uint64_t c = next.fetch_add(1, std::memory_order_relaxed);
+        if (c >= nchunks) { pool.release(slot); return; }
+        const uint64_t off  = c * (uint64_t)chunk;
+        const size_t   n    = (size_t)std::min<uint64_t>(chunk, file_size - off);
+        const size_t   want = (n + 4095) & ~size_t(4095);   // <= chunk: a MiB multiple
+        char * const   hp   = static_cast<char *>(pool.buf(slot));
+        size_t got = 0;
+        int    err = 0;
+        // Ask for the ROUNDED window, stop at the LOGICAL length.  The tail's
+        // first read returns just its n bytes; looping on to `want` would re-read
+        // at an unaligned offset, which ext4 answers with end-of-file but a
+        // filesystem that checks alignment first refuses with EINVAL (review).
+        while (got < n) {
+          const ssize_t r = ::pread(fd, hp + got, want - got, (off_t)(off + got));
+          if (r < 0) {
+            if (errno == EINTR) continue;
+            err = errno;
+            break;
+          }
+          if (r == 0) break;                       // end of file: short, below
+          got += (size_t)r;
+        }
+        if (fail_env && seq_base + c == (uint64_t)::strtoull(fail_env, nullptr, 10))
+          err = EIO;
+        // GZSTD_DEBUG_DSTAGE_STALL_FRAME=N:MS: hold frame N's reader MS ms after
+        // its read -- an I/O stall on one frame, which is what let the other
+        // readers run ahead into the throttle deadlock above.  Test-only.
+        if (stall_frame >= 0 && seq_base + c == (uint64_t)stall_frame)
+          std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
+        if (err != 0 || got < n) {
+          pool.release(slot);
+          abort_pass(std::string("--direct-stage: ")
+                     + (err ? std::string("pread failed (") + std::strerror(err) + ")"
+                            : "short read " + std::to_string(got) + " of "
+                              + std::to_string(n) + " bytes")
+                     + " at offset " + std::to_string((unsigned long long)off));
+          return;
+        }
+        if (m) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
+        Task t;
+        t.seq       = seq_base + c;
+        t.gds_stage = slot;
+        t.src_len   = n;
+        deliver(c, std::move(t));
+      }
+    } catch (const std::exception & e) {
+      abort_pass(std::string("--direct-stage: a reader failed: ") + e.what());
+    } catch (...) {
+      abort_pass("--direct-stage: a reader failed");
+    }
+  };
+  const int nr = (int)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)std::max(1, nreaders),
+                                                                std::max<uint64_t>(1, nchunks)));
+  std::vector<std::thread> th;
+  try {
+    th.reserve((size_t)nr - 1);
+    for (int i = 1; i < nr; ++i) th.emplace_back(reader);
+  } catch (...) {
+    // Fewer readers, not a failed pass: this thread's own reader still runs.
+  }
+  reader();
+  for (auto & t : th) if (t.joinable()) t.join();
+  // Non-empty only after an abort (a frame before these was never delivered).
+  // The pool is marked done by then, so returning their slots is bookkeeping.
+  for (auto & kv : waiting) kv.second.release_input();
+}
+#endif
+
 static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   g_compress_pass_stats = CompressPassStats{};
@@ -32020,22 +32043,86 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // looked wrong until the timings were read.
   std::unique_ptr<GdsStagePool> stage_pool;
   bool reader_done = false;
-  // ---- --gds-only producer: names regions, reads nothing ----
+  // --direct-stage: the PAGE-LOCKED HOST pool its producers read frames into
+  // (GdsStagePool's HOST MODE), for a plain file and for --tar alike.  Allocated
+  // on the first worker's device for tidiness only: the allocation is portable,
+  // so every device can DMA out of it.  Returns the slots pinned; throws if not
+  // even one could be.
   //
-  // Every other reader below moves bytes.  This one does not: it emits Tasks
+  // DEPTH = one starting batch, and no more.  A worker copies a batch out and
+  // releases its slots BEFORE compressing it, so the readers refill while the GPU
+  // works; a deeper pool only adds pinning (~0.5 s per GiB, all of it before the
+  // first read), a longer pipeline fill and a bigger last batch to drain.
+  // MEASURED at 16 MiB frames, 16 GiB cold, one H100, --tar: 32 slots 6.20-6.57
+  // s, 48 6.64-6.66, 64 7.02-7.32, 80 7.63-7.66; 16 matched 32 on wall but cost
+  // 15-25% more host CPU in smaller batches.  The start (compress_tune_start) is
+  // the tuner's byte target, so this is ~512 MiB at any frame size.  Bounded by
+  // RAM (an eighth of what is available, half of --memlimit) and by the frames
+  // the input has.
+  //
+  // NOT PER DEVICE.  v0.17.82 multiplied the depth by the device count, on the
+  // reasoning that each worker wants a full batch.  But the slots are READ-AHEAD,
+  // not the workers' working set (released before compress), and the producer's
+  // rate is the drive's, not the devices'.  MEASURED, 16 GiB cold, 4.7 GiB/s
+  // drive: eight H100s pinned 256 slots (2.0-2.1 s before the first read) and ran
+  // 10.8 s plain / 11.0-11.8 s --tar, against 8.4-8.5 / 8.6-9.0 s at 32 slots --
+  // slower than the ordinary reader's 8.5-9.3.  Two H100s, which together outrun
+  // that drive: 32 slots 5.71-5.80 s, 64 5.75-5.93 (ABBA), batches settling the
+  // same.
+  //
+  // THE QUEUE MUST KNOW THE DEPTH OR THE RUN DEADLOCKS: a worker waits in
+  // wait_for_batch_or_cap(pop_n) for pop_n frames, and the producer can never
+  // have more than the pool in flight.  max_depth gives that wait its escape.
+  auto pin_dstage_host_pool = [&](const char * what, double * pin_ms) -> size_t {
+    if (gpu_ids.empty())
+      throw std::runtime_error(std::string(what) + ": no selected GPU for the staging pool");
+    if (const cudaError_t st = cudaSetDevice(gpu_ids.front()); st != cudaSuccess)
+      throw std::runtime_error(std::string(what) + ": select the staging device failed: "
+                               + cudaGetErrorString(st));
+    stage_pool = std::make_unique<GdsStagePool>();
+    size_t stage_bufs = std::max<size_t>(16, std::min(compress_tune_start, HARD_BATCH_CAP));
+    size_t avail = get_available_ram_bytes();
+    if (avail == 0) avail = 8ULL << 30;   // compute_throttle_budget's guess
+    size_t cap_bytes = avail / 8;
+    if (opt.mem_limit_mib > 0)
+      cap_bytes = std::min(cap_bytes, size_t(opt.mem_limit_mib) * ONE_MIB / 2);
+    stage_bufs = std::min(stage_bufs, std::max<size_t>(1, cap_bytes / gpu_chunk));
+    const uint64_t frames_in = total_in ? (total_in + gpu_chunk - 1) / gpu_chunk : 1;
+    stage_bufs = std::min<size_t>(stage_bufs, std::max<uint64_t>(1, frames_in));
+    // Measurement only: pin exactly this many slots.
+    const char * e = ::getenv("GZSTD_DEBUG_DSTAGE_SLOTS");
+    if (!e) e = ::getenv("GZSTD_DEBUG_DSTAGE_TAR_SLOTS");   // its v0.17.82 name
+    if (e) stage_bufs = std::max<size_t>(1, (size_t)std::strtoull(e, nullptr, 10));
+    std::string swhy;
+    const uint64_t pin_t0 = now_ns();
+    while (!stage_pool->init_host(gpu_chunk, stage_bufs, &swhy)) {
+      if (stage_bufs == 1)
+        throw std::runtime_error(std::string(what) + ": " + swhy);
+      stage_bufs = std::max<size_t>(1, stage_bufs / 2);
+    }
+    if (pin_ms) *pin_ms = double(now_ns() - pin_t0) / 1e6;
+    g_gds_stage_pool.store(stage_pool.get(), std::memory_order_release);
+    queue.set_max_depth(stage_bufs);
+    g_adapt_src_path.store("dstage", std::memory_order_relaxed);
+    return stage_bufs;
+  };
+  // ---- staged plain-file producer: --gds-only names regions, reads nothing ----
+  //
+  // Every other reader below moves bytes.  --gds-only does not: it emits Tasks
   // that carry only (offset, length), and the GPU worker turns each into a
-  // cuFileRead landing straight in VRAM.  So there is no read here, no host
+  // cuFileRead landing straight in VRAM.  (--direct-stage shares the setup but
+  // DOES read, ahead of the workers, into the pinned host pool -- see
+  // dstage_read_plain.)  So there is no read here, no host
   // buffer, no page-cache footprint and no backpressure to apply — the pace is
   // set by the GPU workers popping batches, which is exactly where we want it.
   // NOT in --tar mode: there the assembler is the producer and composes frames
   // in the staging pool, so this branch must not claim the input first (it did,
   // and reported a pipe that was never involved).
   if (!reader_done && opt.region_staged() && !opt.tar_mode) {
-    // ONE PRODUCER, TWO BACKENDS.  Everything from here to the queue push is
-    // identical for --gds-only and --direct-stage: both need the same verified
-    // O_DIRECT descriptor and both emit the same region-naming Tasks.  Only the
-    // cuFile registration below is conditional, and only the GPU worker's
-    // per-frame transfer differs.  FLAG names the one the user actually typed,
+    // ONE SETUP, TWO BACKENDS.  Both need the same verified O_DIRECT
+    // descriptor, opened here.  Then --gds-only registers it with cuFile and
+    // emits region-naming Tasks, and --direct-stage reads every frame into the
+    // host pool and emits slot Tasks.  FLAG names the one the user actually typed,
     // so no message ever blames a flag they did not pass.
     const char * FLAG = opt.gds_only ? "--gds-only" : "--direct-stage";
     if (opt.input == "-")
@@ -32089,8 +32176,45 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       vlog(V_VERBOSE, opt, b);
     }
     const uint64_t file_size = (uint64_t)st.st_size;
+    // --direct-stage: READ AHEAD into the pinned host pool (dstage_read_plain).
+    // A pool that cannot be pinned at all is refused after the joins, as --tar's
+    // is -- never die() with the workers and the writer live.
+    if (opt.direct_stage) {
+      size_t stage_bufs = 0;
+      double pin_ms = 0.0;
+      try {
+        stage_bufs = pin_dstage_host_pool("--direct-stage", &pin_ms);
+      } catch (...) {
+        stage_setup_failure = std::current_exception();
+        g_gpu_aborted.store(true, std::memory_order_relaxed);
+        queue.set_done();
+        throttle.set_done();
+        gz_direct_read_abort();
+        std::lock_guard<std::mutex> lk(results.m);
+        results.cv.notify_all();
+      }
+      if (!stage_setup_failure) {
+        const uint64_t nframes = gpu_chunk ? (file_size + gpu_chunk - 1) / gpu_chunk : 0;
+        // Reserve the whole run's sequence numbers up front: readers claim
+        // frames in any interleaving, and seq must still be the frame's index.
+        const uint64_t seq_base = seq_counter.fetch_add((size_t)nframes, std::memory_order_relaxed);
+        const int nreaders = opt.read_threads > 0 ? (int)opt.read_threads : DSTAGE_PLAIN_READERS;
+        if (opt.verbosity >= V_VERBOSE) {
+          char b[192];
+          std::snprintf(b, sizeof(b),
+            "[DSTAGE] staging: %zu x %zu MiB of pinned host memory (%.0f ms), "
+            "%d O_DIRECT reader(s) ahead of the GPU\n",
+            stage_bufs, gpu_chunk / ONE_MIB, pin_ms,
+            (int)std::min<uint64_t>((uint64_t)std::max(1, nreaders), std::max<uint64_t>(1, nframes)));
+          vlog(V_VERBOSE, opt, b);
+        }
+        dstage_read_plain(queue, *stage_pool, fd, file_size, gpu_chunk, seq_base,
+                          nreaders, m, throttle, results);
+      }
+      reader_done = true;
+    }
     uint64_t off = 0;
-    while (off < file_size) {
+    while (!opt.direct_stage && off < file_size) {
       const size_t n = (size_t)std::min<uint64_t>(gpu_chunk, file_size - off);
       Task t;
       t.seq     = seq_counter.fetch_add(1, std::memory_order_relaxed);
@@ -32160,51 +32284,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       }
     } else if (opt.direct_stage) {
       // --tar --direct-stage: the same slots in PAGE-LOCKED HOST memory (see
-      // GdsStagePool's HOST MODE).  Allocated on the first worker's device for
-      // tidiness only: the allocation is portable, so every device can DMA it.
-      if (gpu_ids.empty())
-        throw std::runtime_error("--direct-stage --tar: no selected GPU for the staging pool");
-      if (const cudaError_t st = cudaSetDevice(gpu_ids.front()); st != cudaSuccess)
-        throw std::runtime_error(std::string("--direct-stage --tar: select the staging device failed: ")
-                                 + cudaGetErrorString(st));
-      stage_pool = std::make_unique<GdsStagePool>();
-      // DEPTH = one starting batch per device, and no more.  A worker copies a
-      // batch out and releases its slots BEFORE compressing it, so the readers
-      // refill while the GPU works; a deeper pool only adds pinning (~0.55 s per
-      // GiB, all of it before the first read), a longer pipeline fill and a
-      // bigger last batch to drain.  MEASURED at 16 MiB frames, 16 GiB cold,
-      // one H100: 32 slots 6.20-6.57 s, 48 6.64-6.66, 64 7.02-7.32, 80
-      // 7.63-7.66; 16 matched 32 on wall but cost 15-25% more host CPU in
-      // smaller batches.  The start (compress_tune_start) is the tuner's byte
-      // target, so this is ~512 MiB at any frame size.  Bounded by RAM (an
-      // eighth of what is available, half of --memlimit) and by the frames the
-      // archive has; the queue depth then caps what a worker can pop.
-      size_t stage_bufs = std::max<size_t>(16, std::min(compress_tune_start, HARD_BATCH_CAP))
-                        * std::max<size_t>(1, gpu_ids.size());
-      size_t avail = get_available_ram_bytes();
-      if (avail == 0) avail = 8ULL << 30;   // compute_throttle_budget's guess
-      size_t cap_bytes = avail / 8;
-      if (opt.mem_limit_mib > 0)
-        cap_bytes = std::min(cap_bytes, size_t(opt.mem_limit_mib) * ONE_MIB / 2);
-      stage_bufs = std::min(stage_bufs, std::max<size_t>(1, cap_bytes / gpu_chunk));
-      const uint64_t frames_in = total_in ? (total_in + gpu_chunk - 1) / gpu_chunk : 1;
-      stage_bufs = std::min<size_t>(stage_bufs, std::max<uint64_t>(1, frames_in));
-      // Measurement only: pin exactly this many slots.
-      if (const char * e = ::getenv("GZSTD_DEBUG_DSTAGE_TAR_SLOTS"))
-        stage_bufs = std::max<size_t>(1, (size_t)std::strtoull(e, nullptr, 10));
-      std::string swhy;
-      const uint64_t pin_t0 = now_ns();
-      while (!stage_pool->init_host(gpu_chunk, stage_bufs, &swhy)) {
-        if (stage_bufs == 1)
-          throw std::runtime_error("--direct-stage --tar: " + swhy);
-        stage_bufs = std::max<size_t>(1, stage_bufs / 2);
-      }
-      const double pin_ms = double(now_ns() - pin_t0) / 1e6;
-      g_gds_stage_pool.store(stage_pool.get(), std::memory_order_release);
-      // Same deadlock guard as the VRAM mode: pops must be able to complete
-      // with every slot queued.
-      queue.set_max_depth(stage_bufs);
-      g_adapt_src_path.store("dstage", std::memory_order_relaxed);
+      // GdsStagePool's HOST MODE and pin_dstage_host_pool above).
+      double pin_ms = 0.0;
+      const size_t stage_bufs = pin_dstage_host_pool("--direct-stage --tar", &pin_ms);
       if (opt.verbosity >= V_VERBOSE) {
         char b[192];
         std::snprintf(b, sizeof(b),
@@ -32616,8 +32698,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       }
     } else if (opt.verbosity >= V_VERBOSE) {
       char b[192];
-      // EXACT BYTES, not just MiB.  A failed O_DIRECT read throws, and the throw
-      // lands in the standard abort -> discard -> CPU-only rebuild, so the
+      // EXACT BYTES, not just MiB.  A failed O_DIRECT read aborts the pass into
+      // the standard discard -> CPU-only rebuild (dstage_read_plain), so the
       // archive comes out byte-identical at exit 0 whether this path ran or
       // silently gave up -- the same shape as the --gds-only compat fallback.
       // Rounded MiB cannot tell 4095 staged bytes from 0; the byte count can,
