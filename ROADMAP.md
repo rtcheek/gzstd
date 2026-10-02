@@ -70,6 +70,31 @@ describes a moving target we do not control.
 
 ---
 
+## OPEN after the v0.17.87 whole-codebase review: decisions and follow-ups
+
+The review (ten subsystems, CHANGELOG v0.17.87) fixed what was a defect and left what is a decision.
+These came out of it, roughly by weight:
+
+1. **Multi-input `-c` to a redirected file is buffered from the second input on.** The fix for the
+   shared-stdout data loss adopts stdout for O_DIRECT only at offset zero. Giving `DirectWriter` a base
+   offset would restore O_DIRECT for the later inputs.
+2. **An input that shrinks while it is read** is archived as its prefix at exit 0 (pooled reader); the
+   mmap reader dies of SIGBUS. Decide the contract. The obvious check (EOF before the size seen at open)
+   breaks files whose reported size is not their length (sysfs: 4096 reported, 23 real).
+3. **The tar error flag survives a clean CPU rebuild** (exit 1, `--rm` suppressed). Needs layout-time
+   and assembly-time errors kept apart.
+4. **`-c` with `-d --tar`** is accepted and ignored. Refuse it, or implement tar's `-O`.
+5. **`gzstd -d -D dict -f -o dict`** replaces the dictionary; compression refuses the same line.
+6. **Short-flag bundles**: `-qf`, `-dq`, `-19f`, `-T4q` are "unknown option"; so are `-z` and `--zstd=`.
+   `-M`/`--memory` take MiB where zstd takes bytes with a suffix. `--train -c -o dict` writes to stdout
+   where zstd lets the later of the two win.
+7. **`--calibrate` records a CPU rescue as GPU speed** when the GPU faults mid-measurement.
+8. **A decompress prefetch read error exits 4**, where the table says 3. Needs an injector.
+9. **A failed cuFile statistics re-exec** continues into the crash it exists to avoid.
+10. **A CUDA call that never returns** still blocks compress recovery.
+11. **~13 futex calls per frame** on every CPU path, at 1 MiB and at 16 MiB frames.
+12. **Indexed `-l --tar`** does not validate sparse maps (`-t --tar` does).
+
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
 Found by Codex while reviewing v0.17.84, reproduced in v0.17.85 with a stall hook

@@ -1,12 +1,337 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.86  
+**Covers:** v0.9.50 → v0.17.87  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.87 — the whole-codebase review before v0.18.0: ten subsystems, one version
+
+Every subsystem of gzstd reviewed twice, independently, before the v0.18.0 tag. My pass was experimental:
+for each subsystem a matrix of real runs (failures injected, round trips, hostile inputs, the same command
+lines through zstd 1.5.7 or GNU tar) tallied for wrong bytes, wrong exit codes, leftovers, crashes and
+hangs. Codex (GPT-6-Sol) read the code against pinned shapes and wrote ledgers of operations. Findings were
+reproduced before they were fixed, the fixes are covered by suite cells seen to fail without them, and the
+repairs were reviewed again afterwards. (Three one-line hardenings sit on paths that need an allocation
+or read failure to reach and were applied without a reproduction: a failed batch hand-back, a failed
+O_DIRECT adoption, a read error in a `--filelist`.) Findings that are policy rather than defects are
+listed at the end, unchanged.
+
+What a user would have hit:
+
+| Subsystem | Finding | Before |
+|---|---|---|
+| reader/writer I/O | **a file behind stdout was truncated per input** | `gzstd -c a b > f` kept only `b`, exit 0. Since v0.13.2 |
+| GPU failure handling | the `--tar` GPU decode pool skipped the content checksum | wrong bytes at exit 0, 9 of 20 bit flips |
+| `--tar` | sparse maps were trusted | data discarded at exit 0; `-t` passed |
+| reader/writer I/O | `--sparse -dc x >> f` | every run of zeros dropped, exit 0 |
+| arguments | `-C file`, `-B file`, `--filelist list` | the named input ignored, stdin compressed, exit 0 |
+| GPU hot path | a batch notify sent without the writer's mutex | a hang when the missed batch held the last permits |
+| exit paths | `die()` ran every library's exit handlers | SIGSEGV in 3 of 41 failing GPU runs |
+| exit paths | SIGHUP, `ulimit -f` | a truncated output left under its final name |
+| exit paths | `-d --rm --keep-going` | deleted the damaged archive it had just failed to decode |
+
+### Part 1 — exit, error and cleanup paths
+
+A "death matrix" that fails or kills real runs in each mode, and from Codex a ledger of every way the
+process terminates. Nine defects.
+
+| # | Found by | Defect | Measured before the fix |
+|---|---|---|---|
+| 1 | both | `die()` crashed the process it was ending | `-d --gpu-only` + write error: SIGSEGV in 3 of 41 runs |
+| 2 | both | SIGHUP left a truncated output under its final name | 4 of 4; ~830 MiB of a 1.6 GiB archive |
+| 3 | both | a file-size limit killed the run with a core dump | exit 153, 256 MiB left under the final name |
+| 4 | Codex | `-d --rm --keep-going` deleted a damaged archive | exit 6, recovery differs from the original, archive gone |
+| 5 | Codex | `--stats-json` to an unwritable path exited 0 | no stats file, no message |
+| 6 | Codex | tar extraction stopped by a full destination exited 1 | 1, where the table says 3 |
+| 7 | Codex | `-d --tar --rm` exited 0 and kept the archive | flag accepted and ignored |
+| 8 | Codex | a failed rename-fallback copy left a partial file | (needs a hook; see below) |
+| 9 | mine | every write failure said "(disk full?)" | `gzstd -dc x.zst \| head` reported a full disk |
+
+**1. `die()` no longer runs anybody's exit-time teardown.** It called `std::exit()` from whichever thread
+failed, with the others still running. `exit()` runs every atexit handler and static destructor in the
+process, libnvcomp's and libcudart's included. gdb on a crashed run: the dying thread inside `exit()` ->
+`_dl_call_fini` -> libnvcomp `__cxa_finalize` -> `free()`, and a GPU worker inside `cudaMemcpyAsync` on the
+state being destroyed. The same `exit()` was behind v0.17.70's hang (a static condition variable destroyed
+under a waiter) and v0.17.82's crash (a tar assembler against GPU bringup). Now `die()` does this
+program's own cleanup by hand (remove the registered partial output, report or keep the cuFile log, flush
+stdout) and calls `_Exit()`. After: 60 of 60 runs exit 3. Other modes showed 0 crashes in 30 runs each
+before the fix; the hazard was the same in all of them.
+
+**2-3. Signals.** SIGHUP (a dropped ssh session, a closed terminal) and SIGXCPU now remove the partial
+output and die of the signal, as SIGINT and SIGTERM already did. A signal inherited as ignored stays
+ignored, so `nohup gzstd ...` survives a hangup (verified: the run completes and the archive decodes).
+SIGXFSZ is ignored, like SIGPIPE, so a write past `ulimit -f` returns EFBIG and takes the ordinary
+write-error path: exit 3, output removed. SIGQUIT is left alone: it asks for a core dump.
+
+**4. `--rm` never removes a source that decoded with damage.** Under `--keep-going` a corrupt archive
+yields what could be recovered and exits 6 or 7. `--rm` then deleted the archive: the only copy a better
+tool, a later version or a repaired medium could recover more from. It is now kept, with a message. An
+intact archive is still removed.
+
+**5. An unwritable `--stats-json` fails the command** (exit 3) after the output is finalized and before
+`--rm`: the finished output is kept and the source is not removed. `-t` reports it too.
+
+**6. A tar extraction stopped by its destination** (no space, a quota, a size limit, a device error) exits
+3. A member that cannot be restored for other reasons (permissions) still exits 1.
+
+**7. `--rm` with `-d --tar` or `-t --tar` is refused** (exit 2) instead of being accepted and ignored.
+Creation's `--rm`, which removes the archived sources, is unchanged.
+
+**8. The rename fallback.** When installing the output by rename fails, it is copied into a fresh file at
+the final name. If that copy failed, the complete temp was kept and reported, and the truncated copy stayed
+beside it under the final name. It is now removed, by the same identity check the cleanup registry uses.
+No filesystem here refuses rename, so `GZSTD_DEBUG_RENAME_FALLBACK=1|copyfail` forces the path.
+
+**9. Write failures name their cause.** The syscall's errno is recorded where the write fails, and the
+message says "no space left on the output device", "broken pipe (the reader of the output closed it)",
+"file size limit exceeded" or the system's text.
+
+**The repairs were reviewed too, and three had gaps** (Codex, round 2):
+- `--stats-json` with the output on stdout (`-c`) still exited 0: the new check sat in the file branch.
+- `-l` ignored its final flush. A listing redirected to a full disk or past a size limit exited 0,
+  truncated, and ignoring SIGXFSZ would have made that reachable where the signal used to kill the run. A
+  listing that cannot be written now exits 3. A reader that closes the pipe (`gzstd -l ... | head`) asked
+  for less: that stays a quiet exit 0.
+- A failure first reported by the final flush or close still said "(disk full?)"; the cause is captured
+  there too.
+
+### Part 2 — GPU failure handling
+
+**The `--tar` GPU decode pool never checked the content checksum.** A frame the GPU decoded to the right
+size with a success status was written out as good data. nvCOMP does not verify the checksum; the
+streaming decompressor has done so on the device since the checksum work, and this pool was missed. One
+flipped bit in a 4 GiB tar archive, extracted through the pool: exit 0 with wrong bytes in 9 of 20
+trials. The pool engages on its own under `--adapt`. The check now runs on the host copy the pool already
+holds; a mismatch goes to the CPU rescue, which reports real corruption (exit 4) or, for a transient GPU
+fault, simply decodes the frame. The same 20 flips: 20 of 20 exit 4.
+
+Two smaller repairs. Both CPU-rescue warnings said "the output is complete and correct" before the CPU
+pass had run, and that pass can still fail; they now say what is happening and claim nothing. And handing
+a failed GPU batch back to the queue could throw inside a blanket catch, leaving frames owned by nobody
+and the writer waiting for them; that is now a fatal out-of-memory error with a message.
+
+My failure matrix (about 75 runs: injected compress and decompress faults, allocation failures, stalls,
+verify mismatches, tar with faults, `--rm`) was clean. Small archives never reach the pool's GPU stream,
+which is why it took a 4 GiB one to see this.
+
+
+### Part 3 — reader and writer I/O: a file behind stdout belongs to the caller
+
+**The most serious finding of the review, and it is in every release since v0.13.2.** When stdout is
+redirected to a regular file and O_DIRECT output is on, gzstd adopted the descriptor, truncated the file
+and wrote from offset zero. It did that once per input, whatever the descriptor's position was.
+O_DIRECT output is on by default on a GPU build with a PCIe Gen4+ fabric, and anywhere with `--direct`.
+
+| Command | Before |
+|---|---|
+| `gzstd -c a b > f` | `f` holds only `b`, exit 0 |
+| `{ gzstd -c a; gzstd -c b; } > f` and `for x in *; do gzstd -c "$x"; done > f` | only the last archive, exit 0 |
+| `{ printf header; gzstd -c a; } > f` | the header is gone |
+| `{ gzstd -dc a.zst; gzstd -dc b.zst; } > f` | only `b` |
+| `{ gzstd -dc a.zst; echo done; } > f` | "done" written over the first bytes of the output |
+| `gzstd -c b >> existing`, and a GPU fault or `--verify` mismatch forces a rebuild | `existing` is emptied first |
+| `{ gzstd -c big; echo done; } > f`, gzstd killed or the disk fills | `echo: write error: Invalid argument` |
+| `{ gzstd --gds-only -c a; gzstd --gds-only -c b; } > f` | only `b` |
+
+zstd, `--no-direct` and the default CPU-only build were always right. Codex reported the first row for
+`--direct`; reproducing it showed the default was affected and led to the rest. A matrix of 112 checks
+over ten backends (two commands, several inputs, header, trailer, append, rebuilds, sparse output, tar):
+66 wrong on v0.17.86, 0 now.
+
+Four mechanisms, four fixes:
+
+- **Adoption only at offset zero.** The output's starting point is taken from the descriptor (its
+  position, or the file's length when it is open for appending). Anywhere but zero, the output continues
+  from there on the buffered writer, which truncates nothing. Inputs after the first in a multi-input `-c`
+  run therefore use the buffered writer; giving the O_DIRECT writer a base offset would restore the speed
+  and is noted for later.
+- **The O_DIRECT writer hands the descriptor back as a writer would.** Every write it makes is positional,
+  so the position stayed at zero; compression happened to move it (the seek table is appended with a
+  seek and a write), decompression did not. It now leaves the position at the end of what it wrote. And
+  O_DIRECT is a flag of the open file description, which the shell and the next command share: it is
+  cleared when the writer finishes, and by `die()` and the signal handler when it does not get to.
+- **The rebuild returns to where this output began**, not to zero, before discarding the rejected archive.
+- **`--gds-only` peer-to-peer output** reopens the descriptor at offset zero, so it now declines a
+  descriptor that is not there (it already declined an append-mode one) and uses the ordinary writer.
+
+The review of these repairs found one more of the same family. When a rebuild is impossible (the input
+is a pipe), the check that decides so probed the output with a seek to offset zero, and then the run
+died: the next command in the redirection wrote over the header. The probe no longer moves anything.
+
+**Holes need a destination that can hold one.** The sparse writer assumed a named output, or `--sparse`,
+meant a seekable file. `--sparse -dc x.zst >> f` dropped every run of zeros at exit 0 (on an append
+descriptor the seeks do nothing). `gzstd -d -o fifo x.zst` and `--sparse -dc x.zst | ...` failed at the
+first run of zeros with "disk full?". And a hole is made by seeking over a range, which keeps whatever
+is already there: on a descriptor opened read-write over an existing file, `--sparse -dc` returned the old
+bytes where zeros belonged (found by the repairs review). Zeros are now written wherever a hole cannot be
+made: anything but a regular file, not open for appending, with nothing beyond the write position.
+
+My own pass over this subsystem (635 round trips across readers, writers, sizes around every block and
+chunk boundary, odd inputs and outputs) found no wrong bytes, and that is the lesson: it never shared a
+stdout between two writers.
+
+
+### Part 4 — `--tar`: a sparse map is a claim
+
+A tar sparse member says where its stored bytes go. Nothing checked it. A segment placed past the
+member's logical size was written there and then cut off by the final truncate: the data was discarded at
+exit 0, and `-t --tar` called the archive valid (GNU tar: "invalid sparse archive member"). Reproducing
+that turned up the worse case: segment lengths adding up to more than the member stores made the
+extractor read the next member's header and data as this file's content, and the next member was never
+extracted. Both are now a data error (exit 4) before a byte is written, on extraction and on `-t`; a PAX
+1.0 map is bounded by the member's stored size. GNU tar's own archives in all four sparse formats
+(old GNU, PAX 0.0, 0.1, 1.0) and gzstd's extract identically to before.
+
+My pass (a tree of awkward members in six creation modes, extracted by gzstd and by GNU tar; a GNU-made
+archive; nine hostile archives) found nothing wrong. Two further Codex findings were checked against GNU
+tar and are not defects: overlapping selections (`src/d src/d/f` reports the second "Not found in
+archive") and a dangling PAX header before the end blocks passing `-t` both behave exactly as tar does.
+
+
+### Parts 7 and 8 — the CPU and GPU hot paths: a wakeup that could be lost
+
+A GPU worker publishes a finished batch to its own slot, under the slot's mutex, and then notifies the
+writer. It notified without the writer's mutex. The writer scans the slots and then sleeps, and a notify
+landing between the two wakes nobody: the writer sleeps on a frame that is already there. Usually the next
+batch's notify rescues it. When the missed batch holds the last throttle permits, no next batch can start
+and the run hangs. Codex found it by listing, for every condition variable, each writer of the predicate
+and whether it holds the mutex.
+
+The window is nanoseconds wide, so the program opens it: `GZSTD_DEBUG_WRITER_PRE_WAIT_US` holds the writer
+between its scan and its wait for longer than a batch takes. With one permit and one frame per batch, GPU
+compress and GPU decompress both hung, 5 of 5; with the notify taking the mutex, 5 of 5 complete. One
+uncontended lock per batch.
+
+My pass was a syscall ledger under `strace -c` (1 GiB, 1024 frames): no per-frame open or close, no
+mapping churn, no small reads on any CPU or GPU path. Permit accounting, sequence numbering, size
+arithmetic and the seek table were checked by Codex and came back clean.
+
+### Parts 5 and 10 — `--adapt` and dictionaries: a FIFO where a file is expected
+
+Opening a FIFO that has no writer blocks forever. The `-D` dictionary loader opened first and checked the
+type afterwards; the `--adapt` profile loader never checked. So `gzstd -D fifo ...` hung (zstd refuses),
+and so did every `--adapt` run with a FIFO at `profile.json`. Both now open without blocking. The
+dictionary is refused as not a regular file (exit 2); the profile is treated as unusable and the run goes
+ahead. The profile's first reader also read the whole file before applying its 1 MiB limit; both readers
+now stop one byte past it.
+
+Otherwise clean. `--adapt` with a profile that is empty, garbage, truncated, wrongly typed, absurdly
+valued, 100,000 levels deep or 26 MB long, with an unwritable cache, and with eight runs saving at once:
+every run correct, every profile left valid. Dictionaries: `--train` output byte-identical to zstd's,
+`-D` round trips in both directions between the two tools, the wrong or missing dictionary always exit
+4, `--patch-from` decoding zstd's patches, `--rm` never removing the dictionary.
+
+### Part 6 — argument parsing and zstd compatibility
+
+Found by running the same command lines through zstd 1.5.7 and gzstd and comparing what each did (82
+command lines), then by Codex reading the parser as a zstd user would.
+
+| Command | Before | Now |
+|---|---|---|
+| `gzstd -C file` | `file` taken as tar's directory; stdin compressed, exit 0 | usage error naming `--tar` |
+| `gzstd -B file` | `file` taken as `-B`'s value; stdin compressed, exit 0 | `file` is the input, as in zstd |
+| `gzstd --filelist list` | "accepted and ignored"; stdin compressed, exit 0 | the listed files are compressed |
+| `gzstd --filelist empty` | (same) | usage error, as zstd errors |
+| `gzstd -22 file` | exit 2, "zstd-compatible behavior" | warns and uses 19, which is what zstd does |
+| `gzstd -d x.tzst`, `x.zstd` | `x.tzst.out`, `x.zstd.out` | `x.tar`, `x` |
+
+The first four share a shape: an option that names or precedes the inputs was mis-parsed, no input was
+left, and "no input" means standard input.
+
+
+### Part 9 — `--gds-only`
+
+Seventeen probes of refusals and edge cases (pipes, tmpfs, two GPUs, foreign archives, empty and one-byte
+files, tar, `--rm`, `--verify`, stats) behaved correctly, with no kernel complaint. Two refusals exited 1
+where `--help` promises a usage error (2) for every requirement `--gds-only` cannot meet: decompressing
+to stdout, and an input on a filesystem cuFile will not register. The shared-stdout defect above is the
+third `--gds-only` repair.
+
+### The repairs were reviewed, and nine more things came out of it
+
+Part 1's repairs had gaps in four of nine (above). The repairs of parts 2 to 10 went to Codex the same
+way, at maximum effort, with one instruction: enumerate every place that writes to, truncates, seeks or
+changes flags on a shared stdout, and say what each leaves behind.
+
+Round 1, seven findings. Two were reproduced and are described above (the rebuild probe that rewound
+stdout; `--sparse` over existing data). Four were applied as written: a failed O_DIRECT adoption left the
+flag on the shared descriptor; `--train -C s1 s2` skipped the new `-C` rule and trained without `s1`; a
+read error part-way through a `--filelist` processed the paths read so far; a file named exactly `.tzst`.
+One was declined: an indexed `-l --tar` not running the sparse-map check (listed below).
+
+Round 2, two findings. Applied: the saved stdout flags were registered after the adoption that sets
+O_DIRECT, so a signal in between left the flag behind; they are registered first, in an atomic. Declined:
+making `--filelist` refuse a FIFO because opening one with no writer blocks. `--filelist <(find ...)`
+hands the option a pipe, and that has to keep working.
+
+### Not changed: for the maintainer to decide
+
+Reproduced or measured, and left alone because the right answer is a decision, not a repair.
+
+- **An input that shrinks while it is read** (pooled reader) is archived as the shorter file at exit 0;
+  the mmap reader dies of SIGBUS in the same situation. zstd also archives the prefix. The obvious check
+  (end of file before the size seen at open is an error) would break files whose reported size is not
+  their length: a sysfs file reports 4096 bytes, holds 23, and compresses correctly today.
+- **A CUDA call that never returns** blocks compress recovery: the abort path joins a drainer that is
+  stuck in the driver. No timeout can be put around a call that holds the context.
+- **The tar error flag across a rebuild**: after a GPU fault and a clean CPU rebuild of a `--tar` archive,
+  an error recorded during the first assembly still makes the run exit 1 and suppresses `--rm`. Fail-safe,
+  but wrong; resetting it needs layout-time and assembly-time errors kept apart.
+- **`--calibrate`** records the CPU rescue's speed as the GPU's when the GPU faults during the measurement.
+- **A read error in the decompress prefetch reader** (EIO) exits 4 (data) where the table says 3 (I/O).
+  It cannot be injected without privileges, so it was not changed blind.
+- **`-c` with `-d --tar`** is accepted and ignored: members are extracted to disk, nothing reaches stdout.
+- **`--stats-json -`** writes a file named `-`. `output_bytes` in the stats excludes the appended seek
+  table, and the stats are written before the output is finalized.
+- **`exec 1<>old; gzstd -c x`** truncates `old` on the O_DIRECT writer and leaves a stale tail on the
+  buffered one (as zstd and cat do).
+- **zstd command lines that still differ**: short-flag bundles containing `q`, `v`, a level or `T#`
+  (`-qf`, `-dq`, `-19f`) are "unknown option"; `-z`/`--compress` and `--zstd=...` are unknown; `-M` and
+  `--memory` take MiB and reject zstd's byte suffixes; `--train -c -o dict` writes to stdout where zstd
+  lets the last of the two win; a multi-file run stops at the first failure where zstd continues;
+  `--output-dir-flat`, `--output-dir-mirror`, `-r`, `--exclude-compressed`, `--format=gzip` and `--trace`
+  are accepted with a warning and ignored.
+- **`gzstd -d -D dict -f -o dict x.zst`** replaces the dictionary with the decoded output. Compression
+  refuses the same command line; decoding needs the explicit `-f -o`, and the `--patch-from` equivalent
+  (updating the reference in place) is a legitimate use.
+- **A failed cuFile statistics re-exec** only warns and continues, into the exit-time crash the re-exec
+  exists to avoid. It needs `/proc/self/exe` to be unusable, which could not be arranged here.
+- **`-l --tar` on an indexed archive** lists from the index and does not run the new sparse-map check;
+  `-t --tar` does.
+- **Overlapping tar selections** (`src/d src/d/f`) report the second as not found, and **a dangling PAX
+  header** before the end blocks passes `-t`. Both match GNU tar exactly.
+- **Sub-second modification times** are not stored in tar archives (GNU tar's default too).
+- **`--rm` does not fsync** the output before removing the source unless `--sync-output` is given.
+- **About 13 futex calls per frame** on every CPU path (1 MiB and 16 MiB frames alike): condition-variable
+  traffic that may be worth a look as an efficiency item. No per-frame open, mmap or small read was found
+  on any path.
+- **Multi-input `-c` to a redirected file** now uses the buffered writer from the second input on.
+
+### Tests
+
+Twenty-six new cells in six sections: exit and cleanup paths (10), a file behind stdout (7, two of them
+`--gds-only`), sparse maps (1), a FIFO where a file is expected (1), zstd command lines (5), GPU failure
+handling (2). All but four need no GPU, so the CPU-only build runs them. Every cell was seen to fail
+without its fix: against v0.17.86, and with the fixes removed one at a time in 25 single-fix builds.
+
+Suites at the end, each run once on the final code: the extensive GPU run 738 passed, 0 failed, 1 skipped
+of 739; the CPU-only build 419 passed, 0 failed (every cell it can run). Both builds compile without
+warnings.
+
+One cell taught the usual lesson. The lost-wakeup cell first used 8 frames, and the build without the fix
+passed its decompress half: decompression raises a throttle of 1 to its batch floor of 8, so every frame
+got a permit, the workers finished, and their exit woke the writer. With 16 frames it hangs as it should.
+
+Part 1's crash is tested by mechanism, not by rate: `GZSTD_DEBUG_EXIT_PROBE` makes a static destructor
+print a marker, which must appear on a normal exit and must not appear after `die()`. The GPU pool's
+checksum is tested the same way: a flipped archive bit cannot be a suite test, because whether the GPU
+stream or a CPU decoder takes that frame is a race, so `GZSTD_DEBUG_POOL_GPU_CORRUPT` flips a byte of the
+first frame the GPU decoder brings back and the extraction must still be identical, with one frame rescued.
+The shared-stdout cells pass `--direct` explicitly so they discriminate on any host and on both builds.
 
 ## v0.17.86 — decompress and -t default to hybrid whatever the page cache holds
 
