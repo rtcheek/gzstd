@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.87";
+static constexpr const char * GZSTD_VERSION = "0.17.88";
 //
 // Architecture overview:
 //
@@ -1618,27 +1618,32 @@ static volatile sig_atomic_t g_termination_signal = 0;
 static int g_tmp_file_slot = -1;
 static volatile sig_atomic_t g_tmp_filefd = -1;
 
-// THE CALLER'S STDOUT, AS IT WAS (v0.17.87).  O_DIRECT is a flag of the open
-// file DESCRIPTION, and a regular file behind stdout shares that description
-// with the shell and with every later command in the same redirection.  The
-// writer clears the flag when it finishes or is destroyed -- but die() and a
-// fatal signal leave without destroying anything, and then the next command's
-// ordinary write failed with EINVAL:
+// THE CALLER'S STDOUT WHEN A RUN DIES (v0.17.88).
 //
-//     { gzstd -c big; echo done; } > f        (gzstd killed, or the disk fills)
-//     bash: echo: write error: Invalid argument
+// v0.17.87 wrote a redirected stdout through a dup of the caller's descriptor
+// with O_DIRECT set on it.  O_DIRECT is a flag of the open file DESCRIPTION,
+// which the dup shares with the shell and with every later command in the same
+// redirection, so it had to be cleared again on every way out -- and SIGQUIT,
+// SIGABRT, SIGSEGV, SIGKILL and the watchdog's _Exit have no way out that runs
+// our code.  After any of them the next command's write failed with EINVAL.
+// The writer now opens its OWN description on the same file (see
+// DirectWriter::adopt_fd_detached), so the caller's is never flagged and there
+// is nothing to restore, whatever kills the process.
 //
-// -1 = stdout was not adopted.  The signal may be delivered on a worker thread
-// while main arms this, so it is a lock-free atomic; its load and fcntl are
-// async-signal-safe.
+// What is left for the exits we DO control (die(), the handled signals, the
+// watchdog) is the caller's POSITION: every write of ours is positional, so it
+// still sits where the output began, and the next command in the redirection
+// would write over the partial output instead of after it, as it would after a
+// buffered writer died.  Move it to the end of the file.  lseek is
+// async-signal-safe; the flag is a lock-free atomic because a signal can be
+// delivered on a worker thread while main arms it.
 static_assert(std::atomic<int>::is_always_lock_free,
-              "the stdout flag restore needs signal-safe atomic access");
-static std::atomic<int> g_stdout_adopted_flags{-1};
-static void gz_restore_stdout_flags()
+              "the stdout position restore needs signal-safe atomic access");
+static std::atomic<int> g_stdout_adopted{0};
+static void gz_stdout_leave_at_end()
 {
 #ifndef _WIN32
-  const int fl = g_stdout_adopted_flags.load();
-  if (fl >= 0) (void)::fcntl(STDOUT_FILENO, F_SETFL, fl & ~O_DIRECT);
+  if (g_stdout_adopted.load()) (void)::lseek(STDOUT_FILENO, 0, SEEK_END);
 #endif
 }
 
@@ -1772,7 +1777,7 @@ static void signal_cleanup_handler(int signum)
   // started; there is now one, and it is async-signal-safe (fstat, fstatat and
   // unlinkat all are).
   cleanup_tmp_file();
-  gz_restore_stdout_flags();
+  gz_stdout_leave_at_end();
   std::signal(signum, SIG_DFL);
   std::raise(signum);
 }
@@ -3423,7 +3428,7 @@ static void die(const std::string & msg, int code = EXIT_ERROR)
   // and cuFile's own shutdown, which the kernel does for a dying process anyway,
   // and libcufile's statistics dump, which is not wanted for a failed run.
   cleanup_tmp_file();
-  gz_restore_stdout_flags();   // before the flush below: stdout may still be O_DIRECT
+  gz_stdout_leave_at_end();    // an adopted stdout: after the partial output, not on top of it
 #ifdef HAVE_NVCOMP
   gz_cufile_log_finish();
 #endif
@@ -3438,6 +3443,37 @@ static void die_io(const std::string & msg)
 { die(msg, EXIT_IO); }
 static void die_data(const std::string & msg)
 { die(msg, EXIT_DATA); }
+
+// NOTHING THIS RUN READS MAY BE THE REGULAR FILE BEHIND STDOUT (v0.17.88).
+// Whatever is written to stdout -- an archive, decoded data, a listing, a
+// dictionary -- would land on, or truncate, the file being read.  The inputs
+// and tar operands are checked as a set before the first write (see
+// gz_refuse_stdout_alias); this is the same test for the files read ON THE SIDE:
+// the -D dictionary and --patch-from reference (in every mode -- the stdout
+// check there used to cover compression only, so `exec 1<>dict; gzstd -d -c -D
+// dict x.zst` and `-l -D dict` wrote over the dictionary), and the --filelist,
+// --files-from and --exclude-from lists, named or on standard input (`exec
+// 1<>list; gzstd -c --filelist list` truncated the list after reading it), the
+// --adapt profile and the cuFile configuration.  Called where each is opened,
+// so a new side input only has to call it.  cat's rule: "input file is output
+// file".  It does not ask whether this run will write to stdout: a side input
+// that IS the stdout file is refused even by a run that would not have written
+// there (`exec 1<>dict; gzstd -t -D dict x.zst`).  Loud, and nobody's workflow.
+static void gz_refuse_if_stdout_file(const struct stat & st, const std::string & what)
+{
+#ifndef _WIN32
+  if (!S_ISREG(st.st_mode)) return;
+  struct stat ost;
+  const int ofd = fileno(stdout);
+  if (ofd >= 0 && ::fstat(ofd, &ost) == 0 && S_ISREG(ost.st_mode)
+      && ost.st_dev == st.st_dev && ost.st_ino == st.st_ino)
+    die_usage("input and output are the same file: " + what
+              + " is also where standard output is redirected");
+#else
+  (void)st; (void)what;
+#endif
+}
+
 
 // Defined with the staged producer; declared here because the device-side
 // checksum verdict (far above it in file order) needs it to tell a dishonest
@@ -7328,6 +7364,11 @@ static std::string gz_cufile_config_text(std::string * config_out)
   if (config_out) *config_out = path;
   std::ifstream f(path);
   if (!f) return std::string();
+  {
+    struct stat cst {};
+    if (::stat(path.c_str(), &cst) == 0)
+      gz_refuse_if_stdout_file(cst, "the cuFile configuration " + path);
+  }
   const std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   std::string t;
   t.reserve(raw.size());
@@ -7699,6 +7740,9 @@ static AdaptProfileRead adapt_profile_read_fd(int fd, AdaptJv & root)
   if (fd < 0) return AdaptProfileRead::UNUSABLE;
   struct stat st {};
   if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { ::close(fd); return AdaptProfileRead::UNUSABLE; }
+  // Stdout redirected onto the profile itself: the archive would be written
+  // there and the save at the end would then rename a new profile over it.
+  gz_refuse_if_stdout_file(st, "the --adapt profile");
   std::string text;
   char buf[64 * 1024];
   bool ok = true;
@@ -9789,6 +9833,32 @@ public:
     return true;
   }
 
+  // ADOPT A DESCRIPTOR THE CALLER SHARES WITH OTHERS -- a redirected stdout --
+  // WITHOUT TOUCHING ITS DESCRIPTION (v0.17.88).  Opening /proc/self/fd/N yields
+  // a NEW open file description on the same inode (no name is resolved; see
+  // plain_fd_), so O_DIRECT lives on a description nobody else holds and no
+  // exit, however abrupt, can leave it on the shell's.  The caller's descriptor
+  // is kept only to be POSITIONED: finalize() moves it to the end of what was
+  // written and from then on fd() returns it, so the trailers appended after
+  // finalize (seek table, tar index: lseek(END) + write) go through the caller's
+  // own description and advance its position exactly as a plain writer would.
+  // Returns false if the reopen is refused (no /proc, or the file's mode no
+  // longer allows writing): the caller then writes through stdio instead.
+  bool adopt_fd_detached(int caller_fd) {
+    if (caller_fd < 0) return false;
+    char link[64];
+    std::snprintf(link, sizeof(link), "/proc/self/fd/%d", caller_fd);
+    const int d = ::open(link, O_WRONLY | O_DIRECT | O_CLOEXEC);
+    if (d < 0) return false;
+    fd_ = d;
+    if (!init_after_open_()) return false;   // init closed d
+    caller_fd_ = caller_fd;
+    handed_back_ = false;
+    return true;
+  }
+  // >= 0 when this writer was adopted detached: the descriptor to hand back.
+  int caller_fd() const { return caller_fd_; }
+
   // HAND AN ADOPTED DESCRIPTOR BACK THE WAY A WRITER LEAVES ONE (v0.17.87).
   //
   // The dup made by adopt_fd SHARES its open file description with the caller's
@@ -9909,7 +9979,16 @@ public:
         return false;
       }
     }
-    if (!restore_adopted_(true)) {
+    if (caller_fd_ >= 0) {
+      // Detached: nothing to un-flag; position the caller's descriptor and hand
+      // it back for the trailers (see adopt_fd_detached).
+      if (::lseek(caller_fd_, (off_t)logical_written_, SEEK_SET) == (off_t)-1) {
+        gz_note_write_errno(errno);
+        werr_.store(true, std::memory_order_relaxed);
+        return false;
+      }
+      handed_back_ = true;
+    } else if (!restore_adopted_(true)) {
       werr_.store(true, std::memory_order_relaxed);
       return false;
     }
@@ -9927,6 +10006,10 @@ public:
     if (plain_fd_v_ >= 0) { ::close(plain_fd_v_); plain_fd_v_ = -1; }
     (void)restore_adopted_(false);   // an aborted run still must not leave O_DIRECT behind
     adopted_flags_ = -1;
+    if (caller_fd_ >= 0) {           // detached stdout: this writer is done with it
+      caller_fd_ = -1; handed_back_ = false;
+      g_stdout_adopted.store(0);
+    }
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
     for (int i = 0; i < NBUF; ++i) if (bufs_[i]) { ::free(bufs_[i]); bufs_[i] = nullptr; }
   }
@@ -9949,7 +10032,8 @@ public:
   // write_sparse to keep sparse seeks O_DIRECT-aligned, so it must reflect the
   // caller's view, not the (lagging) physical write position.
   size_t total_bytes() const { return (size_t)logical_written_ + buf_used_; }
-  int fd() const { return fd_; }
+  // After a detached writer's finalize() this is the CALLER's descriptor.
+  int fd() const { return handed_back_ ? caller_fd_ : fd_; }
   uint64_t preallocated() const { return preallocated_; }
 
   // Continue after bytes written positionally by another engine (currently
@@ -10108,6 +10192,8 @@ private:
   std::thread wt2_;                     // probe drain thread (lazy)
   int plain_fd_v_ = -1;                 // lazy non-O_DIRECT fd for tails
   int adopted_flags_ = -1;              // adopt_fd: the description's flags before O_DIRECT
+  int caller_fd_ = -1;                  // adopt_fd_detached: the caller's descriptor (not ours to close)
+  bool handed_back_ = false;            // ...and whether finalize() has handed it back via fd()
   bool plain_after_external_prefix_ = false; // unaligned GDS prefix => plain tail
   std::thread wt_;
 
@@ -13978,6 +14064,7 @@ static void load_dictionaries(const Options & opt)
   struct stat st {};
   if (::fstat(fileno(f), &st) != 0)
     die_io("cannot stat " + what + ": " + p + " (" + std::strerror(errno) + ")");
+  gz_refuse_if_stdout_file(st, what + " " + p);
   g_dep_known = true; g_dep_dev = st.st_dev; g_dep_ino = st.st_ino;
   g_dep_what = what; g_dep_path = p;
   // A FIFO or device would be read to EOF with no size to check first, and
@@ -19723,6 +19810,18 @@ static bool tar_entry_is_the_archive(const struct stat & st)
   return false;
 }
 
+// "archive cannot contain itself" is said ONCE per path: a rebuild after a GPU
+// fault or a --verify mismatch walks the tree again, and said it again.
+static bool tar_self_warn_once(const std::string & path)
+{
+  static std::mutex m;
+  static std::vector<std::string> seen;
+  std::lock_guard<std::mutex> lk(m);
+  if (std::find(seen.begin(), seen.end(), path) != seen.end()) return false;
+  seen.push_back(path);
+  return true;
+}
+
 enum class TarOutputEntryMatch { NO, YES, UNKNOWN };
 
 static TarOutputEntryMatch tar_entry_is_the_old_archive(
@@ -21055,14 +21154,31 @@ struct LayoutBuilder {
         warn_skip(p.fspath, "cannot identify its parent while excluding the old archive");
         continue;
       }
+      // SAID AT DEFAULT VERBOSITY, in GNU tar's words (v0.17.88).  Leaving the
+      // archive out of itself is right, but it used to be silent below -v: a
+      // run whose output sits inside the tree it archives (`gzstd --tar -c tree
+      // > tree/out`, `>> tree/out`, `-o tree/out`) dropped a file from the
+      // archive without a word.  tar prints exactly this and exits 0; -q
+      // suppresses it here.
       if (old_archive == TarOutputEntryMatch::YES) {
-        vlog(V_VERBOSE, opt, "[TAR] " + p.fspath
-             + ": file is the archive; not dumped\n");
+        if (tar_self_warn_once(p.fspath))
+          vlog(V_DEFAULT, opt, "gzstd: " + p.fspath
+               + ": archive cannot contain itself; not dumped\n");
         continue;
       }
       if (!g_tar_output_ids.empty() && tar_entry_is_the_archive(st)) {
-        vlog(V_VERBOSE, opt, "[TAR] " + p.fspath
-             + ": file is the archive; not dumped\n");
+        // On the atomic path THIS entry is the temporary the archive is being
+        // written to, under a name the user never typed: name the archive
+        // instead -- and say nothing if the old archive at that name is in the
+        // tree too, because the branch above reports that one.
+        const bool named = !opt.to_stdout && !opt.output.empty();
+        const bool is_temp = named
+            && fs::path(p.fspath).filename() != fs::path(opt.output).filename();
+        if (is_temp && !g_tar_output_entries.empty())
+          vlog(V_VERBOSE, opt, "[TAR] " + p.fspath + ": file is the archive; not dumped\n");
+        else if (tar_self_warn_once(is_temp ? opt.output : p.fspath))
+          vlog(V_DEFAULT, opt, "gzstd: " + (is_temp ? opt.output : p.fspath)
+               + ": archive cannot contain itself; not dumped\n");
         continue;
       }
 
@@ -29395,7 +29511,7 @@ static std::string wd_run_cmd(const char * cmd) {
 // Gather state, write ./gzstd-deadlock-<pid>-<unixtime>.json, and hard-exit.
 [[noreturn]] static void wd_dump_and_die(double stall_s) {
   GzWatchdog * d = g_wd.load(std::memory_order_relaxed);
-  if (!d) std::_Exit(70);
+  if (!d) { gz_stdout_leave_at_end(); std::_Exit(70); }
   // Sample heartbeats twice (500 ms apart) to tell SPINNING from BLOCKED.
   std::vector<uint64_t> hb0((size_t)d->n_workers), hb1((size_t)d->n_workers);
   std::vector<uint64_t> dhb0((size_t)d->n_workers), dhb1((size_t)d->n_workers);
@@ -29491,6 +29607,7 @@ static std::string wd_run_cmd(const char * cmd) {
     "[WATCHDOG] Hard-exiting — --watchdog is a diagnostic, no recovery.\n",
     stall_s, fname);
   std::fflush(stderr);
+  gz_stdout_leave_at_end();
   std::_Exit(70);
 }
 
@@ -40381,6 +40498,51 @@ static void order_all_gpus_before_cuda(const Options & opt, bool eager = false)
 }
 #endif
 
+#ifndef _WIN32
+// A REGULAR FILE BEHIND STDOUT MUST NOT BE ONE OF THE FILES THIS RUN READS
+// (v0.17.88).  A named output is refused when it is the input; a redirected one
+// was not, and what gets written to it destroys what was to be read from it:
+//
+//   exec 1<>b; gzstd -c a b      the O_DIRECT writer truncated b while writing
+//                                a's archive, then read that archive as input 2
+//   exec 1<>a.zst; gzstd -l a.zst   the listing was written over the archive
+//   gzstd --tar -c data > data   data left out "as the archive", exit 0
+//
+// (The buffered writer overwrote in place instead, as zstd does.  cat refuses:
+// "input file is output file".)  By identity, so a hard link, a symlink and
+// another spelling are caught; "-" is standard input.  `dirs`, when given, is
+// the directory each path is relative to (tar's positional -C; "." = none).
+// A path that cannot be stat'ed is not a match: opening it fails loudly later.
+static void gz_refuse_stdout_alias(const struct stat & out_st,
+                                   const std::vector<std::string> & paths,
+                                   const std::vector<std::string> * dirs)
+{
+  for (size_t i = 0; i < paths.size(); ++i) {
+    const std::string & ip = paths[i];
+    std::string full = ip;
+    if (dirs) {
+      // A tar operand, treated as the walk treats it: trailing slashes dropped
+      // (`data/` names the file `data`; stat("data/") fails on a regular file
+      // and let `--tar data/ >> data` through), and the entry itself, not what
+      // a symlink points at -- the archive stores the link.
+      while (full.size() > 1 && full.back() == '/') full.pop_back();
+      if (i < dirs->size() && (*dirs)[i] != "." && !(*dirs)[i].empty()
+          && !full.empty() && full[0] != '/')
+        full = (*dirs)[i] + "/" + full;
+    }
+    struct stat ist;
+    const bool have = (ip == "-" && !dirs) ? ::fstat(STDIN_FILENO, &ist) == 0
+                    : dirs                 ? ::lstat(full.c_str(), &ist) == 0
+                                           : ::stat(full.c_str(), &ist) == 0;
+    if (have && S_ISREG(ist.st_mode)
+        && ist.st_dev == out_st.st_dev && ist.st_ino == out_st.st_ino)
+      die_usage("input and output are the same file: "
+                + ((ip == "-" && !dirs) ? std::string("standard input") : full)
+                + " is also where standard output is redirected");
+  }
+}
+#endif
+
 static int gzstd_main(int argc, char ** argv)
 {
   setup_signal_handlers();
@@ -40606,6 +40768,14 @@ static int gzstd_main(int argc, char ** argv)
     // (an unindexed one decodes, and refuses, through the GPU path).
     gz_require_usable_gpu(opt, "-l");
 #endif
+    {
+      // The listing goes to stdout; it must not land on an archive being listed
+      // (see gz_refuse_stdout_alias).
+      struct stat lst;
+      const int lfd = fileno(stdout);
+      if (lfd >= 0 && ::fstat(lfd, &lst) == 0 && S_ISREG(lst.st_mode))
+        gz_refuse_stdout_alias(lst, opt.tar_mode ? opt.tar_sources : opt.inputs, nullptr);
+    }
     if (opt.tar_mode) { Meter meter; return list_tar(opt, &meter); }
     return list_zst(opt);
   }
@@ -41377,6 +41547,55 @@ static int gzstd_main(int argc, char ** argv)
     struct stat bst;
     if (bfd >= 0 && std::fflush(stdout) == 0
         && ::fstat(bfd, &bst) == 0 && S_ISREG(bst.st_mode)) {
+      // THE FILE BEHIND STDOUT MUST NOT BE ONE OF THE INPUTS (v0.17.88): see
+      // gz_refuse_stdout_alias.  ALL inputs are checked now, at the first one,
+      // because the damage is done before the aliased input is ever opened.
+      if (!opt.tar_mode) {
+        gz_refuse_stdout_alias(bst, opt.inputs, nullptr);
+      } else if (opt.mode == Mode::COMPRESS) {
+        // --tar create.  The operands named on the command line are checked the
+        // same way (each under the -C in effect for it): `gzstd --tar -c data >
+        // data` would otherwise leave `data` out "as the archive" and exit 0
+        // without the one file it was asked for.
+        gz_refuse_stdout_alias(bst, opt.tar_sources, &opt.tar_source_dest);
+        // A file deeper in the tree cannot be checked before the walk, and the
+        // walk leaves the output out of the archive by design (an archive made
+        // inside the tree it archives).  That is only safe when the output holds
+        // nothing of its own: `exec 1<>FILE` onto an EXISTING file inside the
+        // tree would have FILE truncated or overwritten here and then skipped
+        // there -- destroyed, absent from the archive, exit 0.  So an output
+        // that already has data beyond the write position is refused unless it
+        // is open for appending (which destroys nothing).  `>` and `>>` and -o
+        // are unaffected: the first is empty, the second appends.
+        //
+        // -f IS THE OVERRIDE, and the only one in this family: a file that is
+        // both read and written can never come out right, but this rule also
+        // stops a file that merely already exists, and replacing an existing
+        // output is what -f means.  With it the run goes ahead, loudly, and
+        // does what -f does to a named output: everything from the write
+        // position on is discarded FIRST, so neither writer leaves the old tail
+        // behind the new archive (the buffered one would, as GNU tar does).  If
+        // the file does turn out to be in the tree, the walk reports it in
+        // tar's words: "archive cannot contain itself; not dumped".
+        const int tfl = ::fcntl(bfd, F_GETFL);
+        const off_t tcur = ::lseek(bfd, 0, SEEK_CUR);
+        if (!(tfl >= 0 && (tfl & O_APPEND)) && tcur >= 0 && bst.st_size > tcur) {
+          if (!opt.force)
+            die_usage("--tar: standard output is an existing file opened without "
+                      "truncation, and --tar cannot tell whether it is one of the "
+                      "files being archived; writing the archive would overwrite "
+                      "it.  Redirect with > or >>, name the archive with -o, or "
+                      "pass -f to overwrite it anyway");
+          // (opt.force is also set by --overwrite, so the text names neither.)
+          vlog(V_ERROR, opt, "gzstd: warning: --tar: standard output is an existing "
+               "file opened without truncation; overwrite forced, so its contents "
+               "from the write position on are being replaced by the archive\n");
+          if (::ftruncate(bfd, tcur) != 0)
+            die_io("--tar: cannot truncate redirected stdout ("
+                   + std::string(std::strerror(errno)) + ")");
+          bst.st_size = tcur;
+        }
+      }
       const int bfl = ::fcntl(bfd, F_GETFL);
       const off_t cur = ::lseek(bfd, 0, SEEK_CUR);
       out_base = (bfl >= 0 && (bfl & O_APPEND)) ? bst.st_size : (cur > 0 ? cur : 0);
@@ -41459,13 +41678,14 @@ static int gzstd_main(int argc, char ** argv)
 
       // From here a buffered fallback is SAFE: the file is already empty, so an
       // O_DIRECT adoption failure costs speed, not correctness.
-      // ARMED BEFORE adopt_fd sets O_DIRECT on the shared description: a signal
-      // during its buffer allocation or thread start must still clear the flag
-      // for the next command.  (If adoption fails it restores the flags itself,
-      // and restoring them again at exit changes nothing.)
-      g_stdout_adopted_flags.store(flags);   // die()/a signal restore it; see the definition
+      // DETACHED: the writer gets its own description, so the caller's is never
+      // given O_DIRECT (see adopt_fd_detached and g_stdout_adopted).  Armed
+      // first, so a die() or signal from here on leaves stdout positioned after
+      // whatever was written; the writer disarms it when it closes.
+      g_stdout_adopted.store(1);
       auto dw = std::make_unique<DirectWriter>();
-      if (dw->adopt_fd(fd)) {
+      if (!dw->adopt_fd_detached(fd)) g_stdout_adopted.store(0);
+      else {
         out = nullptr;
         direct_writer = std::move(dw);
         vlog(V_VERBOSE, opt, "[O_DIRECT] stdout redirect using O_DIRECT (--direct)\n");
@@ -41766,13 +41986,26 @@ static int gzstd_main(int argc, char ** argv)
         // fault or a --verify mismatch first), but the same one.  Dup before the
         // reset so the inode survives the writer's destructor, rewind and empty
         // it, then hand it back.
+        //
+        // A DETACHED stdout writer (v0.17.88) is re-adopted detached: adopt_fd on
+        // a dup would put O_DIRECT back on the caller's description -- fd() is
+        // the caller's own descriptor once finalize() has run -- and would leave
+        // the caller's position wherever the rejected pass put it.
+        const int stdout_fd = dw_ptr->caller_fd();
         int keep = ::fcntl(dw_ptr->fd(), F_DUPFD_CLOEXEC, 0);
         direct_writer.reset();                 // dtor joins writer thread, closes its fd
         bool reopened = false;
         if (keep >= 0) {
           if (::ftruncate(keep, 0) == 0 && ::lseek(keep, 0, SEEK_SET) == 0) {
             direct_writer = std::make_unique<DirectWriter>();
-            reopened = direct_writer->adopt_fd(keep);
+            if (stdout_fd >= 0) {
+              g_stdout_adopted.store(1);
+              reopened = ::lseek(stdout_fd, 0, SEEK_SET) == 0
+                      && direct_writer->adopt_fd_detached(stdout_fd);
+              if (!reopened) g_stdout_adopted.store(0);
+            } else {
+              reopened = direct_writer->adopt_fd(keep);
+            }
             if (!reopened) direct_writer.reset();
           }
           ::close(keep);                       // adopt_fd holds its own dup
@@ -44228,7 +44461,13 @@ static std::vector<std::string> read_list_file(const std::string & flag,
   if (path != "-") {
     file.open(path);
     if (!file) die_usage(flag + ": cannot open '" + path + "': " + std::strerror(errno));
+    struct stat lst {};
+    if (::stat(path.c_str(), &lst) == 0) gz_refuse_if_stdout_file(lst, flag + " " + path);
     in = &file;
+  } else {
+    struct stat lst {};
+    if (::fstat(STDIN_FILENO, &lst) == 0)
+      gz_refuse_if_stdout_file(lst, "standard input (the " + flag + " list)");
   }
   std::string line;
   while (std::getline(*in, line)) {
@@ -44804,6 +45043,10 @@ static Options parse_args(int argc, char ** argv)
       std::ifstream ls(lf);
       if (!ls) die_io("cannot read --filelist " + lf + ": "
                       + std::strerror(errno ? errno : ENOENT));
+      {
+        struct stat fst {};
+        if (::stat(lf.c_str(), &fst) == 0) gz_refuse_if_stdout_file(fst, "--filelist " + lf);
+      }
       std::string line;
       size_t listed = 0;
       while (std::getline(ls, line)) {

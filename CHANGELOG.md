@@ -1,12 +1,112 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.87  
+**Covers:** v0.9.50 → v0.17.88  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.88 — the two shared-stdout gaps the tag review found
+
+Asked whether v0.17.87 was safe to tag, Codex said no: the shared-stdout repair was incomplete in two
+places, both older than the repair, and the second-machine gate was still owed. Both gaps were reproduced
+and are closed here. The gate (the batch tuner's byte targets on 11 GiB cards) is still owed.
+
+**1. A redirected stdout that is also an input.** A named output is refused when it is the input; a
+redirected one was not. With `exec 1<>b; gzstd -c a b` the O_DIRECT writer truncated `b` while writing
+`a`'s archive, before `b` was ever opened as the second input: `b` gone, exit 0. The buffered writer and
+zstd overwrite `b` in place the same way; cat refuses ("input file is output file"). Now a usage error
+(exit 2) before anything is written, checked against every input up front, by identity, so a hard link, a
+symlink and standard input are caught too. `gzstd -c f >> f` and `gzstd -c f > f` are refused by the same
+rule (the second used to archive the empty file the shell had just made).
+
+Codex's next round found the same hazard in the two other things written to stdout, and both are closed
+the same way. `exec 1<>a.zst; gzstd -l a.zst` wrote the listing over the archive it was listing. And
+`--tar` creation leaves its own output out of the archive by design, so a source aliased by stdout was
+destroyed and absent from the archive at exit 0. An operand named on the command line is refused by
+identity (under the `-C` in effect for it), which also turns `gzstd --tar -c data > data` from a quiet
+archive without `data` into an error. A file deeper in the tree cannot be checked before the walk, so
+`--tar` to a redirected stdout that already holds data beyond the write position is refused unless it
+is open for appending: `>`, `>>`, `-o` and an archive written into the tree it archives all still work;
+`exec 1<>existing-file` with `--tar` does not, even when the file is outside the tree: that refusal is
+broader than it needs to be, so **`-f` overrides it** (as does `--overwrite`, which implies it). The
+error says so; with `-f` the run goes ahead with a warning that `-q` does not silence and replaces the
+file from the write position on, discarding the rest first so no old
+tail is left behind the new archive (GNU tar leaves it). It is the only override in this family: a file
+that is both read and written cannot come out right, and stays refused with `-f`, as `zstd -f a -o a`
+does.
+
+A third round found the files read on the side. `exec 1<>list; gzstd -c --filelist list` truncated the
+list after reading it, and the `-D` dictionary was protected only when compressing: `-d -c -D dict` and
+`-l -D dict` wrote over it. Rather than add two more special cases, there is now one test,
+`gz_refuse_if_stdout_file`, called where each side input is opened: the dictionary and `--patch-from`
+reference in every mode, and the `--filelist`, `--files-from` and `--exclude-from` lists. A new side
+input only has to call it, and the fourth round supplied three: a list read from standard input, the
+`--adapt` profile, and the cuFile configuration named by `CUFILE_ENV_PATH_JSON`. The test does not ask
+whether the run will write to stdout, so `exec 1<>dict; gzstd -t -D dict x.zst` is refused too: loud,
+and nobody's workflow. Two spellings of a tar operand were also wrong: `data/` (the walk drops the
+slash; the check did not, so `--tar data/ >> data` got through) and a symlink (the check followed it and
+refused `--tar link >> out` when `link` points at `out`, although tar stores the link, not its target).
+
+**And where the archive is rightly left out of itself, gzstd now says so.** `gzstd --tar -c tree >
+tree/out`, `>> tree/out` and `-o tree/out` all write an archive inside the tree being archived, and the
+archive is skipped as a member. That was reported only at `-v`. It is now one line at default verbosity,
+in GNU tar's words: `gzstd: tree/out: archive cannot contain itself; not dumped`. On the atomic path
+the file actually skipped is the temporary the archive is written through; the message names the
+archive, and `-q` silences it. It is printed once per path: a rebuild after a GPU fault or a `--verify`
+mismatch walks the tree again and at first said it again. Exit status is unchanged (0), as with tar.
+
+**2. No exit can leave O_DIRECT on the caller's descriptor.** v0.17.87 wrote a redirected stdout through
+a dup of the caller's descriptor with O_DIRECT set on it. The flag belongs to the open file description,
+which the dup shares with the shell, so it had to be cleared on every way out, and v0.17.87 did that in
+`die()` and in its signal handler. SIGQUIT, SIGABRT, SIGSEGV, SIGKILL and the watchdog's exit run neither.
+Measured: after each of them the next command in the redirection failed with "write error: Invalid
+argument".
+
+The writer now opens its own description on the file (through `/proc/self/fd/N`, so no name is resolved)
+and the caller's is never flagged. There is nothing left to restore, whatever kills the process: all
+seven signals leave the next write working. The caller's descriptor is kept only to be positioned.
+`finalize()` moves it to the end of the output and hands it back, so the seek table and tar index, which
+are appended afterwards, go through the caller's own description and advance it as a plain writer would.
+A rebuild re-adopts the same way. If the reopen is refused (no `/proc`), the output is written through
+stdio instead.
+
+**Also: where the next command lands after a failed run.** Every write of the O_DIRECT writer is
+positional, so when a run died the caller's position was still where the output began, and the next
+command wrote over the partial output instead of after it. `die()`, the handled signals and the watchdog
+now leave the position at the end of the file. (A handled signal is best effort: the writer threads run
+until the process is gone. After an unhandled one the position is still the start.)
+
+`RELEASING.md` quoted suite totals from v0.17.64; they are current again.
+
+**Tests.** Two new cells and three extended, none needing a GPU. The killed-run cell does not race: the
+reader is stalled by a hook after the writer has adopted stdout, the `-v` line on a FIFO is the
+rendezvous, then the process gets SIGKILL and the same descriptor is written to. Nineteen builds with one
+piece removed each fail their cell, v0.17.87 itself among them (three cells). Two did not at first. With
+the tar operand check removed, the existing-data rule refused the same command, so the cell gained
+`gzstd --tar -c data >> data`, which only the operand check stops. And the `-f` check's existing file
+was 3 MB against a 5 MB archive, so there was no old tail to leave and the build without the truncate
+passed; it is 12 MB now. The shared-stdout matrix,
+extended with trailers after every writer and rebuilds followed by a second input: 133 checks over
+eleven backends, 0 wrong.
+
+**The verdict, and the bar it was given under.** Five rounds. The first said not safe (the two gaps
+above and the owed gate); rounds two to four each found further self-aliasing forms, every one of them
+stdout opened read-write (`1<>`) onto a file the same command reads. For round five the bar was written
+down: a blocker is a regression against the deployed v0.17.77, or loss of user data from a command a
+user could plausibly type, the ordinary shell forms `>`, `>>`, pipes and grouped commands included;
+`1<>` self-aliasing is should-fix. Under it: no blockers, **safe to tag**, the second-machine gate
+aside. Three should-fix items remain, all loud refusals or a caller naming gzstd's own profile as an
+output; they are in ROADMAP. The tar warning and the `-f` override were added afterwards and went back
+for a sixth round: no blockers, safe to tag. The review was static; the suites below ran on the final
+code.
+
+Suites, on the final code: the extensive GPU run 740 passed, 0 failed, 1 skipped of 741; the CPU-only
+build 421 passed, 0 failed. Both builds compile without warnings. The checklist's real-data round trip
+was run through the repaired stdout paths on a 130 GiB archive with default flags (one input, two
+inputs, two commands into one file, decompression followed by a trailer): byte-identical each time.
 
 ## v0.17.87 — the whole-codebase review before v0.18.0: ten subsystems, one version
 

@@ -610,8 +610,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=580
-$EXTENSIVE && EXPECTED_TESTS=739
+EXPECTED_TESTS=582
+$EXTENSIVE && EXPECTED_TESTS=741
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -804,6 +804,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # ...plus two more from part 6 (bare -B, the .tzst/.zstd names): 578, 737.
 # ...plus the FIFO cell (parts 5 and 10, no GPU) and the writer's lost wakeup
 # (parts 7-8, GPU): 580, 739; no-GPU deltas 160 -> 161 and 189 -> 190.
+# v0.17.88: two more shared-stdout cells (a killed run; stdout that is also an
+# input), neither needing a GPU: 582, 741.
 EXPECTED_NOGPU_DELTA=161
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=190   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
@@ -8190,6 +8192,14 @@ so_is "$so/o2.zst" "$so/ab" || so_why+=" [two commands > f: the first archive wa
 tail -c +17 "$so/o3" | head -c -8 > "$so/o3.zst"
 [[ "$(head -c 15 "$so/o3")" == "HEADER-16-BYTES" && "$(tail -c 8 "$so/o3")" == "TRAILER" ]] \
   && so_is "$so/o3.zst" "$so/a" || so_why+=" [a header or trailer around the archive was damaged]"
+# From offset zero (the O_DIRECT writer itself, no header in front): the next
+# command must land after the archive's LAST byte, which is its seek table --
+# appended after the writer has finished, through the caller's descriptor.
+{ "$GZSTD" --cpu-only --direct -q -c "$so/a"; printf 'TRAILER\n'; } > "$so/o3b" 2>/dev/null
+head -c -8 "$so/o3b" > "$so/o3b.zst"
+[[ "$(tail -c 8 "$so/o3b")" == "TRAILER" ]] && so_is "$so/o3b.zst" "$so/a" \
+  && "$GZSTD" -l "$so/o3b.zst" >/dev/null 2>&1 && cmp -s "$so/o3b.zst" "$so/a.zst" \
+  || so_why+=" [a trailer after the O_DIRECT writer landed inside the archive (its seek table)]"
 [[ -z "$so_why" ]] && pass "-c to a redirected file appends to what is already there" \
   || fail "-c to a redirected file appends to what is already there" "$so_why"
 
@@ -8208,13 +8218,46 @@ cmp -s "$so/o4b" "$so/ab" || so_why+=" [-dc a.zst b.zst > f: $(stat -c %s "$so/o
 # left it set, and the next command's write failed: "write error: Invalid
 # argument".  (A filesystem that does not enforce O_DIRECT alignment cannot show
 # the failure; the cell then passes without discriminating.)
+# v0.17.88: ...and it lands AFTER the partial output, not on top of it.  Every
+# write of the O_DIRECT writer is positional, so the caller's position was still
+# where the output began when the run died.
 rc=0
 { ( trap '' XFSZ; ulimit -f 2048; exec "$GZSTD" --cpu-only --direct -q -c "$so/rnd" ) || rc=$?
   printf 'AFTER\n' || echo "the next command could not write" >&2; } > "$so/o5" 2> "$so/e5"
-if [[ $rc -eq 3 ]] && ! grep -aq "could not write\|write error" "$so/e5"; then
-  pass "a failed -c run hands stdout back without O_DIRECT set"
-else
+if [[ $rc -ne 3 ]] || grep -aq "could not write\|write error" "$so/e5"; then
   fail "a failed -c run hands stdout back without O_DIRECT set" "exit $rc; $(grep -a 'write' "$so/e5" | head -1 | cut -c1-90)"
+elif [[ "$(tail -c 6 "$so/o5")" != "AFTER" || $(stat -c %s "$so/o5") -le 6 ]]; then
+  fail "a failed -c run hands stdout back without O_DIRECT set" \
+       "the next command wrote at offset $(grep -abo AFTER "$so/o5" | head -1 | cut -d: -f1) of $(stat -c %s "$so/o5"): over the partial output, not after it"
+else
+  pass "a failed -c run hands stdout back without O_DIRECT set"
+fi
+
+# 3b. THE SAME FOR A RUN THAT GETS NO CHANCE TO CLEAN UP (v0.17.88).  v0.17.87
+# cleared the flag in die() and in its signal handler; SIGKILL, SIGQUIT, SIGABRT,
+# SIGSEGV and the watchdog's exit run neither, and left the shell's descriptor
+# with O_DIRECT set.  The writer now has its OWN description on the file, so the
+# caller's is never flagged at all.  The program opens the window: the reader is
+# stalled after the writer has adopted stdout (the -v line is the rendezvous),
+# then the process is killed outright and the same descriptor is written to.
+so_fifo="$so/efifo"; mkfifo "$so_fifo"
+exec 7>"$so/o13"
+GZSTD_DEBUG_POOLED_STALL_CHUNK=1:30000 "$GZSTD" --cpu-only --no-mmap --read-threads 1 --chunk-size=1 \
+    --direct -v -c "$so/rnd" >&7 2>"$so_fifo" &
+so_kpid=$!
+so_adopted=false
+while IFS= read -r -t 20 so_line; do
+  [[ "$so_line" == *"stdout redirect using O_DIRECT"* ]] && { so_adopted=true; break; }
+done < "$so_fifo"
+kill -KILL "$so_kpid" 2>/dev/null; wait "$so_kpid" 2>/dev/null
+so_w=0; printf 'AFTER\n' >&7 2>/dev/null || so_w=$?
+exec 7>&-
+if ! $so_adopted; then
+  skip_host "a killed -c run leaves the caller's stdout usable" "stdout was not adopted for O_DIRECT in $TMPDIR"
+elif [[ $so_w -ne 0 ]]; then
+  fail "a killed -c run leaves the caller's stdout usable" "after SIGKILL the next write to the same descriptor failed (O_DIRECT left on it)"
+else
+  pass "a killed -c run leaves the caller's stdout usable"
 fi
 
 # 4. THE REBUILD after a --verify mismatch (or a GPU fault) rewound to offset
@@ -8238,6 +8281,16 @@ rc=0
   printf 'DONE\n'; } > "$so/o7b"
 [[ $rc -eq 4 && "$(head -c 15 "$so/o7b")" == "HEADER-16-BYTES" && "$(tail -c 5 "$so/o7b")" == "DONE" ]] \
   || so_why+=" [unrebuildable (piped input): exit $rc, want 4; the file starts '$(head -c 15 "$so/o7b" | tr -c '[:print:]' '.')']"
+# ...and a rebuild on the O_DIRECT writer (adopted at offset zero) must leave the
+# descriptor after the REBUILT output: v0.17.88 re-adopts it with the caller's
+# descriptor in hand, or the trailer below lands on the archive.
+rc=0
+{ GZSTD_DEBUG_CORRUPT_FRAME=3 "$GZSTD" --cpu-only --direct --verify --chunk-size=1 -c "$so/b" 2> "$so/e7c" || rc=$?
+  printf 'TRAILER\n'; } > "$so/o7c"
+head -c -8 "$so/o7c" > "$so/o7c.zst"
+grep -aq "rebuilding" "$so/e7c" || so_why+=" [O_DIRECT writer: no rebuild happened]"
+[[ $rc -eq 0 && "$(tail -c 8 "$so/o7c")" == "TRAILER" ]] && so_is "$so/o7c.zst" "$so/b" \
+  || so_why+=" [rebuild on the O_DIRECT writer, then a trailer: exit $rc, the archive or the trailer is damaged]"
 [[ -z "$so_why" ]] && pass "a rebuild discards only its own output on a shared stdout" \
   || fail "a rebuild discards only its own output on a shared stdout" "$so_why"
 
@@ -8264,6 +8317,121 @@ head -c "$(stat -c %s "$so/mix")" "$so/o12" | cmp -s - "$so/mix" \
   || so_why+=" [--sparse over an existing file: old bytes where zeros belong]"
 [[ -z "$so_why" ]] && pass "zeros are written where a hole cannot be made" \
   || fail "zeros are written where a hole cannot be made" "$so_why"
+
+# 5b. THE FILE BEHIND STDOUT MUST NOT BE ONE OF THE INPUTS (v0.17.88).  A named
+# output is refused when it is the input; a redirected one was not, and the
+# O_DIRECT writer truncated it while writing the FIRST input's archive -- before
+# the aliased input was ever opened.  `exec 1<>b; gzstd -c a b`: b gone, exit 0.
+so_why=""
+for so_fl in --direct --no-direct; do
+  cp "$so/b" "$so/b2"; rc=0
+  ( exec 1<>"$so/b2"; "$GZSTD" --cpu-only $so_fl -q -c "$so/a" "$so/b2" 2>/dev/null ) || rc=$?
+  [[ $rc -eq 2 ]] && cmp -s "$so/b2" "$so/b" || so_why+=" [$so_fl, stdout is the second input: exit $rc, input $(cmp -s "$so/b2" "$so/b" && echo intact || echo DESTROYED)]"
+done
+cp "$so/b" "$so/b2"; ln "$so/b2" "$so/b2.link"; rc=0
+( exec 1<>"$so/b2"; "$GZSTD" --cpu-only --direct -q -c "$so/a" "$so/b2.link" 2>/dev/null ) || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/b2" "$so/b" || so_why+=" [through a hard link: exit $rc]"
+cp "$so/b" "$so/b2"; rc=0; "$GZSTD" --cpu-only -q -c < "$so/b2" 1<>"$so/b2" 2>/dev/null || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/b2" "$so/b" || so_why+=" [standard input is the same file: exit $rc]"
+rc=0; "$GZSTD" --cpu-only --direct -q -c "$so/a" "$so/b" > "$so/o14.zst" 2>/dev/null || rc=$?
+[[ $rc -eq 0 ]] && so_is "$so/o14.zst" "$so/ab" || so_why+=" [distinct files were refused or damaged: exit $rc]"
+# The same for the other two things written to stdout.  A LISTING landed on the
+# archive it was listing.  And --tar creation leaves its own output out of the
+# archive by design, so a source aliased by stdout was destroyed AND absent:
+# a named operand is refused by identity; a file deeper in the tree cannot be
+# checked before the walk, so an output that already holds data (and is not
+# open for appending) is refused outright.
+cp "$so/a.zst" "$so/l.zst"; rc=0
+( exec 1<>"$so/l.zst"; "$GZSTD" -l "$so/l.zst" 2>/dev/null ) || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/l.zst" "$so/a.zst" || so_why+=" [-l onto the archive it lists: exit $rc, archive $(cmp -s "$so/l.zst" "$so/a.zst" && echo intact || echo OVERWRITTEN)]"
+mkdir -p "$so/tw/tree/sub"; cp "$so/a" "$so/tw/data"; cp "$so/a" "$so/tw/tree/f1"; cp "$so/b" "$so/tw/tree/sub/f2"
+rc=0; ( cd "$so/tw" && exec 1<>data && "$GZSTD" --cpu-only --direct -q -c --tar data 2>/dev/null ) || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/tw/data" "$so/a" || so_why+=" [--tar, stdout is the operand: exit $rc, $(cmp -s "$so/tw/data" "$so/a" && echo intact || echo DESTROYED)]"
+rc=0; ( cd "$so/tw" && "$GZSTD" --cpu-only -q -c --tar data >> data 2>/dev/null ) || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/tw/data" "$so/a" || so_why+=" [--tar data >> data: exit $rc, $(cmp -s "$so/tw/data" "$so/a" && echo intact || echo CHANGED)]"
+rc=0; ( cd "$so/tw" && exec 1<>tree/sub/f2 && "$GZSTD" --cpu-only -q -c --tar tree 2>/dev/null ) || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/tw/tree/sub/f2" "$so/b" || so_why+=" [--tar, stdout is a file inside the tree: exit $rc, $(cmp -s "$so/tw/tree/sub/f2" "$so/b" && echo intact || echo DESTROYED)]"
+# -f IS THE OVERRIDE for that last rule, and for nothing else in this family:
+# the refusal names it, and with it the run goes ahead with a warning and
+# replaces the file from the write position on -- no old tail left behind the
+# new archive, on either writer (the buffered one would leave it, as GNU tar
+# does).  A file that is both read and written stays refused even with -f.
+rc=0; ( cd "$so/tw" && exec 1<>tree/sub/f2 && "$GZSTD" --cpu-only -q -c --tar tree 2>../f0.err ) || rc=$?
+grep -aq -- "-f to overwrite" "$so/f0.err" || so_why+=" [the --tar refusal does not offer -f]"
+( cd "$so/tw" && "$GZSTD" --cpu-only -q -c --tar tree > ../fref.tzst 2>/dev/null )
+for so_fl in --direct --no-direct; do
+  # LONGER than the archive (about 5 MB), or there is no old tail to leave: at
+  # 3 MB the build without the truncate passed this.
+  head -c 12000000 /dev/urandom > "$so/tw/old.x"; rc=0
+  ( cd "$so/tw" && exec 1<>old.x && "$GZSTD" --cpu-only $so_fl -q -f -c --tar tree 2>../f1.err ) || rc=$?
+  [[ $rc -eq 0 ]] && cmp -s "$so/tw/old.x" "$so/fref.tzst" && grep -aq "overwrite forced" "$so/f1.err" \
+    || so_why+=" [--tar -f onto an existing file ($so_fl): exit $rc, $(stat -c %s "$so/tw/old.x") bytes (want $(stat -c %s "$so/fref.tzst")), warning $(grep -ac 'overwrite forced' "$so/f1.err")]"
+done
+rm -f "$so/tw/old.x"
+rc=0; ( cd "$so/tw" && exec 1<>data && "$GZSTD" --cpu-only -q -f -c --tar data 2>/dev/null ) || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/tw/data" "$so/a" || so_why+=" [-f let stdout be the tar operand: exit $rc]"
+# ...while an archive written INTO the tree it archives, and one appended to an
+# existing file, still work.
+rc=0; ( cd "$so/tw" && "$GZSTD" --cpu-only -q -c --tar tree > tree/out.tzst 2>/dev/null \
+        && "$GZSTD" --cpu-only -q -c --tar tree >> tree/out.tzst 2>/dev/null ) || rc=$?
+[[ $rc -eq 0 && $("$GZSTD" -l --tar "$so/tw/tree/out.tzst" 2>/dev/null | grep -c 'sub/f2$') -ge 1 ]] \
+  || so_why+=" [--tar into its own tree (> then >>) was refused or lost a member: exit $rc]"
+# ...and SAY SO, as GNU tar does: the archive is left out of itself, which was
+# silent below -v.  One line at default verbosity for >, >> and a named -o (the
+# archive's own name, never the temporary it is written through); none with -q.
+so_selfmsg="archive cannot contain itself; not dumped"
+( cd "$so/tw" && rm -f tree/out.tzst
+  "$GZSTD" --cpu-only -c --tar tree >  tree/out.tzst 2> ../w1.err
+  "$GZSTD" --cpu-only -c --tar tree >> tree/out.tzst 2> ../w2.err
+  "$GZSTD" --cpu-only -f --tar tree -o tree/named.tzst >/dev/null 2> ../w3.err
+  "$GZSTD" --cpu-only -f --tar tree -o tree/named.tzst >/dev/null 2> ../w4.err
+  "$GZSTD" --cpu-only -q -c --tar tree >> tree/out.tzst 2> ../w5.err
+  "$GZSTD" --cpu-only -f --tar tree -o outside.tzst >/dev/null 2> ../w6.err ) 2>/dev/null
+# Once, even when a rebuild walks the tree a second time.
+( cd "$so/tw" && GZSTD_DEBUG_CORRUPT_FRAME=2 "$GZSTD" --cpu-only --verify --chunk-size=1 -f --tar tree \
+    -o tree/named.tzst >/dev/null 2> ../w7.err ) 2>/dev/null
+grep -aq "rebuilding" "$so/w7.err" || so_why+=" [the rebuild for the once-only warning did not happen]"
+[[ $(grep -ac "$so_selfmsg" "$so/w7.err") -eq 1 ]] || so_why+=" [a rebuild printed the warning $(grep -ac "$so_selfmsg" "$so/w7.err") times, want 1]"
+[[ $(grep -ac "tree/out.tzst: $so_selfmsg" "$so/w1.err") -eq 1 ]] || so_why+=" [no warning for --tar -c tree > tree/out]"
+[[ $(grep -ac "tree/out.tzst: $so_selfmsg" "$so/w2.err") -eq 1 ]] || so_why+=" [no warning for --tar -c tree >> tree/out]"
+[[ $(grep -ac "tree/named.tzst: $so_selfmsg" "$so/w3.err") -eq 1 ]] || so_why+=" [-o inside the tree (new): want one warning naming the archive, got '$(grep -a "$so_selfmsg" "$so/w3.err" | head -1 | cut -c1-70)']"
+[[ $(grep -ac "$so_selfmsg" "$so/w4.err") -eq 1 ]] || so_why+=" [-o inside the tree (replacing): $(grep -ac "$so_selfmsg" "$so/w4.err") warnings, want 1]"
+grep -aq "$so_selfmsg" "$so/w5.err" && so_why+=" [-q did not silence the warning]"
+grep -aq "$so_selfmsg" "$so/w6.err" && so_why+=" [warned although the archive is outside the tree]"
+# The trailing slash the walk drops must be dropped here too (`data/` names the
+# file `data`), and a symlink operand is the LINK, which tar stores: one that
+# points at the output is not the output.
+rc=0; ( cd "$so/tw" && "$GZSTD" --cpu-only -q -c --tar data/ >> data 2>/dev/null ) || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/tw/data" "$so/a" || so_why+=" [--tar data/ >> data: exit $rc, $(cmp -s "$so/tw/data" "$so/a" && echo intact || echo CHANGED)]"
+rc=0; ( cd "$so/tw" && : > lk.tzst && ln -s lk.tzst lk && "$GZSTD" --cpu-only -q -c --tar lk >> lk.tzst 2>/dev/null ) || rc=$?
+[[ $rc -eq 0 && $("$GZSTD" -l --tar "$so/tw/lk.tzst" 2>/dev/null | grep -c 'lk') -ge 1 ]] \
+  || so_why+=" [a symlink operand that points at the output was refused: exit $rc]"
+# The files read ON THE SIDE are the same hazard: the --filelist was truncated
+# after it had been read, and the -D dictionary was only protected when
+# compressing (-d -c and -l wrote over it).
+printf '%s\n%s\n' "$so/a" "$so/b" > "$so/paths"; cp "$so/paths" "$so/paths.keep"; rc=0
+( exec 1<>"$so/paths"; "$GZSTD" --cpu-only --direct -q -c --filelist "$so/paths" 2>/dev/null ) || rc=$?
+[[ $rc -eq 2 ]] && cmp -s "$so/paths" "$so/paths.keep" || so_why+=" [stdout is the --filelist: exit $rc, list $(cmp -s "$so/paths" "$so/paths.keep" && echo intact || echo DESTROYED)]"
+( set +o pipefail; for so_i in 1 2 3 4 5 6 7 8; do head -c 3000 /dev/urandom | base64 > "$so/smp$so_i"; done )
+if "$GZSTD" --train -q "$so"/smp? -o "$so/dict" 2>/dev/null && "$GZSTD" --cpu-only -q -f -D "$so/dict" "$so/a" -o "$so/ad.zst" 2>/dev/null; then
+  cp "$so/dict" "$so/dict.keep"; rc=0
+  ( exec 1<>"$so/dict"; "$GZSTD" --cpu-only --direct -q -d -c -D "$so/dict" "$so/ad.zst" 2>/dev/null ) || rc=$?
+  [[ $rc -eq 2 ]] && cmp -s "$so/dict" "$so/dict.keep" || so_why+=" [stdout is the -D dictionary on decode: exit $rc, dictionary $(cmp -s "$so/dict" "$so/dict.keep" && echo intact || echo DESTROYED)]"
+  rc=0; "$GZSTD" --cpu-only -q -d -c -D "$so/dict" "$so/ad.zst" 2>/dev/null | cmp -s - "$so/a" || so_why+=" [-d -c -D to a pipe no longer works]"
+else
+  so_why+=" [could not build the dictionary fixture]"
+fi
+# ...a list read from STANDARD INPUT, and the --adapt profile, by the same test.
+printf 'keep\n' > "$so/rules"; rc=0
+"$GZSTD" --tar -X - --help < "$so/rules" 1<>"$so/rules" 2>/dev/null || rc=$?
+[[ $rc -eq 2 && "$(cat "$so/rules")" == "keep" ]] || so_why+=" [a list on stdin that is also stdout: exit $rc, list '$(head -c 20 "$so/rules" | tr -c '[:print:]' '.')']"
+mkdir -p "$so/xc/gzstd"; rc=0
+XDG_CACHE_HOME="$so/xc" "$GZSTD" --adapt --cpu-only -q -c "$so/a" > "$so/xc/gzstd/profile.json" 2>/dev/null || rc=$?
+[[ $rc -eq 2 && ! -s "$so/xc/gzstd/profile.json" ]] || so_why+=" [stdout is the --adapt profile: exit $rc]"
+rc=0; "$GZSTD" --cpu-only -q -c --filelist "$so/paths.keep" 2>/dev/null > "$so/o15.zst" || rc=$?
+[[ $rc -eq 0 ]] && so_is "$so/o15.zst" "$so/ab" || so_why+=" [--filelist to a separate file was refused or damaged: exit $rc]"
+[[ -z "$so_why" ]] && pass "a redirected stdout that is also an input is refused" \
+  || fail "a redirected stdout that is also an input is refused" "$so_why"
 
 # 6 + 7. --gds-only.  Its peer-to-peer output reopens the descriptor at offset
 # zero, so the second command above overwrote the first there too; and two of

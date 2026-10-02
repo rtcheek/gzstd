@@ -95,6 +95,17 @@ These came out of it, roughly by weight:
 11. **~13 futex calls per frame** on every CPU path, at 1 MiB and at 16 MiB frames.
 12. **Indexed `-l --tar`** does not validate sparse maps (`-t --tar` does).
 
+Added by the v0.17.88 tag review (all loud, none a blocker):
+
+13. **The side-input alias check is unconditional**: `exec 1<>dict; gzstd -t -D dict x.zst` is refused
+    although nothing would be written to stdout.
+14. **`--tar` to `exec 1<>existing-file` is refused even when the file is outside the tree**, unless
+    `-f` is given (then: a warning, and the file is replaced). Narrowing the refusal itself needs to
+    know, before the walk, whether the file is under an operand.
+15. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
+16. **After a failed run the caller's stdout position is best effort**: with `--preallocate` it lands
+    past a gap, and after SIGQUIT, SIGABRT, SIGSEGV or SIGKILL it is still where the output began.
+
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
 Found by Codex while reviewing v0.17.84, reproduced in v0.17.85 with a stall hook
