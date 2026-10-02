@@ -49,13 +49,13 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 740 | 581 | **yes, this server** |
-| GPU, GDS unavailable | 723 | 565 | yes, the workstation |  <!-- derived: baseline - EXPECTED_NOGDS_DELTA (17 / 16); last measured 456 default at the v0.17.63 baseline of 467 -->
-| no GPU (the CPU-only build) | not observed (`-e` adds no CPU-only cells) | 421 | yes |
+| GPU + GPUDirect Storage usable (the baseline) | 749 | 590 | **yes, this server** |
+| GPU, GDS unavailable | 731 | 573 | yes, the workstation |  <!-- derived: baseline - EXPECTED_NOGDS_DELTA (18 / 17); last measured 456 default at the v0.17.63 baseline of 467 -->
+| no GPU (the CPU-only build) | not observed (`-e` adds no CPU-only cells) | 427 | yes |
 
-These are the v0.17.88 figures (the table said 599 / 468 / 351 from v0.17.64 until then; the suite's own
-constants are the authority, and it prints the expectation it used). The baseline row counts what RAN,
-so it is the `EXPECTED_TESTS` constant (741 / 582) minus the one
+These are the v0.17.89 figures (the suite's own constants are the authority, and it prints the
+expectation it used). The baseline row counts what RAN,
+so it is the `EXPECTED_TESTS` constant (750 / 591) minus the one
 cell this server cannot provoke — the trivial-park cell needs a trivially-compressed batch to reach
 a GPU, and the CPU pool here drains the fixture first. Since v0.17.64 that skip goes through
 `skip_host`, which subtracts itself from the expectation, so the run says "as expected on this host"

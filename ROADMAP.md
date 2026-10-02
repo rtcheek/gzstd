@@ -70,41 +70,28 @@ describes a moving target we do not control.
 
 ---
 
-## OPEN after the v0.17.87 whole-codebase review: decisions and follow-ups
+## OPEN after the v0.17.87-89 reviews
 
-The review (ten subsystems, CHANGELOG v0.17.87) fixed what was a defect and left what is a decision.
-These came out of it, roughly by weight:
+The sixteen decisions left by the v0.17.87 and v0.17.88 reviews were ruled on and carried out in
+v0.17.89 (CHANGELOG has the table), along with the `-M` decompression limit found on the way. Closed
+without a change: checking sparse maps on an indexed `-l --tar` (measured: 10 ms today, 0.1 to 2 s
+with the check; `-t --tar` checks them). What is still open:
 
-1. **Multi-input `-c` to a redirected file is buffered from the second input on.** The fix for the
-   shared-stdout data loss adopts stdout for O_DIRECT only at offset zero. Giving `DirectWriter` a base
-   offset would restore O_DIRECT for the later inputs.
-2. **An input that shrinks while it is read** is archived as its prefix at exit 0 (pooled reader); the
-   mmap reader dies of SIGBUS. Decide the contract. The obvious check (EOF before the size seen at open)
-   breaks files whose reported size is not their length (sysfs: 4096 reported, 23 real).
-3. **The tar error flag survives a clean CPU rebuild** (exit 1, `--rm` suppressed). Needs layout-time
-   and assembly-time errors kept apart.
-4. **`-c` with `-d --tar`** is accepted and ignored. Refuse it, or implement tar's `-O`.
-5. **`gzstd -d -D dict -f -o dict`** replaces the dictionary; compression refuses the same line.
-6. **Short-flag bundles**: `-qf`, `-dq`, `-19f`, `-T4q` are "unknown option"; so are `-z` and `--zstd=`.
-   `-M`/`--memory` take MiB where zstd takes bytes with a suffix. `--train -c -o dict` writes to stdout
-   where zstd lets the later of the two win.
-7. **`--calibrate` records a CPU rescue as GPU speed** when the GPU faults mid-measurement.
-8. **A decompress prefetch read error exits 4**, where the table says 3. Needs an injector.
-9. **A failed cuFile statistics re-exec** continues into the crash it exists to avoid.
-10. **A CUDA call that never returns** still blocks compress recovery.
-11. **~13 futex calls per frame** on every CPU path, at 1 MiB and at 16 MiB frames.
-12. **Indexed `-l --tar`** does not validate sparse maps (`-t --tar` does).
-
-Added by the v0.17.88 tag review (all loud, none a blocker):
-
-13. **The side-input alias check is unconditional**: `exec 1<>dict; gzstd -t -D dict x.zst` is refused
-    although nothing would be written to stdout.
-14. **`--tar` to `exec 1<>existing-file` is refused even when the file is outside the tree**, unless
-    `-f` is given (then: a warning, and the file is replaced). Narrowing the refusal itself needs to
-    know, before the walk, whether the file is under an operand.
-15. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
-16. **After a failed run the caller's stdout position is best effort**: with `--preallocate` it lands
-    past a gap, and after SIGQUIT, SIGABRT, SIGSEGV or SIGKILL it is still where the output began.
+1. **~13 futex calls per frame** on every CPU path, at 1 MiB and at 16 MiB frames. Held for the next
+   round, to be investigated properly.
+2. **`>>` stays on the buffered writer**, 3.5x slower than O_DIRECT on a redirected file. Adopting an
+   append descriptor would mean positional writes at a base another appender could also be writing to.
+3. **`--gds-only` peer-to-peer output declines a descriptor that already holds output**, so the second
+   archive of `{ gzstd --gds-only -c a; gzstd --gds-only -c b; } > f` is written device-to-host.
+4. **The `--tar` GPU decode pool has no stall guard.** v0.17.89's guard covers GPU compression;
+   decompression reclaims a wedged batch; the pool's stream synchronize can still hang an extraction.
+5. **`--tar` onto a `1<>` file with more than one link** is refused unless `-f` is given: the name
+   the descriptor reports cannot say where the other links are.
+6. **zstd spellings still missing**: `--zstd=...`; a bare `-M` number is MiB where zstd reads bytes;
+   `--train -c -o dict` writes to stdout where zstd lets the later of the two win.
+7. **After a failed run the caller's stdout position is best effort** (documented in `--help`).
+8. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
+    The caller's doing; left.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

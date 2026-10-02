@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.88";
+static constexpr const char * GZSTD_VERSION = "0.17.89";
 //
 // Architecture overview:
 //
@@ -2775,6 +2775,8 @@ struct Options {
   // -c/-o conflict.  Each -o occurrence now REPLACES both, and to_stdout is
   // resolved from them once, after parsing.
   bool stdout_flag = false;       // an explicit -c/--stdout/--to-stdout appeared
+  bool tar_O = false;             // tar's own spelling, -O, appeared (only valid with -d --tar)
+  bool tar_to_stdout = false;     // -d --tar with -c/-O: member CONTENTS go to stdout (tar -xO)
   bool output_named = false;      // the last -o named a real path
   bool output_dash  = false;      // the last -o was "-" (same destination as -c)
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
@@ -3444,33 +3446,62 @@ static void die_io(const std::string & msg)
 static void die_data(const std::string & msg)
 { die(msg, EXIT_DATA); }
 
-// NOTHING THIS RUN READS MAY BE THE REGULAR FILE BEHIND STDOUT (v0.17.88).
+// NOTHING THIS RUN READS MAY BE THE REGULAR FILE IT WRITES TO STDOUT (v0.17.88,
+// and conditional on the writing since v0.17.89).
+//
 // Whatever is written to stdout -- an archive, decoded data, a listing, a
-// dictionary -- would land on, or truncate, the file being read.  The inputs
-// and tar operands are checked as a set before the first write (see
-// gz_refuse_stdout_alias); this is the same test for the files read ON THE SIDE:
-// the -D dictionary and --patch-from reference (in every mode -- the stdout
-// check there used to cover compression only, so `exec 1<>dict; gzstd -d -c -D
-// dict x.zst` and `-l -D dict` wrote over the dictionary), and the --filelist,
-// --files-from and --exclude-from lists, named or on standard input (`exec
-// 1<>list; gzstd -c --filelist list` truncated the list after reading it), the
-// --adapt profile and the cuFile configuration.  Called where each is opened,
-// so a new side input only has to call it.  cat's rule: "input file is output
-// file".  It does not ask whether this run will write to stdout: a side input
-// that IS the stdout file is refused even by a run that would not have written
-// there (`exec 1<>dict; gzstd -t -D dict x.zst`).  Loud, and nobody's workflow.
-static void gz_refuse_if_stdout_file(const struct stat & st, const std::string & what)
-{
+// dictionary, the help text -- would land on, or truncate, the file being read.
+// The inputs and tar operands are checked as a set before the first write (see
+// gz_refuse_stdout_alias).  These two functions are the same test for the files
+// read ON THE SIDE: the -D dictionary and --patch-from reference, the --filelist,
+// --files-from and --exclude-from lists (named or on standard input), the
+// --adapt profile and the cuFile configuration.
+//
+//   gz_note_side_input()         where each is opened: remember its identity;
+//   gz_stdout_will_be_written()  where data is about to go to stdout: refuse if
+//                                any remembered file IS the stdout file.
+//
+// v0.17.88 refused at the open, whether or not the run would ever write to
+// stdout, so `exec 1<>dict; gzstd -t -D dict x.zst` exited 2 although -t writes
+// nothing there.  zstd checks nothing at all in these cases; this checks only
+// when there is something to lose.  Either order works: a side input opened
+// after writing has begun is checked at once.  cat's rule: "input file is
+// output file".
+struct GzSideInput { dev_t dev; ino_t ino; std::string what; };
+static std::mutex               g_side_m;
+static std::vector<GzSideInput> g_side_inputs;
+static bool                     g_stdout_has_data = false;   // guarded by g_side_m
+
 #ifndef _WIN32
-  if (!S_ISREG(st.st_mode)) return;
+static void gz_refuse_side_alias_locked(const GzSideInput & si)
+{
   struct stat ost;
   const int ofd = fileno(stdout);
   if (ofd >= 0 && ::fstat(ofd, &ost) == 0 && S_ISREG(ost.st_mode)
-      && ost.st_dev == st.st_dev && ost.st_ino == st.st_ino)
-    die_usage("input and output are the same file: " + what
+      && ost.st_dev == si.dev && ost.st_ino == si.ino)
+    die_usage("input and output are the same file: " + si.what
               + " is also where standard output is redirected");
+}
+#endif
+
+static void gz_note_side_input(const struct stat & st, const std::string & what)
+{
+#ifndef _WIN32
+  if (!S_ISREG(st.st_mode)) return;
+  std::lock_guard<std::mutex> lk(g_side_m);
+  g_side_inputs.push_back({st.st_dev, st.st_ino, what});
+  if (g_stdout_has_data) gz_refuse_side_alias_locked(g_side_inputs.back());
 #else
   (void)st; (void)what;
+#endif
+}
+
+static void gz_stdout_will_be_written()
+{
+#ifndef _WIN32
+  std::lock_guard<std::mutex> lk(g_side_m);
+  for (const GzSideInput & si : g_side_inputs) gz_refuse_side_alias_locked(si);
+  g_stdout_has_data = true;
 #endif
 }
 
@@ -3867,6 +3898,7 @@ static void gds_preflight_or_die(const Options & opt, FILE * in)
 // descriptions.  Point users at --help for details and examples.
 static void print_help()
 {
+  gz_stdout_will_be_written();
   std::cout <<
 "gzstd " << GZSTD_VERSION << " — hybrid CPU+GPU Zstd compression\n"
 "\n"
@@ -3901,6 +3933,8 @@ static void print_help()
 "                      below may also follow --tar.\n"
 "  -d --tar ARC [M...] extract a .tar.zst (decompress + untar); member names\n"
 "                      select what to extract, like tar (dirs = whole subtree)\n"
+"  -d --tar -c ARC [M...]  write the members' CONTENTS to stdout instead of\n"
+"                      to disk (tar -xO; -O is accepted too)\n"
 "  -C, --directory DIR positional dir change, like tar: extraction root on -d,\n"
 "                      source root on create; binds the names that follow it\n"
 "  --write-threads N   parallel file writers for -d --tar (default: min(-T,16))\n"
@@ -4022,6 +4056,7 @@ static void print_help()
 // tuning notes, and runnable examples.
 static void print_help_long()
 {
+  gz_stdout_will_be_written();
   std::cout <<
 "gzstd " << GZSTD_VERSION << " — hybrid CPU+GPU Zstd compression\n"
 "\n"
@@ -4142,6 +4177,17 @@ static void print_help_long()
 "============================================================\n"
 "  -c\n"
 "     Write to stdout.  Implied when reading from stdin.\n"
+"     With -d --tar it means what tar's -O means: see -d --tar below.\n"
+"     A file behind a redirected stdout is the caller's: gzstd appends at\n"
+"     the descriptor's position and truncates nothing, so `gzstd -c a b\n"
+"     > f` and `{ gzstd -c a; gzstd -c b; } > f` hold both outputs.  A\n"
+"     run whose stdout is ALSO one of the files it reads (an input, the\n"
+"     -D dictionary, a list file) is refused (exit 2).\n"
+"     If a run FAILS, where it leaves the descriptor is best effort:\n"
+"     after gzstd's own error exit or SIGINT/SIGTERM/SIGHUP the next\n"
+"     writer lands after the partial output (past a gap, with\n"
+"     --preallocate); after SIGKILL or a crash it lands on top of it.\n"
+"     Treat the file from a failed run as garbage either way.\n"
 "\n"
 "  -o, --output FILE\n"
 "     Explicit output path.  Overrides the default (input + .zst on\n"
@@ -4414,6 +4460,16 @@ static void print_help_long()
 "     For inputs over 4 GiB on a <6.4 kernel, gzstd therefore defaults\n"
 "     to fread; on 6.4+ kernels mmap stays on (zero-copy wins there).\n"
 "     --mmap / --no-mmap force the choice and override the auto-gate.\n"
+"     AN INPUT THAT CHANGES WHILE IT IS READ: gzstd archives what it\n"
+"     reads.  If another process SHORTENS the file mid-run, the pooled\n"
+"     and O_DIRECT readers reach the new end, archive the bytes read up\n"
+"     to it and exit 0, as zstd does; the mmap reader instead dies of\n"
+"     SIGBUS (exit by signal, partial output removed).  Neither is\n"
+"     treated as an error that gzstd detects: the size seen at open is\n"
+"     not a promise (some filesystems report sizes that are not the\n"
+"     file's length), so do not compress a file that is being rewritten.\n"
+"     (--tar does notice: a member that changes is reported and the run\n"
+"     exits 1.)\n"
 "\n"
 "  --direct-read / --no-direct-read    (default: off)\n"
 "     Read the input with O_DIRECT: transfer straight from disk into an\n"
@@ -4708,6 +4764,17 @@ static void print_help_long()
 "         gzstd -d --tar backup.tar.zst etc/nginx -C /srv www/site1\n"
 "     extracts etc/nginx under the current directory and www/site1 under\n"
 "     /srv.  `-l --tar ARCHIVE MEMBER...` filters the listing the same way.\n"
+"\n"
+"  -d --tar -c ARCHIVE [MEMBER...]      (also spelled -O, as in tar)\n"
+"     Extract to standard output: the CONTENTS of every selected regular\n"
+"     member, concatenated in archive order, and nothing written to\n"
+"     disk -- what `tar -xO` does.  Directories, links and special files\n"
+"     contribute nothing.  A sparse member is written in full, with\n"
+"     zeros where its holes are.  Example:\n"
+"         gzstd -d --tar -c backup.tar.zst etc/hosts | grep example\n"
+"     On an indexed archive only the frames holding the selected\n"
+"     members are read.  A member name that matches nothing is an error\n"
+"     (exit 1), as on a normal extraction.\n"
 "\n"
 "  -C, --directory DIR\n"
 "     Positional directory change, like tar's.  On extract (-d --tar) it\n"
@@ -5066,9 +5133,21 @@ static void print_help_long()
 "     reason.  Default is auto.\n"
 "\n"
 "  -M N, --memlimit=N, --memory=N    [all modes]\n"
-"     Memory usage limit in MiB (zstd-compatible).  On decompression,\n"
-"     frames requiring a window larger than N MiB are rejected (via\n"
-"     ZSTD_d_windowLogMax) — a hard limit.\n"
+"     Memory usage limit.  A bare N is MiB; a size with a unit is read\n"
+"     as zstd reads it (512MB, 2G, 64MiB; K, M and G are powers of 1024)\n"
+"     and rounded up to a whole MiB.  NOTE: zstd reads a BARE number as\n"
+"     bytes; here it is MiB.\n"
+"     On DECOMPRESSION (-d, -t, and -d/-t --tar) it is the largest window\n"
+"     a frame may need, exactly as in zstd: a frame whose header declares\n"
+"     a larger window is refused before it is decoded, with exit 1 and a\n"
+"     message naming the limit that would decode it, e.g.\n"
+"         frame requires too much memory for decoding: its window is\n"
+"         8388608 bytes (8 MiB), and the limit ... is 4 MiB.\n"
+"     The window is a property of how the data was compressed (level 3\n"
+"     uses 2 MiB, level 19 uses 8 MiB, zstd --long=27 up to 128 MiB),\n"
+"     not of the file's size.  Without -M there is no limit (zstd's own\n"
+"     default is 128 MiB).  Before v0.17.89 the limit was set but never\n"
+"     applied to frames decoded in one piece, which is nearly all of them.\n"
 "     On COMPRESSION it is NOT a hard process-memory limit: it constrains\n"
 "     only the AUTOMATIC frame-throttle calculation.  Effective in-flight\n"
 "     memory can still exceed N MiB, because the 32-frame safety floor and\n"
@@ -5336,6 +5415,7 @@ static void print_help_long()
 "\n"
 "  MAPPED — these do what you expect:\n"
 "     -H (= --help), --decompress / --uncompress (= -d), --test (= -t),\n"
+"     -z / --compress (compress: the default; the last of -d/-t/-z wins),\n"
 "     --keep (= -k), --force (= -f), --stdout / --to-stdout (= -c),\n"
 "     --verbose (= -v), --single-thread (= -T 1), -0 (default level),\n"
 "     -M / --memlimit / --memory, --mmap=on|off, --preallocate=on|off,\n"
@@ -5343,7 +5423,9 @@ static void print_help_long()
 "     --no-dictID, --patch-from=OLD / --patch-from OLD on -d and -t,\n"
 "     --train, --train-cover, --train-fastcover, --train-legacy (with\n"
 "     --maxdict, --dictID, and -r / -B# for the sample set),\n"
-"     and bundled short flags such as -dc, -dkf, -dcf, -dD FILE.\n"
+"     and bundled short flags as zstd reads them: -dc, -dkf, -qf, -dq,\n"
+"     -19f, -T4q, -dvv, -dD FILE, -fo FILE (letters d t k f c z l r q v,\n"
+"     a level, T#, and D or o last).\n"
 "\n"
 "  PARTIALLY MAPPED:\n"
 "     --fast=N     selects level 1; N is ignored (N>1 warns).\n"
@@ -5377,6 +5459,7 @@ static void print_help_long()
 
 static void print_version()
 {
+  gz_stdout_will_be_written();
 #ifdef HAVE_NVCOMP
   std::cout << "gzstd " << GZSTD_VERSION << " (CPU + nvCOMP) MT-CPU + Hybrid scheduling\n";
 #else
@@ -5408,6 +5491,35 @@ static uint64_t parse_u64_value(const std::string & pref, const std::string & v)
     die_usage("value out of range for " + pref + ": " + v);
   }
   return 0; // unreachable; die_usage exits
+}
+// -M / --memlimit / --memory.  A bare number is MiB, as it always was here.  A
+// number with a unit is zstd's spelling and means what it means to zstd (K, M,
+// G, each optionally followed by B or iB, all powers of 1024), rounded up to a
+// whole MiB: `--memory=512MB`, `-M2G`.  Until v0.17.89 a suffix was "invalid
+// value".  (zstd reads a BARE number as bytes; that one difference is kept,
+// and documented, because changing it would silently change every existing
+// gzstd command line that sets a limit.)
+static size_t parse_mem_mib(const std::string & pref, const std::string & v)
+{
+  size_t d = 0;
+  while (d < v.size() && v[d] >= '0' && v[d] <= '9') ++d;
+  if (d == v.size()) return (size_t)parse_u64_value(pref, v);
+  const uint64_t n = parse_u64_value(pref, v.substr(0, d));
+  std::string u = v.substr(d);
+  int shift = -1;
+  if (!u.empty()) {
+    const char c = u[0];
+    shift = (c == 'K' || c == 'k') ? 10 : (c == 'M' || c == 'm') ? 20
+          : (c == 'G' || c == 'g') ? 30 : -1;
+    u = u.substr(1);
+  }
+  if (shift < 0 || !(u.empty() || u == "B" || u == "iB" || u == "b" || u == "ib"))
+    die_usage("invalid value for " + pref + ": " + v
+              + " (a number of MiB, or a size such as 512MB or 2G)");
+  if (n > (UINT64_MAX >> shift)) die_usage("value out of range for " + pref + ": " + v);
+  const uint64_t bytes = n << shift;
+  const uint64_t mib = (bytes + (1ull << 20) - 1) >> 20;
+  return (size_t)std::max<uint64_t>(mib, n ? 1 : 0);
 }
 static int parse_int_value(const std::string & pref, const std::string & v)
 {
@@ -7367,7 +7479,7 @@ static std::string gz_cufile_config_text(std::string * config_out)
   {
     struct stat cst {};
     if (::stat(path.c_str(), &cst) == 0)
-      gz_refuse_if_stdout_file(cst, "the cuFile configuration " + path);
+      gz_note_side_input(cst, "the cuFile configuration " + path);
   }
   const std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   std::string t;
@@ -7495,6 +7607,12 @@ static int gz_cufile_config_stats_level()
 // former exits safely with statistics on.  Set once, before parse_args.
 static bool g_cufile_loaded_at_startup = false;
 
+// Set when the cuFile statistics re-exec failed: an ordinary exit would run a
+// library destructor that crashes.  main() leaves through _Exit instead.
+static std::atomic<bool> g_cufile_exit_unsafe{false};
+
+static bool gz_raw_option_takes_value(const std::string & a);  // shared with parse_args below
+
 // This decision must precede parse_args: --files-from and --exclude-from can
 // consume stdin (or a FIFO) while parsing.  The raw argv is passed unchanged to
 // execv, and the child must be the first process to consume those lists.  Only
@@ -7507,13 +7625,7 @@ static bool gz_cufile_preload_requested(int argc, char ** argv, Options & opt)
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i] ? argv[i] : "";
     if (a == "--") break;
-    if (a == "-o" || a == "--output" || a == "--exclude" || a == "--exclude-from"
-        || a == "-X" || a == "--files-from" || a == "--format" || a == "-C"
-        || a == "--directory" || a == "--verify-engine" || a == "--stats-json"
-        || a == "--pinned" || a == "--gpu-order" || a == "--patch-from"
-        || a == "-D" || a == "--dict" || a == "--dictionary"
-        || a == "--filelist" || a == "--output-dir-flat"
-        || a == "--output-dir-mirror" || a == "--trace") {
+    if (gz_raw_option_takes_value(a)) {
       if (i + 1 < argc) ++i;
       continue;
     }
@@ -7594,14 +7706,26 @@ static void gz_cufile_stats_preload(int argc, char ** argv)
   vlog(V_VERBOSE, opt, "[GDS] cufile_stats=" + std::to_string(level) + " in the cuFile config: "
        "re-executing with " + path + " preloaded (a dlopen'ed libcufile crashes writing its "
        "statistics at exit)\n");
-  ::execv("/proc/self/exe", argv);
+  // Test-only: GZSTD_DEBUG_FAIL_CUFILE_REEXEC makes the re-exec "fail" (as it
+  // does where /proc/self/exe cannot be executed), to reach the path below.
+  if (std::getenv("GZSTD_DEBUG_FAIL_CUFILE_REEXEC")) errno = ENOENT;
+  else ::execv("/proc/self/exe", argv);
   const int e = errno;              // still here: exec failed; undo and carry on
   if (had_preload) ::setenv("LD_PRELOAD", orig.c_str(), 1); else ::unsetenv("LD_PRELOAD");
   ::unsetenv("GZSTD_CUFILE_PRELOAD_ORIG");
   ::unsetenv("GZSTD_CUFILE_PRELOADED");
+  // CARRY ON, AND LEAVE BY THE SIDE DOOR (v0.17.89).  This used to warn that the
+  // run would "likely crash at exit (status 139)" and then walk into it: a
+  // dlopen'ed libcufile with statistics on crashes in its exit-time destructor,
+  // after the output is complete -- a finished job reported as a crash.  The
+  // work does not need the re-exec, only the exit does.  So do the work, and
+  // main() leaves through _Exit, which runs no library destructor (it does its
+  // own cleanup first, exactly as the abandoned-GPU exit already does).
+  g_cufile_exit_unsafe.store(true, std::memory_order_relaxed);
   vlog(V_ERROR, opt, std::string("gzstd: warning: cufile_stats is on and re-executing with "
-       "libcufile preloaded failed (") + std::strerror(e) + "); libcufile will likely crash "
-       "this run at exit (exit status 139) after the output is complete\n");
+       "libcufile preloaded failed (") + std::strerror(e) + "); the run continues, and "
+       "gzstd will exit without running libcufile's exit handler, which would crash "
+       "(its statistics dump is skipped)\n");
 }
 
 // At a clean exit (atexit, and main's abandoned-GPU _Exit): drop the log if cuFile
@@ -7742,7 +7866,7 @@ static AdaptProfileRead adapt_profile_read_fd(int fd, AdaptJv & root)
   if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { ::close(fd); return AdaptProfileRead::UNUSABLE; }
   // Stdout redirected onto the profile itself: the archive would be written
   // there and the save at the end would then rename a new profile over it.
-  gz_refuse_if_stdout_file(st, "the --adapt profile");
+  gz_note_side_input(st, "the --adapt profile");
   std::string text;
   char buf[64 * 1024];
   bool ok = true;
@@ -9844,18 +9968,60 @@ public:
   // own description and advance its position exactly as a plain writer would.
   // Returns false if the reopen is refused (no /proc, or the file's mode no
   // longer allows writing): the caller then writes through stdio instead.
-  bool adopt_fd_detached(int caller_fd) {
+  //
+  // `base` (v0.17.89) is where this output begins in the file: not zero when
+  // something is already there -- an earlier input of the same `-c` run, or an
+  // earlier command in the same redirection.  v0.17.88 sent those to the
+  // buffered stdio writer, which MEASURED 3.5x slower than this one on a
+  // redirected file (130 GiB decompressed: 37-38 s here against 133-136 s; 65
+  // GiB compressed: 21-22 s against 66-74 s; flush included, no overlap).
+  //
+  // O_DIRECT needs block-aligned file offsets and `base` is wherever the last
+  // writer stopped.  So the writer's own coordinate space starts at the block
+  // boundary BELOW base (file_base_), and the bytes already in that block
+  // (pre_ of them) are read back and placed at the front of the first buffer:
+  // the first aligned write rewrites them unchanged, together with the new
+  // data that follows.  Every offset the write thread uses is then writer-space
+  // + file_base_, and aligned.  The caller must have checked that the file ENDS
+  // at `base`: nothing may lie beyond it.
+  bool adopt_fd_detached(int caller_fd, uint64_t base = 0) {
     if (caller_fd < 0) return false;
     char link[64];
     std::snprintf(link, sizeof(link), "/proc/self/fd/%d", caller_fd);
+    const uint64_t abase = base & ~(uint64_t)(ALIGN - 1);
+    const size_t   pre   = (size_t)(base - abase);
+    std::vector<char> head(pre);
+    if (pre > 0) {
+      // Through its own buffered description, so it sees what the last writer
+      // left whether that went through the page cache or around it.
+      const int rfd = ::open(link, O_RDONLY | O_CLOEXEC);
+      if (rfd < 0) return false;
+      size_t got = 0;
+      while (got < pre) {
+        const ssize_t r = ::pread(rfd, head.data() + got, pre - got, (off_t)(abase + got));
+        if (r > 0) { got += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break;
+      }
+      ::close(rfd);
+      if (got != pre) return false;
+    }
     const int d = ::open(link, O_WRONLY | O_DIRECT | O_CLOEXEC);
     if (d < 0) return false;
     fd_ = d;
     if (!init_after_open_()) return false;   // init closed d
+    file_base_ = abase;
+    pre_ = pre;
+    if (pre > 0) {
+      std::memcpy(bufs_[cur_bi_], head.data(), pre);
+      buf_used_ = pre;
+    }
     caller_fd_ = caller_fd;
     handed_back_ = false;
     return true;
   }
+  // Where this output begins in the file (0 unless adopted with a base).
+  uint64_t base_offset() const { return file_base_ + pre_; }
   // >= 0 when this writer was adopted detached: the descriptor to hand back.
   int caller_fd() const { return caller_fd_; }
 
@@ -9905,6 +10071,7 @@ private:
     }
     buf_used_ = 0; cur_bi_ = 0;
     logical_written_ = 0; phys_written_ = 0;
+    file_base_ = 0; pre_ = 0;
     plain_after_external_prefix_ = false;
     werr_.store(false, std::memory_order_relaxed); wt_done_ = false;
     free_.clear(); for (int i = 1; i < NBUF; ++i) free_.push_back(i);  // 0 is the first fill buffer
@@ -9974,7 +10141,7 @@ public:
       // — and returning true here made the caller accept it, exit 0, and with
       // --rm delete the source.  A failure to shorten the output is an I/O
       // error like any other.
-      if (::ftruncate(fd_, (off_t)logical_written_) != 0) {
+      if (::ftruncate(fd_, (off_t)(file_base_ + logical_written_)) != 0) {
         werr_.store(true, std::memory_order_relaxed);
         return false;
       }
@@ -9982,7 +10149,7 @@ public:
     if (caller_fd_ >= 0) {
       // Detached: nothing to un-flag; position the caller's descriptor and hand
       // it back for the trailers (see adopt_fd_detached).
-      if (::lseek(caller_fd_, (off_t)logical_written_, SEEK_SET) == (off_t)-1) {
+      if (::lseek(caller_fd_, (off_t)(file_base_ + logical_written_), SEEK_SET) == (off_t)-1) {
         gz_note_write_errno(errno);
         werr_.store(true, std::memory_order_relaxed);
         return false;
@@ -10020,6 +10187,7 @@ public:
   // Falls back gracefully on filesystems that don't support fallocate.
   bool preallocate(uint64_t size) {
     if (fd_ < 0 || size == 0) return false;
+    if (file_base_ != 0 || pre_ != 0) return false;   // only a fresh output is preallocated
 #ifdef __linux__
     int ret = ::fallocate(fd_, 0, 0, (off_t)size);
     if (ret == 0) { preallocated_ = size; return true; }
@@ -10046,7 +10214,8 @@ public:
   // turning a future mixed-writer call into overlapping output.
   bool adopt_external_prefix(uint64_t bytes) {
     std::lock_guard<std::mutex> lk(mx_);
-    if (fd_ < 0 || buf_used_ != 0 || logical_written_ != 0 || !ops_.empty())
+    if (fd_ < 0 || buf_used_ != 0 || logical_written_ != 0 || !ops_.empty()
+        || file_base_ != 0 || pre_ != 0)   // only an output that starts at zero
       return false;
     // If the last known-size frame ends off the O_DIRECT grid, every tail
     // pwrite starts unaligned.  Open the held inode through procfs now, before
@@ -10179,6 +10348,12 @@ private:
   uint64_t logical_written_ = 0;   // caller-side logical position (enqueued writes + seeks)
   uint64_t phys_written_ = 0;      // write-thread physical position (hole-punch offset)
   uint64_t preallocated_ = 0;
+  // adopt_fd_detached(fd, base): writer-space offset 0 is file offset file_base_
+  // (block-aligned), and the first pre_ bytes of writer space are the file's
+  // own bytes [file_base_, base), read back so the first block can be rewritten
+  // whole.  Both are 0 for every other kind of output.
+  uint64_t file_base_ = 0;
+  uint64_t pre_ = 0;
   enum OpKind { OP_WRITE, OP_SEEK };
   struct WOp { OpKind kind; int bi; size_t len; size_t tail; uint64_t off; };
   std::mutex mx_;
@@ -10208,7 +10383,7 @@ private:
 #ifdef __linux__
       if (preallocated_ > 0 && op.len > 0)  // punch the skipped region back to a hole
         (void)::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                          (off_t)op.off, (off_t)op.len);
+                          (off_t)(file_base_ + op.off), (off_t)op.len);
 #endif
       // Positional writes need no lseek; the op's offset already accounts
       // for the hole.
@@ -10219,13 +10394,13 @@ private:
       bool ok;
       if (plain_after_external_prefix_) {
         ok = plain_fd_v_ >= 0
-          && pwrite_plain_(plain_fd_v_, b, op.len, (off_t)op.off);
+          && pwrite_plain_(plain_fd_v_, b, op.len, (off_t)(file_base_ + op.off));
       } else {
-        ok = (body == 0) || pwrite_all(b, body, (off_t)op.off);
+        ok = (body == 0) || pwrite_all(b, body, (off_t)(file_base_ + op.off));
         if (ok && op.tail > 0) {            // final unaligned tail: plain fd
           int pfd = plain_fd_();
           ok = pfd >= 0 && pwrite_plain_(pfd, b + body, op.tail,
-                                         (off_t)(op.off + body));
+                                         (off_t)(file_base_ + op.off + body));
         }
       }
       g_odirect_write_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
@@ -14064,7 +14239,7 @@ static void load_dictionaries(const Options & opt)
   struct stat st {};
   if (::fstat(fileno(f), &st) != 0)
     die_io("cannot stat " + what + ": " + p + " (" + std::strerror(errno) + ")");
-  gz_refuse_if_stdout_file(st, what + " " + p);
+  gz_note_side_input(st, what + " " + p);
   g_dep_known = true; g_dep_dev = st.st_dev; g_dep_ino = st.st_ino;
   g_dep_what = what; g_dep_path = p;
   // A FIFO or device would be read to EOF with no size to check first, and
@@ -14273,6 +14448,7 @@ static int run_train(const Options & opt)
   // exit 0 -- losing a dictionary existing archives may need.  Refused before
   // any training work.  (zstd --train does the same replace; gzstd need not.)
   const bool train_stdout = opt.to_stdout || opt.output_dash;
+  if (train_stdout) gz_stdout_will_be_written();   // a side input must not be the stdout file
   const std::string out_path = train_stdout ? std::string("stdout")
                              : (opt.output_named ? opt.output : std::string("dictionary"));
   struct stat ost {};
@@ -14507,6 +14683,56 @@ static std::string decode_error_hint(size_t err, const void * frame, size_t len)
   return "\n  (re-run with --keep-going to recover what is readable and report the damage)";
 }
 
+// -M / --memlimit / --memory ON DECOMPRESSION IS ENFORCED (v0.17.89), as in zstd.
+//
+// The limit is the largest WINDOW a frame may need.  zstd refuses a frame whose
+// header declares a larger one ("Frame requires too much memory for decoding").
+// gzstd set the same limit on its decode contexts and then never tripped it:
+// the limit only binds zstd's STREAMING decoder, and nearly every frame here is
+// decoded in one shot into a buffer of its declared size, which that limit does
+// not consult.  MEASURED: a frame with a 30.9 MiB window decoded at -M4, from a
+// file and from standard input, where `zstd --memory=4MB` refuses it -- while
+// --help called the option "a hard limit".
+//
+// So each frame's header is checked where it is about to be decoded
+// (gz_enforce_window_limit), and the streaming contexts get the EXACT limit
+// (ZSTD_DCtx_setMaxWindowSize) instead of the power of two below it; a refusal
+// from either is reported the same way, exit 1, with the size to ask for.
+// 0 = no limit, the default (zstd's own default is 128 MiB; gzstd has none).
+static std::atomic<uint64_t> g_mem_limit_bytes{0};
+
+static void gz_die_window_too_large(uint64_t window)
+{
+  const uint64_t lim = g_mem_limit_bytes.load(std::memory_order_relaxed);
+  const uint64_t need_mib = window ? (window + ONE_MIB - 1) / ONE_MIB : 0;
+  std::string msg = "frame requires too much memory for decoding";
+  if (window)
+    msg += ": its window is " + std::to_string(window) + " bytes ("
+         + std::to_string(need_mib) + " MiB)";
+  msg += ", and the limit set with -M/--memory is " + std::to_string(lim / ONE_MIB) + " MiB.";
+  if (window) msg += "  Decode it with -M" + std::to_string(need_mib) + " or more, or without -M";
+  die(msg, EXIT_ERROR);
+}
+
+// `frame` points at a zstd frame's first bytes (the header is all that is read).
+static inline void gz_enforce_window_limit(const void * frame, size_t n)
+{
+  const uint64_t lim = g_mem_limit_bytes.load(std::memory_order_relaxed);
+  if (lim == 0 || !frame || n < 5) return;
+  ZSTD_frameHeader zfh;
+  if (ZSTD_getFrameHeader(&zfh, frame, n) != 0) return;   // unparsable or short: the decoder reports it
+  if (zfh.frameType == ZSTD_skippableFrame) return;
+  if (zfh.windowSize > lim) gz_die_window_too_large(zfh.windowSize);
+}
+
+// A streaming decode refused a frame for its window: same message, same exit.
+static inline void gz_die_if_window_error(size_t zerr)
+{
+  if (ZSTD_isError(zerr) && ZSTD_getErrorCode(zerr) == ZSTD_error_frameParameter_windowTooLarge
+      && g_mem_limit_bytes.load(std::memory_order_relaxed) != 0)
+    gz_die_window_too_large(0);
+}
+
 // Apply --memlimit to a decompression context via ZSTD_d_windowLogMax.
 // zstd's decompressor refuses to allocate window buffers larger than 2^wlog,
 // so a user who passes `-M 50` gets streams with >64 MiB windows rejected
@@ -14516,12 +14742,11 @@ static void apply_mem_limit_to_dctx(ZSTD_DCtx * dctx, const Options & opt)
 {
   if (!dctx || opt.mem_limit_mib == 0) return;
   uint64_t bytes = uint64_t(opt.mem_limit_mib) * ONE_MIB;
-  // floor(log2(bytes)) — clamped to zstd's accepted range [10, 31].
-  int wlog = 0;
-  for (uint64_t b = bytes; b >>= 1; ) ++wlog;
-  if (wlog < 10) wlog = 10;   // zstd minimum
-  if (wlog > 31) wlog = 31;   // zstd maximum (2 GiB window)
-  size_t st = ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, wlog);
+  // The EXACT limit, as the zstd CLI sets it (v0.17.89).  This used to be
+  // windowLogMax = floor(log2(bytes)), so -M100 meant 64 MiB to a streamed frame
+  // and 100 MiB to nothing else; gz_enforce_window_limit compares exact sizes.
+  const uint64_t zmax = (uint64_t)1 << 31;                 // zstd's largest window
+  size_t st = ZSTD_DCtx_setMaxWindowSize(dctx, (size_t)std::min<uint64_t>(std::max<uint64_t>(bytes, 1024), zmax));
   if (ZSTD_isError(st) && opt.verbosity >= V_ERROR) {
     std::fprintf(stderr, "gzstd: warning: could not apply --memlimit (%s)\n",
                  ZSTD_getErrorName(st));
@@ -14909,6 +15134,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
   size_t frame_at = 0;   // where the frame in progress starts (for the error hint)
   while (zin.pos < zin.size) {
     ret = ZSTD_decompressStream(dctx, &zout, &zin);
+    gz_die_if_window_error(ret);
     if (ZSTD_isError(ret))
       die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
                + decode_error_hint(ret, input.data() + frame_at, input.size() - frame_at));
@@ -15016,6 +15242,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
       ZSTD_outBuffer zout { outbuf.data(), outbuf.size(), 0 };
       const size_t consumed_from = zin.pos;
       ret = ZSTD_decompressStream(dctx, &zout, &zin);
+      gz_die_if_window_error(ret);
       if (ZSTD_isError(ret)) {
         // The old message here told the user to "re-run with --keep-going" —
         // from a decoder that ignored --keep-going, so following that advice
@@ -16677,6 +16904,7 @@ static void cpu_decomp_worker(
                  "is corrupt and --keep-going cannot recover past an un-allocatable frame");
       }
       std::memset(out_buf->data(), 0, out_buf->size());
+      gz_enforce_window_limit(t.ptr(), t.len());
       const unsigned char * fhk = (const unsigned char *)t.ptr();
       const bool own_ck_k = fhk && t.len() >= 9 && (fhk[4] & 0x04);
       size_t rc = ZSTD_decompressDCtx(tl_dctx, out_buf->data(), out_buf->size(),
@@ -16741,6 +16969,7 @@ static void cpu_decomp_worker(
         ZSTD_outBuffer zout { chunk->data(), chunk->size(), 0 };
         size_t zin_before = zin.pos;
         size_t ret = ZSTD_decompressStream(tl_dctx, &zout, &zin);
+        gz_die_if_window_error(ret);
         if (ZSTD_isError(ret))
           die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
                + decode_error_hint(ret, t.ptr(), t.len()));
@@ -16801,6 +17030,7 @@ static void cpu_decomp_worker(
       }
       // Read the Content_Checksum_flag while the input is still held:
       // release_input() below invalidates these bytes.
+      gz_enforce_window_limit(t.ptr(), t.len());
       const unsigned char * fhp = (const unsigned char *)t.ptr();
       const bool own_ck = fhp && t.len() >= 9 && (fhp[4] & 0x04);
       actual = ZSTD_decompressDCtx(tl_dctx, out_buf->data(), out_buf->size(),
@@ -16917,6 +17147,12 @@ static void cpu_decomp_worker(
  correct (CPU and GPU emit interchangeable zstd frames).  Blocks until the
  queue is drained; the caller then exits and normal teardown proceeds.
 ======================================================================*/
+// How many times a GPU-only pipeline handed its remaining frames to the CPU in
+// this process.  --calibrate reads it: a "gpu decompress" pass that finished on
+// the CPU measured the CPU, and decompression does not set g_gpu_failed_restart
+// the way a compress fault does (it finishes on the CPU instead of rebuilding).
+static std::atomic<int> g_gpu_cpu_rescue_runs{0};
+
 static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
                                   ResultStore * results, const Options & opt,
                                   Meter * m, FrameThrottle * bp,
@@ -16940,6 +17176,7 @@ static void gpu_only_cpu_fallback(bool decompress, TaskQueue * queue,
                                   // their work, and this said "all GPUs failed".
                                   int gpus_lost, int gpus_total)
 {
+  g_gpu_cpu_rescue_runs.fetch_add(1, std::memory_order_relaxed);
   // NOT EVERY STAGED PIPELINE HAS A COMPATIBLE CPU FALLBACK.  Pretending it
   // does is how a host-configuration problem turned into "ZSTD error: Src
   // size is incorrect" with exit 4.
@@ -17204,6 +17441,14 @@ static bool kernel_has_per_vma_locks();   // Linux >= 6.4; defined below
 // filesystem that in fact supports O_DIRECT.
 static const bool g_debug_mt_direct_einval = [] {
   const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT_EINVAL"); return e && *e == '1'; }();
+// Test-only: GZSTD_DEBUG_MT_PREAD_EIO=N makes the Nth pread of the parallel
+// decompress reader (1-based, counted across its threads) fail with EIO, as a
+// failing device would.  No filesystem here can be made to do that without
+// privileges, and the path it reaches reported a READ error as a DATA error
+// (exit 4 where the table says 3) until v0.17.89.
+static const long g_debug_mt_pread_eio = [] () -> long {
+  const char * e = std::getenv("GZSTD_DEBUG_MT_PREAD_EIO"); return e ? std::atol(e) : 0L; }();
+static std::atomic<long> g_debug_mt_pread_count{0};
 // Test-only companion for the SINGLE-reader fallback.  The first direct read is
 // trimmed to one complete frame; the next is refused with EINVAL, and after the
 // fallback seek the held buffered descriptor is closed so fread sets ferror.
@@ -17422,6 +17667,8 @@ static size_t stream_frames_to_queue_mt(
   std::atomic<uint64_t> direct_bytes_ok{0};
   const char * worker_fail_msg = nullptr;       // guarded by mtx; allocation-free
   bool resource_failed = false;          // guarded by mtx; not corrupt input
+  bool read_failed = false;              // guarded by mtx; a pread error, not corrupt input
+  int  read_errno = 0;
   bool stop = false;
 
   std::atomic<bool> readers_done_early{false};
@@ -17475,6 +17722,7 @@ static size_t stream_frames_to_queue_mt(
       uint64_t t0 = m ? now_ns() : 0;
       size_t got = 0;
       bool io_err = false;
+      int  io_errno_local = 0;
       bool short_read = false;
       while (got < want) {
         // O_DIRECT (v0.17.66) needs the OFFSET, the LENGTH and the BUFFER ADDRESS
@@ -17495,6 +17743,9 @@ static size_t stream_frames_to_queue_mt(
         // therefore untested -- and an untested fallback is the one that fails.
         ssize_t r;
         if (use_direct && g_debug_mt_direct_einval) { r = -1; errno = EINVAL; }
+        else if (g_debug_mt_pread_eio > 0
+                 && g_debug_mt_pread_count.fetch_add(1, std::memory_order_relaxed) + 1
+                    == g_debug_mt_pread_eio) { r = -1; errno = EIO; }
         else r = ::pread(use_direct ? dfd : fd, s.buf->p + got, req, off + (off_t)got);
         if (r < 0) {
           if (errno == EINTR) continue;
@@ -17514,6 +17765,7 @@ static size_t stream_frames_to_queue_mt(
             }
             continue;
           }
+          io_errno_local = errno;
           io_err = true; break;
         }
         if (r == 0) { short_read = true; break; }
@@ -17542,10 +17794,15 @@ static size_t stream_frames_to_queue_mt(
         std::lock_guard<std::mutex> lk(mtx);
         if (io_err || short_read) {
                       failed.store(true, std::memory_order_relaxed);
-                      if (fail_msg.empty() && !worker_fail_msg)
+                      if (fail_msg.empty() && !worker_fail_msg) {
                         worker_fail_msg = short_read
                             ? "unexpected end of input (parallel decompress reader)"
                             : "pread failed (parallel decompress reader)";
+                        // A READ error is exit 3, not corrupt data (exit 4): the
+                        // archive may be perfectly good on a device that is not.
+                        // An archive that ENDS early stays a data error.
+                        if (io_err) { read_failed = true; read_errno = io_errno_local; }
+                      }
                       stop = true; }
         else { s.idx = i; s.len = got; s.ready = true; }
       }
@@ -17652,6 +17909,7 @@ static size_t stream_frames_to_queue_mt(
   auto emit = [&](const char * p, size_t fc,
                   const std::shared_ptr<BlockBuf> * view_of,
                   std::vector<char> * take_from) -> bool {
+    gz_enforce_window_limit(p, fc);
     unsigned long long dz = ZSTD_getFrameContentSize(p, fc);
     if (dz == ZSTD_CONTENTSIZE_UNKNOWN || dz == ZSTD_CONTENTSIZE_ERROR) {
       // Complete frame but no content-size header (e.g. a zstd-streamed segment
@@ -17931,12 +18189,15 @@ static size_t stream_frames_to_queue_mt(
   }
 
   if (failed.load(std::memory_order_relaxed)) {
-    std::string why; bool resource = false;
+    std::string why; bool resource = false, read_io = false; int read_io_errno = 0;
     { std::lock_guard<std::mutex> lk(mtx);
       why = fail_msg.empty() && worker_fail_msg ? worker_fail_msg : fail_msg;
-      resource = resource_failed; }
+      resource = resource_failed; read_io = read_failed; read_io_errno = read_errno; }
     if (resource)
       die(why.empty() ? "parallel decompress reader allocation failed" : why);
+    if (read_io)
+      die_io((why.empty() ? std::string("parallel decompress reader read failed") : why)
+             + (read_io_errno ? std::string(": ") + std::strerror(read_io_errno) : std::string()));
     die_data(why.empty() ? "parallel decompress reader failed" : why);
   }
   if (max_frame_decomp_out) *max_frame_decomp_out = max_frame_decomp;
@@ -18322,6 +18583,7 @@ static size_t stream_frames_to_queue(
       if (frame_comp > remaining) break;
 
       // Get decompressed size from the frame header
+      gz_enforce_window_limit(ptr, remaining);
       unsigned long long frame_decomp = ZSTD_getFrameContentSize(ptr, remaining);
       if (frame_decomp == ZSTD_CONTENTSIZE_UNKNOWN ||
           frame_decomp == ZSTD_CONTENTSIZE_ERROR) {
@@ -18785,7 +19047,7 @@ public:
     if (!dctx_) die("failed to create ZSTD_DStream for --verify");
     ZSTD_initDStream(dctx_);
     attach_verify_dict(dctx_);   // after init, which would detach it
-    apply_mem_limit_to_dctx_stream();
+    allow_full_window();  // verifies our own compressed output, not user input
     th_ = std::thread(&StreamVerifier::run, this);
   }
   ~StreamVerifier() {
@@ -18850,15 +19112,11 @@ public:
 
 private:
   static constexpr size_t MAXQ = 64;
-  void apply_mem_limit_to_dctx_stream() {
-    if (opt_.mem_limit_mib > 0) {
-      unsigned wl = 10;
-      uint64_t cap = (uint64_t)opt_.mem_limit_mib * ONE_MIB;
-      while (wl < 31 && ((uint64_t)1 << (wl + 1)) <= cap) ++wl;
-      ZSTD_DCtx_setParameter(dctx_, ZSTD_d_windowLogMax, (int)wl);
-    } else {
-      ZSTD_DCtx_setParameter(dctx_, ZSTD_d_windowLogMax, 31);  // match ultra windows
-    }
+  void allow_full_window() {
+    // -M caps compression's in-flight memory.  It must not reject the frame
+    // this run just wrote when --verify decodes it for a round-trip check
+    // (`--sliding-window --verify -19 -M4` did: the window is 8 MiB).
+    ZSTD_DCtx_setParameter(dctx_, ZSTD_d_windowLogMax, 31);  // match ultra windows
   }
   void run() {
     std::vector<char> plain(1 << 20);
@@ -22830,6 +23088,10 @@ struct PoolGpuDecoder {
               std::vector<FrameBuf> & out,
               std::vector<char> & rescue) {
     const size_t n = comps.size();
+    // The CPU seek decoders check each frame's window against -M themselves.
+    // This batch can succeed entirely on nvCOMP, so check its inputs here,
+    // before any transfer (see gz_enforce_window_limit).
+    for (size_t i = 0; i < n; ++i) gz_enforce_window_limit(comps[i], cszs[i]);
     out.assign(n, nullptr);
     rescue.assign(n, 0);
     if (n == 0) return true;
@@ -23214,6 +23476,7 @@ public:
   // the operation Meter the governor watches, never byte counts.  null → no
   // live flush (the -v-only pool atomics still accrue for the [WRITER] line).
   void set_sink_meter(Meter * sm) { sink_meter_ = sm; }
+  void set_cat_stdout() { cat_stdout_ = true; }
 
   void run(int read_fd) {
     uint64_t t0 = now_ns();
@@ -24002,7 +24265,11 @@ private:
   const Options & opt_; Meter * m_; bool as_root_;   // extraction root = roots_[0]
   bool validate_only_ = false;
   bool list_only_ = false;
-  bool read_only() const { return validate_only_ || list_only_; }  // no writer pool
+  // -d --tar -c / -O (v0.17.89): no filesystem is touched, so it is a read-only
+  // walk like -t and -l -- but each selected regular member's CONTENT is
+  // written to standard output, in archive order, as `tar -xO` does.
+  bool cat_stdout_ = false;
+  bool read_only() const { return validate_only_ || list_only_ || cat_stdout_; }  // no writer pool
 
   // Member selection (see set_members).  Every path-resolving helper takes a
   // root index into roots_ (default 0 = the ctor's dest_fd) so a member bound to its own
@@ -25743,6 +26010,7 @@ private:
     // checksum was already verified in parse(); count the member, list it if
     // requested, and consume its data so the parser stays aligned.  A short read
     // here (truncated archive) is caught by parse().
+    if (cat_stdout_) { cat_entry(r, rel, e, pad); return; }
     if (read_only()) {
       // ...except a sparse member's MAP, which -t must check as extraction does
       // (see sparse_map_fits): an archive whose map would lose data on extract
@@ -25893,6 +26161,84 @@ private:
   // PAX GNU.sparse.1.0: the segment map is a text block ("numblocks\noff\nlen\n…")
   // at the start of the file data, NUL-padded to a 512 multiple.  Read whole
   // 512-blocks (so map bytes consumed is always 512-aligned), parsing decimals.
+  // ---- -d --tar -c / -O: member contents to standard output ---------------
+  // What `tar -xO` does: every selected REGULAR member's bytes, concatenated in
+  // archive order, and nothing for directories, links or special files (they
+  // have no content to give; a hard link's data belongs to its first name).
+  // A sparse member is written in full, zeros where its holes are -- a stream
+  // cannot hold a hole.  A failed write is fatal like any other -c output.
+  void cat_write(const char * p, size_t n) {
+    while (n > 0) {
+      const ssize_t w = ::write(STDOUT_FILENO, p, n);
+      if (w > 0) { p += w; n -= (size_t)w; continue; }
+      if (w < 0 && errno == EINTR) continue;
+      gz_note_write_errno(w < 0 ? errno : EIO);
+      die_io(gz_write_fail("stdout write failed"));
+    }
+  }
+  void cat_zeros(uint64_t n) {
+    static const char z[1 << 16] = {0};
+    while (n > 0) { const size_t k = (size_t)std::min<uint64_t>(n, sizeof z); cat_write(z, k); n -= k; }
+  }
+  // Copy `n` stream bytes to stdout; false if the stream ends first.
+  bool cat_copy(StreamReader & r, uint64_t n) {
+    char buf[1 << 16];
+    while (n > 0) {
+      const size_t got = r.read_some(buf, (size_t)std::min<uint64_t>(n, sizeof buf));
+      if (!got) return false;
+      cat_write(buf, got);
+      n -= got;
+    }
+    return true;
+  }
+  void cat_entry(StreamReader & r, const std::string & rel, const InEntry & e, uint64_t pad) {
+    if (e.is_sparse) {
+      if (opt_.keep_going && e.size)
+        g_member_ranges.add(rel, r.consumed_total, e.size);
+      uint64_t used = 0;
+      std::vector<std::pair<uint64_t,uint64_t>> data_map;
+      const std::vector<std::pair<uint64_t,uint64_t>> * mapp = &e.sparse_map;
+      if (e.sparse_map_in_data) {
+        if (!read_pax_sparse_map(r, data_map, used, e.size)) { fail_data(rel, "bad PAX sparse map"); return; }
+        mapp = &data_map;
+      }
+      bool ok = sparse_map_fits(*mapp, e.real_size, e.size - used);
+      uint64_t pos = 0, consumed = used;
+      for (size_t i = 0; ok && i < mapp->size(); ++i) {
+        const uint64_t base = (*mapp)[i].first, len = (*mapp)[i].second;
+        if (base < pos) { ok = false; break; }          // overlapping / out of order: not streamable
+        cat_zeros(base - pos);
+        if (!cat_copy(r, len)) { fail_data(rel, "truncated sparse file data"); return; }
+        consumed += len; pos = base + len;
+      }
+      if (!ok) {
+        fail_data(rel, "invalid sparse map (a segment lies outside the file, or the map is not in order)");
+        r.skip(e.size - consumed); r.skip(pad);
+        return;
+      }
+      cat_zeros(e.real_size - pos);
+      r.skip(e.size - consumed); r.skip(pad);
+      ++vfiles_; vbytes_ += e.real_size;
+      return;
+    }
+    const bool regular = e.typeflag == '0' || e.typeflag == '\0' || e.typeflag == '7';
+    if (regular) {
+      if (opt_.keep_going && e.size)
+        g_member_ranges.add(rel, r.consumed_total, e.size);
+      if (!cat_copy(r, e.size)) { fail_data(rel, "truncated file data"); return; }
+      r.skip(pad);
+      ++vfiles_; vbytes_ += e.size;
+      return;
+    }
+    // Match ordinary extraction's unsupported-type verdict.  Silently skipping
+    // an unknown member here reports success with data omitted.
+    if (e.typeflag != '5' && e.typeflag != '2' && e.typeflag != '1'
+        && e.typeflag != '3' && e.typeflag != '4' && e.typeflag != '6'
+        && e.typeflag != 'V')
+      fail(rel, std::string("unsupported tar entry type '") + e.typeflag
+                + "' — skipped (data NOT extracted; use GNU tar)");
+    if (e.size) { r.skip(e.size); r.skip(pad); }
+  }
   // A SPARSE MAP IS A CLAIM ABOUT WHERE THE STORED BYTES GO (v0.17.87).  Nothing
   // checked it: a segment placed past the member's logical size was written
   // there and then cut off by the final ftruncate, so the member's data was
@@ -26428,6 +26774,7 @@ static bool foreign_scan_entries(FILE * in, const TarSeekTable & st,
       got += (size_t)r;
     }
     if (m) m->read_bytes.fetch_add(csz, std::memory_order_relaxed);
+    gz_enforce_window_limit(comp.data(), csz);
     unsigned long long fcs = ZSTD_getFrameContentSize(comp.data(), csz);
     if (fcs == ZSTD_CONTENTSIZE_ERROR
         || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz)) return false;
@@ -26678,6 +27025,7 @@ static FrameBuf decompress_seek_frame(const char * comp, size_t csz, size_t usz,
                                       size_t k, ZSTD_DCtx * dctx) {
   // GPU-written frames may omit the content size; when present it must
   // corroborate the index geometry before we allocate.
+  gz_enforce_window_limit(comp, csz);
   unsigned long long fcs = ZSTD_getFrameContentSize(comp, csz);
   if (fcs == ZSTD_CONTENTSIZE_ERROR
       || (fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs != usz))
@@ -29634,6 +29982,92 @@ static void watchdog_loop(std::atomic<bool> * done, int timeout_secs) {
   }
 }
 
+// THE GPU STALL GUARD (v0.17.89): on by default, unlike --watchdog.
+//
+// A CUDA or nvCOMP call that never returns cannot be recovered from: the thread
+// is inside the driver, nothing can interrupt it, and the abort path that every
+// other GPU fault takes ends in a join on that very thread.  Until now such a
+// run simply sat there forever -- no output, no error, nothing for a batch
+// system to act on.  It cannot be FIXED, but it can be ENDED: if one device has
+// been inside a single submit, or a single completion wait and drain, for
+// GPU_STALL_SECS (10 minutes), the run is stopped with a loud error, exit 5, and
+// its partial output removed (die() does that from any thread and leaves by
+// _Exit, which joins nobody).
+//
+// What it measures is deliberately narrow, because a default-on timer that kills
+// a healthy run is worse than a hang.  A worker waiting for INPUT (a stalled
+// pipe, a slow disk) is in an intake phase; a drain thread with nothing
+// submitted is in DrainWait; neither counts.  The clock runs only while a
+// worker sits in Submit, or its drain thread in Drain, with its heartbeat
+// unchanged -- i.e. inside one batch's driver calls.  The drain's push is a
+// vector append, never a wait on the writer, so a slow SINK does not count
+// either.  A batch normally spends milliseconds to seconds there.
+//
+// GZSTD_DEBUG_GPU_STALL_SEC overrides the limit (0 disables), for the suite.
+// Decompression needs none of this: a wedged decompress batch is reclaimed and
+// finished on the CPU (GzDecompInflight).
+static constexpr int GPU_STALL_SECS = 600;
+static int gpu_stall_secs()
+{
+  static const int v = [] {
+    if (const char * e = std::getenv("GZSTD_DEBUG_GPU_STALL_SEC")) {
+      char * end = nullptr;
+      const long n = std::strtol(e, &end, 10);
+      if (end != e && n >= 0) return (int)n;
+    }
+    return GPU_STALL_SECS;
+  }();
+  return v;
+}
+static void gpu_stall_loop(std::atomic<bool> * done, int secs)
+{
+  GzWatchdog * d = g_wd.load(std::memory_order_relaxed);
+  if (!d || secs <= 0 || d->n_workers <= 0) return;
+  const size_t n = (size_t)d->n_workers;
+  std::vector<uint64_t> hb(n, 0), dhb(n, 0), since(n, now_ns()), dsince(n, now_ns());
+  const auto tick = std::chrono::milliseconds(1000);
+  const uint64_t missed_tick_ns = (uint64_t)
+      std::chrono::duration_cast<std::chrono::nanoseconds>(tick * 3).count();
+  uint64_t last_sample = now_ns();
+  while (!done->load(std::memory_order_relaxed)) {
+    if (gz_periodic_wait(*done, tick)) break;
+    if (done->load(std::memory_order_relaxed)) break;
+    const uint64_t now = now_ns();
+    // SIGSTOP, a debugger, or scheduler suspension can stop this timer along
+    // with the worker.  No observation was made during that gap, so it cannot
+    // establish that a driver call was stuck throughout it.
+    if (now - last_sample > missed_tick_ns) {
+      std::fill(since.begin(), since.end(), now);
+      std::fill(dsince.begin(), dsince.end(), now);
+    }
+    last_sample = now;
+    for (size_t w = 0; w < n; ++w) {
+      WdWorker & k = d->wk((int)w);
+      const uint64_t h  = k.heartbeat.load(std::memory_order_relaxed);
+      const uint64_t dh = k.drain_heartbeat.load(std::memory_order_relaxed);
+      const bool in_submit = k.phase.load(std::memory_order_relaxed) == (int)WatchPhase::Submit;
+      const bool in_drain  = k.drain_phase.load(std::memory_order_relaxed) == (int)WatchPhase::Drain;
+      if (!in_submit || h != hb[w])  { hb[w] = h;   since[w] = now; }
+      if (!in_drain  || dh != dhb[w]) { dhb[w] = dh; dsince[w] = now; }
+      const double s_sub = double(now - since[w]) / 1e9, s_drn = double(now - dsince[w]) / 1e9;
+      if (s_sub < secs && s_drn < secs) continue;
+      const bool sub = s_sub >= secs;
+      char msg[640];
+      std::snprintf(msg, sizeof msg,
+        "GPU %d has not answered for %.0f seconds: one batch has been %s all that time, "
+        "which normally takes well under a second.  The GPU or its driver is hung, and a "
+        "call that never returns cannot be recovered from, so this run is being stopped "
+        "and its partial output removed; the input is untouched.\n"
+        "  Check the kernel log (dmesg) for NVIDIA Xid messages, and re-run with "
+        "--cpu-only to finish without the GPU.",
+        k.device_id.load(std::memory_order_relaxed), sub ? s_sub : s_drn,
+        sub ? "in submission (host-to-device copy and launch)"
+            : "awaiting completion and read-back");
+      die(msg, EXIT_GPU_FAIL);
+    }
+  }
+}
+
 // Drain one completed batch (runs on the per-device DRAIN thread): read back
 // statuses and compressed sizes, run the verify check, copy each frame D2H,
 // stitch on the content checksum, deliver to the ResultStore, and record all
@@ -32335,7 +32769,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // overwrite the old stream and then cut its tail off, despite exiting 0.
       vlog(V_ERROR, opt, "WARNING: --gds-only cannot use peer-to-peer output on "
            "an append-mode descriptor; using device-to-host transfers for writing.\n");
-    } else if (::lseek(base_fd, 0, SEEK_CUR) > 0) {
+    } else if (::lseek(base_fd, 0, SEEK_CUR) > 0
+               || (g_direct_writer && g_direct_writer->base_offset() > 0)) {
+      // (The second test is for an O_DIRECT writer adopted with a base: base_fd
+      // is then its PRIVATE description, whose own position is always zero.)
       // THE SAME HAZARD WITHOUT O_APPEND (v0.17.87): a descriptor that is not at
       // offset zero already carries someone's output -- an earlier input of this
       // run, an earlier command in the same redirection.  The reopened
@@ -32472,6 +32909,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   GzWatchdog wd;
   std::atomic<bool> watchdog_done{false};
   std::thread watchdog_thr;
+  std::thread stall_thr;      // the default-on GPU stall guard (see gpu_stall_loop)
 
   // Everything that needs a live CUDA context, in one place so it can run either
   // inline (fixed-share / gpu-only) or on a background thread while the main
@@ -32582,15 +33020,20 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     }
     workers.reserve((size_t)gpu_count);
 
-    if (opt.watchdog && opt.watchdog_secs > 0) {
-      const int wsecs = opt.watchdog_secs;
+    // The per-worker state is set up for EVERY GPU run now: the stall guard reads
+    // it by default.  The --watchdog thread (diagnostic: JSON dump, exit 70) is
+    // still opt-in and independent.
+    const bool want_diag  = opt.watchdog && opt.watchdog_secs > 0;
+    const bool want_stall = gpu_stall_secs() > 0;
+    if (want_diag || want_stall) {
       wd.n_workers   = gpu_count;
       wd.streams_per = (int)std::max<size_t>(1, opt.gpu_streams);
       wd.workers     = std::vector<WdWorker>((size_t)wd.n_workers);
       wd.streams     = std::vector<WdStream>((size_t)wd.n_workers * (size_t)wd.streams_per);
       wd.opt = &opt; wd.meter = m; wd.throttle = &throttle; wd.queue = &queue; wd.which = "compress";
       g_wd.store(&wd, std::memory_order_release);
-      watchdog_thr = std::thread(watchdog_loop, &watchdog_done, wsecs);
+      if (want_diag)  watchdog_thr = std::thread(watchdog_loop, &watchdog_done, opt.watchdog_secs);
+      if (want_stall) stall_thr    = std::thread(gpu_stall_loop, &watchdog_done, gpu_stall_secs());
     }
 
     for (int i = 0; i < gpu_count; ++i) {
@@ -33452,10 +33895,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   g_gds_cout_meter = nullptr;
   perf_mark(PerfCounters::HM_WRITER_JOINED);
   // ---- GPU deadlock watchdog teardown (v0.14.59) ----
-  if (watchdog_thr.joinable()) {
+  if (watchdog_thr.joinable() || stall_thr.joinable()) {
     watchdog_done.store(true, std::memory_order_relaxed);
     gz_wake_periodic_loops();
-    watchdog_thr.join();
+    if (watchdog_thr.joinable()) watchdog_thr.join();
+    if (stall_thr.joinable())    stall_thr.join();
   }
   g_wd.store(nullptr, std::memory_order_release);
   progress_done = true;
@@ -36864,6 +37308,7 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
     // each other; a frame that declares nothing cannot be checked and is not
     // taken on trust either.
     {
+      gz_enforce_window_limit(hdr, (size_t)hgot);
       const unsigned long long fcs = ZSTD_getFrameContentSize(hdr, (size_t)hgot);
       // A frame that declares NOTHING cannot be checked -- that is a limit of the
       // archive, not evidence against it, so it still demotes quietly.  A frame
@@ -37371,6 +37816,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
             decline = db;
             break;
           }
+          gz_enforce_window_limit(fh, (size_t)got);
           const unsigned long long fcs =
             ZSTD_getFrameContentSize(fh, (size_t)got);
           if (fcs == ZSTD_CONTENTSIZE_ERROR || fcs == ZSTD_CONTENTSIZE_UNKNOWN) {
@@ -38761,8 +39207,24 @@ static void print_reader_diag(const Options & opt, const Meter & meter, double w
 // -d --tar: decompress each archive into a pipe and extract it via
 // tarx::Extractor.  Reuses the full parallel decompressor (CPU/GPU) unchanged —
 // the pipe is just a FILE* sink like stdout.  Returns an exit code.
+#ifndef _WIN32
+static void gz_refuse_stdout_alias(const struct stat & out_st,
+                                   const std::vector<std::string> & paths,
+                                   const std::vector<std::string> * dirs);
+#endif
 static int extract_tar(const Options & opt, Meter * m)
 {
+#ifndef _WIN32
+  if (opt.tar_to_stdout) {
+    // Member contents are about to be written to stdout: it must not be one of
+    // the archives being read, nor a side input (see gz_refuse_stdout_alias).
+    struct stat ost;
+    const int ofd = fileno(stdout);
+    if (ofd >= 0 && std::fflush(stdout) == 0 && ::fstat(ofd, &ost) == 0 && S_ISREG(ost.st_mode))
+      gz_refuse_stdout_alias(ost, opt.tar_sources, nullptr);
+    gz_stdout_will_be_written();
+  }
+#endif
   int dest_fd = ::open(opt.tar_dest.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
   if (dest_fd < 0)
     die_io("cannot open extraction directory '" + opt.tar_dest + "': " + std::strerror(errno));
@@ -38861,7 +39323,7 @@ static int extract_tar(const Options & opt, Meter * m)
            "readers pread individual frames at unaligned offsets, so this archive is read "
            "through the page cache.\n");
     };
-    if (members.empty() && arc != "-" && !opt.keep_going) {
+    if (members.empty() && arc != "-" && !opt.keep_going && !opt.tar_to_stdout) {
       tarx::TarSeekTable pst; std::vector<uint64_t> pbounds;
       if (tarx::build_full_parallel_plan(in, dest_fd, opt, m, pst, pbounds)) {
         int Np = std::min<int>({resolve_cpu_threads(opt.cpu_threads), 16,
@@ -38939,6 +39401,7 @@ static int extract_tar(const Options & opt, Meter * m)
     // stream's file data to disk — counting both double-counts the output.
     tarx::Extractor ex(dest_fd, opt, /*meter=*/nullptr);
     ex.set_sink_meter(m);   // live writer-pool sink timing → --adapt (not bytes)
+    if (opt.tar_to_stdout) ex.set_cat_stdout();   // -c / -O: contents to stdout, in order
     if (!members.empty()) ex.set_members(members, roots);
     std::thread exth([&] { ex.run_sink(&sink); });
 
@@ -39970,6 +40433,10 @@ static int run_calibrate(Options opt)
     po.cpu_only = !gpu; po.gpu_only = gpu; po.hybrid = false;
     po.backend_user_set = true;
     po.mode = compress_dir ? Mode::COMPRESS : Mode::DECOMPRESS;
+    // The corpus decoded here is calibration's own, not the user's input: -M is
+    // a limit on what the USER asks to decode, and `--calibrate -M1` would
+    // otherwise refuse its own 2 MiB-window frames (v0.17.89).
+    if (!compress_dir) po.mem_limit_mib = 0;
     Meter m;
     const auto t0 = std::chrono::steady_clock::now();
 #ifdef HAVE_NVCOMP
@@ -40242,10 +40709,16 @@ static int run_calibrate(Options opt)
       if (!gcompressed.empty()) {
         g_gpu_failed_restart.store(false);
         g_gpu_aborted.store(false);
+        // A DECOMPRESS FAULT DOES NOT SET g_gpu_failed_restart: the pipeline
+        // finishes the remaining frames on the CPU and returns normally, so the
+        // pass "ran" and its rate was recorded as the GPU's (v0.17.89).  The
+        // rescue counter is what says the number is not a GPU number.
+        const int rescues_before = g_gpu_cpu_rescue_runs.load(std::memory_order_relaxed);
         pass(false, true, gcompressed, devnull, payload, 1);   // warmup
         rows[3].gibs = pass(false, true, gcompressed, devnull, payload, TIMED_REPEAT);
         rows[3].ran = rows[3].gibs > 0;
-        if (g_gpu_failed_restart.load()) {
+        if (g_gpu_failed_restart.load()
+            || g_gpu_cpu_rescue_runs.load(std::memory_order_relaxed) != rescues_before) {
           rows[3] = Row{"gpu decompress"};
           std::fprintf(stderr, "[CALIBRATE] gpu decompress  FAULTED — row discarded\n");
         } else {
@@ -40543,9 +41016,112 @@ static void gz_refuse_stdout_alias(const struct stat & out_st,
 }
 #endif
 
+// DIAGNOSTIC ENVIRONMENT VARIABLES ARE ANNOUNCED, LOUDLY (v0.17.89).
+//
+// gzstd reads about a hundred GZSTD_DEBUG_* variables (and the GZSTD_FORCE_POOL /
+// GZSTD_POOL_* knobs).  They exist for the test suite: they inject GPU faults,
+// read errors and corrupt frames, stall threads, and force code paths.  None is
+// documented outside this file, and until now none said anything when set -- so
+// one left exported in a shell, a job script or a container image would change
+// what a real run does, up to deliberately failing it, in silence.  Every one
+// that is set is now named on stderr before any work starts, whatever the
+// verbosity.
+//
+// GZSTD_DEBUG_HOOKS_ACK (any value) acknowledges them and suppresses the banner.
+// It is for the suite, which exports hooks for every run and inspects stderr;
+// a stray hook does not come with its acknowledgement.  The variables gzstd sets
+// for ITSELF across a re-exec or for a calibration child are plumbing, not
+// hooks, and a process started that way stays quiet (its parent already spoke).
+#ifndef _WIN32
+extern char ** environ;
+#endif
+// IS THE FILE BEHIND STDOUT INSIDE A DIRECTORY --tar IS ARCHIVING?  (v0.17.89)
+//
+// v0.17.88 refused --tar creation onto any existing, non-appending stdout file,
+// because a file inside the tree would be overwritten and then left out of the
+// archive as "the archive".  That also refused a file that is nowhere near the
+// tree.  The question can be answered before the walk: find the file's parent
+// directory and climb it by identity (fd_containment), looking for one of the
+// directory operands.
+//
+// The parent comes from the name /proc/self/fd/N reports -- a descriptor has no
+// parent -- so the name is VERIFIED to still be this file (same dev/ino); if it
+// is not (unlinked, renamed), the answer is UNKNOWN, and the caller refuses
+// exactly as before.  A multiply linked output is also UNKNOWN: its visible
+// name cannot prove where the other links lie.
+static Containment gz_stdout_in_tar_sources(int ofd, const struct stat & ost, const Options & opt)
+{
+  std::vector<std::pair<dev_t, ino_t>> dir_ids;
+  for (size_t i = 0; i < opt.tar_sources.size(); ++i) {
+    std::string full = opt.tar_sources[i];
+    while (full.size() > 1 && full.back() == '/') full.pop_back();
+    if (i < opt.tar_source_dest.size() && opt.tar_source_dest[i] != "."
+        && !opt.tar_source_dest[i].empty() && !full.empty() && full[0] != '/')
+      full = opt.tar_source_dest[i] + "/" + full;
+    struct stat st;
+    if (::lstat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+      dir_ids.emplace_back(st.st_dev, st.st_ino);
+  }
+  if (dir_ids.empty()) return Containment::OUTSIDE;   // file operands: checked by identity
+  // The pathname returned for stdout describes only one of its links.  Another
+  // link may be inside a source directory even when this parent's climb says
+  // OUTSIDE.  Keep the v0.17.88 refusal for multiply linked files; -f remains
+  // the caller's explicit override.
+  if (ost.st_nlink > 1) return Containment::UNKNOWN;
+  char link[64], buf[PATH_MAX + 1];
+  std::snprintf(link, sizeof(link), "/proc/self/fd/%d", ofd);
+  const ssize_t n = ::readlink(link, buf, PATH_MAX);
+  if (n <= 0 || buf[0] != '/') return Containment::UNKNOWN;
+  buf[n] = '\0';
+  const std::string path(buf);
+  const size_t slash = path.rfind('/');
+  const std::string dir  = slash == 0 ? std::string("/") : path.substr(0, slash);
+  const std::string base = path.substr(slash + 1);
+  const int dfd = ::open(dir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (dfd < 0) return Containment::UNKNOWN;
+  struct stat chk;
+  if (base.empty() || ::fstatat(dfd, base.c_str(), &chk, AT_SYMLINK_NOFOLLOW) != 0
+      || chk.st_dev != ost.st_dev || chk.st_ino != ost.st_ino) {
+    ::close(dfd);
+    return Containment::UNKNOWN;                      // that name is not this file
+  }
+  const Containment c = fd_containment(dfd, dir_ids);
+  ::close(dfd);
+  return c;
+}
+
+static void gz_announce_debug_env()
+{
+#ifndef _WIN32
+  if (std::getenv("GZSTD_DEBUG_HOOKS_ACK")) return;
+  if (std::getenv("GZSTD_CUFILE_PRELOADED") || std::getenv("GZSTD_CALIBRATE_GPUC_FD")) return;
+  int n = 0;
+  for (char ** e = environ; e && *e; ++e) {
+    const char * v = *e;
+    const bool hook = std::strncmp(v, "GZSTD_DEBUG_", 12) == 0
+                   || std::strncmp(v, "GZSTD_FORCE_POOL=", 17) == 0
+                   || std::strncmp(v, "GZSTD_POOL_", 11) == 0
+                   || std::strncmp(v, "GZSTD_NO_PREFER_INLINE=", 23) == 0;
+    if (!hook) continue;
+    if (n++ == 0)
+      std::fprintf(stderr, "\ngzstd: ******************************************************************\n");
+    std::fprintf(stderr, "gzstd: *** WARNING: DIAGNOSTIC HOOK SET IN THE ENVIRONMENT: %s\n", v);
+  }
+  if (n) {
+    std::fprintf(stderr,
+      "gzstd: *** %d test hook%s active.  Test hooks change what gzstd does and can\n"
+      "gzstd: *** INJECT FAILURES OR CORRUPT OUTPUT ON PURPOSE.  Unset %s for real work.\n"
+      "gzstd: ******************************************************************\n\n",
+      n, n == 1 ? " is" : "s are", n == 1 ? "it" : "them");
+    std::fflush(stderr);
+  }
+#endif
+}
+
 static int gzstd_main(int argc, char ** argv)
 {
   setup_signal_handlers();
+  gz_announce_debug_env();
 
   // Test-only: deterministic GPU fault injection (see g_debug_fail_gpu_after).
   if (std::getenv("GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST"))
@@ -40605,6 +41181,15 @@ static int gzstd_main(int argc, char ** argv)
   gz_cufile_stats_preload(argc, argv);
 #endif
   Options opt = parse_args(argc, argv);
+  // The decode-side window limit (see gz_enforce_window_limit).  Global because
+  // the checks sit at frame level, far from any Options.  Only for a run that
+  // DECODES THE USER'S INPUT: when compressing, -M is a memory budget and the
+  // frames --verify decodes are the ones this run just wrote; --calibrate
+  // decodes a corpus it generated.
+  const bool user_decode = (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST)
+                           && !opt.calibrate;
+  g_mem_limit_bytes.store(user_decode ? (uint64_t)opt.mem_limit_mib * ONE_MIB : 0,
+                          std::memory_order_relaxed);
   // --train is its own operation: no compress/decompress setup applies.
   if (opt.train) return run_train(opt);
   // -D / --patch-from: load the run's dictionary before any coder (or thread) exists.
@@ -40775,6 +41360,7 @@ static int gzstd_main(int argc, char ** argv)
       const int lfd = fileno(stdout);
       if (lfd >= 0 && ::fstat(lfd, &lst) == 0 && S_ISREG(lst.st_mode))
         gz_refuse_stdout_alias(lst, opt.tar_mode ? opt.tar_sources : opt.inputs, nullptr);
+      gz_stdout_will_be_written();
     }
     if (opt.tar_mode) { Meter meter; return list_tar(opt, &meter); }
     return list_zst(opt);
@@ -41129,7 +41715,13 @@ static int gzstd_main(int argc, char ** argv)
     // the dictionary is refused (conservatively -- the dictionary's own name
     // would survive), a symlink to it is not (the link is replaced, its target
     // left alone; v0.17.77 compared the target and refused it).
-    if (g_dict_compress && opt.force && out_present
+    //
+    // DECODING TOO (v0.17.89): `gzstd -d -D dict -f -o dict x.zst` replaced the
+    // dictionary with the decoded data at exit 0, and other archives may still
+    // need it.  Not the --patch-from reference: `-d --patch-from=old -o old`
+    // updates a file in place from its patch, which is what patches are for (the
+    // reference is fully in memory before the output replaces it).
+    if ((g_dict_compress || (g_dep_known && !g_dict_patch)) && opt.force && out_present
         && gz_is_decode_dependency(out_lst))
       die_usage("dictionary and output are the same file: " + opt.output);
 
@@ -41492,6 +42084,11 @@ static int gzstd_main(int argc, char ** argv)
   // terminal has no inode the walk could collide with, so it simply does not
   // match, and no special case is needed for it.
   if (opt.tar_mode && opt.mode == Mode::COMPRESS && out) {
+    // Test-only: GZSTD_DEBUG_TAR_ERR_FIRST_PASS raises the tar error flag before
+    // the first pass, as an assembly-time error in that pass would.  With a
+    // forced rebuild it shows whether the flag outlives the discarded pass.
+    if (std::getenv("GZSTD_DEBUG_TAR_ERR_FIRST_PASS"))
+      g_tar_had_errors.store(true, std::memory_order_relaxed);
     g_tar_output_ids.clear();
     g_tar_output_entries.clear();
     struct stat os_;
@@ -41547,6 +42144,7 @@ static int gzstd_main(int argc, char ** argv)
     struct stat bst;
     if (bfd >= 0 && std::fflush(stdout) == 0
         && ::fstat(bfd, &bst) == 0 && S_ISREG(bst.st_mode)) {
+      gz_stdout_will_be_written();   // side inputs: the dictionary, lists, profile, ...
       // THE FILE BEHIND STDOUT MUST NOT BE ONE OF THE INPUTS (v0.17.88): see
       // gz_refuse_stdout_alias.  ALL inputs are checked now, at the first one,
       // because the damage is done before the aliased input is ever opened.
@@ -41558,38 +42156,43 @@ static int gzstd_main(int argc, char ** argv)
         // data` would otherwise leave `data` out "as the archive" and exit 0
         // without the one file it was asked for.
         gz_refuse_stdout_alias(bst, opt.tar_sources, &opt.tar_source_dest);
-        // A file deeper in the tree cannot be checked before the walk, and the
-        // walk leaves the output out of the archive by design (an archive made
-        // inside the tree it archives).  That is only safe when the output holds
-        // nothing of its own: `exec 1<>FILE` onto an EXISTING file inside the
-        // tree would have FILE truncated or overwritten here and then skipped
-        // there -- destroyed, absent from the archive, exit 0.  So an output
-        // that already has data beyond the write position is refused unless it
-        // is open for appending (which destroys nothing).  `>` and `>>` and -o
-        // are unaffected: the first is empty, the second appends.
+        // A FILE DEEPER IN THE TREE.  The walk leaves the output out of the
+        // archive by design (an archive made inside the tree it archives), which
+        // is only safe when the output holds nothing of its own: `exec 1<>FILE`
+        // onto an EXISTING file inside the tree would have FILE truncated or
+        // overwritten here and then skipped there -- destroyed, absent from the
+        // archive, exit 0.  So an output that already has data beyond the write
+        // position, and is not open for appending (which destroys nothing), is
+        // looked up: OUTSIDE every directory operand it is simply the caller's
+        // chosen output and the run goes ahead (v0.17.89; v0.17.88 refused it
+        // too); INSIDE one, or UNKNOWN, it is refused -- unless -f insists.
+        // `>` and `>>` and -o never get here: the first is empty, the second
+        // appends.
         //
-        // -f IS THE OVERRIDE, and the only one in this family: a file that is
-        // both read and written can never come out right, but this rule also
-        // stops a file that merely already exists, and replacing an existing
-        // output is what -f means.  With it the run goes ahead, loudly, and
-        // does what -f does to a named output: everything from the write
-        // position on is discarded FIRST, so neither writer leaves the old tail
-        // behind the new archive (the buffered one would, as GNU tar does).  If
-        // the file does turn out to be in the tree, the walk reports it in
-        // tar's words: "archive cannot contain itself; not dumped".
+        // Whenever the run does go ahead, everything from the write position on
+        // is discarded FIRST, as -f does to a named output, so neither writer
+        // leaves the old tail behind the new archive (the buffered one would, as
+        // GNU tar does).  If -f forces a file that is in the tree, the walk
+        // reports it in tar's words: "archive cannot contain itself; not dumped".
         const int tfl = ::fcntl(bfd, F_GETFL);
         const off_t tcur = ::lseek(bfd, 0, SEEK_CUR);
         if (!(tfl >= 0 && (tfl & O_APPEND)) && tcur >= 0 && bst.st_size > tcur) {
-          if (!opt.force)
-            die_usage("--tar: standard output is an existing file opened without "
-                      "truncation, and --tar cannot tell whether it is one of the "
-                      "files being archived; writing the archive would overwrite "
-                      "it.  Redirect with > or >>, name the archive with -o, or "
-                      "pass -f to overwrite it anyway");
-          // (opt.force is also set by --overwrite, so the text names neither.)
-          vlog(V_ERROR, opt, "gzstd: warning: --tar: standard output is an existing "
-               "file opened without truncation; overwrite forced, so its contents "
-               "from the write position on are being replaced by the archive\n");
+          const Containment where = gz_stdout_in_tar_sources(bfd, bst, opt);
+          if (where != Containment::OUTSIDE) {
+            if (!opt.force)
+              die_usage(std::string("--tar: standard output is an existing file opened "
+                        "without truncation, and ")
+                        + (where == Containment::INSIDE
+                             ? "it is inside a directory being archived"
+                             : "--tar cannot tell whether it is inside a directory being archived")
+                        + "; writing the archive would overwrite it.  Redirect with > "
+                          "or >>, name the archive with -o, or pass -f to overwrite it "
+                          "anyway");
+            // (opt.force is also set by --overwrite, so the text names neither.)
+            vlog(V_ERROR, opt, "gzstd: warning: --tar: standard output is an existing "
+                 "file opened without truncation; overwrite forced, so its contents "
+                 "from the write position on are being replaced by the archive\n");
+          }
           if (::ftruncate(bfd, tcur) != 0)
             die_io("--tar: cannot truncate redirected stdout ("
                    + std::string(std::strerror(errno)) + ")");
@@ -41640,13 +42243,17 @@ static int gzstd_main(int argc, char ** argv)
       if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) break;   // S_ISREG is the real gate
       int flags = fcntl(fd, F_GETFL);
       if (flags < 0 || (flags & O_APPEND)) break;                // append: never truncate
-      // ONLY AT OFFSET ZERO (see out_base above).  Anywhere else, something has
-      // already been written through this descriptor and our output continues
-      // from there on the buffered path -- which appends at the position and
-      // truncates nothing, exactly as zstd and cat do.  The DirectWriter leaves
-      // the position at the end of what it wrote, so the second input of a
-      // multi-input run lands here too.
-      if (out_base != 0) break;
+      // AT OFFSET ZERO, OR AT THE END OF WHAT IS ALREADY THERE (see out_base
+      // above).  v0.17.87 adopted only at zero and v0.17.88 kept that, sending
+      // everything after the first output of a redirection to the buffered
+      // writer -- correct, and MEASURED 3.5x slower.  v0.17.89 adopts at a
+      // non-zero base too (DirectWriter::adopt_fd_detached), provided the file
+      // ENDS at the descriptor's position: then there is nothing beyond it to
+      // preserve, truncate or expose through a sparse hole.  A descriptor parked
+      // in the middle of existing data (`exec 1<>old` after a seek) stays on
+      // the buffered writer, which appends at the position and touches nothing
+      // else.
+      if (out_base != 0 && st.st_size != out_base) break;
 #ifdef HAVE_NVCOMP
       // This is a caller-owned file, so die() cannot restore its previous
       // contents if a later --gpu-only check finds no usable device.
@@ -41671,10 +42278,14 @@ static int gzstd_main(int argc, char ** argv)
       // the truncating-write semantics the caller is entitled to.
       if (std::fflush(stdout) != 0)
         die_io("cannot flush stdout before O_DIRECT adoption");
-      if (::ftruncate(fd, 0) != 0)
-        die_io("cannot truncate redirected stdout (" + std::string(std::strerror(errno)) + ")");
-      if (::lseek(fd, 0, SEEK_SET) == (off_t)-1)
-        die_io("cannot rewind redirected stdout (" + std::string(std::strerror(errno)) + ")");
+      // (At a non-zero base nothing is truncated and nothing rewound: the file
+      // already ends where this output begins.)
+      if (out_base == 0) {
+        if (::ftruncate(fd, 0) != 0)
+          die_io("cannot truncate redirected stdout (" + std::string(std::strerror(errno)) + ")");
+        if (::lseek(fd, 0, SEEK_SET) == (off_t)-1)
+          die_io("cannot rewind redirected stdout (" + std::string(std::strerror(errno)) + ")");
+      }
 
       // From here a buffered fallback is SAFE: the file is already empty, so an
       // O_DIRECT adoption failure costs speed, not correctness.
@@ -41684,7 +42295,7 @@ static int gzstd_main(int argc, char ** argv)
       // whatever was written; the writer disarms it when it closes.
       g_stdout_adopted.store(1);
       auto dw = std::make_unique<DirectWriter>();
-      if (!dw->adopt_fd_detached(fd)) g_stdout_adopted.store(0);
+      if (!dw->adopt_fd_detached(fd, (uint64_t)out_base)) g_stdout_adopted.store(0);
       else {
         out = nullptr;
         direct_writer = std::move(dw);
@@ -41977,6 +42588,19 @@ static int gzstd_main(int argc, char ** argv)
         vlog(V_ERROR, opt, os.str());   // loud: an integrity event survives -q (only -qq silences)
       }
 
+      // THE REJECTED PASS'S TAR VERDICT GOES WITH IT (v0.17.89).  A --tar rebuild
+      // walks and reads every source again, so whatever the first pass recorded
+      // -- "file changed as we read it", a staged read that failed and CAUSED
+      // this rebuild, its removal records for --rm -- describes an archive that
+      // is about to be discarded.  It was kept: after a perfectly clean rebuild
+      // the run still exited 1 and --rm was suppressed.  The rebuild's own walk
+      // re-reports anything that is still wrong (an unreadable file is skipped,
+      // and flagged, again), so nothing real is lost by starting it clean.
+      if (opt.tar_mode && opt.mode == Mode::COMPRESS) {
+        g_tar_had_errors.store(false, std::memory_order_relaxed);
+        g_tar_removal_paths.clear();
+      }
+
       // Reset the output to empty for the rebuild (input already rewound above).
 #ifndef _WIN32
       if (dw_ptr) {
@@ -41996,12 +42620,15 @@ static int gzstd_main(int argc, char ** argv)
         direct_writer.reset();                 // dtor joins writer thread, closes its fd
         bool reopened = false;
         if (keep >= 0) {
-          if (::ftruncate(keep, 0) == 0 && ::lseek(keep, 0, SEEK_SET) == 0) {
+          // Back to where THIS output began: out_base for an adopted stdout
+          // (zero, or the end of an earlier output), zero for a named output.
+          const off_t rb = stdout_fd >= 0 ? out_base : (off_t)0;
+          if (::ftruncate(keep, rb) == 0 && ::lseek(keep, rb, SEEK_SET) == rb) {
             direct_writer = std::make_unique<DirectWriter>();
             if (stdout_fd >= 0) {
               g_stdout_adopted.store(1);
-              reopened = ::lseek(stdout_fd, 0, SEEK_SET) == 0
-                      && direct_writer->adopt_fd_detached(stdout_fd);
+              reopened = ::lseek(stdout_fd, rb, SEEK_SET) == rb
+                      && direct_writer->adopt_fd_detached(stdout_fd, (uint64_t)rb);
               if (!reopened) g_stdout_adopted.store(0);
             } else {
               reopened = direct_writer->adopt_fd(keep);
@@ -42928,7 +43555,8 @@ int main(int argc, char ** argv)
       // Output, --rm and the profile are all complete by here; an ordinary return
       // would run cuFile/CUDA teardown that the wedged call can block, so flush
       // what we own and leave.
-      if (g_decomp_abandoned.load(std::memory_order_relaxed)) {
+      if (g_decomp_abandoned.load(std::memory_order_relaxed)
+          || g_cufile_exit_unsafe.load(std::memory_order_relaxed)) {
         cleanup_tmp_file();
 #ifndef _WIN32
         gz_cufile_log_finish();   // _Exit skips atexit; the run itself completed
@@ -44414,28 +45042,73 @@ static void apply_backend_defaults(Options & opt)
 #endif
 }
 
-// zstd/gzip compat: is `a` a bundled group of no-arg short flags like "-dcf"?
-// True only when every char after a single leading '-' is one of the no-arg
-// operation flags {d,t,k,f,c}.  Anything containing a value-taking flag
-// (-o/-T/-M/-B), a digit (numeric levels, -M#, -b#), a long option ("--…"),
-// or the repeat flags (-vv/-vvv/-qq — v/q aren't in the set) returns false and
-// is left for the exact-match loop to handle unchanged.  v/q are intentionally
-// excluded so their repeat semantics survive; bundle verbosity flags separately.
+// zstd/gzip compat: split a bundled group of short flags into the separate
+// tokens the match loop below understands, so `-dcf`, `-qf`, `-19f`, `-T4q` and
+// `-dqf` mean what they mean to zstd.  Returns false -- and the argument is left
+// exactly as typed -- unless EVERY character is accounted for and the group
+// really is more than one flag:
 //
-// The one value flag allowed is a TRAILING D: zstd reads `-dD DICT` and
-// `-dcD DICT` as the group plus `-D DICT`, taking the NEXT argument as the
-// dictionary, and scripts written for zstd spell it that way.  Expanding the
-// group leaves `-D` last, so its branch consumes the next argument unchanged.
-// D anywhere else (`-Dd`) is not a group; zstd rejects that spelling too.
-static bool is_bundleable_short_group(const std::string & a)
+//   d t k f c z l r   no-argument flags, one token each;
+//   v, q              counted, and emitted once as -v/-vv/-vvv and -q/-qq, so the
+//                     repeat meaning survives (`-dvv` is -d -vv);
+//   digits            a compression level (`-19f` is -19 -f);
+//   T#                a thread count (`-T4q` is -T4 -q);
+//   D or o            only as the LAST character: zstd reads `-dD DICT` and
+//                     `-fo OUT` as the group plus a flag whose value is the
+//                     NEXT argument, and it is emitted last so that still holds.
+//
+// Anything else (-B#, -M#, -b#, a letter that is not a flag) is not a group.
+// Until v0.17.89 only {d,t,k,f,c} with a trailing D expanded, so `-qf`, `-dq`,
+// `-19f` and `-T4q` -- everyday zstd spellings -- were "unknown option".
+// A single flag (`-19`, `-T4`, `-vv`, `-qq`) is not a group and is not touched.
+static bool expand_short_group(const std::string & a, std::vector<std::string> & out)
 {
   if (a.size() < 3 || a[0] != '-' || a[1] == '-') return false;
-  for (size_t i = 1; i < a.size(); ++i) {
-    char c = a[i];
-    if (c == 'D' && i + 1 == a.size()) continue;
-    if (c != 'd' && c != 't' && c != 'k' && c != 'f' && c != 'c') return false;
+  std::vector<std::string> pieces;
+  std::string value_flag;
+  int nv = 0, nq = 0;
+  auto digit = [](char c) { return c >= '0' && c <= '9'; };
+  for (size_t i = 1; i < a.size();) {
+    const char c = a[i];
+    if (digit(c)) {
+      size_t j = i; while (j < a.size() && digit(a[j])) ++j;
+      pieces.push_back("-" + a.substr(i, j - i)); i = j;
+    } else if (c == 'T') {
+      size_t j = i + 1; while (j < a.size() && digit(a[j])) ++j;
+      if (j == i + 1) return false;
+      pieces.push_back("-" + a.substr(i, j - i)); i = j;
+    } else if (c == 'v') { ++nv; ++i; }
+    else if (c == 'q') { ++nq; ++i; }
+    else if (c == 'D' || c == 'o') {
+      if (i + 1 != a.size()) return false;
+      value_flag = std::string("-") + c; ++i;
+    } else if (std::strchr("dtkfczlr", c)) {
+      pieces.push_back(std::string("-") + c); ++i;
+    } else return false;
   }
+  if (nv) pieces.push_back("-" + std::string((size_t)std::min(nv, 3), 'v'));
+  if (nq) pieces.push_back(nq >= 2 ? "-qq" : "-q");
+  if (!value_flag.empty()) pieces.push_back(value_flag);
+  if (pieces.size() < 2) return false;
+  for (std::string & p : pieces) out.push_back(std::move(p));
   return true;
+}
+
+// A raw argv value must stay one token even when it happens to look like a
+// short-option group.  The cuFile pre-scan and parse_args must agree on this:
+// `-qo --gds-only` names an output file, not a request for cuFile.
+static bool gz_raw_option_takes_value(const std::string & a)
+{
+  if (a == "-o" || a == "--output" || a == "--exclude" || a == "--exclude-from"
+      || a == "-X" || a == "--files-from" || a == "--format" || a == "-C"
+      || a == "--directory" || a == "--verify-engine" || a == "--stats-json"
+      || a == "--pinned" || a == "--gpu-order" || a == "--patch-from"
+      || a == "-D" || a == "--dict" || a == "--dictionary"
+      || a == "--filelist" || a == "--output-dir-flat"
+      || a == "--output-dir-mirror" || a == "--trace") return true;
+  std::vector<std::string> pieces;
+  return expand_short_group(a, pieces) && !pieces.empty()
+      && (pieces.back() == "-o" || pieces.back() == "-D");
 }
 
 // GNU tar -C semantics: tar chdir()s at each -C, so a RELATIVE -C is resolved
@@ -44462,12 +45135,12 @@ static std::vector<std::string> read_list_file(const std::string & flag,
     file.open(path);
     if (!file) die_usage(flag + ": cannot open '" + path + "': " + std::strerror(errno));
     struct stat lst {};
-    if (::stat(path.c_str(), &lst) == 0) gz_refuse_if_stdout_file(lst, flag + " " + path);
+    if (::stat(path.c_str(), &lst) == 0) gz_note_side_input(lst, flag + " " + path);
     in = &file;
   } else {
     struct stat lst {};
     if (::fstat(STDIN_FILENO, &lst) == 0)
-      gz_refuse_if_stdout_file(lst, "standard input (the " + flag + " list)");
+      gz_note_side_input(lst, "standard input (the " + flag + " list)");
   }
   std::string line;
   while (std::getline(*in, line)) {
@@ -44501,19 +45174,23 @@ static Options parse_args(int argc, char ** argv)
   // individual flags up front, so the match loop and all its value-flag
   // (argv[++i]) handling work unchanged.  Only all-no-arg-operation-flag groups
   // expand; value flags, digits, and -vv/-qq pass through untouched (see
-  // is_bundleable_short_group).  xargs/xv own the rewritten argv for the rest
+  // expand_short_group).  xargs/xv own the rewritten argv for the rest
   // of this function; everything below operates on the expanded argc/argv.
   std::vector<std::string> xargs;
   xargs.reserve((size_t)std::max(argc, 1));
   if (argc > 0) xargs.push_back(argv[0] ? argv[0] : "gzstd");
   {
     bool end_of_opts = false;
+    bool value_next = false;
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i] ? argv[i] : "";
+      // The previous raw option consumes this whole argument.  In particular,
+      // `-o -dqf` names the file "-dqf"; expanding it would change the output
+      // to "-d" and turn the rest into flags.
+      if (value_next) { xargs.push_back(std::move(a)); value_next = false; continue; }
       if (!end_of_opts && a == "--") { end_of_opts = true; xargs.push_back(a); continue; }
-      if (!end_of_opts && is_bundleable_short_group(a))
-        for (size_t k = 1; k < a.size(); ++k) xargs.push_back(std::string("-") + a[k]);
-      else
+      if (!end_of_opts) value_next = gz_raw_option_takes_value(a);
+      if (end_of_opts || !expand_short_group(a, xargs))
         xargs.push_back(std::move(a));
     }
   }
@@ -44570,6 +45247,9 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "-V" || a == "--version") { print_version(); std::exit(EXIT_OK); }
     else if (a == "-d" || a == "--decompress" || a == "--uncompress")
       opt.mode = Mode::DECOMPRESS;
+    // zstd's -z/--compress: compress, which is the default.  It was "unknown
+    // option" (v0.17.89); as in zstd, the last of -d/-t/-z wins.
+    else if (a == "-z" || a == "--compress") opt.mode = Mode::COMPRESS;
     else if (a == "-t" || a == "--test") opt.mode = Mode::TEST;
     else if (a == "-k" || a == "--keep") { opt.keep = true; opt.rm_requested = false; }
     else if (a == "--rm") { opt.keep = false; opt.rm_requested = true; }
@@ -44724,6 +45404,9 @@ static Options parse_args(int argc, char ** argv)
     }
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") {
       opt.stdout_flag = true; opt.to_stdout = true;
+    }
+    else if (a == "-O") {            // tar's spelling of the same thing, for -d --tar
+      opt.stdout_flag = true; opt.to_stdout = true; opt.tar_O = true;
     }
     else if (a == "-v" || a == "--verbose") opt.verbosity = V_VERBOSE;
     else if (a == "-vv") opt.verbosity = V_DEBUG;
@@ -45045,7 +45728,7 @@ static Options parse_args(int argc, char ** argv)
                       + std::strerror(errno ? errno : ENOENT));
       {
         struct stat fst {};
-        if (::stat(lf.c_str(), &fst) == 0) gz_refuse_if_stdout_file(fst, "--filelist " + lf);
+        if (::stat(lf.c_str(), &fst) == 0) gz_note_side_input(fst, "--filelist " + lf);
       }
       std::string line;
       size_t listed = 0;
@@ -45139,25 +45822,25 @@ static Options parse_args(int argc, char ** argv)
     // ZSTD_d_windowLogMax and to compress as a throttle-budget cap.
     else if (a.size() > 2 && a[0] == '-' && a[1] == 'M'
           && (a[2] >= '0' && a[2] <= '9')) {
-      opt.mem_limit_mib = (size_t)parse_u64_value("-M", a.substr(2));
+      opt.mem_limit_mib = parse_mem_mib("-M", a.substr(2));
     }
     else if (a == "-M") {
       if (i + 1 >= argc) die_usage("missing value for -M");
-      opt.mem_limit_mib = (size_t)parse_u64_value("-M", argv[++i]);
+      opt.mem_limit_mib = parse_mem_mib("-M", argv[++i]);
     }
     else if (a.rfind("--memlimit=", 0) == 0) {
-      opt.mem_limit_mib = (size_t)parse_u64_value("--memlimit", a.substr(11));
+      opt.mem_limit_mib = parse_mem_mib("--memlimit", a.substr(11));
     }
     else if (a == "--memlimit") {
       if (i + 1 >= argc) die_usage("missing value for --memlimit");
-      opt.mem_limit_mib = (size_t)parse_u64_value("--memlimit", argv[++i]);
+      opt.mem_limit_mib = parse_mem_mib("--memlimit", argv[++i]);
     }
     else if (a.rfind("--memory=", 0) == 0) {
-      opt.mem_limit_mib = (size_t)parse_u64_value("--memory", a.substr(9));
+      opt.mem_limit_mib = parse_mem_mib("--memory", a.substr(9));
     }
     else if (a == "--memory") {
       if (i + 1 >= argc) die_usage("missing value for --memory");
-      opt.mem_limit_mib = (size_t)parse_u64_value("--memory", argv[++i]);
+      opt.mem_limit_mib = parse_mem_mib("--memory", argv[++i]);
     }
     // Job size: `-B#` in compression (bytes).  gzstd uses --chunk-size in MiB
     // with different semantics (one frame per chunk).  Warn.
@@ -45188,6 +45871,10 @@ static Options parse_args(int argc, char ** argv)
     }
     else push_positional(a);
   }
+  // --train returns before the later tar validation, so check -O here too.
+  if (opt.tar_O && !(opt.tar_mode && opt.mode == Mode::DECOMPRESS && !opt.list_mode))
+    die_usage("-O applies to --tar extraction (-d --tar ARCHIVE -O writes member "
+              "contents to standard output); use -c for plain compression/decompression");
   // --train is its own operation: validate it and return now.  None of the
   // compress/decompress checks below apply -- they would, for instance, refuse
   // -o with several inputs (a training set IS several inputs) or add stdin when
@@ -45311,6 +45998,15 @@ static Options parse_args(int argc, char ** argv)
         die_usage("--rm is not supported with --tar extraction or test: the archive "
                   "is never removed.  Remove it yourself once the extraction has "
                   "been checked");
+      // -c WITH EXTRACTION WAS ACCEPTED AND IGNORED TOO (v0.17.89): members went
+      // to disk and nothing reached the pipe the user had asked for.  It now
+      // means what `tar -xO` means -- the selected members' CONTENTS on standard
+      // output, in archive order, nothing written to disk -- and tar's own
+      // spelling, -O, is accepted for it.  (-t writes nothing anywhere; -l is
+      // the listing.)
+      if (opt.mode == Mode::DECOMPRESS && !opt.list_mode
+          && (opt.stdout_flag || opt.output_dash))
+        opt.tar_to_stdout = true;
     }
     opt.keep = true;  // never delete archive sources / input archives
   }

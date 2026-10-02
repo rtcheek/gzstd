@@ -1,12 +1,218 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.88  
+**Covers:** v0.9.50 → v0.17.89  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.89 — the review's open questions, decided
+
+The v0.17.87 and v0.17.88 reviews left sixteen items that were decisions rather than defects. The
+maintainer ruled on each; this version carries the rulings out.
+
+| # | Item | Ruling | Result |
+|---|---|---|---|
+| 1 | later inputs of `-c a b > f` used the buffered writer | try a base offset, benchmark, keep the faster | O_DIRECT at a base: **3.5x faster**, kept |
+| 2 | an input that shrinks while read is archived as its prefix | leave, document | documented in `--help` |
+| 3 | a tar error flag survived a clean rebuild | fix | fixed |
+| 4 | `-c` with `-d --tar` was accepted and ignored | implement tar's `-O` | implemented |
+| 5 | `-d -D dict -f -o dict` replaced the dictionary | refuse | refused (`--patch-from` in place still allowed) |
+| 6 | zstd's short-flag bundles, `-M` suffixes | do them | done, plus `-z` |
+| 7 | `--calibrate` recorded a CPU rescue as GPU speed | fix | fixed |
+| 8 | a read error exited 4 | build a hidden hook, fix, and make every hook loud | all three |
+| 9 | a failed cuFile re-exec walked into a crash | finish, leave by `_Exit` | done |
+| 10 | a driver call that never returns hung the run | a timer | default-on stall guard, 10 minutes |
+| 11 | about 13 futex calls per frame | next round | untouched |
+| 12 | indexed `-l --tar` does not check sparse maps | measure first, then: leave it | measured, below; closed |
+| 13 | a side input behind stdout refused even by `-t` | do what zstd does | checked only when stdout is written |
+| 14 | `--tar` onto an existing `1<>` file refused everywhere | allow outside the tree | allowed outside, refused inside |
+| 15 | naming the `--adapt` profile as an output | the caller's fault | untouched |
+| 16 | stdout position after a failed run | document | documented in `--help` |
+
+### 1. The O_DIRECT writer at a base offset
+
+v0.17.87 stopped the writer truncating a shared stdout by adopting it only at offset zero; everything
+after the first output of a redirection went to the buffered stdio writer. That was correct and slow.
+Measured on a redirected file, flush included, interleaved, CPU-only so only the writer differs
+(the device's own O_DIRECT ceiling with dd: 3.5 GB/s):
+
+| | O_DIRECT writer | buffered writer |
+|---|---|---|
+| decompress to 130 GiB | 36.7, 38.2, 37.7 s | 135.6, 132.9, 134.0 s |
+| compress to 65 GiB | 21.7, 21.3 s | 73.6, 65.7 s |
+
+O_DIRECT needs block-aligned offsets, and the base is wherever the last writer stopped. So the writer's
+coordinate space starts at the block boundary below the base, and the bytes already in that block are
+read back into the front of the first buffer: the first aligned write rewrites them unchanged, with the
+new data after them. It is adopted at a non-zero base only when the file ends exactly at the
+descriptor's position, so there is nothing beyond it to preserve or to expose through a sparse hole;
+an append descriptor (`>>`) and a position in the middle of existing data stay on the buffered writer.
+A rebuild returns to the base. `--gds-only` peer-to-peer output still declines a used descriptor.
+
+With the 130 GiB file as the SECOND input: compress 20.8 and 20.7 s against 70.8 and 75.3 s on
+v0.17.88; decompress 41.2 and 39.4 s against 147.2 and 134.7 s. Outputs verified; `-c a b a` is
+byte-identical to the three archives written separately.
+
+### 4. `-d --tar -c`: member contents to stdout
+
+`-c` with tar extraction used to be accepted and ignored: members went to disk and nothing reached the
+pipe. It now does what `tar -xO` does, and tar's own spelling `-O` is accepted: the contents of every
+selected regular member, concatenated in archive order, nothing written to disk. Directories, links and
+special files contribute nothing; a sparse member is written in full, zeros where its holes are. On an
+indexed archive only the frames holding the selected members are read. Byte-identical to
+`tar -xO | cat` on indexed, foreign and sparse archives, with and without member selection.
+
+(Through a pipe, because GNU tar 1.35 writing `-xO` to a regular file seeks its stdout for a sparse
+member and overwrites its own earlier output. gzstd writes the zeros.)
+
+### 6. zstd's command-line spellings
+
+Short flags bundle as zstd reads them: `-qf`, `-dq`, `-dqf`, `-19f`, `-T4q`, `-dvv`, `-kq19`,
+`-fo FILE`. Letters `d t k f c z l r q v`, a level, `T#`, and `D` or `o` last. Only `{d,t,k,f,c}` with
+a trailing `D` expanded before; the rest were "unknown option". Fifteen spellings were run through
+zstd 1.5.7 and gzstd: same exit code and same files each time. `-z`/`--compress` is accepted (the
+default; the last of `-d`/`-t`/`-z` wins).
+
+`-M`, `--memlimit` and `--memory` take zstd's sizes: `512MB`, `2G`, `64MiB` (powers of 1024, rounded
+up to a whole MiB). A bare number is still MiB here, where zstd reads bytes; that one difference is
+kept, and documented, because changing it would change every existing gzstd command line that sets
+a limit.
+
+### 8. A read error is exit 3, and every test hook now announces itself
+
+The parallel decompress reader reported a failed `pread` as corrupt data (exit 4). An archive on a
+failing device is not a corrupt archive: it is exit 3 now. An archive that ends early is still exit 4.
+No filesystem here will fail a read on request, so `GZSTD_DEBUG_MT_PREAD_EIO=N` injects one.
+
+That makes about a hundred `GZSTD_DEBUG_*` variables, none documented outside the source, none of
+which said anything when set. One left exported in a shell or a job script would change what a real
+run does, up to failing it on purpose, in silence. Every one that is set is now named on stderr before
+any work starts, at any verbosity, with a line saying what test hooks are and to unset them. The
+suite, which sets hooks for every run and inspects stderr, acknowledges them with
+`GZSTD_DEBUG_HOOKS_ACK`; a stray hook does not come with its acknowledgement.
+
+### 10. A GPU that stops answering ends the run
+
+A CUDA or nvCOMP call that never returns cannot be recovered from: the thread is inside the driver,
+and the abort path every other GPU fault takes ends in a join on that thread. Such a run sat there
+forever. It cannot be fixed but it can be ended: when one device has been inside a single submit, or a
+single completion wait and read-back, for 10 minutes, the run stops with a loud error, exit 5, and its
+partial output removed.
+
+A default-on timer that kills a healthy run is worse than a hang, so what it measures is narrow. A
+worker waiting for input is in an intake phase; a drain thread with nothing submitted is idle; a slow
+sink does not hold the drain. Verified with the limit at 3 seconds: a wedged batch is stopped in 4
+seconds; a run that waits 8 seconds for its input at the start, one whose input pauses 8 seconds
+mid-run, and one whose reader sleeps 8 seconds, all finish and round-trip. Compression only:
+decompression already reclaims a wedged batch and finishes on the CPU.
+
+### The smaller ones
+
+- **3.** A `--tar` rebuild walks and reads every source again. The rejected pass's verdict ("file
+  changed as we read it", a failed staged read) and its `--rm` records now go with it; they used to
+  survive a clean rebuild as exit 1 with `--rm` suppressed. A real error is found again by the
+  rebuild's own walk: an unreadable member still exits 1 and keeps the sources.
+- **5.** `gzstd -d -D dict -f -o dict x.zst` is refused, as compression already was.
+  `-d --patch-from=old -o old` still updates the reference in place.
+- **7.** A GPU decompress fault finishes on the CPU and returns normally, so `--calibrate` recorded the
+  CPU's rate in the "gpu decompress" row. The row is discarded when the pass was rescued.
+- **9.** When the cuFile statistics re-exec fails, the run used to warn that it would crash at exit
+  (status 139) and then did. It now finishes and leaves through `_Exit`, as the abandoned-GPU exit
+  already does. Without that the forced case exits 139; with it, 0.
+- **13.** A side input behind stdout (the dictionary, a list file) is refused only when the run writes
+  to stdout. `exec 1<>dict; gzstd -t -D dict x.zst` runs.
+- **14.** `--tar` onto an existing file opened `1<>` is looked up before it is refused: the file's
+  parent chain is climbed by identity, and outside every directory being archived the run goes ahead
+  (replacing the file, no old tail left). Inside the tree, or when it cannot tell, it is still refused
+  unless `-f` is given.
+
+### 12. What checking sparse maps on an indexed listing would cost
+
+Measured on a 9.3 GiB archive holding 20 GiB of ordinary files, 2000 small ones and 200 sparse members
+(50 MiB of data in a 1 GiB file each), warm, three runs each:
+
+| | time |
+|---|---|
+| indexed `-l --tar` today (reads the index) | 9-10 ms |
+| `-t --tar` (decodes everything, checks the maps) | 1.0-3.3 s |
+| decoding the 200 sparse members only | 2.27-2.29 s |
+| decoding one sparse member | 53-58 ms |
+| indexed `-l --tar` of an archive with no sparse members | 7-11 ms |
+
+A header-only check would decode about one frame per sparse member: somewhere between a tenth of a
+second and two seconds for this archive, against 10 ms. Nothing for an archive without sparse members.
+The maintainer's decision on those numbers: leave the listing as it is. `-t --tar` is where the maps
+are checked.
+
+### Found on the way, and fixed: `-M` was not a limit
+
+Testing the new `-M` sizes showed that the limit was hardly ever applied when decompressing. A frame
+with a 30.9 MiB window decoded at `-M4`, from a file and from standard input; `zstd --memory=4MB`
+refuses it; `--help` called the option "a hard limit". The limit was set on the decode contexts as
+zstd's window limit, which only binds zstd's streaming decoder, and nearly every frame here is decoded
+in one shot into a buffer of its declared size. Only a frame too large for that (the suite's one `-M`
+cell used 128 MiB) took the streaming path and was refused, as a data error (exit 4).
+
+The ruling was to do what zstd does. Each frame's declared window is now checked where it is about to
+be decoded: in the readers, where a frame becomes a task (which is what covers the GPU), in the CPU
+decoder, and in the tar decode pool. The streaming contexts get the exact limit instead of the power of
+two below it (`-M100` used to mean 64 MiB to a streamed frame). A refusal is exit 1 on every path --
+zstd's code, and the right class here: the archive is intact and the caller's own limit refused it, so
+it is not the data error (4) the streamed case used to report. The message says what limit would work:
+
+    frame requires too much memory for decoding: its window is 8388608 bytes (8 MiB), and the limit
+    set with -M/--memory is 4 MiB.  Decode it with -M8 or more, or without -M
+
+Thirteen cases against zstd 1.5.7, same verdict in each: the 30.9 MiB frame at `-M4` from a file, from
+standard input, under `-t`, `--hybrid` and `--gpu-only`; a frame with no declared content size; the
+boundary (`-M31` decodes it, `-M30` does not); and frames within the limit. The window is a property
+of how the data was compressed, not of its size: level 3 uses 2 MiB, level 19 uses 8 MiB. Without `-M`
+there is still no limit. `--help` says all of this now.
+
+### What the review of this version found
+
+Codex reviewed v0.17.89 before the suites ran and found three things, each reproduced before its fix
+was taken:
+
+- **A value that looks like a bundle was split.** `gzstd -o -dqf input` wrote to `./-d` and gained
+  `-f`. The wider bundles made an old hazard (`-o -dc`) much easier to hit. An option's value is now
+  never expanded, and the cuFile pre-scan uses the same list.
+- **`-d --tar -c` skipped a member of a type it cannot extract**, silently, where disk extraction
+  reports it and exits 1. Same error now.
+- **A stopped process tripped the new stall guard.** SIGSTOP for longer than the limit while a batch
+  was in flight, then SIGCONT, and the pause was counted as a hung driver call: exit 5. The guard now
+  discards its samples when its own clock shows it was not running.
+
+And three smaller ones: an output with more than one link is treated as "cannot tell" by the new
+containment check (a hard link from inside the tree made it say "outside"); `-d --tar -o -` means
+stdout; `--train -O` is refused.
+
+Its second round was about the `-M` limit, which had gone in after the first. The limit must apply to
+the user's input and to nothing else, and in three places it applied to the wrong thing or not at all:
+`--calibrate -M4` refused the corpus calibration had generated itself (found independently too);
+`--sliding-window --verify -19 -M4` refused the frame the same run had just compressed, where `-M` is
+a memory budget; and the `--tar` GPU decode pool could decode an oversized frame without the check.
+The limit is now armed only when the run decodes the user's input, and the pool checks each batch.
+Round three: no blockers, safe to tag.
+
+### Tests
+
+Suites on the final code: the extensive GPU run 749 passed, 0 failed, 1 skipped of 750; the CPU-only
+build 427 passed, 0 failed. Both builds compile without warnings. Two older extensive cells were updated
+for behaviour this version changes on purpose: `-dz` was the suite's example of an unknown bundle and
+is now `-d -z`, and the one existing `-M` cell expected the streamed refusal's old exit 4.
+
+Nine new cells (six need no GPU) and the shared-stdout cells extended for items 1, 5, 13 and 14.
+Eighteen builds with one change removed each fail their cell, and the `-M` cell also holds the two
+compress-side cases that must NOT be refused. Two fixtures had to grow before their
+cell meant anything: the parallel reader is only used above 128 MiB of compressed input, and a notice
+printed at default verbosity cannot be found in a run made with `-q`. The stall-guard cell failed once
+in about forty runs with exit 0 (the run had completed: no batch was ever held) and could not be made
+to do it again; its failure message now carries the evidence. The shared-stdout matrix, now
+with outputs at a base: 160 checks over eleven backends, 0 wrong.
 
 ## v0.17.88 — the two shared-stdout gaps the tag review found
 

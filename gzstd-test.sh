@@ -439,6 +439,10 @@ files_match() {
 # cpu-only coverage.  Disable it globally and let the dedicated tests opt back
 # in, so the GPU paths stay exercised on small fixtures.
 export GZSTD_DEBUG_GPU_MIN_BYTES=0
+# Since v0.17.89 gzstd prints a loud banner naming every GZSTD_DEBUG_* hook it
+# finds in the environment.  This suite sets hooks for every run and inspects
+# stderr, so it acknowledges them; the cell that tests the banner unsets this.
+export GZSTD_DEBUG_HOOKS_ACK=1
 # Same reasoning for the "is the GPU still worth starting" sample: the suite's
 # fixtures all finish long before cuInit could, so an honest verdict would skip
 # the GPU everywhere and the GPU paths would stop being covered.  0 = always
@@ -610,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=582
-$EXTENSIVE && EXPECTED_TESTS=741
+EXPECTED_TESTS=591
+$EXTENSIVE && EXPECTED_TESTS=750
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -806,8 +810,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # (parts 7-8, GPU): 580, 739; no-GPU deltas 160 -> 161 and 189 -> 190.
 # v0.17.88: two more shared-stdout cells (a killed run; stdout that is also an
 # input), neither needing a GPU: 582, 741.
-EXPECTED_NOGPU_DELTA=161
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=190   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
+# v0.17.89: nine cells for the review decisions: 591, 750.  Three need a GPU
+# (the stall guard, --calibrate, and the cuFile re-exec, which also needs GDS):
+# no-GPU deltas 161 -> 164 and 190 -> 193; no-GDS deltas 16 -> 17 and 17 -> 18.
+EXPECTED_NOGPU_DELTA=164
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=193   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -825,8 +832,8 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=190   # MEASURED 2026-09-21 (607 - 463) + 34 
 # one of the 607 cells has now been exercised.
 # v0.17.83 made it mode-DEPENDENT by one: its nvidia-fs staleness cell is a GDS
 # cell that exists only under --extensive.
-EXPECTED_NOGDS_DELTA=16   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87, derived
-$EXTENSIVE && EXPECTED_NOGDS_DELTA=17   # + the v0.17.83 --extensive cell
+EXPECTED_NOGDS_DELTA=17   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89, derived
+$EXTENSIVE && EXPECTED_NOGDS_DELTA=18   # + the v0.17.83 --extensive cell
 
 # ============================================================
 # Banner & system info
@@ -8200,6 +8207,17 @@ head -c -8 "$so/o3b" > "$so/o3b.zst"
 [[ "$(tail -c 8 "$so/o3b")" == "TRAILER" ]] && so_is "$so/o3b.zst" "$so/a" \
   && "$GZSTD" -l "$so/o3b.zst" >/dev/null 2>&1 && cmp -s "$so/o3b.zst" "$so/a.zst" \
   || so_why+=" [a trailer after the O_DIRECT writer landed inside the archive (its seek table)]"
+# v0.17.89: the later inputs get the O_DIRECT writer too (v0.17.88 gave them the
+# buffered one: correct, and MEASURED 3.5x slower on a 130 GiB second input).
+# Byte-identity cannot show which writer ran, so count the adoptions at -v; and
+# the result must be byte-identical to the same archives written one at a time.
+"$GZSTD" --cpu-only --direct -v -c "$so/a" "$so/b" "$so/a" > "$so/o3c.zst" 2> "$so/o3c.err"
+so_adopt=$(tr '\r' '\n' < "$so/o3c.err" | grep -ac 'stdout redirect using O_DIRECT')
+if [[ $so_adopt -ge 1 ]]; then
+  [[ $so_adopt -eq 3 ]] || so_why+=" [three inputs, $so_adopt O_DIRECT adoptions: the later inputs fell back to the buffered writer]"
+fi
+cat "$so/a.zst" "$so/b.zst" "$so/a.zst" | cmp -s - "$so/o3c.zst" \
+  || so_why+=" [-c a b a is not byte-identical to the three archives written separately]"
 [[ -z "$so_why" ]] && pass "-c to a redirected file appends to what is already there" \
   || fail "-c to a redirected file appends to what is already there" "$so_why"
 
@@ -8341,6 +8359,7 @@ rc=0; "$GZSTD" --cpu-only --direct -q -c "$so/a" "$so/b" > "$so/o14.zst" 2>/dev/
 # a named operand is refused by identity; a file deeper in the tree cannot be
 # checked before the walk, so an output that already holds data (and is not
 # open for appending) is refused outright.
+so_selfmsg_pre="archive cannot contain itself; not dumped"
 cp "$so/a.zst" "$so/l.zst"; rc=0
 ( exec 1<>"$so/l.zst"; "$GZSTD" -l "$so/l.zst" 2>/dev/null ) || rc=$?
 [[ $rc -eq 2 ]] && cmp -s "$so/l.zst" "$so/a.zst" || so_why+=" [-l onto the archive it lists: exit $rc, archive $(cmp -s "$so/l.zst" "$so/a.zst" && echo intact || echo OVERWRITTEN)]"
@@ -8351,23 +8370,33 @@ rc=0; ( cd "$so/tw" && "$GZSTD" --cpu-only -q -c --tar data >> data 2>/dev/null 
 [[ $rc -eq 2 ]] && cmp -s "$so/tw/data" "$so/a" || so_why+=" [--tar data >> data: exit $rc, $(cmp -s "$so/tw/data" "$so/a" && echo intact || echo CHANGED)]"
 rc=0; ( cd "$so/tw" && exec 1<>tree/sub/f2 && "$GZSTD" --cpu-only -q -c --tar tree 2>/dev/null ) || rc=$?
 [[ $rc -eq 2 ]] && cmp -s "$so/tw/tree/sub/f2" "$so/b" || so_why+=" [--tar, stdout is a file inside the tree: exit $rc, $(cmp -s "$so/tw/tree/sub/f2" "$so/b" && echo intact || echo DESTROYED)]"
-# -f IS THE OVERRIDE for that last rule, and for nothing else in this family:
-# the refusal names it, and with it the run goes ahead with a warning and
-# replaces the file from the write position on -- no old tail left behind the
-# new archive, on either writer (the buffered one would leave it, as GNU tar
-# does).  A file that is both read and written stays refused even with -f.
+# THAT RULE LOOKS BEFORE IT REFUSES (v0.17.89): the file's parent chain is
+# climbed by identity, and a file OUTSIDE every directory being archived is
+# simply the caller's chosen output -- the run goes ahead, and replaces it from
+# the write position on with no old tail left behind (the buffered writer would
+# leave one, as GNU tar does).  INSIDE the tree it is refused, and -f is the
+# override, for this rule and nothing else in this family: the refusal names
+# it, and with it the run goes ahead with a warning.  A file that is both read
+# and written stays refused even with -f.
 rc=0; ( cd "$so/tw" && exec 1<>tree/sub/f2 && "$GZSTD" --cpu-only -q -c --tar tree 2>../f0.err ) || rc=$?
-grep -aq -- "-f to overwrite" "$so/f0.err" || so_why+=" [the --tar refusal does not offer -f]"
+grep -aq -- "-f to overwrite" "$so/f0.err" && grep -aq "inside a directory being archived" "$so/f0.err" \
+  || so_why+=" [the --tar refusal does not say the file is inside the tree, or does not offer -f]"
 ( cd "$so/tw" && "$GZSTD" --cpu-only -q -c --tar tree > ../fref.tzst 2>/dev/null )
 for so_fl in --direct --no-direct; do
   # LONGER than the archive (about 5 MB), or there is no old tail to leave: at
   # 3 MB the build without the truncate passed this.
   head -c 12000000 /dev/urandom > "$so/tw/old.x"; rc=0
-  ( cd "$so/tw" && exec 1<>old.x && "$GZSTD" --cpu-only $so_fl -q -f -c --tar tree 2>../f1.err ) || rc=$?
-  [[ $rc -eq 0 ]] && cmp -s "$so/tw/old.x" "$so/fref.tzst" && grep -aq "overwrite forced" "$so/f1.err" \
-    || so_why+=" [--tar -f onto an existing file ($so_fl): exit $rc, $(stat -c %s "$so/tw/old.x") bytes (want $(stat -c %s "$so/fref.tzst")), warning $(grep -ac 'overwrite forced' "$so/f1.err")]"
+  ( cd "$so/tw" && exec 1<>old.x && "$GZSTD" --cpu-only $so_fl -q -c --tar tree 2>../f1.err ) || rc=$?
+  [[ $rc -eq 0 ]] && cmp -s "$so/tw/old.x" "$so/fref.tzst" && [[ ! -s "$so/f1.err" ]] \
+    || so_why+=" [--tar onto an existing file OUTSIDE the tree ($so_fl): exit $rc, $(stat -c %s "$so/tw/old.x") bytes (want $(stat -c %s "$so/fref.tzst")), stderr '$(head -c 60 "$so/f1.err")']"
 done
 rm -f "$so/tw/old.x"
+cp "$so/b" "$so/tw/tree/sub/f2"; rc=0
+( cd "$so/tw" && exec 1<>tree/sub/f2 && "$GZSTD" --cpu-only -f -c --tar tree 2>../f2.err ) || rc=$?
+[[ $rc -eq 0 ]] && grep -aq "overwrite forced" "$so/f2.err" && grep -aq "tree/sub/f2: $so_selfmsg_pre" "$so/f2.err" \
+  && "$GZSTD" -t --tar -q "$so/tw/tree/sub/f2" 2>/dev/null \
+  || so_why+=" [-f onto a file INSIDE the tree: exit $rc, want a warning, the tar notice and a valid archive]"
+cp "$so/b" "$so/tw/tree/sub/f2"
 rc=0; ( cd "$so/tw" && exec 1<>data && "$GZSTD" --cpu-only -q -f -c --tar data 2>/dev/null ) || rc=$?
 [[ $rc -eq 2 ]] && cmp -s "$so/tw/data" "$so/a" || so_why+=" [-f let stdout be the tar operand: exit $rc]"
 # ...while an archive written INTO the tree it archives, and one appended to an
@@ -8418,6 +8447,15 @@ if "$GZSTD" --train -q "$so"/smp? -o "$so/dict" 2>/dev/null && "$GZSTD" --cpu-on
   ( exec 1<>"$so/dict"; "$GZSTD" --cpu-only --direct -q -d -c -D "$so/dict" "$so/ad.zst" 2>/dev/null ) || rc=$?
   [[ $rc -eq 2 ]] && cmp -s "$so/dict" "$so/dict.keep" || so_why+=" [stdout is the -D dictionary on decode: exit $rc, dictionary $(cmp -s "$so/dict" "$so/dict.keep" && echo intact || echo DESTROYED)]"
   rc=0; "$GZSTD" --cpu-only -q -d -c -D "$so/dict" "$so/ad.zst" 2>/dev/null | cmp -s - "$so/a" || so_why+=" [-d -c -D to a pipe no longer works]"
+  # ...but ONLY when something is written there (v0.17.89; zstd checks nothing):
+  # -t writes nothing to stdout, and a named output does not either.
+  rc=0; ( exec 1<>"$so/dict"; "$GZSTD" --cpu-only -q -t -D "$so/dict" "$so/ad.zst" 2>/dev/null ) || rc=$?
+  [[ $rc -eq 0 ]] && cmp -s "$so/dict" "$so/dict.keep" || so_why+=" [-t -D dict with stdout on the dictionary: exit $rc, want 0 (nothing is written to stdout)]"
+  rc=0; ( exec 1<>"$so/dict"; "$GZSTD" --cpu-only -q -f -d -D "$so/dict" "$so/ad.zst" -o "$so/o16" 2>/dev/null ) || rc=$?
+  [[ $rc -eq 0 ]] && cmp -s "$so/dict" "$so/dict.keep" && cmp -s "$so/o16" "$so/a" || so_why+=" [-d -D dict -o FILE with stdout on the dictionary: exit $rc, want 0]"
+  # The dictionary as the decode OUTPUT is refused, as on compression (v0.17.89).
+  rc=0; "$GZSTD" --cpu-only -q -d -D "$so/dict" -f -o "$so/dict" "$so/ad.zst" 2>/dev/null || rc=$?
+  [[ $rc -eq 2 ]] && cmp -s "$so/dict" "$so/dict.keep" || so_why+=" [-d -D dict -f -o dict: exit $rc, dictionary $(cmp -s "$so/dict" "$so/dict.keep" && echo intact || echo REPLACED)]"
 else
   so_why+=" [could not build the dictionary fixture]"
 fi
@@ -8697,6 +8735,265 @@ if has_gpu 2>/dev/null; then
 else
   skip "a GPU batch published in the writer's blind window still wakes it" "no GPU"
 fi
+
+# ────────────────────────────────────────────────────────────
+section "Decisions from the review (v0.17.89)"
+
+rv="$TMPDIR/rv89"; rm -rf "$rv"; mkdir -p "$rv"
+( set +o pipefail
+  head -c 300000 /dev/urandom | base64 > "$rv/small"
+  # Over 128 MiB COMPRESSED (about 180 MiB here), or the parallel decompress
+  # reader is not used and cell 2's hook has nothing to fail.
+  head -c 180000000 /dev/urandom | base64 -w0 | head -c 240000000 > "$rv/big" )
+"$GZSTD" --cpu-only -q -f "$rv/big" -o "$rv/big.zst" 2>/dev/null
+
+# 1. DIAGNOSTIC HOOKS ARE ANNOUNCED.  About a hundred GZSTD_DEBUG_* variables
+# exist for this suite; one left set in a real environment used to change what
+# a run does in silence.  Every one that is set is now named on stderr, at any
+# verbosity, unless GZSTD_DEBUG_HOOKS_ACK acknowledges them (this suite exports
+# it; this cell removes it).
+rv_why=""
+env -u GZSTD_DEBUG_HOOKS_ACK GZSTD_DEBUG_GPU_MIN_BYTES=0 "$GZSTD" --cpu-only -q -t "$rv/big.zst" 2>"$rv/b1.err" \
+  || rv_why+=" [the run failed with the banner on]"
+grep -aq "DIAGNOSTIC HOOK SET IN THE ENVIRONMENT: GZSTD_DEBUG_GPU_MIN_BYTES=0" "$rv/b1.err" \
+  || rv_why+=" [a set hook was not announced under -q]"
+grep -aq "test hook" "$rv/b1.err" || rv_why+=" [no summary line]"
+"$GZSTD" --cpu-only -q -t "$rv/big.zst" 2>"$rv/b2.err"
+[[ ! -s "$rv/b2.err" ]] || rv_why+=" [the acknowledgement did not silence the banner]"
+env -u GZSTD_DEBUG_HOOKS_ACK -u GZSTD_DEBUG_GPU_MIN_BYTES -u GZSTD_DEBUG_GPU_GUARD_SEC \
+  "$GZSTD" --cpu-only -q -t "$rv/big.zst" 2>"$rv/b3.err"
+grep -aq "DIAGNOSTIC HOOK" "$rv/b3.err" && rv_why+=" [a banner with no hook set: $(grep -a 'HOOK SET' "$rv/b3.err" | head -1 | cut -c1-90)]"
+[[ -z "$rv_why" ]] && pass "diagnostic environment hooks are announced loudly" \
+  || fail "diagnostic environment hooks are announced loudly" "$rv_why"
+
+# 2. A READ error is exit 3, not a data error.  The parallel decompress reader
+# reported a failed pread as corrupt data (exit 4); an archive on a failing
+# device is not a corrupt archive.  GZSTD_DEBUG_MT_PREAD_EIO injects the error
+# no filesystem here will produce.  An archive that ENDS early is still exit 4.
+rv_why=""
+rc=0; GZSTD_DEBUG_MT_PREAD_EIO=1 "$GZSTD" -d --cpu-only -q -f "$rv/big.zst" -o "$rv/big.out" 2>"$rv/r.err" || rc=$?
+if ! grep -aq "pread failed" "$rv/r.err"; then
+  rv_why+=" [the hook did not reach the parallel reader: exit $rc, '$(head -c 80 "$rv/r.err")']"
+else
+  [[ $rc -eq 3 ]] || rv_why+=" [a read error exited $rc, want 3]"
+  [[ ! -e "$rv/big.out" ]] || rv_why+=" [the partial output was left behind]"
+fi
+head -c 150000000 "$rv/big.zst" > "$rv/cut.zst"
+rc=0; "$GZSTD" -t --cpu-only -q "$rv/cut.zst" 2>/dev/null || rc=$?
+[[ $rc -eq 4 ]] || rv_why+=" [a truncated archive exited $rc, want 4]"
+[[ -z "$rv_why" ]] && pass "a read error while decompressing is exit 3, a short archive exit 4" \
+  || fail "a read error while decompressing is exit 3, a short archive exit 4" "$rv_why"
+
+# 3. -d --tar -c (and -O): member CONTENTS to stdout, as `tar -xO`.  The flag
+# used to be accepted and ignored -- members went to disk and nothing reached
+# the pipe.  GNU tar is the oracle, through a pipe: writing to a regular file,
+# tar seeks its stdout for a sparse member and corrupts its own output.
+if command -v tar >/dev/null 2>&1; then
+  rv_why=""
+  mkdir -p "$rv/tree/sub" "$rv/tree/empty"
+  cp "$rv/small" "$rv/tree/a.txt"; head -c 3000000 "$rv/big" > "$rv/tree/sub/b.txt"; printf 'tiny\n' > "$rv/tree/sub/t"
+  ln -s a.txt "$rv/tree/link"; ln "$rv/tree/a.txt" "$rv/tree/hard"
+  ( cd "$rv" && head -c 5000 big > tree/sparse.bin && truncate -s 1048576 tree/sparse.bin \
+      && head -c 70000 big >> tree/sparse.bin && truncate -s 3145728 tree/sparse.bin
+    "$GZSTD" --cpu-only -q -f --tar tree -o idx.tzst 2>/dev/null
+    "$GZSTD" --cpu-only -q -f --tar --sparse tree -o sp.tzst 2>/dev/null )
+  for rv_a in idx.tzst sp.tzst; do
+    "$GZSTD" -d -q --cpu-only -c "$rv/$rv_a" 2>/dev/null | tar -xOf - 2>/dev/null | cat > "$rv/t.all"
+    for rv_f in -c -O; do
+      rc=0; ( cd "$rv" && mkdir -p xo && cd xo && "$GZSTD" -d --tar $rv_f -q "../$rv_a" > ../g.all 2>/dev/null ) || rc=$?
+      [[ $rc -eq 0 ]] && cmp -s "$rv/g.all" "$rv/t.all" || rv_why+=" [$rv_a $rv_f: exit $rc, $(stat -c %s "$rv/g.all") bytes against tar's $(stat -c %s "$rv/t.all")]"
+    done
+    [[ -z "$(ls -A "$rv/xo" 2>/dev/null)" ]] || rv_why+=" [$rv_a: -c still wrote members to disk]"
+    "$GZSTD" -d -q --cpu-only -c "$rv/$rv_a" 2>/dev/null | tar -xOf - tree/sub tree/sparse.bin 2>/dev/null | cat > "$rv/t.sel"
+    "$GZSTD" -d --tar -c -q "$rv/$rv_a" tree/sub tree/sparse.bin > "$rv/g.sel" 2>/dev/null
+    cmp -s "$rv/g.sel" "$rv/t.sel" || rv_why+=" [$rv_a, selected members: differs from tar -xO]"
+  done
+  rc=0; "$GZSTD" -d --tar -c -q "$rv/idx.tzst" tree/nope >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 1 ]] || rv_why+=" [a member that is not there exited $rc, want 1]"
+  # A member of a type gzstd cannot extract is REPORTED here as it is on disk
+  # (exit 1); skipping it quietly sent an incomplete stream at exit 0.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$rv/odd.tar" <<'PYEOF_ODD'
+import sys
+def hdr(name, size, t):
+    h = bytearray(512); h[0:len(name)] = name
+    h[100:108] = b'0000644\0'; h[108:116] = b'0001750\0'; h[116:124] = b'0001750\0'
+    h[124:136] = ('%011o' % size).encode() + b'\0'; h[136:148] = b'00000000000\0'
+    h[148:156] = b'        '; h[156:157] = t; h[257:265] = b'ustar\x0000'
+    h[148:156] = ('%06o' % sum(h)).encode() + b'\0 '
+    return bytes(h)
+pad = lambda b: b + b'\0' * (-len(b) % 512)
+open(sys.argv[1], 'wb').write(hdr(b'a.txt', 5, b'0') + pad(b'hello') + hdr(b'weird', 6, b'Z') + pad(b'SECRET')
+                              + hdr(b'b.txt', 5, b'0') + pad(b'world') + b'\0' * 1024)
+PYEOF_ODD
+    "$GZSTD" --cpu-only -q -f "$rv/odd.tar" -o "$rv/odd.tar.zst" 2>/dev/null
+    rc=0; rv_odd=$("$GZSTD" -d --tar -c -q "$rv/odd.tar.zst" 2>/dev/null) || rc=$?
+    [[ $rc -eq 1 && "$rv_odd" == "helloworld" ]] || rv_why+=" [an unsupported member type: exit $rc, want 1 with the other members' data]"
+  fi
+  rc=0; "$GZSTD" --cpu-only -q -O -c "$rv/small" >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 2 ]] || rv_why+=" [-O without --tar exited $rc, want 2]"
+  [[ -z "$rv_why" ]] && pass "-d --tar -c writes member contents to stdout, as tar -xO" \
+    || fail "-d --tar -c writes member contents to stdout, as tar -xO" "$rv_why"
+else
+  skip_host "-d --tar -c writes member contents to stdout, as tar -xO" "no tar to compare with"
+fi
+
+# 4. zstd's short-flag bundles and memory sizes.  -qf, -dq, -19f and -T4q were
+# "unknown option"; -z was unknown; -M512MB was "invalid value".
+rv_why=""
+rv_run() {   # rv_run WANT-FILE args... : run in a clean dir holding f (and f.zst), expect WANT-FILE
+  local want=$1; shift
+  rm -rf "$rv/w"; mkdir -p "$rv/w"; cp "$rv/small" "$rv/w/f"; cp "$rv/small.zst" "$rv/w/p.zst"
+  ( cd "$rv/w" && "$GZSTD" --cpu-only "$@" >/dev/null 2>"$rv/w.err" ) || { rv_why+=" [$*: exit $?: $(head -c 60 "$rv/w.err")]"; return; }
+  [[ -e "$rv/w/$want" ]] || rv_why+=" [$*: did not produce $want]"
+}
+"$GZSTD" --cpu-only -q -f "$rv/small" -o "$rv/small.zst" 2>/dev/null
+rv_run f.zst -qf f;          [[ ! -s "$rv/w.err" ]] || rv_why+=" [-qf was not quiet]"
+rv_run f.zst -19f f;         "$GZSTD" --cpu-only -q -19 -f "$rv/small" -o "$rv/l19.zst" 2>/dev/null
+cmp -s "$rv/w/f.zst" "$rv/l19.zst" || rv_why+=" [-19f is not -19 -f]"
+rv_run f.zst -T4q f
+rv_run out   -dq p.zst -o out;   cmp -s "$rv/w/out" "$rv/small" || rv_why+=" [-dq did not decompress]"
+rv_run out   -dqf p.zst -o out
+rv_run f.zst -zf f
+rv_run o.zst -qfo o.zst f
+rv_run f.zst -kq19 f
+rc=0; "$GZSTD" --cpu-only -tq "$rv/small.zst" 2>/dev/null || rc=$?; [[ $rc -eq 0 ]] || rv_why+=" [-tq: exit $rc]"
+# A VALUE is never a group: `-o -dqf f` names the output "-dqf".  Split, it wrote
+# ./-d and gained -f (found by the review of this very change).
+rm -rf "$rv/w"; mkdir -p "$rv/w"; cp "$rv/small" "$rv/w/f"; printf 'OLD' > "$rv/w/-d"
+( cd "$rv/w" && "$GZSTD" --cpu-only -q -o -dqf f 2>/dev/null )
+[[ -e "$rv/w/-dqf" && "$(cat "$rv/w/-d")" == "OLD" ]] || rv_why+=" [-o -dqf: the value was split into flags ($(ls -A "$rv/w" | paste -sd,))]"
+rc=0; "$GZSTD" --cpu-only -q -xf "$rv/small" >/dev/null 2>&1 || rc=$?; [[ $rc -eq 2 ]] || rv_why+=" [-xf (not a flag) exited $rc, want 2]"
+for rv_m in -M512MB --memory=512MB --memlimit=2G "-M 64MiB" -M100; do
+  rc=0; "$GZSTD" --cpu-only -q -d $rv_m -c "$rv/small.zst" 2>/dev/null | cmp -s - "$rv/small" || rc=1
+  [[ $rc -eq 0 ]] || rv_why+=" [$rv_m was not accepted]"
+done
+rc=0; "$GZSTD" --cpu-only -q -d -M12X -c "$rv/small.zst" >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 2 ]] || rv_why+=" [-M12X exited $rc, want 2]"
+[[ -z "$rv_why" ]] && pass "zstd's short-flag bundles, -z and memory sizes are understood" \
+  || fail "zstd's short-flag bundles, -z and memory sizes are understood" "$rv_why"
+
+# 5. THE TAR VERDICT OF A DISCARDED PASS GOES WITH IT.  A rebuild walks and reads
+# every source again; an error recorded by the rejected pass used to survive a
+# clean rebuild (exit 1, --rm suppressed).  The hook raises the flag before the
+# first pass, as an assembly-time error in it would.  A REAL error -- a file
+# that cannot be read -- is found again by the rebuild's own walk and stays.
+rv_why=""
+mkdir -p "$rv/tt"; head -c 6000000 "$rv/big" > "$rv/tt/d1"; cp "$rv/small" "$rv/tt/d2"
+rc=0; GZSTD_DEBUG_TAR_ERR_FIRST_PASS=1 GZSTD_DEBUG_CORRUPT_FRAME=2 "$GZSTD" --cpu-only --verify --chunk-size=1 \
+  -f --tar -C "$rv" tt -o "$rv/tt.tzst" 2>"$rv/t1.err" >/dev/null || rc=$?
+grep -aq "rebuilding" "$rv/t1.err" || rv_why+=" [no rebuild happened]"
+[[ $rc -eq 0 ]] || rv_why+=" [a clean rebuild still exited $rc]"
+rc=0; GZSTD_DEBUG_TAR_ERR_FIRST_PASS=1 "$GZSTD" --cpu-only -q --chunk-size=1 -f --tar -C "$rv" tt -o "$rv/tt.tzst" 2>/dev/null || rc=$?
+[[ $rc -eq 1 ]] || rv_why+=" [without a rebuild the flag must stand: exit $rc, want 1]"
+if [[ $EUID -ne 0 ]]; then
+  : > "$rv/tt/secret"; chmod 000 "$rv/tt/secret"
+  rc=0; GZSTD_DEBUG_CORRUPT_FRAME=2 "$GZSTD" --cpu-only --verify --chunk-size=1 -f --tar -C "$rv" tt -o "$rv/tt.tzst" >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 1 ]] || rv_why+=" [an unreadable member plus a rebuild exited $rc, want 1]"
+  chmod 644 "$rv/tt/secret"
+fi
+[[ -z "$rv_why" ]] && pass "a rebuilt tar archive is judged on the rebuild, not on the discarded pass" \
+  || fail "a rebuilt tar archive is judged on the rebuild, not on the discarded pass" "$rv_why"
+
+# 5b. -M ON DECOMPRESSION IS A LIMIT, as in zstd.  It was set on the decode
+# contexts and never applied: the limit binds zstd's streaming decoder, and
+# nearly every frame here is decoded in one shot.  A frame with an 8 MiB window
+# (level 19) decoded at -M4; `zstd --memory=4MB` refuses it.  Each frame's
+# declared window is now checked before it is decoded: exit 1, and the message
+# says what limit would do.  Level 3 uses a 2 MiB window.
+rv_why=""
+head -c 9500000 "$rv/big" > "$rv/w.in"
+"$GZSTD" --cpu-only -q -19 -f "$rv/w.in" -o "$rv/w19.zst" 2>/dev/null
+"$GZSTD" --cpu-only -q  -3 -f "$rv/w.in" -o "$rv/w3.zst"  2>/dev/null
+rc=0; "$GZSTD" -d --cpu-only -q -M4 -c "$rv/w19.zst" >/dev/null 2>"$rv/m.err" || rc=$?
+[[ $rc -eq 1 ]] && grep -aq "too much memory" "$rv/m.err" && grep -aq -- "-M8" "$rv/m.err" \
+  || rv_why+=" [-M4 on an 8 MiB window: exit $rc, want 1 and a message naming -M8: '$(head -c 90 "$rv/m.err")']"
+rc=0; "$GZSTD" -d --cpu-only -q -M4 -c < "$rv/w19.zst" >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 1 ]] || rv_why+=" [the same from standard input: exit $rc]"
+rc=0; "$GZSTD" -t --cpu-only -q -M4 "$rv/w19.zst" 2>/dev/null || rc=$?
+[[ $rc -eq 1 ]] || rv_why+=" [-t -M4: exit $rc]"
+"$GZSTD" -d --cpu-only -q -M8 -c "$rv/w19.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [-M8 did not decode an 8 MiB window]"
+"$GZSTD" -d --cpu-only -q -M8MB -c "$rv/w19.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [-M8MB did not decode it]"
+"$GZSTD" -d --cpu-only -q -c "$rv/w19.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [no limit did not decode it]"
+rc=0; "$GZSTD" -d --cpu-only -q -M1 -c "$rv/w3.zst" >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 1 ]] || rv_why+=" [-M1 on a 2 MiB window: exit $rc, want 1]"
+"$GZSTD" -d --cpu-only -q -M2 -c "$rv/w3.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [-M2 did not decode a 2 MiB window]"
+# ...and ONLY when decoding the user's input.  Compressing, -M is a memory budget:
+# the frames --verify decodes are the ones this run just wrote, and must not be
+# refused (the sliding-window verifier did, as soon as the limit was real).
+for rv_v in "--verify" "--sliding-window --verify"; do
+  rc=0; "$GZSTD" --cpu-only -q -19 -M4 $rv_v -f "$rv/w.in" -o "$rv/wv.zst" 2>/dev/null || rc=$?
+  [[ $rc -eq 0 ]] && "$GZSTD" -d --cpu-only -q -c "$rv/wv.zst" 2>/dev/null | cmp -s - "$rv/w.in" \
+    || rv_why+=" [compress -19 -M4 $rv_v: exit $rc, want 0]"
+done
+[[ -z "$rv_why" ]] && pass "-M refuses a frame whose window exceeds the limit, as zstd does" \
+  || fail "-M refuses a frame whose window exceeds the limit, as zstd does" "$rv_why"
+
+# 6-8 need a GPU.
+if has_gpu 2>/dev/null; then
+  # 6. THE GPU STALL GUARD.  A driver call that never returns cannot be recovered
+  # from, and such a run used to sit there forever.  It is now stopped (exit 5,
+  # loud, partial output removed) once one batch has been inside the driver for
+  # the limit -- 10 minutes; 2 seconds here, with the existing drain-stall hook
+  # standing in for the hung call.  A stalled INPUT is not a stalled GPU: the
+  # same limit must leave a run alone that merely waits 5 seconds for its data.
+  rv_why=""
+  rc=0; GZSTD_DEBUG_GPU_STALL_SEC=2 GZSTD_DEBUG_ADAPT_STALL=-1:60 timeout --foreground -k 5 45 \
+    "$GZSTD" --gpu-only -f "$rv/big" -o "$rv/stall.zst" 2>"$rv/s.err" >/dev/null || rc=$?
+  # (The tail of stderr rides along: this failed ONCE in ~40 runs with exit 0 --
+  # the run had completed, so the GPU never held a batch -- and left no evidence.)
+  [[ $rc -eq 5 ]] || rv_why+=" [a wedged batch: exit $rc, want 5 (124 = it hung; 0 = no batch was ever in flight): $(tr '\r' '\n' < "$rv/s.err" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -a 'WARNING\|ERROR\|GPU' | tail -2 | cut -c1-110 | paste -sd'|')]"
+  grep -aq "has not answered for" "$rv/s.err" || rv_why+=" [no stall message]"
+  [[ -z "$(ls "$rv"/stall.zst* 2>/dev/null)" ]] || rv_why+=" [the partial output was left behind]"
+  rc=0; ( sleep 5; cat "$rv/big" ) | GZSTD_DEBUG_GPU_STALL_SEC=2 timeout --foreground -k 5 60 \
+    "$GZSTD" --gpu-only -q -c 2>/dev/null > "$rv/slow.zst" || rc=$?
+  [[ $rc -eq 0 ]] && "$GZSTD" -d -q --cpu-only -c "$rv/slow.zst" 2>/dev/null | cmp -s - "$rv/big" \
+    || rv_why+=" [a run waiting 5 s for its INPUT was stopped or damaged: exit $rc]"
+  # Nor is a STOPPED process a hung GPU: SIGSTOP for longer than the limit while a
+  # batch is in flight, then SIGCONT, must not count the pause (it did: exit 5).
+  # The drain hook holds a batch for 3 s; the process is stopped across it.
+  GZSTD_DEBUG_GPU_STALL_SEC=5 GZSTD_DEBUG_ADAPT_STALL=-1:3 "$GZSTD" --gpu-only -q -f "$rv/big" -o "$rv/stop.zst" 2>/dev/null &
+  rv_pid=$!
+  sleep 2.5; kill -STOP "$rv_pid" 2>/dev/null; sleep 7; kill -CONT "$rv_pid" 2>/dev/null
+  rc=0; wait "$rv_pid" || rc=$?
+  [[ $rc -eq 0 ]] && "$GZSTD" -d -q --cpu-only -c "$rv/stop.zst" 2>/dev/null | cmp -s - "$rv/big" \
+    || rv_why+=" [a run stopped for 7 s (limit 5 s) and continued: exit $rc, want 0]"
+  [[ -z "$rv_why" ]] && pass "a GPU that stops answering ends the run instead of hanging it" \
+    || fail "a GPU that stops answering ends the run instead of hanging it" "$rv_why"
+
+  # 7. --calibrate must not record a CPU rescue as the GPU's speed.  A decompress
+  # fault finishes on the CPU and returns normally, so the "gpu decompress" row
+  # carried a CPU number.
+  rc=0; GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1 GZSTD_DEBUG_CALIBRATE_BYTES=67108864 XDG_CACHE_HOME="$rv/xdg" \
+    timeout --foreground -k 5 180 "$GZSTD" --calibrate --no-profile >/dev/null 2>"$rv/c.err" || rc=$?
+  if [[ $rc -eq 0 ]] && grep -aq "gpu decompress  FAULTED" "$rv/c.err"; then
+    pass "--calibrate discards a GPU decompress row that finished on the CPU"
+  else
+    fail "--calibrate discards a GPU decompress row that finished on the CPU" \
+         "exit $rc; $(grep -a 'gpu decompress' "$rv/c.err" | head -1 | cut -c1-80)"
+  fi
+else
+  skip "a GPU that stops answering ends the run instead of hanging it" "no GPU"
+  skip "--calibrate discards a GPU decompress row that finished on the CPU" "no GPU"
+fi
+
+# 8. cuFile statistics, when the preload re-exec cannot happen: the run used to
+# warn that it would crash at exit (status 139) and then did.  It now finishes
+# and leaves without running the library's exit handler.
+rv_gs="${CUFILE_ENV_PATH_JSON:-/etc/cufile.json}"
+if gds_testable && [[ -r "$rv_gs" ]] && grep -q '"cufile_stats"' "$rv_gs"; then
+  sed -e 's/"cufile_stats"[[:space:]]*:[[:space:]]*[0-9]*/"cufile_stats": 3/' "$rv_gs" > "$rv/gs.json"
+  rc=0; GZSTD_DEBUG_FAIL_CUFILE_REEXEC=1 CUFILE_ENV_PATH_JSON="$rv/gs.json" CUFILE_LOGFILE_PATH="$rv/gs.log" \
+    "$GZSTD" -t --gds-only "$rv/big.zst" >/dev/null 2>"$rv/g.err" || rc=$?
+  if [[ $rc -eq 0 ]] && grep -aq "re-executing with libcufile preloaded failed" "$rv/g.err"; then
+    pass "a failed cuFile statistics re-exec no longer ends in a crash"
+  else
+    fail "a failed cuFile statistics re-exec no longer ends in a crash" "exit $rc (139 = the exit-time crash)"
+  fi
+else
+  skip "a failed cuFile statistics re-exec no longer ends in a crash" "GDS unavailable ($(gds_host_status)), or no cufile_stats key"
+fi
+rm -rf "$rv"
 
 # ────────────────────────────────────────────────────────────
 section "Decompress tail-aware GPU intake (pinned rates)"
@@ -9775,8 +10072,11 @@ if command -v zstd >/dev/null 2>&1; then
   if [ -f "$TMPDIR/mem-big.zst" ]; then
     rc=0
     "$GZSTD" --cpu-only -d -M 1 -f "$TMPDIR/mem-big.zst" -o "$TMPDIR/mem-big.out" >/dev/null 2>&1 || rc=$?
-    [[ $rc -eq 4 ]] && pass "-M rejects oversize-window stream (exit 4)" \
-                   || fail "-M rejects oversize-window stream" "got exit $rc (expected 4)"
+    # Exit 1 since v0.17.89 (it was 4, a DATA error, which an intact archive
+    # refused for the caller's own limit is not; 1 is also what zstd exits with).
+    # Until then this streamed frame was the only kind -M was applied to at all.
+    [[ $rc -eq 1 ]] && pass "-M rejects oversize-window stream (exit 1)" \
+                   || fail "-M rejects oversize-window stream" "got exit $rc (expected 1)"
     # Loose limit should succeed
     "$GZSTD" --cpu-only -d -M 256 -f "$TMPDIR/mem-big.zst" -o "$TMPDIR/mem-big.out" >/dev/null 2>&1 \
       && cmp -s "$TMPDIR/mem-big.bin" "$TMPDIR/mem-big.out" \
@@ -9828,8 +10128,9 @@ rm -f "$TMPDIR/bf"
 rm -f "$TMPDIR/bf"
 
 # Regression: a bundle with a non-operation char must NOT be silently accepted
-expect_exit 2 "$GZSTD" -dz "$TMPDIR/bf.zst" \
-  && pass "-dz (unknown bundle) rejected (exit 2)" || fail "-dz (unknown bundle) rejected"
+# (-dx: x is not a flag.  This was -dz until v0.17.89 made -z zstd's --compress.)
+expect_exit 2 "$GZSTD" -dx "$TMPDIR/bf.zst" \
+  && pass "-dx (unknown bundle) rejected (exit 2)" || fail "-dx (unknown bundle) rejected"
 
 # Regression: -vv keeps its repeat semantics (debug), not split into -v -v.
 # At V_DEBUG the decomp worker prints per-task "take seq=" lines; -v (V_VERBOSE)
