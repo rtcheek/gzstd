@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.89";
+static constexpr const char * GZSTD_VERSION = "0.17.90";
 //
 // Architecture overview:
 //
@@ -12025,8 +12025,9 @@ public:
     ++total_tasks_;
     cv_.notify_all();      // wake all GPU workers waiting in wait_for_batch_or_cap
     cpu_cv_.notify_one();  // wake one CPU worker waiting in pop_one_cpu
+    const size_t head = q_.front().seq;
     lk.unlock();           // MUST precede the poke — see notify_throttle_()
-    notify_throttle_();
+    notify_throttle_(head);
   }
 
   // The head of the deque is the lowest queued seq (push keeps it sorted), so
@@ -12045,7 +12046,16 @@ public:
   // only signalled by release(), and in the wedge case no release will ever
   // come.  Poking it re-runs every waiter's predicate.  Defined out of line
   // because FrameThrottle is declared after this class.
-  void set_throttle(FrameThrottle * bp) { throttle_ = bp; }
+  //
+  // `writer_cursor` is the ResultStore's next_pub, the cursor the waiters' own
+  // predicate compares the queue front against.  The throttle checks it under
+  // its mutex so a completed release cannot precede a stale skip.  The four
+  // drivers each pair one queue with one ResultStore and one throttle.
+  void set_throttle(FrameThrottle * bp, const std::atomic<size_t> * writer_cursor)
+  {
+    throttle_ = bp;
+    cursor_ = writer_cursor;
+  }
 
   // Cap the number of queued (read-but-not-popped) frames for producer
   // backpressure.  0 = unbounded (default).  Set before the producer starts.
@@ -12092,8 +12102,9 @@ public:
     batch.clear();
     cv_.notify_all();
     cpu_cv_.notify_one();
+    const size_t head = q_.front().seq;
     lk.unlock();
-    notify_throttle_();   // these are the OLDEST frames — the writer may want one
+    notify_throttle_(head);   // these are the OLDEST frames — the writer may want one
   }
 
   // Pop a single task (used by CPU workers).
@@ -12454,13 +12465,14 @@ private:
     return t;
   }
 
-  void notify_throttle_();           // defined after FrameThrottle
+  void notify_throttle_(size_t head);   // defined after FrameThrottle
 
   mutable std::mutex      m_;        // mutable: front_seq_at_most() is a const probe
   std::condition_variable cv_;
   std::condition_variable cpu_cv_;   // dedicated CV for CPU workers (avoids spurious wakes from GPU pops)
   std::condition_variable space_cv_; // producer waits here when a bounded queue is full
   FrameThrottle *         throttle_ = nullptr;  // optional; poked after each push
+  const std::atomic<size_t> * cursor_ = nullptr;  // the writer's next frame (ResultStore::next_pub)
   std::deque<Task>        q_;
   bool                    done_ = false;
   size_t                  max_depth_ = 0;  // 0 = unbounded (default); >0 caps queued frames (ROADMAP 7.8)
@@ -12918,9 +12930,10 @@ struct ResultStore {
   std::unordered_map<size_t, FrameBuf>           data;           // seq -> compressed frame
   size_t                                         next_to_write = 0;
   // Lock-free mirror of next_to_write for the throttle's overdraft predicate,
-  // which runs under the throttle mutex and must not reach for `m`.  Advisory:
-  // it may lag by one frame, which only ever costs a missed overdraft (the next
-  // push pokes again), never a spurious one that could unbound memory.
+  // which runs under the throttle mutex and must not reach for `m`.  A cursor
+  // advance is followed by a release for every drained frame; a push checks
+  // this mirror under the throttle mutex, so it either sees a completed
+  // release's cursor or that release will wake the waiter afterward.
   std::atomic<size_t>                            next_pub{0};
   size_t                                         total_tasks   = 0;
   bool                                           producer_done = false;
@@ -13071,7 +13084,10 @@ public:
         break;
       }
       if (!waited) { waited = true; t0 = std::chrono::steady_clock::now(); }
+      bool woke = false;
       cv_.wait(lk, [&] {
+        if (woke) wakeups_.fetch_add(1, std::memory_order_relaxed);
+        woke = true;
         return permits_ > 0 || done_ || (permits_ == 0 && urgent());
       });
     }
@@ -13131,9 +13147,14 @@ public:
         break;
       }
       if (!waited) { waited = true; t0 = std::chrono::steady_clock::now(); }
-      cv_.wait(lk, [&] {
+      bool woke = false;
+      ++batch_waiters_;
+      bcv_.wait(lk, [&] {
+        if (woke) wakeups_.fetch_add(1, std::memory_order_relaxed);
+        woke = true;
         return done_ || permits_ >= std::min(n, max_) || (permits_ >= 0 && urgent());
       });
+      --batch_waiters_;
     }
     int observed = max_ - permits_;
     int prev = peak_in_flight_.load(std::memory_order_relaxed);
@@ -13153,12 +13174,41 @@ public:
   // new frame visible, so a worker parked with zero permits can notice that the
   // head of the queue is now the writer's next-needed frame.  MUST be called
   // with no queue lock held (see acquire_or_overdraft's lock-order note); the
-  // empty critical section fences against a waiter that has evaluated its
-  // predicate but not yet parked, which would otherwise miss this wakeup.
-  void poke() {
+  // critical section fences against a waiter that has evaluated its predicate
+  // but not yet parked, which would otherwise miss this wakeup.
+  //
+  // ONLY WHEN THE HEAD IS THE WRITER'S FRAME (v0.17.90).  This used to wake
+  // every waiter on every push.  Unless the push made the queue front the frame
+  // the writer is waiting for, no waiter can act on it: the rest of every
+  // predicate is about permits, and permits arrive through release(), which
+  // wakes its own waiters.  So each of them woke, took m_ and the queue lock,
+  // and went back to sleep.  A run whose sink is slower than its workers lives
+  // in exactly that state, with every worker parked: MEASURED, `-d` of an 8 GiB
+  // archive of 1 MiB frames to a file, 96 workers: 1.27 million throttle waits
+  // (155 per frame) and 166 s of system CPU in a 10 s run.  On /dev/null the
+  // same archive fell into it in about one run in four, at twice the wall time.
+  //
+  // Check the cursor WHILE HOLDING m_.  The writer stores next_pub before
+  // handing every drained frame to a backend that calls release().  If that
+  // release has completed, acquiring m_ makes the cursor store visible; if it
+  // has not, the later release wakes the waiters.  A relaxed cursor load before
+  // acquiring m_ has no such ordering and could skip the last useful poke.
+  //
+  // The every-push broadcast was also covering for release(): with one CV, its
+  // notify_one could land on a GPU intake that needs a whole batch, which went
+  // back to sleep while a CPU worker that could use the permit slept on, until
+  // a push woke everyone.  Batch waiters now park on bcv_, which release()
+  // broadcasts to (there are few of them), and its notify_one per permit goes
+  // to cv_, where every waiter can use one permit.
+  void poke(size_t head, const std::atomic<size_t> * cursor, bool force) {
     if (disabled_) return;
-    { std::lock_guard<std::mutex> lk(m_); }
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      if (!force && cursor && head > cursor->load(std::memory_order_relaxed))
+        return;
+    }
     cv_.notify_all();
+    bcv_.notify_all();
   }
 
   uint64_t overdrafts() const { return overdrafts_.load(std::memory_order_relaxed); }
@@ -13223,9 +13273,11 @@ public:
   void release(int n = 1) {
     if (n <= 0 || disabled_) return;
     int grew = 0, new_max = 0;
+    bool batch_waiting = false;
     {
       std::lock_guard<std::mutex> lk(m_);
       permits_ += n;
+      batch_waiting = batch_waiters_ > 0;
       // Consume a pending governor grow request (one step per request).
       if (grow_ceiling_ > max_
           && g_adapt_sink_grow_tick.exchange(false, std::memory_order_relaxed)) {
@@ -13236,6 +13288,9 @@ public:
       }
     }
     for (int i = 0; i < n + grew; ++i) cv_.notify_one();
+    // GPU intakes wait for a whole batch, or for the writer's frame: each must
+    // re-check, and there are only as many as GPU workers.  See poke().
+    if (batch_waiting) bcv_.notify_all();
     if (grew) {
       g_adapt_action_flags.fetch_or(ADAPT_ACT_SINK_GROW, std::memory_order_relaxed);
       if (grow_opt_ && grow_opt_->verbosity >= V_VERBOSE)
@@ -13254,6 +13309,7 @@ public:
       done_ = true;
     }
     cv_.notify_all();
+    bcv_.notify_all();
   }
 
   int in_flight() const {
@@ -13276,6 +13332,7 @@ public:
     uint64_t block_count;
     uint64_t block_nanos;
     uint64_t overdrafts;   // head-of-line frames let past the cap (v0.15.67)
+    uint64_t wakeups;      // parked waiters woken (v0.17.90)
   };
   Stats stats() const {
     return Stats{
@@ -13284,6 +13341,7 @@ public:
       block_count_.load(std::memory_order_relaxed),
       block_nanos_.load(std::memory_order_relaxed),
       overdrafts_.load(std::memory_order_relaxed),
+      wakeups_.load(std::memory_order_relaxed),
     };
   }
 
@@ -13326,16 +13384,37 @@ private:
   bool disabled_;        // true when constructed with max_in_flight <= 0
   bool done_ = false;
   mutable std::mutex m_;
-  std::condition_variable cv_;
+  std::condition_variable cv_;    // CPU workers, acquire(): any one permit will do
+  std::condition_variable bcv_;   // acquire_batch_or_head: GPU intakes (v0.17.90)
+  int batch_waiters_ = 0;         // parked on bcv_; guarded by m_
   std::atomic<int>      peak_in_flight_{0};
   std::atomic<uint64_t> block_count_{0};
   std::atomic<uint64_t> block_nanos_{0};
   std::atomic<uint64_t> overdrafts_{0};  // head-of-line permits taken past the cap
+  // Times a parked acquire_or_overdraft / acquire_batch_or_head waiter was woken
+  // (each wake re-evaluates its predicate under m_ and the queue lock).  About
+  // one per frame when only useful wakes are sent; it was the parked-worker
+  // count per frame before poke() learned to skip useless ones (v0.17.90).
+  std::atomic<uint64_t> wakeups_{0};
 };
 
 // Out of line: TaskQueue is declared before FrameThrottle, so it can only hold
 // the pointer, not call through it, at the point of definition.
-inline void TaskQueue::notify_throttle_() { if (throttle_) throttle_->poke(); }
+//
+// `head` is the queue front after the push, read under the queue lock.  The
+// throttle compares it with the writer's cursor under its own lock, after the
+// queue lock is released.  No cursor: always urgent.
+// GZSTD_DEBUG_THROTTLE_POKE_ALL=1 wakes on every push again, the herd this
+// removed, so one binary can measure both (test-only).
+static const bool g_debug_throttle_poke_all = [] {
+  const char * e = ::getenv("GZSTD_DEBUG_THROTTLE_POKE_ALL");
+  return e && *e && *e != '0';
+}();
+inline void TaskQueue::notify_throttle_(size_t head)
+{
+  if (!throttle_) return;
+  throttle_->poke(head, cursor_, g_debug_throttle_poke_all);
+}
 
 // In-order, byte-bounded hand-off of decompressed frames from the decompress
 // writer thread to an in-process consumer — the `-t --tar` validator.  It
@@ -13470,7 +13549,8 @@ static void log_throttle_stats(const FrameThrottle & t, const Options & opt,
      << " (" << std::fixed << std::setprecision(1) << saturation << "%), "
      << "block_count=" << s.block_count
      << ", block_time=" << std::fixed << std::setprecision(2) << ms << "ms"
-     << ", head_of_line_overdrafts=" << s.overdrafts;
+     << ", head_of_line_overdrafts=" << s.overdrafts
+     << ", wakeups=" << s.wakeups;
   vlog(V_DEBUG, opt, os.str() + "\n");
 }
 
@@ -18723,7 +18803,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   FrameThrottle throttle(compute_throttle_budget(
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, threads, 0, opt));
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt);
-  queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
+  queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
   // Disable throttle in test mode: no disk I/O means permits are never released.
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
@@ -27432,7 +27512,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // on ultra / low-RAM runs.  (ROADMAP 7.3.)
   FrameThrottle throttle(compute_throttle_budget(host_chunk, threads, 0, opt));
   adapt_arm_throttle_grow(throttle, host_chunk, opt);
-  queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
+  queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
   std::thread wthr(writer_thread, out, std::ref(results), std::cref(opt), m, &throttle);
 
   std::vector<std::thread> pool; pool.reserve((size_t)threads);
@@ -32712,7 +32792,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       std::max<size_t>(1, chosen_mib) * ONE_MIB, comp_parallelism,
       comp_gpu_batch_floor, opt));
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, chosen_mib) * ONE_MIB, opt);
-  queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
+  queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
 
   // ---- PURE PEER-TO-PEER OUTPUT PREFLIGHT (--gds-only compress) -----------
   // Reopen the verified output descriptor through procfs with O_DIRECT and hand
@@ -37599,7 +37679,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
       std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, decomp_parallelism,
       decomp_gpu_batch_floor, opt));
   adapt_arm_throttle_grow(throttle, std::max<size_t>(1, opt.chunk_mib) * ONE_MIB, opt);
-  queue.set_throttle(&throttle);   // head-of-line overdraft wakeups
+  queue.set_throttle(&throttle, &results.next_pub);   // head-of-line overdraft wakeups
   FrameThrottle * bp_ptr = (opt.mode == Mode::TEST) ? nullptr : &throttle;
 
   // Bound queued (read-but-not-popped) frames to pipeline depth so a slow GPU

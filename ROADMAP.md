@@ -75,10 +75,16 @@ describes a moving target we do not control.
 The sixteen decisions left by the v0.17.87 and v0.17.88 reviews were ruled on and carried out in
 v0.17.89 (CHANGELOG has the table), along with the `-M` decompression limit found on the way. Closed
 without a change: checking sparse maps on an indexed `-l --tar` (measured: 10 ms today, 0.1 to 2 s
-with the check; `-t --tar` checks them). What is still open:
+with the check; `-t --tar` checks them). The "13 futex calls per frame" was investigated in v0.17.90:
+mostly strace's own doing, and the real part, a wake-everyone on the frame throttle, is fixed.
+What is still open:
 
-1. **~13 futex calls per frame** on every CPU path, at 1 MiB and at 16 MiB frames. Held for the next
-   round, to be investigated properly.
+1. **`--sliding-window` is slower than zstd on wall time, by a noticeable margin, every time**
+   (the maintainer's observation, 2026-10-02). That mode exists to produce what `zstd` produces --
+   one frame, a window that slides across the whole input -- so zstd itself is the yardstick and
+   there is no reason in principle to lose to it. Find where the time goes (reader, the job
+   hand-off, the writer, thread count, `ZSTD_c_nbWorkers`/`jobSize`/overlap settings against zstd's
+   defaults) and close the gap or explain it.
 2. **`>>` stays on the buffered writer**, 3.5x slower than O_DIRECT on a redirected file. Adopting an
    append descriptor would mean positional writes at a base another appender could also be writing to.
 3. **`--gds-only` peer-to-peer output declines a descriptor that already holds output**, so the second

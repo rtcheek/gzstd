@@ -1,12 +1,112 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.89  
+**Covers:** v0.9.50 → v0.17.90  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.90 — the futex traffic, investigated: a wake-everyone on the frame throttle
+
+The v0.17.87 review counted about 13 futex calls per frame on every CPU path, at 1 MiB and at
+16 MiB frames, and the maintainer held it for a proper investigation. Two findings.
+
+### Most of the 13 was strace
+
+Every one of those counts was taken under `strace -f`, which stops the traced process at every
+system call; that holds lock owners in the kernel and multiplies contention. Counted without it,
+by a small `LD_PRELOAD` profiler that times only the contended `pthread_mutex_lock` calls and
+every condition-variable wait, against a frame-pointer build so that finding the call site needs
+no unwinder, a CPU compress or decompress of 8 GiB in 1 MiB frames at the default 96 workers takes
+about 9.7 mutex locks per frame, of which 0.3 to 1 are contended, and time blocked on mutexes is
+0.2% of thread time. Voluntary context switches without any tracing agree: 1.1 to 1.7 per frame.
+
+The first version of that profiler called `backtrace()` to name the caller of an out-of-line
+`std::mutex::lock()`. The unwinder takes a global lock, and the profile showed a 7-second convoy on
+the result store that did not exist: the profiled run made 74,000 context switches where the same
+run unprofiled made 9,000. A profiler is checked against an unprofiled run before it is believed.
+
+### The real cost: every push woke every worker parked on the throttle
+
+The frame throttle bounds frames in flight. When it is spent, workers park on it until the writer
+returns a permit, or until the frame the writer is waiting for reaches the front of the queue (the
+v0.15.67 head-of-line overdraft). That second wake was delivered by `poke()`, called after every
+queue push, as a broadcast. Unless the push made the queue front the writer's frame, no waiter could
+proceed: everything else they wait for is a permit, and permits come from `release()`. So each
+parked worker woke, took the throttle lock and the queue lock, and went back to sleep, once per push.
+
+A run whose sink is slower than its decoders lives in that state. Decompressing an 8 GiB archive of
+1 MiB frames to a file, 96 workers, the old wake restored in the same binary as the control (four
+interleaved runs per arm, two of them flush-inclusive; the machine was shared and loaded):
+
+| | wake on every push | after |
+|---|---|---|
+| throttle wakeups (`-vv` statistic) | 705,000 (86 per frame) | 7,900 (about one per frame) |
+| voluntary context switches | 1.08 to 1.21 million | 18,000 |
+| system CPU | 70 to 82 s | 10.3 to 11.3 s |
+| wall | 8.7 to 8.9 s | 7.8 to 8.9 s |
+
+The sink sets the pace, so the wall time does not move beyond the noise; what comes back is about
+65 seconds of CPU per 8 GiB, which on a shared machine belongs to someone else. On `/dev/null` the same archive fell
+into the herd intermittently (9 of 25 runs in one batch, at up to twice the wall time); 12 runs per
+arm afterwards: mean throttle wakeups 20,680 before, 50 after. At the default 16 MiB frames there
+are a sixteenth as many pushes and no measurable difference either way.
+
+The fix wakes on a push only when the pushed queue front is at or below the writer's cursor, which
+is the waiters' own predicate evaluated where the push happens. The queue is given the writer's
+cursor for that (`TaskQueue::set_throttle(bp, &results.next_pub)`). If the cursor moves on during
+the check, the frames it passed are being written and each returns its permit through `release()`,
+which wakes waiters that then see the new cursor.
+
+The every-push broadcast was also covering for something. With one condition variable, a
+`release()` sends one wake per permit, and that wake could land on a GPU intake that needs a whole
+batch, which went back to sleep while a CPU worker that could have used the permit slept on, until
+the next push woke everyone. A first version of this fix kept a "wake everyone while a permit is
+free" clause for that case, and it still herded (mean 2,666 wakeups on `/dev/null` against 22
+without it). GPU intakes now wait on their own condition variable, which `release()` broadcasts to
+(there are only as many as GPU workers), and the per-permit wakes go to the CPU workers, any one of
+whom can use one permit.
+
+Codex reviewed it by counting, for each of the three wait predicates, every event that can make it
+true and the wake that follows. It found one gap and fixed it: the push read the writer's cursor with
+a relaxed load and no lock, so on a weakly ordered machine it could see a stale cursor and skip the
+last useful wake. The cursor is now compared under the throttle's own mutex, which `release()` also
+takes; the writer stores the cursor before handing the frames it passed to the backend that releases
+them, so a push either sees the new cursor or is followed by that release's wake. Not reproducible
+here; x86 does not reorder that way.
+
+`-vv` now reports the count: `[THROTTLE] stats [...]: ..., wakeups=N`.
+`GZSTD_DEBUG_THROTTLE_POKE_ALL=1` restores the wake on every push, so one binary can measure both.
+
+### Tests
+
+Two new cells, both without a GPU:
+
+- **A stalled read does not wedge the CPU workers behind the throttle.** Case 5b of v0.17.85 for the
+  CPU workers: chunk 0's reader is held for 2 s with a one-frame throttle, so the push that delivers
+  it is the only way out. The existing CPU cells (4 and 5) passed even with that wake removed
+  entirely; this one hangs. Overdrafts are asserted.
+- **A push that is not the writer's frame wakes no parked worker.** 128 frames into a pipe read at
+  200 MiB/s, 32 workers, a 16-frame throttle, counted by the new statistic: about 130 wakeups,
+  against about 2,000 with the old wake in the same binary, which the cell requires so it cannot
+  pass by the workers never parking.
+
+Five builds with one change each: a push wake that skips the GPU intakes, one that skips the CPU
+workers, a `release()` that does not wake the GPU intakes, and `<` for `<=` in the cursor test each
+hang a cell. GPU intakes waiting on the CPU condition variable again is not caught: that is the
+stall the separate variable removes, and it costs throughput, not liveness, so no cell can force it.
+
+Suites on the final code, with the server shared and loaded (other users' jobs at 100% on six of
+the eight GPUs): the extensive GPU run 751 passed, 0 failed, 1 skipped of 752; the CPU-only build
+429 passed, 0 failed. Both builds compile without warnings.
+
+### Looked at, not changed
+
+At default frames a decompress to a file spends about 15 s of system CPU per 8 GiB against 5 s to
+`/dev/null`. That is the buffered output path, page-cache copies and `sync_file_range` writeback,
+not locking.
 
 ## v0.17.89 — the review's open questions, decided
 

@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=591
-$EXTENSIVE && EXPECTED_TESTS=750
+EXPECTED_TESTS=593
+$EXTENSIVE && EXPECTED_TESTS=752
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -7501,6 +7501,89 @@ if has_gpu 2>/dev/null; then
   rm -f "$TMPDIR/lv5b.bin" "$TMPDIR/lv5b.zst" "$TMPDIR/lv5b.log"
 else
   skip "a stalled read does not wedge the GPU intake behind the throttle" "no GPU"
+fi
+
+# 5c. Case 5b through the CPU WORKERS, which need no GPU (v0.17.90).  A push
+#    wakes parked workers only when it makes the writer's frame the queue front,
+#    so THAT wake is the only way out of this cycle: chunk 0's reader is held for
+#    2 s, the workers spend the one-frame throttle on later frames, and chunk 0
+#    must be seen as the writer's frame when it finally arrives.  Builds where
+#    that push woke nobody, or where `<=` became `<`, hung 2 of 2; this ran in
+#    2.3 s.  The overdraft counter proves the head-of-line path was taken.
+(
+  set +o pipefail
+  head -c $((49*1048576)) /dev/urandom | base64 -w0 | head -c $((64*1048576 + 12345)) > "$TMPDIR/lv5c.bin"
+)
+cat "$TMPDIR/lv5c.bin" > /dev/null
+rc=0
+env GZSTD_DEBUG_POOLED_STALL_CHUNK=0:2000 timeout --foreground -k 10 60 \
+  "$GZSTD" --cpu-only -T4 --no-mmap --no-direct-read --chunk-size=1 --read-threads=4 \
+  --throttle-frames=1 -vv -f "$TMPDIR/lv5c.bin" -o "$TMPDIR/lv5c.zst" >/dev/null 2>"$TMPDIR/lv5c.log" || rc=$?
+lv5c_od=$(tr '\r' '\n' < "$TMPDIR/lv5c.log" | grep -a -o 'head_of_line_overdrafts=[0-9]*' | head -1 | cut -d= -f2)
+if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+  fail "a stalled read does not wedge the CPU workers behind the throttle" \
+       "TIMED OUT -- the push that delivered the writer's frame woke no worker"
+elif [[ $rc -ne 0 ]]; then
+  fail "a stalled read does not wedge the CPU workers behind the throttle" "exit $rc"
+elif [[ -z "$lv5c_od" || "$lv5c_od" -lt 1 ]]; then
+  fail "a stalled read does not wedge the CPU workers behind the throttle" \
+       "no head-of-line overdraft recorded (${lv5c_od:-none}): the stall did not bite"
+elif ! "$GZSTD" -d -q -c "$TMPDIR/lv5c.zst" | cmp -s - "$TMPDIR/lv5c.bin"; then
+  fail "a stalled read does not wedge the CPU workers behind the throttle" "does not decode to the input"
+else
+  pass "a stalled read does not wedge the CPU workers behind the throttle" "($lv5c_od overdrafts)"
+fi
+rm -f "$TMPDIR/lv5c.bin" "$TMPDIR/lv5c.zst" "$TMPDIR/lv5c.log"
+
+# 5d. ...and a push that is NOT the writer's frame wakes nobody (v0.17.90).  It
+#    woke every worker parked on the throttle, each of which went straight back
+#    to sleep: with the sink slower than the decoders that is every frame, times
+#    every parked worker -- 1.27 million wakes and 166 s of system CPU for one
+#    8 GiB decompress of 1 MiB frames.  A 128-frame archive into a pipe read at
+#    200 MiB/s, 32 workers on a 16-frame throttle, counted by the throttle's own
+#    wakeups statistic: about one per frame now, 15-18 per frame before.
+#    GZSTD_DEBUG_THROTTLE_POKE_ALL=1 puts the old wake back in the same binary,
+#    and that arm must show the herd, or the cell is not measuring it.
+if command -v python3 >/dev/null 2>&1; then
+  (
+    set +o pipefail
+    head -c $((97*1048576)) /dev/urandom | base64 -w0 | head -c $((128*1048576)) > "$TMPDIR/lv5d.bin"
+  )
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$TMPDIR/lv5d.bin" -o "$TMPDIR/lv5d.zst" 2>/dev/null
+  cat > "$TMPDIR/lv5d.py" <<'PYEOF_SLOW'
+import sys, time
+# Read stdin at about RATE MiB/s and discard it: a sink slower than the decoders.
+rate = float(sys.argv[1]) * 1048576; got = 0; t0 = time.monotonic(); r = sys.stdin.buffer
+while True:
+    b = r.read(262144)
+    if not b: break
+    got += len(b)
+    ahead = got / rate - (time.monotonic() - t0)
+    if ahead > 0: time.sleep(ahead)
+PYEOF_SLOW
+  lv5d() {   # $1 = env assignment; prints the wakeups count, or "exit N"
+    local rc=0
+    env "$1" timeout --foreground -k 10 60 \
+      "$GZSTD" -d -c -T32 --cpu-only --throttle-frames=16 -vv "$TMPDIR/lv5d.zst" 2>"$TMPDIR/lv5d.log" \
+      | python3 "$TMPDIR/lv5d.py" 200 || rc=$?
+    [[ $rc -ne 0 ]] && { echo "exit $rc"; return; }
+    tr '\r' '\n' < "$TMPDIR/lv5d.log" | grep -a -o 'wakeups=[0-9]*' | tail -1 | cut -d= -f2
+  }
+  lv5d_old=$(lv5d GZSTD_DEBUG_THROTTLE_POKE_ALL=1)
+  lv5d_new=$(lv5d GZSTD_DEBUG_THROTTLE_POKE_ALL=0)
+  if ! [[ "$lv5d_old" =~ ^[0-9]+$ && "$lv5d_new" =~ ^[0-9]+$ ]]; then
+    fail "a push that is not the writer's frame wakes no parked worker" "old arm: ${lv5d_old:-none}, new arm: ${lv5d_new:-none}"
+  elif [[ $lv5d_old -lt 512 ]]; then
+    fail "a push that is not the writer's frame wakes no parked worker" \
+         "the control arm woke only $lv5d_old times for 128 frames: the workers never parked, so this measured nothing"
+  elif [[ $lv5d_new -gt 256 ]]; then
+    fail "a push that is not the writer's frame wakes no parked worker" "$lv5d_new wakeups for 128 frames (the old wake: $lv5d_old)"
+  else
+    pass "a push that is not the writer's frame wakes no parked worker" "($lv5d_new wakeups for 128 frames; every push: $lv5d_old)"
+  fi
+  rm -f "$TMPDIR/lv5d.bin" "$TMPDIR/lv5d.zst" "$TMPDIR/lv5d.log" "$TMPDIR/lv5d.py"
+else
+  skip "a push that is not the writer's frame wakes no parked worker" "python3 not found"
 fi
 
 # 6. A decode error under --adapt -d --tar printed its ERROR and then NEVER
