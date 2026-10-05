@@ -1,12 +1,140 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.91  
+**Covers:** v0.9.50 → v0.17.92  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.92 — the single-frame loose ends: stdin, holes, a dying GPU build's tail, a pipe's seek table
+
+The four items v0.17.91 left open, and one more found on a quiet machine.
+
+### A pipe's seek table arrives last: warned by default, checked with `--verify` and `-t`
+
+A frame written without a checksum of its own (`zstd --no-check`) is verified against the seek table's,
+which gzstd reads from the end of a FILE before decoding. Through a pipe the table arrives after the
+frames are written, so those frames were decoded unverified, silently -- what zstd does on every route,
+since it never reads seek-table checksums. gzstd's own archives carry a checksum in every frame and are
+not affected. The maintainer's decision: warn by default, verify on request.
+
+- `-d` through a pipe now ends with a warning when such frames passed: they were NOT verified; re-run
+  with `--verify`, or decompress from the file. Exit 0, as before.
+- `-d --verify` (until now accepted and ignored when decompressing) and `-t` (always -- it exists to
+  answer "is this intact") hash those frames as they are decoded and check them against the table at
+  the end: exit 4 on a mismatch, a named output removed. Frames with their own checksum cost nothing.
+- The frame splitter and the streaming decoder note each frame as it passes (sizes, output offset,
+  own checksum or not) and keep the trailing table. The table is used only if it describes exactly the
+  frames observed, in order; otherwise those frames are reported unverified, never corrupt.
+- The hash is taken on the CPU from the decoded bytes. A GPU-decoded frame is hashed where it lands in
+  host memory -- not routed to the CPU, which would leave `--gpu-only` (no CPU pool) with a frame nobody
+  decodes. GPUDirect output never reaches the host; such frames would be reported unverified.
+
+A three-frame archive and a single sizeless frame, sound and with one payload byte flipped: `-d` warns
+on both; `--verify` and `-t` pass the sound one and exit 4 on the corrupt one, on the CPU route, the
+streaming route, `--gpu-only` and `--hybrid`; a table with the wrong frame sizes produces "does not
+describe" and exit 0. Named files behave exactly as before.
+
+### A GPU build waited for its GPUs before streaming a pipe
+
+Measured on an idle machine: an 8 GiB single-frame archive piped through `-d` took 17.1-18.5 s from the
+GPU build against 13.3-14.2 s with `--cpu-only`. The stdin handoff (v0.17.91) reached the GPU driver's
+fallback branch while the GPUs were still being brought up in the background, and the branch joined
+that bringup -- CUDA's initialisation, 3-4 s on an 8-GPU machine -- before streaming a byte that would
+never touch a GPU. It now streams first and tears down after (not under `--gpu-only`, whose "no usable
+GPU" refusal comes first, nor with GPUDirect output registered): 14.5-15.1 s, level with zstd
+(12.3-17.6 s on the same runs).
+
+The same idle machine settled v0.17.91's open timing: the piped decode is level with zstd (12.9-15.1 s
+against 12.8-16.6 s), the decoder's read-ahead makes no measurable difference when nothing competes
+(13.5-15.9 s without it) and only helps under load, `-t` through a pipe is level (8.0-8.3 s against
+7.9-9.4 s), and piped `--sliding-window` compression stays ahead (13.9-14.4 s against 16.7-17.7 s).
+
+### A huge or sizeless frame after smaller ones, on stdin
+
+v0.17.91 streamed only the FIRST frame on stdin. After smaller frames, a sizeless one made the frame
+splitter read the rest of the input into memory, and a huge sized one was read whole and decoded as one
+task. The splitter now stands down at that frame's header wherever it comes: the frames before it go
+through the parallel route as usual, and once they are written, the rest -- the bytes already read,
+then the pipe -- is streamed at the output offset they reached. gzstd's own 64 MiB archive followed by a
+300 MiB frame, `-T4`: peak memory 476-603 MiB before, 104-136 MiB now, identical output, sized and
+sizeless alike.
+
+### The single-frame decoder leaves holes
+
+It wrote zeros densely, so the same archive made a sparse file through the frame writer and a dense one
+through the single-frame route. The frame writer's output policy -- holes only on a regular file that is
+not appended to and has nothing past the position, `--sparse`/`--no-sparse`, progressive writeback for
+decompression -- is now one function the three async writers share (the frame writer, the single-frame
+decoder, `--sliding-window`). A 300 MiB frame that is one third zeros: 200 MiB allocated with `-o`, 300
+with `--no-sparse`, identical bytes either way.
+
+### A GPU build that died lost the end of a redirected stdout
+
+A GPU build on a fast bus defaults a regular-file stdout to O_DIRECT, through a writer with a background
+drain thread. `die()` ends the process with `_Exit`, so that writer's queued buffers and its partly
+filled one were dropped: a 300 MiB decode that failed its checksum at the end left 268 MiB in the file
+(v0.17.91: 288), where the CPU-only build, writing plain stdout, left all of it. `die()` now flushes that
+writer for a taken-over stdout only (a named output is removed instead). It must not run beside a
+producer: the writer's `write`, `seek_forward`, `finalize` and `close` now hold a timed lock that the
+exit flush waits for at most 2 s before giving up, which is the old outcome. Having it, it never
+releases it, so nothing writes after the flush; preallocated slack is trimmed as `finalize` would.
+Write-failure deaths (a file-size limit on stdout) still exit 3 in 0.1-0.2 s; decode-error deaths in the
+frame-parallel route still exit 4 with a correct prefix.
+
+### What the review found
+
+Codex counted every decoder of a piped frame, every thread that can be inside the O_DIRECT writer when
+`die()` runs, and every caller of the shared write policy. It found three defects in the seek-table
+check, each reproduced on the build before its fix:
+
+- **A false corruption verdict.** Hashes were keyed by output offset, and an empty frame has the same
+  offset as the frame after it: a SOUND archive whose first frame was empty exited 4 through a pipe
+  ("content-checksum mismatch at frame 0"), exit 0 from the file. Keys are now offset and size.
+- **Piped `-t --tar -` was not checked.** The tar test path decodes in decompress mode, so the check
+  never armed: a corrupt member reported "OK ... tar structure valid" at exit 0. Now exit 4.
+- **`--keep-going --verify` exited 4** on a mismatch, where `--keep-going`'s contract (and the
+  named-file route) is to keep the output and exit 6. Now 6.
+
+It also bounded and hardened the exit-time flush: `die()` now waits at most 2 s for the writer's
+producer and 30 s for its drain before leaving anyway (a stalled device must not hang a failing run);
+the global writer pointer is published and cleared under a lock, so a death during a CPU rebuild never
+reaches a writer that is being destroyed; the producer-side methods that still changed the writer's
+cursors without the lock now take it; and an adopted stdout that ends in a sparse hole is cut to its
+exact length. Under `-t` or `--verify`, a frame the table promises a checksum for but no decoder hashed
+is an error (exit 1), not a silent pass; a valid table too large to keep (over 64 MiB) is reported the
+same way. The record keeps only counts for a plain `-d`, so millions of frames cost no memory there.
+
+### Tests
+
+Suites on the final code: the extensive GPU run 757 passed, 0 failed, 1 skipped of 758; the CPU-only
+build 435 passed, 0 failed. Both builds compile without warnings. The CPU-only suite's first run failed
+one case, once: a v0.17.88 cell where `--verify` on a piped input with a corrupted frame must exit 4
+(the input cannot be rebuilt) exited 0. It has not happened again in 520 attempts -- the same input and
+fresh random ones, the machine idle and loaded, the process pinned to one to four CPUs -- nor in the
+suite's re-run, and v0.17.91 behaves identically; it is unexplained. The case now keeps gzstd's stderr
+and puts it in the failure message, so a recurrence says what happened.
+
+Three new cells, none needing a GPU, and the seek-table cell extended:
+
+- **A pipe's trailing seek table: warned by default, checked by --verify and -t**: the shapes above,
+  an empty frame before data, `-t --tar -`, `--keep-going --verify`; the GPU arm where there is a GPU.
+
+- **A huge or sizeless frame after smaller ones streams through a pipe**: both shapes, identical output,
+  peak under 300 MiB at `-T4`, and `-t` through the pipe.
+- **The single-frame decoder leaves holes where the frame writer would**: allocation with `-o` and with
+  `--no-sparse`, skipped on a filesystem that makes no holes.
+- The seek-table cell now also requires every decoded byte to reach a REGULAR-FILE stdout before the
+  checksum error, which is the GPU build's O_DIRECT case.
+
+v0.17.91's GPU build fails all four; builds with one change undone each fail their own: the handoff
+limited to the first frame again, the decoder writing densely, `die()` without the flush, and for the
+seek table -- never armed, the splitter or the streaming decoder not noting frames, no hash at the GPU
+hand-off, no warning, and no check that the table describes the stream (the last first written so that
+it kept part of the check, and survived; rewritten, it fails); and the review's three fixes undone
+(hashes keyed by offset alone, `-t --tar` unarmed, `--keep-going` dying).
 
 ## v0.17.91 — single-frame archives: the gap behind "zstd is faster" was pipes
 

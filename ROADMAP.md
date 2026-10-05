@@ -77,6 +77,10 @@ v0.17.89 (CHANGELOG has the table), along with the `-M` decompression limit foun
 without a change: checking sparse maps on an indexed `-l --tar` (measured: 10 ms today, 0.1 to 2 s
 with the check; `-t --tar` checks them). The "13 futex calls per frame" was investigated in v0.17.90:
 mostly strace's own doing, and the real part, a wake-everyone on the frame throttle, is fixed.
+v0.17.92 closed the four items v0.17.91 left: a huge or sizeless frame after smaller ones on stdin now
+streams, the single-frame decoder leaves holes, a GPU build's death no longer drops the end of an
+O_DIRECT stdout, and a pipe's trailing seek table is warned about by default and checked by --verify
+and -t.
 "zstd beats --sliding-window" was investigated in v0.17.91: from files gzstd was already faster;
 the gap was PIPES (a single-frame archive on stdin was read whole before decoding; the compressor
 read and wrote on one thread), now faster than zstd both ways. What is still open:
@@ -94,20 +98,6 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
 6. **After a failed run the caller's stdout position is best effort** (documented in `--help`).
 7. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
     The caller's doing; left.
-
-8. **On stdin, seek-table checksums cannot be checked.** The table is at the end of the stream, so a
-  frame written without its own checksum (`zstd --no-check`) arriving through a pipe is decoded
-  unverified. Named files are checked. Was so before v0.17.91.
-9. **Only the FIRST frame on stdin is streamed.** A huge or sizeless frame after smaller ones is still
-  read whole by the frame splitter, as before; a multi-frame stream with a giant frame in the middle is
-  rare, and the named-file route has the same rule.
-10. **The single-frame decoder never makes holes.** It writes zeros densely where the frame-parallel
-  writer leaves sparse holes in a regular-file output; v0.17.91 kept that (sparse off) deliberately.
-11. **A GPU build that exits on an error loses the O_DIRECT stdout tail.** With stdout redirected to a
-  regular file (adopted for O_DIRECT), a fatal data error ends the process without flushing the direct
-  writer's buffered tail: a corrupt 300 MiB frame left 268 MiB (v0.17.90) / 288 MiB (v0.17.91) of
-  output where the CPU-only build and any pipe get all 300 MiB. Partial output on an error is best
-  effort, but the two builds should agree.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

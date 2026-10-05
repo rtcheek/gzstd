@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.91";
+static constexpr const char * GZSTD_VERSION = "0.17.92";
 //
 // Architecture overview:
 //
@@ -1641,6 +1641,7 @@ static volatile sig_atomic_t g_tmp_filefd = -1;
 static_assert(std::atomic<int>::is_always_lock_free,
               "the stdout position restore needs signal-safe atomic access");
 static std::atomic<int> g_stdout_adopted{0};
+static void gz_direct_stdout_flush_for_exit();   // defined with g_direct_writer
 static void gz_stdout_leave_at_end()
 {
 #ifndef _WIN32
@@ -2796,6 +2797,10 @@ struct Options {
                                   //  frame (independent zstd -t round-trip) while compressing.  On
                                   //  any XXH64 mismatch, discard the output and rebuild CPU-only,
                                   //  retrying until it verifies clean.  Compress-only.
+  bool verify_decode = false;     // --verify on DEcompression (v0.17.92): check frames that carry
+                                  //  no checksum of their own against a seek table that arrives
+                                  //  only at the end of a pipe (see GzLateCk).  `opt.verify`
+                                  //  stays compress-only.
   int  verify_retries = 0;        // --verify-retries=N: max rebuild attempts on verify mismatch
                                   //  (0 = unlimited — keep trying until clean or interrupted)
   // --verify-engine=cpu|gpu|auto: which engine runs the --verify check on a
@@ -3431,6 +3436,7 @@ static void die(const std::string & msg, int code = EXIT_ERROR)
   // and cuFile's own shutdown, which the kernel does for a dying process anyway,
   // and libcufile's statistics dump, which is not wanted for a failed run.
   cleanup_tmp_file();
+  gz_direct_stdout_flush_for_exit();   // what was written so far reaches the caller's file
   gz_stdout_leave_at_end();    // an adopted stdout: after the partial output, not on top of it
 #ifdef HAVE_NVCOMP
   gz_cufile_log_finish();
@@ -4014,7 +4020,9 @@ static void print_help()
 "\n"
 "Integrity:\n"
 "  --verify            decompress-verify every frame while compressing; on any\n"
-"                      mismatch, rebuild CPU-only and retry until it verifies\n"
+"                      mismatch, rebuild CPU-only and retry until it verifies.\n"
+"                      Decompressing a pipe: also check frames whose only\n"
+"                      checksum is in a trailing seek table\n"
 "  --verify-retries N  cap verify rebuild attempts (0 = unlimited; default).\n"
 "                      Implies --verify\n"
 "  --verify-engine E   verify on cpu|gpu|auto (gpu-only compress; auto = by\n"
@@ -4286,7 +4294,15 @@ static void print_help_long()
 "     from the original input, retrying until it verifies clean.  Needs\n"
 "     regular files for input and output (a pipe cannot be rewound to\n"
 "     rebuild); over a pipe a mismatch is a fatal data error instead.\n"
-"     Off by default.  Compress-only (decompression already validates).\n"
+"     Off by default.\n"
+"     On DECOMPRESSION every frame's own checksum is always checked;\n"
+"     --verify matters only for frames written WITHOUT one (zstd\n"
+"     --no-check) whose checksum lives in a seek table at the end of the\n"
+"     archive.  From a file that table is read first and those frames are\n"
+"     checked anyway.  Through a PIPE it arrives after they are written:\n"
+"     by default gzstd then warns that they were not verified; with\n"
+"     --verify (and always under -t) it hashes them as they are decoded\n"
+"     and checks them at the end, exit 4 on a mismatch.\n"
 "\n"
 "  --verify-retries N\n"
 "     Cap the number of CPU-only rebuild attempts --verify makes on a\n"
@@ -10079,6 +10095,7 @@ private:
     file_base_ = 0; pre_ = 0;
     plain_after_external_prefix_ = false;
     werr_.store(false, std::memory_order_relaxed); wt_done_ = false;
+    wt_exited_ = wt2_exited_ = false;
     free_.clear(); for (int i = 1; i < NBUF; ++i) free_.push_back(i);  // 0 is the first fill buffer
     ops_.clear();
     g_odirect_write_ns.store(0, std::memory_order_relaxed);  // -v: per-output write-time
@@ -10093,6 +10110,7 @@ public:
   // full buffers flush mid-stream, so there is no unaligned tail except at
   // finalize.  The copy runs here (caller thread); the ::write runs async.
   bool write(const void * data, size_t len) {
+    std::lock_guard<std::timed_mutex> prod(prod_m_);   // see flush_for_exit
     if (fd_ < 0 || werr_.load(std::memory_order_relaxed)) return false;
     const char * src = static_cast<const char *>(data);
     while (len > 0) {
@@ -10121,11 +10139,65 @@ public:
   // trim would cut a complete archive back to ZERO BYTES and still exit 0.
   // Measured doing exactly that before this hook existed.
   void adopt_external_write(uint64_t len) {
+    std::lock_guard<std::timed_mutex> prod(prod_m_);
     logical_written_ = len;
     preallocated_    = 0;      // the P2P path did its own trimming
   }
 
+  // WHAT A FAILED RUN WROTE MUST REACH THE FILE (v0.17.92).  die() ends the
+  // process with _Exit, so this writer's queued buffers and its partly filled
+  // one were simply lost: a GPU build -- which defaults a redirected stdout to
+  // O_DIRECT on a fast bus -- left 268 MiB of a 300 MiB decode that failed its
+  // checksum at the end, where the CPU-only build (plain stdout) left all 300.
+  // For a taken-over stdout the partial output IS what the caller keeps, so
+  // die() calls this.  It must not run beside a producer: write(),
+  // seek_forward(), finalize() and close() hold prod_m_, and this waits for it
+  // at most `wait`, then gives up (the old outcome).  Having it, it never lets
+  // go -- the process is ending, and no write may start after the flush.
+  // Not for a named output: die() removes that.
+  bool flush_for_exit(std::chrono::milliseconds wait) {
+    std::unique_lock<std::timed_mutex> prod(prod_m_, std::defer_lock);
+    if (!prod.try_lock_for(wait)) return false;
+    prod.release();
+    if (fd_ < 0 || !wt_.joinable() || werr_.load(std::memory_order_relaxed)) return false;
+    if (buf_used_ > 0) {
+      size_t tail = buf_used_ - (buf_used_ / ALIGN) * ALIGN;
+      enqueue({OP_WRITE, cur_bi_, buf_used_, tail, logical_written_});
+      logical_written_ += buf_used_;
+      buf_used_ = 0;
+    }
+    { std::lock_guard<std::mutex> lk(mx_); wt_done_ = true; }
+    cv_op_.notify_all();
+    // A failing run cannot wait forever on a stalled filesystem.  Allow the
+    // queued writes one bounded drain attempt; die() then _Exits even if the
+    // device never answers.  Normal finalize()/close() still join fully.
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    {
+      std::unique_lock<std::mutex> lk(exit_m_);
+      if (!exit_cv_.wait_until(lk, drain_deadline, [&] { return wt_exited_; }))
+        return false;
+    }
+    wt_.join();
+    if (wt2_.joinable()) {
+      std::unique_lock<std::mutex> lk(exit_m_);
+      if (!exit_cv_.wait_until(lk, drain_deadline, [&] { return wt2_exited_; }))
+        return false;
+      lk.unlock();
+      wt2_.join();
+    }
+    if (werr_.load(std::memory_order_relaxed)) return false;
+    // A preallocated output can have slack past the accepted bytes.  An
+    // adopted stdout can also end with an accepted sparse SEEK, with no
+    // physical write after it to extend the file.  Its adoption required the
+    // file to end at the starting position, so this exact length is safe.
+    if ((caller_fd_ >= 0 || (preallocated_ > 0 && logical_written_ < preallocated_))
+        && ::ftruncate(fd_, (off_t)(file_base_ + logical_written_)) != 0)
+      return false;   // best effort: the run is failing anyway
+    return true;
+  }
+
   bool finalize() {
+    std::lock_guard<std::timed_mutex> prod(prod_m_);
     if (fd_ < 0) return false;
     if (!wt_.joinable()) return !werr_.load(std::memory_order_relaxed);  // never opened/already done
     if (buf_used_ > 0) {
@@ -10168,6 +10240,7 @@ public:
   }
 
   void close() {
+    std::lock_guard<std::timed_mutex> prod(prod_m_);
     // Join the write thread if finalize() didn't (e.g. an error/abort path).
     if (wt_.joinable()) {
       { std::lock_guard<std::mutex> lk(mx_); wt_done_ = true; }
@@ -10191,6 +10264,7 @@ public:
   // filesystem doesn't need to allocate new extents + journal on every write().
   // Falls back gracefully on filesystems that don't support fallocate.
   bool preallocate(uint64_t size) {
+    std::lock_guard<std::timed_mutex> prod(prod_m_);
     if (fd_ < 0 || size == 0) return false;
     if (file_base_ != 0 || pre_ != 0) return false;   // only a fresh output is preallocated
 #ifdef __linux__
@@ -10204,7 +10278,10 @@ public:
   // Logical output position (what's been enqueued + what's buffered).  Used by
   // write_sparse to keep sparse seeks O_DIRECT-aligned, so it must reflect the
   // caller's view, not the (lagging) physical write position.
-  size_t total_bytes() const { return (size_t)logical_written_ + buf_used_; }
+  size_t total_bytes() const {
+    std::lock_guard<std::timed_mutex> prod(prod_m_);
+    return (size_t)logical_written_ + buf_used_;
+  }
   // After a detached writer's finalize() this is the CALLER's descriptor.
   int fd() const { return handed_back_ ? caller_fd_ : fd_; }
   uint64_t preallocated() const { return preallocated_; }
@@ -10218,6 +10295,7 @@ public:
   // writer has accepted any bytes.  Check those invariants rather than silently
   // turning a future mixed-writer call into overlapping output.
   bool adopt_external_prefix(uint64_t bytes) {
+    std::lock_guard<std::timed_mutex> prod(prod_m_);
     std::lock_guard<std::mutex> lk(mx_);
     if (fd_ < 0 || buf_used_ != 0 || logical_written_ != 0 || !ops_.empty()
         || file_base_ != 0 || pre_ != 0)   // only an output that starts at zero
@@ -10241,6 +10319,7 @@ public:
   // skip_ok guard), then enqueue an ordered SEEK so it lands after the buffered
   // data on the write thread.  The hole-punch + lseek happen there.
   bool seek_forward(size_t offset) {
+    std::lock_guard<std::timed_mutex> prod(prod_m_);   // see flush_for_exit
     if (fd_ < 0 || werr_.load(std::memory_order_relaxed)) return false;
     if (buf_used_ > 0) {
       size_t tail = buf_used_ - (buf_used_ / ALIGN) * ALIGN;  // normally 0 (aligned seek point)
@@ -10361,8 +10440,12 @@ private:
   uint64_t pre_ = 0;
   enum OpKind { OP_WRITE, OP_SEEK };
   struct WOp { OpKind kind; int bi; size_t len; size_t tail; uint64_t off; };
+  mutable std::timed_mutex prod_m_; // the producer side; see flush_for_exit
   std::mutex mx_;
   std::condition_variable cv_op_, cv_free_;
+  std::mutex exit_m_;
+  std::condition_variable exit_cv_;   // only the failed-run drain waits here
+  bool wt_exited_ = false, wt2_exited_ = false;
   std::deque<WOp> ops_;            // ordered fd ops for the write thread
   std::deque<int> free_;           // free buffer indices
   bool wt_done_ = false;
@@ -10424,7 +10507,11 @@ private:
       WOp op;
       { std::unique_lock<std::mutex> lk(mx_);
         cv_op_.wait(lk, [&]{ return !ops_.empty() || wt_done_; });
-        if (ops_.empty()) return;            // done and drained
+        if (ops_.empty()) {
+          { std::lock_guard<std::mutex> done(exit_m_); wt_exited_ = true; }
+          exit_cv_.notify_all();
+          return;                             // done and drained
+        }
         op = ops_.front(); ops_.pop_front(); }
       if (!wt2_spawned_ && !seek_seen_.load(std::memory_order_relaxed)
           && g_adapt_writer_probe.load(std::memory_order_relaxed) != 0) {
@@ -10448,7 +10535,11 @@ private:
           return wt_done_
               || (!ops_.empty()
                   && g_adapt_writer_probe.load(std::memory_order_relaxed) != 0); });
-        if (ops_.empty() && wt_done_) return;
+        if (ops_.empty() && wt_done_) {
+          { std::lock_guard<std::mutex> done(exit_m_); wt2_exited_ = true; }
+          exit_cv_.notify_all();
+          return;
+        }
         if (ops_.empty()
             || g_adapt_writer_probe.load(std::memory_order_relaxed) == 0) continue;
         op = ops_.front(); ops_.pop_front(); }
@@ -11397,6 +11488,34 @@ static std::atomic<bool> g_phase_on{false};
 // Writer thread checks this to decide between DirectWriter and fwrite.
 #ifndef _WIN32
 static DirectWriter * g_direct_writer = nullptr;
+// die() may run on a worker while main replaces the writer for a CPU rebuild.
+// Guard the pointer AND its destruction so exit flushing never dereferences a
+// writer whose unique_ptr has already been reset.
+static std::timed_mutex g_direct_writer_exit_m;
+static void gz_direct_writer_publish(DirectWriter * dw)
+{
+  std::lock_guard<std::timed_mutex> lk(g_direct_writer_exit_m);
+  g_direct_writer = dw;
+}
+
+// die()'s half of DirectWriter::flush_for_exit: only for a taken-over stdout,
+// whose partial output the caller keeps (a named output is removed instead).
+// The same deadline covers waiting for a pointer replacement and for a producer.
+static void gz_direct_stdout_flush_for_exit()
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  std::unique_lock<std::timed_mutex> lk(g_direct_writer_exit_m, std::defer_lock);
+  if (!lk.try_lock_until(deadline)) return;
+  DirectWriter * dw = g_direct_writer;
+  if (dw && g_stdout_adopted.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline > now ? deadline - now : std::chrono::steady_clock::duration::zero());
+    (void)dw->flush_for_exit(left);
+  }
+}
+#else
+static void gz_direct_stdout_flush_for_exit() {}
 #endif
 
 // Set when ANY GPU fault is detected during compression.  A faulting GPU is an
@@ -11637,6 +11756,7 @@ struct DamageReport {
     uint64_t off;        // start offset in the decompressed output
     uint64_t produced;   // bytes actually recovered for this frame
     uint64_t declared;   // bytes the frame header said it should hold
+    bool late_unchecked; // trailing seek-table checksum could not be checked
   };
   std::mutex            m;
   std::vector<Range>    ranges;                  // one per damaged frame
@@ -11652,8 +11772,8 @@ struct DamageReport {
   uint64_t              break_off = 0;           // bytes recovered before the break
   std::string           break_reason;
 
-  void record(uint64_t off, uint64_t produced, uint64_t declared) {
-    { std::lock_guard<std::mutex> lk(m); ranges.push_back({off, produced, declared}); }
+  void record(uint64_t off, uint64_t produced, uint64_t declared, bool late_unchecked = false) {
+    { std::lock_guard<std::mutex> lk(m); ranges.push_back({off, produced, declared, late_unchecked}); }
     any.store(true, std::memory_order_relaxed);
     if (produced < declared) incomplete.store(true, std::memory_order_relaxed);
   }
@@ -11693,7 +11813,9 @@ static void report_keep_going_damage(const Options & opt) {
   for (size_t i = 0; i < n && i < SHOW; ++i) {
     const auto & r = g_damage.ranges[i];
     os << "  output bytes " << r.off << ".." << (r.off + r.declared);
-    if (r.produced >= r.declared)
+    if (r.late_unchecked)
+      os << ": trailing seek-table checksum could not be checked (content present, UNVERIFIED)\n";
+    else if (r.produced >= r.declared)
       os << ": checksum mismatch (content present, UNVERIFIED)\n";
     else
       os << ": could not decode — " << r.produced << " of " << r.declared
@@ -13923,6 +14045,70 @@ static uint64_t g_tar_chunk_size = 0;
 static uint64_t g_tar_nframes = 0;
 static uint64_t g_tar_stream_size = 0;   // total uncompressed tar bytes
 
+// THE OUTPUT POLICY OF EVERY ASYNC WRITER (v0.17.92): may this destination hold
+// holes, and should writeback be pushed as it goes.  It was the frame writer's
+// alone; the single-frame decoder and --sliding-window wrote zeros densely and
+// never pushed writeback, so the same archive made a sparse file by one route
+// and a dense one by the other.  Now the three ask the same question here.
+struct GzWritePolicy { bool sparse; bool psync; };
+static GzWritePolicy gz_write_policy(FILE * out, const Options & opt)
+{
+  // Sparse file support: skip zero-filled 4K blocks via seek.
+  // --sparse forces on, --no-sparse forces off, default auto (file:on, stdout:off).
+  //
+  // A HOLE NEEDS A DESTINATION THAT CAN HOLD ONE (v0.17.87): a regular file,
+  // not open for appending.  "Seekable" was assumed from "has a name" and from
+  // "--sparse was given", and both are wrong:
+  //   * a named FIFO has a name: `gzstd -d -o fifo x.zst` failed (exit 3, "disk
+  //     full?") at the first run of zeros, because the seek returns ESPIPE;
+  //   * `--sparse -dc x.zst | ...` failed the same way;
+  //   * `--sparse -dc x.zst >> f`: on an O_APPEND descriptor every write goes
+  //     to the end of the file whatever the position is, so the seeks did
+  //     nothing and each run of zeros was DROPPED from the output at exit 0.
+  // Where a hole cannot be made the zeros are written, --sparse or not.
+  bool sparse_capable = (g_direct_writer != nullptr);   // adopted: regular, not append
+#ifndef _WIN32
+  if (!sparse_capable && out) {
+    struct stat sst{};
+    const int sfd = ::fileno(out);
+    const int sfl = sfd >= 0 ? ::fcntl(sfd, F_GETFL) : -1;
+    sparse_capable = sfd >= 0 && sfl >= 0 && !(sfl & O_APPEND)
+                  && ::fstat(sfd, &sst) == 0 && S_ISREG(sst.st_mode);
+    // ...AND NOTHING MAY LIE BEYOND THE POSITION.  A hole is made by seeking
+    // over the range, which leaves whatever is already there: on a descriptor
+    // the caller opened read-write over an existing file, `--sparse -dc`
+    // returned the OLD bytes where zeros belonged, at exit 0 (repairs review).
+    // An output this program created or truncated is empty past the position.
+    if (sparse_capable) {
+      (void)std::fflush(out);
+      const off_t spos = ::lseek(sfd, 0, SEEK_CUR);
+      sparse_capable = spos >= 0 && ::fstat(sfd, &sst) == 0 && sst.st_size <= spos;
+    }
+  }
+#else
+  if (!sparse_capable) sparse_capable = out && out != stdout;
+#endif
+  bool enable_sparse;
+  if (opt.sparse_mode == 1) {
+    enable_sparse = sparse_capable;  // --sparse: force on, where a hole is possible
+  } else if (opt.sparse_mode == 0) {
+    enable_sparse = false; // --no-sparse: force off
+  } else {
+    // Auto: enable for seekable file output (not pipes/stdout)
+    enable_sparse = (g_direct_writer != nullptr)   // O_DIRECT file
+                 || (out && out != stdout && sparse_capable);  // regular file via fwrite
+  }
+  // Progressive writeback (sync_file_range) is enabled for decompression to
+  // avoid the multi-second rename stall on ext4 data=ordered when the
+  // tmp file's dirty pages must flush at commit time.  Skip it for
+  // --overwrite (no tmp+rename) — the user explicitly opted out of
+  // atomicity for speed, and the writeback hint just steals bandwidth
+  // from fwrite.  Also skip for stdout (no rename).
+  bool psync = (opt.mode == Mode::DECOMPRESS) && !opt.unsafe_overwrite
+               && (out != stdout);
+  return GzWritePolicy{enable_sparse, psync};
+}
+
 static void writer_thread(FILE * out, ResultStore & results,
                           const Options & opt, Meter * m,
                           FrameThrottle * bp)
@@ -13938,59 +14124,9 @@ static void writer_thread(FILE * out, ResultStore & results,
   AsyncWritePool * aio = nullptr;
   std::unique_ptr<AsyncWritePool> aio_ptr;
   if (!skip_write && !sink) {
-    // Sparse file support: skip zero-filled 4K blocks via seek.
-    // --sparse forces on, --no-sparse forces off, default auto (file:on, stdout:off).
-    //
-    // A HOLE NEEDS A DESTINATION THAT CAN HOLD ONE (v0.17.87): a regular file,
-    // not open for appending.  "Seekable" was assumed from "has a name" and from
-    // "--sparse was given", and both are wrong:
-    //   * a named FIFO has a name: `gzstd -d -o fifo x.zst` failed (exit 3, "disk
-    //     full?") at the first run of zeros, because the seek returns ESPIPE;
-    //   * `--sparse -dc x.zst | ...` failed the same way;
-    //   * `--sparse -dc x.zst >> f`: on an O_APPEND descriptor every write goes
-    //     to the end of the file whatever the position is, so the seeks did
-    //     nothing and each run of zeros was DROPPED from the output at exit 0.
-    // Where a hole cannot be made the zeros are written, --sparse or not.
-    bool sparse_capable = (g_direct_writer != nullptr);   // adopted: regular, not append
-#ifndef _WIN32
-    if (!sparse_capable && out) {
-      struct stat sst{};
-      const int sfd = ::fileno(out);
-      const int sfl = sfd >= 0 ? ::fcntl(sfd, F_GETFL) : -1;
-      sparse_capable = sfd >= 0 && sfl >= 0 && !(sfl & O_APPEND)
-                    && ::fstat(sfd, &sst) == 0 && S_ISREG(sst.st_mode);
-      // ...AND NOTHING MAY LIE BEYOND THE POSITION.  A hole is made by seeking
-      // over the range, which leaves whatever is already there: on a descriptor
-      // the caller opened read-write over an existing file, `--sparse -dc`
-      // returned the OLD bytes where zeros belonged, at exit 0 (repairs review).
-      // An output this program created or truncated is empty past the position.
-      if (sparse_capable) {
-        (void)std::fflush(out);
-        const off_t spos = ::lseek(sfd, 0, SEEK_CUR);
-        sparse_capable = spos >= 0 && ::fstat(sfd, &sst) == 0 && sst.st_size <= spos;
-      }
-    }
-#else
-    if (!sparse_capable) sparse_capable = out && out != stdout;
-#endif
-    bool enable_sparse;
-    if (opt.sparse_mode == 1) {
-      enable_sparse = sparse_capable;  // --sparse: force on, where a hole is possible
-    } else if (opt.sparse_mode == 0) {
-      enable_sparse = false; // --no-sparse: force off
-    } else {
-      // Auto: enable for seekable file output (not pipes/stdout)
-      enable_sparse = (g_direct_writer != nullptr)   // O_DIRECT file
-                   || (out && out != stdout && sparse_capable);  // regular file via fwrite
-    }
-    // Progressive writeback (sync_file_range) is enabled for decompression to
-    // avoid the multi-second rename stall on ext4 data=ordered when the
-    // tmp file's dirty pages must flush at commit time.  Skip it for
-    // --overwrite (no tmp+rename) — the user explicitly opted out of
-    // atomicity for speed, and the writeback hint just steals bandwidth
-    // from fwrite.  Also skip for stdout (no rename).
-    bool psync = (opt.mode == Mode::DECOMPRESS) && !opt.unsafe_overwrite
-                 && (out != stdout);
+    const GzWritePolicy wp = gz_write_policy(out, opt);
+    const bool enable_sparse = wp.sparse;
+    const bool psync = wp.psync;
 #ifndef _WIN32
     aio_ptr = std::make_unique<AsyncWritePool>(out, g_direct_writer, enable_sparse, m, bp, psync);
     aio = aio_ptr.get();
@@ -14920,6 +15056,7 @@ namespace xxh {
       total = 0; buflen = 0;
     }
     void update(const void * data, size_t len) {
+      if (len == 0) return;  // an empty decoded frame may have a null data() pointer
       const unsigned char * p = (const unsigned char *)data;
       total += len;
       if (buflen + len < 32) { std::memcpy(buf + buflen, p, len); buflen += len; return; }
@@ -15140,6 +15277,244 @@ struct TableCkScope {
   TableCkScope & operator=(const TableCkScope &) = delete;
 };
 
+// ---- the seek table that arrives LAST (v0.17.92) ---------------------------
+// A frame written without a checksum of its own (`zstd --no-check`) is verified
+// against the seek table's -- which TableCkScope reads from the end of the file
+// BEFORE decoding.  A pipe has no end to read first: the table arrives after
+// every frame it describes has been decoded and written.  So for an input whose
+// table could not be loaded up front, the two in-order readers (the frame
+// splitter and the streaming decoder) note each frame as it passes -- sizes,
+// output offset, whether it carries its own checksum -- and keep the trailing
+// table.  At the end of the input:
+//   * default `-d`: if such frames exist and the table has checksums for them,
+//     say they were NOT verified and how to verify them (--verify, or the file);
+//   * `-t`, and `-d --verify`: every decoder has hashed those frames (on the
+//     CPU, from the decoded bytes -- a GPU-decoded frame at its host hand-off),
+//     keyed by output offset and size; compare them now.  A mismatch is a data error
+//     (exit 4, a named output removed) -- after the fact, which on a pipe is the
+//     only time it can be known.
+// The table is used only if it describes exactly the frames observed, in order
+// (compressed and decompressed sizes); otherwise those frames are reported as
+// unverified, never as corrupt -- a wrong table must not fail a sound archive.
+// gzstd's own archives carry a checksum in every frame and never reach this.
+struct GzLateFrame { uint64_t csz, dsz, off; bool own_ck, skippable; };
+struct GzLateCk {
+  std::mutex m;
+  bool observing = false;                  // this input's table was not read first
+  bool armed = false;                      // ...and the frames must be checked
+  std::vector<GzLateFrame> frames;         // in stream order, the table itself excluded
+  uint64_t frame_count = 0;                // also tracked without retaining records for plain -d
+  uint64_t unchecked_count = 0;            // data frames with no checksum of their own
+  std::vector<unsigned char> table;        // the last seek-table frame, whole
+  uint64_t frames_at_table = 0;            // frame_count when it arrived
+  bool oversized_table = false;            // valid table shape, too large to retain
+  // Empty DATA frames do not advance the output offset.  Include their size
+  // in the key so a following nonempty frame cannot replace their digest.
+  std::map<std::pair<uint64_t, uint64_t>, uint32_t> hashes; // (offset, size) -> XXH64 low 32
+  uint64_t handoff_off = 0;                // the splitter's output offset at a stream handoff
+  bool reported = false;
+};
+static GzLateCk g_late;
+static std::atomic<bool> g_late_armed{false};     // read on the decoders' paths
+
+static void gz_late_reset(bool observing)
+{
+  std::lock_guard<std::mutex> lk(g_late.m);
+  g_late.observing = observing;
+  g_late.armed = false;
+  g_late.frames.clear();
+  g_late.frame_count = 0;
+  g_late.unchecked_count = 0;
+  g_late.table.clear();
+  g_late.frames_at_table = 0;
+  g_late.oversized_table = false;
+  g_late.hashes.clear();
+  g_late.handoff_off = 0;
+  g_late.reported = false;
+  g_late_armed.store(false, std::memory_order_relaxed);
+}
+// After the input's TableCkScope: hash when testing, or when asked to verify.
+static void gz_late_arm(bool want)
+{
+  std::lock_guard<std::mutex> lk(g_late.m);
+  g_late.armed = g_late.observing && want;
+  g_late_armed.store(g_late.armed, std::memory_order_relaxed);
+}
+static bool gz_late_observing()
+{
+  std::lock_guard<std::mutex> lk(g_late.m);
+  return g_late.observing;
+}
+static void gz_late_note_data(uint64_t csz, uint64_t dsz, uint64_t off, bool own_ck)
+{
+  std::lock_guard<std::mutex> lk(g_late.m);
+  if (!g_late.observing) return;
+  ++g_late.frame_count;
+  if (!own_ck) ++g_late.unchecked_count;
+  if (g_late.armed) g_late.frames.push_back({csz, dsz, off, own_ck, false});
+}
+// Recognize a table too large to retain from its eight-byte header and nine-byte
+// footer.  The length and entry count must agree, so an unrelated large
+// skippable frame does not turn a sound -t stream into an error.
+static bool gz_late_oversize_table_shape(const unsigned char * h,
+                                         const unsigned char * tail, uint64_t n)
+{
+  return h && tail && n >= 17 && rd_le32(h) == 0x184D2A5Eu
+      && uint64_t(rd_le32(h + 4)) + 8 == n
+      && rd_le32(tail + 5) == 0x8F92EAB1u
+      && (tail[4] & 0x80u) && !(tail[4] & 0x7Cu)
+      && uint64_t(rd_le32(tail)) * 12 + 17 == n;
+}
+// A whole skippable frame.  A seek table is kept; any other is just a frame.
+static void gz_late_note_skippable(const unsigned char * p, size_t n,
+                                   bool oversized_table_hint = false)
+{
+  std::lock_guard<std::mutex> lk(g_late.m);
+  if (!g_late.observing) return;
+  const bool is_table = p && n >= 8 + 9 && rd_le32(p) == 0x184D2A5Eu
+                        && rd_le32(p + n - 4) == 0x8F92EAB1u && n <= ((size_t)64 << 20);
+  const bool oversized_table = n > ((size_t)64 << 20)
+      && (oversized_table_hint
+          || (p && gz_late_oversize_table_shape(p, p + n - 9, n)));
+  if (is_table) {
+    g_late.table.assign(p, p + n);
+    g_late.frames_at_table = g_late.frame_count;
+    g_late.oversized_table = false;
+  } else if (oversized_table) {
+    g_late.table.clear();
+    g_late.frames_at_table = g_late.frame_count;
+    g_late.oversized_table = true;
+  } else {
+    ++g_late.frame_count;
+    if (g_late.armed) g_late.frames.push_back({(uint64_t)n, 0, 0, true, true});
+  }
+}
+static void gz_late_record(uint64_t off, uint64_t size, uint32_t h32)
+{
+  if (!g_late_armed.load(std::memory_order_relaxed)) return;
+  std::lock_guard<std::mutex> lk(g_late.m);
+  if (!g_late.armed) return;   // a previous input may have ended before we got the lock
+  g_late.hashes[{off, size}] = h32;
+}
+static void gz_late_hash(uint64_t off, const void * data, size_t len)
+{
+  if (!g_late_armed.load(std::memory_order_relaxed)) return;
+  gz_late_record(off, len, gz_content_ck32(data, len));
+}
+static void gz_late_set_handoff(uint64_t off)
+{
+  std::lock_guard<std::mutex> lk(g_late.m);
+  g_late.handoff_off = off;
+}
+static uint64_t gz_late_handoff_or(uint64_t fallback)
+{
+  std::lock_guard<std::mutex> lk(g_late.m);
+  return g_late.observing ? g_late.handoff_off : fallback;
+}
+// At the end of an input, once everything is written.  Says or checks once.
+static void gz_late_finish(const Options & opt)
+{
+  std::unique_lock<std::mutex> lk(g_late.m);
+  if (!g_late.observing || g_late.reported) return;
+  g_late.reported = true;
+  // The table must be the last frame, carry checksums, and parse.
+  if (g_late.frames_at_table != g_late.frame_count) return;
+  if (g_late.oversized_table) {
+    if (g_late.unchecked_count == 0) return;
+    const bool armed = g_late.armed;
+    const uint64_t unchecked = g_late.unchecked_count;
+    if (armed && opt.keep_going)
+      for (const GzLateFrame & f : g_late.frames)
+        if (!f.skippable && !f.own_ck)
+          g_damage.record(f.off, f.dsz, f.dsz, /*late_unchecked=*/true);
+    lk.unlock();
+    const std::string msg = "trailing seek table is too large to retain, so "
+        + std::to_string(unchecked) + " frame(s) could not be checked";
+    if (armed && !opt.keep_going) die(msg, EXIT_ERROR);
+    vlog(armed ? V_ERROR : V_DEFAULT, opt,
+         "warning: " + msg + (armed ? "; decoded bytes kept but UNVERIFIED\n"
+                                   : "; re-run from a seekable file to verify them\n"));
+    return;
+  }
+  if (g_late.table.empty()) return;
+  const std::vector<unsigned char> & tb = g_late.table;
+  const size_t n = tb.size();
+  const unsigned char desc = tb[n - 5];
+  if (!(desc & 0x80u) || (desc & 0x7Cu)) return;        // no checksums, or a layout we do not know
+  const uint64_t nf = rd_le32(tb.data() + n - 9);
+  const uint64_t esz = 12;
+  if (rd_le32(tb.data() + 4) != n - 8 || nf * esz + 9 + 8 != n) return;
+  const uint64_t unchecked = g_late.unchecked_count;
+  if (unchecked == 0) return;                              // every frame verified itself
+  if (!g_late.armed) {
+    lk.unlock();
+    vlog(V_DEFAULT, opt,
+         "warning: " + std::to_string(unchecked) + " frame(s) of this stream carry no checksum of "
+         "their own; the seek table that has their checksums came at the end of the pipe, after "
+         "they were written, so they were NOT verified.  Re-run with --verify to check them, or "
+         "decompress from the file.\n");
+    return;
+  }
+  // Pair the table's entries with the frames observed, in order.
+  bool fits = (nf == g_late.frames.size());
+  for (uint64_t k = 0; fits && k < nf; ++k) {
+    const unsigned char * q = tb.data() + 8 + k * esz;
+    fits = rd_le32(q) == g_late.frames[k].csz && rd_le32(q + 4) == g_late.frames[k].dsz;
+  }
+  if (!fits) {
+    lk.unlock();
+    vlog(V_DEFAULT, opt,
+         "warning: the seek table at the end of this stream does not describe its frames, so "
+         + std::to_string(unchecked) + " frame(s) without a checksum of their own were NOT verified.\n");
+    return;
+  }
+  uint64_t checked = 0, unhashed = 0, recovered_bad = 0;
+  for (uint64_t k = 0; k < nf; ++k) {
+    const GzLateFrame & f = g_late.frames[k];
+    if (f.skippable || f.own_ck) continue;
+    const uint32_t want = rd_le32(tb.data() + 8 + k * esz + 8);
+    const auto it = g_late.hashes.find({f.off, f.dsz});
+    if (it == g_late.hashes.end()) {
+      ++unhashed;
+      if (opt.keep_going)
+        g_damage.record(f.off, f.dsz, f.dsz, /*late_unchecked=*/true);
+      continue;
+    }
+    if (it->second != want) {
+      if (opt.keep_going) {
+        // The decoded bytes have already reached the destination.  Preserve
+        // them under --keep-going, just as the up-front table check does, and
+        // let the caller report EXIT_DECOMP_UNVERIFIED after this function.
+        g_damage.record(f.off, f.dsz, f.dsz);
+        ++recovered_bad;
+        ++checked;
+        continue;
+      }
+      lk.unlock();
+      die_data("content-checksum mismatch at frame " + std::to_string(k)
+               + ": the seek table at the end of the stream says it hashes to "
+               + std::to_string(want) + " but the decoded bytes do not -- the archive is "
+               "corrupt (checked at the end of the input, after the frame was written)");
+    }
+    ++checked;
+  }
+  lk.unlock();
+  if (recovered_bad > 0)
+    vlog(V_ERROR, opt, "WARNING: --keep-going: " + std::to_string(recovered_bad)
+         + " frame(s) failed the trailing seek-table checksum; decoded bytes kept but UNVERIFIED\n");
+  if (unhashed > 0) {
+    // A fitting table promises a checksum for each of these frames.  A missing
+    // digest is a decoder coverage failure, not evidence that the input is
+    // corrupt; never let -t or --verify report clean success for it.
+    const std::string msg = std::to_string(unhashed) + " frame(s) could not be checked "
+        "against the trailing seek table because their decoded hashes are unavailable";
+    if (!opt.keep_going) die(msg, EXIT_ERROR);
+    vlog(V_ERROR, opt, "WARNING: --keep-going: " + msg + "; decoded bytes kept but UNVERIFIED\n");
+  }
+  vlog(V_VERBOSE, opt, "[VERIFY] " + std::to_string(checked) + " frame(s) checked against the "
+       "seek table at the end of the stream\n");
+}
+
 // Verify seek-table checksums across a STREAMING decode, where a frame's bytes
 // never all exist in one buffer.  The one-shot decoders hash a finished frame;
 // these paths must hash as the bytes go past.
@@ -15174,10 +15549,14 @@ struct StreamFrameCk {
   // head() has seen its header and frame_off_ is where the frame starts.
   bool       decided_ = false;
   bool       need_    = false;
+  bool       tbl_     = false;   // a seek-table entry to compare with now
+  bool       late_    = false;   // ...or a hash for a pipe's table at the end (GzLateCk)
   uint32_t   want_    = 0;
   void decide_() {
     decided_ = true;
-    need_ = active_ && !own_ck_ && table_checksum_for(frame_off_, &want_);
+    tbl_  = active_ && !own_ck_ && table_checksum_for(frame_off_, &want_);
+    late_ = !own_ck_ && !tbl_ && g_late_armed.load(std::memory_order_relaxed);
+    need_ = tbl_ || late_;
   }
   void bytes(const void * p, size_t n) {
     if (n && !decided_) decide_();
@@ -15186,7 +15565,7 @@ struct StreamFrameCk {
   }
   bool mismatch() {
     if (!decided_) decide_();
-    return need_ && (uint32_t)h_.digest() != want_;
+    return tbl_ && (uint32_t)h_.digest() != want_;
   }
   void frame_end(uint64_t seq) {
     if (mismatch())
@@ -15194,11 +15573,14 @@ struct StreamFrameCk {
                + ": the seek table says this frame hashes to "
                + std::to_string(want_)
                + " but the decoded bytes do not -- the archive is corrupt");
+    if (late_) gz_late_record(frame_off_, out_total_ - frame_off_, (uint32_t)h_.digest());
     h_.reset(0);
     frame_off_ = out_total_;
     own_ck_    = false;
     decided_   = false;
     need_      = false;
+    tbl_       = false;
+    late_      = false;
   }
 };
 
@@ -15398,10 +15780,15 @@ static void gz_require_usable_gpu(const Options & opt, const char * who);
 // `in` before the decision to stream it -- the frame splitter reads a few MiB
 // before it can see that the first frame is huge or sizeless, and on a pipe it
 // cannot give them back.  They are decoded first, exactly as if read here.
+//
+// `out_base` (v0.17.92): the decompressed offset this stream starts at -- not 0
+// when it is the tail of an input whose earlier frames the parallel route has
+// already written.  The seek-table checksum map is keyed by that offset.
 static void decompress_stream_from_file(FILE * in, FILE * out,
                                         const Options & opt, Meter * m,
                                         const std::vector<char> * prefix = nullptr,
-                                        bool table_scope_active = false)
+                                        bool table_scope_active = false,
+                                        uint64_t out_base = 0)
 {
 #ifdef HAVE_NVCOMP
   // Decodes on the CPU whatever the hardware; --gpu-only still needs a GPU.
@@ -15440,14 +15827,15 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   std::unique_ptr<TableCkScope> tck_scope;
   if (!table_scope_active) tck_scope = std::make_unique<TableCkScope>(in);
   StreamFrameCk sck;
+  sck.frame_off_ = sck.out_total_ = out_base;
   // WRITE ON ANOTHER THREAD (v0.17.91).  This decoder read, decoded and wrote
   // on one thread, so a slow destination -- a pipe above all -- stalled the
   // decoding: MEASURED, an 8 GiB single-frame archive piped through `-d -c` took
   // 26 s against zstd's 20 s, while `-t`, which writes nothing, was faster than
   // zstd.  Output now goes to the same AsyncWritePool the frame-parallel writer
   // uses, in OUT_BATCH pieces decoded straight into the buffer that is handed
-  // over.  Sparse output stays off: this path never made holes, and whether it
-  // should is a separate decision.  The pool counts wrote_bytes as it writes;
+  // over, under the frame writer's output policy (gz_write_policy: holes where
+  // the destination can hold them, since v0.17.92).  The pool counts wrote_bytes as it writes;
   // `emitted` is what the decoder has produced, which is what the old
   // synchronous count was at every point it was read (the --keep-going
   // recovery offsets below).
@@ -15460,10 +15848,11 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
 #endif
   std::unique_ptr<AsyncWritePool> aio;
   if (to_out) {
+    const GzWritePolicy wp = gz_write_policy(out, opt);   // holes as the frame writer makes them
 #ifndef _WIN32
-    aio = std::make_unique<AsyncWritePool>(out, g_direct_writer, false, m, nullptr, false);
+    aio = std::make_unique<AsyncWritePool>(out, g_direct_writer, wp.sparse, m, nullptr, wp.psync);
 #else
-    aio = std::make_unique<AsyncWritePool>(out, nullptr, false, m, nullptr, false);
+    aio = std::make_unique<AsyncWritePool>(out, nullptr, wp.sparse, m, nullptr, wp.psync);
 #endif
   }
   FrameBuf batch;
@@ -15483,6 +15872,13 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   // Everything decoded so far reaches the destination before an error ends the
   // run, as it did when every piece was written as it was decoded.
   auto drain = [&]() { if (aio) { ship(); aio->flush(); } };
+  // GzLateCk: on a pipe, note each frame and keep a skippable one whole -- the
+  // last of them may be the seek table, which arrives only now.
+  const bool late_obs = gz_late_observing();
+  std::vector<unsigned char> skip_cap;
+  bool skip_big = false;
+  unsigned char skip_tail[9] = {};
+  size_t skip_tail_n = 0;
 
   // One input chunk through the decoder.  The prefix goes through first.
   auto feed = [&](const char * src, size_t n) {
@@ -15542,6 +15938,31 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
         head_n += take;
       }
       cur_len += used;
+      if (late_obs && head_n >= 4 && (rd_le32(head) & 0xFFFFFFF0u) == 0x184D2A50u) {
+        // Keep the footer even after the full-frame capture reaches its memory
+        // bound.  A large valid seek table must not silently bypass -t/--verify.
+        if (used >= sizeof skip_tail) {
+          std::memcpy(skip_tail, src + zin.pos - sizeof skip_tail, sizeof skip_tail);
+          skip_tail_n = sizeof skip_tail;
+        } else if (used > 0) {
+          const size_t keep = std::min(skip_tail_n, sizeof skip_tail - used);
+          std::memmove(skip_tail, skip_tail + skip_tail_n - keep, keep);
+          std::memcpy(skip_tail + keep, src + consumed_from, used);
+          skip_tail_n = keep + used;
+        }
+        if (!skip_big) {
+          // This frame's bytes from earlier calls, before its magic was known:
+          // fewer than four, so all of them are in `head`.
+          const size_t prev = (size_t)std::min<uint64_t>(cur_len - used, head_n);
+          if (skip_cap.empty() && prev > 0) skip_cap.assign(head, head + prev);
+          if (skip_cap.size() + used > ((size_t)64 << 20)) {
+            skip_big = true;
+            skip_cap.clear();
+          } else {
+            skip_cap.insert(skip_cap.end(), src + consumed_from, src + zin.pos);
+          }
+        }
+      }
       sck.head(head, head_n);
       // The frame's LAST output arrives on the same call that reports the
       // boundary, so hash before settling the frame -- not after.
@@ -15564,6 +15985,18 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
         emitted += zout.pos;
       }
       if (frame_done) {
+        if (late_obs && head_n >= 4) {
+          if (rd_le32(head) == 0xFD2FB528u)
+            gz_late_note_data(cur_len, sck.out_total_ - sck.frame_off_, sck.frame_off_, sck.own_ck_);
+          else if ((rd_le32(head) & 0xFFFFFFF0u) == 0x184D2A50u)
+            gz_late_note_skippable(skip_big ? nullptr : skip_cap.data(),
+                                   skip_big ? (size_t)cur_len : skip_cap.size(),
+                                   skip_big && head_n >= 8 && skip_tail_n == sizeof skip_tail
+                                     && gz_late_oversize_table_shape(head, skip_tail, cur_len));
+          skip_cap.clear();
+          skip_big = false;
+          skip_tail_n = 0;
+        }
         // frame_end may exit on a seek-table checksum mismatch.  The old
         // synchronous writer had already emitted this frame at that point.
         if (aio && sck.mismatch()) drain();
@@ -15666,11 +16099,12 @@ static void gz_stream_rest(FILE * in, FILE * out, const Options & opt, Meter * m
                            const std::vector<char> & prefix, uint64_t decomp)
 {
   gz_note_single_frame_stream(opt, decomp);
+  const uint64_t wrote_before = m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0;
   if (m && decomp > 0) {
     // --tar can share one meter across several input archives.
     m->total_out.fetch_add(decomp, std::memory_order_relaxed);
-    m->total_out_final.store(true, std::memory_order_release);
   }
+  if (m) m->total_out_final.store(false, std::memory_order_release);
 #ifndef _WIN32
   // The old sized-frame queue path preallocated its direct output before
   // writing.  Streaming the first frame bypasses that queue and its setup.
@@ -15682,6 +16116,35 @@ static void gz_stream_rest(FILE * in, FILE * out, const Options & opt, Meter * m
   }
 #endif
   decompress_stream_from_file(in, out, opt, m, &prefix, true);
+  if (m) {
+    const uint64_t actual = m->wrote_bytes.load(std::memory_order_relaxed) - wrote_before;
+    if (actual >= decomp) m->total_out.fetch_add(actual - decomp, std::memory_order_relaxed);
+    else                  m->total_out.fetch_sub(decomp - actual, std::memory_order_relaxed);
+    m->total_out_final.store(true, std::memory_order_release);
+  }
+  gz_late_finish(opt);   // a pipe's trailing seek table (GzLateCk)
+}
+
+// The tail half (v0.17.92): stream_frames_to_queue stood down at frame
+// `frames_before`, a huge or sizeless one, after queueing the frames before it;
+// those are all written now (the caller joined its writer).  Decode the rest --
+// `prefix`, then whatever `in` still holds -- on one CPU thread in bounded
+// memory, at the output offset the parallel part reached.
+static void gz_stream_tail(FILE * in, FILE * out, const Options & opt, Meter * m,
+                           const std::vector<char> & prefix, size_t frames_before)
+{
+  vlog(V_DEFAULT, opt,
+       "warning: frame " + std::to_string(frames_before) + " onward is too large to "
+       "split or declares no size; the rest is streamed on the CPU (one thread).\n");
+  const uint64_t wrote_before = m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0;
+  if (m) m->total_out_final.store(false, std::memory_order_release);
+  decompress_stream_from_file(in, out, opt, m, &prefix, true,
+      gz_late_handoff_or(wrote_before));
+  if (m) {
+    m->total_out.fetch_add(m->wrote_bytes.load(std::memory_order_relaxed) - wrote_before,
+                           std::memory_order_relaxed);
+    m->total_out_final.store(true, std::memory_order_release);
+  }
 }
 
 struct CpuThreadStats {
@@ -17261,6 +17724,7 @@ static void cpu_decomp_worker(
       // Same rule as the strict path, reported the --keep-going way: the content
       // is present, so record it as recovered-but-unverified rather than dying.
       if (!ZSTD_isError(rc) && !own_ck_k) {
+        gz_late_hash(t.out_off, out_buf->data(), (size_t)t.decomp_size);   // GzLateCk
         uint32_t want_k = 0;
         if (table_checksum_for(t.out_off, &want_k)
             && gz_content_ck32(out_buf->data(), (size_t)t.decomp_size) != want_k) {
@@ -17341,6 +17805,7 @@ static void cpu_decomp_worker(
           ++chunk_seq;
         }
         if (ret == 0) {
+          if (!stream_own_ck) gz_late_record(t.out_off, actual, (uint32_t)stream_h.digest());   // GzLateCk
           uint32_t want_s = 0;
           if (!stream_own_ck && table_checksum_for(t.out_off, &want_s)
               && (uint32_t)stream_h.digest() != want_s)
@@ -17392,6 +17857,7 @@ static void cpu_decomp_worker(
       // deliberately: holding a sound frame against possibly-stale table
       // metadata would fail good archives to close a gap they do not have.
       if (!own_ck) {
+        gz_late_hash(t.out_off, out_buf->data(), out_buf->size());   // a pipe's table, at the end
         uint32_t want_ck = 0;
         if (table_checksum_for(t.out_off, &want_ck)
             && gz_content_ck32(out_buf->data(), out_buf->size()) != want_ck)
@@ -18869,6 +19335,7 @@ static size_t stream_frames_to_queue(
           skip_size = rd_le32(ptr + 4);
           size_t total_skip = 8 + (size_t)skip_size;
           if (total_skip > remaining) break;  // need more data
+          gz_late_note_skippable((const unsigned char *)ptr, total_skip);   // a pipe's seek table
           buf_off += total_skip;
           ++total_frames;            // a complete frame, just not a DATA one
           if (m) m->skipped_input_bytes.fetch_add(total_skip, std::memory_order_relaxed);
@@ -18876,8 +19343,11 @@ static size_t stream_frames_to_queue(
         }
       }
 
-      // A huge or sizeless FIRST data frame: stream it (see stream_rest above).
-      if (stream_rest && seq == 0) {
+      // A huge or sizeless data frame: stream it and everything after it (see
+      // stream_rest above).  ANY position since v0.17.92: after smaller frames,
+      // a sizeless one used to make this read the rest of the input into memory,
+      // and a huge sized one was read whole and decoded as one task.
+      if (stream_rest) {
         ZSTD_frameHeader zfh;
         const size_t need = ZSTD_getFrameHeader(&zfh, ptr, remaining);
         if (need > 0 && !ZSTD_isError(need) && !eof) break;   // header incomplete
@@ -18893,11 +19363,17 @@ static size_t stream_frames_to_queue(
 #endif
           *fallback = true;
           *stream_rest = true;
+          gz_late_set_handoff(out_off_acc);    // where the stream's frames begin in the output
           if (raw_data) raw_data->assign(buf.data() + buf_off, buf.data() + buf_len);
+          // First frame: its declared size, for the caller's meter and
+          // preallocation.  Later: the largest QUEUED frame, as every other
+          // return reports it -- the GPU driver sizes buffers from this, and
+          // the frame being streamed never reaches a GPU.
           if (max_frame_decomp_out)
-            *max_frame_decomp_out = zfh.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN
+            *max_frame_decomp_out = seq > 0 ? max_frame_decomp
+                                  : zfh.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN
                                     ? 0 : (size_t)zfh.frameContentSize;
-          return 0;
+          return seq;
         }
       }
       // Try to find the compressed frame size (the sequential parse spine —
@@ -18995,6 +19471,8 @@ static size_t stream_frames_to_queue(
       if (m) m->reader_copy_ns.fetch_add(now_ns() - cp_t0, std::memory_order_relaxed);
       t.decomp_size = (size_t)frame_decomp;
       t.out_off = out_off_acc;                 // --keep-going: offset of this frame in the output
+      gz_late_note_data(frame_comp, frame_decomp, out_off_acc,
+                        ((unsigned char)ptr[4] & 0x04) != 0);   // GzLateCk
       out_off_acc += (uint64_t)frame_decomp;
       if ((size_t)frame_decomp > max_frame_decomp) max_frame_decomp = (size_t)frame_decomp;
       // push() blocks on the bounded queue when consumers can't keep up — that
@@ -19091,6 +19569,9 @@ static size_t stream_frames_to_queue(
 static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   TableCkScope tck_scope(in);   // seek-table checksums for THIS input
+  // A pipe's table comes last: hash what it alone can verify under -t and
+  // -d --verify, else warn at the end (GzLateCk).
+  gz_late_arm(opt.mode == Mode::TEST || opt.verify_decode);
   // ---- Performance instrumentation (active at -vvv) ----
   PerfCounters perf_local;
   if (opt.verbosity >= V_TRACE) { g_perf = &perf_local; g_phase_on.store(true); }
@@ -19187,6 +19668,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
          "cannot determine frame sizes; using streaming CPU decompress\n");
     decompress_from_buffer(raw_data, out, opt, m,
                            m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
+    gz_late_finish(opt);
     return;
   }
 
@@ -19242,7 +19724,9 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   // are fully written now (writer joined), so append the tail via the CPU
   // streaming decoder.  Before v0.13.54 this tail was silently dropped —
   // truncated output with exit 0.
-  if (fallback && !raw_data.empty()) {
+  if (fallback && stream_rest) {
+    gz_stream_tail(in, out, opt, m, raw_data, n_frames);
+  } else if (fallback && !raw_data.empty()) {
     vlog(V_DEFAULT, opt,
          "warning: frame " + std::to_string(n_frames) + " onward has no "
          "content-size header (zstd streaming output); the parallel reader "
@@ -19251,6 +19735,7 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
     decompress_from_buffer(raw_data, out, opt, m,
                            m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
   }
+  gz_late_finish(opt);   // a pipe's trailing seek table (GzLateCk), now that all is written
 
   if (g_perf) {
     g_perf->print_summary("CPU-ONLY DECOMPRESS");
@@ -19635,8 +20120,8 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   // 130 GiB tar); through pipes it was the whole gap: 191-203 s against zstd's
   // 113-116 s for `cat | -c | cat`.  zstd's CLI reads and writes on their own
   // threads; so does this now.  The output goes to the AsyncWritePool the frame
-  // writer uses (sparse off, as before), in OUT_BATCH pieces that zstd fills
-  // directly; the pool counts wrote_bytes as it writes them.
+  // writer uses, under its output policy (gz_write_policy), in OUT_BATCH pieces
+  // that zstd fills directly; the pool counts wrote_bytes as it writes them.
   const size_t READ_CHUNK = 4 * ONE_MIB;
   static constexpr size_t OUT_BATCH = 8 * ONE_MIB;
 
@@ -19647,10 +20132,11 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   std::unique_ptr<StreamVerifier> sv;
   if (opt.verify) sv = std::make_unique<StreamVerifier>(opt);
 
+  const GzWritePolicy wp = gz_write_policy(out, opt);   // the frame writer's rules
 #ifndef _WIN32
-  AsyncWritePool aio(out, g_direct_writer, false, m, nullptr, false);
+  AsyncWritePool aio(out, g_direct_writer, wp.sparse, m, nullptr, wp.psync);
 #else
-  AsyncWritePool aio(out, nullptr, false, m, nullptr, false);
+  AsyncWritePool aio(out, nullptr, wp.sparse, m, nullptr, wp.psync);
 #endif
   FrameBuf batch;
   size_t batch_used = 0;
@@ -27757,6 +28243,7 @@ static bool build_full_parallel_plan(FILE * in, int dest_fd,
 // whatever checksum it carries in its own trailer.
 static void table_checksums_clear()
 {
+  gz_late_reset(false);
   g_tbl_ck_off.clear();
   g_tbl_ck_val.clear();
   g_input_max_frame.store(0, std::memory_order_relaxed);
@@ -27767,6 +28254,9 @@ static void table_checksums_load(FILE * in)
 {
   table_checksums_clear();
   if (!in) return;
+  // A pipe's table can only be seen at its end: watch the frames go by
+  // instead (GzLateCk).  The parse below then fails on the seek, as before.
+  if (std::ftell(in) < 0) gz_late_reset(true);
   tarx::TarSeekTable st;
   if (!tarx::parse_foreign_seek_table(in, st) || !st.valid()) return;
   // Publish the real maximum frame size BEFORE the checksum early-outs: a table
@@ -37290,8 +37780,23 @@ static void gpu_decomp_worker(
               rc_bail_if_reclaimed();
             }
 
+            // Hash at the host hand-off, but publish the digest only with the
+            // delivery transaction below.  A reclaimed batch can be rescued
+            // on the CPU; its abandoned GPU must not overwrite that rescue's
+            // digest after the new worker has finished.
+            bool late_hash_ready = false;
+            uint32_t late_hash = 0;
+            if (g_late_armed.load(std::memory_order_relaxed)) {
+              const unsigned char * fp = (const unsigned char *)C.batch[i].ptr();
+              if (fp && C.batch[i].len() >= 5 && !(fp[4] & 0x04)) {
+                late_hash = gz_content_ck32(h_out->data(), actual);
+                late_hash_ready = true;
+              }
+            }
             uint64_t rl_t0 = g_perf ? now_ns() : 0;
             rc_commit_delivery([&] {
+              if (late_hash_ready)
+                gz_late_record(C.batch[i].out_off, actual, late_hash);
               results->push_to_slot(slot_index, batch_seqs[i], std::move(h_out));
               // See the compress site: engagement means a DELIVERED frame.
               g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
@@ -37927,6 +38432,9 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   const uint64_t abandoned_at_start =
       g_decomp_abandoned.load(std::memory_order_relaxed);
   TableCkScope tck_scope(in);   // seek-table checksums for THIS input
+  // A pipe's table comes last: hash what it alone can verify under -t and
+  // -d --verify, else warn at the end (GzLateCk).
+  gz_late_arm(opt.mode == Mode::TEST || opt.verify_decode);
   // NO INPUT INHERITS THE PREVIOUS ONE'S STAGED-READ STATE.  This is the call
   // that actually closes the hole: it runs first, so it does not matter how the
   // previous file's run ended -- cleanly, by demotion, or by a fault that
@@ -39078,6 +39586,19 @@ gds_out_declined:
     // made this std::thread's destructor call std::terminate — an abort on
     // every hybrid/gpu-only decompress of a streamed-zstd file (v0.13.54).
     stop_bringup_sample();
+    // STREAM FIRST, THEN TEAR DOWN (v0.17.92).  A single huge or sizeless frame
+    // on a pipe lands here at its header, while the GPUs are still being brought
+    // up in the background -- and the join below waited for that (CUDA's init,
+    // 3-4 s on an 8-GPU machine) before a byte was decoded, for a stream that
+    // never uses a GPU.  MEASURED, 8 GiB single frame through a pipe, idle
+    // machine: 17.1-18.5 s by default against 13.3-14.2 s with --cpu-only.  The
+    // stream touches no GPU state; any worker the bringup still starts finds the
+    // queue done and exits, and the join still precedes gpu_workers (above).
+    // Not with GDS output registered (its teardown below must come first) and
+    // not under --gpu-only, whose "no usable GPU" refusal should precede decoding.
+    const bool stream_now = stream_rest && !opt.gpu_only
+                            && !g_gds_out_active.load(std::memory_order_relaxed);
+    if (stream_now) gz_stream_rest(in, out, opt, m, raw_data, max_frame_decomp);
     if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
     if (gpu_only_no_device.load(std::memory_order_acquire))
       die_usage(gz_no_gpu_usage_msg(opt));
@@ -39104,7 +39625,7 @@ gds_out_declined:
     }
 
     if (stream_rest) {
-      gz_stream_rest(in, out, opt, m, raw_data, max_frame_decomp);
+      if (!stream_now) gz_stream_rest(in, out, opt, m, raw_data, max_frame_decomp);
       return;
     }
     vlog(V_DEFAULT, opt,
@@ -39117,6 +39638,7 @@ gds_out_declined:
          "for data safety, just slower.\n");
     decompress_from_buffer(raw_data, out, opt, m,
                            m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
+    gz_late_finish(opt);
     return;
   }
 
@@ -39384,7 +39906,9 @@ gds_out_declined:
   // content-size header, so the reader buffered the rest of the input in
   // raw_data.  All parsed frames are written (writer joined); append the
   // tail via the CPU streaming decoder.  Previously dropped silently.
-  if (fallback && !raw_data.empty()) {
+  if (fallback && stream_rest) {
+    gz_stream_tail(in, out, opt, m, raw_data, n_frames);
+  } else if (fallback && !raw_data.empty()) {
     vlog(V_DEFAULT, opt,
          "warning: frame " + std::to_string(n_frames) + " onward has no "
          "content-size header (zstd streaming output); the parallel reader "
@@ -39393,6 +39917,7 @@ gds_out_declined:
     decompress_from_buffer(raw_data, out, opt, m,
                            m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0);
   }
+  gz_late_finish(opt);   // a pipe's trailing seek table (GzLateCk), now that all is written
 
   // CLEAR ON THE WAY OUT TOO, not only on the way in.  Every non-abandoned GPU
   // worker and any CPU rescue have joined by here.  A reclaimed worker is detached,
@@ -40140,6 +40665,7 @@ static int verify_tar(const Options & opt, Meter * m)
                                    // writer_thread / the streaming helpers); the
                                    // validate-only Extractor gives the test
                                    // semantics.  TEST mode would discard output.
+    dopt.verify_decode = true;     // -t --tar still checks a pipe's trailing seek table
 
     // A corrupt zstd stream makes the decompressor die_data(); that is itself a
     // test failure, surfaced as exit 4 — the desired behavior for `-t`.  out is
@@ -42801,7 +43327,7 @@ static int gzstd_main(int argc, char ** argv)
 #endif
 
 #ifndef _WIN32
-  g_direct_writer = dw_ptr;
+  gz_direct_writer_publish(dw_ptr);
 #endif
 
   Meter meter;
@@ -43108,7 +43634,11 @@ static int gzstd_main(int argc, char ** argv)
         // the caller's position wherever the rejected pass put it.
         const int stdout_fd = dw_ptr->caller_fd();
         int keep = ::fcntl(dw_ptr->fd(), F_DUPFD_CLOEXEC, 0);
-        direct_writer.reset();                 // dtor joins writer thread, closes its fd
+        {
+          std::lock_guard<std::timed_mutex> exit_lk(g_direct_writer_exit_m);
+          g_direct_writer = nullptr;
+          direct_writer.reset();               // dtor joins writer thread, closes its fd
+        }
         bool reopened = false;
         if (keep >= 0) {
           // Back to where THIS output began: out_base for an adopted stdout
@@ -43131,7 +43661,7 @@ static int gzstd_main(int argc, char ** argv)
         if (!reopened)
           die_io("failed to reset O_DIRECT output for CPU rebuild");
         dw_ptr = direct_writer.get();
-        g_direct_writer = dw_ptr;
+        gz_direct_writer_publish(dw_ptr);
       } else
 #endif
       if (out) {
@@ -43394,8 +43924,11 @@ static int gzstd_main(int argc, char ** argv)
         die_io("--sync-output: fsync of O_DIRECT output failed ("
                + std::string(std::strerror(errno)) + ")");
     }
-    g_direct_writer = nullptr;
-    direct_writer.reset();
+    {
+      std::lock_guard<std::timed_mutex> exit_lk(g_direct_writer_exit_m);
+      g_direct_writer = nullptr;
+      direct_writer.reset();
+    }
     finalize_ms = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(
         std::chrono::steady_clock::now() - t_fin).count();
   }
@@ -46595,11 +47128,14 @@ static Options parse_args(int argc, char ** argv)
   }
 
   if (opt.verify && opt.mode != Mode::COMPRESS) {
-    // Decompression already validates every frame's checksum as it runs, so
-    // --verify is redundant there — accept it quietly so scripts that always
-    // pass --verify still work, but say it's a no-op.
-    vlog(V_VERBOSE, opt, "note: --verify applies to compression; decompression already validates checksums\n");
+    // Decompression already validates every frame's own checksum as it runs.
+    // What --verify adds there (v0.17.92): frames written WITHOUT one, whose
+    // only evidence is a seek table that a pipe delivers last -- see GzLateCk.
+    // A file, or a redirected stdin, is checked anyway; so is anything under -t.
+    vlog(V_VERBOSE, opt, "note: --verify on decompression checks frames that carry no checksum of "
+         "their own against a seek table arriving at the end of a pipe\n");
     opt.verify = false;
+    opt.verify_decode = true;
   }
 
   if (opt.keep_going) {

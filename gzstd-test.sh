@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=596
-$EXTENSIVE && EXPECTED_TESTS=755
+EXPECTED_TESTS=599
+$EXTENSIVE && EXPECTED_TESTS=758
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -8378,10 +8378,13 @@ grep -aq "rebuilding" "$so/e7" || so_why+=" [second command: no rebuild happened
 # zero, so the command after the failed gzstd wrote over the header.
 rc=0
 { printf 'HEADER-16-BYTES\n'
-  cat "$so/b" | GZSTD_DEBUG_CORRUPT_FRAME=1 "$GZSTD" --cpu-only --verify --chunk-size=1 -c 2>/dev/null || rc=$?
+  cat "$so/b" | GZSTD_DEBUG_CORRUPT_FRAME=1 "$GZSTD" --cpu-only --verify --chunk-size=1 -c 2> "$so/e7b" || rc=$?
   printf 'DONE\n'; } > "$so/o7b"
+# (stderr kept: this case exited 0 ONCE, in a v0.17.92 CPU-only suite run, and
+# 520 attempts to reproduce it -- fixed and fresh inputs, loaded and pinned to
+# one CPU -- all exited 4.  If it recurs, the message below says what gzstd said.)
 [[ $rc -eq 4 && "$(head -c 15 "$so/o7b")" == "HEADER-16-BYTES" && "$(tail -c 5 "$so/o7b")" == "DONE" ]] \
-  || so_why+=" [unrebuildable (piped input): exit $rc, want 4; the file starts '$(head -c 15 "$so/o7b" | tr -c '[:print:]' '.')']"
+  || so_why+=" [unrebuildable (piped input): exit $rc, want 4; the file starts '$(head -c 15 "$so/o7b" | tr -c '[:print:]' '.')'; stderr: $(tr '\n' ' ' < "$so/e7b" | cut -c1-300)]"
 # ...and a rebuild on the O_DIRECT writer (adopted at offset zero) must leave the
 # descriptor after the REBUILT output: v0.17.88 re-adopts it with the caller's
 # descriptor in hand, or the trailer below lands on the archive.
@@ -9266,6 +9269,13 @@ SCPY
         sc_n=$(stat -c %s "$sc/partial.out" 2>/dev/null || echo 0)
         [[ $sc_n -eq $((300*1048576)) ]] \
           || sc_why+=" [checksum failure emitted $sc_n of $((300*1048576)) decoded bytes]"
+        # ...and stdout redirected to a REGULAR FILE too (v0.17.92): a GPU build
+        # takes that over with O_DIRECT, and die() used to drop the writer's
+        # buffered tail -- 268 MiB of 300 reached the file.
+        rc=0; "$GZSTD" -d -q -c --cpu-only "$sc/bad.zst" > "$sc/partial2.out" 2>/dev/null || rc=$?
+        sc_n=$(stat -c %s "$sc/partial2.out" 2>/dev/null || echo 0)
+        [[ $rc -eq 4 && $sc_n -eq $((300*1048576)) ]] \
+          || sc_why+=" [stdout to a regular file: exit $rc, $sc_n of $((300*1048576)) decoded bytes reached it]"
       fi
     done
     [[ -z "$sc_why" ]] && pass "a single frame without its own checksum is checked against the seek table" \
@@ -9299,6 +9309,179 @@ if command -v zstd >/dev/null 2>&1; then
   rm -rf "$sz_d"
 else
   skip "--sliding-window output is byte-identical to zstd's" "no zstd"
+fi
+
+# A HUGE OR SIZELESS FRAME AFTER SMALLER ONES on stdin (v0.17.92).  Only the
+# first frame used to be streamed: a later sizeless frame made the splitter read
+# the rest of the input into memory, and a later huge sized one was read whole
+# and decoded as one task.  gzstd's own 64 MiB archive, then a 300 MiB frame
+# (a third of it zeros) sized and sizeless: at -T4 the old route peaked at 476-603
+# MiB, the stream about 136.  The same frame from a named file shows item 10:
+# the single-frame decoder now leaves holes where the frame writer would.
+if [[ -x /usr/bin/time ]] && command -v zstd >/dev/null 2>&1; then
+  tf="$TMPDIR/tf"; mkdir -p "$tf"; tf_why=""
+  head -c $((64*1048576)) /dev/urandom > "$tf/s.bin"
+  { head -c $((100*1048576)) /dev/urandom; head -c $((100*1048576)) /dev/zero
+    head -c $((100*1048576)) /dev/urandom; } > "$tf/z.bin"
+  "$GZSTD" -q -f --cpu-only "$tf/s.bin" -o "$tf/s.zst" 2>/dev/null
+  zstd -q -f "$tf/z.bin" -o "$tf/z.zst"
+  cat "$tf/z.bin" | zstd -q -c > "$tf/zs.zst"
+  cat "$tf/s.bin" "$tf/z.bin" > "$tf/want"
+  for tf_k in z zs; do
+    rc=0
+    cat "$tf/s.zst" "$tf/$tf_k.zst" | /usr/bin/time -f %M -o "$tf/rss" \
+      "$GZSTD" -d -q -c --cpu-only -T4 > "$tf/out" 2>/dev/null || rc=$?
+    tf_m=$(tail -1 "$tf/rss" 2>/dev/null)
+    [[ $rc -eq 0 ]] && cmp -s "$tf/out" "$tf/want" || tf_why+=" [$tf_k after small frames: exit $rc or wrong bytes]"
+    [[ "$tf_m" =~ ^[0-9]+$ && $tf_m -lt 307200 ]] || tf_why+=" [$tf_k after small frames peaked at ${tf_m:-?} KiB, want < 300 MiB]"
+    rc=0; cat "$tf/s.zst" "$tf/$tf_k.zst" | "$GZSTD" -t -q --cpu-only -T4 2>/dev/null || rc=$?
+    [[ $rc -eq 0 ]] || tf_why+=" [$tf_k after small frames: -t exited $rc]"
+  done
+  [[ -z "$tf_why" ]] && pass "a huge or sizeless frame after smaller ones streams through a pipe" \
+    || fail "a huge or sizeless frame after smaller ones streams through a pipe" "$tf_why"
+  # Holes: only where this filesystem makes them at all.
+  truncate -s 1M "$tf/probe" 2>/dev/null
+  if [[ -e "$tf/probe" && $(stat -c %b "$tf/probe") -eq 0 ]]; then
+    # A filesystem that compresses or elides written zero blocks gives a
+    # dense file a sparse-looking st_blocks count.  Measure that property
+    # before asserting an allocation difference between the two modes.
+    dd if=/dev/zero of="$tf/dense_probe" bs=1M count=16 conv=fsync status=none 2>/dev/null
+    dense_bytes=$(( $(stat -c %b "$tf/dense_probe" 2>/dev/null || echo 0) * 512 ))
+    if [[ $dense_bytes -ge $((12*1048576)) ]]; then
+      hz_why=""
+      "$GZSTD" -d -q -f --cpu-only "$tf/z.zst" -o "$tf/h1" 2>/dev/null
+      "$GZSTD" -d -q -f --cpu-only --no-sparse "$tf/z.zst" -o "$tf/h2" 2>/dev/null
+      hz1=$(( $(stat -c %b "$tf/h1" 2>/dev/null || echo 0) * 512 / 1048576 ))
+      hz2=$(( $(stat -c %b "$tf/h2" 2>/dev/null || echo 0) * 512 / 1048576 ))
+      cmp -s "$tf/h1" "$tf/z.bin" && cmp -s "$tf/h2" "$tf/z.bin" || hz_why+=" [wrong bytes]"
+      [[ $hz1 -le 220 ]] || hz_why+=" [-o file: $hz1 MiB allocated for 200 MiB of data and 100 MiB of zeros]"
+      [[ $hz2 -ge 290 ]] || hz_why+=" [--no-sparse: only $hz2 MiB allocated]"
+      [[ -z "$hz_why" ]] && pass "the single-frame decoder leaves holes where the frame writer would" "($hz1 MiB allocated of 300)" \
+        || fail "the single-frame decoder leaves holes where the frame writer would" "$hz_why"
+    else
+      skip_host "the single-frame decoder leaves holes where the frame writer would" "this filesystem elides written zero blocks"
+    fi
+  else
+    skip_host "the single-frame decoder leaves holes where the frame writer would" "this filesystem makes no holes"
+  fi
+  rm -rf "$tf"
+else
+  skip "a huge or sizeless frame after smaller ones streams through a pipe" "needs /usr/bin/time and zstd"
+  skip "the single-frame decoder leaves holes where the frame writer would" "needs /usr/bin/time and zstd"
+fi
+
+# A PIPE'S SEEK TABLE ARRIVES LAST (v0.17.92).  A frame written without a
+# checksum of its own (zstd --no-check) is verified against the seek table's,
+# which a file has at its end and gzstd reads first.  Through a pipe the table
+# comes after the frames are written: by default gzstd now SAYS they were not
+# verified; with -t, or -d --verify, it hashes them as they are decoded and
+# checks them at the end (exit 4 on a mismatch).  A table that does not describe
+# the stream's frames verifies nothing and fails nothing.  Three 4 MiB frames
+# (the parallel route, and the GPU's host hand-off where there is a GPU), and one
+# sizeless frame (the streaming route); each sound, then with one payload byte
+# flipped -- random data is stored raw, so only the table can tell.
+if command -v zstd >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  lt="$TMPDIR/lt"; mkdir -p "$lt"; lt_why=""
+  for p in a b c; do
+    head -c $((4*1048576)) /dev/urandom > "$lt/m_$p"
+    zstd -q -f "$lt/m_$p" -o "$lt/m_$p.ck"
+    zstd -q --no-check -f "$lt/m_$p" -o "$lt/m_$p.nc"
+  done
+  : > "$lt/empty"
+  zstd -q -f "$lt/empty" -o "$lt/e.ck"
+  zstd -q --no-check -f "$lt/empty" -o "$lt/e.nc"
+  python3 - "$lt" <<'LTTAR' 2>/dev/null
+import sys, tarfile
+d = sys.argv[1]
+with tarfile.open(f'{d}/one.tar', 'w', format=tarfile.USTAR_FORMAT) as tf:
+    tf.add(f'{d}/m_a', arcname='m_a')
+LTTAR
+  zstd -q -f "$lt/one.tar" -o "$lt/t.ck"
+  zstd -q --no-check -f "$lt/one.tar" -o "$lt/t.nc"
+  cat "$lt/m_a" | zstd -q --no-check -c > "$lt/s_a.nc"     # sizeless: streamed at any size
+  python3 - "$lt" <<'LTPY' 2>/dev/null
+import struct, sys
+d = sys.argv[1]
+ck = {p: struct.unpack('<I', open(f'{d}/m_{p}.ck', 'rb').read()[-4:])[0] for p in 'abc'}
+def table(entries):
+    ent = b''.join(struct.pack('<III', c, u, k) for c, u, k in entries)
+    pay = ent + struct.pack('<I', len(entries)) + bytes([0x80]) + struct.pack('<I', 0x8F92EAB1)
+    return struct.pack('<II', 0x184D2A5E, len(pay)) + pay
+def write(name, bodies, cks, csz_skew=0, flip=None):
+    raw = b''.join(bodies) + table([(len(b) + csz_skew, 4 * 1048576, k) for b, k in zip(bodies, cks)])
+    raw = bytearray(raw)
+    if flip is not None: raw[flip] ^= 0xFF
+    open(f'{d}/{name}', 'wb').write(bytes(raw))
+mb = [open(f'{d}/m_{p}.nc', 'rb').read() for p in 'abc']
+mc = [ck[p] for p in 'abc']
+write('m_good.zst', mb, mc)
+write('m_bad.zst', mb, mc, flip=len(mb[0]) + len(mb[1]) // 2)
+write('m_wrong.zst', mb, mc, csz_skew=1)
+sb = [open(f'{d}/s_a.nc', 'rb').read()]
+write('s_good.zst', sb, [ck['a']])
+write('s_bad.zst', sb, [ck['a']], flip=len(sb[0]) // 2)
+# An empty frame and the next frame both start at output offset zero.  Their
+# late hashes must remain distinct (the original offset-only map lost one).
+eb = open(f'{d}/e.nc', 'rb').read()
+ec = struct.unpack('<I', open(f'{d}/e.ck', 'rb').read()[-4:])[0]
+open(f'{d}/e_good.zst', 'wb').write(eb + mb[0] + table([
+    (len(eb), 0, ec), (len(mb[0]), 4 * 1048576, ck['a'])]))
+# -t --tar internally decodes in DECOMPRESS mode so it must arm late checking.
+tb = open(f'{d}/t.nc', 'rb').read()
+tc = struct.unpack('<I', open(f'{d}/t.ck', 'rb').read()[-4:])[0]
+tsz = len(open(f'{d}/one.tar', 'rb').read())
+traw = bytearray(tb + table([(len(tb), tsz, tc)]))
+open(f'{d}/t_good.zst', 'wb').write(traw)
+traw[len(tb) // 2] ^= 0xFF
+open(f'{d}/t_bad.zst', 'wb').write(traw)
+LTPY
+  if [[ -s "$lt/m_bad.zst" && -s "$lt/s_bad.zst" ]]; then
+    cat "$lt/m_a" "$lt/m_b" "$lt/m_c" > "$lt/m.want"
+    lt_run() {   # file, args... -> sets lt_rc, lt_err
+      lt_rc=0; cat "$lt/$1" | "$GZSTD" "${@:2}" > "$lt/out" 2> "$lt/err" || lt_rc=$?
+      lt_err=$(cat "$lt/err")
+    }
+    for k in m s; do
+      lt_run ${k}_good.zst -d -c --cpu-only
+      [[ $lt_rc -eq 0 ]] && grep -q "NOT verified" <<< "$lt_err" || lt_why+=" [$k sound, -d: exit $lt_rc or no 'not verified' warning]"
+      lt_run ${k}_good.zst -d -c --cpu-only --verify
+      [[ $lt_rc -eq 0 ]] && ! grep -q "NOT verified" <<< "$lt_err" || lt_why+=" [$k sound, -d --verify: exit $lt_rc]"
+      [[ $k == m ]] && { cmp -s "$lt/out" "$lt/m.want" || lt_why+=" [m sound, --verify: wrong bytes]"; }
+      lt_run ${k}_bad.zst -d -c --cpu-only
+      [[ $lt_rc -eq 0 ]] && grep -q "NOT verified" <<< "$lt_err" || lt_why+=" [$k corrupt, -d: exit $lt_rc or no warning]"
+      lt_run ${k}_bad.zst -d -c --cpu-only --verify
+      [[ $lt_rc -eq 4 ]] || lt_why+=" [$k corrupt, -d --verify: exit $lt_rc, want 4]"
+      lt_run ${k}_bad.zst -t --cpu-only
+      [[ $lt_rc -eq 4 ]] || lt_why+=" [$k corrupt, -t: exit $lt_rc, want 4]"
+      lt_run ${k}_good.zst -t --cpu-only
+      [[ $lt_rc -eq 0 ]] || lt_why+=" [$k sound, -t: exit $lt_rc]"
+    done
+    lt_run m_wrong.zst -d -c --cpu-only --verify
+    [[ $lt_rc -eq 0 ]] && grep -q "does not describe" <<< "$lt_err" \
+      || lt_why+=" [a table that does not describe the stream: exit $lt_rc, want 0 and a warning]"
+    lt_run e_good.zst -d -c --cpu-only --verify
+    [[ $lt_rc -eq 0 ]] && cmp -s "$lt/out" "$lt/m_a" \
+      || lt_why+=" [empty frame before data: exit $lt_rc or false checksum mismatch]"
+    lt_run m_bad.zst -d --cpu-only --verify --keep-going -o "$lt/recovered"
+    [[ $lt_rc -eq 6 && $(stat -c %s "$lt/recovered" 2>/dev/null) -eq $((12*1048576)) ]] \
+      || lt_why+=" [--keep-going --verify did not keep complete decoded output at exit 6]"
+    lt_run t_good.zst -t --tar --cpu-only -
+    [[ $lt_rc -eq 0 ]] || lt_why+=" [-t --tar, sound pipe: exit $lt_rc]"
+    lt_run t_bad.zst -t --tar --cpu-only -
+    [[ $lt_rc -eq 4 ]] && grep -q "seek table at the end" <<< "$lt_err" \
+      || lt_why+=" [-t --tar, corrupt pipe: exit $lt_rc or late checksum not checked]"
+    if has_gpu 2>/dev/null; then
+      lt_run m_bad.zst -d -c --gpu-only --verify
+      [[ $lt_rc -eq 4 ]] || lt_why+=" [corrupt, GPU-decoded, --verify: exit $lt_rc, want 4]"
+    fi
+    [[ -z "$lt_why" ]] && pass "a pipe's trailing seek table: warned by default, checked by --verify and -t" \
+      || fail "a pipe's trailing seek table: warned by default, checked by --verify and -t" "$lt_why"
+  else
+    skip "a pipe's trailing seek table: warned by default, checked by --verify and -t" "could not build fixture"
+  fi
+  rm -rf "$lt"
+else
+  skip "a pipe's trailing seek table: warned by default, checked by --verify and -t" "needs zstd and python3"
 fi
 
 section "Decompress tail-aware GPU intake (pinned rates)"
