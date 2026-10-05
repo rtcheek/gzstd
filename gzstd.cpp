@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.90";
+static constexpr const char * GZSTD_VERSION = "0.17.91";
 //
 // Architecture overview:
 //
@@ -64,6 +64,7 @@ static constexpr const char * GZSTD_VERSION = "0.17.90";
 #include <string>
 #include <vector>
 #include <deque>
+#include <set>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -5075,8 +5076,12 @@ static void print_help_long()
 "     multi-threaded mode (`ZSTD_c_nbWorkers`).  Maximum ratio on\n"
 "     repetitive data (matches `zstd` exactly) because the\n"
 "     sliding window carries context across the full file.\n"
-"     Implies --cpu-only.  Decompression is single-threaded because\n"
-"     one frame = one unit of work for any decompressor.\n"
+"     Implies --cpu-only.  Workers default to the PHYSICAL cores this\n"
+"     process may use, as `zstd -T0` does (hyperthread siblings add\n"
+"     nothing); -T N sets N, -T 0 uses every hardware thread.\n"
+"     Decompression is single-threaded because one frame = one unit\n"
+"     of work for any decompressor; it streams in constant memory from\n"
+"     a file or a pipe, with reading, decoding and writing overlapped.\n"
 "\n"
 "============================================================\n"
 " CPU TUNING\n"
@@ -15160,21 +15165,40 @@ struct StreamFrameCk {
   void head(const unsigned char * h, size_t n) {
     own_ck_ = (n >= 5) && ((h[4] & 0x04) != 0);
   }
+  // HASH ONLY WHAT WILL BE COMPARED (v0.17.91).  Every output byte used to go
+  // through XXH64 here, and the digest was then thrown away unless the frame
+  // had no checksum of its own AND the seek table had one for it -- a frame
+  // that carries its own checksum is verified by zstd itself.  On a single-frame
+  // archive that was a second full pass over the output on the one thread
+  // doing all the work.  Decided at the frame's first output byte, when
+  // head() has seen its header and frame_off_ is where the frame starts.
+  bool       decided_ = false;
+  bool       need_    = false;
+  uint32_t   want_    = 0;
+  void decide_() {
+    decided_ = true;
+    need_ = active_ && !own_ck_ && table_checksum_for(frame_off_, &want_);
+  }
   void bytes(const void * p, size_t n) {
-    if (active_ && n) h_.update(p, n);
+    if (n && !decided_) decide_();
+    if (need_ && n) h_.update(p, n);
     out_total_ += n;
   }
+  bool mismatch() {
+    if (!decided_) decide_();
+    return need_ && (uint32_t)h_.digest() != want_;
+  }
   void frame_end(uint64_t seq) {
-    uint32_t want = 0;
-    if (active_ && !own_ck_ && table_checksum_for(frame_off_, &want)
-        && (uint32_t)h_.digest() != want)
+    if (mismatch())
       die_data("content-checksum mismatch at frame " + std::to_string(seq)
                + ": the seek table says this frame hashes to "
-               + std::to_string(want)
+               + std::to_string(want_)
                + " but the decoded bytes do not -- the archive is corrupt");
     h_.reset(0);
     frame_off_ = out_total_;
     own_ck_    = false;
+    decided_   = false;
+    need_      = false;
   }
 };
 
@@ -15256,6 +15280,105 @@ static void decompress_from_buffer(const std::vector<char> & input,
   ZSTD_freeDCtx(dctx);
 }
 
+// Reads a FILE ahead on its own thread, in order, `depth` chunks at a time
+// (v0.17.91: --sliding-window and the single-frame decoder).  take() hands out
+// the next chunk; a count below the chunk size means the stream ended there, by
+// EOF or by error, and the reader has stopped touching the FILE, so the caller
+// may test ferror() on it -- and must not take() again.  give_back() returns the
+// buffer for reuse.  The destructor stops the reader after any read in progress;
+// a pipe read can block indefinitely, so callers must not stop consuming early.
+class ChunkPrefetcher {
+public:
+  ChunkPrefetcher(FILE * in, size_t chunk, int depth) : in_(in), chunk_(chunk) {
+    for (int i = 0; i < depth; ++i) free_.emplace_back(chunk);
+    thr_ = std::thread([this] { run(); });
+  }
+  ~ChunkPrefetcher() {
+    { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
+    cv_.notify_all();
+    if (thr_.joinable()) thr_.join();
+  }
+  ChunkPrefetcher(const ChunkPrefetcher &) = delete;
+  ChunkPrefetcher & operator=(const ChunkPrefetcher &) = delete;
+  FrameVec take(size_t & n) {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [this] { return !full_.empty(); });
+    FrameVec b = std::move(full_.front().first);
+    n = full_.front().second;
+    full_.pop_front();
+    lk.unlock();
+    cv_.notify_all();
+    return b;
+  }
+  void give_back(FrameVec && b) {
+    { std::lock_guard<std::mutex> lk(m_); free_.push_back(std::move(b)); }
+    cv_.notify_all();
+  }
+private:
+  void run() {
+    try {
+      for (;;) {
+        FrameVec b;
+        {
+          std::unique_lock<std::mutex> lk(m_);
+          cv_.wait(lk, [this] { return stop_ || !free_.empty(); });
+          if (stop_) return;
+          b = std::move(free_.front());
+          free_.pop_front();
+        }
+        b.resize(chunk_);
+        const size_t n = std::fread(b.data(), 1, chunk_, in_);
+        {
+          std::lock_guard<std::mutex> lk(m_);
+          full_.emplace_back(std::move(b), n);
+        }
+        cv_.notify_all();
+        if (n < chunk_) return;   // EOF or error: the FILE is the caller's again
+      }
+    } catch (const std::bad_alloc &) {
+      die("out of memory");
+    } catch (const std::exception & e) {
+      die(e.what());
+    } catch (...) {
+      die("input read failed");
+    }
+  }
+  FILE * in_;
+  size_t chunk_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::deque<FrameVec> free_;
+  std::deque<std::pair<FrameVec, size_t>> full_;
+  bool stop_ = false;
+  std::thread thr_;
+};
+
+// Say why a single-frame (or sizeless) stream is decoded on one CPU thread.  The
+// named-file route and the pipe route (stream_frames_to_queue's stream_rest)
+// both land in decompress_stream_from_file and print the same thing.
+// `decomp` is the first frame's declared size, 0 when it declares none.
+static void gz_note_single_frame_stream(const Options & opt, uint64_t decomp)
+{
+  char sz[32]; human_bytes(double(decomp), sz, sizeof(sz));
+#ifdef HAVE_NVCOMP
+  // V_DEFAULT, not V_NORMAL (always shown): it explains a routing choice, and
+  // -q asks for errors only.  Since v0.17.91 it also prints for piped input,
+  // which -q scripts never saw before.
+  if (!opt.cpu_only)
+    vlog(V_DEFAULT, opt, decomp > 0
+         ? std::string("warning: first frame decompresses to ") + sz
+           + " (GPU max: 16 MiB).\n"
+           "  This file was likely compressed with --sliding-window or zstd.\n"
+           "  Decompressing on CPU (a single frame can't use the GPU).\n"
+         : std::string("warning: first frame has no content-size header "
+           "(a piped zstd / tar --zstd stream).\n"
+           "  Streaming on CPU (a sizeless frame can't be split for the GPU).\n"));
+#endif
+  vlog(V_VERBOSE, opt, decomp > 0
+       ? std::string("[INIT] decompress: streaming single ") + sz + " frame on CPU\n"
+       : std::string("[INIT] decompress: streaming sizeless frame on CPU\n"));
+}
+
 // Streaming decompress of a large single-frame input (zstd /
 // --sliding-window) read directly from the FILE.  A single zstd frame can't be
 // split across threads (nor GPU subchunks), so the old fallback buffered the
@@ -15270,16 +15393,22 @@ static void decompress_from_buffer(const std::vector<char> & input,
 #ifdef HAVE_NVCOMP
 static void gz_require_usable_gpu(const Options & opt, const char * who);
 #endif
+//
+// `prefix` (v0.17.91): bytes of this same stream that were already read from
+// `in` before the decision to stream it -- the frame splitter reads a few MiB
+// before it can see that the first frame is huge or sizeless, and on a pipe it
+// cannot give them back.  They are decoded first, exactly as if read here.
 static void decompress_stream_from_file(FILE * in, FILE * out,
-                                        const Options & opt, Meter * m)
+                                        const Options & opt, Meter * m,
+                                        const std::vector<char> * prefix = nullptr,
+                                        bool table_scope_active = false)
 {
 #ifdef HAVE_NVCOMP
   // Decodes on the CPU whatever the hardware; --gpu-only still needs a GPU.
   gz_require_usable_gpu(opt, "single-frame stream decode");
 #endif
   const size_t IO_CHUNK = 4 * ONE_MIB;
-  std::vector<char> inbuf(IO_CHUNK);
-  std::vector<char> outbuf(IO_CHUNK);
+  std::vector<char> outbuf(IO_CHUNK);   // -t and the tar sink decode here
   ZSTD_DCtx * dctx = ZSTD_createDCtx();
   if (!dctx) die("failed to create ZSTD_DCtx");
   apply_decode_options(dctx, opt);
@@ -15305,30 +15434,89 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   bool decode_broke = false;   // --keep-going: stop reading, keep what we wrote
   // Seek-table checksums for frames that carry none of their own.  This decoder
   // sees the whole stream from offset 0, so it can place every frame exactly.
-  // It is reached DIRECTLY from the driver, not through decompress_cpu_mt, so it
-  // installs the per-input scope itself -- without this the map is empty here
-  // and every frame silently goes unverified.
-  TableCkScope tck_scope(in);
+  // Direct driver routes install their own scope.  The prefix route already
+  // has the caller's scope: reloading here would rewind its unread FILE* and
+  // clear that scope's checksum map when this nested scope ends.
+  std::unique_ptr<TableCkScope> tck_scope;
+  if (!table_scope_active) tck_scope = std::make_unique<TableCkScope>(in);
   StreamFrameCk sck;
+  // WRITE ON ANOTHER THREAD (v0.17.91).  This decoder read, decoded and wrote
+  // on one thread, so a slow destination -- a pipe above all -- stalled the
+  // decoding: MEASURED, an 8 GiB single-frame archive piped through `-d -c` took
+  // 26 s against zstd's 20 s, while `-t`, which writes nothing, was faster than
+  // zstd.  Output now goes to the same AsyncWritePool the frame-parallel writer
+  // uses, in OUT_BATCH pieces decoded straight into the buffer that is handed
+  // over.  Sparse output stays off: this path never made holes, and whether it
+  // should is a separate decision.  The pool counts wrote_bytes as it writes;
+  // `emitted` is what the decoder has produced, which is what the old
+  // synchronous count was at every point it was read (the --keep-going
+  // recovery offsets below).
+  static constexpr size_t OUT_BATCH = 8 * ONE_MIB;
+  const bool to_out = !g_tar_decomp_sink && opt.mode != Mode::TEST
+#ifndef _WIN32
+                      && (g_direct_writer || out);
+#else
+                      && out;
+#endif
+  std::unique_ptr<AsyncWritePool> aio;
+  if (to_out) {
+#ifndef _WIN32
+    aio = std::make_unique<AsyncWritePool>(out, g_direct_writer, false, m, nullptr, false);
+#else
+    aio = std::make_unique<AsyncWritePool>(out, nullptr, false, m, nullptr, false);
+#endif
+  }
+  FrameBuf batch;
+  size_t batch_used = 0;
+  const uint64_t written_base = m ? m->wrote_bytes.load(std::memory_order_relaxed) : 0;
+  uint64_t emitted = 0;
+  auto ship = [&]() {
+    if (aio && batch && batch_used > 0) {
+      batch->resize(batch_used);
+      std::vector<FrameBuf> v;
+      v.push_back(std::move(batch));
+      aio->submit(std::move(v));
+    }
+    batch.reset();
+    batch_used = 0;
+  };
+  // Everything decoded so far reaches the destination before an error ends the
+  // run, as it did when every piece was written as it was decoded.
+  auto drain = [&]() { if (aio) { ship(); aio->flush(); } };
 
-  for (;;) {
-    if (decode_broke) break;
-    size_t n = std::fread(inbuf.data(), 1, IO_CHUNK, in);
-    if (n == 0) { check_read_error(in, opt.input); break; }  // EOF (not an error)
+  // One input chunk through the decoder.  The prefix goes through first.
+  auto feed = [&](const char * src, size_t n) {
     total_in_bytes += n;
     if (m) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
-    ZSTD_inBuffer zin { inbuf.data(), n, 0 };
+    ZSTD_inBuffer zin { src, n, 0 };
     while (zin.pos < zin.size) {
-      ZSTD_outBuffer zout { outbuf.data(), outbuf.size(), 0 };
+      char * dst = outbuf.data();
+      size_t cap = outbuf.size();
+      if (aio) {
+        if (!batch) { batch = std::make_shared<FrameVec>(OUT_BATCH); batch_used = 0; }
+        dst = batch->data() + batch_used;
+        // At most one block's worth per call, as zstd's own CLI decodes.  A call
+        // that fails throws away what IT produced, so the call size is the
+        // granularity of --keep-going's recovery: a whole 8 MiB batch per call
+        // recovered 4 MiB LESS than the 4 MiB calls this replaced (measured,
+        // flip in the middle of a 300 MiB frame); one block per call recovers
+        // more than either, to within a block of what `zstd -d` keeps.
+        cap = std::min(OUT_BATCH - batch_used, ZSTD_DStreamOutSize());
+      }
+      ZSTD_outBuffer zout { dst, cap, 0 };
       const size_t consumed_from = zin.pos;
       ret = ZSTD_decompressStream(dctx, &zout, &zin);
+      // A failing call does not commit its own output.  Earlier calls may
+      // still be in the async batch, including when the window limit handler
+      // exits before the ordinary decode-error branch below.
+      if (ZSTD_isError(ret)) drain();
       gz_die_if_window_error(ret);
       if (ZSTD_isError(ret)) {
         // The old message here told the user to "re-run with --keep-going" —
         // from a decoder that ignored --keep-going, so following that advice
         // produced the same exit 4 and the same nothing.  Honour it instead.
         if (opt.keep_going) {
-          g_damage.set_framing_break(data_frames, m ? m->wrote_bytes.load() : 0,
+          g_damage.set_framing_break(data_frames, written_base + emitted,
               std::string("frame decode failed: ") + ZSTD_getErrorName(ret));
           decode_broke = true;
           break;
@@ -15340,15 +15528,20 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
         // hint then just leaves the ID out.
         const bool fresh = (head_n == 0);
         die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
-               + decode_error_hint(ret, fresh ? (const void *)(inbuf.data() + consumed_from)
+               + decode_error_hint(ret, fresh ? (const void *)(src + consumed_from)
                                               : (const void *)head,
                                    fresh ? n - consumed_from : head_n));
       }
-      // Bytes this call consumed belong to the frame that was in progress.
-      for (size_t i = consumed_from; i < zin.pos; ++i) {
-        if (head_n < sizeof head) head[head_n++] = (unsigned char)inbuf[i];
-        ++cur_len;
+      // Bytes this call consumed belong to the frame that was in progress.  (A
+      // loop over every one of them, which this was, cost a pass over the whole
+      // compressed input on the decoding thread.)
+      const size_t used = zin.pos - consumed_from;
+      if (head_n < sizeof head) {
+        const size_t take = std::min(sizeof head - head_n, used);
+        std::memcpy(head + head_n, src + consumed_from, take);
+        head_n += take;
       }
+      cur_len += used;
       sck.head(head, head_n);
       // The frame's LAST output arrives on the same call that reports the
       // boundary, so hash before settling the frame -- not after.
@@ -15357,31 +15550,79 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
         // Frame boundary: the frame whose head we captured has completed.
         if (head_n >= 4 && rd_le32(head) == 0xFD2FB528u) ++data_frames;
       }
-      if (zout.pos > 0) sck.bytes(outbuf.data(), zout.pos);
+      if (zout.pos > 0) sck.bytes(dst, zout.pos);
       if (zout.pos > 0) {
         if (g_tar_decomp_sink) {
           // -t/-d --tar single-frame path: hand the chunk to the tar parser.
-          g_tar_decomp_sink->push(std::make_shared<FrameVec>(outbuf.data(), outbuf.data() + zout.pos));
-        } else if (opt.mode != Mode::TEST) {
-#ifndef _WIN32
-          if (g_direct_writer) {
-            if (!g_direct_writer->write(outbuf.data(), zout.pos))
-              die_io(gz_write_fail("direct write failed"));
-          } else
-#endif
-          if (out) {   // out is null only in sink mode (handled above); guard silences -Wnonnull
-            size_t w = robust_fwrite(outbuf.data(), zout.pos, out);
-            if (w != zout.pos) die_io("short write to output (broken pipe?)");
-          }
+          g_tar_decomp_sink->push(std::make_shared<FrameVec>(dst, dst + zout.pos));
+        } else if (aio) {
+          batch_used += zout.pos;
+          if (batch_used == OUT_BATCH) ship();
         }
-        if (m) m->wrote_bytes.fetch_add(zout.pos, std::memory_order_relaxed);
+        // -t and the tar sink write nothing here; the pool counts what it writes.
+        if (m && !aio) m->wrote_bytes.fetch_add(zout.pos, std::memory_order_relaxed);
+        emitted += zout.pos;
       }
       if (frame_done) {
+        // frame_end may exit on a seek-table checksum mismatch.  The old
+        // synchronous writer had already emitted this frame at that point.
+        if (aio && sck.mismatch()) drain();
         sck.frame_end(data_frames);   // hashes are complete for this frame now
         head_n = 0; cur_len = 0;
       }
     }
+  };
+  if (prefix && !prefix->empty()) feed(prefix->data(), prefix->size());
+  std::unique_ptr<ChunkPrefetcher> reader;
+  if (!opt.keep_going) {
+    // Read-ahead is optional.  A failed buffer allocation or thread creation
+    // must not unwind through the live output and progress threads.
+    try { reader = std::make_unique<ChunkPrefetcher>(in, IO_CHUNK, 4); }
+    catch (const std::exception &) { /* use the synchronous reader below */ }
   }
+  if (!reader) {
+    // A corrupt frame can make feed() stop before EOF.  With a pipe still open,
+    // a prefetch thread may already be blocked in fread for the next full
+    // chunk; joining it would hang the recovery exit.  Read on this thread so
+    // decode_broke stops input immediately, including when the prefix broke.
+    try {
+      std::vector<char> inbuf(IO_CHUNK);
+      while (!decode_broke) {
+        const size_t n = std::fread(inbuf.data(), 1, IO_CHUNK, in);
+        if (n > 0) feed(inbuf.data(), n);
+        if (n < IO_CHUNK) { drain(); check_read_error(in, opt.input); break; }
+      }
+    } catch (const std::bad_alloc &) {
+      die("out of memory");
+    } catch (const std::exception & e) {
+      die(e.what());
+    } catch (...) {
+      die("decode failed");
+    }
+  } else {
+    // READ AHEAD too, as zstd's CLI does: the decoder no longer waits for each
+    // read.  A short chunk is the end of the stream (EOF or error); the reader
+    // has stopped, so check it and stop asking.  Catch exceptions while the
+    // reader is still alive: unwinding its destructor could join a pipe read
+    // that will never finish.
+    try {
+      for (;;) {
+        size_t n = 0;
+        FrameVec chunk = reader->take(n);
+        if (n > 0) feed(chunk.data(), n);
+        if (n < IO_CHUNK) { drain(); check_read_error(in, opt.input); break; }
+        reader->give_back(std::move(chunk));
+      }
+    } catch (const std::bad_alloc &) {
+      die("out of memory");
+    } catch (const std::exception & e) {
+      die(e.what());
+    } catch (...) {
+      die("decode failed");
+    }
+  }
+  drain();   // a backstop: every way out of the loop above has drained already
+  if (aio && aio->had_error()) die_io(gz_write_fail("async write failed"));
   if (ret > 0 && !decode_broke) {
     // A truncated trailing SKIPPABLE frame is gzstd's own damaged index/seek
     // table and is recoverable for -d/-l (see trailing_skippable_tolerated —
@@ -15399,7 +15640,7 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
       // whose contract depends on the input's frame geometry is not a contract.
       // Everything decoded so far has already been written; stop cleanly and let
       // the driver report the damage and pick the exit code.
-      g_damage.set_framing_break(data_frames, m ? m->wrote_bytes.load() : 0,
+      g_damage.set_framing_break(data_frames, written_base + emitted,
           "truncated zstd stream: the final frame is incomplete");
     } else {
       ZSTD_freeDCtx(dctx);
@@ -15417,6 +15658,32 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   }
   ZSTD_freeDCtx(dctx);
 }
+// The pipe route's half of a single-frame decode (stream_frames_to_queue's
+// stream_rest): the frame splitter stood down at the first frame's header,
+// holding `prefix`; the rest of the stream is still in `in`.  `decomp` is the
+// frame's declared size, 0 when it declares none.
+static void gz_stream_rest(FILE * in, FILE * out, const Options & opt, Meter * m,
+                           const std::vector<char> & prefix, uint64_t decomp)
+{
+  gz_note_single_frame_stream(opt, decomp);
+  if (m && decomp > 0) {
+    // --tar can share one meter across several input archives.
+    m->total_out.fetch_add(decomp, std::memory_order_relaxed);
+    m->total_out_final.store(true, std::memory_order_release);
+  }
+#ifndef _WIN32
+  // The old sized-frame queue path preallocated its direct output before
+  // writing.  Streaming the first frame bypasses that queue and its setup.
+  if (m && decomp > 0 && opt.mode == Mode::DECOMPRESS && !g_tar_decomp_sink
+      && g_direct_writer && opt.preallocate_output
+      && g_direct_writer->preallocate(decomp)) {
+    char sz[32]; human_bytes(double(decomp), sz, sizeof(sz));
+    vlog(V_VERBOSE, opt, std::string("[FALLOCATE] preallocated ") + sz + " output\n");
+  }
+#endif
+  decompress_stream_from_file(in, out, opt, m, &prefix, true);
+}
+
 struct CpuThreadStats {
   uint64_t tasks    = 0;
   uint64_t in_bytes = 0;
@@ -18301,6 +18568,18 @@ static size_t stream_frames_to_queue_mt(
  Returns:
    total number of frames pushed (0 if fallback triggered on first frame)
 ======================================================================*/
+//
+// `stream_rest` (v0.17.91): when non-null, a FIRST data frame that is sizeless
+// or larger than SINGLE_FRAME_STREAM_MIN is not split at all.  This reader can
+// only find where a frame ends by holding all of it, so such a frame used to be
+// read whole -- an 8 GiB single-frame archive piped in took 17 GiB of RAM and
+// decoded nothing until the last byte had arrived (2.4x slower than zstd, which
+// streams).  Named files never got here: the driver routes them to the streaming
+// decoder by peeking at the header, which a pipe cannot do.  So the decision is
+// made here, at the header: return 0 with *fallback and *stream_rest set, the
+// bytes read so far in *raw_data, the rest still unread in `in`, and the frame's
+// declared size (0 = none) in *max_frame_decomp_out.  The caller hands both to
+// decompress_stream_from_file.
 static size_t stream_frames_to_queue(
     FILE * in,
     TaskQueue & queue,
@@ -18309,7 +18588,8 @@ static size_t stream_frames_to_queue(
     bool * fallback,
     std::vector<char> * raw_data,
     size_t * max_frame_decomp_out = nullptr,
-    const std::atomic<bool> * abort = nullptr)
+    const std::atomic<bool> * abort = nullptr,
+    bool * stream_rest = nullptr)
 {
   size_t max_frame_decomp = 0;
   try_boost_io_priority(!opt.gpu_only);  // only boost when CPU pool competes
@@ -18596,6 +18876,30 @@ static size_t stream_frames_to_queue(
         }
       }
 
+      // A huge or sizeless FIRST data frame: stream it (see stream_rest above).
+      if (stream_rest && seq == 0) {
+        ZSTD_frameHeader zfh;
+        const size_t need = ZSTD_getFrameHeader(&zfh, ptr, remaining);
+        if (need > 0 && !ZSTD_isError(need) && !eof) break;   // header incomplete
+        if (need == 0 && zfh.frameType == ZSTD_frame
+            && (zfh.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN
+                || zfh.frameContentSize > (unsigned long long)SINGLE_FRAME_STREAM_MIN)) {
+#ifndef _WIN32
+          // O_DIRECT reads above use pread on a separate descriptor, so they
+          // leave the FILE* at its old offset.  The streaming decoder reads
+          // the prefix first, then continues through that FILE*.
+          if (use_direct && ::fseeko(in, din_off, SEEK_SET) != 0)
+            die_io("cannot position input after O_DIRECT stream prefix: " + opt.input);
+#endif
+          *fallback = true;
+          *stream_rest = true;
+          if (raw_data) raw_data->assign(buf.data() + buf_off, buf.data() + buf_len);
+          if (max_frame_decomp_out)
+            *max_frame_decomp_out = zfh.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN
+                                    ? 0 : (size_t)zfh.frameContentSize;
+          return 0;
+        }
+      }
       // Try to find the compressed frame size (the sequential parse spine —
       // each frame's blocks must be walked to locate the next frame's start).
       uint64_t ps_t0 = m ? now_ns() : 0;
@@ -18843,8 +19147,11 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
   // Stream frames from input directly into the queue.
   // Workers start decompressing as soon as the first frame is pushed.
   bool fallback = false;
+  bool stream_rest = false;
+  size_t first_decomp = 0;
   std::vector<char> raw_data;
-  size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data);
+  size_t n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback, &raw_data,
+                                           &first_decomp, nullptr, &stream_rest);
 
   // Preallocate output file to avoid per-write extent allocation overhead.
   // total_out is known from zstd frame headers parsed by stream_frames_to_queue.
@@ -18872,6 +19179,10 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
     for (auto & th : pool) th.join();
     wthr.join();
 
+    if (stream_rest) {
+      gz_stream_rest(in, out, opt, m, raw_data, first_decomp);
+      return;
+    }
     vlog(V_VERBOSE, opt,
          "cannot determine frame sizes; using streaming CPU decompress\n");
     decompress_from_buffer(raw_data, out, opt, m,
@@ -19242,11 +19553,51 @@ private:
   std::thread      th_;
 };
 
+// Physical cores this process may run on: distinct (package, core) pairs among
+// the CPUs in its affinity mask, from sysfs.  0 when that cannot be read, and
+// the caller falls back.  Hyperthread siblings share one core's execution units.
+static unsigned gz_physical_cores_allowed()
+{
+#ifdef __linux__
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof(set), &set) != 0) return 0;
+  std::set<std::pair<long, long>> cores;
+  for (int c = 0; c < CPU_SETSIZE; ++c) {
+    if (!CPU_ISSET(c, &set)) continue;
+    const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/";
+    long pkg = -1, core = -1;
+    if (FILE * f = std::fopen((base + "physical_package_id").c_str(), "r")) {
+      if (std::fscanf(f, "%ld", &pkg) != 1) pkg = -1;
+      std::fclose(f);
+    }
+    if (FILE * f = std::fopen((base + "core_id").c_str(), "r")) {
+      if (std::fscanf(f, "%ld", &core) != 1) core = -1;
+      std::fclose(f);
+    }
+    if (pkg < 0 || core < 0) return 0;
+    cores.insert({pkg, core});
+  }
+  return (unsigned)cores.size();
+#else
+  return 0;
+#endif
+}
+
 static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  // DEFAULT = PHYSICAL CORES (v0.17.91), as `zstd -T0` does.  It used to be
+  // every hardware thread.  MEASURED on a 2-socket, 128-core, 256-thread
+  // machine, 4 GiB to a file at level 3, 128 workers against 256: idle, a
+  // little faster or equal on four data profiles (medium 1.50-1.87 s against
+  // 1.87-2.06 s, the others within the spread); with other users' jobs on the
+  // machine, 25-45% faster (1.24-1.96 s against 1.54-3.62 s), since the extra
+  // workers only fight them for cores.  Level 19 no worse.  -T0 still means
+  // every hardware thread, and -T N still means N.
   unsigned n_threads = (unsigned)std::thread::hardware_concurrency();
   if (opt.cpu_threads > 0) n_threads = (unsigned)opt.cpu_threads;
   else if (opt.cpu_threads == -1) n_threads = (unsigned)std::thread::hardware_concurrency();
+  else if (const unsigned pc = gz_physical_cores_allowed()) n_threads = pc;
   if (n_threads < 1) n_threads = 1;
 
   vlog(V_VERBOSE, opt, "[SLIDING-WINDOW] single-frame compression with "
@@ -19277,10 +19628,17 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   gz_fifo_gate("GZSTD_DEBUG_SLIDING_GATE");   // after the pledge, before the first read
 #endif
 
+  // READ AHEAD AND WRITE BEHIND (v0.17.91).  One thread used to read a chunk,
+  // feed it to zstd's workers, and write what came out, in turn, so reading
+  // and writing never overlapped each other or the hand-off.  From a file that
+  // cost little (the file route was already 2.3x faster than `zstd -T0` on a
+  // 130 GiB tar); through pipes it was the whole gap: 191-203 s against zstd's
+  // 113-116 s for `cat | -c | cat`.  zstd's CLI reads and writes on their own
+  // threads; so does this now.  The output goes to the AsyncWritePool the frame
+  // writer uses (sparse off, as before), in OUT_BATCH pieces that zstd fills
+  // directly; the pool counts wrote_bytes as it writes them.
   const size_t READ_CHUNK = 4 * ONE_MIB;
-  const size_t OUT_BUF = ZSTD_CStreamOutSize();
-  std::vector<char> inbuf(READ_CHUNK);
-  std::vector<char> outbuf(OUT_BUF);
+  static constexpr size_t OUT_BATCH = 8 * ONE_MIB;
 
   bool finished = false;
   uint64_t read_total = 0;      // checked against the pledge: see the read loop
@@ -19289,8 +19647,33 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   std::unique_ptr<StreamVerifier> sv;
   if (opt.verify) sv = std::make_unique<StreamVerifier>(opt);
 
+#ifndef _WIN32
+  AsyncWritePool aio(out, g_direct_writer, false, m, nullptr, false);
+#else
+  AsyncWritePool aio(out, nullptr, false, m, nullptr, false);
+#endif
+  FrameBuf batch;
+  size_t batch_used = 0;
+  auto ship = [&]() {
+    if (batch && batch_used > 0) {
+      batch->resize(batch_used);
+      std::vector<FrameBuf> v;
+      v.push_back(std::move(batch));
+      aio.submit(std::move(v));
+    }
+    batch.reset();
+    batch_used = 0;
+  };
+  std::unique_ptr<ChunkPrefetcher> reader;
+  try { reader = std::make_unique<ChunkPrefetcher>(in, READ_CHUNK, 4); }
+  catch (const std::bad_alloc &) { die("out of memory"); }
+  catch (const std::exception & e) { die(e.what()); }
+  // after the gate: it reads at once.  A thrown allocation in the loop must
+  // exit before reader's destructor tries to join an unfinished pipe read.
+  try {
   while (!finished) {
-    size_t n = std::fread(inbuf.data(), 1, READ_CHUNK, in);
+    size_t n = 0;
+    FrameVec inbuf = reader->take(n);
     // A SHORT read is what ends this stream, so the error check belongs on the
     // short branch too — not just on n == 0.  Otherwise a mid-file EIO is
     // flushed as ZSTD_e_end and sealed into a valid, truncated archive.
@@ -19310,14 +19693,35 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
       die_data("--sliding-window: " + opt.input + " grew while it was being compressed "
                "(" + std::to_string(total_in) + " bytes when it was sized, more when read); "
                "the frame would declare the wrong size");
-    if (sv && n) sv->note_input(inbuf.data(), n);
     bool last_chunk = (n < READ_CHUNK);
+    // END THE FRAME ON THE LAST DATA, NOT ON AN EMPTY READ (v0.17.91).  A file
+    // whose size is an exact multiple of READ_CHUNK used to end with a full
+    // chunk sent as ZSTD_e_continue and then a zero-byte read sent as
+    // ZSTD_e_end, which closes the frame with an empty block: 3 bytes zstd does
+    // not write, so the help's "matches zstd exactly" was false for exactly
+    // those sizes (measured, 1 GiB: 98642 bytes against zstd's 98639; 1 GiB + 1
+    // byte, and any pipe, identical).  When the pledged size is reached on a
+    // full chunk, look at the next one first: empty means this is the end, and
+    // anything else is the growth the check above refuses.
+    if (!last_chunk && total_in > 0 && read_total == total_in) {
+      size_t n2 = 0;
+      FrameVec next = reader->take(n2);
+      if (n2 < READ_CHUNK) check_read_error(in, opt.input);
+      if (n2 > 0)
+        die_data("--sliding-window: " + opt.input + " grew while it was being compressed "
+                 "(" + std::to_string(total_in) + " bytes when it was sized, more when read); "
+                 "the frame would declare the wrong size");
+      reader->give_back(std::move(next));
+      last_chunk = true;
+    }
+    if (sv && n) sv->note_input(inbuf.data(), n);
 
     ZSTD_inBuffer input = { inbuf.data(), n, 0 };
     ZSTD_EndDirective directive = last_chunk ? ZSTD_e_end : ZSTD_e_continue;
 
     do {
-      ZSTD_outBuffer output = { outbuf.data(), outbuf.size(), 0 };
+      if (!batch) { batch = std::make_shared<FrameVec>(OUT_BATCH); batch_used = 0; }
+      ZSTD_outBuffer output = { batch->data() + batch_used, OUT_BATCH - batch_used, 0 };
       size_t remaining = ZSTD_compressStream2(cctx, &output, &input, directive);
       if (ZSTD_isError(remaining))
         die_data(std::string("ZSTD_compressStream2: ") + ZSTD_getErrorName(remaining));
@@ -19335,23 +19739,25 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
           if (g_debug_corrupt_persist || sw_corrupted.compare_exchange_strong(expect, true))
             static_cast<unsigned char *>(output.dst)[output.pos / 2] ^= 0xFF;
         }
-#ifndef _WIN32
-        if (g_direct_writer) {
-          if (!g_direct_writer->write((const char *)output.dst, output.pos))
-            die_io(gz_write_fail("direct write failed"));
-        } else
-#endif
-        {
-          size_t w = robust_fwrite((const char *)output.dst, output.pos, out);
-          if (w != output.pos) die_io("short write to output (broken pipe?)");
-        }
         if (sv) sv->note_output(output.dst, output.pos);
-        if (m) m->wrote_bytes.fetch_add(output.pos, std::memory_order_relaxed);
+        batch_used += output.pos;
+        if (batch_used == OUT_BATCH) ship();
       }
 
       if (last_chunk && remaining == 0) finished = true;
     } while (input.pos < input.size || (last_chunk && !finished));
+    reader->give_back(std::move(inbuf));
   }
+  } catch (const std::bad_alloc &) {
+    die("out of memory");
+  } catch (const std::exception & e) {
+    die(e.what());
+  } catch (...) {
+    die("compression failed");
+  }
+  ship();
+  aio.flush();
+  if (aio.had_error()) die_io(gz_write_fail("async write failed"));
 
   ZSTD_freeCCtx(cctx);
   progress_done = true; gz_wake_periodic_loops(); progress_thr.join();
@@ -37624,6 +38030,7 @@ static void decompress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter 
   // single-frame files (where frame 0 IS the whole file) without
   // touching the rest of the input.
   bool fallback = false;
+  bool stream_rest = false;           // a huge or sizeless first frame: see the reader
   bool gpu_disabled_by_peek = false;  // oversize first frame → no GPU for this file
   std::vector<char> raw_data;  // populated by stream_frames_to_queue if it falls back
   int64_t first_frame_decomp = peek_first_frame_decomp_size(in);
@@ -38634,7 +39041,7 @@ gds_out_declined:
   if (n_frames == GDS_VERIFY_DEMOTE)
     n_frames = stream_frames_to_queue(in, queue, m, opt, &fallback,
                                       &raw_data, &max_frame_decomp,
-                                      &gpu_only_no_device);
+                                      &gpu_only_no_device, &stream_rest);
 
   // Deferred bringup found no GPU for a --gpu-only request: error out as the
   // old synchronous path did, now that the reader has stopped streaming.
@@ -38696,6 +39103,10 @@ gds_out_declined:
       g_gds_out_active.store(false, std::memory_order_relaxed);
     }
 
+    if (stream_rest) {
+      gz_stream_rest(in, out, opt, m, raw_data, max_frame_decomp);
+      return;
+    }
     vlog(V_DEFAULT, opt,
          std::string("warning: frame sizes unknown (no content-size headers); "
          "falling back from ")
@@ -42823,20 +43234,7 @@ static int gzstd_main(int argc, char ** argv)
       // so the byte-level out% and preallocation have nothing to go on.
       const bool known_size = first_frame_decomp > 0;
       char sz[32]; human_bytes(double(known_size ? first_frame_decomp : 0), sz, sizeof(sz));
-#ifdef HAVE_NVCOMP
-      if (!opt.cpu_only)
-        vlog(V_NORMAL, opt, known_size
-             ? std::string("warning: first frame decompresses to ") + sz
-               + " (GPU max: 16 MiB).\n"
-               "  This file was likely compressed with --sliding-window or zstd.\n"
-               "  Decompressing on CPU (a single frame can't use the GPU).\n"
-             : std::string("warning: first frame has no content-size header "
-               "(a piped zstd / tar --zstd stream).\n"
-               "  Streaming on CPU (a sizeless frame can't be split for the GPU).\n"));
-#endif
-      vlog(V_VERBOSE, opt, known_size
-           ? std::string("[INIT] decompress: streaming single ") + sz + " frame on CPU\n"
-           : std::string("[INIT] decompress: streaming sizeless frame on CPU\n"));
+      gz_note_single_frame_stream(opt, first_frame_decomp > 0 ? (uint64_t)first_frame_decomp : 0);
       if (known_size) {
         // total_out/total_out_final drive the progress bar's byte-level out%.
         meter.total_out.store((uint64_t)first_frame_decomp, std::memory_order_relaxed);
@@ -46185,7 +46583,12 @@ static Options parse_args(int argc, char ** argv)
     if (opt.hybrid)
       die_usage("--sliding-window is incompatible with --hybrid (GPU cannot use sliding window context)");
     if (!opt.cpu_only) {
-      vlog(V_NORMAL, opt, "warning: --sliding-window implies --cpu-only (GPU cannot use sliding window context)\n");
+      // Only a build that HAS a GPU path has anything to say here, and -q asks
+      // for errors only (v0.17.91: it printed from the CPU-only build too, and
+      // under -q, on every run).
+#ifdef HAVE_NVCOMP
+      vlog(V_DEFAULT, opt, "warning: --sliding-window implies --cpu-only (GPU cannot use sliding window context)\n");
+#endif
       opt.cpu_only = true;
       opt.backend_user_set = true;
     }

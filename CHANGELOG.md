@@ -1,12 +1,149 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.90  
+**Covers:** v0.9.50 → v0.17.91  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.91 — single-frame archives: the gap behind "zstd is faster" was pipes
+
+The maintainer reported that `zstd` beats `gzstd --sliding-window` on wall time "by a noticeable
+margin, every time". Measured on a 130 GiB tar and slices of it, warm and cold, it was true only
+through pipes, and there by a lot. Everything below was measured with the machine shared and heavily
+loaded (load average 340 to 435 from another user's jobs), so the absolute times are loose; every
+comparison is interleaved, and the ratios held across repeats.
+
+### Where gzstd was already ahead
+
+From and to files, level 3: `--sliding-window` on the 130 GiB tar took 35.6-38.1 s against `zstd -T0`'s
+79-97 s, same size. Decoding a single-frame archive: warm `-t` 4.6 s against 6.7-10 s, cold `-d` to a
+file 12 s against 22-26 s. Level 19: a tie.
+
+### Pipes: a single-frame archive on stdin was read whole first
+
+| 8 GiB single-frame archive through a pipe, machine loaded | before | now | zstd |
+|---|---|---|---|
+| `-d -c` | 34-40.5 s, 17.4 GiB RSS | 11.0-12.6 s, 22 MiB | 16.7-21.7 s |
+| `-d -c`, lightly loaded | 34-40 s | 13.4-14.8 s | 13.6-14.7 s |
+| `-t` | 29-39 s, 17.4 GiB RSS | 8.5 s, 24 MiB | 12.9-13.1 s |
+
+The frame splitter that reads stdin can only find where a frame ends by holding all of it, so a single
+frame -- zstd's own output, `--sliding-window`, `tar --zstd` -- was read completely into memory before
+a byte was decoded. Named files never had this: the driver peeks at the first frame's header and sends
+a huge or sizeless one to the streaming decoder, and a pipe cannot be peeked. An archive larger than
+memory could not be decoded from a pipe at all.
+
+The splitter now makes that decision itself, at the first frame's header: a frame that declares no
+size, or more than 256 MiB, is handed to the streaming decoder together with the bytes already read,
+and the rest is read from the pipe as it arrives. Only the first data frame; a giant frame after small
+ones is still read whole, as on the named-file route.
+
+### The streaming decoder wrote on its decoding thread
+
+`-t` was faster than zstd while `-d` through a pipe was slower: the one thread read, decoded and then
+waited for each write. Output now goes to the same background writer the frame-parallel path uses, in
+8 MiB batches decoded in place, and input is read ahead on its own thread, as zstd's CLI does (the
+read-ahead alone: 11.0-12.6 s against 13.2-13.7 s for the 8 GiB pipe decode, interleaved). Final, on a
+lightly loaded machine: 13.4-14.8 s against zstd's 13.6-14.7 s -- level -- and a third ahead of zstd
+under heavy load. `--keep-going` reads on the decoding thread instead (see the review below). Two passes over the data went too: a loop that touched every compressed
+byte to keep the first eight of each frame, and an XXH64 of every decoded byte, computed for every frame
+and kept only for a frame with no checksum of its own and an entry in the seek table. Now only those
+frames are hashed.
+
+One thing this exposed: a decode call that fails discards what it produced, so the call size is the
+granularity of `--keep-going`'s recovery. Decoding 8 MiB per call recovered 4 MiB less than the old
+4 MiB calls after a corrupt block. Each call is now capped at zstd's own output size (128 KiB), and the
+recovery is exactly what `zstd -d` keeps (116,260,864 bytes, against 115,998,720 before).
+
+### `--sliding-window` read and wrote on one thread
+
+| 16 GiB through `cat | ... -c | cat`, level 3 | before | now | zstd -T0 |
+|---|---|---|---|
+| machine loaded | 27.3-27.9 s | 16.7-18.8 s | 24.7-25.1 s |
+| machine idle | 26.9-28.9 s | 13.9-14.6 s | 15.2-16.7 s |
+
+zstd's CLI reads and writes on their own threads. The compressor now reads ahead on a thread of its
+own (four 4 MiB chunks) and writes through the background writer.
+
+### Smaller changes on the way
+
+- **Default `--sliding-window` workers: physical cores**, as `zstd -T0` does, counted from the
+  affinity mask (so `taskset` still works). It was every hardware thread. On this 128-core, 256-thread
+  machine, 4 GiB to a file: idle, 128 workers are a little faster or equal across four data profiles
+  (medium 1.50-1.87 s against 1.87-2.06 s; zstd 2.14-2.54 s); with other users' jobs running, 25-45%
+  faster (1.24-1.96 s against 1.54-3.62 s), because the extra workers only fight them for cores. It
+  never lost. `-T0` still uses every hardware thread.
+- **The output is now byte-identical to zstd's**, as `--help` claimed. It was, except for a file whose
+  size is an exact multiple of 4 MiB: the frame ended with an empty block, 3 bytes longer. When the
+  file's known size is reached on a full chunk, the compressor now looks at the next chunk first; an
+  empty one ends the frame there, and anything else is the existing "grew while it was being
+  compressed" error.
+- **Warnings respect `-q`.** "first frame decompresses to ... Decompressing on CPU" now prints at the
+  default level (it is about routing, and now also appears for pipes); "--sliding-window implies
+  --cpu-only" prints only from a build that has a GPU path, at the default level. Both used to print
+  under `-qq`, the second from the CPU-only build too.
+
+### What the review found
+
+Codex reviewed the change by tracing every route into the frame splitter and every way out of the
+streaming decoder, and found four regressions in it, all fixed; the two that change output were
+reproduced first:
+
+- **A redirected stdin broke.** `gzstd -d < sizeless.zst` from a regular file exited 4 ("Destination
+  buffer is too small"), with or without `--direct-read`; v0.17.90 decoded it. The streaming decoder
+  installed its own seek-table scope, which rewound the input the splitter had already read past, so
+  the prefix was decoded twice. The handoff now uses the driver's scope, and an O_DIRECT prefix
+  repositions the input first.
+- **A checksum error lost the last batch.** On a seek-table mismatch 310,378,496 of 314,572,800
+  decoded bytes reached stdout, where v0.17.90 wrote them all; the same for an `-M` window refusal.
+  Both now drain the writer first.
+- The handoff skipped output preallocation, and replaced (instead of adding to) the meter's output
+  total that `--tar` keeps across archives. Both restored.
+
+A third round, on the decoder's read-ahead (added after the second): with `--keep-going`, a corrupt
+frame and a pipe its writer keeps open, decoding stopped while the read-ahead thread waited in `fread`
+for a next chunk that would never come, and the exit waited on that read. (v0.17.90 hung there too,
+earlier: it was still reading the whole frame.) `--keep-going` now reads on the decoding thread, so it
+stops reading when it stops decoding; and an allocation or thread-start failure can no longer unwind
+through a live read. A new check holds the pipe open after 12 MiB with a broken block at 9 MiB: exit 7
+within 10 s, where the read-ahead build waited.
+
+Found on the way and left for a separate change (ROADMAP): a GPU build that exits on an error with
+stdout redirected to a regular file loses the O_DIRECT writer's buffered tail -- 268 MiB of 300 reach
+the file from v0.17.90's GPU build, all of it from the CPU-only build or through a pipe.
+
+### Tests
+
+Suites on the final code: the extensive GPU run 754 passed, 0 failed, 1 skipped of 755; the CPU-only
+build 432 passed, 0 failed. Both builds compile without warnings.
+
+Three new cells, none needing a GPU:
+
+- **A single-frame archive decodes through a pipe in bounded memory.** 300 MiB of random data, sized
+  and sizeless frames: identical output, `-d` and `-t` under 150 MiB RSS (the old route: 740 MiB),
+  the streaming route named at `-v`, a redirected (not piped) stdin with and without `--direct-read`,
+  a truncated stream exits 4, `--keep-going` on a block marked with the reserved type keeps within
+  one block of what zstd keeps, and `--keep-going` on a pipe held open exits instead of waiting.
+- **A single frame without its own checksum is checked against the seek table** on the streaming
+  route: `--no-check`, one payload byte flipped, exit 4 from `-d` and `-t`, with every decoded byte
+  written before the error.
+- **`--sliding-window` output is byte-identical to zstd's**, at 8 MiB and 8 MiB + 1, from a file and
+  through a pipe.
+
+The `--sliding-window` warning cell now expects the warning from GPU builds only. (Its first version
+wrote `A && B || C && D`, which bash groups as `((A && B) || C) && D`, so it failed every GPU build;
+the first extensive run caught it. It now compares a flag, and fails v0.17.90's CPU-only build, which
+printed the warning.) Ten builds, each with
+one change undone, fail a cell: no handoff, the prefix dropped, no final drain, never hashing, no
+per-call cap, the compressor's last batch dropped, no look-ahead, a look-ahead that ignores growth, a
+nested seek-table scope, and no drain on a checksum mismatch; read-ahead under `--keep-going` hangs the
+live-pipe check. (No final drain is caught only while the error-path drain is missing: each way out of
+the loop drains on its own, so the final one is a backstop.) The compressor's last batch and the
+growth check are caught by existing cells (the round trip, and the grew/shrank cell, whose 12 MiB
+fixture is an exact multiple of the read size).
 
 ## v0.17.90 — the futex traffic, investigated: a wake-everyone on the frame throttle
 

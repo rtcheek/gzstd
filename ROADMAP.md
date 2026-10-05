@@ -77,27 +77,37 @@ v0.17.89 (CHANGELOG has the table), along with the `-M` decompression limit foun
 without a change: checking sparse maps on an indexed `-l --tar` (measured: 10 ms today, 0.1 to 2 s
 with the check; `-t --tar` checks them). The "13 futex calls per frame" was investigated in v0.17.90:
 mostly strace's own doing, and the real part, a wake-everyone on the frame throttle, is fixed.
-What is still open:
+"zstd beats --sliding-window" was investigated in v0.17.91: from files gzstd was already faster;
+the gap was PIPES (a single-frame archive on stdin was read whole before decoding; the compressor
+read and wrote on one thread), now faster than zstd both ways. What is still open:
 
-1. **`--sliding-window` is slower than zstd on wall time, by a noticeable margin, every time**
-   (the maintainer's observation, 2026-10-02). That mode exists to produce what `zstd` produces --
-   one frame, a window that slides across the whole input -- so zstd itself is the yardstick and
-   there is no reason in principle to lose to it. Find where the time goes (reader, the job
-   hand-off, the writer, thread count, `ZSTD_c_nbWorkers`/`jobSize`/overlap settings against zstd's
-   defaults) and close the gap or explain it.
-2. **`>>` stays on the buffered writer**, 3.5x slower than O_DIRECT on a redirected file. Adopting an
+1. **`>>` stays on the buffered writer**, 3.5x slower than O_DIRECT on a redirected file. Adopting an
    append descriptor would mean positional writes at a base another appender could also be writing to.
-3. **`--gds-only` peer-to-peer output declines a descriptor that already holds output**, so the second
+2. **`--gds-only` peer-to-peer output declines a descriptor that already holds output**, so the second
    archive of `{ gzstd --gds-only -c a; gzstd --gds-only -c b; } > f` is written device-to-host.
-4. **The `--tar` GPU decode pool has no stall guard.** v0.17.89's guard covers GPU compression;
+3. **The `--tar` GPU decode pool has no stall guard.** v0.17.89's guard covers GPU compression;
    decompression reclaims a wedged batch; the pool's stream synchronize can still hang an extraction.
-5. **`--tar` onto a `1<>` file with more than one link** is refused unless `-f` is given: the name
+4. **`--tar` onto a `1<>` file with more than one link** is refused unless `-f` is given: the name
    the descriptor reports cannot say where the other links are.
-6. **zstd spellings still missing**: `--zstd=...`; a bare `-M` number is MiB where zstd reads bytes;
+5. **zstd spellings still missing**: `--zstd=...`; a bare `-M` number is MiB where zstd reads bytes;
    `--train -c -o dict` writes to stdout where zstd lets the later of the two win.
-7. **After a failed run the caller's stdout position is best effort** (documented in `--help`).
-8. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
+6. **After a failed run the caller's stdout position is best effort** (documented in `--help`).
+7. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
     The caller's doing; left.
+
+8. **On stdin, seek-table checksums cannot be checked.** The table is at the end of the stream, so a
+  frame written without its own checksum (`zstd --no-check`) arriving through a pipe is decoded
+  unverified. Named files are checked. Was so before v0.17.91.
+9. **Only the FIRST frame on stdin is streamed.** A huge or sizeless frame after smaller ones is still
+  read whole by the frame splitter, as before; a multi-frame stream with a giant frame in the middle is
+  rare, and the named-file route has the same rule.
+10. **The single-frame decoder never makes holes.** It writes zeros densely where the frame-parallel
+  writer leaves sparse holes in a regular-file output; v0.17.91 kept that (sparse off) deliberately.
+11. **A GPU build that exits on an error loses the O_DIRECT stdout tail.** With stdout redirected to a
+  regular file (adopted for O_DIRECT), a fatal data error ends the process without flushing the direct
+  writer's buffered tail: a corrupt 300 MiB frame left 268 MiB (v0.17.90) / 288 MiB (v0.17.91) of
+  output where the CPU-only build and any pipe get all 300 MiB. Partial output on an error is best
+  effort, but the two builds should agree.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

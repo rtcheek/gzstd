@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=593
-$EXTENSIVE && EXPECTED_TESTS=752
+EXPECTED_TESTS=596
+$EXTENSIVE && EXPECTED_TESTS=755
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -9079,6 +9079,228 @@ fi
 rm -rf "$rv"
 
 # ────────────────────────────────────────────────────────────
+section "Single-frame archives: --sliding-window and pipes (v0.17.91)"
+
+# A single-frame archive (zstd's own output, gzstd --sliding-window, tar --zstd)
+# arriving on STDIN was read whole before a byte was decoded: the frame splitter
+# can only find a frame's end by holding all of it, and the named-file route that
+# streams such frames instead peeks at the header, which a pipe cannot do.  An
+# 8 GiB archive took 17 GiB of RAM and 2.4x zstd's time; one larger than RAM
+# could not be decoded at all.  Now the splitter streams a huge or sizeless
+# FIRST frame from its header.  Random data, so the compressed frame itself is
+# large too: the old route held at least 300 MiB here, the stream about 25 MiB.
+if [[ -x /usr/bin/time ]] && command -v zstd >/dev/null 2>&1 \
+    && command -v python3 >/dev/null 2>&1; then
+  pf="$TMPDIR/pf"; mkdir -p "$pf"
+  head -c $((300*1048576)) /dev/urandom > "$pf/r.bin"
+  zstd -q -f "$pf/r.bin" -o "$pf/sized.zst"                 # declares its size
+  cat "$pf/r.bin" | zstd -q -c > "$pf/sizeless.zst"          # declares none
+  pf_why=""
+  for pf_k in sized sizeless; do
+    pf_rss=$( { cat "$pf/$pf_k.zst" | /usr/bin/time -f %M -o "$pf/rss" "$GZSTD" -d -q -c --cpu-only \
+               | cmp -s - "$pf/r.bin" && echo same || echo DIFFERENT; } 2>/dev/null)
+    pf_m=$(tail -1 "$pf/rss" 2>/dev/null)
+    [[ "$pf_rss" == same ]] || pf_why+=" [$pf_k: -d through a pipe gave different bytes]"
+    [[ "$pf_m" =~ ^[0-9]+$ && $pf_m -lt 153600 ]] || pf_why+=" [$pf_k: -d through a pipe peaked at ${pf_m:-?} KiB, want < 150 MiB]"
+    rc=0; cat "$pf/$pf_k.zst" | /usr/bin/time -f %M -o "$pf/rss" "$GZSTD" -t -q --cpu-only 2>/dev/null || rc=$?
+    pf_m=$(tail -1 "$pf/rss" 2>/dev/null)
+    [[ $rc -eq 0 ]] || pf_why+=" [$pf_k: -t through a pipe exited $rc]"
+    [[ "$pf_m" =~ ^[0-9]+$ && $pf_m -lt 153600 ]] || pf_why+=" [$pf_k: -t through a pipe peaked at ${pf_m:-?} KiB]"
+  done
+  # A redirected regular stdin can take the sequential splitter but read its
+  # prefix with O_DIRECT pread.  The streaming suffix must start after that
+  # prefix, even though the seek-table probe rewinds the FILE* in between.
+  # Found by review: plain redirects broke too (exit 4, "Destination buffer is
+  # too small" -- the prefix decoded twice).
+  for pf_dr in "" --direct-read; do
+    rc=0
+    "$GZSTD" -d -q -c --cpu-only $pf_dr < "$pf/sizeless.zst" \
+      > "$pf/direct.out" 2> "$pf/direct.log" || rc=$?
+    [[ $rc -eq 0 ]] && cmp -s "$pf/direct.out" "$pf/r.bin" \
+      || pf_why+=" [sizeless frame from redirected stdin ${pf_dr:-(buffered)}: exit $rc or wrong bytes]"
+  done
+  # The route, not just the outcome: -v names it.
+  cat "$pf/sized.zst" | "$GZSTD" -d -c -v --cpu-only 2>"$pf/v.log" >/dev/null
+  grep -aq "streaming single .* frame on CPU" "$pf/v.log" || pf_why+=" [sized frame from a pipe did not take the streaming route]"
+  # A truncated stream through the pipe: an error, and --keep-going keeps the
+  # decodable prefix (exit 7), as on the named-file route.
+  head -c $((150*1048576)) "$pf/sized.zst" > "$pf/cut.zst"
+  rc=0; cat "$pf/cut.zst" | "$GZSTD" -d -q -c --cpu-only >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 4 ]] || pf_why+=" [truncated stream through a pipe exited $rc, want 4]"
+  rc=0; cat "$pf/cut.zst" | "$GZSTD" -d -q -c --cpu-only --keep-going > "$pf/kg.out" 2>/dev/null || rc=$?
+  pf_n=$(stat -c %s "$pf/kg.out" 2>/dev/null || echo 0)
+  [[ $rc -eq 7 && $pf_n -gt 0 ]] && cmp -s "$pf/kg.out" <(head -c "$pf_n" "$pf/r.bin") \
+    || pf_why+=" [--keep-going through a pipe: exit $rc, $pf_n bytes recovered]"
+  # Corruption mid-frame with --keep-going: everything decoded before the bad
+  # block must reach stdout (exit 7).  zstd's own decoder is the oracle for how
+  # much that is; gzstd may come within one 128 KiB block of it.  Entropy-coded
+  # data, so the flip breaks a block instead of decoding to different bytes.
+  ( set +o pipefail
+    head -c $((230*1048576)) /dev/urandom | base64 -w0 | head -c $((300*1048576)) > "$pf/b.bin" )
+  zstd -q -f "$pf/b.bin" -o "$pf/b.zst"
+  # Mark the block nearest 37% of the way in as type 3 (reserved): every decoder
+  # rejects exactly that block, whatever the random data around it.  A flipped
+  # payload byte sometimes decoded to different bytes instead.
+  python3 - "$pf/b.zst" "$pf/bbad.zst" <<'PFPY' 2>/dev/null
+import sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+fhd = b[4]; ss = (fhd >> 5) & 1
+pos = 4 + 1 + (0 if ss else 1) + [0, 1, 2, 4][fhd & 3] + [ss, 2, 4, 8][fhd >> 6]
+target = int(len(b) * 0.37)
+while True:
+    h = b[pos] | (b[pos + 1] << 8) | (b[pos + 2] << 16)
+    last, btype, bsize = h & 1, (h >> 1) & 3, h >> 3
+    if pos >= target or last:
+        b[pos] |= 0x06                     # block type 3: reserved, always an error
+        break
+    pos += 3 + (1 if btype == 1 else bsize)
+open(sys.argv[2], 'wb').write(bytes(b))
+PFPY
+  zstd -dc "$pf/bbad.zst" 2>/dev/null > "$pf/z.out"
+  pf_z=$(stat -c %s "$pf/z.out" 2>/dev/null || echo 0)
+  rc=0; cat "$pf/bbad.zst" | "$GZSTD" -d -q -c --cpu-only --keep-going > "$pf/kg2.out" 2>/dev/null || rc=$?
+  pf_n=$(stat -c %s "$pf/kg2.out" 2>/dev/null || echo 0)
+  if cmp -s "$pf/z.out" <(head -c "$pf_z" "$pf/b.bin"); then
+    [[ $rc -eq 7 && $pf_n -ge $((pf_z - 131072)) ]] && cmp -s "$pf/kg2.out" <(head -c "$pf_n" "$pf/b.bin") \
+      || pf_why+=" [corrupt mid-frame through a pipe, --keep-going: exit $rc, $pf_n bytes kept, zstd keeps $pf_z]"
+  else
+    pf_why+=" [fixture: zstd's own partial output ($pf_z bytes) is not a prefix of the input]"
+  fi
+  # Keep the pipe open after three full read chunks.  Corruption in the third
+  # makes --keep-going stop while the reader is waiting for the fourth; joining
+  # that speculative read would wait forever for bytes we will not send.
+  # GEOMETRY: this assumes 4 MiB reads in both the frame splitter (the prefix)
+  # and the streaming decoder.  If either changes, revisit the 12 MiB / 9 MiB
+  # numbers: a larger prefix could put the broken block inside it.
+  rc=0
+  python3 - "$GZSTD" "$pf/sizeless.zst" <<'PFPY' >/dev/null 2>&1 || rc=$?
+import os, select, subprocess, sys, time
+b = bytearray(open(sys.argv[2], 'rb').read(12 * 1048576))
+fhd = b[4]; ss = (fhd >> 5) & 1
+pos = 4 + 1 + (0 if ss else 1) + [0, 1, 2, 4][fhd & 3] + [ss, 2, 4, 8][fhd >> 6]
+while pos < 9 * 1048576:
+    h = b[pos] | (b[pos + 1] << 8) | (b[pos + 2] << 16)
+    btype, bsize = (h >> 1) & 3, h >> 3
+    pos += 3 + (1 if btype == 1 else bsize)
+b[pos] |= 0x06                         # block type 3: reserved
+p = subprocess.Popen([sys.argv[1], '-d', '-q', '-c', '--cpu-only', '--keep-going'],
+                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+fd = p.stdin.fileno()
+os.set_blocking(fd, False)
+view = memoryview(b)
+sent = 0
+deadline = time.monotonic() + 10
+verdict = 124
+try:
+    while sent < len(view):
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([], [fd], [], left)[1]:
+            break
+        try:
+            sent += os.write(fd, view[sent:])
+        except BlockingIOError:
+            continue
+        except BrokenPipeError:
+            break
+    if sent == len(view):
+        try:
+            verdict = p.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+finally:
+    if p.poll() is None:
+        p.kill()
+        p.wait()
+    p.stdin.close()                     # intentionally open until after wait
+sys.exit(0 if verdict == 7 else 1)
+PFPY
+  [[ $rc -eq 0 ]] || pf_why+=" [--keep-going waited for more input after mid-stream corruption on a live pipe]"
+  [[ -z "$pf_why" ]] && pass "a single-frame archive decodes through a pipe in bounded memory" \
+    || fail "a single-frame archive decodes through a pipe in bounded memory" "$pf_why"
+  rm -rf "$pf"
+else
+  skip "a single-frame archive decodes through a pipe in bounded memory" "needs /usr/bin/time, zstd and python3"
+fi
+
+# The streaming decoder used to hash every byte it produced and throw the
+# digest away unless the frame had no checksum of its own; it now hashes only
+# those frames (v0.17.91).  So the one case that still needs the hash must be
+# seen to work: a 300 MiB frame written with --no-check, whose only integrity
+# evidence is a seek-table entry, with one payload byte flipped.  Random data is
+# stored raw, so the flip decodes cleanly to the wrong bytes and only the table
+# can catch it.  Named file, so it takes the streaming route by size.
+if command -v zstd >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  sc="$TMPDIR/sc"; mkdir -p "$sc"
+  head -c $((300*1048576)) /dev/urandom > "$sc/r.bin"
+  zstd -q -f "$sc/r.bin" -o "$sc/r.ck"
+  zstd -q --no-check -f "$sc/r.bin" -o "$sc/r.nc"
+  python3 - "$sc" <<'SCPY' 2>/dev/null
+import os, struct, sys
+d = sys.argv[1]
+ck = struct.unpack('<I', open(f'{d}/r.ck', 'rb').read()[-4:])[0]
+body = open(f'{d}/r.nc', 'rb').read()
+pay = struct.pack('<III', len(body), 300 * 1048576, ck) + struct.pack('<I', 1) + bytes([0x80]) \
+      + struct.pack('<I', 0x8F92EAB1)
+tbl = struct.pack('<II', 0x184D2A5E, len(pay)) + pay
+open(f'{d}/good.zst', 'wb').write(body + tbl)
+bad = bytearray(body + tbl)
+bad[len(body) // 2] ^= 0xFF
+open(f'{d}/bad.zst', 'wb').write(bytes(bad))
+SCPY
+  sc_why=""
+  if [[ -s "$sc/good.zst" && -s "$sc/bad.zst" ]]; then
+    "$GZSTD" -d -q -c --cpu-only -v "$sc/good.zst" 2>"$sc/v.log" | cmp -s - "$sc/r.bin" \
+      || sc_why+=" [the sound archive did not decode to its input]"
+    grep -aq "streaming single .* frame on CPU" "$sc/v.log" || sc_why+=" [not the streaming route]"
+    for sc_m in -d -t; do
+      rc=0
+      # Through a pipe: what reaches stdout before the error is the decoder's
+      # doing.  (A regular-file stdout adopted for O_DIRECT loses its writer's
+      # buffered tail when a GPU build exits on an error -- older, and separate.)
+      if [[ $sc_m == -d ]]; then { "$GZSTD" -d -q -c --cpu-only "$sc/bad.zst" 2>/dev/null || echo "rc=$?" > "$sc/rc"; } | cat > "$sc/partial.out"
+        rc=$(sed -n 's/^rc=//p' "$sc/rc" 2>/dev/null); rc=${rc:-0}; rm -f "$sc/rc"
+      else "$GZSTD" -t -q --cpu-only "$sc/bad.zst" 2>/dev/null || rc=$?; fi
+      [[ $rc -eq 4 ]] || sc_why+=" [$sc_m on a corrupt payload exited $rc, want 4]"
+      if [[ $sc_m == -d ]]; then
+        sc_n=$(stat -c %s "$sc/partial.out" 2>/dev/null || echo 0)
+        [[ $sc_n -eq $((300*1048576)) ]] \
+          || sc_why+=" [checksum failure emitted $sc_n of $((300*1048576)) decoded bytes]"
+      fi
+    done
+    [[ -z "$sc_why" ]] && pass "a single frame without its own checksum is checked against the seek table" \
+      || fail "a single frame without its own checksum is checked against the seek table" "$sc_why"
+  else
+    skip "a single frame without its own checksum is checked against the seek table" "could not build fixture"
+  fi
+  rm -rf "$sc"
+else
+  skip "a single frame without its own checksum is checked against the seek table" "needs zstd and python3"
+fi
+
+# --sliding-window says its output matches zstd's.  It did, except for a file
+# whose size is an exact multiple of the 4 MiB read: that frame ended with an
+# empty block, 3 bytes zstd does not write (v0.17.91).  Both sides of the
+# boundary, from a file and from a pipe.
+if command -v zstd >/dev/null 2>&1; then
+  sz_d="$TMPDIR/swz"; mkdir -p "$sz_d"; swz_why=""
+  head -c $((8*1048576 + 1)) /dev/urandom > "$sz_d/r"
+  for swz_n in $((8*1048576)) $((8*1048576 + 1)); do
+    head -c "$swz_n" "$sz_d/r" > "$sz_d/in"
+    "$GZSTD" --sliding-window -q -f "$sz_d/in" -o "$sz_d/g.zst" 2>/dev/null
+    zstd -q -f "$sz_d/in" -o "$sz_d/z.zst"
+    cmp -s "$sz_d/g.zst" "$sz_d/z.zst" || swz_why+=" [$swz_n bytes from a file: $(stat -c %s "$sz_d/g.zst") bytes, zstd $(stat -c %s "$sz_d/z.zst")]"
+    cat "$sz_d/in" | "$GZSTD" --sliding-window -q -c > "$sz_d/gp.zst" 2>/dev/null
+    cat "$sz_d/in" | zstd -q -c > "$sz_d/zp.zst"
+    cmp -s "$sz_d/gp.zst" "$sz_d/zp.zst" || swz_why+=" [$swz_n bytes through a pipe differ]"
+  done
+  [[ -z "$swz_why" ]] && pass "--sliding-window output is byte-identical to zstd's" \
+    || fail "--sliding-window output is byte-identical to zstd's" "$swz_why"
+  rm -rf "$sz_d"
+else
+  skip "--sliding-window output is byte-identical to zstd's" "no zstd"
+fi
+
 section "Decompress tail-aware GPU intake (pinned rates)"
 
 # v0.17.54: hybrid decompress declines GPU intake at the tail, as compress has
@@ -9837,10 +10059,14 @@ rm -f "$TMPDIR/sw-interop.zst" "$TMPDIR/sw-interop.dec"
 out=$("$GZSTD" -k -f --sliding-window \
   "$TMPDIR/large.bin" -o "$TMPDIR/sw-impl.zst" 2>&1)
 rc=$?
-if [[ $rc -eq 0 ]] && grep -q "implies --cpu-only" <<< "$out"; then
+# The warning is about the GPU path, so only a build that has one prints it
+# (v0.17.91; the CPU-only build used to print it on every run).
+if "$GZSTD" --version 2>/dev/null | grep -q "CPU-only"; then sw_want_warn=false; else sw_want_warn=true; fi
+sw_has_warn=false; grep -q "implies --cpu-only" <<< "$out" && sw_has_warn=true
+if [[ $rc -eq 0 && $sw_has_warn == "$sw_want_warn" ]]; then
   pass "--sliding-window implies --cpu-only (warning)"
 else
-  fail "--sliding-window implies --cpu-only" "exit $rc"
+  fail "--sliding-window implies --cpu-only" "exit $rc, warning expected: $sw_want_warn"
 fi
 rm -f "$TMPDIR/sw-impl.zst"
 
