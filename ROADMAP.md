@@ -262,8 +262,14 @@ split one PCIe link).
   (a pageable upload that takes its own page faults runs at 40% speed), and `--adapt` /
   `--calibrate FILE` learn the device count from `overhead + size / rate`. 195 GiB: 20.2–21.4 s →
   13.2–14.7 s on 2 GPUs. Still ~2× the 256 CPU cores' 6.3–6.8 s, so the decision below is unchanged
-  for this box; on the workstation the device-count model is **untested** — with 2 cards its only
-  question is 1 vs 2.
+  for this box. On the workstation the model has now been tested (2026-10-06, v0.18.0, 24 GiB of
+  base64, `--adapt --gpu-only`, fresh profile), and it answers 1 vs 2 correctly:
+  - Run 1 measured 2 cards.
+  - Run 2 explored 1 card (32.9 s) and recorded 0.78 GiB/s with 2.06 s of overhead, against
+    1.43 GiB/s and 2.52 s for two.
+  - Run 3 predicted 21.5 s on 2 cards, chose 2, and ran 17.7 s.
+
+  One caveat: run 1's rate was depressed by the source latch fixed in v0.18.1.
 - The kernel is nvCOMP's. Chunk size and batch shape are the only levers we own.
 
 ### The decision this section exists to force
@@ -1338,7 +1344,7 @@ Create `~/.gzstd/` directory on first run. Store tuning data:
 - NVMe write throughput (GiB/s, for writer thread sizing)
 - CPU/GPU ratio for rate-matched dispatch
 
-**Why it matters:** On 8 GiB files where total runtime is 3-6 seconds, the auto-tuner spends 2-3 seconds rediscovering optimal batch sizes every run. On the workstation where the answer is always "batch=8 for compress," this is pure waste. A cached profile would eliminate the exploration phase.
+**Why it matters:** On 8 GiB files where total runtime is 3-6 seconds, the auto-tuner spends 2-3 seconds rediscovering optimal batch sizes every run. On the workstation where the answer is always "batch=8 for compress," this is pure waste. *(Historical, from the v0.11.x era. Measured 2026-10-06: 4 x 16 MiB is that box's best compress batch, and v0.18.1 starts there. `--adapt` has kept per-device batch priors since v0.17.80.)* A cached profile would eliminate the exploration phase.
 
 ### 2.2 Calibration Run
 **Priority: Medium | Complexity: Medium | Status: SUBSUMED by v0.15.1 `--calibrate`** — memfd corpus through the real readers, warmup passes off the clock, seeds the profile.
@@ -1493,7 +1499,12 @@ documented deferral during M4):
   = D2H-cost-aware routing (keep trivially-compressed/small frames on CPU per the
   existing <2% rule, decode-heavy frames on GPU); and positive-perf validation on a
   genuine CPU-poor/GPU-rich box (a CPU-rich box's pool clears the starvation before
-  the GPU is worth engaging, so the win isn't demonstrable there).
+  the GPU is worth engaging, so the win isn't demonstrable there). **The 24-core Gen3
+  workstation is not that box either** (2026-10-06, v0.18.0, two 11 GiB cards). On a 9.4 GiB
+  decode-bound archive of 300 x 32 MiB base64 members, `-d --tar --adapt -v` extracted warm at
+  7.5 GiB/s on 22 CPU decoders and never engaged the GPU decoders, which is correct by design.
+  The pool's GPU path did run on Turing in the suite, forced by `GZSTD_DEBUG_POOL_GPU_FIRST`.
+  Still owed: a host with roughly 8 cores or fewer and a GPU.
 - **Tar-create member-reader scale-up:** the v0.15.5 dormant-reader
   mechanism covers only the plain-decompress prefetch pool; the tar-create
   member readers (`--read-threads`, device-bound per the v0.14.x
