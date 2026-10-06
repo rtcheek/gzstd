@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.92";
+static constexpr const char * GZSTD_VERSION = "0.17.93";
 //
 // Architecture overview:
 //
@@ -5089,7 +5089,8 @@ static void print_help_long()
 "\n"
 "  --sliding-window\n"
 "     Compress the whole file as a single frame with zstd's built-in\n"
-"     multi-threaded mode (`ZSTD_c_nbWorkers`).  Maximum ratio on\n"
+"     multi-threaded mode (`ZSTD_c_nbWorkers`) when the linked zstd\n"
+"     supports it; otherwise warns and uses one thread. Maximum ratio on\n"
 "     repetitive data (matches `zstd` exactly) because the\n"
 "     sliding window carries context across the full file.\n"
 "     Implies --cpu-only.  Workers default to the PHYSICAL cores this\n"
@@ -5478,13 +5479,37 @@ static void print_help_long()
 "For a condensed option list, run `gzstd -h`.\n";
 }
 
+// DOES THE LINKED ZSTD HAVE ITS OWN WORKER THREADS? (v0.17.93)  Only
+// --sliding-window uses them (ZSTD_c_nbWorkers), and a libzstd compiled without
+// ZSTD_MULTITHREAD accepts nothing above 0 there.  zstd's own Makefile builds
+// the STATIC library single-threaded unless asked (libzstd.a-mt), and the
+// portable release binary used to link Ubuntu 20.04's libzstd.a -- zstd 1.4.4,
+// single-threaded -- so --sliding-window died at once in every release:
+// "ZSTD_CCtx_setParameter(nbWorkers): Unsupported parameter".  Asked at run time
+// because the answer belongs to the library actually linked, not the header.
+// GZSTD_DEBUG_ZSTD_SINGLE_THREAD=1 answers "no" (test-only; announced by the
+// hook banner), so the suite can reach the fallback with a threaded library.
+static bool gz_zstd_multithreaded()
+{
+  static const bool forced_st = [] {
+    const char * e = ::getenv("GZSTD_DEBUG_ZSTD_SINGLE_THREAD");
+    return e && *e && *e != '0';
+  }();
+  if (forced_st) return false;
+  const ZSTD_bounds b = ZSTD_cParam_getBounds(ZSTD_c_nbWorkers);
+  return !ZSTD_isError(b.error) && b.upperBound > 0;
+}
+
 static void print_version()
 {
   gz_stdout_will_be_written();
+  // The zstd library goes on the SAME line: scripts read the first line.
+  const std::string zl = std::string(" [zstd ") + ZSTD_versionString()
+                       + (gz_zstd_multithreaded() ? ", multithreaded]" : ", single-threaded]");
 #ifdef HAVE_NVCOMP
-  std::cout << "gzstd " << GZSTD_VERSION << " (CPU + nvCOMP) MT-CPU + Hybrid scheduling\n";
+  std::cout << "gzstd " << GZSTD_VERSION << " (CPU + nvCOMP) MT-CPU + Hybrid scheduling" << zl << "\n";
 #else
-  std::cout << "gzstd " << GZSTD_VERSION << " (CPU-only) MT compression\n";
+  std::cout << "gzstd " << GZSTD_VERSION << " (CPU-only) MT compression" << zl << "\n";
 #endif
 }
 
@@ -19876,7 +19901,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   progress_done = true; gz_wake_periodic_loops(); progress_thr.join();
 }
 
-// Single-frame compression using zstd's built-in MT with sliding window.
+// Single-frame compression using zstd's sliding window (built-in MT when available).
 // Produces one frame (like `zstd`) for maximum ratio on repetitive data.
 // Decompression will be single-threaded (one frame = one unit of work).
 // XXH64, implemented here rather than called out to libzstd.
@@ -20085,8 +20110,15 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   else if (const unsigned pc = gz_physical_cores_allowed()) n_threads = pc;
   if (n_threads < 1) n_threads = 1;
 
-  vlog(V_VERBOSE, opt, "[SLIDING-WINDOW] single-frame compression with "
-       + std::to_string(n_threads) + " zstd worker threads\n");
+  // A zstd built without its worker threads cannot do this in parallel: say so
+  // and compress the one frame on this thread, rather than die (v0.17.93).
+  bool sw_mt = gz_zstd_multithreaded();
+  if (!sw_mt)
+    vlog(V_DEFAULT, opt, std::string("warning: this build's zstd library (") + ZSTD_versionString()
+         + ") has no multithreading; --sliding-window compresses on one thread\n");
+  else
+    vlog(V_VERBOSE, opt, "[SLIDING-WINDOW] single-frame compression with "
+         + std::to_string(n_threads) + " zstd worker threads\n");
 
   uint64_t total_in = known_input_size(opt, in);
 
@@ -20100,8 +20132,15 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level): ") + ZSTD_getErrorName(st));
   ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);  // self-verifying frames (see compress worker)
-  st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, (int)n_threads);
-  if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(nbWorkers): ") + ZSTD_getErrorName(st));
+  if (sw_mt) {
+    st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, (int)n_threads);
+    if (ZSTD_isError(st)) {
+      // The probe said yes and the library still refused: same fallback.
+      vlog(V_DEFAULT, opt, std::string("warning: zstd refused worker threads (")
+           + ZSTD_getErrorName(st) + "); --sliding-window compresses on one thread\n");
+      sw_mt = false;
+    }
+  }
   if (total_in > 0) {
     st = ZSTD_CCtx_setPledgedSrcSize(cctx, total_in);
     if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setPledgedSrcSize: ") + ZSTD_getErrorName(st));
@@ -20167,9 +20206,9 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
     if (m && n > 0) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
     read_total += n;
     // THE PLEDGE IS A PROMISE THIS PATH MUST KEEP ITSELF.  The frame header carries
-    // total_in as its content size, and zstd's multithreaded mode (nbWorkers >= 1,
-    // which this path always uses) does not check the bytes it is then given against
-    // it.  MEASURED: a 2 GiB input that grew by 1 MiB half a second into the run
+    // total_in as its content size, and zstd's multithreaded mode (when available)
+    // does not check the bytes it is then given against it.  MEASURED: a 2 GiB
+    // input that grew by 1 MiB half a second into the run
     // exited 0 with an archive declaring 2.00 GiB that no decoder accepts ("Data
     // corruption detected") -- and --rm would then have removed the source.  A log
     // file still being written is the ordinary way to get here.  Only GROWTH gets

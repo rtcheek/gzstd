@@ -1,12 +1,77 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.92  
+**Covers:** v0.9.50 → v0.17.93  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.17.93 — the release binary's zstd: 1.4.4, single-threaded, since May
+
+The maintainer ran the installed release on the 130 GiB tar:
+
+    $ gzstd --sliding-window -f td.tar
+    gzstd: ERROR: ZSTD_CCtx_setParameter(nbWorkers): Unsupported parameter
+
+in 6 ms. The release binary (v0.17.88, installed from the tag) contains zstd **1.4.4**: the portable
+build compiles inside an Ubuntu 20.04 container and statically linked that distribution's `libzstd.a`.
+zstd's own Makefile builds the static library single-threaded unless asked (`libzstd.a-mt`), and
+Ubuntu ships it that way, so the worker-thread parameter `--sliding-window` needs did not exist in it.
+Every release since the portable build was added (May) failed `--sliding-window` this way, while every
+suite and benchmark ran the dev builds against conda's zstd 1.5.7, multithreaded and shared. The binary
+users ran was not the binary we tested: an older encoder, and none of the byte-identity results
+(`--train`, `--sliding-window` against zstd) were ever checked against it.
+
+- **The portable build compiles zstd itself**: a pinned release (`ZSTD_VERSION=1.5.7`, the dev
+  version), downloaded on the host and checked against `ZSTD_SHA256` on every run, built in the
+  container with `make libzstd.a-mt`. Ubuntu's `libzstd-dev` is no longer installed, CMake must
+  report taking the library given to it, and the build fails unless the binary reports
+  `[zstd 1.5.7, multithreaded]`.
+- **The release workflow** caches the zstd tarball (its own key, apart from nvCOMP), asserts the same
+  version line, and round-trips `--sliding-window` on 27 MB of data (checking zstd interoperability
+  when the runner has zstd).
+- **CMake**: with `-DGZSTD_ZSTD_EXPLICIT=ON`, `-DZSTD_INCLUDE_DIR` and `-DZSTD_LIBRARY` are used as
+  given, ahead of FindZSTD and pkg-config (which otherwise win over them: any zstd visible on a build
+  host could replace the one asked for). An opt-in, not a rule, because an existing build directory
+  keeps both variables cached from an earlier search and must not have stale ones promoted.
+- **`--version`** names the zstd library and whether it has worker threads, on its first line:
+  `gzstd 0.17.93 (CPU + nvCOMP) MT-CPU + Hybrid scheduling [zstd 1.5.7, multithreaded]`.
+- **`--sliding-window` on a zstd without threads** warns and compresses on one thread instead of dying.
+
+Checked here without Docker, which this machine lacks: the script's fetch and checksum (a corrupted
+cached tarball is caught and deleted), and its in-container steps with the paths substituted -- zstd
+1.5.7 built as `libzstd.a-mt` (zstd reports 0..256 worker threads; the plain `libzstd.a` target
+reports 0..0), CMake taking it explicitly, and a `BUILD_STATIC` build reporting
+`[zstd 1.5.7, multithreaded]` with no dynamic zstd or libstdc++. That build's `--sliding-window`
+output is byte-identical to `zstd -T0`; a build against a single-threaded static zstd warns and
+round-trips. The container itself runs only in the workflow: run it by hand before the tag.
+
+### What the review found
+
+Codex found two ways the pipeline could hide a failure and one way the CMake change could pick a stale
+library, and fixed all three: the container script ran `cmake ... | tee` under plain `set -e`, so a
+failed configure was masked by tee's success (now `set -euo pipefail`); the workflow's smoke test did
+the same for its round trips (now `pipefail` too -- and its two `cmd | grep -q` checks became
+`grep >/dev/null`, since under pipefail a `grep -q` that exits at its first match can make the writer
+die of SIGPIPE and the check read false, which for the NVML check would pass a hard dependency); and
+the explicit zstd pair became the opt-in above. A second round, on those fixes as built, made the same
+change everywhere it applied: the build script's own post-build checks, which already ran under
+`pipefail`, read `ldd` through `grep -q` (a dynamic library could be reported static) and
+`find | head -1` inside `$(...)` (a SIGPIPE'd find could end the script under `set -e`); both now read
+their input whole (`grep >/dev/null`, `find -print -quit`). Safe to commit.
+
+### Tests
+
+Suites on the final code: the extensive GPU run 758 passed, 0 failed, 1 skipped of 759; the CPU-only
+build 436 passed, 0 failed. Both builds compile without warnings. The suites run the dev builds; the
+release container runs only in the workflow, so run it by hand before the tag.
+
+One new cell: `--version` names the zstd library, and `--sliding-window` with a zstd that has no
+threads (`GZSTD_DEBUG_ZSTD_SINGLE_THREAD`, or a real single-threaded build) warns and round-trips. A
+build with the old code fails it against both the dev zstd (no warning) and a single-threaded static
+one (exit 4, the release failure). The deployed v0.17.88 fails it.
 
 ## v0.17.92 — the single-frame loose ends: stdin, holes, a dying GPU build's tail, a pipe's seek table
 

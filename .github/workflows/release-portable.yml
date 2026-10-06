@@ -38,6 +38,27 @@ jobs:
           path: ~/.cache/gzstd-build
           key: nvcomp-5.2.0.10-cuda12-${{ runner.os }}
 
+      # The zstd release the binary is built against is pinned in the build
+      # script (ZSTD_VERSION, with its ZSTD_SHA256); read it from there so the
+      # cache key and the smoke test cannot drift from it.
+      - name: zstd version
+        id: zstd
+        run: |
+          v=$(grep -oP 'ZSTD_VERSION="\$\{ZSTD_VERSION:-\K[0-9.]+' scripts/build-portable.sh)
+          s=$(grep -oP 'ZSTD_SHA256="\$\{ZSTD_SHA256:-\K[0-9a-f]+' scripts/build-portable.sh)
+          [ -n "$v" ] && [ -n "$s" ] || { echo "ERROR: cannot read ZSTD_VERSION/ZSTD_SHA256 from the build script"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "sha=$s" >> "$GITHUB_OUTPUT"
+
+      # Cache the zstd source tarball like nvCOMP.  Its own directory and key,
+      # so a zstd bump never invalidates the nvCOMP cache or the other way round.
+      # The build script verifies the checksum whether or not this hits.
+      - name: Cache zstd source
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gzstd-zstd
+          key: zstd-${{ steps.zstd.outputs.version }}-${{ steps.zstd.outputs.sha }}-${{ runner.os }}
+
       - name: Build portable binary
         run: |
           scripts/build-portable.sh
@@ -48,11 +69,15 @@ jobs:
 
       - name: Smoke test (CPU path only — no GPU, no driver on hosted runners)
         run: |
+          # Fail when a producer in a round-trip pipeline exits nonzero, even
+          # if cmp has already received the expected bytes.  grep must consume
+          # full producer output under pipefail, so the checks below omit -q.
+          set -euo pipefail
           # Hosted runners have NO NVIDIA driver — exactly the environment a
           # portable binary must support.  Since v0.13.55 NVML is dlopen'd at
           # runtime, so the binary must carry no DT_NEEDED on libnvidia-ml;
           # assert that here so a stub-linking regression fails the release.
-          if ldd build-portable/gzstd | grep -q "libnvidia-ml"; then
+          if ldd build-portable/gzstd | grep "libnvidia-ml" >/dev/null; then
             echo "ERROR: binary has a hard NVML dependency (DT_NEEDED" \
                  "libnvidia-ml) — it will not start on driver-less machines"
             ldd build-portable/gzstd
@@ -62,6 +87,24 @@ jobs:
           # Runs directly, no LD_LIBRARY_PATH tricks: this is the real
           # driver-less user experience.
           ./build-portable/gzstd --version
+
+          # The zstd inside must be the pinned release WITH its worker threads.
+          # Every release before v0.17.93 linked Ubuntu 20.04's libzstd.a (zstd
+          # 1.4.4, single-threaded) and --sliding-window died at once:
+          # "ZSTD_CCtx_setParameter(nbWorkers): Unsupported parameter".
+          ./build-portable/gzstd --version \
+            | grep -F "[zstd ${{ steps.zstd.outputs.version }}, multithreaded]" \
+            || { echo "ERROR: binary does not report zstd ${{ steps.zstd.outputs.version }}, multithreaded"; exit 1; }
+          head -c 20000000 /dev/urandom | base64 > sw.txt
+          ./build-portable/gzstd --sliding-window -q -f sw.txt -o sw.txt.zst
+          ./build-portable/gzstd -d -q -c sw.txt.zst | cmp - sw.txt
+          if command -v zstd >/dev/null 2>&1; then
+            zstd -q -dc sw.txt.zst | cmp - sw.txt
+            zstd -q -T0 -f sw.txt -o sw.ref.zst
+            cmp sw.txt.zst sw.ref.zst || echo "note: --sliding-window output differs from this runner's zstd ($(zstd -V))"
+          fi
+          echo "--sliding-window round-trip OK"
+          rm -f sw.txt sw.txt.zst sw.ref.zst
 
           # CPU round-trip — exercises the dispatch and proves the binary
           # actually loads on a fresh Ubuntu 22.04 host (different glibc
@@ -83,8 +126,8 @@ jobs:
           setfattr -n user.gz -v v acltest/src/f
           ./build-portable/gzstd -q -f -o acltest/a.tar.zst --tar --acls --xattrs acltest/src
           ./build-portable/gzstd -d -q --tar --acls --xattrs -C acltest/out acltest/a.tar.zst
-          F=$(find acltest/out -type f -name f | head -1)
-          getfacl -cpn "$F" 2>/dev/null | grep -q "user:$(id -u):rwx" \
+          F=$(find acltest/out -type f -name f -print -quit)
+          getfacl -cpn "$F" 2>/dev/null | grep "user:$(id -u):rwx" >/dev/null \
             || { echo "ERROR: ACL not restored — shipped binary lacks working --acls"; exit 1; }
           [ "$(getfattr -n user.gz --only-values "$F" 2>/dev/null)" = v ] \
             || { echo "ERROR: xattr not restored — shipped binary lacks working --xattrs"; exit 1; }

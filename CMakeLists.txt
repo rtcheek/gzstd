@@ -28,12 +28,19 @@ find_package(Threads REQUIRED)
 # =====================================================
 #                      Zstd
 # Try, in order:
+#   0) -DGZSTD_ZSTD_EXPLICIT=ON with -DZSTD_INCLUDE_DIR and -DZSTD_LIBRARY:
+#      use that pair as given.  The opt-in is needed because older build trees
+#      can retain both variables from a previous find, even when they are stale;
+#      those trees must keep the old FindZSTD/pkg-config priority.
 #   1) CMake's FindZSTD (target ZSTD::ZSTD)
 #   2) pkg-config 'zstd'
 #   3) Manual fallback that looks in common prefixes (e.g., $CONDA_PREFIX)
-#      and allows -DZSTD_INCLUDE_DIR / -DZSTD_LIBRARY overrides.
 #
-# When BUILD_STATIC is ON, prefer libzstd.a over libzstd.so.
+# When BUILD_STATIC is ON, prefer libzstd.a over libzstd.so.  A STATIC libzstd
+# must be built multithreaded (zstd's `make libzstd.a-mt`): zstd's Makefile
+# builds the static library single-threaded by default, and distributions ship
+# it that way -- Ubuntu's libzstd.a is one -- which leaves --sliding-window
+# running on one thread.  gzstd --version reports which one was linked.
 # =====================================================
 
 # Helper: preferred library name list based on BUILD_STATIC
@@ -45,11 +52,27 @@ else()
   set(_ZSTD_LIB_SUFFIXES lib lib64)
 endif()
 
+# 0) Explicit pair.  Cache entries alone do not prove user intent: a previous
+# configure may have populated them via find_path/find_library.  Without the
+# opt-in, leave the v0.17.92 discovery order intact for existing build trees.
+option(GZSTD_ZSTD_EXPLICIT "Use ZSTD_INCLUDE_DIR and ZSTD_LIBRARY before package discovery" OFF)
+if(GZSTD_ZSTD_EXPLICIT)
+  if(NOT ZSTD_INCLUDE_DIR OR NOT ZSTD_LIBRARY)
+    message(FATAL_ERROR "GZSTD_ZSTD_EXPLICIT requires both ZSTD_INCLUDE_DIR and ZSTD_LIBRARY")
+  endif()
+  add_library(ZSTD::ZSTD INTERFACE IMPORTED)
+  target_include_directories(ZSTD::ZSTD INTERFACE ${ZSTD_INCLUDE_DIR})
+  target_link_libraries(ZSTD::ZSTD INTERFACE ${ZSTD_LIBRARY})
+  message(STATUS "Zstd (explicit): ${ZSTD_LIBRARY}")
+endif()
+
 # 1) Built-in finder (provides target ZSTD::ZSTD)
-find_package(ZSTD QUIET)
+if(NOT TARGET ZSTD::ZSTD)
+  find_package(ZSTD QUIET)
+endif()
 
 # 2) pkg-config fallback (synthesizes target when found)
-if(NOT ZSTD_FOUND)
+if(NOT TARGET ZSTD::ZSTD AND NOT ZSTD_FOUND)
   find_package(PkgConfig QUIET)
   if(PKG_CONFIG_FOUND)
     pkg_check_modules(ZSTD_PKG zstd IMPORTED_TARGET)
@@ -80,9 +103,9 @@ if(NOT TARGET ZSTD::ZSTD)
 
   if(NOT ZSTD_LIBRARY)
     # When BUILD_STATIC is ON, force find_library to prefer .a over .so so
-    # we pick up libzstd.a (which Ubuntu's libzstd-dev does ship) instead of
-    # libzstd.so.  Without this, .so wins and the binary ends up dynamically
-    # linked to libzstd.
+    # we pick up libzstd.a instead of libzstd.so.  Without this, .so wins and
+    # the binary ends up dynamically linked to libzstd.  (Ubuntu's libzstd.a is
+    # single-threaded; the release build compiles its own, see above.)
     if(BUILD_STATIC)
       set(_zstd_orig_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
       set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")

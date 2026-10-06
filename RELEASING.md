@@ -49,13 +49,13 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 757 | 598 | **yes, this server** |
-| GPU, GDS unavailable | 739 | 581 | yes, the workstation |  <!-- derived: baseline - EXPECTED_NOGDS_DELTA (18 / 17); last measured 456 default at the v0.17.63 baseline of 467 -->
-| no GPU (the CPU-only build) | not observed (`-e` adds no CPU-only cells) | 435 | yes |
+| GPU + GPUDirect Storage usable (the baseline) | 758 | 599 | **yes, this server** |
+| GPU, GDS unavailable | 740 | 582 | yes, the workstation |  <!-- derived: baseline - EXPECTED_NOGDS_DELTA (18 / 17); last measured 456 default at the v0.17.63 baseline of 467 -->
+| no GPU (the CPU-only build) | not observed (`-e` adds no CPU-only cells) | 436 | yes |
 
 These are the v0.17.89 figures (the suite's own constants are the authority, and it prints the
 expectation it used). The baseline row counts what RAN,
-so it is the `EXPECTED_TESTS` constant (758 / 599) minus the one
+so it is the `EXPECTED_TESTS` constant (759 / 600) minus the one
 cell this server cannot provoke — the trivial-park cell needs a trivially-compressed batch to reach
 a GPU, and the CPU pool here drains the fixture first. Since v0.17.64 that skip goes through
 `skip_host`, which subtracts itself from the expectation, so the run says "as expected on this host"
@@ -120,6 +120,18 @@ or filesystem. The `--direct` and GPU-verify defaults take a different branch be
 that a Gen5 box never executes.
 
 Any second host helps, including a GPU-less one.
+
+## 4b. The released binary is not the one the suites test
+
+The suites run the dev builds, linked against conda's shared zstd. The release is built by
+`scripts/build-portable.sh` in an Ubuntu 20.04 container and links zstd statically. For months
+that was Ubuntu's `libzstd.a` -- zstd 1.4.4, single-threaded -- and `--sliding-window` failed
+in every release while every suite passed. Since v0.17.93 the script builds a pinned, checksummed
+zstd (`ZSTD_VERSION`/`ZSTD_SHA256`) as `libzstd.a-mt`, and both the script and the workflow fail
+unless the binary reports `[zstd <ZSTD_VERSION>, multithreaded]` and round-trips
+`--sliding-window`. Before a tag that changes the build, run the workflow by hand (Actions ->
+"Build portable release binary" -> Run workflow) and try the artifact on a real host. When
+bumping zstd in the dev environment, bump `ZSTD_VERSION` and `ZSTD_SHA256` to match.
 
 ## 5. Housekeeping
 

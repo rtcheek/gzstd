@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=599
-$EXTENSIVE && EXPECTED_TESTS=758
+EXPECTED_TESTS=600
+$EXTENSIVE && EXPECTED_TESTS=759
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -9483,6 +9483,28 @@ LTPY
 else
   skip "a pipe's trailing seek table: warned by default, checked by --verify and -t" "needs zstd and python3"
 fi
+
+# THE LINKED ZSTD (v0.17.93).  --version names it and says whether it has its own
+# worker threads -- the release binary had linked a single-threaded zstd 1.4.4
+# for months, and --sliding-window died at once in every release.  A zstd
+# without them must not kill --sliding-window either: it warns and compresses on
+# one thread.  GZSTD_DEBUG_ZSTD_SINGLE_THREAD=1 makes the threaded library look
+# like one without (the release workflow checks the real static library).
+zv_why=""
+zv_line=$("$GZSTD" --version 2>/dev/null | head -1)
+grep -qE '\[zstd [0-9]+\.[0-9]+\.[0-9]+, (multithreaded|single-threaded)\]$' <<< "$zv_line" \
+  || zv_why+=" [--version does not name the zstd library: '$zv_line']"
+zv_line=$(GZSTD_DEBUG_ZSTD_SINGLE_THREAD=1 "$GZSTD" --version 2>/dev/null | head -1)
+grep -q ', single-threaded\]$' <<< "$zv_line" || zv_why+=" [the hook did not report single-threaded: '$zv_line']"
+head -c 3000000 /dev/urandom | base64 > "$TMPDIR/zv.in"
+rc=0; GZSTD_DEBUG_ZSTD_SINGLE_THREAD=1 "$GZSTD" --sliding-window -f "$TMPDIR/zv.in" -o "$TMPDIR/zv.zst" \
+  2> "$TMPDIR/zv.err" || rc=$?
+[[ $rc -eq 0 ]] && "$GZSTD" -d -q -c "$TMPDIR/zv.zst" 2>/dev/null | cmp -s - "$TMPDIR/zv.in" \
+  || zv_why+=" [--sliding-window on a single-threaded zstd: exit $rc or a bad archive]"
+grep -q "has no multithreading" "$TMPDIR/zv.err" || zv_why+=" [no warning that it ran on one thread]"
+[[ -z "$zv_why" ]] && pass "--version names the zstd library; --sliding-window copes with one that has no threads" \
+  || fail "--version names the zstd library; --sliding-window copes with one that has no threads" "$zv_why"
+rm -f "$TMPDIR/zv.in" "$TMPDIR/zv.zst" "$TMPDIR/zv.err"
 
 section "Decompress tail-aware GPU intake (pinned rates)"
 

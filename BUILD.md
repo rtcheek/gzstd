@@ -73,13 +73,19 @@ cmake --build build -j$(nproc)
 
 Links zstd, libstdc++, libgcc, libacl, and CUDA runtime statically. The resulting binary only needs glibc at runtime; the NVIDIA driver is optional (CUDA and NVML are discovered at runtime, with CPU-only fallback when absent).
 
-**Static zstd archive required.** `BUILD_STATIC=ON` links `libzstd.a`, which the
-conda-forge `zstd` package does **not** ship — install it explicitly:
+**Static zstd archive required — and it must be MULTITHREADED.** `BUILD_STATIC=ON`
+links `libzstd.a`. zstd's own Makefile builds the static library single-threaded
+unless asked, and distributions ship it that way (Ubuntu's `libzstd-dev` does), so
+`--sliding-window` then runs on one thread. Build it from a zstd release instead and
+point CMake at it — opt in to the explicit pair so cached results from an older
+build directory do not silently override package discovery:
 ```bash
-conda install -c conda-forge zstd-static   # provides $CONDA_PREFIX/lib/libzstd.a
+make -C zstd-1.5.7/lib -j libzstd.a-mt            # static, with worker threads
+cmake -B build -DBUILD_STATIC=ON -DGZSTD_ZSTD_EXPLICIT=ON \
+      -DZSTD_INCLUDE_DIR=$PWD/zstd-1.5.7/lib -DZSTD_LIBRARY=$PWD/zstd-1.5.7/lib/libzstd.a
 ```
-(or `apt install libzstd-dev` for the system archive, though that may be a
-different zstd version than the one used at compile time). Likewise `--acls`
+`gzstd --version` names the zstd it was linked with and whether it has worker threads,
+e.g. `[zstd 1.5.7, multithreaded]`. Likewise `--acls`
 needs `libacl.a`/`libattr.a` (`apt install libacl1-dev libattr1-dev`); without
 them the binary builds but `--acls`/`--xattrs` are unavailable.
 
@@ -94,9 +100,9 @@ scripts/build-portable.sh
 ```
 
 What it does:
-1. Downloads NVIDIA's official `nvcomp-linux-x86_64-5.2.0.10_cuda12-archive.tar.xz` from `developer.download.nvidia.com` (cached at `~/.cache/gzstd-build/nvcomp/` for re-runs).
+1. Downloads NVIDIA's official `nvcomp-linux-x86_64-5.2.0.10_cuda12-archive.tar.xz` from `developer.download.nvidia.com` (cached at `~/.cache/gzstd-build/nvcomp/` for re-runs), and the pinned zstd release tarball (`ZSTD_VERSION`, checked against `ZSTD_SHA256` on every run; cached at `~/.cache/gzstd-zstd/`).
 2. Spins up a Docker container running `nvidia/cuda:12.6.0-devel-ubuntu20.04` (glibc 2.31 floor — covers Ubuntu 20.04+, Debian 11+, RHEL 8+).
-3. Builds with `BUILD_STATIC=ON`, pointing CMake at the official tarball's `lib/libnvcomp_static.a`.
+3. Builds zstd inside the container as a static, multithreaded library (`make libzstd.a-mt`), then gzstd with `BUILD_STATIC=ON`, pointing CMake at that zstd and at the official nvCOMP tarball's `lib/libnvcomp_static.a`. The build fails unless the binary reports `[zstd <ZSTD_VERSION>, multithreaded]`. (Until v0.17.93 it linked Ubuntu 20.04's `libzstd.a` — zstd 1.4.4, single-threaded — and `--sliding-window` failed in every release.)
 4. Statically links nvCOMP, the CUDA runtime, libstdc++, libgcc, and libzstd into a single executable.
 
 Output: `build-portable/gzstd`, ~60–80 MB.
