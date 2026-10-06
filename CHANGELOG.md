@@ -1,12 +1,113 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.17.93  
+**Covers:** v0.9.50 → v0.18.0  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.0 — a hung GPU no longer hangs a `--tar` extraction
+
+**The release.** The first tag since v0.17.88, and it carries v0.17.89 through v0.17.93 with it: the
+review's sixteen rulings (O_DIRECT output at an offset, `-M` enforced on decompression, the GPU
+compression stall guard), the frame throttle that woke every worker per push, single-frame archives
+through pipes and `--sliding-window` faster than zstd from files and pipes alike, the single-frame
+loose ends, and release binaries built against a multithreaded zstd 1.5.7 (every release before this
+one died on `--sliding-window`). Those entries below have the details. This one closes the decode
+pool's known stuck-batch hang.
+
+**The defect.** The `-d --tar` decode pool's GPU workers (engaged by `--adapt` on a GPU-rich host
+whose CPU decoders cannot keep the writers fed) decode a batch of frames in one call that ends in
+`cudaStreamSynchronize`. A CUDA or nvCOMP call that never returns -- a hung GPU or driver -- kept
+those frames forever: every parse thread waited for its next frame, and teardown joined the stuck
+thread. The extraction sat there with no output and no error. GPU compression has had a stall guard
+since v0.17.89 (it ends the run at 10 minutes); GPU decompression has reclaimed a stuck batch since
+v0.17.53. The pool had neither.
+
+**The fix finishes the run instead of ending it**, as decompression's reclaim does. Each GPU worker
+publishes what it is doing; a watchdog gives up on one that has sat in a single batch past its
+deadline -- 8x that device's average batch time, 6 s at least -- copies the batch's compressed frames
+back onto the decode queue, where the CPU decoders take them, and retires the device:
+
+    WARNING: [GPU0] tar decode batch wedged 6.1 s (limit 6.0 s); reclaiming 10 frame(s) for
+    the CPU decoders and retiring the device
+
+The frames are copied, never moved: the stuck call may still be reading them. If it ever returns, the
+worker finds it was given up on and parks for good without touching the run, since the rest of its
+batch would run against state that may already be gone. Teardown detaches it, the device is left out
+of any later archive in the same invocation, and the process leaves by `_Exit` so that CUDA's own
+teardown cannot block on the hung call. A worker stuck in bringup or in freeing its buffers holds no
+frames, so it blocks nothing until teardown waits for it; teardown gives up on it 6 s after that phase
+began instead of waiting forever. The run exits 0 with correct output. cuInit and device ranking,
+which run before any pool worker exists, are not watched -- as on every other GPU path.
+
+Measured on the 8-GPU server at load ~150, two cards busy with other tenants: pool batches of 1 MiB
+frames took 8-39 ms, and bringup took 1.1-1.2 s with six devices at once. Hence two choices: the 6 s
+batch floor (GPU decompression's) is ~150x real work, and bringup is never given up on mid-run, where
+a slow but healthy one still helps.
+
+- Static review found a later-input gap in device retirement: selection filtered out a device
+  abandoned by an earlier input only after its ranking pass.  The CUDA fallback for a subset, and
+  opted-in all-device ranking, can probe the abandoned device before the next input has a watchdog.
+  After a reclaim, selection takes survivors from the cached usable-device list without probing it;
+  the optional `-vv` device UUID trace also skips its all-device probe on later inputs.
+- The watchdog starts before any GPU worker, and if its thread cannot be created no GPU worker is
+  started: the CPU decoders carry the run. (Codex found that the first version started it after the
+  workers and only warned on failure, leaving workers that could hold frames forever unguarded.)
+- `-v` adds `N reclaimed from a stalled GPU` to the pool's summary line when it happens; `-vv` prints
+  each device's bringup time and each batch's.
+- **The reclaim warnings now start their own line.** Written with `fputs` in fixed buffers (no
+  allocation in a watchdog), they were appended to the progress bar; GPU decompression's two reclaim
+  messages had the same flaw and now clear the bar first, as `vlog` does.
+- **A pool GPU that fails bringup says why**: `GPU 0 unavailable (cudaSetDevice: CUDA-capable
+  device(s) is/are busy or unavailable); CPU decoders cover its share`. The line used to say only
+  "unavailable".
+- Test hooks: `GZSTD_DEBUG_POOL_GPU_STALL=init|batch|release` -- the first pool GPU worker to reach
+  that phase stalls in it until the watchdog gives up on it, then carries on as a late-returning call
+  would; `GZSTD_DEBUG_POOL_GPU_FIRST=1` -- the CPU decoders wait until a GPU worker has claimed its
+  first batch (or the GPU drops out, or 60 s pass).
+
+### Review
+
+Codex reviewed it as a TAG review, over v0.17.88..v0.18.0, at maximum effort: SAFE TO TAG, with the
+two selection fixes above and one more that was taken in a different form (the watchdog-first order).
+A second round on that repair, counting its paths -- N watches, one watchdog, then a prefix of k
+workers, teardown pairing only those k -- found no remaining blocker: SAFE TO TAG.
+
+### Tests
+
+Suites on the final code: extensive on the GPU build, 760 passed, 0 failed, 1 skipped of 761 (the
+trivial-park cell this host cannot provoke); the CPU-only build, 436 passed, 0 failed, after the cell
+change below (the first CPU-only run failed that cell; the extensive run, made before the change,
+passed it, and its new form was then run on the GPU build by hand, 5 of 5). Both builds warning-free.
+
+**One older cell was timing-dependent, and failed once.** "The memory cap switches blocks to copies"
+(v0.17.47) set the zero-copy cap to one block. The cap is checked per block against the blocks alive at
+that moment, so at 1 it binds only if a reader has run ahead of the consumer. In the CPU-only suite on
+this host at load ~100 it never did: 176 views, 0 copied, a failure (0 of 40 reruns of the same
+command, on this build and on v0.17.88). The cell now uses a cap of 0, which every block exceeds however
+the threads are scheduled: 176 copied, 5 of 5 on both builds, while a build that ignores the cap gives
+176 views and fails it.
+
+Two new GPU cells beside the pool's checksum cell, on the same 1 GiB fixture: a stuck batch is
+finished by the CPU decoders (exit 0, identical bytes, a reclaim, and `0 frame(s) GPU-decoded` on one
+device -- a worker that carried on would deliver that batch itself and count it), and a stuck bringup
+does not hold up the end of the run. Five single-change mutants, each caught: the watchdog never takes
+a batch; a given-up worker carries on; bringup is never given up on; teardown joins every worker;
+teardown decides before the watchdog's verdict.
+
+**A cell that depends on the GPU winning a race is not a test on a busy host.** On this server at load
+~150, six cards' bringup outlasted the whole CPU extraction: the GPU decoded nothing, and the pool's
+existing checksum cell had been skipping as "not exercised" -- with v0.17.88 too. The first mutant run
+here skipped the same way for the real build and every mutant. So the program opens the window itself:
+`GZSTD_DEBUG_POOL_GPU_FIRST` makes the GPU take the first batch, and both cells use it.
+
+That hook exposed one more way to lose the GPU, which the new bringup message then named: with six
+gzstd processes starting at once on the same card, `cudaSetDevice` failed with "busy or unavailable"
+in 4 of 18 runs (one at a time: 0 of 6). The pool falls back to the CPU and the output is correct; the
+cells say why they skipped. Retrying is a ROADMAP item, not part of this release.
 
 ## v0.17.93 — the release binary's zstd: 1.4.4, single-threaded, since May
 

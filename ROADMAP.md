@@ -89,8 +89,9 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    append descriptor would mean positional writes at a base another appender could also be writing to.
 2. **`--gds-only` peer-to-peer output declines a descriptor that already holds output**, so the second
    archive of `{ gzstd --gds-only -c a; gzstd --gds-only -c b; } > f` is written device-to-host.
-3. **The `--tar` GPU decode pool has no stall guard.** v0.17.89's guard covers GPU compression;
-   decompression reclaims a wedged batch; the pool's stream synchronize can still hang an extraction.
+3. ~~**The `--tar` GPU decode pool has no stall guard.**~~ CLOSED v0.18.0: a watchdog hands a stuck
+   batch back to the CPU decoders and retires the device, as GPU decompression does; the extraction
+   finishes. cuInit and device ranking are still unwatched, as on every GPU path.
 4. **`--tar` onto a `1<>` file with more than one link** is refused unless `-f` is given: the name
    the descriptor reports cannot say where the other links are.
 5. **zstd spellings still missing**: `--zstd=...`; a bare `-M` number is MiB where zstd reads bytes;
@@ -98,6 +99,31 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
 6. **After a failed run the caller's stdout position is best effort** (documented in `--help`).
 7. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
     The caller's doing; left.
+8. **Move to zstd 1.6.0 once it is tagged.** Checked 2026-10-06: 1.5.7 (February 2025) is still the
+   newest release; zstd's development branch calls itself 1.6.0, with a CHANGELOG entry dated December
+   2025, but is untagged, 419 commits ahead. Stay on 1.5.7 until the tag: an untagged commit has no
+   release tarball, published checksum or signature, and moving only the release build would reopen
+   the tested-versus-shipped gap v0.17.93 closed. Little in it helps gzstd on x86-64: zstd measured
+   its decoding change (#4771) at -0.3% to +6.4%, against a 4% code-layout noise floor, and one
+   compression stage at +1% (#4772). The rest is ARM and RISC-V, the CLI, and fixes to paths gzstd
+   never calls. When it lands:
+   - bump `ZSTD_VERSION` and `ZSTD_SHA256` in `scripts/build-portable.sh` and the dev environment's
+     zstd TOGETHER (`--version` shows which one a binary has);
+   - the one default 1.6.0 changes (pre-1.0, 2016-era formats no longer decode) does not touch
+     anything gzstd writes, and a FILE in those formats is already refused by gzstd's own magic
+     check before the library sees it. Only stdin skips that check, so a pre-1.0 frame piped in may
+     decode under 1.5.7 and not under 1.6.0; untested (no such frame to hand), and not worth a
+     `ZSTD_LEGACY_SUPPORT` build;
+   - rerun the byte-identity cells (`--train`, `-D`, `--sliding-window`) against a zstd CLI of the
+     same version, and re-measure the drop-in table above;
+   - measure decoding on entropy-coded data (base64 of random) before claiming a speedup.
+9. **Concurrent gzstd processes can lose the GPU at bringup.** MEASURED (v0.18.0, 8-GPU server, 595
+   driver, Default compute mode): six processes starting together on one card, `cudaSetDevice` failed
+   with `cudaErrorDevicesUnavailable` ("busy or unavailable") in 4 of 18 runs; one at a time, 0 of 6.
+   Every path falls back to the CPU, so output is correct, but a batch of parallel jobs
+   (`parallel gzstd ::: files`) can quietly run without the GPU it asked for. A short, bounded retry
+   on that one error, before writing the card off, is the likely fix; measure first whether the other
+   paths' bringup sees the same rate.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

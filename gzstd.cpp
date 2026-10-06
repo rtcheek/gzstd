@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.17.93";
+static constexpr const char * GZSTD_VERSION = "0.18.0";
 //
 // Architecture overview:
 //
@@ -21213,6 +21213,16 @@ static Containment fd_containment(int start_fd,
 // throw-on-error CUDA/nvCOMP checks.
 static void checkCuda(cudaError_t st, const char * msg);
 static void checkNvcomp(nvcompStatus_t st, const char * msg);
+// Bitmask: a device whose stuck batch was reclaimed, and whose worker was given up
+// on and left parked inside CUDA -- by GPU decompression (GzDecompInflight) or by
+// the --tar decode pool's watchdog.  Read by decompress_nvcomp (detach instead of
+// join), by device selection (later files and archives in the same invocation
+// must not touch it) and by main (fast exit).
+static std::atomic<uint64_t> g_decomp_abandoned{0};
+// The same for ANY device, including one past the 64 the mask can name: some
+// thread is parked inside CUDA, so main must leave by _Exit rather than run
+// CUDA's teardown, which the stuck call can block.
+static std::atomic<bool> g_gpu_thread_parked{false};
 #endif
 
 #ifdef HAVE_NVCOMP
@@ -24051,27 +24061,33 @@ struct PoolGpuDecoder {
   // still drain the queue).
   bool init(int dev, size_t batch, size_t sc, size_t sd) {
     device_id = dev; stride_comp = std::max<size_t>(1, sc); stride_decomp = std::max<size_t>(1, sd);
-    if (cudaSetDevice(dev) != cudaSuccess) return false;
-    if (cudaStreamCreate(&stream) != cudaSuccess) return false;
+    // Each failure names its call, for the caller's "unavailable" line.
+    auto ok = [&](cudaError_t st, const char * what) {
+      if (st == cudaSuccess) return true;
+      last_error = std::string(what) + ": " + cudaGetErrorString(st);
+      return false;
+    };
+    if (!ok(cudaSetDevice(dev), "cudaSetDevice")) return false;
+    if (!ok(cudaStreamCreate(&stream), "cudaStreamCreate")) return false;
     size_t b = std::max<size_t>(1, batch);
     for (; b >= 1; b /= 2) {
       size_t free_b = 0, total_b = 0;
-      if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+      if (!ok(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo")) return false;
       size_t est = b * stride_comp + b * stride_decomp
                  + b * (sizeof(void*) * 2 + sizeof(size_t) * 3 + sizeof(nvcompStatus_t))
                  + (size_t)256 * ONE_MIB;   // nvCOMP temp headroom (queried per batch)
       if ((double)est <= (double)free_b * 0.85) break;
-      if (b == 1) return false;             // can't fit even one frame
+      if (b == 1) { last_error = "not enough free VRAM for one frame"; return false; }
     }
     cap_batch = b;
-    if (cudaMalloc(&d_comp,        cap_batch * stride_comp)   != cudaSuccess) return false;
-    if (cudaMalloc(&d_decomp,      cap_batch * stride_decomp) != cudaSuccess) return false;
-    if (cudaMalloc(&d_comp_ptrs,   cap_batch * sizeof(void*))  != cudaSuccess) return false;
-    if (cudaMalloc(&d_decomp_ptrs, cap_batch * sizeof(void*))  != cudaSuccess) return false;
-    if (cudaMalloc(&d_comp_sizes,   cap_batch * sizeof(size_t)) != cudaSuccess) return false;
-    if (cudaMalloc(&d_decomp_sizes, cap_batch * sizeof(size_t)) != cudaSuccess) return false;
-    if (cudaMalloc(&d_actual,       cap_batch * sizeof(size_t)) != cudaSuccess) return false;
-    if (cudaMalloc(&d_stats, cap_batch * sizeof(nvcompStatus_t)) != cudaSuccess) return false;
+    if (!ok(cudaMalloc(&d_comp,        cap_batch * stride_comp),   "cudaMalloc(input)")) return false;
+    if (!ok(cudaMalloc(&d_decomp,      cap_batch * stride_decomp), "cudaMalloc(output)")) return false;
+    if (!ok(cudaMalloc(&d_comp_ptrs,   cap_batch * sizeof(void*)),  "cudaMalloc")) return false;
+    if (!ok(cudaMalloc(&d_decomp_ptrs, cap_batch * sizeof(void*)),  "cudaMalloc")) return false;
+    if (!ok(cudaMalloc(&d_comp_sizes,   cap_batch * sizeof(size_t)), "cudaMalloc")) return false;
+    if (!ok(cudaMalloc(&d_decomp_sizes, cap_batch * sizeof(size_t)), "cudaMalloc")) return false;
+    if (!ok(cudaMalloc(&d_actual,       cap_batch * sizeof(size_t)), "cudaMalloc")) return false;
+    if (!ok(cudaMalloc(&d_stats, cap_batch * sizeof(nvcompStatus_t)), "cudaMalloc")) return false;
     // The slot pointer arrays are fixed for the buffer's lifetime, so upload
     // them once here rather than every batch.
     std::vector<void*> hcp(cap_batch), hdp(cap_batch);
@@ -24079,8 +24095,8 @@ struct PoolGpuDecoder {
       hcp[i] = (char*)d_comp   + i * stride_comp;
       hdp[i] = (char*)d_decomp + i * stride_decomp;
     }
-    if (cudaMemcpy(d_comp_ptrs,   hcp.data(), cap_batch * sizeof(void*), cudaMemcpyHostToDevice) != cudaSuccess) return false;
-    if (cudaMemcpy(d_decomp_ptrs, hdp.data(), cap_batch * sizeof(void*), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    if (!ok(cudaMemcpy(d_comp_ptrs,   hcp.data(), cap_batch * sizeof(void*), cudaMemcpyHostToDevice), "cudaMemcpy")) return false;
+    if (!ok(cudaMemcpy(d_decomp_ptrs, hdp.data(), cap_batch * sizeof(void*), cudaMemcpyHostToDevice), "cudaMemcpy")) return false;
     h_comp_sizes.resize(cap_batch); h_decomp_sizes.resize(cap_batch);
     h_actual.resize(cap_batch);     h_stats.resize(cap_batch);
     return true;
@@ -24194,7 +24210,10 @@ struct PoolGpuDecoder {
     }
   }
 
-  ~PoolGpuDecoder() {
+  // Free the device buffers and the stream.  Its own call, not only the
+  // destructor's, so the pool can run it inside a watched phase: freeing on a
+  // hung device can block like any other call.
+  void release() {
     if (device_id >= 0) cudaSetDevice(device_id);
     if (d_comp)        cudaFree(d_comp);
     if (d_decomp)      cudaFree(d_decomp);
@@ -24206,7 +24225,14 @@ struct PoolGpuDecoder {
     if (d_actual)      cudaFree(d_actual);
     if (d_stats)       cudaFree(d_stats);
     if (stream)        cudaStreamDestroy(stream);
+    d_comp = d_decomp = d_temp = nullptr;
+    d_comp_ptrs = d_decomp_ptrs = nullptr;
+    d_comp_sizes = d_decomp_sizes = d_actual = nullptr;
+    d_stats = nullptr;
+    stream = cudaStream_t{};
+    device_id = -1;
   }
+  ~PoolGpuDecoder() { release(); }
 
   PoolGpuDecoder() = default;
   PoolGpuDecoder(const PoolGpuDecoder &) = delete;
@@ -24758,9 +24784,20 @@ public:
         ddcv.notify_one();
       }
     };
+    // GZSTD_DEBUG_POOL_GPU_FIRST=1 (test-only, with GZSTD_POOL_GPU): the CPU
+    // decoders wait until a GPU worker has claimed its first batch, so a cell
+    // about the GPU's batches does not hang on GPU bringup beating the CPU
+    // decoders -- on a busy host it often lost, and the cells skipped as not
+    // exercised.  Opened by that claim, by every way the GPU can drop out (no
+    // device, a failed bringup, a worker given up on), and after 60 s regardless.
+    std::mutex gf_mx; std::condition_variable gf_cv; bool gf_open = true;
     // One decoder: pop a read frame, decompress it (the verified seek path),
     // deposit it in its partition's reorder buffer.
     auto decoder_loop = [&](std::atomic<bool> * retire) {
+      {
+        std::unique_lock<std::mutex> lk(gf_mx);
+        gf_cv.wait_for(lk, std::chrono::seconds(60), [&] { return gf_open; });
+      }
       ZSTD_DCtx * dctx = ZSTD_createDCtx();
       if (!dctx) die("failed to create ZSTD_DCtx");
       apply_decode_options(dctx, dopt);
@@ -24871,16 +24908,84 @@ public:
 #ifdef HAVE_NVCOMP
     const bool gpu_force = gpu_capable && std::getenv("GZSTD_POOL_GPU") != nullptr;
     const bool gpu_lazy  = gpu_capable && dopt.adapt && !gpu_force;
+    if (gpu_force && std::getenv("GZSTD_DEBUG_POOL_GPU_FIRST")) gf_open = false;   // no thread yet
+    auto gf_release = [&] {
+      { std::lock_guard<std::mutex> lk(gf_mx); gf_open = true; }
+      gf_cv.notify_all();
+    };
     // Target GPU batch, capped by the host-RAM ceiling (no point buffering more
     // frames than could ever be in flight).
     const size_t gpu_batch = std::min<size_t>(ram_cap_frames, 64);
     std::once_flag gpu_spawn_once;
+    // THE STALL GUARD (v0.18.0).  A CUDA or nvCOMP call that never returns used to
+    // hang the whole extraction: the batch's frames never reached their partitions,
+    // so every parse thread waited in take_pool forever, and teardown joined the
+    // stuck thread.  The fix mirrors GPU decompression's (GzDecompInflight): the
+    // run is not ENDED but FINISHED.  Each GPU worker publishes what it is doing; a
+    // watchdog gives up on a worker that has sat in one batch past its deadline,
+    // COPIES the batch's compressed frames back onto the decode queue for the CPU
+    // decoders (at least one is always running while frames are outstanding), and
+    // retires the device.  The stuck call may still be reading those buffers, so
+    // they are copied, never moved.  Should the call ever return, the worker sees
+    // that it was given up on and PARKS for good without touching the run:
+    // returning would run the rest of its batch against state that may be gone.
+    // Teardown detaches it and main leaves by _Exit (g_gpu_thread_parked).
+    //
+    // A batch's deadline is that of GPU decompression's reclaim: 8x the device's
+    // EMA of healthy batch times, 6 s at least.  MEASURED here (H100s, a box at
+    // load ~150 with two cards busy with other tenants): pool batches of 1 MiB
+    // frames took 8-39 ms.  Bringup and the final release of a device's buffers
+    // hold no frames, so a worker stuck in either blocks nothing until teardown
+    // waits for it; only then is it given up on, 6 s after the phase began.
+    // MEASURED: bringup took 1.1-1.2 s on six devices at once, so a slow but
+    // healthy bringup still helps the run instead of being written off mid-way.
+    // cuInit and device ranking (gz_cuda_usable_count, select_best_gpus) run
+    // before any worker exists and are NOT watched, as on every other GPU path.
+    //
+    // Giving up on a healthy-but-slow worker costs that device for the rest of the
+    // run, never correctness: its frames are decoded by the CPU like any other.
+    struct GpuWatch {
+      enum Phase { Idle, Init, Batch, Release, Done };
+      std::mutex m;
+      std::condition_variable cv;      // Done / abandoned, for teardown and the test hook
+      Phase phase = Idle;
+      uint64_t since = 0;              // when the current watched phase began
+      uint64_t ema = 0;                // EMA of healthy batch durations (ns)
+      std::vector<RItem> * batch = nullptr;   // the claimed frames while phase == Batch
+      int dev = -1;
+      bool abandoned = false;          // one-way, set by the watchdog
+      // Never returns.  Touches nothing but this object, which the parked
+      // worker's own shared_ptr keeps alive after the run is gone.
+      [[noreturn]] void park() {
+        std::unique_lock<std::mutex> lk(m);
+        for (;;) cv.wait(lk);
+      }
+    };
+    std::vector<std::shared_ptr<GpuWatch>> gpu_watch;   // paired with gpu_dworkers
+    std::atomic<uint64_t> gpu_recl_frames{0};           // frames taken from a stuck GPU
+    std::thread gpu_watch_thr;
+    std::mutex gw_mx; std::condition_variable gw_cv; bool gw_stop = false;
+    std::atomic<bool> gw_teardown{false};   // teardown is waiting on the GPU workers
     auto spawn_gpu_workers = [&] {
       std::call_once(gpu_spawn_once, [&] {
         const int dc = gz_cuda_usable_count(dopt, "tar decode pool");
         const int ndev = dopt.gpu_devices > 0 ? std::min(dopt.gpu_devices, dc) : dc;
         if (ndev < 1) {   // no usable GPU (absent, or CUDA_VISIBLE_DEVICES-masked)
           vlog(V_VERBOSE, dopt, "[TAR] decode pool: no GPU available; CPU decoders only\n");
+          gf_release();
+          return;
+        }
+        std::vector<int> pool_ids = select_best_gpus(dc, ndev, dopt);
+        // A device an earlier reclaim gave up on (an earlier input in this
+        // invocation) still has a thread parked inside CUDA on it.
+        if (const uint64_t gone = g_decomp_abandoned.load(std::memory_order_relaxed))
+          pool_ids.erase(std::remove_if(pool_ids.begin(), pool_ids.end(),
+                           [gone](int d) { return d >= 0 && d < ADAPT_DL_MAX
+                                               && (gone & (1ull << d)); }),
+                         pool_ids.end());
+        if (pool_ids.empty()) {
+          vlog(V_VERBOSE, dopt, "[TAR] decode pool: every GPU was retired earlier in this run; CPU decoders only\n");
+          gf_release();
           return;
         }
         // VRAM dimension of the frame budget: the CPU-sized budget (2*n_dec_max)
@@ -24888,89 +24993,267 @@ public:
         // ndev*gpu_batch frames in flight -- still capped by the 4 GiB host
         // ceiling so RAM stays bounded.
         const size_t target = std::min(ram_cap_frames,
-            (size_t)2 * (size_t)n_dec_max + (size_t)ndev * gpu_batch);
+            (size_t)2 * (size_t)n_dec_max + pool_ids.size() * gpu_batch);
         if (target > budget_frames) budget.grow(target - budget_frames);
         if (dopt.verbosity >= V_VERBOSE) {
           char b[192];
           std::snprintf(b, sizeof b,
-            "[TAR] decode pool: GPU decode on %d device(s), batch up to %zu frame(s), budget -> %zu\n",
-            ndev, gpu_batch, target);
+            "[TAR] decode pool: GPU decode on %zu device(s), batch up to %zu frame(s), budget -> %zu\n",
+            pool_ids.size(), gpu_batch, target);
           vlog(V_VERBOSE, dopt, b);
         }
-        gpu_dworkers.reserve(gpu_dworkers.size() + (size_t)ndev);
-        const std::vector<int> pool_ids = select_best_gpus(dc, ndev, dopt);
+        gpu_dworkers.reserve(gpu_dworkers.size() + pool_ids.size());
+        gpu_watch.reserve(gpu_watch.size() + pool_ids.size());
         for (int d : pool_ids) {
-          gpu_dworkers.emplace_back([&, dev = d] {
-            PoolGpuDecoder gd;
-            if (!gd.init(dev, gpu_batch, g_csz, g_usz)) {
-              vlog(V_VERBOSE, dopt, "[TAR] decode pool: GPU " + std::to_string(dev)
-                   + " unavailable; CPU decoders cover its share\n");
-              return;
-            }
-            gpu_dev_up.fetch_add(1, std::memory_order_relaxed);
-            // Per-worker CPU rescue context, used only when nvCOMP fails a frame
-            // or a claimed frame is too large for the GPU (> GPU_SUBCHUNK_MAX).
-            ZSTD_DCtx * rescue_dctx = ZSTD_createDCtx();
-            if (!rescue_dctx) die("failed to create ZSTD_DCtx");
-            apply_decode_options(rescue_dctx, dopt);
-            std::vector<RItem> claimed;        // pre-read buffers from the decode queue
-            std::vector<const char *> comps;   // eligible frames' host buffers
-            std::vector<size_t> cszs, uszs;
-            std::vector<size_t> pos;           // claimed[j] -> index in comps, or npos
-            std::vector<FrameBuf> out;
-            std::vector<char> resc;
-            const size_t npos = (size_t)-1;
-            bool retire = false;
+          gpu_watch.push_back(std::make_shared<GpuWatch>());
+          gpu_watch.back()->dev = d;
+        }
+        // The watchdog (see GpuWatch), started BEFORE any worker: a worker it does
+        // not guard could hold frames forever.  If it cannot start, no GPU worker
+        // is started either and the CPU decoders carry the run.  The list it scans
+        // is complete before it starts and never changes under it.  Its messages
+        // are built in fixed buffers: an allocation exception escaping a
+        // std::thread entry would call terminate.
+        try {
+          gpu_watch_thr = std::thread([&] {
+            const auto tick = std::chrono::milliseconds(250);
+            const uint64_t missed_ns = 3 * 250000000ull;
+            const uint64_t floor_ns = 6000000000ull;
+            uint64_t last = now_ns();
             for (;;) {
-              claimed.clear();
               {
-                std::unique_lock<std::mutex> lk(ddmx);
-                ddcv.wait(lk, [&] { return !ddq.empty() || ddqdone; });
-                if (ddq.empty()) break;                       // ddqdone, nothing left
-                const size_t take = std::min(ddq.size(), gd.cap_batch);
-                for (size_t i = 0; i < take; ++i) { claimed.push_back(std::move(ddq.front())); ddq.pop_front(); }
+                std::unique_lock<std::mutex> lk(gw_mx);
+                if (gw_cv.wait_for(lk, tick, [&] { return gw_stop; })) return;
               }
-              comps.clear(); cszs.clear(); uszs.clear();
-              pos.assign(claimed.size(), npos);
-              for (size_t j = 0; j < claimed.size(); ++j) {
-                const size_t k = claimed[j].k;
-                const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
-                if (usz > 0 && usz <= GPU_SUBCHUNK_MAX) {
-                  pos[j] = comps.size();
-                  comps.push_back(claimed[j].comp.data());
-                  cszs.push_back(claimed[j].comp.size());
-                  uszs.push_back(usz);
-                }
-              }
-              if (!gd.decode(comps, cszs, uszs, out, resc))
-                retire = true;   // stream fault: finish this batch on CPU, then stop
-              for (size_t j = 0; j < claimed.size(); ++j) {
-                const size_t k = claimed[j].k;
-                FrameBuf fb;
-                if (pos[j] != npos && !resc[pos[j]] && out[pos[j]]) {
-                  fb = std::move(out[pos[j]]);
-                  gpu_dec_frames.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                  // Ineligible (huge) or nvCOMP-failed frame: decompress the
-                  // ALREADY-READ buffer on CPU (authoritative -- succeeds on a
-                  // transient glitch, dies clean on real corruption).  No re-pread;
-                  // the reader already did (and counted) the I/O.
-                  const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
-                  fb = decompress_seek_frame(claimed[j].comp.data(), claimed[j].comp.size(),
-                                             usz, k, rescue_dctx);
-                  if (pos[j] != npos)
-                    gpu_resc_frames.fetch_add(1, std::memory_order_relaxed);
-                }
+              const uint64_t now = now_ns();
+              // SIGSTOP, a debugger, or a starved scheduler can stop this thread
+              // along with the worker.  Nothing was observed during that gap, so
+              // it cannot show a call was stuck throughout it: restart the clocks.
+              const bool gap = now - last > missed_ns;
+              last = now;
+              for (const auto & wp : gpu_watch) {
+                GpuWatch & w = *wp;
+                std::vector<RItem> rescued;
+                GpuWatch::Phase ph;
+                uint64_t age = 0, lim = 0;
+                bool alloc_failed = false;
                 {
-                  std::lock_guard<std::mutex> lk(psync[claimed[j].pi].mx);
-                  psync[claimed[j].pi].ready.emplace(k, std::move(fb));
+                  std::lock_guard<std::mutex> lk(w.m);
+                  if (w.abandoned || w.phase == GpuWatch::Idle || w.phase == GpuWatch::Done) continue;
+                  if (gap) { w.since = now; continue; }
+                  ph  = w.phase;
+                  if (ph != GpuWatch::Batch && !gw_teardown.load(std::memory_order_relaxed)) continue;
+                  age = now - w.since;
+                  lim = ph == GpuWatch::Batch ? std::max<uint64_t>(8 * w.ema, floor_ns) : floor_ns;
+                  if (age <= lim) continue;
+                  if (ph == GpuWatch::Batch && w.batch) {
+                    try {
+                      rescued.reserve(w.batch->size());
+                      for (const RItem & r : *w.batch) rescued.push_back(RItem{ r.pi, r.k, r.comp });
+                    } catch (const std::bad_alloc &) { alloc_failed = true; }
+                  }
+                  if (!alloc_failed) w.abandoned = true;
                 }
-                psync[claimed[j].pi].cv.notify_one();
+                if (alloc_failed)
+                  die("a --tar GPU decode batch wedged, and there was not enough host "
+                      "memory to copy its frames for the CPU decoders", EXIT_GPU_FAIL);
+                w.cv.notify_all();
+                gf_release();
+                if (w.dev >= 0 && w.dev < ADAPT_DL_MAX)
+                  g_decomp_abandoned.fetch_or(1ull << w.dev, std::memory_order_relaxed);
+                g_gpu_thread_parked.store(true, std::memory_order_relaxed);
+                char l[256];
+                if (ph == GpuWatch::Batch)
+                  std::snprintf(l, sizeof l,
+                    "WARNING: [GPU%d] tar decode batch wedged %.1f s (limit %.1f s); "
+                    "reclaiming %zu frame(s) for the CPU decoders and retiring the device\n",
+                    w.dev, age / 1e9, lim / 1e9, rescued.size());
+                else
+                  std::snprintf(l, sizeof l,
+                    "WARNING: [GPU%d] tar decode pool: %s stuck %.1f s (limit %.1f s); "
+                    "leaving the device behind\n",
+                    w.dev, ph == GpuWatch::Init ? "device bringup" : "freeing its buffers",
+                    age / 1e9, lim / 1e9);
+                if (dopt.verbosity >= V_ERROR) {
+                  if (g_progress_active.load(std::memory_order_relaxed))
+                    std::fputs("\r\033[K", stderr);   // off the progress line, as vlog does
+                  std::fputs(l, stderr);
+                }
+                if (!rescued.empty()) {
+                  gpu_recl_frames.fetch_add(rescued.size(), std::memory_order_relaxed);
+                  try {
+                    std::lock_guard<std::mutex> lk(ddmx);
+                    // To the FRONT: their partitions are already waiting for them.
+                    for (auto it = rescued.rbegin(); it != rescued.rend(); ++it)
+                      ddq.push_front(std::move(*it));
+                  } catch (const std::bad_alloc &) {
+                    die("a --tar GPU decode batch was reclaimed, but there was not enough "
+                        "host memory to queue its frames for the CPU decoders", EXIT_GPU_FAIL);
+                  }
+                  ddcv.notify_all();
+                }
               }
-              if (retire) break;
             }
-            ZSTD_freeDCtx(rescue_dctx);
           });
+        } catch (const std::system_error & e) {
+          if (dopt.verbosity >= V_NORMAL)
+            std::fprintf(stderr, "gzstd: warning: could not start the --tar GPU stall "
+                         "watchdog (%s); decoding on the CPU only\n", e.what());
+          gpu_watch.clear();
+          gf_release();
+          return;
+        }
+        for (size_t wi = 0; wi < gpu_watch.size(); ++wi) {
+          const std::shared_ptr<GpuWatch> w = gpu_watch[wi];
+          const int d = w->dev;
+          // Paired with gpu_watch by index; a watch whose thread never started
+          // stays Idle, which the watchdog ignores and teardown never reaches.
+          try {
+            gpu_dworkers.emplace_back([&, dev = d, w] {
+              auto enter = [&](GpuWatch::Phase ph, std::vector<RItem> * b) {
+                std::lock_guard<std::mutex> lk(w->m);
+                w->phase = ph; w->batch = b; w->since = now_ns();
+              };
+              // Leave a watched phase.  False: the watchdog gave up on this worker
+              // meanwhile, and the caller must park without touching the run.
+              auto leave = [&](GpuWatch::Phase next, uint64_t batch_ns) -> bool {
+                {
+                  std::lock_guard<std::mutex> lk(w->m);
+                  if (w->abandoned) return false;
+                  w->phase = next; w->batch = nullptr;
+                  if (batch_ns) w->ema = w->ema ? (3 * w->ema + batch_ns) / 4 : batch_ns;
+                }
+                if (next == GpuWatch::Done) w->cv.notify_all();
+                return true;
+              };
+              // GZSTD_DEBUG_POOL_GPU_STALL=init|batch|release: the first worker to
+              // reach that phase stalls in it, as a call into a hung driver would,
+              // until the watchdog has given up on it (60 s at most), and then
+              // carries on as that call returning late would.  Test-only.
+              auto stall_hook = [&](const char * ph) {
+                static const char * const want = ::getenv("GZSTD_DEBUG_POOL_GPU_STALL");
+                static std::atomic<bool> fired{false};
+                if (!want || std::strcmp(want, ph) != 0 || fired.exchange(true)) return;
+                if (std::strcmp(ph, "batch") != 0) gf_release();   // holds no frames: let the CPU run
+                vlog(V_VERBOSE, dopt, "[STALL] tar decode pool GPU " + std::to_string(dev)
+                     + ": stalling in " + ph + " until the watchdog gives up on it\n");
+                std::unique_lock<std::mutex> lk(w->m);
+                w->cv.wait_for(lk, std::chrono::seconds(60), [&] { return w->abandoned; });
+              };
+              std::unique_ptr<PoolGpuDecoder> gd(new PoolGpuDecoder);
+              // Free the device's buffers inside a watched phase, then report done.
+              auto finish = [&] {
+                enter(GpuWatch::Release, nullptr);
+                stall_hook("release");
+                gd.reset();
+                if (!leave(GpuWatch::Done, 0)) w->park();
+              };
+              enter(GpuWatch::Init, nullptr);
+              stall_hook("init");
+              const uint64_t init_t0 = now_ns();
+              const bool up = gd->init(dev, gpu_batch, g_csz, g_usz);
+              if (!leave(GpuWatch::Idle, 0)) w->park();
+              if (!up) {
+                vlog(V_VERBOSE, dopt, "[TAR] decode pool: GPU " + std::to_string(dev)
+                     + " unavailable (" + (gd->last_error.empty() ? std::string("bringup failed") : gd->last_error)
+                     + "); CPU decoders cover its share\n");
+                gf_release();
+                finish();
+                return;
+              }
+              if (dopt.verbosity >= V_DEBUG) {
+                char b[128];
+                std::snprintf(b, sizeof b, "[TAR] decode pool: GPU %d up in %.0f ms\n",
+                              dev, double(now_ns() - init_t0) / 1e6);
+                vlog(V_DEBUG, dopt, b);
+              }
+              gpu_dev_up.fetch_add(1, std::memory_order_relaxed);
+              // Per-worker CPU rescue context, used only when nvCOMP fails a frame
+              // or a claimed frame is too large for the GPU (> GPU_SUBCHUNK_MAX).
+              ZSTD_DCtx * rescue_dctx = ZSTD_createDCtx();
+              if (!rescue_dctx) die("failed to create ZSTD_DCtx");
+              apply_decode_options(rescue_dctx, dopt);
+              std::vector<RItem> claimed;        // pre-read buffers from the decode queue
+              std::vector<const char *> comps;   // eligible frames' host buffers
+              std::vector<size_t> cszs, uszs;
+              std::vector<size_t> pos;           // claimed[j] -> index in comps, or npos
+              std::vector<FrameBuf> out;
+              std::vector<char> resc;
+              const size_t npos = (size_t)-1;
+              bool retire = false, claimed_any = false;
+              for (;;) {
+                claimed.clear();
+                {
+                  std::unique_lock<std::mutex> lk(ddmx);
+                  ddcv.wait(lk, [&] { return !ddq.empty() || ddqdone; });
+                  if (ddq.empty()) break;                       // ddqdone, nothing left
+                  const size_t take = std::min(ddq.size(), gd->cap_batch);
+                  for (size_t i = 0; i < take; ++i) { claimed.push_back(std::move(ddq.front())); ddq.pop_front(); }
+                }
+                if (!claimed_any) { claimed_any = true; gf_release(); }
+                comps.clear(); cszs.clear(); uszs.clear();
+                pos.assign(claimed.size(), npos);
+                for (size_t j = 0; j < claimed.size(); ++j) {
+                  const size_t k = claimed[j].k;
+                  const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
+                  if (usz > 0 && usz <= GPU_SUBCHUNK_MAX) {
+                    pos[j] = comps.size();
+                    comps.push_back(claimed[j].comp.data());
+                    cszs.push_back(claimed[j].comp.size());
+                    uszs.push_back(usz);
+                  }
+                }
+                // Published from here until the batch is delivered or handed back:
+                // every claimed frame, the CPU-routed ones included, is outstanding.
+                enter(GpuWatch::Batch, &claimed);
+                stall_hook("batch");
+                const uint64_t b_t0 = now_ns();
+                const bool ok = gd->decode(comps, cszs, uszs, out, resc);
+                const uint64_t b_ns = now_ns() - b_t0;
+                if (!leave(GpuWatch::Idle, ok ? std::max<uint64_t>(1, b_ns) : 0)) w->park();
+                if (!ok)
+                  retire = true;   // stream fault: finish this batch on CPU, then stop
+                else if (dopt.verbosity >= V_DEBUG) {
+                  char b[160];
+                  std::snprintf(b, sizeof b, "[TAR] decode pool: GPU %d batch of %zu frame(s) in %.1f ms\n",
+                                dev, comps.size(), double(b_ns) / 1e6);
+                  vlog(V_DEBUG, dopt, b);
+                }
+                for (size_t j = 0; j < claimed.size(); ++j) {
+                  const size_t k = claimed[j].k;
+                  FrameBuf fb;
+                  if (pos[j] != npos && !resc[pos[j]] && out[pos[j]]) {
+                    fb = std::move(out[pos[j]]);
+                    gpu_dec_frames.fetch_add(1, std::memory_order_relaxed);
+                  } else {
+                    // Ineligible (huge) or nvCOMP-failed frame: decompress the
+                    // ALREADY-READ buffer on CPU (authoritative -- succeeds on a
+                    // transient glitch, dies clean on real corruption).  No re-pread;
+                    // the reader already did (and counted) the I/O.
+                    const size_t usz = (size_t)(u_off[k + 1] - u_off[k]);
+                    fb = decompress_seek_frame(claimed[j].comp.data(), claimed[j].comp.size(),
+                                               usz, k, rescue_dctx);
+                    if (pos[j] != npos)
+                      gpu_resc_frames.fetch_add(1, std::memory_order_relaxed);
+                  }
+                  {
+                    std::lock_guard<std::mutex> lk(psync[claimed[j].pi].mx);
+                    psync[claimed[j].pi].ready.emplace(k, std::move(fb));
+                  }
+                  psync[claimed[j].pi].cv.notify_one();
+                }
+                if (retire) break;
+              }
+              ZSTD_freeDCtx(rescue_dctx);
+              finish();
+            });
+          } catch (const std::system_error & e) {
+            if (dopt.verbosity >= V_NORMAL)
+              std::fprintf(stderr, "gzstd: warning: could not start a --tar GPU decode "
+                           "worker (%s); the CPU decoders cover its share\n", e.what());
+            gf_release();
+            break;
+          }
         }
       });
     };
@@ -25219,7 +25502,28 @@ public:
       { std::lock_guard<std::mutex> lk(ddmx); ddqdone = true; }
       ddcv.notify_all();
       for (auto & t : dworkers) t.join();
-      for (auto & t : gpu_dworkers) t.join();
+#ifdef HAVE_NVCOMP
+      // A GPU worker either finishes or is given up on by the watchdog (see
+      // GpuWatch); one it gave up on may never return, so it is detached, never
+      // joined.  Wait for the verdict first: deciding join-or-detach before the
+      // watchdog has spoken would join a stuck worker.
+      gw_teardown.store(true, std::memory_order_relaxed);
+      for (size_t i = 0; i < gpu_dworkers.size(); ++i) {
+        GpuWatch & w = *gpu_watch[i];
+        bool gone;
+        {
+          std::unique_lock<std::mutex> lk(w.m);
+          w.cv.wait(lk, [&] { return w.phase == GpuWatch::Done || w.abandoned; });
+          gone = w.abandoned;
+        }
+        if (gone) gpu_dworkers[i].detach(); else gpu_dworkers[i].join();
+      }
+      if (gpu_watch_thr.joinable()) {
+        { std::lock_guard<std::mutex> lk(gw_mx); gw_stop = true; }
+        gw_cv.notify_all();
+        gpu_watch_thr.join();
+      }
+#endif
       if (!force_pool && dopt.verbosity >= V_VERBOSE) {
         // Report the SETTLED (still-active, non-retired) pool -- start-high means
         // the peak is always n_dec_max, so the contracted size is the useful one.
@@ -25235,11 +25539,16 @@ public:
       if (dopt.verbosity >= V_VERBOSE && gpu_dev_up.load(std::memory_order_relaxed) > 0) {
         char b[176];
         std::snprintf(b, sizeof b,
-          "[TAR] decode pool: %d GPU stream(s), %llu frame(s) GPU-decoded, %llu rescued to CPU\n",
+          "[TAR] decode pool: %d GPU stream(s), %llu frame(s) GPU-decoded, %llu rescued to CPU",
           gpu_dev_up.load(std::memory_order_relaxed),
           (unsigned long long)gpu_dec_frames.load(std::memory_order_relaxed),
           (unsigned long long)gpu_resc_frames.load(std::memory_order_relaxed));
-        vlog(V_VERBOSE, dopt, b);
+        std::string l = b;
+#ifdef HAVE_NVCOMP
+        if (const uint64_t r = gpu_recl_frames.load(std::memory_order_relaxed))
+          l += ", " + std::to_string(r) + " reclaimed from a stalled GPU";
+#endif
+        vlog(V_VERBOSE, dopt, l + "\n");
       }
     }
 
@@ -33017,6 +33326,25 @@ static std::vector<int> select_best_gpus(int total_devices, int want,
   // floor raw(k) == k, as before.
   const std::vector<int> & usable = gz_floor_postcuda().ids;
   total_devices = std::min(total_devices, (int)usable.size());
+  // A reclaimed decompressor or --tar pool worker can still be stuck inside
+  // CUDA on its device.  The callers used to filter that device only AFTER
+  // this function ranked it.  A partial-device CUDA fallback calls
+  // cudaSetDevice/cudaMemGetInfo on every candidate; opted-in all-device
+  // ranking calls cudaGetDeviceProperties.  Either can probe the abandoned
+  // device and hang the next input before its watchdog exists.  Use the
+  // already cached CUDA order and touch no device while choosing survivors.
+  if (const uint64_t gone = g_decomp_abandoned.load(std::memory_order_relaxed)) {
+    if (want <= 0) return {};
+    std::vector<int> survivors;
+    survivors.reserve((size_t)total_devices);
+    for (int k = 0; k < total_devices; ++k) {
+      const int d = usable[(size_t)k];
+      if (d >= 0 && d < ADAPT_DL_MAX && (gone & (1ull << d))) continue;
+      survivors.push_back(d);
+      if ((int)survivors.size() >= want) break;
+    }
+    return survivors;
+  }
   auto raw = [&usable](int k) { return usable[(size_t)k]; };
 
   want = std::min(want, total_devices);
@@ -35027,10 +35355,8 @@ struct GzDecompInflight {
 static GzDecompInflight * const g_decomp_inflight = new GzDecompInflight[ADAPT_DL_MAX];
 // Bitmask: no new intake (deadline passed, batch still in flight).
 static std::atomic<uint64_t> g_decomp_demoted{0};
-// Bitmask: the device's batch was reclaimed and its worker abandoned.  Read by
-// decompress_nvcomp (detach instead of join), by select_best_gpus (later files
-// in the same invocation must not touch it) and by main (fast exit).
-static std::atomic<uint64_t> g_decomp_abandoned{0};
+// g_decomp_abandoned (the devices retired by a reclaim) is defined with the --tar
+// decode pool's GPU decoder, which retires devices the same way (v0.18.0).
 // Raised whenever a GPU decompress worker accounts for its exit -- by the worker
 // itself, or by the reclaimer on behalf of one it abandoned.  Teardown waits on
 // this instead of joining blindly: a wedged worker never returns, and the join
@@ -39227,7 +39553,11 @@ gds_out_declined:
       }
       // Deferred device detection (the ~2s cuInit, off the critical path).
       const int dc = gz_cuda_usable_count(opt, "decompress bringup thread");
-      if (g_gpu_mask.env && opt.verbosity >= V_DEBUG && !gz_floor_precuda().all_old)
+      // A prior input may have left a worker stuck on one card.  The optional
+      // UUID trace queries every card, including that one, before selection
+      // can skip it; omit the trace after any reclaim.
+      if (g_gpu_mask.env && opt.verbosity >= V_DEBUG && !gz_floor_precuda().all_old
+          && !g_decomp_abandoned.load(std::memory_order_relaxed))
         vlog(V_DEBUG, opt, "[GPU] CUDA sees " + gz_cuda_visible_uuids() + "\n");
       if (dc <= 0) {
         if (opt.gpu_only) {
@@ -39381,7 +39711,11 @@ gds_out_declined:
             // std::string in its thread: an allocation exception escaping a
             // std::thread entry calls terminate.  The fixed buffer already carries
             // the complete diagnostic.
-            if (opt.verbosity >= V_VERBOSE) std::fputs(l, stderr);
+            if (opt.verbosity >= V_VERBOSE) {
+              if (g_progress_active.load(std::memory_order_relaxed))
+                std::fputs("\r\033[K", stderr);   // off the progress line, as vlog does
+              std::fputs(l, stderr);
+            }
           }
           if (age <= d2) continue;
           // Take the undelivered tail.  COPY host bytes: the wedged call may
@@ -39440,7 +39774,11 @@ gds_out_declined:
         // Allocation-free for the same reason as the demotion line above, and in
         // particular because ownership has moved to the reclaimer by this point:
         // an exception here would strand the frames before re_enqueue().
-        if (opt.verbosity >= V_ERROR) std::fputs(l, stderr);
+        if (opt.verbosity >= V_ERROR) {
+          if (g_progress_active.load(std::memory_order_relaxed))
+            std::fputs("\r\033[K", stderr);
+          std::fputs(l, stderr);
+        }
         if (n > 0) {
           try {
             queue.re_enqueue(rescued);
@@ -44606,6 +44944,7 @@ int main(int argc, char ** argv)
       // would run cuFile/CUDA teardown that the wedged call can block, so flush
       // what we own and leave.
       if (g_decomp_abandoned.load(std::memory_order_relaxed)
+          || g_gpu_thread_parked.load(std::memory_order_relaxed)
           || g_cufile_exit_unsafe.load(std::memory_order_relaxed)) {
         cleanup_tmp_file();
 #ifndef _WIN32

@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=600
-$EXTENSIVE && EXPECTED_TESTS=759
+EXPECTED_TESTS=602
+$EXTENSIVE && EXPECTED_TESTS=761
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -813,8 +813,10 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.17.89: nine cells for the review decisions: 591, 750.  Three need a GPU
 # (the stall guard, --calibrate, and the cuFile re-exec, which also needs GDS):
 # no-GPU deltas 161 -> 164 and 190 -> 193; no-GDS deltas 16 -> 17 and 17 -> 18.
-EXPECTED_NOGPU_DELTA=164
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=193   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
+# v0.18.0: two GPU cells for the --tar decode pool's stall watchdog: no-GPU
+# deltas 164 -> 166 and 193 -> 195.
+EXPECTED_NOGPU_DELTA=166
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=195   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -4124,7 +4126,13 @@ elif files_match "$TMPDIR/mtreader.bin" "$TMPDIR/zc-c.dec"; then
 else
   fail "GZSTD_DEBUG_READER_COPY restores the per-frame copy" "output mismatch"
 fi
-GZSTD_DEBUG_ZC_MAX_BLOCKS=1 "$GZSTD" -d -v --cpu-only -c "$TMPDIR/mt-1.zst" 2>"$TMPDIR/zc-m.log" >"$TMPDIR/zc-m.dec"
+# A cap of 0, not 1 (v0.18.0): the cap is checked per block against the blocks
+# alive at that moment, so at 1 it binds only if a reader has run ahead of the
+# consumer.  On a host at load ~100 it once never did (176 views, 0 copied, a
+# CPU-only suite failure; 0 of 40 reruns).  At 0 every block is past the cap,
+# however the threads are scheduled; a build that ignores the cap still gives
+# 176 views and 0 copied, and fails.
+GZSTD_DEBUG_ZC_MAX_BLOCKS=0 "$GZSTD" -d -v --cpu-only -c "$TMPDIR/mt-1.zst" 2>"$TMPDIR/zc-m.log" >"$TMPDIR/zc-m.dec"
 read -r zc_v zc_c zc_k <<< "$(zc_counts "$TMPDIR/zc-m.log")"
 if [[ -z "${zc_v:-}" ]]; then
   fail "the memory cap switches blocks to copies" "no [READER] zero-copy line: NOT TESTED"
@@ -8754,6 +8762,10 @@ section "GPU failure handling (v0.17.87 review)"
 # IDENTICAL at exit 0 with one frame rescued.  Without the check the same run
 # writes the flipped byte.  1 GiB at -T2 so the GPU stream comes online while
 # frames remain (146-411 frames here); if it decodes none, nothing was tested.
+# GZSTD_DEBUG_POOL_GPU_FIRST (v0.18.0) holds the CPU decoders until the GPU has
+# claimed its first batch: on a host at load ~150, six cards' bringup took
+# 1.1-1.2 s, longer than the CPU decoders took to finish, and the cell skipped
+# as not exercised -- on v0.17.88 too.
 if has_gpu 2>/dev/null; then
   gp="$TMPDIR/gpupool"; rm -rf "$gp"; mkdir -p "$gp/src/m" "$gp/out"
   (
@@ -8762,8 +8774,8 @@ if has_gpu 2>/dev/null; then
   )
   "$GZSTD" -q -f --tar --cpu-only --chunk-size=1 -C "$gp/src" m -o "$gp/a.tzst" 2>/dev/null
   rc=0
-  env GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 GZSTD_DEBUG_POOL_GPU_CORRUPT=1 timeout --foreground -k 10 120 \
-    "$GZSTD" -d --tar --hybrid -T2 -v "$gp/a.tzst" -C "$gp/out" >/dev/null 2>"$gp/err" || rc=$?
+  env GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 GZSTD_DEBUG_POOL_GPU_FIRST=1 GZSTD_DEBUG_POOL_GPU_CORRUPT=1 timeout --foreground -k 10 120 \
+    "$GZSTD" -d --tar --hybrid -T2 --gpu-devices=1 -v "$gp/a.tzst" -C "$gp/out" >/dev/null 2>"$gp/err" || rc=$?
   gp_dec=$(tr '\r' '\n' < "$gp/err" | grep -a -o '[0-9]* frame(s) GPU-decoded' | head -1 | awk '{print $1}')
   gp_res=$(tr '\r' '\n' < "$gp/err" | grep -a -o '[0-9]* rescued to CPU' | head -1 | awk '{print $1}')
   if [[ $rc -ne 0 ]]; then
@@ -8780,9 +8792,58 @@ if has_gpu 2>/dev/null; then
   else
     pass "the tar GPU decode pool verifies the content checksum" "($gp_dec GPU-decoded, $gp_res rescued)"
   fi
+
+  # A STUCK GPU BATCH IN THE POOL IS FINISHED BY THE CPU (v0.18.0).  A CUDA call
+  # that never returned hung the whole extraction: the batch's frames never
+  # reached their partitions and teardown joined the stuck thread.  Now the
+  # watchdog copies the batch back to the CPU decoders after its deadline (6 s
+  # for a first batch) and retires the device.  GZSTD_DEBUG_POOL_GPU_STALL=batch
+  # holds the first GPU batch until the watchdog gives up on it and then lets it
+  # carry on, as a call returning late would: the worker must PARK, so a run on
+  # one device ends with "0 frame(s) GPU-decoded" -- a worker that resumed would
+  # deliver that batch itself and count it.  One device, and _FIRST so the GPU
+  # takes the first batch however busy the host; "[STALL]" says that it did.
+  # =init holds bringup instead: a worker stuck there holds no frames, and
+  # teardown must not wait for it.
+  rm -rf "$gp/out"; mkdir -p "$gp/out"
+  rc=0
+  env GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 GZSTD_DEBUG_POOL_GPU_FIRST=1 GZSTD_DEBUG_POOL_GPU_STALL=batch \
+    timeout --foreground -k 10 120 "$GZSTD" -d --tar --hybrid -T2 --gpu-devices=1 -v "$gp/a.tzst" -C "$gp/out" \
+    >/dev/null 2>"$gp/err" || rc=$?
+  tr '\r' '\n' < "$gp/err" > "$gp/err.txt"
+  gs_dec=$(grep -a -o '[0-9]* frame(s) GPU-decoded' "$gp/err.txt" | head -1 | awk '{print $1}')
+  gs_rec=$(grep -a -o '[0-9]* reclaimed from a stalled GPU' "$gp/err.txt" | head -1 | awk '{print $1}')
+  gs_why=""
+  if ! grep -aq '\[STALL\] tar decode pool GPU .*stalling in batch' "$gp/err.txt"; then
+    skip_host "a stuck tar GPU decode batch is finished by the CPU decoders" \
+      "not exercised: no GPU came up to claim a batch (exit $rc; $(grep -a 'decode pool\|GPU' "$gp/err.txt" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tail -3 | tr '\n' ' ' | cut -c1-240))"
+  else
+    [[ $rc -eq 0 ]] || gs_why+=" [exit $rc, want 0]"
+    cmp -s "$gp/src/m/d" "$gp/out/m/d" || gs_why+=" [extracted bytes differ]"
+    grep -aq 'tar decode batch wedged' "$gp/err.txt" || gs_why+=" [no 'batch wedged' warning: the watchdog did not take the batch]"
+    [[ "${gs_rec:-0}" -ge 1 ]] || gs_why+=" [0 frames reclaimed]"
+    [[ "${gs_dec:-x}" == 0 ]] || gs_why+=" [${gs_dec:-?} frame(s) GPU-decoded, want 0: the given-up worker carried on]"
+    [[ -z "$gs_why" ]] && pass "a stuck tar GPU decode batch is finished by the CPU decoders" "($gs_rec frame(s) reclaimed)" \
+      || fail "a stuck tar GPU decode batch is finished by the CPU decoders" "$gs_why  $(grep -a 'WARNING\|GPU stream' "$gp/err.txt" | head -3 | tr '\n' ' ' | cut -c1-300)"
+  fi
+  rm -rf "$gp/out"; mkdir -p "$gp/out"
+  rc=0
+  env GZSTD_FORCE_POOL=1 GZSTD_POOL_GPU=1 GZSTD_DEBUG_POOL_GPU_STALL=init \
+    timeout --foreground -k 10 120 "$GZSTD" -d --tar --hybrid -T2 --gpu-devices=1 -v "$gp/a.tzst" -C "$gp/out" \
+    >/dev/null 2>"$gp/err" || rc=$?
+  tr '\r' '\n' < "$gp/err" > "$gp/err.txt"
+  gs_why=""
+  [[ $rc -eq 0 ]] || gs_why+=" [exit $rc, want 0]"
+  cmp -s "$gp/src/m/d" "$gp/out/m/d" || gs_why+=" [extracted bytes differ]"
+  grep -aq '\[STALL\] tar decode pool GPU .*stalling in init' "$gp/err.txt" || gs_why+=" [the hook did not fire]"
+  grep -aq 'device bringup stuck' "$gp/err.txt" || gs_why+=" [no 'bringup stuck' warning: teardown waited for the worker]"
+  [[ -z "$gs_why" ]] && pass "a stuck tar GPU decode bringup does not hold up the end of the run" \
+    || fail "a stuck tar GPU decode bringup does not hold up the end of the run" "$gs_why"
   rm -rf "$gp"
 else
   skip "the tar GPU decode pool verifies the content checksum" "no GPU"
+  skip "a stuck tar GPU decode batch is finished by the CPU decoders" "no GPU"
+  skip "a stuck tar GPU decode bringup does not hold up the end of the run" "no GPU"
 fi
 
 # A GPU BATCH PUBLISHED IN THE WRITER'S BLIND WINDOW STILL WAKES IT.  A GPU worker

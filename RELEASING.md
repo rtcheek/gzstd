@@ -49,13 +49,13 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 758 | 599 | **yes, this server** |
-| GPU, GDS unavailable | 740 | 582 | yes, the workstation |  <!-- derived: baseline - EXPECTED_NOGDS_DELTA (18 / 17); last measured 456 default at the v0.17.63 baseline of 467 -->
-| no GPU (the CPU-only build) | not observed (`-e` adds no CPU-only cells) | 436 | yes |
+| GPU + GPUDirect Storage usable (the baseline) | 760 | 601 | **yes, this server** |
+| GPU, GDS unavailable | 742 | 584 | yes, the workstation |  <!-- derived: baseline - EXPECTED_NOGDS_DELTA (18 / 17); last measured 456 default at the v0.17.63 baseline of 467 -->
+| no GPU (the CPU-only build) | not a release gate | 436 | yes |
 
-These are the v0.17.89 figures (the suite's own constants are the authority, and it prints the
+These are the v0.18.0 expectations (the suite's own constants are the authority, and it prints the
 expectation it used). The baseline row counts what RAN,
-so it is the `EXPECTED_TESTS` constant (759 / 600) minus the one
+so it is the `EXPECTED_TESTS` constant (761 / 602) minus the one
 cell this server cannot provoke — the trivial-park cell needs a trivially-compressed batch to reach
 a GPU, and the CPU pool here drains the fixture first. Since v0.17.64 that skip goes through
 `skip_host`, which subtracts itself from the expectation, so the run says "as expected on this host"
