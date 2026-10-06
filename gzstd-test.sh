@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=602
-$EXTENSIVE && EXPECTED_TESTS=761
+EXPECTED_TESTS=604
+$EXTENSIVE && EXPECTED_TESTS=763
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -815,8 +815,10 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # no-GPU deltas 161 -> 164 and 190 -> 193; no-GDS deltas 16 -> 17 and 17 -> 18.
 # v0.18.0: two GPU cells for the --tar decode pool's stall watchdog: no-GPU
 # deltas 164 -> 166 and 193 -> 195.
-EXPECTED_NOGPU_DELTA=166
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=195   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
+# v0.18.1: two GPU cells (the tuner's start by card, the source hold lifting):
+# 604, 763; no-GPU deltas 166 -> 168 and 195 -> 197.
+EXPECTED_NOGPU_DELTA=168
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=197   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7120,7 +7122,7 @@ rm -rf "$APRI_XDG" "$TMPDIR/apri.zst" "$TMPDIR/apri.out" "$TMPDIR/apri.err" \
        "$TMPDIR/apri-t.tzst" "$TMPDIR/apri-tar.err"
 
 # ────────────────────────────────────────────────────────────
-section "--adapt governor actions: source-bound batch latch"
+section "--adapt governor actions: source-bound batch hold"
 
 # GZSTD_DEBUG_ADAPT_REGIME forces the classifier's verdict from t=0
 # (skipping ramp + hysteresis) so sub-second suite runs exercise the
@@ -7146,31 +7148,61 @@ else
 fi
 
 if has_gpu 2>/dev/null; then
-  # 3. source-bound + GPU tuner: the growth latch fires, is logged, and
+  # 3. source-bound + GPU tuner: the growth hold engages, is logged, and
   # lands in the summary's action list.
   env GZSTD_DEBUG_ADAPT_REGIME=source-bound "$GZSTD" --adapt --no-profile -v --gpu-only \
     -k -f "$TMPDIR/large.bin" -o "$TMPDIR/alat.zst" 2>"$TMPDIR/alat2.err"
-  if grep -q 'GPU batch growth latched' "$TMPDIR/alat2.err"; then
-    pass "source-bound latches the GPU batch tuner"
+  if grep -q 'GPU batch growth held' "$TMPDIR/alat2.err"; then
+    pass "source-bound holds the GPU batch tuner"
   else
-    fail "source-bound latches the GPU batch tuner"
+    fail "source-bound holds the GPU batch tuner"
   fi
   if grep -q 'actions: source-latch(gpu-batch)' "$TMPDIR/alat2.err"; then
     pass "summary lists the source latch"
   else
     fail "summary lists the source latch"
   fi
-  # 4. The latch touches tuning only: the latched run's output round-trips.
+  # 4. The hold touches tuning only: the held run's output round-trips.
   "$GZSTD" -d -k -f --cpu-only "$TMPDIR/alat.zst" -o "$TMPDIR/alat.out" 2>/dev/null
   if files_match "$TMPDIR/large.bin" "$TMPDIR/alat.out"; then
-    pass "latched run output round-trips"
+    pass "held run output round-trips"
   else
-    fail "latched run output round-trips"
+    fail "held run output round-trips"
   fi
+  # 5. The hold LIFTS (v0.18.1).  Until v0.18.1 this was a latch: a 0.6 s
+  #    source-bound reading at the end of warm-up, on every fresh-profile GPU
+  #    compression on a two-card Gen3 host, froze each device at its start for
+  #    the rest of the run and left nothing in the profile.  Now a window closed
+  #    while the run reads source-bound timed the reader, not the device: it is
+  #    discarded, and the walk resumes afterwards.  GZSTD_DEBUG_TUNE_SOURCE_HOLD
+  #    holds each device's first 3 windows -- counted in WINDOWS, because a timed
+  #    regime would outlast a whole run this size on a fast card.  With a peak
+  #    of 16 (GZSTD_DEBUG_TUNE_CURVE), the device must settle at 16 after the
+  #    hold, and the profile must keep it.  GZSTD_DEBUG_TUNE_L2 pins the start
+  #    (32 here) on any card.
+  ahold="$TMPDIR/ahold"; rm -rf "$ahold"; mkdir -p "$ahold"
+  t0=$(now_ms); why=""
+  head -c $((576 * 1024 * 1024)) /dev/urandom | base64 -w0 | head -c $((768 * 1024 * 1024)) > "$ahold/src"
+  env XDG_CACHE_HOME="$ahold/xdg" $AQ GZSTD_DEBUG_TUNE_SOURCE_HOLD=3 GZSTD_DEBUG_TUNE_CURVE=16 \
+    GZSTD_DEBUG_TUNE_FAST=1 GZSTD_DEBUG_TUNE_L2=52428800 \
+    "$GZSTD" --adapt -v --no-progress -f --gpu-only --gpu-streams=1 --chunk-size=1 \
+    "$ahold/src" -o /dev/null 2>"$ahold/h.err"; rc=$?
+  [[ $rc -eq 0 ]] || why+=" rc:$rc"
+  held=$(grep -o '[0-9]* source-held windows' "$ahold/h.err" | head -1 | awk '{print $1}')
+  (( ${held:-0} >= 3 )) || why+=" source-held-${held:-none}"
+  grep -q 'f1: settled 16,' "$ahold/h.err" || why+=" not-settled-16($(grep -o 'f1: settled [0-9]*' "$ahold/h.err"))"
+  rec=$(tr -d ' \n' < "$ahold/xdg/gzstd/profile.json" 2>/dev/null | grep -o '"f1":{[^}]*}' | head -1)
+  rb=$(sed -n 's/.*"batch":\([0-9]*\).*/\1/p' <<<"$rec")
+  [[ "$rb" == 16 ]] || why+=" profile-batch-${rb:-none}"
+  rm -rf "$ahold"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "a source-bound hold lifts: the tuner resumes and the profile keeps its batch" \
+    || fail "a source-bound hold lifts: the tuner resumes and the profile keeps its batch" "got$why"
 else
-  skip "source-bound latches the GPU batch tuner" "no GPU"
+  skip "source-bound holds the GPU batch tuner" "no GPU"
   skip "summary lists the source latch" "no GPU"
-  skip "latched run output round-trips" "no GPU"
+  skip "held run output round-trips" "no GPU"
+  skip "a source-bound hold lifts: the tuner resumes and the profile keeps its batch" "no GPU"
 fi
 rm -f "$TMPDIR/alat.zst" "$TMPDIR/alat.out" "$TMPDIR/alat1.err" "$TMPDIR/alat2.err"
 
@@ -7280,10 +7312,40 @@ if has_gpu 2>/dev/null; then
   else
     skip_host "each GPU tunes its own batch (two devices, two peaks)" "needs two GPUs"
   fi
+
+  # 3. Compress starts by the card (v0.18.1).  The 512 MiB byte target is an
+  #    H100's; on two 11 GiB Turing cards the compress kernel ran best at 32-64
+  #    MiB a batch and the walk down from 32 x 16 MiB left auto 12% behind.  A
+  #    card with less L2 than the reference (48 MiB) starts proportionally lower:
+  #    at 5.5 MiB, 16 MiB frames start at 2, not 8 (large.bin's start, the
+  #    eight-frame floor).  An H100-sized L2 changes nothing; neither a pinned
+  #    --gpu-batch nor decompress is lowered.  GZSTD_DEBUG_TUNE_L2 stands in for
+  #    the card, so this runs on any GPU.
+  t0=$(now_ms); why=""
+  env GZSTD_DEBUG_TUNE_L2=5767168 "$GZSTD" -v --no-progress -f --gpu-only \
+    "$TMPDIR/large.bin" -o "$TUN/l.zst" 2>"$TUN/l1.err" || why+=" small-rc"
+  grep -q "f16: starting at 2 (lowered from 8 for this card's 5.50 MiB L2)" "$TUN/l1.err" \
+    || why+=" small-L2($(grep -o 'starting at.*' "$TUN/l1.err" | head -1))"
+  env GZSTD_DEBUG_TUNE_L2=52428800 "$GZSTD" -v --no-progress -f --gpu-only \
+    "$TMPDIR/large.bin" -o "$TUN/l.zst" 2>"$TUN/l2.err" || why+=" big-rc"
+  grep -q 'f16: starting at 8$' "$TUN/l2.err" \
+    || why+=" big-L2($(grep -o 'starting at.*' "$TUN/l2.err" | head -1))"
+  env GZSTD_DEBUG_TUNE_L2=5767168 "$GZSTD" -v --no-progress -f --gpu-only --gpu-batch=8 \
+    "$TMPDIR/large.bin" -o "$TUN/l.zst" 2>"$TUN/l3.err" || why+=" pinned-rc"
+  grep -q 'lowered from' "$TUN/l3.err" && why+=" pinned-lowered"
+  env GZSTD_DEBUG_TUNE_L2=5767168 "$GZSTD" -v --no-progress -f -d --gpu-only \
+    "$TUN/l.zst" -o "$TUN/l.out" 2>"$TUN/l4.err" || why+=" decompress-rc"
+  grep -q 'starting at [0-9]*$' "$TUN/l4.err" || why+=" decompress-no-start"
+  grep -q 'lowered from' "$TUN/l4.err" && why+=" decompress-lowered"
+  files_match "$TMPDIR/large.bin" "$TUN/l.out" || why+=" round-trip"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "a small-L2 card starts compress lower; pins and decompress keep their start" \
+    || fail "a small-L2 card starts compress lower; pins and decompress keep their start" "got$why"
   rm -rf "$TUN"
 else
   skip "tuner explores past its allocation; the profile keeps only what ran" "no GPU"
   skip "each GPU tunes its own batch (two devices, two peaks)" "no GPU"
+  skip "a small-L2 card starts compress lower; pins and decompress keep their start" "no GPU"
 fi
 
 # ────────────────────────────────────────────────────────────

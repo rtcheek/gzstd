@@ -933,9 +933,31 @@ report follows.
   best pinned batch.
 - **CLOSED v0.17.81:** a real mixed-card run, an H100 PCIe with an H100 NVL. Each card found the
   same batch on its own.
-- **OPEN, before the tag:** the start's byte targets (~2 GiB for decompress, ~512 MiB for
-  compress) were derived on one H100. On a small-VRAM card the allocation caps them, and the tuner
-  corrects from there, but that is reasoning. Validate them on the 11 GiB consumer cards.
+- **CLOSED v0.18.1: compress starts by the card.** Measured on the 11 GiB cards at v0.18.0
+  (the CHANGELOG's v0.18.0 entry has the table): the compress kernel runs best at 32–64 MiB a
+  batch there, not the H100's 512 MiB, and the walk down from 32 x 16 MiB left auto 6–12% behind
+  the best pinned batch. The start now scales by the card's L2 cache against a 48 MiB reference:
+  the 2080 Ti starts at 2 x 16 MiB and 32 x 1 MiB, while the H100 is unchanged. Auto now trails
+  the best pinned batch by ~3.5% at 16 MiB frames (16.85–16.94 s against 16.29–16.37) and ~1% at
+  1 MiB (14.62–14.69 against 14.45–14.49).
+  - **Still OPEN:** the L2 proxy is fitted to two architectures (Turing; Hopper PCIe and NVL). An
+    Ampere or Ada card is the next data point: big-L2 Ada cards are capped at the H100 target and
+    unmeasured.
+  - **Still OPEN:** decompress auto trails by 3–5% at 48 GiB (2–15% at 24 GiB). Its start sits on or
+    one step from the best, so the start is not the cause: the in-run windows rate the 88-frame
+    allocation above 64, while whole pinned runs put 64 ahead by 2%.
+- **CLOSED v0.18.1: a source-bound reading no longer freezes the tuner.** It was a latch
+  (`SETTLED` at the current batch, never released, nothing recorded). A 0.6 s reading at the end
+  of warm-up froze every fresh-profile `--adapt` GPU compress at its start on the two-card Gen3
+  host (20.84–20.89 s, against 18.4 without `--adapt`). It is now a hold: a window that closes
+  while the run reads source-bound timed the reader, so it is discarded, along with the first
+  window after the reading ends. Fresh `--adapt` now runs 16.82–17.10 s, the same as plain auto,
+  and leaves a batch for the next run.
+  - **Still OPEN:** the classifier itself. Its first post-ramp sample transitions WARMUP at once
+    (no hysteresis, by design), and on that host the first sample reads source-bound: the reader
+    pool starts at 3 threads where the profile's runs start at 4. The hold makes the blip cost
+    nothing measurable; nothing else acts on it in compress.
+- **CLOSED v0.18.1 (doc):** the `--gpu-batch` help described the defaults from before v0.17.81.
 - **OPEN:** a pair of cards that genuinely want different batches (an H100 with a 2080 Ti) is not
   available on one host, so only the synthetic two-peak cell covers it.
 

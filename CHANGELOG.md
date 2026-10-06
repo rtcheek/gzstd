@@ -1,12 +1,87 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.0  
+**Covers:** v0.9.50 → v0.18.1  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.1 — the GPU batch tuner starts by the card, and a source-bound blip no longer freezes it
+
+**The release moves here.** v0.18.0 was not tagged. Its second-machine checks are in its entry below.
+They passed everywhere except the gate owed since v0.17.80, the batch tuner's byte targets on 11 GiB
+cards, and that check turned up a second, older defect.
+
+**1. Compress started too high on a small card, and paid for it on every run.** The start is a byte
+target per batch (v0.17.81), measured on an H100: 512 MiB for compress.
+- On two 11 GiB RTX 2080 Ti cards, the nvCOMP compress kernel's rate per byte peaks at 32–64 MiB a
+  batch, at both 1 and 16 MiB frames (0.53–0.57 GiB/s a stream). It falls to ~0.41 at 256 MiB and
+  above. This is kernel time (`comp=` at -vv), not scheduling.
+- The start of 32 x 16 MiB was the worst batch measured. The tuner found the right batch, but its
+  first windows ran at the largest and slowest size of the run. Auto finished 6–12% behind the best
+  pinned batch, about 2 s on 24 or 48 GiB.
+- **The fix:** each device now lowers compress's target in proportion to its L2 cache, against a
+  48 MiB reference, never raising it (`tune_device_start`).
+  - Of the three measured cards' properties (2080 Ti, H100 PCIe, H100 NVL), L2 (5.5, 50 and
+    50 MiB) and VRAM (11, 80 and 94 GiB) both track their optima; SM count does not. L2 is a
+    judgement, not a measurement: the slowdown is inside the kernel, where a cache plausibly sets
+    the cost and capacity does not.
+  - On the 2080 Ti the start becomes 2 x 16 MiB and 32 x 1 MiB. The H100 is unchanged by
+    construction.
+- Decompress keeps its target: on the same cards its start sat on or one step from the best.
+- A pinned `--gpu-batch`, `--gds-only` and an input of unknown size are not lowered. The `--tar`
+  staging pool keeps its depth: it is read-ahead for the drive, measured as such.
+
+**2. A brief source-bound reading froze the tuner for the whole run** (since v0.15.x, `--adapt`
+only). The governor's source-bound verdict latched the tuner: every device `SETTLED` at its
+current batch, with nothing recorded afterwards.
+- On a fresh profile, the classifier's first post-ramp sample read source-bound for ~0.6 s on 7 of 7
+  GPU compressions on the two-card host. That held a start of 32 where 4 was best: 20.84–20.89 s,
+  against 18.4 without `--adapt`, and no batch left in the profile for the next run.
+- **The fix:** the latch is a hold. A window that closes while the run reads source-bound timed the
+  reader, not the device, so it is discarded (`source-held` in the -v summary). The first window
+  after the reading ends is discarded too, because it spans the reading. The walk then resumes where
+  it stood.
+- **A first draft only capped growth during the reading, and that was wrong.** It kept measuring,
+  and a device that had just doubled 2 -> 4 rated 4 below 2 on a window the source starved, then
+  settled at 2. A starved window is not evidence about the device in either direction.
+
+**Measured** on the two-card PCIe Gen3 host: 24 GiB of base64 of random data, `--gpu-only`, warm,
+output to `/dev/null`. Old and new binaries were interleaved in rotating order over three rounds;
+wall seconds.
+
+| run | v0.18.0 | v0.18.1 | best pinned |
+|---|---|---|---|
+| compress, 16 MiB frames, auto | 18.42–18.60 (start 32) | 16.84–16.98 (start 2) | 16.27–16.43 (4) |
+| compress, 16 MiB frames, fresh `--adapt` | 20.84–20.89 (frozen at 32) | 16.82–17.10 | — |
+| compress, 1 MiB frames, auto | 15.62–15.79 (start 256) | 14.62–14.69 (start 32) | 14.45–14.49 (32) |
+| decompress, 16 MiB frames, 48 GiB out, auto | 9.26–9.34 | 9.27–9.35 | — |
+| decompress, same, fresh `--adapt` | 9.07–9.26 | 9.14–9.30 | — |
+
+Both decompress paths are unchanged, as they should be.
+
+**Not changed, still open** (ROADMAP):
+- The L2 proxy is fitted to two architectures. Ampere and Ada are unmeasured, and big-L2 Ada cards
+  are capped at the H100's target.
+- Decompress auto still trails its best pinned batch by 3–5% at 48 GiB. The in-run windows prefer
+  the 88-frame allocation, while whole runs prefer 64.
+- The classifier's first-sample blip remains; the hold makes it cost nothing measurable.
+
+**Tests.** Two GPU cells:
+- **A small-L2 card starts compress lower.** `GZSTD_DEBUG_TUNE_L2` stands in for the card: it starts
+  at 2 at 5.5 MiB and at 8 at 50 MiB, and neither a pinned `--gpu-batch` nor decompress is lowered.
+- **A source-bound hold lifts.** `GZSTD_DEBUG_TUNE_SOURCE_HOLD=K` holds a device's first K windows.
+  It is counted in windows, not seconds, because a timed regime would outlast a whole small run on a
+  fast card. The device must settle at the synthetic peak afterwards, and the profile must keep it.
+
+The forced-regime cell's wording follows the hold. Four single-change mutants were each caught by
+their cell and by no other: the hold never lifting, held windows counted, no device start, and
+decompress lowered.
+
+The `--gpu-batch` help now describes the real default: tuned per GPU from a byte target, lowered on
+small-L2 cards for compress.
 
 ## v0.18.0 — a hung GPU no longer hangs a `--tar` extraction
 
@@ -108,6 +183,57 @@ That hook exposed one more way to lose the GPU, which the new bringup message th
 gzstd processes starting at once on the same card, `cudaSetDevice` failed with "busy or unavailable"
 in 4 of 18 runs (one at a time: 0 of 6). The pool falls back to the CPU and the output is correct; the
 cells say why they skipped. Retrying is a ROADMAP item, not part of this release.
+
+**The second machine: a 24-core PCIe Gen3 host with two 11 GiB cards, where GDS is unavailable.**
+- **Builds and suites:** both builds are warning-free and report `[zstd 1.5.7, multithreaded]`.
+  - Extensive suite: 743 passed, 0 failed, 18 skipped. Every skip is a `--gds-only` cell, refused
+    here. The trivial-park cell runs on this host, so the count is 743, not the 742 that
+    RELEASING.md derived.
+  - The three decode-pool cells ran on Turing for the first time and passed: 734 frames
+    GPU-decoded with 1 rescued, and 64 frames reclaimed.
+  - CPU-only build: 436 passed, 0 failed.
+- **Real-data `--tar` round trips:** byte-identical whether gzstd or GNU tar extracted them, on
+  three trees:
+  - three files totalling 22 GiB (base64, repetitive text, incompressible);
+  - 123,552 real system files in 8.2 GiB;
+  - 300 decode-bound 32 MiB files.
+
+  `-l --tar` printed the same bytes as `tar -tvf`. `-d --tar --adapt` was byte-identical on every
+  tree, cold and warm.
+- **GPU engagement:** `-T 1` engaged the GPU both ways (56 and 87 batches), and the 24 GiB round
+  trip was byte-identical. The pool's GPU decoders did not engage on their own: 22 CPU decoders
+  kept the writers fed, at 7.5 GiB/s on the warm decode-bound archive.
+
+**The batch tuner on 11 GiB cards, the gate owed since v0.17.80: it settles correctly, but it
+starts too high.**
+- No run ran out of memory or fell back to the CPU. Counting `done batch=` lines shows every run
+  did its work on the GPU.
+- Compress settles on the best pinned batch. Decompress settles at its allocation, within a step
+  of the best pinned batch.
+- The byte targets were derived on an H100 and are high for these cards:
+  - compress runs best at 32–64 MiB per batch here, against ~512 MiB on the H100;
+  - decompress runs best at 0.5–1 GiB, against 1–2+ GiB.
+- The walk down from the start costs a roughly fixed ~2 s, so auto mode trails the best pinned
+  batch. Measured `--gpu-only` on both cards, warm, output to `/dev/null`, three interleaved rounds,
+  wall seconds:
+
+| run | start | auto (settles) | best pinned | auto behind |
+|---|---|---|---|---|
+| compress, 16 MiB frames, 24 GiB | 32 | 18.34–18.46 (3–4) | 4: 16.31–16.46 | 12% |
+| compress, 16 MiB frames, 48 GiB | 32 | 32.54–32.67 (3–4) | 4: 30.34–30.49 | 7% |
+| compress, 1 MiB frames, 24 GiB | 256 | 15.34–15.74 (32–64) | 32/64: 14.40–14.57 | 6–9% |
+| decompress, 16 MiB frames, 24 GiB out | 64 | 5.32–5.62 (88) | 64: 4.86–4.87 | 9–15% |
+| decompress, 16 MiB frames, 48 GiB out | 64 | 9.11–9.30 (88) | 64: 8.83–8.84 | 3–5% |
+| decompress, 1 MiB frames, 24 GiB out | 256 | 5.69–5.91 (256) | 512: 5.54–5.58 | 2–6% |
+
+- **What the measurement shows:**
+  - The start of 32 is the worst compress batch measured at 16 MiB frames: 20.8 s, against 16.3 s
+    at 4.
+  - With `--adapt`, the second run starts from the profile's batch and is faster than plain auto:
+    17.7 s at 24 GiB.
+  - At 16 MiB frames, decompress's in-run windows rate 88 above 64, while the pinned runs put 64
+    2% ahead.
+- The open questions are in ROADMAP.
 
 ## v0.17.93 — the release binary's zstd: 1.4.4, single-threaded, since May
 

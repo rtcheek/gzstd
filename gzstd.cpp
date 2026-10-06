@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.0";
+static constexpr const char * GZSTD_VERSION = "0.18.1";
 //
 // Architecture overview:
 //
@@ -3983,8 +3983,8 @@ static void print_help()
 "  --no-throttle       alias for --throttle-frames=0 (benchmarking)\n";
 #ifdef HAVE_NVCOMP
   std::cout <<
-"  --gpu-batch N       GPU subchunks per stream (default: 8 compress,\n"
-"                      16 decompress; decompress auto-scales by size)\n"
+"  --gpu-batch N       GPU subchunks per stream (default: tuned per GPU\n"
+"                      from a start chosen by frame size)\n"
 "  --gpu-streams N     CUDA streams per device (default: 1)\n"
 "  --gpu-devices N     number of GPUs (0 = auto)\n"
 "  --gpu-order O       cuda (default) | ranked: rank all GPUs by load first\n"
@@ -5227,12 +5227,18 @@ static void print_help_long()
 " GPU TUNING\n"
 "============================================================\n"
 "  --gpu-batch N\n"
-"     Max GPU subchunks per CUDA stream.  Default: 8 for compress; for\n"
-"     decompress 16, auto-scaled up by input size (64 above 10 GiB, 256\n"
-"     above 75 GiB).  Each stream targets batches of up to N subchunks;\n"
-"     the per-stream binary search may clamp lower if VRAM (GPU\n"
-"     memory) is tight (reported at -v as `VRAM-fit: batch=X\n"
-"     (requested N, ...)`).\n"
+"     Max GPU subchunks per CUDA stream, and it turns the batch tuner\n"
+"     off.  Default: each GPU tunes its own batch while it runs, halving\n"
+"     and doubling from a start set in BYTES per batch for the frame\n"
+"     size -- about 2 GiB for decompress and 512 MiB for compress, at\n"
+"     most a sixteenth of the input; compress starts lower on a card\n"
+"     with less L2 cache than an H100 (on an 11 GiB RTX 2080 Ti: 2\n"
+"     frames of 16 MiB, not 32).  -v prints each GPU's start and where\n"
+"     it settled.  An input of unknown size (a pipe) starts at 8 for\n"
+"     compress and 16 for decompress.  Each stream targets batches of\n"
+"     up to N subchunks; the per-stream binary search may clamp lower\n"
+"     if VRAM (GPU memory) is tight (reported at -v as `VRAM-fit:\n"
+"     batch=X (requested N, ...)`).\n"
 "\n"
 "  --gpu-streams N\n"
 "     CUDA streams per device (default: 1; 2 for -t verify).\n"
@@ -29269,7 +29275,16 @@ struct DevStats {
 //   LOCKED     --gpu-batch, or a path pin (--gds-only -t): no tuning at all.
 //   SINK       writer (or --tar extract) busy >= 55% after 3 s: every device
 //              clamps its best down to max(16, best/4) and stops; intake jitters.
-//   SOURCE     --adapt says the reader is the faucet: every device stops at best.
+//   SOURCE     a HOLD, not a latch: while --adapt classifies the run source-bound,
+//              a window times the reader, not the device, so it is discarded
+//              (counted "source-held") and no device changes its proposal.  The
+//              walk resumes where it stood when the regime changes.  (Until
+//              v0.18.1 this was a latch that froze every device at its
+//              batch for the rest of the run: a 0.6 s source-bound reading at the
+//              end of warm-up, on 7 of 7 fresh-profile GPU compressions on a
+//              two-card Gen3 host, held a start of 32 where 4 was best for the
+//              whole run -- 21 s against 18.4 without --adapt -- and, since a
+//              frozen run records nothing, left no batch for the next run.)
 //
 // CAN THIS RUN MEASURE WHAT IT CHOSE?  Only valid windows move `best`, and only
 // they are recorded (`settled`, `measured_max`).  A proposal that never ran full
@@ -29290,11 +29305,13 @@ struct DevStats {
 // which is how compress, with no mid-run growth, still converges above 256.
 struct TuneRun {
   std::atomic<bool>   locked{false};     // --gpu-batch or a path pin: no tuning
-  // Sink- or source-bound latch: run-wide, because both are about the writer or
-  // the reader, not about any one device.  The reason is the latch itself: a
-  // separate boolean can become visible before the reason needed for the clamp.
-  static constexpr int FREEZE_SINK = 1, FREEZE_SOURCE = 2;
+  // Sink-bound latch: run-wide, because it is about the writer, not about any
+  // one device.  The reason is the latch itself: a separate boolean can become
+  // visible before the reason needed for the clamp.  (The source-bound reading
+  // is a hold, checked at every tick: see SOURCE in the table.)
+  static constexpr int FREEZE_SINK = 1;
   std::atomic<int>    freeze_reason{0};
+  std::atomic<bool>   source_hold_logged{false};   // the hold's line and action flag, once
   // Largest single pop the throttle can always grant (see the header); 0 until
   // the throttle exists.  Also bounds the cross-run allocation request.
   std::atomic<size_t> explore_max{0};
@@ -29392,7 +29409,8 @@ struct DeviceTune {
   // What was actually measured (tick thread; published under tune_mtx).
   size_t   settled = 0;                  // best batch from a VALID window
   size_t   measured_max = 0;             // largest batch with a VALID window
-  uint32_t valid_windows = 0, supply_windows = 0;
+  uint32_t valid_windows = 0, supply_windows = 0, source_windows = 0;
+  bool     source_held = false;              // the last window was discarded by the source hold
   bool     explore_blocked = false;      // an exploration allocation failed
   size_t   explored_from = 0;            // ceiling before the current exploration
 };
@@ -29435,6 +29453,17 @@ static double tune_explore_fraction() {
     return 0.1;
   }();
   return f;
+}
+// Test-only (GZSTD_DEBUG_TUNE_SOURCE_HOLD=K): each device's first K windows are
+// held as if --adapt read the run as source-bound, then the hold lifts.  Counted
+// in windows, not seconds, so a cell sees the hold END on any card: a timed
+// regime would outlast a whole small run on a fast one.  0 = unset.
+static uint32_t gz_debug_tune_source_hold() {
+  static const uint32_t k = [] {
+    const char * e = ::getenv("GZSTD_DEBUG_TUNE_SOURCE_HOLD");
+    return e ? (uint32_t)std::strtoul(e, nullptr, 10) : 0u;
+  }();
+  return k;
 }
 // Test-only (GZSTD_DEBUG_TUNE_FAST=1): decide after every batch, not every
 // 0.3 s / 4 batches, so a small input reaches a verdict.
@@ -29517,8 +29546,10 @@ static size_t tune_prior_budget(size_t frame_bytes, size_t gpu_streams,
 // slower, and 1 MiB compress climbed from 8.  A GUIDE, not an answer: the tuner
 // halves and doubles from here on any card, and the allocation caps it.  The
 // input/16 target is subject to the eight-frame floor on tiny inputs.
+static constexpr uint64_t TUNE_DECOMPRESS_START_BYTES = uint64_t(2) << 30;
+static constexpr uint64_t TUNE_COMPRESS_START_BYTES   = uint64_t(512) << 20;
 static size_t tune_default_start(size_t frame_bytes, uint64_t input_bytes, bool decompress) {
-  uint64_t target = decompress ? (uint64_t(2) << 30) : (uint64_t(512) << 20);
+  uint64_t target = decompress ? TUNE_DECOMPRESS_START_BYTES : TUNE_COMPRESS_START_BYTES;
   if (input_bytes) target = std::min<uint64_t>(target, input_bytes / 16);
   const size_t n = size_t(target / std::max<size_t>(1, frame_bytes));
   size_t p = 1;
@@ -29526,13 +29557,56 @@ static size_t tune_default_start(size_t frame_bytes, uint64_t input_bytes, bool 
   return std::min<size_t>(std::max<size_t>(p, 8), AUTO_TUNE_BATCH_CEILING);
 }
 
+// Compress's 512 MiB target is an H100's.  The nvCOMP compress kernel's rate
+// per byte FALLS as a batch grows past the card's best, so a start above it is
+// paid twice: in kernel time, and in the walk down, whose first windows are
+// the biggest and slowest of the run.  MEASURED on two 11 GiB Turing cards
+// (24 and 48 GiB of base64, --gpu-only, pinned sweeps): the kernel peaks at
+// 32-64 MiB a batch at both 1 and 16 MiB frames (0.53-0.57 GiB/s a stream)
+// and falls to ~0.41 at 256 MiB and above; the start of 32 x 16 MiB was the
+// worst batch measured (20.8 s against 16.3 at 4), and walking down from it
+// left auto 6-12% behind the best pinned batch.  An H100 PCIe and an H100 NVL
+// both run best near 512 MiB.  The three cards' L2 caches (5.5, 50 and 50 MiB)
+// track that, as VRAM does and SM count does not; L2 is a judgement, not a
+// measurement -- the slowdown is inside the kernel, where a cache plausibly
+// sets the cost and capacity does not.  So a card with less L2 than the
+// reference starts proportionally lower.  A GUIDE fitted to two
+// architectures, never above the H100's target: starting low is the cheap
+// error, since the tuner's windows grow with the batch and a climb pays only
+// its last window at full size.  Decompress keeps its target: on the same
+// cards its start (64 at 16 MiB, 256 at 1 MiB) sat on or one step from the
+// best pinned batch.  The eight-frame floor is not applied here: it guards
+// tiny inputs, and on a small card 16 MiB frames run best at four.
+static constexpr uint64_t TUNE_L2_REF_BYTES = uint64_t(48) << 20;
+// Test-only (GZSTD_DEBUG_TUNE_L2=BYTES): every device reports this L2 size, so a
+// cell can assert the lowered start on any card.
+static size_t tune_device_start(size_t start, size_t frame_bytes, int device, int * l2_out) {
+  int l2 = 0;
+  if (const char * e = ::getenv("GZSTD_DEBUG_TUNE_L2")) {
+    l2 = std::atoi(e);
+  } else if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return start;
+  }
+  if (l2_out) *l2_out = l2;
+  if (l2 <= 0 || uint64_t(l2) >= TUNE_L2_REF_BYTES) return start;
+  const uint64_t target = TUNE_COMPRESS_START_BYTES * uint64_t(l2) / TUNE_L2_REF_BYTES;
+  const size_t n = size_t(target / std::max<size_t>(1, frame_bytes));
+  size_t p = 1;
+  while (p * 2 <= n) p <<= 1;
+  return std::min(start, p);
+}
+
 // Build one tuner per device for an operation.  Called where the real device
 // count is known, before any worker starts.  `start` is the batch a device
 // without a prior begins at; `frame_bytes` sets the frame class; the throttle's
 // permits bound exploration (see EXPLORE_MAX in the header; <= 0 = disabled).
+// `by_device`: `start` is compress's default byte target, which each device
+// lowers to its own (tune_device_start); false for a pin, --gpu-batch, an
+// unknown size, or decompress.
 static void tune_init_devices(DeviceTune * tunes, int n, const std::vector<int> & ids,
                               TuneRun & run, const Options & opt, size_t start,
-                              size_t frame_bytes, int throttle_permits) {
+                              size_t frame_bytes, int throttle_permits, bool by_device) {
   const size_t streams = std::max<size_t>(1, opt.gpu_streams);
   const size_t total = std::max<size_t>(1, size_t(std::max(1, n)) * streams);
   run.explore_max.store(throttle_permits > 0
@@ -29546,6 +29620,8 @@ static void tune_init_devices(DeviceTune * tunes, int n, const std::vector<int> 
     T.device = ids[i];
     T.fclass = fc;
     size_t b = std::min(start, runnable);
+    int l2 = 0;
+    if (by_device) b = std::min(tune_device_start(start, frame_bytes, ids[i], &l2), runnable);
     // The UUID is needed only to read or write the profile: one properties query
     // per device (~1.5 ms, uncached), and only under --adapt.
     if (opt.adapt) {
@@ -29572,9 +29648,16 @@ static void tune_init_devices(DeviceTune * tunes, int n, const std::vector<int> 
       }
     }
     T.batch_size.store(std::max<size_t>(1, std::min<size_t>(b, HARD_BATCH_CAP)));
-    if (T.phase == DeviceTune::Phase::BASELINE && !run.locked.load() && opt.verbosity >= V_VERBOSE)
+    if (T.phase == DeviceTune::Phase::BASELINE && !run.locked.load() && opt.verbosity >= V_VERBOSE) {
+      std::string why;
+      if (by_device && T.batch_size.load() < std::min(start, runnable)) {
+        char l2s[32]; human_bytes(double(l2), l2s, sizeof(l2s));
+        why = std::string(" (lowered from ") + std::to_string(std::min(start, runnable))
+            + " for this card's " + l2s + " L2)";
+      }
       vlog(V_VERBOSE, opt, "[AUTO-TUNE] GPU" + std::to_string(ids[i]) + " " + fc
-           + ": starting at " + std::to_string(T.batch_size.load()) + "\n");
+           + ": starting at " + std::to_string(T.batch_size.load()) + why + "\n");
+    }
   }
 }
 
@@ -29599,12 +29682,14 @@ static void tune_publish_devices(DeviceTune * tunes, int n, const Options & opt)
   for (int i = 0; i < n; ++i) {
     DeviceTune & T = tunes[i];
     std::lock_guard<std::mutex> lk(T.tune_mtx);
-    if (opt.verbosity >= V_VERBOSE && !T.run->locked.load() && (T.valid_windows || T.supply_windows))
+    if (opt.verbosity >= V_VERBOSE && !T.run->locked.load()
+        && (T.valid_windows || T.supply_windows || T.source_windows))
       vlog(V_VERBOSE, opt, "[AUTO-TUNE] GPU" + std::to_string(T.device) + " " + T.fclass
            + ": settled " + std::to_string(T.settled) + ", measured up to "
            + std::to_string(T.measured_max) + ", ceiling " + std::to_string(T.ceiling.load())
            + " (" + std::to_string(T.valid_windows) + " valid / "
-           + std::to_string(T.supply_windows) + " supply-limited windows, "
+           + std::to_string(T.supply_windows) + " supply-limited / "
+           + std::to_string(T.source_windows) + " source-held windows, "
            + std::to_string(T.stale_dropped.load()) + " stale and "
            + std::to_string(T.warm_dropped.load()) + " warm-up batches left out)\n");
     if (T.run->locked.load() || !T.valid_windows || !T.settled || T.uuid.empty()) continue;
@@ -29732,28 +29817,25 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
   // more decision on a valid window of its own, then applies the clamp at its
   // next tick -- which is not worth a global lock on every worker iteration.
   const std::string tag = "[AUTO-TUNE] GPU" + std::to_string(T.device) + " ";
-  // --adapt source-bound latch (M4 action 1): the governor says the reader is
-  // the faucet -- a bigger batch can never be filled faster than the source
-  // feeds it, so growth is pure latency.  Latch in place (no down-clamp: unlike
-  // sink-bound there is no writer head-of-line wave to shrink).  Checked before
-  // the window gate: a starved queue may never accumulate MIN_BATCHES.
-  if (R.freeze_reason.load(std::memory_order_acquire) == 0 && opt.adapt
-      && g_adapt_regime.load(std::memory_order_relaxed) == (int)AdaptRegime::SOURCE_BOUND) {
-    int expected = 0;
-    if (R.freeze_reason.compare_exchange_strong(expected, TuneRun::FREEZE_SOURCE)) {
-      g_adapt_action_flags.fetch_or(ADAPT_ACT_SOURCE_LATCH, std::memory_order_relaxed);
-      if (opt.verbosity >= V_VERBOSE)
-        vlog(V_VERBOSE, opt, "[ADAPT] source-bound: GPU batch growth latched on every "
-             "device (source cannot outfeed it)\n");
-    }
+  // --adapt source-bound HOLD (M4 action 1): while the governor says the reader
+  // is the faucet, a bigger batch cannot be filled faster than the source feeds
+  // it, and a window's rate is the source's.  Re-read at every tick, because the
+  // reading can be brief (see SOURCE in the table).  Logged before the window
+  // gate: a starved queue may never accumulate MIN_BATCHES.
+  const bool source_hold = opt.adapt
+      && g_adapt_regime.load(std::memory_order_relaxed) == (int)AdaptRegime::SOURCE_BOUND;
+  if (source_hold && !R.source_hold_logged.exchange(true, std::memory_order_relaxed)) {
+    g_adapt_action_flags.fetch_or(ADAPT_ACT_SOURCE_LATCH, std::memory_order_relaxed);
+    if (opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "[ADAPT] source-bound: GPU batch growth held on every device "
+           "while the source cannot outfeed it\n");
   }
   if (R.freeze_reason.load(std::memory_order_acquire) != 0) {
-    // Apply the run's latch to this device once.
+    // Apply the run's sink latch to this device once.
     std::unique_lock<std::mutex> lk(T.tune_mtx, std::try_to_lock);
     if (!lk.owns_lock() || T.sink_applied) return 0;
     T.sink_applied = true;
-    size_t b = T.best_batch ? T.best_batch : T.batch_size.load();
-    if (R.freeze_reason.load() == TuneRun::FREEZE_SINK) b = TuneRun::sink_freeze_clamp(b);
+    const size_t b = TuneRun::sink_freeze_clamp(T.best_batch ? T.best_batch : T.batch_size.load());
     const size_t c = T.ceiling.load();
     tune_propose(T, std::max<size_t>(1, c ? std::min(b, c) : b));
     T.phase = DeviceTune::Phase::SETTLED;
@@ -29815,14 +29897,27 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
       }
     }
     T.sink_applied = true;
-    const size_t b = R.freeze_reason.load(std::memory_order_acquire) == TuneRun::FREEZE_SINK
-        ? TuneRun::sink_freeze_clamp(T.best_batch ? T.best_batch : cur)
-        : (T.best_batch ? T.best_batch : cur);
+    const size_t b = TuneRun::sink_freeze_clamp(T.best_batch ? T.best_batch : cur);
     tune_propose(T, std::max<size_t>(1, std::min(b, C)));
     T.phase = DeviceTune::Phase::SETTLED;
     return 0;
   }
 
+  // SOURCE HOLD: a window closed while --adapt read the run as source-bound
+  // timed the reader, not the device: it moves nothing and is not recorded.
+  // MEASURED, why it must not count: a device that had just doubled 2 -> 4 when
+  // the reading arrived rated 4 below 2 on that window and settled at 2, where
+  // 4 is best (two 11 GiB cards, 16 MiB frames).
+  // The first window closed after a hold began during it: discarded too.
+  const bool held = source_hold || T.source_windows < gz_debug_tune_source_hold();
+  if (held || T.source_held) {
+    T.source_held = held;
+    ++T.source_windows;
+    if (opt.verbosity >= V_DEBUG)   // -vv: a slow source can hold for a whole run
+      vlog(V_DEBUG, opt, tag + "holding at " + std::to_string(cur)
+           + ": the window timed the source, not this device\n");
+    return 0;
+  }
   // SUPPLY-LIMITED: the window did not run the proposal, so it says nothing
   // about it.  Never let it move `best` or reach the profile.
   if ((size_t)full * 4 < (size_t)batches * 3) {
@@ -34003,6 +34098,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // is sized to this too: MEASURED, 16 GiB cold at 16 MiB frames, a pool of
   // 32 slots (this start) ran 6.20-6.57 s against 7.02-7.32 at 64 and 7.63-7.66
   // at 80 -- pinning, pipeline fill and the last batch's drain all grow with it.
+  const bool compress_start_by_device = !(opt.gpu_batch_user_set || opt.gds_only) && total_in != 0;
   const size_t compress_tune_start =
       opt.gpu_batch_user_set || opt.gds_only ? opt.gpu_batch_cap
       : total_in == 0 ? DEFAULT_GPU_BATCH_CAP
@@ -34349,7 +34445,8 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     json_sink = std::make_unique<StatsSink>(gpu_count);
     tunes.reset(new DeviceTune[(size_t)gpu_count]);
     tune_init_devices(tunes.get(), gpu_count, gpu_ids, tune_run, opt,
-                      compress_tune_start, tune_frame_bytes, throttle.max_permits());
+                      compress_tune_start, tune_frame_bytes, throttle.max_permits(),
+                      compress_start_by_device);
     fatal_msgs.assign((size_t)gpu_count, std::string());
     // Per-GPU result slots (reduces lock contention).  init_slots resizes
     // ResultStore::slots, which the writer iterates in drain_slots_locked under
@@ -39635,7 +39732,8 @@ gds_out_declined:
                         ? opt.gpu_batch_cap
                       : decomp_src_bytes == 0 ? DEFAULT_GPU_DECOMP_BATCH_CAP
                       : tune_default_start(decomp_frame_cap(opt), decomp_src_bytes, /*decompress=*/true),
-                      decomp_frame_cap(opt), bp_ptr ? bp_ptr->max_permits() : 0);
+                      decomp_frame_cap(opt), bp_ptr ? bp_ptr->max_permits() : 0,
+                      /*by_device=*/false);
     for (int i = 0; i < gpu_count; ++i) {
       gpu_workers.emplace_back(gpu_decomp_worker, gpu_ids[i], i, opt,
                                &queue, &results, m, sched,
