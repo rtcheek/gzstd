@@ -943,7 +943,9 @@ report follows.
   (the CHANGELOG's v0.18.0 entry has the table): the compress kernel runs best at 32–64 MiB a
   batch there, not the H100's 512 MiB, and the walk down from 32 x 16 MiB left auto 6–12% behind
   the best pinned batch. The start now scales by the card's L2 cache against a 48 MiB reference:
-  the 2080 Ti starts at 2 x 16 MiB and 32 x 1 MiB, while the H100 is unchanged. Auto now trails
+  the 2080 Ti starts at 2 x 16 MiB and 32 x 1 MiB, while the H100 is unchanged (checked at
+  v0.18.2: L2 reads 50 MiB on the PCIe cards and 60 MiB on the NVL cards, and both start at
+  32 x 16 MiB and 256 x 1 MiB with nothing lowered). Auto now trails
   the best pinned batch by ~3.5% at 16 MiB frames (16.85–16.94 s against 16.29–16.37) and ~1% at
   1 MiB (14.62–14.69 against 14.45–14.49).
   - **Still OPEN:** the L2 proxy is fitted to two architectures (Turing; Hopper PCIe and NVL). An
@@ -964,6 +966,10 @@ report follows.
     pool starts at 3 threads where the profile's runs start at 4. The hold makes the blip cost
     nothing measurable; nothing else acts on it in compress.
 - **CLOSED v0.18.1 (doc):** the `--gpu-batch` help described the defaults from before v0.17.81.
+- **CLOSED v0.18.2: a CPU rebuild into `/dev/null` exited 3** (since v0.15.72). The rebuild probe
+  asked only whether the output seeks; the null device seeks and cannot be truncated. It now asks
+  what discarding means: truncate a file, nothing for the null device, and refuse anything else
+  that keeps what was written (a block device, a tape), like a pipe.
 - **OPEN:** a pair of cards that genuinely want different batches (an H100 with a 2080 Ti) is not
   available on one host, so only the synthetic two-peak cell covers it.
 

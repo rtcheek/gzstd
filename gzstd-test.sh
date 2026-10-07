@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=604
-$EXTENSIVE && EXPECTED_TESTS=763
+EXPECTED_TESTS=606
+$EXTENSIVE && EXPECTED_TESTS=765
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -817,6 +817,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # deltas 164 -> 166 and 193 -> 195.
 # v0.18.1: two GPU cells (the tuner's start by card, the source hold lifting):
 # 604, 763; no-GPU deltas 166 -> 168 and 195 -> 197.
+# v0.18.2: two --verify cells (a rebuild into /dev/null; an output that seeks
+# but cannot be discarded), neither needing a GPU: 606, 765; deltas unchanged.
 EXPECTED_NOGPU_DELTA=168
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=197   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
@@ -3411,6 +3413,30 @@ else
   fail "--verify over a pipe dies loudly" "rc=$vp_rc (expected non-zero + message)"
 fi
 rm -f "$perr"
+
+# The null device is not a pipe (v0.18.2).  It seeks, so the rebuild went ahead,
+# and then it could not be truncated: `gzstd -c f > /dev/null` with a GPU fault
+# or a --verify mismatch exited 3 where a file output rebuilt.  It kept nothing,
+# so there is nothing to discard.  The opposite case is an output that seeks,
+# cannot be truncated and KEEPS what was written (a block device, a tape):
+# /dev/zero stands in for it -- it seeks, ftruncate gives EINVAL, and it is not
+# the null device -- and it must be refused like a pipe, before the rebuild.
+nerr="$TMPDIR/verify-null.err"; nv_rc=0
+GZSTD_DEBUG_CORRUPT_FRAME=0 "$GZSTD" --verify --cpu-only -c "$vsrc" > /dev/null 2>"$nerr" || nv_rc=$?
+if [[ $nv_rc -eq 0 ]] && grep -qiE "verify caught a corrupt frame.*sequence 0" "$nerr"; then
+  pass "--verify rebuilds into /dev/null (exit 0)"
+else
+  fail "--verify rebuilds into /dev/null" "rc=$nv_rc (expected 0 + a logged rebuild): $(grep -iE 'error' "$nerr" | head -1)"
+fi
+nv_rc=0
+GZSTD_DEBUG_CORRUPT_FRAME=0 "$GZSTD" --verify --cpu-only -c "$vsrc" > /dev/zero 2>"$nerr" || nv_rc=$?
+if [[ $nv_rc -eq 4 ]] && grep -qiE "output is a pipe, stream or device" "$nerr" \
+   && ! grep -qiE "rebuilding CPU-only" "$nerr"; then
+  pass "--verify refuses an output it can seek but not discard (exit 4, no rebuild)"
+else
+  fail "--verify refuses an output it can seek but not discard" "rc=$nv_rc (expected 4, refused before any rebuild): $(grep -iE 'error|rebuild' "$nerr" | head -1)"
+fi
+rm -f "$nerr"
 
 # ============================================================
 # 18b2. Producer unwind path (exception safety)

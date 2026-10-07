@@ -1,12 +1,75 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.1  
+**Covers:** v0.9.50 → v0.18.2  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.2 — a CPU rebuild into `/dev/null` no longer exits 3
+
+**The release moves here.** v0.18.1 was not tagged. Its H100 check on the eight-GPU server passed (below),
+and the same check turned this up.
+
+**The defect** (since v0.15.72). A GPU fault or a `--verify` mismatch during compression discards
+the output and rebuilds the archive on the CPU. A probe decides whether it can, and it asked only
+whether the output seeks. The null device seeks, then refused the truncate:
+
+    gzstd: ERROR: cannot discard the rejected archive before --verify rebuild (Invalid argument)
+
+So `gzstd --gpu-only -c big > /dev/null`, the usual way to time a compression, exited 3 on a card
+that failed at bringup, where the same run to a file rebuilt and exited 0. It was found on a real
+one: an H100 that an uncontained ECC error (Xid 95) in another tenant's job had left needing a
+reset, refusing every context with "busy or unavailable". The message said `--verify` although
+the GPU had faulted. Nothing wrong was written; the run died before the rebuild.
+
+**The fix:** the probe asks what discarding means for this output (`gz_output_discard`).
+- A regular file is truncated, as before.
+- The null device kept nothing, so there is nothing to discard and the rebuild goes ahead. It is
+  matched by device number, not as "a character device": a tape seeks and keeps every byte.
+- Anything else that seeks but cannot be truncated (a block device, a tape) keeps the rejected
+  bytes, and a shorter rebuild written over them would leave their tail behind. It is now refused
+  before the attempt, like a pipe ("the output is a pipe, stream or device"; exit 4 for `--verify`,
+  5 for a GPU fault), instead of at the truncate with exit 3.
+- The rebuild's three I/O errors say "the CPU rebuild", not "--verify rebuild".
+
+**Checked** on both builds, with both triggers (`GZSTD_DEBUG_CORRUPT_FRAME`,
+`GZSTD_DEBUG_FAIL_GPU_AFTER`), and on the faulted card itself with no hooks:
+
+| output | v0.18.1 | v0.18.2 |
+|---|---|---|
+| `> /dev/null` | exit 3 | rebuilt, exit 0 |
+| `> /dev/zero` (seeks, cannot be truncated, not the null device) | rebuild started, exit 3 at the truncate | refused before the rebuild, exit 4 / 5 |
+| `> file`, `>> file`, `-o file` | rebuilt, exit 0 | unchanged: byte-identical round trips, the `>>` prefix kept |
+| a pipe | exit 4 / 5 | unchanged |
+
+**Tests.** Two `--verify` cells that need no GPU: a rebuild into `/dev/null` exits 0, and `/dev/zero`
+is refused with exit 4 and no rebuild. 606 / 765; the no-GPU deltas are unchanged. Three
+single-change mutants were each caught by their own cell and by no other: always truncating, a
+probe that only seeks, and every character device taken for the null device. v0.18.1 fails both.
+
+**Suites** on the eight-GPU server: `-e` 763 ran, 0 failures, 2 host skips (the trivial-park cell, and
+the decompress tail-yield cell, whose GPU came online too late on a loaded host); CPU-only 438, 0
+failures. Both runs were launched under `nohup`, which ignores SIGHUP for everything they start, so
+the one cell that sends SIGHUP failed in each; run from a normal shell it passes on both builds, and
+under `nohup` it fails the same way on purpose. No other cell sends SIGHUP.
+
+**The tag review** (Codex, v0.18.0 to v0.18.2, against the blocker bar) found no blocker and one
+should-fix, adopted here. v0.18.1's source hold marked a window only when one CLOSED during the
+`--adapt` source-bound reading. A reading that began and ended between two closures left a window
+that may have timed the source counted as valid. Each tick that sees the reading now marks the open
+window, so that window is discarded too. Only this
+device's worker runs the tick, so the mark needs no lock. Nothing changes without `--adapt`, under
+a forced regime, or under the window-counted hold hook; the three hold cells pass unchanged. No
+hook produces a reading shorter than a window, so this case has no cell.
+
+**The H100 check for v0.18.1's start by L2.** `cudaDevAttrL2CacheSize` reads 50 MiB on all five
+H100 PCIe cards and 60 MiB on all three H100 NVL cards. The v0.18.1 entry said 50 for both and is
+corrected. Both are above the 48 MiB reference, so neither lowers its start: `-v --gpu-only` on
+20 GiB starts at 32 x 16 MiB and 256 x 1 MiB on each, with no "lowered" note, and settles at 32 and
+256, exit 0.
 
 ## v0.18.1 — the GPU batch tuner starts by the card, and a source-bound blip no longer freezes it
 
@@ -25,7 +88,7 @@ target per batch (v0.17.81), measured on an H100: 512 MiB for compress.
 - **The fix:** each device now lowers compress's target in proportion to its L2 cache, against a
   48 MiB reference, never raising it (`tune_device_start`).
   - Of the three measured cards' properties (2080 Ti, H100 PCIe, H100 NVL), L2 (5.5, 50 and
-    50 MiB) and VRAM (11, 80 and 94 GiB) both track their optima; SM count does not. L2 is a
+    60 MiB) and VRAM (11, 80 and 94 GiB) both track their optima; SM count does not. L2 is a
     judgement, not a measurement: the slowdown is inside the kernel, where a cache plausibly sets
     the cost and capacity does not.
   - On the 2080 Ti the start becomes 2 x 16 MiB and 32 x 1 MiB. The H100 is unchanged by
@@ -40,10 +103,11 @@ current batch, with nothing recorded afterwards.
 - On a fresh profile, the classifier's first post-ramp sample read source-bound for ~0.6 s on 7 of 7
   GPU compressions on the two-card host. That held a start of 32 where 4 was best: 20.84–20.89 s,
   against 18.4 without `--adapt`, and no batch left in the profile for the next run.
-- **The fix:** the latch is a hold. A window that closes while the run reads source-bound timed the
-  reader, not the device, so it is discarded (`source-held` in the -v summary). The first window
-  after the reading ends is discarded too, because it spans the reading. The walk then resumes where
-  it stood.
+- **The fix:** the latch is a hold. A window that closes while the run reads source-bound may have
+  timed the reader, not the device, so it is discarded (`source-held` in the -v summary). So is the
+  next one, which usually spans the end of the reading; when the reading ends exactly at a closure
+  it need not, and the discard is conservative. The walk then resumes where it stood. (v0.18.2 also
+  discards a window that saw a reading begin and end inside it.)
 - **A first draft only capped growth during the reading, and that was wrong.** It kept measuring,
   and a device that had just doubled 2 -> 4 rated 4 below 2 on a window the source starved, then
   settled at 2. A starved window is not evidence about the device in either direction.

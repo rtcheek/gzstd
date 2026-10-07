@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.1";
+static constexpr const char * GZSTD_VERSION = "0.18.2";
 //
 // Architecture overview:
 //
@@ -29275,10 +29275,11 @@ struct DevStats {
 //   LOCKED     --gpu-batch, or a path pin (--gds-only -t): no tuning at all.
 //   SINK       writer (or --tar extract) busy >= 55% after 3 s: every device
 //              clamps its best down to max(16, best/4) and stops; intake jitters.
-//   SOURCE     a HOLD, not a latch: while --adapt classifies the run source-bound,
-//              a window times the reader, not the device, so it is discarded
-//              (counted "source-held") and no device changes its proposal.  The
-//              walk resumes where it stood when the regime changes.  (Until
+//   SOURCE     a HOLD, not a latch: a window any tick saw --adapt read as
+//              source-bound may have timed the reader, not the device, so it is
+//              discarded (counted "source-held") and no device changes its
+//              proposal; so is the first window closed after one held under the
+//              reading.  The walk resumes where it stood.  (Until
 //              v0.18.1 this was a latch that froze every device at its
 //              batch for the rest of the run: a 0.6 s source-bound reading at the
 //              end of warm-up, on 7 of 7 fresh-profile GPU compressions on a
@@ -29410,7 +29411,7 @@ struct DeviceTune {
   size_t   settled = 0;                  // best batch from a VALID window
   size_t   measured_max = 0;             // largest batch with a VALID window
   uint32_t valid_windows = 0, supply_windows = 0, source_windows = 0;
-  bool     source_held = false;              // the last window was discarded by the source hold
+  bool     source_held = false;          // discard the next closure (see SOURCE); inert after a sink latch
   bool     explore_blocked = false;      // an exploration allocation failed
   size_t   explored_from = 0;            // ceiling before the current exploration
 };
@@ -29566,7 +29567,7 @@ static size_t tune_default_start(size_t frame_bytes, uint64_t input_bytes, bool 
 // and falls to ~0.41 at 256 MiB and above; the start of 32 x 16 MiB was the
 // worst batch measured (20.8 s against 16.3 at 4), and walking down from it
 // left auto 6-12% behind the best pinned batch.  An H100 PCIe and an H100 NVL
-// both run best near 512 MiB.  The three cards' L2 caches (5.5, 50 and 50 MiB)
+// both run best near 512 MiB.  The three cards' L2 caches (5.5, 50 and 60 MiB)
 // track that, as VRAM does and SM count does not; L2 is a judgement, not a
 // measurement -- the slowdown is inside the kernel, where a cache plausibly
 // sets the cost and capacity does not.  So a card with less L2 than the
@@ -29819,16 +29820,23 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
   const std::string tag = "[AUTO-TUNE] GPU" + std::to_string(T.device) + " ";
   // --adapt source-bound HOLD (M4 action 1): while the governor says the reader
   // is the faucet, a bigger batch cannot be filled faster than the source feeds
-  // it, and a window's rate is the source's.  Re-read at every tick, because the
-  // reading can be brief (see SOURCE in the table).  Logged before the window
+  // it, and a window it overlaps may rate the source.  Re-read at every tick,
+  // because the reading can be brief (see SOURCE in the table).  Logged before the window
   // gate: a starved queue may never accumulate MIN_BATCHES.
   const bool source_hold = opt.adapt
       && g_adapt_regime.load(std::memory_order_relaxed) == (int)AdaptRegime::SOURCE_BOUND;
-  if (source_hold && !R.source_hold_logged.exchange(true, std::memory_order_relaxed)) {
-    g_adapt_action_flags.fetch_or(ADAPT_ACT_SOURCE_LATCH, std::memory_order_relaxed);
-    if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "[ADAPT] source-bound: GPU batch growth held on every device "
-           "while the source cannot outfeed it\n");
+  if (source_hold) {
+    // Mark the OPEN window, not only one that closes during the reading: a
+    // reading that begins and ends between two closures may still have timed
+    // part of it (v0.18.2 review).  Only this device's worker calls the tick,
+    // so the flag needs no lock.
+    T.source_held = true;
+    if (!R.source_hold_logged.exchange(true, std::memory_order_relaxed)) {
+      g_adapt_action_flags.fetch_or(ADAPT_ACT_SOURCE_LATCH, std::memory_order_relaxed);
+      if (opt.verbosity >= V_VERBOSE)
+        vlog(V_VERBOSE, opt, "[ADAPT] source-bound: GPU batch growth held on every device "
+             "while the source cannot outfeed it\n");
+    }
   }
   if (R.freeze_reason.load(std::memory_order_acquire) != 0) {
     // Apply the run's sink latch to this device once.
@@ -29903,19 +29911,21 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
     return 0;
   }
 
-  // SOURCE HOLD: a window closed while --adapt read the run as source-bound
-  // timed the reader, not the device: it moves nothing and is not recorded.
+  // SOURCE HOLD: a window that may have timed the reader rather than the device
+  // moves nothing and is not recorded.
   // MEASURED, why it must not count: a device that had just doubled 2 -> 4 when
   // the reading arrived rated 4 below 2 on that window and settled at 2, where
   // 4 is best (two 11 GiB cards, 16 MiB frames).
-  // The first window closed after a hold began during it: discarded too.
+  // Discarded: a window any tick saw the reading in, and the first one closed
+  // after a closure held under it.  The second is conservative: when the
+  // reading ends exactly at that closure, the next window need not overlap it.
   const bool held = source_hold || T.source_windows < gz_debug_tune_source_hold();
   if (held || T.source_held) {
     T.source_held = held;
     ++T.source_windows;
     if (opt.verbosity >= V_DEBUG)   // -vv: a slow source can hold for a whole run
       vlog(V_DEBUG, opt, tag + "holding at " + std::to_string(cur)
-           + ": the window timed the source, not this device\n");
+           + ": the window may have timed the source; discarded\n");
     return 0;
   }
   // SUPPLY-LIMITED: the window did not run the proposal, so it says nothing
@@ -42610,6 +42620,30 @@ static void gz_announce_debug_env()
 #endif
 }
 
+// What discarding a rejected archive means for the output a CPU rebuild writes
+// over (v0.18.2).  The rebuild asked only whether the output SEEKS, then
+// truncated it -- and the null device seeks but cannot be truncated, so
+// `gzstd -c big > /dev/null` after a GPU fault or a --verify mismatch exited 3
+// ("cannot discard the rejected archive") where a file output rebuilt and
+// exited 0.  There was nothing to discard: the null device kept none of it.
+// Matched by device number, not as "a character device": a tape seeks and keeps
+// every byte.  Anything else that seeks without truncating (a block device, a
+// tape) KEEPS the rejected bytes, and a shorter rebuild written over them would
+// leave their tail behind, so it is refused like a pipe.  A failed stat is
+// CANNOT, never a guess.
+enum class OutDiscard { TRUNCATE, NOTHING_KEPT, CANNOT };
+static OutDiscard gz_output_discard(int fd)
+{
+  struct stat st;
+  if (fd < 0 || ::fstat(fd, &st) != 0) return OutDiscard::CANNOT;
+  if (S_ISREG(st.st_mode)) return OutDiscard::TRUNCATE;
+  struct stat nd;
+  if (S_ISCHR(st.st_mode) && ::stat("/dev/null", &nd) == 0 && S_ISCHR(nd.st_mode)
+      && st.st_rdev == nd.st_rdev)
+    return OutDiscard::NOTHING_KEPT;
+  return OutDiscard::CANNOT;
+}
+
 static int gzstd_main(int argc, char ** argv)
 {
   setup_signal_handlers();
@@ -44001,23 +44035,30 @@ static int gzstd_main(int argc, char ** argv)
       const bool in_rebuildable =
           opt.tar_mode || (in && in != stdin && std::fseek(in, 0, SEEK_SET) == 0);
       bool out_rebuildable;
+      OutDiscard out_discard = OutDiscard::TRUNCATE;
 #ifndef _WIN32
       if (dw_ptr) out_rebuildable = true;            // O_DIRECT regular file
       else
 #endif
+      {
         // A PROBE, so it must not move anything (v0.17.87 repairs review): this
         // was fseek(out, 0, SEEK_SET), which rewound the caller's stdout before
         // the die() below -- `{ printf header; producer | gzstd -c; printf done; }
         // > f` with a GPU fault left "done" written over the header.  The
-        // rebuild itself seeks to where this output began (rb_base).
-        out_rebuildable = (out && fseeko(out, 0, SEEK_CUR) == 0);      // seekable (incl. redirected stdout)
+        // rebuild itself seeks to where this output began (rb_base).  Seeking
+        // is not enough: the rejected bytes must also be discardable
+        // (gz_output_discard).
+        out_discard = out ? gz_output_discard(fileno(out)) : OutDiscard::CANNOT;
+        out_rebuildable = out && fseeko(out, 0, SEEK_CUR) == 0
+                          && out_discard != OutDiscard::CANNOT;
+      }
 
       if (!in_rebuildable || !out_rebuildable) {
         // Unrecoverable over a pipe: die loudly so a pipeline fails.
         if (verify_trigger) {
           die(std::string("--verify: a frame failed to verify and the ")
-              + (!in_rebuildable ? "input" : "output")
-              + " is a pipe/stream, so the output cannot be discarded and rebuilt.\n"
+              + (!in_rebuildable ? "input is a pipe/stream" : "output is a pipe, stream or device")
+              + ", so the output cannot be discarded and rebuilt.\n"
               "  The compressed bytes are CORRUPT; do not use them.  Re-run with\n"
               "  regular files for input and output so --verify can recover.", EXIT_DATA);
         }
@@ -44025,8 +44066,8 @@ static int gzstd_main(int argc, char ** argv)
                           ? "the staged input read failed during compression ("
                             + gz_stage_read_reason() + ") and the "
                           : "a GPU faulted during compression and the ")
-            + (!in_rebuildable ? "input" : "output")
-            + " is a pipe/stream — the partial output cannot be discarded and\n"
+            + (!in_rebuildable ? "input is a pipe/stream" : "output is a pipe, stream or device")
+            + " — the partial output cannot be discarded and\n"
             "  rebuilt on the CPU, and a faulted GPU's output is NOT trustworthy.\n"
             "  Any bytes already sent downstream are INCOMPLETE/CORRUPT; do not use them.\n"
             "  Re-run with --cpu-only, or compress to/from regular files so a GPU\n"
@@ -44154,12 +44195,16 @@ static int gzstd_main(int argc, char ** argv)
         // a GPU faulted or --verify rejected a frame, at exit 0.  (The O_DIRECT
         // branch above is only ever taken at base zero.)
         const off_t rb_base = (out == stdout) ? out_base : 0;
+        // (A GPU fault rebuilds here too, so the messages do not say --verify.)
         if (std::fflush(out) != 0)
-          die_io("cannot flush output before --verify rebuild");
+          die_io("cannot flush output before the CPU rebuild");
         if (fseeko(out, rb_base, SEEK_SET) != 0 || ftello(out) != rb_base)
-          die_io("cannot rewind output for --verify rebuild");
-        if (ftruncate(fileno(out), rb_base) != 0)
-          die_io("cannot discard the rejected archive before --verify rebuild ("
+          die_io("cannot rewind output for the CPU rebuild");
+        // The null device kept nothing, so there is nothing to discard
+        // (gz_output_discard; anything else that cannot be truncated was refused
+        // above, before the attempt was counted).
+        if (out_discard == OutDiscard::TRUNCATE && ftruncate(fileno(out), rb_base) != 0)
+          die_io("cannot discard the rejected archive before the CPU rebuild ("
                  + std::string(std::strerror(errno)) + ")");
       }
       meter.reset();
