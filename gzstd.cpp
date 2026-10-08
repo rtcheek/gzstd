@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.2";
+static constexpr const char * GZSTD_VERSION = "0.18.3";
 //
 // Architecture overview:
 //

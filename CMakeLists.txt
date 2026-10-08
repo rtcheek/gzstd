@@ -412,9 +412,48 @@ if(UNIX AND NOT APPLE)
     list(APPEND _RPATH_BASE "$ENV{CONDA_PREFIX}/lib" "$ENV{CONDA_PREFIX}/lib64")
   endif()
 
+  # The directories of the shared libraries linked here, so a zstd, nvCOMP or
+  # CUDA runtime in an unlisted prefix still runs.  BUILD_WITH_INSTALL_RPATH
+  # (below) drops the link directories CMake used to add to the build-tree
+  # RPATH by itself, and the installed binary never had them.  Not
+  # INSTALL_RPATH_USE_LINK_PATH: that runs CMake's conflict check over every
+  # library and warns when a conda prefix holds a second libcudart.  The
+  # loader's own implicit directories are left to it.
+  set(_gz_rt_libs ${NVCOMP_LIBRARY})
+  if(TARGET ZSTD::ZSTD)
+    get_target_property(_gz_zl ZSTD::ZSTD INTERFACE_LINK_LIBRARIES)
+    if(_gz_zl)
+      list(APPEND _gz_rt_libs ${_gz_zl})
+    endif()
+  endif()
+  if(HAVE_NVCOMP AND NOT BUILD_STATIC AND TARGET CUDA::cudart)
+    get_target_property(_gz_cl CUDA::cudart IMPORTED_LOCATION)
+    if(_gz_cl)
+      list(APPEND _gz_rt_libs ${_gz_cl})
+    endif()
+  endif()
+  foreach(_gz_l IN LISTS _gz_rt_libs)
+    if(IS_ABSOLUTE "${_gz_l}" AND _gz_l MATCHES "\\.so(\\.[0-9.]+)?$")
+      get_filename_component(_gz_d "${_gz_l}" DIRECTORY)
+      if(NOT _gz_d IN_LIST _RPATH_BASE
+         AND NOT _gz_d IN_LIST CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES
+         AND NOT _gz_d IN_LIST CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES)
+        list(APPEND _RPATH_BASE "${_gz_d}")
+      endif()
+    endif()
+  endforeach()
+
+  # ONE RPATH for the build tree and the install, and no empty element (v0.18.3).
+  # With a separate BUILD_RPATH, CMake's generated build-tree RPATH ended in an
+  # empty element -- the CURRENT DIRECTORY to the dynamic loader -- so the binary
+  # loaded libnvidia-ml.so.1, libcufile.so.0 or libcuda.so.1 out of whatever
+  # directory it ran in, ahead of the driver's own.  v0.17.38 left it as a
+  # build-tree-only defect; it was not: the release workflow ships the
+  # build-tree binary, and every release carried it.
+  # scripts/build-portable.sh refuses a binary with an empty or relative element.
   set_target_properties(gzstd PROPERTIES
-    BUILD_RPATH "${_RPATH_BASE}"
-    INSTALL_RPATH "${_RPATH_BASE}")
+    INSTALL_RPATH "${_RPATH_BASE}"
+    BUILD_WITH_INSTALL_RPATH ON)
 endif()
 
 # macOS: use @loader_path to keep the binary relocatable

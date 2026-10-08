@@ -37,32 +37,22 @@ cmake --build build -j$(nproc)
 
 Requires all shared libraries (zstd, nvcomp, cudart) to be on `LD_LIBRARY_PATH` or in the RPATH at runtime. The RPATH is automatically configured for `$ORIGIN`, conda prefixes, and common system paths.
 
-### Known: the build-tree binary searches the current directory for libraries
+### The library search path never includes the current directory (since v0.18.3)
 
-`./build/gzstd` — the binary CMake leaves in the build tree — has an empty element at the end of its
-RUNPATH, and an empty RUNPATH element means **the current working directory** to the dynamic loader.
-It will therefore load `libnvidia-ml.so.1`, `libcufile.so.0`, `libzstd`, `libnvcomp` or `libcudart`
-from whatever directory you run it in, and that library's constructors execute inside the process.
+The binary is built with its install RPATH (`BUILD_WITH_INSTALL_RPATH`), so `./build/gzstd`, the
+installed binary and the release artifact all carry the same RUNPATH: `$ORIGIN` and its
+neighbours, the conda prefix when one is active, and the directory of any shared zstd, nvCOMP or
+CUDA runtime the build linked from outside the system's own library directories.
 
-**Installed binaries are not affected.** Anything from `cmake --install` — including the portable
-release artifact — has a clean RUNPATH with no empty element. This is not reachable through an
-archive or any input file, and it is not remotely triggerable; it needs a library file sitting in a
-directory you then run the *development* binary from.
+Through v0.18.2 CMake's build-tree RPATH ended in an **empty element**, which the dynamic loader reads
+as the current working directory. The binary then loaded `libnvidia-ml.so.1`, `libcufile.so.0` or
+`libcuda.so.1` from whatever directory it ran in, ahead of the driver's own, and ran that library's
+constructors. The release workflow ships the build-tree binary, so every release carried it.
+`scripts/build-portable.sh` now refuses a binary with an empty or relative search-path element, and
+the suite checks the binary it tests.
 
-In practice this matters only if you run `./build/gzstd` with your working directory somewhere you do
-not control — a shared scratch area, or a tree you have just extracted from an untrusted archive. If
-that applies to you, run the installed binary instead:
-
-```bash
-cmake --install build --prefix ./dist
-./dist/bin/gzstd ...
-```
-
-The empty element is added by CMake's generated build-tree RPATH, not by this project's list. It is
-left in place deliberately: the two available fixes each cost more than the defect — one drops
-CMake's auto-discovered link directories (so a build whose zstd/nvCOMP live outside the listed
-prefixes links but will not run), and the other breaks `cmake --install` outright. See the v0.17.38
-CHANGELOG entry for the measurements.
+To use a library of your own instead of the system's, put it next to the binary (`$ORIGIN`) or name
+its directory in `LD_LIBRARY_PATH`.
 
 ### Static Build (portable)
 

@@ -211,6 +211,29 @@ docker run --rm \
 BIN="$REPO_ROOT/$BUILD_DIR/gzstd"
 [[ -x "$BIN" ]] || { echo "ERROR: build did not produce $BIN"; exit 1; }
 
+# The library search path must not reach the CURRENT DIRECTORY (v0.18.3).  An
+# empty RUNPATH/RPATH element means the current directory to the dynamic loader,
+# and a relative one is resolved against it: the binary would then load
+# libnvidia-ml.so.1, libcufile.so.0 or libcuda.so.1 out of wherever it is run,
+# ahead of the driver's own.  Every release through v0.18.2 shipped an empty
+# element (CMake's build-tree RPATH; this script ships the build-tree binary).
+# CMakeLists.txt now builds with the install RPATH; this refuses a regression.
+command -v readelf >/dev/null 2>&1 || { echo "ERROR: readelf not found (binutils)"; exit 1; }
+rpaths=$(readelf -d "$BIN" | sed -n 's/.*Library r\(un\)\{0,1\}path: \[\(.*\)\]$/\2/p')
+while IFS= read -r rp; do
+  [[ -z "$rp" ]] && continue
+  case ":$rp:" in *::*)
+    echo "ERROR: $BIN has an EMPTY library search path element (= the current directory): [$rp]"; exit 1 ;;
+  esac
+  IFS=: read -r -a rp_elems <<< "$rp"
+  for e in "${rp_elems[@]}"; do
+    case "$e" in /*|'$ORIGIN'|'$ORIGIN/'*) ;;
+      *) echo "ERROR: $BIN has a RELATIVE library search path element '$e': [$rp]"; exit 1 ;;
+    esac
+  done
+done <<< "$rpaths"
+echo "Library search path: ${rpaths:-<none>} (no empty or relative element)"
+
 echo
 echo "=== Result ==="
 ls -lh "$BIN"

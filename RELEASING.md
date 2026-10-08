@@ -49,13 +49,13 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 764 | 605 | **yes, this server** |
-| GPU, GDS unavailable | 747 | 589 | yes, the workstation |  <!-- extensive MEASURED 743 at v0.18.0 (2026-10-06): EXPECTED_TESTS - EXPECTED_NOGDS_DELTA (761 - 18), because the trivial-park cell RUNS there; v0.18.1 adds two GPU cells (763 - 18 = 745, MEASURED 745 2026-10-06); v0.18.2 adds two no-GPU cells (765 - 18 = 747); default derived as 606 - 17 -->
-| no GPU (the CPU-only build) | not a release gate | 438 | yes |
+| GPU + GPUDirect Storage usable (the baseline) | 765 | 606 | **yes, this server** |
+| GPU, GDS unavailable | 748 | 590 | yes, the workstation |  <!-- extensive MEASURED 743 at v0.18.0 (2026-10-06): EXPECTED_TESTS - EXPECTED_NOGDS_DELTA (761 - 18), because the trivial-park cell RUNS there; v0.18.1 adds two GPU cells (763 - 18 = 745, MEASURED 745 2026-10-06); v0.18.2 adds two no-GPU cells (765 - 18 = 747); v0.18.3 one more (766 - 18 = 748); default derived as 607 - 17 -->
+| no GPU (the CPU-only build) | not a release gate | 439 | yes |
 
-These are the v0.18.2 expectations (the suite's own constants are the authority, and it prints the
+These are the v0.18.3 expectations (the suite's own constants are the authority, and it prints the
 expectation it used). The baseline row counts what RAN,
-so it is the `EXPECTED_TESTS` constant (765 / 606) minus the one
+so it is the `EXPECTED_TESTS` constant (766 / 607) minus the one
 cell this server cannot provoke — the trivial-park cell needs a trivially-compressed batch to reach
 a GPU, and the CPU pool here drains the fixture first. Since v0.17.64 that skip goes through
 `skip_host`, which subtracts itself from the expectation, so the run says "as expected on this host"
@@ -129,7 +129,10 @@ that was Ubuntu's `libzstd.a` -- zstd 1.4.4, single-threaded -- and `--sliding-w
 in every release while every suite passed. Since v0.17.93 the script builds a pinned, checksummed
 zstd (`ZSTD_VERSION`/`ZSTD_SHA256`) as `libzstd.a-mt`, and both the script and the workflow fail
 unless the binary reports `[zstd <ZSTD_VERSION>, multithreaded]` and round-trips
-`--sliding-window`. Before a tag that changes the build, run the workflow by hand (Actions ->
+`--sliding-window`. Since v0.18.3 the script also refuses a binary whose library search path
+(RUNPATH/RPATH) has an empty or relative element: the loader reads an empty one as the current
+directory, and every release through v0.18.2 shipped one, because the workflow ships the build-tree
+binary and CMake's build-tree RPATH ended in it. Before a tag that changes the build, run the workflow by hand (Actions ->
 "Build portable release binary" -> Run workflow) and try the artifact on a real host. When
 bumping zstd in the dev environment, bump `ZSTD_VERSION` and `ZSTD_SHA256` to match.
 

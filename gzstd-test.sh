@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=606
-$EXTENSIVE && EXPECTED_TESTS=765
+EXPECTED_TESTS=607
+$EXTENSIVE && EXPECTED_TESTS=766
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -819,6 +819,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 604, 763; no-GPU deltas 166 -> 168 and 195 -> 197.
 # v0.18.2: two --verify cells (a rebuild into /dev/null; an output that seeks
 # but cannot be discarded), neither needing a GPU: 606, 765; deltas unchanged.
+# v0.18.3: one cell, no GPU (the library search path never reaches the current
+# directory): 607, 766; deltas unchanged.
 EXPECTED_NOGPU_DELTA=168
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=197   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
@@ -934,6 +936,29 @@ if [[ -x "$_eg" && -f "$(dirname "$_eg")/../gzstd.cpp" ]]; then
   fi
 else
   skip "no host-order reads of on-disk fields" "checker or source not alongside this script"
+fi
+
+# The binary's library search path must not reach the current directory
+# (v0.18.3).  An empty RUNPATH/RPATH element IS the current directory to the
+# dynamic loader, and a relative one is resolved against it, so the binary would
+# load libnvidia-ml.so.1, libcufile.so.0 or libcuda.so.1 out of wherever it runs
+# -- a planted one ran its constructor inside every release through v0.18.2.
+# CMake's build-tree RPATH added the empty element; the binary is now built with
+# its install RPATH.  scripts/build-portable.sh refuses the same for releases.
+if command -v readelf >/dev/null 2>&1; then
+  _rp_why=""
+  while IFS= read -r _rp; do
+    [[ -z "$_rp" ]] && continue
+    case ":$_rp:" in *::*) _rp_why+=" [empty element: $_rp]" ;; esac
+    IFS=: read -r -a _rp_e <<< "$_rp"
+    for _e in "${_rp_e[@]}"; do
+      case "$_e" in /*|'$ORIGIN'|'$ORIGIN/'*|'') ;; *) _rp_why+=" [relative element '$_e']" ;; esac
+    done
+  done <<< "$(readelf -d "$GZSTD" 2>/dev/null | sed -n 's/.*Library r\(un\)\{0,1\}path: \[\(.*\)\]$/\2/p')"
+  [[ -z "$_rp_why" ]] && pass "the library search path never reaches the current directory" \
+    || fail "the library search path never reaches the current directory" "$_rp_why"
+else
+  skip_host "the library search path never reaches the current directory" "readelf (binutils) not installed"
 fi
 
 # ============================================================

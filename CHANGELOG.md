@@ -1,12 +1,67 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.2  
+**Covers:** v0.9.50 → v0.18.3  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.3 — gzstd no longer loads libraries from the current directory
+
+**The defect** (every release through v0.18.2, and every development build). The binary's library
+search path (RUNPATH) ended in an empty element, and the dynamic loader reads an empty element as the
+**current working directory**, ahead of the system's own library directories. gzstd loads
+`libnvidia-ml.so.1` and `libcufile.so.0` by name at runtime, and the static CUDA runtime loads
+`libcuda.so.1` the same way. Run from a directory holding a planted copy of one of them, gzstd loaded
+it and ran its constructor as the invoking user. Demonstrated on the v0.18.2 release binary with a
+harmless stand-in library: the loader tried `libnvidia-ml.so.1` with no directory, found the planted
+one, and ran it.
+
+It matters where someone else controls the directory gzstd runs in: a shared scratch area on a
+multi-user host, a tree just extracted from an untrusted archive (by gzstd `--tar` itself, for the
+next run), a job compressing an upload directory, or `sudo gzstd` run from any of those.
+
+**v0.17.38 found this and left it**, judging it a development-build defect because "the portable
+artifact a `v*` tag builds is clean". It was not: the release workflow ships the build-tree binary
+(`build-portable/gzstd`), not an installed one. The release tarballs of v0.17.77, v0.17.88 and
+v0.18.2 all carry the empty element.
+
+**The fix.** The empty element came from CMake's generated build-tree RPATH, not from the project's
+list. The binary is now built with its install RPATH (`BUILD_WITH_INSTALL_RPATH`), so the build
+tree, the installed binary and the release carry the same path, with no empty element.
+- v0.17.38 rejected that fix because it drops CMake's own auto-discovered link directories: a zstd or
+  nvCOMP in an unlisted prefix would link but not run. The directories of the shared zstd, nvCOMP and
+  CUDA runtime actually linked are now added explicitly, leaving out the loader's own system
+  directories.
+- The installed binary used to lose those directories; it now keeps them.
+- `INSTALL_RPATH_USE_LINK_PATH` was tried first and dropped: it runs CMake's conflict check over
+  every library and warns when the conda prefix holds a second `libcudart`. Both configurations stay
+  warning-free.
+
+**Checked** with a scratch copy of `CMakeLists.txt` (a stub source that calls zstd), in the build tree
+and after `cmake --install`, each run from `/`:
+
+| configuration | old RUNPATH | new RUNPATH |
+|---|---|---|
+| conda zstd | 7 entries + **empty** | 7 entries |
+| zstd in an unlisted prefix | that prefix + **empty**; the installed binary **lost** the prefix | that prefix, in both |
+| static, no conda (the release's shape) | — | the 5 `$ORIGIN` entries |
+
+With the real builds, the planted-library test loads the stand-in into v0.18.2 and not into v0.18.3,
+and both round-trip a GPU compression.
+
+**Guards.** `scripts/build-portable.sh` refuses a binary whose RUNPATH or RPATH has an empty or
+relative element; it refuses the v0.18.2 release binary, a relative `lib` entry and an old-style
+RPATH with an empty element, and passes both new builds and a binary with none. A suite cell checks
+the binary under test the same way (607 / 766; no GPU needed, so the deltas are unchanged); it fails
+on the v0.18.2 release binary and passes on both new builds. To use a library of your own, put it
+next to the binary or name its directory in `LD_LIBRARY_PATH`.
+
+**Suites** on the eight-GPU server: CPU-only 439 ran, 0 failures. The `-e` run was stopped at 256 of 766
+(255 passed, 0 failures, the trivial-park skip), the new cell among them, by choice: the change is to
+the link step, the release script and one cell, and nothing the extensive sections add can reach it.
 
 ## v0.18.2 — a CPU rebuild into `/dev/null` no longer exits 3
 
@@ -5993,6 +6048,9 @@ so nothing else touches NVML): **the pre-fix binary hangs at the 30 s timeout; t
 which is a larger question than this destructor and is left open deliberately.
 
 ### KNOWN, NOT FIXED: the current working directory is on the BUILD-TREE library search path
+
+*(Corrected in v0.18.3: the claim below that the portable artifact is clean was wrong. The release
+workflow ships the build-tree binary, so every release carried the empty element. Fixed there.)*
 
 Found while building the NVML shim above: a "control" run with no `LD_LIBRARY_PATH` set also hung,
 because `./build/gzstd` loaded the shim **out of the current directory**. Its RUNPATH ends in an
