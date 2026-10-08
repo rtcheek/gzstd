@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.3";
+static constexpr const char * GZSTD_VERSION = "0.18.4";
 //
 // Architecture overview:
 //
@@ -4501,6 +4501,10 @@ static void print_help_long()
 "     On COMPRESS it is a single stream: it cannot use --read-threads\n"
 "     and cannot go through mmap.  When the input is already cached the\n"
 "     buffered path is faster, which is why this is not the default.\n"
+"     --sliding-window honours it too since v0.18.4 (before, the flag was\n"
+"     ignored there).  MEASURED on the 8-GPU server, 19.5 GiB, level 3,\n"
+"     cache dropped, medians of 3: 5.1-5.3 s against 8.2-9.3 s buffered,\n"
+"     and under 2 s of system time against 8.6-8.7.\n"
 "\n"
 "     ON DECOMPRESS (since v0.17.66) IT KEEPS THE PARALLEL READER: the\n"
 "     prefetch threads read O_DIRECT through their own descriptor, so the\n"
@@ -4511,6 +4515,13 @@ static void print_help_long()
 "     HALF the host CPU (~35 CPU-seconds against ~70), because the ~41 s\n"
 "     of SYSTEM time the page cache charges is gone.  Worth it on a busy\n"
 "     machine, or when you do not want this read to evict anyone's cache.\n"
+"     A single frame of more than 256 MiB, or one that declares no size\n"
+"     (a large --sliding-window or `zstd` archive, or one made through a\n"
+"     pipe), streams through one reader instead, which reads O_DIRECT too\n"
+"     since v0.18.4 (before, it read through the page cache).  It decodes\n"
+"     at the same speed either way: MEASURED, 19.5 GiB in one frame, cold,\n"
+"     -d took 7.42 s with it and 7.43 s without, with 0.3 s of system time\n"
+"     against 4.2 (medians of 3).\n"
 "     A filesystem that refuses O_DIRECT reads degrades to buffered\n"
 "     rather than failing the run (-v says so).\n"
 "     --read-threads N pins this pool's size; 1 selects the sequential\n"
@@ -5096,6 +5107,9 @@ static void print_help_long()
 "     Implies --cpu-only.  Workers default to the PHYSICAL cores this\n"
 "     process may use, as `zstd -T0` does (hyperthread siblings add\n"
 "     nothing); -T N sets N, -T 0 uses every hardware thread.\n"
+"     The input is read ahead on its own thread, up to one 4 MiB chunk per\n"
+"     worker (64 at most) when the CPUs it may use span more than one L3\n"
+"     cache, 4 chunks inside one; --direct-read reads it with O_DIRECT.\n"
 "     Decompression is single-threaded because one frame = one unit\n"
 "     of work for any decompressor; it streams in constant memory from\n"
 "     a file or a pipe, with reading, decoding and writing overlapped.\n"
@@ -15693,60 +15707,167 @@ static void decompress_from_buffer(const std::vector<char> & input,
   ZSTD_freeDCtx(dctx);
 }
 
+// Test-only (see the read loops): force every O_DIRECT pread in the parallel
+// reader, and in ChunkPrefetcher's O_DIRECT mode (v0.18.4), to fail with EINVAL,
+// so the buffered degrade path can be exercised on a filesystem that in fact
+// supports O_DIRECT.
+static const bool g_debug_mt_direct_einval = [] {
+  const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT_EINVAL"); return e && *e == '1'; }();
+// Test-only: GZSTD_DEBUG_MT_PREAD_EIO=N makes the Nth pread of the parallel
+// decompress reader (1-based, counted across its threads), or of the
+// --sliding-window O_DIRECT reader (v0.18.4), fail with EIO, as a failing
+// device would.  No filesystem here can be made to do that without
+// privileges, and the path it reaches reported a READ error as a DATA error
+// (exit 4 where the table says 3) until v0.17.89.
+static const long g_debug_mt_pread_eio = [] () -> long {
+  const char * e = std::getenv("GZSTD_DEBUG_MT_PREAD_EIO"); return e ? std::atol(e) : 0L; }();
+static std::atomic<long> g_debug_mt_pread_count{0};
+
 // Reads a FILE ahead on its own thread, in order, `depth` chunks at a time
 // (v0.17.91: --sliding-window and the single-frame decoder).  take() hands out
 // the next chunk; a count below the chunk size means the stream ended there, by
-// EOF or by error, and the reader has stopped touching the FILE, so the caller
-// may test ferror() on it -- and must not take() again.  give_back() returns the
-// buffer for reuse.  The destructor stops the reader after any read in progress;
-// a pipe read can block indefinitely, so callers must not stop consuming early.
+// EOF or by error, and the reader has stopped touching the input, so the caller
+// may test ferror() on the FILE and read_error() here -- and must not take()
+// again.  give_back() returns the buffer for reuse.  The destructor stops the
+// reader after any read in progress; a pipe read can block indefinitely, so
+// callers must not stop consuming early.
+//
+// O_DIRECT (v0.18.4, --sliding-window --direct-read).  The second constructor
+// preads `dfd` -- an O_DIRECT description of the file behind `in`, which it
+// takes ownership of on successful construction -- from `off`, a multiple of
+// 4 KiB.  Its buffers are one
+// aligned region laid out by DirectReadPool, for the reason given there: one
+// allocation faults in as long contiguous runs, so a read reaches the device's
+// largest request.  A filesystem may accept open(O_DIRECT) and still refuse the
+// read; then, as the decompress readers do, the FILE is moved to the offset
+// reached and the rest is read buffered, with a warning.  Any other failed read
+// stops the reader and is reported by read_error(), which ferror() cannot see.
 class ChunkPrefetcher {
 public:
-  ChunkPrefetcher(FILE * in, size_t chunk, int depth) : in_(in), chunk_(chunk) {
-    for (int i = 0; i < depth; ++i) free_.emplace_back(chunk);
+  struct Chunk { const char * data = nullptr; size_t n = 0; int slot = -1; };
+  ChunkPrefetcher(FILE * in, size_t chunk, int depth)
+    : in_(in), chunk_(chunk), vecs_((size_t)std::max(depth, 1)) {
+    // Allocated here, on the caller's thread, as before v0.18.4: from the
+    // reader thread they came from its own malloc arena, and a run inside one
+    // L3 cache measured 2.5% slower (2.10-2.14 s against 2.05-2.07).  No pages
+    // are touched until the first read.
+    for (size_t i = 0; i < vecs_.size(); ++i) {
+      vecs_[i].resize(chunk);
+      free_.push_back((int)i);
+    }
     thr_ = std::thread([this] { run(); });
   }
+#ifndef _WIN32
+  ChunkPrefetcher(FILE * in, int dfd, uint64_t off, size_t chunk, int depth,
+                  const Options & opt)
+    : in_(in), chunk_(chunk), dfd_(dfd), off_(off), direct_(true), opt_(&opt) {
+    // Ownership transfers only after construction succeeds.  make_unique can
+    // fail before entering this body, so the caller closes dfd on any throw.
+    const size_t n = (size_t)std::max(depth, 1);
+    if (!pool_.init(chunk, n, /*want_thp=*/true)) throw std::bad_alloc();
+    for (size_t i = 0; i < n; ++i) free_.push_back((int)i);
+    thr_ = std::thread([this] { run(); });
+  }
+#endif
   ~ChunkPrefetcher() {
     { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
     cv_.notify_all();
     if (thr_.joinable()) thr_.join();
+#ifndef _WIN32
+    if (dfd_ >= 0) ::close(dfd_);
+#endif
   }
   ChunkPrefetcher(const ChunkPrefetcher &) = delete;
   ChunkPrefetcher & operator=(const ChunkPrefetcher &) = delete;
-  FrameVec take(size_t & n) {
+  Chunk take() {
     std::unique_lock<std::mutex> lk(m_);
     cv_.wait(lk, [this] { return !full_.empty(); });
-    FrameVec b = std::move(full_.front().first);
-    n = full_.front().second;
+    const Chunk c = full_.front();
     full_.pop_front();
-    lk.unlock();
-    cv_.notify_all();
-    return b;
+    // No notify: the reader waits for a FREE slot, which give_back() supplies,
+    // so a wake here found it still waiting, once per chunk (Codex review).
+    return c;
   }
-  void give_back(FrameVec && b) {
-    { std::lock_guard<std::mutex> lk(m_); free_.push_back(std::move(b)); }
+  void give_back(const Chunk & c) {
+    if (c.slot < 0) return;
+    { std::lock_guard<std::mutex> lk(m_); free_.push_back(c.slot); }
     cv_.notify_all();
   }
+  // After a short take(): the errno of a failed O_DIRECT read, else 0, and
+  // the bytes that came through O_DIRECT.  The reader wrote both before handing
+  // over that chunk, under the same lock.
+  int read_error() const { return err_; }
+  uint64_t direct_bytes() const { return direct_bytes_; }
 private:
+  char * slot_buf(int s) {
+#ifndef _WIN32
+    if (dfd_ >= 0) return pool_.buf(s);   // still the region after a fallback
+#endif
+    return vecs_[(size_t)s].data();
+  }
+  size_t fill(char * b) {
+#ifndef _WIN32
+    if (direct_) return fill_direct(b);
+#endif
+    return std::fread(b, 1, chunk_, in_);
+  }
+#ifndef _WIN32
+  // The region is 2 MiB-aligned and the chunk a multiple of 4 KiB, so every
+  // read starts on the grid until the end of the file, the only place a read
+  // returns an off-grid count.  Stop there: the next read would start off the
+  // grid, which on ext4 and tmpfs simply returns 0 past the end (measured), but
+  // is refused if the file grew in between, turning the end of the stream into
+  // a fallback warning.  A short count ON the grid is not proof of the end, so
+  // that one is asked again.
+  size_t fill_direct(char * b) {
+    size_t got = 0;
+    while (got < chunk_) {
+      ssize_t r;
+      if (g_debug_mt_direct_einval) { r = -1; errno = EINVAL; }
+      else if (g_debug_mt_pread_eio > 0
+               && g_debug_mt_pread_count.fetch_add(1, std::memory_order_relaxed) + 1
+                  == g_debug_mt_pread_eio) { r = -1; errno = EIO; }
+      else r = ::pread(dfd_, b + got, chunk_ - got, (off_t)off_);
+      if (r > 0) {
+        got += (size_t)r;
+        off_ += (uint64_t)r;
+        direct_bytes_ += (uint64_t)r;
+        if (((size_t)r & 4095u) != 0) break;
+        continue;
+      }
+      if (r == 0) break;
+      if (errno == EINTR) continue;
+      if (errno == EINVAL && ::fseeko(in_, (off_t)off_, SEEK_SET) == 0) {
+        direct_ = false;
+        vlog(V_DEFAULT, *opt_, "gzstd: warning: the filesystem refused an O_DIRECT read at offset "
+             + std::to_string(off_) + "; continuing with buffered reads.\n");
+        return got + std::fread(b + got, 1, chunk_ - got, in_);
+      }
+      err_ = errno ? errno : EIO;
+      break;
+    }
+    return got;
+  }
+#endif
   void run() {
     try {
       for (;;) {
-        FrameVec b;
+        int s;
         {
           std::unique_lock<std::mutex> lk(m_);
           cv_.wait(lk, [this] { return stop_ || !free_.empty(); });
           if (stop_) return;
-          b = std::move(free_.front());
+          s = free_.front();
           free_.pop_front();
         }
-        b.resize(chunk_);
-        const size_t n = std::fread(b.data(), 1, chunk_, in_);
+        char * b = slot_buf(s);
+        const size_t n = fill(b);
         {
           std::lock_guard<std::mutex> lk(m_);
-          full_.emplace_back(std::move(b), n);
+          full_.push_back(Chunk{b, n, s});
         }
         cv_.notify_all();
-        if (n < chunk_) return;   // EOF or error: the FILE is the caller's again
+        if (n < chunk_) return;   // EOF or error: the input is the caller's again
       }
     } catch (const std::bad_alloc &) {
       die("out of memory");
@@ -15758,10 +15879,20 @@ private:
   }
   FILE * in_;
   size_t chunk_;
+  std::vector<FrameVec> vecs_;   // buffered: one per slot
+#ifndef _WIN32
+  DirectReadPool pool_;          // O_DIRECT: slot i is pool_.buf(i)
+  int dfd_ = -1;
+  uint64_t off_ = 0;
+  bool direct_ = false;          // reader thread only; false again after a fallback
+  const Options * opt_ = nullptr;
+#endif
+  int err_ = 0;
+  uint64_t direct_bytes_ = 0;
   std::mutex m_;
   std::condition_variable cv_;
-  std::deque<FrameVec> free_;
-  std::deque<std::pair<FrameVec, size_t>> full_;
+  std::deque<int> free_;
+  std::deque<Chunk> full_;
   bool stop_ = false;
   std::thread thr_;
 };
@@ -16037,13 +16168,66 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
     }
   };
   if (prefix && !prefix->empty()) feed(prefix->data(), prefix->size());
+  // --direct-read (v0.18.4).  The frame splitter honoured it and handed a huge
+  // or sizeless frame to this decoder, which read on through the page cache:
+  // every single-frame archive over SINGLE_FRAME_STREAM_MIN (any real
+  // --sliding-window output) was read buffered whatever was asked.  The reader
+  // now reads O_DIRECT, as the --sliding-window compressor's does, from where
+  // the FILE stands -- 0 on the named route, and where the splitter stopped on
+  // the prefix route, which repositions the FILE after its own O_DIRECT reads
+  // and stops on its 4 MiB grid.  Only a regular file can be read this way;
+  // a prefix route already warned about a non-regular source in the splitter.
+  // On the direct named-file route this is the first reader to check it.
+  // Explicit only, as on compress.
+  int dfd = -1;
+#ifndef _WIN32
+  uint64_t doff = 0;
+  if (!decode_broke && opt.direct_read && opt.direct_read_user_set) {
+    struct stat dst{};
+    const bool regular = in && ::fstat(::fileno(in), &dst) == 0 && S_ISREG(dst.st_mode);
+    const off_t here = regular ? ::ftello(in) : -1;
+    if (here >= 0 && (here & 4095) == 0) {
+      dfd = gz_reopen_input(::fileno(in), O_RDONLY | O_DIRECT);
+      doff = (uint64_t)here;
+    }
+    if (dfd < 0 && (regular || (!prefix && opt.input != "-")))
+      vlog(V_DEFAULT, opt,
+           "warning: --direct-read could not engage O_DIRECT on the held input; "
+           "using buffered input instead.\n");
+  }
+#endif
   std::unique_ptr<ChunkPrefetcher> reader;
-  if (!opt.keep_going) {
+  bool reads_direct = false;
+  // --keep-going reads buffered input on this thread: a prefetch thread can
+  // sit in a pipe read after the decoder has found damage.  O_DIRECT uses a
+  // single-slot reader under --keep-going.  The slot is held until feed()
+  // finishes, so a broken block cannot leave an extra read in flight for join.
+  if ((!opt.keep_going || dfd >= 0) && !decode_broke) {   // a broken prefix reads no more
     // Read-ahead is optional.  A failed buffer allocation or thread creation
     // must not unwind through the live output and progress threads.
-    try { reader = std::make_unique<ChunkPrefetcher>(in, IO_CHUNK, 4); }
-    catch (const std::exception &) { /* use the synchronous reader below */ }
+    try {
+#ifndef _WIN32
+      if (dfd >= 0) {
+        reader = std::make_unique<ChunkPrefetcher>(in, dfd, doff, IO_CHUNK,
+                                                  opt.keep_going ? 1 : 4, opt);
+        reads_direct = true;
+      }
+#endif
+      if (!reader && !opt.keep_going)
+        reader = std::make_unique<ChunkPrefetcher>(in, IO_CHUNK, 4);
+    }
+    catch (const std::exception &) {
+#ifndef _WIN32
+      // Construction, including make_unique's allocation, did not take the fd.
+      if (dfd >= 0) ::close(dfd);
+#endif
+      /* use the synchronous reader below */
+    }
   }
+  if (reads_direct)
+    vlog(V_VERBOSE, opt, "[DIRECT-READ] single-frame stream: O_DIRECT input (page cache bypassed)\n");
+  uint64_t direct_total = 0;
+  bool direct_counted = false;
   if (!reader) {
     // A corrupt frame can make feed() stop before EOF.  With a pipe still open,
     // a prefetch thread may already be blocked in fread for the next full
@@ -16064,18 +16248,30 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
       die("decode failed");
     }
   } else {
-    // READ AHEAD too, as zstd's CLI does: the decoder no longer waits for each
-    // read.  A short chunk is the end of the stream (EOF or error); the reader
-    // has stopped, so check it and stop asking.  Catch exceptions while the
-    // reader is still alive: unwinding its destructor could join a pipe read
-    // that will never finish.
+    // Read ahead too, except that --keep-going holds its one slot until feed()
+    // succeeds.  A short chunk is the end of the stream (EOF or error); the reader
+    // has stopped, so check it -- ferror() for a buffered read, read_error()
+    // for an O_DIRECT one -- and stop asking.  A broken frame under
+    // --keep-going (O_DIRECT only, see above) stops input exactly where the
+    // synchronous loop does: feed() does not stop on its own.  Catch
+    // exceptions while the reader is still alive: unwinding its destructor
+    // could join a pipe read that will never finish.
     try {
-      for (;;) {
-        size_t n = 0;
-        FrameVec chunk = reader->take(n);
-        if (n > 0) feed(chunk.data(), n);
-        if (n < IO_CHUNK) { drain(); check_read_error(in, opt.input); break; }
-        reader->give_back(std::move(chunk));
+      while (!decode_broke) {
+        const ChunkPrefetcher::Chunk chunk = reader->take();
+        const size_t n = chunk.n;
+        if (n > 0) feed(chunk.data, n);
+        if (n < IO_CHUNK) {
+          drain();
+          check_read_error(in, opt.input);
+          if (const int e = reader->read_error())
+            die_io("read error on " + (opt.input.empty() ? std::string("input") : opt.input)
+                   + " (" + std::strerror(e) + ")");
+          direct_total = reader->direct_bytes();   // the reader has stopped
+          direct_counted = true;
+          break;
+        }
+        if (!decode_broke) reader->give_back(chunk);
       }
     } catch (const std::bad_alloc &) {
       die("out of memory");
@@ -16087,6 +16283,13 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
   }
   drain();   // a backstop: every way out of the loop above has drained already
   if (aio && aio->had_error()) die_io(gz_write_fail("async write failed"));
+  // The proof that O_DIRECT did the reading (the setup line precedes the first
+  // read, and a refused read degrades after it).  Only once the reader has
+  // stopped: a --keep-going break leaves its one slot held, so it has not
+  // reached EOF and cannot publish a final count.
+  if (reads_direct && direct_counted)
+    vlog(V_VERBOSE, opt, "[DIRECT-READ] single-frame stream: read " + std::to_string(direct_total)
+         + " bytes with O_DIRECT\n");
   if (ret > 0 && !decode_broke) {
     // A truncated trailing SKIPPABLE frame is gzstd's own damaged index/seek
     // table and is recoverable for -d/-l (see trailing_skippable_tolerated —
@@ -18280,19 +18483,6 @@ static int probe_preadable_input(const Options & opt, FILE * in, uint64_t * size
 ======================================================================*/
 static bool kernel_has_per_vma_locks();   // Linux >= 6.4; defined below
 
-// Test-only (see the read loop): force every O_DIRECT pread in the parallel
-// reader to fail with EINVAL, so the buffered degrade path can be exercised on a
-// filesystem that in fact supports O_DIRECT.
-static const bool g_debug_mt_direct_einval = [] {
-  const char * e = std::getenv("GZSTD_DEBUG_MT_DIRECT_EINVAL"); return e && *e == '1'; }();
-// Test-only: GZSTD_DEBUG_MT_PREAD_EIO=N makes the Nth pread of the parallel
-// decompress reader (1-based, counted across its threads) fail with EIO, as a
-// failing device would.  No filesystem here can be made to do that without
-// privileges, and the path it reaches reported a READ error as a DATA error
-// (exit 4 where the table says 3) until v0.17.89.
-static const long g_debug_mt_pread_eio = [] () -> long {
-  const char * e = std::getenv("GZSTD_DEBUG_MT_PREAD_EIO"); return e ? std::atol(e) : 0L; }();
-static std::atomic<long> g_debug_mt_pread_count{0};
 // Test-only companion for the SINGLE-reader fallback.  The first direct read is
 // trimmed to one complete frame; the next is refused with EINVAL, and after the
 // fallback seek the held buffered descriptor is closed so fread sets ferror.
@@ -20100,6 +20290,36 @@ static unsigned gz_physical_cores_allowed()
 #endif
 }
 
+// Last-level caches this process may run on: distinct L3 sharing sets among
+// the CPUs in its affinity mask, from sysfs.  0 when that cannot be read.
+static unsigned gz_l3_domains_allowed()
+{
+#ifdef __linux__
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof(set), &set) != 0) return 0;
+  std::set<std::string> doms;
+  char line[4096];
+  for (int c = 0; c < CPU_SETSIZE; ++c) {
+    if (!CPU_ISSET(c, &set)) continue;
+    const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cache/index3/";
+    FILE * f = std::fopen((base + "level").c_str(), "r");
+    if (!f) return 0;
+    const bool lvl3 = std::fgets(line, sizeof line, f) && std::atoi(line) == 3;
+    std::fclose(f);
+    if (!lvl3) return 0;
+    if (!(f = std::fopen((base + "shared_cpu_list").c_str(), "r"))) return 0;
+    const bool got = std::fgets(line, sizeof line, f) != nullptr;
+    std::fclose(f);
+    if (!got) return 0;
+    doms.insert(line);
+  }
+  return (unsigned)doms.size();
+#else
+  return 0;
+#endif
+}
+
 static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // DEFAULT = PHYSICAL CORES (v0.17.91), as `zstd -T0` does.  It used to be
@@ -20195,20 +20415,109 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
     batch.reset();
     batch_used = 0;
   };
+  // READ FAR ENOUGH AHEAD -- ACROSS L3 CACHES (v0.18.4).  The reader held 4
+  // chunks (16 MiB), and with zstd's workers spread over a large machine that
+  // made READING the bottleneck of a warm run.  MEASURED on a 2-socket,
+  // 128-core machine whose L3 is 16 separate caches, 19.5 GiB from the page
+  // cache to /dev/null, 128 workers, level 3: with 4 chunks the reader spent
+  // the whole run inside fread, copying at 1.5-2.5 GiB/s from a cache a plain
+  // read takes at 14.5, and the run took 6.0-13.4 s; with 64 it copied at
+  // 4.1-4.6 and took 4.6-5.3 s.  At levels 15 and 19, exploratory times at
+  // the tested depths were close.  Placement matters: pinned inside one L3 cache,
+  // 8 workers copied at 10.5 GiB/s with 4 chunks, and spread one per cache at
+  // 2.3-2.6 whatever the depth -- consistent with a cost of moving input
+  // between caches (inferred, not proven).  So:
+  //   * inside ONE L3, keep 4.  There a deeper ring measured SLOWER, as if it
+  //     no longer fit the cache: 1.9-2.1 s with 4 chunks, 2.6 with 8, 2.5
+  //     with 64 (an 8-core desktop, or a container on one core complex).
+  //   * across several, one chunk per worker: with 16 workers, 16 were
+  //     enough; with 32, 12.9 s became 4.3 (medians of 3); with 128, 64.  It costs 4 MiB
+  //     a worker, against the 8 MiB input section and output each worker holds
+  //     at level 3.  Capped at 64 (128 measured no better), and at what the
+  //     input can fill.  Unknown topology counts as several.
+  // A one-thread zstd consumes slowly and keeps 4 either way, and the L3
+  // layout (two sysfs files per allowed CPU) is read only where it can change
+  // the answer.  An EMPTY regular file is a known size too: known_input_size()
+  // says 0 for it and for a pipe alike, and without this an empty --direct-read
+  // input reserved and prefaulted the whole 256 MiB region (measured 263 MiB
+  // peak, against 8 MiB on v0.18.3; found by the Codex review).
+  uint64_t fill_cap = UINT64_MAX;   // chunks the input can fill, plus the end
+  if (total_in > 0) fill_cap = total_in / READ_CHUNK + 2;
+#ifndef _WIN32
+  else if (in) {
+    struct stat est{};
+    if (::fstat(::fileno(in), &est) == 0 && S_ISREG(est.st_mode) && est.st_size == 0)
+      fill_cap = 2;
+  }
+#endif
+  int depth = 4;
+  bool l3_read = false;
+  unsigned l3s = 0;                 // 0 = unknown
+  if (sw_mt && n_threads > 4 && fill_cap > 4) {
+    l3s = gz_l3_domains_allowed();
+    l3_read = true;
+    if (l3s != 1) depth = (int)std::min<unsigned>(64, n_threads);
+  }
+  depth = (int)std::min<uint64_t>((uint64_t)depth, fill_cap);
+
+  // --direct-read (v0.18.4): this path ignored it and read through the page
+  // cache.  Its one reader now reads O_DIRECT, through a new description of
+  // the held input (gz_reopen_input) -- never the user's name, which may name
+  // another file by now -- starting where the FILE stands, which must be on
+  // the 4 KiB grid.  Only when asked: the --adapt read-path prior that can
+  // turn the flag on was measured on the frame-parallel reader, not this one.
+  int dfd = -1;
+#ifndef _WIN32
+  uint64_t doff = 0;
+  if (opt.direct_read && opt.direct_read_user_set) {
+    struct stat dst{};
+    const bool regular = in && ::fstat(::fileno(in), &dst) == 0 && S_ISREG(dst.st_mode);
+    const off_t here = regular ? ::ftello(in) : -1;
+    if (here >= 0 && (here & 4095) == 0) {
+      dfd = gz_reopen_input(::fileno(in), O_RDONLY | O_DIRECT);
+      doff = (uint64_t)here;
+    }
+    // A pipe stays silent, as on decompress: there is nothing to bypass.
+    if (dfd < 0 && (opt.input != "-" || regular))
+      vlog(V_DEFAULT, opt,
+           "warning: --direct-read could not engage O_DIRECT on the held input; "
+           "using buffered input instead.\n");
+  }
+#endif
   std::unique_ptr<ChunkPrefetcher> reader;
-  try { reader = std::make_unique<ChunkPrefetcher>(in, READ_CHUNK, 4); }
+  try {
+#ifndef _WIN32
+    if (dfd >= 0)
+      reader = std::make_unique<ChunkPrefetcher>(in, dfd, doff, READ_CHUNK, depth, opt);
+#endif
+    if (!reader) reader = std::make_unique<ChunkPrefetcher>(in, READ_CHUNK, depth);
+  }
   catch (const std::bad_alloc &) { die("out of memory"); }
   catch (const std::exception & e) { die(e.what()); }
+  vlog(V_VERBOSE, opt, "[SLIDING-WINDOW] reading ahead " + std::to_string(depth) + " x "
+       + std::to_string(READ_CHUNK / ONE_MIB) + " MiB"
+       + (!l3_read ? std::string()
+          : l3s ? " (" + std::to_string(l3s) + " L3 cache" + (l3s == 1 ? ")" : "s)")
+                : std::string(" (L3 layout unknown)"))
+       + (dfd >= 0 ? ", O_DIRECT (page cache bypassed)" : "") + "\n");
+  // A short chunk ends the stream: EOF, or a failed read.  ferror() reports a
+  // buffered one, and the reader an O_DIRECT one, which ferror() cannot see.
+  auto check_input_end = [&]() {
+    check_read_error(in, opt.input);
+    if (const int e = reader->read_error())
+      die_io("read error on " + (opt.input.empty() ? std::string("input") : opt.input)
+             + " (" + std::strerror(e) + ")");
+  };
   // after the gate: it reads at once.  A thrown allocation in the loop must
   // exit before reader's destructor tries to join an unfinished pipe read.
   try {
   while (!finished) {
-    size_t n = 0;
-    FrameVec inbuf = reader->take(n);
+    const ChunkPrefetcher::Chunk cur = reader->take();
+    const size_t n = cur.n;
     // A SHORT read is what ends this stream, so the error check belongs on the
     // short branch too — not just on n == 0.  Otherwise a mid-file EIO is
     // flushed as ZSTD_e_end and sealed into a valid, truncated archive.
-    if (n < READ_CHUNK) check_read_error(in, opt.input);
+    if (n < READ_CHUNK) check_input_end();
     if (m && n > 0) m->read_bytes.fetch_add(n, std::memory_order_relaxed);
     read_total += n;
     // THE PLEDGE IS A PROMISE THIS PATH MUST KEEP ITSELF.  The frame header carries
@@ -20235,19 +20544,19 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
     // full chunk, look at the next one first: empty means this is the end, and
     // anything else is the growth the check above refuses.
     if (!last_chunk && total_in > 0 && read_total == total_in) {
-      size_t n2 = 0;
-      FrameVec next = reader->take(n2);
-      if (n2 < READ_CHUNK) check_read_error(in, opt.input);
+      const ChunkPrefetcher::Chunk next = reader->take();
+      const size_t n2 = next.n;
+      if (n2 < READ_CHUNK) check_input_end();
       if (n2 > 0)
         die_data("--sliding-window: " + opt.input + " grew while it was being compressed "
                  "(" + std::to_string(total_in) + " bytes when it was sized, more when read); "
                  "the frame would declare the wrong size");
-      reader->give_back(std::move(next));
+      reader->give_back(next);
       last_chunk = true;
     }
-    if (sv && n) sv->note_input(inbuf.data(), n);
+    if (sv && n) sv->note_input(cur.data, n);
 
-    ZSTD_inBuffer input = { inbuf.data(), n, 0 };
+    ZSTD_inBuffer input = { cur.data, n, 0 };
     ZSTD_EndDirective directive = last_chunk ? ZSTD_e_end : ZSTD_e_continue;
 
     do {
@@ -20277,7 +20586,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
 
       if (last_chunk && remaining == 0) finished = true;
     } while (input.pos < input.size || (last_chunk && !finished));
-    reader->give_back(std::move(inbuf));
+    reader->give_back(cur);
   }
   } catch (const std::bad_alloc &) {
     die("out of memory");
@@ -20289,6 +20598,11 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   ship();
   aio.flush();
   if (aio.had_error()) die_io(gz_write_fail("async write failed"));
+  // The proof that O_DIRECT did the reading: the setup line above is printed
+  // before the first read, and a refused read degrades to buffered after it.
+  if (dfd >= 0)
+    vlog(V_VERBOSE, opt, "[SLIDING-WINDOW] read " + std::to_string(reader->direct_bytes())
+         + " of " + std::to_string(read_total) + " bytes with O_DIRECT\n");
 
   ZSTD_freeCCtx(cctx);
   progress_done = true; gz_wake_periodic_loops(); progress_thr.join();

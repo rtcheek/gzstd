@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=607
-$EXTENSIVE && EXPECTED_TESTS=766
+EXPECTED_TESTS=613
+$EXTENSIVE && EXPECTED_TESTS=772
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -821,6 +821,10 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # but cannot be discarded), neither needing a GPU: 606, 765; deltas unchanged.
 # v0.18.3: one cell, no GPU (the library search path never reaches the current
 # directory): 607, 766; deltas unchanged.
+# v0.18.4: three --sliding-window --direct-read cells (reads O_DIRECT with the same
+# frame; a refused read degrades; a failed read exits 3) and three for the
+# single-frame decoder (-d/-t read O_DIRECT; refused/failed reads; --keep-going),
+# none needing a GPU: 613, 772; deltas unchanged.  DERIVED.
 EXPECTED_NOGPU_DELTA=168
 $EXTENSIVE && EXPECTED_NOGPU_DELTA=197   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
@@ -9485,6 +9489,152 @@ else
   skip "--sliding-window output is byte-identical to zstd's" "no zstd"
 fi
 
+# --sliding-window HONOURS --direct-read (v0.18.4).  The flag was accepted and
+# ignored: the one reader read through the page cache whatever was asked.  It now
+# preads an O_DIRECT description of the held input.  The bytes must not change --
+# the buffered run is the oracle, and the cell above ties that to zstd -- across
+# the shapes the O_DIRECT reader treats differently: a size on the 4 MiB grid
+# (the look-ahead at the pledge reads past it), one off the 4 KiB grid (the only
+# off-grid read is the last), and a single byte.  The setup line prints before the
+# first read, and a refused read degrades to buffered after it, so the proof is
+# the end-of-run count of bytes that came through O_DIRECT.  The default path
+# must not print it.
+swd="$TMPDIR/swd"; mkdir -p "$swd"; swd_why=""
+head -c $((8*1048576 + 4097)) /dev/urandom > "$swd/r"
+for swd_n in $((8*1048576)) $((8*1048576 + 4097)) 1; do
+  head -c "$swd_n" "$swd/r" > "$swd/in"
+  rc_b=0; "$GZSTD" --sliding-window -v -f "$swd/in" -o "$swd/b.zst" 2>"$swd/b.log" || rc_b=$?
+  rc_d=0; "$GZSTD" --sliding-window --direct-read -v -f "$swd/in" -o "$swd/d.zst" 2>"$swd/d.log" || rc_d=$?
+  swd_cnt=$(tr '\r' '\n' < "$swd/d.log" | sed -n 's/.*\[SLIDING-WINDOW\] read \([0-9][0-9]*\) of \([0-9][0-9]*\) bytes with O_DIRECT.*/\1 \2/p' | head -1)
+  if [[ $rc_b -ne 0 || $rc_d -ne 0 ]]; then swd_why+=" [$swd_n: exit $rc_b buffered, $rc_d O_DIRECT]"
+  elif ! cmp -s "$swd/b.zst" "$swd/d.zst"; then swd_why+=" [$swd_n: the O_DIRECT run wrote different bytes]"
+  elif [[ "$swd_cnt" != "$swd_n $swd_n" ]]; then swd_why+=" [$swd_n: O_DIRECT read ${swd_cnt:-<no count line>}, want all of it]"
+  elif tr '\r' '\n' < "$swd/d.log" | grep -qiE 'refused an O_DIRECT|could not engage'; then swd_why+=" [$swd_n: degraded to buffered]"
+  elif tr '\r' '\n' < "$swd/b.log" | grep -q 'with O_DIRECT'; then swd_why+=" [$swd_n: the DEFAULT run claimed O_DIRECT]"
+  fi
+done
+[[ -z "$swd_why" ]] && pass "--sliding-window --direct-read reads O_DIRECT and writes the same frame" \
+  || fail "--sliding-window --direct-read reads O_DIRECT and writes the same frame" "$swd_why"
+
+# ...and a filesystem that accepts open(O_DIRECT) but refuses the read degrades
+# to buffered from the offset reached, once, with the same frame.  Every local
+# filesystem here accepts the reads, so the refusal is forced.
+rc=0; GZSTD_DEBUG_MT_DIRECT_EINVAL=1 "$GZSTD" --sliding-window --direct-read -v -f "$swd/r" \
+  -o "$swd/f.zst" 2>"$swd/f.log" || rc=$?
+"$GZSTD" --sliding-window -q -f "$swd/r" -o "$swd/rb.zst" 2>/dev/null
+swd_ref=$(tr '\r' '\n' < "$swd/f.log" | grep -c 'refused an O_DIRECT read')
+swd_cnt=$(tr '\r' '\n' < "$swd/f.log" | sed -n 's/.*\[SLIDING-WINDOW\] read \([0-9][0-9]*\) of.*/\1/p' | head -1)
+if [[ $rc -eq 0 && $swd_ref -eq 1 && "$swd_cnt" == 0 ]] && cmp -s "$swd/f.zst" "$swd/rb.zst"; then
+  pass "--sliding-window --direct-read degrades to buffered when the read is refused"
+else
+  fail "--sliding-window --direct-read degrades to buffered when the read is refused" \
+       "exit $rc, refusal logged $swd_ref times (want 1), O_DIRECT bytes ${swd_cnt:-?} (want 0), same frame: $(cmp -s "$swd/f.zst" "$swd/rb.zst" && echo yes || echo no)"
+fi
+
+# ...and any other failed O_DIRECT read is an I/O error: exit 3 and no archive.
+# ferror() cannot see it, so this is the check that it is asked at all; without
+# it the short read ends the frame early, and zstd's own size check turns a READ
+# error into a DATA one (exit 4).  GZSTD_DEBUG_MT_PREAD_EIO=2 fails the second
+# read, 4 MiB in.
+rc=0; GZSTD_DEBUG_MT_PREAD_EIO=2 "$GZSTD" --sliding-window --direct-read -f "$swd/r" \
+  -o "$swd/e.zst" 2>"$swd/e.log" || rc=$?
+if [[ $rc -eq 3 && ! -e "$swd/e.zst" ]] && grep -q 'read error on' "$swd/e.log"; then
+  pass "--sliding-window --direct-read: a failed read exits 3 with no archive"
+else
+  fail "--sliding-window --direct-read: a failed read exits 3 with no archive" \
+       "exit $rc (want 3), archive left: $([[ -e "$swd/e.zst" ]] && echo yes || echo no), stderr: $(tr '\n' ' ' < "$swd/e.log" | head -c 200)"
+fi
+rm -rf "$swd"
+
+# THE SINGLE-FRAME DECODER HONOURS --direct-read TOO (v0.18.4).  A frame too large
+# to split, or one that declares no size, is decoded by one streaming reader, and
+# that reader read through the page cache whatever was asked: every real
+# --sliding-window archive.  A SIZELESS frame takes that route at any size, so a
+# small one exercises it.  The proof is the end-of-run count of bytes that came
+# through O_DIRECT, which must be the whole archive; -t takes the same reader.
+sfd="$TMPDIR/sfd"; mkdir -p "$sfd"; sfd_why=""
+head -c $((9*1048576 + 4097)) /dev/urandom > "$sfd/r.bin"
+cat "$sfd/r.bin" | "$GZSTD" --sliding-window -q -c > "$sfd/s.zst" 2>/dev/null   # sizeless
+sfd_sz=$(stat -c %s "$sfd/s.zst")
+rc=0; "$GZSTD" -d -v -f "$sfd/s.zst" -o "$sfd/b.out" 2>"$sfd/b.log" || rc=$?
+[[ $rc -eq 0 ]] && files_match "$sfd/r.bin" "$sfd/b.out" || sfd_why+=" [buffered -d: exit $rc or wrong bytes]"
+tr '\r' '\n' < "$sfd/b.log" | grep -q 'with O_DIRECT' && sfd_why+=" [the DEFAULT run claimed O_DIRECT]"
+for sfd_m in d t; do
+  rc=0
+  if [[ $sfd_m == d ]]; then "$GZSTD" -d --direct-read -v -f "$sfd/s.zst" -o "$sfd/d.out" 2>"$sfd/d.log" || rc=$?
+  else "$GZSTD" -t --direct-read -v "$sfd/s.zst" 2>"$sfd/d.log" || rc=$?; fi
+  sfd_cnt=$(tr '\r' '\n' < "$sfd/d.log" | sed -n 's/.*single-frame stream: read \([0-9][0-9]*\) bytes with O_DIRECT.*/\1/p' | head -1)
+  if [[ $rc -ne 0 ]]; then sfd_why+=" [-$sfd_m --direct-read: exit $rc]"
+  elif [[ $sfd_m == d ]] && ! files_match "$sfd/r.bin" "$sfd/d.out"; then sfd_why+=" [-d --direct-read: wrong bytes]"
+  elif [[ "$sfd_cnt" != "$sfd_sz" ]]; then sfd_why+=" [-$sfd_m: O_DIRECT read ${sfd_cnt:-<no count line>} of $sfd_sz bytes]"
+  elif tr '\r' '\n' < "$sfd/d.log" | grep -qiE 'refused an O_DIRECT|could not engage'; then sfd_why+=" [-$sfd_m: degraded to buffered]"
+  fi
+done
+[[ -z "$sfd_why" ]] && pass "the single-frame decoder reads O_DIRECT under --direct-read (-d and -t)" \
+  || fail "the single-frame decoder reads O_DIRECT under --direct-read (-d and -t)" "$sfd_why"
+
+# ...a refused O_DIRECT read degrades to buffered, once, with the same bytes; any
+# other failed read is an I/O error, exit 3, with the output removed (the
+# decoder's buffered reads were always checked; ferror() cannot see these).
+sfd_why=""
+rc=0; GZSTD_DEBUG_MT_DIRECT_EINVAL=1 "$GZSTD" -d --direct-read -v -f "$sfd/s.zst" -o "$sfd/f.out" 2>"$sfd/f.log" || rc=$?
+sfd_ref=$(tr '\r' '\n' < "$sfd/f.log" | grep -c 'refused an O_DIRECT read')
+[[ $rc -eq 0 && $sfd_ref -eq 1 ]] && files_match "$sfd/r.bin" "$sfd/f.out" \
+  || sfd_why+=" [refused: exit $rc, refusal logged $sfd_ref times (want 1), same bytes: $(files_match "$sfd/r.bin" "$sfd/f.out" && echo yes || echo no)]"
+rc=0; GZSTD_DEBUG_MT_PREAD_EIO=2 "$GZSTD" -d --direct-read -f "$sfd/s.zst" -o "$sfd/e.out" 2>"$sfd/e.log" || rc=$?
+[[ $rc -eq 3 && ! -e "$sfd/e.out" ]] && grep -q 'read error on' "$sfd/e.log" \
+  || sfd_why+=" [failed read: exit $rc (want 3), output left: $([[ -e "$sfd/e.out" ]] && echo yes || echo no)]"
+[[ -z "$sfd_why" ]] && pass "single-frame decoder, --direct-read: a refused read degrades, a failed one exits 3" \
+  || fail "single-frame decoder, --direct-read: a refused read degrades, a failed one exits 3" "$sfd_why"
+
+# ...and under --keep-going.  Its buffered decoder reads synchronously (a prefetch
+# thread could wait forever on a pipe); the O_DIRECT one reads through ONE slot it
+# hands back only after the chunk decodes, so no read is in flight past a broken
+# block (a read on a stalled network filesystem could otherwise hold the exit),
+# and it must stop there exactly as the synchronous loop does.  The oracle is the
+# buffered run: the same exit code and the same recovered bytes.  The O_DIRECT run
+# must also have STOPPED there -- a reader that read on to the end prints its
+# byte count, one stopped early does not -- and a loop that does not stop now
+# waits forever on the held slot, hence the timeout.  Entropy-coded data with a
+# reserved block type 37% in, as above, so the damage breaks a block in the
+# second 4 MiB read rather than a checksum at the end.
+if command -v python3 >/dev/null 2>&1; then
+  sfd_why=""
+  ( set +o pipefail
+    head -c $((15*1048576)) /dev/urandom | base64 -w0 | head -c $((20*1048576)) > "$sfd/k.bin" )
+  cat "$sfd/k.bin" | "$GZSTD" --sliding-window -q -c > "$sfd/k.zst" 2>/dev/null
+  python3 - "$sfd/k.zst" "$sfd/kbad.zst" <<'SFDPY' 2>/dev/null
+import sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+fhd = b[4]; ss = (fhd >> 5) & 1
+pos = 4 + 1 + (0 if ss else 1) + [0, 1, 2, 4][fhd & 3] + [ss, 2, 4, 8][fhd >> 6]
+target = int(len(b) * 0.37)
+while True:
+    h = b[pos] | (b[pos + 1] << 8) | (b[pos + 2] << 16)
+    last, btype, bsize = h & 1, (h >> 1) & 3, h >> 3
+    if pos >= target or last:
+        b[pos] |= 0x06                     # block type 3: reserved, always an error
+        break
+    pos += 3 + (1 if btype == 1 else bsize)
+open(sys.argv[2], 'wb').write(bytes(b))
+SFDPY
+  rcb=0; timeout --foreground -k 10 120 "$GZSTD" -d --keep-going -q -f "$sfd/kbad.zst" -o "$sfd/kb.out" 2>/dev/null || rcb=$?
+  rcd=0; timeout --foreground -k 10 120 "$GZSTD" -d --keep-going --direct-read -v -f "$sfd/kbad.zst" -o "$sfd/kd.out" 2>"$sfd/kd.log" || rcd=$?
+  if [[ $rcb -ne 7 || $rcd -ne 7 ]]; then sfd_why+=" [exit $rcb buffered, $rcd O_DIRECT; want 7 and 7]"
+  elif ! cmp -s "$sfd/kb.out" "$sfd/kd.out"; then
+    sfd_why+=" [recovered $(stat -c %s "$sfd/kd.out" 2>/dev/null) bytes O_DIRECT, $(stat -c %s "$sfd/kb.out" 2>/dev/null) buffered, or different bytes]"
+  elif ! tr '\r' '\n' < "$sfd/kd.log" | grep -q 'single-frame stream: O_DIRECT input'; then
+    sfd_why+=" [the --keep-going run did not read O_DIRECT]"
+  elif tr '\r' '\n' < "$sfd/kd.log" | grep -q 'single-frame stream: read'; then
+    sfd_why+=" [the O_DIRECT reader read on past the broken block]"
+  fi
+  [[ -z "$sfd_why" ]] && pass "single-frame decoder, --direct-read --keep-going recovers what the buffered run does" \
+    || fail "single-frame decoder, --direct-read --keep-going recovers what the buffered run does" "$sfd_why"
+else
+  skip "single-frame decoder, --direct-read --keep-going recovers what the buffered run does" "needs python3"
+fi
+rm -rf "$sfd"
+
 # A HUGE OR SIZELESS FRAME AFTER SMALLER ONES on stdin (v0.17.92).  Only the
 # first frame used to be streamed: a later sizeless frame made the splitter read
 # the rest of the input into memory, and a later huge sized one was read whole
@@ -14515,17 +14665,24 @@ rm -f "$PIN"/in.bin* "$PIN"/repl.bin "$PIN/sw.zst" "$PIN/sw.out" \
 #     decoder accepts ("Data corruption detected").  No rename is involved -- a log file
 #     still being written is enough.  GZSTD_DEBUG_SLIDING_GATE parks the run after the
 #     pledge and before the first read, so the change is a rendezvous, not a race.
+#     The _dr arms read O_DIRECT (v0.18.4), changing size OFF the 4 KiB grid: only
+#     the end of the file returns an off-grid count, and the reader must stop there.
 head -c $((12*1048576)) /dev/urandom > "$PIN/sz.bin"
 sz_ok=1; sz_why=""
-for sz_arm in grew shrank; do
+for sz_arm in grew shrank grew_dr shrank_dr; do
   cp "$PIN/sz.bin" "$PIN/sz_in.bin"; rm -f "$PIN/sz.zst" "$PIN/gate"; mkfifo "$PIN/gate"
+  sz_dr=(); [[ $sz_arm == *_dr ]] && sz_dr=(--direct-read)
   GZSTD_DEBUG_SLIDING_GATE="$PIN/gate" timeout --foreground -k 10 120 \
-    "$GZSTD" --cpu-only -T1 --sliding-window -f "$PIN/sz_in.bin" -o "$PIN/sz.zst" >"$PIN/sz.log" 2>&1 &
+    "$GZSTD" --cpu-only -T1 --sliding-window "${sz_dr[@]}" -f "$PIN/sz_in.bin" -o "$PIN/sz.zst" >"$PIN/sz.log" 2>&1 &
   sz_pid=$!
   if [[ $sz_arm == grew ]]; then
     sz_do='exec 9>"$1" || exit 1; head -c 1048576 /dev/urandom >> "$2" || exit 1; printf go >&9; exec 9>&-'
-  else
+  elif [[ $sz_arm == grew_dr ]]; then
+    sz_do='exec 9>"$1" || exit 1; head -c 1000 /dev/urandom >> "$2" || exit 1; printf go >&9; exec 9>&-'
+  elif [[ $sz_arm == shrank ]]; then
     sz_do='exec 9>"$1" || exit 1; truncate -s 4194304 "$2" || exit 1; printf go >&9; exec 9>&-'
+  else
+    sz_do='exec 9>"$1" || exit 1; truncate -s 5000000 "$2" || exit 1; printf go >&9; exec 9>&-'
   fi
   sz_gated=0; timeout 60 sh -c "$sz_do" sh "$PIN/gate" "$PIN/sz_in.bin" && sz_gated=1
   sz_rc=0; wait "$sz_pid" || sz_rc=$?
@@ -14535,7 +14692,7 @@ for sz_arm in grew shrank; do
   if [[ $sz_rc -ne 4 ]]; then
     sz_ok=0; sz_why="$sz_arm: exit $sz_rc, want 4"; break
   fi
-  if [[ $sz_arm == grew ]] && ! grep -aq "grew while it was being compressed" "$PIN/sz.log"; then
+  if [[ $sz_arm == grew* ]] && ! grep -aq "grew while it was being compressed" "$PIN/sz.log"; then
     sz_ok=0; sz_why="grew: exit 4 but not from the size check"; break
   fi
   if [[ -e "$PIN/sz.zst" ]]; then sz_ok=0; sz_why="$sz_arm: an archive with the wrong declared size was left behind"; break; fi

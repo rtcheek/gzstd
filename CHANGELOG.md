@@ -1,12 +1,176 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.3  
+**Covers:** v0.9.50 → v0.18.4  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.4 — `--sliding-window` reads far enough ahead, and `--direct-read` reaches single frames both ways
+
+**What was slow.** `--sliding-window` read its input on one thread, four 4 MiB chunks ahead (v0.17.91).
+On a large machine that made READING the bottleneck, and the reason was not the disk. MEASURED on the
+2-socket, 128-core server (its L3 is 16 separate caches), 19.5 GiB (20,971,520,000 bytes) from the page
+cache to /dev/null, 128 workers, level 3: the reader spent the entire run inside `fread`, copying out of
+the page cache at 1.5-2.5 GiB/s a file that a plain `dd` reads at 14.5 GiB/s, and the run took 6.0-13.4
+s. With 64 chunks the same copy ran at 4.1-4.6 GiB/s and the run took 4.6-5.3 s. Placement mattered:
+with every thread inside one L3 cache the copy ran at 10.5 GiB/s with 4 chunks, and with one thread per
+cache at 2.3-2.6 whatever the depth. That result is consistent with a cost from moving input between
+caches; a shallow ring also made the reader wait for buffers.
+
+What depth a run needs -- an EXPLORATORY sweep, one or two runs per cell, which justifies the policy and
+claims nothing by itself (warm, high-ratio data unless noted):
+
+| workers, placement | 4 chunks | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| 128, whole machine | 6.0-13.4 s | 6.2-6.6 | 5.8 | 5.0-5.1 | 4.6-5.3 | 4.6 |
+| 32, whole machine | 12.1 | | 4.2 / 6.2 | 4.3 | 4.3-5.2 | |
+| 16, whole machine | 7.6 / 11.6 | | 6.3 | | 6.4-6.6 | |
+| 8, inside one L3 cache | **1.9-2.1** | 2.6 | | | 2.5 | |
+| 128, medium data, level 9 | 6.8-11.4 | 6.7 | 6.7 | 6.7 | 5.1-6.2 | |
+
+In the exploratory level-15 and level-19 checks, the tested depths were close (10.5 vs 10.7 s and
+63.6 vs 64.8 s). The larger low-level gaps motivated growing the ring when workers are spread across
+caches. In the tested single-cache placement, the deeper ring was slower in this sweep, consistent with
+cache pressure; the five-run A/B below checks that the chosen depth does not regress that placement.
+
+**What `--direct-read` did here: nothing.** The flag was accepted and the input was read through the
+page cache (strace: `O_RDONLY`).
+
+**The fix.**
+- The read-ahead is one chunk per worker, at most 64 (256 MiB) and never more than the input can fill,
+  when the CPUs the process may use span more than one L3 cache; 4, as before, inside one cache, or when
+  zstd has no worker threads. The L3 layout comes from sysfs, read from the affinity mask the same way
+  physical cores are counted, and only where it can change the answer (more than 4 workers, an input
+  of more than 4 chunks); an unreadable layout counts as several caches. `-v` prints the depth, and the
+  number of caches when it read them.
+- `--direct-read` reads O_DIRECT, through a new description of the held input (`gz_reopen_input`, never
+  the user's name), from where the FILE stands, which must be on the 4 KiB grid. The buffers are one
+  aligned region laid out by `DirectReadPool`, as on the frame-parallel O_DIRECT reader. A filesystem
+  that refuses the reads degrades to buffered from the offset reached, with a warning, as the decompress
+  readers do; any other failed read exits 3 (ferror cannot see an O_DIRECT error, so the reader reports
+  it). `-v` ends with the number of bytes that came through O_DIRECT. Only an explicit `--direct-read`
+  engages it: the `--adapt` read-path prior was measured on the frame-parallel reader (ROADMAP 11).
+- The reader's buffers are allocated on the caller's thread, as before. Allocated lazily on the reader
+  thread, they came from its own malloc arena, and a run inside one L3 cache measured 2.5% slower
+  (2.10-2.14 s against 2.05-2.07, five runs each).
+
+**Measured, v0.18.3 against v0.18.4**: median (min-max) of three interleaved runs, the final binary,
+19.5 GiB, default workers unless noted, level 3, to /dev/null, on the server above:
+
+| case | v0.18.3 | v0.18.4 |
+|---|---|---|
+| high-ratio data, warm | 13.01 s (12.58-13.38) | 4.60 s (4.58-5.15) |
+| medium data, warm | 7.80 s (7.20-11.11) | 4.80 s (4.77-5.61) |
+| medium data, level 9, warm | 6.75 s (6.32-10.33) | 5.19 s (5.01-6.91) |
+| high-ratio, cold | 18.73 s (15.04-18.94) | 9.30 s (9.12-9.46); **5.10 s (5.04-5.24) with --direct-read** |
+| medium, cold | 15.54 s (11.65-15.62) | 8.17 s (8.17-8.30); **5.27 s (5.18-5.63) with --direct-read** |
+| `-T32`, warm | 12.94 s (12.88-13.12) | 4.30 s (4.13-4.30) |
+| `-T8`, warm | 12.72 s (8.86-13.39) | 9.05 s (8.88-9.18) |
+| `-T16` inside two L3 caches | 3.71 s (3.71-4.64) | 3.68 s (3.66-3.69) |
+| `-T8` inside one L3 cache (five runs) | 2.03 s (2.03-2.06) | 2.03 s (2.03-2.05) |
+
+`dd iflag=direct bs=4M` read the same file cold in 5.68 s (4.77-5.88), so `--direct-read` runs at the
+device's single-stream rate. It also takes the page cache's work away: a median 1.3-1.8 s of system
+time against 8.6-8.7 buffered and 16.8-20.2 on v0.18.3. Memory grows with the depth and with zstd
+itself, which keeps more workers busy once its input arrives (median peak RSS): 1.3-2.1 GiB against
+1.0-1.2 at level 3, 5.1 GiB against 2.4 at level 9.
+
+**The single-frame decoder ignored `--direct-read` too.** A frame of more than 256 MiB, or one that
+declares no size, is decoded by one streaming reader (v0.17.91) -- every large `--sliding-window`
+archive -- and that reader read through the page cache whatever was asked (strace, a 600 MiB frame:
+`O_RDONLY`, no O_DIRECT reopen, no warning). Frames up to 256 MiB go through the frame splitter, which
+already honoured the flag. The streaming reader now takes the same O_DIRECT mode as the compressor's:
+from where the FILE stands -- 0 on the named-file route, the splitter's 4 MiB-aligned stopping point on
+the routes that hand over mid-stream, which reposition the FILE after their own O_DIRECT reads -- with
+the same fallback and the same exit 3 on a failed read, and, as there, only for an explicit flag.
+Under `--keep-going` it uses one O_DIRECT slot: buffered input still reads synchronously because a
+prefetch thread can wait forever on a pipe. A regular file can also have a delayed read, so the direct
+reader does not start the next read until the current chunk decodes cleanly. Its loop stops at a broken
+block exactly where the synchronous loop does.
+MEASURED, median of three, a 19.5 GiB single-frame archive, cold, to /dev/null: `-d` 7.42 s (7.41-7.43)
+with `--direct-read` against 7.43 s (7.43-7.45) buffered and 7.52 s (7.44-7.56) on v0.18.3; `-t` 7.26
+against 7.38. Decoding is the limit, so the gain is the page cache's work: system time 0.33 s against
+4.21 (`-t`: 0.29 against 4.41).
+
+**Normal single-frame decode depth** stays at 4 chunks (one under `--keep-going`). It consumes on one thread; an exploratory
+check found no clear speedup at 64 (cold 7.6-8.3 s against 7.4; warm 7.7 against 7.4), with 240 MiB
+more buffer capacity.
+
+**Found, not acted on** (ROADMAP 10): where the threads run matters more than the read-ahead. Eight
+workers inside one L3 cache compressed the high-ratio file in 2.05 s, against 4.6 s for the default 128
+spread over the machine; on medium data 3.2-3.4 s against 4.9-5.6, with one socket's 64 workers
+between them (4.05-4.17). At level 9 one socket was best (4.3-4.4 s), and one cache ran out of compute
+(6.0 s). (Exploratory: two runs per cell.)
+
+Levels and parallel readers (the question that started this): on this server and at the levels tested,
+reading mattered less as the level rose. From level 15 the run was slower than a single cold buffered
+reader; below it a single O_DIRECT stream reached this device. These measurements do not establish
+whether parallel readers help on other storage or CPU layouts.
+
+**Review (Codex, GPT-6-Sol).** Round 1: NOT SAFE TO COMMIT, two blockers, both upheld.
+- An EMPTY input reserved the whole region: `known_input_size()` says 0 for an empty file and for a pipe
+  alike, so the input cap never applied, and `--direct-read` on a 0-byte file prefaulted 256 MiB
+  (measured 263 MiB peak, against 8 MiB on v0.18.3). An empty regular file now caps the depth at 2 (16
+  MiB peak).
+- The A/B table had two runs per cell where AGENTS.md asks for a median of three; it was re-measured
+  with the final binary (above).
+- Also adopted: the sysfs scan is skipped where it cannot change the depth, and `take()` no longer
+  notifies -- nothing waits for a full slot to empty, so each chunk woke the waiting reader for
+  nothing (a defect since v0.17.91). The causal sentences above were narrowed at its request.
+- Its note that a seekable stdin positioned mid-file would be pledged at its full size is not
+  reachable: the driver refuses that input first (exit 2), on v0.18.3 and v0.18.4 alike.
+- Its verification gap, a failed read at the look-ahead past an exact multiple of 4 MiB: closed (exit
+  3, no archive, both builds).
+
+Round 2: SAFE TO COMMIT, with doc-only narrowing of the exploratory claims (adopted). The decoder's
+`--direct-read` gap was then found by the owner and added; round 3 reviewed it: NOT SAFE, one blocker,
+fixed with its code.
+- Under `--keep-going` the O_DIRECT decoder kept a 4-slot read-ahead, so a read PAST the broken block
+  could be in flight at exit; on a stalled network or FUSE filesystem the join could wait on it, where
+  v0.18.3's synchronous loop issued no such read. It now reads through one slot, handed back only after
+  the chunk decodes. MEASURED with strace on a 4-chunk archive broken in chunk 2: 2 O_DIRECT reads, 3
+  runs of 3; with 4 slots (a mutant), all 4.
+- Also adopted: a prefix that already broke under `--keep-going` no longer opens the O_DIRECT
+  descriptor it then never used (a leaked descriptor per such file; checked with strace on a small
+  frame followed by a sizeless one broken in its first block); the decoder closes the descriptor when
+  building its reader throws before the constructor takes it; and a named non-regular input (a block
+  device) now gets the could-not-engage warning, which no other reader gave it.
+- Its other adjudications: the start offset, the prefix and the fallback are contiguous on every route
+  into the decoder; explicit-only engagement is right on decode as on compress.
+
+Round 4, on those fixes as built and measured: SAFE TO COMMIT, no edits.
+
+**Found, not acted on** (ROADMAP 12): a sized frame of more than 256 MiB on a REDIRECTED stdin
+(`gzstd -d < archive.zst`) skips the streaming decoder -- that route is taken only for a named file --
+and the parallel reader holds the whole frame: 631 MB peak for a 600 MiB frame, on v0.18.3 and v0.18.4
+alike. `--direct-read` is honoured there.
+
+**Tests.** Three always-run cells: `--direct-read` reads O_DIRECT and writes the same frame as the
+buffered run, at a size on the 4 MiB grid, one off the 4 KiB grid and a single byte, proven by the
+O_DIRECT byte count rather than the setup line; a refused read degrades once, to the same frame; a
+failed read (`GZSTD_DEBUG_MT_PREAD_EIO=2`, whose scope now includes this reader) exits 3 with no archive.
+The grow/shrink cell gained two O_DIRECT arms that change size off the 4 KiB grid. Mutants, built from
+the tracked files: never engaging O_DIRECT fails all three new cells (as does v0.18.3); a refused read
+made fatal fails the degrade cell; an unchecked read error fails the exit-3 cell (it exits 4, from zstd's
+size check). Removing the stop at an off-grid count SURVIVED: on ext4 and tmpfs a read past the end at
+an off-grid offset returns 0 before the alignment check, so the stop only matters if the file grows
+between the two reads (then the run falls back to buffered, with the right bytes). Kept for that case.
+Three more for the decoder, on a SIZELESS frame (which streams at any size): `-d` and `-t` read the
+whole archive O_DIRECT; a refused read degrades once and a failed one exits 3 with the output removed;
+and `--keep-going` on a reserved block type 37% in recovers exactly the bytes and exit code of the
+buffered run, with the reader stopped at the break (under a timeout: a loop that does not stop now
+waits forever on the held slot). Mutants, all built from the final tree: the three above, each caught
+again; the decoder never engaging O_DIRECT (all three decoder cells), ignoring its read error (exit 4,
+from the truncated stream, not 3), not stopping at a broken block (held by the timeout), and
+`--keep-going` keeping its synchronous buffered reader -- each caught. Four slots under `--keep-going`
+passes every cell, because nothing in them stalls a read; the strace count above is its check.
+
+**Suites** on the eight-GPU server, on the final binaries: `-e` 771 ran, 0 failures, 1 skipped of 772
+(the trivial-park cell, which this host cannot provoke), 14m39s; CPU-only 445 ran, 0 failures. An
+earlier CPU-only run, before the decoder change and its three cells, passed 442/0.
 
 ## v0.18.3 — gzstd no longer loads libraries from the current directory
 

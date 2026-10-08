@@ -124,6 +124,27 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    (`parallel gzstd ::: files`) can quietly run without the GPU it asked for. A short, bounded retry
    on that one error, before writing the card off, is the likely fix; measure first whether the other
    paths' bringup sees the same rate.
+10. **`--sliding-window` placement is worth a fuller measurement.** Exploratory sweep (v0.18.4, 2-socket
+   128-core server whose L3 is 16 separate caches, 19.5 GiB warm to /dev/null): at level 3, 8 workers
+   pinned inside one L3 cache took 2.05 s (high-ratio data) and 3.2-3.4 s (medium), against 4.6-4.9 s
+   and 4.9-5.6 s for the default 128 workers spread over the machine; one socket (64 workers) took
+   4.05-4.17 s on medium. At level 9 one socket was best (4.3-4.4 s), and one cache ran out of compute
+   (6.0 s). The same 8 workers spread one per cache took 7.7-8.7 s, which is consistent with a cost
+   of moving zstd's input between caches (inferred, not proven; no cache counters are readable on that
+   host). v0.18.4 sized the read-ahead to this and stopped there; choosing WHERE to run (a
+   level- and data-dependent placement, or an `--adapt` action) is open. Check a one-L3 desktop and
+   a single-socket Intel box first: the effect may be specific to many-cache parts.
+11. **`--adapt` never picks O_DIRECT for `--sliding-window`.** v0.18.4 honours an explicit
+   `--direct-read` there (cold, medians of 3: 5.1-5.3 s against 8.2-9.3 s buffered), but not the `--adapt`
+   read-path prior, which was measured on the frame-parallel reader, and the frame path's automatic
+   cold-input probe does not run on this path either. A cold sliding-window run would gain from both;
+   it needs this path to record its own read rate first.
+12. **A huge sized frame on a redirected stdin is held whole.** `gzstd -d < archive.zst` with a single
+   frame of more than 256 MiB that declares its size skips the streaming decoder -- the route that
+   peeks at the first frame is taken only for a named file -- and the parallel reader treats the
+   seekable stdin as a file and decodes the frame as one task: MEASURED 631 MB peak for a 600 MiB frame
+   (v0.18.3 and v0.18.4 alike), so a 100 GiB `--sliding-window` archive would need about 100 GiB of
+   memory that `gzstd -d archive.zst` streams in 50 MiB. A pipe and a sizeless frame already stream.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
