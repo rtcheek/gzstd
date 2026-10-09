@@ -49,13 +49,13 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 771 | 612 | **yes, this server** |
-| GPU, GDS unavailable | 754 | 596 | yes, the workstation |  <!-- extensive MEASURED 743 at v0.18.0 (2026-10-06): EXPECTED_TESTS - EXPECTED_NOGDS_DELTA (761 - 18), because the trivial-park cell RUNS there; v0.18.1 adds two GPU cells (763 - 18 = 745, MEASURED 745 2026-10-06); v0.18.2 adds two no-GPU cells (765 - 18 = 747); v0.18.3 one more (766 - 18 = 748); v0.18.4 six more (772 - 18 = 754); default derived as 613 - 17 -->
+| GPU + GPUDirect Storage usable (the baseline) | 772 | 613 | **yes, this server** |
+| GPU, GDS unavailable | 755 | 597 | yes, the workstation |  <!-- extensive MEASURED 743 at v0.18.0 (2026-10-06): EXPECTED_TESTS - EXPECTED_NOGDS_DELTA (761 - 18), because the trivial-park cell RUNS there; v0.18.1 adds two GPU cells (763 - 18 = 745, MEASURED 745 2026-10-06); v0.18.2 adds two no-GPU cells (765 - 18 = 747); v0.18.3 one more (766 - 18 = 748); v0.18.4 six more (772 - 18 = 754); v0.18.5 one more (773 - 18 = 755); default derived as 614 - 17 -->
 | no GPU (the CPU-only build) | not a release gate | 445 | yes |
 
-These are the v0.18.4 expectations (the suite's own constants are the authority, and it prints the
+These are the v0.18.5 expectations (the suite's own constants are the authority, and it prints the
 expectation it used). The baseline row counts what RAN,
-so it is the `EXPECTED_TESTS` constant (772 / 613) minus the one
+so it is the `EXPECTED_TESTS` constant (773 / 614) minus the one
 cell this server cannot provoke — the trivial-park cell needs a trivially-compressed batch to reach
 a GPU, and the CPU pool here drains the fixture first. Since v0.17.64 that skip goes through
 `skip_host`, which subtracts itself from the expectation, so the run says "as expected on this host"

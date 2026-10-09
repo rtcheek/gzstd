@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.4";
+static constexpr const char * GZSTD_VERSION = "0.18.5";
 //
 // Architecture overview:
 //
@@ -4861,6 +4861,12 @@ static void print_help_long()
 "the CPU and never touches a GPU.  -v says which happened.  So a\n"
 "short job, or one the CPU pool decodes at memory speed, costs no\n"
 "GPU bringup and no VRAM under the default.\n"
+"An input of unknown size (a pipe) is held to the one-batch bound as\n"
+"it arrives: CUDA starts once a batch's worth of work has come in, or\n"
+"after a few seconds if it is still coming; a pipe that ends first\n"
+"never touches a GPU.  Through v0.18.4 every piped run started CUDA\n"
+"at once and waited for it -- about 2 s on an 8-GPU machine, even for\n"
+"1 MiB.\n"
 "\n"
 "Through v0.17.85, decompressing (or testing) an input that was\n"
 "already in the page cache switched to --cpu-only on its own.  That\n"
@@ -9124,9 +9130,10 @@ static constexpr double GPU_SAMPLE_SETTLED = 1.25;
 // extrapolate.  No rate constants, no core-count thresholds — it reads the box
 // it is running on.
 //
-// Conservative in every uncertain direction: an unknown total, an unreadable
-// meter, or a job too slow to sample all engage the GPU, i.e. keep today's
-// behaviour.  --gpu-only always engages — there is no CPU pool to fall back on.
+// An unknown total uses arrived work and producer completion to decide whether
+// a batch can be filled; without a work callback, or with a job still running at
+// the guard, it engages the GPU.  --gpu-only always engages — there is no CPU
+// pool to fall back on.
 // `progress` returns the fraction of the JOB that is done (0..1), or <0 when it
 // cannot be known.  It is a callback because the two directions have to measure
 // different things: decompress can use bytes read from the archive, but compress
@@ -9135,10 +9142,18 @@ static constexpr double GPU_SAMPLE_SETTLED = 1.25;
 // progress there says 98% while nearly all the compression is still to do.  It
 // has to count work COMPLETED instead.  Getting this wrong is not a small error:
 // it made every compress skip the GPU, including jobs long enough to want it.
+//
+// `work` and `no_more` (v0.18.5) answer for an input of UNKNOWN size -- a pipe --
+// where `progress` has no denominator: `work` is how much work has arrived so
+// far, in the units gpu_min_useful_bytes measures (input bytes for compress,
+// declared output bytes of the frames queued for decompress), and `no_more`
+// says no further GPU work will arrive.  See the unknown-size branch below.
 static bool gpu_bringup_worth_it(const Options & opt,
                                  const std::function<double()> & progress,
                                  std::mutex & mx, std::condition_variable & cv,
-                                 const std::function<bool()> & stop)
+                                 const std::function<bool()> & stop,
+                                 const std::function<double()> & work = {},
+                                 const std::function<bool()> & no_more = {})
 {
   if (opt.gpu_only) return true;
   // GZSTD_DEBUG_GPU_GUARD_SEC overrides the guard; 0 disables the check so the
@@ -9153,11 +9168,54 @@ static bool gpu_bringup_worth_it(const Options & opt,
     if (end != e && v >= 0.0) guard_sec = v;
   }
   if (guard_sec <= 0.0) return true;
-  if (progress() < 0.0) {                      // no denominator -> cannot judge
-    vlog(V_DEBUG, opt, "[GPU] bringup sample: no progress signal -> engage\n");
-    return true;
-  }
   const auto t_start = std::chrono::steady_clock::now();
+  // NO DENOMINATOR -- A PIPE (v0.18.5).  This used to engage at once, and the run
+  // then waited out cuInit and device setup however little the input turned out
+  // to be: in a GPU build ANY piped input cost about 2 s (MEASURED, 8-GPU server:
+  // 1 MiB through -c or -d, 2.13-2.16 s against 0.02 s for the same file named,
+  // which the up-front size gate keeps CPU-only).  So hold a pipe to that same
+  // gate, on the evidence as it arrives: engage once one batch's worth of work
+  // has arrived (gpu_min_useful_bytes, the bound a named input must pass), skip
+  // if the input ends below it or the run stops, and engage at the guard if work
+  // is still arriving -- a slow pipe, as the sampler engages when it cannot
+  // conclude.  The waits are the sampler's own timed CV waits (see `hold`).
+  if (progress() < 0.0) {
+    const uint64_t gate = gpu_min_useful_bytes(opt);   // 0: the suite's override
+    if (!work || gate == 0) {
+      vlog(V_DEBUG, opt, "[GPU] bringup sample: no progress signal -> engage\n");
+      return true;
+    }
+    auto verdict = [&](bool engage, const char * why) {
+      if (opt.verbosity >= V_DEBUG) {
+        char b[240];
+        std::snprintf(b, sizeof b,
+          "[GPU] bringup sample: size unknown, %.1f MiB of work at %.0f ms, %s "
+          "(one batch: %.0f MiB) -> %s\n",
+          work() / 1048576.0,
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() * 1000.0,
+          why, gate / 1048576.0, engage ? "engage" : "skip");
+        vlog(V_DEBUG, opt, b);
+      }
+      return engage;
+    };
+    for (;;) {
+      if (stop()) return verdict(false, "run ended");
+      if (work() >= (double)gate) return verdict(true, "a batch's worth arrived");
+      if (no_more && no_more()) {
+        // Work can cross the gate between the first load and producer_done.
+        // The completion callback takes the producer's results.m, so a load
+        // after it sees all work published before the producer finished.
+        if (work() >= (double)gate)
+          return verdict(true, "a batch's worth arrived");
+        return verdict(false, "input ended below one batch");
+      }
+      if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count()
+          >= guard_sec)
+        return verdict(true, "still arriving at the guard");
+      std::unique_lock<std::mutex> lk(mx);
+      cv.wait_for(lk, std::chrono::milliseconds(10), [&] { return stop(); });
+    }
+  }
   auto say = [&](bool engage, const char * why, double remaining, double p) {
     if (opt.verbosity >= V_DEBUG) {
       const double el = std::chrono::duration<double>(
@@ -34701,8 +34759,17 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       // Stop when the job is essentially finished rather than when the READER
       // is: with mmap the reader is done almost at once, so a reader-tied stop
       // would cut every sample short and skip the GPU unconditionally.
+      // A pipe has no total (comp_progress -1): the work that has arrived is
+      // what the reader has read, and the input has ended when it says so.
       if (!gpu_bringup_worth_it(opt, comp_progress, bringup_mx, bringup_cv,
-                                [&] { return comp_progress() >= 0.98; })) {
+                                [&] { return comp_progress() >= 0.98; },
+                                [&]() -> double {
+                                  return m ? double(m->read_bytes.load(std::memory_order_relaxed)) : 0.0;
+                                },
+                                [&] {
+                                  std::lock_guard<std::mutex> lk(results.m);
+                                  return results.producer_done;
+                                })) {
         vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
                              "skipping GPU bringup\n");
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
@@ -35428,11 +35495,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   // race — and leaving the std::thread joinable would call std::terminate at
   // scope exit.
   //
-  // Deliberately NOT signalling the sampler here, unlike decompress: the main
-  // thread reaches this point when the READER is done, which with an mmap'd
-  // input is almost immediately — cutting the sample short there would skip the
-  // GPU on every compress.  The sampler bounds itself at ~0.25 s and stops early
-  // on its own progress signal, so the join is short regardless.
+  // Do not stop a known-size sample just because the reader is done: with mmap
+  // that happens almost immediately while the CPU workers still have work.
+  // For an unknown-size input, producer_done ends the gate wait on its next
+  // timed wake; if a batch arrived first, bringup may already be running.
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   // Do NOT call throttle.set_done() before join: workers must respect
   // throttle while draining the queue to avoid buffering entire output in RAM.
@@ -39921,8 +39987,8 @@ gds_out_declined:
   // thread when defer_detect (hybrid adaptive or gpu-only) so the CPU pool
   // (hybrid) or the reader (gpu-only) overlaps cuInit; inline otherwise.
   // Denominator for the "is the GPU still worth starting" sample: the archive's
-  // own size, which Meter::read_bytes counts up to.  0 (pipe/stdin) disables the
-  // check, keeping today's behaviour.
+  // own size, which Meter::read_bytes counts up to.  With no known size, the
+  // bringup guard uses queued frame output and producer completion instead.
   const uint64_t decomp_src_bytes = known_input_size(opt, in);
   tune_run_decomp.input_bytes.store(decomp_src_bytes, std::memory_order_relaxed);
   if (sched) sched->set_decomp_source_bytes(decomp_src_bytes);   // tail check's unread estimate
@@ -39937,6 +40003,7 @@ gds_out_declined:
       bringup_stop.store(true, std::memory_order_relaxed); }
     bringup_cv.notify_all();
   };
+
 
   // Fraction of the job COMPLETED: decompress increments read_bytes in the
   // workers as they consume frames, not in the reader, so this measures work
@@ -39961,11 +40028,25 @@ gds_out_declined:
       // fraction of a second with the workers a few percent in.  The sampler then
       // read that as "the run ended" and skipped the GPU on exactly the archives
       // GPU decompress exists for.  bringup_stop now means only a genuine abort.
+      // A pipe has no total (decomp_progress -1): the work that has arrived is
+      // the declared output of the frames the reader has queued -- the measure
+      // the up-front gate uses -- and none will follow once the reader is done.
+      // That covers a hand-off to the CPU streaming decoder too: a huge or
+      // sizeless FIRST frame sets producer_done (and stops this sample) before
+      // it streams, and a later one streams only after the frames before it
+      // have been decoded and the producer is done.
       if (!gpu_bringup_worth_it(opt, decomp_progress,
                                 bringup_mx, bringup_cv,
                                 [&] {
                                   return bringup_stop.load(std::memory_order_relaxed)
                                       || decomp_progress() >= 0.98;
+                                },
+                                [&]() -> double {
+                                  return m ? double(m->total_out.load(std::memory_order_relaxed)) : 0.0;
+                                },
+                                [&] {
+                                  std::lock_guard<std::mutex> lk(results.m);
+                                  return results.producer_done;
                                 })) {
         vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
                              "skipping GPU bringup\n");
@@ -40469,9 +40550,9 @@ gds_out_declined:
   // or spawned ones that immediately hit the done+empty queue and exit.)
   //
   // Wake the sampler rather than STOPPING it: reaching here means the reader is
-  // done, not that the job is.  Its stop predicate is job-tied, so it re-checks
-  // and returns immediately if the workers really have finished; otherwise it
-  // finishes its (bounded, sub-second) window and answers honestly.
+  // done, not that the job is.  A known-size sample remains job-tied.  With
+  // unknown size, producer_done ends the gate wait at its next timed wake;
+  // bringup may already be running if a batch arrived first.
   bringup_cv.notify_all();
   if (gpu_bringup_thr.joinable()) gpu_bringup_thr.join();
   // THE SECOND CHECK, now that the bringup's answer is final.  An archive small
@@ -44590,10 +44671,30 @@ static int gzstd_main(int argc, char ** argv)
     // overlapping read/decompress/write with bounded memory — for every mode,
     // instead of buffering the whole frame through the queue.  Genuinely
     // multi-frame chunked inputs (frame0 below the threshold) keep their
-    // parallel path.  Seekable input only (peek returns -1 on stdin).
-    int64_t first_frame_decomp =
-        (opt.input != "-") ? peek_first_frame_decomp_size(in) : -1;
-    if (opt.input != "-" && needs_stream_decode(first_frame_decomp)) {
+    // parallel path.  Seekable input only: a pipe cannot be peeked.
+    //
+    // A REDIRECTED STDIN IS SEEKABLE TOO (v0.18.5).  This peek was for named
+    // files only, so `gzstd -d < archive.zst` sent a huge sized first frame to
+    // the parallel reader, which treats a seekable stdin as a file but decodes
+    // the frame as one task.  MEASURED on the 8-GPU server, 19.5 GiB in one
+    // frame, median of three: 10.3 GiB peak RSS and 17.01 s, against 52 MiB
+    // and 7.43 s for the named route, and 8.12 s for `zstd -d <` (a 600 MiB
+    // frame: 621 MiB).  A seekable stdin is at its start here
+    // (refuse_offset_stdin), so it gets the same
+    // peek -- but only once its first bytes are a zstd or skippable magic:
+    // stdin skips the named-file magic check above, and the peek's -1 would
+    // read anything else as a sizeless frame.  Other input keeps its old
+    // route and its old error.
+    bool peekable = opt.input != "-";
+    if (!peekable && in && std::ftell(in) == 0) {
+      unsigned char mg[4] = {0};
+      const size_t nr = std::fread(mg, 1, 4, in);
+      std::rewind(in);
+      const uint32_t m32 = nr == 4 ? rd_le32(mg) : 0;
+      peekable = m32 == 0xFD2FB528u || (m32 & 0xFFFFFFF0u) == 0x184D2A50u;
+    }
+    int64_t first_frame_decomp = peekable ? peek_first_frame_decomp_size(in) : -1;
+    if (peekable && needs_stream_decode(first_frame_decomp)) {
       // < 0: no content-size header (tar --zstd / piped zstd) — size unknown,
       // so the byte-level out% and preallocation have nothing to go on.
       const bool known_size = first_frame_decomp > 0;

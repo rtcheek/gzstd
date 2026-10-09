@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=613
-$EXTENSIVE && EXPECTED_TESTS=772
+EXPECTED_TESTS=614
+$EXTENSIVE && EXPECTED_TESTS=773
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -825,8 +825,11 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # frame; a refused read degrades; a failed read exits 3) and three for the
 # single-frame decoder (-d/-t read O_DIRECT; refused/failed reads; --keep-going),
 # none needing a GPU: 613, 772; deltas unchanged.  DERIVED.
-EXPECTED_NOGPU_DELTA=168
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=197   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
+# v0.18.5: one GPU cell (a pipe is held to the GPU gate): 614, 773; no-GPU deltas
+# 168 -> 169 and 197 -> 198.  Default CONFIRMED 2026-10-09: 613/0/1 of 614 on the
+# 8-GPU host, CPU-only 445 (614 - 169).  The extensive figures are still DERIVED.
+EXPECTED_NOGPU_DELTA=169
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=198   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -5150,6 +5153,48 @@ if has_gpu; then
 guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
   fi
 
+  # A PIPE IS HELD TO THE SAME GATE (v0.18.5).  It has no size, so the gate
+  # above cannot decide up front, and the bringup engaged at once: ANY piped
+  # input cost a GPU build ~2 s of cuInit it never used (1 MiB: 2.13 s against
+  # 0.02 s named).  The bringup now waits on the evidence: engage when one
+  # batch's worth of work has arrived, skip when the input ends below it --
+  # including when the rest of it goes to the CPU streaming decoder.  The gate
+  # is armed small and the guard long, so only the evidence can decide.  The
+  # DECISION is asserted, never the time.
+  sg_why=""
+  sg_dec() { tr '\r' '\n' < "$1" | grep -o 'bringup sample: size unknown.*-> [a-z]*' | head -1; }
+  head -c $((8*1048576)) /dev/urandom > "$TMPDIR/sg8.bin" 2>/dev/null
+  cat "$sg_src" | GZSTD_DEBUG_GPU_MIN_BYTES=4194304 GZSTD_DEBUG_GPU_GUARD_SEC=60 \
+    "$GZSTD" -vv -c > "$TMPDIR/sgp1.zst" 2> "$TMPDIR/sgp.log"
+  sg_d=$(sg_dec "$TMPDIR/sgp.log")
+  [[ "$sg_d" == *"input ended below one batch"*"-> skip" ]] || sg_why+=" [1 MiB piped compress: ${sg_d:-no size-unknown decision}]"
+  rc=0; cat "$TMPDIR/sg8.bin" | GZSTD_DEBUG_GPU_MIN_BYTES=4194304 GZSTD_DEBUG_GPU_GUARD_SEC=60 \
+    "$GZSTD" -vv -c > "$TMPDIR/sgp8.zst" 2> "$TMPDIR/sgp.log" || rc=$?
+  sg_d=$(sg_dec "$TMPDIR/sgp.log")
+  [[ "$sg_d" == *"a batch's worth arrived"*"-> engage" ]] || sg_why+=" [8 MiB piped compress: ${sg_d:-no size-unknown decision}]"
+  "$GZSTD" -d -q -c "$TMPDIR/sgp8.zst" 2>/dev/null | cmp -s - "$TMPDIR/sg8.bin" && [[ $rc -eq 0 ]] \
+    || sg_why+=" [8 MiB piped compress: exit $rc or the archive does not round-trip]"
+  cat "$sg_zst" | GZSTD_DEBUG_GPU_MIN_BYTES=4194304 GZSTD_DEBUG_GPU_GUARD_SEC=60 \
+    "$GZSTD" -d -vv -c 2> "$TMPDIR/sgp.log" | cmp -s - "$sg_src" || sg_why+=" [piped -d: wrong bytes]"
+  sg_d=$(sg_dec "$TMPDIR/sgp.log")
+  [[ "$sg_d" == *"input ended below one batch"*"-> skip" ]] || sg_why+=" [1 MiB piped -d: ${sg_d:-no size-unknown decision}]"
+  # Sized frames, then a sizeless one: the reader hands the rest to the CPU
+  # streaming decoder once the frames before it are done, so no more GPU work
+  # can come.  Guard 10 s, not 60: a run that missed the end of the queued work
+  # would wait out the guard and engage.  The sizeless
+  # frame must outgrow one 4 MiB read through the pipe: a smaller one fits a
+  # single zstd call, which writes the size after all (and then no hand-off).
+  cat "$TMPDIR/sg8.bin" | "$GZSTD" --sliding-window -q -c > "$TMPDIR/sgsl.zst" 2>/dev/null
+  cat "$sg_zst" "$TMPDIR/sgsl.zst" | GZSTD_DEBUG_GPU_MIN_BYTES=104857600 GZSTD_DEBUG_GPU_GUARD_SEC=10 \
+    "$GZSTD" -d -vv -c 2> "$TMPDIR/sgp.log" | cmp -s - <(cat "$sg_src" "$TMPDIR/sg8.bin") || sg_why+=" [sized then sizeless, piped -d: wrong bytes]"
+  tr '\r' '\n' < "$TMPDIR/sgp.log" | grep -q 'onward is too large to split or declares no size' \
+    || sg_why+=" [sized then sizeless, piped -d: the rest was not handed to the streaming decoder]"
+  sg_d=$(sg_dec "$TMPDIR/sgp.log")
+  [[ "$sg_d" == *"input ended below one batch"*"-> skip" ]] || sg_why+=" [sized then sizeless, piped -d: ${sg_d:-no size-unknown decision}]"
+  [[ -z "$sg_why" ]] && pass "a pipe is held to the GPU gate: engage at one batch, skip below it" \
+    || fail "a pipe is held to the GPU gate: engage at one batch, skip below it" "$sg_why"
+  rm -f "$TMPDIR"/sg8.bin "$TMPDIR"/sgp1.zst "$TMPDIR"/sgp8.zst "$TMPDIR"/sgp.log "$TMPDIR"/sgsl.zst
+
   rm -f "$sg_src" "$sg_zst" "$TMPDIR/smallgate.out" "$TMPDIR/smallgate-tree.tar.zst"
   rm -rf "$sg_tree" "$TMPDIR/smallgate-tree.out"
 else
@@ -5159,6 +5204,7 @@ else
   skip "small archive decompress defaults to cpu-only"        "no GPU"
   skip "small --tar creation goes cpu-only, walks once, round-trips" "no GPU"
   skip "bringup sample skips the GPU only when the job outruns cuInit" "no GPU"
+  skip "a pipe is held to the GPU gate: engage at one batch, skip below it" "no GPU"
 fi
 
 # ============================================================
@@ -9287,6 +9333,15 @@ if [[ -x /usr/bin/time ]] && command -v zstd >/dev/null 2>&1 \
     pf_m=$(tail -1 "$pf/rss" 2>/dev/null)
     [[ $rc -eq 0 ]] || pf_why+=" [$pf_k: -t through a pipe exited $rc]"
     [[ "$pf_m" =~ ^[0-9]+$ && $pf_m -lt 153600 ]] || pf_why+=" [$pf_k: -t through a pipe peaked at ${pf_m:-?} KiB]"
+    # ...and from a REDIRECTED stdin (v0.18.5).  A seekable stdin skipped the
+    # first-frame peek named files get, so a huge SIZED frame went to the
+    # parallel reader and was decoded as one task: 300+ MiB here, 10.3 GiB for a
+    # 19.5 GiB frame.
+    pf_rss=$( { /usr/bin/time -f %M -o "$pf/rss" "$GZSTD" -d -q -c --cpu-only < "$pf/$pf_k.zst" \
+               | cmp -s - "$pf/r.bin" && echo same || echo DIFFERENT; } 2>/dev/null)
+    pf_m=$(tail -1 "$pf/rss" 2>/dev/null)
+    [[ "$pf_rss" == same ]] || pf_why+=" [$pf_k: -d from a redirected stdin gave different bytes]"
+    [[ "$pf_m" =~ ^[0-9]+$ && $pf_m -lt 153600 ]] || pf_why+=" [$pf_k: -d from a redirected stdin peaked at ${pf_m:-?} KiB, want < 150 MiB]"
   done
   # A redirected regular stdin can take the sequential splitter but read its
   # prefix with O_DIRECT pread.  The streaming suffix must start after that
@@ -9303,6 +9358,8 @@ if [[ -x /usr/bin/time ]] && command -v zstd >/dev/null 2>&1 \
   # The route, not just the outcome: -v names it.
   cat "$pf/sized.zst" | "$GZSTD" -d -c -v --cpu-only 2>"$pf/v.log" >/dev/null
   grep -aq "streaming single .* frame on CPU" "$pf/v.log" || pf_why+=" [sized frame from a pipe did not take the streaming route]"
+  "$GZSTD" -d -c -v --cpu-only < "$pf/sized.zst" 2>"$pf/v.log" >/dev/null
+  grep -aq "streaming single .* frame on CPU" "$pf/v.log" || pf_why+=" [sized frame from a redirected stdin did not take the streaming route]"
   # A truncated stream through the pipe: an error, and --keep-going keeps the
   # decodable prefix (exit 7), as on the named-file route.
   head -c $((150*1048576)) "$pf/sized.zst" > "$pf/cut.zst"

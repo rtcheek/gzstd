@@ -1,12 +1,86 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.4  
+**Covers:** v0.9.50 → v0.18.5  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.5 — a redirected stdin streams like a named file, and a pipe no longer waits for the GPUs
+
+**The defect** (ROADMAP 12, found while checking v0.18.4). `gzstd -d < archive.zst` with a single
+frame of more than 256 MiB that declares its size was held whole: the first-frame peek that sends such
+a frame to the streaming decoder ran only for a NAMED file, so a seekable stdin went to the parallel
+reader, which reads it as a file but decodes the frame as one task. MEASURED on the 8-GPU server, a
+19.5 GiB single frame, median of three: 17.01 s (16.68-18.34) and 10.3 GiB peak, against 7.43 s and 52
+MiB for the same file named, and 8.12 s and 4 MiB for `zstd -d <`, which streams any input. A 600 MiB
+frame: 621 MiB peak. A sizeless frame and a pipe already streamed.
+
+**The fix.** A seekable stdin -- always at its start here, since gzstd refuses one that is not -- gets
+the same peek, but only once its first four bytes are a zstd or skippable magic: stdin skips the
+named-file magic check, and the peek's -1 ("no size") would otherwise send any other input to the
+streaming decoder with a different error. A non-zstd, empty or two-byte stdin keeps its old route and
+message (each compared before and after the change; the GPU build's against v0.18.3).
+
+**Measured after**, same archive: `-d < file` 7.43 s (7.43-7.44) and 52 MiB, identical to the named
+route; 600 MiB frame 0.26 s and 50 MiB. Checked on both builds: the bytes; `-t`; `--direct-read` (the
+whole archive read O_DIRECT from offset 0); a sizeless frame; a skippable frame first; `--keep-going`
+on a reserved block type (the same recovery as the named file); a normal multi-frame archive on stdin
+(still the parallel path); a pipe; a stdin positioned mid-file (still refused, exit 2).
+
+**Tests.** The single-frame pipe cell gained redirected-stdin arms: `-d` of the sized and the sizeless
+frame in under 150 MiB, and the sized frame on the streaming route. A mutant without the peek fails
+both arms (1.04 GiB peak for the 300 MiB frame, and the wrong route); the cell count is unchanged.
+
+**A pipe no longer waits for the GPUs** (ROADMAP 13, found while measuring the above). In the GPU
+build ANY piped input cost about 2 s. MEASURED on the 8-GPU server, three runs each: 1 MiB through
+`-c`, or a 1 MiB archive or sizeless frame through `-d`, 2.13-2.16 s, against 0.02 s for the same file
+named and in the CPU-only build. The up-front size gate (`gpu_min_useful_bytes`: one GPU batch, 128
+MiB by default for compress) keeps a small NAMED input on the CPU, but it needs a size; a pipe went
+hybrid, the bringup guard had no denominator for its progress sample and engaged at once, and the run
+then waited out CUDA's initialisation before finding the CPU long done ("file already decompressed by
+CPU during init; skipping GPU"). A 600 MiB single frame through a pipe, which the CPU streaming
+decoder handles alone, paid the same: 2.2 s against 0.26 s for the file named.
+
+**The fix.** For an input of unknown size the guard now waits on the evidence, in the sampler's own
+10 ms timed condition-variable waits: it engages once one batch's worth of work has arrived (compress:
+the bytes read; decompress: the declared output of the frames queued, the measure the up-front gate
+uses), skips if the input ends below that or the run stops, and engages at `GPU_INIT_GUARD_SEC` if work
+is still arriving. No new constants; the suite's overrides (`GZSTD_DEBUG_GPU_MIN_BYTES=0`,
+`GZSTD_DEBUG_GPU_GUARD_SEC=0`) still engage at once.
+
+**Measured after**, three runs each: the 1 MiB pipes 0.02-0.03 s; the 600 MiB frame 0.27-0.29 s; a
+9 MiB sizeless frame 0.03-0.04 s; sized frames followed by a sizeless one 0.04 s, skipping when the
+frames before the hand-off are done. A pipe trickling 60 MiB over 6 s engaged at the guard (32 MiB
+in, 4,006 ms). On big piped jobs CUDA now starts after one batch's worth instead of at once -- read
+from -vv, 131 ms (compress, 19.5 GiB) and 132 ms (decompress, a 1,250-frame archive, 384 MiB of work
+queued by then) -- and the GPU engaged on both, by the count of GPU batches. Their end-to-end time
+could not be measured: another user's jobs held four of the eight GPUs, the load average was 85, and
+2 of 3 piped compress runs on BOTH v0.18.3 and v0.18.5 stopped with "a GPU faulted during compression
+and the input is a pipe" (ROADMAP 14).
+
+**Review (Codex, GPT-6-Sol).** Round 1: SAFE TO COMMIT, one should-fix, adopted: the guard read the
+work counter, then the completion flag, so a final chunk that crossed the gate between the two reads
+could be skipped as "ended below one batch"; it now re-reads the counter after the flag, which it takes
+under the producer's lock. That interleaving was not reproduced; fixed by inspection. Its stale comments
+on the unknown-size path were corrected too. Round 2, on the fix as built: SAFE TO COMMIT, with two
+comment corrections.
+
+**Tests.** A new GPU cell in the small-input gate section, with the gate armed small and the guard long
+so only the evidence decides, asserting the logged decision and never a time: 1 MiB piped compress
+skips; 8 MiB engages and round-trips; a 1 MiB archive piped to `-d` skips; sized frames then an 8 MiB
+sizeless one skip after the hand-off. Mutants on GPU builds: engaging at once (the old behaviour)
+fails all four arms; never engaging at the gate fails the 8 MiB arm; compress passing no evidence
+fails both compress arms. A flag I first added to mark the hand-off to the streaming decoder was
+redundant -- removing it passed the cell, and the code shows why: a huge first frame sets
+`producer_done` and stops the sample before it streams, and a later one streams only after the
+producer is done -- so it was removed rather than kept.
+
+**Suites** on the eight-GPU server (heavily loaded by other users), default runs on the final binaries:
+GPU build 613 ran, 0 failures, 1 skipped of 614 (the trivial-park cell, which this host cannot provoke),
+10m59s; CPU-only 445 ran, 0 failures. The extensive run was not made for this version.
 
 ## v0.18.4 — `--sliding-window` reads far enough ahead, and `--direct-read` reaches single frames both ways
 

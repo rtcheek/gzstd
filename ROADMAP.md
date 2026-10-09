@@ -139,12 +139,22 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    read-path prior, which was measured on the frame-parallel reader, and the frame path's automatic
    cold-input probe does not run on this path either. A cold sliding-window run would gain from both;
    it needs this path to record its own read rate first.
-12. **A huge sized frame on a redirected stdin is held whole.** `gzstd -d < archive.zst` with a single
-   frame of more than 256 MiB that declares its size skips the streaming decoder -- the route that
-   peeks at the first frame is taken only for a named file -- and the parallel reader treats the
-   seekable stdin as a file and decodes the frame as one task: MEASURED 631 MB peak for a 600 MiB frame
-   (v0.18.3 and v0.18.4 alike), so a 100 GiB `--sliding-window` archive would need about 100 GiB of
-   memory that `gzstd -d archive.zst` streams in 50 MiB. A pipe and a sizeless frame already stream.
+12. ~~**A huge sized frame on a redirected stdin is held whole.**~~ CLOSED v0.18.5: a seekable stdin
+   that starts with a zstd or skippable magic gets the first-frame peek named files get, so a huge
+   or sizeless first frame streams. MEASURED, 19.5 GiB in one frame, median of three: 17.01 s and
+   10.3 GiB peak before, 7.43 s and 52 MiB after -- the same as the file named, and ahead of
+   `zstd -d <` (8.12 s, 4 MiB).
+13. ~~**Any piped input costs a GPU build about 2 s.**~~ CLOSED v0.18.5: an input of unknown size is held
+   to the same one-batch gate as a named one, on the evidence as it arrives -- engage once a batch's
+   worth of work has come in, skip if it ends first, engage at the guard if it is still coming. 1 MiB
+   piped: 2.13-2.16 s -> 0.02-0.03 s. A big piped job starts CUDA ~130 ms later than before (read from
+   -vv); its end-to-end time is still to be measured on a quiet machine.
+14. **Piped compress stops on a GPU fault under VRAM pressure.** OBSERVED (v0.18.5 and v0.18.3 alike,
+   8-GPU server, another user's jobs holding four cards at 75-94 GiB): compressing 19.5 GiB through a
+   pipe, 2 of 3 runs of each version exited with "a GPU faulted during compression and the input is a
+   pipe/stream", after "insufficient VRAM for even 1 stream" on the busy cards. A pipe cannot be rebuilt
+   on the CPU, so the refusal itself is correct; what is not known is whether a CONTENDED card should
+   count as a fault at all, rather than be skipped like one that is merely full. Not investigated.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
