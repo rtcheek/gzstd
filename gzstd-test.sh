@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=614
-$EXTENSIVE && EXPECTED_TESTS=773
+EXPECTED_TESTS=616
+$EXTENSIVE && EXPECTED_TESTS=775
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -828,8 +828,12 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # v0.18.5: one GPU cell (a pipe is held to the GPU gate): 614, 773; no-GPU deltas
 # 168 -> 169 and 197 -> 198.  Default CONFIRMED 2026-10-09: 613/0/1 of 614 on the
 # 8-GPU host, CPU-only 445 (614 - 169).  The extensive figures are still DERIVED.
-EXPECTED_NOGPU_DELTA=169
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=198   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
+# v0.18.6: two GPU cells (the driver probe ranks a subset without NVML; a subset
+# chosen without any load reading says so): 616, 775; no-GPU deltas 171, 200.
+# Default CONFIRMED 2026-10-09: 615 ran of 616 on the 8-GPU host, CPU-only 445
+# (616 - 171).  The extensive figures are DERIVED.
+EXPECTED_NOGPU_DELTA=171
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=200   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -5473,9 +5477,9 @@ if has_gpu 2>/dev/null; then
     elif [[ -z "$ds_sel" ]]; then ds_why+=" [no ranked selection was made before CUDA started]"
     elif [[ "$ds_sel" == "$ds_guess" ]]; then ds_why+=" [ranking never differed from the guess ($ds_guess)]"
     else
-      printf '%s' "$ds_log" | grep -q 'waiting up to 500 ms for the NVML sample (hybrid bringup thread)' \
-        || ds_why+=" [the NVML wait was not on the hybrid bringup thread]"
-      printf '%s' "$ds_log" | grep -q 'NVML sample (main thread' && ds_why+=" [the main thread waited for NVML]"
+      printf '%s' "$ds_log" | grep -q 'ranking the cards before CUDA starts (hybrid bringup thread)' \
+        || ds_why+=" [the ranking was not on the hybrid bringup thread]"
+      printf '%s' "$ds_log" | grep -q 'before CUDA starts (main thread' && ds_why+=" [the main thread ranked]"
       [[ "$ds_sees" == "$ds_sel" ]] || ds_why+=" [CUDA saw '$ds_sees', ranked '$ds_sel', guessed '$ds_guess']"
       env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
         "$GZSTD" -d -q -c "$TMPDIR/dsub.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || ds_why+=" [round-trip]"
@@ -5494,12 +5498,137 @@ if has_gpu 2>/dev/null; then
     [[ $ds_rc -eq 0 ]] || ds_why+=" [rc=$ds_rc]"
     printf '%s' "$ds_log" | grep -q 'placed a startup guess' || ds_why+=" [no startup guess placed]"
     printf '%s' "$ds_log" | grep -q 'skipping GPU bringup' || ds_why+=" [GPU bringup was not skipped]"
+    printf '%s' "$ds_log" | grep -q 'ranking the cards before CUDA starts' && ds_why+=" [something ranked the cards]"
     printf '%s' "$ds_log" | grep -q 'waiting up to 500 ms for the NVML sample' && ds_why+=" [something waited for NVML]"
     env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
       "$GZSTD" -d -q -c "$TMPDIR/dsub2.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || ds_why+=" [round-trip]"
     [[ -z "$ds_why" ]] && pass "a hybrid GPU subset that skips GPU bringup has no ranking wait" \
       || fail "a hybrid GPU subset that skips GPU bringup has no ranking wait" "$ds_why"
     rm -f "$TMPDIR/dsub.zst" "$TMPDIR/dsub2.zst"
+
+    # THE DRIVER PROBE RANKS THE SUBSET, AND NVML IS NOT STARTED (v0.18.6).
+    # finalize_gpu_mask asks the kernel driver for each card's utilization and
+    # free VRAM (gz_rm_probe, ~40 ms) and starts the NVML sampler only when the
+    # probe cannot decide.  Three arms, each one hybrid --gpu-devices=1 run with
+    # bringup forced (the suite's GZSTD_DEBUG_GPU_GUARD_SEC=0):
+    #   default      every /proc card answers the probe, the rank says "from
+    #                the driver", nothing waits for NVML, CUDA reads the mask;
+    #   newest-last  the probe offers every size list OLDEST first, so this
+    #                driver must REFUSE the other releases' sizes -- and the
+    #                probe must still land on the same three sizes;
+    #   off          the probe is skipped and NVML ranks, as before v0.18.6;
+    # then which runs load NVML at all, and where calibrate ranks.
+    # A driver older than R515 is never probed; the cell skips there.
+    pr_ver=$(cat /sys/module/nvidia/version 2>/dev/null); pr_major=${pr_ver%%.*}
+    if [[ $pr_major =~ ^[0-9]+$ ]] && (( pr_major >= 515 )); then
+      pr_why=""; pr_detail=""
+      for pr_arm in default newest-last off; do
+        pr_rc=0
+        pr_log=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_GUARD_SEC=0 \
+                   GZSTD_DEBUG_RM_PROBE=$([[ $pr_arm == default ]] || echo $pr_arm) \
+                   timeout --foreground -k 10 120 "$GZSTD" --gpu-devices=1 -vv -k -f \
+                   "$TMPDIR/large.bin" -o "$TMPDIR/probe-$pr_arm.zst" 2>&1) || pr_rc=$?
+        pr_log=$(printf '%s' "$pr_log" | command tr '\r' '\n')
+        pr_sel=$(ds_uuids "$pr_log" '\[GPU\] selected')
+        pr_sees=$(ds_uuids "$pr_log" 'CUDA sees')
+        [[ $pr_rc -eq 0 ]] || pr_why+=" [$pr_arm rc=$pr_rc]"
+        [[ -n "$pr_sel" && "$pr_sees" == "$pr_sel" ]] \
+          || pr_why+=" [$pr_arm: CUDA saw '${pr_sees:0:12}', ranked '${pr_sel:0:12}']"
+        if [[ $pr_arm == off ]]; then
+          printf '%s' "$pr_log" | grep -q 'selected GPU-.*from NVML' || pr_why+=" [off: NVML did not rank]"
+        else
+          pr_line=$(printf '%s' "$pr_log" | grep -o "driver probe: $dr_proc_n card(s) in [0-9.]* ms (.*)" | head -1)
+          [[ -n "$pr_line" ]] || pr_why+=" [$pr_arm: no probe line for all $dr_proc_n cards: $(printf '%s' "$pr_log" | grep -o 'driver probe: .*' | head -1 | cut -c1-90)]"
+          printf '%s' "$pr_log" | grep -q 'selected GPU-.*from the driver' || pr_why+=" [$pr_arm: the driver did not rank]"
+          printf '%s' "$pr_log" | grep -q 'waiting up to 500 ms for the NVML sample' && pr_why+=" [$pr_arm: waited for NVML]"
+          pr_sizes=${pr_line#* ms (}
+          [[ $pr_arm == default ]] && pr_detail=$pr_sizes
+          [[ $pr_arm == newest-last && "$pr_sizes" != "$pr_detail" ]] \
+            && pr_why+=" [newest-last accepted ($pr_sizes), default ($pr_detail)]"
+        fi
+        env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+          "$GZSTD" -d -q -c "$TMPDIR/probe-$pr_arm.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" \
+          || pr_why+=" [$pr_arm round-trip]"
+        rm -f "$TMPDIR/probe-$pr_arm.zst"
+      done
+      # "Not started" is observable: the loader names every library it
+      # initializes.  With the probe, no run loads libnvidia-ml, whether bringup
+      # happens (guard 0) or is skipped (a huge guard).  With the probe off --
+      # a driver it cannot ask -- NVML loads in both: at the ranking, and at
+      # startup even when bringup is then skipped (its head start, as before
+      # v0.18.6).  The probe-off arms also prove the check can see a load.
+      for pr_arm in default:0 default:100000 off:0 off:100000; do
+        rm -rf "$TMPDIR/pr-ld"; mkdir -p "$TMPDIR/pr-ld"
+        env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_GUARD_SEC=${pr_arm#*:} \
+          LD_DEBUG=libs LD_DEBUG_OUTPUT="$TMPDIR/pr-ld/ld" \
+          GZSTD_DEBUG_RM_PROBE=$([[ ${pr_arm%:*} == default ]] || echo ${pr_arm%:*}) \
+          timeout --foreground -k 10 120 "$GZSTD" --gpu-devices=1 -q -k -f \
+          "$TMPDIR/large.bin" -o "$TMPDIR/probe-ld.zst" >/dev/null 2>&1 || pr_why+=" [$pr_arm loader run rc=$?]"
+        if grep -qs 'calling init: .*libnvidia-ml' "$TMPDIR/pr-ld"/ld*; then
+          [[ ${pr_arm%:*} == default ]] && pr_why+=" [$pr_arm: the probe's run loaded NVML]"
+        else
+          [[ ${pr_arm%:*} == off ]] && pr_why+=" [$pr_arm: no NVML load (blind check, or no head start)]"
+        fi
+      done
+      rm -rf "$TMPDIR/pr-ld" "$TMPDIR/probe-ld.zst"
+      # --calibrate's device-count children each measure a cold start, which a
+      # device held open by the parent would make warm.  So under calibrate the
+      # parent ranks only after its count pass: the ranking line follows the
+      # last count row.  (The suite's corpus hook skips that pass unless
+      # GZSTD_DEBUG_CALIBRATE_GPUC asks for it.)
+      pr_cal=$(env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$TMPDIR/pr-xdg" GZSTD_DEBUG_CALIBRATE_BYTES=8388608 \
+                 GZSTD_DEBUG_CALIBRATE_GPUC=1 timeout --foreground -k 10 300 \
+                 "$GZSTD" --calibrate --gpu-devices=2 -vv 2>&1 >/dev/null | command tr '\r' '\n') \
+        || pr_why+=" [calibrate rc=$?]"
+      pr_count=$(printf '%s' "$pr_cal" | grep -n 'gpu devices  2: overhead' | head -1 | cut -d: -f1)
+      pr_rank=$(printf '%s' "$pr_cal" | grep -n 'ranking the cards before CUDA starts' | head -1 | cut -d: -f1)
+      [[ -n "$pr_count" && -n "$pr_rank" ]] && (( pr_rank > pr_count )) \
+        || pr_why+=" [calibrate: count row at line '${pr_count}', ranking at line '${pr_rank}']"
+      rm -rf "$TMPDIR/pr-xdg"
+      [[ -z "$pr_why" ]] && pass "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" \
+        || fail "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" "$pr_why"
+    else
+      skip "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" \
+           "driver '${pr_ver:-unknown}' predates R515"
+    fi
+
+    # ...AND WITH NO LOAD SOURCE AT ALL, THE RANDOM PICK IS NAMED (v0.18.6).  The
+    # probe off and every card dropped from the NVML sample: the startup guess
+    # stands, as it did before, but now a default-verbosity warning says so
+    # (until v0.18.6 only -v did).  -q silences it.  A stalled probe, below,
+    # reaches the same warning without a second wait.
+    nl_why=""; nl_rc=0
+    nl_all=$(sed -n 's/^GPU UUID:[ \t]*//p' /proc/driver/nvidia/gpus/*/information 2>/dev/null | paste -sd, -)
+    nl_err=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_RM_PROBE=off GZSTD_DEBUG_NVML_DROP="$nl_all" \
+               timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -k -f \
+               "$TMPDIR/large.bin" -o "$TMPDIR/noload.zst" 2>&1 >/dev/null) || nl_rc=$?
+    [[ $nl_rc -eq 0 ]] || nl_why+=" [rc=$nl_rc]"
+    printf '%s' "$nl_err" | grep -q 'warning: could not read GPU load before choosing .*picked at random' \
+      || nl_why+=" [no warning: $(printf '%s' "$nl_err" | command tr '\r' '\n' | grep -v '^$' | head -1 | cut -c1-80)]"
+    env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+      "$GZSTD" -d -q -c "$TMPDIR/noload.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || nl_why+=" [round-trip]"
+    nl_err=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_RM_PROBE=off GZSTD_DEBUG_NVML_DROP="$nl_all" \
+               timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -q -k -f \
+               "$TMPDIR/large.bin" -o "$TMPDIR/noload.zst" 2>&1 >/dev/null) || nl_why+=" [-q rc=$?]"
+    printf '%s' "$nl_err" | grep -q 'could not read GPU load' && nl_why+=" [-q did not silence it]"
+    # A probe stuck in the driver (GZSTD_DEBUG_RM_PROBE=stall: its thread never
+    # returns) spends the ONE 500 ms ranking budget it shares with NVML, so NVML
+    # is not started for a second wait; the guess stands, the warning says
+    # why, and the run still exits 0 with its probe thread detached.  The
+    # DECISION is asserted, never the time; timeout catches a hang at exit.
+    nl_rc=0
+    nl_err=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_RM_PROBE=stall \
+               timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -k -f \
+               "$TMPDIR/large.bin" -o "$TMPDIR/noload.zst" 2>&1 >/dev/null) || nl_rc=$?
+    [[ $nl_rc -eq 0 ]] || nl_why+=" [stalled probe: rc=$nl_rc]"
+    printf '%s' "$nl_err" | grep -q 'driver probe: no answer within the shared 500 ms budget; NVML: the shared 500 ms budget expired' \
+      || nl_why+=" [stalled probe: $(printf '%s' "$nl_err" | command tr '\r' '\n' | grep -o 'could not read GPU load.*' | head -1 | cut -c1-120)]"
+    env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+      "$GZSTD" -d -q -c "$TMPDIR/noload.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" \
+      || nl_why+=" [stalled probe: round-trip]"
+    rm -f "$TMPDIR/noload.zst"
+    [[ -z "$nl_why" ]] && pass "a GPU subset chosen without any load reading says so" \
+      || fail "a GPU subset chosen without any load reading says so" "$nl_why"
   elif [[ "${GPU_ALL_DEVICES:-}" == *,* ]]; then
     skip "--gpu-order=ranked ranks every device after CUDA startup" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
@@ -5511,12 +5640,18 @@ if has_gpu 2>/dev/null; then
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
     skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
+    skip "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" \
+         "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
+    skip "a GPU subset chosen without any load reading says so" \
+         "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
   else
     skip "--gpu-order=ranked ranks every device after CUDA startup" "single GPU host"
     skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "single GPU host"
     skip "an all-device GPU set keeps CUDA's order by default" "single GPU host"
     skip "a hybrid GPU subset is ranked on the bringup thread and CUDA reads the ranked mask" "single GPU host"
     skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" "single GPU host"
+    skip "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" "single GPU host"
+    skip "a GPU subset chosen without any load reading says so" "single GPU host"
   fi
 
   # THE COMPUTE-CAPABILITY FLOOR (v0.17.77).  gzstd's GPU code runs on compute

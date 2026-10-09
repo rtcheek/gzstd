@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.5";
+static constexpr const char * GZSTD_VERSION = "0.18.6";
 //
 // Architecture overview:
 //
@@ -111,6 +111,9 @@ static constexpr const char * GZSTD_VERSION = "0.18.5";
 #include <sys/syscall.h>   // SYS_memfd_create (--calibrate's RAM-backed corpus file)
 #include <sys/wait.h>      // waitpid (--calibrate's per-device-count children)
 #endif
+#ifdef __linux__
+#include <sys/ioctl.h>     // the NVIDIA driver probe (gz_rm_probe) that ranks GPUs without NVML
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/utsname.h>
@@ -158,8 +161,11 @@ static constexpr int kGzGpuMinCc =
 static int gz_debug_gpu_cc(const std::string & uuid)
 {
   struct Hook { int all = -1; std::vector<std::pair<std::string, int>> per; };
-  static const Hook hook = []{
-    Hook h;
+  // A timed-out RM probe can resume while another thread runs std::exit.
+  // Keep the hook alive for that entire interval; its old magic-static
+  // destructor could otherwise free per-card strings under the probe.
+  static const Hook * hook = []{
+    auto * h = new Hook;
     const char * e = std::getenv("GZSTD_DEBUG_GPU_CC");
     if (!e) return h;
     std::stringstream ss(e);
@@ -174,13 +180,13 @@ static int gz_debug_gpu_cc(const std::string & uuid)
       const long mnr = std::strtol(mp, &end, 10);
       if (end == mp || *end != '\0' || maj < 0 || maj > 99 || mnr < 0 || mnr > 9) continue;
       const int cc = int(maj * 10 + mnr);
-      if (at == std::string::npos) h.all = cc;
-      else h.per.emplace_back(tok.substr(at + 1), cc);
+      if (at == std::string::npos) h->all = cc;
+      else h->per.emplace_back(tok.substr(at + 1), cc);
     }
     return h;
   }();
-  for (const auto & p : hook.per) if (p.first == uuid) return p.second;
-  return hook.all;
+  for (const auto & p : hook->per) if (p.first == uuid) return p.second;
+  return hook->all;
 }
 
  #ifdef HAVE_NVML
@@ -5280,6 +5286,10 @@ static void print_help_long()
 "     pipeline absorbed the slow card for less than the ranking cost.\n"
 "     Without a caller mask, --gpu-devices N below the full count\n"
 "     still ranks, since a busy card can be most of the capacity.\n"
+"     That ranking asks the NVIDIA kernel driver directly (about\n"
+"     0.04 s for 8 cards, drivers R515 and newer) and falls back to\n"
+"     NVML when the driver cannot answer; if neither can, the cards\n"
+"     are picked at random and gzstd warns.\n"
 "\n"
 "  --gpu-mem-frac X\n"
 "     Fraction of free VRAM per device to allocate (0.1..0.95,\n"
@@ -21608,6 +21618,385 @@ static std::atomic<bool> g_gpu_thread_parked{false};
 // through it too, so the all-device ranking has one implementation.
 static std::vector<int> select_best_gpus(int total_devices, int want, const Options & opt);
 
+#if defined(HAVE_NVML) && defined(__linux__)
+/*======================================================================
+ RANKING GPUs FROM THE DRIVER ITSELF (v0.18.6)
+ -----------------------------------------------------------------------
+ The subset mask below needs every card's utilization and free VRAM before
+ CUDA starts.  NVML takes ~280 ms to its first sample on the 8-GPU host
+ (median of 100 fresh starts; p99 323 ms), and almost none of that is the
+ question asked: an ioctl trace of nvmlInit shows 28 peer-to-peer capability
+ queries, one per card PAIR, at ~7.8 ms each, plus clock correlation for
+ every card.  The driver answers the two figures directly.  Measured on the
+ same host, all 8 cards: 38 ms median, utilization included.  NVML also holds
+ the driver's locks for that time, so cuInit, which follows, waited behind
+ it.  A late answer cost worse than time: finalize_gpu_mask gave NVML 500 ms,
+ and on a loaded host it missed, so CUDA got the RANDOM startup guess, and
+ only the -v log said why.
+
+ THE INTERFACE.  These are the resource-manager (RM) ioctls on
+ /dev/nvidiactl that libnvidia-ml itself makes.  NVIDIA publishes their
+ definitions with the open kernel modules from R515 on
+ (open-gpu-kernel-modules, src/common/sdk/nvidia/inc), and the kernel side
+ is the same for the proprietary modules.  Compiled against the headers of
+ all 221 release tags, 515.43.04 through 615.78.08: the request codes, both
+ request blocks, the command IDs and every structure used here are identical
+ in all of them, except four sizes:
+   - the alloc block kept its 32 bytes, but R535 inserted paramsSize where
+     the status was, moving the status from +24 to +28;
+   - the probed-ID list is 256 bytes before R580, 384 after;
+   - the free-VRAM list is 436, 444, 460 or 1028 bytes (it gained entries);
+   - the utilization ring is 47216, 34000, 50704 or 55888 bytes, and those
+     sizes are distinct, so the size alone fixes the sample layout.  It is
+     NOT a function of the major version: 515.43-515.76 and 520 share one
+     layout, while 515.86 onward share the next one with 525.
+ The driver checks a control's paramsSize against the exact size it was
+ built with and refuses any other before it copies anything back (the check
+ in rs_resource.c is the same in 515 and 595; it answers
+ NV_ERR_INVALID_PARAM_STRUCT, and this driver refused a wrong-size GPU list
+ earlier, with NV_ERR_INVALID_ARGUMENT).  The one way past that check is the
+ driver's control cache, which serves any buffer at least as large as the
+ cached answer; the export tables of all 221 releases mark none of the five
+ controls used here cacheable, and none privileged.  So the probe offers the
+ known sizes in turn, and the one the driver accepts is the layout it has.  A
+ wrong guess is refused, never misread.  Only the status
+ offset cannot be asked that way; the R535 boundary is exact in every tag, so
+ the major version decides it.  A driver older than R515 (nothing published
+ to check against) is not probed, and any refusal the probe does not expect
+ hands the ranking to NVML, exactly as before.
+
+ THE PROCESS MUST HOLD /dev/nvidiaN OPEN.  The driver grants a client a GPU
+ only while the calling process has that card's device file open
+ (nv_is_gpu_accessible walks the fd table); otherwise the device alloc fails
+ with NV_ERR_INSUFFICIENT_PERMISSIONS.  NVML opens them too.  The probe KEEPS
+ the descriptors and its client for the life of the process, as NVML does:
+ without persistence mode, closing a card's last descriptor tears the GPU
+ down, and cuInit would pay to bring it straight back up.  O_CLOEXEC keeps
+ them from children.
+
+ UTILIZATION is the driver's own history, a ring of 72 samples (100 on early
+ R515 and R520) that spanned ~14 s on the 8-GPU host.  The probe takes the
+ mean of the graphics-engine samples, the figure NVML reports, over the whole
+ ring: the driver's window, not one chosen here.  NVML's reading is a single
+ instant, which is why the sampler smooths it.  On that host the means
+ matched nvidia-smi's readings to within a few points per card (91.5 vs 91).
+ A card with no samples reads 100: unknown is not idle, as in the sampler.
+ Free VRAM is the heap's free figure, which matched NVML's to the MiB.
+
+ Bounded like every NVML wait in this file: the probe runs on its own thread.
+ Probe and NVML share one 500 ms ranking deadline; a probe that consumes it
+ leaves the startup guess in place rather than starting a second wait.
+======================================================================*/
+struct GzRmProbe {
+  std::vector<GpuMonitor::Row> rows;  // empty when the probe could not answer
+  std::string why;                    // why not, for the -v trace
+  std::string detail;                 // driver version and the layouts it accepted
+  double ms = 0.0;
+};
+
+namespace gz_rm {
+// The two request blocks, 32 bytes in every release.  w24/w28: before R535
+// the status sat at +24 (then padding); from R535 paramsSize is at +24 and the
+// status at +28.
+struct Alloc   { uint32_t hRoot, hParent, hNew, hClass; uint64_t params; uint32_t w24, w28; };
+struct Control { uint32_t hClient, hObject, cmd, flags; uint64_t params; uint32_t paramsSize, status; };
+static_assert(sizeof(Alloc) == 32 && sizeof(Control) == 32, "RM request blocks are 32 bytes");
+// NV0080_ALLOC_PARAMETERS
+struct DeviceAlloc { uint32_t deviceId, hClientShare, hTargetClient, hTargetDevice, flags, pad0;
+                     uint64_t vaSpaceSize, vaStartInternal, vaLimitInternal; uint32_t vaMode, pad1; };
+static_assert(sizeof(DeviceAlloc) == 56, "NV0080_ALLOC_PARAMETERS is 56 bytes");
+// NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS
+struct IdInfoV2 { uint32_t gpuId, gpuFlags, deviceInstance, subDeviceInstance, sliStatus, boardId,
+                  gpuInstance; int32_t numaId; };
+static_assert(sizeof(IdInfoV2) == 32, "NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS is 32 bytes");
+// NV0000_CTRL_GPU_GET_UUID_FROM_GPU_ID_PARAMS (flags 0: the ASCII "GPU-..." form)
+struct Uuid { uint32_t gpuId, flags; char uuid[256]; uint32_t len; };
+static_assert(sizeof(Uuid) == 268, "NV0000_CTRL_GPU_GET_UUID_FROM_GPU_ID_PARAMS is 268 bytes");
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS at its largest (128 entries); smaller
+// releases read a prefix of it.
+struct FbInfo { uint32_t count; struct { uint32_t index, data; } e[128]; };
+static_assert(sizeof(FbInfo) == 1028, "the largest FB_GET_INFO_V2 is 1028 bytes");
+
+constexpr unsigned kMagic = 'F', kEscControl = 0x2a, kEscAlloc = 0x2b;
+constexpr uint32_t kClassRoot = 0x41, kClassDevice = 0x80, kClassSubdevice = 0x2080;
+constexpr uint32_t kCmdProbedIds = 0x214, kCmdIdInfoV2 = 0x205, kCmdUuid = 0x275;
+constexpr uint32_t kCmdFbInfoV2 = 0x20801303, kCmdUtilV2 = 0x20802096;
+constexpr uint32_t kFbHeapFree = 0x16, kFbTotalRam = 0x08;  // both in KiB
+constexpr uint8_t  kUtilTypePerfmon = 2;
+constexpr uint32_t kInvalidGpuId = 0xffffffffu;
+constexpr uint32_t kIoctlFailed = 0xffffffffu;   // no RM status: the ioctl itself failed
+
+// Every size each control has had in a published release (see above).
+constexpr uint32_t kProbedIdsSizes[] = {384, 256};
+constexpr uint32_t kFbInfoSizes[] = {1028, 460, 444, 436};
+struct UtilLayout { uint32_t size, sample, count, gr_util; };
+constexpr UtilLayout kUtilLayouts[] = {
+  {55888, 776, 72, 136},   // R570 - R615
+  {50704, 704, 72, 124},   // R550 - R565
+  {34000, 472, 72, 124},   // 515.86 - R545
+  {47216, 472, 100, 124},  // 515.43 - 515.76, R520
+};
+constexpr size_t kUtilBufMax = 55888;
+}  // namespace gz_rm
+
+// "/sys/module/nvidia/version" is the bare version; /proc's banner carries it
+// as the first token that starts with a digit and holds a dot.
+static std::string gz_nvidia_driver_version()
+{
+  std::string v;
+  {
+    std::ifstream f("/sys/module/nvidia/version");
+    std::getline(f, v);
+  }
+  while (!v.empty() && std::isspace((unsigned char)v.back())) v.pop_back();
+  if (!v.empty()) return v;
+  std::ifstream f("/proc/driver/nvidia/version");
+  std::string line, tok;
+  if (!std::getline(f, line)) return "";
+  std::istringstream ss(line);
+  while (ss >> tok)
+    if (std::isdigit((unsigned char)tok[0]) && tok.find('.') != std::string::npos) return tok;
+  return "";
+}
+
+// Can the probe ask this driver at all?  Two file checks, no ioctl, so the
+// mask path can decide at startup whether NVML needs its old head start.
+static bool gz_rm_probe_can_ask()
+{
+  const char * hook = std::getenv("GZSTD_DEBUG_RM_PROBE");
+  if (hook && std::strcmp(hook, "off") == 0) return false;
+  return std::atoi(gz_nvidia_driver_version().c_str()) >= 515
+      && ::access("/dev/nvidiactl", R_OK | W_OK) == 0;
+}
+
+// UUID -> /dev/nvidiaN minor, from the driver's own /proc inventory.
+static std::map<std::string, int> gz_proc_gpu_minors()
+{
+  std::map<std::string, int> out;
+  std::error_code ec;
+  for (const auto & e : fs::directory_iterator("/proc/driver/nvidia/gpus", ec)) {
+    std::ifstream inf(e.path() / "information");
+    std::string line, uuid;
+    int minor = -1;
+    while (std::getline(inf, line)) {
+      if (line.rfind("GPU UUID:", 0) == 0) {
+        const auto p = line.find("GPU-");
+        if (p != std::string::npos) {
+          uuid = line.substr(p);
+          while (!uuid.empty() && std::isspace((unsigned char)uuid.back())) uuid.pop_back();
+        }
+      } else if (line.rfind("Device Minor:", 0) == 0) {
+        minor = std::atoi(line.c_str() + 13);
+      }
+    }
+    if (!uuid.empty() && minor >= 0) out[uuid] = minor;
+  }
+  return out;
+}
+
+static GzRmProbe gz_rm_probe_run(bool newest_last)
+{
+  using namespace gz_rm;
+  GzRmProbe out;
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::string ver = gz_nvidia_driver_version();
+  const int major = std::atoi(ver.c_str());
+  if (major < 515) {
+    out.why = ver.empty() ? "driver version unreadable"
+                          : "driver " + ver + " predates the published interface (R515)";
+    return out;
+  }
+  const int ctl = ::open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);  // kept open: see above
+  if (ctl < 0) {
+    out.why = std::string("cannot open /dev/nvidiactl: ") + std::strerror(errno);
+    return out;
+  }
+  // rm_alloc / rm_control pass a parameter block to the kernel driver in memory:
+  // its ABI is this machine's byte order by definition, never a file's, so
+  // scripts/check-endian-reads.sh exempts them by name (and the three memcpy
+  // lines on the utilization ring below by text).
+  auto rm_alloc = [&](uint32_t hParent, uint32_t & hNew, uint32_t cls, void * p, uint32_t psz,
+                   uint32_t hRoot) -> uint32_t {
+    Alloc a{hRoot, hParent, hNew, cls, (uint64_t)(uintptr_t)p, 0, 0};
+    if (major >= 535) a.w24 = psz;
+    if (::ioctl(ctl, _IOWR(kMagic, kEscAlloc, Alloc), &a) < 0) return kIoctlFailed;
+    const uint32_t st = major >= 535 ? a.w28 : a.w24;
+    if (st == 0) hNew = a.hNew;
+    return st;
+  };
+  auto rm_control = [&](uint32_t hClient, uint32_t hObj, uint32_t cmd, void * p, uint32_t psz) -> uint32_t {
+    Control c{hClient, hObj, cmd, 0, (uint64_t)(uintptr_t)p, psz, 0};
+    if (::ioctl(ctl, _IOWR(kMagic, kEscControl, Control), &c) < 0) return kIoctlFailed;
+    return c.status;
+  };
+  auto hex = [](uint32_t v) { char b[16]; std::snprintf(b, sizeof b, "0x%x", v); return std::string(b); };
+  // GZSTD_DEBUG_RM_PROBE=newest-last: offer every size list oldest first, so
+  // the suite sees this driver REFUSE the sizes of other releases.
+  auto offer_order = [newest_last](size_t n, size_t k) { return newest_last ? n - 1 - k : k; };
+
+  uint32_t hClient = 0;
+  uint32_t st = rm_alloc(0, hClient, kClassRoot, nullptr, 0, 0);
+  if (st != 0) { out.why = "client alloc refused (" + hex(st) + ")"; return out; }
+
+  // Each size loop below stops at the first size the driver ACCEPTS.  Any
+  // refusal moves on: the refusal code differs by control (see above).
+  uint32_t ids[96];
+  st = kIoctlFailed;
+  uint32_t ids_size = 0;
+  const size_t nid = sizeof kProbedIdsSizes / sizeof kProbedIdsSizes[0];
+  for (size_t k = 0; k < nid && st != 0; ++k) {
+    ids_size = kProbedIdsSizes[offer_order(nid, k)];
+    std::memset(ids, 0xff, sizeof ids);
+    st = rm_control(hClient, hClient, kCmdProbedIds, ids, ids_size);
+  }
+  if (st != 0) { out.why = "GPU list refused (" + hex(st) + ")"; return out; }
+
+  const auto minors = gz_proc_gpu_minors();
+  const char * drop = std::getenv("GZSTD_DEBUG_NVML_DROP");   // see GpuMonitor::run
+  std::vector<unsigned char> ub(kUtilBufMax);
+  uint32_t fb_size = 0, util_size = 0;
+  for (uint32_t i = 0; i < 32 && ids[i] != kInvalidGpuId; ++i) {
+    Uuid u{};
+    u.gpuId = ids[i];
+    if (rm_control(hClient, hClient, kCmdUuid, &u, sizeof u) != 0) continue;
+    const std::string uuid(u.uuid, ::strnlen(u.uuid, sizeof u.uuid));
+    if (uuid.rfind("GPU-", 0) != 0) continue;
+    if (drop && std::string(",").append(drop).append(",").find("," + uuid + ",") != std::string::npos)
+      continue;
+    IdInfoV2 ii{};
+    ii.gpuId = ids[i];
+    if (rm_control(hClient, hClient, kCmdIdInfoV2, &ii, sizeof ii) != 0) continue;
+    const auto m = minors.find(uuid);
+    if (m == minors.end()) continue;
+    const std::string node = "/dev/nvidia" + std::to_string(m->second);
+    if (::open(node.c_str(), O_RDWR | O_CLOEXEC) < 0) continue;      // kept open: see above
+    uint32_t hDev = 0x67a00100u + i, hSub = 0x67a00200u + i;
+    DeviceAlloc da{};
+    da.deviceId = ii.deviceInstance;
+    if (rm_alloc(hClient, hDev, kClassDevice, &da, sizeof da, hClient) != 0) continue;
+    uint32_t sub_id = 0;
+    if (rm_alloc(hDev, hSub, kClassSubdevice, &sub_id, sizeof sub_id, hClient) != 0) continue;
+
+    FbInfo fb{};
+    st = kIoctlFailed;
+    const size_t nfb = sizeof kFbInfoSizes / sizeof kFbInfoSizes[0];
+    for (size_t k = 0; k < nfb && st != 0; ++k) {
+      fb = FbInfo{};
+      fb.count = 2;
+      fb.e[0].index = kFbHeapFree;
+      fb.e[1].index = kFbTotalRam;
+      fb_size = kFbInfoSizes[offer_order(nfb, k)];
+      st = rm_control(hClient, hSub, kCmdFbInfoV2, &fb, fb_size);
+    }
+    if (st != 0 || fb.e[1].data == 0 || fb.e[0].data > fb.e[1].data) continue;
+    GpuMonitor::Row r;
+    r.uuid = uuid;
+    r.free_bytes = (unsigned long long)fb.e[0].data << 10;
+    r.total_bytes = (unsigned long long)fb.e[1].data << 10;
+    r.cc = gz_debug_gpu_cc(uuid);   // -1 unless the suite's hook names it: the PCI ID decides the floor
+
+    r.util = 100;                    // unknown is not idle
+    const size_t nul = sizeof kUtilLayouts / sizeof kUtilLayouts[0];
+    for (size_t k = 0; k < nul; ++k) {
+      const UtilLayout & L = kUtilLayouts[offer_order(nul, k)];
+      std::fill(ub.begin(), ub.end(), 0);
+      ub[0] = kUtilTypePerfmon;                         // type
+      const uint32_t buf = L.sample * L.count;          // bufSize, at +4
+      std::memcpy(ub.data() + 4, &buf, 4);              // driver ABI, native order (endian-check ALLOW)
+      st = rm_control(hClient, hSub, kCmdUtilV2, ub.data(), L.size);
+      if (st != 0) continue;   // refused: another release's size, or no samples here
+      util_size = L.size;
+      double sum = 0;
+      unsigned n = 0;
+      for (uint32_t s = 0; s < L.count; ++s) {
+        const unsigned char * smp = ub.data() + 16 + (size_t)s * L.sample;
+        uint64_t ts;
+        uint32_t gr;
+        // The driver's own memory, native order (endian-check ALLOW):
+        std::memcpy(&ts, smp, 8);              // base.timeStamp: 0 = an empty slot
+        std::memcpy(&gr, smp + L.gr_util, 4);  // percent x 100
+        if (ts == 0 || gr > 10000) continue;
+        sum += gr;
+        ++n;
+      }
+      if (n) r.util = (unsigned)std::lround(sum / n / 100.0);
+      break;
+    }
+    out.rows.push_back(std::move(r));
+  }
+  out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  out.detail = "driver " + ver + ", list " + std::to_string(ids_size) + " B, free VRAM "
+             + std::to_string(fb_size) + " B, utilization "
+             + (util_size ? std::to_string(util_size) + " B" : std::string("unavailable"));
+  if (out.rows.empty()) out.why = "no card answered (" + out.detail + ")";
+  return out;
+}
+
+// Run the probe on its own thread within the subset ranking's 500 ms budget.
+// A probe still inside the driver at the deadline is detached, like a wedged sampler.
+static GzRmProbe gz_rm_probe(std::chrono::steady_clock::time_point deadline)
+{
+  GzRmProbe out;
+  const char * hook = std::getenv("GZSTD_DEBUG_RM_PROBE");
+  if (hook && std::strcmp(hook, "off") == 0) {
+    out.why = "disabled (GZSTD_DEBUG_RM_PROBE=off)";
+    return out;
+  }
+  const bool newest_last = hook && std::strcmp(hook, "newest-last") == 0;
+  // GZSTD_DEBUG_RM_PROBE=stall: the probe thread never returns, as one stuck
+  // in the driver would not, so the suite can hold the shared deadline and
+  // the detached thread at exit to account.
+  const bool stall = hook && std::strcmp(hook, "stall") == 0;
+  struct Shared {
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    GzRmProbe r;
+  };
+  auto sh = std::make_shared<Shared>();
+  std::thread t;
+  try {
+    t = std::thread([sh, newest_last, stall] {
+      if (stall) {
+        std::mutex m;
+        std::condition_variable cv;
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [] { return false; });
+      }
+      GzRmProbe r;
+      try {
+        r = gz_rm_probe_run(newest_last);
+      } catch (const std::exception & e) {
+        // Keep a failed optional probe from terminating the process.  Even
+        // formatting the reason may allocate and fail under memory pressure.
+        r.rows.clear(); r.detail.clear(); r.why.clear(); r.ms = 0;
+        try { r.why = std::string("failed: ") + e.what(); } catch (...) {}
+      } catch (...) {
+        r.rows.clear(); r.detail.clear(); r.why.clear(); r.ms = 0;
+      }
+      std::lock_guard<std::mutex> lk(sh->m);
+      sh->r = std::move(r);
+      sh->done = true;
+      sh->cv.notify_all();
+    });
+  } catch (const std::system_error & e) {
+    out.why = std::string("cannot start its thread: ") + e.what();
+    return out;
+  }
+  std::unique_lock<std::mutex> lk(sh->m);
+  if (!sh->cv.wait_until(lk, deadline, [&sh] { return sh->done; })) {
+    lk.unlock();
+    t.detach();
+    out.why = "no answer within the shared 500 ms budget";
+    return out;
+  }
+  out = std::move(sh->r);
+  lk.unlock();
+  t.join();
+  return out;
+}
+#endif // HAVE_NVML && __linux__
+
 // ---- The subset mask, placed early and ranked late (v0.17.75) ----
 //
 // An unmasked SUBSET (--gpu-devices N below the /proc count, --adapt's device
@@ -21620,16 +22009,19 @@ static std::vector<int> select_best_gpus(int total_devices, int want, const Opti
 // having paid that wait for nothing.
 //
 // Now: apply_backend_defaults() PUTENVs a guessed mask before any other thread
-// exists (a random N of the /proc UUIDs), then starts the sampler without
-// waiting.  finalize_gpu_mask() runs immediately before the first CUDA call of
-// whichever path gets there (hybrid bringup thread, a synchronous bringup, the
-// verify probe, ...): it waits for the sample, ranks, and rewrites the mask IN
-// PLACE.  So a hybrid main thread does not wait for ranking, a hybrid run
-// that skips CUDA does not wait for ranking on its work path (normal exit can
-// still wait up to 500 ms for the sampler), and a run that uses CUDA gets the
-// ranked cards when a complete sample is available.  Waiting there is nearly
-// free, because the driver serializes NVML's attach with cuInit anyway
-// (measured: run in parallel they finish 45 ms sooner than back to back).
+// exists (a random N of the /proc UUIDs) and returns without waiting.
+// finalize_gpu_mask() runs immediately before the first CUDA call of whichever
+// path gets there (hybrid bringup thread, a synchronous bringup, the verify
+// probe, ...): it ranks, and rewrites the mask IN PLACE.  So a hybrid main
+// thread does not wait for ranking, a hybrid run that skips CUDA never ranks at
+// all, and a run that uses CUDA gets the ranked cards.
+//
+// v0.18.6: the ranking asks the DRIVER first (gz_rm_probe, ~40 ms for 8 cards)
+// and starts the NVML sampler only when the probe cannot decide.  Until then
+// the sampler started here, at startup, and finalize waited up to 500 ms for
+// its first sample: ~280 ms typically, during which NVML held the driver
+// locks that cuInit needs next, and on a loaded host it missed the deadline
+// and CUDA got the random guess.
 //
 // WHY PUTENV AND AN IN-PLACE WRITE.  setenv while other threads may call getenv
 // is not safe (it can reallocate environ under them).  POSIX putenv makes the
@@ -21652,6 +22044,7 @@ struct GzGpuMask {
   std::mutex mx;
   bool   pending = false;           // guess placed, ranking not applied yet
   bool   expand_on_unknown = false; // no safe N-card guess if NVML also lacks a rank
+  bool   probe_unavailable = false;  // startup check chose the NVML head start
   char * env = nullptr;             // "CUDA_VISIBLE_DEVICES=<value>", leaked
   char * value = nullptr;           // env + strlen("CUDA_VISIBLE_DEVICES=")
   size_t cap = 0;                   // bytes available at value, NUL included
@@ -21692,25 +22085,33 @@ static std::string gz_cuda_visible_uuids()
 }
 
 // Rank and apply the pending subset mask.  `who` names the calling site for
-// the -vv trace the suite reads ("waiting ... (hybrid bringup)" vs "(main
-// thread)").  Idempotent and thread-safe; a no-op when nothing is pending.
+// the -vv trace the suite reads ("ranking the cards ... (hybrid bringup
+// thread)" vs "(main thread ...)").  Idempotent and thread-safe; a no-op when
+// nothing is pending.
 static void finalize_gpu_mask(const Options & opt, const char * who)
 {
   GzGpuMask & m = g_gpu_mask;
   std::lock_guard<std::mutex> lk(m.mx);
   if (!m.pending) return;
   m.pending = false;
-  vlog(V_DEBUG, opt, std::string("[GPU] waiting up to 500 ms for the NVML sample (")
-                     + who + ")\n");
-  g_gpu_monitor.wait_ready(500);
-  const auto rows = g_gpu_monitor.snapshot();
-  std::string sel;
-  size_t too_old = 0;           // v0.17.77: complete sample, cards below the floor
-  bool none_new_enough = false;
-  bool rank_decided = false;
-  if (!rows.empty()) {
-    // The first sweep can omit a card whose NVML handle or UUID lookup failed.
-    // NVML and /proc can also expose different inventories in a container.
+  // v0.18.6: ask the driver first (gz_rm_probe, ~40 ms on 8 cards), and wait
+  // for the NVML sample only when the probe cannot decide.  Both sources go
+  // through the same checks.  The sampler is not even started unless it is
+  // needed: NVML's start holds the driver's locks for ~0.3 s, and cuInit, which
+  // comes next, would wait behind it.
+  vlog(V_DEBUG, opt, std::string("[GPU] ranking the cards before CUDA starts (") + who + ")\n");
+  struct Decision {
+    std::string sel;
+    size_t too_old = 0;           // v0.17.77: complete sample, cards below the floor
+    bool none_new_enough = false;
+    bool rank_decided = false;
+  };
+  auto decide = [&m](const std::vector<GpuMonitor::Row> & rows) {
+    Decision d;
+    if (rows.empty()) return d;
+    // A sample can omit a card whose lookup failed (an NVML handle or UUID,
+    // a probe that could not open its device file), and NVML, the driver probe
+    // and /proc can expose different inventories in a container.
     // Rank only from a sufficient sample.  A partial old-only sample cannot
     // prove that the omitted cards are below the floor.
     std::vector<const GpuMonitor::Row *> eligible;
@@ -21724,8 +22125,8 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
       eligible.push_back(&r);
     }
     if (eligible.size() >= (size_t)m.want) {
-      // An NVML row can have a UUID but no capability: the optional query may
-      // be unavailable or fail for this card.  Use the PCI classification in
+      // A row can have a UUID but no capability: NVML's optional query may be
+      // unavailable or fail for this card, and the driver probe never asks.  Use the PCI classification in
       // that case.  An unclassified card cannot justify narrowing the mask.
       std::vector<const GpuMonitor::Row *> fit;
       size_t unresolved = 0;
@@ -21735,27 +22136,86 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
         if (pci > 0 || r->cc >= kGzGpuMinCc) fit.push_back(r);
         else ++unresolved;
       }
-      // A partial NVML sweep can contain N old cards while omitting a new one.
+      // A partial sample can contain N old cards while omitting a new one.
       // Emptying the mask then hides the new card even when the startup guess
-      // selected it.  Fewer than N usable rows decide the mask only when NVML
-      // accounted for every /proc candidate; otherwise keep the guess.
+      // selected it.  Fewer than N usable rows decide the mask only when the
+      // sample accounted for every /proc candidate; otherwise keep the guess.
       if (fit.size() >= (size_t)m.want
           || (eligible.size() == m.candidates.size() && unresolved == 0)) {
-        rank_decided = true;
-        too_old = eligible.size() - fit.size() - unresolved;
-        none_new_enough = fit.empty();
+        d.rank_decided = true;
+        d.too_old = eligible.size() - fit.size() - unresolved;
+        d.none_new_enough = fit.empty();
         std::vector<GzDevRank> rin;
         rin.reserve(fit.size());
         for (const auto * r : fit) rin.push_back({r->util, r->free_bytes});
         const std::vector<size_t> order = gz_rank_devices(rin);
         for (size_t i = 0; i < order.size() && i < (size_t)m.want; ++i) {
-          if (!sel.empty()) sel += ",";
-          sel += fit[order[i]]->uuid;
+          if (!d.sel.empty()) d.sel += ",";
+          d.sel += fit[order[i]]->uuid;
         }
       }
     }
+    return d;
+  };
+  // The probe and NVML share the old startup wait budget.  In particular, a
+  // probe stuck in the driver must not add another full NVML wait before CUDA.
+  const auto rank_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  Decision d;
+  std::string source, probe_why, nvml_why;
+#if defined(HAVE_NVML) && defined(__linux__)
+  if (m.probe_unavailable) {
+    // The startup check already chose NVML's head start.  Do not spend this
+    // ranking deadline retrying a driver the check could not ask.
+    probe_why = "unavailable when the startup mask was placed";
+  } else {
+    const GzRmProbe probe = gz_rm_probe(rank_deadline);
+    if (!probe.rows.empty()) {
+      d = decide(probe.rows);
+      char ms[32];
+      std::snprintf(ms, sizeof ms, "%.1f", probe.ms);
+      vlog(V_DEBUG, opt, "[GPU] driver probe: " + std::to_string(probe.rows.size()) + " card(s) in "
+                         + ms + " ms (" + probe.detail + ")\n");
+      if (d.rank_decided) source = "the driver";
+      else probe_why = "its " + std::to_string(probe.rows.size()) + " card(s) do not settle the choice";
+    } else {
+      probe_why = probe.why;
+    }
   }
-  const char * how = "incomplete or mismatched NVML sample; kept the startup guess";
+#else
+  probe_why = "not available on this platform";
+#endif
+  if (!d.rank_decided) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        rank_deadline - std::chrono::steady_clock::now()).count();
+    bool sampler_started = false;
+    if (left > 0) {
+      vlog(V_DEBUG, opt, "[GPU] driver probe: " + probe_why
+                         + "; waiting up to " + std::to_string(left)
+                         + " ms for the NVML sample (" + who + ")\n");
+      try {
+        g_gpu_monitor.start();   // a no-op if apply_backend_defaults started it
+        sampler_started = true;
+      } catch (const std::system_error &) {
+        // No sampler exists; wait_ready would consume the remaining budget.
+      }
+    }
+    const auto wait_left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        rank_deadline - std::chrono::steady_clock::now()).count();
+    const bool ready = sampler_started && wait_left > 0
+        && g_gpu_monitor.wait_ready((int)wait_left);
+    // Read the snapshot even with the budget spent: a sampler started at
+    // startup (a driver the probe cannot ask) may already hold a sample.
+    d = decide(g_gpu_monitor.snapshot());
+    if (d.rank_decided) source = "NVML";
+    else if (left <= 0) nvml_why = "the shared 500 ms budget expired before NVML could start";
+    else nvml_why = ready ? "its sample does not settle the choice"
+                          : "no usable sample within the shared 500 ms budget";
+  }
+  std::string sel = d.sel;
+  const size_t too_old = d.too_old;
+  const bool none_new_enough = d.none_new_enough;
+  const bool rank_decided = d.rank_decided;
+  std::string how = "no usable load sample; kept the startup guess";
   if (none_new_enough && ::getenv("CUDA_VISIBLE_DEVICES") == m.value) {
     // Name no card: CUDA then enumerates none, and every path runs as it does on
     // a host without GPUs.  Normally the pre-CUDA check has already said so;
@@ -21765,8 +22225,8 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
     how = "no card is new enough for this build";
   } else if (!rank_decided && m.expand_on_unknown
              && ::getenv("CUDA_VISIBLE_DEVICES") == m.value) {
-    // /proc could not classify enough cards and NVML did not supply a usable
-    // rank.  Expose every candidate so the post-CUDA floor can find a newer
+    // /proc could not classify enough cards and neither the driver probe nor
+    // NVML supplied a usable rank.  Expose every candidate so the post-CUDA floor can find a newer
     // card outside the random guess.  The placed buffer reserves this value.
     for (const auto & u : m.candidates) {
       if (!sel.empty()) sel += ",";
@@ -21776,6 +22236,12 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
     how = "incomplete GPU inventory; checking all visible cards after CUDA starts";
   } else if (sel.empty()) {
     sel = m.value;
+    // v0.18.6: SAY SO.  The guess is random by design (two jobs must not pile
+    // onto one card), so a run that keeps it chose its GPUs blind, and until
+    // now only the -v trace admitted it.  Once per run, at the default level.
+    vlog(V_DEFAULT, opt, "gzstd: warning: could not read GPU load before choosing (driver probe: "
+                         + probe_why + "; NVML: " + nvml_why + "); using " + sel
+                         + ", picked at random.  Set CUDA_VISIBLE_DEVICES to choose.\n");
   } else if (sel.size() + 1 > m.cap) {
     how = "ranked set does not fit the placed mask; kept the startup guess";
     sel = m.value;
@@ -21784,9 +22250,8 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
     sel = ::getenv("CUDA_VISIBLE_DEVICES") ? ::getenv("CUDA_VISIBLE_DEVICES") : "";
   } else {
     std::memcpy(m.value, sel.c_str(), sel.size() + 1);
-    how = too_old ? "combined rank: utilization + free VRAM, over the cards new enough "
-                    "for this build"
-                  : "combined rank: utilization + free VRAM";
+    how = std::string("combined rank: utilization + free VRAM, from ") + source
+        + (too_old ? ", over the cards new enough for this build" : "");
   }
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
@@ -41014,7 +41479,7 @@ static bool place_gpu_mask_guess(const Options & opt)
   m.candidates = std::move(candidates);
   m.pending = true;
   vlog(V_DEBUG, opt, "[GPU] " + std::to_string(want) + " of " + std::to_string(uuids.size())
-       + " cards: placed a startup guess (" + guess + "); NVML ranks them before CUDA starts\n");
+       + " cards: placed a startup guess (" + guess + "); ranked before CUDA starts\n");
   return true;
 }
 
@@ -46030,14 +46495,31 @@ static void apply_backend_defaults(Options & opt)
         sel += tok; ++taken;
       }
     } else if (place_gpu_mask_guess(opt)) {
-      // v0.17.75: the guess is in place (putenv, before any other thread); the
-      // sampler starts only NOW, after it.  Ranking waits for the first CUDA
-      // call -- except where that call is effectively immediate on this
-      // thread (cuFile's --gds-only, --direct-stage's staging, --tar, and
-      // calibrate), which rank here exactly as before.
+      // v0.17.75: the guess is in place (putenv, before any other thread).
+      // Ranking waits for the first CUDA call -- except where that call is
+      // effectively immediate on this thread (cuFile's --gds-only,
+      // --direct-stage's staging, and --tar), which rank here.  Calibrate's
+      // device-count children run before the parent's first CUDA call: opening
+      // every /dev/nvidiaN here would make their cold-start measurements warm.
+      // v0.18.6: no sampler here; finalize_gpu_mask asks the driver and
+      // starts NVML only if the driver cannot answer.  A driver the probe
+      // cannot ask at all (before R515, or no access to /dev/nvidiactl) gets
+      // the sampler NOW, as before v0.18.6: a hybrid bringup ranks seconds
+      // later, and that head start is what lets a slow NVML answer in time.
+      // Never under calibrate, whose count children must find no device held.
       mask_placed = true;
-      g_gpu_monitor.start();
-      if ((opt.gds_only || opt.direct_stage || opt.tar_mode || opt.calibrate)
+#if defined(HAVE_NVML) && defined(__linux__)
+      if (!opt.calibrate && !gz_rm_probe_can_ask()) {
+        {
+          std::lock_guard<std::mutex> lk(g_gpu_mask.mx);
+          g_gpu_mask.probe_unavailable = true;
+        }
+        g_gpu_monitor.start();
+      }
+#else
+      if (!opt.calibrate) g_gpu_monitor.start();
+#endif
+      if ((opt.gds_only || opt.direct_stage || opt.tar_mode)
           && !gz_floor_precuda().all_old)
         finalize_gpu_mask(opt, "main thread, immediate GPU mode");
     } else {

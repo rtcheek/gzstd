@@ -1,12 +1,133 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.5  
+**Covers:** v0.9.50 → v0.18.6  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.6 — GPUs are ranked by asking the driver, and a blind pick says so
+
+**The defect.** An unmasked GPU subset (`--gpu-devices N` below the card count, `--gds-only`'s card,
+`--adapt`'s device count) is chosen just before CUDA starts, from each card's utilization and free
+VRAM. The choice waited up to 500 ms for NVML's first sample, and when the sample was late it kept
+the RANDOM startup guess, which only `-v` admitted. NVML is slow to a first sample: MEASURED on the
+8-GPU server, 100 fresh processes, 278 ms median, p99 323 ms. Inside a v0.18.5 run, 7 runs at load
+25-39, the selection came 270-508 ms after start (median 305), two of them at the deadline, and one
+of those two used a card no ranked run chose. An ioctl trace of `nvmlInit` (an LD_PRELOAD shim) says
+where the time goes: 28 peer-to-peer capability queries, one per card pair, 219 ms; clock
+correlation for every card, 85 ms. Once NVML is up, the two figures gzstd needs take 0.09 ms for all
+8 cards. And while NVML starts it holds the driver locks that `cuInit`, next, needs.
+
+**The fix.** `gz_rm_probe` asks the kernel driver directly, with the resource-manager (RM) ioctls on
+`/dev/nvidiactl` that libnvidia-ml itself makes: per card its UUID, a device and subdevice object,
+the heap's free and total VRAM, and the driver's own utilization history (a ring of 72 samples,
+about 14 s here), averaged. NVML starts only when the probe cannot decide; a pick that neither
+source could rank prints a default-verbosity warning naming the cards (`-q` silences it).
+
+**Portable by construction, checked against every release.** NVIDIA publishes these definitions with
+the open kernel modules from R515. A layout check compiled against the headers of all 221 release
+tags, 515.43.04 through 615.78.08 (42 distinct header sets), found the request codes, command IDs and
+structures identical everywhere except four sizes:
+
+| releases (tags) | alloc status at | GPU list | free-VRAM list | utilization ring |
+|---|---|---|---|---|
+| 515.43-515.76, 520 (18) | +24 | 256 | 436 | 47216 (100 samples) |
+| 515.86+, 525, 530 (31) | +24 | 256 | 436 | 34000 |
+| 535 (39) | +28 | 256 | 436 | 34000 |
+| 545 (5) | +28 | 256 | 444 | 34000 |
+| 550, 555 (39) | +28 | 256 | 444 | 50704 |
+| 560, 565 (5) | +28 | 256 | 460 | 50704 |
+| 570, 575 (31) | +28 | 256 | 460 | 55888 |
+| 580-615 (53) | +28 | 384 | 1028 | 55888 |
+
+The layout is not a function of the major version (late 515 differs from 520), so the probe offers
+the known sizes in turn: the driver compares a control's size with the exact size it was built with
+and refuses any other before copying anything back (the check in `rs_resource.c`, identical in 515
+and 595), and the export tables of all 221 releases mark none of the five controls cacheable (the
+cache serves any buffer big enough) or privileged. A wrong guess is refused, never misread. Only the
+alloc status offset cannot be asked, and its R535 boundary is exact in every tag. Drivers before R515
+have nothing published to check against and are not probed. The probe runs on its own thread, and
+it and NVML share ONE 500 ms ranking budget: a probe stuck in the driver spends it, NVML is not
+started for a second wait, and the guess stands with the warning (a stalled probe, induced with a
+debug hook: selection at 507 ms, exit 0, the right bytes). The probe keeps the device files and its
+client open for the process lifetime, as NVML does (closing a card's last descriptor tears it down
+without persistence mode). A driver the probe cannot ask at all (before R515, or no access to
+`/dev/nvidiactl`) still gets the NVML sampler at startup, as before, because a hybrid run ranks
+seconds later and that head start is what lets a slow NVML answer in time.
+
+**Is utilization needed?** Measured before building it, since free VRAM alone is the stable half of
+the interface. A 30-minute NVML trace of the 8 cards (899 samples, other users' jobs plus test jobs)
+replayed through both policies: free VRAM alone picks the same set as the combined rank in 779 of
+899 samples for one card, 415 for two, 99 for three, 351 for four. And a `--gds-only` gzstd job
+holds only ~6 GiB of an 80 GiB card, so free VRAM alone sends a second gzstd onto the same card:
+16 GiB `--gds-only` compress, three interleaved rounds, alone 7.80-7.97 s; two jobs on one card
+11.40-12.37 s each; split across two cards 10.05-11.68 s. The probe reads both.
+
+**Measured after**, 8-GPU server, load 12-39, 600 MiB input, 7 interleaved rounds, wall medians:
+`--gds-only` 2.47 s (2.46-3.00) -> 2.23 s (2.13-2.68); `--gpu-only --gpu-devices=1` 1.53 s
+(1.46-1.97) -> 1.22 s (1.18-1.47). Time from start to the selection on stderr: v0.18.5 median 305 ms;
+v0.18.6 with the probe off (NVML) 288 ms; with the probe 33-42 ms. The probe's runs never load
+libnvidia-ml (loader trace). The probe alone, 100 processes at load 143: 10.6 ms median for free
+VRAM, ~38 ms with utilization. The two sources picked the same card on `--gds-only`, and different
+cards of the same model on a hybrid run: the probe's figure is a 14 s mean, NVML's one instant.
+
+**Scope.** Only the subset mask. `--gpu-order=ranked` and an all-device run still ask NVML, unchanged.
+
+**`--calibrate` with a GPU subset now ranks after its device-count pass.** That pass runs one child per
+device count, each measuring a cold start, and its own comment records what a device held open by
+the parent does to them: a flat ~1.5 s at every count. On the subset path v0.18.5 started NVML in
+the parent at startup, which opens every card, and the probe would have done the same; the parent
+now ranks only after the children (seen at -vv: the ranking line follows the last count row). The
+children run on the startup guess instead of a ranked set.
+
+**Tests.** Two GPU cells. The probe ranks a subset (every /proc card answers, the rank says "from
+the driver", nothing waits for NVML, CUDA reads the mask); offered its sizes oldest first, this driver
+refuses the other releases' sizes and the probe lands on the same three; with the probe off, NVML
+ranks. The loader names every library it initializes, so "NVML is not started" is asserted
+directly: with the probe no run loads libnvidia-ml, with bringup forced or skipped; with the probe
+off it loads in both, including at startup when bringup is skipped (the head start; these arms also
+prove the check can see a load). Under `--calibrate --gpu-devices=2` the ranking follows the count
+pass. The second cell: with no load source the warning appears and `-q` silences it, and a stalled
+probe reaches the same warning without starting NVML and exits 0. The bringup cells match the new
+trace line. Mutants, each caught by the arm meant for it: the sampler started at startup again; the
+GPU-list or the utilization negotiation stopping at the first refusal; the warning at the `-q` level;
+the alloc status read at the pre-R535 offset; NVML given its own 500 ms after the probe; no head
+start for a driver the probe cannot ask; calibrate ranking at startup. The v0.18.5 binary fails both
+new cells. The probe honours the suite's `GZSTD_DEBUG_NVML_DROP` and `GZSTD_DEBUG_GPU_CC`, so the
+partial-inventory and floor cells test both sources; `GZSTD_DEBUG_RM_PROBE=off|newest-last|stall` is
+new.
+
+**Review** (Codex, GPT-6-Sol). Round 1: SAFE TO COMMIT, with five fixes made as code, all adopted:
+the shared 500 ms budget (the staged tree let a stuck probe add a full NVML wait, ~1 s against
+v0.18.5's 500 ms); the GPU_CC debug hook made process-lifetime, since a detached probe can read it
+during `std::exit`; calibrate ranking after its count pass; the probe thread catching any exception
+without needing an allocation to report it; and a sampler that failed to start no longer waiting out
+the budget. Added after it: the startup head start for drivers the probe cannot ask, the `stall`
+hook and its arm, and a snapshot read even when the budget is spent (a sampler started at startup
+may already hold one). Round 2, on the built tree: SAFE TO COMMIT, with one edit, adopted: the
+startup "cannot ask" decision now holds through the ranking, so a device file that became openable
+in between cannot start a probe that spends the budget while an NVML sample waits. That trigger was
+not provoked, and with the probe disabled by hook the skip is not observable, so no mutant covers
+it. It re-ruled its own round-1 calibrate finding as an improvement rather than a regression, since
+v0.18.5's NVML sampler already held the cards there. The head-start mutant was rebuilt on the final
+tree and is still caught. Both configurations build warning-free.
+
+**Suites** (default, 2026-10-09): GPU build 614 passed, 1 failed, 1 skipped of 616; CPU-only 444
+passed, 1 failed (445 ran). The one failure in both was the source guard against host-order reads
+of on-disk fields (`scripts/check-endian-reads.sh`), which matched the probe's ioctl parameter
+blocks and its reads of the driver's sample ring: memory exchanged with the kernel, native byte
+order by definition. They are now exempt by name (`rm_alloc`, `rm_control`; renamed from `alloc` and
+`control`, too generic to exempt) and by text (three `memcpy` lines), with a comment at each site; a
+differently spelled read and a `pread` on the same line as an exempt call are still reported. The
+checker now passes, both configurations rebuild warning-free, and the subset-ranking cells pass on
+the rebuilt binary. Extensive not run.
+
+**Not verified.** Only driver 595.91.07 ran the probe; every other release is covered by its compiled
+headers, not by running. Not run without persistence mode (on here since 2026-10-09), in a container
+that exposes only some `/dev/nvidiaN`, or on the workstation.
 
 ## v0.18.5 — a redirected stdin streams like a named file, and a pipe no longer waits for the GPUs
 

@@ -133,6 +133,12 @@ declare -a ALLOW_CALLEE=(
   'sscanf'                       # parses decimal TEXT into &ints; text has no byte
                                  # order.  (v0.17.73: --calibrate reads its children's
                                  # "gpuc N wall active bytes" report lines.)
+  'rm_alloc'                     # v0.18.6 gz_rm_probe: an RM alloc parameter block
+  'rm_control'                   # and control block handed to the NVIDIA kernel
+                                 # driver by ioctl, in memory.  The kernel ABI is
+                                 # this machine's byte order by definition; nothing
+                                 # here touches a file.  Distinctive names on purpose:
+                                 # a bare `alloc`/`control` would exempt too much.
 )
 
 # EXEMPTIONS SUBTRACT, THEY DO NOT EXCUSE.
@@ -167,6 +173,12 @@ declare -a ALLOW=(
   # getrandom(2) filling a nonce: randomness has no byte order, and this reads
   # from the kernel rather than from a file. Used for quarantine/temp names.
   'reinterpret_cast<char *>(&value) + off'
+  # v0.18.6 gz_rm_probe: the bufSize field written into, and the timestamp and
+  # utilization read back out of, the NVIDIA driver's in-memory sample ring.
+  # Kernel ABI, native order by definition; never a file.
+  'std::memcpy(ub.data() + 4, &buf, 4);'
+  'std::memcpy(&ts, smp, 8);'
+  'std::memcpy(&gr, smp + L.gr_util, 4);'
 )
 
 # A call split across lines is still one call.  Fold each source file into LOGICAL
