@@ -160,8 +160,31 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    `--adapt` action that tries placements across runs per (strategy, size) bucket.  Worker threads
    inherit the creating thread's affinity, so a placement is a `sched_setaffinity` before the context
    is created (and for the reader).  Today the win is available by hand: `taskset -c 0-7,128-135 gzstd
-   --sliding-window ...` at levels up to 12 on this box.  Check a one-L3 desktop and a single-socket
-   Intel box before choosing: the effect may be specific to many-cache parts.  The original text: Exploratory sweep (v0.18.4, 2-socket
+   --sliding-window ...` at levels up to 12 on this box.
+
+   **The one-L3 check (2026-10-12, v0.18.8): the effect is NOT specific to many-cache parts.** The
+   2-GPU workstation: one socket, 12 cores / 24 threads (Intel, CPUs 0-11 distinct cores, siblings
+   12-23), one 19.3 MiB L3.  Same method (warm, /dev/null, 2 GiB slices, medians of 3; level 15 n=2,
+   level 19 n=1); `taskset -c 0-1/0-3/0-5/0-11` (2/4/6/12 workers), the default (0-23, 12 workers:
+   one per physical core), and `-T0` (24):
+
+   | level | high-ratio best / default | medium | low-ratio |
+   |---|---|---|---|
+   | 1 | 6 cores 0.36 s / 0.75 | 6 cores 0.47 / 0.72 | 4 cores 0.55 / 0.72 |
+   | 3 | 6 cores 0.38 / 0.68 | 6 cores 0.54 / 0.67 | 6 cores 0.59 / 0.67 |
+   | 6 | 12 cores 0.43 / 0.51 | 12 cores 0.53 / 0.58 | 6 cores 0.62 / 0.67 |
+   | 9 | 12 cores 0.46 / 0.48 | -T0 0.71 / 0.78 | 12 cores 0.93 / 0.99 |
+   | 12 | default 0.50 | -T0 1.01 / 1.39 | -T0 1.39 / 1.58 |
+   | 15 | default 9.82 | default 8.74 (-T0 9.30) | -T0 5.79 / 6.52 |
+   | 19 | default 0.63 | -T0 33.90 / 50.83 | -T0 41.15 / 53.89 |
+
+   With one cache there is nothing to pack into, yet 4-6 workers beat 12 by 1.13-2.10x at levels 1-3:
+   so at least part of the server's effect is worker COUNT against one producer, not cache crossing.
+   And a second, separate question this box opens: the physical-core default (measured on the
+   2-socket server, idle and shared) loses to SMT at high levels here, 1.14-1.50x.  Where the boxes
+   differ: levels 6-12 still wanted 1-4 caches on the server, but the whole socket here; only the
+   fast/dfast levels (1-4) want few workers on both.  Still to check: a single-socket AMD part with
+   several L3s (CCDs).  The original text: Exploratory sweep (v0.18.4, 2-socket
    128-core server whose L3 is 16 separate caches, 19.5 GiB warm to /dev/null): at level 3, 8 workers
    pinned inside one L3 cache took 2.05 s (high-ratio data) and 3.2-3.4 s (medium), against 4.6-4.9 s
    and 4.9-5.6 s for the default 128 workers spread over the machine; one socket (64 workers) took

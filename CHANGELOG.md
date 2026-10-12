@@ -17,8 +17,66 @@ failed, 1 skipped (the usual host skip) of 816, 14m52s. The failure was this rel
 meeting a stale fixture: "--gds-only bringup halving" needs four reallocations, and its 32 MiB archive
 of two 16 MiB frames now opens at batch 2 ("batches: 2 1") where the tuner's uncapped 64 used to give
 room. Its archive is now written at 1 MiB frames; the same fixture and command then give "32 16 8 4",
-four reallocations, exit 0. The workstation (GDS unavailable there: 506 default / 798 extensive) is
-still owed, with the v0.18.7 list.
+four reallocations, exit 0.
+
+### The workstation (2026-10-12): the second machine and the v0.18.7 list
+
+The 2-GPU workstation (2x RTX 2080 Ti, 11 GiB, Turing, driver 570.207; 12-core/24-thread Intel, one L3;
+kernel 6.8), both configurations rebuilt warning-free at 0.18.8.
+
+**Suites.** CPU-only 381 passed, 0 failed, "as expected on this host". GPU `--extensive` 797 passed, 1
+failed, 18 skipped of 816, "798 ran, as expected" -- every skip a `--gds-only` cell (GDS unavailable,
+refused). The failure was a fixture written for the 8-GPU server: the driver-probe cell's calibrate arm
+asked for `--gpu-devices=2`, which on a 2-card host is every card, so nothing ranks (correct) and the
+cell found no ranking line. The arm now asks for 2 only where the host has more than two cards, else 1,
+and anchors on the count pass's last line in either form ("gpu devices  2: overhead" or "one device,
+nothing to choose"). Checked by hand: passes here, passes a server-shaped log, and fails both mutant
+orders (ranking before the count pass, ranking between its rows). Not re-run in a full suite.
+
+**The driver probe on a second driver and card generation** (v0.18.6). 570.207 on Turing: 2 cards in
+4.1-13.9 ms, the subset ranked "from the driver", NVML not loaded; the suite's default, newest-last
+(this driver refuses the other releases' sizes) and off arms all pass. With persistence mode off (card
+0 drives no display, so it is torn down between runs; card 1 runs the login screen): 2 cards in
+12.4-13.1 ms, the cold card read and chosen, NVML not loaded (`LD_DEBUG=libs`) except under
+`GZSTD_DEBUG_RM_PROBE=off`, where NVML ranks as designed; newest-last lands on the same sizes, the
+all-device `--gpu-order=ranked` ranks "from the driver", and the repaired calibrate arm passes.
+
+**The reader pool, plain and unprefaulted against huge pages** (v0.18.7), memory free (228 GiB), warm,
+to /dev/null, a scratch build choosing the pool's pages by environment, rotated, no compaction stall in
+any run:
+
+| 19.5 GiB | plain, no prefault (v0.18.7) | huge pages + prefault (before) | plain + 4 GiB memset |
+|---|---|---|---|
+| `--cpu-only --no-mmap`, high-ratio, 6 rounds | **1.35-1.39 s** | 1.75-1.79 s | 2.57-2.64 s |
+| `--gpu-only`, medium, 4 rounds | **6.44-7.74 s** | 7.82-9.32 s | 7.29-9.36 s |
+
+Plain pages won every round of both. The old workstation order (huge pages ahead of the memset) still
+holds; the v0.18.7 default is ahead of both. The stock 0.18.8 binary took 1.35-1.36 s on the CPU shape,
+the plain arm's figure.
+
+**`--gpu-order=ranked` at the probe's cost** (v0.18.7's open question): `--gpu-only` compress, CUDA's
+order against ranked, ABBA, 4 a cell, 1 GiB / 4 GiB / 19.5 GiB of the medium corpus:
+
+| regime | CUDA order | ranked |
+|---|---|---|
+| quiet | 1.05-1.29 / 2.08-2.22 / 6.34-7.54 s | 1.03-1.07 / 2.04-2.21 / 6.43-6.91 s |
+| card 0 at 98% (a spin kernel) | 1.16-1.36 / 2.44-2.99 / 8.18-10.26 s | 1.20-1.24 / 2.47-2.84 / 8.05-10.36 s |
+| card 0 with 2.3 GiB free (8 GiB held, idle) | 0.96-1.11 / 2.04-2.30 / 6.73-8.14 s | 0.99-1.01 / 2.02-2.07 / 6.58-7.61 s |
+
+The ranking put the loaded card last in every busy-card run, and no cell separates beyond its spread:
+it does not pay here either, at 4-14 ms, so it stays opt-in. In two VRAM-regime runs it put the
+starved card FIRST: back to back, the other card still carried utilization from the previous job (it
+had done most of it), the two scored 1 each, and a tie goes to the idler card (a rule measured on the
+server). After an idle gap the driver and NVML both rank it last. The block comment above
+`gz_rank_devices` still says ties go to more free VRAM; the code (and its own inline comment) prefers
+the idler card.
+
+**`--sliding-window` placement on a one-L3 part** (ROADMAP 10): see the ROADMAP for the table. Fewer
+workers win at levels 1-3 here too (4-6 workers against the default 12: 1.13-2.10x), so the effect is
+not specific to many-cache parts; levels 6-9 are within ~10%; at levels 12 and 19 every hardware
+thread (`-T0`, 24) wins on the medium and low-ratio corpora (1.14-1.50x; at 15 only on low-ratio,
+1.13x), where the default is one worker per physical core (measured on the idle-or-shared 2-socket
+server, "level 19 no worse"). Neither default changed: both are one box's evidence.
 
 ### Simultaneous jobs on one card keep their GPU (ROADMAP 9)
 

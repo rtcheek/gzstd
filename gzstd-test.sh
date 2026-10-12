@@ -5725,12 +5725,16 @@ if has_gpu 2>/dev/null; then
       # device held open by the parent would make warm.  So under calibrate the
       # parent ranks only after its count pass: the ranking line follows the
       # last count row.  (The suite's corpus hook skips that pass unless
-      # GZSTD_DEBUG_CALIBRATE_GPUC asks for it.)
+      # GZSTD_DEBUG_CALIBRATE_GPUC asks for it.)  The count must stay below the
+      # host's cards or nothing ranks: 2 where there are more than two (two
+      # count rows), else 1 (its count pass prints "one device, nothing to
+      # choose").  The anchor is the pass's LAST line, whichever form it takes.
+      pr_sub=1; (( dr_proc_n > 2 )) && pr_sub=2
       pr_cal=$(env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$TMPDIR/pr-xdg" GZSTD_DEBUG_CALIBRATE_BYTES=8388608 \
                  GZSTD_DEBUG_CALIBRATE_GPUC=1 timeout --foreground -k 10 300 \
-                 "$GZSTD" --calibrate --gpu-devices=2 -vv 2>&1 >/dev/null | command tr '\r' '\n') \
+                 "$GZSTD" --calibrate --gpu-devices=$pr_sub -vv 2>&1 >/dev/null | command tr '\r' '\n') \
         || pr_why+=" [calibrate rc=$?]"
-      pr_count=$(printf '%s' "$pr_cal" | grep -n 'gpu devices  2: overhead' | head -1 | cut -d: -f1)
+      pr_count=$(printf '%s' "$pr_cal" | grep -n '\[CALIBRATE\] gpu devices' | tail -1 | cut -d: -f1)
       pr_rank=$(printf '%s' "$pr_cal" | grep -n 'ranking the cards before CUDA starts' | head -1 | cut -d: -f1)
       [[ -n "$pr_count" && -n "$pr_rank" ]] && (( pr_rank > pr_count )) \
         || pr_why+=" [calibrate: count row at line '${pr_count}', ranking at line '${pr_rank}']"
