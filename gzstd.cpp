@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.6";
+static constexpr const char * GZSTD_VERSION = "0.18.7";
 //
 // Architecture overview:
 //
@@ -4510,7 +4510,10 @@ static void print_help_long()
 "     --sliding-window honours it too since v0.18.4 (before, the flag was\n"
 "     ignored there).  MEASURED on the 8-GPU server, 19.5 GiB, level 3,\n"
 "     cache dropped, medians of 3: 5.1-5.3 s against 8.2-9.3 s buffered,\n"
-"     and under 2 s of system time against 8.6-8.7.\n"
+"     and under 2 s of system time against 8.6-8.7.  Since v0.18.7 it\n"
+"     is the --sliding-window DEFAULT for an input less than 95% cached\n"
+"     (half cached: 5.3 s against 6.8-6.9; fully cached it stays\n"
+"     buffered); --no-direct-read keeps the page cache.\n"
 "\n"
 "     ON DECOMPRESS (since v0.17.66) IT KEEPS THE PARALLEL READER: the\n"
 "     prefetch threads read O_DIRECT through their own descriptor, so the\n"
@@ -5278,12 +5281,13 @@ static void print_help_long()
 "\n"
 "  --gpu-order {cuda|ranked}    (default: cuda)\n"
 "     The order an all-device set is handed to the workers in.  cuda\n"
-"     keeps CUDA's own order.  ranked asks NVML (the NVIDIA management\n"
-"     library) for each card's utilization and free VRAM first and puts\n"
-"     the least-loaded card first; that costs 0.25-0.40 s of driver time\n"
-"     per run on an 8-GPU host, and measured on one (v0.17.74) it never\n"
-"     paid for itself: with one card busy or nearly out of VRAM the\n"
-"     pipeline absorbed the slow card for less than the ranking cost.\n"
+"     keeps CUDA's own order.  ranked asks for each card's utilization\n"
+"     and free VRAM first and puts the least-loaded card first.  It asks\n"
+"     the NVIDIA kernel driver directly (about 0.04 s for 8 cards) and\n"
+"     falls back to NVML (the NVIDIA management library, 0.25-0.40 s).\n"
+"     Measured with NVML's cost (v0.17.74) it never paid for itself:\n"
+"     with one card busy or nearly out of VRAM the pipeline absorbed\n"
+"     the slow card for less than the ranking cost.\n"
 "     Without a caller mask, --gpu-devices N below the full count\n"
 "     still ranks, since a busy card can be most of the capacity.\n"
 "     That ranking asks the NVIDIA kernel driver directly (about\n"
@@ -5311,6 +5315,9 @@ static void print_help_long()
 "     passed.  A compress allocates nothing after bringup, so it is\n"
 "     reached only by a kernel launch that fails for want of memory;\n"
 "     that discards the pass and rebuilds CPU-only (see --gpu-only).\n"
+"     A card too full even to start (the context itself needs VRAM)\n"
+"     is skipped like one too full for a stream: it produced nothing,\n"
+"     so the run carries on without it, through a pipe too.\n"
 "\n"
 "  --gpu-only\n"
 "     GPU only for the steady state; CPU still performs rescue and\n"
@@ -12083,18 +12090,41 @@ static void warn_damaged_trailer(const Options & opt, size_t n)
 class DirectReadPool {
 public:
   // want_thp: the MADV_HUGEPAGE + sparse-prefault dance below was built to
-  // merge O_DIRECT DMA segments, and on a modern kernel it also speeds the
-  // buffered pooled reader (huge-page-backed copy_to_user: 3.10 s vs 3.85 s
-  // plain on the Gen3 workstation).  On pre-6.4 kernels it is poison for
+  // merge O_DIRECT DMA segments.  An older buffered-reader measurement on the
+  // Gen3 workstation favored huge pages over prefaulted plain pages (3.10 s
+  // vs 3.85 s); the comparison with unprefaulted plain pages is still owed.
+  // On pre-6.4 kernels huge pages are poison for
   // buffered mode: THP doesn't engage, the sparse prefault leaves 1 page per
   // 2 MiB mapped, and every copy faults into a THP-eligible VMA (compaction
   // attempts on a fragmented box) — measured 2.14 GiB/s vs plain fread's 9.6
-  // on the 256-core server.  Callers pass want_thp = o_direct (DMA always
-  // needs it) || kernel >= 6.4.  The !want_thp path takes MADV_NOHUGEPAGE
-  // explicitly (system THP=always must not re-enable the pathology) and
-  // prefaults everything with a memset — deterministic, zero faults during
-  // reads, no THP anywhere.
-  bool init(size_t buf_size, size_t n_bufs, bool want_thp) {
+  // on the 256-core server.  Callers ask for huge pages for their explicit
+  // O_DIRECT path; the !want_thp path takes MADV_NOHUGEPAGE explicitly (system
+  // THP=always must not re-enable the pathology).  Plain-page prefaulting is
+  // selected separately, for pre-6.4 kernels.
+  //
+  // v0.18.7: a pool initialized for buffered reads on 6.4+ no longer asks
+  // for huge pages and is not prefaulted (prefault_plain = false).  The
+  // automatic CPU cold-input probe is an exception: it initializes one shared
+  // pool for O_DIRECT first, then reuses it for buffered reads.  The sparse prefault above asks
+  // the kernel for every huge page of the pool at once, on one thread, before
+  // the first read; where memory is mostly page cache that is a synchronous
+  // reclaim-and-compaction storm.  MEASURED on the 8-GPU server (1.4 TiB of
+  // page cache, ~37 GB free), 19.5 GiB --gpu-only compress, a 1251-buffer
+  // (19.5 GiB) pool, 6 interleaved rounds: huge pages + prefault 8.1-9.8 s
+  // with 322-1273 compaction stalls a run, and in 3 of 11 runs across the
+  // session the prefault alone stalled ~98 s; plain pages + the 4 GiB memset
+  // 6.9-7.3 s; plain pages, no prefault, 5.0-5.2 s and no compaction at all;
+  // huge pages faulted lazily by the readers 11.9-14.3 s.  With memory free,
+  // huge pages' best run (4.98 s, no compaction) matched plain pages.  Free
+  // 2 MiB blocks did not predict the stalls (22.7 GiB of them free against
+  // 19.5 GiB wanted, and still ~400 stalls a run: watermarks and NUMA
+  // placement), so there is no test to make, only a default to choose.
+  // The workstation figure above (3.10 vs 3.85 s) compared huge pages with
+  // the MEMSET path, whose 4 GiB memset costs ~1.8 s on its own here; plain
+  // and unprefaulted is owed an A/B there.  Explicit O_DIRECT keeps huge pages (its DMA
+  // segments need them), and a pre-6.4 kernel keeps the memset (its faults
+  // during reads contend on mmap_lock).
+  bool init(size_t buf_size, size_t n_bufs, bool want_thp, bool prefault_plain = true) {
     buf_size_ = buf_size;
     // Allocate the WHOLE pool as one big region (not n_bufs small ones) and slice it.
     // This is what cuts the O_DIRECT DMA segment count: many small posix_memalign
@@ -12123,7 +12153,7 @@ public:
       volatile char * vp = static_cast<volatile char *>(base_);
       for (size_t o = 0; o < total; o += HP) vp[o] = 0;
     } else {
-      // Old-kernel buffered mode: plain pages, prefaulted (see init comment).
+      // Buffered mode: plain pages, prefaulted only when requested.
 #ifdef MADV_NOHUGEPAGE
       (void)madvise(base_, total, MADV_NOHUGEPAGE);
 #endif
@@ -12131,7 +12161,8 @@ public:
       // and a full memset costs seconds of startup.  Beyond the cap, plain
       // 4 KiB first-touch faults amortize fine — it was the THP allocation
       // attempts that were toxic, and MADV_NOHUGEPAGE prevents those.
-      std::memset(base_, 0, std::min<size_t>(total, size_t(4) << 30));
+      if (prefault_plain)
+        std::memset(base_, 0, std::min<size_t>(total, size_t(4) << 30));
     }
     bufs_.reserve(n_bufs);
     free_.reserve(n_bufs);
@@ -20388,6 +20419,10 @@ static unsigned gz_l3_domains_allowed()
 #endif
 }
 
+#ifndef _WIN32
+static double adapt_path_residency(const std::string & path);   // defined below
+static bool device_is_rotational(const std::string & path);     // defined below
+#endif
 static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // DEFAULT = PHYSICAL CORES (v0.17.91), as `zstd -T0` does.  It used to be
@@ -20532,12 +20567,43 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   // cache.  Its one reader now reads O_DIRECT, through a new description of
   // the held input (gz_reopen_input) -- never the user's name, which may name
   // another file by now -- starting where the FILE stands, which must be on
-  // the 4 KiB grid.  Only when asked: the --adapt read-path prior that can
-  // turn the flag on was measured on the frame-parallel reader, not this one.
+  // the 4 KiB grid.  The --adapt read-path prior that can turn the flag on
+  // was measured on the frame-parallel reader, not this one, so it is not
+  // followed here; residency decides instead (below).
+  //
+  // v0.18.7 (ROADMAP 11): A COLD INPUT READS O_DIRECT BY DEFAULT.  This reader
+  // is one sequential stream, so the frame path's in-run probe (two readers,
+  // keep the faster) has nothing to compare; the choice is made up front, by
+  // the same residency line the --adapt classes and that probe use (below 95%
+  // resident is cold).  MEASURED on the 8-GPU server, --sliding-window compress,
+  // cold / half-cached / warm, 3 rounds each (19.5 GiB): buffered 8.55-8.91 /
+  // 6.77-6.92 / 5.24-5.50 s, O_DIRECT 5.29-5.34 / 5.28-5.38 / 5.32-6.64 s; and
+  // cold at 1 GiB (591-610 against 651-721 ms) and 256 MiB (204-227 against
+  // 265-270 ms), so no size gate.  Not on spinning media (queue-depth-1
+  // O_DIRECT is pathological there, the frame probe's own exclusion), and never
+  // over the user's choice: --direct-read / --no-direct-read, --mmap / --no-mmap
+  // or --cold.  Residency and media are read through the HELD descriptor, so
+  // the check describes the file being read even on a redirected stdin.
   int dfd = -1;
 #ifndef _WIN32
   uint64_t doff = 0;
-  if (opt.direct_read && opt.direct_read_user_set) {
+  bool want_direct = opt.direct_read && opt.direct_read_user_set;
+  std::string cold_note;
+  if (!want_direct && !opt.direct_read_user_set && !opt.mmap_user_set && !opt.cold_read && in) {
+    struct stat cst{};
+    if (::fstat(::fileno(in), &cst) == 0 && S_ISREG(cst.st_mode)) {
+      const std::string held = "/proc/self/fd/" + std::to_string(::fileno(in));
+      const double rz = adapt_path_residency(held);
+      if (rz >= 0.0 && rz < 0.95 && !device_is_rotational(held)) {
+        want_direct = true;
+        char b[96];
+        std::snprintf(b, sizeof b, "[SLIDING-WINDOW] cold input (%.0f%% resident): reading O_DIRECT\n",
+                      rz * 100.0);
+        cold_note = b;
+      }
+    }
+  }
+  if (want_direct) {
     struct stat dst{};
     const bool regular = in && ::fstat(::fileno(in), &dst) == 0 && S_ISREG(dst.st_mode);
     const off_t here = regular ? ::ftello(in) : -1;
@@ -20545,11 +20611,13 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
       dfd = gz_reopen_input(::fileno(in), O_RDONLY | O_DIRECT);
       doff = (uint64_t)here;
     }
-    // A pipe stays silent, as on decompress: there is nothing to bypass.
-    if (dfd < 0 && (opt.input != "-" || regular))
+    // A pipe stays silent, as on decompress: there is nothing to bypass.  The
+    // residency default is not a request, so it falls back without a warning.
+    if (dfd < 0 && opt.direct_read_user_set && (opt.input != "-" || regular))
       vlog(V_DEFAULT, opt,
            "warning: --direct-read could not engage O_DIRECT on the held input; "
            "using buffered input instead.\n");
+    if (dfd >= 0 && !cold_note.empty()) vlog(V_VERBOSE, opt, cold_note);
   }
 #endif
   std::unique_ptr<ChunkPrefetcher> reader;
@@ -22084,6 +22152,190 @@ static std::string gz_cuda_visible_uuids()
   return out;
 }
 
+// ---- CLAIMS: simultaneous gzstd processes see each other's cards (v0.18.7) ----
+//
+// Ranking reads the cards' PAST load: the probe's utilization is the driver's
+// last ~14 s, NVML's one instant, and free VRAM moves only once a job has
+// allocated.  Jobs that start together therefore all see the same picture and
+// all choose the same card.  MEASURED on the 8-GPU host (v0.18.6, three idle
+// cards): 4 and 8 simultaneous `--gpu-only --gpu-devices=1` jobs landed on ONE
+// card in 10 of 10 rounds, and with 8 there, 2-4 jobs per round found too little
+// VRAM left for a single stream and ran on the CPU instead (the others had each
+// taken their --gpu-mem-frac of what was free).
+//
+// So every process that ranks records the cards it chose, and the next one
+// counts them.  Under one lock: read the live claims, rank, append its own.  A
+// claim adds 100 to the card's utilization, the top of the sampled scale: a
+// card with a gzstd job on it ranks at least as busy as a saturated card.  The
+// existing combined utilization/free-VRAM rank still decides the choice.  A
+// claim lives as long as its process: it records the pid and the start time; a line whose
+// process is gone (or whose pid now belongs to another process) is dropped
+// when the next ranking rewrites the file.  So no exit path has to clean up.
+//
+// Per user: $XDG_RUNTIME_DIR/gzstd, else /dev/shm/gzstd-<uid>, mode 0700 and
+// owned by us, checked every time (a directory someone else made is ignored).
+// Jobs of different users do not see each other's claims; they still see each
+// other's load once it shows.  Lock waiting and scanning share the ranking's
+// 500 ms budget.  The wait uses a helper thread, so a process stopped while
+// holding it cannot hold anyone else past the deadline; the ranking then goes
+// ahead without claims.  GZSTD_DEBUG_GPU_CLAIMS=off disables all of it, and
+// GZSTD_DEBUG_GPU_CLAIMS_DIR=<dir> moves it (the suite's private directory).
+#ifdef __linux__
+struct GzGpuClaims {
+  int fd = -1;                                  // the claims file, LOCK_EX held while >= 0
+  std::map<std::string, unsigned> live;         // UUID -> live claims by other processes
+  std::vector<std::string> keep;                // the live lines, rewritten with ours
+  std::string why;                              // why there are none, for -vv
+  ~GzGpuClaims() { if (fd >= 0) ::close(fd); }  // closing releases the lock
+};
+
+// The process's start time in clock ticks since boot (field 22 of
+// /proc/<pid>/stat), or 0 if the process does not exist.  The command name in
+// field 2 may hold spaces or parentheses, so the fields are counted from the
+// LAST ')'.
+static unsigned long long gz_proc_starttime(long pid)
+{
+  std::ifstream f("/proc/" + std::to_string(pid) + "/stat");
+  std::string s;
+  if (!std::getline(f, s)) return 0;
+  const auto rp = s.rfind(')');
+  if (rp == std::string::npos) return 0;
+  std::istringstream ss(s.substr(rp + 1));
+  std::string tok;
+  for (int field = 3; ss >> tok; ++field)
+    if (field == 22) return std::strtoull(tok.c_str(), nullptr, 10);
+  return 0;
+}
+
+// The per-user claims directory, created if absent; "" when there is none we
+// can trust.
+static std::string gz_claims_dir()
+{
+  const char * hook = std::getenv("GZSTD_DEBUG_GPU_CLAIMS");
+  if (hook && std::strcmp(hook, "off") == 0) return "";
+  std::string dir;
+  if (const char * d = std::getenv("GZSTD_DEBUG_GPU_CLAIMS_DIR")) dir = d;
+  else if (const char * x = std::getenv("XDG_RUNTIME_DIR"); x && *x == '/') dir = std::string(x) + "/gzstd";
+  else dir = "/dev/shm/gzstd-" + std::to_string((unsigned long)::getuid());
+  if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return "";
+  struct stat st{};
+  if (::lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::getuid()
+      || (st.st_mode & 077) != 0)
+    return "";
+  return dir;
+}
+
+// Lock the claims file and read the live claims within `deadline`.  A timed-out
+// scan retains the lock so the later write can replace the stale contents.
+static std::unique_ptr<GzGpuClaims> gz_claims_open(std::chrono::steady_clock::time_point deadline)
+{
+  auto c = std::make_unique<GzGpuClaims>();
+  if (std::chrono::steady_clock::now() >= deadline) {
+    c->why = "the ranking budget was spent before claims"; return c;
+  }
+  const std::string dir = gz_claims_dir();
+  if (dir.empty()) { c->why = "no claims directory"; return c; }
+  const int fd = ::open((dir + "/gpu-claims").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd < 0) { c->why = std::string("cannot open the claims file: ") + std::strerror(errno); return c; }
+  struct stat st{};
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    ::close(fd); c->why = "the claims file is not regular"; return c;
+  }
+  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    // Contended: block on a helper thread, give up at the deadline.  A thread
+    // that gets the lock after we gave up closes the descriptor, which releases it.
+    struct Shared { std::mutex m; std::condition_variable cv; bool done = false, ok = false, abandoned = false; };
+    auto sh = std::make_shared<Shared>();
+    try {
+      std::thread([sh, fd] {
+        const bool ok = ::flock(fd, LOCK_EX) == 0;
+        std::lock_guard<std::mutex> lk(sh->m);
+        if (sh->abandoned) { ::close(fd); return; }
+        sh->ok = ok; sh->done = true; sh->cv.notify_all();
+      }).detach();
+    } catch (const std::system_error &) {
+      ::close(fd); c->why = "cannot start the lock thread"; return c;
+    }
+    std::unique_lock<std::mutex> lk(sh->m);
+    if (!sh->cv.wait_until(lk, deadline, [&sh] { return sh->done; })) {
+      sh->abandoned = true;
+      c->why = "the claims lock was not free within the ranking budget";
+      return c;
+    }
+    if (!sh->ok) { ::close(fd); c->why = "flock failed"; return c; }
+  }
+  c->fd = fd;
+  // Read incrementally.  A torn or corrupt file must not turn the shared
+  // ranking deadline into an unbounded read, /proc scan, or allocation.  The
+  // line cap follows the UUID and decimal field widths, not the host's size.
+  constexpr size_t max_line = sizeof("GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx") - 1
+      + 2 + sizeof(long) * 3 + sizeof(unsigned long long) * 3;
+  auto abandon = [&](const char * why) {
+    c->live.clear(); c->keep.clear(); c->why = why;
+    // Keep the lock so gz_claims_write can replace the unreadable contents
+    // with this process's claim.  Otherwise every later job pays the scan.
+    return std::move(c);
+  };
+  auto parse_line = [&](const std::string & line) {
+    std::istringstream ls(line);
+    std::string uuid;
+    long pid = 0;
+    unsigned long long start = 0;
+    if (!(ls >> uuid >> pid >> start) || uuid.rfind("GPU-", 0) != 0 || pid <= 0) return;
+    if (pid == (long)::getpid() || gz_proc_starttime(pid) != start) return;
+    ++c->live[uuid];
+    c->keep.push_back(line);
+  };
+  std::string line;
+  bool overlong = false;
+  char buf[4096];
+  off_t offset = 0;
+  for (;;) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      return abandon("the claims scan exceeded the ranking budget");
+    const ssize_t n = ::pread(fd, buf, sizeof buf, offset);
+    if (n < 0) return abandon("cannot read the claims file");
+    if (n == 0) break;
+    offset += n;
+    for (ssize_t i = 0; i < n; ++i) {
+      if (buf[i] == '\n') {
+        if (!overlong) parse_line(line);
+        line.clear(); overlong = false;
+        if (std::chrono::steady_clock::now() >= deadline)
+          return abandon("the claims scan exceeded the ranking budget");
+      } else if (line.size() < max_line) line += buf[i];
+      else overlong = true;
+    }
+  }
+  if (!overlong && !line.empty()) parse_line(line);
+  if (std::chrono::steady_clock::now() >= deadline)
+    return abandon("the claims scan exceeded the ranking budget");
+  return c;
+}
+
+// Rewrite the claims file: the live lines, then one per card this process chose.
+static void gz_claims_write(GzGpuClaims & c, const std::string & sel)
+{
+  if (c.fd < 0) return;
+  std::string out;
+  for (const auto & l : c.keep) out += l + "\n";
+  const unsigned long long me = gz_proc_starttime((long)::getpid());
+  std::stringstream ss(sel);
+  std::string uuid;
+  while (std::getline(ss, uuid, ','))
+    if (uuid.rfind("GPU-", 0) == 0 && me)
+      out += uuid + " " + std::to_string((long)::getpid()) + " " + std::to_string(me) + "\n";
+  if (::ftruncate(c.fd, 0) == 0) {
+    size_t off = 0;
+    while (off < out.size()) {
+      const ssize_t w = ::pwrite(c.fd, out.data() + off, out.size() - off, (off_t)off);
+      if (w <= 0) break;
+      off += (size_t)w;
+    }
+  }
+}
+#endif // __linux__
+
 // Rank and apply the pending subset mask.  `who` names the calling site for
 // the -vv trace the suite reads ("ranking the cards ... (hybrid bringup
 // thread)" vs "(main thread ...)").  Idempotent and thread-safe; a no-op when
@@ -22162,6 +22414,7 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
   const auto rank_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   Decision d;
   std::string source, probe_why, nvml_why;
+  std::vector<GpuMonitor::Row> ranked_rows;   // the sample that decided, for the claims pass
 #if defined(HAVE_NVML) && defined(__linux__)
   if (m.probe_unavailable) {
     // The startup check already chose NVML's head start.  Do not spend this
@@ -22171,6 +22424,7 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
     const GzRmProbe probe = gz_rm_probe(rank_deadline);
     if (!probe.rows.empty()) {
       d = decide(probe.rows);
+      if (d.rank_decided) ranked_rows = probe.rows;
       char ms[32];
       std::snprintf(ms, sizeof ms, "%.1f", probe.ms);
       vlog(V_DEBUG, opt, "[GPU] driver probe: " + std::to_string(probe.rows.size()) + " card(s) in "
@@ -22205,12 +22459,37 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
         && g_gpu_monitor.wait_ready((int)wait_left);
     // Read the snapshot even with the budget spent: a sampler started at
     // startup (a driver the probe cannot ask) may already hold a sample.
-    d = decide(g_gpu_monitor.snapshot());
+    ranked_rows = g_gpu_monitor.snapshot();
+    d = decide(ranked_rows);
     if (d.rank_decided) source = "NVML";
     else if (left <= 0) nvml_why = "the shared 500 ms budget expired before NVML could start";
     else nvml_why = ready ? "its sample does not settle the choice"
                           : "no usable sample within the shared 500 ms budget";
   }
+#ifdef __linux__
+  // v0.18.7: rank again with other gzstd processes' live claims counted (see
+  // GzGpuClaims).  The same sample, so whether it decides cannot change; only
+  // the order can.  Hold the file lock through the mask write, then release it
+  // before the selected-card log can block on a slow stderr sink.
+  std::unique_ptr<GzGpuClaims> claims;
+  std::string claims_note;
+  if (d.rank_decided) {
+    claims = gz_claims_open(rank_deadline);
+    if (!claims->live.empty()) {
+      for (auto & r : ranked_rows) {
+        const auto it = claims->live.find(r.uuid);
+        if (it != claims->live.end()) r.util += 100u * it->second;
+      }
+      d = decide(ranked_rows);
+    }
+    std::string seen;
+    for (const auto & [uuid, n] : claims->live)
+      seen += (seen.empty() ? "" : ", ") + uuid.substr(0, 12) + " x" + std::to_string(n);
+    claims_note = "[GPU] claims: " + (!claims->why.empty() ? "none (" + claims->why + ")"
+                  : claims->live.empty() ? std::string("no other gzstd holds a card")
+                  : "other gzstd processes hold " + seen) + "\n";
+  }
+#endif
   std::string sel = d.sel;
   const size_t too_old = d.too_old;
   const bool none_new_enough = d.none_new_enough;
@@ -22252,7 +22531,14 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
     std::memcpy(m.value, sel.c_str(), sel.size() + 1);
     how = std::string("combined rank: utilization + free VRAM, from ") + source
         + (too_old ? ", over the cards new enough for this build" : "");
+#ifdef __linux__
+    if (claims) gz_claims_write(*claims, sel);
+#endif
   }
+#ifdef __linux__
+  claims.reset();
+  if (!claims_note.empty()) vlog(V_DEBUG, opt, claims_note);
+#endif
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
     os << "[GPU] selected " << sel << " (" << how
@@ -29743,8 +30029,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
         pool_n = std::min<size_t>(pool_n,
                                   std::max<size_t>(8, (size_t)(ram_avail / 4 / cap)));
       if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
-      dr_pool_ok = dr_pool.init(cap, pool_n,
-                                /*want_thp=*/o_direct || kernel_has_per_vma_locks());
+      dr_pool_ok = dr_pool.init(cap, pool_n, /*want_thp=*/o_direct,
+                                /*prefault_plain=*/!kernel_has_per_vma_locks());
       if (dr_pool_ok) g_direct_read_pool = &dr_pool;
       if (opt.verbosity >= V_VERBOSE)
         vlog(V_VERBOSE, opt,
@@ -32729,6 +33015,10 @@ static void gpu_worker(
     { std::lock_guard<std::mutex> lk(idle_m); drain_closed = true; }
     submit_cv.notify_all();
   };
+  // v0.18.7: has this worker taken a batch yet?  Until it has, it has produced
+  // nothing, so a failure is a failed BRINGUP -- skip the card -- not a fault
+  // that makes everything the run produced untrustworthy (see the catch).
+  bool took_batch = false;
 
   try {
     uint64_t init_t0 = g_perf ? now_ns() : 0;
@@ -32748,6 +33038,13 @@ static void gpu_worker(
       // 1.68 s for no reason.
       std::lock_guard<std::mutex> ctx_lk(g_gpu_ctx_init_m);
       checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
+      // GZSTD_DEBUG_FAIL_GPU_BRINGUP=<CUDA index>|all: this device's bringup
+      // fails the way a card another process has filled does ("cudaSetDevice:
+      // out of memory"), so the suite can hold a full card to its contract
+      // (skipped, not a fault) without filling one.
+      if (const char * fb = std::getenv("GZSTD_DEBUG_FAIL_GPU_BRINGUP"))
+        if (std::strcmp(fb, "all") == 0 || std::atoi(fb) == device_id)
+          throw std::runtime_error("cudaSetDevice: out of memory (GZSTD_DEBUG_FAIL_GPU_BRINGUP)");
       checkCuda(cudaFree(0), "cudaFree(0) [force context]");
     }
     checkNvcomp(nvcompBatchedZstdCompressGetMaxOutputChunkSize(gpu_chunk, comp_opts, &max_out_chunk), "nvcompBatchedZstdCompressGetMaxOutputChunkSize");
@@ -33419,6 +33716,7 @@ static void gpu_worker(
         if (sched) { sched->mark_gpu_take(C.batch.size()); }
         if (g_perf) g_perf->sched_gpu_tasks.fetch_add(C.batch.size());
         C.filled = C.batch.size();
+        took_batch = true;
         C.delivered = 0;
         C.pop_ns = now_ns();   // the tuner's wall-rate window opens at the pop
 
@@ -34071,6 +34369,61 @@ static void gpu_worker(
     queue->notify_cpu_waiters();
   }
   catch (const std::exception & e) {
+    // A FAILED BRINGUP IS NOT A FAULT (v0.18.7, ROADMAP 14).  A card another
+    // process has filled cannot even create a context: cudaSetDevice fails "out
+    // of memory".  That landed in the fault path below, which discards the whole
+    // output -- and over a pipe, where it cannot be rebuilt, the run died with
+    // exit 5 although every other card was healthy and this one had produced
+    // nothing.  MEASURED (8-GPU server, one card filled to 6 MiB free, a healthy
+    // card beside it, 600 MiB piped): exit 5 in hybrid and in --gpu-only.  A
+    // worker that has not taken a batch has nothing to distrust, so it is a
+    // bringup failure like "insufficient VRAM for even 1 stream": say why, count
+    // it for the bringup barrier, give the card back, and let the other workers
+    // (or, if this was the last GPU of a --gpu-only run, the CPU) carry on.
+    // The drain thread can fault before this worker takes a batch.  It has
+    // already started the pass-wide abort protocol; do not launch CPU rescue
+    // into that abandoned queue or mislabel its failure as a harmless skip.
+    // Join it before counting this worker as failed: another worker must not
+    // start the last-GPU rescue while this drainer can still publish an abort.
+    if (!took_batch) {
+      close_drain_fifo();
+      if (drainer.joinable()) drainer.join();
+    }
+    if (!took_batch && !g_gpu_aborted.load(std::memory_order_relaxed)) {
+      const std::string why = std::string("[GPU") + std::to_string(device_id)
+          + "] bringup failed (" + e.what() + "); skipping device";
+      vlog(V_ERROR, opt, why + "\n");
+      *any_gpu_failed = true;
+      *fatal_msg = why;
+      const int fails = gpu_failures
+          ? gpu_failures->fetch_add(1, std::memory_order_acq_rel) + 1 : 1;
+      gpu_bringup_signal();
+      try {
+        if (vram_reserve) { cudaFree(vram_reserve); vram_reserve = nullptr; }
+        if (auto sp = std::weak_ptr<std::vector<StreamCtx>>(ctxs_ptr).lock()) {
+          for (auto & C : *sp) {
+            free_stream_buffers_only(C, opt);
+            if (C.ck_done)   { cudaEventDestroy(C.ck_done);    C.ck_done = nullptr; }
+            if (C.ck_stream) { cudaStreamDestroy(C.ck_stream); C.ck_stream = nullptr; }
+            if (C.stream) cudaStreamDestroy(C.stream);
+          }
+        }
+      } catch (...) {}
+      if (sched && ctxs_ptr) {
+        for (size_t s = 0; s < ctxs_ptr->size(); ++s)
+          sched->unregister_gpu_stream(device_id);
+      }
+      { std::lock_guard<std::mutex> lk(results->m); results->cv.notify_all(); }
+      queue->notify_cpu_waiters();
+      // The bringup skip's own rule, unchanged: the last GPU of a --gpu-only run
+      // to fail finishes the run on the CPU.
+      if (opt.gpu_only && fails == gpu_worker_count
+          && !g_gpu_aborted.load(std::memory_order_relaxed))
+        gpu_only_cpu_fallback(false, queue, results, opt, m, bp,
+                              /*discard_results=*/false,
+                              /*gpus_lost=*/fails, /*gpus_total=*/gpu_worker_count);
+      return;
+    }
     // GPU fault — a faulted GPU is an unreliable narrator: we cannot trust any
     // frame it reported "done".  ABORT the whole compress pass and let the driver
     // rebuild CPU-only from the (still-present) input.  There is no point
@@ -34207,32 +34560,50 @@ static std::atomic<bool> g_rank_all_after_cuda{false};
 static void rank_all_cuda_devices(std::vector<int> & ids, const Options & opt)
 {
   if (ids.size() <= 1 || !g_rank_all_after_cuda.load(std::memory_order_relaxed)) return;
-  try {
-    g_gpu_monitor.start();
-  } catch (const std::system_error &) {
-    return;                                    // no sampler: CUDA's own order
-  }
-  if (!g_gpu_monitor.wait_ready(500)) return;
-  const auto rows = g_gpu_monitor.snapshot();
-  if (rows.size() < ids.size() || rows.size() != g_gpu_monitor.device_count()) return;
-  std::vector<GzDevRank> rin;
-  rin.reserve(ids.size());
+  // Each CUDA device's UUID, from CUDA itself: the "GPU-..." form the driver
+  // probe and NVML both key their rows on, so no PCI lookup is needed to match
+  // them (NVML and CUDA do not share an index space).  No context is created.
+  std::vector<std::string> uuids;
+  uuids.reserve(ids.size());
   for (int d : ids) {
-    // NVML and CUDA do not share an index space (see gz_nvml_handle_for_cuda):
-    // correlate by PCI address, then by the UUID the sampler keyed its rows on.
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) return;
-    char pci[32];
-    std::snprintf(pci, sizeof(pci), "%08x:%02x:%02x.0",
-                  prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
-    nvmlDevice_t h{};
-    if (nvmlDeviceGetHandleByPciBusId_v2(pci, &h) != NVML_SUCCESS) return;
-    char uu[96] = {0};
-    if (nvmlDeviceGetUUID(h, uu, sizeof(uu)) != NVML_SUCCESS || !uu[0]) return;
-    const GpuMonitor::Row * row = nullptr;
-    for (const auto & r : rows) if (r.uuid == uu) { row = &r; break; }
-    if (!row) return;
-    rin.push_back({row->util, row->free_bytes});
+    uuids.push_back(gz_cuda_uuid_str(prop));
+  }
+  auto rank_inputs = [&](const std::vector<GpuMonitor::Row> & rows) {
+    std::vector<GzDevRank> rin;
+    for (const auto & u : uuids) {
+      const GpuMonitor::Row * row = nullptr;
+      for (const auto & r : rows) if (r.uuid == u) { row = &r; break; }
+      if (!row) return std::vector<GzDevRank>{};   // ORDER ONLY: a partial sample ranks nothing
+      rin.push_back({row->util, row->free_bytes});
+    }
+    return rin;
+  };
+  // v0.18.7: the driver first (gz_rm_probe, ~40 ms for 8 cards), NVML only if
+  // the probe cannot cover every device.  NVML cost 0.25-0.40 s here, which is
+  // why this ranking is opt-in (see order_all_gpus_before_cuda).
+  const char * source = "the driver";
+  std::vector<GzDevRank> rin;
+  const auto rank_deadline = std::chrono::steady_clock::now()
+                             + std::chrono::milliseconds(500);
+#ifdef __linux__
+  rin = rank_inputs(gz_rm_probe(rank_deadline).rows);
+#endif
+  if (rin.size() != ids.size()) {
+    if (std::chrono::steady_clock::now() >= rank_deadline) return;
+    source = "NVML";
+    try {
+      g_gpu_monitor.start();
+    } catch (const std::system_error &) {
+      return;                                    // no sampler: CUDA's own order
+    }
+    const int left_ms = (int)std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            rank_deadline - std::chrono::steady_clock::now()).count());
+    if (!g_gpu_monitor.wait_ready(left_ms)) return;
+    rin = rank_inputs(g_gpu_monitor.snapshot());
+    if (rin.size() != ids.size()) return;
   }
   const std::vector<size_t> order = gz_rank_devices(rin);
   if (order.size() != ids.size()) return;
@@ -34243,7 +34614,7 @@ static void rank_all_cuda_devices(std::vector<int> & ids, const Options & opt)
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
     os << "[GPU] all " << ids.size() << " devices ranked after CUDA startup by combined "
-          "rank (utilization + free VRAM); the top-ranked card is CUDA GPU"
+          "rank (utilization + free VRAM, from " << source << "); the top-ranked card is CUDA GPU"
        << ids.front() << " and is first in the returned worker order (order";
     for (int d : ids) os << ' ' << d;
     os << ")\n";
@@ -35801,8 +36172,11 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     if (ram_avail > 0)
       pool_n = std::min<size_t>(pool_n, std::max<size_t>(8, (size_t)(ram_avail / 4 / cap)));
     if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
+    // Huge pages for O_DIRECT only, and plain unprefaulted pages for the
+    // buffered pool on a 6.4+ kernel (see DirectReadPool::init, v0.18.7).
     const bool pool_ok = nv_pool.init(cap, pool_n,
-                                      /*want_thp=*/kernel_has_per_vma_locks());
+                                      /*want_thp=*/want_direct_read && kernel_has_per_vma_locks(),
+                                      /*prefault_plain=*/!kernel_has_per_vma_locks());
     if (pool_ok) {
       g_direct_read_pool = &nv_pool;
       // Declare the depth ceiling: the queue can never hold more than
@@ -43287,22 +43661,63 @@ static void order_all_gpus_before_cuda(const Options & opt, bool eager = false)
     return;
   }
 
-  try {
-    g_gpu_monitor.start();
-  } catch (const std::system_error & e) {
-    vlog(V_ERROR, opt, std::string("gzstd: warning: cannot start GPU device sampler (")
-         + e.what() + "); keeping CUDA's original device order\n");
-    return;
-  }
-  g_gpu_monitor.wait_ready(500);
-  const auto rows = g_gpu_monitor.snapshot();
+  // v0.18.7: the driver probe first, if it accounts for every card in the
+  // driver's /proc inventory (the same ORDER-ONLY rule as below); NVML otherwise.
+  std::vector<GpuMonitor::Row> rows;
+  const char * source = "the driver";
+  const auto rank_deadline = std::chrono::steady_clock::now()
+                             + std::chrono::milliseconds(500);
+#ifdef __linux__
+  rows = gz_rm_probe(rank_deadline).rows;
+  const auto & proc_uuids = gz_proc_gpu_uuids();
+  // Equal counts alone do not prove coverage: a duplicate or foreign UUID
+  // would make CUDA_VISIBLE_DEVICES omit a real card in this all-device path.
+  if (rows.size() <= 1 || rows.size() != proc_uuids.size()
+      || std::any_of(proc_uuids.begin(), proc_uuids.end(), [&](const std::string & u) {
+           return std::count_if(rows.begin(), rows.end(), [&](const GpuMonitor::Row & r) {
+                    return r.uuid == u;
+                  }) != 1;
+         })) rows.clear();
+#endif
+  if (rows.empty()) {
+    if (std::chrono::steady_clock::now() >= rank_deadline) return;
+    source = "NVML";
+    try {
+      g_gpu_monitor.start();
+    } catch (const std::system_error & e) {
+      vlog(V_ERROR, opt, std::string("gzstd: warning: cannot start GPU device sampler (")
+           + e.what() + "); keeping CUDA's original device order\n");
+      return;
+    }
+    const int left_ms = (int)std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            rank_deadline - std::chrono::steady_clock::now()).count());
+    g_gpu_monitor.wait_ready(left_ms);
+    rows = g_gpu_monitor.snapshot();
 
-  // ORDER ONLY, NEVER COUNT.  A per-device NVML handle/UUID lookup can fail
-  // even after DeviceGetCount succeeds.  Building the environment from that
-  // partial table would silently hide every omitted device, changing the
-  // gpu_devices=0 contract from "all" to "whatever NVML happened to report".
-  // With an incomplete sample the safe fallback is the original full set.
-  if (rows.size() <= 1 || rows.size() != g_gpu_monitor.device_count()) return;
+    // ORDER ONLY, NEVER COUNT.  A per-device NVML handle/UUID lookup can fail
+    // even after DeviceGetCount succeeds.  Building the environment from that
+    // partial table would silently hide every omitted device, changing the
+    // gpu_devices=0 contract from "all" to "whatever NVML happened to report".
+    // With an incomplete sample the safe fallback is the original full set.
+    if (rows.size() <= 1 || rows.size() != g_gpu_monitor.device_count()
+        || std::any_of(rows.begin(), rows.end(), [&](const GpuMonitor::Row & r) {
+             return std::count_if(rows.begin(), rows.end(), [&](const GpuMonitor::Row & q) {
+                      return q.uuid == r.uuid;
+                    }) != 1;
+           })) return;
+    // NVML can expose a different inventory from /proc in a container.  A
+    // same-size table with one foreign UUID still omits a physical card; do
+    // not turn that table into an all-device CUDA_VISIBLE_DEVICES mask.
+    const auto & inventory = gz_proc_gpu_uuids();
+    if (!inventory.empty()
+        && (rows.size() != inventory.size()
+            || std::any_of(inventory.begin(), inventory.end(), [&](const std::string & u) {
+                 return std::count_if(rows.begin(), rows.end(), [&](const GpuMonitor::Row & r) {
+                          return r.uuid == u;
+                        }) != 1;
+               }))) return;
+  }
 
   std::vector<GzDevRank> rin;
   rin.reserve(rows.size());
@@ -43323,8 +43738,8 @@ static void order_all_gpus_before_cuda(const Options & opt, bool eager = false)
   if (opt.verbosity >= V_VERBOSE) {
     std::ostringstream os;
     os << "[GPU] all " << rows.size() << " devices kept, ordered by combined "
-          "rank (utilization + free VRAM); the least-contended card is CUDA "
-          "GPU0 and takes the first batch\n";
+          "rank (utilization + free VRAM, from " << source << "); the least-contended "
+          "card is CUDA GPU0 and takes the first batch\n";
     vlog(V_VERBOSE, opt, os.str());
   }
 #else

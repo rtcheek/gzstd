@@ -1,12 +1,196 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.6  
+**Covers:** v0.9.50 → v0.18.7  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.7 — (in progress) simultaneous GPU jobs spread out, a full card is not a fault, the reader pool no longer stalls, and a cold --sliding-window reads O_DIRECT
+
+### Suites (2026-10-09, the 8-GPU server, after every review edit)
+
+GPU default 518 passed, 0 failed, 1 skipped of 519 (the usual host skip), 8m55s -- v0.18.6's default
+of 619 took 11m17s; CPU-only 380 passed, 0 failed, 1m53s; GPU `--extensive` 777 passed, 0 failed, 1
+skipped of 778, 13m39s. Each run "as expected on this host". The workstation (the release's second
+machine, GDS unavailable there: 503 default / 760 extensive) is still owed, and with it: the driver probe
+on a second driver and card generation, with persistence mode off; the buffered reader pool, plain and
+unprefaulted against huge pages, where memory is free; whether `--gpu-order=ranked` now pays for itself
+at the probe's cost (an all-card run with one card loaded, which on the shared server means other users'
+cards); and the sliding-window placement study on a one-L3 part.
+
+### 100 stable tests moved from the default suite to --extensive
+
+At the owner's request, sections that are slow, stable and outside current work now run only under
+`-e`: the `--adapt` GPU deadline demote/escalate and GPU decompress stuck-batch reclaim fault-injection
+sections, decompress tail-aware GPU intake, the three `--direct-stage` sections, parameter honor
+verification, and the `-l` section (which also holds older output and removal safety cells). The criteria:
+the newest change any of them guards is v0.17.87 or older, and none touches this release's code. Kept in the
+default despite the cost: the per-device batch tuner (changed in v0.18.1), the `--adapt` source hold
+(v0.18.1), the redirected-stdout data-loss cells, the dedicated exit/signal section, and native tar
+extraction. Each moved block is marked `moved to -e in v0.18.7`; `-e` still runs everything, so the pre-tag run loses
+nothing. Default 619 -> 519 tests (no-GPU delta 173 -> 139, CPU-only 446 -> 380; the GDS delta 17 -> 16,
+one moved cell needs GDS); `--extensive` unchanged at 778.
+
+### Simultaneous jobs no longer pile onto one card
+
+**The defect.** Ranking reads the cards' PAST load: the driver probe's utilization is its last ~14 s,
+NVML's one instant, and free VRAM moves only once a job has allocated. Jobs started together therefore
+all see the same picture and all choose the same card. MEASURED on the 8-GPU server (three idle cards,
+five busy with other users' jobs), `--gpu-only --gpu-devices=1` on 600 MiB: 4 and 8 simultaneous jobs
+chose ONE card in 10 of 10 rounds. With 8 there, 2-4 jobs per round printed "insufficient VRAM for even
+1 stream" and ran entirely on the CPU, still exiting 0 (the documented rescue): each job takes its
+`--gpu-mem-frac` (60%) of the VRAM it finds free, so the later ones found too little.
+
+**The fix: claims.** Each process that ranks records the cards it chose in a per-user claims file
+(`$XDG_RUNTIME_DIR/gzstd/gpu-claims`, else `/dev/shm/gzstd-<uid>/`; a directory not ours or not 0700
+is ignored), and the next ranking counts them. Under one `flock`: read the live claims, rank, rewrite
+its own. A claim adds 100 to the card's utilization, the top of that scale, so a card with a gzstd
+job on it ranks at least as busy as a saturated card; the existing combined utilization/free-VRAM
+rank still decides the choice. A claim lives as long as its process (pid plus start time, so a reused
+pid does not count), and dead lines are dropped on the next rewrite, so no exit path has to clean up. The lock
+wait and claims scan come out of the ranking's shared 500 ms budget; past it, the ranking goes
+ahead without claims. Jobs of different users do not see each other's claims (they still see each
+other's load once it shows). `GZSTD_DEBUG_GPU_CLAIMS=off` disables it; `GZSTD_DEBUG_GPU_CLAIMS_DIR`
+moves it.
+
+**Measured after**, 8 simultaneous jobs, claims off and on interleaved with the same binary, three
+rounds each: off, 1 card and 3-4 jobs without a GPU batch every round; on, 6-7 cards and 0. Wall time
+was the same on this host (median 7.4-8.0 s either way): it is host-bound, and its idle cores absorb
+the CPU fallback. Limited to 16 cores (`taskset`), the slowest job took 7.62 / 9.25 / 7.79 s off and
+7.58 / 7.49 / 7.48 s on; the 9.25 s round was the one where all 8 off-jobs shared the card's GPU.
+With claims, jobs beyond the idle cards go to lightly loaded cards other users hold (here 8-22%
+busy) before doubling up on one of ours; that is the existing ranking's view of a busy card,
+unchanged.
+
+**Tests.** One GPU cell, with the program holding the window open: job 1 compresses from a FIFO the
+cell keeps open, so it ranks, claims and waits; job 2 must report job 1's claim and choose another
+card; after job 1 exits, a third ranking must find no live claim. A private claims directory keeps
+other runs out. Mutants, each caught: claims read but not counted; no claim written; a dead
+process's claim still counted.
+
+**Review** (Codex, GPT-6-Sol, round 1: SAFE TO COMMIT, four fixes as code, all adopted): a claims file
+grown to thousands of stale lines could hold the lock and the scan past the deadline, so the read is
+incremental, deadline-checked and line-capped, and a scan that runs out of time is replaced by this
+process's own claim; a non-regular claims file is ignored; the lock is released before the -vv lines are
+logged; the cell's `printf | grep -q` checks became here-strings (under `pipefail` a large log could make
+a matching `grep -q` look like a failure), and job 3's exit status is checked.  The +100 wording was
+corrected: a claimed card ranks at least as busy as a saturated one, but the combined rank can still
+choose it when every alternative has much less free VRAM.  The same `pipefail` hazard was then removed
+from the other new and updated ranking cells, and two absence checks that the shared-budget change had
+made blind (they looked for "waiting up to 500 ms", and the line now says how much of the budget is
+left) were widened.
+
+### A card too full to start is skipped, not a fault (ROADMAP 14)
+
+**The defect.** A piped compress died with exit 5 when another process had filled one of the cards, though
+every other card was healthy. MEASURED on the 8-GPU server, one card filled to 6 MiB free (a VRAM filler
+on an idle card) beside a healthy one: `cat 600MiB | gzstd -c` and `--gpu-only` both exited 5 with
+"WARNING: [GPU0] cudaSetDevice: out of memory (output will be discarded; rebuilding CPU-only)" and "a GPU
+faulted during compression and the input is a pipe/stream"; 19.5 GiB piped, the same after 12.8 s of
+work, with a corrupt partial output. A CUDA context needs VRAM, so a full card cannot even start, and the
+compress worker's catch-all treated that as a fault -- which discards the whole pass (rebuilt on the CPU
+for a regular file, impossible through a pipe). Squeezing the card AFTER bringup did nothing (compress
+allocates nothing after bringup, and its first launches succeeded with 4 MiB free), and so did static
+pressure that left a context room (1-6 GiB free: the existing "insufficient VRAM for even 1 stream" skip).
+
+**The fix.** A worker that fails before it has taken its first batch has produced nothing, so there is
+nothing to distrust: it is a bringup failure, handled as the existing VRAM skip is -- named on stderr,
+counted for the bringup barrier, the card's resources freed, the others (or, for the last card of a
+`--gpu-only` run, the CPU) carrying on. After its first batch, an error is still a fault. **After:** the
+same piped 19.5 GiB run exits 0 in 14.9 s with the right bytes and "[GPU0] bringup failed
+(cudaSetDevice: out of memory); skipping device"; every shape tried (piped and named compress, hybrid and
+`--gpu-only`, piped decompress, the full card alone under `--gpu-only`) exits 0 with the right bytes.
+
+**Tests.** One GPU cell: `GZSTD_DEBUG_FAIL_GPU_BRINGUP=<index>|all` (new) fails a device's bringup the way
+the full card did; through a pipe the run must exit 0, name the failure and round-trip, and a regular
+file must not be rebuilt. A mutant with the old classification fails all four checks (pipe exit 5, no
+skip line, no round-trip, a rebuild). The existing "GPU fault over a pipe dies loudly" cell is unchanged:
+its hook faults in the drain, after a batch.
+
+### The GPU reader pool no longer asks for 19.5 GiB of huge pages up front
+
+**The defect, found while measuring the above.** One `--gpu-only` compress of a 19.5 GiB file in three
+stalled ~98 s before reading a byte: 3 of 11 runs across the session, with and without a full card,
+v0.18.5 included. The timestamped log put the whole gap in the reader pool's `init`: a 1,251-buffer,
+19.5 GiB zero-copy pool on transparent huge pages, prefaulted by one thread touching one byte per 2 MiB.
+On a host whose memory is mostly page cache (here 1.4 TiB cached, ~37 GB free) every one of those faults
+can reclaim and compact synchronously. The runs that did not stall paid for it too: 309-1,561 compaction
+stalls a run (`/proc/vmstat`), almost all failed.
+
+**The fix.** A pool initialized for buffered reads on a 6.4+ kernel takes plain pages, not prefaulted
+(`MADV_NOHUGEPAGE`; the readers fault them in, which per-VMA locks make cheap). Explicit O_DIRECT keeps
+huge pages (its DMA segments need them), and a pre-6.4 kernel keeps its memset prefault (its faults
+contend on mmap_lock). The automatic cold-input probe reuses one pool for both read modes: the CPU path
+initializes it for O_DIRECT, while the GPU path initializes it for buffered reads. Their mixed-mode
+performance with this policy has not been measured. MEASURED, four
+variants interleaved, 6 rounds each: huge pages + prefault 8.1-9.8 s; plain + the 4 GiB memset
+6.9-7.3 s; **plain, not prefaulted, 5.0-5.2 s, no compaction**; huge pages faulted by the readers
+11.9-14.3 s. With memory free, huge pages' best run (4.98 s, no compaction) matched plain pages. Free
+2 MiB blocks did not predict the stalls (`/proc/buddyinfo` showed 22.7 GiB of them against 19.5 GiB
+wanted, and runs still compacted ~400 times: watermarks and NUMA placement), so this is a default, not a
+test. **After**, against v0.18.5, interleaved: `--gpu-only` 19.5 GiB 4.97-5.85 s against 8.81-11.15 s, no
+compaction stalls against 309-1,561, at more kernel time (~21 s against ~13: 4 KiB faults); the CPU
+path's pooled reader (`--cpu-only --no-mmap`) 0.91-0.94 s against 1.35-1.44 s; the default `mmap` paths
+unchanged. The workstation's recorded huge-page win (3.10 s against 3.85) was measured against the
+memset variant, which costs ~1.8 s on its own here: a plain-and-unprefaulted A/B there is owed.
+
+**Not testable in the suite** (a page-backing choice); verified by the measurements above.
+
+**The cold-input probe** (Codex, round 2, an open point): the GPU path's automatic probe runs its O_DIRECT
+pass in the same pool, now on plain pages, so its O_DIRECT rate drops -- MEASURED 3.79-4.05 GiB/s
+against 4.61-4.65 on huge pages. The run as a whole still won: a default compress of the 19.5 GiB file
+cold, 3 rounds, v0.18.5 11.6 / 12.4 / 14.6 s, now 5.7 / 5.8 / 6.5 s (the probe chose O_DIRECT in 5 of
+6 runs, buffered once).
+
+### --gpu-order=ranked asks the driver too
+
+The probe now also serves the all-device ranking (`rank_all_cuda_devices`, after CUDA starts) and the
+eager pre-CUDA ordering under GPU `--verify`. The post-CUDA path matches sampled rows to CUDA's UUIDs;
+the eager path checks them against the complete `/proc` UUID inventory before setting the device order.
+The PCI lookup through NVML is gone; NVML remains the fallback when the probe cannot cover every device
+within the shared 500 ms ranking budget. Checked with the loader trace: every shape tried
+(default, `--gpu-only`, subsets, `--gds-only`, `-d`, `--adapt`, `--gpu-order=ranked`) now runs without
+loading libnvidia-ml, and `GZSTD_DEBUG_RM_PROBE=off` brings NVML back. `--gpu-order=ranked` stays
+opt-in: its v0.17.74 verdict ("never paid for itself") was measured at NVML's 0.25-0.40 s, and whether
+it pays at the probe's ~0.04 s needs an all-card run with a loaded card, which on this shared host
+means other users' cards -- owed on a quiet machine. The probe cell gained an arm: a ranked run ranks
+"from the driver" and never loads NVML.
+
+### --sliding-window placement: measured, not changed (ROADMAP 10)
+
+The fuller measurement ROADMAP 10 asked for (levels 1-19, three corpora, the stream packed onto 1, 2, 4,
+8 or all 16 L3 caches): for levels 1-12 the default spread is 1.5-2.6x slower than one to four caches;
+from level 15 the default is best or close. The tables and the open design question are in ROADMAP 10;
+no placement policy ships, because no rule yet explains the measurements without a machine-tuned table.
+
+### A cold --sliding-window input reads O_DIRECT by default (ROADMAP 11)
+
+`--sliding-window` honoured only an explicit `--direct-read`; `--adapt`'s read-path prior was measured on
+the frame-parallel reader, and the frame path's automatic cold probe compares two readers inside one
+run, which this single sequential stream cannot do. So residency decides up front, by the line the
+`--adapt` classes and that probe already use: below 95% resident is cold. Read through the held
+descriptor (`/proc/self/fd`), so a redirected stdin qualifies; not on rotational media (the frame
+probe's exclusion); never over `--direct-read`/`--no-direct-read`, `--mmap`/`--no-mmap` or `--cold`; a
+fallback to buffered is silent (it was not a request). MEASURED on the 8-GPU server, compress, 3 rounds:
+
+| 19.5 GiB | buffered | O_DIRECT |
+|---|---|---|
+| cold | 8.55-8.91 s | 5.29-5.34 s |
+| half cached | 6.77-6.92 s | 5.28-5.38 s |
+| warm (kept buffered) | 5.24-5.50 s | 5.32-6.64 s |
+
+and cold at 1 GiB (591-610 ms against 651-721) and 256 MiB (204-227 against 265-270), so no size gate.
+The single-frame DECODER keeps buffered by default: v0.18.4 measured no difference there (7.42 s
+against 7.43).
+
+**Tests.** One cell (both builds): the file is evicted (skipped where it cannot be), then the default run
+must decide O_DIRECT, read every byte that way and write the buffered oracle's frame; warm, and cold
+with `--no-direct-read`, it must not. The v0.18.4 cell's buffered oracle now says `--no-direct-read`
+(a cold default run would otherwise read O_DIRECT). Mutants, each caught: the rule off (cold arm);
+the rule ignoring residency (warm arm).
 
 ## v0.18.6 — GPUs are ranked by asking the driver, and a blind pick says so
 

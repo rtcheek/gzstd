@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=616
-$EXTENSIVE && EXPECTED_TESTS=775
+EXPECTED_TESTS=519
+$EXTENSIVE && EXPECTED_TESTS=778
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -832,8 +832,20 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # chosen without any load reading says so): 616, 775; no-GPU deltas 171, 200.
 # Default CONFIRMED 2026-10-09: 615 ran of 616 on the 8-GPU host, CPU-only 445
 # (616 - 171).  The extensive figures are DERIVED.
-EXPECTED_NOGPU_DELTA=171
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=200   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
+# v0.18.7: two GPU cells (simultaneous subset jobs see each other's cards; a GPU
+# that fails bringup is skipped, not a fault) and one cell any build runs (a cold
+# --sliding-window input reads O_DIRECT by default): 619, 778; no-GPU deltas 173,
+# 202.  DERIVED.
+# v0.18.7, at the owner's request: eight stable, slow default sections moved to
+# --extensive (each marked "moved to -e in v0.18.7"): --adapt GPU deadline demote/
+# escalate, GPU decompress stuck-batch reclaim, decompress tail-aware GPU intake,
+# the three --direct-stage sections, parameter honor verification and -l.  100
+# tests (34 of them GPU-only, one a GDS cell): default 619 -> 519 and no-GPU delta
+# 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
+# CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
+# 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
+EXPECTED_NOGPU_DELTA=139
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=202   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -851,7 +863,7 @@ $EXTENSIVE && EXPECTED_NOGPU_DELTA=200   # MEASURED 2026-09-21 (607 - 463) + 34 
 # one of the 607 cells has now been exercised.
 # v0.17.83 made it mode-DEPENDENT by one: its nvidia-fs staleness cell is a GDS
 # cell that exists only under --extensive.
-EXPECTED_NOGDS_DELTA=17   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89, derived
+EXPECTED_NOGDS_DELTA=16   # 11 MEASURED 2026-09-21 + 2 v0.17.76 cells + 1 v0.17.82 + 2 v0.17.87 + 1 v0.17.89, derived; the v0.17.82 cell moved to -e in v0.18.7
 $EXTENSIVE && EXPECTED_NOGDS_DELTA=18   # + the v0.17.83 --extensive cell
 
 # ============================================================
@@ -3017,6 +3029,30 @@ CFLPY
   fi
   rm -f "$gf_perr"
 
+  # ...BUT A GPU THAT NEVER STARTED IS NOT A FAULT (v0.18.7, ROADMAP 14).  A card
+  # another process has filled cannot create a context ("cudaSetDevice: out of
+  # memory"); that used to take the fault path above, so a pipe died with exit 5
+  # although the card had produced nothing.  It is a bringup failure now: the
+  # card is skipped, the run finishes on what is left (here the CPU, the suite
+  # exposing one card), and nothing is rebuilt.  The hook fails that bringup the
+  # same way; the second arm is a regular file, which must not be rebuilt either.
+  gb_why=""; gb_err="$TMPDIR/gpubringup.err"
+  cat "$gf_src" | GZSTD_DEBUG_FAIL_GPU_BRINGUP=all timeout --foreground -k 10 120 \
+    "$GZSTD" --gpu-only -v -c 2>"$gb_err" > "$TMPDIR/gpubringup.zst"
+  gb_rc=${PIPESTATUS[1]}
+  [[ $gb_rc -eq 0 ]] || gb_why+=" [pipe rc=$gb_rc]"
+  grep -q 'bringup failed (cudaSetDevice: out of memory' "$gb_err" || gb_why+=" [pipe: no bringup-failed line]"
+  "$GZSTD" -d -c "$TMPDIR/gpubringup.zst" 2>/dev/null | cmp -s - "$gf_src" || gb_why+=" [pipe round-trip]"
+  GZSTD_DEBUG_FAIL_GPU_BRINGUP=all timeout --foreground -k 10 120 \
+    "$GZSTD" --gpu-only -v -k -f "$gf_src" -o "$TMPDIR/gpubringup.zst" 2>"$gb_err"
+  gb_rc=$?
+  [[ $gb_rc -eq 0 ]] || gb_why+=" [file rc=$gb_rc]"
+  grep -qi 'rebuild' "$gb_err" && gb_why+=" [file: rebuilt after a bringup failure]"
+  "$GZSTD" -d -c "$TMPDIR/gpubringup.zst" 2>/dev/null | cmp -s - "$gf_src" || gb_why+=" [file round-trip]"
+  rm -f "$gb_err" "$TMPDIR/gpubringup.zst"
+  [[ -z "$gb_why" ]] && pass "a GPU that fails bringup is skipped, not a fault (pipe and file)" \
+    || fail "a GPU that fails bringup is skipped, not a fault (pipe and file)" "$gb_why"
+
   # GPU-side --verify (--verify-engine=gpu): decompress + raw byte-compare each
   # batch in VRAM on the GPU.  Tiny config (1 GPU/1 stream/batch 1/4 MiB chunks)
   # so the verify buffers fit a small card.
@@ -3133,6 +3169,7 @@ else
   skip "GPU fault -> CPU-only rebuild (round-trips)" "no GPU"
   skip "GPU fault -> CPU-only rebuild (--tar)" "no GPU"
   skip "GPU fault over a pipe dies loudly" "no GPU"
+  skip "a GPU that fails bringup is skipped, not a fault (pipe and file)" "no GPU"
   skip "trivial skip parks, never retires a GPU" "no GPU"
 fi
 
@@ -5477,9 +5514,9 @@ if has_gpu 2>/dev/null; then
     elif [[ -z "$ds_sel" ]]; then ds_why+=" [no ranked selection was made before CUDA started]"
     elif [[ "$ds_sel" == "$ds_guess" ]]; then ds_why+=" [ranking never differed from the guess ($ds_guess)]"
     else
-      printf '%s' "$ds_log" | grep -q 'ranking the cards before CUDA starts (hybrid bringup thread)' \
+      grep -q 'ranking the cards before CUDA starts (hybrid bringup thread)' <<< "$ds_log" \
         || ds_why+=" [the ranking was not on the hybrid bringup thread]"
-      printf '%s' "$ds_log" | grep -q 'before CUDA starts (main thread' && ds_why+=" [the main thread ranked]"
+      grep -q 'before CUDA starts (main thread' <<< "$ds_log" && ds_why+=" [the main thread ranked]"
       [[ "$ds_sees" == "$ds_sel" ]] || ds_why+=" [CUDA saw '$ds_sees', ranked '$ds_sel', guessed '$ds_guess']"
       env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
         "$GZSTD" -d -q -c "$TMPDIR/dsub.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || ds_why+=" [round-trip]"
@@ -5496,10 +5533,10 @@ if has_gpu 2>/dev/null; then
                timeout --foreground -k 10 120 "$GZSTD" -vv -k -f --gpu-devices=1 \
                "$TMPDIR/large.bin" -o "$TMPDIR/dsub2.zst" 2>&1) || ds_rc=$?
     [[ $ds_rc -eq 0 ]] || ds_why+=" [rc=$ds_rc]"
-    printf '%s' "$ds_log" | grep -q 'placed a startup guess' || ds_why+=" [no startup guess placed]"
-    printf '%s' "$ds_log" | grep -q 'skipping GPU bringup' || ds_why+=" [GPU bringup was not skipped]"
-    printf '%s' "$ds_log" | grep -q 'ranking the cards before CUDA starts' && ds_why+=" [something ranked the cards]"
-    printf '%s' "$ds_log" | grep -q 'waiting up to 500 ms for the NVML sample' && ds_why+=" [something waited for NVML]"
+    grep -q 'placed a startup guess' <<< "$ds_log" || ds_why+=" [no startup guess placed]"
+    grep -q 'skipping GPU bringup' <<< "$ds_log" || ds_why+=" [GPU bringup was not skipped]"
+    grep -q 'ranking the cards before CUDA starts' <<< "$ds_log" && ds_why+=" [something ranked the cards]"
+    grep -q 'ms for the NVML sample' <<< "$ds_log" && ds_why+=" [something waited for NVML]"
     env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
       "$GZSTD" -d -q -c "$TMPDIR/dsub2.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || ds_why+=" [round-trip]"
     [[ -z "$ds_why" ]] && pass "a hybrid GPU subset that skips GPU bringup has no ranking wait" \
@@ -5535,12 +5572,12 @@ if has_gpu 2>/dev/null; then
         [[ -n "$pr_sel" && "$pr_sees" == "$pr_sel" ]] \
           || pr_why+=" [$pr_arm: CUDA saw '${pr_sees:0:12}', ranked '${pr_sel:0:12}']"
         if [[ $pr_arm == off ]]; then
-          printf '%s' "$pr_log" | grep -q 'selected GPU-.*from NVML' || pr_why+=" [off: NVML did not rank]"
+          grep -q 'selected GPU-.*from NVML' <<< "$pr_log" || pr_why+=" [off: NVML did not rank]"
         else
           pr_line=$(printf '%s' "$pr_log" | grep -o "driver probe: $dr_proc_n card(s) in [0-9.]* ms (.*)" | head -1)
           [[ -n "$pr_line" ]] || pr_why+=" [$pr_arm: no probe line for all $dr_proc_n cards: $(printf '%s' "$pr_log" | grep -o 'driver probe: .*' | head -1 | cut -c1-90)]"
-          printf '%s' "$pr_log" | grep -q 'selected GPU-.*from the driver' || pr_why+=" [$pr_arm: the driver did not rank]"
-          printf '%s' "$pr_log" | grep -q 'waiting up to 500 ms for the NVML sample' && pr_why+=" [$pr_arm: waited for NVML]"
+          grep -q 'selected GPU-.*from the driver' <<< "$pr_log" || pr_why+=" [$pr_arm: the driver did not rank]"
+          grep -q 'ms for the NVML sample' <<< "$pr_log" && pr_why+=" [$pr_arm: waited for NVML]"
           pr_sizes=${pr_line#* ms (}
           [[ $pr_arm == default ]] && pr_detail=$pr_sizes
           [[ $pr_arm == newest-last && "$pr_sizes" != "$pr_detail" ]] \
@@ -5571,6 +5608,19 @@ if has_gpu 2>/dev/null; then
         fi
       done
       rm -rf "$TMPDIR/pr-ld" "$TMPDIR/probe-ld.zst"
+      # --gpu-order=ranked orders EVERY card after CUDA starts; it asks the driver
+      # too (v0.18.7), so NVML stays unloaded there as well.
+      rm -rf "$TMPDIR/pr-ld"; mkdir -p "$TMPDIR/pr-ld"
+      pr_rk=$(env -u CUDA_VISIBLE_DEVICES LD_DEBUG=libs LD_DEBUG_OUTPUT="$TMPDIR/pr-ld/ld" \
+                timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-order=ranked -v -k -f \
+                "$TMPDIR/large.bin" -o "$TMPDIR/probe-rk.zst" 2>&1 | command tr '\r' '\n') \
+        || pr_why+=" [ranked rc]"
+      grep -qF 'ranked after CUDA startup by combined rank (utilization + free VRAM, from the driver)' <<< "$pr_rk" \
+        || pr_why+=" [ranked: not ranked from the driver: $(grep -o 'ranked after CUDA startup.*VRAM[^)]*)' <<< "$pr_rk" | head -1 | cut -c1-90)]"
+      grep -qs 'calling init: .*libnvidia-ml' "$TMPDIR/pr-ld"/ld* && pr_why+=" [ranked: loaded NVML]"
+      env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
+        "$GZSTD" -d -q -c "$TMPDIR/probe-rk.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || pr_why+=" [ranked round-trip]"
+      rm -rf "$TMPDIR/pr-ld" "$TMPDIR/probe-rk.zst"
       # --calibrate's device-count children each measure a cold start, which a
       # device held open by the parent would make warm.  So under calibrate the
       # parent ranks only after its count pass: the ranking line follows the
@@ -5603,14 +5653,14 @@ if has_gpu 2>/dev/null; then
                timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -k -f \
                "$TMPDIR/large.bin" -o "$TMPDIR/noload.zst" 2>&1 >/dev/null) || nl_rc=$?
     [[ $nl_rc -eq 0 ]] || nl_why+=" [rc=$nl_rc]"
-    printf '%s' "$nl_err" | grep -q 'warning: could not read GPU load before choosing .*picked at random' \
+    grep -q 'warning: could not read GPU load before choosing .*picked at random' <<< "$nl_err" \
       || nl_why+=" [no warning: $(printf '%s' "$nl_err" | command tr '\r' '\n' | grep -v '^$' | head -1 | cut -c1-80)]"
     env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
       "$GZSTD" -d -q -c "$TMPDIR/noload.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" || nl_why+=" [round-trip]"
     nl_err=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_RM_PROBE=off GZSTD_DEBUG_NVML_DROP="$nl_all" \
                timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -q -k -f \
                "$TMPDIR/large.bin" -o "$TMPDIR/noload.zst" 2>&1 >/dev/null) || nl_why+=" [-q rc=$?]"
-    printf '%s' "$nl_err" | grep -q 'could not read GPU load' && nl_why+=" [-q did not silence it]"
+    grep -q 'could not read GPU load' <<< "$nl_err" && nl_why+=" [-q did not silence it]"
     # A probe stuck in the driver (GZSTD_DEBUG_RM_PROBE=stall: its thread never
     # returns) spends the ONE 500 ms ranking budget it shares with NVML, so NVML
     # is not started for a second wait; the guess stands, the warning says
@@ -5621,7 +5671,7 @@ if has_gpu 2>/dev/null; then
                timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -k -f \
                "$TMPDIR/large.bin" -o "$TMPDIR/noload.zst" 2>&1 >/dev/null) || nl_rc=$?
     [[ $nl_rc -eq 0 ]] || nl_why+=" [stalled probe: rc=$nl_rc]"
-    printf '%s' "$nl_err" | grep -q 'driver probe: no answer within the shared 500 ms budget; NVML: the shared 500 ms budget expired' \
+    grep -q 'driver probe: no answer within the shared 500 ms budget; NVML: the shared 500 ms budget expired' <<< "$nl_err" \
       || nl_why+=" [stalled probe: $(printf '%s' "$nl_err" | command tr '\r' '\n' | grep -o 'could not read GPU load.*' | head -1 | cut -c1-120)]"
     env -u CUDA_VISIBLE_DEVICES timeout --foreground -k 10 120 \
       "$GZSTD" -d -q -c "$TMPDIR/noload.zst" 2>/dev/null | cmp -s - "$TMPDIR/large.bin" \
@@ -5629,6 +5679,55 @@ if has_gpu 2>/dev/null; then
     rm -f "$TMPDIR/noload.zst"
     [[ -z "$nl_why" ]] && pass "a GPU subset chosen without any load reading says so" \
       || fail "a GPU subset chosen without any load reading says so" "$nl_why"
+
+    # SIMULTANEOUS JOBS SEE EACH OTHER'S CARDS (v0.18.7).  Ranking reads past
+    # load, so jobs started together all chose the same card (8 of 8, every
+    # round, and half of them then lost the GPU for want of VRAM).  Each ranking
+    # now records its cards in a per-user claims file and counts the live claims
+    # of others.  The PROGRAM holds the window open: job 1 compresses from a FIFO
+    # this cell keeps open, so it ranks, claims, and then waits for input; job 2
+    # must report job 1's claim and choose another card.  After job 1 exits, a
+    # third ranking must find no live claim (the dead process's line is dropped).
+    # A private claims directory keeps the user's other gzstd runs out of it.
+    cl_why=""; cl_dir="$TMPDIR/claims"; rm -rf "$cl_dir"
+    rm -f "$TMPDIR/cl-in" "$TMPDIR/cl-err"; mkfifo "$TMPDIR/cl-in" "$TMPDIR/cl-err"
+    head -c 4194304 "$TMPDIR/large.bin" > "$TMPDIR/cl-src.bin"
+    ( env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_CLAIMS_DIR="$cl_dir" \
+        timeout --foreground -k 10 120 "$GZSTD" --gpu-only --gpu-devices=1 -vv -c \
+        < "$TMPDIR/cl-in" > "$TMPDIR/cl1.zst" 2> "$TMPDIR/cl-err"; echo $? > "$TMPDIR/cl1.rc" ) &
+    cl_pid=$!
+    exec {cl_w}> "$TMPDIR/cl-in"
+    exec {cl_r}< "$TMPDIR/cl-err"
+    cl_sel1=""
+    while IFS= read -r -u "$cl_r" cl_line; do
+      [[ "$cl_line" == *"] selected GPU-"* ]] && { cl_sel1=$(printf '%s' "$cl_line" | grep -o 'selected GPU-[0-9a-f-]*' | cut -c10-); break; }
+    done
+    cl_log2=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_CLAIMS_DIR="$cl_dir" \
+                timeout --foreground -k 10 120 "$GZSTD" --gpu-devices=1 -vv -k -f \
+                "$TMPDIR/cl-src.bin" -o "$TMPDIR/cl2.zst" 2>&1 | command tr '\r' '\n') || cl_why+=" [job 2 rc]"
+    cat "$TMPDIR/cl-src.bin" >&"$cl_w"
+    exec {cl_w}>&-
+    cat <&"$cl_r" > /dev/null
+    exec {cl_r}<&-
+    wait "$cl_pid"
+    cl_sel2=$(printf '%s' "$cl_log2" | grep -o 'selected GPU-[0-9a-f-]*' | head -1 | cut -c10-)
+    if [[ -z "$cl_sel1" ]]; then cl_why+=" [job 1 never selected a card]"
+    else
+      grep -qF "claims: other gzstd processes hold ${cl_sel1:0:12} x1" <<< "$cl_log2" \
+        || cl_why+=" [job 2 did not see job 1's claim: $(printf '%s' "$cl_log2" | grep -o 'claims: .*' | head -1 | cut -c1-80)]"
+      [[ -n "$cl_sel2" && "$cl_sel2" != "$cl_sel1" ]] || cl_why+=" [both chose '${cl_sel1:0:12}']"
+    fi
+    [[ "$(cat "$TMPDIR/cl1.rc" 2>/dev/null)" == 0 ]] || cl_why+=" [job 1 rc=$(cat "$TMPDIR/cl1.rc" 2>/dev/null)]"
+    "$GZSTD" -d -q -c "$TMPDIR/cl1.zst" 2>/dev/null | cmp -s - "$TMPDIR/cl-src.bin" || cl_why+=" [job 1 round-trip]"
+    "$GZSTD" -d -q -c "$TMPDIR/cl2.zst" 2>/dev/null | cmp -s - "$TMPDIR/cl-src.bin" || cl_why+=" [job 2 round-trip]"
+    cl_log3=$(env -u CUDA_VISIBLE_DEVICES GZSTD_DEBUG_GPU_CLAIMS_DIR="$cl_dir" \
+                timeout --foreground -k 10 120 "$GZSTD" --gpu-devices=1 -vv -k -f \
+                "$TMPDIR/cl-src.bin" -o "$TMPDIR/cl2.zst" 2>&1 | command tr '\r' '\n') || cl_why+=" [job 3 rc]"
+    grep -qF 'claims: no other gzstd holds a card' <<< "$cl_log3" \
+      || cl_why+=" [a finished job's claim still counted: $(printf '%s' "$cl_log3" | grep -o 'claims: .*' | head -1 | cut -c1-80)]"
+    rm -rf "$cl_dir" "$TMPDIR/cl-in" "$TMPDIR/cl-err" "$TMPDIR/cl1.rc" "$TMPDIR/cl1.zst" "$TMPDIR/cl2.zst" "$TMPDIR/cl-src.bin"
+    [[ -z "$cl_why" ]] && pass "simultaneous GPU subset jobs see each other's cards" \
+      || fail "simultaneous GPU subset jobs see each other's cards" "$cl_why"
   elif [[ "${GPU_ALL_DEVICES:-}" == *,* ]]; then
     skip "--gpu-order=ranked ranks every device after CUDA startup" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
@@ -5644,6 +5743,8 @@ if has_gpu 2>/dev/null; then
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
     skip "a GPU subset chosen without any load reading says so" \
          "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
+    skip "simultaneous GPU subset jobs see each other's cards" \
+         "fewer than 2 GPUs with ${dr_min_mib} MiB free, or an index mask"
   else
     skip "--gpu-order=ranked ranks every device after CUDA startup" "single GPU host"
     skip "a caller's CUDA_VISIBLE_DEVICES is never re-ranked" "single GPU host"
@@ -5652,6 +5753,7 @@ if has_gpu 2>/dev/null; then
     skip "a hybrid GPU subset that skips GPU bringup has no ranking wait" "single GPU host"
     skip "the driver probe ranks a GPU subset without NVML, and NVML still ranks without it" "single GPU host"
     skip "a GPU subset chosen without any load reading says so" "single GPU host"
+    skip "simultaneous GPU subset jobs see each other's cards" "single GPU host"
   fi
 
   # THE COMPUTE-CAPABILITY FLOOR (v0.17.77).  gzstd's GPU code runs on compute
@@ -8201,6 +8303,7 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────
+if $EXTENSIVE; then
 section "--adapt GPU deadline demote + escalate (fault injection)"
 
 # GZSTD_DEBUG_ADAPT_STALL=-1:<secs> stalls the first drain thread to pop a
@@ -8342,6 +8445,8 @@ else
   skip "a slow GPU decompress batch is demoted, not reclaimed" "no GPU"
   skip "decompress reclaim stays quiet on a healthy run" "no GPU"
 fi
+
+fi  # $EXTENSIVE (--adapt GPU deadline demote/escalate + GPU decompress stuck-batch reclaim: moved to -e in v0.18.7 -- stable, untouched, and slow)
 
 # ────────────────────────────────────────────────────────────
 section "Exit, signal and cleanup paths (v0.17.87 review)"
@@ -9689,24 +9794,63 @@ fi
 # (the look-ahead at the pledge reads past it), one off the 4 KiB grid (the only
 # off-grid read is the last), and a single byte.  The setup line prints before the
 # first read, and a refused read degrades to buffered after it, so the proof is
-# the end-of-run count of bytes that came through O_DIRECT.  The default path
+# the end-of-run count of bytes that came through O_DIRECT.  The buffered oracle
+# passes --no-direct-read (v0.18.7: a COLD default run reads O_DIRECT, below) and
 # must not print it.
 swd="$TMPDIR/swd"; mkdir -p "$swd"; swd_why=""
 head -c $((8*1048576 + 4097)) /dev/urandom > "$swd/r"
 for swd_n in $((8*1048576)) $((8*1048576 + 4097)) 1; do
   head -c "$swd_n" "$swd/r" > "$swd/in"
-  rc_b=0; "$GZSTD" --sliding-window -v -f "$swd/in" -o "$swd/b.zst" 2>"$swd/b.log" || rc_b=$?
+  rc_b=0; "$GZSTD" --sliding-window --no-direct-read -v -f "$swd/in" -o "$swd/b.zst" 2>"$swd/b.log" || rc_b=$?
   rc_d=0; "$GZSTD" --sliding-window --direct-read -v -f "$swd/in" -o "$swd/d.zst" 2>"$swd/d.log" || rc_d=$?
   swd_cnt=$(tr '\r' '\n' < "$swd/d.log" | sed -n 's/.*\[SLIDING-WINDOW\] read \([0-9][0-9]*\) of \([0-9][0-9]*\) bytes with O_DIRECT.*/\1 \2/p' | head -1)
   if [[ $rc_b -ne 0 || $rc_d -ne 0 ]]; then swd_why+=" [$swd_n: exit $rc_b buffered, $rc_d O_DIRECT]"
   elif ! cmp -s "$swd/b.zst" "$swd/d.zst"; then swd_why+=" [$swd_n: the O_DIRECT run wrote different bytes]"
   elif [[ "$swd_cnt" != "$swd_n $swd_n" ]]; then swd_why+=" [$swd_n: O_DIRECT read ${swd_cnt:-<no count line>}, want all of it]"
   elif tr '\r' '\n' < "$swd/d.log" | grep -qiE 'refused an O_DIRECT|could not engage'; then swd_why+=" [$swd_n: degraded to buffered]"
-  elif tr '\r' '\n' < "$swd/b.log" | grep -q 'with O_DIRECT'; then swd_why+=" [$swd_n: the DEFAULT run claimed O_DIRECT]"
+  elif tr '\r' '\n' < "$swd/b.log" | grep -q 'with O_DIRECT'; then swd_why+=" [$swd_n: the --no-direct-read run claimed O_DIRECT]"
   fi
 done
 [[ -z "$swd_why" ]] && pass "--sliding-window --direct-read reads O_DIRECT and writes the same frame" \
   || fail "--sliding-window --direct-read reads O_DIRECT and writes the same frame" "$swd_why"
+
+# ...AND A COLD INPUT READS O_DIRECT BY DEFAULT (v0.18.7, ROADMAP 11).  Below 95%
+# resident the one reader takes O_DIRECT unless told otherwise (measured: 19.5 GiB
+# cold 5.3 s against 8.6-8.9 buffered; half-cached 5.3 against 6.8-6.9).  The file
+# is evicted first; where it cannot be (tmpfs, no eviction tool) the cell skips.
+# Cold: the decision line, every byte through O_DIRECT, and the buffered oracle's
+# frame.  Then the same file warm (the oracle run cached it) and cold again with
+# --no-direct-read: neither may read O_DIRECT.
+swc_dc="$(cd "$(dirname "$0")" && pwd)/scripts/drop_cache"; swc_why=""
+head -c $((8*1048576 + 4097)) "$swd/r" > "$swd/cold"
+swc_evict() { "$swc_dc" "$swd/cold" >/dev/null 2>&1 \
+                && "$swc_dc" -c "$swd/cold" 2>/dev/null | grep -q ', 0.0%)'; }
+if [[ -x "$swc_dc" ]] && swc_evict; then
+  rc=0; "$GZSTD" --sliding-window -v -f "$swd/cold" -o "$swd/c.zst" 2>"$swd/c.log" || rc=$?
+  swc_log=$(tr '\r' '\n' < "$swd/c.log")
+  swc_cnt=$(sed -n 's/.*\[SLIDING-WINDOW\] read \([0-9][0-9]*\) of \([0-9][0-9]*\) bytes with O_DIRECT.*/\1 \2/p' <<< "$swc_log" | head -1)
+  [[ $rc -eq 0 ]] || swc_why+=" [cold rc=$rc]"
+  grep -qF 'cold input (0% resident): reading O_DIRECT' <<< "$swc_log" || swc_why+=" [cold: no O_DIRECT decision]"
+  [[ "$swc_cnt" == "$((8*1048576 + 4097)) $((8*1048576 + 4097))" ]] || swc_why+=" [cold: O_DIRECT read '${swc_cnt:-none}']"
+  rc_b=0; "$GZSTD" --sliding-window --no-direct-read -f "$swd/cold" -o "$swd/cb.zst" 2>/dev/null || rc_b=$?
+  [[ $rc_b -eq 0 ]] || swc_why+=" [buffered oracle rc=$rc_b]"
+  cmp -s "$swd/c.zst" "$swd/cb.zst" || swc_why+=" [cold: a different frame from the buffered run]"
+  rc_w=0; "$GZSTD" --sliding-window -v -f "$swd/cold" -o "$swd/w.zst" 2>"$swd/w.log" || rc_w=$?
+  [[ $rc_w -eq 0 ]] || swc_why+=" [warm rc=$rc_w]"
+  swc_wlog=$(tr '\r' '\n' < "$swd/w.log")
+  grep -qE 'cold input|with O_DIRECT' <<< "$swc_wlog" && swc_why+=" [warm: read O_DIRECT]"
+  if swc_evict; then
+    rc_n=0; "$GZSTD" --sliding-window --no-direct-read -v -f "$swd/cold" -o "$swd/n.zst" 2>"$swd/n.log" || rc_n=$?
+    [[ $rc_n -eq 0 ]] || swc_why+=" [--no-direct-read rc=$rc_n]"
+    swc_nlog=$(tr '\r' '\n' < "$swd/n.log")
+    grep -qE 'cold input|with O_DIRECT' <<< "$swc_nlog" && swc_why+=" [--no-direct-read: read O_DIRECT]"
+  fi
+  [[ -z "$swc_why" ]] && pass "a cold --sliding-window input reads O_DIRECT by default" \
+    || fail "a cold --sliding-window input reads O_DIRECT by default" "$swc_why"
+else
+  skip_host "a cold --sliding-window input reads O_DIRECT by default" \
+            "this host cannot evict a file from the page cache here (tmpfs?)"
+fi
 
 # ...and a filesystem that accepts open(O_DIRECT) but refuses the read degrades
 # to buffered from the offset reached, once, with the same frame.  Every local
@@ -10022,6 +10166,7 @@ grep -q "has no multithreading" "$TMPDIR/zv.err" || zv_why+=" [no warning that i
   || fail "--version names the zstd library; --sliding-window copes with one that has no threads" "$zv_why"
 rm -f "$TMPDIR/zv.in" "$TMPDIR/zv.zst" "$TMPDIR/zv.err"
 
+if $EXTENSIVE; then
 section "Decompress tail-aware GPU intake (pinned rates)"
 
 # v0.17.54: hybrid decompress declines GPU intake at the tail, as compress has
@@ -10727,6 +10872,8 @@ else
   skip "--direct-stage takes the ordinary GPU allocation" "no GPU"
 fi
 
+fi  # $EXTENSIVE (decompress tail-aware GPU intake + --direct-stage decompress, compression and --tar: moved to -e in v0.18.7 -- stable, untouched, and slow)
+
 
 section "Sliding-window compression"
 
@@ -11173,6 +11320,7 @@ rm -f "$TMPDIR/bf.bin" "$TMPDIR/bf.zst" "$TMPDIR/bf" "$TMPDIR/bf.out"
 fi  # $EXTENSIVE (zstd-compat flag layer + bundled short flags)
 
 # ============================================================
+if $EXTENSIVE; then
 section "Parameter honor verification"
 # ----------------------------------------------------------------
 # Round-trip tests confirm flags don't BREAK things, but they don't
@@ -11379,6 +11527,8 @@ fi
 rm -f "$TMPDIR/ultra.zst"
 
 rm -f "$PHV" "$PHV_ZST" "$PHV_OUT"
+
+fi  # $EXTENSIVE (parameter honor verification: moved to -e in v0.18.7 -- stable, untouched, and slow)
 
 # ============================================================
 # Native tar archiving (--tar)
@@ -13058,6 +13208,7 @@ fi
 # ============================================================
 # List (-l, and -l --tar)
 # ============================================================
+if $EXTENSIVE; then
 section "List contents (-l)"
 
 if ! command -v tar >/dev/null 2>&1; then
@@ -14608,6 +14759,8 @@ RMS_MATRIX
 
   rm -rf "$LS" "$LA"
 fi
+
+fi  # $EXTENSIVE (list contents (-l): moved to -e in v0.18.7 -- stable, untouched, and slow)
 
 # ============================================================
 # Multi-input "-" routing and --rm ordering (always run)

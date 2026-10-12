@@ -124,7 +124,35 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    (`parallel gzstd ::: files`) can quietly run without the GPU it asked for. A short, bounded retry
    on that one error, before writing the card off, is the likely fix; measure first whether the other
    paths' bringup sees the same rate.
-10. **`--sliding-window` placement is worth a fuller measurement.** Exploratory sweep (v0.18.4, 2-socket
+10. **`--sliding-window` placement: the fuller measurement is done (v0.18.7); the policy is still open.**
+   MEASURED 2026-10-09 on the 8-GPU server (2 x 64-core EPYC 9554, 16 L3 caches of 8 cores), warm,
+   to /dev/null, `taskset` to 1/2/4/8/16 caches (8/16/32/64/128 workers), medians of 3, 2 GiB slices
+   of the three corpora:
+
+   | level | high-ratio best (1 L3 / default) | medium best | low-ratio best |
+   |---|---|---|---|
+   | 1 | 1 L3 0.36 s / 0.60 | 1 L3 0.40 / 0.70 | 1 L3 0.40 / 0.69 |
+   | 3 | 1 L3 0.45 / 0.83 | 1 L3 0.45 / 0.86 | 1 L3 0.44 / 0.92 |
+   | 6 | 1 L3 0.33 / 0.83 | 1 L3 0.49 / 0.89 | 2 L3 0.47 / 0.93 |
+   | 9 | 1 L3 0.43 / 1.10 | 4 L3 0.61 / 1.16 | 2 L3 0.64 / 1.19 |
+   | 12 | 1 L3 0.48 / 1.11 | 4 L3 0.76 / 1.17 | 2 L3 0.83 / 1.30 |
+   | 15 | default 2.64 (1 L3: 9.30) | default 2.35 | 8 L3 2.00 / 2.32 |
+   | 19 | 4 L3 0.89 / 1.13 | 8 L3 10.46 / 11.81 | default 13.98 |
+
+   and on the full 19.5 GiB medium file: level 1, 1 L3 2.58 s against 4.68 default; level 3 3.24
+   against 5.54; level 6, 4 L3 3.33 against 6.10; level 9, 4 L3 2.74 against 6.21.  So for levels
+   1-12 (zstd's fast..lazy2 strategies, the default level 3 among them) the default spread is 1.5-2.6x
+   slower than packing the stream onto one to four caches; from level 15 (bt* strategies) the work is
+   compute-bound and wants most of the machine.  What is NOT settled is a rule: the obvious model --
+   enough workers to keep up with the one producer, packed into as few caches as hold them -- predicts
+   2-4 caches at level 3, where 1 wins; a level table would be a machine-tuned constant.  Candidates:
+   (a) key on zstd's own strategy (`ZSTD_getCParams(level, size).strategy`): fast..lazy2 -> the fewest
+   caches whose cores cover a single-thread rate measured on the first chunk, bt* -> all; (b) an
+   `--adapt` action that tries placements across runs per (strategy, size) bucket.  Worker threads
+   inherit the creating thread's affinity, so a placement is a `sched_setaffinity` before the context
+   is created (and for the reader).  Today the win is available by hand: `taskset -c 0-7,128-135 gzstd
+   --sliding-window ...` at levels up to 12 on this box.  Check a one-L3 desktop and a single-socket
+   Intel box before choosing: the effect may be specific to many-cache parts.  The original text: Exploratory sweep (v0.18.4, 2-socket
    128-core server whose L3 is 16 separate caches, 19.5 GiB warm to /dev/null): at level 3, 8 workers
    pinned inside one L3 cache took 2.05 s (high-ratio data) and 3.2-3.4 s (medium), against 4.6-4.9 s
    and 4.9-5.6 s for the default 128 workers spread over the machine; one socket (64 workers) took
@@ -134,7 +162,11 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    host). v0.18.4 sized the read-ahead to this and stopped there; choosing WHERE to run (a
    level- and data-dependent placement, or an `--adapt` action) is open. Check a one-L3 desktop and
    a single-socket Intel box first: the effect may be specific to many-cache parts.
-11. **`--adapt` never picks O_DIRECT for `--sliding-window`.** v0.18.4 honours an explicit
+11. ~~**`--adapt` never picks O_DIRECT for `--sliding-window`.**~~ CLOSED v0.18.7, without `--adapt`: this path
+   is one sequential reader, so there is no in-run comparison to make; residency decides up front, by
+   the line the `--adapt` classes and the frame probe already use (below 95% resident = cold).  MEASURED,
+   19.5 GiB, 3 rounds: cold 5.29-5.34 s O_DIRECT against 8.55-8.91 buffered; half-cached 5.28-5.38
+   against 6.77-6.92; warm 5.24-5.50 buffered (kept).  The original text: v0.18.4 honours an explicit
    `--direct-read` there (cold, medians of 3: 5.1-5.3 s against 8.2-9.3 s buffered), but not the `--adapt`
    read-path prior, which was measured on the frame-parallel reader, and the frame path's automatic
    cold-input probe does not run on this path either. A cold sliding-window run would gain from both;
@@ -149,7 +181,12 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    worth of work has come in, skip if it ends first, engage at the guard if it is still coming. 1 MiB
    piped: 2.13-2.16 s -> 0.02-0.03 s. A big piped job starts CUDA ~130 ms later than before (read from
    -vv); its end-to-end time is still to be measured on a quiet machine.
-14. **Piped compress stops on a GPU fault under VRAM pressure.** OBSERVED (v0.18.5 and v0.18.3 alike,
+14. ~~**Piped compress stops on a GPU fault under VRAM pressure.**~~ CLOSED v0.18.7: the "fault" was a
+   card too full to create a CUDA context ("cudaSetDevice: out of memory"), caught by the compress
+   worker's fault handler.  Reproduced with one card filled to 6 MiB free beside a healthy one: a
+   piped 19.5 GiB compress exited 5.  A worker that fails before it takes its first batch has produced
+   nothing, so it is now a bringup failure -- the card is skipped and the run continues (exit 0, right
+   bytes).  The original text: OBSERVED (v0.18.5 and v0.18.3 alike,
    8-GPU server, another user's jobs holding four cards at 75-94 GiB): compressing 19.5 GiB through a
    pipe, 2 of 3 runs of each version exited with "a GPU faulted during compression and the input is a
    pipe/stream", after "insufficient VRAM for even 1 stream" on the busy cards. A pipe cannot be rebuilt

@@ -49,13 +49,13 @@ is neither:
 
 | host | extensive | default | reachable today? |
 |---|---|---|---|
-| GPU + GPUDirect Storage usable (the baseline) | 774 | 615 | **yes, this server** |
-| GPU, GDS unavailable | 757 | 599 | yes, the workstation |  <!-- extensive MEASURED 743 at v0.18.0 (2026-10-06): EXPECTED_TESTS - EXPECTED_NOGDS_DELTA (761 - 18), because the trivial-park cell RUNS there; v0.18.1 adds two GPU cells (763 - 18 = 745, MEASURED 745 2026-10-06); v0.18.2 adds two no-GPU cells (765 - 18 = 747); v0.18.3 one more (766 - 18 = 748); v0.18.4 six more (772 - 18 = 754); v0.18.5 one more (773 - 18 = 755); v0.18.6 two GPU cells (775 - 18 = 757); default derived as 616 - 17 -->
-| no GPU (the CPU-only build) | not a release gate | 445 | yes |
+| GPU + GPUDirect Storage usable (the baseline) | 777 | 518 | **yes, this server** |
+| GPU, GDS unavailable | 760 | 503 | yes, the workstation |  <!-- extensive MEASURED 743 at v0.18.0 (2026-10-06): EXPECTED_TESTS - EXPECTED_NOGDS_DELTA (761 - 18), because the trivial-park cell RUNS there; v0.18.1 adds two GPU cells (763 - 18 = 745, MEASURED 745 2026-10-06); v0.18.2 adds two no-GPU cells (765 - 18 = 747); v0.18.3 one more (766 - 18 = 748); v0.18.4 six more (772 - 18 = 754); v0.18.5 one more (773 - 18 = 755); v0.18.6 two GPU cells (775 - 18 = 757); v0.18.7 two more (777 - 18 = 759); plus one cell any build runs (778 - 18 = 760); default derived as 519 - 16 after v0.18.7 moved 100 stable default tests to -e -->
+| no GPU (the CPU-only build) | not a release gate | 380 | yes |
 
-These are the v0.18.6 expectations (the suite's own constants are the authority, and it prints the
+These are the v0.18.7 expectations (the suite's own constants are the authority, and it prints the
 expectation it used). The baseline row counts what RAN,
-so it is the `EXPECTED_TESTS` constant (775 / 616) minus the one
+so it is the `EXPECTED_TESTS` constant (778 / 519) minus the one
 cell this server cannot provoke — the trivial-park cell needs a trivially-compressed batch to reach
 a GPU, and the CPU pool here drains the fixture first. Since v0.17.64 that skip goes through
 `skip_host`, which subtracts itself from the expectation, so the run says "as expected on this host"
