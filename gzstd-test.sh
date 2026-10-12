@@ -614,8 +614,20 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=519
-$EXTENSIVE && EXPECTED_TESTS=778
+EXPECTED_TESTS=522
+$EXTENSIVE && EXPECTED_TESTS=816
+# v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
+# +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
+# Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
+# gone (--exclude-compressed is real now): 521 -> 522, 781 -> 795.  None needs a GPU.
+# Then --long: +5 --extensive, the --long=27 warn cell gone: 795 -> 799.
+# Then --no-check: +5 --extensive, its silent-no-op cell gone: 799 -> 803.
+# Then --rsyncable under --sliding-window: +1 --extensive: 803 -> 804.
+# Then --zstd=: +3 --extensive: 804 -> 807.
+# Round-two review: +2 --extensive safety/regression cells: 807 -> 809.
+# Round-three review: +2 --extensive symlink-target/chain cells: 809 -> 811.
+# Round-four review: +3 procfd cells and +1 dangling output-alias cell: 811 -> 815.
+# Round-five review: +1 plain --rm output freed by an earlier input: 815 -> 816.
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -844,8 +856,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=139
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=202   # MEASURED 2026-09-21 (607 - 463) + 34 derived since
+EXPECTED_NOGPU_DELTA=141   # + the two v0.18.8 GPU cells
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=205   # MEASURED 2026-09-21 (607 - 463) + 34 derived since; + 3 v0.18.8
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -1784,12 +1796,23 @@ PYEOF
   cmp -s "$TRD/o.dict" "$TRD/dictionary" || why+=" -o-not-replaced"
   ls "$TRD"/o.dict.gzstd-tmp-* >/dev/null 2>&1 && why+=" temp-left"
   "$GZSTD" -q --train -c "${TRF[@]}" 2>/dev/null | cmp -s - "$TRD/dictionary" || why+=" -c"
+  # -c and -o together: the LATER one wins (v0.18.8), as in zstd -- `-c -o d`
+  # writes d and nothing to stdout; `-o d -c` writes stdout (zstd cannot).
+  rm -f "$TRD/co.dict"
+  [[ -z "$("$GZSTD" -q --train "${TRF[@]}" -c -o "$TRD/co.dict" 2>/dev/null | head -c 1)" ]] \
+    && cmp -s "$TRD/co.dict" "$TRD/dictionary" || why+=" -c-then-o"
+  rm -f "$TRD/co.dict"
+  "$GZSTD" -q --train "${TRF[@]}" -o "$TRD/co.dict" -c 2>/dev/null | cmp -s - "$TRD/dictionary" \
+    && [[ ! -e "$TRD/co.dict" ]] || why+=" -o-then-c"
   "$GZSTD" -q --train "$TRD"/set/r1.json "$TRD"/set/r2.json "$TRD"/set/r4.json -o "$TRD/x" >/dev/null 2>&1; rc=$?
   [[ $rc -eq 2 ]] || why+=" few-samples:$rc"
   "$GZSTD" -q --train "$TRD/set" -o "$TRD/x" >/dev/null 2>&1; rc=$?; [[ $rc -eq 2 ]] || why+=" dir-without-r:$rc"
   "$GZSTD" -q --train "${TRF[@]}" "$TRD/missing.json" -o "$TRD/x" >/dev/null 2>&1; rc=$?
   [[ $rc -eq 3 ]] || why+=" missing:$rc"
   "$GZSTD" -q --train-cover=q=1 "${TRF[@]}" -o "$TRD/x" >/dev/null 2>&1; rc=$?; [[ $rc -eq 2 ]] || why+=" bad-params:$rc"
+  "$GZSTD" -q --train -M1 "${TRF[@]}" -o "$TRD/x" >/dev/null 2>"$TRD/m1.err"; rc=$?
+  [[ $rc -eq 2 ]] && grep -aq 'cannot hold even one complete sample' "$TRD/m1.err" \
+    || why+=" tiny-memory:$rc"
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "--train output (./dictionary, -o replaced, -c) and refusals" \
     || fail "--train output (./dictionary, -o replaced, -c) and refusals" "got$why"
@@ -2258,7 +2281,11 @@ GVPY
   # SUCCESS WITHOUT ALLOCATING ANYTHING.  A correct build emits one per attempt,
   # with a strictly decreasing batch.
   bh_z="$TMPDIR/gds-halve.zst"; bh_e="$TMPDIR/gds-halve.err"
-  "$GZSTD" -k -f -3 "$TMPDIR/large.bin" -o "$bh_z" 2>/dev/null
+  # 1 MiB FRAMES, so the opening batch has room to halve four times.  Since
+  # v0.18.8 the batch is capped at the archive's frame count (ROADMAP 9), and the
+  # 32 MiB fixture at 16 MiB frames opens at 2: "batches: 2 1", two
+  # reallocations, where the tuner's uncapped 64 used to give the room.
+  "$GZSTD" -k -f -3 --chunk-size=1 "$TMPDIR/large.bin" -o "$bh_z" 2>/dev/null
   GZSTD_DEBUG_FAIL_BRINGUP_ALLOC=3 GZSTD_DEBUG_ENSURE=1 \
     run_test "$GZSTD" -q -t --gds-only "$bh_z" 2>"$bh_e"
   bh_rc=$LAST_RC
@@ -2399,6 +2426,48 @@ GVPY
     fi
   done
   rm -f "$ro_src" "$ro_z" "$ro_out" "$ro_e"
+
+  # v0.18.8 (ROADMAP 9): NO GPU BATCH LARGER THAN THE INPUT.  Both paths sized their
+  # device slabs and nvCOMP workspace for the tuner's 256-frame headroom whatever
+  # the input held: one 16-frame decompress peaked at 25.4 GiB of an H100 and one
+  # 16-frame compress at 36.5 GiB, so simultaneous jobs on one card lost the GPU
+  # (MEASURED: 15 of 40 compress jobs in rounds of 8, 3 of 60 decompress jobs in
+  # rounds of 6; 0 of each with the cap).  Each arm asks the bringup what it sized
+  # for, at -vv, and fails if any request exceeds the input's frame count.
+  # THE CELL DISCRIMINATES, mutation-proven: with either cap removed that arm
+  # reports 256 against 6.
+  pa_src="$TMPDIR/prealloc.bin"; pa_z="$TMPDIR/prealloc.zst"; pa_e="$TMPDIR/prealloc.err"
+  # 6 frames of 1 MiB, entropy-coded so the GPU is engaged on both sides.
+  head -c 4608K /dev/urandom | base64 -w 76 | head -c 6M > "$pa_src"
+  pa_n=6
+  for pa_dir in compress decompress; do
+    if [[ $pa_dir == compress ]]; then
+      pa_name="GPU compress sizes its batch to the input"
+      run_test "$GZSTD" -vv --gpu-only --gpu-devices=1 --chunk-size=1 -k -f "$pa_src" -o "$pa_z" 2>"$pa_e"
+      pa_seen=$(grep -aoE '\[VRAM check\] batch=[0-9]+' "$pa_e" 2>/dev/null | awk -F= '$2>m{m=$2} END{print m+0}')
+    else
+      pa_name="GPU decompress sizes its batch to the archive"
+      run_test "$GZSTD" -vv -d --gpu-only --gpu-devices=1 -c "$pa_z" 2>"$pa_e" >"$TMPDIR/prealloc.out"
+      pa_seen=$(grep -aoE 'pre-alloc batch=[0-9]+' "$pa_e" 2>/dev/null | awk -F= '$2>m{m=$2} END{print m+0}')
+    fi
+    pa_rc=$LAST_RC
+    if [[ $pa_rc -ne 0 ]]; then
+      fail "$pa_name" "exit $pa_rc"
+    elif [[ ${pa_seen:-0} -eq 0 ]]; then
+      if ! grep -aq '\] done batch=' "$pa_e" 2>/dev/null; then
+        skip_host "$pa_name" "no GPU bringup (card full?)"
+      else
+        fail "$pa_name" "no batch size in the -vv trace: NOT TESTED"
+      fi
+    elif [[ $pa_seen -gt $pa_n ]]; then
+      fail "$pa_name" "sized for $pa_seen frames; the input has $pa_n"
+    elif [[ $pa_dir == decompress ]] && ! files_match "$pa_src" "$TMPDIR/prealloc.out"; then
+      fail "$pa_name" "output mismatch"
+    else
+      pass "$pa_name"
+    fi
+  done
+  rm -f "$pa_src" "$pa_z" "$pa_e" "$TMPDIR/prealloc.out"
 
   if $EXTENSIVE; then
   # v0.17.67/68: THE VRAM RECOVERIES, AND THE SHRINK THAT SHRANK NOTHING.
@@ -2612,6 +2681,37 @@ GVPY
          "the recovered run did not produce a byte-correct archive"
   else
     pass "a compress launch failure re-arms its reserve at a quiet device point"
+  fi
+
+  # 4. A LOST RACE HALVES AGAIN (v0.18.8, ROADMAP 9).  When the bringup reserve
+  # does not fit, decompress frees its buffers and rebuilds at half the batch; a
+  # process that takes the freed VRAM in between used to cost the whole device
+  # ("lost VRAM while reducing batch to N  skipping device") although a smaller
+  # batch would have fitted.  GZSTD_DEBUG_FAIL_VRAM_RESERVE forces the shrink,
+  # GZSTD_DEBUG_REAL_REBUILD_OOM fails the first rebuild for real (an impossible
+  # temp size), and the device must then come up one halving lower and decode.
+  # THE CELL DISCRIMINATES, mutation-proven: without the retry the device is
+  # skipped and no batch runs on it.
+  GZSTD_DEBUG_FAIL_VRAM_RESERVE=1 GZSTD_DEBUG_REAL_REBUILD_OOM=1 \
+    run_test "$GZSTD" -vv -d --gpu-only --gpu-devices=1 -c "$vr_z" 2>"$vr_e" >"$vr_out"
+  vr_rc=$LAST_RC
+  vr_lost=$(grep -ac 'lost VRAM while reducing batch to [0-9]*; trying' "$vr_e" 2>/dev/null || true)
+  vr_skip=$(grep -ac 'lost VRAM while reducing batch to [0-9]*  skipping device' "$vr_e" 2>/dev/null || true)
+  if [[ ${vr_lost:-0} -eq 0 && ${vr_skip:-0} -eq 0 ]]; then
+    if [[ $(vr_engaged) -eq 0 ]]; then
+      skip_host "a lost bringup race halves the batch again" "no GPU bringup (card full?)"
+    else
+      fail "a lost bringup race halves the batch again" "hook never fired: NOT TESTED"
+    fi
+  elif [[ $vr_rc -ne 0 ]]; then
+    fail "a lost bringup race halves the batch again" "exit $vr_rc"
+  elif [[ ${vr_skip:-0} -ne 0 || $(vr_engaged) -eq 0 ]]; then
+    fail "a lost bringup race halves the batch again" \
+         "device written off after one lost race ($(vr_engaged) GPU batches)"
+  elif ! files_match "$vr_src" "$vr_out"; then
+    fail "a lost bringup race halves the batch again" "output mismatch"
+  else
+    pass "a lost bringup race halves the batch again"
   fi
   rm -f "$vr_src" "$vr_z" "$vr_out" "$vr_e" \
         "$TMPDIR/vrec.out.zst" "$TMPDIR/vrec.roundtrip"
@@ -9414,12 +9514,32 @@ rm -rf "$rv/w"; mkdir -p "$rv/w"; cp "$rv/small" "$rv/w/f"; printf 'OLD' > "$rv/
 ( cd "$rv/w" && "$GZSTD" --cpu-only -q -o -dqf f 2>/dev/null )
 [[ -e "$rv/w/-dqf" && "$(cat "$rv/w/-d")" == "OLD" ]] || rv_why+=" [-o -dqf: the value was split into flags ($(ls -A "$rv/w" | paste -sd,))]"
 rc=0; "$GZSTD" --cpu-only -q -xf "$rv/small" >/dev/null 2>&1 || rc=$?; [[ $rc -eq 2 ]] || rv_why+=" [-xf (not a flag) exited $rc, want 2]"
-for rv_m in -M512MB --memory=512MB --memlimit=2G "-M 64MiB" -M100; do
+# A bare number is BYTES since v0.18.8, as in zstd: 104857600 is 100 MiB.
+for rv_m in -M512MB --memory=512MB --memlimit=2G "-M 64MiB" -M104857600; do
   rc=0; "$GZSTD" --cpu-only -q -d $rv_m -c "$rv/small.zst" 2>/dev/null | cmp -s - "$rv/small" || rc=1
   [[ $rc -eq 0 ]] || rv_why+=" [$rv_m was not accepted]"
 done
 rc=0; "$GZSTD" --cpu-only -q -d -M12X -c "$rv/small.zst" >/dev/null 2>&1 || rc=$?
 [[ $rc -eq 2 ]] || rv_why+=" [-M12X exited $rc, want 2]"
+# ...and a bare -M100 is 100 bytes, below any frame's window: refused (exit 1),
+# with a note that a bare number used to be MiB here.
+rc=0; "$GZSTD" --cpu-only -d -M100 -c "$rv/small.zst" >/dev/null 2>"$rv/m100.err" || rc=$?
+[[ $rc -eq 1 ]] && grep -aq -- "-M100 is 100 bytes: a bare number counts bytes" "$rv/m100.err" \
+  || rv_why+=" [bare -M100 is 100 bytes: exit $rc, want 1 and the note]"
+# The last memory option owns both the limit and the bare-number note.  The
+# separated spelling and long aliases share the same parser; -q hides the note.
+rc=0; "$GZSTD" --cpu-only -d --memlimit=100 -M512MB -c "$rv/small.zst" \
+  >/dev/null 2>"$rv/multi.err" || rc=$?
+[[ $rc -eq 0 ]] && ! grep -aq 'bare number counts bytes' "$rv/multi.err" \
+  || rv_why+=" [last suffixed -M did not replace earlier bare --memlimit]"
+rc=0; "$GZSTD" --cpu-only -d -M512MB -M 100 -c "$rv/small.zst" \
+  >/dev/null 2>"$rv/multi.err" || rc=$?
+[[ $rc -eq 1 ]] && grep -aq -- '-M 100 is 100 bytes' "$rv/multi.err" \
+  || rv_why+=" [last separated -M did not set the limit and note]"
+rc=0; "$GZSTD" --cpu-only -q -d --memory=100 -c "$rv/small.zst" \
+  >/dev/null 2>"$rv/multi.err" || rc=$?
+[[ $rc -eq 1 ]] && ! grep -aq 'bare number counts bytes' "$rv/multi.err" \
+  || rv_why+=" [-q did not suppress the bare --memory note]"
 [[ -z "$rv_why" ]] && pass "zstd's short-flag bundles, -z and memory sizes are understood" \
   || fail "zstd's short-flag bundles, -z and memory sizes are understood" "$rv_why"
 
@@ -9455,26 +9575,34 @@ rv_why=""
 head -c 9500000 "$rv/big" > "$rv/w.in"
 "$GZSTD" --cpu-only -q -19 -f "$rv/w.in" -o "$rv/w19.zst" 2>/dev/null
 "$GZSTD" --cpu-only -q  -3 -f "$rv/w.in" -o "$rv/w3.zst"  2>/dev/null
-rc=0; "$GZSTD" -d --cpu-only -q -M4 -c "$rv/w19.zst" >/dev/null 2>"$rv/m.err" || rc=$?
-[[ $rc -eq 1 ]] && grep -aq "too much memory" "$rv/m.err" && grep -aq -- "-M8" "$rv/m.err" \
-  || rv_why+=" [-M4 on an 8 MiB window: exit $rc, want 1 and a message naming -M8: '$(head -c 90 "$rv/m.err")']"
-rc=0; "$GZSTD" -d --cpu-only -q -M4 -c < "$rv/w19.zst" >/dev/null 2>&1 || rc=$?
+# Sizes carry their unit: a bare -M number is BYTES since v0.18.8.  The message
+# names the limit WITH its unit, or following it would ask for bytes.
+rc=0; "$GZSTD" -d --cpu-only -q -M4M -c "$rv/w19.zst" >/dev/null 2>"$rv/m.err" || rc=$?
+[[ $rc -eq 1 ]] && grep -aq "too much memory" "$rv/m.err" && grep -aq -- "-M8MB" "$rv/m.err" \
+  || rv_why+=" [-M4M on an 8 MiB window: exit $rc, want 1 and a message naming -M8MB: '$(head -c 90 "$rv/m.err")']"
+rc=0; "$GZSTD" -d --cpu-only -q -M4M -c < "$rv/w19.zst" >/dev/null 2>&1 || rc=$?
 [[ $rc -eq 1 ]] || rv_why+=" [the same from standard input: exit $rc]"
-rc=0; "$GZSTD" -t --cpu-only -q -M4 "$rv/w19.zst" 2>/dev/null || rc=$?
-[[ $rc -eq 1 ]] || rv_why+=" [-t -M4: exit $rc]"
-"$GZSTD" -d --cpu-only -q -M8 -c "$rv/w19.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [-M8 did not decode an 8 MiB window]"
+rc=0; "$GZSTD" -t --cpu-only -q -M4M "$rv/w19.zst" 2>/dev/null || rc=$?
+[[ $rc -eq 1 ]] || rv_why+=" [-t -M4M: exit $rc]"
+"$GZSTD" -d --cpu-only -q -M8M -c "$rv/w19.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [-M8M did not decode an 8 MiB window]"
 "$GZSTD" -d --cpu-only -q -M8MB -c "$rv/w19.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [-M8MB did not decode it]"
+# Bare bytes at the boundary, as zstd counts them: 8 MiB exactly decodes the
+# 8 MiB window, one byte less refuses it.
+"$GZSTD" -d --cpu-only -q -M8388608 -c "$rv/w19.zst" 2>/dev/null | cmp -s - "$rv/w.in" \
+  || rv_why+=" [-M8388608 (bytes) did not decode an 8 MiB window]"
+rc=0; "$GZSTD" -d --cpu-only -q -M8388607 -c "$rv/w19.zst" >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 1 ]] || rv_why+=" [-M8388607 (bytes) on an 8 MiB window: exit $rc, want 1]"
 "$GZSTD" -d --cpu-only -q -c "$rv/w19.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [no limit did not decode it]"
-rc=0; "$GZSTD" -d --cpu-only -q -M1 -c "$rv/w3.zst" >/dev/null 2>&1 || rc=$?
-[[ $rc -eq 1 ]] || rv_why+=" [-M1 on a 2 MiB window: exit $rc, want 1]"
-"$GZSTD" -d --cpu-only -q -M2 -c "$rv/w3.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [-M2 did not decode a 2 MiB window]"
+rc=0; "$GZSTD" -d --cpu-only -q -M1M -c "$rv/w3.zst" >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 1 ]] || rv_why+=" [-M1M on a 2 MiB window: exit $rc, want 1]"
+"$GZSTD" -d --cpu-only -q -M2M -c "$rv/w3.zst" 2>/dev/null | cmp -s - "$rv/w.in" || rv_why+=" [-M2M did not decode a 2 MiB window]"
 # ...and ONLY when decoding the user's input.  Compressing, -M is a memory budget:
 # the frames --verify decodes are the ones this run just wrote, and must not be
 # refused (the sliding-window verifier did, as soon as the limit was real).
 for rv_v in "--verify" "--sliding-window --verify"; do
-  rc=0; "$GZSTD" --cpu-only -q -19 -M4 $rv_v -f "$rv/w.in" -o "$rv/wv.zst" 2>/dev/null || rc=$?
+  rc=0; "$GZSTD" --cpu-only -q -19 -M4M $rv_v -f "$rv/w.in" -o "$rv/wv.zst" 2>/dev/null || rc=$?
   [[ $rc -eq 0 ]] && "$GZSTD" -d --cpu-only -q -c "$rv/wv.zst" 2>/dev/null | cmp -s - "$rv/w.in" \
-    || rv_why+=" [compress -19 -M4 $rv_v: exit $rc, want 0]"
+    || rv_why+=" [compress -19 -M4M $rv_v: exit $rc, want 0]"
 done
 [[ -z "$rv_why" ]] && pass "-M refuses a frame whose window exceeds the limit, as zstd does" \
   || fail "-M refuses a frame whose window exceeds the limit, as zstd does" "$rv_why"
@@ -11008,8 +11136,9 @@ rm -f "$TMPDIR/zc.out"
 ("$GZSTD" --single-thread --cpu-only -f "$TMPDIR/zc.bin" 2>&1 | tail -1 | grep -q " => ") \
   && pass "--single-thread compresses" || fail "--single-thread compresses"
 
-# Silent no-ops (should not print any warning or error)
-for opt in --check --no-check --asyncio --no-asyncio --format=zstd \
+# Silent no-ops (should not print any warning or error).  --no-check left this
+# list in v0.18.8, when it became real (see the --no-check cells below).
+for opt in --check --asyncio --no-asyncio --format=zstd \
            --no-dictID --compress-literals --no-compress-literals \
            --row-match-finder --no-row-match-finder \
            --auto-threads=physical --stream-size=1024 --size-hint=1024 \
@@ -11022,8 +11151,9 @@ for opt in --check --no-check --asyncio --no-asyncio --format=zstd \
   fi
 done
 
-# Warn no-ops (each should emit one compat warning)
-for opt in --long=27 --rsyncable --exclude-compressed \
+# Warn no-ops (each should emit one compat warning).  --exclude-compressed and
+# --long left this list in v0.18.8, when they became real.
+for opt in --rsyncable \
            --format=gzip --pass-through; do
   out=$("$GZSTD" "$opt" -f "$TMPDIR/zc.bin" 2>&1)
   if echo "$out" | grep -qi "accepted for zstd compatibility but ignored"; then
@@ -11234,7 +11364,7 @@ fi
 ("$GZSTD" --memory=256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "--memory=N accepted" || fail "--memory=N accepted"
 
 # -M tightens the throttle budget at -vv (source should show `source=ram`)
-out=$("$GZSTD" --cpu-only -vv -M 32 -f "$TMPDIR/zc.bin" 2>&1)
+out=$("$GZSTD" --cpu-only -vv -M 32M -f "$TMPDIR/zc.bin" 2>&1)
 echo "$out" | grep -q "\[THROTTLE\].*source=ram" && pass "-M tightens throttle (source=ram)" \
   || fail "-M tightens throttle" "expected source=ram in throttle line"
 
@@ -11248,20 +11378,209 @@ if command -v zstd >/dev/null 2>&1; then
   zstd -q -19 --long=27 -f "$TMPDIR/mem-big.bin" -o "$TMPDIR/mem-big.zst" 2>/dev/null
   if [ -f "$TMPDIR/mem-big.zst" ]; then
     rc=0
-    "$GZSTD" --cpu-only -d -M 1 -f "$TMPDIR/mem-big.zst" -o "$TMPDIR/mem-big.out" >/dev/null 2>&1 || rc=$?
+    "$GZSTD" --cpu-only -d -M 1M -f "$TMPDIR/mem-big.zst" -o "$TMPDIR/mem-big.out" >/dev/null 2>&1 || rc=$?
     # Exit 1 since v0.17.89 (it was 4, a DATA error, which an intact archive
     # refused for the caller's own limit is not; 1 is also what zstd exits with).
     # Until then this streamed frame was the only kind -M was applied to at all.
     [[ $rc -eq 1 ]] && pass "-M rejects oversize-window stream (exit 1)" \
                    || fail "-M rejects oversize-window stream" "got exit $rc (expected 1)"
     # Loose limit should succeed
-    "$GZSTD" --cpu-only -d -M 256 -f "$TMPDIR/mem-big.zst" -o "$TMPDIR/mem-big.out" >/dev/null 2>&1 \
+    "$GZSTD" --cpu-only -d -M 256M -f "$TMPDIR/mem-big.zst" -o "$TMPDIR/mem-big.out" >/dev/null 2>&1 \
       && cmp -s "$TMPDIR/mem-big.bin" "$TMPDIR/mem-big.out" \
       && pass "-M with loose limit still decompresses" \
       || fail "-M with loose limit still decompresses"
     rm -f "$TMPDIR/mem-big.bin" "$TMPDIR/mem-big.zst" "$TMPDIR/mem-big.out"
   fi
+
+  # --long[=N] (v0.18.8; accepted and IGNORED before, so a `zstd --long=28`
+  # archive could not be decoded here at all without -M: the refusal said
+  # "re-run with --keep-going").  160 MiB of random data at --long=28 declares a
+  # 160 MiB window (the descriptor is not only powers of two), past the 128 MiB
+  # default both decoders keep.
+  dd if=/dev/urandom bs=1M count=160 2>/dev/null > "$TMPDIR/long.bin"
+  zstd -q -1 --long=28 -f "$TMPDIR/long.bin" -o "$TMPDIR/long.zst" 2>/dev/null
+  if [ -f "$TMPDIR/long.zst" ]; then
+    run_test "$GZSTD" --cpu-only -d -c "$TMPDIR/long.zst" >/dev/null 2>"$TMPDIR/long.err"; lg_def=$LAST_RC
+    run_test "$GZSTD" --cpu-only -d --long=27 -c "$TMPDIR/long.zst" >/dev/null 2>"$TMPDIR/long.err27"; lg_27=$LAST_RC
+    run_test "$GZSTD" --cpu-only -d --long=27 -M0 -c "$TMPDIR/long.zst" >/dev/null 2>"$TMPDIR/long.err0"; lg_zero=$LAST_RC
+    run_test "$GZSTD" --cpu-only -d --long=28 -f "$TMPDIR/long.zst" -o "$TMPDIR/long.out" 2>/dev/null; lg_28=$LAST_RC
+    # -M0 is "no -M" in zstd (MEASURED: `zstd -d --long=27 -M0` refuses this
+    # frame), so --long=27 still sets the limit.
+    if [[ $lg_def -eq 1 && $lg_27 -eq 1 && $lg_zero -eq 1 && $lg_28 -eq 0 ]] \
+       && grep -q "Decode it with --long=28 or -M160MB" "$TMPDIR/long.err" \
+       && grep -q "the limit set with --long=27 is 128 MiB" "$TMPDIR/long.err27" \
+       && cmp -s "$TMPDIR/long.bin" "$TMPDIR/long.out"; then
+      pass "--long=28 decodes zstd --long=28 output; without it the refusal names it"
+    else
+      fail "--long=28 decodes zstd --long=28 output; without it the refusal names it" \
+           "rc default=$lg_def --long=27=$lg_27 -M0=$lg_zero --long=28=$lg_28"
+    fi
+  else
+    fail "--long=28 decodes zstd --long=28 output; without it the refusal names it" \
+         "zstd could not write the fixture: NOT TESTED"
+  fi
+  rm -f "$TMPDIR/long.bin" "$TMPDIR/long.zst" "$TMPDIR/long.out" "$TMPDIR/long.err" "$TMPDIR/long.err27" "$TMPDIR/long.err0"
+else
+  # Counted either way: these cells used to vanish from the total without zstd.
+  for c in "-M rejects oversize-window stream (exit 1)" "-M with loose limit still decompresses" \
+           "--long=28 decodes zstd --long=28 output; without it the refusal names it"; do
+    skip "$c" "zstd not installed"
+  done
 fi
+# --long in frame mode: a 3 MiB block repeated 20 MiB later is past level 3's
+# 2 MiB window and past a 16 MiB frame; --long grows the frame to its window and
+# finds it.  MEASURED, the same shape at 30 + 60 + 30 MiB: 93.3 -> 70.3 MB.
+head -c 2400K /dev/urandom | base64 -w 0 | head -c 3M > "$TMPDIR/long-a"
+head -c 15M /dev/urandom | base64 -w 0 | head -c 20M > "$TMPDIR/long-b"
+cat "$TMPDIR/long-a" "$TMPDIR/long-b" "$TMPDIR/long-a" > "$TMPDIR/long.bin"
+"$GZSTD" -q -f --cpu-only "$TMPDIR/long.bin" -o "$TMPDIR/long-n.zst" 2>/dev/null
+"$GZSTD" -q -f --long "$TMPDIR/long.bin" -o "$TMPDIR/long-l.zst" 2>/dev/null
+lg_n=$(stat -c %s "$TMPDIR/long-n.zst" 2>/dev/null || echo 0)
+lg_l=$(stat -c %s "$TMPDIR/long-l.zst" 2>/dev/null || echo 0)
+if [[ $lg_l -gt 0 && $lg_l -lt $(( lg_n - 2000000 )) ]] \
+   && "$GZSTD" -q -d -c "$TMPDIR/long-l.zst" 2>/dev/null | cmp -s - "$TMPDIR/long.bin"; then
+  pass "--long finds a match past the frame and the level's window"
+else
+  fail "--long finds a match past the frame and the level's window" "$lg_n -> $lg_l bytes"
+fi
+# --sliding-window --long=N is zstd's own single frame: byte-identical.  On THIS
+# data, where long-distance matching changes the bytes -- on random data it
+# changes nothing, and a build that ignored --long matched zstd there too.
+if command -v zstd >/dev/null 2>&1; then
+  "$GZSTD" -q -f --sliding-window -T2 --long=27 "$TMPDIR/long.bin" -o "$TMPDIR/long-g.zst" 2>/dev/null
+  zstd -q -f -T2 --long=27 "$TMPDIR/long.bin" -o "$TMPDIR/long-z.zst" 2>/dev/null
+  cmp -s "$TMPDIR/long-g.zst" "$TMPDIR/long-z.zst" \
+    && pass "--sliding-window --long=27: same bytes as zstd --long=27" \
+    || fail "--sliding-window --long=27: same bytes as zstd --long=27"
+  rm -f "$TMPDIR/long-g.zst" "$TMPDIR/long-z.zst"
+else
+  skip "--sliding-window --long=27: same bytes as zstd --long=27" "zstd not installed"
+fi
+rm -f "$TMPDIR/long-a" "$TMPDIR/long-b" "$TMPDIR/long.bin" "$TMPDIR/long-n.zst" "$TMPDIR/long-l.zst"
+# Compression with --long is CPU work: a named GPU backend is refused, and so is
+# a window log zstd would refuse.
+rc=0; "$GZSTD" --gpu-only --long -f "$TMPDIR/zc.bin" -o /dev/null >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 2 ]] && pass "--long with --gpu-only is refused (exit 2)" \
+                || fail "--long with --gpu-only is refused (exit 2)" "rc=$rc"
+rc=0; "$GZSTD" --long=32 -f "$TMPDIR/zc.bin" -o /dev/null >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 2 ]] && pass "--long=32 is out of range (exit 2)" \
+                || fail "--long=32 is out of range (exit 2)" "rc=$rc"
+
+# --zstd=k=v,... (v0.18.8; refused as an unknown option before): zstd's advanced
+# parameters.  The spec below changes the bytes against the plain level (so a
+# build that ignored it would fail), and --sliding-window must match zstd's.
+head -c 6M /dev/urandom | base64 -w 0 | head -c 8M > "$TMPDIR/zp.txt"
+zp_spec="wlog=20,clog=18,hlog=17,slog=3,mml=5,tlen=16,strat=4"
+if command -v zstd >/dev/null 2>&1; then
+  "$GZSTD" -q -f --sliding-window -T2 --zstd=$zp_spec "$TMPDIR/zp.txt" -o "$TMPDIR/zp-g.zst" 2>/dev/null
+  zstd -q -f -T2 --zstd=$zp_spec "$TMPDIR/zp.txt" -o "$TMPDIR/zp-z.zst" 2>/dev/null
+  zstd -q -f -T2 "$TMPDIR/zp.txt" -o "$TMPDIR/zp-n.zst" 2>/dev/null
+  cmp -s "$TMPDIR/zp-g.zst" "$TMPDIR/zp-z.zst" && ! cmp -s "$TMPDIR/zp-z.zst" "$TMPDIR/zp-n.zst" \
+    && pass "--sliding-window --zstd=...: same bytes as zstd --zstd=..." \
+    || fail "--sliding-window --zstd=...: same bytes as zstd --zstd=..."
+else
+  skip "--sliding-window --zstd=...: same bytes as zstd --zstd=..." "zstd not installed"
+fi
+# CONTROL FIRST: a good spec is accepted -- a build without --zstd= refused it
+# as an unknown option, exit 2, and passed the refusals below for that reason.
+zp_bad=""
+rc=0; "$GZSTD" -q --zstd=wlog=20,strat=4 -f "$TMPDIR/zp.txt" -o /dev/null >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 0 ]] || zp_bad+=" control:$rc"
+for zp_b in "bogus=1" "wlog=40" "strat=10" "wlog=" "wlog=20," ""; do
+  rc=0; "$GZSTD" --zstd=$zp_b -f "$TMPDIR/zp.txt" -o /dev/null >/dev/null 2>&1 || rc=$?
+  [[ $rc -eq 2 ]] || zp_bad+=" '$zp_b':$rc"
+done
+[[ -z "$zp_bad" ]] && pass "--zstd= refuses a bad key, form or range before any work (exit 2)" \
+                   || fail "--zstd= refuses a bad key, form or range before any work (exit 2)" "$zp_bad"
+rc=0; "$GZSTD" --gpu-only --zstd=strat=4 -f "$TMPDIR/zp.txt" -o /dev/null >/dev/null 2>"$TMPDIR/zp.err" || rc=$?
+# The message is this refusal's only on a GPU build: a CPU-only one refuses
+# --gpu-only itself, first.
+zp_msg=1
+if "$GZSTD" -V 2>&1 | grep -qi nvcomp; then
+  grep -q "zstd= is incompatible with --gpu-only" "$TMPDIR/zp.err" || zp_msg=0
+fi
+[[ $rc -eq 2 && $zp_msg -eq 1 ]] \
+  && pass "--zstd= with --gpu-only is refused (exit 2)" \
+                || fail "--zstd= with --gpu-only is refused (exit 2)" "rc=$rc"
+rm -f "$TMPDIR/zp.txt" "$TMPDIR/zp-g.zst" "$TMPDIR/zp-z.zst" "$TMPDIR/zp-n.zst" "$TMPDIR/zp.err"
+
+# --no-check (v0.18.8; it was a SILENT no-op, the worst class: zstd drops the
+# checksum when compressing and skips it when decoding, gzstd did neither and said
+# nothing).  Byte 4 of a frame is its descriptor; bit 2 says it has a checksum.
+head -c 200K /dev/urandom | base64 > "$TMPDIR/nc.txt"
+"$GZSTD" -q -f --cpu-only --no-check "$TMPDIR/nc.txt" -o "$TMPDIR/nc-n.zst" 2>/dev/null
+"$GZSTD" -q -f --cpu-only "$TMPDIR/nc.txt" -o "$TMPDIR/nc-c.zst" 2>/dev/null
+nc_n=$(od -An -tu1 -j4 -N1 "$TMPDIR/nc-n.zst" 2>/dev/null | tr -d ' ')
+nc_c=$(od -An -tu1 -j4 -N1 "$TMPDIR/nc-c.zst" 2>/dev/null | tr -d ' ')
+if [[ -n "$nc_n" && -n "$nc_c" && $(( nc_n & 4 )) -eq 0 && $(( nc_c & 4 )) -eq 4 ]] \
+   && "$GZSTD" -q -d -c "$TMPDIR/nc-n.zst" 2>/dev/null | cmp -s - "$TMPDIR/nc.txt"; then
+  pass "--no-check writes frames without a checksum (the default keeps it)"
+else
+  fail "--no-check writes frames without a checksum (the default keeps it)" "descriptors $nc_n / $nc_c"
+fi
+if command -v zstd >/dev/null 2>&1; then
+  "$GZSTD" -q -f --sliding-window -T2 --no-check "$TMPDIR/nc.txt" -o "$TMPDIR/nc-g.zst" 2>/dev/null
+  zstd -q -f -T2 --no-check "$TMPDIR/nc.txt" -o "$TMPDIR/nc-z.zst" 2>/dev/null
+  cmp -s "$TMPDIR/nc-g.zst" "$TMPDIR/nc-z.zst" \
+    && pass "--sliding-window --no-check: same bytes as zstd --no-check" \
+    || fail "--sliding-window --no-check: same bytes as zstd --no-check"
+else
+  skip "--sliding-window --no-check: same bytes as zstd --no-check" "zstd not installed"
+fi
+# Decoding: random data is stored in raw blocks, so one flipped byte decodes
+# cleanly and ONLY the checksum can tell.  Default: refused (exit 4).  --no-check:
+# the wrong bytes at exit 0 -- what `zstd -d --no-check` does, and what was asked.
+head -c 4M /dev/urandom > "$TMPDIR/nc.bin"
+"$GZSTD" -q -f --cpu-only "$TMPDIR/nc.bin" -o "$TMPDIR/nc-bad.zst" 2>/dev/null
+python3 -c "
+f=open('$TMPDIR/nc-bad.zst','r+b'); f.seek(2*1024*1024); b=f.read(1); f.seek(2*1024*1024); f.write(bytes([b[0]^0xFF])); f.close()"
+rc_c=0; "$GZSTD" -q --cpu-only -d -c "$TMPDIR/nc-bad.zst" >/dev/null 2>&1 || rc_c=$?
+rc_n=0; "$GZSTD" -q --cpu-only -d --no-check -c "$TMPDIR/nc-bad.zst" >/dev/null 2>&1 || rc_n=$?
+rc_t=0; "$GZSTD" -q --cpu-only -t --no-check "$TMPDIR/nc-bad.zst" >/dev/null 2>&1 || rc_t=$?
+[[ $rc_c -eq 4 && $rc_n -eq 0 && $rc_t -eq 0 ]] \
+  && pass "-d/-t --no-check skip the checksum (exit 0), as zstd does; without it exit 4" \
+  || fail "-d/-t --no-check skip the checksum (exit 0), as zstd does; without it exit 4" \
+          "default=$rc_c -d --no-check=$rc_n -t --no-check=$rc_t"
+# The device verify is skipped too: MEASURED, 4 GiB entropy-coded --gpu-only
+# decode on an H100, 3.26-3.37 s with it and 2.19-2.27 s without.
+if has_gpu 2>/dev/null; then
+  rc_g=0; "$GZSTD" -q --gpu-only --gpu-devices=1 -d -c "$TMPDIR/nc-bad.zst" >/dev/null 2>&1 || rc_g=$?
+  rc_gn=0; "$GZSTD" -q --gpu-only --gpu-devices=1 -d --no-check -c "$TMPDIR/nc-bad.zst" >/dev/null 2>&1 || rc_gn=$?
+  [[ $rc_g -eq 4 && $rc_gn -eq 0 ]] \
+    && pass "--gpu-only -d --no-check skips the device checksum (exit 0); without it exit 4" \
+    || fail "--gpu-only -d --no-check skips the device checksum (exit 0); without it exit 4" \
+            "default=$rc_g --no-check=$rc_gn"
+else
+  skip "--gpu-only -d --no-check skips the device checksum (exit 0); without it exit 4" "no GPU"
+fi
+rc=0; "$GZSTD" -q --verify --no-check -f "$TMPDIR/nc.txt" -o /dev/null >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 2 ]] && pass "--verify with --no-check is refused (exit 2)" \
+                || fail "--verify with --no-check is refused (exit 2)" "rc=$rc"
+# --rsyncable (v0.18.8) is real under --sliding-window: zstd's own, in its worker
+# threads.  (Frame mode still warns; it is in the warn-no-op loop above.)
+if command -v zstd >/dev/null 2>&1; then
+  # A FIXED input, 16 MiB.  Whether the mode moves a byte depends on where its
+  # sync points land, so on random input it is a coin toss -- MEASURED, 4 MiB of
+  # base64 changed in 1 to 3 seeds of 5 -- and a cell on random data would pass
+  # by luck for a build that ignored the flag.  Seeds 1, 2 and 3 all change here.
+  python3 -c "
+import random, base64, sys
+n = 12 * 1024 * 1024   # randbytes() spelled for Python < 3.9: the same bytes
+sys.stdout.buffer.write(base64.b64encode(random.Random(1).getrandbits(n * 8).to_bytes(n, 'little')))" \
+    > "$TMPDIR/nc.txt"
+  "$GZSTD" -q -f --sliding-window -T2 --rsyncable "$TMPDIR/nc.txt" -o "$TMPDIR/nc-g.zst" 2>/dev/null
+  zstd -q -f -T2 --rsyncable "$TMPDIR/nc.txt" -o "$TMPDIR/nc-z.zst" 2>/dev/null
+  zstd -q -f -T2 "$TMPDIR/nc.txt" -o "$TMPDIR/nc-n.zst" 2>/dev/null
+  # Against zstd --rsyncable, and NOT equal to plain zstd: on this input the mode
+  # changes the bytes, so a build that ignored it would fail.
+  cmp -s "$TMPDIR/nc-g.zst" "$TMPDIR/nc-z.zst" && ! cmp -s "$TMPDIR/nc-z.zst" "$TMPDIR/nc-n.zst" \
+    && pass "--sliding-window --rsyncable: same bytes as zstd --rsyncable" \
+    || fail "--sliding-window --rsyncable: same bytes as zstd --rsyncable"
+else
+  skip "--sliding-window --rsyncable: same bytes as zstd --rsyncable" "zstd not installed"
+fi
+rm -f "$TMPDIR/nc.txt" "$TMPDIR/nc-n.zst" "$TMPDIR/nc-c.zst" "$TMPDIR/nc-g.zst" "$TMPDIR/nc-z.zst" \
+      "$TMPDIR/nc.bin" "$TMPDIR/nc-bad.zst"
 out=$("$GZSTD" -B128K -f "$TMPDIR/zc.bin" 2>&1)
 echo "$out" | grep -qi "chunk-size" && pass "-B# warns" || fail "-B# warns"
 
@@ -11318,6 +11637,336 @@ expect_exit 2 "$GZSTD" -dx "$TMPDIR/bf.zst" \
 rm -f "$TMPDIR/bf.bin" "$TMPDIR/bf.zst" "$TMPDIR/bf" "$TMPDIR/bf.out"
 
 fi  # $EXTENSIVE (zstd-compat flag layer + bundled short flags)
+
+# ============================================================
+section "zstd directories (-r, --output-dir-flat/-mirror, --exclude-compressed)"
+# v0.18.8: all four were accepted and IGNORED -- -r exited 3 on the directory as
+# a read error, the output dirs left every output beside its input.  The
+# new-option expectations below were MEASURED against zstd 1.5.7 on the same
+# tree.  The plain named-file cells instead pin gzstd's existing behavior: a
+# command line that uses none of the new options must not change (review bar).
+# --cpu-only throughout: the suite's GZSTD_DEBUG_GPU_MIN_BYTES=0 would otherwise
+# send each tiny file to a GPU.
+zd="$TMPDIR/zdir"
+zd_tree() {   # a small tree with two inputs that share a name
+  rm -rf "$1"; mkdir -p "$1/sub" "$1/sub2"
+  echo a > "$1/a.txt"; echo b > "$1/sub/b.txt"; echo b2 > "$1/sub2/b.txt"; echo h > "$1/.hid"
+}
+zd_files() { ( cd "$1" && find . -type f | LC_ALL=C sort | tr '\n' ' ' ); }
+
+# DEFAULT RUN: one round trip each way, in place and mirrored -- the paths every
+# -r user takes.  The edge cases are --extensive, below.
+zd_tree "$zd/t"; cp -r "$zd/t" "$zd/orig"
+zd_ok=1
+"$GZSTD" -q --cpu-only -r --rm "$zd/t" || zd_ok=0
+[[ "$(zd_files "$zd/t")" == "./.hid.zst ./a.txt.zst ./sub/b.txt.zst ./sub2/b.txt.zst " ]] || zd_ok=0
+"$GZSTD" -q --cpu-only -d -r --rm "$zd/t" || zd_ok=0
+diff -r "$zd/t" "$zd/orig" >/dev/null 2>&1 || zd_ok=0
+( cd "$zd" && "$GZSTD" -q --cpu-only -r --output-dir-mirror m t \
+    && "$GZSTD" -q --cpu-only -d -r --output-dir-mirror back m ) || zd_ok=0
+diff -r "$zd/back/m/t" "$zd/orig" >/dev/null 2>&1 || zd_ok=0
+[[ $zd_ok -eq 1 ]] && pass "-r --rm and --output-dir-mirror round-trip a tree" \
+                   || fail "-r --rm and --output-dir-mirror round-trip a tree"
+rm -rf "$zd"
+
+if $EXTENSIVE; then
+# 1. What the walk takes.  A symbolic link is skipped with zstd's warning unless
+# -f (which follows it, as zstd's -f does); a FIFO is skipped -- zstd opens it and
+# blocks, MEASURED -- so `timeout` here is the cell's own guard; a link back to an
+# enclosing directory is refused under -f instead of walked until the path is too
+# long.  The FIFO makes both arms exit 1, as zstd's "-- ignored" does.
+zd_tree "$zd"; echo z > "$zd/sub/z.txt"; "$GZSTD" -q --cpu-only "$zd/sub/z.txt" -o "$zd/sub/zz.zst"
+rm -f "$zd/sub/z.txt"; ln -s ../a.txt "$zd/sub/link.txt"; ln -s .. "$zd/sub/up"; mkfifo "$zd/fifo"
+run_test timeout 30 "$GZSTD" --cpu-only -r "$zd" 2>"$TMPDIR/zd.err"
+zd_got=$(zd_files "$zd")
+if [[ $LAST_RC -eq 1 \
+      && "$zd_got" == "./.hid ./.hid.zst ./a.txt ./a.txt.zst ./sub/b.txt ./sub/b.txt.zst ./sub/zz.zst ./sub/zz.zst.zst ./sub2/b.txt ./sub2/b.txt.zst " ]] \
+   && grep -q "link.txt is a symbolic link, ignoring" "$TMPDIR/zd.err" \
+   && grep -q "fifo is not a regular file -- ignored" "$TMPDIR/zd.err"; then
+  pass "-r takes every regular file; a symbolic link and a FIFO are skipped"
+else
+  fail "-r takes every regular file; a symbolic link and a FIFO are skipped" "rc=$LAST_RC files: $zd_got"
+fi
+find "$zd" -name '*.zst' ! -name zz.zst -delete
+run_test timeout 30 "$GZSTD" --cpu-only -f -r "$zd" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 1 && -f "$zd/sub/link.txt.zst" ]] \
+   && grep -q "up leads back to a directory it is inside -- ignored" "$TMPDIR/zd.err"; then
+  pass "-r -f follows a symbolic link and refuses a directory loop"
+else
+  fail "-r -f follows a symbolic link and refuses a directory loop" "rc=$LAST_RC"
+fi
+rm -rf "$zd"
+
+# 2. -d, -t and -l under -r.  -d decodes only .zst/.tzst/.zstd names, and all
+# three skip a file that does not start with a zstd frame -- each reported, the
+# run carrying on to exit 1, where the fail-fast loop would have stopped at the
+# first one with exit 4 (zstd: the same two messages, exit 1).
+mkdir -p "$zd"; echo a > "$zd/a.txt"; "$GZSTD" -q --cpu-only --rm "$zd/a.txt"
+echo plain > "$zd/x.txt"; echo notzstd > "$zd/fake.zst"
+run_test "$GZSTD" --cpu-only -d -r "$zd" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 1 && "$(cat "$zd/a.txt" 2>/dev/null)" == a ]] \
+   && grep -q "x.txt: unknown suffix" "$TMPDIR/zd.err" \
+   && grep -q "fake.zst: unknown header -- ignored" "$TMPDIR/zd.err"; then
+  pass "-d -r decodes the zstd files and reports the rest (exit 1)"
+else
+  fail "-d -r decodes the zstd files and reports the rest (exit 1)" "rc=$LAST_RC"
+fi
+rm -f "$zd/a.txt"
+run_test "$GZSTD" --cpu-only -t -r "$zd" 2>"$TMPDIR/zd.err"; zd_t=$LAST_RC
+run_test "$GZSTD" -l -r "$zd" >"$TMPDIR/zd.out" 2>"$TMPDIR/zd.err2"; zd_l=$LAST_RC
+if [[ $zd_t -eq 1 && $zd_l -eq 1 ]] && grep -q "a.txt.zst" "$TMPDIR/zd.out" \
+   && grep -q "x.txt: unknown header -- ignored" "$TMPDIR/zd.err" \
+   && grep -q 'File ".*fake.zst" not compressed by zstd' "$TMPDIR/zd.err2"; then
+  pass "-t -r and -l -r skip a file that is not zstd and carry on"
+else
+  fail "-t -r and -l -r skip a file that is not zstd and carry on" "-t rc=$zd_t -l rc=$zd_l"
+fi
+rm -rf "$zd"
+
+# 3. A directory without -r, plain command line (the owner's ruling, v0.18.8:
+# follow zstd): skipped with zstd's message, exit 1, the other inputs still run.
+# It used to be "read error on DIR (Is a directory)", exit 3, after creating and
+# removing DIR.zst.
+zd_tree "$zd"; mkdir -p "$zd/x"; echo y > "$zd/x/y.txt"
+run_test "$GZSTD" --cpu-only "$zd/x" "$zd/a.txt" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 1 && -f "$zd/a.txt.zst" && ! -e "$zd/x.zst" ]] \
+   && grep -q "x is a directory -- ignored" "$TMPDIR/zd.err"; then
+  pass "a directory without -r is skipped (exit 1), the rest still run"
+else
+  fail "a directory without -r is skipped (exit 1), the rest still run" "rc=$LAST_RC"
+fi
+# Plain --rm with one output already there: that input is skipped AND KEPT, the
+# next is compressed and removed, exit 3 -- zstd's contract (it says 1).
+echo old > "$zd/a.txt.zst"
+run_test "$GZSTD" --cpu-only --rm "$zd/a.txt" "$zd/x/y.txt" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 3 && -f "$zd/a.txt" && "$(cat "$zd/a.txt.zst")" == old \
+      && -f "$zd/x/y.txt.zst" && ! -e "$zd/x/y.txt" ]]; then
+  pass "plain --rm skips an existing output (input kept), removes only what it compressed"
+else
+  fail "plain --rm skips an existing output (input kept), removes only what it compressed" "rc=$LAST_RC"
+fi
+# The output of the second decode exists at parse time, but the first decode
+# removes that exact input name before the second one starts.  Pre-skipping the
+# second would leave its archive untouched and change a valid exit 0 into 3.
+echo first > "$zd/seq-first"; echo second > "$zd/seq-second"
+"$GZSTD" -q --cpu-only -c "$zd/seq-first" >"$zd/seq.zst"
+"$GZSTD" -q --cpu-only -c "$zd/seq-second" >"$zd/seq.zst.zst"
+run_test "$GZSTD" --cpu-only -d --rm "$zd/seq.zst" "$zd/seq.zst.zst" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 0 && "$(cat "$zd/seq")" == first \
+      && "$(cat "$zd/seq.zst")" == second && ! -e "$zd/seq.zst.zst" ]]; then
+  pass "plain -d --rm processes an output freed by its earlier input"
+else
+  fail "plain -d --rm processes an output freed by its earlier input" "rc=$LAST_RC"
+fi
+# Its own names: the symlink-chain cells below build $zd/chain.zst, and an
+# archive left at that name made `ln -s` fail and one of them test nothing.
+rm -f "$zd/seq" "$zd/seq.zst" "$zd/seq-first" "$zd/seq-second"
+echo source > "$zd/a"; echo later > "$zd/a.zst"
+run_test "$GZSTD" --cpu-only -r -f --rm "$zd/a" "$zd/a.zst" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 2 && "$(cat "$zd/a")" == source \
+      && "$(cat "$zd/a.zst")" == later && ! -e "$zd/a.zst.zst" ]]; then
+  pass "-r -f --rm refuses to replace a later input before reading it"
+else
+  fail "-r -f --rm refuses to replace a later input before reading it" "rc=$LAST_RC"
+fi
+ln -s a.zst "$zd/link.zst"
+run_test "$GZSTD" --cpu-only -r -f --rm "$zd/a" "$zd/link.zst" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 2 && "$(cat "$zd/a")" == source \
+      && "$(cat "$zd/a.zst")" == later && -L "$zd/link.zst" \
+      && ! -e "$zd/link.zst.zst" ]]; then
+  pass "-r -f --rm refuses to replace a later symlink input's target"
+else
+  fail "-r -f --rm refuses to replace a later symlink input's target" "rc=$LAST_RC"
+fi
+echo middle > "$zd/mid"
+ln -s a.zst "$zd/mid.zst"
+ln -s mid.zst "$zd/chain.zst"
+run_test "$GZSTD" --cpu-only -r -f --rm "$zd/mid" "$zd/chain.zst" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 2 && "$(cat "$zd/mid")" == middle \
+      && "$(cat "$zd/a.zst")" == later && -L "$zd/mid.zst" \
+      && -L "$zd/chain.zst" && ! -e "$zd/chain.zst.zst" ]]; then
+  pass "-r -f --rm refuses to replace an intermediate symlink before later input"
+else
+  fail "-r -f --rm refuses to replace an intermediate symlink before later input" "rc=$LAST_RC"
+fi
+# A held directory can be reached through /proc/self/fd even after an ancestor
+# loses search permission.  Canonicalizing that name and stat'ing the displayed
+# path refused a usable -f output parent, including a missing mirror child
+# that can be created through the held directory.  A procfd file link has the
+# matching input problem: readlink returns an inaccessible path, while opening the
+# magic link still reads the held file.
+if [[ $(id -u) -eq 0 || ! -d /proc/self/fd ]]; then
+  skip_host "-f output parent through a held procfd directory" "requires non-root procfs"
+  skip_host "-f mirror creates a child under a held procfd directory" "requires non-root procfs"
+  skip_host "-f input through a held procfd file" "requires non-root procfs"
+else
+  mkdir -p "$zd/pin/hidden/out" "$zd/pin/visible/out"
+  echo alpha > "$zd/pin/visible/a"; echo beta > "$zd/pin/visible/b"
+  echo held > "$zd/pin/hidden/data"
+  exec 7<"$zd/pin/hidden/out" 8<"$zd/pin/hidden/data"
+  chmod 000 "$zd/pin/hidden"
+  run_test "$GZSTD" --cpu-only -r -f --output-dir-flat /proc/self/fd/7 \
+    "$zd/pin/visible/a" "$zd/pin/visible/b" 2>"$TMPDIR/zd.err"
+  zd_parent_rc=$LAST_RC
+  run_test "$GZSTD" --cpu-only -r -f --output-dir-mirror /proc/self/fd/7/new \
+    "$zd/pin/visible/a" "$zd/pin/visible/b" 2>"$TMPDIR/zd.err3"
+  zd_mirror_rc=$LAST_RC
+  run_test "$GZSTD" --cpu-only -r -f --output-dir-flat "$zd/pin/visible/out" \
+    "$zd/pin/visible/a" /proc/self/fd/8 2>"$TMPDIR/zd.err2"
+  zd_magic_rc=$LAST_RC
+  chmod 700 "$zd/pin/hidden"
+  exec 7<&- 8<&-
+  if [[ $zd_parent_rc -eq 0 && -s "$zd/pin/hidden/out/a.zst" \
+        && -s "$zd/pin/hidden/out/b.zst" \
+        && "$("$GZSTD" -q --cpu-only -dc "$zd/pin/hidden/out/a.zst")" == alpha \
+        && "$("$GZSTD" -q --cpu-only -dc "$zd/pin/hidden/out/b.zst")" == beta ]]; then
+    pass "-f output parent through a held procfd directory"
+  else
+    fail "-f output parent through a held procfd directory" "rc=$zd_parent_rc"
+  fi
+  zd_mirror_a="$zd/pin/hidden/out/new/${zd#/}/pin/visible/a.zst"
+  zd_mirror_b="$zd/pin/hidden/out/new/${zd#/}/pin/visible/b.zst"
+  if [[ $zd_mirror_rc -eq 0 && -s "$zd_mirror_a" && -s "$zd_mirror_b" \
+        && "$("$GZSTD" -q --cpu-only -dc "$zd_mirror_a")" == alpha \
+        && "$("$GZSTD" -q --cpu-only -dc "$zd_mirror_b")" == beta ]]; then
+    pass "-f mirror creates a child under a held procfd directory"
+  else
+    fail "-f mirror creates a child under a held procfd directory" "rc=$zd_mirror_rc"
+  fi
+  if [[ $zd_magic_rc -eq 0 && -s "$zd/pin/visible/out/8.zst" \
+        && "$("$GZSTD" -q --cpu-only -dc "$zd/pin/visible/out/8.zst")" == held ]]; then
+    pass "-f input through a held procfd file"
+  else
+    fail "-f input through a held procfd file" "rc=$zd_magic_rc"
+  fi
+fi
+rm -rf "$zd"
+
+# The first output can create the target of a dangling symlink used by the
+# second mirror output.  Both inputs would then overwrite the same archive;
+# --rm must refuse before removing either source.
+mkdir -p "$zd/dang/future" "$zd/dang/alias" "$zd/dang/out"
+echo first > "$zd/dang/future/x"; echo second > "$zd/dang/alias/x"
+ln -s future "$zd/dang/out/alias"
+pushd "$zd/dang" >/dev/null
+run_test "$GZSTD" --cpu-only -r -f --rm --output-dir-mirror out \
+  future/x alias/x 2>"$TMPDIR/zd.err"
+zd_alias_rc=$LAST_RC
+popd >/dev/null
+if [[ $zd_alias_rc -eq 2 && "$(cat "$zd/dang/future/x")" == first \
+      && "$(cat "$zd/dang/alias/x")" == second \
+      && -L "$zd/dang/out/alias" && ! -e "$zd/dang/out/future" ]]; then
+  pass "-f --rm refuses mirror outputs joined by a dangling symlink"
+else
+  fail "-f --rm refuses mirror outputs joined by a dangling symlink" "rc=$zd_alias_rc"
+fi
+rm -rf "$zd"
+
+# 4. An empty directory leaves NO inputs, and that must not mean standard input
+# (the --filelist lesson).  Stdin is a FIFO this shell holds open for writing and
+# never writes: a run that reads it blocks until `timeout` kills it (124).
+mkdir -p "$zd/empty"; mkfifo "$TMPDIR/zd.fifo"; exec 7<>"$TMPDIR/zd.fifo"
+run_test timeout 10 "$GZSTD" --cpu-only -r "$zd/empty" <&7 >"$TMPDIR/zd.out" 2>"$TMPDIR/zd.err"
+exec 7>&-; rm -f "$TMPDIR/zd.fifo"
+if [[ $LAST_RC -eq 0 && ! -s "$TMPDIR/zd.out" ]] && grep -q "non-empty directories" "$TMPDIR/zd.err"; then
+  pass "-r on an empty directory exits 0 without reading standard input"
+else
+  fail "-r on an empty directory exits 0 without reading standard input" "rc=$LAST_RC"
+fi
+rm -rf "$zd"
+
+# 5. --output-dir-flat over a tree with two b.txt.  Without -f the later one is
+# skipped (exit 3: an existing output, gzstd's code for it; zstd says 1); with -f
+# the last one wins after a warning, as in zstd; with -f --rm it is refused before
+# ANY work -- zstd removed both inputs and kept one output (MEASURED: data lost).
+zd_tree "$zd/t"; mkdir -p "$zd/out"
+run_test "$GZSTD" --cpu-only -r --output-dir-flat "$zd/out" "$zd/t" 2>"$TMPDIR/zd.err"
+zd_got=$(zd_files "$zd/out")
+if [[ $LAST_RC -eq 3 && "$zd_got" == "./.hid.zst ./a.txt.zst ./b.txt.zst " ]] \
+   && grep -q "would both be written to" "$TMPDIR/zd.err"; then
+  pass "--output-dir-flat: a name clash skips the later input (exit 3)"
+else
+  fail "--output-dir-flat: a name clash skips the later input (exit 3)" "rc=$LAST_RC files: $zd_got"
+fi
+rm -rf "$zd/out"; mkdir -p "$zd/out"
+run_test "$GZSTD" --cpu-only -f -r --output-dir-flat "$zd/out" "$zd/t" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 0 ]] && grep -q "two files have the same name" "$TMPDIR/zd.err" \
+   && [[ "$(zd_files "$zd/out")" == "./.hid.zst ./a.txt.zst ./b.txt.zst " ]]; then
+  pass "--output-dir-flat -f: the last of two same-named inputs wins, with a warning"
+else
+  fail "--output-dir-flat -f: the last of two same-named inputs wins, with a warning" "rc=$LAST_RC"
+fi
+rm -rf "$zd/out"; mkdir -p "$zd/out"
+run_test "$GZSTD" --cpu-only -f --rm -r --output-dir-flat "$zd/out" "$zd/t" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 2 && -z "$(zd_files "$zd/out")" && -f "$zd/t/sub/b.txt" && -f "$zd/t/sub2/b.txt" ]]; then
+  pass "--output-dir-flat -f --rm with a name clash is refused before any work"
+else
+  fail "--output-dir-flat -f --rm with a name clash is refused before any work" "rc=$LAST_RC"
+fi
+# A missing flat directory: zstd fails every file on its own; refused once here.
+run_test "$GZSTD" --cpu-only -r --output-dir-flat "$zd/nope" "$zd/t" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 3 && ! -e "$zd/nope" && -z "$(find "$zd/t" -name '*.zst')" ]] \
+   && grep -q -- "--output-dir-flat .*nope: No such file or directory" "$TMPDIR/zd.err"; then
+  pass "--output-dir-flat into a missing directory is refused before any work"
+else
+  fail "--output-dir-flat into a missing directory is refused before any work" "rc=$LAST_RC"
+fi
+# Mirror refuses a path that climbs with "..", as zstd does, and writes nothing.
+( cd "$zd/t/sub" && run_test "$GZSTD" --cpu-only --output-dir-mirror ../../m ../a.txt 2>"$TMPDIR/zd.err"; echo $LAST_RC > "$TMPDIR/zd.rc" )
+if [[ "$(cat "$TMPDIR/zd.rc")" == 1 && ! -e "$zd/m" ]] \
+   && grep -q "output-dir-mirror cannot compress '../a.txt'" "$TMPDIR/zd.err"; then
+  pass "--output-dir-mirror refuses a path with .. (exit 1)"
+else
+  fail "--output-dir-mirror refuses a path with .. (exit 1)" "rc=$(cat "$TMPDIR/zd.rc")"
+fi
+rm -rf "$zd"
+
+# 6. --exclude-compressed: zstd's extension table, case-sensitive; .zstd and .tar
+# are NOT in it (MEASURED against zstd 1.5.7: it compresses f.zstd, f.tar, f.JPG).
+mkdir -p "$zd"; for e in zst jpg JPG zstd tar txt; do echo q > "$zd/f.$e"; done
+run_test "$GZSTD" -q --cpu-only -r --exclude-compressed "$zd"
+zd_got=$(zd_files "$zd")
+if [[ $LAST_RC -eq 0 && "$zd_got" == "./f.JPG ./f.JPG.zst ./f.jpg ./f.tar ./f.tar.zst ./f.txt ./f.txt.zst ./f.zst ./f.zstd ./f.zstd.zst " ]]; then
+  pass "--exclude-compressed skips zstd's compressed extensions (case matters)"
+else
+  fail "--exclude-compressed skips zstd's compressed extensions (case matters)" "rc=$LAST_RC files: $zd_got"
+fi
+rm -rf "$zd"
+
+# 7. With -r, several named inputs and one existing output: that input is
+# skipped and the others still run.  Without -r the legacy path stays fail-fast.
+zd_tree "$zd"; "$GZSTD" -q --cpu-only -k "$zd/a.txt"
+run_test "$GZSTD" --cpu-only "$zd/a.txt" "$zd/sub/b.txt" 2>"$TMPDIR/zd.err"
+if [[ $LAST_RC -eq 3 && -f "$zd/sub/b.txt.zst" ]] && grep -q "output exists" "$TMPDIR/zd.err"; then
+  pass "several inputs: one with an existing output is skipped, the rest run (exit 3)"
+else
+  fail "several inputs: one with an existing output is skipped, the rest run (exit 3)" "rc=$LAST_RC"
+fi
+rm -rf "$zd"
+
+# 8. -r -c concatenates in directory order (zstd's: readdir, depth first) -- the
+# order zstd itself would use on the same filesystem.  The expected order comes
+# from os.scandir, which yields readdir order (find(1) may not: bfs is breadth-first).
+zd_tree "$zd"; mkdir -p "$zd/sub/deep"; echo deep > "$zd/sub/deep/d.txt"
+"$GZSTD" -q --cpu-only -r -c "$zd" 2>/dev/null | "$GZSTD" -q -d -c > "$TMPDIR/zd.cat" 2>/dev/null
+if python3 - "$zd" "$TMPDIR/zd.cat" <<'ZDPY'
+import os, sys
+order = []
+def walk(d):
+    for e in os.scandir(d):
+        if e.is_symlink(): continue
+        if e.is_dir(): walk(e.path)
+        elif e.is_file(): order.append(e.path)
+walk(sys.argv[1])
+sys.exit(0 if b"".join(open(p, "rb").read() for p in order) == open(sys.argv[2], "rb").read() else 1)
+ZDPY
+then
+  pass "-r -c concatenates in directory order"
+else
+  fail "-r -c concatenates in directory order"
+fi
+rm -rf "$zd" "$TMPDIR/zd.cat" "$TMPDIR/zd.err" "$TMPDIR/zd.err2" "$TMPDIR/zd.out" "$TMPDIR/zd.rc"
+fi  # $EXTENSIVE (zstd directories: edge cases)
 
 # ============================================================
 if $EXTENSIVE; then
@@ -11475,14 +12124,15 @@ fi
 
 # --- --memlimit applied (re-verifies the v0.12.30 fix) ---
 # Already tested in the zstd-compat section, but assert it appears in -v output too.
-out=$("$GZSTD" -d --cpu-only --overwrite -M 1024 -v "$PHV_ZST" -o "$PHV_OUT" 2>&1 \
+out=$("$GZSTD" -d --cpu-only --overwrite -M 1024M -v "$PHV_ZST" -o "$PHV_OUT" 2>&1 \
       | sed 's/\x1b\[[0-9;]*m//g')
-# -M 1024 with default 16 MiB chunks → ram cap kicks in at 1024/16=64 frames.
+# -M 1024M with default 16 MiB chunks → ram cap kicks in at 1024/16=64 frames.
+# (1024M: a bare -M number is bytes since v0.18.8.)
 # Just sanity that decompress completes successfully.
 if cmp -s "$PHV" "$PHV_OUT"; then
-  pass "-M 1024 round-trip"
+  pass "-M 1024M round-trip"
 else
-  fail "-M 1024 round-trip" "output mismatch"
+  fail "-M 1024M round-trip" "output mismatch"
 fi
 
 # --- --throttle-frames=N visible at -v ---

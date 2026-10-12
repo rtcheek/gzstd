@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.7";
+static constexpr const char * GZSTD_VERSION = "0.18.8";
 //
 // Architecture overview:
 //
@@ -95,6 +95,7 @@ static constexpr const char * GZSTD_VERSION = "0.18.7";
 #include <sys/stat.h>
 #ifndef _WIN32
 #include <dirent.h>        // opendir/readdir — tar-mode directory walk
+#include <sys/vfs.h>       // statfs — distinguish procfs magic links from path symlinks
 #include <fnmatch.h>       // --exclude glob matching (GNU tar semantics)
 #include <grp.h>           // getgrgid_r — gname for tar headers
 #include <pwd.h>           // getpwuid_r — uname for tar headers
@@ -766,9 +767,6 @@ static GpuMonitor & g_gpu_monitor = *new GpuMonitor;
 ======================================================================*/
 #include <dlfcn.h>
 #include <cstddef>
-#ifndef _WIN32
-#include <sys/vfs.h>
-#endif
 
 typedef struct { int err; int cu_err; } GzCUfileError_t;
 typedef void * GzCUfileHandle_t;
@@ -2719,11 +2717,9 @@ struct Options {
   //                     >0 = explicit cap.  v0.12.48+.
   int throttle_factor = 0;
   int throttle_frames = -1;
-  // Memory usage limit in MiB (zstd-compat `-M#` / `--memlimit` / `--memory`).
-  // Decompress: passed to ZSTD_d_windowLogMax — frames requiring a larger
-  // window are rejected.  Compress: caps the in-flight RAM budget in
-  // compute_throttle_budget.  0 = unlimited (zstd's default).
-  size_t mem_limit_mib = 0;
+  // -M / --memlimit / --memory, in BYTES (v0.18.8; it was MiB).  A bare number is
+  // bytes, as in zstd; K/M/G[B|iB] suffixes are powers of 1024, as in zstd.
+  uint64_t mem_limit_bytes = 0;
   // zstd-compat `-D FILE`: the dictionary to compress or decode with.  main()
   // loads it once (load_dictionaries); every user-data coder references it
   // through apply_decode_options / apply_compress_dict.
@@ -2747,7 +2743,36 @@ struct Options {
   unsigned train_maxdict = 110 * 1024;      // --maxdict=#, zstd's default (112640)
   unsigned train_dict_id = 0;               // --dictID=#; 0 = derived from the content
   size_t   train_block_size = 0;            // -B#: split samples into #-byte blocks
-  bool     recursive = false;               // -r: expand directories (training only)
+  bool     recursive = false;               // -r: expand directories (zstd's walk; v0.18.8 beyond --train)
+  // v0.18.8, zstd's output-directory options.  Mirror wins when both are given,
+  // as in zstd; -c and -o win over either.  Mapped per input by gz_map_output_dir.
+  std::string out_dir_flat;                 // --output-dir-flat DIR
+  std::string out_dir_mirror;               // --output-dir-mirror DIR
+  bool     exclude_compressed = false;      // --exclude-compressed (zstd's extension table)
+  // --long[=N] (v0.18.8; was warned about and ignored): compress -- long-distance
+  // matching with a 2^N window, on the CPU; decompress/test -- the window limit is
+  // 2^N unless -M names one.  zstd's meaning both ways.  0 = not given.
+  int      long_wlog = 0;
+  // --no-check (v0.18.8; was a SILENT no-op, the worst class): compress -- the
+  // CPU's frames carry no content checksum; decompress/test -- no checksum is
+  // checked.  zstd's meaning; --check (the default) turns it back on, last wins.
+  bool     no_check = false;
+  // --rsyncable (v0.18.8): zstd's rsync-friendly mode, which zstd implements in
+  // its multithreaded single-frame compressor -- gzstd's --sliding-window, where it
+  // is real.  gzstd's own frames are cut at fixed offsets, so elsewhere it warns.
+  bool     rsyncable = false;
+  // --zstd=k=v,... (v0.18.8; was refused as an unknown option): zstd's advanced
+  // compression parameters, each overriding the level's, on the CPU.  0 = unset,
+  // as in zstd.  Order: windowLog chainLog hashLog searchLog minMatch targetLength
+  // strategy overlapLog ldmHashLog ldmMinMatch ldmBucketSizeLog ldmHashRateLog.
+  int      zparams[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  bool     zparams_set = false;
+  // Inputs dropped before the per-file loop (a directory without -r, an unknown
+  // suffix under -r -d, an existing output in a multi-file run...): each printed
+  // its own line, and the run's exit code is at least this.  zstd skips such an
+  // input and carries on; the loop itself stays fail-fast.
+  int      deferred_exit = 0;
+  std::vector<std::string> input_outputs;   // per-input output names, when an output dir maps them
 #ifdef HAVE_NVCOMP
   size_t gpu_batch_cap = DEFAULT_GPU_BATCH_CAP;
   // The batch cap as parse_args resolved it, snapshotted before --adapt seeds
@@ -2758,6 +2783,10 @@ struct Options {
   // snapshotted (gate falls back to gpu_batch_cap).
   size_t gpu_batch_cap_gate = 0;
   bool gpu_batch_user_set = false;
+  // Internal, not a flag (v0.18.8): the frames this compress will produce when
+  // the input size is known (0 = unknown, e.g. a pipe).  Set on the workers'
+  // copy only; caps the batch a GPU pre-allocates for (see gpu_worker).
+  uint64_t input_frames_hint = 0;
   double gpu_mem_fraction = DEFAULT_GPU_MEM_FRACTION;
   size_t gpu_streams = 0;            // 0=auto (1 for compress, 2 for test/verify)
   int gpu_devices = 0;            // 0=auto (all GPUs, compress and decompress)
@@ -2786,6 +2815,7 @@ struct Options {
   bool tar_O = false;             // tar's own spelling, -O, appeared (only valid with -d --tar)
   bool tar_to_stdout = false;     // -d --tar with -c/-O: member CONTENTS go to stdout (tar -xO)
   bool output_named = false;      // the last -o named a real path
+  bool stdout_last = false;       // -c came after the last -o (v0.18.8: --train lets the later win)
   bool output_dash  = false;      // the last -o was "-" (same destination as -c)
   bool cold_read = false;         // --cold: posix_fadvise(DONTNEED) on input before read (benchmarking only)
   bool watchdog = false;          // --watchdog: arm the GPU deadlock watchdog (diagnostic; dumps JSON + aborts on a stall)
@@ -3935,6 +3965,9 @@ static void print_help()
 "Output:\n"
 "  -c                  write to stdout\n"
 "  -o, --output FILE   explicit output path\n"
+"  -r                  every file under each directory named (zstd's -r)\n"
+"  --output-dir-flat DIR / --output-dir-mirror DIR\n"
+"                      outputs into DIR, flat or at their inputs' paths\n"
 "  -f                  overwrite existing file (atomic: .tmp + rename)\n"
 "  --overwrite         remove the old output FIRST, then write (no temp copy;\n"
 "                      faster + no double space on ext4; NOT atomic — a failed\n"
@@ -4216,6 +4249,8 @@ static void print_help_long()
 "     On ext4 with large outputs the\n"
 "     rename can stall while the journal flushes dirty pages; use\n"
 "     --overwrite if that cost is unacceptable.\n"
+"     Under -r, -f also makes the directory walk follow symbolic links,\n"
+"     as zstd's does (see DIRECTORIES under COMPATIBILITY OPTIONS).\n"
 "\n"
 "  --overwrite\n"
 "     UNLINK-FIRST.  The existing output is removed BEFORE the new one is\n"
@@ -5184,10 +5219,10 @@ static void print_help_long()
 "     reason.  Default is auto.\n"
 "\n"
 "  -M N, --memlimit=N, --memory=N    [all modes]\n"
-"     Memory usage limit.  A bare N is MiB; a size with a unit is read\n"
-"     as zstd reads it (512MB, 2G, 64MiB; K, M and G are powers of 1024)\n"
-"     and rounded up to a whole MiB.  NOTE: zstd reads a BARE number as\n"
-"     bytes; here it is MiB.\n"
+"     Memory usage limit, read as zstd reads it: a BARE N is BYTES, and a\n"
+"     size with a unit is a power of 1024 (512MB, 2G, 64MiB, 512K).  So\n"
+"     -M512 is 512 bytes and -M512M is 512 MiB.  Until v0.18.8 a bare N\n"
+"     was MiB here; a bare value under 1 MiB now prints a note saying so.\n"
 "     On DECOMPRESSION (-d, -t, and -d/-t --tar) it is the largest window\n"
 "     a frame may need, exactly as in zstd: a frame whose header declares\n"
 "     a larger window is refused before it is decoded, with exit 1 and a\n"
@@ -5196,12 +5231,15 @@ static void print_help_long()
 "         8388608 bytes (8 MiB), and the limit ... is 4 MiB.\n"
 "     The window is a property of how the data was compressed (level 3\n"
 "     uses 2 MiB, level 19 uses 8 MiB, zstd --long=27 up to 128 MiB),\n"
-"     not of the file's size.  Without -M there is no limit (zstd's own\n"
-"     default is 128 MiB).  Before v0.17.89 the limit was set but never\n"
+"     not of the file's size.  Without -M (or --long=N) a frame decoded\n"
+"     in one piece has no limit, and a frame too large to decode in one\n"
+"     piece -- a single-frame zstd archive -- is held to zstd's own\n"
+"     default, 128 MiB (this said \"no limit\" until v0.18.8; it never was\n"
+"     for those).  Before v0.17.89 the limit was set but never\n"
 "     applied to frames decoded in one piece, which is nearly all of them.\n"
 "     On COMPRESSION it is NOT a hard process-memory limit: it constrains\n"
 "     only the AUTOMATIC frame-throttle calculation.  Effective in-flight\n"
-"     memory can still exceed N MiB, because the 32-frame safety floor and\n"
+"     memory can still exceed the limit, because the 32-frame safety floor and\n"
 "     the GPU batch floor are applied afterwards, and an explicit\n"
 "     --throttle-frames bypasses the memory calculation entirely.\n"
 "     Useful on shared machines where the default `min(pipeline, RAM/2)`\n"
@@ -5245,11 +5283,11 @@ static void print_help_long()
 "       -r            train on every file under a directory (symbolic links\n"
 "                     are skipped); without -r a directory is refused\n"
 "       -T#           search threads (default: zstd's, 1 to 4 by cores)\n"
-"       -M N          load at most N MiB of samples (gzstd's -M is in MiB\n"
-"                     everywhere; zstd's --memory counts bytes)\n"
+"       -M N          load at most N bytes of samples (a bare N is bytes,\n"
+"                     -M64M is 64 MiB; zstd's --memory, byte for byte)\n"
 "     Each sample is capped at 128 KiB and the set at 2 GiB, as in zstd;\n"
-"     fewer than 5 samples is refused (exit 2).  -r and -B# have no other\n"
-"     use in gzstd, and warn outside --train.\n"
+"     fewer than 5 samples is refused (exit 2).  -B# has no other use in\n"
+"     gzstd, and warns outside --train.\n"
 "\n"
 #ifdef HAVE_NVCOMP
 "============================================================\n"
@@ -5492,7 +5530,81 @@ static void print_help_long()
 "     -19f, -T4q, -dvv, -dD FILE, -fo FILE (letters d t k f c z l r q v,\n"
 "     a level, T#, and D or o last).\n"
 "\n"
+"  DIRECTORIES (v0.18.8; all four used to be accepted and ignored):\n"
+"     -r / --recursive  compresses, decompresses, tests or lists every\n"
+"                  file under each directory named, in zstd's order\n"
+"                  (directory order, depth first).  A symbolic link is\n"
+"                  skipped with a warning, unless -f is given (as in\n"
+"                  zstd, -f then follows it).  -d decodes only files\n"
+"                  named .zst, .tzst or .zstd; -d, -t and -l skip a\n"
+"                  file that does not start with a zstd frame.  Two\n"
+"                  departures from zstd: a FIFO, socket or device in the\n"
+"                  tree is skipped (zstd opens a FIFO and waits on it),\n"
+"                  and a link back to an enclosing directory is refused.\n"
+"     A directory named WITHOUT -r is skipped: \"DIR is a directory --\n"
+"                  ignored\", as zstd says it.\n"
+"     --output-dir-flat DIR   writes every output into DIR (which must\n"
+"                  exist).  Two inputs with the same name: the later one\n"
+"                  is skipped, or with -f the last one wins -- refused\n"
+"                  outright with --rm, which would remove both inputs.\n"
+"     --output-dir-mirror DIR writes each output under DIR at its input's\n"
+"                  own path, creating directories; a path with \"..\" is\n"
+"                  refused, an absolute one is mirrored in full.  Mirror\n"
+"                  wins over flat; -c and -o win over both.\n"
+"     --exclude-compressed  skips files whose name ends in one of zstd's\n"
+"                  compressed extensions (.zst, .gz, .xz, .zip, .jpg,\n"
+"                  .mp4 and about a hundred more; case matters).\n"
+"     With several inputs, one whose output already exists (no -f) is\n"
+"     skipped and the rest are still processed, as in zstd; the exit code\n"
+"     is then 3 (zstd says 1).  Skipped inputs are reported one per line.\n"
+"\n"
+"  --long[=N] (v0.18.8; was accepted and ignored), N = 10..31, default 27:\n"
+"     compress: long-distance matching with a 2^N-byte window, as zstd's.\n"
+"                  Implies --cpu-only (nvCOMP has none; --gpu-only and the\n"
+"                  other GPU backends are refused), and frames grow to the\n"
+"                  window unless --chunk-size is given -- as --ultra's do --\n"
+"                  so a match can reach as far back as in zstd; fewer, larger\n"
+"                  frames mean less parallelism on small inputs.\n"
+"                  --sliding-window --long=N is byte-identical to zstd's.\n"
+"                  As with zstd's own output, a window past 128 MiB needs\n"
+"                  `zstd -d --long=N` to decode.\n"
+"     decompress / test: a frame may need a window of at most 2^N bytes,\n"
+"                  as zstd reads it; -M wins when both are given.  Without\n"
+"                  either, a frame too large to decode in one shot is held to\n"
+"                  zstd's 128 MiB default, and the refusal names the --long=N\n"
+"                  (or -M) that decodes it.\n"
+"\n"
+"  --zstd=k=v[,k=v...] (v0.18.8; it was refused as unknown): zstd's\n"
+"     advanced compression parameters, each overriding the level's:\n"
+"     windowLog/wlog, chainLog/clog, hashLog/hlog, searchLog/slog,\n"
+"     minMatch/mml, targetLength/tlen, strategy/strat, overlapLog/ovlog,\n"
+"     ldmHashLog/lhlog, ldmMinMatch/lmml, ldmBucketSizeLog/lblog,\n"
+"     ldmHashRateLog/lhrlog; 0 leaves one at the level's value.  Its\n"
+"     windowLog beats --long's, and grows the frames as --long does.\n"
+"     Implies --cpu-only (nvCOMP takes none of them); --sliding-window\n"
+"     --zstd=... is byte-identical to zstd's.  A bad key or form, or a\n"
+"     value outside the linked zstd's range, is refused before any work.\n"
+"\n"
+"  --no-check (v0.18.8; until then it was ignored WITHOUT a word):\n"
+"     decompress / test: no checksum is checked -- not the frames' own,\n"
+"                  not a seek table's, not on a GPU -- as `zstd -d\n"
+"                  --no-check`: a damaged frame that still decodes is\n"
+"                  written at exit 0.  What it buys is the hashing: MEASURED,\n"
+"                  a --gpu-only decode of 4 GiB on an H100 took 2.2 s\n"
+"                  instead of 3.3; CPU and hybrid decodes barely change.\n"
+"     compress:    frames compressed on the CPU carry no checksum;\n"
+"                  --sliding-window --no-check is byte-identical to zstd.\n"
+"                  PARTIAL: a frame compressed on a GPU keeps the checksum\n"
+"                  gzstd adds to nvCOMP's output (4 bytes a frame, hashed on\n"
+"                  otherwise idle cores).  Use --cpu-only for none at all.\n"
+"     --verify cannot be combined with it: the round trip is judged by\n"
+"     the checksums it leaves out.\n"
+"\n"
 "  PARTIALLY MAPPED:\n"
+"     --rsyncable  real with --sliding-window (byte-identical to zstd's,\n"
+"                  which lives in zstd's worker threads); otherwise warned\n"
+"                  about and ignored: gzstd's independent frames start at\n"
+"                  fixed offsets, so one inserted byte moves every later one.\n"
 "     --fast=N     selects level 1; N is ignored (N>1 warns).\n"
 "     --adapt=min,max  enables gzstd's pipeline governor; the level bounds\n"
 "                  are ignored (gzstd's --adapt is not zstd's --adapt).\n"
@@ -5500,23 +5612,19 @@ static void print_help_long()
 "     --format=posix|pax|gnu|oldgnu selects --tar SPARSE ENCODING only.\n"
 "\n"
 "  ACCEPTED AND SILENTLY IGNORED — no warning, no effect:\n"
-"     --[no-]asyncio, --[no-]check, --[no-]compress-literals,\n"
+"     --[no-]asyncio, --check (the default), --[no-]compress-literals,\n"
 "     --[no-]row-match-finder, --[no-]mmap-dict, --stream-size=,\n"
 "     --size-hint=, --target-compressed-block-size=, --auto-threads=\n"
-"     NOTE: gzstd ALWAYS writes frame checksums, so --no-check has no\n"
-"     effect — it does not disable them.\n"
 "\n"
 "  --filelist FILE reads input paths from FILE, one per line, as zstd\n"
 "     does.  (Through v0.17.86 it was accepted and ignored, so the\n"
 "     listed files were never processed.)\n"
 "\n"
 "  ACCEPTED WITH A WARNING, THEN IGNORED:\n"
-"     --long, --rsyncable, --exclude-compressed,\n"
-"     --[no-]pass-through, --output-dir-flat,\n"
-"     --output-dir-mirror, --trace, -B, -b# / -e# / -i#, -S,\n"
-"     --priority=, --format=gzip|xz|lzma|lz4, --patch-from on\n"
-"     COMPRESSION (creating a patch; an ordinary frame is written), and\n"
-"     -r / --recursive and -B# outside --train\n"
+"     --rsyncable without --sliding-window, --[no-]pass-through, --trace, -B,\n"
+"     -b# / -e# / -i#, -S, --priority=, --format=gzip|xz|lzma|lz4,\n"
+"     --patch-from on COMPRESSION (creating a patch; an ordinary frame\n"
+"     is written), and -B# outside --train\n"
 "     -q / -qq suppress these warnings, regardless of argument order.\n"
 "\n"
 "For a condensed option list, run `gzstd -h`.\n";
@@ -5581,18 +5689,26 @@ static uint64_t parse_u64_value(const std::string & pref, const std::string & v)
   }
   return 0; // unreachable; die_usage exits
 }
-// -M / --memlimit / --memory.  A bare number is MiB, as it always was here.  A
-// number with a unit is zstd's spelling and means what it means to zstd (K, M,
-// G, each optionally followed by B or iB, all powers of 1024), rounded up to a
-// whole MiB: `--memory=512MB`, `-M2G`.  Until v0.17.89 a suffix was "invalid
-// value".  (zstd reads a BARE number as bytes; that one difference is kept,
-// and documented, because changing it would silently change every existing
-// gzstd command line that sets a limit.)
-static size_t parse_mem_mib(const std::string & pref, const std::string & v)
+// -M / --memlimit / --memory, in BYTES, as zstd reads them (v0.18.8, the
+// owner's ruling: a script moved from zstd to gzstd must keep its meaning).  A
+// bare number is bytes; K, M and G, each optionally followed by B or iB, are
+// powers of 1024 (zstd's own suffixes: `--memory=512MB`, `-M2G`).  Until v0.18.8
+// a BARE number was MiB here -- kept then so existing gzstd command lines would
+// not change -- and until v0.17.89 a suffix was "invalid value".  A bare value
+// under 1 MiB is almost surely an old MiB spelling: parse_args notes it.
+static bool g_mem_bare_small = false;   // a bare -M value under 1 MiB (see above)
+static std::string g_mem_bare_spelling;  // ...as typed, for the note
+static uint64_t parse_mem_bytes(const std::string & pref, const std::string & v)
 {
   size_t d = 0;
   while (d < v.size() && v[d] >= '0' && v[d] <= '9') ++d;
-  if (d == v.size()) return (size_t)parse_u64_value(pref, v);
+  if (d == v.size()) {
+    const uint64_t n = parse_u64_value(pref, v);
+    g_mem_bare_small = n > 0 && n < (1ull << 20);
+    g_mem_bare_spelling = pref + " " + v;
+    return n;
+  }
+  g_mem_bare_small = false;
   const uint64_t n = parse_u64_value(pref, v.substr(0, d));
   std::string u = v.substr(d);
   int shift = -1;
@@ -5604,11 +5720,9 @@ static size_t parse_mem_mib(const std::string & pref, const std::string & v)
   }
   if (shift < 0 || !(u.empty() || u == "B" || u == "iB" || u == "b" || u == "ib"))
     die_usage("invalid value for " + pref + ": " + v
-              + " (a number of MiB, or a size such as 512MB or 2G)");
+              + " (a number of bytes, or a size such as 512MB or 2G)");
   if (n > (UINT64_MAX >> shift)) die_usage("value out of range for " + pref + ": " + v);
-  const uint64_t bytes = n << shift;
-  const uint64_t mib = (bytes + (1ull << 20) - 1) >> 20;
-  return (size_t)std::max<uint64_t>(mib, n ? 1 : 0);
+  return n << shift;
 }
 static int parse_int_value(const std::string & pref, const std::string & v)
 {
@@ -10863,7 +10977,7 @@ static constexpr int THROTTLE_MIN_FRAMES = 32;
 static size_t compute_verify_queue_depth(size_t frame_bytes, const Options & opt)
 {
   size_t avail = get_available_ram_bytes();
-  if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;   // assume 8 GiB if unknown
+  if (avail == 0) avail = (size_t)std::min<uint64_t>(8ULL << 30, SIZE_MAX);
   frame_bytes = std::max<size_t>(frame_bytes, 1);
   // ~12% of available RAM.  The verify queue is post-write RAM held separately
   // from the frame throttle (the write releases the throttle permit; verify holds
@@ -10874,10 +10988,10 @@ static size_t compute_verify_queue_depth(size_t frame_bytes, const Options & opt
   // even when verify's aggregate rate nearly matched the disk.  A deeper queue
   // absorbs the bursts; it scales down on small-RAM boxes and honors --memlimit.
   size_t budget = avail / 8;                             // ~12% of available RAM
-  const size_t HARD_CAP = 32ULL * 1024 * 1024 * 1024;    // never hold > 32 GiB of frames
+  const size_t HARD_CAP = (size_t)std::min<uint64_t>(32ULL << 30, SIZE_MAX);
   if (budget > HARD_CAP) budget = HARD_CAP;
-  if (opt.mem_limit_mib > 0) {                            // give verify a slice of any --memlimit
-    size_t ml = (size_t(opt.mem_limit_mib) * ONE_MIB) / 4;
+  if (opt.mem_limit_bytes > 0) {                          // give verify a slice of any --memlimit
+    size_t ml = (size_t)std::min<uint64_t>(opt.mem_limit_bytes / 4, SIZE_MAX);
     if (ml < budget) budget = ml;
   }
   size_t depth = budget / frame_bytes;
@@ -10897,7 +11011,7 @@ static int compute_throttle_budget(size_t frame_bytes,
                                    const Options & opt)
 {
   size_t avail = get_available_ram_bytes();
-  if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;  // assume 8 GiB if unknown
+  if (avail == 0) avail = (size_t)std::min<uint64_t>(8ULL << 30, SIZE_MAX);
   frame_bytes = std::max<size_t>(frame_bytes, 1);
   pipeline_parallelism = std::max(pipeline_parallelism, 1);
   gpu_batch_floor = std::max(gpu_batch_floor, 0);
@@ -10906,11 +11020,11 @@ static int compute_throttle_budget(size_t frame_bytes,
   int pipeline_frames = pipeline_parallelism * slack;
   size_t ram_cap_frames = (avail / 2) / frame_bytes;
   // zstd-compat: --memlimit / --memory / -M# tightens the RAM cap on the
-  // compress side to `mem_limit_mib` MiB total in-flight (matches the
+  // compress side to `mem_limit_bytes` total in-flight (matches the
   // spirit of zstd's memory cap flag, which is decompress-only in stock
   // zstd but extends naturally to compress for gzstd).
-  if (opt.mem_limit_mib > 0) {
-    size_t mem_cap_bytes = size_t(opt.mem_limit_mib) * ONE_MIB;
+  if (opt.mem_limit_bytes > 0) {
+    size_t mem_cap_bytes = (size_t)std::min<uint64_t>(opt.mem_limit_bytes, SIZE_MAX);
     size_t mem_cap_frames = std::max<size_t>(1, mem_cap_bytes / frame_bytes);
     if (mem_cap_frames < ram_cap_frames) ram_cap_frames = mem_cap_frames;
   }
@@ -11052,10 +11166,35 @@ static int compute_throttle_budget(size_t frame_bytes,
  since zstd can't use a window larger than the input chunk.
 ======================================================================*/
 
+// --long[=N] on COMPRESSION (v0.18.8): long-distance matching with a 2^N window,
+// as zstd's.  Global for the reason the dictionary is: the per-frame compressor
+// takes no Options.  Set once in gzstd_main, for compress runs only; 0 = off.
+static int g_long_wlog = 0;
+// --zstd=... (v0.18.8): the parameters, in Options::zparams order, for the same
+// reason.  Its windowLog beats --long's, as in zstd.
+static int g_zparams[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static const ZSTD_cParameter g_zparam_ids[12] = {
+  ZSTD_c_windowLog, ZSTD_c_chainLog, ZSTD_c_hashLog, ZSTD_c_searchLog,
+  ZSTD_c_minMatch, ZSTD_c_targetLength, ZSTD_c_strategy, ZSTD_c_overlapLog,
+  ZSTD_c_ldmHashLog, ZSTD_c_ldmMinMatch, ZSTD_c_ldmBucketSizeLog, ZSTD_c_ldmHashRateLog };
+
+// --no-check (v0.18.8), set once in gzstd_main before any coder exists.
+// COMPRESS: frames the CPU writes carry no content checksum (the GPU's keep the
+// one gzstd stamps on nvCOMP output -- see the help).  DECOMPRESS/TEST: nothing
+// is checked -- not the frames' own checksums (libzstd's, via apply_decode_options),
+// not a seek table's (never loaded), not on a GPU (no frame is marked as having
+// one).  zstd's meaning both ways; what it buys is the hashing.
+static bool g_no_check = false;
+
+
 // Returns the required windowLog for the given compression level.
 // Returns 0 if no special window is needed (level < 20 or !ultra).
 static int ultra_window_log(int level, bool ultra)
 {
+  // --long=N names the window outright, overriding a level's (ultra or not), as
+  // zstd's --long does; the frame is then grown to hold it, below.
+  if (g_zparams[0]) return g_zparams[0];   // --zstd=windowLog: zstd's precedence
+  if (g_long_wlog) return g_long_wlog;
   if (!ultra || level < 20) return 0;
   // level 20 -> 25, level 21 -> 26, level 22 -> 27
   return level + 5;
@@ -11068,8 +11207,9 @@ static size_t ultra_min_chunk_mib(int level, bool ultra)
 {
   int wlog = ultra_window_log(level, ultra);
   if (wlog == 0) return 0;
-  // windowLog N means window = 2^N bytes; convert to MiB
-  return size_t(1) << (wlog - 20);  // 25->32, 26->64, 27->128
+  // windowLog N means window = 2^N bytes; convert to MiB.  --long can ask for a
+  // window under 1 MiB (N >= 10), which any frame already holds.
+  return wlog >= 20 ? size_t(1) << (wlog - 20) : 1;  // 25->32, 26->64, 27->128
 }
 
 // Apply ultra window log to a CCtx.  Call after setting compression level.
@@ -11086,6 +11226,28 @@ static int apply_ultra_cctx(ZSTD_CCtx * cctx, int level, bool ultra)
                 << "  falling back to default window\n";
       return 0;
     }
+  }
+  if (g_long_wlog) {
+    // zstd's --long is these two parameters.  libzstd shrinks the window to a
+    // frame whose size it knows, so a frame never declares more than it spans.
+    const size_t st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
+    if (ZSTD_isError(st))
+      die(std::string("--long: the linked zstd refused long-distance matching (")
+          + ZSTD_getErrorName(st) + ")");
+  }
+  // --zstd=: the rest of zstd's advanced parameters (windowLog is above).
+  // overlapLog belongs to zstd's worker threads; on a context without them it is
+  // skipped, as zstd's own CLI sets it only with workers.
+  for (int k = 1; k < 12; ++k) {
+    if (!g_zparams[k]) continue;
+    if (k == 7) {
+      int nbw = 0;
+      if (ZSTD_isError(ZSTD_CCtx_getParameter(cctx, ZSTD_c_nbWorkers, &nbw)) || nbw < 1) continue;
+    }
+    const size_t st = ZSTD_CCtx_setParameter(cctx, g_zparam_ids[k], g_zparams[k]);
+    if (ZSTD_isError(st))
+      die(std::string("--zstd=: the linked zstd refused a parameter (")
+          + ZSTD_getErrorName(st) + ")");
   }
   return wlog;
 }
@@ -11771,6 +11933,11 @@ static inline bool gz_debug_compress_launch_miss()
 // fail that allocation naturally, so without a REAL failure the pre-tag host can
 // never see the defect.  See ensure_buffers().
 static std::atomic<int> g_debug_real_bringup_oom{0};
+// GZSTD_DEBUG_REAL_REBUILD_OOM=N (v0.18.8): the next N decompress bringup REBUILDS
+// (the reserve's shrink step) really fail, as when another process takes the VRAM
+// that step just freed -- so the suite can watch the device halve again instead
+// of being written off.
+static std::atomic<int> g_debug_real_rebuild_oom{0};
 
 // Test-only fault injection (read once from $GZSTD_DEBUG_REAL_DECOMP_TEMP_OOM):
 // make the next N MID-RUN temp growths ask cudaMalloc for an impossible size, so
@@ -13049,6 +13216,10 @@ private:
       return;
     }
     attach_verify_dict(zds);   // -D compress: the frames carry the dictionary
+    // Our own frames: never refuse one for its window.  --long --chunk-size can
+    // write frames past libzstd's 128 MiB streaming default (v0.18.8), and the
+    // StreamVerifier already lifts it for the same reason.
+    ZSTD_DCtx_setParameter(zds, ZSTD_d_windowLogMax, 31);
     for (;;) {
       Item it;
       {
@@ -13768,10 +13939,11 @@ static void adapt_arm_throttle_grow(FrameThrottle & t, size_t frame_bytes,
   if (!opt.adapt || opt.throttle_frames > 0 || t.disabled()) return;
   if (g_tar_decomp_sink) return;
   size_t avail = get_available_ram_bytes();
-  if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;
-  size_t cap_bytes = std::min<size_t>(avail / 2, 32ULL * 1024 * 1024 * 1024);
-  if (opt.mem_limit_mib > 0)
-    cap_bytes = std::min(cap_bytes, (size_t)opt.mem_limit_mib * ONE_MIB);
+  if (avail == 0) avail = (size_t)std::min<uint64_t>(8ULL << 30, SIZE_MAX);
+  size_t cap_bytes = std::min<size_t>(avail / 2,
+      (size_t)std::min<uint64_t>(32ULL << 30, SIZE_MAX));
+  if (opt.mem_limit_bytes > 0)
+    cap_bytes = (size_t)std::min<uint64_t>(cap_bytes, opt.mem_limit_bytes);
   const int ceiling = (int)std::min<size_t>((size_t)INT_MAX,
       cap_bytes / std::max<size_t>(1, frame_bytes));
   t.arm_grow(ceiling, &opt);
@@ -14526,7 +14698,7 @@ static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, i
   // Per-frame content checksum (XXH64 in the frame footer): makes every frame
   // self-verifying so decompress/-t catches silent corruption / bit-rot.  ~4
   // bytes/frame; standard zstd, verified by any decoder.
-  ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_checksumFlag, 1);
+  ZSTD_CCtx_setParameter(tl_cctx, ZSTD_c_checksumFlag, g_no_check ? 0 : 1);   // --no-check
 
   // Ultra levels (20-22) need an explicit windowLog for the large window to take effect.
   // Without this, zstd silently clamps to its default window (~8 MiB), defeating ultra.
@@ -14863,11 +15035,12 @@ static int run_train(const Options & opt)
                           : opt.train_algo == Options::TrainAlgo::COVER  ? 9 : 1;
   const uint64_t max_mem = find_max_mem(total * mem_mult) / mem_mult;
   uint64_t loaded = std::min(std::min(max_mem, total), SAMPLES_MAX);
-  if (opt.mem_limit_mib) {
-    // gzstd's -M is in MiB everywhere, so here too (zstd's --memory counts bytes).
-    const uint64_t lim = (uint64_t)opt.mem_limit_mib << 20;
+  if (opt.mem_limit_bytes) {
+    // Bytes, as zstd's --memory counts them (v0.18.8; this was MiB), and zstd's
+    // message, which reports whole MB.
+    const uint64_t lim = opt.mem_limit_bytes;
     vlog(V_DEFAULT, opt, "!  Warning : setting manual memory limit for dictionary training data at "
-                         + std::to_string(opt.mem_limit_mib) + " MB \n");
+                         + std::to_string(lim >> 20) + " MB \n");
     loaded = std::min(loaded, lim);
   }
   if (one_too_large)
@@ -14914,7 +15087,9 @@ static int run_train(const Options & opt)
     std::fclose(f);
   }
   vlog(V_DEBUG, opt, "Loaded " + std::to_string(filled / 1024) + " KB total training data, "
-                     + std::to_string(nloaded) + " nb samples \n");
+                       + std::to_string(nloaded) + " nb samples \n");
+  if (opt.mem_limit_bytes && nloaded == 0)
+    die_usage("--train: memory limit cannot hold even one complete sample");
 
   // 4. Train, with zstd's parameters.  Threads only change the optimizer's
   // speed; zstd's default is MAX(1, MIN(4, cores/4)), and gzstd uses the same
@@ -15063,8 +15238,30 @@ static std::string decode_error_hint(size_t err, const void * frame, size_t len)
 // (gz_enforce_window_limit), and the streaming contexts get the EXACT limit
 // (ZSTD_DCtx_setMaxWindowSize) instead of the power of two below it; a refusal
 // from either is reported the same way, exit 1, with the size to ask for.
-// 0 = no limit, the default (zstd's own default is 128 MiB; gzstd has none).
+// 0 = no limit set by the user.  Then a frame decoded in one shot has none, and
+// a STREAMED frame (one too big to decode in one shot) gets libzstd's default,
+// 128 MiB, which is zstd's default too -- so `zstd --long=28` output needs
+// --long=28 (or -M256MB) here as it does in zstd.  gz_die_if_window_error says so.
 static std::atomic<uint64_t> g_mem_limit_bytes{0};
+// v0.18.8: N when --long=N set g_mem_limit_bytes (no -M), so the refusal names the
+// option the user actually gave.  0 = the limit came from -M.
+static int g_mem_limit_long = 0;
+
+// The smallest --long=N whose window holds `window` bytes (zstd's own hint).
+static int gz_long_for_window(uint64_t window)
+{
+  int wl = 10;
+  while (wl < 31 && ((uint64_t)1 << wl) < window) ++wl;
+  return wl;
+}
+
+// A byte count as a person reads it: "128 MiB" when whole, else exact bytes.
+// Since v0.18.8 -M can set a limit that is not a whole MiB.
+static std::string gz_mem_human(uint64_t b)
+{
+  return (b % ONE_MIB == 0) ? std::to_string(b / ONE_MIB) + " MiB"
+                            : std::to_string(b) + " bytes";
+}
 
 static void gz_die_window_too_large(uint64_t window)
 {
@@ -15074,8 +15271,16 @@ static void gz_die_window_too_large(uint64_t window)
   if (window)
     msg += ": its window is " + std::to_string(window) + " bytes ("
          + std::to_string(need_mib) + " MiB)";
-  msg += ", and the limit set with -M/--memory is " + std::to_string(lim / ONE_MIB) + " MiB.";
-  if (window) msg += "  Decode it with -M" + std::to_string(need_mib) + " or more, or without -M";
+  if (g_mem_limit_long) {
+    msg += ", and the limit set with --long=" + std::to_string(g_mem_limit_long)
+         + " is " + gz_mem_human(lim) + ".";
+    if (window) msg += "  Decode it with --long=" + std::to_string(gz_long_for_window(window))
+                     + " or -M" + std::to_string(need_mib) + "MB";
+  } else {
+    // The suggestion carries its unit: a bare -M number is BYTES (v0.18.8).
+    msg += ", and the limit set with -M/--memory is " + gz_mem_human(lim) + ".";
+    if (window) msg += "  Decode it with -M" + std::to_string(need_mib) + "MB or more, or without -M";
+  }
   die(msg, EXIT_ERROR);
 }
 
@@ -15091,27 +15296,54 @@ static inline void gz_enforce_window_limit(const void * frame, size_t n)
 }
 
 // A streaming decode refused a frame for its window: same message, same exit.
-static inline void gz_die_if_window_error(size_t zerr)
+// `frame`/`n`, when given, are the refused frame's first bytes, for its size.
+//
+// WITH NO LIMIT OF THE USER'S, the refusal is libzstd's 128 MiB default, and it
+// used to fall through to the generic decode error -- exit 4, "re-run with
+// --keep-going", which cannot help -- while --long=N, the option zstd names for
+// it, was accepted and ignored (v0.18.8: a `zstd --long=28` archive could not be
+// decoded without -M).  Now it says what zstd says, exit 1 as with -M.
+static inline void gz_die_if_window_error(size_t zerr, const void * frame = nullptr,
+                                          size_t n = 0)
 {
-  if (ZSTD_isError(zerr) && ZSTD_getErrorCode(zerr) == ZSTD_error_frameParameter_windowTooLarge
-      && g_mem_limit_bytes.load(std::memory_order_relaxed) != 0)
-    gz_die_window_too_large(0);
+  if (!ZSTD_isError(zerr) || ZSTD_getErrorCode(zerr) != ZSTD_error_frameParameter_windowTooLarge)
+    return;
+  uint64_t window = 0;
+  if (frame && n >= 5) {
+    ZSTD_frameHeader zfh;
+    if (ZSTD_getFrameHeader(&zfh, frame, n) == 0) window = zfh.windowSize;
+  }
+  if (g_mem_limit_bytes.load(std::memory_order_relaxed) != 0) gz_die_window_too_large(window);
+  std::string msg = "frame requires too much memory for decoding";
+  if (window)
+    msg += ": its window is " + std::to_string(window) + " bytes ("
+         + std::to_string((window + ONE_MIB - 1) / ONE_MIB) + " MiB), past the 128 MiB "
+           "default (zstd's too).  Decode it with --long="
+         + std::to_string(gz_long_for_window(window)) + " or -M"
+         + std::to_string((window + ONE_MIB - 1) / ONE_MIB) + "MB";
+  else
+    msg += ": its window is past the 128 MiB default (zstd's too).  Decode it with "
+           "--long=31, or -M with the window's size";
+  die(msg, EXIT_ERROR);
 }
 
 // Apply --memlimit to a decompression context via ZSTD_d_windowLogMax.
 // zstd's decompressor refuses to allocate window buffers larger than 2^wlog,
-// so a user who passes `-M 50` gets streams with >64 MiB windows rejected
-// (we use floor(log2(bytes)) — errs on the strict side of the user's cap).
-// No-op when mem_limit_mib == 0 (zstd's default is windowLogMax=27).
+// so `-M50MB` rejects streamed frames whose window exceeds 50 MiB.
+// No-op when no limit is set (zstd's default is windowLogMax=27).
 static void apply_mem_limit_to_dctx(ZSTD_DCtx * dctx, const Options & opt)
 {
-  if (!dctx || opt.mem_limit_mib == 0) return;
-  uint64_t bytes = uint64_t(opt.mem_limit_mib) * ONE_MIB;
+  // The run's resolved decode limit: -M, else --long=N's 2^N (v0.18.8), set in
+  // gzstd_main before any decoder exists.  0 for a run that does not decode the
+  // user's input (--calibrate) -- the same exemption gz_enforce_window_limit has.
+  const uint64_t bytes = g_mem_limit_bytes.load(std::memory_order_relaxed);
+  if (!dctx || bytes == 0) return;
   // The EXACT limit, as the zstd CLI sets it (v0.17.89).  This used to be
   // windowLogMax = floor(log2(bytes)), so -M100 meant 64 MiB to a streamed frame
   // and 100 MiB to nothing else; gz_enforce_window_limit compares exact sizes.
   const uint64_t zmax = (uint64_t)1 << 31;                 // zstd's largest window
-  size_t st = ZSTD_DCtx_setMaxWindowSize(dctx, (size_t)std::min<uint64_t>(std::max<uint64_t>(bytes, 1024), zmax));
+  size_t st = ZSTD_DCtx_setMaxWindowSize(dctx,
+      (size_t)std::min<uint64_t>(std::max<uint64_t>(bytes, 1024), zmax));
   if (ZSTD_isError(st) && opt.verbosity >= V_ERROR) {
     std::fprintf(stderr, "gzstd: warning: could not apply --memlimit (%s)\n",
                  ZSTD_getErrorName(st));
@@ -15132,14 +15364,22 @@ static void apply_decode_options(ZSTD_DCtx * dctx, const Options & opt)
 {
   if (!dctx) return;
   apply_mem_limit_to_dctx(dctx, opt);
+  // --no-check: libzstd skips the frames' own checksums, as `zstd -d --no-check`.
+  if (g_no_check) {
+    const size_t st = ZSTD_DCtx_setParameter(dctx, ZSTD_d_forceIgnoreChecksum, ZSTD_d_ignoreChecksum);
+    if (ZSTD_isError(st))
+      die(std::string("--no-check: the linked zstd cannot skip checksums (")
+          + ZSTD_getErrorName(st) + ")");
+  }
   // --patch-from: a patch frame's window spans the whole reference (zstd sizes
   // it to cover the larger of the reference and the new file), far past the
   // 128 MiB default.  zstd's own decoder raises its limit to exactly the
   // reference's size -- and then refuses its own patch when the window is a few
   // bytes larger (measured: "200000005 > 200000000 ... Use --long=28").  Allow
   // the format's maximum instead: memory is still only what the frame declares.
-  // An explicit -M wins.
-  if (g_dict_patch && opt.mem_limit_mib == 0) {
+  // An explicit -M or --long wins.  Both have already set the exact limit on
+  // this context; lifting windowLogMax here would undo it for streamed frames.
+  if (g_dict_patch && g_mem_limit_bytes.load(std::memory_order_relaxed) == 0) {
     const ZSTD_bounds b = ZSTD_dParam_getBounds(ZSTD_d_windowLogMax);
     if (!ZSTD_isError(b.error))
       ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, b.upperBound);
@@ -15285,6 +15525,10 @@ static std::vector<uint32_t> g_tbl_ck_val;
 // of the same table, and published as a global because the GPU worker sizes its
 // slabs from it and holds no descriptor of its own.
 static std::atomic<uint64_t> g_input_max_frame{0};
+// v0.18.8: the table's DATA frame count, published beside the maximum (0 = no
+// usable table).  It caps the decompress batch the device pre-allocates for: a
+// batch can never hold more frames than the archive has.
+static std::atomic<uint64_t> g_input_frames{0};
 static std::atomic<bool>     g_input_geom_known{false};
 
 #ifdef HAVE_NVCOMP
@@ -15764,7 +16008,7 @@ static void decompress_from_buffer(const std::vector<char> & input,
   size_t frame_at = 0;   // where the frame in progress starts (for the error hint)
   while (zin.pos < zin.size) {
     ret = ZSTD_decompressStream(dctx, &zout, &zin);
-    gz_die_if_window_error(ret);
+    gz_die_if_window_error(ret, input.data() + frame_at, input.size() - frame_at);
     if (ZSTD_isError(ret))
       die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
                + decode_error_hint(ret, input.data() + frame_at, input.size() - frame_at));
@@ -16167,7 +16411,10 @@ static void decompress_stream_from_file(FILE * in, FILE * out,
       // still be in the async batch, including when the window limit handler
       // exits before the ordinary decode-error branch below.
       if (ZSTD_isError(ret)) drain();
-      gz_die_if_window_error(ret);
+      // The refused frame's first bytes: where decode_error_hint below finds them.
+      gz_die_if_window_error(ret, head_n == 0 ? (const void *)(src + consumed_from)
+                                              : (const void *)head,
+                             head_n == 0 ? n - consumed_from : head_n);
       if (ZSTD_isError(ret)) {
         // The old message here told the user to "re-run with --keep-going" —
         // from a decoder that ignored --keep-going, so following that advice
@@ -18113,7 +18360,7 @@ static void cpu_decomp_worker(
         ZSTD_outBuffer zout { chunk->data(), chunk->size(), 0 };
         size_t zin_before = zin.pos;
         size_t ret = ZSTD_decompressStream(tl_dctx, &zout, &zin);
-        gz_die_if_window_error(ret);
+        gz_die_if_window_error(ret, t.ptr(), t.len());
         if (ZSTD_isError(ret))
           die_data(std::string("ZSTD decompress error: ") + ZSTD_getErrorName(ret)
                + decode_error_hint(ret, t.ptr(), t.len()));
@@ -20128,7 +20375,7 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   if (!cctx) die("failed to create ZSTD_CCtx");
   size_t st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level) error: ") + ZSTD_getErrorName(st));
-  ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);  // self-verifying frames (see compress worker)
+  ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, g_no_check ? 0 : 1);  // self-verifying frames (see compress worker); --no-check
 
   // Ultra levels need explicit windowLog for large windows to take effect
   {
@@ -20460,7 +20707,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   size_t st;
   st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, opt.level);
   if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setParameter(level): ") + ZSTD_getErrorName(st));
-  ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);  // self-verifying frames (see compress worker)
+  ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, g_no_check ? 0 : 1);  // self-verifying frames (see compress worker); --no-check
   if (sw_mt) {
     st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, (int)n_threads);
     if (ZSTD_isError(st)) {
@@ -20469,6 +20716,14 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
            + ZSTD_getErrorName(st) + "); --sliding-window compresses on one thread\n");
       sw_mt = false;
     }
+  }
+  // --rsyncable (v0.18.8), zstd's own: it lives in zstd's worker threads, so a
+  // library without them cannot do it -- said, not dropped in silence.
+  if (opt.rsyncable) {
+    st = sw_mt ? ZSTD_CCtx_setParameter(cctx, ZSTD_c_rsyncable, 1) : (size_t)-1;
+    if (!sw_mt || ZSTD_isError(st))
+      vlog(V_DEFAULT, opt, "warning: --rsyncable needs zstd's worker threads, which this "
+                           "run does not have; the frame is written without it\n");
   }
   if (total_in > 0) {
     st = ZSTD_CCtx_setPledgedSrcSize(cctx, total_in);
@@ -25320,7 +25575,7 @@ struct PoolGpuDecoder {
         // fault on an intact archive, simply decodes the frame correctly.
         // Frame_Header_Descriptor bit 2 = Content_Checksum_flag; the checksum is
         // the frame's last four bytes.
-        if (cszs[i] >= 9
+        if (!g_no_check && cszs[i] >= 9
             && (static_cast<unsigned char>(comps[i][4]) & 0x04)
             && gz_content_ck32(fb->data(), usz) != rd_le32(comps[i] + cszs[i] - 4)) {
           rescue[i] = 1;
@@ -29724,6 +29979,7 @@ static void table_checksums_clear()
   g_tbl_ck_off.clear();
   g_tbl_ck_val.clear();
   g_input_max_frame.store(0, std::memory_order_relaxed);
+  g_input_frames.store(0, std::memory_order_relaxed);
   g_input_geom_known.store(false, std::memory_order_relaxed);
 }
 
@@ -29733,7 +29989,8 @@ static void table_checksums_load(FILE * in)
   if (!in) return;
   // A pipe's table can only be seen at its end: watch the frames go by
   // instead (GzLateCk).  The parse below then fails on the seek, as before.
-  if (std::ftell(in) < 0) gz_late_reset(true);
+  // Not under --no-check: nothing would be compared at the end.
+  if (std::ftell(in) < 0 && !g_no_check) gz_late_reset(true);
   tarx::TarSeekTable st;
   if (!tarx::parse_foreign_seek_table(in, st) || !st.valid()) return;
   // Publish the real maximum frame size BEFORE the checksum early-outs: a table
@@ -29747,8 +30004,11 @@ static void table_checksums_load(FILE * in)
       if (dz > mx) mx = dz;
     }
     g_input_max_frame.store(mx, std::memory_order_relaxed);
+    g_input_frames.store(st.u_off.empty() ? 0 : (uint64_t)(st.u_off.size() - 1),
+                         std::memory_order_relaxed);
     g_input_geom_known.store(true, std::memory_order_relaxed);
   }
+  if (g_no_check) return;                           // --no-check: geometry only
   if (st.checksums.empty()) return;                 // table carries no checksums
   // u_off holds nframes+1 prefix sums and checksums holds nframes entries; if
   // they disagree the table is not the shape this map assumes, so take nothing
@@ -30650,10 +30910,10 @@ static size_t tune_prior_budget(size_t frame_bytes, size_t gpu_streams,
   const size_t want = tune_prior_alloc_max(tune_frame_class(frame_bytes));
   if (!want) return 0;
   size_t avail = get_available_ram_bytes();
-  if (avail == 0) avail = 8ULL * 1024 * 1024 * 1024;   // compute_throttle_budget's guess
+  if (avail == 0) avail = (size_t)std::min<uint64_t>(8ULL << 30, SIZE_MAX);
   size_t cap_bytes = avail / 2;
-  if (opt.mem_limit_mib > 0)
-    cap_bytes = std::min(cap_bytes, size_t(opt.mem_limit_mib) * ONE_MIB);
+  if (opt.mem_limit_bytes > 0)
+    cap_bytes = (size_t)std::min<uint64_t>(cap_bytes, opt.mem_limit_bytes);
   const size_t per_stream = cap_bytes / std::max<size_t>(1, frame_bytes)
                           / std::max<size_t>(1, gpu_streams);
   return std::min(want, std::max(AUTO_TUNE_BATCH_CEILING, per_stream));
@@ -33095,6 +33355,15 @@ static void gpu_worker(
     if (opt.gds_only && !opt.gpu_batch_user_set)
       per_stream_cap = std::min<size_t>(per_stream_cap, 64);
     per_stream_cap = device_tune_limit_alloc(tune, per_stream_cap, opt, device_id);
+    // NO BATCH LARGER THAN THE INPUT (v0.18.8, ROADMAP 9) -- decompress's cap,
+    // mirrored.  A 600 MiB input (38 frames) sized slabs and an nvCOMP workspace
+    // for 256 (est. 15.9 GiB on an H100), and 8 jobs started together on one card
+    // found too little left for a single stream.  A batch never holds more frames
+    // than the input has; an underestimate (a --tar whose layout grows) only makes
+    // batches smaller.  --gpu-batch is the user's.
+    if (!opt.gpu_batch_user_set && opt.input_frames_hint > 0
+        && opt.input_frames_hint < per_stream_cap)
+      per_stream_cap = (size_t)opt.input_frames_hint;
     double per_stream_frac = std::max(0.05, std::min(0.95, opt.gpu_mem_fraction / double(stream_count)));
 
     ctxs_ptr = std::make_shared<std::vector<StreamCtx>>(stream_count);
@@ -35541,6 +35810,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   std::vector<std::thread> workers;
   Options opt_for_workers = opt;
   opt_for_workers.chunk_mib = chosen_mib;
+  opt_for_workers.input_frames_hint = total_in ? (total_in + host_chunk - 1) / host_chunk : 0;
   std::vector<std::string> fatal_msgs;
 
   // Batch auto-tuning: one tuner per device (see DeviceTune), built with
@@ -35809,10 +36079,10 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     stage_pool = std::make_unique<GdsStagePool>();
     size_t stage_bufs = std::max<size_t>(16, std::min(compress_tune_start, HARD_BATCH_CAP));
     size_t avail = get_available_ram_bytes();
-    if (avail == 0) avail = 8ULL << 30;   // compute_throttle_budget's guess
+    if (avail == 0) avail = (size_t)std::min<uint64_t>(8ULL << 30, SIZE_MAX);
     size_t cap_bytes = avail / 8;
-    if (opt.mem_limit_mib > 0)
-      cap_bytes = std::min(cap_bytes, size_t(opt.mem_limit_mib) * ONE_MIB / 2);
+    if (opt.mem_limit_bytes > 0)
+      cap_bytes = (size_t)std::min<uint64_t>(cap_bytes, opt.mem_limit_bytes / 2);
     stage_bufs = std::min(stage_bufs, std::max<size_t>(1, cap_bytes / gpu_chunk));
     const uint64_t frames_in = total_in ? (total_in + gpu_chunk - 1) / gpu_chunk : 1;
     stage_bufs = std::min<size_t>(stage_bufs, std::max<uint64_t>(1, frames_in));
@@ -37514,6 +37784,20 @@ static void gpu_decomp_worker(
                "anyway -- the budget is a target, and one frame is the floor\n");
     }
     per_stream_cap = device_tune_limit_alloc(tune, per_stream_cap, opt, device_id);
+    // NO BATCH LARGER THAN THE ARCHIVE (v0.18.8, ROADMAP 9).  The tuner's 256-frame
+    // headroom was allocated whatever the archive held: a 16-frame archive took
+    // slabs and an nvCOMP workspace for 256 frames on every card, and six such
+    // decompressions started together on one card lost the race for that VRAM --
+    // MEASURED, 1-2 of 6 jobs per round did no GPU batch at all ("lost VRAM while
+    // reducing batch to 128  skipping device").  A batch can never hold more
+    // frames than an archive described by a truthful table has.  The table is
+    // a claim, not evidence: an understated count can cost batch throughput,
+    // but cannot drop a frame because per-batch ensure_buffers() can grow.
+    // --gpu-batch is the user's.
+    if (!opt.gpu_batch_user_set && g_input_geom_known.load(std::memory_order_relaxed)) {
+      const uint64_t nf = g_input_frames.load(std::memory_order_relaxed);
+      if (nf > 0 && nf < per_stream_cap) per_stream_cap = (size_t)nf;
+    }
 
     // We need to allocate per-stream buffers.  Unlike compression, we need
     // to handle variable decompressed sizes.  We pre-allocate from the ARCHIVE'S
@@ -37811,42 +38095,63 @@ static void gpu_decomp_worker(
                + std::to_string(per_stream_cap) + " (non-fatal)\n");
           break;
         }
-        const size_t reduced = std::max<size_t>(1, per_stream_cap / 2);
+        size_t reduced = std::max<size_t>(1, per_stream_cap / 2);
         // GIVE THE BUFFERS BACK BEFORE ASKING FOR LESS.  ensure_buffers()
         // early-returns true when the current allocation is already big enough,
         // so a shrink request against live buffers is a no-op that frees
         // nothing; free_device() zeroes alloc_batch, which is what makes the
         // next call actually reallocate at the smaller size.
+        //
+        // A LOST RACE HALVES AGAIN (v0.18.8, ROADMAP 9).  Between the free and the
+        // rebuild another process on the same card can take what was freed; this
+        // used to give the whole device up on the first such loss, although half
+        // the batch might well have fitted.  Free what the failed attempt took and
+        // ask for half, down to one frame, before writing the device off -- the
+        // same descent the initial allocation makes.
         bool restored = true;
-        for (auto & C : ctxs) {
-          C.free_device();
-          // THE SAME TWO EXPRESSIONS THE INITIAL PATH CORRECTED, which this
-          // rebuild kept in their superseded form: a compressed slot is
-          // compressBound(chunk), not chunk (a stored frame is larger than its
-          // input), and the workspace comes from nvCOMP, not `reduced * 1024`
-          // -- the guess that was measured ~50,000x low.  Rebuilding at the old
-          // sizes handed the next batch an allocation 16 MiB short on the
-          // compressed slab and 13.1 GB short on temp, which it then had to
-          // discard and re-register: ~1.24 s of BAR1 registration thrown away.
-          // BOTH shared expressions, not one: the compressed term was unified a
-          // round ago and the decompressed term was left raw here, so a frame of
-          // 1,000,003 bytes rebuilt a 1,000,003-byte stride against a consumer
-          // that strides 1,003,520 -- 3,517 bytes a slot, and one more full
-          // free/alloc/re-register cycle on the first batch.
-          const size_t reb_decomp =
-              decomp_out_slot(host_chunk_bytes,
-                              g_gds_out_active.load(std::memory_order_relaxed));
-          if (!C.ensure_buffers(reduced, decomp_comp_slot(opt, C.gds_read),
-                                reb_decomp,
-                                gds_decomp_temp_for(reduced, reb_decomp)))
-            { restored = false; break; }
+        for (;;) {
+          restored = true;
+          for (auto & C : ctxs) {
+            C.free_device();
+            // THE SAME TWO EXPRESSIONS THE INITIAL PATH CORRECTED, which this
+            // rebuild kept in their superseded form: a compressed slot is
+            // compressBound(chunk), not chunk (a stored frame is larger than its
+            // input), and the workspace comes from nvCOMP, not `reduced * 1024`
+            // -- the guess that was measured ~50,000x low.  Rebuilding at the old
+            // sizes handed the next batch an allocation 16 MiB short on the
+            // compressed slab and 13.1 GB short on temp, which it then had to
+            // discard and re-register: ~1.24 s of BAR1 registration thrown away.
+            // BOTH shared expressions, not one: the compressed term was unified a
+            // round ago and the decompressed term was left raw here, so a frame of
+            // 1,000,003 bytes rebuilt a 1,000,003-byte stride against a consumer
+            // that strides 1,003,520 -- 3,517 bytes a slot, and one more full
+            // free/alloc/re-register cycle on the first batch.
+            const size_t reb_decomp =
+                decomp_out_slot(host_chunk_bytes,
+                                g_gds_out_active.load(std::memory_order_relaxed));
+            if (!C.ensure_buffers(reduced, decomp_comp_slot(opt, C.gds_read),
+                                  reb_decomp,
+                                  gz_debug_count_down(g_debug_real_rebuild_oom)
+                                      ? GZ_DEBUG_IMPOSSIBLE_BYTES
+                                      : gds_decomp_temp_for(reduced, reb_decomp)))
+              { restored = false; break; }
+          }
+          if (restored || reduced <= 1) break;
+          for (auto & Cf : ctxs) Cf.free_device();   // what the failed attempt took
+          cudaGetLastError();   // handled (retry smaller) -- consume; see ensure_buffers()
+          vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
+               + "] lost VRAM while reducing batch to " + std::to_string(reduced)
+               + "; trying " + std::to_string(std::max<size_t>(1, reduced / 2)) + "\n");
+          reduced = std::max<size_t>(1, reduced / 2);
         }
         if (!restored) {
           // FREE WHAT THE PARTIAL REBUILD LEFT.  This loop frees and rebuilds one
           // stream at a time and breaks on the first failure, so on that exit the
           // streams before it hold their REDUCED allocations, the failing one
           // holds whatever it got before the failing call, and the streams after
-          // it still hold their ORIGINAL ones -- up to 4,270,256,128 bytes of
+          // it hold what they had when this attempt began: their ORIGINAL
+          // allocations when this was the first attempt (a later one starts from
+          // the retry's free_device(), so nothing) -- up to 4,270,256,128 bytes of
           // slabs at batch 127, plus temp and arrays, held until process teardown
           // on a card that has just refused an allocation.  DecompStreamCtx has
           // raw CUDA pointers and no destructor, so nothing else reclaims them.
@@ -38729,7 +39034,9 @@ static void gpu_decomp_worker(
             const unsigned char * fp = (const unsigned char *)C.batch[i].ptr();
             const size_t fl = C.batch[i].len();
             C.h_has_ck[i] = 0; C.h_expect_ck[i] = 0;
-            if (fp && fl >= 9 && (fp[4] & 0x04)) {
+            if (g_no_check) {
+              // --no-check: verify nothing on the device either.
+            } else if (fp && fl >= 9 && (fp[4] & 0x04)) {
               C.h_has_ck[i] = 1;
               C.h_expect_ck[i] = (unsigned int)fp[fl-4]
                                | ((unsigned int)fp[fl-3] << 8)
@@ -40050,7 +40357,9 @@ static size_t gds_staged_frames_to_queue(FILE * in, TaskQueue & queue, Meter * m
                "boundary, so the table does not account for every frame in the file");
       return GDS_VERIFY_DEMOTE;
     }
-    if (hdr[4] & 0x04) {
+    if (g_no_check) {
+      // --no-check: no expected checksum, so no trailer pread either.
+    } else if (hdr[4] & 0x04) {
       g_gds_meta_preads.fetch_add(1, std::memory_order_relaxed);
       if (::pread(fd, tr, sizeof tr, (off_t)(off + csz - 4)) != (ssize_t)sizeof tr)
         return GDS_VERIFY_DEMOTE;
@@ -41861,6 +42170,7 @@ static bool place_gpu_mask_guess(const Options & opt)
 
 static void apply_backend_defaults(Options & opt);
 static std::string derive_output(const std::string & input, Mode mode);
+static void gz_make_parent_dirs(const std::string & path);   // --output-dir-mirror (v0.18.8)
 
 #ifndef _WIN32
 // Reader-state diagnosis (per-thread), shared by the plain decompress loop and
@@ -43172,7 +43482,7 @@ static int run_calibrate(Options opt)
     // The corpus decoded here is calibration's own, not the user's input: -M is
     // a limit on what the USER asks to decode, and `--calibrate -M1` would
     // otherwise refuse its own 2 MiB-window frames (v0.17.89).
-    if (!compress_dir) po.mem_limit_mib = 0;
+    if (!compress_dir) po.mem_limit_bytes = 0;
     Meter m;
     const auto t0 = std::chrono::steady_clock::now();
 #ifdef HAVE_NVCOMP
@@ -43581,7 +43891,7 @@ static int run_calibrate(Options opt)
 
   cobs.gpuc = gpuc_samples;
   // Record both directions like qualifying --adapt runs.
-  if (!opt.no_profile) {
+  if (!opt.no_profile && opt.deferred_exit == EXIT_OK) {
     // Wall synthesis falls back to whichever engine measured, so one dead
     // engine never discards the other's valid rate.
     auto synth_wall = [&](const Row & a, const Row & b) -> uint64_t {
@@ -43615,7 +43925,9 @@ static int run_calibrate(Options opt)
     else
       std::fprintf(stderr, "[CALIBRATE] profile recorded: %s\n", cal_path.c_str());
   } else {
-    std::fprintf(stderr, "[CALIBRATE] --no-profile: measured only, nothing recorded\n");
+    std::fprintf(stderr, "%s\n", opt.no_profile
+        ? "[CALIBRATE] --no-profile: measured only, nothing recorded"
+        : "[CALIBRATE] input(s) skipped: measured only, nothing recorded");
   }
   return EXIT_OK;
 }
@@ -43939,6 +44251,8 @@ static int gzstd_main(int argc, char ** argv)
     g_debug_fail_bringup_alloc.store(int(std::atoll(fb)), std::memory_order_relaxed);
   if (const char * ro = std::getenv("GZSTD_DEBUG_REAL_BRINGUP_OOM"))
     g_debug_real_bringup_oom.store(int(std::atoll(ro)), std::memory_order_relaxed);
+  if (const char * rr = std::getenv("GZSTD_DEBUG_REAL_REBUILD_OOM"))
+    g_debug_real_rebuild_oom.store(int(std::atoll(rr)), std::memory_order_relaxed);
   if (const char * rp = std::getenv("GZSTD_DEBUG_REAL_PINNED_OOM"))
     g_debug_real_pinned_oom.store(int(std::atoll(rp)), std::memory_order_relaxed);
   if (const char * rt = std::getenv("GZSTD_DEBUG_REAL_DECOMP_TEMP_OOM"))
@@ -43989,8 +44303,26 @@ static int gzstd_main(int argc, char ** argv)
   // decodes a corpus it generated.
   const bool user_decode = (opt.mode == Mode::DECOMPRESS || opt.mode == Mode::TEST)
                            && !opt.calibrate;
-  g_mem_limit_bytes.store(user_decode ? (uint64_t)opt.mem_limit_mib * ONE_MIB : 0,
-                          std::memory_order_relaxed);
+  // --long=N stands in for -M when -M is absent: a 2^N window, as in zstd.
+  uint64_t decode_limit = 0;
+  if (user_decode) {
+    // -M0 is "no -M", as in zstd (MEASURED: `zstd -d -M0` keeps its 128 MiB
+    // default, and `--long=27 -M0` its 2^27), so it does not override --long.
+    if (opt.mem_limit_bytes) decode_limit = opt.mem_limit_bytes;
+    else if (opt.long_wlog) {
+      decode_limit = (uint64_t)1 << opt.long_wlog;
+      g_mem_limit_long = opt.long_wlog;
+    }
+  }
+  g_mem_limit_bytes.store(decode_limit, std::memory_order_relaxed);
+  // --long on compression: the per-frame compressor reads it (see g_long_wlog).
+  // Not under --calibrate, which measures the levels as they are.
+  if (opt.mode == Mode::COMPRESS && !opt.calibrate) {
+    g_long_wlog = opt.long_wlog;
+    for (int k = 0; k < 12; ++k) g_zparams[k] = opt.zparams[k];   // --zstd=
+  }
+  // --no-check, both ways (see g_no_check).  --calibrate measures with checksums.
+  if (!opt.calibrate) g_no_check = opt.no_check;
   // --train is its own operation: no compress/decompress setup applies.
   if (opt.train) return run_train(opt);
   // -D / --patch-from: load the run's dictionary before any coder (or thread) exists.
@@ -44143,7 +44475,7 @@ static int gzstd_main(int argc, char ** argv)
 
 #ifndef _WIN32
   // --calibrate: explicit calibration pass; no input files involved.
-  if (opt.calibrate) return run_calibrate(opt);
+  if (opt.calibrate) return std::max(run_calibrate(opt), opt.deferred_exit);
 
   // -l: list .zst frame info (plain) or archive contents (`-l --tar`).  Checked
   // before the extract/verify dispatch so it doesn't fall through to either.
@@ -44164,7 +44496,7 @@ static int gzstd_main(int argc, char ** argv)
       gz_stdout_will_be_written();
     }
     if (opt.tar_mode) { Meter meter; return list_tar(opt, &meter); }
-    return list_zst(opt);
+    return std::max(list_zst(opt), opt.deferred_exit);   // inputs -r or a skip dropped
   }
   // -d --tar: extract the archive(s) into -C DIR via the native parallel
   // extractor; bypasses the single-output per-file loop below.
@@ -44255,8 +44587,13 @@ static int gzstd_main(int argc, char ** argv)
 
   // For multi-file with no explicit -o, derive output per file
   if (opt.inputs.size() > 1 && !opt.to_stdout) {
-    opt.output = derive_output(opt.input, opt.mode);
+    opt.output = opt.input_outputs.empty() ? derive_output(opt.input, opt.mode)
+                                           : opt.input_outputs[file_idx];
   }
+  // --output-dir-mirror creates the input's directories under DIR, as zstd does,
+  // one input at a time so a skipped or failed input leaves nothing behind.
+  if (!opt.out_dir_mirror.empty() && !opt.input_outputs.empty() && opt.input != "-")
+    gz_make_parent_dirs(opt.output);
 
   // --tar synthesizes its input from tar_sources; there is no input FILE*.
   HeldDir in_dir;                 // retained through --rm quarantine/removal
@@ -46294,6 +46631,7 @@ static int gzstd_main(int argc, char ** argv)
       adapt_obs.explored != 0 && adapt_obs.wall_ns < adapt_save_min_ns()
       && !adapt_obs.fault;
   if (opt.adapt && !opt.no_profile && exit_code == EXIT_OK
+      && opt.deferred_exit == EXIT_OK
       && (adapt_obs.wall_ns >= adapt_save_min_ns() || adapt_obs.fault
           || adapt_stamp_only)) {
     adapt_obs.stamp_only = adapt_stamp_only;
@@ -46327,7 +46665,8 @@ static int gzstd_main(int argc, char ** argv)
   }
 #endif
 
-  return exit_code;
+  // Inputs skipped before the loop (gz_resolve_file_inputs) each said why.
+  return std::max(exit_code, opt.deferred_exit);
 }
 
 // Top-level exception boundary.  This is load-bearing for more than tidiness:
@@ -48010,6 +48349,605 @@ static const char * const VCS_EXCLUDES[] = {
 };
 
 /* parse_args at end */
+/*----------------------------------------------------------------------------
+ v0.18.8: zstd's -r, --output-dir-flat, --output-dir-mirror and
+ --exclude-compressed, which were accepted and ignored (-r exited 3 on the
+ directory; the output dirs left every output beside its input).
+
+ Everything here is decided BEFORE the per-file loop, which stays fail-fast: an
+ input dropped here prints its own line and raises opt.deferred_exit, as zstd
+ skips it and carries on.  Each behaviour below was MEASURED against zstd 1.5.7.
+----------------------------------------------------------------------------*/
+
+// --zstd=k=v[,k=v...] (v0.18.8), zstd's parseCompressionParameters: each key in
+// its long or short spelling, a decimal value, commas between, nothing after.
+// zstd reports a bad key or form as "Incorrect parameter" (exit 1) and an
+// out-of-range value only when it applies it (exit 11); both are usage errors here,
+// caught before any work, with the range the linked library accepts.  0 = unset.
+static void parse_zstd_params(const std::string & spec, Options & opt)
+{
+  static const char * const names[12][2] = {
+    {"windowLog", "wlog"}, {"chainLog", "clog"}, {"hashLog", "hlog"},
+    {"searchLog", "slog"}, {"minMatch", "mml"}, {"targetLength", "tlen"},
+    {"strategy", "strat"}, {"overlapLog", "ovlog"}, {"ldmHashLog", "lhlog"},
+    {"ldmMinMatch", "lmml"}, {"ldmBucketSizeLog", "lblog"}, {"ldmHashRateLog", "lhrlog"} };
+  static const ZSTD_cParameter ids[12] = {
+    ZSTD_c_windowLog, ZSTD_c_chainLog, ZSTD_c_hashLog, ZSTD_c_searchLog,
+    ZSTD_c_minMatch, ZSTD_c_targetLength, ZSTD_c_strategy, ZSTD_c_overlapLog,
+    ZSTD_c_ldmHashLog, ZSTD_c_ldmMinMatch, ZSTD_c_ldmBucketSizeLog, ZSTD_c_ldmHashRateLog };
+  size_t i = 0;
+  if (spec.empty()) die_usage("--zstd= needs parameters, e.g. --zstd=wlog=23,strat=6");
+  while (i < spec.size()) {
+    const size_t eq = spec.find('=', i);
+    const size_t comma = spec.find(',', i);
+    if (eq == std::string::npos || (comma != std::string::npos && comma < eq))
+      die_usage("incorrect parameter: --zstd=" + spec);
+    const std::string key = spec.substr(i, eq - i);
+    const size_t end = comma == std::string::npos ? spec.size() : comma;
+    const std::string val = spec.substr(eq + 1, end - eq - 1);
+    int k = -1;
+    for (int j = 0; j < 12; ++j)
+      if (key == names[j][0] || key == names[j][1]) { k = j; break; }
+    if (k < 0 || val.empty() || val.size() > 9
+        || val.find_first_not_of("0123456789") != std::string::npos)
+      die_usage("incorrect parameter: --zstd=" + spec + " (" + key + "=" + val + ")");
+    const int v = std::stoi(val);
+    if (v != 0) {
+      const ZSTD_bounds b = ZSTD_cParam_getBounds(ids[k]);
+      if (!ZSTD_isError(b.error) && (v < b.lowerBound || v > b.upperBound))
+        die_usage("--zstd=" + key + "=" + val + " is out of range ("
+                  + std::to_string(b.lowerBound) + " to " + std::to_string(b.upperBound) + ")");
+    }
+    opt.zparams[k] = v;
+    opt.zparams_set = true;
+    i = end == spec.size() ? end : end + 1;
+    if (end != spec.size() && i == spec.size())
+      die_usage("incorrect parameter: --zstd=" + spec + " (trailing comma)");
+  }
+}
+
+// zstd's compressedFileExtensions.  Case-sensitive, matched against the last
+// extension of the name; .zstd and .tar are NOT in it (measured: zstd
+// --exclude-compressed compresses f.zstd, f.tar, f.JPG and f.ZST).
+static bool gz_is_compressed_name(const std::string & path)
+{
+  static const char * const exts[] = {
+    ".zst", ".tzst", ".gz", ".tgz", ".lzma", ".xz", ".txz", ".lz4", ".tlz4",
+    ".7z", ".aa3", ".aac", ".aar", ".ace", ".alac", ".ape", ".apk", ".apng",
+    ".arc", ".archive", ".arj", ".ark", ".asf", ".avi", ".avif", ".ba", ".br",
+    ".bz2", ".cab", ".cdx", ".chm", ".cr2", ".divx", ".dmg", ".dng", ".docm",
+    ".docx", ".dotm", ".dotx", ".dsft", ".ear", ".eftx", ".emz", ".eot", ".epub",
+    ".f4v", ".flac", ".flv", ".gho", ".gif", ".gifv", ".gnp", ".iso", ".jar",
+    ".jpeg", ".jpg", ".jxl", ".lz", ".lzh", ".m4a", ".m4v", ".mkv", ".mov",
+    ".mp2", ".mp3", ".mp4", ".mpa", ".mpc", ".mpe", ".mpeg", ".mpg", ".mpl",
+    ".mpv", ".msi", ".odp", ".ods", ".odt", ".ogg", ".ogv", ".otp", ".ots",
+    ".ott", ".pea", ".png", ".pptx", ".qt", ".rar", ".s7z", ".sfx", ".sit",
+    ".sitx", ".sqx", ".svgz", ".swf", ".tbz2", ".tib", ".tlz", ".vob", ".war",
+    ".webm", ".webp", ".wma", ".wmv", ".woff", ".woff2", ".wvl", ".xlsx", ".xpi",
+    ".xps", ".zip", ".zipx", ".zoo", ".zpaq" };
+  const size_t slash = path.find_last_of('/');
+  const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+  const size_t dot = base.find_last_of('.');
+  if (dot == std::string::npos) return false;
+  const std::string ext = base.substr(dot);
+  for (const char * e : exts) if (ext == e) return true;
+  return false;
+}
+
+// Does `path` start with a zstd frame or a skippable frame?  "" if so, else
+// zstd's own complaint for it ("unexpected end of file" for an empty file,
+// "unknown header" otherwise).  -t, -l and -d under -r ask this of every file the
+// walk found, before the fail-fast loop meets one: zstd reports such a file and
+// carries on (exit 1), where the loop would stop the run on it (exit 4).
+static std::string gz_zstd_header_problem(const std::string & path)
+{
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOCTTY);
+  if (fd < 0) return std::string("cannot open (") + std::strerror(errno) + ")";
+  unsigned char m[4] = {0, 0, 0, 0};
+  ssize_t got = 0;
+  while (got < 4) {
+    const ssize_t r = ::read(fd, m + got, 4 - got);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) break;
+    got += r;
+  }
+  ::close(fd);
+  if (got == 0) return "unexpected end of file";
+  if (got < 4) return "unknown header";
+  const uint32_t v = (uint32_t)m[0] | ((uint32_t)m[1] << 8) | ((uint32_t)m[2] << 16)
+                   | ((uint32_t)m[3] << 24);
+  if (v == 0xFD2FB528u || (v & 0xFFFFFFF0u) == 0x184D2A50u) return "";
+  return "unknown header";
+}
+
+static std::string gz_path_join(const std::string & dir, const std::string & name)
+{
+  if (dir.empty()) return name;
+  return dir.back() == '/' ? dir + name : dir + "/" + name;
+}
+
+// One "-- ignored" line at V_ERROR (zstd's display level 1: -q keeps it, -qq
+// drops it), and the run's exit code is at least `code`.
+static void gz_drop_input(Options & opt, const std::string & msg, int code)
+{
+  if (opt.verbosity >= V_ERROR) std::fprintf(stderr, "gzstd: %s\n", msg.c_str());
+  opt.deferred_exit = std::max(opt.deferred_exit, code);
+}
+
+// zstd's UTIL_prepareFileList: readdir order (NOT sorted, so `-r -c` concatenates
+// in the order zstd would on the same filesystem), depth first, "." and ".."
+// skipped, a symbolic link skipped with a warning -- followed under -f, as zstd
+// does.  Two things zstd does not do: a link back to an enclosing directory is
+// refused rather than walked until the path is too long, and a FIFO, socket or
+// device is skipped ("is not a regular file", zstd's own message for those):
+// zstd opens a FIFO it meets in the tree and blocks there (MEASURED: hung).
+static void gz_walk_dir(Options & opt, const std::string & dir,
+                        std::vector<std::pair<dev_t, ino_t>> & stack,
+                        std::vector<std::string> & out,
+                        std::set<std::string> & followed_file_links)
+{
+  DIR * d = ::opendir(dir.c_str());
+  if (!d) {
+    gz_drop_input(opt, "cannot open directory " + dir + " ("
+                  + std::strerror(errno) + ") -- ignored", EXIT_IO);
+    return;
+  }
+  int rerr = 0;
+  for (;;) {
+    errno = 0;
+    struct dirent * e = ::readdir(d);
+    if (!e) { rerr = errno; break; }
+    if (!std::strcmp(e->d_name, ".") || !std::strcmp(e->d_name, "..")) continue;
+    const std::string path = gz_path_join(dir, e->d_name);
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) != 0) {
+      gz_drop_input(opt, "cannot stat " + path + " (" + std::strerror(errno)
+                    + ") -- ignored", EXIT_IO);
+      continue;
+    }
+    const bool is_link = S_ISLNK(st.st_mode);
+    if (is_link) {
+      if (!opt.force) {
+        if (opt.verbosity >= V_DEFAULT)
+          std::fprintf(stderr, "gzstd: warning: %s is a symbolic link, ignoring\n", path.c_str());
+        continue;
+      }
+      if (::stat(path.c_str(), &st) != 0) {
+        gz_drop_input(opt, "cannot stat " + path + " (" + std::strerror(errno)
+                      + ") -- ignored", EXIT_IO);
+        continue;
+      }
+    }
+    if (S_ISDIR(st.st_mode)) {
+      bool loop = false;
+      for (const auto & a : stack)
+        if (a.first == st.st_dev && a.second == st.st_ino) { loop = true; break; }
+      if (loop) {
+        gz_drop_input(opt, path + " leads back to a directory it is inside -- ignored",
+                      EXIT_ERROR);
+        continue;
+      }
+      stack.emplace_back(st.st_dev, st.st_ino);
+      gz_walk_dir(opt, path, stack, out, followed_file_links);
+      stack.pop_back();
+    } else if (S_ISREG(st.st_mode)) {
+      out.push_back(path);
+      if (is_link) followed_file_links.insert(path);
+    } else {
+      gz_drop_input(opt, path + " is not a regular file -- ignored", EXIT_ERROR);
+    }
+  }
+  ::closedir(d);
+  if (rerr)
+    gz_drop_input(opt, "cannot read directory " + dir + " (" + std::strerror(rerr)
+                  + "); files after the error were not processed", EXIT_IO);
+}
+
+// --output-dir-mirror: the input's directory, lexically -- "./" and "//"
+// collapse, a leading "/" is dropped (an absolute input is mirrored in full
+// under DIR) -- or false for a path with a ".." component, which zstd refuses
+// (it would climb out of DIR).  Symbolic links are kept by name, as in zstd.
+static bool gz_mirror_subdir(const std::string & input, std::string & sub)
+{
+  const size_t slash = input.find_last_of('/');
+  const std::string dir = slash == std::string::npos ? std::string() : input.substr(0, slash);
+  sub.clear();
+  size_t i = 0;
+  while (i <= dir.size()) {
+    const size_t j = std::min(dir.find('/', i), dir.size());
+    const std::string c = dir.substr(i, j - i);
+    if (c == "..") return false;
+    if (!c.empty() && c != ".") sub = gz_path_join(sub, c);
+    i = j + 1;
+  }
+  return true;
+}
+
+// mkdir -p of an output's parent directories, for --output-dir-mirror.
+static void gz_make_parent_dirs(const std::string & path)
+{
+  const size_t slash = path.find_last_of('/');
+  if (slash == std::string::npos || slash == 0) return;
+  const std::string dir = path.substr(0, slash);
+  for (size_t i = 1; i <= dir.size(); ++i) {
+    if (i != dir.size() && dir[i] != '/') continue;
+    const std::string pre = dir.substr(0, i);
+    if (::mkdir(pre.c_str(), 0777) == 0) continue;
+    const int err = errno;
+    struct stat st {};
+    if (err == EEXIST && ::stat(pre.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) continue;
+    die_io("cannot create directory " + pre + " for " + path + " ("
+           + std::strerror(err == EEXIST ? ENOTDIR : err) + ")");
+  }
+}
+
+static void gz_resolve_file_inputs(Options & opt)
+{
+  const bool want_dirs = !opt.out_dir_flat.empty() || !opt.out_dir_mirror.empty();
+  if (opt.tar_mode) {
+    if (want_dirs)
+      die_usage("--output-dir-flat/--output-dir-mirror do not apply to --tar (name the "
+                "archive with -o; extract into a directory with -C)");
+    return;   // -r means nothing more to --tar: it always recurses
+  }
+  if (opt.inputs.empty()) return;   // standard input; nothing to resolve
+  // EVERY named-file run, with or without the new options -- the owner's ruling
+  // (v0.18.8): zstd's contract.  A directory without -r is skipped (exit 1), and
+  // with several inputs one whose output exists is skipped while the rest still
+  // run (exit 3).  Under --rm only the inputs actually compressed are removed.
+  // The first review round held this to the new options, because plain
+  // `gzstd DIR` used to exit 3 and plain `gzstd --rm a b` used to stop at `a`;
+  // both now behave as zstd does, which is the point.
+
+  // 1. Directories, -r, --exclude-compressed.
+  const bool decompress_to_files = opt.mode == Mode::DECOMPRESS && !opt.list_mode;
+  std::vector<std::string> files;
+  std::set<std::string> followed_file_links;  // already-known -f symlinks; no extra stat per regular file
+  bool dropped = false;
+  for (const std::string & in : opt.inputs) {
+    if (in == "-") { files.push_back(in); continue; }
+    struct stat st {};
+    const bool lst_ok = ::lstat(in.c_str(), &st) == 0;
+    if (lst_ok && S_ISLNK(st.st_mode) && opt.force)
+      followed_file_links.insert(in);
+    if (lst_ok && opt.recursive && S_ISLNK(st.st_mode) && !opt.force) {
+      // zstd -r skips a symbolic link even when it is named, and exits 1.
+      if (opt.verbosity >= V_DEFAULT)
+        std::fprintf(stderr, "gzstd: warning: %s is a symbolic link, ignoring\n", in.c_str());
+      opt.deferred_exit = std::max(opt.deferred_exit, EXIT_ERROR);
+      dropped = true;
+      continue;
+    }
+    // lstat already settled a regular file.  Only a symlink needs the second
+    // lookup to tell whether its target is a directory.  This is on every
+    // plain named-file run now, so avoid a redundant stat per ordinary file.
+    const bool is_dir = lst_ok && (S_ISDIR(st.st_mode)
+        || (S_ISLNK(st.st_mode) && ::stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)));
+    if (is_dir) {
+      if (!opt.recursive) {
+        // zstd's message and exit 1.  This used to be "read error on DIR (Is a
+        // directory)", exit 3, after creating and removing DIR.zst.
+        gz_drop_input(opt, in + " is a directory -- ignored", EXIT_ERROR);
+        dropped = true;
+        continue;
+      }
+      std::vector<std::pair<dev_t, ino_t>> stack{{st.st_dev, st.st_ino}};
+      std::vector<std::string> walked;
+      gz_walk_dir(opt, in, stack, walked, followed_file_links);
+      for (std::string & f : walked) {
+        // -d needs a suffix to name the output.  Only files the WALK found: a
+        // file named on the command line keeps gzstd's "NAME.out" naming.
+        if (decompress_to_files && derive_output(f, opt.mode) == f + ".out") {
+          gz_drop_input(opt, f + ": unknown suffix (.zst/.tzst/.zstd expected) -- ignored",
+                        EXIT_ERROR);
+          dropped = true;
+          continue;
+        }
+        if (opt.mode != Mode::COMPRESS) {
+          const std::string why = gz_zstd_header_problem(f);
+          if (!why.empty()) {
+            gz_drop_input(opt, opt.list_mode ? "File \"" + f + "\" not compressed by zstd"
+                                             : f + ": " + why + " -- ignored", EXIT_ERROR);
+            dropped = true;
+            continue;
+          }
+        }
+        files.push_back(std::move(f));
+      }
+      continue;
+    }
+    files.push_back(in);   // anything else: the loop opens it and reports as before
+  }
+  if (opt.exclude_compressed && opt.mode == Mode::COMPRESS) {
+    // zstd skips these quietly (display level 4) and does not count them as errors.
+    std::vector<std::string> kept;
+    for (std::string & f : files) {
+      if (f != "-" && gz_is_compressed_name(f)) {
+        vlog(V_VERBOSE, opt, "gzstd: " + f + " is already compressed -- skipped (--exclude-compressed)\n");
+        dropped = true;
+      } else kept.push_back(std::move(f));
+    }
+    files.swap(kept);
+  }
+
+  // 2. Where each output goes.  -c, -o, -t and -l name no per-input file, and
+  // zstd ignores the output directories for them.
+  const bool to_files = !opt.to_stdout && !opt.stdout_flag && !opt.output_dash
+                     && !opt.output_named && opt.output.empty()
+                     && opt.mode != Mode::TEST && !opt.list_mode;
+  std::vector<std::string> outs;
+  if (to_files && want_dirs) {
+    const bool mirror = !opt.out_dir_mirror.empty();   // zstd: mirror wins
+    if (!mirror) {
+      // zstd does not create a flat directory; every output fails on its own.
+      // Refused once, before any work, instead.
+      struct stat st {};
+      if (::stat(opt.out_dir_flat.c_str(), &st) != 0)
+        die_io("--output-dir-flat " + opt.out_dir_flat + ": " + std::strerror(errno));
+      if (!S_ISDIR(st.st_mode))
+        die_io("--output-dir-flat " + opt.out_dir_flat + ": " + std::strerror(ENOTDIR));
+    }
+    std::vector<std::string> kept;
+    for (std::string & f : files) {
+      if (f == "-") { kept.push_back(f); outs.push_back("stdout"); continue; }
+      const std::string derived = derive_output(f, opt.mode);
+      const size_t slash = derived.find_last_of('/');
+      const std::string base = slash == std::string::npos ? derived : derived.substr(slash + 1);
+      if (mirror) {
+        std::string sub;
+        if (!gz_mirror_subdir(f, sub)) {
+          gz_drop_input(opt, "--output-dir-mirror cannot "
+                        + std::string(opt.mode == Mode::COMPRESS ? "compress" : "decompress")
+                        + " '" + f + "' into '" + opt.out_dir_mirror + "'", EXIT_ERROR);
+          dropped = true;
+          continue;
+        }
+        outs.push_back(gz_path_join(gz_path_join(opt.out_dir_mirror, sub), base));
+      } else {
+        outs.push_back(gz_path_join(opt.out_dir_flat, base));
+      }
+      kept.push_back(std::move(f));
+    }
+    files.swap(kept);
+  }
+
+  // 3. A multi-file run skips an input whose output exists (no -f) and goes on,
+  // as zstd does; it used to stop the whole run at the first one.  Two inputs
+  // with one output (--output-dir-flat over a tree): the later one is skipped,
+  // or with -f the last one wins after zstd's warning -- but never under --rm,
+  // which would delete both inputs and keep only one output.
+  if (to_files && files.size() > 1) {
+    std::vector<std::string> kept, kept_outs;
+    std::map<std::string, std::string> seen;   // output -> the input it came from
+    // With -f, an earlier output can replace a LATER input before that input is
+    // opened: `-r -f --rm DIR` containing a and a.zst is one such case.  Compare
+    // directory entries, not target inodes: -f renames over the output name,
+    // while two hard links to one inode remain separate names.  Open each
+    // parent once, then use its directory identity when it exists, so symlink
+    // and bind-mount spellings are covered without a per-file realpath.
+    std::map<std::string, std::string> parents;
+    auto entry_key = [&parents](const std::string & path) {
+      const fs::path p(path);
+      const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+      const std::string dir_name = dir.string();
+      auto it = parents.find(dir_name);
+      if (it == parents.end()) {
+        struct stat dst {};
+        std::string parent_key;
+        // Ask the ORIGINAL path, as OutputDir does.  Canonicalizing it first
+        // can turn a usable /proc/self/fd/N directory into a spelling whose
+        // ancestors we cannot traverse, and wrongly refuse a valid run.
+        int dfd = ::open(dir_name.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (dfd < 0 && errno != ENOENT) {
+          const int e = errno;
+          die_io("cannot open directory " + dir_name + " for output/input clash check ("
+                 + std::string(std::strerror(e)) + ")");
+        }
+        std::vector<std::string> missing;
+        if (dfd < 0) {
+          // A mirror parent may not exist yet.  Resolve its existing prefix
+          // through directory descriptors.  A dangling symlink in that prefix
+          // must be followed too: an earlier output may create its target,
+          // making two initially different spellings name the SAME output.
+          dfd = ::open(dir.is_absolute() ? "/" : ".",
+                       O_PATH | O_DIRECTORY | O_CLOEXEC);
+          if (dfd < 0) die_io("cannot open base of " + dir_name
+                             + " for output/input clash check (" + std::strerror(errno) + ")");
+          std::deque<fs::path> pending;
+          for (const auto & part : dir) pending.push_back(part);
+          int links = 0;
+          while (!pending.empty()) {
+            const fs::path component = pending.front();
+            pending.pop_front();
+            const std::string part = component.string();
+            if (part.empty() || part == "." || part == "/") continue;
+            if (part == "..") {
+              if (!missing.empty()) { missing.pop_back(); continue; }
+              const int up = ::openat(dfd, "..", O_PATH | O_DIRECTORY | O_CLOEXEC);
+              if (up < 0) die_io("cannot resolve directory " + dir_name
+                                 + " for output/input clash check (" + std::strerror(errno) + ")");
+              ::close(dfd);
+              dfd = up;
+              continue;
+            }
+            if (!missing.empty()) { missing.push_back(part); continue; }
+            const int next = ::openat(dfd, part.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+            if (next >= 0) { ::close(dfd); dfd = next; continue; }
+            if (errno != ENOENT) die_io("cannot resolve directory " + dir_name
+                                       + " for output/input clash check (" + std::strerror(errno) + ")");
+            // ENOENT can mean either an absent entry or a symlink to an absent
+            // target.  readlinkat on the held parent distinguishes the two.
+            std::string target(256, '\0');
+            ssize_t n;
+            for (;;) {
+              n = ::readlinkat(dfd, part.c_str(), &target[0], target.size());
+              if (n < 0 || (size_t)n < target.size()) break;
+              target.resize(target.size() * 2);
+            }
+            if (n < 0) {
+              if (errno != EINVAL && errno != ENOENT)
+                die_io("cannot resolve directory link " + dir_name
+                       + " for output/input clash check (" + std::strerror(errno) + ")");
+              missing.push_back(part);
+              continue;
+            }
+            if (++links > 40) die_usage("too many directory links in " + dir_name);
+            target.resize((size_t)n);
+            const fs::path link_target(target);
+            if (link_target.is_absolute()) {
+              const int root = ::open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+              if (root < 0) die_io("cannot resolve directory " + dir_name
+                                 + " for output/input clash check (" + std::strerror(errno) + ")");
+              ::close(dfd);
+              dfd = root;
+            }
+            std::deque<fs::path> expanded;
+            for (const auto & piece : link_target) expanded.push_back(piece);
+            expanded.insert(expanded.end(), pending.begin(), pending.end());
+            pending.swap(expanded);
+          }
+        }
+        if (::fstat(dfd, &dst) != 0) {
+          const int e = errno;
+          ::close(dfd);
+          die_io("cannot identify directory " + dir_name + " for output/input clash check ("
+                 + std::string(std::strerror(e)) + ")");
+        }
+        ::close(dfd);
+        const std::string id = std::to_string((uintmax_t)dst.st_dev) + ":"
+                             + std::to_string((uintmax_t)dst.st_ino);
+        parent_key = missing.empty() ? "i:" + id : "p:" + id;
+        for (const std::string & part : missing)
+          parent_key = gz_path_join(parent_key, part);
+        it = parents.emplace(dir_name, std::move(parent_key)).first;
+      }
+      return gz_path_join(it->second, p.filename().string());
+    };
+    auto link_chain_keys = [&entry_key](const std::string & source) {
+      fs::path p(source);
+      std::vector<std::string> keys;
+      // Linux permits 40 symlink traversals; inspect the final endpoint too.
+      for (int hop = 0; hop <= 40; ++hop) {
+        // Every link in the chain is a pathname the later open must follow.
+        // Replacing an intermediate link changes the input just as replacing
+        // the final target does.
+        keys.push_back(entry_key(p.string()));
+        std::error_code ec;
+        const fs::path target = fs::read_symlink(p, ec);
+        if (ec) {
+          // A regular or not-yet-existing target ends the chain.  The latter
+          // matters: an earlier output could create a dangling link's target.
+          if (ec == std::errc::invalid_argument
+              || ec == std::errc::no_such_file_or_directory)
+            return keys;
+          die_io("cannot resolve symlink input " + source + " (" + ec.message() + ")");
+          return keys;  // die_io exits
+        }
+        // A procfs magic link (notably /proc/self/fd/N) reopens a held object.
+        // Its readlink text may be an inaccessible path or "pipe:[N]", and
+        // replacing that text's pathname cannot change what this input reads.
+        // The link's own entry is already in keys.  Identify the filesystem,
+        // not a spelling such as /proc or /dev/fd, before stopping here.
+        const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+        struct statfs sf {};
+        if (::statfs(dir.c_str(), &sf) == 0
+            && sf.f_type == 0x9fa0 /* PROC_SUPER_MAGIC */) return keys;
+        // An unknown filesystem keeps the ordinary pathname guard below;
+        // inability to classify it alone is not a reason to refuse the run.
+        p = target.is_absolute() ? target : p.parent_path() / target;
+      }
+      die_usage("symlink input " + source + " has too many links");
+      return keys;  // die_usage exits
+    };
+    std::map<std::string, std::pair<size_t, std::string>> source_names;
+    std::vector<std::string> earlier_rm_inputs;
+    std::set<std::string> removed_before_output;
+    size_t keyed_rm_inputs = 0;
+    if (opt.force)
+      for (size_t k = 0; k < files.size(); ++k) {
+        if (files[k] == "-") continue;
+        // -r -f follows a file symlink.  Replacing any entry it traverses
+        // before the later open changes the bytes read from that input.
+        if (followed_file_links.count(files[k])) {
+          for (const std::string & key : link_chain_keys(files[k]))
+            source_names[key] = {k, files[k]};
+        } else source_names[entry_key(files[k])] = {k, files[k]};
+      }
+    for (size_t k = 0; k < files.size(); ++k) {
+      const std::string & f = files[k];
+      if (f == "-") { kept.push_back(f); if (!outs.empty()) kept_outs.push_back(outs[k]); continue; }
+      const std::string out = outs.empty() ? derive_output(f, opt.mode) : outs[k];
+      const std::string out_key = opt.force ? entry_key(out) : out;
+      if (opt.force) {
+        auto src = source_names.find(out_key);
+        if (src != source_names.end() && src->second.first > k)
+          die_usage("output " + out + " would replace input " + src->second.second
+                    + " before it is read: refusing");
+      }
+      auto it = seen.find(out_key);
+      if (it != seen.end()) {
+        if (!opt.force) {
+          gz_drop_input(opt, "ERROR: " + f + " and " + it->second + " would both be written to "
+                        + out + " -- " + f + " skipped (use -f to let the last one win)", EXIT_IO);
+          dropped = true;
+          continue;
+        }
+        if (opt.rm_requested)
+          die_usage(f + " and " + it->second + " would both be written to " + out
+                    + ", and --rm would then remove both: refusing");
+        if (opt.verbosity >= V_ERROR)
+          std::fprintf(stderr, "gzstd: warning: two files have the same name: %s (the last one wins)\n",
+                       out.c_str());
+      } else {
+        seen.emplace(out_key, f);
+      }
+      struct stat ost {};
+      if (!opt.force && ::stat(out.c_str(), &ost) == 0 && S_ISREG(ost.st_mode)) {
+        bool freed_by_earlier_input = false;
+        if (opt.rm_requested && !earlier_rm_inputs.empty()) {
+          // The per-file loop removes a successful earlier input before it
+          // reaches this output.  An output that names that input (including
+          // through a symlink) can be free by then.  The per-file output check
+          // remains authoritative if an earlier input was kept after damage.
+          // Key names only on an occupied output: a normal --rm tree must not
+          // pay another parent open/fstat for every distinct input directory.
+          while (keyed_rm_inputs < earlier_rm_inputs.size())
+            removed_before_output.insert(entry_key(earlier_rm_inputs[keyed_rm_inputs++]));
+          for (const std::string & key : link_chain_keys(out))
+            if (removed_before_output.count(key)) {
+              freed_by_earlier_input = true;
+              break;
+            }
+        }
+        if (!freed_by_earlier_input) {
+          gz_drop_input(opt, "ERROR: output exists (use -f to overwrite): " + out + " -- "
+                        + f + " skipped", EXIT_IO);
+          dropped = true;
+          continue;
+        }
+      }
+      kept.push_back(f);
+      if (!outs.empty()) kept_outs.push_back(out);
+      if (!opt.force && opt.rm_requested)
+        earlier_rm_inputs.push_back(f);
+    }
+    files.swap(kept);
+    outs.swap(kept_outs);
+  }
+
+  if (files.empty()) {
+    // NEVER FALL THROUGH TO STANDARD INPUT: inputs were named, and an empty list
+    // here would mean "-" to everything below (the --filelist lesson, v0.17.87).
+    if (!dropped && opt.verbosity >= V_ERROR)
+      std::fprintf(stderr, "gzstd: please provide correct input file(s) or non-empty "
+                           "directories -- ignored\n");
+    std::fflush(stderr);
+    std::exit(opt.deferred_exit);
+  }
+  opt.inputs.swap(files);
+  opt.input_outputs.swap(outs);
+}
+
 static Options parse_args(int argc, char ** argv)
 {
   Options opt;
@@ -48247,7 +49185,7 @@ static Options parse_args(int argc, char ** argv)
       opt.verify_retries = n;
     }
     else if (a == "-c" || a == "--stdout" || a == "--to-stdout") {
-      opt.stdout_flag = true; opt.to_stdout = true;
+      opt.stdout_flag = true; opt.to_stdout = true; opt.stdout_last = true;
     }
     else if (a == "-O") {            // tar's spelling of the same thing, for -d --tar
       opt.stdout_flag = true; opt.to_stdout = true; opt.tar_O = true;
@@ -48337,6 +49275,7 @@ static Options parse_args(int argc, char ** argv)
       // is an ordinary NAMED file now, not a special case.
       opt.output_dash  = (opt.output == "-");
       opt.output_named = !opt.output_dash;
+      opt.stdout_last  = false;
       if (opt.output_dash) opt.output = "stdout";
     }
     else if (a.rfind("--output=", 0) == 0) {
@@ -48344,6 +49283,7 @@ static Options parse_args(int argc, char ** argv)
       if (opt.output.empty()) die_usage("missing value for --output");
       opt.output_dash  = (opt.output == "-");
       opt.output_named = !opt.output_dash;
+      opt.stdout_last  = false;
       if (opt.output_dash) opt.output = "stdout";
     }
     else if (parse_double_arg("cpu-share", i, argc, argv, opt.cpu_share)) {
@@ -48499,7 +49439,7 @@ static Options parse_args(int argc, char ** argv)
     //
     // Silent no-ops: zstd defaults we already match, so the flag is a no-op.
     else if (a == "--asyncio" || a == "--no-asyncio") {}
-    else if (a == "--check" || a == "--no-check") {}
+    else if (a == "--check" || a == "--no-check") { opt.no_check = (a == "--no-check"); }
     else if (a == "--no-dictID") { opt.no_dict_id = true; }
     else if (a == "--compress-literals" || a == "--no-compress-literals") {}
     else if (a == "--row-match-finder" || a == "--no-row-match-finder") {}
@@ -48523,8 +49463,20 @@ static Options parse_args(int argc, char ** argv)
                             "gzstd's --adapt governs the pipeline, not the "
                             "compression level; bounds ignored, governor enabled");
     }
+    // --long[=N] (v0.18.8; was warned about and ignored).  Bare: 27, zstd's
+    // default.  zstd reads a non-number as 0 and carries on; refused here.
     else if (a == "--long" || a.rfind("--long=", 0) == 0) {
-      warn_ignored_zstd_opt(a, "use --ultra for large window levels");
+      int wl = 27;
+      if (a.size() > 6) {
+        const std::string v = a.substr(7);
+        if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos || v.size() > 3)
+          die_usage("invalid value for --long: '" + v + "' (a window log, 10 to 31)");
+        wl = std::stoi(v);
+        if (wl < 10 || wl > 31)
+          die_usage("--long=" + v + " is out of range: a window log is 10 to 31 "
+                    "(a window of 2^N bytes), as in zstd");
+      }
+      opt.long_wlog = wl;
     }
     // --patch-from=OLD / --patch-from OLD, zstd's spellings.  Recorded here;
     // what it means depends on the final mode (the dictionary block below).
@@ -48541,16 +49493,19 @@ static Options parse_args(int argc, char ** argv)
       opt.patch_from = argv[++i];
     }
     else if (a == "--rsyncable") {
-      warn_ignored_zstd_opt("--rsyncable");
+      opt.rsyncable = true;   // real under --sliding-window; warned about otherwise (after the loop)
+    }
+    else if (a.rfind("--zstd=", 0) == 0) {
+      parse_zstd_params(a.substr(7), opt);   // v0.18.8; compression only, like zstd's
     }
     else if (a == "--exclude-compressed") {
-      warn_ignored_zstd_opt("--exclude-compressed");
+      opt.exclude_compressed = true;   // v0.18.8; was warned and ignored
     }
     else if (a == "--pass-through" || a == "--no-pass-through") {
       warn_ignored_zstd_opt(a);
     }
     else if (a == "-r" || a == "--recursive") {
-      opt.recursive = true;   // honoured by --train; warned about otherwise (after the loop)
+      opt.recursive = true;   // expanded after the loop (gz_resolve_file_inputs), or by --train
     }
     else if (a == "-l" || a == "--list") {
       opt.list_mode = true;
@@ -48588,9 +49543,23 @@ static Options parse_args(int argc, char ** argv)
       // the producer's output, the same fall-through this option was fixed for.
       if (listed == 0) die_usage("--filelist " + lf + " names no files");
     }
-    else if (eat_zstd_value_opt("output-dir-flat", i, argc, argv)
-          || eat_zstd_value_opt("output-dir-mirror", i, argc, argv)) {
-      warn_ignored_zstd_opt(a, "output dir flags not supported");
+    // zstd's output directories (v0.18.8; they were warned about and ignored, so
+    // every output landed beside its input).  Both spellings, `--opt DIR` and
+    // `--opt=DIR`, and zstd's refusal of an empty one.
+    else if (a == "--output-dir-flat" || a == "--output-dir-mirror"
+             || a.rfind("--output-dir-flat=", 0) == 0
+             || a.rfind("--output-dir-mirror=", 0) == 0) {
+      const bool mirror = a.rfind("--output-dir-mirror", 0) == 0;
+      const std::string nm = mirror ? "--output-dir-mirror" : "--output-dir-flat";
+      std::string dir;
+      if (a.size() > nm.size()) dir = a.substr(nm.size() + 1);
+      else {
+        if (i + 1 >= argc) die_usage("missing value for " + nm);
+        dir = argv[++i];
+      }
+      if (dir.empty())
+        die_usage(nm + ": output dir cannot be empty string (did you mean to pass '.' instead?)");
+      (mirror ? opt.out_dir_mirror : opt.out_dir_flat) = dir;
     }
     else if (eat_zstd_value_opt("trace", i, argc, argv)) {
       warn_ignored_zstd_opt("--trace");
@@ -48662,29 +49631,35 @@ static Options parse_args(int argc, char ** argv)
       (flag == "--maxdict" ? opt.train_maxdict : opt.train_dict_id) = zstd_u32_value(flag, v);
     }
     // Memory limit (zstd-compat `-M#` / `-M N` / `--memlimit[=N]` /
-    // `--memory[=N]`, value in MiB).  Applied to decompress via
-    // ZSTD_d_windowLogMax and to compress as a throttle-budget cap.
+    // `--memory[=N]`, value in bytes unless suffixed).  Applied to decompress
+    // via the exact window limit and to compress as a throttle-budget cap.
     else if (a.size() > 2 && a[0] == '-' && a[1] == 'M'
           && (a[2] >= '0' && a[2] <= '9')) {
-      opt.mem_limit_mib = parse_mem_mib("-M", a.substr(2));
+      opt.mem_limit_bytes = parse_mem_bytes("-M", a.substr(2));
+      g_mem_bare_spelling = a;
     }
     else if (a == "-M") {
       if (i + 1 >= argc) die_usage("missing value for -M");
-      opt.mem_limit_mib = parse_mem_mib("-M", argv[++i]);
+      opt.mem_limit_bytes = parse_mem_bytes("-M", argv[++i]);
+      g_mem_bare_spelling = a + " " + argv[i];
     }
     else if (a.rfind("--memlimit=", 0) == 0) {
-      opt.mem_limit_mib = parse_mem_mib("--memlimit", a.substr(11));
+      opt.mem_limit_bytes = parse_mem_bytes("--memlimit", a.substr(11));
+      g_mem_bare_spelling = a;
     }
     else if (a == "--memlimit") {
       if (i + 1 >= argc) die_usage("missing value for --memlimit");
-      opt.mem_limit_mib = parse_mem_mib("--memlimit", argv[++i]);
+      opt.mem_limit_bytes = parse_mem_bytes("--memlimit", argv[++i]);
+      g_mem_bare_spelling = a + " " + argv[i];
     }
     else if (a.rfind("--memory=", 0) == 0) {
-      opt.mem_limit_mib = parse_mem_mib("--memory", a.substr(9));
+      opt.mem_limit_bytes = parse_mem_bytes("--memory", a.substr(9));
+      g_mem_bare_spelling = a;
     }
     else if (a == "--memory") {
       if (i + 1 >= argc) die_usage("missing value for --memory");
-      opt.mem_limit_mib = parse_mem_mib("--memory", argv[++i]);
+      opt.mem_limit_bytes = parse_mem_bytes("--memory", argv[++i]);
+      g_mem_bare_spelling = a + " " + argv[i];
     }
     // Job size: `-B#` in compression (bytes).  gzstd uses --chunk-size in MiB
     // with different semantics (one frame per chunk).  Warn.
@@ -48745,6 +49720,14 @@ static Options parse_args(int argc, char ** argv)
       die_usage("--train cannot be combined with -D or --patch-from");
     if (opt.inputs.empty() || (opt.inputs.size() == 1 && opt.inputs[0] == "-"))
       die_usage("--train needs sample files to train on (or -r DIR)");
+    // -c and -o together: the LATER one names the dictionary's destination, as
+    // in zstd (`--train S -c -o d` writes d).  This took stdout either way.  (zstd
+    // itself cannot write a dictionary to stdout -- "cannot open /*stdout*\\",
+    // exit 3 -- so `-o d -c` and a lone -c are where gzstd does more.)
+    if (opt.stdout_flag && opt.output_named && !opt.stdout_last) {
+      opt.stdout_flag = false;
+      opt.to_stdout = false;
+    }
     g_verbosity = opt.verbosity;
     g_color_stderr = is_stderr_tty();
     return opt;
@@ -48768,6 +49751,15 @@ static Options parse_args(int argc, char ** argv)
   if (!opt.tar_mode && opt.tar_dest_set)
     die_usage("-C/--directory DIR applies to --tar.  (zstd's -C means --check: frame "
               "checksums, which are on by default here; drop the flag)");
+  // -r, a directory without it, --exclude-compressed and the output directories
+  // (v0.18.8).  BEFORE the stdin default: a list emptied here exits instead.
+  // The resolver can exit when every named input is skipped.  Give the bare
+  // byte-size note before that exit, using the final -M and verbosity options.
+  if (g_mem_bare_small && opt.verbosity >= V_DEFAULT)
+    std::fprintf(stderr, "gzstd: note: %s is %llu bytes: a bare number counts bytes, as in "
+                 "zstd (until v0.18.8 it was MiB here); write it with M for MiB\n",
+                 g_mem_bare_spelling.c_str(), (unsigned long long)opt.mem_limit_bytes);
+  gz_resolve_file_inputs(opt);
   if (opt.inputs.empty()) opt.inputs.push_back("-");
 
   // -o with multiple files is ambiguous
@@ -48880,11 +49872,15 @@ static Options parse_args(int argc, char ** argv)
                          "build (compiled without nvCOMP)\n");
 #endif
 
-  // -r and -B# are honoured only by --train (validated right after the loop).
+  // -B# is honoured only by --train (validated right after the loop).  -r is
+  // expanded by gz_resolve_file_inputs since v0.18.8.
   {
-    if (opt.recursive)
-      warn_ignored_zstd_opt("-r/--recursive", "recurse into directories yourself; "
-                                              "only --train expands directories");
+    // --rsyncable: zstd's is a property of its multithreaded single frame, and
+    // gzstd's independent frames start at fixed offsets -- one inserted byte moves
+    // every later boundary, which is exactly what rsync-friendliness must avoid.
+    if (opt.rsyncable && opt.mode == Mode::COMPRESS && !opt.sliding_window)
+      warn_ignored_zstd_opt("--rsyncable", "gzstd's frames are cut at fixed offsets; "
+                                           "it applies with --sliding-window");
     if (opt.train_block_size)
       warn_ignored_zstd_opt("-B#", "use --chunk-size N (MiB) for frame size");
   }
@@ -48899,6 +49895,25 @@ static Options parse_args(int argc, char ** argv)
     warn_ignored_zstd_opt("--patch-from", "creating patches is not supported; "
                                           "only -d/-t use it");
     opt.patch_from.clear();
+  }
+  // --long and --zstd= on COMPRESSION are CPU work, the -D rule below: nvCOMP
+  // has neither long-distance matching nor zstd's parameters, and a frame from
+  // it would silently lack what was asked for.  On decompression --long only
+  // sets the window limit, and --zstd= means nothing (zstd ignores it there too).
+  if ((opt.long_wlog || opt.zparams_set) && opt.mode == Mode::COMPRESS) {
+    const std::string flag = opt.long_wlog ? "--long" : "--zstd=";
+    const std::string why = opt.long_wlog ? " (nvCOMP has no long-distance matching)"
+                                          : " (nvCOMP takes none of zstd's parameters)";
+    if (opt.gds_only)     die_usage(flag + " is incompatible with --gds-only" + why);
+    if (opt.direct_stage) die_usage(flag + " is incompatible with --direct-stage" + why);
+    if (opt.gpu_only)     die_usage(flag + " is incompatible with --gpu-only" + why);
+    if (opt.hybrid)       die_usage(flag + " is incompatible with --hybrid" + why);
+#ifdef HAVE_NVCOMP
+    if (!opt.cpu_only)
+      vlog(V_VERBOSE, opt, "note: " + flag + " implies --cpu-only" + why + "\n");
+#endif
+    opt.cpu_only = true;
+    opt.backend_user_set = true;
   }
   if (!opt.dict_path.empty() || !opt.patch_from.empty()) {
     // nvCOMP takes no dictionary in either direction, so this is CPU work.  A
@@ -48960,6 +49975,13 @@ static Options parse_args(int argc, char ** argv)
     }
   }
 
+  // --verify checks content by the frames' checksums (compression's pool decodes
+  // each frame and lets the checksum judge it; decompression's adds the checks a
+  // frame lacks), which is precisely what --no-check asks to skip.  Refused rather
+  // than run as a check that checks nothing.
+  if (opt.verify && opt.no_check)
+    die_usage("--verify cannot be combined with --no-check: the round trip is judged "
+              "by the content checksums --no-check leaves out");
   if (opt.verify && opt.mode != Mode::COMPRESS) {
     // Decompression already validates every frame's own checksum as it runs.
     // What --verify adds there (v0.17.92): frames written WITHOUT one, whose
@@ -49139,8 +50161,9 @@ static Options parse_args(int argc, char ** argv)
     opt.output = "stdout";
   }
   else if (!opt.to_stdout && opt.output.empty() && opt.inputs.size() == 1) {
-    // Single file, no -o: auto-derive output name
-    opt.output = derive_output(opt.input, opt.mode);
+    // Single file, no -o: auto-derive output name (or the output directory's)
+    opt.output = opt.input_outputs.empty() ? derive_output(opt.input, opt.mode)
+                                           : opt.input_outputs[0];
   }
   // Multi-file with no -o: output is derived per-file in main loop
 

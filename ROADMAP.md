@@ -47,11 +47,16 @@ was true of the common path and false of roughly thirty options.
   byte-identical to `zstd --train`'s (20 of 20 option sets measured). `--no-dictID` is MAPPED
   since v0.17.71 (it leaves the ID out of frames gzstd writes); it used to be on the silent list
   below. Still missing: CREATING patches (`--patch-from` on compress warns).
-- **Accepted but divergent** (each warns): `-r`/`--recursive` compresses nothing (exit 3
-  since v0.15.69 — it used to exit 0 having done nothing), `--format=gzip` emits zstd,
-  `--output-dir-flat`/`--output-dir-mirror` write nothing, `--no-check` still writes the
-  checksum.
-- **Accepted silently, no effect:** `--[no-]asyncio`, `--[no-]check`,
+- **Real since v0.18.8** (each was ignored, `--no-check` silently; checked against zstd 1.5.7 on
+  the same input): `-r`, `--output-dir-flat`, `--output-dir-mirror`, `--exclude-compressed`,
+  `--long[=N]` (both ways; a `zstd --long=28` archive could not be decoded here before), `--no-check`
+  (both ways; a GPU-compressed frame keeps its checksum), `--rsyncable` (with `--sliding-window`),
+  `--zstd=...`, `--train -c -o` order, and a bare `-M N` as bytes. The `--sliding-window` forms are
+  byte-identical to zstd's. A directory without `-r`, and an existing output among several inputs,
+  are skipped and the run goes on, as in zstd.
+- **Accepted but divergent** (each warns): `--format=gzip` emits zstd; `--rsyncable` without
+  `--sliding-window` (fixed frame offsets).
+- **Accepted silently, no effect:** `--[no-]asyncio`, `--check` (the default),
   `--[no-]compress-literals`, `--[no-]row-match-finder`, `--[no-]mmap-dict`,
   `--stream-size=`, `--size-hint=`, `--target-compressed-block-size=`, `--auto-threads=`.
 
@@ -60,8 +65,10 @@ was true of the common path and false of roughly thirty options.
 | Gap | Size | Note |
 |---|---|---|
 | Creating patches (`--patch-from` on compress) | Medium | Decode shipped. zstd's is ONE long-window frame referencing OLD (plus long-distance matching); gzstd's independent frames would each need OLD as their prefix and a window spanning it |
-| `-r` / `--output-dir-flat` / `--output-dir-mirror` | Small | Self-contained file-walking and output-path mapping |
-| `--long`, `--rsyncable`, `--no-check` | Small | Thin wrappers over zstd parameters gzstd already sets |
+| ~~`-r` / `--output-dir-flat` / `--output-dir-mirror`~~ | DONE v0.18.8 | plus `--exclude-compressed`; the per-file loop stays fail-fast, skips are decided before it |
+| ~~`--long`, `--no-check`~~ | DONE v0.18.8 | `--no-check` leaves GPU-compressed frames' checksums (partial, documented) |
+| `--rsyncable` in frame mode | Medium | Real with `--sliding-window` since v0.18.8.  Frame mode needs CONTENT-DEFINED frame boundaries (a rolling hash in the reader), which would also keep parallel decompress and the seek table -- a feature, not a wrapper |
+| ~~Bare `-M N` = bytes~~ | DONE v0.18.8 | the owner's ruling: zstd's meaning wins; a bare value under 1 MiB prints a note for old gzstd spellings |
 | `--format=gzip\|xz\|lzma\|lz4` | High | Needs zlib/liblzma/liblz4; see Phase 8 |
 | `-b#`/`-e#`/`-i#` benchmark mode | Medium | Overlaps `--calibrate`; decide whether to map or keep separate |
 
@@ -94,8 +101,8 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    finishes. cuInit and device ranking are still unwatched, as on every GPU path.
 4. **`--tar` onto a `1<>` file with more than one link** is refused unless `-f` is given: the name
    the descriptor reports cannot say where the other links are.
-5. **zstd spellings still missing**: `--zstd=...`; a bare `-M` number is MiB where zstd reads bytes;
-   `--train -c -o dict` writes to stdout where zstd lets the later of the two win.
+5. ~~**zstd spellings**~~ CLOSED v0.18.8: `--zstd=...`, the `--train -c -o` order, and a bare `-M`
+   number counting bytes as zstd's does.
 6. **After a failed run the caller's stdout position is best effort** (documented in `--help`).
 7. **`-o` or `--stats-json` naming the `--adapt` profile** lets the profile save replace that output.
     The caller's doing; left.
@@ -117,13 +124,15 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    - rerun the byte-identity cells (`--train`, `-D`, `--sliding-window`) against a zstd CLI of the
      same version, and re-measure the drop-in table above;
    - measure decoding on entropy-coded data (base64 of random) before claiming a speedup.
-9. **Concurrent gzstd processes can lose the GPU at bringup.** MEASURED (v0.18.0, 8-GPU server, 595
-   driver, Default compute mode): six processes starting together on one card, `cudaSetDevice` failed
-   with `cudaErrorDevicesUnavailable` ("busy or unavailable") in 4 of 18 runs; one at a time, 0 of 6.
-   Every path falls back to the CPU, so output is correct, but a batch of parallel jobs
-   (`parallel gzstd ::: files`) can quietly run without the GPU it asked for. A short, bounded retry
-   on that one error, before writing the card off, is the likely fix; measure first whether the other
-   paths' bringup sees the same rate.
+9. ~~**Concurrent gzstd processes can lose the GPU at bringup.**~~ CLOSED v0.18.8. The error this
+   item named never came back: 0 `cudaErrorDevicesUnavailable` in 60 simultaneous compress and
+   decompress starts and 36 `--tar` decode-pool starts, six processes at a time on one card (595
+   driver), so no retry was added for it. The loss that DID reproduce was VRAM. Both GPU paths sized
+   their buffers for the tuner's 256-frame headroom whatever the input held (one 16-frame decompress
+   peaked at 25.4 GiB of an H100, one 16-frame compress at 36.5 GiB), and simultaneous jobs on one card
+   lost the race for it: 15 of 40 compress jobs in rounds of 8, 3 of 60 decompress jobs in rounds of 6.
+   The batch is now capped at the input's frame count (2.1 and 4.8 GiB; 0 of 40 and 0 of 60 lost), and
+   a decompress that loses VRAM while shrinking its batch halves again instead of dropping the card.
 10. **`--sliding-window` placement: the fuller measurement is done (v0.18.7); the policy is still open.**
    MEASURED 2026-10-09 on the 8-GPU server (2 x 64-core EPYC 9554, 16 L3 caches of 8 cores), warm,
    to /dev/null, `taskset` to 1/2/4/8/16 caches (8/16/32/64/128 workers), medians of 3, 2 GiB slices
@@ -192,6 +201,12 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    pipe/stream", after "insufficient VRAM for even 1 stream" on the busy cards. A pipe cannot be rebuilt
    on the CPU, so the refusal itself is correct; what is not known is whether a CONTENDED card should
    count as a fault at all, rather than be skipped like one that is merely full. Not investigated.
+15. **The GPU decompress verify costs a third of a `--gpu-only` decode.** MEASURED v0.18.8, 4 GiB
+   entropy-coded on one H100: 3.26-3.37 s with the device XXH64 verify, 2.19-2.27 s with `--no-check`.
+   XXH64's four lanes are serial within a frame, and `gzx_xxh64_kernel` gives each frame four threads
+   (gpuverify.cu) -- a batch of N frames runs 4N threads, far too few to fill an H100.  Idle host
+   cores (hybrid already finishes in ~0.5 s) might take most of it back.  Measure the kernel's own
+   time at -vvv before designing anything.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

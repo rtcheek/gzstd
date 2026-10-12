@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.7  
+**Covers:** v0.9.50 → v0.18.8  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,7 +8,275 @@
 ---
 
 
-## v0.18.7 — (in progress) simultaneous GPU jobs spread out, a full card is not a fault, the reader pool no longer stalls, and a cold --sliding-window reads O_DIRECT
+## v0.18.8 — (in progress) a GPU batch is sized to its input, a lost VRAM race halves instead of dropping the card, seven zstd options gzstd ignored now work, and -M counts bytes as zstd does
+
+### Suites (2026-10-12, the 8-GPU server, after every review edit)
+
+CPU-only 381 passed, 0 failed, 1m51s, "as expected on this host". GPU `--extensive` 814 passed, 1
+failed, 1 skipped (the usual host skip) of 816, 14m52s. The failure was this release's own batch cap
+meeting a stale fixture: "--gds-only bringup halving" needs four reallocations, and its 32 MiB archive
+of two 16 MiB frames now opens at batch 2 ("batches: 2 1") where the tuner's uncapped 64 used to give
+room. Its archive is now written at 1 MiB frames; the same fixture and command then give "32 16 8 4",
+four reallocations, exit 0. The workstation (GDS unavailable there: 506 default / 798 extensive) is
+still owed, with the v0.18.7 list.
+
+### Simultaneous jobs on one card keep their GPU (ROADMAP 9)
+
+**What ROADMAP 9 named did not come back.** v0.18.0 saw `cudaSetDevice` fail with
+`cudaErrorDevicesUnavailable` in 4 of 18 rounds of six processes starting together on one card. On
+the same server and 595 driver now: 0 in 60 simultaneous `--gpu-only` compress and decompress starts
+and 0 in 36 `--tar` decode-pool starts, six processes at a time on one quiet card. No retry was added
+for an error that cannot be produced to test it.
+
+**What did reproduce was VRAM.** Both GPU paths sized their device buffers for the batch tuner's
+headroom, 256 frames per stream, whatever the input held, and a batch can never hold more frames than
+the input has. Peak device memory of ONE 16-frame (256 MiB) run on an H100: decompress 25,413 MiB,
+compress 36,491 MiB. Started together on one card, the later jobs found too little left and ran
+entirely on the CPU, exiting 0 with correct output:
+
+| 16-frame input, simultaneous jobs on one card | v0.18.5 | v0.18.8 |
+|---|---|---|
+| compress, rounds of 8 (5 rounds) | 15 of 40 jobs without a GPU batch | 0 of 40 |
+| decompress, rounds of 6 (10 rounds) | 3 of 60 | 0 of 60 |
+| peak VRAM, one compress / one decompress | 36,491 / 25,413 MiB | 4,803 / 2,147 MiB |
+
+Round wall times for the 8 compress jobs: 7.31-7.95 s before, 7.34-7.60 s after.
+
+**The fix: no batch larger than the input.** Decompress caps the per-stream batch at the seek table's
+frame count (published beside its largest frame, `g_input_frames`); compress at the input's frame
+count, `ceil(size / chunk)` (`Options::input_frames_hint`, set on the workers' copy only). A pipe or
+an archive without a table keeps the old sizing. An explicit `--gpu-batch` is the user's and is not
+capped. The count is a claim, not evidence: an understated table count can make batches smaller and
+cost throughput, but cannot drop a frame; the per-batch allocator grows if needed. A `--tar` create's
+count is exact (frames span members: 3,000 files of
+50 KB made 10 frames of 16 MiB, `ceil` says 10). The `--adapt` profile sees nothing new: a batch
+larger than the frame count could never run full, so those windows were always discarded as
+supply-limited. Single jobs, interleaved, on one quiet H100 (ms):
+
+| one job | v0.18.7 | v0.18.8 |
+|---|---|---|
+| compress 2 GiB, 128 frames | 1715-1741 | 1669-1709 |
+| decompress 2 GiB, 128 frames | 2652-2705 | 2627-2702 |
+
+**A lost race halves again.** When the decompress VRAM reserve does not fit, bringup frees its
+buffers and rebuilds at half the batch. A process taking the freed VRAM in between used to cost the
+whole device ("lost VRAM while reducing batch to N  skipping device"), although a smaller batch might
+well have fitted. It now frees what the failed attempt took and halves again, down to one frame, before
+writing the device off: the descent the initial allocation already made. Compress's bringup already
+halved to one frame; the `--tar` decode pool sizes against measured free VRAM, and its CPU decoders
+take the work if it loses (0 in 36 above). New hook `GZSTD_DEBUG_REAL_REBUILD_OOM=N` really fails the
+next N rebuilds.
+
+**Tests.** Default: the batch each direction sizes for, at `-vv`, must not exceed a 6-frame input's
+6. Against v0.18.7 both arms fail at 256. `--extensive`: with the reserve forced to fail and the first
+rebuild really failing, the device must come up one halving lower and decode byte-correct; a mutant
+without the retry skips the device (0 GPU batches). Expected counts 521 / 781 (no-GPU deltas 141 / 205).
+
+### Seven zstd options that were ignored now do what zstd does (the drop-in gaps)
+
+The ROADMAP's drop-in list, each checked against zstd 1.5.7 on the same input before and after.
+
+**`-r`, `--output-dir-flat`, `--output-dir-mirror`, `--exclude-compressed`.** All four were accepted
+and ignored: `-r` warned and then failed on the directory as a read error (exit 3, after creating and
+removing `DIR.zst`), and the output directories left every output beside its input. Now
+`gz_resolve_file_inputs` decides everything before the per-file loop, which stays fail-fast:
+
+- `-r` walks each directory as zstd does: readdir order, depth first, hidden files included. So
+  `-r -c` concatenates in the order zstd would on the same filesystem. A symbolic link is skipped
+  with zstd's warning, or followed under `-f`, as zstd's `-f` does.
+- Two deliberate differences from zstd's walk. A FIFO, socket or device is skipped with zstd's own
+  "is not a regular file" (MEASURED: zstd opens a FIFO it meets in the tree and blocks there). A link
+  back to an enclosing directory is refused rather than walked until the path is too long.
+- `-d -r` decodes only `.zst`/`.tzst`/`.zstd` names. `-d`, `-t` and `-l` under `-r` skip a file that
+  does not start with a zstd or skippable frame, with zstd's messages ("unknown suffix", "unknown
+  header", "unexpected end of file", 'File "X" not compressed by zstd'). Each is reported and the
+  run carries on to exit 1, where the fail-fast loop would have stopped at the first one with exit 4.
+- A directory named without `-r` is skipped: "DIR is a directory -- ignored", exit 1, as zstd. It
+  used to fail as a read error, exit 3, after creating and removing `DIR.zst`.
+- An empty directory leaves no inputs, and that exits instead of falling through to standard input
+  (the `--filelist` lesson of v0.17.87).
+- `--output-dir-flat DIR` writes every output into DIR. Two inputs with one name: the later one is
+  skipped, or with `-f` the last one wins after zstd's warning. With `-f --rm` the clash is refused
+  before any work: MEASURED, zstd removed both inputs and kept one output. A missing DIR is refused
+  once, before any work; zstd fails each file on its own.
+- `--output-dir-mirror DIR` mirrors the input's path lexically: `./` and `//` collapse, an absolute
+  path is mirrored in full, a `..` is refused (zstd's message). Directories are created per input, as
+  it is processed. Mirror wins over flat; `-c` and `-o` win over both, as in zstd.
+- `--exclude-compressed` uses zstd's extension table, read from the binary and confirmed file by
+  file: case-sensitive, and `.zstd` and `.tar` are not in it.
+- With several inputs, one whose output already exists (no `-f`) is skipped and kept, and the rest
+  still run, as in zstd; under `--rm` only what was compressed is removed. The run used to stop at
+  the first one. The exit code is then 3, gzstd's code for it; zstd says 1.
+- Both rules apply to every command line, with or without the new options: the owner's ruling,
+  "follow zstd", after the review had held them to the new options (below).
+
+Against zstd on the same trees, 23 shapes: zstd's files in 22; the 23rd is the deliberate refusal
+of a `-f --rm` clash, where zstd loses a file. Exit codes differ only where gzstd's table is finer
+(3 for an existing output) and at the up-front refusal of a missing flat directory.
+
+**`--long[=N]`.** Warned and ignored. That had a sharper edge than it looks: **a `zstd --long=28`
+archive could not be decoded here at all** without `-M`. A frame too large to decode in one shot is
+streamed, and the stream gets libzstd's 128 MiB default. The refusal then said "re-run with
+--keep-going", which cannot help, while the `--long=28` zstd itself names was ignored. The `-M` help
+claimed "without -M there is no limit"; for those frames there never was none.
+
+- On decompression `--long=N` now sets a 2^N limit when `-M` is absent, as in zstd.
+- The default-limit refusal says what zstd says ("its window is 268435456 bytes (256 MiB), past the
+  128 MiB default (zstd's too). Decode it with --long=28 or -M256"), exit 1 as with `-M`.
+- On compression it is long-distance matching with a 2^N window. It implies `--cpu-only`, the `-D`
+  rule: nvCOMP has none, and the GPU backends are refused by name.
+- Frames grow to the window unless `--chunk-size` is given, as `--ultra`'s do, so a match can reach
+  as far back as in zstd. Fewer, larger frames mean less parallelism on a small input: 119 MiB at
+  `--long=27` ran as one frame, 363 ms against 110.
+- MEASURED, a 30 MiB block repeated 90 MiB later: 93.3 MB without `--long=27`, 70.3 MB with it.
+- `--sliding-window --long=27` is byte-identical to `zstd --long=27 -T4`.
+- The frame-mode verify pool now lifts its own decoder's window limit, as the stream verifier
+  already did, since `--long --chunk-size` can write frames past 128 MiB.
+
+**`--no-check`.** It was a SILENT no-op, the class the guiding goal calls worst: zstd drops the
+checksum when compressing and skips it when decoding, and gzstd did neither and said nothing.
+
+- Decoding and `-t` now check nothing, as `zstd -d --no-check`: not the frames' own checksums
+  (libzstd's, `ZSTD_d_forceIgnoreChecksum`), not a seek table's (never loaded), not a pipe's late
+  table, and not on a GPU (no frame is marked as having one). The staged readers also skip the
+  trailer `pread`.
+- MEASURED on a flipped byte in a stored block: exit 4 by default, the wrong bytes at exit 0 with
+  `--no-check`, on CPU, stdin, `--gpu-only` and `--direct-stage` -- exactly zstd's two results.
+- What it buys is the hashing. 4 GiB entropy-coded on one H100: `--gpu-only` decode 3.26-3.37 s with
+  the device verify, 2.19-2.27 s without, so the verify is a third of that decode. CPU decode at 32
+  threads and hybrid decode are unchanged within noise.
+- Compressing: CPU frames carry no checksum, and `--sliding-window --no-check` is byte-identical to
+  zstd's. PARTIAL, documented: a GPU frame keeps the checksum gzstd stamps on nvCOMP's output.
+  Dropping it would change byte accounting on the peer-to-peer pack path to save 4 bytes a frame,
+  hashed on otherwise idle cores.
+- `--verify --no-check` is refused: the round trip is judged by the checksums it leaves out.
+
+**`--rsyncable`.** zstd implements it in its multithreaded single-frame compressor, which is
+`--sliding-window` here, where it is now real and byte-identical. In frame mode it still warns, now
+with the reason: gzstd's frames start at fixed offsets, so one inserted byte moves every later
+boundary. Content-defined frame boundaries would be the frame-mode version (ROADMAP).
+
+**`--zstd=k=v,...`** (it was refused as an unknown option). zstd's advanced parameters, in long and
+short spellings, each overriding the level's.
+- Applied to the CPU contexts beside `--long`, and implies `--cpu-only`.
+- Its windowLog beats `--long`'s, in either order, as in zstd.
+- `--sliding-window --zstd=...` is byte-identical to zstd's for four parameter sets, including
+  `overlapLog`, which is applied only where zstd applies it: with worker threads.
+- A bad key or form, or a value outside the linked library's bounds, is refused before any work.
+  zstd says "Incorrect parameter", exit 1; an out-of-range value it reports only when applied,
+  exit 11.
+
+**`--train -c -o d`** wrote stdout. The later of the two now wins, as in zstd. zstd cannot write a
+dictionary to stdout at all ("cannot open /\*stdout\*\\", exit 3), so `-o d -c` and a lone `-c`
+stay where gzstd does more.
+
+**A bare `-M N` is BYTES, as in zstd** (the owner's ruling: a script moved from zstd must keep its
+meaning). It was MiB, kept so in v0.17.89 because flipping it changes existing gzstd command lines.
+MEASURED, zstd reads a bare number as bytes: `zstd -M1000` refuses as out of bounds, `-M20000000`
+decodes a 16 MiB window (its own `-H` says "megabytes", which is wrong). The suffixes were already
+zstd's (K, M, G, optionally B or iB, powers of 1024) and are unchanged, so `-M512M` means 512 MiB in
+both tools, and a suffixed command line means what it did.
+- The limit is now held in bytes, so the decode boundary is zstd's exactly: `-M8388608` decodes an
+  8 MiB window, `-M8388607` refuses it. The budgets that `-M` also sets on compression, and
+  `--train`'s sample limit (now byte for byte zstd's), read the same bytes.
+- A refusal names the limit with its unit ("-M8MB", "--long=28 or -M160MB"), because following it
+  without one would now ask for bytes.
+- A bare value under 1 MiB prints a note (`-M512 is 512 bytes: a bare number counts bytes, as in
+  zstd (until v0.18.8 it was MiB here)`), the likely sign of an old gzstd spelling. The run still
+  does what it says: a decode refuses every frame and says what would decode it, and a compress
+  keeps its one-frame floor.
+
+**Tests.** Default: one `-r --rm` and `--output-dir-mirror` round trip.
+
+`--extensive`, 38 new cells and three retired, including nine review cells. The retired ones are the
+warn/silent cells of the options now real.
+- The "zstd directories" section now has 24 cells, including the default round trip, three
+  round-four procfd cells, one dangling mirror-output alias cell, and one plain `-d --rm` sequence.
+  Five targeted mutants of it
+  (stdin fall-through, FIFO skip, loop guard, `--rm` clash, magic check) each fail the cell aimed
+  at them.
+- In the compat section, cells for `--long`, `--no-check`, `--rsyncable` and `--zstd=`. Every one
+  fails against v0.18.7.
+- Each byte-identity cell uses input where the option changes zstd's bytes, so ignoring the option
+  cannot pass. The first `--long` and `--rsyncable` cells did not: random input, LDM changes nothing.
+  `--rsyncable` uses a fixed-seed fixture: MEASURED, on random 4 MiB input it changed zstd's bytes in
+  only 1 to 3 seeds of 5.
+- Cells that need the `zstd` binary now skip when it is absent rather than vanish from the count.
+  That includes the two older `-M` cells beside them.
+- The `--train` output cell checks both `-c`/`-o` orders.
+
+Expected counts 522 / 816 (no-GPU deltas 141 / 205; CPU-only 381), with the review cells below. The
+`-M` cells now spell MiB with a unit, check bare bytes at the 8 MiB boundary, and check the note.
+
+### Review (Codex, GPT-6-Sol, high)
+
+Round 1, the batch cap and the lost-race halving: SAFE TO COMMIT. One correction adopted: the comment
+and this section had called the frame-count cap free on any table, and an understated count CAN cost
+batch throughput (never a frame).
+
+Round 2, the drop-in options: SAFE TO COMMIT after three defects it fixed as code, all adopted:
+- **An earlier output could replace a later input.** In a directory holding `a` and `a.zst`,
+  `-r -f --rm` compresses `a` over the input `a.zst` before that input is read. The second pass then
+  archives the replacement, and `--rm` can remove it at exit 0. zstd does the same. The pre-check now
+  refuses, before any work, an output that names a later input. It compares directory entries, each
+  parent resolved once, so a symlinked spelling is caught without a realpath per file. A new cell
+  covers it.
+- **`--patch-from` lifted the window to the format maximum whenever `-M` was absent**, undoing an
+  explicit `--long=N`. Both now win (checked: a 150 MiB-window patch decodes by default and at
+  `--long=28`, and is refused at `--long=27` and `-M100`).
+- **`--calibrate` and `--adapt` ignored the deferred skips:** the exit code bypassed them, and a
+  profile could be saved for a run that will exit nonzero.
+
+It also held the new skip-and-continue rules to the new options. Plain `gzstd --rm a b` with `a.zst`
+present used to stop at `a`; under the first draft it skipped `a`, compressed and removed `b`, and
+exited 3. Plain `gzstd DIR` went from exit 3 to 1. Both change a command line that uses none of the
+new options, which the round's own bar forbade. **The owner ruled: follow zstd.** Plain runs now take
+both rules, and the cells check zstd's behavior (the directory skipped at exit 1 with the other input
+compressed; under `--rm` the skipped input kept and only the compressed one removed).
+
+Round 3, review of the round-2 repairs: the later-input guard also has to protect a file reached
+through a symlink under `-f`. An earlier output could replace the target or an intermediate link
+of a later symlink chain while the input's own entry remained untouched. The guard now records every
+entry in a followed file symlink chain and refuses the collision before work; two extensive cells
+pin the source bytes and exit code. A parent it cannot resolve now refuses too (an unknown parent is
+no evidence that two names differ), and parents are keyed by device and inode, which also covers a
+bind-mount spelling. Built warning-free both ways; the section passes 19 of 19 on both builds, and a
+mutant that compares the link's own name only fails exactly the two new cells, at exit 0.
+
+Round 4, review of that repair: resolving a parent by pathname could refuse a usable
+`/proc/self/fd/N` directory whose displayed path crosses an inaccessible ancestor, including a
+mirror output parent created below it. Parents are now keyed from `O_PATH` directory descriptors;
+missing suffixes are kept relative to the nearest existing descriptor. A dangling symlink in that
+prefix must be followed: `out/alias -> future` can become live when an earlier mirror output creates
+`out/future`, so two inputs could overwrite one archive before `--rm` removes both. The symlink-chain walk also
+stops at procfs magic links, whose displayed target may be inaccessible while the held file is
+readable. Four extensive cells cover these cases. Built warning-free both ways; the section passes
+23 of 23 on both builds; a mutant that never follows a dangling link fails exactly the dangling-link
+cell, at exit 0.
+
+Round 5, review of the owner's plain-file and byte-sized `-M` rulings: the up-front existing-output
+check could skip a later `-d --rm a.zst.zst` because its output `a.zst` exists at parse time, even
+though the preceding `-d --rm a.zst` removes that name before the second input runs. It now treats
+an output reached through an earlier input entry as available at that point; the ordinary per-file
+output check still makes the final decision. Earlier entries are keyed only when an output is
+occupied, keeping extra parent opens off the usual `--rm` path. One extensive cell pins both decoded
+payloads and the exit code. The plain-file resolver avoids a redundant `stat` after `lstat` identifies a regular
+file. Five `-M` budget conversions clamp to `size_t` rather than wrap on a 32-bit target, and the
+nearby RAM fallback/hard-cap constants do not truncate to zero there. The small bare `-M` note now
+uses the actual option spelling and still appears if input resolution skips every named file.
+It also made an explicit `-M0` mean "unlimited", overriding `--long=N`; that one was NOT adopted:
+zstd reads `-M0` as no `-M` at all (MEASURED: `zstd -d -M0` keeps its 128 MiB default and
+`--long=27 -M0` refuses a 256 MiB window), and the owner's ruling is zstd's meaning. The cell now
+asserts zstd's result.
+`--train -M1` now reports that its limit holds no complete sample before calling libzstd with an
+empty sample set. The existing training and memory-size cells gained targeted assertions.
+Built warning-free both ways. Its new cell first reused the name `chain.zst`, which a later
+symlink-chain cell creates with `ln -s`; with an archive already there the link was never made and
+that cell failed (exit 0, nothing to refuse) -- a fixture collision, renamed. Then: the directory
+section 24 of 24 on both builds, the v0.17.89 decisions block, the compat block and Dictionaries all
+pass on both; a mutant that never treats an output as freed fails exactly the new cell (exit 3).
+
+## v0.18.7 — simultaneous GPU jobs spread out, a full card is not a fault, the reader pool no longer stalls, and a cold --sliding-window reads O_DIRECT
 
 ### Suites (2026-10-09, the 8-GPU server, after every review edit)
 
