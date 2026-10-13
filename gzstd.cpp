@@ -2962,8 +2962,10 @@ static std::string gz_stage_read_reason()
  an exchange rate is the thing this codebase has no defensible way to pick
  (it would be a machine-tuned constant in all but name).
 
- Ties on the combined score go to more free VRAM, then to lower util — so the
- all-idle case still lands on the roomiest card, which is what shipped before.
+ Ties on the combined score go to lower util, then to more free VRAM — the idler
+ card, not the roomier one, for the measured reason at the tie-break below.  The
+ all-idle case still lands on the roomiest card, which is what shipped before:
+ util ranks all tie at 0 there, so vram_rank alone decides the sum.
 ======================================================================*/
 #ifdef HAVE_NVCOMP
 struct GzDevRank {

@@ -8,7 +8,7 @@
 ---
 
 
-## v0.18.8 — (in progress) a GPU batch is sized to its input, a lost VRAM race halves instead of dropping the card, seven zstd options gzstd ignored now work, and -M counts bytes as zstd does
+## v0.18.8 — a GPU batch is sized to its input, a lost VRAM race halves instead of dropping the card, seven zstd options gzstd ignored now work, and -M counts bytes as zstd does
 
 ### Suites (2026-10-12, the 8-GPU server, after every review edit)
 
@@ -68,8 +68,8 @@ it does not pay here either, at 4-14 ms, so it stays opt-in. In two VRAM-regime 
 starved card FIRST: back to back, the other card still carried utilization from the previous job (it
 had done most of it), the two scored 1 each, and a tie goes to the idler card (a rule measured on the
 server). After an idle gap the driver and NVML both rank it last. The block comment above
-`gz_rank_devices` still says ties go to more free VRAM; the code (and its own inline comment) prefers
-the idler card.
+`gz_rank_devices` said ties go to more free VRAM; the code (and its own inline comment) prefers the
+idler card. The comment is corrected; the code is unchanged.
 
 **`--sliding-window` placement on a one-L3 part** (ROADMAP 10): see the ROADMAP for the table. Fewer
 workers win at levels 1-3 here too (4-6 workers against the default 12: 1.13-2.10x), so the effect is
@@ -77,6 +77,33 @@ not specific to many-cache parts; levels 6-9 are within ~10%; at levels 12 and 1
 thread (`-T0`, 24) wins on the medium and low-ratio corpora (1.14-1.50x; at 15 only on low-ratio,
 1.13x), where the default is one worker per physical core (measured on the idle-or-shared 2-socket
 server, "level 19 no worse"). Neither default changed: both are one box's evidence.
+
+### Real-data round trips (2026-10-12, the 8-GPU server; RELEASING 3)
+
+None had been recorded since v0.18.3, so these cover v0.18.4 through v0.18.8. All of them ran on the
+0.18.8 GPU build, on NVMe, while another user's job held four of the eight cards (57-66 GiB each).
+Every run exited 0 and every result was byte-identical. No log printed a warning, rescue or fallback
+apart from the one designed warning noted below.
+
+- **A few huge files:** a `--tar` archive of the 131 GiB test corpus (ten files, five of them 20 GiB,
+  one all zeros), 65.4 GiB: create 41 s, `-t --tar` 20 s, extract 32 s.
+- **Many small files:** a conda installation of 252,306 entries (dangling symlinks among the symlinks,
+  80,418 hardlink groups), 7.3 GiB: create 12.7 s, extract 11.4 s. Trees are compared by content
+  (`diff -r`), by type, mode, owner, size, mtime and link target for every entry, and by hardlink group.
+- **Compression-heavy:** three 20 GiB files at `-19`, stored at 25.9% of source. A hybrid run, so only
+  the CPU frames are at level 19; the GPU frames are at nvCOMP's fixed level. Extracted under
+  `--adapt`, it went through the decode pool (96 decoders, settled at 15 readers + 96 decoders), not
+  inline.
+- **The GPU engaged:** `-T 1` on a 20 GiB file, 33 GPU batches compressing and 58 decompressing.
+- **A foreign single-frame archive:** a 70 GB zstd file holding one 130.35 GiB frame and no seek
+  table. `-t` was clean, and `-dc` piped into `cmp` matched the original tar. It warns "first frame
+  decompresses to 130.35 GiB (GPU max: 16 MiB)" and decodes on one CPU thread, as designed.
+
+On the three tar archives, three more checks:
+- GNU tar 1.35 (`tar --zstd -xpf`) extracted each one to the same bytes and metadata.
+- `-l --tar` printed the same bytes as `tar -tvf` (11, 252,306 and 3 lines).
+- `-d --tar --adapt` from an archive evicted from the page cache (0 pages resident) was identical on
+  all three, with the decode pool engaged each time.
 
 ### Simultaneous jobs on one card keep their GPU (ROADMAP 9)
 
