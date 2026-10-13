@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.8";
+static constexpr const char * GZSTD_VERSION = "0.18.9";
 //
 // Architecture overview:
 //
@@ -2871,6 +2871,20 @@ struct Options {
                                   //  the table, record the profile) instead of compressing
   std::string input;              // current file being processed
   std::vector<std::string> inputs; // all positional args (multi-file)
+  // Parallel to `inputs` while parsing: true where the name came from --filelist,
+  // which zstd's named-symlink rule does not apply to.  Cleared once that rule
+  // has run (gz_drop_named_symlinks); nothing after it reads this.
+  std::vector<bool> input_listed;
+  // Names skipped by the CLI symlink rule.  Not read, but still NAMED as inputs:
+  // the checks that refuse to write over an input (--stats-json, the --train
+  // dictionary) consult these too, or the writer would follow the link and
+  // replace its target.  (The stdout check is about what the run READS, and a
+  // skipped link is not read.)
+  std::vector<std::string> skipped_named_symlinks;
+  // --stats-json must protect names dropped by the resolver as well as names
+  // it will read.  This records original operands and recursive walk entries
+  // before later filters discard them; only populated for --stats-json.
+  std::vector<std::string> stats_input_candidates;
   std::string output;             // explicit -o; empty = auto-derive per file
 
   // --tar: synthesize a GNU-format tar stream from tar_sources and feed it to
@@ -4251,8 +4265,10 @@ static void print_help_long()
 "     On ext4 with large outputs the\n"
 "     rename can stall while the journal flushes dirty pages; use\n"
 "     --overwrite if that cost is unacceptable.\n"
-"     Under -r, -f also makes the directory walk follow symbolic links,\n"
-"     as zstd's does (see DIRECTORIES under COMPATIBILITY OPTIONS).\n"
+"     -f also lets a symbolic link named as an input be read: without it\n"
+"     the link is skipped with a warning, as in zstd (v0.18.9).  Under -r,\n"
+"     -f makes the directory walk follow symbolic links too, as zstd's\n"
+"     does (see DIRECTORIES under COMPATIBILITY OPTIONS).\n"
 "\n"
 "  --overwrite\n"
 "     UNLINK-FIRST.  The existing output is removed BEFORE the new one is\n"
@@ -5545,6 +5561,11 @@ static void print_help_long()
 "                  and a link back to an enclosing directory is refused.\n"
 "     A directory named WITHOUT -r is skipped: \"DIR is a directory --\n"
 "                  ignored\", as zstd says it.\n"
+"     A symbolic link named as an input is skipped unless -f (v0.18.9),\n"
+"                  for every operation, as in zstd; a link to a FIFO is\n"
+"                  read, and names from --filelist are not filtered.  The\n"
+"                  skip changes the exit code only when nothing is left\n"
+"                  to do (then 1).\n"
 "     --output-dir-flat DIR   writes every output into DIR (which must\n"
 "                  exist).  Two inputs with the same name: the later one\n"
 "                  is skipped, or with -f the last one wins -- refused\n"
@@ -5557,8 +5578,9 @@ static void print_help_long()
 "                  compressed extensions (.zst, .gz, .xz, .zip, .jpg,\n"
 "                  .mp4 and about a hundred more; case matters).\n"
 "     With several inputs, one whose output already exists (no -f) is\n"
-"     skipped and the rest are still processed, as in zstd; the exit code\n"
-"     is then 3 (zstd says 1).  Skipped inputs are reported one per line.\n"
+"     skipped and the rest are still processed, as in zstd; so is one that\n"
+"     does not exist (\"can't stat\", v0.18.9).  The exit code is then 3\n"
+"     (zstd says 1).  Skipped inputs are reported one per line.\n"
 "\n"
 "  --long[=N] (v0.18.8; was accepted and ignored), N = 10..31, default 27:\n"
 "     compress: long-distance matching with a 2^N-byte window, as zstd's.\n"
@@ -14905,8 +14927,9 @@ constexpr size_t   NOISE_LEN   = 32;                    // NOISELENGTH
 // UTIL_prepareFileList: readdir order (NOT sorted -- the shuffle below is
 // applied to this order, so sorting would change the dictionary), depth
 // first, "." and ".." skipped, symbolic links skipped with a warning.
+// Retain skipped link names for the dictionary-output collision check.
 static void expand_dir(const std::string & dir, std::vector<std::string> & out,
-                       const Options & opt)
+                       std::vector<std::string> & skipped_links, const Options & opt)
 {
   DIR * d = opendir(dir.c_str());
   if (!d) die_io("cannot open directory " + dir + " (" + std::strerror(errno) + ")");
@@ -14916,9 +14939,10 @@ static void expand_dir(const std::string & dir, std::vector<std::string> & out,
     const std::string path = dir + "/" + e->d_name;
     struct stat st {};
     if (::lstat(path.c_str(), &st) == 0 && S_ISLNK(st.st_mode)) {
+      skipped_links.push_back(path);
       vlog(V_DEFAULT, opt, "gzstd: warning: " + path + " is a symbolic link, ignoring\n");
     } else if (::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-      expand_dir(path, out, opt);
+      expand_dir(path, out, skipped_links, opt);
     } else {
       out.push_back(path);
     }
@@ -14970,13 +14994,14 @@ static int run_train(const Options & opt)
   using namespace train;
   // 1. The file list: inputs as given, directories expanded under -r.
   std::vector<std::string> files;
+  std::vector<std::string> skipped_tree_links;
   for (const std::string & in : opt.inputs) {
     struct stat st {};
     if (::stat(in.c_str(), &st) != 0)
       die_io("cannot open training sample " + in + " (" + std::strerror(errno) + ")");
     if (S_ISDIR(st.st_mode)) {
       if (!opt.recursive) die_usage(in + " is a directory: pass -r to train on the files under it");
-      expand_dir(in, files, opt);
+      expand_dir(in, files, skipped_tree_links, opt);
     } else {
       files.push_back(in);
     }
@@ -14994,13 +15019,19 @@ static int run_train(const Options & opt)
   const bool out_exists = train_stdout
       ? (::fstat(fileno(stdout), &ost) == 0)
       : (::stat(out_path.c_str(), &ost) == 0);
-  if (out_exists && S_ISREG(ost.st_mode))
-    for (const std::string & f : files) {
+  if (out_exists && S_ISREG(ost.st_mode)) {
+    // A sample named through a link that was skipped (no -f) is not trained on,
+    // but it was named: the dictionary must not replace it either (v0.18.9).
+    auto refuse_sample = [&](const std::string & f) {
       struct stat fst {};
       if (::stat(f.c_str(), &fst) == 0 && fst.st_dev == ost.st_dev && fst.st_ino == ost.st_ino)
         die_usage("--train: the output " + out_path + " is also one of the samples (" + f
                   + "); writing it would replace that sample. Name another output with -o");
-    }
+    };
+    for (const std::string & f : files) refuse_sample(f);
+    for (const std::string & f : opt.skipped_named_symlinks) refuse_sample(f);
+    for (const std::string & f : skipped_tree_links) refuse_sample(f);
+  }
   shuffle(files);
 
   // 2. How much to load (DiB_fileStats).  Sizes are taken once, in shuffled order.
@@ -15091,7 +15122,7 @@ static int run_train(const Options & opt)
   vlog(V_DEBUG, opt, "Loaded " + std::to_string(filled / 1024) + " KB total training data, "
                        + std::to_string(nloaded) + " nb samples \n");
   if (opt.mem_limit_bytes && nloaded == 0)
-    die_usage("--train: memory limit cannot hold even one complete sample");
+    die("--train: memory limit cannot hold even one complete sample");
 
   // 4. Train, with zstd's parameters.  Threads only change the optimizer's
   // speed; zstd's default is MAX(1, MIN(4, cores/4)), and gzstd uses the same
@@ -43374,6 +43405,16 @@ static void append_tar_index(int dfd, FILE * f, Meter & meter) {
 static int run_calibrate(Options opt)
 {
   const double GiB = 1024.0 * 1024.0 * 1024.0;
+  // FILE is a corpus operand even when there is no GPU device-count pass
+  // (CPU-only builds and the small-corpus test hook).  Validate it before
+  // generating the synthetic corpus or recording a profile.
+  if (opt.inputs.size() > 1)
+    die_usage("--calibrate takes at most one FILE");
+  if (opt.inputs.size() == 1 && opt.inputs[0] != "-") {
+    struct stat st {};
+    if (::stat(opt.inputs[0].c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+      die_usage("--calibrate FILE: " + opt.inputs[0] + " is not a readable regular file");
+  }
   // Refuse an existing -o target BEFORE measuring anything: the device-count
   // pass below can run for minutes, and the sink block that also checks this
   // comes after it.
@@ -44343,12 +44384,13 @@ static int gzstd_main(int argc, char ** argv)
   // replaced that input with the previous file's JSON before it was read:
   // `--stats-json b a b` compressed a, wrote its stats over b, and only then
   // refused b (exit 2) -- whose data was already gone.  Compare against every
-  // input up front; the per-file check below remains for the one opened.
+  // input up front, including a name dropped by the resolver or a recursive
+  // walk; the per-file check below remains for the one opened.
   if (!opt.stats_json.empty() && !opt.tar_mode) {
     struct stat stats_st {};
     if (::stat(opt.stats_json.c_str(), &stats_st) == 0
-        && gz_stats_target_holds_data(stats_st))
-      for (const std::string & in : opt.inputs) {
+        && gz_stats_target_holds_data(stats_st)) {
+      auto refuse_stats_input = [&](const std::string & in) {
         struct stat input_st {};
         const bool known = in == "-" ? ::fstat(STDIN_FILENO, &input_st) == 0
                                      : ::stat(in.c_str(), &input_st) == 0;
@@ -44356,7 +44398,15 @@ static int gzstd_main(int argc, char ** argv)
             && input_st.st_ino == stats_st.st_ino)
           die_usage("--stats-json output is also an input: " + opt.stats_json
                     + (in == opt.stats_json ? "" : " (" + in + ")"));
-      }
+      };
+      // When the resolver filled stats_input_candidates, it holds every operand and
+      // every walked entry: a superset of the inputs left, so one pass covers both
+      // (a -r run over a large tree would otherwise stat each name twice).
+      const std::vector<std::string> & names =
+          opt.stats_input_candidates.empty() ? opt.inputs : opt.stats_input_candidates;
+      for (const std::string & in : names) refuse_stats_input(in);
+      for (const std::string & in : opt.skipped_named_symlinks) refuse_stats_input(in);
+    }
   }
 #ifndef _WIN32
   // The same for --tar create, whose stats were written over an archived
@@ -48510,6 +48560,7 @@ static void gz_walk_dir(Options & opt, const std::string & dir,
     const bool is_link = S_ISLNK(st.st_mode);
     if (is_link) {
       if (!opt.force) {
+        if (!opt.stats_json.empty()) opt.stats_input_candidates.push_back(path);
         if (opt.verbosity >= V_DEFAULT)
           std::fprintf(stderr, "gzstd: warning: %s is a symbolic link, ignoring\n", path.c_str());
         continue;
@@ -48592,11 +48643,16 @@ static void gz_resolve_file_inputs(Options & opt)
                 "archive with -o; extract into a directory with -C)");
     return;   // -r means nothing more to --tar: it always recurses
   }
+  // --calibrate FILE names a corpus to measure, not files to process: its own
+  // check says what is wrong with it ("not a readable regular file", exit 2).
+  if (opt.calibrate) return;
   if (opt.inputs.empty()) return;   // standard input; nothing to resolve
+  if (!opt.stats_json.empty()) opt.stats_input_candidates = opt.inputs;
   // EVERY named-file run, with or without the new options -- the owner's ruling
   // (v0.18.8): zstd's contract.  A directory without -r is skipped (exit 1), and
   // with several inputs one whose output exists is skipped while the rest still
-  // run (exit 3).  Under --rm only the inputs actually compressed are removed.
+  // run (exit 3), as is one that cannot be looked up at all (exit 3, v0.18.9).
+  // Under --rm only the inputs actually compressed are removed.
   // The first review round held this to the new options, because plain
   // `gzstd DIR` used to exit 3 and plain `gzstd --rm a b` used to stop at `a`;
   // both now behave as zstd does, which is the point.
@@ -48608,23 +48664,33 @@ static void gz_resolve_file_inputs(Options & opt)
   bool dropped = false;
   for (const std::string & in : opt.inputs) {
     if (in == "-") { files.push_back(in); continue; }
+    // A name that cannot be looked up -- missing, a dangling link reached under
+    // -f or through --filelist, a path through an unreadable directory -- is
+    // skipped with zstd's message and the rest still run (v0.18.9).  It used
+    // to reach the per-file open, which stopped the whole run there.  The
+    // exit code stays gzstd's 3, as for an input whose output exists; zstd
+    // says 1.  (A named link without -f never gets here: gz_drop_named_symlinks.)
     struct stat st {};
-    const bool lst_ok = ::lstat(in.c_str(), &st) == 0;
-    if (lst_ok && S_ISLNK(st.st_mode) && opt.force)
-      followed_file_links.insert(in);
-    if (lst_ok && opt.recursive && S_ISLNK(st.st_mode) && !opt.force) {
-      // zstd -r skips a symbolic link even when it is named, and exits 1.
-      if (opt.verbosity >= V_DEFAULT)
-        std::fprintf(stderr, "gzstd: warning: %s is a symbolic link, ignoring\n", in.c_str());
-      opt.deferred_exit = std::max(opt.deferred_exit, EXIT_ERROR);
+    if (::lstat(in.c_str(), &st) != 0) {
+      gz_drop_input(opt, "can't stat " + in + " : " + std::strerror(errno) + " -- ignored",
+                    EXIT_IO);
       dropped = true;
       continue;
     }
+    if (S_ISLNK(st.st_mode) && opt.force)
+      followed_file_links.insert(in);
     // lstat already settled a regular file.  Only a symlink needs the second
-    // lookup to tell whether its target is a directory.  This is on every
-    // plain named-file run now, so avoid a redundant stat per ordinary file.
-    const bool is_dir = lst_ok && (S_ISDIR(st.st_mode)
-        || (S_ISLNK(st.st_mode) && ::stat(in.c_str(), &st) == 0 && S_ISDIR(st.st_mode)));
+    // lookup, to tell whether its target is a directory.
+    bool is_dir = S_ISDIR(st.st_mode);
+    if (S_ISLNK(st.st_mode)) {
+      if (::stat(in.c_str(), &st) != 0) {
+        gz_drop_input(opt, "can't stat " + in + " : " + std::strerror(errno) + " -- ignored",
+                      EXIT_IO);
+        dropped = true;
+        continue;
+      }
+      is_dir = S_ISDIR(st.st_mode);
+    }
     if (is_dir) {
       if (!opt.recursive) {
         // zstd's message and exit 1.  This used to be "read error on DIR (Is a
@@ -48636,6 +48702,9 @@ static void gz_resolve_file_inputs(Options & opt)
       std::vector<std::pair<dev_t, ino_t>> stack{{st.st_dev, st.st_ino}};
       std::vector<std::string> walked;
       gz_walk_dir(opt, in, stack, walked, followed_file_links);
+      if (!opt.stats_json.empty())
+        opt.stats_input_candidates.insert(opt.stats_input_candidates.end(),
+                                          walked.begin(), walked.end());
       for (std::string & f : walked) {
         // -d needs a suffix to name the output.  Only files the WALK found: a
         // file named on the command line keeps gzstd's "NAME.out" naming.
@@ -48950,6 +49019,51 @@ static void gz_resolve_file_inputs(Options & opt)
   opt.input_outputs.swap(outs);
 }
 
+// A SYMBOLIC LINK NAMED AS AN INPUT is skipped unless -f (v0.18.9), zstd's rule
+// for every operation that takes file names: compress, -d, -t, -l, -c, -o and
+// --train (MEASURED against zstd 1.5.7: "is a symbolic link, ignoring", hidden by
+// -q).  Only -r did this here; a plain run followed the link, and under --rm
+// removed it.  As in zstd:
+//   * a dangling link is skipped the same way, and a link to a FIFO is kept
+//     (zstd reads a FIFO named through a link);
+//   * names from --filelist are not filtered (zstd merges the list afterwards);
+//   * a skipped link does not change the exit code -- unless it leaves nothing
+//     to do, and then the run exits 1 at once.  Never the stdin fall-through
+//     (the --filelist lesson, v0.17.87).
+// One difference, deliberately: when every COMMAND-LINE name is a link but
+// --filelist named files, zstd exits 1 without reading the list; gzstd runs the
+// list.  -f follows every link, as zstd's -f does.  --tar keeps tar's meaning
+// (a named link is archived as a link) and never gets here.
+static void gz_drop_named_symlinks(Options & opt)
+{
+  std::vector<bool> listed;
+  listed.swap(opt.input_listed);   // read once, here; nothing later uses it
+  // --calibrate FILE is gzstd's own command and checks its one FILE itself.
+  if (opt.force || opt.tar_mode || opt.calibrate || opt.inputs.empty()) return;
+  std::vector<std::string> kept;
+  kept.reserve(opt.inputs.size());
+  bool skipped = false;
+  for (size_t k = 0; k < opt.inputs.size(); ++k) {
+    std::string & in = opt.inputs[k];
+    struct stat st {};
+    if (in != "-" && !(k < listed.size() && listed[k])
+        && ::lstat(in.c_str(), &st) == 0 && S_ISLNK(st.st_mode)
+        && !(::stat(in.c_str(), &st) == 0 && S_ISFIFO(st.st_mode))) {
+      if (opt.verbosity >= V_DEFAULT)
+        std::fprintf(stderr, "gzstd: warning: %s is a symbolic link, ignoring\n", in.c_str());
+      opt.skipped_named_symlinks.push_back(in);
+      skipped = true;
+      continue;
+    }
+    kept.push_back(std::move(in));
+  }
+  opt.inputs.swap(kept);   // always: the kept names were moved out of opt.inputs
+  if (skipped && opt.inputs.empty()) {
+    std::fflush(stderr);
+    std::exit(EXIT_ERROR);
+  }
+}
+
 static Options parse_args(int argc, char ** argv)
 {
   Options opt;
@@ -49018,11 +49132,14 @@ static Options parse_args(int argc, char ** argv)
   // the -C in effect at its position (the parallel tar_source_dest vector).
   // A push site that bypasses this desyncs the vectors and their consumers
   // index out of bounds — the v0.14.80 `--tar -- SRC` segfault.
-  auto push_positional = [&opt](const std::string & p) {
+  auto push_positional = [&opt](const std::string & p, bool listed = false) {
     if (opt.tar_mode) {
       opt.tar_sources.push_back(p);
       opt.tar_source_dest.push_back(opt.tar_dest);
-    } else opt.inputs.push_back(p);
+    } else {
+      opt.inputs.push_back(p);
+      opt.input_listed.push_back(listed);
+    }
   };
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -49535,7 +49652,7 @@ static Options parse_args(int argc, char ** argv)
       size_t listed = 0;
       while (std::getline(ls, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) { push_positional(line); ++listed; }
+        if (!line.empty()) { push_positional(line, true); ++listed; }
       }
       // A read error is not the end of the list: stopping there would process
       // the paths read so far and exit 0.
@@ -49730,6 +49847,11 @@ static Options parse_args(int argc, char ** argv)
       opt.stdout_flag = false;
       opt.to_stdout = false;
     }
+    if (g_mem_bare_small && opt.verbosity >= V_DEFAULT)
+      std::fprintf(stderr, "gzstd: note: %s is %llu bytes: a bare number counts bytes, as in "
+                   "zstd (until v0.18.8 it was MiB here); write it with M for MiB\n",
+                   g_mem_bare_spelling.c_str(), (unsigned long long)opt.mem_limit_bytes);
+    gz_drop_named_symlinks(opt);   // zstd skips a named link sample too
     g_verbosity = opt.verbosity;
     g_color_stderr = is_stderr_tty();
     return opt;
@@ -49761,6 +49883,7 @@ static Options parse_args(int argc, char ** argv)
     std::fprintf(stderr, "gzstd: note: %s is %llu bytes: a bare number counts bytes, as in "
                  "zstd (until v0.18.8 it was MiB here); write it with M for MiB\n",
                  g_mem_bare_spelling.c_str(), (unsigned long long)opt.mem_limit_bytes);
+  gz_drop_named_symlinks(opt);
   gz_resolve_file_inputs(opt);
   if (opt.inputs.empty()) opt.inputs.push_back("-");
 

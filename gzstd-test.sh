@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=522
-$EXTENSIVE && EXPECTED_TESTS=816
+EXPECTED_TESTS=523
+$EXTENSIVE && EXPECTED_TESTS=819
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -628,6 +628,10 @@ $EXTENSIVE && EXPECTED_TESTS=816
 # Round-three review: +2 --extensive symlink-target/chain cells: 809 -> 811.
 # Round-four review: +3 procfd cells and +1 dangling output-alias cell: 811 -> 815.
 # Round-five review: +1 plain --rm output freed by an earlier input: 815 -> 816.
+# v0.18.9: +2 --extensive (a named symlink is skipped unless -f; a missing input
+# is skipped and the rest run): 816 -> 818.  None needs a GPU.
+# Round-six continuation: +1 default for --calibrate FILE validation without
+# a GPU device-count pass: 522 -> 523, 818 -> 819.
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -1811,8 +1815,21 @@ PYEOF
   [[ $rc -eq 3 ]] || why+=" missing:$rc"
   "$GZSTD" -q --train-cover=q=1 "${TRF[@]}" -o "$TRD/x" >/dev/null 2>&1; rc=$?; [[ $rc -eq 2 ]] || why+=" bad-params:$rc"
   "$GZSTD" -q --train -M1 "${TRF[@]}" -o "$TRD/x" >/dev/null 2>"$TRD/m1.err"; rc=$?
-  [[ $rc -eq 2 ]] && grep -aq 'cannot hold even one complete sample' "$TRD/m1.err" \
+  [[ $rc -eq 1 ]] && grep -aq 'cannot hold even one complete sample' "$TRD/m1.err" \
     || why+=" tiny-memory:$rc"
+  # A sample named through a link is skipped without -f (v0.18.9) and not
+  # trained on, but it was named: -o its target must still be refused, or the
+  # dictionary replaces it at exit 0 (it did, before the skipped names were kept).
+  cp "${TRF[0]}" "$TRD/linked.json"; cp "$TRD/linked.json" "$TRD/linked.orig"
+  ln -sf linked.json "$TRD/Ls.json"
+  "$GZSTD" -q --train "$TRD/Ls.json" "${TRF[@]}" -o "$TRD/linked.json" >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 2 ]] && cmp -s "$TRD/linked.json" "$TRD/linked.orig" || why+=" skipped-link-sample:$rc"
+  mkdir -p "$TRD/tree"; ln -s ../linked.json "$TRD/tree/L"
+  "$GZSTD" -q --train -r "$TRD/tree" "${TRF[@]}" -o "$TRD/linked.json" \
+    >/dev/null 2>"$TRD/tree-link.err"; rc=$?
+  [[ $rc -eq 2 ]] && cmp -s "$TRD/linked.json" "$TRD/linked.orig" \
+    && grep -q 'also one of the samples' "$TRD/tree-link.err" || why+=" skipped-tree-link-sample:$rc"
+  rm -f "$TRD/linked.json" "$TRD/linked.orig" "$TRD/Ls.json"
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
   [[ -z "$why" ]] && pass "--train output (./dictionary, -o replaced, -c) and refusals" \
     || fail "--train output (./dictionary, -o replaced, -c) and refusals" "got$why"
@@ -1945,6 +1962,55 @@ mk_b64 "$TR/in/s"; cp "$TR/in/s" "$TR/s.orig"
 cmp -s "$TR/in/s" "$TR/s.orig" || why+=" stdin-source-replaced"
 "$GZSTD" -q -f --stats-json "$TR/st.json" "$TR/in/a.zst" "$TR/in/b.zst" 2>/dev/null; rc=$?
 [[ $rc -eq 0 && -s "$TR/st.json" ]] || why+=" separate-stats:$rc"
+# A named symlink is skipped without -f, but its target is still a named
+# input for the stats collision guard.  Otherwise this run truncates `linked`
+# through `L` after compressing `first` and exits successfully.
+mk_b64 "$TR/in/first"; mk_b64 "$TR/in/linked"; cp "$TR/in/linked" "$TR/linked.orig"
+ln -s linked "$TR/in/L"
+"$GZSTD" -q --cpu-only --stats-json "$TR/in/L" "$TR/in/first" "$TR/in/L" 2>/dev/null; rc=$?
+[[ $rc -eq 2 ]] || why+=" skipped-link-stats:$rc"
+cmp -s "$TR/in/linked" "$TR/linked.orig" || why+=" skipped-link-target-replaced"
+[[ -e "$TR/in/first.zst" ]] && why+=" skipped-link-first-ran"
+# The resolver can drop a named input after the link filter: an existing
+# output makes that input unavailable, but the stats writer must still refuse
+# to replace it.  Cover a --filelist symlink, a member found by -r, and a
+# symlink skipped inside a recursively walked directory.
+mk_b64 "$TR/in/other"; mk_b64 "$TR/in/plain"; cp "$TR/in/plain" "$TR/plain.orig"
+# The plainest case, and v0.18.8's own regression (0.18.3 refused it): a named
+# file whose output exists is skipped by the resolver, then its stats replace it.
+echo occupied > "$TR/in/plain.zst"
+"$GZSTD" -q --cpu-only --stats-json "$TR/in/plain" "$TR/in/other" "$TR/in/plain" 2>/dev/null; rc=$?
+[[ $rc -eq 2 ]] || why+=" resolver-plain:$rc"
+cmp -s "$TR/in/plain" "$TR/plain.orig" || why+=" resolver-plain-replaced"
+[[ -e "$TR/in/other.zst" ]] && why+=" resolver-plain-other-ran"
+rm -f "$TR/in/other.zst"
+mk_b64 "$TR/in/hold"; cp "$TR/in/hold" "$TR/hold.orig"
+ln -s hold "$TR/in/L2"; printf '%s\n' "$TR/in/L2" > "$TR/list"
+echo occupied > "$TR/in/L2.zst"
+"$GZSTD" -q --cpu-only --stats-json "$TR/in/L2" "$TR/in/other" --filelist "$TR/list" \
+  2>"$TR/filelist-link.err"; rc=$?
+[[ $rc -eq 2 ]] && grep -q -- '--stats-json output is also an input' "$TR/filelist-link.err" \
+  || why+=" resolver-filelist-link:$rc"
+cmp -s "$TR/in/hold" "$TR/hold.orig" || why+=" resolver-filelist-target-replaced"
+[[ -e "$TR/in/other.zst" ]] && why+=" resolver-filelist-other-ran"
+rm -f "$TR/in/other.zst"
+mkdir -p "$TR/tree"; mk_b64 "$TR/tree/member"; cp "$TR/tree/member" "$TR/member.orig"
+echo occupied > "$TR/tree/member.zst"
+"$GZSTD" -q --cpu-only -r --exclude-compressed --stats-json "$TR/tree/member" \
+  "$TR/in/other" "$TR/tree" 2>"$TR/recursive-member.err"; rc=$?
+[[ $rc -eq 2 ]] && grep -q -- '--stats-json output is also an input' "$TR/recursive-member.err" \
+  || why+=" resolver-recursive-member:$rc"
+cmp -s "$TR/tree/member" "$TR/member.orig" || why+=" resolver-recursive-member-replaced"
+[[ -e "$TR/in/other.zst" ]] && why+=" resolver-recursive-other-ran"
+rm -f "$TR/in/other.zst"
+mk_b64 "$TR/outside"; cp "$TR/outside" "$TR/outside.orig"
+mkdir -p "$TR/link-tree"; ln -s ../outside "$TR/link-tree/L"
+"$GZSTD" -q --cpu-only -r --stats-json "$TR/link-tree/L" \
+  "$TR/in/other" "$TR/link-tree" 2>"$TR/recursive-link.err"; rc=$?
+[[ $rc -eq 2 ]] && grep -q -- '--stats-json output is also an input' "$TR/recursive-link.err" \
+  || why+=" resolver-recursive-link:$rc"
+cmp -s "$TR/outside" "$TR/outside.orig" || why+=" resolver-recursive-link-target-replaced"
+[[ -e "$TR/in/other.zst" ]] && why+=" resolver-recursive-link-other-ran"
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$why" ]] && pass "--stats-json naming a later input is refused before any input is read" \
   || fail "--stats-json naming a later input is refused before any input is read" "got$why"
@@ -2287,13 +2353,16 @@ GVPY
   # reallocations, where the tuner's uncapped 64 used to give the room.
   "$GZSTD" -k -f -3 --chunk-size=1 "$TMPDIR/large.bin" -o "$bh_z" 2>/dev/null
   GZSTD_DEBUG_FAIL_BRINGUP_ALLOC=3 GZSTD_DEBUG_ENSURE=1 \
-    run_test "$GZSTD" -q -t --gds-only "$bh_z" 2>"$bh_e"
+    run_test "$GZSTD" -vv -t --gds-only "$bh_z" 2>"$bh_e"
   bh_rc=$LAST_RC
   bh_n=$(grep -c 'ENSURE. realloc' "$bh_e" 2>/dev/null || true)
   bh_batches=$(grep -oE 'ENSURE. realloc: batch [0-9]+' "$bh_e" 2>/dev/null | awk '{print $4}' | tr '\n' ' ' || true)
   bh_ok=1; bh_why=""
   if [[ $bh_rc -ne 0 ]]; then
     bh_ok=0; bh_why="exit $bh_rc after 3 forced bringup allocation failures"
+  elif ! grep -q '\[GDS\] verify:' "$bh_e" \
+       || ! grep -qE '\[GPU[0-9]+/S[0-9]+\] done batch=' "$bh_e"; then
+    bh_ok=0; bh_why="GDS verification or GPU decode never ran after bringup"
   elif [[ ${bh_n:-0} -lt 4 ]]; then
     # The load-bearing assertion: one line per attempt means each retry really
     # reallocated.  Fewer means the retries were absorbed by the early-return.
@@ -5728,13 +5797,18 @@ if has_gpu 2>/dev/null; then
       # GZSTD_DEBUG_CALIBRATE_GPUC asks for it.)  The count must stay below the
       # host's cards or nothing ranks: 2 where there are more than two (two
       # count rows), else 1 (its count pass prints "one device, nothing to
-      # choose").  The anchor is the pass's LAST line, whichever form it takes.
+      # choose").  Anchor on that marker or the final two-device count row;
+      # a staging-failure summary is not evidence that a child ran.
       pr_sub=1; (( dr_proc_n > 2 )) && pr_sub=2
       pr_cal=$(env -u CUDA_VISIBLE_DEVICES XDG_CACHE_HOME="$TMPDIR/pr-xdg" GZSTD_DEBUG_CALIBRATE_BYTES=8388608 \
                  GZSTD_DEBUG_CALIBRATE_GPUC=1 timeout --foreground -k 10 300 \
                  "$GZSTD" --calibrate --gpu-devices=$pr_sub -vv 2>&1 >/dev/null | command tr '\r' '\n') \
         || pr_why+=" [calibrate rc=$?]"
-      pr_count=$(printf '%s' "$pr_cal" | grep -n '\[CALIBRATE\] gpu devices' | tail -1 | cut -d: -f1)
+      if (( pr_sub == 1 )); then
+        pr_count=$(printf '%s' "$pr_cal" | grep -n '\[CALIBRATE\] gpu devices: one device, nothing to choose' | tail -1 | cut -d: -f1)
+      else
+        pr_count=$(printf '%s' "$pr_cal" | grep -nE '\[CALIBRATE\] gpu devices[[:space:]]+2: (overhead|NOT MEASURED)' | tail -1 | cut -d: -f1)
+      fi
       pr_rank=$(printf '%s' "$pr_cal" | grep -n 'ranking the cards before CUDA starts' | head -1 | cut -d: -f1)
       [[ -n "$pr_count" && -n "$pr_rank" ]] && (( pr_rank > pr_count )) \
         || pr_why+=" [calibrate: count row at line '${pr_count}', ranking at line '${pr_rank}']"
@@ -7093,6 +7167,20 @@ else
   fail "--calibrate -o existing target refused" "rc=$rc"
 fi
 rm -f "$TMPDIR/aprof-precious.txt"
+
+# FILE validation must run in CPU-only builds and when the test hook skips the
+# GPU device-count pass; neither may silently calibrate a synthetic corpus.
+mkdir -p "$TMPDIR/cal-dir"
+cal_why=""
+for cal_input in "$TMPDIR/cal-missing" "$TMPDIR/cal-dir"; do
+  env XDG_CACHE_HOME="$APROF_XDG" $ACB "$GZSTD" --calibrate --no-profile \
+    "$cal_input" 2>"$TMPDIR/cal-input.err"; rc=$?
+  [[ $rc -eq 2 ]] && grep -q -- '--calibrate FILE: .* is not a readable regular file' \
+    "$TMPDIR/cal-input.err" && ! grep -q '\[CALIBRATE\] generating' "$TMPDIR/cal-input.err" \
+    || cal_why+=" $cal_input:$rc"
+done
+[[ -z "$cal_why" ]] && pass "--calibrate refuses a missing or directory FILE before measuring" \
+  || fail "--calibrate refuses a missing or directory FILE before measuring" "$cal_why"
 
 rm -rf "$APROF_XDG" "$TMPDIR/aprof.zst" "$TMPDIR/aprof-fast.zst" "$TMPDIR/aprof-bad.zst" \
        "$TMPDIR/aprof-cal.err"
@@ -11739,6 +11827,58 @@ if [[ $LAST_RC -eq 1 && -f "$zd/a.txt.zst" && ! -e "$zd/x.zst" ]] \
 else
   fail "a directory without -r is skipped (exit 1), the rest still run" "rc=$LAST_RC"
 fi
+# 3b. A NAMED SYMBOLIC LINK is skipped unless -f, zstd's rule for every
+# operation (v0.18.9; only -r did it before, so a plain run followed the link and
+# --rm removed it).  The skip leaves the exit code alone unless nothing is left:
+# then 1.  --filelist names are not filtered; a link to a FIFO is kept.  Each
+# arm MEASURED against zstd 1.5.7 on the same tree.
+rm -rf "$zd"; mkdir -p "$zd"; zs_why=""
+echo tgt > "$zd/t"; echo ok > "$zd/ok"; ln -s t "$zd/L"; ln -s missing "$zd/dl"
+"$GZSTD" -q --cpu-only -c "$zd/t" > "$zd/t.zst"; ln -s t.zst "$zd/Lz.zst"
+run_test "$GZSTD" --cpu-only "$zd/L" 2>"$TMPDIR/zs.err"
+[[ $LAST_RC -eq 1 && ! -e "$zd/L.zst" ]] && grep -q "L is a symbolic link, ignoring" "$TMPDIR/zs.err" \
+  || zs_why+=" alone:$LAST_RC"
+run_test "$GZSTD" --cpu-only -q "$zd/L" 2>"$TMPDIR/zs.err"
+[[ $LAST_RC -eq 1 && ! -s "$TMPDIR/zs.err" ]] || zs_why+=" quiet:$LAST_RC"
+run_test "$GZSTD" --cpu-only --rm "$zd/L" "$zd/dl" "$zd/ok" 2>"$TMPDIR/zs.err"
+[[ $LAST_RC -eq 0 && -L "$zd/L" && -f "$zd/t" && ! -e "$zd/L.zst" && -L "$zd/dl" \
+   && -f "$zd/ok.zst" && ! -e "$zd/ok" ]] || zs_why+=" rm-with-other:$LAST_RC"
+run_test "$GZSTD" --cpu-only -d -c "$zd/Lz.zst" >/dev/null 2>&1; [[ $LAST_RC -eq 1 ]] || zs_why+=" d:$LAST_RC"
+run_test "$GZSTD" --cpu-only -t "$zd/Lz.zst" 2>/dev/null; [[ $LAST_RC -eq 1 ]] || zs_why+=" t:$LAST_RC"
+echo ok > "$zd/ok"; rm -f "$zd/ok.zst"
+run_test "$GZSTD" --cpu-only -r "$zd/L" "$zd/ok" 2>/dev/null
+[[ $LAST_RC -eq 0 && ! -e "$zd/L.zst" && -f "$zd/ok.zst" ]] || zs_why+=" r-with-other:$LAST_RC"
+printf '%s\n' "$zd/L" > "$zd/list"
+run_test "$GZSTD" --cpu-only -q --filelist "$zd/list" 2>/dev/null
+[[ $LAST_RC -eq 0 && "$("$GZSTD" -dc "$zd/L.zst" 2>/dev/null)" == tgt ]] || zs_why+=" filelist:$LAST_RC"
+rm -f "$zd/L.zst"
+run_test "$GZSTD" --cpu-only -q -f "$zd/L" 2>/dev/null
+[[ $LAST_RC -eq 0 && "$("$GZSTD" -dc "$zd/L.zst" 2>/dev/null)" == tgt ]] || zs_why+=" force:$LAST_RC"
+mkfifo "$zd/fifo"; ln -s fifo "$zd/Lf"
+# The writer is bounded: if the link were wrongly skipped, nothing would ever
+# open the FIFO for reading and an unbounded writer would hang the suite at
+# `wait` (it did, on a mutant).
+timeout 10 bash -c 'exec 3>"$1"; printf fifo >&3' _ "$zd/fifo" &
+run_test timeout 30 "$GZSTD" --cpu-only -q -c "$zd/Lf" >"$zd/Lf.out" 2>/dev/null; wait
+[[ $LAST_RC -eq 0 && "$("$GZSTD" -dc "$zd/Lf.out" 2>/dev/null)" == fifo ]] || zs_why+=" fifo-link:$LAST_RC"
+[[ -z "$zs_why" ]] && pass "a named symbolic link is skipped unless -f, as zstd" \
+  || fail "a named symbolic link is skipped unless -f, as zstd" "failing arms:$zs_why"
+# 3c. A name that cannot be looked up is skipped and the rest still run
+# (v0.18.9): a missing file, and a dangling link that -f follows.  It used to
+# stop the whole run at the first one.  Exit 3, gzstd's code (zstd says 1), as
+# for an existing output below.
+rm -rf "$zd"; mkdir -p "$zd"; echo ok > "$zd/ok"; ln -s no-such-target "$zd/dangling"
+run_test "$GZSTD" --cpu-only "$zd/missing" "$zd/ok" 2>"$TMPDIR/zm.err"
+zm_rc1=$LAST_RC; zm_ok1=0; [[ -f "$zd/ok.zst" ]] && zm_ok1=1; rm -f "$zd/ok.zst"
+run_test "$GZSTD" --cpu-only -f "$zd/dangling" "$zd/ok" 2>>"$TMPDIR/zm.err"
+if [[ $zm_rc1 -eq 3 && $zm_ok1 -eq 1 && $LAST_RC -eq 3 && -f "$zd/ok.zst" && ! -e "$zd/dangling.zst" ]] \
+   && grep -q "can't stat $zd/missing : No such file or directory -- ignored" "$TMPDIR/zm.err" \
+   && grep -q "can't stat $zd/dangling : No such file or directory -- ignored" "$TMPDIR/zm.err"; then
+  pass "a missing input or a dangling link is skipped (exit 3), the rest still run"
+else
+  fail "a missing input or a dangling link is skipped (exit 3), the rest still run" "rc=$zm_rc1/$LAST_RC"
+fi
+rm -rf "$zd"; zd_tree "$zd"; mkdir -p "$zd/x"; echo y > "$zd/x/y.txt"
 # Plain --rm with one output already there: that input is skipped AND KEPT, the
 # next is compressed and removed, exit 3 -- zstd's contract (it says 1).
 echo old > "$zd/a.txt.zst"

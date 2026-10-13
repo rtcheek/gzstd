@@ -1,12 +1,176 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.8  
+**Covers:** v0.9.50 → v0.18.9  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.9 — --stats-json no longer writes over a skipped input, a symbolic link named as an input is skipped unless -f, as in zstd, and a missing input no longer stops the run
+
+v0.18.8 was committed but never tagged, and it must not be. One more review round on its last
+repairs found four defects. The checks before the tag turned up two gaps in following zstd, and the
+owner ordered both fixed in a new version. Reviewing that fix then exposed a data loss already in
+v0.18.8: `--stats-json` could write over an input the run had skipped. 0.18.3 refused that command.
+
+### Suites and round trips (2026-10-12, the 8-GPU server, after every review edit)
+
+Both configurations were rebuilt warning-free at 0.18.9. CPU-only: 382 passed, 0 failed, 1m56s, "as
+expected on this host". GPU `--extensive`: 818 passed, 0 failed, 1 skipped of 819, 15m38s. The skip
+is the usual host skip: no trivial batch reached a GPU. Both ran with SIGPIPE at its default; the
+shell they were started from ignored it.
+
+The round trips were run on v0.18.8 before the tag (below). This version changes only how inputs
+are chosen and checked, and plain-file runs pass through that code. Two were repeated on the 0.18.9
+binary, both byte-identical:
+- `-T 1` on the 20 GiB file: 50 GPU batches compressing, 55 decompressing;
+- the 252,306-entry conda tree, through `--tar` and back.
+
+No build files changed since v0.18.3 apart from `scripts/check-endian-reads.sh`, a checker that is
+not part of the build. So the by-hand workflow run (RELEASING 4b) is not required.
+
+### A named symbolic link is skipped unless -f
+
+zstd skips a symbolic link named on the command line unless `-f` is given ("Warning : X is a
+symbolic link, ignoring", hidden by `-q`). MEASURED against zstd 1.5.7, it does so for every
+operation that takes file names: compress, `-d`, `-t`, `-l`, `-c`, `-o` and `--train`. gzstd did
+it only under `-r`. A plain run followed the link, and `--rm` then removed it (the link, never its
+target). Now gzstd does what zstd does:
+
+- A dangling link and a link to a directory are skipped the same way. A link to a FIFO is read, as
+  zstd reads it.
+- Names from `--filelist` are not filtered: zstd merges the list after this step.
+- The skip leaves the exit code alone unless nothing is left to do; then the run exits 1 at once,
+  never falling through to standard input. Under `-r`, the old code set exit 1 on every skipped
+  link, which was wrong whenever other inputs remained (zstd: 0).
+- `-f` follows every link, as zstd's `-f` does.
+- One deliberate difference: when every command-line name is a link but `--filelist` named files,
+  zstd exits 1 without reading the list. gzstd processes the list.
+- `--tar` is unchanged: a named link is archived as a link, as tar does.
+- `--calibrate FILE` is left out too. It is gzstd's own command, its FILE may be a link to a
+  corpus, and it checks that FILE itself ("not a readable regular file", exit 2). My first version
+  of this change sent a missing FILE through the new skip instead (exit 3, calibrate's message lost).
+
+The rule runs once, right after parsing (`gz_drop_named_symlinks`). `Options::input_listed` marks the
+names that came from `--filelist`.
+
+**A skipped link is not read, but it was named, and nothing may be written over it.** Codex's
+review of this change found that it opened a data-loss path. `gzstd --stats-json L first L` removed
+`L` from the inputs, so the check that refuses a stats path naming an input no longer saw it. The run
+compressed `first` and wrote its JSON through `L`, over `L`'s target, at exit 0; v0.18.8 refused this
+at exit 2. The same hole was in the `--train` guard that refuses a dictionary output naming a sample
+(v0.17.77): `--train Ls s2 ... -o s1`, with `Ls -> s1`, replaced `s1` with the dictionary (zstd
+does that too; gzstd chose not to). Both reproduced, both now refused at exit 2 before any work.
+The skipped names are kept in `Options::skipped_named_symlinks`, and both checks consult them. The
+standard-output check is left alone, because it refuses only what the run READS, and a skipped link
+is not read. Each check has a test arm; a build with either check removed fails exactly its arm.
+
+**The same loss was already in v0.18.8, and it was worse.** Codex's next pass followed the class to
+every name the v0.18.8 resolver drops. `gzstd --stats-json a first a` with `a.zst` already present
+skips `a`, because its output exists. The stats check then never saw `a`: it compressed `first` and
+wrote its JSON over `a` (exit 3). 0.18.3 refused that command at exit 2. So v0.18.8 as committed
+would have shipped this. The same happened to:
+- a `--filelist` link whose output exists;
+- a file found by `-r` whose output exists;
+- a link that `-r` skipped inside the walk.
+
+The stats check now also covers the original operands and every walked entry
+(`Options::stats_input_candidates`, filled only under `--stats-json`). The `--train -r` walk returns
+the links it skips, so `--train -r tree ... -o T` is refused when a link in `tree` leads to `T`. That
+case had been open since v0.17.77. Every case has a test arm (the plain case among them), and a
+build with the new loop removed fails exactly those arms.
+
+**`--calibrate FILE` was checked only on the GPU path.** It was validated inside the GPU
+device-count pass, so the CPU-only build ignored a missing or directory FILE and calibrated the
+synthetic corpus at exit 0. FILE is now checked first, before the corpus is generated. That also
+removes the wasted work: on either build, a bad FILE used to cost a full generate-and-measure pass
+before the refusal. A default-suite cell pins both cases (522 -> 523, 818 -> 819; CPU-only 382).
+
+### A missing input is skipped, and the rest still run
+
+`gzstd missing ok` stopped the whole run at exit 3 without compressing `ok`. zstd prints "can't stat
+missing : No such file or directory -- ignored" and finishes the rest. gzstd now prints zstd's
+message and does the same. That covers any name that cannot be looked up: a missing file, a path
+through an unreadable directory, and a dangling link reached under `-f` or from `--filelist`. The
+exit code stays 3, gzstd's code for an I/O error, as for an input whose output already exists
+(v0.18.8); zstd says 1. A single missing input still exits 3; only the message changed.
+
+**Against zstd on the same tree, 36 command lines** (compress, `-d`, `-t`, `-l`, `-c`, `-o`, `--rm`,
+`-r`, `--filelist`, `--train`, `-f`, dangling links, a link to a directory, a missing name): the
+resulting files are identical in all 36. Exit codes are equal except the four "can't stat" cases
+(3 against 1, as above).
+
+### Review (Codex, GPT-6-Sol, high), round 6: v0.18.8's round-5 repairs
+
+Rounds 2-4 of the v0.18.8 review each had the next round check the previous round's repairs.
+Nobody had checked round 5's, which were adopted at the end of the review. This round did, and it
+found four defects:
+
+- **`--train -M1` exited 2; zstd exits 1.** It now exits 1, with the same message.
+- **A dangling link named under `-f` stopped the run at exit 3; zstd skips it.** It is now skipped
+  (see above). Codex also set the exit code to 1. That part was not adopted: v0.18.8 already ruled
+  that a skipped input exits 3 here.
+- **The `--gds-only` bringup-halving cell could pass without GDS or a GPU decode.** It now runs at
+  `-vv` and requires the GDS verification record and a GPU batch. On the 8-GPU server, by hand:
+  four reallocations, batches "32 16 8 4", 8 GPU batches.
+- **The calibrate-ordering cell could anchor on a staging-failure line.** It now anchors on the
+  exact count row ("gpu devices  2:") or the one-device marker. Both forms checked on the server
+  (`--gpu-devices=2` and `=1`).
+
+One low finding, also fixed: under `--train`, the bare `-M` note was never printed. It now prints
+once, and a later `-q` silences it.
+
+The other round-5 items held, both in its reading and in my reproductions:
+- The output freed by an earlier `--rm` input: a failed earlier input stops the run at exit 4 with
+  nothing overwritten, and `--rm` of a named link removes the link, not its target.
+- The 32-bit clamps.
+- `-M0`, identical to zstd on four command lines.
+- The `gz_rank_devices` comment.
+
+The same session then reviewed this version's own changes over three more turns:
+- **Turn 2** found the skipped-link `--stats-json` loss (above).
+- **Turn 3** followed it to the resolver-dropped names (v0.18.8's own loss), the `--train -r`
+  walk and `--calibrate` on CPU-only builds. All three were reproduced before being fixed.
+- **Turn 4** reviewed those repairs as built, plus one change of mine: the stats check makes one
+  pass over the candidates, which already hold every input left, instead of reading the inputs
+  and then the candidates. It found nothing: **SAFE TO TAG**, no code changed.
+
+Every finding was reproduced on a build before its fix was adopted, and every fix has a test arm
+that a build without it fails. The one finding not adopted as written was the exit code of the
+"can't stat" skip (3, not 1).
+
+### Tests
+
+**New cells (three).** Counts go to 523 default and 819 `--extensive`; CPU-only becomes 382.
+- Two `--extensive` cells in "zstd directories":
+  - the named-link rule: alone, quiet, `--rm` with another input, `-d`, `-t`, `-r` with another
+    input, `--filelist`, `-f`, and a link to a FIFO;
+  - the missing-input skip.
+- One default cell in "--adapt persistent profile": `--calibrate` refuses a missing or directory
+  FILE before measuring.
+
+**New arms in existing cells.**
+- The `--stats-json` collision cell gains five arms: a skipped command-line link, and four names
+  the resolver drops (plain, `--filelist` link, `-r` member, `-r` skipped link).
+- The `--train` refusals cell gains two: a skipped named link, and a link skipped by the `-r`
+  walk. Its tiny `-M` arm now expects exit 1.
+
+**Fixtures tightened.**
+- The `--gds-only` bringup-halving cell must now see GDS verify and a GPU batch.
+- The calibrate-ordering cell anchors on the exact count row.
+
+**Every new arm was mutation-checked.** Each fails a build with its own check removed:
+- the named-link arms: `--filelist` names filtered too, a link to a FIFO filtered, exit 1 set on
+  every skip;
+- the stats arms: the candidate loop removed, or the skipped-link loop removed;
+- the `--train` arms: the tree-link loop removed;
+- the calibrate cell: the early FILE check removed.
+
+The FIFO mutant also caught a defect in the cell itself. The writer blocked forever on a FIFO that
+nothing opened for reading, so a regression would have hung the suite at `wait`. The writer is now
+bounded by `timeout 10`.
 
 ## v0.18.8 — a GPU batch is sized to its input, a lost VRAM race halves instead of dropping the card, seven zstd options gzstd ignored now work, and -M counts bytes as zstd does
 

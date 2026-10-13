@@ -54,6 +54,11 @@ was true of the common path and false of roughly thirty options.
   `--zstd=...`, `--train -c -o` order, and a bare `-M N` as bytes. The `--sliding-window` forms are
   byte-identical to zstd's. A directory without `-r`, and an existing output among several inputs,
   are skipped and the run goes on, as in zstd.
+- **Since v0.18.9:** a symbolic link named as an input is skipped unless `-f`, for every operation,
+  as zstd does (it was only under `-r`). A missing input is skipped and the rest run (it stopped the
+  run). 36 command lines against zstd 1.5.7: the same files in all 36. Two differences remain, both
+  deliberate: a skipped input exits 3 where zstd says 1, and when every command-line name is a link,
+  gzstd still runs `--filelist`.
 - **Accepted but divergent** (each warns): `--format=gzip` emits zstd; `--rsyncable` without
   `--sliding-window` (fixed frame offsets).
 - **Accepted silently, no effect:** `--[no-]asyncio`, `--check` (the default),
