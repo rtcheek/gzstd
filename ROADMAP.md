@@ -217,7 +217,8 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    to the same one-batch gate as a named one, on the evidence as it arrives -- engage once a batch's
    worth of work has come in, skip if it ends first, engage at the guard if it is still coming. 1 MiB
    piped: 2.13-2.16 s -> 0.02-0.03 s. A big piped job starts CUDA ~130 ms later than before (read from
-   -vv); its end-to-end time is still to be measured on a quiet machine.
+   -vv). Its end-to-end cost, measured on a quiet box (v0.18.10), is nothing: 19.5 GiB piped compress
+   21.23 s against 21.14 with the old engage-at-once start; piped -d 6.43 against 6.68 s.
 14. ~~**Piped compress stops on a GPU fault under VRAM pressure.**~~ CLOSED v0.18.7: the "fault" was a
    card too full to create a CUDA context ("cudaSetDevice: out of memory"), caught by the compress
    worker's fault handler.  Reproduced with one card filled to 6 MiB free beside a healthy one: a
@@ -229,12 +230,29 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    pipe/stream", after "insufficient VRAM for even 1 stream" on the busy cards. A pipe cannot be rebuilt
    on the CPU, so the refusal itself is correct; what is not known is whether a CONTENDED card should
    count as a fault at all, rather than be skipped like one that is merely full. Not investigated.
-15. **The GPU decompress verify costs a third of a `--gpu-only` decode.** MEASURED v0.18.8, 4 GiB
+15. ~~**The GPU decompress verify costs a third of a `--gpu-only` decode.**~~ CLOSED v0.18.10: the kernel was
+   memory-latency bound (~180 cycles per stripe against an 8.7 ms no-load floor for a 16 MiB frame). One
+   block per frame streaming tiles into shared memory: 54 -> 12 ms per batch, bit-identical; 4 GiB
+   end to end, the check's cost fell from +35% to +8%. Left: the batch tuner on SHORT runs (starts at 8,
+   tries 4) costs ~0.45 s on a 4 GiB decode against a fixed --gpu-batch=32, check or no check.
+   The original text: **The GPU decompress verify costs a third of a `--gpu-only` decode.** MEASURED v0.18.8, 4 GiB
    entropy-coded on one H100: 3.26-3.37 s with the device XXH64 verify, 2.19-2.27 s with `--no-check`.
    XXH64's four lanes are serial within a frame, and `gzx_xxh64_kernel` gives each frame four threads
    (gpuverify.cu) -- a batch of N frames runs 4N threads, far too few to fill an H100.  Idle host
    cores (hybrid already finishes in ~0.5 s) might take most of it back.  Measure the kernel's own
    time at -vvv before designing anything.
+16. **Piped compress is about 1.6x slower than zstd.** MEASURED v0.18.10, quiet 8-GPU server, 19.5 GiB
+   warm, three interleaved runs: `cat f | gzstd -c` 21.61 s (hybrid), 19.81 s (`--cpu-only`), against
+   `cat f | zstd -T0 -c` 12.46 s. The pipe alone (`cat | cat`) moves it in 6.8-8.1 s and the named file
+   compresses in 1.28 s, so neither tool is pipe-bound. Not triaged: measure what the reader does per
+   read (sizes, syscalls, the pipe's buffer, `F_SETPIPE_SZ`) before guessing.
+17. **Piped hybrid decompress pays ~1 s for GPUs it never uses.** MEASURED v0.18.10, same box: the
+   1,250-frame archive piped to `-d`, 0 GPU batches, 6.70 s against 5.68 for `--cpu-only` (zstd -d
+   6.64). A named file predicts from its size that "CPU pool will finish before GPU init could" and
+   skips GPU startup (hybrid = cpu-only, ~1.0 s). A pipe has no size, so the evidence gate starts CUDA
+   after one batch and the run then waits out an init (~6 s for 8 GPUs on this static-BAR1 host) it
+   no longer needs. Candidates: predict from the observed CPU rate, or let a run that finishes first
+   stop waiting on a GPU bringup it never used.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

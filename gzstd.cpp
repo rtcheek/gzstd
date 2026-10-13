@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.9";
+static constexpr const char * GZSTD_VERSION = "0.18.10";
 //
 // Architecture overview:
 //
@@ -5343,7 +5343,9 @@ static void print_help_long()
 "     falls back to NVML (the NVIDIA management library, 0.25-0.40 s).\n"
 "     Measured with NVML's cost (v0.17.74) it never paid for itself:\n"
 "     with one card busy or nearly out of VRAM the pipeline absorbed\n"
-"     the slow card for less than the ranking cost.\n"
+"     the slow card for less than the ranking cost.  At the driver's\n"
+"     cost (v0.18.10, 8 cards) it costs nothing visible on a quiet box\n"
+"     and gains at most 5-8% with busy cards, within the noise.\n"
 "     Without a caller mask, --gpu-devices N below the full count\n"
 "     still ranks, since a busy card can be most of the capacity.\n"
 "     That ranking asks the NVIDIA kernel driver directly (about\n"
@@ -15398,11 +15400,19 @@ static void apply_decode_options(ZSTD_DCtx * dctx, const Options & opt)
   if (!dctx) return;
   apply_mem_limit_to_dctx(dctx, opt);
   // --no-check: libzstd skips the frames' own checksums, as `zstd -d --no-check`.
+  // ZSTD_d_forceIgnoreChecksum arrived in zstd 1.4.7; RHEL 8 ships 1.4.4, and
+  // without this guard gzstd did not COMPILE there (v0.18.8-9).  It is a #define
+  // in zstd.h, so its absence is testable.
   if (g_no_check) {
+#ifdef ZSTD_d_forceIgnoreChecksum
     const size_t st = ZSTD_DCtx_setParameter(dctx, ZSTD_d_forceIgnoreChecksum, ZSTD_d_ignoreChecksum);
     if (ZSTD_isError(st))
       die(std::string("--no-check: the linked zstd cannot skip checksums (")
           + ZSTD_getErrorName(st) + ")");
+#else
+    die(std::string("--no-check: decoding without checksums needs zstd 1.4.7 or newer; this gzstd "
+                    "was built against zstd ") + ZSTD_versionString());
+#endif
   }
   // --patch-from: a patch frame's window spans the whole reference (zstd sizes
   // it to cover the larger of the reference and the new file), far past the
@@ -31300,7 +31310,16 @@ static size_t device_tune_tick(DeviceTune & T, const Options & opt, const Meter 
   const size_t cur = T.batch_size.load();
   const size_t C = std::max<size_t>(1, T.ceiling.load() ? T.ceiling.load() : HARD_BATCH_CAP);
   if (const size_t peak = gz_debug_tune_peak(T.device)) {
-    const double d = std::fabs(std::log2(double(cur) / double(peak)));
+    // Doublings away from the peak, without log2: glibc 2.29 gave log2 (and
+    // log, exp, pow) new symbol versions, and this test hook was the ONLY call
+    // that made the release binary need glibc 2.29 -- so it would not start on
+    // RHEL/Rocky 8 (glibc 2.28).  frexp splits off the power of two, so a ratio
+    // that IS one (every halving or doubling) comes out exact, as log2 gave it,
+    // and equal distances either side of the peak still tie.
+    int e2 = 0;
+    const double m2 = std::frexp(double(cur) / double(peak), &e2);   // ratio = m2 * 2^e2, m2 in [0.5, 1)
+    const double d = std::fabs(double(e2 - 1)
+                               + std::log1p(2.0 * m2 - 1.0) / 0.69314718055994530942);
     cur_thr = 10.0 / (1.0 + d);
   }
 
@@ -31712,8 +31731,12 @@ static int gzstd_xxh_gpu_selftest()
 
   std::vector<size_t> small;
   for (size_t L = 0; L <= 200; ++L) small.push_back(L);     // exhaustive tail cover
+  // 16383..16385 bracket one shared-memory tile (512 stripes = 16 KiB);
+  // 32736 is one stripe before two tiles, and 32768 is exactly two tiles.
+  // (1 << 20) - 1 leaves 511 stripes after the last whole tile.
   std::vector<size_t> big = {
-    255, 256, 257, 4095, 4096, 4097, 65535, 65536, 65537,
+    255, 256, 257, 4095, 4096, 4097, 16383, 16384, 16385, 32736, 32768,
+    65535, 65536, 65537,
     (1u << 20) - 1, (1u << 20), (1u << 20) + 1,
     (1u << 20) + 4, (1u << 20) + 8, (1u << 20) + 31,
     3 * (1u << 20) + 33, (4u << 20)
@@ -31751,8 +31774,11 @@ static int gzstd_xxh_gpu_selftest()
     }
   const int r1 = run_pass(small, 256, "small");
   const int r2 = run_pass(big, ((4u << 20) + 4096) & ~size_t(4095), "large");
-  if (r1 < 0 || r2 < 0) return 2;
-  const int rc = (r1 || r2) ? 1 : 0;
+  // The last frame fills its slot exactly at a two-tile boundary.  This also
+  // covers the allocation end, which the padded large pass does not reach.
+  const int r3 = run_pass({0, 16383, 16384, 16385, 32768}, 32768, "exact slot");
+  if (r1 < 0 || r2 < 0 || r3 < 0) return 2;
+  const int rc = (r1 || r2 || r3) ? 1 : 0;
   std::cerr << "gzstd: xxh64 GPU selftest: " << (rc ? "FAIL" : "PASS") << "\n";
   return rc;
 }

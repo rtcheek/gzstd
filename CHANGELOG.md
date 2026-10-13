@@ -1,12 +1,168 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.9  
+**Covers:** v0.9.50 → v0.18.10  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.10 — (in progress) the GPU checksum check runs four times faster, gzstd runs and builds on RHEL/Rocky 8 again, and three quiet-box measurements
+
+A morning with the 8-GPU server to itself (no other user's GPU jobs at the start, load 0.1). It was
+used for the three items that needed a quiet box, and it stayed quiet for the first two.
+
+### The GPU decompress checksum check was waiting on memory (ROADMAP 15)
+
+**Measured first.** A 4 GiB entropy-coded archive (base64 of random data), `-d --gpu-only` on one
+H100, eight interleaved runs each: 3.70 s with the content-checksum check, 2.58 s with `--no-check`.
+That is +43%, more than the ROADMAP's earlier figure. At `-vv`, each batch spent 25 ms decoding and
+another ~52 ms hashing. The tuner starts at 8 frames, tries 4, and has only reached 16 when a 4 GiB
+run ends, so most batches are small and the fixed hash cost weighs heavily. Two cheap levers were
+tried first:
+- **Larger batches:** a fixed `--gpu-batch` of 16, 32 or 64 gave +40%, +24% and +12%.
+- **More CUDA streams:** they made both arms slower (2 streams: 4.17 against 2.78 s).
+
+**The kernel was latency-bound.** A scratch benchmark at 16 MiB frames on the H100:
+
+| kernel | per batch, 8 frames | per batch, 256 frames |
+|---|---|---|
+| shipped: 4 threads a frame, 8 loads in flight | 50.9 ms | 54.0 ms |
+| the same, loads issued a group ahead, 32 deep | 15.9 ms | 17.7 ms |
+| one block a frame, tiles staged in shared memory | 12.0 ms | 12.9 ms |
+| the four chains with no loads at all (the floor) | 8.7 ms | 8.7 ms |
+
+XXH64's four dependent chains are the algorithm's limit, and they were not what took the time: each
+32-byte stripe cost about 180 SM cycles, against 8.7 ms for the whole frame with no memory traffic.
+The kernel comment credited an unroll by eight with the speed. The shipped unrolled kernel runs at
+51-54 ms, so the unroll had bought almost nothing.
+
+**The fix.** Each frame now gets a block of 256 threads. They stream the frame into shared memory
+one 16 KiB tile ahead, in coalesced 8-byte loads, while four threads run the same chains from shared
+memory. 16-byte loads would be faster still, but the decompress caller's stride is only 8-byte
+aligned. The block uses 32 KiB of shared memory, within every supported card's limit (sm_70 to
+sm_120: 42-46 registers). Its speed on Turing is not measured. The launcher's signature is
+unchanged, so both callers (`--gds-only` compress and GPU decompress) take it as is.
+
+**Checked.**
+- **Bit-identical:** to the old kernel on 256 frames of varied length, including frames at an
+  8-byte-only stride.
+- **Built-in self-test** (`GZSTD_DEBUG_XXH_SELFTEST=1`, the CPU hash against the GPU's): passes
+  for every length 0-200 and 22 longer lengths. Five new lengths sit on the tile boundaries
+  (16383-16385, 32736, 32768).
+- **Bench hook:** 12.0 ms per batch at every batch size, against 55-56 ms.
+- **End to end**, 12 interleaved runs each (another user's jobs had taken four of the eight cards by
+  then): old kernel 3.99 s (3.81-4.67), new 3.19 s (3.05-3.24), `--no-check` 2.95 s (2.74-3.04).
+  The check's cost fell from +35% to +8%. Output byte-identical.
+- **Corruption still caught:** a flipped bit in three frame payloads of a 256 MiB archive fails
+  `-d --gpu-only` at exit 4, naming the frame. A fourth flip landed in the seek table, which
+  decoding does not read: exit 0 with correct output, as with the old binary and zstd.
+- **`--gds-only` paths:** `-t --gds-only` verifies 256 frames in VRAM. `--gds-only` compress
+  writes checksums that `zstd -t` and a CPU `gzstd -t` accept, and the output decodes
+  byte-identical.
+- **NVIDIA's checkers on the self-test:** memcheck 0 errors, racecheck 0 hazards on the
+  double-buffered shared memory, synccheck 0 errors.
+
+**Review (Codex, GPT-6-Sol, high): SAFE TO COMMIT, one round.** It confirmed:
+- every thread reaches every barrier, because the tile count is per block and the out-of-range
+  return is whole-block;
+- the full-mask shuffles are defined in every warp;
+- no index can overflow at gzstd's frame sizes;
+- no load reads past a frame.
+
+It changed three things, all adopted:
+- **A pointer past the allocation.** At an exact tile boundary, three of the compute lanes formed
+  the leftover-stripe pointer past the end of the buffer. The loop then had no iterations, so the
+  pointer was never used, but forming it is still out of bounds in C++. The address is now formed
+  only for a stripe that exists.
+- **A new self-test pass** whose last frame ends exactly at the allocation's end, which the padded
+  pass never reached.
+- **Comments narrowed to what was measured:** my claim about Turing speed is gone.
+
+The bench, re-run on an idle card after the edit: old kernel 54.7-56.6 ms per batch, new 12.2 ms.
+On the card another user's job had taken, the new kernel took 26 ms. The bench hook times whichever
+card comes first, so on a shared box it measures that card's load.
+
+### RHEL / Rocky 8: the release binary would not start, and the source would not build
+
+Found by the owner on a Rocky Linux 8.10 machine. Two failures, one cause each.
+
+**The release binary:** `./gzstd -V` stopped with "/lib64/libm.so.6: version `GLIBC_2.29' not
+found". RHEL 8's glibc is 2.28. The release container's glibc is 2.31, but a binary needs only the
+symbol versions it binds. Every symbol the 0.18.9 release binds is 2.22 or older except one:
+`log2@GLIBC_2.29`. glibc 2.29 gave log2 (with log, exp and pow) a new symbol version, and the only
+`log2` call in gzstd is a debug hook for the tuner tests (`GZSTD_DEBUG_TUNE_CURVE`). So since the
+Ubuntu 20.04 container, no release has started on RHEL 8, while BUILD.md said "glibc 2.31 floor —
+covers ... RHEL 8+". RHEL 8's glibc is 2.28, so that sentence was wrong twice over.
+
+The hook now takes its distance from the peak with `frexp` and `log1p`, both at version 2.2.5. The
+GPU build binds no `log2` any more. `frexp` splits off the power of two, so a ratio that is one comes
+out exact, as `log2` gave it, and batch sizes equally far either side of the peak still tie. The
+three suite cells driven by the hook pass on both binaries, run as the suite runs them (one card
+pinned): the hold settles at 16; the climb explores 512 and the profile keeps it, and the gate
+refuses; two cards settle at 16 and 64.
+
+`scripts/build-portable.sh` now refuses a binary that needs any glibc symbol version newer than
+2.28, and names the symbols. Against the published 0.18.9 binary it exits 1 and names
+`log2@GLIBC_2.29`; with the limit raised to 2.29 it passes. This is a release-build change, so the
+workflow must be run by hand before the tag (RELEASING 4b). That run is also the first build of the
+release binary without `log2`, so it confirms the 2.28 floor.
+
+**The source build:** compiling against the system zstd stopped at `ZSTD_d_forceIgnoreChecksum`,
+which zstd added in 1.4.7. RHEL 8 ships 1.4.4. `--no-check` decompression (v0.18.8) used it
+unguarded, and nothing had compiled gzstd against an older zstd since the release build pinned 1.5.7
+(v0.17.93). The parameter is a `#define` in zstd.h, so the call is now under `#ifdef`. Built against
+an older zstd, `-d --no-check` stops with "decoding without checksums needs zstd 1.4.7 or newer; this
+gzstd was built against zstd 1.4.4". Checked by building against zstd 1.4.4 (its own release
+tarball, sha256 checked): the build is clean, and a round trip, `-t`, `--sliding-window`, `--long=27`,
+`--patch-from`, `--train` with `-D`, and `--tar` all work.
+
+GCC 8 is RHEL 8's compiler, and it keeps `std::filesystem` in `libstdc++fs`, which CMake now links
+for GCC before 9.1. GCC 8.5 reported no other error in `gzstd.cpp`. BUILD.md's prerequisites said
+GCC 7+, but GCC 7 has no `std::filesystem` at all; they now say GCC 8+ and zstd 1.4.4+, and a short
+RHEL/Rocky 8 section was added.
+
+### A big piped job no longer starts its GPUs at once, and it costs nothing (ROADMAP 13)
+
+v0.18.5 made a pipe wait for one batch's worth of input before starting CUDA, and could not measure
+the end-to-end cost on a loaded box. Now measured with one binary, alternating the default with
+`GZSTD_DEBUG_GPU_MIN_BYTES=0` (the old engage-at-once start), ABBA x3 after a warm-up, warm source,
+`/dev/null`:
+- 19.5 GiB piped compress: 21.23 s (20.20-21.57) against 21.14 s (20.47-21.95);
+- the 1,250-frame archive piped to `-d`: 6.43 s (6.11-7.02) against 6.68 s (6.59-7.03).
+
+The later start costs nothing measurable.
+
+**Two things the reference runs showed, now ROADMAP 16 and 17:**
+- **16: piped compress is about 1.6x slower than zstd.** 19.5 GiB through a pipe, three runs each:
+  gzstd hybrid 21.61 s, `--cpu-only` 19.81 s, `zstd -T0` 12.46 s. The pipe alone (`cat | cat`)
+  moves it in 6.8-8.1 s, and the named file compresses in 1.28 s.
+- **17: piped hybrid decompress pays about 1 s for GPUs it never uses.** It ran 0 GPU batches and
+  took 6.70 s, against 5.68 s for `--cpu-only`; zstd took 6.64 s. With a named file the up-front
+  size prediction skips GPU startup ("CPU pool will finish before GPU init could"), and hybrid
+  equals `--cpu-only` at about 1.0 s. A pipe has no size, so the run starts CUDA after the first
+  batch and then waits it out.
+
+### `--gpu-order=ranked` on all eight cards, at the driver probe's cost
+
+The v0.18.7 question, owed to a quiet box because all-card runs touch other users' cards.
+`--gpu-only` compress of 1, 4 and 19.5 GiB, CUDA's order against ranked, ABBA x2 after a warm-up in
+each regime. Load was imposed on the cards CUDA lists first, the worst case for CUDA's order, with a
+scratch generator: a spin kernel, or VRAM held idle. Medians of 4:
+
+| regime | 1 GiB | 4 GiB | 19.5 GiB |
+|---|---|---|---|
+| quiet | 4.96 / 4.94 s | 5.39 / 5.50 | 6.21 / 6.34 |
+| first card at 100% | 4.74 / 4.78 | 5.33 / 5.27 | 6.31 (6.10-7.10) / 6.00 (5.64-6.52) |
+| first card with 2.3 GiB free, plus another user's job | 4.94 / 5.03 | 5.45 / 5.57 | 6.30 / 6.27 |
+| first four cards at 100% | 4.18 / 4.20 | 4.51 / 4.47 | 5.68 (5.33-6.06) / 5.25 (5.18-5.58) |
+
+At 0.04 s the ranking costs nothing visible when the box is quiet. With busy cards it gains 5-8% at
+19.5 GiB, but the ranges overlap. CUDA startup is 4-5 s of every run here, so it hides most of the
+difference. On this host a card whose CUDA context another process already holds starts faster,
+which is why four busy cards ran faster than none. It stays opt-in. Another user started a job on one card during the
+third regime, so that row has a second loaded card it was not designed with.
 
 ## v0.18.9 — --stats-json no longer writes over a skipped input, a symbolic link named as an input is skipped unless -f, as in zstd, and a missing input no longer stops the run
 

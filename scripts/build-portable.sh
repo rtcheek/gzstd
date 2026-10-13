@@ -234,6 +234,23 @@ while IFS= read -r rp; do
 done <<< "$rpaths"
 echo "Library search path: ${rpaths:-<none>} (no empty or relative element)"
 
+# THE GLIBC FLOOR IS 2.28, RHEL/ROCKY 8's (v0.18.10).  The container's glibc is
+# 2.31, but a binary needs only the symbol VERSIONS it actually binds, and every
+# one was 2.22 or older except log2@GLIBC_2.29, from one debug test hook: so no
+# release since the Ubuntu 20.04 container would start on RHEL 8 ("version
+# `GLIBC_2.29' not found"), although BUILD.md promised RHEL 8.  This refuses a
+# binary that needs anything newer than GLIBC_MAX, and names the symbols.
+GLIBC_MAX=2.28
+glibc_need=$(readelf -W --version-info "$BIN" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' \
+             | sed 's/^GLIBC_//' | sort -Vu | tail -1)
+[[ -n "$glibc_need" ]] || { echo "ERROR: could not read the glibc symbol versions of $BIN"; exit 1; }
+if [[ "$(printf '%s\n%s\n' "$glibc_need" "$GLIBC_MAX" | sort -V | tail -1)" != "$GLIBC_MAX" ]]; then
+  echo "ERROR: $BIN needs glibc $glibc_need, newer than the $GLIBC_MAX floor (RHEL/Rocky 8). Symbols:"
+  readelf -W --dyn-syms "$BIN" | grep -oE "[^ ]+@GLIBC_${glibc_need}( |$)" | sort -u | sed 's/^/  /'
+  exit 1
+fi
+echo "glibc: needs $glibc_need (floor $GLIBC_MAX)"
+
 echo
 echo "=== Result ==="
 ls -lh "$BIN"
@@ -284,4 +301,4 @@ fi
 
 echo
 echo "Output: $BIN"
-echo "Copy to any Linux x86_64 with glibc >= 2.31 (NVIDIA driver optional: GPU paths engage when present)."
+echo "Copy to any Linux x86_64 with glibc >= $glibc_need (NVIDIA driver optional: GPU paths engage when present)."

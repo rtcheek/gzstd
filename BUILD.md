@@ -2,14 +2,28 @@
 
 ## Prerequisites
 
-- C++17 compiler (GCC 7+ or Clang 5+)
+- C++17 compiler with `<filesystem>`: GCC 8+ (GCC 8 links `libstdc++fs` automatically) or Clang 5+
 - CMake 3.18+
-- Zstd (headers + library): `conda install zstd` or `apt install libzstd-dev`
+- Zstd 1.4.4+ (headers + library): `conda install zstd`, `apt install libzstd-dev` or `dnf install libzstd-devel`.
+  Decompressing with `--no-check` needs zstd 1.4.7+; built against an older zstd, it refuses and says so.
 
 **For GPU support (optional):**
 - CUDA Toolkit 11+
 - nvCOMP: `conda install -c conda-forge nvcomp`
 - NVIDIA driver (optional at runtime — NVML is dlopen'd; without a driver gzstd runs CPU-only)
+
+## RHEL / Rocky / Alma 8
+
+The system toolchain is enough (GCC 8.5, AppStream CMake, zstd 1.4.4), CPU-only:
+
+```bash
+sudo dnf install gcc-c++ cmake libzstd-devel libacl-devel
+cmake -B build && cmake --build build -j$(nproc)
+```
+
+`libacl-devel` is optional (it enables `--acls`).  Built against the system zstd, decompressing with
+`--no-check` is not available (zstd 1.4.7+); everything else is.  Releases from v0.18.10 also run
+here as shipped.
 
 ## Quick Start (from scratch)
 
@@ -91,14 +105,14 @@ scripts/build-portable.sh
 
 What it does:
 1. Downloads NVIDIA's official `nvcomp-linux-x86_64-5.2.0.10_cuda12-archive.tar.xz` from `developer.download.nvidia.com` (cached at `~/.cache/gzstd-build/nvcomp/` for re-runs), and the pinned zstd release tarball (`ZSTD_VERSION`, checked against `ZSTD_SHA256` on every run; cached at `~/.cache/gzstd-zstd/`).
-2. Spins up a Docker container running `nvidia/cuda:12.6.0-devel-ubuntu20.04` (glibc 2.31 floor — covers Ubuntu 20.04+, Debian 11+, RHEL 8+).
+2. Spins up a Docker container running `nvidia/cuda:12.6.0-devel-ubuntu20.04`. Its glibc is 2.31, but a binary needs only the symbol versions it binds, and the script refuses a binary that needs any newer than 2.28 (RHEL/Rocky 8). Until v0.18.10 one function bound `log2@GLIBC_2.29`, so no release started on RHEL 8.
 3. Builds zstd inside the container as a static, multithreaded library (`make libzstd.a-mt`), then gzstd with `BUILD_STATIC=ON`, pointing CMake at that zstd and at the official nvCOMP tarball's `lib/libnvcomp_static.a`. The build fails unless the binary reports `[zstd <ZSTD_VERSION>, multithreaded]`. (Until v0.17.93 it linked Ubuntu 20.04's `libzstd.a` — zstd 1.4.4, single-threaded — and `--sliding-window` failed in every release.)
 4. Statically links nvCOMP, the CUDA runtime, libstdc++, libgcc, and libzstd into a single executable.
 
 Output: `build-portable/gzstd`, ~60–80 MB.
 
 **Runtime requirements on target:**
-- glibc ≥ 2.31 (Ubuntu 20.04 / Debian 11 / RHEL 8 / Fedora 33+)
+- glibc ≥ 2.28 from v0.18.10 (RHEL/Rocky/Alma 8+, Debian 10+, Ubuntu 18.10+, Fedora 29+). v0.18.9 and earlier need 2.29 and stop with "version `GLIBC_2.29' not found" on RHEL 8.
 - NVIDIA driver — optional. Since v0.13.55 NVML is loaded via dlopen at runtime, so the binary starts (and runs CPU-only) on machines without any NVIDIA driver. With a driver present, GPU paths work as usual.
 - For the GPU paths, a GPU of compute capability 7.0 or newer: Volta (V100) and later. nvCOMP 5.2 carries no code for anything older, and gzstd's own kernels are built for the same range. Older cards, such as Pascal (GTX 10xx, P100), are treated as absent: gzstd runs on the CPU without starting CUDA, and `--gpu-only` refuses with exit 2 and names the card (v0.17.77). A build made with CUDA 13 raises the floor to 7.5 (Turing), because CUDA 13 cannot compile for Volta.
 - That's it. No CUDA, no nvCOMP, no Python, no nothing.

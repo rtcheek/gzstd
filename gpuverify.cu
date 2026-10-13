@@ -114,15 +114,26 @@ extern "C" int gzv_kernel_available(void)
 // WHAT THAT MEANS FOR WALL TIME.  A frame's hash costs (len/32) dependent
 // rounds no matter how many threads are thrown at it, so the kernel's runtime
 // scales with the CHUNK SIZE and is almost independent of how many frames are in
-// the batch.  Frames all hash concurrently (a 258-frame batch is 1032 threads —
-// nothing for any GPU), so bigger batches amortise a fixed cost and get cheaper
-// per byte, while a bigger --chunk-mib gets linearly more expensive. Do not size
-// this from a small batch and conclude it is slow. MEASURE at the batch you ship.
+// the batch while its blocks fit concurrently.  On the measured H100, batches
+// of 8..256 frames were close in duration; a card with fewer resident blocks
+// may need multiple waves.  Bigger batches amortise a fixed cost and get
+// cheaper per byte until that point, while a bigger --chunk-mib gets linearly
+// more expensive.  MEASURE at the batch and card you ship.
 //
-// Threads are assigned four-per-frame and consecutively, so a frame's four lanes
-// read one contiguous 32-byte stripe (one memory sector) per iteration, and the
-// four lanes of a frame always live in the same warp — which is what lets the
-// final combine use __shfl_sync instead of shared memory.
+// THE FOUR CHAINS WERE WAITING ON MEMORY, NOT ON ARITHMETIC (v0.18.10).  Until
+// then each frame got four threads and nothing else, and each thread loaded its
+// own words: eight 8-byte loads in flight per thread, then eight dependent
+// rounds, then the next eight loads.  MEASURED on an H100 at 16 MiB frames: 51-54
+// ms per batch for 8..256 frames -- about 180 SM cycles per 32-byte stripe, where
+// the same four chains with no loads at all (the arithmetic floor) take 8.7 ms.
+// A --gpu-only decode of 4 GiB spent a third of its time there (ROADMAP 15).
+//
+// So a frame now gets a whole BLOCK.  All of its threads stream the frame into
+// shared memory a tile ahead, in coalesced 8-byte loads, while threads 0..3 of
+// warp 0 run the four chains out of shared memory.  Same chains, same order,
+// bit-identical result; 12.0..12.9 ms for 8..256 16 MiB frames on an H100.
+// The four compute lanes are still the algorithm's ceiling -- the block only
+// keeps them fed.
 // ---------------------------------------------------------------------------
 
 static constexpr unsigned long long GZX_P1 = 11400714785074694791ULL;
@@ -161,13 +172,15 @@ __device__ __forceinline__ unsigned int gzx_rd4(const unsigned char * p)
          | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
 }
 
-// One frame per four consecutive threads; `out[chunk]` receives the low 32 bits
+// One BLOCK per frame (GZX_BLOCK threads); `out[chunk]` receives the low 32 bits
 // of XXH64(frame, seed=0), which is precisely what zstd stores as the frame's
 // Content_Checksum.
 //
-// PRECONDITION: `base` is 8-byte aligned and `stride` is a multiple of 8, so the
-// main loop can use aligned 64-bit loads.  The tail path makes no alignment
-// assumption.
+// PRECONDITION: `base` is 8-byte aligned and `stride` is a multiple of 8, so
+// every frame starts on an 8-byte boundary and the tiles can be loaded as
+// 64-bit words.  Only 8: the decompress caller's stride is 8-byte granular, so a
+// 16-byte vector load would lack its required alignment on some frame starts.
+// The tail path makes no alignment assumption.
 //
 // `base` is always cudaMalloc'd (256-byte aligned).  `stride` USED TO BE
 // DESCRIBED HERE as "the GPU subchunk size, always a whole number of MiB", and
@@ -178,72 +191,87 @@ __device__ __forceinline__ unsigned int gzx_rd4(const unsigned char * p)
 // enough to produce it; no seek table required.  That caller now rounds the
 // stride up to 8 explicitly, so the precondition holds again, but it holds
 // because the caller maintains it and not because the shape guarantees it.
-__global__ void gzx_xxh64_kernel(const unsigned char * __restrict__ base,
-                                 size_t stride,
-                                 const size_t * __restrict__ sizes,
-                                 size_t n_chunks,
-                                 unsigned int * __restrict__ out)
+//
+// SIZES.  GZX_TILE stripes of 32 bytes per tile, two tiles (32 KiB of static
+// shared memory, under the 48 KiB a block may declare on every card gzstd
+// supports, Volta on).  MEASURED on an H100, 256 frames of 16 MiB: 512x256 12.9
+// ms, 256x128 14.7 ms.  Turing occupancy is limited by the 32 KiB shared-memory
+// allocation per block; this rewrite's speed on Turing has not been measured.
+static constexpr int GZX_BLOCK = 256;
+static constexpr int GZX_TILE  = 512;                  // stripes per tile
+static constexpr int GZX_WORDS = GZX_TILE * 4;         // 64-bit words per tile
+
+__global__ void __launch_bounds__(GZX_BLOCK)
+gzx_xxh64_kernel(const unsigned char * __restrict__ base,
+                 size_t stride,
+                 const size_t * __restrict__ sizes,
+                 size_t n_chunks,
+                 unsigned int * __restrict__ out)
 {
-    const size_t   tid   = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t   chunk = tid >> 2;          // four threads per frame
-    const unsigned lane  = (unsigned)(tid & 3u);
+    __shared__ __align__(16) unsigned long long tile[2][GZX_WORDS];
 
-    // NO EARLY RETURN.  __shfl_sync below needs every thread of the warp to take
-    // part; a `return` for out-of-range threads would leave the trailing warp of
-    // the last block short and make the exchange undefined.  Out-of-range threads
-    // instead run the whole kernel over a zero-length frame and store nothing.
-    const bool active = (chunk < n_chunks);
-    size_t len = 0;
-    if (active) len = sizes[chunk];
+    const size_t chunk = blockIdx.x;
+    // The grid is exactly n_chunks blocks, so this never fires; if it did, the
+    // WHOLE block would leave together, which is what keeps __syncthreads safe.
+    if (chunk >= n_chunks) return;
 
-    const unsigned char * p    = base + (active ? chunk * stride : 0);
-    const size_t          nblk = len >> 5;    // whole 32-byte stripes
+    const size_t                len   = sizes[chunk];
+    const unsigned char *       p     = base + chunk * stride;
+    const unsigned long long *  src   = reinterpret_cast<const unsigned long long *>(p);
+    const size_t                nblk  = len >> 5;                // whole 32-byte stripes
+    const size_t                ntile = nblk / GZX_TILE;
+    const unsigned              lane  = threadIdx.x;             // 0..3 compute
 
-    unsigned long long v;
+    unsigned long long v = 0;
     switch (lane) {                            // seed is always 0 here
         case 0:  v = GZX_P1 + GZX_P2; break;
         case 1:  v = GZX_P2;          break;
         case 2:  v = 0ULL;            break;
-        default: v = 0ULL - GZX_P1;   break;
+        case 3:  v = 0ULL - GZX_P1;   break;
+        default: break;                        // a loader, not a chain
     }
 
-    const unsigned long long * q =
-        reinterpret_cast<const unsigned long long *>(p) + lane;
+    // Every thread loads a strided share of one tile; consecutive threads take
+    // consecutive words, so each warp's load is one contiguous 256-byte run.
+    auto fill = [&](size_t t, int b) {
+        const unsigned long long * from = src + t * GZX_WORDS;
+        unsigned long long *       to   = tile[b];
+#pragma unroll 4
+        for (int i = threadIdx.x; i < GZX_WORDS; i += GZX_BLOCK) to[i] = __ldg(from + i);
+    };
 
-    // UNROLLED BY EIGHT FOR MEMORY-LEVEL PARALLELISM, NOT FOR LOOP OVERHEAD.
-    // The accumulator chain is dependent but the LOADS are not, so the eight
-    // __ldg's below issue back-to-back and their latencies overlap; the rolled
-    // version stalled on each load in turn.  MEASURED on H100, 16 MiB frames:
-    // 57 ms rolled vs the unrolled figure in the bench hook -- the arithmetic is
-    // identical either way, so any difference is stall, not work.
-    size_t k = 0;
-    for (; k + 8 <= nblk; k += 8) {
-        const unsigned long long a0 = __ldg(q +  0);
-        const unsigned long long a1 = __ldg(q +  4);
-        const unsigned long long a2 = __ldg(q +  8);
-        const unsigned long long a3 = __ldg(q + 12);
-        const unsigned long long a4 = __ldg(q + 16);
-        const unsigned long long a5 = __ldg(q + 20);
-        const unsigned long long a6 = __ldg(q + 24);
-        const unsigned long long a7 = __ldg(q + 28);
-        v = gzx_round(v, a0); v = gzx_round(v, a1);
-        v = gzx_round(v, a2); v = gzx_round(v, a3);
-        v = gzx_round(v, a4); v = gzx_round(v, a5);
-        v = gzx_round(v, a6); v = gzx_round(v, a7);
-        q += 32;
+    if (ntile) fill(0, 0);
+    __syncthreads();
+    for (size_t t = 0; t < ntile; ++t) {
+        // The next tile's loads go out before this tile's rounds, so their
+        // latency hides behind the chains instead of stalling them.
+        if (t + 1 < ntile) fill(t + 1, (int)((t + 1) & 1));
+        if (lane < 4) {
+            // Accumulator j consumes word j of every stripe: stride 4 words.
+            const unsigned long long * w = tile[t & 1] + lane;
+#pragma unroll 16
+            for (int j = 0; j < GZX_TILE; ++j) v = gzx_round(v, w[4 * j]);
+        }
+        // Both: this tile is free to be overwritten, and the next one is loaded.
+        __syncthreads();
     }
-    for (; k < nblk; ++k) { v = gzx_round(v, __ldg(q)); q += 4; }
+    // The stripes after the last whole tile (fewer than GZX_TILE) straight from
+    // global memory; at most one tile's worth of rounds, so not worth staging.
+    if (lane < 4) {
+        // Form an address only for a stripe that exists.  On an exact tile
+        // boundary, a precomputed q would be beyond the last slot for lanes
+        // 1..3 even though the remainder loop has no iterations.
+        for (size_t k = ntile * GZX_TILE; k < nblk; ++k)
+            v = gzx_round(v, __ldg(src + 4 * k + lane));
+    }
 
-    // Gather the four accumulators onto lane 0 of this group.  The group is four
-    // consecutive threads and 4 divides the warp size, so a group never straddles
-    // two warps and the source lanes are always in-warp.
-    const unsigned wl    = threadIdx.x & 31u;
-    const unsigned gbase = wl & ~3u;
-    const unsigned long long v1 = __shfl_sync(0xffffffffu, v, gbase + 0, 32);
-    const unsigned long long v2 = __shfl_sync(0xffffffffu, v, gbase + 1, 32);
-    const unsigned long long v3 = __shfl_sync(0xffffffffu, v, gbase + 2, 32);
-    const unsigned long long v4 = __shfl_sync(0xffffffffu, v, gbase + 3, 32);
-    if (lane != 0) return;
+    // Gather the four accumulators onto thread 0.  Lanes 0..3 are warp 0, and
+    // every thread of warp 0 reaches this point, as __shfl_sync's full mask needs.
+    const unsigned long long v1 = __shfl_sync(0xffffffffu, v, 0, 32);
+    const unsigned long long v2 = __shfl_sync(0xffffffffu, v, 1, 32);
+    const unsigned long long v3 = __shfl_sync(0xffffffffu, v, 2, 32);
+    const unsigned long long v4 = __shfl_sync(0xffffffffu, v, 3, 32);
+    if (threadIdx.x != 0) return;
 
     unsigned long long h;
     if (len >= 32) {
@@ -275,7 +303,7 @@ __global__ void gzx_xxh64_kernel(const unsigned char * __restrict__ base,
     }
     h = gzx_avalanche(h);
 
-    if (active) out[chunk] = (unsigned int)(h & 0xffffffffULL);
+    out[chunk] = (unsigned int)(h & 0xffffffffULL);
 }
 
 // Launch the batch hash on `stream`.  Ordered after whatever filled `base`
@@ -285,10 +313,7 @@ extern "C" void gzx_launch_xxh64(const void * base, size_t stride,
                                  unsigned int * out, cudaStream_t stream)
 {
     if (n_chunks == 0) return;
-    const int      block   = 128;                       // 32 frames per block
-    const size_t   threads = n_chunks * 4;
-    const unsigned grid    = (unsigned)((threads + block - 1) / block);
-    gzx_xxh64_kernel<<<grid, block, 0, stream>>>(
+    gzx_xxh64_kernel<<<(unsigned)n_chunks, GZX_BLOCK, 0, stream>>>(
         (const unsigned char *)base, stride, sizes, n_chunks, out);
 }
 

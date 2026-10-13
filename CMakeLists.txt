@@ -387,6 +387,13 @@ else()
     Threads::Threads)
 endif()
 
+# GCC 8 (RHEL/Rocky 8's system compiler) keeps std::filesystem in a separate
+# library; without it the link fails with undefined std::filesystem symbols.
+# GCC 9.1 folded it into libstdc++.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.1)
+  target_link_libraries(gzstd PRIVATE stdc++fs)
+endif()
+
 # Static linking: prefer static libstdc++ and libgcc for maximum portability.
 # The resulting binary only needs glibc (2.17+) at runtime; the NVIDIA driver
 # is optional (CUDA and NVML are discovered at runtime, with CPU fallback).
