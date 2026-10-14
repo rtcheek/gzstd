@@ -614,8 +614,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=523
-$EXTENSIVE && EXPECTED_TESTS=819
+EXPECTED_TESTS=525
+$EXTENSIVE && EXPECTED_TESTS=821
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -632,6 +632,8 @@ $EXTENSIVE && EXPECTED_TESTS=819
 # is skipped and the rest run): 816 -> 818.  None needs a GPU.
 # Round-six continuation: +1 default for --calibrate FILE validation without
 # a GPU device-count pass: 522 -> 523, 818 -> 819.
+# v0.18.11 (ROADMAP 16): +2 default -- a pipe's buffer is grown both ways, and a
+# piped run counts its input once: 523 -> 525, 819 -> 821.  None needs a GPU.
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -1147,7 +1149,50 @@ cat "$TMPDIR/medium.txt" \
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 files_match "$TMPDIR/medium.txt" "$TMPDIR/pipeline.recovered" \
   && pass "compress ${SYM_ARROW} decompress pipeline" || fail "compress ${SYM_ARROW} decompress pipeline" "mismatch"
-rm -f "$TMPDIR/pipe.zst" "$TMPDIR/pipe.recovered" "$TMPDIR/pipeline.recovered"
+
+# A 64 KiB pipe set the pace of a piped run (v0.18.11, ROADMAP 16): gzstd grows
+# an input pipe and a stdout pipe to 1 MiB.  The -v lines are the evidence it
+# ran; a host whose limit refuses 1 MiB still prints them, saying so.  Both ends
+# of `gzstd -dc | gzstd -d` would race to grow one pipe, so each side is driven
+# against cat.
+t0=$(now_ms); why=""
+cat "$TMPDIR/medium.txt" | "$GZSTD" -v --cpu-only -c 2>"$TMPDIR/pg-in.err" > "$TMPDIR/pipe.zst"
+pg_rc=$?
+[[ $pg_rc -eq 0 ]] || why+=" input-exit:$pg_rc"
+grep -qE '^\[READER\] input pipe buffer [0-9]+ KiB -> [0-9]+ KiB' "$TMPDIR/pg-in.err" || why+=" input-line"
+"$GZSTD" -v -d --cpu-only -c "$TMPDIR/pipe.zst" 2>"$TMPDIR/pg-out.err" | cat > "$TMPDIR/pipe.recovered"
+pg_rc=${PIPESTATUS[0]}   # gzstd's status, not cat's
+[[ $pg_rc -eq 0 ]] || why+=" output-exit:$pg_rc"
+grep -qE '^\[WRITER\] output pipe buffer [0-9]+ KiB -> [0-9]+ KiB' "$TMPDIR/pg-out.err" || why+=" output-line"
+files_match "$TMPDIR/medium.txt" "$TMPDIR/pipe.recovered" || why+=" bytes"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "a pipe's buffer is grown on the way in and out" \
+  || fail "a pipe's buffer is grown on the way in and out" "missing:$why"
+
+# A piped run counts its input ONCE (v0.18.11).  The pipe reader's chunks became
+# zero-copy views, and the workers count views themselves (an mmap reader counts
+# nothing), so the first build counted every piped byte twice: 39.06 GiB "read"
+# from a 19.53 GiB pipe, a 13.8% ratio printed for 27.6%.  --stats-json shows it.
+t0=$(now_ms); why=""
+pc_size=$(stat -c %s "$TMPDIR/medium.txt")
+cat "$TMPDIR/medium.txt" | "$GZSTD" -q --cpu-only --stats-json "$TMPDIR/pc.json" -c > /dev/null 2>&1
+pc_rc=$?
+pc_n=$(grep -o '^  "input_bytes": [0-9]*' "$TMPDIR/pc.json" 2>/dev/null | grep -o '[0-9]*$')
+[[ $pc_rc -eq 0 ]] || why+=" cpu-exit:$pc_rc"
+[[ "$pc_n" == "$pc_size" ]] || why+=" cpu:${pc_n:-none}"
+if has_gpu 2>/dev/null; then
+  rm -f "$TMPDIR/pc.json"  # do not accept the CPU arm's stats if the GPU arm fails
+  cat "$TMPDIR/medium.txt" | "$GZSTD" -q --gpu-only --stats-json "$TMPDIR/pc.json" -c > /dev/null 2>&1
+  pc_rc=$?
+  pc_n=$(grep -o '^  "input_bytes": [0-9]*' "$TMPDIR/pc.json" 2>/dev/null | grep -o '[0-9]*$')
+  [[ $pc_rc -eq 0 ]] || why+=" gpu-exit:$pc_rc"
+  [[ "$pc_n" == "$pc_size" ]] || why+=" gpu:${pc_n:-none}"
+fi
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "a piped run counts its input once" \
+  || fail "a piped run counts its input once" "input_bytes vs ${pc_size}:$why"
+rm -f "$TMPDIR/pipe.zst" "$TMPDIR/pipe.recovered" "$TMPDIR/pipeline.recovered" \
+      "$TMPDIR/pg-in.err" "$TMPDIR/pg-out.err" "$TMPDIR/pc.json"
 
 # ============================================================
 # 6. Tar integration

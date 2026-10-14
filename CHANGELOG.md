@@ -1,6 +1,6 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.10  
+**Covers:** v0.9.50 → v0.18.11  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
@@ -8,7 +8,106 @@
 ---
 
 
-## v0.18.10 — (in progress) the GPU checksum check runs four times faster, gzstd runs and builds on RHEL/Rocky 8 again, and three quiet-box measurements
+## v0.18.11 — piped runs: a pipe's 64 KiB buffer set the pace, and the copy after it is gone (ROADMAP 16)
+
+**The defect.** Piped compression was about 1.6x slower than zstd (ROADMAP 16, found in v0.18.10).
+MEASURED on the 8-GPU server, 19.5 GiB warm: `cat f | gzstd --cpu-only -c` 19.8 s, `zstd -T0` 12.5 s.
+The pipe was not the limit: `cat | dd bs=16M` drained it in 7.6 s. gzstd's `-v` line said where the
+time went. One stdin reader, saturated, spent 64.8% of its time in `read()` and 34.9% copying each
+16 MiB chunk into a fresh task buffer. Worker count changed nothing (19.4 s at 8, 24 and 96 workers).
+
+**Two levers, both measured before any code.** A scratch reader drained the same pipe at 2.5-3.5
+GiB/s whatever it did with the bytes, so the copy alone did not explain gzstd's 1.04 GiB/s. The
+pipe size did. A Linux pipe holds 64 KiB, so each read took at most 64 KiB, with a wakeup of the
+writer between reads. Enlarging the pipe from the writer's side (`fcntl(F_SETPIPE_SZ)` before
+exec'ing `cat`) took gzstd from 17.5-19.6 s to 12.0-13.0 s, with no change to gzstd. The copy then
+became 45% of the reader's time.
+
+**The fix.**
+- **An input pipe and a stdout pipe are grown to 1 MiB.** That is the default
+  `/proc/sys/fs/pipe-max-size`. A pipe is only ever grown, never shrunk; a lower limit, or the
+  user's pipe-page budget, refuses the call and leaves the pipe as it was. Input: stdin and named
+  FIFOs, wherever they are opened. Output: once per run, on the per-file path when the output is
+  stdout, and at the guard every other stdout writer already passes. That per-file path calls the
+  guard only when stdout is a regular file, so a pipe there would have been missed; that was caught
+  by reading the call sites before trusting the guard's comment.
+- **The pipe readers no longer copy.** Both compress paths' pipe readers (CPU, and GPU/hybrid) read
+  straight into an uninitialised block. The task holds a zero-copy view of it with shared
+  ownership, as the parallel decompress reader's tasks do. Backpressure counts the view, as before.
+- **`-v` says whether it happened:** `[READER] input pipe buffer 64 KiB -> 1024 KiB`, and the same
+  for `[WRITER] output pipe buffer`.
+
+**A defect in the first build, caught by its own output.** The workers count a view's bytes
+themselves, because an mmap reader counts nothing. The new views were therefore counted twice:
+"39.06 GiB => 5.40 GiB, 13.82%" for a 19.53 GiB input, and twice the real `input_bytes` in
+`--stats-json`. Workers now skip views that own a block, since their reader counted them. Every
+other block view goes to the decompress workers, which never count this way.
+
+**Measured after**, 19.5 GiB warm, three interleaved runs each, against the 0.18.10 binary:
+
+| through a pipe | 0.18.10 | 0.18.11 | zstd |
+|---|---|---|---|
+| compress, `--cpu-only` | 19.82 s | **11.00-11.18** | 11.74-11.82 (`-T0`) |
+| compress, hybrid (the default) | 19.76 | 14.52-14.79 | |
+| decompress to a pipe, `--cpu-only` | 12.98 | **7.95** | 18.36 (`zstd -d`) |
+| decompress to a pipe, hybrid | 17.08 (9.91-19.26) | **7.83** | |
+
+Byte-identical through pipes on every backend (`--cpu-only`, hybrid, `--gpu-only`, `--verify`, the
+CPU-only build). Sizes covered: 0 and 1 byte, exactly one 16 MiB chunk and one byte over, 100 MiB,
+and 19.5 GiB. A named FIFO, `--tar` create to a pipe, `-d --tar -O` to a pipe, `-l` into a pipe and
+stdout to a regular file are unchanged.
+
+**Left open (ROADMAP 16): hybrid compression from a pipe still trails `--cpu-only` and zstd, and
+only with many GPUs.**
+
+| hybrid from a pipe | time |
+|---|---|
+| 1 GPU | 9.60-9.91 s (the fastest of all) |
+| 2 GPUs | 10.29 s |
+| 8 GPUs (the default) | 13.81-14.92 s |
+| `--gpu-only`, 8 GPUs | about 12.4 s |
+
+The reader's `read()` share stays ~96%, and the reader is never blocked downstream. Ruled out:
+- page faults: the 1-GPU run took more of them;
+- startup: the 8-GPU input rate sags across the whole run, not only while CUDA starts;
+- pinned staging: `--pinned=on` took 44 s.
+
+So it is how hybrid combines the CPU pool with many GPUs on a reader-bound input, not yet explained.
+
+**Tests.** Two default cells in "Pipe (stdin/stdout) operation", 523 -> 525 (`--extensive` 819 ->
+821; CPU-only 384):
+- **a pipe's buffer is grown both ways:** the two `-v` lines, and the bytes round-trip;
+- **a piped run counts its input once:** `--stats-json` `input_bytes` equals the file's size, on
+  the CPU path and, with a GPU, `--gpu-only`.
+
+Three CPU-only mutants each fail exactly their arm: no input growth, no output growth, and the
+double count restored (2,097,152 of 1,048,576). The 0.18.10 binary fails the first cell.
+
+**Review (Codex, GPT-6-Sol, high): SAFE TO COMMIT, one round.** It traced the new views through
+every compress consumer:
+- the CPU worker and the GPU hash and upload all read through `ptr()`;
+- a GPU fault releases its batch, and does not re-queue released input;
+- a GPU bringup failure hands queued tasks to the CPU through the same `ptr()`;
+- `--verify` works on the output frames;
+- the throttle still bounds host memory;
+- a read error after a partial chunk is still reported.
+
+It fixed two diagnostics, both adopted:
+- A regular file after a FIFO in one run inherited the FIFO's pipe line. The state is now cleared
+  per input; checked with `gzstd -v ff reg`.
+- An empty pipe printed no pipe line, because the reader summary returned first. Checked with
+  `cat /dev/null | gzstd -v`.
+
+It also made the cells check exit codes and drop the CPU arm's stats before the GPU arm. One
+correction to that: in `gzstd -dc | cat` the status `$?` is cat's, so the cell reads
+`${PIPESTATUS[0]}`.
+
+**Suite (2026-10-14, the 8-GPU server, final code, other users on every card):** default on the GPU
+build, 524 passed, 0 failed, 1 skipped of 525, 8m29s. The skip is this host's usual "no trivial batch
+reached a GPU". CPU-only build (warning-free), 384 passed, 0 failed, "as expected on this host",
+1m56s. `--extensive` not run.
+
+## v0.18.10 — the GPU checksum check runs four times faster, gzstd runs and builds on RHEL/Rocky 8 again, and three quiet-box measurements
 
 A morning with the 8-GPU server to itself (no other user's GPU jobs at the start, load 0.1). It was
 used for the three items that needed a quiet box, and it stayed quiet for the first two.
@@ -122,6 +221,11 @@ GCC 8 is RHEL 8's compiler, and it keeps `std::filesystem` in `libstdc++fs`, whi
 for GCC before 9.1. GCC 8.5 reported no other error in `gzstd.cpp`. BUILD.md's prerequisites said
 GCC 7+, but GCC 7 has no `std::filesystem` at all; they now say GCC 8+ and zstd 1.4.4+, and a short
 RHEL/Rocky 8 section was added.
+
+**Confirmed on the Rocky 8.10 machine** (GCC 8.5, system zstd): it builds and links, and the binary
+reports `[zstd 1.4.4, single-threaded]`. RHEL 8's libzstd is built without zstd's own threads, so
+`--sliding-window` runs on one thread there; frame mode is gzstd's own threads and unaffected.
+BUILD.md's RHEL section says so, and shows how to build against a multithreaded zstd 1.5.7.
 
 ### A big piped job no longer starts its GPUs at once, and it costs nothing (ROADMAP 13)
 

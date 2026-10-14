@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.10";
+static constexpr const char * GZSTD_VERSION = "0.18.11";
 //
 // Architecture overview:
 //
@@ -3505,6 +3505,63 @@ static void die_io(const std::string & msg)
 static void die_data(const std::string & msg)
 { die(msg, EXIT_DATA); }
 
+// A PIPE'S BUFFER SET THE PACE OF A PIPED RUN (v0.18.11, ROADMAP 16).  Linux
+// pipes hold 64 KiB, so a pipe moved 64 KiB per read() or write() with a wakeup
+// of the other side between each.  MEASURED on the 8-GPU server, 19.5 GiB warm:
+// `cat f | gzstd --cpu-only -c` 18.5 -> 12.5 s with a 1 MiB pipe (the one stdin
+// reader spent ~65% of its time in read()), and `gzstd -dc a.zst | cat` 12.5-16.3
+// -> 7.0-7.7 s.  So an input pipe and a stdout pipe are grown to 1 MiB: only
+// ever grown, never shrunk.  1 MiB is the default /proc/sys/fs/pipe-max-size; a
+// lower limit, or the user's pipe-page budget, refuses the call and leaves the
+// pipe as it was.  Both ends share the buffer, so the other process gains too.
+// Returns {before, after} in bytes; {0, 0} when fd is not a pipe or is already
+// at least 1 MiB.  Recorded for the [READER] and [WRITER] lines at -v.
+static std::pair<int, int> gz_grow_pipe(int fd)
+{
+#ifdef F_SETPIPE_SZ
+  struct stat st {};
+  if (fd < 0 || ::fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode)) return {0, 0};
+  const int cur = ::fcntl(fd, F_GETPIPE_SZ);
+  constexpr int WANT = 1 << 20;
+  if (cur <= 0 || cur >= WANT) return {0, 0};
+  const int got = ::fcntl(fd, F_SETPIPE_SZ, WANT);
+  return {cur, got > 0 ? got : cur};
+#else
+  (void)fd;
+  return {0, 0};
+#endif
+}
+static std::atomic<int> g_input_pipe_from{0},  g_input_pipe_to{0};
+static std::atomic<int> g_output_pipe_from{0}, g_output_pipe_to{0};
+static void gz_note_input_pipe(int fd)
+{
+  const auto r = gz_grow_pipe(fd);
+  if (r.second) {
+    g_input_pipe_from.store(r.first, std::memory_order_relaxed);
+    g_input_pipe_to.store(r.second, std::memory_order_relaxed);
+  } else {
+    // Diagnostics are per input, even when one invocation processes many files.
+    // A regular file after a FIFO must not inherit the FIFO's report.
+    g_input_pipe_to.store(0, std::memory_order_relaxed);
+    g_input_pipe_from.store(0, std::memory_order_relaxed);
+  }
+}
+// Grow a stdout pipe, once per run, before the first data goes there.  Called
+// from gz_stdout_will_be_written (listings, --tar -O, --train -c, help) AND from
+// the per-file output path, which calls that guard only when stdout is a
+// regular file -- so `gzstd -dc a.zst | tar x` reaches it only from there.
+static void gz_note_output_pipe()
+{
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const auto r = gz_grow_pipe(STDOUT_FILENO);
+    if (r.second) {
+      g_output_pipe_from.store(r.first, std::memory_order_relaxed);
+      g_output_pipe_to.store(r.second, std::memory_order_relaxed);
+    }
+  });
+}
+
 // NOTHING THIS RUN READS MAY BE THE REGULAR FILE IT WRITES TO STDOUT (v0.17.88,
 // and conditional on the writing since v0.17.89).
 //
@@ -3560,6 +3617,7 @@ static void gz_stdout_will_be_written()
 #ifndef _WIN32
   std::lock_guard<std::mutex> lk(g_side_m);
   for (const GzSideInput & si : g_side_inputs) gz_refuse_side_alias_locked(si);
+  gz_note_output_pipe();
   g_stdout_has_data = true;
 #endif
 }
@@ -9702,10 +9760,12 @@ static FILE * open_input(const std::string & path)
   if (path == "-") {
     set_binary_mode(stdin);
     refuse_offset_stdin();   // every caller of open_input inherits the guarantee
+    gz_note_input_pipe(STDIN_FILENO);
     return stdin;
   }
   FILE * f = std::fopen(path.c_str(), "rb");
   if (!f) die_io("cannot open input: " + path);
+  gz_note_input_pipe(::fileno(f));   // a named FIFO
   return f;
 }
 // THE OUTPUT TRANSACTION: the destination's parent directory, opened once and
@@ -17936,8 +17996,10 @@ static void cpu_worker(
     // The writer releases this permit after the output is physically written.
 
     // Count mmap views here (their reader doesn't); --direct-read views
-    // (direct_buf>=0) are already counted by the O_DIRECT reader — skip them.
-    if (m && t.view_ptr && t.direct_buf < 0) m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
+    // (direct_buf>=0) are already counted by the O_DIRECT reader, and so are a
+    // pipe reader's block views (v0.18.11) by the read that filled them -- skip both.
+    if (m && t.view_ptr && t.direct_buf < 0 && !t.block)
+      m->read_bytes.fetch_add(t.len(), std::memory_order_relaxed);
 
     if (opt->verbosity >= V_DEBUG) {
       char in_s[32];
@@ -30544,10 +30606,17 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   if (!reader_done)
 #endif
   {
-    std::vector<char> host_in(host_chunk);
+    // READ STRAIGHT INTO THE TASK'S OWN BLOCK (v0.18.11, ROADMAP 16).  This path
+    // takes pipes, and it used to fread into one staging buffer and then copy
+    // every chunk into a fresh vector: 35% of the one reader's time on a
+    // 19.5 GiB pipe.  The block is allocated uninitialised (new char[], not a
+    // vector's zero fill) and the Task holds it as a view with shared ownership,
+    // the way the parallel decompress reader's blocks are held; release_input()
+    // drops it.  queued_host_bytes() counts the view, so backpressure is unchanged.
     while (true) {
+      std::shared_ptr<char> blk(new char[host_chunk], std::default_delete<char[]>());
       uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
-      size_t n = std::fread(host_in.data(), 1, host_chunk, in);
+      size_t n = std::fread(blk.get(), 1, host_chunk, in);
       if ((g_perf || m) && n > 0) {
         const uint64_t r_dt = now_ns() - rd_t0;
         if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
@@ -30561,9 +30630,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
 
       Task t;
       t.seq = seq.fetch_add(1, std::memory_order_relaxed);
-      const uint64_t c_t0 = m ? now_ns() : 0;
-      t.data.assign(host_in.data(), host_in.data() + n);
-      if (m) m->reader_copy_ns.fetch_add(now_ns() - c_t0, std::memory_order_relaxed);
+      t.view_ptr = blk.get();
+      t.view_len = n;
+      t.block = std::move(blk);
       queue.push(std::move(t));
     }
   }
@@ -34072,9 +34141,10 @@ static void gpu_worker(
         if (m) {
           // mmap views are counted here (their reader doesn't); --direct-read
           // views (direct_buf >= 0) were already counted by the O_DIRECT
-          // reader — skip them (mirrors cpu_worker).
+          // reader, and a pipe reader's block views by its read (v0.18.11) —
+          // skip them (mirrors cpu_worker).
           for (size_t i = 0; i < C.filled; ++i)
-            if (C.batch[i].view_ptr && C.batch[i].direct_buf < 0)
+            if (C.batch[i].view_ptr && C.batch[i].direct_buf < 0 && !C.batch[i].block)
               m->read_bytes.fetch_add(C.batch[i].len(), std::memory_order_relaxed);
         }
 
@@ -36617,10 +36687,14 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
   if (!reader_done)
 #endif
   {
-    std::vector<char> host_in(host_chunk);
+    // Read straight into a block the frames share (v0.18.11, ROADMAP 16): the CPU
+    // path's fallback reader above says why.  Each GPU-sized frame is a view into
+    // the block with shared ownership, so the block is freed when the last of its
+    // frames releases its input.
     while (true) {
+      std::shared_ptr<char> blk(new char[host_chunk], std::default_delete<char[]>());
       uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
-      size_t n_host = std::fread(host_in.data(), 1, host_chunk, in);
+      size_t n_host = std::fread(blk.get(), 1, host_chunk, in);
       if ((g_perf || m) && n_host > 0) {
         const uint64_t r_dt = now_ns() - rd_t0;
         if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
@@ -36632,16 +36706,16 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
       if (n_host == 0) { check_read_error(in, opt.input); break; }
       if (m) m->read_bytes.fetch_add(n_host);
       size_t off = 0;
-      const uint64_t c_t0 = m ? now_ns() : 0;
       while (off < n_host) {
         size_t sub_n = std::min(gpu_chunk, n_host - off);
         Task t;
         t.seq = seq_counter.fetch_add(1, std::memory_order_relaxed);
-        t.data.assign(host_in.data() + off, host_in.data() + off + sub_n);
+        t.view_ptr = blk.get() + off;
+        t.view_len = sub_n;
+        t.block = blk;
         queue.push(std::move(t));
         off += sub_n;
       }
-      if (m) m->reader_copy_ns.fetch_add(now_ns() - c_t0, std::memory_order_relaxed);
     }
   }
 
@@ -42243,6 +42317,16 @@ static void print_reader_diag(const Options & opt, const Meter & meter, double w
   const uint64_t r_ps = meter.reader_parse_ns.load();
   const uint64_t r_cp = meter.reader_copy_ns.load();
   const uint64_t r_bk = meter.reader_blocked_ns.load();
+  // A pipe input's buffer, as gz_note_input_pipe left it (v0.18.11): whether the
+  // enlargement happened is the first thing to know about a slow piped run.
+  // Report it even for an empty pipe, whose timed reader counters remain zero.
+  if (const int pto = g_input_pipe_to.load(std::memory_order_relaxed)) {
+    const int pfrom = g_input_pipe_from.load(std::memory_order_relaxed);
+    char pline[128];
+    std::snprintf(pline, sizeof(pline), "[READER] input pipe buffer %d KiB -> %d KiB%s\n",
+                  pfrom / 1024, pto / 1024, pto > pfrom ? "" : " (the system refused a larger one)");
+    vlog(V_VERBOSE, opt, pline);
+  }
   if (r_io + r_ps + r_cp + r_bk == 0) return;
   const double r_n = std::max(1, meter.reader_threads.load());
   if (meter.reader_serial_consumer.load()) {
@@ -44703,6 +44787,7 @@ static int gzstd_main(int argc, char ** argv)
       in = ::fdopen(ifd, "rb");
       if (!in) { const int e = errno; ::close(ifd);
         die_io("cannot open input: " + opt.input + " (" + std::strerror(e) + ")"); }
+      gz_note_input_pipe(ifd);   // a named FIFO
 #ifndef _WIN32
       gz_fifo_gate("GZSTD_DEBUG_INPUT_GATE");
 #endif
@@ -45356,6 +45441,7 @@ static int gzstd_main(int argc, char ** argv)
   off_t out_base = 0;
 #ifndef _WIN32
   if (out == stdout && opt.mode != Mode::TEST) {
+    gz_note_output_pipe();   // a pipe never reaches gz_stdout_will_be_written below
     const int bfd = fileno(stdout);
     struct stat bst;
     if (bfd >= 0 && std::fflush(stdout) == 0
@@ -46589,6 +46675,14 @@ static int gzstd_main(int argc, char ** argv)
         "starved %.1f%%  (of %.2f s run)\n",
         busy * 100.0, hol * 100.0, avg_stuck, starved * 100.0, wall_ns / 1e9);
       vlog(V_VERBOSE, opt, wline);
+      // A stdout pipe's buffer, as gz_note_output_pipe left it (v0.18.11).
+      if (const int pto = g_output_pipe_to.load(std::memory_order_relaxed)) {
+        const int pfrom = g_output_pipe_from.load(std::memory_order_relaxed);
+        char pline[128];
+        std::snprintf(pline, sizeof(pline), "[WRITER] output pipe buffer %d KiB -> %d KiB%s\n",
+                      pfrom / 1024, pto / 1024, pto > pfrom ? "" : " (the system refused a larger one)");
+        vlog(V_VERBOSE, opt, pline);
+      }
       // Split the "busy" time into actual device I/O vs the single-threaded
       // zero-scan (sparse detection), so "busy 97%" isn't mistaken for "device
       // saturated" when much of it is CPU scanning on the write thread.

@@ -22,8 +22,21 @@ cmake -B build && cmake --build build -j$(nproc)
 ```
 
 `libacl-devel` is optional (it enables `--acls`).  Built against the system zstd, decompressing with
-`--no-check` is not available (zstd 1.4.7+); everything else is.  Releases from v0.18.10 also run
-here as shipped.
+`--no-check` is not available (zstd 1.4.7+), and `--version` reports `[zstd 1.4.4, single-threaded]`:
+RHEL 8's libzstd is built without zstd's own threads (its `zstd` command has them: it carries its own
+copy of the library).  That costs only `--sliding-window`, which then
+runs on one thread (gzstd warns); every other mode compresses frames on gzstd's own threads.  For a
+multithreaded zstd, build one and point CMake at it:
+
+```bash
+curl -LO https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+tar xf zstd-1.5.7.tar.gz && make -C zstd-1.5.7/lib -j$(nproc) libzstd.a-mt
+cmake -B build -DGZSTD_ZSTD_EXPLICIT=ON -DZSTD_INCLUDE_DIR=$PWD/zstd-1.5.7/lib \
+      -DZSTD_LIBRARY=$PWD/zstd-1.5.7/lib/libzstd.a
+cmake --build build -j$(nproc)
+```
+
+Releases from v0.18.10 also run here as shipped, with zstd 1.5.7 multithreaded built in.
 
 ## Quick Start (from scratch)
 

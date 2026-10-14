@@ -241,7 +241,14 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    (gpuverify.cu) -- a batch of N frames runs 4N threads, far too few to fill an H100.  Idle host
    cores (hybrid already finishes in ~0.5 s) might take most of it back.  Measure the kernel's own
    time at -vvv before designing anything.
-16. **Piped compress is about 1.6x slower than zstd.** MEASURED v0.18.10, quiet 8-GPU server, 19.5 GiB
+16. **Piped compress is about 1.6x slower than zstd.** MOSTLY FIXED v0.18.11: a 64 KiB pipe paced the one
+   stdin reader, and a copy followed every read.  Pipes are now grown to 1 MiB both ways, and the pipe
+   readers read in place: piped `--cpu-only` compress 19.8 -> 11.0 s (zstd -T0 11.7), piped decompress
+   13.0-17.1 -> 7.8-8.0 s (zstd -d 18.4).  STILL OPEN: hybrid compress from a pipe with many GPUs,
+   14.5-14.8 s against 9.6-9.9 s with ONE GPU and 11.0 s CPU-only.  The reader stays ~96% in read() and
+   is never blocked downstream, and it is not page faults (1 GPU took more), not startup (the rate sags
+   all run) and not pageable staging (--pinned=on: 44 s).  Something in how hybrid combines the CPU pool
+   with many GPUs on a reader-bound input.  The original text: MEASURED v0.18.10, quiet 8-GPU server, 19.5 GiB
    warm, three interleaved runs: `cat f | gzstd -c` 21.61 s (hybrid), 19.81 s (`--cpu-only`), against
    `cat f | zstd -T0 -c` 12.46 s. The pipe alone (`cat | cat`) moves it in 6.8-8.1 s and the named file
    compresses in 1.28 s, so neither tool is pipe-bound. Not triaged: measure what the reader does per
