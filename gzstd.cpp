@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.12";
+static constexpr const char * GZSTD_VERSION = "0.18.13";
 //
 // Architecture overview:
 //
@@ -4641,6 +4641,17 @@ static void print_help_long()
 "     over: bare --adapt enables the governor; zstd's value form\n"
 "     --adapt=min#,max# also enables it, but the level bounds are\n"
 "     ignored with a warning (gzstd does not vary the level mid-stream).\n"
+"     A PIPE STARTS ITS GPUS ONLY WHEN THE CPUS FALL BEHIND (v0.18.13): with\n"
+"     input of unknown size, hybrid starts CUDA only once a GPU batch's\n"
+"     worth of frames is waiting for the CPU pool (or the input queue is\n"
+"     full) at every sample across 0.15 s, and never merely because the\n"
+"     pipe is still sending; --cpu-batch N raises the bar by its N.  A pipe\n"
+"     the CPUs keep up with runs without CUDA's start-up and exit cost.\n"
+"     (--cpu-share's fixed split starts the GPUs at once, with or without\n"
+"     --adapt.)  Without --adapt, hybrid starts the GPUs once a\n"
+"     batch's worth of input has arrived, or after 4 s if it is still\n"
+"     arriving.  -v prints the decision, -vv each time the backlog\n"
+"     crosses a batch, -vvv every sample.\n"
 "     GPU DEVICE COUNT: a single-file --gpu-only compress runs on as many GPUs as the\n"
 "     profile predicts will finish THIS input soonest.  More devices are\n"
 "     not free: starting CUDA costs time for every visible device (measured\n"
@@ -5395,6 +5406,7 @@ static void print_help_long()
 "  --cpu-batch N  [hybrid only]\n"
 "     Queue depth before CPU workers start popping.  Keeps frames\n"
 "     stocked for GPU batch fills on fast-decompress workloads.\n"
+"     End-of-input or a full producer queue releases this threshold.\n"
 "     Default: 0 (CPUs pop immediately).\n"
 "\n"
 "  --cpu-share X  [hybrid only]\n"
@@ -6511,6 +6523,14 @@ static std::atomic<bool> g_adapt_gpu_declined{false};
 // the stale decline won and an all-CPU aggregate was filed as hybrid on a
 // GPU-less or CUDA-hidden host.
 static std::atomic<bool> g_adapt_gpu_absent{false};
+// A GPU decompress worker FAILED mid-run, or the stall guard reclaimed a stuck
+// batch (v0.18.13, Codex).  Decompression rescues both on the CPU and can still
+// exit 0, so the run's rate is a fault-and-rescue figure: count the fault and
+// merge no rates, as the compress rebuild path does (adapt_obs.fault).  Without
+// it a clean exit on another card marks the run "declined" and the rescue's rate
+// lands in overall_gibs_hybrid.  A full card skipped at bringup is not a fault
+// (v0.18.7) and does not set this.
+static std::atomic<bool> g_adapt_gpu_faulted{false};
 // Page-cache residency class of THIS run's input: 1 = warm, 0 = cold, -1 = not
 // probed (compress, pipes, non-regular output, --list).  The backend prior is
 // keyed by it for decompress — see the prior for why bucketing beats picking a
@@ -9456,6 +9476,17 @@ static uint64_t known_input_size(const Options & opt, FILE * in)
 // GZSTD_DEBUG_GPU_MIN_BYTES overrides the bound; 0 disables the gate entirely,
 // which is how the suite keeps exercising the GPU paths on small fixtures.  Test
 // hook only, same shape as GZSTD_DEBUG_ADAPT_SAVE_MIN_MS.
+// The frame the gate measures a batch in.  Clamp the chunk to the GPU's real
+// per-subchunk ceiling: compress_nvcomp hard-clamps chosen_mib to GPU_SUBCHUNK_MAX
+// (a larger host chunk would overflow the device input slot), so --chunk-size=256
+// does NOT give the GPU 256 MiB frames — it still gets 16.  Sizing the gate off
+// the unclamped request made the bound 16x the geometry the run would actually
+// use, and routed inputs the GPU could easily have filled to the CPU instead.
+static uint64_t gpu_gate_frame_bytes(const Options & opt)
+{
+  return std::min<uint64_t>(std::max<size_t>(1, opt.chunk_mib),
+                            GPU_SUBCHUNK_MAX / ONE_MIB) * 1024 * 1024;
+}
 static uint64_t gpu_min_useful_bytes(const Options & opt)
 {
   if (const char * e = std::getenv("GZSTD_DEBUG_GPU_MIN_BYTES")) {
@@ -9463,21 +9494,12 @@ static uint64_t gpu_min_useful_bytes(const Options & opt)
     const unsigned long long v = std::strtoull(e, &end, 10);
     if (end != e) return (uint64_t)v;
   }
-  // Clamp the chunk to the GPU's real per-subchunk ceiling: compress_nvcomp
-  // hard-clamps chosen_mib to GPU_SUBCHUNK_MAX (a larger host chunk would
-  // overflow the device input slot), so --chunk-size=256 does NOT give the GPU
-  // 256 MiB frames — it still gets 16.  Sizing the gate off the unclamped
-  // request made the bound 16x the geometry the run would actually use, and
-  // routed inputs the GPU could easily have filled to the CPU instead.
-  const uint64_t gate_mib =
-      std::min<uint64_t>(std::max<size_t>(1, opt.chunk_mib),
-                         GPU_SUBCHUNK_MAX / ONE_MIB);
   // The pre-adapt cap (see Options::gpu_batch_cap_gate): the question is whether
   // the input can fill a batch of the geometry parse_args derived, not one the
   // profile's settled ceiling inflated.
   const size_t gate_batch =
       opt.gpu_batch_cap_gate ? opt.gpu_batch_cap_gate : opt.gpu_batch_cap;
-  return gate_mib * 1024 * 1024 * (uint64_t)std::max<size_t>(1, gate_batch);
+  return gpu_gate_frame_bytes(opt) * (uint64_t)std::max<size_t>(1, gate_batch);
 }
 
 // How long GPU bringup takes, near enough.  Same guard the -d --tar decode pool
@@ -9530,12 +9552,15 @@ static constexpr double GPU_SAMPLE_SETTLED = 1.25;
 // far, in the units gpu_min_useful_bytes measures (input bytes for compress,
 // declared output bytes of the frames queued for decompress), and `no_more`
 // says no further GPU work will arrive.  See the unknown-size branch below.
+// `backlog` (v0.18.13) is the frames read and not yet taken by any worker
+// (TaskQueue::backlog_frames); --adapt decides a pipe on it instead of `work`.
 static bool gpu_bringup_worth_it(const Options & opt,
                                  const std::function<double()> & progress,
                                  std::mutex & mx, std::condition_variable & cv,
                                  const std::function<bool()> & stop,
                                  const std::function<double()> & work = {},
-                                 const std::function<bool()> & no_more = {})
+                                 const std::function<bool()> & no_more = {},
+                                 const std::function<size_t()> & backlog = {})
 {
   if (opt.gpu_only) return true;
   // GZSTD_DEBUG_GPU_GUARD_SEC overrides the guard; 0 disables the check so the
@@ -9566,6 +9591,90 @@ static bool gpu_bringup_worth_it(const Options & opt,
     if (!work || gate == 0) {
       vlog(V_DEBUG, opt, "[GPU] bringup sample: no progress signal -> engage\n");
       return true;
+    }
+    // --ADAPT: A PIPE STARTS ITS GPUS ONLY WHEN THE CPUS FALL BEHIND (v0.18.13,
+    // ROADMAP 17).  That a batch's worth has ARRIVED says nothing about whether
+    // the CPU pool needs help, and a pipe the pool keeps up with cannot go faster
+    // than the pipe: a GPU only adds CUDA's start, the devices' setup and its exit.
+    // MEASURED, 8-GPU server, a 1,250-frame archive through `cat` under --adapt:
+    // CUDA started at 91 ms, at most 25-34 of 2,144 frames were ever in flight,
+    // not one GPU batch ran, and the run took 4.1-4.5 s against 3.4-4.1 for
+    // --cpu-only.  So the evidence here is the BACKLOG: frames read that no
+    // worker has taken, or a queue too full to take another.  It must be at a
+    // batch's worth at every sample across a sample window after
+    // the sampler's warm-up, so a burst from the writer or the pool's own start
+    // does not count.  Checks are 10 ms apart initially, then 100 ms after 4 s.
+    // There is no guard
+    // either: a pipe the CPU pool keeps up with never starts CUDA, however long
+    // it runs, and one that falls behind starts it whenever it does.  The
+    // backend prior still picks --cpu-only outright where it measured that, and
+    // the default (no --adapt) is unchanged below.
+    if (opt.adapt && backlog) {
+      const uint64_t fb = gpu_gate_frame_bytes(opt);
+      // --cpu-batch N usually keeps CPU workers off the queue until N frames
+      // wait, so N waiting frames are that setting, not a pool that fell behind.
+      // EOF or a producer cap releases that floor to prevent a deadlock.  Before
+      // any GPU registers the scheduler lets CPUs run wild and its GPU floor is 0.
+      const size_t want = (size_t)std::max<uint64_t>(1, (gate + fb - 1) / fb)
+                        + opt.cpu_queue_min;
+      auto el_now = [&] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+      };
+      auto adapt_verdict = [&](bool engage, const char * why, size_t seen) {
+        if (opt.verbosity >= V_VERBOSE) {
+          char q[32], b[240];
+          if (seen == SIZE_MAX) std::snprintf(q, sizeof q, "a full queue");
+          else std::snprintf(q, sizeof q, "%zu frame%s", seen, seen == 1 ? "" : "s");
+          std::snprintf(b, sizeof b,
+            "[ADAPT] pipe: %s waiting at %.0f ms (behind at %zu: one GPU batch%s), %s -> %s\n",
+            q, el_now() * 1000.0, want, opt.cpu_queue_min ? " + --cpu-batch" : "",
+            why, engage ? "start the GPUs" : "no GPUs");
+          vlog(V_VERBOSE, opt, b);
+        }
+        return engage;
+      };
+      // -v says what was decided (adapt_verdict); -vv each time the backlog
+      // crosses a batch or falls back under it; -vvv every sample.
+      auto adapt_note = [&](int level, const char * what, size_t q, double el) {
+        if (opt.verbosity < level) return;
+        char b[200];
+        if (q == SIZE_MAX)
+          std::snprintf(b, sizeof b, "[ADAPT] pipe gate %.0f ms: queue full, %s\n", el * 1000.0, what);
+        else
+          std::snprintf(b, sizeof b, "[ADAPT] pipe gate %.0f ms: %zu of %zu frames waiting, %s\n",
+                        el * 1000.0, q, want, what);
+        vlog(level, opt, b);
+      };
+      double held_since = -1.0;
+      for (;;) {
+        if (stop()) return adapt_verdict(false, "run ended", 0);
+        const double el = el_now();
+        const size_t q = backlog();
+        adapt_note(V_TRACE, "sample", q, el);
+        if (el >= GPU_SAMPLE_WARMUP_SEC && q >= want) {
+          if (held_since < 0.0) {
+            held_since = el;
+            adapt_note(V_DEBUG, "a batch is waiting; holding for the sample window", q, el);
+          }
+          if (el - held_since >= GPU_SAMPLE_WINDOW_SEC)
+            return adapt_verdict(true, "the CPU pool fell behind", q);
+        } else {
+          if (held_since >= 0.0)
+            adapt_note(V_DEBUG, "the CPU pool caught up; not behind after all", q, el);
+          held_since = -1.0;
+          // The input has ended and less than a batch is waiting: the pool kept up.
+          // Read in this order -- producer done, then the queue -- so no frame
+          // queued before the end can be missed.
+          if (no_more && no_more() && backlog() < want)
+            return adapt_verdict(false, "the input ended with the CPU pool keeping up", q);
+        }
+        // The sampler's 10 ms cadence while a start would still matter most, then
+        // 100 ms: this can now wait out a whole run, and the decision only has to
+        // beat a cuInit of seconds.
+        std::unique_lock<std::mutex> lk(mx);
+        cv.wait_for(lk, std::chrono::milliseconds(el < GPU_INIT_GUARD_SEC ? 10 : 100),
+                    [&] { return stop(); });
+      }
     }
     auto verdict = [&](bool engage, const char * why) {
       if (opt.verbosity >= V_DEBUG) {
@@ -12679,9 +12788,7 @@ public:
     // The `!q_.empty()` guard on the byte cap guarantees progress even when a
     // single frame exceeds the whole budget.  re_enqueue (push_front) bypasses
     // both, so it never blocks.
-    while (!done_ &&
-           ((max_depth_ > 0 && q_.size() >= max_depth_) ||
-            (max_bytes_ > 0 && !q_.empty() && queued_bytes_ >= max_bytes_)))
+    while (!done_ && at_capacity_locked())
       space_cv_.wait(lk);
     // done_ set mid-stream means a shutdown is in progress (GPU-fault abort): drop
     // the task instead of buffering it — the consumers have exited and the whole
@@ -12746,6 +12853,17 @@ public:
   {
     throttle_ = bp;
     cursor_ = writer_cursor;
+  }
+
+  // Frames read and not yet taken by any worker -- or SIZE_MAX when the caps
+  // above have been reached, which tells a live producer its next push will wait:
+  // consumers are behind it.  --adapt's pipe gate reads this (v0.18.13), and a
+  // small --throttle-factor cap must not hide a backlog the queue cannot hold.
+  size_t backlog_frames()
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    if (at_capacity_locked()) return SIZE_MAX;
+    return q_.size();
   }
 
   // Cap the number of queued (read-but-not-popped) frames for producer
@@ -12977,6 +13095,18 @@ public:
   {
     cpu_cv_.notify_all();
   }
+  // The same, fenced against a waiter that has evaluated its predicate under the
+  // lock but not yet parked (the empty critical section, as gpu_bringup_signal
+  // does).  For a state change OUTSIDE this queue that a waiter's predicate reads
+  // -- the GPU stream count behind wait_for_cpu's hold (v0.18.13) -- where an
+  // unfenced notify could land in that gap and be lost for good.  Never call it
+  // with this queue's lock held, which rules out the predicates' callees: they use
+  // the plain notify above.
+  void notify_cpu_waiters_fenced()
+  {
+    { std::lock_guard<std::mutex> lk(m_); }
+    cpu_cv_.notify_all();
+  }
 
   // Wake ONE CPU worker.  Used by the high-frequency gpu_got_data() path
   // to avoid thundering herd: each CPU pops one frame then loops back,
@@ -12994,6 +13124,7 @@ public:
     size_t depth;         // number of tasks in queue
     bool   done;          // producer has called set_done()
     double front_ratio;   // compressed/decompressed ratio of front task (-1.0 if empty or unknown)
+    bool   at_capacity;   // queue has reached a producer cap
   };
 
   // Blocking wait for CPU workers in hybrid mode.
@@ -13005,13 +13136,18 @@ public:
   // and returns true when the CPU worker should attempt to pop.
   // Returns false when queue is drained (caller should exit).
   // Returns true when the predicate is satisfied (caller should try to pop).
-  bool wait_for_cpu(std::function<bool(const QueueState &)> may_proceed)
+  // `hold_when_drained` (v0.18.13): while it returns true a drained queue does NOT
+  // end the wait -- see cpu_decomp_worker, whose GPUs can still hand frames back.
+  // Called under this queue's lock, so like may_proceed it must not call back in.
+  bool wait_for_cpu(std::function<bool(const QueueState &)> may_proceed,
+                    const std::function<bool()> & hold_when_drained = {})
   {
     std::unique_lock<std::mutex> lk(m_);
     while (true) {
-      if (q_.empty() && done_) return false;  // drained
+      if (q_.empty() && done_ && !(hold_when_drained && hold_when_drained()))
+        return false;  // drained
       if (!q_.empty()) {
-        QueueState qs { q_.size(), done_, front_ratio_locked() };
+        QueueState qs = queue_state_locked();
         if (may_proceed(qs)) return true;
       }
       cpu_cv_.wait(lk);
@@ -13038,7 +13174,7 @@ public:
       // (the caller exits; the output is discarded anyway).  The abort paths
       // store the flag before set_done(), whose notify_all lands here.
       if (g_gpu_aborted.load(std::memory_order_relaxed)) { --gpu_yield_waiters_; return false; }
-      QueueState qs { q_.size(), done_, front_ratio_locked() };
+      QueueState qs = queue_state_locked();
       if (may_take(qs)) { --gpu_yield_waiters_; return true; }
       cv_.wait(lk);
     }
@@ -13094,7 +13230,7 @@ public:
     while (true) {
       if (q_.empty() && done_) return false;
       if (!q_.empty()) {
-        QueueState qs { q_.size(), done_, front_ratio_locked() };
+        QueueState qs = queue_state_locked();
         if (may_proceed(qs)) {
           t = take_front_locked();
           return true;
@@ -13114,7 +13250,7 @@ public:
     std::unique_lock<std::mutex> lk(m_);
     if (q_.empty() && done_) return -1;
     if (!q_.empty()) {
-      QueueState qs { q_.size(), done_, front_ratio_locked() };
+      QueueState qs = queue_state_locked();
       if (may_proceed(qs)) {
         t = take_front_locked();
         pop_signal_locked();
@@ -13125,6 +13261,17 @@ public:
   }
 
 private:
+  // Shared by push(), the --adapt backlog probe, and CPU predicates.  A CPU
+  // --cpu-batch floor cannot wait for more frames once this cap stops the producer.
+  // CALLER MUST HOLD m_.
+  bool at_capacity_locked() const {
+    return (max_depth_ > 0 && q_.size() >= max_depth_)
+        || (max_bytes_ > 0 && !q_.empty() && queued_bytes_ >= max_bytes_);
+  }
+  QueueState queue_state_locked() const {
+    return { q_.size(), done_, front_ratio_locked(), at_capacity_locked() };
+  }
+
   // Peek at front task's compression ratio.  CALLER MUST HOLD m_.
   double front_ratio_locked() const {
     if (q_.empty()) return -1.0;
@@ -17323,8 +17470,8 @@ public:
       const double faster = D.faster_sum.load(std::memory_order_relaxed);
       if (mine <= 0.0 || faster <= 0.0) return true;   // fastest, or unranked yet
       const double depth = (double)depth_now;
-      // CPUs refuse depths below --cpu-queue-min, so GPUs must stay the
-      // drain of last resort there (same invariant as the aggregate path).
+      // --cpu-batch can hold CPUs off a shallow queue before EOF or a producer
+      // cap; keep GPU intake available there (as in the aggregate path).
       if (opt_.cpu_queue_min > 0 && depth <= (double)opt_.cpu_queue_min)
         return true;
       const double batch = (double)dev_batch_(device);
@@ -17374,8 +17521,8 @@ public:
     const double g = gpu_rate_ema_.load(std::memory_order_relaxed);
     if (c <= 0.0 || g <= 0.0) return true;
     const double depth = (double)depth_now;
-    // CPUs refuse depths below --cpu-queue-min, so the GPU must stay the
-    // drain of last resort there or the run hangs with both sides yielding.
+    // --cpu-batch can hold CPUs off a shallow queue before EOF or a producer
+    // cap.  Keep GPU intake available so both sides cannot yield there.
     if (opt_.cpu_queue_min > 0 && depth <= (double)opt_.cpu_queue_min)
       return true;
     // This device's batch, and the whole GPU pool's appetite: every live
@@ -17492,7 +17639,10 @@ public:
     int n = active_gpu_streams_.fetch_sub(1, std::memory_order_relaxed) - 1;
     if (n < 0) n = 0;
     update_queue_floor(n, gpu_batch_size_.load(std::memory_order_relaxed));
-    if (queue_) queue_->notify_cpu_waiters();
+    // Fenced: a hybrid decompress CPU worker may be deciding, under the queue lock,
+    // whether this stream still counts (v0.18.13).  Callers are worker exits and
+    // the reclaimer, never a queue predicate.
+    if (queue_) queue_->notify_cpu_waiters_fenced();
   }
 
   // Streams whose floor reservation is live: total minus quiesced devices'.
@@ -18117,7 +18267,10 @@ static void cpu_worker(
           size_t floor = sched->cpu_queue_floor();
           if (floor > 0 && qs.depth <= floor) return false;
         }
-        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min) return false;
+        // At EOF or a producer cap, waiting for more queued frames cannot
+        // succeed.  Fixed-share GPUs can also wait for the CPU's first take.
+        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
+            && !qs.done && !qs.at_capacity) return false;
         return true;
       };
       bool drained = false;
@@ -18427,17 +18580,42 @@ static void cpu_decomp_worker(
           size_t floor = sched->cpu_queue_floor();
           if (floor > 0 && qs.depth <= floor) return false;
         }
-        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min) return false;
+        // End-of-input and a full producer queue release --cpu-batch's floor;
+        // otherwise a fixed-share GPU can wait for a CPU take that never comes.
+        if (opt->cpu_queue_min > 0 && qs.depth < opt->cpu_queue_min
+            && !qs.done && !qs.at_capacity) return false;
         return true;
+      };
+      // A DRAINED QUEUE IS NOT THE END WHILE A GPU CAN STILL HAND FRAMES BACK
+      // (v0.18.13).  This worker used to leave the moment the queue was empty and
+      // the producer done, although a GPU stream might still hold frames it had
+      // popped.  Four paths return them to the queue: a trivially-compressed batch
+      // skipped for the CPU, a VRAM shrink, a fault's undelivered tail, and a stuck
+      // batch the reclaimer takes away.  With the CPU pool gone, nobody took them.
+      // MEASURED, 8-GPU server, the 1,250-frame archive, -d -c -T1 with a forced
+      // stall (GZSTD_DEBUG_DECOMP_STALL): the reclaimer requeued 16 frames 6 s in,
+      // after the one CPU worker had left, and the run ended "internal error:
+      // writer stuck ... frame 97 of 1250 missing", exit 1, output cut short --
+      // on v0.18.11 as well.  The trivial skip was worse: its stream then parks
+      // until the front is no longer trivial, which with no CPU worker is never,
+      // and teardown waits on that worker.  Every hand-back happens while its
+      // stream is still registered (the reclaimer unregisters only after
+      // requeueing), so wait until none is: unregister_gpu_stream wakes this,
+      // fenced, and the last one out lets a drained queue end the wait again.
+      // Not on an abort, which leaves the queue undrained on purpose.
+      auto gpus_may_hand_back = [&] {
+        return sched->any_gpu_active() && !g_gpu_aborted.load(std::memory_order_relaxed);
       };
       bool drained = false;
       while (true) {
-        if (!tq->wait_for_cpu(may_take)) { drained = true; break; }
+        if (!tq->wait_for_cpu(may_take, gpus_may_hand_back)) { drained = true; break; }
         if (bp) bp->acquire_or_overdraft(head_of_line);
         int rc = tq->try_pop_one_cpu(t, may_take);
         if (rc == 1) { got_task = true; break; }
         if (bp) bp->release(1);
-        if (rc == -1) { drained = true; break; }
+        // Drained between the wait and the pop: let the wait decide again, since a
+        // GPU may still hand frames back.  (Leaving here was the same hole.)
+        if (rc == -1) continue;
       }
       if (drained) break;
       if (got_task) {
@@ -34866,6 +35044,15 @@ static void gpu_worker(
     close_drain_fifo();
     drainer.join();
     wd_phase(slot_index, WatchPhase::Exiting);
+    // A CLEAN EXIT WITH NO GPU WORK YET DELIVERED, anywhere in the run: the CPU
+    // pool took it all.  That is the hybrid backend's policy outcome, like the
+    // lazy guard's decline, and --adapt files its rate as hybrid's (v0.18.13, see
+    // g_adapt_gpu_declined).  Through v0.18.12 it fell through to "cpu", so a run
+    // that paid CUDA's start and exit for nothing lowered the cpu-only figure the
+    // backend prior compares against.  A worker that FAILS still reaches the
+    // catch below instead, and stays filed as cpu.
+    if (!g_adapt_gpu_engaged.load(std::memory_order_relaxed))
+      g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
 
     // Export per-stream stats for JSON output
     if (json_sink) {
@@ -36180,9 +36367,12 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                                 [&] {
                                   std::lock_guard<std::mutex> lk(results.m);
                                   return results.producer_done;
-                                })) {
-        vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
-                             "skipping GPU bringup\n");
+                                },
+                                [&] { return queue.backlog_frames(); })) {
+        // --adapt's pipe gate has said why already ("[ADAPT] pipe: ...").
+        if (!opt.adapt || comp_progress() >= 0.0)
+          vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
+                               "skipping GPU bringup\n");
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
       }
@@ -37645,7 +37835,7 @@ static void gpu_decomp_worker(
     { std::lock_guard<std::mutex> lk(g_decomp_exit_mx); }
     g_decomp_exit_cv.notify_all();
     if (out != gpu_worker_count) return;    // not the last worker out
-    if (!opt.gpu_only || !queue) return;    // hybrid still has CPU consumers
+    if (!opt.gpu_only || !queue) return;    // hybrid: its CPU pool outlasts every GPU stream (v0.18.13)
     if (queue->drained()) return;           // empty AND producer done: nothing owed
     const int lost = std::min(gpu_worker_count,
         (gpu_failures ? gpu_failures->load(std::memory_order_acquire) : 0)
@@ -38037,6 +38227,11 @@ static void gpu_decomp_worker(
   auto leave_unstarted = [&]() {
     vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id)
          + "] the queue was drained before this device was set up; not starting it\n");
+    // The bringup thread checks for a drained queue before spawning this worker;
+    // this covers a drain after that check.  Both are filed the same way
+    // (v0.18.13): a decline by policy, so --adapt records the run's rate as
+    // hybrid's, not as a cpu-only rate that paid for CUDA.
+    g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
     queue->notify_cpu_waiters();
     note_exit_and_rescue();
   };
@@ -38811,7 +39006,10 @@ static void gpu_decomp_worker(
         // under the queue lock.  An empty or unknown front (front_ratio -1) ends the park
         // and falls through to the blocking batch wait; a drained queue ends the worker.
         // CPU workers take a trivial front ahead of every share, floor and --cpu-batch
-        // gate, so the frame a stream parks behind is always taken.
+        // gate, so the frame a stream parks behind is always taken -- and since
+        // v0.18.13 they are still there to take it: they wait until every GPU stream
+        // has unregistered (cpu_decomp_worker), where they used to leave as soon as
+        // the queue was empty and this parked stream could wait forever.
         if (sched) {
           bool all_trivial = true;
           for (const auto & t : C.batch) {
@@ -40313,6 +40511,10 @@ static void gpu_decomp_worker(
       if (producer_done_seen) break;
       if (!submitted_any) std::this_thread::yield();
     }
+    // A clean exit with no GPU frame delivered anywhere in the run: filed as a
+    // decline by policy (v0.18.13) -- see the compress worker's note.
+    if (!g_adapt_gpu_engaged.load(std::memory_order_relaxed))
+      g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
 
     // Cleanup.  Writers first: free_device() below releases the very slab they
     // are reading from, so a pending write would DMA out of freed VRAM.
@@ -40348,6 +40550,7 @@ static void gpu_decomp_worker(
     // registry is still legal to touch.
     if (!gz_decomp_unpublish(device_id)) gz_decomp_park_forever();
     *any_gpu_failed = true;
+    g_adapt_gpu_faulted.store(true, std::memory_order_relaxed);
     *fatal_msg = std::string("[GPU") + std::to_string(device_id) + "] " + e.what();
     // SAY WHAT HAPPENED, HERE.  fatal_msg is reported by the caller after the
     // workers join -- but when this is the last worker out under --gpu-only the
@@ -41541,9 +41744,12 @@ gds_out_declined:
                                 [&] {
                                   std::lock_guard<std::mutex> lk(results.m);
                                   return results.producer_done;
-                                })) {
-        vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
-                             "skipping GPU bringup\n");
+                                },
+                                [&] { return queue.backlog_frames(); })) {
+        // --adapt's pipe gate has said why already ("[ADAPT] pipe: ...").
+        if (!opt.adapt || decomp_progress() >= 0.0)
+          vlog(V_VERBOSE, opt, "[GPU] CPU pool will finish before GPU init could; "
+                               "skipping GPU bringup\n");
         g_adapt_gpu_declined.store(true, std::memory_order_relaxed);
         return;
       }
@@ -41790,6 +41996,7 @@ gds_out_declined:
           if (bp_ptr) bp_ptr->release(n);
         }
         g_decomp_abandoned.fetch_or(bit, std::memory_order_relaxed);
+        g_adapt_gpu_faulted.store(true, std::memory_order_relaxed);   // see its note
         if (sched)
           // VRAM bringup may auto-reduce --gpu-streams.  Decrement exactly what
           // this worker registered; using the requested count can drive the
@@ -47021,6 +47228,8 @@ static int gzstd_main(int argc, char ** argv)
   // which is what stops the predictor re-selecting the same probe on every run
   // forever.  Without this a probe that finished under the floor left no trace
   // at all, not even `runs`.
+  if (g_adapt_gpu_faulted.load(std::memory_order_relaxed))
+    adapt_obs.fault = true;   // a rescued decompress fault (v0.18.13): see the flag
   const bool adapt_stamp_only =
       adapt_obs.explored != 0 && adapt_obs.wall_ns < adapt_save_min_ns()
       && !adapt_obs.fault;

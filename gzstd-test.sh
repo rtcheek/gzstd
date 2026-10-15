@@ -619,8 +619,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=527
-$EXTENSIVE && EXPECTED_TESTS=824
+EXPECTED_TESTS=530
+$EXTENSIVE && EXPECTED_TESTS=828
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -647,6 +647,14 @@ $EXTENSIVE && EXPECTED_TESTS=824
 # The --extensive no-GPU delta then MEASURED 2026-10-14 on the 8-GPU host, CPU-only
 # build: 617 ran of 824 (617 passed, 172 skipped), so it is 207, not the derived 206.
 # The default no-GPU delta (142) is still derived for this version.
+# v0.18.13 (ROADMAP 17): +2 default GPU cells -- --adapt starts a pipe's GPUs only
+# when the CPUs fall behind, and files a run whose GPUs got nothing as hybrid:
+# 527 -> 529, 824 -> 826; no-GPU deltas 142 -> 144, 207 -> 209.
+# ...and one --extensive GPU cell in the stuck-batch reclaim section (hybrid: a
+# reclaimed GPU batch is decoded after the CPU pool drained): 826 -> 827; the
+# --extensive no-GPU delta 209 -> 210.
+# ...and one default GPU cell from the review (--cpu-batch with a fixed --cpu-share
+# finishes a short input): 529 -> 530, 827 -> 828; no-GPU deltas 144 -> 145, 210 -> 211.
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -875,8 +883,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=142   # + the two v0.18.8 GPU cells, + one v0.18.12 GPU cell
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=207   # MEASURED 2026-10-14 (824 - 617); the derived 206 was one low
+EXPECTED_NOGPU_DELTA=145   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=211   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -5385,6 +5393,28 @@ os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)' "$asym_zst" 2>
   fi
   rm -f "$TMPDIR"/qcap-*.dec "$TMPDIR"/qcap-*.log
 
+  # --CPU-BATCH LETS GO AT THE END OF THE INPUT (v0.18.13, found by review).  A hybrid
+  # CPU worker waited for N queued frames even after the producer had finished or
+  # was blocked on a full queue; with a fixed --cpu-share the GPU in turn waits for
+  # the CPU's first take, so fewer than N frames hung both directions for good
+  # (v0.18.11/12: timed out at 30 s, compress and decompress).  32 one-MiB frames
+  # against --cpu-batch=64.  The timeout is a HANG GUARD, not a performance check.
+  cbx_why=""
+  head -c $((24*1048576)) /dev/urandom 2>/dev/null | base64 -w0 | head -c $((32*1048576)) \
+    > "$TMPDIR/cbx.bin"
+  timeout --foreground -k 5 60 "$GZSTD" -q -f --hybrid --cpu-share=0.5 --cpu-batch=64 \
+    --chunk-size=1 "$TMPDIR/cbx.bin" -o "$TMPDIR/cbx.zst" 2>/dev/null
+  rc=$?
+  [[ $rc -eq 0 ]] || cbx_why+=" compress:exit $rc"
+  timeout --foreground -k 5 60 "$GZSTD" -d -q -f --hybrid --cpu-share=0.5 --cpu-batch=64 \
+    "$TMPDIR/cbx.zst" -o "$TMPDIR/cbx.out" 2>/dev/null
+  rc=$?
+  [[ $rc -eq 0 ]] || cbx_why+=" decompress:exit $rc"
+  files_match "$TMPDIR/cbx.bin" "$TMPDIR/cbx.out" || cbx_why+=" bytes"
+  [[ -z "$cbx_why" ]] && pass "--cpu-batch with a fixed --cpu-share finishes a short input" \
+    || fail "--cpu-batch with a fixed --cpu-share finishes a short input" "$cbx_why"
+  rm -f "$TMPDIR/cbx.bin" "$TMPDIR/cbx.zst" "$TMPDIR/cbx.out"
+
   rm -f "$asym_src" "$asym_zst"
 else
   skip "asymmetric mode: PCIe gen detected"                          "no GPU"
@@ -5397,6 +5427,7 @@ else
   skip "asymmetric mode: explicit --cpu-only beats tuning-flag promotion" "no GPU"
   skip "asymmetric mode: --cpu-batch + explicit --cpu-only triggers silencing" "no GPU"
   skip "hybrid decompress declares its queue-depth ceiling"          "no GPU"
+  skip "--cpu-batch with a fixed --cpu-share finishes a short input" "no GPU"
 fi
 
 # ============================================================
@@ -5557,6 +5588,67 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
     || sg_why+=" [a worker pre-allocated with nothing to take]"
   [[ -z "$sg_why" ]] && pass "a GPU worker with nothing left to take is not set up" \
     || fail "a GPU worker with nothing left to take is not set up" "$sg_why"
+
+  # --ADAPT STARTS A PIPE'S GPUS ONLY WHEN THE CPUS FALL BEHIND (v0.18.13, ROADMAP 17).
+  # The default starts CUDA once a batch's worth has ARRIVED, or at the guard if the
+  # pipe is still sending; under --adapt the evidence is a batch's worth WAITING,
+  # held for the sample window, and there is no guard.  Three arms, each asserting
+  # the DECISION, never the time (--no-profile, so no stored prior picks a backend):
+  #   control  -- 160 MiB trickled past a 1 s guard WITHOUT --adapt: CUDA starts;
+  #   kept up  -- the same trickle under --adapt: no GPUs, however long it sends;
+  #   behind   -- two -19 workers fed 48 one-MiB frames at once: GPUs start.
+  sg_why=""
+  for i in 1 2 3 4 5; do cat "$TMPDIR/large.bin"; done > "$TMPDIR/ap160.bin"
+  ap_trickle() { local i; for i in 0 1 2 3 4 5 6 7 8 9; do
+                   dd if="$TMPDIR/ap160.bin" bs=16M skip=$i count=1 status=none; sleep 0.15; done; }
+  ap_dec() { tr '\r' '\n' < "$1" | grep -o "$2" | head -1; }
+  ap_trickle | GZSTD_DEBUG_GPU_MIN_BYTES=134217728 GZSTD_DEBUG_GPU_GUARD_SEC=1 \
+    "$GZSTD" -vv --no-profile -c > /dev/null 2> "$TMPDIR/ap.log"
+  [[ "$(ap_dec "$TMPDIR/ap.log" 'bringup sample: size unknown.*-> [a-z]*')" == *"-> engage" ]] \
+    || sg_why+=" [control without --adapt did not start CUDA]"
+  ap_trickle | GZSTD_DEBUG_GPU_MIN_BYTES=134217728 GZSTD_DEBUG_GPU_GUARD_SEC=1 \
+    "$GZSTD" -vv --adapt --no-profile -c > "$TMPDIR/ap.zst" 2> "$TMPDIR/ap.log"
+  rc=${PIPESTATUS[1]}
+  [[ $rc -eq 0 ]] || sg_why+=" [kept up: exit $rc]"
+  [[ "$(ap_dec "$TMPDIR/ap.log" '\[ADAPT\] pipe: .*')" == *"keeping up -> no GPUs" ]] \
+    || sg_why+=" [kept up: $(ap_dec "$TMPDIR/ap.log" '\[ADAPT\] pipe: .*\|bringup sample: size unknown.*')]"
+  ! tr '\r' '\n' < "$TMPDIR/ap.log" | grep -q 'device workers online' \
+    || sg_why+=" [kept up: GPU workers started]"
+  "$GZSTD" -d -q -c "$TMPDIR/ap.zst" 2>/dev/null | cmp -s - "$TMPDIR/ap160.bin" || sg_why+=" [kept up: bytes]"
+  seq 1 20000000 | head -c $((48*1048576)) > "$TMPDIR/apseq.bin"
+  cat "$TMPDIR/apseq.bin" | GZSTD_DEBUG_GPU_MIN_BYTES=8388608 GZSTD_DEBUG_GPU_GUARD_SEC=60 \
+    "$GZSTD" -vv --adapt --no-profile -T2 -19 --chunk-size=1 -c > "$TMPDIR/ap.zst" 2> "$TMPDIR/ap.log"
+  rc=${PIPESTATUS[1]}
+  [[ $rc -eq 0 ]] || sg_why+=" [behind: exit $rc]"
+  [[ "$(ap_dec "$TMPDIR/ap.log" '\[ADAPT\] pipe: .*')" == *"fell behind -> start the GPUs" ]] \
+    || sg_why+=" [behind: $(ap_dec "$TMPDIR/ap.log" '\[ADAPT\] pipe: .*')]"
+  "$GZSTD" -d -q -c "$TMPDIR/ap.zst" 2>/dev/null | cmp -s - "$TMPDIR/apseq.bin" || sg_why+=" [behind: bytes]"
+  [[ -z "$sg_why" ]] && pass "--adapt starts a pipe's GPUs only when the CPUs fall behind" \
+    || fail "--adapt starts a pipe's GPUs only when the CPUs fall behind" "$sg_why"
+
+  # A RUN WHOSE GPUS CAME UP AND GOT NOTHING IS FILED AS HYBRID (v0.18.13).  The
+  # CPU pool took all the work -- the hybrid backend's policy outcome -- so the
+  # --adapt profile records the run's rate as hybrid's.  Through v0.18.12 it was
+  # filed as cpu-only: a rate that paid CUDA's start and exit lowered the number
+  # the backend prior compares hybrid against.  The sizeless frame is handed to
+  # the CPU streaming decoder; trickled over ~4.5 s so the run passes the 4 s
+  # floor below which no backend rate is recorded, while CUDA comes up at once.
+  sg_why=""
+  ap_x="$TMPDIR/ap-xdg"; rm -rf "$ap_x"; mkdir -p "$ap_x"
+  ap_n=$(stat -c %s "$TMPDIR/sgsl.zst"); ap_step=$(( (ap_n + 9) / 10 ))
+  { for i in 0 1 2 3 4 5 6 7 8 9; do
+      dd if="$TMPDIR/sgsl.zst" bs=$ap_step skip=$i count=1 status=none; sleep 0.45; done; } \
+    | env XDG_CACHE_HOME="$ap_x" GZSTD_DEBUG_GPU_MIN_BYTES=0 GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 \
+      "$GZSTD" -d -vv --adapt -c > "$TMPDIR/ap.out" 2> "$TMPDIR/ap.log"
+  rc=${PIPESTATUS[1]}
+  [[ $rc -eq 0 ]] || sg_why+=" exit:$rc"
+  cmp -s "$TMPDIR/ap.out" "$TMPDIR/sg8.bin" || sg_why+=" bytes"
+  tr '\r' '\n' < "$TMPDIR/ap.log" | grep -q 'done batch' && sg_why+=" [a GPU batch ran: nothing to prove]"
+  grep -q '"overall_gibs_hybrid"' "$ap_x/gzstd/profile.json" 2>/dev/null || sg_why+=" [no hybrid rate]"
+  grep -q '"overall_gibs_cpu"' "$ap_x/gzstd/profile.json" 2>/dev/null && sg_why+=" [filed as cpu-only]"
+  [[ -z "$sg_why" ]] && pass "--adapt files a run whose GPUs got nothing as hybrid" \
+    || fail "--adapt files a run whose GPUs got nothing as hybrid" "$sg_why"
+  rm -rf "$ap_x" "$TMPDIR"/ap160.bin "$TMPDIR"/apseq.bin "$TMPDIR"/ap.zst "$TMPDIR"/ap.out "$TMPDIR"/ap.log
   rm -f "$TMPDIR"/sg8.bin "$TMPDIR"/sgp1.zst "$TMPDIR"/sgp8.zst "$TMPDIR"/sgp.log "$TMPDIR"/sgsl.zst \
         "$TMPDIR"/sgns.out
 
@@ -5571,6 +5663,8 @@ else
   skip "bringup sample skips the GPU only when the job outruns cuInit" "no GPU"
   skip "a pipe is held to the GPU gate: engage at one batch, skip below it" "no GPU"
   skip "a GPU worker with nothing left to take is not set up" "no GPU"
+  skip "--adapt starts a pipe's GPUs only when the CPUs fall behind" "no GPU"
+  skip "--adapt files a run whose GPUs got nothing as hybrid" "no GPU"
 fi
 
 # ============================================================
@@ -8787,11 +8881,43 @@ if has_gpu 2>/dev/null; then
   else
     fail "decompress reclaim stays quiet on a healthy run" "exit $rc"
   fi
+
+  # 4. HYBRID: THE CPU POOL WAITS FOR FRAMES A GPU HANDS BACK (v0.18.13).  A hybrid
+  # CPU worker used to leave as soon as the queue was empty and the producer done,
+  # though a GPU stream still held frames.  The reclaimer then requeued the wedged
+  # batch into a queue nobody read: "internal error: writer stuck ... frame 1 of 48
+  # missing", exit 1 (v0.18.11 and v0.18.12, 3 of 3).  The trickle keeps frames
+  # arriving after the one GPU registers, so its queue floor reserves it a batch;
+  # the stall wedges that batch; one CPU worker finishes the rest; the reclaim comes
+  # 6 s in.  Compressible 1 MiB frames, not base64: the CPU must keep up here.
+  rc=0
+  seq 1 20000000 2>/dev/null | head -c $((48*1048576)) > "$dr_src"
+  "$GZSTD" -q -f --cpu-only --chunk-size=1 "$dr_src" -o "$dr_zst" 2>/dev/null
+  dr_n=$(stat -c %s "$dr_zst"); dr_step=$(( (dr_n + 39) / 40 ))
+  { for i in $(seq 0 39); do
+      dd if="$dr_zst" bs=$dr_step skip=$i count=1 status=none; sleep 0.06; done; } \
+    | timeout --foreground -k 10 60 env GZSTD_DEBUG_DECOMP_STALL=-1:60 \
+      "$GZSTD" -d -v -T1 -c > "$dr_out" 2> "$dr_log"
+  rc=${PIPESTATUS[1]}
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    fail "hybrid: a reclaimed GPU batch is decoded after the CPU pool drained" "TIMED OUT"
+  elif ! grep -aqE 'batch wedged .* past its deadline.*reclaiming [0-9]+ frame' "$dr_log"; then
+    fail "hybrid: a reclaimed GPU batch is decoded after the CPU pool drained" \
+         "no reclaim announced: NOT TESTED (exit $rc)"
+  elif [[ $rc -ne 0 ]]; then
+    fail "hybrid: a reclaimed GPU batch is decoded after the CPU pool drained" \
+         "exit $rc: $(grep -ao 'writer stuck[^(]*' "$dr_log" | head -1)"
+  elif files_match "$dr_src" "$dr_out"; then
+    pass "hybrid: a reclaimed GPU batch is decoded after the CPU pool drained"
+  else
+    fail "hybrid: a reclaimed GPU batch is decoded after the CPU pool drained" "output differs"
+  fi
   rm -f "$dr_src" "$dr_zst" "$dr_out" "$dr_log"
 else
   skip "wedged GPU decompress batch is reclaimed for the CPU" "no GPU"
   skip "a slow GPU decompress batch is demoted, not reclaimed" "no GPU"
   skip "decompress reclaim stays quiet on a healthy run" "no GPU"
+  skip "hybrid: a reclaimed GPU batch is decoded after the CPU pool drained" "no GPU"
 fi
 
 fi  # $EXTENSIVE (--adapt GPU deadline demote/escalate + GPU decompress stuck-batch reclaim: moved to -e in v0.18.7 -- stable, untouched, and slow)

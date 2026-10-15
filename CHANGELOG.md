@@ -1,11 +1,223 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.12  
+**Covers:** v0.9.50 → v0.18.13  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.18.13 — --adapt starts a pipe's GPUs only when the CPUs fall behind, and a hybrid decompress no longer loses frames a GPU hands back
+
+**The decision (owner, 2026-10-15).** ROADMAP 17 left one question after v0.18.12: should a pipe the
+CPU pool keeps up with start CUDA at all? The answer is an `--adapt` behaviour. Without `--adapt`,
+the default stays hybrid as v0.18.5 made it, and `--cpu-only` is the user's to ask for. With
+`--adapt`, a pipe starts its GPUs only when the CPUs fall behind, and the 4 s fallback is gone.
+(An explicit `--cpu-share` is a fixed split brought up before the reader starts, and is unchanged.)
+
+**Why the evidence had to change.** The pipe gate starts CUDA once a GPU batch's worth of work has
+*arrived*. That says nothing about whether the CPU pool needs help. MEASURED, 8-GPU server, a
+1,250-frame archive (19.5 GiB of output) through `cat`, four runs under v0.18.12's `--adapt`:
+- CUDA started at 91 ms every time;
+- at most 25-34 of the 2,144 frames the throttle allows were ever in flight;
+- not one GPU batch ran, and the runs took 4.1-4.5 s against 3.4-4.1 for `--cpu-only`.
+
+`--adapt`'s regime classifier could not have told the gate. It gives no verdict before 3.5 s (a 3 s
+warm-up, then 0.5 s of agreement). And it called these runs compute-bound 3 times of 4: source-bound
+needs the reader 85% busy, and the decompress pipe reader ran at about 82%. Compute-bound there
+means only "neither of the other two". The direct evidence is the backlog: frames read that no
+worker has taken.
+
+**The change, under `--adapt`, for input of unknown size (a pipe, a FIFO):**
+- CUDA starts when a GPU batch's worth of frames is waiting (`TaskQueue::backlog_frames`; a queue
+  too full to take another frame counts too, so a small `--throttle-factor` cap cannot hide a
+  backlog). It must be there at every sample across the 0.15 s window, after the
+  sampler's 0.10 s warm-up, so a burst from the writer or the pool's own start does not count. A dip
+  between two samples goes unseen; the cost of that is a start a few milliseconds early or late.
+- There is no guard. A pipe the CPU pool keeps up with never starts CUDA, however long it runs; one
+  that falls behind starts it whenever it does.
+- When the input ends with less than a batch waiting, the GPUs stay off. The producer is read done
+  before the queue, so no frame queued before the end is missed.
+- A batch is counted in frames: the gate's bytes over the frame size, which is the GPU batch cap.
+  The sampler checks every 10 ms for the first 4 s, then every 100 ms, since it can now wait out a
+  whole run.
+- With `--cpu-batch N` the CPU workers normally wait until N frames are queued, so the threshold is
+  a batch plus N. End-of-input or a full producer queue releases the CPU floor: otherwise a small
+  input or a bounded queue can leave both fixed-share engines waiting forever. Nothing else holds
+  frames back before a GPU registers: the scheduler lets the CPUs take freely, and the queue floor
+  reserved for GPUs is 0.
+- Output follows the tiering `--adapt` should have everywhere (ROADMAP 22): `-v` prints the decision
+  (`[ADAPT] pipe: N frames waiting at T ms (behind at B: one GPU batch), ... -> start the GPUs | no
+  GPUs`),
+  `-vv` each time the backlog crosses a batch or falls back, `-vvv` every sample.
+
+Named files are unchanged: their sampler already predicts whether the CPU pool finishes before CUDA
+would be up. So is the backend prior, which still picks `--cpu-only` outright where it measured that.
+
+**Measured**, 8-GPU server, warm, through `cat`, each `--adapt` run with a fresh profile, so only
+the gate decides:
+
+| | `--adapt` | default hybrid | `--cpu-only` |
+|---|---|---|---|
+| piped `-d`, 1,250 frames, 4 runs | **2.93-3.85 s**, no CUDA | 4.06-5.29 s | 2.99-3.36 s |
+| piped compress, 19.5 GiB, 4 runs | **6.03-6.20 s**, no CUDA | 7.20-7.82 s | 6.07-6.13 s |
+| CPU behind: 1 GiB, `-T2 -19`, 2 runs | 4.35-4.42 s, GPUs at 272 ms | 4.15-4.23 s, at 81 ms | |
+| CPU behind: piped `-d -T1`, 1 run | 4.98 s, GPUs at 354 ms | 4.47 s, at 91 ms | |
+| 192 MiB trickled over ~6 s, 1 run | **6.36 s**, no CUDA | 7.81 s, CUDA at 3.6 s | |
+
+Where the CPUs fall behind, `--adapt` starts the GPUs about 0.2-0.26 s later than the default, the
+time the backlog takes to build and hold, and pays roughly that. Fewer CPU workers alone did not make
+a pipe fall behind here: `-T8` and even `-T2` at level 3 kept up with this corpus, whose zero runs
+compress almost free. The behind cases needed `-19` or `-T1`.
+
+### A hybrid decompress lost the frames a GPU handed back after the CPU pool had left
+
+**The defect** (found while testing the filing change below, present in v0.18.11 and v0.18.12, and
+probably long before). A hybrid CPU decompress worker left as soon as the queue was empty and the
+producer done, although a GPU stream might still hold frames it had popped. Four paths hand popped
+frames back to the queue:
+- a batch of trivially compressed frames, skipped for the CPU;
+- a VRAM shrink, which requeues the batch;
+- a fault's undelivered tail;
+- a stuck batch the stall guard reclaims.
+
+With the CPU pool gone, nothing took them. The last-GPU-out CPU rescue only ever ran under
+`--gpu-only`, and the comment on it said "hybrid still has CPU consumers". MEASURED, 8-GPU server, the
+1,250-frame archive, `-d -c -T1`, with a forced stall (`GZSTD_DEBUG_DECOMP_STALL`): the guard requeued
+16 frames 6 s in, after the one CPU worker had left. The run ended "internal error: writer stuck
+workers_done but frame 97 of 1250 missing", exit 1, with the output cut short. The v0.18.11 binary
+failed identically, with or without `--adapt`. The trivial-batch path is worse in principle: the
+stream then parks until the front of the queue is no longer trivial, which with no CPU worker is
+never, and teardown waits on that worker. The suite's reclaim cells could not see any of this,
+because they run `--gpu-only`: in hybrid their corpus was drained by the CPU before a GPU took a batch.
+
+**The fix.** Every hand-back happens while its stream is still registered with the scheduler; the
+reclaimer unregisters the stuck stream only after requeueing. So a hybrid CPU decompress worker now
+treats a drained queue as the end only when no GPU stream is registered:
+- `TaskQueue::wait_for_cpu` takes a hold predicate, `any_gpu_active()`, which is ignored on an abort;
+- a pop that finds the queue drained loops back to that wait, instead of leaving through the same
+  hole;
+- `unregister_gpu_stream` wakes the waiters with a new fenced notify (an empty critical section on
+  the queue lock first). Otherwise a worker that had just read "one stream left" under the lock
+  could miss the last unregister. The plain notify stays for the callers that run inside a queue
+  predicate, where taking the lock would self-deadlock.
+
+Registration comes after every bringup failure's early return, and all three unregister sites (the
+normal exit, the error path, the reclaimer) release exactly what was registered, so the hold cannot
+outlive its streams. Compress needs none of this: its GPU workers never hand frames back (a fault
+rebuilds the whole archive).
+
+The fixed-share audit also found an older `--cpu-batch` deadlock in both directions: with fewer
+than N frames at EOF, or with a producer cap below N, CPUs kept waiting for the threshold while a
+GPU waiting for the CPU's first share could not take a frame. The hybrid CPU predicates now release
+the threshold at EOF or when the queue reaches the same cap that blocks `push()`.
+
+**Measured after**, the same repro: exit 0, byte-identical, the 16 reclaimed frames decoded by the CPU
+worker that had waited for them. Ordinary runs are unchanged, five interleaved runs each: piped
+hybrid `-d` 4.3 s; `-t` of a 10 GB archive 0.65-1.09 s against 0.71-0.92 s on v0.18.12; `-d -T8`
+0.50-0.54 s against 0.48-0.54 s.
+
+
+### `--adapt` files a run whose GPUs got nothing as hybrid
+
+The backend prior compares end-to-end rates filed under `overall_gibs_cpu` and
+`overall_gibs_hybrid`. A hybrid run whose GPUs stay out by policy, as when the lazy guard declines or
+the CPU already drained the queue, is filed as hybrid, because that is hybrid's honest rate there.
+One case fell through to cpu: CUDA came up, the workers set up or left, and the CPU pool took every
+frame. It is item 17's own shape, and through v0.18.12 the run was filed as a cpu-only rate that had
+paid CUDA's start and exit, lowering the very number hybrid is compared against. Now a GPU worker
+that leaves cleanly before any GPU frame has been delivered marks the run as declined. That covers
+both the v0.18.12 skip-before-setup path and a set-up worker that drains with nothing; compress
+mirrors it. A worker that *fails* still leaves through its error path. And a decompress fault that
+the CPU rescues -- a worker's mid-run failure, or a stuck batch the stall guard reclaims -- now marks
+the run as faulted, so the profile counts the fault and merges no rate at all, as compress's CPU
+rebuild already did. Before, such a run could exit 0 and file its fault-and-rescue rate as cpu-only;
+with the clean-exit rule above, a healthy card leaving cleanly would have moved it to hybrid instead
+(found by the review). A full card skipped at bringup is not a fault (v0.18.7) and keeps its rate.
+MEASURED: a sizeless frame trickled for ~5 s, eight
+GPUs up and idle, filed `overall_gibs_cpu` before and `overall_gibs_hybrid` after.
+
+### Tests
+
+Three default GPU cells, 527 -> 530, and one `--extensive` GPU cell (`--extensive` 824 -> 828; the
+no-GPU deltas 142 -> 145 and 207 -> 211). Each asserts the decision or the outcome, never the time:
+- **--adapt starts a pipe's GPUs only when the CPUs fall behind.** Three arms, with `--no-profile`
+  so no stored prior picks a backend:
+  - a control: 160 MiB trickled past a 1 s guard without `--adapt` starts CUDA;
+  - the same trickle under `--adapt` prints "keeping up -> no GPUs", starts no worker and
+    round-trips;
+  - two `-19` workers fed 48 one-MiB frames at once print "fell behind -> start the GPUs" and
+    round-trip.
+- **--adapt files a run whose GPUs got nothing as hybrid.** A sizeless frame trickled over ~4.5 s
+  under `--adapt`: the profile must hold `overall_gibs_hybrid` and no `overall_gibs_cpu`.
+- **hybrid: a reclaimed GPU batch is decoded after the CPU pool drained** (`--extensive`, in the
+  stuck-batch reclaim section). 48 one-MiB frames are trickled through a pipe so frames are still
+  arriving after the one GPU registers, and its queue floor reserves it a batch. The stall hook wedges
+  that batch, one CPU worker finishes the rest, and the reclaim comes 6 s in. It must exit 0
+  byte-identical, with the reclaim announced; if the reclaim is not announced, it fails as "NOT
+  TESTED". v0.18.11/v0.18.12 fail it 3 of 3 ("frame 1 of 48 missing").
+- **--cpu-batch with a fixed --cpu-share finishes a short input** (in "Asymmetric mode"). 32
+  one-MiB frames against `--cpu-batch=64 --cpu-share=0.5`, both directions, under a 60 s hang guard.
+  It passes in 2 s; v0.18.12 times out compressing.
+
+Four GPU mutants each fail exactly their cell:
+- the `--adapt` branch disabled: the default rule starts CUDA "still arriving at the guard";
+- a guard put back inside it: CUDA starts with 0 frames waiting;
+- the clean-exit filing removed: "filed as cpu-only".
+- the CPU decompress worker's hold removed (the wait called without it): "writer stuck ... frame 1 of 48
+  missing", as before the fix.
+
+### Review (Codex, GPT-6-Sol): SAFE TO COMMIT, three rounds
+
+- **Round 1 (high).** One blocker in the filing change, adopted after checking the save path: a
+  decompress GPU fault that the CPU rescues can exit 0, and with the clean-exit rule a healthy card
+  leaving cleanly would have filed its fault-and-rescue rate as hybrid. Before, it was filed as
+  cpu-only. Such runs now count a fault and record no rate. I narrowed its version: it marked every
+  `any_gpu_failed`, two of whose three sources are full-card bringup skips, which v0.18.7 decided are
+  not faults. Also adopted: `--cpu-share` bypasses the pipe gate entirely (fixed-share bringup is
+  inline), and the backlog is sampled, so a dip between samples goes unseen. I had already made
+  `--cpu-batch` raise the gate's threshold, so its rewording of "the CPUs fall behind" was not taken.
+- **Round 2 (max), on the hand-back fix.** No hang, lost wakeup or self-deadlock, with file:line:
+  - every registering stream unregisters, and setup failures return before registering;
+  - the reclaimer requeues before it unregisters;
+  - no caller of the fenced notify holds the queue lock;
+  - decompress never sets the abort flag;
+  - each input builds its own scheduler.
+
+  It found one more pre-existing hang, confirmed before adopting: with `--cpu-batch N` and a fixed
+  `--cpu-share`, an input with fewer than N frames hung both directions, on v0.18.12 too (timed out
+  at 30 s). The CPU waited for N queued frames that would never come, and the fixed-share GPU waited
+  for the CPU's first take. A producer stopped by a queue cap below N frames had the same cycle. The
+  hybrid CPU predicates now release the `--cpu-batch` floor at end of input, or when the queue
+  reaches the cap that blocks `push()`; that cap check is now one helper both share. Its patch built
+  clean; the repro then finished in about 1 s, byte-exact, and a new default cell guards it.
+- **Round 3 (high).** It reviewed its own repair the other way. A momentarily full queue does not let
+  the CPUs flood it: they still obey GPU priority and the GPU queue floor, and the pop rechecks the
+  predicate. At end of input, waiting for N more frames could not fill a GPU batch anyway. It
+  corrected two scheduler comments that still said the CPUs always refuse a shallow queue.
+
+### Suites (2026-10-15, the 8-GPU server, final code, shared: other users' jobs on several cards, load ~10)
+
+- GPU build, `--extensive`: 826 passed, 0 failed, 2 skipped of 828, 15m8s, "as expected on this
+  host". One skip is the usual "no trivial batch reached a GPU". The other is the pipe arm of
+  "decompress GPU yields the tail", which reports itself not exercised when a busy host brings the
+  GPU up only after the one CPU worker has drained the pipe; its comment puts that at about 1 run in
+  3 on a shared box. None of this version's changes reach that arm. Its command, run 3 times on this
+  build and on v0.18.12: the GPU came online, the armed check declined, output identical, every time.
+- CPU-only build (warning-free), `--extensive`: 617 passed, 0 failed, 3m2s, "as expected" (828 - 211).
+- CPU-only build, default: 385 passed, 0 failed, 1m55s, "as expected" (530 - 145).
+
+### ROADMAP
+
+17 is decided as above. New items, from the owner's questions during this work:
+- 19: the GPU device-count model only serves `--gpu-only` compress. Hybrid on a pipe ran faster on
+  one GPU than on eight.
+- 20: nothing ranks the cards by measured speed.
+- 21: `--adapt` should try `--gds-only` and `--direct-stage` per card, rank them against the other
+  backends by input size and residency, and favour the winner.
+- 22: `--calibrate` should announce each step and show progress, findings and colour, and
+  `--adapt`'s output should follow one `-v`/`-vv`/`-vvv` tiering.
 
 
 ## v0.18.12 — piped compression runs twice as fast, a piped decompress stops setting up GPUs with nothing left to take, and ZSTD_NBTHREADS sets the compression thread count

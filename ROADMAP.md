@@ -259,8 +259,15 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    `cat f | zstd -T0 -c` 12.46 s. The pipe alone (`cat | cat`) moves it in 6.8-8.1 s and the named file
    compresses in 1.28 s, so neither tool is pipe-bound. Not triaged: measure what the reader does per
    read (sizes, syscalls, the pipe's buffer, `F_SETPIPE_SZ`) before guessing.
-17. **Piped hybrid decompress pays ~1 s for GPUs it never uses.** PARTLY FIXED v0.18.12, and the rest is a
-   POLICY QUESTION FOR THE OWNER.  After v0.18.11's faster pipe the gap was 2.4 s (hybrid 5.68-5.83 s,
+17. **Piped hybrid decompress pays ~1 s for GPUs it never uses.** PARTLY FIXED v0.18.12; DECIDED v0.18.13
+   (owner, 2026-10-15): it is an --adapt behaviour.  Under --adapt a pipe starts its GPUs only when
+   the CPU pool falls behind -- a GPU batch's worth of frames waiting (or a full queue), held for the
+   0.15 s sample window -- and the 4 s fallback is gone, so a pipe the CPUs keep up with never starts
+   CUDA.  --cpu-batch N raises the threshold by N (CPU workers normally wait for N frames, with
+   end-of-input and full-queue escapes); an
+   explicit --cpu-share is a fixed split and unchanged.  Without --adapt the default stays hybrid as
+   v0.18.5 made it; --cpu-only is the user's choice.  See the v0.18.13 CHANGELOG for the measurements.  The v0.18.12 text: PARTLY FIXED v0.18.12, and
+   the rest is a POLICY QUESTION FOR THE OWNER.  After v0.18.11's faster pipe the gap was 2.4 s (hybrid 5.68-5.83 s,
    `--cpu-only` 3.30-3.42): CUDA came up at ~3.2 s, the CPU pool finished at ~3.7 s, and the run then
    waited while eight workers each reserved VRAM and page-locked memory for a 256-frame batch, one
    after another.  A decompress GPU worker now leaves before its setup when the queue is drained:
@@ -293,6 +300,57 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    it: the default was as fast or faster everywhere. Unverified guess: cache per core (zstd's
    level-3 tables are ~768 KiB per worker). Workaround since v0.18.12: `ZSTD_NBTHREADS=2` sets the
    compression count on such a machine. A rule would need measurements from more CPUs first.
+19. **The GPU device-count model only serves `--gpu-only` compress.** `--calibrate` (and ordinary
+   --adapt runs) record, per device count, a fixed overhead and a busy rate, and --adapt then runs a
+   single-file `--gpu-only` compress on the count predicted to finish soonest.  Hybrid, decompress,
+   `-t` and `--tar` never consult it: they start every visible GPU unless --gpu-devices says
+   otherwise.  The case that showed it (v0.18.12, 19.5 GiB through `cat`): hybrid with ONE GPU took
+   6.4-7.3 s against 7.6-8.0 with all eight -- each device adds start-up and exit cost, and past a
+   few the host sets the rate.  Hybrid needs its own model (the CPU pool carries part of the input,
+   so the --gpu-only rates do not transfer), and decompress its own measurements.
+20. **Nothing ranks the cards by measured speed.**  Which GPUs a run uses is CUDA's order (a static
+   fastest-first heuristic from device properties), or with `--gpu-order=ranked` the current load
+   (utilization, then free memory, from the driver probe); a `--gpu-devices N` subset takes the N
+   least loaded.  No per-card throughput is recorded anywhere, and --calibrate's count pass varies
+   only HOW MANY cards, in CUDA's order.  Cards differ in practice: the 8-GPU server mixes H100 NVL
+   and PCIe H100s, one card runs hot (it threw corrected memory errors near 90 C), and slot
+   generation and PCIe/NUMA placement change the transfer rate.  Candidates: record a per-card
+   settled rate from the per-device batch tuners (each already measures its own device) into the
+   profile, keyed by UUID; add a single-card pass per device to --calibrate; then rank by measured
+   rate, with load as the tie-breaker or the override for a busy card.
+21. **--adapt does not consider `--gds-only` (owner's note, 2026-10-15).**  The idea: when GPUDirect
+   Storage is usable on this host (the same checks `--gds-only` already refuses on: nvidia-fs loaded
+   and matching the driver, P2PDMA, a supported filesystem, a card the drive can reach), have --adapt
+   try it as a fourth backend beside --cpu-only, --hybrid and --gpu-only, on EACH of the GPUs (GDS is
+   peer-to-peer from the drive, so which card sits closest to the NVMe matters more than for any
+   other mode), record the end-to-end results in the profile under the backend prior's rules
+   (explore once, 5% margin, re-measure the staler side every 20 runs), and favour it under --adapt
+   when it wins.  Measure the input size where it starts to pay: setup is not free
+   (cuFileBufRegister measured ~950 ms for a 4 GiB slab per stream, and the static BAR1 mapping
+   costs per process), so the profile should keep overhead + rate per backend and per card, as the
+   device-count model does, and predict the winner for THIS input's size.  What earlier work says
+   to expect, so the measurement is designed around it: on real media ~95% of --gds-only's win was
+   plain O_DIRECT into the staging slab, which `--direct-stage` gives without GDS's platform gates;
+   GDS measured as contention resilience (host CPU and page cache left alone) more than raw
+   throughput; and its rate depends on residency -- a warm, cached input favours the ordinary
+   readers, which GDS bypasses.  So key it by input residency, as the backend prior already does
+   for decompress, include `--direct-stage` as the fifth arm, and score CPU time as well as wall
+   time if the ranking is meant to reflect contention.  Pipes cannot use it (GDS reads a file).
+22. **--calibrate and --adapt should show their work (owner, 2026-10-15).**  --calibrate prints each
+   result when a step finishes, but never announces a step before it starts: during each GPU
+   device-count child (up to 4 GiB of compression apiece) the screen is silent, and the findings
+   arrive as unstructured rows.  It should say what it is measuring as it starts each step (the
+   corpus, each direction, each device count, the sink), show progress through the long ones, and
+   end with a summary of what it found and what --adapt will do with it (the backend, the device
+   count at a few input sizes).  Colour it: vlog() already colours "[TAG]" lines (a colour per
+   subsystem, numbers highlighted) when stderr is a colour terminal (g_color_stderr), but
+   --calibrate writes with raw fprintf and bypasses it, so most of this is routing its lines
+   through the same path, which also keeps a redirected log plain.  And --adapt's
+   ~40 [ADAPT] sites should follow one tiering, as the v0.18.13 pipe gate now does: -v each
+   decision and the evidence that settled it (backend, regime, reader/writer pool sizes, batch
+   latch, GPU start), -vv each time an input crosses a threshold or a state changes, -vvv every
+   tick or sample.  Today their levels are ad hoc (most at -v, a few at -vv), and some decisions
+   say nothing at any level.  Audit every site against that table before changing any of them.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
