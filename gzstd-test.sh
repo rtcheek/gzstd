@@ -448,6 +448,11 @@ export GZSTD_DEBUG_HOOKS_ACK=1
 # the GPU everywhere and the GPU paths would stop being covered.  0 = always
 # engage.  The dedicated tests below set both hooks explicitly.
 export GZSTD_DEBUG_GPU_GUARD_SEC=0
+# The caller's zstd environment must not reach the runs: gzstd reads
+# ZSTD_NBTHREADS for its compression thread count (v0.18.12), and the zstd the
+# byte-identical cells compare against reads it and ZSTD_CLEVEL.  The cell that
+# tests ZSTD_NBTHREADS sets it per command.
+unset ZSTD_NBTHREADS ZSTD_CLEVEL
 
 # ONE GPU BY DEFAULT — the single biggest cost in this suite is CUDA init, and it
 # scales with the number of visible devices, not with the work.  Measured on the
@@ -614,8 +619,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=525
-$EXTENSIVE && EXPECTED_TESTS=821
+EXPECTED_TESTS=527
+$EXTENSIVE && EXPECTED_TESTS=824
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -634,6 +639,14 @@ $EXTENSIVE && EXPECTED_TESTS=821
 # a GPU device-count pass: 522 -> 523, 818 -> 819.
 # v0.18.11 (ROADMAP 16): +2 default -- a pipe's buffer is grown both ways, and a
 # piped run counts its input once: 523 -> 525, 819 -> 821.  None needs a GPU.
+# v0.18.12: +1 --extensive (ZSTD_NBTHREADS sets the compression default):
+# 821 -> 822.  No GPU.
+# v0.18.12, ROADMAP 16 and 17: +2 default -- a pipe fills recycled blocks through
+# a bounce buffer (runs on every build), and a GPU worker with nothing left to take
+# is not set up (GPU): 525 -> 527, 822 -> 824; no-GPU deltas 141 -> 142, 205 -> 206.
+# The --extensive no-GPU delta then MEASURED 2026-10-14 on the 8-GPU host, CPU-only
+# build: 617 ran of 824 (617 passed, 172 skipped), so it is 207, not the derived 206.
+# The default no-GPU delta (142) is still derived for this version.
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -862,8 +875,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=141   # + the two v0.18.8 GPU cells
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=205   # MEASURED 2026-09-21 (607 - 463) + 34 derived since; + 3 v0.18.8
+EXPECTED_NOGPU_DELTA=142   # + the two v0.18.8 GPU cells, + one v0.18.12 GPU cell
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=207   # MEASURED 2026-10-14 (824 - 617); the derived 206 was one low
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -1191,6 +1204,37 @@ fi
 LAST_TEST_MS=$(( $(now_ms) - t0 ))
 [[ -z "$why" ]] && pass "a piped run counts its input once" \
   || fail "a piped run counts its input once" "input_bytes vs ${pc_size}:$why"
+
+# THE PIPE READERS FILL RECYCLED BLOCKS THROUGH A BOUNCE BUFFER (v0.18.12, ROADMAP
+# 16): read() copies into a 256 KiB buffer, and streaming stores move it into a
+# block that is reused once its frame is done.  The bytes must survive every
+# boundary of that: 1 MiB chunks (64 of them, then a tail that is a bounce buffer
+# and 7 bytes), on the CPU path and, with a GPU, the GPU path's reader.  "reused"
+# is the pool working; a CPU run of 65 chunks reuses a block in practice (5-6 made
+# on the 8-GPU host), while --gpu-only reads all of it before CUDA is up and so
+# only has to round-trip.
+t0=$(now_ms); why=""
+{ cat "$TMPDIR/large.bin" "$TMPDIR/large.bin"; head -c 262151 "$TMPDIR/medium.txt"; } > "$TMPDIR/pb.bin"
+cat "$TMPDIR/pb.bin" | "$GZSTD" -v --cpu-only --chunk-size=1 -c 2> "$TMPDIR/pb.err" > "$TMPDIR/pb.zst"
+pb_rc=${PIPESTATUS[1]}
+[[ $pb_rc -eq 0 ]] || why+=" cpu-exit:$pb_rc"
+pb_line=$(grep -oE '^\[READER\] pipe blocks: [0-9]+ made, [0-9]+ reused' "$TMPDIR/pb.err")
+pb_reused=$(echo "$pb_line" | grep -oE '[0-9]+ reused' | grep -oE '[0-9]+')
+[[ -n "$pb_line" ]] || why+=" cpu:no-pool-line"
+[[ "${pb_reused:-0}" -ge 1 ]] || why+=" cpu:nothing-reused(${pb_line:-none})"
+"$GZSTD" -d -q -c "$TMPDIR/pb.zst" 2>/dev/null | cmp -s - "$TMPDIR/pb.bin" || why+=" cpu:bytes"
+if has_gpu 2>/dev/null; then
+  rm -f "$TMPDIR/pb.zst"
+  cat "$TMPDIR/pb.bin" | "$GZSTD" -v --gpu-only --chunk-size=1 -c 2> "$TMPDIR/pb.err" > "$TMPDIR/pb.zst"
+  pb_rc=${PIPESTATUS[1]}
+  [[ $pb_rc -eq 0 ]] || why+=" gpu-exit:$pb_rc"
+  grep -qE '^\[READER\] pipe blocks: [0-9]+ made, [0-9]+ reused' "$TMPDIR/pb.err" || why+=" gpu:no-pool-line"
+  "$GZSTD" -d -q -c "$TMPDIR/pb.zst" 2>/dev/null | cmp -s - "$TMPDIR/pb.bin" || why+=" gpu:bytes"
+fi
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+[[ -z "$why" ]] && pass "a pipe fills recycled blocks through a bounce buffer, byte-exact" \
+  || fail "a pipe fills recycled blocks through a bounce buffer, byte-exact" "$why"
+rm -f "$TMPDIR/pb.bin" "$TMPDIR/pb.zst" "$TMPDIR/pb.err"
 rm -f "$TMPDIR/pipe.zst" "$TMPDIR/pipe.recovered" "$TMPDIR/pipeline.recovered" \
       "$TMPDIR/pg-in.err" "$TMPDIR/pg-out.err" "$TMPDIR/pc.json"
 
@@ -4936,6 +4980,49 @@ LAST_TEST_MS=0
 files_match "$TMPDIR/small.txt" "$TMPDIR/tform1.recovered" \
   && pass "-T 2 round-trip correct" || fail "-T 2 round-trip" "mismatch"
 
+# ZSTD_NBTHREADS (v0.18.12), read where zstd 1.5.7 reads it: the COMPRESSION
+# thread count when the line sets none.  -T and --single-thread win; 0 is zstd's
+# "no worker threads" (one thread, not -T0); a non-number is ignored with a
+# warning that -q hides; -d and -t never read it, so the decode count stays the
+# default's.  Counts come from -v's "[CPU] N worker/decompression threads online".
+tf_why=""
+tf_run() { local ev=$1; shift; ZSTD_NBTHREADS="$ev" "$GZSTD" -f --cpu-only "$@" 2>&1 >/dev/null; }
+tf_cnt() { grep -o '\[CPU\] [0-9]* [a-z]* threads online' <<<"$1"; }
+"$GZSTD" -q -k -f --cpu-only "$TMPDIR/medium.txt" -o "$TMPDIR/tform-nbt.zst" 2>/dev/null
+tf_def_c=$(tf_cnt "$(env -u ZSTD_NBTHREADS "$GZSTD" -f --cpu-only -v -c "$TMPDIR/medium.txt" 2>&1 >/dev/null)")
+tf_def_d=$(tf_cnt "$(env -u ZSTD_NBTHREADS "$GZSTD" -f --cpu-only -v -d -c "$TMPDIR/tform-nbt.zst" 2>&1 >/dev/null)")
+[[ -n "$tf_def_c" && -n "$tf_def_d" ]] || tf_why+=" no-default-count($tf_def_c/$tf_def_d)"
+o=$(tf_run 2 -v "$TMPDIR/medium.txt" -o "$TMPDIR/tform-nbt2.zst"); [[ $? -eq 0 ]] || tf_why+=" env2-rc"
+grep -q '\[CPU\] 2 worker threads online' <<<"$o" || tf_why+=" env2-not-2($(tf_cnt "$o"))"
+grep -q 'ZSTD_NBTHREADS=2: 2 compression threads' <<<"$o" || tf_why+=" env2-no-v-line"
+"$GZSTD" -q -d -c "$TMPDIR/tform-nbt2.zst" 2>/dev/null | cmp -s - "$TMPDIR/medium.txt" || tf_why+=" env2-roundtrip"
+o=$(tf_run 2 -v -T3 -c "$TMPDIR/medium.txt")
+grep -q '\[CPU\] 3 worker threads online' <<<"$o" || tf_why+=" T3-lost($(tf_cnt "$o"))"
+grep -q 'ZSTD_NBTHREADS' <<<"$o" && tf_why+=" T3-env-line"
+o=$(tf_run 2 -v -T -c "$TMPDIR/medium.txt")
+[[ "$(tf_cnt "$o")" == "$tf_def_c" ]] || tf_why+=" bare-T-not-default($(tf_cnt "$o"))"
+grep -q 'ZSTD_NBTHREADS' <<<"$o" && tf_why+=" bare-T-env-line"
+o=$(tf_run 2 -v --single-thread -c "$TMPDIR/medium.txt")
+grep -q 'single-thread streaming path' <<<"$o" || tf_why+=" single-thread-lost($(tf_cnt "$o"))"
+o=$(tf_run 0 -v -c "$TMPDIR/medium.txt")
+grep -q 'single-thread streaming path' <<<"$o" || tf_why+=" env0-not-one-thread($(tf_cnt "$o"))"
+o=$(tf_run abc -v -c "$TMPDIR/medium.txt"); [[ $? -eq 0 ]] || tf_why+=" abc-rc"
+grep -q 'ignoring environment variable setting ZSTD_NBTHREADS=abc' <<<"$o" || tf_why+=" abc-no-warning"
+[[ "$(tf_cnt "$o")" == "$tf_def_c" ]] || tf_why+=" abc-not-default($(tf_cnt "$o"))"
+for bad_threads in 4097 18446744073709551616; do
+  o=$(tf_run "$bad_threads" -v -c "$TMPDIR/medium.txt"); [[ $? -eq 0 ]] || tf_why+=" large-$bad_threads-rc"
+  grep -q "ignoring environment variable setting ZSTD_NBTHREADS=$bad_threads" <<<"$o" || tf_why+=" large-$bad_threads-no-warning"
+  [[ "$(tf_cnt "$o")" == "$tf_def_c" ]] || tf_why+=" large-$bad_threads-not-default($(tf_cnt "$o"))"
+done
+o=$(tf_run abc -q -c "$TMPDIR/medium.txt")
+grep -q 'ZSTD_NBTHREADS' <<<"$o" && tf_why+=" abc-q-warned"
+o=$(tf_run 2 -v -d -c "$TMPDIR/tform-nbt.zst")
+[[ "$(tf_cnt "$o")" == "$tf_def_d" ]] || tf_why+=" d-changed($(tf_cnt "$o") vs $tf_def_d)"
+o=$(tf_run abc -t "$TMPDIR/tform-nbt.zst")
+grep -q 'ZSTD_NBTHREADS' <<<"$o" && tf_why+=" t-read-it"
+[[ -z "$tf_why" ]] && pass "ZSTD_NBTHREADS sets the compression default, as zstd's does" \
+  || fail "ZSTD_NBTHREADS sets the compression default, as zstd's does" "$tf_why"
+
 rm -f "$TMPDIR"/tform*
 fi  # $EXTENSIVE (Thread option forms)
 
@@ -5448,7 +5535,30 @@ guard0: $(echo "$sg_log7" | grep -c 'bringup sample.*skip') skip(s))"
   [[ "$sg_d" == *"input ended below one batch"*"-> skip" ]] || sg_why+=" [sized then sizeless, piped -d: ${sg_d:-no size-unknown decision}]"
   [[ -z "$sg_why" ]] && pass "a pipe is held to the GPU gate: engage at one batch, skip below it" \
     || fail "a pipe is held to the GPU gate: engage at one batch, skip below it" "$sg_why"
-  rm -f "$TMPDIR"/sg8.bin "$TMPDIR"/sgp1.zst "$TMPDIR"/sgp8.zst "$TMPDIR"/sgp.log "$TMPDIR"/sgsl.zst
+
+  # A GPU WORKER WITH NOTHING LEFT TO TAKE IS NOT SET UP (v0.18.12, ROADMAP 17).
+  # A piped archive engages the GPUs before the CPU pool has finished it, and the
+  # workers then reserved VRAM and page-locked host memory for a 256-frame batch
+  # however little was left: a 1,250-frame archive through `cat` ran 0 GPU batches
+  # and still waited ~1 s for eight such setups.  A worker now leaves first when
+  # the queue is drained (producer done and nothing queued).  A sizeless frame
+  # makes that deterministic: the reader hands it to the CPU streaming decoder at
+  # its header, long before cuInit returns, and --gpu-only engages regardless.
+  # The v0.18.11 binary pre-allocates here every time.
+  sg_why=""
+  cat "$TMPDIR/sgsl.zst" | "$GZSTD" -d --gpu-only -vv -c 2> "$TMPDIR/sgp.log" \
+    > "$TMPDIR/sgns.out"
+  rc=${PIPESTATUS[1]}   # gzstd's status, not cat's
+  [[ $rc -eq 0 ]] || sg_why+=" exit:$rc"
+  cmp -s "$TMPDIR/sgns.out" "$TMPDIR/sg8.bin" || sg_why+=" bytes"
+  tr '\r' '\n' < "$TMPDIR/sgp.log" | grep -q 'the queue was drained before this device was set up; not starting it' \
+    || sg_why+=" [no worker left unstarted]"
+  ! tr '\r' '\n' < "$TMPDIR/sgp.log" | grep -q '\] pre-alloc batch=' \
+    || sg_why+=" [a worker pre-allocated with nothing to take]"
+  [[ -z "$sg_why" ]] && pass "a GPU worker with nothing left to take is not set up" \
+    || fail "a GPU worker with nothing left to take is not set up" "$sg_why"
+  rm -f "$TMPDIR"/sg8.bin "$TMPDIR"/sgp1.zst "$TMPDIR"/sgp8.zst "$TMPDIR"/sgp.log "$TMPDIR"/sgsl.zst \
+        "$TMPDIR"/sgns.out
 
   rm -f "$sg_src" "$sg_zst" "$TMPDIR/smallgate.out" "$TMPDIR/smallgate-tree.tar.zst"
   rm -rf "$sg_tree" "$TMPDIR/smallgate-tree.out"
@@ -5460,6 +5570,7 @@ else
   skip "small --tar creation goes cpu-only, walks once, round-trips" "no GPU"
   skip "bringup sample skips the GPU only when the job outruns cuInit" "no GPU"
   skip "a pipe is held to the GPU gate: engage at one batch, skip below it" "no GPU"
+  skip "a GPU worker with nothing left to take is not set up" "no GPU"
 fi
 
 # ============================================================

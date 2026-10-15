@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.11";
+static constexpr const char * GZSTD_VERSION = "0.18.12";
 //
 // Architecture overview:
 //
@@ -91,6 +91,9 @@ static constexpr const char * GZSTD_VERSION = "0.18.11";
 #include <functional>
 #include <cerrno>
 #include <csignal>
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>   // _mm_stream_si128: the pipe readers' block fill (gz_stream_copy)
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #ifndef _WIN32
@@ -3533,8 +3536,13 @@ static std::pair<int, int> gz_grow_pipe(int fd)
 }
 static std::atomic<int> g_input_pipe_from{0},  g_input_pipe_to{0};
 static std::atomic<int> g_output_pipe_from{0}, g_output_pipe_to{0};
+// The compress pipe readers' block pool, per input, for the [READER] line at -v
+// (GzPipeBlocks, v0.18.12).
+static std::atomic<uint64_t> g_pipe_blocks_made{0}, g_pipe_blocks_reused{0};
 static void gz_note_input_pipe(int fd)
 {
+  g_pipe_blocks_made.store(0, std::memory_order_relaxed);
+  g_pipe_blocks_reused.store(0, std::memory_order_relaxed);
   const auto r = gz_grow_pipe(fd);
   if (r.second) {
     g_input_pipe_from.store(r.first, std::memory_order_relaxed);
@@ -3560,6 +3568,128 @@ static void gz_note_output_pipe()
       g_output_pipe_to.store(r.second, std::memory_order_relaxed);
     }
   });
+}
+
+// THE PIPE READERS FILL RECYCLED BLOCKS THROUGH A SMALL BOUNCE BUFFER (v0.18.12,
+// ROADMAP 16).  v0.18.11 read a pipe straight into a new 16 MiB block per chunk.
+// The kernel does that copy while it holds the pipe's lock, so the writer on the
+// other end (`cat`, `tar`) waits for it, and the copy ran at the speed of the
+// block's memory: fresh pages fault and are zeroed inside it, and a reused block
+// that a worker has just read must first be taken back from that worker's cache.
+// MEASURED (8-GPU server, 19.5 GiB warm through `cat`, a scratch reader with 8
+// consumer threads that each read every block): straight into new blocks 1.19-
+// 1.22 GiB/s; reused blocks 1.65-1.80; reused blocks filled from a 256 KiB buffer
+// that the kernel copies into (it stays in this core's cache) and then streamed
+// into the block with non-temporal stores, 3.0-3.24 -- the same as a reader whose
+// blocks nobody reads (3.07-3.11).  Both halves are needed: the same bounce into
+// fresh pages was 1.33-1.47, and a plain memcpy from it 1.96-2.05.  The streaming
+// stores write whole cache lines without reading them first, outside the lock.
+#if defined(__SSE2__) || defined(_M_X64)
+static void gz_stream_copy(char * dst, const char * src, size_t n)
+{
+  size_t head = (64 - (reinterpret_cast<uintptr_t>(dst) & 63)) & 63;
+  if (head > n) head = n;
+  std::memcpy(dst, src, head);
+  dst += head; src += head; n -= head;
+  size_t i = 0;
+  for (; i + 64 <= n; i += 64) {
+    const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + i));
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + i + 16));
+    const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + i + 32));
+    const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + i + 48));
+    _mm_stream_si128(reinterpret_cast<__m128i *>(dst + i),      a);
+    _mm_stream_si128(reinterpret_cast<__m128i *>(dst + i + 16), b);
+    _mm_stream_si128(reinterpret_cast<__m128i *>(dst + i + 32), c);
+    _mm_stream_si128(reinterpret_cast<__m128i *>(dst + i + 48), d);
+  }
+  std::memcpy(dst + i, src + i, n - i);
+  // Streaming stores are weakly ordered: fence before the block is handed on.
+  _mm_sfence();
+}
+#else
+static void gz_stream_copy(char * dst, const char * src, size_t n) { std::memcpy(dst, src, n); }
+#endif
+static constexpr size_t GZ_PIPE_BOUNCE = 256 * 1024;
+// Blocks of one chunk size.  A released block goes back on the free list instead
+// of to the allocator, so its pages stay mapped.  The list never holds more than
+// the run had in flight at once (a block is only made when the list is empty),
+// and it is capped at 1 GiB of blocks (two at the least); close() frees the idle
+// blocks once the reader is done, after which a released block is simply deleted.
+// The deleter holds the state, so a block released after the reader's scope ended
+// is still safe.
+class GzPipeBlocks {
+  struct State {
+    std::mutex m;
+    std::vector<char *> free_;
+    size_t keep = 0;
+    bool closed = false;
+    ~State() { for (char * p : free_) delete[] p; }
+  };
+  std::shared_ptr<State> st_ = std::make_shared<State>();
+  size_t chunk_;
+public:
+  explicit GzPipeBlocks(size_t chunk) : chunk_(chunk)
+  {
+    st_->keep = std::max<size_t>(2, (size_t(1) << 30) / std::max<size_t>(1, chunk));
+    g_pipe_blocks_made.store(0, std::memory_order_relaxed);
+    g_pipe_blocks_reused.store(0, std::memory_order_relaxed);
+  }
+  ~GzPipeBlocks() { close(); }
+  GzPipeBlocks(const GzPipeBlocks &) = delete;
+  GzPipeBlocks & operator=(const GzPipeBlocks &) = delete;
+  std::shared_ptr<char> get()
+  {
+    char * p = nullptr;
+    {
+      std::lock_guard<std::mutex> g(st_->m);
+      if (!st_->free_.empty()) { p = st_->free_.back(); st_->free_.pop_back(); }
+    }
+    if (p) g_pipe_blocks_reused.fetch_add(1, std::memory_order_relaxed);
+    else {
+      p = new char[chunk_];
+      g_pipe_blocks_made.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::shared_ptr<State> st = st_;
+    return std::shared_ptr<char>(p, [st](char * q) {
+      {
+        std::lock_guard<std::mutex> g(st->m);
+        if (!st->closed && st->free_.size() < st->keep) {
+          try { st->free_.push_back(q); return; } catch (...) {}
+        }
+      }
+      delete[] q;
+    });
+  }
+  void close()
+  {
+    std::vector<char *> drop;
+    {
+      std::lock_guard<std::mutex> g(st_->m);
+      st_->closed = true;
+      drop.swap(st_->free_);
+    }
+    for (char * p : drop) delete[] p;
+  }
+};
+static inline uint64_t now_ns();   // defined below
+// fread exactly as before -- a short count only at the end of input or on an
+// error, which the caller's next fread reports -- but through `bounce`.
+static size_t gz_pipe_fill(FILE * in, char * dst, size_t want, char * bounce,
+                           uint64_t * copy_ns)
+{
+  size_t n = 0;
+  while (n < want) {
+    const size_t ask = std::min(GZ_PIPE_BOUNCE, want - n);
+    const size_t got = std::fread(bounce, 1, ask, in);
+    if (got) {
+      const uint64_t t0 = copy_ns ? now_ns() : 0;
+      gz_stream_copy(dst + n, bounce, got);
+      if (copy_ns) *copy_ns += now_ns() - t0;
+    }
+    n += got;
+    if (got < ask) break;
+  }
+  return n;
 }
 
 // NOTHING THIS RUN READS MAY BE THE REGULAR FILE IT WRITES TO STDOUT (v0.17.88,
@@ -5250,6 +5380,11 @@ static void print_help_long()
 "     I/O threads, and it bypasses the automatic 96-worker cap.  It is not\n"
 "     literally uncapped: only --sliding-window uses every hardware thread.\n"
 "     When -T is omitted entirely, the default is all cores capped at 96.\n"
+"     ZSTD_NBTHREADS=N in the environment sets the COMPRESSION default, as\n"
+"     in zstd (v0.18.12): it means -T N, except that 0 means one thread\n"
+"     (zstd's \"no worker threads\"), not -T 0.  -T, --threads and\n"
+"     --single-thread on the command line win; -d, -t and -l never read\n"
+"     it.  Invalid or out-of-range values are ignored with a warning.\n"
 "\n"
 "  --chunk-size N\n"
 "     Host I/O chunk size in MiB (default: 16).  Each independent\n"
@@ -5684,6 +5819,10 @@ static void print_help_long()
 "     --verify cannot be combined with it: the round trip is judged by\n"
 "     the checksums it leaves out.\n"
 "\n"
+"  ZSTD_NBTHREADS (v0.18.12), the environment variable: the compression\n"
+"     thread count when no -T is given (see -T).  ZSTD_CLEVEL is not read:\n"
+"     the level is 3 unless -# is given.\n"
+"\n"
 "  PARTIALLY MAPPED:\n"
 "     --rsyncable  real with --sliding-window (byte-identical to zstd's,\n"
 "                  which lives in zstd's worker threads); otherwise warned\n"
@@ -5986,6 +6125,34 @@ static unsigned zstd_u32_value(const std::string & flag, const std::string & v)
   if (!zstd_read_u32(p, out) || *p != '\0')
     die_usage(flag + ": '" + v + "' is not a number (optional suffix K, KB, KiB, M, MB, MiB)");
   return out;
+}
+// ZSTD_NBTHREADS (v0.18.12), read as zstd 1.5.7's default_nbThreads reads it
+// (programs/zstdcli.c): a number with the optional suffix above and nothing
+// after it.  Anything else is ignored with a warning using zstd's reason,
+// which -q hides; so is a count -T itself would refuse.  Its 0 is zstd's "no
+// worker threads", single-threaded, NOT its -T0 (all cores): here it means
+// --single-thread, -T 1.  The caller decides whether the variable applies.
+static constexpr unsigned GZ_THREAD_ARG_MAX = 4096;
+static void gz_apply_zstd_nbthreads(Options & opt)
+{
+  const char * env = std::getenv("ZSTD_NBTHREADS");
+  if (!env) return;
+  const char * p = env;
+  unsigned n = 0;
+  const char * bad = nullptr;
+  if (*p < '0' || *p > '9')                               bad = "not a valid unsigned value";
+  else if (!zstd_read_u32(p, n) || n > GZ_THREAD_ARG_MAX) bad = "numeric value too large";
+  else if (*p != '\0')                                    bad = "not a valid unsigned value";
+  if (bad) {
+    if (opt.verbosity >= V_DEFAULT)
+      std::fprintf(stderr, "gzstd: warning: ignoring environment variable setting "
+                           "ZSTD_NBTHREADS=%s: %s\n", env, bad);
+    return;
+  }
+  opt.cpu_threads = n == 0 ? 1 : (int)n;
+  if (opt.verbosity >= V_VERBOSE)
+    std::fprintf(stderr, "gzstd: ZSTD_NBTHREADS=%s: %d compression thread%s (-T overrides it)\n",
+                 env, opt.cpu_threads, opt.cpu_threads == 1 ? "" : "s");
 }
 // f= and accel= exist only in the fastcover set; these let one parser serve both.
 static void set_train_f(ZDICT_fastCover_params_t & p, unsigned v) { p.f = v; }
@@ -30613,13 +30780,22 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     // vector's zero fill) and the Task holds it as a view with shared ownership,
     // the way the parallel decompress reader's blocks are held; release_input()
     // drops it.  queued_host_bytes() counts the view, so backpressure is unchanged.
+    // Since v0.18.12 the blocks are recycled and filled through a bounce buffer:
+    // see GzPipeBlocks.
+    GzPipeBlocks blocks(host_chunk);
+    std::unique_ptr<char[]> bounce(new char[GZ_PIPE_BOUNCE]);
     while (true) {
-      std::shared_ptr<char> blk(new char[host_chunk], std::default_delete<char[]>());
+      std::shared_ptr<char> blk = blocks.get();
       uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
-      size_t n = std::fread(blk.get(), 1, host_chunk, in);
+      uint64_t cp_ns = 0;
+      size_t n = gz_pipe_fill(in, blk.get(), host_chunk, bounce.get(),
+                              (g_perf || m) ? &cp_ns : nullptr);
       if ((g_perf || m) && n > 0) {
-        const uint64_t r_dt = now_ns() - rd_t0;
-        if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+        const uint64_t r_dt = now_ns() - rd_t0 - cp_ns;
+        if (m) {
+          m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+          m->reader_copy_ns.fetch_add(cp_ns, std::memory_order_relaxed);
+        }
         if (g_perf) {
           g_perf->read_ns.fetch_add(r_dt);
           g_perf->read_bytes_total.fetch_add(n);
@@ -36690,14 +36866,22 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // Read straight into a block the frames share (v0.18.11, ROADMAP 16): the CPU
     // path's fallback reader above says why.  Each GPU-sized frame is a view into
     // the block with shared ownership, so the block is freed when the last of its
-    // frames releases its input.
+    // frames releases its input.  Recycled blocks through a bounce buffer since
+    // v0.18.12 (GzPipeBlocks).
+    GzPipeBlocks blocks(host_chunk);
+    std::unique_ptr<char[]> bounce(new char[GZ_PIPE_BOUNCE]);
     while (true) {
-      std::shared_ptr<char> blk(new char[host_chunk], std::default_delete<char[]>());
+      std::shared_ptr<char> blk = blocks.get();
       uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
-      size_t n_host = std::fread(blk.get(), 1, host_chunk, in);
+      uint64_t cp_ns = 0;
+      size_t n_host = gz_pipe_fill(in, blk.get(), host_chunk, bounce.get(),
+                                   (g_perf || m) ? &cp_ns : nullptr);
       if ((g_perf || m) && n_host > 0) {
-        const uint64_t r_dt = now_ns() - rd_t0;
-        if (m) m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+        const uint64_t r_dt = now_ns() - rd_t0 - cp_ns;
+        if (m) {
+          m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+          m->reader_copy_ns.fetch_add(cp_ns, std::memory_order_relaxed);
+        }
         if (g_perf) {
           g_perf->read_ns.fetch_add(r_dt);
           g_perf->read_bytes_total.fetch_add(n_host);
@@ -37837,16 +38021,45 @@ static void gpu_decomp_worker(
   // the first shrink of a run would double a threshold nothing had used yet,
   // and the documented "restores after 32" would have been 64 all along.
   bool   batch_regrew_since_pressure = false;
+  // NOTHING LEFT TO TAKE: LEAVE BEFORE THE SETUP (v0.18.12, ROADMAP 17).  A piped
+  // archive has no size, so bringup starts as soon as one batch's worth has
+  // arrived, and the CPU pool can finish the whole stream before a worker gets
+  // here.  The setup below then still reserved VRAM and page-locked host memory
+  // for a 256-frame batch, ~180 ms a device and serialised, and the run waited
+  // for every one.  MEASURED, 8-GPU server, a 1,250-frame archive through `cat`:
+  // the CPU pool finished at 3.71 s, the eighth device was ready at 4.69 s, and
+  // not one GPU batch ran (hybrid 5.68-5.83 s, --cpu-only 3.30-3.42).  drained()
+  // is the producer done AND the queue empty, so no frame is left for this worker
+  // and none can be owed to it: this is the exit a worker takes when it drains
+  // the queue normally, taken before batch slabs and pinned host buffers are
+  // allocated.  Checked again after context creation, which waits its turn
+  // behind the other devices and may already have allocated CUDA context state.
+  auto leave_unstarted = [&]() {
+    vlog(V_DEBUG, opt, "[GPU" + std::to_string(device_id)
+         + "] the queue was drained before this device was set up; not starting it\n");
+    queue->notify_cpu_waiters();
+    note_exit_and_rescue();
+  };
+  auto nothing_left = [&]() {
+    if (!queue || !queue->drained()) return false;
+    leave_unstarted();
+    return true;
+  };
   try {
+    if (nothing_left()) return;
     uint64_t init_t0 = g_perf ? now_ns() : 0;
     {
       // One device at a time — see g_gpu_ctx_init_m.  Same defect as the
       // compress worker: concurrent creation makes the driver finish every
       // device together, so none is usable until the last one is.
-      std::lock_guard<std::mutex> ctx_lk(g_gpu_ctx_init_m);
+      std::unique_lock<std::mutex> ctx_lk(g_gpu_ctx_init_m);
+      // Asked again on this device's turn: the queue it waited behind can have
+      // drained, and a context made now is only torn down again at exit.
+      if (queue && queue->drained()) { ctx_lk.unlock(); leave_unstarted(); return; }
       checkCuda(cudaSetDevice(device_id), "cudaSetDevice");
       checkCuda(cudaFree(0), "cudaFree(0) [force context]");
     }
+    if (nothing_left()) return;
 
     // For decompress, gpu_batch_cap is PER STREAM (not divided across streams).
     // Kernel launch overhead dominates, so each stream needs large batches.
@@ -42326,6 +42539,15 @@ static void print_reader_diag(const Options & opt, const Meter & meter, double w
     std::snprintf(pline, sizeof(pline), "[READER] input pipe buffer %d KiB -> %d KiB%s\n",
                   pfrom / 1024, pto / 1024, pto > pfrom ? "" : " (the system refused a larger one)");
     vlog(V_VERBOSE, opt, pline);
+  }
+  // The compress pipe readers' recycled blocks (v0.18.12): "reused" near the chunk
+  // count is the pool working; "made" near it means every chunk faulted fresh pages.
+  if (const uint64_t made = g_pipe_blocks_made.load(std::memory_order_relaxed)) {
+    char bline[128];
+    std::snprintf(bline, sizeof(bline), "[READER] pipe blocks: %llu made, %llu reused\n",
+                  (unsigned long long)made,
+                  (unsigned long long)g_pipe_blocks_reused.load(std::memory_order_relaxed));
+    vlog(V_VERBOSE, opt, bline);
   }
   if (r_io + r_ps + r_cp + r_bk == 0) return;
   const double r_n = std::max(1, meter.reader_threads.load());
@@ -49242,6 +49464,7 @@ static Options parse_args(int argc, char ** argv)
 
   std::string pinned_value_tmp; // scratch buffer for --pinned VALUE parsing
   std::string gpu_order_tmp;    // scratch buffer for --gpu-order VALUE parsing
+  bool thread_option_seen = false; // even a bare -T/--threads suppresses the environment default
 #ifndef HAVE_NVCOMP
   // Scratch destinations so a CPU-only build consumes GPU tuning arguments
   // exactly as the GPU build does, then discards them.
@@ -49474,6 +49697,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--sliding-window") opt.sliding_window = true;
     else if (a == "--hybrid") { opt.hybrid = true; opt.backend_user_set = true; }
     else if (a.rfind("-T", 0) == 0 && a.size() > 2) {
+      thread_option_seen = true;
       std::string val = a.substr(2);
       if (!val.empty() && val[0] == '=') val = val.substr(1);
       if (val.empty()) die_usage("missing value for -T");
@@ -49487,6 +49711,7 @@ static Options parse_args(int argc, char ** argv)
       opt.cpu_threads = (th == 0) ? -1 : th;
     }
     else if (a == "-T" || a == "--threads" || a.rfind("--threads=", 0) == 0) {
+      thread_option_seen = true;
       // Value forms: `--threads=N` (attached), or `-T N` / `--threads N`
       // (separate).  Only consume the next token as the count when it actually
       // looks like an integer — a bare `-T` (e.g. `-T --cpu-only`, `-T file.zst`,
@@ -49688,7 +49913,7 @@ static Options parse_args(int argc, char ** argv)
     else if (a.rfind("--target-compressed-block-size=", 0) == 0) {}
     else if (a.rfind("--auto-threads=", 0) == 0) {}
     // Real mapping: --single-thread ≈ -T 1
-    else if (a == "--single-thread") { opt.cpu_threads = 1; }
+    else if (a == "--single-thread") { thread_option_seen = true; opt.cpu_threads = 1; }
     // Warn no-ops: zstd features gzstd does not implement.
     // (Bare --adapt is a REAL gzstd flag since v0.15.0 — the adaptive
     // governor — parsed above; it deliberately takes over zstd's flag of
@@ -49929,6 +50154,18 @@ static Options parse_args(int argc, char ** argv)
     }
     else push_positional(a);
   }
+  // ZSTD_NBTHREADS (v0.18.12), where zstd reads it: only when nothing on the line
+  // set a count -- -T, --threads and --single-thread all win -- and only to
+  // compress.  A bare -T/--threads is accepted as auto above, so its presence
+  // must also suppress the environment default.  zstd never reads it for -d, and
+  // its -t and -l run no compression threads; here those counts are decode
+  // workers, so it must not touch them.  --train compresses in this sense and reads
+  // it, as zstd's training does.  The use: a machine-wide compression default, set
+  // once, that also reaches the gzstd `tar -I` starts.  MEASURED (v0.18.12) on a
+  // 2-core, 4-thread machine: -T2 compressed 9% faster with 37% less CPU than the
+  // default's 3 workers, while decompression was 7% faster at 3.
+  if (!thread_option_seen && opt.mode == Mode::COMPRESS && !opt.list_mode)
+    gz_apply_zstd_nbthreads(opt);
   // --train returns before the later tar validation, so check -O here too.
   if (opt.tar_O && !(opt.tar_mode && opt.mode == Mode::DECOMPRESS && !opt.list_mode))
     die_usage("-O applies to --tar extraction (-d --tar ARCHIVE -O writes member "
@@ -50435,16 +50672,15 @@ static Options parse_args(int argc, char ** argv)
   // a tuning constant: no real machine wants thousands of compression threads,
   // and -T0 / auto never routes through here.
   {
-    constexpr size_t THREAD_ARG_MAX = 4096;
-    if (opt.write_threads > THREAD_ARG_MAX)
+    if (opt.write_threads > GZ_THREAD_ARG_MAX)
       die_usage("--write-threads is unreasonably large (max "
-                + std::to_string(THREAD_ARG_MAX) + ")");
-    if (opt.cpu_threads > (int)THREAD_ARG_MAX)
+                + std::to_string(GZ_THREAD_ARG_MAX) + ")");
+    if (opt.cpu_threads > (int)GZ_THREAD_ARG_MAX)
       die_usage("-T/--threads is unreasonably large (max "
-                + std::to_string(THREAD_ARG_MAX) + ")");
-    if (opt.read_threads > THREAD_ARG_MAX)
+                + std::to_string(GZ_THREAD_ARG_MAX) + ")");
+    if (opt.read_threads > GZ_THREAD_ARG_MAX)
       die_usage("--read-threads is unreasonably large (max "
-                + std::to_string(THREAD_ARG_MAX) + ")");
+                + std::to_string(GZ_THREAD_ARG_MAX) + ")");
   }
 
   // BEFORE the --gpu-only check below, which --gds-only would otherwise trip with

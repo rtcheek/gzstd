@@ -241,10 +241,16 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    (gpuverify.cu) -- a batch of N frames runs 4N threads, far too few to fill an H100.  Idle host
    cores (hybrid already finishes in ~0.5 s) might take most of it back.  Measure the kernel's own
    time at -vvv before designing anything.
-16. **Piped compress is about 1.6x slower than zstd.** MOSTLY FIXED v0.18.11: a 64 KiB pipe paced the one
-   stdin reader, and a copy followed every read.  Pipes are now grown to 1 MiB both ways, and the pipe
-   readers read in place: piped `--cpu-only` compress 19.8 -> 11.0 s (zstd -T0 11.7), piped decompress
-   13.0-17.1 -> 7.8-8.0 s (zstd -d 18.4).  STILL OPEN: hybrid compress from a pipe with many GPUs,
+16. ~~**Piped compress is about 1.6x slower than zstd.**~~ FIXED v0.18.11 + v0.18.12, now about twice as
+   fast as zstd.  v0.18.11: a 64 KiB pipe paced the one stdin reader, and a copy followed every read;
+   pipes are grown to 1 MiB both ways and the readers read in place (`--cpu-only` 19.8 -> 11.0 s).
+   v0.18.12: the kernel's copy out of the pipe, done under the pipe's lock, ran at the speed of the
+   block it wrote into (fresh pages, or lines a worker had just read).  The readers now reuse blocks
+   from a pool and fill them through a 256 KiB buffer with streaming stores: 19.5 GiB through `cat`,
+   `--cpu-only` 13.5-15.3 -> 6.0-6.2 s, hybrid with 8 GPUs 12.9-15.9 -> 7.6-8.0, `zstd -T0` 12.2-16.5.
+   What is left is hybrid's ~1.5 s over `--cpu-only` on a pipe the CPU pool keeps up with: CUDA's exit
+   cost and the queue floor left to GPUs that cannot shorten the run -- the gate question in 17.
+   The v0.18.11 text: STILL OPEN: hybrid compress from a pipe with many GPUs,
    14.5-14.8 s against 9.6-9.9 s with ONE GPU and 11.0 s CPU-only.  The reader stays ~96% in read() and
    is never blocked downstream, and it is not page faults (1 GPU took more), not startup (the rate sags
    all run) and not pageable staging (--pinned=on: 44 s).  Something in how hybrid combines the CPU pool
@@ -253,13 +259,40 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    `cat f | zstd -T0 -c` 12.46 s. The pipe alone (`cat | cat`) moves it in 6.8-8.1 s and the named file
    compresses in 1.28 s, so neither tool is pipe-bound. Not triaged: measure what the reader does per
    read (sizes, syscalls, the pipe's buffer, `F_SETPIPE_SZ`) before guessing.
-17. **Piped hybrid decompress pays ~1 s for GPUs it never uses.** MEASURED v0.18.10, same box: the
+17. **Piped hybrid decompress pays ~1 s for GPUs it never uses.** PARTLY FIXED v0.18.12, and the rest is a
+   POLICY QUESTION FOR THE OWNER.  After v0.18.11's faster pipe the gap was 2.4 s (hybrid 5.68-5.83 s,
+   `--cpu-only` 3.30-3.42): CUDA came up at ~3.2 s, the CPU pool finished at ~3.7 s, and the run then
+   waited while eight workers each reserved VRAM and page-locked memory for a 256-frame batch, one
+   after another.  A decompress GPU worker now leaves before its setup when the queue is drained:
+   hybrid 3.69-5.76 -> 3.74-6.16 s (medians 5.68 -> 4.42), still timing-dependent -- how many devices
+   start their setup before the drain varies (0: 3.9 s; all 8: 5.8 s, and their setups slow the CPU
+   pool).  With CUDA started, exit costs ~0.4 s more (contexts on 8 devices: ~1.0 s); `_Exit` does not
+   help, the cost is in the kernel.  So the remainder is WHETHER TO START CUDA.  The pipe gate (v0.18.5)
+   starts it once one batch's worth of work has ARRIVED, ~0.1 s in, whether or not the CPU pool keeps
+   up, and at the 4 s guard if input is still arriving.  MEASURED with the early start switched off
+   (GZSTD_DEBUG_GPU_MIN_BYTES huge): piped -d 3.42-3.72 s (= `--cpu-only`), but piped compress of
+   19.5 GiB unchanged at 7.7 s -- the guard starts CUDA at 4 s and the run, done at ~6.1 s, waits for
+   it.  A candidate rule: start early only when a batch's worth is WAITING (the CPU pool has fallen
+   behind, so a GPU would have work at once); at the guard, the same test instead of "still
+   arriving".  That would leave a source-bound pipe on the CPU for its whole run -- same wall time,
+   none of CUDA's cost, but no GPU offload either -- and it reverses part of v0.18.5's design, so it is
+   not done without the owner.  The compress GPU worker has no such exit yet (its workers took
+   batches in every piped run measured; its test-only all-devices rendezvous would need the case).
+   The v0.18.10 text: MEASURED v0.18.10, same box: the
    1,250-frame archive piped to `-d`, 0 GPU batches, 6.70 s against 5.68 for `--cpu-only` (zstd -d
    6.64). A named file predicts from its size that "CPU pool will finish before GPU init could" and
    skips GPU startup (hybrid = cpu-only, ~1.0 s). A pipe has no size, so the evidence gate starts CUDA
    after one batch and the run then waits out an init (~6 s for 8 GPUs on this static-BAR1 host) it
    no longer needs. Candidates: predict from the observed CPU rate, or let a run that finishes first
    stop waiting on a GPU bringup it never used.
+18. **On some small hyperthreaded CPUs, the compression default runs too many workers.** MEASURED
+   v0.18.12 on a 2-core, 4-thread machine (cold and warm, alternating, four runs per arm): the
+   default's 3 workers against `-T2` compressed a 3.5 GiB directory with `--tar` no faster cold
+   and 9% slower warm, and used 33-37% more CPU. Decompression went the other way (3 workers 7%
+   faster). The same comparison on 2-core and 12-core slices of the server's CPU did NOT reproduce
+   it: the default was as fast or faster everywhere. Unverified guess: cache per core (zstd's
+   level-3 tables are ~768 KiB per worker). Workaround since v0.18.12: `ZSTD_NBTHREADS=2` sets the
+   compression count on such a machine. A rule would need measurements from more CPUs first.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

@@ -1,11 +1,243 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.11  
+**Covers:** v0.9.50 → v0.18.12  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
+
+
+## v0.18.12 — piped compression runs twice as fast, a piped decompress stops setting up GPUs with nothing left to take, and ZSTD_NBTHREADS sets the compression thread count
+
+### Piped compression: the copy out of the pipe was the limit (ROADMAP 16)
+
+**The defect.** v0.18.11 grew the pipe and stopped copying each chunk, and piped compression still
+trailed: hybrid with eight GPUs was 14.5 s against 11.0 s for `--cpu-only`, and both moved with no
+setting gzstd had. MEASURED on the 8-GPU server, 19.5 GiB warm through `cat`, sampling every thread
+of both processes from `/proc` every 20 ms:
+- The one stdin reader and `cat` were each on a CPU, in the kernel, in ~95% of samples, and each
+  one's system time tracked the run's wall time across modes: reader 8.4 s with one GPU, 10.3 s
+  `--cpu-only`, 11.8-13.7 s with eight. Linux copies pipe data while it holds the pipe's lock, so
+  `cat`'s copy in and gzstd's copy out take turns, and the slower copy sets the rate.
+- With eight GPUs, `-v` showed the input rate falling from 1.93 to 1.28 GiB/s once the GPU workers
+  came up. With one GPU it rose from 1.8 to 2.6.
+- Ruled out, each by measurement: CPU clock (3.75 GHz in every mode), automatic NUMA balancing
+  (`numactl --membind`: same times, no hint faults), page faults, transparent huge pages and malloc
+  trimming (glibc tunables: no change), interrupts and IPIs (counted), GPU traffic on the machine (a
+  separate 8-GPU job does not slow `cat | dd`), and socket placement (both pinned to one socket kept
+  the order: one GPU 8.7 s, `--cpu-only` 9.6-10.8, eight GPUs 11.7-12.5).
+
+**What the copy depends on: where it writes.** A scratch reader reproduced it without gzstd: it read
+the same pipe into 16 MiB blocks and handed them to 8 threads that each read every block, as the
+compression workers do.
+
+| scratch reader, 8 consumer threads | GiB/s |
+|---|---|
+| a new block per chunk, `read()` straight into it (gzstd v0.18.11) | 1.19-1.22 |
+| blocks reused, `read()` straight in | 1.65-1.80 |
+| blocks reused, `read()` into a 256 KiB buffer, `memcpy` into the block | 1.96-2.05 |
+| **blocks reused, `read()` into a 256 KiB buffer, non-temporal stores into the block** | **3.00-3.24** |
+| fresh pages each time, the same buffer and stores | 1.33-1.47 |
+| nobody reads the blocks, `read()` straight in (the ceiling) | 3.07-3.11 |
+
+A fresh block faults and zeroes its pages inside the copy. A reused block that a worker has just
+read must first be taken back from that worker's cache. Either way the kernel does that work while
+it holds the pipe's lock. Copying into a small buffer keeps the locked copy in this core's cache.
+The streaming stores then write the block's lines whole, outside the lock, without reading them
+first. Both halves are needed. The result held for buffers of 64 KiB to 1 MiB, either reuse order
+and 1 to 32 consumers.
+
+**The fix.** Both compress pipe readers (CPU, and GPU/hybrid) now:
+- take their blocks from a pool. A block goes back to the pool when its frame releases it, so its
+  pages stay mapped. The pool holds at most what the run once had in flight, capped at 1 GiB (two
+  blocks at the least). The reader frees the idle blocks when it finishes; a block still held by a
+  frame stays valid, and is deleted when that frame releases it;
+- `fread` into a 256 KiB buffer and copy it into the block with SSE2 streaming stores, fenced before
+  the block is queued. `fread`'s contract is unchanged: a short count only at the end of the input or
+  on an error, which the next call reports. Non-x86 builds use `memcpy`.
+
+`-v` adds `[READER] pipe blocks: N made, M reused`, and the copy's time is reported as task-copy.
+
+**Measured after**, 19.5 GiB warm through `cat`, unpinned, three interleaved runs per arm, against
+the same code without the change:
+
+| through a pipe | before | after |
+|---|---|---|
+| `--cpu-only` | 13.46-15.32 s | **6.01-6.22** |
+| hybrid, one GPU | 9.44-9.81 | **6.42-7.30** |
+| hybrid, eight GPUs (the default) | 12.91-15.85 | **7.60-8.01** |
+| `zstd -T0`, same pipe | 12.23-16.45 | |
+
+The old reader's time depended on where the scheduler put it relative to `cat`. Pinned to one
+socket it was 9.6-10.8 s `--cpu-only`, and v0.18.11 measured 11.0-11.2. The new one ran 6.0-6.2 s
+every time. 13 blocks served all 1,250 chunks. Byte-identical through pipes at 0 and 1 byte,
+at the 256 KiB and 1 MiB boundaries (-1, 0, +1), at 16 MiB +-1 and at 48 MiB + 3 bytes. That covers
+`--cpu-only`, hybrid, `--gpu-only`, `--chunk-size` 1 and 3, the CPU-only build and a named FIFO
+(77 cases).
+
+**Still open (ROADMAP 16, 17):** hybrid from a pipe trails `--cpu-only` by ~1.5 s, 7.6 against 6.1 s.
+The input arrives at ~3 GiB/s, which the CPU pool alone keeps up with, so the GPUs cannot shorten
+the run, and they cost two things:
+- with CUDA started, the process takes ~1.1-1.2 s longer to exit;
+- once the GPUs register, the CPU pool leaves a queue floor of 120-192 frames to them, and the last
+  ~0.5 s waits on GPU batches.
+Whether a source-bound pipe should start the GPUs at all is the gate question below.
+
+### Piped decompress: a GPU worker with nothing left to take is not set up (ROADMAP 17)
+
+**The defect.** A pipe has no size, so the GPU gate (v0.18.5) starts CUDA once a batch's worth of
+work has arrived, about 0.1 s in. With 8 GPUs, CUDA takes ~3 s to come up. Each GPU worker then
+reserved VRAM and page-locked host memory for a 256-frame batch, ~130-180 ms per device and one
+after another. The run waited for all of them, even when the CPU pool had already finished.
+MEASURED, a 1,250-frame archive (19.5 GiB of output) through `cat`:
+- the CPU pool decoded the last frame at 3.71 s;
+- the eighth device was set up at 4.69 s;
+- not one GPU batch ran.
+
+Hybrid took 5.68-5.83 s against 3.30-3.42 s for `--cpu-only`. v0.18.11's faster pipe had made the gap
+2.4 s, up from the 1 s ROADMAP 17 recorded.
+
+**The fix.** A GPU decompress worker now checks whether the queue is drained (producer done and
+nothing queued) before its setup, again when its turn at context creation comes, and again after
+it. When the queue is drained, it leaves the way a worker that drained the queue normally does. Its
+exit is counted for the last-worker rescue, and it allocates no batch slabs and no pinned host
+memory. A worker that leaves at the third check has already created its CUDA context. The decision
+is shown at `-vv`: `[GPUn] the queue was drained before this device was set up; not starting it`.
+
+**Measured after**, five interleaved runs each:
+
+| piped `-d`, 1,250 frames | runs (s) |
+|---|---|
+| hybrid, before | 3.69 3.69 5.68 5.74 5.76 |
+| hybrid, after | 3.74 4.13 4.42 5.21 6.16 |
+| `--cpu-only` | 3.43-4.09 |
+
+Traces of six runs after the change show the rest of the gap. How many devices start their setup
+before the CPU pool drains the queue varies from run to run, and those devices finish it:
+- 0 started (all 8 skipped): 3.89 s;
+- 1-5 started: 4.25-5.18 s;
+- all 8 started: 5.80 s. Their setups began while the CPU pool was still decoding and slowed it:
+  the last frame came at 4.37 s instead of ~3.5.
+
+With CUDA started, exit then costs ~0.4 s more, and ~1.0 s with contexts on all 8 devices (a
+standalone test). Leaving through `_Exit` changes nothing, because the cost is in the kernel. So the
+rest of item 17 belongs to the gate, not the workers. With the early start switched off by a debug
+hook, piped `-d` took 3.42-3.72 s, the same as `--cpu-only`. Piped compress did not change (7.7 s):
+the 4 s guard still starts CUDA, and the run then waits for it. ROADMAP 17 keeps that decision, with
+these numbers.
+
+The compress GPU worker is unchanged. Its workers came up and took batches in every piped run
+measured, and its test-only all-devices rendezvous counts ready and failed workers. A worker that
+left as "drained" would be neither, and the rendezvous would wait forever.
+
+**Tests.** Two default cells, 525 -> 527 (`--extensive` 822 -> 824). The no-GPU deltas become 142
+and 207, both measured by the CPU-only runs below; the `--extensive` one had been derived as 205, one
+low:
+- **a pipe fills recycled blocks through a bounce buffer, byte-exact** (every build). 64 MiB plus
+  a 256 KiB + 7-byte tail is piped through `--cpu-only --chunk-size=1`: blocks must be reused, and
+  the bytes must round-trip. With a GPU, `--gpu-only` must print the pool line and round-trip;
+- **a GPU worker with nothing left to take is not set up** (GPU). A sizeless frame through
+  `-d --gpu-only` goes to the CPU streaming decoder at its header, long before CUDA is up. The
+  worker must say it was not started and must not pre-allocate.
+
+Mutants, each failing exactly its arm:
+- the pool never reuses: "66 made, 0 reused";
+- the streaming copy drops its tail: wrong bytes;
+- the code before this change fails both cells: no pool line, and a pre-allocated worker.
+
+### ZSTD_NBTHREADS sets the compression thread count, as in zstd
+
+**Why.** On a 2-core, 4-thread machine (Rocky 8.10, gzstd built against zstd 1.5.7), `gzstd --tar`
+of a 3.54 GiB home directory used about 70% more CPU than `tar -I 'zstd -T0'`: 26.0 s against 15.3.
+The default runs 3 workers there (4 hardware threads, minus the one gzstd reserves for I/O on
+machines with 4 or fewer). Alternating the default with `-T2`, four runs each, after a discarded
+warm-up:
+
+| 2-core, 4-thread machine | Default (3 workers) | `-T2` |
+|---|---|---|
+| `--tar` compress, cold | 13.43-13.63 s, user 25.3-26.1 s | 13.50-13.82 s, user 16.9-17.4 s |
+| `--tar` compress, warm | 8.22-8.37 s, user 22.8-23.2 s | **7.46-7.95 s**, user 14.4-15.3 s |
+| decompress (`-dc`), warm | **1.360-1.369 s**, user 3.82-3.84 s | 1.450-1.475 s, user 2.81-2.84 s |
+
+So on that machine, 2 compression workers are faster and cheaper, while 3 decompression workers
+are faster. The same comparison on slices of the server's CPU (`taskset`, `-T` given explicitly,
+warm) did not reproduce the compression result:
+
+| Server slice | Workload | Default | One per physical core |
+|---|---|---|---|
+| 2 cores, 4 threads | compress 8 GiB | **2.24-2.26 s** | 2.51-2.52 s |
+| | decompress | **1.38-1.39 s** | 1.54-1.61 s |
+| | `--tar`, 5,248 files, 3.25 GiB | **1.75-1.84 s** | 1.85-1.95 s |
+| 12 cores, 24 threads | compress | 0.50-0.58 s | 0.52-0.60 s |
+| | decompress | **0.42-0.45 s** | 0.47-0.50 s |
+| | `--tar` | 1.28-1.39 s | 1.24-1.29 s |
+
+The default stays as it is: it is right on the server's CPU, and for decompression everywhere
+measured. What the small machine needed was a way to set its compression count once, for every run,
+including the gzstd that `tar -I` starts. zstd has one: `ZSTD_NBTHREADS`. gzstd ignored it. (ROADMAP
+18 keeps the open question.)
+
+**The change.** gzstd reads `ZSTD_NBTHREADS` where zstd 1.5.7 reads it (`programs/zstdcli.c`,
+`default_nbThreads`, checked against the source and against the zstd binary):
+- Only when the command line sets no thread count: `-T`, `--threads` and `--single-thread` win,
+  including a bare `-T` or `--threads` (which means the default count).
+- Only to compress, including `--tar` creation, `--sliding-window`, the hybrid CPU pool and
+  `--train`. Never for `-d`, `-t` or `-l`, where gzstd's count is the decode workers'.
+- The value is a number with zstd's optional K/M suffix and nothing after it. Anything else is ignored
+  with a warning using zstd's reason ("not a valid unsigned value" or "numeric value too large"),
+  which `-q` hides. A count past the 4,096 that `-T` accepts is also "numeric value too large"; zstd
+  itself would run there, clamping to its own worker limit.
+- N means `-T N`, except 0. zstd's 0 is "no worker threads", single-threaded, not its `-T0` (all
+  cores); here it means `--single-thread`.
+- `-v` prints `ZSTD_NBTHREADS=N: N compression threads (-T overrides it)`.
+
+`--train` with `ZSTD_NBTHREADS=3` writes a dictionary byte-identical to zstd's with the same setting.
+`ZSTD_CLEVEL` is still not read; the help says so.
+
+**Tests.** One `--extensive` cell in "Thread option forms (-T)", 821 -> 822: the count with the
+variable set, `-T3`, a bare `-T` and `--single-thread` winning, 0 as one thread, an invalid value,
+4097 and 2^64 warned about (and silent with `-q`) at the default count, decode workers unchanged
+under `-d`, and nothing read under `-t`. Seven mutants each fail exactly their arms: no call, read
+in every mode, 0 as all cores, the variable beating `-T`, the warning ignoring `-q`, and after the
+review the old guard (a bare `-T` loses) and the old INT_MAX limit (4097 exits 2). The suite now
+unsets `ZSTD_NBTHREADS` and `ZSTD_CLEVEL` at the start: the first would change every compression
+run, and both change the zstd that the byte-identical cells compare against.
+
+### Review (Codex, GPT-6-Sol, high): SAFE TO COMMIT, two rounds
+
+Round 1 found three defects, all in `ZSTD_NBTHREADS`. Two were real and fixed:
+- `ZSTD_NBTHREADS=4097` made every compression exit 2 ("-T/--threads is unreasonably large"): the
+  parser stopped at INT_MAX while `-T` stops at 4,096. It is now ignored with a warning, and the
+  limit is one constant shared by both.
+- A bare `-T` or `--threads` let the variable win: the guard was "no count set", and a bare `-T`
+  sets none. The guard is now "no thread option on the line".
+
+The third was wrong. Codex said a 2^64 value could wrap the number parser and select one thread. The
+parser returns as soon as the value passes 2^32-1, so it cannot. The binary before the change already
+answered `ZSTD_NBTHREADS=18446744073709551616` with "numeric value too large" at the default count.
+Codex withdrew it. Its edit to that shared parser (11 callers) was not taken; its test case was.
+
+Its patch also did not compile: it dropped the closing line of the `--read-threads` message. It
+corrected two over-claims in this section: a worker that leaves after its context was created has
+made that context, and the pool frees only its idle blocks when the reader ends. Round 2, on the
+built tree, checked the repairs in the other direction too (every thread option, bundled `-T4q`,
+`--train`, `--tar`, `-b`). With file:line, it confirmed that:
+- the `--cpu-share` barrier is passed before the producer can finish, so it cannot be waiting on a
+  worker that left as drained;
+- no compress-side consumer reads a block after its last reference drops. That covers the CPU
+  worker, the GPU hash threads (joined before release, also on a fault), the upload, a bringup
+  failure's hand-off to the CPU and a later fault's release.
+
+### Suites (2026-10-14, the 8-GPU server, quiet, final code)
+
+- GPU build, `--extensive`: 823 passed, 0 failed, 1 skipped of 824, 16m23s, "as expected on this
+  host". The skip is this host's usual "no trivial batch reached a GPU".
+- CPU-only build (warning-free), `--extensive`: 617 passed, 0 failed, 3m6s, "as expected". Its
+  first run flagged 617 against 618 expected, from the derived delta, now measured as 207.
+- CPU-only build, default: 385 passed, 0 failed, 1m54s, "as expected".
+
+The GPU default run was not made separately: `--extensive` contains it.
 
 
 ## v0.18.11 — piped runs: a pipe's 64 KiB buffer set the pace, and the copy after it is gone (ROADMAP 16)

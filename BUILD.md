@@ -36,6 +36,9 @@ cmake -B build -DGZSTD_ZSTD_EXPLICIT=ON -DZSTD_INCLUDE_DIR=$PWD/zstd-1.5.7/lib \
 cmake --build build -j$(nproc)
 ```
 
+Both builds are confirmed on Rocky 8.10 with GCC 8.5: the system one reports
+`[zstd 1.4.4, single-threaded]`, this one `[zstd 1.5.7, multithreaded]`.
+
 Releases from v0.18.10 also run here as shipped, with zstd 1.5.7 multithreaded built in.
 
 ## Quick Start (from scratch)
