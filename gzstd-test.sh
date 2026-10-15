@@ -619,8 +619,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=530
-$EXTENSIVE && EXPECTED_TESTS=828
+EXPECTED_TESTS=534
+$EXTENSIVE && EXPECTED_TESTS=832
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -655,6 +655,12 @@ $EXTENSIVE && EXPECTED_TESTS=828
 # --extensive no-GPU delta 209 -> 210.
 # ...and one default GPU cell from the review (--cpu-batch with a fixed --cpu-share
 # finishes a short input): 529 -> 530, 827 -> 828; no-GPU deltas 144 -> 145, 210 -> 211.
+# v0.18.14 (ROADMAP 22): +4 default -- --adapt's lines follow one tiering (-v / -vv
+# / -vvv), -v says why a run left the profile alone and what a save filed,
+# --calibrate announces its steps and ends with its findings (colour only on a
+# terminal), and the fingerprint names the loaded driver's version.  The first
+# three run on every build; the fourth needs nvCOMP and an NVIDIA module:
+# 530 -> 534, 828 -> 832; no-GPU deltas 145 -> 146, 211 -> 212.
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -883,8 +889,8 @@ count_tests() { echo "$EXPECTED_TESTS"; }
 # 173 -> 139 (CPU-only 446 -> 380), GDS delta 17 -> 16; --extensive unchanged.
 # CONFIRMED 2026-10-09 on the 8-GPU host: default 518 ran of 519 (8m55s, against
 # 11m17s for v0.18.6's 619), CPU-only 380, --extensive 777 ran of 778 (13m39s).
-EXPECTED_NOGPU_DELTA=145   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells
-$EXTENSIVE && EXPECTED_NOGPU_DELTA=211   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells
+EXPECTED_NOGPU_DELTA=146   # 142 MEASURED 2026-10-14 (527 - 385); + three v0.18.13 GPU cells, + one v0.18.14
+$EXTENSIVE && EXPECTED_NOGPU_DELTA=212   # 207 MEASURED 2026-10-14 (824 - 617); + four v0.18.13 GPU cells, + one v0.18.14
 # THE GDS DELTA, UNLIKE THE NO-GPU ONE, IS MODE-INDEPENDENT -- and that is now
 # MEASURED, not assumed.  It had only ever been measured in DEFAULT mode, so the
 # --extensive expectation of 607 - 11 = 596 was a derived guess of exactly the
@@ -7221,6 +7227,52 @@ if ! grep -q '\[ADAPT\]' "$TMPDIR/adapt-q.err" && ! grep -q '\[ADAPT\]' "$TMPDIR
 else
   fail "[ADAPT] silent without -v and without --adapt"
 fi
+
+# ONE TIERING FOR EVERY [ADAPT] LINE (v0.18.14, ROADMAP 22): -v each decision and
+# the evidence that settled it, -vv each crossing or state change, -vvv every
+# tick.  A forced regime makes the transition deterministic.  Hold the explicit
+# mmap reader at its test gate for 350 ms, so even a fast host sees governor
+# ticks while the pass is live; the release has a timeout if the gate is missed.
+at_why=""
+at_gate="$TMPDIR/adapt-t-gate"
+mkfifo "$at_gate"
+for at_v in v vv vvv; do
+  env GZSTD_DEBUG_ADAPT_REGIME=compute-bound GZSTD_DEBUG_MMAP_GATE="$at_gate" \
+    "$GZSTD" --adapt --no-profile -$at_v --cpu-only --mmap -T2 -k -f \
+    "$TMPDIR/large.bin" -o "$TMPDIR/adapt-t.zst" 2>"$TMPDIR/adapt-t-$at_v.err" &
+  at_pid=$!
+  (sleep 0.35; timeout 5 bash -c 'printf x > "$1"' _ "$at_gate") &
+  at_release=$!
+  wait "$at_pid" || at_why+=" [-$at_v exit $?]"
+  wait "$at_release" || at_why+=" [-$at_v reader gate was missed]"
+done
+rm -f "$at_gate"
+grep -q '\[ADAPT\] regime: warmup -> compute-bound (t=[0-9.]* s; forced by GZSTD_DEBUG_ADAPT_REGIME)' \
+  "$TMPDIR/adapt-t-v.err" || at_why+=" [-v: no transition with its evidence]"
+grep -q '\[ADAPT\] tick ' "$TMPDIR/adapt-t-v.err" && at_why+=" [-v printed a tick]"
+grep -q '\[ADAPT\] tick ' "$TMPDIR/adapt-t-vv.err" && at_why+=" [-vv printed a tick]"
+grep -q '\[ADAPT\] tick [0-9.]* s: forced compute-bound' "$TMPDIR/adapt-t-vvv.err" \
+  || at_why+=" [-vvv: no tick line]"
+[[ -z "$at_why" ]] && pass "--adapt tiers its lines: decisions at -v, ticks only at -vvv" \
+  || fail "--adapt tiers its lines: decisions at -v, ticks only at -vvv" "$at_why"
+
+# A RUN THAT LEAVES THE PROFILE ALONE SAYS WHY, AND A SAVE SAYS WHAT IT FILED
+# (v0.18.14).  Set an unreachable save floor for the first run so the result
+# does not depend on host speed.  Clear it for the second; its backend filing
+# depends on whether the run crosses the independent 4 s backend floor.
+at_x="$TMPDIR/adapt-t-xdg"; rm -rf "$at_x"; at_why=""
+env XDG_CACHE_HOME="$at_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 "$GZSTD" --adapt -v --cpu-only -k -f "$TMPDIR/large.bin" \
+  -o "$TMPDIR/adapt-t.zst" 2>"$TMPDIR/adapt-t-s1.err" || at_why+=" [run 1 exit $?]"
+grep -q '\[ADAPT\] profile not updated: the run took [0-9.]* s, under the 600.0 s' "$TMPDIR/adapt-t-s1.err" \
+  || at_why+=" [run 1: $(grep -a 'ADAPT\] profile' "$TMPDIR/adapt-t-s1.err" | head -1 | cut -c1-90)]"
+env XDG_CACHE_HOME="$at_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 "$GZSTD" --adapt -v --cpu-only -k -f \
+  "$TMPDIR/large.bin" -o "$TMPDIR/adapt-t.zst" 2>"$TMPDIR/adapt-t-s2.err" || at_why+=" [run 2 exit $?]"
+grep -E '^\[ADAPT\] profile updated \(compress, regime [a-z-]+; [0-9.]+ GiB/s end-to-end' \
+  "$TMPDIR/adapt-t-s2.err" | grep -Eq 'under 4 s: not filed in the backend pair|filed as cpu-only' \
+  || at_why+=" [run 2: $(grep -a 'ADAPT\] profile' "$TMPDIR/adapt-t-s2.err" | head -1 | cut -c1-110)]"
+[[ -z "$at_why" ]] && pass "--adapt -v says why a run left the profile alone, and what a save filed" \
+  || fail "--adapt -v says why a run left the profile alone, and what a save filed" "$at_why"
+rm -rf "$at_x" "$TMPDIR/adapt-t.zst" "$TMPDIR"/adapt-t-*.err
 rm -f "$TMPDIR/adapt.zst" "$TMPDIR/adapt.dec" "$TMPDIR/adapt-plain.zst" \
       "$TMPDIR/adapt-on.zst" "$TMPDIR/adapt-v.err" "$TMPDIR/adapt-q.err" "$TMPDIR/adapt-off.err"
 
@@ -7403,6 +7455,40 @@ env XDG_CACHE_HOME="$APROF_XDG" $ACB "$GZSTD" --calibrate --no-profile 2>/dev/nu
 rc=$?
 [[ $rc -eq 0 && ! -e "$APROF" ]] && pass "--calibrate --no-profile records nothing" \
   || fail "--calibrate --no-profile records nothing" "rc=$rc"
+
+# 9b. --CALIBRATE SHOWS ITS WORK (v0.18.14, ROADMAP 22): each step is announced as
+# it starts and the run ends with its findings.  In a log every step gets a
+# permanent line and nothing is coloured; on a terminal (here `script`'s pty) the
+# step is a status line the next step or result row replaces, coloured like vlog().  The pty
+# run is also the regression check for `gzstd --calibrate` in a terminal, which
+# until v0.18.14 refused "to write compressed data to the terminal" (exit 2).
+cs_why=""
+env XDG_CACHE_HOME="$APROF_XDG" $ACB "$GZSTD" --calibrate --no-profile 2>"$TMPDIR/cal-show.err" \
+  || cs_why+=" [log run exit $?]"
+grep -q '^\[CALIBRATE\] cpu compress: warm-up, .* untimed \.\.\.$' "$TMPDIR/cal-show.err" \
+  || cs_why+=" [log: no step line]"
+grep -q '^\[CALIBRATE\] cpu compress: timed, .* input \.\.\.$' "$TMPDIR/cal-show.err" \
+  || cs_why+=" [log: no timed step line]"
+grep -q '^\[CALIBRATE\] cpu decompress: warm-up, .* compressed, untimed \.\.\.$' "$TMPDIR/cal-show.err" \
+  || cs_why+=" [log: no decompress warm-up line]"
+grep -q '^\[CALIBRATE\] cpu decompress: timed, .* compressed input \.\.\.$' "$TMPDIR/cal-show.err" \
+  || cs_why+=" [log: no decompress timed line]"
+grep -q '^\[CALIBRATE\] findings:$' "$TMPDIR/cal-show.err" || cs_why+=" [log: no findings]"
+grep -q '^\[CALIBRATE\]   compress    cpu  *[0-9.]* GiB/s' "$TMPDIR/cal-show.err" \
+  || cs_why+=" [log: no compress row in the findings]"
+grep -q $'\033' "$TMPDIR/cal-show.err" && cs_why+=" [log: colour codes]"
+if command -v script >/dev/null 2>&1; then
+  cs_cmd="env XDG_CACHE_HOME=$(printf %q "$APROF_XDG") $ACB $(printf %q "$GZSTD") --calibrate --no-profile"
+  script -qec "$cs_cmd" /dev/null >"$TMPDIR/cal-show.tty" 2>&1 </dev/null || cs_why+=" [terminal run exit $?]"
+  grep -q $'\033\[1;96m' "$TMPDIR/cal-show.tty" || cs_why+=" [terminal: no colour]"
+  cs_txt=$(sed $'s/\033\[[0-9;]*[mK]//g' "$TMPDIR/cal-show.tty")
+  [[ "$cs_txt" == *$'untimed ...\r['* ]] || cs_why+=" [terminal: no status line]"
+  [[ "$cs_txt" == *$'untimed ...\r\n'* ]] && cs_why+=" [terminal: the log's permanent step line]"
+  [[ "$cs_txt" == *"[CALIBRATE] findings:"* ]] || cs_why+=" [terminal: no findings]"
+fi
+[[ -z "$cs_why" ]] && pass "--calibrate announces each step and ends with its findings; colour only on a terminal" \
+  || fail "--calibrate announces each step and ends with its findings; colour only on a terminal" "$cs_why"
+rm -f "$TMPDIR/cal-show.err" "$TMPDIR/cal-show.tty"
 
 # 10. --calibrate -o EXISTING refuses (exit 2) and leaves the file untouched —
 # the sink target is created and REMOVED, so a pre-existing file must never
@@ -7776,6 +7862,20 @@ if has_nvcomp; then
   fi
 else
   skip "--adapt -vv prints the profile fingerprint" "no nvCOMP build"
+fi
+# THE FINGERPRINT NAMES THE LOADED DRIVER (v0.18.14).  NVIDIA's open kernel module
+# reports "...Open Kernel Module for x86_64  595.91.07" in /proc, and the parser
+# took the word after "Kernel Module": every profile recorded driver "for", so a
+# driver upgrade never cleared the GPU-derived priors.
+# /sys/module/nvidia/version is the oracle on purpose: it is a source the parser
+# does not read, so a misreading of the procfs line cannot pass by matching itself.
+if has_nvcomp && [[ -r /sys/module/nvidia/version && ${#FP_HASH} -eq 16 ]]; then
+  fp_mod=$(< /sys/module/nvidia/version)
+  [[ "$FP_DRV" == "$fp_mod" ]] && pass "the --adapt fingerprint names the loaded driver's version" \
+    || fail "the --adapt fingerprint names the loaded driver's version" \
+            "fingerprint says '$FP_DRV', the module '$fp_mod'"
+else
+  skip "the --adapt fingerprint names the loaded driver's version" "no nvCOMP build or no NVIDIA module"
 fi
 
 # Craft a cpu-dominant profile for this machine's fingerprint.

@@ -336,7 +336,15 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    readers, which GDS bypasses.  So key it by input residency, as the backend prior already does
    for decompress, include `--direct-stage` as the fifth arm, and score CPU time as well as wall
    time if the ranking is meant to reflect contention.  Pipes cannot use it (GDS reads a file).
-22. **--calibrate and --adapt should show their work (owner, 2026-10-15).**  --calibrate prints each
+22. ~~**--calibrate and --adapt should show their work (owner, 2026-10-15).**~~ SHIPPED v0.18.14
+   (CHANGELOG has the audit table): --calibrate announces each step, shows progress on a terminal
+   (the device-count children report theirs over their pipe), ends with its findings and what
+   --adapt does with them, and colours through vlog's painter; every [ADAPT] line follows the
+   -v / -vv / -vvv tiering, and six decisions that printed nothing now say so at -v.  Owner's
+   rulings (2026-10-15), both for a later version: the governor's reader scale-up request (M4
+   action 3) has had no consumer since v0.15.44 -- leave it for now, remove it in its own small
+   reviewed change; NO_COLOR -- honour it everywhere at once (vlog, --calibrate AND the progress
+   bar, which colours unconditionally), not for vlog alone.  The original text:  --calibrate prints each
    result when a step finishes, but never announces a step before it starts: during each GPU
    device-count child (up to 4 GiB of compression apiece) the screen is silent, and the findings
    arrive as unstructured rows.  It should say what it is measuring as it starts each step (the

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.13";
+static constexpr const char * GZSTD_VERSION = "0.18.14";
 //
 // Architecture overview:
 //
@@ -2281,6 +2281,7 @@ static const double ADAPT_BACKEND_MIN_SEC = 4.0;
 // far above them) can consume the regime as a published global — the same way
 // every other --adapt acting site does, with no governor->worker pointer.
 static bool adapt_regime_is_source_bound();
+struct Options;   // defined below; ReaderPoolCtl holds a pointer for its log lines
 
 class ReaderPoolCtl {
 public:
@@ -2304,6 +2305,12 @@ public:
     live_ = p;
     if (p) p->store(want_.load(std::memory_order_relaxed), std::memory_order_relaxed);
   }
+
+  // --adapt's -vv/-vvv lines (ROADMAP 22): each step and its verdict at -vv,
+  // every measurement window at -vvv.  Set before supervise() starts.
+  void set_log(const Options * o, const char * what) { log_opt_ = o; log_what_ = what; }
+  // V_DEBUG and V_TRACE, which are declared further down (static_assert there).
+  static constexpr int LOG_STEP = 4, LOG_WINDOW = 5;
 
   int  want()    const { return want_.load(std::memory_order_relaxed); }
   int  start()   const { return start_; }
@@ -2407,6 +2414,13 @@ public:
       const double dt = std::chrono::duration<double>(now - prev_t).count();
       const double rate = dt > 0 ? double(b - prev_b) / dt : 0.0;
       prev_b = b; prev_t = now;
+      if (log_on(LOG_WINDOW)) {
+        char wb[160];
+        std::snprintf(wb, sizeof wb, "window %.3f GiB/s at %d reader%s (%s%s)\n", rate / 1073741824.0,
+                      want(), want() == 1 ? "" : "s", probing ? "probing" : "baseline",
+                      rounds >= ADAPT_RD_MAX_ROUNDS ? ", search over" : "");
+        log_line(LOG_WINDOW, wb);
+      }
       if (rate <= 0.0 || rounds >= ADAPT_RD_MAX_ROUNDS) continue;
       // Baseline windows only: a probing window measures a DIFFERENT
       // configuration and would inflate the estimated noise with real signal.
@@ -2421,9 +2435,12 @@ public:
           // that would grade it is not source-bound).  Undo it rather than let
           // stop() persist a speculative size, and do not count a round: nothing
           // was learned.
+          const int abandoned = want();
           set_want(probe_from);
           probing = false;
           probing_.store(false, std::memory_order_relaxed);
+          trace("undone", abandoned, probe_from, rate, pre_rate, rounds,
+                "the run is no longer source-bound");
         }
         continue;
       }
@@ -2464,13 +2481,10 @@ public:
         probe_from_.store(cur, std::memory_order_relaxed);
         probing_.store(true, std::memory_order_relaxed);
         set_want(next);
-        if (rd_ctl_trace_on()) {
-          char nb[96];
-          std::snprintf(nb, sizeof nb, "[RD-CTL] noise floor %.3fx -> need %.3fx\n",
-                        noise_ratio(), req_ratio);
-          std::fputs(nb, stderr);
-        }
-        trace("probe", cur, next, rate, 0.0, rounds);
+        char nb[96];
+        std::snprintf(nb, sizeof nb, "needs %.3fx: noise floor %.3fx, margin %.2fx",
+                      req_ratio, noise_ratio(), ADAPT_RD_MARGIN);
+        trace("probe", cur, next, rate, 0.0, rounds, nb);
       } else {
         probing = false; ++rounds;
         probing_.store(false, std::memory_order_relaxed);
@@ -2507,25 +2521,22 @@ public:
   void wake_all() { { std::lock_guard<std::mutex> g(mx_); } cv_.notify_all(); }
 
 private:
-  // GZSTD_DEBUG_RD_CTL=1: one line per decision, to stderr.  The teardown line
-  // reports only the SETTLED count, which cannot distinguish "probed both
-  // directions and correctly rejected them" from "never probed at all" — they
-  // print identically when the search returns to base.  Reading that difference
-  // is the whole diagnostic.
+  // One line per step and verdict at -vv under --adapt (v0.18.14), and the same
+  // lines at any verbosity with GZSTD_DEBUG_RD_CTL=1 (until v0.18.14 the only way,
+  // as "[RD-CTL]" lines).  The teardown line reports only the SETTLED count,
+  // which cannot distinguish "probed both directions and correctly rejected
+  // them" from "never probed at all" — they print identically when the search
+  // returns to base.  Reading that difference is the whole diagnostic.
   static bool rd_ctl_trace_on()
   {
     static const bool on = ::getenv("GZSTD_DEBUG_RD_CTL") != nullptr;
     return on;
   }
-  static void trace(const char * what, int from, int to,
-                    double rate, double pre, int rounds)
-  {
-    if (!rd_ctl_trace_on()) return;
-    char was[48] = "";
-    if (pre > 0) std::snprintf(was, sizeof was, " (was %.3f)", pre / 1073741824.0);
-    std::fprintf(stderr, "[RD-CTL] %-6s %d -> %d  rate %.3f GiB/s%s  round %d\n",
-                 what, from, to, rate / 1073741824.0, was, rounds);
-  }
+  // Defined after vlog(): Options and vlog_emit are declared below this class.
+  bool log_on(int level) const;
+  void log_line(int level, const char * body) const;
+  void trace(const char * what, int from, int to,
+             double rate, double pre, int rounds, const char * why = nullptr) const;
 
   void set_want(int n)
   {
@@ -2537,6 +2548,8 @@ private:
     cv_.notify_all();
   }
   const int floor_, ceil_, base_;
+  const Options *       log_opt_ = nullptr;          // --adapt -vv/-vvv lines (set_log)
+  const char *          log_what_ = "reader pool";
   std::atomic<int>      want_;
   std::atomic<int> *    live_ = nullptr;   // live active-reader publication target
   const int             start_;
@@ -3381,17 +3394,11 @@ static std::string vlog_colorize_numbers(const std::string & s, const char * res
   return out;
 }
 
-static void vlog(int min_level, const Options & opt, const std::string & msg)
+// vlog()'s colours for one line, returned rather than printed (a transient status
+// line needs them without the newline): a leading [TAG] in its subsystem's colour,
+// numbers highlighted.  Callers check g_color_stderr; the line must not end in \n.
+static std::string vlog_paint(const std::string & msg)
 {
-  if (opt.verbosity < min_level) return;
-  if (g_progress_active.load(std::memory_order_relaxed))
-    std::fprintf(stderr, "\r\033[K");  // clear progress line
-
-  if (!g_color_stderr) {
-    std::cerr << msg;
-    return;
-  }
-
   // All levels use default terminal color — numbers are colorized individually.
   const char * lvl_color = "";
 
@@ -3406,11 +3413,14 @@ static void vlog(int min_level, const Options & opt, const std::string & msg)
   }
   if (tag_part.empty()) body_part = msg;
 
-  // Pick tag color based on prefix: GPU → bold bright yellow, CPU → bold bright magenta.
+  // Pick tag color based on prefix: GPU → bold bright yellow, CPU → bold bright magenta,
+  // ADAPT → bold bright green, CALIBRATE → bold bright cyan.
   const char * tag_color = "\033[1m";       // default: bold white
   if (tag_part.size() > 4) {               // at least "[GPU" or "[CPU"
     if (tag_part.compare(1, 3, "GPU") == 0) tag_color = "\033[1;93m";  // bold bright yellow
     else if (tag_part.compare(1, 3, "CPU") == 0) tag_color = "\033[1;95m";  // bold bright magenta
+    else if (tag_part.compare(1, 5, "ADAPT") == 0) tag_color = "\033[1;92m";  // bold bright green
+    else if (tag_part.compare(1, 9, "CALIBRATE") == 0) tag_color = "\033[1;96m";  // bold bright cyan
   }
 
   // Colorize tag: punctuation white, letters in tag_color, numbers in palette.
@@ -3426,12 +3436,66 @@ static void vlog(int min_level, const Options & opt, const std::string & msg)
     out += lvl_color;
   }
   out += body_col;
+  out += "\033[0m";
+  return out;
+}
 
+// A calibration status line shares stderr with pipeline warnings.  Serialize its
+// redraw with vlog output and clear it before a permanent diagnostic is printed.
+static std::mutex g_vlog_emit_mx;
+static bool g_cal_status_shown = false;   // protected by g_vlog_emit_mx
+static bool g_cal_status_dying = false;   // protected by g_vlog_emit_mx
+
+// The output half of vlog(), without its verbosity test: --calibrate's lines are
+// that command's output at every verbosity, and go through here so they take the
+// same colours (and stay plain when stderr is not a terminal).
+static void vlog_emit(const std::string & msg)
+{
+  std::lock_guard<std::mutex> lk(g_vlog_emit_mx);
+  if (g_cal_status_shown) {
+    std::fputs("\r\033[K", stderr);
+    g_cal_status_shown = false;
+  }
+  if (g_progress_active.load(std::memory_order_relaxed))
+    std::fprintf(stderr, "\r\033[K");  // clear progress line
+
+  if (!g_color_stderr) {
+    std::cerr << msg;
+    return;
+  }
   // Strip trailing newline so reset lands before it (avoids stray color on blank lines).
-  bool has_nl = !out.empty() && out.back() == '\n';
-  if (has_nl) out.pop_back();
-  std::cerr << out << "\033[0m";
+  const bool has_nl = !msg.empty() && msg.back() == '\n';
+  std::cerr << vlog_paint(has_nl ? msg.substr(0, msg.size() - 1) : msg);
   if (has_nl) std::cerr << '\n';
+}
+
+static void vlog(int min_level, const Options & opt, const std::string & msg)
+{
+  if (opt.verbosity < min_level) return;
+  vlog_emit(msg);
+}
+
+static_assert(ReaderPoolCtl::LOG_STEP == V_DEBUG && ReaderPoolCtl::LOG_WINDOW == V_TRACE,
+              "ReaderPoolCtl's log levels mirror -vv and -vvv");
+bool ReaderPoolCtl::log_on(int level) const
+{
+  return rd_ctl_trace_on() || (log_opt_ && log_opt_->verbosity >= level);
+}
+void ReaderPoolCtl::log_line(int level, const char * body) const
+{
+  if (!log_on(level)) return;
+  vlog_emit(std::string("[ADAPT] ") + log_what_ + ": " + body);
+}
+void ReaderPoolCtl::trace(const char * what, int from, int to,
+                          double rate, double pre, int rounds, const char * why) const
+{
+  if (!log_on(LOG_STEP)) return;
+  char was[48] = "";
+  if (pre > 0) std::snprintf(was, sizeof was, " (was %.3f)", pre / 1073741824.0);
+  char b[256];
+  std::snprintf(b, sizeof b, "%-6s %d -> %d readers, rate %.3f GiB/s%s, round %d%s%s\n",
+                what, from, to, rate / 1073741824.0, was, rounds, why ? "; " : "", why ? why : "");
+  log_line(LOG_STEP, b);
 }
 
 static std::atomic<bool> g_dying{false};
@@ -3460,6 +3524,14 @@ static void die(const std::string & msg, int code = EXIT_ERROR)
   // (The no-fixed-waits rule governs scheduling paths, not the death path.)
   if (g_dying.exchange(true, std::memory_order_acq_rel))
     for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+  // A calibration pass can fail while its transient line is visible.  Stop its
+  // ticker from redrawing over the error before the immediate _Exit below.
+  {
+    std::lock_guard<std::mutex> lk(g_vlog_emit_mx);
+    g_cal_status_dying = true;
+    if (g_cal_status_shown) std::fputs("\r\033[K", stderr);
+    g_cal_status_shown = false;
+  }
   if (g_verbosity >= V_ERROR) {
     std::cerr << "gzstd: ERROR: " << msg << "\n";
     if (g_tmp_active && g_tmp_base[0] != '\0')
@@ -4596,8 +4668,12 @@ static void print_help_long()
 "     and writer state counters every 100 ms and classifies the bottleneck\n"
 "     regime: source-bound (the input path is the faucet), compute-bound\n"
 "     (the CPU/GPU engines are the ceiling), or sink-bound (the output\n"
-"     device is).  Regime transitions and an end-of-run share summary\n"
-"     print at -v as [ADAPT] lines.  The regimes drive actions, each\n"
+"     device is).  It reports as [ADAPT] lines: -v each decision and the\n"
+"     evidence that settled it (a regime change, a pool size, the backend,\n"
+"     what the profile recorded or why it did not, and an end-of-run share\n"
+"     summary); -vv also each threshold crossed (a regime candidate, a\n"
+"     reader-pool step and its verdict); -vvv also every 100 ms sample.\n"
+"     The regimes drive actions, each\n"
 "     latched and reported in the summary's action list: source-bound\n"
 "     freezes GPU batch growth and wakes dormant prefetch readers;\n"
 "     sink-bound grows the in-flight budget on bursty output and probes\n"
@@ -4695,7 +4771,10 @@ static void print_help_long()
 "     With `-o NEWFILE` (a path that does not exist) it also writes,\n"
 "     fsyncs, measures and then removes a scratch target, to calibrate the\n"
 "     sink rate of that filesystem.  --no-profile measures and prints\n"
-"     without saving.\n"
+"     without saving.  Each step is announced as it starts (on a terminal,\n"
+"     a status line with its progress), and the run ends with its findings\n"
+"     and what --adapt does with them: the backend measured so far and,\n"
+"     with two or more GPUs, the count it would pick at 1, 10 and 100 GiB.\n"
 "     GPU DEVICE COUNT (hosts with 2 or more GPUs; see --adapt): first,\n"
 "     before this process touches CUDA, one child process per candidate\n"
 "     count (1, 2, 4, ... and all) runs a --gpu-only compress, because only\n"
@@ -7121,17 +7200,55 @@ private:
       if      (sink_busy >= SINK_BUSY)                                  observed = AdaptRegime::SINK_BOUND;
       else if (rbusy >= SOURCE_BUSY && rblocked <= SOURCE_BLOCKED_MAX)  observed = AdaptRegime::SOURCE_BOUND;
       else                                                              observed = AdaptRegime::COMPUTE_BOUND;
+      last_sink_busy_ = sink_busy; last_rbusy_ = rbusy; last_rblocked_ = rblocked;
+      have_signals_ = true;
+    }
+    // -vvv: every tick, the signals and what they classified as (ROADMAP 22).
+    if (opt_.verbosity >= V_TRACE) {
+      char l[288];
+      const double sink_gibs = double(cur.wbytes - prev_.wbytes) / dt * 1e9 / 1073741824.0;
+      if (forced_ != AdaptRegime::WARMUP)
+        std::snprintf(l, sizeof l, "[ADAPT] tick %.1f s: forced %s (GZSTD_DEBUG_ADAPT_REGIME), "
+                      "sink %.2f GiB/s\n", t / 1e9, adapt_regime_name(forced_), sink_gibs);
+      else if (observed == AdaptRegime::WARMUP)
+        std::snprintf(l, sizeof l, "[ADAPT] tick %.1f s: warm-up (classifies from %.0f s), "
+                      "sink %.2f GiB/s\n", t / 1e9, RAMP_SEC, sink_gibs);
+      else
+        std::snprintf(l, sizeof l, "[ADAPT] tick %.1f s: sink busy %.0f%%%s, reader busy %.0f%% "
+                      "blocked %.0f%% (io %.0f%% of it), sink %.2f GiB/s -> %s (regime %s)\n",
+                      t / 1e9, last_sink_busy_ * 100.0, last_sink_bursty_ ? " (bursty)" : "",
+                      last_rbusy_ * 100.0, last_rblocked_ * 100.0, last_io_frac_ * 100.0, sink_gibs,
+                      adapt_regime_name(observed), adapt_regime_name(regime_));
+      vlog(V_TRACE, opt_, l);
     }
     prev_ = cur;
     prev_ns_ = t;
 
     if (observed == regime_) {
+      // -vv: a candidate that did not hold for STICKY_TICKS is a threshold
+      // crossed and crossed back.
+      if (candidate_ticks_ > 0 && candidate_ != regime_ && opt_.verbosity >= V_DEBUG) {
+        char l[160];
+        std::snprintf(l, sizeof l, "[ADAPT] regime candidate %s dropped after %d tick%s at "
+                      "%.1f s; staying %s\n", adapt_regime_name(candidate_), candidate_ticks_,
+                      candidate_ticks_ == 1 ? "" : "s", t / 1e9, adapt_regime_name(regime_));
+        vlog(V_DEBUG, opt_, l);
+      }
       candidate_ticks_ = 0;
     } else if (observed == candidate_) {
       if (++candidate_ticks_ >= STICKY_TICKS) transition_(observed, t);
     } else {
       candidate_ = observed;
       candidate_ticks_ = 1;
+      // -vv: the first tick that reads differently.  Warm-up's end switches at
+      // once (below), so it is not a candidate.
+      if (regime_ != AdaptRegime::WARMUP && opt_.verbosity >= V_DEBUG) {
+        char l[200];
+        std::snprintf(l, sizeof l, "[ADAPT] regime candidate %s at %.1f s (now %s; switches "
+                      "after %d ticks in a row)\n", adapt_regime_name(observed), t / 1e9,
+                      adapt_regime_name(regime_), STICKY_TICKS);
+        vlog(V_DEBUG, opt_, l);
+      }
     }
     // WARMUP → first classification switches immediately (the ramp guard
     // already provided the damping; making it also wait STICKY_TICKS would
@@ -7195,10 +7312,11 @@ private:
         probe_ticks_ = 0;
         ++probe_rounds_;
         g_adapt_writer_probe.store(1, std::memory_order_relaxed);
-        char pl[96];
+        char pl[160];
         std::snprintf(pl, sizeof(pl),
-          "[ADAPT] sink-bound: probing +1 parallel writer (round %d)\n",
-          probe_rounds_);
+          "[ADAPT] sink-bound: probing +1 parallel writer (round %d; sink busy %.0f%%, "
+          "writing %.2f GiB/s, kept if +10%%)\n",
+          probe_rounds_, last_sink_busy_ * 100.0, wrate * 1e9 / 1073741824.0);
         vlog(V_VERBOSE, opt_, pl);
         probe_phase_ = 1;
       }
@@ -7388,11 +7506,13 @@ private:
         ++probe_rounds_;
         ewgrow_extra_ += ewgrow_step_;
         adapt_set_ewgrow(ewgrow_extra_);
-        char pl[128];
+        char pl[192];
         std::snprintf(pl, sizeof(pl),
-          "[ADAPT] sink-bound: probing +%d extract writers (round %d, pool %d -> %d)\n",
+          "[ADAPT] sink-bound: probing +%d extract writers (round %d, pool %d -> %d; "
+          "writing %.2f GiB/s, writers starved %.0f%%, kept if +10%%)\n",
           ewgrow_step_, probe_rounds_, ewgrow_base_ + ewgrow_extra_ - ewgrow_step_,
-          ewgrow_base_ + ewgrow_extra_);
+          ewgrow_base_ + ewgrow_extra_, probe_pre_rate_ * 1e9 / 1073741824.0,
+          std::max(0.0, starved_ema_) * 100.0);
         vlog(V_VERBOSE, opt_, pl);
         probe_phase_ = 1;
       }
@@ -7432,9 +7552,29 @@ private:
     candidate_ticks_ = 0;
     g_adapt_regime.store((int)to, std::memory_order_relaxed);
     if (from != AdaptRegime::WARMUP) ++transitions_;
-    char line[160];
-    std::snprintf(line, sizeof(line), "[ADAPT] regime: %s -> %s (t=%.1f s)\n",
-                  adapt_regime_name(from), adapt_regime_name(to), t / 1e9);
+    if (opt_.verbosity < V_VERBOSE) return;
+    // -v: the decision AND the evidence that settled it (ROADMAP 22) -- the
+    // comparison against the threshold that classified the last tick.
+    char ev[192];
+    if (forced_ != AdaptRegime::WARMUP)
+      std::snprintf(ev, sizeof ev, "forced by GZSTD_DEBUG_ADAPT_REGIME");
+    else if (!have_signals_)
+      std::snprintf(ev, sizeof ev, "no signals yet");
+    else if (to == AdaptRegime::SINK_BOUND)
+      std::snprintf(ev, sizeof ev, "sink busy %.0f%% >= %.0f%%", last_sink_busy_ * 100.0,
+                    SINK_BUSY * 100.0);
+    else if (to == AdaptRegime::SOURCE_BOUND)
+      std::snprintf(ev, sizeof ev, "reader busy %.0f%% >= %.0f%%, blocked %.0f%% <= %.0f%%; "
+                    "sink busy %.0f%%", last_rbusy_ * 100.0, SOURCE_BUSY * 100.0,
+                    last_rblocked_ * 100.0, SOURCE_BLOCKED_MAX * 100.0, last_sink_busy_ * 100.0);
+    else
+      std::snprintf(ev, sizeof ev, "neither: sink busy %.0f%% < %.0f%%, reader busy %.0f%% "
+                    "(source-bound needs %.0f%% with <= %.0f%% blocked)", last_sink_busy_ * 100.0,
+                    SINK_BUSY * 100.0, last_rbusy_ * 100.0, SOURCE_BUSY * 100.0,
+                    SOURCE_BLOCKED_MAX * 100.0);
+    char line[288];
+    std::snprintf(line, sizeof(line), "[ADAPT] regime: %s -> %s (t=%.1f s; %s)\n",
+                  adapt_regime_name(from), adapt_regime_name(to), t / 1e9, ev);
     vlog(V_VERBOSE, opt_, line);
   }
 
@@ -7457,6 +7597,9 @@ private:
   int64_t prev_ns_ = 0;
   double  last_io_frac_ = 0.0;                 // tick-thread only
   bool    last_sink_bursty_ = false;           // tick-thread only
+  // The last classified tick's signals: the evidence a regime line reports.
+  double  last_sink_busy_ = 0.0, last_rbusy_ = 0.0, last_rblocked_ = 0.0;   // tick-thread only
+  bool    have_signals_ = false;               // tick-thread only
   int     probe_phase_ = 0;                    // 0 idle / 1 grow round / 2 contract round / 3 converged
   int     probe_rounds_ = 0;                   // tick-thread only
   int     ewgrow_rounds_cap_ = 2;              // extract: max grow rounds (sized to cpu at first probe)
@@ -7797,6 +7940,11 @@ static bool adapt_fp_gpus_procfs(std::string & gpus, std::string & driver)
     names += model;
   }
   // "NVRM version: NVIDIA UNIX x86_64 Kernel Module  570.207  Fri Nov 14 ..."
+  // "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.91.07  Release ..."
+  // The version is the first token after "Kernel Module" that starts with a digit
+  // and has a dot.  Until v0.18.14 it was simply the NEXT token, which on the open
+  // kernel module (NVIDIA's default since R560) is "for": every profile recorded
+  // driver "for", so a driver upgrade never cleared its GPU-derived priors.
   std::string drv;
   {
     std::ifstream vf("/proc/driver/nvidia/version");
@@ -7804,10 +7952,12 @@ static bool adapt_fp_gpus_procfs(std::string & gpus, std::string & driver)
     while (vf && std::getline(vf, line)) {
       const size_t k = line.find("Kernel Module");
       if (k == std::string::npos) continue;
-      const size_t s = line.find_first_not_of(" \t", k + 13);
-      if (s == std::string::npos) break;
-      const size_t e2 = line.find_first_of(" \t", s);
-      drv = line.substr(s, e2 == std::string::npos ? e2 : e2 - s);
+      std::istringstream ts(line.substr(k + 13));
+      for (std::string tok; ts >> tok;)
+        if (std::isdigit((unsigned char)tok[0]) && tok.find('.') != std::string::npos) {
+          drv = tok;
+          break;
+        }
       break;
     }
   }
@@ -9061,6 +9211,29 @@ static uint64_t adapt_save_min_ns()
   return v;
 }
 
+// --adapt -v (ROADMAP 22): a run that leaves the profile alone says why, so a
+// profile that is not converging is not a mystery.
+static void adapt_note_not_saved(const Options & opt, int rc, uint64_t wall_ns)
+{
+  if (!opt.adapt || opt.verbosity < V_VERBOSE) return;
+  std::string why;
+  if (opt.no_profile) {
+    why = "--no-profile";
+  } else if (rc != 0) {
+    why = "the run did not succeed (exit " + std::to_string(rc) + ")";
+  } else if (wall_ns == 0) {
+    why = "nothing was measured";
+  } else if (wall_ns < adapt_save_min_ns()) {
+    char b[160];
+    std::snprintf(b, sizeof b, "the run took %.2f s, under the %.1f s a run needs before "
+                  "its rates mean anything", wall_ns / 1e9, adapt_save_min_ns() / 1e9);
+    why = b;
+  } else {
+    why = "an input was skipped";
+  }
+  vlog(V_VERBOSE, opt, "[ADAPT] profile not updated: " + why + "\n");
+}
+
 // A --adapt save that never lands means the profile never CONVERGES: every run
 // re-explores from the priors and the user sees only that "--adapt doesn't seem
 // to do anything".  At -v-only that is indistinguishable from "still learning",
@@ -9072,8 +9245,12 @@ static uint64_t adapt_save_min_ns()
 // ONE-SHOT per process: save is attempted once per operation and any real cause
 // (read-only cache dir, a filesystem whose flock does nothing, a full disk) will
 // recur identically, so repeating it on a multi-file run would be noise.
+// Set by every failed save, whether or not it was the one that warned:
+// --calibrate reads it to avoid saying "profile recorded" after a save that failed.
+static std::atomic<bool> g_adapt_save_failed{false};
 static void adapt_warn_save_failed(const Options & opt, const std::string & why)
 {
+  g_adapt_save_failed.store(true, std::memory_order_relaxed);
   static std::atomic<bool> warned{false};
   if (warned.exchange(true)) return;
   vlog(V_ERROR, opt, "warning: --adapt could not persist its profile (" + why
@@ -9298,8 +9475,48 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
     ::unlinkat(profile_dir.fd, tmp_base.c_str(), 0);
     return;
   }
-  vlog(V_VERBOSE, opt, std::string("[ADAPT] profile updated (") + dname + ", "
-       + (obs.fault ? "fault counted, rates unchanged" : ("regime " + obs.regime))
+  if (opt.verbosity < V_VERBOSE) return;
+  // What the save FILED, in adapt_merge_dir's terms (ROADMAP 22): the backend
+  // prior's next decision is made from exactly this, so -v says it.
+  static const char * const bk[] = { "", "cpu-only", "hybrid" };
+  std::string filed;
+  if (obs.fault) {
+    filed = "fault counted; this run's rates ignored";
+    if (obs.explored)
+      filed += std::string("; the ") + bk[obs.explored == 1 ? 1 : 2]
+            + " probe stamped as tried";
+  } else if (obs.stamp_only) {
+    filed = std::string("the ") + bk[obs.explored == 1 ? 1 : 2]
+          + " probe stamped as tried; the run was too short for a rate";
+  } else {
+    filed = "regime " + obs.regime;
+    const double wall_s = obs.wall_ns / 1e9;
+    if (wall_s > 0 && obs.payload_bytes > 0) {
+      char b[192];
+      const double r = obs.payload_bytes / (1024.0 * 1024.0 * 1024.0) / wall_s;
+      if (wall_s < ADAPT_BACKEND_MIN_SEC)
+        std::snprintf(b, sizeof b, "; %.2f GiB/s end-to-end, under %.0f s: not filed in the "
+                      "backend pair", r, ADAPT_BACKEND_MIN_SEC);
+      else if (obs.backend_used == 1 || obs.backend_used == 2)
+        std::snprintf(b, sizeof b, "; %.2f GiB/s end-to-end filed as %s%s%s", r,
+                      bk[obs.backend_used], obs.resid_class >= 0 ? ", " : "",
+                      obs.resid_class >= 0
+                        ? (std::string(adapt_resid_class_name(obs.resid_class)) + " input").c_str() : "");
+      else
+        std::snprintf(b, sizeof b, "; %.2f GiB/s end-to-end, not a backend-pair run", r);
+      filed += b;
+      // adapt_merge_dir stamps this at any length, not only past the backend floor.
+      if (obs.explored && obs.explored != obs.backend_used)
+        filed += std::string("; the ") + bk[obs.explored == 1 ? 1 : 2] + " probe did not run as "
+               + bk[obs.explored == 1 ? 1 : 2] + ", so it is stamped as tried";
+    }
+    if (!obs.gpuc.empty()) {
+      filed += "; GPU device count";
+      for (size_t i = 0; i < obs.gpuc.size(); ++i)
+        filed += (i ? ", " : " ") + std::to_string(obs.gpuc[i].devices);
+    }
+  }
+  vlog(V_VERBOSE, opt, std::string("[ADAPT] profile updated (") + dname + ", " + filed
        + "): " + path + "\n");
 }
 #endif  // !_WIN32
@@ -9833,6 +10050,24 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
   // percentages.  Only a genuine pipe (total_in == 0: tar -I gzstd, cat |
   // gzstd, terminal) is suppressed.  --progress overrides everything but the
   // V_DEBUG cap.
+#ifndef _WIN32
+  // A --calibrate device-count child (v0.18.14): no bar of its own (it runs -q);
+  // it tells the parent how far it has got, through the pipe its "gpuc" sample
+  // goes back on, and the parent draws the status line (see run_calibrate).
+  // Frames, not bytes: compress's mmap reader reaches the end almost at once.
+  if (const char * fdv = std::getenv("GZSTD_CALIBRATE_GPUC_FD")) {
+    const int fd = std::atoi(fdv);
+    for (bool fin = false; !fin;) {
+      fin = gz_periodic_wait(*done_flag, std::chrono::milliseconds(250));
+      char l[64];
+      const int n = std::snprintf(l, sizeof l, "prog %llu %llu\n",
+                                  (unsigned long long)m->tasks_done.load(),
+                                  (unsigned long long)m->total_frames.load());
+      if (n > 0 && ::write(fd, l, (size_t)n) < 0) break;   // the parent has gone
+    }
+    return;
+  }
+#endif
   if (opt.no_progress) return;                 // explicit suppression wins
   if (opt.verbosity < V_DEFAULT || opt.verbosity >= V_DEBUG) return;
   if (opt.verbosity == V_DEFAULT && !opt.force_progress) {
@@ -14114,7 +14349,7 @@ public:
   // keeps the pipeline unblocked without the convoy.
   void release(int n = 1) {
     if (n <= 0 || disabled_) return;
-    int grew = 0, new_max = 0;
+    int grew = 0, new_max = 0, step = 0, ceil = 0;
     bool batch_waiting = false;
     {
       std::lock_guard<std::mutex> lk(m_);
@@ -14127,6 +14362,8 @@ public:
         max_     += grew;
         permits_ += grew;
         new_max   = max_;
+        step      = ++grow_steps_;
+        ceil      = grow_ceiling_;
       }
     }
     for (int i = 0; i < n + grew; ++i) cv_.notify_one();
@@ -14135,10 +14372,13 @@ public:
     if (batch_waiting) bcv_.notify_all();
     if (grew) {
       g_adapt_action_flags.fetch_or(ADAPT_ACT_SINK_GROW, std::memory_order_relaxed);
-      if (grow_opt_ && grow_opt_->verbosity >= V_VERBOSE)
-        vlog(V_VERBOSE, *grow_opt_, "[ADAPT] sink-bound bursty: throttle budget +"
+      // -v the decision (the first step); -vv each further step (ROADMAP 22).
+      const int lvl = step == 1 ? V_VERBOSE : V_DEBUG;
+      if (grow_opt_ && grow_opt_->verbosity >= lvl)
+        vlog(lvl, *grow_opt_, "[ADAPT] sink-bound bursty: throttle budget +"
              + std::to_string(grew) + " frames (" + std::to_string(new_max)
-             + " total)\n");
+             + " total, step " + std::to_string(step) + ", ceiling "
+             + std::to_string(ceil) + ")\n");
     }
   }
 
@@ -14223,6 +14463,7 @@ private:
   int max_;
   int grow_ceiling_ = 0;                 // 0 = growth not armed
   const Options * grow_opt_ = nullptr;   // for the [ADAPT] grow line
+  int grow_steps_ = 0;                   // grow steps taken (under m_)
   bool disabled_;        // true when constructed with max_in_flight <= 0
   bool done_ = false;
   mutable std::mutex m_;
@@ -19363,6 +19604,7 @@ static size_t stream_frames_to_queue_mt(
   const int  rd_seed_d = can_scale ? g_adapt_rd_prior.load(std::memory_order_relaxed) : 0;
   ReaderPoolCtl rd_ctl(n_readers, rd_floor_d, cap, rd_seed_d);
   rd_ctl.bind_live(m ? &m->reader_threads : nullptr);
+  rd_ctl.set_log(&opt, "reader pool");
 
   // ZERO-COPY FRAMES (v0.17.47).  Every frame used to be copied out of its block
   // into its own Task on the ONE ordered consumer thread below, and that copy was
@@ -21687,6 +21929,7 @@ static bool pooled_read_chunks(size_t host_chunk,
   const int rd_seed = g_adapt_rd_prior.load(std::memory_order_relaxed);
   ReaderPoolCtl rd_ctl(n_readers, rd_floor, rd_ceil, rd_seed);
   rd_ctl.bind_live(m ? &m->reader_threads : nullptr);
+  rd_ctl.set_log(optp, "reader pool");
 
   std::atomic<size_t> next_idx{0};
   std::atomic<bool>   done{false};
@@ -24784,6 +25027,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   const int rd_seed_t = rd_ad_t ? g_adapt_rd_prior.load(std::memory_order_relaxed) : 0;
   ReaderPoolCtl rd_ctl_t(nreaders, rd_floor_t, rd_ceil_t, rd_seed_t);
   rd_ctl_t.bind_live(m ? &m->reader_threads : nullptr);
+  rd_ctl_t.set_log(&opt, "tar reader pool");
   std::atomic<bool> rd_done_t{false};
   const bool  rd_trace  = std::getenv("GZSTD_DEBUG_TAR_RD") != nullptr;
   // Per-reader state, so a wedged run names its own culprit.
@@ -25601,7 +25845,7 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
     if (opt.verbosity >= V_VERBOSE) {
       char rb[160];
       std::snprintf(rb, sizeof rb,
-        "[TAR] reader pool: started %d%s, settled %d (range %d-%d)\n",
+        "[ADAPT] tar reader pool: started %d%s, settled %d (range %d-%d)\n",
         rd_ctl_t.start(), rd_ctl_t.seeded() ? " (from profile)" : "",
         rd_ctl_t.want(), rd_ctl_t.floor_v(), rd_ctl_t.ceiling());
       vlog(V_VERBOSE, opt, rb);
@@ -43941,6 +44185,52 @@ static void append_tar_index(int dfd, FILE * f, Meter & meter) {
  (the corpus is sized so startup amortizes; treat them as priors, not
  benchmarks — gzstd-benchmark.sh remains the honest instrument).
 ======================================================================*/
+
+// --calibrate's screen (v0.18.14, ROADMAP 22).  Every permanent line goes through
+// vlog_emit, so it takes vlog's colours on a colour terminal and stays plain in a
+// log.  On a terminal each step also keeps a transient status line -- what it is
+// measuring, how far through, how long so far -- which the next step or result
+// row replaces.  A log gets a permanent line as each step starts instead, so a
+// calibration that stalls still says where.  The ticker threads and the main thread
+// both draw, hence the lock.
+struct CalScreen {
+  const bool tty = is_stderr_tty();
+  ~CalScreen() {
+    std::lock_guard<std::mutex> lk(g_vlog_emit_mx);
+    if (g_cal_status_shown) std::fputs("\r\033[K", stderr);
+    g_cal_status_shown = false;
+  }
+  // A permanent line (ends in \n); vlog_emit clears a status line first.
+  void say(const std::string & line)
+  {
+    vlog_emit(line);
+  }
+  // Transient, terminal only: replaced by the next status or permanent line.
+  void status(const std::string & text)
+  {
+    if (!tty) return;
+    std::lock_guard<std::mutex> lk(g_vlog_emit_mx);
+    if (g_cal_status_dying) return;
+    const std::string s = "[CALIBRATE] " + text;
+    std::fprintf(stderr, "\r%s\033[K", (g_color_stderr ? vlog_paint(s) : s).c_str());
+    std::fflush(stderr);
+    g_cal_status_shown = true;
+  }
+  // A step begins: a status line on a terminal, a permanent line in a log.
+  void step(const std::string & text)
+  {
+    if (tty) status(text + " ...");
+    else     say("[CALIBRATE] " + text + " ...\n");
+  }
+};
+
+static std::string cal_size(double bytes)
+{
+  char b[32];
+  human_bytes(bytes, b, sizeof b);
+  return b;
+}
+
 static int run_calibrate(Options opt)
 {
   const double GiB = 1024.0 * 1024.0 * 1024.0;
@@ -43979,8 +44269,17 @@ static int run_calibrate(Options opt)
     unsigned long long v = std::strtoull(e, &end, 10);
     if (end != e && v >= (1ull << 20)) corpus_sz = (size_t)v;   // floor 1 MiB
   }
-  std::fprintf(stderr, "[CALIBRATE] generating %.1f GiB corpus (half text-like, half random)...\n",
-               corpus_sz / GiB);
+  CalScreen scr;
+  scr.say("[CALIBRATE] each engine runs an untimed warm-up, then a timed pass over "
+          "4 copies of the corpus; " + std::string(opt.no_profile
+            ? "--no-profile: the results are shown, not recorded\n"
+            : "the last line says whether the --adapt profile recorded them\n"));
+  {
+    char gl[128];
+    std::snprintf(gl, sizeof gl, "[CALIBRATE] generating %.1f GiB corpus (half text-like, half random)...\n",
+                  corpus_sz / GiB);
+    scr.say(gl);
+  }
   std::string corpus(corpus_sz, '\0');
   {
     // Text-like half: rotating dictionary words + counters (compresses ~3-4x,
@@ -44026,8 +44325,18 @@ static int run_calibrate(Options opt)
   // single-reader stdin path instead — measured 1.0 vs 2.85 GiB/s for the
   // same corpus on the same box.  If memfd_create is unavailable the
   // fmemopen fallback still measures; the rate is then the pipe-path rate.
-  auto pass = [&](bool compress_dir, bool gpu, const std::string & in_buf,
+  //
+  // `label` names the step on the status line, which a ticker redraws every 250 ms
+  // on a terminal from the pass's own Meter: decompress counts output against the
+  // corpus it must rebuild, compress counts frames finished once the reader knows
+  // how many there are (its mmap reader reaches the end almost at once, so bytes
+  // READ would say 100% with the work still to do).  last_secs keeps the pass's
+  // duration for the result row.
+  double last_secs = 0;
+  auto pass = [&](const char * label, bool compress_dir, bool gpu, const std::string & in_buf,
                   FILE * sink, uint64_t & payload_out, int repeat) -> double {
+    last_secs = 0;
+    payload_out = 0;
     Options po = base;
     FILE * in = nullptr;
     int mfd = (int)syscall(SYS_memfd_create, "gzstd-calibrate", 0);
@@ -44067,16 +44376,66 @@ static int run_calibrate(Options opt)
     if (!compress_dir) po.mem_limit_bytes = 0;
     Meter m;
     const auto t0 = std::chrono::steady_clock::now();
+    const double want = double(compress_dir ? in_buf.size() : corpus.size()) * repeat;
+    std::mutex tk_mx;
+    std::condition_variable tk_cv;
+    bool tk_done = false;
+    std::thread tk;
+    if (scr.tty)
+      tk = std::thread([&] {
+        std::unique_lock<std::mutex> lk(tk_mx);
+        while (!tk_cv.wait_for(lk, std::chrono::milliseconds(250), [&] { return tk_done; })) {
+          double frac = -1.0;
+          if (!compress_dir) frac = want > 0 ? double(m.wrote_bytes.load()) / want : -1.0;
+          else if (const uint64_t tf = m.total_frames.load()) frac = double(m.tasks_done.load()) / double(tf);
+          const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          char b[160];
+          if (gpu && frac <= 0.0)        // cuInit and the devices' setup come first
+            std::snprintf(b, sizeof b, "%s: waiting for the GPUs, %.1f s", label, el);
+          else if (frac >= 1.0)          // the work is done; teardown (a GPU's exit) is not
+            std::snprintf(b, sizeof b, "%s: finishing, %.1f s", label, el);
+          else if (frac >= 0.0)
+            std::snprintf(b, sizeof b, "%s %3.0f%% of %s, %.1f s", label,
+                          100.0 * frac, cal_size(want).c_str(), el);
+          else
+            std::snprintf(b, sizeof b, "%s %s, %.1f s", label, cal_size(want).c_str(), el);
+          lk.unlock();
+          scr.status(b);
+          lk.lock();
+        }
+      });
+    // A pipeline exception must join the ticker before its Meter and captured
+    // locals unwind.  An unjoined std::thread would terminate the process before
+    // the top-level exception handler can report the pipeline failure.
+    struct TickerGuard {
+      std::thread & thread;
+      std::mutex & mx;
+      std::condition_variable & cv;
+      bool & done;
+      void stop() noexcept {
+        if (!thread.joinable()) return;
+        { std::lock_guard<std::mutex> lk(mx); done = true; }
+        cv.notify_all();
+        thread.join();
+      }
+      ~TickerGuard() { stop(); }
+    } ticker{tk, tk_mx, tk_cv, tk_done};
 #ifdef HAVE_NVCOMP
     if (compress_dir) { if (gpu) compress_nvcomp(in, sink, po, &m); else compress_cpu_mt(in, sink, po, &m); }
     else              { if (gpu) decompress_nvcomp(in, sink, po, &m); else decompress_cpu_mt(in, sink, po, &m); }
 #else
-    if (gpu) { std::fclose(in); return 0.0; }
+    if (gpu) {
+      std::fclose(in);
+      ticker.stop();
+      return 0.0;
+    }
     if (compress_dir) compress_cpu_mt(in, sink, po, &m);
     else              decompress_cpu_mt(in, sink, po, &m);
 #endif
+    ticker.stop();
     const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(
         std::chrono::steady_clock::now() - t0).count();
+    last_secs = secs;
     std::fclose(in);
     payload_out = compress_dir ? m.read_bytes.load() : m.wrote_bytes.load();
     return (secs > 0 && payload_out > 0) ? payload_out / GiB / secs : 0.0;
@@ -44098,29 +44457,48 @@ static int run_calibrate(Options opt)
   // pass doubles as the compressed-corpus capture (a truncated prefix is
   // NOT a valid warmup input — it cuts mid-frame and reads as corruption).
   const int TIMED_REPEAT = 4;
+  // A result row: the rate, and what it was measured over.
+  auto row_line = [&](const char * name, double gibs) {
+    if (gibs <= 0 || last_secs <= 0) {
+      scr.say(std::string("[CALIBRATE] ") + name + "  NOT MEASURED\n");
+      return;
+    }
+    char b[160];
+    std::snprintf(b, sizeof b, "[CALIBRATE] %-15s %7.2f GiB/s  (%s in %.2f s)\n", name, gibs,
+                  cal_size(gibs * last_secs * GiB).c_str(), last_secs);
+    scr.say(b);
+  };
 
   // cpu compress: warmup+capture (untimed, 1 copy), then timed (4 copies).
   char * comp_buf = nullptr; size_t comp_sz = 0;
   {
     FILE * ms = open_memstream(&comp_buf, &comp_sz);
     if (!ms) die_io("--calibrate: open_memstream failed");
-    pass(true, false, corpus, ms, payload, 1);         // warmup + capture
+    scr.step("cpu compress: warm-up, " + cal_size(corpus.size()) + " untimed");
+    pass("cpu compress: warm-up", true, false, corpus, ms, payload, 1);         // warmup + capture
     std::fclose(ms);
   }
   std::string compressed = comp_buf ? std::string(comp_buf, comp_sz) : std::string();
   free(comp_buf);
   if (compressed.empty()) die("--calibrate: cpu compress pass produced no output");
-  rows[0].gibs = pass(true, false, corpus, devnull, payload, TIMED_REPEAT);
+  scr.step("cpu compress: timed, " + cal_size(double(corpus.size()) * TIMED_REPEAT) + " input");
+  rows[0].gibs = pass("cpu compress: timed", true, false, corpus, devnull, payload, TIMED_REPEAT);
   rows[0].ran = rows[0].gibs > 0;
-  std::fprintf(stderr, "[CALIBRATE] cpu compress    %7.2f GiB/s\n", rows[0].gibs);
+  row_line("cpu compress", rows[0].gibs);
 
   // cpu decompress: warmup (untimed), then timed.
-  pass(false, false, compressed, devnull, payload, 1);
-  rows[2].gibs = pass(false, false, compressed, devnull, payload, TIMED_REPEAT);
+  scr.step("cpu decompress: warm-up, " + cal_size(compressed.size()) + " compressed, untimed");
+  pass("cpu decompress: warm-up", false, false, compressed, devnull, payload, 1);
+  scr.step("cpu decompress: timed, " + cal_size(double(compressed.size()) * TIMED_REPEAT)
+           + " compressed input");
+  rows[2].gibs = pass("cpu decompress: timed", false, false, compressed, devnull, payload, TIMED_REPEAT);
   rows[2].ran = rows[2].gibs > 0;
-  std::fprintf(stderr, "[CALIBRATE] cpu decompress  %7.2f GiB/s\n", rows[2].gibs);
+  row_line("cpu decompress", rows[2].gibs);
 
   std::vector<AdaptObs::GpucSample> gpuc_samples;   // recorded with cobs below
+#ifdef HAVE_NVCOMP
+  int cal_devices = 0;                               // visible GPUs, for the summary
+#endif
   // GPU DEVICE COUNT (v0.17.73).  --gpu-only compress at every candidate count
   // (gpuc_candidates), each in a CHILD process that sees only that many devices:
   // cuInit charges every VISIBLE device, so a process that has already
@@ -44180,12 +44558,15 @@ static int run_calibrate(Options opt)
     int gfd = -1;
     std::string in_path;
     double cal_gib = 0;
+    cal_devices = devices;
     if (devices <= 1) {
-      std::fprintf(stderr, "[CALIBRATE] gpu devices: %s, nothing to choose\n",
-                   devices == 1 ? "one device" : "no device");
+      scr.say(std::string("[CALIBRATE] gpu devices: ") + (devices == 1 ? "one device" : "no device")
+              + ", nothing to choose\n");
     } else if (devices > AdaptPriors::Dir::GPUC_MAX) {
-      std::fprintf(stderr, "[CALIBRATE] gpu devices: %d exceeds the profile model's %d-device "
-                           "limit; count pass skipped\n", devices, AdaptPriors::Dir::GPUC_MAX);
+      char b[160];
+      std::snprintf(b, sizeof b, "[CALIBRATE] gpu devices: %d exceeds the profile model's %d-device "
+                                 "limit; count pass skipped\n", devices, AdaptPriors::Dir::GPUC_MAX);
+      scr.say(b);
     } else if (!cal_file.empty()) {
       in_path = cal_file;
       cal_gib = double(cal_file_bytes) / GiB;
@@ -44196,6 +44577,7 @@ static int run_calibrate(Options opt)
       if (pages > 0 && psz > 0) want = std::min(want, (size_t)pages * (size_t)psz / 4);
       if (gpuc_test_hook) want = std::min(want, size_t(64) << 20);   // the suite's cell: rows, not timing
       const size_t reps = corpus.empty() ? 0 : std::max<size_t>(1, want / corpus.size());
+      scr.step("gpu devices: staging " + cal_size(double(reps) * corpus.size()) + " of the corpus for the count pass");
       gfd = (int)syscall(SYS_memfd_create, "gzstd-calibrate-gpuc", 0);   // inherited by the children
       bool staged = gfd >= 0;
       for (size_t r = 0; staged && r < reps; ++r)
@@ -44208,18 +44590,26 @@ static int run_calibrate(Options opt)
         in_path = "/proc/self/fd/" + std::to_string(gfd);
         cal_gib = double(reps * corpus.size()) / GiB;
       } else {
-        std::fprintf(stderr, "[CALIBRATE] gpu devices: not measured (could not stage the corpus)\n");
+        scr.say("[CALIBRATE] gpu devices: not measured (could not stage the corpus)\n");
       }
     }
     if (!in_path.empty()) {
       const bool with_rate = !cal_file.empty();
-      std::fprintf(stderr, "[CALIBRATE] gpu devices: --gpu-only compress of %.1f GiB (%s) at each "
-                           "count, one process each (each pays its own cuInit)\n", cal_gib,
-                   with_rate ? cal_file.c_str() : "synthetic; overhead only");
+      const std::vector<int> counts = gpuc_candidates(devices);
+      {
+        std::string cl;
+        for (int n : counts) cl += (cl.empty() ? "" : ", ") + std::to_string(n);
+        char b[512];
+        std::snprintf(b, sizeof b, "[CALIBRATE] gpu devices: --gpu-only compress of %.1f GiB (%s) at each "
+                                   "count (%s), one process each (each pays its own cuInit)\n", cal_gib,
+                      with_rate ? cal_file.c_str() : "synthetic; overhead only", cl.c_str());
+        scr.say(b);
+      }
       if (with_rate && cal_gib < 60)
-        std::fprintf(stderr, "[CALIBRATE]   (under ~60 GiB the rates include the batch tuner's "
-                             "ramp: right for files this size, low for much larger ones)\n");
-      for (int n : gpuc_candidates(devices)) {
+        scr.say("[CALIBRATE]   (under ~60 GiB the rates include the batch tuner's "
+                "ramp: right for files this size, low for much larger ones)\n");
+      for (size_t ci = 0; ci < counts.size(); ++ci) {
+        const int n = counts[ci];
         int pfd[2];
         if (::pipe(pfd) != 0) break;
         (void)::fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
@@ -44244,12 +44634,56 @@ static int run_calibrate(Options opt)
           ::_exit(127);
         }
         ::close(pfd[1]);
-        std::string rep;
-        char b[512];
-        for (ssize_t k; (k = ::read(pfd[0], b, sizeof b)) != 0;) {
-          if (k < 0) { if (errno == EINTR) continue; break; }
-          rep.append(b, (size_t)k);
+        // The child writes "prog DONE TOTAL" (frames) every 250 ms from its progress
+        // thread, then its "gpuc" sample at exit (see progress_loop).  On a terminal
+        // the wait is a poll, so the status line moves even while nothing arrives
+        // (cuInit can take seconds before the child's pipeline starts).
+        {
+          char b[96];
+          std::snprintf(b, sizeof b, "gpu devices %2d: measuring (%zu of %zu)", n, ci + 1, counts.size());
+          scr.step(b);
         }
+        const auto c0 = std::chrono::steady_clock::now();
+        unsigned long long pdone = 0, ptotal = 0;
+        auto child_status = [&] {
+          const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
+          char b[160];
+          if (ptotal == 0 || pdone == 0)
+            std::snprintf(b, sizeof b, "gpu devices %2d (%zu of %zu): starting %d GPU%s, %.1f s", n,
+                          ci + 1, counts.size(), n, n == 1 ? "" : "s", el);
+          else if (pdone >= ptotal)
+            std::snprintf(b, sizeof b, "gpu devices %2d (%zu of %zu): finishing, %.1f s", n,
+                          ci + 1, counts.size(), el);
+          else
+            std::snprintf(b, sizeof b, "gpu devices %2d (%zu of %zu): %3.0f%% of %.1f GiB, %.1f s", n,
+                          ci + 1, counts.size(), 100.0 * std::min(1.0, double(pdone) / double(ptotal)),
+                          cal_gib, el);
+          scr.status(b);
+        };
+        std::string rep, pend;
+        char b[512];
+        for (;;) {
+          if (scr.tty) {
+            struct pollfd pf {};
+            pf.fd = pfd[0]; pf.events = POLLIN;
+            const int pr = ::poll(&pf, 1, 250);
+            if (pr < 0) { if (errno == EINTR) continue; break; }
+            if (pr == 0) { child_status(); continue; }
+          }
+          const ssize_t k = ::read(pfd[0], b, sizeof b);
+          if (k < 0) { if (errno == EINTR) continue; break; }
+          if (k == 0) break;
+          pend.append(b, (size_t)k);
+          for (size_t nl; (nl = pend.find('\n')) != std::string::npos;) {
+            const std::string line = pend.substr(0, nl + 1);
+            pend.erase(0, nl + 1);
+            unsigned long long d = 0, t = 0;
+            if (std::sscanf(line.c_str(), "prog %llu %llu", &d, &t) == 2) { pdone = d; ptotal = t; }
+            else rep += line;
+          }
+          if (scr.tty) child_status();
+        }
+        rep += pend;
         ::close(pfd[0]);
         int st = 0;
         const bool ok = pid > 0 && ::waitpid(pid, &st, 0) == pid && WIFEXITED(st)
@@ -44262,14 +44696,19 @@ static int run_calibrate(Options opt)
           g.devices = dv; g.wall_ns = wl; g.active_ns = ac; g.bytes = by;
           g.force_rate = with_rate; g.no_rate = !with_rate;
           gpuc_samples.push_back(g);
+          char l[160];
           if (with_rate)
-            std::fprintf(stderr, "[CALIBRATE] gpu devices %2d: overhead %5.2f s, busy %6.2f GiB/s\n",
-                         n, (wl - ac) / 1e9, by / GiB / (ac / 1e9));
+            std::snprintf(l, sizeof l, "[CALIBRATE] gpu devices %2d: overhead %5.2f s, busy %6.2f GiB/s\n",
+                          n, (wl - ac) / 1e9, by / GiB / (ac / 1e9));
           else
-            std::fprintf(stderr, "[CALIBRATE] gpu devices %2d: overhead %5.2f s\n", n, (wl - ac) / 1e9);
+            std::snprintf(l, sizeof l, "[CALIBRATE] gpu devices %2d: overhead %5.2f s  (run %.2f s)\n",
+                          n, (wl - ac) / 1e9, wl / 1e9);
+          scr.say(l);
         } else {
-          std::fprintf(stderr, "[CALIBRATE] gpu devices %2d: NOT MEASURED (child %s)\n", n,
-                       ok ? "reported nothing usable" : "failed");
+          char l[128];
+          std::snprintf(l, sizeof l, "[CALIBRATE] gpu devices %2d: NOT MEASURED (child %s)\n", n,
+                        ok ? "reported nothing usable" : "failed");
+          scr.say(l);
         }
       }
       if (with_rate && !gpuc_samples.empty()) {
@@ -44288,10 +44727,10 @@ static int run_calibrate(Options opt)
           std::snprintf(c, sizeof c, "%s %.1f GiB -> %d", f == 0.1 ? "" : ",", sz, ch.n);
           line += c;
         }
-        std::fprintf(stderr, "%s\n", line.c_str());
+        scr.say(line + "\n");
       } else if (!with_rate && !gpuc_samples.empty()) {
-        std::fprintf(stderr, "[CALIBRATE] gpu devices: rates are learned by --adapt on real runs; "
-                             "for them now, run gzstd --calibrate FILE on a representative file\n");
+        scr.say("[CALIBRATE] gpu devices: rates are learned by --adapt on real runs; "
+                "for them now, run gzstd --calibrate FILE on a representative file\n");
       }
     }
     if (gfd >= 0) ::close(gfd);
@@ -44302,6 +44741,7 @@ static int run_calibrate(Options opt)
   // gpu rows only when a device is actually usable.
   {
     int ndev = 0;
+    scr.step("gpu: starting CUDA to find the usable devices");
     ndev = gz_cuda_usable_count(opt, "calibrate");
     // The child process count pass above must run before this process starts
     // CUDA.  Once it is done, an explicit --gpu-only request cannot silently
@@ -44318,21 +44758,23 @@ static int run_calibrate(Options opt)
       char * gcomp = nullptr; size_t gsz = 0;
       FILE * gms = open_memstream(&gcomp, &gsz);
       if (gms) {
-        pass(true, true, corpus, gms, payload, 1);     // warmup + capture
+        scr.step("gpu compress: warm-up, " + cal_size(corpus.size()) + " untimed (pays the devices' start)");
+        pass("gpu compress: warm-up", true, true, corpus, gms, payload, 1);     // warmup + capture
         std::fclose(gms);
       }
       std::string gcompressed = gcomp ? std::string(gcomp, gsz) : std::string();
       free(gcomp);
       if (!g_gpu_failed_restart.load() && !gcompressed.empty()) {
-        rows[1].gibs = pass(true, true, corpus, devnull, payload, TIMED_REPEAT);
+        scr.step("gpu compress: timed, " + cal_size(double(corpus.size()) * TIMED_REPEAT) + " input");
+        rows[1].gibs = pass("gpu compress: timed", true, true, corpus, devnull, payload, TIMED_REPEAT);
         rows[1].ran = rows[1].gibs > 0;
       }
       if (g_gpu_failed_restart.load()) {
         rows[1] = Row{"gpu compress"};
         gcompressed.clear();
-        std::fprintf(stderr, "[CALIBRATE] gpu compress    FAULTED — row discarded\n");
+        scr.say("[CALIBRATE] gpu compress    FAULTED — row discarded\n");
       } else {
-        std::fprintf(stderr, "[CALIBRATE] gpu compress    %7.2f GiB/s\n", rows[1].gibs);
+        row_line("gpu compress", rows[1].gibs);
       }
       if (!gcompressed.empty()) {
         g_gpu_failed_restart.store(false);
@@ -44342,19 +44784,22 @@ static int run_calibrate(Options opt)
         // pass "ran" and its rate was recorded as the GPU's (v0.17.89).  The
         // rescue counter is what says the number is not a GPU number.
         const int rescues_before = g_gpu_cpu_rescue_runs.load(std::memory_order_relaxed);
-        pass(false, true, gcompressed, devnull, payload, 1);   // warmup
-        rows[3].gibs = pass(false, true, gcompressed, devnull, payload, TIMED_REPEAT);
+        scr.step("gpu decompress: warm-up, " + cal_size(gcompressed.size()) + " compressed, untimed");
+        pass("gpu decompress: warm-up", false, true, gcompressed, devnull, payload, 1);   // warmup
+        scr.step("gpu decompress: timed, " + cal_size(double(gcompressed.size()) * TIMED_REPEAT)
+                 + " compressed input");
+        rows[3].gibs = pass("gpu decompress: timed", false, true, gcompressed, devnull, payload, TIMED_REPEAT);
         rows[3].ran = rows[3].gibs > 0;
         if (g_gpu_failed_restart.load()
             || g_gpu_cpu_rescue_runs.load(std::memory_order_relaxed) != rescues_before) {
           rows[3] = Row{"gpu decompress"};
-          std::fprintf(stderr, "[CALIBRATE] gpu decompress  FAULTED — row discarded\n");
+          scr.say("[CALIBRATE] gpu decompress  FAULTED — row discarded\n");
         } else {
-          std::fprintf(stderr, "[CALIBRATE] gpu decompress  %7.2f GiB/s\n", rows[3].gibs);
+          row_line("gpu decompress", rows[3].gibs);
         }
       }
     } else {
-      std::fprintf(stderr, "[CALIBRATE] no usable GPU — skipping gpu rows\n");
+      scr.say("[CALIBRATE] no usable GPU — skipping gpu rows\n");
     }
   }
 #endif
@@ -44429,6 +44874,7 @@ static int run_calibrate(Options opt)
     if (!outf) ::close(cfd);
     if (in && outf) {
       Meter m;
+      scr.step("sink write: " + cal_size(cap) + " to " + po.output + ", then flush and fsync");
       compress_cpu_mt(in, outf, po, &m);
       // Buffered fwrite alone measures the page cache, not the device —
       // fold the flush into the measured time so the recorded rate is the
@@ -44452,13 +44898,15 @@ static int run_calibrate(Options opt)
         cobs.writer_bytes = m.wrote_bytes.load();
         cobs.writer_disk_ns = dns;
       }
+      char sl[PATH_MAX + 160];
       if (cal_durable)
-        std::fprintf(stderr, "[CALIBRATE] sink write      %7.2f GiB/s -> %s (removed)\n",
-                     rows[4].gibs, po.output.c_str());
+        std::snprintf(sl, sizeof sl, "[CALIBRATE] sink write      %7.2f GiB/s -> %s (removed)\n",
+                      rows[4].gibs, po.output.c_str());
       else
-        std::fprintf(stderr, "[CALIBRATE] sink write      NOT MEASURED — flush/fsync of %s "
-                             "failed (%s); nothing recorded\n",
-                     po.output.c_str(), std::strerror(cal_errno));
+        std::snprintf(sl, sizeof sl, "[CALIBRATE] sink write      NOT MEASURED — flush/fsync of %s "
+                                     "failed (%s); nothing recorded\n",
+                      po.output.c_str(), std::strerror(cal_errno));
+      scr.say(sl);
     }
     if (in) std::fclose(in);
     // Nothing to remove: the name was unlinked immediately after creation (see
@@ -44467,7 +44915,7 @@ static int run_calibrate(Options opt)
     // separate pathname operations, so a replacement installed between them was
     // deleted instead of ours.
   } else {
-    std::fprintf(stderr, "[CALIBRATE] no -o TARGET — sink rate not measured\n");
+    scr.say("[CALIBRATE] no -o TARGET — sink rate not measured\n");
   }
   std::fclose(devnull);
 
@@ -44496,20 +44944,121 @@ static int run_calibrate(Options opt)
     dobs.regime = "calibrate";
     save_opt.mode = Mode::DECOMPRESS;
     if (dobs.wall_ns > 0) adapt_profile_save(save_opt, dobs);
-    // Report what actually happened.  This printed "profile recorded:" followed by
-    // an EMPTY path when there is no cache directory at all (HOME and
-    // XDG_CACHE_HOME both unset) — adapt_profile_save() correctly warns and saves
-    // nothing, and then this line said the opposite, louder.
+  }
+  const bool recorded = !opt.no_profile && opt.deferred_exit == EXIT_OK
+                        && !adapt_profile_path().empty()
+                        && !g_adapt_save_failed.load(std::memory_order_relaxed);
+
+  // FINDINGS (v0.18.14, ROADMAP 22): what was measured, then what --adapt does
+  // with it.  The second half reads the profile back after the save, so it states
+  // what the next run starts from -- earlier runs' measurements included -- and
+  // not a restatement of these rows.
+  {
+    auto rate = [](const Row & r) -> std::string {
+      if (!r.ran) return "    --     ";
+      char b[32];
+      std::snprintf(b, sizeof b, "%6.2f GiB/s", r.gibs);
+      return b;
+    };
+    auto dir_row = [&](const char * name, const Row & c, const Row & g) {
+      char b[200];
+#ifdef HAVE_NVCOMP
+      std::snprintf(b, sizeof b, "[CALIBRATE]   %-11s cpu %s   gpu %s", name, rate(c).c_str(),
+                    rate(g).c_str());
+      std::string l = b;
+      if (c.ran && g.ran && c.gibs > 0) {
+        std::snprintf(b, sizeof b, "   (gpu/cpu %.2fx)", g.gibs / c.gibs);
+        l += b;
+      }
+#else
+      (void)g;   // a CPU-only build has no GPU rows
+      std::snprintf(b, sizeof b, "[CALIBRATE]   %-11s cpu %s", name, rate(c).c_str());
+      std::string l = b;
+#endif
+      scr.say(l + "\n");
+    };
+    scr.say("[CALIBRATE] findings:\n");
+    dir_row("compress", rows[0], rows[1]);
+    dir_row("decompress", rows[2], rows[3]);
+    if (rows[4].ran) {
+      char b[96];
+      std::snprintf(b, sizeof b, "[CALIBRATE]   sink write  %6.2f GiB/s\n", rows[4].gibs);
+      scr.say(b);
+    }
+    if (recorded) {
+#ifdef HAVE_NVCOMP
+      const AdaptPriors pr = adapt_load_priors();
+#endif
+      scr.say("[CALIBRATE] what --adapt does with them:\n");
+#ifdef HAVE_NVCOMP
+      scr.say("[CALIBRATE]   engine rates: saved CPU/GPU rates, where available, seed "
+              "the hybrid scheduler; live measurements then correct them\n");
+#endif
+      scr.say("[CALIBRATE]   end-to-end rates: predict how long an input will take, which "
+              "decides whether a run is long enough to try another read path\n");
+#ifdef HAVE_NVCOMP
+      // Show the saved flat pair.  The next run can instead use a residency
+      // bucket, scale the CPU rate to its core budget, or re-probe a stale side.
+      auto backend = [&](const AdaptPriors::Dir & d) -> std::string {
+        const double oc = d.overall_cpu, oh = d.overall_hybrid;
+        char b[200];
+        if (oc > 0 && oh > 0)
+          std::snprintf(b, sizeof b, "cpu-only %.2f vs hybrid %.2f GiB/s -> flat pair favors %s", oc, oh,
+                        oc > oh * 1.05 ? "--cpu-only"
+                        : oh > oc * 1.05 ? "--hybrid" : "--hybrid (within 5%: the default)");
+        else if (oh > 0)
+          std::snprintf(b, sizeof b, "hybrid %.2f GiB/s, cpu-only untried -> an eligible "
+                                     "run may try cpu-only", oh);
+        else if (oc > 0)
+          std::snprintf(b, sizeof b, "cpu-only %.2f GiB/s, hybrid untried -> --hybrid "
+                                     "(the default); an eligible run may measure it", oc);
+        else
+          std::snprintf(b, sizeof b, "nothing measured yet -> --hybrid (the default)");
+        return b;
+      };
+      scr.say("[CALIBRATE]   backend: the saved flat pair below comes from end-to-end runs of " +
+              std::to_string((int)ADAPT_BACKEND_MIN_SEC) + " s or more, not from these engine rates\n");
+      scr.say("[CALIBRATE]     compress:   " + backend(pr.dir[0]) + "\n");
+      scr.say("[CALIBRATE]     decompress: " + backend(pr.dir[1]) + "\n");
+      scr.say("[CALIBRATE]     (a run may use a residency pair, scale the CPU rate for "
+              "available cores, or re-probe the staler side after " +
+              std::to_string((int)ADAPT_BACKEND_RECHECK_RUNS) + " runs if the input is long enough)\n");
+      if (cal_devices > 1 && cal_devices <= AdaptPriors::Dir::GPUC_MAX) {
+        scr.say("[CALIBRATE]   GPU devices for a one-file --gpu-only compress (other GPU "
+                "modes use all visible devices when engaged, unless a count is set):\n");
+        for (double sz : {1.0, 10.0, 100.0}) {
+          const GpucChoice ch = gpuc_choose(cal_devices, sz, pr.dir[0], pr.dir[0].runs);
+          char b[256];
+          std::snprintf(b, sizeof b, "[CALIBRATE]     %5.0f GiB -> %d of %d  (%s)\n", sz, ch.n,
+                        cal_devices, ch.why.c_str());
+          scr.say(b);
+        }
+      }
+#endif
+      if (rows[4].ran)
+        scr.say("[CALIBRATE]   sink rate: recorded; no --adapt decision reads it yet\n");
+    }
+  }
+
+  // Report what actually happened.  This printed "profile recorded:" followed by
+  // an EMPTY path when there is no cache directory at all (HOME and
+  // XDG_CACHE_HOME both unset) — adapt_profile_save() correctly warns and saves
+  // nothing, and then this line said the opposite, louder.  It also said
+  // "recorded" after a save that warned it could not persist (v0.18.14).
+  if (!opt.no_profile && opt.deferred_exit == EXIT_OK) {
     const std::string cal_path = adapt_profile_path();
     if (cal_path.empty())
-      std::fprintf(stderr, "[CALIBRATE] measured, but NOT recorded: no cache "
-                           "directory (neither XDG_CACHE_HOME nor HOME is set)\n");
+      scr.say("[CALIBRATE] measured, but NOT recorded: no cache "
+              "directory (neither XDG_CACHE_HOME nor HOME is set)\n");
+    else if (!recorded)
+      scr.say("[CALIBRATE] measured, but NOT recorded: the profile could not be "
+              "written (see the warning above): " + cal_path + "\n");
     else
-      std::fprintf(stderr, "[CALIBRATE] profile recorded: %s\n", cal_path.c_str());
+      scr.say("[CALIBRATE] profile recorded: " + cal_path + "\n");
   } else {
-    std::fprintf(stderr, "%s\n", opt.no_profile
-        ? "[CALIBRATE] --no-profile: measured only, nothing recorded"
-        : "[CALIBRATE] input(s) skipped: measured only, nothing recorded");
+    scr.say(opt.no_profile
+        ? "[CALIBRATE] --no-profile: measured only, nothing recorded\n"
+        : "[CALIBRATE] input(s) skipped: measured only, nothing recorded\n");
   }
   return EXIT_OK;
 }
@@ -45124,6 +45673,8 @@ static int gzstd_main(int argc, char ** argv)
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
         adapt_profile_save(opt, obs);
+      } else {
+        adapt_note_not_saved(opt, rc, obs.wall_ns);
       }
     }
     return rc;
@@ -45157,6 +45708,8 @@ static int gzstd_main(int argc, char ** argv)
         obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
         obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
         adapt_profile_save(opt, obs);
+      } else {
+        adapt_note_not_saved(opt, rc, obs.wall_ns);
       }
     }
     return rc;
@@ -47250,6 +47803,8 @@ static int gzstd_main(int argc, char ** argv)
     adapt_obs.cpu_ema_gibs  = g_adapt_cpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_obs.gpu_ema_gibs  = g_adapt_gpu_ema_gibs.load(std::memory_order_relaxed);
     adapt_profile_save(opt, adapt_obs);
+  } else if (!std::getenv("GZSTD_CALIBRATE_GPUC_FD")) {   // a calibrate child reports below
+    adapt_note_not_saved(opt, exit_code, adapt_obs.wall_ns);
   }
   // --calibrate's GPU-count children (run_calibrate) hand their sample back
   // through the pipe named here instead of saving a profile of their own.
@@ -48032,6 +48587,9 @@ static void apply_backend_defaults(Options & opt)
       vlog(V_VERBOSE, opt, std::string("[ADAPT] profile priors loaded")
            + (priors.gpu_valid ? "" : " (driver changed: GPU rates/batch invalidated)")
            + "\n");
+    else if (!priors.loaded && opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, "[ADAPT] no profile entry for this machine yet: the defaults run, "
+                           "and this run is measured (" + adapt_profile_path() + ")\n");
   }
   const AdaptPriors::Dir & prior_dir =
       priors.dir[opt.mode == Mode::COMPRESS ? 0 : 1];
@@ -48181,6 +48739,18 @@ static void apply_backend_defaults(Options & opt)
   }
   if (priors.loaded && prior_dir.cpu_gibs > 0)
     g_adapt_seed_cpu_gibs.store(prior_dir.cpu_gibs, std::memory_order_relaxed);
+  if (opt.verbosity >= V_VERBOSE && priors.loaded && !opt.cpu_only
+      && (g_adapt_seed_cpu_gibs.load(std::memory_order_relaxed) > 0
+          || g_adapt_seed_gpu_gibs.load(std::memory_order_relaxed) > 0)) {
+    const double cs = g_adapt_seed_cpu_gibs.load(std::memory_order_relaxed);
+    const double gs = g_adapt_seed_gpu_gibs.load(std::memory_order_relaxed);
+    char b[224], c[40] = "", g[40] = "";
+    if (cs > 0) std::snprintf(c, sizeof c, "cpu %.2f GiB/s", cs);
+    if (gs > 0) std::snprintf(g, sizeof g, "%sgpu %.2f GiB/s", cs > 0 ? ", " : "", gs);
+    std::snprintf(b, sizeof b, "[ADAPT] hybrid scheduler seed values loaded from the profile: "
+                  "%s%s (used if this run selects hybrid)\n", c, g);
+    vlog(V_VERBOSE, opt, b);
+  }
 #endif   // !_WIN32
 #endif   // HAVE_NVCOMP — GPU-specific priors end here
 
@@ -48263,9 +48833,14 @@ static void apply_backend_defaults(Options & opt)
               && cur_thr <= prior_dir.rd_ctx_threads * 2));
       if (seed > 0 && ctx_ok)
         g_adapt_rd_prior.store((int)std::min(seed, 4096.0), std::memory_order_relaxed);
-      else if (seed > 0 && opt.verbosity >= V_DEBUG)
-        vlog(V_DEBUG, opt, "[ADAPT] reader seed declined: recorded under a "
-                           "different chunk size or thread count\n");
+      else if (seed > 0 && opt.verbosity >= V_VERBOSE) {
+        // -v since v0.18.14 (a decision, with the evidence that settled it).
+        char b[224];
+        std::snprintf(b, sizeof b, "[ADAPT] reader seed declined: the profile's %.0f readers were "
+                      "settled at %.0f MiB chunks and %.0f threads; this run has %d and %d\n",
+                      seed, prior_dir.rd_ctx_chunk_mib, prior_dir.rd_ctx_threads, cur_chunk, cur_thr);
+        vlog(V_VERBOSE, opt, b);
+      }
     }
   }
 
@@ -48391,8 +48966,13 @@ static void apply_backend_defaults(Options & opt)
   // re-pay the probe every run.  A positive (or absent) verdict leaves the
   // controller free to probe (and a positive typically re-keeps in one
   // window).  Latest-wins on record, so hardware changes can flip it back.
-  if (priors.loaded && prior_dir.writer_par < 0)
+  if (priors.loaded && prior_dir.writer_par < 0) {
     g_adapt_writer_probe_allowed.store(0, std::memory_order_relaxed);
+    if (opt.verbosity >= V_VERBOSE && !(opt.tar_mode && opt.mode == Mode::DECOMPRESS)
+        && !opt.list_mode)
+      vlog(V_VERBOSE, opt, "[ADAPT] writer probe off: the profile measured no gain from a "
+                           "second drain thread on this machine\n");
+  }
 
   // Extract writer-pool grow prior (M4 action 5c): -d --tar starts its pool at
   // the profile's settled tar_write_threads and always keeps probing upward from
@@ -48454,7 +49034,14 @@ static void apply_backend_defaults(Options & opt)
 #endif
   g_adapt_resid_class.store(resid_cls, std::memory_order_relaxed);
 
-  if (opt.backend_user_set) return;
+  if (opt.backend_user_set) {
+    if (opt.adapt && !opt.no_profile && !opt.list_mode && opt.verbosity >= V_VERBOSE)
+      vlog(V_VERBOSE, opt, std::string("[ADAPT] backend: set to ")
+           + (opt.cpu_only ? "--cpu-only" : opt.gpu_only ? "--gpu-only" : "--hybrid")
+           + " (given or implied by another flag), so the profile's backend prior is not "
+             "consulted\n");
+    return;
+  }
 
 #ifndef _WIN32
   // TOO SMALL TO PAY FOR A GPU AT ALL.
@@ -48777,6 +49364,33 @@ static void apply_backend_defaults(Options & opt)
         std::fprintf(stderr, "%s", line);
       }
       return;
+    }
+    // -v (ROADMAP 22): the prior looked and changed nothing -- say what it saw,
+    // or a profile that is not converging looks like one that was never read.
+    if (opt.verbosity >= V_VERBOSE && !opt.list_mode) {
+      const char * kb = key_note[0] ? key_note : "flat";
+      char b[352];
+      if (oc > 0 && oh > 0)
+        std::snprintf(b, sizeof b, "[ADAPT] backend prior (%s pair): cpu-only %.2f vs hybrid %.2f "
+                      "GiB/s, within 5%% -> the default (--hybrid)%s\n", kb, oc, oh,
+                      prior_dir.runs - std::min(oc_run, oh_run) >= ADAPT_BACKEND_RECHECK_RUNS
+                        ? "; a re-measure is due, but this input looks too short to record one" : "");
+      else if (oh > 0 && !explorable)
+        std::snprintf(b, sizeof b, "[ADAPT] backend prior (%s pair): hybrid %.2f GiB/s, cpu-only "
+                      "untried; this input looks too short to record a cpu-only probe -> the "
+                      "default (--hybrid)\n", kb, oh);
+      else if (oh > 0)
+        std::snprintf(b, sizeof b, "[ADAPT] backend prior (%s pair): hybrid %.2f GiB/s; a cpu-only "
+                      "probe at run %.0f left no rate, next try at run %.0f -> the default "
+                      "(--hybrid)\n", kb, oh, oc_run, oc_run + ADAPT_BACKEND_RECHECK_RUNS);
+      else if (oc > 0)
+        std::snprintf(b, sizeof b, "[ADAPT] backend prior (%s pair): cpu-only %.2f GiB/s, hybrid "
+                      "untried -> the default (--hybrid)%s\n", kb, oc,
+                      explorable ? " may measure it" : "; this input looks too short to record it");
+      else
+        std::snprintf(b, sizeof b, "[ADAPT] backend prior (%s pair): nothing measured end-to-end "
+                      "yet -> the default (--hybrid)\n", kb);
+      vlog(V_VERBOSE, opt, b);
     }
   }
 #endif
@@ -50870,7 +51484,10 @@ static Options parse_args(int argc, char ** argv)
   if (!any_stdout_dest && !opt.output_named)
     for (const std::string & in : opt.inputs)
       if (in == "-") { any_stdout_dest = true; break; }
-  if (opt.mode == Mode::COMPRESS && any_stdout_dest && !opt.force && is_stdout_tty())
+  // --calibrate writes nothing to stdout: without a FILE it parses as stdin ->
+  // stdout, and until v0.18.14 this refused `gzstd --calibrate` in a terminal.
+  if (opt.mode == Mode::COMPRESS && any_stdout_dest && !opt.force && !opt.calibrate
+      && is_stdout_tty())
     die_usage("refusing to write compressed data to the terminal "
               "(use -o FILE, redirect stdout, or -f to force)");
 

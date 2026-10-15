@@ -1,12 +1,182 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.13  
+**Covers:** v0.9.50 → v0.18.14  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.14 — --calibrate and --adapt show their work; `gzstd --calibrate` runs in a terminal again; the profile records the real driver version
+
+**The ask (owner, 2026-10-15, ROADMAP 22).** `--calibrate` "should reflect the tests it's working on
+and the findings it's coming to", in colour; and `--adapt` "on -v, -vv, -vvv should get more and more
+chatty about its adaptations".
+
+### --calibrate
+
+- **Each step says what it is measuring as it starts.** In a log (stderr not a terminal) that is a
+  permanent line, so a calibration that stalls still says where. On a terminal it is a status line,
+  redrawn every 250 ms with how far the step has got and for how long, and replaced by the next step
+  or result row. The ticker reads the pass's own Meter. Decompress counts output against the corpus it
+  must rebuild. Compress counts finished frames, because its mmap reader reaches the end almost at
+  once, so bytes read would say 100% with the work still to do. A GPU pass shows "waiting for the
+  GPUs" until its first frame, and "finishing" between its last frame and its return (a GPU's exit).
+- **The GPU device-count children report their progress.** Each child already sent its sample back
+  through a pipe at exit. It now also sends `prog DONE TOTAL` (frames) every 250 ms from its progress
+  thread, and the parent polls the pipe so the status line moves through cuInit too ("starting 4
+  GPUs, 1.3 s", then "65% of 2.7 GiB", then "finishing").
+- **Result rows say what they measured over**, e.g. `cpu compress   10.64 GiB/s  (4.00 GiB in 0.38 s)`.
+  The row prefixes are unchanged (the suite and scripts match them).
+- **It ends with its findings, then what `--adapt` does with them.** The second half reads the
+  profile back after the save, so it states what the next run starts from, earlier runs included:
+  - the engine rates seed the hybrid scheduler's estimates;
+  - the end-to-end rates predict how long an input will take (whether a run may try another read path);
+  - the backend is NOT chosen from these rates, but from end-to-end runs of 4 s or more; for each
+    direction it gives the saved flat pair and the backend that pair favors, or what is still untried;
+  - with two or more GPUs, the device count `gpuc_choose` picks for a one-file `--gpu-only` compress
+    at 1, 10 and 100 GiB, with its reason ("exploring 8 (never measured)", or the predicted time);
+  - a sink rate is recorded, but no `--adapt` decision reads it yet (said so).
+
+  A CPU-only build prints only what applies to it: no GPU column, scheduler or backend lines.
+- **Colour** comes from vlog()'s painter, now split out (`vlog_paint`) so a status line can use it
+  without a newline: `[CALIBRATE]` in bold cyan, `[ADAPT]` now bold green, numbers highlighted. It
+  appears only when stderr is a terminal, as for every vlog line, so a redirected log stays plain.
+
+Rates measured on the 8-GPU server (4 idle cards visible, `--calibrate FILE` on a 2.7 GiB
+file), shown below with the current summary wording:
+
+```
+[CALIBRATE] findings:
+[CALIBRATE]   compress    cpu  10.64 GiB/s   gpu   4.91 GiB/s   (gpu/cpu 0.46x)
+[CALIBRATE]   decompress  cpu  22.12 GiB/s   gpu   1.32 GiB/s   (gpu/cpu 0.06x)
+[CALIBRATE] what --adapt does with them:
+[CALIBRATE]   engine rates: saved CPU/GPU rates, where available, seed the hybrid scheduler; live measurements then correct them
+[CALIBRATE]   end-to-end rates: predict how long an input will take, which decides whether a run is long enough to try another read path
+[CALIBRATE]   backend: the saved flat pair below comes from end-to-end runs of 4 s or more, not from these engine rates
+[CALIBRATE]     compress:   nothing measured yet -> --hybrid (the default)
+[CALIBRATE]     decompress: nothing measured yet -> --hybrid (the default)
+[CALIBRATE]     (a run may use a residency pair, scale the CPU rate for available cores, or re-probe the staler side after 20 runs if the input is long enough)
+[CALIBRATE]   GPU devices for a one-file --gpu-only compress (other GPU modes use all visible devices when engaged, unless a count is set):
+[CALIBRATE]         1 GiB -> 1 of 4  (predicted 2.0 s for 1.0 GiB (overhead 1.6 s, 2.5 GiB/s))
+[CALIBRATE]        10 GiB -> 2 of 4  (predicted 4.0 s for 10.0 GiB (overhead 1.9 s, 4.7 GiB/s))
+[CALIBRATE]       100 GiB -> 4 of 4  (predicted 18.0 s for 100.0 GiB (overhead 2.5 s, 6.4 GiB/s))
+```
+
+### --adapt: one tiering for every [ADAPT] line
+
+-v: each decision and the evidence that settled it. -vv: also each threshold crossed or state
+changed. -vvv: also every tick or sample. Every site was audited against that before any was
+changed. Kept as they were: the decision lines already at -v that carry their evidence (probe
+verdicts with both rates, the GPU count with its reason, the read-path priors with their rates, the
+deadline demotes, the extract pool sizes, the end-of-run summary), the fingerprint at -vv, and the
+v0.18.13 pipe gate, which was the model. Changed:
+
+| line | was | now |
+|---|---|---|
+| `regime: A -> B` | -v, time only | -v, plus the comparison that classified it (`sink busy 62% >= 55%`; `neither: sink busy 12% < 55%, reader busy 40% (source-bound needs 85% with <= 5% blocked)`; `forced by GZSTD_DEBUG_ADAPT_REGIME`) |
+| a regime candidate begins / is dropped before its 5 ticks | silent | -vv |
+| every governor tick: sink busy, reader busy and blocked, io share, sink GiB/s, what it classified as | silent | -vvv |
+| `sink-bound: probing +1 parallel writer` / `+N extract writers` | -v | -v, plus the sink busy share and rate it started from, and the +10% bar |
+| `throttle budget +N frames` | -v at every step | -v the first step, -vv the rest, with step number and ceiling |
+| reader pool: each probe, keep, revert, undo | only with `GZSTD_DEBUG_RD_CTL` (`[RD-CTL]` lines) | -vv as `[ADAPT] reader pool:` lines (the variable still forces them) |
+| reader pool: every 250 ms window | silent | -vvv |
+| `[TAR] reader pool: started..., settled...` | -v | -v, tagged `[ADAPT] tar reader pool` (an --adapt decision) |
+| `reader seed declined` | -vv, no numbers | -v, with the recorded and current chunk size and thread count |
+| `profile updated (direction, regime X)` | -v | -v, plus what was FILED: the end-to-end rate and the backend it was filed under, "under 4 s: not filed in the backend pair", a probe stamped as tried, and the GPU device counts recorded |
+| a run that did not update the profile | silent | -v: `--no-profile`, a failed exit, a run under the 3 s floor (with its duration), or a skipped input |
+| no profile entry for this machine yet | silent | -v, with the path |
+| hybrid scheduler seeded from the profile | silent | -v, with the rates |
+| writer probe turned off by the profile's negative verdict | silent | -v |
+| an explicit backend, so the backend prior is not consulted | silent | -v |
+| the backend prior looked and changed nothing (within 5%; one side untried; a probe held off until run N; too short to record a probe; nothing measured) | silent | -v, with the pair it saw |
+
+The default-verbosity `gzstd: profile prior (...)` line, which reports a backend the prior changed,
+stays at the default level.
+
+Left as they are, and why:
+- **The governor's reader scale-up request (M4 action 3) has had no consumer since v0.15.44.**
+  `adapt_request_reader_scaleup` sets a flag and notifies a condition variable that no thread reads or
+  waits on; `ReaderPoolCtl` replaced it and reads the published regime itself. The summary's
+  `reader-scaleup` action comes from the pool controller. Printing the request would announce an
+  action that does nothing, so it prints nothing; removing the dead code is the owner's call.
+- **The ranked dispatcher's per-device decline streak** is not at -vv: it is re-evaluated every
+  100 ms per device and restarts on any tick that does not decline. Its -v quiesce line carries both
+  rates.
+
+### Found on the way (pre-existing)
+
+- **`gzstd --calibrate` refused to run in a terminal.** Without FILE it parses as stdin -> stdout, and
+  the guard against writing compressed data to a terminal (v0.14.1) then exits 2: "refusing to write
+  compressed data to the terminal". `--calibrate` writes nothing to stdout. The published v0.18.9 does
+  the same. `--calibrate FILE` and `--calibrate -o TARGET` were not affected (neither is stdout). The
+  guard now skips `--calibrate`.
+- **Every profile on a host with NVIDIA's open kernel module recorded driver "for".** The procfs
+  fingerprint (v0.15.27) took the token after "Kernel Module". The proprietary module's line is
+  `NVIDIA UNIX x86_64 Kernel Module  570.207`; the open one's is
+  `NVIDIA UNIX Open Kernel Module for x86_64  595.91.07`. So on the 8-GPU server, since its move to
+  the 595 open driver (2026-09-30), a driver upgrade could never clear the GPU-derived priors (batch
+  sizes, GPU rates, the device-count model). It now takes the first token after "Kernel Module" that
+  starts with a digit and has a dot. The fingerprint hash does not include the driver, so profiles
+  keep their entries. The first `--adapt` run of this build on such a host says
+  `GPU driver changed (for -> 595.91.07); clearing GPU-derived priors` once, and relearns them.
+- **`--calibrate` said "profile recorded" after a save that had warned it could not write**
+  (read-only cache directory, lock failure). Every failed save now sets a flag; the line says
+  "measured, but NOT recorded: the profile could not be written".
+
+### Tests
+
+Four default cells, 530 -> 534 (`--extensive` 828 -> 832); the no-GPU deltas become 146 and 212.
+- "--adapt tiers its lines": a forced regime at -v, -vv and -vvv, with the mmap reader held at
+  `GZSTD_DEBUG_MMAP_GATE` for 350 ms so every run spans governor ticks on any host. -v must carry the
+  transition with its evidence, -v and -vv no tick line, -vvv a tick line. (`-T2`: a `-T1` compress
+  does not use the mmap reader, so it never reaches the gate.)
+- "--adapt -v says why a run left the profile alone, and what a save filed": an unreachable save
+  floor (the test hook) gives "profile not updated", a zero floor gives "profile updated (...filed...)".
+- "--calibrate announces each step and ends with its findings; colour only on a terminal": a log run
+  (step lines for both phases of both CPU directions, findings, no escape codes) and a `script` pty
+  run (colour, a status line rather than the log's permanent one, findings). The pty run is also the
+  regression check for `gzstd --calibrate` in a terminal.
+- "the --adapt fingerprint names the loaded driver's version" (nvCOMP build with an NVIDIA module):
+  the fingerprint's driver against `/sys/module/nvidia/version`, a source the parser does not read.
+
+Each cell was seen to fail. Nine mutants, each built and run: the tick printed at -vv, the transition
+without its evidence, colour in a log, never a terminal, the terminal guard restored, no "not
+updated" line, the old "profile updated" text, the timed step line removed (CPU-only build), and the
+"for" driver parse (GPU build). Each failed its own cell and no other.
+
+### Review (Codex, GPT-6-Sol at high)
+
+- **Round 1: NOT SAFE TO COMMIT, five findings, all real.**
+  - A pass that threw with the status ticker running would destroy a joinable thread (std::terminate
+    instead of the exit-1 handler). A guard now joins it on every exit.
+  - Pipeline warnings could land on the status line. `vlog_emit` and the status line now share one
+    lock, and so does `die()`, so neither is drawn over.
+  - A timed pass was never announced in a log, so a run stalled there still said "warm-up". Now
+    each timed pass has a step line, and a pass that measured nothing prints NOT MEASURED, not 0.00.
+  - Over-claiming wording: the calibrate summary stated the flat pair as the next run's choice; the
+    seed line printed before a prior could pick cpu-only; a fault save said "rates unchanged" though a
+    driver change can clear old GPU rates in the same save. And the reader pool's "undone" line printed
+    the reverted count on both sides of its arrow.
+  - Two cells depended on host speed. The save cell now uses the floor hook. The tick cell now holds
+    the reader at a FIFO gate. Its version used `-T1`, which never reaches that gate: found by running
+    it, fixed to `-T2`.
+
+  Not taken: its fingerprint cell derived the expected version from the same procfs line with an awk
+  copy of the fixed parser, a test that cannot catch a misreading of that line. Kept
+  `/sys/module/nvidia/version`; it found no case where the two differ.
+- **Round 2: SAFE TO COMMIT, no findings.** It audited its own round-1 lock: nothing takes it while
+  holding it, the signal handler does not log, and `die()` releases it before printing. It also
+  checked the ticker's lifetime on the CPU-only early return and on unwinding.
+
+### Suites (2026-10-15, the 8-GPU server, final code; shared: another user's job on one card, and a
+short `--calibrate` demonstration on two other cards during the GPU run)
+
+- GPU build, default: 533 passed, 0 failed, 1 skipped of 534, 11m35s, "as expected on this host".
+  The skip is the usual "no trivial batch reached a GPU".
+- CPU-only build (warning-free), default: 388 passed, 0 failed, 1m51s, "as expected" (534 - 146).
+- `--extensive` not run (owner's call: `parse_args` is untouched).
 
 ## v0.18.13 — --adapt starts a pipe's GPUs only when the CPUs fall behind, and a hybrid decompress no longer loses frames a GPU hands back
 
