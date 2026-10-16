@@ -1,9 +1,43 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.16  
+**Covers:** v0.9.50 → v0.18.17  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+
+## v0.18.17 — the governor's unused reader scale-up request is removed
+
+The owner's ruling recorded in v0.18.14 (2026-10-15): remove M4 action 3's governor-side request in
+its own small change.
+
+v0.15.5 grew the decompress read-ahead reader on a rule: extra threads parked on a condition
+variable, and the governor woke them once per run when it classified the run source-bound with more
+than half of the readers' time in pread.  Measured sizing arrived for the compress reader in
+v0.15.44; the shared `ReaderPoolCtl` replaced the decompress rule in v0.15.46 and reached
+`--tar` create in v0.15.47.  It steps, measures, and keeps only a gain in either direction,
+because source-bound covers both a copy-bound reader that wants more threads and a saturated
+device that wants fewer; a cold compress is classified source-bound for most of its run, where
+growing loses.  The request stayed: the first qualifying tick (or the forced-regime hook) still
+latched its flag and notified the variable, and the decompress reader's teardown still set a
+`readers_done` flag under the variable's mutex and notified it.  Nothing waited on the variable or
+read either flag.
+
+- **Removed:** the flag, the condition variable and its mutex, `adapt_request_reader_scaleup` and
+  its two governor call sites (the tick and the forced-regime hook), the teardown notify,
+  `readers_done`, and `active_readers` -- the look-ahead bound of a decompress reader pool that does
+  not resize, which only the old wake ever raised, so it was always the starting count; the count is
+  now used directly.
+- **Kept:** `ADAPT_ACT_READER_SCALEUP`, which `ReaderPoolCtl` sets (the summary's
+  `reader-pool(resized)`), and the readers' io share, still on the -vvv tick line.
+- **No behaviour change:** output, exit codes, the profile and every reader pool's sizing take
+  the same paths as in v0.18.16.
+- **Text corrected:** `--help` for `--adapt` said source-bound "wakes dormant prefetch readers",
+  untrue since v0.15.46; it now says each reader pool tries a larger or smaller size, kept only on a
+  measured gain.  ROADMAP: the tar-create reader scale-up note is closed (done in v0.15.47), and
+  ROADMAP 22's leftover is marked done.
 
 ---
 
@@ -155,7 +189,7 @@ pages for the CPU probe pool, a performance choice the suite cannot judge (measu
 
 ## v0.18.15 — a cold compress's read-probe remainder sizes its readers; a reader that does not resize stops publishing the profile's count
 
-**The question (owner, 2026-10-15):** with the governor's reader scale-up request dead since v0.15.44,
+**The question (owner, 2026-10-15):** with the governor's reader scale-up request dead since v0.15.46,
 does gzstd still add readers when they cannot keep the compressors fed?  Mostly yes: `ReaderPoolCtl`
 replaced that request and reads the published regime itself (when source-bound it steps, measures and
 keeps only a gain).  But it was missing from exactly the run it matters most for.
@@ -369,11 +403,12 @@ The default-verbosity `gzstd: profile prior (...)` line, which reports a backend
 stays at the default level.
 
 Left as they are, and why:
-- **The governor's reader scale-up request (M4 action 3) has had no consumer since v0.15.44.**
-  `adapt_request_reader_scaleup` sets a flag and notifies a condition variable that no thread reads or
-  waits on; `ReaderPoolCtl` replaced it and reads the published regime itself. The summary's
-  `reader-scaleup` action comes from the pool controller. Printing the request would announce an
-  action that does nothing, so it prints nothing; removing the dead code is the owner's call.
+- **At v0.18.14, the governor's reader scale-up request (M4 action 3) had had no consumer since
+  v0.15.46.** `adapt_request_reader_scaleup` set a flag and notified a condition variable that no
+  thread read or waited on; `ReaderPoolCtl` had replaced it and read the published regime itself.
+  The summary's reader-pool action came from the controller. Reporting the request would have
+  announced an action that did nothing, so it printed nothing. The dead request was removed in
+  v0.18.17.
 - **The ranked dispatcher's per-device decline streak** is not at -vv: it is re-evaluated every
   100 ms per device and restarts on any tick that does not decline. Its -v quiesce line carries both
   rates.

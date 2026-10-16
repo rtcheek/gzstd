@@ -8063,7 +8063,7 @@ section "--adapt governor actions: source-bound batch hold"
 
 # 1. A forced regime publishes and prints the transition line (no GPU needed).
 # compute-bound: the one regime with no cpu-only action attached (sink-bound
-# would grow the throttle since v0.15.6, source-bound wakes readers).
+# grows the throttle since v0.15.6; source-bound lets the reader pools step).
 env GZSTD_DEBUG_ADAPT_REGIME=compute-bound "$GZSTD" --adapt --no-profile -v --cpu-only \
   -k -f "$TMPDIR/large.bin" -o "$TMPDIR/alat.zst" 2>"$TMPDIR/alat1.err"
 if grep -q '\[ADAPT\] regime: warmup -> compute-bound' "$TMPDIR/alat1.err"; then

@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.16";
+static constexpr const char * GZSTD_VERSION = "0.18.17";
 //
 // Architecture overview:
 //
@@ -4699,7 +4699,8 @@ static void print_help_long()
 "     reader-pool step and its verdict); -vvv also every 100 ms sample.\n"
 "     The regimes drive actions, each\n"
 "     latched and reported in the summary's action list: source-bound\n"
-"     freezes GPU batch growth and wakes dormant prefetch readers;\n"
+"     freezes GPU batch growth and lets each reader pool try a larger or\n"
+"     smaller size (kept only on a measured gain);\n"
 "     sink-bound grows the in-flight budget on bursty output and probes\n"
 "     +1 parallel O_DIRECT drain thread (kept only on a measured >= 10%\n"
 "     gain); every engine (the CPU pool, each GPU device) is ranked by\n"
@@ -6578,7 +6579,7 @@ static std::atomic<int>  g_adapt_rd_ctx_chunk{0};   // geometry the settled coun
 static std::atomic<int>  g_adapt_rd_ctx_threads{0};
 static std::atomic<int>  g_adapt_rd_settled{0};
 static std::atomic<int>  g_adapt_rd_prior{0};
-// Leaked, never destroyed, like g_adapt_scale_cv: the Extractor's supervisor
+// Leaked, never destroyed: the Extractor's supervisor
 // waits on this CV for the WHOLE extraction, so when any thread dies (die ->
 // std::exit) it is parked here, and std::exit runs static destructors.
 // glibc's pthread_cond_destroy blocks until every waiter has left -- this one
@@ -6846,28 +6847,10 @@ static void adapt_esc_notify_all() {
 // start.
 static std::atomic<bool> g_adapt_sink_grow_tick{false};
 
-// Reader scale-up signal (M4 action 3).  Dormant prefetch threads park on
-// this CV; the governor raises the flag when SOURCE_BOUND with the io state
-// dominating the reader's split.  One-way per operation, reset at governor
-// start.  Flag writes happen under the mutex (and are re-checked under it by
-// every waiter) so a waiter between its predicate check and its wait cannot
-// miss the only notification that will come — the v0.15.4 MAJOR-1 lesson.
-// Deliberately leaked (references to heap objects): die()/std::exit can run
-// while dormant readers are still parked here, and destroying a CV with
-// waiters is UB — a leaked object is never destroyed.
-static std::mutex              & g_adapt_scale_mtx = *new std::mutex;
-static std::condition_variable & g_adapt_scale_cv  = *new std::condition_variable;
-static std::atomic<bool>        g_adapt_reader_scaleup{false};
-
-static void adapt_request_reader_scaleup()
-{
-  {
-    std::lock_guard<std::mutex> lk(g_adapt_scale_mtx);
-    if (g_adapt_reader_scaleup.exchange(true, std::memory_order_relaxed))
-      return;   // already requested this run
-  }
-  g_adapt_scale_cv.notify_all();
-}
+// M4 action 3 (reader scale-up) has no governor-side signal.  The decompress
+// reader adopted ReaderPoolCtl in v0.15.46; --tar create followed in v0.15.47.
+// Each controller reads the published regime and keeps only a measured gain;
+// the governor's grow request, unused after v0.15.46, was removed in v0.18.17.
 
 // Defined far below; forward-declared so the writer-grow probe (action 5c) can
 // size its round cap to the machine's usable thread count.
@@ -6901,7 +6884,6 @@ public:
     t_start_ = std::chrono::steady_clock::now();
     g_adapt_regime.store(0, std::memory_order_relaxed);
     g_adapt_action_flags.store(0, std::memory_order_relaxed);
-    g_adapt_reader_scaleup.store(false, std::memory_order_relaxed);
     g_adapt_sink_grow_tick.store(false, std::memory_order_relaxed);
     g_adapt_writer_probe.store(0, std::memory_order_relaxed);
     g_adapt_writer_probe_verdict.store(0, std::memory_order_relaxed);
@@ -6921,11 +6903,9 @@ public:
     g_adapt_deadline_escalate.store(0, std::memory_order_relaxed);
     snap_baseline_();
     // Forced regime (test hook) publishes before any worker runs, so even
-    // sub-tick operations exercise the acting paths.  A forced source-bound
-    // also asserts the io-dominance gate (the hook forces the whole verdict).
+    // sub-tick operations exercise the acting paths.
     if (forced_ != AdaptRegime::WARMUP) {
       transition_(forced_, now_ns_());
-      if (forced_ == AdaptRegime::SOURCE_BOUND) adapt_request_reader_scaleup();
       if (forced_ == AdaptRegime::SINK_BOUND) {
         g_adapt_sink_grow_tick.store(true, std::memory_order_relaxed);
         // The forced hook also raises the SINK_BOUND writer actuator so short
@@ -7217,9 +7197,9 @@ private:
       const double rbusy     = double((cur.rio - prev_.rio) + (cur.rparse - prev_.rparse)
                                       + (cur.rcopy - prev_.rcopy)) / (dt * rthreads);
       const double rblocked  = double(cur.rblocked - prev_.rblocked) / (dt * rthreads);
-      // io share WITHIN the reader's own time: the scale-up gate.  More
-      // prefetch threads only help when the reader's time is spent in
-      // pread, not in the per-frame copy (which sits on one consumer).
+      // io share WITHIN the reader's own time, reported on the -vvv tick
+      // line.  It was the gate of the governor's reader grow request
+      // (removed v0.18.17); ReaderPoolCtl measures instead of gating on it.
       const double d_io  = double(cur.rio - prev_.rio);
       const double d_all = d_io + double(cur.rparse - prev_.rparse)
                          + double(cur.rcopy - prev_.rcopy)
@@ -7291,12 +7271,6 @@ private:
     // just misfile 0.5 s of a classified regime under warmup).
     if (regime_ == AdaptRegime::WARMUP && observed != AdaptRegime::WARMUP)
       transition_(observed, t);
-
-    // M4 action 3: SOURCE_BOUND with io dominating the reader's split —
-    // more prefetch threads can help; wake any dormant readers.  The
-    // request latches one-way per run (see adapt_request_reader_scaleup).
-    if (regime_ == AdaptRegime::SOURCE_BOUND && last_io_frac_ >= 0.5)
-      adapt_request_reader_scaleup();
 
     // M4 action 4: bursty SINK_BOUND — request one bounded throttle-budget
     // grow step; the operation's FrameThrottle consumes it on its next
@@ -19650,8 +19624,8 @@ static size_t stream_frames_to_queue_mt(
 
   // --adapt reader scale-up (M4 action 3): size the slot ring for the CAP up
   // front — the modulo geometry is frozen at spawn, so a late-woken reader
-  // must find the ring already sized for it.  Extra readers park dormant on
-  // the adapt CV (no polling) until the governor calls for them.  Never
+  // must find the ring already sized for it.  Readers above the controller's
+  // current size park in ReaderPoolCtl (no polling) until it steps up.  Never
   // scales past a user-pinned --read-threads.  The O_DIRECT decompress pool is
   // now parallel, but remains fixed-size until its scaling policy is measured.
   const bool can_scale = opt.adapt && opt.read_threads == 0 && !opt.direct_read;
@@ -19793,7 +19767,6 @@ static size_t stream_frames_to_queue_mt(
   std::mutex mtx;
   std::condition_variable cv_filled, cv_freed;
   size_t consumed = 0;                 // blocks < consumed are free for reuse
-  std::atomic<int> active_readers{n_readers};   // grows when dormant readers wake
   std::atomic<size_t> next_block{0};
   std::atomic<bool> failed{false};
   std::string fail_msg;
@@ -19826,12 +19799,10 @@ static size_t stream_frames_to_queue_mt(
         // Free once the consumer passed the slot's previous tenant (ring
         // safety: never beyond n_slots ahead), AND stay within the active
         // pool's look-ahead (2x active readers) so an un-scaled run doesn't
-        // buffer — or lazily allocate — the dormant capacity.
+        // buffer — or lazily allocate — the parked capacity.
         cv_freed.wait(lk, [&]{
           const size_t ahead = std::min((size_t)n_slots,
-              (size_t)(2 * std::max(1, can_scale
-                                       ? rd_ctl.want()
-                                       : active_readers.load(std::memory_order_relaxed))));
+              (size_t)(2 * std::max(1, can_scale ? rd_ctl.want() : n_readers)));
           return stop || consumed + ahead > i; });
         if (stop) return;
       }
@@ -19956,7 +19927,6 @@ static size_t stream_frames_to_queue_mt(
   // that grew the pool once, by at most 2x, on a SOURCE_BOUND verdict — and
   // SOURCE_BOUND does not say which way to move (it covers both a copy-bound
   // reader that wants more threads and a saturated device that wants fewer).
-  std::atomic<bool> readers_done{false};
   std::vector<std::thread> readers;
   readers.reserve((size_t)cap);
   // Supervisor runs alongside; the MAIN thread must fall through to the consumer
@@ -20253,11 +20223,6 @@ static size_t stream_frames_to_queue_mt(
       double(zc_wait_ns) / 1e9);
     vlog(V_VERBOSE, opt, zb);
   }
-  {
-    std::lock_guard<std::mutex> lk(g_adapt_scale_mtx);
-    readers_done.store(true, std::memory_order_relaxed);
-  }
-  g_adapt_scale_cv.notify_all();
   readers_done_early.store(true, std::memory_order_relaxed);
   rd_ctl.stop();                       // releases parked readers and the supervisor
   cv_freed.notify_all(); cv_filled.notify_all();

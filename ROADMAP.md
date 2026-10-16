@@ -342,8 +342,8 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    --adapt does with them, and colours through vlog's painter; every [ADAPT] line follows the
    -v / -vv / -vvv tiering, and six decisions that printed nothing now say so at -v.  Owner's
    rulings (2026-10-15), both for a later version: the governor's reader scale-up request (M4
-   action 3) has had no consumer since v0.15.44 -- leave it for now, remove it in its own small
-   reviewed change; NO_COLOR -- honour it everywhere at once (vlog, --calibrate AND the progress
+   action 3) has had no consumer since v0.15.46 -- leave it for now, remove it in its own small
+   reviewed change (DONE v0.18.17); NO_COLOR -- honour it everywhere at once (vlog, --calibrate AND the progress
    bar, which colours unconditionally), not for vlog alone (DONE v0.18.16, with `--no-color`).  The original text:  --calibrate prints each
    result when a step finishes, but never announces a step before it starts: during each GPU
    device-count child (up to 4 GiB of compression apiece) the screen is silent, and the findings
@@ -1772,7 +1772,10 @@ documented deferral during M4):
   7.5 GiB/s on 22 CPU decoders and never engaged the GPU decoders, which is correct by design.
   The pool's GPU path did run on Turing in the suite, forced by `GZSTD_DEBUG_POOL_GPU_FIRST`.
   Still owed: a host with roughly 8 cores or fewer and a GPU.
-- **Tar-create member-reader scale-up:** the v0.15.5 dormant-reader
+- ~~**Tar-create member-reader scale-up.**~~ DONE v0.15.47: `ReaderPoolCtl` sizes the tar-create
+  member readers as it does the compress and decompress readers (step, measure, keep only a gain).
+  The v0.15.5 dormant-reader wake this note planned to extend was retired in v0.15.46 and its
+  leftover removed in v0.18.17.  The original note: the v0.15.5 dormant-reader
   mechanism covers only the plain-decompress prefetch pool; the tar-create
   member readers (`--read-threads`, device-bound per the v0.14.x
   measurements) are the same shape — dormant threads + the source-bound
