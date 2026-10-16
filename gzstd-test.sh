@@ -448,6 +448,9 @@ export GZSTD_DEBUG_HOOKS_ACK=1
 # the GPU everywhere and the GPU paths would stop being covered.  0 = always
 # engage.  The dedicated tests below set both hooks explicitly.
 export GZSTD_DEBUG_GPU_GUARD_SEC=0
+# NO_COLOR turns gzstd's colour off (v0.18.16); the cells that expect colour on a
+# terminal must not depend on the caller's shell.  The colour cell sets it itself.
+unset NO_COLOR
 # The caller's zstd environment must not reach the runs: gzstd reads
 # ZSTD_NBTHREADS for its compression thread count (v0.18.12), and the zstd the
 # byte-identical cells compare against reads it and ZSTD_CLEVEL.  The cell that
@@ -619,8 +622,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=536
-$EXTENSIVE && EXPECTED_TESTS=834
+EXPECTED_TESTS=539
+$EXTENSIVE && EXPECTED_TESTS=837
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -665,6 +668,11 @@ $EXTENSIVE && EXPECTED_TESTS=834
 # controller (both producers; the GPU arm runs inside the cell when there is a
 # GPU), and an O_DIRECT reader publishes its own count, not the profile's seed.
 # Both run on every build: 534 -> 536, 832 -> 834; no-GPU deltas unchanged.
+# v0.18.16: +3 default -- the read probe leaves first touch out of its rates (both
+# producers, the GPU arm inside the cell), after a read probe the [READER] line
+# divides by the readers it had, and colour only on a terminal, never with
+# --no-color or NO_COLOR.  All run on every build: 536 -> 539, 834 -> 837; no-GPU
+# deltas unchanged.
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -7048,6 +7056,46 @@ else
 fi
 rm -f "$TMPDIR/ultra-prog.zst"
 
+# --- Colour only on a terminal, and never with --no-color or NO_COLOR (v0.18.16) ---
+# Every colour on stderr goes through one decision: the progress bar and the
+# end-of-run summary lines used to colour unconditionally (into a log file too),
+# and NO_COLOR was honoured nowhere.  A non-empty NO_COLOR turns it off whatever
+# its value; an empty one does not (no-color.org).  Cursor control (\r, \033[K)
+# is not colour.  Counts SGR sequences (ESC [ ... m) only.
+nc_sgr() { grep -ao $'\033\[[0-9;]*m' "$1" | wc -l; }
+nc_why=""
+# The log run is slowed (-19, one thread: ~0.5 s) so the progress bar draws, and
+# that it drew is checked: a bar that never ticked would prove nothing about it.
+"$GZSTD" -k -f --cpu-only -T1 -19 -v --progress "$TMPDIR/medium.txt" -o "$TMPDIR/nc.zst" \
+  2>"$TMPDIR/nc-log.err"
+[[ $(nc_sgr "$TMPDIR/nc-log.err") -eq 0 ]] || nc_why+=" [log: $(nc_sgr "$TMPDIR/nc-log.err") colour codes]"
+grep -aq 'medium.txt : ' "$TMPDIR/nc-log.err" || nc_why+=" [log: no summary line]"
+tr '\r' '\n' < "$TMPDIR/nc-log.err" | grep -aq '^in:' || nc_why+=" [log: the progress bar never drew]"
+if command -v script >/dev/null 2>&1; then
+  for nc_case in plain flag env empty; do
+    nc_pre=""; nc_fl=""
+    case $nc_case in flag) nc_fl="--no-color";; env) nc_pre="NO_COLOR=1";; empty) nc_pre="NO_COLOR=";; esac
+    script -qec "env $nc_pre $(printf %q "$GZSTD") -k -f --cpu-only -v $nc_fl $(printf %q "$TMPDIR/medium.txt") -o $(printf %q "$TMPDIR/nc.zst")" \
+      /dev/null > "$TMPDIR/nc-$nc_case.tty" 2>&1 < /dev/null || nc_why+=" [$nc_case: exit $?]"
+    n=$(nc_sgr "$TMPDIR/nc-$nc_case.tty")
+    sed $'s/\033\[[0-9;]*[mK]//g' "$TMPDIR/nc-$nc_case.tty" | grep -aq 'medium.txt : ' \
+      || nc_why+=" [$nc_case: no summary line]"
+    case $nc_case in
+      plain|empty) [[ $n -gt 0 ]] || nc_why+=" [$nc_case: no colour on a terminal]";;
+      flag|env)    [[ $n -eq 0 ]] || nc_why+=" [$nc_case: $n colour codes]";;
+    esac
+  done
+fi
+rm -f "$TMPDIR/nc.zst" "$TMPDIR/nc-log.err" "$TMPDIR"/nc-*.tty
+if [[ -n "$nc_why" ]]; then
+  fail "colour only on a terminal, never with --no-color or NO_COLOR" "$nc_why"
+elif ! command -v script >/dev/null 2>&1; then
+  skip_host "colour only on a terminal, never with --no-color or NO_COLOR" \
+    "script is unavailable; terminal colour cases not exercised"
+else
+  pass "colour only on a terminal, never with --no-color or NO_COLOR"
+fi
+
 # --- Interop: gzstd --ultra -22 output readable by stock zstd ---
 if command -v zstd &>/dev/null; then
   "$GZSTD" -k -f --cpu-only --ultra -22 \
@@ -8708,6 +8756,116 @@ else
 fi
 rm -rf "$TMPDIR/rsd.bin" "$TMPDIR/rsd_x" "$TMPDIR/rsd1.err" "$TMPDIR/rsd2.err" \
        "$TMPDIR/rsd3.err" "$TMPDIR/rpr.err"
+
+# 5. THE READ PROBE LEAVES FIRST TOUCH OUT OF ITS RATES (v0.18.16, ROADMAP 23).  A
+#    pool buffer no reader has had yet pays its page faults inside whichever timed
+#    pass draws it: the GPU producer's single O_DIRECT reader measured 3.56 GiB/s
+#    against 4.6 on mapped buffers, picked buffered, and O_DIRECT was faster end
+#    to end.  A timed pass now faults a fresh buffer in itself, times that apart,
+#    and the probe's rate is over reading time.  GZSTD_DEBUG_PROBE_TOUCH_MS adds 20
+#    ms to every first touch, so the two rates differ by far more than rounding.
+#    From the -vv O_DIRECT pass line: the touch was counted (>= 20 ms), the pass
+#    read for its full window (reading time >= 195 ms of the 200 ms target,
+#    unless the hard 512-chunk ceiling stopped it), and
+#    the -v rate the decision used is bytes over READING time, not wall time.
+#    Both producers, as cell 3; a host whose TMPDIR cannot take the probe skips.
+t0=$(now_ms); why=""; ran=0; missed=""
+for arm in cpu gpu; do
+  [[ $arm == gpu ]] && ! has_gpu 2>/dev/null && continue
+  fl=""; [[ $arm == cpu ]] && fl="--cpu-only"
+  rm -f "$TMPDIR/rft.bin"; truncate -s 4G "$TMPDIR/rft.bin"
+  env XDG_CACHE_HOME="$TMPDIR/rft_x" GZSTD_DEBUG_PROBE_TOUCH_MS=20 \
+    "$GZSTD" --no-profile $fl -vv -T24 --chunk-size 2 \
+    -c "$TMPDIR/rft.bin" > /dev/null 2> "$TMPDIR/rft.err"
+  rc=$?
+  pass_l=$(tr '\r' '\n' < "$TMPDIR/rft.err" | grep -ao '\[READ-PROBE\] O_DIRECT pass: .*' | head -1)
+  sum_l=$(tr '\r' '\n' < "$TMPDIR/rft.err" | grep -ao '\[READ-PROBE\] O_DIRECT [0-9.]* GiB/s vs.*' | head -1)
+  if [[ -z "$sum_l" ]]; then
+    missed+=" $arm:no-probe(exit-$rc)"
+    [[ $rc -eq 0 ]] || why+=" $arm:exit-$rc"
+    continue
+  fi
+  ran=$((ran+1))
+  [[ $rc -eq 0 ]] || why+=" $arm:exit-$rc"
+  [[ -n "$pass_l" ]] || { why+=" $arm:no-pass-line"; continue; }
+  verdict=$(awk -v p="$pass_l" -v s="$sum_l" 'BEGIN {
+    if (!match(p, /pass: [0-9]+ chunks/)) { print "unparsed-chunks"; exit }
+    split(substr(p, RSTART, RLENGTH), count, " "); chunks = count[2]
+    if (!match(p, /[0-9.]+ GiB in [0-9.]+ ms/)) { print "unparsed-pass"; exit }
+    split(substr(p, RSTART, RLENGTH), a, " "); gib = a[1]; ms = a[4]
+    if (!match(p, /[0-9.]+ ms of it first touch/)) { print "unparsed-touch"; exit }
+    split(substr(p, RSTART, RLENGTH), b, " "); tch = b[1]
+    if (!match(p, /-> [0-9.]+ GiB\/s/)) { print "unparsed-pass-rate"; exit }
+    split(substr(p, RSTART, RLENGTH), d, " "); pass_rate = d[2]
+    if (!match(s, /O_DIRECT [0-9.]+ GiB\/s/)) { print "unparsed-rate"; exit }
+    split(substr(s, RSTART, RLENGTH), c, " "); r = c[2]
+    if (tch < 20)  { printf "touch-not-counted(%.1fms)", tch; exit }
+    rd = ms - tch
+    if (rd <= 0) { print "nonpositive-reading-time"; exit }
+    want = gib / (rd / 1000.0)
+    if (rd < 195 && chunks < 512) {
+      printf "short-window(%.1fms-read, %d chunks)", rd, chunks; exit
+    }
+    # The pass line rounds GiB to 4 decimals, both times to 2 decimals, and
+    # its rate to 3 decimals.  Bound their combined error explicitly; the -v
+    # decision rate has only 2 decimals, so compare it to that raw rate.
+    low = (gib - 0.00005) / ((rd + 0.01) / 1000.0) - 0.0005
+    high = rd > 0.01 ? (gib + 0.00005) / ((rd - 0.01) / 1000.0) + 0.0005 : 1e100
+    if (pass_rate < low || pass_rate > high) {
+      printf "pass-rate-%.3f-not-over-reading-time(%.3f)", pass_rate, want; exit
+    }
+    if (r < pass_rate - 0.0056 || r > pass_rate + 0.0056) {
+      printf "rate-%.2f-not-pass-rate(%.3f)", r, pass_rate; exit
+    }
+    print "ok" }')
+  [[ "$verdict" == ok ]] || why+=" $arm:$verdict"
+done
+rm -rf "$TMPDIR/rft.bin" "$TMPDIR/rft_x" "$TMPDIR/rft.err"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+if (( ran == 0 )) && [[ -z "$why" ]]; then
+  skip_host "the read probe leaves first touch out of its rates" \
+    "no read probe here (rotational TMPDIR or no O_DIRECT)"
+elif [[ -z "$why$missed" ]]; then
+  pass "the read probe leaves first touch out of its rates"
+else
+  fail "the read probe leaves first touch out of its rates" "$why$missed"
+fi
+
+# 6. AFTER A READ PROBE, THE -v [READER] LINE DIVIDES BY THE READERS IT HAD
+#    (v0.18.16).  The probe runs 1 reader, then N, then the winner's count, and the
+#    line divided the whole run's reader time by the last pass's count: after an
+#    O_DIRECT pick it printed "io 115% ... 1 reader".  It now uses the passes'
+#    time-weighted count and says so when that differs from the last.  Reader time
+#    cannot exceed the reader-seconds the passes had, so io <= 100% (101 for
+#    rounding).  CPU producer only: the line and the accounting are shared code.
+rf_why=""
+rm -f "$TMPDIR/rfr.bin"; truncate -s 4G "$TMPDIR/rfr.bin"
+env XDG_CACHE_HOME="$TMPDIR/rfr_x" GZSTD_DEBUG_READ_PROBE_PICK=direct \
+  "$GZSTD" --no-profile --cpu-only -v -T24 --chunk-size 2 -c "$TMPDIR/rfr.bin" \
+  > /dev/null 2> "$TMPDIR/rfr.err"
+rf_rc=$?
+rf_line=$(tr '\r' '\n' < "$TMPDIR/rfr.err" | grep -ao '\[READER\] io [0-9.]*%.*run)' | head -1)
+if [[ $rf_rc -eq 0 ]] && ! grep -aq 'READ-PROBE.*-> O_DIRECT for the remainder' "$TMPDIR/rfr.err"; then
+  rm -rf "$TMPDIR/rfr.bin" "$TMPDIR/rfr_x" "$TMPDIR/rfr.err"
+  skip_host "after a read probe, the [READER] line divides by the readers it had" \
+    "no read probe here (rotational TMPDIR or no O_DIRECT)"
+else
+  [[ $rf_rc -eq 0 ]] || rf_why+=" [exit $rf_rc]"
+  [[ -n "$rf_line" ]] || rf_why+=" [no reader line]"
+  rf_io=$(sed -E 's/^\[READER\] io ([0-9.]+)%.*/\1/' <<<"$rf_line")
+  awk -v v="${rf_io:-999}" 'BEGIN { exit !(v <= 101.0) }' || rf_why+=" [io ${rf_io:-none}% over 100]"
+  rm -rf "$TMPDIR/rfr.bin" "$TMPDIR/rfr_x" "$TMPDIR/rfr.err"
+  if [[ -n "$rf_why" ]]; then
+    fail "after a read probe, the [READER] line divides by the readers it had" "$rf_why"
+  elif [[ "$rf_line" == *"1 reader at the end, "*" on average"* ]]; then
+    pass "after a read probe, the [READER] line divides by the readers it had"
+  else
+    # The buffered probe occupied under 5% of a very long run; the diagnostic
+    # deliberately suppresses its average in that case.
+    skip_host "after a read probe, the [READER] line divides by the readers it had" \
+      "the probe changed the run's average reader count by at most 5%"
+  fi
+fi
 
 # ────────────────────────────────────────────────────────────
 section "--adapt sink budget grow (bursty sink-bound)"

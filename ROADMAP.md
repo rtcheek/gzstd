@@ -344,7 +344,7 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    rulings (2026-10-15), both for a later version: the governor's reader scale-up request (M4
    action 3) has had no consumer since v0.15.44 -- leave it for now, remove it in its own small
    reviewed change; NO_COLOR -- honour it everywhere at once (vlog, --calibrate AND the progress
-   bar, which colours unconditionally), not for vlog alone.  The original text:  --calibrate prints each
+   bar, which colours unconditionally), not for vlog alone (DONE v0.18.16, with `--no-color`).  The original text:  --calibrate prints each
    result when a step finishes, but never announces a step before it starts: during each GPU
    device-count child (up to 4 GiB of compression apiece) the screen is silent, and the findings
    arrive as unstructured rows.  It should say what it is measuring as it starts each step (the
@@ -359,7 +359,13 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    latch, GPU start), -vv each time an input crosses a threshold or a state changes, -vvv every
    tick or sample.  Today their levels are ad hoc (most at -v, a few at -vv), and some decisions
    say nothing at any level.  Audit every site against that table before changing any of them.
-23. **The cold read probe times its arms on a cold buffer pool (found v0.18.15).**  Each arm gets a
+23. ~~**The cold read probe times its arms on a cold buffer pool (found v0.18.15).**~~ SHIPPED v0.18.16
+   on the 8-GPU server: a timed pass faults a fresh buffer in outside its read and the rates are over
+   reading time; the CPU producer's probe pool is plain pages on 6.4+.  Cold 48 GiB, plain defaults:
+   hybrid 14.37-14.82 -> 12.25-12.43 s, `--gpu-only` 16.87-16.98 -> 15.38-15.55, `--cpu-only`
+   11.62-11.96 -> 10.70-10.93 (CHANGELOG v0.18.16).  **Still owed: the same A/B on the Gen3
+   workstation** (the probe's pick there, and plain against huge pages for the CPU producer), and a
+   pre-6.4 kernel, where the CPU probe pool keeps huge pages unmeasured.  The text as found:  Each arm gets a
    200 ms window, and whichever pool pages are fresh pay their first-touch faults inside it.  The
    GPU/hybrid producer's pool is plain and unfaulted, so its single O_DIRECT reader reads 3.56-3.58
    GiB/s against 4.56-4.63 on a prefaulted pool (cold 48 GiB, 8-GPU server); it picks buffered, and
@@ -377,7 +383,8 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    before) before shipping it.
    `GZSTD_DEBUG_POOL_THP` and `GZSTD_DEBUG_READ_PROBE_PICK` are the controls.  `--gpu-only` is not
    affected in practice: its arms read 1.7-2.2 vs 3.8-4.2 GiB/s (pipeline rates, as v0.15.43 noted),
-   and either pick finishes in 16.7-16.9 s.
+   and either pick finishes in 16.7-16.9 s.  (Corrected in v0.18.16: that was measured at load
+   14-17; on a quiet box forced O_DIRECT is about 10% faster on `--gpu-only` too.)
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

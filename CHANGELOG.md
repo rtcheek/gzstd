@@ -1,9 +1,154 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.15  
+**Covers:** v0.9.50 → v0.18.16  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+
+## v0.18.16 — the cold read probe times both arms reading, not faulting (ROADMAP 23); `--no-color` and NO_COLOR, everywhere
+
+The owner's two asks (2026-10-15): ROADMAP 23, and the colour ruling deferred from v0.18.14 --
+honour NO_COLOR everywhere at once, the progress bar included.
+
+### ROADMAP 23: the read probe charged one arm for page faults
+
+A cold compress of 4 GiB or more times an O_DIRECT pass against a buffered pass, about 200 ms
+each, then reads the rest on the winner.  A pool buffer no reader has had yet has no pages, and
+whichever pass draws it pays the faults inside its window.  In the GPU/hybrid producer the pool is
+plain and unfaulted, so the single O_DIRECT reader paid them serially: 3.56 GiB/s against 4.6 on
+mapped buffers, so it picked buffered, and O_DIRECT was faster end to end.  The CPU producer
+avoided that by prefaulting huge pages for its O_DIRECT pass before the timer, then read its
+buffered pass and its remainder into huge pages, slower than plain.
+
+- **A timed pass now faults a fresh buffer in itself, before its read, and times that apart**
+  (`DirectReadPool::acquire` says when a slot is handed out for the first time;
+  `ReadWindow::touch_ns`).  The probe's rates are over reading time, and a pass stops after 200 ms
+  of reading, not of wall time.  The remainder can reuse buffers mapped during the probe, but a
+  slot it draws fresh still costs first touch there: a single O_DIRECT reader pays that serially
+  where buffered readers fault in parallel.  The rates compare reads into mapped buffers; they
+  do not predict every first-touch cost in the remainder.  On this box forced O_DIRECT was the
+  faster remainder on all three paths (below).
+- **The CPU producer's probe pool is plain pages** on a 6.4+ kernel, as the GPU producer's was.
+  Measured, cold 48 GiB, 12 pinned readers, v0.18.15 with the pool forced each way: O_DIRECT
+  remainder 10.86-10.94 s plain against 11.14-11.49 on huge pages, buffered 12.64-12.79 against
+  12.95-13.06.  A pre-6.4 kernel keeps huge pages there: a plain pool on one is memset-prefaulted
+  (up to 4 GiB, one thread), and nothing has measured the probe on one.
+- `-v`: the `[READ-PROBE]` line says how much first touch it left out of each arm.  `-vv`: one line
+  per timed pass with its raw figures (chunks, bytes, wall time, first touch, readers, rate).
+
+Measured on the 8-GPU server, cold 48 GiB, plain defaults (no `--adapt`: the runs that never
+learn), binaries alternated, three rounds:
+
+| path | v0.18.15 | v0.18.16 | probe picks |
+|---|---|---|---|
+| `--cpu-only` | 11.62-11.96 s | 10.70-10.93 s | O_DIRECT, both (now on plain pages) |
+| hybrid (default) | 14.37-14.82 s | 12.25-12.43 s | buffered -> **O_DIRECT** (4.72-4.80 GiB/s measured, was 3.43-3.51) |
+| `--gpu-only` | 16.87-16.98 s | 15.38-15.55 s | buffered -> **O_DIRECT** (4.68-4.74, was 2.02-2.11) |
+
+The hybrid gain is the pick and nothing else: v0.18.15 forced to O_DIRECT ran 12.01-12.29 s against
+v0.18.16's 12.22-13.18.  `--gpu-only` likewise, mostly (forced 15.08-15.54, v0.18.16 14.45-14.91).
+**A correction to v0.18.15:** its ROADMAP 23 said `--gpu-only` was "not affected in practice"
+(either pick 16.7-16.9 s).  That was measured with the box at load 14-17; at load ~5 forced O_DIRECT
+is about 10% faster there too.  With `--adapt`, three runs on a fresh profile now take O_DIRECT from
+the first (12.16, 10.87 -- exploring `--cpu-only` -- and 12.41 s), where v0.18.15 needed a second run.
+
+**Owed: the workstation.**  Its read-path ranking has differed from this box's before; the probe's
+pick there, and plain against huge pages for the CPU producer, are measured here only.
+
+### The -v [READER] line after a read probe
+
+Pre-existing: the line divided the whole run's reader time by the LAST pass's reader count.  The
+probe runs 1 reader, then N, then the winner's count, so after an O_DIRECT pick it printed "io
+114.8% ... 1 reader" (v0.18.15, `--cpu-only`, cold 48 GiB), and on hybrid too once hybrid picked
+O_DIRECT.  It now divides by the pooled passes' time-weighted count (a resizing pass at its settled
+size) and says so when that differs from the last: "io 92.9% ... 1 reader at the end, 1.2 on
+average".  A run whose passes all have one count prints exactly what it did.
+
+### --no-color and NO_COLOR
+
+Colour came from two kinds of site.  vlog, the GPU/CPU tables and `--calibrate` coloured only when
+stderr was a terminal (`g_color_stderr`).  The progress bar, the `-t` progress line, the `[GDS]`
+phase line and every end-of-run summary line (compress, decompress, `-t`, `--tar` extract,
+`-t --tar`) coloured unconditionally, into a log file as well (19 codes in a `-v --progress` log of
+a 2 MB compress).  NO_COLOR was honoured nowhere.
+
+Now every colour on stderr goes through one decision: stderr is a terminal, `--no-color` was not
+given, and NO_COLOR is unset or empty (no-color.org: a non-empty value, whatever it is, turns
+colour off).  Cursor control -- `\r` and `\033[K`, which redraw a line in place -- is not colour
+and stays.  Counted on a pseudo-terminal (`script`), SGR sequences only:
+
+| run | default | `--no-color` | `NO_COLOR=1` | `NO_COLOR=` (empty) | stderr to a file |
+|---|---|---|---|---|---|
+| compress `-v` | 102 | 0 | 0 | 102 | 0 (v0.18.15: 30) |
+| `-t`, `-d`, `-t --tar`, `--tar` extract | 28-61 | 0 | | | |
+| `--calibrate` | 348 | 0 | | | |
+| `--gpu-only -vvv` (with the performance table) | 2469 | 0 | | | |
+
+The text is identical with colour off.  `--no-color` is a new option (zstd 1.5.7 has none to match).
+
+### Test hooks (new)
+
+- `GZSTD_DEBUG_PROBE_TOUCH_MS=N`: each first touch in a timed probe pass also takes N ms, so a cell
+  can tell a rate over reading time from one over wall time.
+
+### Tests
+
++3 default cells, all on every build (536 -> 539, `--extensive` 834 -> 837; no-GPU deltas
+unchanged), and the suite now unsets NO_COLOR so the cells that expect colour on a terminal do not
+depend on the caller's shell:
+- "the read probe leaves first touch out of its rates": a 4 GiB sparse file, 2 MiB chunks, 20 ms
+  added to every first touch; from the -vv O_DIRECT pass line the touch was counted (>= 20 ms), the
+  pass read for its full window (>= 195 ms of reading unless the 512-chunk ceiling stops it), and
+  the -v rate the decision used is bytes over reading time.  Both producers.
+- "after a read probe, the [READER] line divides by the readers it had": O_DIRECT forced; the line
+  names its average when it differs by more than 5%, and its io is at most 100% (reader time cannot
+  exceed the passes' reader-seconds).
+- "colour only on a terminal, never with --no-color or NO_COLOR": a log run slowed so the progress
+  bar draws (and checked that it did), then four pty runs: default and an empty NO_COLOR colour;
+  `--no-color` and `NO_COLOR=1` do not; each still prints its summary line.
+
+All three fail on v0.18.15.  Ten mutants, built and run on the GPU build (nine on the CPU-only one,
+which has no GPU producer): first touch never done, the CPU or the GPU producer's decision over wall
+time, the window stopping on wall time, the [READER] line by the last count, the compress summary or
+the progress bar coloured unconditionally, NO_COLOR ignored, an empty NO_COLOR treated as set, and
+`--no-color` parsed but ignored.  Each failed its own cell and no other, and the probe and [READER]
+mutants again after the review's changes to those cells.  Not covered by a cell: plain against huge
+pages for the CPU probe pool, a performance choice the suite cannot judge (measured above).
+
+### Review (Codex, GPT-6-Sol at high)
+
+- **Round 1: SAFE TO COMMIT, no blocking findings.**  It checked that a slot is off the free list
+  before it is touched (no Task can still own it), that the copy path cannot mark a slot fresh, that
+  the chunk ceiling still stops a pass, that the CPU pool's first-pass window identifies the probe,
+  that no SGR site is left ungated, and that the cuFile re-exec keeps the arguments.  It named a real
+  limitation (D3: a slot the remainder draws fresh still costs a lone O_DIRECT reader first touch),
+  now stated above.  Its cell changes were taken: a probe stopped by the 512-chunk ceiling is not a
+  short window, a crashing run fails instead of skipping, the [READER] cell skips when the probe
+  barely moved the average, and the colour cell skips without `script`.  Its -vv precision change
+  was taken at readable widths; its CHANGELOG edits were not (the 2 MB figure is as measured).
+- **Round 2: SAFE TO COMMIT.**  It found that the readable widths were not enough: a true 0.245
+  GiB/s prints as 0.25 on the -v line, 2.04% off, so the 2% check could fail a correct binary on a
+  slow host.  Its fix was taken: the -vv rate is checked against bytes over reading time within that
+  line's rounding, then the -v rate against the -vv rate within two decimals.  Its tighter D3
+  wording was taken.
+
+### Suites (2026-10-16, the 8-GPU server, final code; shared, seven cards busy with other users' jobs)
+
+- CPU-only build (warning-free), default: 393 passed, 0 failed, 1m59s, "as expected" (539 - 146).
+- GPU build, default, first run: **invalid**.  The suite masks to the card with the most free memory,
+  and the only idle card was 61:00.0 (index 3), which refuses CUDA contexts (row remap pending; the
+  card that fell off the bus on 2026-10-01): 498 passed, 19 failed, 22 skipped, every failure a GPU
+  bringup ("no GPU bringup", "hook never fired", "landed on only 1 GPU").  Checked by hand: v0.18.15
+  and v0.18.16 both fail bringup on that card ("CUDA-capable device(s) is/are busy or unavailable")
+  and both work on card 0.
+- GPU build, default, rerun masked to a healthy card (index 5) at the owner's call: 524 passed,
+  0 failed, 15 skipped of 539, 11m15s.  Fourteen skips are the cells that need two GPUs (a one-card
+  mask), one the usual "no trivial batch reached a GPU"; the count check flags the 13 multi-GPU
+  skips as unexpected, which is the mask.
+- `--extensive` not run (owner's call), although `parse_args` changed (`--no-color`).
 
 ---
 

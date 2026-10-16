@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.15";
+static constexpr const char * GZSTD_VERSION = "0.18.16";
 //
 // Architecture overview:
 //
@@ -2674,6 +2674,7 @@ struct Options {
   //   V_TRACE(5)   = -vvv: per-chunk debug trace
   int verbosity = 2;         // V_DEFAULT
   bool force_progress = false; // --progress: show progress even when stderr is not a TTY
+  bool no_color       = false; // --no-color (or a non-empty NO_COLOR): no ANSI colour anywhere
   bool no_progress    = false; // --no-progress: suppress the meter unconditionally.
                                // Needed as its own field: --no-progress used to
                                // work by lowering DEFAULT verbosity to ERROR, so
@@ -3162,7 +3163,14 @@ static int g_verbosity = V_DEFAULT;
 
 // True when stderr is a TTY and ANSI color codes should be emitted.
 // Set once after parse_args(); never changes afterwards.
+// EVERY colour on stderr checks this, the progress bar and the end-of-run
+// summary lines included (until v0.18.16 those coloured unconditionally, into a
+// log file as well, and NO_COLOR was not honoured anywhere).  Cursor control --
+// "\r" and "\033[K", which redraw a line in place -- is not colour and is not
+// gated here.
 static bool g_color_stderr = false;
+// A colour code, or nothing when colour is off.
+static const char * gzc(const char * code) { return g_color_stderr ? code : ""; }
 
 // Global flag: true when the progress bar is actively drawing on stderr.
 // vlog() checks this to clear the progress line before printing so verbose
@@ -4380,6 +4388,7 @@ static void print_help()
 "  -v / -vv / -vvv     verbose / debug / trace\n"
 "  -q / -qq            errors only / silent\n"
 "  --progress          force progress meter in pipes\n"
+"  --no-color          no colour on stderr (also a non-empty NO_COLOR)\n"
 "  --stats-json FILE   write run stats to FILE\n"
 "\n"
 "Misc:\n"
@@ -5744,6 +5753,11 @@ static void print_help_long()
 "                    pipe and the TTY (terminal) detection would\n"
 "                    suppress it).\n"
 "  --no-progress     Suppress the progress meter.\n"
+"  --no-color        No ANSI colour on stderr.  Colour is used only when\n"
+"                    stderr is a terminal; a non-empty NO_COLOR\n"
+"                    environment variable turns it off too (no-color.org).\n"
+"                    Cursor control (the progress line redrawn in place)\n"
+"                    is not colour and stays.\n"
 "  --stats-json FILE Write a machine-readable run summary to FILE.\n"
 "\n"
 "============================================================\n"
@@ -6366,6 +6380,12 @@ struct Meter {
   std::atomic< uint64_t > reader_copy_ns    { 0 };
   std::atomic< uint64_t > reader_blocked_ns { 0 };
   std::atomic< int >      reader_threads    { 1 }; // io/parse/copy/blocked sum across these
+  // Reader count weighted by how long each pooled pass ran (v0.18.16), for the -v
+  // [READER] line: a cold read probe runs 1, then N, then 1 or N readers, and
+  // dividing the whole run by the LAST pass's count printed "io 115%, 1 reader".
+  // count_ns / pass_ns is the average; 0 when no pooled pass ran.
+  std::atomic< uint64_t > reader_count_ns   { 0 }; // sum of readers x pass time
+  std::atomic< uint64_t > reader_pass_ns    { 0 }; // sum of pass time
   // Set by the parallel prefetch decompress reader, whose io runs on reader_threads
   // threads but whose parse / task-copy / queue push run on ONE ordered consumer.
   // print_reader_diag must not divide the consumer's time by the reader count.
@@ -6383,6 +6403,7 @@ struct Meter {
     extract_busy_ns = 0; extract_starved_ns = 0; writer_pool_threads = 1;
     reader_io_ns = 0; reader_parse_ns = 0; reader_copy_ns = 0;
     reader_blocked_ns = 0; reader_threads = 1; reader_serial_consumer = false;
+    reader_count_ns = 0; reader_pass_ns = 0;
     t0 = std::chrono::steady_clock::now();
   }
 };
@@ -9537,6 +9558,15 @@ static void adapt_profile_save(const Options & opt, const AdaptObs & obs_in)
 #endif  // !_WIN32
 
 static bool is_stderr_tty() { return isatty(fileno(stderr)) != 0; }
+// Colour on stderr: a terminal, and neither --no-color nor a NO_COLOR that is set
+// and not empty (no-color.org: "regardless of its value").
+static bool gz_colour_wanted(const Options & opt)
+{
+  if (opt.no_color) return false;
+  const char * nc = std::getenv("NO_COLOR");
+  if (nc && *nc) return false;
+  return is_stderr_tty();
+}
 static bool is_stdout_tty() { return isatty(fileno(stdout)) != 0; }
 // Format a byte count as a human-readable string (e.g. "3.14 GiB").
 static void human_bytes(double x, char * buf, size_t n)
@@ -9610,23 +9640,29 @@ static void progress_emit_line(double in_pct, double out_pct,
   else                 std::snprintf(in_pct_s,  sizeof(in_pct_s),  "---");
   if (out_pct >= 0.0) {
     std::snprintf(out_pct_s, sizeof(out_pct_s), "%.1f%%", out_pct);
-    out_pct_color = PR_GREEN_B;
+    out_pct_color = gzc(PR_GREEN_B);
   } else {
     std::snprintf(out_pct_s, sizeof(out_pct_s), "---");
-    out_pct_color = PR_YELLOW_B;
+    out_pct_color = gzc(PR_YELLOW_B);
   }
 
   // Buffer is larger than plain text to accommodate ANSI escape sequences.
   // Only the ##.#% values are bright/bold; labels, sizes, and rates use dim cyan/green.
+  // Every code goes through gzc(): plain when colour is off (g_color_stderr).
+  const char * cy = gzc(PR_CYAN), * cyb = gzc(PR_CYAN_B), * gr = gzc(PR_GREEN),
+             * rst = gzc(PR_RESET), * grey = gzc("\033[90m");
   char line[512];
   int n = std::snprintf(line, sizeof(line),
-      PR_CYAN "in:" PR_CYAN_B "%s" PR_RESET   // in label dim cyan + pct bold bright cyan
-      PR_CYAN " %s %s/s"                      // in size + rate dim cyan
-      "\033[90m | \033[0m"                     // dark grey separator
-      PR_GREEN "out:" "%s" "%s" PR_RESET       // out label dim green + pct (bold green or yellow)
-      PR_GREEN " %s %s/s" PR_RESET " ",        // out size + rate dim green
-      in_pct_s, in_s, in_rate_s,
-      out_pct_color, out_pct_s, out_s, out_rate_s);
+      "%sin:%s%s%s"                          // in label dim cyan + pct bold bright cyan
+      "%s %s %s/s"                           // in size + rate dim cyan
+      "%s | %s"                              // dark grey separator
+      "%sout:%s%s%s"                         // out label dim green + pct (bold green or yellow)
+      "%s %s %s/s%s ",                       // out size + rate dim green
+      cy, cyb, in_pct_s, rst,
+      cy, in_s, in_rate_s,
+      grey, rst,
+      gr, out_pct_color, out_pct_s, rst,
+      gr, out_s, out_rate_s, rst);
   if (n < 0) n = 0;
   // \r overwrites the line; \033[K clears to end; PR_RESET before \033[K
   // prevents the erase from inheriting a background color.
@@ -10114,7 +10150,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     // driver-open notice (\r + \033[K), so the first real render paints over it.
     if (const char * phase = g_init_phase.load(std::memory_order_relaxed)) {
       if (in == 0 && out == 0) {
-        std::fprintf(stderr, "\r\033[36m[GDS]\033[0m %s ...\033[K", phase);
+        std::fprintf(stderr, "\r%s[GDS]%s %s ...\033[K", gzc("\033[36m"), gzc("\033[0m"), phase);
         std::fflush(stderr);
         continue;
       }
@@ -10185,18 +10221,20 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     if (is_test) {
       // Test mode: show verified bytes and decompression throughput.
       char line[512];
+      const char * cy = gzc("\033[36m"), * cyb = gzc("\033[1;96m"), * gr = gzc("\033[32m"),
+                 * grb = gzc("\033[1;92m"), * dim = gzc("\033[2m"), * rst = gzc("\033[0m");
       if (in_pct >= 0.0)
         std::snprintf(line, sizeof(line),
-            "\033[36min:\033[1;96m%.1f%%\033[0m %s  "
-            "\033[32mverified:\033[1;92m%s\033[0m  "
-            "\033[2m@ %s/s\033[0m ",
-            in_pct, in_s, out_s, out_rate_s);
+            "%sin:%s%.1f%%%s %s  "
+            "%sverified:%s%s%s  "
+            "%s@ %s/s%s ",
+            cy, cyb, in_pct, rst, in_s, gr, grb, out_s, rst, dim, out_rate_s, rst);
       else
         std::snprintf(line, sizeof(line),
-            "\033[36min:\033[0m%s  "
-            "\033[32mverified:\033[1;92m%s\033[0m  "
-            "\033[2m@ %s/s\033[0m ",
-            in_s, out_s, out_rate_s);
+            "%sin:%s%s  "
+            "%sverified:%s%s%s  "
+            "%s@ %s/s%s ",
+            cy, rst, in_s, gr, grb, out_s, rst, dim, out_rate_s, rst);
       std::fprintf(stderr, "\r%s\033[K", line);
       std::fflush(stderr);
     } else {
@@ -12955,15 +12993,23 @@ public:
       bufs_.push_back(static_cast<char *>(base_) + i * stride_);
       free_.push_back((int)i);
     }
+    // Not "faulted in": the huge-page prefault maps the whole page only where
+    // THP engages, and the plain memset stops at 4 GiB.  A fresh slot just means
+    // no reader has had it yet; touching a slot that is already mapped is cheap.
+    used_.assign(n_bufs, 0);
     return true;
   }
   // Blocks until a buffer is free; returns its slot index, or -1 after
   // set_done() (abort: the reader must stop, no buffer is coming back).
-  int acquire() {
+  // *fresh (optional) says whether this is the slot's first acquisition: the
+  // read probe faults such a buffer in outside its timed read (ReadWindow).
+  int acquire(bool * fresh = nullptr) {
     std::unique_lock<std::mutex> lk(m_);
     cv_.wait(lk, [&]{ return done_ || !free_.empty(); });
     if (done_) return -1;
     int s = free_.back(); free_.pop_back();
+    if (fresh) *fresh = !used_[(size_t)s];
+    used_[(size_t)s] = 1;
     return s;
   }
   void release(int slot) {
@@ -12986,6 +13032,7 @@ private:
   size_t              stride_ = 0;       // per-buffer stride (2 MiB-aligned)
   std::vector<char *> bufs_;
   std::vector<int>    free_;
+  std::vector<uint8_t> used_;          // slot acquired at least once (under m_)
   std::mutex          m_;
   std::condition_variable cv_;
   size_t              buf_size_ = 0;
@@ -21888,6 +21935,18 @@ struct ReadWindow {
   std::atomic<size_t>   chunks{0};   // results: chunks actually read
   std::atomic<uint64_t> bytes{0};    //          bytes actually read
   double   secs = 0.0;               //          wall time this pass took (set after join)
+  // FIRST TOUCH, LEFT OUT OF A TIMED PASS (v0.18.15 ROADMAP 23, fixed v0.18.16).
+  // A buffer the pool has never handed out has no pages yet, and whichever pass
+  // draws it first pays the faults inside its 200 ms: the GPU producer's single
+  // O_DIRECT reader read 3.56 GiB/s against 4.6 on prefaulted buffers, the probe
+  // picked buffered, and O_DIRECT was 8% faster end to end.  A timed pass now
+  // faults a fresh buffer in itself, before its read, and sums that time here;
+  // secs_touch is it per reader (the readers fault in parallel), and the probe
+  // rates are bytes / (secs - secs_touch).  Both arms are then timed reading
+  // into mapped memory, which is what the remainder mostly does: it reuses them.
+  std::atomic<uint64_t> touch_ns{0};
+  double   secs_touch = 0.0;         //          touch_ns per reader, seconds (set after join)
+  double   read_secs() const { return secs - secs_touch; }
   // ATOMIC: every reader thread in the pass can observe EOF and write this
   // concurrently.  A plain bool would be a data race even though every writer
   // stores the same value.
@@ -21991,7 +22050,8 @@ static bool pooled_read_chunks(size_t host_chunk,
         // window only to carry its start offset, and must not stop at once.
         if (rel >= win->max_chunks
             || (win->target_secs > 0.0 && rel >= win->min_chunks
-                && win_elapsed() >= win->target_secs)) {
+                && win_elapsed() - double(win->touch_ns.load(std::memory_order_relaxed))
+                                   / (1e9 * n_readers) >= win->target_secs)) {
           done.store(true, std::memory_order_relaxed);
           break;
         }
@@ -22001,13 +22061,26 @@ static bool pooled_read_chunks(size_t host_chunk,
       char * buf;
       if (pool) {                           // blocks when all bufs in flight = backpressure
         const uint64_t a_t0 = m ? now_ns() : 0;
-        slot = pool->acquire();
+        bool fresh = false;
+        slot = pool->acquire(win_bounded ? &fresh : nullptr);
         if (m) m->reader_blocked_ns.fetch_add(now_ns() - a_t0, std::memory_order_relaxed);
         if (slot < 0) {                     // pool set_done(): GPU-fault abort, stop reading
           done.store(true, std::memory_order_relaxed);
           break;
         }
         buf = pool->buf(slot);
+        if (fresh) {                        // a timed pass: fault it in outside the read
+          // GZSTD_DEBUG_PROBE_TOUCH_MS=N (test hook): each first touch also takes N ms,
+          // so a cell can tell a rate over reading time from one over wall time.
+          static const long touch_ms = [] {
+            const char * e = std::getenv("GZSTD_DEBUG_PROBE_TOUCH_MS");
+            return e ? std::strtol(e, nullptr, 10) : 0L; }();
+          const uint64_t f0 = now_ns();
+          volatile char * vp = buf;
+          for (size_t o = 0; o < cap; o += 4096) vp[o] = 0;
+          if (touch_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(touch_ms));
+          win->touch_ns.fetch_add(now_ns() - f0, std::memory_order_relaxed);
+        }
       }
       else      { buf = static_cast<char *>(scratch); }
       uint64_t t0 = (g_perf || m) ? now_ns() : 0;
@@ -22139,7 +22212,27 @@ static bool pooled_read_chunks(size_t host_chunk,
       }
     }
   }
-  if (win) win->secs = win_elapsed();
+  if (win) {
+    win->secs = win_elapsed();
+    win->secs_touch = double(win->touch_ns.load()) / (1e9 * n_readers);
+    // -vv: a timed pass's raw figures, from which the -v [READ-PROBE] rate is made.
+    if (win_bounded && optp && optp->verbosity >= V_DEBUG) {
+      char pl[256];
+      const double gib = double(win->bytes.load()) / 1073741824.0;
+      std::snprintf(pl, sizeof pl, "[READ-PROBE] %s pass: %zu chunks, %.4f GiB in %.2f ms on "
+                    "%d reader%s, %.2f ms of it first touch (per reader) -> %.3f GiB/s\n",
+                    o_direct ? "O_DIRECT" : "buffered", win->chunks.load(), gib,
+                    win->secs * 1000.0, n_readers, n_readers == 1 ? "" : "s",
+                    win->secs_touch * 1000.0, win->read_secs() > 0 ? gib / win->read_secs() : 0.0);
+      vlog(V_DEBUG, *optp, pl);
+    }
+  }
+  if (m) {   // the [READER] line's time-weighted count; a resizing pass counts at its settled size
+    const uint64_t pass_ns = (uint64_t)(win_elapsed() * 1e9);
+    m->reader_count_ns.fetch_add(pass_ns * (uint64_t)(rd_adaptive ? rd_ctl.want() : n_readers),
+                                 std::memory_order_relaxed);
+    m->reader_pass_ns.fetch_add(pass_ns, std::memory_order_relaxed);
+  }
   if (!pool) free(scratch);
   if (io_error.load(std::memory_order_relaxed))
     die_io(o_direct ? "O_DIRECT read failed (--direct-read)" : "pread failed (pooled reader)");
@@ -31021,7 +31114,19 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
         pool_n = std::min<size_t>(pool_n,
                                   std::max<size_t>(8, (size_t)(ram_avail / 4 / cap)));
       if (pool_n < 8) pool_n = std::min<size_t>(8, std::max<size_t>(file_chunks + 1, 1));
-      dr_pool_ok = dr_pool.init(cap, pool_n, /*want_thp=*/o_direct,
+      // Huge pages for an explicit O_DIRECT read only.  The cold read probe's
+      // first pass is O_DIRECT too, but its pool also serves the buffered arm and
+      // whichever remainder wins, and plain pages measured better for both
+      // (v0.18.16, cold 48 GiB, 12 pinned readers: O_DIRECT remainder 10.86-10.94 s
+      // against 11.14-11.49 on huge pages, buffered 12.64-12.79 against
+      // 12.95-13.06); the GPU producer's probe pool was already plain.  The
+      // probe's timed passes leave first touch out (ReadWindow::touch_ns), which
+      // is what the huge-page prefault used to do for the O_DIRECT arm alone.
+      // A pre-6.4 kernel keeps huge pages here, as before: a plain pool there is
+      // memset-prefaulted (up to 4 GiB, one thread), and nothing has measured the
+      // probe on one.
+      const bool probe_plain = win != nullptr && kernel_has_per_vma_locks();
+      dr_pool_ok = dr_pool.init(cap, pool_n, /*want_thp=*/o_direct && !probe_plain,
                                 /*prefault_plain=*/!kernel_has_per_vma_locks());
       if (dr_pool_ok) g_direct_read_pool = &dr_pool;
       if (opt.verbosity >= V_VERBOSE)
@@ -31122,18 +31227,22 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     if (!run_pooled_reader(false, fds.b, fsz_known, &b)) return false;
     if (b.eof.load() || b.chunks.load() == 0) return true;
 
-    const double ra = a.secs > 0 ? (double)a.bytes.load() / a.secs : 0.0;
-    const double rb = b.secs > 0 ? (double)b.bytes.load() / b.secs : 0.0;
+    // Rates over READING time: each pass's first touch of fresh pool buffers is
+    // left out (ReadWindow::touch_ns), so neither arm is charged for faults the
+    // other happened not to take.
+    const double ra = a.read_secs() > 0 ? (double)a.bytes.load() / a.read_secs() : 0.0;
+    const double rb = b.read_secs() > 0 ? (double)b.bytes.load() / b.read_secs() : 0.0;
     // 5% margin, matching the backend prior: a tie keeps the buffered path,
     // which is what a run without this probe would have used.
     const int  forced = read_probe_forced_pick();
     const bool take_direct = forced ? forced == 1 : ra > rb * 1.05;
     if (opt.verbosity >= V_VERBOSE) {
-      char pb[224];
+      char pb[288];
       std::snprintf(pb, sizeof pb,
         "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over %.0f/%.0f ms "
-        "-> %s for the remainder%s\n",
+        "(first touch %.0f/%.0f ms left out) -> %s for the remainder%s\n",
         ra / 1073741824.0, rb / 1073741824.0, a.secs * 1000.0, b.secs * 1000.0,
+        a.secs_touch * 1000.0, b.secs_touch * 1000.0,
         take_direct ? "O_DIRECT" : "buffered", forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)" : "");
       vlog(V_VERBOSE, opt, pb);
     }
@@ -37284,7 +37393,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
             ReadWindow a; a.target_secs = READ_PROBE_SECS;
             a.min_chunks = READ_PROBE_MIN_CHUNKS; a.max_chunks = READ_PROBE_MAX_CHUNKS;
             bool ok = pooled_read_chunks(gpu_chunk, m, &nv_pool,
-                                         true, 1, fdd, nv_emit, &a);
+                                         true, 1, fdd, nv_emit, &a, &opt);
             // An emit that returned false (GPU abort) ends a pass exactly like a
             // full window would; without this check the probe would read on past
             // an abort and file the remaining chunks into drops.
@@ -37295,19 +37404,21 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
                                        READ_PROBE_ROUNDS * (size_t)n_readers);
               b.max_chunks  = READ_PROBE_MAX_CHUNKS;
               ok = pooled_read_chunks(gpu_chunk, m, &nv_pool,
-                                      false, n_readers, dr_fd, nv_emit, &b);
+                                      false, n_readers, dr_fd, nv_emit, &b, &opt);
               if (ok && !b.eof.load() && b.chunks.load() > 0 && !aborted()) {
-                const double ra = a.secs > 0 ? (double)a.bytes.load() / a.secs : 0.0;
-                const double rb = b.secs > 0 ? (double)b.bytes.load() / b.secs : 0.0;
+                // Over reading time, first touch left out (as compress_cpu_mt).
+                const double ra = a.read_secs() > 0 ? (double)a.bytes.load() / a.read_secs() : 0.0;
+                const double rb = b.read_secs() > 0 ? (double)b.bytes.load() / b.read_secs() : 0.0;
                 const int  forced = read_probe_forced_pick();
                 const bool td = forced ? forced == 1 : ra > rb * 1.05;
                 if (opt.verbosity >= V_VERBOSE) {
-                  char pb[224];
+                  char pb[288];
                   std::snprintf(pb, sizeof pb,
                     "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over "
-                    "%.0f/%.0f ms -> %s for the remainder%s\n",
+                    "%.0f/%.0f ms (first touch %.0f/%.0f ms left out) -> %s for the remainder%s\n",
                     ra / 1073741824.0, rb / 1073741824.0,
-                    a.secs * 1000.0, b.secs * 1000.0, td ? "O_DIRECT" : "buffered",
+                    a.secs * 1000.0, b.secs * 1000.0,
+                    a.secs_touch * 1000.0, b.secs_touch * 1000.0, td ? "O_DIRECT" : "buffered",
                     forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)" : "");
                   vlog(V_VERBOSE, opt, pb);
                 }
@@ -43083,15 +43194,27 @@ static void print_reader_diag(const Options & opt, const Meter & meter, double w
            "path is the faucet; a faster source or read path is the only lever\n");
     return;
   }
-  // Percentages are per reader thread (counters sum across them).
-  const double r_wall = wall_ns * r_n;
-  char rline[256];
+  // Percentages are per reader thread (counters sum across them).  The count is
+  // the pooled passes' time-weighted average when there were any (see
+  // Meter::reader_count_ns); it differs from the last pass's only when the passes
+  // differed, as a cold read probe's do, and then the line says both.
+  const uint64_t pc_ns = meter.reader_pass_ns.load();
+  const double r_avg = pc_ns > 0 ? double(meter.reader_count_ns.load()) / double(pc_ns) : r_n;
+  const bool   r_mixed = r_avg > 0.0 && std::fabs(r_avg - r_n) > 0.05 * r_n;
+  const double r_wall = wall_ns * (r_mixed ? r_avg : r_n);
+  char r_cnt[64];
+  if (r_mixed)
+    std::snprintf(r_cnt, sizeof r_cnt, "%d reader%s at the end, %.1f on average", (int)r_n,
+                  r_n > 1 ? "s" : "", r_avg);
+  else
+    std::snprintf(r_cnt, sizeof r_cnt, "%d reader%s", (int)r_n, r_n > 1 ? "s" : "");
+  char rline[288];
   std::snprintf(rline, sizeof(rline),
     "[READER] io %.1f%% | parse %.1f%% | task-copy %.1f%% | blocked-downstream %.1f%%  "
-    "(per thread, %d reader%s, %.2f s run)\n",
+    "(per thread, %s, %.2f s run)\n",
     double(r_io) / r_wall * 100.0, double(r_ps) / r_wall * 100.0,
     double(r_cp) / r_wall * 100.0, double(r_bk) / r_wall * 100.0,
-    (int)r_n, r_n > 1 ? "s" : "", wall_ns / 1e9);
+    r_cnt, wall_ns / 1e9);
   vlog(V_VERBOSE, opt, rline);
   // Reader-saturated (the reader is the faucet) vs blocked-downstream (the reader
   // is idle waiting for the GPU/CPU consumers — they are the faucet).
@@ -43393,9 +43516,9 @@ static int extract_tar(const Options & opt, Meter * m)
         ? opt.tar_sources[0]
         : (std::to_string(opt.tar_sources.size()) + " archives");
     char summary[512];
-    std::snprintf(summary, sizeof(summary),
-      "%s : \033[36m%s\033[0m => \033[32m%s\033[0m, %s @ \033[32m%s/s\033[0m",
-      in_name.c_str(), in_s, out_s, opt.tar_dest.c_str(), rate_s);
+    const char * cy = gzc("\033[36m"), * gr = gzc("\033[32m"), * rst = gzc("\033[0m");
+    std::snprintf(summary, sizeof(summary), "%s : %s%s%s => %s%s%s, %s @ %s%s/s%s",
+      in_name.c_str(), cy, in_s, rst, gr, out_s, rst, opt.tar_dest.c_str(), gr, rate_s, rst);
     std::fprintf(stderr, "\r%s\033[K\n", summary);
     std::fflush(stderr);
   }
@@ -43613,20 +43736,24 @@ static int verify_tar(const Options & opt, Meter * m)
       const char * verdict = v.bad ? "tar structure invalid" : "tar structure valid";
       // Numbers colored to match the plain -t summary line: in=cyan, out=green,
       // ratio=bold, rate=green; entry count bold; OK bold-bright-green.
-      const char * status  = v.bad ? "\033[31mCORRUPT\033[0m" : "\033[1;92mOK\033[0m";
+      const char * bo = gzc("\033[1m"), * cy = gzc("\033[36m"), * gr = gzc("\033[32m"),
+                 * rst = gzc("\033[0m");
+      char status[48];
+      std::snprintf(status, sizeof status, "%s%s%s", gzc(v.bad ? "\033[31m" : "\033[1;92m"),
+                    v.bad ? "CORRUPT" : "OK", rst);
       if (v.comp > 0 && v.bytes > 0) {
         char comp[64]; human_bytes(double(v.comp), comp, sizeof(comp));
         double pct = double(v.comp) / double(v.bytes) * 100.0;
         std::fprintf(stderr,
-                     "%s : %s, \033[1m%llu\033[0m entries, \033[36m%s\033[0m => \033[32m%s\033[0m"
-                     " (ratio: \033[1m%.1f%%\033[0m) @ \033[32m%s/s\033[0m — %s\n",
-                     v.name.c_str(), status, (unsigned long long)v.files,
-                     comp, sz, pct, rate, verdict);
+                     "%s : %s, %s%llu%s entries, %s%s%s => %s%s%s"
+                     " (ratio: %s%.1f%%%s) @ %s%s/s%s — %s\n",
+                     v.name.c_str(), status, bo, (unsigned long long)v.files, rst,
+                     cy, comp, rst, gr, sz, rst, bo, pct, rst, gr, rate, rst, verdict);
       } else {
         std::fprintf(stderr,
-                     "%s : %s, \033[1m%llu\033[0m entries, \033[32m%s\033[0m @ \033[32m%s/s\033[0m — %s\n",
-                     v.name.c_str(), status, (unsigned long long)v.files,
-                     sz, rate, verdict);
+                     "%s : %s, %s%llu%s entries, %s%s%s @ %s%s/s%s — %s\n",
+                     v.name.c_str(), status, bo, (unsigned long long)v.files, rst,
+                     gr, sz, rst, gr, rate, rst, verdict);
       }
     }
     std::fflush(stderr);
@@ -47188,9 +47315,12 @@ static int gzstd_main(int argc, char ** argv)
         base_name = opt.input;
 
       char summary[512];
+      const char * ok = gzc("\033[1;92m"), * cy = gzc("\033[36m"), * gr = gzc("\033[32m"),
+                 * bo = gzc("\033[1m"), * rst = gzc("\033[0m");
       std::snprintf(summary, sizeof(summary),
-        "%s : \033[1;92mOK\033[0m (\033[36m%s\033[0m => \033[32m%s\033[0m, ratio: \033[1m%.1f%%\033[0m) @ \033[32m%s/s\033[0m",
-        base_name.c_str(), comp_s, decomp_s, pct, rate_s);
+        "%s : %sOK%s (%s%s%s => %s%s%s, ratio: %s%.1f%%%s) @ %s%s/s%s",
+        base_name.c_str(), ok, rst, cy, comp_s, rst, gr, decomp_s, rst, bo, pct, rst,
+        gr, rate_s, rst);
       std::fprintf(stderr, "\r%s\033[K\n", summary);
       std::fflush(stderr);
     }
@@ -47631,9 +47761,11 @@ static int gzstd_main(int argc, char ** argv)
         : ((opt.input == "-") ? "(stdin)" : opt.input);
     std::string out_name = to_stdout ? "(stdout)" : opt.output;
     char summary[512];
-    std::snprintf(summary, sizeof(summary),
-      "%s : \033[1m%5.2f%%\033[0m (\033[36m%s\033[0m => \033[32m%s\033[0m, %s) @ \033[32m%s/s\033[0m",
-      in_name.c_str(), ratio_pct, in_s, out_s, out_name.c_str(), rate_s);
+    const char * bo = gzc("\033[1m"), * cy = gzc("\033[36m"), * gr = gzc("\033[32m"),
+               * rst = gzc("\033[0m");
+    std::snprintf(summary, sizeof(summary), "%s : %s%5.2f%%%s (%s%s%s => %s%s%s, %s) @ %s%s/s%s",
+      in_name.c_str(), bo, ratio_pct, rst, cy, in_s, rst, gr, out_s, rst, out_name.c_str(),
+      gr, rate_s, rst);
     std::fprintf(stderr, "\r%s\033[K\n", summary);
     std::fflush(stderr);
   }
@@ -47652,9 +47784,9 @@ static int gzstd_main(int argc, char ** argv)
     std::string in_name  = (opt.input == "-") ? "(stdin)" : opt.input;
     std::string out_name = to_stdout ? "(stdout)" : opt.output;
     char summary[512];
-    std::snprintf(summary, sizeof(summary),
-      "%s : \033[36m%s\033[0m => \033[32m%s\033[0m, %s @ \033[32m%s/s\033[0m",
-      in_name.c_str(), in_s, out_s, out_name.c_str(), rate_s);
+    const char * cy = gzc("\033[36m"), * gr = gzc("\033[32m"), * rst = gzc("\033[0m");
+    std::snprintf(summary, sizeof(summary), "%s : %s%s%s => %s%s%s, %s @ %s%s/s%s",
+      in_name.c_str(), cy, in_s, rst, gr, out_s, rst, out_name.c_str(), gr, rate_s, rst);
     std::fprintf(stderr, "\r%s\033[K\n", summary);
     std::fflush(stderr);
   }
@@ -50534,6 +50666,7 @@ static Options parse_args(int argc, char ** argv)
       opt.force_progress = false;
       opt.no_progress    = true;   // wins regardless of verbosity or flag order
     }
+    else if (a == "--no-color") opt.no_color = true;
     else if (a.size() >= 2 && a[0] == '-' && a[1] >= '0' && a[1] <= '9') {
       bool all_digits = true;
       for (size_t k = 1; k < a.size(); ++k) { if (a[k] < '0' || a[k] > '9') { all_digits = false; break; } }
@@ -51079,7 +51212,7 @@ static Options parse_args(int argc, char ** argv)
                    g_mem_bare_spelling.c_str(), (unsigned long long)opt.mem_limit_bytes);
     gz_drop_named_symlinks(opt);   // zstd skips a named link sample too
     g_verbosity = opt.verbosity;
-    g_color_stderr = is_stderr_tty();
+    g_color_stderr = gz_colour_wanted(opt);
     return opt;
   }
   // -d/-l --tar ARCHIVE MEMBER...: the first positional after --tar is the
@@ -51712,8 +51845,8 @@ static Options parse_args(int argc, char ** argv)
   // Sync global verbosity for die() (which has no access to Options)
   g_verbosity = opt.verbosity;
 
-  // Cache TTY check once; used by vlog() to gate ANSI color on verbose output.
-  g_color_stderr = is_stderr_tty();
+  // Decided once; every colour on stderr checks it (see g_color_stderr).
+  g_color_stderr = gz_colour_wanted(opt);
 
   return opt;
 }
