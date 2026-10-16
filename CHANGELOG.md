@@ -1,9 +1,137 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.14  
+**Covers:** v0.9.50 → v0.18.15  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+
+## v0.18.15 — a cold compress's read-probe remainder sizes its readers; a reader that does not resize stops publishing the profile's count
+
+**The question (owner, 2026-10-15):** with the governor's reader scale-up request dead since v0.15.44,
+does gzstd still add readers when they cannot keep the compressors fed?  Mostly yes: `ReaderPoolCtl`
+replaced that request and reads the published regime itself (when source-bound it steps, measures and
+keeps only a gain).  But it was missing from exactly the run it matters most for.
+
+### The read probe's remainder never resized
+
+A cold compress of 4 GiB or more on non-rotational media times O_DIRECT against buffered reads, then
+reads the rest of the file on the winner.  That last pass goes through a `ReadWindow` that carries only
+its start offset (no chunk cap, no clock), but the controller was skipped for *any* window, so a
+default cold compress never resized at all.  The GPU/hybrid producer's last pass was not even handed
+the Options.  Seen on a cold 25 GiB file: source-bound for 2.6 s, buffered remainder, no `reader pool`
+line.  Now only the two timed passes (bounded windows) are excluded, in both producers.
+
+Measured on the 8-GPU server, cold 48 GiB, `--adapt`, first run (no profile), default `-T`,
+read probe unforced, binaries alternated, three rounds each:
+
+| path | probe picked | v0.18.14 | v0.18.15 | controller |
+|---|---|---|---|---|
+| `--cpu-only` | O_DIRECT 3/3 | 10.90-11.65 s | 10.88-11.72 s | not armed (one stream) |
+| hybrid (default) | buffered 3/3 | 13.75-14.31 s | 13.93-14.12 s | arms; tries 18 and 6, keeps 12 |
+| `--gpu-only` | buffered 3/3 | 16.25-17.32 s | 16.27-17.08 s | arms; settled 9 once, 12 twice |
+
+The wall-time ranges overlap; these samples show no clear change.  The read is device-bound; the
+controller kept its start in five of the six runs where it armed, and settled 9 instead of 12 once
+(`--gpu-only`, whose GPUs set the pace either way).  What changes is that the run can now measure the
+remainder, and its settled count reaches the profile's cold bucket.
+
+### A reader that does not resize published the profile's seed as its count
+
+The governor divides reader time by `Meter::reader_threads`, and `ReaderPoolCtl::bind_live` publishes
+`want()`, which starts at the profile's seed.  The decompress and `--tar` readers pass a seed only to a
+pool that resizes; the compress pooled reader passed it to every pass: O_DIRECT (one stream), the
+probe's timed passes, a pinned `--read-threads`.  Measured: with a profile seed of 6, a one-reader
+`--adapt --direct-read` compress published 3 (the seed clamped to that pool's ceiling), read the
+saturated device as 33% busy on every one of 85 ticks, and was classified and **filed compute-bound**
+(the profile's compress regime read "compute-bound" afterwards).  The same run without the seed: 99%,
+source-bound.  Now the seed goes only to a pool that resizes.  This mattered more after the fix above:
+the remainder now writes a cold-bucket seed, and the next run's `--adapt` read-path prior probes
+`--direct-read`, which is exactly that one-reader pass.  Measured on cold 48 GiB, starting from the
+default hybrid backend on a fresh profile, three `--adapt` runs against a build with only the
+remainder fix:
+
+| run | v0.18.15 | remainder fix only |
+|---|---|---|
+| 1: probe -> buffered, pool keeps 12, seed 12 written | 14.47 s | 14.47 s |
+| 2: `--adapt` probes `--direct-read` (one reader) | 1 reader, source-bound, 11.60 s | **3 readers**, 32% busy, **filed compute-bound**, 11.54 s |
+| 3: `--adapt` takes `--direct-read` (measured 4.20 vs 3.65 GiB/s) | source-bound, 11.52 s | still filed compute-bound, 11.53 s |
+
+The sequence also shows `--adapt` overruling the probe's buffered verdict (ROADMAP 23) from its second
+run on: run 2 tries O_DIRECT, run 3 keeps it on the measured rates.
+
+### The summary's action list
+
+Only the decompress reader set the action flag, so a compress whose pool settled 12 -> 6 printed
+"actions: none" (v0.18.14's CHANGELOG said the summary's action came from the pool controller; only
+for decompress).  Compress and `--tar` create set it now, and the label is `reader-pool(resized)`,
+since it moves either way.
+
+### Where the read probe's measurement is off (the owner's second question)
+
+- **"reader busy 103%" is not specific to the probe.** A reader adds a whole pread's duration to the
+  100 ms tick in which the read finishes, so a tick swings by about one read per reader: steady state
+  is 92-108% with or without the probe (one O_DIRECT reader: 98-103%).  Harmless against the 85% gate.
+- **Steps of the controller make larger swings**, 66% to 158%: the live count changes when the step
+  is taken, before the in-flight reads of the threads joining or leaving land.  One tick each; the
+  regime needs five, so no verdict changed.  Not fixed.
+- **The probe times its arms on a cold buffer pool**, and that does change verdicts: ROADMAP 23.  In
+  the GPU/hybrid producer the pool is plain and unfaulted, so the single O_DIRECT reader pays the
+  first-touch faults inside its 200 ms window: 3.56-3.58 GiB/s against 4.56-4.63 on a prefaulted pool,
+  same file.  It then picks buffered, and forced O_DIRECT finishes hybrid in 12.52-13.18 s against
+  13.78-14.10 s for buffered.  The CPU producer prefaults huge pages for O_DIRECT before the timer, so
+  its verdict is right here, but its buffered arm and remainder then run on huge pages (2-3% slower).
+- **Not gzstd's: buffered reads after the probe ran 10-13% slower unpinned** (12.6-13.1 s against
+  11.0-12.4 s at 12 pinned readers), and the device saw identical traffic.  Pinned to one NUMA node the
+  two paths match (node 0: 11.7-12.1 s both; node 1: 10.03-10.09 s both): it is where the kernel puts
+  the reader threads.
+
+### Test hooks (new)
+
+- `GZSTD_DEBUG_READ_PROBE_PICK=direct|buffered`: the probe still times both passes, then reads the
+  remainder on this path; the `[READ-PROBE]` line says it was forced.
+- `GZSTD_DEBUG_POOL_THP=0|1`: overrides `DirectReadPool`'s huge-page choice, the one-binary A/B control.
+
+### Tests
+
++2 default cells, both on every build (534 -> 536, `--extensive` 832 -> 834; no-GPU deltas unchanged):
+- "the read probe's buffered remainder runs the reader controller": a 4 GiB sparse file (cold by
+  construction) at 2 MiB chunks, so the two timed passes (512 chunks each at most) cannot consume it;
+  the buffered remainder forced; both producers (the GPU one inside the cell when there is a GPU, and
+  it must be the hybrid producer).  A host whose TMPDIR cannot take the probe at all skips it; once one
+  producer has probed, the other not probing is a failure.
+- "an O_DIRECT reader publishes 1 reader, not the profile's seed": run 1 writes a seed of 3, run 2 (a
+  buffered control) must start from it, and run 3 reads O_DIRECT in the same bucket, where the -v
+  `[READER]` line names its divisor.  Without the control, a broken seed loader would pass vacuously.
+
+Each was seen to fail on v0.18.14 or a mutant.  Four mutants, built and run on both builds where they
+apply: every window excluded again (the remainder cell fails, both arms), the GPU pass without Options
+(fails, GPU arm only), the seed on every pass ("3 reader"), and the seed never loaded (the control
+fails).  Each failed its own cell and no other.
+
+### Review (Codex, GPT-6-Sol at high)
+
+- **Round 1: SAFE TO COMMIT, no findings in the C++.**  It checked that a parked reader on a windowed
+  pass holds no claim or pool slot and is woken before the join, that only pass 3's window is
+  unbounded, that each non-resizing pass now publishes its configured count, and that the action flag
+  is set before the per-file summary and reset when the next file's governor starts.  Its cell
+  changes were taken: 2 MiB chunks so the remainder always has work, a missing probe in one producer
+  failing rather than skipping, a check that the GPU arm used the hybrid producer, and the seed
+  cell's buffered control, a hole in my version, which the fourth mutant now proves.  Its correction
+  to this entry ("nothing better than the start", against a run that settled 9) was taken, reworded.
+- **Round 2 (docs and the merged cells): SAFE TO COMMIT, no findings.**  It narrowed three claims, all
+  taken: overlapping ranges show no clear change in these samples (not proof of none), the sequence
+  starts on the hybrid backend (a later run may change backend), and ROADMAP 23 names the measured
+  path that pays rather than every run without --adapt.
+
+### Suites (2026-10-15, the 8-GPU server, final code; shared with three other users, load ~6)
+
+- GPU build, default: 535 passed, 0 failed, 1 skipped of 536, 11m00s, "as expected on this host".
+  The skip is the usual "no trivial batch reached a GPU".  Both new cells ran (the remainder cell 4.3 s).
+- CPU-only build (warning-free), default: 390 passed, 0 failed, 1m54s, "as expected" (536 - 146).
+- `--extensive` not run (owner's call: `parse_args` is untouched).
 
 ---
 

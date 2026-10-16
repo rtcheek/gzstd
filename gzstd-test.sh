@@ -619,8 +619,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=534
-$EXTENSIVE && EXPECTED_TESTS=832
+EXPECTED_TESTS=536
+$EXTENSIVE && EXPECTED_TESTS=834
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -661,6 +661,10 @@ $EXTENSIVE && EXPECTED_TESTS=832
 # terminal), and the fingerprint names the loaded driver's version.  The first
 # three run on every build; the fourth needs nvCOMP and an NVIDIA module:
 # 530 -> 534, 828 -> 832; no-GPU deltas 145 -> 146, 211 -> 212.
+# v0.18.15: +2 default -- the read probe's buffered remainder runs the reader
+# controller (both producers; the GPU arm runs inside the cell when there is a
+# GPU), and an O_DIRECT reader publishes its own count, not the profile's seed.
+# Both run on every build: 534 -> 536, 832 -> 834; no-GPU deltas unchanged.
 count_tests() { echo "$EXPECTED_TESTS"; }
 
 # ---- Host-dependent deltas, applied to the baseline at the drift check ----
@@ -8620,6 +8624,90 @@ fi
 
 rm -f "$TMPDIR/arsu.bin" "$TMPDIR/arsu.zst" "$TMPDIR/arsu.out" \
       "$TMPDIR/arsu1.err" "$TMPDIR/arsu2.err"
+
+# 3. THE READ PROBE'S REMAINDER SIZES ITSELF (v0.18.15).  A cold compress of 4 GiB
+#    or more times O_DIRECT against buffered reads, then reads the rest of the file
+#    on the winner -- through a window that carries only its start offset.  Every
+#    window used to keep the controller off, so the run the probe exists for never
+#    resized; and the GPU producer's last pass was not even handed the Options.
+#    A sparse 4 GiB file is cold by construction (no page is cached) and costs no
+#    disk.  With 2 MiB chunks, the two timed passes can claim at most 2 GiB
+#    together (512 chunks each), so pass 3 must have work even on a fast host.
+#    GZSTD_DEBUG_READ_PROBE_PICK chooses the buffered remainder whatever the
+#    device measures.  Both producers: --cpu-only, and the default hybrid one when
+#    there is a GPU.  Once either arm probes, the host has proved capable; a
+#    missing probe in the other arm is a failure, not a host skip.
+t0=$(now_ms); why=""; ran=0; missed=""
+for arm in cpu gpu; do
+  [[ $arm == gpu ]] && ! has_gpu 2>/dev/null && continue
+  fl=""; [[ $arm == cpu ]] && fl="--cpu-only"
+  rm -f "$TMPDIR/rpr.bin"; truncate -s 4G "$TMPDIR/rpr.bin"
+  env XDG_CACHE_HOME="$TMPDIR/rpr_x" GZSTD_DEBUG_READ_PROBE_PICK=buffered \
+    "$GZSTD" --adapt --no-profile $fl -v -T24 --chunk-size 2 \
+    -c "$TMPDIR/rpr.bin" > /dev/null 2> "$TMPDIR/rpr.err"
+  rc=$?
+  if ! grep -q 'READ-PROBE.*-> buffered for the remainder' "$TMPDIR/rpr.err"; then
+    missed+=" $arm:no-probe(exit-$rc)"
+    continue
+  fi
+  ran=$((ran+1))
+  [[ $rc -eq 0 ]] || why+=" $arm:exit-$rc"
+  if [[ $arm == gpu ]] && ! grep -q '\[HYBRID\] starting CPU pool:' "$TMPDIR/rpr.err"; then
+    why+=" gpu:did-not-use-hybrid-producer"
+  fi
+  grep -q 'reader pool: started [0-9]*, settled [0-9]* (range' "$TMPDIR/rpr.err" \
+    || why+=" $arm:no-controller"
+done
+rm -f "$TMPDIR/rpr.bin"; rm -rf "$TMPDIR/rpr_x"
+LAST_TEST_MS=$(( $(now_ms) - t0 ))
+if (( ran == 0 )); then
+  skip_host "the read probe's buffered remainder runs the reader controller" \
+    "no read probe here (rotational TMPDIR or no O_DIRECT)"
+elif [[ -z "$why$missed" ]]; then
+  pass "the read probe's buffered remainder runs the reader controller"
+else
+  fail "the read probe's buffered remainder runs the reader controller" "$why$missed"
+fi
+
+# 4. A READER THAT DOES NOT RESIZE PUBLISHES ITS OWN COUNT, NOT THE PROFILE'S SEED
+#    (v0.18.15).  The governor divides reader time by the published count.  The
+#    compress pooled reader handed the profile's seed to EVERY pass, so a one-reader
+#    O_DIRECT run with a seed of 6 published 3 (its ceiling), read a saturated
+#    device as 33% busy and filed the run compute-bound.  Run 1 writes a seed of 3
+#    (a buffered --adapt run that qualifies for a save).  Run 2 proves that a
+#    buffered pool actually loads that seed; otherwise a broken prior loader
+#    could make the O_DIRECT assertion pass vacuously.  Run 3 reads O_DIRECT,
+#    one stream, in the same bucket, and the -v [READER] line names its divisor.
+head -c 64M /dev/urandom > "$TMPDIR/rsd.bin"
+env XDG_CACHE_HOME="$TMPDIR/rsd_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=0 "$GZSTD" --adapt --cpu-only \
+  --no-mmap -v -T24 -c "$TMPDIR/rsd.bin" > /dev/null 2> "$TMPDIR/rsd1.err"
+rsd_rc1=$?
+rsd_seed=$(grep -o '"read_threads_settled_warm_nofile": *[0-9]*' "$TMPDIR/rsd_x/gzstd/profile.json" \
+           2>/dev/null | grep -o '[0-9]*$')
+env XDG_CACHE_HOME="$TMPDIR/rsd_x" GZSTD_DEBUG_ADAPT_SAVE_MIN_MS=600000 \
+  "$GZSTD" --adapt --cpu-only --no-mmap -v -T24 \
+  -c "$TMPDIR/rsd.bin" > /dev/null 2> "$TMPDIR/rsd2.err"
+rsd_rc2=$?
+env XDG_CACHE_HOME="$TMPDIR/rsd_x" "$GZSTD" --adapt --cpu-only --direct-read -v -T24 \
+  -c "$TMPDIR/rsd.bin" > /dev/null 2> "$TMPDIR/rsd3.err"
+rsd_rc3=$?
+rsd_line=$(grep -ao '\[READER\] io.*(per thread, [0-9]* reader' "$TMPDIR/rsd3.err" | head -1)
+if grep -q 'could not engage O_DIRECT' "$TMPDIR/rsd3.err"; then
+  skip_host "an O_DIRECT reader publishes 1 reader, not the profile's seed" "no O_DIRECT on TMPDIR"
+elif [[ $rsd_rc1 -ne 0 || "${rsd_seed:-0}" -lt 2 ]]; then
+  fail "an O_DIRECT reader publishes 1 reader, not the profile's seed" \
+       "run 1 exit $rsd_rc1; seed ${rsd_seed:-none} (want at least 2)"
+elif [[ $rsd_rc2 -ne 0 ]] || ! grep -qF "reader pool: started $rsd_seed (from profile)" "$TMPDIR/rsd2.err"; then
+  fail "an O_DIRECT reader publishes 1 reader, not the profile's seed" \
+       "run 2 exit $rsd_rc2; buffered reader did not load seed $rsd_seed"
+elif [[ $rsd_rc3 -eq 0 && "$rsd_line" == *"(per thread, 1 reader" ]]; then
+  pass "an O_DIRECT reader publishes 1 reader, not the profile's seed" "seed $rsd_seed"
+else
+  fail "an O_DIRECT reader publishes 1 reader, not the profile's seed" \
+       "exit $rsd_rc3, seed $rsd_seed: ${rsd_line:-no [READER] line}"
+fi
+rm -rf "$TMPDIR/rsd.bin" "$TMPDIR/rsd_x" "$TMPDIR/rsd1.err" "$TMPDIR/rsd2.err" \
+       "$TMPDIR/rsd3.err" "$TMPDIR/rpr.err"
 
 # ────────────────────────────────────────────────────────────
 section "--adapt sink budget grow (bursty sink-bound)"

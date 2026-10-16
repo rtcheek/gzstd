@@ -359,6 +359,25 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    latch, GPU start), -vv each time an input crosses a threshold or a state changes, -vvv every
    tick or sample.  Today their levels are ad hoc (most at -v, a few at -vv), and some decisions
    say nothing at any level.  Audit every site against that table before changing any of them.
+23. **The cold read probe times its arms on a cold buffer pool (found v0.18.15).**  Each arm gets a
+   200 ms window, and whichever pool pages are fresh pay their first-touch faults inside it.  The
+   GPU/hybrid producer's pool is plain and unfaulted, so its single O_DIRECT reader reads 3.56-3.58
+   GiB/s against 4.56-4.63 on a prefaulted pool (cold 48 GiB, 8-GPU server); it picks buffered, and
+   forced O_DIRECT finishes the hybrid compress in 12.52-13.18 s against 13.78-14.10 s.  The CPU
+   producer avoids this by prefaulting huge pages for O_DIRECT before the timer, but then its
+   buffered arm and remainder read into huge pages (2-3% slower than plain) and the prefault itself
+   costs wall time, which is why it is not the fix for the GPU producer either (hybrid on a prefaulted
+   pool: 13.66-13.70 s).  The measured cold default hybrid path pays on its first run; without
+   `--adapt`, comparable runs keep taking that path.  In the measured three-run `--adapt` sequence,
+   the read-path prior probes `--direct-read` on run 2 and keeps it on the measured rates on run 3
+   (14.47 s -> 11.60 -> 11.52 s, CHANGELOG v0.18.15).  The shape of a fix: both producers on plain
+   pages, and each arm timed on warm buffers -- prefault in parallel only the buffers the probe can draw,
+   or leave a fresh buffer's first touch out of the window's time.  It can change the read path of an
+   eligible cold compress, so measure it on both boxes (the Gen3 workstation's ranking has differed
+   before) before shipping it.
+   `GZSTD_DEBUG_POOL_THP` and `GZSTD_DEBUG_READ_PROBE_PICK` are the controls.  `--gpu-only` is not
+   affected in practice: its arms read 1.7-2.2 vs 3.8-4.2 GiB/s (pipeline rates, as v0.15.43 noted),
+   and either pick finishes in 16.7-16.9 s.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

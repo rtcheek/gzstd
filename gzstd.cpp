@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.14";
+static constexpr const char * GZSTD_VERSION = "0.18.15";
 //
 // Architecture overview:
 //
@@ -2242,6 +2242,21 @@ static const size_t READ_PROBE_MAX_CHUNKS = 512;
 // Below this the probe is not worth its own startup, and the two passes would be
 // a large fraction of the job.
 static const uint64_t READ_PROBE_MIN_INPUT = 4ull * 1024 * 1024 * 1024;
+// GZSTD_DEBUG_READ_PROBE_PICK=direct|buffered (test hook, v0.18.15): the probe
+// still times both passes, then reads the remainder on this path whatever they
+// measured.  Which path wins is a property of the device, so without it a cell
+// cannot choose which remainder it exercises.  0 = measure, 1 = O_DIRECT,
+// 2 = buffered.
+static int read_probe_forced_pick()
+{
+  static const int v = [] {
+    const char * e = std::getenv("GZSTD_DEBUG_READ_PROBE_PICK");
+    if (e && !std::strcmp(e, "direct"))   return 1;
+    if (e && !std::strcmp(e, "buffered")) return 2;
+    return 0;
+  }();
+  return v;
+}
 
 // ---- Adaptive reader-pool sizing (--adapt, buffered pooled reader) --------
 // The right reader count depends on which stage is the bottleneck, and that is
@@ -7002,7 +7017,7 @@ public:
     if (acts == 0)                        os << " none";
     if (acts & ADAPT_ACT_SOURCE_LATCH)    os << " source-latch(gpu-batch)";
     if (acts & ADAPT_ACT_DEVICE_QUIESCE)  os << " device-quiesce(ranked)";
-    if (acts & ADAPT_ACT_READER_SCALEUP)  os << " reader-scaleup";
+    if (acts & ADAPT_ACT_READER_SCALEUP)  os << " reader-pool(resized)";   // either way
     if (acts & ADAPT_ACT_SINK_GROW)       os << " sink-grow(throttle)";
     if (acts & ADAPT_ACT_WRITER_PROBE)    os << " writer-probe(kept)";
     if (g_adapt_writer_probe_engaged.load(std::memory_order_relaxed)
@@ -12906,6 +12921,12 @@ public:
     stride_ = ((buf_size + HP - 1) / HP) * HP;   // 2 MiB-aligned stride ⇒ every slice is 2 MiB-aligned
     const size_t total = stride_ * n_bufs;
     if (posix_memalign(&base_, HP, total) != 0 || !base_) { base_ = nullptr; return false; }
+    // GZSTD_DEBUG_POOL_THP=0/1 overrides the caller's want_thp (the A/B control,
+    // one binary; v0.18.15).
+    static const int thp_force = [] {
+      const char * e = std::getenv("GZSTD_DEBUG_POOL_THP");
+      return (e && *e == '0') ? 0 : (e && *e == '1') ? 1 : -1; }();
+    if (thp_force >= 0) want_thp = thp_force == 1;
     if (want_thp) {
 #ifdef MADV_HUGEPAGE
       (void)madvise(base_, total, MADV_HUGEPAGE);  // best-effort; no-op if THP is disabled
@@ -21915,18 +21936,33 @@ static bool pooled_read_chunks(size_t host_chunk,
 
   // Adaptive sizing applies only to the buffered pool: O_DIRECT is single-stream
   // by settled design, a user pin is final, and without a pool there is nothing
-  // to park.  A bounded window (a probe pass) is excluded too — its whole point
-  // is to time ONE configuration, and resizing underneath it would measure a
-  // moving target.  Declared here because read_loop captures them.
+  // to park.  A BOUNDED window (the read probe's two timed passes) is excluded
+  // too — its whole point is to time ONE configuration, and resizing underneath
+  // it would measure a moving target.  The probe's last pass is not one of them:
+  // it carries a window only for its start offset (no chunk cap, no clock), and
+  // it is the rest of the run.  Until v0.18.15 every window was excluded, so a
+  // default cold compress of 4 GiB or more — the case the probe exists for —
+  // never resized at all.  Declared here because read_loop captures them.
   const int  rd_floor = std::max(1, n_readers / 2);
   const int  rd_ceil  = std::min(n_readers * 3, 32);
+  const bool win_bounded = win != nullptr
+                        && (win->max_chunks != SIZE_MAX || win->target_secs > 0.0);
   const bool rd_adaptive = optp && optp->adapt && optp->read_threads == 0 && !o_direct
-                        && pool != nullptr && win == nullptr && rd_ceil > n_readers;
+                        && pool != nullptr && !win_bounded && rd_ceil > n_readers;
   // Start from the profile's settled count when there is one — that is the whole
   // point of persisting it: run 2 begins where run 1 finished instead of paying
   // the climb again (~1.5 s on a 32 GiB input).  Clamped into this run's range,
   // since chunk size or thread count may differ from when it was recorded.
-  const int rd_seed = g_adapt_rd_prior.load(std::memory_order_relaxed);
+  //
+  // ONLY FOR A POOL THAT RESIZES, as the decompress and --tar readers already
+  // had it.  The seed becomes want(), and bind_live publishes want() as the live
+  // reader count the governor divides by — but a pass that does not resize runs
+  // exactly n_readers threads.  MEASURED (v0.18.15): a profile seed of 6 on a
+  // one-reader O_DIRECT compress published 3 (the seed clamped to that pool's
+  // ceiling), the saturated reader read 33% busy on every tick, and the whole
+  // run was classified and filed compute-bound; without the seed, 99% and
+  // source-bound.  The probe's timed passes published it the same way.
+  const int rd_seed = rd_adaptive ? g_adapt_rd_prior.load(std::memory_order_relaxed) : 0;
   ReaderPoolCtl rd_ctl(n_readers, rd_floor, rd_ceil, rd_seed);
   rd_ctl.bind_live(m ? &m->reader_threads : nullptr);
   rd_ctl.set_log(optp, "reader pool");
@@ -22066,11 +22102,7 @@ static bool pooled_read_chunks(size_t host_chunk,
     }
   };
 
-  // Adaptive sizing applies only to the buffered pool: O_DIRECT is single-stream
-  // by settled design, a user pin is final, and without a pool there is nothing
-  // to park.  A bounded window (a probe pass) is excluded too — its whole point
-  // is to time ONE configuration, and resizing underneath it would measure a
-  // moving target.
+  // rd_adaptive (above) says which passes resize.
   if (n_readers == 1 && !rd_adaptive) {
     read_loop(0);
   } else {
@@ -22093,6 +22125,10 @@ static bool pooled_read_chunks(size_t host_chunk,
     if (rd_adaptive) {
       if (m) m->reader_threads.store(rd_ctl.want(), std::memory_order_relaxed);
       g_adapt_rd_settled.store(rd_ctl.want(), std::memory_order_relaxed);
+      // The summary's action list.  Only the decompress reader set this until
+      // v0.18.15, so a compress that settled 12 -> 6 reported "actions: none".
+      if (rd_ctl.want() != rd_ctl.start())
+        g_adapt_action_flags.fetch_or(ADAPT_ACT_READER_SCALEUP, std::memory_order_relaxed);
       if (optp->verbosity >= V_VERBOSE) {
         char rb[160];
         std::snprintf(rb, sizeof rb,
@@ -25842,6 +25878,8 @@ static void assemble(TaskQueue & queue, const TarLayout & lay, size_t chunk_size
   if (rd_ad_t) {
     if (m) m->reader_threads.store(rd_ctl_t.want(), std::memory_order_relaxed);
     g_adapt_rd_settled.store(rd_ctl_t.want(), std::memory_order_relaxed);
+    if (rd_ctl_t.want() != rd_ctl_t.start())   // the summary's action list, as above
+      g_adapt_action_flags.fetch_or(ADAPT_ACT_READER_SCALEUP, std::memory_order_relaxed);
     if (opt.verbosity >= V_VERBOSE) {
       char rb[160];
       std::snprintf(rb, sizeof rb,
@@ -31088,17 +31126,20 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     const double rb = b.secs > 0 ? (double)b.bytes.load() / b.secs : 0.0;
     // 5% margin, matching the backend prior: a tie keeps the buffered path,
     // which is what a run without this probe would have used.
-    const bool take_direct = ra > rb * 1.05;
+    const int  forced = read_probe_forced_pick();
+    const bool take_direct = forced ? forced == 1 : ra > rb * 1.05;
     if (opt.verbosity >= V_VERBOSE) {
-      char pb[192];
+      char pb[224];
       std::snprintf(pb, sizeof pb,
         "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over %.0f/%.0f ms "
-        "-> %s for the remainder\n",
+        "-> %s for the remainder%s\n",
         ra / 1073741824.0, rb / 1073741824.0, a.secs * 1000.0, b.secs * 1000.0,
-        take_direct ? "O_DIRECT" : "buffered");
+        take_direct ? "O_DIRECT" : "buffered", forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)" : "");
       vlog(V_VERBOSE, opt, pb);
     }
-    ReadWindow c;                                   // pass 3: the rest, unbounded
+    // Pass 3: the rest, unbounded.  Its window carries only the start offset, so
+    // a buffered remainder sizes itself under --adapt (see rd_adaptive).
+    ReadWindow c;
     c.start_chunk = b.start_chunk + b.chunks.load();
     return run_pooled_reader(take_direct, take_direct ? fds.d : fds.b,
                              fsz_known, &c);
@@ -37258,20 +37299,25 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
               if (ok && !b.eof.load() && b.chunks.load() > 0 && !aborted()) {
                 const double ra = a.secs > 0 ? (double)a.bytes.load() / a.secs : 0.0;
                 const double rb = b.secs > 0 ? (double)b.bytes.load() / b.secs : 0.0;
-                const bool td = ra > rb * 1.05;
+                const int  forced = read_probe_forced_pick();
+                const bool td = forced ? forced == 1 : ra > rb * 1.05;
                 if (opt.verbosity >= V_VERBOSE) {
-                  char pb[192];
+                  char pb[224];
                   std::snprintf(pb, sizeof pb,
                     "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over "
-                    "%.0f/%.0f ms -> %s for the remainder\n",
+                    "%.0f/%.0f ms -> %s for the remainder%s\n",
                     ra / 1073741824.0, rb / 1073741824.0,
-                    a.secs * 1000.0, b.secs * 1000.0, td ? "O_DIRECT" : "buffered");
+                    a.secs * 1000.0, b.secs * 1000.0, td ? "O_DIRECT" : "buffered",
+                    forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)" : "");
                   vlog(V_VERBOSE, opt, pb);
                 }
+                // The rest of the run: Options so a buffered remainder sizes
+                // itself under --adapt (the two timed passes above stay fixed;
+                // see rd_adaptive in pooled_read_chunks).
                 ReadWindow c; c.start_chunk = b.start_chunk + b.chunks.load();
                 ok = pooled_read_chunks(gpu_chunk, m, &nv_pool,
                                         td, td ? 1 : n_readers, td ? fdd : dr_fd,
-                                        nv_emit, &c);
+                                        nv_emit, &c, &opt);
               }
             }
             reader_done = ok; nv_probed = true;
