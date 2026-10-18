@@ -622,8 +622,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=539
-$EXTENSIVE && EXPECTED_TESTS=837
+EXPECTED_TESTS=547
+$EXTENSIVE && EXPECTED_TESTS=845
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -11817,6 +11817,231 @@ else
   fail "--sliding-window --cpu-only" "exit $rc or unexpected warning"
 fi
 rm -f "$TMPDIR/sw-cpu.zst"
+
+# ============================================================
+section "--sliding-window placement (v0.18.18)"
+
+# The worker count follows zstd's strategy for the level, and the run is placed
+# on the fewest L3 caches that hold it (GzSwPlacement).  The first four cells
+# run on any host with zstd worker threads; the count and -T placement cells
+# skip when usable L3 layout is unavailable.  The rest need two L3 caches this suite may use, and
+# skip_host otherwise.  None of it may change the frame.
+swp_in="$TMPDIR/large.bin"
+swp_n() { sed -E "s/.*$1 ([0-9]+).*/\1/"; }   # the number after a phrase
+swp_affinity_works=0
+if command -v taskset >/dev/null 2>&1; then
+  swp_first_cpu=$(taskset -pc $$ 2>/dev/null | sed -E 's/.*: ([0-9]+).*/\1/')
+  if [[ "$swp_first_cpu" =~ ^[0-9]+$ ]] && taskset -c "$swp_first_cpu" true 2>/dev/null; then
+    swp_affinity_works=1
+  fi
+fi
+
+# 1. zstd's workers write one frame for any count of at least one; a plan that
+#    fell to none (single-threaded mode, a different frame) would show here.
+"$GZSTD" -q -f --sliding-window -3 "$swp_in" -o "$TMPDIR/swp-a.zst" 2>/dev/null
+swp_rc_a=$?
+GZSTD_DEBUG_SW_PLACE=off "$GZSTD" -q -f --sliding-window -3 "$swp_in" -o "$TMPDIR/swp-b.zst" 2>/dev/null
+swp_rc_b=$?
+if [[ $swp_rc_a -eq 0 && $swp_rc_b -eq 0 && -s "$TMPDIR/swp-a.zst" ]] \
+   && cmp -s "$TMPDIR/swp-a.zst" "$TMPDIR/swp-b.zst"; then
+  pass "--sliding-window placement: the same frame placed and unplaced"
+else
+  fail "--sliding-window placement: the same frame placed and unplaced"
+fi
+rm -f "$TMPDIR/swp-a.zst" "$TMPDIR/swp-b.zst"
+
+# 2. Level 3 is dfast: half of an L3 cache's cores, at most 8, and zstd's pool
+#    is sized to the same number.
+"$GZSTD" -v -f --sliding-window -3 -c "$swp_in" 2>"$TMPDIR/swp2.err" >/dev/null
+swp_rc=$?
+swp_line=$(grep -ao "placement: level 3 (dfast) takes [0-9]* workers*: half of an L3 cache.s [0-9]* cores" "$TMPDIR/swp2.err" | head -1)
+swp_pool=$(grep -ao 'single-frame compression with [0-9]* zstd worker' "$TMPDIR/swp2.err" | swp_n with)
+swp_no_mt=0
+swp_layout_ok=1
+grep -qa 'has no multithreading; --sliding-window compresses on one thread' "$TMPDIR/swp2.err" && swp_no_mt=1
+if [[ $swp_rc -eq 0 && $swp_no_mt -eq 1 ]]; then
+  swp_layout_ok=0
+  skip_host "--sliding-window placement: the count follows the strategy" "zstd has no worker threads"
+elif [[ $swp_rc -eq 0 ]] \
+   && { grep -Eqa 'placement: none: (the CPU affinity cannot be read|the L3 cache layout cannot be read)' "$TMPDIR/swp2.err" \
+        || { [[ $swp_affinity_works -eq 0 ]] && grep -qa 'placement: none: the CPU affinity cannot be set' "$TMPDIR/swp2.err"; }; }; then
+  swp_layout_ok=0
+  skip_host "--sliding-window placement: the count follows the strategy" "placement unavailable on this host"
+else
+  swp_w=$(swp_n takes <<<"$swp_line"); swp_c=$(swp_n "cache.s" <<<"$swp_line")
+  swp_want=$(( (swp_c + 1) / 2 )); (( swp_want > 8 )) && swp_want=8
+  if [[ $swp_rc -eq 0 && -n "$swp_line" && "$swp_w" == "$swp_want" && "$swp_pool" == "$swp_w" ]]; then
+    pass "--sliding-window placement: the count follows the strategy"
+  else
+    fail "--sliding-window placement: the count follows the strategy" "line=[$swp_line] pool=$swp_pool"
+  fi
+fi
+
+# 3. Level 13 is btlazy2, compute-bound: unplaced, and the count it had before
+#    (which GZSTD_DEBUG_SW_PLACE=off also gives).
+"$GZSTD" -v -f --sliding-window -13 -c "$swp_in" 2>"$TMPDIR/swp3.err" >/dev/null
+swp_rc_a=$?
+GZSTD_DEBUG_SW_PLACE=off "$GZSTD" -v -f --sliding-window -13 -c "$swp_in" 2>"$TMPDIR/swp3b.err" >/dev/null
+swp_rc_b=$?
+swp_p13=$(grep -ao 'single-frame compression with [0-9]* zstd worker' "$TMPDIR/swp3.err" | swp_n with)
+swp_off=$(grep -ao 'single-frame compression with [0-9]* zstd worker' "$TMPDIR/swp3b.err" | swp_n with)
+if [[ $swp_rc_a -eq 0 && $swp_rc_b -eq 0 && $swp_no_mt -eq 1 ]]; then
+  skip_host "--sliding-window placement: levels 13 and up keep every core" "zstd has no worker threads"
+elif [[ $swp_rc_a -eq 0 && $swp_rc_b -eq 0 ]] \
+   && grep -qa 'placement: none: level 13 (btlazy2) is compute-bound' "$TMPDIR/swp3.err" \
+   && grep -qa 'placement: off: GZSTD_DEBUG_SW_PLACE=off' "$TMPDIR/swp3b.err" \
+   && [[ -n "$swp_p13" && "$swp_p13" == "$swp_off" ]]; then
+  pass "--sliding-window placement: levels 13 and up keep every core"
+else
+  fail "--sliding-window placement: levels 13 and up keep every core" "placed=$swp_p13 off=$swp_off"
+fi
+
+# 4. -T N is a count, still placed; -T 0 means every hardware thread, unplaced.
+"$GZSTD" -v -f --sliding-window -3 -T2 -c "$swp_in" 2>"$TMPDIR/swp4.err" >/dev/null
+swp_rc_a=$?
+"$GZSTD" -v -f --sliding-window -3 -T0 -c "$swp_in" 2>"$TMPDIR/swp4b.err" >/dev/null
+swp_rc_b=$?
+if [[ $swp_rc_a -eq 0 && $swp_rc_b -eq 0 && $swp_no_mt -eq 1 ]]; then
+  skip_host "--sliding-window placement: -T N is placed, -T 0 is not" "zstd has no worker threads"
+elif [[ $swp_rc_a -eq 0 && $swp_rc_b -eq 0 ]] \
+   && { grep -Eqa 'placement: none: (the CPU affinity cannot be read|the L3 cache layout cannot be read|2 workers would need every L3 cache)' "$TMPDIR/swp4.err" \
+        || { [[ $swp_affinity_works -eq 0 ]] && grep -qa 'placement: none: the CPU affinity cannot be set' "$TMPDIR/swp4.err"; }; }; then
+  skip_host "--sliding-window placement: -T N is placed, -T 0 is not" "no eligible subset of L3 caches"
+elif [[ $swp_rc_a -eq 0 && $swp_rc_b -eq 0 ]] \
+   && grep -qa 'placement: 2 workers asked for' "$TMPDIR/swp4.err" \
+   && grep -qa 'single-frame compression with 2 zstd worker threads' "$TMPDIR/swp4.err" \
+   && grep -qa 'placement: none: -T 0 asks for every hardware thread' "$TMPDIR/swp4b.err"; then
+  pass "--sliding-window placement: -T N is placed, -T 0 is not"
+else
+  fail "--sliding-window placement: -T N is placed, -T 0 is not" \
+    "$(grep -ah placement "$TMPDIR/swp4.err" "$TMPDIR/swp4b.err" | tr '\n' ' ')"
+fi
+
+# Two whole L3 caches inside this suite's affinity, as sysfs CPU lists.
+swp_expand() { tr ',' '\n' | awk -F- '{ if (NF == 1) print $1; else for (i = $1; i <= $2; i++) print i }'; }
+swp_caches=()
+if command -v taskset >/dev/null 2>&1; then
+  swp_allowed=" $(taskset -pc $$ 2>/dev/null | sed 's/.*: //' | swp_expand | tr '\n' ' ') "
+  while read -r swp_l; do
+    [[ -n "$swp_l" ]] || continue
+    swp_ok=1
+    for swp_c in $(swp_expand <<<"$swp_l"); do
+      [[ "$swp_allowed" == *" $swp_c "* ]] || { swp_ok=0; break; }
+    done
+    (( swp_ok )) && swp_caches+=("$swp_l")
+  done < <(cat /sys/devices/system/cpu/cpu[0-9]*/cache/index3/shared_cpu_list 2>/dev/null | sort -u | sort -n)
+fi
+if (( !swp_layout_ok || ${#swp_caches[@]} < 2 )); then
+  for swp_t in "the early threads use the placed cache" "placement is undone between files" \
+               "a second simultaneous run takes the other cache" "busy caches are avoided"; do
+    skip_host "--sliding-window placement: $swp_t" "fewer than two L3 caches here"
+  done
+else
+  swp_c1=${swp_caches[0]}; swp_c2=${swp_caches[1]}
+  swp_cl="$TMPDIR/swp-claims"; rm -rf "$swp_cl"
+  # Start a run held at the sliding-window gate (after its placement and claim,
+  # before any read) and wait for its pool line; leaves its pid in swp_pid.
+  swp_hold_seq=0
+  swp_held() {
+    swp_ready=0
+    swp_pid=""
+    swp_gate_fd=""
+    swp_hold_seq=$((swp_hold_seq + 1))
+    swp_fifo="$TMPDIR/swp.$swp_hold_seq.fifo"
+    mkfifo "$swp_fifo" || return 1
+    # A read/write handle keeps the release write from blocking if the child
+    # exits between its pool line and the gate.  Each hold gets a fresh FIFO,
+    # so an unread release byte cannot free the next held run.
+    exec {swp_gate_fd}<>"$swp_fifo" || return 1
+    GZSTD_DEBUG_GPU_CLAIMS_DIR="$swp_cl" GZSTD_DEBUG_SLIDING_GATE="$swp_fifo" \
+      taskset -c "$swp_c1,$swp_c2" "$GZSTD" -v -f --sliding-window -3 -c "$swp_in" 2>"$1" >/dev/null &
+    swp_pid=$!
+    for _ in $(seq 400); do
+      if grep -qa 'single-frame compression' "$1" 2>/dev/null; then swp_ready=1; return 0; fi
+      kill -0 "$swp_pid" 2>/dev/null || return 1
+      sleep 0.05
+    done
+    return 1
+  }
+  swp_release() {
+    local rc=1
+    if (( swp_ready )) && [[ -n "$swp_gate_fd" ]]; then
+      printf x >&"$swp_gate_fd"
+      wait "$swp_pid"; rc=$?
+    elif [[ -n "$swp_pid" ]]; then
+      kill "$swp_pid" 2>/dev/null || true
+      wait "$swp_pid" 2>/dev/null || true
+    fi
+    [[ -z "$swp_gate_fd" ]] || exec {swp_gate_fd}>&-
+    rm -f "$swp_fifo"
+    return "$rc"
+  }
+  swp_cpus() { grep -ao 'L3 caches (CPUs [0-9,-]*)' "$1" | head -1 | sed -E 's/.*CPUs ([0-9,-]*).*/\1/'; }
+
+  # 5. At this gate only the calling and progress threads exist.  Both must be
+  #    on the one placed cache named by the plan; later workers inherit the
+  #    calling thread's affinity when they start.
+  swp_threads=""
+  if swp_held "$TMPDIR/swp5.err"; then
+    swp_threads=$(for t in /proc/"$swp_pid"/task/*; do awk '/Cpus_allowed_list/{print $2}' "$t/status"; done | sort -u | tr '\n' ' ')
+  fi
+  swp_release; swp_rc=$?
+  swp_at=$(swp_cpus "$TMPDIR/swp5.err")
+  if [[ $swp_rc -eq 0 && -n "$swp_at" && ( "$swp_at" == "$swp_c1" || "$swp_at" == "$swp_c2" ) \
+        && "$swp_threads" == "$swp_at " ]] && grep -qa 'on 1 of 2 L3 caches' "$TMPDIR/swp5.err"; then
+    pass "--sliding-window placement: the early threads use the placed cache"
+  else
+    fail "--sliding-window placement: the early threads use the placed cache" \
+      "rc=$swp_rc line=[$swp_at] threads=[$swp_threads] allowed=[$swp_c1 | $swp_c2]"
+  fi
+
+  # 6. Two files in one run: the second is planned from the CPUs the process was
+  #    given, not from the first file's placement (which would read as one cache).
+  GZSTD_DEBUG_GPU_CLAIMS_DIR="$swp_cl" taskset -c "$swp_c1,$swp_c2" \
+    "$GZSTD" -v -f --sliding-window -3 -c "$swp_in" "$TMPDIR/medium.txt" 2>"$TMPDIR/swp6.err" >/dev/null
+  swp_rc=$?
+  if [[ $swp_rc -eq 0 && $(grep -ac 'placement: level 3 (dfast) .*on 1 of 2 L3 caches' "$TMPDIR/swp6.err") -eq 2 ]]; then
+    pass "--sliding-window placement: placement is undone between files"
+  else
+    fail "--sliding-window placement: placement is undone between files" \
+      "$(grep -ah placement "$TMPDIR/swp6.err" | tr '\n' ' ')"
+  fi
+
+  # 7. Claims: with the first run held at the gate, its cache claimed, a second
+  #    run takes the other one.
+  swp_b=""
+  if swp_held "$TMPDIR/swp7a.err"; then
+    GZSTD_DEBUG_GPU_CLAIMS_DIR="$swp_cl" taskset -c "$swp_c1,$swp_c2" \
+      "$GZSTD" -v -f --sliding-window -3 -c "$swp_in" 2>"$TMPDIR/swp7b.err" >/dev/null
+    swp_rc_b=$?
+    swp_b=$(swp_cpus "$TMPDIR/swp7b.err")
+  else swp_rc_b=1; fi
+  swp_release; swp_rc_a=$?
+  swp_a=$(swp_cpus "$TMPDIR/swp7a.err")
+  if [[ $swp_rc_a -eq 0 && $swp_rc_b -eq 0 && -n "$swp_a" && -n "$swp_b" && "$swp_a" != "$swp_b" ]]; then
+    pass "--sliding-window placement: a second simultaneous run takes the other cache"
+  else
+    fail "--sliding-window placement: a second simultaneous run takes the other cache" "first=[$swp_a] second=[$swp_b]"
+  fi
+
+  # 8. Load: told the first cache is busy, a run takes the second, and the other
+  #    way round.
+  GZSTD_DEBUG_GPU_CLAIMS_DIR="$swp_cl" GZSTD_DEBUG_SW_BUSY=16,0 taskset -c "$swp_c1,$swp_c2" \
+    "$GZSTD" -v -f --sliding-window -3 -c "$swp_in" 2>"$TMPDIR/swp8a.err" >/dev/null
+  swp_rc_a=$?
+  GZSTD_DEBUG_GPU_CLAIMS_DIR="$swp_cl" GZSTD_DEBUG_SW_BUSY=0,16 taskset -c "$swp_c1,$swp_c2" \
+    "$GZSTD" -v -f --sliding-window -3 -c "$swp_in" 2>"$TMPDIR/swp8b.err" >/dev/null
+  swp_rc_b=$?
+  if [[ $swp_rc_a -eq 0 && $swp_rc_b -eq 0 && "$(swp_cpus "$TMPDIR/swp8a.err")" == "$swp_c2" \
+        && "$(swp_cpus "$TMPDIR/swp8b.err")" == "$swp_c1" ]]; then
+    pass "--sliding-window placement: busy caches are avoided"
+  else
+    fail "--sliding-window placement: busy caches are avoided" \
+      "16,0 -> [$(swp_cpus "$TMPDIR/swp8a.err")] 0,16 -> [$(swp_cpus "$TMPDIR/swp8b.err")] caches [$swp_c1 | $swp_c2]"
+  fi
+  rm -rf "$swp_cl"
+fi
+rm -f "$TMPDIR"/swp*.err
 
 # The two zstd-compat command-line sections below are gated to --extensive:
 # they verify drop-in zstd/gzip flag compatibility (aliases, no-op acceptance,

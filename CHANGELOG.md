@@ -1,9 +1,148 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.17  
+**Covers:** v0.9.50 → v0.18.18  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
+
+---
+
+
+## v0.18.18 — `--sliding-window` sizes its workers by zstd's strategy and places the run on the fewest L3 caches (ROADMAP 10): 1.1-2.8x faster on whole files at levels 1-12
+
+The owner's ask (2026-10-16): ROADMAP 10 as planned -- separate worker count from placement, then a
+rule.  Measured on the 8-GPU server (2 x 64-core EPYC 9554: 16 L3 caches of 8 cores and their SMT
+siblings), warm, to /dev/null, `taskset` and `-T` per arm, arms interleaved; the CPU-only build, so
+no run opened a GPU.
+
+### Count and placement are separate effects, and both are large
+
+One frame compressed by zstd's own workers has a serial spine: the main thread copies the input into
+zstd's jobs and the output out of them, the reader thread copies the input from the file, and each
+job's checksum is taken in input order.  2 GiB slices of the three corpora, medians of 3:
+
+- **Placement.** 4 workers inside one cache took 0.27-0.40 s at level 3; the same 4 spread one per
+  cache 0.82-0.94 s, 8 spread 0.79-0.92.
+- **Count, inside one cache** (level 3): 2 / 4 / 6 / 8 / 12 / 16 workers took 0.33-0.63 / 0.27-0.40 /
+  0.30-0.41 / 0.40-0.43 / 0.42-0.51 / 0.45-0.48 s; 128 packed in, 0.73-0.81.  4 workers on 4 of the
+  cache's cores instead of all 8: 0.26-0.54 s against 0.25-0.48 at levels 2-5 (the spare cores run
+  the spine).
+- **A small count without the placement loses**: unpinned, 4 workers took 0.84-1.23 s at levels 2-8
+  and 8 took 0.67-0.97, against 0.66-0.94 for the default's 128.  So the new count is never used
+  without the placement, except where the process's CPUs are all in one cache anyway.
+- **Small inputs gain too**: 16 MiB 0.04 -> 0.02 s, 256 MiB 0.18-0.23 -> 0.06-0.11 s (much of the
+  default's cost there is starting 128 threads).
+
+### The count follows zstd's strategy and window, fitted on whole files
+
+The first rule, fitted to 2 GiB slices (12 workers at levels 8-12), was 1.5x SLOWER than the default
+at level 12 on the 19.5 GiB files: the pool's fill and drain weigh more on a slice (32 workers x
+16 MiB jobs are a quarter of 2 GiB).  Re-measured on the whole corpora (2 runs of 9 counts and
+placements per level), in shares of one cache's physical cores:
+
+| strategy (levels) | workers | 19.5 GiB | default |
+|---|---|---|---|
+| fast, dfast, greedy (1-5) | 1/2 a cache: 4 | 1.80-4.22 s | 4.40-5.60 s |
+| lazy (6-7), lazy2 on a window of 2 MiB or less (8) | 3/2: 12, two caches | 2.76-3.73 s | 5.03-5.54 s |
+| lazy2 on a larger window (9-12) | 4 caches: 32 | 2.89-4.67 s | 3.91-6.63 s |
+| btlazy2 and slower (13+, --ultra) | every core, as before | | (8 caches were no better) |
+
+The data matters as well: the high-ratio corpus (8000:1) wants fewer workers at every level (6 at
+levels 6-7, 1.94-1.98 s; 12-16 at 9-12), the medium (3.6:1) and low-ratio (1.1:1) ones the counts
+above, and real files sit with them (a 130 GiB tar compresses 2.0:1).  Over levels 1, 3 and 5-12 and
+the three corpora (30 cells): 102 s against 157 for the default and 90 for the best arm of each
+cell, and no cell slower than the default; the worst is high-ratio level 9, 4.67 s against its best
+2.36 and the default's 6.39.  On the 2 GiB slices: 13.7 s against 27.8, none slower.
+
+The caps (8, 24, 32) keep a cache of more than 12 cores to measured counts; the 12-core, one-L3
+workstation's v0.18.8 data agrees where it exists (4-6 workers beat 12 at levels 1-3, half its cache
+is 6; all 12 cores best at levels 6-12).  A rate-matching rule (enough workers to feed a fixed spine
+rate, from one worker's measured rate) fitted the slices within 10% when given the true rate, and
+was rejected: a probe of the first 4 MiB varied 5x within a single file (the medium corpus alternates
+1.2:1 and 5800:1 stretches), and zstd's per-job table reset made a 4 MiB sample 2-4x slow at levels
+9-12.
+
+### Placement on a shared host
+
+- The compression path's threads inherit it: the plan is applied to the calling thread before its
+  progress, writer and reader threads and zstd's pool exist, and that thread's own affinity is
+  restored when the frame is done.  An outer `--adapt` governor or `--verify` pool starts earlier
+  and retains its own affinity.  The placement stays within the CPUs given to the calling thread
+  (taskset, a cpuset).
+- The scheduler moves unpinned work off a pinned cache within milliseconds (4 busy loops started
+  inside it: 0.39-0.48 s against 0.40 idle; pinned to half its cores, 0.43-0.50).
+- The bad case is several gzstd runs pinned to one cache: 4 at once took 1.20 s, against 1.04 with
+  the default.  So runs **claim** their caches, as GPU ranking claims cards (the same per-user
+  claims directory, a second file): a claimed cache ranks as full.  Measured: 4 simultaneous runs
+  0.56 s on four caches (off: 1.03), 8 runs 0.60 (off: 1.02).
+- Then less busy caches first (among those that still let the fewest caches hold the count), from
+  a 20 ms /proc/stat sample taken only where 20 ms is small: 8 GiB or more, or a size not known (a
+  pipe).  At 2 GiB it cost 0.01-0.04 s with the same cache chosen
+  either way.  /proc/schedstat was tried first and rejected: a CPU's run time there advances only when
+  a task is switched out, so a busy loop read as idle in 10 ms windows.
+- For caches with known socket IDs, a plan that needs several caches prefers the first one's socket
+  unless a cache elsewhere is a whole busy hardware thread lighter; an unknown ID adds no preference.
+
+### Results, one binary (GZSTD_DEBUG_SW_PLACE=off is the control)
+
+Whole 19.5 GiB corpora from the page cache to /dev/null, 3 runs per arm, interleaved; medians
+(ranges):
+
+| level | data | placed (v0.18.18) | off (v0.18.17's count, unplaced) | speedup |
+|---|---|---|---|---|
+| 1 | high | 2.49 s (2.36-2.71) | 4.43 s (4.39-4.60) | 1.78x |
+| 1 | medium | 2.92 s (2.92-2.93) | 4.56 s (4.56-4.56) | 1.56x |
+| 1 | low | 2.55 s (2.55-2.71) | 4.71 s (4.68-4.80) | 1.85x |
+| 3 | high | 1.83 s (1.83-1.85) | 5.17 s (5.15-5.20) | 2.83x |
+| 3 | medium | 3.53 s (3.53-3.59) | 5.52 s (5.32-5.78) | 1.56x |
+| 3 | low | 3.56 s (3.53-3.56) | 5.55 s (5.35-5.58) | 1.56x |
+| 6 | high | 3.40 s (3.10-3.86) | 5.27 s (5.25-5.46) | 1.55x |
+| 6 | medium | 3.60 s (3.45-3.75) | 5.43 s (4.80-5.92) | 1.51x |
+| 6 | low | 3.12 s (2.93-3.84) | 5.26 s (4.93-5.51) | 1.69x |
+| 9 | high | 4.58 s (4.56-4.78) | 5.95 s (4.96-6.28) | 1.30x |
+| 9 | medium | 2.78 s (2.75-2.82) | 6.42 s (5.06-8.55) | 2.31x |
+| 9 | low | 4.32 s (4.21-4.53) | 6.36 s (4.92-6.46) | 1.47x |
+| 12 | high | 4.30 s (4.26-4.57) | 5.17 s (5.12-5.23) | 1.20x |
+| 12 | medium | 3.39 s (3.37-3.45) | 5.12 s (5.04-5.59) | 1.51x |
+| 12 | low | 3.78 s (3.73-4.00) | 4.14 s (3.91-4.34) | 1.10x |
+
+Cold (medium, level 3, dropped from the page cache, the O_DIRECT reader): 4.90 s against 5.27, 1.08x;
+the drive is the limit there.
+
+### Also
+
+- The claims code (v0.18.7) moved out of the GPU-only build and takes a kind (`GzClaims`,
+  `GzClaimsKind`): GPU ranking keeps `gpu-claims` unchanged, placement uses `l3-claims`, keys
+  `L3-<first CPU>`.
+- `--help` describes the count and the placement; `-v` prints the plan (`[SLIDING-WINDOW]
+  placement: ...`) and `-vv` the caches' cores, load and claims.  "with 1 zstd worker threads" is
+  now singular.
+- Hooks: `GZSTD_DEBUG_SW_PLACE=off` (the old count, unplaced), `GZSTD_DEBUG_SW_BUSY=b0,b1,...` (busy
+  hardware threads per cache, in CPU order, instead of the sample), `GZSTD_DEBUG_L3_CLAIMS=off`.
+- The output does not depend on any of it: zstd's workers write the same frame for any count of at
+  least one (checked at -T 1, 2, 3, 7 and 32, and by a new cell placed against unplaced).
+- Tests: +8 cells in "--sliding-window placement (v0.18.18)" (547 default, 845 with -e); four need
+  two L3 caches the suite may use and `skip_host` otherwise; placement checks also skip when the
+  supported zstd build has no worker threads or usable L3 layout.  Each was seen to fail: claims off,
+  placement off, and five source mutants (no restore, busy ignored, zero workers, the wrong share,
+  the progress thread started before the plan).
+
+- Suites: CPU-only default 401/0 (120 skipped, the no-GPU set); GPU default, masked to one healthy
+  card on a host with tenants and a failed card, 532/0/15 of 547 -- the 15 skips are the multi-GPU
+  cells a one-card mask cannot run, the same 15 as v0.18.16's masked run.  The first CPU-only run
+  failed one source guard: check-endian-reads.sh flagged the two `sched_setaffinity` calls as
+  possible host-order reads; it now lists `sched_setaffinity` beside `sched_getaffinity` among the
+  callees that cannot read an on-disk field.  `-e` not run: no argument parsing changed.
+
+### Still open (ROADMAP 10)
+
+- The workstation: its new counts (6 at levels 1-5, 12 at 6-12) against its v0.18.8 bests.
+- Caches of more than 12 cores (single-socket parts with one large L3) are held to the caps,
+  unmeasured.  `--long` moves a level onto the larger-window row (more workers), unmeasured with
+  long-distance matching.
+- High-ratio data at levels 6-12 runs up to 2x slower than its own best (never slower than before).
+- The single-frame decoder's reader, decoder and writer threads are not placed.
+- Claims are per user; simultaneous runs of different users see each other only as load.
 
 ---
 

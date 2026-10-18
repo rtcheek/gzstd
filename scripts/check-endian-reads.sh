@@ -129,6 +129,8 @@ declare -a ALLOW_CALLEE=(
   'pthread_setaffinity_np'       # &cpu_set_t in; scheduling, not a field read
   'sched_getaffinity'            # &cpu_set_t OUT from the kernel; a CPU mask has
                                  # no on-disk representation and no byte order
+  'sched_setaffinity'            # &cpu_set_t IN to the kernel; likewise (v0.18.18:
+                                 # --sliding-window's placement and its restore)
   'strftime'                     # &tm in, formatted text out; no on-disk integer
   'sscanf'                       # parses decimal TEXT into &ints; text has no byte
                                  # order.  (v0.17.73: --calibrate reads its children's

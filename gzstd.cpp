@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.17";
+static constexpr const char * GZSTD_VERSION = "0.18.18";
 //
 // Architecture overview:
 //
@@ -5475,9 +5475,23 @@ static void print_help_long()
 "     supports it; otherwise warns and uses one thread. Maximum ratio on\n"
 "     repetitive data (matches `zstd` exactly) because the\n"
 "     sliding window carries context across the full file.\n"
-"     Implies --cpu-only.  Workers default to the PHYSICAL cores this\n"
-"     process may use, as `zstd -T0` does (hyperthread siblings add\n"
-"     nothing); -T N sets N, -T 0 uses every hardware thread.\n"
+"     Implies --cpu-only.  One frame has a serial spine (reading, copying\n"
+"     into zstd's jobs, checksumming in order) that is fastest when the\n"
+"     compression threads share L3 caches, so the worker count follows\n"
+"     zstd's strategy and the compression path is placed (v0.18.18):\n"
+"     with default parameters on large inputs, levels 1-5\n"
+"     take half of an L3 cache's cores, 6-8 one and a half caches' worth,\n"
+"     9-12 four caches' worth, on the fewest caches that hold them (the\n"
+"     least loaded, accounting for other gzstd runs of your user) inside\n"
+"     the CPUs this process may use.  Levels 13 and up are compute-bound and\n"
+"     use the PHYSICAL cores this process may use, as `zstd -T0` does.\n"
+"     Small inputs and --zstd/--long may change the strategy or window.\n"
+"     If layout or affinity is unavailable, or every cache is needed on\n"
+"     a multi-cache host, the default count stays as before.\n"
+"     -T N sets N workers; they are placed for fast through lazy2 when\n"
+"     fewer caches can hold them.  -T 0 uses every hardware thread,\n"
+"     unplaced.  -v prints the placement.  The output does not depend on\n"
+"     it: the frame is the same for any number of workers.\n"
 "     The input is read ahead on its own thread, up to one 4 MiB chunk per\n"
 "     worker (64 at most) when the CPUs it may use span more than one L3\n"
 "     cache, 4 chunks inside one; --direct-read reads it with O_DIRECT.\n"
@@ -21330,6 +21344,207 @@ private:
   std::thread      th_;
 };
 
+// ---- CLAIMS: simultaneous gzstd processes see each other's choices (v0.18.7) ----
+//
+// Two users of one mechanism: the GPU ranking (cards, by UUID) and, since v0.18.18,
+// --sliding-window's L3 placement (caches, "L3-<first CPU>"; see GzSwPlacement).
+// Each has its own file in the claims directory and its own GzClaimsKind; the
+// text below describes the GPU case it was written for.
+//
+// Ranking reads the cards' PAST load: the probe's utilization is the driver's
+// last ~14 s, NVML's one instant, and free VRAM moves only once a job has
+// allocated.  Jobs that start together therefore all see the same picture and
+// all choose the same card.  MEASURED on the 8-GPU host (v0.18.6, three idle
+// cards): 4 and 8 simultaneous `--gpu-only --gpu-devices=1` jobs landed on ONE
+// card in 10 of 10 rounds, and with 8 there, 2-4 jobs per round found too little
+// VRAM left for a single stream and ran on the CPU instead (the others had each
+// taken their --gpu-mem-frac of what was free).
+//
+// So every process that ranks records the cards it chose, and the next one
+// counts them.  Under one lock: read the live claims, rank, append its own.  A
+// claim adds 100 to the card's utilization, the top of the sampled scale: a
+// card with a gzstd job on it ranks at least as busy as a saturated card.  The
+// existing combined utilization/free-VRAM rank still decides the choice.  A
+// claim lives as long as its process: it records the pid and the start time; a line whose
+// process is gone (or whose pid now belongs to another process) is dropped
+// when the next ranking rewrites the file.  So no exit path has to clean up.
+//
+// Per user: $XDG_RUNTIME_DIR/gzstd, else /dev/shm/gzstd-<uid>, mode 0700 and
+// owned by us, checked every time (a directory someone else made is ignored).
+// Jobs of different users do not see each other's claims; they still see each
+// other's load once it shows.  Lock waiting and scanning share the ranking's
+// 500 ms budget.  The wait uses a helper thread, so a process stopped while
+// holding it cannot hold anyone else past the deadline; the ranking then goes
+// ahead without claims.  GZSTD_DEBUG_GPU_CLAIMS=off disables all of it, and
+// GZSTD_DEBUG_GPU_CLAIMS_DIR=<dir> moves it (the suite's private directory).
+#ifdef __linux__
+struct GzClaims {
+  int fd = -1;                                  // the claims file, LOCK_EX held while >= 0
+  std::map<std::string, unsigned> live;         // key -> live claims by other processes
+  std::vector<std::string> keep;                // the live lines, rewritten with ours
+  std::string why;                              // why there are none, for -vv
+  ~GzClaims() { if (fd >= 0) ::close(fd); }     // closing releases the lock
+};
+
+// What a claims file holds: its name in the claims directory, the hook that
+// turns it off, and the shape of a valid key (a prefix, and its longest length).
+struct GzClaimsKind { const char * file; const char * off_hook; const char * prefix; size_t key_max; };
+#ifdef HAVE_NVCOMP
+static const GzClaimsKind GZ_CLAIMS_GPU = { "gpu-claims", "GZSTD_DEBUG_GPU_CLAIMS", "GPU-",
+                                            sizeof("GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx") - 1 };
+#endif
+static const GzClaimsKind GZ_CLAIMS_L3  = { "l3-claims", "GZSTD_DEBUG_L3_CLAIMS", "L3-",
+                                            sizeof("L3-") - 1 + 10 };
+
+// The process's start time in clock ticks since boot (field 22 of
+// /proc/<pid>/stat), or 0 if the process does not exist.  The command name in
+// field 2 may hold spaces or parentheses, so the fields are counted from the
+// LAST ')'.
+static unsigned long long gz_proc_starttime(long pid)
+{
+  std::ifstream f("/proc/" + std::to_string(pid) + "/stat");
+  std::string s;
+  if (!std::getline(f, s)) return 0;
+  const auto rp = s.rfind(')');
+  if (rp == std::string::npos) return 0;
+  std::istringstream ss(s.substr(rp + 1));
+  std::string tok;
+  for (int field = 3; ss >> tok; ++field)
+    if (field == 22) return std::strtoull(tok.c_str(), nullptr, 10);
+  return 0;
+}
+
+// The per-user claims directory, created if absent; "" when there is none we
+// can trust.
+static std::string gz_claims_dir(const char * off_hook)
+{
+  const char * hook = std::getenv(off_hook);
+  if (hook && std::strcmp(hook, "off") == 0) return "";
+  std::string dir;
+  if (const char * d = std::getenv("GZSTD_DEBUG_GPU_CLAIMS_DIR")) dir = d;
+  else if (const char * x = std::getenv("XDG_RUNTIME_DIR"); x && *x == '/') dir = std::string(x) + "/gzstd";
+  else dir = "/dev/shm/gzstd-" + std::to_string((unsigned long)::getuid());
+  if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return "";
+  struct stat st{};
+  if (::lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::getuid()
+      || (st.st_mode & 077) != 0)
+    return "";
+  return dir;
+}
+
+// Lock the claims file and read the live claims within `deadline`.  A timed-out
+// scan retains the lock so the later write can replace the stale contents.
+static std::unique_ptr<GzClaims> gz_claims_open(const GzClaimsKind & kind,
+                                                std::chrono::steady_clock::time_point deadline)
+{
+  auto c = std::make_unique<GzClaims>();
+  if (std::chrono::steady_clock::now() >= deadline) {
+    c->why = "the ranking budget was spent before claims"; return c;
+  }
+  const std::string dir = gz_claims_dir(kind.off_hook);
+  if (dir.empty()) { c->why = "no claims directory"; return c; }
+  const int fd = ::open((dir + "/" + kind.file).c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd < 0) { c->why = std::string("cannot open the claims file: ") + std::strerror(errno); return c; }
+  struct stat st{};
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    ::close(fd); c->why = "the claims file is not regular"; return c;
+  }
+  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    // Contended: block on a helper thread, give up at the deadline.  A thread
+    // that gets the lock after we gave up closes the descriptor, which releases it.
+    struct Shared { std::mutex m; std::condition_variable cv; bool done = false, ok = false, abandoned = false; };
+    auto sh = std::make_shared<Shared>();
+    try {
+      std::thread([sh, fd] {
+        const bool ok = ::flock(fd, LOCK_EX) == 0;
+        std::lock_guard<std::mutex> lk(sh->m);
+        if (sh->abandoned) { ::close(fd); return; }
+        sh->ok = ok; sh->done = true; sh->cv.notify_all();
+      }).detach();
+    } catch (const std::system_error &) {
+      ::close(fd); c->why = "cannot start the lock thread"; return c;
+    }
+    std::unique_lock<std::mutex> lk(sh->m);
+    if (!sh->cv.wait_until(lk, deadline, [&sh] { return sh->done; })) {
+      sh->abandoned = true;
+      c->why = "the claims lock was not free within the ranking budget";
+      return c;
+    }
+    if (!sh->ok) { ::close(fd); c->why = "flock failed"; return c; }
+  }
+  c->fd = fd;
+  // Read incrementally.  A torn or corrupt file must not turn the shared
+  // ranking deadline into an unbounded read, /proc scan, or allocation.  The
+  // line cap follows the key and decimal field widths, not the host's size.
+  const size_t max_line = kind.key_max
+      + 2 + sizeof(long) * 3 + sizeof(unsigned long long) * 3;
+  auto abandon = [&](const char * why) {
+    c->live.clear(); c->keep.clear(); c->why = why;
+    // Keep the lock so gz_claims_write can replace the unreadable contents
+    // with this process's claim.  Otherwise every later job pays the scan.
+    return std::move(c);
+  };
+  auto parse_line = [&](const std::string & line) {
+    std::istringstream ls(line);
+    std::string key;
+    long pid = 0;
+    unsigned long long start = 0;
+    if (!(ls >> key >> pid >> start) || key.rfind(kind.prefix, 0) != 0 || pid <= 0) return;
+    if (pid == (long)::getpid() || gz_proc_starttime(pid) != start) return;
+    ++c->live[key];
+    c->keep.push_back(line);
+  };
+  std::string line;
+  bool overlong = false;
+  char buf[4096];
+  off_t offset = 0;
+  for (;;) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      return abandon("the claims scan exceeded the ranking budget");
+    const ssize_t n = ::pread(fd, buf, sizeof buf, offset);
+    if (n < 0) return abandon("cannot read the claims file");
+    if (n == 0) break;
+    offset += n;
+    for (ssize_t i = 0; i < n; ++i) {
+      if (buf[i] == '\n') {
+        if (!overlong) parse_line(line);
+        line.clear(); overlong = false;
+        if (std::chrono::steady_clock::now() >= deadline)
+          return abandon("the claims scan exceeded the ranking budget");
+      } else if (line.size() < max_line) line += buf[i];
+      else overlong = true;
+    }
+  }
+  if (!overlong && !line.empty()) parse_line(line);
+  if (std::chrono::steady_clock::now() >= deadline)
+    return abandon("the claims scan exceeded the ranking budget");
+  return c;
+}
+
+// Rewrite the claims file: the live lines, then one per key (a card, a cache)
+// this process chose; `sel` lists them, comma-separated.
+static void gz_claims_write(GzClaims & c, const GzClaimsKind & kind, const std::string & sel)
+{
+  if (c.fd < 0) return;
+  std::string out;
+  for (const auto & l : c.keep) out += l + "\n";
+  const unsigned long long me = gz_proc_starttime((long)::getpid());
+  std::stringstream ss(sel);
+  std::string key;
+  while (std::getline(ss, key, ','))
+    if (key.rfind(kind.prefix, 0) == 0 && me)
+      out += key + " " + std::to_string((long)::getpid()) + " " + std::to_string(me) + "\n";
+  if (::ftruncate(c.fd, 0) == 0) {
+    size_t off = 0;
+    while (off < out.size()) {
+      const ssize_t w = ::pwrite(c.fd, out.data() + off, out.size() - off, (off_t)off);
+      if (w <= 0) break;
+      off += (size_t)w;
+    }
+  }
+}
+#endif // __linux__
+
 // Physical cores this process may run on: distinct (package, core) pairs among
 // the CPUs in its affinity mask, from sysfs.  0 when that cannot be read, and
 // the caller falls back.  Hyperthread siblings share one core's execution units.
@@ -21391,12 +21606,467 @@ static unsigned gz_l3_domains_allowed()
 #endif
 }
 
+// ---- --sliding-window: HOW MANY WORKERS, AND WHERE (v0.18.18, ROADMAP 10) ----
+//
+// One frame compressed by zstd's own worker threads has a serial spine: this
+// thread copies the input into zstd's job buffers and the output out of them,
+// the reader thread copies the input from the file, and each job's checksum is
+// taken in input order.  The workers compress in parallel around it.  Where
+// those threads run decides the speed more than how many there are.  MEASURED
+// on the 8-GPU server (2 x 64-core EPYC 9554: 16 L3 caches of 8 cores and their
+// SMT siblings), 2 GiB slices of the three corpora from memory to /dev/null,
+// warm, medians of 3:
+//
+//   * PLACEMENT.  4 workers inside one L3 cache took 0.27-0.40 s at level 3; the
+//     same 4 spread one per cache 0.82-0.94 s, 8 spread 0.79-0.92.  Across caches
+//     every copy the spine makes crosses the fabric between them.
+//   * COUNT, at fixed placement (one cache), level 3: 2 / 4 / 6 / 8 / 12 / 16
+//     workers took 0.33-0.63 / 0.27-0.40 / 0.30-0.41 / 0.40-0.43 / 0.42-0.51 /
+//     0.45-0.48 s, and 128 packed in 0.73-0.81.  Workers beyond what the spine can
+//     feed only add jobs in flight and take the cores the spine runs on: 4 workers
+//     on 4 of a cache's cores took 0.26-0.54 s at levels 2-5, on all 8 0.25-0.48.
+//   * A SMALL COUNT WITHOUT THE PLACEMENT LOSES.  Left to the scheduler, 4 workers
+//     took 0.84-1.23 s at levels 2-8 and 8 took 0.67-0.97, against 0.66-0.94 for
+//     the default's 128.  So the count below is used only with the placement, or
+//     where the process's CPUs are all in one cache anyway.
+//   * BY STRATEGY AND WINDOW, MEASURED ON WHOLE FILES.  2 GiB slices suggested
+//     fewer workers than whole files want: the pool's fill and drain weigh more on a
+//     slice (32 workers x 16 MiB jobs are a quarter of 2 GiB).  On the 19.5 GiB
+//     corpora (2 runs of 9 counts and placements per level):
+//       fast, dfast, greedy (levels 1-5)     1/2 a cache: 4    1.80-4.22 s, default 4.40-5.60
+//       lazy (6-7), lazy2 on a window of
+//         2 MiB or less (8)                  3/2: 12, 2 caches 2.76-3.73 s, default 5.03-5.54
+//       lazy2 on a larger window (9-12)      4 caches: 32      2.89-4.67 s, default 3.91-6.63
+//       btlazy2 and slower (13+)             every core, as before (8 caches were no better)
+//     The data matters too: the high-ratio corpus (8000:1) wants fewer at every
+//     level (6 workers, 1.94-1.98 s at levels 6-7; 12-16 at 9-12), the medium (3.6:1)
+//     and low-ratio (1.1:1) ones these counts, and real files sit with them (a 130
+//     GiB tar compresses 2.0:1).  Over levels 1, 3 and 5-12 and the three corpora
+//     (30 cells): 102 s, against 157 for the default and 90 for the best of each
+//     cell, and no cell slower than the default -- the worst is high-ratio level 9,
+//     4.67 s against its best 2.36 and the default's 6.39.  On the 2 GiB slices
+//     13.7 s against 27.8, none slower.  A first rule fitted to the slices (12 at
+//     levels 8-12) was 1.5x slower than the default at level 12 on whole files.
+//     The 12-core, one-L3 workstation (v0.18.8, ROADMAP 10) agrees where it was
+//     measured: 4-6 workers beat 12 by 1.13-2.10x at levels 1-3 (half its cache is
+//     6), and all 12 cores were best at levels 6-12 (the shares, held to its 12).
+//     A cache of more than 12 cores is unmeasured; the caps hold it to the counts
+//     that were.  A probe of one worker's rate on the first chunk, which would not
+//     need a table, was tried and rejected: one 4 MiB sample's rate varied 5x within
+//     a single file (ROADMAP 10).
+//   * SMALL INPUTS gain too: 16 MiB 0.04 -> 0.02 s, 256 MiB 0.18-0.23 -> 0.06-0.11
+//     (much of the default's cost there is starting 128 threads).
+//   * SHARED HOSTS.  The scheduler moves unpinned work off a pinned cache within
+//     milliseconds (4 busy loops started inside it: 0.39-0.48 s, idle 0.40); 4
+//     loops PINNED to half its cores cost 0.43-0.50.  The bad case is several
+//     gzstd runs pinned to one cache: 4 at once on one took 1.20 s, on one each
+//     0.43-0.45, and with today's default 1.04.  So a cache another gzstd process
+//     of this user has claimed ranks as full (the GPU ranking's claims file, a
+//     second kind), then busy caches rank lower, from a 20 ms /proc/stat sample
+//     taken only where 20 ms is small: 8 GiB or more, or a size not known.  At
+//     2 GiB it cost 0.01-0.04 s of 0.23-0.83 (same cache chosen either way), and
+//     unpinned load moves off by itself.  /proc/schedstat was rejected: a CPU's
+//     run time advances only when a task is switched out, so a busy loop reads idle.
+//
+// THE DECISION, made before the progress, reader, writer and zstd threads
+// start (they inherit it).  A contended claims lock can use a helper thread
+// during planning.  The outer --adapt governor and --verify pool can also
+// start earlier; those threads retain their original affinity.
+//
+//   case                                         workers                 where
+//   -------------------------------------------  ----------------------  -------------------
+//   GZSTD_DEBUG_SW_PLACE=off                     as before               as before
+//   -T 0                                         every hardware thread   as before
+//   strategy btlazy2 or slower (13+, --ultra)    as before, or -T N      as before
+//   CPU affinity or L3 layout unreadable         as before, or -T N      as before
+//   this process's CPUs all in one L3 cache      by strategy, or -T N    as before
+//   its CPUs span caches; fewer hold the count   by strategy, or -T N    the fewest that do
+//   its CPUs span caches; the count needs all    as before, or -T N      as before
+//   the affinity cannot be set                   as before, or -T N      as before
+//
+// "As before" is the v0.17.91 default, the physical cores this process may use.
+// The count is in physical cores; the allowed SMT siblings come with each
+// chosen cache and can run the spine.  It never leaves the affinity the process
+// was given (taskset, a cpuset), and the thread's own affinity is restored when
+// the frame is done.
+// GZSTD_DEBUG_SW_PLACE=off is the A/B control.  GZSTD_DEBUG_SW_BUSY=b0,b1,...
+// replaces the sample with busy hardware threads per cache, in CPU order, at any
+// input size; GZSTD_DEBUG_L3_CLAIMS=off turns the claims off.
+#ifdef __linux__
+// One L3 cache, as far as this process may use it.
+struct GzL3Dom {
+  int      first = -1;      // the cache's lowest CPU: its name, "L3-<first>"
+  long     pkg = -1;        // the socket it is on: a multi-cache plan stays on one
+  std::vector<int> cpus;    // its hardware threads inside this process's affinity
+  unsigned cores = 0;       // the physical cores among them
+  double   busy = 0.0;      // busy hardware threads in the sample (0 when unsampled)
+  unsigned claims = 0;      // other live gzstd processes that placed a run on it
+};
+
+// A sysfs CPU list ("0-7,128-135") into `out`; false if malformed.
+static bool gz_parse_cpu_list(const char * s, std::vector<int> & out)
+{
+  out.clear();
+  while (*s && *s != '\n') {
+    char * e = nullptr;
+    const long a = std::strtol(s, &e, 10);
+    if (e == s || a < 0) return false;
+    long b = a;
+    s = e;
+    if (*s == '-') {
+      b = std::strtol(s + 1, &e, 10);
+      if (e == s + 1 || b < a) return false;
+      s = e;
+    }
+    if (b >= CPU_SETSIZE) return false;
+    for (long c = a; c <= b; ++c) out.push_back((int)c);
+    if (*s == ',') ++s;
+    else if (*s && *s != '\n') return false;
+  }
+  return !out.empty();
+}
+
+// Sorted CPUs as a sysfs-style list, for the -v line.
+static std::string gz_cpu_list_str(std::vector<int> v)
+{
+  std::sort(v.begin(), v.end());
+  std::string s;
+  for (size_t i = 0; i < v.size();) {
+    size_t j = i;
+    while (j + 1 < v.size() && v[j + 1] == v[j] + 1) ++j;
+    if (!s.empty()) s += ",";
+    s += std::to_string(v[i]);
+    if (j > i) s += "-" + std::to_string(v[j]);
+    i = j + 1;
+  }
+  return s;
+}
+
+static bool gz_sysfs_line(const std::string & path, char * buf, size_t n)
+{
+  FILE * f = std::fopen(path.c_str(), "r");
+  if (!f) return false;
+  const bool ok = std::fgets(buf, (int)n, f) != nullptr;
+  std::fclose(f);
+  return ok;
+}
+
+// The L3 caches of the CPUs in `allowed`, in CPU order; empty when the layout
+// cannot be read.  Up to three sysfs reads per cache and one per physical core,
+// not per hardware thread.  The socket is optional (-1: unknown).
+static std::vector<GzL3Dom> gz_l3_layout(const cpu_set_t & allowed)
+{
+  std::vector<GzL3Dom> doms;
+  std::vector<int> dom_of(CPU_SETSIZE, -1), list;
+  std::vector<char> core_seen(CPU_SETSIZE, 0);
+  char line[4096];
+  for (int c = 0; c < CPU_SETSIZE; ++c) {
+    if (!CPU_ISSET(c, &allowed)) continue;
+    const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(c);
+    if (dom_of[c] < 0) {
+      if (!gz_sysfs_line(base + "/cache/index3/level", line, sizeof line) || std::atoi(line) != 3
+          || !gz_sysfs_line(base + "/cache/index3/shared_cpu_list", line, sizeof line)
+          || !gz_parse_cpu_list(line, list))
+        return {};
+      GzL3Dom d;
+      d.first = *std::min_element(list.begin(), list.end());
+      // The socket only steers which cache a multi-cache plan adds next; a host
+      // that does not report one (or reports -1) gets no preference, not no plan.
+      if (gz_sysfs_line(base + "/topology/physical_package_id", line, sizeof line)) {
+        char * pkg_end = nullptr;
+        const long pkg = std::strtol(line, &pkg_end, 10);
+        if (pkg_end != line && pkg >= 0) d.pkg = pkg;
+      }
+      for (int x : list) if (dom_of[x] < 0) dom_of[x] = (int)doms.size();
+      if (dom_of[c] != (int)doms.size()) return {};   // not in its own cache's list
+      doms.push_back(d);
+    }
+    GzL3Dom & d = doms[(size_t)dom_of[c]];
+    d.cpus.push_back(c);
+    if (!core_seen[c]) {          // a physical core: this thread and its siblings
+      if (!gz_sysfs_line(base + "/topology/thread_siblings_list", line, sizeof line)
+          || !gz_parse_cpu_list(line, list))
+        return {};
+      if (std::find(list.begin(), list.end(), c) == list.end()) return {};
+      for (int x : list)
+        if (CPU_ISSET(x, &allowed) && dom_of[x] != dom_of[c]) return {};
+      for (int x : list) core_seen[x] = 1;
+      core_seen[c] = 1;
+      ++d.cores;
+    }
+  }
+  std::sort(doms.begin(), doms.end(), [](const GzL3Dom & a, const GzL3Dom & b) { return a.first < b.first; });
+  return doms;
+}
+
+// Busy hardware threads per CPU over `ms` milliseconds: the non-idle share of
+// each CPU's /proc/stat clock ticks (idle and iowait count as idle).  Empty when
+// it cannot be read.  At the usual 100 Hz a busy CPU shows about two ticks
+// over 20 ms, so this is a coarse ranking signal.
+// A measurement window, not a wait for an event.
+static std::vector<double> gz_cpu_busy_sample(int ms)
+{
+  using Snap = std::vector<std::pair<unsigned long long, unsigned long long>>;
+  auto snap = [](Snap & v) {
+    v.assign(CPU_SETSIZE, {0, 0});
+    std::ifstream f("/proc/stat");
+    std::string l;
+    bool any = false;
+    while (std::getline(f, l)) {
+      if (l.size() < 4 || l.compare(0, 3, "cpu") != 0 || !std::isdigit((unsigned char)l[3])) continue;
+      int cpu = -1;
+      unsigned long long x[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      if (std::sscanf(l.c_str(), "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu", &cpu,
+                      &x[0], &x[1], &x[2], &x[3], &x[4], &x[5], &x[6], &x[7]) < 5
+          || cpu < 0 || cpu >= CPU_SETSIZE)
+        continue;
+      unsigned long long tot = 0;
+      for (unsigned long long y : x) tot += y;
+      v[(size_t)cpu] = {tot, x[3] + x[4]};
+      any = true;
+    }
+    return any;
+  };
+  Snap a, b;
+  if (!snap(a)) return {};
+  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+  if (!snap(b)) return {};
+  std::vector<double> busy(CPU_SETSIZE, 0.0);
+  for (size_t c = 0; c < busy.size(); ++c) {
+    if (b[c].first <= a[c].first || b[c].second < a[c].second) continue;
+    const unsigned long long dt = b[c].first - a[c].first, di = b[c].second - a[c].second;
+    if (di <= dt) busy[c] = double(dt - di) / double(dt);
+  }
+  return busy;
+}
+static const char * gz_strategy_name(int s)
+{
+  static const char * const n[] = {"?", "fast", "dfast", "greedy", "lazy", "lazy2",
+                                   "btlazy2", "btopt", "btultra", "btultra2"};
+  return (s >= 1 && s <= 9) ? n[s] : "?";
+}
+#endif // __linux__
+
+// The plan for one --sliding-window frame, applied to the calling thread on
+// construction and undone on destruction.  See the table above.
+class GzSwPlacement {
+public:
+  GzSwPlacement(const Options & opt, unsigned as_before, uint64_t total_in, bool sample_ok)
+    : workers_(as_before)
+  {
+#ifdef __linux__
+    plan_(opt, as_before, total_in, sample_ok);
+#else
+    (void)opt; (void)total_in; (void)sample_ok;
+#endif
+  }
+  ~GzSwPlacement()
+  {
+#ifdef __linux__
+    if (placed_) ::sched_setaffinity(0, sizeof saved_, &saved_);
+#endif
+  }
+  GzSwPlacement(const GzSwPlacement &) = delete;
+  GzSwPlacement & operator=(const GzSwPlacement &) = delete;
+  unsigned workers() const { return workers_; }
+  const std::string & note() const { return note_; }        // -v
+  const std::string & detail() const { return detail_; }    // -vv
+private:
+  unsigned    workers_;
+  std::string note_, detail_;
+#ifdef __linux__
+  bool        placed_ = false;
+  cpu_set_t   saved_;
+
+  void plan_(const Options & opt, unsigned as_before, uint64_t total_in, bool sample_ok)
+  {
+    const std::string tag = "[SLIDING-WINDOW] placement: ";
+    if (const char * h = std::getenv("GZSTD_DEBUG_SW_PLACE"); h && std::strcmp(h, "off") == 0) {
+      note_ = tag + "off: GZSTD_DEBUG_SW_PLACE=off\n";
+      return;
+    }
+    if (opt.cpu_threads == -1) {
+      note_ = tag + "none: -T 0 asks for every hardware thread\n";
+      return;
+    }
+    const bool asked = opt.cpu_threads > 0;               // -T N, or ZSTD_NBTHREADS
+    const ZSTD_compressionParameters cp = ZSTD_getCParams(opt.level, total_in, 0);
+    const int strat = g_zparams[6] ? g_zparams[6] : (int)cp.strategy;
+    const int uwl = ultra_window_log(opt.level, opt.ultra);   // --zstd=windowLog, --long, --ultra
+    const int wlog = uwl ? uwl : (int)cp.windowLog;
+    const std::string what = g_zparams[6] ? std::string("--zstd=strategy=") + std::to_string(strat)
+                           + " (" + gz_strategy_name(strat) + ")"
+                           : "level " + std::to_string(opt.level) + " (" + gz_strategy_name(strat) + ")";
+    if (strat >= (int)ZSTD_btlazy2) {
+      note_ = tag + "none: " + what + " is compute-bound and wants every core\n";
+      return;
+    }
+    CPU_ZERO(&saved_);
+    if (::sched_getaffinity(0, sizeof saved_, &saved_) != 0) {
+      note_ = tag + "none: the CPU affinity cannot be read\n";
+      return;
+    }
+    std::vector<GzL3Dom> doms = gz_l3_layout(saved_);
+    if (doms.empty()) {
+      note_ = tag + "none: the L3 cache layout cannot be read\n";
+      return;
+    }
+    unsigned cache_cores = 0, all_cores = 0;
+    for (const auto & d : doms) { cache_cores = std::max(cache_cores, d.cores); all_cores += d.cores; }
+    unsigned want;
+    std::string why;
+    if (asked) {
+      want = (unsigned)opt.cpu_threads;
+      why = std::to_string(want) + " worker" + (want == 1 ? "" : "s") + " asked for (-T or ZSTD_NBTHREADS)";
+    } else {
+      // The shares and caps of the table above: lazy, and lazy2 on a window of
+      // 2 MiB or less (level 8), take 3/2 of a cache; lazy2 on a larger one, 4.
+      const bool quick = strat <= (int)ZSTD_greedy;
+      const bool mid   = strat == (int)ZSTD_lazy || wlog <= 21;
+      const unsigned share = quick ? (cache_cores + 1) / 2 : mid ? (3 * cache_cores + 1) / 2
+                                   : 4 * cache_cores;
+      const unsigned cap = quick ? 8u : mid ? 24u : 32u;
+      want = std::max(1u, std::min({share, cap, all_cores}));
+      why = what + " takes " + std::to_string(want) + " worker" + (want == 1 ? "" : "s") + ": "
+          + (quick ? "half of" : mid ? "one and a half times" : "four times")
+          + " an L3 cache's " + std::to_string(cache_cores) + " cores"
+          + (want < share ? want == cap ? ", at most " + std::to_string(cap)
+                                        : ", held to the " + std::to_string(all_cores) + " this process may use"
+                          : std::string());
+    }
+    auto need_all = [&]() {
+      workers_ = asked ? want : as_before;
+      note_ = tag + "none: " + std::to_string(want) + " worker" + (want == 1 ? " would" : "s would")
+            + " need every L3 cache this process may use" + (asked ? "" : "; kept "
+            + std::to_string(as_before)) + "\n";
+    };
+    if (doms.size() == 1) {
+      workers_ = want;
+      note_ = tag + why + "; this process's CPUs share one L3 cache\n";
+      return;
+    }
+    // The fewest caches that can hold the count, if the largest were chosen.
+    std::vector<unsigned> by_size;
+    for (const auto & d : doms) by_size.push_back(d.cores);
+    std::sort(by_size.rbegin(), by_size.rend());
+    size_t k_min = 0;
+    for (unsigned held = 0; k_min < by_size.size() && held < want; ++k_min) held += by_size[k_min];
+    if (k_min >= doms.size()) { need_all(); return; }
+    // Load: a busy sample (or the hook) and other gzstd processes' claims.
+    std::string sampled = "not sampled (input under 8 GiB)";
+    if (const char * h = std::getenv("GZSTD_DEBUG_SW_BUSY")) {
+      const char * s = h;
+      for (auto & d : doms) {
+        char * e = nullptr;
+        const double v = std::strtod(s, &e);
+        if (e == s) break;
+        d.busy = std::max(0.0, v);
+        s = (*e == ',') ? e + 1 : e;
+      }
+      sampled = "from GZSTD_DEBUG_SW_BUSY";
+    } else if (sample_ok) {
+      const std::vector<double> busy = gz_cpu_busy_sample(20);
+      if (busy.empty()) sampled = "not sampled (/proc/stat unreadable)";
+      else {
+        for (auto & d : doms) for (int c : d.cpus) d.busy += busy[(size_t)c];
+        sampled = "busy hardware threads over 20 ms";
+      }
+    }
+    std::unique_ptr<GzClaims> claims =
+        gz_claims_open(GZ_CLAIMS_L3, std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
+    for (auto & d : doms) {
+      const auto it = claims->live.find("L3-" + std::to_string(d.first));
+      if (it != claims->live.end()) d.claims = it->second;
+    }
+    // A claimed cache counts as full, once per claim.  The first pick is the least
+    // loaded that still permits a minimum-cache plan; later ones prefer its socket
+    // unless one elsewhere is a whole busy hardware thread lighter.
+    auto load = [](const GzL3Dom & d) { return d.busy + double(d.claims) * double(d.cpus.size()); };
+    std::vector<size_t> order(doms.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return load(doms[a]) < load(doms[b]); });
+    std::vector<size_t> pick;
+    std::vector<size_t> rest = order;
+    unsigned held = 0;
+    long pkg0 = -1;
+    // On a partial cpuset the caches can have different usable capacities.
+    // Only consider a low-load cache if the remaining slots can still hold
+    // `want`; otherwise the load order can use more than k_min caches or fall
+    // back to the old count despite a k_min-cache placement being possible.
+    while (held < want && pick.size() < k_min) {
+      if (!pick.empty())
+        std::stable_sort(rest.begin(), rest.end(), [&](size_t a, size_t b) {
+          return load(doms[a]) + (pkg0 >= 0 && doms[a].pkg >= 0 && doms[a].pkg != pkg0 ? 1.0 : 0.0)
+               < load(doms[b]) + (pkg0 >= 0 && doms[b].pkg >= 0 && doms[b].pkg != pkg0 ? 1.0 : 0.0); });
+      std::vector<size_t> capacity_order = rest;
+      std::sort(capacity_order.begin(), capacity_order.end(), [&](size_t a, size_t b) {
+        return doms[a].cores > doms[b].cores;
+      });
+      std::vector<unsigned> prefix(capacity_order.size() + 1, 0);
+      std::vector<size_t> capacity_rank(doms.size());
+      for (size_t j = 0; j < capacity_order.size(); ++j) {
+        prefix[j + 1] = prefix[j] + doms[capacity_order[j]].cores;
+        capacity_rank[capacity_order[j]] = j;
+      }
+      const size_t slots = k_min - pick.size() - 1;
+      bool found = false;
+      for (size_t pos = 0; pos < rest.size(); ++pos) {
+        const size_t candidate = rest[pos];
+        unsigned possible = held + doms[candidate].cores;
+        possible += capacity_rank[candidate] < slots
+                  ? prefix[slots + 1] - doms[candidate].cores : prefix[slots];
+        if (possible < want) continue;
+        pick.push_back(candidate);
+        held += doms[candidate].cores;
+        if (pick.size() == 1) pkg0 = doms[candidate].pkg;
+        rest.erase(rest.begin() + pos);
+        found = true;
+        break;
+      }
+      if (!found) break;
+    }
+    {
+      std::ostringstream os;
+      os << "[SLIDING-WINDOW] L3 caches (first CPU: cores, busy, claims; " << sampled << "):";
+      for (const auto & d : doms) os << " " << d.first << ":" << d.cores << "," << std::fixed
+                                     << std::setprecision(1) << d.busy << "," << d.claims;
+      os << "; claims: " << (claims->why.empty() ? std::string("read") : claims->why) << "\n";
+      detail_ = os.str();
+    }
+    if (held < want || pick.size() >= doms.size()) { need_all(); return; }  // partly-allowed caches
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    std::vector<int> cpus;
+    std::string keys;
+    for (size_t i : pick) {
+      for (int c : doms[i].cpus) { CPU_SET(c, &mask); cpus.push_back(c); }
+      keys += (keys.empty() ? "" : ",") + ("L3-" + std::to_string(doms[i].first));
+    }
+    if (::sched_setaffinity(0, sizeof mask, &mask) != 0) {
+      const int e = errno;
+      workers_ = asked ? want : as_before;
+      note_ = tag + "none: the CPU affinity cannot be set (" + std::strerror(e) + ")"
+            + (asked ? "" : "; kept " + std::to_string(as_before)) + "\n";
+      return;
+    }
+    placed_ = true;
+    workers_ = want;
+    gz_claims_write(*claims, GZ_CLAIMS_L3, keys);
+    note_ = tag + why + "; on " + std::to_string(pick.size()) + " of " + std::to_string(doms.size())
+          + " L3 caches (CPUs " + gz_cpu_list_str(cpus) + ")\n";
+  }
+#endif
+};
+
 #ifndef _WIN32
 static double adapt_path_residency(const std::string & path);   // defined below
 static bool device_is_rotational(const std::string & path);     // defined below
 #endif
 static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
+  // v0.18.18: GzSwPlacement (above) usually replaces this count with fewer
+  // workers, placed; this is still its "as before" and the count for levels 13+.
   // DEFAULT = PHYSICAL CORES (v0.17.91), as `zstd -T0` does.  It used to be
   // every hardware thread.  MEASURED on a 2-socket, 128-core, 256-thread
   // machine, 4 GiB to a file at level 3, 128 workers against 256: idle, a
@@ -21414,14 +22084,33 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   // A zstd built without its worker threads cannot do this in parallel: say so
   // and compress the one frame on this thread, rather than die (v0.17.93).
   bool sw_mt = gz_zstd_multithreaded();
+  uint64_t total_in = known_input_size(opt, in);
+  // HOW MANY WORKERS, AND WHERE (v0.18.18): decided before the progress, reader,
+  // writer and zstd worker threads start, so all of them inherit it.  A claims
+  // lock helper and the outer --adapt governor or --verify pool can start
+  // earlier and keep their own.  The calling thread's affinity is restored when `place` goes out of scope, after
+  // every one of them has been joined.  See GzSwPlacement.  The busy sample costs
+  // 20 ms, so it is taken only for 8 GiB or more, or a size not known (a pipe).
+  std::unique_ptr<GzSwPlacement> place;
+  if (sw_mt) {
+    bool sample_ok = total_in >= (8ULL << 30);
+#ifndef _WIN32
+    if (total_in == 0 && in) {
+      struct stat pst{};
+      sample_ok = !(::fstat(::fileno(in), &pst) == 0 && S_ISREG(pst.st_mode) && pst.st_size == 0);
+    }
+#endif
+    place = std::make_unique<GzSwPlacement>(opt, n_threads, total_in, sample_ok);
+    n_threads = place->workers();
+    if (!place->detail().empty()) vlog(V_DEBUG, opt, place->detail());
+    if (!place->note().empty()) vlog(V_VERBOSE, opt, place->note());
+  }
   if (!sw_mt)
     vlog(V_DEFAULT, opt, std::string("warning: this build's zstd library (") + ZSTD_versionString()
          + ") has no multithreading; --sliding-window compresses on one thread\n");
   else
     vlog(V_VERBOSE, opt, "[SLIDING-WINDOW] single-frame compression with "
-         + std::to_string(n_threads) + " zstd worker threads\n");
-
-  uint64_t total_in = known_input_size(opt, in);
+         + std::to_string(n_threads) + " zstd worker thread" + (n_threads == 1 ? "\n" : "s\n"));
 
   std::atomic<bool> progress_done{false};
   std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
@@ -23194,189 +23883,6 @@ static std::string gz_cuda_visible_uuids()
   return out;
 }
 
-// ---- CLAIMS: simultaneous gzstd processes see each other's cards (v0.18.7) ----
-//
-// Ranking reads the cards' PAST load: the probe's utilization is the driver's
-// last ~14 s, NVML's one instant, and free VRAM moves only once a job has
-// allocated.  Jobs that start together therefore all see the same picture and
-// all choose the same card.  MEASURED on the 8-GPU host (v0.18.6, three idle
-// cards): 4 and 8 simultaneous `--gpu-only --gpu-devices=1` jobs landed on ONE
-// card in 10 of 10 rounds, and with 8 there, 2-4 jobs per round found too little
-// VRAM left for a single stream and ran on the CPU instead (the others had each
-// taken their --gpu-mem-frac of what was free).
-//
-// So every process that ranks records the cards it chose, and the next one
-// counts them.  Under one lock: read the live claims, rank, append its own.  A
-// claim adds 100 to the card's utilization, the top of the sampled scale: a
-// card with a gzstd job on it ranks at least as busy as a saturated card.  The
-// existing combined utilization/free-VRAM rank still decides the choice.  A
-// claim lives as long as its process: it records the pid and the start time; a line whose
-// process is gone (or whose pid now belongs to another process) is dropped
-// when the next ranking rewrites the file.  So no exit path has to clean up.
-//
-// Per user: $XDG_RUNTIME_DIR/gzstd, else /dev/shm/gzstd-<uid>, mode 0700 and
-// owned by us, checked every time (a directory someone else made is ignored).
-// Jobs of different users do not see each other's claims; they still see each
-// other's load once it shows.  Lock waiting and scanning share the ranking's
-// 500 ms budget.  The wait uses a helper thread, so a process stopped while
-// holding it cannot hold anyone else past the deadline; the ranking then goes
-// ahead without claims.  GZSTD_DEBUG_GPU_CLAIMS=off disables all of it, and
-// GZSTD_DEBUG_GPU_CLAIMS_DIR=<dir> moves it (the suite's private directory).
-#ifdef __linux__
-struct GzGpuClaims {
-  int fd = -1;                                  // the claims file, LOCK_EX held while >= 0
-  std::map<std::string, unsigned> live;         // UUID -> live claims by other processes
-  std::vector<std::string> keep;                // the live lines, rewritten with ours
-  std::string why;                              // why there are none, for -vv
-  ~GzGpuClaims() { if (fd >= 0) ::close(fd); }  // closing releases the lock
-};
-
-// The process's start time in clock ticks since boot (field 22 of
-// /proc/<pid>/stat), or 0 if the process does not exist.  The command name in
-// field 2 may hold spaces or parentheses, so the fields are counted from the
-// LAST ')'.
-static unsigned long long gz_proc_starttime(long pid)
-{
-  std::ifstream f("/proc/" + std::to_string(pid) + "/stat");
-  std::string s;
-  if (!std::getline(f, s)) return 0;
-  const auto rp = s.rfind(')');
-  if (rp == std::string::npos) return 0;
-  std::istringstream ss(s.substr(rp + 1));
-  std::string tok;
-  for (int field = 3; ss >> tok; ++field)
-    if (field == 22) return std::strtoull(tok.c_str(), nullptr, 10);
-  return 0;
-}
-
-// The per-user claims directory, created if absent; "" when there is none we
-// can trust.
-static std::string gz_claims_dir()
-{
-  const char * hook = std::getenv("GZSTD_DEBUG_GPU_CLAIMS");
-  if (hook && std::strcmp(hook, "off") == 0) return "";
-  std::string dir;
-  if (const char * d = std::getenv("GZSTD_DEBUG_GPU_CLAIMS_DIR")) dir = d;
-  else if (const char * x = std::getenv("XDG_RUNTIME_DIR"); x && *x == '/') dir = std::string(x) + "/gzstd";
-  else dir = "/dev/shm/gzstd-" + std::to_string((unsigned long)::getuid());
-  if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return "";
-  struct stat st{};
-  if (::lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::getuid()
-      || (st.st_mode & 077) != 0)
-    return "";
-  return dir;
-}
-
-// Lock the claims file and read the live claims within `deadline`.  A timed-out
-// scan retains the lock so the later write can replace the stale contents.
-static std::unique_ptr<GzGpuClaims> gz_claims_open(std::chrono::steady_clock::time_point deadline)
-{
-  auto c = std::make_unique<GzGpuClaims>();
-  if (std::chrono::steady_clock::now() >= deadline) {
-    c->why = "the ranking budget was spent before claims"; return c;
-  }
-  const std::string dir = gz_claims_dir();
-  if (dir.empty()) { c->why = "no claims directory"; return c; }
-  const int fd = ::open((dir + "/gpu-claims").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (fd < 0) { c->why = std::string("cannot open the claims file: ") + std::strerror(errno); return c; }
-  struct stat st{};
-  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-    ::close(fd); c->why = "the claims file is not regular"; return c;
-  }
-  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-    // Contended: block on a helper thread, give up at the deadline.  A thread
-    // that gets the lock after we gave up closes the descriptor, which releases it.
-    struct Shared { std::mutex m; std::condition_variable cv; bool done = false, ok = false, abandoned = false; };
-    auto sh = std::make_shared<Shared>();
-    try {
-      std::thread([sh, fd] {
-        const bool ok = ::flock(fd, LOCK_EX) == 0;
-        std::lock_guard<std::mutex> lk(sh->m);
-        if (sh->abandoned) { ::close(fd); return; }
-        sh->ok = ok; sh->done = true; sh->cv.notify_all();
-      }).detach();
-    } catch (const std::system_error &) {
-      ::close(fd); c->why = "cannot start the lock thread"; return c;
-    }
-    std::unique_lock<std::mutex> lk(sh->m);
-    if (!sh->cv.wait_until(lk, deadline, [&sh] { return sh->done; })) {
-      sh->abandoned = true;
-      c->why = "the claims lock was not free within the ranking budget";
-      return c;
-    }
-    if (!sh->ok) { ::close(fd); c->why = "flock failed"; return c; }
-  }
-  c->fd = fd;
-  // Read incrementally.  A torn or corrupt file must not turn the shared
-  // ranking deadline into an unbounded read, /proc scan, or allocation.  The
-  // line cap follows the UUID and decimal field widths, not the host's size.
-  constexpr size_t max_line = sizeof("GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx") - 1
-      + 2 + sizeof(long) * 3 + sizeof(unsigned long long) * 3;
-  auto abandon = [&](const char * why) {
-    c->live.clear(); c->keep.clear(); c->why = why;
-    // Keep the lock so gz_claims_write can replace the unreadable contents
-    // with this process's claim.  Otherwise every later job pays the scan.
-    return std::move(c);
-  };
-  auto parse_line = [&](const std::string & line) {
-    std::istringstream ls(line);
-    std::string uuid;
-    long pid = 0;
-    unsigned long long start = 0;
-    if (!(ls >> uuid >> pid >> start) || uuid.rfind("GPU-", 0) != 0 || pid <= 0) return;
-    if (pid == (long)::getpid() || gz_proc_starttime(pid) != start) return;
-    ++c->live[uuid];
-    c->keep.push_back(line);
-  };
-  std::string line;
-  bool overlong = false;
-  char buf[4096];
-  off_t offset = 0;
-  for (;;) {
-    if (std::chrono::steady_clock::now() >= deadline)
-      return abandon("the claims scan exceeded the ranking budget");
-    const ssize_t n = ::pread(fd, buf, sizeof buf, offset);
-    if (n < 0) return abandon("cannot read the claims file");
-    if (n == 0) break;
-    offset += n;
-    for (ssize_t i = 0; i < n; ++i) {
-      if (buf[i] == '\n') {
-        if (!overlong) parse_line(line);
-        line.clear(); overlong = false;
-        if (std::chrono::steady_clock::now() >= deadline)
-          return abandon("the claims scan exceeded the ranking budget");
-      } else if (line.size() < max_line) line += buf[i];
-      else overlong = true;
-    }
-  }
-  if (!overlong && !line.empty()) parse_line(line);
-  if (std::chrono::steady_clock::now() >= deadline)
-    return abandon("the claims scan exceeded the ranking budget");
-  return c;
-}
-
-// Rewrite the claims file: the live lines, then one per card this process chose.
-static void gz_claims_write(GzGpuClaims & c, const std::string & sel)
-{
-  if (c.fd < 0) return;
-  std::string out;
-  for (const auto & l : c.keep) out += l + "\n";
-  const unsigned long long me = gz_proc_starttime((long)::getpid());
-  std::stringstream ss(sel);
-  std::string uuid;
-  while (std::getline(ss, uuid, ','))
-    if (uuid.rfind("GPU-", 0) == 0 && me)
-      out += uuid + " " + std::to_string((long)::getpid()) + " " + std::to_string(me) + "\n";
-  if (::ftruncate(c.fd, 0) == 0) {
-    size_t off = 0;
-    while (off < out.size()) {
-      const ssize_t w = ::pwrite(c.fd, out.data() + off, out.size() - off, (off_t)off);
-      if (w <= 0) break;
-      off += (size_t)w;
-    }
-  }
-}
-#endif // __linux__
 
 // Rank and apply the pending subset mask.  `who` names the calling site for
 // the -vv trace the suite reads ("ranking the cards ... (hybrid bringup
@@ -23510,13 +24016,13 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
   }
 #ifdef __linux__
   // v0.18.7: rank again with other gzstd processes' live claims counted (see
-  // GzGpuClaims).  The same sample, so whether it decides cannot change; only
+  // GzClaims).  The same sample, so whether it decides cannot change; only
   // the order can.  Hold the file lock through the mask write, then release it
   // before the selected-card log can block on a slow stderr sink.
-  std::unique_ptr<GzGpuClaims> claims;
+  std::unique_ptr<GzClaims> claims;
   std::string claims_note;
   if (d.rank_decided) {
-    claims = gz_claims_open(rank_deadline);
+    claims = gz_claims_open(GZ_CLAIMS_GPU, rank_deadline);
     if (!claims->live.empty()) {
       for (auto & r : ranked_rows) {
         const auto it = claims->live.find(r.uuid);
@@ -23574,7 +24080,7 @@ static void finalize_gpu_mask(const Options & opt, const char * who)
     how = std::string("combined rank: utilization + free VRAM, from ") + source
         + (too_old ? ", over the cards new enough for this build" : "");
 #ifdef __linux__
-    if (claims) gz_claims_write(*claims, sel);
+    if (claims) gz_claims_write(*claims, GZ_CLAIMS_GPU, sel);
 #endif
   }
 #ifdef __linux__

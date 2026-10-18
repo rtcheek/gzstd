@@ -138,7 +138,25 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    lost the race for it: 15 of 40 compress jobs in rounds of 8, 3 of 60 decompress jobs in rounds of 6.
    The batch is now capped at the input's frame count (2.1 and 4.8 GiB; 0 of 40 and 0 of 60 lost), and
    a decompress that loses VRAM while shrinking its batch halves again instead of dropping the card.
-10. **`--sliding-window` placement: the fuller measurement is done (v0.18.7); the policy is still open.**
+10. ~~**`--sliding-window` placement: the fuller measurement is done (v0.18.7); the policy is still open.**~~
+   SHIPPED v0.18.18 (CHANGELOG has the tables): the count and the placement are separate effects and
+   both are large -- 4 workers in one cache 0.27-0.40 s at level 3 against 0.82-0.94 spread one per
+   cache, and inside one cache 4 workers beat 8 (0.27 vs 0.43 s, high-ratio) -- and a small count
+   WITHOUT the placement is slower than the default.  The rule: the count follows zstd's strategy
+   and window, as a share of one cache's physical cores (1/2 for fast..greedy, levels 1-5; 3/2 for
+   lazy and for lazy2 on a window of 2 MiB or less, levels 6-8; 4 caches for lazy2 on a larger one,
+   9-12; btlazy2 and slower unchanged), placed on the fewest caches that hold it, choosing the
+   least loaded feasible cache first; simultaneous runs claim their caches (the GPU claims mechanism,
+   a second file).  Whole 19.5 GiB files, 30 cells: 102 s against 157 for the default and 90 for the best of each cell, none slower
+   than the default.  A rule fitted to 2 GiB slices first was 1.5x slower than the default at level
+   12 on whole files; a per-worker rate probe was rejected (a 4 MiB sample's rate varied 5x within a
+   file).  **Still open:** the workstation's check of its new counts (6 at levels 1-5, 12 at 6-12)
+   against its v0.18.8 bests; caches of more than 12 cores (held to caps, unmeasured); `--long`
+   (moves a level onto the larger-window row, unmeasured with long-distance matching); high-ratio
+   data at levels 6-12, up to 2x slower than its own best (never slower than before); the
+   single-frame decoder's threads; claims across users.  An `--adapt` action that learns the count
+   per (strategy, size) bucket across runs (candidate b below) would answer the data dependence.
+   The text as found:
    MEASURED 2026-10-09 on the 8-GPU server (2 x 64-core EPYC 9554, 16 L3 caches of 8 cores), warm,
    to /dev/null, `taskset` to 1/2/4/8/16 caches (8/16/32/64/128 workers), medians of 3, 2 GiB slices
    of the three corpora:
