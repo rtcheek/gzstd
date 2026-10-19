@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.18";
+static constexpr const char * GZSTD_VERSION = "0.18.19";
 //
 // Architecture overview:
 //
@@ -116,6 +116,7 @@ static constexpr const char * GZSTD_VERSION = "0.18.18";
 #include <sys/wait.h>      // waitpid (--calibrate's per-device-count children)
 #endif
 #ifdef __linux__
+#include <sched.h>         // dynamic affinity masks for the CPU allowance
 #include <sys/ioctl.h>     // the NVIDIA driver probe (gz_rm_probe) that ranks GPUs without NVML
 #endif
 #include <fcntl.h>
@@ -5509,6 +5510,11 @@ static void print_help_long()
 "     I/O threads, and it bypasses the automatic 96-worker cap.  It is not\n"
 "     literally uncapped: only --sliding-window uses every hardware thread.\n"
 "     When -T is omitted entirely, the default is all cores capped at 96.\n"
+"     The hardware threads are the ones THIS PROCESS MAY USE: its CPU\n"
+"     affinity (taskset, a container's or batch job's cpuset), and no more\n"
+"     than a cgroup CPU quota allows (docker --cpus, systemd CPUQuota=),\n"
+"     rounded up to whole CPUs.  A quota takes no I/O reserve: it is CPU\n"
+"     time, not cores.  -v says when this is fewer than the machine has.\n"
 "     ZSTD_NBTHREADS=N in the environment sets the COMPRESSION default, as\n"
 "     in zstd (v0.18.12): it means -T N, except that 0 means one thread\n"
 "     (zstd's \"no worker threads\"), not -T 0.  -T, --threads and\n"
@@ -6690,6 +6696,212 @@ static std::atomic<int> g_adapt_src_cold{-1};
 static std::atomic<int> g_adapt_explored{0};
 static const char * adapt_resid_class_name(int c) { return c == 1 ? "warm" : "cold"; }
 
+/*======================================================================
+ THE CPUs THIS PROCESS MAY USE (v0.18.19)
+ -----------------------------------------------------------------------
+ std::thread::hardware_concurrency() counts every online CPU of the
+ machine.  A job held by taskset, a container's cpuset, a batch
+ scheduler's allocation or a cgroup CPU quota (docker --cpus, systemd
+ CPUQuota=) may use far fewer, and until v0.18.19 every default pool was
+ sized from the machine: 94 workers on 8 allowed CPUs.  MEASURED on the
+ 2 x 64-core server, 19.3 GiB of base64-of-random, warm, to /dev/null,
+ the CPU-only build, arms interleaved x3, no two arms' ranges overlapping:
+                                 default (94)    the allowance's count
+   taskset, 4 cores + SMT    c    5.92-6.00 s     5.06-5.08 s  (6)
+                             d    3.96-4.02       3.68-3.71
+   taskset, 2 cores + SMT    c   10.79-11.11      9.78-9.84    (3)
+                             d    7.50-7.57       7.25
+   CPUQuota=400%             c   10.54-12.08      5.92-5.98    (4)
+                             d   10.04-10.43      5.54-5.59
+ The default also burned ~35% more user CPU, with ~14,000 involuntary
+ context switches a run against under 100.
+
+ The allowance is the affinity mask's CPU count, then the smallest cgroup
+ CPU quota between this process's cgroup and its hierarchy's root (v2
+ cpu.max, v1 cpu.cfs_quota_us over cpu.cfs_period_us), rounded UP to
+ whole CPUs as Java and .NET do.  Only the tree this process can see is
+ read: inside a cgroup namespace its own group is the root, and a quota on
+ an ancestor above it is invisible to every program in the container (Java,
+ Go and Rust read the same files and stop at the same place).  A container
+ runtime sets the quota on the container's own group, which is visible.
+ A quota is CPU TIME, not cores, so resolve_cpu_threads() takes its I/O
+ reserve from the mask only: under a 4-CPU quota 3 workers took 7.34-7.43 s
+ against 4's 5.92-5.98, and 8 beat 6 under an 8-CPU quota (2.99-3.01 s
+ against 3.79-3.80).
+
+ Read ONCE, at the first call, which main() makes before any other
+ thread exists: --sliding-window narrows the calling thread's own mask
+ to place its run (GzSwPlacement), and that must not shrink the
+ allowance of a pool sized afterwards.
+======================================================================*/
+struct GzCpuAllowance {
+  unsigned machine = 1;   // hardware_concurrency(): every online CPU
+  unsigned mask = 1;      // CPUs in the affinity mask (the machine's count when unreadable)
+  unsigned quota = 0;     // a cgroup CPU quota in whole CPUs, rounded up; 0 = none
+  unsigned allowed() const { return quota ? std::min(mask, quota) : mask; }
+};
+
+#ifdef __linux__
+// The smallest cgroup CPU quota, as CPUs' worth of time (quota / period),
+// between this process's cgroup and the root of each hierarchy that limits
+// CPU; 0 when none is set or none can be read.  /proc/self/cgroup names the
+// group ("0::/path" for v2, "N:cpu,cpuacct:/path" for v1) and
+// /proc/self/mountinfo where that hierarchy is mounted and which part of it
+// the mount shows (a container sees its own group as the mount's root).
+static double gz_cgroup_cpu_quota()
+{
+  // Test hook: read a fake tree instead -- DIR/proc/self/cgroup,
+  // DIR/proc/self/mountinfo, and each mount point under DIR -- so the suite can
+  // exercise v1 and v2 layouts on any host.
+  const char * fake = std::getenv("GZSTD_DEBUG_CGROUP_ROOT");
+  const std::string pre = fake ? fake : "";
+  std::string v2_group, v1_group;
+  {
+    std::ifstream cg(pre + "/proc/self/cgroup");
+    std::string line;
+    while (std::getline(cg, line)) {
+      const size_t a = line.find(':');
+      const size_t b = a == std::string::npos ? a : line.find(':', a + 1);
+      if (b == std::string::npos) continue;
+      const std::string ctl = line.substr(a + 1, b - a - 1);
+      if (line.compare(0, a, "0") == 0 && ctl.empty()) { v2_group = line.substr(b + 1); continue; }
+      std::stringstream ss(ctl);
+      for (std::string c; std::getline(ss, c, ',');)
+        if (c == "cpu") v1_group = line.substr(b + 1);
+    }
+  }
+  if (v2_group.empty() && v1_group.empty()) return 0;
+  // A quota file's value as CPUs, or 0 for none ("max", -1) or unreadable.
+  auto read_v2 = [](const std::string & dir) -> double {
+    std::ifstream f(dir + "/cpu.max");
+    std::string q, p;
+    if (!(f >> q >> p) || q == "max") return 0;
+    std::string extra;
+    if (f >> extra) return 0;
+    auto decimal = [](const std::string & s) -> unsigned long long {
+      if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos) return 0;
+      errno = 0;
+      const unsigned long long n = std::strtoull(s.c_str(), nullptr, 10);
+      return errno == ERANGE ? 0 : n;
+    };
+    const auto quota = decimal(q), period = decimal(p);
+    return quota && period ? double(quota) / double(period) : 0;
+  };
+  auto read_v1 = [](const std::string & dir) -> double {
+    std::ifstream fq(dir + "/cpu.cfs_quota_us"), fp(dir + "/cpu.cfs_period_us");
+    long long quota = 0, period = 0;
+    if (!(fq >> quota) || !(fp >> period) || quota <= 0 || period <= 0) return 0;
+    std::string extra;
+    if ((fq >> extra) || (fp >> extra)) return 0;
+    return double(quota) / double(period);
+  };
+  double best = 0;
+  auto take = [&best](double q) { if (q > 0 && (best == 0 || q < best)) best = q; };
+  // mountinfo escapes whitespace and backslashes in ROOT and MOUNTPOINT.
+  auto unescape_mount = [](std::string s) {
+    for (size_t i = 0; i + 3 < s.size(); ++i) {
+      if (s[i] != '\\' || s[i + 1] < '0' || s[i + 1] > '7'
+          || s[i + 2] < '0' || s[i + 2] > '7' || s[i + 3] < '0' || s[i + 3] > '7') continue;
+      const int octal = ((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0');
+      if (octal != 040 && octal != 011 && octal != 012 && octal != 0134) continue;
+      const char c = char(octal);
+      s.replace(i, 4, 1, c);
+    }
+    return s;
+  };
+  // A cgroup namespace can report /../.. for a process outside its view.
+  // Never use such a path to walk above the mounted hierarchy.
+  auto safe_rel = [](const std::string & rel) {
+    if (!rel.empty() && rel[0] != '/') return false;
+    for (size_t i = 0; i < rel.size();) {
+      while (i < rel.size() && rel[i] == '/') ++i;
+      const size_t end = rel.find('/', i);
+      const std::string part = rel.substr(i, end == std::string::npos ? end : end - i);
+      if (part == "." || part == "..") return false;
+      if (end == std::string::npos) break;
+      i = end;
+    }
+    return true;
+  };
+  std::ifstream mi(pre + "/proc/self/mountinfo");
+  std::string line;
+  while (std::getline(mi, line)) {
+    // "ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS"
+    std::istringstream ls(line);
+    std::vector<std::string> f;
+    for (std::string w; ls >> w;) f.push_back(w);
+    const auto dash = std::find(f.begin(), f.end(), "-");
+    if (f.size() < 5 || f.end() - dash < 2) continue;
+    const std::string & fstype = *(dash + 1);
+    const bool v2 = fstype == "cgroup2";
+    bool v1 = false;
+    if (fstype == "cgroup" && f.end() - dash >= 4) {        // SUPEROPTS names the controllers
+      std::stringstream ss(*(dash + 3));
+      for (std::string o; std::getline(ss, o, ',');) if (o == "cpu") v1 = true;
+    }
+    const std::string & group = v2 ? v2_group : v1_group;
+    if ((!v2 && !v1) || group.empty()) continue;
+    // The group's path below this mount: the mount shows the hierarchy from ROOT.
+    const std::string root = unescape_mount(f[3]);
+    const std::string mount = unescape_mount(f[4]);
+    if (mount.empty() || !safe_rel(mount)) continue;
+    const std::string base = pre + (mount == "/" ? std::string() : mount);
+    std::string rel;
+    if (root == "/") rel = group;
+    else if (group.compare(0, root.size(), root) == 0
+             && (group.size() == root.size() || group[root.size()] == '/'))
+      rel = group.substr(root.size());
+    else continue;
+    if (!safe_rel(rel)) continue;
+    // Walk from the group up to the mount: a parent's quota limits its children.
+    std::string dir = base + (rel == "/" ? "" : rel);
+    while (true) {
+      take(v2 ? read_v2(dir) : read_v1(dir));
+      if (dir.size() <= base.size()) break;
+      const size_t s = dir.find_last_of('/');
+      if (s == std::string::npos || s < base.size()) break;
+      dir.resize(s);
+    }
+  }
+  return best;
+}
+#endif
+
+static const GzCpuAllowance & gz_cpu_allowance()
+{
+  static const GzCpuAllowance a = [] {
+    GzCpuAllowance r;
+    r.machine = std::max(1u, std::thread::hardware_concurrency());
+    r.mask = r.machine;
+#ifdef __linux__
+    // The kernel's affinity mask can exceed cpu_set_t (1024 CPU IDs), even
+    // when this process is allowed only a handful of those CPUs.  EINVAL then
+    // means grow the buffer, not "use every CPU on the machine".
+    for (size_t bits = CPU_SETSIZE;;) {
+      const size_t bytes = CPU_ALLOC_SIZE(bits);
+      cpu_set_t * set = CPU_ALLOC(bits);
+      if (!set) break;
+      CPU_ZERO_S(bytes, set);
+      const int rc = sched_getaffinity(0, bytes, set);
+      const int err = errno;
+      if (rc == 0) {
+        const int count = CPU_COUNT_S(bytes, set);
+        if (count > 0) r.mask = (unsigned)count;
+      }
+      CPU_FREE(set);
+      if (rc == 0 || err != EINVAL || bits > SIZE_MAX / 2) break;
+      bits *= 2;
+    }
+    // Unreadable is "no quota": the mask alone, never a refusal to run.
+    double q = 0;
+    try { q = gz_cgroup_cpu_quota(); } catch (...) { q = 0; }
+    if (q > 0) r.quota = (unsigned)std::min<double>(INT_MAX, std::max(1.0, std::ceil(q - 1e-9)));
+#endif
+    return r;
+  }();
+  return a;
+}
+
 // Cores this process can actually expect to get, right now.
 //
 // TWO CONSTRAINTS, and the smaller wins: how many CPUs we are ALLOWED (affinity
@@ -6717,16 +6929,8 @@ static const char * adapt_resid_class_name(int c) { return c == 1 ? "warm" : "co
 // wrong thing in one of those two cases. Available CORES predicts both.
 static double adapt_avail_cores()
 {
-  long allowed = 0;
-#ifndef _WIN32
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  if (sched_getaffinity(0, sizeof(set), &set) == 0) allowed = CPU_COUNT(&set);
-#endif
-  if (allowed <= 0) {
-    const unsigned hc = std::thread::hardware_concurrency();
-    allowed = hc ? (long)hc : 0;
-  }
+  // The mask and, since v0.18.19, a cgroup CPU quota (gz_cpu_allowance).
+  const long allowed = (long)gz_cpu_allowance().allowed();
   if (allowed <= 0) return -1.0;
   // Contention is applied as a FRACTION, never subtracted.  The load average is
   // system-wide while the affinity mask is per-process, so subtracting one from
@@ -9601,7 +9805,9 @@ static void pin_thread_to_core(int core)
 // Workers should avoid these cores.  Returns {0, 1} on most systems.
 static std::vector<int> get_io_cores()
 {
-  unsigned hw = std::thread::hardware_concurrency();
+  // From the affinity mask, not the machine (v0.18.19): a quota is time, not
+  // cores to set aside (see gz_cpu_allowance).
+  const unsigned hw = gz_cpu_allowance().mask;
   if (hw <= 4) return {0};  // tiny system: share one core
   return {0, 1};            // dedicate two cores to I/O
 }
@@ -11479,19 +11685,19 @@ private:
 //   -1 = all hardware threads (-T0 flag, like zstd)
 //    0 = auto (capped at 96 for efficiency  diminishing returns beyond that)
 //   >0 = user-specified exact count
+// "Hardware threads" are the ones this process may use (v0.18.19, see
+// gz_cpu_allowance): the affinity mask less the I/O reserve, then no more
+// than a cgroup CPU quota allows.  An unrestricted machine is unchanged.
 static int resolve_cpu_threads(int opt_threads)
 {
-  unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-  int io_reserved = (int)get_io_cores().size();  // cores pinned to reader/writer
-  if (opt_threads == -1) {
-    // -T0: use every thread except I/O-pinned cores
-    return std::max(1, (int)hw - io_reserved);
-  }
   if (opt_threads > 0)
     return opt_threads;                     // explicit -T N
-  // Auto: use hw minus I/O cores, capped at 96
-  int def = std::max(1, (int)hw - io_reserved);
-  return std::min(def, 96);
+  const GzCpuAllowance & cpus = gz_cpu_allowance();
+  int io_reserved = (int)get_io_cores().size();  // cores pinned to reader/writer
+  int n = std::max(1, (int)cpus.mask - io_reserved);
+  if (cpus.quota) n = std::min(n, (int)cpus.quota);
+  if (opt_threads == -1) return n;          // -T0: every thread except I/O-pinned cores
+  return std::min(n, 96);                   // auto: capped at 96
 }
 
 // Query available host RAM (returns 0 if unknown)
@@ -14033,7 +14239,7 @@ static std::unique_ptr<VerifyPool> build_pass_verify_pool(PassOpt pass)
 
   const int cores = (pass_opt.cpu_threads > 0)
       ? pass_opt.cpu_threads
-      : std::max(1, (int)std::thread::hardware_concurrency());
+      : (int)gz_cpu_allowance().allowed();   // the CPUs this process may use (v0.18.19)
   // cpu-only: keep verify well clear of the compress pool (≤ cores/16).
   // hybrid: the GPUs carry the compression, so the CPU pool has spare cores —
   // raise the ceiling (≤ cores/8) so verify can match the faster hybrid producer
@@ -21926,12 +22132,16 @@ private:
       const unsigned share = quick ? (cache_cores + 1) / 2 : mid ? (3 * cache_cores + 1) / 2
                                    : 4 * cache_cores;
       const unsigned cap = quick ? 8u : mid ? 24u : 32u;
-      want = std::max(1u, std::min({share, cap, all_cores}));
+      // A cgroup CPU quota holds the count too (v0.18.19, gz_cpu_allowance).
+      const unsigned quota = gz_cpu_allowance().quota;
+      const unsigned room = quota ? std::min(all_cores, quota) : all_cores;
+      want = std::max(1u, std::min({share, cap, room}));
       why = what + " takes " + std::to_string(want) + " worker" + (want == 1 ? "" : "s") + ": "
           + (quick ? "half of" : mid ? "one and a half times" : "four times")
           + " an L3 cache's " + std::to_string(cache_cores) + " cores"
           + (want < share ? want == cap ? ", at most " + std::to_string(cap)
-                                        : ", held to the " + std::to_string(all_cores) + " this process may use"
+                          : room < all_cores ? ", held to this process's CPU quota of " + std::to_string(room)
+                                             : ", held to the " + std::to_string(all_cores) + " this process may use"
                           : std::string());
     }
     auto need_all = [&]() {
@@ -22063,6 +22273,9 @@ private:
 static double adapt_path_residency(const std::string & path);   // defined below
 static bool device_is_rotational(const std::string & path);     // defined below
 #endif
+// zstd workers the last --sliding-window pass ran, for --stats-json (v0.18.19:
+// it reported the machine's hardware threads less one, whatever ran).
+static std::atomic<int> g_sw_pass_threads{0};
 static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // v0.18.18: GzSwPlacement (above) usually replaces this count with fewer
@@ -22074,11 +22287,15 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   // 1.87-2.06 s, the others within the spread); with other users' jobs on the
   // machine, 25-45% faster (1.24-1.96 s against 1.54-3.62 s), since the extra
   // workers only fight them for cores.  Level 19 no worse.  -T0 still means
-  // every hardware thread, and -T N still means N.
-  unsigned n_threads = (unsigned)std::thread::hardware_concurrency();
+  // every hardware thread, and -T N still means N.  Since v0.18.19 the
+  // hardware threads are the ones this process may use, and a cgroup CPU quota
+  // caps the physical count too (gz_cpu_allowance).
+  const GzCpuAllowance & cpus = gz_cpu_allowance();
+  unsigned n_threads = cpus.allowed();
   if (opt.cpu_threads > 0) n_threads = (unsigned)opt.cpu_threads;
-  else if (opt.cpu_threads == -1) n_threads = (unsigned)std::thread::hardware_concurrency();
-  else if (const unsigned pc = gz_physical_cores_allowed()) n_threads = pc;
+  else if (opt.cpu_threads == -1) n_threads = cpus.allowed();
+  else if (const unsigned pc = gz_physical_cores_allowed())
+    n_threads = cpus.quota ? std::min(pc, cpus.quota) : pc;
   if (n_threads < 1) n_threads = 1;
 
   // A zstd built without its worker threads cannot do this in parallel: say so
@@ -22105,6 +22322,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
     if (!place->detail().empty()) vlog(V_DEBUG, opt, place->detail());
     if (!place->note().empty()) vlog(V_VERBOSE, opt, place->note());
   }
+  g_sw_pass_threads.store(sw_mt ? (int)n_threads : 1, std::memory_order_relaxed);
   if (!sw_mt)
     vlog(V_DEFAULT, opt, std::string("warning: this build's zstd library (") + ZSTD_versionString()
          + ") has no multithreading; --sliding-window compresses on one thread\n");
@@ -22129,6 +22347,7 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
       vlog(V_DEFAULT, opt, std::string("warning: zstd refused worker threads (")
            + ZSTD_getErrorName(st) + "); --sliding-window compresses on one thread\n");
       sw_mt = false;
+      g_sw_pass_threads.store(1, std::memory_order_relaxed);
     }
   }
   // --rsyncable (v0.18.8), zstd's own: it lives in zstd's worker threads, so a
@@ -46237,6 +46456,16 @@ static int gzstd_main(int argc, char ** argv)
       os << ")";
     }
     else                     os << " (auto-select backend)";
+    // v0.18.19: say when the pools are sized from fewer CPUs than the machine has.
+    const GzCpuAllowance & cpus = gz_cpu_allowance();
+    if (cpus.allowed() < cpus.machine) {
+      os << "\n[CPU] this process may use " << cpus.allowed() << " of the machine's "
+         << cpus.machine << " CPUs (";
+      if (cpus.mask < cpus.machine) os << "affinity mask " << cpus.mask;
+      if (cpus.mask < cpus.machine && cpus.quota) os << ", ";
+      if (cpus.quota) os << "cgroup CPU quota " << cpus.quota;
+      os << "); default pools are sized from it";
+    }
     std::fprintf(stderr, "%s\n", os.str().c_str());
     std::fflush(stderr);  // unbuffer so it hits the terminal immediately
   }
@@ -47633,9 +47862,12 @@ static int gzstd_main(int argc, char ** argv)
     // written only after a CPU-only pass, on the claim that "the nvCOMP path
     // writes its own stats" -- it never did.)
     if (!opt.stats_json.empty()) {
-      int threads = (opt.cpu_threads > 0)
-                    ? opt.cpu_threads
-                    : std::max(1, int(std::thread::hardware_concurrency()) - 1);
+      // The workers that ran (v0.18.19): compress_cpu_mt's pool, or the zstd
+      // workers of a --sliding-window pass.  This reported the machine's hardware
+      // threads less one -- 255 on a 256-thread host whose pool was 96.
+      int threads = (opt.sliding_window && g_sw_pass_threads.load(std::memory_order_relaxed) > 0)
+                    ? g_sw_pass_threads.load(std::memory_order_relaxed)
+                    : resolve_cpu_threads(opt.cpu_threads);
       const CompressPassStats * gpu = nullptr;
 #ifdef HAVE_NVCOMP
       if (!pass_opt.cpu_only && g_compress_pass_stats.pipeline) {
@@ -48491,6 +48723,9 @@ static int gzstd_main(int argc, char ** argv)
 // abort with no exit code the caller can act on.
 int main(int argc, char ** argv)
 {
+  // The CPUs this process may use, read while this is the only thread and before
+  // any placement narrows its mask (see gz_cpu_allowance).
+  (void)gz_cpu_allowance();
   // Tears the cuFile driver down before exit() runs the loader's finalizers, on
   // the paths that unwind -- see GzGdsDriverGuard for the ones that do not.
   // HAVE_NVCOMP-guarded: the whole cuFile loader lives inside that block, so an

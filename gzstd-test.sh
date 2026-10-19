@@ -622,8 +622,9 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=547
-$EXTENSIVE && EXPECTED_TESTS=845
+EXPECTED_TESTS=552
+$EXTENSIVE && EXPECTED_TESTS=850
+# v0.18.19: +5 tests in both (worker count under a mask and a cgroup quota): 547 -> 552, 845 -> 850.
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
 # Then "zstd directories": +1 default, +15 --extensive, and one compat warn cell
@@ -1387,6 +1388,122 @@ for threads in 1 2 4; do
   rm -f "$compressed" "$recovered"
 done
 fi  # $EXTENSIVE (File management, multi-file, sparse, threading)
+
+# ============================================================
+# 10b. The default worker count follows the CPUs this process may use (v0.18.19)
+# ============================================================
+# Every default pool used to be sized from the MACHINE's CPUs: 94-96 workers
+# under an 8-CPU taskset (4-17% slower), ~1.9x slower under a 4-CPU quota.  The
+# count is now the affinity mask less the I/O reserve (1 at 4 CPUs or fewer,
+# else 2), and no more than a cgroup CPU quota rounded up to whole CPUs.
+section "Worker count: affinity mask and cgroup CPU quota (v0.18.19)"
+LAST_TEST_MS=0
+wc_expand() { tr ',' '\n' | awk -F- '{ if (NF == 1) print $1; else for (i = $1; i <= $2; i++) print i }'; }
+wc_allowed=()
+if command -v taskset >/dev/null 2>&1; then
+  mapfile -t wc_allowed < <(taskset -pc $$ 2>/dev/null | sed 's/.*: //' | wc_expand)
+fi
+if (( ${#wc_allowed[@]} == 0 )) && [[ -r /proc/self/status ]]; then
+  mapfile -t wc_allowed < <(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status | wc_expand)
+fi
+wc_workers() {
+  if grep -qa '\[CPU\] single-thread streaming path' "$1"; then echo 1
+  else grep -aoE '\[CPU\] [0-9]+ (worker|decompression) threads online' "$1" | head -1 | grep -oE '[0-9]+' | head -1
+  fi
+}
+wc_logged_quota() { grep -aoE 'cgroup CPU quota [0-9]+' "$1" | head -1 | grep -oE '[0-9]+' | head -1; }
+"$GZSTD" --cpu-only -q -f -c "$TMPDIR/medium.txt" > "$TMPDIR/wc.zst" 2>/dev/null
+if (( ${#wc_allowed[@]} < 9 )) || ! command -v taskset >/dev/null 2>&1; then
+  for wc_t in "an 8-CPU mask: allowance-sized workers, -T0 and decompress too" "--stats-json reports the pool"; do
+    skip_host "worker count: $wc_t" "needs taskset and at least 9 allowed CPUs"
+  done
+else
+  wc_mask=$(IFS=,; echo "${wc_allowed[*]:0:8}")
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -c "$TMPDIR/medium.txt" 2>"$TMPDIR/wc1.err" >/dev/null; wc_rc1=$?
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -T0 -c "$TMPDIR/medium.txt" 2>"$TMPDIR/wc2.err" >/dev/null; wc_rc2=$?
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -d -f -c "$TMPDIR/wc.zst" 2>"$TMPDIR/wc4.err" >/dev/null; wc_rc4=$?
+  wc_want_mask=6
+  wc_allowed_mask=8
+  wc_existing_quota=$(wc_logged_quota "$TMPDIR/wc1.err")
+  if [[ -n $wc_existing_quota ]] && (( wc_existing_quota < wc_want_mask )); then wc_want_mask=$wc_existing_quota; fi
+  if [[ -n $wc_existing_quota ]] && (( wc_existing_quota < wc_allowed_mask )); then wc_allowed_mask=$wc_existing_quota; fi
+  if [[ $wc_rc1 -eq 0 && $wc_rc2 -eq 0 && $wc_rc4 -eq 0 \
+        && "$(wc_workers "$TMPDIR/wc1.err")" == "$wc_want_mask" && "$(wc_workers "$TMPDIR/wc2.err")" == "$wc_want_mask" \
+        && "$(wc_workers "$TMPDIR/wc4.err")" == "$wc_want_mask" ]] \
+     && grep -qa "\[CPU\] this process may use $wc_allowed_mask of the machine.*affinity mask 8" "$TMPDIR/wc1.err"; then
+    pass "worker count: an 8-CPU mask: allowance-sized workers, -T0 and decompress too"
+  else
+    fail "worker count: an 8-CPU mask: allowance-sized workers, -T0 and decompress too" \
+      "rc $wc_rc1/$wc_rc2/$wc_rc4; $(grep -ah '^\[CPU\]' "$TMPDIR/wc1.err" "$TMPDIR/wc2.err" "$TMPDIR/wc4.err" | tr '\n' ' ')"
+  fi
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -q -f --stats-json "$TMPDIR/wc3.json" -c "$TMPDIR/medium.txt" >/dev/null 2>&1
+  wc_rc3=$?
+  if [[ $wc_rc3 -eq 0 ]] && grep -q "\"cpu\": { \"threads\": $wc_want_mask }" "$TMPDIR/wc3.json" 2>/dev/null; then
+    pass "worker count: --stats-json reports the pool"
+  else
+    fail "worker count: --stats-json reports the pool" "$(grep -o '"cpu": {[^}]*}' "$TMPDIR/wc3.json" 2>/dev/null)"
+  fi
+fi
+# A cgroup quota, from fake v2 and v1 trees (GZSTD_DEBUG_CGROUP_ROOT), so the
+# parsing runs on any host.  v2: the job's 3-CPU quota above a step with none
+# ("max") -- the parent limits the child.  v1: a container's view (the mount
+# shows the hierarchy from /docker), 1.5 CPUs rounded up to 2.  Expected: no
+# more than the quota, and no more than the mask allows.
+wc_n=${#wc_allowed[@]}            # this suite's mask (nproc would also obey OMP_NUM_THREADS)
+(( wc_n > 0 )) || wc_n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+wc_base=$(( wc_n <= 4 ? wc_n - 1 : wc_n - 2 )); (( wc_base < 1 )) && wc_base=1
+wc_v2="$TMPDIR/wc-cg2"; wc_v1="$TMPDIR/wc-cg1"
+rm -rf "$wc_v2" "$wc_v1"
+mkdir -p "$wc_v2/proc/self" "$wc_v2/sys/fs/cgroup/job/step" "$wc_v1/proc/self" "$wc_v1/sys/fs/cgroup/cpu,cpuacct/abc"
+echo "0::/job/step" > "$wc_v2/proc/self/cgroup"
+echo "30 25 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate" > "$wc_v2/proc/self/mountinfo"
+echo "300000 100000" > "$wc_v2/sys/fs/cgroup/job/cpu.max"
+echo "max 100000" > "$wc_v2/sys/fs/cgroup/job/step/cpu.max"
+printf '12:memory:/docker/abc\n4:cpu,cpuacct:/docker/abc\n0::/\n' > "$wc_v1/proc/self/cgroup"
+printf '%s\n' "40 30 0:35 /docker /sys/fs/cgroup/cpu,cpuacct rw,nosuid shared:13 - cgroup cgroup rw,cpu,cpuacct" \
+              "41 30 0:36 /docker /sys/fs/cgroup/memory rw,nosuid shared:14 - cgroup cgroup rw,memory" > "$wc_v1/proc/self/mountinfo"
+echo 150000 > "$wc_v1/sys/fs/cgroup/cpu,cpuacct/abc/cpu.cfs_quota_us"
+echo 100000 > "$wc_v1/sys/fs/cgroup/cpu,cpuacct/abc/cpu.cfs_period_us"
+for wc_case in "v2 3" "v1 2"; do
+  read -r wc_kind wc_q <<<"$wc_case"
+  if (( wc_base <= wc_q )); then
+    skip_host "worker count: a cgroup $wc_kind CPU quota of $wc_q" "the quota cannot reduce this host's default pool"
+    continue
+  fi
+  wc_dir=$wc_v2; [[ $wc_kind == v1 ]] && wc_dir=$wc_v1
+  wc_want=$(( wc_base < wc_q ? wc_base : wc_q ))
+  GZSTD_DEBUG_CGROUP_ROOT="$wc_dir" "$GZSTD" --cpu-only -v -f -c "$TMPDIR/medium.txt" 2>"$TMPDIR/wc-$wc_kind.err" >/dev/null
+  wc_rc=$?
+  wc_got=$(wc_workers "$TMPDIR/wc-$wc_kind.err")
+  if [[ $wc_rc -eq 0 && "$wc_got" == "$wc_want" ]] \
+     && grep -qa "cgroup CPU quota $wc_q" "$TMPDIR/wc-$wc_kind.err"; then
+    pass "worker count: a cgroup $wc_kind CPU quota of $wc_q ($wc_want workers)"
+  else
+    fail "worker count: a cgroup $wc_kind CPU quota of $wc_q ($wc_want workers)" \
+      "rc $wc_rc, got ${wc_got:-none}; $(grep -ah '^\[CPU\]' "$TMPDIR/wc-$wc_kind.err" | tr '\n' ' ')"
+  fi
+done
+# A real quota, where the session can make one (systemd user scope, cgroup v2).
+if command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user --scope -q -p CPUQuota=200% true >/dev/null 2>&1; then
+  wc_want=$(( wc_base < 2 ? wc_base : 2 ))
+  systemd-run --user --scope -q -p CPUQuota=200% "$GZSTD" --cpu-only -v -f -c "$TMPDIR/medium.txt" \
+    2>"$TMPDIR/wc-real.err" >/dev/null
+  wc_rc=$?
+  wc_real_quota=$(wc_logged_quota "$TMPDIR/wc-real.err")
+  if [[ -n $wc_real_quota ]] && (( wc_real_quota < wc_want )); then wc_want=$wc_real_quota; fi
+  if (( wc_base <= 2 )) && [[ -z $wc_real_quota || $wc_real_quota -ge $wc_base ]]; then
+    skip_host "worker count: a real CPUQuota=200% scope" "the quota cannot reduce this host's default pool"
+  elif [[ $wc_rc -eq 0 && "$(wc_workers "$TMPDIR/wc-real.err")" == "$wc_want" ]]; then
+    pass "worker count: a real CPUQuota=200% scope ($wc_want workers)"
+  else
+    fail "worker count: a real CPUQuota=200% scope ($wc_want workers)" \
+      "rc $wc_rc; $(grep -ah '^\[CPU\]' "$TMPDIR/wc-real.err" | tr '\n' ' ')"
+  fi
+else
+  skip_host "worker count: a real CPUQuota=200% scope" "no systemd user session can set a CPU quota here"
+fi
+rm -rf "$wc_v2" "$wc_v1" "$TMPDIR"/wc*.err "$TMPDIR/wc.zst" "$TMPDIR/wc3.json"
 
 # ============================================================
 # 11. Chunk sizes

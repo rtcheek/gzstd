@@ -318,6 +318,11 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    it: the default was as fast or faster everywhere. Unverified guess: cache per core (zstd's
    level-3 tables are ~768 KiB per worker). Workaround since v0.18.12: `ZSTD_NBTHREADS=2` sets the
    compression count on such a machine. A rule would need measurements from more CPUs first.
+   v0.18.19 adds a data point from the other side: on the server's slices (`taskset`, `-T` per arm,
+   base64-of-random, warm) one worker per allowed CPU beat the I/O reserve's count -- 4 cores + SMT,
+   8 workers 4.66-4.68 s against 6's 5.04-5.10 (compress), 3.37-3.38 against 3.67-3.68 (decompress);
+   2 cores + SMT, 4 against 3, 9.02 against 9.85 and 6.62 against 7.26.  So the reserve itself is
+   in question here too, and still CPU-dependent.
 19. **The GPU device-count model only serves `--gpu-only` compress.** `--calibrate` (and ordinary
    --adapt runs) record, per device count, a fixed overhead and a busy rate, and --adapt then runs a
    single-file `--gpu-only` compress on the count predicted to finish soonest.  Hybrid, decompress,
@@ -326,6 +331,17 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    6.4-7.3 s against 7.6-8.0 with all eight -- each device adds start-up and exit cost, and past a
    few the host sets the rate.  Hybrid needs its own model (the CPU pool carries part of the input,
    so the --gpu-only rates do not transfer), and decompress its own measurements.
+   **MEASURED 2026-10-19 on the 8-GPU server: nothing to build here.**  Default (hybrid) runs, warm,
+   to /dev/null, on 1, 2, 3 or 5 idle cards named by CUDA_VISIBLE_DEVICES, against `--cpu-only`:
+   19.5 GiB FILES take ~1.1 s (compress) and ~1.0 s (decompress) at every count, because the bringup
+   predictor sees the CPU pool finish first and starts no GPU -- also on 16 and 8 logical CPUs, and
+   on base64-of-random.  Through `cat` the CPUs keep up with the pipe, so every GPU is pure cost:
+   compress `--cpu-only` 5.70-5.99 s, 1 GPU 6.55-7.24, 2 6.28-6.56, 3 6.41-6.67, 5 6.93-7.17;
+   decompress 3.12-3.53 against 3.27-3.98 (1) to 3.71-5.36 (5).  The best count is ZERO, and
+   `--adapt`'s pipe gate (item 17) already chooses it: 8 runs from a fresh profile, no GPU started,
+   compress 5.76-6.21 s, decompress 2.71-3.48.  A count model matters only where GPUs carry real
+   work (few cores, slow levels), which this host never reaches at the default level.  Revisit on
+   such a host.
 20. **Nothing ranks the cards by measured speed.**  Which GPUs a run uses is CUDA's order (a static
    fastest-first heuristic from device properties), or with `--gpu-order=ranked` the current load
    (utilization, then free memory, from the driver probe); a `--gpu-devices N` subset takes the N
@@ -336,6 +352,16 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    settled rate from the per-device batch tuners (each already measures its own device) into the
    profile, keyed by UUID; add a single-card pass per device to --calibrate; then rank by measured
    rate, with load as the tie-breaker or the override for a busy card.
+   **MEASURED 2026-10-19 on the 8-GPU server: not worth building there.**  `--gpu-only`, one card
+   each (the five idle ones), warm 19.5 GiB, batch pinned, x4: compress 5.41-6.50 (PCIe, 200 W cap),
+   5.72-6.41 and 5.89-6.34 (PCIe), 5.59-5.74 (NVL), 6.09-6.70 s (PCIe held to 1200 MHz); decompress
+   4.49-4.99, 5.08-5.48, 4.49-5.13, 4.98-5.13, 5.26-5.54.  No card reaches its power limit (at most
+   ~178 W, 70-90% busy): the host sets the pace, so the NVL card is no faster and a 200 W cap costs
+   nothing.  The clock-capped card is ~5-10% slower, about one card's own run-to-run spread, so a
+   ranking learned from run rates would mostly rank noise.  Where the host's threads run did not
+   matter either (`numactl` to the card's socket or the other one: same times; item 9.1 below).
+   Measurement trap found on the way: polling `nvidia-smi` every 0.5 s during a run made it ~1 s
+   slower.  Revisit on a host that mixes GPU generations.
 21. **--adapt does not consider `--gds-only` (owner's note, 2026-10-15).**  The idea: when GPUDirect
    Storage is usable on this host (the same checks `--gds-only` already refuses on: nvidia-fs loaded
    and matching the driver, P2PDMA, a supported filesystem, a card the drive can reach), have --adapt
@@ -403,6 +429,11 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    affected in practice: its arms read 1.7-2.2 vs 3.8-4.2 GiB/s (pipeline rates, as v0.15.43 noted),
    and either pick finishes in 16.7-16.9 s.  (Corrected in v0.18.16: that was measured at load
    14-17; on a quiet box forced O_DIRECT is about 10% faster on `--gpu-only` too.)
+24. ~~**The default worker count ignored the CPU mask and any CPU quota (found 2026-10-19).**~~
+   FIXED v0.18.19: every default pool was sized from the machine's online CPUs, so a job under
+   `taskset`, a cpuset or a cgroup quota ran 94-96 workers -- 4-17% slower under a mask, ~1.9x
+   under a 4-CPU quota.  Pools now size from `gz_cpu_allowance()`: the mask, then the quota rounded
+   up.  CHANGELOG v0.18.19 has the tables.  The I/O reserve's own value is item 18's question.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 
@@ -2563,6 +2594,11 @@ per-arm numbers are in CHANGELOG v0.17.0–10).
 > ranked at bringup, after CUDA. **What is still true:** nothing looks at where the INPUT lives. A
 > source-proximity rank (NVMe root complex / NUMA node of the input's block device) is still unbuilt
 > and still unmeasured for H2D bandwidth.
+> **Measured for a WARM file (2026-10-19, item 20):** `--gpu-only` on one card per socket, with the
+> process bound by `numactl` to the card's socket or to the other one, the file's cached pages all
+> on one node: the same times either way (compress 5.60-5.96 against 5.62-5.80 s).  Unbound was
+> ~0.3 s slower than either binding (where the kernel spreads the threads).  Cold reads from a
+> particular NVMe are still unmeasured.
 
 Device selection at the time was `min(gpu_devices, device_count)` — the FIRST N
 devices, with no awareness of where the data is coming from. On this box that is measurably

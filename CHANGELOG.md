@@ -1,12 +1,112 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.18  
+**Covers:** v0.9.50 → v0.18.19  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.19 — the default worker count follows the CPUs this process may use (affinity mask, cgroup CPU quota), not the machine's: 1.1-2.2x faster under a mask or a quota
+
+Found while measuring ROADMAP 19 and 20 (the owner's go-ahead, 2026-10-19; both are recorded in the
+ROADMAP as measured and not worth building on this server).  A hybrid run held to 8 CPUs by `taskset`
+started "96 threads" in its CPU pool.  Every default pool was sized from
+`std::thread::hardware_concurrency()`, which counts every online CPU of the MACHINE, not the
+process's affinity mask, and nothing read a cgroup CPU quota.  So a job confined by `taskset`, a
+container's or a batch job's cpuset, or a CPU quota (`docker --cpus`, systemd `CPUQuota=`) ran
+94-96 workers on the CPUs it had.  Only `--sliding-window` (v0.17.91) counted the mask.  Earlier
+slice measurements (ROADMAP 18) all passed `-T` by hand to imitate a smaller machine, so the
+default a confined user actually gets was never measured.
+
+### Measured
+
+The 8-GPU server (2 x 64-core EPYC), 19.3 GiB of base64-of-random and its archive, warm, to
+/dev/null, the CPU-only build, arms interleaved x3; no two arms' ranges overlap:
+
+| allowance | | default (94-96 workers) | the allowance's count | physical cores |
+|---|---|---|---|---|
+| `taskset` 4 cores + SMT | compress | 5.92-6.00 s | **5.06-5.08 s** (6) | 5.66-5.70 (4) |
+| | decompress | 3.96-4.02 | **3.68-3.71** | 4.25-4.26 |
+| `taskset` 2 cores + SMT | compress | 10.79-11.11 | **9.78-9.84** (3) | 10.97-11.01 (2) |
+| | decompress | 7.50-7.57 | **7.25** | 8.39-8.40 |
+| `CPUQuota=400%` | compress | 10.54-12.08 | **5.92-5.98** (4) | 10.89-11.13 (2) |
+| | decompress | 10.04-10.43 | **5.54-5.59** | 8.15-8.17 |
+
+The default also burned 34-35% more user CPU, with ~14,000 involuntary context switches a run
+against under 100 at the allowance's count.  After the change, one binary, the new default against
+`-T96` (the old default's count): 8-CPU mask 5.07-5.09 s against 5.99-6.12 (compress) and 3.67-3.70
+against 4.03-4.05 (decompress); 4-CPU quota 5.94-5.96 against 12.90-13.49 and 5.54-5.59 against
+9.90-11.07.
+
+### What the count is now
+
+`gz_cpu_allowance()`, read once at the top of `main()` while it is the only thread (a later
+`--sliding-window` placement narrows the calling thread's own mask, and must not shrink a pool
+sized after it): the affinity mask's CPU count, and the smallest cgroup CPU quota between the
+process's cgroup and its hierarchy's root (v2 `cpu.max`, v1 `cpu.cfs_quota_us` over
+`cpu.cfs_period_us`, found through `/proc/self/cgroup` and `/proc/self/mountinfo`, so a container's
+own view works), rounded UP to whole CPUs as Java and .NET do.  Only the tree the process can see
+is read: inside a cgroup namespace a quota on an ancestor above the container's own group is
+invisible, as it is to Java, Go and Rust; container runtimes set the limit on the container's own
+group.  Values with trailing junk, `max`, a zero period, `.`/`..` path components and unreadable
+files all mean no quota (the mask alone, never a refusal to run); mountinfo's octal escapes are
+decoded; an affinity mask over 1024 CPU IDs is read with a growing buffer.
+
+- **The default** is the mask less the existing I/O reserve (1 at 4 CPUs or fewer, else 2), then no
+  more than the quota, capped at 96, as before.  A quota is CPU time, not cores, so it takes no
+  reserve: under a 4-CPU quota 3 workers took 7.34-7.43 s against 4's 5.92-5.98, and under 8, 6
+  workers 3.79-3.80 s against 8's 2.99-3.01.  A machine with no mask and no quota is unchanged (the
+  server keeps 96, a 4-thread machine 3).
+- **`-T0`** (every hardware thread, uncapped) means every one this process may use: 254 workers
+  under a 4-CPU quota before.  `-T N` is unchanged.
+- **`--sliding-window`**: the default physical-core count and the v0.18.18 strategy count are both
+  held to the quota; `-T0` is the allowance.
+- **The `--verify` pool** sizes from the allowance.  `--train` keeps zstd's own `MIN(4, cores/4)`
+  over the machine, so the two tools still train alike.  The `--adapt` machine fingerprint keeps the
+  machine's count (it names the machine); its core budget already scales priors to the allowance.
+- **`--stats-json`** reports the workers that ran.  A CPU pass reported the machine's hardware
+  threads less one: 255 on this server, whose pool was 96.
+- **`-v`** says when the allowance is below the machine: `[CPU] this process may use 8 of the
+  machine's 256 CPUs (affinity mask 8); default pools are sized from it`.
+
+Not changed, and open: whether the I/O reserve is right at all.  Under a mask, one worker per
+allowed CPU was faster still on this server (4 cores + SMT: 8 workers 4.66-4.68 s against 6's
+5.04-5.10; 2 cores + SMT: 4 against 3, 9.02 against 9.85), but the small Intel machine of ROADMAP
+18 measured the opposite, so that is ROADMAP 18's question, not this fix's.
+
+### Test hook (new)
+
+- `GZSTD_DEBUG_CGROUP_ROOT=DIR`: read `DIR/proc/self/cgroup`, `DIR/proc/self/mountinfo` and each
+  cgroup mount under `DIR`, so v1 and v2 layouts can be tested on any host.
+
+### Tests
+
+Section "Worker count: affinity mask and cgroup CPU quota (v0.18.19)", 5 cells in the default run
+(547 -> 552; -e 845 -> 850): an 8-CPU mask gives 6 workers, for `-T0` and for decompression too,
+and the `-v` line; `--stats-json` reports 6; a fake v2 tree (a job's 3-CPU quota above a step with
+none: the parent limits the child) and a fake v1 container view (1.5 CPUs, rounded up to 2); a real
+`CPUQuota=200%` user scope where systemd can make one.  The cells lower their expectation under a
+quota the suite itself runs in, and skip where the host is too small for a quota to change the
+count (or has no `taskset`, fewer than 9 CPUs, or no systemd user session).  Each of 8 mutants,
+rebuilt on the final source, fails at least one cell: the machine's count, the quota ignored, no
+walk to the parent, the v1 mount root ignored, rounding down, the old `--stats-json` formula, the
+reserve taken after the quota, and `-T0` from the machine.
+
+Suites: CPU-only default 406/0 (120 skipped, the no-GPU set); GPU default, masked to one idle card on
+a host with tenants on six cards, 537/0/15 of 552 -- the 15 skips are the multi-GPU cells of a
+one-card mask, as in v0.18.18.  -e not run: no argument parsing changed.
+
+### Review
+
+Codex (GPT-6-Sol, high), two rounds.  Round 1 hardened the parsing (strict numbers, mountinfo
+escapes, `.`/`..` refused, the large-mask buffer, an `INT_MAX` clamp) and the cells (one-worker
+runs, an existing quota, small hosts); adopted, except that a failure to read the quota now falls
+back to the mask instead of exiting.  It raised two blockers: a v1 group of `/` under a mount root
+of `/docker/<id>`, which it withdrew when asked for a runtime that produces that pairing (both files
+are shown relative to the same cgroup namespace), and an ancestor's quota above the namespace root,
+withdrawn as the documented scope above.  Round 2: no findings, SAFE TO COMMIT.
 
 ## v0.18.18 — `--sliding-window` sizes its workers by zstd's strategy and places the run on the fewest L3 caches (ROADMAP 10): 1.1-2.8x faster on whole files at levels 1-12
 
