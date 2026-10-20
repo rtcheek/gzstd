@@ -131,7 +131,12 @@ workflow now starts the binary in a `rockylinux/rockylinux:8.10` container, afte
 image really is glibc 2.28, and round-trips a 20 MB file, `-t`, `--sliding-window -T4`, a pipe and a
 `--tar` archive there (by checksum; the image has no cmp).  The step cannot run here (no docker on the
 build server); its script passed run directly against the release-style build, and its glibc check
-fails as it should on this host's 2.39.  Its first real run is the manual workflow run before the tag.
+fails as it should on this host's 2.39.  Its first real run (the manual run before the tag, on
+775ee4a) proved the floor -- the image reported glibc 2.28, the binary started and printed
+`[zstd 1.5.7, multithreaded]`, and the file, `-t`, `--sliding-window` and pipe round trips passed --
+then stopped at the `--tar` check: the minimal image has no `find`.  The check now names the two
+extracted files by path; the workflow change is a commit of its own, and the tag goes on it, because
+a tag push runs the tagged commit's workflow.  gzstd.cpp is unchanged from 775ee4a.
 
 ### Review
 

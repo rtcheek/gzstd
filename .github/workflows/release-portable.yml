@@ -142,7 +142,9 @@ jobs:
       # machine that found it has since moved to Rocky 9 (glibc 2.34, where any
       # of those releases would start).  8.10 is the last Rocky 8; the check that
       # it IS glibc 2.28 keeps a changed image from passing this silently.  The
-      # image has no cmp, so outputs are compared by checksum.
+      # image is minimal: coreutils, bash and glibc-common, but no cmp and no find
+      # (the first run of this step stopped at find), so outputs are compared by
+      # checksum and the extracted files are named by path.
       - name: Runs on RHEL/Rocky 8 (glibc 2.28)
         run: |
           set -euo pipefail
@@ -163,8 +165,7 @@ jobs:
               mkdir -p t/d out && echo one > t/d/a && echo two > t/d/b
               /b/gzstd -q -f --tar -o t.tar.zst t/d
               /b/gzstd -q -d --tar -C out t.tar.zst
-              [ "$(find out -type f -name a -exec cat {} +)" = one ] \
-                && [ "$(find out -type f -name b -exec cat {} +)" = two ] \
+              [ "$(cat out/t/d/a)" = one ] && [ "$(cat out/t/d/b)" = two ] \
                 || { echo "ERROR: --tar round trip on Rocky 8"; exit 1; }
               echo "Rocky 8.10 (glibc 2.28): starts; file, -t, --sliding-window, pipe and --tar round trips OK"
             '
