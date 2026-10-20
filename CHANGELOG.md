@@ -1,12 +1,143 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.19  
+**Covers:** v0.9.50 → v0.18.20  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.20 — `--patch-from` creates patches, byte-identical to zstd's; `--format=gzip|xz|lzma|lz4` is refused when compressing, and another compressor's file is named as such (ROADMAP Phase 8 decided against)
+
+The owner's decision (2026-10-19): gzstd will not write or read gzip, xz, lzma or lz4.  Writing
+gzip through zlib adds nothing over gzip, which every Linux box has, and pigz does it in parallel;
+what zstd's `--format` mostly buys is one tool reading several formats, which would cost three
+optional libraries and a suite section per codec.  Trying it showed two things worth fixing:
+
+- **`--format=gzip` (and xz, lzma, lz4) warned and wrote zstd, at exit 0** -- under any name the
+  caller chose: `gzstd --format=gzip -k f -o f.gz` produced a zstd file named `f.gz` that gzip
+  cannot read.  The drop-in rules call an accepted option that silently does something else a
+  defect, and a warning on stderr did not stop the script.  It is now refused when compressing
+  (exit 2, nothing written): `--format=gzip: gzstd writes only zstd; use gzip or pigz to write gzip`
+  (xz for xz, `xz --format=lzma` for lzma, lz4 for lz4).  With -d, -t and -l it still warns and is
+  ignored, as zstd ignores it when decoding; a later `--format=zstd` on the line wins, and the tar
+  sparse values (posix, pax, gnu, oldgnu) are unchanged.  The parser comment that this "must stay a
+  warn/silent no-op ... or `gzstd --format=gzip` from a ported command line breaks" recorded the old
+  decision; a ported line that asks for gzip output needs gzip output, so breaking it loudly is the
+  point.
+- **`gzstd -d f.gz` said "did you mean to compress? use: gzstd f.gz".**  It still fails (exit 4),
+  but every magic check -- -d and -t, plain -l, and --tar extract, test and list -- now recognises
+  gzip, xz, lz4, bzip2 and lzma from the first four bytes and names the tool: `hint: this looks like
+  gzip data, and gzstd reads only zstd: use gzip -d or pigz -d`, with `(tar -z)` under --tar (-J,
+  -j, --lzma, -I lz4 for the others).  Plain -l had said "not a valid zstd stream (truncated or
+  corrupt)".  A file in no known format keeps the old hint.  lzma is recognised as zstd's own CLI
+  does (5D 00), which only ever chooses a hint on a path that has already failed.
+
+### `--patch-from` on compression: creating a patch
+
+The owner's ask (2026-10-19), after asking what a patch is: a patch is NEW compressed with all of OLD
+as its dictionary, so every stretch NEW shares with OLD becomes a reference into it; it decodes
+only against the same OLD.  gzstd decoded zstd's patches since v0.17.71; on compression the option
+warned and wrote an ordinary frame.
+
+zstd's patch is ONE frame whose window reaches back into OLD, which gzstd's independent frames could
+not each do -- but the `--sliding-window` path already writes one frame through libzstd, and is
+byte-identical to zstd there.  So `--patch-from` on compression now routes to it and applies zstd
+1.5.7's recipe (programs/fileio.c, `FIO_adjustParamsForPatchFromMode`), read from the source:
+- window `2^(highbit(NEW) + 1)`, clamped to zstd's 10..31, set over `--long`'s and
+  `--zstd=windowLog`'s, as there;
+- long-distance matching turned on when that window exceeds the chain of the level's default
+  parameters for this NEW and OLD (`ZSTD_cycleLog`: chainLog, less 1 from btlazy2 on);
+- OLD attached with `ZSTD_CCtx_refPrefix`, raw content, for this one frame;
+- levels 20-22 without `--ultra` (zstd's CLI sets ultra for `--patch-from`).
+
+zstd's refusals, the same way: several files, stdin (zstd needs `--stream-size` there, which gzstd
+does not take), and OLD or NEW over 2 GiB; also `--tar`, `-D`, and the GPU backends.  The output may
+not replace OLD, by `-o` with `-f` or through a stdout opened on it: the patch is useless without it
+(decoding still may, `-d --patch-from=old -o old` being an in-place update).  `--rm` removes NEW and
+never OLD, `--verify` checks the patch against OLD, and `-v` prints the window and whether
+long-distance matching is on.
+
+zstd also sets, on the patch's context, six switches gzstd had accepted as no-ops: `--[no-]compress-literals`,
+`--[no-]row-match-finder`, `--size-hint=`, `--target-compressed-block-size=`, `-B#` (the job size) and
+`--stream-size=` (which zstd uses for the window instead of NEW's size).  Each changes zstd's patch
+bytes where measured except `--size-hint`, which zstd ignores for a named file (its size is pledged).
+Creating a patch now passes all six (found by the Codex review); they remain no-ops elsewhere,
+including plain `--sliding-window` (ROADMAP).  The patch also pledges an empty NEW's size of 0, as
+zstd does.
+
+Measured against zstd 1.5.7 (conda's CLI): text files of 300 KB, 8 MiB and 96 MiB with scattered
+edits, levels 1, 3, 9, 19 and 22 (19 and 22 not at 96 MiB), and `--long=27`, `--zstd=wlog=20,clog=20`
+and an empty NEW: every patch byte-identical to zstd's, for any `-T` on both sides (zstd -T1 and -T4
+agree, as do gzstd's default and -T3).  zstd decodes gzstd's patches and gzstd zstd's.  Sizes: 45 KB
+for the 96 MiB file at level 1 (38 MB as an ordinary frame at level 3), 3.6 KB for 8 MiB.
+
+**Speed, against zstd 1.5.7's default (-T = min(4, cores/4)) and -T0, warm, 3 runs each.**  Making a
+patch is serial in both tools: the window spans NEW, and zstd's worker jobs are several windows
+long, so the whole file is one job (-T0 does not help zstd either).
+
+| pair, level | | zstd | zstd -T0 | gzstd |
+|---|---|---|---|---|
+| 96 MiB, 3 | create | 0.39-0.43 s | 0.40-0.42 | 0.36-0.43 |
+| | apply | 0.12-0.13 | | 0.14-0.19 |
+| 96 MiB, 19 | create | 8.98-12.02 | 8.94-12.87 | 8.95-12.73 |
+| 1 GiB, 3 | create | 3.60-3.72 | 3.72-3.76 | 3.96-3.99, then **3.23-3.56** |
+| | apply | 1.15-1.33 | | 1.19-1.38 |
+
+The first 1 GiB result lost 8%: gzstd COPIED the reference into memory before compressing (0.64 s
+for 1 GiB, measured with an empty NEW) where zstd maps it (0.01 s; zstd maps a reference over its
+128 MiB memory limit).  Creating a patch now maps it too (0.01-0.02 s; 3.23-3.56 s against zstd's
+3.32-3.82 in the same session).  A reference shortened mid-run then ends the run by SIGBUS with the
+partial output removed, the policy for every mapped input (measured: exit 135, nothing left).
+Decoding keeps the copy, because `-d --patch-from=old -o old` writes over the reference itself.
+
+### Tests
+
+--patch-from compression, +3 default cells and one -e cell rewritten (the one that asserted the old
+warning): byte-identical to zstd at -1, -3, -19 and -22 on a NEW with scattered edits, with zstd's
+own -19 and -22 patches as the control that the fixture tells levels apart; gzstd -d and zstd -d
+rebuild NEW from a patch under 1% of it; the refusals (several files, stdin, --tar, -o OLD with OLD
+intact); in -e, --verify, -c (the same bytes as -o) and --rm (NEW removed, OLD kept).  Each of 7
+mutants fails a cell: no prefix, no long-distance matching, the window one smaller, no implied
+--ultra (it survived the first fixture, OLD plus a changed tail, where every level gives the same
+patch -- hence the control), and each refusal removed in turn.
+The byte-identity cell also compares six option variants, each at a level and on an input where the
+option changes zstd's own bytes (`-7 --no-row-match-finder`, `--stream-size=64K`,
+`--target-compressed-block-size=8K` on a literal-heavy fixture, ...), with that change as the arm's
+control; 5 more mutants, each dropping one pass-through, fail naming their flag.  The byte comparison
+skips unless the zstd CLI and gzstd's libzstd are both 1.5.7; the decode cell still runs.
+
+Default run +3 (552 -> 555): another compressor's file on -d (gzip real, the others magic-only so no
+tools are needed), on -t, -l, -l --tar and -d --tar, and an unknown file keeping the compress hint.
+`-e` (850 -> 855): the --format=gzip warn cell becomes three -- refused for all four values with
+nothing written, -d --format=gzip decodes with a warning, a later --format=zstd wins.  Each of 6
+mutants fails at least one cell: the old warning, no hint, the plain site's old hint, plain -l's old
+message, --format=zstd not winning, and refusing in every mode.  Both builds warning-free.
+### Review
+
+Codex (GPT-6-Sol, high), two rounds.  Round 1, NOT SAFE, two blockers, both fixed as it proposed:
+patch creation ignored six switches zstd sets on its patch context (`--no-compress-literals` and the
+others above; a `--no-compress-literals` patch differed from zstd's), and `-l -z --patch-from=missing
+ARCHIVE`, which used to list, now tried to load the reference.  Also adopted: plain `-l`'s hint from
+the bytes it inspected (it re-opened the name, which a rename could change), the libzstd-version
+guard on the byte comparison, tar arms that need neither tar nor gzip, and a locale probe for the
+width cell.  Its option arms could not fail (four of the flags leave zstd's bytes unchanged on that
+fixture); reworked with per-arm controls, and 5 mutants confirm them.  Round 2: no findings, SAFE TO
+COMMIT.
+
+### The help fits 80 columns
+
+Both `-h` and `--help`, in both builds, now fit an 80-column terminal (widest 78 and 80, measured in
+display columns).  Eight lines were wider, up to 89; the `--patch-from` line added here had also
+lost its newline in `-h`, running `--train` onto it.  A new -e cell checks the width with
+`wc -L` on both helps.
+
+Totals with all of it: default 552 -> 558, -e 850 -> 859.
+
+Suites: CPU-only default 412/0 (120 skipped, the no-GPU set, as expected); `-e` on the GPU build,
+masked to the one idle card on a host with tenants on four, 840/0/19 of 859 -- 18 cells that need two
+or more GPUs and the trivial-park cell; the run's count note is that one-card mask.
 
 ## v0.18.19 — the default worker count follows the CPUs this process may use (affinity mask, cgroup CPU quota), not the machine's: 1.1-2.2x faster under a mask or a quota
 

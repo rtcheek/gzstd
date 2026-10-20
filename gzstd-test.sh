@@ -622,8 +622,13 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=552
-$EXTENSIVE && EXPECTED_TESTS=850
+EXPECTED_TESTS=558
+$EXTENSIVE && EXPECTED_TESTS=859
+# v0.18.20: +1 -e (both helps fit 80 columns): 858 -> 859.
+# v0.18.20 (--patch-from on compression): +3 default cells; the -e cell that
+# asserted the old warning now checks --verify, -c and --rm.  555 -> 558, 855 -> 858.
+# v0.18.20: +3 default (another compressor's input names its tool), and in -e the
+# --format=gzip warn cell becomes 3 refusal cells: 552 -> 555, 850 -> 855.
 # v0.18.19: +5 tests in both (worker count under a mask and a cgroup quota): 547 -> 552, 845 -> 850.
 # v0.18.8: +2 default GPU tests (batch sized to the input, both directions) and
 # +1 --extensive GPU test (a lost bringup race halves again): 519 -> 521, 778 -> 781.
@@ -1648,6 +1653,50 @@ rc=0; "$GZSTD" -d -f --cpu-only "$TMPDIR/medium.txt" -o /dev/null 2>/dev/null ||
 [[ $rc -eq 4 ]] && pass "exit 4 non-zstd input" "(EXIT_DATA)" \
   || { [[ $rc -ne 0 ]] && pass "non-zero non-zstd" "(exit $rc)" || fail "non-zstd" "got 0"; }
 
+# Another compressor's input (v0.18.20): still exit 4, and the hint names the
+# tool that reads it instead of suggesting the user meant to compress it.  The
+# hint reads only the first bytes, so magic-only files stand in for xz, lz4,
+# bzip2 and lzma (no tools needed); the gzip file is real when gzip exists.
+ff_dir="$TMPDIR/foreign"; rm -rf "$ff_dir"; mkdir -p "$ff_dir/x"
+gzip -c "$TMPDIR/medium.txt" > "$ff_dir/f.gz" 2>/dev/null \
+  || printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03padding' > "$ff_dir/f.gz"
+printf '\xfd7zXZ\x00\x00\x04padding' > "$ff_dir/f.xz"
+printf '\x04\x22\x4d\x18padding' > "$ff_dir/f.lz4"
+printf 'BZh91AY&SYpadding' > "$ff_dir/f.bz2"
+printf '\x5d\x00\x00\x80\x00padding' > "$ff_dir/f.lzma"
+printf 'plain text, no format at all\n' > "$ff_dir/f.txt"
+ff_bad=""
+for ff in gz:gzip xz:xz lz4:lz4 bz2:bzip2 lzma:lzma; do
+  ff_ext=${ff%%:*}; ff_name=${ff#*:}
+  rc=0; "$GZSTD" -d -f --cpu-only -c "$ff_dir/f.$ff_ext" >/dev/null 2>"$ff_dir/e.$ff_ext" || rc=$?
+  { [[ $rc -eq 4 ]] && grep -qa "hint: this looks like $ff_name data" "$ff_dir/e.$ff_ext"; } \
+    || ff_bad+=" $ff_ext(rc=$rc)"
+done
+[[ -z $ff_bad ]] && pass "-d on another compressor's file names the tool that reads it" \
+  || fail "-d on another compressor's file names the tool that reads it" "$ff_bad"
+ff_bad=""
+rc=0; "$GZSTD" -t --cpu-only "$ff_dir/f.gz" 2>"$ff_dir/e.t" || rc=$?
+{ [[ $rc -eq 4 ]] && grep -qa 'looks like gzip data' "$ff_dir/e.t"; } || ff_bad+=" -t(rc=$rc)"
+rc=0; "$GZSTD" -l "$ff_dir/f.xz" >/dev/null 2>"$ff_dir/e.l" || rc=$?
+{ [[ $rc -eq 4 ]] && grep -qa 'looks like xz data' "$ff_dir/e.l"; } || ff_bad+=" -l(rc=$rc)"
+# The tar paths reject on compressed magic before reading a tar header, so the
+# same gzip fixture covers them even on a host without the tar program.
+cp "$ff_dir/f.gz" "$ff_dir/t.tar.gz"
+rc=0; "$GZSTD" -l --tar "$ff_dir/t.tar.gz" >/dev/null 2>"$ff_dir/e.lt" || rc=$?
+{ [[ $rc -eq 4 ]] && grep -qa 'looks like gzip data.*(tar -z)' "$ff_dir/e.lt"; } || ff_bad+=" -l--tar(rc=$rc)"
+rc=0; "$GZSTD" -d --tar --cpu-only "$ff_dir/t.tar.gz" -C "$ff_dir/x" >/dev/null 2>"$ff_dir/e.dt" || rc=$?
+{ [[ $rc -eq 4 ]] && grep -qa 'looks like gzip data.*(tar -z)' "$ff_dir/e.dt"; } || ff_bad+=" -d--tar(rc=$rc)"
+rc=0; "$GZSTD" -t --tar --cpu-only "$ff_dir/t.tar.gz" >/dev/null 2>"$ff_dir/e.tt" || rc=$?
+{ [[ $rc -eq 4 ]] && grep -qa 'looks like gzip data.*(tar -z)' "$ff_dir/e.tt"; } || ff_bad+=" -t--tar(rc=$rc)"
+[[ -z $ff_bad ]] && pass "-t, -l and --tar on another compressor's file name its tool too" \
+  || fail "-t, -l and --tar on another compressor's file name its tool too" "$ff_bad"
+rc=0; "$GZSTD" -d -f --cpu-only -c "$ff_dir/f.txt" >/dev/null 2>"$ff_dir/e.txt" || rc=$?
+{ [[ $rc -eq 4 ]] && grep -qa 'hint: did you mean to compress' "$ff_dir/e.txt" \
+    && ! grep -qa 'looks like' "$ff_dir/e.txt"; } \
+  && pass "-d on a file in no known format still suggests compressing it" \
+  || fail "-d on a file in no known format still suggests compressing it" "rc=$rc $(cat "$ff_dir/e.txt")"
+rm -rf "$ff_dir"
+
 # ============================================================
 # 15. Help & version
 # ============================================================
@@ -1657,6 +1706,23 @@ section "Help and version (extensive)"
 LAST_TEST_MS=0
 ("$GZSTD" -h 2>&1 || true) | grep -qi "usage\|options\|compress" && pass "-h shows help" || fail "-h shows help"
 ("$GZSTD" --help 2>&1 || true) | grep -qi "usage\|options\|compress" && pass "--help shows help" || fail "--help shows help"
+# Both helps fit an 80-column terminal (v0.18.20).  wc -L counts display
+# columns only in a UTF-8 locale; a missing C.UTF-8 must not make a correct
+# help fail by counting the bytes of em dashes and arrows separately.
+hw_locale=""
+for candidate in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+  if [[ $(LC_ALL="$candidate" locale charmap 2>/dev/null) == UTF-8 ]]; then
+    hw_locale=$candidate; break
+  fi
+done
+if [[ -n $hw_locale ]]; then
+  hw_s=$("$GZSTD" -h 2>&1 | LC_ALL="$hw_locale" wc -L)
+  hw_l=$("$GZSTD" --help 2>&1 | LC_ALL="$hw_locale" wc -L)
+  (( hw_s <= 80 && hw_l <= 80 )) && pass "-h and --help fit 80 columns" "($hw_s, $hw_l)" \
+    || fail "-h and --help fit 80 columns" "widest lines: -h $hw_s, --help $hw_l"
+else
+  skip "-h and --help fit 80 columns" "no UTF-8 locale available for wc -L"
+fi
 ("$GZSTD" -V 2>&1 || true) | grep -qE "[0-9]+\.[0-9]+\.[0-9]+" && pass "-V shows version" "($VERSION)" || fail "-V shows version"
 ("$GZSTD" --version 2>&1 || true) | grep -qE "[0-9]+\.[0-9]+\.[0-9]+" && pass "--version shows version" || fail "--version shows version"
 
@@ -1985,6 +2051,104 @@ PYEOF
     fail "--patch-from reads a magic-prefixed reference as raw content" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
   fi
 
+  # ---- --patch-from on COMPRESSION: creating a patch (v0.18.20) ----
+  # One frame with OLD as its prefix, zstd's recipe (window from NEW's size,
+  # long-distance matching past the level's chain), so the bytes must equal
+  # zstd's own at every level, 20-22 included without --ultra as in zstd.  NEW
+  # has scattered edits (every 97th line changed, every 389th a line inserted),
+  # so the levels' patches differ -- the control: zstd's -19 and -22 must, or
+  # the -22 arm could not catch a run that fell back to 19.
+  awk 'NR % 97 == 0 { sub(/member/, "admin") } NR % 389 == 0 { print "{\"inserted\":" NR "}" } { print }' \
+    "$DICTD/old.bin" > "$DICTD/newe.bin"
+  # Bitstream equality requires the same libzstd version on both sides.
+  if [[ $(zstd --version 2>/dev/null) == *v1.5.7* \
+        && $("$GZSTD" --version 2>/dev/null) == *"zstd 1.5.7"* ]]; then
+  t0=$(now_ms); why=""
+  for lv in 1 3 19 22; do
+    zstd -q -f -$lv --patch-from="$DICTD/old.bin" "$DICTD/newe.bin" -o "$DICTD/pzz.$lv.zst" 2>/dev/null
+    rc=0; "$GZSTD" -q -f -$lv --patch-from="$DICTD/old.bin" "$DICTD/newe.bin" -o "$DICTD/pzg.$lv.zst" 2>"$DICTD/err" || rc=$?
+    { [[ $rc -eq 0 ]] && cmp -s "$DICTD/pzz.$lv.zst" "$DICTD/pzg.$lv.zst"; } || why+=" -$lv(rc=$rc)"
+  done
+  # FIO_createCResources also passes these switches to zstd's patch CCtx.
+  # They were formerly accepted no-ops in gzstd, so compare their patch bytes.
+  # The literal fixture has little matchable content in OLD but an alphabet
+  # small enough for Huffman coding, so disabling literal compression must
+  # change zstd's bytes; that control catches an ineffective comparison.
+  python3 - "$DICTD/pz-literals.bin" <<'PY'
+import random, sys
+rng = random.Random(1820)
+alphabet = b"etaoinshrdlucmfwypvbgkqjxz"
+with open(sys.argv[1], "wb") as out:
+    out.write(bytes(alphabet[rng.randrange(len(alphabet))] for _ in range(1 << 20)))
+PY
+  # Each variant is LEVEL FLAG INPUT, chosen so that the flag changes zstd's
+  # own bytes there (measured, 1.5.7) -- the control below, without which an
+  # arm could not catch gzstd ignoring the flag.  --size-hint is the exception:
+  # a named NEW's size is pledged, so zstd ignores the hint and so must gzstd;
+  # its arm only checks that gzstd still matches.
+  pz_variant=0
+  for pz_case in "3 --no-compress-literals lit" "7 --no-row-match-finder new" \
+                 "3 --stream-size=64K new" "3 --target-compressed-block-size=8K lit" \
+                 "3 -B512K new" "3 --size-hint=64K new"; do
+    read -r pz_lv pz_flag pz_in <<<"$pz_case"
+    (( ++pz_variant ))
+    pz_input="$DICTD/newe.bin"; [[ $pz_in == lit ]] && pz_input="$DICTD/pz-literals.bin"
+    zstd -q -f -$pz_lv --patch-from="$DICTD/old.bin" "$pz_input" \
+      -o "$DICTD/pzz.base$pz_variant.zst" 2>/dev/null
+    zstd -q -f -$pz_lv "$pz_flag" --patch-from="$DICTD/old.bin" "$pz_input" \
+      -o "$DICTD/pzz.opt$pz_variant.zst" 2>/dev/null
+    rc=0; "$GZSTD" -q -f -$pz_lv "$pz_flag" --patch-from="$DICTD/old.bin" "$pz_input" \
+      -o "$DICTD/pzg.opt$pz_variant.zst" 2>"$DICTD/err" || rc=$?
+    { [[ $rc -eq 0 ]] && cmp -s "$DICTD/pzz.opt$pz_variant.zst" "$DICTD/pzg.opt$pz_variant.zst"; } \
+      || why+=" $pz_flag(rc=$rc)"
+    [[ $pz_flag == --size-hint=* ]] && continue
+    cmp -s "$DICTD/pzz.base$pz_variant.zst" "$DICTD/pzz.opt$pz_variant.zst" \
+      && why+=" $pz_flag did not change zstd's bytes (NOT TESTED)"
+  done
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  if cmp -s "$DICTD/pzz.19.zst" "$DICTD/pzz.22.zst"; then
+    fail "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)" \
+         "control: zstd's -19 and -22 patches are equal -- the fixture does not discriminate, NOT TESTED"
+  elif [[ -z "$why" ]]; then
+    pass "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)"
+  else
+    fail "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)" "differs at$why $(head -c 160 "$DICTD/err")"
+  fi
+  else
+    skip "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)" \
+      "requires zstd CLI and linked library 1.5.7"
+    "$GZSTD" -q -f -3 --patch-from="$DICTD/old.bin" "$DICTD/newe.bin" \
+      -o "$DICTD/pzg.3.zst" 2>"$DICTD/err"
+  fi
+  # Both decoders rebuild NEW from it, and it is a patch, not a plain frame:
+  # under a hundredth of NEW, where a plain frame of 2 MB of JSON is not.
+  t0=$(now_ms); rc=0; rcz=0
+  "$GZSTD" -q -d -c --patch-from="$DICTD/old.bin" "$DICTD/pzg.3.zst" > "$DICTD/pzg.out" 2>"$DICTD/err" || rc=$?
+  zstd -q -d -c --patch-from="$DICTD/old.bin" "$DICTD/pzg.3.zst" > "$DICTD/pzz.out" 2>/dev/null || rcz=$?
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  pz_size=$(stat -c%s "$DICTD/pzg.3.zst" 2>/dev/null || echo 0)
+  [[ $rc -eq 0 && $rcz -eq 0 ]] && files_match "$DICTD/newe.bin" "$DICTD/pzg.out" \
+    && files_match "$DICTD/newe.bin" "$DICTD/pzz.out" && (( pz_size > 0 && pz_size * 100 < $(stat -c%s "$DICTD/newe.bin") )) \
+    && pass "--patch-from compress: gzstd -d and zstd -d rebuild NEW from a small patch" "($pz_size bytes)" \
+    || fail "--patch-from compress: gzstd -d and zstd -d rebuild NEW from a small patch" "rc=$rc/$rcz size=$pz_size"
+  # zstd's refusals (several files, stdin), --tar, and a patch over its own
+  # reference -- it decodes only against OLD, so OLD must survive -f.
+  t0=$(now_ms); why=""
+  cp "$DICTD/old.bin" "$DICTD/old2.bin"
+  "$GZSTD" -f --patch-from="$DICTD/old.bin" "$DICTD/new.bin" "$DICTD/newm.bin" >/dev/null 2>"$DICTD/err"; rc=$?
+  { [[ $rc -eq 2 ]] && grep -q "on multiple files" "$DICTD/err"; } || why+=" two:$rc"
+  "$GZSTD" -c --patch-from="$DICTD/old.bin" < "$DICTD/new.bin" >/dev/null 2>"$DICTD/err"; rc=$?
+  { [[ $rc -eq 2 ]] && grep -q "needs a named input file" "$DICTD/err"; } || why+=" stdin:$rc"
+  "$GZSTD" --tar -f --patch-from="$DICTD/old.bin" -o "$DICTD/pt.tzst" "$DICTD/s" >/dev/null 2>"$DICTD/err"; rc=$?
+  [[ $rc -eq 2 ]] || why+=" tar:$rc"
+  "$GZSTD" -f --patch-from="$DICTD/old2.bin" "$DICTD/new.bin" -o "$DICTD/old2.bin" >/dev/null 2>"$DICTD/err"; rc=$?
+  { [[ $rc -eq 2 ]] && cmp -s "$DICTD/old.bin" "$DICTD/old2.bin"; } || why+=" over-OLD:$rc"
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--patch-from compress refuses several files, stdin, --tar, and -o OLD (exit 2)" \
+    || fail "--patch-from compress refuses several files, stdin, --tar, and -o OLD (exit 2)" "got$why"
+  rm -f "$DICTD"/pzz.* "$DICTD"/pzg.* "$DICTD/old2.bin" "$DICTD/pt.tzst" \
+    "$DICTD/newe.bin" "$DICTD/pz-literals.bin"
+
   # ---- --train (v0.17.72) ----
   # gzstd mirrors zstd's builder step for step -- directory walk, fixed-seed
   # shuffle, per-sample cap, -B# chunking, load limit, ZDICT parameters -- so the
@@ -2153,6 +2317,9 @@ else
            "compress -D refuses --hybrid (exit 2)" \
            "-d --patch-from=OLD decodes a zstd --patch-from patch" \
            "--patch-from reads a magic-prefixed reference as raw content" \
+           "--patch-from compress: byte-identical to zstd --patch-from (-1 -3 -19 -22)" \
+           "--patch-from compress: gzstd -d and zstd -d rebuild NEW from a small patch" \
+           "--patch-from compress refuses several files, stdin, --tar, and -o OLD (exit 2)" \
            "--train: same dictionary bytes as zstd --train" \
            "--train-cover=k=64,d=8,split=80: same bytes as zstd (no search)" \
            "--train-legacy: same bytes as zstd" \
@@ -12215,8 +12382,7 @@ done
 
 # Warn no-ops (each should emit one compat warning).  --exclude-compressed and
 # --long left this list in v0.18.8, when they became real.
-for opt in --rsyncable \
-           --format=gzip --pass-through; do
+for opt in --rsyncable --pass-through; do
   out=$("$GZSTD" "$opt" -f "$TMPDIR/zc.bin" 2>&1)
   if echo "$out" | grep -qi "accepted for zstd compatibility but ignored"; then
     pass "warn no-op: $opt"
@@ -12224,6 +12390,29 @@ for opt in --rsyncable \
     fail "warn no-op: $opt" "missing compat warning"
   fi
 done
+
+# --format=gzip|xz|lzma|lz4 is REFUSED when compressing (v0.18.20).  It was a
+# warn no-op above: exit 0 and a zstd file, even under a name like x.gz.
+ff_bad=""
+for ff in gzip xz lzma lz4; do
+  rm -f "$TMPDIR/zc.$ff"
+  rc=0; out=$("$GZSTD" --format=$ff -f "$TMPDIR/zc.bin" -o "$TMPDIR/zc.$ff" 2>&1) || rc=$?
+  { [[ $rc -eq 2 && ! -e "$TMPDIR/zc.$ff" ]] && echo "$out" | grep -q "writes only zstd"; } \
+    || ff_bad+=" $ff(rc=$rc)"
+done
+[[ -z $ff_bad ]] && pass "--format=gzip|xz|lzma|lz4 is refused when compressing (exit 2, no output)" \
+  || fail "--format=gzip|xz|lzma|lz4 is refused when compressing (exit 2, no output)" "$ff_bad"
+# Decoding ignores it with a warning, as zstd does; a later --format=zstd wins.
+"$GZSTD" -q -f -c --cpu-only "$TMPDIR/zc.bin" > "$TMPDIR/zc-fmt.zst" 2>/dev/null
+rc=0; out=$("$GZSTD" -d --format=gzip -c "$TMPDIR/zc-fmt.zst" 2>&1 >"$TMPDIR/zc-fmt.out") || rc=$?
+{ [[ $rc -eq 0 ]] && cmp -s "$TMPDIR/zc.bin" "$TMPDIR/zc-fmt.out" \
+    && echo "$out" | grep -qi "accepted for zstd compatibility but ignored"; } \
+  && pass "-d --format=gzip decodes, with a warning" \
+  || fail "-d --format=gzip decodes, with a warning" "rc=$rc $out"
+rc=0; "$GZSTD" --format=gzip --format=zstd -q -f -c --cpu-only "$TMPDIR/zc.bin" > "$TMPDIR/zc-last.zst" 2>/dev/null || rc=$?
+{ [[ $rc -eq 0 ]] && "$GZSTD" -t -q "$TMPDIR/zc-last.zst" 2>/dev/null; } \
+  && pass "--format=zstd after --format=gzip wins" || fail "--format=zstd after --format=gzip wins" "rc=$rc"
+rm -f "$TMPDIR/zc-fmt.zst" "$TMPDIR/zc-fmt.out" "$TMPDIR/zc-last.zst"
 
 # --adapt is a REAL gzstd flag since v0.15.0 (the adaptive governor takes
 # over zstd's same-named flag): bare form runs with NO compat warning;
@@ -12376,16 +12565,19 @@ if command -v zstd &>/dev/null && [[ -s "$DICTD/a.dict" ]]; then
   [[ -z "$why" ]] && pass "--patch-from errors: with -D, empty, option 2; missing reference 3" \
     || fail "--patch-from errors: with -D, empty, option 2; missing reference 3" "got$why"
 
-  # CREATING a patch is not implemented: it must warn and write a plain frame.
-  t0=$(now_ms); rc=0
-  "$GZSTD" -f --patch-from="$DICTD/old.bin" "$DICTD/new.bin" -o "$DICTD/pz.zst" 2>"$DICTD/err" || rc=$?
+  # CREATING a patch (v0.18.20; it used to warn and write a plain frame): the
+  # stream verifier has the reference, -c writes the same bytes as -o, and --rm
+  # removes NEW but never the reference.
+  t0=$(now_ms); rc=0; why=""
+  cp "$DICTD/new.bin" "$DICTD/new3.bin"
+  "$GZSTD" -q -f --verify --patch-from="$DICTD/old.bin" "$DICTD/new.bin" -o "$DICTD/pz.zst" 2>"$DICTD/err" || why+=" verify:$?"
+  "$GZSTD" -q -c --patch-from="$DICTD/old.bin" "$DICTD/new.bin" 2>/dev/null | cmp -s - "$DICTD/pz.zst" || why+=" -c"
+  "$GZSTD" -q -f --rm --patch-from="$DICTD/old.bin" "$DICTD/new3.bin" -o "$DICTD/pz3.zst" 2>/dev/null || why+=" rm:$?"
+  [[ ! -e "$DICTD/new3.bin" && -e "$DICTD/old.bin" ]] || why+=" rm-files"
   LAST_TEST_MS=$(( $(now_ms) - t0 ))
-  if [[ $rc -eq 0 ]] && grep -q "creating patches is not supported" "$DICTD/err" \
-     && zstd -q -d -c "$DICTD/pz.zst" 2>/dev/null | cmp -s - "$DICTD/new.bin"; then
-    pass "compress --patch-from warns; output is a plain frame"
-  else
-    fail "compress --patch-from warns; output is a plain frame" "rc=$rc: $(head -c 200 "$DICTD/err" | tr '\n' ' ')"
-  fi
+  [[ -z "$why" ]] && pass "compress --patch-from: --verify, -c and --rm (the reference kept)" \
+    || fail "compress --patch-from: --verify, -c and --rm (the reference kept)" "got$why $(head -c 160 "$DICTD/err")"
+  rm -f "$DICTD/new3.bin" "$DICTD/pz3.zst"
 
   # --train's remaining spellings and routes, each against zstd's own bytes.
   train_same "--train-fastcover=k=200,d=8,f=18,accel=2: same bytes" \
@@ -12409,7 +12601,7 @@ else
            "--patch-from OLD (separated spelling)" \
            "--patch-from with a window past 128 MiB" \
            "--patch-from errors: with -D, empty, option 2; missing reference 3" \
-           "compress --patch-from warns; output is a plain frame" \
+           "compress --patch-from: --verify, -c and --rm (the reference kept)" \
            "--train-fastcover=k=200,d=8,f=18,accel=2: same bytes" \
            "--train-fastcover (bare): same bytes as zstd" \
            "--maxdict 8K --dictID=4242 -19: same bytes as zstd" \

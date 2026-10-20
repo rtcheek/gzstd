@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.19";
+static constexpr const char * GZSTD_VERSION = "0.18.20";
 //
 // Architecture overview:
 //
@@ -2775,7 +2775,7 @@ struct Options {
   unsigned train_selectivity = 9;           // --train-legacy=s=#, zstd's default
   unsigned train_maxdict = 110 * 1024;      // --maxdict=#, zstd's default (112640)
   unsigned train_dict_id = 0;               // --dictID=#; 0 = derived from the content
-  size_t   train_block_size = 0;            // -B#: split samples into #-byte blocks
+  size_t   train_block_size = 0;            // -B#: train sample blocks; patch CCtx jobSize
   bool     recursive = false;               // -r: expand directories (zstd's walk; v0.18.8 beyond --train)
   // v0.18.8, zstd's output-directory options.  Mirror wins when both are given,
   // as in zstd; -c and -o win over either.  Mapped per input by gz_map_output_dir.
@@ -2794,6 +2794,15 @@ struct Options {
   // its multithreaded single-frame compressor -- gzstd's --sliding-window, where it
   // is real.  gzstd's own frames are cut at fixed offsets, so elsewhere it warns.
   bool     rsyncable = false;
+  // These zstd CLI switches used to be accepted without effect.  Patch
+  // creation must pass them through: zstd sets each on its patch CCtx too.
+  int      patch_literal_mode = ZSTD_ps_auto;
+  int      patch_row_match = ZSTD_ps_auto;
+  int      patch_target_cblock_size = 0;
+  int      patch_src_size_hint = 0;
+  uint64_t patch_window_src_size = 0;      // --stream-size= overrides NEW size for zstd's patch window
+  std::string patch_target_cblock_arg, patch_src_hint_arg, patch_stream_size_arg;
+  bool patch_target_cblock_seen = false, patch_src_hint_seen = false, patch_stream_size_seen = false;
   // --zstd=k=v,... (v0.18.8; was refused as an unknown option): zstd's advanced
   // compression parameters, each overriding the level's, on the CPU.  0 = unset,
   // as in zstd.  Order: windowLog chainLog hashLog searchLog minMatch targetLength
@@ -2949,6 +2958,7 @@ struct Options {
   bool tar_selinux = false;              // --selinux: store/restore SELinux contexts (RHT.security.selinux)
   bool tar_index = true;                 // --[no-]index: append the member-index skippable frame on create
   bool tar_sparse_oldgnu = false;        // --format=gnu/oldgnu: emit OLDGNU 'S' sparse (default: PAX GNU.sparse.1.0)
+  std::string foreign_format;            // --format=gzip|xz|lzma|lz4: refused when compressing (v0.18.20)
   std::string tar_dest = ".";            // -C/--directory: extraction root (decompress + --tar)
   bool tar_dest_set = false;             // -C/--directory was typed (refused without --tar)
 };
@@ -4252,7 +4262,8 @@ static void print_help()
 "  -t                  test (verify integrity, no output)\n"
 "  -D FILE             compress or decode with dictionary FILE (implies\n"
 "                      --cpu-only; --no-dictID leaves its ID out of frames)\n"
-"  --patch-from=OLD    -d/-t: decode a zstd --patch-from patch against OLD\n"
+"  --patch-from=OLD    make a patch of FILE against OLD (one frame, as zstd's);\n"
+"                      -d/-t: decode one against OLD\n"
 "  --train FILE...     build a dictionary from sample files into -o NAME\n"
 "                      (default: dictionary); same bytes as zstd --train\n"
 "  -l                  list .zst frame info (Frames/Skips/Sizes/Ratio/Check);\n"
@@ -4292,10 +4303,14 @@ static void print_help()
 "  --numeric-owner     numeric uid/gid only: no name lookup on create, no\n"
 "                      name-first chown on root extract (like GNU tar)\n"
 "  --one-file-system   do not descend into other mounted filesystems\n"
-"  --xattrs            store/restore extended attributes (give on both create and extract)\n"
-"  --acls              store/restore POSIX ACLs (give on both create and extract)\n"
-"  --selinux           store/restore SELinux contexts (give on both create and extract)\n"
-"  --sparse            store sparse files compactly on create (PAX GNU.sparse.1.0; opt-in)\n"
+"  --xattrs            store/restore extended attributes (give on both\n"
+"                      create and extract)\n"
+"  --acls              store/restore POSIX ACLs (give on both create and\n"
+"                      extract)\n"
+"  --selinux           store/restore SELinux contexts (give on both create\n"
+"                      and extract)\n"
+"  --sparse            store sparse files compactly on create (PAX\n"
+"                      GNU.sparse.1.0; opt-in)\n"
 "  --no-index          create: skip the member index (instant -l, seek-based\n"
 "                      MEMBER extraction); it is a standard zstd skippable\n"
 "                      frame all tools ignore\n"
@@ -4338,12 +4353,14 @@ static void print_help()
 "  --[no-]preallocate  fallocate output to expected size up front\n"
 "                      (default: off; slower for O_DIRECT — see --preallocate)\n"
 "  --direct            O_DIRECT output (bypass page cache; auto-on for\n"
-"                      Gen4+ compress & decompress, --no-direct to force buffered)\n"
+"                      Gen4+ compress & decompress, --no-direct to force\n"
+"                      buffered)\n"
 "  --sync-output       fsync output before exit\n"
 "  --cold              drop input from page cache before reading\n"
 "                      (BENCHMARKING ONLY: forces a cold-cache read)\n"
 "  --watchdog[=SECS]   arm the GPU deadlock watchdog (DIAGNOSTIC ONLY: if a\n"
-"                      hybrid/GPU run stalls SECS s (default 30), dump JSON + abort)\n"
+"                      hybrid/GPU run stalls SECS s (default 30), dump JSON\n"
+"                      and abort)\n"
 "  --direct-read / --no-direct-read\n"
 "                      O_DIRECT input: single stream on compress; parallel on\n"
 "                      eligible decompress inputs; bypasses the page cache\n"
@@ -4418,8 +4435,8 @@ static void print_help_long()
 "\n"
 "Compatibility is NOT total: some zstd options are mapped, some are accepted\n"
 "and ignored silently, and some warn.  Dictionaries are trained (--train),\n"
-"used both ways (-D), and patches decode (-d --patch-from) but are not\n"
-"created.  See COMPATIBILITY OPTIONS near the end of this help for the\n"
+"used both ways (-D), and patches are made and decoded (--patch-from).\n"
+"See COMPATIBILITY OPTIONS near the end of this help for the\n"
 "exact classification of every one.\n"
 "\n"
 "With no file arguments (or file `-`), gzstd reads from stdin and writes\n"
@@ -4754,23 +4771,21 @@ static void print_help_long()
 "     batch's worth of input has arrived, or after 4 s if it is still\n"
 "     arriving.  -v prints the decision, -vv each time the backlog\n"
 "     crosses a batch, -vvv every sample.\n"
-"     GPU DEVICE COUNT: a single-file --gpu-only compress runs on as many GPUs as the\n"
-"     profile predicts will finish THIS input soonest.  More devices are\n"
+"     GPU DEVICE COUNT: a single-file --gpu-only compress runs on as many GPUs\n"
+"     as the profile predicts will finish THIS input soonest.  More devices are\n"
 "     not free: starting CUDA costs time for every visible device (measured\n"
-"     ~0.75 s each on an 8-GPU host, ~7 s for all 8), and past a few\n"
-"     devices the host, not the GPUs, sets the rate.  So each device count\n"
-"     keeps two numbers: its fixed overhead (wall time minus the time the\n"
-"     GPUs were busy) and its busy rate, and the predicted time is\n"
-"     overhead + size / rate.  On inputs of 8 GiB or more, counts that were\n"
-"     never measured are tried first -- all devices, then half, then a\n"
-"     quarter, down to 1 -- and stale counts are eligible after 20 runs; within 3%\n"
-"     of the best, the fewer devices win.  Smaller inputs never explore:\n"
-"     they take the best measured count.  stdin (size unknown) takes the\n"
-"     highest measured rate; within 3%, fewer devices win.  Ordinary runs\n"
-"     need 2 s or more of GPU work\n"
-"     to save a rate; shorter ones save overhead alone.  An explicit\n"
-"     --gpu-devices always wins.  To skip the exploring runs, measure once\n"
-"     with --calibrate FILE.\n"
+"     ~0.75 s each on an 8-GPU host, ~7 s for all 8), and past a few devices the\n"
+"     host, not the GPUs, sets the rate.  So each device count keeps two\n"
+"     numbers: its fixed overhead (wall time minus the time the GPUs were busy)\n"
+"     and its busy rate, and the predicted time is overhead + size / rate.  On\n"
+"     inputs of 8 GiB or more, counts that were never measured are tried first\n"
+"     -- all devices, then half, then a quarter, down to 1 -- and stale counts\n"
+"     are eligible after 20 runs; within 3% of the best, the fewer devices win.\n"
+"     Smaller inputs never explore: they take the best measured count.  stdin\n"
+"     (size unknown) takes the highest measured rate; within 3%, fewer devices\n"
+"     win.  Ordinary runs need 2 s or more of GPU work to save a rate; shorter\n"
+"     ones save overhead alone.  An explicit --gpu-devices always wins.  To skip\n"
+"     the exploring runs, measure once with --calibrate FILE.\n"
 "     PROFILE: a clean --adapt run of 3 s or longer records its measured\n"
 "     calibration to ${XDG_CACHE_HOME:-~/.cache}/gzstd/profile.json, keyed\n"
 "     by a hardware fingerprint (CPU model + cores, GPU names, kernel).\n"
@@ -5103,9 +5118,9 @@ static void print_help_long()
 "     Selects the SPARSE-file encoding only (the rest of the archive is\n"
 "     always ustar + GNU extensions).  posix, pax = PAX GNU.sparse.1.0\n"
 "     (default); gnu, oldgnu = legacy OLDGNU 'S'.  Inert without --sparse.\n"
-"     For CLI compatibility --format=zstd is accepted as a no-op, and\n"
-"     gzip, xz, lzma and lz4 are accepted with a warning and IGNORED —\n"
-"     gzstd always emits zstd.\n"
+"     For CLI compatibility --format=zstd is accepted as a no-op.\n"
+"     gzip, xz, lzma and lz4 are REFUSED when compressing (gzstd writes\n"
+"     only zstd; use gzip, pigz, xz or lz4), and warned about otherwise.\n"
 "\n"
 "  --[no-]index (on create; default: on)\n"
 "     Append a member index to the archive so `-l --tar` lists it\n"
@@ -5604,14 +5619,23 @@ static void print_help_long()
 "     Implies --cpu-only: nvCOMP takes no dictionary, so --gpu-only,\n"
 "     --hybrid, --gds-only and --direct-stage are refused.\n"
 "\n"
-"  --patch-from=OLD, --patch-from OLD    [decompress/test]\n"
-"     Decode a patch made by `zstd --patch-from=OLD NEW`, rebuilding NEW\n"
-"     (zstd-compatible).  OLD is used as raw content, whatever its first\n"
-"     bytes are; up to 2 GiB, as in zstd.  The patch's window may span\n"
-"     all of OLD, so the default 128 MiB window limit is lifted to the\n"
-"     format's maximum (an explicit -M still wins).  Cannot be combined\n"
-"     with -D.  Implies --cpu-only, like -D.  CREATING patches is not\n"
-"     implemented: on compression it warns and writes an ordinary frame.\n"
+"  --patch-from=OLD, --patch-from OLD    [compress, decompress, test]\n"
+"     A patch is NEW compressed against OLD: every stretch NEW shares with\n"
+"     OLD becomes a reference into it, so the patch of a changed file is\n"
+"     small, and it decodes only with the same OLD.\n"
+"     Compress (v0.18.20): `gzstd --patch-from=OLD NEW -o NEW.patch.zst`\n"
+"     writes ONE frame with OLD as its prefix, byte-identical to `zstd\n"
+"     --patch-from` (the same window, 2^(log2(NEW)+1); long-distance\n"
+"     matching when that outgrows the level's search; --sliding-window's\n"
+"     single-frame writer).  One named regular file at a time, no --tar,\n"
+"     no stdin; levels 20-22 need no --ultra, as in zstd.  The output may\n"
+"     not replace OLD.  Decompress: `gzstd -d --patch-from=OLD\n"
+"     NEW.patch.zst -o NEW` rebuilds NEW (zstd's patches as well); -t\n"
+"     checks one.  OLD is used as raw content, whatever its first bytes\n"
+"     are; OLD and NEW up to 2 GiB each, as in zstd.  The patch's window\n"
+"     may span all of OLD, so the default 128 MiB decode window limit is\n"
+"     lifted to the format's maximum (an explicit -M still wins).  Cannot\n"
+"     be combined with -D.  Implies --cpu-only, like -D.\n"
 "\n"
 "  --train FILE..., --train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#,\n"
 "  shrink[=#]], --train-cover[=k=#,d=#,steps=#,split=#,shrink[=#]],\n"
@@ -5661,8 +5685,9 @@ static void print_help_long()
 "\n"
 "  --gpu-devices N\n"
 "     Number of GPUs to use.  0 = auto (all available GPUs, for both\n"
-"     compress and decompress; with --adapt, a single-file --gpu-only compress uses\n"
-"     the count its profile predicts is fastest -- see --adapt).\n"
+"     compress and decompress; with --adapt, a single-file --gpu-only\n"
+"     compress uses the count its profile predicts is fastest -- see\n"
+"     --adapt).\n"
 "\n"
 "  --gpu-order {cuda|ranked}    (default: cuda)\n"
 "     The order an all-device set is handed to the workers in.  cuda\n"
@@ -5877,7 +5902,8 @@ static void print_help_long()
 "     --verbose (= -v), --single-thread (= -T 1), -0 (default level),\n"
 "     -M / --memlimit / --memory, --mmap=on|off, --preallocate=on|off,\n"
 "     -D FILE / -D=FILE (compress and decode with a dictionary),\n"
-"     --no-dictID, --patch-from=OLD / --patch-from OLD on -d and -t,\n"
+"     --no-dictID, --patch-from=OLD / --patch-from OLD (making a patch,\n"
+"     and on -d and -t),\n"
 "     --train, --train-cover, --train-fastcover, --train-legacy (with\n"
 "     --maxdict, --dictID, and -r / -B# for the sample set),\n"
 "     and bundled short flags as zstd reads them: -dc, -dkf, -qf, -dq,\n"
@@ -5974,11 +6000,19 @@ static void print_help_long()
 "                  are ignored (gzstd's --adapt is not zstd's --adapt).\n"
 "     --format=zstd is a no-op (gzstd always emits zstd).\n"
 "     --format=posix|pax|gnu|oldgnu selects --tar SPARSE ENCODING only.\n"
+"     --format=gzip|xz|lzma|lz4 is REFUSED when compressing (v0.18.20; it\n"
+"                  used to warn and write zstd, even to a name like x.gz):\n"
+"                  gzip, pigz, xz and lz4 write those formats.  With -d, -t\n"
+"                  or -l it warns: zstd ignores it there too.  An input in\n"
+"                  one of those formats (or bzip2) fails as not zstd, and\n"
+"                  the error names the tool that reads it.\n"
 "\n"
 "  ACCEPTED AND SILENTLY IGNORED — no warning, no effect:\n"
-"     --[no-]asyncio, --check (the default), --[no-]compress-literals,\n"
-"     --[no-]row-match-finder, --[no-]mmap-dict, --stream-size=,\n"
-"     --size-hint=, --target-compressed-block-size=, --auto-threads=\n"
+"     --[no-]asyncio, --check (the default), --[no-]mmap-dict,\n"
+"     --auto-threads=.  The following are real with --patch-from\n"
+"     compression and ignored otherwise: --[no-]compress-literals,\n"
+"     --[no-]row-match-finder, --stream-size=, --size-hint=,\n"
+"     --target-compressed-block-size=.\n"
 "\n"
 "  --filelist FILE reads input paths from FILE, one per line, as zstd\n"
 "     does.  (Through v0.17.86 it was accepted and ignored, so the\n"
@@ -5986,9 +6020,8 @@ static void print_help_long()
 "\n"
 "  ACCEPTED WITH A WARNING, THEN IGNORED:\n"
 "     --rsyncable without --sliding-window, --[no-]pass-through, --trace, -B,\n"
-"     -b# / -e# / -i#, -S, --priority=, --format=gzip|xz|lzma|lz4,\n"
-"     --patch-from on COMPRESSION (creating a patch; an ordinary frame\n"
-"     is written), and -B# outside --train\n"
+"     -b# / -e# / -i#, -S, --priority=, --format=gzip|xz|lzma|lz4 with\n"
+"     -d/-t/-l, and -B# outside --train/--patch-from compression\n"
 "     -q / -qq suppress these warnings, regardless of argument order.\n"
 "\n"
 "For a condensed option list, run `gzstd -h`.\n";
@@ -15692,14 +15725,30 @@ static void load_dictionaries(const Options & opt)
   // Leaked on purpose (see g_dict_buf).  Read in a loop: a reference can be
   // up to 2 GiB, past what one fread is guaranteed to return.
   const size_t len = (size_t)st.st_size;
-  char * buf = static_cast<char *>(std::malloc(len ? len : 1));
-  if (!buf) die("out of memory reading " + what + " " + p);
-  for (size_t got = 0; got < len;) {
-    const size_t r = std::fread(buf + got, 1, len - got, f);
-    if (r == 0)
-      die_io("cannot read " + what + ": " + p
-             + (std::ferror(f) ? " (read error)" : " (file shrank while reading)"));
-    got += r;
+  char * buf = nullptr;
+#ifndef _WIN32
+  // CREATING a patch MAPS the reference instead of copying it (v0.18.20), as
+  // zstd does for one over its 128 MiB memory limit.  MEASURED, 1 GiB warm:
+  // the copy took 0.64 s before compression could start (zstd's mapping
+  // 0.01 s), and a 1 GiB patch took 3.96-3.99 s against zstd's 3.60-3.72.  The
+  // output can never be the reference (refused below), and a reference
+  // shortened mid-run raises SIGBUS like any mapped input (see the handler).
+  // Decoding keeps the copy: `-d --patch-from=old` may write over old itself.
+  if (patch && opt.mode == Mode::COMPRESS && len > 0) {
+    void * mp = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fileno(f), 0);
+    if (mp != MAP_FAILED) buf = static_cast<char *>(mp);
+  }
+#endif
+  if (!buf) {
+    buf = static_cast<char *>(std::malloc(len ? len : 1));
+    if (!buf) die("out of memory reading " + what + " " + p);
+    for (size_t got = 0; got < len;) {
+      const size_t r = std::fread(buf + got, 1, len - got, f);
+      if (r == 0)
+        die_io("cannot read " + what + ": " + p
+               + (std::ferror(f) ? " (read error)" : " (file shrank while reading)"));
+      got += r;
+    }
   }
   std::fclose(f);
   g_dict_buf = buf;
@@ -22358,13 +22407,61 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
       vlog(V_DEFAULT, opt, "warning: --rsyncable needs zstd's worker threads, which this "
                            "run does not have; the frame is written without it\n");
   }
-  if (total_in > 0) {
+  if (total_in > 0 || g_dict_patch) {
     st = ZSTD_CCtx_setPledgedSrcSize(cctx, total_in);
     if (ZSTD_isError(st)) die_data(std::string("ZSTD_CCtx_setPledgedSrcSize: ") + ZSTD_getErrorName(st));
   }
 
   apply_ultra_cctx(cctx, opt.level, opt.ultra);
   apply_compress_dict(cctx, opt.level);   // -D; no-op without one
+  if (g_dict_patch) {
+    // CREATING A PATCH (v0.18.20): this one frame, with the --patch-from
+    // reference as its prefix.  zstd 1.5.7's recipe, programs/fileio.c
+    // FIO_adjustParamsForPatchFromMode, so the patch is zstd's byte for byte:
+    // a window of 2^(highbit(NEW) + 1), clamped to zstd's range, set over
+    // --long's and --zstd=windowLog's as there; long-distance matching turned on
+    // when that window outgrows the chain of the level's default parameters for
+    // this NEW and OLD (ZSTD_cycleLog: chainLog, less 1 for the binary-tree
+    // strategies); and the reference attached as raw content for this frame.
+    // gzstd_main has refused stdin, a second input, and either file over 2 GiB.
+    const uint64_t window_src_size = opt.patch_window_src_size
+                                   ? opt.patch_window_src_size : total_in;
+    unsigned hb = 0;
+    for (uint64_t v = window_src_size >> 1; v; v >>= 1) ++hb;   // FIO_highbit64
+    const unsigned file_wlog = hb + 1;
+    if (file_wlog > (unsigned)ZSTD_WINDOWLOG_MAX)
+      vlog(V_DEFAULT, opt, "gzstd: warning: Max window log exceeded by file (compression ratio will suffer)\n");
+    const int pwlog = std::max<int>(ZSTD_WINDOWLOG_MIN, std::min<int>(ZSTD_WINDOWLOG_MAX, (int)file_wlog));
+    st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, pwlog);
+    if (ZSTD_isError(st)) die(std::string("--patch-from: the linked zstd refused windowLog (") + ZSTD_getErrorName(st) + ")");
+    // FIO_createCResources sets these even in patch mode.  In particular,
+    // forcing raw literals is not equivalent to the library's auto default.
+    auto patch_param = [&](ZSTD_cParameter p, int value, const char * name) {
+      const size_t r = ZSTD_CCtx_setParameter(cctx, p, value);
+      if (ZSTD_isError(r))
+        die(std::string("--patch-from: the linked zstd refused ") + name
+            + " (" + ZSTD_getErrorName(r) + ")");
+    };
+    patch_param(ZSTD_c_literalCompressionMode, opt.patch_literal_mode, "literalCompressionMode");
+    patch_param(ZSTD_c_useRowMatchFinder, opt.patch_row_match, "useRowMatchFinder");
+    patch_param(ZSTD_c_targetCBlockSize, opt.patch_target_cblock_size, "targetCBlockSize");
+    patch_param(ZSTD_c_srcSizeHint, opt.patch_src_size_hint, "srcSizeHint");
+    patch_param(ZSTD_c_enableDedicatedDictSearch, 1, "enableDedicatedDictSearch");
+    if (sw_mt) patch_param(ZSTD_c_jobSize, (int)opt.train_block_size, "jobSize");
+    const ZSTD_compressionParameters cp = ZSTD_getCParams(opt.level, (unsigned long long)window_src_size, g_dict_len);
+    const unsigned cycle = cp.chainLog - ((unsigned)cp.strategy >= (unsigned)ZSTD_btlazy2 ? 1u : 0u);
+    const bool ldm = file_wlog > cycle;
+    if (ldm) {
+      st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
+      if (ZSTD_isError(st)) die(std::string("--patch-from: the linked zstd refused long-distance matching (") + ZSTD_getErrorName(st) + ")");
+    }
+    st = ZSTD_CCtx_refPrefix(cctx, g_dict_buf, g_dict_len);
+    if (ZSTD_isError(st)) die(std::string("--patch-from: the linked zstd refused the reference (") + ZSTD_getErrorName(st) + ")");
+    vlog(V_VERBOSE, opt, "[PATCH] against " + g_ddict_path + " (" + std::to_string(g_dict_len)
+                         + " bytes): windowLog " + std::to_string(pwlog)
+                         + (ldm ? ", long-distance matching on" : g_long_wlog ? ", long-distance matching on (--long)" : "")
+                         + "\n");
+  }
 #ifndef _WIN32
   gz_fifo_gate("GZSTD_DEBUG_SLIDING_GATE");   // after the pledge, before the first read
 #endif
@@ -43924,6 +44021,30 @@ static void print_reader_diag(const Options & opt, const Meter & meter, double w
   }
 }
 
+// An input that is not zstd but ANOTHER compressor's (v0.18.20): name it and
+// what reads it, instead of suggesting the user meant to compress it.  The
+// first four bytes, as every magic check below reads.  gzstd decodes only zstd
+// (ROADMAP Phase 8: no zlib/liblzma/liblz4).  Empty when none matches; lzma
+// (legacy .lzma) is recognised the way zstd's own CLI does, by 5D 00.
+static std::string gz_foreign_format_hint(const unsigned char * b, size_t n, bool tar)
+{
+  const char * name = nullptr, * tool = nullptr, * tarflag = nullptr;
+  if (n >= 2 && b[0] == 0x1F && b[1] == 0x8B) {
+    name = "gzip"; tool = "gzip -d or pigz -d"; tarflag = "-z";
+  } else if (n >= 4 && b[0] == 0xFD && b[1] == '7' && b[2] == 'z' && b[3] == 'X') {
+    name = "xz"; tool = "xz -d"; tarflag = "-J";
+  } else if (n >= 4 && b[0] == 0x04 && b[1] == 0x22 && b[2] == 0x4D && b[3] == 0x18) {
+    name = "lz4"; tool = "lz4 -d"; tarflag = "-I lz4";
+  } else if (n >= 4 && b[0] == 'B' && b[1] == 'Z' && b[2] == 'h' && b[3] >= '1' && b[3] <= '9') {
+    name = "bzip2"; tool = "bzip2 -d"; tarflag = "-j";
+  } else if (n >= 2 && b[0] == 0x5D && b[1] == 0x00) {
+    name = "lzma"; tool = "xz -d --format=lzma"; tarflag = "--lzma";
+  }
+  if (!name) return "";
+  return std::string("this looks like ") + name + " data, and gzstd reads only zstd: use " + tool
+       + (tar ? std::string(" (tar ") + tarflag + ")" : std::string());
+}
+
 // -d --tar: decompress each archive into a pipe and extract it via
 // tarx::Extractor.  Reuses the full parallel decompressor (CPU/GPU) unchanged —
 // the pipe is just a FILE* sink like stdout.  Returns an exit code.
@@ -44000,7 +44121,9 @@ static int extract_tar(const Options & opt, Meter * m)
       const uint32_t mg = (nr == 4) ? rd_le32(magic) : 0u;
       bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
       if (!ok_magic) {
-        vlog(V_ERROR, opt, "gzstd: untar: not a zstd archive: " + arc + "\n");
+        const std::string hint = gz_foreign_format_hint(magic, nr, true);
+        vlog(V_ERROR, opt, "gzstd: untar: not a zstd archive: " + arc + "\n"
+                           + (hint.empty() ? std::string() : "  hint: " + hint + "\n"));
         if (in && in != stdin) std::fclose(in);
         rc = EXIT_DATA; continue;
       }
@@ -44343,7 +44466,9 @@ static int verify_tar(const Options & opt, Meter * m)
       const uint32_t mg = (nr == 4) ? rd_le32(magic) : 0u;
       bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
       if (!ok_magic) {
-        vlog(V_ERROR, opt, "gzstd: test: not a zstd archive: " + arc + "\n");
+        const std::string hint = gz_foreign_format_hint(magic, nr, true);
+        vlog(V_ERROR, opt, "gzstd: test: not a zstd archive: " + arc + "\n"
+                           + (hint.empty() ? std::string() : "  hint: " + hint + "\n"));
         if (in && in != stdin) std::fclose(in);
         rc = EXIT_DATA; continue;
       }
@@ -44822,6 +44947,11 @@ static int list_zst(const Options & opt)
       if (ok && pos != fsize) ok = false;
       if (prog_shown) { std::fprintf(stderr, "\r%*s\r", 64, ""); std::fflush(stderr); }
     }
+    // Keep the hint tied to the bytes this listing actually inspected.  The
+    // pathname can name a different file by the time validation finishes.
+    unsigned char first_magic[4] = {0};
+    const size_t first_magic_len = std::min<size_t>(fsize, sizeof first_magic);
+    if (first_magic_len) std::memcpy(first_magic, base, first_magic_len);
 #ifndef _WIN32
     if (mp != MAP_FAILED) ::munmap(mp, mp_len);
     if (wfd >= 0) ::close(wfd);
@@ -44836,7 +44966,11 @@ static int list_zst(const Options & opt)
     // no frame count, no ratio and no checksum kind to report, so the row would be
     // zeros either way; report the error and move to the next file.
     if (!ok) {
-      vlog(V_ERROR, opt, "gzstd: list: " + fn + ": not a valid zstd stream (truncated or corrupt)\n");
+      // Another compressor's file is not "truncated or corrupt" (v0.18.20).
+      const std::string hint = gz_foreign_format_hint(first_magic, first_magic_len, false);
+      vlog(V_ERROR, opt, "gzstd: list: " + fn + (hint.empty()
+                           ? ": not a valid zstd stream (truncated or corrupt)\n"
+                           : ": not a zstd stream\n  hint: " + hint + "\n"));
       rc = EXIT_DATA;
       continue;
     }
@@ -44874,7 +45008,9 @@ static int list_tar(const Options & opt, Meter * m)
       const uint32_t mg = (nr == 4) ? rd_le32(magic) : 0u;
       bool ok_magic = (mg == 0xFD2FB528u) || ((mg & 0xFFFFFFF0u) == 0x184D2A50u);
       if (!ok_magic) {
-        vlog(V_ERROR, opt, "gzstd: list: not a zstd archive: " + arc + "\n");
+        const std::string hint = gz_foreign_format_hint(magic, nr, true);
+        vlog(V_ERROR, opt, "gzstd: list: not a zstd archive: " + arc + "\n"
+                           + (hint.empty() ? std::string() : "  hint: " + hint + "\n"));
         if (in && in != stdin) std::fclose(in);
         rc = EXIT_DATA; continue;
       }
@@ -46712,11 +46848,13 @@ static int gzstd_main(int argc, char ** argv)
   // A dictionary-backed archive must not replace the dictionary through a
   // caller-owned stdout descriptor either.  `exec 1<>dict; gzstd -D dict -c in`
   // keeps the file intact until we start writing, then overwrites it at exit 0.
-  if (to_stdout && (g_dict_compress || !opt.stats_json.empty())) {
+  // A patch being created needs its --patch-from reference just the same (v0.18.20).
+  const bool dep_needed = g_dict_compress || (g_dict_patch && opt.mode == Mode::COMPRESS);
+  if (to_stdout && (dep_needed || !opt.stats_json.empty())) {
     struct stat stdout_st {};
     if (::fstat(fileno(stdout), &stdout_st) == 0) {
-      if (g_dict_compress && gz_is_decode_dependency(stdout_st))
-        die_usage("dictionary and output are the same file: " + g_dep_path);
+      if (dep_needed && gz_is_decode_dependency(stdout_st))
+        die_usage(g_dep_what + " and output are the same file: " + g_dep_path);
       struct stat stats_st {};
       if (!opt.stats_json.empty()
           && ::stat(opt.stats_json.c_str(), &stats_st) == 0
@@ -46876,10 +47014,11 @@ static int gzstd_main(int argc, char ** argv)
     // dictionary with the decoded data at exit 0, and other archives may still
     // need it.  Not the --patch-from reference: `-d --patch-from=old -o old`
     // updates a file in place from its patch, which is what patches are for (the
-    // reference is fully in memory before the output replaces it).
-    if ((g_dict_compress || (g_dep_known && !g_dict_patch)) && opt.force && out_present
-        && gz_is_decode_dependency(out_lst))
-      die_usage("dictionary and output are the same file: " + opt.output);
+    // reference is fully in memory before the output replaces it).  CREATING one
+    // over its reference is refused (v0.18.20): the patch decodes only against it.
+    if ((g_dict_compress || (g_dep_known && (!g_dict_patch || opt.mode == Mode::COMPRESS)))
+        && opt.force && out_present && gz_is_decode_dependency(out_lst))
+      die_usage(g_dep_what + " and output are the same file: " + opt.output);
 
     // REFUSE TO WRITE THE OUTPUT OVER THE INPUT.  With --rm this was total data
     // loss reported as success: the temp file was renamed onto the input path,
@@ -47897,7 +48036,10 @@ static int gzstd_main(int argc, char ** argv)
           die_data("not a Zstd file (bad magic: 0x"
               + ([&]{ char h[16]; snprintf(h, sizeof(h), "%08X", m32); return std::string(h); })()
               + "): " + opt.input
-              + "\n  hint: did you mean to compress? use: gzstd " + opt.input);
+              + "\n  hint: " + [&] {
+                  const std::string f = gz_foreign_format_hint(magic, nr, false);
+                  return f.empty() ? "did you mean to compress? use: gzstd " + opt.input : f;
+                }());
         }
       }
       // Rewind so the actual decompressor sees the full stream
@@ -51295,18 +51437,17 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--format" || a.rfind("--format=", 0) == 0) {
       // Two roles share the --format= prefix.  posix/pax/gnu/oldgnu select
       // gzstd's SPARSE-file encoding (posix/pax → PAX GNU.sparse.1.0, the
-      // default; gnu/oldgnu → OLDGNU 'S'; inert without --sparse).  The zstd/gzip
-      // OUTPUT-format values are accepted for zstd-CLI compatibility and ignored
-      // (gzstd only ever emits zstd) — this must stay a warn/silent no-op, not an
-      // error, or `gzstd --format=gzip` from a ported command line breaks.
+      // default; gnu/oldgnu → OLDGNU 'S'; inert without --sparse).  zstd is a
+      // no-op.  gzip/xz/lzma/lz4 are decided after the loop, once the mode is
+      // known: refused when compressing, warned about otherwise (v0.18.20).
       std::string v;
       if (a.rfind("--format=", 0) == 0) v = a.substr(9);
       else { if (i + 1 >= argc) die_usage("missing value for --format"); v = argv[++i]; }
       if      (v == "posix" || v == "pax")    opt.tar_sparse_oldgnu = false;
       else if (v == "gnu"   || v == "oldgnu") opt.tar_sparse_oldgnu = true;
-      else if (v == "zstd") { /* already zstd — silent no-op */ }
+      else if (v == "zstd") opt.foreign_format.clear();   // already zstd; the last --format wins
       else if (v == "gzip" || v == "xz" || v == "lzma" || v == "lz4")
-        warn_ignored_zstd_opt("--format=" + v, "gzstd emits only zstd format");
+        opt.foreign_format = v;
       else die_usage("unsupported --format '" + v + "' (tar sparse: posix, pax, gnu, "
                      "oldgnu; zstd/gzip/xz/lzma/lz4 accepted for compatibility)");
     }
@@ -51609,16 +51750,25 @@ static Options parse_args(int argc, char ** argv)
     // is silent or warning acceptance for the rest.  Keep in sync with zstd
     // --help. ===
     //
-    // Silent no-ops: zstd defaults we already match, so the flag is a no-op.
+    // Compatibility switches: some remain no-ops on ordinary compression,
+    // but patch creation passes zstd's context settings through below.
     else if (a == "--asyncio" || a == "--no-asyncio") {}
     else if (a == "--check" || a == "--no-check") { opt.no_check = (a == "--no-check"); }
     else if (a == "--no-dictID") { opt.no_dict_id = true; }
-    else if (a == "--compress-literals" || a == "--no-compress-literals") {}
-    else if (a == "--row-match-finder" || a == "--no-row-match-finder") {}
+    else if (a == "--compress-literals" || a == "--no-compress-literals")
+      opt.patch_literal_mode = a == "--compress-literals" ? ZSTD_ps_enable : ZSTD_ps_disable;
+    else if (a == "--row-match-finder" || a == "--no-row-match-finder")
+      opt.patch_row_match = a == "--row-match-finder" ? ZSTD_ps_enable : ZSTD_ps_disable;
     else if (a == "--mmap-dict" || a == "--no-mmap-dict") {}
-    else if (a.rfind("--stream-size=", 0) == 0) {}
-    else if (a.rfind("--size-hint=", 0) == 0) {}
-    else if (a.rfind("--target-compressed-block-size=", 0) == 0) {}
+    else if (a.rfind("--stream-size=", 0) == 0) {
+      opt.patch_stream_size_seen = true; opt.patch_stream_size_arg = a.substr(14);
+    }
+    else if (a.rfind("--size-hint=", 0) == 0) {
+      opt.patch_src_hint_seen = true; opt.patch_src_hint_arg = a.substr(12);
+    }
+    else if (a.rfind("--target-compressed-block-size=", 0) == 0) {
+      opt.patch_target_cblock_seen = true; opt.patch_target_cblock_arg = a.substr(31);
+    }
     else if (a.rfind("--auto-threads=", 0) == 0) {}
     // Real mapping: --single-thread ≈ -T 1
     else if (a == "--single-thread") { thread_option_seen = true; opt.cpu_threads = 1; }
@@ -51874,6 +52024,20 @@ static Options parse_args(int argc, char ** argv)
   // default's 3 workers, while decompression was 7% faster at 3.
   if (!thread_option_seen && opt.mode == Mode::COMPRESS && !opt.list_mode)
     gz_apply_zstd_nbthreads(opt);
+  // --format=gzip|xz|lzma|lz4 is REFUSED when compressing (v0.18.20).  It used
+  // to warn and write zstd anyway: exit 0, and a zstd file under whatever name
+  // the caller chose, x.gz included -- the silent divergence the drop-in rules
+  // call a defect.  gzip, pigz, xz and lz4 write those formats; gzstd does not
+  // link their libraries (ROADMAP Phase 8, decided against 2026-10-19).  zstd
+  // ignores --format when decoding, so -d, -t, -l and --train only warn.
+  if (!opt.foreign_format.empty()) {
+    const std::string & ff = opt.foreign_format;
+    if (opt.mode == Mode::COMPRESS && !opt.list_mode && !opt.train)
+      die_usage("--format=" + ff + ": gzstd writes only zstd; use "
+                + (ff == "gzip" ? "gzip or pigz" : ff == "lzma" ? "xz --format=lzma" : ff)
+                + " to write " + ff);
+    warn_ignored_zstd_opt("--format=" + ff, "gzstd reads and writes only zstd");
+  }
   // --train returns before the later tar validation, so check -O here too.
   if (opt.tar_O && !(opt.tar_mode && opt.mode == Mode::DECOMPRESS && !opt.list_mode))
     die_usage("-O applies to --tar extraction (-d --tar ARCHIVE -O writes member "
@@ -52071,20 +52235,70 @@ static Options parse_args(int argc, char ** argv)
     if (opt.rsyncable && opt.mode == Mode::COMPRESS && !opt.sliding_window)
       warn_ignored_zstd_opt("--rsyncable", "gzstd's frames are cut at fixed offsets; "
                                            "it applies with --sliding-window");
-    if (opt.train_block_size)
+    if (opt.train_block_size && !(opt.mode == Mode::COMPRESS
+                                  && !opt.list_mode && !opt.patch_from.empty()))
       warn_ignored_zstd_opt("-B#", "use --chunk-size N (MiB) for frame size");
   }
 
   // -D / --patch-from: recorded by the loop, decided here where the mode is final.
   if (!opt.dict_path.empty() && !opt.patch_from.empty())
     die_usage("can't use -D and --patch-from at the same time");   // zstd refuses it too
-  if (!opt.patch_from.empty() && opt.mode == Mode::COMPRESS) {
-    // CREATING a patch is not implemented: zstd's is a long-window diff against
-    // OLD, which gzstd's independent frames do not do.  Say so and drop it --
-    // loading a reference the run will not use would only add ways to fail.
-    warn_ignored_zstd_opt("--patch-from", "creating patches is not supported; "
-                                          "only -d/-t use it");
+  // -l is dispatched before the compression mode, even if a later -z set that
+  // mode again.  Before patch creation was added, this spelling discarded the
+  // reference and listed normally; keep it from trying to load OLD for -l.
+  if (!opt.patch_from.empty() && opt.list_mode && opt.mode == Mode::COMPRESS) {
+    warn_ignored_zstd_opt("--patch-from", "-l only lists the input");
     opt.patch_from.clear();
+  }
+  if (!opt.patch_from.empty() && opt.mode == Mode::COMPRESS && !opt.list_mode) {
+    // These spellings were accepted no-ops on ordinary compression.  Validate
+    // their values only for a patch, where they now reach zstd's CCtx.
+    if (opt.patch_src_hint_seen)
+      opt.patch_src_size_hint = (int)std::min<unsigned>(INT_MAX,
+          zstd_u32_value("--size-hint", opt.patch_src_hint_arg));
+    if (opt.patch_target_cblock_seen) {
+      const unsigned value = zstd_u32_value("--target-compressed-block-size",
+                                            opt.patch_target_cblock_arg);
+      if (value > INT_MAX) die_usage("--target-compressed-block-size is too large");
+      opt.patch_target_cblock_size = (int)value;
+    }
+    if (opt.patch_stream_size_seen) {
+      // zstd uses --stream-size here even for a named NEW, when choosing the
+      // patch window and LDM threshold; the actual file size is still pledged.
+      const bool old_note = g_mem_bare_small;
+      const std::string old_spelling = g_mem_bare_spelling;
+      opt.patch_window_src_size = parse_mem_bytes("--stream-size", opt.patch_stream_size_arg);
+      g_mem_bare_small = old_note;
+      g_mem_bare_spelling = old_spelling;
+    }
+    // CREATING a patch (v0.18.20; until then warned about and dropped).  zstd's
+    // patch is ONE frame whose window reaches back into OLD, which gzstd's
+    // independent frames cannot each do; the --sliding-window path writes one
+    // frame through libzstd, so it writes the patch (see its [PATCH] block).
+    // zstd's own refusals, for its reasons: a patch is one file against one
+    // reference, and its window is sized from the file before reading it.
+    if (opt.tar_mode)
+      die_usage("can't use --patch-from with --tar (a patch is one file against one reference)");
+    if (opt.inputs.size() > 1)
+      die_usage("can't use --patch-from on multiple files");
+    if (opt.inputs.empty() || opt.inputs[0] == "-")
+      die_usage("--patch-from needs a named input file: the patch's window is sized from it "
+                "(zstd needs --stream-size for stdin, which gzstd does not take)");
+    struct stat nst {};
+    if (::stat(opt.inputs[0].c_str(), &nst) == 0) {
+      if (!S_ISREG(nst.st_mode))
+        die_usage("--patch-from needs a regular input file: " + opt.inputs[0]);
+      if ((uint64_t)nst.st_size > PATCH_REF_MAX)
+        die_usage("--patch-from: " + opt.inputs[0] + " is too large ("
+                  + std::to_string((uint64_t)nst.st_size) + " bytes; the limit is "
+                  + std::to_string(PATCH_REF_MAX) + ", as in zstd)");
+    }   // a missing input is reported by the input loop, as for any compression
+    if (opt.gpu_only || opt.hybrid || opt.gds_only || opt.direct_stage) {
+      // Refused by the -D/--patch-from rule below, with nvCOMP's reason.
+    } else {
+      opt.sliding_window = true;
+    }
+    opt.ultra = true;   // as zstd's CLI: --patch-from allows levels 20-22 without --ultra
   }
   // --long and --zstd= on COMPRESSION are CPU work, the -D rule below: nvCOMP
   // has neither long-distance matching nor zstd's parameters, and a frame from

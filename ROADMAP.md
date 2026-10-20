@@ -46,7 +46,7 @@ was true of the common path and false of roughly thirty options.
   `--train-cover/-fastcover/-legacy`, `--maxdict`, `--dictID`, `-r` and `-B#` build dictionaries
   byte-identical to `zstd --train`'s (20 of 20 option sets measured). `--no-dictID` is MAPPED
   since v0.17.71 (it leaves the ID out of frames gzstd writes); it used to be on the silent list
-  below. Still missing: CREATING patches (`--patch-from` on compress warns).
+  below. CREATING patches is real since v0.18.20 (`--patch-from` on compress, byte-identical to zstd's).
 - **Real since v0.18.8** (each was ignored, `--no-check` silently; checked against zstd 1.5.7 on
   the same input): `-r`, `--output-dir-flat`, `--output-dir-mirror`, `--exclude-compressed`,
   `--long[=N]` (both ways; a `zstd --long=28` archive could not be decoded here before), `--no-check`
@@ -59,22 +59,26 @@ was true of the common path and false of roughly thirty options.
   run). 36 command lines against zstd 1.5.7: the same files in all 36. Two differences remain, both
   deliberate: a skipped input exits 3 where zstd says 1, and when every command-line name is a link,
   gzstd still runs `--filelist`.
-- **Accepted but divergent** (each warns): `--format=gzip` emits zstd; `--rsyncable` without
+- **Refused since v0.18.20:** `--format=gzip|xz|lzma|lz4` when compressing (it emitted zstd with a
+  warning; Phase 8 decided against implementing it).
+- **Accepted but divergent** (each warns): `--rsyncable` without
   `--sliding-window` (fixed frame offsets).
-- **Accepted silently, no effect:** `--[no-]asyncio`, `--check` (the default),
-  `--[no-]compress-literals`, `--[no-]row-match-finder`, `--[no-]mmap-dict`,
-  `--stream-size=`, `--size-hint=`, `--target-compressed-block-size=`, `--auto-threads=`.
+- **Accepted silently, no effect:** `--[no-]asyncio`, `--check` (the default), `--[no-]mmap-dict`,
+  `--auto-threads=`.  Real only when CREATING a patch since v0.18.20 (zstd sets them on its patch
+  context): `--[no-]compress-literals`, `--[no-]row-match-finder`, `--stream-size=`, `--size-hint=`,
+  `--target-compressed-block-size=`, and `-B#` as the job size.  Plain `--sliding-window` could take
+  the same five context switches (it is byte-identical to zstd otherwise); not done yet.
 
 ### Ordered gap list
 
 | Gap | Size | Note |
 |---|---|---|
-| Creating patches (`--patch-from` on compress) | Medium | Decode shipped. zstd's is ONE long-window frame referencing OLD (plus long-distance matching); gzstd's independent frames would each need OLD as their prefix and a window spanning it |
+| ~~Creating patches (`--patch-from` on compress)~~ | DONE v0.18.20 | one frame through the `--sliding-window` writer with OLD as its prefix and zstd 1.5.7's window/LDM rule (`FIO_adjustParamsForPatchFromMode`): byte-identical to `zstd --patch-from` at every level measured |
 | ~~`-r` / `--output-dir-flat` / `--output-dir-mirror`~~ | DONE v0.18.8 | plus `--exclude-compressed`; the per-file loop stays fail-fast, skips are decided before it |
 | ~~`--long`, `--no-check`~~ | DONE v0.18.8 | `--no-check` leaves GPU-compressed frames' checksums (partial, documented) |
 | `--rsyncable` in frame mode | Medium | Real with `--sliding-window` since v0.18.8.  Frame mode needs CONTENT-DEFINED frame boundaries (a rolling hash in the reader), which would also keep parallel decompress and the seek table -- a feature, not a wrapper |
 | ~~Bare `-M N` = bytes~~ | DONE v0.18.8 | the owner's ruling: zstd's meaning wins; a bare value under 1 MiB prints a note for old gzstd spellings |
-| `--format=gzip\|xz\|lzma\|lz4` | High | Needs zlib/liblzma/liblz4; see Phase 8 |
+| ~~`--format=gzip\|xz\|lzma\|lz4`~~ | DECIDED AGAINST | refused when compressing since v0.18.20; a foreign input's error names its tool; see Phase 8 |
 | `-b#`/`-e#`/`-i#` benchmark mode | Medium | Overlaps `--calibrate`; decide whether to map or keep separate |
 
 **Re-measure this table before each tag** — it is the only part of the roadmap that
@@ -2431,7 +2435,23 @@ throughput (`-c >/dev/null`, best-of-5) before/after the allocator change.
 ## Phase 8: Multi-Format Codec Compatibility (zstd `--format=` parity)
 
 ### 8.1 `--format=zstd|gzip|xz|lzma|lz4` (proposed 2026-07-17)
-**Priority: Medium | Complexity: High | Status: NOT STARTED**
+**Status: DECIDED AGAINST (owner, 2026-10-19).  Not to be built.**
+
+The reasoning: writing gzip through zlib adds nothing over gzip itself, which is on every Linux box,
+and pigz already does it in parallel; xz and lz4 have their own tools.  What zstd's version mostly
+buys is one tool reading every format (`zstd -d` sniffs .gz/.xz/.lz4 when built with those
+libraries), which is convenience, not capability, and would cost three optional libraries, their
+static-link and portability burden, and a suite section per codec.  What shipped instead, v0.18.20:
+- `--format=gzip|xz|lzma|lz4` is REFUSED when compressing (exit 2, nothing written, the error names
+  gzip/pigz, xz or lz4).  It used to warn and write zstd at exit 0, even to a name like `x.gz`.
+  With -d/-t/-l it still warns and is ignored, as zstd ignores it there; `--format=zstd` later on the
+  line wins.
+- An input that is another compressor's (gzip, xz, lz4, bzip2, lzma; first four bytes) still fails as
+  not zstd (exit 4), but the error names the tool that reads it, and `tar`'s flag under `--tar`,
+  instead of "did you mean to compress?".  All five magic checks (-d/-t, -l, and --tar
+  extract/test/list).
+
+The design below is kept for the record.
 
 Implement as much as practical of zstd's multi-format support, in the same
 manner zstd does it: `--format=<codec>` selects the compression format for
