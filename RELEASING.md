@@ -132,7 +132,10 @@ unless the binary reports `[zstd <ZSTD_VERSION>, multithreaded]` and round-trips
 `--sliding-window`. Since v0.18.3 the script also refuses a binary whose library search path
 (RUNPATH/RPATH) has an empty or relative element: the loader reads an empty one as the current
 directory, and every release through v0.18.2 shipped one, because the workflow ships the build-tree
-binary and CMake's build-tree RPATH ended in it. Before a tag that changes the build, run the workflow by hand (Actions ->
+binary and CMake's build-tree RPATH ended in it. Since v0.18.22 the workflow also STARTS the binary in a `rockylinux/rockylinux:8.10` container
+(glibc 2.28, the floor the script checks statically) and round-trips a file, `-t`, `--sliding-window`,
+a pipe and `--tar` there; the Rocky 8 machine that caught the 2.29 break has moved to Rocky 9.
+Before a tag that changes the build, run the workflow by hand (Actions ->
 "Build portable release binary" -> Run workflow) and try the artifact on a real host. When
 bumping zstd in the dev environment, bump `ZSTD_VERSION` and `ZSTD_SHA256` to match.
 

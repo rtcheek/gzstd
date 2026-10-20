@@ -1,12 +1,155 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.21  
+**Covers:** v0.9.50 → v0.18.22  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.22 — pre-tag review of v0.18.10-v0.18.21: small files compress 2.4x faster, GPU `-t` takes half the time, the source builds against zstd 1.4.4 (RHEL 8) again, and `--size-hint` takes zstd's full range
+
+The release review before tagging, of all twelve versions since v0.18.9 together: Codex with GPT-6.1-Sol
+(new; 500K context) at max effort, in one session over three angles -- correctness, then performance,
+then tightness.  Every finding below was reproduced before its fix was adopted.
+
+### Correctness
+
+- **The source no longer built against RHEL 8's zstd 1.4.4** (v0.18.20 and v0.18.21).  The switches
+  that patch creation and then `--sliding-window` pass to zstd used names newer than 1.4.4: the
+  `ZSTD_ps_*` values (1.5.1) and `ZSTD_c_useRowMatchFinder` and `ZSTD_c_enableDedicatedDictSearch`.
+  Reproduced: v0.18.21 against zstd 1.4.4 (its release tarball, sha256 checked, CPU-only) stopped with
+  8 errors, although v0.18.10 had made exactly that build work.  The switch values are now gzstd's own
+  (0, 1 and 2 are the same numbers in both zstd generations), and each parameter is compiled only
+  where the linked zstd has it; asked for one it lacks, gzstd warns that it is unavailable and ignores
+  it.  One guard needed more than `#ifdef`: zstd 1.5.6 made `ZSTD_c_targetCBlockSize` a stable enum
+  member with no macro, so the reviewer's `#ifdef` was false on every current build and would have
+  dropped `--target-compressed-block-size` there; it also tests `ZSTD_VERSION_NUMBER >= 10506`.  Now
+  builds warning-free against 1.4.4 (`[zstd 1.4.4, single-threaded]`), with a round trip and
+  `--patch-from` both ways.
+- **`--sliding-window --size-hint=8192M` was refused** (v0.18.21; `--patch-from` too since v0.18.20),
+  exit 2 with "is not a number": the value went through a 32-bit parser.  zstd reads it as a size_t
+  and clamps it to INT_MAX, and v0.18.9 accepted it (it had no effect then).  `--size-hint` and
+  `--target-compressed-block-size` now use zstd's size parser (digits, then K or M, then optional i and
+  B): 8192M is accepted, and through a pipe its bytes equal zstd's; an overflowing value and `1G` are
+  still refused, as by zstd.
+
+### Tests
+
+Four cells failed a correct build under a cgroup CPU quota, which v0.18.19 made gzstd honour.
+Reproduced under a real one-CPU quota (`systemd-run --user --scope -p CPUQuota=100%`, 256 CPUs in
+the mask): the pipe-block cell's default run correctly takes the single-thread path, which has no
+block pool (now `-T2`, which also makes reuse certain); the ZSTD_NBTHREADS cell found no default
+count line (it now also reads the single-thread one: the old cell fails under the quota, the new one
+passes with and without it); the placement cell expected half a cache where the quota allows one
+(now capped by the logged quota).  And the patch cell's `-B512K` arm lacked the worker-thread gate
+v0.18.21 gave its sibling; it also gains a `--size-hint=8192M` arm.  Counts unchanged.
+
+The one-frame serial path (below) took nine cells' premise away, found by the first suite run of
+this version (CPU-only 405/8, `-e` 850/9): they compressed a fixture that now fits in one frame and
+expected the pool.  The five worker-count cells (an 8-CPU mask, --stats-json, cgroup v2 and v1
+quotas, a real CPUQuota scope), the two `--throttle-frames=0` / `--no-throttle` cells and `-M`'s
+throttle line now compress `large.bin`, two frames.  The pinned-input cell said "small inputs are
+enough -- both readers engage at any size", which stopped being true of the mmap reader; it now has
+three arms: the one-frame stdio path on 8 MiB (new: the default reader for every small file must
+read the pinned file too, and does), the mmap reader on 24 MiB, and O_DIRECT as before.
+
+### Performance
+
+The second angle asked for an operation ledger -- every syscall, copy, lock, wake-up, clock read and
+thread, counted against the input's shape -- for six concrete command lines on the 8-GPU server:
+piped compress and decompress of 32 GiB, a one-H100 decode with the content check, `--sliding-window`,
+a cold compress from NVMe, and 10,000 separate runs on 4 KiB files.  For four of them the reviewer
+found nothing worth 2% (the fences, clock reads and lock sections it counted came to 0.1-0.4% of the
+run; the documented reader designs stand).  Three changes measured, and are in; one was redirected.
+Every timing below is interleaved (ABBA) in one binary, against a debug hook that restores the old
+work.  Running a binary through `env` costs ~0.65 ms per process on its own, so in the per-process
+comparisons both arms go through it.
+
+- **An input that fits in one frame is compressed on one thread.**  A 4 KiB file started the whole
+  pool -- 96 workers plus the reader, writer and progress threads: 102 thread creations and 1,896
+  syscalls for one 4 KiB frame.  An auto-sized run (no -T, no reader flags, not --tar or --verify)
+  whose known size fits in one frame at the chunk size the serial path would use now takes that
+  path; the chunk sizing (--chunk-size, the --ultra/--long growth, the RAM cap) is one helper both
+  paths share, so the decision and the frame geometry cannot drift.  0 threads and 247 syscalls for
+  the 4 KiB run.  Output byte-identical to the pool's at 8 sizes from 1 MiB-1 to 40 MiB (both sides of
+  the 16 MiB boundary) x 7 option sets, both builds.  1,000 JSON files of 4 KiB, each run replacing
+  its output: CPU-only build 12.30-12.49 s -> 5.16-5.34 (2.4x), with -D 13.0-13.2 -> 5.4-5.6; GPU
+  build 17.2-17.4 -> 8.2-8.5 (2.1x); zstd 1.5.7 8.2.  2 MiB 18 -> 9-10 ms, 15 MiB 64-71 -> 48 ms.
+  The serial path itself had to change for this to win: it allocated and zeroed a full chunk (~32
+  MiB with its output buffer) every run, and with that the 4 KiB loop took 22.2-22.4 s, slower than
+  the pool.  Its buffers now start at the input's size, uninitialised, and grow if the file does;
+  every `-T1` run on a small file gains the same.
+- **`-t` on a GPU checks each frame in VRAM and copies nothing back.**  The decoded bytes were copied
+  to the host only for the writer to drop them; only `--gds-only -t` had skipped that.  Every GPU
+  decode path now uses the same discard: status, declared size and the content checksum (the frame's
+  own, or the seek table's) are checked on the device, and a mismatch fails exactly as before (the
+  integrity cell: a bad checksum, a wrong size, a bad table entry, and a GPU fault with CPU rescue of
+  a sound and a bad frame).  `-t --gpu-only` on 32 GiB, one H100: 8.08-8.16 s -> 3.70-4.38; default
+  hybrid `-t` 1.16 -> 0.76 s.  --tar, --verify, --keep-going and a pipe's trailing seek table still
+  copy back.  The reviewer first proposed this for any decode to `/dev/null`; not adopted: /dev/null
+  is this project's measurement sink, and it would have reported twice what any real output can get.
+  `-d -o /dev/null` still copies (7.6 s).
+- **The CPU-allowance parse skips mount rows that are not cgroups** before splitting them.  Nothing
+  here (56 rows); with a 5,000-row mountinfo (a container host; a fake root through
+  GZSTD_DEBUG_CGROUP_ROOT) 8.64-8.77 -> 5.53-5.76 s per 1,000 runs, 3.1 ms per process.
+
+### Tightness
+
+The CPU and GPU pipe readers shared their fill, recycling and accounting in two copies; now one
+`GzPipeReader` (round trips byte-exact on all three compress paths, P1 unchanged at 9.5-10.1 s).
+The read-probe verdict -- rates, the 5% margin, the hook and the line it prints -- was written out
+twice; now `read_probe_take_direct` (both producers, cold 6 GiB: same line, same pick).  The frame
+throttle's pool-drain notification had no waiter since the pools stopped waiting on it, but the
+writer still broadcast it on every frame; removed, with its CV and mutex.  Stale comments corrected,
+and the build files' glibc wording now says 2.28.  Two larger consolidations are listed for later,
+not done before a tag: the three-pass read-probe orchestration (still one copy per producer) and the
+overlapping topology readers.
+
+### No writer, so count the frames
+
+Making `-t` discard on the device removed the one thing that noticed a frame that never arrived: the
+ordered writer ("internal error: writer stuck ... frame N missing", exit 1 -- how v0.18.13's hand-back
+defect showed itself).  With no writer, a lost frame would have ended `-t` at exit 0.  The gap was
+already there for `--gds-only -t`.  Found reviewing the reviewer's change; the check is the
+reviewer's.  Each input now counts the data frames it verified -- a GPU's under the same reclaim lock
+as the delivery, so a reclaimed batch cannot count its retry too; a CPU worker's once per frame, not
+per output chunk -- and once every consumer and CPU rescue has finished, the count must equal the
+frames enqueued, or the run exits 1 naming both.  Skippable frames and the seek table are never
+enqueued.  `GZSTD_DEBUG_DROP_TEST_FRAME=N` drops one: on a 256-frame archive `-t --gpu-only` and
+hybrid `-t` exit 1, "verified 255 of 256 enqueued data frames"; a healthy multi-file `-t` exits 0.
+The integrity cell requires that exit 1, and fails on a build without the check.
+
+### The release binary is started on glibc 2.28
+
+`scripts/build-portable.sh` has refused a binary that needs a glibc symbol newer than 2.28 (RHEL/Rocky
+8's) since v0.18.10 -- a static reading of the symbol table.  What proved it at run time was a Rocky
+8.10 machine, the one that found every release through v0.18.9 stopping with "version `GLIBC_2.29'
+not found"; it now runs Rocky 9 (glibc 2.34), where those releases would start too.  The release
+workflow now starts the binary in a `rockylinux/rockylinux:8.10` container, after checking that the
+image really is glibc 2.28, and round-trips a 20 MB file, `-t`, `--sliding-window -T4`, a pipe and a
+`--tar` archive there (by checksum; the image has no cmp).  The step cannot run here (no docker on the
+build server); its script passed run directly against the release-style build, and its glibc check
+fails as it should on this host's 2.39.  Its first real run is the manual workflow run before the tag.
+
+### Review
+
+Codex, GPT-6.1-Sol at max, five turns in one session (correctness; performance; the revisions and
+tightness; the completeness gap; the final verdict at high).  Turn 1 found the four correctness
+defects above; I reproduced each before adopting it, and corrected one of its fixes (the
+targetCBlockSize guard).  Turn 2's performance proposals were measured as above; one was redirected
+(`/dev/null` to `-t`).  Turn 3 deleted two comments that carried design history (why gzstd has its
+own XXH64; why a GPU hash mismatch dies instead of retrying, the 8-device "writer stuck"); restored
+at the code they explain.  Turn 5: SAFE TO TAG ("all findings are resolved, all three builds pass,
+and the completeness regression catches the mutant; the planned suites remain the final release
+gate").  The deferred items are ROADMAP 25.
+
+Suites, on the final tree: CPU-only default 413/0 (120 skipped, the no-GPU set, as expected); `-e`
+on the GPU build with the suite choosing its own cards 858/0 of 860, 2 skipped (the trivial-park cell,
+and a tail decline the CPU finished before a GPU reached intake -- both counted as this host's), the
+count expected here, no drift note.  The first run of this version, before the nine cell fixes above,
+was CPU-only 405/8 and `-e` 850/9.
 
 ## v0.18.21 — `--sliding-window` takes zstd's compression switches and loads `-D` as zstd does
 

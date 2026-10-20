@@ -39,7 +39,9 @@ cmake --build build -j$(nproc)
 Both builds are confirmed on Rocky 8.10 with GCC 8.5: the system one reports
 `[zstd 1.4.4, single-threaded]`, this one `[zstd 1.5.7, multithreaded]`.
 
-Releases from v0.18.10 also run here as shipped, with zstd 1.5.7 multithreaded built in.
+Releases from v0.18.10 also run here as shipped, with zstd 1.5.7 multithreaded built in.  Since
+v0.18.22 the release workflow starts every release binary on Rocky Linux 8.10 (glibc 2.28) and
+round-trips a file, a pipe and a tar archive there before it is published.
 
 ## Quick Start (from scratch)
 

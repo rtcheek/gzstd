@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.21";
+static constexpr const char * GZSTD_VERSION = "0.18.22";
 //
 // Architecture overview:
 //
@@ -2653,6 +2653,17 @@ static ZDICT_fastCover_params_t zstd_default_fastcover_params()
   return p;
 }
 
+// The numeric values shared by zstd's literal mode and parameter switches.
+// Older supported headers (RHEL 8's 1.4.4) predate ZSTD_paramSwitch_e; keep
+// the CLI state independent of that type and guard each experimental parameter.
+// Most are macros (ZSTD_c_experimentalParamN), so #ifdef finds them; but zstd
+// 1.5.6 made targetCBlockSize a stable enum member with NO macro, so it needs
+// the version as well: #ifdef alone would drop it from every 1.5.6+ build.
+enum GzZstdSwitch { GZ_ZSTD_AUTO = 0, GZ_ZSTD_ENABLE = 1, GZ_ZSTD_DISABLE = 2 };
+#if defined(ZSTD_c_targetCBlockSize) || ZSTD_VERSION_NUMBER >= 10506
+#define GZ_HAVE_TARGET_CBLOCK 1
+#endif
+
 struct Options {
   Mode mode = Mode::COMPRESS;
   bool list_mode = false;    // -l/--list: list .zst frame info, or `-l --tar` archive contents
@@ -2797,8 +2808,8 @@ struct Options {
   // zstd CLI switches that set its compression context (FIO_createCResources),
   // accepted without effect until v0.18.20.  Real where gzstd writes zstd's one
   // frame: --patch-from compression (v0.18.20) and --sliding-window (v0.18.21).
-  int      zstd_literal_mode = ZSTD_ps_auto;     // --[no-]compress-literals
-  int      zstd_row_match = ZSTD_ps_auto;        // --[no-]row-match-finder
+  int      zstd_literal_mode = GZ_ZSTD_AUTO;     // --[no-]compress-literals
+  int      zstd_row_match = GZ_ZSTD_AUTO;        // --[no-]row-match-finder
   int      zstd_target_cblock_size = 0;          // --target-compressed-block-size=
   int      zstd_src_size_hint = 0;               // --size-hint=
   uint64_t patch_window_src_size = 0;      // --stream-size= overrides NEW size for zstd's patch window
@@ -4455,7 +4466,13 @@ static void print_help_long()
 "     Test mode: decompress and verify integrity but write nothing.\n"
 "     Exit code 0 on success, 4 on data error.  Defaults to 2 CUDA\n"
 "     streams per device (vs. 1 for normal decompress) because there\n"
-"     is no downstream writer to bottleneck on.\n"
+"     is no downstream writer to bottleneck on.  On eligible GPU runs\n"
+"     (v0.18.22), decoded bytes stay in VRAM: status, size and enabled\n"
+"     content checksums (frame or seek table) are checked without\n"
+"     copying plaintext back: about half the time of a GPU file decode.\n"
+"     --tar, --verify and pipes that may need a trailing seek-table hash\n"
+"     still use host delivery.  Staged readers keep their existing -t\n"
+"     behaviour.  --keep-going is ignored under -t.\n"
 "     With --tar (`-t --tar ARCHIVE`), ALSO validates the tar structure\n"
 "     inside the zstd stream — every header checksum and member size, and\n"
 "     that the archive is complete — catching a truncated or corrupt tar\n"
@@ -5537,6 +5554,10 @@ static void print_help_long()
 "     I/O threads, and it bypasses the automatic 96-worker cap.  It is not\n"
 "     literally uncapped: only --sliding-window uses every hardware thread.\n"
 "     When -T is omitted entirely, the default is all cores capped at 96.\n"
+"     In CPU frame mode, automatic threads use one thread for a nonempty\n"
+"     file whose known size fits one chunk, unless --verify, --tar or an\n"
+"     explicit reader is requested (v0.18.22).  The pool has no parallel\n"
+"     work for that frame: 2.4x faster on 4 KiB files.\n"
 "     The hardware threads are the ones THIS PROCESS MAY USE: its CPU\n"
 "     affinity (taskset, a container's or batch job's cpuset), and no more\n"
 "     than a cgroup CPU quota allows (docker --cpus, systemd CPUQuota=),\n"
@@ -6318,6 +6339,28 @@ static unsigned zstd_u32_value(const std::string & flag, const std::string & v)
     die_usage(flag + ": '" + v + "' is not a number (optional suffix K, KB, KiB, M, MB, MiB)");
   return out;
 }
+// NEXT_TSIZE in zstd's CLI has the same suffixes as NEXT_UINT32, but keeps
+// values wider than 32 bits.  In particular --size-hint is clamped to INT_MAX
+// AFTER parsing (FIO_setSrcSizeHint); e.g. 8192M is valid, even on a small input.
+static size_t zstd_size_value(const std::string & flag, const std::string & v)
+{
+  size_t digits = 0;
+  while (digits < v.size() && v[digits] >= '0' && v[digits] <= '9') ++digits;
+  if (digits == 0)
+    die_usage(flag + ": '" + v + "' is not a number (optional suffix K, KB, KiB, M, MB, MiB)");
+  const uint64_t n = parse_u64_value(flag, v.substr(0, digits));
+  const char * p = v.c_str() + digits;
+  unsigned shift = 0;
+  if (*p == 'K' || *p == 'M') {
+    shift = *p++ == 'M' ? 20 : 10;
+    if (*p == 'i') ++p;
+    if (*p == 'B') ++p;
+  }
+  if (*p != '\0')
+    die_usage(flag + ": '" + v + "' is not a number (optional suffix K, KB, KiB, M, MB, MiB)");
+  if (n > (SIZE_MAX >> shift)) die_usage("value out of range for " + flag + ": " + v);
+  return (size_t)n << shift;
+}
 // ZSTD_NBTHREADS (v0.18.12), read as zstd 1.5.7's default_nbThreads reads it
 // (programs/zstdcli.c): a number with the optional suffix above and nothing
 // after it.  Anything else is ignored with a warning using zstd's reason,
@@ -6876,7 +6919,22 @@ static double gz_cgroup_cpu_quota()
   };
   std::ifstream mi(pre + "/proc/self/mountinfo");
   std::string line;
+  const bool parse_all = std::getenv("GZSTD_DEBUG_CGROUP_PARSE_ALL") != nullptr;
   while (std::getline(mi, line)) {
+    // Only cgroup mounts can constrain the CPU allowance.  mountinfo can have
+    // thousands of other rows in a container; do not copy/tokenise every field
+    // of those rows on every process start.  The kernel spells the separator
+    // " - ".  Retain the general parser below for a differently spaced row.
+    const size_t sep = line.find(" - ");
+    if (!parse_all && sep != std::string::npos) {
+      const size_t fspos = sep + 3;
+      auto is_type = [&](const char * name, size_t n) {
+        return line.compare(fspos, n, name) == 0
+            && (fspos + n == line.size()
+                || std::isspace(static_cast<unsigned char>(line[fspos + n])));
+      };
+      if (!is_type("cgroup", 6) && !is_type("cgroup2", 7)) continue;
+    }
     // "ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS"
     std::istringstream ls(line);
     std::vector<std::string> f;
@@ -10336,6 +10394,17 @@ static void gz_wake_periodic_loops()
   g_loop_wake_cv.notify_all();
 }
 
+static bool progress_loop_needed(const Options & opt, uint64_t total_in)
+{
+#ifndef _WIN32
+  if (std::getenv("GZSTD_CALIBRATE_GPUC_FD")) return true;
+#endif
+  if (opt.no_progress || opt.verbosity < V_DEFAULT || opt.verbosity >= V_DEBUG)
+    return false;
+  return opt.verbosity != V_DEFAULT || opt.force_progress
+      || (is_stderr_tty() && !(opt.input == "-" && total_in == 0));
+}
+
 static void progress_loop(const Options & opt, const Meter * m, uint64_t total_in, std::atomic< bool > * done_flag)
 {
   // Progress bar at V_DEFAULT and V_VERBOSE only.
@@ -10364,12 +10433,7 @@ static void progress_loop(const Options & opt, const Meter * m, uint64_t total_i
     return;
   }
 #endif
-  if (opt.no_progress) return;                 // explicit suppression wins
-  if (opt.verbosity < V_DEFAULT || opt.verbosity >= V_DEBUG) return;
-  if (opt.verbosity == V_DEFAULT && !opt.force_progress) {
-    if (!is_stderr_tty()) return;
-    if (opt.input == "-" && total_in == 0) return;
-  }
+  if (!progress_loop_needed(opt, total_in)) return;
   if (::getenv("GZSTD_DEBUG_PHASE"))
     std::fprintf(stderr, "[PHASE %7.3fs] progress bar up\n", gz_since_start_s());
   g_progress_active.store(true, std::memory_order_relaxed);
@@ -12082,8 +12146,8 @@ static const ZSTD_cParameter g_zparam_ids[12] = {
 static bool g_no_check = false;
 
 
-// Returns the required windowLog for the given compression level.
-// Returns 0 if no special window is needed (level < 20 or !ultra).
+// Explicit --zstd/--long window, otherwise the ultra level's required windowLog.
+// Returns 0 when none overrides the library default.
 static int ultra_window_log(int level, bool ultra)
 {
   // --long=N names the window outright, overriding a level's (ultra or not), as
@@ -12095,7 +12159,7 @@ static int ultra_window_log(int level, bool ultra)
   return level + 5;
 }
 
-// Returns the minimum chunk size (in MiB) needed for ultra levels.
+// Returns the minimum chunk size (in MiB) for the resolved window.
 // The chunk must be >= window size for the compressor to use the full window.
 // Returns 0 if no minimum is needed.
 static size_t ultra_min_chunk_mib(int level, bool ultra)
@@ -14314,6 +14378,18 @@ static std::unique_ptr<VerifyPool> build_pass_verify_pool(PassOpt pass)
 // in-order drain taps each finished frame into it.  null = verification off.
 static VerifyPool * g_verify_pool = nullptr;
 
+// Drop one enqueued DATA frame per input before verification.  The sink must be
+// discard-only; the regression test then proves its completeness check detects
+// missing work, independently of the ordered writer's missing-frame watchdog.
+static bool gz_debug_drop_test_frame(size_t seq)
+{
+  static const uint64_t target = [] {
+    const char * e = std::getenv("GZSTD_DEBUG_DROP_TEST_FRAME");
+    return e ? parse_u64_value("GZSTD_DEBUG_DROP_TEST_FRAME", e) : UINT64_MAX;
+  }();
+  return (uint64_t)seq == target;
+}
+
 struct ResultStore {
   std::mutex                                     m;
   std::condition_variable                        cv;
@@ -14328,6 +14404,33 @@ struct ResultStore {
   size_t                                         total_tasks   = 0;
   bool                                           producer_done = false;
   bool                                           workers_done  = false;
+
+  // Per input, independent of Meter's output-chunk counts.  A CPU streaming
+  // decode can deliver several chunks for one DATA frame; only completion of
+  // that entire task earns a credit.  GPU credits are committed under the same
+  // reclaim lock as delivery, so a reclaimed batch cannot count its retry too.
+  std::atomic<size_t>                            discard_verified_frames{0};
+  std::atomic<bool>                              discard_test_dropped{false};
+
+  bool drop_discard_frame_for_test(size_t seq, const Options & opt) {
+    if (!gz_debug_drop_test_frame(seq)
+        || discard_test_dropped.exchange(true, std::memory_order_relaxed)) return false;
+    vlog(V_VERBOSE, opt, "[TEST] dropping enqueued DATA frame " + std::to_string(seq)
+         + " before verification (GZSTD_DEBUG_DROP_TEST_FRAME)\n");
+    return true;
+  }
+
+  // Called only after all consumers have finished, including CPU rescues.
+  // queue.total_tasks() counts original DATA tasks, unlike total_tasks here,
+  // which CPU streaming may expand into writer chunks.  Requeues add no tasks;
+  // skippable frames and seek tables are never enqueued in the first place.
+  void check_discard_complete(size_t enqueued, const std::string & input) const {
+    const size_t verified = discard_verified_frames.load(std::memory_order_relaxed);
+    if (verified != enqueued)
+      die("internal error: discard verification incomplete for " + input
+          + ": verified " + std::to_string(verified) + " of "
+          + std::to_string(enqueued) + " enqueued data frames", EXIT_ERROR);
+  }
 
   // --- Per-producer result slots (reduces mutex contention) ---
   // Each GPU worker and CPU worker group gets its own slot.
@@ -14740,38 +14843,7 @@ public:
     };
   }
 
-  // -- Pool-drain notification (v0.13.10+) --
-  // The writer calls notify_drain() after each buf.reset() (i.e. after
-  // dropping a per-frame shared_ptr ref).  Per-worker bounded buffer
-  // pools (cpu_worker, cpu_decomp_worker) wait on this CV when their
-  // pool is full instead of yield-spinning, eliminating the sched_yield
-  // syscall storm seen in v0.13.9 at high thread counts.
-  //
-  // Why a separate CV from permit-acquire (cv_):
-  //   - permit-acquire is contended on m_; sharing the CV would force
-  //     pool-waiters and permit-waiters to serialize on the same mutex.
-  //   - notify_all on every shared_ptr drop on m_ would block release()
-  //     for the duration of broadcasting.
-  // drain_cv_ + drain_m_ are dedicated, so permit-acquire is unaffected.
-  void notify_drain() {
-    // notify_all because the writer doesn't know which worker's pool
-    // slot just freed.  Wakes more than necessary but workers re-check
-    // predicate via atomic shared_ptr use_count() — cheap.
-    drain_cv_.notify_all();
-  }
-
-  template<class Predicate>
-  void wait_for_drain(Predicate pred) {
-    std::unique_lock<std::mutex> lk(drain_m_);
-    // 10ms timeout is a safety net for any missed notify; in normal
-    // operation the writer notifies on every frame drop so workers
-    // wake promptly.
-    drain_cv_.wait_for(lk, std::chrono::milliseconds(10), pred);
-  }
-
 private:
-  std::mutex              drain_m_;
-  std::condition_variable drain_cv_;
   int permits_;
   int max_;
   int grow_ceiling_ = 0;                 // 0 = growth not armed
@@ -15244,11 +15316,7 @@ private:
         if (bp_) bp_->release(1);
         // Drop our shared_ptr ref now (not at end of loop) so the worker pool
         // can recycle the buffer for its next frame as soon as we're done.
-        // After the drop, notify pool-waiters: this is the moment use_count
-        // transitions from 2 to 1 (worker becomes the sole owner), so the
-        // worker's pool acquire predicate will now succeed.
         buf.reset();
-        if (bp_) bp_->notify_drain();
       }
 
       // Batch fully written (handed to the OS): clear writing_ and wake any
@@ -15660,14 +15728,9 @@ static inline size_t compress_one_cpu_frame(const void * src, size_t src_size, i
   apply_compress_dict(tl_cctx, level);   // -D; no-op without one
 
   size_t bound = ZSTD_compressBound(src_size);
-  // Grow-only: ZSTD writes [0,csz) and never reads the dst buffer, so the tail
-  // [csz,bound) needs no initialization.  resize() value-initializes (zeroes)
-  // the grown region — up to ~16 MiB per frame, which the profile pins as the
-  // single largest gzstd-attributable CPU-compress cost (callgrind:
-  // _M_default_append -> memset, ~7% of total, worst on compressible data).
-  // Keeping the buffer at bound across frames makes resize() zero once on the
-  // first frame, then no-op.  We return csz instead of shrinking `out` so the
-  // buffer never re-grows (and re-zeroes) on the next call.
+  // Grow-only: ZSTD writes [0,csz) and never reads the destination.  FrameVec's
+  // default_init_allocator leaves new storage uninitialised.  Return csz without
+  // shrinking `out`, so a reused buffer needs no resize on the next frame.
   if (out.size() < bound) out.resize(bound);
   size_t csz = ZSTD_compress2(tl_cctx, out.data(), out.size(), src, src_size);
   if (ZSTD_isError(csz)) die_data(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
@@ -16380,8 +16443,18 @@ static void apply_decode_options(ZSTD_DCtx * dctx, const Options & opt)
   }
 }
 
-// Streaming decompress from an in-memory buffer (used when stream_frames_to_queue
-// already consumed stdin but couldn't parse frame boundaries).
+// XXH64, implemented here rather than called out to libzstd.
+//
+// gzstd needs to COMPUTE content checksums for the GPU frame footer (nvCOMP
+// emits compressed bytes but not zstd's checksum) and the
+// sliding-window stream verifier.  It used `extern "C" ZSTD_XXH64`, which
+// libzstd compiles in but does not always EXPORT: Ubuntu's libzstd 1.5.5
+// exports no XXH symbols, so a dynamically linked GPU build failed at LOAD
+// with `undefined symbol: ZSTD_XXH64`, before any GPU code ran.  (Release
+// builds are static, which is why it never bit in the field.)  Checking a frame's
+// own trailer never needed that exported symbol: libzstd validates it internally.
+// Verified byte for byte against ZSTD_XXH64 over sizes 0..8 KiB and random
+// seeds before the dependency was removed.
 namespace xxh {
   static constexpr uint64_t P1 = 11400714785074694791ULL;
   static constexpr uint64_t P2 = 14029467366897019727ULL;
@@ -19048,9 +19121,9 @@ static void cpu_decomp_worker(
   // ONE PLACE THAT DECIDES PUSH-OR-DISCARD, so the three delivery sites below
   // cannot drift apart on permit accounting.
   //
-  // `--gds-only -t` runs with NO WRITER THREAD: the GPU verifies each frame on
-  // the device and drops it, so there is nothing to order and nothing draining
-  // the ResultStore.  If a GPU fault sends the remaining work to this CPU pool,
+  // Eligible GPU `-t` runs have NO WRITER THREAD: the GPU
+  // checks each frame on the device and drops it, so nothing drains the
+  // ResultStore.  If a GPU fault sends the remaining work to this CPU pool,
   // every frame it pushes is retained forever -- on a 130 GiB archive that is
   // the entire decompressed output held in RAM.  ZSTD_decompress has already
   // validated the frame by then (that IS the verification this run exists to
@@ -19058,9 +19131,8 @@ static void cpu_decomp_worker(
   //
   // The permit still has to come back: normally the writer frees it as it
   // writes, and with no writer this is the only place that can.
-  const bool verify_discard = discard_results;
   auto deliver = [&](size_t seq, FrameBuf buf) {
-    if (verify_discard) {
+    if (discard_results) {
       // CREDIT WHAT THE WRITER WOULD HAVE.  In TEST mode writer_thread counts
       // both tasks_done and wrote_bytes for every frame it retires; on this path
       // there is no writer, so dropping the frame silently also dropped its
@@ -19185,9 +19257,8 @@ static void cpu_decomp_worker(
         int rc = tq->try_pop_one_cpu(t, may_take);
         if (rc == 1) { got_task = true; break; }
         if (bp) bp->release(1);
-        // Drained between the wait and the pop: let the wait decide again, since a
-        // GPU may still hand frames back.  (Leaving here was the same hole.)
-        if (rc == -1) continue;
+        // Any unsuccessful pop, including a drain between wait and pop, goes
+        // back through the wait: a GPU may still hand frames back.
       }
       if (drained) break;
       if (got_task) {
@@ -19226,6 +19297,11 @@ static void cpu_decomp_worker(
     if (!got_task) break;
 
     // Permit already acquired above (before pop).
+    if (discard_results && results->drop_discard_frame_for_test(t.seq, *opt)) {
+      t.release_input();
+      if (bp) bp->release(1);
+      continue;
+    }
 
 #ifdef HAVE_NVCOMP
     // A staged decompress Task names a REGION OF THE ARCHIVE and carries no
@@ -19472,6 +19548,12 @@ static void cpu_decomp_worker(
       if (m) m->read_bytes.fetch_add(comp_size, std::memory_order_relaxed);
       deliver(t.seq, std::move(out_buf));
     }
+
+    // Count INPUT frames only after all of their chunks and integrity checks
+    // completed.  deliver() also handles partial streaming chunks, so crediting
+    // there would turn one verified frame into several completeness credits.
+    if (discard_results)
+      results->discard_verified_frames.fetch_add(1, std::memory_order_relaxed);
 
     const auto t1_w = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration_cast<
@@ -21327,7 +21409,55 @@ static void decompress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter 
 /*======================================================================
  MT CPU-only compression
 ======================================================================*/
-static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Meter * m)
+static std::atomic<int> g_cpu_pass_threads{0};   // actual final CPU pass, including the small-input path
+
+// Both compression producers use the same recycled pipe blocks, bounce copy and
+// read accounting.  Their callers retain the different frame splitting/ownership
+// rules: the CPU moves the block into one Task; the GPU shares it across Tasks.
+class GzPipeReader {
+  FILE * in_;
+  const Options & opt_;
+  Meter * meter_;
+  size_t chunk_;
+  GzPipeBlocks blocks_;
+  std::unique_ptr<char[]> bounce_{new char[GZ_PIPE_BOUNCE]};
+public:
+  GzPipeReader(FILE * in, const Options & opt, Meter * m, size_t chunk)
+    : in_(in), opt_(opt), meter_(m), chunk_(chunk), blocks_(chunk) {}
+
+  std::shared_ptr<char> next(size_t & n) {
+    std::shared_ptr<char> blk = blocks_.get();
+    const uint64_t t0 = (g_perf || meter_) ? now_ns() : 0;
+    uint64_t cp_ns = 0;
+    n = gz_pipe_fill(in_, blk.get(), chunk_, bounce_.get(),
+                     (g_perf || meter_) ? &cp_ns : nullptr);
+    if ((g_perf || meter_) && n > 0) {
+      const uint64_t r_dt = now_ns() - t0 - cp_ns;
+      if (meter_) {
+        meter_->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
+        meter_->reader_copy_ns.fetch_add(cp_ns, std::memory_order_relaxed);
+      }
+      if (g_perf) {
+        g_perf->read_ns.fetch_add(r_dt);
+        g_perf->read_bytes_total.fetch_add(n);
+      }
+    }
+    if (n == 0) { check_read_error(in_, opt_.input); return {}; }
+    if (meter_) meter_->read_bytes.fetch_add(n);
+    return blk;
+  }
+};
+
+struct CpuCompressChunk {
+  size_t bytes;
+  bool serial;
+};
+
+// Resolve the geometry once, before choosing a serial stream or a worker pool.
+// A possible one-frame input gets the serial RAM budget.  If that budget makes
+// the frame too small, fall back to the pool and apply its larger worker budget.
+static CpuCompressChunk cpu_compress_chunk(const Options & opt, int threads,
+                                           uint64_t single_frame_size)
 {
   // Chunk size: 16 MiB default, or user-specified via --chunk-size
   size_t chosen_mib = opt.chunk_user_set ? opt.chunk_mib : 16;
@@ -21350,13 +21480,20 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
     }
   }
 
-  // Bound the chunk by available RAM, exactly as the MT path does (the -T1
-  // early-return in compress_cpu_mt skips its own check_ram_budget call).  A
-  // no-op for normal chunk sizes; for an absurd --chunk-size it reduces the
-  // chunk to fit instead of throwing an uncaught bad_alloc on the inbuf/outbuf
-  // allocation below.
-  chosen_mib = check_ram_budget(1, chosen_mib, opt);
-  const size_t chunk_bytes = std::max<size_t>(1, chosen_mib) * ONE_MIB;
+  bool serial = !opt.tar_mode && (threads == 1
+      || (single_frame_size > 0 && single_frame_size <= chosen_mib * ONE_MIB));
+  chosen_mib = check_ram_budget(serial ? 1 : threads, chosen_mib, opt);
+  if (serial && threads > 1 && single_frame_size > chosen_mib * ONE_MIB) {
+    serial = false;
+    chosen_mib = check_ram_budget(threads, chosen_mib, opt);
+  }
+  return {std::max<size_t>(1, chosen_mib) * ONE_MIB, serial};
+}
+
+static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Meter * m,
+                                size_t chunk_bytes)
+{
+  g_cpu_pass_threads.store(1, std::memory_order_relaxed);
 
   // Plain-compress seek table (v0.14.92): pin the fixed-chunk geometry that
   // the per-frame csize recording pairs with; append_tar_index derives and
@@ -21383,7 +21520,9 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
 #endif
 
   std::atomic<bool> progress_done{false};
-  std::thread progress_thr(progress_loop, std::cref(opt), m, total_in, &progress_done);
+  std::thread progress_thr;
+  if (progress_loop_needed(opt, total_in))
+    progress_thr = std::thread(progress_loop, std::cref(opt), m, total_in, &progress_done);
 
   ZSTD_CCtx * cctx = ZSTD_createCCtx();
   if (!cctx) die("failed to create ZSTD_CCtx");
@@ -21400,11 +21539,28 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   }
   apply_compress_dict(cctx, opt.level);   // -D; no-op without one
 
-  std::vector< char > inbuf(chunk_bytes);
-  std::vector< char > outbuf(ZSTD_compressBound(chunk_bytes));
+  // fread/zstd initialise only their returned prefixes.  A small known file
+  // needs neither full-chunk storage nor a full-chunk memset.  Read one byte
+  // past its known size to establish EOF; if it grew, finish the SAME chunk
+  // before compressing, preserving the frame geometry of the ordinary path.
+  // The hook restores the old full-size, value-initialised buffers for A/B.
+  const bool zero_stream = std::getenv("GZSTD_DEBUG_STREAM_ZERO") != nullptr;
+  const size_t first_read = !zero_stream && total_in > 0 && total_in < chunk_bytes
+                          ? (size_t)total_in + 1 : chunk_bytes;
+  FrameVec inbuf(first_read);
+  FrameVec outbuf;
+  if (zero_stream) {
+    outbuf.resize(ZSTD_compressBound(chunk_bytes));
+    std::memset(inbuf.data(), 0, inbuf.size());
+    std::memset(outbuf.data(), 0, outbuf.size());
+  }
   while (true) {
     uint64_t rd_t0 = g_perf ? now_ns() : 0;
-    size_t n = std::fread(inbuf.data(), 1, chunk_bytes, in);
+    size_t n = std::fread(inbuf.data(), 1, inbuf.size(), in);
+    if (n == inbuf.size() && inbuf.size() < chunk_bytes) {
+      inbuf.resize(chunk_bytes);
+      n += std::fread(inbuf.data() + n, 1, chunk_bytes - n, in);
+    }
     if (g_perf && n > 0) {
       g_perf->read_ns.fetch_add(now_ns() - rd_t0);
       g_perf->read_bytes_total.fetch_add(n);
@@ -21414,6 +21570,8 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
       break;
     }
     if (m) m->read_bytes.fetch_add(n);
+    const size_t bound = ZSTD_compressBound(n);
+    if (outbuf.size() < bound) outbuf.resize(bound);
     uint64_t comp_t0 = g_perf ? now_ns() : 0;
     size_t csz = ZSTD_compress2(cctx, outbuf.data(), outbuf.size(), inbuf.data(), n);
     if (ZSTD_isError(csz)) die_data(std::string("ZSTD error: ") + ZSTD_getErrorName(csz));
@@ -21454,28 +21612,10 @@ static void compress_cpu_stream(FILE * in, FILE * out, const Options & opt, Mete
   }
 
   ZSTD_freeCCtx(cctx);
-  progress_done = true; gz_wake_periodic_loops(); progress_thr.join();
+  if (progress_thr.joinable()) {
+    progress_done = true; gz_wake_periodic_loops(); progress_thr.join();
+  }
 }
-
-// Single-frame compression using zstd's sliding window (built-in MT when available).
-// Produces one frame (like `zstd`) for maximum ratio on repetitive data.
-// Decompression will be single-threaded (one frame = one unit of work).
-// XXH64, implemented here rather than called out to libzstd.
-//
-// gzstd needs to COMPUTE a content checksum in two places — the GPU frame footer
-// (nvCOMP emits compressed bytes but not zstd's checksum) and the sliding-window
-// stream verifier — and it had only the plumbing to ATTACH one.  The computation
-// came from `extern "C" ZSTD_XXH64`, which libzstd compiles in but does not always
-// EXPORT: Ubuntu's libzstd 1.5.5 exports zero XXH symbols, so a dynamically linked
-// GPU build fails at LOAD with `undefined symbol: ZSTD_XXH64` — before any GPU code
-// runs.  (Release builds are static, which is why this never bit in the field.)
-//
-// Note this was never needed for checking: libzstd validates the frame checksum
-// INTERNALLY on every decompress, which requires no exported symbol.  Only our own
-// producer-side computation did.
-//
-// Verified byte-for-byte against ZSTD_XXH64 across sizes 0..8 KiB and random seeds
-// before the dependency was removed.
 
 // Streaming round-trip verifier for the single-frame paths.
 //
@@ -22345,6 +22485,8 @@ static bool device_is_rotational(const std::string & path);     // defined below
 // zstd workers the last --sliding-window pass ran, for --stats-json (v0.18.19:
 // it reported the machine's hardware threads less one, whatever ran).
 static std::atomic<int> g_sw_pass_threads{0};
+// One zstd frame with a sliding window, using libzstd's worker pool when present.
+// The resulting frame is one unit of work for decompression.
 static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & opt, Meter * m)
 {
   // v0.18.18: GzSwPlacement (above) usually replaces this count with fewer
@@ -22462,11 +22604,25 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
       if (ZSTD_isError(r))
         die(std::string("the linked zstd refused ") + name + " (" + ZSTD_getErrorName(r) + ")");
     };
+    // Experimental parameter names are macros; targetCBlockSize also has a
+    // stable enum spelling in 1.5.6+ (GZ_HAVE_TARGET_CBLOCK covers both).
+    // An older library keeps its defaults; explicit unsupported switches get
+    // the compatibility warning in parse_args, before output.
+#ifdef ZSTD_c_literalCompressionMode
     cctx_param(ZSTD_c_literalCompressionMode, opt.zstd_literal_mode, "--[no-]compress-literals");
+#endif
+#ifdef ZSTD_c_useRowMatchFinder
     cctx_param(ZSTD_c_useRowMatchFinder, opt.zstd_row_match, "--[no-]row-match-finder");
+#endif
+#ifdef GZ_HAVE_TARGET_CBLOCK
     cctx_param(ZSTD_c_targetCBlockSize, opt.zstd_target_cblock_size, "--target-compressed-block-size");
+#endif
+#ifdef ZSTD_c_srcSizeHint
     cctx_param(ZSTD_c_srcSizeHint, opt.zstd_src_size_hint, "--size-hint");
+#endif
+#ifdef ZSTD_c_enableDedicatedDictSearch
     cctx_param(ZSTD_c_enableDedicatedDictSearch, 1, "enableDedicatedDictSearch");
+#endif
     if (sw_mt) cctx_param(ZSTD_c_jobSize, (int)opt.train_block_size, "-B# (jobSize)");
   }
   if (g_dict_patch) {
@@ -22843,16 +22999,16 @@ static bool mmap_ok_for_input(const Options & opt, const std::string & path)
 // mistake here.  A single dd stream already saturates the drive (4.5 GB/s), so the
 // only job left is to not stall that stream — hence zero-copy:
 //
-//   • pool != nullptr (CPU path): pread straight into a pooled aligned buffer and
+//   • pool != nullptr (CPU and GPU/hybrid paths): pread into a pooled aligned buffer and
 //     hand it to emit(buf, n, idx, slot); the Task aliases it as a view and the
 //     worker recycles the slot on release_input().  No per-chunk 16 MiB memcpy —
 //     that copy, contending for memory bandwidth with the compressors, was what
 //     held the stream to ~1/3 of the drive (1.5 vs 4.5 GB/s).  pool->acquire()
 //     blocks when all buffers are in flight, so it is also the producer
 //     backpressure (the queue byte-cap is a no-op for zero-byte view tasks).
-//   • pool == nullptr (GPU path): reuse one scratch buffer; emit copies (it splits
-//     the host chunk into gpu subchunks anyway, so a single owning buffer per chunk
-//     doesn't fit — keep the copy there, where PCIe dominates regardless).
+//   • pool == nullptr (allocation fallback): reuse a scratch buffer; emit copies
+//     each chunk into an owning Task.  The GPU/hybrid producer uses its pool
+//     when available and otherwise falls through to its fread reader.
 //
 // O_DIRECT transfers straight disk→buffer, bypassing the page cache (no populate,
 // no eviction) — honest-cold, no kcompactd, no warm-cache skew.  It can't go
@@ -22963,6 +23119,29 @@ struct ReadWindow {
   // stores the same value.
   std::atomic<bool>     eof{false};  //          the FILE ended inside this pass
 };
+
+// Both producers grade the same two timed passes.  Leave first touch out of
+// each rate and require a 5% gain over buffered input; the test hook and the
+// diagnostic must describe that same decision on CPU and GPU/hybrid paths.
+static bool read_probe_take_direct(const ReadWindow & a, const ReadWindow & b,
+                                    const Options & opt)
+{
+  const double ra = a.read_secs() > 0 ? (double)a.bytes.load() / a.read_secs() : 0.0;
+  const double rb = b.read_secs() > 0 ? (double)b.bytes.load() / b.read_secs() : 0.0;
+  const int forced = read_probe_forced_pick();
+  const bool take_direct = forced ? forced == 1 : ra > rb * 1.05;
+  if (opt.verbosity >= V_VERBOSE) {
+    char pb[288];
+    std::snprintf(pb, sizeof pb,
+      "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over %.0f/%.0f ms "
+      "(first touch %.0f/%.0f ms left out) -> %s for the remainder%s\n",
+      ra / 1073741824.0, rb / 1073741824.0, a.secs * 1000.0, b.secs * 1000.0,
+      a.secs_touch * 1000.0, b.secs_touch * 1000.0,
+      take_direct ? "O_DIRECT" : "buffered", forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)" : "");
+    vlog(V_VERBOSE, opt, pb);
+  }
+  return take_direct;
+}
 
 template <typename Emit>   // template so the lambda inlines (and -Wnonnull sees the
                            // pooled/aligned buffer as non-null)
@@ -31692,10 +31871,27 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   // Option A: if single-threaded, use simple streaming helper.  --tar has no
   // single FILE* to stream; it always uses the chunked queue path below (a
   // 1-worker pool still works), so the tar producer can feed it.
-  if (threads == 1 && !opt.tar_mode) {
+  // An auto-sized pool has no parallel work for an input that fits in one
+  // frame at the serial path's resolved chunk size.  Keep explicit -T/environment
+  // counts, verification/reader hooks, explicit readers, streams and --tar on their paths.
+  // Use the held fd, never a fresh lookup of the input name.  The helper keeps the
+  // same frame geometry and reads to EOF even if the file grows after sizing.
+  uint64_t single_frame_size = 0;
+  if (threads > 1 && opt.cpu_threads == 0 && !opt.tar_mode && !opt.verify
+      && !opt.direct_read_user_set && !opt.mmap_user_set && opt.read_threads == 0
+      && !g_debug_throw_reader && !std::getenv("GZSTD_DEBUG_MMAP_GATE")
+      && !std::getenv("GZSTD_DEBUG_NO_SMALL_SERIAL")) {
+    single_frame_size = known_input_size(opt, in);
+  }
+  const CpuCompressChunk chunk = cpu_compress_chunk(opt, threads, single_frame_size);
+  const bool small_serial = chunk.serial && threads > 1;
+  g_cpu_pass_threads.store(threads, std::memory_order_relaxed);
+  if (chunk.serial) {
     if (opt.verbosity >= V_VERBOSE)
-      vlog(V_VERBOSE, opt, "[CPU] single-thread streaming path (-T 1)\n");
-    compress_cpu_stream(in, out, opt, m);
+      vlog(V_VERBOSE, opt, small_serial
+          ? "[CPU] single-thread streaming path (input fits in one frame)\n"
+          : "[CPU] single-thread streaming path (-T 1)\n");
+    compress_cpu_stream(in, out, opt, m, chunk.bytes);
     if (g_perf) {
       g_perf->print_summary("CPU-ONLY COMPRESS (single-thread)");
       g_perf = nullptr;
@@ -31707,30 +31903,8 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
   cpuagg.threads = threads;
   cpuagg.per_thread.resize((size_t)threads);
 
-  // Determine chunk size (auto or user-specified)
-  // Chunk size: 16 MiB default, or user-specified via --chunk-size
-  size_t chosen_mib = opt.chunk_user_set ? opt.chunk_mib : 16;
-
-  // Ultra levels need chunk >= window size to be effective.
-  {
-    size_t ultra_min = ultra_min_chunk_mib(opt.level, opt.ultra);
-    if (ultra_min > 0 && chosen_mib < ultra_min) {
-      if (!opt.chunk_user_set) {
-        vlog(V_VERBOSE, opt, "[ULTRA] auto-increasing chunk size from "
-             + std::to_string(chosen_mib) + " to " + std::to_string(ultra_min)
-             + " MiB (must be >= window size)\n");
-        chosen_mib = ultra_min;
-      } else {
-        vlog(V_ERROR, opt, "warning: --chunk-size=" + std::to_string(chosen_mib)
-             + " MiB is smaller than the ultra window ("
-             + std::to_string(ultra_min) + " MiB). Compression ratio will suffer.\n");
-      }
-    }
-  }
-
-  // Pre-flight: check we won't OOM  may reduce chunk size
-  chosen_mib = check_ram_budget(threads, chosen_mib, opt);
-  const size_t host_chunk = std::max<size_t>(1, chosen_mib) * ONE_MIB;
+  const size_t chosen_mib = chunk.bytes / ONE_MIB;
+  const size_t host_chunk = chunk.bytes;
 
   // Plain-compress seek table (v0.14.92): pin the chunk geometry for the
   // writer thread's csize recording; see compress_cpu_stream for the story.
@@ -32055,25 +32229,7 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     if (!run_pooled_reader(false, fds.b, fsz_known, &b)) return false;
     if (b.eof.load() || b.chunks.load() == 0) return true;
 
-    // Rates over READING time: each pass's first touch of fresh pool buffers is
-    // left out (ReadWindow::touch_ns), so neither arm is charged for faults the
-    // other happened not to take.
-    const double ra = a.read_secs() > 0 ? (double)a.bytes.load() / a.read_secs() : 0.0;
-    const double rb = b.read_secs() > 0 ? (double)b.bytes.load() / b.read_secs() : 0.0;
-    // 5% margin, matching the backend prior: a tie keeps the buffered path,
-    // which is what a run without this probe would have used.
-    const int  forced = read_probe_forced_pick();
-    const bool take_direct = forced ? forced == 1 : ra > rb * 1.05;
-    if (opt.verbosity >= V_VERBOSE) {
-      char pb[288];
-      std::snprintf(pb, sizeof pb,
-        "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over %.0f/%.0f ms "
-        "(first touch %.0f/%.0f ms left out) -> %s for the remainder%s\n",
-        ra / 1073741824.0, rb / 1073741824.0, a.secs * 1000.0, b.secs * 1000.0,
-        a.secs_touch * 1000.0, b.secs_touch * 1000.0,
-        take_direct ? "O_DIRECT" : "buffered", forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)" : "");
-      vlog(V_VERBOSE, opt, pb);
-    }
+    const bool take_direct = read_probe_take_direct(a, b, opt);
     // Pass 3: the rest, unbounded.  Its window carries only the start offset, so
     // a buffered remainder sizes itself under --adapt (see rd_adaptive).
     ReadWindow c;
@@ -32182,28 +32338,9 @@ static void compress_cpu_mt(FILE * in, FILE * out, const Options & opt, Meter * 
     // drops it.  queued_host_bytes() counts the view, so backpressure is unchanged.
     // Since v0.18.12 the blocks are recycled and filled through a bounce buffer:
     // see GzPipeBlocks.
-    GzPipeBlocks blocks(host_chunk);
-    std::unique_ptr<char[]> bounce(new char[GZ_PIPE_BOUNCE]);
-    while (true) {
-      std::shared_ptr<char> blk = blocks.get();
-      uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
-      uint64_t cp_ns = 0;
-      size_t n = gz_pipe_fill(in, blk.get(), host_chunk, bounce.get(),
-                              (g_perf || m) ? &cp_ns : nullptr);
-      if ((g_perf || m) && n > 0) {
-        const uint64_t r_dt = now_ns() - rd_t0 - cp_ns;
-        if (m) {
-          m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
-          m->reader_copy_ns.fetch_add(cp_ns, std::memory_order_relaxed);
-        }
-        if (g_perf) {
-          g_perf->read_ns.fetch_add(r_dt);
-          g_perf->read_bytes_total.fetch_add(n);
-        }
-      }
-      if (n == 0) { check_read_error(in, opt.input); break; }
-      if (m) m->read_bytes.fetch_add(n);
-
+    GzPipeReader reader(in, opt, m, host_chunk);
+    size_t n = 0;
+    while (auto blk = reader.next(n)) {
       Task t;
       t.seq = seq.fetch_add(1, std::memory_order_relaxed);
       t.view_ptr = blk.get();
@@ -34127,9 +34264,7 @@ static bool gz_retake_vram_reserve(void ** reserve, size_t * reserve_bytes,
 // nvCOMP's batched zstd compressor does NOT add the per-frame content checksum
 // that the CPU path emits (ZSTD_c_checksumFlag), so GPU/hybrid archives were not
 // self-verifying.  We add it ourselves: zstd's content checksum is the low 32
-
-// bits of XXH64(uncompressed_frame, 0), computed by our own xxh:: above so the
-// binary carries no undefined ZSTD_XXH64 reference (see that note).
+// bits of XXH64(uncompressed_frame, 0), computed by the local xxh:: implementation.
 // Stamp the zstd content-checksum trailer into a frame that ALREADY HAS ROOM for
 // it: the caller sizes the buffer to csz+4 and copies csz bytes of frame into it,
 // leaving [csz, csz+4) as the checksum slot.
@@ -38234,22 +38369,7 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
               ok = pooled_read_chunks(gpu_chunk, m, &nv_pool,
                                       false, n_readers, dr_fd, nv_emit, &b, &opt);
               if (ok && !b.eof.load() && b.chunks.load() > 0 && !aborted()) {
-                // Over reading time, first touch left out (as compress_cpu_mt).
-                const double ra = a.read_secs() > 0 ? (double)a.bytes.load() / a.read_secs() : 0.0;
-                const double rb = b.read_secs() > 0 ? (double)b.bytes.load() / b.read_secs() : 0.0;
-                const int  forced = read_probe_forced_pick();
-                const bool td = forced ? forced == 1 : ra > rb * 1.05;
-                if (opt.verbosity >= V_VERBOSE) {
-                  char pb[288];
-                  std::snprintf(pb, sizeof pb,
-                    "[READ-PROBE] O_DIRECT %.2f GiB/s vs buffered %.2f GiB/s over "
-                    "%.0f/%.0f ms (first touch %.0f/%.0f ms left out) -> %s for the remainder%s\n",
-                    ra / 1073741824.0, rb / 1073741824.0,
-                    a.secs * 1000.0, b.secs * 1000.0,
-                    a.secs_touch * 1000.0, b.secs_touch * 1000.0, td ? "O_DIRECT" : "buffered",
-                    forced ? " (GZSTD_DEBUG_READ_PROBE_PICK)" : "");
-                  vlog(V_VERBOSE, opt, pb);
-                }
+                const bool td = read_probe_take_direct(a, b, opt);
                 // The rest of the run: Options so a buffered remainder sizes
                 // itself under --adapt (the two timed passes above stay fixed;
                 // see rd_adaptive in pooled_read_chunks).
@@ -38287,27 +38407,9 @@ static void compress_nvcomp(FILE * in, FILE * out, const Options & opt, Meter * 
     // the block with shared ownership, so the block is freed when the last of its
     // frames releases its input.  Recycled blocks through a bounce buffer since
     // v0.18.12 (GzPipeBlocks).
-    GzPipeBlocks blocks(host_chunk);
-    std::unique_ptr<char[]> bounce(new char[GZ_PIPE_BOUNCE]);
-    while (true) {
-      std::shared_ptr<char> blk = blocks.get();
-      uint64_t rd_t0 = (g_perf || m) ? now_ns() : 0;
-      uint64_t cp_ns = 0;
-      size_t n_host = gz_pipe_fill(in, blk.get(), host_chunk, bounce.get(),
-                                   (g_perf || m) ? &cp_ns : nullptr);
-      if ((g_perf || m) && n_host > 0) {
-        const uint64_t r_dt = now_ns() - rd_t0 - cp_ns;
-        if (m) {
-          m->reader_io_ns.fetch_add(r_dt, std::memory_order_relaxed);
-          m->reader_copy_ns.fetch_add(cp_ns, std::memory_order_relaxed);
-        }
-        if (g_perf) {
-          g_perf->read_ns.fetch_add(r_dt);
-          g_perf->read_bytes_total.fetch_add(n_host);
-        }
-      }
-      if (n_host == 0) { check_read_error(in, opt.input); break; }
-      if (m) m->read_bytes.fetch_add(n_host);
+    GzPipeReader reader(in, opt, m, host_chunk);
+    size_t n_host = 0;
+    while (auto blk = reader.next(n_host)) {
       size_t off = 0;
       while (off < n_host) {
         size_t sub_n = std::min(gpu_chunk, n_host - off);
@@ -39039,7 +39141,7 @@ static void gpu_decomp_worker(
   int gpu_worker_count,              // total GPU workers spawned
   uint64_t abandoned_at_start,       // reclaims from earlier input files do not count here
   // The frozen sink decision -- see cpu_decomp_worker's parameter of the same
-  // name.  Used for BOTH this worker's own delivery (C.gds_verify) and the CPU
+  // name.  Used for BOTH this worker's own delivery and the CPU
   // rescue it may start, so the two cannot disagree about whether a writer
   // exists.
   bool discard_results)
@@ -39100,6 +39202,7 @@ static void gpu_decomp_worker(
     gz_decomp_park_forever();
   };
   const size_t stream_count = std::max<size_t>(1, (size_t)opt.gpu_streams);
+  bool device_check_reported = false;
 
   // Per-stream state for decompression (declared before try so catch can rescue)
   struct DecompStreamCtx {
@@ -39142,7 +39245,6 @@ static void gpu_decomp_worker(
     std::vector<void *> h_dstage; // pinned host lanes, one per staged-read thread (lazily sized)
     size_t h_dstage_n = 0;        // lanes actually pinned
     size_t h_dstage_slot_bytes = 0;
-    bool   gds_verify = false;    // --gds-only -t only: verified on device, no D2H
     bool   gds_reg_log = false;   // verbosity, carried for the same local-struct reason
     void * d_temp = nullptr;
     size_t temp_bytes = 0;
@@ -39585,10 +39687,6 @@ static void gpu_decomp_worker(
       C.gds_only    = g_gds_out_active.load(std::memory_order_relaxed);
       C.gds_read    = g_gds_read_active.load(std::memory_order_relaxed);
       C.dstage      = C.gds_read && opt.direct_stage;
-      // The frozen decision, not the live global: a later demotion clears that
-      // global but does not retroactively create the writer this pipeline chose
-      // not to spawn.
-      C.gds_verify  = discard_results;
       C.gds_reg_log = (opt.verbosity >= V_VERBOSE);
     }
     for (size_t s = 0; s < stream_count; ++s) {
@@ -41128,6 +41226,24 @@ static void gpu_decomp_worker(
                 + std::to_string(C.batch[i].decomp_size)
                 + " bytes, nvCOMP produced " + std::to_string(actual)
                 + " (corrupt input?)");
+          // THREE CHECKS, TWO RESPONSES.  nvCOMP can report success yet produce
+          // a size that disagrees with the header's declared content size (corrupt
+          // input, or a transient device fault).  The CPU path gets that check for
+          // free -- ZSTD_decompressDCtx rejects such a frame -- and without it the
+          // GPU path wrote a short or wrong frame at exit 0.  Status and size
+          // THROW: the undelivered tail is re-enqueued for another GPU or a CPU
+          // worker.  CPU rescue either succeeds (a transient glitch) or fails
+          // with zstd's data error, as CPU-only and stock zstd do.
+          // Only the content hash sees the BYTES: wrong-but-right-length output
+          // passed both checks above, so a corrupt archive decoded to garbage at
+          // exit 0.  A hash mismatch is DETERMINISTIC (the same bytes hash the same
+          // on every device), so it DIES with EXIT_DATA rather than throwing.
+          // Throwing was unsafe as well as pointless: it re-enqueued the frame for
+          // "another GPU", and the CPU fallback ran only once every GPU worker had
+          // failed -- with several devices the others exited cleanly and the frame
+          // had no consumer.  Measured: --gpu-only on 8 devices ended "internal
+          // error: writer stuck", exit 1, where one device or --hybrid reported the
+          // data error.  Exit 4 matches the CPU path, stock zstd and the exit table.
           if (C.h_has_ck[i] && C.h_verify_ck[i] != C.h_expect_ck[i]) {
             // WHICH OF THE TWO IS IT?  A staged frame's expected hash was read
             // from the END OF THE EXTENT THE SEEK TABLE CLAIMED, so an entry that
@@ -41280,48 +41396,31 @@ static void gpu_decomp_worker(
         // the writer can write frame 0 to disk while frame 1 is transferring.
         // A single batch D2H would stall the writer for the entire transfer.
         for (size_t i = 0; i < C.filled; ++i) {
+          if (discard_results && gz_debug_drop_test_frame(batch_seqs[i])) {
+            bool dropped = false;
+            // Even the fault hook must respect reclaim ownership: the old
+            // worker cannot touch ResultStore after the driver has moved on.
+            rc_commit_delivery([&] {
+              if (results->drop_discard_frame_for_test(batch_seqs[i], opt)) {
+                if (bp) bp->release(1);
+                C.batch[i].release_input();
+                C.delivered = i + 1;
+                dropped = true;
+              }
+            });
+            if (dropped) continue;
+          }
           size_t actual = checked_actual(i);
-          // Integrity check: nvCOMP can report success yet produce a size that
-          // disagrees with the frame header's declared content size (corrupt
-          // input, or a transient device fault).  The CPU path gets this for
-          // free — ZSTD_decompressDCtx rejects a frame whose output != declared
-          // size — so without this guard the GPU path silently writes a short
-          // /wrong frame and exits 0.  Throwing re-enqueues the undelivered tail
-          // to the main queue (catch block); a CPU worker then re-decodes it and
-          // either succeeds (transient glitch — run completes correctly) or dies
-          // cleanly with a zstd data error, matching CPU-only and stock zstd.
-          // CONTENT CHECK.  The two guards above see structure and length; only
-          // this one sees the BYTES.  Wrong-but-right-length output passed both
-          // of them, so a corrupt archive decompressed to garbage at exit 0.
-          // Throwing takes the same route as a size mismatch: the undelivered
-          // tail is re-enqueued and a CPU worker re-decodes it, which either
-          // succeeds (transient device glitch) or dies with a zstd data error,
-          // matching CPU-only and stock zstd.
-          // DIE, DO NOT THROW.  A size mismatch can be a transient device fault,
-          // so that one throws and lets another worker (or the CPU pool) retry.
-          // A CONTENT-CHECKSUM MISMATCH IS DETERMINISTIC: the same bytes hash the
-          // same way on every device, so a retry cannot change the answer, and
-          // routing it through the fault machinery is both pointless and unsafe.
-          // Unsafe because that path re-enqueues the frame for "another GPU to
-          // pick up" and only runs the CPU fallback once fails == gpu_worker_count
-          // -- with several devices the workers that never touched the bad frame
-          // exit cleanly, the count never completes, and the re-enqueued frame
-          // has no consumer.  Measured: --gpu-only on 8 devices ended in
-          // "internal error: writer stuck" and exit 1, while the same archive on
-          // one device or under --hybrid correctly reported a data error.
-          //
-          // EXIT_DATA matches the CPU path, stock zstd, and this project's own
-          // exit table (4 = corrupt input / integrity failure).
           out_sum += actual;
 
-          if (C.gds_verify) {
-            // ---- --gds-only -t: verified in VRAM, nothing leaves the device ----
+          if (discard_results) {
+            // ---- verified in VRAM, no host output is needed ----
             //
-            // The comparison directly above IS the verification, and it ran on
-            // the device against the frame's own trailer.  Copying the frame D2H
-            // from here would move every decompressed byte to the host purely to
-            // hand it to a writer that discards it in TEST mode -- which is the
-            // whole cost this path exists to remove.
+            // The comparison above IS the verification, using the device's hash
+            // against the frame trailer or the seek table.  Copying plaintext
+            // D2H would only hand it to a writer that discards it in TEST mode.
+            // Status, size, frame/seek-table checksum
+            // validation above is identical to the ordinary D2H path.
             //
             // FRAMES WITHOUT A CHECKSUM ARE NOT SILENTLY BLESSED.  They still get
             // nvCOMP's per-chunk status and the produced-vs-declared size check,
@@ -41334,16 +41433,31 @@ static void gpu_decomp_worker(
             // count.  The two paths must credit identically or the totals depend
             // on where the work happened to run.
             rc_commit_delivery([&] {
+              results->discard_verified_frames.fetch_add(1, std::memory_order_relaxed);
               if (m) {
                 m->wrote_bytes.fetch_add(actual, std::memory_order_relaxed);
                 m->tasks_done.fetch_add(1, std::memory_order_relaxed);
               }
-              g_gds_verify_frames.fetch_add(1, std::memory_order_relaxed);
-              g_gds_verify_bytes.fetch_add(actual, std::memory_order_relaxed);
+              if (opt.gds_only && opt.mode == Mode::TEST) {
+                g_gds_verify_frames.fetch_add(1, std::memory_order_relaxed);
+                g_gds_verify_bytes.fetch_add(actual, std::memory_order_relaxed);
+              }
+              // Retire any permit where the ordinary writer would (TEST
+              // currently supplies no throttle).
+              if (bp) bp->release(1);
+              if (!opt.gds_only)
+                g_adapt_gpu_engaged.store(true, std::memory_order_relaxed);
               // Mirrors the loop tail below, which this branch skips.
               C.batch[i].release_input();
               C.delivered = i + 1;
             });
+            if (!device_check_reported) {
+              device_check_reported = true;
+              vlog(V_VERBOSE, opt, "[GPU" + std::to_string(device_id)
+                   + "] -t: status, size"
+                   + (C.h_has_ck[i] ? " and content checks" : " checks (no content checksum)")
+                   + " stay on device; no plaintext D2H\n");
+            }
             // ...INCLUDING THE FAULT HOOK.  This branch `continue`s past the tail
             // where GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST lives, so for --gds-only -t
             // that hook could never fire and every "GPU fault -> CPU rescue" test
@@ -41733,7 +41847,7 @@ static void gpu_decomp_worker(
         ++batch_regrow_streak;
 
         // Notify writer that a full batch of frames is now available
-        results->notify_slot_batch();
+        if (!discard_results) results->notify_slot_batch();
       }
 
       // Check termination (no in-flight check needed: batches complete inline)
@@ -42718,7 +42832,19 @@ gds_out_declined:
   // and may demote (no usable seek table), which clears that global -- leaving
   // workers to conclude they should push into a ResultStore whose writer was
   // never created.
-  const bool discard_results = g_gds_verify_active.load(std::memory_order_relaxed);
+  // Ordinary -t can use the same topology: check status, size and the content
+  // hash before discarding on the device.  CPU workers and fault rescues receive
+  // the same frozen answer.  Tar consumers, --verify and a pipe's late seek-table
+  // hashes still need host bytes.  Keep staged-region eligibility unchanged.
+  // -d always delivers plaintext, including to /dev/null, the benchmark sink.
+  const bool device_test = opt.mode == Mode::TEST && !opt.tar_mode
+      && !g_tar_decomp_sink && !opt.verify_decode && !opt.keep_going
+      && !opt.region_staged() && !gz_late_observing()
+      && !std::getenv("GZSTD_DEBUG_TEST_D2H");
+  const bool discard_results = device_test
+      || g_gds_verify_active.load(std::memory_order_relaxed);
+  if (discard_results)
+    vlog(V_VERBOSE, opt, "[GPU] -t: device verification selected; no plaintext D2H\n");
   if (!g_gds_out_active.load(std::memory_order_relaxed) && !discard_results)
     writer_thr = std::thread(writer_thread, out, std::ref(results), std::cref(opt), m, bp_ptr);
 
@@ -43419,6 +43545,7 @@ gds_out_declined:
     for (auto & th : cpu_pool) th.join();
     if (sched) { tick_done = true; gz_wake_periodic_loops(); if (tick_thr.joinable()) tick_thr.join(); }
     if (writer_thr.joinable()) writer_thr.join();
+    if (discard_results) results.check_discard_complete(queue.total_tasks(), opt.input);
 
     // GDS output was registered before frame parsing, but a sizeless FIRST
     // frame sends the whole file through the CPU streaming decoder and writes
@@ -43673,6 +43800,11 @@ gds_out_declined:
         vlog(V_VERBOSE, opt, "[WRITER] join took " + std::to_string(int(ms)) + " ms\n");
     }
   }
+
+  // No writer exists on this topology to notice a missing sequence number.
+  // Consumers and CPU rescues have finished; check this input's original DATA
+  // tasks before accepting the run or decoding a separately streamed tail.
+  if (discard_results) results.check_discard_complete(queue.total_tasks(), opt.input);
 
   // --gds-only: finalise the destination.  Every cuFileWrite was rounded up to
   // the O_DIRECT block, so the file is currently up to 4 KiB longer than the
@@ -48047,6 +48179,8 @@ static int gzstd_main(int argc, char ** argv)
       // threads less one -- 255 on a 256-thread host whose pool was 96.
       int threads = (opt.sliding_window && g_sw_pass_threads.load(std::memory_order_relaxed) > 0)
                     ? g_sw_pass_threads.load(std::memory_order_relaxed)
+                    : g_cpu_pass_threads.load(std::memory_order_relaxed) > 0
+                    ? g_cpu_pass_threads.load(std::memory_order_relaxed)
                     : resolve_cpu_threads(opt.cpu_threads);
       const CompressPassStats * gpu = nullptr;
 #ifdef HAVE_NVCOMP
@@ -51797,9 +51931,9 @@ static Options parse_args(int argc, char ** argv)
     else if (a == "--check" || a == "--no-check") { opt.no_check = (a == "--no-check"); }
     else if (a == "--no-dictID") { opt.no_dict_id = true; }
     else if (a == "--compress-literals" || a == "--no-compress-literals")
-      opt.zstd_literal_mode = a == "--compress-literals" ? ZSTD_ps_enable : ZSTD_ps_disable;
+      opt.zstd_literal_mode = a == "--compress-literals" ? GZ_ZSTD_ENABLE : GZ_ZSTD_DISABLE;
     else if (a == "--row-match-finder" || a == "--no-row-match-finder")
-      opt.zstd_row_match = a == "--row-match-finder" ? ZSTD_ps_enable : ZSTD_ps_disable;
+      opt.zstd_row_match = a == "--row-match-finder" ? GZ_ZSTD_ENABLE : GZ_ZSTD_DISABLE;
     else if (a == "--mmap-dict" || a == "--no-mmap-dict") {}
     else if (a.rfind("--stream-size=", 0) == 0) {
       opt.patch_stream_size_seen = true; opt.patch_stream_size_arg = a.substr(14);
@@ -52288,20 +52422,37 @@ static Options parse_args(int argc, char ** argv)
   // --sliding-window below; here it still has to be named.
   if (opt.mode == Mode::COMPRESS && !opt.list_mode
       && (opt.sliding_window || !opt.patch_from.empty())) {
+#ifndef ZSTD_c_literalCompressionMode
+    if (opt.zstd_literal_mode != GZ_ZSTD_AUTO)
+      warn_ignored_zstd_opt("--[no-]compress-literals", "unavailable in the linked zstd");
+#endif
+#ifndef ZSTD_c_useRowMatchFinder
+    if (opt.zstd_row_match != GZ_ZSTD_AUTO)
+      warn_ignored_zstd_opt("--[no-]row-match-finder", "unavailable in the linked zstd");
+#endif
     if (opt.zstd_src_hint_seen)
-      opt.zstd_src_size_hint = (int)std::min<unsigned>(INT_MAX,
-          zstd_u32_value("--size-hint", opt.zstd_src_hint_arg));
+      opt.zstd_src_size_hint = (int)std::min<size_t>(INT_MAX,
+          zstd_size_value("--size-hint", opt.zstd_src_hint_arg));
+#ifndef ZSTD_c_srcSizeHint
+    if (opt.zstd_src_hint_seen)
+      warn_ignored_zstd_opt("--size-hint", "unavailable in the linked zstd");
+#endif
     if (opt.zstd_target_cblock_seen) {
-      const unsigned value = zstd_u32_value("--target-compressed-block-size",
-                                            opt.zstd_target_cblock_arg);
+      const size_t value = zstd_size_value("--target-compressed-block-size",
+                                           opt.zstd_target_cblock_arg);
       // The library raises a small value to its minimum, as for zstd, and
       // refuses one above its maximum: refused here, before any output.
+#ifdef GZ_HAVE_TARGET_CBLOCK
       const ZSTD_bounds b = ZSTD_cParam_getBounds(ZSTD_c_targetCBlockSize);
       if (value > INT_MAX || (!ZSTD_isError(b.error) && (int)value > b.upperBound))
         die_usage("--target-compressed-block-size=" + opt.zstd_target_cblock_arg
                   + " is above the linked zstd's limit of "
                   + std::to_string(ZSTD_isError(b.error) ? INT_MAX : b.upperBound) + " bytes");
       opt.zstd_target_cblock_size = (int)value;
+#else
+      (void)value;
+      warn_ignored_zstd_opt("--target-compressed-block-size", "unavailable in the linked zstd");
+#endif
     }
   }
 

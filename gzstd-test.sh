@@ -1241,13 +1241,14 @@ LAST_TEST_MS=$(( $(now_ms) - t0 ))
 # 16): read() copies into a 256 KiB buffer, and streaming stores move it into a
 # block that is reused once its frame is done.  The bytes must survive every
 # boundary of that: 1 MiB chunks (64 of them, then a tail that is a bounce buffer
-# and 7 bytes), on the CPU path and, with a GPU, the GPU path's reader.  "reused"
-# is the pool working; a CPU run of 65 chunks reuses a block in practice (5-6 made
-# on the 8-GPU host), while --gpu-only reads all of it before CUDA is up and so
-# only has to round-trip.
+# and 7 bytes), on the CPU path and, with a GPU, the GPU path's reader.  Pin two
+# workers: a one-CPU allowance otherwise takes the single-thread streaming path,
+# which has no block pool.  Two workers also bound the input queue below this
+# fixture's chunk count, so a block must be released before the reader finishes.
+# --gpu-only reads all of it before CUDA is up and only has to round-trip.
 t0=$(now_ms); why=""
 { cat "$TMPDIR/large.bin" "$TMPDIR/large.bin"; head -c 262151 "$TMPDIR/medium.txt"; } > "$TMPDIR/pb.bin"
-cat "$TMPDIR/pb.bin" | "$GZSTD" -v --cpu-only --chunk-size=1 -c 2> "$TMPDIR/pb.err" > "$TMPDIR/pb.zst"
+cat "$TMPDIR/pb.bin" | "$GZSTD" -v --cpu-only -T2 --chunk-size=1 -c 2> "$TMPDIR/pb.err" > "$TMPDIR/pb.zst"
 pb_rc=${PIPESTATUS[1]}
 [[ $pb_rc -eq 0 ]] || why+=" cpu-exit:$pb_rc"
 pb_line=$(grep -oE '^\[READER\] pipe blocks: [0-9]+ made, [0-9]+ reused' "$TMPDIR/pb.err")
@@ -1417,6 +1418,8 @@ wc_workers() {
   fi
 }
 wc_logged_quota() { grep -aoE 'cgroup CPU quota [0-9]+' "$1" | head -1 | grep -oE '[0-9]+' | head -1; }
+# The compress arms read large.bin, two 16 MiB frames: since v0.18.22 an input that fits in one
+# frame (medium.txt is exactly 1 MiB) compresses on one thread, so it shows no pool to count.
 "$GZSTD" --cpu-only -q -f -c "$TMPDIR/medium.txt" > "$TMPDIR/wc.zst" 2>/dev/null
 if (( ${#wc_allowed[@]} < 9 )) || ! command -v taskset >/dev/null 2>&1; then
   for wc_t in "an 8-CPU mask: allowance-sized workers, -T0 and decompress too" "--stats-json reports the pool"; do
@@ -1424,8 +1427,8 @@ if (( ${#wc_allowed[@]} < 9 )) || ! command -v taskset >/dev/null 2>&1; then
   done
 else
   wc_mask=$(IFS=,; echo "${wc_allowed[*]:0:8}")
-  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -c "$TMPDIR/medium.txt" 2>"$TMPDIR/wc1.err" >/dev/null; wc_rc1=$?
-  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -T0 -c "$TMPDIR/medium.txt" 2>"$TMPDIR/wc2.err" >/dev/null; wc_rc2=$?
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc1.err" >/dev/null; wc_rc1=$?
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -f -T0 -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc2.err" >/dev/null; wc_rc2=$?
   taskset -c "$wc_mask" "$GZSTD" --cpu-only -v -d -f -c "$TMPDIR/wc.zst" 2>"$TMPDIR/wc4.err" >/dev/null; wc_rc4=$?
   wc_want_mask=6
   wc_allowed_mask=8
@@ -1441,7 +1444,7 @@ else
     fail "worker count: an 8-CPU mask: allowance-sized workers, -T0 and decompress too" \
       "rc $wc_rc1/$wc_rc2/$wc_rc4; $(grep -ah '^\[CPU\]' "$TMPDIR/wc1.err" "$TMPDIR/wc2.err" "$TMPDIR/wc4.err" | tr '\n' ' ')"
   fi
-  taskset -c "$wc_mask" "$GZSTD" --cpu-only -q -f --stats-json "$TMPDIR/wc3.json" -c "$TMPDIR/medium.txt" >/dev/null 2>&1
+  taskset -c "$wc_mask" "$GZSTD" --cpu-only -q -f --stats-json "$TMPDIR/wc3.json" -c "$TMPDIR/large.bin" >/dev/null 2>&1
   wc_rc3=$?
   if [[ $wc_rc3 -eq 0 ]] && grep -q "\"cpu\": { \"threads\": $wc_want_mask }" "$TMPDIR/wc3.json" 2>/dev/null; then
     pass "worker count: --stats-json reports the pool"
@@ -1477,7 +1480,7 @@ for wc_case in "v2 3" "v1 2"; do
   fi
   wc_dir=$wc_v2; [[ $wc_kind == v1 ]] && wc_dir=$wc_v1
   wc_want=$(( wc_base < wc_q ? wc_base : wc_q ))
-  GZSTD_DEBUG_CGROUP_ROOT="$wc_dir" "$GZSTD" --cpu-only -v -f -c "$TMPDIR/medium.txt" 2>"$TMPDIR/wc-$wc_kind.err" >/dev/null
+  GZSTD_DEBUG_CGROUP_ROOT="$wc_dir" "$GZSTD" --cpu-only -v -f -c "$TMPDIR/large.bin" 2>"$TMPDIR/wc-$wc_kind.err" >/dev/null
   wc_rc=$?
   wc_got=$(wc_workers "$TMPDIR/wc-$wc_kind.err")
   if [[ $wc_rc -eq 0 && "$wc_got" == "$wc_want" ]] \
@@ -1492,7 +1495,7 @@ done
 if command -v systemd-run >/dev/null 2>&1 \
    && systemd-run --user --scope -q -p CPUQuota=200% true >/dev/null 2>&1; then
   wc_want=$(( wc_base < 2 ? wc_base : 2 ))
-  systemd-run --user --scope -q -p CPUQuota=200% "$GZSTD" --cpu-only -v -f -c "$TMPDIR/medium.txt" \
+  systemd-run --user --scope -q -p CPUQuota=200% "$GZSTD" --cpu-only -v -f -c "$TMPDIR/large.bin" \
     2>"$TMPDIR/wc-real.err" >/dev/null
   wc_rc=$?
   wc_real_quota=$(wc_logged_quota "$TMPDIR/wc-real.err")
@@ -2089,14 +2092,24 @@ PY
   pz_variant=0
   for pz_case in "3 --no-compress-literals lit" "7 --no-row-match-finder new" \
                  "3 --stream-size=64K new" "3 --target-compressed-block-size=8K lit" \
-                 "3 -B512K new" "3 --size-hint=64K new"; do
+                 "3 -B512K new" "3 --size-hint=64K new" "3 --size-hint=8192M new"; do
     read -r pz_lv pz_flag pz_in <<<"$pz_case"
     (( ++pz_variant ))
+    # A single-threaded libzstd cannot apply -B's worker job size.  Keep the
+    # other patch comparisons on that supported build, as for sliding-window.
+    if [[ $pz_flag == -B* && $("$GZSTD" --version 2>/dev/null) != *"multithreaded]"* ]]; then
+      continue
+    fi
     pz_input="$DICTD/newe.bin"; [[ $pz_in == lit ]] && pz_input="$DICTD/pz-literals.bin"
     zstd -q -f -$pz_lv --patch-from="$DICTD/old.bin" "$pz_input" \
       -o "$DICTD/pzz.base$pz_variant.zst" 2>/dev/null
     zstd -q -f -$pz_lv "$pz_flag" --patch-from="$DICTD/old.bin" "$pz_input" \
       -o "$DICTD/pzz.opt$pz_variant.zst" 2>/dev/null
+    # zstd's CLI may also lack worker threads and accept -B without effect.
+    # That reference cannot discriminate a job-size implementation.
+    if [[ $pz_flag == -B* ]] && cmp -s "$DICTD/pzz.base$pz_variant.zst" "$DICTD/pzz.opt$pz_variant.zst"; then
+      continue
+    fi
     rc=0; "$GZSTD" -q -f -$pz_lv "$pz_flag" --patch-from="$DICTD/old.bin" "$pz_input" \
       -o "$DICTD/pzg.opt$pz_variant.zst" 2>"$DICTD/err" || rc=$?
     { [[ $rc -eq 0 ]] && cmp -s "$DICTD/pzz.opt$pz_variant.zst" "$DICTD/pzg.opt$pz_variant.zst"; } \
@@ -2665,11 +2678,137 @@ if has_gpu 2>/dev/null; then
     done
   done
 
-  run_test "$GZSTD" -k -f --gpu-only "$TMPDIR/large.bin" -o "$TMPDIR/gpu-test.zst" 2>/dev/null
-  run_test "$GZSTD" -t --gpu-only "$TMPDIR/gpu-test.zst" 2>/dev/null
-  [[ $LAST_RC -eq 0 ]] \
-    && pass "gpu-only -t integrity" || fail "gpu-only -t integrity"
-  rm -f "$TMPDIR/gpu-test.zst"
+  # -t must check on the device before dropping plaintext, including a checksum
+  # supplied only by the seek table.  Damage the LAST frame's footer so the
+  # final-batch fault hook hands that damage to CPU rescue before it is checked.
+  # Keep this as one cell (the no-GPU count is unchanged).
+  gt="$TMPDIR/gpu-test"; gt_why=""
+  "$GZSTD" -q -k -f --cpu-only --chunk-size=1 "$TMPDIR/large.bin" -o "$gt.zst" 2>/dev/null
+  python3 - "$gt" <<'GTPY' 2>/dev/null
+import struct, sys
+p = sys.argv[1]
+b = bytearray(open(p + '.zst', 'rb').read())
+frames, pos = [], 0
+while pos + 4 <= len(b) and struct.unpack_from('<I', b, pos)[0] == 0xFD2FB528:
+    start = pos
+    desc = b[pos + 4]
+    assert desc & 4                              # own content checksum
+    single = bool(desc & 32)
+    pos += 5 + (not single) + (0, 1, 2, 4)[desc & 3]
+    fcs_pos = pos
+    fcs_len = (int(single), 2, 4, 8)[desc >> 6]
+    assert fcs_len                               # known content size
+    size = int.from_bytes(b[pos:pos + fcs_len], 'little') + (256 if fcs_len == 2 else 0)
+    pos += fcs_len
+    while True:
+        h = int.from_bytes(b[pos:pos + 3], 'little')
+        assert (h >> 1) & 3 != 3
+        pos += 3 + (1 if (h >> 1) & 3 == 1 else h >> 3)
+        if h & 1:
+            break
+    ck = struct.unpack_from('<I', b, pos)[0]
+    frames.append((start, pos, size, ck, fcs_pos, fcs_len))
+    pos += 4
+assert len(frames) >= 2
+# One DATA frame between two skippable frames.  Multi-input controls below
+# require a fresh completeness count for each file and no credit for metadata.
+start, footer = frames[0][:2]
+skip = struct.pack('<II', 0x184D2A50, 3) + b'gap'
+open(p + '-one.zst', 'wb').write(skip + b[start:footer + 4] + skip)
+open(p + '.frames', 'w').write(str(len(frames)) + '\n')
+bad = bytearray(b)
+bad[frames[-1][1]] ^= 1                          # same payload and geometry
+open(p + '-bad-ck.zst', 'wb').write(bad)
+bad = bytearray(b)
+fcs_pos, fcs_len = frames[0][4:]
+declared = int.from_bytes(bad[fcs_pos:fcs_pos + fcs_len], 'little')
+bad[fcs_pos:fcs_pos + fcs_len] = (declared + 1).to_bytes(fcs_len, 'little')
+open(p + '-bad-size.zst', 'wb').write(bad)
+body, entries = bytearray(), bytearray()
+for start, footer, size, ck, _, _ in frames:
+    frame = bytearray(b[start:footer])            # remove own checksum
+    frame[4] &= ~4
+    body += frame
+    entries += struct.pack('<III', len(frame), size, ck)
+def save_table(suffix, ent):
+    pay = ent + struct.pack('<IBI', len(frames), 0x80, 0x8F92EAB1)
+    open(p + suffix + '.zst', 'wb').write(body + struct.pack('<II', 0x184D2A5E, len(pay)) + pay)
+save_table('-table', entries)
+entries[-4] ^= 1
+save_table('-bad-table', entries)
+GTPY
+  if [[ ! -s "$gt-bad-table.zst" || ! -s "$gt-one.zst" || ! -s "$gt.frames" ]]; then
+    gt_why="fixture construction failed"
+  else
+    t0=$(now_ms)
+    for gt_case in "clean:0:" "bad-ck:4:-bad-ck" "bad-size:4:-bad-size" \
+                   "table:0:-table" "bad-table:4:-bad-table" \
+                   "rescue:0:" "rescue-bad:4:-bad-ck"; do
+      IFS=: read -r gt_name gt_want gt_suffix <<< "$gt_case"
+      gt_fault=()
+      [[ $gt_name == rescue* ]] && gt_fault=(GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST=1)
+      gt_rc=0
+      env -u GZSTD_DEBUG_TEST_D2H "${gt_fault[@]}" timeout --foreground -k 10 120 \
+        "$GZSTD" -vv -t --gpu-only --gpu-devices=1 --gpu-streams=1 --gpu-batch=2 \
+        "$gt$gt_suffix.zst" > /dev/null 2>"$gt.err" || gt_rc=$?
+      [[ $gt_rc -eq $gt_want ]] || gt_why+=" $gt_name:exit=$gt_rc,want=$gt_want"
+      grep -q 'device verification selected; no plaintext D2H' "$gt.err" \
+        || gt_why+=" $gt_name:no-device-check-path"
+      if [[ $gt_name == clean || $gt_name == table ]]; then
+        grep -q 'content checks stay on device; no plaintext D2H' "$gt.err" \
+          || gt_why+=" $gt_name:no-device-content-check"
+        grep -qE '\[GPU[0-9]+/S[0-9]+\] done batch=' "$gt.err" \
+          || gt_why+=" $gt_name:no-GPU-batch"
+      fi
+      if [[ $gt_name == rescue* ]]; then
+        grep -Fq 'simulated GPU decompress fault (GZSTD_DEBUG_FAIL_GPU_DECOMP_LAST)' "$gt.err" \
+          || gt_why+=" $gt_name:fault-did-not-fire"
+      fi
+    done
+    # The A/B hook restores D2H, and /dev/null remains on that delivery path.
+    for gt_arm in test-d2h null-output; do
+      gt_args=(-t); gt_env=(GZSTD_DEBUG_TEST_D2H=1)
+      [[ $gt_arm == null-output ]] && { gt_args=(-d -f -o /dev/null); gt_env=(); }
+      gt_rc=0
+      env "${gt_env[@]}" timeout --foreground -k 10 120 \
+        "$GZSTD" -v --gpu-only --gpu-devices=1 "${gt_args[@]}" \
+        "$gt.zst" > /dev/null 2>"$gt.err" || gt_rc=$?
+      [[ $gt_rc -eq 0 ]] || gt_why+=" $gt_arm:exit=$gt_rc"
+      grep -q 'no plaintext D2H' "$gt.err" && gt_why+=" $gt_arm:discarded"
+    done
+
+    # Without the completeness guard the dropped frame used to disappear at
+    # exit 0: there is no ordered writer to notice its missing sequence number.
+    # First process a different, one-DATA-frame input in the SAME invocation.
+    # The target seq=1 exists only in the second input; credits must be per file.
+    # The full fixture carries a seek table, which is also not a DATA task.
+    read -r gt_frames < "$gt.frames"
+    for gt_arm in complete lost lost-d2h; do
+      gt_env=()
+      [[ $gt_arm == lost* ]] && gt_env=(GZSTD_DEBUG_DROP_TEST_FRAME=1)
+      [[ $gt_arm == lost-d2h ]] && gt_env+=(GZSTD_DEBUG_TEST_D2H=1)
+      gt_rc=0
+      env -u GZSTD_DEBUG_TEST_D2H -u GZSTD_DEBUG_DROP_TEST_FRAME "${gt_env[@]}" \
+        timeout --foreground -k 10 120 "$GZSTD" -v -t --gpu-only --gpu-devices=1 \
+        --gpu-streams=1 --gpu-batch=2 "$gt-one.zst" "$gt.zst" \
+        > /dev/null 2>"$gt.err" || gt_rc=$?
+      if [[ $gt_arm == lost ]]; then
+        [[ $gt_rc -eq 1 ]] || gt_why+=" completeness:exit=$gt_rc,want=1"
+        grep -Fq '[TEST] dropping enqueued DATA frame 1 before verification' "$gt.err" \
+          || gt_why+=" completeness:frame-did-not-vanish"
+        grep -Fq "verified $((gt_frames - 1)) of $gt_frames enqueued data frames" "$gt.err" \
+          || gt_why+=" completeness:missing-counts"
+      else
+        [[ $gt_rc -eq 0 ]] || gt_why+=" $gt_arm:exit=$gt_rc,want=0"
+        grep -Fq '[TEST] dropping enqueued DATA frame' "$gt.err" \
+          && gt_why+=" $gt_arm:unexpected-drop"
+      fi
+    done
+    LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  fi
+  [[ -z "$gt_why" ]] && pass "gpu-only -t integrity" \
+    || fail "gpu-only -t integrity" "$gt_why"
+  rm -f "$gt"*.zst "$gt.err" "$gt.frames"
 
   # v0.17.15 regression: one GPU faults while holding the FINAL batch and
   # re-enqueues its undelivered frames; the other device has already drained the
@@ -5352,7 +5491,7 @@ files_match "$TMPDIR/small.txt" "$TMPDIR/tform1.recovered" \
 # default's.  Counts come from -v's "[CPU] N worker/decompression threads online".
 tf_why=""
 tf_run() { local ev=$1; shift; ZSTD_NBTHREADS="$ev" "$GZSTD" -f --cpu-only "$@" 2>&1 >/dev/null; }
-tf_cnt() { grep -o '\[CPU\] [0-9]* [a-z]* threads online' <<<"$1"; }
+tf_cnt() { grep -oE '\[CPU\] ([0-9]+ [a-z]+ threads online|single-thread streaming path)' <<<"$1"; }
 "$GZSTD" -q -k -f --cpu-only "$TMPDIR/medium.txt" -o "$TMPDIR/tform-nbt.zst" 2>/dev/null
 tf_def_c=$(tf_cnt "$(env -u ZSTD_NBTHREADS "$GZSTD" -f --cpu-only -v -c "$TMPDIR/medium.txt" 2>&1 >/dev/null)")
 tf_def_d=$(tf_cnt "$(env -u ZSTD_NBTHREADS "$GZSTD" -f --cpu-only -v -d -c "$TMPDIR/tform-nbt.zst" 2>&1 >/dev/null)")
@@ -7517,9 +7656,10 @@ fi
 rm -f "$TMPDIR/thr-vv.zst"
 
 # --throttle-frames=0 disables the throttle (v0.12.48+).  Must succeed AND
-# the verbose output must show DISABLED.
+# the verbose output must show DISABLED.  Two frames (large.bin): a one-frame
+# input compresses on one thread since v0.18.22, with no throttle to disable.
 "$GZSTD" -k -f --cpu-only --throttle-frames=0 -v \
-  "$TMPDIR/small.txt" -o "$TMPDIR/thr-disabled.zst" 2>"$TMPDIR/thr-disabled.log"
+  "$TMPDIR/large.bin" -o "$TMPDIR/thr-disabled.zst" 2>"$TMPDIR/thr-disabled.log"
 rc=$?
 if [[ $rc -eq 0 ]] && grep -q "\[THROTTLE\] DISABLED" "$TMPDIR/thr-disabled.log"; then
   pass "--throttle-frames=0 disables throttle"
@@ -7528,7 +7668,7 @@ else
 fi
 # --no-throttle is an alias for --throttle-frames=0
 "$GZSTD" -k -f --cpu-only --no-throttle -v --overwrite \
-  "$TMPDIR/small.txt" -o "$TMPDIR/thr-disabled.zst" 2>"$TMPDIR/thr-disabled.log"
+  "$TMPDIR/large.bin" -o "$TMPDIR/thr-disabled.zst" 2>"$TMPDIR/thr-disabled.log"
 if grep -q "\[THROTTLE\] DISABLED" "$TMPDIR/thr-disabled.log"; then
   pass "--no-throttle alias works"
 else
@@ -12209,6 +12349,8 @@ elif [[ $swp_rc -eq 0 ]] \
 else
   swp_w=$(swp_n takes <<<"$swp_line"); swp_c=$(swp_n "cache.s" <<<"$swp_line")
   swp_want=$(( (swp_c + 1) / 2 )); (( swp_want > 8 )) && swp_want=8
+  swp_quota=$(wc_logged_quota "$TMPDIR/swp2.err")
+  if [[ -n $swp_quota ]] && (( swp_quota < swp_want )); then swp_want=$swp_quota; fi
   if [[ $swp_rc -eq 0 && -n "$swp_line" && "$swp_w" == "$swp_want" && "$swp_pool" == "$swp_w" ]]; then
     pass "--sliding-window placement: the count follows the strategy"
   else
@@ -12672,8 +12814,9 @@ fi
 ("$GZSTD" --memlimit 256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "--memlimit N accepted" || fail "--memlimit N accepted"
 ("$GZSTD" --memory=256 -f "$TMPDIR/zc.bin" >/dev/null 2>&1) && pass "--memory=N accepted" || fail "--memory=N accepted"
 
-# -M tightens the throttle budget at -vv (source should show `source=ram`)
-out=$("$GZSTD" --cpu-only -vv -M 32M -f "$TMPDIR/zc.bin" 2>&1)
+# -M tightens the throttle budget at -vv (source should show `source=ram`).
+# large.bin, two frames: a one-frame input takes the throttle-free serial path.
+out=$("$GZSTD" --cpu-only -vv -M 32M -f -c "$TMPDIR/large.bin" 2>&1 >/dev/null)
 echo "$out" | grep -q "\[THROTTLE\].*source=ram" && pass "-M tightens throttle (source=ram)" \
   || fail "-M tightens throttle" "expected source=ram in throttle line"
 
@@ -16959,35 +17102,45 @@ else
 fi
 rm -f "$TMPDIR"/einval.* "$TMPDIR"/einval-eio.*
 
-# 3. Compress: the mmap reader, and --direct-read's O_DIRECT reader.  Small inputs
-#    are enough -- both readers engage at any size.
+# 3. Compress: the one-frame serial path, the mmap reader, and --direct-read's
+#    O_DIRECT reader.  Since v0.18.22 an auto-sized run on an input that fits in
+#    one frame reads it with stdio on one thread (the serial arm, 8 MiB); the mmap
+#    reader needs the pool, so its arm reads 24 MiB (two 16 MiB frames).
+#    --direct-read is an explicit reader and keeps the pool at any size.
 head -c $((8*1048576)) /dev/urandom > "$PIN/a8.bin"
 head -c $((9*1048576)) /dev/urandom > "$PIN/b8.bin"
+head -c $((24*1048576)) /dev/urandom > "$PIN/a24.bin"
+head -c $((25*1048576)) /dev/urandom > "$PIN/b24.bin"
 pc_ok=1; pc_skip=0; pc_why=""
-for pc_arm in mmap direct; do
-  cp "$PIN/a8.bin" "$PIN/in.bin"; cp "$PIN/b8.bin" "$PIN/repl.bin"
+for pc_arm in serial mmap direct; do
+  pc_a="$PIN/a8.bin"; pc_b="$PIN/b8.bin"
+  [[ $pc_arm == mmap ]] && { pc_a="$PIN/a24.bin"; pc_b="$PIN/b24.bin"; }
+  cp "$pc_a" "$PIN/in.bin"; cp "$pc_b" "$PIN/repl.bin"
   pc_flags=(--cpu-only -v -f); [[ $pc_arm == direct ]] && pc_flags+=(--direct-read)
   pin_swap in.bin repl.bin "$PIN/c.log" -- "${pc_flags[@]}" "$PIN/in.bin" -o "$PIN/c.zst"
   "$GZSTD" -q -d -c "$PIN/c.zst" > "$PIN/c.out" 2>/dev/null
   if [[ $PS_GATED -ne 1 ]]; then pc_ok=0; pc_why="$pc_arm: never reached the gate"; break; fi
+  if [[ $pc_arm == serial ]] && ! grep -aq 'single-thread streaming path (input fits in one frame)' "$PIN/c.log"; then
+    pc_ok=0; pc_why="serial: the one-frame serial path did not engage, so this tested nothing"; break
+  fi
   if [[ $pc_arm == mmap ]] && ! grep -aq 'MMAP\] using zero-copy reader' "$PIN/c.log"; then
     pc_ok=0; pc_why="mmap: the mmap reader did not engage, so this tested nothing"; break
   fi
   if [[ $pc_arm == direct ]] && ! grep -aq 'DIRECT-READ\] O_DIRECT input' "$PIN/c.log"; then
     pc_skip=1
   fi
-  if [[ $PS_RC -ne 0 ]] || ! files_match "$PIN/a8.bin" "$PIN/c.out"; then
+  if [[ $PS_RC -ne 0 ]] || ! files_match "$pc_a" "$PIN/c.out"; then
     pc_ok=0
-    pc_why="$pc_arm: exit $PS_RC; archive holds $(files_match "$PIN/b8.bin" "$PIN/c.out" && echo 'the REPLACEMENT' || echo 'neither file')"
+    pc_why="$pc_arm: exit $PS_RC; archive holds $(files_match "$pc_b" "$PIN/c.out" && echo 'the REPLACEMENT' || echo 'neither file')"
     break
   fi
   rm -f "$PIN"/in.bin* "$PIN"/repl.bin "$PIN/c.zst" "$PIN/c.out"
 done
 if [[ $pc_ok -eq 1 && $pc_skip -eq 1 ]]; then
-  skip "compress readers (mmap, O_DIRECT) read the pinned file" \
-       "O_DIRECT unavailable for $TMPDIR (the mmap arm passed; the direct arm did not engage)"
+  skip "compress readers (one-frame stdio, mmap, O_DIRECT) read the pinned file" \
+       "O_DIRECT unavailable for $TMPDIR (the serial and mmap arms passed; the direct arm did not engage)"
 elif [[ $pc_ok -eq 1 ]]; then
-  pass "compress readers (mmap, O_DIRECT) read the pinned file, not a renamed replacement"
+  pass "compress readers (one-frame stdio, mmap, O_DIRECT) read the pinned file, not a renamed replacement"
 else
   fail "compress readers read the pinned file" "$pc_why"
 fi

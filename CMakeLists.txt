@@ -395,7 +395,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_L
 endif()
 
 # Static linking: prefer static libstdc++ and libgcc for maximum portability.
-# The resulting binary only needs glibc (2.17+) at runtime; the NVIDIA driver
+# Runtime glibc requirements follow the linked symbol versions; the portable
+# build checks that none needs newer than 2.28 (RHEL/Rocky 8).  The NVIDIA driver
 # is optional (CUDA and NVML are discovered at runtime, with CPU fallback).
 if(BUILD_STATIC AND NOT MSVC)
   target_link_options(gzstd PRIVATE

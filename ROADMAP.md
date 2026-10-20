@@ -444,6 +444,24 @@ read and wrote on one thread), now faster than zstd both ways. What is still ope
    `taskset`, a cpuset or a cgroup quota ran 94-96 workers -- 4-17% slower under a mask, ~1.9x
    under a 4-CPU quota.  Pools now size from `gz_cpu_allowance()`: the mask, then the quota rounded
    up.  CHANGELOG v0.18.19 has the tables.  The I/O reserve's own value is item 18's question.
+25. **Left by the v0.18.22 pre-tag review (deferred, none a defect).**  The reviewer's operation
+   ledgers for six command lines (CHANGELOG v0.18.22) found these, each measured or bounded, none
+   worth taking before a tag:
+   - **Decode reader overlap.**  The prefetch reader asks for a 17 MiB overlap on 16 MiB frames, so a
+     warm 24 GiB archive copies ~6.4 GiB twice from the page cache.  A tighter overlap derived from
+     the validated frame geometry could remove most of it; it overlaps decode and the pipe, so the
+     wall gain is unproven.  Measure on a sink-bound and a CPU-bound decode before building.
+   - **The O_DIRECT output staging copy** (`--sliding-window` and the frame writer to a file): every
+     compressed byte is copied into an aligned 16 MiB buffer.  Handing the aligned buffers to the
+     positional writes would remove the copy; it overlaps the NVMe writes, so the gain is unproven.
+   - **Checksum threads per GPU compress batch** are created and joined for every batch of more than
+     one frame; a persistent pool would save `min(b,8)` thread lifecycles per batch.  Bounded by the
+     GPU share of a run; measure on a hybrid compress where the GPU takes most frames.
+   - **Tightness, listed not done:** the three-pass read-probe orchestration still exists once per
+     producer (CPU, GPU/hybrid) -- sharing it needs adapters for the GPU path's abort handling and
+     the descriptor/pool lifetimes; and the physical-core, L3-count and placement topology readers
+     overlap (512 sysfs reads for the core count alone on the 256-thread server) but keep different
+     fallbacks and affinity scopes.
 
 ## FIXED v0.17.85: the GPU intake deadlocked behind the throttle when one read stalled
 

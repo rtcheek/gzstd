@@ -14,7 +14,8 @@
 #     the shipped encoder was older than the one every test used.
 #
 # Result: build-portable/gzstd, ~60–80 MB, runs on any Linux x86_64 with
-# glibc ≥ 2.31 and an NVIDIA driver providing libnvidia-ml.so.1.
+# glibc ≥ 2.28 (the symbol-version check below enforces this target).  The NVIDIA
+# driver is optional; GPU paths engage when it is available.
 #
 # Usage:   scripts/build-portable.sh [--nvcomp-version X.Y.Z.W]
 #          scripts/build-portable.sh --help
