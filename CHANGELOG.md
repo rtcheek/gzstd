@@ -1,12 +1,122 @@
 # gzstd Optimization Changelog
 
-**Covers:** v0.9.50 → v0.18.20  
+**Covers:** v0.9.50 → v0.18.21  
 **Test machines:**
 - **Server:** 256-core CPU, 8× NVIDIA H100 (95 GiB VRAM each), NVMe ~3 GiB/s write
 - **Workstation:** 256 GiB RAM, 24-core CPU, 2× NVIDIA RTX 2080 Ti (10 GiB VRAM each), NVMe ~1.8 GiB/s write
 
 ---
 
+
+## v0.18.21 — `--sliding-window` takes zstd's compression switches and loads `-D` as zstd does
+
+v0.18.20 made six zstd switches real for patch creation, because zstd sets them on its patch
+context.  zstd sets four on every context and `-B#` when built with worker threads
+(`FIO_createCResources`).  `--sliding-window` uses zstd's single-frame compressor, so these
+settings now apply there too (the ROADMAP note; the owner's ask, 2026-10-20):
+`--[no-]compress-literals`, `--[no-]row-match-finder`,
+`--target-compressed-block-size=`, `--size-hint=` and `-B#` as zstd's job size (it warned "use
+--chunk-size" there).  Unset, each is the library's own default, so a run without them writes the
+bytes it always did -- measured at levels 1, 3, 9 and 19: the same as v0.18.20's and zstd's.  On
+gzstd's own frames they stay no-ops, silently as before, and `-B#` still warns.  `--stream-size=`
+stays patch-only (zstd also pledges it as a pipe's size; gzstd does not).  A
+`--target-compressed-block-size` above the linked zstd's limit (128 KiB) is now refused before any
+output, exit 2 (zstd: error 11); the library refused it after the output was opened.
+
+Measured against zstd 1.5.7 on 7 MiB of mixed text and random data: each switch at a level where it
+changes zstd's bytes, a combination (`-9 --no-compress-literals --no-row-match-finder
+--target-compressed-block-size=4K -B2M`), `-B1M` with `--long=27` and with `--rsyncable`,
+`--no-row-match-finder` with `--zstd=`, and -T1, -T4 and -T16: byte-identical.  As in zstd, `--size-hint` changes the frame only through a pipe
+(a named file's size is pledged, and libzstd then ignores the hint).
+
+**`-D` with `--sliding-window` was not zstd's frame.**  Found while checking `-D` with the switches.
+gzstd compresses with one CDict per level, built from the level alone and shared by every frame
+worker.  zstd loads the dictionary into its context, which builds the tables from the context's own
+parameters: the dedicated dictionary search (`enableDedicatedDictSearch`, which zstd's CLI always
+sets), `--long`, `--zstd=`, the row match finder.  Against zstd 1.5.7, v0.18.20's
+`--sliding-window -D` differed with a 112 KB dictionary at levels 5, 7 and 9 on a 200 KB file and
+at every level on 7 MiB, and with the suite's 4 KB JSON dictionary at every level on 200 KB, 2 MB
+and 4.7 MB.  The frame now loads the dictionary as zstd does (`ZSTD_CCtx_loadDictionary_byReference`)
+and is byte-identical at levels 1-19, with each switch, `--long=27`, `--zstd=`, `--no-dictID`, -T1,
+from a pipe of at least 4 MiB, and on an empty file.  A sliding-window run no longer builds the
+shared CDict.  Speed is unchanged (a 16 MB dictionary on 27 MiB, 3 runs each: level 3 0.09-0.10 s
+against 0.10 s, level 19 1.05-1.06 s against 1.07-1.09 s; zstd 1.04 s).  zstd's bytes are not always
+fewer: summed over levels 1, 3, 5, 7, 9, 12, 16 and 19 against v0.18.20's frames, 4.2% smaller on
+4.7 MB of JSON (4 KB dictionary), 1.3% larger on 200 KB of it, 3.1% larger on the 7 MiB of text and
+random data (112 KB dictionary; 6.3% at level 19).  `--sliding-window` promises zstd's frame, so it takes zstd's.
+
+**Two older divergences found and kept (the owner's decision, 2026-10-20; ROADMAP):**
+- **Frame mode's `-D` keeps gzstd's own dictionary route.**  The frame workers share one CDict per
+  level, built from the level alone; zstd loads the dictionary into its context, which builds the
+  tables from the context's parameters, the dedicated search included.  So a one-frame file is not
+  zstd's bytes at levels 5 and 7 (5-10 with a large dictionary), and past about 128 KB (130,000
+  bytes matched, 140,000 did not) at most levels.  Measured with a harness that compresses each way
+  through the same libzstd 1.5.7, and against zstd's CLI, it is not a ratio question: each route
+  wins at some levels.
+
+  | input, dictionary | gzstd's route | zstd's (CLI) |
+  |---|---|---|
+  | 100 B and 1 KB JSON, 4 KB | identical at every level | |
+  | 10 KB JSON, level 5 / 7 | 647 / 623 | 635 / 618 |
+  | 60 KB JSON, level 5 / 7 | 2,542 / 2,520 | 2,812 / 2,917 |
+  | 200 KB JSON, level 3 / 9 | 10,943 / 9,381 | 10,149 / 8,544 |
+  | 200 KB JSON, level 12 / 16 | 9,671 / 8,092 | 11,883 / 11,073 |
+  | 200 KB and 600 KB JSON, 8 levels summed | about 1% smaller | |
+  | 4.7 MB JSON, 8 levels summed | | 4.5% smaller |
+  | 200 KB text, 112 KB, levels 5-9 | 1.0-1.4% larger | |
+
+  zstd's bytes would need each worker to build its own tables from the dictionary, which the shared
+  CDict exists to avoid: up to 80 MiB at level 19 for a dictionary of 1 MiB or more (7.5 GiB at 96
+  workers), 1.5 MiB for a 112 KB trained one.  A shared CDict built with the dedicated search
+  (`ZSTD_createCDict_advanced2`) is not zstd's either: a referenced CDict's own level (none) then
+  replaces the run's, which moved levels 16 and 19.  The ROADMAP's "a gzstd `-D` frame is
+  byte-identical to zstd's" now says which frames are.
+- **`--sliding-window` from stdin records the input's size, which zstd never does for stdin**, when
+  stdin is a redirected file (any size: gzstd reads it with fstat) or a pipe under 4 MiB (gzstd
+  reads 4 MiB at a time, so the first read is the whole input, and libzstd takes a single complete
+  call as the size; zstd's 128 KB reads never give it that).  Measured: 1,000,000 and 4,194,303
+  bytes through a pipe differ from zstd's frame; 4,194,304 and 4,194,305 match.  Kept as a feature:
+  the frame carries its content size, which `-l` and any decoder can use, and a window no larger
+  than the input.  The help now says so.  v0.18.20 did the same; the identity cell pipes 8 MiB and
+  could not see it.
+
+### Tests
+
+Default +1 (558 -> 559; `-e` 859 -> 860): `--sliding-window` with each switch and `-D`, against zstd
+1.5.7, in the v0.18.20 cell's LEVEL FLAG INPUT form with the same per-arm control (the flag must
+change zstd's own bytes there): `-3 --no-compress-literals` and `-3
+--target-compressed-block-size=8K` on the literal-heavy fixture, `-7 --no-row-match-finder`,
+`-3 -B512K`, `-3 --size-hint=64K` through a pipe of 4.7 MB, and `-D` at levels 7 and 19.  The run is
+not -q, so a `-B#` warning fails it.  Skipped unless the zstd CLI and gzstd's libzstd are both 1.5.7
+with worker threads, and the CLI's `-B512K` actually changes this fixture.
+v0.18.20 fails all seven arms and the warning check; each of 7 mutants fails exactly its own arm (each
+switch dropped in turn, `-D` back on the shared CDict, `-B#` warning again).  Both builds
+warning-free; both helps still fit 80 columns.
+
+### Review
+
+Codex (GPT-6-Sol, high), two rounds, SAFE TO COMMIT both times.  It walked `FIO_createCResources`
+against the sliding-window context parameter by parameter (the dictionary loaded before the
+switches is built at the first `ZSTD_compressStream2`, after them, so the order does not matter),
+and found no sliding-window `-D` route left to the shared CDict.  Round 1: the cell's gate admitted
+a gzstd linked to a single-threaded libzstd 1.5.7, where `-B#` cannot set a job size, so a correct
+build would fail; it now also needs gzstd's "multithreaded" and a zstd `-B512K` that changes the
+fixture, and skips otherwise.  It also narrowed help text that overclaimed (frame-mode `-D` "differs
+at levels 5 and 7" -- small records match there).  Round 2: `--stream-size=` through a pipe of 4 MiB
+or more is still not zstd's frame (zstd pledges it; gzstd uses it only for a patch), which the
+help's "same level and options" covered; the help and ROADMAP now except it.  Adopted, with the
+help's "a named file or a pipe of 4 MiB or more" kept over its "a named input".
+
+Suites: `-e` on the GPU build, the suite choosing its own cards (no `CUDA_VISIBLE_DEVICES`: the
+freest card by default, the two freest for the multi-GPU cells), 859/0 of 860, 1 skipped (the
+trivial-park cell this server cannot trigger) -- the count expected here, so the multi-GPU cells a
+one-card mask skipped in v0.18.20 have now run.  A first run with a five-card mask failed two
+tuner cells (853/2/5): they assume one visible card, and with five each card got a fifth of the
+batches (the source-hold cell alone: passes on one card, fails on five).  CPU-only default 413/0
+(120 skipped, the no-GPU set, as expected), after round 1's edits; round 2 changed only help and
+ROADMAP text.  The `-e` run came before the review: the gated cell was rerun standalone on the GPU
+build (passes) as on the CPU-only one, on v0.18.20 and on a mutant (fail), and the help widths
+rechecked in both builds (78 and 80).
 
 ## v0.18.20 — `--patch-from` creates patches, byte-identical to zstd's; `--format=gzip|xz|lzma|lz4` is refused when compressing, and another compressor's file is named as such (ROADMAP Phase 8 decided against)
 

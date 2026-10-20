@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License").
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
-static constexpr const char * GZSTD_VERSION = "0.18.20";
+static constexpr const char * GZSTD_VERSION = "0.18.21";
 //
 // Architecture overview:
 //
@@ -2775,7 +2775,7 @@ struct Options {
   unsigned train_selectivity = 9;           // --train-legacy=s=#, zstd's default
   unsigned train_maxdict = 110 * 1024;      // --maxdict=#, zstd's default (112640)
   unsigned train_dict_id = 0;               // --dictID=#; 0 = derived from the content
-  size_t   train_block_size = 0;            // -B#: train sample blocks; patch CCtx jobSize
+  size_t   train_block_size = 0;            // -B#: train sample blocks; one-frame jobSize
   bool     recursive = false;               // -r: expand directories (zstd's walk; v0.18.8 beyond --train)
   // v0.18.8, zstd's output-directory options.  Mirror wins when both are given,
   // as in zstd; -c and -o win over either.  Mapped per input by gz_map_output_dir.
@@ -2794,15 +2794,16 @@ struct Options {
   // its multithreaded single-frame compressor -- gzstd's --sliding-window, where it
   // is real.  gzstd's own frames are cut at fixed offsets, so elsewhere it warns.
   bool     rsyncable = false;
-  // These zstd CLI switches used to be accepted without effect.  Patch
-  // creation must pass them through: zstd sets each on its patch CCtx too.
-  int      patch_literal_mode = ZSTD_ps_auto;
-  int      patch_row_match = ZSTD_ps_auto;
-  int      patch_target_cblock_size = 0;
-  int      patch_src_size_hint = 0;
+  // zstd CLI switches that set its compression context (FIO_createCResources),
+  // accepted without effect until v0.18.20.  Real where gzstd writes zstd's one
+  // frame: --patch-from compression (v0.18.20) and --sliding-window (v0.18.21).
+  int      zstd_literal_mode = ZSTD_ps_auto;     // --[no-]compress-literals
+  int      zstd_row_match = ZSTD_ps_auto;        // --[no-]row-match-finder
+  int      zstd_target_cblock_size = 0;          // --target-compressed-block-size=
+  int      zstd_src_size_hint = 0;               // --size-hint=
   uint64_t patch_window_src_size = 0;      // --stream-size= overrides NEW size for zstd's patch window
-  std::string patch_target_cblock_arg, patch_src_hint_arg, patch_stream_size_arg;
-  bool patch_target_cblock_seen = false, patch_src_hint_seen = false, patch_stream_size_seen = false;
+  std::string zstd_target_cblock_arg, zstd_src_hint_arg, patch_stream_size_arg;
+  bool zstd_target_cblock_seen = false, zstd_src_hint_seen = false, patch_stream_size_seen = false;
   // --zstd=k=v,... (v0.18.8; was refused as an unknown option): zstd's advanced
   // compression parameters, each overriding the level's, on the CPU.  0 = unset,
   // as in zstd.  Order: windowLog chainLog hashLog searchLog minMatch targetLength
@@ -5508,6 +5509,17 @@ static void print_help_long()
 "     fewer caches can hold them.  -T 0 uses every hardware thread,\n"
 "     unplaced.  -v prints the placement.  The output does not depend on\n"
 "     it: the frame is the same for any number of workers.\n"
+"     With the same libzstd, level and options (except --stream-size= on\n"
+"     a pipe), a named file or a pipe of 4 MiB or more gives zstd's bytes,\n"
+"     these switches included (v0.18.21; they had no effect):\n"
+"     --[no-]compress-literals, --[no-]row-match-finder,\n"
+"     --target-compressed-block-size=, -B# (with worker threads), and\n"
+"     --size-hint=, which counts only when the size is not known.  -D loads\n"
+"     the dictionary into this frame's compressor, as zstd does (until\n"
+"     v0.18.21 it used gzstd's shared one, and its bytes differed).\n"
+"     From stdin redirected from a file, or a pipe under 4 MiB, gzstd\n"
+"     records the input's size on purpose (zstd never does for stdin), so\n"
+"     the frame's header and window differ from zstd's.\n"
 "     The input is read ahead on its own thread, up to one 4 MiB chunk per\n"
 "     worker (64 at most) when the CPUs it may use span more than one L3\n"
 "     cache, 4 chunks inside one; --direct-read reads it with O_DIRECT.\n"
@@ -5615,6 +5627,11 @@ static void print_help_long()
 "     in the message.  A trained dictionary and raw content both work.\n"
 "     Compressed frames carry the dictionary's ID, as zstd's do, unless\n"
 "     --no-dictID is given; `zstd -d -D FILE` reads them.\n"
+"     -D with --sliding-window matches zstd's bytes on a named file or a\n"
+"     pipe of 4 MiB or more without --stream-size=.  Other frames share\n"
+"     dictionary tables across workers, so their bytes can differ,\n"
+"     especially above about 128 KB or at levels 5 and 7: sometimes\n"
+"     smaller, sometimes larger.\n"
 "     FILE must be a regular file of at most 32 MiB, as in zstd.\n"
 "     Implies --cpu-only: nvCOMP takes no dictionary, so --gpu-only,\n"
 "     --hybrid, --gds-only and --direct-stage are refused.\n"
@@ -5657,8 +5674,8 @@ static void print_help_long()
 "       -M N          load at most N bytes of samples (a bare N is bytes,\n"
 "                     -M64M is 64 MiB; zstd's --memory, byte for byte)\n"
 "     Each sample is capped at 128 KiB and the set at 2 GiB, as in zstd;\n"
-"     fewer than 5 samples is refused (exit 2).  -B# has no other use in\n"
-"     gzstd, and warns outside --train.\n"
+"     fewer than 5 samples is refused (exit 2).  Elsewhere -B# is zstd's\n"
+"     job size with --sliding-window and --patch-from, and warns otherwise.\n"
 "\n"
 #ifdef HAVE_NVCOMP
 "============================================================\n"
@@ -6009,10 +6026,11 @@ static void print_help_long()
 "\n"
 "  ACCEPTED AND SILENTLY IGNORED — no warning, no effect:\n"
 "     --[no-]asyncio, --check (the default), --[no-]mmap-dict,\n"
-"     --auto-threads=.  The following are real with --patch-from\n"
-"     compression and ignored otherwise: --[no-]compress-literals,\n"
-"     --[no-]row-match-finder, --stream-size=, --size-hint=,\n"
-"     --target-compressed-block-size=.\n"
+"     --auto-threads=.  These are real with --sliding-window (v0.18.21)\n"
+"     and --patch-from compression and ignored otherwise:\n"
+"     --[no-]compress-literals, --[no-]row-match-finder, --size-hint=,\n"
+"     --target-compressed-block-size=.  --stream-size= is real only with\n"
+"     --patch-from (zstd also pledges it as a pipe's size; gzstd does not).\n"
 "\n"
 "  --filelist FILE reads input paths from FILE, one per line, as zstd\n"
 "     does.  (Through v0.17.86 it was accepted and ignored, so the\n"
@@ -6021,7 +6039,7 @@ static void print_help_long()
 "  ACCEPTED WITH A WARNING, THEN IGNORED:\n"
 "     --rsyncable without --sliding-window, --[no-]pass-through, --trace, -B,\n"
 "     -b# / -e# / -i#, -S, --priority=, --format=gzip|xz|lzma|lz4 with\n"
-"     -d/-t/-l, and -B# outside --train/--patch-from compression\n"
+"     -d/-t/-l, and -B# outside --train, --sliding-window and --patch-from\n"
 "     -q / -qq suppress these warnings, regardless of argument order.\n"
 "\n"
 "For a condensed option list, run `gzstd -h`.\n";
@@ -15774,10 +15792,12 @@ static void load_dictionaries(const Options & opt)
     if (!g_ddict)
       die_data("cannot load dictionary " + p + ": its zstd dictionary header is corrupt");
     // Compressing with it: build the run level's CDict now, before any thread,
-    // so a failure is reported here rather than from a worker.
+    // so a failure is reported here rather than from a worker.  --sliding-window
+    // hands the dictionary to its one context instead, as zstd does (see there),
+    // so it builds none.
     if (opt.mode == Mode::COMPRESS) {
       g_dict_compress = true;
-      apply_compress_dict(nullptr, opt.level);
+      if (!opt.sliding_window) apply_compress_dict(nullptr, opt.level);
     }
   }
   g_ddict_id = ZSTD_getDictID_fromDDict(g_ddict);
@@ -22413,7 +22433,42 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
   }
 
   apply_ultra_cctx(cctx, opt.level, opt.ultra);
-  apply_compress_dict(cctx, opt.level);   // -D; no-op without one
+  if (g_dict_compress) {
+    // -D, ZSTD'S WAY (v0.18.21): the dictionary is loaded into this context,
+    // which builds its tables from the context's own parameters -- with the
+    // dedicated dictionary search, --long's window, --zstd=, the row match finder
+    // setting -- as FIO_createCResources does.  The per-level CDict the frame
+    // workers share (apply_compress_dict) is built from the level alone, and
+    // until v0.18.21 this frame used it: MEASURED against zstd 1.5.7, it differed
+    // at levels 5-9 on a 200 KB file (the search) and at every level on 7 MiB.
+    st = ZSTD_CCtx_loadDictionary_byReference(cctx, g_dict_buf, g_dict_len);
+    if (!ZSTD_isError(st) && g_no_dict_id) st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_dictIDFlag, 0);
+    if (ZSTD_isError(st))
+      die(std::string("could not load the -D dictionary into the compressor: ") + ZSTD_getErrorName(st));
+  }
+  {
+    // zstd's context switches (patches v0.18.20, every --sliding-window run
+    // v0.18.21; until then accepted without effect): FIO_createCResources sets
+    // these on every context zstd compresses with, so this frame stays zstd's
+    // under --[no-]compress-literals, --[no-]row-match-finder,
+    // --target-compressed-block-size=, --size-hint= and -B#.  Unset, each is the
+    // library's own default (auto, auto, 0, 0, 0), so a run without them writes
+    // the bytes it always did; forcing literals on or off is NOT the same as
+    // auto.  --size-hint only counts when no size is pledged (a pipe), and the
+    // dedicated dictionary search only when zstd builds a dictionary's tables
+    // itself; zstd sets that one always, and so does this.
+    auto cctx_param = [&](ZSTD_cParameter p, int value, const char * name) {
+      const size_t r = ZSTD_CCtx_setParameter(cctx, p, value);
+      if (ZSTD_isError(r))
+        die(std::string("the linked zstd refused ") + name + " (" + ZSTD_getErrorName(r) + ")");
+    };
+    cctx_param(ZSTD_c_literalCompressionMode, opt.zstd_literal_mode, "--[no-]compress-literals");
+    cctx_param(ZSTD_c_useRowMatchFinder, opt.zstd_row_match, "--[no-]row-match-finder");
+    cctx_param(ZSTD_c_targetCBlockSize, opt.zstd_target_cblock_size, "--target-compressed-block-size");
+    cctx_param(ZSTD_c_srcSizeHint, opt.zstd_src_size_hint, "--size-hint");
+    cctx_param(ZSTD_c_enableDedicatedDictSearch, 1, "enableDedicatedDictSearch");
+    if (sw_mt) cctx_param(ZSTD_c_jobSize, (int)opt.train_block_size, "-B# (jobSize)");
+  }
   if (g_dict_patch) {
     // CREATING A PATCH (v0.18.20): this one frame, with the --patch-from
     // reference as its prefix.  zstd 1.5.7's recipe, programs/fileio.c
@@ -22434,20 +22489,6 @@ static void compress_cpu_sliding_window(FILE * in, FILE * out, const Options & o
     const int pwlog = std::max<int>(ZSTD_WINDOWLOG_MIN, std::min<int>(ZSTD_WINDOWLOG_MAX, (int)file_wlog));
     st = ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, pwlog);
     if (ZSTD_isError(st)) die(std::string("--patch-from: the linked zstd refused windowLog (") + ZSTD_getErrorName(st) + ")");
-    // FIO_createCResources sets these even in patch mode.  In particular,
-    // forcing raw literals is not equivalent to the library's auto default.
-    auto patch_param = [&](ZSTD_cParameter p, int value, const char * name) {
-      const size_t r = ZSTD_CCtx_setParameter(cctx, p, value);
-      if (ZSTD_isError(r))
-        die(std::string("--patch-from: the linked zstd refused ") + name
-            + " (" + ZSTD_getErrorName(r) + ")");
-    };
-    patch_param(ZSTD_c_literalCompressionMode, opt.patch_literal_mode, "literalCompressionMode");
-    patch_param(ZSTD_c_useRowMatchFinder, opt.patch_row_match, "useRowMatchFinder");
-    patch_param(ZSTD_c_targetCBlockSize, opt.patch_target_cblock_size, "targetCBlockSize");
-    patch_param(ZSTD_c_srcSizeHint, opt.patch_src_size_hint, "srcSizeHint");
-    patch_param(ZSTD_c_enableDedicatedDictSearch, 1, "enableDedicatedDictSearch");
-    if (sw_mt) patch_param(ZSTD_c_jobSize, (int)opt.train_block_size, "jobSize");
     const ZSTD_compressionParameters cp = ZSTD_getCParams(opt.level, (unsigned long long)window_src_size, g_dict_len);
     const unsigned cycle = cp.chainLog - ((unsigned)cp.strategy >= (unsigned)ZSTD_btlazy2 ? 1u : 0u);
     const bool ldm = file_wlog > cycle;
@@ -51750,24 +51791,24 @@ static Options parse_args(int argc, char ** argv)
     // is silent or warning acceptance for the rest.  Keep in sync with zstd
     // --help. ===
     //
-    // Compatibility switches: some remain no-ops on ordinary compression,
-    // but patch creation passes zstd's context settings through below.
+    // Compatibility switches: some remain no-ops on gzstd's own frames, but
+    // --sliding-window and patch creation pass zstd's context settings through.
     else if (a == "--asyncio" || a == "--no-asyncio") {}
     else if (a == "--check" || a == "--no-check") { opt.no_check = (a == "--no-check"); }
     else if (a == "--no-dictID") { opt.no_dict_id = true; }
     else if (a == "--compress-literals" || a == "--no-compress-literals")
-      opt.patch_literal_mode = a == "--compress-literals" ? ZSTD_ps_enable : ZSTD_ps_disable;
+      opt.zstd_literal_mode = a == "--compress-literals" ? ZSTD_ps_enable : ZSTD_ps_disable;
     else if (a == "--row-match-finder" || a == "--no-row-match-finder")
-      opt.patch_row_match = a == "--row-match-finder" ? ZSTD_ps_enable : ZSTD_ps_disable;
+      opt.zstd_row_match = a == "--row-match-finder" ? ZSTD_ps_enable : ZSTD_ps_disable;
     else if (a == "--mmap-dict" || a == "--no-mmap-dict") {}
     else if (a.rfind("--stream-size=", 0) == 0) {
       opt.patch_stream_size_seen = true; opt.patch_stream_size_arg = a.substr(14);
     }
     else if (a.rfind("--size-hint=", 0) == 0) {
-      opt.patch_src_hint_seen = true; opt.patch_src_hint_arg = a.substr(12);
+      opt.zstd_src_hint_seen = true; opt.zstd_src_hint_arg = a.substr(12);
     }
     else if (a.rfind("--target-compressed-block-size=", 0) == 0) {
-      opt.patch_target_cblock_seen = true; opt.patch_target_cblock_arg = a.substr(31);
+      opt.zstd_target_cblock_seen = true; opt.zstd_target_cblock_arg = a.substr(31);
     }
     else if (a.rfind("--auto-threads=", 0) == 0) {}
     // Real mapping: --single-thread ≈ -T 1
@@ -51983,8 +52024,9 @@ static Options parse_args(int argc, char ** argv)
       opt.mem_limit_bytes = parse_mem_bytes("--memory", argv[++i]);
       g_mem_bare_spelling = a + " " + argv[i];
     }
-    // Job size: `-B#` in compression (bytes).  gzstd uses --chunk-size in MiB
-    // with different semantics (one frame per chunk).  Warn.
+    // Job size: `-B#` in compression (bytes), real for gzstd's one-frame runs
+    // (--sliding-window, --patch-from).  gzstd's own frames are sized by
+    // --chunk-size in MiB (one frame per chunk), so elsewhere it warns.
     else if (a.size() > 2 && a[0] == '-' && a[1] == 'B'
           && (a[2] >= '0' && a[2] <= '9')) {
       // zstd's -B#: in --train it splits samples into #-byte blocks (the
@@ -52226,8 +52268,9 @@ static Options parse_args(int argc, char ** argv)
                          "build (compiled without nvCOMP)\n");
 #endif
 
-  // -B# is honoured only by --train (validated right after the loop).  -r is
-  // expanded by gz_resolve_file_inputs since v0.18.8.
+  // -B# is --train's sample block (validated right after the loop) and, as in
+  // zstd, the job size of a one-frame compression.  -r is expanded by
+  // gz_resolve_file_inputs since v0.18.8.
   {
     // --rsyncable: zstd's is a property of its multithreaded single frame, and
     // gzstd's independent frames start at fixed offsets -- one inserted byte moves
@@ -52235,9 +52278,31 @@ static Options parse_args(int argc, char ** argv)
     if (opt.rsyncable && opt.mode == Mode::COMPRESS && !opt.sliding_window)
       warn_ignored_zstd_opt("--rsyncable", "gzstd's frames are cut at fixed offsets; "
                                            "it applies with --sliding-window");
-    if (opt.train_block_size && !(opt.mode == Mode::COMPRESS
-                                  && !opt.list_mode && !opt.patch_from.empty()))
+    if (opt.train_block_size && !(opt.mode == Mode::COMPRESS && !opt.list_mode
+                                  && (opt.sliding_window || !opt.patch_from.empty())))
       warn_ignored_zstd_opt("-B#", "use --chunk-size N (MiB) for frame size");
+  }
+  // zstd's context switches (v0.18.20 for patches, v0.18.21 for --sliding-window):
+  // their values are checked only where they reach a context, so the runs that
+  // ignore them keep accepting whatever they accepted.  --patch-from sets
+  // --sliding-window below; here it still has to be named.
+  if (opt.mode == Mode::COMPRESS && !opt.list_mode
+      && (opt.sliding_window || !opt.patch_from.empty())) {
+    if (opt.zstd_src_hint_seen)
+      opt.zstd_src_size_hint = (int)std::min<unsigned>(INT_MAX,
+          zstd_u32_value("--size-hint", opt.zstd_src_hint_arg));
+    if (opt.zstd_target_cblock_seen) {
+      const unsigned value = zstd_u32_value("--target-compressed-block-size",
+                                            opt.zstd_target_cblock_arg);
+      // The library raises a small value to its minimum, as for zstd, and
+      // refuses one above its maximum: refused here, before any output.
+      const ZSTD_bounds b = ZSTD_cParam_getBounds(ZSTD_c_targetCBlockSize);
+      if (value > INT_MAX || (!ZSTD_isError(b.error) && (int)value > b.upperBound))
+        die_usage("--target-compressed-block-size=" + opt.zstd_target_cblock_arg
+                  + " is above the linked zstd's limit of "
+                  + std::to_string(ZSTD_isError(b.error) ? INT_MAX : b.upperBound) + " bytes");
+      opt.zstd_target_cblock_size = (int)value;
+    }
   }
 
   // -D / --patch-from: recorded by the loop, decided here where the mode is final.
@@ -52251,17 +52316,6 @@ static Options parse_args(int argc, char ** argv)
     opt.patch_from.clear();
   }
   if (!opt.patch_from.empty() && opt.mode == Mode::COMPRESS && !opt.list_mode) {
-    // These spellings were accepted no-ops on ordinary compression.  Validate
-    // their values only for a patch, where they now reach zstd's CCtx.
-    if (opt.patch_src_hint_seen)
-      opt.patch_src_size_hint = (int)std::min<unsigned>(INT_MAX,
-          zstd_u32_value("--size-hint", opt.patch_src_hint_arg));
-    if (opt.patch_target_cblock_seen) {
-      const unsigned value = zstd_u32_value("--target-compressed-block-size",
-                                            opt.patch_target_cblock_arg);
-      if (value > INT_MAX) die_usage("--target-compressed-block-size is too large");
-      opt.patch_target_cblock_size = (int)value;
-    }
     if (opt.patch_stream_size_seen) {
       // zstd uses --stream-size here even for a named NEW, when choosing the
       // patch window and LDM threshold; the actual file size is still pledged.

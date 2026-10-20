@@ -622,8 +622,8 @@ human_size() {
 # management, Multi-file, Sparse, Threading, Stress, Help/version, Output
 # redirection, Sync output, Space-separated values, Thread option forms,
 # Verbose output validation, Completion summary format).
-EXPECTED_TESTS=558
-$EXTENSIVE && EXPECTED_TESTS=859
+EXPECTED_TESTS=559
+$EXTENSIVE && EXPECTED_TESTS=860
 # v0.18.20: +1 -e (both helps fit 80 columns): 858 -> 859.
 # v0.18.20 (--patch-from on compression): +3 default cells; the -e cell that
 # asserted the old warning now checks --verify, -c and --rm.  555 -> 558, 855 -> 858.
@@ -2120,6 +2120,61 @@ PY
     "$GZSTD" -q -f -3 --patch-from="$DICTD/old.bin" "$DICTD/newe.bin" \
       -o "$DICTD/pzg.3.zst" 2>"$DICTD/err"
   fi
+
+  # ---- --sliding-window takes the same switches, and -D as zstd loads it (v0.18.21) ----
+  # zstd sets those switches on every context, not only a patch's, so the
+  # --sliding-window frame must match zstd's with each (they were accepted with
+  # no effect).  The same LEVEL FLAG INPUT form and per-arm control, plus arms
+  # the patch cell cannot have: --size-hint through a pipe, where no size is
+  # pledged and the hint counts (a pipe of more than one 4 MiB read: from a
+  # smaller one gzstd's first read is the whole input, and libzstd records its
+  # size, which zstd's 128 KB reads never let it do); and -D, which until
+  # v0.18.21 went through gzstd's shared per-level dictionary and differed from
+  # zstd at every level on this data (mutation-tested: that route fails both -D
+  # arms).  The run is not -q, so a -B# still warned about as ignored would
+  # show (a GPU build also warns that --sliding-window implies --cpu-only).
+  # The -B arm needs workers in BOTH builds.  gzstd supports libzstd without
+  # them, and zstd's CLI may accept -B without applying a job size.  Version
+  # alone cannot distinguish these builds (both still report 1.5.7), so the
+  # reference must actually produce different bytes with -B on this fixture.
+  sw_cap_base="$DICTD/sw-cap-base.zst"; sw_cap_job="$DICTD/sw-cap-job.zst"
+  if [[ -s "$DICTD/pz-literals.bin" && $(zstd --version 2>/dev/null) == *v1.5.7* \
+        && $("$GZSTD" --version 2>/dev/null) == *"zstd 1.5.7, multithreaded]"* ]] \
+        && zstd -q -f -3 "$DICTD/newe.bin" -o "$sw_cap_base" 2>/dev/null \
+        && zstd -q -f -3 -B512K "$DICTD/newe.bin" -o "$sw_cap_job" 2>/dev/null \
+        && ! cmp -s "$sw_cap_base" "$sw_cap_job"; then
+  t0=$(now_ms); why=""; sw_variant=0
+  for sw_case in "3 --no-compress-literals lit" "7 --no-row-match-finder new" \
+                 "3 --target-compressed-block-size=8K lit" "3 -B512K new" \
+                 "3 --size-hint=64K pipe" "7 -D new" "19 -D new"; do
+    read -r sw_lv sw_flag sw_in <<<"$sw_case"
+    (( ++sw_variant ))
+    sw_input="$DICTD/newe.bin"; [[ $sw_in == lit ]] && sw_input="$DICTD/pz-literals.bin"
+    [[ $sw_in == pipe ]] && sw_input="$DICTD/body.json"
+    sw_args=("$sw_flag"); [[ $sw_flag == -D ]] && sw_args=(-D "$DICTD/a.dict")
+    sw_base="$DICTD/swz.base$sw_variant.zst"; sw_z="$DICTD/swz.opt$sw_variant.zst"
+    sw_g="$DICTD/swg.opt$sw_variant.zst"; rc=0
+    if [[ $sw_in == pipe ]]; then
+      cat "$sw_input" | zstd -q -$sw_lv -c > "$sw_base" 2>/dev/null
+      cat "$sw_input" | zstd -q -$sw_lv "${sw_args[@]}" -c > "$sw_z" 2>/dev/null
+      cat "$sw_input" | "$GZSTD" --sliding-window -$sw_lv "${sw_args[@]}" -c > "$sw_g" 2>"$DICTD/err" || rc=$?
+    else
+      zstd -q -f -$sw_lv "$sw_input" -o "$sw_base" 2>/dev/null
+      zstd -q -f -$sw_lv "${sw_args[@]}" "$sw_input" -o "$sw_z" 2>/dev/null
+      "$GZSTD" -f --sliding-window -$sw_lv "${sw_args[@]}" "$sw_input" -o "$sw_g" 2>"$DICTD/err" || rc=$?
+    fi
+    { [[ $rc -eq 0 ]] && cmp -s "$sw_z" "$sw_g"; } || why+=" -$sw_lv $sw_flag(rc=$rc)"
+    grep -qi "ignored" "$DICTD/err" && why+=" -$sw_lv $sw_flag warned: $(grep -i -m1 ignored "$DICTD/err")"
+    cmp -s "$sw_base" "$sw_z" && why+=" -$sw_lv $sw_flag did not change zstd's bytes (NOT TESTED)"
+  done
+  LAST_TEST_MS=$(( $(now_ms) - t0 ))
+  [[ -z "$why" ]] && pass "--sliding-window: zstd's switches and -D give zstd's bytes" \
+    || fail "--sliding-window: zstd's switches and -D give zstd's bytes" "differs at$why"
+  else
+    skip "--sliding-window: zstd's switches and -D give zstd's bytes" \
+      "requires zstd CLI and linked library 1.5.7 with a working -B oracle"
+  fi
+  rm -f "$sw_cap_base" "$sw_cap_job"
   # Both decoders rebuild NEW from it, and it is a patch, not a plain frame:
   # under a hundredth of NEW, where a plain frame of 2 MB of JSON is not.
   t0=$(now_ms); rc=0; rcz=0

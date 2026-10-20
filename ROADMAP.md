@@ -41,7 +41,10 @@ was true of the common path and false of roughly thirty options.
   for `-19`, `--long=27`, `--no-check` and `--rsyncable`.
 - **Dictionaries — READ (v0.17.70), WRITTEN (v0.17.71) and TRAINED (v0.17.72), CPU-only.**
   `-D` compresses and decodes in every mode (`-t`, `--tar`, stdin, `-dD`, `-D=`, `--no-dictID`);
-  a gzstd `-D` frame is byte-identical to zstd's with the same libzstd. `-d --patch-from=OLD`
+  `--sliding-window -D` is byte-identical to zstd's with the same libzstd since v0.18.21
+  for named files and pipes of at least 4 MiB without `--stream-size=`. Frame mode's
+  `-D` keeps gzstd's own route; its bytes can differ even for small files at levels 5
+  and 7, and above about 128 KB at most levels (the gap table). `-d --patch-from=OLD`
   decodes zstd's patches (OLD as raw content, up to 2 GiB, window limit lifted). `--train`,
   `--train-cover/-fastcover/-legacy`, `--maxdict`, `--dictID`, `-r` and `-B#` build dictionaries
   byte-identical to `zstd --train`'s (20 of 20 option sets measured). `--no-dictID` is MAPPED
@@ -64,10 +67,11 @@ was true of the common path and false of roughly thirty options.
 - **Accepted but divergent** (each warns): `--rsyncable` without
   `--sliding-window` (fixed frame offsets).
 - **Accepted silently, no effect:** `--[no-]asyncio`, `--check` (the default), `--[no-]mmap-dict`,
-  `--auto-threads=`.  Real only when CREATING a patch since v0.18.20 (zstd sets them on its patch
-  context): `--[no-]compress-literals`, `--[no-]row-match-finder`, `--stream-size=`, `--size-hint=`,
-  `--target-compressed-block-size=`, and `-B#` as the job size.  Plain `--sliding-window` could take
-  the same five context switches (it is byte-identical to zstd otherwise); not done yet.
+  `--auto-threads=`.  Real for zstd's one frame -- creating a patch since v0.18.20, every
+  `--sliding-window` run since v0.18.21 (zstd sets them on every context) -- and no-ops on gzstd's
+  own frames: `--[no-]compress-literals`, `--[no-]row-match-finder`, `--size-hint=`,
+  `--target-compressed-block-size=`, and `-B#` as the job size (it warns there).  `--stream-size=`
+  is real only for a patch (zstd also pledges it as stdin's size; gzstd does not).
 
 ### Ordered gap list
 
@@ -80,6 +84,8 @@ was true of the common path and false of roughly thirty options.
 | ~~Bare `-M N` = bytes~~ | DONE v0.18.8 | the owner's ruling: zstd's meaning wins; a bare value under 1 MiB prints a note for old gzstd spellings |
 | ~~`--format=gzip\|xz\|lzma\|lz4`~~ | DECIDED AGAINST | refused when compressing since v0.18.20; a foreign input's error names its tool; see Phase 8 |
 | `-b#`/`-e#`/`-i#` benchmark mode | Medium | Overlaps `--calibrate`; decide whether to map or keep separate |
+| ~~Frame-mode `-D` is not zstd's bytes~~ | DECIDED: kept (v0.18.21) | The frame workers share one CDict per level, built from the level alone; zstd loads the dictionary into its context.  A one-frame file can differ from zstd's bytes at levels 5 and 7, and past about 128 KB at most levels -- but each route wins at some levels (60 KB JSON, level 7: 2,520 bytes against zstd's 2,917; 200 KB, level 9: 9,381 against 8,544; level 16: 8,092 against 11,073), and zstd's bytes would need a CDict per worker (up to 80 MiB each at level 19).  The owner kept gzstd's route; CHANGELOG v0.18.21 has the table.  `--sliding-window -D` matches zstd on named files and pipes of at least 4 MiB without `--stream-size=` since v0.18.21 |
+| ~~`--sliding-window` from stdin records the size~~ | DECIDED: kept (v0.18.21) | stdin redirected from a file, and a pipe under 4 MiB, give a frame with its content size and a window fitted to it, which zstd never writes for stdin.  The owner kept it as a feature; the help says so |
 
 **Re-measure this table before each tag** — it is the only part of the roadmap that
 describes a moving target we do not control.
